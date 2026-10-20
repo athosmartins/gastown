@@ -4933,6 +4933,8 @@ _filter_built() {
   local repos arr id r built_ids="" ingate_ids="" _bounced _glabel
   local built_reasons="" ingate_reasons="" _matched_ref _out _kept_sp _bid _breason
   local _bf_json _bf_signal _bf_rc _bf_id_unk _bf_found _bf_unverified=0
+  local _fb_named _fb_open_tried="" _fb_open_ok=0 _fb_open_src="" _fb_arts _fb_nl=$'\n'
+  local _bf_tab=$'\t' _bf_pre_on=0 _bf_pref="" _bf_ids="" _bf_refs _bf_hits _bf_idsp
   arr=$(cat)
 
   # ── (wa-8y45 leak) GATE-MARKER + GATE-LABEL consultation ─────────────────────
@@ -4958,13 +4960,41 @@ _filter_built() {
   # candidate (never wedge dispatch on a bad read).
   while IFS=$'\t' read -r id _bounced _glabel; do
     [ -z "$id" ] && continue
+    # ga-it7qiq: "does an OPEN type:quality-gate-marker name this bead" is a question about a SET (8 open markers in the
+    # whole city on 20/10) but was asked once per candidate — `bd list --include-infra -l source-bead:<id>`, 1.2-2.7 s each
+    # at load 44, hundreds of times a sweep. ONE bulk read the first time a candidate needs it (lazy: an empty list or a
+    # list of gate-labelled beads never pays it), then a set lookup on the EXACT id line. Not the set — the per-bead read
+    # of before — when: the test seam is defined, or the bulk read failed / is not a list (never turned into "no marker").
+    # gate:needs-fix beads ask a different question (an ACTIVE re-gating) and keep their own read below.
+    _fb_named=0
+    if [ "$_bounced" != "1" ] && [ "$_glabel" != "1" ]; then
+      if [ -z "${PILOT_TEST_GATE_OPEN_BEADS+x}" ] && [ -z "$_fb_open_tried" ]; then
+        _fb_open_tried=1
+        if command -v bd >/dev/null 2>&1; then
+          # vazio ([]) → conjunto vazio, nenhum marker aberto (ok=1); falhou/ilegível → ok=0 e cai na leitura por bead de antes
+          if _fb_arts=$(bd -C "$GC_CITY" list --include-infra -l "type:quality-gate-marker" --status open --json -n 0 2>/dev/null) \
+             && _fb_open_src=$(printf '%s' "$_fb_arts" | jq -r 'if type == "array" then (.[] | select(.status == "open") | (.labels // [])[] | select(startswith("source-bead:")) | ltrimstr("source-bead:")) else error("not a list") end' 2>/dev/null); then
+            _fb_open_ok=1
+          else
+            _fb_open_src=""
+          fi
+        fi
+      fi
+      if [ "$_fb_open_ok" = "1" ]; then
+        case "${_fb_nl}${_fb_open_src}${_fb_nl}" in
+          *"${_fb_nl}${id}${_fb_nl}"*) _fb_named=1 ;;
+        esac
+      elif _beadid_has_open_gate_marker "$id"; then
+        _fb_named=1
+      fi
+    fi
     if [ "$_bounced" = "1" ]; then
       # gate:needs-fix → re-dispatchable; drop ONLY if a marker is actively re-gating now.
       if _beadid_has_active_gate_artifact "$id"; then
         ingate_ids="${ingate_ids:+$ingate_ids }$id"
         ingate_reasons="${ingate_reasons}${id}"$'\t'"gate:needs-fix + actively re-gating (open marker)"$'\n'
       fi
-    elif [ "$_glabel" = "1" ] || _beadid_has_open_gate_marker "$id"; then
+    elif [ "$_glabel" = "1" ] || [ "$_fb_named" = "1" ]; then
       # a gate:* lifecycle label OR any OPEN quality-gate-marker → built / in the gate.
       ingate_ids="${ingate_ids:+$ingate_ids }$id"
       if [ "$_glabel" = "1" ]; then
@@ -5006,12 +5036,55 @@ _filter_built() {
     _ownership_guard_repos >/dev/null
     repos="${_OWNERSHIP_GUARD_REPOS:-}"
     if [ -n "$repos" ]; then
+      # ga-it7qiq: the answer to "does a delivery branch for <id> exist" cost one `git for-each-ref` per candidate PER
+      # REPO (0.4-1.0 s each at load 44, x7 repos x hundreds of beads, every pass). List each repo's refs ONCE and ask
+      # which candidate ids occur in them at all. Every glob in delivery-branch-patterns.sh embeds the id literally
+      # (fix/<id>, fix/<id>-*, crew/*/<id> ...), so a repo none of whose refs contains the id CANNOT have a delivery
+      # branch for it: the exact function would answer rc 1 ("looked, none"), and that call is skipped. This only ever
+      # skips a NEGATIVE; whenever the id occurs in some ref (even as a prefix of another bead's branch) the exact
+      # function below still decides. Off — every pair asked the exact way, as before — when the pattern lib is not
+      # loaded (rc 2 must stay "could not tell"), when a repo's refs cannot be listed, and for an id with characters
+      # outside [A-Za-z0-9._-] (git would read them as a glob).
+      if type _delivery_branch_patterns_ready >/dev/null 2>&1 && _delivery_branch_patterns_ready; then
+        _bf_pre_on=1
+        # vazio → sem ids: nada a pré-filtrar (pré-filtro desligado abaixo); falhou/ilegível → idem, desligado (cada par vai à função exata)
+        _bf_ids=$(printf '%s' "$arr" | jq -r '.[]?.id // empty' 2>/dev/null) || _bf_ids=""
+        _bf_idsp=$(printf '%s' "$_bf_ids" | tr '\n' ' ')
+        if [ -n "$_bf_idsp" ]; then
+          while IFS= read -r r; do
+            [ -n "$r" ] && [ -d "$r" ] || continue
+            # vazio (repo sem refs) → nenhum id aparece, sem hits; falhou/ilegível → "repo<TAB>*" = perguntar a função exata por bead
+            if _bf_refs=$(git -C "$r" for-each-ref --format='%(refname)' refs/heads refs/remotes/origin </dev/null 2>/dev/null) \
+               && _bf_hits=$(printf '%s\n' "$_bf_refs" | awk -v ids="$_bf_idsp" -v repo="$r" \
+                   'BEGIN { n = split(ids, a, " ") } { for (i = 1; i <= n; i++) if (index($0, a[i])) h[a[i]] = 1 } END { for (k in h) printf "%s\t%s\n", repo, k }' 2>/dev/null); then
+              :
+            else
+              _bf_hits="${r}${_bf_tab}*"
+            fi
+            [ -n "$_bf_hits" ] && _bf_pref="${_bf_pref}${_bf_hits}${_fb_nl}"
+          done <<< "$repos"
+        else
+          _bf_pre_on=0
+        fi
+      fi
       while IFS= read -r id; do
         [ -z "$id" ] && continue
         _bf_id_unk=0
         _bf_found=0
         while IFS= read -r r; do
           [ -n "$r" ] && [ -d "$r" ] || continue
+          if [ "$_bf_pre_on" = "1" ]; then
+            case "$id" in
+              *[!A-Za-z0-9._-]*) ;;   # an id git could read as a glob: never prefiltered
+              *)
+                case "${_fb_nl}${_bf_pref}" in
+                  # the repo's refs could not be listed, or some ref of it contains the id → the exact function decides
+                  *"${_fb_nl}${r}${_bf_tab}*${_fb_nl}"*|*"${_fb_nl}${r}${_bf_tab}${id}${_fb_nl}"*) ;;
+                  # no ref of this repo contains the id → "looked, none" (what the exact function answers as rc 1)
+                  *) continue ;;
+                esac ;;
+            esac
+          fi
           # ga-3ebneo: the lookup (and which branch names count as a delivery) lives in
           # _delivery_branch_local_ref + delivery-branch-patterns.sh — it used to be a
           # hand-written crew/*/<id> + fix/<id>-* list here, blind to feat/<id>,
