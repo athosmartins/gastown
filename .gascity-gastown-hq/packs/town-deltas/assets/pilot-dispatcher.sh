@@ -4394,27 +4394,42 @@ _filter_exec_manual() {
 
   _em_out=""
   if command -v python3 >/dev/null 2>&1 && [ -f "$_em_bsp" ]; then
-    local _em_pydir _em_line _em_out1 _em_bridge_ok _em_states
+    local _em_pydir _em_lines _em_n_in _em_n_out _em_bridge_ok _em_states
     _em_pydir="$(dirname "$_em_bsp")"
     _em_bridge_ok=1
     _em_states=""
-    while IFS= read -r _em_line; do
-      [ -z "$_em_line" ] && continue
-      _em_out1=$(printf '%s' "$_em_line" | PYTHONPATH="$_em_pydir" python3 -c '
+    # ga-it7qiq: ONE python3 for the whole list, fed the same `jq -c '.[]'` stream the per-bead loop used to read.
+    # It was one `python3 -c` per candidate (0.095 s each at load 44 — 30 s for the 322 WA beads, every pass, ~6
+    # passes a sweep). The contract is unchanged: one "id<TAB>state" line per bead, and ANY problem switches the
+    # bridge off as a whole (the label check below then serves the list) — a half-bridged answer is never used.
+    # vazio → lista vazia: nenhum python3, estados vazios (a ponte segue "ligada", como antes); falhou/ilegível → ponte desligada
+    _em_lines=$(printf '%s' "$_em_in" | jq -c '.[]' 2>/dev/null) || _em_lines=""
+    if [ -n "$_em_lines" ]; then
+      # vazio (python3 respondeu sem linhas) ou falhou/ilegível (rc != 0, traceback) → ponte desligada: o check de label abaixo serve a lista
+      if _em_states=$(printf '%s\n' "$_em_lines" | PYTHONPATH="$_em_pydir" python3 -c '
 import sys, json
 from bead_state import derive
-b = json.load(sys.stdin)
-st = derive({"status": b.get("status", ""), "labels": b.get("labels") or [],
-              "assignee": b.get("assignee") or "", "metadata": b.get("metadata") or {}})
-print(str(b.get("id", "")) + "\t" + st["state"])
-' 2>/dev/null)
-      if [ -z "$_em_out1" ]; then
-        _em_bridge_ok=0
-        break
-      fi
-      _em_states="${_em_states}${_em_out1}
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    b = json.loads(line)
+    st = derive({"status": b.get("status", ""), "labels": b.get("labels") or [],
+                  "assignee": b.get("assignee") or "", "metadata": b.get("metadata") or {}})
+    print(str(b.get("id", "")) + "\t" + st["state"])
+' 2>/dev/null); then
+        # one answer line per bead asked; fewer/more means the answer cannot be trusted as a whole
+        _em_n_in=$(printf '%s\n' "$_em_lines" | grep -c . || true)
+        _em_n_out=$(printf '%s\n' "$_em_states" | grep -c . || true)
+        if [ "$_em_n_in" != "$_em_n_out" ]; then
+          _em_bridge_ok=0
+        fi
+        _em_states="${_em_states}
 "
-    done < <(printf '%s' "$_em_in" | jq -c '.[]' 2>/dev/null)
+      else
+        _em_bridge_ok=0
+        _em_states=""
+      fi
+    fi
 
     if [ "$_em_bridge_ok" = "1" ]; then
       # ga-0kqjl: the derived-state check ALONE is not sufficient. derive()'s
