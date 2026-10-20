@@ -129,6 +129,10 @@ r=$(PR_ROUTE=auto run_pre 'c "'"$(q "$J_ROUTED")"'"; c "'"$(q "$J_OWNED")"'"; c 
 reset; wnd 0
 r=$(PR_ROUTE=auto PR_SCRIPTS="$WORK/nao-existe" run_pre 'c "'"$(q "$J_LABEL")"'"; echo'); r="${r% }"
 [ "$r" = 1 ] && ok "wa-node-dispatch.sh ausente: NÃO é candidata" || bad "script ausente virou candidata ($r)"
+echo "── (1) o helper de WA recusa por conta própria o id que não é wa-* (defesa em profundidade: o candidate_pre só delega wa-*)"
+reset; wnd 0
+r=$(PR_ROUTE=auto run_pre 'cw() { local x=0; _pilot_node_only_wa_pre "$1" || x=$?; printf "%s " "$x"; }; cw "'"$(q "$J_PS")"'"; cw "'"$(q "$J_GA")"'"; cw "'"$(q "$J_LABEL")"'"; echo'); r="${r% }"
+[ "$r" = "1 1 0" ] && [ "$(calls)" = 1 ] && ok "chamado direto: ps-* e ga-* NÃO (sem sonda); wa-* com a sonda em 0 SIM — $r" || bad "o helper de WA deixou passar id que não é wa-* ($r, sondas=$(calls))"
 echo "── (1) teto de sondas por varredura"
 reset; wnd 12
 r=$(PR_ROUTE=auto PR_CAP=2 run_pre 'c "'"$(q "$J_LABEL")"'"; c "'"$(q "$J_LABEL")"'"; c "'"$(q "$J_LABEL")"'"; c "'"$(q "$J_LABEL")"'"; echo'); r="${r% }"

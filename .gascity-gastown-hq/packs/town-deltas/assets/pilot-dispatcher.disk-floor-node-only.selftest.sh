@@ -34,6 +34,8 @@ region() { RA="$1" RB="$2" awk 'f==0 && $0 ~ ENVIRON["RA"] {f=1} f==1 && n>0 && 
 FUNC_EXEMPT="$(fn_src _pilot_priority_node_exempt)"; FUNC_PRE="$(fn_src _pilot_priority_node_exempt_pre)"
 FUNC_SHADOW="$(fn_src _pilot_node_first_shadow)"; FUNC_VETO="$(fn_src _pilot_node_first_veto)"
 FUNC_BOUND="$(fn_src _pilot_priority_pool_bound_pre)"; FUNC_NC="$(fn_src _pilot_node_only_candidate_pre)"
+# ga-8okir7: _pilot_node_only_candidate_pre delega a bead wa-* a _pilot_node_only_wa_pre; o harness tem que carregar o que a função sob teste chama (a prova do caminho de WA mora em pilot-dispatcher.disk-floor-node-only-wa.selftest.sh)
+FUNC_ON="$(fn_src _pilot_node_only_wa_route_on)"; FUNC_WA="$(fn_src _pilot_node_only_wa_pre)"; PNW_INIT="$(grep -E '^_PNW_PROBES=' "$DISPATCHER")"
 VETO_LINE="$(grep -E '^PILOT_NODE_FIRST_VETO_LABELS="' "$DISPATCHER" | head -1)"
 PNY_INIT="$(grep -E '^_PNY_(ASKED|VERDICT|EFFECTIVE|GRANTED|GRANTED_N|EXEMPT_THIS)=' "$DISPATCHER")"
 GATE_SRC="$(region '^if \[ "\$_PILOT_QUOTA_STATE" = "limited" \]; then$' '^# ── ga-d0hz3: CROSS-STAGE admission gate')"
@@ -43,6 +45,7 @@ STALL_SRC="$(region '^PILOT_STALL_STATE=' '^# ga-2lca0l \(3\)')"
 FUNC_YSTALL="$(fn_src _pilot_yield_stall_check)"
 { [ -n "$FUNC_EXEMPT" ] && [ -n "$FUNC_PRE" ] && [ -n "$FUNC_SHADOW" ] && [ -n "$FUNC_VETO" ] && [ -n "$FUNC_BOUND" ] && [ -n "$VETO_LINE" ] && [ -n "$PNY_INIT" ]; } \
   || { echo "FATAL: ga-2hd02v.1.19 não aplicada (funções ou linhas de configuração do nó não achadas em $DISPATCHER)" >&2; exit 2; }
+{ [ -n "$FUNC_ON" ] && [ -n "$FUNC_WA" ] && [ -n "$PNW_INIT" ]; } || { echo "FATAL: ga-8okir7 não aplicada (o caminho de WA do filtro pré-claim não está em $DISPATCHER: _pilot_node_only_wa_route_on / _pilot_node_only_wa_pre / _PNW_PROBES)" >&2; exit 2; }
 { [ -n "$GATE_SRC" ] && [ -n "$CLEAR_SRC" ] && [ -n "$FUNC_TOPUP" ] && [ -n "$STALL_SRC" ] && [ -n "$FUNC_YSTALL" ]; } || { echo "FATAL: região ou função do dispatcher não achada (gates / limpa-pausa / _pilot_pool_topup / Step 5 / cessões consecutivas) em $DISPATCHER" >&2; exit 2; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pilot-diskfloor-nodeonly-selftest.XXXXXX")"
@@ -209,7 +212,7 @@ run_nc() {
     eval "$PNY_INIT"
     rig_to_builders() { case "$1" in gascity) echo gastown.dog ;; *) echo wa-worker ;; esac; }
     rig_has_persistent_crew_capability() { return 1; }
-    eval "$FUNC_VETO"; eval "$FUNC_SHADOW"; eval "$FUNC_EXEMPT"; eval "$FUNC_PRE"; eval "$FUNC_BOUND"; eval "$FUNC_NC"
+    eval "$FUNC_VETO"; eval "$FUNC_SHADOW"; eval "$FUNC_EXEMPT"; eval "$FUNC_PRE"; eval "$FUNC_BOUND"; eval "$FUNC_NC"; eval "$FUNC_ON"; eval "$FUNC_WA"; eval "$PNW_INIT"
     c() { local x=0; _pilot_node_only_candidate_pre "$1" || x=$?; printf '%s ' "$x"; }
     eval "$1"
   ) 2>&1 | tail -1
@@ -220,13 +223,15 @@ J_RIG='{"id":"ga-p3","labels":["story:approved"],"metadata":{"story.rig":"gascit
 J_WA='{"id":"wa-p4","labels":["story:approved"],"metadata":{"gc.routed_to":"wa-worker"}}'
 J_PS='{"id":"ps-p5","labels":["story:approved"],"metadata":{"gc.routed_to":"ps-worker"}}'
 J_WAPFX='{"id":"wa-p6","labels":["story:approved"],"metadata":{}}'
+# ga-8okir7: o wa-* sem rota agora é do caminho de WA (nunca chega à regra ga-*); o prefixo de OUTRO store que ainda chega nela é este (ps-* de primeira vista, sem rota e sem story.rig)
+J_PSPFX='{"id":"ps-p9","labels":["story:approved"],"metadata":{}}'
 J_OTHER='{"id":"ga-p7","labels":["story:approved"],"metadata":{"story.rig":"whatsapp_automation"}}'
 J_VETO='{"id":"ga-p8","labels":["story:approved","exec:manual"],"metadata":{"gc.routed_to":"gastown.dog"}}'
 J_NOID='{"labels":["story:approved"],"metadata":{"gc.routed_to":"gastown.dog"}}'
 echo "── (3) node com vaga: a bead de dog do HQ é candidata; o resto NÃO (e não gasta a consulta ao oráculo)"
 reset; oracle 0 '{"verdict":"node","reason":"free_slot","effective":4}'
-r=$(run_nc 'c "'"${J_WA//\"/\\\"}"'"; c "'"${J_PS//\"/\\\"}"'"; c "'"${J_WAPFX//\"/\\\"}"'"; c "'"${J_OTHER//\"/\\\"}"'"; c "'"${J_VETO//\"/\\\"}"'"; c "isto não é json"; c "'"${J_NOID//\"/\\\"}"'"; echo'); r="${r% }"
-[ "$r" = "1 1 1 1 1 1 1" ] && [ "$(calls)" = 0 ] && ok "wa-worker, ps-worker, bead de outro store, de outro rig, com veto, JSON ilegível e sem id: NÃO candidatas, 0 consultas — $r" || bad "um filtro de entrada falhou ($r, consultas=$(calls))"
+r=$(run_nc 'c "'"${J_WA//\"/\\\"}"'"; c "'"${J_PS//\"/\\\"}"'"; c "'"${J_WAPFX//\"/\\\"}"'"; c "'"${J_PSPFX//\"/\\\"}"'"; c "'"${J_OTHER//\"/\\\"}"'"; c "'"${J_VETO//\"/\\\"}"'"; c "isto não é json"; c "'"${J_NOID//\"/\\\"}"'"; echo'); r="${r% }"
+[ "$r" = "1 1 1 1 1 1 1 1" ] && [ "$(calls)" = 0 ] && ok "wa-worker, ps-worker, bead de outro store, de outro rig, com veto, JSON ilegível e sem id: NÃO candidatas, 0 consultas — $r" || bad "um filtro de entrada falhou ($r, consultas=$(calls))"
 r=$(run_nc 'c "'"${J_DOG//\"/\\\"}"'"; c "'"${J_FIRST//\"/\\\"}"'"; c "'"${J_RIG//\"/\\\"}"'"; echo'); r="${r% }"
 [ "$r" = "0 0 0" ] && [ "$(calls)" = 1 ] && ok "dog roteado, ga-* sem rota e rig→dog: candidatas, UMA consulta à varredura — $r" || bad "bead de dog que o nó quer não é candidata ($r, consultas=$(calls))"
 echo "── (3) o terceiro estado nunca vira node"
