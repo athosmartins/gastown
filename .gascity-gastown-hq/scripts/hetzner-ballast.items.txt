@@ -1,0 +1,17 @@
+# hetzner-ballast.items.txt — a fila do lastro do nó Hetzner (ga-2hd02v.5). TSV, 8 colunas separadas por TAB; o hetzner-ballast.sh install a leva para ~/gt-remote/ballast/items.tsv.
+#
+# Contents
+#   Colunas · Itens de hoje · O que falta (donos)
+#
+# COLUNAS: nome · papel (work | filler) · núcleos (inteiro ou auto = o resto do orçamento) · rss_mb (teto da soma de RSS do item; passou, o governo o termina) · prazo_s (o `timeout` do item; o governo
+#   o termina 60 s depois) · cooldown_s (espera entre rodadas; falha espera no mínimo 600 s) · requires (`-` ou lista de path:/exec:/cmd:/flag:/noflag:, todos verdadeiros; predicado desconhecido = item inerte) ·
+#   comando (relativo = a partir de ~/gt-remote/ballast/items/). Detalhes em scripts/hetzner-ballast.py e docs/runbooks/hetzner-ballast.md.
+#
+# ITENS DE HOJE: hq-selftests roda os *.selftest.sh do hq contra o origin/main do espelho do nó (acha vermelho antes do gate). queima é o último recurso — CPU pura quando não há trabalho útil — e nasce
+#   DESLIGADO (flag burn.on; hetzner-ballast.sh burn on).
+# O QUE FALTA (cada um entra aqui quando o dono entregar um comando que roda sozinho no nó, só com código e dado público que já está lá): calibração do Traço BIM (wa-eqp0dy), suíte completa do WA contra
+#   o origin/main (precisa do gt-iso-run, cujos processos de root o `runner` não consegue pausar nem matar: o item precisa de desenho próprio), backfill do estudo de viabilidade (wa-ekvjuo).
+#
+# nome	papel	núcleos	rss_mb	prazo_s	cooldown_s	requires	comando
+hq-selftests	work	auto	4096	10800	600	exec:~/gt-remote/bin/hetzner-remote-git.sh	hq-selftests.sh
+queima	filler	auto	512	3600	0	flag:burn.on	queima.sh
