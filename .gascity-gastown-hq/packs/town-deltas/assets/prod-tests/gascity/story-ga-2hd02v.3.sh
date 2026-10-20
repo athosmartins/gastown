@@ -7,7 +7,8 @@
 # O QUE VERIFICA (nos arquivos IMPLANTADOS, não numa cópia): o modo `pilot` de N slots existe no gancho do Pilot e no despachante e o selftest dele (casos, sem os mutantes) termina com "N/N ok";
 #   o teto de sessões do template wa-worker-remote (max_active_sessions) é um dígito ≥ 1 e o plist VERSIONADO e o plist VIVO do Pilot não ligam mais slots do que ele nem do que o `cap` do host
 #   (.gc/session-ssh.json) deixam abrir — PILOT_WA_NODE_SLOTS acima do teto faria o Pilot atribuir a um alias que o engine não abre; PILOT_WA_NODE_SLOTS > 1 sem PILOT_WA_NODE_SPAWN=pilot não vale nada
-#   (o modo pool tem 1 slot); PILOT_WA_NODE_SPAWN que não seja pool|pilot vale pool em silêncio; o runbook descreve o modo.
+#   (o modo pool tem 1 slot); PILOT_WA_NODE_SPAWN que não seja pool|pilot vale pool em silêncio; o runbook descreve o modo;
+#   o relatório da prova do dia seguinte (scripts/wa-node-report.py) existe, compila e o selftest dele (só os casos, sem os mutantes) termina com "N/N ok" (N ≥ 40) contra a árvore viva.
 # O QUE NÃO VERIFICA — e não diz que verifica: que o nó rodou UMA bead de WhatsApp (o WA nunca rodou no nó), que a rota `auto` não mandou ao nó nenhuma bead com dado de lead (isso é a medida da sombra,
 #   `.gc/wa-node-route.jsonl` mais os comentários `nó (...)` das beads), nem que o `pool` abre a sessão de uma bead da loja do WA (nunca provado; é por isso que mais de 1 slot usa o modo `pilot`).
 #   Este teste PASSAR não diz que o nó está ocupado: quem diz é o uso de CPU do nó por hora.
@@ -103,5 +104,20 @@ pass=${line%%/*}; rest=${line#*/}; total=${rest%% *}
 [[ "$pass" == "$total" && "$total" -ge 240 ]] || fail "selftest do modo pilot reportou '$line' (esperado todos ok e pelo menos 240 casos)"
 printf '%s\n' "$out" | grep -q 'SELFTEST OK' || fail "selftest do modo pilot sem a linha final de sucesso"
 log "selftest do modo pilot: $line ✓"
+
+# ── o relatório da prova do dia seguinte: existe, compila, o runbook o descreve e o selftest (os casos) passa ──
+REPORT="$CITY/scripts/wa-node-report.py"; REPORT_ST="$CITY/scripts/wa-node-report.selftest.sh"
+for f in "$REPORT" "$REPORT_ST"; do [[ -f "$f" ]] || fail "arquivo implantado ausente: $f"; [[ -x "$f" ]] || fail "$f sem permissão de execução"; done
+"$BASH32" -n "$REPORT_ST" || fail "$REPORT_ST não parseia sob $BASH32"
+python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$REPORT" || fail "$REPORT não compila"
+grep -q '^## A prova do dia seguinte' "$RUNBOOK" || fail "o runbook não descreve o relatório da prova do dia seguinte ($RUNBOOK)"
+out="$(WA_NODE_REPORT_ST_NOMUT=1 timeout 600 "$BASH32" "$REPORT_ST" 2>&1)" || { echo "$out" | tail -25 >&2; fail "selftest do relatório falhou (ou estourou o tempo) contra a árvore viva"; }
+line=$(printf '%s\n' "$out" | grep -E '^[0-9]+/[0-9]+ ok$' | tail -1)
+[[ -n "$line" ]] || fail "selftest do relatório sem a linha de resultado 'N/N ok':
+$out"
+pass=${line%%/*}; rest=${line#*/}; total=${rest%% *}
+[[ "$pass" == "$total" && "$total" -ge 40 ]] || fail "selftest do relatório reportou '$line' (esperado todos ok e pelo menos 40 casos)"
+printf '%s\n' "$out" | grep -q 'SELFTEST OK' || fail "selftest do relatório sem a linha final de sucesso"
+log "selftest do relatório da prova do dia seguinte: $line ✓"
 
 log "OK — modo pilot de N slots pronto e dentro do teto. Rota auto, N slots vivos e a prova do dia seguinte (wa-node-route.jsonl + CPU do nó por hora) são passos de ligar (docs/runbooks/hetzner-wa-node.md)."
