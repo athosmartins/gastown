@@ -6,11 +6,13 @@ Contents
 
 REGRA (Athos, 14/10): "Hetzner pago trabalha sempre". O launchd do mini roda isto a cada 900 s (com.gascity.hetzner-occupancy-watch). Cada rodada faz TRÊS
 leituras, e cada uma tem três estados (leu / não consegui ler / vale X): "não consegui" nunca vira "ocioso" nem "ocupado".
-  sessões  `gc session list --json`: sessões com `-remote-` no nome em state active/awake (as de `-remote-mbp-` são de outro host e não contam)
-  CPU      `ssh hetzner-teste` lê o /proc/stat: núcleos ocupados NA JANELA desde a leitura anterior (uma rajada entre duas leituras aparece; um instante não vale)
+  sessões  `gc session list --json`: sessões com `-remote-` no nome em state active/awake (as de `-remote-mbp-` são de outro host e não contam), e `bd list --status
+           in_progress --json --limit 0` (só leitura): dessas, só conta a que SEGURA uma bead (assignee = o alias, o session_name ou o name dela)
+  CPU     `ssh hetzner-teste` lê o /proc/stat: núcleos ocupados NA JANELA desde a leitura anterior (uma rajada entre duas leituras aparece; um instante não vale)
   fila     ~/.gc/pilot-dispatchable.json (o Pilot a grava a cada rodada): só as lojas elegíveis (hq), com idade e ttl conferidos
-ESTADO   ocupado = sessão remota ativa OU CPU >= régua (0,5 núcleo, HETZNER_OCC_BUSY_CORES): uma prova basta
-         ocioso  = sessões e CPU lidas e as duas dizem ocioso
+ESTADO   ocupado = sessão remota que SEGURA bead in_progress OU CPU >= régua (0,5 núcleo, HETZNER_OCC_BUSY_CORES): uma prova basta. Sessão viva sem bead NÃO prova nada
+         (20/10: 2 dog-remote paradas, beads fechadas, 26 de 26 leituras "ocupado" com CPU de 1 a 18 %, ga-l9q18u); o bd que falha não vira "ninguém segura bead"
+         ocioso  = sessões (e quem segura bead) e CPU lidas e as duas dizem ocioso
          desconhecido = o resto (inclui a 1ª leitura, que só semeia o baseline de CPU)
 AVISO    ao Mayor por `gc mail send` (não nudge: o nudge ao Mayor trava com a sessão anexada, ga-eldeu). Só avisa; não atribui nem despacha nada.
   ocioso   ocioso há >= 30 min (3 leituras seguidas, 2 min de folga para o jitter do launchd) COM fila > 0; cooldown de 3 h; o mail que falha não gasta o cooldown
@@ -43,6 +45,7 @@ DEAD = frozenset({"asleep", "drained", "closed", "archived", "quarantined", "fai
 WARMUP = frozenset({"sem-leitura-anterior", "leitura-anterior-velha", "contador-recuou", "relogio-recuou"})  # a CPU só semeou o baseline: não é "cego"
 BEGIN, END = "@@OCC-BEGIN@@", "@@OCC-END@@"
 REMOTE_CMD = "echo %s; grep '^cpu' /proc/stat; echo %s" % (BEGIN, END)
+RULE = 2  # a regra que produziu a leitura (vai no JSONL como "regra"): 2 = ocupado é sessão que SEGURA bead (ga-l9q18u); leitura sem o campo é da regra 1, em que sessão viva bastava
 
 
 class Fail(Exception):
@@ -83,10 +86,10 @@ def load_config(env):
         blind_cooldown_s=_num(env, "HETZNER_OCC_BLIND_COOLDOWN_S", 21600, int, 0),
         min_window_s=120, max_window_s=3 * interval, future_tol_s=60,
         ssh_timeout_s=_num(env, "HETZNER_OCC_SSH_TIMEOUT_S", 30, int, 1),
-        gc_timeout_s=_num(env, "HETZNER_OCC_GC_TIMEOUT_S", 60, int, 1),
+        gc_timeout_s=_num(env, "HETZNER_OCC_GC_TIMEOUT_S", 60, int, 1), bd_timeout_s=_num(env, "HETZNER_OCC_BD_TIMEOUT_S", 60, int, 1),
         focus_stale_s=_num(env, "GATE_FOCUS_STALE_S", 7200, int, 1),
         pilot_file=env.get("HETZNER_OCC_PILOT_FILE") or os.path.join(home, ".gc", "pilot-dispatchable.json"),
-        gc_bin=env.get("GC_BIN", "gc"), ssh_bin=env.get("SSH_BIN", "ssh"),
+        gc_bin=env.get("GC_BIN", "gc"), ssh_bin=env.get("SSH_BIN", "ssh"), bd_bin=env.get("BD_BIN", "bd"),
         now=_now(env),
     )
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@-]*", c.ssh_host):
@@ -214,8 +217,29 @@ def _ident(s):
     return None
 
 
+def _owners(s):
+    """Os nomes pelos quais uma bead in_progress aponta para a sessão: o Pilot atribui ao ALIAS do pool (dog-remote-2); session_name e name também valem."""
+    return [s[k] for k in ("session_name", "name", "alias") if isinstance(s.get(k), str) and s[k]]
+
+
+def read_holders(c):
+    """(donos, None, None) ou (None, motivo, detalhe). donos = os assignees das beads in_progress: a sessão que segura uma delas é a que trabalha. Uma leitura, só `list`."""
+    # vazio → lista [] = ninguém segura bead (leu); falhou/ilegível/travou → (None, motivo): o chamador deixa 'ocupadas' null e a sessão viva não prova nada (nunca "ocioso")
+    rc, out, err, why = run_cmd([c.bd_bin, "-C", c.city, "list", "--status", "in_progress", "--json", "--limit", "0"], c.bd_timeout_s)
+    motivo = _failed(rc, why, "bd")
+    if motivo:
+        return None, motivo, _oneline(err)
+    try:
+        lst = json.loads(out)
+    except ValueError:
+        return None, "json-ilegivel" if out.strip() else "saida-vazia", ""
+    if not isinstance(lst, list) or not all(isinstance(b, dict) and (b.get("assignee") is None or isinstance(b["assignee"], str)) for b in lst):
+        return None, "forma-desconhecida", ""
+    return {b["assignee"] for b in lst if b.get("assignee")}, None, None
+
+
 def read_sessions(c):
-    r = {"lido": False, "ativas": None, "nomes": [], "motivo": None}
+    r = {"lido": False, "ativas": None, "ocupadas": None, "nomes": [], "nomes_ocupadas": [], "motivo": None}
     rc, out, err, why = run_cmd([c.gc_bin, "--city", c.city, "session", "list", "--json"], c.gc_timeout_s)
     r["motivo"] = _failed(rc, why, "gc")
     if r["motivo"]:
@@ -234,7 +258,7 @@ def read_sessions(c):
         r["motivo"] = "sem-lista-sessions"
         return r
     other = re.compile(r"-remote-(%s)(-|$)" % "|".join(re.escape(h) for h in c.other_hosts)) if c.other_hosts else None
-    active, bad_entry, bad_state = [], 0, 0
+    active, live, bad_entry, bad_state = [], [], 0, 0
     for s in lst:
         ident = _ident(s)
         if ident is None:
@@ -245,16 +269,33 @@ def read_sessions(c):
             continue
         elif isinstance(s.get("state"), str) and s["state"] in LIVE:
             active.append(ident)
+            live.append((ident, _owners(s)))
         elif not (isinstance(s.get("state"), str) and s["state"] in DEAD):
             bad_state += 1  # state ausente ou fora do vocabulário (draining, start-pending...): não dá para dizer que trabalha nem que dorme
-    if active:  # uma sessão ativa provada basta, mesmo com entradas ilegíveis ao lado
-        r.update(lido=True, ativas=len(active), nomes=sorted(active))
-    elif bad_entry or bad_state:
-        r["motivo"] = "entrada-ilegivel" if bad_entry else "estado-ilegivel"
-    else:
-        r.update(lido=True, ativas=0)
     if bad_entry + bad_state:
         r["ilegiveis"] = bad_entry + bad_state
+    unreadable = "entrada-ilegivel" if bad_entry else "estado-ilegivel"
+    if not active:
+        if bad_entry or bad_state:
+            r["motivo"] = unreadable
+        else:
+            r.update(lido=True, ativas=0, ocupadas=0)  # nenhuma viva: o bd nem é chamado (e o Dolt fora do ar não atrapalha)
+        return r
+    r.update(ativas=len(active), nomes=sorted(active))  # o gc leu: as vivas contam mesmo que o bd falhe, mas viva não é ocupada
+    held, why, detail = read_holders(c)
+    if held is None:
+        r["motivo"], r["detalhe"] = why, detail  # ocupadas fica null (não 0): não sei quem segura bead
+        return r
+    mine = sorted(i for i, owners in live if held.intersection(owners))
+    r.update(ocupadas=len(mine), nomes_ocupadas=mine)
+    if mine:  # uma sessão que segura bead provada basta, mesmo com entrada ilegível ou sem nome ao lado
+        r["lido"] = True
+    elif bad_entry or bad_state:
+        r["motivo"] = unreadable  # a ilegível pode ser a que trabalha
+    elif any(not owners for _i, owners in live):
+        r["motivo"] = "sessao-sem-dono"  # viva sem session_name, alias nem name: não dá para casar com bead
+    else:
+        r["lido"] = True
     return r
 
 
@@ -392,7 +433,7 @@ def read_focus(c, now):
 
 # ---- estado, sequências e aviso ----------------------------------------------------------------------------------------------------------------------
 def decide(sess, cpu, cores, busy_cores):
-    if (sess["lido"] and sess["ativas"]) or (cpu["lido"] and cores >= busy_cores):
+    if (sess["lido"] and sess["ocupadas"]) or (cpu["lido"] and cores >= busy_cores):
         return "ocupado"
     if sess["lido"] and cpu["lido"]:
         return "ocioso"
@@ -414,7 +455,8 @@ def idle_mail(c, rd, span):
     body = "\n".join([
         "Estado do mundo: o nó Hetzner (%s) está OCIOSO há %d min (%d leituras seguidas, a cada %d min) e o Pilot tem %d bead(s) aprovada(s) esperando. "
         "Regra do Athos (14/10): o Hetzner pago trabalha sempre." % (c.ssh_host, _mins(span), rd["ociosas_seguidas"], _mins(c.interval_s), fila["n"]),
-        "• sessões remotas ativas: %s · CPU: %s núcleo(s) ocupado(s) de %s na última janela de %s s (régua: %s)" % (sess["ativas"], cpu["nucleos"], cpu["ncpu"], cpu["janela_s"], c.busy_cores),
+        "• sessões remotas vivas: %s · segurando bead: %s · CPU: %s núcleo(s) ocupado(s) de %s na última janela de %s s (régua: %s)" % (
+            sess["ativas"], sess["ocupadas"], cpu["nucleos"], cpu["ncpu"], cpu["janela_s"], c.busy_cores),
         "• fila (até %d; primeiros ids): %s" % (fila["n"], ", ".join(fila["ids"])),
         "• foco do gate: " + foco,
         "A fila é lida do pilot-dispatchable.json ANTES dos vetos de pool e do freio de top-up: parte dela pode estar vetada, então o número é um teto, não uma promessa.",
@@ -457,7 +499,7 @@ def run(args, env):
     c = load_config(env)
     if args.print_config:
         keys = ("city", "interval_s", "busy_cores", "stores", "other_hosts", "ssh_host", "alarm", "alarm_key", "idle_after_s", "blind_after_s", "slack_s",
-                "idle_cooldown_s", "blind_cooldown_s", "min_window_s", "max_window_s", "ssh_timeout_s", "gc_timeout_s", "pilot_file")
+                "idle_cooldown_s", "blind_cooldown_s", "min_window_s", "max_window_s", "ssh_timeout_s", "gc_timeout_s", "bd_timeout_s", "pilot_file")
         print(json.dumps({k: getattr(c, k) for k in keys}, ensure_ascii=False, indent=2))
         return 0
     now, dry = c.now, args.dry_run
@@ -480,7 +522,7 @@ def run(args, env):
     cegas = 0 if decided else _int(st.get("cegas_seguidas"), 0) + (0 if warm else 1)
     decidida_em = now if decided else _int(st.get("decidida_em"), now)  # sem nenhuma decidida ainda, conta desde a 1ª leitura
 
-    rd = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now)), "epoch": now, "estado": est, "sessoes": sess, "cpu": cpu, "fila": fila, "foco": foco,
+    rd = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now)), "epoch": now, "regra": RULE, "estado": est, "sessoes": sess, "cpu": cpu, "fila": fila, "foco": foco,
           "ociosas_seguidas": ocio, "cegas_seguidas": cegas}
     idle_due = est == "ocioso" and fila["lido"] and fila["n"] > 0 and now - ocio_desde >= c.idle_after_s - c.slack_s
     blind_due = cegas > 0 and now - decidida_em >= c.blind_after_s - c.slack_s
