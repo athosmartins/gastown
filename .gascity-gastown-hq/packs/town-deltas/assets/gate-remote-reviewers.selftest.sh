@@ -59,6 +59,34 @@ case "${FAKE_SSH_MODE:-room}" in
 esac
 SH
   chmod +x "$c/scripts/gc-session-ssh"
+  # `hetzner-claude.py gate` de mentira (ga-2hd02v.7): o modo vem de FAKE_CLAUDE_MODE (padrão ok) e cada chamada deixa seus argumentos em FAKE_CLAUDE_LOG. ASCII de propósito.
+  cat > "$c/scripts/hetzner-claude.py" <<'PY'
+import os, sys, time
+mode, log = os.environ.get("FAKE_CLAUDE_MODE", "ok"), os.environ.get("FAKE_CLAUDE_LOG")
+if log:
+    open(log, "a").write(" ".join(sys.argv[1:]) + "\n")
+out = {"ok": ("ok", 0),
+       "quota": ("blocked: quota: sem cota: You've hit your weekly limit - resets Oct 22, 4pm (UTC) (renova em 2026-10-22T16:00:00Z)", 1),
+       "loggedout": ("blocked: logged-out: servidor sem login (claude auth status: loggedIn=false)", 1),
+       "expired": ("blocked: expired: login nao vale: Not logged in", 1),
+       "unreachable": ("blocked: unreachable: ssh nao chegou ao servidor", 1),
+       "unknown": ("blocked: unknown: erro interno: OSError", 1),
+       "garbage": ("Welcome to Ubuntu 24.04 - some banner", 0),
+       "okrc1": ("ok", 1),
+       "okmore": ("ok, mas nao tenho certeza", 0),
+       "rc2": ("", 2),
+       "empty": ("", 0)}
+if mode == "hang":  # um gate que demora e, se esperarem por ele, acaba dizendo ok: só o prazo da lib impede o remoto
+    time.sleep(8)
+    print("ok")
+    sys.exit(0)
+if mode == "crash":
+    raise RuntimeError("bug futuro")
+text, rc = out[mode]
+if text:
+    print(text)
+sys.exit(rc)
+PY
 }
 flag_on()  { : > "$1/.gc/gate-remote-reviewers.on"; }
 cfg_edit() { python3 -I - "$1/.gc/session-ssh.json" "$2" <<'PY'
@@ -137,6 +165,33 @@ mkcity "$TMP/c3"; flag_on "$TMP/c3"; sed -i.bak 's/^max_active_sessions *=.*/max
 R="$(pick "$LIB" "$TMP/c3")";                  eq "template max_active_sessions = 0 → local" "$(tpl "$R")" "gate-reviewer"
 mkdir -p "$TMP/nobin"; for _t in jq sed head dirname sh env; do ln -sf "$(command -v "$_t")" "$TMP/nobin/$_t"; done; ln -sf /bin/bash "$TMP/nobin/bash"
 R="$(pick "$LIB" "$C" PATH="$TMP/nobin")";     eq "no timeout/gtimeout on the PATH → local (the probe is never run unbounded)" "$(tpl "$R")" "gate-reviewer"; has "…says so" "$R" "timeout"
+
+echo "── 2b. the node's Claude login: only a positive 'ok' sends a reviewer to the node (ga-2hd02v.7) ──"
+# 20/10: the node's account hit its weekly limit; every reviewer sent there sat 18 min on the limit modal with no verdict. The lib never asked: room on the node was enough.
+CLOG="$TMP/claude.log"; : > "$CLOG"; mkcity "$TMP/c5"; flag_on "$TMP/c5"; C5="$TMP/c5"
+R="$(pick "$LIB" "$C5" FAKE_CLAUDE_LOG="$CLOG")";                   eq "login ok + room → the REMOTE template" "$(tpl "$R")/$(kind "$R")" "gate-reviewer-remote/node"
+eq "the question asked is exactly 'gate'" "$(cat "$CLOG")" "gate"
+for _m in quota loggedout expired; do
+  R="$(pick "$LIB" "$C5" FAKE_CLAUDE_MODE=$_m)";                    eq "login $_m (measured) → local, kind=fallback" "$(tpl "$R")/$(kind "$R")" "gate-reviewer/fallback"; has "…says unready (a reviewer sent there would sit on the modal)" "$R" "unready"
+done
+R="$(pick "$LIB" "$C5" FAKE_CLAUDE_MODE=quota)";                    has "…and carries the gate's own words (the log is how the Mayor sees why)" "$R" "weekly limit"
+for _m in unreachable unknown garbage okrc1 okmore rc2 empty crash; do
+  R="$(pick "$LIB" "$C5" FAKE_CLAUDE_MODE=$_m)";                    eq "the gate could not tell ($_m) → local, NOT room" "$(tpl "$R")/$(kind "$R")" "gate-reviewer/fallback"; has "…says unknown" "$R" "unknown"
+done
+T0=$(date +%s)
+R="$(pick "$LIB" "$C5" FAKE_CLAUDE_MODE=hang GATE_REMOTE_CLAUDE_SECS=1)"; T1=$(date +%s)
+eq "a gate that hangs → local" "$(tpl "$R")" "gate-reviewer"; has "…says it timed out" "$R" "timed out"
+if [ $((T1 - T0)) -le 5 ]; then ok "…and the dispatcher waited $((T1 - T0))s, not the 8s the gate wanted"; else bad "the Claude gate was not bounded: $((T1 - T0))s"; fi
+case "$(sed -n 's/^GATE_REMOTE_CLAUDE_SECS="\${GATE_REMOTE_CLAUDE_SECS:-\([0-9]*\)}"/\1/p' "$LIB")" in 40) ok "default Claude gate bound is 40 s" ;; *) bad "default Claude gate bound changed or unreadable" ;; esac
+R="$(pick "$LIB" "$C5" GATE_REMOTE_CLAUDE_SECS=abc FAKE_CLAUDE_MODE=quota)"; has "a bound that is not a number falls back to the default (the gate still runs; 'timeout abc' would make it unknown)" "$R" "unready"
+rm -f "$C5/scripts/hetzner-claude.py"
+R="$(pick "$LIB" "$C5")";                                           eq "the gate script is missing → local, NOT room" "$(tpl "$R")" "gate-reviewer"; has "…says unknown" "$R" "unknown"
+mkcity "$TMP/c6"; : > "$CLOG"
+R="$(pick "$LIB" "$TMP/c6" FAKE_CLAUDE_MODE=quota FAKE_CLAUDE_LOG="$CLOG")"; eq "flag OFF: the Claude gate is not even asked (inert stays inert)" "$(kind "$R")/$(wc -c < "$CLOG" | tr -d ' ')" "inert/0"
+mkcity "$TMP/c5"; flag_on "$TMP/c5"; : > "$CLOG"
+R="$(pick "$LIB" "$C5" FAKE_SSH_MODE=full4 FAKE_CLAUDE_LOG="$CLOG")"; eq "node full: the Claude gate is not asked (no ssh for an answer that cannot change)" "$(wc -c < "$CLOG" | tr -d ' ')" 0
+R="$(env GC_CITY="$C5" FAKE_CLAUDE_MODE=quota /bin/bash -c 'set -euo pipefail; source "$0"; gate_remote_pick_template; printf "%s" "$GATE_REMOTE_PICK_TEMPLATE"' "$LIB" 2>&1)"
+eq "/bin/bash (3.2) under set -euo pipefail: a blocked login picks local" "$R" "gate-reviewer"
 
 echo "── 3. Bash 3.2 under the dispatcher's own strict mode ──"
 mkcity "$TMP/c4"; flag_on "$TMP/c4"
@@ -447,6 +502,20 @@ if [ -n "$MLIB" ]; then
   killed "an unreadable flag is read as 'on'" "$MLIB" "$(tpl "$(pick "$MLIB" "$MC")")" "gate-reviewer"
 else killed "an unreadable flag is read as 'on'" "" "" ""; fi
 
+# o login do Claude do nó (ga-2hd02v.7): cada regra tem que reprovar quando some
+m_claude() { # <FAKE_CLAUDE_MODE> [extra KEY=VAL] → template escolhido pela lib MLIB com o nó com vaga
+  mkcity "$MC"; flag_on "$MC"; tpl "$(pick "$MLIB" "$MC" FAKE_CLAUDE_MODE="$1" ${2:+"$2"})"
+}
+MLIB="$(mutate_lib cl-blocked "blocked:*) printf 'unready:node Claude login not usable (%s)' \"\${cg#blocked:}\" ;;" "blocked:*) printf 'room' ;;")"
+killed "a blocked Claude login (quota) counts as room" "$MLIB" "$(m_claude quota)" "gate-reviewer"
+MLIB="$(mutate_lib cl-unknown "*) printf 'unknown:node Claude login unreadable (%s)' \"\${cg#unknown:}\" ;;" "*) printf 'room' ;;")"
+killed "a gate that could not tell (banner on stdout) counts as room" "$MLIB" "$(m_claude garbage)" "gate-reviewer"
+MLIB="$(mutate_lib cl-rc '0:ok) printf '"'"'ok'"'"' ;;' '*:ok) printf '"'"'ok'"'"' ;;')"
+killed "the gate's exit code is ignored (the line 'ok' with rc 1)" "$MLIB" "$(m_claude okrc1)" "gate-reviewer"
+MLIB="$(mutate_lib cl-empty '0:ok) printf '"'"'ok'"'"' ;;' '0:*) printf '"'"'ok'"'"' ;;')"
+killed "a gate that said nothing (rc 0, empty) counts as ok" "$MLIB" "$(m_claude empty)" "gate-reviewer"
+MLIB="$(mutate_lib cl-timeout 'raw="$("$tbin" -k 5 "$secs" "$py" -I "$bin" gate 2>/dev/null </dev/null)"' 'raw="$("$py" -I "$bin" gate 2>/dev/null </dev/null)"')"
+killed "the Claude gate runs unbounded" "$MLIB" "$(m_claude hang GATE_REMOTE_CLAUDE_SECS=1)" "gate-reviewer"
 echo
 echo "gate-remote-reviewers selftest: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
