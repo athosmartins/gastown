@@ -803,6 +803,41 @@ gc_json_or_unknown() {
   return 0
 }
 
+# gc — ga-it7qiq: shadows the `gc` binary for the shell of THIS script (a function wins over PATH when the shell runs a
+# command; `timeout ... gc`, `env gc` and other processes still reach the binary). `gc rig list --json` costs 35-60 s a
+# call under load and a sweep made ~20 of them (~17 call sites). Nothing in this script adds, removes or suspends a rig,
+# so one read per sweep answers all of them.
+# Once _pilot_rig_list_prime stored a GOOD answer — in the parent shell; a subshell only inherits it at fork — the EXACT
+# read `gc --city $GC_CITY rig list --json` is served from memory. EVERYTHING else, and an empty cache (never primed, or
+# the prime failed), runs the real binary with the caller's arguments, stdin and exit status: transparent. It lives here,
+# and not inside gc_json_or_unknown, because that helper must stay byte-identical across its 4 production copies
+# (gc-json-or-unknown.selftest.sh drift guard) and the other three scripts never prime.
+_PILOT_RIG_LIST_JSON=""
+gc() {
+  if [ -n "${_PILOT_RIG_LIST_JSON:-}" ] && [ "$#" -eq 5 ] && [ "$1" = "--city" ] && [ "$2" = "${GC_CITY:-}" ] \
+     && [ "$3" = "rig" ] && [ "$4" = "list" ] && [ "$5" = "--json" ]; then
+    printf '%s' "$_PILOT_RIG_LIST_JSON"
+    return 0
+  fi
+  command gc "$@"
+}
+
+# _pilot_rig_list_prime — ga-it7qiq: read `gc rig list --json` ONCE, here, and let the gc() shadow above serve it for the
+# rest of the sweep. Call it at plain top-level scope (never inside `$(...)` or a pipe: a subshell cannot hand the
+# value back to its parent, only inherit it) and BEFORE the first statement that can reach a rig-list read — the
+# painel emit is the first one. The rig list does not change in a way that matters inside one sweep.
+# THREE states: a good answer is cached (rc 0); a failed, empty, unparseable or ok:false answer is NOT cached and
+# returns 1, so every later site retries exactly as it did before this function existed (never worse than that).
+_pilot_rig_list_prime() {
+  local _prl_out
+  _PILOT_RIG_LIST_JSON=""
+  # vazio → nada guardado, devolve 1 (cada site refaz a leitura); falhou/ilegível → idem (gc_json_or_unknown já devolve 1 para saída vazia, JSON ilegível e ok:false)
+  _prl_out=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json) || return 1
+  [ -n "$_prl_out" ] || return 1
+  _PILOT_RIG_LIST_JSON="$_prl_out"
+  return 0
+}
+
 # rig_root_path <rig> — registered production-root path for a rig, or "" if none.
 # Memoized across the sweep in PILOT_RIG_PATHS_JSON (one `gc rig list` per run).
 PILOT_RIG_PATHS_JSON=""
@@ -5417,6 +5452,47 @@ else
   log "Dolt health OK (latency=${DOLT_LATENCY_MS:-?}ms cpu=$(_dolt_cpu)%) — dispatch-to-capacity armed."
 fi
 
+# ── ga-it7qiq: read the rig list ONCE per sweep, BEFORE the painel emit ──────────────────────────────────────
+# Measured 20/10 (replay of this very emit, load 44): `gc rig list --json` costs 35-60 s a call and the emit below
+# paid it 8 times — once for its own store list and once PER STORE, because _filter_built -> _ownership_guard_repos
+# fetched it afresh inside each store's pipeline subshell (the memo only survives if it is filled in the PARENT shell,
+# and _ownership_guard_repos_prime used to run ~1200 lines further down, after the emit; ga-2wcz6 moved the function's
+# DEFINITION above the emit and left the prime behind). That was ~5 of the 25-40 min a sweep took. Two primes, at plain
+# top-level scope, in this order:
+#   1. _pilot_rig_list_prime — the raw `gc rig list --json`, which gc_json_or_unknown then serves to every site of the
+#      sweep (~17 sites, ~12 of them on the straight path of every sweep);
+#   2. _ownership_guard_repos_prime — the repo list built from it (ga-130et), inherited by every _filter_built subshell.
+# Both `|| true`: a failed read caches nothing and every site retries exactly as it did before (and set -e must not
+# abort the sweep over it). pilot-dispatcher.rig-list-once.selftest.sh pins the order on this very file.
+#
+# _ownership_guard_repos_prime — call _ownership_guard_repos exactly ONCE,
+# here, at plain top-level script scope (not inside any function, pipe, or
+# `$(...)`), so its memo cache is populated in THIS shell — the one every
+# subshell forked for the rest of the sweep inherits from — before any of
+# the 6 real call sites below get a chance to be the first invocation from
+# inside their own (sometimes several-levels-deep) subshell. A subshell
+# cannot write the memo back to its parent, but it CAN read a value the
+# parent already set before the fork; that asymmetry is the entire fix.
+# Wrapped in its own named function (rather than a bare statement) only so
+# this exact priming step is independently extractable and testable via the
+# same extract_fn helper pilot-dispatcher.ns-rig-list-gc-failure.selftest.sh
+# already uses for every other function under test here.
+# ga-130et fix-attempt-3: gate review of fix-attempt-2 found the bare call
+# below crashed the ENTIRE script under this file's `set -euo pipefail` any
+# time `gc rig list` failed — _ownership_guard_repos legitimately returns 1
+# on a real fetch failure (gc_json_or_unknown's documented failure modes),
+# and an unguarded function call whose last statement fails propagates that
+# failure straight through errexit. `|| true` at the call site (matching the
+# sibling rig_root_path cache's own `$(...) || true` fail-open convention,
+# ga-07509) keeps the memo globals — including _OWNERSHIP_GUARD_REPOS_FAILED,
+# which every real caller already checks — set exactly as before; only the
+# incidental script-aborting side effect of a failed prime is suppressed.
+_ownership_guard_repos_prime() {
+  _ownership_guard_repos >/dev/null
+}
+_pilot_rig_list_prime || true
+_ownership_guard_repos_prime || true
+
 # ── wa-u5r1: emit the FULL dispatchable queue for the painel (ALWAYS, fail-open) ─
 # Computed here — AFTER the lock + Dolt probe, BEFORE every early-exit gate (quota
 # pause, cross-stage defer, both-lanes-full) — so the painel's "Aprovadas" mirror
@@ -6577,36 +6653,10 @@ _crew_progressed_since() {
 # _filter_built's definition; search "ga-htjni: ownership" above for the
 # current definition, its ga-130et memoization/caveat notes, and full
 # rationale. _ownership_guard_repos_prime (ga-130et's own fix for the
-# subshell-loses-the-memo problem, immediately below) was not moved — it
-# already runs after the relocated definition regardless of where either
-# lives, so its own placement is unaffected by this relocation.
-
-# _ownership_guard_repos_prime — call _ownership_guard_repos exactly ONCE,
-# here, at plain top-level script scope (not inside any function, pipe, or
-# `$(...)`), so its memo cache is populated in THIS shell — the one every
-# subshell forked for the rest of the sweep inherits from — before any of
-# the 6 real call sites below get a chance to be the first invocation from
-# inside their own (sometimes several-levels-deep) subshell. A subshell
-# cannot write the memo back to its parent, but it CAN read a value the
-# parent already set before the fork; that asymmetry is the entire fix.
-# Wrapped in its own named function (rather than a bare statement) only so
-# this exact priming step is independently extractable and testable via the
-# same extract_fn helper pilot-dispatcher.ns-rig-list-gc-failure.selftest.sh
-# already uses for every other function under test here.
-# ga-130et fix-attempt-3: gate review of fix-attempt-2 found the bare call
-# below crashed the ENTIRE script under this file's `set -euo pipefail` any
-# time `gc rig list` failed — _ownership_guard_repos legitimately returns 1
-# on a real fetch failure (gc_json_or_unknown's documented failure modes),
-# and an unguarded function call whose last statement fails propagates that
-# failure straight through errexit. `|| true` at the call site (matching the
-# sibling rig_root_path cache's own `$(...) || true` fail-open convention,
-# ga-07509) keeps the memo globals — including _OWNERSHIP_GUARD_REPOS_FAILED,
-# which every real caller already checks — set exactly as before; only the
-# incidental script-aborting side effect of a failed prime is suppressed.
-_ownership_guard_repos_prime() {
-  _ownership_guard_repos >/dev/null
-}
-_ownership_guard_repos_prime || true
+# subshell-loses-the-memo problem) used to be defined and called right here,
+# AFTER the painel emit — so the emit never benefited from it (ga-it7qiq).
+# It now lives, with its rationale, in front of the emit (search
+# "ga-it7qiq: read the rig list ONCE per sweep" above) and runs there once.
 
 # ── TTL claim-recovery (relocated from ~L1586, ga-wisp-1gdiik) ────────────────
 # Runs HERE, after the stale-sling helpers + _ownership_guard_repos are defined, so
