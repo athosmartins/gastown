@@ -62,6 +62,7 @@ W="$(dirname "$0")"
 cat >/dev/null
 echo x >> "$W/ssh.calls"
 [ -f "$W/ssh.sleep" ] && sleep "$(cat "$W/ssh.sleep")"
+[ -f "$W/claude.started" ] && : > "$W/ssh.sawclaude"      # o gate do Claude já tinha começado enquanto a medição do nó ainda corria?
 if [ -f "$W/ssh.rc" ] && [ "$(cat "$W/ssh.rc")" != 0 ]; then echo "ssh: connect to host stub port 22: Connection timed out" >&2; exit "$(cat "$W/ssh.rc")"; fi
 cat "$W/ssh.out"
 EOF
@@ -107,7 +108,16 @@ printf '['
 for k in $b; do [ "$b" = none ] && break; printf '{"id":"ga-b%s","status":"in_progress","assignee":"dog-remote-%s"},' "$k" "$k"; done
 printf '{"id":"ga-x","status":"in_progress","assignee":"gastown.dog-2"},{"id":"ga-y","status":"in_progress"}]\n'
 EOF
-chmod +x "$W/ssh-stub" "$W/list-stub" "$W/gcl-stub" "$W/bd-stub"
+# o `hetzner-claude.py gate` (ga-2hd02v.7): devolve $W/claude.out com a saída $W/claude.rc; claude.sleep = segundos de demora; conta as chamadas e marca que começou
+cat > "$W/claude-stub" <<'EOF'
+#!/bin/sh
+W="$(dirname "$0")"
+echo x >> "$W/claude.calls"; : > "$W/claude.started"
+[ -f "$W/claude.sleep" ] && sleep "$(cat "$W/claude.sleep")"
+cat "$W/claude.out"
+exit "$(cat "$W/claude.rc")"
+EOF
+chmod +x "$W/ssh-stub" "$W/list-stub" "$W/gcl-stub" "$W/bd-stub" "$W/claude-stub"
 
 node() {  # node IDLE_PCT LOAD5 MEM_AVAIL_PCT  → resposta do nó com 16 núcleos, 32 GB, entre os marcadores (e com ruído de .bashrc antes)
   local idle="$1" load="$2" mem="$3" d=$(( $1 * 10 ))
@@ -123,13 +133,15 @@ mkcfg() {  # mkcfg CAP [released]
   printf '{"default_host":"hetzner","hosts":{"hetzner":{"ssh":"stub","cap":%s,"remote_root":"/r","remote_home":"/h"%s}}}\n' "$1" "${2-,\"real_sessions_released_by\":\"mayor teste\"}" > "$SSHJ"
 }
 mkshim() { printf '{"city":"/c","gate_done_bin":%s}\n' "${1-\"$GDB\"}" > "$SHIM"; }
-RT=""      # RT=N → HETZNER_CAPACITY_READ_TIMEOUT_S=N (encurta o prazo das leituras de gc/bd); newcity zera
-newcity() { RT=""; D="$T/d.$((++nd))"; mkdir -p "$D"; mkcfg 10; mkshim; node 70 3 90; sess 3; busy all; rm -f "$W/ssh.calls" "$W/ssh.sleep" "$W/list.rc" "$W/list.extra" "$W"/gcl.* "$W"/bd.*; NOW=$T0; }
+RT=""      # RT=N → HETZNER_CAPACITY_READ_TIMEOUT_S=N (encurta o prazo das leituras de gc/bd e do gate do Claude); newcity zera
+CC=""      # CC = HETZNER_CAPACITY_CLAUDE_CMD (o comando do gate do Claude); newcity põe o claude-stub, que um caso pode trocar
+gate_says() { printf '%s\n' "$2" > "$W/claude.out"; echo "$1" > "$W/claude.rc"; }      # gate_says SAÍDA LINHA — o que o gate do Claude falso devolve (LINHA vazia = saída sem texto)
+newcity() { RT=""; CC="[\"$W/claude-stub\"]"; D="$T/d.$((++nd))"; mkdir -p "$D"; mkcfg 10; mkshim; node 70 3 90; sess 3; busy all; rm -f "$W/ssh.calls" "$W/ssh.sleep" "$W/list.rc" "$W/list.extra" "$W"/gcl.* "$W"/bd.* "$W/claude.calls" "$W/claude.sleep" "$W/claude.started" "$W/ssh.sawclaude"; gate_says 0 ok; NOW=$T0; }
 nd=0
 hc() {  # hc ARGS → $OUT (stdout), $RC
   OUT=$(HETZNER_CAPACITY_DIR="$D" GC_SSH_CONFIG="$SSHJ" HETZNER_CAPACITY_SHIM_CONFIG="$SHIM" HETZNER_CAPACITY_NOW="$NOW" \
         HETZNER_CAPACITY_SSH_CMD="[\"$W/ssh-stub\"]" HETZNER_CAPACITY_LIST_CMD="[\"$W/list-stub\"]" \
-        HETZNER_CAPACITY_SESSIONS_CMD="[\"$W/gcl-stub\"]" HETZNER_CAPACITY_BEADS_CMD="[\"$W/bd-stub\"]" HETZNER_CAPACITY_READ_TIMEOUT_S="$RT" "$PY" -I "$P" "$@" 2>"$W/err"); RC=$?
+        HETZNER_CAPACITY_SESSIONS_CMD="[\"$W/gcl-stub\"]" HETZNER_CAPACITY_BEADS_CMD="[\"$W/bd-stub\"]" HETZNER_CAPACITY_CLAUDE_CMD="$CC" HETZNER_CAPACITY_READ_TIMEOUT_S="$RT" "$PY" -I "$P" "$@" 2>"$W/err"); RC=$?
 }
 at() { NOW=$((T0 + $1)); }
 jget() {  # jget CAMPO.PONTADO → valor do $OUT (JSON), texto simples; null/ausente → "null"
@@ -445,9 +457,61 @@ sp=importlib.util.spec_from_file_location("hc",sys.argv[1]); m=importlib.util.mo
   done
 }
 
-if [ -n "${HC_MUTANT:-}" ]; then g_third; g_read; g_step; g_verdict; g_idle; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
+cnew() { newcity; sess 0; }      # cidade sem sessões vivas: a vaga existe, e é a pergunta ao Claude que decide
+g_claude() {  # o login do Claude do nó (ga-2hd02v.7): só `ok` do gate (saída 0 e a linha exata) deixa o veredito dizer NÓ; login medido ruim = MINI; o resto = NÃO SEI; tudo AO VIVO, sem pausa gravada
+  cnew; hc --json verdict
+  check "claude: gate ok → NÓ free_slot (rc 0), com UMA pergunta ao gate" "0 node free_slot 1" "$RC $(jget verdict) $(jget reason) $(wc -l < "$W/claude.calls" | tr -d ' ')"
+  for st in logged-out expired quota; do
+    cnew; gate_says 1 "blocked: $st: texto do gate"; hc --json verdict
+    check "claude: blocked: $st (saída 1) → MINI claude_blocked (rc 1)" "1 local claude_blocked" "$RC $(jget verdict) $(jget reason)"
+  done
+  cnew; gate_says 1 "blocked: quota: You've hit your weekly limit · renova em 2026-10-22T16:00:00Z"; hc --json verdict
+  case "$(jget detail)" in *"renova em 2026-10-22T16:00:00Z"*) ok 0 "claude: o detalhe do veredito leva o horário em que a cota renova";; *) ok 1 "claude: o detalhe do veredito não leva o horário (veio '$(jget detail)')";; esac
+  # o que não é nem ok nem login medido ruim → NÃO SEI (rc 2): nunca NÓ, e nunca um MINI "conhecido"
+  while IFS='|' read -r rc line why; do
+    cnew; gate_says "$rc" "$line"; hc --json verdict
+    check "claude: $why → NÃO SEI claude_unknown (rc 2)" "2 unknown claude_unknown" "$RC $(jget verdict) $(jget reason)"
+  done <<'EOF'
+1|blocked: unreachable: ssh fora|o gate não soube dizer (unreachable)
+1|blocked: unknown: resposta ilegível|o gate não soube dizer (unknown)
+0|okay|saída 0 com linha que só começa com ok
+0||saída 0 e vazia
+1||saída 1 e vazia
+1|ok|saída 1 com a linha ok (contradição)
+0|blocked: quota: x|saída 0 com linha blocked (contradição)
+2|blocked: quota: x|saída 2 com linha blocked
+3|ok|saída 3 com a linha ok
+124|blocked: quota: x|saída 124 (o timeout cortou o gate)
+EOF
+  cnew; echo 5 > "$W/claude.sleep"; RT=1; hc --json verdict
+  check "claude: gate que estoura o prazo → NÃO SEI claude_unknown (rc 2), sem esperar os 5 s" "2 unknown claude_unknown" "$RC $(jget verdict) $(jget reason)"
+  case "$(jget detail)" in *prazo*) ok 0 "claude: o detalhe do estouro diz 'prazo'";; *) ok 1 "claude: o detalhe do estouro não diz prazo (veio '$(jget detail)')";; esac
+  cnew; CC='["/nao/existe/gate-claude"]'; hc --json verdict
+  check "claude: comando do gate que não executa → NÃO SEI claude_unknown (rc 2)" "2 unknown claude_unknown" "$RC $(jget verdict) $(jget reason)"
+  cnew; CC='isto não é uma lista JSON'; hc --json verdict
+  check "claude: HETZNER_CAPACITY_CLAUDE_CMD que não é lista JSON → NÃO SEI claude_unknown (rc 2), sem traceback" "2 unknown claude_unknown" "$RC $(jget verdict) $(jget reason)"
+  # a ordem das condições: pausa e nó cheio vêm antes da pergunta ao Claude
+  cnew; gate_says 1 "blocked: quota: x"; hc --json pause --reason "janela"; hc --json verdict
+  check "claude: pausa do Mayor + gate blocked → a pausa decide (MINI paused)" "1 paused" "$RC $(jget reason)"
+  newcity; sess 10; gate_says 1 "blocked: quota: x"; hc --json verdict
+  check "claude: nó cheio + gate blocked → node_full decide (a pergunta vem depois da vaga)" "local node_full" "$(jget verdict) $(jget reason)"
+  # retomada sozinha (item 4): nada é gravado; com o gate de volta a ok o veredito seguinte volta a ser NÓ, e a pausa do Mayor continua só dele
+  cnew; gate_says 1 "blocked: quota: x"; hc --json verdict; r1="$RC $(jget reason)"
+  gate_says 0 ok; at 120; hc --json verdict; r2="$RC $(jget reason)"
+  check "claude: blocked e depois ok → MINI claude_blocked e, no veredito seguinte, NÓ (retomada sozinha)" "1 claude_blocked|0 free_slot" "$r1|$r2"
+  check "claude: o bloqueio não grava pause.json" "no" "$([ -e "$D/pause.json" ] && echo yes || echo no)"
+  cnew; hc --json pause --reason "mayor"; gate_says 1 "blocked: quota: x"; hc --json verdict; gate_says 0 ok; at 120; hc --json verdict
+  check "claude: gate de volta a ok NÃO apaga a pausa do Mayor (segue MINI paused)" "1 paused yes" "$RC $(jget reason) $([ -e "$D/pause.json" ] && echo yes || echo no)"
+  # quem pergunta: só o `verdict`, e junto com a medição do nó (o ssh dorme 2 s; o gate já tinha começado quando ele acabou)
+  cnew; echo 2 > "$W/ssh.sleep"; hc --json verdict
+  check "claude: a pergunta ao gate corre JUNTO com a medição do nó (a soma estouraria os 40 s do Pilot)" "yes" "$([ -e "$W/ssh.sawclaude" ] && echo yes || echo no)"
+  cnew; hc --json status; hc --json read; hc --json step; hc --json pause --reason t; hc --json resume
+  check "claude: status, read, step, pause e resume não perguntam ao gate" "no" "$([ -e "$W/claude.calls" ] && echo yes || echo no)"
+}
+
+if [ -n "${HC_MUTANT:-}" ]; then g_third; g_read; g_step; g_verdict; g_idle; g_claude; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
 if [ -n "${HC_ONLY:-}" ]; then "g_$HC_ONLY"; echo "── $((n - fails))/$n ok (só g_$HC_ONLY)"; [ "$fails" = 0 ]; exit $?; fi
-g_read; g_step; g_verdict; g_third; g_idle
+g_read; g_step; g_verdict; g_third; g_idle; g_claude
 
 [ -n "${HC_NO_MUTANTS:-}" ] || {
   echo "── controle negativo: cada mutante tem que reprovar a bateria ──"
@@ -526,6 +590,27 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
   mutant "sem dog-remote no nó, conta uma sessão fantasma" 'return others, 0, ""' 'return others + 1, 0, ""'
   mutant "a prova de carga aceita leitura com gc/bd não lidos (idle_why com motivo)" ' and r.get("idle_why") == "" and r["sessions"] >= cur' ' and r["sessions"] >= cur'
   mutant "a prova de carga aceita leitura sem idle_why (anterior à separação ocupada×ociosa)" 'r.get("idle_why") == ""' 'not r.get("idle_why")'
+  # (ga-2hd02v.7) o login do Claude do nó
+  mutant "o gate do Claude que não diz ok não segura o veredito (unknown vira NÓ)" '    if cg != "ok":
+        return out("unknown", "claude_unknown",' '    if False:
+        return out("unknown", "claude_unknown",'
+  mutant "login medido ruim vira NÃO SEI em vez de MINI" 'return out("local", "claude_blocked",' 'return out("unknown", "claude_blocked",'
+  mutant "saída do gate diferente de 0 vale como ok (só a linha importa)" 'if p.returncode == 0 and first == "ok":' 'if first == "ok":'
+  mutant "linha do gate que só começa com ok vale" 'if p.returncode == 0 and first == "ok":' 'if p.returncode == 0 and first.startswith("ok"):'
+  mutant "blocked de qualquer estado vale como login ruim (unreachable e unknown viram MINI)" 'first.startswith(("blocked: logged-out: ", "blocked: expired: ", "blocked: quota: "))' 'first.startswith("blocked: ")'
+  mutant "blocked com saída que não é 1 vale como login ruim" 'if p.returncode == 1 and first.startswith(' 'if first.startswith('
+  mutant "gate do Claude que estoura o prazo vale como ok" 'return f"unknown:o gate do Claude estourou o prazo ({limit:g}s)"' 'return "ok"'
+  mutant "comando do gate do Claude que não executa vale como ok" 'return f"unknown:o gate do Claude não rodou ({ex})"' 'return "ok"'
+  mutant "comando do gate do Claude mal configurado vale como ok" 'return f"unknown:{e}"' 'return "ok"'
+  mutant "veredito sem a pergunta ao gate do Claude vale como ok" 'return "unknown:o login do Claude do nó não foi perguntado"' 'return "ok"'
+  mutant "a pergunta ao gate corre DEPOIS da medição (a soma, não o maior)" '        claude = ThreadPoolExecutor(max_workers=1).submit(claude_gate) if args.cmd == "verdict" else None
+        res = tick(env, cfg, now, ssh_dest, refresh=ssh_dest is not None)' '        res = tick(env, cfg, now, ssh_dest, refresh=ssh_dest is not None)
+        claude = ThreadPoolExecutor(max_workers=1).submit(claude_gate) if args.cmd == "verdict" else None'
+  mutant "o bloqueio do Claude grava pause.json (a retomada dependeria de alguém)" '    if cg.startswith("blocked:"):
+        return out("local", "claude_blocked",' '    if cg.startswith("blocked:"):
+        os.makedirs(env.dir, exist_ok=True); atomic_write(env.pause, "{}")
+        return out("local", "claude_blocked",'
+  mutant "o step também pergunta ao gate do Claude" 'submit(claude_gate) if args.cmd == "verdict" else None' 'submit(claude_gate) if args.cmd in ("verdict", "step") else None'
 }
 echo "── $((n - fails))/$n ok"
 [ "$fails" = 0 ]

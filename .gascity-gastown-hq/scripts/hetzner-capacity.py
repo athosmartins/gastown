@@ -89,6 +89,7 @@ CITY = os.path.dirname(HERE)
 POOL_DOG_ALIAS = re.compile(r"dog-remote-[0-9]+")      # o alias do pool dog-remote: o Pilot atribui a bead a ele. dog-remote-adhoc-*, gate-reviewer-*, wa-worker-* não casam: não têm bead-por-alias
 READ_TIMEOUT_GC_S = 25       # `gc session list --json` leva 10-21 s no mini com load 44 (medido 19/10); estourou = ilegível = ocupada. As duas leituras correm em PARALELO: o custo é o da maior
 READ_TIMEOUT_BD_S = 15       # `bd list --status in_progress --json` leva ~3 s; ssh (2 leituras) + a maior das duas leituras cabe nos 40 s que o Pilot dá ao veredito inteiro
+CLAUDE_GATE_TIMEOUT_S = 30   # `hetzner-claude.py gate` com o cache vencido (120 s) custa 1 ssh e, de hora em hora, uma chamada de modelo; corre JUNTO com a medição do nó, e estourar = unknown, nunca ok
 
 DEFAULTS = {
     "host": "hetzner",                 # chave em session-ssh.json → hosts
@@ -240,6 +241,41 @@ def gate_done_state(env: Env) -> str:
     if not isinstance(v, str):
         raise ConfigError("config do atalho: gate_done_bin tem que ser texto ou null")
     return "ok" if os.path.isabs(v) and os.path.isfile(v) and os.access(v, os.X_OK) else "not-exec"
+
+
+def claude_gate() -> str:
+    """O login do Claude NO NÓ, perguntado ao `hetzner-claude.py gate` (ga-2hd02v.7): 'ok' | 'blocked:<linha do gate>' | 'unknown:<porquê>'. Só 'ok' (saída 0 e a linha exata) libera;
+    'blocked' é o login MEDIDO ruim (logged-out, expired ou quota, saída 1); todo o resto é 'unknown', que NÃO é ok. É o mesmo mapa do gate-remote-reviewers.lib.sh."""
+    # vazio (o gate não imprimiu linha nenhuma) → unknown: um gate que não disse nada não disse "ok"; falhou/ilegível (comando mal configurado, não executa, prazo, saída fora de 0/1,
+    # linha estranha, "blocked: unreachable|unknown") → unknown também. Nada disto vira "ok" nem escreve pausa: o veredito é refeito a cada chamada
+    try:
+        cmd = json_env_cmd("HETZNER_CAPACITY_CLAUDE_CMD", [sys.executable, "-I", os.path.join(HERE, "hetzner-claude.py"), "gate"])
+    except ConfigError as e:
+        return f"unknown:{e}"
+    limit = read_timeout(CLAUDE_GATE_TIMEOUT_S)
+    try:
+        p = subprocess.run(cmd, capture_output=True, timeout=limit, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return f"unknown:o gate do Claude estourou o prazo ({limit:g}s)"
+    except OSError as ex:
+        return f"unknown:o gate do Claude não rodou ({ex})"
+    first = (p.stdout.decode("utf-8", "replace").splitlines() or [""])[0]
+    if p.returncode == 0 and first == "ok":
+        return "ok"
+    if p.returncode == 1 and first.startswith(("blocked: logged-out: ", "blocked: expired: ", "blocked: quota: ")):
+        return "blocked:" + first[len("blocked: "):]
+    return f"unknown:o gate do Claude disse rc={p.returncode} [{first[:80]}]"
+
+
+def claude_result(fut) -> str:
+    """O que a pergunta ao gate do Claude (disparada junto com a medição do nó) respondeu. Sem pergunta, ou pergunta que levantou exceção, é 'unknown', nunca 'ok'."""
+    # vazio (verdict chamado sem a pergunta) → unknown; falhou (a pergunta levantou exceção) → unknown também
+    if fut is None:
+        return "unknown:o login do Claude do nó não foi perguntado"
+    try:
+        return fut.result()
+    except Exception as e:
+        return f"unknown:a pergunta ao gate do Claude falhou ({type(e).__name__}: {e})"
 
 
 # ───────────────────────────────── medição ─────────────────────────────────
@@ -564,8 +600,8 @@ def idle_note(r: dict) -> str:
     return f" (+{r['sessions_idle']} vivas ociosas, contam vaga)" if isinstance(r.get("sessions_idle"), int) and r["sessions_idle"] > 0 else ""
 
 
-def verdict(env: Env, cfg: dict, st: dict, now: int) -> dict:
-    """{'verdict': node|local|unknown, 'reason': código, 'detail': texto, ...}. A primeira condição que falha decide; só `node` autoriza."""
+def verdict(env: Env, cfg: dict, st: dict, now: int, claude=None) -> dict:
+    """{'verdict': node|local|unknown, 'reason': código, 'detail': texto, ...}. A primeira condição que falha decide; só `node` autoriza. `claude` = a pergunta ao gate do Claude já disparada (ga-2hd02v.7)."""
     base = {"ceiling": st["ceiling"], "host_cap": None, "effective": None, "active": None, "free": None, "age_s": None, "reading": None}
 
     def out(v, reason, detail):
@@ -614,6 +650,12 @@ def verdict(env: Env, cfg: dict, st: dict, now: int) -> dict:
     base["active"], base["free"] = r["sessions"], base["effective"] - r["sessions"]
     if r["sessions"] >= base["effective"]:
         return out("local", "node_full", f"{r['sessions']} sessões ocupadas no nó{idle_note(r)}, teto {base['effective']} (degrau {st['ceiling']}, cap do provider {caps['cap']})")
+    # vaga e nó frio não bastam: se a conta do Claude do nó bateu o limite (20/10, ga-2hd02v.7) a bead ficaria parada no modal do limite. Vale AO VIVO, sem pausa gravada: quando o gate volta a ok o próximo veredito volta a ser node
+    cg = claude_result(claude)
+    if cg.startswith("blocked:"):
+        return out("local", "claude_blocked", f"o login do Claude do nó não vale ({cg.partition(':')[2]})")
+    if cg != "ok":
+        return out("unknown", "claude_unknown", f"não consegui saber se o login do Claude do nó vale ({cg.partition(':')[2]})")
     return out("node", "free_slot", f"{r['sessions']} de {base['effective']} sessões ocupadas{idle_note(r)}; CPU livre {r['cpu_headroom_pct']}%, RAM {r['mem_avail_pct']}%")
 
 
@@ -706,13 +748,15 @@ def main(argv=None) -> int:
         except ConfigError:
             if args.cmd == "step":
                 raise
+        # o login do Claude do nó (ga-2hd02v.7) é perguntado JUNTO com a medição do nó: o custo é o da maior das duas, não a soma (o Pilot dá 40 s ao veredito inteiro). Só o `verdict` pergunta
+        claude = ThreadPoolExecutor(max_workers=1).submit(claude_gate) if args.cmd == "verdict" else None
         res = tick(env, cfg, now, ssh_dest, refresh=ssh_dest is not None)
         if args.cmd == "step":
             d = res["decision"]
             say(args, {"ceiling": res["state"]["ceiling"], "refreshed": res["refreshed"], "locked": res["locked"], "decision": d, "alarms": res["alarms"]},
                 f"degrau {res['state']['ceiling']}" + (f" — {d['action']}: {d['why']}" if d else " — leitura em dia (ou outro ciclo rodando)"))
             return 0
-        v = verdict(env, cfg, res["state"], now)
+        v = verdict(env, cfg, res["state"], now, claude)
         v["alarms"] = res["alarms"]
         say(args, v, f"{v['verdict']} {v['reason']}: {v['detail']}")
         return {"node": 0, "local": 1}.get(v["verdict"], 2)
