@@ -1,0 +1,585 @@
+#!/usr/bin/env python3
+"""hetzner-ballast.py — o lastro do nó Hetzner: trabalho útil de baixa prioridade que ocupa a CPU que sobra e cede na hora. (ga-2hd02v.5, fatia 2/5) Python 3.9+, só biblioteca padrão.
+
+Contents
+  Para que serve · O contrato do nice · Um tick (esta fatia) · Itens · Três estados · Arquivos · Uso
+
+PARA QUE SERVE
+  Athos (20/10): "se está 100% ocupado a gente fica feliz; o que não pode é ficar menos". Mesmo com toda bead elegível indo ao nó, a fila tem buracos (madrugada de 20/10: 7 h em 0-15% de CPU).
+  Este governo roda NO NÓ (cron do `runner`, a cada minuto, sem root) e, quando a CPU livre passa de 15% por 3 leituras seguidas, começa o próximo item da fila de lastro (hetzner-ballast.items.txt; no nó, items.tsv).
+O CONTRATO DO NICE
+  Todo item roda em nice 19 + SCHED_IDLE (chrt -i 0) + ionice classe 3: o escalonador entrega a CPU a qualquer sessão (nice 0) na hora, sem esperar este governo. O /proc/stat conta esse tempo
+  na coluna `nice`, e é por isso que ele NÃO é carga: carga = user+system+irq+softirq+steal (nice <= 0). O hetzner-capacity.py lê a mesma coluna (CPU em nice > 0 é folga da cidade) — sem isso o
+  lastro faria o nó parecer "quente" e a cidade deixaria de mandar bead para ele.
+UM TICK  (esta fatia: MEDE e COMEÇA. Encerrar a rodada, prazo, RAM, filler, desligar e stop são a fatia 3/5; nada disto está instalado: a ferramenta do mini é a 4/5)
+  1 lê o registro, /proc/stat, /proc/meminfo e a tabela de processos  2 CPU livre = núcleos - carga(nice<=0); a conta de leituras livres seguidas anda ou zera  3 com a chave `on`, começa itens
+  `work` enquanto couberem no orçamento (núcleos livres - reserva) e a RAM disponível deixar (>= piso de partida + o teto do item). Sem a chave `on` só mede.
+ITENS  (registro TSV, 8 colunas: nome papel núcleos rss_mb prazo_s cooldown_s requires comando)
+  papel work|filler (o filler só começa a partir da fatia 3/5) · núcleos inteiro ou `auto` (leva o resto do orçamento) · rss_mb teto da soma de RSS do item · requires `-` ou lista de
+  path:/exec:/cmd:/flag:/noflag: (todos verdadeiros; predicado desconhecido = item inerte) · comando relativo vale a partir da pasta de itens. Linha malformada = erro visível em
+  `registry_errors`; o item dela não roda e os outros seguem. O que roda é achado na TABELA DE PROCESSOS (o líder da sessão leva a marca `ballast-item:<item>:<rodada>` na linha de comando E a
+  pasta runs/<rodada> é DESTA pasta de lastro), não no state.json: perder o estado não duplica o que já roda, e processo com a marca de outra pasta não é nosso.
+TRÊS ESTADOS
+  Toda leitura é leu / vazio / não consegui ler. "Não consegui ler" (registro, /proc/stat, meminfo, tabela de processos) nunca vira "livre": nada começa naquele tick.
+  state.json corrompido vai para <arquivo>.corrupt-<época> e recomeça; ilegível por permissão = rc 3 (inerte). A escrita da pasta é conferida ANTES de qualquer efeito.
+ARQUIVOS  (em $BALLAST_HOME, padrão ~/gt-remote/ballast)
+  items.tsv · items/ · on (a chave: presente = ligado) · state.json · lock · ticks.jsonl · runs/<rodada>/{meta.json,log}
+USO  hetzner-ballast.py tick | status      env: BALLAST_HOME BALLAST_PROC BALLAST_NOW BALLAST_ITEMS BALLAST_ITEMS_DIR BALLAST_LAUNCH_PREFIX (JSON) e os limites BALLAST_* de load_config
+"""
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from types import SimpleNamespace
+
+MARK = "ballast-item:"
+NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,40}$")
+ROLES = ("work", "filler")
+
+
+class Fail(Exception):
+    """Não consigo gravar/ler algo que o tick precisa para ser seguro: exit 3, nada começa."""
+    def __init__(self, msg, rc=3):
+        Exception.__init__(self, msg)
+        self.rc = rc
+
+
+class Unreadable(Exception):
+    """Uma leitura não respondeu: o tick registra a nota e não começa nem mata nada."""
+
+
+# ---- configuração -------------------------------------------------------------------------------------------------------------------------------------
+def _num(env, key, default, cast, lo):
+    v = cast(env.get(key, default))
+    if not v >= lo:  # NaN também reprova
+        raise ValueError("%s=%r abaixo do mínimo %r" % (key, v, lo))
+    return v
+
+
+def _prefix(raw):
+    """BALLAST_LAUNCH_PREFIX: vazio → o prefixo padrão; senão uma lista JSON de textos. Qualquer outra coisa é configuração inválida (ValueError), nunca um prefixo vazio por engano:
+    sem o nice 19 o item NÃO seria lastro e a cidade o veria como carga."""
+    if not raw:
+        return None
+    v = json.loads(raw)
+    if not (isinstance(v, list) and all(isinstance(x, str) for x in v)):
+        raise ValueError("BALLAST_LAUNCH_PREFIX tem que ser uma lista JSON de textos")
+    return v
+
+
+def load_config(env):
+    home = env.get("BALLAST_HOME") or os.path.join(os.path.expanduser("~"), "gt-remote", "ballast")
+    raw = env.get("BALLAST_NOW", "").strip()
+    prefix = env.get("BALLAST_LAUNCH_PREFIX", "").strip()
+    return SimpleNamespace(
+        home=home, proc=env.get("BALLAST_PROC", "/proc"), now=int(raw) if raw else int(time.time()),
+        registry=env.get("BALLAST_ITEMS") or os.path.join(home, "items.tsv"), items_dir=env.get("BALLAST_ITEMS_DIR") or os.path.join(home, "items"),
+        idle_min_pct=_num(env, "BALLAST_IDLE_MIN_PCT", 15.0, float, 0.0), idle_ticks=_num(env, "BALLAST_IDLE_TICKS", 3, int, 1),
+        reserve=_num(env, "BALLAST_RESERVE_CORES", 1.0, float, 0.0), max_items=_num(env, "BALLAST_MAX_ITEMS", 4, int, 1),
+        gap_s=_num(env, "BALLAST_GAP_S", 180, int, 1), page_kb=_num(env, "BALLAST_PAGE_KB", 4, int, 1),
+        ram_start_mb=_num(env, "BALLAST_RAM_START_MB", 14336, int, 0),
+        launch_prefix=_prefix(prefix))
+
+
+# ---- leituras (cada uma com três estados) ---------------------------------------------------------------------------------------------------------------
+def read_text(path):
+    # vazio → texto vazio (o chamador decide se vazio vale); falhou/ilegível → Unreadable (nada começa, nada é morto)
+    try:
+        with open(path, "rb") as f:
+            return f.read().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise Unreadable("%s: %s" % (path, e))
+
+
+def read_stat(root):
+    """(ncpu, [user nice system idle iowait irq softirq steal])."""
+    # vazio → Unreadable (sem linha cpu); falhou/ilegível → Unreadable
+    lines = read_text(os.path.join(root, "stat")).splitlines()
+    f = lines[0].split() if lines else []
+    if len(f) < 9 or f[0] != "cpu":
+        raise Unreadable("/proc/stat: linha agregada estranha")
+    try:
+        vec = [int(x) for x in f[1:9]]
+    except ValueError:
+        raise Unreadable("/proc/stat: não numérico")
+    ncpu = sum(1 for ln in lines if re.match(r"^cpu[0-9]+ ", ln))
+    if ncpu < 1:
+        raise Unreadable("/proc/stat: nenhum cpuN")
+    return ncpu, vec
+
+
+def read_mem_avail_mb(root):
+    # vazio (sem a linha) → Unreadable, nunca 0 MB; falhou/ilegível → Unreadable
+    for ln in read_text(os.path.join(root, "meminfo")).splitlines():
+        if ln.startswith("MemAvailable:"):
+            try:
+                return int(ln.split()[1]) // 1024
+            except (ValueError, IndexError):
+                raise Unreadable("/proc/meminfo: MemAvailable não numérico")
+    raise Unreadable("/proc/meminfo: sem MemAvailable")
+
+
+def scan(root, page_kb):
+    """Tabela de processos: [{pid, sid, state, rss_kb, cmd}]. Processo que some no meio da leitura é ignorado; a pasta que não abre é Unreadable."""
+    # vazio → lista vazia (ninguém roda); falhou/ilegível → Unreadable (não dá para saber o que roda: nada começa, nada é morto)
+    try:
+        names = os.listdir(root)
+    except OSError as e:
+        raise Unreadable("%s: %s" % (root, e))
+    out = []
+    for nm in names:
+        if not nm.isdigit():
+            continue
+        d = os.path.join(root, nm)
+        try:
+            with open(os.path.join(d, "stat"), "rb") as f:
+                data = f.read().decode("utf-8", "replace")
+            rest = data[data.rindex(")") + 2:].split()
+            st, sid = rest[0], int(rest[3])
+            with open(os.path.join(d, "statm"), "rb") as f:
+                rss = int(f.read().split()[1]) * page_kb
+            with open(os.path.join(d, "cmdline"), "rb") as f:
+                cmd = f.read().decode("utf-8", "replace")
+        except (OSError, ValueError, IndexError):
+            continue
+        out.append({"pid": int(nm), "sid": sid, "state": st, "rss_kb": rss, "cmd": cmd})
+    return out
+
+
+def running_items(procs, known=None, valid=None):
+    """{rodada: {item, run, pid, state, rss_kb, members}}. O grupo do item é a SESSÃO do líder (pid == sid): vale o líder com a marca `ballast-item:<item>:<rodada>` na linha de comando
+    E uma pasta runs/<rodada> NESTA pasta de lastro (`valid`; a marca sozinha não basta: o selftest do próprio governo roda como item do hq-selftests e deixa processos com a marca de outra pasta,
+    que não são nossos e nunca podem ser contados nem mortos), e também a rodada que a meta.json conhece (`known`: rodada -> (item, pid)) cujo líder já morreu mas deixou filho vivo na sessão.
+    Pid reaproveitado (líder vivo SEM a marca da rodada) não é o item; zumbi sem filho vivo também não. `valid` None = sem filtro (só para quem não tem pasta)."""
+    known = dict(known or {})
+    by_pid = {p["pid"]: p for p in procs}
+    cand = {}
+    for p in procs:
+        if p["pid"] != p["sid"]:
+            continue
+        m = next((a for a in p["cmd"].split("\0") if a.startswith(MARK)), None)
+        parts = m[len(MARK):].split(":") if m else []
+        if len(parts) == 2 and NAME_RE.match(parts[0]) and (valid is None or parts[1] in valid):
+            cand[parts[1]] = (parts[0], p["pid"])
+    for run, (item, pid) in known.items():
+        ldr = by_pid.get(pid)
+        if run not in cand and (ldr is None or ldr["state"] == "Z"):
+            cand[run] = (item, pid)
+    out = {}
+    for run, (item, pid) in cand.items():
+        mem = [q for q in procs if q["sid"] == pid and q["state"] != "Z"]
+        if mem:
+            lead = by_pid.get(pid)
+            out[run] = {"item": item, "run": run, "pid": pid, "state": lead["state"] if lead else "S", "rss_kb": sum(q["rss_kb"] for q in mem), "members": [q["pid"] for q in mem]}
+    return out
+
+
+def current_runs(cfg):
+    """(procs, rodadas sem marca final, {rodada: dados do que roda}). Qualquer leitura que falha é Unreadable: sem ler NINGUÉM é dado por morto."""
+    procs = scan(cfg.proc, cfg.page_kb)
+    unf, valid = unfinished_runs(cfg)
+    known = {}
+    for r in unf:
+        m = read_meta(cfg, r)
+        if m and isinstance(m.get("pid"), int):
+            known[r] = (m["item"], m["pid"])
+    return procs, unf, running_items(procs, known, valid)
+
+
+# ---- registro -----------------------------------------------------------------------------------------------------------------------------------------
+def parse_registry(text):
+    """(itens, erros). Linha malformada é erro visível e não vira item; o resto segue."""
+    items, errors, seen = [], [], set()
+    for i, raw in enumerate(text.splitlines(), 1):
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        c = [x.strip() for x in raw.split("\t")]
+        if len(c) != 8:
+            errors.append("linha %d: %d colunas (esperava 8)" % (i, len(c)))
+            continue
+        name, role, cores, rss, tmo, cool, req, cmd = c
+        try:
+            if not NAME_RE.match(name):
+                raise ValueError("nome inválido %r" % name)
+            if name in seen:
+                raise ValueError("nome repetido %r" % name)
+            if role not in ROLES:
+                raise ValueError("papel %r (work|filler)" % role)
+            ncores = "auto" if cores == "auto" else int(cores)
+            if ncores != "auto" and ncores < 1:
+                raise ValueError("núcleos %r < 1" % cores)
+            rss_mb, tmo_s, cool_s = int(rss), int(tmo), int(cool)
+            if rss_mb < 1 or tmo_s < 1 or cool_s < 0:
+                raise ValueError("rss_mb/prazo < 1 ou cooldown < 0")
+            if not req or not cmd:
+                raise ValueError("requires ou comando vazio")
+        except ValueError as e:
+            errors.append("linha %d: %s" % (i, e))
+            continue
+        seen.add(name)
+        items.append({"name": name, "role": role, "cores": ncores, "rss_mb": rss_mb, "timeout_s": tmo_s, "cooldown_s": cool_s, "requires": req, "command": cmd})
+    return items, errors
+
+
+def resolve_command(cfg, item):
+    """argv do item, ou None. Relativo vale a partir da pasta de itens; precisa existir e ser executável."""
+    try:
+        argv = shlex.split(item["command"])
+    except ValueError:
+        return None, "comando ilegível"
+    if not argv:
+        return None, "comando vazio"
+    if not os.path.isabs(argv[0]):
+        argv[0] = os.path.join(cfg.items_dir, argv[0])
+    if not (os.path.isfile(argv[0]) and os.access(argv[0], os.X_OK)):
+        return None, "comando: %s ausente ou sem permissão de execução" % argv[0]
+    return argv, ""
+
+
+def check_requires(cfg, req):
+    """(ok, motivo). Predicado desconhecido NUNCA vira 'sem requisito'."""
+    if req == "-":
+        return True, ""
+    for term in req.split(","):
+        pred, _, arg = term.strip().partition(":")
+        if pred == "path":
+            ok = bool(arg) and os.path.exists(os.path.expanduser(arg))
+        elif pred == "exec":
+            p = os.path.expanduser(arg)
+            ok = bool(arg) and os.path.isfile(p) and os.access(p, os.X_OK)
+        elif pred == "cmd":
+            ok = bool(arg) and shutil.which(arg) is not None
+        elif pred == "flag":
+            ok = bool(arg) and "/" not in arg and os.path.exists(os.path.join(cfg.home, arg))
+        elif pred == "noflag":
+            ok = bool(arg) and "/" not in arg and not os.path.exists(os.path.join(cfg.home, arg))
+        else:
+            return False, "requires: predicado desconhecido %r" % term.strip()
+        if not ok:
+            return False, "requires: %s não vale" % term.strip()
+    return True, ""
+
+
+def eligibility(cfg, item, st, running_names):
+    """(ok, motivo) do item AGORA: requisitos, comando, timeout no PATH, cooldown, já rodando."""
+    if item["name"] in running_names:
+        return False, "rodando"
+    ok, why = check_requires(cfg, item["requires"])
+    if not ok:
+        return False, why
+    argv, why = resolve_command(cfg, item)
+    if argv is None:
+        return False, why
+    if shutil.which("timeout") is None:
+        return False, "timeout ausente no PATH (sem prazo não começa)"
+    until = st["cooldown"].get(item["name"], 0)
+    if until > cfg.now:
+        return False, "cooldown até %d" % until
+    return True, ""
+
+
+# ---- estado -------------------------------------------------------------------------------------------------------------------------------------------
+def fresh_state():
+    return {"v": 1, "last": None, "free_ticks": 0, "cooldown": {}}
+
+
+def load_state(cfg):
+    path = os.path.join(cfg.home, "state.json")
+    # vazio (arquivo ausente) → estado novo; falhou por permissão/E-S → Fail rc 3 (inerte); corrompido → vai para o lado e recomeça
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return fresh_state()
+    except OSError as e:
+        raise Fail("%s: não abre (%s)" % (path, e))
+    try:
+        st = json.loads(raw.decode("utf-8"))
+        if not (isinstance(st, dict) and st.get("v") == 1 and isinstance(st.get("cooldown"), dict) and isinstance(st.get("free_ticks"), int)):
+            raise ValueError("formato")
+        return st
+    except (ValueError, RecursionError, UnicodeDecodeError):
+        aside = "%s.corrupt-%d" % (path, cfg.now)
+        try:
+            os.replace(path, aside)
+        except OSError as e:
+            raise Fail("%s: corrompido e não consegui pôr de lado (%s)" % (path, e))
+        print("hetzner-ballast: %s corrompido; cópia em %s, recomeço" % (path, aside), file=sys.stderr)
+        return fresh_state()
+
+
+def save_json(path, obj):
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+        os.replace(tmp, path)
+    except OSError as e:
+        raise Fail("%s: não gravei (%s)" % (path, e))
+
+
+def append_line(path, obj, cap=1000000):
+    """Uma linha JSON no fim; passou do teto de bytes, fica só a metade mais nova (o histórico longo mora no mini, que puxa results.jsonl)."""
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > cap:
+            with open(path, "rb") as f:
+                keep = f.read().splitlines(True)
+            keep = keep[len(keep) // 2:]
+            with open(path, "wb") as f:
+                f.writelines(keep)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(obj) + "\n")
+    except OSError as e:
+        raise Fail("%s: não gravei (%s)" % (path, e))
+
+
+# ---- lançamento ---------------------------------------------------------------------------------------------------------------------------------------
+def default_prefix():
+    """nice 19 + SCHED_IDLE + ionice idle, com o que existir no PATH (o nice é o que o /proc/stat conta como fundo; sem ele o item NÃO é lastro e o prefixo vazio é erro do chamador)."""
+    pre = ["nice", "-n", "19"]
+    if shutil.which("chrt"):
+        pre += ["chrt", "-i", "0"]
+    if shutil.which("ionice"):
+        pre += ["ionice", "-c", "3"]
+    return pre
+
+
+def start_item(cfg, item, cores):
+    argv, why = resolve_command(cfg, item)
+    if argv is None:
+        raise Unreadable(why)
+    run = "%s-%d" % (item["name"], cfg.now)
+    rundir = os.path.join(cfg.home, "runs", run)
+    k = 1
+    while os.path.exists(rundir):
+        k += 1
+        run = "%s-%d-%d" % (item["name"], cfg.now, k)
+        rundir = os.path.join(cfg.home, "runs", run)
+    try:
+        os.makedirs(rundir)
+        save_json(os.path.join(rundir, "meta.json"), {"item": item["name"], "role": item["role"], "cores": cores, "rss_mb": item["rss_mb"], "timeout_s": item["timeout_s"],
+                                                      "cooldown_s": item["cooldown_s"], "start": cfg.now})
+        log = open(os.path.join(rundir, "log"), "ab")
+    except OSError as e:
+        raise Fail("%s: não crio a rodada (%s)" % (rundir, e))
+    env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"), "HOME": os.path.expanduser("~"), "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1", "BALLAST_HOME": cfg.home,
+           "BALLAST_RUN_DIR": rundir, "BALLAST_CORES": str(cores), "BALLAST_ITEM": item["name"]}
+    prefix = cfg.launch_prefix if cfg.launch_prefix is not None else default_prefix()
+    # oom_score_adj 1000: se o nó (sem swap) ficar sem memória, o kernel mata o lastro antes de uma sessão (subir o próprio valor não pede root); sem /proc (macOS) a linha é silenciosa
+    wrapper = ["sh", "-c", '{ echo 1000 > /proc/self/oom_score_adj; } 2>/dev/null; "$@"; echo $? > "$BALLAST_RUN_DIR/rc"', MARK + item["name"] + ":" + run] + prefix + ["timeout", "-k", "30", str(item["timeout_s"])] + argv
+    try:
+        p = subprocess.Popen(wrapper, cwd=rundir, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True, close_fds=True)
+    except OSError as e:
+        raise Unreadable("%s: não executou (%s)" % (item["name"], e))
+    finally:
+        log.close()
+    # o pid na meta: se o líder morrer deixando filho vivo na sessão, a rodada ainda é achada (a marca só vive na linha de comando do líder)
+    save_json(os.path.join(rundir, "meta.json"), {"item": item["name"], "role": item["role"], "cores": cores, "rss_mb": item["rss_mb"], "timeout_s": item["timeout_s"],
+                                                  "cooldown_s": item["cooldown_s"], "start": cfg.now, "pid": p.pid})
+    return {"item": item["name"], "run": run, "pid": p.pid, "cores": cores}
+
+
+# ---- rodadas (pasta runs/) ----------------------------------------------------------------------------------------------------------------------------
+def read_meta(cfg, run):
+    # vazio/ilegível → None (a rodada é encerrada com o nome do item tirado do nome da pasta, sem tamanho nem prazo)
+    try:
+        with open(os.path.join(cfg.home, "runs", run, "meta.json"), "r", encoding="utf-8") as f:
+            m = json.load(f)
+        return m if isinstance(m, dict) and isinstance(m.get("item"), str) else None
+    except (OSError, ValueError, RecursionError):
+        return None
+
+
+def unfinished_runs(cfg):
+    """(rodadas sem marca final, todas as rodadas desta pasta)."""
+    base = os.path.join(cfg.home, "runs")
+    # vazio (sem pasta runs) → nenhuma rodada; falhou/ilegível → Unreadable (não encerra nada por palpite)
+    try:
+        names = os.listdir(base)
+    except FileNotFoundError:
+        return [], set()
+    except OSError as e:
+        raise Unreadable("%s: %s" % (base, e))
+    alld = set(d for d in names if os.path.isdir(os.path.join(base, d)))
+    return sorted(d for d in alld if not os.path.exists(os.path.join(base, d, "final"))), alld
+
+
+# ---- o tick -------------------------------------------------------------------------------------------------------------------------------------------
+def iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(t))
+
+
+def load_registry(cfg):
+    # vazio (nenhuma linha de item) → lista vazia (nada a rodar); falhou/ilegível → Unreadable (nada começa; o que já roda continua)
+    return parse_registry(read_text(cfg.registry))
+
+
+def running_cores(cfg, run):
+    tot = 0
+    for r in run.values():
+        m = read_meta(cfg, r["run"])
+        # vazio/ilegível → conta pelo menos 1 núcleo: errar para menos começaria item demais
+        tot += int(m["cores"]) if m and isinstance(m.get("cores"), int) else 1
+    return tot
+
+
+def cpu_step(cfg, st, vec, ncpu, rec, notes):
+    """Carga = user+system+irq+softirq+steal (nice <= 0). O tempo em nice > 0 é o próprio lastro (e qualquer fundo): não conta. True = leitura boa, sem lacuna."""
+    last = st.get("last")
+    ok = False
+    if not last or any(v < l for v, l in zip(vec, last["vec"])):
+        st["free_ticks"] = 0
+        notes.append("primeira-leitura")
+    else:
+        d = [v - l for v, l in zip(vec, last["vec"])]
+        dt = sum(d)
+        if dt <= 0:
+            st["free_ticks"] = 0
+            notes.append("leitura-ilegivel")
+        else:
+            fg = (d[0] + d[2] + d[5] + d[6] + d[7]) / float(dt)
+            rec["fg_cores"], rec["free_pct"] = round(fg * ncpu, 1), round(100.0 * (1.0 - fg), 1)
+            if cfg.now - last["t"] > cfg.gap_s:
+                st["free_ticks"] = 0
+                notes.append("lacuna")
+            else:
+                ok = True
+                st["free_ticks"] = st["free_ticks"] + 1 if rec["free_pct"] >= cfg.idle_min_pct else 0
+    st["last"] = {"t": cfg.now, "vec": vec}
+    return ok
+
+
+def do_tick(cfg):
+    rec = {"ts": iso(cfg.now), "t": cfg.now, "mode": "ligado", "note": "", "started": [], "running": [], "skipped": [], "registry_errors": [], "ram": None}
+    try:
+        os.makedirs(cfg.home, exist_ok=True)
+        lock = open(os.path.join(cfg.home, "lock"), "w")
+    except OSError as e:
+        raise Fail("%s: não crio a pasta/lock (%s)" % (cfg.home, e))
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        rec["note"] = "outra-instancia"
+        return rec
+    # a escrita é conferida ANTES de qualquer efeito: item começado e estado que não grava = item que ninguém controla
+    probe = os.path.join(cfg.home, ".w.%d" % os.getpid())
+    try:
+        with open(probe, "w") as f:
+            f.write("x")
+        os.remove(probe)
+    except OSError as e:
+        raise Fail("%s: não consigo gravar (%s)" % (cfg.home, e))
+    st = load_state(cfg)
+    on = os.path.exists(os.path.join(cfg.home, "on"))
+    rec["mode"] = "ligado" if on else "desligado"
+    items, notes = [], []
+    try:
+        items, rec["registry_errors"] = load_registry(cfg)
+    except Unreadable as e:
+        notes.append("registro-ilegivel")
+        print("hetzner-ballast: %s" % e, file=sys.stderr)
+    ncpu = vec = mem = procs = None
+    run = {}
+    try:
+        ncpu, vec = read_stat(cfg.proc)
+        mem = read_mem_avail_mb(cfg.proc)
+        procs, _unf, run = current_runs(cfg)
+    except Unreadable as e:
+        notes.append("leitura-ilegivel")
+        procs = None
+        print("hetzner-ballast: %s" % e, file=sys.stderr)
+    rec["ncpu"], rec["mem_avail_mb"] = ncpu, mem
+    free_ok = False
+    if vec is not None:
+        free_ok = cpu_step(cfg, st, vec, ncpu, rec, notes)
+    rec["free_ticks"] = st["free_ticks"]
+    rec["running"] = sorted(r["item"] for r in run.values())
+    # começar itens: ligado, tudo lido, CPU livre por idle_ticks leituras seguidas, orçamento = núcleos livres - reserva
+    block = any(n.startswith(("leitura-ilegivel", "registro-ilegivel", "primeira-leitura", "lacuna")) for n in notes)
+    if on and procs is not None and not block and free_ok and mem is not None and st["free_ticks"] >= cfg.idle_ticks:
+        budget = int(ncpu - rec["fg_cores"] - cfg.reserve + 1e-9)
+        names = {r["item"] for r in run.values()}
+        used = running_cores(cfg, run)
+        for it in items:
+            if it["role"] != "work":
+                continue
+            ok, why = eligibility(cfg, it, st, names)
+            cores = it["cores"] if it["cores"] != "auto" else budget - used
+            if not ok or cores < 1 or used + cores > budget:
+                continue
+            if mem - it["rss_mb"] < cfg.ram_start_mb:
+                rec["skipped"].append({"item": it["name"], "why": "ram"})
+                rec["ram"] = "baixa"
+                continue
+            if len(run) + len(rec["started"]) >= cfg.max_items:
+                break
+            try:
+                rec["started"].append(start_item(cfg, it, cores))
+                used += cores
+            except Unreadable as e:
+                notes.append("nao-comecou:%s" % it["name"])
+                print("hetzner-ballast: %s" % e, file=sys.stderr)
+    rec["note"] = ",".join(notes)
+    save_json(os.path.join(cfg.home, "state.json"), st)
+    append_line(os.path.join(cfg.home, "ticks.jsonl"), rec)
+    return rec
+
+
+# ---- status -------------------------------------------------------------------------------------------------------------------------------------------
+def do_status(cfg):
+    out = {"home": cfg.home, "mode": "ligado" if os.path.exists(os.path.join(cfg.home, "on")) else "desligado", "items": [], "registry_errors": [], "running": [],
+           "launch_prefix": cfg.launch_prefix if cfg.launch_prefix is not None else default_prefix()}
+    st = fresh_state()
+    try:
+        with open(os.path.join(cfg.home, "state.json"), "rb") as f:
+            st = json.loads(f.read().decode("utf-8"))
+        if not isinstance(st.get("cooldown"), dict):
+            st = fresh_state()
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError):
+        pass   # status só LÊ: estado ausente/ilegível aparece como "sem cooldown", sem gravar nada
+    try:
+        items, out["registry_errors"] = load_registry(cfg)
+    except Unreadable as e:
+        out["registry_errors"] = ["registro ilegível: %s" % e]
+        items = []
+    try:
+        run = current_runs(cfg)[2]
+        out["running"] = sorted(r["item"] for r in run.values())
+    except Unreadable as e:
+        out["running"] = None
+        run = {}
+    names = {r["item"] for r in run.values()}
+    for it in items:
+        ok, why = eligibility(cfg, it, st, names)
+        out["items"].append({"name": it["name"], "role": it["role"], "cores": it["cores"], "eligible": ok, "why": why})
+    return out
+
+
+def main(argv):
+    try:
+        cfg = load_config(os.environ)
+    except (ValueError, json.JSONDecodeError) as e:
+        print("hetzner-ballast: configuração inválida: %s" % e, file=sys.stderr)
+        return 3
+    cmd = argv[0] if argv else ""
+    try:
+        if cmd == "tick":
+            print(json.dumps(do_tick(cfg)))
+            return 0
+        if cmd == "status":
+            print(json.dumps(do_status(cfg)))
+            return 0
+    except Fail as e:
+        print("hetzner-ballast: %s" % e, file=sys.stderr)
+        return e.rc
+    print("uso: hetzner-ballast.py tick | status", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
