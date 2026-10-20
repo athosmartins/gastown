@@ -1,0 +1,26 @@
+# hetzner-mac-only.ps.txt — arquivos de teste do PS (property_scrapers) que NÃO vão ao nó Linux (Hetzner): citam launchd/plist/osascript/caminho do mini. Um glob por linha; # comenta. (ga-2hd02v.4)
+#
+# Contents
+#   O que entra aqui · Como a lista é lida · Estado da semente (INFERIDA, não medida) · Como se mantém
+#
+# O QUE ENTRA AQUI: teste de PS que depende do macOS ou do layout do mini (launchd/plist de verdade, osascript, /Users/athos/..., ~/.property-scrapers). No Linux ele reprova (ou passa vazio) por causa do AMBIENTE.
+# COMO A LISTA É LIDA (scripts/ps-node-classify.py, mac_only_globs): o glob casa o caminho relativo ao repo. Bead que cita um teste daqui NÃO vai ao nó (so-no-mac:<caminho>). Lista ausente, ilegível ou
+#   SEM nenhum glob = "não sei o que fica no Mac" -> o classificador devolve unknown (nunca "nada é só-Mac"). Esta é a lista do PS; a do WA é hetzner-mac-only.txt e não vale aqui.
+# ESTADO DA SEMENTE: INFERIDA. Saiu de uma varredura de texto dos 97 arquivos de teste de main (20/10): os que contêm /Users/, osascript, launchctl, launchd, /opt/homebrew, .property-scrapers, keychain,
+#   plutil ou com.scrapers. NENHUM foi rodado no nó ainda. A 1ª rodada do pytest do PS no nó (passo "Prova" do runbook hetzner-ps-node.md) confirma ou derruba cada linha; o que passar no nó SAI daqui.
+# COMO SE MANTÉM: arquivo que reprova no nó e passa no mini entra (é o ambiente, não o código); arquivo que passa nos dois sai.
+
+tests/test_empreendimentos_late_sync_refresh.py
+tests/test_empreendimentos_refresh_native_schedule.py
+tests/test_empreendimentos_refresh_alerting.py
+tests/test_empreendimentos_refresh_freshness.py
+tests/test_scraper_auto_healer.py
+tests/test_watchdog_daily_freshness.py
+tests/test_watchdog_owner_consolidator_drift.py
+tests/test_blow_monthly_only.py
+tests/test_scraper_status_blow_probe.py
+tests/test_rodada_status_marker.py
+tests/test_backup_to_s3.py
+lib/tests/test_sync_processos_health.py
+lib/tests/test_runner_data_dir.py
+lib/tests/test_runner_same_day_recovery.py

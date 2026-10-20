@@ -1,0 +1,127 @@
+# hetzner-rsync-filter.ps.txt — o QUE do rig property_scrapers (PS) o nó Hetzner pode TER. Lido por scripts/ps-node-classify.py; mesmo formato do hetzner-rsync-filter.wa.txt. (ga-2hd02v.4)
+#
+# Contents
+#   Para que serve · O que garante · O que não garante · Seção 1 (nega sempre) · Seção 2 (tests/) · Seção 3 (fora de tests/: código e config listados)
+#
+# PARA QUE SERVE: o ps-worker-remote trabalha num worktree do ESPELHO git do rig (scripts/hetzner-mirror.sh, Seção 1 do filtro WA + .beads/ data/ logs/ + o que a varredura de conteúdo sinaliza); não há rsync
+#   de PS para o nó. Este arquivo existe para o CLASSIFICADOR: a bead só vai ao nó se todo arquivo que ela cita é um arquivo que o nó tem. Ele é DELIBERADAMENTE mais estreito que o espelho (lista branca:
+#   código, testes, doc em texto e a config listada), porque citar um arquivo que o nó não carrega é sinal de que a bead precisa de dado ou de host que não está lá.
+# A Seção 1 É CÓPIA DA DO WA, BYTE A BYTE: o selftest (ps-node-classify.selftest.sh) confere a igualdade; o filtro do espelho (hetzner-mirror.sh sparse_spec) lê a Seção 1 do arquivo WA, então mudar uma sem a outra
+#   abriria um buraco entre o que o espelho nega e o que o classificador acha que sai.
+# O QUE GARANTE (por NOME e PASTA): segredo e formato de dado conhecidos não saem; nome DESCONHECIDO não sai (a lista branca é a seção 3); `shared/`, `data/`, `logs/`, `crew/`, `.beads/` e a config de estado em tempo
+#   de execução (config/seen_properties.json) ficam de fora. Custo de negar demais: a bead fica no mini, como hoje.
+# O QUE NÃO GARANTE: o filtro nunca lê CONTEÚDO. Quem olha o conteúdo é a varredura do espelho (hetzner-mirror-scan.py: >=20 telefones ou >=3 CPFs) e o texto da bead (dado-no-texto, no classificador).
+# MEDIDO (20/10, árvore rastreada de main: 305 arquivos): códigos .py/.sh/.js são ~85%; os .json fora de tests/ e config/ são netimoveis/*.json (tabelas de bairros, não saem) e baselines de notebooks (464 KB, não saem).
+#
+# SEÇÃO 1 — NEGA SEMPRE, em qualquer pasta (inclusive tests/): credencial, formas de segredo e formato de dado.
+- .env
+- .env.*
+- *.pem
+- *.key
+- *.p12
+- *.pfx
+- *.crt
+- *.p8
+- *.jks
+- *.keystore
+- *.gpg
+- *.token
+- *.pickle
+- id_rsa*
+- id_ed25519*
+- *.kdbx
+- credentials*.json
+- client_secret*.json
+- cookies*.json
+- cookies*.txt
+- *.session
+- .netrc
+- .npmrc
+- .pypirc
+- .pgpass
+- .htpasswd
+- .git-credentials
+- .aws/
+- .ssh/
+- .gnupg/
+- auth/
+- auth-*/
+- auth_*/
+- auth.bak*/
+# dotfile com palavra de segredo no nome (.pdpj_token.txt, .token) e arquivo de dado/config com ela (token.txt, access_token.json, secrets.yaml, service_account.json).
+# Só a extensão que começa com j/y/t/i (json, yaml, yml, txt, ini...) é negada: processo_lookup/pdpj_token.py e tests/test_pdpj_token*.py são CÓDIGO que o nó precisa.
+- .*[Tt][Oo][Kk][Ee][Nn]*
+- *[Tt][Oo][Kk][Ee][Nn]*.[jyti]*
+- *[Ss][Ee][Cc][Rr][Ee][Tt]*.[jyti]*
+- *[Pp][Aa][Ss][Ss][Ww]*.[jyti]*
+- *[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll]*.[jyti]*
+- *[Aa][Pp][Ii][-_][Kk][Ee][Yy]*.[jyti]*
+- *[Ss][Ee][Rr][Vv][Ii][Cc][Ee][-_][Aa][Cc][Cc][Oo][Uu][Nn][Tt]*.[jyti]*
+- *[Pp][Rr][Ii][Vv][Aa][Tt][Ee][-_][Kk][Ee][Yy]*.[jyti]*
+- *[Tt][Oo][Kk][Ee][Nn]
+- *[Ss][Ee][Cc][Rr][Ee][Tt]
+- *.duckdb*
+- *.db
+- *.db-*
+- *.sqlite*
+- *.parquet
+- *.wal
+- *.gz
+- *.pkl
+- *.xlsx
+- *.csv
+- __pycache__
+- .pytest_cache
+# SEÇÃO 2 — tests/ e lib/tests/ vão inteiros (fixtures html/json são código de teste; segredo e formato de dado já saíram na seção 1).
++ /tests/***
++ /lib/tests/***
+# SEÇÃO 3 — fora de tests/: pastas que nunca saem, e DEPOIS a lista do que sai. O que não está na lista cai no `- *` do fim.
+- .git
+- .repo.git
+- .worktrees
+- .gc-worktrees
+- .claude
+- .codex
+- .gemini
+- .gc
+- .runtime
+- .beads
+- .pytest_cache
+- venv
+- .venv
+- venv-*
+- crew/
+- refinery/
+- polecats/
+- scratchpad/
+- witness/
+- worktrees/
+- node_modules
+- /shared/
+- /data
+- /data.*
+- /logs
+- /logs.*
+- data/
+# estado de execução do raspador (ids já vistos, última rodada): vive no repo por história, mas é dado de operação, não código
+- /config/seen_properties.json
+# 3a — código: sai em qualquer pasta que não foi negada acima. `+ */` deixa o rsync entrar nas pastas; imagem, pdf, binário, log e extensão desconhecida ficam de fora.
++ */
++ *.py
++ *.sh
++ *.js
++ *.mjs
++ *.cjs
++ *.ts
++ *.css
+# 3b — texto que o código lê ou que descreve o código, UM CAMINHO por linha (nunca por extensão solta).
++ /config/*.json
++ /scrapers/*/fixtures/**
++ /scrapers/blow/package.json
++ /requirements.txt
++ /CLAUDE.md
++ /README.md
++ /PROJECT_STRUCTURE.md
++ /docs/**.md
++ /launchd/*.plist
+- *
