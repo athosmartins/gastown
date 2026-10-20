@@ -34,7 +34,13 @@ O VEREDITO  (a primeira condição que falha decide; só `node` autoriza)
   pausa → MINI · config do provider ilegível → NÃO SEI · `real_sessions_released_by` ausente → MINI · config do atalho ilegível → NÃO SEI ·
   `gate_done_bin` nulo, relativo ou não executável → MINI (o atalho recusa caminho relativo; uma bead no nó sem como entregar ao gate encalha: ga-2hd02v.1.13) · sem nenhuma leitura, ou a última mais velha que
   `max_age_s` (ou carimbada mais de 60 s no futuro) → NÃO SEI · último ssh não conectou → MINI (nó fora) · leitura ilegível → NÃO SEI · vermelho → MINI (nó quente) · sessões do nó ilegíveis → NÃO SEI ·
-  sessões OCUPADAS >= min(degrau, cap do provider) → MINI (nó cheio) · senão NÓ.
+  sessões OCUPADAS >= min(degrau, cap do provider) → MINI (nó cheio) · login do Claude do nó medido ruim → MINI (claude_blocked) ·
+  gate do Claude que não soube dizer → NÃO SEI (claude_unknown) · senão NÓ.
+  O login do Claude do nó (ga-2hd02v.7) é perguntado AO VIVO, em paralelo com a medição do nó (o custo é o da maior das duas, não a soma), e a resposta só decide por último, depois da vaga: só `ok` do `hetzner-claude.py gate`
+  (saída 0 e a linha exata) autoriza; `blocked: logged-out|expired|quota` (saída 1) = MINI, com a linha do gate (e o horário em que a cota renova) no detalhe; o resto (comando que não
+  executa ou está mal configurado, prazo, saída fora de 0/1, linha estranha ou vazia, pergunta que levantou exceção, `blocked: unreachable|unknown`) = NÃO SEI, que NÃO é ok.
+  Esta ferramenta não grava nada por causa do Claude (nem pause.json, nem estado seu; o cache do gate é do `hetzner-claude.py`): quando o gate volta a ok o veredito seguinte volta a ser NÓ, sem ninguém tirar pausa, e a pausa do Mayor
+  (pause.json) segue só dele. Só o `verdict` pergunta (status, read, step, pause e resume não); a leitura do nó que o `verdict` faz continua sendo gravada como antes.
 
 SESSÃO OCUPADA × OCIOSA  (ga-2hd02v.1.22: o nó "cheio" de dogs parados)
   O nó lista as tmux vivas; uma sessão viva NÃO é uma sessão trabalhando. Uma dog-remote conta OCUPADA só se há uma bead `in_progress` atribuída ao alias dela
@@ -65,10 +71,10 @@ ARQUIVOS  (pasta de estado: $HETZNER_CAPACITY_DIR, senão <cidade>/.gc/hetzner-c
   Lê também: $GC_SSH_CONFIG ou <cidade>/.gc/session-ssh.json (host, cap, liberação) e $HETZNER_CAPACITY_SHIM_CONFIG ou ~/.gastown/remote-shim.json (gate_done_bin).
   Para os testes: HETZNER_CAPACITY_SSH_CMD e HETZNER_CAPACITY_LIST_CMD (lista JSON de argumentos) trocam o ssh e o list-running; HETZNER_CAPACITY_SESSIONS_CMD e
   HETZNER_CAPACITY_BEADS_CMD trocam o `gc session list --json` e o `bd list --status in_progress --json`; HETZNER_CAPACITY_READ_TIMEOUT_S ENCURTA o prazo dessas duas leituras
-  (25 s o gc, 15 s o bd; nunca alonga); HETZNER_CAPACITY_NOW (época) troca o relógio.
+  (25 s o gc, 15 s o bd; nunca alonga) e o do gate do Claude (30 s); HETZNER_CAPACITY_CLAUDE_CMD (lista JSON) troca o `hetzner-claude.py gate`; HETZNER_CAPACITY_NOW (época) troca o relógio.
 
 O QUE NÃO FAZ
-  Não abre sessão, não encerra sessão, não atribui bead (só LÊ gc e bd), não mexe em city.toml, agents/ nem session-ssh.json. O degrau é o teto de OPERAÇÃO; os tetos FIXOS (`cap` do host no provider
+  Não abre sessão, não encerra sessão, não atribui bead (só LÊ gc e bd e pergunta o login do Claude do nó ao `hetzner-claude.py gate`), não mexe em city.toml, agents/ nem session-ssh.json. O degrau é o teto de OPERAÇÃO; os tetos FIXOS (`cap` do host no provider
   e `max_active_sessions` do dog-remote) continuam sendo o limite duro, e o veredito usa o MENOR dos dois. Quem leva a bead ao nó (atribuir ao alias dog-remote-<n> e
   abrir a sessão) é outra fatia: aqui só se diz se pode.
 """
