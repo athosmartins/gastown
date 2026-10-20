@@ -61,9 +61,9 @@ PATH_RE = re.compile(r"(?<![\w/.\-~$])((?:/?[\w.\-]+/)*[\w\-]+(?:\.[\w\-]+)*\.(?
 HOME_RE = re.compile(r"(?<!\w)[~$][\w{}]*/(?:[\w.\-]+/)*[\w.\-]+\.(?:" + EXTS + r")(?![\w])", re.IGNORECASE)   # ~/x.json, $HOME/x.py: o nó não tem o home do Mac
 SAFE_SEG = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,80}$")
 TEST_RE = re.compile(r"(^|/)tests?/|(^|/)test_[^/]*\.py$|_test\.py$|\.selftest\.sh$")
-REPO_ABS_RE = re.compile(r"/Users/athos/gt/property_scrapers/(?:crew/[\w.\-]+/)?")   # o repo e o worktree de uma crew/worker (as beads de PS citam os dois); outro /Users/... continua host Mac
+REPO_ABS_RE = re.compile(r"/Users/athos/gt/property_scrapers/(?:crew/[\w\-][\w.\-]*/)?")   # o repo e o worktree de uma crew/worker (as beads de PS citam os dois); outro /Users/... continua host Mac
 CANARY_OK = "tests/test_zz_ps_node_canary.py"         # o filtro TEM de deixar sair
-CANARY_NO = ("data/zz_ps_node_canary.json", ".env", "credentials_zz.json")   # o filtro TEM de segurar
+CANARY_NO = ("data/zz_ps_node_canary.json", ".env", "credentials_zz.json", "zz_ps_node_canary.unlisted")   # o filtro TEM de segurar; o último é nome que NENHUMA regra lista: só o `- *` do fim o nega
 
 # palavras do texto (sem acento, minúsculas). slug -> regex. Larga de propósito (ver LIMITES).
 SOFT = (
@@ -162,9 +162,11 @@ def sent_by_filter(paths):
     # filtro ausente/ilegível -> Unreadable (sem o filtro não sei o que o nó tem)
     try:
         with open(FILTER, "r", encoding="utf-8") as fh:
-            if "- *" not in fh.read():
-                raise Unreadable("filtro-sem-negacao-final")
-    except OSError:
+            rules = [l.strip() for l in fh.read().splitlines() if l.strip() and not l.lstrip().startswith("#")]
+        # vazio (nenhuma regra) -> Unreadable; a ÚLTIMA regra tem de ser exatamente `- *` (o rsync usa a 1ª que casa: sem o catch-all no fim, o que não está listado SAI). "- *" como texto não basta: `- *.pem` o contém
+        if not rules or rules[-1] != "- *":
+            raise Unreadable("filtro-sem-negacao-final")
+    except (OSError, UnicodeError):
         raise Unreadable("filtro-ilegivel")
     root = tempfile.mkdtemp(prefix="ps-node-classify.")
     try:
@@ -212,7 +214,7 @@ def scraper_info(paths):
     if not names:
         return []
     allowed, blocked = set(), set()
-    # vazio (arquivo sem nenhum raspador liberado) -> todo raspador citado conta como fora do nó; falhou/ilegível -> `lista-de-raspadores-ilegivel` (só informa, a decisão não depende disto)
+    # vazio (arquivo sem nenhuma entrada) ou linha que não se lê -> `lista-de-raspadores-ilegivel`; falhou/ilegível (arquivo ausente) -> o mesmo (só informa, a decisão não depende disto)
     try:
         with open(ELIGIBLE, "r", encoding="utf-8") as fh:
             for line in fh:
@@ -224,12 +226,14 @@ def scraper_info(paths):
                 name, _, tenant = nm.partition(":")
                 name, tenant = name.strip(), tenant.strip()
                 if not re.fullmatch(r"[a-z0-9_\-]+", name):
-                    continue
+                    return ["lista-de-raspadores-ilegivel"]   # linha que não é `nome` nem `nome:tenant`: o cabeçalho da lista manda recusar a lista INTEIRA (um bloqueio que não casa liberaria em silêncio)
                 if neg and not tenant:
                     blocked.add(name)
                 elif not neg:
                     allowed.add(name)
     except (OSError, UnicodeError):
+        return ["lista-de-raspadores-ilegivel"]
+    if not allowed and not blocked:   # arquivo existe mas sem NENHUMA entrada (vazio, só comentário, truncado): não sei o que é liberado, e "nenhum liberado" seria um veredito
         return ["lista-de-raspadores-ilegivel"]
     return ["raspador-fora-do-no:" + n for n in names if n.lower() in blocked or n.lower() not in allowed]
 

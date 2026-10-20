@@ -62,13 +62,18 @@ expect "mini: telefone real no texto (duro)" "$(DESC 'lib/x.py tests/test_x.py c
 expect "mini: CPF dentro da metadata (duro)" "$(field "$GOOD" metadata '{"k":"123.456.789-09"}')" 10 'dado-no-texto'
 expect "node: teste em lib/tests/ conta como teste (o PS tem dois diretórios de teste)" "$(DESC 'lib/x.py e lib/tests/test_x.py')" 0 '"verdict": "node".*"tests": \["lib/tests/test_x.py"\]'
 expect "node: o worktree de crew/worker (absoluto) é normalizado para o relativo" "$(DESC 'ver /Users/athos/gt/property_scrapers/crew/worker-ps-qrun/lib/foo.py e /Users/athos/gt/property_scrapers/tests/test_foo.py')" 0 '"paths": \["lib/foo.py", "tests/test_foo.py"\]'
+expect "mini: crew/./ (segmento ponto) NÃO é prefixo de worktree: o caminho fica fora do formato" "$(DESC 'ver /Users/athos/gt/property_scrapers/crew/./lib/foo.py e tests/test_foo.py')" 10 'caminho-fora-do-formato'
 expect "mini: rede viva (proxy) citada sem etiqueta (mole)" "$(DESC 'lib/x.py troca o proxy; tests/test_x.py')" 10 'moles:rede-viva'
 expect "mini: rede viva ('na rodada real') citada sem etiqueta" "$(DESC 'lib/x.py; confirmar na rodada real; tests/test_x.py')" 10 'moles:rede-viva'
 expect "mini: launchd/plist citado sem etiqueta (host Mac)" "$(DESC 'lib/x.py recarrega o launchd; tests/test_x.py')" 10 'moles:host-mac'
 expect "mini: MotherDuck citado sem etiqueta (banco real)" "$(DESC 'lib/x.py grava no MotherDuck; tests/test_x.py')" 10 'moles:banco-de-dados'
 expect "mini: ~/.property-scrapers (dado real do mini) sem etiqueta" "$(DESC 'lib/x.py le ~/.property-scrapers/shared; tests/test_x.py')" 10 'moles:banco-de-dados'
 expect "node:ok ignora a rede viva e DIZ que ignorou" "$(labels "$(DESC 'lib/x.py troca o proxy; tests/test_x.py')" '["node:ok"]')" 0 'moles-ignoradas:rede-viva'
-expect "mini: teste da lista mac-only REAL do PS (auto-healer/launchd)" "$(DESC 'lib/x.py e tests/test_scraper_auto_healer.py')" 10 'so-no-mac:tests/test_scraper_auto_healer\.py'
+printf 'tests/test_scraper_auto_healer.py\n' > "$T/macs-ps-fixture.txt"; export PS_NODE_MAC_ONLY="$T/macs-ps-fixture.txt"
+expect "mini: teste da lista mac-only do PS (fixture: a semente real pode encolher sem quebrar este caso)" "$(DESC 'lib/x.py e tests/test_scraper_auto_healer.py')" 10 'so-no-mac:tests/test_scraper_auto_healer\.py'
+unset PS_NODE_MAC_ONLY
+# a lista REAL do PS lê (tem globs) e não é a de outro rig: um teste do PS que SEMPRE esteve nela segue valendo, sem fixar qual
+[ "$(grep -c '^[^#[:space:]]' "$HERE/hetzner-mac-only.ps.txt")" -ge 1 ] && ok "a semente mac-only real do PS tem ao menos um glob" || bad "a semente mac-only real do PS não tem nenhum glob"
 expect "mini: banco citado sem etiqueta (mole)" "$(DESC 'lib/x.py abre um sqlite; tests/test_x.py')" 10 'moles:banco-de-dados'
 expect "mini: credencial citada sem etiqueta" "$(DESC 'lib/x.py usa o token do pdpj; tests/test_x.py')" 10 'moles:credencial'
 expect "mini: host Mac citado sem etiqueta" "$(DESC 'lib/x.py roda osascript; tests/test_x.py')" 10 'moles:host-mac'
@@ -120,9 +125,18 @@ expect "mini: teste que só roda no Mac" "$(DESC 'lib/x.py e tests/test_launchd_
 expect "node: lista mac-only que não casa não atrapalha" "$GOOD" 0 '"verdict": "node"'
 unset PS_NODE_MAC_ONLY
 stub() { printf '#!/bin/sh\n%s\n' "$2" > "$T/$1"; chmod +x "$T/$1"; }
-printf '+ */\n+ *.py\n- *.pyc\n' > "$T/filtro-furado.txt"   # tem "- *" como TEXTO (passa a checagem de substring) mas não nega o resto: só o canário de segredo pega
+printf '+ */\n+ *.py\n+ *\n- *\n' > "$T/filtro-furado.txt"   # termina em "- *" (passa a checagem da última regra) mas um `+ *` antes deixa tudo sair: só o canário pega
 export PS_NODE_FILTER="$T/filtro-furado.txt"
-expect "unknown: filtro furado ('- *.pyc' não é a negação final) deixa sair canário de segredo" "$GOOD" 11 'canario-errado'
+expect "unknown: filtro furado ('+ *' antes do '- *' final) deixa sair canário de segredo" "$GOOD" 11 'canario-errado'
+unset PS_NODE_FILTER
+# o catch-all `- *` tem de ser a ÚLTIMA regra: "- *" como substring existe em `- *.pem` (Seção 1), então o filtro real SEM a última linha passava pela checagem de texto
+sed '$d' "$REAL_FILTER" > "$T/filtro-sem-ultima.txt"; tail -n 1 "$T/filtro-sem-ultima.txt" | grep -qvx -- '- \*' && ok "(controle) a cópia do filtro real sem a última linha não termina em '- *'" || bad "controle: a cópia ainda termina em '- *'"
+export PS_NODE_FILTER="$T/filtro-sem-ultima.txt"
+expect "unknown: filtro real SEM a última linha ('- *') -> filtro-sem-negacao-final" "$GOOD" 11 'filtro-sem-negacao-final'
+unset PS_NODE_FILTER
+{ cat "$REAL_FILTER" | sed '$d'; printf '+ *\n- *\n'; } > "$T/filtro-mais-tudo.txt"   # termina em '- *' mas um `+ *` antes deixa TUDO sair: só o canário de nome não listado pega
+export PS_NODE_FILTER="$T/filtro-mais-tudo.txt"
+expect "unknown: filtro que termina em '- *' mas deixa sair o que ninguém lista (+ * antes) -> canario-errado" "$GOOD" 11 'canario-errado'
 unset PS_NODE_FILTER
 # argv do rsync no classificador: $1=-a $2=-n $3=--out-format $4=--filter $5=<origem>/ $6=<destino>/ (o destino é SEMPRE vazio: quem "lista tudo" lista a origem, $5)
 stub rs-rc1 'exit 1'
@@ -151,6 +165,10 @@ if ! printf '%s' "$OUT" | grep -q 'raspador-fora-do-no'; then ok "info: valore:t
 expect "info: nenhum raspador citado -> nenhum slug de raspador" "$GOOD" 0 '"info": \[\]'
 export PS_NODE_ELIGIBLE="$T/nao-existe-elig.txt"
 expect "info: lista de liberados ilegível -> lista-de-raspadores-ilegivel (não digo que está liberado), e a decisão não muda" "$(DESC "$(printf "$SC" imoview)")" 0 '"verdict": "node".*lista-de-raspadores-ilegivel'
+printf '# so comentario\n' > "$T/elig-vazia.txt"; export PS_NODE_ELIGIBLE="$T/elig-vazia.txt"
+expect "info: lista de liberados SEM nenhuma entrada (vazia/truncada) -> lista-de-raspadores-ilegivel, não 'nenhum liberado'" "$(DESC "$(printf "$SC" imoview)")" 0 'lista-de-raspadores-ilegivel'
+printf 'imoview\n!alpha beta\n' > "$T/elig-ruim.txt"; export PS_NODE_ELIGIBLE="$T/elig-ruim.txt"
+expect "info: linha que não é nome nem nome:tenant -> a lista INTEIRA é ilegível (um bloqueio que não casa liberaria em silêncio)" "$(DESC "$(printf "$SC" imoview)")" 0 'lista-de-raspadores-ilegivel'
 unset PS_NODE_ELIGIBLE
 # a Seção 1 do filtro do PS é a do WA (o espelho git lê a do WA: se divergirem, o classificador acha que sai o que o espelho nega, ou o contrário)
 if diff <(sed -n '/^# SEÇÃO 1/,/^# SEÇÃO 2/p' "$HERE/hetzner-rsync-filter.wa.txt" | sed '$d') <(sed -n '/^# SEÇÃO 1/,/^# SEÇÃO 2/p' "$REAL_FILTER" | sed '$d') >/dev/null; then ok "Seção 1 do filtro do PS igual à do WA (byte a byte)"; else bad "Seção 1 do filtro do PS DIVERGE da do WA"; fi
@@ -235,9 +253,14 @@ mutant sem-sqlite3       '|db|sqlite3?|xlsx|'                          '|db|sqli
 mutant sem-rede-viva     'proxy|proxies|'                              ''                                       "$(DESC 'lib/x.py troca o proxy; tests/test_x.py')" 10 'moles:rede-viva'
 mutant sem-launchd       '\blaunchd\b|'                           ''                                       "$(DESC 'lib/x.py recarrega o launchd; tests/test_x.py')" 10 'moles:host-mac'
 mutant sem-motherduck    '|motherduck'                                 ''                                       "$(DESC 'lib/x.py grava no MotherDuck; tests/test_x.py')" 10 'moles:banco-de-dados'
-mutant worktree-nao-normaliza '(?:crew/[\w.\-]+/)?'                    ''                                       "$(DESC 'ver /Users/athos/gt/property_scrapers/crew/worker-ps-qrun/lib/foo.py e /Users/athos/gt/property_scrapers/tests/test_foo.py')" 0 '"paths": \["lib/foo.py", "tests/test_foo.py"\]'
+mutant worktree-nao-normaliza '(?:crew/[\w\-][\w.\-]*/)?'                    ''                                       "$(DESC 'ver /Users/athos/gt/property_scrapers/crew/worker-ps-qrun/lib/foo.py e /Users/athos/gt/property_scrapers/tests/test_foo.py')" 0 '"paths": \["lib/foo.py", "tests/test_foo.py"\]'
 mutant info-raspador-mudo 'return ["raspador-fora-do-no:" + n for n in names if n.lower() in blocked or n.lower() not in allowed]' 'return []' "$(DESC "$(printf "$SC" loft)")" 0 'raspador-fora-do-no:loft' "PS_NODE_ELIGIBLE=$T/elig.txt"
-mutant info-lista-ilegivel-vira-liberado 'return ["lista-de-raspadores-ilegivel"]' 'return []' "$(DESC "$(printf "$SC" imoview)")" 0 'lista-de-raspadores-ilegivel' "PS_NODE_ELIGIBLE=$T/nao-existe-elig.txt"
+mutant info-lista-ilegivel-vira-liberado $'    except (OSError, UnicodeError):\n        return ["lista-de-raspadores-ilegivel"]' $'    except (OSError, UnicodeError):\n        return []' "$(DESC "$(printf "$SC" imoview)")" 0 'lista-de-raspadores-ilegivel' "PS_NODE_ELIGIBLE=$T/nao-existe-elig.txt"
+mutant filtro-so-substring 'if not rules or rules[-1] != "- *":' 'if "- *" not in "\n".join(rules):' "$GOOD" 11 'filtro-sem-negacao-final' "PS_NODE_FILTER=$T/filtro-sem-ultima.txt"
+mutant sem-canario-nao-listado ', "zz_ps_node_canary.unlisted")' ')' "$GOOD" 11 'canario-errado' "PS_NODE_FILTER=$T/filtro-mais-tudo.txt"
+mutant crew-aceita-ponto  '(?:crew/[\w\-][\w.\-]*/)?' '(?:crew/[\w.\-]+/)?' "$(DESC 'ver /Users/athos/gt/property_scrapers/crew/./lib/foo.py e tests/test_foo.py')" 10 'caminho-fora-do-formato'
+mutant lista-vazia-vale-nenhum 'if not allowed and not blocked:' 'if False:' "$(DESC "$(printf "$SC" imoview)")" 0 'lista-de-raspadores-ilegivel' "PS_NODE_ELIGIBLE=$T/elig-vazia.txt"
+mutant linha-ruim-e-pulada 'return ["lista-de-raspadores-ilegivel"]   # linha que não é' 'continue   # linha que não é' "$(DESC "$(printf "$SC" imoview)")" 0 'lista-de-raspadores-ilegivel' "PS_NODE_ELIGIBLE=$T/elig-ruim.txt"
 mutant sem-home          'if HOME_RE.search(text):'                    'if False:'                              "$(DESC 'lib/x.py tests/test_x.py e ~/segredos/chave.json')" 10 'caminho-fora-do-formato'
 mutant mac-vazio-vale    'if not globs:'                               'if False:'                              "$GOOD" 11 'mac-only-vazio' "PS_NODE_MAC_ONLY=$T/macs-vazio.txt"
 # o resíduo no TMPDIR: o mutante que não apaga a árvore tem de deixar item para trás (senão o teste de "sem resíduo" passaria mesmo sem a limpeza)
