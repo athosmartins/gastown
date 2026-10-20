@@ -2,7 +2,7 @@
 
 ## Contents
 
-• O que esta fatia é — e o que não é · Estado: o que está vivo · Como usar (comandos) · Os degraus e os limites (e por quê) · O veredito · Sessão ocupada × sessão viva (ga-2hd02v.1.22) · Como ligar a sombra do Pilot · Como ler a sombra · Ligar e desligar o nó primeiro (`on`) · Subir os tetos fixos · O que falta para o "nó primeiro" de verdade · Medido, inferido, não testado · Limites
+• O que esta fatia é — e o que não é · Estado: o que está vivo · Como usar (comandos) · Os degraus e os limites (e por quê) · Encher o nó: relógio próprio, CPU e carga externa (ga-2hd02v.2) · O veredito · Sessão ocupada × sessão viva (ga-2hd02v.1.22) · Como ligar a sombra do Pilot · Como ler a sombra · Ligar e desligar o nó primeiro (`on`) · Subir os tetos fixos · O que falta para o "nó primeiro" de verdade · Medido, inferido, não testado · Limites
 
 Bead ga-2hd02v.1.11 (fatia da ga-2hd02v.1; objetivo do Athos: o mini para de entrar em swap, o Hetzner pago trabalha 24/7). **Entrega duas peças, em duas fatias** (a ga-2hd02v.1.11 foi recusada 3x pelo teto de tamanho do gate): (1) `scripts/hetzner-capacity.py` — fatia A, ga-5yp4n1, **tem que estar no main antes desta** — que mede o nó e responde "quantas sessões ele aguenta agora" (um teto que sobe em degraus 1→3→6→10 só com evidência, e desce sozinho) e "esta bead vai ao nó ou fica no mini" (`verdict`); (2) o **modo sombra** do Pilot (`PILOT_NODE_FIRST=shadow`) — fatia B, ga-elvr8e, esta —, que consulta o veredito para cada bead de dog do HQ e **registra** o que faria, sem mudar o despacho.
 
@@ -25,7 +25,8 @@ Tudo em `scripts/hetzner-capacity.py` (Python 3.9+, `python3 -I`). `--json` e `-
 | `status` | degrau, desde quando, últimas leituras, **o que falta para subir**, `cap` do provider, pausa | só lê (sem ssh, sem gravar) |
 | `read` | uma medição avulsa do nó | só lê; exit 0 lida, 1 não consegui |
 | `verdict` | mede se a última leitura tem mais de `refresh_s` (60 s), avalia os degraus, dá o veredito | grava estado e leitura; exit **0 = NÓ, 1 = MINI, 2 = NÃO SEI** |
-| `step` | o mesmo ciclo sem o veredito (para um agendador) | grava |
+| `step` | o mesmo ciclo sem o veredito. É o que o job `com.gascity.hetzner-capacity-step` roda a cada 180 s (ga-2hd02v.2) | grava |
+| `hourly [--hours N] [--min-pct P]` | CPU **ocupada** (100 − ocioso) média por hora cheia UTC das últimas N horas completas (24; 85 %): a prova ao vivo da meta de encher o nó | só lê `readings.jsonl`; exit 0 = toda hora com leitura e ≥ P, **1 = alguma hora abaixo ou SEM leitura** (hora sem leitura não prova nada), 3 = não li o arquivo |
 | `set-ceiling N --reason T` | força um degrau da lista, registrado em `events.jsonl` | grava |
 | `pause --reason T` / `resume` | trava / destrava o envio ao nó **na hora** (próximo veredito) | grava `pause.json` |
 
@@ -36,13 +37,29 @@ Estado em `<cidade>/.gc/hetzner-capacity/` (`state.json`, `readings.jsonl` com t
 | regra | valor padrão | por quê |
 |---|---|---|
 | CPU livre | o **menor** entre o ocioso de uma amostra de 2 s do `/proc/stat` e `1 − load5/núcleos` | rajada curta e carga sustentada contam as duas; o nó divide a CPU com as baterias do `mbp-run.sh` |
-| sobe um degrau | janela de 1800 s desde a última mudança, ≥ 6 leituras, **todas** verdes (CPU livre ≥ 35 % e RAM ≥ 40 %), e em alguma o nó já tinha ≥ degrau sessões **ocupadas**, lidas com gc e bd sem falha | nunca pula; a prova de carga evita subir só porque o nó está ocioso por falta de demanda (`require_load_proof=false` dispensa) |
-| desce um degrau | 2 leituras seguidas **vermelhas** (CPU livre < 10 % ou RAM < 20 %), **posteriores** à última mudança | o nó **não tem swap**: RAM acabando mata sessão, então pesa tanto quanto a CPU; a evidência não vale duas vezes (sem cascata 10→6→3→1 com as mesmas leituras) |
+| sobe um degrau | janela de 480 s desde a última mudança, ≥ 3 leituras, **todas** verdes (CPU livre ≥ 10 % e RAM ≥ 40 %; era 1800 s, 6 leituras e 35 %), e em alguma o nó já tinha ≥ degrau sessões **ocupadas**, lidas com gc e bd sem falha | nunca pula; a prova de carga evita subir só porque o nó está ocioso por falta de demanda (`require_load_proof=false` dispensa) |
+| desce um degrau | 2 leituras seguidas com a **RAM** < 20 %, **posteriores** à última mudança. A CPU cheia **não** desce (ga-2hd02v.2; `cpu_lowers_ceiling=true` devolve a regra antiga: CPU livre < 3 % também desce) | o nó **não tem swap**: RAM acabando mata sessão, então a RAM é o limite duro; a evidência não vale duas vezes (sem cascata 10→6→3→1 com as mesmas leituras) |
 | faixa entre os limites | âmbar: mantém o degrau, ainda autoriza | sem faixa o degrau oscilaria; a config recusa limites iguais |
 | leitura que falhou | cor `unknown`: não é verde, não é vermelha | atrasa a subida, nunca a adianta; não desce por falta de leitura |
 | leitura velha | > 900 s não autoriza | `max_age_s` tem que ser maior que `refresh_s` (a config recusa o contrário) |
 
 Os números são **padrões de partida**, não verdades: o runbook não mediu 6 ou 10 sessões reais. Ajuste em `config.json` (chave desconhecida ou valor inválido é erro, não "usa o padrão") depois de olhar `readings.jsonl`.
+
+## Encher o nó: relógio próprio, CPU e carga externa (ga-2hd02v.2)
+
+Decisão do Athos (20/10, resposta ao AskUserQuestion do Mayor, verbatim): *"se está 100% ocupado a gente fica feliz. o que nao pode é ficar menos do que 100% ocupado"* — quem ocupa o nó (o Traço BIM dele ou os builders da cidade) não importa. Medido nesse dia (média de CPU por hora, `.gc/hetzner-occupancy.jsonl`): 0–15 % entre 00h e 06h, 75–90 % de 07h a 11h, 40–62 % de 12h a 15h, com a cidade presa em 1 vaga. Três causas, três mudanças:
+
+| causa | mudança | onde |
+|---|---|---|
+| a leitura só era feita quando o Pilot pedia o veredito (varredura de 25–40 min, ~2 leituras por janela): o degrau nunca subia | job `com.gascity.hetzner-capacity-step` roda `hetzner-capacity.py step` a cada **180 s**; a janela vira 480 s com 3 leituras (a escada 1→3→6→10 sobe em ~27 min com carga, não em horas) | `scripts/com.gascity.hetzner-capacity-step.plist`, `DEFAULTS` |
+| subia só com 35 % de CPU **livre**: a cidade nunca levava o nó acima de ~65 % | verde = sobra para mais uma sessão: CPU livre ≥ **10 %** (~1,6 núcleo dos 16) | `cpu_up_headroom_pct` |
+| 2 leituras vermelhas por CPU derrubavam o degrau, e a CPU podia ser do Traço BIM | o degrau só desce por **RAM**. A CPU < 3 % livre ainda faz o veredito do momento ser `node_hot` (a bead nova vai ao mini enquanto durar), mas o degrau fica: na leitura seguinte à saída da carga (≤ 3 min) o veredito volta a `node` com as vagas todas | `lowers_ceiling()`, `cpu_down_headroom_pct` = 3 |
+
+O que **não** mudou: a prova de carga (o degrau só sobe se o nó já teve ≥ degrau sessões ocupadas, lidas com gc e bd), subir um degrau por vez, a RAM como limite duro (20 % desce, 40 % sobe), o cap do provider e o `max_active_sessions`. O que isto **não** faz: não distingue quem usa a CPU (sessão da cidade × externo) e não cria trabalho elegível ao nó — a madrugada parada (00h–07h, degrau 3) era falta de bead elegível, outra frente (as fatias ga-2hd02v.4.x).
+
+**Instalar (Mayor, depois do merge):** copiar o plist para `~/Library/LaunchAgents/`, `launchctl bootstrap gui/$(id -u) <plist>`, e conferir em 3 ciclos (~9 min): `.gc/logs/hetzner-capacity-step.out` ganha uma linha `degrau N — …` por ciclo, e `python3 -I scripts/hetzner-capacity.py status` mostra `reads` subindo de 3 em 3 minutos. A linha da política do Dolt (`wait-for-dolt.policy.tsv`) já está no repo (`isento`: sem o Dolt a leitura de sessões conta o nó cheio, nunca vazio, e a de CPU/RAM segue valendo); registrar o job no `daemon-presence-watchdog.sh` (limite de 3× o ciclo = 540 s, o `.out` ganha uma linha por ciclo) é do Mayor, depois de instalado. **Retirar:** `launchctl bootout gui/$(id -u)/com.gascity.hetzner-capacity-step`; o degrau fica onde está e volta a só mexer quando o Pilot pede veredito.
+
+**Prova ao vivo (um dia sem o Athos usando o nó):** `python3 -I scripts/hetzner-capacity.py hourly --hours 24` — exit 0 e todas as horas ≥ 85 % de CPU ocupada. Hora sem leitura (job parado, nó fora) sai como `SEM LEITURA` e exit 1: não conta como ocupada nem como livre. **Não foi medido aqui**: o mini é do Mayor e o job só existe depois do merge e da instalação; a bateria prova a política com um nó de mentira (`g_fill`, `g_hourly`) e o plist, não o nó vivo. Se, com o degrau em 10 e a CPU a menos de 85 %, a fila de beads elegíveis ao nó estiver vazia, o gargalo é oferta de trabalho, não capacidade.
 
 ## O veredito
 
@@ -167,7 +184,7 @@ O degrau é o teto de **operação**; o limite duro são dois números fixos que
 ## Medido, inferido, não testado
 
 **Medido (19/10, 03:5x −03, contra o nó vivo, só leitura):** `read` devolveu CPU livre 64,9–65,0 %, RAM disponível 93,8–94,3 %, 16 núcleos, 1 sessão (o `dog-remote-1`); `vmstat 2 2` e `free -m` no próprio nó deram RAM 93,8 % e ocioso instantâneo 74 %, coerentes (o número do script é o mais conservador por desenho). O nó **não tem swap** (`SwapTotal 0`). Bateria `scripts/hetzner-capacity.selftest.sh` no nó (`mbp-run.sh --repo hq`): 68 s, contra 5 min 39 s no mini sob load 60–70; os mutantes da bateria reprovam todos.
-**Inferido:** os limiares de CPU e RAM (35/10 % e 40/20 %) e a janela de 30 min; que uma sessão `claude` ociosa pesa pouco na CPU do nó.
+**Inferido:** os limiares de CPU e RAM (CPU 10/3 % desde a ga-2hd02v.2, antes 35/10 %; RAM 40/20 %) e a janela de 480 s (antes 30 min); que uma sessão `claude` ociosa pesa pouco na CPU do nó.
 **Não testado:** `PILOT_NODE_FIRST=on` no Pilot vivo (a ga-2hd02v.1.14 foi provada com a bateria `pilot-dispatcher.node-dispatch.selftest.sh` e seus mutantes, sem `gc` nem `bd` reais); a isenção do priority yield (ga-2hd02v.1.19) com uma P0 do WA presa em pool cheio no Pilot vivo (só stubs: `pilot-dispatcher.node-yield.selftest.sh`); a passada só-nó do disk floor (ga-2hd02v.1.20, e a bead de WA que ela leva desde a ga-8okir7) numa varredura viva com o disco do mini abaixo do piso (só as regiões extraídas do dispatcher e o helper com oráculo falso, `pilot-dispatcher.disk-floor-node-only.selftest.sh`: nenhuma varredura inteira com `bd` falso); uma sessão real com carga de build no nó; o custo do `verdict` dentro de uma varredura real do Pilot sob load 60+; `PILOT_NODE_FIRST=shadow` no Pilot vivo; os degraus 6 e 10.
 
 ## Limites
