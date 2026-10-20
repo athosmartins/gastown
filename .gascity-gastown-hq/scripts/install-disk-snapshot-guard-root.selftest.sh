@@ -415,8 +415,16 @@ c_launchd_unreadable() {
   expect_rc 3 "saída sem bloco arguments vira rc 3, não 0"
 }
 
+c_euid_env() {
+  echo "== EUID vindo do ambiente"
+  # o bash aceita EUID importado; o instalador decide pelo `id -u`, então EUID=0 vindo de fora não desliga os ganchos de quem não é root
+  new_world; EXTRA_ENV="EUID=0" run_inst
+  expect_rc 0 "com EUID=0 no ambiente a instalação segue pelos ganchos (o uid vem do id -u)"
+}
+
 suite_core() {
   c_happy
+  c_euid_env
   c_pin_required
   c_staging_private
   c_not_root
@@ -483,7 +491,8 @@ if [ "$SKIP_MUT" = "0" ]; then
   mutant "escrita-de-grupo-ignorada" '[ "${1:5:1}" = "w" ] || [ "${1:8:1}" = "w" ]' 'false'
   mutant "sem-volta-do-plist" 'if restore_original; then' 'if false; then'
   mutant "launchd-nao-conferido" 'if [ "$LD_ARGS" = "$want_args" ]; then' 'if true; then'
-  mutant "sem-checagem-de-root" 'if [ "$EUID" != "$ROOT_UID" ]; then' 'if false; then'
+  mutant "sem-checagem-de-root" 'if [ "$MY_UID" != "$ROOT_UID" ]; then' 'if false; then'
+  mutant "uid-do-ambiente" 'MY_UID=$(/usr/bin/id -u 2>/dev/null) || MY_UID=""' 'MY_UID="${EUID:-}"'
 fi
 
 echo
