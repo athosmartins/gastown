@@ -20,8 +20,10 @@ SUBCOMANDOS
                             que foi varrido, arquivo que não é comum (FIFO...), ilegível e raiz sem nenhum arquivo lido saem 3, nunca "limpo".
 
 ESTADO E GUARDA
-  <estado>/hetzner-claude.state.json: {state, reason, checked_at, probe, login, known}; probe = a última chamada de modelo {state, reason, at};
-  known = o último estado MEDIDO (ok/logged-out/expired/quota), que "não consegui saber" não apaga. state ∈ ok | logged-out | expired | quota |
+  <estado>/hetzner-claude.state.json: {state, reason, checked_at, probe, login, known, reset_at}; probe = a última chamada de modelo {state, reason, at[, reset_at]};
+  known = o último estado MEDIDO (ok/logged-out/expired/quota), que "não consegui saber" não apaga. `quota` inclui o limite SEMANAL e o de 5 h
+  ("You've hit your weekly limit · resets Oct 22, 4pm (UTC)", texto MEDIDO em 20/10, ga-2hd02v.7): quando o texto traz o fuso, o horário em que renova vira
+  `reset_at` (época) e o `gate` o imprime; passado esse horário a chamada de modelo é repetida na hora, sem esperar os 15 min de retry. state ∈ ok | logged-out | expired | quota |
   unreachable | unknown. TRÊS respostas, não duas: "não consegui saber" (ssh fora, JSON ilegível, tipo errado) é `unreachable` ou
   `unknown`, e o gate trata como bloqueado. `ok` exige `claude auth status` com loggedIn == true E uma chamada de modelo real
   (haiku, 1 turno) com is_error == false e saída 0: a medição de 14/10 mostrou que um servidor DESLOGADO responde subtype "success"
@@ -56,6 +58,8 @@ import subprocess
 import sys
 import time
 import urllib.request
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 BUILDER = os.environ.get("HETZNER_BUILDER") or os.path.join(HERE, "remote-bundle-build.py")
@@ -120,7 +124,13 @@ PROBE_CMD = (REMOTE_PATH + f'd={shlex.quote(RHOME)}/gt-remote/probe; mkdir -p "$
              'timeout 90 claude -p "Responda apenas: OK" --model haiku --output-format json --no-session-persistence '
              '--setting-sources local </dev/null')
 EXPIRED_RE = re.compile(r"not logged in|/login|log in|expired|invalid.{0,20}(token|credential)|unauthori[sz]ed|authentication|\b401\b", re.I)
-QUOTA_RE = re.compile(r"usage limit|limit reached|rate.?limit|quota|too many requests|\b429\b|credit balance|out of (extra )?usage", re.I)
+# "hit your … limit" é o texto MEDIDO do limite (20/10: "You've hit your weekly limit · resets Oct 22, 4pm (UTC)"; o mini mede "session limit"); sem ele o gate dizia `unknown`
+QUOTA_RE = re.compile(r"usage limit|limit reached|rate.?limit|quota|too many requests|\b429\b|credit balance|out of (extra )?usage"
+                      r"|hit your\b.{0,40}\blimit\b|\b(?:weekly|5-hour|five-hour|session) limit\b", re.I)
+# "resets Oct 22, 4pm (UTC)" · "resets Jun 12 at 8pm (America/Sao_Paulo)" · "resets 1:00pm (America/Sao_Paulo)": o fuso entre parênteses é parte do texto, sem ele não há horário
+RESET_RE = re.compile(r"\bresets\s+(?:(?P<mon>[A-Za-z]{3})[A-Za-z]*\.?\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?\s*(?:,|\bat\b)?\s*)?"
+                      r"(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<ap>[ap])m\b\s*\((?P<tz>[A-Za-z][A-Za-z0-9_+/-]{0,39})\)", re.I)
+MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
 TOKEN_RES = (re.compile(rb"sk-ant-[A-Za-z0-9_-]{16,}"), re.compile(rb'"(?:access|refresh)Token"\s*:\s*"[A-Za-z0-9._-]{16,}"'),
              re.compile(rb"claudeAiOauth"))
 
@@ -199,6 +209,47 @@ def classify_probe(rc, out: str):
     return "unknown", f"erro de modelo não reconhecido: {txt}"
 
 
+def parse_reset(text: str, now: float):
+    """Época do horário em que o limite renova, lida do texto do claude ("resets Oct 22, 4pm (UTC)"), ou None quando o texto não deixa saber."""
+    # vazio → o texto não tem "resets <hora> (<fuso>)": None; falhou/ilegível → fuso que não é zona, data impossível, hora fora de 1-12, mês que não é mês: None, nunca um horário chutado
+    m = RESET_RE.search(text)
+    if not m:
+        return None
+    try:
+        tz = timezone.utc if m["tz"].upper() in ("UTC", "GMT") else ZoneInfo(m["tz"])
+        hour, minute = int(m["h"]), int(m["m"] or 0)
+        if not 1 <= hour <= 12 or minute > 59:
+            return None
+        hour = hour % 12 + (12 if m["ap"].lower() == "p" else 0)
+        ref = datetime.fromtimestamp(now, tz)
+        if m["mon"]:
+            at = datetime(ref.year, MONTHS.index(m["mon"].lower()) + 1, int(m["day"]), hour, minute, tzinfo=tz)
+            if at < ref - timedelta(days=1):  # "Jan 3" lido em dezembro é o ano que vem
+                at = at.replace(year=ref.year + 1)
+        else:
+            at = ref.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if at <= ref:  # só a hora e ela já passou hoje: é a de amanhã
+                at += timedelta(days=1)
+        return int(at.timestamp())
+    except (ValueError, KeyError, OSError, OverflowError):  # ZoneInfoNotFoundError é KeyError; "../x" é ValueError; MONTHS.index falha com ValueError
+        return None
+
+
+def reset_due(pr, now: float) -> bool:
+    """A última chamada foi `quota` com horário de renovação e esse horário já passou: não vale esperar a janela de retry."""
+    # vazio → sem reset_at (ou a chamada não foi quota): False, vale a janela de PROBE_RETRY; falhou/ilegível → reset_at que não é número: False também (um valor torto não faz medir em laço)
+    ra = pr.get("reset_at") if pr and pr["state"] == "quota" else None
+    return isinstance(ra, (int, float)) and not isinstance(ra, bool) and now >= ra
+
+
+def iso(ts) -> str:
+    """AAAA-MM-DDTHH:MM:SSZ de uma época, ou "" se não for número / não couber (estado editado à mão)."""
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)) if isinstance(ts, (int, float)) and not isinstance(ts, bool) else ""
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
 def probe(cmd: str = PROBE_CMD):
     r = ssh(cmd, PROBE_TIMEOUT)
     if r.conn_failed:
@@ -261,14 +312,18 @@ def refresh(prev, force_probe: bool = False) -> dict:
             pr = None
     else:
         window = PROBE_OK_TTL if pr and pr["state"] == "ok" else PROBE_RETRY
-        if force_probe or pr is None or not 0 <= now - pr["at"] < window:
+        if force_probe or pr is None or reset_due(pr, now) or not 0 <= now - pr["at"] < window:
             ps, pw = probe()
             if ps != "unreachable":  # sem resposta não é veredito: o registro da última chamada que respondeu fica como está
                 pr = {"state": ps, "reason": pw, "at": now}
+                ra = parse_reset(pw, now) if ps == "quota" else None
+                if ra is not None:
+                    pr["reset_at"] = ra
             state, reason = (ps, pw) if ps == "unreachable" else (pr["state"], pr["reason"])
         else:
             state, reason = pr["state"], pr["reason"]
-    return {"state": state, "reason": reason, "checked_at": now, "probe": pr, "login": login, "known": state if state in KNOWN else last_known(prev)}
+    return {"state": state, "reason": reason, "checked_at": now, "probe": pr, "login": login, "known": state if state in KNOWN else last_known(prev),
+            "reset_at": pr.get("reset_at") if pr and state == "quota" else None}
 
 
 def last_known(prev):
@@ -339,7 +394,8 @@ def cmd_gate(a) -> int:
     if st["state"] == "ok":
         print("ok")
         return 0
-    print(f"blocked: {st['state']}: {st['reason']}")
+    back = iso(st.get("reset_at")) if st["state"] == "quota" else ""
+    print(f"blocked: {st['state']}: {st['reason']}" + (f" (renova em {back})" if back else ""))
     return 1
 
 
