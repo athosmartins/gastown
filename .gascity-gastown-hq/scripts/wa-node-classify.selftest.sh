@@ -22,6 +22,7 @@ fails=0; n=0
 ok()  { n=$((n+1)); echo "ok   $1"; }
 bad() { n=$((n+1)); echo "FAIL $1"; fails=$((fails+1)); }
 PY=${WA_NODE_SELFTEST_PY:-python3}
+export WA_NODE_MIRROR="$T/espelho-ausente"   # os casos antigos valem SEM espelho (cai no filtro do rsync); o espelho entra só nos casos da seção "espelho git", com um stub
 
 CLS="$CLS_REAL"; OUT=""; RC=0
 run() { OUT=$(printf '%s' "$1" | "$PY" -I "$CLS" 2>/dev/null); RC=$?; }
@@ -52,7 +53,7 @@ expect "mini: epic" "$(field "$GOOD" issue_type '"epic"')" 10 '"reasons": \["epi
 expect "mini: banco .db citado (o filtro segura)" "$WITHDB" 10 'caminho-fora-do-filtro:queue\.db'
 expect "mini: pasta data/ citada (o filtro segura mesmo sendo .py)" "$(DESC 'lib/x.py usa data/helper.py; tests/test_x.py')" 10 'caminho-fora-do-filtro:data/helper\.py'
 expect "mini: credentials*.json citado" "$(DESC 'lib/x.py lê config/credentials_prod.json; tests/test_x.py')" 10 'caminho-fora-do-filtro:config/credentials_prod\.json'
-expect "mini: doc .md fora do filtro" "$(DESC 'lib/x.py conforme docs/guia.md; tests/test_x.py')" 10 'caminho-fora-do-filtro:docs/guia\.md'
+expect "mini: doc .md fora do filtro, SEM espelho legível (cai no filtro do rsync e diz por quê)" "$(DESC 'lib/x.py conforme docs/guia.md; tests/test_x.py')" 10 'caminho-fora-do-filtro:docs/guia\.md.*espelho-ilegivel:espelho-sem-resposta'
 expect "mini: telefone real no texto (duro)" "$(DESC 'lib/x.py tests/test_x.py cliente (31) 98876-5432')" 10 '"reasons": \["dado-no-texto"\]'
 expect "mini: CPF dentro da metadata (duro)" "$(field "$GOOD" metadata '{"k":"123.456.789-09"}')" 10 'dado-no-texto'
 expect "mini: banco citado sem etiqueta (mole)" "$(DESC 'lib/x.py abre um sqlite; tests/test_x.py')" 10 'moles:banco-de-dados'
@@ -125,6 +126,71 @@ export WA_NODE_RSYNC="$T/rs-pendura" WA_NODE_RSYNC_TIMEOUT=1; expect "unknown: r
 unset WA_NODE_RSYNC WA_NODE_RSYNC_TIMEOUT
 export WA_NODE_RSYNC_TIMEOUT=abc; expect "prazo do rsync ilegível volta ao padrão (30) e não derruba" "$GOOD" 0 '"verdict": "node"'; unset WA_NODE_RSYNC_TIMEOUT
 
+
+# ---- espelho git (ga-2hd02v.3): .md que o rsync não lista mas o espelho entrega (docs/, DESIGN.md...) deixa de ser "fora do filtro"; só com o espelho legível E a varredura de conteúdo, senão volta ao filtro do rsync
+# spec = Seção 1 do filtro real + pastas de dado (o `sparse` sem rig) + um caminho que a varredura de CONTEÚDO sinalizou (docs/sinalizado.md); o espelho de verdade serve o mesmo formato em `spec-out <rig>`
+HETZNER_MIRROR_FILTER="$REAL_FILTER" bash "$HERE/hetzner-mirror.sh" sparse > "$T/spec.txt" 2>/dev/null; echo '!/docs/sinalizado.md' >> "$T/spec.txt"
+[ "$(wc -l < "$T/spec.txt")" -gt 25 ] && ok "spec de teste gerado pelo hetzner-mirror.sh real (>25 linhas)" || bad "spec de teste não gerado: o hetzner-mirror.sh sparse falhou"
+stub mirror-ok '[ "$1" = spec-out ] && [ "$2" = whatsapp_automation ] || exit 2; cat "'"$T"'/spec.txt"'
+printf '#!/bin/sh\ncat "%s/spec.txt"\nexit 75\n' "$T" > "$T/mirror-75"; chmod +x "$T/mirror-75"   # o espelho que sai com rc 75 mesmo imprimindo um spec bom
+stub mirror-vazio 'exit 0'
+stub mirror-pendura 'sleep 6; cat "'"$T"'/spec.txt"'
+{ echo '!zz-primeira'; sed '1d' "$T/spec.txt"; } > "$T/spec-sem-raiz.txt"; stub mirror-sem-raiz 'cat "'"$T"'/spec-sem-raiz.txt"'
+{ echo '/*'; echo '!*.csv'; echo '!*.db'; echo '!*.parquet'; echo '!.env'; echo '!*.duckdb*'; echo '!data/'; } > "$T/spec-curto.txt"; stub mirror-curto 'cat "'"$T"'/spec-curto.txt"'
+grep -vxF '!*.parquet' "$T/spec.txt" > "$T/spec-sem-parquet.txt"; stub mirror-sem-parquet 'cat "'"$T"'/spec-sem-parquet.txt"'
+{ cat "$T/spec.txt"; echo 'docs/sem-bang.md'; } > "$T/spec-torta.txt"; stub mirror-torta 'cat "'"$T"'/spec-torta.txt"'
+{ cat "$T/spec.txt"; echo '!*.md'; } > "$T/spec-nega-md.txt"; stub mirror-nega-md 'cat "'"$T"'/spec-nega-md.txt"'
+stub git-mudo '[ "$1" = init ] && exit 0; exit 1'   # init ok, check-ignore sem nada negado (rc 1): nem o canário de dado é negado
+printf '#!/bin/sh\n[ "$1" = init ] && exit 0\nexit 128\n' > "$T/git-quebrado"; chmod +x "$T/git-quebrado"   # init ok, check-ignore quebra (rc 128)
+DOCS='lib/x.py e tests/test_x.py conforme '
+export WA_NODE_MIRROR="$T/mirror-ok"
+expect "node: .md fora da lista do rsync, mas o espelho entrega (docs/) — e DIZ que foi pelo espelho" "$(DESC "${DOCS}docs/runbooks/guia.md")" 0 '"verdict": "node".*"info": \[.*"via-espelho:docs/runbooks/guia\.md"'
+expect "node: DESIGN.md na raiz (o espelho entrega)" "$(DESC "${DOCS}DESIGN.md")" 0 '"verdict": "node".*via-espelho:DESIGN\.md'
+expect "node: .md maiúsculo (README.MD) também" "$(DESC "${DOCS}docs/LEIAME.MD")" 0 'via-espelho:docs/LEIAME\.MD'
+expect "mini: .md que a varredura de CONTEÚDO sinalizou (espelho nega) segue fora" "$(DESC "${DOCS}docs/sinalizado.md")" 10 'caminho-fora-do-filtro:docs/sinalizado\.md'
+expect "mini: .md em pasta que o rsync NUNCA deixa sair (shared/), mesmo o espelho não negando" "$(DESC "${DOCS}shared/notas.md")" 10 'caminho-fora-do-filtro:shared/notas\.md'
+expect "mini: .md dentro de logs/ (pasta de dado) segue fora" "$(DESC "${DOCS}logs/relatorio.md")" 10 'caminho-fora-do-filtro:logs/relatorio\.md'
+expect "mini: .json neutro em docs/ NÃO ganha o espelho (só texto .md)" "$(DESC "${DOCS}docs/auto_response/ab_results/x.json")" 10 'caminho-fora-do-filtro:docs/auto_response/ab_results/x\.json'
+expect "mini: .txt neutro em docs/ também não" "$(DESC "${DOCS}docs/notas.txt")" 10 'caminho-fora-do-filtro:docs/notas\.txt'
+expect "mini: um .md entregue e um .db na mesma bead — o .db segura" "$(DESC "${DOCS}docs/guia.md e queue.db")" 10 'caminho-fora-do-filtro:queue\.db'
+expect "mini: .md entregue + .md sinalizado — só o sinalizado vira motivo" "$(DESC "${DOCS}docs/guia.md e docs/sinalizado.md")" 10 '"reasons": \["caminho-fora-do-filtro:docs/sinalizado\.md"\]'
+expect "unknown: só doc citado (sem código nem teste) deixa de ser mini, mas segue sem prova" "$(DESC 'ajustar docs/runbooks/guia.md')" 11 'sem-prova-de-codigo-e-teste.*via-espelho'
+expect "mini: telefone no texto vence o espelho" "$(DESC "${DOCS}docs/guia.md (31) 98876-5432")" 10 '"reasons": \["dado-no-texto"\]'
+expect "mini: palavra de banco vence o espelho (mole)" "$(DESC "${DOCS}docs/guia.md abre um sqlite")" 10 'moles:banco-de-dados'
+expect "node:ok + .md entregue" "$(labels "$(DESC 'ajustar docs/runbooks/guia.md')" '["node:ok"]')" 0 '"basis": "label".*via-espelho'
+printf '# so comentario\ndocs/runbooks/*.md\n' > "$T/macs-md.txt"
+export WA_NODE_MAC_ONLY="$T/macs-md.txt"
+expect "mini: .md entregue mas na lista só-Mac segue só-Mac" "$(DESC "${DOCS}docs/runbooks/guia.md")" 10 'so-no-mac:docs/runbooks/guia\.md'
+unset WA_NODE_MAC_ONLY
+# o espelho não ajuda quando o texto não cita .md fora da lista: nem é consultado (espelho que pendura não atrasa nem muda o caso)
+export WA_NODE_MIRROR="$T/mirror-pendura" WA_NODE_MIRROR_TIMEOUT=1
+expect "o espelho só é consultado quando há .md fora do rsync (bead sem doc não paga)" "$GOOD" 0 '"verdict": "node"'
+unset WA_NODE_MIRROR_TIMEOUT
+# falhas de leitura do espelho: voltam ao filtro do rsync (mini, como antes) e dizem o motivo em `info`; NUNCA viram "o espelho entrega"
+chega() { # chega <rótulo> <stub do espelho> <motivo esperado em info> [VAR=valor]   (sem subshell: ok/bad contam em globais)
+  export WA_NODE_MIRROR="$T/$2"; [ -n "${4:-}" ] && export "$4"
+  expect "espelho que falha ($1): volta ao filtro do rsync e diz '$3'" "$(DESC "${DOCS}docs/runbooks/guia.md")" 10 "caminho-fora-do-filtro:docs/runbooks/guia\\.md.*espelho-ilegivel:$3"
+  [ -n "${4:-}" ] && unset "${4%%=*}"; export WA_NODE_MIRROR="$T/mirror-ok"; return 0; }
+chega "script ausente" espelho-ausente espelho-sem-resposta
+chega "sai com rc 75 (varredura ainda não cobre as pontas) mesmo imprimindo um spec bom" mirror-75 espelho-rc-75
+chega "saída vazia" mirror-vazio espelho-formato
+chega "spec sem a raiz /*" mirror-sem-raiz espelho-formato
+chega "spec com linha que não é negação" mirror-torta espelho-formato
+chega "spec curto demais (filtro cortado)" mirror-curto espelho-filtro-cortado
+chega "spec sem a família *.parquet" mirror-sem-parquet espelho-filtro-cortado
+chega "spec que nega TODO .md (o canário de doc é negado)" mirror-nega-md espelho-canario-errado
+chega "não responde no prazo" mirror-pendura espelho-sem-resposta WA_NODE_MIRROR_TIMEOUT=1
+chega "git inexistente" mirror-ok espelho-git-sem-resposta WA_NODE_GIT=$T/nao-existe-git
+chega "git que não nega nada (canário de dado passa)" mirror-ok espelho-canario-errado WA_NODE_GIT=$T/git-mudo
+chega "git que falha (rc 128)" mirror-ok espelho-git-rc-128 WA_NODE_GIT=$T/git-quebrado
+# o rsync "só negações" falha mas o estrito não: o espelho não é consultado e o caso volta ao filtro
+printf '#!/bin/sh\ncase "$4" in *filtro-so-negacoes*) exit 1;; esac\nexec rsync "$@"\n' > "$T/rs-so-neg-falha"; chmod +x "$T/rs-so-neg-falha"   # só a visão "só negações" falha (rc 1)
+stub rs-so-neg-vaza 'case "$4" in *filtro-so-negacoes*) rsync "$@"; printf "shared/zz_wa_node_canary.md\nlogs/zz_wa_node_canary.md\n"; exit 0;; esac; exec rsync "$@"'
+export WA_NODE_RSYNC="$T/rs-so-neg-falha"; expect "visão 'só negações' do rsync que falha: volta ao filtro do rsync" "$(DESC "${DOCS}docs/runbooks/guia.md")" 10 'espelho-ilegivel:rsync-rc-1'; unset WA_NODE_RSYNC
+# prazo do espelho ilegível volta ao padrão e não derruba
+export WA_NODE_MIRROR_TIMEOUT=abc; expect "prazo do espelho ilegível volta ao padrão (20) e não derruba" "$(DESC "${DOCS}docs/runbooks/guia.md")" 0 'via-espelho'; unset WA_NODE_MIRROR_TIMEOUT
+export WA_NODE_MIRROR="$T/espelho-ausente"
+
 # ---- o classificador não deixa resíduo e só aceita stdin
 tmp_residue() { # tmp_residue <classificador> -> nº de itens que sobraram num TMPDIR só dele (a bead cita caminhos, então o classificador cria a árvore temporária)
   local d; d=$(mktemp -d "$T/tmpd.XXXXXX")
@@ -161,7 +227,7 @@ mutant() { # mutant <nome> <trecho original> <trecho novo> <json> <rc> <regex> [
   local name="$1" json="$4" rc="$5" rx="$6" envspec="${7:-}" M="$T/mut-$1.py"
   mk_mutant "$name" "$2" "$3" || { bad "mutante $name: o trecho original não existe (o classificador mudou? atualize o mutante)"; return; }
   export WA_NODE_FILTER="$REAL_FILTER" WA_NODE_MAC_ONLY="$REAL_MAC"
-  [ -n "$envspec" ] && export "$envspec"
+  for e in $envspec; do export "$e"; done   # várias VAR=valor separadas por espaço ($T não tem espaço)
   CLS="$CLS_REAL"
   if ! check "$json" "$rc" "$rx"; then
     bad "mutante $name VAZIO: o classificador ORIGINAL já reprova o caso designado (rc=$RC, esperado $rc; saída: $(printf '%s' "$OUT" | cut -c1-200))"
@@ -173,18 +239,19 @@ mutant() { # mutant <nome> <trecho original> <trecho novo> <json> <rc> <regex> [
     else ok "mutante $name morreu"; fi
     CLS="$CLS_REAL"
   fi
-  unset WA_NODE_FILTER WA_NODE_MAC_ONLY; [ -n "$envspec" ] && unset "${envspec%%=*}"
+  unset WA_NODE_FILTER WA_NODE_MAC_ONLY; for e in $envspec; do unset "${e%%=*}"; done
+  export WA_NODE_MIRROR="$T/espelho-ausente"   # o padrão da bateria (um envspec pode ter trocado e desarmado)
 }
 mutant sem-node-mini     '"node:mini" in labels'                       'False'                                  "$(labels "$GOOD" '["node:mini"]')" 10 'etiqueta-node:mini'
 mutant sem-epic          'b.get("issue_type") == "epic"'               'False'                                  "$(field "$GOOD" issue_type '"epic"')" 10 '"epic"'
 mutant sem-pii           'if has_pii(json.dumps'                       'if False and has_pii(json.dumps'        "$(DESC 'lib/x.py tests/test_x.py (31) 98876-5432')" 10 'dado-no-texto'
 mutant pii-sem-cauda     'len(set(d[-8:])) > 3'                        'len(set(d[-8:])) >= 0'                  "$(DESC 'lib/x.py tests/test_x.py +55 31 99999-9999')" 0 '"verdict": "node"'
-mutant filtro-ignorado   'if p not in sent:'                           'if False:'                              "$WITHDB" 10 'caminho-fora-do-filtro'
+mutant filtro-ignorado   'if p not in sent and p not in via_mirror:'   'if False:'                              "$WITHDB" 10 'caminho-fora-do-filtro'
 mutant mac-ignorado      'elif any(fnmatch.fnmatchcase(p, g) for g in globs):' 'elif False:'                    "$(DESC 'lib/x.py e tests/test_launchd_plist.py')" 10 'so-no-mac' "WA_NODE_MAC_ONLY=$T/macs.txt"
 # o canário tem DUAS metades (o de código TEM de sair, os de segredo NÃO): um mutante por metade e um para as duas; cada um com o rsync que só ELE separa do original
-mutant sem-canario       'if CANARY_OK not in sent or any(c in sent for c in CANARY_NO):' 'if False:'          "$GOOD" 11 'canario-errado' "WA_NODE_RSYNC=$T/rs-mudo"
-mutant sem-canario-codigo 'CANARY_OK not in sent or any('              'False or any('                          "$GOOD" 11 'canario-errado' "WA_NODE_RSYNC=$T/rs-mudo"
-mutant sem-canario-segredo 'or any(c in sent for c in CANARY_NO):'    'or False:'                              "$GOOD" 11 'canario-errado' "WA_NODE_RSYNC=$T/rs-tudo"
+mutant sem-canario       'if any(c not in sent for c in ok_canary) or any(c in sent for c in no_canary):' 'if False:'          "$GOOD" 11 'canario-errado' "WA_NODE_RSYNC=$T/rs-mudo"
+mutant sem-canario-codigo 'if any(c not in sent for c in ok_canary) or any(' 'if False or any('                          "$GOOD" 11 'canario-errado' "WA_NODE_RSYNC=$T/rs-mudo"
+mutant sem-canario-segredo 'or any(c in sent for c in no_canary):'    'or False:'                              "$GOOD" 11 'canario-errado' "WA_NODE_RSYNC=$T/rs-tudo"
 mutant rc-ignorado       'if r.returncode != 0:'                       'if False:'                              "$GOOD" 11 'rsync-rc-23' "WA_NODE_RSYNC=$T/rs-parcial"
 mutant sem-moles         'if soft and not override:'                   'if False:'                              "$(DESC 'lib/x.py abre um sqlite; tests/test_x.py')" 10 'moles:banco-de-dados'
 mutant label-ignorada    'override = "node:ok" in labels'              'override = False'                       "$(labels "$NOPROOF" '["node:ok"]')" 0 'label'
@@ -204,6 +271,20 @@ mutant sem-maiuscula     ', re.IGNORECASE)'                            ')'      
 mutant sem-sqlite3       '|db|sqlite3?|xlsx|'                          '|db|sqlite|xlsx|'                       "$(DESC 'lib/x.py tests/test_x.py e data/x.sqlite3')" 10 'caminho-fora-do-filtro:data/x\.sqlite3'
 mutant sem-home          'if HOME_RE.search(text):'                    'if False:'                              "$(DESC 'lib/x.py tests/test_x.py e ~/segredos/chave.json')" 10 'caminho-fora-do-formato'
 mutant mac-vazio-vale    'if not globs:'                               'if False:'                              "$GOOD" 11 'mac-only-vazio' "WA_NODE_MAC_ONLY=$T/macs-vazio.txt"
+# espelho git: cada mutante troca UMA linha da regra nova e o caso designado reprova; o ambiente do caso (stub do espelho) vem em "VAR=valor"
+mutant espelho-sem-negacoes 'open_sent = sent_by_filter(cands, only_denies=True)' 'open_sent = set(cands)' "$(DESC "${DOCS}shared/notas.md")" 10 'caminho-fora-do-filtro:shared/notas\.md' "WA_NODE_MIRROR=$T/mirror-ok"
+mutant espelho-sem-varredura 'denied = mirror_denied(mirror_rules(), ok)' 'denied = set()' "$(DESC "${DOCS}docs/sinalizado.md")" 10 'caminho-fora-do-filtro:docs/sinalizado\.md' "WA_NODE_MIRROR=$T/mirror-ok"
+mutant espelho-ext-solta 'MIRROR_TEXT_EXT = ("md",)' 'MIRROR_TEXT_EXT = ("md", "json", "txt")' "$(DESC "${DOCS}docs/auto_response/ab_results/x.json")" 10 'caminho-fora-do-filtro:docs/auto_response/ab_results/x\.json' "WA_NODE_MIRROR=$T/mirror-ok"
+mutant espelho-falha-vira-chega 'return [], ["espelho-ilegivel:" + str(e)]' 'return cands, ["espelho-ilegivel:" + str(e)]' "$(DESC "${DOCS}docs/runbooks/guia.md")" 10 'espelho-ilegivel:espelho-sem-resposta'
+mutant espelho-rc-ignorado 'raise Unreadable("espelho-rc-%d" % r.returncode)' 'pass' "$(DESC "${DOCS}docs/runbooks/guia.md")" 10 'espelho-ilegivel:espelho-rc-75' "WA_NODE_MIRROR=$T/mirror-75"
+mutant espelho-sem-raiz 'lines[0] != "/*" or ' '' "$(DESC "${DOCS}docs/runbooks/guia.md")" 10 'espelho-ilegivel:espelho-formato' "WA_NODE_MIRROR=$T/mirror-sem-raiz"
+mutant espelho-linha-torta 'any(not l.startswith("!") or len(l) < 2 for l in lines[1:])' 'False' "$(DESC "${DOCS}docs/runbooks/guia.md")" 10 'espelho-ilegivel:espelho-formato' "WA_NODE_MIRROR=$T/mirror-torta"
+mutant espelho-poucas-regras 'len(rules) < MIRROR_MIN_RULES or ' '' "$(DESC "${DOCS}docs/runbooks/guia.md")" 10 'espelho-ilegivel:espelho-filtro-cortado' "WA_NODE_MIRROR=$T/mirror-curto"
+mutant espelho-sem-familias 'or any(c not in rules for c in ("*.csv", "*.db", "*.parquet", ".env", "*.duckdb*"))' '' "$(DESC "${DOCS}docs/runbooks/guia.md")" 10 'espelho-ilegivel:espelho-filtro-cortado' "WA_NODE_MIRROR=$T/mirror-sem-parquet"
+mutant espelho-sem-canario-dado 'any(c not in denied for c in CANARY_MIRROR_NO) or ' '' "$(DESC "${DOCS}docs/runbooks/guia.md")" 10 'espelho-ilegivel:espelho-canario-errado' "WA_NODE_MIRROR=$T/mirror-ok WA_NODE_GIT=$T/git-mudo"
+mutant espelho-sem-canario-doc ' or CANARY_OK in denied or CANARY_DOC in denied' '' "$(DESC "${DOCS}docs/runbooks/guia.md")" 10 'espelho-ilegivel:espelho-canario-errado' "WA_NODE_MIRROR=$T/mirror-nega-md"
+mutant espelho-git-rc-ignorado 'if r.returncode not in (0, 1):' 'if False:' "$(DESC "${DOCS}docs/runbooks/guia.md")" 10 'espelho-ilegivel:espelho-git-rc-128' "WA_NODE_MIRROR=$T/mirror-ok WA_NODE_GIT=$T/git-quebrado"
+mutant so-neg-sem-canario-pasta 'no_canary += list(CANARY_OPEN_NO)' 'pass' "$(DESC "${DOCS}docs/runbooks/guia.md")" 10 'espelho-ilegivel:canario-errado' "WA_NODE_MIRROR=$T/mirror-ok WA_NODE_RSYNC=$T/rs-so-neg-vaza"
 # o resíduo no TMPDIR: o mutante que não apaga a árvore tem de deixar item para trás (senão o teste de "sem resíduo" passaria mesmo sem a limpeza)
 if mk_mutant sem-limpeza 'shutil.rmtree(root, ignore_errors=True)' 'pass'; then
   left=$(tmp_residue "$T/mut-sem-limpeza.py")
