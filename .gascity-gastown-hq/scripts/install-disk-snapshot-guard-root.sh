@@ -36,7 +36,7 @@
 #   - PATH fixo logo abaixo: o sudo mantém o PATH do athos, e um `install` ou `launchctl` em ~/.local/bin rodaria como root.
 #   - Não faz `source` de nada e não chama outro arquivo do repo. O único arquivo do usuário que ele LÊ é o
 #     disk-snapshot-guard.sh a copiar, e a cópia só é conferida (e o plist só é tocado) depois de estar em pasta do root.
-#   - Os ganchos de teste (DSG_*) só valem SEM root: como root nenhuma variável de ambiente muda o que roda.
+#   - Os ganchos de teste (DSG_*) só valem SEM root: como root nenhum DSG_* muda o que roda (o uid vem de `id -u`, não do $EUID).
 #   - Sob dúvida (dono, modo, symlink, saída do launchctl ilegível) o estado que fica é o inerte: recusa e não mexe.
 #
 # NÃO COBRE (de propósito):
@@ -46,6 +46,8 @@
 #   - ACLs (`ls -le`) não são lidas, só o tipo, o dono e os bits de modo. Grupo com escrita conta como "gravável".
 #   - Este arquivo também mora no repo até o sudo: o --expect-sha256 trava o que o root COPIA, não este instalador. Quem
 #     passa o comando deve passar também o `shasum -a 256` deste arquivo, para o Athos conferir antes de rodar.
+#   - O ambiente do root: o `sudo` simples o limpa; com `sudo -E` (ou env_keep) BASH_ENV e funções exportadas rodariam como root
+#     antes de qualquer checagem deste arquivo. Use `sudo` simples, como em USO.
 #
 # GANCHOS DE TESTE (só sem root; o selftest usa todos): DSG_ROOT_PFX (prefixo de "/"), DSG_ROOT_UID (uid que conta como
 #   root), DSG_OWNER (user:group no lugar de root:wheel), DSG_LAUNCHCTL, DSG_PLISTBUDDY (binários falsos),
@@ -72,8 +74,12 @@ ROOT_OWNER="root:wheel"
 LAUNCHCTL="/bin/launchctl"
 PLISTBUDDY="/usr/libexec/PlistBuddy"
 RETRY_SLEEP=2
-# $EUID é do próprio bash (sem comando externo que possa falhar): sem root os ganchos valem, com root nunca.
-if [ "$EUID" != "0" ]; then
+# o uid vem de `id -u`, nunca de $EUID: o bash aceita EUID importado do ambiente (medido nos bash 5.2 e 3.2.57) e um `sudo -E`
+# ligaria os ganchos como root. vazio → MY_UID vazio: nenhum gancho vale e a checagem de root lá embaixo recusa;
+# falhou/ilegível → idem (sem uid confirmado o estado é o inerte)
+MY_UID=$(/usr/bin/id -u 2>/dev/null) || MY_UID=""
+case "$MY_UID" in (*[!0-9]*) MY_UID="" ;; esac
+if [ -n "$MY_UID" ] && [ "$MY_UID" != "0" ]; then
   ROOT_PFX="${DSG_ROOT_PFX:-}"
   ROOT_UID="${DSG_ROOT_UID:-0}"
   ROOT_OWNER="${DSG_OWNER:-root:wheel}"
@@ -354,16 +360,10 @@ do_install() {
   [ -L "$SRC" ] && die 1 "$SRC é um symlink: o root não copia o que um symlink do repo aponta. Nada foi alterado"
   [ -f "$SRC" ] || die 1 "não achei $SRC ao lado do instalador. Nada foi alterado"
   [ -s "$SRC" ] || die 1 "$SRC está vazio. Nada foi alterado"
-  # vazio → n/a; falhou/ilegível → só reprova se houver --expect-sha256 (sem hash não confirmo o revisado); sem pin vira "indisponível"
-  if src_sha=$(sha256_of "$SRC"); then
-    say "  fonte: $SRC (sha256 $src_sha)"
-    if [ -n "$PIN" ] && [ "$src_sha" != "$PIN" ]; then
-      die 1 "o sha256 de $SRC ($src_sha) difere do --expect-sha256 ($PIN): o arquivo do repo mudou depois da revisão. Nada foi alterado"
-    fi
-  else
-    [ -z "$PIN" ] || die 1 "não consegui calcular o sha256 de $SRC para conferir o --expect-sha256. Nada foi alterado"
-    say "  fonte: $SRC (sha256 indisponível neste sistema)"
-  fi
+  # vazio → n/a; falhou/ilegível → recusa: sem o hash da fonte não confirmo que é o arquivo revisado (aqui o --expect-sha256 é obrigatório)
+  src_sha=$(sha256_of "$SRC") || die 1 "não consegui calcular o sha256 de $SRC para conferir o --expect-sha256. Nada foi alterado"
+  say "  fonte: $SRC (sha256 $src_sha)"
+  [ "$src_sha" = "$PIN" ] || die 1 "o sha256 de $SRC ($src_sha) difere do --expect-sha256 ($PIN): o arquivo do repo mudou depois da revisão. Nada foi alterado"
 
   safe_node "$PLIST_REAL" - || die 1 "$WHY: o plist tem de ser do root. Nada foi alterado"
   read_plist_layout "$PLIST_REAL" || die 1 "$WHY. Nada foi alterado"
@@ -395,7 +395,7 @@ do_install() {
   fi
   # o mv sobre um symlink de arquivo trocaria o alvo; troca-se o próprio nome (a pasta é do root, ninguém mais põe link ali)
   if [ -L "$PROG_FILE_REAL" ]; then rm -f "$PROG_FILE_REAL" || die 1 "não consegui remover o symlink $PROG_PATH. O root não executa nada novo"; fi
-  mv -f "$tmp_copy" "$PROG_FILE_REAL" || die 1 "não consegui colocar a cópia em $PROG_PATH"
+  mv -f "$tmp_copy" "$PROG_FILE_REAL" || die 1 "não consegui colocar a cópia em $PROG_PATH. O plist não foi alterado"
   safe_node "$PROG_FILE_REAL" - || die 3 "$WHY (depois do rename): confira à mão $PROG_PATH"
   say "  copiado: $PROG_PATH"
 
@@ -488,7 +488,7 @@ if [ "$MODE" = "check" ]; then
   exit "$rc"
 fi
 
-if [ "$EUID" != "$ROOT_UID" ]; then
+if [ "$MY_UID" != "$ROOT_UID" ]; then
   die 2 "rode como root: sudo /bin/bash $0 ... (sem root o instalador não escreve em $PROG_DIR nem em ${PLIST_PATH%/*}). Nada foi alterado"
 fi
 do_install
