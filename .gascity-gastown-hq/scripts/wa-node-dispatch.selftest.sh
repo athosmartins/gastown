@@ -11,6 +11,8 @@
 #   N SLOTS (ga-2hd02v.3): WA_NODE_SPAWN=pilot com WA_NODE_SLOTS aliases · escolhe o 1º alias sem bead e sem sessão viva · todos ocupados = 12 · leitura de qualquer alias ilegível = 11 · só `pilot` consulta o oráculo de capacidade
 #   (local = 12; ausente, mudo, lento, incoerente ou sem `free` = 11; as beads atribuídas cuja sessão não subiu descontam da vaga) · a bead leva a marca pilot.wa_node_alias e NUNCA gc.routed_to · pool continua com 1 slot · N inválido = 1 ·
 #   release solta as duas formas e só de alias do nó.
+#   IDENTIDADE (ga-2hd02v.3): WA_NODE_SELF e WA_NODE_STORY trocam o nome que as mensagens e o comentário da bead usam e a bead que o comentário cita (o wrapper da bead de PS) · padrão = o texto da 1.10 byte a byte
+#   nas partes fixas · vazio = padrão · valor com espaço, aspa, $, crase, ;, barra, quebra de linha ou acima de 64 caracteres = padrão (o valor vai para um comentário DA BEAD) · 64 exatos passam.
 # CONTROLE NEGATIVO: cada mutante troca UMA linha numa cópia do script e o caso designado tem de reprovar; mutante que sobrevive reprova esta bateria.
 # COMO RODAR: bash scripts/wa-node-dispatch.selftest.sh   (macOS /bin/bash 3.2 e Linux; precisa de jq e python3)
 set -u
@@ -407,6 +409,57 @@ fresh; export STUB_DROP_META=1; d apply wa-t1; expect_rc "pool: escrita que pego
 fresh '{"status":"in_progress","assignee":"wa-worker-remote-2","metadata":{"pilot.wa_node_alias":"wa-worker-remote-2"}}'; export STUB_KEEP_META=1; d release wa-t1; expect_rc "release: forma pilot, o dono saiu mas a marca ficou -> 13" 13
 fresh '{"status":"in_progress","assignee":"wa-worker-remote-1","metadata":{"gc.routed_to":"wa-worker-remote"}}'; export STUB_KEEP_META=1; d release wa-t1; expect_rc "release: forma pool, o dono saiu mas a rota ficou -> 13" 13
 
+# ---- identidade: WA_NODE_SELF / WA_NODE_STORY (ga-2hd02v.3) — o wrapper da bead de PS troca o nome e a bead citada sem copiar o script
+cmt() { bead '."wa-t1".comments[0]'; }
+cmt_ok() { # cmt_ok <rótulo> <bead que o comentário cita> <nome do script no comentário> — o comentário começa por "nó (<bead>): " e acaba por " Ao fim da entrega: <nome> release wa-t1."
+  local c; c=$(cmt)
+  case "$c" in "nó ($2): "*" Ao fim da entrega: $3 release wa-t1.") ok "$1" ;; *) bad "$1 (comentário: $c)" ;; esac
+}
+say_ok() { # say_ok <rótulo> <nome sem .sh> — a mensagem de sucesso do apply começa pelo nome
+  printf '%s' "$OUT" | grep -q "^$2: wa-t1 → " && ok "$1" || bad "$1 (saída: $(printf '%s' "$OUT" | tr '\n' ' ' | cut -c1-160))"
+}
+L64=$(printf '%064d' 0 | tr 0 a); L65=$(printf '%065d' 0 | tr 0 a)
+fresh; d apply wa-t1
+expect_rc "identidade padrão: apply -> 0" 0
+cmt_ok "identidade padrão: o comentário do apply é o da 1.10 (ga-2hd02v.1.10, wa-node-dispatch.sh)" ga-2hd02v.1.10 wa-node-dispatch.sh
+say_ok "identidade padrão: a mensagem começa por wa-node-dispatch:" wa-node-dispatch
+fresh; d
+expect_rc "identidade padrão: sem argumentos -> 2" 2
+printf '%s' "$OUT" | grep -q '^wa-node-dispatch: uso: wa-node-dispatch.sh check|apply|release <bead>' && ok "identidade padrão: o uso diz wa-node-dispatch.sh" || bad "identidade padrão: uso: $OUT"
+fresh '{"status":"in_progress","assignee":"wa-worker-remote-1","metadata":{"gc.routed_to":"wa-worker-remote"}}'; d release wa-t1
+expect_rc "identidade padrão: release -> 0" 0
+case "$(cmt)" in "nó (ga-2hd02v.1.10): dono wa-worker-remote-1 e rota wa-worker-remote soltos após a entrega"*) ok "identidade padrão: o comentário do release é o da 1.10" ;; *) bad "identidade padrão: comentário do release: $(cmt)" ;; esac
+
+fresh; WA_NODE_SELF=ps-node-dispatch.sh WA_NODE_STORY=ga-2hd02v.4 d apply wa-t1
+expect_rc "identidade trocada: apply -> 0" 0
+cmt_ok "identidade trocada: o comentário cita ga-2hd02v.4 e ps-node-dispatch.sh" ga-2hd02v.4 ps-node-dispatch.sh
+say_ok "identidade trocada: a mensagem começa por ps-node-dispatch:" ps-node-dispatch
+printf '%s' "$OUT" | grep -q 'wa-node-dispatch' && bad "identidade trocada: sobrou wa-node-dispatch na saída: $OUT" || ok "identidade trocada: nenhum wa-node-dispatch na saída"
+case "$(cmt)" in *wa-node-dispatch*|*ga-2hd02v.1.10*) bad "identidade trocada: sobrou o nome/a bead antigos no comentário: $(cmt)" ;; *) ok "identidade trocada: nenhum nome/bead antigos no comentário" ;; esac
+fresh; WA_NODE_SELF=ps-node-dispatch.sh d
+expect_rc "identidade trocada: sem argumentos -> 2" 2
+printf '%s' "$OUT" | grep -q '^ps-node-dispatch: uso: ps-node-dispatch.sh check|apply|release <bead>' && ok "identidade trocada: o uso diz ps-node-dispatch.sh" || bad "identidade trocada: uso: $OUT"
+fresh '{"status":"in_progress","assignee":"wa-worker-remote-1","metadata":{"gc.routed_to":"wa-worker-remote"}}'; WA_NODE_STORY=ga-2hd02v.4 d release wa-t1
+expect_rc "identidade trocada: release -> 0" 0
+case "$(cmt)" in "nó (ga-2hd02v.4): dono wa-worker-remote-1 e rota wa-worker-remote soltos após a entrega"*) ok "identidade trocada: o comentário do release cita ga-2hd02v.4" ;; *) bad "identidade trocada: comentário do release: $(cmt)" ;; esac
+
+# vazio → o padrão
+fresh; WA_NODE_SELF= WA_NODE_STORY= d apply wa-t1
+expect_rc "identidade vazia: apply -> 0" 0
+cmt_ok "identidade vazia: volta ao padrão" ga-2hd02v.1.10 wa-node-dispatch.sh
+# ilegível → o padrão (o valor vai para um comentário da bead)
+for v in 'ps node.sh' 'a;b' 'a$b' 'a`b' "a'b" 'a"b' 'a/b' 'a(b)' $'a\nb' "$L65"; do
+  fresh; WA_NODE_SELF="$v" d apply wa-t1
+  [ "$RC" = 0 ] && { cmt_ok "WA_NODE_SELF ilegível ($(printf '%s' "$v" | tr '\n' '~' | cut -c1-12)…) volta ao padrão" ga-2hd02v.1.10 wa-node-dispatch.sh; } || bad "WA_NODE_SELF ilegível: apply rc=$RC"
+  fresh; WA_NODE_STORY="$v" d apply wa-t1
+  [ "$RC" = 0 ] && { cmt_ok "WA_NODE_STORY ilegível ($(printf '%s' "$v" | tr '\n' '~' | cut -c1-12)…) volta ao padrão" ga-2hd02v.1.10 wa-node-dispatch.sh; } || bad "WA_NODE_STORY ilegível: apply rc=$RC"
+done
+# 64 caracteres passam (o teto é inclusivo)
+fresh; WA_NODE_SELF="$L64" WA_NODE_STORY="$L64" d apply wa-t1
+cmt_ok "identidade de 64 caracteres passa (o teto é inclusivo)" "$L64" "$L64"
+fresh; WA_NODE_SELF=ps_node-dispatch.v2.sh WA_NODE_STORY=ga-2hd02v.4.1 d apply wa-t1
+cmt_ok "identidade com _ - . e dígitos passa" ga-2hd02v.4.1 ps_node-dispatch.v2.sh
+
 # ---- 1 caso de ponta a ponta com o classificador REAL (mesma bead que o selftest dele manda ao nó)
 fresh; unset WA_NODE_CLASSIFY
 jq -c '."wa-t1" += {"description":"Em lib/foo_parser.py a funcao quebra com string vazia. Teste em tests/test_foo_parser.py."}' "$STATE" > "$STATE.n" && mv "$STATE.n" "$STATE"
@@ -527,6 +580,38 @@ mutant dormindo-qualquer-template ' and ((.template // .Template // "") == $t)) 
 fresh; sessions '[{"template":"wa-worker","state":"asleep","closed":false,"alias":"wa-worker-remote-1"}]'; SL=1 pm apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
 mutant dormindo-qualquer-estado '((.state // .State // "") == "asleep") and' '((.state // .State // "") != "") and'
 fresh; sessions '[{"template":"wa-worker-remote","state":"suspended","closed":false,"alias":"wa-worker-remote-1"}]'; SL=1 pm apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
+
+# ---- identidade (ga-2hd02v.3)
+mutant say-fixo 'say() { echo "${SELF%.sh}: $*" >&2; }' 'say() { echo "wa-node-dispatch: $*" >&2; }'
+fresh; WA_NODE_SELF=ps-node-dispatch.sh d apply wa-t1; if printf '%s' "$OUT" | grep -q '^ps-node-dispatch: wa-t1'; then survived; else killed; fi
+mutant uso-fixo 'die 2 "uso: $SELF check' 'die 2 "uso: wa-node-dispatch.sh check'
+fresh; WA_NODE_SELF=ps-node-dispatch.sh d; if printf '%s' "$OUT" | grep -q 'uso: ps-node-dispatch.sh check'; then survived; else killed; fi
+mutant comentario-nome-fixo 'Ao fim da entrega: $SELF release $id.' 'Ao fim da entrega: wa-node-dispatch.sh release $id.'
+fresh; WA_NODE_SELF=ps-node-dispatch.sh d apply wa-t1; case "$(cmt)" in *"ps-node-dispatch.sh release wa-t1."*) survived ;; *) killed ;; esac
+mutant comentario-apply-bead-fixa '"nó ($STORY): $who' '"nó (ga-2hd02v.1.10): $who'
+fresh; WA_NODE_STORY=ga-2hd02v.4 d apply wa-t1; case "$(cmt)" in "nó (ga-2hd02v.4): "*) survived ;; *) killed ;; esac
+mutant comentario-release-bead-fixa '"nó ($STORY): dono $as e' '"nó (ga-2hd02v.1.10): dono $as e'
+fresh '{"status":"in_progress","assignee":"wa-worker-remote-1","metadata":{"gc.routed_to":"wa-worker-remote"}}'; WA_NODE_STORY=ga-2hd02v.4 d release wa-t1; case "$(cmt)" in "nó (ga-2hd02v.4): dono "*) survived ;; *) killed ;; esac
+mutant self-sem-filtro 'case "$SELF" in *[!A-Za-z0-9._-]*) SELF=wa-node-dispatch.sh ;; esac; ' ''
+fresh; WA_NODE_SELF='ps node.sh' d apply wa-t1; case "$(cmt)" in *"ps node.sh release"*) killed ;; *) survived ;; esac
+mutant story-sem-filtro 'case "$STORY" in *[!A-Za-z0-9._-]*) STORY=ga-2hd02v.1.10 ;; esac; ' ''
+fresh; WA_NODE_STORY='a;b' d apply wa-t1; case "$(cmt)" in "nó (a;b): "*) killed ;; *) survived ;; esac
+mutant self-sem-teto '[ "${#SELF}" -le 64 ] || SELF=wa-node-dispatch.sh' ':'
+fresh; WA_NODE_SELF="$L65" d apply wa-t1; case "$(cmt)" in *"$L65 release"*) killed ;; *) survived ;; esac
+mutant story-sem-teto '[ "${#STORY}" -le 64 ] || STORY=ga-2hd02v.1.10' ':'
+fresh; WA_NODE_STORY="$L65" d apply wa-t1; case "$(cmt)" in "nó ($L65): "*) killed ;; *) survived ;; esac
+mutant self-teto-65 '[ "${#SELF}" -le 64 ]' '[ "${#SELF}" -le 65 ]'
+fresh; WA_NODE_SELF="$L65" d apply wa-t1; case "$(cmt)" in *"$L65 release"*) killed ;; *) survived ;; esac
+mutant story-teto-65 '[ "${#STORY}" -le 64 ]' '[ "${#STORY}" -le 65 ]'
+fresh; WA_NODE_STORY="$L65" d apply wa-t1; case "$(cmt)" in "nó ($L65): "*) killed ;; *) survived ;; esac
+mutant self-teto-63 '[ "${#SELF}" -le 64 ]' '[ "${#SELF}" -lt 64 ]'
+fresh; WA_NODE_SELF="$L64" d apply wa-t1; case "$(cmt)" in *"$L64 release"*) survived ;; *) killed ;; esac
+mutant story-teto-63 '[ "${#STORY}" -le 64 ]' '[ "${#STORY}" -lt 64 ]'
+fresh; WA_NODE_STORY="$L64" d apply wa-t1; case "$(cmt)" in "nó ($L64): "*) survived ;; *) killed ;; esac
+mutant self-vazio-quebra 'SELF="${WA_NODE_SELF:-wa-node-dispatch.sh}"' 'SELF="${WA_NODE_SELF-wa-node-dispatch.sh}"'
+fresh; WA_NODE_SELF= d apply wa-t1; case "$(cmt)" in *" Ao fim da entrega: wa-node-dispatch.sh release wa-t1.") survived ;; *) killed ;; esac
+mutant story-vazio-quebra 'STORY="${WA_NODE_STORY:-ga-2hd02v.1.10}"' 'STORY="${WA_NODE_STORY-ga-2hd02v.1.10}"'
+fresh; WA_NODE_STORY= d apply wa-t1; case "$(cmt)" in "nó (ga-2hd02v.1.10): "*) survived ;; *) killed ;; esac
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

@@ -23,6 +23,7 @@
 #   uma 2ª sessão). Só `pilot` tem mais de 1 slot: WA_NODE_SLOTS (1..9, padrão 1) aliases wa-worker-remote-1..N; em `pool` o N vale 1 (o alias da sessão do pool não é nomeável). Em `pilot` o apply escolhe o 1º alias
 #   sem bead em andamento e sem sessão viva e CONSULTA o oráculo de capacidade (hetzner-capacity.py verdict): só `node` com vaga livre (descontadas as beads já atribuídas cuja sessão ainda não subiu) deixa passar.
 # Env: WA_NODE_SPAWN (pool|pilot, padrão pool; outro valor = pool), WA_NODE_SLOTS (1..9, padrão 1; vazio ou ilegível = 1), WA_NODE_ALIAS_PREFIX (wa-worker-remote-), WA_NODE_CAPACITY (hetzner-capacity.py), WA_NODE_CAPACITY_TIMEOUT (45 s).
+# Env (identidade, para o wrapper de OUTRA loja — o ps-node-dispatch.sh da bead de PS): WA_NODE_SELF (nome que as mensagens e o comentário da bead usam, padrão wa-node-dispatch.sh), WA_NODE_STORY (bead que o comentário cita, padrão ga-2hd02v.1.10).
 # Env (teste): GC_CITY, WA_NODE_BD (bd), WA_NODE_GC (gc), WA_NODE_CLASSIFY, WA_NODE_PY, WA_NODE_ALIAS (alias único: ganha de SLOTS e do prefixo; padrão <prefixo>1), WA_NODE_ROUTE_TEMPLATE (wa-worker-remote), WA_NODE_LOG, WA_NODE_TIMEOUT (20 s), WA_NODE_SESSION_TIMEOUT (60 s, só para `gc session list`).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -48,7 +49,11 @@ case "$TMO" in ''|*[!0-9]*) TMO=20 ;; esac     # prazo ilegível volta ao padrã
 STMO="${WA_NODE_SESSION_TIMEOUT:-60}"
 case "$STMO" in ''|*[!0-9]*) STMO=60 ;; esac
 
-say() { echo "wa-node-dispatch: $*" >&2; }
+# como o script se chama nas mensagens e qual bead o comentário cita (ga-2hd02v.3). Um wrapper de outra loja (PS) troca os dois sem copiar o script.
+# vazio → o nome e a bead de sempre; ilegível (espaço, aspas, barra, $, `, ;, quebra de linha, acima de 64 caracteres) → o mesmo: o valor vai para a mensagem e para um comentário DA BEAD, então nunca entra solto.
+SELF="${WA_NODE_SELF:-wa-node-dispatch.sh}"; case "$SELF" in *[!A-Za-z0-9._-]*) SELF=wa-node-dispatch.sh ;; esac; [ "${#SELF}" -le 64 ] || SELF=wa-node-dispatch.sh
+STORY="${WA_NODE_STORY:-ga-2hd02v.1.10}"; case "$STORY" in *[!A-Za-z0-9._-]*) STORY=ga-2hd02v.1.10 ;; esac; [ "${#STORY}" -le 64 ] || STORY=ga-2hd02v.1.10
+say() { echo "${SELF%.sh}: $*" >&2; }
 die() { local rc="$1"; shift; say "$*"; exit "$rc"; }
 T() { if command -v timeout >/dev/null 2>&1; then timeout "$TMO" "$@"; else "$@"; fi; }
 TS() { if command -v timeout >/dev/null 2>&1; then timeout "$STMO" "$@"; else "$@"; fi; }
@@ -74,7 +79,7 @@ bead_json() {
   printf '%s' "$out" | jq -ce --arg id "$2" 'if type=="array" then .[0] else . end | select(type=="object" and .id == $id)' 2>/dev/null
 }
 
-cmd="${1:-}"; id="${2:-}"; [ $# -ge 2 ] || die 2 "uso: wa-node-dispatch.sh check|apply|release <bead> [--store DIR] [--basis label|any] [--dry-run]"
+cmd="${1:-}"; id="${2:-}"; [ $# -ge 2 ] || die 2 "uso: $SELF check|apply|release <bead> [--store DIR] [--basis label|any] [--dry-run]"
 shift 2
 store=""; basis="any"; dry=0
 while [ $# -gt 0 ]; do
@@ -194,7 +199,7 @@ apply)
   fi
   if [ "$SPAWN" = pilot ]; then who="atribuída a $PICK (marca pilot.wa_node_alias, sem rota) — veredito node (base $b: $(printf '%s' "$out" | jq -r '(.reasons // []) | join(", ")')). O Pilot abre a sessão do alias; sem gc session new à mão."
   else who="atribuída a $PICK, rota $ROUTE — veredito node (base $b: $(printf '%s' "$out" | jq -r '(.reasons // []) | join(", ")')). O pool cria a sessão; sem gc session new à mão (a duplicata é derrubada pelo dedup)."; fi
-  T "$BD" -C "$store" comment "$id" "nó (ga-2hd02v.1.10): $who Ao fim da entrega: wa-node-dispatch.sh release $id." >/dev/null 2>&1 || say "aviso: comentário em $id não gravado"
+  T "$BD" -C "$store" comment "$id" "nó ($STORY): $who Ao fim da entrega: $SELF release $id." >/dev/null 2>&1 || say "aviso: comentário em $id não gravado"
   wn=""; [ "$w" = 0 ] || wn=" [bd update rc=$w, a releitura confere]"   # o rc do bd mentiu (resposta perdida): fica no log
   jlog apply "$id" 0 "despachada para $PICK ($b)$wn"; say "$id → $PICK ($([ "$SPAWN" = pilot ] && echo sessão-do-pilot || echo "$ROUTE")), base=$b$wn"; printf '%s\n' "$out"; exit 0 ;;
 
@@ -210,7 +215,7 @@ release)
   T "$BD" -C "$store" update "$id" --if-assignee "$as" --assignee "" --unset-metadata "$ukey" -q >/dev/null 2>&1 || { jlog release "$id" 13 "escrita-falhou"; die 13 "bd update falhou ao soltar $id — nada garantido (um update morto por prazo pode ter gravado); confira"; }
   A=$(bead_json "$store" "$id") || A=""
   { [ -n "$A" ] && [ -z "$(printf '%s' "$A" | jq -r '.assignee // ""')" ] && [ -z "$(printf '%s' "$A" | jq -r '.metadata["gc.routed_to"] // ""')" ] && [ -z "$(printf '%s' "$A" | jq -r '.metadata["pilot.wa_node_alias"] // ""')" ]; } || { jlog release "$id" 13 "conferencia-falhou"; die 13 "não consegui confirmar que $id foi solta — confira à mão"; }
-  T "$BD" -C "$store" comment "$id" "nó (ga-2hd02v.1.10): dono $as e $([ "$shape" = pilot ] && echo "marca $ukey" || echo "rota $ROUTE") soltos após a entrega (evita sessão nova a cada 15 min até o merge)." >/dev/null 2>&1 || true
+  T "$BD" -C "$store" comment "$id" "nó ($STORY): dono $as e $([ "$shape" = pilot ] && echo "marca $ukey" || echo "rota $ROUTE") soltos após a entrega (evita sessão nova a cada 15 min até o merge)." >/dev/null 2>&1 || true
   jlog release "$id" 0 "solta"; say "$id solta"; exit 0 ;;
 
 *) die 2 "comando desconhecido: $cmd (check|apply|release)" ;;

@@ -1,24 +1,28 @@
 # wa-worker-remote: o wa-worker que roda no servidor Hetzner, só para bead de código sem dado de lead/cliente (ga-2hd02v.1.10; regra do Athos 18/10: "nenhum dado de lead/cliente no nó").
 #
 # Contents
-#   O que é · INERTE até ligar · Por que 1 só · O que o provider faz com este arquivo · Como a bead chega · O que NÃO tem aqui
+#   O que é · INERTE até ligar · Por que 3 · O que o provider faz com este arquivo · Como a bead chega · O que NÃO tem aqui
 #
 # O QUE É: um wa-worker de pool (headless, sonnet) cujo nome de sessão contém `-remote-`; o `remote_match` do provider híbrido manda essa sessão ao host remoto (scripts/gc-session-ssh).
 #   Quem decide QUE bead vai para cá é scripts/wa-node-classify.py (código + teste sem banco real, nada que o filtro de rsync segure); o gancho do Pilot é PILOT_WA_NODE_ROUTE
 #   (default off). Ver docs/runbooks/hetzner-wa-node.md.
 # INERTE ATÉ LIGAR: min_active_sessions = 0 e nenhuma bead leva `gc.routed_to=wa-worker-remote` enquanto o Pilot estiver em `off`; a ativação viva (papel `wa-worker` em `worktree_rigs`
 #   do host e o modo do Pilot) é o passo de ligar do runbook, só depois do flip da ga-2hd02v.1.6 provado.
-# POR QUE 1 SÓ: mesmo primeiro degrau do dog-remote — prova com poucas beads reais antes de abrir mais slots; subir o teto é decisão do Mayor depois de medir.
+# POR QUE 3 (ga-2hd02v.3; Athos 20/10: "o que não pode é ficar menos do que 100% ocupado"): mesmo 2º degrau do dog-remote (escada 1→3→6→10, ga-2hd02v.1.11). Este teto é só o LIMITE do engine; quantos slots estão
+#   LIGADOS é PILOT_WA_NODE_SLOTS (1..9, padrão 1) com PILOT_WA_NODE_SPAWN=pilot — sem eles o wa-node-dispatch.sh segue em 1 slot e o pool abre a sessão, como na 1.10. PILOT_WA_NODE_SLOTS não
+#   passa deste teto (nem do `cap` do host em .gc/session-ssh.json, 6, dividido com dog-remote e gate-reviewer); o prod-test story-ga-2hd02v.3.sh cobra isso. O oráculo hetzner-capacity.py
+#   ainda decide, a cada bead, se cabe mais uma. Subir de 3 é medir antes: docs/runbooks/hetzner-wa-node.md, "N slots".
 # O QUE O PROVIDER FAZ COM ESTE ARQUIVO: ignora `work_dir` (a pasta não existe no host) e abre a sessão num worktree git novo do rig `whatsapp_automation`, criado pelo wt-add no start
 #   (config do host: "worktree_rigs": {"wa-worker": "whatsapp_automation"} — o papel é o que vem antes de `-remote-`). `pre_start` não existe aqui: o provider não o executa no host.
 # COMO A BEAD CHEGA: JÁ ATRIBUÍDA ao alias da sessão (o atalho bd/gc do servidor recusa `bd ready`, `bd query`, `bd update --claim` e `gc runtime drain-ack`). Quem despacha é
 #   scripts/wa-node-dispatch.sh (ou o gancho do Pilot) e a bead é achada por `bd list --status in_progress --assignee`. Ver prompt.template.md.
 # O QUE NÃO TEM AQUI: Dolt, a árvore da cidade, credencial do GitHub, o banco real, dado de lead/cliente. O push vai só ao espelho do mini.
-# literal, sem {{.AgentBase}}: com no máximo 1 sessão não há instância a distinguir, e a pasta só existe para o engine (o provider a troca pelo worktree)
+# literal, sem {{.AgentBase}}: o provider ignora a pasta (troca pelo worktree do host), então as sessões não precisam de pasta própria; só o engine a exige
 work_dir = ".gc/agents/wa-worker-remote"
 min_active_sessions = 0
-max_active_sessions = 1
-# Sem `gc runtime drain-ack` no atalho, quem encerra a sessão ociosa é este prazo (o stop do provider recolhe o worktree se nada se perde). Curto de propósito: o slot é 1.
+max_active_sessions = 3
+# Sem `gc runtime drain-ack` no atalho, quem encerra a sessão ociosa é este prazo (o stop do provider recolhe o worktree se nada se perde). Curto de propósito: sessão parada segura um slot do nó.
+# Dormir NÃO solta o alias: o Pilot acorda a sessão do alias (gc session wake) em vez de abrir outra, e o wa-node-dispatch.sh em modo pilot não conta sessão dormindo como slot ocupado.
 idle_timeout = "15m"
 wake_mode = "fresh"
 model = "sonnet"
