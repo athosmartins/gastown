@@ -21,8 +21,10 @@ COMANDOS  (todos aceitam --json; --dir muda a pasta de estado)
 
 OS DEGRAUS
   Sobe UM degrau (nunca pula) quando, desde a última mudança, passou `up_window_s`, há ao menos `up_min_reads` leituras e TODAS estão verdes
-  (CPU livre >= `cpu_up_headroom_pct` E RAM disponível >= `mem_up_avail_pct`), e em alguma delas o nó já tinha `sessões >= degrau` (prova de que aguentou
-  o degrau atual com carga; `require_load_proof=false` dispensa). Leitura que falhou NÃO é verde: atrasa a subida, nunca a adianta.
+  (CPU livre >= `cpu_up_headroom_pct` E RAM disponível >= `mem_up_avail_pct`), e em alguma delas o nó já tinha `sessões OCUPADAS >= degrau` (prova de que aguentou
+  o degrau atual com carga; `require_load_proof=false` dispensa). Só vale como prova a leitura em que o gc e o bd foram LIDOS (`idle_why` vazio): leitura em que um deles
+  falhou ou estourou o prazo não prova nada (nem veta: as outras leituras da janela seguem valendo), e a gravada antes da separação ocupada×ociosa também não.
+  Leitura que falhou NÃO é verde: atrasa a subida, nunca a adianta.
   Desce UM degrau com `down_reads` leituras seguidas vermelhas (CPU livre < `cpu_down_headroom_pct` OU RAM < `mem_down_avail_pct`). A faixa entre os
   limites é âmbar: mantém o degrau. Leitura que falhou não é vermelha: sem leitura, o degrau fica como está (e o veredito vira "não sei").
   CPU livre = o MENOR entre o ocioso de uma amostra de 2 s do /proc/stat e (1 - load5/núcleos): rajada curta e carga sustentada contam as duas.
@@ -36,13 +38,17 @@ O VEREDITO  (a primeira condição que falha decide; só `node` autoriza)
 
 SESSÃO OCUPADA × OCIOSA  (ga-2hd02v.1.22: o nó "cheio" de dogs parados)
   O nó lista as tmux vivas; uma sessão viva NÃO é uma sessão trabalhando. Uma dog-remote conta OCUPADA só se há uma bead `in_progress` atribuída ao alias dela
-  (dog-remote-<n>; o nome da sessão no nó, dog-remote-<id>, também vale) — essa bead é o sinal de trabalho. Sem bead, a sessão é uma vaga LIVRE: o Pilot a reaproveita
-  (atribui a bead e acorda o alias). Para casar a tmux do nó com o alias lê-se `gc session list --json` (session_name → alias).
+  (dog-remote-<n>; o nome da sessão no nó, dog-remote-<id>, também vale) — essa bead é o sinal de trabalho. Sem bead, a sessão é uma vaga LIVRE para ESTE oráculo.
+  Só a leitura chega a isso: o `_pilot_node_pick_alias` do Pilot ainda só escolhe alias novo ou dormindo, então uma dog-remote ACORDADA e ociosa não é aproveitada por ele
+  (veredito `node`, mas o Pick não acha alias) até o patch do engine do ga-2hd02v.1.22 entrar na janela e deixar a sessão morta pelo idle_timeout dormindo.
+  Para casar a tmux do nó com o alias lê-se `gc session list --json` (session_name → alias). Só as beads do HQ contam (`bd -C <cidade>`, in_progress, não efêmeras):
+  uma dog-remote trabalhando bead de rig ou efêmera aparece ociosa, coerente com a regra do Pilot de que só bead de dog do HQ vai ao nó.
   Conta sempre ocupada, sem prova em contrário: sessão que não é dog-remote-* (gate-reviewer, wa-worker), sessão cujo alias no gc não é de pool (`dog-remote-<n>`;
   dog-remote-adhoc-* não tem bead-por-alias), sessão que o gc não lista ou lista sem alias (sem dono conhecido não dá para dizer que está parada).
   Falhou/ilegível (gc ou bd com rc≠0, estourou o prazo, não é JSON, formato fora do esperado): TODAS as sessões do nó contam ocupadas e o motivo vai em `idle_why` —
   nunca "ociosa por falta de leitura", para não lotar o nó (é o veredito de antes desta leitura). Lista vazia lida com sucesso é a ausência de bead (vaga livre), não falha.
-  Leituras: `sessions` = ocupadas (o que o veredito e a prova de carga do degrau usam), `sessions_total` = tmux vivas, `sessions_idle` = vagas livres.
+  Leituras: `sessions` = ocupadas (o que o veredito e a prova de carga do degrau usam), `sessions_total` = tmux vivas, `sessions_idle` = vagas livres. Com `idle_why`
+  não vazio, `sessions` é o total vivo contado como ocupado: vale para o veredito (inerte: node_full) e NÃO vale como prova de carga (o `decide()` só conta a leitura com `idle_why` vazio).
   Prazo: o `gc session list` leva 10-21 s no mini com load 44 (medido 19/10) e o `bd list` ~3 s; as duas leituras correm em PARALELO (custo = o maior prazo, não a soma),
   com prazo de 25 s o gc e 15 s o bd, para caber nos 40 s que o Pilot dá ao veredito inteiro. A leitura é refeita no máximo a cada `refresh_s` (60 s). Estourou = ilegível = ocupadas.
 
@@ -445,8 +451,10 @@ def decide(st: dict, cfg: dict, now: int) -> dict:
     bad = [r for r in win if color(r, cfg) != "green"]
     if bad:
         unmet.append(f"{len(bad)} de {len(win)} leituras da janela não estão verdes ({', '.join(sorted({color(r, cfg) for r in bad}))})")
-    if cfg["require_load_proof"] and not any(isinstance(r.get("sessions"), int) and r["sessions"] >= cur for r in win):
-        unmet.append(f"prova de carga: nenhuma leitura da janela com >= {cur} sessões no nó")
+    # vazio (sessions 0, ou nó sem dog-remote) → 0 >= cur é falso, não prova; falhou/ilegível (sessions não inteiro, ou idle_why com motivo / ausente = gc ou bd não lidos, ou leitura anterior à
+    # separação ocupada×ociosa) → essa leitura não prova e não veta: o teto só sobe por outra leitura da janela que provou. `sessions` com idle_why é o TOTAL vivo contado como ocupado (inerte para o veredito).
+    if cfg["require_load_proof"] and not any(isinstance(r.get("sessions"), int) and r.get("idle_why") == "" and r["sessions"] >= cur for r in win):
+        unmet.append(f"prova de carga: nenhuma leitura da janela, com gc e bd lidos, com >= {cur} sessões ocupadas no nó")
     if unmet:
         return {"action": "hold", "to": cur, "why": "não subiu: " + "; ".join(unmet), "unmet": unmet}
     return {"action": "up", "to": steps[i + 1], "unmet": [],

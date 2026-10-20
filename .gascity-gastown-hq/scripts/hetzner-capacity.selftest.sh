@@ -25,6 +25,8 @@
 #     só as com bead · a bead no nome da sessão também vale · bead de outro dono e a sem dono não contam · TERCEIRO ESTADO: bd ou gc que falha / devolve lixo / não-lista / vazio
 #     = todas as sessões contam OCUPADAS (node_full, com o motivo em idle_why), nunca "ociosas" · `[]` lido = ninguém trabalha = vaga · sessão sem alias, fora da lista do gc,
 #     gate-reviewer / wa-worker / dog-remote-adhoc contam ocupadas · a prova de carga do degrau é de sessão OCUPADA (dog ocioso não faz o teto subir) ·
+#     TERCEIRO ESTADO na prova de carga: leitura em que o gc ou o bd falhou / estourou o prazo (idle_why com motivo, sessions = total vivo contado ocupado) e a gravada antes da separação
+#     (sem idle_why) NÃO provam carga — nem vetam: uma leitura que falhou no meio de leituras ocupadas lidas ainda deixa subir ·
 #     PRAZO: gc e bd correm em PARALELO (o custo é o maior prazo, não a soma: o gc leva 10-21 s no mini carregado e o Pilot dá 40 s ao veredito inteiro) · estourar o prazo
 #     de qualquer um é ilegível (ocupadas, motivo 'prazo') · HETZNER_CAPACITY_READ_TIMEOUT_S só encurta o prazo e o valor inválido cai no padrão.
 # CONTROLE NEGATIVO: ilegível contado como verde · sem prova de carga · degrau que pula · evidência que vale duas vezes · `present()` que engole erro · veredito sem o
@@ -34,7 +36,7 @@
 #   sem catch-all · catch-all que sai 1 · ssh que não executa vira nó fora · gate_done_bin relativo aceito · (ga-2hd02v.1.22) rc≠0 do gc/bd ignorado · leitura que falhou conta ociosa ·
 #   bead de qualquer dono / só a primeira bead / saída não-lista vira "ninguém trabalha" · sessão sem alias, gate-reviewer / wa-worker e dog-remote-adhoc contam ociosas ·
 #   bead no nome da sessão não vale · o veredito conta todas as vivas · sessão fantasma sem dog-remote · leituras em sequência · prazo estourado vira lista vazia ·
-#   prazo de teste que alonga o padrão · prazo inválido/<=0 vira quase zero — cada um é aplicado numa cópia e a bateria TEM que falhar.
+#   prazo de teste que alonga o padrão · prazo inválido/<=0 vira quase zero · prova de carga que aceita leitura com idle_why com motivo / sem idle_why — cada um é aplicado numa cópia e a bateria TEM que falhar.
 # VARIÁVEIS: HC_UNDER_TEST (script a testar) · HC_PY (interpretador; padrão /usr/bin/python3 = o 3.9 do mini) · HC_NO_MUTANTS=1 · HC_ONLY=<grupo> (só g_<grupo>: read, step, verdict, third, idle; sem mutantes)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -419,6 +421,28 @@ sp=importlib.util.spec_from_file_location("hc",sys.argv[1]); m=importlib.util.mo
   check "step: 3 sessões OCIOSAS não são prova de carga → não sobe do degrau 1" "1" "$(ceil)"
   newcity; sess 3; busy all; node 70 3 90; series 0 2400 300
   check "step: 3 sessões OCUPADAS são prova de carga → sobe para 3" "3" "$(ceil)"
+
+  # TERCEIRO ESTADO na prova de carga (gate-fix 1): quando o gc ou o bd não é LIDO, `sessions` guarda o TOTAL vivo contado como ocupado. Para o veredito isso é o inerte
+  # (node_full); para a prova de carga seria o contrário (dog ocioso subiria o teto). Leitura sem a separação ocupada×ociosa feita não prova nada.
+  newcity; sess 3; busy none; node 70 3 90; echo 1 > "$W/bd.rc"; series 0 2400 300
+  check "step: bd falhando o tempo todo, 3 sessões sem bead → NÃO sobe (leitura que não separou ocupada de ociosa não é prova de carga)" "1" "$(ceil)"
+  newcity; sess 3; busy none; node 70 3 90; echo 1 > "$W/gcl.rc"; series 0 2400 300
+  check "step: gc falhando o tempo todo, 3 sessões sem bead → NÃO sobe" "1" "$(ceil)"
+  newcity; sess 3; busy none; node 70 3 90; echo 4 > "$W/gcl.sleep"; RT=1; series 0 2400 300
+  check "step: gc estourando o prazo o tempo todo, 3 sessões sem bead → NÃO sobe" "1" "$(ceil)"
+  newcity; sess 3; busy none; node 70 3 90; series 0 1200 300; echo 1 > "$W/bd.rc"; series 1500 1500 300; rm -f "$W/bd.rc"; series 1800 2400 300
+  check "step: UMA leitura com bd falhando no meio de uma janela de dogs ociosos já seria prova com any(): não sobe" "1" "$(ceil)"
+  # os controles: a guarda não pode ser larga demais (leitura que falhou não VETA a subida; as outras da janela seguem valendo)
+  newcity; sess 3; busy all; node 70 3 90; series 0 1200 300; echo 1 > "$W/bd.rc"; series 1500 1500 300; rm -f "$W/bd.rc"; series 1800 2400 300
+  check "step: uma leitura com bd falhando no meio de leituras com 3 OCUPADAS lidas → ainda sobe para 3 (não veta)" "3" "$(ceil)"
+  # leitura gravada antes da separação ocupada×ociosa (sem idle_why): não sabe quantas eram ociosas → não prova; com idle_why "" (lida) a mesma leitura prova
+  for why in '' ',"idle_why":""'; do
+    newcity; sess 3; busy none; node 70 3 90; rd=""
+    for t in 600 900 1200 1500 1800 2100; do rd="$rd{\"t\":$((T0 + t)),\"state\":\"ok\",\"sessions\":3,\"cpu_headroom_pct\":70.0,\"mem_avail_pct\":90.0$why},"; done
+    printf '{"v":1,"ceiling":1,"changed_at":%s,"changed_why":"x","readings":[%s]}' "$T0" "${rd%,}" > "$D/state.json"; at 2400; hc --json step
+    if [ -z "$why" ]; then check "step: leituras gravadas SEM idle_why (antes da separação) não provam carga → não sobe" "1" "$(ceil)"
+    else check "step: as mesmas leituras COM idle_why vazio (gc e bd lidos, 3 ocupadas) provam → sobe para 3" "3" "$(ceil)"; fi
+  done
 }
 
 if [ -n "${HC_MUTANT:-}" ]; then g_third; g_read; g_step; g_verdict; g_idle; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
@@ -500,6 +524,8 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
   mutant "o prazo do teste alonga o padrão" '    return min(v, default) if v > 0 else default' '    return v if v > 0 else default'
   mutant "prazo inválido ou <= 0 vira prazo quase zero" '    return min(v, default) if v > 0 else default' '    return min(v, default) if v > 0 else 0.001'
   mutant "sem dog-remote no nó, conta uma sessão fantasma" 'return others, 0, ""' 'return others + 1, 0, ""'
+  mutant "a prova de carga aceita leitura com gc/bd não lidos (idle_why com motivo)" ' and r.get("idle_why") == "" and r["sessions"] >= cur' ' and r["sessions"] >= cur'
+  mutant "a prova de carga aceita leitura sem idle_why (anterior à separação ocupada×ociosa)" 'r.get("idle_why") == ""' 'not r.get("idle_why")'
 }
 echo "── $((n - fails))/$n ok"
 [ "$fails" = 0 ]
