@@ -22,6 +22,10 @@
 		<string>whatsapp_automation property_scrapers</string>
 		<key>PILOT_CTX_READY_RIG_QUERIES</key>
 		<string>1</string>
+		<key>PILOT_DOLT_CPU_MAX</key>
+		<string>120</string>
+		<key>PILOT_NODE_FIRST</key>
+		<string>on</string>
 		<key>PILOT_PS_WORKER_MAX</key>
 		<string>1</string>
 		<key>PILOT_SPAWN_PS_WORKER</key>
@@ -30,6 +34,8 @@
 		<string>1</string>
 		<key>PILOT_SUSPENDED_CREWS_OVERRIDE</key>
 		<string>batista-ps</string>
+		<key>PILOT_WA_NODE_ROUTE</key>
+		<string>label</string>
 		<key>PILOT_WA_WORKER_MAX</key>
 		<string>2</string>
 	</dict>
