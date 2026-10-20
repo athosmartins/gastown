@@ -14,9 +14,9 @@ COMANDOS  (todos aceitam --json; --dir muda a pasta de estado)
             (inclui erro interno nosso: reason "internal"; um traceback do Python sairia 1, que aqui é MINI, por isso `main` pega tudo).
             Quem chama trata 1 e 2 do mesmo jeito (fica no mini); a diferença está no motivo, para o log.
   step      o mesmo ciclo (mede se vencido, avalia, grava) sem dar veredito. Para um agendador. exit 0 se rodou, 3 se não conseguiu gravar/ler a configuração (ou erro interno).
-            O agendador (com.gascity.hetzner-capacity-step, a cada 180 s) é o relógio das leituras: o degrau não pode depender de o Pilot pedir veredito (ga-2hd02v.2).
+            Quem agenda é o job com.gascity.hetzner-capacity-step (180 s; o plist está em scripts/ e instalar é do Mayor): o degrau não pode depender de o Pilot pedir veredito (ga-2hd02v.2).
   hourly    só LÊ readings.jsonl: CPU OCUPADA (100 - ocioso) média por hora cheia UTC das últimas --hours (24) horas completas. exit 0 = toda hora tem leitura e média >= --min-pct (85),
-            1 = alguma hora abaixo ou SEM leitura (hora sem leitura não prova nada: não é 0% nem é OK), 3 = não consegui ler o arquivo. É a consulta da prova ao vivo da meta.
+            1 = alguma hora abaixo ou SEM leitura (hora sem leitura não prova nada: não é 0% nem é OK), 3 = não consegui ler o arquivo ou argumento fora de faixa. É a consulta da prova ao vivo da meta.
   status    só LÊ (sem ssh, sem gravar): degrau, leituras, o que falta para subir, tetos fixos (cap do provider) e as condições do veredito.
   read      uma medição avulsa, nada é gravado. exit 0 lida, 1 não consegui, 3 erro de configuração/estado ou interno.
   set-ceiling N --reason T   força um degrau (só os da lista), registrado em events.jsonl. O ciclo seguinte continua a partir dele.
@@ -689,6 +689,7 @@ def hourly(env: Env, now: int, hours: int, min_pct: float) -> dict:
         h = r["t"] // 3600
         if h not in busy:
             continue
+        # vazio/falhou/ilegível (leitura que não é ok, sem cpu_idle_pct, não numérico ou fora de 0..100) → conta em `falhas` e fica fora da média: nunca vira 0% nem 100% de CPU
         idle = r.get("cpu_idle_pct")
         if r.get("state") == "ok" and is_num(idle) and 0 <= idle <= 100:
             busy[h].append(100.0 - idle)
