@@ -374,7 +374,7 @@ EOF
 )
 eqs "$COLL" "dog-remote gate-reviewer-remote wa-worker-remote ps-worker-remote"; ok $? "ambiguidade do -N: só os nomes sem cauda colidem pelo IDENTITY_PATTERN do runbook (achei: '$COLL')"
 for x in $COLL; do
-  reset_db2; run_exe_a GC_SESSION_NAME="$x" -- ga-t2 "worker/$x-2" "$SHA"
+  reset_db2; run_exe_a GC_SESSION_NAME="$x" GC_ALIAS="$x-1" BEADS_ACTOR="$x-1" -- ga-t2 "worker/$x-2" "$SHA"   # alias do MESMO papel da sessão (senão a identidade mista recusa antes)
   ok $((RC != 1)) "sessão sem cauda '$x' com worker/$x-2: recusa 1"; has "$T/err" "branch principal de OUTRA sessão"; ok $? "'$x': diz que worker/$x-2 pode ser de OUTRA sessão"
   [ "$(mut_count)" = 0 ]; ok $? "'$x': nada escrito"
 done
@@ -462,6 +462,9 @@ run_ps; ok $((RC != 1)) "PS: duas beads do alias na loja do rig: recusa 1"; has 
 mk_work unk.txt "worker/remote-e2e-1"; SHAU=$NEWSHA
 reset_ps; run_exe GC_SESSION_NAME=remote-e2e-1 GATE_DONE_REMOTE_DRY_RUN=1
 ok $((RC != 0)) "papel desconhecido (remote-e2e-1): sai 0 e trata como o rig do HQ"; has "$T/out" "bead=ga-t1 worker/remote-e2e-1@${SHAU:0:12}"; ok $? "papel desconhecido: a bead é a ga-t1 da loja da cidade"
+# identidade mista (o identity_pattern do atalho é global): alias de um papel com sessão de outro = recusa 2 antes de ler qualquer bead
+reset_ps; run_ps GC_ALIAS="$ALIAS" BEADS_ACTOR="$ALIAS"; ok $((RC != 2)) "PS identidade mista (alias dog-remote-1, sessão ps-worker-remote-…): recusa 2"; has "$T/err" "identidade mista"; ok $? "identidade mista: diz o motivo"; ps_nothing; ok $? "identidade mista: nada escrito"
+reset_ps; run_exe GC_ALIAS="$PSALIAS" BEADS_ACTOR="$PSALIAS"; ok $((RC != 2)) "HQ identidade mista (alias ps-worker-remote-1, sessão dog-remote-…): recusa 2"; has "$T/err" "identidade mista"; ok $? "HQ identidade mista: diz o motivo"; ps_nothing; ok $? "HQ identidade mista: nada escrito"
 # o papel da sessão limita o rig: ps-worker-remote com bead ga-…, dog-remote com bead ps-…
 reset_ps; run_ps -- ga-t1 "worker/$PSSESS" "$PSSHA"; ok $((RC != 1)) "PS sessão com bead ga-…: recusa 1"; has "$T/err" "é de outro prefixo (ga)"; ok $? "PS sessão com bead ga-…: diz que é de outro prefixo"; ps_nothing; ok $? "PS sessão com bead ga-…: nada escrito"
 reset_ps; run_exe_a -- ps-t1 "worker/$SESS" "$SHA"; ok $((RC != 1)) "dog-remote com bead ps-…: recusa 1"; has "$T/err" "é de outro prefixo (ps)"; ok $? "dog-remote com bead ps-…: diz que é de outro prefixo"; ps_nothing; ok $? "dog-remote com bead ps-…: nada escrito"
@@ -558,6 +561,8 @@ case_ps_node_mark() { reset_ps; run_ps; [ "$(psq '.beads["ps-t1"].metadata | has
 case_ps_no_routes() { reset_ps; printf '{"prefix":"ga","path":"."}\n' > "$CITY/.beads/routes.jsonl"; run_ps; r=$RC; e=0; has "$T/err" "não achei a rota do prefixo 'ps'" && e=1; cp "$T/routes.orig" "$CITY/.beads/routes.jsonl"; [ "$r" = 1 ] && [ "$e" = 1 ] && ps_nothing; }
 case_ps_unknown_prefix() { reset_ps; run_ps GC_SESSION_NAME=wa-worker-remote-abc123 GC_ALIAS=wa-worker-remote-1 BEADS_ACTOR=wa-worker-remote-1; [ "$RC" = 1 ] && ps_nothing; }
 case_unknown_role() { reset_ps; run_exe GC_SESSION_NAME=remote-e2e-1 GATE_DONE_REMOTE_DRY_RUN=1; [ "$RC" = 0 ] && has "$T/out" "bead=ga-t1 worker/remote-e2e-1@"; }
+case_mixed_identity() { reset_ps; run_ps GC_ALIAS="$ALIAS" BEADS_ACTOR="$ALIAS"; [ "$RC" = 2 ] && has "$T/err" "identidade mista" && ps_nothing; }
+mutant ps-identidade-mista-vale 'if rig_of_session(alias) != role_prefix:' 'if False:' case_mixed_identity
 mutant ps-loja-da-cidade        'bead = one_bead(ctx.store, alias)' 'bead = one_bead(city, alias)' case_ps_happy
 mutant ps-guarda-de-prefixo     'if bpfx != role_prefix:' 'if False:' case_ps_prefix_guard
 mutant ps-rotas-do-hq           'bead = named_bead(city, alias, args[0], ctx.store, ctx.rig.routes)' 'bead = named_bead(city, alias, args[0], ctx.store)' case_ps_back_hq_route

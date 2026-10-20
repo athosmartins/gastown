@@ -38,7 +38,7 @@ O QUE NÃO FAZ
   Não roda a checagem "NEW READS NEED A FAILURE TEST" nem a auto-auditoria do diff (são do construtor, antes do push): o marcador registra
   `self_audit: … auto-auditoria do diff NÃO verificada aqui`, visível, não calado.
   Só os rigs da tabela RIGS (gascity, property_scrapers, whatsapp_automation; ga-2hd02v.4): o PREFIXO da bead decide a loja do bead, o repositório do worktree e o espelho, e o PAPEL da sessão
-  (dog-remote, ps-worker-remote, wa-worker-remote) decide de que rig ela pode submeter (sessão de outro papel, ou prefixo fora da tabela → recusa; nome de sessão que não é de nenhum papel vale como
+  (dog-remote, ps-worker-remote, wa-worker-remote) decide de que rig ela pode submeter (alias e sessão de papéis diferentes, sessão de outro papel, ou prefixo fora da tabela → recusa; nome de sessão que não é de nenhum papel vale como
   dog-remote, o comportamento de antes). O marcador do gate mora SEMPRE na loja da cidade; a bead, na do rig. Não força push: um branch fix/<bead>-… que já está no
   origin e não é ancestral do novo sha (histórico reescrito) é recusado pelo próprio passo 1 do gate-done.md.
   Se uma execução morrer no meio (kill do wrapper), sobra o worktree/branch: a próxima recusa e diz o que recolher (nunca apaga o que não criou).
@@ -374,6 +374,9 @@ def main() -> int:
     os.environ.update({"GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "gc.auto", "GIT_CONFIG_VALUE_0": "0", "GIT_CONFIG_KEY_1": "maintenance.auto", "GIT_CONFIG_VALUE_1": "false"})
     mirror = os.environ.get("GATE_DONE_REMOTE_MIRROR") or ""  # só vale para o rig do HQ (teste); os outros rigs usam sempre o espelho do próprio nome
     role_prefix = rig_of_session(sess)
+    # o identity_pattern do atalho é GLOBAL (casa os quatro papéis), então alias de um papel com sessão de outro passa por ele: aqui o alias e a sessão têm de ser do MESMO papel (nome sem papel vale como o HQ nos dois)
+    if rig_of_session(alias) != role_prefix:
+        raise Stop(f"identidade mista: o alias {alias!r} é do rig {RIGS[rig_of_session(alias)].name} e a sessão {sess!r} é do rig {RIGS[role_prefix].name}: não submeto", 2)
     args = sys.argv[1:]
     want = None
     if args:  # forma com argumentos: o dog diz a bead, o ref do espelho e o sha (ga-2hd02v.1.18); nada é lido antes de a forma e o ref passarem
