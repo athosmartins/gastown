@@ -243,6 +243,63 @@ export GC_SSH_CONFIG=$T/session-ssh.json
 reset; setpool alfa@example.test; g . 0 ok; age checked -1000; g "mesma conta, estado vencido, janela de 1 h aberta: não repete a chamada de modelo" 0 ok; eq "...a chamada de modelo gasta cota: foi 1 só" "$(calls probe)" 1
 unset GC_SSH_CONFIG
 unset FAKE_VAULT FAKE_SECRET_LOG
+echo "== cota: o texto REAL do limite semanal / de sessão e o horário em que renova (ga-2hd02v.7)"
+# MEDIDO 20/10: a conta do nó bateu o limite semanal e o gate dizia "blocked: unknown: erro de modelo não reconhecido: You've hit your weekly limit" (QUOTA_RE só
+# conhecia "usage limit"). O texto veio da transcrição do revisor remoto (isApiErrorMessage, error rate_limit); "session limit" e o fuso com NOME são os que o mini mede
+# (claude-quota-check.selftest.sh). O formato do `result` do `claude -p` para o limite NÃO foi medido aqui: assume-se o mesmo texto da tela.
+P_WEEKLY="{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"You've hit your weekly limit · resets Oct 22, 4pm (UTC)\"}"
+P_SESSION="{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"You've hit your session limit · resets 1:00pm (America/Sao_Paulo)\"}"
+reset; setprobe "$P_WEEKLY" 1; g "MEDIDO 20/10: o limite semanal é quota, não 'unknown'" 1 "blocked: quota"; has "o texto do claude fica no motivo" "$GOUT" "resets Oct 22, 4pm (UTC)"
+reset; setprobe "$P_SESSION" 1; g "o limite de sessão (5 h) também é quota" 1 "blocked: quota"
+reset; setprobe "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"You've hit your Opus limit · resets 9am (UTC)\"}" 1; g "limite de modelo ('hit your Opus limit') é quota" 1 "blocked: quota"
+reset; setprobe "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"Something else broke · resets soon\"}" 1; g "erro que cita 'resets' sem falar de limite continua 'unknown'" 1 "blocked: unknown"
+reset; g . 0 ok; setprobe "$P_WEEKLY" 1; age checked -1000; age probe -5000; g . 1 quota; eq "o limite semanal também não avisa o celular (regra da cidade: nada de aviso de cota)" "$(notifys)" 0
+# parse_reset(texto, agora) -> época do horário em que renova, ou None quando não dá para saber. O fuso entre parênteses MANDA (o mini assume São Paulo; aqui o texto diz qual é).
+# vazio → sem "resets" no texto: None; falhou/ilegível → fuso ausente, inventado ou que não é nome de zona, data impossível, hora fora de 1-12: None (nunca uma hora chutada)
+pr() { python3 -I - "$S" "$1" "$2" <<'PY'
+import datetime as d, importlib.machinery as im, importlib.util as iu, sys
+ldr = im.SourceFileLoader("hzc", sys.argv[1]); spec = iu.spec_from_loader("hzc", ldr); m = iu.module_from_spec(spec); ldr.exec_module(m)
+now = int(d.datetime.strptime(sys.argv[3], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=d.timezone.utc).timestamp())
+r = m.parse_reset(sys.argv[2], now)
+print("None" if r is None else d.datetime.fromtimestamp(r, d.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+PY
+}
+N=2026-10-20T22:30:00Z
+eq "reset: o texto MEDIDO (data + hora + UTC)" "$(pr "You've hit your weekly limit · resets Oct 22, 4pm (UTC)" $N)" 2026-10-22T16:00:00Z
+eq "reset: só a hora, com fuso de nome; já passou hoje -> amanhã" "$(pr "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)" $N)" 2026-10-21T16:00:00Z
+eq "reset: só a hora, ainda não passou hoje -> hoje" "$(pr "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)" 2026-10-20T14:00:00Z)" 2026-10-20T16:00:00Z
+eq "reset: 'Jun 12 at 8pm' (formato do mini)" "$(pr "You've hit your weekly limit · resets Jun 12 at 8pm (America/Sao_Paulo)" 2026-06-10T15:00:00Z)" 2026-06-12T23:00:00Z
+eq "reset: dezembro lendo janeiro -> o ano que vem" "$(pr "You've hit your weekly limit · resets Jan 3 at 8pm (America/Sao_Paulo)" 2026-12-30T12:00:00Z)" 2027-01-03T23:00:00Z
+eq "reset: 12am é meia-noite" "$(pr "resets 12am (UTC)" $N)" 2026-10-21T00:00:00Z
+eq "reset: 12pm é meio-dia" "$(pr "resets 12pm (UTC)" $N)" 2026-10-21T12:00:00Z
+eq "reset: com minutos" "$(pr "resets 4:30pm (UTC)" $N)" 2026-10-21T16:30:00Z
+eq "reset: sem fuso -> None (o fuso do cliente não é o do texto)" "$(pr "You've hit your weekly limit · resets Oct 22, 4pm" $N)" None
+eq "reset: fuso inventado -> None" "$(pr "resets 4pm (Mars/Olympus)" $N)" None
+eq "reset: o 'fuso' é um prazo relativo -> None" "$(pr "resets 3:00pm (in 45min)" $N)" None
+eq "reset: data impossível -> None" "$(pr "resets Feb 30, 4pm (UTC)" $N)" None
+eq "reset: hora fora de 1-12 -> None" "$(pr "resets 13pm (UTC)" $N)" None
+eq "reset: sem a palavra resets -> None" "$(pr "You've hit your weekly limit" $N)" None
+eq "reset: fuso que é caminho -> None" "$(pr "resets 4pm (../../etc/passwd)" $N)" None
+# no gate de verdade: o estado guarda o horário e o gate diz quando renova (texto montado do relógio de agora, para não depender do dia em que o teste roda)
+read -r RTXT RE REISO < <(python3 -I -c 'import datetime as d
+t = (d.datetime.now(d.timezone.utc) + d.timedelta(days=2)).replace(hour=16, minute=0, second=0, microsecond=0)
+print("%s_%d" % (["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][t.month - 1], t.day), int(t.timestamp()), t.strftime("%Y-%m-%dT%H:%M:%SZ"))')
+P_FUT="{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"You've hit your weekly limit · resets ${RTXT/_/ }, 4pm (UTC)\"}"
+reset; setprobe "$P_FUT" 1; g "gate: quota com horário" 1 "blocked: quota"; has "o gate diz quando renova" "$GOUT" "$REISO"
+eq "o estado guarda reset_at (época)" "$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("reset_at"))' "$SF")" "$RE"
+reset; setprobe "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"You've hit your weekly limit · resets Oct 22, 4pm\"}" 1; g "sem fuso no texto: continua quota" 1 "blocked: quota"
+hasnt "e não inventa um horário" "$GOUT" "renova em"; eq "nem grava reset_at" "$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("reset_at"))' "$SF")" None
+# quota com horário JÁ VENCIDO: não espera os 15 min da janela de retry, mede de novo (voltar quando a conta renovar); horário no futuro: segue a janela
+setreset() { python3 -I - "$SF" "$1" <<'PY'
+import json, sys, time
+p, secs = sys.argv[1], float(sys.argv[2])
+d = json.load(open(p)); r = int(time.time() + secs); d["reset_at"] = r; d["probe"]["reset_at"] = r
+json.dump(d, open(p, "w"))
+PY
+}
+reset; setprobe "$P_FUT" 1; g . 1 quota; setreset -10; age checked -1000; age probe -100; g "reset vencido, dentro da janela de retry: mede de novo" 1 quota; eq "2 chamadas de modelo" "$(calls probe)" 2
+reset; setprobe "$P_FUT" 1; g . 1 quota; setreset 3600; age checked -1000; age probe -100; g "reset no futuro, dentro da janela: não repete" 1 quota; eq "continua 1 chamada" "$(calls probe)" 1
+reset; setprobe "$P_FUT" 1; g . 1 quota; setreset -10; age checked -1000; age probe -100; setprobe "$P_OK" 0; g "renovou: volta a ok na primeira medição depois do horário" 0 ok; eq "e não guarda o horário velho" "$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("reset_at"))' "$SF")" None
 
 echo "== status"
 reset; out=$(python3 -I "$S" status); eq "status ok" $? 0; has "json" "$out" '"state": "ok"'
