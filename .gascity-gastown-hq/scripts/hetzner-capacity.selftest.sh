@@ -641,6 +641,17 @@ EOF
   check "claude: comando do gate que não executa → NÃO SEI claude_unknown (rc 2)" "2 unknown claude_unknown" "$RC $(jget verdict) $(jget reason)"
   cnew; CC='isto não é uma lista JSON'; hc --json verdict
   check "claude: HETZNER_CAPACITY_CLAUDE_CMD que não é lista JSON → NÃO SEI claude_unknown (rc 2), sem traceback" "2 unknown claude_unknown" "$RC $(jget verdict) $(jget reason)"
+  # a pergunta que LEVANTOU exceção (NUL no argumento: o subprocess levanta ValueError, que o gate não trata) → NÃO SEI, nunca NÓ
+  cnew; CC='["a\u0000b"]'; hc --json verdict
+  check "claude: pergunta que levantou exceção (NUL no comando do gate) → NÃO SEI claude_unknown (rc 2)" "2 unknown claude_unknown" "$RC $(jget verdict) $(jget reason)"
+  case "$(jget detail)" in *"falhou (ValueError"*) ok 0 "claude: o detalhe da exceção diz que a pergunta falhou e com qual erro";; *) ok 1 "claude: o detalhe da exceção não diz o erro (veio '$(jget detail)')";; esac
+  # o veredito SEM a pergunta (verdict() chamado sem o gate) o CLI nunca alcança — o main dispara a pergunta em todo `verdict` —, então só a chamada direta prova que ele não vira ok; o 3º é o controle: resposta ok vale ok
+  cr() { "$PY" -I -c 'import importlib.util,sys
+sp=importlib.util.spec_from_file_location("hc",sys.argv[1]); m=importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+class F:
+    def result(self): raise RuntimeError("x")
+print(m.claude_result(None)[:8], m.claude_result(F())[:8], m.claude_result(type("O", (), {"result": lambda s: "ok"})()))' "$P"; }
+  check "claude: sem a pergunta → unknown; pergunta que levantou exceção → unknown; só a resposta ok do gate vale ok" "unknown: unknown: ok" "$(cr)"
   # a ordem das condições: pausa e nó cheio vêm antes da pergunta ao Claude
   cnew; gate_says 1 "blocked: quota: x"; hc --json pause --reason "janela"; hc --json verdict
   check "claude: pausa do Mayor + gate blocked → a pausa decide (MINI paused)" "1 paused" "$RC $(jget reason)"
@@ -785,6 +796,7 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
   mutant "comando do gate do Claude que não executa vale como ok" 'return f"unknown:o gate do Claude não rodou ({ex})"' 'return "ok"'
   mutant "comando do gate do Claude mal configurado vale como ok" 'return f"unknown:{e}"' 'return "ok"'
   mutant "veredito sem a pergunta ao gate do Claude vale como ok" 'return "unknown:o login do Claude do nó não foi perguntado"' 'return "ok"'
+  mutant "pergunta ao gate do Claude que levantou exceção vale como ok" 'return f"unknown:a pergunta ao gate do Claude falhou ({type(e).__name__}: {e})"' 'return "ok"'
   mutant "a pergunta ao gate corre DEPOIS da medição (a soma, não o maior)" '        claude = ThreadPoolExecutor(max_workers=1).submit(claude_gate) if args.cmd == "verdict" else None
         res = tick(env, cfg, now, ssh_dest, refresh=ssh_dest is not None)' '        res = tick(env, cfg, now, ssh_dest, refresh=ssh_dest is not None)
         claude = ThreadPoolExecutor(max_workers=1).submit(claude_gate) if args.cmd == "verdict" else None'
