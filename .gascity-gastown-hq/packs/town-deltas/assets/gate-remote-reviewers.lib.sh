@@ -13,7 +13,8 @@
 # A FLAG $GC_CITY/.gc/gate-remote-reviewers.on (precedente: gate-e5-second-reviewer.on); criá-la é o passo de ligar, decisão do Mayor
 # depois do flip da 1.6. Três estados: ligada / desligada / ilegível. O NÓ: `room`, `full`, `unready` (o start seria recusado) ou
 # `unknown` (não deu para ver), e `unknown` NÃO é `room`. Cabe = (vivas no nó < `cap` do host em .gc/session-ssh.json) E (remotos vivos
-# < max_active_sessions do template); os dois tetos são LIDOS. Saída não entendida (rc≠0, estouro, linha estranha, jq/`timeout`
+# < max_active_sessions do template) E o login do Claude do nó vale (`hetzner-claude.py gate` diz `ok`; login medido ruim = `unready`, gate que não soube dizer = `unknown`: ga-2hd02v.7);
+# os dois tetos são LIDOS. Saída não entendida (rc≠0, estouro, linha estranha, jq/`timeout`
 # ausente, teto ilegível) vira o template local: o pior erro é um revisor rodar onde sempre rodou, nunca um gate sem revisor. Cada
 # leitura diz o que faz quando vem VAZIA e quando FALHA (regra E12). Bash 3.2: só funções e atribuições no topo (o dispatcher roda sob
 # `set -euo pipefail`); toda função devolve 0 e comunica por stdout/globais.
@@ -22,6 +23,8 @@ GATE_REMOTE_TEMPLATE="${GATE_REMOTE_TEMPLATE:-gate-reviewer-remote}"
 GATE_REMOTE_LOCAL_TEMPLATE="${GATE_REMOTE_LOCAL_TEMPLATE:-gate-reviewer}"
 # Segundos que o `list-running` pode levar. Só inteiro >= 1; vazio, texto ou 0 voltam ao padrão (`timeout 0` = sem limite).
 GATE_REMOTE_PROBE_SECS="${GATE_REMOTE_PROBE_SECS:-30}"
+# Segundos que o `hetzner-claude.py gate` pode levar (com o cache vencido custa 1 ssh e, de hora em hora, uma chamada de modelo). Mesma regra: inteiro >= 1, senão o padrão.
+GATE_REMOTE_CLAUDE_SECS="${GATE_REMOTE_CLAUDE_SECS:-40}"
 
 GATE_REMOTE_PICK_TEMPLATE=""
 GATE_REMOTE_PICK_KIND=""
@@ -84,10 +87,33 @@ _gate_remote_host_facts() {
   return 0
 }
 
+# _gate_remote_claude_state — "ok", "blocked:<porquê>" ou "unknown:<porquê>": o login do Claude NO NÓ, perguntado ao `hetzner-claude.py gate` (ga-2hd02v.7). 20/10: a conta do nó bateu o
+#   limite semanal e todo revisor mandado para lá ficou 18 min no modal do limite, sem veredito; a lib só olhava vaga. Só `ok` (saída 0 e a linha exata) libera; `blocked: logged-out|expired|quota: …`
+#   (saída 1) é o veredito MEDIDO do login. O resto é unknown, que NÃO é ok: script ausente, sem python3 ou timeout, prazo, saída que não é 0 nem 1, linha estranha, `blocked: unreachable|unknown` (o gate não
+#   soube) e saída vazia. vazio → unknown (um gate que não disse nada não disse "ok"); falhou/ilegível → unknown também.
+_gate_remote_claude_state() {
+  local bin="${GATE_REMOTE_CLAUDE_BIN:-${GC_CITY:-}/scripts/hetzner-claude.py}" secs="$GATE_REMOTE_CLAUDE_SECS" py="" tbin="" raw="" rc=0 first=""
+  case "$secs" in ''|*[!0-9]*|0) secs=40 ;; esac
+  [ -r "$bin" ] || { printf 'unknown:%s not readable' "$bin"; return 0; }
+  py="$(command -v python3 2>/dev/null || true)"
+  [ -n "$py" ] || { printf 'unknown:no python3 to run the Claude gate'; return 0; }
+  tbin="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
+  [ -n "$tbin" ] || { printf 'unknown:no timeout/gtimeout binary to bound the Claude gate'; return 0; }
+  raw="$("$tbin" -k 5 "$secs" "$py" -I "$bin" gate 2>/dev/null </dev/null)" && rc=0 || rc=$?
+  first="$(printf '%s\n' "$raw" | head -n 1)" || first=""
+  case "$rc:$first" in
+    0:ok) printf 'ok' ;;
+    1:"blocked: logged-out: "*|1:"blocked: expired: "*|1:"blocked: quota: "*) printf 'blocked:%s' "${first#blocked: }" ;;
+    124:*|137:*) printf 'unknown:Claude gate timed out after %ss' "$secs" ;;
+    *) printf 'unknown:Claude gate said rc=%s [%s]' "$rc" "$(printf '%s' "$first" | cut -c1-80)" ;;
+  esac
+  return 0
+}
+
 # gate_remote_node_state — uma linha: "room", "full:<porquê>", "unready:<porquê>" ou "unknown:<porquê>".
 gate_remote_node_state() {
   local ssh_bin="${GATE_REMOTE_SSH_BIN:-${GC_CITY:-}/scripts/gc-session-ssh}" secs="$GATE_REMOTE_PROBE_SECS"
-  local tbin="" facts="" cap="" rig="" rel="" tcap="" raw="" rc=0 line="" total=0 rem=0
+  local tbin="" facts="" cap="" rig="" rel="" tcap="" raw="" rc=0 line="" total=0 rem=0 cg=""
   case "$secs" in ''|*[!0-9]*|0) secs=30 ;; esac
 
   # Config do host. VAZIO ou ilegível = não sabemos os tetos = unknown (nunca "cabe").
@@ -128,7 +154,14 @@ $raw
 EOF
   if [ "$total" -ge "$cap" ]; then printf 'full:node has %s of %s sessions' "$total" "$cap"; return 0; fi
   if [ "$rem" -ge "$tcap" ]; then printf 'full:node has %s of %s %s sessions' "$rem" "$tcap" "$GATE_REMOTE_TEMPLATE"; return 0; fi
-  printf 'room'
+
+  # Vaga não basta: o Claude do nó tem que estar logado e com cota. Por último, para só pagar o ssh quando a resposta pode mudar a escolha.
+  cg="$(_gate_remote_claude_state)" || cg="unknown:Claude gate call failed"
+  case "$cg" in
+    ok) printf 'room' ;;
+    blocked:*) printf 'unready:node Claude login not usable (%s)' "${cg#blocked:}" ;;
+    *) printf 'unknown:node Claude login unreadable (%s)' "${cg#unknown:}" ;;
+  esac
   return 0
 }
 
