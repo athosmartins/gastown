@@ -6,7 +6,7 @@
 #
 # CASOS (grupos, na ordem): cfg (configuração em vigor, plist, gramática do Python 3.9) · sess (sessões remotas: 3 estados, MBP fora) · cpu (/proc/stat por ssh: baseline, janela, recuo de contador,
 #   ssh que cai ou trava) · fila (arquivo do Pilot: ausente/velho/futuro/ilegível NÃO é zero; lojas) · estado (ocupado / ocioso / desconhecido: a tabela inteira) · alarme (sequência de 30 min, jitter, cooldown,
-#   mail que falha, modo foco, chave de ligar, vigia cego) · saida (JSONL, número por dia, arquivos corrompidos, --dry-run, instância única, crash e falha de gravação, nada fora de .gc).
+#   mail que falha, modo foco, chave de ligar, vigia cego) · baixa (aviso de CPU baixa, ga-2hd02v.6: CPU média < 85 % por 30 min, sem olhar fila, sessão nem foco; vigia cego para a CPU; o número por dia é a média de CPU) · saida (JSONL, número por dia, arquivos corrompidos, --dry-run, instância única, crash e falha de gravação, nada fora de .gc).
 # CONTROLE NEGATIVO: cada mutante (um trecho literal do script trocado, que tem de existir UMA vez) TEM de reprovar o grupo que o pega; mutante que passa = teste que não pega o bug. Só roda sem argumento e com o script de verdade.
 #   Cada mutante roda em segundo plano com o PRÓPRIO diretório temporário e para no 1º caso que reprova (o resto do grupo não diz nada de novo): sem isso eram ~80 grupos inteiros em série, mais de 10 min.
 # COMO RODAR: hetzner-occupancy-watch.selftest.sh [grupo ...]   (sem argumento: todos os grupos e o controle negativo). HETZNER_OCC_UNDER_TEST=<script> roda a suíte contra outra cópia.
@@ -122,8 +122,12 @@ fresh() {   # cidade, HOME, stubs e relógio novos; sessões = nenhuma remota; f
   NOW=${1:-$NOW0}; CB=0; CI=0; NCPU=16; RC=0; TENV=()
   STUB_GC_RC=0; STUB_GC_SLEEP=""; STUB_SSH_RC=0; STUB_SSH_SLEEP=""; STUB_MAIL_RC=0; STUB_SSH_FILE=""; STUB_OUTFAIL=""; STUB_BD_RC=0; STUB_BD_SLEEP=""
   PILOT_HQ=3; PILOT_WA=0; FOCUS=off; WOUT="$T/out.json"; WERR="$T/err"
+  # o aviso de CPU baixa (ga-2hd02v.6) nasce DESLIGADO aqui (régua 0 = nenhuma janela é baixa): os grupos antigos usam CPU de 0,3 % como "ocioso" e contam mails, e o de CPU baixa viria junto em todos.
+  # Quem testa o aviso novo (grupo baixa) e a configuração padrão (cfg) pede o padrão de verdade com fresh_lp.
+  LOWPCT="HETZNER_OCC_LOW_PCT=0"
   sessions_are "$SJ_NONE"; beads_are "$BJ_REMOTE"
 }
+fresh_lp() { fresh "$@"; LOWPCT=; }   # como o fresh, mas com o padrão de verdade do aviso de CPU baixa (85 %, 30 min, 3 h)
 W() {   # W [VAR=valor ...] [-- args do vigia] : roda o vigia no ambiente do cenário. stdout → $WOUT, stderr → $WERR, rc → $RC
   local extra=()
   while [ $# -gt 0 ] && [ "$1" != "--" ]; do extra+=("$1"); shift; done
@@ -135,7 +139,7 @@ W() {   # W [VAR=valor ...] [-- args do vigia] : roda o vigia no ambiente do cen
     STUB_BD_FILE="${STUB_BD_FILE:-}" STUB_BD_RC="${STUB_BD_RC:-0}" STUB_BD_SLEEP="${STUB_BD_SLEEP:-}" \
     STUB_DIR="$T/stub" STUB_STATE_FILE="$C/.gc/hetzner-occupancy.state.json" STUB_GC_FILE="${STUB_GC_FILE:-}" STUB_GC_RC="${STUB_GC_RC:-0}" STUB_GC_SLEEP="${STUB_GC_SLEEP:-}" \
     STUB_SSH_FILE="${STUB_SSH_FILE:-}" STUB_SSH_RC="${STUB_SSH_RC:-0}" STUB_SSH_SLEEP="${STUB_SSH_SLEEP:-}" STUB_MAIL_RC="${STUB_MAIL_RC:-0}" STUB_OUTFAIL="${STUB_OUTFAIL:-}" \
-    "${extra[@]+"${extra[@]}"}" python3 "$WATCH" "$@" >"$WOUT" 2>"$WERR"
+    ${LOWPCT:+"$LOWPCT"} "${extra[@]+"${extra[@]}"}" python3 "$WATCH" "$@" >"$WOUT" 2>"$WERR"
   RC=$?
 }
 statfile() {   # statfile <arquivo> <busy> <idle> <ncpu> : o que `grep '^cpu' /proc/stat` devolve entre os marcadores (com ruído de .bashrc antes, que o vigia tem de ignorar)
@@ -191,6 +195,20 @@ g_cfg() {
   eq "intervalo padrão = 900 s" 900 "$(reading interval_s)"
   eq "régua padrão = 0.5 núcleo" 0.5 "$(reading busy_cores)"
   eq "loja elegível padrão = só hq" '["hq"]' "$(reading stores)"
+  fresh_lp; W -- --print-config
+  eq "aviso de CPU baixa: régua padrão = 85 % (Athos 20/10: o nó pago tem de ficar perto de 100 %)" 85.0 "$(reading low_pct)"
+  eq "... por 30 min" 1800 "$(reading low_after_s)"; eq "... cooldown de 3 h" 10800 "$(reading low_cooldown_s)"
+  W HETZNER_OCC_LOW_PCT=70 HETZNER_OCC_LOW_AFTER_S=3600 HETZNER_OCC_LOW_COOLDOWN_S=60 -- --print-config
+  eq "env muda a régua de CPU baixa" 70.0 "$(reading low_pct)"; eq "env muda o prazo" 3600 "$(reading low_after_s)"; eq "env muda o cooldown" 60 "$(reading low_cooldown_s)"
+  W HETZNER_OCC_LOW_PCT=0 -- --print-config; eq "régua 0 é aceita (desliga o aviso de CPU baixa)" 0.0 "$(reading low_pct)"
+  W HETZNER_OCC_LOW_PCT=100 -- --print-config; eq "régua 100 é aceita" 100.0 "$(reading low_pct)"
+  local bad_pct
+  for bad_pct in 101 -1 nan inf abc ""; do
+    W HETZNER_OCC_LOW_PCT="$bad_pct" -- --print-config
+    check "HETZNER_OCC_LOW_PCT='$bad_pct' inválido: o vigia recusa (rc != 0, nunca vira uma régua que avisa o tempo todo)" "$([ "$RC" -ne 0 ] && echo 1 || echo 0)"
+  done
+  fresh
+  W -- --print-config
   eq "com a chave .on posta, o aviso está ligado" true "$(reading alarm)"
   rm -f "$C/.gc/hetzner-occupancy-alarm.on"; W -- --print-config
   eq "sem a chave .on o aviso está DESLIGADO (inerte por padrão)" false "$(reading alarm)"; : > "$C/.gc/hetzner-occupancy-alarm.on"
@@ -602,6 +620,161 @@ g_alarme() {
 }
 
 # ============================================================================================================================================================================
+g_baixa() {
+  local d before after m0
+  echo "--- baixa: CPU média < 85% por 30 min avisa o Mayor, mesmo com sessão segurando bead (a madrugada de 20/10: 7 h com 0–15 % de CPU e 'ocupado' em todas as leituras, zero aviso)"
+  fresh_lp; sessions_are "$SJ_REMOTE"; tick 900 5 >/dev/null
+  tick 900 5
+  eq "1ª janela abaixo de 85 %: sem aviso" 0 "$(mails)"; eq "... seguidas" 1 "$(reading baixas_seguidas)"; eq "... alarme.cpu_baixa = nao" nao "$(reading alarme.cpu_baixa)"
+  eq "... o estado é 'ocupado' (a sessão segura bead): o aviso não depende do estado" ocupado "$(reading estado)"
+  tick 900 5
+  eq "2ª janela (30 min de CPU medida): 1 mail ao Mayor" 1 "$(mails)"; eq "... destinatário" mayor "$(mailfield 1 to)"
+  eq "... alarme.cpu_baixa = enviado" enviado "$(reading alarme.cpu_baixa)"; eq "... e o estado segue 'ocupado' (nenhum aviso de ocioso nem de cego)" ocupado "$(reading estado)"
+  has "... assunto diz a CPU média" "CPU média de 0.3%" "$(mailfield 1 subj)"; has "... e o tempo" "30 min" "$(mailfield 1 subj)"
+  has "... corpo cita a régua" "abaixo de 85%" "$(mailfield 1 body)"; has "... e a sequência" "2 janelas seguidas" "$(mailfield 1 body)"
+  has "... corpo cita a CPU da última janela" "0.05 núcleo(s) de 16" "$(mailfield 1 body)"
+  has "... corpo dá o contexto: sessões vivas" "sessões remotas vivas: 1" "$(mailfield 1 body)"; has "... e quantas seguram bead" "segurando bead: 1" "$(mailfield 1 body)"
+  has "... e a fila do Pilot" "fila do Pilot (hq): 3" "$(mailfield 1 body)"; has "... e o foco" "foco do gate: desligado" "$(mailfield 1 body)"
+  has "... corpo diz que não depende de fila nem de sessão" "NÃO depende de fila nem de sessão" "$(mailfield 1 body)"
+  has "... corpo diz que o vigia não atribui nada" "não atribui" "$(mailfield 1 body)"
+  eq "... o cooldown já estava GRAVADO quando o mail saiu (se não der para gravar, o mail nem sai)" "$NOW" "$(jv "$T/stub/mail.1.state" alarme_baixa_em)"
+  tick 900 5; eq "continua baixa: cooldown, sem mail repetido" 1 "$(mails)"; eq "... alarme.cpu_baixa = cooldown" cooldown "$(reading alarme.cpu_baixa)"
+  idle_run 10; eq "11 janelas depois (2h45 após o aviso): ainda em cooldown" 1 "$(mails)"
+  tick 900 5; eq "3 h depois do aviso: o 2º aviso sai" 2 "$(mails)"
+
+  echo "--- baixa: a régua é 85 % (< e não <=); janela alta zera a sequência; leitura ilegível nunca conta como baixa"
+  fresh_lp; tick 900 5 >/dev/null; tick 900 1360
+  eq "janela de exatamente 85.0 %: não é baixa" 85.0 "$(reading cpu.pct)"; eq "... seguidas = 0" 0 "$(reading baixas_seguidas)"
+  tick 900 1359; eq "janela de 84.9 %: é baixa" 84.9 "$(reading cpu.pct)"; eq "... seguidas = 1" 1 "$(reading baixas_seguidas)"
+  fresh_lp; tick 900 5 >/dev/null; tick 900 5; tick 900 1500; tick 900 5
+  eq "baixa, ALTA (93.8 %), baixa: sem aviso (a sequência recomeçou)" 0 "$(mails)"; eq "... seguidas = 1" 1 "$(reading baixas_seguidas)"
+  tick 900 5; eq "... a 2ª baixa depois da alta avisa" 1 "$(mails)"
+  fresh_lp; sessions_are "$SJ_REMOTE"; tick 900 5 >/dev/null; STUB_SSH_RC=255; idle_run 3
+  eq "ssh fora por 45 min (3 leituras): nenhum mail (leitura que falha NÃO é CPU baixa)" 0 "$(mails)"; eq "... seguidas = 0" 0 "$(reading baixas_seguidas)"; eq "... alarme.cpu_baixa = nao" nao "$(reading alarme.cpu_baixa)"
+  fresh_lp; sessions_are "$SJ_REMOTE"; tick 900 5 >/dev/null; tick 900 5; STUB_SSH_RC=255; tick 900 5
+  eq "baixa, ssh caiu: a sequência zera (a leitura que falha não vale como baixa)" 0 "$(reading baixas_seguidas)"
+  STUB_SSH_RC=0; tick 900 5
+  eq "ssh voltou: a janela cobre o buraco (30 min, medidos pelos contadores) e é baixa: avisa" 1 "$(mails)"; eq "... janela de 1800 s" 1800 "$(reading cpu.janela_s)"
+
+  echo "--- baixa: independe de fila, de sessão e do foco do gate"
+  fresh_lp; PILOT_HQ=0; tick 900 5 >/dev/null; tick 900 5; tick 900 5
+  eq "fila VAZIA (o aviso de ocioso exige fila): a CPU baixa avisa do mesmo jeito" 1 "$(mails)"; has "... assunto é o da CPU" "CPU média" "$(mailfield 1 subj)"
+  fresh_lp; PILOT_HQ=none; tick 900 5 >/dev/null; tick 900 5; tick 900 5
+  eq "fila ILEGÍVEL: avisa" 1 "$(mails)"; has "... e o corpo não inventa um número de fila" "fila do Pilot (hq): não lida" "$(mailfield 1 body)"
+  fresh_lp; STUB_GC_RC=1; tick 900 5 >/dev/null; tick 900 5; tick 900 5
+  eq "sessões ILEGÍVEIS (o gc falha): avisa" 1 "$(mails)"; has "... e o corpo não inventa contagem de sessão" "sessões remotas vivas: não lido" "$(mailfield 1 body)"
+  fresh_lp; FOCUS=on; tick 900 5 >/dev/null; tick 900 5; tick 900 5
+  eq "foco do gate LIGADO (cala o aviso de ocioso): a CPU baixa avisa do mesmo jeito" 1 "$(mails)"; has "... e o corpo diz o foco" "foco do gate: ligado" "$(mailfield 1 body)"
+  fresh_lp; tick 900 5 >/dev/null; tick 900 5; tick 900 5
+  eq "sem sessão e com fila: a CPU baixa avisa na 2ª janela (30 min medidos)" 1 "$(mails)"; has "... é o aviso de CPU" "CPU média" "$(mailfield 1 subj)"
+  tick 900 5; eq "o aviso de ocioso, que conta leituras seguidas, sai na seguinte: 2 mails, cada um no seu tempo" 2 "$(mails)"; has "... o 2º é o de ocioso" "Hetzner ocioso" "$(mailfield 2 subj)"
+  eq "... alarme.ocioso = enviado" enviado "$(reading alarme.ocioso)"; eq "... e o de CPU baixa segue em cooldown" cooldown "$(reading alarme.cpu_baixa)"
+
+  echo "--- baixa: a chave .on, o HETZNER_OCC_ALARM e o --dry-run valem para o aviso novo"
+  fresh_lp; sessions_are "$SJ_REMOTE"; rm -f "$C/.gc/hetzner-occupancy-alarm.on"; tick 900 5 >/dev/null; idle_run 3
+  eq "sem a chave .on: nenhum mail" 0 "$(mails)"; eq "... alarme.cpu_baixa = desligado" desligado "$(reading alarme.cpu_baixa)"
+  : > "$C/.gc/hetzner-occupancy-alarm.on"; tick 900 5; eq "pôs a chave: o aviso sai (a sequência continuou)" 1 "$(mails)"
+  fresh_lp; sessions_are "$SJ_REMOTE"; TENV=(HETZNER_OCC_ALARM=0); tick 900 5 >/dev/null; idle_run 3
+  eq "HETZNER_OCC_ALARM=0 desliga o aviso MESMO com a chave" 0 "$(mails)"; eq "... alarme.cpu_baixa = desligado" desligado "$(reading alarme.cpu_baixa)"
+  fresh_lp; sessions_are "$SJ_REMOTE"; tick 900 5 >/dev/null; tick 900 5
+  before=$(cksum "$C/.gc/"hetzner-occupancy* | sort); m0=$(mails)
+  NOW=$((NOW + 900)); CB=$((CB + 5 * 900)); CI=$((CI + (NCPU * 100 - 5) * 900)); statfile "$T/stat.txt" "$CB" "$CI" "$NCPU"; STUB_SSH_FILE="$T/stat.txt"; pilot 60 1800 3 0; focus_is off
+  W -- --dry-run --print
+  after=$(cksum "$C/.gc/"hetzner-occupancy* | sort)
+  eq "dry-run: diz que ENVIARIA o aviso de CPU baixa" enviaria "$(reading alarme.cpu_baixa)"; eq "... nenhum arquivo mudou" "$before" "$after"; eq "... nenhum mail" "$m0" "$(mails)"
+
+  echo "--- baixa: régua, prazo e tolerância do launchd"
+  fresh_lp; TENV=(HETZNER_OCC_LOW_PCT=50); tick 900 5 >/dev/null; tick 900 1000; tick 900 1000
+  eq "régua em 50 %: duas janelas de 62.5 % não são baixas" 0 "$(mails)"
+  tick 900 700; tick 900 700; eq "... duas de 43.8 % são" 1 "$(mails)"
+  fresh_lp; sessions_are "$SJ_REMOTE"; TENV=(HETZNER_OCC_LOW_AFTER_S=3600); tick 900 5 >/dev/null; idle_run 3
+  eq "prazo de 1 h: 3 janelas (45 min) ainda não avisam" 0 "$(mails)"; tick 900 5; eq "... a 4ª (60 min medidos) avisa" 1 "$(mails)"
+  fresh_lp; sessions_are "$SJ_REMOTE"; tick 890 5 >/dev/null; tick 890 5; tick 890 5
+  eq "janelas de 890 s: a 2ª (1780 s medidos) já avisa (tolerância de 2 min do launchd)" 1 "$(mails)"
+  fresh_lp; sessions_are "$SJ_REMOTE"; tick 800 5 >/dev/null; tick 800 5; tick 800 5
+  eq "janelas de 800 s: a 2ª (1600 s medidos) AINDA não avisa" 0 "$(mails)"; tick 800 5; eq "... a 3ª (2400 s) avisa" 1 "$(mails)"
+  fresh_lp; sessions_are "$SJ_REMOTE"; TENV=(HETZNER_OCC_LOW_PCT=0); tick 900 5 >/dev/null; idle_run 6
+  eq "HETZNER_OCC_LOW_PCT=0 desliga o aviso de CPU baixa" 0 "$(mails)"; eq "... seguidas = 0" 0 "$(reading baixas_seguidas)"
+
+  echo "--- baixa: mail que falha não consome o cooldown"
+  fresh_lp; sessions_are "$SJ_REMOTE"; tick 900 5 >/dev/null; tick 900 5; STUB_MAIL_RC=1; tick 900 5
+  eq "mail falhou: tentou 1 vez" 1 "$(mails)"; eq "... alarme.cpu_baixa = falhou" falhou "$(reading alarme.cpu_baixa)"; eq "... nada de cooldown gravado" null "$(state_f alarme_baixa_em)"
+  STUB_MAIL_RC=0; tick 900 5; eq "próxima leitura tenta DE NOVO e passa" 2 "$(mails)"; eq "... enviado" enviado "$(reading alarme.cpu_baixa)"
+  tick 900 5; eq "e agora sim o cooldown vale" 2 "$(mails)"
+
+  echo "--- baixa: estado guardado ilegível recomeça a sequência (nunca avisa por conta de número que não confere)"
+  fresh_lp; sessions_are "$SJ_REMOTE"; tick 900 5 >/dev/null; tick 900 5
+  python3 -I - "$C/.gc/hetzner-occupancy.state.json" "$((NOW + 99999))" <<'PY'
+import json, sys
+p = sys.argv[1]
+s = json.load(open(p))
+s.update(baixas_seguidas=5, baixa_desde=int(sys.argv[2]))   # sequência "longa", mas o início está no futuro
+json.dump(s, open(p, "w"))
+PY
+  tick 900 5; eq "baixa_desde no futuro (relógio recuou): a sequência recomeça em 1" 1 "$(reading baixas_seguidas)"; eq "... e nenhum aviso sai por ela" 0 "$(mails)"
+  python3 -I - "$C/.gc/hetzner-occupancy.state.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+s = json.load(open(p))
+s.update(baixas_seguidas=5, baixa_nucleos_s="x")
+json.dump(s, open(p, "w"))
+PY
+  tick 900 5; eq "acumulador que não é número: a sequência recomeça em 1" 1 "$(reading baixas_seguidas)"; eq "... e nenhum aviso sai por ela" 0 "$(mails)"; eq "... o vigia segue (rc 0)" 0 "$RC"
+
+  echo "--- baixa: CPU ilegível por 1 h = vigia CEGO para a CPU, mesmo com a sessão provando 'ocupado' (sem isso o aviso novo morre em silêncio)"
+  fresh_lp; sessions_are "$SJ_REMOTE"; tick 900 5 >/dev/null
+  eq "a 1ª leitura só semeia o baseline: não conta como CPU cega" 0 "$(reading cpu_cegas_seguidas)"
+  STUB_SSH_RC=255; idle_run 3
+  eq "ssh fora há 45 min: sem aviso ainda" 0 "$(mails)"; eq "... 3 leituras de CPU cega" 3 "$(reading cpu_cegas_seguidas)"
+  eq "... o estado segue 'ocupado' e o cego de estado NÃO acende (a sessão prova)" 0 "$(reading cegas_seguidas)"
+  tick 900 5; eq "ssh fora há 60 min: 1 mail 'CEGO'" 1 "$(mails)"; has "... assunto" "CEGO" "$(mailfield 1 subj)"; eq "... alarme.cego = enviado" enviado "$(reading alarme.cego)"
+  has "... corpo diz que é a CPU" "não consegue ler a CPU" "$(mailfield 1 body)"; has "... diz por quê" "ssh-falhou" "$(mailfield 1 body)"; has "... e que o aviso de CPU baixa não sai" "aviso de CPU baixa NÃO sai" "$(mailfield 1 body)"
+  hasnt "... e não diz que o ESTADO está cego (o estado é lido)" "ocioso ou ocupado" "$(mailfield 1 body)"
+  tick 900 5; eq "continua cego: cooldown (6 h), sem repetir" 1 "$(mails)"
+  fresh_lp; sessions_are "$SJ_REMOTE"; tick 900 5 >/dev/null; tick 3000 5
+  eq "janela velha demais (50 min): repor o baseline NÃO conta como CPU cega" 0 "$(reading cpu_cegas_seguidas)"; eq "... motivo" leitura-anterior-velha "$(reading cpu.motivo)"
+  # CPU alta (15 núcleos) em todos os ticks: a janela de 45 min da leitura que volta não é baixa, então só a contagem de CPU cega está em jogo
+  fresh_lp; sessions_are "$SJ_REMOTE"; tick 900 1500 >/dev/null; STUB_SSH_RC=255; tick 900 1500; tick 900 1500; STUB_SSH_RC=0; tick 900 1500
+  eq "uma leitura de CPU que decide zera a contagem de CPU cega" 0 "$(reading cpu_cegas_seguidas)"
+  STUB_SSH_RC=255; tick 900 1500; tick 900 1500; tick 900 1500; eq "cega, cega, cega depois de uma boa: não chega a 1 h" 0 "$(mails)"
+  fresh_lp; sessions_are "$SJ_REMOTE"; tick 890 5 >/dev/null; STUB_SSH_RC=255; idle_run 4 890
+  eq "CPU cega, leituras a cada 890 s: a 4ª (3560 s desde a última boa) já avisa (tolerância de 2 min)" 1 "$(mails)"
+  fresh_lp; sessions_are "$SJ_REMOTE"; tick 800 5 >/dev/null; STUB_SSH_RC=255; idle_run 4 800
+  eq "CPU cega, leituras a cada 800 s: a 4ª (3200 s) AINDA não avisa" 0 "$(mails)"
+  fresh_lp; PILOT_HQ=none; sessions_are "$SJ_REMOTE"; tick 900 5 >/dev/null; idle_run 6
+  eq "CPU lida, fila ilegível, sessão provando ocupado: nada cego (o estado decide e a CPU está lida)" 0 "$(reading cpu_cegas_seguidas)"
+
+  echo "--- baixa: o número por dia (ocupacao_pct) é a média de CPU do nó, ponderada pela janela; o número de sessão mudou de nome"
+  fresh_lp; d="$C/.gc/hetzner-occupancy-daily.json"; tick 900 5 >/dev/null; tick 300 1600; tick 900 0
+  eq "ocupacao_pct: 300 s a 100 % + 900 s a 0 % = 25.0 (a média simples das janelas daria 50.0)" 25.0 "$(jv "$d" dias.2026-10-19.ocupacao_pct)"
+  eq "... 2 janelas de CPU somadas" 2 "$(jv "$d" dias.2026-10-19.cpu_janelas)"; eq "... núcleos-segundo ocupados" 4800.0 "$(jv "$d" dias.2026-10-19.cpu_nucleos_s)"
+  eq "... capacidade em núcleos-segundo (16 núcleos x 1200 s)" 19200 "$(jv "$d" dias.2026-10-19.cpu_capacidade_s)"
+  eq "ocupacao_sessao_pct = o número antigo, ocupado/(ocupado+ocioso): 1 ocupado e 1 ocioso" 50.0 "$(jv "$d" dias.2026-10-19.ocupacao_sessao_pct)"
+  fresh_lp; d="$C/.gc/hetzner-occupancy-daily.json"; tick 900 5 >/dev/null
+  eq "só a 1ª leitura (nenhuma janela de CPU): ocupacao_pct null, nunca 0 %" null "$(jv "$d" dias.2026-10-19.ocupacao_pct)"; eq "... cpu_janelas = 0" 0 "$(jv "$d" dias.2026-10-19.cpu_janelas)"
+  fresh_lp; d="$C/.gc/hetzner-occupancy-daily.json"; sessions_are "$SJ_REMOTE"; tick 900 5 >/dev/null; STUB_SSH_RC=255; idle_run 3
+  eq "ssh fora o dia todo com sessão segurando bead: o número de sessão diz 100.0" 100.0 "$(jv "$d" dias.2026-10-19.ocupacao_sessao_pct)"
+  eq "... mas a CPU nunca foi lida: ocupacao_pct null (era o buraco: 'ocupado' o dia todo com a CPU parada)" null "$(jv "$d" dias.2026-10-19.ocupacao_pct)"
+  fresh_lp; d="$C/.gc/hetzner-occupancy-daily.json"
+  printf '%s' '{"dias":{"2026-10-18":{"desconhecido":0,"leituras":38,"ocioso":0,"ocupacao_pct":100.0,"ocupado":38},"2026-10-19":{"desconhecido":1,"leituras":3,"ocioso":0,"ocupacao_pct":100.0,"ocupado":2}},"intervalo_s":900}' > "$d"
+  tick 900 5 >/dev/null; tick 900 5
+  eq "dia gravado pela versão antiga (18/10): o número de sessão ganhou o nome novo" 100.0 "$(jv "$d" dias.2026-10-18.ocupacao_sessao_pct)"
+  eq "... e ocupacao_pct é null: a CPU desse dia nunca foi somada (nada de número de sessão com cara de CPU)" null "$(jv "$d" dias.2026-10-18.ocupacao_pct)"; eq "... cpu_janelas = 0" 0 "$(jv "$d" dias.2026-10-18.cpu_janelas)"
+  eq "hoje (19/10, que a versão antiga já tinha começado): o número de sessão segue de onde parou (2 ocupado + 1 ocioso)" 66.7 "$(jv "$d" dias.2026-10-19.ocupacao_sessao_pct)"
+  eq "... e a média de CPU é só das janelas lidas desde a mudança (1)" 1 "$(jv "$d" dias.2026-10-19.cpu_janelas)"; eq "... ocupacao_pct" 0.3 "$(jv "$d" dias.2026-10-19.ocupacao_pct)"
+  tick 900 5
+  eq "2ª passada: o dia antigo não é migrado de novo (o número de sessão segue 100.0)" 100.0 "$(jv "$d" dias.2026-10-18.ocupacao_sessao_pct)"; eq "... e ocupacao_pct segue null" null "$(jv "$d" dias.2026-10-18.ocupacao_pct)"
+  eq "... e hoje acumula a 2ª janela" 2 "$(jv "$d" dias.2026-10-19.cpu_janelas)"
+
+  echo "--- baixa: a linha-resumo e o JSONL trazem os três avisos"
+  fresh_lp; sessions_are "$SJ_REMOTE"; tick 900 5 >/dev/null; tick 900 5
+  NOW=$((NOW + 900)); CB=$((CB + 5 * 900)); CI=$((CI + (NCPU * 100 - 5) * 900)); statfile "$T/stat.txt" "$CB" "$CI" "$NCPU"; STUB_SSH_FILE="$T/stat.txt"; pilot 60 1800 3 0; focus_is off
+  W --
+  has "linha-resumo: ocioso/cego/cpu_baixa" "alarme=nao/nao/enviado" "$(cat "$WOUT")"
+  last_line "$C/.gc/hetzner-occupancy.jsonl"; eq "JSONL: alarme.cpu_baixa da última leitura" enviado "$(jv "$T/last.json" alarme.cpu_baixa)"; eq "JSONL: baixas_seguidas" 2 "$(jv "$T/last.json" baixas_seguidas)"
+}
+
+# ============================================================================================================================================================================
 g_saida() {
   echo "--- saida: JSONL, número por dia"
   fresh; tick 900 5 >/dev/null; tick 900 5; tick 900 200
@@ -616,12 +789,13 @@ g_saida() {
   tick 900 5 >/dev/null; tick 900 5; tick 900 200; tick 900 5; STUB_SSH_RC=255; tick 900 5; tick 86400 5
   local d="$C/.gc/hetzner-occupancy-daily.json"
   eq "dia 19: 1 ocioso" 1 "$(jv "$d" dias.2026-10-19.ocioso)"; eq "dia 19: 1 desconhecido (a 1ª leitura, sem baseline)" 1 "$(jv "$d" dias.2026-10-19.desconhecido)"; eq "dia 19: 0 ocupado" 0 "$(jv "$d" dias.2026-10-19.ocupado)"
-  eq "dia 19: leituras" 2 "$(jv "$d" dias.2026-10-19.leituras)"; eq "dia 19: ocupação 0.0% (desconhecido não entra na conta)" 0.0 "$(jv "$d" dias.2026-10-19.ocupacao_pct)"
+  eq "dia 19: leituras" 2 "$(jv "$d" dias.2026-10-19.leituras)"; eq "dia 19: ocupação de SESSÃO 0.0% (desconhecido não entra na conta; é o número antigo, com o nome novo)" 0.0 "$(jv "$d" dias.2026-10-19.ocupacao_sessao_pct)"
   eq "dia 20 (virou a meia-noite): 1 ocupado" 1 "$(jv "$d" dias.2026-10-20.ocupado)"; eq "dia 20: 1 ocioso" 1 "$(jv "$d" dias.2026-10-20.ocioso)"; eq "dia 20: 1 desconhecido" 1 "$(jv "$d" dias.2026-10-20.desconhecido)"
-  eq "dia 20: ocupação 50.0%" 50.0 "$(jv "$d" dias.2026-10-20.ocupacao_pct)"
-  eq "dia 21: só desconhecido → ocupação null (nunca 0%, nunca 100%)" null "$(jv "$d" dias.2026-10-21.ocupacao_pct)"; eq "dia 21: 1 leitura" 1 "$(jv "$d" dias.2026-10-21.leituras)"
+  eq "dia 20: ocupação de sessão 50.0%" 50.0 "$(jv "$d" dias.2026-10-20.ocupacao_sessao_pct)"
+  eq "dia 21: só desconhecido → ocupação de sessão null (nunca 0%, nunca 100%)" null "$(jv "$d" dias.2026-10-21.ocupacao_sessao_pct)"; eq "dia 21: 1 leitura" 1 "$(jv "$d" dias.2026-10-21.leituras)"
+  eq "dia 21: sem janela de CPU lida → ocupacao_pct (a média de CPU) null, nunca 0%" null "$(jv "$d" dias.2026-10-21.ocupacao_pct)"
   fresh "$(epoch_of 2026 10 20 3 0 0)"; sessions_are "$SJ_ZOMBIES"; beads_are '[]'; tick 900 5 >/dev/null; idle_run 3
-  eq "o número do dia (20/10): 2 zumbis vivos + CPU baixa = 3 ocioso, 0 ocupado, 0.0 % (antes: 100 %)" "3/0/0.0" "$(jv "$d" dias.2026-10-20.ocioso)/$(jv "$d" dias.2026-10-20.ocupado)/$(jv "$d" dias.2026-10-20.ocupacao_pct)"
+  eq "o número de sessão do dia (20/10): 2 zumbis vivos + CPU baixa = 3 ocioso, 0 ocupado, 0.0 % (antes: 100 %)" "3/0/0.0" "$(jv "$d" dias.2026-10-20.ocioso)/$(jv "$d" dias.2026-10-20.ocupado)/$(jv "$d" dias.2026-10-20.ocupacao_sessao_pct)"
 
   echo "--- saida: arquivos corrompidos não somem em silêncio"
   fresh; tick 900 5 >/dev/null; printf 'lixo{' > "$C/.gc/hetzner-occupancy-daily.json"; tick 900 5
@@ -826,10 +1000,39 @@ g_mutantes() {
   mutante lista-do-bd-ilegivel-vale "bead" $'    if not isinstance(lst, list) or not all(' $'    if False and not all('
   mutante detalhe-do-bd-some "bead" $'r["motivo"], r["detalhe"] = why, detail' $'r["motivo"] = why'
   mutante regra-nao-gravada "saida" $'"epoch": now, "regra": RULE, ' $'"epoch": now, '
+  # ga-2hd02v.6: o aviso de CPU baixa (CPU média < 85 % por 30 min, sem olhar fila, sessão nem foco), a CPU cega e o número por dia
+  mutante baixa-regua-com-igual "baixa" $'cpu["pct"] < c.low_pct):' $'cpu["pct"] <= c.low_pct):'
+  mutante baixa-ilegivel-estende-a-sequencia "baixa" $'    if not (cpu["lido"] and cpu["pct"] < c.low_pct):\n        return {"n": 0, "desde": None, "nucleos_s": None, "cap_s": None}' $'    if cpu["lido"] and not cpu["pct"] < c.low_pct:\n        return {"n": 0, "desde": None, "nucleos_s": None, "cap_s": None}\n    if not cpu["lido"]:\n        return {"n": _int(st.get("baixas_seguidas"), 0) + 1, "desde": _int(st.get("baixa_desde"), now - 900), "nucleos_s": 0.0, "cap_s": 1.0}'
+  mutante baixa-janela-alta-nao-zera "baixa" $'    if not (cpu["lido"] and cpu["pct"] < c.low_pct):\n        return {"n": 0, "desde": None, "nucleos_s": None, "cap_s": None}' $'    if not (cpu["lido"] and cpu["pct"] < c.low_pct):\n        return {"n": _int(st.get("baixas_seguidas"), 0), "desde": _int(st.get("baixa_desde")), "nucleos_s": _flt(st.get("baixa_nucleos_s")), "cap_s": _flt(st.get("baixa_capacidade_s"))}'
+  mutante baixa-desde-o-fim-da-janela "baixa" $'"desde": now - cpu["janela_s"], "nucleos_s": win_n, "cap_s": win_c}' $'"desde": now, "nucleos_s": win_n, "cap_s": win_c}'
+  mutante baixa-sem-tolerancia-do-launchd "baixa" $'now - low["desde"] >= c.low_after_s - c.slack_s' $'now - low["desde"] >= c.low_after_s'
+  mutante baixa-tolerancia-enorme "baixa" $'now - low["desde"] >= c.low_after_s - c.slack_s' $'now - low["desde"] >= c.low_after_s - 1000'
+  mutante baixa-sem-cooldown "baixa" $'a_low = _plan(c, low_due, last_low, c.low_cooldown_s, now, dry)' $'a_low = _plan(c, low_due, None, c.low_cooldown_s, now, dry)'
+  mutante baixa-calada-pelo-foco "baixa" $'a_low = _plan(c, low_due, last_low, c.low_cooldown_s, now, dry)' $'a_low = _plan(c, low_due, last_low, c.low_cooldown_s, now, dry, "foco" if foco == "ligado" else None)'
+  mutante baixa-depende-da-fila "baixa" $'low_due = low["n"] > 0 and' $'low_due = fila["lido"] and fila["n"] > 0 and low["n"] > 0 and'
+  mutante baixa-depende-do-estado "baixa" $'low_due = low["n"] > 0 and' $'low_due = est != "ocupado" and low["n"] > 0 and'
+  mutante baixa-depende-da-sessao-lida "baixa" $'low_due = low["n"] > 0 and' $'low_due = sess["lido"] and low["n"] > 0 and'
+  mutante baixa-sequencia-nao-gravada "baixa" $'"baixas_seguidas": low["n"], "baixa_desde": low["desde"],' $'"baixas_seguidas": 0, "baixa_desde": None,'
+  mutante baixa-desde-no-futuro-vale "baixa" $'since <= now and' $'True and'
+  mutante baixa-acumulador-ilegivel-vale "baixa" $'acc_n is not None and acc_c is not None:' $'True:'
+  mutante baixa-regua-sem-teto "cfg" $'if c.low_pct > 100:' $'if False:'
+  mutante baixa-regua-negativa "cfg" $'"HETZNER_OCC_LOW_PCT", 85, float, 0)' $'"HETZNER_OCC_LOW_PCT", 85, float, -1000)'
+  mutante cpu-cega-nao-avisa "baixa" $'blind_cpu_due = cpu_cegas > 0 and now - cpu_lida_em >= c.blind_after_s - c.slack_s' $'blind_cpu_due = False'
+  mutante cpu-cega-sem-tolerancia-do-launchd "baixa" $'now - cpu_lida_em >= c.blind_after_s - c.slack_s' $'now - cpu_lida_em >= c.blind_after_s'
+  mutante cpu-cega-1a-leitura-conta "baixa" $'(0 if cpu_warm else 1)' $'1'
+  mutante cpu-cega-nao-zera "baixa" $'cpu_cegas = 0 if cpu["lido"] else ' $'cpu_cegas = '
+  mutante cpu-cega-sem-texto-da-cpu "baixa" $'if cpu_span is not None:' $'if False:'
+  mutante diario-cpu-sem-ponderar-pela-janela "baixa" $'day["cpu_nucleos_s"] = round(day["cpu_nucleos_s"] + cores * cpu["janela_s"], 2)' $'day["cpu_nucleos_s"] = round(day["cpu_nucleos_s"] + cores * 900, 2)'
+  mutante diario-cpu-capacidade-sem-ponderar "baixa" $'day["cpu_capacidade_s"] += cpu["ncpu"] * cpu["janela_s"]' $'day["cpu_capacidade_s"] += cpu["ncpu"] * 900'
+  mutante diario-cpu-sem-leitura-vira-zero "baixa" $'round(100.0 * nucleos_s / capacidade_s, 1) if capacidade_s else None' $'round(100.0 * nucleos_s / capacidade_s, 1) if capacidade_s else 0.0'
+  mutante diario-cpu-conta-janela-nao-lida "baixa" $'        if cpu["lido"]:  # só janela LIDA' $'        if True:  # só janela LIDA'
+  mutante diario-antigo-perde-o-numero-de-sessao "baixa" $'day["ocupacao_sessao_pct"] = day["ocupacao_pct"]' $'day["ocupacao_sessao_pct"] = None'
+  mutante diario-antigo-fica-com-cara-de-cpu "baixa" $'day.update(ocupacao_pct=None, cpu_janelas=0' $'day.update(cpu_janelas=0'
+  mutante diario-migra-a-cada-rodada "baixa" $'if isinstance(day, dict) and "cpu_janelas" not in day:' $'if isinstance(day, dict):'
   mutantes_wait
 }
 
-GROUPS_ALL="cfg sess bead cpu fila estado alarme saida"
+GROUPS_ALL="cfg sess bead cpu fila estado alarme baixa saida"
 run_groups() { local g; for g in "$@"; do "g_$g"; done; }
 
 DEFAULT="$GROUPS_ALL mutantes"; [ -z "${HOCC_NO_MUTANTS:-}" ] || DEFAULT="$GROUPS_ALL"

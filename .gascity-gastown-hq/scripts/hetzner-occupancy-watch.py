@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""hetzner-occupancy-watch.py — o nó Hetzner pago está trabalhando? Uma leitura a cada 15 min; aviso ao Mayor se ocioso com fila. (ga-2hd02v.1.12)
+"""hetzner-occupancy-watch.py — o nó Hetzner pago está trabalhando? Uma leitura a cada 15 min; aviso ao Mayor se ocioso com fila ou se a CPU fica abaixo da régua. (ga-2hd02v.1.12, ga-2hd02v.6)
 
 Contents
   Regra · Estado · Aviso · Arquivos · Uso
@@ -16,11 +16,16 @@ ESTADO   ocupado = sessão remota que SEGURA bead in_progress OU CPU >= régua (
          desconhecido = o resto (inclui a 1ª leitura, que só semeia o baseline de CPU)
 AVISO    ao Mayor por `gc mail send` (não nudge: o nudge ao Mayor trava com a sessão anexada, ga-eldeu). Só avisa; não atribui nem despacha nada.
   ocioso   ocioso há >= 30 min (3 leituras seguidas, 2 min de folga para o jitter do launchd) COM fila > 0; cooldown de 3 h; o mail que falha não gasta o cooldown
-  cego     nenhuma leitura decidiu há >= 1 h (sessões, CPU ou fila ilegíveis); cooldown de 6 h
+  cpu baixa  a CPU do nó abaixo de 85 % (HETZNER_OCC_LOW_PCT; 0 desliga) por >= 30 min: janelas de CPU seguidas, cada uma com média abaixo da régua, que juntas cobrem 30 min medidos (2 min de folga);
+           cooldown de 3 h. Só olha a CPU: NÃO depende de fila, de sessão nem do foco do gate. Athos, 20/10: "o que nao pode é ficar menos do que 100% ocupado"; na madrugada de 20/10 a CPU ficou em
+           0-15 % por 7 h e nenhum aviso saiu, porque toda leitura era "ocupado" (havia sessão segurando bead)
+  cego     nenhuma leitura decidiu o estado há >= 1 h (sessões, CPU ou fila ilegíveis), OU a CPU não é lida há >= 1 h (com a CPU cega o aviso de CPU baixa está mudo, mesmo que a sessão prove "ocupado"); cooldown de 6 h
   foco     o foco do gate (gate-focus.state, mesma regra de 3 estados da gate-focus-lib.sh) liga: só conserto é despachado, então o aviso de ocioso se cala
   chave    o aviso só sai com <cidade>/.gc/hetzner-occupancy-alarm.on presente (e sem HETZNER_OCC_ALARM=0): sem ela é o modo só-medir, INERTE de propósito (mede e grava, nunca manda mail)
-ARQUIVOS (só em <cidade>/.gc): hetzner-occupancy.jsonl (uma leitura por rodada) · hetzner-occupancy-daily.json (o número por dia: ocupado/ocioso/desconhecido e
-  ocupacao_pct = ocupado/(ocupado+ocioso), null se nenhuma leitura decidiu) · hetzner-occupancy.state.json (baseline de CPU e contadores) · hetzner-occupancy.lock.
+ARQUIVOS (só em <cidade>/.gc): hetzner-occupancy.jsonl (uma leitura por rodada) · hetzner-occupancy-daily.json (o número por dia: ocupado/ocioso/desconhecido;
+  ocupacao_pct = a média de CPU do nó no dia, ponderada pela janela (cpu_nucleos_s / cpu_capacidade_s; cpu_janelas = quantas janelas entraram), null se nenhuma janela foi lida;
+  ocupacao_sessao_pct = ocupado/(ocupado+ocioso), o número que ocupacao_pct era até a ga-2hd02v.6, null se nenhuma leitura decidiu. Dia gravado antes dela fica com o número antigo
+  em ocupacao_sessao_pct e ocupacao_pct null: a CPU daquele dia nunca foi somada) · hetzner-occupancy.state.json (baseline de CPU e contadores) · hetzner-occupancy.lock.
   Arquivo corrompido não some: a cópia fica em <arquivo>.corrupt-<epoch>.
 USO      hetzner-occupancy-watch.py [--print] [--dry-run] [--print-config]
          exit 0 ok (inclui "outra instância rodando") · 1 crash (traceback no stderr) · 3 não consegui gravar
@@ -30,6 +35,7 @@ import calendar
 import errno
 import fcntl
 import json
+import math
 import os
 import re
 import signal
@@ -84,6 +90,8 @@ def load_config(env):
         slack_s=120,  # o launchd não é relógio suíço: 3 leituras a 890 s ainda são "30 min"
         idle_cooldown_s=_num(env, "HETZNER_OCC_IDLE_COOLDOWN_S", 10800, int, 0),
         blind_cooldown_s=_num(env, "HETZNER_OCC_BLIND_COOLDOWN_S", 21600, int, 0),
+        low_pct=_num(env, "HETZNER_OCC_LOW_PCT", 85, float, 0),  # 0 = nenhuma janela é baixa = aviso de CPU baixa desligado
+        low_after_s=_num(env, "HETZNER_OCC_LOW_AFTER_S", 1800, int, 60), low_cooldown_s=_num(env, "HETZNER_OCC_LOW_COOLDOWN_S", 10800, int, 0),
         min_window_s=120, max_window_s=3 * interval, future_tol_s=60,
         ssh_timeout_s=_num(env, "HETZNER_OCC_SSH_TIMEOUT_S", 30, int, 1),
         gc_timeout_s=_num(env, "HETZNER_OCC_GC_TIMEOUT_S", 60, int, 1), bd_timeout_s=_num(env, "HETZNER_OCC_BD_TIMEOUT_S", 60, int, 1),
@@ -94,6 +102,8 @@ def load_config(env):
     )
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@-]*", c.ssh_host):
         raise ValueError("HETZNER_SSH_HOST inválido: %r" % c.ssh_host)
+    if c.low_pct > 100:  # acima de 100 toda janela seria "baixa": o aviso sairia a cada cooldown para sempre (inf também cai aqui; NaN já reprovou no _num)
+        raise ValueError("HETZNER_OCC_LOW_PCT=%r acima de 100" % c.low_pct)
     c.alarm_key = os.path.join(c.gc_dir, "hetzner-occupancy-alarm.on")
     c.alarm = env.get("HETZNER_OCC_ALARM") != "0" and os.path.exists(c.alarm_key)  # chave ilegível/ausente = desligado (o estado inerte)
     return c
@@ -444,8 +454,44 @@ def _int(v, default=None):
     return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else default
 
 
+def _flt(v, default=None):
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v >= 0 else default
+
+
 def _mins(s):
     return int(round(s / 60.0))
+
+
+def _avg_pct(nucleos_s, capacidade_s):
+    """% da capacidade usada: núcleos-segundo ocupados / núcleos-segundo disponíveis. Sem capacidade medida é None (não 0 %: ninguém mediu)."""
+    return round(100.0 * nucleos_s / capacidade_s, 1) if capacidade_s else None
+
+
+def _show(v, none="não lido"):
+    return none if v is None else str(v)
+
+
+def low_streak(c, st, cpu, cores, now):
+    """A sequência de janelas de CPU seguidas, cada uma com média abaixo da régua: {n, desde, nucleos_s, cap_s}. n = 0 = sem sequência. `desde` é o INÍCIO da janela da 1ª (a CPU é
+    uma média sobre a janela inteira, então 2 janelas de 15 min = 30 min medidos). Só uma janela LIDA entra: CPU ilegível ou alta zera, nunca estende."""
+    if not (cpu["lido"] and cpu["pct"] < c.low_pct):
+        return {"n": 0, "desde": None, "nucleos_s": None, "cap_s": None}
+    win_n, win_c = cores * cpu["janela_s"], cpu["ncpu"] * cpu["janela_s"]
+    # vazio → sem sequência anterior (recomeça aqui); falhou/ilegível/no futuro (estado editado à mão, relógio que recuou) → recomeça aqui também: nunca SOMA um número que não confere (a janela de agora vale por si, medida pelos contadores)
+    prev_n, since, acc_n, acc_c = _int(st.get("baixas_seguidas"), 0), _int(st.get("baixa_desde")), _flt(st.get("baixa_nucleos_s")), _flt(st.get("baixa_capacidade_s"))
+    if prev_n > 0 and since is not None and since <= now and acc_n is not None and acc_c is not None:
+        return {"n": prev_n + 1, "desde": since, "nucleos_s": acc_n + win_n, "cap_s": acc_c + win_c}
+    return {"n": 1, "desde": now - cpu["janela_s"], "nucleos_s": win_n, "cap_s": win_c}
+
+
+def migrate_daily(daily):
+    """Dia gravado antes da ga-2hd02v.6 (sem cpu_janelas): o `ocupacao_pct` dele é o número de SESSÃO. Ele passa a se chamar ocupacao_sessao_pct e `ocupacao_pct` (a média de CPU) fica null:
+    a CPU daquele dia nunca foi somada, e um número de sessão com cara de CPU seria pior que nenhum. Uma vez só: depois da 1ª passada o dia tem cpu_janelas."""
+    for day in daily["dias"].values():
+        if isinstance(day, dict) and "cpu_janelas" not in day:
+            if "ocupacao_pct" in day and "ocupacao_sessao_pct" not in day:
+                day["ocupacao_sessao_pct"] = day["ocupacao_pct"]
+            day.update(ocupacao_pct=None, cpu_janelas=0, cpu_nucleos_s=0.0, cpu_capacidade_s=0)
 
 
 def idle_mail(c, rd, span):
@@ -465,15 +511,39 @@ def idle_mail(c, rd, span):
     return subj, body
 
 
-def blind_mail(c, rd, span):
+def blind_mail(c, rd, span, cpu_span=None):
+    """span = minutos sem leitura que decidisse o ESTADO (None = o estado não está cego); cpu_span = minutos sem ler a CPU (None = a CPU está lida). Pelo menos um dos dois."""
     sess, cpu, fila = rd["sessoes"], rd["cpu"], rd["fila"]
-    subj = "Hetzner: vigia de ocupação CEGO há %d min (não consigo medir)" % _mins(span)
-    body = "\n".join([
-        "Estado do mundo: há %d min (%d leituras) o vigia não consegue dizer se o nó Hetzner está ocioso ou ocupado. Enquanto isso NENHUM aviso de ocioso sai "
-        "(leitura que falha nunca vira \"ocioso\")." % (_mins(span), rd["cegas_seguidas"]),
+    subj = "Hetzner: vigia de ocupação CEGO há %d min (não consigo medir)" % _mins(max(s for s in (span, cpu_span) if s is not None))
+    lines = []
+    if span is not None:
+        lines.append("Estado do mundo: há %d min (%d leituras) o vigia não consegue dizer se o nó Hetzner está ocioso ou ocupado. Enquanto isso NENHUM aviso de ocioso sai "
+                     "(leitura que falha nunca vira \"ocioso\")." % (_mins(span), rd["cegas_seguidas"]))
+    if cpu_span is not None:
+        lines.append("%s há %d min (%d leituras) o vigia não consegue ler a CPU do nó Hetzner. Enquanto isso o aviso de CPU baixa NÃO sai (leitura que falha nunca vira \"CPU baixa\"), "
+                     "mesmo que uma sessão segurando bead mantenha o estado em \"ocupado\"." % ("Estado do mundo:" if span is None else "E", _mins(cpu_span), rd["cpu_cegas_seguidas"]))
+    body = "\n".join(lines + [
         "• sessões: %s · CPU: %s · fila: %s" % (sess["motivo"] or "ok", cpu["motivo"] or "ok", fila["motivo"] or "ok"),
         "• detalhe: %s" % (_oneline(sess.get("detalhe", "") + " " + cpu.get("detalhe", ""), 200) or "-"),
         "Conferir no mini: a lista de sessões do gc, o ssh %s e a idade do ~/.gc/pilot-dispatchable.json. Próximo aviso deste tipo em no mínimo %d h." % (c.ssh_host, c.blind_cooldown_s // 3600),
+    ])
+    return subj, body
+
+
+def low_mail(c, rd, low):
+    fila, sess, cpu = rd["fila"], rd["sessoes"], rd["cpu"]
+    span, media = rd["epoch"] - low["desde"], _avg_pct(low["nucleos_s"], low["cap_s"])
+    foco = rd["foco"] + (" (tratado como desligado)" if rd["foco"] == "desconhecido" else "")
+    subj = "Hetzner abaixo da meta: CPU média de %s%% há %d min (aviso abaixo de %g%%)" % (media, _mins(span), c.low_pct)
+    body = "\n".join([
+        "Estado do mundo: a CPU do nó Hetzner (%s) está abaixo de %g%% há %d min (%d janelas seguidas de CPU): média de %s%%. Meta do Athos (20/10): o nó pago fica com a CPU perto de 100%% o tempo todo."
+        % (c.ssh_host, c.low_pct, _mins(span), low["n"], media),
+        "• última janela: %s%% (%s núcleo(s) de %s ocupados, janela de %s s)" % (cpu["pct"], cpu["nucleos"], cpu["ncpu"], cpu["janela_s"]),
+        "• contexto (não entra na decisão): sessões remotas vivas: %s · segurando bead: %s · fila do Pilot (hq): %s · foco do gate: %s" % (
+            _show(sess["ativas"]), _show(sess["ocupadas"]), _show(fila["n"], "não lida"), foco),
+        "Este aviso NÃO depende de fila nem de sessão: com sessão segurando bead e a CPU parada ele sai do mesmo jeito (foi o que faltou na madrugada de 20/10, 7 h com 0 a 15% de CPU e zero aviso). "
+        "A fila, quando lida, é a do Pilot ANTES dos vetos de pool e do freio de top-up: é um teto, não uma promessa.",
+        "O vigia só mede e avisa: não atribui nem despacha nada. Próximo aviso deste tipo em no mínimo %d h. Voltar a só-medir: rm %s" % (c.low_cooldown_s // 3600, c.alarm_key),
     ])
     return subj, body
 
@@ -499,7 +569,7 @@ def run(args, env):
     c = load_config(env)
     if args.print_config:
         keys = ("city", "interval_s", "busy_cores", "stores", "other_hosts", "ssh_host", "alarm", "alarm_key", "idle_after_s", "blind_after_s", "slack_s",
-                "idle_cooldown_s", "blind_cooldown_s", "min_window_s", "max_window_s", "ssh_timeout_s", "gc_timeout_s", "bd_timeout_s", "pilot_file")
+                "idle_cooldown_s", "blind_cooldown_s", "low_pct", "low_after_s", "low_cooldown_s", "min_window_s", "max_window_s", "ssh_timeout_s", "gc_timeout_s", "bd_timeout_s", "pilot_file")
         print(json.dumps({k: getattr(c, k) for k in keys}, ensure_ascii=False, indent=2))
         return 0
     now, dry = c.now, args.dry_run
@@ -521,25 +591,38 @@ def run(args, env):
     ocio_desde = (_int(st.get("ocioso_desde"), now) if prev_ocio > 0 else now) if est == "ocioso" else None
     cegas = 0 if decided else _int(st.get("cegas_seguidas"), 0) + (0 if warm else 1)
     decidida_em = now if decided else _int(st.get("decidida_em"), now)  # sem nenhuma decidida ainda, conta desde a 1ª leitura
+    # a CPU cega é outra conta: uma sessão que prova "ocupado" decide o ESTADO, mas com a CPU ilegível o aviso de CPU baixa não tem como sair (ga-2hd02v.6)
+    cpu_warm = not cpu["lido"] and cpu["motivo"] in WARMUP
+    cpu_cegas = 0 if cpu["lido"] else _int(st.get("cpu_cegas_seguidas"), 0) + (0 if cpu_warm else 1)
+    cpu_lida_em = now if cpu["lido"] else _int(st.get("cpu_lida_em"), now)  # sem nenhuma lida ainda, conta desde a 1ª leitura
+    low = low_streak(c, st, cpu, cores, now)
 
     rd = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now)), "epoch": now, "regra": RULE, "estado": est, "sessoes": sess, "cpu": cpu, "fila": fila, "foco": foco,
-          "ociosas_seguidas": ocio, "cegas_seguidas": cegas}
+          "ociosas_seguidas": ocio, "cegas_seguidas": cegas, "baixas_seguidas": low["n"], "cpu_cegas_seguidas": cpu_cegas}
     idle_due = est == "ocioso" and fila["lido"] and fila["n"] > 0 and now - ocio_desde >= c.idle_after_s - c.slack_s
-    blind_due = cegas > 0 and now - decidida_em >= c.blind_after_s - c.slack_s
-    last_idle, last_blind = _int(st.get("alarme_ocioso_em")), _int(st.get("alarme_cego_em"))
+    blind_state_due = cegas > 0 and now - decidida_em >= c.blind_after_s - c.slack_s
+    blind_cpu_due = cpu_cegas > 0 and now - cpu_lida_em >= c.blind_after_s - c.slack_s
+    blind_due = blind_state_due or blind_cpu_due
+    low_due = low["n"] > 0 and now - low["desde"] >= c.low_after_s - c.slack_s
+    last_idle, last_blind, last_low = _int(st.get("alarme_ocioso_em")), _int(st.get("alarme_cego_em")), _int(st.get("alarme_baixa_em"))
     a_idle = _plan(c, idle_due, last_idle, c.idle_cooldown_s, now, dry, "foco" if foco == "ligado" else None)
     a_blind = _plan(c, blind_due, last_blind, c.blind_cooldown_s, now, dry)
-    rd["alarme"] = {"ocioso": a_idle, "cego": a_blind}
+    a_low = _plan(c, low_due, last_low, c.low_cooldown_s, now, dry)
+    rd["alarme"] = {"ocioso": a_idle, "cego": a_blind, "cpu_baixa": a_low}
     if dry:
         rd["dry_run"] = True
 
     new_st = {"versao": 1, "cpu": new_base or (st.get("cpu") if _baseline_ok(st.get("cpu")) else None), "ociosas_seguidas": ocio, "ocioso_desde": ocio_desde,
-              "cegas_seguidas": cegas, "decidida_em": decidida_em, "alarme_ocioso_em": last_idle, "alarme_cego_em": last_blind, "atualizado_em": now}
+              "cegas_seguidas": cegas, "decidida_em": decidida_em, "alarme_ocioso_em": last_idle, "alarme_cego_em": last_blind, "atualizado_em": now,
+              "cpu_cegas_seguidas": cpu_cegas, "cpu_lida_em": cpu_lida_em, "baixas_seguidas": low["n"], "baixa_desde": low["desde"],
+              "baixa_nucleos_s": None if low["n"] == 0 else round(low["nucleos_s"], 2), "baixa_capacidade_s": None if low["n"] == 0 else low["cap_s"], "alarme_baixa_em": last_low}
     sends = []  # (chave do estado, valor antigo, assunto, corpo)
     if a_idle == "enviar":
         sends.append(("alarme_ocioso_em", last_idle, ("ocioso",)) + idle_mail(c, rd, now - ocio_desde))
     if a_blind == "enviar":
-        sends.append(("alarme_cego_em", last_blind, ("cego",)) + blind_mail(c, rd, now - decidida_em))
+        sends.append(("alarme_cego_em", last_blind, ("cego",)) + blind_mail(c, rd, now - decidida_em if blind_state_due else None, now - cpu_lida_em if blind_cpu_due else None))
+    if a_low == "enviar":
+        sends.append(("alarme_baixa_em", last_low, ("cpu_baixa",)) + low_mail(c, rd, low))
     if not dry:
         for key, _old, _k, _s, _b in sends:
             new_st[key] = now  # o cooldown é gravado ANTES do mail: se não der para gravar, o mail nem sai (nada de repetir a cada rodada)
@@ -555,18 +638,25 @@ def run(args, env):
         append_line(os.path.join(c.gc_dir, "hetzner-occupancy.jsonl"), json.dumps(rd, ensure_ascii=False, separators=(",", ":")))
         daily_path = os.path.join(c.gc_dir, "hetzner-occupancy-daily.json")
         daily = load_json(daily_path, lambda o: isinstance(o, dict) and isinstance(o.get("dias"), dict), now, dry) or {"dias": {}}
-        day = daily["dias"].setdefault(time.strftime("%Y-%m-%d", time.localtime(now)), {"ocupado": 0, "ocioso": 0, "desconhecido": 0, "leituras": 0, "ocupacao_pct": None})
+        migrate_daily(daily)
+        day = daily["dias"].setdefault(time.strftime("%Y-%m-%d", time.localtime(now)), {"ocupado": 0, "ocioso": 0, "desconhecido": 0, "leituras": 0, "ocupacao_pct": None, "ocupacao_sessao_pct": None,
+                                                                                         "cpu_janelas": 0, "cpu_nucleos_s": 0.0, "cpu_capacidade_s": 0})
         day[est] += 1
         day["leituras"] += 1
         dec = day["ocupado"] + day["ocioso"]
-        day["ocupacao_pct"] = round(100.0 * day["ocupado"] / dec, 1) if dec else None
+        day["ocupacao_sessao_pct"] = round(100.0 * day["ocupado"] / dec, 1) if dec else None
+        if cpu["lido"]:  # só janela LIDA entra na média de CPU do dia; sem nenhuma, ocupacao_pct fica null (nunca 0 %)
+            day["cpu_janelas"] += 1
+            day["cpu_nucleos_s"] = round(day["cpu_nucleos_s"] + cores * cpu["janela_s"], 2)
+            day["cpu_capacidade_s"] += cpu["ncpu"] * cpu["janela_s"]
+        day["ocupacao_pct"] = _avg_pct(day["cpu_nucleos_s"], day["cpu_capacidade_s"])
         daily["intervalo_s"] = c.interval_s
         write_atomic(daily_path, json.dumps(daily, ensure_ascii=False, sort_keys=True, indent=1))
     if args.show:
         print(json.dumps(rd, ensure_ascii=False, indent=2))
     else:
-        print("%s estado=%s sessoes=%s cpu=%s fila=%s foco=%s ociosas=%d cegas=%d alarme=%s/%s" % (
-            rd["ts"], est, sess["ativas"], cpu["nucleos"], fila["n"], foco, ocio, cegas, rd["alarme"]["ocioso"], rd["alarme"]["cego"]))
+        print("%s estado=%s sessoes=%s cpu=%s fila=%s foco=%s ociosas=%d cegas=%d alarme=%s/%s/%s" % (
+            rd["ts"], est, sess["ativas"], cpu["nucleos"], fila["n"], foco, ocio, cegas, rd["alarme"]["ocioso"], rd["alarme"]["cego"], rd["alarme"]["cpu_baixa"]))
     return 0
 
 
