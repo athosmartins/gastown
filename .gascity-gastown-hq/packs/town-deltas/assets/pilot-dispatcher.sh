@@ -11857,9 +11857,12 @@ _pilot_node_only_candidate_pre() {
 # ao wa-worker-remote já existe (_pilot_wa_node_decide, ga-2hd02v.1.10, PILOT_WA_NODE_ROUTE, padrão off): a passada passa a chegar até ele. A sessão wa-worker-remote roda no Hetzner (worktree e build lá); no mini
 # fica a escrita da bead. Fora de label|auto nada muda. Não há ps-worker remoto (nenhum agente de pool no nó para PS): a bead de ps-worker segue solta na passada.
 
+# Nota de manutenção: os mutantes de pilot-dispatcher.wa-node-route.selftest.sh trocam a 1ª ocorrência, no arquivo INTEIRO, do padrão `off` da rota (a expansão da variável com o `:-` e o `off`) e da chamada do
+# script com `--basis` seguido de `--dry-run`, e esperam que ela esteja em _pilot_wa_node_decide: por isso os dois helpers abaixo leem a rota sem esse padrão (vazio já cai no `*)`) e escrevem a sonda com
+# --dry-run ANTES de --basis (o wa-node-dispatch.sh aceita as opções em qualquer ordem). Não escreva aqui, nem em comentário, os dois trechos literais.
 # _pilot_node_only_wa_route_on — exit 0 iff PILOT_WA_NODE_ROUTE move bead de verdade (label|auto) e a varredura não é DRY_RUN. shadow só registra; off, vazio e valor que não existe = não.
 _pilot_node_only_wa_route_on() {
-  case "${PILOT_WA_NODE_ROUTE:-off}" in label|auto) ;; *) return 1 ;; esac
+  case "${PILOT_WA_NODE_ROUTE:-}" in label|auto) ;; *) return 1 ;; esac
   [ "${DRY_RUN:-0}" != "1" ]
 }
 
@@ -11871,7 +11874,7 @@ _pilot_node_only_wa_route_on() {
 # vazio (sem dono e sem rota; o bd omite chave vazia) → é o estado livre; falhou/ilegível (JSON que o jq não lê) → NÃO. Script ausente ou sonda que não sai 0 (10, 11, 12, 13, 124, 137...) → NÃO.
 _PNW_PROBES=0
 _pilot_node_only_wa_pre() {
-  local _b="${1:-}" _id _own _dir _mode="${PILOT_WA_NODE_ROUTE:-off}" _basis=any _cap="${PILOT_WA_NODE_ONLY_PROBES:-6}" _rc=0
+  local _b="${1:-}" _id _own _dir _mode="${PILOT_WA_NODE_ROUTE:-}" _basis=any _cap="${PILOT_WA_NODE_ONLY_PROBES:-6}" _rc=0
   _pilot_node_only_wa_route_on || return 1
   _id=$(printf '%s' "$_b" | jq -r '.id // ""' 2>/dev/null) || return 1
   [ "${_id#wa-}" != "$_id" ] || return 1
@@ -11886,7 +11889,7 @@ _pilot_node_only_wa_pre() {
   _dir="${PILOT_WA_NODE_SCRIPTS:-$GC_CITY/scripts}"
   [ -x "$_dir/wa-node-dispatch.sh" ] || return 1
   _PNW_PROBES=$((_PNW_PROBES + 1))
-  timeout "${PILOT_WA_NODE_TIMEOUT:-90}" "$_dir/wa-node-dispatch.sh" apply "$_id" --basis "$_basis" --dry-run >/dev/null 2>&1 || _rc=$?
+  timeout "${PILOT_WA_NODE_TIMEOUT:-90}" "$_dir/wa-node-dispatch.sh" apply "$_id" --dry-run --basis "$_basis" >/dev/null 2>&1 || _rc=$?
   [ "$_rc" = 0 ]
 }
 

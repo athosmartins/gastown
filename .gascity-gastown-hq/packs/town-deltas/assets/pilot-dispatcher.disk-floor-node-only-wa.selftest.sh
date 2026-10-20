@@ -108,13 +108,13 @@ echo "── (1) a bead de WA candidata: label exige node:ok no JSON; a sonda é
 reset; wnd 0
 r=$(PR_ROUTE=label run_pre 'c "'"$(q "$J_LABEL")"'"; echo'); r="${r% }"
 [ "$r" = 0 ] && [ "$(calls)" = 1 ] && ok "label + node:ok + sonda rc 0: candidata, UMA sonda" || bad "label + node:ok + rc 0 não é candidata (rc=$r, sondas=$(calls))"
-[ "$(cat "$WORK/wnd.calls" 2>/dev/null)" = "apply wa-p1 --basis label --dry-run" ] && ok "a sonda é 'apply <bead> --basis label --dry-run' (dry-run: nada é escrito)" || bad "a sonda não é o dry-run esperado: '$(cat "$WORK/wnd.calls" 2>/dev/null)'"
+[ "$(cat "$WORK/wnd.calls" 2>/dev/null)" = "apply wa-p1 --dry-run --basis label" ] && ok "a sonda é 'apply <bead> --dry-run --basis label' (dry-run: nada é escrito)" || bad "a sonda não é o dry-run esperado: '$(cat "$WORK/wnd.calls" 2>/dev/null)'"
 reset; wnd 0
 r=$(PR_ROUTE=label run_pre 'c "'"$(q "$J_PLAIN")"'"; echo'); r="${r% }"
 [ "$r" = 1 ] && [ "$(calls)" = 0 ] && ok "label sem node:ok: NÃO é candidata e não gasta a sonda (o apply recusaria por base)" || bad "label sem node:ok passou ou gastou sonda (rc=$r, sondas=$(calls))"
 reset; wnd 0
 r=$(PR_ROUTE=auto run_pre 'c "'"$(q "$J_PLAIN")"'"; echo'); r="${r% }"
-[ "$r" = 0 ] && [ "$(calls)" = 1 ] && [ "$(cat "$WORK/wnd.calls")" = "apply wa-p2 --basis any --dry-run" ] && ok "auto sem node:ok: candidata pela sonda (apply --basis any --dry-run)" || bad "auto sem node:ok (rc=$r, sondas=$(calls), argv='$(cat "$WORK/wnd.calls" 2>/dev/null)')"
+[ "$r" = 0 ] && [ "$(calls)" = 1 ] && [ "$(cat "$WORK/wnd.calls")" = "apply wa-p2 --dry-run --basis any" ] && ok "auto sem node:ok: candidata pela sonda (apply --dry-run --basis any)" || bad "auto sem node:ok (rc=$r, sondas=$(calls), argv='$(cat "$WORK/wnd.calls" 2>/dev/null)')"
 
 echo "── (1) o terceiro estado nunca vira node: só o rc 0 da sonda vale"
 for rc in 10 11 12 13 2 124 137 127; do
@@ -248,8 +248,8 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
     case "$r" in "RESULT 0/"*) bad "mutante '$1' NÃO foi pego ($r)" ;; "RESULT "*) ok "mutante '$1' pego ($r)" ;; *) bad "mutante '$1': sem resultado ($r)" ;; esac
   }
   # as âncoras são ASCII de propósito (o python3 lê o argv no locale do shell e o arquivo em UTF-8: uma âncora com acento não casaria sob LC_ALL=C)
-  mutant "a sonda não é dry-run" '--basis "$_basis" --dry-run >/dev/null' '--basis "$_basis" >/dev/null'
-  mutant "a rota desligada deixa passar" $'  case "${PILOT_WA_NODE_ROUTE:-off}" in label|auto) ;; *) return 1 ;; esac\n  [ "${DRY_RUN:-0}" != "1" ]' $'  [ "${DRY_RUN:-0}" != "1" ]'
+  mutant "a sonda não é dry-run" '--dry-run --basis "$_basis" >/dev/null' '--basis "$_basis" >/dev/null'
+  mutant "a rota desligada deixa passar" $'  case "${PILOT_WA_NODE_ROUTE:-}" in label|auto) ;; *) return 1 ;; esac\n  [ "${DRY_RUN:-0}" != "1" ]' $'  [ "${DRY_RUN:-0}" != "1" ]'
   mutant "o DRY_RUN deixa passar" $'label|auto) ;; *) return 1 ;; esac\n  [ "${DRY_RUN:-0}" != "1" ]' $'label|auto) ;; *) return 1 ;; esac\n  :'
   mutant "a sonda vale com qualquer rc" '  [ "$_rc" = 0 ]' '  return 0'
   mutant "o teto de sondas não vale" '  [ "$_PNW_PROBES" -lt "$_cap" ] || return 1' '  :'
