@@ -57,10 +57,10 @@ index 862561fa9..9984c96e3 100644
  	}
 diff --git a/cmd/gc/dolt_hold.go b/cmd/gc/dolt_hold.go
 new file mode 100644
-index 000000000..5fda955b6
+index 000000000..84b01c08e
 --- /dev/null
 +++ b/cmd/gc/dolt_hold.go
-@@ -0,0 +1,241 @@
+@@ -0,0 +1,283 @@
 +package main
 +
 +import (
@@ -199,6 +199,37 @@ index 000000000..5fda955b6
 +	return filepath.Join(layout.PackStateDir, managedDoltHoldFileName), nil
 +}
 +
++// managedDoltHoldPathAbsent reports whether nothing at all is on the hold
++// path: the parent directory is really gone, or it is there and the file is
++// not. A symlink counts as something even when its target is missing, for the
++// file and for the parent, which is what the shell reader does
++// (examples/bd/assets/scripts/dolt-hold.sh). Anything it cannot tell comes back
++// as an error, which the caller reads as a hold.
++func managedDoltHoldPathAbsent(path string) (bool, error) {
++	dir := filepath.Dir(path)
++	if _, err := os.Stat(dir); err != nil {
++		if !errors.Is(err, fs.ErrNotExist) {
++			return false, err
++		}
++		// The parent does not resolve: gone for real, or a link that leads
++		// nowhere. Only the first says "no hold".
++		if _, lerr := os.Lstat(dir); lerr != nil {
++			if errors.Is(lerr, fs.ErrNotExist) {
++				return true, nil
++			}
++			return false, lerr
++		}
++		return false, err
++	}
++	if _, err := os.Lstat(path); err != nil {
++		if errors.Is(err, fs.ErrNotExist) {
++			return true, nil
++		}
++		return false, err
++	}
++	return false, nil
++}
++
 +// readManagedDoltHold reads the hold for the city. It never returns a Go
 +// error: a failure to read is the managedDoltHoldUnreadable state, which
 +// blocks.
@@ -210,12 +241,23 @@ index 000000000..5fda955b6
 +	if err != nil {
 +		return managedDoltHold{State: managedDoltHoldUnreadable, Err: err}
 +	}
-+	// file absent (ENOENT) → no hold; open failed for any other reason
-+	// (EACCES, EIO, ENOTDIR on the parent...) → unreadable, which blocks.
++	// file absent (ENOENT, nothing on the path) → no hold; ENOENT with a
++	// symlink on the path, or open failed for any other reason (EACCES, EIO,
++	// ENOTDIR on the parent...) → unreadable, which blocks.
 +	f, err := os.Open(path)
 +	if err != nil {
 +		if errors.Is(err, fs.ErrNotExist) {
-+			return managedDoltHold{State: managedDoltHoldNone, Path: path}
++			// Open follows symlinks, so ENOENT is also what a link whose
++			// target is gone reports. Only a path with nothing on it counts
++			// as "no hold".
++			absent, aerr := managedDoltHoldPathAbsent(path)
++			if aerr != nil {
++				return managedDoltHold{State: managedDoltHoldUnreadable, Path: path, Err: aerr}
++			}
++			if absent {
++				return managedDoltHold{State: managedDoltHoldNone, Path: path}
++			}
++			return managedDoltHold{State: managedDoltHoldUnreadable, Path: path, Err: err}
 +		}
 +		return managedDoltHold{State: managedDoltHoldUnreadable, Path: path, Err: err}
 +	}
@@ -304,20 +346,22 @@ index 000000000..5fda955b6
 +}
 diff --git a/cmd/gc/dolt_hold_script_test.go b/cmd/gc/dolt_hold_script_test.go
 new file mode 100644
-index 000000000..27c432779
+index 000000000..b5301faea
 --- /dev/null
 +++ b/cmd/gc/dolt_hold_script_test.go
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,208 @@
 +package main
 +
 +import (
 +	"errors"
++	"fmt"
 +	"io/fs"
 +	"os"
 +	"os/exec"
 +	"path/filepath"
 +	"strings"
 +	"testing"
++	"time"
 +)
 +
 +// The shell lifecycle script is the one door every start/recover walks
@@ -374,12 +418,152 @@ index 000000000..27c432779
 +		})
 +	}
 +}
++
++// The prelude of gc-beads-bd.sh carries a fallback dolt_hold_blocks for
++// harnesses that ship the script without its sibling helper. Its comment
++// promises it "can only block MORE than the helper, never less"; this holds it
++// to that. Each case is a hold-file situation; wherever the real helper
++// blocks, the fallback must block too. It may also block where the helper
++// releases (an expired hold: the fallback does not read expiry), so the table
++// pins only the direction that protects Dolt, plus the one case where both
++// must agree on "no hold" so the fallback is not a blanket refusal.
++func TestGCBeadsBdFallbackHoldReaderNeverBlocksLessThanHelper(t *testing.T) {
++	if _, err := exec.LookPath("sh"); err != nil {
++		t.Skip("sh not available")
++	}
++	script, err := os.ReadFile(filepath.Join(repoRootForLint(t), "examples", "bd", "assets", "scripts", "gc-beads-bd.sh"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	const start = "\n    dolt_hold_blocks() {\n"
++	i := strings.Index(string(script), start)
++	if i < 0 {
++		t.Fatal("fallback dolt_hold_blocks not found in gc-beads-bd.sh")
++	}
++	body := string(script)[i+1:]
++	j := strings.Index(body, "\n    }\n")
++	if j < 0 {
++		t.Fatal("end of fallback dolt_hold_blocks not found in gc-beads-bd.sh")
++	}
++	fallback := body[:j+len("\n    }\n")]
++
++	fallbackBlocks := func(t *testing.T, holdPath string) bool {
++		t.Helper()
++		cmd := exec.Command("sh", "-c", fallback+`if dolt_hold_blocks; then echo BLOCK; else echo FREE; fi`)
++		// In production gc-beads-bd always has PACK_STATE_DIR by the time it
++		// gets here (it mkdir -p's it first); only the "no path" case leaves
++		// it empty.
++		stateDir := ""
++		if holdPath != "" {
++			stateDir = filepath.Dir(holdPath)
++		}
++		cmd.Env = append(os.Environ(), "GC_DOLT_HOLD_FILE="+holdPath, "PACK_STATE_DIR="+stateDir)
++		out, runErr := cmd.CombinedOutput()
++		if runErr != nil {
++			t.Fatalf("running the fallback: %v\n%s", runErr, out)
++		}
++		return strings.TrimSpace(string(out)) == "BLOCK"
++	}
++
++	type scenario struct {
++		name     string
++		setup    func(t *testing.T, holdPath string)
++		skipAs0  bool
++		wantFree bool // both readers must say "no hold"
++	}
++	mkParent := func(t *testing.T, holdPath string) {
++		t.Helper()
++		if err := os.MkdirAll(filepath.Dir(holdPath), 0o755); err != nil {
++			t.Fatal(err)
++		}
++	}
++	scenarios := []scenario{
++		{name: "parent directory absent", setup: func(t *testing.T, holdPath string) {}, wantFree: true},
++		{name: "file absent", setup: mkParent, wantFree: true},
++		{name: "empty file", setup: func(t *testing.T, holdPath string) { writeHoldFile(t, holdPath, "") }},
++		{name: "unexpired hold", setup: func(t *testing.T, holdPath string) {
++			writeHoldFile(t, holdPath, fmt.Sprintf("expires_at=%d\n", time.Now().Add(time.Hour).Unix()))
++		}},
++		{name: "expires_at not a number", setup: func(t *testing.T, holdPath string) { writeHoldFile(t, holdPath, "expires_at=soon\n") }},
++		{name: "directory in place of the file", setup: func(t *testing.T, holdPath string) {
++			if err := os.MkdirAll(holdPath, 0o755); err != nil {
++				t.Fatal(err)
++			}
++		}},
++		{name: "symlink whose target is missing", setup: func(t *testing.T, holdPath string) {
++			mkParent(t, holdPath)
++			if err := os.Symlink(filepath.Join(filepath.Dir(holdPath), "no-such-target"), holdPath); err != nil {
++				t.Fatal(err)
++			}
++		}},
++		{name: "parent is a symlink whose target is missing", setup: func(t *testing.T, holdPath string) {
++			parent := filepath.Dir(holdPath)
++			if err := os.MkdirAll(filepath.Dir(parent), 0o755); err != nil {
++				t.Fatal(err)
++			}
++			if err := os.Symlink(filepath.Join(filepath.Dir(parent), "no-such-dir"), parent); err != nil {
++				t.Fatal(err)
++			}
++		}},
++		{name: "a file where the parent directory should be", setup: func(t *testing.T, holdPath string) {
++			parent := filepath.Dir(holdPath)
++			if err := os.MkdirAll(filepath.Dir(parent), 0o755); err != nil {
++				t.Fatal(err)
++			}
++			if err := os.WriteFile(parent, []byte("x"), 0o644); err != nil {
++				t.Fatal(err)
++			}
++		}},
++		{name: "parent not searchable", skipAs0: true, setup: func(t *testing.T, holdPath string) {
++			writeHoldFile(t, holdPath, "owner=x\n")
++			parent := filepath.Dir(holdPath)
++			if err := os.Chmod(parent, 0o000); err != nil {
++				t.Fatal(err)
++			}
++			t.Cleanup(func() { _ = os.Chmod(parent, 0o755) })
++		}},
++		{name: "file not readable", skipAs0: true, setup: func(t *testing.T, holdPath string) {
++			writeHoldFile(t, holdPath, "owner=x\n")
++			if err := os.Chmod(holdPath, 0o000); err != nil {
++				t.Fatal(err)
++			}
++			t.Cleanup(func() { _ = os.Chmod(holdPath, 0o644) })
++		}},
++	}
++	for _, sc := range scenarios {
++		t.Run(sc.name, func(t *testing.T) {
++			if sc.skipAs0 && os.Geteuid() == 0 {
++				t.Skip("root ignores file modes")
++			}
++			_, holdPath := holdTestCity(t)
++			sc.setup(t, holdPath)
++			helper, msg := shellHoldBlocks(t, holdPath)
++			fb := fallbackBlocks(t, holdPath)
++			if sc.wantFree && (helper || fb) {
++				t.Fatalf("no hold here, but helper blocks=%v (%q) fallback blocks=%v", helper, msg, fb)
++			}
++			if helper && !fb {
++				t.Fatalf("helper blocks (%q) but the fallback lets it through — \"never blocks less\" is false", msg)
++			}
++		})
++	}
++
++	t.Run("no path to look at", func(t *testing.T) {
++		helper, msg := shellHoldBlocks(t, "")
++		if !helper {
++			t.Fatalf("helper should hold when it has no path to look at, got free (%q)", msg)
++		}
++		if !fallbackBlocks(t, "") {
++			t.Fatal("helper holds when there is no path to look at, the fallback lets it through")
++		}
++	})
++}
 diff --git a/cmd/gc/dolt_hold_test.go b/cmd/gc/dolt_hold_test.go
 new file mode 100644
-index 000000000..c8538aea3
+index 000000000..7929caa88
 --- /dev/null
 +++ b/cmd/gc/dolt_hold_test.go
-@@ -0,0 +1,470 @@
+@@ -0,0 +1,520 @@
 +package main
 +
 +import (
@@ -563,6 +747,56 @@ index 000000000..c8538aea3
 +		}
 +		if blocks, msg := shellHoldBlocks(t, holdPath); !blocks {
 +			t.Fatalf("dolt-hold.sh read a file-where-the-directory-should-be as \"no hold\": %q", msg)
++		}
++	})
++	t.Run("symlink whose target is missing", func(t *testing.T) {
++		cityPath, holdPath := holdTestCity(t)
++		// os.Open follows the link and reports ENOENT, which on its own would
++		// read as "no hold". But something IS at the hold path: whoever put it
++		// there meant a hold, and the shell reader blocks on it too.
++		if err := os.MkdirAll(filepath.Dir(holdPath), 0o755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.Symlink(filepath.Join(filepath.Dir(holdPath), "no-such-target"), holdPath); err != nil {
++			t.Fatal(err)
++		}
++		got := readManagedDoltHold(cityPath)
++		if got.State != managedDoltHoldUnreadable || !got.Blocks() {
++			t.Fatalf("hold = %+v, want unreadable+blocking", got)
++		}
++		if blocks, msg := shellHoldBlocks(t, holdPath); !blocks {
++			t.Fatalf("dolt-hold.sh let a dangling symlink through: %q", msg)
++		}
++	})
++	t.Run("parent directory is a symlink whose target is missing", func(t *testing.T) {
++		cityPath, holdPath := holdTestCity(t)
++		// Same class one level up: the parent is not ABSENT (a link sits
++		// there), it just leads nowhere, so nothing can say "no hold".
++		parent := filepath.Dir(holdPath)
++		if err := os.MkdirAll(filepath.Dir(parent), 0o755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.Symlink(filepath.Join(filepath.Dir(parent), "no-such-dir"), parent); err != nil {
++			t.Fatal(err)
++		}
++		got := readManagedDoltHold(cityPath)
++		if got.State != managedDoltHoldUnreadable || !got.Blocks() {
++			t.Fatalf("hold = %+v, want unreadable+blocking", got)
++		}
++		if blocks, msg := shellHoldBlocks(t, holdPath); !blocks {
++			t.Fatalf("dolt-hold.sh let a dangling parent symlink through: %q", msg)
++		}
++	})
++	t.Run("parent directory absent", func(t *testing.T) {
++		cityPath, holdPath := holdTestCity(t)
++		// The one ENOENT that does mean "no hold": nobody can have put a
++		// hold under a directory that does not exist.
++		got := readManagedDoltHold(cityPath)
++		if got.State != managedDoltHoldNone || got.Blocks() {
++			t.Fatalf("hold = %+v, want none", got)
++		}
++		if blocks, msg := shellHoldBlocks(t, holdPath); blocks {
++			t.Fatalf("dolt-hold.sh blocked on an absent parent: %q", msg)
 +		}
 +	})
 +	t.Run("permission denied", func(t *testing.T) {
@@ -1028,7 +1262,7 @@ index 000000000..d5da26267
 +    return 0
 +}
 diff --git a/examples/bd/assets/scripts/gc-beads-bd.sh b/examples/bd/assets/scripts/gc-beads-bd.sh
-index 038baf936..fed703b9b 100755
+index 038baf936..bf35c72a7 100755
 --- a/examples/bd/assets/scripts/gc-beads-bd.sh
 +++ b/examples/bd/assets/scripts/gc-beads-bd.sh
 @@ -1908,6 +1908,14 @@ op_start() {
@@ -1046,7 +1280,7 @@ index 038baf936..fed703b9b 100755
      local gc_helper_bin
      gc_helper_bin=$(resolve_gc_helper_bin)
  
-@@ -2679,6 +2687,23 @@ else
+@@ -2679,6 +2687,45 @@ else
      }
  fi
  
@@ -1058,19 +1292,41 @@ index 038baf936..fed703b9b 100755
 +    . "$hold_helper"
 +else
 +    # Focused harnesses run this prelude without sibling assets. Production
-+    # always has dolt-hold.sh next to this script. The fallback can only block
-+    # MORE than the helper (the file's mere presence holds; expiry is not
-+    # read), never less.
++    # always has dolt-hold.sh next to this script. This reader is stricter than
++    # the helper, never looser: whatever the helper holds on, it holds on too.
++    # It does not read expiry (the file's mere presence holds, so it can hold
++    # where the helper has released an expired hold), and a path it cannot see
++    # clearly is a hold. Only "the parent is gone" or "the parent is a
++    # searchable directory without the file" releases.
 +    dolt_hold_blocks() {
-+        DOLT_HOLD_MESSAGE="dolt hold file present (${PACK_STATE_DIR:-}/dolt-hold)"
-+        [ -n "${PACK_STATE_DIR:-}" ] && [ -e "${GC_DOLT_HOLD_FILE:-$PACK_STATE_DIR/dolt-hold}" ]
++        _dh_file="${GC_DOLT_HOLD_FILE:-}"
++        if [ -z "$_dh_file" ]; then
++            DOLT_HOLD_MESSAGE="dolt hold: pack state dir unknown, cannot look for the hold file; treating it as a hold"
++            # empty (no path to look at) -> hold; failed -> n/a, nothing is read yet
++            [ -n "${PACK_STATE_DIR:-}" ] || return 0
++            _dh_file="$PACK_STATE_DIR/dolt-hold"
++        fi
++        DOLT_HOLD_MESSAGE="dolt hold file present or unreadable ($_dh_file); fallback reader does not read expiry, remove the file to release it"
++        _dh_dir=$(dirname "$_dh_file")
++        # empty (parent gone) -> released; unreadable (parent is a broken link,
++        # a regular file, or not searchable) -> hold
++        if [ ! -e "$_dh_dir" ] && [ ! -h "$_dh_dir" ]; then
++            return 1
++        fi
++        if [ ! -d "$_dh_dir" ] || [ ! -x "$_dh_dir" ]; then
++            return 0
++        fi
++        if [ -e "$_dh_file" ] || [ -h "$_dh_file" ]; then
++            return 0
++        fi
++        return 1
 +    }
 +fi
 +
  # op_recover stops the dolt server, restarts it, and verifies health.
  op_recover() {
      local read_only_status
-@@ -2687,6 +2712,12 @@ op_recover() {
+@@ -2687,6 +2734,12 @@ op_recover() {
          die "recovery not supported for remote dolt servers"
      fi
  
@@ -1084,10 +1340,10 @@ index 038baf936..fed703b9b 100755
      # Restarting dolt does not free disk space, and the recovery cycle
      # itself amplifies the failure: each restart triggers a conjoin/backup
 diff --git a/examples/dolt/commands/restart/run.sh b/examples/dolt/commands/restart/run.sh
-index 0a006747a..815d56f07 100755
+index 0a006747a..3b5abed94 100755
 --- a/examples/dolt/commands/restart/run.sh
 +++ b/examples/dolt/commands/restart/run.sh
-@@ -49,6 +49,20 @@ LOG_FILE="${GC_DOLT_LOG_FILE:-$PACK_STATE_DIR/dolt.log}"
+@@ -49,6 +49,24 @@ LOG_FILE="${GC_DOLT_LOG_FILE:-$PACK_STATE_DIR/dolt.log}"
  BD_SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$GC_BEADS_BD_SCRIPT")" && pwd)"
  . "$BD_SCRIPT_DIR/dolt-enospc.sh"
  
@@ -1095,24 +1351,28 @@ index 0a006747a..815d56f07 100755
 +# the stop below: gc-beads-bd start would refuse too, but only after the stop
 +# had already taken a running server down. --force does not override a hold;
 +# remove the hold file instead. The helper is read when present; harnesses
-+# that ship only gc-beads-bd skip this early check and still get the refusal
-+# from gc-beads-bd start.
++# that ship only gc-beads-bd skip this early check (and say so) and still get
++# the refusal from gc-beads-bd start.
 +if [ -r "$BD_SCRIPT_DIR/dolt-hold.sh" ]; then
 +  . "$BD_SCRIPT_DIR/dolt-hold.sh"
 +  if dolt_hold_blocks; then
 +    echo "gc dolt restart: refused: $DOLT_HOLD_MESSAGE" >&2
 +    exit 1
 +  fi
++else
++  # A guard that is skipped says so: under a hold, gc-beads-bd start refuses,
++  # but only after the stop below has already taken a running server down.
++  echo "gc dolt restart: warning: $BD_SCRIPT_DIR/dolt-hold.sh is not readable; skipping the early hold check" >&2
 +fi
 +
  if recovery_should_skip_due_to_enospc; then
    if [ "$force_restart" != "true" ]; then
      echo "gc dolt restart: recent Dolt log shows ENOSPC; refusing restart because it can amplify recovery writes" >&2
 diff --git a/examples/dolt/restart_test.go b/examples/dolt/restart_test.go
-index faf328de8..6e917a791 100644
+index faf328de8..146497f84 100644
 --- a/examples/dolt/restart_test.go
 +++ b/examples/dolt/restart_test.go
-@@ -255,3 +255,83 @@ func TestRestartRejectsRemoteHostWithDiagnostic(t *testing.T) {
+@@ -255,3 +255,114 @@ func TestRestartRejectsRemoteHostWithDiagnostic(t *testing.T) {
  		t.Fatalf("restart invoked gc-beads-bd despite remote-host refusal; ops log:\n%s\noutput:\n%s", data, out)
  	}
  }
@@ -1194,5 +1454,36 @@ index faf328de8..6e917a791 100644
 +	}
 +	if got := strings.Join(strings.Fields(string(data)), " "); got != "stop start" {
 +		t.Fatalf("expected ops 'stop start' after the hold expired, got %q\n%s", got, out)
++	}
++}
++
++// Without the helper the early check cannot run, and the only thing left
++// between a hold and a running stop is gc-beads-bd start, which refuses AFTER
++// the stop. That is a degraded guard, not a silent one: restart says so on
++// stderr and carries on.
++func TestRestartWarnsWhenHoldHelperIsMissing(t *testing.T) {
++	root := repoRoot(t)
++	port, cleanup := startReachableTCPListener(t)
++	defer cleanup()
++
++	cityPath := t.TempDir()
++	bdLog := writeFakeBeadsBDForRestart(t, cityPath, map[string]int{"stop": 0, "start": 0})
++	// installHoldHelperForRestart deliberately not called.
++
++	out, err := runRestart(t, cityPath, root, port)
++	if err != nil {
++		t.Fatalf("gc dolt restart failed without the hold helper: %v\n%s", err, out)
++	}
++	for _, want := range []string{"dolt-hold.sh", "skipping the early hold check"} {
++		if !strings.Contains(string(out), want) {
++			t.Fatalf("output lacks %q (a skipped guard must say so):\n%s", want, out)
++		}
++	}
++	data, err := os.ReadFile(bdLog)
++	if err != nil {
++		t.Fatalf("read fake bd log: %v", err)
++	}
++	if got := strings.Join(strings.Fields(string(data)), " "); got != "stop start" {
++		t.Fatalf("expected ops 'stop start', got %q\n%s", got, out)
 +	}
 +}

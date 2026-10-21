@@ -44,17 +44,29 @@ file is removed. While it holds, nothing starts, recovers or restarts the manage
   before starting, so its check comes before the lifecycle lock.
 * `examples/bd/assets/scripts/gc-beads-bd.sh` + new `dolt-hold.sh`: `op_start` and `op_recover`
   refuse with exit 1 (exit 2 reads as success to the Go caller). This is the door `gc dolt start`,
-  `gc dolt restart`, the supervisor and launchd all walk through.
+  `gc dolt restart`, the supervisor and launchd all walk through. When the sibling `dolt-hold.sh`
+  is not readable (focused test harnesses only; production always ships it) the script falls back
+  to a small reader that is **stricter, never looser**: it does not read `expires_at` (the file's
+  mere presence holds, so it can hold where the helper has released an expired hold), and anything
+  it cannot see clearly (a dangling symlink, an unsearchable or non-directory parent, no path at
+  all) is a hold. Only "the parent is gone" or "the parent is a searchable directory without the
+  file" releases. A test holds it to that against the real helper, case by case.
 * `examples/dolt/commands/restart/run.sh`: refuses BEFORE its stop step (a restart that stopped a
   running Dolt and then failed to start it would be the worst outcome). `--force` does not
-  override a hold.
+  override a hold. If `dolt-hold.sh` is not readable the early check is skipped **and says so on
+  stderr**; `gc-beads-bd.sh start` still refuses, but only after the stop.
 
 ## The city side (usable before the window)
 
 * `scripts/dolt-hold-lib.sh`: the same reader for shell. `dolt_hold_blocks` is byte-identical to
   the engine helper (the selftest compares them against this patch).
-* `scripts/dolt-hold.sh on|off|status`: places the hold atomically, default expiry 2 h (cap 12 h
-  unless `--no-expiry`), refuses to overwrite a hold in force, verifies what it wrote.
+* `scripts/dolt-hold.sh on|off|status`: places the hold atomically (a hard link, so it never lands
+  over a hold in force; of two concurrent `on` calls one wins and the other exits 3), default
+  expiry 2 h (cap 12 h unless `--no-expiry`). `--ttl-secs` is decimal: `07200` is 7200 s, not
+  octal. An unreadable clock refuses (exit 4). After writing it reads the file back and requires
+  both "a hold in force" and the `expires_at` it asked for. `off` re-asks the reader after
+  removing and exits 4 if a hold still blocks (for instance a hold file that exists but sits in an
+  unsearchable directory), instead of reporting "nothing to remove".
 * `dolt-hang-watchdog.sh`: under a hold, no probe, no strike, no restart, no death snapshot, and
   it clears strikes / CPU-veto / PID baseline so the first tick after the release starts clean.
 * `dolt-disk-floor-guard.sh` `_resurrect_dolt`: no `gc dolt start`, and — before any escalation —
@@ -69,6 +81,17 @@ After `off`, launchd's retry brings Dolt up on its own: the plist sets no `Throt
 default 10 s applies, and under a hold each relaunch of `gc dolt start` is refused (cheap). Or run
 `gc dolt start` by hand.
 
+**A hold over a HEALTHY Dolt is not quiet either.** `com.gastown.dolt-server` is a one-shot
+launcher with `KeepAlive {Crashed, SuccessfulExit=false}`. Today `gc dolt start` against a running
+Dolt exits 0 and launchd leaves it alone. With the patch and a hold, `start` refuses even when Dolt
+is up (see Decisions), so it exits 1 and launchd relaunches the launcher about every 10 s until the
+hold is removed or expires: one refused `gc dolt start` and one line in
+`.gc/logs/dolt-server-launchd.err` per relaunch (roughly 360 an hour). Dolt itself is untouched and
+keeps serving. It is bounded by the hold's expiry (2 h by default, 12 h at most unless
+`--no-expiry`), and `dolt-hold.sh off` ends it. Read from the plist and the code, not exercised
+live. If a long hold on a healthy Dolt is ever wanted, bootout the launchd job for that time (as
+`hqswap.sh` does) rather than leave it looping.
+
 ## Decisions worth challenging
 
 * **Unreadable = held.** A hold file that cannot be read or parsed blocks, like an active one: what
@@ -82,6 +105,10 @@ default 10 s applies, and under a hold each relaunch of `gc dolt start` is refus
 * **Exit 1, not 2.** `runProviderOp` treats exit 2 as "not needed, success".
 * **A forgotten hold is the main hazard.** Hence the 2 h default expiry in the tool. A bare
   `touch` has no expiry on purpose; use the tool.
+* **The reader looks at the first 4 KiB.** Both readers (Go and shell) cap the read, so a hand-edited
+  file whose `expires_at` line sits past byte 4096 is read as having no expiry (an unexpired hold
+  that never releases), and one cut in the middle of the digits reads as a shorter, probably
+  already past, time. The tool writes a few dozen bytes; only a hand-made file can hit this.
 * **Boot with a hold on:** Dolt does not start (`gc dolt start` is refused), so the city cannot
   come up until the hold is released or expires. Expected from the code, not exercised. The
   expiry is what bounds this.
@@ -89,7 +116,9 @@ default 10 s applies, and under a hold each relaunch of `gc dolt start` is refus
 ## Tests and what they prove
 
 Run on the MBP (`mbp-run.sh --exec --go`): `go vet ./cmd/gc/` clean; the new Go tests and the
-restart tests pass. The new tests **fail without the production change** (checked by reverting
+restart tests pass; `go test ./cmd/gc/ -run "Dolt|GCBeadsBd|BeadsProvider|BdEnv|BdCommand|ManagedBD"`
+and `./examples/...` pass except 6 tests that fail identically on the untouched base `de525d882`
+(3 `TestBackupScript…` — `flock` is missing on the MBP — and 3 `examples/gastown` TOML tests). The new tests **fail without the production change** (checked by reverting
 only the production files): `RecoverManagedBDCommandAllowedRefusesUnderHold`,
 `BdCommandRunnerWithManagedRetryDoesNotRecoverUnderHold`,
 `EnsureManagedDoltPublishedForTickSkipsHealthUnderHold`, `HealthBeadsProviderDoesNotRecoverUnderHold`,
@@ -97,8 +126,14 @@ only the production files): `RecoverManagedBDCommandAllowedRefusesUnderHold`,
 (real `gc-beads-bd.sh`, asserts no lock/pid/state file was created), and
 `TestRestartRefusesUnderHoldBeforeStopping`. `TestReadManagedDoltHoldStates` runs every case
 through the Go reader AND the shell helper and requires them to agree.
+After the first gate review, three more were added test-first and watched failing against the
+earlier code: `TestReadManagedDoltHoldUnreadableBlocks` gained a symlink whose target is missing
+and a parent that is such a symlink (the Go reader said "no hold", the shell one held);
+`TestGCBeadsBdFallbackHoldReaderNeverBlocksLessThanHelper` (11 situations, the fallback must hold
+wherever the helper does; it failed for the dangling symlink, the dangling or regular-file parent,
+the unsearchable parent and the missing path); `TestRestartWarnsWhenHoldHelperIsMissing`.
 
-City side: `scripts/dolt-hold.selftest.sh` (57 checks), plus HOLD sections added to
+City side: `scripts/dolt-hold.selftest.sh` (71 checks, also under macOS `/bin/bash` 3.2), plus HOLD sections added to
 `dolt-hang-watchdog.selftest.sh` and `dolt-disk-floor-guard.selftest.sh`; the HOLD assertions
 fail against the pre-change guard scripts.
 
@@ -144,6 +179,7 @@ restore the previous binary (`gc` symlink). The city-side scripts are inert with
   where that is turned on.
 * **`hqswap.sh` is not changed.** It still freezes launchd and suspends the city; adopting the
   hold there is a follow-up once this is live.
-* **Shell reader vs Go reader:** they agree on every tested case; they differ only if a regular
-  file sits further up the path than the immediate parent (Go: unreadable/blocks; shell: reads as
-  "absent").
+* **Shell reader vs Go reader:** they agree on every tested case, including a dangling symlink at
+  the hold path or as its parent (both hold). They still differ if a regular file sits further up
+  the path than the immediate parent (Go: unreadable/blocks; shell: reads as "absent", because it
+  only inspects the immediate parent).

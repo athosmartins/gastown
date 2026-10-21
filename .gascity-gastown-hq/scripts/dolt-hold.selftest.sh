@@ -134,6 +134,28 @@ out=$(run_tool on --reason x --ttl-secs abc); rc=$?
 [ "$rc" = 2 ] && ok "on --ttl-secs abc -> exit 2" || bad "ttl texto deu rc=$rc"
 out=$(run_tool on --reason x --ttl-secs 43201); rc=$?
 [ "$rc" = 2 ] && [ ! -e "$GC_DOLT_HOLD_FILE" ] && ok "on --ttl-secs acima do teto de 12 h -> exit 2 e nada gravado" || bad "ttl acima do teto passou (rc=$rc)"
+out=$(run_tool on --reason x --ttl-secs 0043201); rc=$?
+[ "$rc" = 2 ] && [ ! -e "$GC_DOLT_HOLD_FILE" ] && ok "on --ttl-secs 0043201 (decimal 43201, acima do teto) -> exit 2" || bad "ttl com zeros acima do teto passou (rc=$rc)"
+out=$(run_tool on --reason x --ttl-secs 000); rc=$?
+[ "$rc" = 2 ] && [ ! -e "$GC_DOLT_HOLD_FILE" ] && ok "on --ttl-secs 000 -> exit 2 (zero, mesmo com zeros)" || bad "ttl 000 passou (rc=$rc)"
+
+# Zero à esquerda é DECIMAL para quem valida (`[ -gt ]`) e era OCTAL para quem grava ($((now + ttl))):
+# "07200" virava 3712 s (a validade vencia cedo e os guards religavam o Dolt sobre a pasta em troca) e
+# "08"/"09" estouravam ("value too great for base", rc 1, temporário esquecido). O que se grava tem de
+# ser o que se validou: expires_at - created_at == o ttl pedido, lido como decimal.
+for pair in 07200:7200 0010:10 08:8 09:9 0900:900 00300:300 000000000000000000000000000007200:7200; do
+  ttl_in="${pair%%:*}"; ttl_want="${pair##*:}"
+  rm -rf "$T/tool"
+  out=$(run_tool on --reason x --ttl-secs "$ttl_in"); rc=$?
+  c_at=$(sed -n 's/^created_at=//p' "$GC_DOLT_HOLD_FILE" 2>/dev/null); e_at=$(sed -n 's/^expires_at=//p' "$GC_DOLT_HOLD_FILE" 2>/dev/null)
+  if [ "$rc" = 0 ] && [ -n "$c_at" ] && [ -n "$e_at" ] && [ $((e_at - c_at)) -eq "$ttl_want" ]; then
+    ok "on --ttl-secs $ttl_in -> validade = created_at + $ttl_want s (decimal)"
+  else
+    bad "on --ttl-secs $ttl_in: rc=$rc, validade-created_at=$([ -n "$c_at" ] && [ -n "$e_at" ] && echo $((e_at - c_at)) || echo '?') (esperava $ttl_want): $out"
+  fi
+  ls -A "$T/tool" 2>/dev/null | grep -q '^\.dolt-hold\.' && bad "on --ttl-secs $ttl_in deixou temporário em $T/tool"
+done
+rm -rf "$T/tool"
 
 t0=$(date +%s)
 out=$(run_tool on --reason "troca do hq" --owner mayor); rc=$?
@@ -153,6 +175,26 @@ out=$(run_tool off); rc=$?
 case "$out" in *"NÃO foi iniciado"*) ok "off avisa que NÃO sobe o Dolt" ;; *) bad "off não avisou que não sobe o Dolt: $out" ;; esac
 out=$(run_tool off); rc=$?
 [ "$rc" = 0 ] && ok "off sem hold -> exit 0 (idempotente)" || bad "off sem hold deu rc=$rc"
+
+# TERCEIRO ESTADO no `off`: pasta-mãe sem permissão de busca. `[ -e arquivo ]` dá falso para um arquivo
+# que EXISTE (o lib trata isto como "não consegui saber -> SEGURA", e o status acerta); o off dizia
+# "sem hold; nada a tirar" (rc 0) com o hold ainda segurando. Tem de recusar (rc 4) e dizer que segura.
+if [ "$(id -u)" != "0" ]; then
+  rm -rf "$T/tool"; mkdir -p "$T/tool"; printf 'owner=x\nreason=y\n' > "$GC_DOLT_HOLD_FILE"; chmod 000 "$T/tool"
+  out=$(run_tool status); rc=$?
+  st_rc=$rc
+  out=$(run_tool off); rc=$?
+  chmod 755 "$T/tool"
+  if [ "$rc" = 4 ] && [ -f "$GC_DOLT_HOLD_FILE" ]; then
+    case "$out" in *"continua em vigor"*) ok "off com a pasta-mãe sem busca -> exit 4, o hold continua e o off DIZ que continua (status=$st_rc)" ;; *) bad "off recusou (rc 4) mas não disse que o hold continua: $out" ;; esac
+  else
+    bad "off com a pasta-mãe sem busca: rc=$rc (esperava 4), hold $([ -f "$GC_DOLT_HOLD_FILE" ] && echo continua || echo sumiu): $out"
+  fi
+  case "$out" in *"nada a tirar"*) bad "off disse 'nada a tirar' com o hold ainda em vigor: $out" ;; esac
+  rm -rf "$T/tool"
+else
+  skip "off com pasta-mãe sem busca: rodando como root (chmod não bloqueia)"
+fi
 
 # --no-expiry grava sem validade; reason com quebra de linha não injeta chave
 out=$(run_tool on --reason "x" --no-expiry); rc=$?
@@ -179,6 +221,65 @@ out=$(run_tool off); rc=$?
 # nenhum temporário sobra ao lado do hold
 ls -A "$T/tool" 2>/dev/null | grep -q '^\.dolt-hold\.' && bad "sobrou arquivo temporário em $T/tool: $(ls -A "$T/tool")" || ok "nenhum temporário sobra ao lado do hold"
 bash "$TOOL" 2>/dev/null; [ "$?" = 2 ] && ok "sem subcomando -> exit 2 (uso)" || bad "sem subcomando não deu exit 2"
+
+# Injeção de falha: comandos de mentira no PATH (SHIM_*) que agem ANTES do ln/mv/date de verdade, para
+# provocar o que não dá para provocar de fora — outro `on` no meio da gravação, o arquivo gravado com
+# outra validade, o relógio ilegível.
+SHIM="$T/shim"; mkdir -p "$SHIM"
+cat > "$SHIM/ln" <<'SHIM_EOF'
+#!/bin/bash
+case "${0##*/}" in
+  date) [ -n "${SHIM_NODATE:-}" ] && exit 1; exec "$SHIM_REAL_DATE" "$@" ;;
+esac
+case "${SHIM_MODE:-}" in
+  race) # outro operador publica o hold dele depois da checagem do `on` e antes da gravação
+    [ -e "$SHIM_HOLD" ] || printf 'owner=outro\nreason=posto no meio\n' > "$SHIM_HOLD" ;;
+  rewrite) # o arquivo vai para o destino com OUTRA validade (ainda no futuro: lê-se como hold em vigor)
+    src=""; for a in "$@"; do case "$a" in --|-f) ;; *) src="$a"; break ;; esac; done
+    sed "s/^expires_at=.*/expires_at=$SHIM_NEWEXP/" "$src" > "$src.x" && "$SHIM_REAL_MV" -f "$src.x" "$src" ;;
+esac
+case "${0##*/}" in
+  mv) exec "$SHIM_REAL_MV" "$@" ;;
+  *)  exec "$SHIM_REAL_LN" "$@" ;;
+esac
+SHIM_EOF
+chmod +x "$SHIM/ln"; cp "$SHIM/ln" "$SHIM/mv"; cp "$SHIM/ln" "$SHIM/date"
+# shim_tool <VAR=valor...> -- <args da ferramenta>: roda dolt-hold.sh com o PATH de mentira e as variáveis SHIM_*
+shim_tool() {
+  local envs=()
+  while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
+  [ "${1:-}" = "--" ] && shift
+  env PATH="$SHIM:$PATH" SHIM_REAL_LN="$(command -v ln)" SHIM_REAL_MV="$(command -v mv)" SHIM_REAL_DATE="$(command -v date)" \
+      SHIM_HOLD="$GC_DOLT_HOLD_FILE" ${envs[@]+"${envs[@]}"} bash "$TOOL" "$@" 2>&1
+}
+
+# (a) `on` com outro `on` no meio: não pode sobrescrever o hold do outro (exit 3), nem deixar temporário
+rm -rf "$T/tool"
+out=$(shim_tool SHIM_MODE=race -- on --reason meu); rc=$?
+if [ "$rc" = 3 ] && grep -qx 'owner=outro' "$GC_DOLT_HOLD_FILE" 2>/dev/null && ! grep -q 'reason=meu' "$GC_DOLT_HOLD_FILE" 2>/dev/null; then
+  ok "hold posto por outro DEPOIS da checagem do on -> exit 3 e o hold dele fica intacto"
+else
+  bad "on sobrescreveu o hold que apareceu no meio (rc=$rc): $(tr '\n' '|' < "$GC_DOLT_HOLD_FILE" 2>/dev/null) / $out"
+fi
+ls -A "$T/tool" 2>/dev/null | grep -q '^\.dolt-hold\.' && bad "a corrida deixou temporário em $T/tool: $(ls -A "$T/tool")" || ok "a corrida não deixa temporário"
+
+# (b) o arquivo gravado tem OUTRA validade que a pedida: o post-write "é lido como hold em vigor" passa
+# (a validade curta ainda segura), então só conferir o valor pega — foi o caso do octal
+rm -rf "$T/tool"
+newexp=$(( $(date +%s) + 60 ))
+out=$(shim_tool SHIM_MODE=rewrite SHIM_NEWEXP="$newexp" -- on --reason x); rc=$?
+case "$out" in *"HOLD posto"*) said_ok=1 ;; *) said_ok=0 ;; esac
+if [ "$rc" = 4 ] && [ "$said_ok" = 0 ]; then
+  ok "arquivo gravado com validade diferente da pedida -> exit 4 e NÃO diz 'HOLD posto'"
+else
+  bad "validade gravada diferente da pedida passou (rc=$rc): $out"
+fi
+rm -rf "$T/tool"
+
+# (c) relógio ilegível: sem `now` não há created_at nem expires_at confiáveis -> recusa (exit 4), nada gravado
+out=$(shim_tool SHIM_NODATE=1 -- on --reason x); rc=$?
+{ [ "$rc" = 4 ] && [ ! -e "$GC_DOLT_HOLD_FILE" ]; } && ok "relógio ilegível -> exit 4 e nada gravado" || bad "relógio ilegível: rc=$rc, hold $([ -e "$GC_DOLT_HOLD_FILE" ] && echo gravado || echo ausente): $out"
+rm -rf "$T/tool"
 
 echo
 echo "dolt-hold selftest: PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
