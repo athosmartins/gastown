@@ -16,6 +16,7 @@
 #   D. o decide inteiro em modo pilot: env passado ao script (dry-run e real), a ordem das chamadas, o orçamento de spawn (só no modo pilot, só na escrita real), dry-run, shadow, off.
 #   E. _pilot_wa_node_settle: rc incerto do apply (13, prazo, sinal) → desfaz SÓ o que tem a cara do apply (sem sessão), nunca pisa em bead de outro, e o decide devolve 2 de qualquer jeito.
 #   F. a fiação (grep no fonte) e as peças genéricas.
+#   G0. o mutador recusa (rc ≠ 0, destino não escrito) origem ausente, origem sem o trecho e nome que não existe.
 #   G. mutantes: cada quebra tem de derrubar este selftest. Cada um roda o arquivo inteiro e para no 1º FAIL; rodam em paralelo (WA_NODE_SPAWN_ST_JOBS, padrão 4).
 #
 # Run:  bash packs/town-deltas/assets/pilot-dispatcher.wa-node-spawn.selftest.sh
@@ -541,11 +542,31 @@ done
 bash -n "$DISPATCHER" && ok "bash -n do pilot-dispatcher.sh" || fail "bash -n do pilot-dispatcher.sh"
 
 # ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
+MUTATOR="$SELF_DIR/pilot-dispatcher.wa-node-spawn.mutants.py"
+if [ -z "${WA_NODE_SPAWN_SELFTEST_FILE:-}" ]; then
+  echo
+  echo "=== G0. o mutador não inventa mutante ==="
+  # origem ausente, origem sem o trecho que o mutante quebra, nome que não existe → rc ≠ 0 e NADA escrito no destino: um destino vazio ou igual ao original passaria por "morto" ou por "sobreviveu" à toa
+  mut_recusa() { # mut_recusa <descrição> <origem> <nome>
+    rm -f "$T/mut.recusa.sh"
+    if python3 -I "$MUTATOR" "$2" "$T/mut.recusa.sh" "$3" > /dev/null 2>&1; then fail "mutador, $1: saiu 0, tinha de recusar"
+    elif [ -e "$T/mut.recusa.sh" ]; then fail "mutador, $1: recusou mas deixou o destino escrito"
+    else ok "mutador, $1: recusa (rc ≠ 0) e não escreve o destino"; fi
+  }
+  : > "$T/fonte-vazia.sh"
+  MUT_UM="$(python3 -I "$MUTATOR" --list 2>/dev/null | head -n 1)"
+  if [ -z "$MUT_UM" ]; then fail "o mutador não listou nome nenhum: sem ele não há como provar a recusa"
+  else
+    mut_recusa "origem ausente" "$T/nao-existe.sh" "$MUT_UM"
+    mut_recusa "origem sem o trecho a quebrar" "$T/fonte-vazia.sh" "$MUT_UM"
+    mut_recusa "nome que não existe" "$DISPATCHER" "nao-existe-esse-mutante"
+  fi
+fi
+
 if [ -z "${WA_NODE_SPAWN_SELFTEST_FILE:-}" ] && [ -z "${WA_NODE_SPAWN_ST_NOMUT:-}" ]; then
   echo
   echo "=== G. mutantes (cada um tem de derrubar o selftest) ==="
   # o mutador mora em arquivo próprio. ausente/ilegível (python falha) → `fail`; vazio (lista sem nomes) ou com menos que o piso de hoje (72) → `fail` também: tirar um mutante tem de ser decisão visível, nunca "todos mortos" por lista curta
-  MUTATOR="$SELF_DIR/pilot-dispatcher.wa-node-spawn.mutants.py"
   MUT_LIST="$(python3 -I "$MUTATOR" --list)" || { fail "o mutador não carregou"; MUT_LIST=""; }
   [ "$(echo "$MUT_LIST" | wc -w | tr -d ' ')" -ge 72 ] || fail "o mutador listou menos de 72 mutantes ($(echo "$MUT_LIST" | wc -w | tr -d ' '))"
   run_mut() { # run_mut <nome> — escreve $T/res.<nome>: morto | SOBREVIVEU | ERRO
