@@ -1,0 +1,30 @@
+--- a/examples/bd/dolt/commands/sql/run.sh
++++ b/examples/bd/dolt/commands/sql/run.sh
+@@ -58,5 +58,27 @@
+     echo "gc dolt sql: no dolt server running and no databases found" >&2
+     exit 1
+   fi
++  # ga-06wmmp: dolt.lock is what a swap/restore/maintenance window holds while the server is down. Opening
++  # the data dir here (mkdir .dolt/tmp, manifest rewrite) goes around it, so refuse while somebody holds it.
++  # Three states: free (no lock file, or flock takes it) -> go on; held (flock exit 1) -> refuse, exit 75;
++  # cannot tell (no flock, or any other flock exit) -> warn and go on, the same fail-open as
++  # dolt_data_lock_holder in gc-beads-bd.sh (gastownhall/gascity#3174).
++  lock_file="${GC_DOLT_LOCK_FILE:-$PACK_STATE_DIR/dolt.lock}"
++  # empty -> no lock file means nobody ever started a server here: free (flock is not even called, it would create the file);
++  # failed/unreadable -> flock exit other than 0/1, or no flock = cannot tell: warning on stderr, then go on as before
++  if [ -f "$lock_file" ]; then
++    if command -v flock >/dev/null 2>&1; then
++      lock_rc=0
++      flock -n "$lock_file" true 2>/dev/null || lock_rc=$?
++      if [ "$lock_rc" = 1 ]; then
++        echo "gc dolt sql: no dolt server running and the dolt lock is held ($lock_file): a swap/restore/maintenance window owns the data dir, so it is not opened in embedded mode. Retry when the window ends." >&2
++        exit 75
++      elif [ "$lock_rc" != 0 ]; then
++        echo "gc dolt sql: warning: cannot probe the dolt lock $lock_file (flock exit $lock_rc); opening in embedded mode anyway" >&2
++      fi
++    else
++      echo "gc dolt sql: warning: flock is not installed, cannot tell whether the dolt lock $lock_file is held; opening in embedded mode anyway" >&2
++    fi
++  fi
+   exec dolt --data-dir "$data_dir" sql "$@"
+ fi
