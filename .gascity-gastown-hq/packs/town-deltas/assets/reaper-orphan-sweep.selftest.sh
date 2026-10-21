@@ -48,7 +48,8 @@
 #     store + 3 GB) ~ 15 GiB): a sweep that ate that headroom would block the GC that returns space.
 # O15c below the floor a SMALL tail still goes (ga-32t5ds): a database whose WHOLE orphan backlog is at most
 #     GC_REAPER_ORPHAN_TAIL_ROWS is swept while the free space is >= GC_REAPER_ORPHAN_TAIL_MIN_FREE_GB; a bigger
-#     backlog, less space, a tail probe that failed, or TAIL_ROWS=0 keep the floor absolute; and the >1000 count
+#     backlog, less space, a tail probe that failed or ran past the sweep budget, or TAIL_ROWS=0 keep the floor
+#     absolute; and the >1000 count
 #     alert names the disk halt (stable text, no numbers: the mail dedupe keys on it).
 # O16 the seatbelt: children exist but `wisps` is empty -> nothing is deleted (every row would look
 #     orphaned) and it is reported; an empty database with no children raises nothing.
@@ -540,6 +541,12 @@ new_db; seed_orphans; : > "$CALLS"; rm -f "$CITY/.gc/runtime/reaper-anomaly-mail
 run_reaper FAKE_DF_AVAIL_KB=5242880 FAIL_RE='LIMIT 20001'
 echo 0 > "$T/failcount"
 [ "$(orphans)" = "3,2,4,1" ] && [ "$(field orphan_swept)" = "0" ] && [ "$(field orphan_halted_dbs)" = "1" ] && ok "O15c a tail probe that FAILED is not 'small': nothing is deleted" || nok "O15c swept on a failed probe" "$OUT | $(orphans)"
+# ... and neither is a probe that runs past the sweep's own budget: budget 1 s, every probe statement sleeps 2 s, so
+# the probe of the second table must not start; "could not be measured" keeps the floor (without the guard the four
+# probes all run, the backlog "fits", and the sweep runs out of time instead of halting).
+new_db; seed_orphans
+run_reaper FAKE_DF_AVAIL_KB=5242880 GC_REAPER_ORPHAN_BUDGET_S=1 SLOW_RE='LIMIT 20001' SLOW_S=2
+[ "$(orphans)" = "3,2,4,1" ] && [ "$(field orphan_halted_dbs)" = "1" ] && printf '%s' "$OUT" | grep 'could not be measured for the tail rule' >/dev/null && ok "O15c a tail probe past the sweep budget is 'cannot tell': the floor holds" || nok "O15c probe past the budget" "$OUT | $(orphans)"
 # The >1000 count alert says WHY the orphans stay when the disk floor halted the sweep, in text without numbers
 # (the mail dedupe keys on it): a second run with another free-disk figure is not re-mailed.
 new_db; seed_orphans; : > "$CALLS"; rm -f "$CITY/.gc/runtime/reaper-anomaly-mailed"
