@@ -4,7 +4,7 @@
 # Contents
 #   O que verifica · O que não verifica · Por que é seguro rodar · O que é aviso e não falha
 #
-# O QUE VERIFICA (nos arquivos IMPLANTADOS, não numa cópia): o modo `pilot` de N slots existe no gancho do Pilot e no despachante e o selftest do gancho nesse modo termina com "N/N ok" (N ≥ 240);
+# O QUE VERIFICA (nos arquivos IMPLANTADOS, não numa cópia): o modo `pilot` de N slots existe no gancho do Pilot e no despachante e o selftest dele (os casos, sem os mutantes) termina com "N/N ok" (N ≥ 240);
 #   o teto de sessões do template wa-worker-remote (max_active_sessions) é um dígito ≥ 1 e o plist VERSIONADO e o plist VIVO do Pilot não ligam mais slots do que ele nem do que o `cap` do host
 #   (.gc/session-ssh.json) deixam abrir — PILOT_WA_NODE_SLOTS acima do teto faria o Pilot atribuir a um alias que o engine não abre; PILOT_WA_NODE_SLOTS > 1 sem PILOT_WA_NODE_SPAWN=pilot não vale nada
 #   (o modo pool tem 1 slot); PILOT_WA_NODE_SPAWN que não seja pool|pilot vale pool em silêncio; o runbook descreve o modo.
@@ -12,7 +12,7 @@
 #   `.gc/wa-node-route.jsonl` mais os comentários `nó (...)` das beads), nem que o `pool` abre a sessão de uma bead da loja do WA (nunca provado; é por isso que mais de 1 slot usa o modo `pilot`).
 #   Este teste PASSAR não diz que o nó está ocupado: quem diz é o uso de CPU do nó por hora.
 # POR QUE É SEGURO RODAR: só lê arquivos (plist, toml, json, fonte) e roda o selftest do modo `pilot`, que usa bd/gc/despachante FALSOS numa pasta temporária. Não fala com o nó, não chama `gc` nem `bd`
-#   reais, não toca em .gc/ vivo.
+#   reais, não toca em .gc/ vivo. Não roda os mutantes (são a evidência do gate): só a bateria de casos.
 # O QUE É AVISO E NÃO FALHA: o plist vivo ou o config do host que não existem nesta máquina (não há o que conferir).
 #
 # Chamado por run.sh depois do deploy (STORY_ID=ga-2hd02v.3). Sai 0 se passar.
@@ -26,7 +26,7 @@ warn() { echo "[prod-test:gascity ga-2hd02v.3] AVISO: $*"; }
 fail() { echo "[prod-test:gascity ga-2hd02v.3] FAIL: $*" >&2; exit 1; }
 [[ -x "$BASH32" ]] || fail "$BASH32 não executa — não dá para checar a sintaxe no interpretador de verdade"
 
-PIL="$ASSETS/pilot-dispatcher.sh"; SPAWN_ST="$ASSETS/pilot-dispatcher.wa-node-spawn.selftest.sh"
+PIL="$ASSETS/pilot-dispatcher.sh"; SPAWN_ST="$ASSETS/pilot-dispatcher.wa-node-spawn.selftest.sh"; SPAWN_MUT="$ASSETS/pilot-dispatcher.wa-node-spawn.mutants.py"
 DSP="$CITY/scripts/wa-node-dispatch.sh"
 AGENT="$CITY/agents/wa-worker-remote/agent.toml"
 RUNBOOK="$CITY/docs/runbooks/hetzner-wa-node.md"
@@ -34,7 +34,7 @@ PLIST_REPO="$CITY/scripts/com.gascity.pilot.plist"
 PLIST_LIVE="${PILOT_LIVE_PLIST:-$HOME/Library/LaunchAgents/com.gascity.pilot.plist}"
 HOSTCFG="$CITY/.gc/session-ssh.json"
 
-for f in "$PIL" "$SPAWN_ST" "$DSP" "$AGENT" "$RUNBOOK" "$PLIST_REPO"; do [[ -f "$f" ]] || fail "arquivo implantado ausente: $f"; done
+for f in "$PIL" "$SPAWN_ST" "$SPAWN_MUT" "$DSP" "$AGENT" "$RUNBOOK" "$PLIST_REPO"; do [[ -f "$f" ]] || fail "arquivo implantado ausente: $f"; done
 for f in "$PIL" "$SPAWN_ST" "$DSP"; do "$BASH32" -n "$f" || fail "$f não parseia sob $BASH32"; done
 [[ -x "$SPAWN_ST" ]] || fail "$SPAWN_ST sem permissão de execução"
 log "arquivos implantados presentes; sintaxe ok ✓"
@@ -94,8 +94,8 @@ check_plist() {
 check_plist "plist versionado" "$PLIST_REPO"
 if [[ -f "$PLIST_LIVE" ]]; then check_plist "plist vivo" "$PLIST_LIVE"; else warn "$PLIST_LIVE não existe nesta máquina: o plist vivo não foi conferido"; fi
 
-# ── o selftest do modo pilot, contra a árvore viva ──
-out="$(timeout 600 "$BASH32" "$SPAWN_ST" 2>&1)" || { echo "$out" | tail -25 >&2; fail "selftest do modo pilot falhou (ou estourou o tempo) contra a árvore viva"; }
+# ── o selftest do modo pilot, contra a árvore viva (os casos; os mutantes são a evidência do gate) ──
+out="$(WA_NODE_SPAWN_ST_NOMUT=1 timeout 600 "$BASH32" "$SPAWN_ST" 2>&1)" || { echo "$out" | tail -25 >&2; fail "selftest do modo pilot falhou (ou estourou o tempo) contra a árvore viva"; }
 line=$(printf '%s\n' "$out" | grep -E '^[0-9]+/[0-9]+ ok$' | tail -1)
 [[ -n "$line" ]] || fail "selftest do modo pilot sem a linha de resultado 'N/N ok':
 $out"

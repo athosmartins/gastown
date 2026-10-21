@@ -16,12 +16,16 @@
 #   D. o decide inteiro em modo pilot: env passado ao script (dry-run e real), a ordem das chamadas, o orçamento de spawn (só no modo pilot, só na escrita real), dry-run, shadow, off.
 #   E. _pilot_wa_node_settle: rc incerto do apply (13, prazo, sinal) → desfaz SÓ o que tem a cara do apply (sem sessão), nunca pisa em bead de outro, e o decide devolve 2 de qualquer jeito.
 #   F. a fiação (grep no fonte) e as peças genéricas.
-#   (os mutantes — cada quebra de uma linha do gancho tem de derrubar este selftest — são da fatia ga-2hd02v.3.4; este arquivo não os roda.)
+#   G. mutantes: cada quebra tem de derrubar este selftest. Cada um roda o arquivo inteiro e para no 1º FAIL; rodam em paralelo (WA_NODE_SPAWN_ST_JOBS, padrão 4).
 #
 # Run:  bash packs/town-deltas/assets/pilot-dispatcher.wa-node-spawn.selftest.sh
 # Exit 0 iff tudo passa. Saída: linhas ok/FAIL, "N/N ok", "SELFTEST OK". Bash 3.2 (macOS) basta.
 
 set -uo pipefail
+
+# --jobs N: quantos mutantes rodam juntos (o mbp-run.sh repassa argumentos, não ambiente; no nó de 16 núcleos: --jobs 12). Padrão 4.
+if [ "${1:-}" = "--jobs" ]; then WA_NODE_SPAWN_ST_JOBS="${2:-4}"; fi
+case "${WA_NODE_SPAWN_ST_JOBS:-4}" in [1-9]|[1-9][0-9]) ;; *) echo "FATAL: --jobs quer um número de 1 a 99 (veio '${WA_NODE_SPAWN_ST_JOBS}')" >&2; exit 2 ;; esac
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 SELF_DIR="$(dirname "$SELF")"
@@ -30,7 +34,7 @@ DISPATCHER="${WA_NODE_SPAWN_SELFTEST_FILE:-$SELF_DIR/pilot-dispatcher.sh}"
 PASS=0
 FAIL=0
 ok()   { echo "  ok   $*"; PASS=$((PASS+1)); }
-# Com WA_NODE_SPAWN_SELFTEST_FILE (o gancho lido de outro arquivo — o mutante da fatia ga-2hd02v.3.4) o primeiro FAIL já diz "morto": sai na hora.
+# Rodando como mutante (WA_NODE_SPAWN_SELFTEST_FILE) o primeiro FAIL já diz "morto": sai na hora.
 fail() { echo "  FAIL $*"; FAIL=$((FAIL+1)); [ -z "${WA_NODE_SPAWN_SELFTEST_FILE:-}" ] || exit 1; }
 eq() { # eq <descrição> <obtido> <esperado>
   if [ "$2" = "$3" ]; then ok "$1"; else fail "$1 — obtido '$2', esperado '$3'"; fi
@@ -535,6 +539,38 @@ for f in _pilot_node_remote_open _pilot_node_remote_rollback; do
   printf '%s' "$body" | grep -qE 'wa-|wa_node|PILOT_WA' && fail "$f cita WA no código (a peça tem de ser genérica: template, alias e chave entram por argumento)" || ok "$f não cita WA no código (genérica)"
 done
 bash -n "$DISPATCHER" && ok "bash -n do pilot-dispatcher.sh" || fail "bash -n do pilot-dispatcher.sh"
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
+if [ -z "${WA_NODE_SPAWN_SELFTEST_FILE:-}" ] && [ -z "${WA_NODE_SPAWN_ST_NOMUT:-}" ]; then
+  echo
+  echo "=== G. mutantes (cada um tem de derrubar o selftest) ==="
+  # o mutador mora em arquivo próprio. ausente/ilegível (python falha) → `fail`; vazio (lista sem nomes) ou com menos que o piso de hoje (72) → `fail` também: tirar um mutante tem de ser decisão visível, nunca "todos mortos" por lista curta
+  MUTATOR="$SELF_DIR/pilot-dispatcher.wa-node-spawn.mutants.py"
+  MUT_LIST="$(python3 -I "$MUTATOR" --list)" || { fail "o mutador não carregou"; MUT_LIST=""; }
+  [ "$(echo "$MUT_LIST" | wc -w | tr -d ' ')" -ge 72 ] || fail "o mutador listou menos de 72 mutantes ($(echo "$MUT_LIST" | wc -w | tr -d ' '))"
+  run_mut() { # run_mut <nome> — escreve $T/res.<nome>: morto | SOBREVIVEU | ERRO
+    local n="$1"
+    if ! python3 -I "$MUTATOR" "$DISPATCHER" "$T/mut.$n.sh" "$n" > "$T/res.$n.apply" 2>&1; then echo ERRO > "$T/res.$n"; return; fi
+    if ! bash -n "$T/mut.$n.sh" 2>>"$T/res.$n.apply"; then echo ERRO > "$T/res.$n"; return; fi
+    if WA_NODE_SPAWN_SELFTEST_FILE="$T/mut.$n.sh" bash "$SELF" > "$T/res.$n.out" 2>&1; then echo SOBREVIVEU > "$T/res.$n"; else echo morto > "$T/res.$n"; fi
+  }
+  JOBS="${WA_NODE_SPAWN_ST_JOBS:-4}"
+  i=0
+  for n in $MUT_LIST; do
+    run_mut "$n" &
+    i=$((i+1))
+    if [ $((i % JOBS)) -eq 0 ]; then wait; fi
+  done
+  wait
+  for n in $MUT_LIST; do
+    case "$(cat "$T/res.$n" 2>/dev/null)" in
+      morto) ok "mutante $n morto" ;;
+      ERRO) fail "mutante $n: não consegui aplicar ou o resultado não é bash válido ($(tr '\n' ' ' < "$T/res.$n.apply"))" ;;
+      *) fail "mutante $n SOBREVIVEU" ;;
+    esac
+  done
+  echo "  ($(echo "$MUT_LIST" | wc -w | tr -d ' ') mutantes)"
+fi
 
 echo
 TOTAL=$((PASS+FAIL))
