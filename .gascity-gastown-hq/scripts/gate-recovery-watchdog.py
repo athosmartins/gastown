@@ -117,6 +117,12 @@ NOTIFY = "/Users/athos/.local/bin/notify"
 DOG_TEMPLATE = "gastown.dog"   # utility pool the repair agent is spawned into (ga-afytf)
 QUOTA_CHECK = os.path.join(CITY, "scripts/claude-quota-check.sh")  # ground-truth quota verdict (ga-wjlv9)
 BD_LIST_CACHED = os.path.join(CITY, "scripts/bd-list-cached.sh")  # ga-h199q: read-cache shim (ga-48xcv) — drop-in ["bash", BD_LIST_CACHED] prefix replaces "bd" at read-only (list/show) call sites; only-list/show/query safety boundary lives in the shim itself, so a write accidentally routed through it still passes straight to the real bd, unaffected
+# Flags for EVERY `list` of type:quality-gate-marker (ga-oi8gb4, same rule as ga-vm20x). --include-infra: bd 1.1.0 treats an
+# --ephemeral bead as INFRA and omits it from a plain `list --all`; pilot-dispatcher's auto-remerge marker was born that way
+# (ga-wisp-*), so the closers below never saw it — four phantoms stayed open 7-20 days and FIX 8 could not see that the
+# source bead still had an open marker. --limit 0: bd cuts at 50 rows silently (ga-21kmp).
+# vazio → no marker, the sweep has nothing to do; falhou/ilegível → the caller's None/return (inert, never a guess).
+MARKER_LIST_FLAGS = ["--all", "--limit", "0", "--include-infra"]
 
 POLL_SEC = 120  # ga-8smq3: was 60; all thresholds below are 12-40min, so 120s loses no detection latency while halving this daemon's Dolt poll load
 TIMEOUT_WINDOW_SEC = 1800      # 2+ timeouts within 30min = gate not producing verdicts
@@ -3590,7 +3596,7 @@ def reap_orphan_and_stale_markers(now):
     keep; a query failure → skip the whole sweep."""
     if not GRW_ENABLED or not GRW_REAP_ORPHAN_ENABLED:
         return
-    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",  # ga-h199q
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", *MARKER_LIST_FLAGS, "-l", "type:quality-gate-marker",  # ga-h199q, ga-oi8gb4
             "--status", "open", "--json"], timeout=25)
     if not r or r.returncode != 0:
         return  # query failure → fail-safe skip (no blind action)
@@ -3805,7 +3811,7 @@ def reap_stale_review_markers(now, rstate, open_running_runs):
     dry-run-aware, fully fail-safe (unreadable → skip; a live/hung run → defer to FIX 1/5)."""
     if not GRW_ENABLED or not GRW_REAP_STALE_REVIEW_ENABLED:
         return
-    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",  # ga-h199q
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", *MARKER_LIST_FLAGS, "-l", "type:quality-gate-marker",  # ga-h199q, ga-oi8gb4
             "--status", "open", "--json"], timeout=25)
     if not r or r.returncode != 0:
         return  # query failure → fail-safe skip (no blind action)
@@ -3887,7 +3893,7 @@ def _open_error_markers():
     """[marker dicts] type:quality-gate-marker + gate-status:error + open, in HQ (the
     dispatcher's domain — it only re-processes HQ queued markers). None on query
     failure (fail-safe skip)."""
-    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",  # ga-h199q
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", *MARKER_LIST_FLAGS, "-l", "type:quality-gate-marker",  # ga-h199q, ga-oi8gb4
             "-l", "gate-status:error", "--status", "open", "--json"], timeout=25)
     if not r or r.returncode != 0:
         return None
@@ -4227,7 +4233,7 @@ def requeue_error_markers(now, rstate):
 def _open_deferred_markers():
     """[marker dicts] type:quality-gate-marker + gate-status:deferred + open, in HQ.
     None on query failure (fail-safe skip)."""
-    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",  # ga-h199q
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", *MARKER_LIST_FLAGS, "-l", "type:quality-gate-marker",  # ga-h199q, ga-oi8gb4
             "-l", "gate-status:deferred", "--status", "open", "--json"], timeout=25)
     if not r or r.returncode != 0:
         return None
@@ -4434,7 +4440,7 @@ def _open_quality_gate_marker_sources():
     FIX 8 only needs to know SOMETHING still tracks the bead, not which phase). None on
     query failure (fail-safe: caller aborts the whole sweep rather than risk treating a
     bead as unreferenced because we simply failed to see its marker)."""
-    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",  # ga-h199q
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", *MARKER_LIST_FLAGS, "-l", "type:quality-gate-marker",  # ga-h199q, ga-oi8gb4
             "--status", "open", "--json"], timeout=25)
     if not r or r.returncode != 0:
         return None
@@ -4596,7 +4602,7 @@ def _open_needs_rebase_markers():
     """[marker dicts] type:quality-gate-marker + gate-status:needs-rebase + open, in
     HQ (the dispatcher's domain — mirrors _open_error_markers/_open_deferred_markers).
     None on query failure (fail-safe skip)."""
-    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",  # ga-h199q
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", *MARKER_LIST_FLAGS, "-l", "type:quality-gate-marker",  # ga-h199q, ga-oi8gb4
             "-l", "gate-status:needs-rebase", "--status", "open", "--json"], timeout=25)
     if not r or r.returncode != 0:
         return None

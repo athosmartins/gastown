@@ -12763,9 +12763,12 @@ FIXSEC
       log "  ga-e2n96: found existing branch '$REMERGE_REF' for $STORY_ID (repo=$REMERGE_REPO) — resubmitting directly to the gate (no builder needed)."
       local REMERGE_BASE_SHA REMERGE_MARKER_ID
       REMERGE_BASE_SHA=$(git -C "$REMERGE_REPO" rev-parse origin/main 2>/dev/null || echo "unknown")
+      # ⚠️ NÃO adicione --ephemeral (Mayor, 07/08; ver /gate-done). bd 1.1.0 trata ephemeral como INFRA e o esconde de
+      # `bd list`: nenhum fechador do watchdog enxergava este marker (ga-oi8gb4 — 4 ga-wisp-* fantasmas abertos 7-20
+      # dias). Mesmo molde do /gate-done: -t chore, não-ephemeral; o wisp-reaper recolhe depois.
       REMERGE_MARKER_ID=$(bd -C "$GC_CITY" create \
         "ready-for-gate: $REMERGE_REF" \
-        -t chore --ephemeral \
+        -t chore \
         -l type:quality-gate-marker \
         -l gate-status:ready \
         -l "branch:$REMERGE_REF" \
