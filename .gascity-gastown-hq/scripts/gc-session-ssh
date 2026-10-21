@@ -105,6 +105,14 @@ HOST_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.@:-]*")
 ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 ENV_OK = re.compile(r"GC_[A-Z0-9_]+|TERM|LANG|LC_[A-Z_]+|TZ")
 SECRETISH = re.compile(r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_?KEY|PRIVATE", re.I)
+# Conta Claude da sessão do host (ga-2hd02v.7.1, decisão do Athos 20/10: "o hetzner sempre acompanhar a conta do Mini"): o start de uma sessão claude lê a conta 'current' do pool do mini e a
+# chave de longa duração dela (`claude setup-token`, item do cofre claude-oauth-token-<e-mail>, a mesma que lib/claude_account_pool.py do whatsapp_automation lê) e a entrega ao claude do host
+# em CLAUDE_CODE_OAUTH_TOKEN. O e-mail entra no argv do `secret`, então o formato é fechado e não começa por '-'.
+ACCT_EMAIL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._%+-]*@[A-Za-z0-9][A-Za-z0-9.-]*")
+ACCT_ITEM = "claude-oauth-token-"
+OAUTH_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
+SECRET_TIMEOUT = 15
+CLAUDE_CMD = re.compile(r"(?:\S*/)?claude(?=\s|$)")  # o comando do start é o claude (ou o caminho absoluto dele): só ele ganha a chave
 IGNORED = ("pre_start", "session_setup", "session_setup_script", "session_live", "pack_overlay_dirs", "overlay_dir", "copy_files", "nudge")
 BEGIN, END = "@@GC-BEGIN@@", "@@GC-END@@"
 EX_CAP, EX_EXISTS, EX_POLICY, EX_PREP = 10, 11, 12, 13
@@ -302,6 +310,14 @@ class Cfg:
         if not isinstance(wr, dict) or not all(isinstance(k, str) and ROLE_RE.fullmatch(k) and isinstance(v, str) and RIG_RE.fullmatch(v) for k, v in wr.items()):
             raise Fail(f"host {self.host}: 'worktree_rigs' tem que ser um objeto papel → rig, ex.: {{'dog': 'gascity'}} (papel [a-z][a-z0-9-]*, rig no formato do hetzner-remote-git.sh) ({wr!r})")
         self.wt_rigs = wr
+        # conta Claude do pool do mini (ga-2hd02v.7.1): ausente → nada muda; presente e mal formada → recusa a config, nunca "ausente" (a chave que faltasse abriria a sessão no login fixo do nó, em silêncio)
+        ca = h.get("claude_account")
+        self.acct = None
+        if ca is not None:
+            if not isinstance(ca, dict) or set(ca) - {"current_file", "secret"}:
+                raise Fail(f"host {self.host}: 'claude_account' tem que ser {{\"current_file\": \"/abs/claude_pool_current_account.json\", \"secret\": \"/abs/secret\"}} (secret é opcional) ({ca!r})")
+            self.acct = {"file": self.need({"claude_account.current_file": ca.get("current_file")}, "claude_account.current_file", PATH_RE),
+                         "secret": self.need({"claude_account.secret": ca.get("secret", self.mini_home + "/.local/bin/secret")}, "claude_account.secret", PATH_RE)}
         base = os.environ.get("GC_EXEC_STATE_DIR") or os.path.join(self.city_guess, ".gc", "runtime", "session-ssh")
         self.state = os.path.join(base, re.sub(r"[^A-Za-z0-9_.-]", "_", str(self.host)))
 
@@ -508,7 +524,8 @@ while kill -0 "$me" 2>/dev/null; do
 done'''
 
 
-def launcher(cfg: Cfg, name: str, p: dict) -> str:
+def launcher(cfg: Cfg, name: str, p: dict, secrets: dict | None = None) -> str:
+    """`secrets` (a chave da conta do pool) entra SÓ aqui: nunca em p["env"], que o dry-run, o log e os eventos imprimem."""
     exitf = f"{cfg.root}/run/{name}.exit"
     try:
         first = (shlex.split(p["command"]) or [""])[0]
@@ -527,8 +544,45 @@ def launcher(cfg: Cfg, name: str, p: dict) -> str:
         out.append(f"bash -c {q(WATCH)} _ {q(cfg.plib)} $$ {cfg.watch_s} </dev/null >/dev/null 2>&1 &")
     if cfg.spath:
         out += [f"export ZDOTDIR={q(cfg.zdot)}", f"export CLAUDE_ENV_FILE={q(cfg.zdot + '/env.sh')}", f"export PATH={q(cfg.spath)}"]
-    run_cmd = f"{'nice -n 10 ' if cfg.gate else ''}sh -c {q(p['command'])}"  # notebook do Athos: começa em nice 10 (mbp-run.sh, modo livre)
+    assign = "".join(f"{k}={q(v)} " for k, v in (secrets or {}).items())  # prefixo do comando final, não `export`: só o claude herda a chave (nem o vigia nem o resto do lançador a têm), e ela nunca vai para argv
+    run_cmd = f"{assign}{'nice -n 10 ' if cfg.gate else ''}sh -c {q(p['command'])}"  # notebook do Athos: começa em nice 10 (mbp-run.sh, modo livre)
     return "\n".join(out + [run_cmd, "rc=$?", f'[ "$rc" -eq 0 ] || echo "saiu com $rc" >{q(exitf)}', 'exit "$rc"']) + "\n"
+
+
+def runs_claude(command: str) -> bool:
+    """O comando do start é o claude? Só ele ganha a chave: um cat, um bash ou um teste não a usam, e menos processos com a chave é menos exposição."""
+    return bool(CLAUDE_CMD.match(command))
+
+
+def acct_email(cfg: Cfg) -> str:
+    """A conta 'current' do pool do mini. Arquivo ausente ou ilegível, JSON que não é objeto, 'current' que não é e-mail → Fail: sem saber qual é a conta atual, a sessão não abre no host."""
+    try:
+        with open(cfg.acct["file"], "rb") as f:
+            cur = json.loads(f.read(65536)).get("current")
+    except (OSError, ValueError, AttributeError) as e:  # AttributeError = o JSON não é um objeto
+        raise Fail(f"não sei qual é a conta atual do pool do mini: {cfg.acct['file']} ilegível ({type(e).__name__}); a sessão não abre no host sem a conta dela")
+    if not isinstance(cur, str) or not ACCT_EMAIL.fullmatch(cur):
+        raise Fail(f"não sei qual é a conta atual do pool do mini: 'current' em {cfg.acct['file']} ausente ou fora do formato de e-mail ({str(cur)[:40]!r}); a sessão não abre no host sem a conta dela")
+    return cur
+
+
+def acct_key(cfg: Cfg, email: str) -> str:
+    """A chave de longa duração da conta, lida NO MINI pelo `secret` (item claude-oauth-token-<e-mail>). Três estados e só o primeiro abre sessão: chave · conta sem item no cofre (rc 4 "Not found") ·
+    cofre ilegível (qualquer outra coisa: fechado, tempo esgotado, saída sem forma de chave). Nenhum dos dois últimos cai no login fixo do nó. O que o secret escreveu NUNCA entra na mensagem (pode
+    trazer pedaço de chave): só o código de saída."""
+    try:
+        r = subprocess.run([cfg.acct["secret"], ACCT_ITEM + email], capture_output=True, timeout=SECRET_TIMEOUT, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        raise Fail(f"chave da conta {email} ilegível: o secret não respondeu em {SECRET_TIMEOUT}s (cofre travado?); a sessão não abre no host e NÃO cai no login fixo do nó")
+    except OSError as e:
+        raise Fail(f"chave da conta {email} ilegível: não consegui rodar {cfg.acct['secret']} ({type(e).__name__}); a sessão não abre no host e NÃO cai no login fixo do nó")
+    tok = r.stdout.decode("utf-8", "replace").strip()
+    # a forma que lib/claude_account_pool.py do WA aceita (sk-ant-, sem espaço), mais ASCII imprimível: vai para um script de sh dentro de aspas
+    if r.returncode == 0 and tok.startswith("sk-ant-") and len(tok) > 16 and tok.isascii() and tok.isprintable() and not any(c.isspace() for c in tok):
+        return tok
+    if r.returncode == 4 and "not found" in r.stderr.decode("utf-8", "replace").lower():
+        raise Fail(f"a conta {email} está sem chave cadastrada no cofre (item {ACCT_ITEM}{email}; cadastro: claude_conta_cadastrar_chave.py do whatsapp_automation); a sessão não abre no host e NÃO cai no login fixo do nó")
+    raise Fail(f"chave da conta {email} ilegível (cofre fechado ou secret falhou, rc={r.returncode}{', saída sem forma de chave' if r.returncode == 0 else ''}); a sessão não abre no host e NÃO cai no login fixo do nó")
 
 
 def gate_check(cfg: Cfg) -> dict:
@@ -668,11 +722,27 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
             cfg.event("refused", name, reason=g["reason"])
             raise Fail(f"host {cfg.host}: não abro sessão nova — {g['reason']}")
         cap = min(cap, g["slot_cap"])  # o teto de RAM do mbp-run.sh (slot_cap) também vale para as sessões
+    secrets, acct_view = {}, None  # a chave da conta atual do pool (ga-2hd02v.7.1): só sessão claude de host com `claude_account`; o resto do start não a vê
+    if cfg.acct and runs_claude(p["command"]):
+        if dry:  # o dry-run não abre o cofre: diz a conta (o arquivo do pool é local e barato) e que a chave NÃO foi lida; arquivo do pool ilegível entra em would_refuse
+            acct_view = {"current": None, "env": OAUTH_ENV, "key": "não lida no dry-run"}
+            try:
+                acct_view["current"] = acct_email(cfg)
+            except Fail as e:
+                would_refuse = would_refuse or str(e)
+            secrets[OAUTH_ENV] = "<chave da conta atual do pool: não lida no dry-run>"
+        else:  # lida aqui, no mini, DEPOIS das políticas locais e ANTES de registrar, travar e abrir o ssh: sem a chave não há sessão e não sobra rastro no host
+            email = acct_email(cfg)
+            try:
+                secrets[OAUTH_ENV] = acct_key(cfg, email)
+            except Fail:
+                cfg.event("refused", name, reason=f"chave da conta Claude {email} indisponível")
+                raise
     run_dir, exitf = f"{cfg.root}/run", f"{cfg.root}/run/{name}.exit"
     lpath = f"{run_dir}/{name}.sh"
     if dry:
         wtd = {"worktree": {"rig": wt["rig"], "path": wt["path"], "add": f"{wt['bin']} wt-add {wt['rig']} {name}", "rm": f"{wt['bin']} wt-rm {wt['rig']} {name}", "start_timeout": start_timeout}} if wt else {}
-        print(json.dumps(dict(p, **wtd, host=cfg.host, session=name, session_kind="teste" if TEST_RE.fullmatch(name) else "real", would_refuse=would_refuse, launcher=launcher(cfg, name, p).split("\n"),
+        print(json.dumps(dict(p, **wtd, host=cfg.host, session=name, session_kind="teste" if TEST_RE.fullmatch(name) else "real", would_refuse=would_refuse, claude_account=acct_view, launcher=launcher(cfg, name, p, secrets).split("\n"),
                               prepare=({"git_user": name, "git_email": f"{name}@gastown.invalid", "trust_file": f"{cfg.home}/.claude.json", "work_dir": p["work_dir"]} if cfg.prepare else None),
                               gate=cfg.gate_cmd if cfg.gate else None, path_extra=cfg.path_extra,
                               session_env={"path": cfg.spath, "claude": cfg.claude_bin, "zdot": cfg.zdot} if cfg.spath else None,
@@ -692,7 +762,7 @@ T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após
     body = body.replace("@PLIBCHECK@", plib).replace("@PREP@", prepare_script(cfg)).replace("@WTADD@", wtadd_sh(wt, name) if wt else "")
     for k, v in {"@NAME@": q(name), "@CAP@": str(cap), "@HOST@": q(cfg.host), "@RUN@": q(run_dir), "@WORKDIR@": q(p["work_dir"]),
                  "@EXITF@": q(exitf), "@LAUNCH@": q(lpath), "@TGT@": tgt(name),
-                 "@B64@": q(base64.b64encode(launcher(cfg, name, p).encode()).decode())}.items():
+                 "@B64@": q(base64.b64encode(launcher(cfg, name, p, secrets).encode()).decode())}.items():
         body = body.replace(k, v)
     body = body.replace("@GATE0@", "" if wt else gate).replace("@GATE1@", gate if wt else "")  # sessão com worktree do provider: o guarda de clone vem DEPOIS do wt-add
     with open(os.path.join(cfg.mkstate(), "lock"), "a") as lf:  # cap + criação são um passo só; entre processos do mini, um por vez
