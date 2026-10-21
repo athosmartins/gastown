@@ -163,6 +163,10 @@ watch_dolt_procs() {  # QUEM abriu: a cada 0,5 s anota, uma vez por processo nov
         END {
           for (p in C) {
             if (C[p] !~ /[Dd]olt/ || C[p] ~ /awk -v seen=|ps -axww/) continue
+            # as ferramentas do próprio vigia (ls -la / stat / lsof +D sobre $D/$DB, que tem ".beads/dolt" no caminho) casam /[Dd]olt/ e
+            # viravam "processo dolt novo" a cada segundo: filtra pela 1ª palavra da linha de comando (o programa), não pelo caminho que ele lê
+            w = C[p]; sub(/ .*/, "", w); sub(/.*\//, "", w)
+            if (w ~ /^(ls|stat|lsof)$/) continue
             key = p " " substr(C[p], 1, 60)
             if (key in S) continue
             chain = ""; q = p; n = 0
