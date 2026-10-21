@@ -301,6 +301,24 @@ reset; setprobe "$P_FUT" 1; g . 1 quota; setreset -10; age checked -1000; age pr
 reset; setprobe "$P_FUT" 1; g . 1 quota; setreset 3600; age checked -1000; age probe -100; g "reset no futuro, dentro da janela: não repete" 1 quota; eq "continua 1 chamada" "$(calls probe)" 1
 reset; setprobe "$P_FUT" 1; g . 1 quota; setreset -10; age checked -1000; age probe -100; setprobe "$P_OK" 0; g "renovou: volta a ok na primeira medição depois do horário" 0 ok; eq "e não guarda o horário velho" "$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("reset_at"))' "$SF")" None
 
+echo "== cota com horário numa conta que o gate acompanha (ga-2hd02v.7 e ga-2hd02v.7.1 nasceram separadas: aqui elas se encontram)"
+# vazio → conta que nao esta no limite: nenhum "renova em" e reset_at null; falhou/ilegivel → conta que o pool trocou: o limite e o horario da conta VELHA nao valem para a nova, mede a nova na hora
+export FAKE_VAULT=$T/vault FAKE_SECRET_LOG=$T/secret.log GC_SSH_CONFIG=$T/session-ssh.json
+P_QF="{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"You've hit your weekly limit · resets ${RTXT/_/ }, 4pm (UTC)\"}"
+rj() { python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2]))' "$SF" "$1"; }
+reset; setpool alfa@example.test; printf '%s' "$P_QF" >"$FAKE/probe.out.$KA"; echo 1 >"$FAKE/probe.rc.$KA"; printf '%s' "$P_OK" >"$FAKE/probe.out.$KB"; echo 0 >"$FAKE/probe.rc.$KB"
+g "alfa no limite semanal (conta seguida): bloqueado, com a conta e o horário em que renova" 1 "blocked: quota: conta alfa@example.test:"; has "...o horário" "$GOUT" "(renova em $REISO)"
+eq "o estado guarda a conta E o horário (reset_at)" "$(rj account) $(rj reset_at)" "alfa@example.test $RE"
+setpool beta@example.test; g "o pool trocou para beta: mede beta NA HORA, mesmo com o horário de alfa no futuro" 0 ok; hasnt "...e não leva o 'renova em' de alfa" "$GOUT" "renova em"
+eq "o estado de beta não herda o reset_at de alfa" "$(rj account) $(rj reset_at)" "beta@example.test None"
+setpool alfa@example.test; g "voltou a alfa: mede alfa de novo, não herda o ok de beta" 1 "blocked: quota"
+reset; setpool alfa@example.test; printf '%s' "$P_QF" >"$FAKE/probe.out.$KA"; echo 1 >"$FAKE/probe.rc.$KA"
+g . 1 quota; setreset -10; age checked -1000; age probe -100; printf '%s' "$P_OK" >"$FAKE/probe.out.$KA"; echo 0 >"$FAKE/probe.rc.$KA"
+g "alfa renovou (horário vencido, dentro da janela de retry): mede de novo e volta a ok" 0 ok
+eq "...medindo com a chave de alfa (a conta que as sessões usam): 2 chamadas de modelo, as 2 com a chave" "$(grep -c "probe:$KA" "$FAKE/env.seen") $(calls probe)" "2 2"
+eq "...e o horário velho sai do estado" "$(rj reset_at)" None
+unset GC_SSH_CONFIG FAKE_VAULT FAKE_SECRET_LOG
+
 echo "== status"
 reset; out=$(python3 -I "$S" status); eq "status ok" $? 0; has "json" "$out" '"state": "ok"'
 reset; python3 -I "$S" status >/dev/null; python3 -I "$S" status --probe >/dev/null; eq "--probe força a chamada" "$(calls probe)" 2
