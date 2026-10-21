@@ -232,6 +232,16 @@ unset GC_SSH_CONFIG; reset; : >"$T/secret.log"
 g "sem config do provider: como sempre (login do próprio nó)" 0 ok; eq "o claude do nó não recebeu env nenhuma" "$(seen)" "auth:UNSET probe:UNSET "; eq "e o cofre não foi tocado" "$(grep -c . "$T/secret.log")" 0
 cfgprov "" "$T/session-ssh2.json"; reset; GC_SSH_CONFIG=$T/session-ssh2.json g "host da config SEM claude_account: como sempre" 0 ok; eq "...sem env" "$(seen)" "auth:UNSET probe:UNSET "
 echo '{' >"$T/session-ssh3.json"; reset; GC_SSH_CONFIG=$T/session-ssh3.json g "config do provider que existe e não lê: bloqueia, não vira 'não segue'" 1 unknown; nocalls "...sem falar com o claude do nó"
+printf '{"default_host":"a","hosts":{"a":{"ssh":"outro-alias","cap":2,"remote_root":"%s","remote_home":"%s","claude_account":{"current_file":"%s","secret":"%s"}}}}\n' "$RROOT" "$SRV" "$T/pool.json" "$T/bin/secret" >"$T/session-ssh4.json"
+reset; setpool alfa@example.test; : >"$T/secret.log"; GC_SSH_CONFIG=$T/session-ssh4.json g "claude_account é de OUTRO host (outro alias de ssh): este nó segue como sempre" 0 ok; eq "...sem env" "$(seen)" "auth:UNSET probe:UNSET "; eq "...e sem tocar no cofre" "$(grep -c . "$T/secret.log")" 0
+reset; setpool alfa@example.test; HETZNER_SESSION_SSH=$T/nao-existe GC_SSH_CONFIG=$T/session-ssh.json g "provider que não carrega: bloqueia, não vira 'não segue'" 1 unknown; has "diz que não carregou" "$GOUT" "não consegui carregar o provider"; nocalls "...sem falar com o claude do nó"
+mkdir -p "$T/city/.gc"; cp "$T/session-ssh.json" "$T/city/.gc/session-ssh.json"; reset; setpool alfa@example.test
+g "config no caminho padrão da cidade, sem GC_SSH_CONFIG: o gate e o provider leem a MESMA" 0 ok; eq "...e segue o pool" "$(seen)" "auth:$KA probe:$KA "; rm -f "$T/city/.gc/session-ssh.json"
+reset; setpool alfa@example.test; printf '{"type":"result","subtype":"success","is_error":true,"result":"Invalid API key: %s (revoked)"}' "$KA" >"$FAKE/probe.out.$KA"; echo 1 >"$FAKE/probe.rc.$KA"
+GC_SSH_CONFIG=$T/session-ssh.json g "erro de modelo que repete a chave: bloqueia (unknown)" 1 unknown; hasnt "...e o motivo não a repete" "$GOUT" "$KA"; if grep -rqF -- "$KA" "$STATE"; then bad "a chave que o servidor repetiu foi para o estado gravado"; else ok; fi
+export GC_SSH_CONFIG=$T/session-ssh.json
+reset; setpool alfa@example.test; g . 0 ok; age checked -1000; g "mesma conta, estado vencido, janela de 1 h aberta: não repete a chamada de modelo" 0 ok; eq "...a chamada de modelo gasta cota: foi 1 só" "$(calls probe)" 1
+unset GC_SSH_CONFIG
 unset FAKE_VAULT FAKE_SECRET_LOG
 
 echo "== status"

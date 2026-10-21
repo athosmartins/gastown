@@ -77,6 +77,10 @@ CONFIGURAÇÃO  $GC_SSH_CONFIG ou <cidade>/.gc/session-ssh.json (cidade = pasta 
   host que dorme, ga-w7qwl1.1.5: o claude da sessão roda com ZDOTDIR=<remote_root>/zdot e CLAUDE_ENV_FILE=<remote_root>/zdot/env.sh do bundle
   (remote-bundle-build.py --session-path, a MESMA lista) e com PATH = só essas pastas — o shell da ferramenta Bash NÃO acha o bd/dolt do usuário;
   zdot ausente ou com PATH diferente do da config → a sessão não abre (exit 126, motivo no .exit); `claude` do comando vira o caminho absoluto).
+  claude_account ({"current_file": "/abs/claude_pool_current_account.json", "secret": "/abs/secret"}; secret é opcional, padrão <mini_home>/.local/bin/secret; ga-2hd02v.7.1): a sessão cujo
+  comando é o claude nasce na conta 'current' do pool do mini, com a chave dela (`secret claude-oauth-token-<e-mail>`, lida no mini, prazo de 15 s) em CLAUDE_CODE_OAUTH_TOKEN como PREFIXO do
+  comando final do lançador (que vai pela entrada padrão do ssh e se apaga ao rodar; nunca no argv, log, evento nem dry-run). Conta sem item no cofre, cofre ilegível ou arquivo do pool
+  ilegível = o start recusa e NÃO cai no login fixo do nó. Host sem o bloco = como antes. Ver docs/runbooks/gc-session-ssh.md.
   Estado no mini:
   $GC_EXEC_STATE_DIR ou <cidade>/.gc/runtime/session-ssh, sempre em <estado>/<host>/. Não há padrão para o cap: sem ele não abre sessão.
 
