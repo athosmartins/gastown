@@ -26,6 +26,8 @@
 		<string>120</string>
 		<key>PILOT_NODE_FIRST</key>
 		<string>on</string>
+		<key>PILOT_PS_NODE_ROUTE</key>
+		<string>shadow</string>
 		<key>PILOT_PS_WORKER_MAX</key>
 		<string>1</string>
 		<key>PILOT_SPAWN_PS_WORKER</key>
