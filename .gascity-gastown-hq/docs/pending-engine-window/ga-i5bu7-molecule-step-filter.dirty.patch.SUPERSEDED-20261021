@@ -1,0 +1,285 @@
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 02a2e0614..bcbdf1b1c 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -3313,6 +3313,87 @@ func poolDemandLabelFilterJQ() string {
+ 			`| select(((.labels // []) | map(select(startswith("gate:needs-human"))) | length) == 0) ]`)
+ }
+ 
++// liveStepMoleculeIdsShell (ga-i5bu7) fetches the set of molecule ids that
++// currently have a live (status=in_progress) step child. It populates the
++// $live_step_molecules shell variable ONCE per script; every "new work" tier
++// that follows reads that variable via poolDemandExcludeLiveMoleculeStepJQ
++// instead of re-querying bd, so a script with several tiers (e.g.
++// poolDemandCountShell's three) pays this cost once, not per tier.
++//
++// Deliberately a SEPARATE upfront bd call rather than a per-candidate lookup:
++// gastown.dog-1's original investigation (ga-i5bu7 comment, 2026-08-29)
++// proposed a per-candidate `bd list --parent <molecule_id> --status
++// in_progress` call and flagged it as the reason NOT to hand-roll the fix
++// solo — in the worst case (every candidate in a 20-row window is a
++// molecule-driven story) that's up to 20 extra bd subprocess spawns per
++// probe invocation, run continuously by every dog/wa-worker/ps-worker
++// citywide. One bd list --status in_progress --type step call up front,
++// reused by every tier, is bounded regardless of candidate count.
++//
++// quiet=true (worker-probe contexts: poolDemandFirstRowFunctionScript)
++// redirects stderr and defaults $live_step_molecules to "[]" on any
++// failure. This is a demand-DISCOVERY filter: failing open (treat nothing
++// as in-flight) merely reproduces today's ga-i5bu7 status quo rather than
++// something worse, whereas failing closed on a transient hiccup here would
++// read as "everything is in-flight" and hide ALL pool demand citywide —
++// a materially worse outage than the bug this fix closes.
++//
++// quiet=false (poolDemandCountShell) leaves bd's own exit status live and
++// contains no stderr redirection, matching that function's own no-masking
++// contract: a real bd failure must surface as an error, not be silently
++// read as "zero in-flight steps" (see poolDemandCountShell's doc comment
++// and TestEffectiveScaleCheckUsesReadyOnly, which asserts its generated
++// script never contains "2>/dev/null"). The fetch and the jq transform are
++// two separate statements (each with its own failure check) rather than one
++// piped line, matching this function's existing "capture first, check
++// status, THEN filter" idiom (ga-g7yt) — a piped `bd ... | jq ...` would
++// report jq's exit code on failure, masking a real bd failure exactly like
++// the pattern that doc comment warns against.
++func liveStepMoleculeIdsShell(quiet bool) string {
++	fetch := `live_step_molecules=$(bd list --status in_progress --type step --json --limit 0)`
++	transform := `live_step_molecules=$(printf "%s" "$live_step_molecules" | jq -c '[.[] | .parent | select(. != null)] | unique')`
++	if quiet {
++		return fetch + ` 2>/dev/null; ` +
++			transform + ` 2>/dev/null; ` +
++			`[ -z "$live_step_molecules" ] && live_step_molecules="[]"; `
++	}
++	return fetch + ` || exit $?; ` +
++		transform + ` || exit $?; ` +
++		`[ -z "$live_step_molecules" ] && live_step_molecules="[]"; `
++}
++
++// poolDemandExcludeLiveMoleculeStepJQ (ga-i5bu7) drops any candidate whose
++// mol-do-work molecule (metadata.molecule_id) currently has a live
++// (status=in_progress) step bead — i.e. the STORY bead was about to be
++// offered as fresh, unclaimed work to a brand-new worker while the
++// molecule's real state-carrying STEP bead was already in_progress under a
++// different, live worker. Root cause: the story stays open+unassigned for
++// the entire mol-do-work run (only the step tracks status), so nothing in
++// poolDemandLabelFilterJQ's label-based checks ever caught this — it needs
++// the story→molecule→step relational hop instead.
++//
++// Data model (verified against live bead JSON, both HQ graph.v2 step beads
++// and a closed whatsapp_automation mol-do-work story/molecule/step triple,
++// 2026-09-01): STORY.metadata.molecule_id -> MOLECULE.id; STEP.parent ==
++// MOLECULE.id, STEP.issue_type == "step". `bd list --parent <id>` (per `bd
++// list --help`) filters by exactly this parent edge.
++//
++// Reads $live_step_molecules, populated once per script by
++// liveStepMoleculeIdsShell — this stage itself never queries bd, so it
++// stays a pure, side-effect-free jq filter like poolDemandLabelFilterJQ and
++// can be piped immediately after it.
++//
++// A candidate with no molecule_id — the majority; most beads are not
++// mol-do-work roots — always survives: the `$mid == ""` branch short-
++// circuits before the live-set lookup, so this is a no-op for ordinary
++// beads and for every graph.v2 step-contract bead (those use
++// metadata.gc.root_bead_id, a different field, not metadata.molecule_id).
++func poolDemandExcludeLiveMoleculeStepJQ() string {
++	return `jq -c --argjson live_step_molecules "$live_step_molecules" ` + shellquote.Quote(
++		`[ .[] | select(((.metadata["molecule_id"] // "") as $mid | `+
++			`$mid == "" or (($live_step_molecules | index($mid)) == null))) ]`)
++}
++
+ // bdReadyPoolDemandMigrationShell is a temporary raw compatibility probe for
+ // graph.v2 workflow roots created before gc.routed_to root stamping shipped.
+ // It is scoped to workflow roots so gc.run_target remains an authoring hint
+@@ -3394,13 +3475,14 @@ func poolDemandFirstRowFunctionScript(includeEphemeralReady bool) string {
+ 	return `probe_pool_demand() { ` +
+ 		`target="$1"; ` +
+ 		`[ -z "$target" ] && return 1; ` +
++		liveStepMoleculeIdsShell(true) +
+ 		`r=$(` + routedReadyTierCommand(includeEphemeralReady) + `); ` +
+ 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
+ 		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit=20", includeEphemeralReady) + ` 2>/dev/null); ` +
+-		`r=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(0) + ` 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
++		`r=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(0) + ` 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | ` + poolDemandExcludeLiveMoleculeStepJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
+ 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
+ 		`legacy_ephemeral_candidates=$(` + legacyEphemeralPoolDemandShell(20, includeEphemeralReady, true) + `); ` +
+-		`r=$(printf "%s" "$legacy_ephemeral_candidates" | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
++		`r=$(printf "%s" "$legacy_ephemeral_candidates" | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | ` + poolDemandExcludeLiveMoleculeStepJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
+ 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
+ 		`return 1; ` +
+ 		`}; `
+@@ -3410,6 +3492,12 @@ func routedReadyTierCommand(includeEphemeralReady bool) string {
+ 	// The shared predicate stays order-free so the count-form does no wasted
+ 	// sorting; the worker first-row path asks bd for the oldest candidate.
+ 	//
++	// ga-i5bu7: relies on $live_step_molecules already being set by the
++	// caller (liveStepMoleculeIdsShell, run once in
++	// poolDemandFirstRowFunctionScript before this command). This function
++	// has no preamble of its own to set it, so it must never be invoked
++	// standalone in a context that skipped that step.
++	//
+ 	// ga-g7yt: --limit=1 followed by a post-filter is a TRAP — if the oldest
+ 	// candidate is the one being filtered out (parked or still held), real work
+ 	// sitting right behind it becomes invisible and the session drains empty
+@@ -3433,7 +3521,7 @@ func routedReadyTierCommand(includeEphemeralReady bool) string {
+ 	// switch to --sort newest (see bead body: that starves the old backlog
+ 	// instead) and not a new label/state — LRU-by-existing-timestamp is the
+ 	// minimal change that stops one bead from monopolizing the only slot served.
+-	return `{ ` + bdReadyPoolDemandShell("--sort oldest --limit=20", includeEphemeralReady) + ` 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c 'sort_by(.updated_at // .created_at // "") | .[0:1]' 2>/dev/null; }`
++	return `{ ` + bdReadyPoolDemandShell("--sort oldest --limit=20", includeEphemeralReady) + ` 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | ` + poolDemandExcludeLiveMoleculeStepJQ() + ` 2>/dev/null | jq -c 'sort_by(.updated_at // .created_at // "") | .[0:1]' 2>/dev/null; }`
+ }
+ 
+ // poolDemandCountShell emits the reconciler count-form for target: it counts
+@@ -3477,13 +3565,17 @@ func poolDemandCountShell(target string, includeEphemeralReady bool) string {
+ 	// TestEffectiveScaleCheckUsesReadyOnly, which asserts the generated
+ 	// script never contains "2>/dev/null").
+ 	script := `target="$1"; ` +
++		liveStepMoleculeIdsShell(false) +
+ 		`ready_json=$(` + bdReadyPoolDemandShell("--limit 0", includeEphemeralReady) + `) || exit $?; ` +
+ 		`ready_json=$(printf "%s" "$ready_json" | ` + poolDemandLabelFilterJQ() + `) || exit $?; ` +
++		`ready_json=$(printf "%s" "$ready_json" | ` + poolDemandExcludeLiveMoleculeStepJQ() + `) || exit $?; ` +
+ 		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit 0", includeEphemeralReady) + `) || exit $?; ` +
+ 		`legacy_json=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(0) + `) || exit $?; ` +
+ 		`legacy_json=$(printf "%s" "$legacy_json" | ` + poolDemandLabelFilterJQ() + `) || exit $?; ` +
++		`legacy_json=$(printf "%s" "$legacy_json" | ` + poolDemandExcludeLiveMoleculeStepJQ() + `) || exit $?; ` +
+ 		`legacy_ephemeral_json=$(` + legacyEphemeralPoolDemandShell(0, includeEphemeralReady, false) + `); ` +
+ 		`legacy_ephemeral_json=$(printf "%s" "$legacy_ephemeral_json" | ` + poolDemandLabelFilterJQ() + `) || exit $?; ` +
++		`legacy_ephemeral_json=$(printf "%s" "$legacy_ephemeral_json" | ` + poolDemandExcludeLiveMoleculeStepJQ() + `) || exit $?; ` +
+ 		`printf "%s\n%s\n%s\n" "$ready_json" "$legacy_json" "$legacy_ephemeral_json" | jq -s "(add // []) | unique_by(.id) | length"`
+ 	return shellquote.Join([]string{"sh", "-c", script, "--", target})
+ }
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index 05df06935..91c9d51d5 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -2086,6 +2086,131 @@ func TestPoolDemandLabelFilterJQExcludesParkLabels(t *testing.T) {
+ 	}
+ }
+ 
++// TestPoolDemandExcludeLiveMoleculeStepJQ (ga-i5bu7) is the direct unit test
++// of the new jq filter, mirroring gastown.dog-1's original test matrix
++// (bead comment, 2026-08-29): a candidate with no molecule_id must survive
++// (the majority case — most beads are not mol-do-work roots), a candidate
++// whose molecule has no live step must survive, and a candidate whose
++// molecule DOES have a live in_progress step must be excluded.
++func TestPoolDemandExcludeLiveMoleculeStepJQ(t *testing.T) {
++	if _, err := exec.LookPath("jq"); err != nil {
++		t.Skip("jq not available; poolDemandExcludeLiveMoleculeStepJQ is a jq pipeline")
++	}
++
++	input := `[{"id":"live-molecule-story","metadata":{"molecule_id":"wa-avll0"}},{"id":"closed-molecule-story","metadata":{"molecule_id":"wa-closed1"}},{"id":"no-molecule-story"},{"id":"empty-molecule-story","metadata":{"molecule_id":""}}]`
++
++	shellCmd := `live_step_molecules='["wa-avll0"]'; printf '%s' '` + input + `' | ` + poolDemandExcludeLiveMoleculeStepJQ()
++	cmd := exec.Command("sh", "-c", shellCmd)
++	out, err := cmd.Output()
++	if err != nil {
++		t.Fatalf("run poolDemandExcludeLiveMoleculeStepJQ: %v", err)
++	}
++
++	got := strings.TrimSpace(string(out))
++	if strings.Contains(got, `"live-molecule-story"`) {
++		t.Errorf("poolDemandExcludeLiveMoleculeStepJQ() output = %s, must not contain a story whose molecule has a live in_progress step", got)
++	}
++	for _, wantPresent := range []string{`"closed-molecule-story"`, `"no-molecule-story"`, `"empty-molecule-story"`} {
++		if !strings.Contains(got, wantPresent) {
++			t.Errorf("poolDemandExcludeLiveMoleculeStepJQ() output = %s, missing survivor %s (over-matched)", got, wantPresent)
++		}
++	}
++}
++
++// TestEffectiveWorkQueryRoutedTierExcludesStoryWithLiveMoleculeStep
++// (ga-i5bu7) is the end-to-end regression: the gc hook (EffectiveWorkQuery's
++// Tier 3, the routed-pool worker-claim path) must not hand a brand-new
++// worker a story bead whose mol-do-work molecule already has a live
++// in_progress step under a different, live worker. This is the exact shape
++// of the bug's own reproduction (wa-e30u5/wa-3hrgk/wa-1kszx, bead
++// description): the story is open+unassigned (so it clears every existing
++// label-based filter) but its molecule's step is already in progress
++// elsewhere. Fails on pre-fix code (would return the story), passes after.
++func TestEffectiveWorkQueryRoutedTierExcludesStoryWithLiveMoleculeStep(t *testing.T) {
++	a := Agent{Name: "worker", Dir: "hello-world"}
++	out := runEffectiveWorkQuery(t, a, map[string]string{
++		"GC_SESSION_ORIGIN": "ephemeral",
++	}, `#!/bin/sh
++set -eu
++case "$*" in
++  *"ready --metadata-field gc.routed_to=hello-world/worker --unassigned"*)
++    printf '[{"id":"story-with-live-step","metadata":{"molecule_id":"mol-1"}}]'
++    ;;
++  *"list --status in_progress --type step --json --limit 0"*)
++    printf '[{"id":"live-step","issue_type":"step","status":"in_progress","parent":"mol-1"}]'
++    ;;
++  *)
++    printf '[]'
++    ;;
++esac
++`)
++	if strings.Contains(out, "story-with-live-step") {
++		t.Fatalf("EffectiveWorkQuery() = %q, must not offer a story whose molecule has a live in_progress step (ga-i5bu7)", out)
++	}
++	if strings.TrimSpace(out) != "[]" {
++		t.Fatalf("EffectiveWorkQuery() = %q, want empty result once the only routed candidate is excluded", out)
++	}
++}
++
++// TestEffectiveWorkQueryRoutedTierKeepsStoryWithoutLiveMoleculeStep
++// (ga-i5bu7) is the companion negative control: a routed story whose
++// molecule has NO live step (a different, unrelated molecule is in
++// progress) must still be offered normally — proves the filter is anchored
++// to the candidate's own molecule_id, not a blanket "any live step anywhere
++// blocks everything" over-match.
++func TestEffectiveWorkQueryRoutedTierKeepsStoryWithoutLiveMoleculeStep(t *testing.T) {
++	a := Agent{Name: "worker", Dir: "hello-world"}
++	out := runEffectiveWorkQuery(t, a, map[string]string{
++		"GC_SESSION_ORIGIN": "ephemeral",
++	}, `#!/bin/sh
++set -eu
++case "$*" in
++  *"ready --metadata-field gc.routed_to=hello-world/worker --unassigned"*)
++    printf '[{"id":"story-molecule-done","metadata":{"molecule_id":"mol-2"}}]'
++    ;;
++  *"list --status in_progress --type step --json --limit 0"*)
++    printf '[{"id":"other-live-step","issue_type":"step","status":"in_progress","parent":"mol-OTHER"}]'
++    ;;
++  *)
++    printf '[]'
++    ;;
++esac
++`)
++	if !strings.Contains(out, "story-molecule-done") {
++		t.Fatalf("EffectiveWorkQuery() = %q, want story-molecule-done offered (its own molecule has no live step)", out)
++	}
++}
++
++// TestEffectivePoolDemandQueryCountExcludesLiveMoleculeStep (ga-i5bu7) is
++// the reconciler-count-side parity test, matching ga-zgfxx/ga-avvu2's own
++// precedent of testing both the worker-claim path and the count-form:
++// without it the reconciler would count a story whose molecule has a live
++// step as demand and keep the pool scaled up for work no worker can
++// actually claim (poolDemandCountShell's own doc comment).
++func TestEffectivePoolDemandQueryCountExcludesLiveMoleculeStep(t *testing.T) {
++	if _, err := exec.LookPath("jq"); err != nil {
++		t.Skip("jq not available; count-form exercises a jq pipeline")
++	}
++	a := Agent{Name: "worker", Dir: "hello-world"}
++	out := runShellWithFakeBd(t, a.EffectivePoolDemandQuery(), nil, `#!/bin/sh
++set -eu
++case "$*" in
++  *"--metadata-field gc.routed_to=hello-world/worker"*)
++    printf '[{"id":"story-with-live-step","metadata":{"molecule_id":"mol-1"}}]'
++    ;;
++  *"list --status in_progress --type step --json --limit 0"*)
++    printf '[{"id":"live-step","issue_type":"step","status":"in_progress","parent":"mol-1"}]'
++    ;;
++  *)
++    printf '[]'
++    ;;
++esac
++`)
++	if strings.TrimSpace(out) != "0" {
++		t.Fatalf("EffectivePoolDemandQuery() count = %q, want 0 (the only candidate's molecule has a live step)", strings.TrimSpace(out))
++	}
++}
++
+ func TestEffectiveAssignedReadyQueryControlDispatcherClaimsLegacyAssignedWork(t *testing.T) {
+ 	a := Agent{Name: ControlDispatcherAgentName, Dir: "gascity"}
+ 	got := a.EffectiveAssignedReadyQuery()

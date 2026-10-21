@@ -1,0 +1,347 @@
+diff --git a/internal/runtime/liveness.go b/internal/runtime/liveness.go
+index 20c5d93e0..2076e4e15 100644
+--- a/internal/runtime/liveness.go
++++ b/internal/runtime/liveness.go
+@@ -15,6 +15,24 @@ type LivenessObserver interface {
+ 	ObserveLiveness(name string, processNames []string) Liveness
+ }
+ 
++// UncertainLivenessReporter is implemented by providers whose liveness
++// checks are backed by a cache that can itself fail to observe current
++// state (e.g. a subprocess snapshot that times out or is killed under
++// load). LastObservationUncertain reports whether the most recent
++// IsRunning/ObserveLiveness answer for ANY session might reflect "could not
++// read live state right now" rather than a confirmed result.
++//
++// ga-ebbr2t: a reconciler that treats a negative IsRunning as proof of death
++// immediately after starting a session can race a failed state-cache
++// refresh -- the refresh error collapses into the same false value as a
++// genuine "not running," and the reconciler then attempts a destructive
++// fresh-start against a session that never actually died. Callers about to
++// treat a negative liveness answer as confirmed death should check this
++// first and, when true, defer to the next tick instead of acting.
++type UncertainLivenessReporter interface {
++	LastObservationUncertain() bool
++}
++
+ // ObserveLiveness returns the consolidated liveness view for a provider
+ // session. Providers with native support may use additional persisted runtime
+ // hints; other providers fall back to IsRunning plus ProcessAlive.
+diff --git a/internal/runtime/tmux/adapter.go b/internal/runtime/tmux/adapter.go
+index ef0f72776..fbbd86548 100644
+--- a/internal/runtime/tmux/adapter.go
++++ b/internal/runtime/tmux/adapter.go
+@@ -269,6 +269,14 @@ func (p *Provider) IsRunning(name string) bool {
+ 	return p.cache.IsRunning(name)
+ }
+ 
++// LastObservationUncertain implements [runtime.UncertainLivenessReporter].
++// It reports whether the underlying state cache's most recent tmux/process
++// snapshot fetch failed, meaning a negative IsRunning/ObserveLiveness result
++// obtained right now cannot be trusted as confirmed death (ga-ebbr2t).
++func (p *Provider) LastObservationUncertain() bool {
++	return p.cache.LastFetchFailed()
++}
++
+ // IsDeadRuntimeSession reports whether a visible tmux session is a
+ // remain-on-exit corpse with no live panes.
+ func (p *Provider) IsDeadRuntimeSession(name string) (bool, error) {
+diff --git a/internal/runtime/tmux/state_cache.go b/internal/runtime/tmux/state_cache.go
+index d7cb08e3e..b6f59fb13 100644
+--- a/internal/runtime/tmux/state_cache.go
++++ b/internal/runtime/tmux/state_cache.go
+@@ -144,6 +144,19 @@ func (c *StateCache) currentState() runtimeStateSnapshot {
+ 	return state
+ }
+ 
++// LastFetchFailed reports whether the most recent underlying tmux/process
++// snapshot fetch attempt returned an error. A true result means any
++// negative IsRunning/ProcessAlive answer given right now may reflect "we
++// could not observe current state" rather than "confirmed not running" --
++// in particular, a session created after the last successful fetch is
++// indistinguishable from a nonexistent one while refreshes keep failing
++// (ga-ebbr2t). Cleared by the next successful refresh.
++func (c *StateCache) LastFetchFailed() bool {
++	c.mu.RLock()
++	defer c.mu.RUnlock()
++	return c.lastError != nil
++}
++
+ // Invalidate marks the cache as dirty, forcing the next IsRunning call
+ // to trigger a refresh. The session data and fetchedAt are preserved as
+ // last-known-good until the refresh completes — even if the refresh fails.
+diff --git a/internal/session/chat.go b/internal/session/chat.go
+index 5a9ffe3e1..f2be67d18 100644
+--- a/internal/session/chat.go
++++ b/internal/session/chat.go
+@@ -203,6 +203,16 @@ func (m *Manager) retryFreshStartAfterStaleKey(
+ 	cfg.Command = freshCmd
+ 	m.killExistingOrphans(ctx, id)
+ 	if err := m.sp.Start(ctx, sessName, cfg); err != nil {
++		if errors.Is(err, runtime.ErrSessionExists) && m.sp.IsRunning(sessName) {
++			// The session we were about to fresh-start is, in fact, still
++			// genuinely alive: our stale-key theory (or the liveness read
++			// that triggered it) was wrong. ensureRunning's own top-level
++			// Start-error handling already treats this exact shape as
++			// converged rather than fatal; mirror that here instead of
++			// surfacing an error that would make the caller tear down or
++			// close a bead whose runtime never actually died (ga-ebbr2t).
++			return true, nil
++		}
+ 		if unroute != nil {
+ 			unroute()
+ 		}
+@@ -418,11 +428,15 @@ func (m *Manager) ensureRunning(ctx context.Context, id string, b beads.Bead, se
+ 			return err
+ 		}
+ 		if !m.sp.IsRunning(sessName) {
+-			retried, err := m.retryFreshStartAfterStaleKey(ctx, id, &b, sessName, resumeCommand, cfg, unroute)
+-			if err != nil {
+-				return err
++			if m.livenessUncertain() {
++				log.Printf("session: liveness read for %q uncertain (state cache fetch failed); deferring stale-key retry to next tick", id)
++			} else {
++				retried, err := m.retryFreshStartAfterStaleKey(ctx, id, &b, sessName, resumeCommand, cfg, unroute)
++				if err != nil {
++					return err
++				}
++				started = retried
+ 			}
+-			started = retried
+ 		}
+ 	}
+ 	if b.Metadata["transport"] == "" && (started || transportVerified) {
+@@ -519,7 +533,9 @@ func (m *Manager) ensureRunningRuntimeOnly(ctx context.Context, id string, b bea
+ 			return err
+ 		}
+ 		if !m.sp.IsRunning(sessName) {
+-			if _, err := m.retryFreshStartAfterStaleKey(ctx, id, &b, sessName, resumeCommand, cfg, unroute); err != nil {
++			if m.livenessUncertain() {
++				log.Printf("session: liveness read for %q uncertain (state cache fetch failed); deferring stale-key retry to next tick", id)
++			} else if _, err := m.retryFreshStartAfterStaleKey(ctx, id, &b, sessName, resumeCommand, cfg, unroute); err != nil {
+ 				return err
+ 			}
+ 		}
+diff --git a/internal/session/manager.go b/internal/session/manager.go
+index 2023b97a6..a839cbe07 100644
+--- a/internal/session/manager.go
++++ b/internal/session/manager.go
+@@ -229,6 +229,16 @@ func (m *Manager) persistTransport(id, provider, transport string) {
+ 	_ = m.store.SetMetadata(id, "transport", transport)
+ }
+ 
++// livenessUncertain reports whether the provider's most recent liveness
++// observation might be unreliable (e.g. a tmux state-cache refresh whose
++// underlying process snapshot fetch failed) rather than a confirmed
++// negative. Callers that just saw IsRunning return false should check this
++// before treating that as proof the session died (ga-ebbr2t).
++func (m *Manager) livenessUncertain() bool {
++	reporter, ok := m.sp.(runtime.UncertainLivenessReporter)
++	return ok && reporter.LastObservationUncertain()
++}
++
+ func (m *Manager) killExistingOrphans(ctx context.Context, sessionID string) {
+ 	_ = ctx
+ 	scanner, ok := m.sp.(runtime.ProcessTableScanner)
+diff --git a/internal/session/manager_test.go b/internal/session/manager_test.go
+index 452c12bc0..c8adc56ae 100644
+--- a/internal/session/manager_test.go
++++ b/internal/session/manager_test.go
+@@ -141,6 +141,82 @@ func (p *dieAndFailProvider) IsRunning(name string) bool {
+ 	return p.Fake.IsRunning(name) //nolint:staticcheck // intentional: IsRunning is not on Fake, it's on Provider
+ }
+ 
++// cacheBlindProvider simulates ga-ebbr2t: the tmux state cache's process
++// snapshot fetch fails right after a session starts, so IsRunning reports
++// false for a session that is genuinely still running (the cache's
++// last-known-good snapshot predates the session's creation, and the
++// refresh that would have picked it up just failed). Unlike
++// failOnceStartProvider/dieAndFailProvider, the session is NOT actually
++// stopped when IsRunning lies -- this is the "we can't currently observe
++// reality" case, not "the process died."
++//
++// The lie is deliberately keyed to "the next IsRunning call after this
++// session's own Start succeeds while armed" rather than a naive one-shot
++// flag: ensureRunning's incidental transportForBead IsRunning probe (called
++// before Start, at the top of the function) must keep reporting the real,
++// unarmed state, or a naive one-shot lie gets consumed there instead of at
++// the actual post-start stale-key check this test targets.
++type cacheBlindProvider struct {
++	*runtime.Fake
++	armed           bool // arms the lie; consumed on the IsRunning call after the next successful own-Start
++	startedSinceArm bool
++	uncertain       bool // LastObservationUncertain() mirrors a live cache-fetch failure
++	reportsCert     bool // whether this provider implements UncertainLivenessReporter at all
++}
++
++func (p *cacheBlindProvider) Start(ctx context.Context, name string, cfg runtime.Config) error {
++	err := p.Fake.Start(ctx, name, cfg)
++	if err == nil && p.armed {
++		p.startedSinceArm = true
++	}
++	return err
++}
++
++func (p *cacheBlindProvider) IsRunning(name string) bool {
++	if p.armed && p.startedSinceArm {
++		p.armed = false
++		p.startedSinceArm = false
++		return false
++	}
++	return p.Fake.IsRunning(name) //nolint:staticcheck // intentional: IsRunning is not on Fake, it's on Provider
++}
++
++// LastObservationUncertain implements runtime.UncertainLivenessReporter.
++// Only consulted by callers that type-assert for it; cacheBlindProviderNoSignal
++// below omits this method entirely to simulate a provider that can't report
++// uncertainty at all.
++func (p *cacheBlindProvider) LastObservationUncertain() bool {
++	return p.reportsCert && p.uncertain
++}
++
++// cacheBlindProviderNoSignal is identical to cacheBlindProvider but does NOT
++// implement runtime.UncertainLivenessReporter, simulating a provider (or an
++// engine build) that has no way to report "liveness read was unreliable" --
++// used to prove the ErrSessionExists convergence fix in
++// retryFreshStartAfterStaleKey holds even without the uncertainty signal.
++type cacheBlindProviderNoSignal struct {
++	*runtime.Fake
++	armed           bool
++	startedSinceArm bool
++}
++
++func (p *cacheBlindProviderNoSignal) Start(ctx context.Context, name string, cfg runtime.Config) error {
++	err := p.Fake.Start(ctx, name, cfg)
++	if err == nil && p.armed {
++		p.startedSinceArm = true
++	}
++	return err
++}
++
++func (p *cacheBlindProviderNoSignal) IsRunning(name string) bool {
++	if p.armed && p.startedSinceArm {
++		p.armed = false
++		p.startedSinceArm = false
++		return false
++	}
++	return p.Fake.IsRunning(name) //nolint:staticcheck // intentional: IsRunning is not on Fake, it's on Provider
++}
++
+ type startupDeathProvider struct {
+ 	*runtime.Fake
+ 	armed     bool
+@@ -4437,6 +4513,114 @@ func TestEnsureRunning_StaleKeyRetryAlsoFails(t *testing.T) {
+ 	}
+ }
+ 
++// TestEnsureRunning_DefersRestartWhenLivenessUncertain reproduces ga-ebbr2t
++// (AC1): when the provider reports that its liveness read is uncertain
++// (mirroring a tmux state-cache process-snapshot fetch failure), a
++// subsequent negative IsRunning must NOT be treated as confirmed death. The
++// reconciler must defer the stale-key retry to the next tick instead of
++// racing a fresh start against a session that is, in fact, still alive.
++func TestEnsureRunning_DefersRestartWhenLivenessUncertain(t *testing.T) {
++	defer SetStaleKeyDetectDelayForTest(0)()
++
++	store := beads.NewMemStore()
++	base := runtime.NewFake()
++	sp := &cacheBlindProvider{Fake: base, reportsCert: true}
++	mgr := NewManager(store, sp)
++
++	info, err := mgr.Create(context.Background(), "worker", "", "claude --dangerously", "/tmp", "claude", nil, ProviderResume{
++		ResumeFlag:    "--resume",
++		SessionIDFlag: "--session-id",
++	}, runtime.Config{})
++	if err != nil {
++		t.Fatalf("Create: %v", err)
++	}
++
++	b, err := store.Get(info.ID)
++	if err != nil {
++		t.Fatalf("Get bead: %v", err)
++	}
++	sessionKey := b.Metadata["session_key"]
++	if sessionKey == "" {
++		t.Fatal("expected session_key in bead metadata after Create with ResumeFlag")
++	}
++
++	if err := mgr.Suspend(info.ID); err != nil {
++		t.Fatalf("Suspend: %v", err)
++	}
++
++	// Arm the exact failure mode from the incident: the IsRunning check
++	// right after this session's own resume-Start will lie false, AND the
++	// provider reports that reading as uncertain (its state-cache fetch
++	// just failed) rather than confirmed.
++	sp.armed = true
++	sp.uncertain = true
++
++	resumeCmd := "claude --dangerously --resume " + sessionKey
++	if err := mgr.Send(context.Background(), info.ID, "hello", resumeCmd, runtime.Config{WorkDir: "/tmp"}); err != nil {
++		t.Fatalf("Send should defer to the next tick rather than fail when liveness is uncertain: %v", err)
++	}
++
++	if !base.IsRunning(info.SessionName) {
++		t.Fatal("the original, genuinely-live session must not be torn down")
++	}
++	if got := base.CountCalls("Start", info.SessionName); got != 2 {
++		t.Errorf("expected exactly 2 Start calls (Create + Send's wake, no fresh-start retry while liveness is uncertain), got %d", got)
++	}
++	if got := base.CountCalls("Stop", info.SessionName); got != 1 {
++		t.Errorf("expected exactly 1 Stop call (Suspend only, no destructive action from the uncertain liveness read), got %d", got)
++	}
++}
++
++// TestEnsureRunning_FreshStartCollisionWithLiveSessionConverges reproduces
++// ga-ebbr2t (AC2): even when a provider cannot report liveness-uncertainty
++// at all (no UncertainLivenessReporter), a fresh-start attempt that collides
++// with "session already exists" against a session that IS actually running
++// must converge, not surface a hard error that would let the caller close
++// the bead or kill the still-live runtime.
++func TestEnsureRunning_FreshStartCollisionWithLiveSessionConverges(t *testing.T) {
++	defer SetStaleKeyDetectDelayForTest(0)()
++
++	store := beads.NewMemStore()
++	base := runtime.NewFake()
++	sp := &cacheBlindProviderNoSignal{Fake: base}
++	mgr := NewManager(store, sp)
++
++	info, err := mgr.Create(context.Background(), "worker", "", "claude --dangerously", "/tmp", "claude", nil, ProviderResume{
++		ResumeFlag:    "--resume",
++		SessionIDFlag: "--session-id",
++	}, runtime.Config{})
++	if err != nil {
++		t.Fatalf("Create: %v", err)
++	}
++
++	b, err := store.Get(info.ID)
++	if err != nil {
++		t.Fatalf("Get bead: %v", err)
++	}
++	sessionKey := b.Metadata["session_key"]
++	if sessionKey == "" {
++		t.Fatal("expected session_key in bead metadata after Create with ResumeFlag")
++	}
++
++	if err := mgr.Suspend(info.ID); err != nil {
++		t.Fatalf("Suspend: %v", err)
++	}
++
++	// No uncertainty signal available -- the reconciler WILL reach
++	// retryFreshStartAfterStaleKey, and its own Start attempt collides with
++	// the still-live session (never actually stopped, just misreported).
++	sp.armed = true
++
++	resumeCmd := "claude --dangerously --resume " + sessionKey
++	if err := mgr.Send(context.Background(), info.ID, "hello", resumeCmd, runtime.Config{WorkDir: "/tmp"}); err != nil {
++		t.Fatalf("Send should converge when the fresh-start collides with a live session, not fail: %v", err)
++	}
++
++	if !base.IsRunning(info.SessionName) {
++		t.Fatal("the original, genuinely-live session must not be torn down")
++	}
++}
++
+ func TestEnsureRunning_RetriesAfterStartupDeathError(t *testing.T) {
+ 	store := beads.NewMemStore()
+ 	base := runtime.NewFake()

@@ -1,0 +1,545 @@
+diff --git a/.gascity-gastown-hq/packs/town-deltas/assets/daemon-refresh.sh b/.gascity-gastown-hq/packs/town-deltas/assets/daemon-refresh.sh
+index b8c8dffa3..4e795ea09 100755
+--- a/.gascity-gastown-hq/packs/town-deltas/assets/daemon-refresh.sh
++++ b/.gascity-gastown-hq/packs/town-deltas/assets/daemon-refresh.sh
+@@ -471,10 +471,34 @@
+ #   VERIFY_TIMEOUT    seconds to wait for a fresh process (default 20)
+ #   VERIFY_INTERVAL   poll interval seconds (default 1)
+ #   SYMBOL_REACHABILITY_TIMEOUT   seconds per daemon for compute_symbol_
+-#                     reachability.py (default 5; ga-8q1ulq, header point 17)
++#                     reachability.py (default 20; ga-8q1ulq, header point 17.
++#                     Was 5 at first ship, raised same-day: measured live
++#                     against a real halt window, wa-v5ya9, the ONE daemon
++#                     that mattered took 8.4s — the 5s default missed the
++#                     mainline case, not just an outlier. 20s comfortably
++#                     covers the range measured so far, 5.2-11.9s.)
+ #   SYMBOL_REACHABILITY_TOTAL_TIMEOUT   seconds for the whole GUARDED batch
+-#                     (default 30; same point) — either budget tripping
+-#                     degrades the remaining daemon(s) to NÃO CALCULADO.
++#                     (default 60; same point, same same-day raise) — either
++#                     budget tripping degrades the remaining daemon(s) to NÃO
++#                     CALCULADO. Kept well under the caller's outer `timeout
++#                     180` on this whole script (not just this section) —
++#                     raising it further risks that outer kill losing the
++#                     WHOLE verdict, not just this section's ranking.
++#   SYMBOL_REACHABILITY_CACHE_DIR   where per-(entrypoint,before,after) results
++#                     persist across separate invocations of this script
++#                     (default $RUNTIME_DIR/.runtime/symbol-reachability-cache
++#                     — `.runtime/` is already gitignored in the rigs checked
++#                     so far). A NEEDS_GUARDED_RESTART halt re-runs this script
++#                     every sweep on the SAME window until it clears; without
++#                     a cache, a daemon whose real closure is large enough to
++#                     miss the per-daemon budget NEVER gets a real answer no
++#                     matter how many sweeps run — recomputing it from scratch
++#                     every time. Only CONFIRMED/NO_EVIDENCE results are
++#                     cached; NÃO CALCULADO is deliberately never cached (it
++#                     means "didn't get to it" or "the subprocess itself
++#                     failed", not a stable answer — caching it would freeze a
++#                     transient failure forever instead of retrying next
++#                     sweep). Set to empty to disable caching entirely.
+ 
+ set -uo pipefail
+ 
+@@ -516,9 +540,20 @@ PS_BIN="${PS_BIN:-ps}"
+ # ga-8q1ulq (header point 17): bounds the cost of the new per-GUARDED-label
+ # symbol-reachability subprocess call — a rig-side git-show-heavy AST walk,
+ # not a cheap check. Either budget tripping degrades the affected daemon(s)
+-# to NÃO CALCULADO, never blocks the halt past it.
+-SYMBOL_REACHABILITY_TIMEOUT="${SYMBOL_REACHABILITY_TIMEOUT:-5}"
+-SYMBOL_REACHABILITY_TOTAL_TIMEOUT="${SYMBOL_REACHABILITY_TOTAL_TIMEOUT:-30}"
++# to NÃO CALCULADO, never blocks the halt past it. 20/60 (was 5/30 at first
++# ship): measured live same-day against a real halt (wa-v5ya9) the 5s
++# default missed the ONE daemon that mattered (8.4s) — the mainline case,
++# not an outlier (Mayor, ga-8q1ulq).
++SYMBOL_REACHABILITY_TIMEOUT="${SYMBOL_REACHABILITY_TIMEOUT:-20}"
++SYMBOL_REACHABILITY_TOTAL_TIMEOUT="${SYMBOL_REACHABILITY_TOTAL_TIMEOUT:-60}"
++# ga-8q1ulq: NOT defaulted here — $RUNTIME_DIR isn't validated non-empty
++# until later, and `set -u` above would error on referencing it this early
++# if it's ever genuinely unset. The effective default ($RUNTIME_DIR/.runtime/
++# symbol-reachability-cache) is computed once, lazily, at first use in the
++# GUARDED batch below, after RUNTIME_DIR is known-good. An explicit empty
++# string here (SYMBOL_REACHABILITY_CACHE_DIR=) disables caching outright —
++# preserved as `-` (not `:-`) so that distinction survives to the lazy site.
++SYMBOL_REACHABILITY_CACHE_DIR="${SYMBOL_REACHABILITY_CACHE_DIR-__unset__}"
+ VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-20}"
+ VERIFY_INTERVAL="${VERIFY_INTERVAL:-1}"
+ 
+@@ -2209,42 +2244,139 @@ classify_guarded() {  # classify_guarded <label>
+   esac
+ }
+ 
++# ga-8q1ulq: resolves <label>'s first DISCO_DIR-recorded entrypoint into
++# SYMREACH_ENTRY (empty if none). Factored out of symbol_reachability_for()
++# so the cache-path lookup (symbol_reachability_cached(), which must know the
++# entry BEFORE deciding whether to even attempt a live call) and the live
++# call itself resolve the identical entry the identical way — duplicating
++# this resolution would risk the two silently drifting apart.
++resolve_symreach_entry() {  # resolve_symreach_entry <label>
++  local _label="$1" _entries _e
++  SYMREACH_ENTRY=""
++  _entries="$(cat "$DISCO_DIR/$_label" 2>/dev/null || true)"
++  for _e in $_entries; do SYMREACH_ENTRY="$_e"; break; done
++}
++
++# ga-8q1ulq: shared JSON->state parser for compute_symbol_reachability.py's
++# output — used identically whether that JSON just came from a live
++# subprocess call or from a cache hit, so a live answer and a cached answer
++# can NEVER be interpreted two different ways. Sets SYMREACH_STATE (confirmed
++# | no_evidence | not_computed) and, only when confirmed, SYMREACH_VIA/
++# SYMREACH_PATH. Always returns 0 — an unparseable/absent-key input degrades
++# to not_computed, it never propagates a shell error.
++symbol_reachability_parse() {  # symbol_reachability_parse <json-string>
++  local _json="$1" _parsed
++  SYMREACH_VIA=""; SYMREACH_PATH=""
++  _parsed="$(printf '%s' "$_json" | python3 -c '
++import json, sys
++try:
++    d = json.load(sys.stdin)
++    r = d.get("reaches")
++except Exception:
++    r = None
++if r is True:
++    print("STATE:confirmed")
++    print("VIA:" + (d.get("via") or ""))
++    print("PATH:" + ",".join(d.get("path") or []))
++elif r is False:
++    print("STATE:no_evidence")
++else:
++    print("STATE:not_computed")
++' 2>/dev/null)"
++  SYMREACH_STATE="$(printf '%s\n' "$_parsed" | sed -n 's/^STATE://p')"
++  case "$SYMREACH_STATE" in
++    confirmed)
++      SYMREACH_VIA="$(printf '%s\n' "$_parsed" | sed -n 's/^VIA://p')"
++      SYMREACH_PATH="$(printf '%s\n' "$_parsed" | sed -n 's/^PATH://p')"
++      ;;
++    no_evidence) ;;
++    *) SYMREACH_STATE="not_computed" ;;
++  esac
++}
++
++# ga-8q1ulq: cache file path for <label> under [$SYMREACH_BEFORE,
++# $SYMREACH_AFTER] — keyed on (entrypoint, before, after) only, per Mayor's
++# direction; NOT on the resolved closure (a coarser key than the true input,
++# same accepted-bias shape point 17's own closure fallback already
++# documents). Prints nothing and returns 1 when caching is disabled
++# (SYMREACH_CACHE_DIR empty) or the label has no resolved entry — callers
++# must check the exit status, an empty stdout alone is ambiguous between
++# those two cases and "wrote a path that happens to be empty" (impossible
++# here, but the convention matters more than this one instance).
++symbol_reachability_cache_path() {  # symbol_reachability_cache_path <label>
++  local _label="$1" _sanitized
++  [ -z "$SYMREACH_CACHE_DIR" ] && return 1
++  resolve_symreach_entry "$_label"
++  [ -z "$SYMREACH_ENTRY" ] && return 1
++  _sanitized="$(printf '%s' "$SYMREACH_ENTRY" | tr '/' '_')"
++  printf '%s/%s__%s__%s.json\n' "$SYMREACH_CACHE_DIR" "$_sanitized" "$SYMREACH_BEFORE" "$SYMREACH_AFTER"
++}
++
++# ga-8q1ulq (Mayor direction, point a): cache hit -> 0 with SYMREACH_STATE/
++# VIA/PATH set exactly as symbol_reachability_for() would have; cache miss or
++# caching disabled -> 1, caller proceeds to the live (budgeted) path. Costs
++# nothing against SYMBOL_REACHABILITY_TOTAL_TIMEOUT — a hit never spends
++# budget, which is the entire point: a looping halt's later sweeps spend
++# their WHOLE budget on what earlier sweeps didn't already answer, instead of
++# re-paying for what they did.
++symbol_reachability_cached() {  # symbol_reachability_cached <label>
++  local _label="$1" _path
++  _path="$(symbol_reachability_cache_path "$_label")" || return 1
++  [ -f "$_path" ] || return 1
++  symbol_reachability_parse "$(cat "$_path" 2>/dev/null || true)"
++  case "$SYMREACH_STATE" in
++    confirmed|no_evidence)
++      log "symbol-reachability $_label ($SYMREACH_ENTRY): cache hit ($SYMREACH_STATE) — not recomputed."
++      return 0
++      ;;
++    *)
++      # A not_computed cache entry should never exist (write-side only ever
++      # caches confirmed/no_evidence — see symbol_reachability_for() below),
++      # but if one somehow does (hand-edited, future bug), fail closed: treat
++      # it as a miss and let the live path run rather than trusting a
++      # third-state result FROM the cache, which the whole point of never
++      # caching that state was to avoid freezing.
++      return 1
++      ;;
++  esac
++}
++
+ # ga-8q1ulq (header point 17): does <label>'s entrypoint call graph reach a
+ # symbol that changed in [$SYMREACH_BEFORE, $SYMREACH_AFTER]? Delegates to
+ # the rig's own compute_symbol_reachability.py (wa-th4b1) — never
+ # reimplemented here, same "consult the rig, don't vendor a second copy"
+ # choice deploy_deps.json consultation already makes above. Only called from
+-# Step 5, lazily, for labels already in GUARDED — never during Step 3/4 — so
+-# the cost is paid only on a run that is actually about to render a
+-# NEEDS_GUARDED_RESTART halt. Sets SYMREACH_STATE to one of confirmed |
+-# no_evidence | not_computed and, only when confirmed, SYMREACH_VIA/
+-# SYMREACH_PATH (diagnostic detail — logged, not rendered into REASON, same
+-# bare-label-list convention GUARDED_OWN/GUARDED_CLOSURE_ONLY already use).
++# Step 5, lazily, for labels already in GUARDED that symbol_reachability_
++# cached() above did NOT already answer — so the cost is paid only on a run
++# that is actually about to render a NEEDS_GUARDED_RESTART halt, and only for
++# what an earlier sweep hasn't already resolved. Sets SYMREACH_STATE to one
++# of confirmed | no_evidence | not_computed and, only when confirmed,
++# SYMREACH_VIA/SYMREACH_PATH (diagnostic detail — logged, not rendered into
++# REASON, same bare-label-list convention GUARDED_OWN/GUARDED_CLOSURE_ONLY
++# already use).
+ symbol_reachability_for() {  # symbol_reachability_for <label>
+-  local label="$1" entries entry e c out rc parsed
++  local label="$1" entries e c out rc cache_path tmp_path
++  resolve_symreach_entry "$label"
+   entries="$(cat "$DISCO_DIR/$label" 2>/dev/null || true)"
+-  entry=""
+-  for e in $entries; do entry="$e"; break; done
+-  SYMREACH_VIA=""; SYMREACH_PATH=""
+-  if [ -z "$entry" ]; then
++  if [ -z "$SYMREACH_ENTRY" ]; then
+     # A FORCE_RESTART_LABELS entry (points 5/16): Step 2 never resolved an
+     # entrypoint for it at all, so there is no file to point the AST parser
+     # at. Same tri-state honesty as everywhere else here: unknown, not "no
+     # evidence".
+-    SYMREACH_STATE="not_computed"
++    SYMREACH_STATE="not_computed"; SYMREACH_VIA=""; SYMREACH_PATH=""
+     log "symbol-reachability $label: no resolved entrypoint — NÃO CALCULADO, ranking unaffected."
+     return 0
+   fi
+ 
+-  set -- --repo "$RUNTIME_DIR" --entrypoint "$entry"
++  set -- --repo "$RUNTIME_DIR" --entrypoint "$SYMREACH_ENTRY"
+   for e in $entries; do
+-    [ "$e" = "$entry" ] && continue
++    [ "$e" = "$SYMREACH_ENTRY" ] && continue
+     set -- "$@" --closure "$e"
+   done
+-  if json_covers_entry "$entry"; then
++  if json_covers_entry "$SYMREACH_ENTRY"; then
+     while IFS= read -r c; do
+       [ -n "$c" ] && set -- "$@" --closure "$c"
+-    done < <(json_closure_for_entry "$entry")
++    done < <(json_closure_for_entry "$SYMREACH_ENTRY")
+   else
+     # ad-hoc tier (header point 17): no deploy_deps.json closure for this
+     # entrypoint. Coarser fallback — the full changed-.py set, not just what
+@@ -2261,36 +2393,30 @@ symbol_reachability_for() {  # symbol_reachability_for <label>
+   out="$(timeout "$SYMBOL_REACHABILITY_TIMEOUT" python3 "$SYMBOL_SCRIPT" "$@" 2>/dev/null)"
+   rc=$?
+   if [ "$rc" -ne 0 ]; then
+-    SYMREACH_STATE="not_computed"
+-    log "symbol-reachability $label ($entry): compute_symbol_reachability.py did not return an answer (exit $rc, timeout=${SYMBOL_REACHABILITY_TIMEOUT}s) — NÃO CALCULADO, ranking unaffected."
++    SYMREACH_STATE="not_computed"; SYMREACH_VIA=""; SYMREACH_PATH=""
++    log "symbol-reachability $label ($SYMREACH_ENTRY): compute_symbol_reachability.py did not return an answer (exit $rc, timeout=${SYMBOL_REACHABILITY_TIMEOUT}s) — NÃO CALCULADO, ranking unaffected."
+     return 0
+   fi
+-  parsed="$(printf '%s' "$out" | python3 -c '
+-import json, sys
+-try:
+-    d = json.load(sys.stdin)
+-    r = d.get("reaches")
+-except Exception:
+-    r = None
+-if r is True:
+-    print("STATE:confirmed")
+-    print("VIA:" + (d.get("via") or ""))
+-    print("PATH:" + ",".join(d.get("path") or []))
+-elif r is False:
+-    print("STATE:no_evidence")
+-else:
+-    print("STATE:not_computed")
+-' 2>/dev/null)"
+-  SYMREACH_STATE="$(printf '%s\n' "$parsed" | sed -n 's/^STATE://p')"
++  symbol_reachability_parse "$out"
++  if [ "$SYMREACH_STATE" = "not_computed" ] && [ "$rc" -eq 0 ]; then
++    log "symbol-reachability $label ($SYMREACH_ENTRY): compute_symbol_reachability.py returned output that did not parse as the expected JSON — NÃO CALCULADO, ranking unaffected."
++  fi
++
++  # ga-8q1ulq (Mayor direction, point a): only a settled answer is cached.
++  # NÃO CALCULADO means "didn't get a usable answer this attempt" — caching
++  # it would freeze a transient timeout/crash/parse-failure forever instead
++  # of letting the next sweep simply try again, exactly the failure mode the
++  # cache exists to prevent, not reproduce.
+   case "$SYMREACH_STATE" in
+-    confirmed)
+-      SYMREACH_VIA="$(printf '%s\n' "$parsed" | sed -n 's/^VIA://p')"
+-      SYMREACH_PATH="$(printf '%s\n' "$parsed" | sed -n 's/^PATH://p')"
+-      ;;
+-    no_evidence) ;;
+-    *)
+-      SYMREACH_STATE="not_computed"
+-      log "symbol-reachability $label ($entry): compute_symbol_reachability.py returned output that did not parse as the expected JSON — NÃO CALCULADO, ranking unaffected."
++    confirmed|no_evidence)
++      cache_path="$(symbol_reachability_cache_path "$label" 2>/dev/null)"
++      if [ -n "$cache_path" ]; then
++        tmp_path="$(mktemp "${cache_path}.XXXXXX" 2>/dev/null || true)"
++        if [ -n "$tmp_path" ] && printf '%s' "$out" > "$tmp_path" 2>/dev/null; then
++          mv -f "$tmp_path" "$cache_path" 2>/dev/null \
++            || { rm -f "$tmp_path" 2>/dev/null; log "WARN: could not persist symbol-reachability cache entry for $label — uncached, will recompute next sweep."; }
++        fi
++      fi
+       ;;
+   esac
+ }
+@@ -2439,21 +2565,86 @@ elif [ -n "${GUARDED// /}" ]; then
+     # when it's available and trustworthy — same ancestor-guard chain
+     # ga-agracx already established (point 14) for the same reason: a
+     # narrower, more relevant diff makes for a more precise answer.
++    BEAD_OWN_WINDOW_USED=0
+     if [ -n "$BEAD_MERGE_PRE_SHA" ] && [ -n "$BEAD_MERGE_SHA" ] \
+        && [ "$BEAD_MERGE_PRE_SHA" != "$BEAD_MERGE_SHA" ] \
+        && git -C "$RUNTIME_DIR" rev-parse --verify -q "$BEAD_MERGE_PRE_SHA" >/dev/null 2>&1 \
+        && git -C "$RUNTIME_DIR" rev-parse --verify -q "$BEAD_MERGE_SHA" >/dev/null 2>&1 \
+        && git -C "$RUNTIME_DIR" merge-base --is-ancestor "$BEAD_MERGE_PRE_SHA" "$BEAD_MERGE_SHA" 2>/dev/null; then
+       SYMREACH_BEFORE="$BEAD_MERGE_PRE_SHA"; SYMREACH_AFTER="$BEAD_MERGE_SHA"
++      BEAD_OWN_WINDOW_USED=1
+     fi
+-    SR_BUDGET_START=$SECONDS
++
++    # ga-8q1ulq (Mayor direction, same-day follow-up): lazy, once-only default
++    # for the persistent cache dir — see the ENV VAR doc block above for why
++    # this can't be defaulted at declaration time (RUNTIME_DIR not yet
++    # validated there). The sentinel distinguishes "caller never set it" (use
++    # the default) from "caller explicitly set it empty" (disable caching).
++    if [ "$SYMBOL_REACHABILITY_CACHE_DIR" = "__unset__" ]; then
++      SYMREACH_CACHE_DIR="$RUNTIME_DIR/.runtime/symbol-reachability-cache"
++    else
++      SYMREACH_CACHE_DIR="$SYMBOL_REACHABILITY_CACHE_DIR"
++    fi
++    if [ -n "$SYMREACH_CACHE_DIR" ]; then
++      mkdir -p "$SYMREACH_CACHE_DIR" 2>/dev/null \
++        || log "WARN: could not create symbol-reachability cache dir $SYMREACH_CACHE_DIR — proceeding uncached this run."
++    fi
++
++    # ga-8q1ulq (Mayor direction, point c): "this bead's own affected set
++    # first" — labels whose entrypoint/closure actually touches a file THIS
++    # bead's own narrow window changed get their symbol check spent before
++    # labels that are only guarded via the WIDER window's unrelated noise.
++    # Matters because GUARDED_OWN (point 16, file-level, wide-window) is NOT
++    # a usable proxy for this: Mayor's wa-v5ya9 case shows the real target
++    # (demand_dashboard.py) reaches via an IMPORT, not its own file, so it
++    # would sit in GUARDED_CLOSURE_ONLY, not GUARDED_OWN — prioritizing
++    # GUARDED_OWN first would have pushed the real target LATER, not sooner.
++    # Only meaningful when the narrow window above was actually accepted;
++    # degrades to "no reordering" (GUARDED's own existing order) otherwise —
++    # never wrong, just uninformative, same third-state shape as everywhere
++    # else in this file.
++    BEAD_OWN_CHANGED_PY=""; BEAD_OWN_CHANGED_PY_SPACED=""
++    if [ "$BEAD_OWN_WINDOW_USED" = "1" ]; then
++      BEAD_OWN_CHANGED_PY="$(git -C "$RUNTIME_DIR" diff --name-only "$SYMREACH_BEFORE" "$SYMREACH_AFTER" -- '*.py' 2>/dev/null || true)"
++      BEAD_OWN_CHANGED_PY_SPACED=" $(printf '%s' "$BEAD_OWN_CHANGED_PY" | tr '\n' ' ') "
++    fi
++    label_touches_bead_own_change() {  # label_touches_bead_own_change <label>
++      local _l="$1" _entries _entry _e _c
++      [ -z "${BEAD_OWN_CHANGED_PY// /}" ] && return 1
++      _entries="$(cat "$DISCO_DIR/$_l" 2>/dev/null || true)"
++      _entry=""
++      for _e in $_entries; do _entry="$_e"; break; done
++      [ -z "$_entry" ] && return 1
++      case "$BEAD_OWN_CHANGED_PY_SPACED" in *" $_entry "*) return 0 ;; esac
++      if json_covers_entry "$_entry"; then
++        while IFS= read -r _c; do
++          [ -z "$_c" ] && continue
++          case "$BEAD_OWN_CHANGED_PY_SPACED" in *" $_c "*) return 0 ;; esac
++        done < <(json_closure_for_entry "$_entry")
++      fi
++      return 1
++    }
++    GUARDED_PRIORITY=""; GUARDED_REST=""
+     for label in $GUARDED; do
+-      if [ $((SECONDS - SR_BUDGET_START)) -ge "$SYMBOL_REACHABILITY_TOTAL_TIMEOUT" ]; then
++      if label_touches_bead_own_change "$label"; then
++        GUARDED_PRIORITY="$GUARDED_PRIORITY $label"
++      else
++        GUARDED_REST="$GUARDED_REST $label"
++      fi
++    done
++    GUARDED_ORDERED="$GUARDED_PRIORITY $GUARDED_REST"
++
++    SR_BUDGET_START=$SECONDS
++    for label in $GUARDED_ORDERED; do
++      if symbol_reachability_cached "$label"; then
++        : # cache hit inside symbol_reachability_cached already set SYMREACH_STATE/VIA/PATH; no budget spent
++      elif [ $((SECONDS - SR_BUDGET_START)) -ge "$SYMBOL_REACHABILITY_TOTAL_TIMEOUT" ]; then
+         GUARDED_SYMBOL_NOT_COMPUTED="$GUARDED_SYMBOL_NOT_COMPUTED $label"
+         log "symbol-reachability $label: skipped — total budget (${SYMBOL_REACHABILITY_TOTAL_TIMEOUT}s) already spent on earlier daemons this run — NÃO CALCULADO, ranking unaffected."
+         continue
++      else
++        symbol_reachability_for "$label"
+       fi
+-      symbol_reachability_for "$label"
+       case "$SYMREACH_STATE" in
+         confirmed)
+           GUARDED_SYMBOL_CONFIRMED="$GUARDED_SYMBOL_CONFIRMED $label"
+diff --git a/.gascity-gastown-hq/packs/town-deltas/assets/tests/daemon-refresh.test.sh b/.gascity-gastown-hq/packs/town-deltas/assets/tests/daemon-refresh.test.sh
+index bd5374d5b..bf051b483 100644
+--- a/.gascity-gastown-hq/packs/town-deltas/assets/tests/daemon-refresh.test.sh
++++ b/.gascity-gastown-hq/packs/town-deltas/assets/tests/daemon-refresh.test.sh
+@@ -277,11 +277,28 @@ sanitized = args.entrypoint.replace("/", "_")
+ if mock:
+     with open(os.path.join(mock, "symbol_argv." + sanitized), "w") as f:
+         json.dump(vars(args), f)
++    # ga-8q1ulq: append-only call counter — lets T70 (cache-across-sweeps)
++    # assert a given entrypoint's real subprocess ran exactly once total,
++    # never once per sweep, regardless of how many times the whole script
++    # itself gets invoked against the same window.
++    with open(os.path.join(mock, "symbol_calls." + sanitized), "a") as f:
++        f.write("1\n")
+ mode = "no_evidence"
+ ctrl = os.path.join(mock, "symbol_mode." + sanitized) if mock else ""
+ if ctrl and os.path.exists(ctrl):
+     with open(ctrl) as f:
+         mode = f.read().strip()
++# ga-8q1ulq: optional artificial delay, independent of `mode` — lets a test
++# model "a real, bounded, non-instant closure walk" (seconds, not the fixed
++# 20s `hang` mode below, which exists only to exceed a timeout, never to
++# complete). Applied before responding, whatever `mode` ends up being.
++delay_ctrl = os.path.join(mock, "symbol_delay." + sanitized) if mock else ""
++if delay_ctrl and os.path.exists(delay_ctrl):
++    with open(delay_ctrl) as f:
++        try:
++            time.sleep(float(f.read().strip()))
++        except ValueError:
++            pass
+ if mode == "confirmed":
+     print(json.dumps({"reaches": True, "via": "direct", "path": ["handler"], "changed_symbols": ["handler"], "warnings": []}))
+ elif mode == "confirmed_graph":
+@@ -305,6 +322,21 @@ seed_symbol_result() {
+   local sanitized="${1//\//_}"
+   echo "$2" > "$MOCK/symbol_mode.$sanitized"
+ }
++# seed_symbol_delay <entrypoint-relpath> <seconds> — sleep this long before
++# responding (any mode). Models a real, bounded, non-instant closure walk —
++# T70's cache-across-sweeps fixture, not the fixed-20s `hang` mode above.
++seed_symbol_delay() {
++  local sanitized="${1//\//_}"
++  echo "$2" > "$MOCK/symbol_delay.$sanitized"
++}
++# symbol_call_count <entrypoint-relpath> — how many times the stub's real
++# subprocess actually ran for this entry, across however many separate script
++# invocations the test has made so far. 0 if never called (e.g. served
++# entirely from cache, or skipped by the total-budget guard).
++symbol_call_count() {
++  local sanitized="${1//\//_}"
++  wc -l < "$MOCK/symbol_calls.$sanitized" 2>/dev/null | tr -d ' ' || echo 0
++}
+ 
+ run_helper() {  # run_helper <changed-relpaths...>  (commits a deploy diff first)
+   # PRE = current HEAD; mutate the listed files; POST = new HEAD.
+@@ -2655,6 +2687,119 @@ assert d["after"] == sys.argv[3], (d["after"], sys.argv[3])
+   && ok "T69 --before/--after use the bead's own merge range, not the wider deploy window" \
+   || nok "T69 window preference" "$(cat /tmp/t69_err 2>/dev/null)"
+ 
++# ════════════════════════════════════════════════════════════════════════════
++# T70 (ga-8q1ulq, Mayor's same-day follow-up — points a/c, wa-v5ya9 regression
++# fixture): TWO GUARDED daemons. zzz-target's closure covers lib/shared_lib.py,
++# which is THIS bead's own commit (BASE..BEAD_POST); aaa-decoy's closure covers
++# lib/other_lib.py, which only a DIFFERENT, later bystander commit touches
++# (BEAD_POST..WIDE_POST) — same "own narrow commit vs. wide-window bystander"
++# shape as wa-ut5lc's real conversation-monitor case. Named so aaa (alphabetic
++# default order) sorts BEFORE zzz — a correct reorder is the ONLY way the
++# bead's-own daemon gets processed first. Both take 4s to answer (seeded delay)
++# against a 3s total budget, so only ONE fits per sweep.
++#
++# Sweep 1: zzz-target (bead's own) must be attempted FIRST and land CONFIRMED;
++# aaa-decoy must be skipped WITHOUT the calculator ever running for it (proof
++# it was budget-skipped, not attempted-and-failed) and land NÃO CALCULADO.
++# Sweep 2, SAME window (the halt looping on an unmerged fix, exactly as it
++# does in production — no new commits between sweeps): zzz-target must answer
++# from CACHE (call count stays at 1 — never recomputed), freeing the entire
++# budget for aaa-decoy, which now completes and lands CONFIRMED too. This is
++# the exact wa-v5ya9 shape: the daemon that matters ends SYMBOL-CONFIRMED,
++# never stuck at NÃO CALCULADO just because a sibling daemon happened to run
++# first.
++# ════════════════════════════════════════════════════════════════════════════
++new_case t70
++make_symbol_script "$RUNTIME"
++cat > "$RUNTIME/daemons/aaa_decoy.py" <<<'print("decoy")'
++cat > "$RUNTIME/daemons/zzz_target.py" <<<'print("target")'
++mkdir -p "$RUNTIME/lib"
++cat > "$RUNTIME/lib/shared_lib.py" <<<'def helper(): pass'
++cat > "$RUNTIME/lib/other_lib.py" <<<'def other(): pass'
++cat > "$RUNTIME/daemons/deploy_deps.json" <<'JSONEOF'
++{
++  "_generated_by": "scripts/gen_daemon_deps.py",
++  "daemons": {
++    "daemons/aaa_decoy.py": {
++      "label": "com.test.aaa-decoy",
++      "closure": ["daemons/aaa_decoy.py", "lib/other_lib.py"]
++    },
++    "daemons/zzz_target.py": {
++      "label": "com.test.zzz-target",
++      "closure": ["daemons/zzz_target.py", "lib/shared_lib.py"]
++    }
++  }
++}
++JSONEOF
++make_plist "$AGENTS" com.test.aaa-decoy "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/aaa_decoy.py"
++make_plist "$AGENTS" com.test.zzz-target "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/zzz_target.py"
++seed_running com.test.aaa-decoy 70001 "$STALE_LSTART"
++seed_running com.test.zzz-target 70101 "$STALE_LSTART"
++seed_symbol_result daemons/aaa_decoy.py confirmed
++seed_symbol_delay daemons/aaa_decoy.py 4
++seed_symbol_result daemons/zzz_target.py confirmed
++seed_symbol_delay daemons/zzz_target.py 4
++SENSITIVE_DAEMONS="aaa-decoy zzz-target"
++
++# BASE -> T70_BEAD_POST is THIS bead's own commit (lib/shared_lib.py only).
++# T70_BEAD_POST -> T70_WIDE_POST is a bystander commit from a DIFFERENT bead
++# (lib/other_lib.py only) — mirrors wa-ut5lc's real shape exactly.
++( cd "$RUNTIME"; git add -A >/dev/null 2>&1; git commit -q -m base --allow-empty )
++T70_PRE=$(git -C "$RUNTIME" rev-parse HEAD)
++echo "# bead's own change" >> "$RUNTIME/lib/shared_lib.py"
++( cd "$RUNTIME"
++  git add -A >/dev/null 2>&1
++  GIT_AUTHOR_DATE="@$POST_COMMIT_EPOCH" GIT_COMMITTER_DATE="@$POST_COMMIT_EPOCH" \
++    git commit -q -m "bead's own merge" --allow-empty )
++T70_BEAD_POST=$(git -C "$RUNTIME" rev-parse HEAD)
++echo "# bystander change" >> "$RUNTIME/lib/other_lib.py"
++( cd "$RUNTIME"
++  git add -A >/dev/null 2>&1
++  GIT_AUTHOR_DATE="@$POST_COMMIT_EPOCH" GIT_COMMITTER_DATE="@$POST_COMMIT_EPOCH" \
++    git commit -q -m bystander --allow-empty )
++T70_WIDE_POST=$(git -C "$RUNTIME" rev-parse HEAD)
++
++run_t70_sweep() {
++  MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" \
++    PRE_DEPLOY_SHA="$T70_PRE" POST_DEPLOY_SHA="$T70_WIDE_POST" \
++    BEAD_MERGE_PRE_SHA="$T70_PRE" BEAD_MERGE_SHA="$T70_BEAD_POST" \
++    DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
++    EXTRA_RUNTIME_ROOTS="" FORCE_RESTART_LABELS="" \
++    LAUNCH_AGENTS_DIR="$AGENTS" LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" \
++    VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 \
++    SYMBOL_REACHABILITY_TIMEOUT=10 SYMBOL_REACHABILITY_TOTAL_TIMEOUT=3 \
++    DRY_RUN=0 bash "$HELPER" 2>/dev/null
++}
++
++SWEEP1=$(run_t70_sweep); RC=$?
++V1=$(field VERDICT "$SWEEP1")
++[ "$V1" = "NEEDS_GUARDED_RESTART" ] && ok "T70 sweep1 verdict NEEDS_GUARDED_RESTART" || nok "T70 sweep1 verdict" "got '$V1' out=[$SWEEP1]"
++for l in com.test.aaa-decoy com.test.zzz-target; do
++  echo "$(field GUARDED "$SWEEP1")" | grep -q "$l" && ok "T70 sweep1 $l in flat GUARDED" || nok "T70 sweep1 guarded $l" "$(field GUARDED "$SWEEP1")"
++done
++echo "$(field GUARDED_SYMBOL_CONFIRMED "$SWEEP1")" | grep -q "com.test.zzz-target" \
++  && ok "T70 sweep1: bead's-own-affected daemon (zzz-target) processed first and CONFIRMED, not starved by the decoy" \
++  || nok "T70 sweep1 zzz-target" "$(field GUARDED_SYMBOL_CONFIRMED "$SWEEP1")"
++echo "$(field GUARDED_SYMBOL_NOT_COMPUTED "$SWEEP1")" | grep -q "com.test.aaa-decoy" \
++  && ok "T70 sweep1: decoy correctly deferred to NÃO CALCULADO (whole budget spent on the priority daemon first)" \
++  || nok "T70 sweep1 aaa-decoy" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$SWEEP1")"
++[ "$(symbol_call_count daemons/aaa_decoy.py)" = "0" ] \
++  && ok "T70 sweep1: decoy's calculator never invoked at all (proves SKIPPED by the budget guard, not attempted-and-timed-out)" \
++  || nok "T70 sweep1 decoy call count" "expected 0, got $(symbol_call_count daemons/aaa_decoy.py)"
++
++SWEEP2=$(run_t70_sweep); RC=$?
++V2=$(field VERDICT "$SWEEP2")
++[ "$V2" = "NEEDS_GUARDED_RESTART" ] && ok "T70 sweep2 verdict NEEDS_GUARDED_RESTART" || nok "T70 sweep2 verdict" "got '$V2' out=[$SWEEP2]"
++echo "$(field GUARDED_SYMBOL_CONFIRMED "$SWEEP2")" | grep -q "com.test.zzz-target" \
++  && ok "T70 sweep2: zzz-target still CONFIRMED (now answered from cache)" \
++  || nok "T70 sweep2 zzz-target" "$(field GUARDED_SYMBOL_CONFIRMED "$SWEEP2")"
++[ "$(symbol_call_count daemons/zzz_target.py)" = "1" ] \
++  && ok "T70 sweep2: zzz-target's calculator called exactly ONCE total across both sweeps (sweep2 was a cache hit, not a recompute)" \
++  || nok "T70 sweep2 zzz-target call count" "expected 1 (cached on sweep2), got $(symbol_call_count daemons/zzz_target.py)"
++echo "$(field GUARDED_SYMBOL_CONFIRMED "$SWEEP2")" | grep -q "com.test.aaa-decoy" \
++  && ok "T70 sweep2: decoy now CONFIRMED too — the cache hit on zzz-target freed the budget it needed. This is the wa-v5ya9 shape: the daemon that matters never stays stuck at NÃO CALCULADO." \
++  || nok "T70 sweep2 aaa-decoy" "$(field GUARDED_SYMBOL_CONFIRMED "$SWEEP2")"
++
+ # ── summary ───────────────────────────────────────────────────────────────────
+ echo ""
+ echo "daemon-refresh tests: $PASS passed, $FAIL failed"

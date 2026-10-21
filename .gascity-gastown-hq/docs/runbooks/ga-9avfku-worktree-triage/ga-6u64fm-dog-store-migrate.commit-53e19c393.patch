@@ -1,0 +1,598 @@
+From 53e19c393e9a8dbd1e263e161fb4371a1599066f Mon Sep 17 00:00:00 2001
+From: "gastown.dog-2" <gastown.dog-2@gascity.local>
+Date: Fri, 25 Sep 2026 12:19:04 -0300
+Subject: [PATCH] fix(ga-6u64fm): classify migrated result; migrate only into
+ builder-readable rigs, one hop max
+
+Gate ga-tguml6 failed the auto-migration on two blocking findings:
+
+1. A successful migration read as a Pilot fault. DISPATCH_RESULT
+   rig_native_dog_store_migrated was not classified in _pilot_sweep_emit, so
+   every migration was tallied under failed_other, and the sweep-event
+   selftest's own drift guard (B4) went red (50 passed / 1 failed vs 51/0 at
+   the merge-base). It is now a refused_by_guard outcome keyed by name (the
+   guard resolved the refusal), listed in KNOWN_RESULTS, the B4 explicit-name
+   loop and an A2 case; the closure invariant still holds. It still returns 1
+   and counts toward the Step 5 stall streak on purpose: that streak is what
+   would notice a migration loop.
+
+2. The destination could be another dog-store-blind rig, with no re-migration
+   guard: gastown, lexbh and marketing map to gastown.dog in rig_to_builders,
+   and the copy keeps the original text, so lexbh -> gastown -> lexbh ... hopped
+   one new bead per 5-minute sweep. Now:
+   - a candidate rig must pass the same predicate that made the source blind
+     (_pilot_dog_store_blind_guard on the rig's own builder), so unknown rigs
+     are never destinations and there is no second list to drift;
+   - the text match is a tokenised path-component match (_pilot_text_names_rig_path):
+     URLs, host.tld/... and word-suffixes no longer count; ~/ and absolute paths do;
+   - _pilot_story_already_migrated: a story carrying gc.migrated_from (snapshot
+     or live record, or unreadable metadata) is parked, never migrated twice.
+   Also: warm the rig-list memo once (was two `gc rig list` per migration) and
+   warn when the destination defaulted because rigs could not be listed.
+
+Selftests: the reviewer's repros (a)(b)(c) both directions, anchoring, hop
+guard, marker round-trip (writer key == reader key) and the cold-memo call
+count are covered; each fix was mutation-tested (removing it fails exactly its
+cases). bash 3.2 (/bin/bash) clean.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ ...t-dispatcher.dog-store-migrate.selftest.sh | 187 +++++++++++++++++-
+ .../town-deltas/assets/pilot-dispatcher.sh    | 169 ++++++++++++++--
+ .../pilot-dispatcher.sweep-event.selftest.sh  |  16 +-
+ 3 files changed, 340 insertions(+), 32 deletions(-)
+
+diff --git a/.gascity-gastown-hq/packs/town-deltas/assets/pilot-dispatcher.dog-store-migrate.selftest.sh b/.gascity-gastown-hq/packs/town-deltas/assets/pilot-dispatcher.dog-store-migrate.selftest.sh
+index 0d9023fb0..59f503625 100755
+--- a/.gascity-gastown-hq/packs/town-deltas/assets/pilot-dispatcher.dog-store-migrate.selftest.sh
++++ b/.gascity-gastown-hq/packs/town-deltas/assets/pilot-dispatcher.dog-store-migrate.selftest.sh
+@@ -25,6 +25,18 @@
+ #      someone claimed the original in the race window — retracts the
+ #      orphan copy instead of leaving two live beads for the same story.
+ #
++# Gate-review ga-tguml6 hardening (two blocking findings, both covered below):
++#   - the destination must be a rig whose OWN builder reads its store — gastown,
++#     lexbh and marketing map to gastown.dog, so migrating INTO them only
++#     relocates the blindness and (the copy keeps the original text) ping-pongs
++#     one bead per 5-minute sweep; the match on the bead's text is anchored on a
++#     real path token (URLs / prose no longer count);
++#   - one hop only: a story that already carries gc.migrated_from is parked, not
++#     migrated again (snapshot AND live record; unreadable metadata refuses too).
++#   The other blocking finding — the new DISPATCH_RESULT "rig_native_dog_store_
++#   migrated" read as a Pilot fault — is classified in
++#   pilot-dispatcher.sweep-event.selftest.sh (B4 + A2).
++#
+ # Falsifiable: neither function exists before this fix, so the awk
+ # extraction below fails hard (FATAL, exit 2) against pre-fix HEAD.
+ #
+@@ -64,6 +76,11 @@ extract_fn() {
+ DEST_FN="$(extract_fn '_pilot_dog_store_blind_migrate_dest')"
+ MIGRATE_FN="$(extract_fn '_pilot_migrate_dog_store_blind_bead')"
+ RIGPATH_FN="$(extract_fn 'rig_root_path')"
++PATHTOK_FN="$(extract_fn '_pilot_text_names_rig_path')"
++MIGRATED_FN="$(extract_fn '_pilot_story_already_migrated')"
++GUARD_FN="$(extract_fn '_pilot_dog_store_blind_guard')"
++BUILDERS_FN="$(extract_fn 'rig_to_builders')"
++BUILDER_FN="$(extract_fn 'rig_to_builder')"
+ if [ -z "$DEST_FN" ]; then
+   echo "FATAL: _pilot_dog_store_blind_migrate_dest() not found in $DISPATCHER (pre-fix HEAD, or extraction pattern drifted)" >&2
+   exit 2
+@@ -76,13 +93,29 @@ if [ -z "$RIGPATH_FN" ]; then
+   echo "FATAL: rig_root_path() not found in $DISPATCHER (pre-fix HEAD, or extraction pattern drifted)" >&2
+   exit 2
+ fi
++for _fn_var in PATHTOK_FN MIGRATED_FN GUARD_FN BUILDERS_FN BUILDER_FN; do
++  if [ -z "${!_fn_var}" ]; then
++    echo "FATAL: helper for $_fn_var not found in $DISPATCHER (pre-fix HEAD, or extraction pattern drifted)" >&2
++    exit 2
++  fi
++done
++# Everything the two functions under test call, defined together so a sandbox can never
++# silently lack one (a missing helper would degrade to the HQ default and pass by accident).
++FN_PRELUDE="$RIGPATH_FN
++$PATHTOK_FN
++$MIGRATED_FN
++$GUARD_FN
++$BUILDERS_FN
++$BUILDER_FN
++$DEST_FN
++$MIGRATE_FN"
+ 
+ WORK="$(mktemp -d "${TMPDIR:-/tmp}/pilot-dog-store-migrate-selftest.XXXXXX")"
+ cleanup() { rm -rf "$WORK"; }
+ trap cleanup EXIT
+ 
+-FAKE_RIGS_JSON='{"rigs":[{"name":"gascity","path":"'"$WORK"'/gascity"},{"name":"gastown","path":"'"$WORK"'/gastown"},{"name":"whatsapp_automation","path":"'"$WORK"'/wa"},{"name":"property_scrapers","path":"'"$WORK"'/ps"}]}'
+-mkdir -p "$WORK/gascity" "$WORK/gastown" "$WORK/wa" "$WORK/ps"
++FAKE_RIGS_JSON='{"rigs":[{"name":"gascity","path":"'"$WORK"'/gascity"},{"name":"gastown","path":"'"$WORK"'/gastown"},{"name":"lexbh","path":"'"$WORK"'/lexbh"},{"name":"marketing","path":"'"$WORK"'/marketing"},{"name":"whatsapp_automation","path":"'"$WORK"'/wa"},{"name":"property_scrapers","path":"'"$WORK"'/ps"}]}'
++mkdir -p "$WORK/gascity" "$WORK/gastown" "$WORK/lexbh" "$WORK/marketing" "$WORK/wa" "$WORK/ps"
+ 
+ echo ""
+ echo "pilot-dispatcher.dog-store-migrate.selftest — ga-6u64fm"
+@@ -90,7 +123,8 @@ echo ""
+ echo "=== Part A: _pilot_dog_store_blind_migrate_dest (pure, no bd calls) ==="
+ 
+ run_dest() { # run_dest <story_json> <src_rig>
+-  PILOT_RIG_PATHS_JSON="$FAKE_RIGS_JSON" bash -c "$DEST_FN"'
++  PILOT_RIG_PATHS_JSON="$FAKE_RIGS_JSON" bash -c "warn() { echo \"WARN: \$*\" >&2; }
++$FN_PRELUDE"'
+ _pilot_dog_store_blind_migrate_dest "$1" "$2"' _ "$1" "$2"
+ }
+ 
+@@ -119,6 +153,59 @@ R=$(run_dest '{"title":"mentions whatsapp_automation by name only","description"
+   && ok "bare rig-name mention (no trailing '/') does not count as a path match -> gascity" \
+   || bad "bare rig-name mention should not match -> gascity — got '$R'"
+ 
++# ── gate-review ga-tguml6, blocking issue 2 — the destination must be a store a builder READS ──
++# rig_to_builders maps gastown, lexbh and marketing to gastown.dog, the builder whose probe cannot
++# read a rig store. Each case below is one of the reviewer's executed repros (or its mirror image).
++expect_dest() { # expect_dest <expected> <src_rig> <text> <description>
++  local _exp="$1" _src="$2" _txt="$3" _desc="$4" _story _got
++  _story=$(jq -cn --arg t "$_txt" '{title:"x",description:$t}')
++  _got=$(run_dest "$_story" "$_src" 2>/dev/null)
++  if [ "$_got" = "$_exp" ]; then ok "$_desc"; else bad "$_desc — expected '$_exp', got '$_got'"; fi
++}
++expect_dest gascity lexbh   'fix lexbh/scripts/x.py; see .gc/system/packs/gastown/agents/dog' \
++  "repro (a): src=lexbh, text names gastown/ as a path -> gascity (gastown is dog-routed: not a valid destination)"
++expect_dest gascity gastown 'fix lexbh/scripts/x.py; see .gc/system/packs/gastown/agents/dog' \
++  "repro (a) mirror: same text, src=gastown -> gascity, NOT lexbh (the loop lexbh -> gastown -> lexbh is closed on both legs)"
++expect_dest gascity gastown 'tune email marketing/ads copy' \
++  "repro (b): 'marketing/' in prose -> gascity (marketing is dog-routed)"
++expect_dest gascity gastown 'see github.com/athosmartins/lexbh/issues/9' \
++  "repro (c): a github URL containing lexbh/ -> gascity"
++expect_dest whatsapp_automation gastown 'touches lexbh/scripts/x.py and whatsapp_automation/scripts/y.py' \
++  "a dog-routed rig named alongside a readable one is IGNORED, not counted as ambiguity -> the readable rig wins"
++expect_dest whatsapp_automation gastown 'see .gc/worktrees/whatsapp_automation/scripts/x.py' \
++  "a hidden-directory path (.gc/...) is a path, not a hostname -> whatsapp_automation (a leading '.' is not a TLD dot)"
++expect_dest gascity gastown 'newrig/scripts/x.py' \
++  "a rig name the routing table does not know is never a destination (rig_to_builders defaults it to the dog)"
++
++# The anchor: the rig must be a path COMPONENT of a path-shaped token, not a substring of one.
++expect_dest gascity gastown 'see https://github.com/athosmartins/whatsapp_automation/issues/9' \
++  "a full URL naming a readable rig is not a path token -> gascity"
++expect_dest gascity gastown 'see github.com/athosmartins/whatsapp_automation/issues/9' \
++  "a bare host.tld/... URL naming a readable rig is not a path token -> gascity"
++expect_dest gascity gastown 'git clone git@github.com:athosmartins/whatsapp_automation/x.git' \
++  "an scp-style remote is not a path token -> gascity"
++expect_dest gascity gastown 'the foo_whatsapp_automation/x.py helper is unrelated' \
++  "a rig name that is only a SUFFIX of another word ('foo_whatsapp_automation/') does not match -> gascity"
++expect_dest whatsapp_automation gastown 'bug in /Users/athos/gt/whatsapp_automation/scripts/x.py' \
++  "an absolute path with the rig as a middle component matches -> whatsapp_automation"
++expect_dest property_scrapers gastown 'bug in ~/gt/property_scrapers/lib/y.py' \
++  "a ~/ path matches (the '~' is quoted in the case pattern; unquoted it would tilde-expand to \$HOME and never match) -> property_scrapers"
++expect_dest whatsapp_automation gastown 'corrigir o erro em whatsapp_automation/scripts/x.py — não é urgente, ação simples' \
++  "accented Portuguese around the token does not break tokenizing (LC_ALL=C tr) -> whatsapp_automation"
++expect_dest whatsapp_automation gastown 'ver "whatsapp_automation/scripts/x.py", (linha 9)' \
++  "quotes/parens/commas delimit the token -> whatsapp_automation"
++
++# gc rig list failing must be ANNOUNCED, not silently read as "no other rig was named".
++RIGFAIL_OUT=$(PILOT_RIG_PATHS_JSON="" bash -c "warn() { echo \"WARN: \$*\" >&2; }
++gc_json_or_unknown() { return 1; }
++GC_CITY=/nonexistent
++$FN_PRELUDE"'
++_pilot_dog_store_blind_migrate_dest "{\"title\":\"x\",\"description\":\"whatsapp_automation/scripts/x.py\"}" gastown' 2>&1)
++case "$RIGFAIL_OUT" in
++  *"could not list rigs"*gascity) ok "gc rig list failure -> destination defaults to gascity AND says why (not silent)" ;;
++  *) bad "gc rig list failure -> expected a 'could not list rigs' WARN then 'gascity', got: $RIGFAIL_OUT" ;;
++esac
++
+ echo ""
+ echo "=== Part B: _pilot_migrate_dog_store_blind_bead (needs a fake bd) ==="
+ 
+@@ -166,6 +253,7 @@ case "$verb" in
+         happy|close_fails)        printf '[{"id":"ORIG-1","status":"open","assignee":null}]'; exit 0 ;;
+         raced_status)             printf '[{"id":"ORIG-1","status":"closed","assignee":null}]'; exit 0 ;;
+         raced_assignee)           printf '[{"id":"ORIG-1","status":"open","assignee":"some-other-dog"}]'; exit 0 ;;
++        already_migrated_live)    printf '[{"id":"ORIG-1","status":"open","assignee":null,"metadata":{"gc.migrated_from":"PREV-0","gc.migrated_from_rig":"lexbh"}}]'; exit 0 ;;
+         *)                        printf '[{"id":"ORIG-1","status":"open","assignee":null}]'; exit 0 ;;
+       esac
+     elif [ "$id" = "NEW-1" ]; then
+@@ -205,16 +293,31 @@ BDEOF
+ 
+ STORY_JSON='{"id":"ORIG-1","title":"daemon gap bug","priority":2,"issue_type":"bug","description":"gap beads never self-close","labels":["lane:small"]}'
+ 
+-run_migrate() { # run_migrate <scenario>
+-  local _scenario="$1" _bin
++run_migrate() { # run_migrate <scenario> [<story_json>]
++  local _scenario="$1" _story="${2:-$STORY_JSON}" _bin
+   _bin=$(fake_bd "$_scenario")
+   PATH="$_bin:$PATH" PILOT_RIG_PATHS_JSON="$FAKE_RIGS_JSON" GC_CITY="$WORK/gascity" \
+     bash -c "
+ warn() { echo \"WARN: \$*\" >&2; }
+ log()  { echo \"LOG: \$*\"; }
+-$RIGPATH_FN
+-$DEST_FN
+-$MIGRATE_FN
++$FN_PRELUDE
++_pilot_migrate_dog_store_blind_bead 'ORIG-1' '$_story' '$WORK/gastown' 'gastown' 'lane:small'
++"
++}
++
++# run_migrate_cold <scenario> — same, but the rig-list memo starts EMPTY and `gc rig list` is a counting
++# stub, so the number of times the migration pays for it (8-17s each under Dolt load) is observable.
++GCLIST_COUNT="$WORK/gclist.count"
++run_migrate_cold() {
++  local _scenario="$1" _bin
++  _bin=$(fake_bd "$_scenario")
++  : > "$GCLIST_COUNT"
++  PATH="$_bin:$PATH" PILOT_RIG_PATHS_JSON="" GC_CITY="$WORK/gascity" FAKE_RIGS_JSON="$FAKE_RIGS_JSON" GCLIST_COUNT="$GCLIST_COUNT" \
++    bash -c "
++warn() { echo \"WARN: \$*\" >&2; }
++log()  { echo \"LOG: \$*\"; }
++gc_json_or_unknown() { echo x >> \"\$GCLIST_COUNT\"; printf '%s' \"\$FAKE_RIGS_JSON\"; }
++$FN_PRELUDE
+ _pilot_migrate_dog_store_blind_bead 'ORIG-1' '$STORY_JSON' '$WORK/gastown' 'gastown' 'lane:small'
+ "
+ }
+@@ -329,6 +432,74 @@ else
+   bad "close-refused race -> expected label-then-close retraction on NEW-1, got: $(cat "$CALLLOG" | tr '\n' '|')"
+ fi
+ 
++# ── gate-review ga-tguml6, blocking issue 2 — one hop only (gc.migrated_from) ──
++# Scenario 7: the sweep SNAPSHOT already says this story is a migration's copy -> refuse before ANY bd call.
++MIG_STORY='{"id":"ORIG-1","title":"daemon gap bug","priority":2,"issue_type":"bug","description":"gap","labels":[],"metadata":{"gc.migrated_from":"PREV-0","gc.migrated_from_rig":"lexbh"}}'
++OUT=$(run_migrate "happy" "$MIG_STORY" 2>/dev/null); RC=$?; CALLLOG="$(calllog_for happy)"
++if [ "$RC" = "1" ] && [ -z "$OUT" ]; then
++  ok "already migrated (snapshot carries gc.migrated_from) -> refuses, returns 1, echoes nothing (caller parks)"
++else
++  bad "already migrated (snapshot) -> expected rc=1 empty, got rc=$RC out='$OUT'"
++fi
++if [ -s "$CALLLOG" ]; then
++  bad "already migrated (snapshot) -> REGRESSION: it still called bd: $(tr '\n' '|' < "$CALLLOG")"
++else
++  ok "already migrated (snapshot) -> NO bd call at all (refused before reading or writing anything)"
++fi
++
++# Scenario 8: the snapshot is clean but the LIVE record carries the marker (a snapshot may omit metadata).
++OUT=$(run_migrate "already_migrated_live" 2>/dev/null); RC=$?; CALLLOG="$(calllog_for already_migrated_live)"
++if [ "$RC" = "1" ] && [ -z "$OUT" ]; then
++  ok "already migrated (only the LIVE bd show carries gc.migrated_from) -> refuses, returns 1"
++else
++  bad "already migrated (live) -> expected rc=1 empty, got rc=$RC out='$OUT'"
++fi
++if grep -qE '^(create|close|label|update)\|' "$CALLLOG"; then
++  bad "already migrated (live) -> REGRESSION: it wrote something: $(tr '\n' '|' < "$CALLLOG")"
++else
++  ok "already migrated (live) -> only the re-check read happened; no create/close/label/update"
++fi
++
++# Scenario 9: unreadable metadata is a THIRD state, and it must not collapse into 'no marker'.
++BAD_META_STORY='{"id":"ORIG-1","title":"daemon gap bug","priority":2,"issue_type":"bug","description":"gap","labels":[],"metadata":"oops-a-string"}'
++OUT=$(run_migrate "happy" "$BAD_META_STORY" 2>/dev/null); RC=$?
++[ "$RC" = "1" ] && [ -z "$OUT" ] \
++  && ok "metadata present but not an object (can't tell) -> refuses (inert), never treated as 'no marker'" \
++  || bad "unreadable metadata -> expected refusal, got rc=$RC out='$OUT'"
++
++# Scenario 10: refusing must not be over-broad — empty/unrelated metadata still migrates.
++for _m in '{}' 'null' '{"pilot.dispatched_at":"1"}'; do
++  _st=$(jq -cn --argjson m "$_m" '{id:"ORIG-1",title:"daemon gap bug",priority:2,issue_type:"bug",description:"gap",labels:[],metadata:$m}')
++  OUT=$(run_migrate "happy" "$_st" 2>/dev/null); RC=$?
++  [ "$RC" = "0" ] && [ "$OUT" = "NEW-1" ] \
++    && ok "metadata=$_m (no gc.migrated_from) -> still migrates (the hop guard is not over-broad)" \
++    || bad "metadata=$_m -> expected a normal migration, got rc=$RC out='$OUT'"
++done
++
++# Scenario 11: round trip — the marker the migration WRITES is the one the guard READS. A rename on
++# either side would leave the guard matching nothing and the ping-pong open, with every other test green.
++run_migrate "happy" >/dev/null 2>&1; CALLLOG="$(calllog_for happy)"
++WRITTEN_META=$(grep -E '^create\|' "$CALLLOG" | head -1 | sed -n 's/.*--metadata \({[^ ]*}\).*/\1/p')
++if [ -n "$WRITTEN_META" ] && printf '%s' "$WRITTEN_META" | jq -e 'has("gc.migrated_from")' >/dev/null 2>&1; then
++  COPY_JSON=$(jq -cn --argjson m "$WRITTEN_META" '{id:"NEW-1",title:"t",metadata:$m}')
++  if bash -c "$MIGRATED_FN"'
++_pilot_story_already_migrated "$1"' _ "$COPY_JSON"; then
++    ok "round trip: the metadata the migration stamps on a copy IS refused by _pilot_story_already_migrated"
++  else
++    bad "round trip: the copy's stamped metadata ($WRITTEN_META) is NOT recognised as already-migrated — writer/reader key drifted"
++  fi
++else
++  bad "round trip: could not extract the --metadata JSON the migration passes to bd create (got '$WRITTEN_META')"
++fi
++
++# Scenario 12: the rig-list memo is warmed ONCE in the migration's own shell (was: picker + caller each paid).
++OUT=$(run_migrate_cold "happy" 2>/dev/null); RC=$?
++N_GCLIST=$(wc -l < "$GCLIST_COUNT" | tr -d ' ')
++[ "$RC" = "0" ] && [ "$OUT" = "NEW-1" ] && ok "cold rig-list memo: the migration still succeeds" \
++                                        || bad "cold rig-list memo -> expected rc=0 out=NEW-1, got rc=$RC out='$OUT'"
++[ "$N_GCLIST" = "1" ] && ok "cold rig-list memo: exactly ONE 'gc rig list' for the whole migration (was two: the picker's subshell memo was thrown away)" \
++                      || bad "cold rig-list memo: expected exactly 1 'gc rig list', got $N_GCLIST"
++
+ echo ""
+ echo "=== Drift-guards: call-site wiring in dispatch_one()'s crew arm ==="
+ has 'PILOT_DOG_STORE_AUTOMIGRATE:-1'                                     "call site respects PILOT_DOG_STORE_AUTOMIGRATE kill switch (default on), independent of PILOT_DOG_STORE_GUARD"
+diff --git a/.gascity-gastown-hq/packs/town-deltas/assets/pilot-dispatcher.sh b/.gascity-gastown-hq/packs/town-deltas/assets/pilot-dispatcher.sh
+index 95259ca39..365b78a35 100755
+--- a/.gascity-gastown-hq/packs/town-deltas/assets/pilot-dispatcher.sh
++++ b/.gascity-gastown-hq/packs/town-deltas/assets/pilot-dispatcher.sh
+@@ -6482,24 +6482,92 @@ _pilot_dog_store_blind_guard() {
+   return 1
+ }
+ 
++# _pilot_text_names_rig_path <text> <rig> — ga-6u64fm: exit 0 iff <text> holds a
++# literal PATH TOKEN that names <rig> as a directory component
++# ("whatsapp_automation/scripts/x.py", "~/gt/whatsapp_automation/x",
++# "/Users/athos/gt/whatsapp_automation/scripts/"). Exit 1 otherwise.
++#
++# Replaces a bare substring test (*"$rig"/*) that counted ANY "<rig>/" anywhere
++# in the prose — "github.com/athosmartins/lexbh/issues/9", a pack path that
++# happens to contain the word, a sentence about "marketing/ads" — as evidence
++# that the rig owns the code (gate-review ga-tguml6, verified by execution).
++# The text is split into tokens on every byte that cannot be part of a path
++# (LC_ALL=C: the descriptions are Portuguese, and a locale-aware tr would choke
++# on the accents instead of splitting there), then each token is judged alone:
++#   - contains "://"                          -> a URL, never a repo path
++#   - bare "host.tld/..." (first component has a "." that is not its first
++#     character, and the token is not explicitly absolute/relative: "/", "./",
++#     "../", "~/")  -> a hostname/URL. A leading "." is a hidden directory
++#     (".gc/system/packs/gastown/..."), which IS a path, so it is kept.
++#   - otherwise the rig must be the FIRST component ("<rig>/...") or any inner
++#     one ("<...>/<rig>/..."); a bare mention with no trailing "/" never counts.
++# "~" is quoted in its case pattern on purpose: an unquoted leading ~ in a case
++# pattern is tilde-expanded to $HOME, which would silently stop matching the
++# literal "~/gt/..." this branch exists for.
++_pilot_text_names_rig_path() {
++  local _text="$1" _rig="$2" _tok _first
++  [ -z "$_rig" ] && return 1
++  while IFS= read -r _tok; do
++    [ -z "$_tok" ] && continue
++    case "$_tok" in
++      *://*) continue ;;
++    esac
++    case "$_tok" in
++      /*|./*|../*|'~'/*) : ;;
++      *)
++        _first="${_tok%%/*}"
++        case "$_first" in
++          .*) : ;;         # a hidden directory (".gc/...", ".git/..."), not a hostname
++          *.*) continue ;;
++        esac
++        ;;
++    esac
++    case "$_tok" in
++      "$_rig"/*|*/"$_rig"/*) return 0 ;;
++    esac
++  done <<EOF_TOKENS
++$(printf '%s' "$_text" | LC_ALL=C tr -c 'A-Za-z0-9_./~:@+-' '\n')
++EOF_TOKENS
++  return 1
++}
++
+ # _pilot_dog_store_blind_migrate_dest <story_json> <src_rig> — ga-6u64fm: pick
+ # the destination rig NAME for an auto-migration out of a dog-store-blind
+ # situation (_pilot_dog_store_blind_guard above). Mirrors the judgment the
+ # Mayor already made BY HAND twice (gt-c1x1j -> gascity/HQ, since its fix
+ # lives in packs/town-deltas/assets; gt-1u1u2 -> whatsapp_automation, since
+ # its fix lives in that rig's own scripts/): if the bead's own title+
+-# description names exactly ONE other registered rig's directory as a
+-# literal path token (e.g. "whatsapp_automation/scripts/..."), that rig
+-# owns the code and is the destination. Zero or more-than-one match
+-# defaults to "gascity" (HQ) — the one store every dog AND the Mayor can
+-# read, so a wrong/ambiguous guess never strands the bead worse than
+-# before; it just means a human may still need to re-route it further,
+-# exactly as already happens today via the park path this replaces.
++# description names exactly ONE other registered rig's directory as a literal
++# path token (_pilot_text_names_rig_path above), that rig owns the code and is
++# the destination. Zero or more-than-one match defaults to "gascity" (HQ) —
++# the one store every dog AND the Mayor can read.
++#
++# A candidate rig must ITSELF be readable by its own builder. rig_to_builders
++# maps gastown, lexbh and marketing (and any unregistered name) to gastown.dog
++# — the exact builder whose probe cannot read a rig store, i.e. the premise of
++# ga-cszxcf. Migrating INTO such a rig only relocates the blindness, and worse:
++# the copy keeps the original text verbatim, so it would be re-routed to the
++# dog, hit the guard again and hop on (gate-review ga-tguml6: one new bead per
++# 5-minute sweep, lexbh -> gastown -> lexbh -> ...). So the destination's
++# readability is CHECKED with the same predicate that made the source blind
++# (_pilot_dog_store_blind_guard applied to that rig's own builder) — never
++# assumed, and never a second list that could drift from the routing table.
++# Today that leaves whatsapp_automation and property_scrapers (own worker
++# pools) plus HQ; a rig added to rig_to_builders later is judged the same way.
++# A wrong pick among those is still worked by a builder that can see the bead
++# (the original text is preserved in the copy, so it can be re-routed) — it
++# is never stranded unreadable; that, and only that, is what the HQ default
++# and the readable-only filter guarantee.
+ _pilot_dog_store_blind_migrate_dest() {
+   local _story_json="$1" _src_rig="$2"
+   local _text
+   _text=$(printf '%s' "$_story_json" | jq -r '(.title // "") + "\n" + (.description // "")' 2>/dev/null || echo "")
+   [ -z "$PILOT_RIG_PATHS_JSON" ] && rig_root_path "gascity" >/dev/null 2>&1   # force memoization
++  if [ -z "$PILOT_RIG_PATHS_JSON" ]; then
++    # Not silent: "could not list rigs" must not read, in the log, as "no other
++    # rig was named" — both end at HQ, for different reasons.
++    warn "ga-6u64fm: could not list rigs (gc rig list failed or was empty) — migration destination defaults to HQ (gascity); it was NOT chosen from the bead's text." >&2
++  fi
+   local _names
+   _names=$(printf '%s' "$PILOT_RIG_PATHS_JSON" | jq -r '.rigs[]?.name' 2>/dev/null || echo "")
+   local _match="" _match_count=0 _n
+@@ -6510,12 +6578,13 @@ _pilot_dog_store_blind_migrate_dest() {
+     [ -z "$_n" ] && continue
+     [ "$_n" = "gascity" ] && continue
+     [ "$_n" = "$_src_rig" ] && continue
+-    case "$_text" in
+-      *"$_n"/*)
+-        _match="$_n"
+-        _match_count=$((_match_count + 1))
+-        ;;
+-    esac
++    if _pilot_dog_store_blind_guard "$(rig_to_builder "$_n")" 1; then
++      continue   # a bead in _n's store would be exactly as unreadable as the source's
++    fi
++    if _pilot_text_names_rig_path "$_text" "$_n"; then
++      _match="$_n"
++      _match_count=$((_match_count + 1))
++    fi
+   done <<EOF_RIGNAMES
+ $_names
+ EOF_RIGNAMES
+@@ -6526,6 +6595,34 @@ EOF_RIGNAMES
+   fi
+ }
+ 
++# _pilot_story_already_migrated <bead_json> — ga-6u64fm: exit 0 (REFUSE a
++# further migration) iff the bead already carries the gc.migrated_from marker
++# the migration itself stamps on every copy, OR that can't be told (input not
++# JSON, metadata present but not an object). Exit 1 (proceed) only for a
++# readable bead that positively lacks the marker (absent/empty metadata).
++# Accepts either a bare object or the one-element array `bd show --json` prints.
++#
++# One hop only: a copy that lands somewhere it still cannot be served must be
++# PARKED for a human, not migrated again. The destination filter in
++# _pilot_dog_store_blind_migrate_dest already closes the known loop; this is the
++# backstop for the loops nobody has thought of yet (a routing-table change, a
++# stale rig list) — before it, nothing read gc.migrated_from at all, so a
++# regression could hop one new bead per sweep indefinitely. Three states, not
++# a boolean: unreadable is treated like present (inert: park), never like absent.
++_pilot_story_already_migrated() {
++  local _rc
++  printf '%s' "${1:-}" | jq -e '
++    (if type == "array" then .[0] else . end)
++    | (.metadata // {})
++    | if type == "object" then has("gc.migrated_from") else error("metadata is not an object") end
++  ' >/dev/null 2>&1
++  _rc=$?
++  case "$_rc" in
++    1) return 1 ;;   # jq -e: false — readable, no marker
++    *) return 0 ;;   # true (marker present) or >=2 (error / not JSON): refuse
++  esac
++}
++
+ # _pilot_migrate_dog_store_blind_bead <story_id> <story_json> <src_city>
+ # <src_rig> <story_labels_csv> — ga-6u64fm: auto-migrate a rig-native bead
+ # the dog pool can never see (per _pilot_dog_store_blind_guard) into a store
+@@ -6534,7 +6631,13 @@ EOF_RIGNAMES
+ # fallback on any abort/failure below — this function can never leave a
+ # bead worse off than that already-safe behavior).
+ #
+-# Destination: _pilot_dog_store_blind_migrate_dest above.
++# Destination: _pilot_dog_store_blind_migrate_dest above (only ever a store some
++# builder can read: HQ, or a rig whose own builder is not the dog).
++#
++# The copy is a plain new bead: it does NOT inherit the original's parent/epic
++# link or dependency edges, and closing the original counts as a closed child
++# of any parent epic it had (same as the two manual moves this automates:
++# gt-c1x1j, gt-1u1u2). One hop only — see _pilot_story_already_migrated.
+ #
+ # Race safety (bead-migration-copy-races memory; a real 2026-09-15 incident
+ # where a hand-migration created an orphan duplicate because a dog claimed
+@@ -6565,6 +6668,17 @@ EOF_RIGNAMES
+ _pilot_migrate_dog_store_blind_bead() {
+   local _story_id="$1" _story_json="$2" _src_city="$3" _src_rig="$4" _story_labels="${5:-}"
+ 
++  # One hop only (gate-review ga-tguml6): a story that is ITSELF an earlier
++  # migration's copy — it carries gc.migrated_from — and is dog-store-blind
++  # AGAIN is parked for a human, never migrated a second time. Checked on the
++  # sweep snapshot here and on the live record below (the snapshot may omit
++  # metadata; the live `bd show` is the authoritative record). Refusing writes
++  # nothing, so the caller's unchanged park path is the outcome.
++  if _pilot_story_already_migrated "$_story_json"; then
++    warn "ga-6u64fm: $_story_id already carries gc.migrated_from (or its metadata is unreadable) — refusing a SECOND auto-migration (ping-pong guard), falling back to park." >&2
++    return 1
++  fi
++
+   # Re-check FRESH — never trust the sweep-start snapshot for a write this
+   # consequential (same discipline as _pilot_routed_to_pool_guard above).
+   local _live_json _live_status _live_assignee
+@@ -6575,6 +6689,16 @@ _pilot_migrate_dog_store_blind_bead() {
+     warn "ga-6u64fm: $_story_id changed since dispatch selection (status=${_live_status:-<unreadable>} assignee=${_live_assignee:-<none>}) — skipping auto-migration, falling back to park." >&2
+     return 1
+   fi
++  if _pilot_story_already_migrated "$_live_json"; then
++    warn "ga-6u64fm: $_story_id's LIVE record carries gc.migrated_from (or is unreadable) — refusing a SECOND auto-migration (ping-pong guard), falling back to park." >&2
++    return 1
++  fi
++
++  # Warm the rig-list memo in THIS shell, once. rig_root_path memoizes into a
++  # global, and a `$(...)` call site runs in a subshell that throws the memo
++  # away — so the destination picker and the rig_root_path call below would each
++  # pay their own `gc rig list` (8-17s under Dolt load) on the dispatch path.
++  [ -z "${PILOT_RIG_PATHS_JSON:-}" ] && rig_root_path "gascity" >/dev/null 2>&1
+ 
+   local _dest_rig _dest_city
+   _dest_rig=$(_pilot_dog_store_blind_migrate_dest "$_story_json" "$_src_rig")
+@@ -10351,6 +10475,14 @@ TASK
+             log "  ga-6u64fm: $STORY_ID auto-migrated to $_MIGRATED_ID — original closed, no park needed (set PILOT_DOG_STORE_AUTOMIGRATE=0 to disable)."
+             bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+             bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
++            # Classified as refused_by_guard in _pilot_sweep_emit (a success is NOT a Pilot
++            # fault; the sweep-event selftest B4 fails until every new name is classified).
++            # Still `return 1` and still counted in NONQUEUE_FAILS on purpose: nothing was
++            # DISPATCHED, and the Step 5 "estagnado" streak is exactly what would notice a
++            # migration loop (dispatched=0 with free slots, sweep after sweep) if a future
++            # regression ever re-created one. A single migration cannot trip it alone — the
++            # alert needs PILOT_STALL_ALERT_CAP (3) consecutive empty sweeps, and the copy
++            # dispatches from its new (builder-readable) store on the next sweep, which resets it.
+             DISPATCH_RESULT="rig_native_dog_store_migrated"
+             return 1
+           fi
+@@ -11061,8 +11193,11 @@ DISPATCH_RESULT=""   # ga-ov3gow: global on purpose — set by dispatch_one(), r
+ #   queued_pool_cap     left queued behind a full wa-worker/ps-worker pool (pre-claim skip OR in-arm cap)
+ #   queued_global_cap   left queued behind the combined ga-jezvn session cap — a different cause, kept apart
+ #   spawn_failed        the worker session could not be spawned
+-#   refused_by_guard    {<DISPATCH_RESULT of the guard>: n} — a deliberate refusal, not a fault
+-#   failed_other        any other NAMED failure (assign / sling / in-flight) and any name not classified here
++#   refused_by_guard    {<DISPATCH_RESULT of the guard>: n} — a deliberate refusal, not a fault. Includes
++#                       rig_native_dog_store_migrated (ga-6u64fm): the dog-store guard REFUSED the dispatch and
++#                       RESOLVED it by moving the bead to a store a builder reads — the benign end of the same
++#                       guard whose park end is rig_native_dog_store_blind; the tally key tells the two apart.
++#   failed_other       any other NAMED failure (assign / sling / in-flight) and any name not classified here
+ #   unclassified        dispatch_one() returned non-zero WITHOUT naming a result (its early guards, a lost
+ #                       claim, a hold): counted so the accounting closes — never read as a success
+ #   pool_saturated      the ga-in9ebr predicate (_pool_saturated_sweep); consumers must not re-derive it
+@@ -11105,7 +11240,7 @@ _pilot_sweep_emit() {
+       elif $o.r == "rig_native_pool_session_cap_queued" then "queued_pool_cap"
+       elif $o.r == "rig_native_global_session_cap_queued" then "queued_global_cap"
+       elif $o.r == "rig_native_spawn_failed" then "spawn_failed"
+-      elif ["pool_ownership_refuse", "rig_native_dog_store_blind", "rig_native_pool_target_only", "rig_dedup_skip"]
++      elif ["pool_ownership_refuse", "rig_native_dog_store_blind", "rig_native_dog_store_migrated", "rig_native_pool_target_only", "rig_dedup_skip"]
+            | any(.[]; . == $o.r) then "refused_by_guard"
+       elif $o.r == "" then "unclassified"
+       else "failed_other" end;
+diff --git a/.gascity-gastown-hq/packs/town-deltas/assets/pilot-dispatcher.sweep-event.selftest.sh b/.gascity-gastown-hq/packs/town-deltas/assets/pilot-dispatcher.sweep-event.selftest.sh
+index 1763c5018..f7c7b7086 100644
+--- a/.gascity-gastown-hq/packs/town-deltas/assets/pilot-dispatcher.sweep-event.selftest.sh
++++ b/.gascity-gastown-hq/packs/town-deltas/assets/pilot-dispatcher.sweep-event.selftest.sh
+@@ -146,17 +146,19 @@ b12 1 sling_no_bead_id
+ b13 1 sling_phantom_bead
+ b14 1 inflight_unconfirmed
+ b15 1
+-b16 1 some_future_result'
++b16 1 some_future_result
++b17 1 rig_native_dog_store_migrated'
+ run_sweep "$BATCH" >/dev/null 2>&1
+ echo "=== A2: one bead per real exit ==="
+-expect '.candidates' '16'          "A2: 16 candidates evaluated"
++expect '.candidates' '17'          "A2: 17 candidates evaluated"
+ expect '.dispatched' '2'           "A2: rc=0 → dispatched (rig_native_ok, sling_ok)"
+ expect '.queued_pool_cap' '2'      "A2: pool session cap → queued_pool_cap, counted per bead"
+ expect '.queued_global_cap' '1'    "A2: global (ga-jezvn) cap → queued_global_cap, SEPARATE from the pool cap (different causes)"
+ expect '.spawn_failed' '1'         "A2: rig_native_spawn_failed → spawn_failed"
+-expect '.refused_by_guard' '{"pool_ownership_refuse":1,"rig_dedup_skip":1,"rig_native_dog_store_blind":1,"rig_native_pool_target_only":1}' \
+-                                   "A2: each guard refusal is counted UNDER THE GUARD'S NAME"
+-expect '.failed_other' '5'         "A2: assign/sling/inflight failures and an UNKNOWN name → failed_other (unknown is never a success)"
++expect '.refused_by_guard' '{"pool_ownership_refuse":1,"rig_dedup_skip":1,"rig_native_dog_store_blind":1,"rig_native_dog_store_migrated":1,"rig_native_pool_target_only":1}' \
++                                   "A2: each guard refusal is counted UNDER THE GUARD'S NAME (incl. ga-6u64fm's migrated: the guard RESOLVED the refusal)"
++expect '.refused_by_guard.rig_native_dog_store_migrated' '1' "A2: a successful auto-migration (ga-6u64fm) is a guard outcome, NOT a Pilot fault (B4 caught it landing in failed_other)"
++expect '.failed_other' '5'         "A2: assign/sling/inflight failures and an UNKNOWN name → failed_other (unknown is never a success; rig_native_dog_store_migrated is NOT in it)"
+ expect '.unclassified' '1'         "A2: non-zero exit with NO named result → unclassified (not dropped, not called a success)"
+ expect '.results.some_future_result' '1' "A2: an unknown result still shows up BY NAME in results (the next vocabulary drift explains itself)"
+ expect '.results.rig_native_pool_session_cap_queued' '2' "A2: results is the per-name ground truth (same vocabulary as pilot_dispatch.result)"
+@@ -276,7 +278,7 @@ fi
+ # B4 — drift guard. A new DISPATCH_RESULT literal that is not classified would silently land in
+ # failed_other: a BENIGN new state (e.g. another kind of queue) would then read as a Pilot failure on
+ # the painel. Adding a result now means classifying it in _pilot_sweep_emit AND listing it here.
+-KNOWN_RESULTS=" sling_ok rig_native_ok dry_run rig_native_pool_session_cap_queued rig_native_global_session_cap_queued rig_native_spawn_failed pool_ownership_refuse rig_native_dog_store_blind rig_native_pool_target_only rig_dedup_skip rig_assign_failed sling_no_bead_id sling_phantom_bead inflight_unconfirmed "
++KNOWN_RESULTS=" sling_ok rig_native_ok dry_run rig_native_pool_session_cap_queued rig_native_global_session_cap_queued rig_native_spawn_failed pool_ownership_refuse rig_native_dog_store_blind rig_native_dog_store_migrated rig_native_pool_target_only rig_dedup_skip rig_assign_failed sling_no_bead_id sling_phantom_bead inflight_unconfirmed "
+ unclassified_names=""
+ for _lit in $(grep -oE 'DISPATCH_RESULT="[a-z_0-9]+"' "$DISPATCHER" | sed 's/.*="//; s/"$//' | sort -u); do
+   case "$KNOWN_RESULTS" in *" $_lit "*) : ;; *) unclassified_names="$unclassified_names $_lit" ;; esac
+@@ -286,7 +288,7 @@ done
+ # … and the names the emitter classifies explicitly must still be REAL names (a rename in dispatch_one
+ # would otherwise leave the emitter matching nothing and everything falling into failed_other).
+ for _nm in rig_native_pool_session_cap_queued rig_native_global_session_cap_queued rig_native_spawn_failed \
+-           pool_ownership_refuse rig_native_dog_store_blind rig_native_pool_target_only rig_dedup_skip; do
++           pool_ownership_refuse rig_native_dog_store_blind rig_native_dog_store_migrated rig_native_pool_target_only rig_dedup_skip; do
+   if grep -q "DISPATCH_RESULT=\"$_nm\"" "$DISPATCHER" && grep -q "$_nm" <<< "$EMIT_FN"; then
+     :
+   else
+-- 
+2.54.0
+

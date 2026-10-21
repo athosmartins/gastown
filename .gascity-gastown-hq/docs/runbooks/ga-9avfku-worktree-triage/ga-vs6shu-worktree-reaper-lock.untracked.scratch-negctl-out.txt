@@ -1,0 +1,99 @@
+── ga-pdrij pool-worktree reaping ──
+  ✓ stale+clean merged pool worktree reaped
+  ✓ merged orphan branch deleted (unblocks _filter_built)
+  ✓ stale+clean unmerged pool worktree reaped
+  ✓ UNMERGED branch KEPT (no data loss)
+  ✓ ga-xv78c: dirty worktree preserved+reaped (disk freed)
+  ✓ dirty worktree's local branch kept
+  ✓ ga-xv78c: dirty WIP preserved to origin before reap (own branch name)
+  ✓ ga-xv78c: preserved commit contains the actual WIP content
+  ✓ fresh worktree KEPT (age gate)
+── ga-xv78c gate-feedback: both-pushes-fail leaves worktree dirty across sweeps ──
+  ✓ gate-feedback: both-pushes-fail worktree survives sweep 1 (not deleted)
+  ✓ gate-feedback: preserve_failed_dirty_kept logged (distinguishable from a routine reap)
+  ✓ gate-feedback: worktree status BYTE-FOR-BYTE unchanged after failed preserve (no premature commit)
+  ✓ gate-feedback: worktree ALSO survives sweep 2 (cross-sweep persistence)
+  ✓ gate-feedback: sweep 2 did NOT silently log it as a routine reap
+  ✓ gate-feedback: sweep 2 retried preserve and logged the failure again (never silently skipped)
+── kill switch (ENABLED=0 = dry) ──
+  ✓ ENABLED=0: stale worktree NOT removed (dry-run)
+  ✓ ENABLED=0: logged would_reap_pool intent
+── per-sweep cap (ga-pdrij backlog drains gradually) ──
+  ✓ cap=2 reaped exactly 2 of 3 (capped)
+  ✓ 1 capped worktree survives this sweep (drains next)
+  ✓ cap-hit logged (no silent truncation)
+── zombie-lock detection (wa-8y45) ──
+  ✓ DEAD-locked worktree reaped
+  ✓ dead's merged crew branch deleted
+  ✓ ANCIENT+IDLE-locked worktree reaped
+  ✓ ancient's NON-crew branch KEPT (no data loss)
+  ✓ YOUNG/ACTIVE-locked worktree KEPT (never reap live agent)
+  ✓ ANCIENT-but-BUSY-locked worktree KEPT (not idle)
+  ✓ gate-review DEAD-locked tree reaped (.gc-worktrees coverage)
+  ✓ UNPARSEABLE lock w/ real unmerged work KEPT (fail-safe)
+  ✗ ga-vs6shu: agent-noreason not logged with the new distinct unparseable event (still collapsed into kept_locked_live?)
+  ✓ unlocked stale+clean .claude/worktrees tree reaped (path coverage)
+  ✓ unlocked's merged crew branch deleted
+  ✓ ga-xv78c: dirty .claude/worktrees tree preserved+reaped
+  ✓ ga-xv78c: dirty WIP preserved to origin (own branch name free → used directly)
+  ✓ ga-xv78c: preserved own-name commit has the real WIP content
+  ✓ reaped_dirty_preserved logged
+  ✓ ga-xv78c: colliding-name dirty tree preserved+reaped (fallback path)
+  ✓ ga-xv78c: pre-existing unrelated origin ref NOT clobbered (no force-push)
+  ✓ ga-xv78c: collision WIP preserved under refs/reclaimed/ fallback
+  ✓ reaped_zombie_lock logged
+  ✓ kept_locked_live logged (live holder)
+── ga-vs6shu: unparseable lock + independently-safe worktree → reaped ──
+  ✗ ga-vs6shu: unparseable+merged+clean+aged lock NOT reaped (the actual measured bug NOT fixed)
+  ✗ ga-vs6shu: merged orphan branch NOT deleted after safety-net reap
+  ✗ ga-vs6shu: safety-net reap not distinctly logged
+── ga-vs6shu: unparseable lock + genuinely UNMERGED work → still kept ──
+  ✓ ga-vs6shu: unparseable+UNMERGED lock KEPT (never lose real work over an unreadable lock reason)
+  ✓ ga-vs6shu: unmerged branch still present (nothing was ever removed)
+── ga-vs6shu: live_session positive detection (session alive, work_dir matches) ──
+  ✓ ga-vs6shu: live_session-confirmed worktree KEPT
+  ✗ ga-vs6shu: live_session verdict not reflected in the log
+── ga-vs6shu: pool-slot-reuse guard (session alive elsewhere, not here) ──
+  ✗ ga-vs6shu: stale lock from a slot busy ELSEWHERE not reaped (pool-slot-reuse guard broken — permanently blocked)
+  ✗ ga-vs6shu: pool-slot-reuse case did not take the expected safety-net path
+── ga-vs6shu: loop-1 (legacy path-glob) unparseable-safe reap coverage ──
+  ✗ ga-vs6shu: loop-1 unparseable+safe lock NOT reaped (call-site wiring drifted from loop 2)
+── zombie kill guard (guarded when ON) ──
+  ✓ crew claude zombie SIGTERM'd (kill enabled)
+  ✓ supervisor/pilot process NOT killed (guard holds)
+  ✓ protected-kill-skip logged
+── zombie kill default-OFF ──
+  ✓ KILL default-OFF: process NOT signaled
+  ✓ kill-off: zombie worktree still reaped (kill is orthogonal)
+── zombie feature kill-switch (ZOMBIE_LOCK_ENABLED=0) ──
+  ✓ ZOMBIE_LOCK_ENABLED=0: dead-locked tree KEPT (old behavior preserved)
+── zombie dry-run (ENABLED=0) ──
+  ✓ ENABLED=0: zombie-locked tree NOT removed (dry-run)
+  ✓ ENABLED=0: logged would_reap_zombie_lock intent
+── independent crew-clone coverage (wa-bptki) ──
+  ✓ fixture precondition: agent-stale worktree exists before reap
+  ✓ independent crew-clone's stale worktree reaped (wa-bptki scope gap fixed)
+  ✓ crew clone's merged orphan branch deleted
+  ✓ crew/worker (no own .git) left alone, no crash
+── ga-0j2zc: gitignored-but-tracked drift excluded from preserve commit ──
+  ✓ ga-0j2zc: dirty worktree with ignored-tracked drift preserved+reaped
+  ✓ ga-0j2zc: preserve commit landed on origin
+  ✓ ga-0j2zc: tracked+ignored file's on-disk DRIFT excluded (preserve kept pre-drift committed content)
+  ✓ ga-0j2zc: tracked+ignored file's on-disk DELETION not swept into the preserve commit
+  ✓ ga-0j2zc: genuine (non-ignored) crew WIP still captured (no ga-xv78c regression)
+  ✓ ga-0j2zc: new untracked file under the ignored dir correctly excluded (pre-existing add -A behavior)
+── ga-t14of: merged-branch age-gate bypass (never while in use) ──
+  ✓ ga-t14of: merged+idle worktree reaped despite being under STALE_HOURS (age-gate bypass works)
+  ✓ ga-t14of: merged+IN-USE worktree KEPT (never reap out from under a live process)
+  ✓ ga-t14of: kept_merged_in_use logged (distinguishable from an ordinary keep)
+  ✓ ga-t14of: freshly-branched (trivially merged) worktree KEPT (grace period protects not-yet-started work)
+── ga-t14of: WT_DIRS multi-root scan (.gascity-gastown-hq nesting) ──
+  ✓ ga-t14of: flat-root ($GT/.gc-worktrees) stale worktree reaped (loop-1 baseline holds)
+  ✓ ga-t14of: nested-root (.gascity-gastown-hq/.gc-worktrees) merged worktree reaped — coverage gap closed
+  ✓ ga-t14of: nested-root merged+IN-USE worktree KEPT (in-use protection applies via loop 1 too)
+── ga-t14of gate-feedback: real (non-fake) lsof path, fail-safe on error/empty ──
+  ✓ gate-feedback: real lsof exit!=0-but-matched → still read as in-use (pipefail-inversion fixed)
+  ✓ gate-feedback: real lsof with ZERO output fails SAFE (kept, not silently reaped)
+  ✓ gate-feedback: real lsof clean-exit + genuine non-match correctly reaped (no over-conservative regression)
+
+── RESULTS: 70 passed, 8 failed ──

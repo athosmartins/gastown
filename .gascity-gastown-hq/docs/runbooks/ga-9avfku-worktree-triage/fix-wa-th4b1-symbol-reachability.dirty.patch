@@ -1,0 +1,106 @@
+diff --git a/.gascity-gastown-hq/packs/town-deltas/assets/compute-symbol-reachability.selftest.sh b/.gascity-gastown-hq/packs/town-deltas/assets/compute-symbol-reachability.selftest.sh
+index 0b9e540e0..e981a44ff 100755
+--- a/.gascity-gastown-hq/packs/town-deltas/assets/compute-symbol-reachability.selftest.sh
++++ b/.gascity-gastown-hq/packs/town-deltas/assets/compute-symbol-reachability.selftest.sh
+@@ -4,8 +4,11 @@
+ # Proves compute_symbol_reachability.py against the three live cases the bead
+ # measured (see that script's module docstring for the full incident writeup):
+ #   T1 — Case 1 (thies-wa, wa-d23f1, Ficha 360): a daemon that imports an
+-#        UNCHANGED function which internally calls a newly-added one IS
+-#        reported reachable; a sibling daemon that imports a DIFFERENT,
++#        UNCHANGED function (build_perfil) whose own body calls another
++#        unchanged-NAMED function (_augment_perfil) whose BODY now calls a
++#        newly-added one (get_consultas) IS reported reachable — via the
++#        intra-file call graph, not a direct name match, since build_perfil's
++#        own AST never changed; a sibling daemon that imports a DIFFERENT,
+ #        unchanged symbol from the same file is NOT.
+ #   T2 — Case 3 (Mayor, wa-5792j/wa-fil4i, inbound_sweep): a daemon that
+ #        transitively imports the changed file, but only ever names two
+@@ -47,14 +50,29 @@ mk_repo() {  # mk_repo <name> -> prints repo path
+ }
+ 
+ # ── T1: Case 1 shape (intra-file call-graph hop through an unchanged caller) ──
++# build_perfil's OWN body is byte-identical pre/post (same two calls, to
++# normalize_doc and to _augment_perfil) — the only things that change are
++# (a) get_consultas, a brand-new function, and (b) _augment_perfil's body,
++# which gains the call to it. This is deliberate: it forces T1 to pass ONLY
++# via a real call-graph hop (build_perfil -> _augment_perfil -> get_consultas).
++# The direct used_names-intersect-names_changed short-circuit in
++# entrypoint_reaches_symbol() can never fire here, because the only name
++# ficha360_app.py imports (build_perfil) is not itself in names_changed — if
++# it were (as in an earlier version of this fixture where build_perfil's own
++# body changed), T1 would pass without ever exercising call_graph()/reaches(),
++# the actual mechanism this module adds.
+ R1="$(mk_repo t1)"
+ mkdir -p "$R1/lib" "$R1/daemons"
+ cat > "$R1/lib/ficha360_data.py" <<'PY'
+ def normalize_doc(doc):
+     return doc.strip()
+ 
++def _augment_perfil(perfil, doc):
++    return perfil
++
+ def build_perfil(doc):
+-    return {"doc": normalize_doc(doc)}
++    perfil = {"doc": normalize_doc(doc)}
++    return _augment_perfil(perfil, doc)
+ PY
+ cat > "$R1/daemons/ficha360_app.py" <<'PY'
+ from lib.ficha360_data import build_perfil
+@@ -78,10 +96,13 @@ def normalize_doc(doc):
+ def get_consultas(doc):
+     return {"consultas": []}
+ 
+-def build_perfil(doc):
+-    perfil = {"doc": normalize_doc(doc)}
++def _augment_perfil(perfil, doc):
+     perfil.update(get_consultas(doc))
+     return perfil
++
++def build_perfil(doc):
++    perfil = {"doc": normalize_doc(doc)}
++    return _augment_perfil(perfil, doc)
+ PY
+ git -C "$R1" add -A && git -C "$R1" commit -q -m post
+ POST1="$(git -C "$R1" rev-parse HEAD)"
+@@ -98,7 +119,7 @@ OUT1="$("$PY" "$SCRIPT" --repo "$R1" --deps "$R1/daemons/deploy_deps.json" \
+   --entrypoints daemons/ficha360_app.py daemons/demand_dashboard.py)"
+ 
+ echo "$OUT1" | grep -qxF "daemons/ficha360_app.py" \
+-  && ok "T1: ficha360_app.py (calls build_perfil, which now calls the new get_consultas) reported reachable" \
++  && ok "T1: ficha360_app.py (imports unchanged build_perfil, which calls unchanged-named _augment_perfil, whose body now calls the new get_consultas) reported reachable via the call graph, not the direct short-circuit" \
+   || bad "T1: ficha360_app.py should be reachable via the intra-file call graph — got: [$OUT1]"
+ echo "$OUT1" | grep -qxF "daemons/demand_dashboard.py" \
+   && bad "T1: demand_dashboard.py (only imports the unrelated, unchanged normalize_doc) should NOT be reachable — got: [$OUT1]" \
+diff --git a/.gascity-gastown-hq/packs/town-deltas/assets/daemon-refresh.sh b/.gascity-gastown-hq/packs/town-deltas/assets/daemon-refresh.sh
+index b880739a0..2eb1636cf 100755
+--- a/.gascity-gastown-hq/packs/town-deltas/assets/daemon-refresh.sh
++++ b/.gascity-gastown-hq/packs/town-deltas/assets/daemon-refresh.sh
+@@ -1834,12 +1834,25 @@ elif [ -n "${GUARDED// /}" ]; then
+     <(echo "${GUARDED:-}" | tr ' ' '\n' | grep -v '^$' | sort -u) \
+     <(echo "${AFFECTED_CLOSURE_ONLY:-}" | tr ' ' '\n' | grep -v '^$' | sort -u) \
+     | tr '\n' ' ' | sed 's/ $//')"
++  # ga-<gate-review>: the "Closure-only" sentence used to be nested INSIDE the
++  # GSC_STEP5 (symbol-confirmed) check, so a run with zero symbol-confirmed
++  # daemons but some closure-only-ranked ones showed NO ranking breakdown at
++  # all — GCO_STEP5 had real data, but SR_PREFIX stayed empty and silently
++  # dropped it. Each sentence now depends only on its own list being
++  # non-empty.
+   SR_PREFIX=""
+   if [ -n "${GSC_STEP5// /}" ]; then
+     SR_PREFIX="RANKED (wa-th4b1): confirmed to reach a changed symbol, restart these first:${GSC_STEP5}."
+-    [ -n "${GCO_STEP5// /}" ] && SR_PREFIX="$SR_PREFIX Closure-only (imports the changed file, but no changed symbol was confirmed reachable — lower priority, may be cosmetic):${GCO_STEP5}."
+-    SR_PREFIX="$SR_PREFIX "
+   fi
++  if [ -n "${GCO_STEP5// /}" ]; then
++    CO_TEXT="Closure-only (imports the changed file, but no changed symbol was confirmed reachable — lower priority, may be cosmetic):${GCO_STEP5}."
++    if [ -n "$SR_PREFIX" ]; then
++      SR_PREFIX="$SR_PREFIX $CO_TEXT"
++    else
++      SR_PREFIX="$CO_TEXT"
++    fi
++  fi
++  [ -n "$SR_PREFIX" ] && SR_PREFIX="$SR_PREFIX "
+   emit NEEDS_GUARDED_RESTART "${SR_PREFIX}sensitive hot-path daemon(s) need a guarded restart (import/template-closure match, not proven reachable to the changed symbols — a listed daemon may be a false positive; this is also NOT a full transitive closure — a daemon reached only through a deeper import chain can be missing from this list entirely, a false negative — verify by hand before treating this list as complete):${GUARDED}" not_verified
+ elif [ -n "${RESTARTED// /}" ]; then
+   emit OK "all affected daemons restarted + verified fresh:${RESTARTED}" verified

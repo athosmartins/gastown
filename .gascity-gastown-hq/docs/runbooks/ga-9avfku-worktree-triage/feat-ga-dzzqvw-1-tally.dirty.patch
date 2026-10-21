@@ -1,0 +1,363 @@
+diff --git a/.gascity-gastown-hq/packs/town-deltas/assets/gate-fastlane.lib.sh b/.gascity-gastown-hq/packs/town-deltas/assets/gate-fastlane.lib.sh
+index 0e29c2f8d..e81cd94e8 100644
+--- a/.gascity-gastown-hq/packs/town-deltas/assets/gate-fastlane.lib.sh
++++ b/.gascity-gastown-hq/packs/town-deltas/assets/gate-fastlane.lib.sh
+@@ -906,7 +906,7 @@ gate_fastlane_confirm() {
+ # failed write is logged and never changes the lane. The marker write is READ BACK, because "the command ran" is
+ # not "the field is there".
+ gate_fastlane_record() {
+-  local city="$1" marker="$2" bead="$3" branch="$4" rig="$5" would="$6" qg_log="$7" back=""
++  local city="$1" marker="$2" bead="$3" branch="$4" rig="$5" would="$6" qg_log="$7" back="" trback=""
+   # a reviewer count that is not a number is UNKNOWN, and is written as JSON null: the tally credits a passed fast run whose
+   # decision carries no integer with an assumed 1 and says so in its report (saved_unmatched_assumed_1). Written as 0 it would
+   # read as "this run saved no reviewer" — a measured zero where nothing was measured.
+@@ -914,6 +914,7 @@ gate_fastlane_record() {
+   if [ -n "$marker" ]; then
+     bd -C "$city" update "$marker" --set-metadata "gate.lane=${GATE_LANE}" -q >/dev/null 2>&1 || true
+     bd -C "$city" update "$marker" --set-metadata "gate.lane_reason=$(printf '%s' "$GATE_LANE_REASON" | cut -c1-300)" -q >/dev/null 2>&1 || true
++    # gate.lane_files has two shapes: "CLASS:path; ..." for the DOC/TEST lane, "path:N; ..." (N = lines added+deleted) for a task-rapida grant
+     bd -C "$city" update "$marker" --set-metadata "gate.lane_files=$(gate_fastlane_files_oneline)" -q >/dev/null 2>&1 || true
+     # ga-dzzqvw: the task-rapida lane's own answer (granted, or why it refused). Only when that lane actually decided: a run the fast lane took, or
+     # one from before the lane existed, has no such answer and writes none.
+@@ -921,6 +922,13 @@ gate_fastlane_record() {
+       bd -C "$city" update "$marker" --set-metadata "gate.tr_code=${GATE_TR_CODE}" -q >/dev/null 2>&1 || true
+     fi
+     back=$(bd -C "$city" show "$marker" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .metadata["gate.lane"] // ""' 2>/dev/null) || back=""
++    # an absent gate.tr_code means "the lane did not decide", so a lost write would read as that: read it back like the lane
++    if [ -n "${GATE_TR_CODE:-}" ]; then
++      trback=$(bd -C "$city" show "$marker" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .metadata["gate.tr_code"] // ""' 2>/dev/null) || trback=""
++      if [ "$trback" != "$GATE_TR_CODE" ]; then
++        echo "[gate-fastlane] WARN: tr_code '${GATE_TR_CODE}' NOT confirmed on marker $marker after write (read back: '${trback:-unreadable}') — it reads as 'the lane did not decide'; the jsonl event below still carries it" >&2
++      fi
++    fi
+     if [ "$back" != "$GATE_LANE" ]; then
+       echo "[gate-fastlane] WARN: lane '${GATE_LANE}' NOT confirmed on marker $marker after write (read back: '${back:-unreadable}') — the jsonl event below is still written" >&2
+     fi
+diff --git a/.gascity-gastown-hq/packs/town-deltas/assets/gate-lane-tally.py b/.gascity-gastown-hq/packs/town-deltas/assets/gate-lane-tally.py
+index 3bf1222cf..b4d2c7d7a 100755
+--- a/.gascity-gastown-hq/packs/town-deltas/assets/gate-lane-tally.py
++++ b/.gascity-gastown-hq/packs/town-deltas/assets/gate-lane-tally.py
+@@ -95,6 +95,7 @@ TR_REASON_CODES = {
+     "bad-inputs":        "entrada da decisao vazia",
+     "e5-active":         "rodada com revisor extra do E5",
+     "policy-files":      "diff mexe em arquivo de politica do gate",
++    "gate-files":        "diff mexe em arquivo do proprio gate (gate-*, quality-gate*, review-merge-policy*, pre-gate-*)",
+     "not-task":          "bead de origem nao e task",
+     "type-unreadable":   "tipo do bead de origem ilegivel",
+     "opted-out":         "bead com a label gate:normal-only (pediu o gate normal)",
+diff --git a/.gascity-gastown-hq/packs/town-deltas/assets/gate-lane-tally.selftest.sh b/.gascity-gastown-hq/packs/town-deltas/assets/gate-lane-tally.selftest.sh
+index 1e5da76dc..b59dc0ec7 100755
+--- a/.gascity-gastown-hq/packs/town-deltas/assets/gate-lane-tally.selftest.sh
++++ b/.gascity-gastown-hq/packs/town-deltas/assets/gate-lane-tally.selftest.sh
+@@ -376,7 +376,7 @@ import importlib.util, json, sys
+ s = importlib.util.spec_from_file_location('t', '$TALLY'); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+ print(m.notify_line(json.loads(sys.argv[1])))" "$J3")
+ case "$NL3" in *"task-rapida: 4 concedida(s), 7 não concedida(s), 1ª revisão PASS 2/FAIL 1, mediana 10.0 min, bugs depois 3"*) ok "task-rapida: the notify line (the only thing a human reads) carries the lane's numbers" ;; *) bad "task-rapida: notify line: $NL3" ;; esac
+-[ "$(python3 "$TALLY" --list-tr-codes | wc -l | tr -d ' ')" = "25" ] && python3 "$TALLY" --list-tr-codes | grep -q '^granted	' && ok "task-rapida: --list-tr-codes lists the 25 codes (granted + 24 refusals)" || bad "task-rapida: --list-tr-codes"
++[ "$(python3 "$TALLY" --list-tr-codes | wc -l | tr -d ' ')" = "26" ] && python3 "$TALLY" --list-tr-codes | grep -q '^granted	' && ok "task-rapida: --list-tr-codes lists the 26 codes (granted + 25 refusals)" || bad "task-rapida: --list-tr-codes"
+ 
+ echo
+ echo "== gate-lane-tally.selftest: $PASS passed, $FAIL failed =="
+diff --git a/.gascity-gastown-hq/packs/town-deltas/assets/gate-review-task.lib.sh b/.gascity-gastown-hq/packs/town-deltas/assets/gate-review-task.lib.sh
+index 5bc213738..97224f36e 100644
+--- a/.gascity-gastown-hq/packs/town-deltas/assets/gate-review-task.lib.sh
++++ b/.gascity-gastown-hq/packs/town-deltas/assets/gate-review-task.lib.sh
+@@ -319,7 +319,8 @@ Author (EXCLUDED from reviewing): $AUTHOR
+ Rig: $RIG
+ Branch SHA: $BRANCH_SHA
+ 
+-This is a small task that the gate measured as touching no message sending, no money and no customer data.
++This is a small task: no changed file PATH is on the gate risk list of message sending, money and customer data.
++Only the file paths were checked against that list, not what the code does, so the scope check below is yours to make.
+ It gets ONE short review: the diff below, read adversarially, with your assigned lens.
+ 
+ YOUR REVIEW LENS: $REVIEWER_LENS
+diff --git a/.gascity-gastown-hq/packs/town-deltas/assets/gate-task-rapida-risco.default.txt b/.gascity-gastown-hq/packs/town-deltas/assets/gate-task-rapida-risco.default.txt
+index 53f4be8e3..9c32a333c 100644
+--- a/.gascity-gastown-hq/packs/town-deltas/assets/gate-task-rapida-risco.default.txt
++++ b/.gascity-gastown-hq/packs/town-deltas/assets/gate-task-rapida-risco.default.txt
+@@ -43,3 +43,56 @@ migrations/
+ *.sqlite
+ *.sqlite3
+ *schema*.sql
++
++# --- second pass (ga-dzzqvw.1), measured on the file names of the whatsapp_automation rig: of its 599 code files that look like sending,
++# money or customer data the first list caught 206, this one catches 595 (the 4 left are internal budget / degradation alerters).
++# --- sending messages
++whatsapp
++wpp
++message
++mensagem
++reply
++respon
++sms
++mail
++notif
++webhook
++broadcast
++inbound
++outbound
++enviad
++enviar
++zenvia
++dialer
++escalat
++# --- money
++payment
++invoice
++fatura
++pix
++boleto
++credit
++# --- customer data
++cliente
++customer
++crm
++contact
++deal
++phone
++telefone
++cpf
++cnpj
++pessoa
++person
++motherduck
++procob
++owner
++
++[whatsapp_automation]
++# every daemon, launchd job and auto-response / e-mail / phone / inbound module of this rig talks to customers or holds their data
++daemons/
++launchd/
++auto_response
++email_companion
++phone_etl
++warming
+diff --git a/.gascity-gastown-hq/packs/town-deltas/assets/gate-taskrapida.lib.sh b/.gascity-gastown-hq/packs/town-deltas/assets/gate-taskrapida.lib.sh
+index 76e510342..cb5c491e7 100644
+--- a/.gascity-gastown-hq/packs/town-deltas/assets/gate-taskrapida.lib.sh
++++ b/.gascity-gastown-hq/packs/town-deltas/assets/gate-taskrapida.lib.sh
+@@ -33,8 +33,8 @@
+ # Needs gate_e11_count_production_lines (quality-gate-guard.sh, sourced lib-only by the dispatcher); without it: counter-missing.
+ 
+ # gate_taskrapida_codes — "code<TAB>label" per line: every GATE_TR_CODE this lib can leave, in one place. gate-taskrapida.selftest.sh
+-# fails when this list and its cases drift. The weekly tally does NOT read it yet: that is slice 2 of the story (ga-dzzqvw.1), which
+-# adds gate-lane-tally.py's TR_REASON_CODES and the check that the two lists agree.
++# fails when this list and its cases drift, and when it differs (code or label) from gate-lane-tally.py's TR_REASON_CODES, which the
++# weekly tally buckets the lane's refusals by.
+ gate_taskrapida_codes() {
+   printf '%s\t%s\n' \
+     granted           "concedida: task pequena, fora da lista de risco" \
+@@ -45,7 +45,8 @@ gate_taskrapida_codes() {
+     bad-inputs        "entrada da decisao vazia" \
+     e5-active         "rodada com revisor extra do E5" \
+     policy-files      "diff mexe em arquivo de politica do gate" \
+-    not-task          "bead de origem nao e task" \
++    gate-files        "diff mexe em arquivo do proprio gate (gate-*, quality-gate*, review-merge-policy*, pre-gate-*)" \
++    not-task"bead de origem nao e task" \
+     type-unreadable   "tipo do bead de origem ilegivel" \
+     opted-out         "bead com a label gate:normal-only (pediu o gate normal)" \
+     labels-unreadable "labels do bead de origem ilegiveis" \
+@@ -159,6 +160,29 @@ _gate_tr_risk_hit() {
+   return 0
+ }
+ 
++# _gate_tr_self_hit <paths> — the first path that is a file of the gate itself, by BASENAME: gate-*, quality-gate*, review-merge-policy*,
++# pre-gate-* (upper/lower case does not matter). The dispatcher's POLICY_FILES only matches (review-merge-policy|quality-gate), so the
++# lane's own lib, the reviewers' prompt libs and the shipped risk list were not covered: a short review must never judge a change to how
++# the short review is decided or what every reviewer is told. Hard-wired here, not a pattern of the editable list. A path that cannot be
++# lower-cased counts as a hit (fail closed). Prints nothing when none matches.
++_gate_tr_self_hit() {
++  local p b
++  while IFS= read -r p; do
++    [ -n "$p" ] || continue
++    b=$(printf '%s' "${p##*/}" | tr '[:upper:]' '[:lower:]') || { printf '%s' "$p"; return 0; }
++    case "$b" in gate-*|quality-gate*|review-merge-policy*|pre-gate-*) printf '%s' "$p"; return 0 ;; esac
++  done <<< "$1"
++  return 0
++}
++
++# gate_taskrapida_is_on — rc 0 when the lane is switched on, 1 when it is off or its switch cannot be read (same reading as the decision's).
++# The dispatcher asks first so a dark lane does not cost a bd read of the source bead on every normal-gate run. Sets GATE_TR_CODE/WHY like
++# the decision would; the decision resets them.
++gate_taskrapida_is_on() {
++  if _gate_tr_off; then return 1; fi
++  return 0
++}
++
+ gate_taskrapida_decide() {
+   local git_fn="${1:-}" base="${2:-}" head="${3:-}" bead_json="${4-}" rig="${5:-}" policy="${6:-}"
+   local ty lb cap total_cap numstat rc=0 add del path total=0 nfiles=0 bad=0 binary=0 paths="" list="" prod hit hit_path hit_pat
+@@ -250,6 +274,10 @@ gate_taskrapida_decide() {
+   if ! _gate_tr_load_risk "$rig"; then
+     _gate_tr_refuse "risk-unreadable" "${GATE_TR_RISK_WHY:-the risk list could not be loaded} — normal gate"; return 1
+   fi
++  hit=$(_gate_tr_self_hit "$paths") || hit=""   # vazio → no file of the gate itself; falhou → the helper counts an unreadable path as a hit, never as none
++  if [ -n "$hit" ]; then
++    _gate_tr_refuse "gate-files" "${hit} is a file of the gate itself (gate-*, quality-gate*, review-merge-policy*, pre-gate-*) — normal gate"; return 1
++  fi
+   hit=$(_gate_tr_risk_hit "$paths") || hit=""
+   if [ -n "$hit" ]; then
+     hit_path="${hit%%$'\t'*}"; hit_pat="${hit#*$'\t'}"
+diff --git a/.gascity-gastown-hq/packs/town-deltas/assets/gate-taskrapida.selftest.sh b/.gascity-gastown-hq/packs/town-deltas/assets/gate-taskrapida.selftest.sh
+index 5d7dff99b..bc3898076 100755
+--- a/.gascity-gastown-hq/packs/town-deltas/assets/gate-taskrapida.selftest.sh
++++ b/.gascity-gastown-hq/packs/town-deltas/assets/gate-taskrapida.selftest.sh
+@@ -193,7 +193,10 @@ echo "── 4. the risk list ──"
+ for p in app/whapi/client.py src/campaign_runner.py src/envio_x.py lib/send_mail.py jobs/outreach.py bot/autoreply.py \
+          svc/notifier.py jobs/followup.py voice/voicebot/agent.py fin/pagamento.py fin/billing.py fin/cobranca.py fin/credito.py \
+          crm/pipedrive_sync.py crm/contato.py crm/lead_score.py crm/fila_espera.py crm/proprietario.py \
+-         db/migrations/001_add_col.sql data/clientes.db data/app.db db/schema.sql App/Whapi/Client.py src/cobrança.py src/crédito.py; do
++         db/migrations/001_add_col.sql data/clientes.db data/app.db db/schema.sql App/Whapi/Client.py src/cobrança.py src/crédito.py \
++         daemons/auto_response_v2_listener.py daemons/inbound_reply_alerter.py daemons/routes/auto_response_api.py daemons/pix_lookup_api.py daemons/procob_api.py \
++         daemons/clientes_dashboard.py daemons/clientes_seed.py daemons/motherduck_sync_daemon.py lib/fleet_credit_guard.py scripts/owner_stale_detect.py \
++         lib/predictive_dialer/providers/zenvia.py lib/estudos_enviados_view.py; do
+   mkbranch "$p:20"; B=$BR; decide "$B" "$(bj task)"; expect "risk keyword in path: $p" normal risk-file
+ done
+ mkbranch tests/test_envio.py:20 src/report/format.py:20; B=$BR
+@@ -241,6 +244,15 @@ decide "$Bc" "$(bj task)" GATE_TASKRAPIDA_RISK_FILE="$T/rig-risk.txt" DRV_RIG=ri
+ decide "$Bd" "$(bj task)" GATE_TASKRAPIDA_RISK_FILE="$T/rig-risk.txt" DRV_RIG=rig_a; expect "[*] section applies to every rig" normal risk-file
+ decide "$Ba" "$(bj task)" GATE_TASKRAPIDA_RISK_FILE="$T/rig-risk.txt" DRV_RIG=;      expect "rig unknown: only the global patterns apply, and that is said by a grant only when nothing else matches" task-rapida granted
+ 
++mkbranch launchd/nightly_job.sh:20; B=$BR
++decide "$B" "$(bj task)" DRV_RIG=whatsapp_automation; expect "launchd/ is a risk in the whatsapp_automation section of the shipped list" normal risk-file
++decide "$B" "$(bj task)" DRV_RIG=gascity;             expect "…and an ordinary path in another rig" task-rapida granted
++# the lane never judges a change to the gate itself, whatever the (editable) list says: basename gate-*, quality-gate*, review-merge-policy*, pre-gate-*
++for p in scripts/gate-foo.sh packs/x/assets/Quality-Gate-Y.sh docs/pre-gate-review.md commands/gate-done.md packs/x/review-merge-policy.toml; do
++  mkbranch "$p:20"; B=$BR; decide "$B" "$(bj task)"; expect "file of the gate itself: $p" normal gate-files
++done
++mkbranch src/aggregate-report.py:20; B=$BR; decide "$B" "$(bj task)"; expect "aggregate-report.py holds the letters gate- but its basename does not start with them" task-rapida granted
++
+ # ── 5. the switch (.gc/gate-task-rapida.on, born ON) ─────────────────────────────────────────────────────────
+ echo "── 5. the switch ──"
+ mkbranch src/report/format.py:20; B=$BR
+@@ -250,6 +262,11 @@ decide "$B" "$(bj task)" GATE_TASKRAPIDA_ENABLED=0;
+ decide "$B" "$(bj task)" GATE_TASKRAPIDA_ON_FILE=;                                  expect "switch location unknown (override empty, GC_CITY unset)" normal switch-unreadable
+ decide "$B" "$(bj task)" GATE_TASKRAPIDA_ON_FILE= GC_CITY="$T/city";                expect "switch located through GC_CITY/.gc (present)" task-rapida granted
+ decide "$B" "$(bj task)" GATE_TASKRAPIDA_ON_FILE= GC_CITY="$T/nowhere";             expect "switch located through GC_CITY/.gc (absent)" normal switch-off
++is_on() { tr_env "$@" "$B32" -c 'source "$1"; gate_taskrapida_is_on && echo on || echo off' _ "$LIB" 2>&1; }   # the dispatcher asks this BEFORE reading the bead
++[ "$(is_on)" = "on" ]                                                    && ok "is_on: switch present → on"                   || bad "is_on with the switch present: $(is_on)"
++[ "$(is_on GATE_TASKRAPIDA_ON_FILE="$T/city/.gc/absent.on")" = "off" ]  && ok "is_on: switch absent → off"                   || bad "is_on with the switch absent"
++[ "$(is_on GATE_TASKRAPIDA_ENABLED=0)" = "off" ]                        && ok "is_on: killed by env → off"                   || bad "is_on with GATE_TASKRAPIDA_ENABLED=0"
++[ "$(is_on GATE_TASKRAPIDA_ON_FILE=)" = "off" ]                         && ok "is_on: switch location unknown → off (a switch nobody can find is not on)" || bad "is_on with no switch location"
+ mkdir -p "$T/city/.gc/dir.on"
+ decide "$B" "$(bj task)" GATE_TASKRAPIDA_ON_FILE="$T/city/.gc/dir.on";              expect "switch is a directory (not a file that says ON)" normal switch-off
+ 
+@@ -312,6 +329,8 @@ case "$P_RAP" in *"5 minutes"*) ok "  …the verdict is asked for in about 5 min
+ case "$P_RAP" in *"reports success when the operation failed"*) ok "  …it keeps the third-state family as a blocker" ;; *) bad "  …the third-state family must still block in the short prompt" ;; esac
+ case "$P_RAP" in *"gate:normal-only"*) ok "  …a diff that turns out to touch messages / money / customer data is sent back with the label that keeps it in the normal gate" ;; *) bad "  …the scope check must tell the builder about gate:normal-only" ;; esac
+ case "$P_RAP" in *"out of the task-rapida scope"*) ok "  …the scope check has its own FAIL wording" ;; *) bad "  …the scope check needs the out-of-scope FAIL wording" ;; esac
++case "$P_RAP" in *"no changed file PATH is on the gate risk list"*"not what the code does"*) ok "  …it says only the PATHS were checked, not the code" ;; *) bad "  …it must say the gate checked paths only" ;; esac
++case "$P_RAP" in *"gate measured"*) bad "  …it still claims the gate measured the scope" ;; *) ok "  …it no longer claims the gate measured the scope" ;; esac
+ case "$P_RAP" in *"RUNNING TESTS"*|*"REFUTATION PASS"*) bad "  …the short prompt still carries the long guidance" ;; *) ok "  …none of the long guidance is left in it" ;; esac
+ apos=$(printf '%s' "$P_RAP" | tr -cd "'" | wc -c | tr -d ' ')
+ [ "$apos" = "0" ] && ok "  …zero apostrophes (the invariant of the prompt lib)" || bad "  …the short prompt has $apos apostrophe(s)"
+@@ -327,6 +346,13 @@ LIB_CODES=$("$B32" -c 'source "$1"; gate_taskrapida_codes | cut -f1' _ "$LIB" 2>
+ # a case names its code either through expect (lane + code) or, for the one that needs a custom check, with field CODE
+ CASE_CODES=$({ sed -En 's/.*expect "[^"]*" (normal|task-rapida|fast) ([a-z0-9-]+).*/\2/p' "${BASH_SOURCE[0]}"; sed -En 's/.*\[ "\$\(field CODE\)" = "([a-z0-9-]+)" \].*/\1/p' "${BASH_SOURCE[0]}"; } | sort -u)
+ [ -n "$LIB_CODES" ] && ok "the lib lists its codes ($(printf '%s\n' "$LIB_CODES" | wc -l | tr -d ' '))" || bad "gate_taskrapida_codes printed nothing"
++# the weekly tally buckets the lane's refusals by its own copy of this list: same codes, same words (and a mutation shows this check can fail)
++LIB_LIST=$("$B32" -c 'source "$1"; gate_taskrapida_codes' _ "$LIB" 2>/dev/null | sort) || LIB_LIST=""
++TALLY_PY="$SELF_DIR/gate-lane-tally.py"
++TALLY_LIST=$(python3 "$TALLY_PY" --list-tr-codes 2>/dev/null | sort) || TALLY_LIST=""
++[ -n "$LIB_LIST" ] && [ "$LIB_LIST" = "$TALLY_LIST" ] && ok "the tally lists exactly the lib codes and labels ($(printf '%s\n' "$LIB_LIST" | wc -l | tr -d ' '))" || bad "the tally TR_REASON_CODES and gate_taskrapida_codes differ: $(diff <(printf '%s\n' "$LIB_LIST") <(printf '%s\n' "$TALLY_LIST") | head -6 | tr '\n' ' ')"
++sed 's/"over-limit": *"[^"]*"/"over-limit": "reworded"/' "$TALLY_PY" > "$T/tally-mut.py"
++[ "$(python3 "$T/tally-mut.py" --list-tr-codes 2>/dev/null | sort)" != "$LIB_LIST" ] && ok "mutation: a reworded label in the tally IS seen as a difference" || bad "mutation: the drift check cannot tell a reworded label apart"
+ # three codes are the dispatcher's own (its block sets them when the lib is missing, the dispatcher's file list is empty, or the lib's answer is
+ # not one it can trust): they are exercised by the wiring cases of section 9, not by the decision driver, and each must be set in the dispatcher
+ DISPATCHER_CODES="lib-not-loaded no-changed-files decision-errored"
+@@ -422,6 +448,11 @@ case "$(cat "$T/trbd.log" 2>/dev/null)" in *LIB-WAS-CALLED*|*" show "*) bad "a r
+ ARGS_STUB='gate_taskrapida_decide() { printf "ARGS %s|%s|%s|%s|%s|%s\n" "$1" "$2" "$3" "$4" "$5" "$6" >> "$TR_BD_LOG"; GATE_TR_CODE=risk-file; return 1; }'
+ tr_dec "args case" "POLICY_FILES=quality-gate-x.sh; $ARGS_STUB" "${REFUSED_NORMAL}trcode=risk-file reason=fast-reason rcode=not-fast" TR_FAKE_BEAD='[{"issue_type":"task"}]'
+ BDLOG=$(cat "$T/trbd.log" 2>/dev/null)
++tr_dec "dark lane (is_on says off): decided without reading the bead" "gate_taskrapida_is_on() { return 1; }; $ARGS_STUB" "${REFUSED_NORMAL}trcode=risk-file reason=fast-reason rcode=not-fast" TR_FAKE_BEAD='[{"issue_type":"task"}]'
++case "$(cat "$T/trbd.log" 2>/dev/null)" in *" show "*) bad "  …a dark lane still read the bead: $(cat "$T/trbd.log")" ;; *'ARGS git_rig|origin/main|abc123||gascity|'*) ok "  …no bd read, and the lib is handed an empty bead (it says switch-off itself)" ;; *) bad "  …dark lane: unexpected: $(cat "$T/trbd.log")" ;; esac
++tr_dec "lit lane (is_on says on): the bead is read" "gate_taskrapida_is_on() { return 0; }; $ARGS_STUB" "${REFUSED_NORMAL}trcode=risk-file reason=fast-reason rcode=not-fast" TR_FAKE_BEAD='[{"issue_type":"task"}]'
++case "$(cat "$T/trbd.log" 2>/dev/null)" in *"-C /beadcity show ga-x --json"*) ok "  …bd -C \$BEAD_CITY show was run" ;; *) bad "  …a lit lane did not read the bead: $(cat "$T/trbd.log")" ;; esac
++BDLOG=$(cat "$T/trbd.log" 2>/dev/null)
+ case "$BDLOG" in *'ARGS git_rig|origin/main|abc123|[{"issue_type":"task"}]|gascity|quality-gate-x.sh'*) ok "  …the lib gets (git_rig, origin/<default>, the claimed SHA, the bead JSON, the rig, the policy files)" ;; *) bad "  …the lib was handed something else: $BDLOG" ;; esac
+ case "$BDLOG" in *"-C /beadcity show ga-x --json"*) ok "  …the source bead is read from ITS store (BEAD_CITY), not the HQ's" ;; *) bad "  …the bead was not read from BEAD_CITY: $BDLOG" ;; esac
+ tr_dec "bd fails after printing part of an answer" "$ARGS_STUB" "${REFUSED_NORMAL}trcode=risk-file reason=fast-reason rcode=not-fast" TR_FAKE_BEAD='[{"issue_type":"task"' TR_FAKE_BD_FAIL=1
+@@ -436,7 +467,7 @@ FL_LIB="$SELF_DIR/gate-fastlane.lib.sh"
+ cat > "$T/bin/bd" <<'EOF'
+ #!/bin/bash
+ printf '%s\n' "$*" >> "${FAKE_BD_LOG:-/dev/null}"
+-case "$*" in *" show "*) printf '[{"id":"m","metadata":{"gate.lane":"%s"}}]\n' "${FAKE_BD_LANE:-}" ;; esac
++case "$*" in *" show "*) printf '[{"id":"m","metadata":{"gate.lane":"%s","gate.tr_code":"%s"}}]\n' "${FAKE_BD_LANE:-}" "${FAKE_BD_TRCODE:-}" ;; esac
+ exit 0
+ EOF
+ chmod +x "$T/bin/bd"
+@@ -464,6 +495,9 @@ RB=$(cat "$T/rec-bd.log")
+ for kv in "gate.lane=task-rapida" "gate.lane_reason=task of 150 production lines (limit 200)" "gate.tr_code=granted"; do
+   case "$RB" in *"--set-metadata $kv"*) ok "  …the marker carries $kv" ;; *) bad "  …marker lacks $kv: $RB" ;; esac
+ done
++rec_err() { PATH="$T/bin:$PATH" FAKE_BD_LOG=/dev/null FAKE_BD_LANE=task-rapida FAKE_BD_TRCODE="$1" "$B32" -c 'set -euo pipefail; source "$1"; . "$3"; gate_fastlane_record /city mk-1 ga-x feat/x gascity 2 "$2"' _ "$FL_LIB" "$T/rec-err.jsonl" "$T/rec-granted.sh" 2>&1 >/dev/null; }
++case "$(rec_err "")" in *"tr_code 'granted' NOT confirmed"*) ok "  …a gate.tr_code that does not read back is WARNed (an absent one reads as 'the lane did not decide')" ;; *) bad "  …a lost gate.tr_code write was silent" ;; esac
++case "$(rec_err granted)" in *"tr_code"*) bad "  …a warning about a tr_code that did read back" ;; *) ok "  …and no warning when it reads back" ;; esac
+ RQ2="$T/rec-refused.jsonl"; : > "$RQ2"; rec_tr "$RQ2" "$T/rec-refused.sh" normal
+ [ "$(tail -1 "$RQ2" | jq -r '[.lane,.reason_code,.tr_code,.tr_lines]|join("|")' 2>/dev/null)" = "normal|code-or-prompt|risk-file|150" ] \
+   && ok "refused: lane=normal keeps the fast lane's reason_code, and the lane's own refusal rides in tr_code / tr_lines (the fast lane's tally buckets are not polluted)" || bad "refused event: $(cat "$RQ2")"
+diff --git a/.gascity-gastown-hq/packs/town-deltas/assets/prod-tests/gascity/story-ga-dzzqvw.1.sh b/.gascity-gastown-hq/packs/town-deltas/assets/prod-tests/gascity/story-ga-dzzqvw.1.sh
+new file mode 100755
+index 000000000..403b34a85
+--- /dev/null
++++ b/.gascity-gastown-hq/packs/town-deltas/assets/prod-tests/gascity/story-ga-dzzqvw.1.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++# prod-tests/gascity/story-ga-dzzqvw.1.sh — prod test for ga-dzzqvw.1 (slice 2/2 of the gate's "task-rapida" lane): the weekly tally counts the lane
++# (how many, why not, first review, time, bugs opened after). Verifies the DEPLOYED tally: it compiles, it reads the LIVE log (exit 2 would be
++# 'could not read', never '0'), its JSON carries the lane's numbers, its code list is the lane lib's list, and its own selftest passes end to end
++# (the lane's selftest is slice 1's prod test).
++# Called by run.sh after deploy (STORY_ID=ga-dzzqvw.1). Exits 0 on pass.
++set -uo pipefail
++CITY="${CITY:-/Users/athos/gt/.gascity-gastown-hq}"; A="$CITY/packs/town-deltas/assets"; TALLY="$A/gate-lane-tally.py"; B32=/bin/bash
++log()  { echo "[prod-test:gascity ga-dzzqvw.1] $*"; }
++fail() { echo "[prod-test:gascity ga-dzzqvw.1] FAIL: $*" >&2; exit 1; }
++for f in "$TALLY" "$A/gate-lane-tally.selftest.sh" "$A/gate-taskrapida.lib.sh" "$A/gate-taskrapida.selftest.sh"; do [[ -f "$f" ]] || fail "missing: $f"; done
++python3 -m py_compile "$TALLY" || fail "gate-lane-tally.py does not compile"
++J=$(python3 "$TALLY" --days 7 --json) || fail "the tally could not read the live log (exit $?)"
++printf '%s' "$J" | python3 -c "import sys,json; d=json.load(sys.stdin); [d[k] for k in ('tr_granted','tr_refused','tr_refusals','tr_first_pass','tr_first_fail','tr_elapsed_median_s','tr_bugs_after','tr_stores')]; assert d['unreadable_lines']==0" \
++  || fail "the tally's JSON on the live log lacks the task-rapida numbers, or counts unreadable lines (look at them before the weekly warns on every run): $J"
++LIB_CODES=$("$B32" -c 'source "$1"; gate_taskrapida_codes | cut -f1' _ "$A/gate-taskrapida.lib.sh" 2>/dev/null | sort) || LIB_CODES=""
++TALLY_CODES=$(python3 "$TALLY" --list-tr-codes | cut -f1 | sort)
++[[ -n "$LIB_CODES" && "$LIB_CODES" = "$TALLY_CODES" ]] || fail "the tally's task-rapida codes are not the lane lib's (lib: $(echo $LIB_CODES | wc -w), tally: $(echo $TALLY_CODES | wc -w))"
++OUT=$("$B32" "$A/gate-lane-tally.selftest.sh" 2>&1) || fail "gate-lane-tally.selftest.sh failed: $(printf '%s' "$OUT" | grep '✗' | head -5 | tr '\n' ' ')"
++log "PASS"
+diff --git a/.gascity-gastown-hq/packs/town-deltas/assets/quality-gate-dispatcher.sh b/.gascity-gastown-hq/packs/town-deltas/assets/quality-gate-dispatcher.sh
+index 39f613326..1128ce9be 100755
+--- a/.gascity-gastown-hq/packs/town-deltas/assets/quality-gate-dispatcher.sh
++++ b/.gascity-gastown-hq/packs/town-deltas/assets/quality-gate-dispatcher.sh
+@@ -17804,7 +17804,8 @@ else
+   GATE_LANE_REASON_CODE="lib-not-loaded"
+   GATE_LANE_REASON="fast-lane lib not loaded (gate-fastlane.lib.sh missing or unreadable) — normal gate"
+ fi
+-# Anything that is not exactly "fast" is "normal" — a lib bug must not be able to produce a third lane.
++# From the DOC/TEST lane, anything that is not exactly "fast" is "normal" — a bug in that lib must not be able to produce another lane. The one
++# other lane value, "task-rapida", is set only by the task-rapida block below, from its own validated grant (lane + code + rc together).
+ case "${GATE_LANE:-}" in fast) ;; *) GATE_LANE="normal" ;; esac
+ if [ "$GATE_LANE" = "fast" ]; then
+   TIER="FAST-LANE"
+@@ -17818,8 +17819,8 @@ fi
+ # (E11's own counter), and no file may match the risk list (.gc/gate-task-rapida-risco.txt). Anything unreadable, over, or merely unverified
+ # leaves the run exactly as the tier step made it. Same merge, same delivery: only the reviewer count and the prompt differ.
+ # The lane's own answer rides in GATE_TR_CODE / GATE_TR_LINES (never in GATE_LANE_REASON_CODE, which the fast lane's tally buckets own), so a
+-# tally can say why a task was NOT granted (gate-lane-tally.py learns to in ga-dzzqvw.1; until then the fields are only recorded). A lib that
+-# returns something other than a clean grant or a clean refusal is "decision-errored".
++# tally can say why a task was NOT granted (gate-lane-tally.py buckets them by TR_REASON_CODES). A lib that returns something other than a
++# clean grant or a clean refusal is "decision-errored".
+ # Nothing from an earlier round of this process (gate_continue_or_exit re-enters) may be read as this round's, hence the reset first.
+ # SELFTEST-EXTRACT taskrapida-decide: BEGIN
+ GATE_TR_CODE=""; GATE_TR_WHY=""; GATE_TR_LINES=""; GATE_REVIEW_PROMPT_MODE=""
+@@ -17833,7 +17834,11 @@ elif ! declare -F gate_taskrapida_decide >/dev/null 2>&1; then
+   GATE_TR_WHY="task-rapida lib not loaded (gate-taskrapida.lib.sh missing or unreadable) — normal gate"
+ else
+   # the source bead lives in ITS rig's store, not always the HQ's; a failed or half-printed read is handed over as "" (the lib calls that type-unreadable)
+-  _TR_JSON=$(bd -C "${BEAD_CITY:-$GC_CITY}" show "$BEAD_ID" --json 2>/dev/null) || _TR_JSON=""
++  # A dark lane (switch off or unreadable) refuses before it looks at the bead, so it does not pay a bd read per run for an answer nobody uses:
++  # the lib is handed "" and says switch-off itself. Without the helper (an older lib) the bead is read as before.
++  if declare -F gate_taskrapida_is_on >/dev/null 2>&1 && ! gate_taskrapida_is_on; then _TR_JSON=""
++  else _TR_JSON=$(bd -C "${BEAD_CITY:-$GC_CITY}" show "$BEAD_ID" --json 2>/dev/null) || _TR_JSON=""
++  fi
+   # the lib writes the lane variables only on a grant, but a lib that errors half way must not leave its writes behind
+   _TR_SAVE_LANE="$GATE_LANE"; _TR_SAVE_REASON="${GATE_LANE_REASON:-}"; _TR_SAVE_CODE="${GATE_LANE_REASON_CODE:-}"
+   _TR_SAVE_FILES="${GATE_LANE_FILES:-}"; _TR_SAVE_COUNTS="${GATE_LANE_COUNTS:-}"

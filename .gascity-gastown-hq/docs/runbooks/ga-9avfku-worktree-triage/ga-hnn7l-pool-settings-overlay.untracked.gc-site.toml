@@ -1,0 +1,25 @@
+workspace_name = "gascity"
+
+[[rig]]
+name = "deacon"
+path = "/Users/athos/gt/deacon"
+
+[[rig]]
+name = "gastown"
+path = "/Users/athos/gt/gastown"
+
+[[rig]]
+name = "lexbh"
+path = "/Users/athos/gt/lexbh"
+
+[[rig]]
+name = "marketing"
+path = "/Users/athos/gt/marketing"
+
+[[rig]]
+name = "property_scrapers"
+path = "/Users/athos/gt/property_scrapers"
+
+[[rig]]
+name = "whatsapp_automation"
+path = "/Users/athos/gt/whatsapp_automation"

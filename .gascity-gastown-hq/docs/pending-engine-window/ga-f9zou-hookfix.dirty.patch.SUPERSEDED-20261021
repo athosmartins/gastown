@@ -1,0 +1,49 @@
+diff --git a/cmd/gc/cmd_hook.go b/cmd/gc/cmd_hook.go
+index 1dcfa3f0e..63c0752f0 100644
+--- a/cmd/gc/cmd_hook.go
++++ b/cmd/gc/cmd_hook.go
+@@ -63,6 +63,11 @@ func cmdHookWithFormat(args []string, inject bool, hookFormat string, stdout, st
+ 	if agentName == "" {
+ 		agentName = os.Getenv("GC_AGENT")
+ 	}
++	// bareAgentName preserves the un-overridden $GC_ALIAS/$GC_AGENT value so
++	// a failed sessionTemplateContext resolution (below) can fall back to it
++	// instead of erroring out. See the fallback at the resolveAgentIdentity
++	// call for why this is needed (ga-f9zou).
++	bareAgentName := agentName
+ 	sessionTemplateContext := false
+ 	if len(args) == 0 {
+ 		template := strings.TrimSpace(os.Getenv("GC_TEMPLATE"))
+@@ -75,6 +80,7 @@ func cmdHookWithFormat(args []string, inject bool, hookFormat string, stdout, st
+ 	}
+ 	if len(args) > 0 {
+ 		agentName = args[0]
++		bareAgentName = args[0]
+ 	}
+ 	if agentName == "" {
+ 		fmt.Fprintln(stderr, "gc hook: agent not specified (set $GC_AGENT or pass as argument)") //nolint:errcheck // best-effort stderr
+@@ -103,6 +109,24 @@ func cmdHookWithFormat(args []string, inject bool, hookFormat string, stdout, st
+ 	}
+ 
+ 	a, ok := resolveAgentIdentity(cfg, agentName, currentRigContext(cfg))
++	if !ok && sessionTemplateContext && bareAgentName != "" && bareAgentName != agentName {
++		// $GC_TEMPLATE is meant to be the session's reliable backing-config
++		// identity (see the sessionTemplateContext block above), but it is
++		// sourced from named-session/pack-import expansion and is not
++		// guaranteed to round-trip through resolveAgentIdentity's exact
++		// qualified-name match in every case (e.g. a rig-scoped, non-pool
++		// session whose template string omits an import binding prefix that
++		// the agent's own config.Agent.QualifiedName() includes). The bare
++		// $GC_ALIAS/$GC_AGENT value has always resolved correctly for such
++		// sessions via resolveAgentIdentity's unambiguous-bare-name step, so
++		// fall back to it rather than failing outright. Confirmed live
++		// (ga-f9zou): `gc hook` with no args failed with "agent ... not
++		// found in config" for a normal rig-scoped session while `gc hook
++		// $GC_AGENT` succeeded against the identical config.
++		if fallback, fallbackOK := resolveAgentIdentity(cfg, bareAgentName, currentRigContext(cfg)); fallbackOK {
++			a, ok = fallback, true
++		}
++	}
+ 	if !ok {
+ 		fmt.Fprintf(stderr, "gc hook: agent %q not found in config\n", agentName) //nolint:errcheck // best-effort stderr
+ 		return 1

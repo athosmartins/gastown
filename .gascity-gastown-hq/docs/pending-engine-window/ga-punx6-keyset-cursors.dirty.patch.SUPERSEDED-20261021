@@ -1,0 +1,697 @@
+diff --git a/internal/api/apierr/apierr.go b/internal/api/apierr/apierr.go
+new file mode 100644
+index 000000000..4b888e76c
+--- /dev/null
++++ b/internal/api/apierr/apierr.go
+@@ -0,0 +1,104 @@
++// Package apierr is the registry of machine-readable problem types for the Gas
++// City HTTP API. Every error the API can return has a stable code registered
++// here; the code is surfaced on the RFC 9457 problem+json body as the canonical
++// `type` URN (urn:gascity:error:<code>) plus a convenience `code` member, so an
++// autonomous consumer branches on a stable identifier instead of parsing the
++// human-readable detail prose.
++//
++// It mirrors the typed-events registry (internal/events.RegisterPayload): a
++// central catalog plus a CI guard that fails the build if the API emits a URN
++// that is not registered. Registration happens at package-init time via the
++// catalog vars, so Registered() is complete before any route is served.
++package apierr
++
++import (
++	"fmt"
++	"regexp"
++	"sort"
++	"sync"
++)
++
++// URNPrefix is the namespace for every Gas City error type URN. The canonical
++// machine code is the segment that follows it: type == URNPrefix + code.
++const URNPrefix = "urn:gascity:error:"
++
++// codePattern constrains a machine code to lowercase kebab-case so URNs stay
++// stable, greppable, and safe as a wire identifier. A subsystem prefix
++// (e.g. "sling-") is encouraged where the code is specific to one surface.
++var codePattern = regexp.MustCompile(`^[a-z][a-z0-9]*(-[a-z0-9]+)*$`)
++
++// ProblemType is a registered error kind: a stable machine code, the default
++// HTTP status it maps to, a short static Title (RFC 9457), and an optional Doc
++// URI for human documentation.
++type ProblemType struct {
++	Code   string
++	Status int
++	Title  string
++	Doc    string
++}
++
++// URN returns the canonical type URN for this problem, urn:gascity:error:<code>.
++func (pt ProblemType) URN() string { return URNPrefix + pt.Code }
++
++var (
++	mu       sync.RWMutex
++	byCode   = map[string]ProblemType{}
++	registry []ProblemType
++)
++
++// Register records a problem type and returns it, so a catalog entry can be a
++// package-level var: `var BeadNotFound = apierr.Register(...)`. It panics on a
++// malformed code, a missing status/title, or a conflicting duplicate (a
++// programming error surfaced at init). Re-registering an identical entry is a
++// no-op, which keeps catalog reloads and test re-imports safe.
++func Register(pt ProblemType) ProblemType {
++	if !codePattern.MatchString(pt.Code) {
++		panic(fmt.Sprintf("apierr: invalid code %q (want lowercase kebab-case)", pt.Code))
++	}
++	if pt.Status < 400 || pt.Status > 599 {
++		panic(fmt.Sprintf("apierr: code %q has non-4xx/5xx status %d", pt.Code, pt.Status))
++	}
++	if pt.Title == "" {
++		panic(fmt.Sprintf("apierr: code %q has empty Title", pt.Code))
++	}
++	mu.Lock()
++	defer mu.Unlock()
++	if existing, ok := byCode[pt.Code]; ok {
++		if existing != pt {
++			panic(fmt.Sprintf("apierr: conflicting re-register of code %q: %+v vs %+v", pt.Code, existing, pt))
++		}
++		return pt
++	}
++	byCode[pt.Code] = pt
++	registry = append(registry, pt)
++	return pt
++}
++
++// Lookup returns the problem type for a bare machine code.
++func Lookup(code string) (ProblemType, bool) {
++	mu.RLock()
++	defer mu.RUnlock()
++	pt, ok := byCode[code]
++	return pt, ok
++}
++
++// LookupURN returns the problem type for a full type URN
++// (urn:gascity:error:<code>), or false if the string is not such a URN or the
++// code is unregistered.
++func LookupURN(urn string) (ProblemType, bool) {
++	if len(urn) <= len(URNPrefix) || urn[:len(URNPrefix)] != URNPrefix {
++		return ProblemType{}, false
++	}
++	return Lookup(urn[len(URNPrefix):])
++}
++
++// Registered returns every registered problem type, sorted by code so callers
++// (and the generated spec) get deterministic output.
++func Registered() []ProblemType {
++	mu.RLock()
++	out := make([]ProblemType, len(registry))
++	copy(out, registry)
++	mu.RUnlock()
++	sort.Slice(out, func(i, j int) bool { return out[i].Code < out[j].Code })
++	return out
++}
+diff --git a/internal/api/apierr/apierr_test.go b/internal/api/apierr/apierr_test.go
+new file mode 100644
+index 000000000..e00e6f727
+--- /dev/null
++++ b/internal/api/apierr/apierr_test.go
+@@ -0,0 +1,164 @@
++package apierr
++
++import (
++	"encoding/json"
++	"net/http"
++	"testing"
++
++	"github.com/danielgtaylor/huma/v2"
++)
++
++// ErrorModel must satisfy huma.StatusError so it can be returned from handlers
++// and thrown by the huma.NewError override.
++var _ huma.StatusError = (*ErrorModel)(nil)
++
++func TestRegister_RejectsMalformedCode(t *testing.T) {
++	for _, bad := range []string{"", "Bad", "has_underscore", "-leading", "trailing-", "double--dash", "UPPER"} {
++		t.Run(bad, func(t *testing.T) {
++			defer func() {
++				if recover() == nil {
++					t.Fatalf("Register(%q) should panic on malformed code", bad)
++				}
++			}()
++			Register(ProblemType{Code: bad, Status: 400, Title: "x"})
++		})
++	}
++}
++
++func TestRegister_RejectsBadStatusOrTitle(t *testing.T) {
++	cases := []ProblemType{
++		{Code: "code-a", Status: 200, Title: "ok"}, // non-4xx/5xx
++		{Code: "code-b", Status: 400, Title: ""},   // empty title
++	}
++	for _, pt := range cases {
++		func() {
++			defer func() {
++				if recover() == nil {
++					t.Fatalf("Register(%+v) should panic", pt)
++				}
++			}()
++			Register(pt)
++		}()
++	}
++}
++
++func TestRegister_IdempotentVsConflict(t *testing.T) {
++	pt := ProblemType{Code: "dup-test-code", Status: 409, Title: "Dup"}
++	Register(pt)
++	Register(pt) // identical re-register: no-op, must not panic
++
++	defer func() {
++		if recover() == nil {
++			t.Fatal("conflicting re-register must panic")
++		}
++	}()
++	Register(ProblemType{Code: "dup-test-code", Status: 400, Title: "Different"})
++}
++
++func TestLookupAndURN(t *testing.T) {
++	pt, ok := Lookup("bead-not-found")
++	if !ok || pt.Status != http.StatusNotFound {
++		t.Fatalf("Lookup(bead-not-found) = %+v,%v", pt, ok)
++	}
++	if pt.URN() != "urn:gascity:error:bead-not-found" {
++		t.Fatalf("URN = %q", pt.URN())
++	}
++	got, ok := LookupURN("urn:gascity:error:bead-not-found")
++	if !ok || got != pt {
++		t.Fatalf("LookupURN = %+v,%v", got, ok)
++	}
++	if _, ok := LookupURN("urn:gascity:error:nope"); ok {
++		t.Fatal("LookupURN of unregistered code should be false")
++	}
++	if _, ok := LookupURN("bead-not-found"); ok {
++		t.Fatal("LookupURN of a bare code (no prefix) should be false")
++	}
++}
++
++// The three original sling URNs must stay byte-identical — they are already
++// public in the OpenAPI spec via x-gascity-problem-types.
++func TestFrozenSlingURNs(t *testing.T) {
++	for _, want := range []string{
++		"urn:gascity:error:sling-missing-bead",
++		"urn:gascity:error:sling-cross-rig",
++		"urn:gascity:error:sling-cross-store-route",
++	} {
++		if _, ok := LookupURN(want); !ok {
++			t.Fatalf("frozen URN %q missing from the registry", want)
++		}
++	}
++}
++
++func TestRegisteredIsSorted(t *testing.T) {
++	reg := Registered()
++	for i := 1; i < len(reg); i++ {
++		if reg[i-1].Code >= reg[i].Code {
++			t.Fatalf("Registered() not sorted by code at %d: %q >= %q", i, reg[i-1].Code, reg[i].Code)
++		}
++	}
++}
++
++func TestConstructorsStampTypeCodeStatusTitle(t *testing.T) {
++	e := BeadNotFound.Msg("bead bd-1 not found")
++	if e.Type != "urn:gascity:error:bead-not-found" || e.Code != "bead-not-found" {
++		t.Fatalf("Msg type/code = %q/%q", e.Type, e.Code)
++	}
++	if e.Status != http.StatusNotFound || e.Title != "Bead Not Found" || e.Detail != "bead bd-1 not found" {
++		t.Fatalf("Msg status/title/detail = %d/%q/%q", e.Status, e.Title, e.Detail)
++	}
++	if e.GetStatus() != http.StatusNotFound {
++		t.Fatalf("GetStatus = %d (StatusError not satisfied via embedding)", e.GetStatus())
++	}
++
++	if got := InvalidRequest.Msgf("field %q required", "name").Detail; got != `field "name" required` {
++		t.Fatalf("Msgf detail = %q", got)
++	}
++
++	withList := ConflictWrongState.With("conflict", &huma.ErrorDetail{Message: "d1"})
++	if len(withList.Errors) != 1 || withList.Errors[0].Message != "d1" {
++		t.Fatalf("With errors = %+v", withList.Errors)
++	}
++
++	ws := StoreUnavailable.WithStatus(http.StatusInternalServerError, "boom")
++	if ws.Status != http.StatusInternalServerError || ws.Code != "store-unavailable" {
++		t.Fatalf("WithStatus status/code = %d/%q", ws.Status, ws.Code)
++	}
++}
++
++// The wire shape must flatten the embedded huma.ErrorModel and add `code`.
++func TestErrorModelJSONShape(t *testing.T) {
++	b, err := json.Marshal(BeadNotFound.Msg("nope"))
++	if err != nil {
++		t.Fatalf("marshal: %v", err)
++	}
++	var m map[string]any
++	if err := json.Unmarshal(b, &m); err != nil {
++		t.Fatalf("unmarshal: %v", err)
++	}
++	for k, want := range map[string]any{
++		"type":   "urn:gascity:error:bead-not-found",
++		"code":   "bead-not-found",
++		"title":  "Bead Not Found",
++		"detail": "nope",
++		"status": float64(http.StatusNotFound),
++	} {
++		if m[k] != want {
++			t.Fatalf("json[%q] = %v (%T), want %v", k, m[k], m[k], want)
++		}
++	}
++	// code is omitempty: an empty-code model omits it (defends the wire compat
++	// claim for legacy paths that don't stamp a code).
++	b2, _ := json.Marshal(&ErrorModel{})
++	if json.Valid(b2) && contains(string(b2), `"code"`) {
++		t.Fatalf("empty ErrorModel must omit code, got %s", b2)
++	}
++}
++
++func contains(s, sub string) bool {
++	for i := 0; i+len(sub) <= len(s); i++ {
++		if s[i:i+len(sub)] == sub {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/internal/api/apierr/catalog.go b/internal/api/apierr/catalog.go
+new file mode 100644
+index 000000000..c31f7f372
+--- /dev/null
++++ b/internal/api/apierr/catalog.go
+@@ -0,0 +1,103 @@
++package apierr
++
++import "net/http"
++
++// The catalog: every machine-readable problem type the API emits, registered at
++// package init. Keep this the single reviewable taxonomy file. Codes are
++// generic by default (bead-not-found, not bead-N-not-found) and refined only
++// where a client must branch differently (two distinct 409 conflicts). Adding a
++// code is additive; removing or renaming one is a breaking change.
++//
++// The three sling-* URNs are frozen: they are already public in the OpenAPI spec
++// via x-gascity-problem-types and must stay byte-identical.
++var (
++	// Resource resolution. Codes are per-resource (city-not-found, not a generic
++	// not-found) so a client branches on which resource was missing; rig-not-found
++	// is shared across the domains that resolve a rig.
++	CityNotFound        = Register(ProblemType{Code: "city-not-found", Status: http.StatusNotFound, Title: "City Not Found"})
++	BeadNotFound        = Register(ProblemType{Code: "bead-not-found", Status: http.StatusNotFound, Title: "Bead Not Found"})
++	MailNotFound        = Register(ProblemType{Code: "mail-not-found", Status: http.StatusNotFound, Title: "Mail Message Not Found"})
++	RigNotFound         = Register(ProblemType{Code: "rig-not-found", Status: http.StatusNotFound, Title: "Rig Not Found"})
++	SessionNotFound     = Register(ProblemType{Code: "session-not-found", Status: http.StatusNotFound, Title: "Session Not Found"})
++	WaitNotFound        = Register(ProblemType{Code: "wait-not-found", Status: http.StatusNotFound, Title: "Wait Not Found"})
++	AgentNotFound       = Register(ProblemType{Code: "agent-not-found", Status: http.StatusNotFound, Title: "Agent Not Found"})
++	ProviderNotFound    = Register(ProblemType{Code: "provider-not-found", Status: http.StatusNotFound, Title: "Provider Not Found"})
++	ConvoyNotFound      = Register(ProblemType{Code: "convoy-not-found", Status: http.StatusNotFound, Title: "Convoy Not Found"})
++	WorkflowNotFound    = Register(ProblemType{Code: "workflow-not-found", Status: http.StatusNotFound, Title: "Workflow Not Found"})
++	RunNotFound         = Register(ProblemType{Code: "run-not-found", Status: http.StatusNotFound, Title: "Run Not Found"})
++	FormulaNotFound     = Register(ProblemType{Code: "formula-not-found", Status: http.StatusNotFound, Title: "Formula Not Found"})
++	OrderNotFound       = Register(ProblemType{Code: "order-not-found", Status: http.StatusNotFound, Title: "Order Not Found"})
++	ExtmsgGroupNotFound = Register(ProblemType{Code: "extmsg-group-not-found", Status: http.StatusNotFound, Title: "External-Message Group Not Found"})
++	// ScopeNotFound is a city-or-rig scope reference that does not resolve (the
++	// detail names which kind); it is distinct from the resource the scope was
++	// being resolved for (e.g. a formula).
++	ScopeNotFound   = Register(ProblemType{Code: "scope-not-found", Status: http.StatusNotFound, Title: "Scope Not Found"})
++	ServiceNotFound = Register(ProblemType{Code: "service-not-found", Status: http.StatusNotFound, Title: "Service Not Found"})
++	PatchNotFound   = Register(ProblemType{Code: "patch-not-found", Status: http.StatusNotFound, Title: "Patch Not Found"})
++	PackNotFound    = Register(ProblemType{Code: "pack-not-found", Status: http.StatusNotFound, Title: "Pack Not Found"})
++
++	// Request validation.
++	InvalidRequest   = Register(ProblemType{Code: "invalid-request", Status: http.StatusBadRequest, Title: "Invalid Request"})
++	ValidationFailed = Register(ProblemType{Code: "validation-failed", Status: http.StatusUnprocessableEntity, Title: "Validation Failed"})
++	// InvalidCursor is a pagination token the server cannot parse (garbage,
++	// a legacy offset cursor, or the wrong kind for the endpoint). Clients
++	// recover by re-fetching the first page.
++	InvalidCursor = Register(ProblemType{Code: "invalid-cursor", Status: http.StatusBadRequest, Title: "Invalid Cursor"})
++	// WebhookRejected is a well-formed webhook request the receiver declined to
++	// dispatch (unknown/unwired sink, policy) — distinct from validation-failed,
++	// which is huma's schema-validation auto-stamp.
++	WebhookRejected = Register(ProblemType{Code: "webhook-rejected", Status: http.StatusUnprocessableEntity, Title: "Webhook Rejected"})
++
++	// Concurrency / state conflicts. concurrent-delete/concurrent-modify are
++	// retryable lost-update races (the target changed under the write); wrong-state
++	// is a terminal precondition failure (the target is in a state the request
++	// cannot proceed from).
++	ConflictConcurrentDelete = Register(ProblemType{Code: "conflict-concurrent-delete", Status: http.StatusConflict, Title: "Concurrent Delete Conflict"})
++	ConflictConcurrentModify = Register(ProblemType{Code: "conflict-concurrent-modify", Status: http.StatusConflict, Title: "Concurrent Modify Conflict"})
++	ConflictWrongState       = Register(ProblemType{Code: "conflict-wrong-state", Status: http.StatusConflict, Title: "Wrong State Conflict"})
++	// SessionConflict is the one code for the session 409s. Many carry a
++	// differentiating detail prefix the CLI already branches on
++	// (ambiguous:/pending_interaction:/no_pending:/invalid_interaction:/
++	// illegal_transition:), mirroring sling-source-workflow-conflict; the rest
++	// share a generic "conflict:" (or no) prefix. A later slice may split the
++	// create-time name/alias-uniqueness conflicts into their own code, since a
++	// client cannot today distinguish "pick a different name" from "resume/stop
++	// first" by code or prefix.
++	SessionConflict = Register(ProblemType{Code: "session-conflict", Status: http.StatusConflict, Title: "Session State Conflict"})
++
++	// AmbiguousReference is a name/reference that matched more than one resource;
++	// the client should re-address with a scoped/qualified name, not retry or wait.
++	AmbiguousReference = Register(ProblemType{Code: "ambiguous-reference", Status: http.StatusConflict, Title: "Ambiguous Reference"})
++	// OperationInProgress is a transient 409 — another operation on the same target
++	// is running; the client may retry — distinct from a terminal "already exists"
++	// wrong-state conflict.
++	OperationInProgress = Register(ProblemType{Code: "operation-in-progress", Status: http.StatusConflict, Title: "Operation In Progress"})
++
++	// Authorization / capability.
++	Forbidden      = Register(ProblemType{Code: "forbidden", Status: http.StatusForbidden, Title: "Forbidden"})
++	NotImplemented = Register(ProblemType{Code: "not-implemented", Status: http.StatusNotImplemented, Title: "Not Implemented"})
++
++	// Idempotency (two-phase reserve/complete).
++	IdempotencyInFlight = Register(ProblemType{Code: "idempotency-in-flight", Status: http.StatusConflict, Title: "Idempotency Key In Flight"})
++	IdempotencyMismatch = Register(ProblemType{Code: "idempotency-mismatch", Status: http.StatusUnprocessableEntity, Title: "Idempotency Key Body Mismatch"})
++
++	// Backend availability. store-unavailable is the bead-store-not-live 503 emitted
++	// by the shared cacheLiveOr503 helper; service-unavailable is the generic 503
++	// that every other converted plain 503 uses — its title matches http.StatusText
++	// so the wire title is preserved.
++	StoreUnavailable   = Register(ProblemType{Code: "store-unavailable", Status: http.StatusServiceUnavailable, Title: "Store Unavailable"})
++	ServiceUnavailable = Register(ProblemType{Code: "service-unavailable", Status: http.StatusServiceUnavailable, Title: "Service Unavailable"})
++	Internal           = Register(ProblemType{Code: "internal", Status: http.StatusInternalServerError, Title: "Internal Server Error"})
++
++	// Generic transport statuses. Titles match http.StatusText so converting a
++	// plain error of these statuses preserves the wire title.
++	MethodNotAllowed = Register(ProblemType{Code: "method-not-allowed", Status: http.StatusMethodNotAllowed, Title: "Method Not Allowed"})
++	BadGateway       = Register(ProblemType{Code: "bad-gateway", Status: http.StatusBadGateway, Title: "Bad Gateway"})
++	GatewayTimeout   = Register(ProblemType{Code: "gateway-timeout", Status: http.StatusGatewayTimeout, Title: "Gateway Timeout"})
++
++	// Sling. The first three are frozen (already public in the spec).
++	SlingMissingBead            = Register(ProblemType{Code: "sling-missing-bead", Status: http.StatusBadRequest, Title: "Sling Missing Bead"})
++	SlingCrossRig               = Register(ProblemType{Code: "sling-cross-rig", Status: http.StatusBadRequest, Title: "Sling Cross-Rig"})
++	SlingCrossStoreRoute        = Register(ProblemType{Code: "sling-cross-store-route", Status: http.StatusBadRequest, Title: "Sling Cross-Store Route"})
++	SlingSourceWorkflowConflict = Register(ProblemType{Code: "sling-source-workflow-conflict", Status: http.StatusConflict, Title: "Sling Source Workflow Conflict"})
++)
+diff --git a/internal/api/apierr/model.go b/internal/api/apierr/model.go
+new file mode 100644
+index 000000000..ba25d04b8
+--- /dev/null
++++ b/internal/api/apierr/model.go
+@@ -0,0 +1,59 @@
++package apierr
++
++import (
++	"fmt"
++
++	"github.com/danielgtaylor/huma/v2"
++)
++
++// ErrorModel is the Gas City problem+json body. It embeds huma.ErrorModel (so it
++// inherits the RFC 9457 shape — type/title/status/detail/instance/errors — plus
++// the StatusError behavior and the application/problem+json content type) and
++// adds a first-class machine-readable `code`. The Go type is named ErrorModel so
++// Huma's DefaultSchemaNamer keeps the OpenAPI schema name "ErrorModel"; `code` is
++// an additive, omitempty member, so the wire shape stays backward compatible.
++//
++// The canonical machine identifier is the `type` URN (urn:gascity:error:<code>);
++// `code` is a convenience projection of the URN's final segment for consumers
++// that switch on short slugs. The registry entry is the single source of truth.
++type ErrorModel struct {
++	huma.ErrorModel
++	Code string `json:"code,omitempty" doc:"Stable machine-readable error code (the final segment of the type URN)."`
++}
++
++// new builds an ErrorModel stamped with this problem type's URN, code, title, and
++// status, at the given occurrence-specific detail and status.
++func (pt ProblemType) new(status int, detail string, details []*huma.ErrorDetail) *ErrorModel {
++	return &ErrorModel{
++		ErrorModel: huma.ErrorModel{
++			Type:   pt.URN(),
++			Title:  pt.Title,
++			Status: status,
++			Detail: detail,
++			Errors: details,
++		},
++		Code: pt.Code,
++	}
++}
++
++// Msg builds an error of this problem type at its default status with a
++// human-readable detail. This is the primary constructor — the one way to mint a
++// gascity API error so the registered code/URN is always stamped.
++func (pt ProblemType) Msg(detail string) *ErrorModel { return pt.new(pt.Status, detail, nil) }
++
++// Msgf is Msg with a printf-style detail.
++func (pt ProblemType) Msgf(format string, a ...any) *ErrorModel {
++	return pt.new(pt.Status, fmt.Sprintf(format, a...), nil)
++}
++
++// With builds an error carrying an errors[] list of individual detail entries
++// (RFC 9457 "errors" member) in addition to the top-level detail.
++func (pt ProblemType) With(detail string, details ...*huma.ErrorDetail) *ErrorModel {
++	return pt.new(pt.Status, detail, details)
++}
++
++// WithStatus overrides the default status for the rare case where one problem
++// type maps to more than one status. The code/URN/title are unchanged.
++func (pt ProblemType) WithStatus(status int, detail string) *ErrorModel {
++	return pt.new(status, detail, nil)
++}
+diff --git a/internal/api/apierr/testenv_import_test.go b/internal/api/apierr/testenv_import_test.go
+new file mode 100644
+index 000000000..35a2b1b0a
+--- /dev/null
++++ b/internal/api/apierr/testenv_import_test.go
+@@ -0,0 +1,5 @@
++// Code generated by go run scripts/add-testenv-import.go; DO NOT EDIT.
++
++package apierr
++
++import _ "github.com/gastownhall/gascity/internal/testenv"
+diff --git a/internal/api/cursor_token.go b/internal/api/cursor_token.go
+new file mode 100644
+index 000000000..cf8dc940e
+--- /dev/null
++++ b/internal/api/cursor_token.go
+@@ -0,0 +1,87 @@
++package api
++
++import (
++	"encoding/base64"
++	"encoding/json"
++	"errors"
++	"strings"
++	"time"
++)
++
++// Keyset cursor tokens: versioned, opaque pagination cursors that encode the
++// sort-key boundary of the last row served instead of an integer offset.
++// Offsets skip or duplicate rows whenever a concurrent write shifts the
++// result set — a guarantee on a live work ledger — while a keyset boundary
++// stays stable: the next page is "rows strictly after this boundary in the
++// collection's total order" regardless of inserts above it.
++//
++// Wire format: "v1:" + base64url(JSON keysetCursor). The prefix versions the
++// token so a future format change (or yesterday's bare-offset cursors) is a
++// typed 400 invalid-cursor, never a silent misread.
++
++const cursorVersionPrefix = "v1:"
++
++// Cursor kinds. Each paginated collection accepts exactly one kind; a valid
++// token of the wrong kind is rejected by the handler as an invalid cursor.
++const (
++	// cursorKindCreatedID marks a (created_at, id) boundary — the total order
++	// of bead-backed collections (#3208).
++	cursorKindCreatedID = "cb"
++	// cursorKindSeq marks an event-log sequence boundary.
++	cursorKindSeq = "sq"
++)
++
++// keysetCursor is the decoded form of a v1 pagination token.
++type keysetCursor struct {
++	Kind      string    `json:"k"`
++	CreatedAt time.Time `json:"ca,omitzero"`
++	ID        string    `json:"id,omitempty"`
++	Seq       uint64    `json:"s,omitempty"`
++}
++
++var errInvalidCursor = errors.New("invalid pagination cursor")
++
++// encodeKeysetCursor serializes a boundary as an opaque v1 token.
++func encodeKeysetCursor(c keysetCursor) string {
++	data, err := json.Marshal(c)
++	if err != nil {
++		// keysetCursor contains only marshalable fields; unreachable.
++		return ""
++	}
++	return cursorVersionPrefix + base64.RawURLEncoding.EncodeToString(data)
++}
++
++// decodeKeysetCursor parses a v1 token, rejecting anything else — including
++// the legacy base64-offset cursors — with an error the handler maps to a 400
++// problem+json invalid-cursor response.
++func decodeKeysetCursor(token string) (keysetCursor, error) {
++	var zero keysetCursor
++	rest, ok := strings.CutPrefix(token, cursorVersionPrefix)
++	if !ok {
++		return zero, errInvalidCursor
++	}
++	data, err := base64.RawURLEncoding.DecodeString(rest)
++	if err != nil {
++		return zero, errInvalidCursor
++	}
++	var c keysetCursor
++	if err := json.Unmarshal(data, &c); err != nil {
++		return zero, errInvalidCursor
++	}
++	switch c.Kind {
++	case cursorKindCreatedID:
++		// A zero CreatedAt is a legal boundary: degraded rows (NULL or
++		// unparseable created_at from a drifted store) carry zero timestamps,
++		// sort to the created-DESC tail, and the server mints boundaries from
++		// them — the decoder must accept every token the server mints or a
++		// walk wedges in a 400 loop at the tail. Only the ID is required.
++		if c.ID == "" {
++			return zero, errInvalidCursor
++		}
++	case cursorKindSeq:
++		// Seq 0 is a legal boundary (before the first event).
++	default:
++		return zero, errInvalidCursor
++	}
++	return c, nil
++}
+diff --git a/internal/api/cursor_token_test.go b/internal/api/cursor_token_test.go
+new file mode 100644
+index 000000000..b4e4c1a6c
+--- /dev/null
++++ b/internal/api/cursor_token_test.go
+@@ -0,0 +1,86 @@
++package api
++
++import (
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestKeysetCursorRoundTrip(t *testing.T) {
++	ts := time.Date(2026, 7, 11, 12, 30, 45, 123456789, time.UTC)
++	in := keysetCursor{Kind: cursorKindCreatedID, CreatedAt: ts, ID: "gc-42"}
++	tok := encodeKeysetCursor(in)
++	if !strings.HasPrefix(tok, "v1:") {
++		t.Fatalf("token %q lacks the v1: version prefix", tok)
++	}
++	out, err := decodeKeysetCursor(tok)
++	if err != nil {
++		t.Fatalf("decode: %v", err)
++	}
++	if out.Kind != cursorKindCreatedID || out.ID != "gc-42" || !out.CreatedAt.Equal(ts) {
++		t.Fatalf("round trip = %+v, want %+v", out, in)
++	}
++}
++
++func TestKeysetCursorSeqRoundTrip(t *testing.T) {
++	in := keysetCursor{Kind: cursorKindSeq, Seq: 98765}
++	out, err := decodeKeysetCursor(encodeKeysetCursor(in))
++	if err != nil {
++		t.Fatalf("decode: %v", err)
++	}
++	if out.Kind != cursorKindSeq || out.Seq != 98765 {
++		t.Fatalf("round trip = %+v, want %+v", out, in)
++	}
++}
++
++func TestKeysetCursorRejectsGarbage(t *testing.T) {
++	for _, tc := range []struct {
++		name  string
++		token string
++	}{
++		{"empty", ""},
++		{"legacy offset cursor", "NTA"},          // base64("50") — the old format
++		{"no prefix", "eyJrIjoiY2IifQ"},          // valid b64 JSON, missing v1:
++		{"unknown version", "v9:eyJrIjoiY2IifQ"}, //
++		{"bad base64", "v1:!!!not-base64!!!"},    //
++		{"bad json", "v1:bm90LWpzb24"},           // base64("not-json")
++		{"unknown kind", "v1:eyJrIjoienoifQ"},    // {"k":"zz"}
++		{"cb missing id", "v1:eyJrIjoiY2IifQ"},   // {"k":"cb"} — no id
++		{"whitespace", "  "},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			if _, err := decodeKeysetCursor(tc.token); err == nil {
++				t.Fatalf("decodeKeysetCursor(%q) = nil error, want rejection", tc.token)
++			}
++		})
++	}
++}
++
++// TestKeysetCursorZeroCreatedAtRoundTrips pins the accept-what-you-mint
++// invariant: degraded rows (NULL/unparseable created_at from a drifted store)
++// carry zero timestamps, sort to the created-DESC tail, and the server mints
++// boundaries from them. The decoder must accept those tokens or a walk wedges
++// in a 400 loop at the tail.
++func TestKeysetCursorZeroCreatedAtRoundTrips(t *testing.T) {
++	tok := encodeKeysetCursor(keysetCursor{Kind: cursorKindCreatedID, ID: "gc-7"})
++	out, err := decodeKeysetCursor(tok)
++	if err != nil {
++		t.Fatalf("decode of a server-minted zero-CreatedAt token failed: %v", err)
++	}
++	if out.Kind != cursorKindCreatedID || out.ID != "gc-7" || !out.CreatedAt.IsZero() {
++		t.Fatalf("round trip = %+v, want zero-CreatedAt cb boundary for gc-7", out)
++	}
++}
++
++func TestKeysetCursorKindMismatchDetectable(t *testing.T) {
++	// A seq cursor decoded where a cb cursor is expected: the decode succeeds
++	// (it is a valid token) — the caller checks Kind. Pin that Kind survives.
++	tok := encodeKeysetCursor(keysetCursor{Kind: cursorKindSeq, Seq: 7})
++	out, err := decodeKeysetCursor(tok)
++	if err != nil {
++		t.Fatalf("decode: %v", err)
++	}
++	if out.Kind == cursorKindCreatedID {
++		t.Fatal("seq cursor decoded as cb kind")
++	}
++}
+diff --git a/internal/api/handler_events_keyset_helpers_test.go b/internal/api/handler_events_keyset_helpers_test.go
+new file mode 100644
+index 000000000..5455ba0b6
+--- /dev/null
++++ b/internal/api/handler_events_keyset_helpers_test.go
+@@ -0,0 +1,21 @@
++package api
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"testing"
++)
++
++// getList is extracted from upstream's internal/api/handler_lists_keyset_test.go
++// (S2 of the keyset-cursor track: convoys/mail/sessions), which is not ported
++// here — out of scope for the S3 events-only fix (ga-punx6/ga-jfl96) and its
++// other cases (TestConvoyList*, TestMailList*, TestSessionList*) exercise
++// endpoints this cherry-pick does not touch. handler_events_keyset_test.go
++// (S3) uses only this one shared helper.
++func getList(t *testing.T, h http.Handler, url string) *httptest.ResponseRecorder {
++	t.Helper()
++	req := httptest.NewRequest("GET", url, nil)
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, req)
++	return rec
++}
+diff --git a/internal/events/recorder.go b/internal/events/recorder.go
+index 8dd31fa82..f0b211080 100644
+--- a/internal/events/recorder.go
++++ b/internal/events/recorder.go
+@@ -431,15 +431,6 @@ func (r *FileRecorder) List(filter Filter) ([]Event, error) {
+ 	return ReadFiltered(r.path, filter)
+ }
+ 
+-// ListInFlight returns events matching the filter, including any still stranded
+-// in an in-flight events.jsonl.rotating-* file during the asynchronous
+-// compression window that plain List cannot see. Results are seq-ordered and
+-// de-duplicated by seq. It implements [InFlightProvider] so the event-list
+-// keyset walk cannot skip a just-rotated segment mid-rotation.
+-func (r *FileRecorder) ListInFlight(filter Filter) ([]Event, error) {
+-	return ReadFilteredWithInFlight(r.path, filter)
+-}
+-
+ // ListTail returns trailing matching events from the underlying file.
+ func (r *FileRecorder) ListTail(filter Filter, limit int) ([]Event, error) {
+ 	return ReadFilteredTail(r.path, filter, limit)

@@ -1,0 +1,65 @@
+diff --git a/cmd/gc/prompt.go b/cmd/gc/prompt.go
+index 47da219df..b809cec76 100644
+--- a/cmd/gc/prompt.go
++++ b/cmd/gc/prompt.go
+@@ -72,6 +72,15 @@ type PromptRenderResult struct {
+ 	Text    string
+ 	Version string
+ 	SHA     string
++	// Errors collects every rendering failure this call degraded through
++	// instead of surfacing: a main-template parse/execute error, or an
++	// inject_fragment lookup miss / execute error. All of these already
++	// print to stderr (see the fmt.Fprintf call sites below) and fall back
++	// to a degraded-but-non-empty Text — callers that must not ship a
++	// degraded prompt (spawning a new agent, `gc prime --strict`) check
++	// this field instead of re-deriving the same signal from stderr, which
++	// production callers routinely discard or never read (ga-8fwusw).
++	Errors []string
+ }
+ 
+ // renderPrompt reads a prompt template file and renders it with the given
+@@ -175,6 +184,7 @@ func renderPromptWithMeta(fs fsys.FS, cityPath, cityName, templatePath string, c
+ 			Text:    body,
+ 			Version: fm.Version,
+ 			SHA:     promptmeta.SHA(body),
++			Errors:  []string{fmt.Sprintf("prompt template %q: %v", templatePath, err)},
+ 		}
+ 	}
+ 
+@@ -186,19 +196,27 @@ func renderPromptWithMeta(fs fsys.FS, cityPath, cityName, templatePath string, c
+ 			Text:    body,
+ 			Version: fm.Version,
+ 			SHA:     promptmeta.SHA(body),
++			Errors:  []string{fmt.Sprintf("prompt template %q: %v", templatePath, err)},
+ 		}
+ 	}
+ 
+-	// Append injected fragments.
++	// Append injected fragments. A lookup miss or execute error on one
++	// fragment does not stop the others from rendering (best-effort, same
++	// as before) — but every failure is recorded in Errors so a caller that
++	// needs to know the output is degraded can find out without re-parsing
++	// stderr text.
++	var fragErrors []string
+ 	for _, name := range injectFragments {
+ 		frag := tmpl.Lookup(name)
+ 		if frag == nil {
+ 			fmt.Fprintf(stderr, "gc: inject_fragment %q: template not found\n", name) //nolint:errcheck // best-effort stderr
++			fragErrors = append(fragErrors, fmt.Sprintf("inject_fragment %q: template not found", name))
+ 			continue
+ 		}
+ 		var fbuf bytes.Buffer
+ 		if err := frag.Execute(&fbuf, td); err != nil {
+ 			fmt.Fprintf(stderr, "gc: inject_fragment %q: %v\n", name, err) //nolint:errcheck // best-effort stderr
++			fragErrors = append(fragErrors, fmt.Sprintf("inject_fragment %q: %v", name, err))
+ 			continue
+ 		}
+ 		buf.WriteString("\n\n")
+@@ -210,6 +228,7 @@ func renderPromptWithMeta(fs fsys.FS, cityPath, cityName, templatePath string, c
+ 		Text:    rendered,
+ 		Version: fm.Version,
+ 		SHA:     promptmeta.SHA(rendered),
++		Errors:  fragErrors,
+ 	}
+ }
+ 
