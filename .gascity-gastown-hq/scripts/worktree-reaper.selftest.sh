@@ -1883,8 +1883,9 @@ dg_kept dg_m "WORKTREE_REAPER_GENERATED_RE narrowed to match nothing"
 # calibration agent inside. Three holes: (1) age = the mtime of the root DIRECTORY, which only moves when a top-level entry is added or
 # removed — a battery writing under an ignored pesquisa/ never touches it; (2) _worktree_in_use was asked for MERGED trees only; (3)
 # `git worktree remove` without --force refuses only a DIRTY tree and ignored files do not make one, so the outputs went with it.
-# Every scenario here ages the WHOLE tree (dir, files, index; commits carry an old date) and turns ACTIVITY_SCAN on. (a)(b)(d)(f)(g)
-# (h)(i)(j)(k) fail on the pre-fix reaper; (c)(e)(l) pin that disk is still freed and that the old rule stays one knob away.
+# Every scenario here ages the WHOLE tree (dir, files, index; commits carry an old date) and turns ACTIVITY_SCAN on. Run against the
+# pre-fix reaper they all fail except (b2)(c)(e)(l)(n)(k3), which pin what must NOT change: disk is still freed (a merged tree, the
+# ordinary age path, a dead-holder lock) and the old rules stay one knob away.
 echo "── ga-m5i7e6: freshest-signal age, in-use on every path, pressure = merged only ──"
 M5_OLD=2020-01-01T00:00:00Z
 m5_mk() {   # <town> — a rig with origin/main (one OLD commit); pesquisa/ is excluded repo-wide so a tree holding it stays CLEAN
@@ -1990,6 +1991,30 @@ else bad "ga-m5i7e6 (k): town loop in-use — present=$([ -d "$TMP/m5k/.gc-workt
 m5_town1 m5k2; m5_run m5k2 "$PRESS"
 if [ -d "$TMP/m5k2/.gc-worktrees/x" ] && [ "$(events m5k2 kept_pressure_unmerged)" = "1" ]; then ok "ga-m5i7e6 (k): town .gc-worktrees loop — unmerged tree under pressure → KEPT, kept_pressure_unmerged logged"
 else bad "ga-m5i7e6 (k): town loop pressure — present=$([ -d "$TMP/m5k2/.gc-worktrees/x" ] && echo y || echo n) event=$(events m5k2 kept_pressure_unmerged)"; fi
+
+# (k2)(k3) loop 1 and a LOCKED unmerged tree: the guard leaves it to the lock contract (as the pool loop does), in use or not, pressure or not
+m5_town1 m5q; git -C "$TMP/m5q" worktree lock --reason "claude agent agent-m5 pid 1001 start x" "$TMP/m5q/.gc-worktrees/x"
+(cd "$TMP/m5q/.gc-worktrees/x" && pwd -P) > "$TMP/m5q.lsof"
+m5_run m5q WORKTREE_REAPER_FAKE_PS="$M5_PS" WORKTREE_REAPER_FAKE_LSOF="$TMP/m5q.lsof"
+if [ -d "$TMP/m5q/.gc-worktrees/x" ] && [ "$(events m5q kept_zombie_lock_in_use)" = "1" ]; then ok "ga-m5i7e6 (k2): town loop — dead lock holder but another process inside → KEPT, kept_zombie_lock_in_use logged"
+else bad "ga-m5i7e6 (k2): town loop zombie-in-use — present=$([ -d "$TMP/m5q/.gc-worktrees/x" ] && echo y || echo n) kept_zombie_lock_in_use=$(events m5q kept_zombie_lock_in_use)"; fi
+m5_town1 m5r; git -C "$TMP/m5r" worktree lock --reason "claude agent agent-m5 pid 1001 start x" "$TMP/m5r/.gc-worktrees/x"
+m5_run m5r "$PRESS" WORKTREE_REAPER_FAKE_PS="$M5_PS"
+if [ ! -d "$TMP/m5r/.gc-worktrees/x" ]; then ok "ga-m5i7e6 (k3): town loop — the same dead-holder lock, nobody inside, PRESSURE → reaped (the pressure keep does not shadow the lock contract)"
+else bad "ga-m5i7e6 (k3): town loop dead-holder lock under pressure — tree still there, kept_pressure_unmerged=$(events m5r kept_pressure_unmerged)"; fi
+
+# (o) the tree's own root directory cannot be stat'ed: unknown is not "since 1970" (pressure would read that as ancient and keep the tree for
+# ANOTHER reason, so the event is what tells them apart) → KEPT, kept_activity_unknown. The fake stat fails for that one path, anything else is the real one.
+m5_mk m5s; m5_tree m5s w unmerged; mkdir -p "$TMP/m5s-bin"
+printf '#!/bin/sh\nfor a in "$@"; do l="$a"; done\ncase "$l" in */crew/w) exit 1 ;; esac\nexec /usr/bin/stat "$@"\n' > "$TMP/m5s-bin/stat"; chmod +x "$TMP/m5s-bin/stat"
+m5_run m5s "$PRESS" PATH="$TMP/m5s-bin:$PATH"
+m5_kept m5s "(o): the tree's root directory cannot be read (stat fails) → unknown is not 1970: KEPT, kept_activity_unknown logged" kept_activity_unknown
+
+# (p) the same unknown-is-kept rule in loop 1: the walk inside the tree fails
+m5_town1 m5t; mkdir -p "$TMP/m5t-bin"; printf '#!/bin/sh\nexit 1\n' > "$TMP/m5t-bin/find"; chmod +x "$TMP/m5t-bin/find"
+m5_run m5t PATH="$TMP/m5t-bin:$PATH"
+if [ -d "$TMP/m5t/.gc-worktrees/x" ] && [ "$(events m5t kept_activity_unknown)" = "1" ]; then ok "ga-m5i7e6 (p): town loop — the walk inside the tree FAILS → KEPT, kept_activity_unknown logged"
+else bad "ga-m5i7e6 (p): town loop unknown — present=$([ -d "$TMP/m5t/.gc-worktrees/x" ] && echo y || echo n) kept_activity_unknown=$(events m5t kept_activity_unknown)"; fi
 
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"

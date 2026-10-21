@@ -23,8 +23,10 @@
 # name, else refs/reclaimed/<label>/<sha>), and ONLY THEN force-removes. If durability
 # can't be confirmed, the worktree is left byte-for-byte as it was — still dirty, so the
 # next sweep refuses it again too; nothing is ever removed on an unconfirmed guess. Age
-# gate protects anything touched recently. Pressure mode lowers the age gate when disk is
-# genuinely low. Branch deletion is merged-only. Kill switch: WORKTREE_REAPER_ENABLED=0.
+# gate protects anything touched recently (ga-m5i7e6: a tree's age is its FRESHEST sign of life — index, HEAD commit, any
+# file inside — not its root directory's mtime, and a tree a live process has its cwd or an open file in is never removed).
+# Pressure mode lowers the age gate when disk is genuinely low, but only MERGED trees go under it: an unmerged tree is kept
+# and logged with its size (kept_pressure_unmerged). Branch deletion is merged-only. Kill switch: WORKTREE_REAPER_ENABLED=0.
 # The one exception to "WITHOUT --force" is a LOCKED worktree (`remove -f -f`); it is reaped only
 # under the LOCK CONTRACT stated at ZOMBIE-LOCK DETECTION below, never because of its age alone.
 # A second, narrower exception (ga-he2c1u, town .gc-worktrees roots only): an UNLOCKED tree dirty with nothing but generated
@@ -252,16 +254,16 @@ _ref_patch_equivalent() {
   return 0
 }
 
-# ── _worktree_in_use <path> — ga-t14of: true iff a live process's CWD is the worktree
-# path itself or a subdirectory of it. Defense-in-depth beyond git's own dirty-check: a
+# ── _worktree_in_use <path> — ga-t14of: true iff a live process has its CWD (ga-m5i7e6: or any
+# open file) at the worktree path itself or inside it. Defense-in-depth beyond git's own dirty-check: a
 # git-CLEAN worktree can still be someone's live shell/build cwd, and removing it out
 # from under that process breaks it even though no file content is lost — the exact
 # failure mode ga-t14of's acceptance criteria calls out ("worktree em uso não é
-# removido, mesmo que a branch esteja mergeada"). Gates the merged-branch fast path
-# below, which otherwise bypasses the age gate that used to be the only thing standing
-# between "just created" and "removed". lsof unavailable/failing → fail SAFE (treat as
+# removido, mesmo que a branch esteja mergeada"). ga-m5i7e6: asked before EVERY removal (see _keep_unsafe
+# and the lock-contract helpers), where it used to gate the merged-branch fast path only; the age gate
+# is not a substitute, a busy tree can look old. lsof unavailable/failing → fail SAFE (treat as
 # in-use; never guess a worktree is free). Seam: WORKTREE_REAPER_FAKE_LSOF=<file>, one
-# absolute cwd path per line, for a hermetic selftest.
+# absolute path (a cwd or an open file) per line, for a hermetic selftest.
 _worktree_in_use() {
   local path="$1"
   if [ -n "${WORKTREE_REAPER_FAKE_LSOF:-}" ]; then
@@ -353,9 +355,11 @@ _wt_lock_reason() {
 # dirty-preserve force-remove (callers skip it for a LOCKED unmerged tree: the lock contract asks _worktree_in_use itself, and
 # reap_zombie_locked has its own check). 0 = KEEP it (the event is logged here), 1 = go on.
 #   (1) a live process has its cwd, its executable or any open file inside → kept_in_use (kept_merged_in_use when the tree is
-#       merged: the name older scenarios and dashboards know), merged or not, aged or not;
+#       merged: the name older scenarios and dashboards know), merged or not;
 #   (2) disk pressure removes only MERGED trees (PRESSURE_REAP_UNMERGED=1 restores the old rule): an unmerged one is
-#       kept_pressure_unmerged with its size, so what pressure no longer takes is visible, not silent.
+#       kept_pressure_unmerged with its size, so what pressure no longer takes is visible, not silent. Literal reading of the
+#       bead's decision: an unmerged tree idle past STALE_HOURS is kept under pressure too, though normal mode would reap it
+#       (its age_h on the event says which); a disk that stays low for days therefore stops reclaiming unmerged trees.
 _keep_unsafe() {
   local repo="$1" wt="$2" br="$3" age="$4" merged="$5" ev kb
   if _worktree_in_use "$wt"; then
