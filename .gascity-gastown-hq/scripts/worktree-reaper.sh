@@ -79,9 +79,8 @@ case "$(stat -f %m / 2>/dev/null)" in ''|*[!0-9]*) _STAT_BSD=0 ;; *) _STAT_BSD=1
 # (_ignored_data_scan): those that are not junk by name (IGNORED_JUNK_RE: regenerable, or tool state) and add up to IGNORED_MIN_KB or more keep
 # the tree (kept_ignored_data), locked or not. Only 0 on the guard = the old rule (ignored files go with the tree); anything else is "on".
 IGNORED_GUARD="${WORKTREE_REAPER_IGNORED_DATA_GUARD:-1}"
-IGNORED_MIN_KB="${WORKTREE_REAPER_IGNORED_MIN_KB:-1}"       # du KiB (a non-empty file is >= 1): the "small limit" below which ignored data does not hold a tree
-case "$IGNORED_MIN_KB" in ''|*[!0-9]*) IGNORED_MIN_KB=1 ;; esac
-[ "$IGNORED_MIN_KB" -ge 1 ] || IGNORED_MIN_KB=1             # 0 would read an empty listing as "data"
+IGNORED_MIN_KB="${WORKTREE_REAPER_IGNORED_MIN_KB:-1}"       # du KiB (a non-empty file is >= 1): the "small limit" below which ignored data does not hold a tree; 0 = any entry holds it
+case "$IGNORED_MIN_KB" in ''|*[!0-9]*) IGNORED_MIN_KB=1 ;; esac   # not a number → the default: any byte of data holds the tree, never a limit that lets data go
 IGNORED_JUNK_RE='(^|/)(\.venv|venv|node_modules|__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|build|dist|\.beads)(/|$)|\.pyc$|\.sw[op]$|(^|/)(\.DS_Store|Thumbs\.db|\.claude/settings\.local\.json)$'
 [ -z "${WORKTREE_REAPER_IGNORED_JUNK_RE:-}" ] || IGNORED_JUNK_RE="$WORKTREE_REAPER_IGNORED_JUNK_RE"
 # ── zombie-lock reaping (wa-8y45): a worktree LOCKED by a stuck/ancient agent ─────
