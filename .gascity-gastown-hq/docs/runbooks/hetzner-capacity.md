@@ -92,6 +92,8 @@ Efeito prático até a janela: o oráculo já deixa de dizer `node_full`, mas o 
 
 **Custo enquanto isso (lido em `packs/town-deltas/assets/pilot-dispatcher.sh`, não medido ao vivo):** com todas as `dog-remote` acordadas e ociosas o oráculo diz `node/free_slot` e o `_pilot_node_pick_alias` não acha alias. A isenção do priority yield e a passada só-nó do disk floor, que dependem do veredito `node`, claimam até `effective` beads por varredura e as soltam de volta ("o nó não ficou com a bead … claim solta"). Antes da mudança o veredito era `node_full` e nada era claimado. Quem decide se isso importa até a janela é o Mayor; a alternativa descartada por ora é fazer o Pilot reusar alias acordado-ocioso (decisão (a) do ga-2hd02v.1.22).
 
+**WhatsApp no nó (ga-2hd02v.3): o oráculo não mudou.** A sessão `wa-worker-remote-K` não tem alias de pool de dog; cai na linha "sempre ocupada" da tabela acima, então conta como ocupada enquanto viver e o oráculo já devolve a vaga certa para N slots de WA. Quem lê a ocupação por hora (`hetzner-occupancy.jsonl`) e quantas leituras tinham sessão de WA viva é `scripts/wa-node-report.py` (seção 2); a leitura está em `hetzner-wa-node.md`, "A prova do dia seguinte".
+
 ## Como ligar a sombra do Pilot
 
 Só depois do merge, e é do Mayor. Reversível tirando a chave.

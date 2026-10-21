@@ -22,6 +22,7 @@ O Mayor liberou a construção em paralelo à 1.6 (18/10 20:45) e pediu a ativa�
 | Agente | `agents/wa-worker-remote/` | O pool do nó: 0..3 sessões (teto do engine; quantas estão LIGADAS é `PILOT_WA_NODE_SLOTS`, padrão 1), `idle_timeout` 15 min, prompt de worker remoto. |
 | Gancho do Pilot | `_pilot_wa_node_decide` em `packs/town-deltas/assets/pilot-dispatcher.sh` (+ `pilot-dispatcher.wa-node-route.selftest.sh` e, para o modo `pilot`, `pilot-dispatcher.wa-node-spawn.selftest.sh`) | Chama o despachante e, no modo `pilot`, abre a sessão. **Padrão `off`.** |
 | Prod test | `packs/town-deltas/assets/prod-tests/gascity/story-ga-2hd02v.1.10.sh` | Roda os três selftests contra a árvore viva e confere que tudo está inerte. Não prova entrega nenhuma. |
+| Relatório | `scripts/wa-node-report.py` (+ `.selftest.sh`) | Só lê: conta o que a rota decidiu e a CPU do nó por hora. Diz se a sombra já dá base para REVISAR o `auto`; não liga nada. |
 
 Códigos de saída do despachante (o chamador que não entende um código trata como "fica no mini"): **0** feito · **10** fica no mini · **11** não consegui ler ou decidir · **12** não elegível agora (já tem dono ou rota, slot do nó ocupado, perdeu a corrida) · **13** escrita não confirmada (a releitura não achou nada nosso, mas um `bd update` morto por prazo ainda pode entrar no servidor depois; o gancho do Pilot segura a bead) · **2** uso. O `apply` recusa (12) toda bead que já tem rota, inclusive `wa-worker` carimbada numa varredura anterior (por exemplo, na espera do teto de sessões do pool): essa bead não migra para o nó sozinha. É a direção inerte, ela fica no mini.
 
@@ -128,6 +129,26 @@ Pré-condição: o flip da ga-2hd02v.1.6 provado (o `dog-remote` entregando de v
 
 * **1.6** (flip do `dog-remote`): pré-condição para ligar. A receita de atribuição vem dela.
 * **1.13** (`gate-done` remoto e liberação do assignee e da rota depois da entrega): o `release` daqui é a ponte manual. O worker remoto roda `gate-done` pelo atalho; que o gate aceite uma bead entregue pelo nó, e libere a rota sozinho, é da 1.13.
+
+## A prova do dia seguinte: `wa-node-report.py` (ga-2hd02v.3)
+
+A meta do Athos (20/10) é o nó a ~100% de CPU o tempo todo; a pergunta de cada manhã é **quantas beads de WA rodaram no nó e quanta CPU o nó teve por hora**. O relatório responde só lendo (não escreve nada, não chama `bd`, `gc` nem rede):
+
+```
+python3 scripts/wa-node-report.py                 # últimas 24 h, texto
+python3 scripts/wa-node-report.py --json          # uma linha de JSON (chaves: janela, ocupacao, prontidao, rota)
+python3 scripts/wa-node-report.py --hours 72 --min-beads 30 --busy-pct 90
+```
+
+Lê `$GC_CITY/.gc/wa-node-route.jsonl` (rota) e `$GC_CITY/.gc/hetzner-occupancy.jsonl` (CPU a cada 15 min, `hetzner-occupancy-watch.py`). Três seções:
+
+1. **Rota e sombra.** O veredito de cada bead é o **último** na janela (pela hora, não pela ordem do arquivo). `dry-run` (sombra) nunca conta como entrega ao nó; só `despachada para …` conta. Lista **para conferir uma a uma** toda bead que teve `node` em algum momento, com a base e as razões, e destaca as que **mudaram de veredito** (node numa linha, mini ou "não sei" em outra): é onde mora o risco de falso `node`.
+2. **CPU do nó por hora UTC.** CPU **não lida** (`lido=false`, ausente, fora de 0..100) aparece como `—` e nunca vira 0%; um 0% de verdade aparece como `0,0`. Mostra também quantas leituras tinham sessão `wa-worker-remote` viva.
+3. **Prontidão da sombra.** Mecânica, não aprovação: pede cobertura mínima em horas (`--min-hours`, padrão 24) e em beads distintas (`--min-beads`, padrão 30). Mesmo "suficiente" só diz "dá para REVISAR"; **quem liga o `auto` é uma pessoa**, depois de ler a lista da seção 1.
+
+Saída: **0** relatório feito · **2** uso errado · **3** nenhum dos dois logs (rota e ocupação) deu para usar (a saída sai mesmo assim, com `ausente`/`ilegivel` em cada um, nunca como zero) · **4** o relatório não se formou. Log **ausente** quer dizer "ainda não houve rodada", não "zero"; **ilegível** não vira vazio.
+
+Ler só a CPU não basta para saber se o WA está no nó: o `hetzner-capacity.py` já trata a sessão de WA como sempre-ocupada, então o oráculo não mudou (ver `hetzner-capacity.md`). O selftest do relatório (`scripts/wa-node-report.selftest.sh`) tem 103 itens e 65 mutantes; rodou no nó Linux em 20/10.
 
 ## O que não foi provado
 
