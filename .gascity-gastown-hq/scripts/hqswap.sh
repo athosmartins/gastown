@@ -53,6 +53,7 @@ notify_() { command -v notify >/dev/null 2>&1 && [ "$MODE" = run ] && notify -t 
 IRREVERSIBLE=0
 die() {
   log "FALHA: $*"
+  touch "$X/stop-watch"
   if [ "$IRREVERSIBLE" = 1 ]; then
     log "depois do irreversível: Dolt fica PARADO e travado. Voltar atrás B do runbook, à mão."
     notify_ "hqswap FALHOU depois da troca: $* — Dolt parado, ver $X/hqswap.log"
@@ -113,17 +114,32 @@ live_counts() {  # o servidor novo: HEAD da base no histórico + versionadas AS 
   for t in $VERSIONED; do printf '%s %s\n' "$t" "$(q "select count(*) from \`$t\` as of '$head'")"; done
 }
 live_ignored() { local t; for t in $IGNORED; do printf '%s %s\n' "$t" "$(dolt --host 127.0.0.1 --port "$PORT" --no-tls -u root -p '' --use-db "$DB" sql -r csv -q "select count(*) from \`$t\`" 2>&1 | tail -1)"; done; }
+same_content() {  # $1 = destino rsync; vazio = idêntico em conteúdo. Horário de diretório (.d..t) só é registrado
+  local out content
+  out=$(rsync -a --checksum --delete --dry-run --itemize-changes "$D/$DB/" "$1/" 2>&1) || { log "rsync dry-run falhou: $out"; return 1; }
+  content=$(printf '%s\n' "$out" | grep -v '^\.d\.\.t[.]* ' | grep -v '^$')
+  [ -n "$out" ] && [ -z "$content" ] && log "só horário de diretório difere em $1: $(printf '%s' "$out" | tr '\n' ' ')"
+  [ -z "$content" ] || { log "conteúdo difere em $1: $(printf '%s' "$content" | head -5 | tr '\n' ' ')"; return 1; }
+}
 mbp_identical() {
-  local out
-  out=$(rsync -a --checksum --dry-run --itemize-changes "$D/$DB/" "$MBP:$MBP_DIR/" 2>&1) || return 1
-  [ -z "$out" ] || { log "MacBook difere: $(printf '%s' "$out" | head -5)"; return 1; }
+  same_content "$MBP:$MBP_DIR" || return 1
   local lf lb rf rb
-  lf=$(find "$D/$DB" -type f | wc -l | tr -d ' '); lb=$(du -sk "$D/$DB" | cut -f1)
-  rf=$(ssh "$MBP" "find $MBP_DIR -type f | wc -l" | tr -d ' '); rb=$(ssh "$MBP" "du -sk $MBP_DIR" | cut -f1)
-  log "MacBook: arquivos $lf/$rf, KB $lb/$rb"
+  lf=$(find "$D/$DB" -type f | wc -l | tr -d ' '); lb=$(find "$D/$DB" -type f -exec stat -f %z {} + | awk '{s+=$1} END{print s}')
+  rf=$(ssh "$MBP" "find $MBP_DIR -type f | wc -l" | tr -d ' '); rb=$(ssh "$MBP" "find $MBP_DIR -type f -exec stat -f %z {} + | awk '{s+=\$1} END{print s}'")
+  log "MacBook: arquivos $lf/$rf, bytes $lb/$rb"
   [ "$lf" = "$rf" ] && [ "$lb" = "$rb" ]
 }
-
+watch_dotdolt() {  # registra cada mudança de entradas em $D/$DB/.dolt (pega quem abre o banco sem lock)
+  local prev="" cur=""
+  while [ ! -e "$X/stop-watch" ]; do
+    cur=$(ls -la "$D/$DB/.dolt" 2>/dev/null | awk 'NR>1{print $1,$5,$6,$7,$8,$9}')
+    if [ "$cur" != "$prev" ]; then
+      { echo "--- $(date '+%T')"; printf '%s\n' "$cur"; lsof +D "$D/$DB" 2>/dev/null | awk 'NR>1{print $1,$2}' | sort -u; } >> "$X/dotdolt-watch.log"
+      prev=$cur
+    fi
+    sleep 1
+  done
+}
 prep() {  # passos 2-3 do runbook (só em produção)
   [ "$MODE" = run ] || return 0
   touch "$HALT" || return 1
@@ -166,6 +182,7 @@ lifecycle stop; rc=$?
 for _ in $(seq 1 30); do no_dolt_on "$D/$DB" && break; sleep 1; done
 no_dolt_on "$D/$DB" || die "ainda há processo dolt com o hq aberto depois do stop"
 log "5 Dolt parado"
+rm -f "$X/stop-watch"; watch_dotdolt & WATCH_PID=$!
 
 # 6. travar o launchd (sobrevive a reboot)
 freeze_launchd || die "launchctl disable falhou"
@@ -179,6 +196,10 @@ PN=$!
 PM=$!
 wait $PN || die "rsync para o nó falhou ($X/rsync-node.log)"
 log "7a nó com a cópia congelada"
+wait $PM || die "rsync para o MacBook falhou ($X/rsync-mbp.log)"
+log "7b MacBook com a cópia congelada"
+same_content "$NODE:$NODE_DIR" || die "cópia do nó não confere com o mini antes do GC"
+log "7c nó idêntico ao mini (conteúdo) — o GC roda sobre este estado"
 
 # 8. linha de base no nó (antes do GC)
 node_counts > "$X/base.txt" || die "contagem de base no nó falhou"
@@ -195,8 +216,7 @@ diff -u "$X/base.txt" "$X/after-gc.txt" || die "contagens/HEAD mudaram com o GC"
 node "cd $NODE_DIR && ~/$NODE_DOLT fsck" > "$X/fsck.log" 2>&1 || die "fsck sujo ($X/fsck.log)"
 log "9 GC ok, contagens iguais, fsck limpo; nó: $(node "du -sh $NODE_DIR" | cut -f1)"
 
-# 10. MacBook bit a bit
-wait $PM || die "rsync para o MacBook falhou ($X/rsync-mbp.log)"
+# 10. MacBook bit a bit (e o mini não mudou desde a cópia)
 mbp_identical || die "cópia do MacBook não confere"
 log "10 MacBook idêntico"
 
@@ -229,6 +249,7 @@ grep -vE "^(HEAD|$(echo $VERSIONED | tr ' ' '|')) " "$X/base.txt" | diff -u - "$
   && log "12 tabelas ignoradas iguais à base" || log "AVISO: tabelas ignoradas diferem da base (pode ser gravação nova depois do start) — conferir $X/live-ignored.txt"
 log "12 servidor novo conferido; hq agora $(du -sh "$D/$DB" | cut -f1)"
 [ -d "$X/hq.old" ] && log "hq.old ainda em $X/hq.old (apagar depois de 24 h ou quando o disco pedir)"
+touch "$X/stop-watch"
 finish
 log "13-14 cidade retomada, vigias de volta (HALT da rotina de compactação FICA)"
 notify_ "hqswap OK: hq agora $(du -sh "$D/$DB" | cut -f1), cidade retomada."
