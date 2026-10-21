@@ -7,8 +7,8 @@
 # O QUE VERIFICA (nos arquivos IMPLANTADOS, não numa cópia): o classificador, o filtro e a lista mac-only do PS, o despachante, o gancho do Pilot e o gate-done-remote existem e parseiam; os selftests
 #   terminam com "N/N ok" e o mínimo de casos; o template ps-worker-remote nasce INERTE (min_active_sessions = 0, 1 só); o despachante do PS fixa o modo pilot (a bead do PS não está na loja que o
 #   pool enxerga); o gancho do Pilot nasce DESLIGADO (padrão `off` no fonte, e nenhum arquivo de configuração da cidade o liga); o prompt do worker remoto não tem skill com barra no início (ga-7nxfa1)
-#   e usa `bd -C property_scrapers`; a Seção 1 do filtro do PS é a do WA; se os 5 arquivos de teste que dependem do binário `node` estão FORA da lista mac-only, o nó tem o Node do pin
-#   (scripts/hetzner-nodejs-guard.sh, ga-2hd02v.4.11: FALHA se o nó não tem, AVISO se não deu para saber).
+#   e usa `bd -C property_scrapers`; a Seção 1 do filtro do PS é a do WA; se ALGUM teste do PS que chama o node (derivado do repositório do PS, 6 hoje) está FORA da lista mac-only, o nó tem o Node do pin
+#   (scripts/hetzner-nodejs-guard.sh, ga-2hd02v.4.11 e .4.14: FALHA se o nó não tem; AVISO se não deu para saber, e a última linha então diz "NÃO verificado"; se todos estão cobertos pela lista, a última linha diz "não se aplica").
 # O QUE NÃO VERIFICA — e não diz que verifica: a "1 bead de PS construída no nó, passando no gate" que a história pede. Ela depende de ligar o gancho (PILOT_PS_NODE_ROUTE) e de uma bead real com
 #   `node:ok`: passos 6–7 do runbook docs/runbooks/hetzner-ps-node.md, não deste teste. Este teste PASSAR não diz que o nó entregou uma bead de PS.
 # POR QUE É SEGURO RODAR: os selftests usam stubs de bd/gc/ssh e uma cidade temporária; as leituras da configuração são só leitura. A única chamada de rede é o `hetzner-nodejs.sh check` do guarda do Node: só leitura, ssh com BatchMode e prazo. Nada é despachado, atribuído nem escrito em bead, e o servidor não é tocado.
@@ -81,14 +81,14 @@ grep -qE '^[^#[:space:]]' "$MAC_PS" || fail "a lista mac-only do PS não tem nen
 log "Seção 1 do filtro do PS igual à do WA; lista mac-only do PS tem globs ✓"
 
 # ── o Node que justifica a lista (ga-2hd02v.4.11) ────────────────────────────
-# os 5 arquivos de teste que dependem do binário `node` saíram da lista mac-only porque o nó tem o Node; se o nó for refeito sem ele, o PS manda bead ao nó e ela reprova alto
+# os testes do PS que dependem do binário `node` (os 5 da medição mais o que nascer depois: o guarda DERIVA o conjunto) saíram da lista mac-only porque o nó tem o Node; se o nó for refeito sem ele, o PS manda bead ao nó e ela reprova alto
 NJG="$CITY/scripts/hetzner-nodejs-guard.sh"
 need "$NJG"; syntax "$NJG"
 # vazio → o guarda sempre imprime uma linha; falhou/ilegível (rc 2) → aviso visível e a nota final, nunca verde calado
 njg_out=$("$BASH32" "$NJG" 2>&1); njg_rc=$?
 NODE_NOTE="Node do nó verificado"
 case $njg_rc in
-  0) log "$njg_out ✓" ;;
+  0) log "$njg_out ✓"; case "$njg_out" in *"não é exigido"*) NODE_NOTE="Node do nó: não se aplica (os testes que o exigem estão na lista mac-only; nada foi verificado no nó)" ;; esac ;;
   1) fail "$njg_out" ;;
   *) warn "$njg_out"; NODE_NOTE="Node do nó NÃO verificado (aviso acima)" ;;
 esac
