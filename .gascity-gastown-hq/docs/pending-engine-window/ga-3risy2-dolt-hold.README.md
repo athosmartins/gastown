@@ -61,10 +61,20 @@ file is removed. While it holds, nothing starts, recovers or restarts the manage
 * `scripts/dolt-hold-lib.sh`: the same reader for shell. `dolt_hold_blocks` is byte-identical to
   the engine helper (the selftest compares them against this patch).
 * `scripts/dolt-hold.sh on|off|status`: places the hold atomically (a hard link, so it never lands
-  over a hold in force; of two concurrent `on` calls one wins and the other exits 3), default
-  expiry 2 h (cap 12 h unless `--no-expiry`). `--ttl-secs` is decimal: `07200` is 7200 s, not
-  octal. An unreadable clock refuses (exit 4). After writing it reads the file back and requires
-  both "a hold in force" and the `expires_at` it asked for. `off` re-asks the reader after
+  over a hold in force; with nothing at the destination, of two concurrent `on` calls one wins and
+  the other exits 3), default expiry 2 h (cap 12 h unless `--no-expiry`). `--ttl-secs` is decimal:
+  `07200` is 7200 s, not octal; it excludes `--no-expiry` (exit 2), and an option's value cannot
+  be another option (`--reason --no-expiry` is exit 2, not a reason). An unreadable clock refuses
+  (exit 4). `--reason` is capped at 1000 bytes and `--owner` at 200 (exit 2, counted in bytes:
+  600 `ã` are 1200), and `expires_at` is written BEFORE them, because both readers see only the
+  first 4096 bytes. It never deletes anything: the hold is published with `ln`, which fails when
+  the destination exists, so a valid hold that arrived while this `on` was preparing its own is
+  left alone (exit 3), and an EXPIRED file left in place is refused too (exit 3, "run `off`"):
+  it is released for the guards, but removing another operator's file is not something `on` does.
+  After writing it reads back the first 4096 bytes (what the
+  readers see, not the whole file) and requires both "a hold in force" and the `expires_at` it
+  asked for (or none, with `--no-expiry`); a failed read-back is exit 4, never "no expiry". The
+  temporary file is removed on any exit, including TERM/INT/HUP. `off` re-asks the reader after
   removing and exits 4 if a hold still blocks (for instance a hold file that exists but sits in an
   unsearchable directory), instead of reporting "nothing to remove".
 * `dolt-hang-watchdog.sh`: under a hold, no probe, no strike, no restart, no death snapshot, and
@@ -98,17 +108,28 @@ live. If a long hold on a healthy Dolt is ever wanted, bootout the launchd job f
   it guards (starting or killing a Dolt on a directory being swapped) is the destructive act.
   Cost: a typo in `expires_at` keeps Dolt down until someone fixes the file; the message says so.
   Only an absent file (ENOENT) or a passed `expires_at` releases.
-* **Expired ≠ removed.** Nothing deletes an expired file; readers treat it as released.
+* **Expired ≠ removed.** Nothing deletes an expired file; readers treat it as released. That
+  includes `dolt-hold.sh on`: over an expired leftover it refuses (exit 3) and says to run `off`
+  first. The earlier behaviour (delete the expired file, then publish) was a check-then-act on a
+  file that is not the tool's to delete: two `on` calls started together with an expired hold in
+  place collided in 18 of 60 runs (10 with both exiting 0 and one hold silently replaced by the
+  other, 8 with one exiting 4), and a valid hold arriving between the check and the `rm` was
+  deleted. With `on` unable to delete, 60 of 60 runs were exact in each situation (nothing at the
+  destination: one exits 0 and the other 3; an expired file in place: both exit 3 and the file is
+  unchanged). Cost: one extra step (`off`, then `on`) when a forgotten expired hold is lying there.
 * **`start` refuses even if a Dolt is already running.** Simpler to reason about than a partial
   carve-out. `ensure-ready` answers "already healthy" before it reaches `start`, so a running
   Dolt under a hold keeps serving.
 * **Exit 1, not 2.** `runProviderOp` treats exit 2 as "not needed, success".
 * **A forgotten hold is the main hazard.** Hence the 2 h default expiry in the tool. A bare
   `touch` has no expiry on purpose; use the tool.
-* **The reader looks at the first 4 KiB.** Both readers (Go and shell) cap the read, so a hand-edited
-  file whose `expires_at` line sits past byte 4096 is read as having no expiry (an unexpired hold
-  that never releases), and one cut in the middle of the digits reads as a shorter, probably
-  already past, time. The tool writes a few dozen bytes; only a hand-made file can hit this.
+* **The reader looks at the first 4 KiB.** Both readers (Go and shell) cap the read, so a file
+  whose `expires_at` line sits past byte 4096 is read as having no expiry (an unexpired hold that
+  never releases), and one cut in the middle of the digits reads as a shorter, probably already
+  past, time. The tool used to be able to produce that itself (an unbounded `--reason` was written
+  before `expires_at`, and its read-back looked at the whole file, so it reported success). Now
+  `--reason`/`--owner` are capped, `expires_at` comes first, and the read-back uses the same 4096
+  bytes the readers do. A hand-made file can still hit it; the tool cannot.
 * **Boot with a hold on:** Dolt does not start (`gc dolt start` is refused), so the city cannot
   come up until the hold is released or expires. Expected from the code, not exercised. The
   expiry is what bounds this.
@@ -132,8 +153,18 @@ and a parent that is such a symlink (the Go reader said "no hold", the shell one
 `TestGCBeadsBdFallbackHoldReaderNeverBlocksLessThanHelper` (11 situations, the fallback must hold
 wherever the helper does; it failed for the dangling symlink, the dangling or regular-file parent,
 the unsearchable parent and the missing path); `TestRestartWarnsWhenHoldHelperIsMissing`.
+After the second gate review the same was done for a directory ABOVE the parent: the shell readers
+(the engine helper, the city lib and the `gc-beads-bd.sh` fallback) read `[ -e parent ]` false as
+"the parent is gone" even when the cause was EACCES or ENOTDIR on a component above it, while Go
+held; and Go in turn read a dangling symlink above the parent as "no hold" while the shell held.
+`TestReadManagedDoltHoldUnreadableBlocks` gained four subtests (unsearchable ancestor, a file in
+place of an ancestor, a dangling-symlink ancestor, and the control: a symlink that resolves with
+nothing under it must still read as "no hold" in both readers) and the fallback test gained three
+situations (14 now) plus a `wantBlock` field so a scenario where the helper lets the path through
+cannot pass vacuously. Each was run red first (the shell subtests against the previous helper,
+the Go one against the previous reader, the fallback ones against the previous fallback).
 
-City side: `scripts/dolt-hold.selftest.sh` (71 checks, also under macOS `/bin/bash` 3.2), plus HOLD sections added to
+City side: `scripts/dolt-hold.selftest.sh` (97 checks, also under macOS `/bin/bash` 3.2), plus HOLD sections added to
 `dolt-hang-watchdog.selftest.sh` and `dolt-disk-floor-guard.selftest.sh`; the HOLD assertions
 fail against the pre-change guard scripts.
 
@@ -180,6 +211,17 @@ restore the previous binary (`gc` symlink). The city-side scripts are inert with
 * **`hqswap.sh` is not changed.** It still freezes launchd and suspends the city; adopting the
   hold there is a follow-up once this is live.
 * **Shell reader vs Go reader:** they agree on every tested case, including a dangling symlink at
-  the hold path or as its parent (both hold). They still differ if a regular file sits further up
-  the path than the immediate parent (Go: unreadable/blocks; shell: reads as "absent", because it
-  only inspects the immediate parent).
+  the hold path, as its parent or anywhere above it, an unsearchable directory anywhere above the
+  hold, and a regular file in place of any ancestor (all hold), and a symlink above the parent
+  that resolves with nothing under it (both read "no hold"). Residual, from reading the code and
+  NOT exercised: `[ -e ]` cannot say WHY a stat failed. The shell tells ENOENT from EACCES/ENOTDIR
+  by looking at the nearest component it can see; a failure of another kind in the middle of the
+  path (EIO, a stale network mount) is invisible to it and reads as "gone", while Go (`os.Open`)
+  holds.
+* **A hold the readers cannot read is silent beyond the log.** The watchdog logs a line on every
+  tick under an unreadable hold and stays inert (it also drops its strikes/veto/PID baseline each
+  tick); nothing counts or pages "N ticks held-unreadable". Fail-closed is the choice, so a bad
+  path or wrong permissions leave a real Dolt hang unrecovered with no signal other than that
+  log line. A counter/page for it is a follow-up.
+* **`kill -9` between `mktemp` and the publish** leaves `.dolt-hold.XXXXXX` next to the hold file.
+  No reader looks at it (only `dolt-hold` counts); TERM/INT/HUP clean it up.

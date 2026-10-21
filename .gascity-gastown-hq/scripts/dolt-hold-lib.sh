@@ -67,14 +67,35 @@ dolt_hold_blocks() {
         _dh_file="$PACK_STATE_DIR/dolt-hold"
     fi
 
-    # Parent directory absent -> nobody can have placed a hold there. Parent
-    # present but not a directory, or not searchable -> unreadable (blocks),
-    # as ENOTDIR/EACCES are in Go. File absent -> no hold. File present but not
-    # a readable regular file -> unreadable. (Only the immediate parent is
-    # checked; a regular file further up the path reads as "absent" here.)
-    _dh_dir=$(dirname "$_dh_file")
+    # Parent directory really absent -> nobody can have placed a hold there.
+    # [ -e ] is false for ENOENT but ALSO for EACCES/ENOTDIR on a component
+    # above the parent, which Go (os.Open) reads as unreadable; so "absent"
+    # only holds when the nearest ancestor that does exist is a searchable
+    # directory. Parent present but not a directory, or not searchable ->
+    # unreadable (blocks), as ENOTDIR/EACCES are in Go. File absent -> no
+    # hold. File present but not a readable regular file -> unreadable.
+    # (A symlink above the parent that leads nowhere holds here, as it does in
+    # Go: something is on the path, so nothing can say "no hold".)
+    # empty (no directory named) or failed (dirname) -> unreadable, never "absent"
+    _dh_dir=$(dirname "$_dh_file") || _dh_dir=""
+    if [ -z "$_dh_dir" ]; then
+        DOLT_HOLD_MESSAGE="dolt hold file $_dh_file could not be read (could not tell its directory); treating it as a hold"
+        return 0
+    fi
     if [ ! -e "$_dh_dir" ] && [ ! -h "$_dh_dir" ]; then
-        return 1
+        _dh_anc="$_dh_dir"
+        while [ ! -e "$_dh_anc" ] && [ ! -h "$_dh_anc" ]; do
+            _dh_up=$(dirname "$_dh_anc") || _dh_up=""
+            if [ -z "$_dh_up" ] || [ "$_dh_up" = "$_dh_anc" ]; then
+                break
+            fi
+            _dh_anc="$_dh_up"
+        done
+        if { [ -e "$_dh_anc" ] || [ -h "$_dh_anc" ]; } && [ -d "$_dh_anc" ] && [ -x "$_dh_anc" ]; then
+            return 1 # the nearest existing ancestor is searchable: really absent
+        fi
+        DOLT_HOLD_MESSAGE="dolt hold file $_dh_file could not be read ($_dh_anc is not a searchable directory); treating it as a hold"
+        return 0
     fi
     if [ ! -d "$_dh_dir" ]; then
         DOLT_HOLD_MESSAGE="dolt hold file $_dh_file could not be read ($_dh_dir is not a directory); treating it as a hold"

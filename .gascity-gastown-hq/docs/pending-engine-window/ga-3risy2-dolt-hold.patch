@@ -57,10 +57,10 @@ index 862561fa9..9984c96e3 100644
  	}
 diff --git a/cmd/gc/dolt_hold.go b/cmd/gc/dolt_hold.go
 new file mode 100644
-index 000000000..84b01c08e
+index 000000000..ae7f61764
 --- /dev/null
 +++ b/cmd/gc/dolt_hold.go
-@@ -0,0 +1,283 @@
+@@ -0,0 +1,309 @@
 +package main
 +
 +import (
@@ -202,9 +202,9 @@ index 000000000..84b01c08e
 +// managedDoltHoldPathAbsent reports whether nothing at all is on the hold
 +// path: the parent directory is really gone, or it is there and the file is
 +// not. A symlink counts as something even when its target is missing, for the
-+// file and for the parent, which is what the shell reader does
-+// (examples/bd/assets/scripts/dolt-hold.sh). Anything it cannot tell comes back
-+// as an error, which the caller reads as a hold.
++// file, for the parent and for any directory above the parent, which is what
++// the shell reader does (examples/bd/assets/scripts/dolt-hold.sh). Anything it
++// cannot tell comes back as an error, which the caller reads as a hold.
 +func managedDoltHoldPathAbsent(path string) (bool, error) {
 +	dir := filepath.Dir(path)
 +	if _, err := os.Stat(dir); err != nil {
@@ -212,14 +212,9 @@ index 000000000..84b01c08e
 +			return false, err
 +		}
 +		// The parent does not resolve: gone for real, or a link that leads
-+		// nowhere. Only the first says "no hold".
-+		if _, lerr := os.Lstat(dir); lerr != nil {
-+			if errors.Is(lerr, fs.ErrNotExist) {
-+				return true, nil
-+			}
-+			return false, lerr
-+		}
-+		return false, err
++		// nowhere — its own, or one on a component above it, whose ENOENT
++		// would otherwise read as the parent's. Only the first says "no hold".
++		return managedDoltHoldAncestorsAbsent(dir, err)
 +	}
 +	if _, err := os.Lstat(path); err != nil {
 +		if errors.Is(err, fs.ErrNotExist) {
@@ -228,6 +223,37 @@ index 000000000..84b01c08e
 +		return false, err
 +	}
 +	return false, nil
++}
++
++// managedDoltHoldAncestorsAbsent decides what an ENOENT on dir means. It walks
++// up to the nearest component that exists: if that is a real directory (or a
++// link that resolves) the rest of the path really is gone and nobody can have
++// put a hold under it; if it is a link that leads nowhere, the ENOENT is the
++// link's and something IS on the path, so the answer is "cannot tell", which
++// the caller reads as a hold. enoent is what Stat(dir) reported.
++func managedDoltHoldAncestorsAbsent(dir string, enoent error) (bool, error) {
++	for p := dir; ; {
++		fi, err := os.Lstat(p)
++		switch {
++		case err == nil:
++			if fi.Mode()&os.ModeSymlink != 0 {
++				if _, serr := os.Stat(p); serr != nil {
++					return false, enoent
++				}
++			}
++			return true, nil
++		case !errors.Is(err, fs.ErrNotExist):
++			return false, err
++		}
++		up := filepath.Dir(p)
++		if up == p {
++			// Walked past the root without finding anything that exists:
++			// not a path anybody could have put a hold on, but also not
++			// something worth calling "no hold" on a guess.
++			return false, enoent
++		}
++		p = up
++	}
 +}
 +
 +// readManagedDoltHold reads the hold for the city. It never returns a Go
@@ -346,10 +372,10 @@ index 000000000..84b01c08e
 +}
 diff --git a/cmd/gc/dolt_hold_script_test.go b/cmd/gc/dolt_hold_script_test.go
 new file mode 100644
-index 000000000..b5301faea
+index 000000000..239205fc0
 --- /dev/null
 +++ b/cmd/gc/dolt_hold_script_test.go
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,241 @@
 +package main
 +
 +import (
@@ -470,6 +496,10 @@ index 000000000..b5301faea
 +		setup    func(t *testing.T, holdPath string)
 +		skipAs0  bool
 +		wantFree bool // both readers must say "no hold"
++		// wantBlock: both readers must hold. Without it a scenario where the
++		// helper lets the path through would pass the "never blocks less"
++		// check below for the wrong reason (nothing to be looser than).
++		wantBlock bool
 +	}
 +	mkParent := func(t *testing.T, holdPath string) {
 +		t.Helper()
@@ -522,6 +552,32 @@ index 000000000..b5301faea
 +			}
 +			t.Cleanup(func() { _ = os.Chmod(parent, 0o755) })
 +		}},
++		{name: "ancestor above the parent not searchable", skipAs0: true, wantBlock: true, setup: func(t *testing.T, holdPath string) {
++			writeHoldFile(t, holdPath, "owner=x\n")
++			packs := filepath.Dir(filepath.Dir(holdPath))
++			if err := os.Chmod(packs, 0o000); err != nil {
++				t.Fatal(err)
++			}
++			t.Cleanup(func() { _ = os.Chmod(packs, 0o755) })
++		}},
++		{name: "a file where an ancestor above the parent should be", wantBlock: true, setup: func(t *testing.T, holdPath string) {
++			packs := filepath.Dir(filepath.Dir(holdPath))
++			if err := os.MkdirAll(filepath.Dir(packs), 0o755); err != nil {
++				t.Fatal(err)
++			}
++			if err := os.WriteFile(packs, []byte("x"), 0o644); err != nil {
++				t.Fatal(err)
++			}
++		}},
++		{name: "ancestor above the parent is a symlink whose target is missing", wantBlock: true, setup: func(t *testing.T, holdPath string) {
++			packs := filepath.Dir(filepath.Dir(holdPath))
++			if err := os.MkdirAll(filepath.Dir(packs), 0o755); err != nil {
++				t.Fatal(err)
++			}
++			if err := os.Symlink(filepath.Join(filepath.Dir(packs), "no-such-dir"), packs); err != nil {
++				t.Fatal(err)
++			}
++		}},
 +		{name: "file not readable", skipAs0: true, setup: func(t *testing.T, holdPath string) {
 +			writeHoldFile(t, holdPath, "owner=x\n")
 +			if err := os.Chmod(holdPath, 0o000); err != nil {
@@ -542,6 +598,9 @@ index 000000000..b5301faea
 +			if sc.wantFree && (helper || fb) {
 +				t.Fatalf("no hold here, but helper blocks=%v (%q) fallback blocks=%v", helper, msg, fb)
 +			}
++			if sc.wantBlock && (!helper || !fb) {
++				t.Fatalf("this path must hold, but helper blocks=%v (%q) fallback blocks=%v", helper, msg, fb)
++			}
 +			if helper && !fb {
 +				t.Fatalf("helper blocks (%q) but the fallback lets it through — \"never blocks less\" is false", msg)
 +			}
@@ -560,10 +619,10 @@ index 000000000..b5301faea
 +}
 diff --git a/cmd/gc/dolt_hold_test.go b/cmd/gc/dolt_hold_test.go
 new file mode 100644
-index 000000000..7929caa88
+index 000000000..ba8f0290d
 --- /dev/null
 +++ b/cmd/gc/dolt_hold_test.go
-@@ -0,0 +1,520 @@
+@@ -0,0 +1,608 @@
 +package main
 +
 +import (
@@ -785,6 +844,94 @@ index 000000000..7929caa88
 +		}
 +		if blocks, msg := shellHoldBlocks(t, holdPath); !blocks {
 +			t.Fatalf("dolt-hold.sh let a dangling parent symlink through: %q", msg)
++		}
++	})
++	t.Run("an ancestor above the parent directory is not searchable", func(t *testing.T) {
++		if os.Geteuid() == 0 {
++			t.Skip("root ignores directory modes")
++		}
++		cityPath, holdPath := holdTestCity(t)
++		// The parent (.../packs/dolt) cannot be stat'd because the directory
++		// above it (.../packs) has no search permission: os.Open says EACCES,
++		// not ENOENT, so nothing says "no hold". [ -e parent ] is false in the
++		// shell for the same reason, and the shell reader must tell the two
++		// apart instead of reading it as "the parent is gone".
++		writeHoldFile(t, holdPath, "owner=x\n")
++		packs := filepath.Dir(filepath.Dir(holdPath))
++		if err := os.Chmod(packs, 0o000); err != nil {
++			t.Fatal(err)
++		}
++		t.Cleanup(func() { _ = os.Chmod(packs, 0o755) })
++		got := readManagedDoltHold(cityPath)
++		if got.State != managedDoltHoldUnreadable || !got.Blocks() {
++			t.Fatalf("hold = %+v, want unreadable+blocking", got)
++		}
++		if blocks, msg := shellHoldBlocks(t, holdPath); !blocks {
++			t.Fatalf("dolt-hold.sh read a hold behind an unsearchable ancestor as \"no hold\": %q", msg)
++		}
++	})
++	t.Run("a file where an ancestor above the parent directory should be", func(t *testing.T) {
++		cityPath, holdPath := holdTestCity(t)
++		// ENOTDIR two levels up: the immediate parent does not exist as far as
++		// [ -e ] can tell, yet the path is not "gone" — a regular file sits
++		// where a directory should be.
++		packs := filepath.Dir(filepath.Dir(holdPath))
++		if err := os.MkdirAll(filepath.Dir(packs), 0o755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(packs, []byte("x"), 0o644); err != nil {
++			t.Fatal(err)
++		}
++		got := readManagedDoltHold(cityPath)
++		if got.State != managedDoltHoldUnreadable || !got.Blocks() {
++			t.Fatalf("hold = %+v, want unreadable+blocking", got)
++		}
++		if blocks, msg := shellHoldBlocks(t, holdPath); !blocks {
++			t.Fatalf("dolt-hold.sh read a file-above-the-parent as \"no hold\": %q", msg)
++		}
++	})
++	t.Run("an ancestor above the parent directory is a symlink whose target is missing", func(t *testing.T) {
++		cityPath, holdPath := holdTestCity(t)
++		// Same class as the dangling parent link, one level further up: the
++		// path cannot be walked, and ENOENT here is the link's, not the
++		// parent's. Something IS on the path, so nothing can say "no hold".
++		packs := filepath.Dir(filepath.Dir(holdPath))
++		if err := os.MkdirAll(filepath.Dir(packs), 0o755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.Symlink(filepath.Join(filepath.Dir(packs), "no-such-dir"), packs); err != nil {
++			t.Fatal(err)
++		}
++		got := readManagedDoltHold(cityPath)
++		if got.State != managedDoltHoldUnreadable || !got.Blocks() {
++			t.Fatalf("hold = %+v, want unreadable+blocking", got)
++		}
++		if blocks, msg := shellHoldBlocks(t, holdPath); !blocks {
++			t.Fatalf("dolt-hold.sh let a dangling ancestor symlink through: %q", msg)
++		}
++	})
++	t.Run("an ancestor above the parent is a symlink that resolves, the rest is absent", func(t *testing.T) {
++		cityPath, holdPath := holdTestCity(t)
++		// The control for the case above: a link that works is not a reason to
++		// hold. The directory under it really is not there, so nobody can have
++		// put a hold in it, and both readers must say "no hold".
++		packs := filepath.Dir(filepath.Dir(holdPath))
++		target := filepath.Join(t.TempDir(), "real-packs")
++		if err := os.MkdirAll(target, 0o755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.MkdirAll(filepath.Dir(packs), 0o755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.Symlink(target, packs); err != nil {
++			t.Fatal(err)
++		}
++		got := readManagedDoltHold(cityPath)
++		if got.State != managedDoltHoldNone || got.Blocks() {
++			t.Fatalf("hold = %+v, want none", got)
++		}
++		if blocks, msg := shellHoldBlocks(t, holdPath); blocks {
++			t.Fatalf("dolt-hold.sh blocked behind a working ancestor symlink with nothing under it: %q", msg)
 +		}
 +	})
 +	t.Run("parent directory absent", func(t *testing.T) {
@@ -1118,10 +1265,10 @@ index 50f8391d8..85c029299 100644
  	}
 diff --git a/examples/bd/assets/scripts/dolt-hold.sh b/examples/bd/assets/scripts/dolt-hold.sh
 new file mode 100644
-index 000000000..d5da26267
+index 000000000..213a3d7e5
 --- /dev/null
 +++ b/examples/bd/assets/scripts/dolt-hold.sh
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,160 @@
 +#!/bin/sh
 +
 +# dolt_hold_blocks returns 0 (true) when a managed-Dolt hold forbids starting,
@@ -1161,14 +1308,35 @@ index 000000000..d5da26267
 +        _dh_file="$PACK_STATE_DIR/dolt-hold"
 +    fi
 +
-+    # Parent directory absent -> nobody can have placed a hold there. Parent
-+    # present but not a directory, or not searchable -> unreadable (blocks),
-+    # as ENOTDIR/EACCES are in Go. File absent -> no hold. File present but not
-+    # a readable regular file -> unreadable. (Only the immediate parent is
-+    # checked; a regular file further up the path reads as "absent" here.)
-+    _dh_dir=$(dirname "$_dh_file")
++    # Parent directory really absent -> nobody can have placed a hold there.
++    # [ -e ] is false for ENOENT but ALSO for EACCES/ENOTDIR on a component
++    # above the parent, which Go (os.Open) reads as unreadable; so "absent"
++    # only holds when the nearest ancestor that does exist is a searchable
++    # directory. Parent present but not a directory, or not searchable ->
++    # unreadable (blocks), as ENOTDIR/EACCES are in Go. File absent -> no
++    # hold. File present but not a readable regular file -> unreadable.
++    # (A symlink above the parent that leads nowhere holds here, as it does in
++    # Go: something is on the path, so nothing can say "no hold".)
++    # empty (no directory named) or failed (dirname) -> unreadable, never "absent"
++    _dh_dir=$(dirname "$_dh_file") || _dh_dir=""
++    if [ -z "$_dh_dir" ]; then
++        DOLT_HOLD_MESSAGE="dolt hold file $_dh_file could not be read (could not tell its directory); treating it as a hold"
++        return 0
++    fi
 +    if [ ! -e "$_dh_dir" ] && [ ! -h "$_dh_dir" ]; then
-+        return 1
++        _dh_anc="$_dh_dir"
++        while [ ! -e "$_dh_anc" ] && [ ! -h "$_dh_anc" ]; do
++            _dh_up=$(dirname "$_dh_anc") || _dh_up=""
++            if [ -z "$_dh_up" ] || [ "$_dh_up" = "$_dh_anc" ]; then
++                break
++            fi
++            _dh_anc="$_dh_up"
++        done
++        if { [ -e "$_dh_anc" ] || [ -h "$_dh_anc" ]; } && [ -d "$_dh_anc" ] && [ -x "$_dh_anc" ]; then
++            return 1 # the nearest existing ancestor is searchable: really absent
++        fi
++        DOLT_HOLD_MESSAGE="dolt hold file $_dh_file could not be read ($_dh_anc is not a searchable directory); treating it as a hold"
++        return 0
 +    fi
 +    if [ ! -d "$_dh_dir" ]; then
 +        DOLT_HOLD_MESSAGE="dolt hold file $_dh_file could not be read ($_dh_dir is not a directory); treating it as a hold"
@@ -1262,7 +1430,7 @@ index 000000000..d5da26267
 +    return 0
 +}
 diff --git a/examples/bd/assets/scripts/gc-beads-bd.sh b/examples/bd/assets/scripts/gc-beads-bd.sh
-index 038baf936..bf35c72a7 100755
+index 038baf936..3266314ac 100755
 --- a/examples/bd/assets/scripts/gc-beads-bd.sh
 +++ b/examples/bd/assets/scripts/gc-beads-bd.sh
 @@ -1908,6 +1908,14 @@ op_start() {
@@ -1280,7 +1448,7 @@ index 038baf936..bf35c72a7 100755
      local gc_helper_bin
      gc_helper_bin=$(resolve_gc_helper_bin)
  
-@@ -2679,6 +2687,45 @@ else
+@@ -2679,6 +2687,62 @@ else
      }
  fi
  
@@ -1296,8 +1464,9 @@ index 038baf936..bf35c72a7 100755
 +    # the helper, never looser: whatever the helper holds on, it holds on too.
 +    # It does not read expiry (the file's mere presence holds, so it can hold
 +    # where the helper has released an expired hold), and a path it cannot see
-+    # clearly is a hold. Only "the parent is gone" or "the parent is a
-+    # searchable directory without the file" releases.
++    # clearly is a hold. Only "the parent is gone" (the nearest ancestor that
++    # exists is a searchable directory) or "the parent is a searchable
++    # directory without the file" releases.
 +    dolt_hold_blocks() {
 +        _dh_file="${GC_DOLT_HOLD_FILE:-}"
 +        if [ -z "$_dh_file" ]; then
@@ -1307,12 +1476,28 @@ index 038baf936..bf35c72a7 100755
 +            _dh_file="$PACK_STATE_DIR/dolt-hold"
 +        fi
 +        DOLT_HOLD_MESSAGE="dolt hold file present or unreadable ($_dh_file); fallback reader does not read expiry, remove the file to release it"
-+        _dh_dir=$(dirname "$_dh_file")
-+        # empty (parent gone) -> released; unreadable (parent is a broken link,
-+        # a regular file, or not searchable) -> hold
++        # empty (no directory named) or failed (dirname) -> hold, never "gone"
++        _dh_dir=$(dirname "$_dh_file") || _dh_dir=""
++        [ -n "$_dh_dir" ] || return 0
++        # [ -e parent ] is false for ENOENT but also for EACCES/ENOTDIR on a
++        # component above the parent, which Go holds on. The parent is gone
++        # only if the nearest ancestor that exists is a searchable directory.
 +        if [ ! -e "$_dh_dir" ] && [ ! -h "$_dh_dir" ]; then
-+            return 1
++            _dh_anc="$_dh_dir"
++            while [ ! -e "$_dh_anc" ] && [ ! -h "$_dh_anc" ]; do
++                _dh_up=$(dirname "$_dh_anc") || _dh_up=""
++                if [ -z "$_dh_up" ] || [ "$_dh_up" = "$_dh_anc" ]; then
++                    break
++                fi
++                _dh_anc="$_dh_up"
++            done
++            if { [ -e "$_dh_anc" ] || [ -h "$_dh_anc" ]; } && [ -d "$_dh_anc" ] && [ -x "$_dh_anc" ]; then
++                return 1
++            fi
++            return 0
 +        fi
++        # The parent is there (a link counts). Unreadable (a broken link, a
++        # regular file, or not searchable) -> hold.
 +        if [ ! -d "$_dh_dir" ] || [ ! -x "$_dh_dir" ]; then
 +            return 0
 +        fi
@@ -1326,7 +1511,7 @@ index 038baf936..bf35c72a7 100755
  # op_recover stops the dolt server, restarts it, and verifies health.
  op_recover() {
      local read_only_status
-@@ -2687,6 +2734,12 @@ op_recover() {
+@@ -2687,6 +2751,12 @@ op_recover() {
          die "recovery not supported for remote dolt servers"
      fi
  

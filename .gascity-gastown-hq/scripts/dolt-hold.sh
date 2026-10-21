@@ -31,14 +31,25 @@
 #   que é uma escolha explícita. Hold esquecido = banco de dados da cidade parado: por isso a
 #   validade é o padrão, e vencida ela SOLTA (os guards e o engine tratam como sem hold). Para
 #   estender, `off` e `on` de novo. Um hold que não dá para ler SEGURA (veja dolt-hold-lib.sh).
-#   Zero à esquerda em --ttl-secs é decimal ("07200" = 7200 s). Duas chamadas de `on` ao mesmo tempo:
-#   com o destino ausente, uma ganha (exit 0) e a outra recusa (exit 3) sem tocar no hold da primeira.
+#   Zero à esquerda em --ttl-secs é decimal ("07200" = 7200 s). --ttl-secs e --no-expiry se excluem.
+#   Os DOIS leitores (o do shell e o do Go) leem só os 4096 primeiros bytes do arquivo; o que estiver
+#   além disso não existe para eles. Por isso --reason (até 1000 bytes) e --owner (até 200) têm teto,
+#   a validade é gravada ANTES deles, e a conferência depois de gravar relê exatamente esses 4096 bytes.
 #
-# SAÍDAS: 0 ok (status: 0 = há hold em vigor); 1 (status: sem hold ou vencido); 2 uso errado;
-#   3 `on` recusado porque já há um hold em vigor, ou porque outro apareceu durante a gravação (não
-#   sobrescreve o de outro); 4 não consegui gravar/apagar o arquivo, ler o relógio, ou conferir o efeito
-#   (`on`: o arquivo não é lido como hold em vigor ou tem outra validade que a pedida; `off`: o hold
-#   continua em vigor depois do comando — inclusive quando ele existe mas a pasta não deixa vê-lo).
+# O `on` NUNCA APAGA NADA: ele publica com `ln`, que falha se o destino existe. Um hold vencido que ficou lá
+#   para os guards já está solto, mas o `on` recusa (exit 3) e manda rodar `off`; quem tira arquivo é o `off`.
+#   Por isso, com duas chamadas de `on` ao mesmo tempo: destino ausente → uma ganha (exit 0) e a outra recusa
+#   (exit 3) sem tocar no hold da primeira; vencido no lugar → as duas recusam (exit 3) e o arquivo não muda.
+#   (Medido: 60 rodadas de cada.)
+#
+# SAÍDAS: 0 ok (status: 0 = há hold em vigor); 1 (status: sem hold ou vencido); 2 uso errado (inclui
+#   texto acima do teto e opções que se contradizem); 3 `on` recusado porque já há um hold em vigor, ou
+#   porque outro apareceu enquanto este era preparado/gravado (não sobrescreve nem apaga o de outro), ou
+#   porque há um hold VENCIDO no lugar (rode `off`);
+#   4 não consegui gravar/apagar o arquivo, ler o relógio, medir o texto ou conferir o efeito (`on`: o
+#   arquivo não é lido como hold em vigor, não consegui relê-lo, ou a validade que o leitor vê não é a
+#   pedida; `off`: o hold continua em vigor depois do comando — inclusive quando ele existe mas a pasta
+#   não deixa vê-lo).
 set -uo pipefail
 
 CITY="${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}"
@@ -48,6 +59,11 @@ source "$_DH_DIR/dolt-hold-lib.sh"
 
 DEFAULT_TTL_SECS=7200
 MAX_TTL_SECS=43200
+# Tetos de texto livre, em BYTES. Com o cabeçalho, created_at e expires_at o arquivo fica perto de 1,4 KiB no
+# pior caso, bem abaixo dos 4096 bytes que os leitores leem.
+MAX_REASON_BYTES=1000
+MAX_OWNER_BYTES=200
+HOLD_READ_BYTES=4096   # igual a dolt_hold_blocks (head -c) e a managedDoltHoldReadLimit do Go
 
 usage() {
   cat >&2 <<'USAGE'
@@ -56,6 +72,37 @@ uso: dolt-hold.sh on --reason "texto" [--owner NOME] [--ttl-secs N | --no-expiry
      dolt-hold.sh status
 USAGE
   exit 2
+}
+
+# O valor de uma opção não pode ser OUTRA opção: `--reason --no-expiry` engolia a opção como texto e gravava
+# um hold com validade (o contrário do pedido). Valor vazio segue para a checagem de cada opção.
+opt_value() {
+  case "$2" in
+    --*) echo "dolt-hold: $1 precisa de um valor, não de outra opção (veio '$2')" >&2; exit 2 ;;
+  esac
+}
+
+# byte_len <texto> — imprime o tamanho em BYTES (LC_ALL=C: 'ã' são 2). Retorna 1 se não deu para medir; quem
+# chama RECUSA nesse caso. "Não consegui medir" nunca vale "cabe".
+byte_len() {
+  local n
+  # vazio → 0 (printf '%s' "" | wc -c); falhou/ilegível → retorna 1 e o chamador recusa (nada é gravado)
+  n=$(printf '%s' "$1" | LC_ALL=C wc -c 2>/dev/null) || return 1
+  n=${n//[[:space:]]/}
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$n"
+}
+
+# first_expires <texto> — imprime o valor do PRIMEIRO "expires_at=" das linhas de <texto> (nada, se não houver).
+# Só builtins do bash: um sed|head que falhasse devolveria "" e, com --no-expiry, "" é justamente o esperado.
+first_expires() {
+  local line
+  while IFS= read -r line; do
+    case "$line" in expires_at=*) printf '%s\n' "${line#expires_at=}"; return 0 ;; esac
+  done <<EOF_EXP
+$1
+EOF_EXP
+  return 0
 }
 
 cmd="${1:-}"
@@ -102,16 +149,20 @@ case "$cmd" in
     ;;
 
   on)
-    reason="" owner="${GC_ALIAS:-${GC_SESSION_NAME:-${USER:-desconhecido}}}" ttl="$DEFAULT_TTL_SECS" no_expiry=0
+    reason="" owner="${GC_ALIAS:-${GC_SESSION_NAME:-${USER:-desconhecido}}}" ttl="$DEFAULT_TTL_SECS" no_expiry=0 ttl_given=0
     while [ $# -gt 0 ]; do
       case "$1" in
-        --reason)    [ $# -ge 2 ] || usage; reason="$2"; shift 2 ;;
-        --owner)     [ $# -ge 2 ] || usage; owner="$2"; shift 2 ;;
-        --ttl-secs)  [ $# -ge 2 ] || usage; ttl="$2"; shift 2 ;;
+        --reason)    [ $# -ge 2 ] || usage; opt_value --reason "$2"; reason="$2"; shift 2 ;;
+        --owner)     [ $# -ge 2 ] || usage; opt_value --owner "$2"; owner="$2"; shift 2 ;;
+        --ttl-secs)  [ $# -ge 2 ] || usage; opt_value --ttl-secs "$2"; ttl="$2"; ttl_given=1; shift 2 ;;
         --no-expiry) no_expiry=1; shift ;;
         *) usage ;;
       esac
     done
+    if [ "$no_expiry" -eq 1 ] && [ "$ttl_given" -eq 1 ]; then
+      echo "dolt-hold: --ttl-secs e --no-expiry se excluem (quem digitou uma validade não quer um hold sem fim)" >&2
+      exit 2
+    fi
     [ -n "$reason" ] || { echo "dolt-hold: --reason é obrigatório (quem ver o hold precisa saber o porquê)" >&2; exit 2; }
     case "$ttl" in ''|*[!0-9]*) echo "dolt-hold: --ttl-secs tem de ser um inteiro positivo" >&2; exit 2 ;; esac
     # Zero à esquerda é decimal para o `[ -gt ]` que valida abaixo mas OCTAL na aritmética que grava
@@ -124,17 +175,44 @@ case "$cmd" in
       echo "dolt-hold: --ttl-secs acima de ${MAX_TTL_SECS}s (12 h); para segurar mais use --no-expiry de propósito" >&2
       exit 2
     fi
-    # uma quebra de linha no texto viraria outra chave do arquivo (reason="x\nexpires_at=1")
-    reason=$(printf '%s' "$reason" | tr '\r\n' '  ')
-    owner=$(printf '%s' "$owner" | tr '\r\n' '  ')
+    # uma quebra de linha no texto viraria outra chave do arquivo (reason="x\nexpires_at=1"). Substituição do
+    # próprio bash, não `tr`: um `tr` que falhasse devolveria texto VAZIO, depois de --reason já ter sido exigido.
+    reason=${reason//$'\r'/ }; reason=${reason//$'\n'/ }
+    owner=${owner//$'\r'/ }; owner=${owner//$'\n'/ }
+    # Teto de texto livre: os leitores só veem os 4096 primeiros bytes do arquivo. Não medir = recusar.
+    reason_len=$(byte_len "$reason") || { echo "dolt-hold: não consegui medir o texto de --reason (wc); recusado, nada foi gravado" >&2; exit 4; }
+    owner_len=$(byte_len "$owner") || { echo "dolt-hold: não consegui medir o texto de --owner (wc); recusado, nada foi gravado" >&2; exit 4; }
+    if [ "$reason_len" -gt "$MAX_REASON_BYTES" ]; then
+      echo "dolt-hold: --reason tem $reason_len bytes; o máximo é $MAX_REASON_BYTES (os leitores só leem os $HOLD_READ_BYTES primeiros bytes do arquivo)" >&2
+      exit 2
+    fi
+    if [ "$owner_len" -gt "$MAX_OWNER_BYTES" ]; then
+      echo "dolt-hold: --owner tem $owner_len bytes; o máximo é $MAX_OWNER_BYTES" >&2
+      exit 2
+    fi
 
-    # Sem hold / hold vencido → pode pôr. Hold em vigor (ou ilegível, que segura) → recusa: o de
-    # outra pessoa não se sobrescreve; quem quer trocar faz `off` antes, sabendo que é dele.
+    # Sem hold → pode pôr. Hold em vigor (ou ilegível, que segura) → recusa: o de outra pessoa não se
+    # sobrescreve; quem quer trocar faz `off` antes, sabendo que é dele. (Vencido no lugar: veja abaixo.)
     if dolt_hold_city_blocks "$CITY"; then
       echo "dolt-hold: já há um hold em vigor — $DOLT_HOLD_MESSAGE" >&2
       echo "dolt-hold: recusado. Se for seu, 'dolt-hold.sh off' e ponha de novo." >&2
       exit 3
     fi
+    # O leitor diz "solto" e ainda assim há um arquivo no destino: é um hold VENCIDO. Para os guards ele já está
+    # solto, mas o `on` NÃO o apaga: apagar o arquivo de outro é o ato que não se desfaz (se um hold válido
+    # chegasse entre a leitura e o rm, ele iria junto), e `ln` só publica em destino ausente. Quem tira é o `off`.
+    expired_in_place() {
+      echo "dolt-hold: há um hold VENCIDO em $HOLD_FILE; o on não apaga arquivo de ninguém." >&2
+      echo "dolt-hold: recusado. Tire-o com 'dolt-hold.sh off' e ponha o novo." >&2
+      exit 3
+    }
+    if [ -e "$HOLD_FILE" ] || [ -h "$HOLD_FILE" ]; then expired_in_place; fi
+
+    # O temporário some em qualquer saída entre o mktemp e a publicação: erro, recusa e também TERM/INT/HUP (o bash
+    # roda o trap de EXIT quando um sinal o mata; conferido no 5.3 e no /bin/bash 3.2 do launchd). kill -9 não dá
+    # para tratar: sobra um .dolt-hold.XXXXXX ao lado do hold, que nenhum leitor lê (só "dolt-hold" conta).
+    tmp=""
+    trap '[ -z "$tmp" ] || rm -f -- "$tmp"' EXIT
 
     # relógio ilegível → recusa (nada gravado); lido → só dígitos. Sem `now` não há created_at nem validade.
     now=$(date +%s 2>/dev/null)
@@ -144,48 +222,51 @@ case "$cmd" in
     if [ "$no_expiry" -eq 0 ]; then expires=$((now + ttl)); fi
     hold_dir=$(dirname "$HOLD_FILE")
     mkdir -p "$hold_dir" 2>/dev/null || { echo "dolt-hold: não consegui criar $hold_dir" >&2; exit 4; }
-    tmp=$(mktemp "$hold_dir/.dolt-hold.XXXXXX") || { echo "dolt-hold: não consegui criar um arquivo temporário em $hold_dir" >&2; exit 4; }
+    tmp=$(mktemp "$hold_dir/.dolt-hold.XXXXXX") || { tmp=""; echo "dolt-hold: não consegui criar um arquivo temporário em $hold_dir" >&2; exit 4; }
     {
       echo "# colocado por dolt-hold.sh em $(date -u +%Y-%m-%dT%H:%M:%SZ) (ga-3risy2); tirar: dolt-hold.sh off"
       echo "created_at=$now"
+      # A validade vem ANTES do texto livre: o que passar dos $HOLD_READ_BYTES bytes não existe para os leitores.
+      if [ -n "$expires" ]; then echo "expires_at=$expires"; fi
       echo "owner=$owner"
       echo "reason=$reason"
-      if [ -n "$expires" ]; then echo "expires_at=$expires"; fi
-    } > "$tmp" || { rm -f -- "$tmp"; echo "dolt-hold: não consegui escrever $tmp" >&2; exit 4; }
+    } > "$tmp" || { echo "dolt-hold: não consegui escrever $tmp" >&2; exit 4; }
     chmod 644 "$tmp" 2>/dev/null || true
-    # Publicar SEM sobrescrever: `ln` falha se o destino existe (o `mv -f` trocava em silêncio o hold que
-    # outro `on` pôs entre a checagem acima e esta gravação). Se o destino existe a esta altura é porque
-    # a checagem acima o leu como VENCIDO (hold em vigor teria dado exit 3): tira-se o vencido e tenta-se
-    # uma vez; perdeu a corrida de novo → o hold do outro fica e este `on` recusa. (Tomar um hold
-    # VENCIDO tem uma janela estreita entre o rm e o ln; o caso comum, destino ausente, é atômico.)
-    if [ -e "$HOLD_FILE" ] || [ -h "$HOLD_FILE" ]; then
-      rm -f -- "$HOLD_FILE" || { rm -f -- "$tmp"; echo "dolt-hold: não consegui tirar o hold vencido $HOLD_FILE" >&2; exit 4; }
-    fi
+    # Publicar SEM sobrescrever e SEM apagar nada: `ln` falha se o destino existe, e é a única coisa que o `on`
+    # faz com ele (o `mv -f` trocava em silêncio o hold que outro `on` pôs entre a checagem acima e esta
+    # gravação; um `rm` antes do `ln` apagava o hold válido que chegasse depois da leitura). Com o destino
+    # ausente, de dois `on` ao mesmo tempo um publica e o outro cai aqui: o que chegou lá é o hold de outro
+    # (exit 3, ele fica como está) ou um vencido (exit 3, manda rodar `off`); nada disso (exit 4).
     if ! ln -- "$tmp" "$HOLD_FILE" 2>/dev/null; then
-      rm -f -- "$tmp"
       if dolt_hold_city_blocks "$CITY"; then
         echo "dolt-hold: outro hold apareceu enquanto este era gravado — $DOLT_HOLD_MESSAGE" >&2
         echo "dolt-hold: recusado; o hold dele ficou como estava." >&2
         exit 3
       fi
+      if [ -e "$HOLD_FILE" ] || [ -h "$HOLD_FILE" ]; then expired_in_place; fi
       echo "dolt-hold: não consegui gravar $HOLD_FILE" >&2
       exit 4
     fi
-    rm -f -- "$tmp"
+    rm -f -- "$tmp"; tmp=""
 
     # confere o efeito, não o retorno: o arquivo gravado tem de ser lido como hold em vigor...
     if ! dolt_hold_city_blocks "$CITY"; then
       echo "dolt-hold: gravei $HOLD_FILE mas ele NÃO é lido como hold em vigor ($DOLT_HOLD_MESSAGE) — não confie nele" >&2
       exit 4
     fi
-    # ...e com a MESMA validade que foi pedida: uma validade curta demais ainda "segura", então só o
-    # valor denuncia (foi assim que o octal passou). Arquivo sem expires_at quando se pediu um → também erro.
-    if [ -n "$expires" ]; then
-      got=$(sed -n 's/^expires_at=//p' "$HOLD_FILE" 2>/dev/null | head -n 1)
-      if [ "$got" != "$expires" ]; then
-        echo "dolt-hold: pedi validade $expires mas o arquivo $HOLD_FILE tem '${got:-nenhuma}' — não confie nele (tire com 'dolt-hold.sh off')" >&2
-        exit 4
-      fi
+    # ...e com a MESMA validade que foi pedida, lida pelos MESMOS bytes que o leitor vê (os $HOLD_READ_BYTES
+    # primeiros): uma validade curta demais ainda "segura", então só o valor denuncia (foi assim que o octal
+    # passou), e uma validade além do que o leitor lê deixa o hold sem fim com a leitura do arquivo inteiro
+    # dizendo que está tudo certo. Sem validade pedida (--no-expiry) o esperado é "nenhuma".
+    # vazio → sem expires_at nesses bytes (só confere com --no-expiry); falhou/ilegível → exit 4, nunca "sem validade"
+    seen=$(LC_ALL=C head -c "$HOLD_READ_BYTES" "$HOLD_FILE" 2>/dev/null) || {
+      echo "dolt-hold: gravei $HOLD_FILE mas não consegui relê-lo para conferir a validade — não confie nele (tire com 'dolt-hold.sh off')" >&2
+      exit 4
+    }
+    got=$(first_expires "$seen")
+    if [ "$got" != "$expires" ]; then
+      echo "dolt-hold: pedi validade ${expires:-nenhuma} mas o leitor vê '${got:-nenhuma}' em $HOLD_FILE — não confie nele (tire com 'dolt-hold.sh off')" >&2
+      exit 4
     fi
     echo "HOLD posto: $DOLT_HOLD_MESSAGE"
     echo "Agora pare o Dolt se for o caso ('gc-beads-bd.sh stop'). Tirar: dolt-hold.sh off"
