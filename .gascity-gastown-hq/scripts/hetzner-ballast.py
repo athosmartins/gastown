@@ -22,11 +22,14 @@ ITENS  (registro TSV, 8 colunas: nome papel núcleos rss_mb prazo_s cooldown_s r
   predicado desconhecido = item inerte) · comando relativo vale a partir da pasta de itens. Linha malformada = erro visível em `registry_errors`; o item dela não roda e os outros seguem.
   O que roda é achado na TABELA DE PROCESSOS (o líder da sessão leva a marca `ballast-item:<item>:<rodada>` na linha de comando), não no state.json: perder o estado não duplica o que já roda.
 TRÊS ESTADOS
-  Toda leitura é leu / vazio / não consegui ler. "Não consegui ler" (registro, /proc/stat, meminfo, tabela de processos) nunca vira "livre" nem "morto": nada começa e nada é morto naquele tick.
+  Toda leitura é leu / vazio / não consegui ler. "Não consegui ler" (registro, /proc/stat, meminfo, tabela de processos) nunca vira "livre" nem "morto": nada começa naquele tick, e sem ler a TABELA DE PROCESSOS nada é morto
+  (/proc/stat e meminfo só decidem começo, pausa e morte por memória: desligar, fim de rodada e prazo seguem valendo sem eles).
   state.json corrompido ou de forma errada vai para <arquivo>.corrupt-<época> e recomeça; ilegível por permissão = rc 3 (inerte). A escrita da pasta é conferida ANTES de qualquer efeito.
   O que o tick não leu fica null no registro (running, registry_errors, mode), nunca [].
 ARQUIVOS  (em $BALLAST_HOME, padrão ~/gt-remote/ballast)
   items.tsv · items/ · on (a chave: presente = ligado) · state.json · lock · ticks.jsonl · results.jsonl · runs/<rodada>/{meta.json,log,rc,final}
+STOP  rc 0 = a sessão de cada item esvaziou (TERM+CONT, KILL 3 s depois no que sobrar) · 3 = não li os processos, nada foi morto · 5 = sobrou processo vivo (`survivors`) ou a tabela ficou
+  ilegível depois do TERM (`unverified`): NÃO diz que parou · outro = o stop não rodou.
 USO  hetzner-ballast.py tick | status [--json] | stop      env: BALLAST_HOME BALLAST_PROC BALLAST_NOW BALLAST_ITEMS BALLAST_ITEMS_DIR BALLAST_LAUNCH_PREFIX (JSON, com `nice`; BALLAST_TEST=1 só no selftest) e os limites BALLAST_* de load_config
 """
 import fcntl
@@ -200,7 +203,8 @@ def current_runs(cfg):
     known = {}
     for r in unf:
         m = read_meta(cfg, r)
-        if m and isinstance(m.get("pid"), int):
+        # pid 0/1/negativo/bool não é líder de sessão de ninguém: sid 0 casaria com thread de kernel e killpg(0) acertaria o grupo do próprio tick
+        if m and type(m.get("pid")) is int and m["pid"] > 1:
             known[r] = (m["item"], m["pid"])
     return procs, unf, running_items(procs, known, valid)
 
@@ -501,7 +505,7 @@ def finalize(cfg, st, run, rec):
     """Encerra uma rodada que não tem mais processo: results.jsonl, cooldown, marca final. rc ilegível/ausente NUNCA vira ok."""
     rundir = os.path.join(cfg.home, "runs", run)
     meta = read_meta(cfg, run)
-    item = meta["item"] if meta else re.sub(r"-[0-9]+(-[0-9]+)?$", "", run)
+    item = meta["item"] if meta else re.sub(r"-[0-9]{9,}(-[0-9]+)?$", "", run)   # a rodada é <item>-<época>[-<n>]; o item pode terminar em número (a-12)
     # vazio (sem arquivo rc) → rc None = morreu sem avisar; falhou/ilegível (não é inteiro) → também None
     rc = None
     try:
@@ -516,6 +520,7 @@ def finalize(cfg, st, run, rec):
     start = meta.get("start") if meta else None
     row = {"ts": iso(cfg.now), "item": item, "run": run, "role": meta.get("role") if meta else None, "cores": meta.get("cores") if meta else None, "start": start,
            "secs": (cfg.now - start) if isinstance(start, int) else None, "rc": rc, "why": why, "summary": summ, "summary_why": summ_why}
+    # a linha de resultado vem ANTES da marca: se a marca não grava, o tick seguinte repete a linha (repetida é melhor que perdida)
     append_line(os.path.join(cfg.home, "results.jsonl"), row, 2000000)
     try:
         with open(os.path.join(rundir, "final"), "w") as f:
@@ -672,6 +677,7 @@ def do_tick(cfg):
     trim_log(os.path.join(cfg.home, "cron.err"), 262144, 65536)
     st = load_state(cfg)
     rec["paused"] = st["paused"]
+    # vazio (sem a chave) → desligado; falhou/ilegível (stat negado) → também desligado: o lado que PARA o lastro (a pasta acabou de aceitar escrita, então nem deve acontecer)
     on = os.path.exists(os.path.join(cfg.home, "on"))
     rec["mode"] = "ligado" if on else "desligado"
     items, notes = [], []
@@ -682,9 +688,17 @@ def do_tick(cfg):
         print("hetzner-ballast: %s" % e, file=sys.stderr)
     ncpu = vec = mem = procs = None
     run = {}
+    # cada leitura falha sozinha: /proc/stat e meminfo só decidem começo, pausa e morte por memória; desligar, fim de rodada e prazo dependem só da tabela de processos e não podem parar por causa deles
+    bad = []
     try:
         ncpu, vec = read_stat(cfg.proc)
+    except Unreadable as e:
+        bad.append(e)
+    try:
         mem = read_mem_avail_mb(cfg.proc)
+    except Unreadable as e:
+        bad.append(e)
+    try:
         procs, unf, run = current_runs(cfg)
         # rodada sem processo vivo na sessão e sem marca final = acabou (ou morreu): encerra. Sem ler os processos NINGUÉM é dado por morto.
         for r in unf:
@@ -692,9 +706,12 @@ def do_tick(cfg):
                 finalize(cfg, st, r, rec)
         prune_runs(cfg)
     except Unreadable as e:
-        notes.append("leitura-ilegivel")
+        bad.append(e)
         procs = None
+    for e in bad:
         print("hetzner-ballast: %s" % e, file=sys.stderr)
+    if bad:
+        notes.append("leitura-ilegivel")
     rec["ncpu"], rec["mem_avail_mb"] = ncpu, mem
     seen_names = {r["item"] for r in run.values()}   # o que existia ANTES de qualquer sinal deste tick: quem leva TERM e ainda morre não pode ser recomeçado em cima
     free_ok = False
@@ -705,8 +722,11 @@ def do_tick(cfg):
         # quem já levou TERM e segue vivo depois da graça leva KILL; prazo estourado (+ folga) leva TERM
         for r in list(run.values()):
             t = st["term"].get(r["run"])
-            m = read_meta(cfg, r["run"]) or {}
-            # vazio/ilegível (meta.json sem start, timeout_s ou rss_mb inteiros) → sem prazo e sem teto de RSS para ESTE item neste tick: não mata por palpite (o `timeout -k` do lançamento ainda o limita)
+            m = read_meta(cfg, r["run"])
+            if m is None:
+                notes.append("meta-ilegivel:%s" % r["run"])
+            m = m or {}
+            # vazio/ilegível (meta.json sem start, timeout_s ou rss_mb inteiros) → sem prazo e sem teto de RSS para ESTE item neste tick (com a nota acima): não mata por palpite (o `timeout -k` do lançamento ainda o limita)
             start, tmo, cap = m.get("start"), m.get("timeout_s"), m.get("rss_mb")
             if t is not None:
                 if cfg.now - t >= cfg.term_grace_s:
@@ -790,9 +810,48 @@ def do_tick(cfg):
     return rec
 
 
+def survivors(cfg, run):
+    """{rodada: [pids]} do que AINDA vive na SESSÃO de cada rodada. A sessão, não o grupo do líder: o `timeout` do GNU troca de grupo e o item segue na sessão com o líder já morto."""
+    # vazio (ninguém vivo na sessão) → {}; falhou/ilegível (tabela de processos) → Unreadable = não sei, pode haver sobrevivente (quem chama NÃO conclui que parou)
+    procs = scan(cfg.proc, cfg.page_kb)
+    left = {}
+    for r in run.values():
+        alive = [p["pid"] for p in procs if p["sid"] == r["pid"] and p["state"] != "Z" and pid_exists(p["pid"])]
+        if alive:
+            left[r["run"]] = alive
+    return left
+
+
+def pid_exists(pid):
+    """A linha do /proc pode ser mais velha que o processo: confirma com o sinal 0 (sem permissão = existe)."""
+    # vazio (ESRCH, sumiu) → False; falhou/ilegível (EPERM, não posso sinalizar) → True: na dúvida conta como vivo, nunca como parado
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def wait_gone(cfg, run, secs):
+    """Espera até `secs` s a sessão de cada rodada esvaziar: {} = esvaziou · {rodada: pids} = sobrou · None = não consegui ler a tabela (não sei)."""
+    end = time.time() + secs
+    while True:
+        try:
+            left = survivors(cfg, run)
+        except Unreadable:
+            return None
+        if not left or time.time() >= end:
+            return left
+        time.sleep(0.2)
+
+
 def do_stop(cfg):
-    """Mata tudo o que roda (TERM+CONT, KILL 3 s depois no que sobrar) e anota o motivo `stop` na rodada, para o results.jsonl não dizer que ela morreu sozinha. Sem ler os processos não
-    mata nada e sai 3. Se um tick está rodando (lock tomado por mais de 5 s) ou o estado não abre, mata do mesmo jeito e a rodada sai como morreu-sem-rc: parar vale mais que a anotação."""
+    """Mata tudo o que roda (TERM+CONT; KILL 3 s depois no que sobrar NA SESSÃO) e anota o motivo `stop` na rodada, para o results.jsonl não dizer que ela morreu sozinha. Só diz que parou
+    o que a tabela de processos mostra vazio: sobrou algo depois do KILL → `survivors`, tabela ilegível → `unverified`, e o rc é 5 nos dois casos. Sem ler os processos antes não mata nada
+    e sai 3 (sem ler DEPOIS do TERM também não manda KILL: não mata às cegas). Se um tick está rodando (lock tomado por mais de 5 s) ou o estado não abre, mata do mesmo jeito e a rodada
+    sai como morreu-sem-rc: parar vale mais que a anotação."""
     try:
         run = current_runs(cfg)[2]
     except Unreadable as e:
@@ -822,23 +881,17 @@ def do_stop(cfg):
             save_json(os.path.join(cfg.home, "state.json"), st)
         except Fail:
             pass
-    end = time.time() + 3
-    while run and time.time() < end:
-        if not any(send_probe(r) for r in run.values()):
-            break
-        time.sleep(0.2)
-    for r in run.values():
-        if send_probe(r):
-            send(r, signal.SIGKILL)
+    left = wait_gone(cfg, run, 3) if run else {}
+    if left:   # o que sobrou na sessão (inclusive filho que o item pôs no mundo depois do 1º scan) leva KILL pelo pid, e o grupo do líder junto
+        for rn, pids in left.items():
+            send(dict(run[rn], members=pids), signal.SIGKILL)
+        left = wait_gone(cfg, run, 2)
+    if left is None:
+        out["stopped"], out["unverified"] = [], True
+    elif left:
+        out["stopped"] = [x for x in out["stopped"] if x["run"] not in left]
+        out["survivors"] = left
     return out
-
-
-def send_probe(r):
-    try:
-        os.killpg(r["pid"], 0)
-        return True
-    except (ProcessLookupError, PermissionError):
-        return False
 
 
 # ---- status -------------------------------------------------------------------------------------------------------------------------------------------
@@ -889,8 +942,9 @@ def main(argv):
             print(json.dumps(do_status(cfg)))
             return 0
         if cmd == "stop":
-            print(json.dumps(do_stop(cfg)))
-            return 0
+            out = do_stop(cfg)
+            print(json.dumps(out))
+            return 5 if out.get("survivors") or out.get("unverified") else 0
     except Fail as e:
         print("hetzner-ballast: %s" % e, file=sys.stderr)
         return e.rc

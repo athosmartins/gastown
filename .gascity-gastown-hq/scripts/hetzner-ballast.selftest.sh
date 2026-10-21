@@ -10,15 +10,16 @@
 #     comentário e linha em branco ignorados · registro ausente/ilegível = nada começa e nada é morto · comando relativo vale a partir da pasta de itens.
 #   tick (g_tick): sem a chave `on` não começa nada · 1ª leitura só semeia · CPU livre >= 15% por 3 leituras seguidas antes de começar, e uma leitura abaixo zera a conta · o
 #     tempo em nice > 0 (o próprio lastro) NÃO conta como carga · orçamento = núcleos livres - reserva (item de N núcleos só cabe se rodando + N <= orçamento; `auto` leva o resto) ·
-#     teto de itens · contador que anda para trás ou lacuna de mais de 3 min recomeça a conta · /proc/stat ou meminfo ilegível = não começa e não mata · outra instância
+#     teto de itens · contador que anda para trás ou lacuna de mais de 3 min recomeça a conta · /proc/stat ou meminfo ilegível = não começa (desligar e prazo seguem valendo; a tabela de processos ilegível é que não mata) · outra instância
 #     rodando = não faz nada · pasta sem permissão = rc 3.
-#   processos (g_run): o que roda é achado na tabela de processos (marca + pasta runs/<rodada> DESTA pasta; marca de outra pasta não é nossa) · duplicata · o que já roda ocupa núcleos (meta.json sumida = o que o registro diz) e teto · lista de processos ilegível ≠ ninguém roda.
+#   processos (g_run): o que roda é achado na tabela de processos (marca + pasta runs/<rodada> DESTA pasta; marca de outra pasta não é nossa; pid 0/1 na meta.json não é líder) · duplicata · o que já roda ocupa núcleos (meta.json sumida = o que o registro diz) e teto · lista de processos ilegível ≠ ninguém roda.
 #   RAM (g_ram): abaixo do piso de partida não começa · abaixo do piso de pausa congela (SIGSTOP) e volta (SIGCONT) com folga · pausa que não passa em N leituras mata o maior ·
 #     abaixo do piso crítico mata o maior na hora · RSS do item acima do teto dele mata.
 #   fim e resultado (g_reap): rc 0 / rc≠0 / sem rc / resumo ilegível viram linha em results.jsonl, nunca "ok" por falta de leitura · cooldown · pid reaproveitado não é o item ·
 #     prazo estourado (TERM, depois KILL) · quem sumiu sem a leitura de processos não é dado por morto.
 #   enchimento (g_fill): item `filler` só entra com a flag, é morto quando um item `work` vai começar e nunca conta no orçamento do `work`.
-#   desligar (g_off): chave `on` apagada mata o que roda (TERM) · `stop` idem · `status` diz o estado sem gravar.
+#   desligar (g_off): chave `on` apagada mata o que roda (TERM+CONT; vale com meminfo ilegível) · `stop` idem, e só diz que parou o que a SESSÃO do item mostra vazia (item noutro grupo da sessão, como com o
+#     timeout do GNU, leva KILL; sobrevivente → rc 5 `survivors`; tabela ilegível depois do TERM → rc 5 `unverified`, sem KILL às cegas) · `status` diz o estado sem gravar.
 #   estado (g_state): state.json corrompido vai para o lado e recomeça sem duplicar o que já roda (o processo é a fonte da verdade) · ilegível por permissão = inerte (rc 3).
 #   lançamento (g_launch): prefixo nice 19 + SCHED_IDLE + ionice idle + timeout -k, com o que existir no PATH; sem `timeout` o item não começa.
 # CONTROLE NEGATIVO: cada mutante (um trecho do script trocado) TEM que reprovar a bateria.
@@ -102,8 +103,16 @@ started_run() { jget started.0.run; }
 isdead() {  # isdead PID — o grupo de processos sumiu (ou só sobrou zumbi): espera até 3 s
   local i=0; while [ "$i" -lt 15 ]; do kill -0 -- "-$1" 2>/dev/null || return 0; [ "$(pstate "$1")" = Z ] && return 0; sleep 0.2; i=$((i+1)); done; return 1
 }
+plive() { kill -0 "$1" 2>/dev/null && [ "$(pstate "$1")" != Z ]; }   # o PROCESSO existe (zumbi não conta)
+pdead() {  # pdead PID… — cada PROCESSO sumiu: espera até 3 s por cada um. Olha o processo e não o grupo (o item pode estar noutro grupo da sessão)
+  local p i; for p in "$@"; do i=0; while [ "$i" -lt 15 ] && plive "$p"; do sleep 0.2; i=$((i+1)); done; ! plive "$p" || return 1; done
+}
 running_one() {  # running_one — newhome + o hq (4 núcleos) já rodando e visível no /proc de mentira: PID e RUN
   newhome; seed; good 50; good 50; good 50; PID=$(started_pid); RUN=$(started_run); alive "$PID" hq "$RUN"
+}
+trapper_up() {  # trapper_up — newhome + o item `tp` (anota `termed` ao tratar o TERM) rodando, PARADO (SIGSTOP no grupo) e visível no /proc de mentira: PID e RUN
+  newhome; : > "$H/items.tsv"; printf '#!/bin/sh\ntrap '"'"'echo 1 > "$BALLAST_RUN_DIR/termed"; exit 0'"'"' TERM\nsleep 300 &\necho 1 > "$BALLAST_RUN_DIR/ready"\nwait\n' > "$H/items/trapper.sh"; chmod +x "$H/items/trapper.sh"; reg 'tp|work|4|1024|3600|300|-|trapper.sh'
+  seed; good 50; good 50; good 50; PID=$(started_pid); RUN=$(started_run); alive "$PID" tp "$RUN"; waitlines "$H/runs/$RUN/ready" 1; kill -STOP -- "-$PID"
 }
 nkilled() { printf '%s' "$OUT" | "$PY" -I -c 'import sys,json; print(len(json.load(sys.stdin)["killed"]))'; }
 rj() { [ -f "$H/results.jsonl" ] && tail -n 1 "$H/results.jsonl" | "$PY" -I -c 'import sys,json; v=json.load(sys.stdin)
@@ -235,6 +244,11 @@ g_run() {
   check "run: item rodando com a meta.json sumida ocupa o que o REGISTRO diz (4), não 1: b(4) não cabe no orçamento 7, e a nota avisa" "[] 1" "$(jget started) $(jget note | grep -c cores-desconhecidos)"
   printf '{"item":"hq","cores":0}' > "$H/runs/$RUN/meta.json"; adv 50 0; bt; check "run: meta.json com núcleos 0 também não vale (o item não encolhe o que ocupa)" "[]" "$(jget started)"
   rm -f "$H/runs/$RUN/meta.json"; : > "$H/items.tsv"; reg 'b|work|1|1024|3600|300|-|sleeper.sh'; adv 50 0; bt; check "run: rodando, sem meta.json e FORA do registro → ocupa o orçamento inteiro: nem o b(1) começa" "[]" "$(jget started)"
+  check "run: item rodando com a meta.json sumida/ilegível → a nota meta-ilegivel:<rodada> avisa que ele ficou sem prazo e sem teto de RSS" "1" "$(jget note | grep -c "meta-ilegivel:$RUN")"
+  for bad in 0 1; do
+    newhome; seed; mkdir -p "$H/runs/hq-1799999000"; printf '{"item":"hq","pid":%s,"start":1799999000,"timeout_s":3600,"cooldown_s":300,"cores":4,"rss_mb":1024,"role":"work"}' "$bad" > "$H/runs/hq-1799999000/meta.json"; member 7000200 "$bad"; adv 50 0; bt
+    check "run: meta.json com pid $bad NÃO acha a rodada (sid $bad casaria com thread de kernel / o init, e killpg($bad) acertaria o grupo do próprio tick)" "[]" "$(jget running)"
+  done
   newhome; seed; good 50; good 50; mkdir -p "$FP/4242"; printf 'lixo' > "$FP/4242/stat"; adv 50 0; bt; check "run: a tabela lista um processo e NENHUM é legível → leitura-ilegivel, nada começa e running null (não é 'ninguém roda')" "leitura-ilegivel [] null" "$(jget note) $(jget started) $(jget running)"
   newhome; seed; mv "$FP" "$FP.off"; NOW=$((NOW + 60)); bt; mv "$FP.off" "$FP"
   check "run: sem conseguir ler nada do /proc → leitura-ilegivel, rc 0, nada começa" "0 leitura-ilegivel []" "$RC $(jget note) $(jget started)"
@@ -299,6 +313,9 @@ g_reap() {
 
   smitem; rm -f "$H/runs/$RUN/meta.json"; gone "$PID"; echo 0 > "$H/runs/$RUN/rc"; adv 50 0; bt
   check "reap: meta.json sumida (não sei o cooldown do item) → o item sai pelo nome da pasta e espera o cooldown de FALHA (600 s), não 0" "sm 600" "$(rj item) $("$PY" -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["cooldown"]["sm"] - d["last"]["t"])' "$H/state.json")"
+
+  newhome; seed; mkdir -p "$H/runs/a-12-1799999000"; echo 0 > "$H/runs/a-12-1799999000/rc"; adv 50 0; bt
+  check "reap: sem meta.json o nome do item sai da pasta tirando SÓ -<época>[-<n>] (item com número no nome: a-12, não a)" "a-12" "$(rj item)"
 
   smitem; gone "$PID"; adv 50 0; bt
   check "reap: sumiu sem rc → why morreu-sem-rc e rc null (não é ok, não é falha de teste)" "null morreu-sem-rc" "$(jget reaped.0.rc) $(jget reaped.0.why)"
@@ -392,6 +409,53 @@ g_off() {
   running_one; bt stop
   check "stop: mata o que roda mesmo com a chave ligada, devolve o que parou, rc 0" "0 hq" "$RC $(jget stopped.0.item)"
   isdead "$PID"; check "stop: o item morreu" "0" "$?"
+
+  # o `timeout` do GNU faz setpgid(0,0): o item vive em OUTRO grupo da MESMA sessão. O stop olha a SESSÃO, não o grupo do líder: antes o líder morria no TERM, a sonda de grupo dizia "sumiu",
+  # o KILL nunca vinha e o stop dizia rc 0 com o item vivo (só o `timeout -k 30` o matava, 30 s depois). Aqui o item ignora o TERM e o shim de `timeout` troca de grupo, como o do GNU.
+  newhome; : > "$H/items.tsv"; printf '#!/bin/sh\ntrap "" TERM\nsleep 300 &\necho "$$ $!" > "$BALLAST_RUN_DIR/pids"\nwait\n' > "$H/items/stubborn.sh"; chmod +x "$H/items/stubborn.sh"; reg 'tc|work|4|1024|3600|300|-|stubborn.sh'
+  mkdir -p "$W/bin2"; printf '#!%s\nimport os, sys\nos.setpgid(0, 0)\na = sys.argv[4:]\nos.execvp(a[0], a)\n' "$PY" > "$W/bin2/timeout"; chmod +x "$W/bin2/timeout"
+  EXTRA_ENV="PATH=$W/bin2:$W/bin:/usr/bin:/bin"; seed; good 50; good 50; good 50; PID=$(started_pid); RUN=$(started_run); waitlines "$H/runs/$RUN/pids" 1
+  read -r SP SL < "$H/runs/$RUN/pids"; alive "$PID" tc "$RUN"; member "$SP" "$PID"; member "$SL" "$PID"; bt stop
+  check "stop: item noutro grupo da sessão (timeout do GNU) que ignora o TERM → rc 0, o item aparece em stopped, sem survivors" "0 tc null" "$RC $(jget stopped.0.item) $(jget survivors)"
+  pdead "$PID" "$SP" "$SL"; check "stop: ...e os processos do item morreram DE VERDADE (o KILL veio pela sessão, não 30 s depois pelo timeout -k)" "0" "$?"
+  kill -9 "$SP" "$SL" 2>/dev/null
+
+  # sobrevivente que o KILL não tira (um zumbi, que o /proc de mentira lista como vivo): o stop NÃO diz que parou
+  running_one; "$PY" -I -c 'import os, time
+p = os.fork()
+if p == 0:
+    os._exit(0)
+print(p, flush=True)
+time.sleep(60)' > "$W/zpid" & ZP=$!
+  waitlines "$W/zpid" 1; ZC=$(head -n 1 "$W/zpid"); member "$ZC" "$PID"; bt stop
+  check "stop: sobrou processo vivo na sessão depois do KILL → rc 5, nada em stopped, survivors nomeia o processo" "5 [] $ZC" "$RC $(jget stopped) $(jget survivors.$RUN.0)"
+  kill -9 "$ZP" 2>/dev/null; wait "$ZP" 2>/dev/null
+
+  # tabela de processos ilegível DEPOIS do TERM (o item, ao tratar o TERM, tira a permissão da pasta): não sei se parou → rc 5, unverified, nada em stopped
+  newhome; : > "$H/items.tsv"; cat > "$H/items/hider.sh" <<EOF
+#!/bin/sh
+trap 'chmod 000 "$FP"' TERM
+sleep 300 &
+echo "\$\$ \$!" > "\$BALLAST_RUN_DIR/pids"
+wait
+EOF
+  chmod +x "$H/items/hider.sh"; reg 'hd|work|4|1024|3600|300|-|hider.sh'; seed; good 50; good 50; good 50; PID=$(started_pid); RUN=$(started_run); waitlines "$H/runs/$RUN/pids" 1
+  read -r SP SL < "$H/runs/$RUN/pids"; alive "$PID" hd "$RUN"; member "$SP" "$PID"; bt stop; chmod 755 "$FP"
+  check "stop: tabela de processos ilegível depois do TERM → rc 5, unverified true, nada em stopped (não sei se parou)" "5 true []" "$RC $(jget unverified) $(jget stopped)"
+  kill -9 -- "-$PID" 2>/dev/null; kill -9 "$SP" "$SL" 2>/dev/null
+
+  # item PARADO (a pausa de RAM manda SIGSTOP): ele só trata o TERM depois do CONT; sem o CONT o TERM fica pendente até o KILL
+  trapper_up; bt stop; waitlines "$H/runs/$RUN/termed" 1
+  check "stop: item parado trata o TERM (o stop manda CONT junto)" "0 1" "$RC $(lines "$H/runs/$RUN/termed")"
+  kill -9 -- "-$PID" 2>/dev/null
+  trapper_up; rm -f "$H/on"; adv 50 0; bt; waitlines "$H/runs/$RUN/termed" 1
+  check "off: item parado trata o TERM da chave apagada (o tick manda CONT junto)" "1 1" "$(nkilled) $(lines "$H/runs/$RUN/termed")"
+  kill -9 -- "-$PID" 2>/dev/null
+
+  # a tabela de processos é lida mesmo com o meminfo ilegível: a chave apagada continua matando (só RAM e começo dependem do meminfo)
+  running_one; rm -f "$H/on"; printf 'MemTotal: 1 kB\n' > "$FP/meminfo"; adv 50 0; bt
+  check "off: meminfo ilegível NÃO impede a chave apagada de matar (nota leitura-ilegivel, nada começa)" "leitura-ilegivel 1 desligado []" "$(jget note) $(nkilled) $(jget killed.0.why) $(jget started)"
+  kill -9 -- "-$PID" 2>/dev/null
 
   running_one; bt stop; gone "$PID"; adv 50 0; bt
   check "stop: a rodada parada à mão é encerrada com o motivo stop (não morreu-sem-rc) e SEM o cooldown de falha" "stop" "$(jget reaped.0.why)"
@@ -581,6 +645,26 @@ estado com last de forma errada passa por válido@@last is None or (isinstance(l
 status não valida a forma do estado@@            st = fresh_state()@@            pass
 status não distingue estado ausente@@        out["state"] = "ausente"@@        pass
 pids listados e nenhum legível viram "ninguém roda"@@    if seen and not out:@@    if False:
+stop não manda KILL no que sobrou na sessão@@    if left:   # o que sobrou@@    if False:   # o que sobrou
+stop olha só o líder e não a sessão (a sonda de grupo que passava com o item vivo)@@p["sid"] == r["pid"] and p["state"] != "Z" and pid_exists(p["pid"])@@p["pid"] == r["pid"] and p["state"] != "Z" and pid_exists(p["pid"])
+stop dá por sumido o que ainda responde ao sinal 0@@        os.kill(pid, 0)
+        return True@@        os.kill(pid, 0)
+        return False
+stop com sobrevivente ou tabela ilegível sai rc 0@@return 5 if out.get("survivors") or out.get("unverified") else 0@@return 0
+stop devolve em stopped a rodada que tem sobrevivente@@        out["stopped"] = [x for x in out["stopped"] if x["run"] not in left]@@        pass
+stop com tabela ilegível depois do TERM diz que esvaziou@@        except Unreadable:
+            return None@@        except Unreadable:
+            return {}
+stop sem SIGCONT (item parado não trata o TERM)@@        send(r, signal.SIGCONT)
+        if st is not None:@@        if st is not None:
+terminate sem SIGCONT (item parado não trata o TERM)@@    send(r, signal.SIGCONT)
+    st["term"][r["run"]] = cfg.now@@    st["term"][r["run"]] = cfg.now
+meta.json com pid 0/1 vale como líder da rodada@@type(m.get("pid")) is int and m["pid"] > 1:@@isinstance(m.get("pid"), int):
+meta.json ilegível não deixa nota@@                notes.append("meta-ilegivel:%s" % r["run"])@@                pass
+nome do item pela pasta tira todo número final@@r"-[0-9]{9,}(-[0-9]+)?$"@@r"-[0-9]+(-[0-9]+)?$"
+meminfo ilegível derruba também a leitura dos processos (leituras juntas)@@        procs, unf, run = current_runs(cfg)@@        if bad:
+            raise Unreadable("juntas")
+        procs, unf, run = current_runs(cfg)
 MUT
   "$PY" -I - "$P" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import re, sys
