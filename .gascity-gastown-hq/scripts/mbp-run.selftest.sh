@@ -140,7 +140,7 @@ case "$name" in
     else echo "stub-exec-ok"; exit "${STUB_RUN_RC:-0}"; fi ;;
   DIRECT)
     echo "DIRECT:$args" >> "$STUB_LOG"
-    case "$args" in *"cat > gt-remote/freeze-wa.txt"*) cat > "$(dirname "$STUB_LOG")/freeze-sent.txt" ;; esac
+    case "$args" in *"cat > gt-remote/freeze-"*) cat > "$(dirname "$STUB_LOG")/freeze-sent.txt" ;; esac
     if [ -n "${STUB_DIRECT_FAIL_ON:-}" ]; then case "$args" in *"$STUB_DIRECT_FAIL_ON"*) exit 1 ;; esac; fi
     # STUB_DIRECT_EXEC_ON=<padrão>: o comando remoto que casa o padrão roda DE VERDADE (bash -c, HOME falso, o uv/shasum falsos do PATH) e o stub devolve o status DELE. É assim que se vê o status que o
     # comando monta (um `| tail` que engole o do uv), e não o que um stub finge: o FAIL_ON acima falha o ssh inteiro e nunca exercita o comando.
@@ -364,7 +364,7 @@ reset() { : > "$STUB_LOG"; rm -f "$STUB_REAPED" "$J" "$STUB_STATE_FILE" "$STUB_S
   rm -f "$T/city/.gc/hetzner-node.on" "$T/city/.gc/hetzner-mac-only.learned" "$T/city/.gc/logs/hetzner-shadow.jsonl" "$T"/last-script-*-hetzner.sh "$T"/last-script-*-mbp.sh "$T/freeze-sent.txt"
   unset STUB_UNREACHABLE_NODE STUB_UNREACHABLE_MBP STUB_PF_RAW_NODE STUB_NOBASE_NODE STUB_NOVENV_NODE STUB_RUN_RC_NODE STUB_RUN_RC_MBP STUB_RUN_OUT_NODE STUB_RUN_OUT_MBP STUB_RUN_SLEEP_NODE STUB_RUN_SLEEP_MBP \
     STUB_N_MEMINFO_RAW STUB_N_AVAIL_MB STUB_N_SWAPTOTAL_MB STUB_N_SWAPFREE_MB STUB_N_SWAPFREE2_MB STUB_N_PSI_MISSING STUB_N_PSI_RAW STUB_N_PSI_SOME STUB_N_PSI_FULL STUB_N_NPROC STUB_N_NPROC_FAIL STUB_N_DISK_MB STUB_N_DISK_FAIL STUB_N_DISK_RAW \
-    STUB_RSYNC_REAL STUB_DIRECT_FAIL_ON STUB_DIRECT_EXEC_ON STUB_UV_FAIL_DRYRUN STUB_AUDIT_BROKEN STUB_AUDIT_UNREADABLE STUB_AUDIT_UNREADABLE_DIR HETZNER_XDIST_OFF HETZNER_XDIST_MIN_TESTS HETZNER_RSYNC_FILTER HETZNER_SEED_ROOT HETZNER_SEED_VENV HETZNER_SEED_DRYRUN HETZNER_MAX_SLOTS HETZNER_SHADOW_WAIT_S HETZNER_SHADOW_WINDOW_S HETZNER_MIN_DISK_MB HETZNER_FREEZE_SKIP HETZNER_NODE_HOST MBP_RUN_SHADOW
+    STUB_RSYNC_REAL STUB_DIRECT_FAIL_ON STUB_DIRECT_EXEC_ON STUB_UV_FAIL_DRYRUN STUB_UV_FREEZE_EXTRA STUB_AUDIT_BROKEN STUB_AUDIT_UNREADABLE STUB_AUDIT_UNREADABLE_DIR HETZNER_XDIST_OFF HETZNER_XDIST_MIN_TESTS HETZNER_RSYNC_FILTER HETZNER_SEED_ROOT HETZNER_SEED_VENV HETZNER_SEED_DRYRUN HETZNER_MAX_SLOTS HETZNER_SHADOW_WAIT_S HETZNER_SHADOW_WINDOW_S HETZNER_MIN_DISK_MB HETZNER_FREEZE_SKIP HETZNER_NODE_HOST MBP_RUN_SHADOW
   unset STUB_UNREACHABLE STUB_AVAIL_MB STUB_SWAP_MB STUB_SWAP2_MB STUB_SWAP_RAW STUB_SWAP2_RAW STUB_PRESSURE STUB_PRESSURE_FAIL STUB_VM_FAIL STUB_VM_DROP STUB_PAGE_SIZE STUB_COMP_PAGES STUB_MP_FAIL STUB_MP_PCT STUB_PF_RAW STUB_POWER STUB_BATT STUB_PMSET_FAIL STUB_PMSET_RAW STUB_SLOTS STUB_NOBASE STUB_RUN_RC STUB_RUN_OUT STUB_RSYNC_RC; }
 expect() { # nome rc_esperado rc_real [grep-no-log padrão]
   n=$((n+1))
@@ -1214,7 +1214,7 @@ cat > "$T/bin/uv" <<'EOF'
 echo "UV:$*" >> "$STUB_LOG"
 # STUB_UV_FAIL_DRYRUN=1: o resolvedor não fecha com o freeze (o motivo de existir do --dry-run)
 case "$*" in *--dry-run*) if [ "${STUB_UV_FAIL_DRYRUN:-0}" = 1 ]; then echo "error: No solution found when resolving dependencies"; exit 2; fi; echo "Would install 1 package" ;; esac
-if [ "$1 $2" = "pip freeze" ]; then printf 'requests==2.0.0\npyobjc-core==10.0\nPyObjC-framework-Cocoa==10.0\nappnope==0.1\n-e git+https://x/y#egg=y\nfoo @ file:///x\npytest==9.0.2\n\n# comentario\n'; fi
+if [ "$1 $2" = "pip freeze" ]; then printf 'requests==2.0.0\npyobjc-core==10.0\nPyObjC-framework-Cocoa==10.0\nappnope==0.1\n-e git+https://x/y#egg=y\nfoo @ file:///x\npytest==9.0.2\n\n# comentario\n'; [ -z "${STUB_UV_FREEZE_EXTRA:-}" ] || printf '%s\n' "$STUB_UV_FREEZE_EXTRA"; fi
 EOF
 chmod +x "$T/bin/uv"
 WANT_HASH=$(printf 'pytest==9.0.2\nrequests==2.0.0\n' | shasum | awk '{print $1}')
@@ -1256,7 +1256,54 @@ has "…diz que a base JÁ foi semeada e o freeze enviado" "$T/err" 'a base foi 
 : > "$STUB_LOG"; rc=$(HETZNER_SEED_DRYRUN=1 STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada STUB_DIRECT_EXEC_ON='--dry-run' STUB_UV_FAIL_DRYRUN=1 seed); expect "dry-run com o uv falhando (erro de resolução): rc 98, o tail não esconde o status" 98 "$rc"
 has "…diz que o dry-run falhou" "$T/err" 'dry-run falhou'; has "…e ainda mostra o erro do uv" "$T/out" 'No solution found'
 HETZNER_SEED_ROOT="$SEEDROOT" HETZNER_SEED_VENV="$SEEDVENV" HETZNER_RSYNC_FILTER="$T/unsafe-filter" "$RUN" --host linux --seed wa >"$T/out" 2>"$T/err"; expect "seed com filtro inseguro: 97 (não semeia)" 97 "$?"
-HETZNER_SEED_ROOT="$SEEDROOT" "$RUN" --host linux --seed ps >"$T/out" 2>"$T/err"; expect "seed ps no nó: 97 (o nó só tem o wa)" 97 "$?"
+# ---- ps no nó (ga-2hd02v.4.8): SÓ o venv. A árvore de runtime do PS (data/, logs/, shared/, .env, lista de telefones) NÃO vai por rsync: o código do PS chega pelo espelho git. O freeze vai para
+# freeze-ps.txt e o venv é o venv-ps, nunca o do wa. Os arquivos *_unico* da árvore falsa são a prova de vazamento: se algum aparecer no nó (qualquer pasta), o seed levou árvore.
+PSROOT="$T/psroot"; mkdir -p "$PSROOT/data" "$PSROOT/logs" "$PSROOT/lib" "$PSROOT/shared"; echo s > "$PSROOT/.env"; echo d > "$PSROOT/data/ps_leads_unico.csv"; echo c > "$PSROOT/lib/ps_codigo_unico.py"; phones 25 > "$PSROOT/lib/ps_lista_unico.py"
+ps_leak() { find "$T/home" -name 'ps_*_unico*' 2>/dev/null | wc -l | tr -d ' '; }
+ps_clean() { find "$T/home/gt-remote" -name 'ps_*_unico*' -delete 2>/dev/null; find "$T/home/gt-remote/wa-base" -mindepth 1 -delete 2>/dev/null; rm -f "$T/freeze-sent.txt"; : > "$STUB_LOG"; }
+pseed() { HETZNER_SEED_ROOT="$PSROOT" HETZNER_SEED_VENV="$SEEDVENV" "$RUN" --host linux --seed ps >"$T/out" 2>"$T/err"; echo $?; }
+ps_clean; rc=$(STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada pseed); expect "seed ps no nó: roda (hash do remoto difere → instala)" 0 "$rc"
+has "ps: instala com uv no venv-ps do nó, com o freeze-ps" "$STUB_LOG" 'DIRECT:.*uv pip install --python gt-remote/venv-ps/bin/python -r gt-remote/freeze-ps\.txt'
+has "ps: grava o hash do freeze só depois de instalar, no venv-ps" "$STUB_LOG" "DIRECT:.*uv pip install.*; echo $WANT_HASH > gt-remote/venv-ps/\.freeze-hash"
+hasnt "ps: não toca no venv-wa nem no freeze-wa" "$STUB_LOG" 'venv-wa|freeze-wa'
+has "ps: freeze filtrado enviado (pytest)" "$T/freeze-sent.txt" '^pytest==9\.0\.2$'; has "ps: freeze filtrado enviado (requests)" "$T/freeze-sent.txt" '^requests==2\.0\.0$'
+n=$((n+1)); if grep -q -i -E 'pyobjc|appnope|git\+|file://|^#' "$T/freeze-sent.txt" 2>/dev/null; then echo "FAIL ps: o freeze enviado ainda tem pacote do macOS / instalação local"; fails=$((fails+1)); else echo "ok   ps: sem pyobjc/appnope/-e/@ file:// no freeze"; fi
+hasnt "ps: nenhum rsync (a árvore do PS não vai ao nó)" "$STUB_LOG" 'RSYNC:'; hasnt "ps: sem auditoria de base (não há base)" "$STUB_LOG" 'HOSTCALL:hetzner:AUDIT'
+eq "ps: nenhum arquivo da árvore do PS apareceu no nó (dado, segredo, lista de telefones, código)" "0" "$(ps_leak)"
+[ ! -e "$T/home/gt-remote/ps-base" ] && ok "ps: não existe base do PS no nó" || bad "ps: criou uma base do PS no nó"
+ps_clean; rc=$(STUB_RSYNC_REAL=1 STUB_DIRECT_OUT="$WANT_HASH" pseed); expect "ps com o hash igual: nada a instalar" 0 "$rc"; hasnt "…sem uv pip install" "$STUB_LOG" 'uv pip install'; has "…diz que já bate" "$T/err" 'dependências do nó Linux já batem'
+ps_clean; rc=$(STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada STUB_DIRECT_FAIL_ON='uv pip install' pseed); expect "ps: uv que falha: rc 98" 98 "$rc"; has "…diz que o hash NÃO foi gravado" "$T/err" 'o hash NÃO foi gravado'
+ps_clean; rc=$(HETZNER_SEED_DRYRUN=1 STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada pseed); expect "ps dry-run" 0 "$rc"; has "ps dry-run: resolve contra o venv-ps com --dry-run" "$STUB_LOG" 'uv pip install --dry-run --python gt-remote/venv-ps/bin/python -r gt-remote/freeze-ps\.txt'
+has "ps dry-run: cria o venv-ps vazio se faltava (sem interpretador o uv não resolve)" "$STUB_LOG" 'test -x gt-remote/venv-ps/bin/python \|\| uv venv --python 3\.14 gt-remote/venv-ps'; hasnt "ps dry-run: NÃO grava o hash" "$STUB_LOG" '> gt-remote/venv-ps/\.freeze-hash'
+has "ps dry-run: a mensagem não promete base semeada" "$T/err" 'DRY-RUN: o freeze foi enviado'; hasnt "ps dry-run: sem 'a base foi semeada'" "$T/err" 'a base foi semeada'
+ps_clean; rc=$(HETZNER_SEED_ROOT="$PSROOT" HETZNER_SEED_VENV="$T/nao-existe-venv" STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada "$RUN" --host linux --seed ps >"$T/out" 2>"$T/err"; echo $?); expect "ps com o venv local ausente: 97" 97 "$rc"; has "…diz qual python faltou" "$T/err" 'python local do venv ausente'; hasnt "…e não instala nada" "$STUB_LOG" 'uv pip install'
+# freeze com linha que não é pin simples (URL com credencial): 97 e NADA enviado ao nó (nem freeze, nem uv). Vale para o ps e para o wa (a guarda é do trecho de dependências, comum aos dois)
+PS_URLTOK='private-pkg @ git+https://ghp_FAKEtoken123@github.com/x/private-pkg.git'
+ps_clean; rc=$(STUB_UV_FREEZE_EXTRA="$PS_URLTOK" STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada pseed); expect "ps com URL+credencial no freeze: 97" 97 "$rc"; has "…diz que não é pin simples" "$T/err" 'não é pin simples'
+hasnt "…e o freeze NÃO foi enviado ao nó" "$STUB_LOG" 'cat > gt-remote/freeze-'; [ ! -e "$T/freeze-sent.txt" ] && ok "…nem a credencial chegou a um arquivo do nó" || bad "…o freeze com a credencial chegou ao nó"; hasnt "…e o uv não rodou" "$STUB_LOG" 'uv pip install'
+ps_clean; rc=$(STUB_UV_FREEZE_EXTRA="$PS_URLTOK" STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada seed); expect "wa com URL+credencial no freeze: 97 (a guarda vale para os dois repos)" 97 "$rc"; hasnt "…e o freeze NÃO foi enviado" "$STUB_LOG" 'cat > gt-remote/freeze-'
+ps_clean; rc=$(STUB_UV_FREEZE_EXTRA='pkg @ https://example.com/p.whl' STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada pseed); expect "ps com '@ https://' (sem credencial) também é recusado: forma que não é pin simples" 97 "$rc"
+PS_LOWRAM='avail_mb=1000\nswap_mb=0\nswap_delta_mb=0\npressure=1\npower=ac\nbatt='   # preflight do nó recusa por RAM e o ssh segue vivo (STUB_UNREACHABLE_NODE mataria o ssh também, e o mutante sem preflight não teria como escrever)
+ps_clean; rc=$(STUB_PF_RAW_NODE="$PS_LOWRAM" STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada pseed); expect "ps com o nó sem RAM no preflight: 98" 98 "$rc"
+hasnt "…e nada foi escrito no nó (sem mkdir, sem freeze, sem uv)" "$STUB_LOG" 'DIRECT:'
+ps_clean; rc=$(STUB_UNREACHABLE_NODE=1 STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada pseed); n=$((n+1)); if [ "$rc" -ge 96 ] && [ "$rc" -le 99 ]; then echo "ok   ps com o nó fora: recusa (rc $rc)"; else echo "FAIL ps com o nó fora: esperado 96..99, veio $rc"; fails=$((fails+1)); fi
+# controles negativos: cada defeito que o caso acima existe para pegar, injetado no script, TEM de aparecer
+ps_mut() { # nome sed-expr  (devolve o caminho do mutante; recusa mutante igual ao script)
+  sed "$2" "$RUN" > "$MUT/mut-$1.sh"; chmod +x "$MUT/mut-$1.sh"
+  n=$((n+1)); if cmp -s "$RUN" "$MUT/mut-$1.sh"; then echo "FAIL premissa: o mutante $1 é igual ao script (o sed não casou)"; fails=$((fails+1)); else echo "ok   premissa: o mutante $1 difere do script"; fi
+}
+ps_run_mut() { HETZNER_SEED_ROOT="$PSROOT" HETZNER_SEED_VENV="$SEEDVENV" STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada "$MUT/mut-$1.sh" --host linux --seed ps >"$T/out" 2>"$T/err"; echo $?; }
+ps_mut psvenvwa 's/rv=venv-ps;/rv=venv-wa;/'
+ps_clean; rc=$(ps_run_mut psvenvwa); n=$((n+1)); if grep -q 'venv-wa' "$STUB_LOG"; then echo "ok   controle: com o venv do wa no lugar do venv-ps o caso o pega (o log mostra venv-wa)"; else echo "FAIL controle: o mutante que instala o PS no venv-wa passou despercebido"; fails=$((fails+1)); fi
+ps_mut psfzwa 's/fz="freeze-\$seed_repo\.txt"/fz="freeze-wa.txt"/'
+ps_clean; rc=$(ps_run_mut psfzwa); n=$((n+1)); if grep -q 'freeze-wa' "$STUB_LOG"; then echo "ok   controle: com o freeze do wa no lugar do freeze-ps o caso o pega (o log mostra freeze-wa)"; else echo "FAIL controle: o mutante que sobrescreve o freeze-wa passou despercebido"; fails=$((fails+1)); fi
+ps_mut psbase 's/^  if \[ "\$seed_repo" = wa \]; then$/  if true; then/'
+ps_clean; rc=$(ps_run_mut psbase); n=$((n+1)); if [ "$(ps_leak)" != 0 ] || grep -q 'RSYNC:' "$STUB_LOG"; then echo "ok   controle: se o ps seguisse o caminho da base do wa, a árvore do PS chegaria ao nó e o caso o pega (rsync no log / arquivo no nó)"; else echo "FAIL controle: o mutante que semeia a árvore do PS passou despercebido"; fails=$((fails+1)); fi
+ps_mut pspreflight '/# ps: só o venv\. preflight/{n;s/preflight || return \$?/true/;}'
+ps_clean; rc=$(STUB_PF_RAW_NODE="$PS_LOWRAM" ps_run_mut pspreflight); n=$((n+1)); if grep -q 'DIRECT:' "$STUB_LOG"; then echo "ok   controle: sem o preflight o ps escreve no nó sem RAM e o caso o pega (DIRECT no log)"; else echo "FAIL controle: o mutante sem preflight no ps passou despercebido"; fails=$((fails+1)); fi
+ps_mut psnoplain 's/\[ -n "\$plain" \] && \[ "\$plain" = "\$total" \] || /true || /'
+ps_clean; rc=$(STUB_UV_FREEZE_EXTRA="$PS_URLTOK" ps_run_mut psnoplain); n=$((n+1)); if grep -q 'ghp_FAKEtoken123' "$T/freeze-sent.txt" 2>/dev/null; then echo "ok   controle: sem a guarda a credencial vai ao freeze do nó e o caso a pega (freeze-sent traz o token)"; else echo "FAIL controle: o mutante sem a guarda de pin simples passou despercebido"; fails=$((fails+1)); fi
+ps_clean
 HETZNER_SEED_ROOT="$T/nao-existe" HETZNER_SEED_VENV="$SEEDVENV" "$RUN" --host linux --seed wa >"$T/out" 2>"$T/err"; expect "árvore local ausente: 97" 97 "$?"
 printf '#!/usr/bin/env bash\ncase "$*" in *sys.version_info*) echo 3.14 ;; esac\nexit 1\n' > "$SEEDVENV/bin/python"
 mkdir -p "$T/emptyhome"; : > "$STUB_LOG"; HOME="$T/emptyhome" PATH="/usr/bin:/bin:/usr/sbin:/sbin" HETZNER_SEED_ROOT="$SEEDROOT" HETZNER_SEED_VENV="$SEEDVENV" STUB_RSYNC_REAL=1 MBP_SSH="$T/bin/ssh" MBP_RSYNC="$T/bin/rsync" "$RUN" --host linux --seed wa >"$T/out" 2>"$T/err"; rc=$?
@@ -1430,7 +1477,8 @@ rc=$(STUB_RSYNC_REAL=1 "$RUN" --host linux --seed hq >"$T/out" 2>"$T/err"; echo 
 [ ! -e "$T/home/gt-remote/hq-base/.gc" ] && [ ! -e "$T/home/gt-remote/hq-base/scripts/.env" ] && ok "seed hq: .gc e .env NÃO chegam" || bad "seed hq: .gc ou .env chegaram à base"
 [ -f "$HQSEEDED" ] && ok "seed hq: carimbo da semeadura (janela da sombra do hq)" || bad "seed hq: sem carimbo"
 rm -rf "$T/city/packs" "$T/city/scripts"; rm -f "$T/city/.gc/logs/mbp-run.jsonl"
-hreset; rc=$("$RUN" --host linux --seed ps >/dev/null 2>"$T/err"; echo $?); expect "--host linux --seed ps: 97 (no nó só wa — seed_node, ga-zri39b.4 — e hq)" 97 "$rc"; has "…diz" "$T/err" 'o nó Linux só tem o wa'
+# o ps ganhou semente no nó (ga-2hd02v.4.8, casos na seção da semeadura: só o venv): o que continua 97 é repo que o nó não conhece
+hreset; rc=$("$RUN" --host linux --seed zz >/dev/null 2>"$T/err"; echo $?); expect "--host linux --seed <repo desconhecido>: 97 (só wa, ps e hq têm semente no nó)" 97 "$rc"; has "…diz" "$T/err" 'uso: --seed wa\|ps\|hq'
 hreset; rc=$("$RUN" --seed hq >/dev/null 2>"$T/err"; echo $?); expect "--seed hq sem --host linux: 97" 97 "$rc"; has "…diz" "$T/err" 'use --host linux --seed hq'
 # SEGURANÇA, de verdade: rsync REAL com o filtro do hq contra uma árvore de hq com dado e segredo plantados
 WTHD="$T/wthd"; mkdir -p "$WTHD/scripts/testdata" "$WTHD/packs/town-deltas/assets/scripts" "$WTHD/docs/runbooks" "$WTHD/docs/reports/x" "$WTHD/docs/research" "$WTHD/agents/dog" "$WTHD/.beads/dolt/hq/.dolt/noms" "$WTHD/.gc/logs" "$WTHD/.gc/runtime/jsonl-archive" "$WTHD/.dolt-backup" "$WTHD/backup" "$WTHD/whatsapp_automation/lib" "$WTHD/gascity/cmd" "$WTHD/docs/pending-engine-window/a.harness"

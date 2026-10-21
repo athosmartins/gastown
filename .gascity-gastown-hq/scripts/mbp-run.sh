@@ -27,6 +27,7 @@
 #   mbp-run.sh --host linux|mbp ...  # fixa UM host (sem a cadeia): vale para --check e --seed, e é como o shadow roda o lado do MBP
 #        --host linux --check          saúde do nó Linux (preflight + bandeira + janela da sombra)
 #        --host linux --seed wa        (re)semeia a base do nó pelo filtro de segurança + node_guard (conteúdo), audita o destino (nome, conteúdo, JWT) e reinstala as dependências se o freeze mudou
+#        --host linux --seed ps        só o venv do PS no nó (gt-remote/venv-ps, do freeze do venv local do PS, sem pacote do macOS): não leva árvore nenhuma, o código do PS chega pelo espelho git
 #
 # CÓDIGOS DE SAÍDA — qualquer 96..99 significa "rode local": quem chama NUNCA trata isso como falha de teste.
 #   0..95  código do pytest/comando remoto (propagado)
@@ -911,21 +912,33 @@ EOF
   AUDIT_STATE=LIMPO
   return 0
 }
+# seed_node: wa = base filtrada + venv; ps = SÓ o venv (ga-2hd02v.4.8). O ps-worker-remote trabalha num worktree do ESPELHO git do rig (hetzner-mirror.sh, varredura de conteúdo limpa), então o nó não precisa
+# da árvore de runtime do PS: ela tem data/, logs/, shared/ e planilha de log, e nunca vai por rsync. O que falta ao worker é o python com pytest e as dependências do PS (o python3 do sistema do nó não tem pytest).
+# O freeze só segue se TODA linha for pin simples nome==versão (o código confere; URL com credencial = 97). Por isso o ps não usa HETZNER_SEED_ROOT, filter_sane, node_guard nem auditoria de base: não há base. base_of/venv_of do nó seguem sem o ps de propósito
+# (o caminho de execução do mbp-run usa os dois para decidir se o repo roda no nó, e o ps ainda não roda por ele: cai no MBP).
 seed_node() {
-  local root base rv lv pyver uvbin freeze hash rhash dry="${HETZNER_SEED_DRYRUN:-0}"
-  [ "$seed_repo" = wa ] || { say "o nó Linux só tem o wa (--seed wa)"; return 97; }
-  filter_sane || { say "o filtro do rsync do nó ($NODE_FILTER) não abre ou não tem a ordem de segurança — não semeio"; return 97; }
-  preflight || return $?
-  root=${HETZNER_SEED_ROOT:-$(local_root_of wa)}; base=$(base_of wa); rv=$(venv_of wa); lv=${HETZNER_SEED_VENV:-$(local_venv_of wa)}   # HETZNER_SEED_*: só o selftest troca
-  [ -d "$root" ] || { say "árvore local $root ausente"; return 97; }
-  # a semeadura leva à base o MESMO que o pytest leva ao espelho: o filtro olha NOME e pasta, o node_guard olha o CONTEÚDO (lista de telefones/CPFs fica no mini). Sem ele a base ganharia o que o
-  # espelho nunca recebe, e `cp -a` a clonaria para cada espelho. Falha fechada: não varreu = não semeia (rc 98), nunca "nada retido".
-  dir="$root"
-  node_guard || { say "não consegui varrer o conteúdo do que iria ao $HNAME (lista do rsync ou hetzner-pii-scan.py falhou) — não semeio"; return 98; }
-  say "semeando $HNAME:~/gt-remote/$base a partir de $root (filtro $NODE_FILTER, --delete-excluded)"
-  "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "mkdir -p gt-remote/$base gt-remote/mirror gt-remote/slots" || return 98
-  "$RSYNC_BIN" -a --delete --delete-excluded --filter=". $HELD" --filter=". $NODE_FILTER" -e "$SSH_BIN $SSH_OPTS" "$root"/ "$MBP_HOST:gt-remote/$base/" || return 98
-  node_audit "gt-remote/$base" || return 98
+  local root base rv lv fz pyver uvbin freeze total plain hash rhash dry="${HETZNER_SEED_DRYRUN:-0}"
+  case "$seed_repo" in wa|ps) ;; *) say "o nó Linux só tem o wa e o ps (--seed wa|ps)"; return 97 ;; esac
+  if [ "$seed_repo" = wa ]; then
+    filter_sane || { say "o filtro do rsync do nó ($NODE_FILTER) não abre ou não tem a ordem de segurança — não semeio"; return 97; }
+    preflight || return $?
+    root=${HETZNER_SEED_ROOT:-$(local_root_of wa)}; base=$(base_of wa); rv=$(venv_of wa); lv=${HETZNER_SEED_VENV:-$(local_venv_of wa)}   # HETZNER_SEED_*: só o selftest troca
+    [ -d "$root" ] || { say "árvore local $root ausente"; return 97; }
+    # a semeadura leva à base o MESMO que o pytest leva ao espelho: o filtro olha NOME e pasta, o node_guard olha o CONTEÚDO (lista de telefones/CPFs fica no mini). Sem ele a base ganharia o que o
+    # espelho nunca recebe, e `cp -a` a clonaria para cada espelho. Falha fechada: não varreu = não semeia (rc 98), nunca "nada retido".
+    dir="$root"
+    node_guard || { say "não consegui varrer o conteúdo do que iria ao $HNAME (lista do rsync ou hetzner-pii-scan.py falhou) — não semeio"; return 98; }
+    say "semeando $HNAME:~/gt-remote/$base a partir de $root (filtro $NODE_FILTER, --delete-excluded)"
+    "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "mkdir -p gt-remote/$base gt-remote/mirror gt-remote/slots" || return 98
+    "$RSYNC_BIN" -a --delete --delete-excluded --filter=". $HELD" --filter=". $NODE_FILTER" -e "$SSH_BIN $SSH_OPTS" "$root"/ "$MBP_HOST:gt-remote/$base/" || return 98
+    node_audit "gt-remote/$base" || return 98
+  else
+    # ps: só o venv. preflight = o nó está de pé e com folga; sem ele não se escreve nada lá. gt-remote/ existe no nó desde a semeadura do wa, mas o mkdir -p garante a pasta que o freeze e o venv usam.
+    preflight || return $?
+    rv=venv-ps; lv=${HETZNER_SEED_VENV:-$(local_venv_of ps)}   # HETZNER_SEED_VENV: só o selftest troca
+    "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "mkdir -p gt-remote" || return 98
+  fi
+  fz="freeze-$seed_repo.txt"   # um arquivo por repo: o freeze do ps nunca sobrescreve o do wa (nem o venv-ps vira o venv-wa)
   # dependências: o freeze do venv do mini, sem o que só existe no macOS (pyobjc, py2app, appnope...) e sem instalação local (-e / @ file:). Linux aarch64 não tem essas rodas.
   # Cada leitura tem três estados: ferramenta ausente / freeze vazio → "não consegui ler" (rc 97, nunca "sem dependências").
   uvbin=$(command -v uv 2>/dev/null || { [ -x "$HOME/.local/bin/uv" ] && echo "$HOME/.local/bin/uv"; })
@@ -934,22 +947,28 @@ seed_node() {
   if [ -n "$uvbin" ]; then freeze=$("$uvbin" pip freeze --python "$lv/bin/python" 2>/dev/null); else freeze=$("$lv/bin/python" -m pip freeze 2>/dev/null); fi
   freeze=$(printf '%s\n' "$freeze" | grep -v -E -i "${HETZNER_FREEZE_SKIP:-^(pyobjc|py2app|appnope|rumps|macholib|altgraph|modulegraph|-e |#)|@ file:|^[[:space:]]*$}" | LC_ALL=C sort)
   [ -n "$freeze" ] && [ -n "$pyver" ] || { say "não consegui ler as dependências do venv local ($lv)"; return 97; }
+  # só pin simples (nome==versão) segue: linha com URL (pkg @ git+https://token@host/..., @ https://...) pode levar credencial ao freeze-<repo>.txt do nó e ao uv, e qualquer forma que eu não reconheço é "não sei o que é".
+  # vazio → o freeze vazio já saiu em 97 acima; falhou/ilegível → grep que não conta deixa $plain vazio ou menor que $total e cai em 97, nunca em "tudo pin simples"
+  total=$(printf '%s\n' "$freeze" | wc -l | tr -d ' '); plain=$(printf '%s\n' "$freeze" | grep -c -E '^[A-Za-z0-9_.-]+==[A-Za-z0-9_.+!-]+$')
+  [ -n "$plain" ] && [ "$plain" = "$total" ] || { say "o freeze do venv local ($lv) tem linha que não é pin simples (nome==versão), talvez URL com credencial — não envio nada ao $HNAME"; return 97; }
   # vazio → o freeze já foi checado acima (vazio = 97); falhou/ilegível (shasum) → hash vazio = 97, nunca igual a um .freeze-hash que faltou
   hash=$(printf '%s\n' "$freeze" | shasum | awk '{print $1}')
   hash_valid "$hash" || { say "não consegui calcular o hash do freeze (shasum falhou) — não sei se as dependências do $HNAME batem"; return 97; }
   # vazio → o nó não tem .freeze-hash (1ª semeadura): não bate, instala; falhou/ilegível → o ssh caiu: também vem vazio, não bate, e o próximo ssh falha em 98. $hash é hex não vazio, então vazio nunca "bate"
   rhash=$("$SSH_BIN" $SSH_OPTS "$MBP_HOST" "cat gt-remote/$rv/.freeze-hash 2>/dev/null")
   if [ "$hash" = "$rhash" ]; then say "dependências do $HNAME já batem (hash ${hash:0:12})"; return 0; fi
-  printf '%s\n' "$freeze" | "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "cat > gt-remote/freeze-wa.txt" || return 98
+  printf '%s\n' "$freeze" | "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "cat > gt-remote/$fz" || return 98
   if [ "$dry" = 1 ]; then
-    # a base JÁ foi semeada (rsync + auditoria) e o freeze JÁ foi enviado; o dry-run só pula a instalação e a gravação do hash
-    say "DRY-RUN: a base foi semeada e o freeze enviado ao $HNAME; abaixo o que o uv instalaria (nada é instalado e o hash não é gravado)"
+    # wa: a base JÁ foi semeada (rsync + auditoria); ps: não há base. Nos dois o freeze JÁ foi enviado e o venv é criado vazio se faltava (o uv não resolve sem interpretador, e o ps começa sem venv-ps);
+    # o dry-run só pula a instalação dos pacotes e a gravação do hash
+    if [ "$seed_repo" = wa ]; then say "DRY-RUN: a base foi semeada e o freeze enviado ao $HNAME; abaixo o que o uv instalaria (nada é instalado e o hash não é gravado)"
+    else say "DRY-RUN: o freeze foi enviado ao $HNAME (e o venv criado vazio se faltava); abaixo o que o uv instalaria (nenhum pacote é instalado e o hash não é gravado)"; fi
     # o `| tail -40` devolvia o status do tail: um uv que falhou (erro de resolução é para isso que o dry-run serve) saía 0. O status do uv é guardado antes e vira o do comando remoto (sem pipefail: o shell remoto pode ser sh)
-    "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "export PATH=\$HOME/.local/bin:\$PATH; o=\$(uv pip install --dry-run --python gt-remote/$rv/bin/python -r gt-remote/freeze-wa.txt 2>&1); r=\$?; printf '%s\n' \"\$o\" | tail -40; exit \$r" \
+    "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "export PATH=\$HOME/.local/bin:\$PATH; test -x gt-remote/$rv/bin/python || uv venv --python $pyver gt-remote/$rv >/dev/null 2>&1; o=\$(uv pip install --dry-run --python gt-remote/$rv/bin/python -r gt-remote/$fz 2>&1); r=\$?; printf '%s\n' \"\$o\" | tail -40; exit \$r" \
       || { say "uv pip install --dry-run falhou no $HNAME (erro do uv, por exemplo o resolvedor não fechar com este freeze, ou o ssh caiu; veja a saída acima) — a próxima semeadura de verdade pode falhar igual"; return 98; }
     return 0
   fi
-  "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "export PATH=\$HOME/.local/bin:\$PATH; set -e; test -x gt-remote/$rv/bin/python || uv venv --python $pyver gt-remote/$rv; uv pip install --python gt-remote/$rv/bin/python -r gt-remote/freeze-wa.txt; echo $hash > gt-remote/$rv/.freeze-hash" \
+  "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "export PATH=\$HOME/.local/bin:\$PATH; set -e; test -x gt-remote/$rv/bin/python || uv venv --python $pyver gt-remote/$rv; uv pip install --python gt-remote/$rv/bin/python -r gt-remote/$fz; echo $hash > gt-remote/$rv/.freeze-hash" \
     || { say "uv pip install falhou no $HNAME — o hash NÃO foi gravado (a próxima semeadura tenta de novo)"; return 98; }
   say "dependências do $HNAME atualizadas (hash $hash)"
   return 0
@@ -1024,7 +1043,7 @@ fi
 refresh_tools() { install_tools >/dev/null 2>&1 || say "AVISO: não atualizei ~/gt-remote/bin no MBP (gascity-mbp); rode: mbp-offload.sh install-mbp"; }
 if [ "$mode" = seed ]; then
   case "$seed_repo" in wa|ps|hq) ;; *) say "uso: --seed wa|ps|hq"; exit 97 ;; esac
-  if [ "$HOSTKIND" = linux ] && [ "$seed_repo" != hq ]; then seed_node; exit $?; fi   # wa no nó: seed_node (ga-zri39b.4; ps ele mesmo recusa)
+  if [ "$HOSTKIND" = linux ] && [ "$seed_repo" != hq ]; then seed_node; exit $?; fi   # wa e ps no nó: seed_node (ga-zri39b.4; o ps é só o venv, ga-2hd02v.4.8)
   if [ "$HOSTKIND" = linux ]; then
     # nó Linux, hq: código sem venv — o MESMO filtro e a MESMA varredura de conteúdo da execução
     repo=hq; dir=$(local_root_of hq); node_files_for hq; base=$(base_of hq)
