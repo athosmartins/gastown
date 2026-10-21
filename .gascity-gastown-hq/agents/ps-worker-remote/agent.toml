@@ -6,13 +6,14 @@
 # O QUE É: um ps-worker de pool (headless, sonnet) cujo nome de sessão contém `-remote-`; o `remote_match` do provider híbrido manda essa sessão ao host remoto (scripts/gc-session-ssh).
 #   Quem decide QUE bead vai para cá é scripts/ps-node-classify.py (código + teste, sem banco real, sem credencial, sem rede viva); o gancho do Pilot é PILOT_PS_NODE_ROUTE (default off).
 #   Ver docs/runbooks/hetzner-ps-node.md. É o irmão do wa-worker-remote: mesmo desenho, rig e classificador próprios.
-# INERTE ATÉ LIGAR: min_active_sessions = 0 e nenhuma bead leva `gc.routed_to=ps-worker-remote` enquanto o Pilot estiver em `off`; a ativação viva (papel `ps-worker` em `worktree_rigs` do host, o espelho git do
+# INERTE ATÉ LIGAR: min_active_sessions = 0 e nenhuma bead leva o dono `ps-worker-remote-1` enquanto o Pilot estiver em `off`; a ativação viva (papel `ps-worker` em `worktree_rigs` do host, o espelho git do
 #   property_scrapers no nó e o modo do Pilot) é o passo de ligar do runbook.
-# POR QUE 1 SÓ: a fila de PS é curta (11 abertas em 20/10) e o primeiro degrau prova ponta a ponta antes de abrir mais slots; subir o teto é decisão do Mayor depois de medir (o despachante também exige slot = 1).
+# POR QUE 1 SÓ: a fila de PS é curta (11 abertas em 20/10) e o primeiro degrau prova ponta a ponta antes de abrir mais slots; subir o teto é decisão do Mayor depois de medir (o ps-node-dispatch.sh também fixa 1 slot: o alias único ps-worker-remote-1).
 # O QUE O PROVIDER FAZ COM ESTE ARQUIVO: ignora `work_dir` (a pasta não existe no host) e abre a sessão num worktree git novo do rig `property_scrapers`, criado pelo wt-add no start
 #   (config do host: "worktree_rigs": {"ps-worker": "property_scrapers"} — o papel é o que vem antes de `-remote-`). `pre_start` não existe aqui: o provider não o executa no host.
-# COMO A BEAD CHEGA: JÁ ATRIBUÍDA ao alias da sessão (o atalho bd/gc do servidor recusa `bd ready`, `bd query`, `bd update --claim` e `gc runtime drain-ack`). Quem despacha é
-#   scripts/ps-node-dispatch.sh (ou o gancho do Pilot) e a bead é achada por `bd list --status in_progress --assignee`. Ver prompt.template.md.
+# COMO A BEAD CHEGA: JÁ ATRIBUÍDA ao alias da sessão (o atalho bd/gc do servidor recusa `bd ready`, `bd query`, `bd update --claim` e `gc runtime drain-ack`). O gancho do Pilot (_pilot_ps_node_decide)
+#   chama scripts/ps-node-dispatch.sh, que escreve o dono e a marca `pilot.wa_node_alias` (SEM `gc.routed_to`: a bead mora na loja do rig e o pool de um template sem `dir` só lê a cidade, nunca a veria),
+#   e é o PILOT quem abre esta sessão (`gc session new ps-worker-remote --alias ps-worker-remote-1`) e a avisa. A bead é achada por `bd -C property_scrapers list --status in_progress --assignee`. Ver prompt.template.md.
 # O QUE NÃO TEM AQUI: Dolt, a árvore da cidade, credencial do GitHub, o banco real (MotherDuck, ~/.property-scrapers), token de site, IP residencial. O push vai só ao espelho do mini.
 # literal, sem {{.AgentBase}}: com no máximo 1 sessão não há instância a distinguir, e a pasta só existe para o engine (o provider a troca pelo worktree)
 work_dir = ".gc/agents/ps-worker-remote"

@@ -27,7 +27,7 @@ bd -C property_scrapers list --status in_progress --assignee "$GC_ALIAS" --json 
 
 **Toda chamada de `bd` sobre a bead leva `-C property_scrapers`**: a bead de PS mora na loja do rig, não na da cidade, e o `bd` sem `-C` olha a cidade (a lista voltaria vazia, e `bd show ps-…` só acha pela rota). O atalho aceita `-C` com o nome do rig (`property_scrapers`) ou o caminho dele.
 
-Veio uma bead? É sua: `bd -C property_scrapers show <id> --json` e comece. (O aviso que acorda a sessão também cita o id da bead.) Veio vazio? A bead ainda não foi atribuída: avise com `gc session nudge gastown.mayor "ps-worker-remote sem bead atribuída"` e termine o turno. Não há laço de espera: quem atribui a bead manda um nudge à sessão, e ao recebê-lo você repete este passo.
+Veio uma bead? É sua: `bd -C property_scrapers show <id> --json` e comece. (O aviso que acorda a sessão também cita o id da bead.) Veio vazio? Só vale como "vazio" uma lista `[]` com rc 0: um `bd` que falha, é recusado ou devolve algo ilegível **não é** lista vazia, então leia a mensagem e repita uma vez antes de concluir qualquer coisa. Vazio de verdade quer dizer que a bead ainda não foi atribuída: avise com `gc session nudge gastown.mayor "ps-worker-remote sem bead atribuída"` e termine o turno. Não há laço de espera: quem atribui a bead manda um nudge à sessão, e ao recebê-lo você repete este passo.
 
 Não existe sonda de pool aqui. `bd ready`, `bd query`, `bd update --claim` e `gc runtime drain-ack` **não passam** pelo atalho: voltam recusados (rc 77) sem executar nada. Não tente outro caminho para fazê-los passar.
 
@@ -38,7 +38,7 @@ Não existe sonda de pool aqui. `bd ready`, `bd query`, `bd update --claim` e `g
 ## Trabalhar e entregar
 
 1. Trabalhe no diretório atual. Registre o andamento com `bd -C property_scrapers comment <id> "..."`.
-2. Rode só testes que não precisam de banco, rede de produção nem do Mac: `"$HOME/gt-remote/venv-ps/bin/python" -m pytest lib/tests tests -k <o que mudou>` (puros, sem rede nem credencial; é o que a CI do PS roda). Use SEMPRE esse python: o `python3` do sistema do nó não tem pytest nem as dependências do PS, e não instale nada: o ambiente de teste do PS é semeado pelo mini (`mbp-run.sh --host linux --seed ps`), nunca pelo worker. Se `"$HOME/gt-remote/venv-ps/bin/python"` não existir, o nó está sem o ambiente de teste do PS: **isso não é falha da bead**, devolva-a pela seção "Se a bead não cabe aqui" com o motivo "nó sem venv-ps". Não rode raspador de verdade contra um site. Se um teste pedir arquivo que o nó não tem, **isso é sinal de que a bead não cabe aqui**: veja a próxima seção, não crie dado falso para passar.
+2. Rode só testes que não precisam de banco, rede de produção nem do Mac: `"$HOME/gt-remote/venv-ps/bin/python" -m pytest lib/tests tests -k <o que mudou>` (é o que a CI do PS roda; sem rede nem credencial). Use SEMPRE esse python: o `python3` do sistema do nó não tem pytest nem as dependências do PS, e não instale nada: o ambiente de teste do PS é semeado pelo mini (`mbp-run.sh --host linux --seed ps`), nunca pelo worker. Se `"$HOME/gt-remote/venv-ps/bin/python"` não existir, o nó está sem o ambiente de teste do PS: **isso não é falha da bead**, devolva-a pela seção "Se a bead não cabe aqui" com o motivo "nó sem venv-ps". O `tests/` da raiz **não** é todo puro: parte dele lê banco ou rede, então antes de rodar um arquivo de lá leia que ele não toca banco, rede nem credencial. Não rode raspador de verdade contra um site. Se um teste pedir arquivo que o nó não tem, **isso é sinal de que a bead não cabe aqui**: veja a próxima seção, não crie dado falso para passar. Teste que falha por erro de ambiente (módulo ou arquivo ausente) não é "passou" nem "sem teste falhando": é um motivo para devolver a bead.
 3. Os commits saem com o autor `<seu nome de sessão>@gastown.invalid`; não mude a identidade git.
 4. `git push origin HEAD` leva o branch ao espelho do mini, que só aceita `worker/*`, `crew/*`, `fix/*` e `feat/*`. Merge é do gate, nunca seu.
 5. Bead de código: ao terminar, rode `gate-done` e deixe um `bd -C property_scrapers comment <id> "entregue: <resumo>"`. **Não feche** a bead; o gate fecha. O skill de mesmo nome não existe nesta sessão: o que vale é o atalho.
@@ -59,7 +59,7 @@ Cabe aqui o que se prova só com código e testes. **Não cabe** (pare, não ten
 
 1. `bd -C property_scrapers comment <id> "nó: não cabe aqui — <o que faltou, sem copiar dado>"`.
 2. `bd -C property_scrapers update <id> --set-metadata athos.node_recusa="<motivo curto>"` (a chave `athos.*` passa pelo atalho).
-3. `gc session nudge gastown.mayor "ps-worker-remote devolveu <id>: não cabe no nó"` e termine o turno. Quem despachou devolve a bead ao mini (rota normal de ps-worker).
+3. `gc session nudge gastown.mayor "ps-worker-remote devolveu <id>: não cabe no nó"` e termine o turno. Você não consegue devolver sozinho (o atalho não deixa mudar dono nem status): quem despachou solta a bead com `ps-node-dispatch.sh release <id>` e a põe de volta em `open`, e só então ela volta à fila do mini (rota normal de ps-worker).
 
 Devolver é uma entrega correta, não uma falha.
 

@@ -11981,6 +11981,8 @@ _pilot_node_only_candidate_pre() {
   [ -n "$_id" ] || return 1
   # ga-8okir7: a bead de WA (wa-*) segue o caminho do gancho do nó de WA, logo abaixo desta função; as regras de dog daqui a soltariam (o alvo dela é wa-worker)
   case "$_id" in wa-*) _pilot_node_only_wa_pre "$_b" && return 0; return 1 ;; esac
+  # ga-2hd02v.4: idem para a bead de PS (ps-*): o gancho do nó de PS (_pilot_ps_node_decide) vem depois das sondas de WA, e as regras de dog daqui a soltariam (o alvo dela é ps-worker)
+  case "$_id" in ps-*) _pilot_node_only_ps_pre "$_b" && return 0; return 1 ;; esac
   # vazio (sem story.rig) → vale o prefixo do id logo abaixo; falhou/ilegível → não é candidata
   _rig=$(printf '%s' "$_b" | jq -r '.metadata["story.rig"] // ""' 2>/dev/null) || return 1
   if ! _pilot_priority_pool_bound_pre "$_b"; then
@@ -11993,7 +11995,7 @@ _pilot_node_only_candidate_pre() {
 # ── ga-8okir7: a passada só-nó também leva ao nó a bead de WA que o gancho do nó de WA leva ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
 # Medido 20/10: com o mini no piso de disco o nó ficou ocioso (CPU 1–18% de 00:45 a 06:35) com trabalho de WA na fila, porque a passada só-nó da 1.20 só deixava passar bead de dog do HQ. O gancho que leva a bead de WA
 # ao wa-worker-remote já existe (_pilot_wa_node_decide, ga-2hd02v.1.10, PILOT_WA_NODE_ROUTE, padrão off): a passada passa a chegar até ele. A sessão wa-worker-remote roda no Hetzner (worktree e build lá); no mini
-# fica a escrita da bead. Fora de label|auto nada muda. Não há ps-worker remoto (nenhum agente de pool no nó para PS): a bead de ps-worker segue solta na passada.
+# fica a escrita da bead. Fora de label|auto nada muda. A bead de PS (ps-*) tem as irmãs logo abaixo (_pilot_node_only_ps_route_on/_pre, ga-2hd02v.4, PILOT_PS_NODE_ROUTE); com o gancho dela desligado a bead de ps-worker segue solta na passada.
 
 # Nota de manutenção: os mutantes de pilot-dispatcher.wa-node-route.selftest.sh trocam a 1ª ocorrência, no arquivo INTEIRO, do padrão `off` da rota (a expansão da variável com o `:-` e o `off`) e da chamada do
 # script com `--basis` seguido de `--dry-run`, e esperam que ela esteja em _pilot_wa_node_decide: por isso os dois helpers abaixo leem a rota sem esse padrão (vazio já cai no `*)`) e escrevem a sonda com
@@ -12029,6 +12031,35 @@ _pilot_node_only_wa_pre() {
   _PNW_PROBES=$((_PNW_PROBES + 1))
   # modo e N de slots iguais aos do apply de verdade (ga-2hd02v.3): vazio → o script assume pool e 1 slot; ilegível → o script cai no mesmo pool/1 (a sonda nunca acha vaga que o apply não acharia)
   WA_NODE_SPAWN="${PILOT_WA_NODE_SPAWN:-}" WA_NODE_SLOTS="${PILOT_WA_NODE_SLOTS:-}" timeout "${PILOT_WA_NODE_TIMEOUT:-90}" "$_dir/wa-node-dispatch.sh" apply "$_id" --dry-run --basis "$_basis" >/dev/null 2>&1 || _rc=$?
+  [ "$_rc" = 0 ]
+}
+
+# ── ga-2hd02v.4: a passada só-nó também leva ao nó a bead de PS que o gancho do nó de PS leva ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+# Irmãs de _pilot_node_only_wa_route_on/_pre para PS (PILOT_PS_NODE_ROUTE, scripts/ps-node-dispatch.sh, teto PILOT_PS_NODE_ONLY_PROBES). Mesma regra: nenhuma escrita antes da claim, UMA sonda `apply --dry-run` por
+# candidata, só o rc 0 vale, em dúvida pula. O ps-node-dispatch.sh fixa o modo pilot e o alias do PS: não há variável de modo para repassar.
+# vazio (sem dono e sem rota; o bd omite chave vazia) → é o estado livre; falhou/ilegível (JSON que o jq não lê) → NÃO. Script ausente ou sonda que não sai 0 (10, 11, 12, 13, 124, 137...) → NÃO.
+_pilot_node_only_ps_route_on() {
+  case "${PILOT_PS_NODE_ROUTE:-}" in label|auto) ;; *) return 1 ;; esac
+  [ "${DRY_RUN:-0}" != "1" ]
+}
+_PNP_PROBES=0
+_pilot_node_only_ps_pre() {
+  local _b="${1:-}" _id _own _dir _mode="${PILOT_PS_NODE_ROUTE:-}" _basis=any _cap="${PILOT_PS_NODE_ONLY_PROBES:-6}" _rc=0
+  _pilot_node_only_ps_route_on || return 1
+  _id=$(printf '%s' "$_b" | jq -r '.id // ""' 2>/dev/null) || return 1
+  [ "${_id#ps-}" != "$_id" ] || return 1
+  _own=$(printf '%s' "$_b" | jq -r '(.assignee // "") + (.metadata["gc.routed_to"] // "")' 2>/dev/null) || return 1
+  [ -z "$_own" ] || return 1
+  if [ "$_mode" = label ]; then
+    _basis=label
+    printf '%s' "$_b" | jq -e '(.labels // []) | index("node:ok")' >/dev/null 2>&1 || return 1
+  fi
+  case "$_cap" in ''|*[!0-9]*) _cap=6 ;; esac
+  [ "$_PNP_PROBES" -lt "$_cap" ] || return 1
+  _dir="${PILOT_PS_NODE_SCRIPTS:-$GC_CITY/scripts}"
+  [ -x "$_dir/ps-node-dispatch.sh" ] || return 1
+  _PNP_PROBES=$((_PNP_PROBES + 1))
+  timeout "${PILOT_PS_NODE_TIMEOUT:-90}" "$_dir/ps-node-dispatch.sh" apply "$_id" --dry-run --basis "$_basis" >/dev/null 2>&1 || _rc=$?
   [ "$_rc" = 0 ]
 }
 
@@ -12447,6 +12478,109 @@ _pilot_wa_node_settle() {
   if [ "$_PWR_MARK" != "$_PWR_ALIAS" ] || [ "$_PWR_STATUS" != in_progress ]; then return 0; fi
   warn "wa-node: $_se_id ficou com o alias $_PWR_ALIAS depois de um apply incerto e sem sessão — desfaço (a próxima varredura tenta de novo)"
   _pilot_node_remote_rollback "$_PWR_ALIAS" "$_se_id" "$_se_store" 0 pilot.wa_node_alias || true
+  return 0
+}
+
+# ── ga-2hd02v.4: bead PS → nó Hetzner (ps-worker-remote). PADRÃO: DESLIGADO ─────────────────────────────
+# Irmão do gancho do WA (_pilot_wa_node_decide, acima): mesma escada de modos, mesmas três saídas, outro rig e outro classificador (scripts/ps-node-classify.py, via scripts/ps-node-dispatch.sh).
+# Athos 20/10: "o que não pode é ficar menos do que 100% ocupado" — a bead de PS que é só código + teste (sem banco real, credencial nem rede viva) usa a CPU do nó em vez de esperar o slot do mini.
+# PILOT_PS_NODE_ROUTE = off|shadow|label|auto — qualquer outro valor (vazio, erro de digitação) é off.
+#   off     nada roda: a função volta antes de ler qualquer coisa; o despacho é o de sempre.
+#   shadow  classifica (ps-node-dispatch.sh check) e grava uma linha em $GC_CITY/.gc/ps-node-route.jsonl; NÃO muda o despacho.
+#   label   além da sombra, a bead que o classificador manda ao nó POR CAUSA da etiqueta humana node:ok vai ao nó (apply --basis label).
+#   auto    além disso, a que se prova só pelo texto da bead (apply --basis any).
+# Retorno 0 = a bead JÁ está atribuída ao ps-worker-remote-<k> e a sessão está aberta e avisada (o chamador não faz o caminho do pool do mini); 1 = nada ficou escrito, a bead segue no mini; 2 = SEGURA: o chamador
+# NÃO despacha esta varredura (carimbar ps-worker por cima de uma atribuição ao nó deixaria a bead nas duas filas) e tenta de novo na próxima. Dois motivos, os do WA: (a) a bead JÁ é do nó (dono ou rota ps-worker-remote*)
+# ou o gancho não consegue relê-la; (b) a escrita pode ter acontecido e não sei dizer (rc 13, prazo estourado, ou o despachante morto por sinal, rc >= 128), ou a sessão não abriu e o desfazer não se confirmou.
+# DIFERENÇA para o WA: só existe o modo pilot. A bead do PS mora na loja do rig e o pool de um template sem `dir` só lê a cidade, então o pool nunca a veria: quem abre a sessão do alias é o Pilot
+# (_pilot_node_remote_open, a receita provada do dog-remote), e o ps-node-dispatch.sh fixa WA_NODE_SPAWN=pilot e escreve só dono + marca pilot.wa_node_alias, sem gc.routed_to.
+# vazio → n/a (o classificador sempre responde node/mini/unknown); falhou/ilegível antes de escrever (rc 10/11/12) → igual a mini: 1 (a bead já foi lida como "não é do nó"; a que é do nó não chega aqui).
+_pilot_ps_node_decide() {
+  local _id="${1:-}" _store="${2:-}" _tgt="${3:-}" _mode="${PILOT_PS_NODE_ROUTE:-off}" _dir _out="" _rc=0 _basis=any _bj="" _bo=""
+  case "$_mode" in shadow|label|auto) ;; *) return 1 ;; esac
+  [ "$_tgt" = "ps-worker" ] || return 1
+  case "$_id" in ps-*) ;; *) return 1 ;; esac
+  if [ "$_mode" != shadow ]; then
+    # três estados, nunca dois: "é do nó" (dono ou rota ps-worker-remote*) / "lida e não é do nó" / "não consegui ler" (bd falhou, saída vazia ou que não é JSON, a bead de outro id). Só o segundo segue; o terceiro
+    # NÃO vira "livre" (o caminho do pool escreveria por cima de uma bead que talvez já seja do nó).
+    _bj=$(timeout "${PILOT_PS_NODE_READ_TIMEOUT:-20}" bd -C "$_store" show "$_id" --json 2>/dev/null) || _bj=""
+    _bo=$(printf '%s' "$_bj" | jq -r --arg id "$_id" 'if type=="array" then .[0] else . end | select(type=="object" and .id == $id) | if (((.assignee // "") | startswith("ps-worker-remote")) or ((.metadata["gc.routed_to"] // "") | startswith("ps-worker-remote"))) then "node" else "other" end' 2>/dev/null) || _bo=""
+    case "$_bo" in
+      other) ;;
+      node) warn "ps-node: $_id já é do nó (dono ou rota ps-worker-remote*) — seguro: sem carimbo do mini e sem sessão do mini; a próxima varredura relê"; return 2 ;;
+      *) warn "ps-node: não consegui reler $_id — não sei se já é do nó; seguro: sem carimbo do mini e sem sessão do mini; a próxima varredura relê"; return 2 ;;
+    esac
+  fi
+  _dir="${PILOT_PS_NODE_SCRIPTS:-$GC_CITY/scripts}"
+  if [ ! -x "$_dir/ps-node-dispatch.sh" ]; then
+    warn "ps-node: $_dir/ps-node-dispatch.sh não está executável — $_id segue no mini"
+    return 1
+  fi
+  [ "$_mode" = label ] && _basis=label
+  if [ "$_mode" = shadow ]; then
+    _out=$(timeout "${PILOT_PS_NODE_TIMEOUT:-90}" "$_dir/ps-node-dispatch.sh" check "$_id" --store "$_store" 2>/dev/null) || _rc=$?
+  elif [ "${DRY_RUN:-0}" = "1" ]; then
+    _out=$(timeout "${PILOT_PS_NODE_TIMEOUT:-90}" "$_dir/ps-node-dispatch.sh" apply "$_id" --store "$_store" --basis "$_basis" --dry-run 2>/dev/null) || _rc=$?
+  else
+    # a sessão lenta deste sweep já gastou o orçamento de spawn → nem escreve (o apply grava a bead; sem poder abrir a sessão seria só um desfazer a mais). Nada escrito → 1 (segue no mini).
+    if _pilot_slow_spawn_budget_spent; then
+      log "  ga-2hd02v.4: $_id fica no mini — uma sessão lenta já gastou o orçamento de spawn deste sweep (uma por sweep); nada escrito"
+      return 1
+    fi
+    _out=$(timeout "${PILOT_PS_NODE_TIMEOUT:-90}" "$_dir/ps-node-dispatch.sh" apply "$_id" --store "$_store" --basis "$_basis" 2>/dev/null) || _rc=$?
+  fi
+  mkdir -p "$GC_CITY/.gc" 2>/dev/null || true
+  jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg b "$_id" --arg m "$_mode" --argjson rc "$_rc" --arg o "$_out" \
+    '{ts:$ts,event:"pilot-node-route",bead:$b,mode:$m,rc:$rc,out:$o}' >> "$GC_CITY/.gc/ps-node-route.jsonl" 2>/dev/null || true
+  [ "$_mode" = shadow ] && return 1
+  if [ "${DRY_RUN:-0}" = "1" ]; then
+    # só o rc 0 do `apply --dry-run` diz "iria ao nó"; 10/11/12 e o resto = não iria (ou o script não soube dizer), e o log não anuncia o que o script não disse
+    if [ "$_rc" = 0 ]; then log "  ga-2hd02v.4: WOULD route $_id to the node (dry-run: nothing written)"
+    else log "  ga-2hd02v.4: dry-run: $_id would NOT go to the node (ps-node-dispatch.sh rc=$_rc; nothing written)"; fi
+    return 1
+  fi
+  case "$_rc" in
+    0) ;;
+    13|124|137|143) warn "ps-node: $_id — resultado da escrita desconhecido (rc=$_rc); não despacho esta varredura"; _pilot_ps_node_settle "$_id" "$_store"; return 2 ;;
+    # morto por qualquer outro sinal (128+n) = o mesmo "não sei se já escreveu"; 125-127 (o timeout falhou, não deu para executar, não achou) e o resto: nada rodou
+    12[89]|1[3-9][0-9]|2[0-4][0-9]|25[0-5]) warn "ps-node: $_id — o despachante morreu por sinal (rc=$_rc); a escrita pode ter acontecido; não despacho esta varredura"; _pilot_ps_node_settle "$_id" "$_store"; return 2 ;;
+    *) return 1 ;;
+  esac
+  # o apply só escreveu (dono + marca); a sessão do alias é do gancho: 0 aberta e avisada · 1 desfeito e confirmado (segue no mini) · 2 segura
+  _pilot_ps_node_open "$_id" "$_store"
+}
+
+# _pilot_ps_node_open <id> <loja> — depois do apply: lê a bead e abre (ou acorda) a sessão do alias a que ela foi atribuída. Só abre para a cara exata do que o apply escreve (dono ps-worker-remote-1..9, marca
+# pilot.wa_node_alias igual ao dono, in_progress); qualquer outra coisa = 2 sem escrever e sem abrir. A leitura e a abertura são as genéricas do WA (_pilot_wa_node_read, _pilot_node_remote_open: template, alias e a CHAVE da marca por argumento).
+# vazio → n/a (o apply acabou de escrever); falhou/ilegível (a bead não releu) → 2, sem sessão e sem desfazer.
+_pilot_ps_node_open() {
+  local _po_id="${1:-}" _po_store="${2:-}" _po_rc=0
+  if ! _pilot_wa_node_read "$_po_id" "$_po_store"; then
+    warn "ps-node: não consegui reler $_po_id depois do apply — não sei a qual alias abrir a sessão; seguro: sem sessão e sem desfazer; a próxima varredura relê"
+    return 2
+  fi
+  case "$_PWR_ALIAS" in
+    ps-worker-remote-[1-9]) ;;
+    *) warn "ps-node: $_po_id depois do apply está com dono '${_PWR_ALIAS:-}' (esperava ps-worker-remote-<1-9>) — seguro: sem sessão e sem desfazer; a próxima varredura relê"; return 2 ;;
+  esac
+  if [ "$_PWR_MARK" != "$_PWR_ALIAS" ] || [ "$_PWR_STATUS" != in_progress ]; then
+    warn "ps-node: $_po_id depois do apply está com marca '${_PWR_MARK:-}' e status '$_PWR_STATUS' (esperava marca=$_PWR_ALIAS e in_progress) — seguro: sem sessão e sem desfazer; a próxima varredura relê"
+    return 2
+  fi
+  _pilot_node_remote_open ps-worker-remote "$_PWR_ALIAS" "$_po_id" "$_po_store" "$_PWR_TITLE" pilot.wa_node_alias || _po_rc=$?
+  return "$_po_rc"
+}
+
+# _pilot_ps_node_settle <id> <loja> — depois de um rc incerto do apply (13, prazo, sinal). A escrita pode ter pegado e então NINGUÉM abriria a sessão (a marca não é rota): a bead ficaria dona de um alias sem sessão e toda
+# varredura a seguraria como "já é do nó". Desfaz SÓ o que tem a cara do que o apply escreve (in_progress, dono ps-worker-remote-<1-9>, marca igual ao dono). Quem chama devolve 2 (segura) de qualquer jeito.
+# vazio (bead livre: a escrita não pegou) → não escreve nada; falhou/ilegível (a bead não leu) → não escreve nada (não sei o que há lá); dono, marca ou status de outro jeito → não toca (é de outro).
+_pilot_ps_node_settle() {
+  local _ss_id="${1:-}" _ss_store="${2:-}"
+  _pilot_wa_node_read "$_ss_id" "$_ss_store" || return 0
+  case "$_PWR_ALIAS" in ps-worker-remote-[1-9]) ;; *) return 0 ;; esac
+  if [ "$_PWR_MARK" != "$_PWR_ALIAS" ] || [ "$_PWR_STATUS" != in_progress ]; then return 0; fi
+  warn "ps-node: $_ss_id ficou com o alias $_PWR_ALIAS depois de um apply incerto e sem sessão — desfaço (a próxima varredura tenta de novo)"
+  _pilot_node_remote_rollback "$_PWR_ALIAS" "$_ss_id" "$_ss_store" 0 pilot.wa_node_alias || true
   return 0
 }
 
@@ -13666,8 +13800,11 @@ LIVESEC
       log "  ga-2hd02v.1.20: $STORY_ID segue na passada só-nó do disk floor — o nó Hetzner tem vaga (effective=${_PNY_EFFECTIVE:-?}); se o nó não ficar com a bead, ela NÃO vai ao mini."
     elif [ "$_PYS_NATIVE" = "1" ] && [ "$_PYS_TARGET" = "wa-worker" ] && _pilot_node_only_wa_route_on; then
       # ga-8okir7: bead de WA (store do WA, pool wa-worker) com PILOT_WA_NODE_ROUTE=label|auto segue até o gancho do nó (_pilot_wa_node_decide, no braço do pool mais abaixo). Se o gancho não a levar ao nó, o braço
-      # solta a claim e sai com disk_floor_node_only: ela NÃO cai no pool do mini. ps-worker (não há ps-worker remoto), crew nomeada e bead do HQ com alvo wa-worker caem no else e soltam.
+      # solta a claim e sai com disk_floor_node_only: ela NÃO cai no pool do mini. ps-worker com PILOT_PS_NODE_ROUTE=label|auto tem o elif logo abaixo (ga-2hd02v.4); ps-worker com o gancho desligado, crew nomeada e bead do HQ com alvo wa-worker caem no else e soltam.
       log "  ga-8okir7: $STORY_ID segue na passada só-nó do disk floor — alvo wa-worker e PILOT_WA_NODE_ROUTE=${PILOT_WA_NODE_ROUTE}; o gancho do nó decide e, se ele não a levar, ela NÃO vai ao mini."
+    elif [ "$_PYS_NATIVE" = "1" ] && [ "$_PYS_TARGET" = "ps-worker" ] && _pilot_node_only_ps_route_on; then
+      # ga-2hd02v.4: o mesmo para a bead de PS (store do PS, pool ps-worker) com PILOT_PS_NODE_ROUTE=label|auto: segue até o gancho do nó de PS (_pilot_ps_node_decide, no braço do pool mais abaixo); se ele não a levar, ela NÃO cai no pool do mini.
+      log "  ga-2hd02v.4: $STORY_ID segue na passada só-nó do disk floor — alvo ps-worker e PILOT_PS_NODE_ROUTE=${PILOT_PS_NODE_ROUTE}; o gancho do nó decide e, se ele não a levar, ela NÃO vai ao mini."
     else
       log "  ga-2hd02v.1.20: $STORY_ID fica para depois do disk floor — não é bead de dog do HQ que o nó queira agora (alvo $_PYS_TARGET); claim solta, nada vai ao mini."
       _pilot_priority_yield_release "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET" "disk-floor-node-only"
@@ -14325,6 +14462,18 @@ TASK
         # (PILOT_WA_NODE_SPAWN=pilot, ga-2hd02v.3): to wa-worker-remote-<k> with the marker pilot.wa_node_alias and the hook has already opened and nudged the
         # session. Either way the spawn case below has its own arm (no gc session new, no gc.routed_to=wa-worker). rc 1: nothing was left written, the pool path runs.
         # rc 2: the write may have landed and we can't tell — release our claim and stand down; the next sweep re-reads.
+        # ── ga-2hd02v.4: o mesmo para a bead de PS (PILOT_PS_NODE_ROUTE, padrão off; _pilot_ps_node_decide só olha alvo ps-worker). Roda ANTES do gancho do WA, que devolve 1 para o alvo que não é wa-worker. rc 0: a bead já
+        # está com o ps-worker-remote-<k> e o gancho já abriu e avisou a sessão (o braço ps-worker-remote) do spawn só loga); rc 1: nada escrito, o caminho do pool segue; rc 2: não sei, solta a claim e não despacha.
+        local _RP_PS_NODE_RC=0
+        _pilot_ps_node_decide "$STORY_ID" "$STORY_BEAD_CITY" "$_SLING_TARGET" || _RP_PS_NODE_RC=$?
+        if [ "$_RP_PS_NODE_RC" = 0 ]; then
+          _SLING_TARGET="ps-worker-remote"
+        elif [ "$_RP_PS_NODE_RC" = 2 ]; then
+          bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+          bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+          DISPATCH_RESULT="ps_node_unknown"
+          return 1
+        fi
         local _RP_NODE_RC=0
         _pilot_wa_node_decide "$STORY_ID" "$STORY_BEAD_CITY" "$_SLING_TARGET" || _RP_NODE_RC=$?
         if [ "$_RP_NODE_RC" = 0 ]; then
@@ -14334,7 +14483,7 @@ TASK
           bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
           DISPATCH_RESULT="wa_node_unknown"
           return 1
-        elif [ "${_PILOT_NODE_ONLY:-0}" = "1" ]; then
+        elif [ "${_PILOT_NODE_ONLY:-0}" = "1" ] && [ "$_SLING_TARGET" != "ps-worker-remote" ]; then
           # ga-8okir7: passada só-nó do disk floor, rc 1 = o gancho não levou a bead ao nó e nada foi escrito. O mini está pausado: ela NÃO cai no caminho do pool do mini (carimbo gc.routed_to=wa-worker + gc session new).
           log "  ga-8okir7: $STORY_ID — o gancho do nó não ficou com a bead (nada escrito) e o disk floor pausa o mini: NÃO vai ao mini; claim solta, reavaliada na próxima varredura."
           bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
@@ -14581,6 +14730,11 @@ TASK
         else
           log "  ga-mfeip: PILOT_SPAWN_WA_WORKER=0 — skipping auto-spawn for $STORY_ID (gc.routed_to=wa-worker set; bead unassigned until worker claims)"
         fi
+        ;;
+      ps-worker-remote)
+        # ga-2hd02v.4: atribuída por ps-node-dispatch.sh (dono ps-worker-remote-<k> + marca pilot.wa_node_alias, SEM gc.routed_to) e a sessão já foi aberta e avisada por _pilot_ps_node_open. Um gc session new AQUI faria
+        # duas sessões (o crew-session-dedup derruba uma); carimbar gc.routed_to=ps-worker mandaria a bead também ao pool do mini. Este braço fica ANTES de ps-worker*), que casaria ps-worker-remote.
+        log "  ga-2hd02v.4: $STORY_ID → ps-worker-remote (node) — no spawn here (the hook already opened and nudged the session)"
         ;;
       ps-worker*)
         # Set gc.routed_to so RoutedPoolQuery finds the unassigned bead AND the supervisor
