@@ -40,8 +40,14 @@ ambiente > default.
 
 ```bash
 printf 'DOLT_BACKUP_EPHEMERAL_DBS=\n' > .gc/config/dolt-backup-ephemeral.env      # desliga TUDO (volta ao staging permanente)
-printf 'DOLT_BACKUP_EPHEMERAL_DRYRUN=1\n' >> .gc/config/dolt-backup-ephemeral.env  # a prova do S3 roda, o rm não
+printf 'DOLT_BACKUP_EPHEMERAL_DRYRUN=1\n' >> .gc/config/dolt-backup-ephemeral.env  # a prova do S3 roda, o rm não — em TODOS os dbs
+printf 'DOLT_BACKUP_EPHEMERAL_DRYRUN_DBS=whatsapp_automation\n' >> .gc/config/dolt-backup-ephemeral.env  # o mesmo, só para esse db
 ```
+
+Para experimentar um db novo use a lista por banco (`DRYRUN_DBS`), **não** o `DRYRUN=1`: o `DRYRUN=1` global também
+segura a liberação real do hq naquela noite, e um staging do hq que fica com conteúdo faz o gate de disco da noite
+seguinte virar o legado (150% do vivo). Lembre que a linha `DOLT_BACKUP_EPHEMERAL_DBS=` da conf **substitui** o
+default (`hq`): ao incluir um db novo, liste o `hq` também.
 
 Lista vazia = modo desligado. Arquivo que existe mas não pode ser lido = modo desligado **e** dry-run (na
 dúvida, o staging fica). O noturno loga `ephemeral staging mode: on(hq)` / `off` no início de cada rodada.

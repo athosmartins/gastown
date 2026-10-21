@@ -87,6 +87,8 @@
 #   DOLT_BACKUP_EPHEMERAL_CONF)
 # DOLT_BACKUP_EPHEMERAL_DRYRUN=1 — decide and log "WOULD RELEASE", delete nothing (conf line > environment;
 # an unreadable conf counts as a dry run). Use it for a first night: the S3 proof still runs, the rm does not.
+# DOLT_BACKUP_EPHEMERAL_DRYRUN_DBS="db1 db2" — the same, only for those dbs (the others release for real). Use it to try a new db
+# without stopping hq's release (ga-dun81y).
 #
 # Caller provides for the release/fingerprint helpers: AWS, BUCKET, BACKUP_ROOT, and (release
 # only) dolt-backup-s3-proof.sh already sourced. A `log` function is used when defined, else stderr.
@@ -143,18 +145,33 @@ _eph_db_list() {
   return 0
 }
 
-# _eph_dryrun — 0 iff the release must only be logged, never performed: DOLT_BACKUP_EPHEMERAL_DRYRUN=1
-# in the conf file, else in the environment. A conf that cannot be read counts as a dry run (doubt keeps
-# the staging). Anything but a literal 1 is "not a dry run".
+# _eph_dryrun [db] — 0 iff the release must only be logged, never performed. Two switches, either is enough:
+#   DOLT_BACKUP_EPHEMERAL_DRYRUN=1       every db (kept as it was);
+#   DOLT_BACKUP_EPHEMERAL_DRYRUN_DBS     (only when <db> is given) space-separated db names: a dry run for THOSE dbs.
+# The second exists because the first is global: trying a new db with DRYRUN=1 also stopped the real release of hq for
+# that night, and an hq staging that keeps its content makes the next night's disk gate the legacy 150% of live
+# (see "KNOWN CONSEQUENCES"). Conf line > environment, for both. A conf that cannot be read counts as a dry run (doubt
+# keeps the staging). Anything but a literal 1 is "not a dry run". vazio → lista ausente ou vazia: nenhum db entra por
+# ela (só o 1 global decide); falhou/ilegível → dry run; nome que não é identificador simples → fora (não é "dry run").
 _eph_dryrun() {
-  local v="" rc=0
+  local db="${1:-}" v="" raw="" tok rc=0
   v="$(_eph_conf_line DOLT_BACKUP_EPHEMERAL_DRYRUN)" || rc=$?
   case "$rc" in
     0) ;;
     1) v="${DOLT_BACKUP_EPHEMERAL_DRYRUN:-0}" ;;
     *) return 0 ;;
   esac
-  [ "$v" = "1" ]
+  [ "$v" = "1" ] && return 0
+  case "$db" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+  rc=0
+  raw="$(_eph_conf_line DOLT_BACKUP_EPHEMERAL_DRYRUN_DBS)" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) raw="${DOLT_BACKUP_EPHEMERAL_DRYRUN_DBS:-}" ;;
+    *) return 0 ;;
+  esac
+  for tok in $raw; do [ "$tok" = "$db" ] && return 0; done
+  return 1
 }
 
 # _eph_is_ephemeral <db> — 0 iff <db> is on the list. An unreadable conf, an empty list and an
@@ -295,7 +312,7 @@ _eph_release_staging() {
   fi
   kb="$(du -sk "$target" 2>/dev/null | awk '{print $1}')"
   case "${kb:-}" in ''|*[!0-9]*) mb="?" ;; *) mb="$((kb / 1024))" ;; esac
-  if _eph_dryrun; then
+  if _eph_dryrun "$db"; then
     _EPH_RELEASE_WHY="dryrun"
     _eph_log "$db: ephemeral staging: DRYRUN — WOULD RELEASE ${mb}MB at $target (S3 proven identical + restorable); nothing deleted"
     return 1

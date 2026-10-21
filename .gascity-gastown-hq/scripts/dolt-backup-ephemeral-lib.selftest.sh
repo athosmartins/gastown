@@ -99,7 +99,7 @@ LOCKH="0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; ROOTH="0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 mkmanifest() { local f="$1" n="$2" i s="5:__DOLT__:$LOCKH:$ROOTH:$GCG"; for i in $(seq 1 "$n"); do s="$s:$(tid "$i"):$((i*7))"; done; printf '%s' "$s" > "$f"; }
 mkdir_backup() { local d="$1" n="$2" i; mkdir -p "$d"; mkmanifest "$d/manifest" "$n"
   for i in $(seq 1 "$n"); do if [ $((i%2)) -eq 1 ]; then printf 'data%s' "$i" > "$d/$(tid "$i")"; else printf 'darc%s' "$i" > "$d/$(tid "$i").darc"; fi; done; }
-reset_bucket() { rm -rf "$FB"; mkdir -p "$FB"; : > "$CALLS"; : > "$LOGF"; unset FAKE_LIST_FAIL FAKE_SYNC_FAIL FAKE_SYNC_NOOP FAKE_DRYRUN_FAIL FAKE_CP_UP_FAIL FAKE_PS_OUT FAKE_PS_FAIL DOLT_BACKUP_EPHEMERAL_DRYRUN; }
+reset_bucket() { rm -rf "$FB"; mkdir -p "$FB"; : > "$CALLS"; : > "$LOGF"; unset FAKE_LIST_FAIL FAKE_SYNC_FAIL FAKE_SYNC_NOOP FAKE_DRYRUN_FAIL FAKE_CP_UP_FAIL FAKE_PS_OUT FAKE_PS_FAIL DOLT_BACKUP_EPHEMERAL_DRYRUN DOLT_BACKUP_EPHEMERAL_DRYRUN_DBS; }
 # a fresh .dolt-backup root, with <db> staged and mirrored identically in the fake bucket
 fresh_root() { BACKUP_ROOT="$T/city/.dolt-backup"; rm -rf "$T/city"; mkdir -p "$BACKUP_ROOT"; }
 
@@ -170,6 +170,24 @@ if [ "$(id -u)" != "0" ]; then
   _eph_dryrun && ok "unreadable conf → treated as a dry run (doubt keeps the staging)" || bad "unreadable conf allowed a real release"
 else ok "(running as root — skipped)"; fi
 chmod 644 "$T/eph.env"; rm -f "$T/eph.env"
+
+echo "── dry-run por banco (DOLT_BACKUP_EPHEMERAL_DRYRUN_DBS, ga-dun81y) ──"
+unset DOLT_BACKUP_EPHEMERAL_DRYRUN; DOLT_BACKUP_EPHEMERAL_DRYRUN_DBS="whatsapp_automation"; export DOLT_BACKUP_EPHEMERAL_DRYRUN_DBS
+_eph_dryrun whatsapp_automation && ok "per-db list: a listed db is a dry run" || bad "listed db not a dry run"
+_eph_dryrun hq && bad "per-db list put hq (not listed) in dry run" || ok "…and a db that is NOT listed (hq) is not"
+_eph_dryrun && bad "per-db list turned the no-argument call into a dry run" || ok "…and the no-argument call is not (only the global 1 decides there)"
+_eph_dryrun 'whatsapp_automation;x' && bad "a db name that is not a plain identifier matched" || ok "a db argument that is not a plain identifier is never a dry run"
+DOLT_BACKUP_EPHEMERAL_DRYRUN_DBS=""; export DOLT_BACKUP_EPHEMERAL_DRYRUN_DBS
+_eph_dryrun hq && bad "empty per-db list put hq in dry run" || ok "empty per-db list → nobody is a dry run by it"
+printf 'DOLT_BACKUP_EPHEMERAL_DRYRUN_DBS=whatsapp_automation\n' > "$T/eph.env"; DOLT_BACKUP_EPHEMERAL_DRYRUN_DBS="hq"; export DOLT_BACKUP_EPHEMERAL_DRYRUN_DBS
+_eph_dryrun whatsapp_automation && ! _eph_dryrun hq && ok "conf line beats the environment for the per-db list" || bad "per-db list: env beat the conf"
+printf 'DOLT_BACKUP_EPHEMERAL_DRYRUN=1\n' > "$T/eph.env"; unset DOLT_BACKUP_EPHEMERAL_DRYRUN_DBS
+_eph_dryrun hq && ok "global 1 still makes every db a dry run" || bad "global 1 lost its effect on hq"
+printf 'DOLT_BACKUP_EPHEMERAL_DRYRUN_DBS=whatsapp_automation\n' > "$T/eph.env"; chmod 000 "$T/eph.env"
+if [ "$(id -u)" != "0" ]; then
+  _eph_dryrun hq && ok "unreadable conf → dry run for any db (doubt keeps the staging)" || bad "unreadable conf let hq release"
+else ok "(running as root — skipped)"; fi
+chmod 644 "$T/eph.env"; rm -f "$T/eph.env"; unset DOLT_BACKUP_EPHEMERAL_DRYRUN_DBS
 
 # ═══ _eph_release_target — path safety ══════════════════════════════════════════════════════
 echo "── _eph_release_target (path-safety) ──"
@@ -299,6 +317,15 @@ DOLT_BACKUP_EPHEMERAL_DRYRUN=1 _eph_release_staging hq "$BACKUP_ROOT/hq"; rc=$?
 
 [ "$rc" -eq 1 ] && [ -d "$BACKUP_ROOT/hq" ] && grep -q 'WOULD RELEASE' "$LOGF" && ok "dry run → decides and logs WOULD RELEASE, deletes nothing" || bad "dry run: rc=$rc exists=$([ -d "$BACKUP_ROOT/hq" ] && echo yes || echo no)"
 [ "$_EPH_RELEASE_WHY" = "dryrun" ] && ok "…reason word: dryrun (never mistaken for a failure)" || bad "reason word is '$_EPH_RELEASE_WHY', expected dryrun"
+
+# 9b. dry run for ONE db: the other ephemeral db still releases for real (the whole point of ga-dun81y)
+reset_bucket; fresh_root; mkdir_backup "$BACKUP_ROOT/hq" 4; mkdir_backup "$FB/hq" 4; mkdir_backup "$BACKUP_ROOT/whatsapp_automation" 4; mkdir_backup "$FB/whatsapp_automation" 4
+DOLT_BACKUP_EPHEMERAL_DBS="hq whatsapp_automation"; DOLT_BACKUP_EPHEMERAL_DRYRUN_DBS="whatsapp_automation"; export DOLT_BACKUP_EPHEMERAL_DBS DOLT_BACKUP_EPHEMERAL_DRYRUN_DBS
+_eph_release_staging whatsapp_automation "$BACKUP_ROOT/whatsapp_automation"; rc=$?
+[ "$rc" -eq 1 ] && [ -d "$BACKUP_ROOT/whatsapp_automation" ] && [ "$_EPH_RELEASE_WHY" = "dryrun" ] && grep -q 'whatsapp_automation: ephemeral staging: DRYRUN — WOULD RELEASE' "$LOGF" && ok "per-db dry run: the listed db only logs WOULD RELEASE, deletes nothing" || bad "per-db dry run (listed db): rc=$rc why=$_EPH_RELEASE_WHY"
+_eph_release_staging hq "$BACKUP_ROOT/hq"; rc=$?
+[ "$rc" -eq 0 ] && [ ! -e "$BACKUP_ROOT/hq" ] && [ "$_EPH_RELEASE_WHY" = "released" ] && ok "…while hq (not on the per-db list) is still RELEASED for real" || bad "per-db dry run stopped hq: rc=$rc why=$_EPH_RELEASE_WHY exists=$([ -e "$BACKUP_ROOT/hq" ] && echo yes || echo no)"
+unset DOLT_BACKUP_EPHEMERAL_DBS DOLT_BACKUP_EPHEMERAL_DRYRUN_DBS
 
 # 10. proof library not loaded
 reset_bucket; fresh_root; mkdir_backup "$BACKUP_ROOT/hq" 4; mkdir_backup "$FB/hq" 4
