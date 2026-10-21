@@ -303,7 +303,7 @@ g_reap() {
   smitem; gone "$PID"; adv 50 0; bt
   check "reap: sumiu sem rc → why morreu-sem-rc e rc null (não é ok, não é falha de teste)" "null morreu-sem-rc" "$(jget reaped.0.rc) $(jget reaped.0.why)"
 
-  smitem; gone "$PID"; echo 0 > "$H/runs/$RUN/rc"; printf 'x\nBALLAST-SUMMARY: {nope\n' > "$H/runs/$RUN/log"; adv 50 0; bt
+  smitem; gone "$PID"; echo 0 > "$H/runs/$RUN/rc"; printf 'x\nBALLAST-SUMMARY: {truncated\n' > "$H/runs/$RUN/log"; adv 50 0; bt
   check "reap: resumo que não é JSON → summary null e summary_why ilegivel (a rodada segue ok)" "ok null ilegivel" "$(rj why) $(rj summary) $(rj summary_why)"
   smitem; gone "$PID"; echo 0 > "$H/runs/$RUN/rc"; printf 'sem resumo\n' > "$H/runs/$RUN/log"; adv 50 0; bt
   check "reap: log sem linha de resumo → summary_why ausente" "null ausente" "$(rj summary) $(rj summary_why)"
