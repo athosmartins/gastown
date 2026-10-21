@@ -39,7 +39,7 @@
 		<key>PILOT_WA_NODE_EXEMPT</key>
 		<string>shadow</string>
 		<key>PILOT_WA_NODE_ROUTE</key>
-		<string>label</string>
+		<string>shadow</string>
 		<key>PILOT_WA_WORKER_MAX</key>
 		<string>2</string>
 	</dict>
