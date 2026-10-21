@@ -388,7 +388,9 @@ PLU="$FX/pilot-utc.log"; PLB="$FX/pilot-brt.log"; NOPILOT="$FX/nao-existe.log"; 
 # ---- a linha REAL do Pilot: o gancho de verdade (_pilot_wa_node_decide, extraído palavra por palavra do pilot-dispatcher.sh) roda em shadow contra um despachante falso e grava em $RL.
 # O despachante falso devolve o par (rc, saída) que o `check` real devolve (classify_checked); a linha é a que o Pilot grava, não a que este selftest imagina.
 DISP="$HERE/../packs/town-deltas/assets/pilot-dispatcher.sh"
+# o gancho chama _pilot_wa_node_spawn_mode (o modo de spawn e os slots, que vão na linha como `spawn` e `slots`): sem ela o `jq` da linha recebe `slots` vazio e NÃO grava. As duas vêm juntas; a segunda é opcional (despachante mais velho não a tem)
 HOOK_FN=""; [ -f "$DISP" ] && HOOK_FN=$(awk '/^_pilot_wa_node_decide\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISP")
+[ -n "$HOOK_FN" ] && HOOK_FN="$HOOK_FN"$'\n'"$(awk '/^_pilot_wa_node_spawn_mode\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISP")"
 mkdir -p "$RL/.gc" "$T/hook"
 cat > "$T/hook/wa-node-dispatch.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -510,8 +512,8 @@ chk_rc13() {
 chk_hook_real() {
   local f="$RL/.gc/wa-node-route.jsonl" r
   if [ -z "$HOOK_FN" ]; then [ "$VERBOSE" = 1 ] && echo "      _pilot_wa_node_decide não foi achada em $DISP" >&2; return 1; fi
-  [ -s "$f" ] || { [ "$VERBOSE" = 1 ] && echo "      o gancho real não gravou nada em $f" >&2; return 1; }
-  eq "$(wc -l < "$f" | tr -d ' ')" 4 "linhas gravadas pelo gancho" && eq "$(jq -r 'keys|join(",")' "$f" | sort -u)" "bead,event,mode,out,rc,ts" "chaves da linha do Pilot" &&
+  [ -s "$f" ] || { [ "$VERBOSE" = 1 ] && echo "      o gancho real não gravou nada em $f (o gancho passou a chamar outra função do despachante que o selftest não extrai?)" >&2; return 1; }
+  eq "$(wc -l < "$f" | tr -d ' ')" 4 "linhas gravadas pelo gancho" && eq "$(jq -r 'keys|join(",")' "$f" | sort -u)" "bead,event,mode,out,rc,slots,spawn,ts" "chaves da linha do Pilot (as de sempre mais spawn e slots, do modo pilot)" &&
   { NOWENV=$(( $(date -u +%s) + 5 )); jrun UTC "$RL"; r=$RC; unset NOWENV; eq "$r" 0 rc; } &&
   eq "$(jf .rota.analise.decisoes)" 4 decisoes && eq "$(jf .rota.analise.pilot_linhas)" 4 pilot_linhas && eq "$(jf .rota.analise.beads_com_veredito)" 3 com_veredito &&
   eq "$(vf node-sombra)" 1 node-sombra && eq "$(vf mini)" 1 mini && eq "$(vf nao-sei)" 1 nao-sei && eq "$(jf '.rota.analise.fora_do_veredito["nao-li"]')" 1 nao-li &&
