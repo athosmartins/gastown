@@ -92,11 +92,11 @@ $(printf '%s' "$dirty" | grep -v '^rc=')" ;;
     got=$(rsh "umask 022; mkdir -p \"\$(dirname \"$dst\")\" && cat > \"$dst.new\" && chmod $mode \"$dst.new\" && set -- \"$dst.new\" && $SHA_REMOTE" < "$SELF/$rel" 2> /dev/null); rc=$?
     [ "$rc" -ne 255 ] || die 98 "ssh não conectou ($NODE): nada foi instalado"
     [ "$got" = "$want" ] || { die 3 "o arquivo $rel chegou diferente (esperado $want, veio '${got:-nada}'): nada foi trocado"; }
+    sums="$sums\"$rel\": \"$want\", "   # o installed.json guarda este sha, o que o nó conferiu: nunca um 2º cálculo que poderia sair vazio
   done
   # fase 2: troca
   for p in "${pairs[@]}"; do dst=${p#*|}; dst=${dst%|*}; rsh "mv -f \"$dst.new\" \"$dst\"" || die 3 "não consegui trocar $dst"; done
   now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  for p in "${pairs[@]}"; do rel=${p%%|*}; sums="$sums\"$rel\": \"$(sha_local "$SELF/$rel")\", "; done
   printf '{"head": "%s", "dirty": %s, "at": "%s", "files": {%s}}\n' "$head" "$dirty" "$now" "${sums%, }" | rsh 'cat > "$HOME/gt-remote/ballast/installed.json"' || die 3 "não gravei installed.json"
   # crontab: tira a linha marcada de antes, acrescenta UMA; as dos outros ficam. cron.err tem teto no próprio governo. Crontab que não consegui ler (rc 4 de lá) → não escrevo nada
   rsh "$CRON_READ"'
