@@ -7,12 +7,14 @@
 # O QUE VERIFICA (nos arquivos IMPLANTADOS, não numa cópia): o classificador, o filtro e a lista mac-only do PS, o despachante, o gancho do Pilot e o gate-done-remote existem e parseiam; os selftests
 #   terminam com "N/N ok" e o mínimo de casos; o template ps-worker-remote nasce INERTE (min_active_sessions = 0, 1 só); o despachante do PS fixa o modo pilot (a bead do PS não está na loja que o
 #   pool enxerga); o gancho do Pilot nasce DESLIGADO (padrão `off` no fonte, e nenhum arquivo de configuração da cidade o liga); o prompt do worker remoto não tem skill com barra no início (ga-7nxfa1)
-#   e usa `bd -C property_scrapers`; a Seção 1 do filtro do PS é a do WA.
+#   e usa `bd -C property_scrapers`; a Seção 1 do filtro do PS é a do WA; se os 5 arquivos de teste que dependem do binário `node` estão FORA da lista mac-only, o nó tem o Node do pin
+#   (scripts/hetzner-nodejs-guard.sh, ga-2hd02v.4.11: FALHA se o nó não tem, AVISO se não deu para saber).
 # O QUE NÃO VERIFICA — e não diz que verifica: a "1 bead de PS construída no nó, passando no gate" que a história pede. Ela depende de ligar o gancho (PILOT_PS_NODE_ROUTE) e de uma bead real com
 #   `node:ok`: passos 6–7 do runbook docs/runbooks/hetzner-ps-node.md, não deste teste. Este teste PASSAR não diz que o nó entregou uma bead de PS.
-# POR QUE É SEGURO RODAR: os selftests usam stubs de bd/gc/ssh e uma cidade temporária; as leituras da configuração são só leitura. Nada é despachado, atribuído nem escrito em bead, e o servidor não é tocado.
+# POR QUE É SEGURO RODAR: os selftests usam stubs de bd/gc/ssh e uma cidade temporária; as leituras da configuração são só leitura. A única chamada de rede é o `hetzner-nodejs.sh check` do guarda do Node: só leitura, ssh com BatchMode e prazo. Nada é despachado, atribuído nem escrito em bead, e o servidor não é tocado.
 #   O selftest do gancho roda sem os mutantes aqui (PS_NODE_ROUTE_ST_NOMUT=1): eles são a bateria do gate.
-# O QUE É AVISO E NÃO FALHA: arquivo de configuração da cidade que não existe nesta árvore (não há o que ligar ali).
+# O QUE É AVISO E NÃO FALHA: arquivo de configuração da cidade que não existe nesta árvore (não há o que ligar ali); o guarda do Node que não conseguiu saber (ssh ao nó caiu, script ausente, prazo): o teste
+#   passa mas a última linha diz "Node do nó NÃO verificado" — nunca fica verde sem dizer.
 #
 # Chamado por run.sh depois do deploy (STORY_ID=ga-2hd02v.4). Sai 0 se passar.
 set -uo pipefail
@@ -78,10 +80,23 @@ fi
 grep -qE '^[^#[:space:]]' "$MAC_PS" || fail "a lista mac-only do PS não tem nenhum glob ($MAC_PS): o classificador devolveria unknown para tudo"
 log "Seção 1 do filtro do PS igual à do WA; lista mac-only do PS tem globs ✓"
 
+# ── o Node que justifica a lista (ga-2hd02v.4.11) ────────────────────────────
+# os 5 arquivos de teste que dependem do binário `node` saíram da lista mac-only porque o nó tem o Node; se o nó for refeito sem ele, o PS manda bead ao nó e ela reprova alto
+NJG="$CITY/scripts/hetzner-nodejs-guard.sh"
+need "$NJG"; syntax "$NJG"
+# vazio → o guarda sempre imprime uma linha; falhou/ilegível (rc 2) → aviso visível e a nota final, nunca verde calado
+njg_out=$("$BASH32" "$NJG" 2>&1); njg_rc=$?
+NODE_NOTE="Node do nó verificado"
+case $njg_rc in
+  0) log "$njg_out ✓" ;;
+  1) fail "$njg_out" ;;
+  *) warn "$njg_out"; NODE_NOTE="Node do nó NÃO verificado (aviso acima)" ;;
+esac
+
 # ── os selftests, contra a árvore viva ───────────────────────────────────────
 run_suite "classificador ps-node-classify (mutantes inclusos)"       130 timeout 600 "$BASH32" "$CLS_ST"
 run_suite "despachante ps-node-dispatch (mutantes inclusos)"          48 timeout 600 "$BASH32" "$DSP_ST"
 run_suite "gate-done-remote (rigs gascity + property_scrapers)"      280 timeout 900 "$BASH32" "$GDR_ST"
 PS_NODE_ROUTE_ST_NOMUT=1 run_suite "gancho do Pilot _pilot_ps_node_decide (sem mutantes)" 125 timeout 600 "$BASH32" "$PIL_ST"
 
-log "OK — classificação, roteamento e gate-done do nó para o PS prontos e INERTES. A bead real no nó é passo de ligar (docs/runbooks/hetzner-ps-node.md)."
+log "OK — classificação, roteamento e gate-done do nó para o PS prontos e INERTES; $NODE_NOTE. A bead real no nó é passo de ligar (docs/runbooks/hetzner-ps-node.md)."
