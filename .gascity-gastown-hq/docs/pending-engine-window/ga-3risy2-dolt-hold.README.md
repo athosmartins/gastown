@@ -6,7 +6,7 @@
 • Decisions worth challenging · Tests and what they prove · Applying in the window
 • Verifying after the window · Rolling back · What is NOT covered / NOT tested
 
-Patch: `ga-3risy2-dolt-hold.patch` (12 files: 8 edited, one of them a test file; 4 new, two of them tests). NOT applied.
+Patch: `ga-3risy2-dolt-hold.patch` (13 files: 8 edited, one of them a test file; 5 new, three of them tests). NOT applied.
 No build, no binary swap, no supervisor kickstart and no Dolt restart was done to produce it.
 The engine window stays Mayor-coordinated. Base: `consolidated/engine-window-20261016`
 (`de525d882`, the live `engwin-1016`). `git apply --check` is clean on that base, and the patch
@@ -163,10 +163,38 @@ nothing under it must still read as "no hold" in both readers) and the fallback 
 situations (14 now) plus a `wantBlock` field so a scenario where the helper lets the path through
 cannot pass vacuously. Each was run red first (the shell subtests against the previous helper,
 the Go one against the previous reader, the fallback ones against the previous fallback).
+After the third gate review the Go reader was fixed for a value it could not represent. It turned
+`expires_at` into a `time.Time` and decided with `!now.Before(t)`; `time.Unix` adds 62135596800 to
+the seconds, so from `expires_at=9223371974719179008` up the sum wraps to the year -292277022657
+and the hold read as long expired, while the shell compares int64 seconds and held. A hand-written
+"forever" (`9223372036854775807`) therefore released the hold on the engine side (controller tick,
+`bd` retry, `gc dolt start/restart`) and kept it on the city guards. The hold now stores
+`ExpiresUnix int64` and expiry is `ExpiresUnix <= now.Unix()` on both sides; `time.Unix` is only
+used to print a date, and only up to year 9999 (later values are printed as raw seconds).
+`TestReadManagedDoltHoldStates` gained five rows (MaxInt64, near-MaxInt64, the two seconds around
+the wrap, 9e18), each run through the Go reader AND the shell helper; the city lib's
+`dolt-hold.selftest.sh` gained the same five rows (those pass on both the old and the new shell
+code: they pin the side Go has to match, they are not a red test). Two of that review's
+non-blocking findings were fixed in the same pass because they share the class "the two readers
+do not read the same bytes the same way": the Go reader trimmed with `strings.TrimSpace`, which
+also trims Unicode spaces (U+00A0, U+0085) that the shell keeps, so a past expiry followed by a
+no-break space read as expired in Go and as unreadable (hold) in the shell; it now trims the C
+locale `[:space:]` set (`" \t\n\v\f\r"`) — three subtests. And `os.Open` on a FIFO at the hold path
+blocks until a writer shows up, which would hang the controller tick; the reader now `Stat`s first
+and answers "not a regular file → cannot tell → hold" without opening it
+(`TestReadManagedDoltHoldFIFOBlocksWithoutHanging`, which fails after 5 s if the reader hangs).
+Mutation check on the MBP, each applied to the finished reader and run against the tests that name
+it: deciding with `time.Unix` again fails MaxInt64, near-MaxInt64 and the first second after the
+wrap; `strings.TrimSpace` again fails the three no-break-space subtests; removing the
+regular-file check fails the FIFO test; the unmutated reader passes all of them.
 
-City side: `scripts/dolt-hold.selftest.sh` (97 checks, also under macOS `/bin/bash` 3.2), plus HOLD sections added to
+City side: `scripts/dolt-hold.selftest.sh` (102 checks, also under macOS `/bin/bash` 3.2), plus HOLD sections added to
 `dolt-hang-watchdog.selftest.sh` and `dolt-disk-floor-guard.selftest.sh`; the HOLD assertions
-fail against the pre-change guard scripts.
+fail against the pre-change guard scripts. After the third review the watchdog's hold block also
+stopped hiding a failed `rm` of its old state (strikes, CPU-veto counter, PID baseline): it now logs
+`WARN: HOLD — não consegui apagar o estado velho ...` and still exits inert, with two selftest
+cases (the control with a working `rm` has no warning; with a read-only state directory the old
+state stays, the warning is in the log, and there are 0 restarts and 0 probes).
 
 ## Applying in the window
 
@@ -212,8 +240,16 @@ restore the previous binary (`gc` symlink). The city-side scripts are inert with
   hold there is a follow-up once this is live.
 * **Shell reader vs Go reader:** they agree on every tested case, including a dangling symlink at
   the hold path, as its parent or anywhere above it, an unsearchable directory anywhere above the
-  hold, and a regular file in place of any ancestor (all hold), and a symlink above the parent
-  that resolves with nothing under it (both read "no hold"). Residual, from reading the code and
+  hold, and a regular file in place of any ancestor (all hold), a symlink above the parent
+  that resolves with nothing under it (both read "no hold"), every `expires_at` up to
+  `9223372036854775807` (both compare int64 seconds; both hold), and a FIFO or other non-regular
+  file at the hold path (both hold; Go does not open it). One known difference, with Go as the
+  STRICTER reader (the shell can only release when the number it reads has really passed), from
+  reading the code and not exercised: Go trims
+  only the C-locale space set around `key`/`value`, while the shell's `[:space:]` follows the
+  locale it runs in (launchd runs C), so a value with a no-break space next to the digits is
+  unreadable (hold) in Go and, in a UTF-8 shell that counts that space as blank, a plain number
+  in the shell. Residual, from reading the code and
   NOT exercised: `[ -e ]` cannot say WHY a stat failed. The shell tells ENOENT from EACCES/ENOTDIR
   by looking at the nearest component it can see; a failure of another kind in the middle of the
   path (EIO, a stale network mount) is invisible to it and reads as "gone", while Go (`os.Open`)

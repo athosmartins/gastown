@@ -63,6 +63,14 @@ case_blocks "expires_at com + é ilegível"           "expires_at=+$((now + 3600
 case_blocks "expires_at negativo é ilegível"        $'expires_at=-5\n'                                 1
 case_blocks "expires_at zero é ilegível"            $'expires_at=0\n'                                  1
 case_blocks "expires_at estourado é ilegível"       $'expires_at=99999999999999999999999\n'            1
+# "para sempre" escrito à mão (MaxInt64): compara em segundos inteiros e segura. O leitor do Go tinha de
+# dar a mesma resposta e não dava (time.Unix soma 62135596800 e dá a volta: ano -292277022657 = vencido).
+# Os limites 9223371974719179007/8 são onde essa volta começava.
+case_blocks "expires_at = MaxInt64 segura (sem prazo)"          $'expires_at=9223372036854775807\n'  1
+case_blocks "expires_at perto de MaxInt64 segura"               $'expires_at=9223372036854775000\n'  1
+case_blocks "expires_at 1 s antes da volta do time.Time segura" $'expires_at=9223371974719179007\n'  1
+case_blocks "expires_at 1 s depois da volta do time.Time segura" $'expires_at=9223371974719179008\n' 1
+case_blocks "expires_at enorme (9e18) segura"                   $'expires_at=9000000000000000000\n'  1
 
 # diretório no lugar do arquivo; arquivo no lugar da pasta-mãe; sem caminho nenhum
 rm -rf "$T/state"; mkdir -p "$H"

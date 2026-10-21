@@ -589,15 +589,21 @@ restart_escalate() {
 # Zera o que seria estado velho no dia em que o hold soltar: os strikes e o contador do veto de
 # CPU (senão o primeiro tick depois da soltura herdaria 2 strikes de antes do hold e reiniciaria
 # um Dolt que ainda está subindo) e a linha de base do PID (senão o PID novo, depois da troca,
-# dispararia um "retrato de morte" para uma parada que foi planejada). Em DRY-RUN só diz o que
-# faria, como todo outro ponto de escrita deste arquivo.
+# dispararia um "retrato de morte" para uma parada que foi planejada). Se o rm falhar (permissão,
+# volume somente leitura) o estado velho FICA, e o log diz isso: o rm devolve não-zero quando não
+# consegue apagar, e devolve 0 quando o arquivo já não existe. O aviso não muda o desfecho do tick
+# (sob hold o watchdog continua inerte); só impede que "zerado" seja lido como verdade quando não foi.
+# Em DRY-RUN só diz o que faria, como todo outro ponto de escrita deste arquivo.
 # hold: segura/ilegível → este bloco; solto (arquivo ausente ou vencido) → segue o fluxo normal
 if dolt_hold_city_blocks "$CITY"; then
   if is_dry_run; then
     log "DRY-RUN: HOLD em vigor (${DOLT_HOLD_MESSAGE}) — não sondaria, não contaria strike, não reiniciaria. Strikes, veto de CPU e linha de base do PID ficam como estão."
   else
     log "HOLD em vigor (${DOLT_HOLD_MESSAGE}) — Dolt parado de propósito: sem sonda, sem strike, sem restart."
-    rm -f "$STRIKES" "$CPU_VETO_FILE" "$LASTPID_FILE" 2>/dev/null || true
+    # apagou ou já não existia → 0; não conseguiu apagar → não-zero (aviso, sem mudar o desfecho do tick)
+    if ! rm -f "$STRIKES" "$CPU_VETO_FILE" "$LASTPID_FILE" 2>/dev/null; then
+      log "WARN: HOLD — não consegui apagar o estado velho (strikes ${STRIKES}, veto de CPU ${CPU_VETO_FILE}, linha de base do PID ${LASTPID_FILE}); o que sobrou continua lá e o primeiro tick depois da soltura pode herdá-lo."
+    fi
   fi
   exit 0
 fi

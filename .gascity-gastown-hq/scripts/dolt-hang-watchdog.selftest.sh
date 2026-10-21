@@ -1091,6 +1091,27 @@ PYF
   [ ! -e "$_sd/state/s" ] && [ ! -e "$_sd/state/v" ] && [ ! -e "$_sd/lastpid" ] \
     && ok "HOLD: strikes, veto de CPU e linha de base do PID zerados (nada de estado velho no dia da soltura)" \
     || bad "HOLD: estado velho sobreviveu ao hold (strikes=$([ -e "$_sd/state/s" ] && echo sim || echo nao) veto=$([ -e "$_sd/state/v" ] && echo sim || echo nao) lastpid=$([ -e "$_sd/lastpid" ] && echo sim || echo nao))"
+  # controle do caso abaixo: quando o rm funciona (o cenario acima) o log NAO tem aviso
+  ! grep -q 'WARN: HOLD' "$_sd/l" \
+    && ok "HOLD: o rm que funcionou nao deixa aviso no log (controle)" \
+    || bad "HOLD: aviso de 'nao consegui apagar' apareceu com o rm funcionando: $(grep 'WARN: HOLD' "$_sd/l" | tail -1)"
+
+  # o rm que zera o estado pode FALHAR (pasta de estado sem permissao de escrita): o estado velho fica e o log
+  # tem de DIZER, para "zerado" nao ser lido como verdade quando nao foi. O tick segue inerte (0 restarts, 0 sondas).
+  if [ "$(id -u)" != "0" ]; then
+    _reset up; printf 'owner=mayor\n' > "$_sd/hold"; _seed_state
+    chmod 555 "$_sd/state"
+    _sim
+    chmod u+rwx "$_sd/state"
+    [ -e "$_sd/state/s" ] && [ -e "$_sd/state/v" ] && grep -q 'WARN: HOLD — não consegui apagar o estado velho' "$_sd/l" \
+      && ok "HOLD: o rm que zera o estado falhou -> o estado velho ficou e o log AVISA (nao finge que zerou)" \
+      || bad "HOLD: rm falhou sem aviso ou estado sumiu (s=$([ -e "$_sd/state/s" ] && echo fica || echo sumiu) log=$(tail -2 "$_sd/l" 2>/dev/null | tr '\n' '|'))"
+    [ "$(_restarts)" = "0" ] && [ ! -e "$_sd/health_calls" ] && [ "$(_pages)" = "0" ] \
+      && ok "HOLD: com o rm falhando o tick continua inerte (0 restarts, 0 sondas, 0 pages)" \
+      || bad "HOLD: o aviso mudou o desfecho do tick (restarts=$(_restarts) pages=$(_pages))"
+  else
+    ok "HOLD: (root: chmod 555 nao impede o rm; caso do rm que falha nao exercitado)"
+  fi
 
   # o mesmo cenario com DRY-RUN: diz o que faria e nao escreve nada (mesma promessa de todo ponto de escrita do arquivo)
   _reset up; printf 'owner=mayor\n' > "$_sd/hold"; _seed_state
