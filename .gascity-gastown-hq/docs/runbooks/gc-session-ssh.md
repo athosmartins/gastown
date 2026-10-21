@@ -2,7 +2,7 @@
 
 ## Contents
 
-• O que esta fatia é — e o que não é · Como ligar (config, city.toml, janela do engine) · Operações (preparo do worktree · **worktree da sessão: o provider cria e recolhe, e a identidade do atalho (ga-2hd02v.1.7)** · o comando do `start`)
+• O que esta fatia é — e o que não é · Como ligar (config, city.toml, janela do engine) · Operações (preparo do worktree · **worktree da sessão: o provider cria e recolhe, e a identidade do atalho (ga-2hd02v.1.7)** · o comando do `start` · **a sessão `claude` segue a conta do pool do mini (ga-2hd02v.7.1)**)
 • Teto do host · **O MBP como host (ga-w7qwl1)** · Quando o ssh não responde · Medido, inferido, não testado · Pontos em aberto · Limites
 
 Bead ga-2hd02v.1.1 (fatia 2 do ga-2hd02v, desenho do estudo ga-ukxa3k, aprovada por Athos em 14/10 18:42). **Entrega duas peças:** (1) `scripts/gc-session-ssh`, o provider no protocolo `exec:` do engine, que abre as sessões de pool num host remoto por ssh com a mesma interface das locais; (2) um patch do engine, `docs/pending-engine-window/ga-2hd02v-hybrid-remote-exec.patch`, que deixa o provider híbrido usar esse script como lado remoto. **O patch NÃO está aplicado**: nada foi compilado, trocado nem reiniciado em produção. Sem o patch o script já funciona sozinho (`GC_SESSION=exec:<cidade>/scripts/gc-session-ssh` serve um teste isolado), mas só o patch deixa a cidade rodar sessões locais e remotas juntas.
@@ -33,6 +33,7 @@ Bead ga-2hd02v.1.1 (fatia 2 do ga-2hd02v, desenho do estudo ga-ukxa3k, aprovada 
 | `ssh_opts` | não | opções extras do ssh (`["-p","2222"]`) |
 | `worktree_prepare` | não (`true`; `false` num host com `presence_gate`) | liga o **preparo do worktree no `start`** (identidade git + confiança da pasta, ver “Preparo do worktree”); texto no lugar de `true`/`false` é erro de configuração |
 | `real_sessions_released_by` | não (ausente = só `remote-e2e-<x>`/`remote-test-<x>` abrem) | decisão EXPLÍCITA do Mayor de liberar sessão real; mesmo com ela, o `start` confere no host o guarda de clone e sai 12 se faltar (ver `hetzner-hardening.md`) |
+| `claude_account` | não (ausente = o host não segue o pool) | a sessão `claude` do host nasce na **conta atual do pool do mini** (ga-2hd02v.7.1, ver “A sessão `claude` do host nasce na conta atual do pool do mini”): `{"current_file": "/Users/athos/shared/data/claude_pool_current_account.json", "secret": "/Users/athos/.local/bin/secret"}`; `current_file` é obrigatório (caminho absoluto), `secret` é opcional (padrão `<mini_home>/.local/bin/secret`); forma errada = erro de configuração que nomeia a chave |
 
 O host vem de `$GC_SSH_HOST` ou de `default_host`. Estado no mini: `$GC_EXEC_STATE_DIR` ou `<cidade>/.gc/runtime/session-ssh/<host>/` (`session-ssh.log`, `lock`, `meta/`).
 
@@ -125,6 +126,36 @@ O **prompt de partida** também vai (campos `prompt_suffix` e `prompt_flag` do J
 **Ambiente.** Só `GC_*`, `TERM`, `LANG`, `LC_*`, `TZ`. O que tem cara de segredo (`TOKEN`, `SECRET`, `PASSWORD`, `KEY`…) **não vai**, a menos que o nome esteja em `env_allow`; o `start` registra no log os nomes descartados (nunca os valores). Em particular, `GC_INSTANCE_TOKEN` não é enviado por padrão: é decisão da fatia .1.2 (shims) se o servidor precisa dele.
 
 **O que o `start` NÃO faz** (cada item é de outra fatia ou é recusa de propósito; o que for pedido e ignorado aparece em `ignored` no dry-run e no log): `pre_start`, `session_setup*`, `session_live`, `pack_overlay_dirs`/`overlay_dir`, `copy_files` e `nudge` do JSON do start (o provider exec do engine também não entrega este último: quem entrega é o `Nudge` depois do `start`).
+
+### A sessão `claude` do host nasce na conta atual do pool do mini (ga-2hd02v.7.1)
+
+**Decisão do Athos (AskUserQuestion do Mayor, 20/10, citada na ga-2hd02v.7.1):** “o hetzner sempre acompanhar a conta do Mini” e “o hetzner tem que conseguir trocar sozinho entre as 5 contas”. Antes disso o `claude` do servidor usava um login fixo (uma conta só, ver `hetzner-claude-login.md`); quando essa conta estourou o limite semanal o nó parou.
+
+**O que o `start` faz** num host com o bloco `claude_account`, para a sessão cujo comando é o `claude` (um `bash`, um `cat` ou um teste não ganham nada e não tocam no cofre):
+
+1. lê `current` em `current_file`, o `claude_pool_current_account.json` do pool do mini (tem que ser um e-mail);
+2. lê **no mini** a chave de longa duração dessa conta (`claude setup-token`, a mesma que o pool do WhatsApp usa), pelo `secret claude-oauth-token-<e-mail>`, com prazo de 15 s;
+3. entrega a chave ao `claude` do host em `CLAUDE_CODE_OAUTH_TOKEN`, **como prefixo de atribuição do comando final** do lançador (`CLAUDE_CODE_OAUTH_TOKEN='…' sh -c '<comando>'`), não como `export`: só o `claude` e seus filhos a herdam (nem o vigia de presença nem o resto do lançador). O lançador vai em base64 pela **entrada padrão** do ssh, é gravado na pasta `run/` do host (modo 700) e se apaga na 2ª linha, ao começar a rodar (e nos dois caminhos de falha do `start`); é o único arquivo em que a chave existe no host. Ela não vai no argv do ssh, do lançador nem do `sh -c`, nem no log, no evento, no dry-run ou no scrollback do tmux.
+
+**Três estados; só o primeiro abre sessão, e nenhum cai no login fixo do nó** (decisão do Athos: o login OAuth do `runner` fica só como reserva manual):
+
+| situação | o que o `start` faz |
+|---|---|
+| chave lida (`secret` sai 0 e imprime `sk-ant-…` sem espaço) | abre a sessão na conta `current` |
+| a conta não tem item no cofre (`secret` sai 4 com “Not found”) | recusa dizendo “sem chave cadastrada” (o cadastro é o `claude_conta_cadastrar_chave.py` do whatsapp_automation) |
+| cofre fechado, `secret` que falha ou passa de 15 s, saída sem forma de chave, arquivo do pool ilegível ou `current` fora do formato de e-mail | recusa dizendo que não sabe a conta ou que a chave está ilegível |
+
+A recusa vem **antes** de registrar a sessão, de travar e de abrir o ssh (nada sobra no host); a da chave grava o evento `refused`. O que o `secret` escreveu nunca entra na mensagem, só o código de saída. Host sem o bloco `claude_account` abre como antes. O `--dry-run` **não abre o cofre**: mostra `claude_account` com a conta atual e `"key": "não lida no dry-run"`, e um arquivo do pool ilegível entra em `would_refuse`.
+
+**O gate mede a mesma conta.** O `hetzner-claude.py gate` mede o servidor com a MESMA chave e guarda o veredito por conta (ver `hetzner-claude-login.md`, “Seguir a conta do pool do mini (ga-2hd02v.7.1)”): quando o pool troca, a sessão nova já nasce na conta nova e o gate já mede a conta nova, sem herdar o “sem cota” da velha.
+
+**Instalar (Mayor, depois do merge).** No `<cidade>/.gc/session-ssh.json` do **mini**, dentro do host do Hetzner, acrescentar `"claude_account": {"current_file": "/Users/athos/shared/data/claude_pool_current_account.json"}` (`secret` só se o executável não for `/Users/athos/.local/bin/secret`). O gate lê o mesmo arquivo, então uma edição liga os dois, **desde que os dois enxerguem a mesma config**: use o caminho padrão (`<cidade>/.gc/session-ssh.json`); se o engine exporta `GC_SSH_CONFIG` para o provider, quem chama o gate precisa do mesmo valor, senão o gate não vê o bloco e mede o login fixo do nó. Conferir: `gc-session-ssh --dry-run start <sessão> < start.json` mostra `claude_account.current` com o e-mail da conta atual e `key` “não lida no dry-run”; `hetzner-claude.py status --fresh --probe` mostra `account` com o mesmo e-mail e `state: ok` (o `--probe` faz a chamada de modelo, que gasta um pouco da cota dessa conta).
+
+**Sessão viva não troca de conta sozinha.** A que já está aberta fica na conta com que nasceu; se parou no modal de limite vale a regra do pool do mini (1 Escape) ou fechar a sessão e deixar o pool abrir outra, que já nasce na conta nova.
+
+**Limite que continua.** Quem roda `env` (ou lê o `environ` do processo, no mesmo usuário) dentro da sessão vê a chave, igual no mini: ela é uma variável de ambiente do `claude`. A chave não rotaciona, então mini e nó usam a mesma ao mesmo tempo.
+
+**Medido × não medido.** Medido com `secret`, arquivo do pool e `claude` falsos (nada do cofre real): os três estados, o prefixo (não `export`), o vazamento (argv do ssh, saída, estado e log do mini, `ps`, scrollback e ambiente do tmux, com controle positivo) e 13 mutantes mortos; ver o grupo `acct` do `gc-session-ssh.selftest.sh`. **Não medido e não medível do servidor:** o `secret` real, o arquivo real do pool e a conta real (só no mini).
 
 ## Teto do host
 

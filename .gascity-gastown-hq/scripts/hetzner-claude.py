@@ -3,7 +3,7 @@
 quando não vale. ga-2hd02v.1.4 (fatia 5), desenho do ga-ukxa3k. Python 3.9+, só biblioteca padrão.
 
 Contents
-  Subcomandos · Estado e guarda · O que NÃO faz · Configuração · Códigos de saída
+  Subcomandos · Estado e guarda · Seguir o pool do mini · O que NÃO faz · Configuração · Códigos de saída
 
 SUBCOMANDOS
   gate                      0 só se o login do servidor está POSITIVAMENTE bom; qualquer outra coisa (deslogado, expirado, sem cota,
@@ -20,7 +20,8 @@ SUBCOMANDOS
                             que foi varrido, arquivo que não é comum (FIFO...), ilegível e raiz sem nenhum arquivo lido saem 3, nunca "limpo".
 
 ESTADO E GUARDA
-  <estado>/hetzner-claude.state.json: {state, reason, checked_at, probe, login, known}; probe = a última chamada de modelo {state, reason, at};
+  <estado>/hetzner-claude.state.json: {state, reason, checked_at, probe, login, known, account}; probe = a última chamada de modelo {state, reason, at, account};
+  account = a conta do pool do mini que a medida mediu (null no host que não segue o pool, ver SEGUIR O POOL DO MINI);
   known = o último estado MEDIDO (ok/logged-out/expired/quota), que "não consegui saber" não apaga. state ∈ ok | logged-out | expired | quota |
   unreachable | unknown. TRÊS respostas, não duas: "não consegui saber" (ssh fora, JSON ilegível, tipo errado) é `unreachable` ou
   `unknown`, e o gate trata como bloqueado. `ok` exige `claude auth status` com loggedIn == true E uma chamada de modelo real
@@ -31,14 +32,23 @@ ESTADO E GUARDA
   novo estar gravado: gravação que falha bloqueia o gate e não avisa. Quem esperou a trava herda a medida de quem a tinha, em vez de repetir o ssh.
   Bandeira manual: <estado>/hetzner-claude.off (existir = bloqueado), para o Mayor segurar o servidor na hora.
 
+SEGUIR O POOL DO MINI (ga-2hd02v.7.1, decisão do Athos 20/10: "o hetzner sempre acompanhar a conta do Mini")
+  Num host cujo bloco da config do provider (gc-session-ssh: $GC_SSH_CONFIG ou <cidade>/.gc/session-ssh.json, o host com `ssh` == HETZNER_SSH_HOST) tem `claude_account`,
+  as sessões do nó nascem na conta 'current' do pool do mini e o gate mede ESSA conta: `claude auth status` e a chamada de modelo levam a chave dela (lida no mini pelo
+  `secret`, só por quem vai medir) em CLAUDE_CODE_OAUTH_TOKEN pela ENTRADA PADRÃO do ssh, nunca no argv; auth status tem que dizer authMethod oauth_token, senão `unknown`.
+  O cache e a janela da chamada de modelo só valem para a conta gravada em `account`: pool que trocou = medida nova na hora. Conta sem item no cofre = logged-out; pool
+  ilegível, cofre fechado, config ou provider que não leem = unknown; nenhum cai no login fixo do nó nem chama o claude do nó sem chave. Sem o bloco, nada disto roda.
+
 O QUE NÃO FAZ
-  Não faz o login (OAuth interativo, passo do Athos), não lê nem copia credencial, não troca conta, não toca em wa-base, venv-wa,
+  Não faz o login (OAuth interativo, passo do Athos), não lê nem copia a credencial do mini (Keychain, ~/.claude) nem guarda chave em arquivo (só no host que segue o pool a chave da
+  conta atual é lida pelo `secret` e usada na medida), não troca conta (quem troca é o pool do mini; o gate só a acompanha), não toca em wa-base, venv-wa,
   slots, traco-bim, mirror nem ~/shared do servidor, e não roda `go build`, `rm -rf` nem nada com sudo.
 
 CONFIGURAÇÃO (ambiente)  HETZNER_SSH_HOST (hetzner-teste) · HETZNER_REMOTE_HOME (/home/runner) · HETZNER_REMOTE_ROOT (<home>/gt-remote/bundle)
   HETZNER_STATE_DIR (<cidade>/.gc) · HETZNER_STATE_TTL (120) · HETZNER_PROBE_OK_TTL (3600) · HETZNER_PROBE_RETRY (900)
   HETZNER_SSH_TIMEOUT (30) · HETZNER_PROBE_TIMEOUT (120) · HETZNER_LOCK_WAIT (20) · HETZNER_INSTALLER_URL (https://claude.ai/install.sh)
-  HETZNER_BUILDER (remote-bundle-build.py ao lado deste script; só o selftest troca)
+  HETZNER_BUILDER (remote-bundle-build.py ao lado deste script; só o selftest troca) · GC_SSH_CONFIG (a config do provider, <cidade>/.gc/session-ssh.json)
+  HETZNER_SESSION_SSH (o provider gc-session-ssh, que este script carrega para ler a conta e a chave; só o selftest troca)
 
 CÓDIGOS  0 ok · 1 bloqueado / falhou / MUDOU (fingerprint) · 2 uso ou configuração inválida · 3 recusa de segurança, ou "não consegui ler/saber" (nunca vira "limpo" nem "igual")
 """
@@ -279,8 +289,9 @@ class Follow:
 
 def follow() -> Follow:
     """Lê a config do provider (a mesma do gc-session-ssh) e a conta atual do pool. NÃO abre o cofre: a chave só é lida por quem vai medir (follow_key).
-    vazio (sem config, ou nenhum host dela com este ssh e `claude_account`) → não segue, como sempre foi; falhou (config que existe e não lê ou não valida, provider que não
-    carrega, arquivo do pool ilegível) → segue SEM conta: bloqueia, nunca vira 'não segue' (o nó seguiria no login fixo dele enquanto as sessões ou o pool dizem outra coisa)."""
+    vazio (sem arquivo de config, ou nenhum host dela com este ssh e `claude_account`: inclusive um JSON que não tem a forma {"hosts": {...}}) → não segue, como sempre foi; falhou
+    (config que existe e não lê, bloco `claude_account` do host que o provider não valida, provider que não carrega, arquivo do pool ilegível) → segue SEM conta: bloqueia, nunca vira
+    'não segue' (o nó seguiria no login fixo dele enquanto as sessões ou o pool dizem outra coisa). O gate e o provider têm que ler a MESMA config (mesmo $GC_SSH_CONFIG)."""
     path = os.environ.get("GC_SSH_CONFIG") or os.path.join(CITY, ".gc", "session-ssh.json")
     try:
         with open(path) as f:

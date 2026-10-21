@@ -5,7 +5,7 @@
 • Estado em uma linha · O que esta fatia é — e o que não é
 • O que está no servidor agora (medido) · Comandos (`hetzner-claude.py`)
 • O login — passo humano do Athos, guiado pelo Mayor · Depois do login: verificação, em ordem
-• Como o provider e o Pilot usam o `gate` · Medido, inferido, não testado · Limites
+• Como o provider e o Pilot usam o `gate` · Seguir a conta do pool do mini (ga-2hd02v.7.1) · Medido, inferido, não testado · Limites
 
 Beads ga-2hd02v.1.4.1 (fatia 5a: o login) e ga-2hd02v.1.4.2 (fatia 5b: a instalação), partes da fatia 5 do ga-2hd02v (desenho do ga-ukxa3k). A história-mãe ga-2hd02v.1.4 foi dividida porque o gate recusou a entrega inteira por tamanho (E11).
 
@@ -17,7 +17,7 @@ Beads ga-2hd02v.1.4.1 (fatia 5a: o login) e ga-2hd02v.1.4.2 (fatia 5b: a instala
 
 É: instalar o Claude Code (build nativo) no usuário `runner` do servidor, levar o bundle de settings/hooks da fatia 1 e os plugins do papel de pool, e dar ao mini um comando que diz se o login do servidor vale (`gate`/`status`).
 
-Não é: o login (OAuth interativo, passo do Athos), troca ou failover de conta (fora de escopo: uma conta só, decisão do Athos de 14/10 18:42, citada no comentário do Mayor em ga-2hd02v.1.4 de 2026-10-14T21:43Z), nem a fiação do `gate` no provider/Pilot (ver "Como o provider e o Pilot usam o gate"). Não copia credencial do mini, não guarda segredo em arquivo versionado, não leva credencial do GitHub nem dado de lead/cliente, e não toca em `wa-base`, `venv-wa`, `slots`, `traco-bim`, `mirror` nem `~/shared` do servidor.
+Não é: o login (OAuth interativo, passo do Athos), troca ou failover de conta (fora de escopo NESTA fatia: uma conta só, decisão do Athos de 14/10 18:42, citada no comentário do Mayor em ga-2hd02v.1.4 de 2026-10-14T21:43Z; **superada em 20/10**: o nó passou a acompanhar a conta do pool do mini, ver “Seguir a conta do pool do mini (ga-2hd02v.7.1)”), nem a fiação do `gate` no provider/Pilot (ver "Como o provider e o Pilot usam o gate"). Não copia credencial do mini, não guarda segredo em arquivo versionado, não leva credencial do GitHub nem dado de lead/cliente, e não toca em `wa-base`, `venv-wa`, `slots`, `traco-bim`, `mirror` nem `~/shared` do servidor.
 
 ## O que está no servidor agora (medido)
 
@@ -112,6 +112,19 @@ O ponto de chamada é o `start` do provider `gc-session-ssh` (fatia .1.1), antes
 
 Não há poller periódico, de propósito: o estado se renova quando alguém pergunta (o `gate` antes de cada `start`, ou `status`). Um login que expira sem que ninguém abra sessão lá não avisa até a próxima pergunta; se isso incomodar, a saída é um plist de `status` a cada 15 min (o selftest e a trava já suportam), e não um detector novo.
 
+## Seguir a conta do pool do mini (ga-2hd02v.7.1)
+
+**Decisão do Athos (AskUserQuestion do Mayor, 20/10, citada na ga-2hd02v.7.1):** “o hetzner sempre acompanhar a conta do Mini”. O nó deixa de ter “a sua conta”: as sessões nascem na conta `current` do pool do mini (`CLAUDE_CODE_OAUTH_TOKEN`, ver `gc-session-ssh.md`, “A sessão `claude` do host nasce na conta atual do pool do mini”), e o `gate` passa a medir ESSA conta, não o login fixo do `runner`. Liga com o mesmo bloco `claude_account` do host na config do provider: o `gate` lê o mesmo arquivo (`$GC_SSH_CONFIG` ou `<cidade>/.gc/session-ssh.json`) e só segue se o host cujo `ssh` é o `HETZNER_SSH_HOST` tem o bloco. Sem ele nada muda.
+
+O que muda no `gate` e no `status` de um host que segue:
+
+* a conta atual vem do arquivo do pool; a chave vem do `secret`, no mini, **só quando vai medir** (cache válido não abre o cofre);
+* `claude auth status` e a chamada de modelo levam a chave pela entrada padrão do ssh (`IFS= read -r CLAUDE_CODE_OAUTH_TOKEN`, nunca no argv); o `claude auth status` tem que dizer `authMethod: oauth_token`, senão o estado é `unknown` (a medida não seria da conta que as sessões usam);
+* o estado grava `account`, e o cache (120 s) e a janela da chamada de modelo (1 h) só valem para a MESMA conta: quando o pool troca, o `gate` mede a conta nova na hora, sem esperar o TTL nem o retry de 15 min, e não herda o `quota` da velha. O motivo de um bloqueio diz de qual conta ele é (`conta fulano@…: sem cota…`);
+* três estados, e nenhum cai no login fixo do nó nem chama o `claude` do nó sem chave: conta sem item no cofre = `logged-out`; arquivo do pool ilegível, cofre fechado ou `secret` que falha, config do provider que existe e não lê, provider que não carrega, `claude` do nó que ignora a env = `unknown`. O que o `secret` ou o servidor escreveu não entra no motivo, e qualquer `sk-ant-…` que sobre nele vira `sk-ant-***`.
+
+**Medido em 21/10 neste servidor (`claude` 2.1.302, chave FALSA, nada do cofre real):** sem env o `claude auth status --json` diz `authMethod: claude.ai` (o login guardado); com `CLAUDE_CODE_OAUTH_TOKEN` na env diz `loggedIn: true` e `authMethod: oauth_token`: a env vence o login guardado, **e o comando não valida a chave** (uma chave falsa também dá `loggedIn: true`). Por isso `ok` continua exigindo a chamada de modelo. **Não medido:** o `secret` real, o arquivo real do pool, a conta real e o texto real de cota ou expiração dessa conta (o classificador segue provado com texto sintético). Prova com fakes, ponta a ponta: o grupo “conta do pool do mini” do `hetzner-claude.selftest.sh`, que também varre o vazamento (argv do ssh, estado, saída) com controle positivo.
+
 ## Medido, inferido, não testado
 
 **MEDIDO**
@@ -147,7 +160,7 @@ Não há poller periódico, de propósito: o estado se renova quando alguém per
 * **Tempo do `gate`:** com o cache válido (120 s) é só leitura de arquivo. Com o cache vencido custa 1 ssh (`claude auth status`); a cada hora custa também a chamada de modelo (limite 90 s no servidor, 120 s no mini). Pior caso, calculado dos limites e não medido: ~170 s se o servidor estiver lento (espera da trava 20 s + `claude auth status` 30 s + chamada de modelo 120 s); quem esperou a trava e a encontra com o estado já renovado por quem a tinha não repete o ssh. O `start` do provider tem timeout próprio (60 s por padrão): quem chama o `gate` decide se espera ou trata timeout como bloqueado (o certo é bloqueado).
 * **O `canary` mantém `--dangerously-skip-permissions`** porque o que ele prova é que o bundle carrega e a sessão responde com os argumentos que o provider vai usar; a revisão automática de segurança (14/10) apontou o flag, e a resposta foi tirar o que ele poderia soltar: `--tools ""` desliga toda ferramenta, então o modelo do canary não tem como rodar comando, editar arquivo nem abrir rede além da chamada ao modelo. **Os hooks do bundle, esses sim, rodam no canary** (o `SessionStart` rodou, ver "Depois do login"): o `canary` prova o bundle carregando, não um ambiente sem execução. `--tools ""` com esses flags foi medido no mini (`claude -p`, haiku): `is_error false`, resposta `OK`. A sonda de `status`/`gate` nem usa `--dangerously-skip-permissions`.
 * **Re-login não é visto sozinho:** depois de `expired`/`quota` o `claude auth status` segue `loggedIn: true`, então o `gate` só mede de novo a chamada de modelo na janela de retry (15 min) mais o cache (120 s). Para soltar na hora depois de um novo login: `status --fresh --probe`.
-* Uma conta só. Cota esgotada ou login expirado seguram `start` novo até normalizar; não há failover para outra conta (o mecanismo do mini usa o Keychain do macOS e não existe no Linux).
+* Sem o bloco `claude_account` na config do provider (o padrão), uma conta só: o login fixo do nó, e cota esgotada ou login expirado seguram `start` novo até normalizar. Com o bloco, o nó acompanha a conta do pool do mini (ver “Seguir a conta do pool do mini (ga-2hd02v.7.1)”); o failover entre as contas continua sendo do pool do mini (o mecanismo dele usa o Keychain do macOS e não existe no Linux), o nó só o segue.
 * O hash do instalador é conferido contra o que o chamador passou, não contra uma fonte independente: quem passa o hash é quem leu o script.
 * `leak-scan` reconhece formatos conhecidos (`sk-ant-…`, `accessToken`/`refreshToken` em JSON, `claudeAiOauth`); formato que ele não conhece passa. **O que ele não leu nunca parece limpo** (sai 3 e lista cada item com `NÃO CONSEGUI LER`): arquivo ilegível ou maior que 20 MB, FIFO/socket/dispositivo na árvore (não abre: pendurava), symlink cujo alvo está **fora** das raízes varridas (de arquivo ou de pasta; contado em "N symlinks não seguidos"), e raiz que não rendeu nenhum arquivo (pasta vazia, caminho que não existe). Symlink cujo alvo está dentro de uma raiz varrida passa, porque o alvo foi lido de verdade; arquivo dado na linha de comando é lido mesmo sendo symlink.
 * `fingerprint`: o hash do `oauthAccount` decide; o `mdat` do Keychain só informa, porque o mini renova o próprio token o dia todo (medido 14/10: 16:29Z → 22:32Z em 12 min, sem ninguém mexer). **O hash também anda sozinho** quando o `claude` busca o perfil de novo (`profileFetchedAt` está dentro do objeto) ou o mini troca de conta; por isso um "antes" velho dá `MUDOU` mesmo sem ninguém mexer na credencial (medido 15/10, ver "Depois do login"). Quem usar o `--compare` como prova deve tirar o `--save` logo antes do passo e conferir os logs de conta no intervalo; este script não filtra o campo volátil.
