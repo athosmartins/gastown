@@ -47,6 +47,8 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -60,6 +62,10 @@ import urllib.request
 HERE = os.path.dirname(os.path.realpath(__file__))
 BUILDER = os.environ.get("HETZNER_BUILDER") or os.path.join(HERE, "remote-bundle-build.py")
 CITY = os.environ.get("GC_CITY_PATH") or os.path.dirname(HERE)
+
+POOL_ENV = "CLAUDE_CODE_OAUTH_TOKEN"  # a env pela qual a sessão do nó recebe a chave da conta do pool do mini (gc-session-ssh, ga-2hd02v.7.1)
+PROVIDER = os.environ.get("HETZNER_SESSION_SSH") or os.path.join(HERE, "gc-session-ssh")  # o provider de sessões: a MESMA leitura da conta e da chave que a sessão faz
+KEY_SCRUB = re.compile(r"sk-ant-[A-Za-z0-9_-]+")
 
 HOST_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.@:-]*")
 PATH_RE = re.compile(r"/[A-Za-z0-9_./+-]+")  # caminho remoto: absoluto, sem espaço nem aspas (entra em comando de shell)
@@ -157,14 +163,24 @@ def ssh(cmd: str, timeout: int = SSH_TIMEOUT, stdin: bytes | None = None) -> Res
 
 
 def _short(s: str, n: int = 160) -> str:
-    return " ".join(s.split())[:n]
+    return KEY_SCRUB.sub("sk-ant-***", " ".join(s.split()))[:n]  # o texto vira motivo gravado em estado e log: chave que o servidor repita nunca vai junto
 
 
 # ---------------------------------------------------------------- login: leitura e classificação
 
-def check_login():
-    """(estado, motivo, login). estado ∈ logged-in | logged-out | unreachable | unknown — nunca 'ok': isso só sai da chamada de modelo."""
-    r = ssh(REMOTE_PATH + "claude auth status --json")
+def keyed(cmd: str, key):
+    """(comando, stdin) de uma chamada ao claude do nó. Com chave (host que segue o pool do mini) ela vai pela ENTRADA PADRÃO do ssh e o servidor a lê com `read`:
+    nunca em argv (ps do servidor e do mini), nunca em arquivo. Sem chave, o comando segue como sempre foi."""
+    if key is None:
+        return cmd, None
+    return f"IFS= read -r {POOL_ENV}; export {POOL_ENV}; {cmd}", (key + "\n").encode()
+
+
+def check_login(key=None):
+    """(estado, motivo, login). estado ∈ logged-in | logged-out | unreachable | unknown — nunca 'ok': isso só sai da chamada de modelo.
+    Com `key` o claude do nó tem que dizer authMethod oauth_token (medido 21/10 com chave falsa: a env vence até o login guardado); senão a medida não é da conta do pool."""
+    cmd, stdin = keyed(REMOTE_PATH + "claude auth status --json", key)
+    r = ssh(cmd, stdin=stdin)
     if r.conn_failed:
         return "unreachable", "ssh não chegou ao servidor" + (" (timeout)" if r.timed_out else f" (rc={r.rc} {_short(r.err, 80)})"), None
     try:
@@ -178,6 +194,8 @@ def check_login():
         return "logged-out", "servidor sem login (claude auth status: loggedIn=false)", login
     if r.rc != 0:
         return "unknown", f"loggedIn=true mas claude auth status saiu {r.rc}", login
+    if key is not None and login.get("authMethod") != "oauth_token":
+        return "unknown", f"claude auth status não usou a chave do pool (authMethod={login.get('authMethod')!r}): a medida não seria da conta que as sessões usam", login
     return "logged-in", "", login
 
 
@@ -199,8 +217,9 @@ def classify_probe(rc, out: str):
     return "unknown", f"erro de modelo não reconhecido: {txt}"
 
 
-def probe(cmd: str = PROBE_CMD):
-    r = ssh(cmd, PROBE_TIMEOUT)
+def probe(cmd: str = PROBE_CMD, key=None):
+    cmd, stdin = keyed(cmd, key)
+    r = ssh(cmd, PROBE_TIMEOUT, stdin)
     if r.conn_failed:
         return "unreachable", "ssh não chegou ao servidor na chamada de modelo"
     return classify_probe(r.rc, r.out)
@@ -250,11 +269,66 @@ def valid_probe(pr) -> bool:
             and isinstance(pr.get("at"), (int, float)) and not isinstance(pr.get("at"), bool))
 
 
-def refresh(prev, force_probe: bool = False) -> dict:
+class Follow:
+    """O que o gate sabe sobre seguir o pool do mini (ga-2hd02v.7.1). on=False: este host não segue (a sonda mede o login do próprio nó, como sempre foi).
+    on=True: `email` é a conta atual do pool; ou None, com `err` = (estado, motivo), quando não dá para saber qual é — e então o gate bloqueia sem chamar o claude do nó."""
+
+    def __init__(self, on=False, mod=None, cfg=None, email=None, err=None):
+        self.on, self.mod, self.cfg, self.email, self.err = on, mod, cfg, email, err
+
+
+def follow() -> Follow:
+    """Lê a config do provider (a mesma do gc-session-ssh) e a conta atual do pool. NÃO abre o cofre: a chave só é lida por quem vai medir (follow_key).
+    vazio (sem config, ou nenhum host dela com este ssh e `claude_account`) → não segue, como sempre foi; falhou (config que existe e não lê ou não valida, provider que não
+    carrega, arquivo do pool ilegível) → segue SEM conta: bloqueia, nunca vira 'não segue' (o nó seguiria no login fixo dele enquanto as sessões ou o pool dizem outra coisa)."""
+    path = os.environ.get("GC_SSH_CONFIG") or os.path.join(CITY, ".gc", "session-ssh.json")
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return Follow()
+    except (OSError, ValueError) as e:
+        return Follow(True, err=("unknown", f"configuração do provider ilegível em {path} ({type(e).__name__}): não sei se este host segue o pool do mini"))
+    hosts = raw.get("hosts") if isinstance(raw, dict) else None
+    names = sorted(n for n, h in hosts.items() if isinstance(h, dict) and h.get("ssh") == HOST and h.get("claude_account") is not None) if isinstance(hosts, dict) else []
+    if not names:
+        return Follow()
+    try:
+        loader = importlib.machinery.SourceFileLoader("gc_session_ssh", PROVIDER)
+        mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("gc_session_ssh", loader))
+        loader.exec_module(mod)
+    except Exception as e:  # noqa: BLE001 — qualquer falha ao carregar o provider bloqueia, não derruba o gate
+        return Follow(True, err=("unknown", f"não consegui carregar o provider {PROVIDER} ({type(e).__name__}): não sei qual conta as sessões usam"))
+    os.environ["GC_SSH_CONFIG"] = path  # o Cfg do provider lê daqui: a MESMA validação do bloco claude_account que a sessão faz
+    try:
+        cfg = mod.Cfg(host=names[0])
+        return Follow(True, mod, cfg, email=mod.acct_email(cfg))
+    except mod.Fail as e:
+        return Follow(True, err=("unknown", str(e)))
+
+
+def follow_key(fw: Follow):
+    """(chave, None) ou (None, (estado, motivo)). Lida pelo `secret` no mini, só por quem mede. Conta sem item no cofre = logged-out; cofre ilegível = unknown; nenhum cai no login do nó."""
+    try:
+        return fw.mod.acct_key(fw.cfg, fw.email), None
+    except fw.mod.NoKey as e:
+        return None, ("logged-out", str(e))
+    except fw.mod.Fail as e:
+        return None, ("unknown", str(e))
+
+
+def refresh(prev, force_probe: bool = False, fw: Follow | None = None) -> dict:
     now = time.time()
-    verdict, why, login = check_login()
+    acct = fw.email if fw is not None and fw.on else None
+    key = None
+    if acct:  # host que segue o pool: a chave é lida AGORA; sem ela não há o que medir e o claude do nó nem é chamado
+        key, err = follow_key(fw)
+        if err:
+            return {"state": err[0], "reason": f"conta {acct}: {err[1]}", "checked_at": now, "probe": None, "login": None,
+                    "known": err[0] if err[0] in KNOWN else last_known(prev), "account": acct}
+    verdict, why, login = check_login(key)
     pr = prev.get("probe") if prev else None
-    pr = pr if valid_probe(pr) else None
+    pr = pr if valid_probe(pr) and pr.get("account") == acct else None  # a chamada de modelo guardada é de OUTRA conta (ou de antes do pool): não vale para esta
     if verdict != "logged-in":
         state, reason = verdict, why
         if verdict == "logged-out":  # a credencial sumiu: o veredito da chamada anterior era de OUTRA credencial, o próximo login mede de novo
@@ -262,13 +336,15 @@ def refresh(prev, force_probe: bool = False) -> dict:
     else:
         window = PROBE_OK_TTL if pr and pr["state"] == "ok" else PROBE_RETRY
         if force_probe or pr is None or not 0 <= now - pr["at"] < window:
-            ps, pw = probe()
+            ps, pw = probe(key=key)
             if ps != "unreachable":  # sem resposta não é veredito: o registro da última chamada que respondeu fica como está
-                pr = {"state": ps, "reason": pw, "at": now}
+                pr = {"state": ps, "reason": pw, "at": now, "account": acct}
             state, reason = (ps, pw) if ps == "unreachable" else (pr["state"], pr["reason"])
         else:
             state, reason = pr["state"], pr["reason"]
-    return {"state": state, "reason": reason, "checked_at": now, "probe": pr, "login": login, "known": state if state in KNOWN else last_known(prev)}
+    if acct and state != "ok":
+        reason = f"conta {acct}: {reason}"  # quem lê o bloqueio vê de QUAL conta do pool ele é
+    return {"state": state, "reason": reason, "checked_at": now, "probe": pr, "login": login, "known": state if state in KNOWN else last_known(prev), "account": acct}
 
 
 def last_known(prev):
@@ -315,16 +391,20 @@ def current(fresh_only: bool = False, force_probe: bool = False):
     """(estado, avisos). Cache dentro do TTL; vencido -> mede sob lock; sem lock e vencido -> NÃO devolve o velho como se valesse."""
     if os.path.exists(OFF_FILE):
         return {"state": "unknown", "reason": f"bandeira manual {OFF_FILE} existe (servidor seguro à mão)", "checked_at": time.time()}
+    fw = follow()  # a conta que as sessões usam AGORA; o cache e a herança sob trava só valem para ela (o pool do mini pode ter trocado)
+    if fw.on and fw.email is None:  # segue o pool e não sabe qual é a conta: nenhum cache responde por ela, e o claude do nó nem é chamado
+        return {"state": fw.err[0], "reason": fw.err[1], "checked_at": time.time()}
+    acct = fw.email if fw.on else None
     st = read_state()
-    if not fresh_only and not force_probe and fresh(st, time.time()):
+    if not fresh_only and not force_probe and fresh(st, time.time()) and st.get("account") == acct:
         return st
     with Lock() as lk:
         if not lk.got:
             return {"state": "unknown", "reason": f"estado vencido e outro processo o atualiza há mais de {LOCK_WAIT}s", "checked_at": time.time()}
         prev = read_state()
-        if not fresh_only and not force_probe and fresh(prev, time.time()):
+        if not fresh_only and not force_probe and fresh(prev, time.time()) and prev.get("account") == acct:
             return prev  # quem tinha a trava acabou de medir: herda a medida em vez de repetir o ssh
-        st = refresh(prev, force_probe)
+        st = refresh(prev, force_probe, fw)
         write_state(st)
         transition(prev, st)
         return st

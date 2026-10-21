@@ -242,6 +242,10 @@ class Fail(Exception):
     """Erro esperado: a mensagem vai para stderr, exit 1 (o engine a mostra no erro da operação)."""
 
 
+class NoKey(Fail):
+    """A conta atual do pool não tem item no cofre (secret rc 4 "Not found"): não é cofre ilegível, mas também não abre sessão (o gate do hetzner-claude.py as distingue: logged-out x unknown)."""
+
+
 class Unreachable(Fail):
     """O host não respondeu (ssh 255 ou tempo esgotado): a ÚNICA falha que um host `sleeps` pode tirar da lista em silêncio."""
 
@@ -581,7 +585,7 @@ def acct_key(cfg: Cfg, email: str) -> str:
     if r.returncode == 0 and tok.startswith("sk-ant-") and len(tok) > 16 and tok.isascii() and tok.isprintable() and not any(c.isspace() for c in tok):
         return tok
     if r.returncode == 4 and "not found" in r.stderr.decode("utf-8", "replace").lower():
-        raise Fail(f"a conta {email} está sem chave cadastrada no cofre (item {ACCT_ITEM}{email}; cadastro: claude_conta_cadastrar_chave.py do whatsapp_automation); a sessão não abre no host e NÃO cai no login fixo do nó")
+        raise NoKey(f"a conta {email} está sem chave cadastrada no cofre (item {ACCT_ITEM}{email}; cadastro: claude_conta_cadastrar_chave.py do whatsapp_automation); a sessão não abre no host e NÃO cai no login fixo do nó")
     raise Fail(f"chave da conta {email} ilegível (cofre fechado ou secret falhou, rc={r.returncode}{', saída sem forma de chave' if r.returncode == 0 else ''}); a sessão não abre no host e NÃO cai no login fixo do nó")
 
 
