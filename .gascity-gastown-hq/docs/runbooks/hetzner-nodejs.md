@@ -16,7 +16,7 @@ Rodam no **mini**; o nó é alcançado por ssh (`HETZNER_NODE_HOST`, padrão `he
 
 ```bash
 bash scripts/hetzner-nodejs.sh check     # só lê. rc 0 igual ao pin · 1 ausente/quebrado/outra versão · 2 não consegui saber · 3 nó que o pin não cobre
-bash scripts/hetzner-nodejs.sh install   # idempotente: igual ao pin = não baixa nada. rc 4 recusado (hash, binário, link alheio) · 5 download falhou
+bash scripts/hetzner-nodejs.sh install   # idempotente: igual ao pin = não baixa nada. rc 4 recusado (hash, binário, arquivo comum no lugar do link, diretório da versão que não é o certo) · 5 download falhou
 bash scripts/hetzner-nodejs.selftest.sh  # hermético, ~40 s: ssh/curl/uname são stubs, o script remoto roda de verdade num HOME temporário; 14 mutantes
 ```
 
@@ -54,6 +54,7 @@ Depois de desligar, `hetzner-mac-only.ps.txt` precisa voltar a listar os 5 arqui
 - Instalação com o nó desligado ou ssh caindo no meio: o selftest cobre (ssh que cai antes e depois de responder = rc 2), não foi provocado ao vivo.
 
 ## Limites
+- Um symlink que já exista em `~/.local/node` ou `~/.local/bin/node` é tratado como nosso e trocado (o nó não tinha nenhum); só arquivo ou diretório comum é recusado.
 - Duas instalações simultâneas não são serializadas (não há lock): quem chega depois do `mv` da outra confere a versão e reaproveita o diretório; numa corrida estrita o perdedor pode deixar um diretório aninhado inofensivo dentro do da versão. Rode um `install` por vez.
 - A troca `ln -sfn` de dois links não é uma transação única: há microssegundos entre `~/.local/node` e `~/.local/bin/node`. Aceitável: o nó só roda teste e a troca só acontece quando o pin muda.
 - A auditoria de dados do nó (`hetzner-audit.sh`) agora pula qualquer filho `gt-remote/venv-*` por padrão de nome (antes só `venv-wa`, e o `venv-ps` da ga-2hd02v.4.8 aparecia como 33 achados `GRANDE` de pacotes). É o que o cabeçalho dela já dizia em LIMITES (`venv*` não é lido por conteúdo); a linha `LIMPO` de dados continua dizendo o que ficou de fora.

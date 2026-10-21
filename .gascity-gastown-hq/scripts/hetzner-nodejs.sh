@@ -11,7 +11,8 @@
 #   install  baixa o tarball NO NÓ, confere o sha256 contra o hash do pin (que vem do mini, nunca de arquivo baixado pelo nó), extrai em ~/.local/node-v<V>-linux-arm64, roda o binário e só se ele disser v<V>
 #            troca os symlinks ~/.local/node e ~/.local/bin/node. Já está igual ao pin = não baixa nada (rc 0). Só o `node` ganha link: npm/npx ficam dentro do diretório, sem entrar no PATH.
 # CÓDIGOS: 0 igual ao pin / instalado · 1 check: ausente, quebrado ou outra versão · install: a conferência final não fechou · 2 NÃO consegui saber (pin ilegível ou ambíguo, ssh caiu, saída que não reconheço; nunca vira "ausente")
-#   3 o nó não é o que o pin cobre (SO/arquitetura) · 4 recusado (sha256 não confere, o binário diz outra versão, link ou diretório que não é nosso) · 5 download falhou
+#   3 o nó não é o que o pin cobre (SO/arquitetura) · 4 recusado (sha256 não confere, o binário diz outra versão, ARQUIVO COMUM no lugar de um dos links, diretório da versão que já existe e não é o node certo) · 5 download falhou
+#   Um symlink que já exista em ~/.local/node ou ~/.local/bin/node é tratado como nosso e é trocado (o nó não tinha nenhum em 21/10); só arquivo ou diretório comum é recusado.
 # POR QUE É SEGURO: o estado antigo só muda nos dois `ln -sfn` do FIM do install; qualquer recusa antes deles deixa o nó como estava (o diretório novo da versão pode já existir, sem link apontando para ele). O pin é DADO (lido por grep, nunca `source`) e versão/hash passam por regex antes de ir ao ssh.
 #   O diretório de cada versão é imutável: trocar de versão não apaga a anterior (desfazer = religar os links; receita no runbook). Não usa sudo, apt, npm install nem toca no python/venv do nó.
 # LIMITES: duas instalações ao mesmo tempo não são serializadas (não há lock): a que chegar depois do `mv` da outra confere a versão do diretório e o reaproveita; numa corrida estrita dos dois `mv` o perdedor pode deixar
