@@ -94,7 +94,7 @@ fi
 # definitions (no `export -f`): subshells and $(...) inherit them, but a spawned
 # `pilot-dispatcher.sh` does not, so a scenario that simulates a missing lib still sees one.
 . "$SELF_DIR/delivery-branch-patterns.sh" || { echo "FATAL: cannot source $SELF_DIR/delivery-branch-patterns.sh" >&2; exit 2; }
-for _dbh in _delivery_branch_patterns_ready _delivery_branch_local_ref _delivery_branch_remote_hit; do
+for _dbh in _delivery_branch_patterns_ready _delivery_branch_local_ref _delivery_branch_listed_ref _delivery_branch_remote_hit; do
   _dbh_src="$(awk -v n="$_dbh" '$0 ~ "^"n"\\(\\) *\\{" {f=1} f {print} f && /^}$/ {exit}' "$DISPATCHER")"
   [ -n "$_dbh_src" ] || { echo "FATAL: $_dbh not found in $DISPATCHER" >&2; exit 2; }
   eval "$_dbh_src"

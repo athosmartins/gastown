@@ -48,7 +48,7 @@ echo "── pilot-dispatcher delivery-branch probes (ga-3ebneo)${PD_UNDER_TEST:
 # ── extract the REAL functions (signature line .. first top-level "}") ────────────────
 FNS="$TMP/fns.sh"
 : > "$FNS"
-for _fn in _delivery_branch_patterns_ready _delivery_branch_local_ref _delivery_branch_remote_hit \
+for _fn in _delivery_branch_patterns_ready _delivery_branch_local_ref _delivery_branch_listed_ref _delivery_branch_remote_hit \
            _target_has_real_branch _beadid_has_crew_branch _beadid_matched_crew_branch_ref _filter_built; do
   awk -v n="$_fn" '$0 ~ "^"n"\\(\\) *\\{" {f=1} f {print} f && /^}$/ {exit}' "$PD" >> "$FNS"
 done

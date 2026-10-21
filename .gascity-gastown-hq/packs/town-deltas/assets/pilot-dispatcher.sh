@@ -4879,6 +4879,46 @@ _delivery_branch_local_ref() {
   return 1
 }
 
+# _delivery_branch_listed_ref <bead_id>   (ref lines on stdin: `git for-each-ref --format=%(refname)` over refs/heads + refs/remotes/origin)
+# ga-it7qiq.4 — the answer _delivery_branch_local_ref gives, taken from a listing the caller already holds instead of 1 + up to
+# 14 `for-each-ref` per (repo, bead). Same contract, same ref:
+#   rc 0  found     stdout = the full refname _delivery_branch_local_ref names (globs in priority order; within a glob, the first listed line)
+#   rc 1  looked, none
+#   rc 2  could not tell (no glob list: lib not loaded or empty prefix list; or an id with a character a glob would read)
+# Why this does not simply call gc_delivery_branch_pick: a line is the delivery only if git's own `for-each-ref refs/heads/<glob>` would
+# have returned it, and git matches a pattern PATH-WISE — a `*` never crosses a `/` (measured on git 2.54: `fix/b-1-*` does not return
+# fix/b-1-x/y, `crew/*/b-1` does not return crew/a/b/b-1, `crew/*/b-1-*` does not return crew/m/b-1-x/y) — whereas the bash `case` in
+# the pick lets `*` cross it. The pick alone would call "built" a bead whose only ref is fix/<id>-x/y, which the exact function (and
+# _target_has_real_branch / _beadid_has_crew_branch, which share it) calls "no branch": a bead stranded by a branch the rest of the
+# Pilot cannot see. A name matches a glob path-wise exactly when it matches the bash pattern AND has as many `/` as the glob (then no
+# `*` swallowed one). The literal-prefix decoy git also returns (fix/<id>/child) matches no glob, as it fails the anchored pick there.
+_delivery_branch_listed_ref() {
+  local _bid="${1:-}" _globs _g _line _name _in _t _gs
+  [ -n "$_bid" ] || return 2
+  case "$_bid" in *[!A-Za-z0-9._-]*) return 2 ;; esac
+  _delivery_branch_patterns_ready || return 2
+  _globs=$(gc_delivery_branch_globs "$_bid") || return 2
+  [ -n "$_globs" ] || return 2
+  _in=$(cat)
+  while IFS= read -r _g; do
+    [ -n "$_g" ] || continue
+    _t="${_g//[!\/]/}"; _gs=${#_t}
+    while IFS= read -r _line; do
+      case "$_line" in
+        refs/heads/*)          _name="${_line#refs/heads/}" ;;
+        refs/remotes/origin/*) _name="${_line#refs/remotes/origin/}" ;;
+        *) continue ;;
+      esac
+      _t="${_name//[!\/]/}"
+      [ "${#_t}" -eq "$_gs" ] || continue
+      case "$_name" in
+        $_g) printf '%s' "$_line"; return 0 ;;
+      esac
+    done <<< "$_in"
+  done <<< "$_globs"
+  return 1
+}
+
 # _delivery_branch_remote_hit <repo> <bead_id> — ask origin ITSELF (authoritative for a
 # branch this clone has not fetched; bounded at 8s) for the bead's delivery branch.
 #   rc 0  found     stdout = the branch name
@@ -4939,7 +4979,7 @@ _filter_built() {
   local _bf_json _bf_signal _bf_rc _bf_id_unk _bf_found _bf_unverified=0
   local _fb_named _fb_open_tried="" _fb_open_ok=0 _fb_open_src="" _fb_arts _fb_nl=$'\n'
   local _bf_tab=$'\t' _bf_pre_on=0 _bf_pref="" _bf_ids="" _bf_refs _bf_hits _bf_idsp
-  local _bf_mem _bf_x _bf_lines _bf_pick
+  local _bf_mem _bf_x _bf_lines
   arr=$(cat)
 
   # ── (wa-8y45 leak) GATE-MARKER + GATE-LABEL consultation ─────────────────────
@@ -5050,14 +5090,15 @@ _filter_built() {
       # ga-it7qiq.4: the POSITIVE side used to cost the exact function per (bead, repo) pair — 1 + up to 14 `for-each-ref`
       # (a bead whose id is only a substring of another bead's branch walked every glob to answer "none"; measured 197
       # calls / ~100 s per WA pass for ~13 such beads). The listing already in hand holds the answer: for an id that
-      # occurs in a repo's refs, keep THOSE ref lines (the awk below) and let gc_delivery_branch_pick — the same anchored,
-      # priority-ordered match the exact function applies to each line git returns — decide found / none in memory.
-      # Same verdict; the matched ref (only ever shown in the log reason) is rebuilt from the pick: refs/heads/<name> when
-      # that line is listed, else refs/remotes/origin/<name>. Only an id with a character git could read as a glob, and
-      # a repo whose refs could not be listed, still go to the exact function.
+      # occurs in a repo's refs, the awk below keeps THOSE ref lines and _delivery_branch_listed_ref decides found / none
+      # from them in memory. The verdict AND the ref it names (shown in the log reason) are the exact function's: it matches
+      # a glob the way git does, path-wise — see its header for why gc_delivery_branch_pick alone would call fix/<id>-x/y
+      # built where git says "no branch". Only an id with a character git could read as a glob, and a repo whose refs could
+      # not be listed, still go to the exact function.
       # Off — every pair asked the exact way, as before — when the pattern lib is not loaded (rc 2 must stay "could not
-      # tell"), when it cannot produce a glob list at all (gc_delivery_branch_pick answers rc 1 for that, which would read
-      # as "none"), and when a repo's refs cannot be listed.
+      # tell"), when it cannot produce a glob list at all (a repo with no ref naming the id would read as "none" where the
+      # exact function says "could not tell"), when a repo's refs cannot be listed, and — per pair — when
+      # _delivery_branch_listed_ref is not defined (a harness that extracted this function without it).
       # vazio (sem prefixos, sem globs) → "could not tell", pré-filtro desligado, cada par vai à função exata (rc 2, contado); falhou → idem
       if type _delivery_branch_patterns_ready >/dev/null 2>&1 && _delivery_branch_patterns_ready \
          && gc_delivery_branch_globs "ga-probe" >/dev/null 2>&1; then
@@ -5097,8 +5138,8 @@ _filter_built() {
                 case "${_fb_nl}${_bf_pref}" in
                   # the repo's refs could not be listed → the exact function decides
                   *"${_fb_nl}${r}${_bf_tab}*${_fb_nl}"*) ;;
-                  # some ref of this repo contains the id → decided in memory from those ref lines (ga-it7qiq.4)
-                  *"${_fb_nl}${r}${_bf_tab}${id}${_bf_tab}"*) _bf_mem=1 ;;
+                  # some ref of this repo contains the id → decided in memory from those ref lines (ga-it7qiq.4); no helper → the exact function
+                  *"${_fb_nl}${r}${_bf_tab}${id}${_bf_tab}"*) if type _delivery_branch_listed_ref >/dev/null 2>&1; then _bf_mem=1; fi ;;
                   # no ref of this repo contains the id → "looked, none" (what the exact function answers as rc 1)
                   *) continue ;;
                 esac ;;
@@ -5126,20 +5167,8 @@ _filter_built() {
               # an index entry with no ref lines cannot happen by construction; if it ever does it is "could not tell", never "none"
               _bf_rc=2
             else
-              # vazio → rc 1 = looked, none (nenhuma ref listada é a entrega do bead); falhou/ilegível → rc != 0/1 = could not tell (KEPT, contado)
-              _bf_pick=$(gc_delivery_branch_pick "$id" <<< "$_bf_lines") || _bf_rc=$?
-              if [ "$_bf_rc" -eq 0 ]; then
-                if [ -z "$_bf_pick" ]; then
-                  # picked, yet no name came out: nothing to show, nothing to trust
-                  _bf_rc=2
-                else
-                  # the pick strips the root: the line was refs/heads/<name> when that one is listed, else the origin ref
-                  case "${_fb_nl}${_bf_lines}${_fb_nl}" in
-                    *"${_fb_nl}refs/heads/${_bf_pick}${_fb_nl}"*) _matched_ref="refs/heads/$_bf_pick" ;;
-                    *) _matched_ref="refs/remotes/origin/$_bf_pick" ;;
-                  esac
-                fi
-              fi
+              # vazio → rc 1 = looked, none (nenhuma ref listada é a entrega do bead); falhou/ilegível → rc 2 = could not tell (KEPT, contado)
+              _matched_ref=$(_delivery_branch_listed_ref "$id" <<< "$_bf_lines") || _bf_rc=$?
             fi
           else
             _matched_ref=$(_delivery_branch_local_ref "$r" "$id") || _bf_rc=$?

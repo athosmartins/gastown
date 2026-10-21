@@ -15,17 +15,20 @@
 #       ref listing per repo (not one git call per bead per repo);
 #   (2b) ga-it7qiq.4 — the POSITIVES: a bead that already HAS a branch used to cost the exact function per (bead, repo)
 #       pair (1 + up to 14 `for-each-ref`, ~100 s per WA pass for ~13 beads). It is now decided in memory from the
-#       listing the prefilter already holds, with gc_delivery_branch_pick. Proved by counting git calls (one listing
+#       listing the prefilter already holds, by _delivery_branch_listed_ref. Proved by counting git calls (one listing
 #       per repo, nothing per bead) AND by parity: the ref logged for every dropped bead is the literal expected one
 #       and the one the exact function names (all prefixes, crew/*/, fix/ over feat/ whatever the sort order, local vs
-#       origin, same text but not a delivery -> kept);
+#       origin, same text but not a delivery -> kept). git reads a glob PATH-WISE (`*` never crosses a `/`) and a bash
+#       `case` does not, so a ref like fix/<id>-x/y is NOT a delivery for the exact function: the slash shapes are
+#       fixtures (m-sl1..m-sl4) and the helper's own contract is checked line by line (2d);
 #   (2c) ga-it7qiq.4 — no delivery globs at all (empty prefix list) is "could not tell" (kept, counted), never "none";
 #   (3) THREE states: a failed / unreadable bulk read falls back to the per-bead read of before (same verdict, never a
 #       silent "no marker"); a repo whose refs cannot be listed is asked the exact way, per bead (still "could not
 #       tell", still counted and logged, candidate KEPT) without dragging the other repos' positives off the fast path;
 #   (4) mutants: a prefilter that skips every repo, a marker set matched by substring, a bulk read that ignores the
-#       status, a pick that finds nothing / accepts any ref naming the id / ignores priority / loses the origin ref,
-#       and a prefilter that trusts an empty glob list must each make THIS file fail.
+#       status, a match that finds nothing / accepts any ref naming the id / ignores priority / loses the origin ref /
+#       lets a `*` cross a `/` / reads an id with a glob character as a pattern, a positive that goes back to the exact
+#       function, and a prefilter that trusts an empty glob list must each make THIS file fail.
 #
 # Runs the REAL function text cut out of the dispatcher, in a child bash (/bin/bash, like production) under
 # `set -euo pipefail`, with counting `bd` / `git` shims first on PATH and two real throw-away git repos. No Dolt needed.
@@ -48,8 +51,8 @@ trap 'rm -rf "$TMP"' EXIT
 
 fn() { sed -n "/^$1() {/,/^}\$/p" "$DISPATCHER"; }
 FB="$(fn _filter_built)"; HOM="$(fn _beadid_has_open_gate_marker)"; HAA="$(fn _beadid_has_active_gate_artifact)"
-DBL="$(fn _delivery_branch_local_ref)"; DBR="$(fn _delivery_branch_patterns_ready)"
-for pair in "FB:_filter_built" "HOM:_beadid_has_open_gate_marker" "HAA:_beadid_has_active_gate_artifact" "DBL:_delivery_branch_local_ref" "DBR:_delivery_branch_patterns_ready"; do
+DBL="$(fn _delivery_branch_local_ref)"; DBR="$(fn _delivery_branch_patterns_ready)"; DLR="$(fn _delivery_branch_listed_ref)"
+for pair in "FB:_filter_built" "HOM:_beadid_has_open_gate_marker" "HAA:_beadid_has_active_gate_artifact" "DBL:_delivery_branch_local_ref" "DBR:_delivery_branch_patterns_ready" "DLR:_delivery_branch_listed_ref"; do
   v="${pair%%:*}"; [ -n "${!v}" ] || { echo "FATAL: ${pair#*:} not found in $DISPATCHER" >&2; exit 2; }
 done
 
@@ -66,9 +69,12 @@ mkgit "$R1"; mkgit "$R2"
 R4="$TMP/r4"; mkdir -p "$R4"; mkgit "$R4"
 for b in fix/m-bare fix/m-slug-the-thing feat/m-feat feature/m-feature-2 refactor/m-refactor docs/m-docs-x chore/m-chore test/m-test \
          crew/ann/m-crew crew/ann/m-crew2-notes feat/m-prio fix/m-prio-x fix/m-both fix/m-two-a fix/m-two-b feat/m-mixed fix/m.dot-1-s \
-         fix/m-dec1x-foo fix/m-dec2/child feat/other-m-dec3 wip/m-dec4 fix/m-dec5.bak; do
+         fix/m-dec1x-foo fix/m-dec2/child feat/other-m-dec3 wip/m-dec4 fix/m-dec5.bak \
+         fix/m-sl1-foo/bar crew/ann/deep/m-sl2 crew/ann/m-sl3-x/y fix/m-sl4-foo/bar feat/m-sl4-ok; do
   "$REALGIT" -C "$R4" branch "$b"
 done
+# m-sl1..m-sl3: the id is followed by a `/`-bearing tail that git's PATH-WISE glob (`*` never crosses a `/`) does not read as the
+# delivery (`fix/<id>-*`, `crew/*/<id>`, `crew/*/<id>-*`) but a bash `case` pattern (`*` crosses `/`) would. m-sl4: such a decoy next to the real one.
 for b in fix/m-both fix/m-remote fix/m-mixed-r; do "$REALGIT" -C "$R4" update-ref "refs/remotes/origin/$b" HEAD; done
 
 # ── bd shim: serves a marker fixture; counts bulk vs per-bead reads ───────────────────────
@@ -122,6 +128,7 @@ source '$HERE/delivery-branch-patterns.sh'
 ${FBB_POST:-:}
 $DBR
 $DBL
+$DLR
 $HOM
 $HAA
 $FB
@@ -206,16 +213,20 @@ m-remote|refs/remotes/origin/fix/m-remote
 m-two|refs/heads/fix/m-two-a
 m-mixed|refs/remotes/origin/fix/m-mixed-r
 m.dot-1|refs/heads/fix/m.dot-1-s
+m-sl4|refs/heads/feat/m-sl4-ok
 b-built|refs/heads/fix/b-built-slug
 b-crew|refs/heads/crew/mila/b-crew
 b-remote|refs/remotes/origin/feat/b-remote
 b-12|refs/heads/fix/b-12-other-bead'
-# ids whose text is in some ref but whose ref is NOT their delivery (or that no ref names): all stay candidates
-MKEPT='b-1 m-dec1 m-dec2 m-dec3 m-dec4 m-dec5 m-none'
+# ids whose text is in some ref but whose ref is NOT their delivery (or that no ref names): all stay candidates.
+# m-sl1..m-sl3 are the slash shapes: the exact function answers "none" for them (git's glob is path-wise), so must this path.
+# m-sl4 sits in MPOS: next to its `/`-bearing decoy fix/m-sl4-foo/bar the delivery is feat/m-sl4-ok, and that is the ref to log.
+MKEPT='b-1 m-dec1 m-dec2 m-dec3 m-dec4 m-dec5 m-none m-sl1 m-sl2 m-sl3'
 MIDS="$(printf '%s\n' "$MPOS" | cut -d'|' -f1 | tr '\n' ' ') $MKEPT"
 # shellcheck disable=SC2086
 MC="$(mk $MIDS)"
 NMC="$(printf '%s' "$MC" | "$REALJQ" 'length')"
+NPOS="$(printf '%s\n' "$MPOS" | wc -l | tr -d ' ')"; NKEPT="$(printf '%s\n' $MKEPT | wc -l | tr -d ' ')"
 REPOS3="$R1
 $R2
 $R4"
@@ -236,8 +247,8 @@ want_log="$(printf '%s\n' "$MPOS" | sed "s/|/${TAB}/" | sort)"
 
 run_fb "$MC" "$REPOS3"
 G="$(count "$GITLOG" 'for-each-ref')"
-if [ "$RC" = 0 ] && [ "$(ids "$OUT")" = "$WANT_MKEPT" ]; then ok "$NMC candidates over 3 repos: the $(printf '%s\n' "$MPOS" | wc -l | tr -d ' ') with a delivery branch are dropped, kept = $WANT_MKEPT"; else bad "rc=$RC kept=$(ids "$OUT") want=$WANT_MKEPT err=$ERR"; fi
-if [ "$G" = "3" ]; then ok "$NMC candidates, 20 of them with a branch: $G git call(s) for 3 repos (one listing each; was one per branch-bearing bead per glob)"; else bad "git for-each-ref calls: $G (want 3: one listing per repo, none per bead that has a branch)"; fi
+if [ "$RC" = 0 ] && [ "$(ids "$OUT")" = "$WANT_MKEPT" ]; then ok "$NMC candidates over 3 repos: the $NPOS with a delivery branch are dropped, kept = $WANT_MKEPT"; else bad "rc=$RC kept=$(ids "$OUT") want=$WANT_MKEPT err=$ERR"; fi
+if [ "$G" = "3" ]; then ok "$NMC candidates, $NPOS of them with a branch: $G git call(s) for 3 repos (one listing each; was one per branch-bearing bead per glob)"; else bad "git for-each-ref calls: $G (want 3: one listing per repo, none per bead that has a branch)"; fi
 if [ "$(logged_refs)" = "$want_log" ]; then ok "the logged ref of every dropped bead is the literal one (fix/ wins over feat/ whatever the sort order, local beats origin only for the same glob, bare/slug/crew shapes)"; else bad "logged refs differ from the literal expectation:
 $(diff <(printf '%s\n' "$want_log") <(logged_refs) || true)"; fi
 EXACT="$(exact_all "$REPOS3" "$MIDS" | sort)"
@@ -253,7 +264,7 @@ $R4"
 run_fb "$MC" "$REPOS4"
 G="$(count "$GITLOG" 'for-each-ref')"; WANT_G=$((4 + NMC))
 if [ "$RC" = 0 ] && [ "$(ids "$OUT")" = "$WANT_MKEPT" ] && [ "$(logged_refs)" = "$want_log" ] && [ "$G" = "$WANT_G" ]; then ok "one repo unreadable: same verdict and same refs, $G git calls = 4 listings + 1 exact ask per bead for the unreadable repo only"; else bad "unreadable repo among healthy ones: rc=$RC kept=$(ids "$OUT") git=$G (want $WANT_G) err=$ERR"; fi
-if grep -q '7 candidate(s) could not be checked' "$TMP/err"; then ok "the 7 kept beads the unreadable repo left unsettled are counted (the 20 found elsewhere are not)"; else bad "unsettled count wrong: $(grep 'could not be checked' "$TMP/err")"; fi
+if grep -q "$NKEPT candidate(s) could not be checked" "$TMP/err"; then ok "the $NKEPT kept beads the unreadable repo left unsettled are counted (the $NPOS found elsewhere are not)"; else bad "unsettled count wrong: $(grep 'could not be checked' "$TMP/err")"; fi
 
 echo "-- 2c. ga-it7qiq.4: no delivery globs at all (empty prefix list) is 'could not tell', not 'none' --"
 FBB_POST='GC_DELIVERY_BRANCH_PREFIXES=""'
@@ -262,6 +273,38 @@ unset FBB_POST
 G="$(count "$GITLOG" 'for-each-ref')"
 if [ "$RC" = 0 ] && [ "$(ids "$OUT")" = '["b-built","b-fresh"]' ] && grep -q '2 candidate(s) could not be checked' "$TMP/err"; then ok "both KEPT and both counted as 'could not be checked' (a repo with no ref naming the id is not 'looked, none' when there is nothing to look for)"; else bad "empty prefix list: rc=$RC kept=$(ids "$OUT") err=$ERR"; fi
 if [ "$G" = "0" ]; then ok "and no ref listing is paid for an answer that cannot be used ($G git calls)"; else bad "empty prefix list still listed refs: $G git calls"; fi
+
+echo "-- 2d. ga-it7qiq.4: _delivery_branch_listed_ref on its own: the exact function's three states and git's path-wise globs --"
+# the premise, pinned against the git that runs this test: a glob is read path-wise (`*` never crosses a `/`)
+GP="$("$REALGIT" -C "$R4" for-each-ref --format='%(refname)' 'refs/heads/fix/m-sl1-*' 'refs/heads/crew/*/m-sl2' 'refs/heads/crew/*/m-sl3-*')"
+if [ -z "$GP" ]; then ok "git itself: fix/<id>-*, crew/*/<id> and crew/*/<id>-* return none of the three slash-tail refs of the fixture"; else bad "this git reads a glob across a '/': $GP -- _delivery_branch_listed_ref's slash rule is now wrong"; fi
+lr() { # <bead id> <ref lines> -> "<stdout>|rc=<n>"; $LR_PRE runs before the function is defined (a way to break the glob list)
+  printf '%s\n' "$2" | /bin/bash -c "source '$HERE/delivery-branch-patterns.sh'; ${LR_PRE:-:}
+$DBR
+$DLR
+out=\$(_delivery_branch_listed_ref '$1'); rc=\$?; printf '%s|rc=%s' \"\$out\" \"\$rc\""
+}
+lr_want() { # <label> <bead id> <ref lines> <want>
+  local got; got="$(lr "$2" "$3")"
+  if [ "$got" = "$4" ]; then ok "$1 -> $got"; else bad "$1: got [$got] want [$4]"; fi
+}
+lr_want "fix/<id>-slug" b-1 'refs/heads/fix/b-1-ok' 'refs/heads/fix/b-1-ok|rc=0'
+lr_want "an origin ref" b-1 'refs/remotes/origin/feat/b-1' 'refs/remotes/origin/feat/b-1|rc=0'
+lr_want "crew/*/<id> (one component)" b-1 'refs/heads/crew/m/b-1' 'refs/heads/crew/m/b-1|rc=0'
+lr_want "priority: fix/ over feat/ whatever the listing order" b-1 $'refs/heads/feat/b-1-x\nrefs/heads/fix/b-1-y' 'refs/heads/fix/b-1-y|rc=0'
+lr_want "a '/' inside the fix/<id>-* tail is no delivery" b-1 'refs/heads/fix/b-1-foo/bar' '|rc=1'
+lr_want "a '/' inside the crew/*/ part is no delivery" b-1 'refs/heads/crew/a/b/b-1' '|rc=1'
+lr_want "a '/' inside the crew/*/<id>-* tail is no delivery" b-1 'refs/heads/crew/m/b-1-x/y' '|rc=1'
+lr_want "such a decoy does not hide the real one" b-1 $'refs/heads/feat/b-1-ok\nrefs/heads/fix/b-1-foo/bar' 'refs/heads/feat/b-1-ok|rc=0'
+lr_want "fix/<id>/child (git's literal-prefix match) is no delivery" b-1 'refs/heads/fix/b-1/child' '|rc=1'
+lr_want "another bead's longer id" b-1 'refs/heads/fix/b-12-other' '|rc=1'
+lr_want "no ref line at all = looked, none" b-1 '' '|rc=1'
+lr_want "an id with a glob character = could not tell" 'b-*' 'refs/heads/fix/b-1' '|rc=2'
+LR_PRE='GC_DELIVERY_BRANCH_PREFIXES=""'; lr_want "an empty prefix list = could not tell" b-1 'refs/heads/fix/b-1' '|rc=2'; unset LR_PRE
+got="$(printf 'refs/heads/fix/b-1\n' | /bin/bash -c "$DBR
+$DLR
+out=\$(_delivery_branch_listed_ref b-1); rc=\$?; printf '%s|rc=%s' \"\$out\" \"\$rc\"")"
+if [ "$got" = '|rc=2' ]; then ok "the pattern lib not loaded = could not tell -> $got"; else bad "pattern lib not loaded: got [$got] want [|rc=2]"; fi
 
 echo "-- 3. THREE states: nothing is collapsed into 'not built' --"
 for mode in fail garbage; do
@@ -295,7 +338,7 @@ PY
       && bad "mutant $1 ($2) was NOT rejected" || ok "mutant $1 ($2) is rejected"
   }
   # M1: a repo whose refs mention the id is skipped too (only the 'unlistable' clause kept) -> built beads stay candidates
-  mutate skipall '*"${_fb_nl}${r}${_bf_tab}${id}${_bf_tab}"*) _bf_mem=1 ;;' ''
+  mutate skipall '*"${_fb_nl}${r}${_bf_tab}${id}${_bf_tab}"*) if type _delivery_branch_listed_ref >/dev/null 2>&1; then _bf_mem=1; fi ;;' ''
   expect_reject skipall "prefilter skips repos that DO name the id"
   # M2: marker set matched by substring instead of the exact id line -> b-mark is dropped by b-marker's marker
   mutate substr '*"${_fb_nl}${id}${_fb_nl}"*) _fb_named=1 ;;' '*"${id}"*) _fb_named=1 ;;'
@@ -310,20 +353,36 @@ PY
   mutate unlistable '*"${_fb_nl}${r}${_bf_tab}*${_fb_nl}"*) ;;' ''
   expect_reject unlistable "unlistable repo read as 'no branch'"
   # M6: the in-memory pick finds nothing -> every bead that has a branch becomes a fresh candidate
-  mutate picknone '_bf_pick=$(gc_delivery_branch_pick "$id" <<< "$_bf_lines") || _bf_rc=$?' '_bf_pick=""; _bf_rc=1'
+  mutate picknone '_matched_ref=$(_delivery_branch_listed_ref "$id" <<< "$_bf_lines") || _bf_rc=$?' '_matched_ref=""; _bf_rc=1'
   expect_reject picknone "in-memory pick answers 'none' for a bead that has a branch"
   # M7: any listed ref that merely contains the id counts (no anchored glob match) -> the decoys are dropped
-  mutate pickany '_bf_pick=$(gc_delivery_branch_pick "$id" <<< "$_bf_lines") || _bf_rc=$?' '_bf_pick="${_bf_lines%%"$_fb_nl"*}"; _bf_pick="${_bf_pick#refs/heads/}"; _bf_pick="${_bf_pick#refs/remotes/origin/}"'
+  mutate pickany '_matched_ref=$(_delivery_branch_listed_ref "$id" <<< "$_bf_lines") || _bf_rc=$?' '_matched_ref="${_bf_lines%%"$_fb_nl"*}"'
   expect_reject pickany "any ref naming the id counts as the delivery"
   # M8: only the first ref line is looked at -> feat/<id> beats fix/<id>-x just because it sorts first
   mutate firstref '_bf_lines="${_bf_lines// /$_fb_nl}"' '_bf_lines="${_bf_lines%% *}"'
   expect_reject firstref "priority across the id's ref lines is lost"
   # M9: the origin ref is reported as a local one -> the logged ref differs from the exact function's
-  mutate headsonly '*) _matched_ref="refs/remotes/origin/$_bf_pick" ;;' '*) _matched_ref="refs/heads/$_bf_pick" ;;'
+  mutate headsonly '$_g) printf '"'"'%s'"'"' "$_line"; return 0 ;;' '$_g) printf '"'"'refs/heads/%s'"'"' "$_name"; return 0 ;;'
   expect_reject headsonly "an origin-only branch is reported as refs/heads/"
   # M10: the prefilter trusts an empty glob list -> 'nothing to look for' is read as 'looked, none'
   mutate noprobe '&& gc_delivery_branch_globs "ga-probe" >/dev/null 2>&1; then' '&& true; then'
   expect_reject noprobe "empty glob list read as 'no branch'"
+  # M11: a `*` may cross a `/` (the bash `case` alone, what gc_delivery_branch_pick does) -> fix/<id>-x/y etc. become "built"
+  mutate slashcross '[ "${#_t}" -eq "$_gs" ] || continue' ':'
+  expect_reject slashcross "a glob '*' that crosses a '/' (a ref git does not return counts as the delivery)"
+  # M12: the in-memory path is never taken (what a renamed/missing helper would silently do) -> same verdicts, a git call per pair again
+  mutate nomem 'if type _delivery_branch_listed_ref >/dev/null 2>&1; then _bf_mem=1; fi ;;' ': ;;'
+  expect_reject nomem "positives go back to the exact function (the cost assertions must see it)"
+  # M13: an id with a glob character is matched as a pattern instead of "could not tell"
+  mutate globid 'case "$_bid" in *[!A-Za-z0-9._-]*) return 2 ;; esac
+  _delivery_branch_patterns_ready || return 2
+  _globs=$(gc_delivery_branch_globs "$_bid") || return 2
+  [ -n "$_globs" ] || return 2
+  _in=$(cat)' '_delivery_branch_patterns_ready || return 2
+  _globs=$(gc_delivery_branch_globs "$_bid") || return 2
+  [ -n "$_globs" ] || return 2
+  _in=$(cat)'
+  expect_reject globid "an id with a glob character is read as a pattern"
 fi
 
 echo
