@@ -347,7 +347,10 @@ _wt_fresh_epoch() {
 
 # ── _wt_lock_reason <repo> <wt> — ga-m5i7e6: the lock reason `git worktree list --porcelain` gives <wt> ("(no reason)" for a
 # bare lock); empty = not locked, or git itself failed (then the caller treats the tree as unlocked and applies _keep_unsafe).
+# That collapse is safe only because the plain `worktree remove` that follows is refused by git for a locked tree (`-f -f` is
+# used nowhere outside the lock contract): a wrong "unlocked" costs one extra in-use/pressure check, never a removal.
 _wt_lock_reason() {
+  # vazio → not locked: _keep_unsafe runs, then the plain remove; falhou → the same, and git still refuses a locked tree there
   git -C "$1" worktree list --porcelain 2>/dev/null | awk -v p="$2" '$1=="worktree"{c=$2} $1=="locked"{ if(c==p){ $1=""; sub(/^ /,""); if ($0=="") $0="(no reason)"; print; exit } }'
 }
 
