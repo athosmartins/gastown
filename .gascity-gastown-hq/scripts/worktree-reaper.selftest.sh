@@ -2066,6 +2066,18 @@ else bad "ga-xpoj67 (x4): zombie lock + ignored data — present=$(m5_has xp4 &&
 xp_mk xp4b; xp_tree xp4b unmerged junk; xp_lock xp4b; xp_run xp4b WORKTREE_REAPER_FAKE_PS="$M5_PS"
 xp_freed xp4b "(x4b): the same dead-holder lock with only junk inside → reaped (the zombie reap itself still works)"
 
+# (x4c) a LOCKED tree that is also MERGED: _keep_unsafe keeps it before the lock contract is ever asked, and the event must still say the tree is locked
+xp_mk xp4c; xp_tree xp4c merged data; xp_lock xp4c; xp_run xp4c WORKTREE_REAPER_FAKE_PS="$M5_PS"
+if m5_has xp4c && [ "$(events xp4c kept_ignored_data)" = "1" ] && [ "$(events xp4c reaped_zombie_lock)" = "0" ] \
+   && [ "$(git -C "$TMP/xp4c/rig" worktree list --porcelain | grep -c '^locked')" = "1" ] \
+   && grep '"event":"kept_ignored_data"' "$TMP/xp4c.jsonl" | grep -q '"locked":true'; then ok "ga-xpoj67 (x4c): MERGED tree with a dead-holder lock and ignored data → KEPT, lock untouched, event says locked:true"
+else bad "ga-xpoj67 (x4c): merged + locked + ignored data — present=$(m5_has xp4c && echo y || echo n) kept_ignored_data=$(events xp4c kept_ignored_data) event=$(grep kept_ignored_data "$TMP/xp4c.jsonl" 2>/dev/null | head -1)"; fi
+xp_mk xp4d; xp_tree xp4d merged junk; xp_lock xp4d; xp_run xp4d WORKTREE_REAPER_FAKE_PS="$M5_PS"
+xp_freed xp4d "(x4d): the same MERGED dead-holder lock with only junk inside → reaped (control: the guard does not hold a clean locked tree)"
+# (x4e) and an UNLOCKED tree says locked:false (the field is git's answer, not a constant)
+xp_mk xp4e; xp_tree xp4e merged data; xp_run xp4e
+grep '"event":"kept_ignored_data"' "$TMP/xp4e.jsonl" | grep -q '"locked":false' && ok "ga-xpoj67 (x4e): an unlocked tree's event says locked:false" || bad "ga-xpoj67 (x4e): event: $(grep kept_ignored_data "$TMP/xp4e.jsonl" 2>/dev/null | head -1)"
+
 # (x5) a lock nobody can name, unmerged work, the BEAD-CLOSED proof (`remove -f -f`): clean + aged + unused + bead closed → reaped; ignored data in it → KEPT first
 mk_bc_rig xp5 'echo pesquisa/ >> "$(git rev-parse --git-common-dir)/info/exclude"; mkdir pesquisa; echo r > pesquisa/o.csv'
 run_bc xp5 "[$(bc_bead "$BC_ID" closed 10)]" WORKTREE_REAPER_IGNORED_DATA_GUARD=1

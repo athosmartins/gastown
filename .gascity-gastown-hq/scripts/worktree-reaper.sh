@@ -400,11 +400,12 @@ _ignored_data_scan() {
   return 0
 }
 
-# ── _keep_ignored_data <repo> <wt> <br> <age_h> [locked] — ga-xpoj67: 0 = KEEP the tree (the event is logged here), 1 = go on. kept_ignored_data
+# ── _keep_ignored_data <repo> <wt> <br> <age_h> — ga-xpoj67: 0 = KEEP the tree (the event is logged here), 1 = go on. kept_ignored_data
 # carries the total size and the 5 largest ignored paths; kept_ignored_data_unknown (size null) is a listing that could not be read — a tree whose
-# ignored files cannot be listed is not a tree without any. IGNORED_GUARD=0 is the old rule: always 1.
+# ignored files cannot be listed is not a tree without any. "locked" is git's own answer for the tree (_wt_lock_reason), whichever caller got here
+# (a MERGED locked tree is kept in _keep_unsafe, before the lock contract). IGNORED_GUARD=0 is the old rule: always 1.
 _keep_ignored_data() {
-  local repo="$1" wt="$2" br="$3" age="$4" lk="${5:-}" rc ev
+  local repo="$1" wt="$2" br="$3" age="$4" rc ev lk
   [ "$IGNORED_GUARD" != "0" ] || return 1
   _ignored_data_scan "$wt"; rc=$?
   case "$rc" in
@@ -412,6 +413,8 @@ _keep_ignored_data() {
     0) ev="kept_ignored_data" ;;
     *) ev="kept_ignored_data_unknown"; _ID_KB=null ;;
   esac
+  # vazio → not locked; falhou (git broke) → the same: it only labels the event, the tree is kept either way
+  lk="$(_wt_lock_reason "$repo" "$wt")"
   printf '{"ts":"%s","event":"%s","repo":"%s","wt":"%s","branch":"%s","age_h":%s,"mode":"%s","locked":%s,"size_kb":%s,"top":%s}\n' \
     "$(ts)" "$ev" "$(_json_esc "$(basename "$repo")")" "$(_json_esc "$(basename "$wt")")" "$(_json_esc "$br")" "$age" "$mode" "$([ -n "$lk" ] && echo true || echo false)" "$_ID_KB" "$_ID_TOP" >> "$LOG" 2>/dev/null
   return 0
@@ -837,7 +840,7 @@ reap_zombie_locked() {
   fi
   # ga-xpoj67: the same `remove -f -f` takes what git ignores in the tree, and a dead lock holder says nothing about that either (the lock
   # contract does not go through _keep_unsafe): ignored data inside → KEPT, logged, the lock stays.
-  if _keep_ignored_data "$repo" "$wt" "$br" "$age" locked; then return 1; fi
+  if _keep_ignored_data "$repo" "$wt" "$br" "$age"; then return 1; fi
   if [ "$ENABLED" != "1" ]; then
     printf '{"ts":"%s","event":"would_reap_zombie_lock","repo":"%s","wt":"%s","branch":"%s","pid":%s,"why":"%s","age_h":%s,"label":"%s"}\n' "$(ts)" "$(basename "$repo")" "$(basename "$wt")" "$br" "$pid" "$why" "$age" "$label" >> "$LOG" 2>/dev/null
     return 1
@@ -1144,7 +1147,7 @@ _reap_or_log_unparseable_lock() {
      && { [ "$_unused" = "1" ] || ! _worktree_in_use "$wt"; }; then
     # The event names which proof reaped it; the ancestry one keeps its ga-vs6shu name.
     # ga-xpoj67: every proof above is about the tree's TRACKED content; the `remove -f -f` below takes what git ignores too
-    if _keep_ignored_data "$repo" "$wt" "$br" "$age" locked; then return 1; fi
+    if _keep_ignored_data "$repo" "$wt" "$br" "$age"; then return 1; fi
     local _ev_reaped="reaped_locked_unparseable_safe" _ev_would="would_reap_locked_unparseable_safe" _del_proof="" _ev_verdict=""
     if [ "$_proof" = "patch_equivalent" ]; then
       _ev_reaped="reaped_locked_unparseable_patch_equivalent"
@@ -1324,7 +1327,7 @@ reap_pool_worktrees() {
             reap_zombie_locked "$repo" "$wt" "$br" "$lock" "$age" "pool"; zrc=$?
             case "$zrc" in
               0) pool_reaped=$((pool_reaped+1)); zombie_reaped=$((zombie_reaped+1)) ;;
-              1) : ;;                                    # nothing removed, already logged (dry-run intent, or kept_zombie_lock_in_use); not tallied here
+              1) : ;;                                    # nothing removed, already logged (dry-run intent, kept_zombie_lock_in_use or kept_ignored_data); not tallied here
               2)
                  # ga-vs6shu: not a pid-confirmed zombie — split "confirmed
                  # live" from "genuinely unparseable" instead of collapsing
