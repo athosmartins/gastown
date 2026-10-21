@@ -11,12 +11,14 @@
 #     MODO SHADOW (o que o Pilot grava hoje): a linha `pilot-node-route` É a decisão (o Pilot só roda `check`, não há `apply`); só o par coerente rc+verdict dá veredito (0+node, 10+mini, 11+unknown);
 #     rc 11 sem saída = 'não li' e não 'não sei'; prazo/sinal = 'não li'; rc e veredito que discordam = 'outro' + INCOERENTE (nunca mini, nunca node) e entra na lista de conferência.
 #     ESCRITA NÃO CONFIRMADA: apply rc 13 (menos 'conferencia-falhou-desfeito', que prova que nada nosso sobrou), release rc 13, Pilot label/auto com rc 13/124+ — até um despacho ou uma soltura CONFIRMAR.
-#     COBERTURA: horas UTC COM linha de decisão (duas linhas a 24 h de distância são duas horas, não 24), mais o intervalo e o maior silêncio · aviso quando o Pilot gravou linhas e NENHUMA deu veredito.
+#     COBERTURA: horas UTC COM VEREDITO (duas linhas a 24 h de distância são duas horas, não 24; hora só de 'não li'/'não elegível'/'outro' não conta, nem a do apply sem veredito), o maior silêncio ENTRE VEREDITOS e o intervalo ·
+#     aviso quando o Pilot gravou linhas e NENHUMA deu veredito · EVENTO DESCONHECIDO (event ausente, vazio, não-texto ou novo) contado à parte, fora de decisão/bead/'linha ilegível' · base e razões de um node ANTERIOR rotuladas como tais.
 #     O GANCHO DE VERDADE: o selftest roda `_pilot_wa_node_decide` (extraída do pilot-dispatcher.sh) contra um despachante falso e lê a linha que ELE grava (chk_hook_real); falha alto se a função sumir.
-#   PRONTIDÃO: mecânica (horas UTC com dado e beads COM VEREDITO); igual ao mínimo basta, um a menos não; --min-hours que não cabe na janela (> --hours + 1) diz isso em vez de "ainda não deu tempo"; nunca diz "aprovado".
+#   PRONTIDÃO: mecânica (horas UTC COM VEREDITO e beads COM VEREDITO); igual ao mínimo basta, um a menos não; --min-hours que não cabe na janela (> --hours + 1) diz isso em vez de "ainda não deu tempo"; nunca diz "aprovado".
 #   OCUPAÇÃO: CPU por hora em UTC (qualquer TZ) · CPU não lida (lido=false, ausente, bool, fora de 0..100, NaN) NUNCA vira 0%, e 0% de verdade aparece como 0,0 · média da janela sobre as LIDAS · "perto de 100%" é >= · sessões
 #     wa-worker-remote (não o wa-worker do mini) · sessões não lidas não viram "0 sessões" · leitura de sessões lida pela metade (`ilegiveis` != 0/ausente: N>0, texto, bool) também não entra na conta de WA ·
-#     linhas sem epoch contadas · bordas da janela · a tabela de texto mostra as últimas 72 horas e avisa.
+#     linhas sem epoch contadas · bordas da janela · a tabela de texto mostra as últimas 72 horas e avisa ·
+#     o que NÃO é leitura do vigia (a linha `tipo:"reaper"` que o reaper grava no mesmo arquivo, `tipo` que não é texto, linha sem cpu NEM sessoes) fica fora de leituras/hora/sem-CPU e vem CONTADA, inclusive num arquivo só de reaper.
 #   ESTADOS: ausente ≠ vazio ≠ ilegível (lixo, pasta no lugar do arquivo) · rc 3 só quando NENHUM dos dois logs serve (e JSON mesmo assim) · rc 2 em uso errado (inclui "010" = dez, nunca octal) · só leitura (nada novo, nada alterado) ·
 #     --json é UMA linha de JSON com as quatro chaves.
 # CONTROLE NEGATIVO: cada mutante troca UMA trecho do script numa cópia (e FALHA se o trecho sumiu ou se repete: o script mudou, atualize o mutante) e a função designada tem de reprovar; mutante que sobrevive reprova esta bateria.
@@ -29,7 +31,7 @@
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REAL="$HERE/wa-node-report.py"
-MIN_MUT=103
+MIN_MUT=133
 T=$(mktemp -d "${TMPDIR:-/tmp}/wa-node-report.XXXXXX")
 trap 'find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null' EXIT
 fails=0; n=0; MUTANTS=0
@@ -170,7 +172,7 @@ rota = [
 ]
 jl(os.path.join(city("rota"), ".gc", "wa-node-route.jsonl"), rota)
 
-# ---- ocupação: 13 leituras na janela
+# ---- ocupação: 13 leituras do vigia na janela (e, no meio delas, 3 linhas do reaper + 1 sem forma de leitura, que NÃO são leituras)
 ocup = [
     occ(-24 * H, cpu(50.0), ses([])),                                                   # borda de baixo: entra
     occ(-25 * H, cpu(100.0), ses(["wa-worker-remote-1"])),                              # fora
@@ -181,12 +183,18 @@ ocup = [
     occ(-3 * H + 1800, cpu(0.0, lido=False), ses([], lido=False)),
     occ(-3 * H + 2700, cpu(100.5), ses(["wa-worker-remote-2", "wa-worker-remote-3"])),  # 100,5% não existe: sem CPU lida
     occ(-2 * H, cpu(0.0), ses([])),                                                     # 10Z: um 0% DE VERDADE
-    occ(-2 * H + 900, None, None),
+    occ(-2 * H + 900, None, ses([], lido=False)),                                       # a chave `cpu` nem existe: sem CPU lida (nunca 0%)
     occ(-2 * H + 1800, cpu(True), ses([], lido=False)),                                 # pct bool: sem CPU lida
     occ(-1 * H, cpu(95.0), ses([1])),                                                   # 11Z: nome que não é texto → sessões não lidas
     occ(-1 * H + 900, cpu(90.0), ses(["wa-worker-remote-1"])),                          # exatamente 90: conta como perto de 100%
     occ(0, cpu(100.0), ses([])),                                                        # exatamente agora: entra
     occ(1, cpu(100.0), ses([])),                                                        # um segundo depois: fora
+    # ---- o reaper grava no MESMO arquivo ({"ts","epoch","tipo":"reaper","fechadas","falhas"}, sem cpu nem sessoes): não é leitura do vigia
+    {"ts": iso(-3 * H + 300), "epoch": NOW - 3 * H + 300, "tipo": "reaper", "fechadas": 2, "falhas": 0},      # 09Z
+    {"ts": iso(-2 * H + 60), "epoch": NOW - 2 * H + 60, "tipo": "reaper", "fechadas": 0, "falhas": 1},        # 10Z
+    {"ts": iso(-1 * H + 300), "epoch": NOW - 1 * H + 300, "tipo": 7},                                          # `tipo` que não é texto: '?'
+    {"ts": iso(-25 * H), "epoch": NOW - 25 * H, "tipo": "reaper", "fechadas": 1, "falhas": 0},                # fora da janela: nem entra na conta dos eventos
+    {"ts": iso(-1 * H + 500), "epoch": NOW - 1 * H + 500, "estado": "ok"},                                    # sem `tipo`, sem cpu e sem sessoes: não se sabe o que é
     {"ts": iso(-5 * H), "estado": "ok", "cpu": cpu(100.0)},                             # sem epoch
     {"ts": iso(-5 * H), "epoch": str(NOW - 5 * H), "cpu": cpu(100.0)},                  # epoch em texto
     b'{"ts": "x", "epoch": NaN, "cpu": {"lido": true, "nucleos": 16, "pct": 100.0}}',   # epoch NaN
@@ -198,6 +206,27 @@ jl(os.path.join(city("span"), ".gc", "wa-node-route.jsonl"), [pr("wa-sp1", -24 *
 # ---- o dia inteiro: uma decisão do Pilot (shadow) em cada hora UTC de -24 h a agora = 25 horas e 25 beads com veredito
 jl(os.path.join(city("dia"), ".gc", "wa-node-route.jsonl"),
    [pr("wa-d%02d" % k, -k * H, "shadow", 0 if k % 2 else 10, cj("node", "label", ["a"]) if k % 2 else cj("mini", "", ["b"])) for k in range(25)])
+# ---- eventos que o relatório não conhece: contados à parte, nunca decisão, nunca bead, nunca "linha ilegível"
+jl(os.path.join(city("ev"), ".gc", "wa-node-route.jsonl"), [
+    pr("wa-ev0", -2 * H, "shadow", 0, cj("node", "code", ["a"])),
+    {"ts": iso(-2 * H), "event": "futuro", "bead": "wa-ev1", "rc": 0, "detail": "x"},
+    {"ts": iso(-2 * H), "event": "futuro", "rc": 0},                       # sem bead: não é "linha ilegível", é evento desconhecido
+    {"ts": iso(-2 * H), "event": 7, "bead": "wa-ev2"},                     # event que nem é texto
+    {"ts": iso(-2 * H), "bead": "wa-ev3", "rc": 0},                        # sem event
+    {"ts": iso(-2 * H), "event": "", "bead": "wa-ev4"},
+])
+# ---- horas em que o DESPACHANTE (apply) rodou e NÃO deu veredito (não elegível, não li, escrita falhou): são horas com decisão, mas não horas COM VEREDITO
+jl(os.path.join(city("sv"), ".gc", "wa-node-route.jsonl"), [
+    ap("wa-sv1", -5 * H, 12, "nao-elegivel status=in_progress assignee=x rota="),
+    ap("wa-sv2", -4 * H, 11, "bead-ilegivel"),
+    ap("wa-sv3", -3 * H, 13, "escrita-falhou-NAO-desfeito rc=1"),
+    ap("wa-sv4", -1 * H, 10, "classificador:mini test-toca-banco"),
+])
+# ---- a ocupação só com linhas do reaper (o vigia ainda não rodou): zero leituras, e isso é dito
+jl(os.path.join(city("sor"), ".gc", "hetzner-occupancy.jsonl"), [
+    {"ts": iso(-2 * H), "epoch": NOW - 2 * H, "tipo": "reaper", "fechadas": 0, "falhas": 0},
+    {"ts": iso(-1 * H), "epoch": NOW - 1 * H, "tipo": "reaper", "fechadas": 1, "falhas": 0},
+])
 # ---- o Pilot gravou, mas nenhuma linha dá veredito: o relatório avisa
 jl(os.path.join(city("pv"), ".gc", "wa-node-route.jsonl"), [pr("wa-pv1", -3 * H, "shadow", 124, ""), pr("wa-pv2", -2 * H, "shadow", 2, "usage: ...")])
 # ---- sessões lidas pela metade: a lista pode estar incompleta, então não entra na conta de WA
@@ -237,7 +266,7 @@ os.makedirs(os.path.join(city("dn"), ".gc", "wa-node-route.jsonl"), exist_ok=Tru
 PYEOF
 python3 -I "$T/fx.py" "$FX" "$NOW" || { echo "o gerador de fixtures falhou"; exit 2; }
 # as cidades de fixture moram em $FX
-RT="$FX/rota"; OC="$FX/ocup"; MU="$FX/muitas"; SR="$FX/sr"; LR="$FX/lr"; DR="$FX/dr"; NA="$FX/na"; VZ="$FX/vz"; LX="$FX/lx"; DN="$FX/dn"; SP="$FX/span"; DIA="$FX/dia"; PV="$FX/pv"; OI="$FX/oi"; RL="$FX/real"
+RT="$FX/rota"; OC="$FX/ocup"; MU="$FX/muitas"; SR="$FX/sr"; LR="$FX/lr"; DR="$FX/dr"; NA="$FX/na"; VZ="$FX/vz"; LX="$FX/lx"; DN="$FX/dn"; SP="$FX/span"; DIA="$FX/dia"; PV="$FX/pv"; OI="$FX/oi"; RL="$FX/real"; EV="$FX/ev"; SOR="$FX/sor"; SV="$FX/sv"
 
 # ---- a linha REAL do Pilot: o gancho de verdade (_pilot_wa_node_decide, extraído palavra por palavra do pilot-dispatcher.sh) roda em shadow contra um despachante falso e grava em $RL.
 # O despachante falso devolve o par (rc, saída) que o `check` real devolve (classify_checked); a linha é a que o Pilot grava, não a que este selftest imagina.
@@ -385,13 +414,13 @@ chk_janela_rota() {
   eq "$(jf '.rota.analise.node_para_conferir|map(.bead)|(index("wa-edge-out")), (index("wa-old")), (index("wa-future"))|tostring')" "$(printf 'null\nnull\nnull')" "fora da janela"
 }
 chk_cobertura() {
-  jrun UTC "$RT" --hours 24; eq "$(jf .rota.analise.horas_cobertas)" 19 horas && eq "$(jf .rota.analise.intervalo_h)" 24 intervalo && eq "$(jf .rota.analise.maior_lacuna_h)" 4 lacuna &&
-  trun UTC "$RT" --hours 24 && has "$OUT" "decisão em 19 hora(s) UTC (intervalo de 24,00 h, maior silêncio 4,00 h), 58 linha(s) na janela, 2 sem hora legível"
+  jrun UTC "$RT" --hours 24; eq "$(jf .rota.analise.horas_cobertas)" 15 "horas COM VEREDITO (as 4 horas só de 'não li'/'outro' não contam)" && eq "$(jf .rota.analise.horas_com_decisao)" 19 "horas com linha de decisão de qualquer tipo" && eq "$(jf .rota.analise.intervalo_h)" 24 intervalo && eq "$(jf .rota.analise.maior_lacuna_h)" 6.98 "maior silêncio ENTRE VEREDITOS" &&
+  trun UTC "$RT" --hours 24 && has "$OUT" "veredito em 15 hora(s) UTC (decisão de qualquer tipo em 19; intervalo de 24,00 h, maior silêncio entre vereditos 6,98 h), 58 linha(s) na janela, 2 sem hora legível"
 }
 chk_horas_com_dado() {
   jrun UTC "$SP" --hours 24 --min-hours 24 --min-beads 2; eq "$(jf .rota.analise.horas_cobertas)" 2 "span: duas linhas a 24 h de distância são DUAS horas" && eq "$(jf .rota.analise.intervalo_h)" 24 "span: intervalo" &&
-  eq "$(jf .prontidao.suficiente_para_revisar)" false "span: 24 h de intervalo não são 24 h com dado" && eq "$(jf '.prontidao.falta|join(";")')" "a sombra tem decisão em 2 hora(s) UTC de 24" "span: falta" &&
-  jrun UTC "$DIA" --min-hours 24 --min-beads 25 && eq "$(jf .janela.horas)" 48 "dia: janela padrão" && eq "$(jf .rota.analise.horas_cobertas)" 25 "dia: uma decisão em cada hora" && eq "$(jf .prontidao.suficiente_para_revisar)" true "dia: 25 horas com dado"
+  eq "$(jf .prontidao.suficiente_para_revisar)" false "span: 24 h de intervalo não são 24 h com dado" && eq "$(jf '.prontidao.falta|join(";")')" "a sombra tem veredito em 2 hora(s) UTC de 24" "span: falta" &&
+  jrun UTC "$DIA" --min-hours 24 --min-beads 25 && eq "$(jf .janela.horas)" 48 "dia: janela padrão" && eq "$(jf .rota.analise.horas_cobertas)" 25 "dia: um veredito em cada hora" && eq "$(jf .prontidao.suficiente_para_revisar)" true "dia: 25 horas com dado"
 }
 chk_aviso_pilot_sem_veredito() {
   jrun UTC "$PV" --hours 24; eq "$(jf '.rota.analise.avisos|length')" 1 aviso && eq "$(jf .rota.analise.pilot_linhas)" 2 linhas && eq "$(jf .rota.analise.beads_com_veredito)" 0 sem-veredito &&
@@ -408,30 +437,30 @@ chk_ordem_do_arquivo() { jrun UTC "$RT" --hours 24; eq "$(vf node-sombra)" 4 som
 
 # ============================== PRONTIDÃO ==============================
 chk_prontidao_falta() {
-  jrun UTC "$RT" --hours 24; eq "$(jf .prontidao.suficiente_para_revisar)" false suficiente && eq "$(jf '.prontidao.falta|join(";")')" "a sombra tem decisão em 19 hora(s) UTC de 24;20 bead(s) com veredito de 30" falta &&
-  trun UTC "$RT" --hours 24 && has "$OUT" 'INSUFICIENTE: a sombra tem decisão em 19 hora(s) UTC de 24; 20 bead(s) com veredito de 30. Não ligue o `auto` com isto.'
+  jrun UTC "$RT" --hours 24; eq "$(jf .prontidao.suficiente_para_revisar)" false suficiente && eq "$(jf '.prontidao.falta|join(";")')" "a sombra tem veredito em 15 hora(s) UTC de 24;20 bead(s) com veredito de 30" falta &&
+  trun UTC "$RT" --hours 24 && has "$OUT" 'INSUFICIENTE: a sombra tem veredito em 15 hora(s) UTC de 24; 20 bead(s) com veredito de 30. Não ligue o `auto` com isto.'
 }
 chk_prontidao_beads_na_borda() {
-  jrun UTC "$RT" --hours 24 --min-hours 19 --min-beads 20; eq "$(jf .prontidao.suficiente_para_revisar)" true "20 de 20" && eq "$(jf .prontidao.a_conferir)" 18 a_conferir && eq "$(jf .prontidao.instaveis)" 4 instaveis &&
+  jrun UTC "$RT" --hours 24 --min-hours 15 --min-beads 20; eq "$(jf .prontidao.suficiente_para_revisar)" true "20 de 20" && eq "$(jf .prontidao.a_conferir)" 18 a_conferir && eq "$(jf .prontidao.instaveis)" 4 instaveis &&
   eq "$(jf .prontidao.escrita_nao_confirmada)" 4 escrita_nao_confirmada && eq "$(jf .prontidao.incoerentes)" 2 incoerentes &&
-  trun UTC "$RT" --hours 24 --min-hours 19 --min-beads 20 && has "$OUT" "base suficiente PARA REVISAR: confira as 18 bead(s) da lista acima; 4 mudaram de veredito; 4 com escrita não confirmada; 2 com rc/veredito incoerentes. Quem liga o auto é uma pessoa." &&
-  jrun UTC "$RT" --hours 24 --min-hours 19 --min-beads 21 && eq "$(jf .prontidao.suficiente_para_revisar)" false "20 de 21"
+  trun UTC "$RT" --hours 24 --min-hours 15 --min-beads 20 && has "$OUT" "base suficiente PARA REVISAR: confira as 18 bead(s) da lista acima; 4 mudaram de veredito; 4 com escrita não confirmada; 2 com rc/veredito incoerentes. Quem liga o auto é uma pessoa." &&
+  jrun UTC "$RT" --hours 24 --min-hours 15 --min-beads 21 && eq "$(jf .prontidao.suficiente_para_revisar)" false "20 de 21"
 }
 chk_prontidao_so_veredito() {
   jrun UTC "$RT" --hours 24 --min-hours 0 --min-beads 21; eq "$(jf .rota.analise.beads_distintas)" 31 distintas && eq "$(jf .prontidao.suficiente_para_revisar)" false "31 distintas, mas só 20 com veredito" &&
   eq "$(jf '.prontidao.falta|join(";")')" "20 bead(s) com veredito de 21" falta
 }
 chk_prontidao_horas_na_borda() {
-  jrun UTC "$RT" --hours 24 --min-beads 0 --min-hours 19; eq "$(jf .prontidao.suficiente_para_revisar)" true "19 de 19" &&
-  jrun UTC "$RT" --hours 24 --min-beads 0 --min-hours 20 && eq "$(jf .prontidao.suficiente_para_revisar)" false "19 de 20" && eq "$(jf '.prontidao.falta|join(";")')" "a sombra tem decisão em 19 hora(s) UTC de 20" falta
+  jrun UTC "$RT" --hours 24 --min-beads 0 --min-hours 15; eq "$(jf .prontidao.suficiente_para_revisar)" true "15 de 15" &&
+  jrun UTC "$RT" --hours 24 --min-beads 0 --min-hours 16 && eq "$(jf .prontidao.suficiente_para_revisar)" false "15 de 16" && eq "$(jf '.prontidao.falta|join(";")')" "a sombra tem veredito em 15 hora(s) UTC de 16" falta
 }
 chk_prontidao_inalcancavel() {
   jrun UTC "$RT" --hours 24 --min-beads 0 --min-hours 26; eq "$(jf .prontidao.suficiente_para_revisar)" false "26 h não cabem" &&
   eq "$(jf '.prontidao.falta|join(";")')" "--min-hours 26 não cabe na janela de 24 h (no máximo 25 hora(s) UTC): aumente --hours" "falta 26" &&
-  jrun UTC "$RT" --hours 24 --min-beads 0 --min-hours 25 && eq "$(jf '.prontidao.falta|join(";")')" "a sombra tem decisão em 19 hora(s) UTC de 25" "falta 25 (cabe: é só falta de dado)" &&
+  jrun UTC "$RT" --hours 24 --min-beads 0 --min-hours 25 && eq "$(jf '.prontidao.falta|join(";")')" "a sombra tem veredito em 15 hora(s) UTC de 25" "falta 25 (cabe: é só falta de dado)" &&
   jrun UTC "$DIA" --hours 24 --min-beads 25 --min-hours 25 && eq "$(jf .prontidao.suficiente_para_revisar)" true "25 horas UTC cabem numa janela de 24 h"
 }
-chk_prontidao_nunca_aprova() { trun UTC "$RT" --hours 24 --min-hours 19 --min-beads 1; has "$OUT" "base suficiente PARA REVISAR" && hasnt "$OUT" "aprovad" && hasnt "$OUT" "APROVAD"; }
+chk_prontidao_nunca_aprova() { trun UTC "$RT" --hours 24 --min-hours 15 --min-beads 1; has "$OUT" "base suficiente PARA REVISAR" && hasnt "$OUT" "aprovad" && hasnt "$OUT" "APROVAD"; }
 
 # ============================== OCUPAÇÃO (sempre em TZ=BRT3: a hora do rótulo é UTC mesmo assim) ==============================
 chk_ocup_totais() {
@@ -489,7 +518,7 @@ chk_rc0_basta_um() {
 }
 chk_rota_vazia() {
   jrun UTC "$VZ"; eq "$RC" 0 rc && eq "$(jf .rota.estado)" vazio estado && eq "$(jf .rota.analise.beads_distintas)" 0 beads && eq "$(jf .prontidao.suficiente_para_revisar)" false suficiente &&
-  trun UTC "$VZ" && has "$OUT" "vazio (" && has "$OUT" "nenhuma linha ainda" && has "$OUT" "INSUFICIENTE: a sombra tem decisão em 0 hora(s) UTC de 24; 0 bead(s) com veredito de 30"
+  trun UTC "$VZ" && has "$OUT" "vazio (" && has "$OUT" "nenhuma linha ainda" && has "$OUT" "INSUFICIENTE: a sombra tem veredito em 0 hora(s) UTC de 24; 0 bead(s) com veredito de 30"
 }
 chk_ausente_nao_e_zero() { trun UTC "$NA"; has "$OUT" "AUSENTE" && has "$OUT" "ainda não houve rodada, isto NÃO é zero"; }
 chk_args_rc2() {
@@ -534,12 +563,42 @@ chk_json_uma_linha() {
   done
 }
 
+# ============================== O QUE NÃO É LEITURA, EVENTO DESCONHECIDO, BASE DO NODE ANTERIOR ==============================
+chk_ocup_nao_leitura() {
+  jrun BRT3 "$OC" --hours 24; eq "$(jf '.ocupacao.analise.eventos_que_nao_sao_leitura|to_entries|map("\(.key)=\(.value)")|sort|join(",")')" "?=1,reaper=2" "eventos: só os da janela (o de -25 h fica fora)" &&
+  eq "$(jf .ocupacao.analise.linhas_sem_forma_de_leitura)" 1 "sem tipo, sem cpu e sem sessoes" && eq "$(jf .ocupacao.analise.leituras)" 13 "leituras = SÓ as do vigia" &&
+  eq "$(oh $H09 .leituras)" 4 "09Z: a linha do reaper não é leitura" && eq "$(oh $H10 .leituras)" 3 "10Z" && eq "$(oh $H11 .leituras)" 2 "11Z" &&
+  eq "$(jf .ocupacao.analise.cpu_sem_leitura)" 6 "o reaper não vira CPU não lida" && eq "$(jf .ocupacao.analise.sessoes_nao_lidas)" 6 "nem sessões não lidas" && eq "$(jf .ocupacao.analise.cpu_lidas)" 7 "cpu_lidas" &&
+  trun BRT3 "$OC" --hours 24 && has "$OUT" "7 linha(s) que NÃO são leitura do vigia, FORA das contas acima (?=1, reaper=2, sem cpu nem sessões=1, sem epoch legível=3)"
+}
+chk_ocup_so_reaper() {
+  jrun UTC "$SOR" --hours 24; eq "$RC" 0 rc && eq "$(jf .ocupacao.estado)" ok estado && eq "$(jf .ocupacao.analise.leituras)" 0 "só reaper: zero leituras" && eq "$(jf .ocupacao.analise.cpu_sem_leitura)" 0 "o reaper não vira CPU não lida" &&
+  eq "$(jf .ocupacao.analise.sessoes_nao_lidas)" 0 "nem sessões não lidas" && eq "$(jf '.ocupacao.analise.horas|length')" 0 "nenhuma hora na tabela" && eq "$(jf .ocupacao.analise.pct_medio)" null "média: não li (null), nunca 0" &&
+  trun UTC "$SOR" --hours 24 && has "$OUT" "0 leitura(s) na janela" && has "$OUT" "2 linha(s) que NÃO são leitura do vigia, FORA das contas acima (reaper=2)"
+}
+chk_eventos_desconhecidos() {
+  jrun UTC "$EV" --hours 24; eq "$(jf '.rota.analise.eventos_desconhecidos|to_entries|map("\(.key)=\(.value)")|sort|join(",")')" "?=3,futuro=2" "desconhecidos (event ausente, vazio, não-texto, e um nome novo)" &&
+  eq "$(jf .rota.analise.outras_ilegiveis)" 0 "sem bead e desconhecido: não é 'linha ilegível'" && eq "$(jf .rota.analise.apply_ilegivel)" 0 apply_ilegivel && eq "$(jf .rota.analise.linhas_na_janela)" 6 "as seis entram na janela" &&
+  eq "$(jf .rota.analise.beads_distintas)" 1 "só a wa-ev0 é bead com decisão" && eq "$(jf .rota.analise.decisoes)" 1 decisoes && eq "$(jf .rota.analise.pilot_linhas)" 1 "o Pilot gravou uma" &&
+  trun UTC "$EV" --hours 24 && has "$OUT" "ATENÇÃO — 5 linha(s) de evento que este relatório não conhece, FORA das contas (?=3, futuro=2)" &&
+  jrun UTC "$RT" --hours 24 && eq "$(jf '.rota.analise.eventos_desconhecidos|length')" 0 "o log de verdade só tem evento conhecido"
+}
+chk_horas_so_sem_veredito() {
+  jrun UTC "$SV" --hours 24 --min-hours 2 --min-beads 0; eq "$(jf .rota.analise.horas_com_decisao)" 4 "4 horas com apply" && eq "$(jf .rota.analise.horas_cobertas)" 1 "só 1 hora COM VEREDITO (apply sem veredito não conta)" && eq "$(jf .rota.analise.maior_lacuna_h)" 0 "um veredito só: sem silêncio a medir" &&
+  eq "$(jf .prontidao.suficiente_para_revisar)" false "1 hora com veredito de 2" && eq "$(jf '.prontidao.falta|join(";")')" "a sombra tem veredito em 1 hora(s) UTC de 2" falta &&
+  trun UTC "$SV" --hours 24 && has "$OUT" "veredito em 1 hora(s) UTC (decisão de qualquer tipo em 4;"
+}
+chk_node_anterior() {
+  jrun UTC "$RT" --hours 24; eq "$(cf wa-sn2 .do_node_anterior)" true "sn2: node e depois mini → base e razões são do node ANTERIOR" && eq "$(cf wa-sn1 .do_node_anterior)" false "sn1: o último É node" && eq "$(cf wa-sx1 .do_node_anterior)" false "sx1: na lista só por ser incoerente, nunca foi node: não há node anterior" && eq "$(cf wa-sn2 .base)" label "sn2: a base segue no JSON" &&
+  trun UTC "$RT" --hours 24 && has "$OUT" "wa-sn2  [mini, base label do node anterior]  razões do node anterior: c" && has "$OUT" "wa-sn1  [node, só sombra (shadow/dry-run), base code]  razões: a; b"
+}
+
 # ---- o caso real: cada função tem de passar contra o script de verdade
 check() { SCRIPT="$REAL"; VERBOSE=1; if "chk_$1"; then ok "$1"; else bad "$1"; fi; VERBOSE=0; }
 for c in veredito_final sombra_nao_e_entrega ultimo_por_hora instaveis conferir_lista base razoes razoes_so_rc0 sombra_so_shadow incoerente rc13 hook_real apply_ilegivel linhas_ilegiveis janela_rota \
          cobertura horas_com_dado aviso_pilot_sem_veredito modos soltas_leituras ordem_do_arquivo \
          prontidao_falta prontidao_beads_na_borda prontidao_so_veredito prontidao_horas_na_borda prontidao_inalcancavel prontidao_nunca_aprova \
-         ocup_totais ocup_horas_utc ocup_hora09 ocup_wa_remoto ocup_hora_sem_cpu ocup_texto ocup_ilegiveis ocup_bordas sem_epoch tabela_72 \
+         ocup_totais ocup_horas_utc ocup_hora09 ocup_wa_remoto ocup_hora_sem_cpu ocup_texto ocup_ilegiveis ocup_bordas sem_epoch tabela_72 ocup_nao_leitura ocup_so_reaper eventos_desconhecidos horas_so_sem_veredito node_anterior \
          rc3_nenhum_log rc0_basta_um rota_vazia ausente_nao_e_zero args_rc2 args_validos horas_decimal now_env somente_leitura json_uma_linha; do
   check "$c"
 done
@@ -563,7 +622,7 @@ mut despachada-sem-marca chk_sombra_nao_e_entrega '            if c == "node-des
 mut dryrun-sem-prefixo chk_veredito_final 'if rc == 0 and detail.startswith("dry-run:"):' 'if rc == 0:'
 mut etiqueta-vira-mini chk_veredito_final 'return "node-sem-etiqueta" if detail.startswith("base=") else ("mini" if detail.startswith("classificador:mini") else "outro")' 'return "mini"'
 mut unknown-vira-nao-li chk_veredito_final 'return "nao-sei" if detail.startswith("classificador:unknown") else "nao-li"' 'return "nao-li"'
-mut capacidade-vira-nao-elegivel chk_veredito_final 'return "node-sem-vaga" if re.split(r"[ =:]", detail, 1)[0] in SEM_VAGA else "nao-elegivel"' 'return "nao-elegivel"'
+mut capacidade-vira-nao-elegivel chk_veredito_final 'return "node-sem-vaga" if re.split(r"[ =:]", detail, maxsplit=1)[0] in SEM_VAGA else "nao-elegivel"' 'return "nao-elegivel"'
 mut split-sem-dois-pontos chk_veredito_final 'r"[ =:]"' 'r"[ =]"'
 mut nao-elegivel-vira-sem-vaga chk_veredito_final 'in SEM_VAGA else "nao-elegivel"' 'in SEM_VAGA else "node-sem-vaga"'
 mut rc-bool-vale-int chk_apply_ilegivel 'if not rc_ok or not isinstance(det, str):' 'if not isinstance(rc, int) or not isinstance(det, str):'
@@ -607,8 +666,8 @@ mut pilot-rc124-estrito chk_rc13 '            elif rc == 13 or rc >= 124:' '    
 mut incerta-fora-da-lista chk_rc13 ' or b["incerta"] or b["incoerente"])' ' or b["incoerente"])'
 mut incoerente-fora-da-lista chk_incoerente ' or b["incoerente"])' ')'
 # -- cobertura, linhas ilegíveis e aviso
-mut horas-e-intervalo chk_horas_com_dado 'horas_dado = len({time.strftime("%Y-%m-%dT%H", time.gmtime(t)) for t in dec_ts})' 'horas_dado = int((ev[-1][0] - ev[0][0]) / 3600) if ev else 0'
-mut horas-todas-as-linhas chk_cobertura ' for t in dec_ts})' ' for t, _j, _r in ev})'
+mut horas-e-intervalo chk_horas_com_dado 'horas_dado = len({time.strftime("%Y-%m-%dT%H", time.gmtime(t)) for t in ver_ts})' 'horas_dado = int((ev[-1][0] - ev[0][0]) / 3600) if ev else 0'
+mut horas-todas-as-linhas chk_cobertura ' for t in ver_ts})' ' for t, _j, _r in ev})'
 mut pilot-fora-das-horas chk_cobertura "            pilot_linhas += 1${nl}            dec_ts.append(e)" "            pilot_linhas += 1"
 mut lacuna-min chk_cobertura 'lacuna = max(' 'lacuna = min('
 mut lacuna-em-minutos chk_cobertura 'round(lacuna / 3600.0, 2)' 'round(lacuna / 60.0, 2)'
@@ -619,6 +678,27 @@ mut outras-ilegiveis-calado chk_linhas_ilegiveis "                outras_ilegive
 mut pilot-rc-ilegivel-calado chk_linhas_ilegiveis "                outras_ilegiveis += 1${nl}                continue${nl}            pilot_linhas += 1" "                continue${nl}            pilot_linhas += 1"
 mut release-rc-ilegivel-calado chk_linhas_ilegiveis "                outras_ilegiveis += 1${nl}            elif rc == 0:" "                pass${nl}            elif rc == 0:"
 mut rc-ok-aceita-bool chk_apply_ilegivel 'rc_ok = isinstance(rc, int) and not isinstance(rc, bool)' 'rc_ok = isinstance(rc, int)'
+mut horas-por-decisao chk_cobertura ' for t in ver_ts})' ' for t in dec_ts})'
+mut lacuna-por-decisao chk_cobertura 'zip(ver_ts, ver_ts[1:])' 'zip(dec_ts, dec_ts[1:])'
+mut veredito-apply-fora-das-horas chk_cobertura "            c = cat_of(rc, det)${nl}            if c in VEREDITOS:${nl}                ver_ts.append(e)" "            c = cat_of(rc, det)"
+mut veredito-shadow-fora-das-horas chk_cobertura "                c, inco, base = shadow_cat(rc, out)${nl}                if c in VEREDITOS:${nl}                    ver_ts.append(e)" "                c, inco, base = shadow_cat(rc, out)"
+mut veredito-conta-toda-decisao-apply chk_horas_so_sem_veredito "            if c in VEREDITOS:${nl}                ver_ts.append(e)" "            ver_ts.append(e)"
+mut veredito-conta-toda-decisao-shadow chk_cobertura "                if c in VEREDITOS:${nl}                    ver_ts.append(e)" "                ver_ts.append(e)"
+mut horas-decisao-so-veredito chk_cobertura 'horas_decisao = len({time.strftime("%Y-%m-%dT%H", time.gmtime(t)) for t in dec_ts})' 'horas_decisao = horas_dado'
+mut prontidao-diz-decisao chk_prontidao_falta '"a sombra tem veredito em %d hora(s) UTC de %d"' '"a sombra tem decisão em %d hora(s) UTC de %d"'
+mut texto-cobertura-sem-decisao chk_cobertura '(decisão de qualquer tipo em %d; intervalo' '(intervalo'
+# -- rota, evento que o relatório não conhece
+mut evento-desconhecido-passa chk_eventos_desconhecidos '        if kind not in EVENTOS_ROTA:' '        if False:'
+mut evento-desconhecido-calado chk_eventos_desconhecidos '            desconhecidos[nome] = desconhecidos.get(nome, 0) + 1' '            pass'
+mut evento-desconhecido-segue chk_eventos_desconhecidos "            desconhecidos[nome] = desconhecidos.get(nome, 0) + 1${nl}            continue" "            desconhecidos[nome] = desconhecidos.get(nome, 0) + 1"
+mut evento-sem-nome-vira-chave chk_eventos_desconhecidos 'nome = kind if isinstance(kind, str) and kind else "?"' 'nome = kind'
+mut evento-desconhecido-mudo-no-texto chk_eventos_desconhecidos '        if a["eventos_desconhecidos"]:' '        if False:'
+mut evento-conhecido-faltando chk_eventos_desconhecidos 'EVENTOS_ROTA = ("apply", "release", "read", "classify", "pilot-node-route")' 'EVENTOS_ROTA = ("apply", "release", "read", "classify")'
+# -- rota, base e razões que são do node ANTERIOR
+mut node-anterior-nunca chk_node_anterior '"do_node_anterior": beads[bid]["final"] not in NODE_CATS and any(c in NODE_CATS for c in beads[bid]["cats"]),' '"do_node_anterior": False,'
+mut node-anterior-sempre chk_node_anterior '"do_node_anterior": beads[bid]["final"] not in NODE_CATS and any(c in NODE_CATS for c in beads[bid]["cats"]),' '"do_node_anterior": True,'
+mut node-anterior-sem-ter-sido-node chk_node_anterior ' and any(c in NODE_CATS for c in beads[bid]["cats"]),' ','
+mut node-anterior-mudo-no-texto chk_node_anterior '                ant = " do node anterior" if n["do_node_anterior"] else ""' '                ant = ""'
 # -- prontidão
 mut beads-no-minimo-nao-basta chk_prontidao_beads_na_borda 'if rota["beads_com_veredito"] < min_beads:' 'if rota["beads_com_veredito"] <= min_beads:'
 mut horas-no-minimo-nao-basta chk_prontidao_horas_na_borda 'elif rota["horas_cobertas"] < min_hours:' 'elif rota["horas_cobertas"] <= min_hours:'
@@ -648,6 +728,18 @@ mut tabela-sem-teto chk_tabela_72 'if len(tab) > 72:' 'if len(tab) > 10**6:'
 mut ilegiveis-ignorado chk_ocup_ilegiveis '        lista_inteira = ileg is None or (isinstance(ileg, int) and not isinstance(ileg, bool) and ileg == 0)' '        lista_inteira = True'
 mut ilegiveis-bool-vale-zero chk_ocup_ilegiveis '(isinstance(ileg, int) and not isinstance(ileg, bool) and ileg == 0)' '(isinstance(ileg, int) and ileg == 0)'
 mut sufixo-ilegivel-sempre chk_ocup_texto ' if b["sessoes_com_entrada_ilegivel"] else ""' ' if True else ""'
+# -- ocupação, o que não é leitura do vigia (o reaper grava no mesmo arquivo)
+mut reaper-vira-leitura chk_ocup_nao_leitura '        if "tipo" in r:' '        if False:'
+mut reaper-so-vira-leitura chk_ocup_so_reaper '        if "tipo" in r:' '        if False:'
+mut sem-forma-vira-leitura chk_ocup_nao_leitura '        if "cpu" not in r and "sessoes" not in r:' '        if False:'
+mut sem-forma-so-sem-cpu chk_ocup_nao_leitura '"cpu" not in r and "sessoes" not in r' '"cpu" not in r'
+mut sem-forma-basta-faltar-uma chk_ocup_nao_leitura '"cpu" not in r and "sessoes" not in r' '"cpu" not in r or "sessoes" not in r'
+mut evento-nao-contado chk_ocup_nao_leitura '            eventos[tp] = eventos.get(tp, 0) + 1' '            pass'
+mut sem-forma-nao-contada chk_ocup_nao_leitura '            sem_forma += 1' '            pass'
+mut tipo-sem-nome-vira-chave chk_ocup_nao_leitura 'tp = tp if isinstance(tp, str) and tp else "?"' 'tp = tp'
+mut nao-leitura-mudo-no-texto chk_ocup_nao_leitura '        if fora:' '        if False:'
+mut nao-leitura-sem-epoch-fora-da-soma chk_ocup_nao_leitura ' + b["linhas_sem_forma_de_leitura"] + b["sem_epoch"]' ' + b["linhas_sem_forma_de_leitura"]'
+mut evento-fora-da-janela-conta chk_ocup_nao_leitura "        if not (lo <= ep <= hi):${nl}            continue${nl}        # O arquivo" "        # O arquivo"
 # -- estados e saída
 mut lixo-vira-vazio chk_rc3_nenhum_log '        return "ilegivel", [], bad' '        return "vazio", [], bad'
 mut pasta-vira-ausente chk_rc3_nenhum_log "    except OSError:${nl}        return \"ilegivel\", [], 0" "    except OSError:${nl}        return \"ausente\", [], 0"

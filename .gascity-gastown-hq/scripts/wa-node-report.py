@@ -10,9 +10,9 @@ USO      wa-node-report.py [--hours N] [--city DIR] [--json] [--min-hours H] [--
          --hours N      janela, em horas, até agora (48; inteiro de 1 a 99999, "010" é dez)        --city DIR   a cidade (GC_CITY_PATH, senão /Users/athos/gt/.gascity-gastown-hq)
          --min-hours H  quantas HORAS UTC COM DADO bastam para REVISAR a flip para auto (24)        --min-beads B  quantas beads COM VEREDITO bastam (30)
          --busy-pct P   a partir de quantos % de CPU a leitura conta como "perto de 100%" (90)       --json       o mesmo em JSON
-         (a janela padrão é 48 h porque 24 horas com dado numa janela de 24 h não deixam folga: ela toca 25 horas UTC no máximo, e uma hora sem linha já reprova)
+         (a janela padrão é 48 h porque 24 horas com dado numa janela de 24 h não deixam folga: ela toca 25 horas UTC no máximo, e uma hora sem veredito já reprova)
          exit 0 ok · 2 uso · 3 NENHUM dos dois logs deu para usar (ausente ou ilegível) · 4 relatório não formado
-O QUE DIZ  1. a rota (<cidade>/.gc/wa-node-route.jsonl: o que o despachante e o Pilot gravam): cobertura da sombra (horas COM linha de decisão, não o intervalo entre a primeira e a última),
+O QUE DIZ  1. a rota (<cidade>/.gc/wa-node-route.jsonl: o que o despachante e o Pilot gravam): cobertura da sombra (horas COM VEREDITO — node/mini/não sei —, não o intervalo entre a primeira e a última nem hora só de "não li"),
               o veredito de cada bead (o ÚLTIMO da janela), as que foram ao nó de verdade, as que o classificador mandou ao nó mas não couberam (sem vaga), as que mudaram de veredito,
               que é onde mora o falso "node", e as de ESCRITA NÃO CONFIRMADA (rc 13 do despachante, ou o Pilot que estourou o prazo), que o relatório lista para conferir à mão.
               No modo `shadow` o Pilot só roda o `check` do despachante e NÃO grava `apply`: o veredito vem da linha `pilot-node-route` (rc 0/10/11 + o `verdict` do JSON em `out`);
@@ -20,7 +20,7 @@ O QUE DIZ  1. a rota (<cidade>/.gc/wa-node-route.jsonl: o que o despachante e o 
               e quantas sessões wa-worker-remote estavam vivas;
            3. a prontidão MECÂNICA da sombra: horas e beads suficientes para alguém REVISAR. Não é aprovação: quem liga o `auto` é uma pessoa, depois de conferir uma a uma as beads `node` da lista.
 ESTADOS QUE NÃO SE CONFUNDEM  log ausente ("ainda não houve rodada") ≠ log vazio ≠ log ilegível ≠ zero decisões na janela. Linha que não dá para ler vem CONTADA e avisada, nunca omitida em
-           silêncio. CPU que não foi lida (a 1ª leitura só semeia o baseline; o ssh falhou) NUNCA vira 0%: entra em "sem CPU lida". Sessões não lidas, ou lidas com entrada ilegível
+           silêncio. Linha de outro assunto no mesmo log (o `tipo:"reaper"` que o reaper grava em hetzner-occupancy.jsonl; um `event` que o despachante não conhece) não é leitura nem decisão: fica fora das contas e vem CONTADA. CPU que não foi lida (a 1ª leitura só semeia o baseline; o ssh falhou) NUNCA vira 0%: entra em "sem CPU lida". Sessões não lidas, ou lidas com entrada ilegível
            (`sessoes.ilegiveis`: a lista pode estar incompleta), não viram "0 sessões". Linha do Pilot cujo rc e `verdict` discordam NUNCA vira mini nem node: vai a "outro" e à lista de conferência.
 O QUE NÃO DIZ  que nenhuma bead com dado de lead foi ao nó: o relatório não vê o conteúdo da bead. Lista as que foram (e por quê) para a conferência humana. A garantia de que dado de lead
            não chega ao nó é o espelho git com a varredura de CPF/telefone, não este relatório. Também não diz que o WA RODOU bem no nó: só que a bead foi atribuída lá.
@@ -50,6 +50,8 @@ ROTULOS = {
 }
 # o `check` do despachante devolve um par COERENTE (classify_checked): rc 0 só com verdict node, 10 só com mini, 11 só com unknown
 SHADOW_PAR = {0: ("node", "node-sombra"), 10: ("mini", "mini"), 11: ("unknown", "nao-sei")}
+# os `event` que o despachante e o Pilot gravam em wa-node-route.jsonl; qualquer outro é evento DESCONHECIDO (formato novo?): contado e dito, nunca só somado em "linhas na janela"
+EVENTOS_ROTA = ("apply", "release", "read", "classify", "pilot-node-route")
 
 
 def num(x):
@@ -109,7 +111,7 @@ def cat_of(rc, detail):
     if rc == 11:
         return "nao-sei" if detail.startswith("classificador:unknown") else "nao-li"
     if rc == 12:
-        return "node-sem-vaga" if re.split(r"[ =:]", detail, 1)[0] in SEM_VAGA else "nao-elegivel"
+        return "node-sem-vaga" if re.split(r"[ =:]", detail, maxsplit=1)[0] in SEM_VAGA else "nao-elegivel"
     if rc == 13:
         return "falha-escrita"
     return "outro"
@@ -150,9 +152,15 @@ def analyse_route(rows, lo, hi):
     ev.sort(key=lambda t: (t[0], t[1]))
     beads, modos, decisoes = {}, {}, 0
     apply_ilegivel = outras_ilegiveis = soltas = leitura_falhou = pilot_linhas = 0
-    pilot_last, dec_ts = {}, []
+    pilot_last, dec_ts, ver_ts = {}, [], []
+    desconhecidos = {}
     for e, _i, r in ev:
         bid, kind = r.get("bead"), r.get("event")
+        # vazio → sem `event` também é desconhecido ('?'); falhou/ilegível → `event` que não é um dos 5 conhecidos (ou nem é texto): não vira bead, não vira decisão, mas CONTA aqui e aparece no texto
+        if kind not in EVENTOS_ROTA:
+            nome = kind if isinstance(kind, str) and kind else "?"
+            desconhecidos[nome] = desconhecidos.get(nome, 0) + 1
+            continue
         if not isinstance(bid, str) or not bid:
             # sem bead: um `apply` assim é uma decisão perdida; o resto (read/classify/release/pilot) é linha sem dono. As duas contam, separadas
             if kind == "apply":
@@ -171,6 +179,8 @@ def analyse_route(rows, lo, hi):
             decisoes += 1
             dec_ts.append(e)
             c = cat_of(rc, det)
+            if c in VEREDITOS:
+                ver_ts.append(e)
             b["cats"].append(c)
             b["ultimo_rc"] = rc
             if c == "node-despachada":
@@ -211,6 +221,8 @@ def analyse_route(rows, lo, hi):
                 # shadow: o Pilot só roda o `check` e NÃO grava `apply`; esta linha É a decisão. Em label/auto o veredito é a linha `apply` do despachante (não se conta duas vezes)
                 decisoes += 1
                 c, inco, base = shadow_cat(rc, out)
+                if c in VEREDITOS:
+                    ver_ts.append(e)
                 b["cats"].append(c)
                 b["ultimo_rc"] = rc
                 if inco:
@@ -246,20 +258,23 @@ def analyse_route(rows, lo, hi):
     com_veredito = sum(1 for b in beads.values() if any(c in VEREDITOS for c in b["cats"]))
     # a lista de conferência = todo node da janela + toda bead cujo estado a máquina não soube dizer (escrita incerta, rc e veredito que discordam): listar a mais é o lado seguro
     node_lista = sorted(bid for bid, b in beads.items() if any(c in NODE_CATS for c in b["cats"]) or b["incerta"] or b["incoerente"])
-    horas_dado = len({time.strftime("%Y-%m-%dT%H", time.gmtime(t)) for t in dec_ts})
-    lacuna = max((y - x for x, y in zip(dec_ts, dec_ts[1:])), default=0)
+    # cobertura = horas UTC COM VEREDITO (linha que deu node/mini/não sei); hora só com "não li"/"não elegível"/"falha de escrita" é hora em que a sombra rodou e NÃO disse nada: não conta, e a contagem larga vai à parte
+    horas_dado = len({time.strftime("%Y-%m-%dT%H", time.gmtime(t)) for t in ver_ts})
+    horas_decisao = len({time.strftime("%Y-%m-%dT%H", time.gmtime(t)) for t in dec_ts})
+    lacuna = max((y - x for x, y in zip(ver_ts, ver_ts[1:])), default=0)
     avisos = []
     if pilot_linhas and not com_veredito:
         avisos.append("o Pilot gravou %d linha(s) e NENHUMA deu veredito (rc ou saída fora do formato do `check`?): este relatório não vale até isso ser explicado" % pilot_linhas)
     return {
         "linhas_na_janela": len(ev), "sem_hora": sem_hora, "primeira": ev[0][0] if ev else None, "ultima": ev[-1][0] if ev else None,
-        "horas_cobertas": horas_dado, "intervalo_h": round((ev[-1][0] - ev[0][0]) / 3600.0, 2) if ev else 0.0, "maior_lacuna_h": round(lacuna / 3600.0, 2),
+        "horas_cobertas": horas_dado, "horas_com_decisao": horas_decisao, "eventos_desconhecidos": desconhecidos, "intervalo_h": round((ev[-1][0] - ev[0][0]) / 3600.0, 2) if ev else 0.0, "maior_lacuna_h": round(lacuna / 3600.0, 2),
         "decisoes": decisoes, "beads_distintas": sum(1 for b in beads.values() if b["cats"]), "beads_com_veredito": com_veredito, "modos": modos, "pilot_ultimo": pilot_last,
         "pilot_linhas": pilot_linhas, "veredito_final": final, "fora_do_veredito": outros, "apply_ilegivel": apply_ilegivel, "outras_ilegiveis": outras_ilegiveis,
         "leituras_que_falharam": leitura_falhou, "soltas": soltas, "avisos": avisos,
         "ao_no_de_verdade": sorted(bid for bid, b in beads.items() if b["despachada"]), "instaveis": sorted(instaveis),
         "escrita_nao_confirmada": sorted(bid for bid, b in beads.items() if b["incerta"]), "incoerentes": sorted(bid for bid, b in beads.items() if b["incoerente"]),
-        "node_para_conferir": [{"bead": bid, "ultimo": beads[bid]["final"], "base": beads[bid]["base"], "razoes": beads[bid]["razoes"],
+        # base e razões vêm do ÚLTIMO node da bead; se ela teve node e o veredito final já não é node (node e depois mini), elas são do node ANTERIOR, e `do_node_anterior` diz isso (bead que nunca foi node não tem o que rotular)
+        "node_para_conferir": [{"bead": bid, "ultimo": beads[bid]["final"], "base": beads[bid]["base"], "razoes": beads[bid]["razoes"], "do_node_anterior": beads[bid]["final"] not in NODE_CATS and any(c in NODE_CATS for c in beads[bid]["cats"]),
                                 "escrita_nao_confirmada": beads[bid]["incerta"], "incoerente": beads[bid]["incoerente"]} for bid in node_lista],
     }
 
@@ -269,12 +284,24 @@ def analyse_occ(rows, lo, hi, busy_pct):
     cpu_ok = cpu_sem = sess_lida = sess_nao = sess_ileg = wa_leituras = 0
     soma_pct = 0.0
     perto = 0
+    eventos, sem_forma = {}, 0
     for r in rows:
         ep = num(r.get("epoch"))
         if ep is None:
             sem_epoch += 1
             continue
         if not (lo <= ep <= hi):
+            continue
+        # O arquivo é compartilhado: o reaper grava nele {"ts","epoch","tipo":"reaper",…} (hetzner-idle-session-reaper.py), sem cpu nem sessoes. Isso NÃO é uma rodada do vigia.
+        # Toda rodada do vigia traz as chaves `cpu` e `sessoes` (hetzner-occupancy-watch.py, o `rd`), mesmo quando a leitura falhou (cpu.lido=false): vazio → a chave existe e o conteúdo não presta = leitura que falhou, e
+        # conta abaixo como "SEM CPU lida"/"sem sessões lidas"; falhou/ilegível → linha com `tipo`, ou sem cpu NEM sessoes, não é leitura: fica fora de leituras/hora/sem-CPU, mas é CONTADA à parte e dita no texto (nunca em silêncio, nunca como CPU não lida).
+        if "tipo" in r:
+            tp = r.get("tipo")
+            tp = tp if isinstance(tp, str) and tp else "?"
+            eventos[tp] = eventos.get(tp, 0) + 1
+            continue
+        if "cpu" not in r and "sessoes" not in r:
+            sem_forma += 1
             continue
         total += 1
         key = time.strftime("%Y-%m-%dT%H:00Z", time.gmtime(ep))
@@ -326,7 +353,7 @@ def analyse_occ(rows, lo, hi, busy_pct):
             "wa_medio": round(h["soma_wa"] / h["sess_lidas"], 2) if h["sess_lidas"] else None,
         })
     return {
-        "leituras": total, "sem_epoch": sem_epoch, "cpu_lidas": cpu_ok, "cpu_sem_leitura": cpu_sem,
+        "leituras": total, "sem_epoch": sem_epoch, "eventos_que_nao_sao_leitura": eventos, "linhas_sem_forma_de_leitura": sem_forma, "cpu_lidas": cpu_ok, "cpu_sem_leitura": cpu_sem,
         "pct_medio": round(soma_pct / cpu_ok, 1) if cpu_ok else None, "perto_de_100": perto, "busy_pct": busy_pct,
         "perto_de_100_pct": round(100.0 * perto / cpu_ok, 1) if cpu_ok else None,
         "sessoes_lidas": sess_lida, "sessoes_nao_lidas": sess_nao, "sessoes_com_entrada_ilegivel": sess_ileg, "leituras_com_wa_no_no": wa_leituras, "horas": tabela,
@@ -334,13 +361,13 @@ def analyse_occ(rows, lo, hi, busy_pct):
 
 
 def prontidao(rota, min_hours, min_beads, hours):
-    """horas = horas UTC COM linha de decisão (não o intervalo primeira→última); beads = só as que chegaram a um VEREDITO (não elegível/não li/falha de escrita não contam)"""
+    """horas = horas UTC COM VEREDITO (não o intervalo primeira→última, nem hora só de "não li"/"não elegível"); beads = só as que chegaram a um VEREDITO (não elegível/não li/falha de escrita não contam)"""
     falta = []
     if min_hours > hours + 1:
         # uma janela de `hours` h toca no máximo hours+1 horas UTC: pedir mais é pedir o impossível, e isso não pode parecer "ainda não deu tempo"
         falta.append("--min-hours %d não cabe na janela de %d h (no máximo %d hora(s) UTC): aumente --hours" % (min_hours, hours, hours + 1))
     elif rota["horas_cobertas"] < min_hours:
-        falta.append("a sombra tem decisão em %d hora(s) UTC de %d" % (rota["horas_cobertas"], min_hours))
+        falta.append("a sombra tem veredito em %d hora(s) UTC de %d" % (rota["horas_cobertas"], min_hours))
     if rota["beads_com_veredito"] < min_beads:
         falta.append("%d bead(s) com veredito de %d" % (rota["beads_com_veredito"], min_beads))
     return {"suficiente_para_revisar": not falta, "falta": falta, "a_conferir": len(rota["node_para_conferir"]), "instaveis": len(rota["instaveis"]),
@@ -376,11 +403,13 @@ def render(res):
         L.append("  " + aviso)
     if r["estado"] in ("ok",):
         a = r["analise"]
-        L.append("  cobertura: %s → %s; decisão em %d hora(s) UTC (intervalo de %s h, maior silêncio %s h), %d linha(s) na janela, %d sem hora legível" % (iso(a["primeira"]), iso(a["ultima"]), a["horas_cobertas"], fnum(a["intervalo_h"], 2), fnum(a["maior_lacuna_h"], 2), a["linhas_na_janela"], a["sem_hora"]))
+        L.append("  cobertura: %s → %s; veredito em %d hora(s) UTC (decisão de qualquer tipo em %d; intervalo de %s h, maior silêncio entre vereditos %s h), %d linha(s) na janela, %d sem hora legível" % (iso(a["primeira"]), iso(a["ultima"]), a["horas_cobertas"], a["horas_com_decisao"], fnum(a["intervalo_h"], 2), fnum(a["maior_lacuna_h"], 2), a["linhas_na_janela"], a["sem_hora"]))
         pl = a["pilot_ultimo"]
         L.append("  modos do Pilot vistos: %s; última linha do Pilot: %s" % (", ".join("%s=%d" % kv for kv in sorted(a["modos"].items())) or "nenhum", ("%s, modo %s, rc %s" % (iso(pl["ts"]), pl["mode"], pl["rc"])) if pl else "—"))
         for av in a["avisos"]:
             L.append("  ATENÇÃO — " + av)
+        if a["eventos_desconhecidos"]:
+            L.append("  ATENÇÃO — %d linha(s) de evento que este relatório não conhece, FORA das contas (%s): o formato do log mudou?" % (sum(a["eventos_desconhecidos"].values()), ", ".join("%s=%d" % kv for kv in sorted(a["eventos_desconhecidos"].items()))))
         L.append("  %d decisão(ões) do despachante sobre %d bead(s) distinta(s); veredito = o ÚLTIMO da bead na janela:" % (a["decisoes"], a["beads_distintas"]))
         for c in VEREDITOS:
             L.append("    %-52s %d" % (ROTULOS[c], a["veredito_final"][c]))
@@ -399,7 +428,8 @@ def render(res):
             L.append("  PARA CONFERIR UMA A UMA (todo veredito node da janela, mais as de escrita não confirmada e as incoerentes; nenhuma pode tocar dado de lead):")
             for n in a["node_para_conferir"][:40]:
                 marca = (" ESCRITA NÃO CONFIRMADA" if n["escrita_nao_confirmada"] else "") + (" INCOERENTE" if n["incoerente"] else "")
-                L.append("    %s  [%s%s]%s  %s" % (n["bead"], ROTULOS.get(n["ultimo"], n["ultimo"] or "—"), (", base " + n["base"]) if n["base"] else "", marca, ("razões: " + "; ".join(n["razoes"])) if n["razoes"] else "razões: —"))
+                ant = " do node anterior" if n["do_node_anterior"] else ""
+                L.append("    %s  [%s%s]%s  %s" % (n["bead"], ROTULOS.get(n["ultimo"], n["ultimo"] or "—"), (", base " + n["base"] + ant) if n["base"] else "", marca, ("razões" + ant + ": " + "; ".join(n["razoes"])) if n["razoes"] else "razões: —"))
             if len(a["node_para_conferir"]) > 40:
                 L.append("    … mais %d (use --json)" % (len(a["node_para_conferir"]) - 40))
     L.append("")
@@ -411,6 +441,15 @@ def render(res):
     if o["estado"] == "ok":
         b = o["analise"]
         L.append("  %d leitura(s) na janela (esperadas ~%d, uma a cada 15 min); CPU lida em %d, SEM CPU lida em %d (a 1ª leitura só semeia o baseline; não entram na média)" % (b["leituras"], res["janela"]["horas"] * 4, b["cpu_lidas"], b["cpu_sem_leitura"]))
+        # vazio → nenhuma linha estranha, nada a dizer; N>0 → linhas que NÃO são leitura do vigia (o reaper grava no mesmo arquivo) ou sem `epoch`: ficaram fora das contas acima, e aqui está quantas
+        fora = sum(b["eventos_que_nao_sao_leitura"].values()) + b["linhas_sem_forma_de_leitura"] + b["sem_epoch"]
+        if fora:
+            partes = ["%s=%d" % kv for kv in sorted(b["eventos_que_nao_sao_leitura"].items())]
+            if b["linhas_sem_forma_de_leitura"]:
+                partes.append("sem cpu nem sessões=%d" % b["linhas_sem_forma_de_leitura"])
+            if b["sem_epoch"]:
+                partes.append("sem epoch legível=%d" % b["sem_epoch"])
+            L.append("  %d linha(s) que NÃO são leitura do vigia, FORA das contas acima (%s)" % (fora, ", ".join(partes)))
         L.append("  META (Athos 20/10): nó em ~100%%. Média da janela: %s%%; leituras com CPU >= %d%%: %d de %d (%s%%)" % (fnum(b["pct_medio"]), b["busy_pct"], b["perto_de_100"], b["cpu_lidas"], fnum(b["perto_de_100_pct"])))
         # vazio → nada a avisar (nenhuma leitura de sessões veio pela metade); N>0 → a lista daquelas leituras pode ter perdido um WA e elas ficam fora da conta
         sufixo = (", %d delas com entrada ilegível: a lista pode estar incompleta e não entra na conta" % b["sessoes_com_entrada_ilegivel"]) if b["sessoes_com_entrada_ilegivel"] else ""
