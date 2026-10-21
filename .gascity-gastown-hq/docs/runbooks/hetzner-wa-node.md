@@ -135,20 +135,26 @@ Pré-condição: o flip da ga-2hd02v.1.6 provado (o `dog-remote` entregando de v
 A meta do Athos (20/10) é o nó a ~100% de CPU o tempo todo; a pergunta de cada manhã é **quantas beads de WA rodaram no nó e quanta CPU o nó teve por hora**. O relatório responde só lendo (não escreve nada, não chama `bd`, `gc` nem rede):
 
 ```
-python3 scripts/wa-node-report.py                 # últimas 24 h, texto
+python3 scripts/wa-node-report.py                 # últimas 48 h, texto
 python3 scripts/wa-node-report.py --json          # uma linha de JSON (chaves: janela, ocupacao, prontidao, rota)
 python3 scripts/wa-node-report.py --hours 72 --min-beads 30 --busy-pct 90
 ```
 
+O padrão é **48 h** porque exigir 24 horas UTC *com dado* de uma janela de 24 h não deixa folga: ela toca no máximo 25 horas UTC, então uma única hora sem linha de decisão já reprova o `--min-hours 24` padrão. Com `--hours 24` isso fica no limite; um `--min-hours` maior que `--hours + 1` o relatório recusa com a frase "não cabe na janela" em vez de dizer "ainda não deu tempo".
+
 Lê `$GC_CITY/.gc/wa-node-route.jsonl` (rota) e `$GC_CITY/.gc/hetzner-occupancy.jsonl` (CPU a cada 15 min, `hetzner-occupancy-watch.py`). Três seções:
 
-1. **Rota e sombra.** O veredito de cada bead é o **último** na janela (pela hora, não pela ordem do arquivo). `dry-run` (sombra) nunca conta como entrega ao nó; só `despachada para …` conta. Lista **para conferir uma a uma** toda bead que teve `node` em algum momento, com a base e as razões, e destaca as que **mudaram de veredito** (node numa linha, mini ou "não sei" em outra): é onde mora o risco de falso `node`.
-2. **CPU do nó por hora UTC.** CPU **não lida** (`lido=false`, ausente, fora de 0..100) aparece como `—` e nunca vira 0%; um 0% de verdade aparece como `0,0`. Mostra também quantas leituras tinham sessão `wa-worker-remote` viva.
-3. **Prontidão da sombra.** Mecânica, não aprovação: pede cobertura mínima em horas (`--min-hours`, padrão 24) e em beads distintas (`--min-beads`, padrão 30). Mesmo "suficiente" só diz "dá para REVISAR"; **quem liga o `auto` é uma pessoa**, depois de ler a lista da seção 1.
+1. **Rota e sombra.** O veredito de cada bead é o **último** na janela (pela hora, não pela ordem do arquivo). `dry-run` (sombra) nunca conta como entrega ao nó; só `despachada para …` conta.
+   * **Modo `shadow` (o que o Pilot grava hoje).** O Pilot só roda o `check` do despachante e **não** grava `apply`: a linha `pilot-node-route` (`{ts,event,bead,mode,rc,out}`) é a **única** da decisão, e o relatório a lê como tal. Só o par coerente dá veredito: rc 0 + `verdict` node, rc 10 + mini, rc 11 + unknown. rc 11 sem saída é a bead que o despachante **não leu** ("não li", não "não sei"); prazo ou sinal (124, 137…) também é "não li"; rc e veredito que **discordam** (ou saída que não é o JSON do classificador) vão a "outro" + `INCOERENTE`, nunca viram mini nem node, e entram na lista de conferência.
+   * **Escrita não confirmada.** `apply` com rc 13 (menos `conferencia-falhou-desfeito`, que releu e provou que nada nosso sobrou), `release` com rc 13 e linha do Pilot em `label`/`auto` com rc 13 ou 124+ deixam a bead em "ESCRITA NÃO CONFIRMADA" — confira à mão — até um despacho ou uma soltura confirmada limpar.
+   * Lista **para conferir uma a uma** toda bead que teve `node` em algum momento (mais as de escrita não confirmada e as incoerentes), com a base e as razões, e destaca as que **mudaram de veredito** (node numa linha, mini ou "não sei" em outra): é onde mora o risco de falso `node`.
+   * **Cobertura** = horas UTC **com** linha de decisão (duas linhas a 24 h de distância são **duas** horas), com o intervalo e o maior silêncio ao lado. Se o Pilot gravou linhas e **nenhuma** deu veredito, o relatório avisa: ele não vale até isso ser explicado.
+2. **CPU do nó por hora UTC.** CPU **não lida** (`lido=false`, ausente, fora de 0..100) aparece como `—` e nunca vira 0%; um 0% de verdade aparece como `0,0`. Mostra também quantas leituras tinham sessão `wa-worker-remote` viva. Uma leitura de sessões **lida pela metade** (`sessoes.ilegiveis` diferente de 0 ou fora do formato: a lista pode ter perdido um WA) não entra nessa conta; o relatório diz quantas foram.
+3. **Prontidão da sombra.** Mecânica, não aprovação: pede cobertura mínima em **horas UTC com decisão** (`--min-hours`, padrão 24) e em **beads com veredito** (`--min-beads`, padrão 30; "não elegível", "não li" e escrita que falhou não contam). Mesmo "suficiente" só diz "dá para REVISAR"; **quem liga o `auto` é uma pessoa**, depois de ler a lista da seção 1.
 
 Saída: **0** relatório feito · **2** uso errado · **3** nenhum dos dois logs (rota e ocupação) deu para usar (a saída sai mesmo assim, com `ausente`/`ilegivel` em cada um, nunca como zero) · **4** o relatório não se formou. Log **ausente** quer dizer "ainda não houve rodada", não "zero"; **ilegível** não vira vazio.
 
-Ler só a CPU não basta para saber se o WA está no nó: o `hetzner-capacity.py` já trata a sessão de WA como sempre-ocupada, então o oráculo não mudou (ver `hetzner-capacity.md`). O selftest do relatório (`scripts/wa-node-report.selftest.sh`) tem 103 itens e 65 mutantes; rodou no nó Linux em 20/10.
+Ler só a CPU não basta para saber se o WA está no nó: o `hetzner-capacity.py` já trata a sessão de WA como sempre-ocupada, então o oráculo não mudou (ver `hetzner-capacity.md`). O selftest do relatório (`scripts/wa-node-report.selftest.sh`) tem 150 itens (47 casos e 103 mutantes) e rodou inteiro no nó Linux em 20/10 (150/150). Ele roda o gancho de verdade do Pilot (`_pilot_wa_node_decide`, extraído do `pilot-dispatcher.sh`) em `shadow` contra um despachante falso e lê a linha que o gancho grava, para o relatório não ser testado só com linhas inventadas.
 
 ## O que não foi provado
 

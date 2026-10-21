@@ -7,19 +7,25 @@ Contents
 PARA QUÊ (Athos 20/10: "o que não pode é ficar menos do que 100% ocupado"): responder em um comando as duas perguntas que decidem os próximos passos da ga-2hd02v.3 —
   (1) quantas beads de WhatsApp o Pilot mandou ao nó, e a sombra já tem base para ligar `PILOT_WA_NODE_ROUTE=auto`? (2) quanto da CPU do nó foi usada, hora a hora?
 USO      wa-node-report.py [--hours N] [--city DIR] [--json] [--min-hours H] [--min-beads B] [--busy-pct P]
-         --hours N      janela, em horas, até agora (24; inteiro de 1 a 99999, "010" é dez)        --city DIR   a cidade (GC_CITY_PATH, senão /Users/athos/gt/.gascity-gastown-hq)
-         --min-hours H  quantas horas de sombra bastam para REVISAR a flip para auto (24)           --min-beads B  quantas beads distintas bastam (30)
+         --hours N      janela, em horas, até agora (48; inteiro de 1 a 99999, "010" é dez)        --city DIR   a cidade (GC_CITY_PATH, senão /Users/athos/gt/.gascity-gastown-hq)
+         --min-hours H  quantas HORAS UTC COM DADO bastam para REVISAR a flip para auto (24)        --min-beads B  quantas beads COM VEREDITO bastam (30)
          --busy-pct P   a partir de quantos % de CPU a leitura conta como "perto de 100%" (90)       --json       o mesmo em JSON
+         (a janela padrão é 48 h porque 24 horas com dado numa janela de 24 h não deixam folga: ela toca 25 horas UTC no máximo, e uma hora sem linha já reprova)
          exit 0 ok · 2 uso · 3 NENHUM dos dois logs deu para usar (ausente ou ilegível) · 4 relatório não formado
-O QUE DIZ  1. a rota (<cidade>/.gc/wa-node-route.jsonl: o que o despachante e o Pilot gravam): cobertura da sombra, o veredito de cada bead (o ÚLTIMO da janela), as que foram ao nó
-              de verdade, as que o classificador mandou ao nó mas não couberam (sem vaga) e as que mudaram de veredito, que é onde mora o falso "node";
+O QUE DIZ  1. a rota (<cidade>/.gc/wa-node-route.jsonl: o que o despachante e o Pilot gravam): cobertura da sombra (horas COM linha de decisão, não o intervalo entre a primeira e a última),
+              o veredito de cada bead (o ÚLTIMO da janela), as que foram ao nó de verdade, as que o classificador mandou ao nó mas não couberam (sem vaga), as que mudaram de veredito,
+              que é onde mora o falso "node", e as de ESCRITA NÃO CONFIRMADA (rc 13 do despachante, ou o Pilot que estourou o prazo), que o relatório lista para conferir à mão.
+              No modo `shadow` o Pilot só roda o `check` do despachante e NÃO grava `apply`: o veredito vem da linha `pilot-node-route` (rc 0/10/11 + o `verdict` do JSON em `out`);
            2. a CPU do nó por hora, em UTC (<cidade>/.gc/hetzner-occupancy.jsonl: uma leitura a cada 15 min do hetzner-occupancy-watch), a média, quantas leituras ficaram perto de 100%
               e quantas sessões wa-worker-remote estavam vivas;
            3. a prontidão MECÂNICA da sombra: horas e beads suficientes para alguém REVISAR. Não é aprovação: quem liga o `auto` é uma pessoa, depois de conferir uma a uma as beads `node` da lista.
 ESTADOS QUE NÃO SE CONFUNDEM  log ausente ("ainda não houve rodada") ≠ log vazio ≠ log ilegível ≠ zero decisões na janela. Linha que não dá para ler vem CONTADA e avisada, nunca omitida em
-           silêncio. CPU que não foi lida (a 1ª leitura só semeia o baseline; o ssh falhou) NUNCA vira 0%: entra em "sem CPU lida". Sessões não lidas não viram "0 sessões".
+           silêncio. CPU que não foi lida (a 1ª leitura só semeia o baseline; o ssh falhou) NUNCA vira 0%: entra em "sem CPU lida". Sessões não lidas, ou lidas com entrada ilegível
+           (`sessoes.ilegiveis`: a lista pode estar incompleta), não viram "0 sessões". Linha do Pilot cujo rc e `verdict` discordam NUNCA vira mini nem node: vai a "outro" e à lista de conferência.
 O QUE NÃO DIZ  que nenhuma bead com dado de lead foi ao nó: o relatório não vê o conteúdo da bead. Lista as que foram (e por quê) para a conferência humana. A garantia de que dado de lead
            não chega ao nó é o espelho git com a varredura de CPF/telefone, não este relatório. Também não diz que o WA RODOU bem no nó: só que a bead foi atribuída lá.
+           A CPU de cada hora é a média das leituras cujo `epoch` cai nela (uma leitura vale uma, qualquer que seja a janela de medida `janela_s` dela) e a leitura de uma hora
+           vai para a hora UTC do seu `epoch`, não da janela que ela mediu: a fronteira da hora é aproximada em até 15 min.
 """
 import argparse
 import calendar
@@ -38,15 +44,12 @@ NODE_CATS = ("node-despachada", "node-sombra", "node-sem-vaga", "node-sem-etique
 # rc 12 do despachante que é "o nó está cheio" (o classificador disse node); os outros rc 12 (bead não livre, corrida perdida) não são capacidade
 SEM_VAGA = ("slot-ocupado", "slot-sem-alias-livre", "sessao-viva", "oraculo-local", "oraculo-sem-vaga")
 ROTULOS = {
-    "node-despachada": "node, atribuída ao nó", "node-sombra": "node, só sombra (dry-run)", "node-sem-vaga": "node, mas sem vaga no nó",
+    "node-despachada": "node, atribuída ao nó", "node-sombra": "node, só sombra (shadow/dry-run)", "node-sem-vaga": "node, mas sem vaga no nó",
     "node-sem-etiqueta": "node pelo classificador, sem a etiqueta node:ok", "mini": "mini", "nao-sei": "não sei (o classificador recusa)",
+    "nao-elegivel": "não elegível", "nao-li": "não li", "falha-escrita": "escrita falhou (rc 13)", "outro": "outro (rc ou saída fora do formato)",
 }
-
-
-def is_rc(r, n):
-    """o rc da linha é o inteiro n (bool não é inteiro aqui: False == 0 em Python)"""
-    v = r.get("rc")
-    return isinstance(v, int) and not isinstance(v, bool) and v == n
+# o `check` do despachante devolve um par COERENTE (classify_checked): rc 0 só com verdict node, 10 só com mini, 11 só com unknown
+SHADOW_PAR = {0: ("node", "node-sombra"), 10: ("mini", "mini"), 11: ("unknown", "nao-sei")}
 
 
 def num(x):
@@ -95,13 +98,14 @@ def route_epoch(r):
 
 
 def cat_of(rc, detail):
-    """o rc e o detalhe que o wa-node-dispatch.sh grava num `apply` → a categoria"""
+    """o rc e o detalhe que o wa-node-dispatch.sh grava num `apply` → a categoria. Detalhe que não é um dos conhecidos NÃO vira um veredito vizinho: vai a 'outro'"""
     if rc == 0 and detail.startswith("dry-run:"):
         return "node-sombra"
     if rc == 0 and detail.startswith("despachada"):
         return "node-despachada"
     if rc == 10:
-        return "node-sem-etiqueta" if detail.startswith("base=") else "mini"
+        # base=… é o node sem a etiqueta; "classificador:mini …" é o mini; o resto (texto novo, vazio) não é nem um nem outro
+        return "node-sem-etiqueta" if detail.startswith("base=") else ("mini" if detail.startswith("classificador:mini") else "outro")
     if rc == 11:
         return "nao-sei" if detail.startswith("classificador:unknown") else "nao-li"
     if rc == 12:
@@ -109,6 +113,30 @@ def cat_of(rc, detail):
     if rc == 13:
         return "falha-escrita"
     return "outro"
+
+
+def shadow_cat(rc, out):
+    """(categoria, incoerente, base) de uma linha `pilot-node-route` do modo shadow: o rc do `check` e o `verdict` do JSON em `out`.
+    Só o par coerente (0+node, 10+mini, 11+unknown) dá veredito. vazio → rc 11 sem saída é a bead que o despachante não leu ('nao-li', não 'não sei');
+    falhou/ilegível → rc fora de 0/10/11 (prazo, sinal) é 'nao-li'; rc e veredito que discordam, ou saída que não é o JSON do classificador, é 'outro' + incoerente: nunca vira mini nem node."""
+    v, base = None, None
+    if isinstance(out, str) and out.strip():
+        try:
+            o = json.loads(out)
+        except ValueError:
+            o = None
+        if isinstance(o, dict):
+            v = o.get("verdict") if isinstance(o.get("verdict"), str) else None
+            bs = o.get("basis")
+            base = bs if isinstance(bs, str) and re.fullmatch(r"[A-Za-z0-9_-]+", bs) else None
+    if rc not in SHADOW_PAR:
+        return "nao-li", False, None
+    esperado, cat = SHADOW_PAR[rc]
+    if v == esperado:
+        return cat, False, base if cat == "node-sombra" else None
+    if rc == 11 and not (isinstance(out, str) and out.strip()):
+        return "nao-li", False, None
+    return "outro", True, None
 
 
 def analyse_route(rows, lo, hi):
@@ -120,25 +148,37 @@ def analyse_route(rows, lo, hi):
         elif lo <= e <= hi:
             ev.append((e, i, r))
     ev.sort(key=lambda t: (t[0], t[1]))
-    beads, modos, decisoes, apply_ilegivel = {}, {}, 0, 0
-    soltas, leitura_falhou, pilot_last = 0, 0, {}
+    beads, modos, decisoes = {}, {}, 0
+    apply_ilegivel = outras_ilegiveis = soltas = leitura_falhou = pilot_linhas = 0
+    pilot_last, dec_ts = {}, []
     for e, _i, r in ev:
         bid, kind = r.get("bead"), r.get("event")
         if not isinstance(bid, str) or not bid:
-            apply_ilegivel += 1
+            # sem bead: um `apply` assim é uma decisão perdida; o resto (read/classify/release/pilot) é linha sem dono. As duas contam, separadas
+            if kind == "apply":
+                apply_ilegivel += 1
+            else:
+                outras_ilegiveis += 1
             continue
-        b = beads.setdefault(bid, {"cats": [], "razoes": None, "base": None, "despachada": False, "ultimo_rc": None})
+        b = beads.setdefault(bid, {"cats": [], "razoes": None, "base": None, "despachada": False, "ultimo_rc": None, "incerta": False, "incoerente": False})
+        rc = r.get("rc")
+        rc_ok = isinstance(rc, int) and not isinstance(rc, bool)
         if kind == "apply":
-            rc, det = r.get("rc"), r.get("detail")
-            if isinstance(rc, bool) or not isinstance(rc, int) or not isinstance(det, str):
+            det = r.get("detail")
+            if not rc_ok or not isinstance(det, str):
                 apply_ilegivel += 1
                 continue
             decisoes += 1
+            dec_ts.append(e)
             c = cat_of(rc, det)
             b["cats"].append(c)
             b["ultimo_rc"] = rc
             if c == "node-despachada":
                 b["despachada"] = True
+                b["incerta"] = False
+            # rc 13 = o estado da escrita é incerto (prazo, bd fora, releitura que falhou): só "conferencia-falhou-desfeito" releu e provou que nada nosso sobrou
+            if rc == 13 and not det.startswith("conferencia-falhou-desfeito"):
+                b["incerta"] = True
             m = None
             if c in ("node-sombra", "node-despachada"):
                 m = re.match(r"(?:dry-run: iria para|despachada para) \S+ \(([A-Za-z0-9_-]+)\)", det)
@@ -146,17 +186,42 @@ def analyse_route(rows, lo, hi):
                 m = re.match(r"base=([A-Za-z0-9_-]+)", det)
             if m:
                 b["base"] = m.group(1)
-        elif kind == "release" and is_rc(r, 0):
-            soltas += 1
+        elif kind == "release":
+            # 0 = solta (releu e conferiu); 12 = não era do nó (nada escrito); 13 = a soltura pode ou não ter pegado: a bead segue na lista de conferência até uma soltura/despacho confirmar
+            if not rc_ok:
+                outras_ilegiveis += 1
+            elif rc == 0:
+                soltas += 1
+                b["incerta"] = False
+            elif rc == 13:
+                b["incerta"] = True
         elif kind in ("read", "classify"):
             leitura_falhou += 1
         elif kind == "pilot-node-route":
             mo = r.get("mode") if isinstance(r.get("mode"), str) else "?"
             modos[mo] = modos.get(mo, 0) + 1
-            pilot_last = {"spawn": r.get("spawn"), "slots": r.get("slots"), "mode": mo}
+            if not rc_ok:
+                outras_ilegiveis += 1
+                continue
+            pilot_linhas += 1
+            dec_ts.append(e)
+            pilot_last = {"ts": e, "mode": mo, "rc": rc}
             out = r.get("out")
+            if mo == "shadow":
+                # shadow: o Pilot só roda o `check` e NÃO grava `apply`; esta linha É a decisão. Em label/auto o veredito é a linha `apply` do despachante (não se conta duas vezes)
+                decisoes += 1
+                c, inco, base = shadow_cat(rc, out)
+                b["cats"].append(c)
+                b["ultimo_rc"] = rc
+                if inco:
+                    b["incoerente"] = True
+                if base:
+                    b["base"] = base
+            elif rc == 13 or rc >= 124:
+                # label/auto: o `apply` morto por prazo/sinal (124, 137, 143, 128+n) não deixa linha própria, e a escrita pode ter pegado (o Pilot segura a bead por isso)
+                b["incerta"] = True
             # vazio ('') → sem razões; texto que não é JSON ou sem `reasons` em lista → sem razões (a conferência humana lê a bead): nunca inventa
-            if is_rc(r, 0) and isinstance(out, str) and out.strip():
+            if rc == 0 and isinstance(out, str) and out.strip():
                 try:
                     o = json.loads(out)
                     rs = o.get("reasons") if isinstance(o, dict) else None
@@ -178,20 +243,30 @@ def analyse_route(rows, lo, hi):
             outros[b["final"]] = outros.get(b["final"], 0) + 1
         else:
             b["final"] = None
-    node_lista = sorted(bid for bid, b in beads.items() if any(c in NODE_CATS for c in b["cats"]))
-    horas = round((ev[-1][0] - ev[0][0]) / 3600.0, 2) if ev else 0.0
+    com_veredito = sum(1 for b in beads.values() if any(c in VEREDITOS for c in b["cats"]))
+    # a lista de conferência = todo node da janela + toda bead cujo estado a máquina não soube dizer (escrita incerta, rc e veredito que discordam): listar a mais é o lado seguro
+    node_lista = sorted(bid for bid, b in beads.items() if any(c in NODE_CATS for c in b["cats"]) or b["incerta"] or b["incoerente"])
+    horas_dado = len({time.strftime("%Y-%m-%dT%H", time.gmtime(t)) for t in dec_ts})
+    lacuna = max((y - x for x, y in zip(dec_ts, dec_ts[1:])), default=0)
+    avisos = []
+    if pilot_linhas and not com_veredito:
+        avisos.append("o Pilot gravou %d linha(s) e NENHUMA deu veredito (rc ou saída fora do formato do `check`?): este relatório não vale até isso ser explicado" % pilot_linhas)
     return {
-        "linhas_na_janela": len(ev), "sem_hora": sem_hora, "primeira": ev[0][0] if ev else None, "ultima": ev[-1][0] if ev else None, "horas_cobertas": horas,
-        "decisoes": decisoes, "beads_distintas": sum(1 for b in beads.values() if b["cats"]), "modos": modos, "pilot_ultimo": pilot_last,
-        "veredito_final": final, "fora_do_veredito": outros, "apply_ilegivel": apply_ilegivel, "leituras_que_falharam": leitura_falhou, "soltas": soltas,
+        "linhas_na_janela": len(ev), "sem_hora": sem_hora, "primeira": ev[0][0] if ev else None, "ultima": ev[-1][0] if ev else None,
+        "horas_cobertas": horas_dado, "intervalo_h": round((ev[-1][0] - ev[0][0]) / 3600.0, 2) if ev else 0.0, "maior_lacuna_h": round(lacuna / 3600.0, 2),
+        "decisoes": decisoes, "beads_distintas": sum(1 for b in beads.values() if b["cats"]), "beads_com_veredito": com_veredito, "modos": modos, "pilot_ultimo": pilot_last,
+        "pilot_linhas": pilot_linhas, "veredito_final": final, "fora_do_veredito": outros, "apply_ilegivel": apply_ilegivel, "outras_ilegiveis": outras_ilegiveis,
+        "leituras_que_falharam": leitura_falhou, "soltas": soltas, "avisos": avisos,
         "ao_no_de_verdade": sorted(bid for bid, b in beads.items() if b["despachada"]), "instaveis": sorted(instaveis),
-        "node_para_conferir": [{"bead": bid, "ultimo": beads[bid]["final"], "base": beads[bid]["base"], "razoes": beads[bid]["razoes"]} for bid in node_lista],
+        "escrita_nao_confirmada": sorted(bid for bid, b in beads.items() if b["incerta"]), "incoerentes": sorted(bid for bid, b in beads.items() if b["incoerente"]),
+        "node_para_conferir": [{"bead": bid, "ultimo": beads[bid]["final"], "base": beads[bid]["base"], "razoes": beads[bid]["razoes"],
+                                "escrita_nao_confirmada": beads[bid]["incerta"], "incoerente": beads[bid]["incoerente"]} for bid in node_lista],
     }
 
 
 def analyse_occ(rows, lo, hi, busy_pct):
     horas, sem_epoch, total = {}, 0, 0
-    cpu_ok = cpu_sem = sess_lida = sess_nao = wa_leituras = 0
+    cpu_ok = cpu_sem = sess_lida = sess_nao = sess_ileg = wa_leituras = 0
     soma_pct = 0.0
     perto = 0
     for r in rows:
@@ -224,8 +299,14 @@ def analyse_occ(rows, lo, hi, busy_pct):
                 perto += 1
         ss = r.get("sessoes")
         nomes = ss.get("nomes") if isinstance(ss, dict) and ss.get("lido") is True else None
-        # sessões não lidas (lido=false, lista que não é lista de texto) → não entram na média de WA: "0 sessões" seria mentira
-        if isinstance(nomes, list) and all(isinstance(n, str) for n in nomes):
+        ileg = ss.get("ilegiveis") if isinstance(ss, dict) else None
+        # `ilegiveis` ausente ou 0 = a lista é inteira; qualquer outra coisa (N>0, ou um valor que não é inteiro) = o watch viu entrada/estado que não leu, e a que não leu pode ser um WA
+        lista_inteira = ileg is None or (isinstance(ileg, int) and not isinstance(ileg, bool) and ileg == 0)
+        # sessões não lidas (lido=false, lista que não é lista de texto) ou lidas pela metade (`ilegiveis`) → não entram na média de WA: "0 sessões" seria mentira
+        if isinstance(nomes, list) and not lista_inteira:
+            sess_nao += 1
+            sess_ileg += 1
+        elif isinstance(nomes, list) and all(isinstance(n, str) for n in nomes):
             wa = sum(1 for n in nomes if n.startswith("wa-worker-remote"))
             h["sess_lidas"] += 1
             h["soma_wa"] += wa
@@ -248,17 +329,22 @@ def analyse_occ(rows, lo, hi, busy_pct):
         "leituras": total, "sem_epoch": sem_epoch, "cpu_lidas": cpu_ok, "cpu_sem_leitura": cpu_sem,
         "pct_medio": round(soma_pct / cpu_ok, 1) if cpu_ok else None, "perto_de_100": perto, "busy_pct": busy_pct,
         "perto_de_100_pct": round(100.0 * perto / cpu_ok, 1) if cpu_ok else None,
-        "sessoes_lidas": sess_lida, "sessoes_nao_lidas": sess_nao, "leituras_com_wa_no_no": wa_leituras, "horas": tabela,
+        "sessoes_lidas": sess_lida, "sessoes_nao_lidas": sess_nao, "sessoes_com_entrada_ilegivel": sess_ileg, "leituras_com_wa_no_no": wa_leituras, "horas": tabela,
     }
 
 
-def prontidao(rota, min_hours, min_beads):
+def prontidao(rota, min_hours, min_beads, hours):
+    """horas = horas UTC COM linha de decisão (não o intervalo primeira→última); beads = só as que chegaram a um VEREDITO (não elegível/não li/falha de escrita não contam)"""
     falta = []
-    if rota["horas_cobertas"] < min_hours:
-        falta.append("a sombra cobre %s h de %d" % (fnum(rota["horas_cobertas"]), min_hours))
-    if rota["beads_distintas"] < min_beads:
-        falta.append("%d bead(s) distinta(s) de %d" % (rota["beads_distintas"], min_beads))
-    return {"suficiente_para_revisar": not falta, "falta": falta, "a_conferir": len(rota["node_para_conferir"]), "instaveis": len(rota["instaveis"])}
+    if min_hours > hours + 1:
+        # uma janela de `hours` h toca no máximo hours+1 horas UTC: pedir mais é pedir o impossível, e isso não pode parecer "ainda não deu tempo"
+        falta.append("--min-hours %d não cabe na janela de %d h (no máximo %d hora(s) UTC): aumente --hours" % (min_hours, hours, hours + 1))
+    elif rota["horas_cobertas"] < min_hours:
+        falta.append("a sombra tem decisão em %d hora(s) UTC de %d" % (rota["horas_cobertas"], min_hours))
+    if rota["beads_com_veredito"] < min_beads:
+        falta.append("%d bead(s) com veredito de %d" % (rota["beads_com_veredito"], min_beads))
+    return {"suficiente_para_revisar": not falta, "falta": falta, "a_conferir": len(rota["node_para_conferir"]), "instaveis": len(rota["instaveis"]),
+            "escrita_nao_confirmada": len(rota["escrita_nao_confirmada"]), "incoerentes": len(rota["incoerentes"])}
 
 
 def fnum(x, nd=1):
@@ -290,26 +376,34 @@ def render(res):
         L.append("  " + aviso)
     if r["estado"] in ("ok",):
         a = r["analise"]
-        L.append("  cobertura: %s → %s (%s h), %d linha(s) na janela, %d sem hora legível" % (iso(a["primeira"]), iso(a["ultima"]), fnum(a["horas_cobertas"], 2), a["linhas_na_janela"], a["sem_hora"]))
-        L.append("  modos do Pilot vistos: %s; spawn=%s slots=%s (da última linha)" % (", ".join("%s=%d" % kv for kv in sorted(a["modos"].items())) or "nenhum", a["pilot_ultimo"].get("spawn") or "—", a["pilot_ultimo"].get("slots") or "—"))
+        L.append("  cobertura: %s → %s; decisão em %d hora(s) UTC (intervalo de %s h, maior silêncio %s h), %d linha(s) na janela, %d sem hora legível" % (iso(a["primeira"]), iso(a["ultima"]), a["horas_cobertas"], fnum(a["intervalo_h"], 2), fnum(a["maior_lacuna_h"], 2), a["linhas_na_janela"], a["sem_hora"]))
+        pl = a["pilot_ultimo"]
+        L.append("  modos do Pilot vistos: %s; última linha do Pilot: %s" % (", ".join("%s=%d" % kv for kv in sorted(a["modos"].items())) or "nenhum", ("%s, modo %s, rc %s" % (iso(pl["ts"]), pl["mode"], pl["rc"])) if pl else "—"))
+        for av in a["avisos"]:
+            L.append("  ATENÇÃO — " + av)
         L.append("  %d decisão(ões) do despachante sobre %d bead(s) distinta(s); veredito = o ÚLTIMO da bead na janela:" % (a["decisoes"], a["beads_distintas"]))
         for c in VEREDITOS:
             L.append("    %-52s %d" % (ROTULOS[c], a["veredito_final"][c]))
         if a["fora_do_veredito"]:
             L.append("    sem veredito (não elegível / não li / falha de escrita): %s" % ", ".join("%s=%d" % kv for kv in sorted(a["fora_do_veredito"].items())))
-        if a["apply_ilegivel"] or a["leituras_que_falharam"]:
-            L.append("    linhas de apply ilegíveis: %d; leituras de bead que falharam: %d (a sonda do disk floor entra aqui)" % (a["apply_ilegivel"], a["leituras_que_falharam"]))
+        if a["apply_ilegivel"] or a["outras_ilegiveis"] or a["leituras_que_falharam"]:
+            L.append("    linhas ilegíveis: apply %d, outras (sem bead ou sem rc) %d; leituras de bead que falharam: %d (a sonda do disk floor entra aqui)" % (a["apply_ilegivel"], a["outras_ilegiveis"], a["leituras_que_falharam"]))
         L.append("  WhatsApp ao nó DE VERDADE (atribuída pelo despachante): %d bead(s)%s; soltas depois da entrega: %d" % (len(a["ao_no_de_verdade"]), (" — " + ", ".join(a["ao_no_de_verdade"][:12])) if a["ao_no_de_verdade"] else "", a["soltas"]))
         if a["instaveis"]:
             L.append("  ATENÇÃO — mudaram de veredito (node e depois mini/não sei; é onde mora o falso 'node'): %s" % ", ".join(a["instaveis"]))
+        if a["escrita_nao_confirmada"]:
+            L.append("  ESCRITA NÃO CONFIRMADA — confira à mão se a bead está no nó (rc 13 do despachante, ou o Pilot que estourou o prazo): %s" % ", ".join(a["escrita_nao_confirmada"]))
+        if a["incoerentes"]:
+            L.append("  ATENÇÃO — linha do Pilot cujo rc e veredito discordam (o `check` não devolve isso; o formato mudou?). Não contam como mini nem como node: %s" % ", ".join(a["incoerentes"]))
         if a["node_para_conferir"]:
-            L.append("  PARA CONFERIR UMA A UMA (todo veredito node da janela; nenhuma pode tocar dado de lead):")
+            L.append("  PARA CONFERIR UMA A UMA (todo veredito node da janela, mais as de escrita não confirmada e as incoerentes; nenhuma pode tocar dado de lead):")
             for n in a["node_para_conferir"][:40]:
-                L.append("    %s  [%s%s]  %s" % (n["bead"], ROTULOS.get(n["ultimo"], n["ultimo"] or "—"), (", base " + n["base"]) if n["base"] else "", ("razões: " + "; ".join(n["razoes"])) if n["razoes"] else "razões: —"))
+                marca = (" ESCRITA NÃO CONFIRMADA" if n["escrita_nao_confirmada"] else "") + (" INCOERENTE" if n["incoerente"] else "")
+                L.append("    %s  [%s%s]%s  %s" % (n["bead"], ROTULOS.get(n["ultimo"], n["ultimo"] or "—"), (", base " + n["base"]) if n["base"] else "", marca, ("razões: " + "; ".join(n["razoes"])) if n["razoes"] else "razões: —"))
             if len(a["node_para_conferir"]) > 40:
                 L.append("    … mais %d (use --json)" % (len(a["node_para_conferir"]) - 40))
     L.append("")
-    L.append("[2] CPU DO NÓ POR HORA, UTC (%s)" % res["ocupacao"]["arquivo"])
+    L.append("[2] CPU DO NÓ POR HORA, UTC (%s) — média das leituras de cada hora (uma leitura vale uma; a fronteira da hora é a do `epoch`, ±15 min)" % res["ocupacao"]["arquivo"])
     o = res["ocupacao"]
     aviso = estado_txt(o["estado"], o["ilegiveis"], o["arquivo"])
     if aviso:
@@ -318,7 +412,9 @@ def render(res):
         b = o["analise"]
         L.append("  %d leitura(s) na janela (esperadas ~%d, uma a cada 15 min); CPU lida em %d, SEM CPU lida em %d (a 1ª leitura só semeia o baseline; não entram na média)" % (b["leituras"], res["janela"]["horas"] * 4, b["cpu_lidas"], b["cpu_sem_leitura"]))
         L.append("  META (Athos 20/10): nó em ~100%%. Média da janela: %s%%; leituras com CPU >= %d%%: %d de %d (%s%%)" % (fnum(b["pct_medio"]), b["busy_pct"], b["perto_de_100"], b["cpu_lidas"], fnum(b["perto_de_100_pct"])))
-        L.append("  sessões wa-worker-remote vivas em %d leitura(s) (de %d com sessões lidas; %d sem sessões lidas)" % (b["leituras_com_wa_no_no"], b["sessoes_lidas"], b["sessoes_nao_lidas"]))
+        # vazio → nada a avisar (nenhuma leitura de sessões veio pela metade); N>0 → a lista daquelas leituras pode ter perdido um WA e elas ficam fora da conta
+        sufixo = (", %d delas com entrada ilegível: a lista pode estar incompleta e não entra na conta" % b["sessoes_com_entrada_ilegivel"]) if b["sessoes_com_entrada_ilegivel"] else ""
+        L.append("  sessões wa-worker-remote vivas em %d leitura(s) (de %d com sessões lidas; %d sem sessões lidas%s)" % (b["leituras_com_wa_no_no"], b["sessoes_lidas"], b["sessoes_nao_lidas"], sufixo))
         L.append("  %-14s %9s %8s %8s %6s %6s %8s %6s" % ("hora", "leituras", "cpu lida", "média %", "mín", "máx", "núcleos", "WA"))
         tab = b["horas"]
         if len(tab) > 72:
@@ -332,7 +428,8 @@ def render(res):
     if p is None:
         L.append("  sem log de rota utilizável (ausente ou ilegível): não dá para dizer")
     elif p["suficiente_para_revisar"]:
-        L.append("  base suficiente PARA REVISAR: confira as %d bead(s) node da lista acima%s. Quem liga o auto é uma pessoa." % (p["a_conferir"], "; %d mudaram de veredito" % p["instaveis"] if p["instaveis"] else ""))
+        extra = ("; %d mudaram de veredito" % p["instaveis"] if p["instaveis"] else "") + ("; %d com escrita não confirmada" % p["escrita_nao_confirmada"] if p["escrita_nao_confirmada"] else "") + ("; %d com rc/veredito incoerentes" % p["incoerentes"] if p["incoerentes"] else "")
+        L.append("  base suficiente PARA REVISAR: confira as %d bead(s) da lista acima%s. Quem liga o auto é uma pessoa." % (p["a_conferir"], extra))
     else:
         L.append("  INSUFICIENTE: " + "; ".join(p["falta"]) + ". Não ligue o `auto` com isto.")
     return "\n".join(L) + "\n"
@@ -340,7 +437,7 @@ def render(res):
 
 def parse_args(argv):
     ap = argparse.ArgumentParser(prog="wa-node-report.py", add_help=True)
-    ap.add_argument("--hours", default="24")
+    ap.add_argument("--hours", default="48")
     ap.add_argument("--city", default=None)
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--min-hours", default="24")
@@ -380,7 +477,7 @@ def main(argv):
         "janela": {"horas": a.hours, "inicio": lo, "fim": hi},
         "rota": {"arquivo": rota_p, "estado": re_, "ilegiveis": rbad, "analise": ra},
         "ocupacao": {"arquivo": occ_p, "estado": oe, "ilegiveis": obad, "analise": oa},
-        "prontidao": prontidao(ra, a.min_hours, a.min_beads) if ra else None,
+        "prontidao": prontidao(ra, a.min_hours, a.min_beads, a.hours) if ra else None,
     }
     try:
         corpo = (json.dumps(res, ensure_ascii=False, sort_keys=True) + "\n") if a.json else render(res)
