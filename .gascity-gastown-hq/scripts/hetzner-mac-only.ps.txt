@@ -3,13 +3,13 @@
 # Contents
 #   O que entra aqui · Como a lista é lida · Estado da lista (MEDIDA em 21/10) · Como se mantém
 #
-# O QUE ENTRA AQUI: teste de PS que, no nó, reprova (ou só pula, ou nem coleta) por causa do AMBIENTE e não do código: macOS/layout do mini (launchd/plist de verdade, osascript, /Users/athos/..., ~/.property-scrapers, hora de boot), o binário `node` (o nó não o tem) ou um módulo que o espelho esparso não leva.
+# O QUE ENTRA AQUI: teste de PS que, no nó, reprova (ou só pula, ou nem coleta) por causa do AMBIENTE e não do código: macOS/layout do mini (launchd/plist de verdade, osascript, /Users/athos/..., ~/.property-scrapers, hora de boot), um binário que o nó não tenha (o Node v22.22.3 está lá desde 21/10, ga-2hd02v.4.9) ou um módulo que o espelho esparso não leva.
 # COMO A LISTA É LIDA (scripts/ps-node-classify.py, mac_only_globs): o glob casa o caminho relativo ao repo. Bead que cita um teste daqui NÃO vai ao nó (so-no-mac:<caminho>). Lista ausente, ilegível ou
 #   SEM nenhum glob = "não sei o que fica no Mac" -> o classificador devolve unknown (nunca "nada é só-Mac"). Esta é a lista do PS; a do WA é hetzner-mac-only.txt e não vale aqui.
 # ESTADO DA LISTA: MEDIDA em 21/10 (ga-2hd02v.4.8). A semente de 20/10 era INFERIDA por varredura de texto dos 97 arquivos de teste; rodei a suíte inteira do PS (lib/tests + tests, commit b2643aa de main, worktree esparso
 #   do espelho do nó, sem rede, python 3.11 do venv-ps): 2402 passaram, 33 falharam, 212 erraram, 3 puladas, 87 s. Das 14 linhas da semente, 10 PASSARAM no nó e saíram. Ficaram as que reprovam lá e passam no mini
 #   (test_rodada_status_marker, test_backup_to_s3) e a que só pula (test_sync_processos_health: "No module named scraper_health" — verde que não prova nada). Entraram test_rodada_state (hora de boot; 58 passam no mini, 1 reprova no nó)
-#   e os 4 arquivos *blow* que faltavam: 242 dos 245 problemas da rodada vêm de UMA causa, o nó não ter Node.js (241 com a asserção "node não está no PATH", 1 com TypeError por NODE=None; contados um a um); os outros 3 são rodada_state, rodada_status_marker e backup_to_s3. Instalar o node no servidor tira esses 5 arquivos daqui (decisão do Mayor: servidor compartilhado).
+#   e os 4 arquivos *blow* que faltavam: 242 dos 245 problemas da rodada vêm de UMA causa, o nó não ter Node.js (241 com a asserção "node não está no PATH", 1 com TypeError por NODE=None; contados um a um); os outros 3 são rodada_state, rodada_status_marker e backup_to_s3. O Node v22.22.3 foi instalado no nó em nível de usuário em 21/10 (ga-2hd02v.4.9, decisão do Mayor) e, no mesmo worktree do espelho (main b2643aa, venv-ps), os 5 arquivos que citam o binário passaram: 243 testes COM o node no PATH contra 242 problemas SEM ele. Por isso os 5 *blow* SAÍRAM daqui (ga-2hd02v.4.10); os outros 3 problemas continuam na lista. Se o Node sair do nó, os 5 voltam (receita em docs/runbooks/hetzner-nodejs.md).
 # COMO SE MANTÉM: arquivo que reprova no nó e passa no mini entra (é o ambiente, não o código); arquivo que passa nos dois sai. Rode de novo a suíte no nó (worktree do espelho + gt-iso-run, ver runbook hetzner-ps-node.md) quando o nó ganhar ferramenta ou o PS ganhar teste.
 
 # macOS / layout do mini: reprovam (ou não coletam) no nó e passam no mini
@@ -18,9 +18,3 @@ tests/test_rodada_status_marker.py
 tests/test_backup_to_s3.py
 # o espelho esparso do nó não leva o módulo scraper_health: os testes só PULAM, e pular não prova nada
 lib/tests/test_sync_processos_health.py
-# precisam do binário `node` (o nó não tem Node.js): asserção de ambiente "node não está no PATH" em cada teste ou fixture
-tests/test_blow_rate_limit.py
-tests/test_blow_budget.py
-tests/test_blow_property_ids.py
-tests/test_blow_scraper_ids_wiring.py
-tests/test_scraper_status_blow_probe.py
