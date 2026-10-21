@@ -27,6 +27,8 @@
 # file inside — not its root directory's mtime, and a tree a live process has its cwd or an open file in is never removed).
 # Pressure mode lowers the age gate when disk is genuinely low, but only MERGED trees go under it: an unmerged tree is kept
 # and logged with its size (kept_pressure_unmerged). Branch deletion is merged-only. Kill switch: WORKTREE_REAPER_ENABLED=0.
+# ga-xpoj67: nor is any tree removed while it holds files git IGNORES that are not junk by name (kept_ignored_data, locked trees included):
+# git does not count ignored files as dirt, so a plain `worktree remove` would take them (battery outputs under an ignored pesquisa/).
 # The one exception to "WITHOUT --force" is a LOCKED worktree (`remove -f -f`); it is reaped only
 # under the LOCK CONTRACT stated at ZOMBIE-LOCK DETECTION below, never because of its age alone.
 # A second, narrower exception (ga-he2c1u, town .gc-worktrees roots only): an UNLOCKED tree dirty with nothing but generated
@@ -833,7 +835,8 @@ reap_zombie_locked() {
     printf '{"ts":"%s","event":"kept_zombie_lock_in_use","repo":"%s","wt":"%s","branch":"%s","pid":%s,"age_h":%s,"label":"%s"}\n' "$(ts)" "$(_json_esc "$(basename "$repo")")" "$(_json_esc "$(basename "$wt")")" "$(_json_esc "$br")" "$pid" "$age" "$(_json_esc "$label")" >> "$LOG" 2>/dev/null
     return 1
   fi
-  # ga-xpoj67: ... nor of what git ignores in it, which the same `remove -f -f` takes too (the lock contract skips _keep_unsafe)
+  # ga-xpoj67: the same `remove -f -f` takes what git ignores in the tree, and a dead lock holder says nothing about that either (the lock
+  # contract does not go through _keep_unsafe): ignored data inside → KEPT, logged, the lock stays.
   if _keep_ignored_data "$repo" "$wt" "$br" "$age" locked; then return 1; fi
   if [ "$ENABLED" != "1" ]; then
     printf '{"ts":"%s","event":"would_reap_zombie_lock","repo":"%s","wt":"%s","branch":"%s","pid":%s,"why":"%s","age_h":%s,"label":"%s"}\n' "$(ts)" "$(basename "$repo")" "$(basename "$wt")" "$br" "$pid" "$why" "$age" "$label" >> "$LOG" 2>/dev/null
