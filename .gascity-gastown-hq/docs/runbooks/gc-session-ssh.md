@@ -2,7 +2,7 @@
 
 ## Contents
 
-• O que esta fatia é — e o que não é · Como ligar (config, city.toml, janela do engine) · Operações (preparo do worktree · **worktree da sessão: o provider cria e recolhe, e a identidade do atalho (ga-2hd02v.1.7)** · o comando do `start` · **a sessão `claude` segue a conta do pool do mini (ga-2hd02v.7.1)**)
+• O que esta fatia é — e o que não é · Como ligar (config, city.toml, janela do engine) · Operações (preparo do worktree · **worktree da sessão: o provider cria e recolhe, e a identidade do atalho (ga-2hd02v.1.7)** · o comando do `start` · **a sessão `claude` segue a conta do pool do mini (ga-2hd02v.7.1)** · **cache do `list-running` (ga-it7qiq.5)**)
 • Teto do host · **O MBP como host (ga-w7qwl1)** · Quando o ssh não responde · Medido, inferido, não testado · Pontos em aberto · Limites
 
 Bead ga-2hd02v.1.1 (fatia 2 do ga-2hd02v, desenho do estudo ga-ukxa3k, aprovada por Athos em 14/10 18:42). **Entrega duas peças:** (1) `scripts/gc-session-ssh`, o provider no protocolo `exec:` do engine, que abre as sessões de pool num host remoto por ssh com a mesma interface das locais; (2) um patch do engine, `docs/pending-engine-window/ga-2hd02v-hybrid-remote-exec.patch`, que deixa o provider híbrido usar esse script como lado remoto. **O patch NÃO está aplicado**: nada foi compilado, trocado nem reiniciado em produção. Sem o patch o script já funciona sozinho (`GC_SESSION=exec:<cidade>/scripts/gc-session-ssh` serve um teste isolado), mas só o patch deixa a cidade rodar sessões locais e remotas juntas.
@@ -29,6 +29,7 @@ Bead ga-2hd02v.1.1 (fatia 2 do ga-2hd02v, desenho do estudo ga-ukxa3k, aprovada 
 | `socket` | não (`gc-remote`) | nome do socket do tmux no host (`tmux -L`): só as sessões deste provider existem nele |
 | `mini_home` | não (`~`) | home do mini, para reescrever `~/…` em `remote_home` |
 | `connect_timeout`, `timeout`, `start_timeout` | não (10, 25, 60 s) | prazos; o `start` leva `start_timeout` |
+| `list_cache_s` | não (`10`) | segundos que uma resposta BOA do `list-running` pode ser reaproveitada (ga-it7qiq.5, ver “Cache do `list-running`”). Inteiro de 0 a 120; **0 desliga** (é o freio de mão: edite a config, vale na próxima chamada, sem janela do engine); texto, `true`/`false`, negativo, acima de 120 ou `null` recusa a config |
 | `env_allow` | não | nomes de variável com cara de segredo que PODEM ir (ver abaixo) |
 | `ssh_opts` | não | opções extras do ssh (`["-p","2222"]`) |
 | `worktree_prepare` | não (`true`; `false` num host com `presence_gate`) | liga o **preparo do worktree no `start`** (identidade git + confiança da pasta, ver “Preparo do worktree”); texto no lugar de `true`/`false` é erro de configuração |
@@ -70,7 +71,7 @@ Cada operação é **um ssh** (ControlMaster em `~/.ssh/cm`, o mesmo do `mbp-run
 | `is-running`, `process-alive`, `get-last-activity` | `true`/`false`; `process-alive` procura os nomes na árvore do painel; atividade em RFC3339. **`false` só quando o tmux do host respondeu e a sessão não está na lista**; tmux que não consegue olhar (ex.: socket sem permissão) = erro (exit 1) com o motivo, como o `list-running` e o teto do `start` (que não contam “0 sessões” nesse caso) |
 | `nudge` | texto por `load-buffer`/`paste-buffer -p` + Enter (qualquer tamanho, aspas e quebras de linha) |
 | `send-keys`, `peek`, `clear-scrollback` | como no tmux local |
-| `list-running <prefixo>` | nomes das sessões do provider. **ssh fora = erro (exit 1), nunca lista vazia**: o engine trata erro como lista parcial e não decide nada com base num “vazio” falso |
+| `list-running <prefixo>` | nomes das sessões do provider. **ssh fora = erro (exit 1), nunca lista vazia**: o engine trata erro como lista parcial e não decide nada com base num “vazio” falso. Uma resposta boa de até `list_cache_s` s (10) atrás é reaproveitada sem ssh (ver “Cache do `list-running`”); `start` e `stop` a invalidam |
 | `set-meta`, `get-meta`, `remove-meta` | ficam **no mini** (`<estado>/meta`); nada de meta vai para o servidor |
 | `attach` | `ssh -t … tmux attach` |
 | `check-image`, `copy-to`, `watch-startup`, `run-live` e qualquer operação desconhecida | **exit 2 (“não suportado”)**, sem abrir ssh, sem ler a entrada, sem tocar em sessão |
@@ -156,6 +157,29 @@ A recusa vem **antes** de registrar a sessão, de travar e de abrir o ssh (nada 
 **Limite que continua.** Quem roda `env` (ou lê o `environ` do processo, no mesmo usuário) dentro da sessão vê a chave, igual no mini: ela é uma variável de ambiente do `claude`. A chave não rotaciona, então mini e nó usam a mesma ao mesmo tempo.
 
 **Medido × não medido.** Medido com `secret`, arquivo do pool e `claude` falsos (nada do cofre real): os três estados, o prefixo (não `export`), o vazamento (argv do ssh, saída, estado e log do mini, `ps`, scrollback e ambiente do tmux, com controle positivo) e 13 mutantes mortos; ver o grupo `acct` do `gc-session-ssh.selftest.sh`. **Não medido e não medível do servidor:** o `secret` real, o arquivo real do pool e a conta real (só no mini).
+
+### Cache do `list-running` (ga-it7qiq.5)
+
+**Por quê.** `gc --city … rig list --json` enumera as sessões pelo provider híbrido e chama `gc-session-ssh list-running` dezenas de vezes por execução com respostas idênticas entre si (ga-it7qiq: 120 execuções em 6 `rig list`, 1,9–2,1 s cada sob load 45–90). Medido de novo em 21/10 (load ~35): um `rig list` de 22–27 s teve 16 filhos diretos `list-running`, **nunca mais de um vivo ao mesmo tempo** (é série), vida mediana 0,35 s; o supervisor e mais um processo também chamam o `list-running` por fora (4 e 7 chamadas no mesmo intervalo de 27 s). Sem tocar no engine (nenhuma janela): o provider guarda a resposta boa por poucos segundos.
+
+**O que entra e por quanto tempo.** Só a lista que o host deu **de verdade** (ssh respondeu, marcadores inteiros, tmux legível), por host, em `<estado>/<host>/lr/cache.json` = `{"gen", "ts", "live"}`; `ts` é o instante em que a pergunta COMEÇOU (o prazo conta do início do ssh, não do fim). Vale `list_cache_s` s (10 por padrão). O cache guarda a lista inteira e o prefixo filtra na saída. `[]` guardado é uma resposta (“o host não tem sessão nossa”), não ausência de cache.
+
+**O que nunca acontece (a regra de três estados deste provider continua):**
+
+| situação | resultado |
+|---|---|
+| ssh fora, tempo esgotado, resposta cortada, tmux ilegível (com o ssh **tentado**) | **erro (exit 1), como antes.** Nada é guardado, e o cache nunca é o plano B do erro — nem o vencido, nem o de 1 s atrás. (Dentro do prazo o ssh nem é tentado: a lista boa de poucos segundos atrás sai, e essa é a defasagem aceita, abaixo) |
+| cache vencido, de relógio que voltou (carimbo no futuro), vazio, ilegível ou com forma errada | pergunta ao host; o arquivo é reescrito |
+| `lr/gen` (a geração) que não dá para ler | esta chamada **não lê nem grava** cache: pergunta ao host |
+| `--dry-run` | não lê nem grava cache; imprime o que rodaria |
+
+**Invalidação.** `start` e `stop` trocam o token de geração (`lr/gen`, troca atômica) e apagam o cache; o `start` faz isso **antes e depois** do ssh dele (o depois num `finally`: start que falhou ou ficou ambíguo também invalida), o `stop` depois. O cache só vale se a geração dentro dele for a que o chamador lê **agora**; e quem perguntou ao host só grava se a geração não mudou durante a pergunta. Resultado: uma resposta lida antes de um `start` que só chega depois dele nunca vira cache válido (coberto no grupo `lr` do selftest, com um ssh falso que segura a resposta). Falha ao trocar a geração (pasta sem escrita) NÃO derruba o `start`/`stop`: vai para o log e o guardado ainda morre sozinho em `list_cache_s` s.
+
+**O acerto do registro de sessões nossas** (`<estado>/<host>/running/`, ver “O MBP como host”) só acontece quando o host foi perguntado: lista vinda do cache não mexe no registro.
+
+**Custo aceito (staleness).** Até `list_cache_s` s, uma sessão que caiu por conta própria continua na lista, e uma aberta por fora do provider não aparece. Isso só pode atrasar uma decisão de vaga (sobre-contagem), e o teto do host e a existência da sessão continuam conferidos **no host, na hora**, dentro do script do `start` — o cache nunca decide o teto. Quem precisa de exatidão absoluta (o `start` já a tem) usa `list_cache_s: 0`.
+
+**Sem trava de voo único (decisão).** Chamadas simultâneas com o cache frio perguntam todas ao host. Medido (acima): as chamadas de um `rig list` são em série, então o cache corta todas menos a primeira. Uma trava para deduplicar a onda fria transformaria “host fora do ar” em N prazos de `timeout` um atrás do outro (a cada espera, a seguinte também falha), que é pior que o problema.
 
 ## Teto do host
 
@@ -269,6 +293,9 @@ Medido nas duas formas (porta fechada, e script com `ssh` falso que não respond
 ## Medido, inferido, não testado
 
 **MEDIDO**
+* **Cache do `list-running` (ga-it7qiq.5, 21/10, hetzner de verdade, load ~42, leitura somente: `tmux list-sessions`, estado em pasta de rascunho).** 16 chamadas seguidas, 3 rodadas, script antigo × novo: **antigo 15–22 s no total (0,93–1,37 s por chamada), novo 7,5–11,9 s (0,47–0,74 s por chamada)**, ou seja, cerca de metade com este load (com load mais alto o ganho é menor: medição seguinte); as 16 respostas idênticas nos dois (2 sessões). O que sobra no acerto do cache é a partida do processo: o perfil de uma chamada de acerto deu 0,275 s, dos quais 0,23 s são imports (`base64` puxa `_struct`/`binascii`, módulos nativos) — sem ssh, sem subprocesso. Cortar isso (imports preguiçosos de `base64`/`hashlib`, só usados no `start`) é outra fatia, não feita aqui.
+* **Segunda medição, com a cidade mais carregada (21/10, hetzner de verdade, load 50–62, leitura somente, estado em pasta de rascunho nova a cada execução).** 16 chamadas seguidas, 2 rodadas, antigo × novo: **antigo 26,5 s e 21,5 s, novo 14,7 s e 14,3 s** (cerca de 0,9 s por chamada no novo), ou seja, **um terço a 45% a menos**, não “metade”: com o load alto o piso é a partida do processo (a nota acima), que fica mais lenta. Nesse momento o host não tinha nenhuma sessão do provider: as 16 respostas foram vazias nos dois e o cache gravou `[]` (lista idêntica NÃO vazia só está provada no hermético, grupo `lr`). Quem quiser o ganho cheio precisa da fatia dos imports preguiçosos.
+* **Selftest do grupo `lr`** (hermético, ssh falso): 55 casos; contra o provider anterior 23 reprovam (todos os que exigem cache, a validação de `list_cache_s` e o `start` que não derruba por falha ao invalidar) e 32 passam por serem invariantes que valem sem cache (erro nunca vira lista, `start` visto na lista, etc.). 20 mutantes do cache no controle negativo.
 * Servidor `hetzner-teste` (14/10, ssh de verdade): Linux 6.8.0-138, `tmux 3.4`, `base64 awk ps sh mktemp` presentes; `claude` e `node` seguem ausentes (fatia .1.4).
 * O provider rodado de verdade contra o `hetzner-teste` com um socket de tmux de teste, `cap` 1 e um `cat` como “agente”: `start` (1,8 s no total, 1 s dele é a espera de confirmação), `list-running`, `is-running`, `nudge` (o texto apareceu no `peek`), `peek`, `send-keys`, `interrupt` (o `Ctrl-C` encerrou o `cat`; num `sh` com `trap INT` apareceu `GOT-INT`), `process-alive` verdadeiro e falso, `get-last-activity` em RFC3339, o 2º `start` recusado pelo teto, o mesmo nome recusado como `already exists`, `stop` e lista vazia depois. O ControlMaster com `ControlPersist` não travou o `capture_output`. Terminado o teste, o diretório de teste do servidor foi removido e o socket do tmux também; nada ficou lá.
 * **Rodada de novo contra o `hetzner-teste` com o provider FINAL** (depois dos achados de “não sei”, abaixo): 27/27 em 47 s, as mesmas operações mais a sessão ausente (`stop` idempotente; `interrupt`, `clear-scrollback`, `get-last-activity`, `nudge`, `send-keys` com exit 0), `interrupt` de verdade (`GOT-INT`), cap 1 recusando a 2ª sessão, e ssh fora (`start` recusa dizendo o host; `list-running` é erro). Depois: socket de teste sem sessões, e só os 6 diretórios vazios que o teste criou e o socket foram removidos (`rmdir`, `rm -f` de um arquivo; nada recursivo, nada além disso). **O caso “tmux sem acesso” NÃO foi feito no servidor** (exigiria `chmod` no diretório de sockets do tmux de um host compartilhado): é só hermético (grupo `terr` do selftest).

@@ -4,7 +4,7 @@ interface das locais (start, stop, interrupt, is-running, peek, nudge, send-keys
 meta, attach). ga-2hd02v.1.1, desenho do ga-ukxa3k, fatia 2. Python 3.9+, só biblioteca padrão.
 
 Contents
-  Uso · O que faz · Vários hosts e o MBP · O que NÃO faz · Configuração · Códigos de saída
+  Uso · O que faz · Vários hosts e o MBP · Cache do list-running · O que NÃO faz · Configuração · Códigos de saída
 
 USO
   GC_SESSION=exec:<cidade>/scripts/gc-session-ssh                (ou, no híbrido, `remote_exec` — patch em docs/pending-engine-window/)
@@ -52,6 +52,15 @@ VÁRIOS HOSTS E O MBP (ga-w7qwl1)  O host de uma sessão vem de $GC_SSH_HOST, se
   sessão em curso NÃO é morta. Sem a biblioteca no host o start recusa. Cada start/recusa/stop vira uma linha em <estado>/<host>/events.jsonl
   (insumo do placar: scripts/session-host-scoreboard.py).
 
+CACHE DO list-running (ga-it7qiq.5)  `gc rig list --json` chama este script ~16-20 vezes por execução (medido 21/10: 16 filhos diretos, nunca dois vivos ao mesmo tempo; ~1 s cada com load 42) e as respostas são idênticas. A lista que o host deu de BOM (ssh respondeu, marcadores
+  inteiros, tmux legível) é guardada por host em <estado>/<host>/lr/cache.json e reaproveitada por até `list_cache_s` s (10 por padrão; 0 desliga; máximo 120): dentro do prazo não há ssh, e o prefixo filtra
+  na saída (o cache guarda a lista inteira). O que NÃO é guardado, nem vira outra coisa: erro, ssh fora, tempo esgotado e resposta cortada continuam erro quando o ssh é tentado (o cache nunca é o plano B de um erro,
+  e erro nunca vira lista vazia; dentro do prazo o ssh nem é tentado, e essa é a defasagem aceita); cache vencido, de relógio que voltou, ilegível ou de forma errada = pergunta ao host. `start` e `stop` trocam a geração (lr/gen) e apagam o cache — o start antes E depois do ssh
+  —, e o guardado só vale com a geração que o chamador lê agora, então uma resposta lida antes de um start/stop que só chega depois dele não vale nem se for gravada. Geração que não dá para ler = esta
+  chamada não lê nem grava cache. O acerto do registro de sessões nossas (<estado>/<host>/running/) só acontece com resposta do host, não com lista do cache. --dry-run não usa nem mexe no cache.
+  Custo aceito: sessão que caiu por conta própria (ou aberta por fora do provider) aparece/some da lista até `list_cache_s` s depois; o teto do `start` e a existência continuam conferidos no host, na hora.
+  Várias chamadas SIMULTÂNEAS com o cache frio perguntam todas ao host (sem trava de voo único: as de um `rig list` são em série, medido, e uma trava transformaria host fora do ar em N prazos um atrás do outro).
+
 O QUE NÃO FAZ (cada item é de outra fatia ou é recusa de propósito)
   pre_start, session_setup*, session_live, overlay/pack_overlay_dirs, copy_files, copy-to: NÃO executam nem copiam (seriam comandos e
   arquivos do mini no servidor; as fatias .1.2/.1.3 decidem) — ficam registrados como "ignored". `nudge` do start também não é
@@ -70,7 +79,7 @@ CONFIGURAÇÃO  $GC_SSH_CONFIG ou <cidade>/.gc/session-ssh.json (cidade = pasta 
      "remote_root": "/home/runner/gt-remote/bundle", "remote_home": "/home/runner"}}}
   obrigatórios: ssh (alias/destino), cap (teto de sessões deste host, contado SÓ no socket do provider, separado do teto do mini),
   remote_root (= --remote-root do remote-bundle-build.py), remote_home. opcionais: socket (gc-remote), connect_timeout (10),
-  timeout (25) e start_timeout (60) em segundos, ssh_opts [], env_allow [], mini_home, real_sessions_released_by (ver acima), worktree_prepare (true/false; padrão true, e false num host
+  timeout (25) e start_timeout (60) em segundos, list_cache_s (10; inteiro de 0 a 120, 0 desliga o cache do list-running; qualquer outra coisa recusa a config), ssh_opts [], env_allow [], mini_home, real_sessions_released_by (ver acima), worktree_prepare (true/false; padrão true, e false num host
   com presence_gate: preparo do worktree no start, ver acima; texto no lugar de true/false é erro de configuração), worktree_rigs ({"dog": "gascity"}: papel → rig dos worktrees que o provider cria e recolhe; ausente = nenhum). Só para o notebook (MBP): path_extra [] (dirs
   absolutos à frente do PATH do ssh sem login: /opt/homebrew/bin), presence_gate (true), gate_cmd ([lista]), presence_lib (padrão
   <remote_home>/gt-remote/bin/mbp-presence.sh), watch_s (5), sleeps (true), session_env ({"path": [pastas], "claude": "/abs/claude"}; OBRIGATÓRIO em
@@ -120,6 +129,9 @@ CLAUDE_CMD = re.compile(r"(?:\S*/)?claude(?=\s|$)")  # o comando do start é o c
 IGNORED = ("pre_start", "session_setup", "session_setup_script", "session_live", "pack_overlay_dirs", "overlay_dir", "copy_files", "nudge")
 BEGIN, END = "@@GC-BEGIN@@", "@@GC-END@@"
 EX_CAP, EX_EXISTS, EX_POLICY, EX_PREP = 10, 11, 12, 13
+# Cache de TTL curto da resposta BOA do list-running, por host (ga-it7qiq.5): as ~16-20 chamadas em série de um `gc rig list --json` têm respostas idênticas (números medidos no cabeçalho, CACHE DO list-running).
+# Só o que o host respondeu entra; erro, timeout e resposta cortada nunca são guardados nem viram lista vazia. start e stop invalidam. `list_cache_s` na config do host: 0 desliga, máximo LIST_TTL_MAX.
+LIST_TTL, LIST_TTL_MAX = 10, 120
 TEST_RE = re.compile(r"remote-(?:e2e|test)-[A-Za-z0-9_-]+")  # a sessão MÍNIMA de teste: a única que abre sem a liberação e sem o guarda de clone
 GUARD = "remote-clone-guard.py"
 # Lançadores de pool do MINI: claude-lowprio.sh baixa a prioridade (renice) e carrega o A/B de --effort; claude-ctxcap-ab.sh carrega o A/B de --autocompact
@@ -287,6 +299,10 @@ class Cfg:
         self.cap = cap
         self.timeout, self.start_timeout, self.connect_timeout = (self.num(h, k, d) for k, d in
                                                                   (("timeout", 25), ("start_timeout", 60), ("connect_timeout", 10)))
+        # cache do list-running: ausente → LIST_TTL; 0 desliga; texto, bool, negativo ou acima do teto → recusa a config (nunca "ausente": um cache longo demais esconderia sessão que caiu)
+        self.list_ttl = h.get("list_cache_s", LIST_TTL)
+        if not isinstance(self.list_ttl, int) or isinstance(self.list_ttl, bool) or not 0 <= self.list_ttl <= LIST_TTL_MAX:
+            raise Fail(f"host {self.host}: 'list_cache_s' tem que ser um inteiro de 0 a {LIST_TTL_MAX} (0 desliga o cache do list-running) ({self.list_ttl!r})")
         self.ssh_opts = [str(x) for x in h.get("ssh_opts") or []]
         self.env_allow = set(h.get("env_allow") or [])
         self.mini_home = os.path.realpath(h.get("mini_home") or os.path.expanduser("~"))
@@ -778,7 +794,11 @@ T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após
         # registra ANTES do ssh: um start ambíguo (ssh cai ou estoura o tempo depois do script já ter rodado no host) deixa o registro,
         # e o list-running com o host fora do ar diz "não sei" em vez de "nada nosso lá"; só uma recusa clara do host o apaga
         cfg.mark(name, True)
-        rc, out, err = remote(cfg, body, start_timeout)
+        lr_invalidate(cfg)  # o list-running guardado deixa de valer ANTES do ssh que muda o host e de novo DEPOIS (mesmo se o ssh falhar ou ficar ambíguo): quem perguntou no meio não grava a lista de antes
+        try:
+            rc, out, err = remote(cfg, body, start_timeout)
+        finally:
+            lr_invalidate(cfg)  # depois do ssh do start
         if rc not in (0, EX_EXISTS):
             cfg.mark(name, False)
     if rc in (EX_CAP, EX_EXISTS, EX_POLICY, EX_PREP):
@@ -814,7 +834,11 @@ has @NAME@; [ $? -eq 1 ] || { echo "sessão @NAME@ continua aberta depois do sto
         cfg.log(f"stop {name}: sem recolhimento de worktree ({e})")
     if wt:  # só chega aqui com a sessão já fora (a conferência acima sai 1 se não): então recolhe o worktree, e o resultado NUNCA muda o rc do stop
         body += "\n" + wtclean_sh(wt, name) + "wtclean\nexit 0"
-    _, out, _ = run(cfg, "stop", body, dry, max(cfg.timeout, WT_STOP_FLOOR) if wt else 0)
+    try:
+        _, out, _ = run(cfg, "stop", body, dry, max(cfg.timeout, WT_STOP_FLOOR) if wt else 0)
+    finally:
+        if not dry:
+            lr_invalidate(cfg)  # stop, depois: a sessão sai da lista; vale também se o ssh falhou no meio (a sessão pode ter caído antes da falha)
     if not dry:
         meta_clear(cfg, name)
         verdict = ([ln[3:] for ln in out.splitlines() if ln.startswith("WT ")] or ["sem resposta do recolhimento"])[-1] if wt else ""  # vazio (sem WT) → "sem resposta", nunca "removed"
@@ -871,9 +895,94 @@ def op_peek(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     return 0
 
 
+# ---------- list-running: cache de TTL curto por host (ga-it7qiq.5) ----------
+# <estado>/<host>/lr/cache.json = {"gen", "ts", "live"} · lr/gen = a geração: um token novo a cada start/stop (lr_invalidate). O guardado só vale com a MESMA geração que o chamador lê agora,
+# então uma resposta que terminou de gravar depois de um start/stop (ou foi perguntada antes dele) fica morta mesmo que o apagar do arquivo tenha perdido a corrida.
+
+def lr_path(cfg: Cfg, leaf: str) -> str:
+    return os.path.join(cfg.state, "lr", leaf)
+
+
+def lr_gen(cfg: Cfg):
+    """A geração do cache deste host. "" = nunca houve start/stop (vale); None = não consegui ler: não sei se o guardado vale, então esta chamada NÃO lê nem grava cache."""
+    try:
+        with open(lr_path(cfg, "gen")) as f:
+            return f.read(64)
+    except FileNotFoundError:
+        return ""
+    except (OSError, ValueError):  # ValueError = bytes que não são texto
+        return None
+
+
+def lr_invalidate(cfg: Cfg) -> None:
+    """start e stop mudam o que o list-running tem que dizer: token de geração novo (troca atômica) e o cache apagado. Falhar NÃO derruba o start/stop (a falha vai para o log;
+    o guardado ainda morre sozinho em list_cache_s segundos)."""
+    try:
+        tmp = os.path.join(cfg.mkstate("lr"), f"gen.tmp{os.getpid()}")
+        with open(tmp, "w") as f:
+            f.write(f"{os.getpid()}.{time.time_ns()}.{os.urandom(4).hex()}")
+        os.replace(tmp, lr_path(cfg, "gen"))
+    except OSError as e:
+        cfg.log(f"list-running: não consegui trocar a geração do cache ({e}); o que está guardado vale no máximo {cfg.list_ttl}s")
+    try:
+        os.unlink(lr_path(cfg, "cache.json"))
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        cfg.log(f"list-running: não consegui apagar o cache ({e}); ele vale no máximo {cfg.list_ttl}s")
+
+
+def lr_read(cfg: Cfg, gen: str):
+    """A lista de uma resposta BOA do host, dentro do prazo e da mesma geração; senão None. None = pergunte ao host (sem arquivo, vencido, de outra geração, relógio que voltou ou
+    arquivo ilegível: nenhum desses vira lista). [] é uma resposta guardada de verdade ("o host respondeu que não tem sessão nossa")."""
+    try:
+        with open(lr_path(cfg, "cache.json")) as f:
+            c = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(c, dict):
+        return None
+    ts, live = c.get("ts"), c.get("live")
+    if c.get("gen") != gen or not isinstance(ts, (int, float)) or not isinstance(live, list) or not all(isinstance(x, str) for x in live):
+        return None
+    return live if 0 <= time.time() - ts < cfg.list_ttl else None  # idade negativa = o relógio voltou: não prova que está fresco
+
+
+def lr_write(cfg: Cfg, gen: str, ts: float, live: list) -> None:
+    """Guarda uma resposta BOA (troca atômica). Auxiliar: se não gravar, o custo é só o ssh da próxima chamada."""
+    tmp = os.path.join(cfg.state, "lr", f"cache.tmp{os.getpid()}")
+    try:
+        cfg.mkstate("lr")
+        with open(tmp, "w") as f:
+            json.dump({"gen": gen, "ts": ts, "live": live}, f)
+        os.replace(tmp, lr_path(cfg, "cache.json"))
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def host_live(cfg: Cfg, dry: bool) -> tuple:
+    """(sessões do host, t0). t0 = quando a pergunta ao host começou; None = a lista veio do cache e o host NÃO foi perguntado. Erro do host (Unreachable/Fail) sobe como
+    sempre: o cache só guarda resposta boa e NUNCA é o plano B de um erro (ssh tentado que falha = erro, não a lista de segundos atrás). Dentro do prazo o ssh nem é tentado: é a defasagem aceita."""
+    gen = None if dry or not cfg.list_ttl else lr_gen(cfg)  # None = sem cache nesta chamada (dry-run, cache desligado ou geração ilegível)
+    if gen is not None:
+        hit = lr_read(cfg, gen)
+        if hit is not None:
+            return hit, None
+    t0 = time.time()
+    _, out, _ = run(cfg, "list-running", "sessions", dry)
+    live = [x for x in out.split("\n") if x]
+    if gen is not None and lr_gen(cfg) == gen:  # start/stop (ou geração que sumiu/ilegível) durante a pergunta: a resposta pode ser de antes da mudança, não guarda
+        lr_write(cfg, gen, t0, live)
+    return live, t0
+
+
 def op_list_running(prefix: str, dry: bool) -> int:
     """Sessões de TODOS os hosts da config (ou só do $GC_SSH_HOST). Host que não responde = erro (o engine trata como lista parcial),
-    nunca "vazio" — salvo um host `sleeps` (notebook) sem nenhuma sessão nossa registrada: ali "não responde" é só o notebook fora do ar."""
+    nunca "vazio" — salvo um host `sleeps` (notebook) sem nenhuma sessão nossa registrada: ali "não responde" é só o notebook fora do ar.
+    Resposta boa de até `list_cache_s` s (10 por padrão) atrás é reaproveitada (host_live); start/stop do provider a invalidam."""
     if not re.fullmatch(r"[A-Za-z0-9_-]*", prefix or ""):
         raise Fail(f"prefixo inválido: {prefix!r}")
     cfg_hosts = load_config()[2].get("hosts")
@@ -883,9 +992,8 @@ def op_list_running(prefix: str, dry: bool) -> int:
     bad = []
     for h in hosts:
         cfg = Cfg(host=h)
-        t0 = time.time()
         try:
-            _, out, _ = run(cfg, "list-running", "sessions", dry)
+            live, t0 = host_live(cfg, dry)
         except Unreachable as e:  # só "não respondeu"; resposta truncada, tmux ilegível ou ssh que nem roda continuam erro
             if cfg.sleeps and not cfg.known():
                 cfg.log(f"list-running: host sem resposta e sem sessão nossa registrada, não conta: {e}")
@@ -895,11 +1003,10 @@ def op_list_running(prefix: str, dry: bool) -> int:
         except Fail as e:
             bad.append(str(e))
             continue
-        live = [x for x in out.split("\n") if x]
         for x in live:
             if x.startswith(prefix):
                 print(x)
-        if not dry:  # o host respondeu: o registro de sessões abertas volta a ser o que o host de fato tem
+        if not dry and t0 is not None:  # o host respondeu AGORA (lista do cache = host não perguntado, o registro fica como está): o registro de sessões abertas volta a ser o que o host de fato tem
             try:
                 run_d = os.path.join(cfg.state, "running")
                 for m in os.listdir(run_d):  # registro mais novo que a pergunta = start em curso que a lista não podia ver: fica

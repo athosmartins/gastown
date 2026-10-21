@@ -34,14 +34,18 @@
 #   confiança), o guarda de clone olha o worktree JÁ criado, wt-add / preparo / guarda que falham deixam o host como estava, teto e 'já existe' recusam ANTES de criar; o stop recolhe o limpo e publicado e MANTÉM
 #   o sujo, o não publicado e o que o git não consegue ler (e nunca muda o rc do stop); papel sem mapa e host sem a chave = como antes; nomes que o engine gera (dog-remote-<cauda>, dog-remote-adhoc-<10>) não são
 #   pedido de host (host fora da config no meio do nome segue recusando); o identity_pattern do runbook casa com eles e só com eles; contrato com o hetzner-remote-git.sh de verdade (caminhos e formatos).
+#   lr (ga-it7qiq.5) — cache de TTL curto do list-running: a 2ª chamada dentro do prazo não faz ssh e o prefixo filtra a lista guardada; start e stop invalidam (o start antes E depois do ssh dele, e uma resposta lida
+#   antes de um start que só chega depois dele não é guardada: ssh falso que SEGURA a resposta); erro, ssh fora e resposta cortada continuam erro e nada fica guardado, e cache vencido + host fora do ar é erro, não a lista
+#   velha; cache vencido, do futuro, vazio, ilegível ou de forma errada pergunta ao host; [] é resposta; geração ilegível = sem cache; dry-run não usa nem altera; list_cache_s (0 desliga, padrão 10, 0-120, o resto recusa a
+#   config); só o host com cache é poupado; lista do cache não mexe no registro de sessões; falha ao invalidar não derruba o start. A base de cfg()/cfgm() fixa list_cache_s=0 em todo host: os outros grupos esperam um ssh por list-running.
 # CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar: teto do host, nome
 #   exato (sessão, is-running, start), alvo de painel =nome:, guarda de /Users/, filtro de env, exit 2 das desconhecidas, marcador de fim,
 #   erro de ssh, flock, "tmux sem acesso" tolerado como "sem servidor", o `has` que engole o erro do tmux, melhor esforço da sessão
 #   ausente, o stop que não confere que a sessão sumiu, e o portão (sem a liberação, liberação de qualquer tipo, nome de teste frouxo ou sem
 #   âncora, sem conferir o sha do guarda, sem rodar o --selfcheck, script do host que sai 0, guarda irmão ilegível), e a regra de presença do MBP (grupo mbp: guarda de /Users/, validação da config, recusa/pausa/slot_cap, vigia, PATH extra,
-#   registro de sessões do list-running); 99 mutantes no total (26 do grupo wt: wt-add/wt-rm do provider, o guarda DEPOIS do wt-add, o recolhimento só do que não perde trabalho e os nomes do engine; 9 do ambiente limpo da sessão, grupo mbp: session_env, ZDOTDIR, PATH explícito e claude absoluto, ga-w7qwl1.1.5).
+#   registro de sessões do list-running); 132 mutantes no total (20 do grupo lr: o cache nunca lido, start sem invalidar antes / depois, stop sem invalidar, gravação sem conferir a geração, prazo e relógio, geração e forma do arquivo, dry-run, list_cache_s em cinco formas, geração ilegível ou ausente, registro acertado com lista do cache, falha ao invalidar derrubando o start; 26 do grupo wt: wt-add/wt-rm do provider, o guarda DEPOIS do wt-add, o recolhimento só do que não perde trabalho e os nomes do engine; 9 do ambiente limpo da sessão, grupo mbp: session_env, ZDOTDIR, PATH explícito e claude absoluto, ga-w7qwl1.1.5).
 #   Mais: contra um stub que só sai 0, quase tudo falha.
-# VARIÁVEIS: GCSSH_UNDER_TEST (script a testar) · GCSSH_ONLY (grupos separados por vírgula) · GCSSH_NO_MUTANTS=1
+# VARIÁVEIS: GCSSH_UNDER_TEST (script a testar) · GCSSH_ONLY (grupos separados por vírgula) · GCSSH_NO_MUTANTS=1 · GCSSH_MUTANTS_ONLY=<grupo> (pula os casos e roda só os mutantes desse grupo)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 P="${GCSSH_UNDER_TEST:-$HERE/gc-session-ssh}"
@@ -73,6 +77,8 @@ if [ -n "${FAKE_SSH_JUNK:-}" ]; then cat >/dev/null; echo "saida sem marcadores"
 if [ -n "${FAKE_SSH_CUT:-}" ]; then sh -c "$*" | grep -v '@@GC-END@@'; exit 0; fi
 if [ -n "${FAKE_SSH_RAN_255:-}" ]; then sh -c "$*" >/dev/null 2>&1; echo "Connection reset by peer" >&2; exit 255; fi  # o script RODOU no host, a conexão caiu depois
 sh -c "$*"; rc=$?
+[ -z "${FAKE_SSH_AFTER_MARK:-}" ] || : > "$FAKE_SSH_AFTER_MARK"  # o comando já rodou no "host" e a resposta ainda não voltou (o teste do cache espera por este arquivo)
+[ -z "${FAKE_SSH_DELAY_AFTER:-}" ] || sleep "$FAKE_SSH_DELAY_AFTER"  # resposta lenta: a lista é lida AGORA e só chega ao chamador N s depois
 [ -z "${FAKE_SSH_TIMES:-}" ] || echo "E $$ $(python3 -c 'import time;print(time.time())')" >> "$FAKE_SSH_TIMES"
 exit $rc
 EOF
@@ -81,7 +87,7 @@ chmod +x "$T/bin/ssh"
 cfg() {  # cfg CAP [TIMEOUT] [EXTRA-JSON-do-host-a]  → $T/cfg.json (host a: socket $SOCK; host b: socket ${SOCK}b, teto 1)
   jq -n --argjson cap "$1" --argjson to "${2:-25}" --argjson extra "${3:-{\}}" --arg rr "$RR" --arg rh "$RH" --arg s "$SOCK" \
     '{default_host:"a", hosts:{a:({ssh:"fakehost",cap:$cap,remote_root:$rr,remote_home:$rh,socket:$s,mini_home:"/Users/test",timeout:$to,start_timeout:$to,real_sessions_released_by:"selftest",worktree_prepare:false}+$extra),
-      b:{ssh:"fakehost",cap:1,remote_root:$rr,remote_home:$rh,socket:($s+"b"),mini_home:"/Users/test",real_sessions_released_by:"selftest",worktree_prepare:false}}}' > "$T/cfg.json"
+      b:{ssh:"fakehost",cap:1,remote_root:$rr,remote_home:$rh,socket:($s+"b"),mini_home:"/Users/test",real_sessions_released_by:"selftest",worktree_prepare:false}}} | .hosts |= map_values({list_cache_s:0} + .)' > "$T/cfg.json"  # list_cache_s:0 em todos os hosts: os grupos (menos lr) esperam um ssh por list-running; quem liga o cache passa list_cache_s no EXTRA
 }
 pv() {  # pv ARGS... < entrada  → RC, $T/out, $T/err
   env HOME="$T/home" GC_SSH_CONFIG="$T/cfg.json" GC_SSH_BIN="$T/bin/ssh" GC_EXEC_STATE_DIR="$T/state" FAKE_SSH_LOG="$T/ssh.log" \
@@ -309,7 +315,7 @@ cfgm() {  # cfgm [EXTRA-JSON-do-host-m]  → $T/cfg.json com a (padrão, sem reg
     '{default_host:"a", hosts:{a:{ssh:"fakehost",cap:3,remote_root:$rr,remote_home:$rh,socket:$s,mini_home:"/Users/test",real_sessions_released_by:"selftest",worktree_prepare:false},
       m:({ssh:"fakembp",cap:2,remote_root:$rr,remote_home:$rh,socket:($s+"m"),mini_home:"/Users/test",presence_gate:true,sleeps:true,watch_s:1,
          gate_cmd:[$chk],presence_lib:$lib,path_extra:[$ex],session_env:{path:[$sb,"/usr/bin","/bin"],claude:$cl},real_sessions_released_by:"selftest"}+$extra),
-      h:{ssh:"fakehost",cap:1,remote_root:"/Users/athos/gt-remote/bundle",remote_home:"/Users/athos",socket:($s+"h"),mini_home:"/Users/test",real_sessions_released_by:"selftest",worktree_prepare:false}}}' > "$T/cfg.json"
+      h:{ssh:"fakehost",cap:1,remote_root:"/Users/athos/gt-remote/bundle",remote_home:"/Users/athos",socket:($s+"h"),mini_home:"/Users/test",real_sessions_released_by:"selftest",worktree_prepare:false}}} | .hosts |= map_values({list_cache_s:0} + .)' > "$T/cfg.json"
 }
 setup_mbp() {
   mkdir -p "$T/lib" "$T/extra"
@@ -778,15 +784,98 @@ EOF
   rm -f "$T/home/.local/bin/claude" "$T/bin/secret"; unset FAKE_VAULT FAKE_SECRET_LOG; cfg 3
 }
 
-all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group acct && g_acct; return 0; }
+# ---------- lr: cache de TTL curto do list-running (ga-it7qiq.5) — só resposta BOA entra, start/stop invalidam, erro nunca vira lista ----------
+calls() { wc -l < "$T/ssh.log" | tr -d ' '; }
+lrv() { GC_SSH_HOST=a pv "$@"; }  # um host só: o número de linhas do ssh.log é o número de perguntas ao host
+age() { jq ".ts -= $2" "$1" > "$1.x" && mv "$1.x" "$1"; }  # envelhece o cache em $2 s
+waitfor() { local i; for i in $(seq 1 200); do [ -e "$1" ] && return 0; sleep 0.1; done; return 1; }
+bgenv() {  # bgenv LOG-DO-SSH SAÍDA ARGS... → o provider em segundo plano com o ssh falso registrando em outro log (as variáveis FAKE_SSH_* vêm de quem chama)
+  local lg="$1" out="$2"; shift 2
+  GC_SSH_HOST=a env HOME="$T/home" GC_SSH_CONFIG="$T/cfg.json" GC_SSH_BIN="$T/bin/ssh" GC_EXEC_STATE_DIR="$T/state" FAKE_SSH_LOG="$lg" "$P" "$@" >"$out" 2>"$out.err"; echo $? > "$out.rc"
+}
+g_lr() {
+  local LR="$T/state/a/lr" C="$T/state/a/lr/cache.json" bad x pid
+  # os grupos de antes (acct, wt…) deixam sessões no socket do host a, e com cap 3 o 1º start deste grupo bateria no teto: parte de um socket e de um estado limpos (só o socket DE TESTE, em $TMUX_TMPDIR)
+  tmux -L "$SOCK" kill-server 2>/dev/null
+  cfg 3 25 '{"list_cache_s":30}'; rm -rf "$LR" "$T/state/a/running"; fresh
+  [ "$(count)" = 0 ]; ok $? "lr: ponto de partida: nenhuma sessão no socket do host a"
+  pv start lr-1 < <(req cat); ok $RC "lr: o start abre a sessão (rc=$RC $(head -c 150 "$T/err"))"
+  [ ! -e "$C" ] && [ -s "$LR/gen" ]; ok $? "lr: o start troca a geração e deixa o cache vazio"
+  fresh; lrv list-running lr </dev/null; [ $RC = 0 ] && [ "$(cat "$T/out")" = lr-1 ] && [ "$(calls)" = 1 ] && [ -s "$C" ]; ok $? "lr: 1ª chamada pergunta ao host (1 ssh), devolve a lista e guarda a resposta (rc=$RC)"
+  fresh; lrv list-running lr </dev/null; [ $RC = 0 ] && [ "$(cat "$T/out")" = lr-1 ] && nossh; ok $? "lr: 2ª chamada dentro do prazo vem do cache: a mesma lista e nenhum ssh (rc=$RC)"
+  fresh; lrv list-running outro </dev/null; [ $RC = 0 ] && [ ! -s "$T/out" ] && nossh; ok $? "lr: o cache guarda a lista inteira e o prefixo filtra na saída (outro prefixo → vazio, sem ssh)"
+  fresh; lrv list-running "" </dev/null; [ "$(cat "$T/out")" = lr-1 ] && nossh; ok $? "lr: prefixo vazio lista tudo, também do cache"
+  # --- start e stop invalidam ---
+  pv start lr-2 < <(req cat); [ $RC = 0 ] && [ ! -e "$C" ]; ok $? "lr: start apaga o cache (rc=$RC)"
+  fresh; lrv list-running lr </dev/null; [ "$(sort "$T/out" | tr '\n' ' ')" = "lr-1 lr-2 " ] && [ "$(calls)" = 1 ]; ok $? "lr: depois do start a lista inclui a sessão nova (pergunta ao host, não serve a de antes)"
+  fresh; lrv list-running lr </dev/null; nossh; pv stop lr-2 </dev/null; [ $RC = 0 ] && [ ! -e "$C" ]; ok $? "lr: stop apaga o cache (rc=$RC)"
+  fresh; lrv list-running lr </dev/null; [ "$(cat "$T/out")" = lr-1 ] && [ "$(calls)" = 1 ]; ok $? "lr: depois do stop a sessão sumiu da lista (pergunta ao host)"
+  pv stop lr-nao-existe </dev/null; fresh; lrv list-running lr </dev/null; [ "$(calls)" = 1 ]; ok $? "lr: stop de sessão que não existe também invalida (não sei o que o host fez no meio)"
+  # --- prazo, relógio e forma do arquivo ---
+  fresh; lrv list-running lr </dev/null; nossh; age "$C" 100; fresh; lrv list-running lr </dev/null; [ "$(cat "$T/out")" = lr-1 ] && [ "$(calls)" = 1 ] && jq -e '.ts > (now - 20)' "$C" >/dev/null; ok $? "lr: cache vencido pergunta ao host de novo e renova o carimbo"
+  age "$C" -1000; fresh; lrv list-running lr </dev/null; [ "$(cat "$T/out")" = lr-1 ] && [ "$(calls)" = 1 ]; ok $? "lr: carimbo no FUTURO (relógio que voltou) não prova frescor: pergunta ao host"
+  for bad in '.live="lr-1"' '.live=[1,2]' '.live=null' '.gen="outra"' 'del(.gen)' 'del(.ts)' '.ts=true' '.ts="agora"' 'del(.live)'; do
+    fresh; lrv list-running lr </dev/null; jq "$bad" "$C" > "$C.x" && mv "$C.x" "$C"; fresh; lrv list-running lr </dev/null
+    [ $RC = 0 ] && [ "$(cat "$T/out")" = lr-1 ] && [ "$(calls)" = 1 ]; ok $? "lr: cache com a forma errada ($bad) é ignorado: pergunta ao host (rc=$RC)"
+  done
+  fresh; lrv list-running lr </dev/null; echo 'isto não é json' > "$C"; fresh; lrv list-running lr </dev/null; [ $RC = 0 ] && [ "$(cat "$T/out")" = lr-1 ] && [ "$(calls)" = 1 ] && jq -e '.live == ["lr-1"]' "$C" >/dev/null; ok $? "lr: cache ilegível é ignorado e reescrito (rc=$RC)"
+  : > "$C"; fresh; lrv list-running lr </dev/null; [ "$(cat "$T/out")" = lr-1 ] && [ "$(calls)" = 1 ]; ok $? "lr: cache VAZIO (arquivo de 0 bytes) é ignorado, não lido como lista vazia"
+  # --- erro nunca vira lista nem fica guardado ---
+  rm -f "$C"; fresh; FAKE_SSH_FAIL=1 lrv list-running lr </dev/null; [ $RC = 1 ] && [ ! -s "$T/out" ] && [ ! -e "$C" ]; ok $? "lr: host fora do ar = erro e NADA guardado (rc=$RC)"
+  fresh; FAKE_SSH_CUT=1 lrv list-running lr </dev/null; [ $RC = 1 ] && has "$T/err" 'sem marcadores' && [ ! -e "$C" ]; ok $? "lr: resposta cortada = erro e NADA guardado (rc=$RC)"
+  fresh; lrv list-running lr </dev/null; [ $RC = 0 ] && [ "$(cat "$T/out")" = lr-1 ] && [ "$(calls)" = 1 ]; ok $? "lr: com o host de volta a resposta é a de verdade (as falhas não deixaram lista nem 'vazio' guardados)"
+  age "$C" 100; fresh; FAKE_SSH_FAIL=1 lrv list-running lr </dev/null; [ $RC = 1 ] && [ ! -s "$T/out" ]; ok $? "lr: cache VENCIDO + host fora do ar = erro (a lista velha não é servida no lugar do erro) (rc=$RC)"
+  # --- resposta vazia é resposta; a geração vale ---
+  pv stop lr-1 </dev/null; fresh; lrv list-running lr </dev/null; [ $RC = 0 ] && [ ! -s "$T/out" ] && [ "$(calls)" = 1 ] && jq -e '.live == []' "$C" >/dev/null; ok $? "lr: o host respondeu que não tem sessão nossa → [] guardado (rc=$RC)"
+  fresh; lrv list-running lr </dev/null; [ $RC = 0 ] && [ ! -s "$T/out" ] && nossh; ok $? "lr: ...e [] vem do cache como resposta, sem ssh"
+  pv start lr-1 < <(req cat); fresh; lrv list-running lr </dev/null; [ "$(cat "$T/out")" = lr-1 ] && [ "$(calls)" = 1 ]; ok $? "lr: start depois do [] guardado: a lista nova aparece (o [] não fica preso)"
+  # --- o registro de sessões nossas só é acertado com resposta do host ---
+  mkdir -p "$T/state/a/running"; touch -t 202001010000 "$T/state/a/running/fantasma1"; age "$C" 100; fresh; lrv list-running lr </dev/null
+  [ ! -e "$T/state/a/running/fantasma1" ] && [ -e "$T/state/a/running/lr-1" ]; ok $? "lr: resposta do host acerta o registro (fantasma sai, sessão viva fica)"
+  touch -t 202001010000 "$T/state/a/running/fantasma2"; fresh; lrv list-running lr </dev/null; nossh; [ -e "$T/state/a/running/fantasma2" ]; ok $? "lr: lista vinda do cache NÃO mexe no registro (o host não foi perguntado)"
+  rm -f "$T/state/a/running/fantasma2"
+  # --- dry-run, 0 e padrão ---
+  fresh; cp "$C" "$T/c.before"; lrv --dry-run list-running lr </dev/null; [ $RC = 0 ] && has "$T/out" '"script"' && nossh && cmp -s "$C" "$T/c.before"; ok $? "lr: dry-run mostra o que rodaria, não usa nem altera o cache (rc=$RC)"
+  cfg 3 25 '{"list_cache_s":0}'; rm -rf "$LR"; fresh; lrv list-running lr </dev/null; lrv list-running lr </dev/null; [ "$(calls)" = 2 ] && [ ! -e "$C" ]; ok $? "lr: list_cache_s 0 desliga: 2 chamadas, 2 ssh e nada guardado"
+  cfg 3; jq 'del(.hosts.a.list_cache_s)' "$T/cfg.json" > "$T/cfg2.json" && mv "$T/cfg2.json" "$T/cfg.json"; fresh; lrv list-running lr </dev/null; lrv list-running lr </dev/null; [ "$(calls)" = 1 ] && [ -s "$C" ]; ok $? "lr: sem list_cache_s o padrão (10 s) vale: 2 chamadas, 1 ssh"
+  for bad in '"10"' true false -1 121 1.5 null '[]' '{}'; do
+    cfg 3 25 "{\"list_cache_s\":$bad}"; fresh; lrv list-running lr </dev/null; [ $RC = 1 ] && has "$T/err" "'list_cache_s'" && nossh; ok $? "lr: list_cache_s=$bad recusa a config nomeando a chave, sem ssh (rc=$RC)"
+  done
+  cfg 3 25 '{"list_cache_s":120}'; fresh; lrv list-running lr </dev/null; [ $RC = 0 ]; ok $? "lr: 120 (o teto) é aceito (rc=$RC)"
+  # --- vários hosts: só o host com cache é poupado ---
+  cfg 3 25 '{"list_cache_s":30}'; rm -rf "$LR"; fresh; pv list-running lr </dev/null; fresh; pv list-running lr </dev/null
+  [ $RC = 0 ] && [ "$(cat "$T/out")" = lr-1 ] && [ "$(calls)" = 1 ]; ok $? "lr: sem \$GC_SSH_HOST junta os hosts; o host com cache é poupado e o sem cache (b) é perguntado (rc=$RC, ssh=$(calls))"
+  # --- geração ilegível: sem cache nesta chamada, nem lido nem gravado ---
+  rm -rf "$LR/gen" "$C"; mkdir -p "$LR/gen"; fresh; lrv list-running lr </dev/null; lrv list-running lr </dev/null; [ $RC = 0 ] && [ "$(calls)" = 2 ] && [ ! -e "$C" ]; ok $? "lr: geração que não consigo ler = não sei se o cache vale → pergunta ao host sempre e não grava (rc=$RC)"
+  rmdir "$LR/gen"
+  # --- invalidar não pode derrubar o start ---
+  mkdir -p "$LR"; chmod 500 "$LR"; pv start lr-9 < <(req cat); x=$RC; chmod 700 "$LR"
+  [ $x = 0 ] && has "$T/state/a/session-ssh.log" 'não consegui trocar a geração'; ok $? "lr: não conseguir invalidar o cache (pasta sem escrita) não derruba o start, e a falha vai para o log (rc=$x)"
+  pv stop lr-9 </dev/null
+  # --- corrida: um list-running que estava em curso durante um start ---
+  cfg 3 25 '{"list_cache_s":30}'; rm -rf "$LR"; lrv list-running lr </dev/null; rm -f "$T/bg1.out"* "$T/ssh.bg1.log"
+  ( FAKE_SSH_DELAY=3 bgenv "$T/ssh.bg1.log" "$T/bg1.out" start lr-5 < <(req cat) ) & pid=$!
+  waitfor "$T/ssh.bg1.log"; fresh; lrv list-running lr </dev/null
+  [ "$(calls)" = 1 ]; ok $? "lr: com um start EM CURSO o list-running não serve o cache de antes (pergunta ao host)"
+  wait $pid; [ "$(cat "$T/bg1.out.rc" 2>/dev/null)" = 0 ]; ok $? "lr: ...e o start lento terminou bem (rc=$(cat "$T/bg1.out.rc" 2>/dev/null) $(head -c 150 "$T/bg1.out.err" 2>/dev/null))"
+  fresh; lrv list-running lr </dev/null; [ "$(sort "$T/out" | tr '\n' ' ')" = "lr-1 lr-5 " ] && [ "$(calls)" = 1 ]; ok $? "lr: ...e depois dele a lista tem a sessão nova (a resposta de antes, guardada no meio, morreu com o fim do start)"
+  rm -f "$C" "$T/bg2.out"* "$T/ssh.bg2.log" "$T/mark2"
+  ( FAKE_SSH_AFTER_MARK="$T/mark2" FAKE_SSH_DELAY_AFTER=3 bgenv "$T/ssh.bg2.log" "$T/bg2.out" list-running lr </dev/null ) & pid=$!
+  waitfor "$T/mark2"; pv start lr-6 < <(req cat); x=$RC
+  wait $pid; [ $x = 0 ] && [ "$(cat "$T/bg2.out.rc" 2>/dev/null)" = 0 ] && [ ! -e "$C" ]; ok $? "lr: resposta lida ANTES de um start, que só chega depois dele, não é guardada (start rc=$x, list rc=$(cat "$T/bg2.out.rc" 2>/dev/null))"
+  fresh; lrv list-running lr </dev/null; has "$T/out" lr-6 && [ "$(calls)" = 1 ]; ok $? "lr: ...e a lista seguinte tem a sessão do start (pergunta ao host)"
+  for x in lr-1 lr-5 lr-6; do pv stop $x </dev/null; done; rm -f "$T/state/a/running/"* 2>/dev/null; cfg 3
+}
+
+all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group acct && g_acct; group lr && g_lr; return 0; }
 
 if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
-all
-echo "== $((n-fails))/$n ok =="
+[ -n "${GCSSH_MUTANTS_ONLY:-}" ] || { all; echo "== $((n-fails))/$n ok =="; }  # GCSSH_MUTANTS_ONLY=grupo: pula os casos e roda só os mutantes cujo grupo é esse
 
 [ -n "${GCSSH_NO_MUTANTS:-}" ] || [ -n "${GCSSH_ONLY:-}" ] || {
   echo "-- controle negativo: cada guarda removida TEM que fazer o grupo que a cobre falhar"
   mutant() {  # mutant GRUPOS DESCRIÇÃO SED-EXPR  (a cópia mutada tem que diferir do original, senão o mutante não testou nada)
+    [ -z "${GCSSH_MUTANTS_ONLY:-}" ] || case ",$1," in *",$GCSSH_MUTANTS_ONLY,"*) ;; *) return;; esac
     local m="$T/mut.$RANDOM"; mkdir -p "$m"; sed -e "$3" "$P" > "$m/gc-session-ssh"; chmod +x "$m/gc-session-ssh"; cp "$(dirname "$P")/$GUARDF" "$m/$GUARDF" 2>/dev/null
     if cmp -s "$P" "$m/gc-session-ssh"; then ok 1 "mutante '$2': o sed não mudou nada (o teste do mutante está errado)"; return; fi
     local r; r=$(GCSSH_MUTANT=1 GCSSH_ONLY="$1" GCSSH_UNDER_TEST="$m/gc-session-ssh" bash "$0" 2>&1 | tail -1)
@@ -904,10 +993,32 @@ echo "== $((n-fails))/$n ok =="
   mutant acct "recusa da chave sem evento refused" 's/^                cfg.event("refused", name, reason=f"chave da conta Claude {email} indisponível")$/                pass/'
   mutant acct "chave como export (o vigia e o resto do lançador a herdam)" 's/    assign = "".join(f"{k}={q(v)} " for k, v in (secrets or {}).items())/    assign = "".join(f"export {k}={q(v)}; " for k, v in (secrets or {}).items())/'
   mutant acct "mensagem de recusa repete o que o secret escreveu" 's/ilegível (cofre fechado ou secret falhou, rc={r.returncode}/ilegível (cofre fechado ou secret falhou, rc={r.returncode} saída={tok}/'
+  mutant lr "cache nunca lido" 's/^        if hit is not None:$/        if False:/'
+  mutant lr "start não invalida ANTES do ssh" 's/^        lr_invalidate(cfg)  # o list-running guardado deixa.*$/        pass/'
+  mutant lr "start não invalida DEPOIS do ssh" 's/^            lr_invalidate(cfg)  # depois do ssh do start$/            pass/'
+  mutant lr "stop não invalida" 's/^            lr_invalidate(cfg)  # stop, depois.*$/            pass/'
+  mutant lr "resposta lida antes de um start/stop é gravada mesmo assim" 's/^    if gen is not None and lr_gen(cfg) == gen:/    if gen is not None:/'
+  mutant lr "prazo ignorado (cache vale para sempre)" 's/return live if 0 <= time.time() - ts < cfg.list_ttl else None/return live/'
+  mutant lr "relógio que voltou (idade negativa) vale" 's/return live if 0 <= time.time() - ts < cfg.list_ttl/return live if time.time() - ts < cfg.list_ttl/'
+  mutant lr "geração gravada no arquivo ignorada" 's/if c.get("gen") != gen or not isinstance(ts, (int, float))/if not isinstance(ts, (int, float))/'
+  mutant lr "forma da lista não conferida" 's/ or not isinstance(live, list) or not all(isinstance(x, str) for x in live)//'
+  mutant lr "dry-run usa o cache" 's/    gen = None if dry or not cfg.list_ttl else lr_gen(cfg)/    gen = None if not cfg.list_ttl else lr_gen(cfg)/'
+  mutant lr "list_cache_s 0 ainda grava" 's/    gen = None if dry or not cfg.list_ttl else lr_gen(cfg)/    gen = None if dry else lr_gen(cfg)/'
+  mutant lr "list_cache_s de qualquer forma aceito" 's/        if not isinstance(self.list_ttl, int) or isinstance(self.list_ttl, bool) or not 0 <= self.list_ttl <= LIST_TTL_MAX:/        if False:/'
+  mutant lr "list_cache_s booleano aceito" 's/ or isinstance(self.list_ttl, bool)//'
+  mutant lr "list_cache_s negativo aceito" 's/or not 0 <= self.list_ttl <= LIST_TTL_MAX:/or not -9 <= self.list_ttl <= LIST_TTL_MAX:/'
+  mutant lr "list_cache_s sem teto" 's/or not 0 <= self.list_ttl <= LIST_TTL_MAX:/or not 0 <= self.list_ttl:/'
+  mutant lr "sem list_cache_s o cache fica desligado" 's/h.get("list_cache_s", LIST_TTL)/h.get("list_cache_s", 0)/'
+  mutant lr "geração ilegível vale como 'sem invalidação'" '/ValueError = bytes que não são texto/{n;s/return None/return ""/;}'
+  mutant lr "geração ausente conta como ilegível (cache nunca liga antes do 1º start)" '/^def lr_gen/,/^def lr_invalidate/s/^        return ""$/        return None/'
+  mutant lr "lista do cache reconcilia o registro de sessões" 's/if not dry and t0 is not None:/if not dry:/'
+  mutant lr "falha ao invalidar derruba o start" 's/^        cfg.log(f"list-running: não consegui trocar a geração do cache.*$/        raise/'
+  [ -n "${GCSSH_MUTANTS_ONLY:-}" ] || {
   echo "-- contra um stub que só sai 0 (a versão 'anterior' não tinha provider nenhum)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"
   r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate,prep,wt,acct" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
   case "$r" in "RESULT 0/"*|"") ok 1 "stub deveria falhar quase tudo ($r)";; *) ok 0 "stub falha os casos novos ($r)";; esac
+  }
   echo "== final: $((n-fails))/$n ok =="
 }
 [ "$fails" = 0 ]
