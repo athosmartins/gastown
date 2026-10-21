@@ -16,11 +16,11 @@ Rodam no **mini**; o nó é alcançado por ssh (`HETZNER_NODE_HOST`, padrão `he
 
 ```bash
 bash scripts/hetzner-nodejs.sh check     # só lê. rc 0 igual ao pin · 1 ausente/quebrado/outra versão · 2 não consegui saber · 3 nó que o pin não cobre
-bash scripts/hetzner-nodejs.sh install   # idempotente: igual ao pin = não baixa nada. rc 4 recusado (hash, binário, arquivo comum no lugar do link, diretório da versão que não é o certo) · 5 download falhou
+bash scripts/hetzner-nodejs.sh install   # idempotente: igual ao pin = não baixa nada. rc 4 recusado (hash, binário, arquivo comum no lugar do link, diretório da versão que não é o certo) · 5 download falhou · 64 uso errado. Termina com a MESMA conferência do check: se depois de instalar não consegue ler o nó = rc 2, se lê e não está ok = rc 1
 bash scripts/hetzner-nodejs.selftest.sh  # hermético, ~40 s: ssh/curl/uname são stubs, o script remoto roda de verdade num HOME temporário; 14 mutantes
 ```
 
-O que o `install` faz no nó, nesta ordem: baixa o tarball de `https://nodejs.org/dist/v<V>/` para um diretório temporário em `~/.local` · confere o sha256 contra o hash do pin (que **vem do mini**, não de arquivo baixado pelo nó) · extrai · roda o binário e exige que ele diga `v<V>` · move para `~/.local/node-v<V>-linux-arm64` · **só então** troca os links `~/.local/node` e `~/.local/bin/node`. Qualquer recusa antes dessa última etapa deixa o nó como estava; o diretório temporário é sempre limpo.
+O que o `install` faz no nó, nesta ordem: baixa o tarball de `https://nodejs.org/dist/v<V>/` para um diretório temporário em `~/.local` · confere o sha256 contra o hash do pin (que **vem do mini**, não de arquivo baixado pelo nó) · extrai · roda o binário e exige que ele diga `v<V>` · move para `~/.local/node-v<V>-linux-arm64` · **só então** troca os links `~/.local/node` e `~/.local/bin/node`. Qualquer recusa antes dessa última etapa deixa o nó como estava; o diretório temporário é limpo na saída normal e na saída por erro (trap de EXIT). **SIGKILL, falta de memória ou queda de energia não rodam o trap** e podem deixar um `~/.local/.nodejs-install.*` (uns 100 MB) que nada varre: com nenhum `install` em curso, apague à mão (`ssh hetzner-teste 'rm -rf ~/.local/.nodejs-install.*'`).
 
 ## Como o hash foi autenticado
 `scripts/hetzner-nodejs.pin` guarda a versão e o sha256 do `node-v22.22.3-linux-arm64.tar.xz`. A linha veio do `SHASUMS256.txt` oficial, autenticado com a assinatura destacada (`.sig`) **e** com a clearsigned (`.asc`): as duas deram `GOODSIG`/`VALIDSIG` da chave `CC68F5A3106FF448322E48ED27F5E38D5B0A215F` (Marco Ippolito), que consta em `nodejs/release-keys` (`keys.list`) e no README do `nodejs/node`. O pin é **dado**: o script o lê por `grep`, nunca com `source`, e versão e hash passam por regex antes de ir ao ssh.
@@ -46,12 +46,12 @@ ssh hetzner-teste 'ln -sfn node-v<antiga>-linux-arm64 ~/.local/node'
 # liberar os 201 MB da versão (depois de desligar):
 ssh hetzner-teste 'rm -rf ~/.local/node-v22.22.3-linux-arm64'
 ```
-Depois de desligar, `hetzner-mac-only.ps.txt` precisa voltar a listar os 5 arquivos (hoje eles **ainda estão** na lista; ver abaixo).
+**Passo obrigatório depois de desligar o Node:** os 5 arquivos **já NÃO estão** em `scripts/hetzner-mac-only.ps.txt` (saíram na ga-2hd02v.4.10, merge `94091be13`), então precisam ser recolocados lá, sob o comentário do binário `node`: `tests/test_blow_rate_limit.py`, `tests/test_blow_budget.py`, `tests/test_blow_property_ids.py`, `tests/test_blow_scraper_ids_wiring.py` e `tests/test_scraper_status_blow_probe.py`. Sem isso, bead de PS que cite um deles vai ao nó e reprova com "node não está no PATH" (a falha de ambiente original).
 
 ## O que NÃO foi testado
-- **A lista mac-only do PS ainda não foi atualizada.** Os 5 arquivos seguem em `scripts/hetzner-mac-only.ps.txt` (conservador: bead que os cita vai ao mini). A edição fica para depois que a ga-2hd02v.4.8 (venv-ps, que reescreve esse mesmo arquivo) estiver na main; a prova de que podem sair é o A/B acima.
+- **Nada mecânico liga "os 5 arquivos estão fora da lista mac-only" a "o nó tem o Node".** A lista já foi atualizada (ga-2hd02v.4.10) e é estática; o Node é estado vivo do host. Se o nó for refeito sem Node, bead que cite esses arquivos vai ao nó e reprova alto em vez de ficar no mini. Guarda planejada: ga-2hd02v.4.11.
 - npm, `npm install` e puppeteer: de propósito fora de escopo. `scrapers/blow/package.json` depende de puppeteer; os 5 testes só precisam do binário (provado acima), mas um teste futuro que rode o scraper de verdade vai precisar de pacote e de navegador.
-- Instalação com o nó desligado ou ssh caindo no meio: o selftest cobre (ssh que cai antes e depois de responder = rc 2), não foi provocado ao vivo.
+- ssh caindo durante o `check` e durante o `install` (antes de o install rodar, depois de ele rodar com a saída completa, sem a sentinela `FIM`, e na conferência final): o selftest cobre, sempre rc 2, e cada um desses ramos tem mutante que o prova. Nada disso foi provocado ao vivo, e o nó desligado de verdade também não.
 
 ## Limites
 - Um symlink que já exista em `~/.local/node` ou `~/.local/bin/node` é tratado como nosso e trocado (o nó não tinha nenhum); só arquivo ou diretório comum é recusado.

@@ -14,7 +14,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 S="$HERE/hetzner-nodejs.sh"
 T=$(mktemp -d "${TMPDIR:-/tmp}/hnjs-selftest.XXXXXX") || exit 2; T=$(cd "$T" && pwd -P)   # pwd -P: no macOS /var é link para /private/var e o readlink -f do script remoto resolve
 trap 'find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null' EXIT
-STUBS="$T/stubs"; FIX="$T/fix"; FAKE_HOME="$T/home"; STUB_LOG="$T/stub.log"; PINF="$T/pin"
+STUBS="$T/stubs"; FIX="$T/fix"; FAKE_HOME="$T/home"; STUB_LOG="$T/stub.log"; PINF="$T/pin"; STUB_COUNT="$T/probe-count"
 mkdir -p "$STUBS" "$FIX"
 fails=0; n=0
 ok()  { n=$((n+1)); echo "ok   $1"; }
@@ -30,9 +30,20 @@ echo "SSH:$*" >> "$STUB_LOG"
 [ -n "${STUB_SSH_RC:-}" ] && exit "$STUB_SSH_RC"
 while [ $# -gt 0 ]; do case "$1" in -o) shift 2 ;; *) break ;; esac; done
 shift   # o host
-if [ -n "${STUB_SSH_DROP_FIM:-}" ]; then HOME="$FAKE_HOME" PATH="$STUBS:$PATH" bash -c "$*" | grep -v '^FIM$'; exit "${PIPESTATUS[0]}"; fi
-HOME="$FAKE_HOME" PATH="$STUBS:$PATH" bash -c "$*"; rc=$?
+kind=probe; case "$*" in "bash -s -- "*" "*) kind=install ;; esac   # o install leva dois argumentos (versão e hash), a sonda um
+if [ "$kind" = probe ]; then
+  n=$(( $(cat "$STUB_COUNT" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$STUB_COUNT"
+  [ "$n" = "${STUB_SSH_FAIL_PROBE_N:-0}" ] && exit 255   # a N-ésima sonda cai (a 2a é a conferência final do install)
+else
+  [ -n "${STUB_SSH_RC_INSTALL:-}" ] && exit "$STUB_SSH_RC_INSTALL"   # cai ANTES de o install rodar
+fi
+out=$(HOME="$FAKE_HOME" PATH="$STUBS:$PATH" bash -c "$*"); rc=$?
+[ -n "${STUB_SSH_DROP_FIM:-}" ] && out=$(printf '%s\n' "$out" | grep -v '^FIM$')
+[ "$kind" = install ] && [ -n "${STUB_SSH_DROP_FIM_INSTALL:-}" ] && out=$(printf '%s\n' "$out" | grep -v '^FIM$')
+[ "$kind" = probe ] && [ -n "${STUB_SSH_DROP_ARCH:-}" ] && out=$(printf '%s\n' "$out" | grep -v '^ARCH ')
+printf '%s\n' "$out"
 [ -n "${STUB_SSH_RC_AFTER:-}" ] && exit "$STUB_SSH_RC_AFTER"
+[ "$kind" = install ] && [ -n "${STUB_SSH_RC_AFTER_INSTALL:-}" ] && exit "$STUB_SSH_RC_AFTER_INSTALL"   # cai DEPOIS de o install rodar
 exit $rc
 STUB
 cat > "$STUBS/curl" <<'STUB'
@@ -52,7 +63,7 @@ case "${1:-}" in -s) echo "${STUB_OS:-Linux}" ;; -m) echo "${STUB_ARCH:-aarch64}
 STUB
 command -v sha256sum >/dev/null 2>&1 || printf '#!/usr/bin/env bash\nexec shasum -a 256 "$@"\n' > "$STUBS/sha256sum"
 chmod +x "$STUBS"/*
-export STUB_LOG FAKE_HOME STUBS FIX MBP_SSH="$STUBS/ssh" HETZNER_NODE_HOST=fake HETZNER_NODEJS_PIN="$PINF"
+export STUB_LOG STUB_COUNT FAKE_HOME STUBS FIX MBP_SSH="$STUBS/ssh" HETZNER_NODE_HOST=fake HETZNER_NODEJS_PIN="$PINF"
 
 # mkfix VERSÃO [VERSÃO QUE O BINÁRIO DIZ]: monta node-v<VERSÃO>-linux-arm64.tar.xz com bin/node falso; imprime o sha256
 mkfix() {
@@ -62,7 +73,7 @@ mkfix() {
   find "$T/mk" -mindepth 1 -delete; sha_of "$FIX/node-v$v-linux-arm64.tar.xz"
 }
 mkpin() { printf '# pin de teste\nNODE_VERSION=%s\nNODE_SHA256_LINUX_ARM64=%s\n' "$1" "$2" > "$PINF"; }
-reset() { find "$FAKE_HOME" -mindepth 1 -delete 2>/dev/null; mkdir -p "$FAKE_HOME/.local/bin"; : > "$STUB_LOG"; unset STUB_SSH_RC STUB_SSH_DROP_FIM STUB_SSH_RC_AFTER STUB_CURL STUB_OS STUB_ARCH; }
+reset() { find "$FAKE_HOME" -mindepth 1 -delete 2>/dev/null; mkdir -p "$FAKE_HOME/.local/bin"; : > "$STUB_LOG"; rm -f "$STUB_COUNT"; unset STUB_SSH_RC STUB_SSH_DROP_FIM STUB_SSH_RC_AFTER STUB_SSH_RC_INSTALL STUB_SSH_RC_AFTER_INSTALL STUB_SSH_DROP_FIM_INSTALL STUB_SSH_DROP_ARCH STUB_SSH_FAIL_PROBE_N STUB_CURL STUB_OS STUB_ARCH; }
 run() { ( cd "$T" && bash "${SCRIPT:-$S}" "$@" > "$T/out" 2>"$T/err" ); echo $?; }   # cwd = o temporário: o mutante sem regex EXECUTA a injeção, e o que ela criar não pode cair no repositório
 nodever() { "$FAKE_HOME/.local/bin/node" --version 2>/dev/null; }
 leftover() { find "$FAKE_HOME/.local" -maxdepth 1 -name '.nodejs-install.*' 2>/dev/null | wc -l | tr -d ' '; }
@@ -100,7 +111,16 @@ c_quebrado() { reset; mkpin 9.9.9 "$SHA9"; ln -s /nao/existe "$FAKE_HOME/.local/
 c_fora_do_pin() { reset; mkpin 9.9.9 "$SHA9"; printf '#!/bin/sh\necho v9.9.9\n' > "$FAKE_HOME/.local/bin/node"; chmod +x "$FAKE_HOME/.local/bin/node"; local rc; rc=$(run check); eq "v9.9.9 fora do diretório do pin: rc 1" 1 "$rc"; has "…diz diferente (não ok)" "$T/out" '^NODEJS diferente'; }
 c_versao_no_dir_certo() { reset; mkpin 9.9.9 "$SHA9"; local d="$FAKE_HOME/.local/node-v9.9.9-linux-arm64" rc; mkdir -p "$d/bin"; printf '#!/bin/sh\necho v9.9.8\n' > "$d/bin/node"; chmod +x "$d/bin/node"
   ln -s node-v9.9.9-linux-arm64 "$FAKE_HOME/.local/node"; ln -s ../node/bin/node "$FAKE_HOME/.local/bin/node"; rc=$(run check); eq "diretório certo com node de outra versão: rc 1" 1 "$rc"; has "…diz diferente (não ok)" "$T/out" '^NODEJS diferente'; }
-CASES="c_vazio c_feliz c_idem c_adulterado c_pin_errado c_dl_falha c_arch c_pin_ausente c_injecao c_repetida c_ssh_cai c_ssh_cai_depois c_sem_fim c_arquivo c_upgrade c_dir_errado c_binario_mente c_quebrado c_fora_do_pin c_versao_no_dir_certo"
+c_install_ssh_cai() { reset; mkpin 9.9.9 "$SHA9"; STUB_SSH_RC_INSTALL=255; export STUB_SSH_RC_INSTALL; local rc; rc=$(run install); eq "install: ssh cai na chamada do install: rc 2" 2 "$rc"; has "…NAO-CONSEGUI" "$T/out" 'NAO-CONSEGUI'
+  [ -L "$FAKE_HOME/.local/bin/node" ] && bad "…nada pode ser instalado" || ok "…nada instalado"; }
+c_install_ssh_cai_depois() { reset; mkpin 9.9.9 "$SHA9"; STUB_SSH_RC_AFTER_INSTALL=255; export STUB_SSH_RC_AFTER_INSTALL; local rc; rc=$(run install); eq "install: ssh cai DEPOIS de o install rodar (saída completa, rc 255): rc 2" 2 "$rc"; has "…NAO-CONSEGUI" "$T/out" 'NAO-CONSEGUI'; }
+c_install_sem_fim() { reset; mkpin 9.9.9 "$SHA9"; STUB_SSH_DROP_FIM_INSTALL=1; export STUB_SSH_DROP_FIM_INSTALL; local rc; rc=$(run install); eq "install: resposta do install sem a sentinela FIM: rc 2" 2 "$rc"; has "…diz que faltou a sentinela" "$T/out" 'sentinela FIM'; }
+c_conferencia_final_nao_le() { reset; mkpin 9.9.9 "$SHA9"; STUB_SSH_FAIL_PROBE_N=2; export STUB_SSH_FAIL_PROBE_N; local rc; rc=$(run install); eq "install ok mas a sonda FINAL não consegue ler: rc 2 (não 1)" 2 "$rc"; has "…NAO-CONSEGUI, não 'a conferência não fechou'" "$T/out" 'NAO-CONSEGUI'; hasnt "…não diz 'verificado e não ok'" "$T/out" 'não fechou'; }
+c_arch_sem_linha() { reset; mkpin 9.9.9 "$SHA9"; STUB_SSH_DROP_ARCH=1; export STUB_SSH_DROP_ARCH; local rc; rc=$(run check); eq "resposta com FIM mas sem a linha ARCH: rc 2 (não 3)" 2 "$rc"; has "…NAO-CONSEGUI" "$T/out" 'NAO-CONSEGUI'; hasnt "…não diz 'arquitetura'" "$T/out" '^NODEJS arquitetura'; }
+c_home_symlink() { reset; mkpin 9.9.9 "$SHA9"; local real=$FAKE_HOME rc; ln -sfn "$real" "$T/homelink"; export FAKE_HOME="$T/homelink"; rc=$(run install); eq "HOME que cruza symlink: install rc 0" 0 "$rc"; rc=$(run check); eq "…e o check seguinte diz ok (rc 0), não 'diferente'" 0 "$rc"
+  : > "$STUB_LOG"; rc=$(run install); eq "…e o install de novo não baixa nada (rc 0)" 0 "$rc"; hasnt "…sem curl" "$STUB_LOG" 'CURL:'; export FAKE_HOME="$real"; rm -f "$T/homelink"; }
+c_usage() { reset; local rc; rc=$(run); eq "sem subcomando: rc 64 (uso errado), não 2" 64 "$rc"; rc=$(run install --pin); eq "--pin sem argumento: rc 64" 64 "$rc"; }
+CASES="c_vazio c_feliz c_idem c_adulterado c_pin_errado c_dl_falha c_arch c_pin_ausente c_injecao c_repetida c_ssh_cai c_ssh_cai_depois c_sem_fim c_arquivo c_upgrade c_dir_errado c_binario_mente c_quebrado c_fora_do_pin c_versao_no_dir_certo c_install_ssh_cai c_install_ssh_cai_depois c_install_sem_fim c_conferencia_final_nao_le c_arch_sem_linha c_home_symlink c_usage"
 for c in $CASES; do echo "== $c"; $c; done
 
 # ---- mutantes: troca UMA substring exata e única do script; o caso apontado tem de FALHAR ----
@@ -132,6 +152,14 @@ mutant arquitetura-ignorada    '[ "$arch" = "Linux aarch64" ] ||'               
 mutant versao-nao-compara      'elif [ "$ver" = "v$V" ] && [ "$loc" = certo ]; then'          'elif [ "$loc" = certo ]; then'            c_versao_no_dir_certo
 mutant local-nao-compara       'elif [ "$ver" = "v$V" ] && [ "$loc" = certo ]; then'          'elif [ "$ver" = "v$V" ]; then'            c_fora_do_pin
 mutant temp-nao-limpa          'find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null' 'true'                              c_adulterado
+mutant conferencia-final-pulada 'probe
+report; exit $?' 'STATE=ok; DETAIL="(mutante)"
+report; exit $?' c_conferencia_final_nao_le
+mutant ssh-255-do-install-ignorado '255) die 2 "NAO-CONSEGUI: o ssh para $HOST caiu no meio; rode check antes de tentar de novo" ;;' '255) ;;' c_install_ssh_cai_depois
+mutant sem-fim-do-install-ignorado 'printf '"'"'%s\n'"'"' "$out" | grep -qx '"'"'FIM'"'"' || die 2' 'true || die 2' c_install_sem_fim
+mutant arch-vazio-vira-arquitetura '[ -n "$arch" ] || {' 'true || {' c_arch_sem_linha
+mutant home-literal-na-sonda 'H=$(cd "$HOME/.local" 2>/dev/null && pwd -P) || H=$HOME/.local' 'H=$HOME/.local' c_home_symlink
+mutant usage-sai-2 'usage() { echo "uso: hetzner-nodejs.sh check|install [--pin ARQUIVO]" >&2; exit 64; }' 'usage() { echo "uso: hetzner-nodejs.sh check|install [--pin ARQUIVO]" >&2; exit 2; }' c_usage
 mutant download-sem-rc         '--max-time 900 -o "$T/node.tar.xz" "https://nodejs.org/dist/v$V/$AD.tar.xz" ||' '--max-time 900 -o "$T/node.tar.xz" "https://nodejs.org/dist/v$V/$AD.tar.xz" || true ||' c_dl_falha
 
 echo

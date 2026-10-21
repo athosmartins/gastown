@@ -10,8 +10,8 @@
 #   check    só LÊ o nó. Diz se o node do nó é exatamente o do pin.
 #   install  baixa o tarball NO NÓ, confere o sha256 contra o hash do pin (que vem do mini, nunca de arquivo baixado pelo nó), extrai em ~/.local/node-v<V>-linux-arm64, roda o binário e só se ele disser v<V>
 #            troca os symlinks ~/.local/node e ~/.local/bin/node. Já está igual ao pin = não baixa nada (rc 0). Só o `node` ganha link: npm/npx ficam dentro do diretório, sem entrar no PATH.
-# CÓDIGOS: 0 igual ao pin / instalado · 1 check: ausente, quebrado ou outra versão · install: a conferência final não fechou · 2 NÃO consegui saber (pin ilegível ou ambíguo, ssh caiu, saída que não reconheço; nunca vira "ausente")
-#   3 o nó não é o que o pin cobre (SO/arquitetura) · 4 recusado (sha256 não confere, o binário diz outra versão, ARQUIVO COMUM no lugar de um dos links, diretório da versão que já existe e não é o node certo) · 5 download falhou
+# CÓDIGOS: 0 igual ao pin / instalado · 1 check: ausente, quebrado ou outra versão · install: depois de instalar a conferência final LEU o nó e ele não está ok (se não conseguiu ler é rc 2) · 2 NÃO consegui saber (pin ilegível ou ambíguo, ssh caiu, saída que não reconheço; nunca vira "ausente")
+#   3 o nó não é o que o pin cobre (SO/arquitetura) · 4 recusado (sha256 não confere, o binário diz outra versão, ARQUIVO COMUM no lugar de um dos links, diretório da versão que já existe e não é o node certo) · 5 download falhou · 64 uso errado (nunca 2, que é "não consegui saber")
 #   Um symlink que já exista em ~/.local/node ou ~/.local/bin/node é tratado como nosso e é trocado (o nó não tinha nenhum em 21/10); só arquivo ou diretório comum é recusado.
 # POR QUE É SEGURO: o estado antigo só muda nos dois `ln -sfn` do FIM do install; qualquer recusa antes deles deixa o nó como estava (o diretório novo da versão pode já existir, sem link apontando para ele). O pin é DADO (lido por grep, nunca `source`) e versão/hash passam por regex antes de ir ao ssh.
 #   O diretório de cada versão é imutável: trocar de versão não apaga a anterior (desfazer = religar os links; receita no runbook). Não usa sudo, apt, npm install nem toca no python/venv do nó.
@@ -27,7 +27,7 @@ PIN=${HETZNER_NODEJS_PIN:-$HERE/hetzner-nodejs.pin}
 RE_VER='^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'; RE_SHA='^[0-9a-f]{64}$'
 say() { echo "NODEJS $*"; }
 die() { local rc=$1; shift; say "$*"; exit "$rc"; }
-usage() { echo "uso: hetzner-nodejs.sh check|install [--pin ARQUIVO]" >&2; exit 2; }
+usage() { echo "uso: hetzner-nodejs.sh check|install [--pin ARQUIVO]" >&2; exit 64; }
 
 cmd=${1:-}; [ -n "$cmd" ] && shift
 case "$cmd" in check|install) ;; *) usage ;; esac
@@ -45,7 +45,8 @@ SHA=$(pin_get NODE_SHA256_LINUX_ARM64) || die 2 "NAO-CONSEGUI: $PIN não tem NOD
 # Só LÊ. Imprime ARCH, NODE e a sentinela FIM; sem a sentinela quem chama trata como "não consegui ler".
 remote_probe() { cat <<'EOF'
 V=$1
-H=$HOME/.local
+# vazio/falhou → ~/.local ainda não existe: fica o literal (o node estará ausente de qualquer jeito); existindo, o caminho CANÔNICO, porque o readlink -f abaixo também resolve tudo e $HOME pode cruzar um symlink
+H=$(cd "$HOME/.local" 2>/dev/null && pwd -P) || H=$HOME/.local
 echo "ARCH $(uname -s) $(uname -m)"
 n=$H/bin/node
 if [ -L "$n" ] || [ -e "$n" ]; then
@@ -102,6 +103,8 @@ probe() {
   out=$(remote_probe | "$SSH_BIN" "${SSH_OPTS[@]}" "$HOST" bash -s -- "$V" 2>/dev/null); rc=$?
   if [ $rc -ne 0 ] || ! printf '%s\n' "$out" | grep -qx 'FIM'; then STATE=nao-consegui; DETAIL="ssh para $HOST caiu (rc $rc) ou a resposta veio incompleta"; return 0; fi
   arch=$(printf '%s\n' "$out" | grep -E '^ARCH ' | head -n 1 | sed -e 's/^ARCH //')
+  # vazio → resposta sem a linha ARCH = nao-consegui (nunca "arquitetura outra"); lida e diferente → arquitetura
+  [ -n "$arch" ] || { STATE=nao-consegui; DETAIL="a resposta do nó veio sem a linha ARCH"; return 0; }
   [ "$arch" = "Linux aarch64" ] || { STATE=arquitetura; DETAIL="o nó é '${arch:-?}' e o pin cobre Linux aarch64"; return 0; }
   node=$(printf '%s\n' "$out" | grep -E '^NODE ' | head -n 1)
   case "$node" in
@@ -142,6 +145,6 @@ case $rc in
   *) die 1 "o instalador remoto saiu com rc $rc; rode check" ;;
 esac
 printf '%s\n' "$out" | grep -qx 'FIM' || die 2 "NAO-CONSEGUI: o instalador remoto terminou sem a sentinela FIM; rode check"
+# a conferência final usa o mesmo report do check: não consegui ler = rc 2, li e não está ok = rc 1, ok = rc 0
 probe
-[ "$STATE" = ok ] || { say "instalado mas a conferência final não fechou ($STATE: $DETAIL)"; exit 1; }
 report; exit $?
