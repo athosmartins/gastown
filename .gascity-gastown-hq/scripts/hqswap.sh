@@ -117,8 +117,8 @@ live_ignored() { local t; for t in $IGNORED; do printf '%s %s\n' "$t" "$(dolt --
 same_content() {  # $1 = destino rsync; vazio = idêntico em conteúdo. Horário de diretório (.d..t) só é registrado
   local out content
   out=$(rsync -a --checksum --delete --dry-run --itemize-changes "$D/$DB/" "$1/" 2>&1) || { log "rsync dry-run falhou: $out"; return 1; }
-  content=$(printf '%s\n' "$out" | grep -v '^\.d\.\.t[.]* ' | grep -v '^$')
-  [ -n "$out" ] && [ -z "$content" ] && log "só horário de diretório difere em $1: $(printf '%s' "$out" | tr '\n' ' ')"
+  content=$(printf '%s\n' "$out" | grep -v '^\.[fd]\.\.t[.]* ' | grep -v '^$')
+  [ -n "$out" ] && [ -z "$content" ] && log "só horário (arquivo/diretório) difere em $1: $(printf '%s' "$out" | tr '\n' ' ')"
   [ -z "$content" ] || { log "conteúdo difere em $1: $(printf '%s' "$content" | head -5 | tr '\n' ' ')"; return 1; }
 }
 mbp_identical() {
