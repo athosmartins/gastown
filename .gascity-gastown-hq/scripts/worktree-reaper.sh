@@ -331,7 +331,8 @@ _wt_fresh_epoch() {
   t="$(git -C "$wt" log -1 --format=%ct HEAD 2>/dev/null)"
   case "$t" in ''|*[!0-9]*) : ;; *) [ "$t" -gt "$best" ] && best="$t" ;; esac
   win=$(( gate_hours * 60 )); [ "$win" -ge "$MERGED_MIN_AGE_MIN" ] || win="$MERGED_MIN_AGE_MIN"; win=$(( win + 1 ))
-  # already younger than every threshold: the walk below could not change a decision
+  # younger than MERGED_MIN_AGE_MIN, which is below every age gate as shipped (30 min against gates of 12/24 h; a knob set past the gate
+  # would defeat this shortcut): the walk below could not change a decision
   [ $(( now_s - best )) -lt $(( MERGED_MIN_AGE_MIN * 60 )) ] && { printf '%s' "$best"; return 0; }
   # vazio → nothing inside changed within the window; falhou (rc != 0: an unreadable dir, a file that vanished mid-walk) → unknown, the tree is KEPT
   if [ "$_STAT_BSD" = "1" ]; then
@@ -360,7 +361,8 @@ _wt_lock_reason() {
 #   (1) a live process has its cwd, its executable or any open file inside → kept_in_use (kept_merged_in_use when the tree is
 #       merged: the name older scenarios and dashboards know), merged or not;
 #   (2) disk pressure removes only MERGED trees (PRESSURE_REAP_UNMERGED=1 restores the old rule): an unmerged one is
-#       kept_pressure_unmerged with its size, so what pressure no longer takes is visible, not silent. Literal reading of the
+#       kept_pressure_unmerged with its size_kb (null once PRESSURE_SIZE_BUDGET du calls were spent in the sweep, or when du
+#       fails), so what pressure no longer takes is visible, not silent. Literal reading of the
 #       bead's decision: an unmerged tree idle past STALE_HOURS is kept under pressure too, though normal mode would reap it
 #       (its age_h on the event says which); a disk that stays low for days therefore stops reclaiming unmerged trees.
 _keep_unsafe() {
@@ -742,7 +744,7 @@ _maybe_kill_zombie() {
 }
 
 # reap_zombie_locked <repo> <wt> <br> <reason> <age_h> <label>
-#   → 0 reaped | 1 dry-run logged | 3 remove failed |
+#   → 0 reaped | 1 nothing removed, already logged (dry-run intent, or kept_zombie_lock_in_use: ga-m5i7e6) | 3 remove failed |
 #     2 not a pid-confirmed zombie (verdict left in $_ZL_VERDICT): the caller hands the lock to
 #       _reap_or_log_unparseable_lock, which KEEPS it unless the tree independently proves safe
 #       (LOCK CONTRACT above) — "2" does not mean "keep".
@@ -1252,7 +1254,7 @@ reap_pool_worktrees() {
             reap_zombie_locked "$repo" "$wt" "$br" "$lock" "$age" "pool"; zrc=$?
             case "$zrc" in
               0) pool_reaped=$((pool_reaped+1)); zombie_reaped=$((zombie_reaped+1)) ;;
-              1) : ;;                                    # dry-run intent logged
+              1) : ;;                                    # nothing removed, already logged (dry-run intent, or kept_zombie_lock_in_use); not tallied here
               2)
                  # ga-vs6shu: not a pid-confirmed zombie — split "confirmed
                  # live" from "genuinely unparseable" instead of collapsing
@@ -1370,7 +1372,7 @@ for WT_DIR in $WT_DIRS; do
             skipped_dirty=$((skipped_dirty+1))
           fi
           ;;
-        *) skipped_dirty=$((skipped_dirty+1)) ;;   # dry-run / fail → leave it
+        *) skipped_dirty=$((skipped_dirty+1)) ;;   # dry-run / a process inside (kept_zombie_lock_in_use) / remove failed → leave it
       esac
     else
       skipped_dirty=$((skipped_dirty+1))   # dirty/locked (live) → has live WIP, leave it
