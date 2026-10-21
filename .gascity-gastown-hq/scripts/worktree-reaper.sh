@@ -60,6 +60,16 @@ PRESSURE_FREE_GB="${WORKTREE_REAPER_PRESSURE_FREE_GB:-8}"  # <this many GiB free
 # short enough to still resolve the reported multi-day pileup on the very next sweep.
 MERGED_MIN_AGE_MIN="${WORKTREE_REAPER_MERGED_MIN_AGE_MIN:-30}"
 case "$MERGED_MIN_AGE_MIN" in ''|*[!0-9]*) MERGED_MIN_AGE_MIN=30 ;; esac
+# ga-m5i7e6: how old a tree is = its FRESHEST sign of life (see _wt_fresh_epoch), not the mtime of its root directory, which
+# only moves when an entry is added or removed at the TOP level (a battery writing under pesquisa/ never touches it: six
+# traco-bim work trees, one with an agent inside, were reaped at "13-14 h"). 0 = the old rule, the directory mtime alone.
+ACTIVITY_SCAN="${WORKTREE_REAPER_ACTIVITY_SCAN:-1}"
+# ga-m5i7e6: under disk pressure the age gate used to drop to PRESSURE_HOURS for EVERY tree. Now pressure removes only
+# MERGED trees (their work is in main); an unmerged one is kept and logged with its size. 1 = the old behavior.
+PRESSURE_REAP_UNMERGED="${WORKTREE_REAPER_PRESSURE_REAP_UNMERGED:-0}"
+PRESSURE_SIZE_BUDGET=20     # du runs for at most this many pressure keeps per sweep (a huge tree costs seconds); the rest log size_kb null
+# vazio/falhou → treated as GNU stat (-c %Y); if that is wrong too, every freshness read fails and every tree is KEPT
+case "$(stat -f %m / 2>/dev/null)" in ''|*[!0-9]*) _STAT_BSD=0 ;; *) _STAT_BSD=1 ;; esac
 # ── zombie-lock reaping (wa-8y45): a worktree LOCKED by a stuck/ancient agent ─────
 ZOMBIE_LOCK_ENABLED="${WORKTREE_REAPER_ZOMBIE_LOCK_ENABLED:-1}"  # 0 = old behavior (skip ALL locked)
 ZOMBIE_HOURS="${WORKTREE_REAPER_ZOMBIE_HOURS:-48}"               # alive holder must EXCEED this AND be idle
@@ -276,13 +286,88 @@ _worktree_in_use() {
   #     "couldn't tell" with "confirmed free" — they are not the same value);
   #   - output exists → lsof is demonstrably working, so trust awk's match/no-match
   #     verdict on what it actually printed, regardless of lsof's own exit code.
+  # ga-m5i7e6: every open file counts, not only a cwd (-Fn lists the cwd, the executable, mapped files and each fd of every
+  # process): a battery whose cwd is elsewhere but writes its output inside the tree is just as much "in use".
+  # vazio → "cannot tell" = in use (below); falhou → same, its exit code is not consulted at all
   local lsof_out
-  lsof_out="$(lsof -d cwd -Fn 2>/dev/null)"
+  lsof_out="$(lsof -Fn 2>/dev/null)"
   [ -n "$lsof_out" ] || return 0
   printf '%s\n' "$lsof_out" | awk -v p="$path" '
     /^n/ { d = substr($0, 2); if (d == p || index(d, p "/") == 1) { found=1; exit } }
     END { exit(found ? 0 : 1) }
   '
+}
+
+# ── _mtime_of <path> — ga-m5i7e6: epoch mtime of a path. BSD `stat -f %m`; GNU stat answers `-f` with filesystem info, so
+# anything that is not all digits falls back to `stat -c %Y`. Prints nothing and returns 1 when neither reads it: the caller
+# decides what "unknown" means.
+_mtime_of() {
+  local v
+  # vazio/falhou → try the GNU form; neither answers → rc 1 and the caller KEEPS the tree
+  v="$(stat -f %m "$1" 2>/dev/null)"
+  case "$v" in ''|*[!0-9]*) v="$(stat -c %Y "$1" 2>/dev/null)" ;; esac
+  case "$v" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$v"
+}
+
+# ── _wt_fresh_epoch <wt> <now_s> — ga-m5i7e6: the newest sign of life of a worktree, as an epoch: its root directory's mtime,
+# its INDEX (every add/commit/checkout moves it), its HEAD commit, and any entry inside modified within the gate window
+# (`find -mmin`, the .git pointer pruned). Returns 1 when a signal that was asked for cannot be read: the caller KEEPS the
+# tree, an unreadable tree is not an old tree. ACTIVITY_SCAN=0 answers with the directory mtime alone (the old rule).
+_wt_fresh_epoch() {
+  local wt="$1" now_s="$2" best t idx win inside rc
+  best="$(_mtime_of "$wt")" || return 1
+  [ "$ACTIVITY_SCAN" = "1" ] || { printf '%s' "$best"; return 0; }
+  # vazio → no index file adds no signal; falhou → same, the other signals still count
+  idx="$(git -C "$wt" rev-parse --git-path index 2>/dev/null)"
+  if [ -n "$idx" ]; then
+    case "$idx" in /*) : ;; *) idx="$wt/$idx" ;; esac
+    t="$(_mtime_of "$idx")" && [ "$t" -gt "$best" ] && best="$t"
+  fi
+  # vazio/falhou → an unreadable HEAD adds no signal (the index and the files inside still count)
+  t="$(git -C "$wt" log -1 --format=%ct HEAD 2>/dev/null)"
+  case "$t" in ''|*[!0-9]*) : ;; *) [ "$t" -gt "$best" ] && best="$t" ;; esac
+  win=$(( gate_hours * 60 )); [ "$win" -ge "$MERGED_MIN_AGE_MIN" ] || win="$MERGED_MIN_AGE_MIN"; win=$(( win + 1 ))
+  # already younger than every threshold: the walk below could not change a decision
+  [ $(( now_s - best )) -lt $(( MERGED_MIN_AGE_MIN * 60 )) ] && { printf '%s' "$best"; return 0; }
+  # vazio → nothing inside changed within the window; falhou (rc != 0: an unreadable dir, a file that vanished mid-walk) → unknown, the tree is KEPT
+  if [ "$_STAT_BSD" = "1" ]; then
+    inside="$(find "$wt" -path "$wt/.git" -prune -o -mmin "-$win" -exec stat -f %m {} + 2>/dev/null)"; rc=$?
+  else
+    inside="$(find "$wt" -path "$wt/.git" -prune -o -mmin "-$win" -exec stat -c %Y {} + 2>/dev/null)"; rc=$?
+  fi
+  [ "$rc" -eq 0 ] || return 1
+  t="$(printf '%s\n' "$inside" | sort -rn | head -n 1)"
+  case "$t" in ''|*[!0-9]*) : ;; *) [ "$t" -gt "$best" ] && best="$t" ;; esac
+  printf '%s' "$best"
+}
+
+# ── _keep_unsafe <repo> <wt> <br> <age_h> <merged> — ga-m5i7e6: the checks EVERY removal path passes before it touches a
+# tree (the plain remove, the dirty-preserve force-remove, the lock reaps). 0 = KEEP it (the event is logged here), 1 = go on.
+#   (1) a live process has its cwd, its executable or any open file inside → kept_in_use (kept_merged_in_use when the tree is
+#       merged: the name older scenarios and dashboards know), merged or not, aged or not;
+#   (2) disk pressure removes only MERGED trees (PRESSURE_REAP_UNMERGED=1 restores the old rule): an unmerged one is
+#       kept_pressure_unmerged with its size, so what pressure no longer takes is visible, not silent.
+_keep_unsafe() {
+  local repo="$1" wt="$2" br="$3" age="$4" merged="$5" ev kb
+  if _worktree_in_use "$wt"; then
+    ev="kept_in_use"; [ "$merged" = "1" ] && ev="kept_merged_in_use"
+    printf '{"ts":"%s","event":"%s","repo":"%s","wt":"%s","branch":"%s","age_h":%s,"mode":"%s"}\n' \
+      "$(ts)" "$ev" "$(_json_esc "$(basename "$repo")")" "$(_json_esc "$(basename "$wt")")" "$(_json_esc "$br")" "$age" "$mode" >> "$LOG" 2>/dev/null
+    return 0
+  fi
+  if [ "$mode" = "pressure" ] && [ "$merged" != "1" ] && [ "$PRESSURE_REAP_UNMERGED" != "1" ]; then
+    kb=null
+    if [ "$PRESSURE_SIZE_BUDGET" -gt 0 ]; then
+      PRESSURE_SIZE_BUDGET=$((PRESSURE_SIZE_BUDGET-1))
+      # vazio/falhou → size_kb null: a log field only, the tree is kept either way
+      kb="$(du -sk "$wt" 2>/dev/null | awk '{print $1}')"; case "$kb" in ''|*[!0-9]*) kb=null ;; esac
+    fi
+    printf '{"ts":"%s","event":"kept_pressure_unmerged","repo":"%s","wt":"%s","branch":"%s","age_h":%s,"size_kb":%s,"reason":"disk pressure removes only merged trees"}\n' \
+      "$(ts)" "$(_json_esc "$(basename "$repo")")" "$(_json_esc "$(basename "$wt")")" "$(_json_esc "$br")" "$age" "$kb" >> "$LOG" 2>/dev/null
+    return 0
+  fi
+  return 1
 }
 
 # ── preserve_and_reap_dirty <repo> <wt> <br> <age> — ga-xv78c: an UNLOCKED pool
@@ -1108,7 +1193,14 @@ reap_pool_worktrees() {
           wt=""; continue
         fi
         local now_s; now_s=$(date +%s)
-        local mtime_s; mtime_s=$(stat -f %m "$wt" 2>/dev/null || echo 0)
+        # ga-m5i7e6: age = the freshest sign of life (_wt_fresh_epoch), not the root directory's mtime; a tree whose signals
+        # cannot be read is KEPT and logged, never aged by a guess.
+        local mtime_s
+        if ! mtime_s="$(_wt_fresh_epoch "$wt" "$now_s")"; then
+          kept=$((kept+1))
+          printf '{"ts":"%s","event":"kept_activity_unknown","repo":"%s","wt":"%s","branch":"%s"}\n' "$(ts)" "$(_json_esc "$(basename "$repo")")" "$(_json_esc "$(basename "$wt")")" "$(_json_esc "$br")" >> "$LOG" 2>/dev/null
+          wt=""; br=""; lock=""; continue
+        fi
         local age=$(( (now_s - mtime_s) / 3600 ))
         local age_min=$(( (now_s - mtime_s) / 60 ))
         # ga-t14of: a branch already merged into origin/<default> bypasses the age gate —
@@ -1120,9 +1212,10 @@ reap_pool_worktrees() {
         local merged=0
         if [ "$age_min" -ge "$MERGED_MIN_AGE_MIN" ] && _worktree_head_merged "$repo" "$wt"; then merged=1; fi
         if [ "$age" -le "$gate_hours" ] 2>/dev/null && [ "$merged" != "1" ]; then kept=$((kept+1)); wt=""; br=""; lock=""; continue; fi
-        if [ "$merged" = "1" ] && _worktree_in_use "$wt"; then
+        # ga-m5i7e6: in use / disk-pressure-unmerged is checked for EVERY tree about to be removed (it used to be the merged
+        # branch only), before the lock contract and the remove below.
+        if _keep_unsafe "$repo" "$wt" "$br" "$age" "$merged"; then
           kept=$((kept+1))
-          printf '{"ts":"%s","event":"kept_merged_in_use","repo":"%s","wt":"%s","branch":"%s","age_h":%s}\n' "$(ts)" "$(basename "$repo")" "$(basename "$wt")" "$br" "$age" >> "$LOG" 2>/dev/null
           wt=""; br=""; lock=""; continue
         fi
         # ── LOCKED worktree — the LOCK CONTRACT (see ZOMBIE-LOCK DETECTION): a pid-confirmed zombie is
@@ -1198,7 +1291,12 @@ for WT_DIR in $WT_DIRS; do
     # matters for symlinked deployments and the selftest's mktemp (/var → /private/var).
     d="$(cd "$d" 2>/dev/null && pwd -P)" || continue
     now_s=$(date +%s)
-    mtime_s=$(stat -f %m "$d")
+    # ga-m5i7e6: same freshest-signal age as the pool loop; unreadable → KEPT and logged
+    if ! mtime_s="$(_wt_fresh_epoch "$d" "$now_s")"; then
+      kept=$((kept+1))
+      printf '{"ts":"%s","event":"kept_activity_unknown","wt":"%s"}\n' "$(ts)" "$(_json_esc "$(basename "$d")")" >> "$LOG" 2>/dev/null
+      continue
+    fi
     age=$(( (now_s - mtime_s) / 3600 ))
     age_min=$(( (now_s - mtime_s) / 60 ))
     merged=0
@@ -1206,9 +1304,9 @@ for WT_DIR in $WT_DIRS; do
     # "merged" check alone would reap a just-created, not-yet-touched worktree too.
     if [ "$age_min" -ge "$MERGED_MIN_AGE_MIN" ] && _worktree_head_merged "$GT" "$d"; then merged=1; fi
     if [ "$age" -le "$gate_hours" ] && [ "$merged" != "1" ]; then kept=$((kept+1)); continue; fi
-    if [ "$merged" = "1" ] && _worktree_in_use "$d"; then
+    # ga-m5i7e6: in use / disk-pressure-unmerged for EVERY tree about to go (was: merged only)
+    if _keep_unsafe "$GT" "$d" "" "$age" "$merged"; then
       kept=$((kept+1))
-      printf '{"ts":"%s","event":"kept_merged_in_use","wt":"%s","age_h":%s}\n' "$(ts)" "$(basename "$d")" "$age" >> "$LOG" 2>/dev/null
       continue
     fi
     if [ "$ENABLED" != "1" ]; then
