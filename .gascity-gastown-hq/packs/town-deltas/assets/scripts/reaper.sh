@@ -92,6 +92,16 @@
 #         `wisps` is empty or unreadable (NOT EXISTS against an empty table makes EVERY child row
 #         an orphan). A halted sweep is counted and named in the DOG_DONE line
 #         (orphan_halted_dbs, orphan_halt) — never a silent skip.
+#         ga-32t5ds — THE FLOOR HAS A TAIL RULE. The floor was sized to drain 1.87 M rows; on the
+#         city volume (5-8 GiB free, 21/10) it kept 1,396 orphan rows (~11 MB) for two days with no
+#         mail. Under the floor a database whose WHOLE orphan backlog (the four child tables; one
+#         bounded anti-join each, LIMIT ceiling+1, measured once per database) is at most
+#         GC_REAPER_ORPHAN_TAIL_ROWS (default 20000, ~160 MB at ~8 KB/row; 0 = no tail rule) is still
+#         swept, while the free space is at least GC_REAPER_ORPHAN_TAIL_MIN_FREE_GB (default 4, above
+#         dolt-disk-floor-guard's CRITICAL 3 GB). A bigger backlog, less space, an unreadable df or a
+#         probe that did not answer keep the floor absolute, and orphan_halt says which. The floor
+#         itself (18 GiB) is unchanged. orphan_tail_dbs counts the databases swept this way, and the
+#         >1000 orphan count alert (note 7b) names the disk halt when it was this run's cause.
 #         LIVE CORRECTION (measured on the real hq, 19/09 23:31, 12,000 orphan events deleted with
 #         this script's statement shape): +97 MB, i.e. ~8 KB per row (2.7x the replica), and it did
 #         NOT fold back. The orphans live in oldgen, which the default GC (`CALL dolt_gc()` — all
@@ -198,6 +208,9 @@ ORPHAN_PAUSE_S="${GC_REAPER_ORPHAN_PAUSE_S:-0.2}"              # breather betwee
 # job (max(200% of the store, store + 3 GB): ~15 GiB for the 7.6 GB hq) and the disk guard's WARN.
 ORPHAN_MAX_ROWS="${GC_REAPER_ORPHAN_MAX_ROWS:-100000}"         # rows ONE run may sweep, all databases
 ORPHAN_MIN_FREE_GB="${GC_REAPER_ORPHAN_MIN_FREE_GB:-18}"       # no sweep below this much free disk on the city volume (0 = guard off)
+# ga-32t5ds (header note 6c): under that floor a database whose WHOLE orphan backlog is a small tail is still swept.
+ORPHAN_TAIL_ROWS="${GC_REAPER_ORPHAN_TAIL_ROWS:-20000}"        # tail ceiling in rows, ~160 MB at ~8 KB/row (0 = no tail rule: the floor is absolute)
+ORPHAN_TAIL_MIN_FREE_GB="${GC_REAPER_ORPHAN_TAIL_MIN_FREE_GB:-4}"   # the tail rule needs this much free disk (above dolt-disk-floor-guard's CRITICAL 3 GB)
 # ga-hpdpij (header note 7): a read-only COUNT of the orphan child rows every run — whether or not the sweep runs —
 # and a durable copy of the summary line.
 ORPHAN_COUNT="${GC_REAPER_ORPHAN_COUNT:-1}"                    # 0 switches the orphan COUNT off (the sweep has its own switch)
@@ -326,6 +339,8 @@ ORPHAN_CAPPED_DBS=0
 ORPHAN_FAILED=0
 ORPHAN_HALTED_DBS=0    # a safety rail cut the sweep of a database short (disk floor, Dolt unwell, empty wisps)
 ORPHAN_HALT_REASON=""  # short, comma-free: the LAST such reason, for the DOG_DONE line
+ORPHAN_TAIL_DBS=0      # databases swept UNDER the free-disk floor by the tail rule (ga-32t5ds)
+ORPHAN_DISK_HALTED_LIST=" "   # " db1 db2 ": the databases the free-disk floor halted, for the count alert's cause
 PURGE_TRIPPED=0        # the purge's consecutive-failure breaker fired in this run: Dolt is unwell
 TOTAL_WOULD_SWEEP=0
 ORPHAN_DEADLINE=""   # $SECONDS value the sweep must stop at; set lazily by its first use
@@ -401,6 +416,8 @@ validate_num ORPHAN_BUDGET_S 180 1
 validate_num ORPHAN_ALERT 5000 1
 validate_num ORPHAN_MAX_ROWS 100000 2   # 2, not 1: a one-row DELETE is never sent (delete_rows_bounded), so a cap of 1 would sweep nothing
 validate_num ORPHAN_MIN_FREE_GB 18 0
+validate_num ORPHAN_TAIL_ROWS 20000 0       # 0 = no tail rule
+validate_num ORPHAN_TAIL_MIN_FREE_GB 4 1    # 1, not 0: the tail rule is never free of an absolute floor
 validate_num ORPHAN_COUNT_ALERT 1000 1
 validate_num ORPHAN_COUNT_BUDGET_S 90 1
 validate_num SUMMARY_LOG_MAX_BYTES 262144 1024
@@ -1023,12 +1040,38 @@ halt_orphan_sweep() {  # halt_orphan_sweep <db> <reason> <mail:0|1>
     fi
 }
 
-halt_orphan_disk() {  # halt_orphan_disk <db> <orphan_disk_state rc: 1 = low, 2 = unreadable>
+halt_orphan_disk() {  # halt_orphan_disk <db> <orphan_disk_state rc: 1 = low, 2 = unreadable> [<why the tail rule did not apply>]
     if [ "$2" -eq 1 ]; then
-        halt_orphan_sweep "$1" "free disk $((ORPHAN_FREE_KB / 1048576)) GiB is below the floor of $ORPHAN_MIN_FREE_GB GiB (headroom the dolt_gc job needs)" 0
+        ORPHAN_DISK_HALTED_LIST="$ORPHAN_DISK_HALTED_LIST$1 "
+        halt_orphan_sweep "$1" "free disk $((ORPHAN_FREE_KB / 1048576)) GiB is below the floor of $ORPHAN_MIN_FREE_GB GiB (headroom the dolt_gc job needs)${3:+ $3}" 0
     else
         halt_orphan_sweep "$1" "free disk space could not be read (df -Pk $CITY_ABS); not sweeping blind" 1
     fi
+}
+
+# ga-32t5ds (header note 6c) — is the WHOLE orphan backlog of <db> a small tail? 0 = yes, at most ORPHAN_TAIL_ROWS rows
+# over the four child tables the sweep touches; 1 = it is bigger; 2 = it could not be measured (a probe that failed, or
+# the sweep's budget ran out first: "cannot tell" is never "small"). Bounded like the dry-run and count probes: an
+# anti-join with LIMIT ceiling+1, and the first table that pushes the sum over the ceiling ends the measuring.
+orphan_tail_fits() {  # orphan_tail_fits <db>
+    local db="$1" table
+    local total=0
+    for table in wisp_comments wisp_dependencies wisp_labels wisp_events; do
+        [ "$SECONDS" -lt "$ORPHAN_DEADLINE" ] || return 2
+        # vazio → a COUNT always answers, 0 = no orphan rows in this table; falhou/ilegível → SQL_COUNT_FAILED=1: return 2, the floor holds (get_sql_count raised the anomaly)
+        get_sql_count "$db" "orphan $table tail probe" "
+            SELECT COUNT(*) FROM (
+                SELECT 1 FROM \`$db\`.$table c
+                LEFT JOIN \`$db\`.wisps w ON w.id = c.issue_id
+                WHERE w.id IS NULL
+                LIMIT $((ORPHAN_TAIL_ROWS + 1))
+            ) orphan_tail_probe
+        "
+        [ "$SQL_COUNT_FAILED" -eq 0 ] || return 2
+        total=$((total + SQL_COUNT_RESULT))
+        [ "$total" -le "$ORPHAN_TAIL_ROWS" ] || return 1
+    done
+    return 0
 }
 
 sweep_orphan_children() {  # sweep_orphan_children <db>
@@ -1038,6 +1081,9 @@ sweep_orphan_children() {  # sweep_orphan_children <db>
     local capped=0
     local failed=0
     local halted=0
+    local tail_state=""   # the tail rule's verdict for this database, asked at most once per run: "" = not yet, else orphan_tail_fits' rc
+    local tail_round=0    # 1 = a round went ahead UNDER the floor because of the tail rule
+    local tail_note=""
     local sweep_t0=$SECONDS
 
     DB_ORPHANS=0
@@ -1083,8 +1129,27 @@ sweep_orphan_children() {  # sweep_orphan_children <db>
             # Free-disk floor, re-read every round: a drain that itself eats disk must see it.
             rc=0
             orphan_disk_state || rc=$?
+            tail_note=""
+            if [ "$rc" -eq 1 ] && [ "$ORPHAN_TAIL_ROWS" -gt 0 ]; then
+                # ga-32t5ds (header note 6c): under the floor a SMALL tail still goes. The floor was sized to drain
+                # 1.87 M rows; 1.4 k rows (~11 MB) sat under it for two days. The absolute tail floor is re-read every
+                # round (ORPHAN_FREE_KB is fresh); the backlog is measured once per database (cost: bounded anti-joins).
+                if [ "$ORPHAN_FREE_KB" -lt $((ORPHAN_TAIL_MIN_FREE_GB * 1048576)) ]; then
+                    tail_note="and is also below the tail floor of $ORPHAN_TAIL_MIN_FREE_GB GiB"
+                else
+                    if [ -z "$tail_state" ]; then
+                        tail_state=0
+                        orphan_tail_fits "$db" || tail_state=$?
+                    fi
+                    case "$tail_state" in
+                        0) rc=0; tail_round=1 ;;
+                        1) tail_note="and the orphan backlog is above the tail ceiling of $ORPHAN_TAIL_ROWS rows" ;;
+                        *) tail_note="and the orphan backlog could not be measured for the tail rule" ;;
+                    esac
+                fi
+            fi
             if [ "$rc" -ne 0 ]; then
-                halt_orphan_disk "$db" "$rc"
+                halt_orphan_disk "$db" "$rc" "$tail_note"
                 halted=1
                 break
             fi
@@ -1179,6 +1244,9 @@ sweep_orphan_children() {  # sweep_orphan_children <db>
     PURGE_START_EPOCH=$((PURGE_START_EPOCH + SECONDS - sweep_t0))
     ORPHAN_SWEPT=$((ORPHAN_SWEPT + swept_db))
     DB_ORPHANS=$swept_db
+    if [ "$tail_round" -eq 1 ] && [ "$swept_db" -gt 0 ]; then
+        ORPHAN_TAIL_DBS=$((ORPHAN_TAIL_DBS + 1))   # swept under the floor by the tail rule, and something went
+    fi
     DB_MUTATIONS=$((DB_MUTATIONS + swept_db))
     if [ "$capped" -eq 1 ]; then
         ORPHAN_CAPPED_DBS=$((ORPHAN_CAPPED_DBS + 1))
@@ -1211,7 +1279,7 @@ sweep_orphan_children() {  # sweep_orphan_children <db>
 # Sets ORPHAN_COUNT_TEXT: "off" | "unknown" | "N" | "N+" (see header note 7b).
 ORPHAN_COUNT_TABLES="wisp_comments wisp_labels wisp_events"   # small tables first, like the sweep
 count_orphan_children() {
-    local db table cap db_total deadline
+    local db table cap db_total deadline why
     local budget_hit=0
 
     ORPHAN_COUNT_TEXT="off"
@@ -1245,7 +1313,14 @@ count_orphan_children() {
             ORPHAN_COUNT_OVER_DBS=$((ORPHAN_COUNT_OVER_DBS + 1))
             # Stable text, NO counts: the mail dedupe keys on it, so this is sent once per TTL, not every run
             # the number moves. The number is orphan_count in the DOG_DONE line and in the durable log.
-            record_anomaly "$db" "more than $ORPHAN_COUNT_ALERT child rows of wisps that no longer exist (orphan_count in the DOG_DONE line): the orphan sweep is not keeping up (stopped, capped or off) or something deletes wisps without their children"
+            # ga-32t5ds: when the free-disk floor halted THIS database's sweep in this very run, say so — the alert's fixed
+            # text did not name the cause, and the floor's halt is silent by design (no mail), so the orphans sat for two
+            # days (21/10). Same rule as above: words only, no free-disk figure (that is orphan_halt in the DOG_DONE line).
+            why=""
+            if [[ "$ORPHAN_DISK_HALTED_LIST" == *" $db "* ]]; then
+                why=" - in THIS run the sweep of $db was halted by the free-disk floor (GC_REAPER_ORPHAN_MIN_FREE_GB; orphan_halt in the DOG_DONE line has the free space and why the small-tail rule did not apply)"
+            fi
+            record_anomaly "$db" "more than $ORPHAN_COUNT_ALERT child rows of wisps that no longer exist (orphan_count in the DOG_DONE line): the orphan sweep is not keeping up (stopped, capped or off) or something deletes wisps without their children$why"
         fi
     done <<EOF
 $COUNT_DBS
@@ -1685,7 +1760,7 @@ ISSUE_STEPS_STATE="off"
 # 19/09 failure ("error on line 6 ... wisp_events") was only ever in the mail.
 # ga-hpdpij: orphan_count* (the orphans LEFT, counted whether or not the sweep ran; "unknown" — never 0 — when
 # they could not be counted; header note 7b) go there too, right after orphan_halted_dbs.
-SUMMARY="reaper — stale_wisps:$TOTAL_STALE_WISPS, closed_wisps:$TOTAL_CLOSED_WISPS, purged:$TOTAL_PURGED, sessions-pruned:$TOTAL_SESSIONS_PRUNED, closed:$TOTAL_ISSUES_CLOSED, expired:$TOTAL_EXPIRED_ISSUES_CLOSED, expired_skipped:$TOTAL_EXPIRED_ISSUES_SKIPPED, skipped_non_city_issues:$TOTAL_STALE_ISSUES_SKIPPED, mail_wisps:$TOTAL_MAIL_WISPS, purge_age_h:$PURGE_AGE_H, purge_batches:$PURGE_BATCHES, purge_capped_dbs:$PURGE_CAPPED_DBS, purge_failed_chunks:$PURGE_FAILED_CHUNKS, purge_child_rows:$PURGE_CHILD_ROWS, orphan_swept:$ORPHAN_SWEPT, orphan_capped_dbs:$ORPHAN_CAPPED_DBS, orphan_failed_dbs:$ORPHAN_FAILED, orphan_halted_dbs:$ORPHAN_HALTED_DBS, orphan_count:$ORPHAN_COUNT_TEXT, orphan_count_unknown:$ORPHAN_COUNT_UNKNOWN, orphan_count_over_dbs:$ORPHAN_COUNT_OVER_DBS, schema_skipped_dbs:$SCHEMA_SKIPPED_DBS, issue_steps:$ISSUE_STEPS_STATE, anomalies:$ANOMALY_COUNT"
+SUMMARY="reaper — stale_wisps:$TOTAL_STALE_WISPS, closed_wisps:$TOTAL_CLOSED_WISPS, purged:$TOTAL_PURGED, sessions-pruned:$TOTAL_SESSIONS_PRUNED, closed:$TOTAL_ISSUES_CLOSED, expired:$TOTAL_EXPIRED_ISSUES_CLOSED, expired_skipped:$TOTAL_EXPIRED_ISSUES_SKIPPED, skipped_non_city_issues:$TOTAL_STALE_ISSUES_SKIPPED, mail_wisps:$TOTAL_MAIL_WISPS, purge_age_h:$PURGE_AGE_H, purge_batches:$PURGE_BATCHES, purge_capped_dbs:$PURGE_CAPPED_DBS, purge_failed_chunks:$PURGE_FAILED_CHUNKS, purge_child_rows:$PURGE_CHILD_ROWS, orphan_swept:$ORPHAN_SWEPT, orphan_capped_dbs:$ORPHAN_CAPPED_DBS, orphan_failed_dbs:$ORPHAN_FAILED, orphan_halted_dbs:$ORPHAN_HALTED_DBS, orphan_tail_dbs:$ORPHAN_TAIL_DBS, orphan_count:$ORPHAN_COUNT_TEXT, orphan_count_unknown:$ORPHAN_COUNT_UNKNOWN, orphan_count_over_dbs:$ORPHAN_COUNT_OVER_DBS, schema_skipped_dbs:$SCHEMA_SKIPPED_DBS, issue_steps:$ISSUE_STEPS_STATE, anomalies:$ANOMALY_COUNT"
 if [ -n "$DRY_RUN" ]; then
     SUMMARY="$SUMMARY, would_close_wisps:$TOTAL_WOULD_CLOSE_WISPS, would_expire:$TOTAL_WOULD_EXPIRE, would_purge:$TOTAL_WOULD_PURGE, would_sweep:$TOTAL_WOULD_SWEEP (dry run)"
 fi
