@@ -72,6 +72,16 @@ PRESSURE_REAP_UNMERGED="${WORKTREE_REAPER_PRESSURE_REAP_UNMERGED:-0}"
 PRESSURE_SIZE_BUDGET=20     # du runs for at most this many pressure keeps per sweep (a huge tree costs seconds); the rest log size_kb null
 # vazio/falhou → treated as GNU stat (-c %Y); if that is wrong too, every freshness read fails and every tree is KEPT
 case "$(stat -f %m / 2>/dev/null)" in ''|*[!0-9]*) _STAT_BSD=0 ;; *) _STAT_BSD=1 ;; esac
+# ga-xpoj67: `git worktree remove` counts only tracked and untracked files as dirt, so what git IGNORES goes with the tree — the battery outputs
+# under an ignored pesquisa/ of a MERGED idle tree went that way (21/10). Before ANY removal the tree's ignored files are measured
+# (_ignored_data_scan): those that are not junk by name (IGNORED_JUNK_RE: regenerable, or tool state) and add up to IGNORED_MIN_KB or more keep
+# the tree (kept_ignored_data), locked or not. Only 0 on the guard = the old rule (ignored files go with the tree); anything else is "on".
+IGNORED_GUARD="${WORKTREE_REAPER_IGNORED_DATA_GUARD:-1}"
+IGNORED_MIN_KB="${WORKTREE_REAPER_IGNORED_MIN_KB:-1}"       # du KiB (a non-empty file is >= 1): the "small limit" below which ignored data does not hold a tree
+case "$IGNORED_MIN_KB" in ''|*[!0-9]*) IGNORED_MIN_KB=1 ;; esac
+[ "$IGNORED_MIN_KB" -ge 1 ] || IGNORED_MIN_KB=1             # 0 would read an empty listing as "data"
+IGNORED_JUNK_RE='(^|/)(\.venv|venv|node_modules|__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|build|dist|\.beads)(/|$)|\.pyc$|\.sw[op]$|(^|/)(\.DS_Store|Thumbs\.db|\.claude/settings\.local\.json)$'
+[ -z "${WORKTREE_REAPER_IGNORED_JUNK_RE:-}" ] || IGNORED_JUNK_RE="$WORKTREE_REAPER_IGNORED_JUNK_RE"
 # ── zombie-lock reaping (wa-8y45): a worktree LOCKED by a stuck/ancient agent ─────
 ZOMBIE_LOCK_ENABLED="${WORKTREE_REAPER_ZOMBIE_LOCK_ENABLED:-1}"  # 0 = old behavior (skip ALL locked)
 ZOMBIE_HOURS="${WORKTREE_REAPER_ZOMBIE_HOURS:-48}"               # alive holder must EXCEED this AND be idle
@@ -355,6 +365,56 @@ _wt_lock_reason() {
   git -C "$1" worktree list --porcelain 2>/dev/null | awk -v p="$2" '$1=="worktree"{c=$2} $1=="locked"{ if(c==p){ $1=""; sub(/^ /,""); if ($0=="") $0="(no reason)"; print; exit } }'
 }
 
+# ── _ignored_data_scan <wt> — ga-xpoj67: what the tree holds that git IGNORES and no rule calls junk. Entries are what
+# `git ls-files -o -i --directory` prints (an ignored directory is ONE entry, trailing /, sized with du); one matching IGNORED_JUNK_RE is skipped.
+# Sets _ID_KB (the total, KiB) and _ID_TOP (JSON: the 5 largest, largest first, {"path","kb"}). rc 0 = data worth keeping (total >= IGNORED_MIN_KB),
+# 1 = none (nothing ignored, only junk, or under the limit), 2 = could not tell (mktemp or git failed): the caller KEEPS the tree. A size du cannot
+# read counts 1 KiB (an entry git listed is never "nothing"), and so does every entry past the 200th, which gets no du: the cost stays bounded
+# and the verdict can only grow.
+_ignored_data_scan() {
+  local wt="$1" tmp rc path kb n=0 total=0 rows="" sep="" tab=$'\t'
+  _ID_KB=0; _ID_TOP="[]"
+  tmp="$(mktemp 2>/dev/null)" || return 2
+  # vazio → nothing is ignored (rc 1 below); falhou (rc != 0: git broke, not a work tree) → rc 2 and the caller KEEPS the tree
+  git -C "$wt" ls-files -z -o -i --exclude-standard --directory --no-empty-directory >"$tmp" 2>/dev/null; rc=$?
+  if [ "$rc" -ne 0 ] || [ ! -f "$tmp" ]; then rm -f "$tmp"; return 2; fi
+  while IFS= read -r -d '' path; do
+    [[ "$path" =~ $IGNORED_JUNK_RE ]] && continue
+    kb=1
+    if [ "$n" -lt 200 ]; then
+      # vazio/falhou → 1 KiB: git lists the entry, so it still holds the tree
+      kb="$(du -sk -- "$wt/${path%/}" 2>/dev/null | awk '{print $1; exit}')"; case "$kb" in ''|*[!0-9]*) kb=1 ;; esac
+    fi
+    n=$((n+1)); total=$((total+kb)); rows="$rows$kb$tab$path"$'\n'
+  done <"$tmp"   # third-state-waiver: $tmp exists (checked above) and was written by a command whose exit code was checked; an empty file is git's answer "nothing is ignored"
+  rm -f "$tmp"
+  [ "$n" -gt 0 ] && [ "$total" -ge "$IGNORED_MIN_KB" ] || return 1
+  _ID_KB="$total"
+  # vazio → no row survives and top stays []; falhou → the same, the total above still holds the tree
+  while IFS="$tab" read -r kb path; do
+    case "$kb" in ''|*[!0-9]*) continue ;; esac
+    _ID_TOP="${_ID_TOP%]}${sep}{\"path\":\"$(_json_esc "$path")\",\"kb\":$kb}]"; sep=","
+  done < <(printf '%s' "$rows" | sort -rn | head -n 5)
+  return 0
+}
+
+# ── _keep_ignored_data <repo> <wt> <br> <age_h> [locked] — ga-xpoj67: 0 = KEEP the tree (the event is logged here), 1 = go on. kept_ignored_data
+# carries the total size and the 5 largest ignored paths; kept_ignored_data_unknown (size null) is a listing that could not be read — a tree whose
+# ignored files cannot be listed is not a tree without any. IGNORED_GUARD=0 is the old rule: always 1.
+_keep_ignored_data() {
+  local repo="$1" wt="$2" br="$3" age="$4" lk="${5:-}" rc ev
+  [ "$IGNORED_GUARD" != "0" ] || return 1
+  _ignored_data_scan "$wt"; rc=$?
+  case "$rc" in
+    1) return 1 ;;
+    0) ev="kept_ignored_data" ;;
+    *) ev="kept_ignored_data_unknown"; _ID_KB=null ;;
+  esac
+  printf '{"ts":"%s","event":"%s","repo":"%s","wt":"%s","branch":"%s","age_h":%s,"mode":"%s","locked":%s,"size_kb":%s,"top":%s}\n' \
+    "$(ts)" "$ev" "$(_json_esc "$(basename "$repo")")" "$(_json_esc "$(basename "$wt")")" "$(_json_esc "$br")" "$age" "$mode" "$([ -n "$lk" ] && echo true || echo false)" "$_ID_KB" "$_ID_TOP" >> "$LOG" 2>/dev/null
+  return 0
+}
+
 # ── _keep_unsafe <repo> <wt> <br> <age_h> <merged> — ga-m5i7e6: the checks every tree passes before the plain remove and the
 # dirty-preserve force-remove (callers skip it for a LOCKED unmerged tree: the lock contract asks _worktree_in_use itself, and
 # reap_zombie_locked has its own check). 0 = KEEP it (the event is logged here), 1 = go on.
@@ -365,6 +425,8 @@ _wt_lock_reason() {
 #       fails), so what pressure no longer takes is visible, not silent. Literal reading of the
 #       bead's decision: an unmerged tree idle past STALE_HOURS is kept under pressure too, though normal mode would reap it
 #       (its age_h on the event says which); a disk that stays low for days therefore stops reclaiming unmerged trees.
+#   (3) ga-xpoj67: the tree holds files git IGNORES that are not junk by name (_keep_ignored_data) → kept_ignored_data, merged or not: the plain
+#       remove and the dirty-preserve force-remove below both take ignored files with the tree.
 _keep_unsafe() {
   local repo="$1" wt="$2" br="$3" age="$4" merged="$5" ev kb
   if _worktree_in_use "$wt"; then
@@ -384,6 +446,7 @@ _keep_unsafe() {
       "$(ts)" "$(_json_esc "$(basename "$repo")")" "$(_json_esc "$(basename "$wt")")" "$(_json_esc "$br")" "$age" "$kb" >> "$LOG" 2>/dev/null
     return 0
   fi
+  _keep_ignored_data "$repo" "$wt" "$br" "$age" && return 0
   return 1
 }
 
@@ -770,6 +833,8 @@ reap_zombie_locked() {
     printf '{"ts":"%s","event":"kept_zombie_lock_in_use","repo":"%s","wt":"%s","branch":"%s","pid":%s,"age_h":%s,"label":"%s"}\n' "$(ts)" "$(_json_esc "$(basename "$repo")")" "$(_json_esc "$(basename "$wt")")" "$(_json_esc "$br")" "$pid" "$age" "$(_json_esc "$label")" >> "$LOG" 2>/dev/null
     return 1
   fi
+  # ga-xpoj67: ... nor of what git ignores in it, which the same `remove -f -f` takes too (the lock contract skips _keep_unsafe)
+  if _keep_ignored_data "$repo" "$wt" "$br" "$age" locked; then return 1; fi
   if [ "$ENABLED" != "1" ]; then
     printf '{"ts":"%s","event":"would_reap_zombie_lock","repo":"%s","wt":"%s","branch":"%s","pid":%s,"why":"%s","age_h":%s,"label":"%s"}\n' "$(ts)" "$(basename "$repo")" "$(basename "$wt")" "$br" "$pid" "$why" "$age" "$label" >> "$LOG" 2>/dev/null
     return 1
@@ -1075,6 +1140,8 @@ _reap_or_log_unparseable_lock() {
      && [ "$_status_rc" -eq 0 ] && [ -z "$_status_out" ] \
      && { [ "$_unused" = "1" ] || ! _worktree_in_use "$wt"; }; then
     # The event names which proof reaped it; the ancestry one keeps its ga-vs6shu name.
+    # ga-xpoj67: every proof above is about the tree's TRACKED content; the `remove -f -f` below takes what git ignores too
+    if _keep_ignored_data "$repo" "$wt" "$br" "$age" locked; then return 1; fi
     local _ev_reaped="reaped_locked_unparseable_safe" _ev_would="would_reap_locked_unparseable_safe" _del_proof="" _ev_verdict=""
     if [ "$_proof" = "patch_equivalent" ]; then
       _ev_reaped="reaped_locked_unparseable_patch_equivalent"
