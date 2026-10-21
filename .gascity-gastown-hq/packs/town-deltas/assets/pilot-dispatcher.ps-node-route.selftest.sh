@@ -276,9 +276,34 @@ a1=$(lnof '      ps-worker-remote)'); a2=$(awk -v a="${a1:-0}" 'NR>a && index($0
 { [ -n "$a1" ] && [ -n "$a2" ] && [ "$a1" -lt "$a2" ]; } && ok "o braço ps-worker-remote) do spawn vem ANTES de ps-worker*) (que o casaria)" || fail "ordem dos braços ($a1, $a2)"
 ARM="$(awk -v a="$a1" -v b="$a2" 'NR>a && NR<b' "$DISPATCHER" | grep -v '^ *#')"
 printf '%s' "$ARM" | grep -qE 'session new|routed_to' && fail "o braço ps-worker-remote) abre sessão ou carimba rota: $ARM" || ok "o braço ps-worker-remote) só loga (nem session new nem gc.routed_to)"
-grep -qF -- '[ "${_PILOT_NODE_ONLY:-0}" = "1" ] && [ "$_SLING_TARGET" != "ps-worker-remote" ]; then' "$DISPATCHER" && ok "o elif só-nó do WA não solta a bead que o PS acabou de levar" || fail "falta o guarda no elif só-nó do WA"
+grep -qF -- 'if [ "$_RP_PS_NODE_RC" != 0 ]; then' "$DISPATCHER" && ok "o gancho do WA (e o elif só-nó dele) fica dentro de um if que a bead levada pelo PS não atravessa" || fail "falta o if em volta do gancho do WA"
 grep -qF -- 'ps-*) _pilot_node_only_ps_pre "$_b" && return 0; return 1 ;; esac' "$DISPATCHER" && ok "a candidata da passada só-nó de uma bead ps-* vai para a sonda do PS" || fail "falta a linha ps-* em _pilot_node_only_candidate_pre"
 grep -qF -- '"$_PYS_TARGET" = "ps-worker" ] && _pilot_node_only_ps_route_on; then' "$DISPATCHER" && ok "a passada só-nó deixa seguir a bead de ps-worker quando a rota do PS move" || fail "falta o elif ps-worker da passada só-nó"
+
+echo; echo "=== F2. o braço do pool, EXECUTADO (a região de dispatch_one entre o gancho do PS e o fim do braço, verbatim) ==="
+ARM="$(awk 'f==0 && $0 ~ /^        local _RP_PS_NODE_RC=0$/ {f=1} f==1 && $0 ~ /^        ;;$/ {exit} f==1 {print}' "$DISPATCHER")"
+[ -n "$ARM" ] || fail "a região do braço do pool não foi achada em $DISPATCHER"
+# armrun <rc do gancho do PS> <rc do gancho do WA> <_PILOT_NODE_ONLY> <alvo> → "rc=<rc da região> fell=<0|1> target=<alvo no fim> result=<DISPATCH_RESULT> calls=<ganchos e bd chamados>"
+armrun() {
+  : > "$T/armbd"
+  ARMBD="$T/armbd" PSRC="$1" WARC="$2" _PILOT_NODE_ONLY="$3" _SLING_TARGET="$4" bash -c '
+bd() { echo "bd $*" >> "$ARMBD"; }
+_pilot_ps_node_decide() { echo ps >> "$ARMBD"; return "$PSRC"; }
+_pilot_wa_node_decide() { echo wa >> "$ARMBD"; return "$WARC"; }
+f() {
+  local STORY_ID=ps-abc12 STORY_BEAD_CITY=/x
+'"$ARM"'
+  FELL=1
+}
+f; rc=$?; echo "rc=$rc fell=${FELL:-0} target=$_SLING_TARGET result=${DISPATCH_RESULT:-} calls=$(cut -c1-17 "$ARMBD" | tr "\n" ",")"' 2>/dev/null | tail -1
+}
+eq "PS levou (rc 0) na passada só-nó: o alvo vira ps-worker-remote, o gancho do WA NÃO roda, nada é solto" "$(armrun 0 1 1 ps-worker)" "rc=0 fell=1 target=ps-worker-remote result= calls=ps,"
+eq "PS levou (rc 0) fora da passada só-nó: idem" "$(armrun 0 1 0 ps-worker)" "rc=0 fell=1 target=ps-worker-remote result= calls=ps,"
+eq "PS não levou (rc 1) na passada só-nó: o gancho do WA devolve 1 e a claim é solta (disk_floor_node_only), sem cair no pool do mini" "$(armrun 1 1 1 ps-worker)" "rc=1 fell=0 target=ps-worker result=disk_floor_node_only calls=ps,wa,bd -C /x label re,bd -C /x update p,"
+eq "PS não levou (rc 1) fora da passada só-nó: segue ao pool, o alvo não muda" "$(armrun 1 1 0 ps-worker)" "rc=0 fell=1 target=ps-worker result= calls=ps,wa,"
+eq "PS inseguro (rc 2): solta a claim, ps_node_unknown, o gancho do WA nem roda" "$(armrun 2 1 0 ps-worker)" "rc=1 fell=0 target=ps-worker result=ps_node_unknown calls=ps,bd -C /x label re,bd -C /x update p,"
+eq "o WA segue igual: o gancho do PS diz 1 (outro alvo), o do WA leva (rc 0): alvo wa-worker-remote" "$(armrun 1 0 0 wa-worker)" "rc=0 fell=1 target=wa-worker-remote result= calls=ps,wa,"
+eq "o WA segue igual: o do WA inseguro (rc 2) solta e devolve wa_node_unknown" "$(armrun 1 2 0 wa-worker)" "rc=1 fell=0 target=wa-worker result=wa_node_unknown calls=ps,wa,bd -C /x label re,bd -C /x update p,"
 
 # ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
 if [ -n "${PS_NODE_ROUTE_SELFTEST_FILE:-}" ]; then
@@ -332,23 +357,23 @@ mut sem-settle-13     $D1 '_pilot_ps_node_settle "$_id" "$_store"; return 2 ;;' 
 mut log-do-wa         $D1 'ps-node-route.jsonl' 'wa-node-route.jsonl'
 mut open-vira-0       $D1 '_pilot_ps_node_open "$_id" "$_store"' '_pilot_ps_node_open "$_id" "$_store"; return 0'
 mut open-sem-alias    $O1 'ps-worker-remote-[1-9]) ;;' '*) ;;'
-mut open-sem-marca    $O1 'if [ "$_PWR_MARK" != "$_PWR_ALIAS" ] || [ "$_PWR_STATUS" != in_progress ]; then' 'if false; then'
+mut open-sem-marca    $O1 'if [ "$_PWR_STATUS" != in_progress ] || [ "$_PWR_MARK" != "$_PWR_ALIAS" ]; then' 'if false; then'
 mut open-template     $O1 '_pilot_node_remote_open ps-worker-remote ' '_pilot_node_remote_open wa-worker-remote '
 mut open-chave        $O1 'pilot.wa_node_alias || _po_rc=$?' 'pilot.ps_node_alias || _po_rc=$?'
 mut open-rc-engolido  $O1 'return "$_po_rc"' 'return 0'
-mut settle-sem-forma  $S1 'if [ "$_PWR_MARK" != "$_PWR_ALIAS" ] || [ "$_PWR_STATUS" != in_progress ]; then return 0; fi' ':'
+mut settle-sem-forma  $S1 'if [ "$_PWR_STATUS" != in_progress ] || [ "$_PWR_MARK" != "$_PWR_ALIAS" ]; then return 0; fi' ':'
 mut settle-chave      $S1 '0 pilot.wa_node_alias || true' '0 pilot.ps_node_alias || true'
-mut route-on-shadow   _pilot_node_only_ps_route_on 'label|auto) ;;' 'shadow|label|auto) ;;'
-mut route-on-dry      _pilot_node_only_ps_route_on '[ "${DRY_RUN:-0}" != "1" ]' 'true'
-mut pre-sem-etiqueta  _pilot_node_only_ps_pre 'index("node:ok")' 'index("node:ok") or true'
-mut pre-sem-dono      _pilot_node_only_ps_pre '[ -z "$_own" ] || return 1' ':'
+mut route-on-shadow   _pilot_node_only_ps_route_on 'label|auto) return 0 ;;' 'shadow|label|auto) return 0 ;;'
+mut route-on-dry      _pilot_node_only_ps_route_on '[ "${DRY_RUN:-0}" != "1" ] || return 1' ':'
+mut pre-sem-etiqueta  _pilot_node_only_ps_pre 'any(. == "node:ok")' 'any(. == "node:ok") or true'
+mut pre-sem-dono      _pilot_node_only_ps_pre 'if [ -n "$_own" ]; then return 1; fi' ':'
 mut pre-sem-teto      _pilot_node_only_ps_pre '[ "$_PNP_PROBES" -lt "$_cap" ] || return 1' ':'
 mut pre-sem-prefixo   _pilot_node_only_ps_pre '[ "${_id#ps-}" != "$_id" ] || return 1' ':'
-mut pre-sonda-sem-dry _pilot_node_only_ps_pre ' --dry-run --basis' ' --basis'
+mut pre-sonda-sem-dry _pilot_node_only_ps_pre ' --dry-run --basis "$_basis"' ' --basis "$_basis"'
 mut fia-sem-chamada   - "$CALL" ':'
 mut fia-ordem         - 'ps_node_unknown' 'ps_node_desconhecido'
 mut fia-braco         - '      ps-worker-remote)' '      ps-worker-remotex)'
-mut fia-guarda        - ' && [ "$_SLING_TARGET" != "ps-worker-remote" ]; then' '; then'
+mut fia-embrulho      - 'if [ "$_RP_PS_NODE_RC" != 0 ]; then' 'if true; then'
 mut fia-candidata     - 'ps-*) _pilot_node_only_ps_pre "$_b" && return 0; return 1 ;; esac' 'ps-*) return 1 ;; esac'
 
 echo "---"; echo "$PASS/$((PASS+FAIL)) ok"
