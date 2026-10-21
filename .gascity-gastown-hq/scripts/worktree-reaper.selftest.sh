@@ -68,6 +68,10 @@ export WORKTREE_REAPER_PRESSURE_FREE_GB=0
 # those scenarios would shell out to this machine's REAL lsof (and an lsof that prints nothing reads as "in use"). Pinned to an
 # empty list = nothing in use; a scenario that wants a busy tree points the seam at its own list, the real-lsof ones unset it.
 export WORKTREE_REAPER_ACTIVITY_SCAN=0
+# ga-xpoj67: the same pin for the ignored-data guard. The ga-m5i7e6 scenarios keep an IGNORED battery output (pesquisa/) in the trees their
+# controls expect reaped (a merged tree under pressure, the ordinary age path, a dead-holder lock), so they run the old rule (guard off);
+# the ga-xpoj67 scenarios switch it on per call, and one of them unsets the pin to prove the default.
+export WORKTREE_REAPER_IGNORED_DATA_GUARD=0
 NO_LSOF="$TMP/no_lsof.txt"; : > "$NO_LSOF"
 export WORKTREE_REAPER_FAKE_LSOF="$NO_LSOF"
 
@@ -2078,6 +2082,170 @@ else
   if [ "$t6" = 0 ]; then ok "ga-m5i7e6 (t4): awk itself fails (rc 2) → 'cannot tell' = in use, never free"
   else bad "ga-m5i7e6 (t4): a failing awk gave rc $t6 (want 0: only a clean rc 1 may read as free)"; fi
 fi
+
+# ══ ga-xpoj67: a file git IGNORES that is not known junk is DATA — never removed with its tree ══
+# Follow-up of ga-m5i7e6 (its consequence 2): `git worktree remove` counts only tracked/untracked files as dirt, so a MERGED idle tree went with
+# its ignored battery outputs (pesquisa/…) — the loss of 21/10. Every removal path now measures the ignored non-junk files first: some → KEPT,
+# kept_ignored_data (size_kb + the 5 largest paths), locked or not; junk only (.venv, node_modules, __pycache__, …) → reaped as before.
+# Against the pre-fix reaper (x1)(x1b)(x3)(x4)(x5)(x6)(x7)(x10)(x11) fail; (x2)(x2b)(x4b)(x8)(x9) pin what must NOT change: disk is still freed.
+echo "── ga-xpoj67: ignored non-junk data is never removed with its tree ──"
+xp_mk() { m5_mk "$1"; printf '%s\n' .venv/ node_modules/ __pycache__/ '*.pyc' .pytest_cache/ .mypy_cache/ build/ dist/ '*.dat' venv/ .ruff_cache/ .beads/ '*.swp' .DS_Store Thumbs.db .claude/settings.local.json >> "$TMP/$1/rig/.git/info/exclude"; }
+xp_tree() {   # <town> merged|unmerged data|junk — crew/w as m5_tree makes it; junk swaps the ignored battery output for the known-junk list; aged 14 h again
+  m5_tree "$1" w "$2"; [ "$3" = junk ] || return 0
+  rm -rf "$TMP/$1/rig/crew/w/pesquisa"
+  ( cd "$TMP/$1/rig/crew/w" && mkdir -p .venv/lib node_modules/p __pycache__ build dist .pytest_cache .mypy_cache && echo x > .venv/lib/a.py && echo x > node_modules/p/i.js \
+    && echo x > __pycache__/m.pyc && echo x > build/o && echo x > dist/o && echo x > .pytest_cache/v && echo x > .mypy_cache/m ) >/dev/null 2>&1
+  ( cd "$TMP/$1/rig/crew/w" && mkdir -p venv .ruff_cache .beads && echo x > venv/p && echo x > .ruff_cache/c && echo x > .beads/redirect && echo x > loose.pyc \
+    && echo x > f.swp && echo x > .DS_Store && echo x > Thumbs.db ) >/dev/null 2>&1
+  m5_age "$TMP/$1/rig/crew/w" 14
+}
+xp_run() { local t="$1"; shift; m5_run "$t" WORKTREE_REAPER_IGNORED_DATA_GUARD=1 "$@"; }
+xp_lock() { git -C "$TMP/$1/rig" worktree lock --reason "claude agent agent-m5 pid 1001 start x" "$TMP/$1/rig/crew/w"; }   # the holder is the dead pid of $M5_PS
+xp_kept() {    # <town> <label> <event> — the tree is still there and the keep was logged exactly once under that event
+  if m5_has "$1" && [ "$(events "$1" "$3")" = "1" ]; then ok "ga-xpoj67 $2"; else bad "ga-xpoj67 $2 — present=$(m5_has "$1" && echo y || echo n) $3=$(events "$1" "$3")"; fi
+}
+xp_freed() {   # <town> <label> — the tree is gone and nothing was kept for its ignored files
+  if ! m5_has "$1" && [ "$(events "$1" kept_ignored_data)" = "0" ]; then ok "ga-xpoj67 $2"; else bad "ga-xpoj67 $2 — present=$(m5_has "$1" && echo y || echo n) kept_ignored_data=$(events "$1" kept_ignored_data)"; fi
+}
+
+xp_mk xp1; xp_tree xp1 merged data; xp_run xp1
+xp_kept xp1 "(x1): MERGED tree, idle 14 h, nobody inside, an ignored battery output in it → KEPT, kept_ignored_data logged once" kept_ignored_data
+grep '"event":"kept_ignored_data"' "$TMP/xp1.jsonl" | grep -Eq '"size_kb":[1-9][0-9]*,"top":\[\{"path":"pesquisa/","kb":[1-9][0-9]*\}\]' \
+  && ok "ga-xpoj67 (x1): the event names the total size and the ignored path" || bad "ga-xpoj67 (x1): event lacks size_kb/top: $(grep kept_ignored_data "$TMP/xp1.jsonl" | head -1)"
+[ -f "$TMP/xp1/rig/crew/w/pesquisa/out/battery.csv" ] && ok "ga-xpoj67 (x1): the battery output is still on disk" || bad "ga-xpoj67 (x1): the battery output is gone"
+xp_mk xp1b; xp_tree xp1b merged data; xp_run xp1b "$PRESS"
+xp_kept xp1b "(x1b): the same tree in PRESSURE mode (merged trees go under pressure) → KEPT, kept_ignored_data" kept_ignored_data
+xp_mk xp2; xp_tree xp2 merged junk; xp_run xp2
+xp_freed xp2 "(x2): the same MERGED tree holding only .venv, node_modules, __pycache__, build, dist and the caches → reaped (disk recovery not regressed)"
+xp_mk xp2b; xp_tree xp2b unmerged junk; xp_run xp2b
+xp_freed xp2b "(x2b): an UNMERGED tree past the age gate with only that junk → reaped"
+xp_mk xp3; xp_tree xp3 unmerged data; xp_run xp3
+xp_kept xp3 "(x3): UNMERGED tree past the age gate (normal mode) with ignored data → KEPT, kept_ignored_data" kept_ignored_data
+
+# (x4) a LOCKED tree: the holder is a dead pid (the zombie reap is `remove -f -f`) → KEPT with its lock; with junk only the same lock is reaped
+xp_mk xp4; xp_tree xp4 unmerged data; xp_lock xp4; xp_run xp4 WORKTREE_REAPER_FAKE_PS="$M5_PS"
+if m5_has xp4 && [ "$(events xp4 kept_ignored_data)" = "1" ] && [ "$(events xp4 reaped_zombie_lock)" = "0" ] \
+   && [ "$(git -C "$TMP/xp4/rig" worktree list --porcelain | grep -c '^locked')" = "1" ] \
+   && grep '"event":"kept_ignored_data"' "$TMP/xp4.jsonl" | grep -q '"locked":true'; then ok "ga-xpoj67 (x4): dead-holder lock, ignored data inside → KEPT, lock untouched, kept_ignored_data logged with locked:true"
+else bad "ga-xpoj67 (x4): zombie lock + ignored data — present=$(m5_has xp4 && echo y || echo n) kept_ignored_data=$(events xp4 kept_ignored_data) reaped_zombie_lock=$(events xp4 reaped_zombie_lock)"; fi
+xp_mk xp4b; xp_tree xp4b unmerged junk; xp_lock xp4b; xp_run xp4b WORKTREE_REAPER_FAKE_PS="$M5_PS"
+xp_freed xp4b "(x4b): the same dead-holder lock with only junk inside → reaped (the zombie reap itself still works)"
+
+# (x4c) a LOCKED tree that is also MERGED: _keep_unsafe keeps it before the lock contract is ever asked, and the event must still say the tree is locked
+xp_mk xp4c; xp_tree xp4c merged data; xp_lock xp4c; xp_run xp4c WORKTREE_REAPER_FAKE_PS="$M5_PS"
+if m5_has xp4c && [ "$(events xp4c kept_ignored_data)" = "1" ] && [ "$(events xp4c reaped_zombie_lock)" = "0" ] \
+   && [ "$(git -C "$TMP/xp4c/rig" worktree list --porcelain | grep -c '^locked')" = "1" ] \
+   && grep '"event":"kept_ignored_data"' "$TMP/xp4c.jsonl" | grep -q '"locked":true'; then ok "ga-xpoj67 (x4c): MERGED tree with a dead-holder lock and ignored data → KEPT, lock untouched, event says locked:true"
+else bad "ga-xpoj67 (x4c): merged + locked + ignored data — present=$(m5_has xp4c && echo y || echo n) kept_ignored_data=$(events xp4c kept_ignored_data) event=$(grep kept_ignored_data "$TMP/xp4c.jsonl" 2>/dev/null | head -1)"; fi
+xp_mk xp4d; xp_tree xp4d merged junk; xp_lock xp4d; xp_run xp4d WORKTREE_REAPER_FAKE_PS="$M5_PS"
+xp_freed xp4d "(x4d): the same MERGED dead-holder lock with only junk inside → reaped (control: the guard does not hold a clean locked tree)"
+# (x4e) and an UNLOCKED tree says locked:false (the field is git's answer, not a constant)
+xp_mk xp4e; xp_tree xp4e merged data; xp_run xp4e
+grep '"event":"kept_ignored_data"' "$TMP/xp4e.jsonl" | grep -q '"locked":false' && ok "ga-xpoj67 (x4e): an unlocked tree's event says locked:false" || bad "ga-xpoj67 (x4e): event: $(grep kept_ignored_data "$TMP/xp4e.jsonl" 2>/dev/null | head -1)"
+
+# (x5) a lock nobody can name, unmerged work, the BEAD-CLOSED proof (`remove -f -f`): clean + aged + unused + bead closed → reaped; ignored data in it → KEPT first
+mk_bc_rig xp5 'echo pesquisa/ >> "$(git rev-parse --git-common-dir)/info/exclude"; mkdir pesquisa; echo r > pesquisa/o.csv'
+run_bc xp5 "[$(bc_bead "$BC_ID" closed 10)]" WORKTREE_REAPER_IGNORED_DATA_GUARD=1
+if bc_wt xp5 && bc_br xp5 && [ "$(events xp5 kept_ignored_data)" = "1" ] && [ "$(events xp5 reaped_locked_unparseable_bead_closed)" = "0" ]; then ok "ga-xpoj67 (x5): closed-bead proof on a locked tree holding ignored data → KEPT, kept_ignored_data (tree and branch intact)"
+else bad "ga-xpoj67 (x5): bead-closed lock + ignored data — wt=$(bc_wt xp5 && echo y || echo n) kept_ignored_data=$(events xp5 kept_ignored_data) reaped_bc=$(events xp5 reaped_locked_unparseable_bead_closed)"; fi
+
+# (x6) loop 1 (the town's own .gc-worktrees) asks the same question
+m5_town1 xp6; xp_run xp6
+if [ -d "$TMP/xp6/.gc-worktrees/x" ] && [ "$(events xp6 kept_ignored_data)" = "1" ]; then ok "ga-xpoj67 (x6): town .gc-worktrees loop — unmerged tree with ignored data → KEPT, kept_ignored_data logged"
+else bad "ga-xpoj67 (x6): town loop — present=$([ -d "$TMP/xp6/.gc-worktrees/x" ] && echo y || echo n) kept_ignored_data=$(events xp6 kept_ignored_data)"; fi
+
+# (x7) the listing of ignored files FAILS: that is not "none" → KEPT, and the event says it could not tell
+xp_mk xp7; xp_tree xp7 merged data; mkdir -p "$TMP/xp7-bin"
+printf '#!/bin/sh\ncase " $* " in *" ls-files "*) exit 1 ;; esac\nexec %s "$@"\n' "$(command -v git)" > "$TMP/xp7-bin/git"; chmod +x "$TMP/xp7-bin/git"
+xp_run xp7 PATH="$TMP/xp7-bin:$PATH"
+xp_kept xp7 "(x7): listing the ignored files fails → unknown is not 'none': KEPT, kept_ignored_data_unknown logged" kept_ignored_data_unknown
+grep '"event":"kept_ignored_data_unknown"' "$TMP/xp7.jsonl" | grep -q '"size_kb":null,"top":\[\]' && ok "ga-xpoj67 (x7): the unknown event says size null, not 0" || bad "ga-xpoj67 (x7): unknown event: $(grep unknown "$TMP/xp7.jsonl" | head -1)"
+
+# (x8) the knob: 0 = the old rule (reaped); a garbage value and the unset default = guard on
+xp_mk xp8; xp_tree xp8 merged data; xp_run xp8 WORKTREE_REAPER_IGNORED_DATA_GUARD=0
+xp_freed xp8 "(x8): WORKTREE_REAPER_IGNORED_DATA_GUARD=0 gives the old rule back (the tree of (x1) is reaped)"
+xp_mk xp8b; xp_tree xp8b merged data; m5_run xp8b WORKTREE_REAPER_IGNORED_DATA_GUARD=yes
+xp_kept xp8b "(x8b): a garbage guard value reads as 'on', never as the old rule → KEPT" kept_ignored_data
+xp_mk xp8c; xp_tree xp8c merged data
+env -u WORKTREE_REAPER_IGNORED_DATA_GUARD WORKTREE_REAPER_ACTIVITY_SCAN=1 WORKTREE_REAPER_GT="$TMP/xp8c" WORKTREE_REAPER_LOG="$TMP/xp8c.jsonl" WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 bash "$REAPER" >/dev/null 2>&1
+xp_kept xp8c "(x8c): the guard variable UNSET (the shipped default) → the tree of (x1) is KEPT" kept_ignored_data
+
+# (x9) the limit: ignored data below WORKTREE_REAPER_IGNORED_MIN_KB does not hold a tree
+xp_mk xp9; xp_tree xp9 merged data; xp_run xp9 WORKTREE_REAPER_IGNORED_MIN_KB=99999999
+xp_freed xp9 "(x9): ignored data below WORKTREE_REAPER_IGNORED_MIN_KB → reaped"
+
+# (x10) a DIRTY tree takes the preserve path, whose snapshot leaves ignored files out and then force-removes: the guard comes first
+xp_mk xp10; xp_tree xp10 unmerged data; echo wip > "$TMP/xp10/rig/crew/w/dirty.txt"; m5_age "$TMP/xp10/rig/crew/w" 14; xp_run xp10
+if m5_has xp10 && [ -f "$TMP/xp10/rig/crew/w/dirty.txt" ] && [ -f "$TMP/xp10/rig/crew/w/pesquisa/out/battery.csv" ] \
+   && [ "$(events xp10 kept_ignored_data)" = "1" ] && [ "$(events xp10 reaped_dirty_preserved)" = "0" ]; then ok "ga-xpoj67 (x10): dirty tree with ignored data → KEPT whole (no preserve-and-force), kept_ignored_data logged"
+else bad "ga-xpoj67 (x10): dirty + ignored data — present=$(m5_has xp10 && echo y || echo n) kept_ignored_data=$(events xp10 kept_ignored_data) reaped_dirty_preserved=$(events xp10 reaped_dirty_preserved)"; fi
+
+# (x11) seven ignored data files of 8..56 KiB: the event carries the total and the FIVE largest, largest first
+xp_mk xp11; m5_tree xp11 w merged
+( cd "$TMP/xp11/rig/crew/w" && rm -rf pesquisa && for i in 1 2 3 4 5 6 7; do dd if=/dev/zero of="d$i.dat" bs=1024 count=$((i*8)) 2>/dev/null; done ); m5_age "$TMP/xp11/rig/crew/w" 14
+xp_run xp11
+L11="$(grep '"event":"kept_ignored_data"' "$TMP/xp11.jsonl" 2>/dev/null)"
+if printf '%s' "$L11" | grep -Eq '"size_kb":[0-9]+,"top":\[\{"path":"d7\.dat","kb":[0-9]+\},\{"path":"d6\.dat","kb":[0-9]+\},\{"path":"d5\.dat","kb":[0-9]+\},\{"path":"d4\.dat","kb":[0-9]+\},\{"path":"d3\.dat","kb":[0-9]+\}\]' \
+   && ! printf '%s' "$L11" | grep -Eq 'd[12]\.dat'; then ok "ga-xpoj67 (x11): top = the 5 largest ignored paths, largest first (d7..d3), the 2 smallest left out"
+else bad "ga-xpoj67 (x11): top-5 wrong: ${L11:-<no kept_ignored_data event>}"; fi
+
+# (x12) du cannot size an entry git listed: unreadable is not empty — it counts 1 KiB and the tree stays
+xp_mk xp12; xp_tree xp12 merged data; mkdir -p "$TMP/xp12-bin"; printf '#!/bin/sh\nexit 1\n' > "$TMP/xp12-bin/du"; chmod +x "$TMP/xp12-bin/du"
+xp_run xp12 PATH="$TMP/xp12-bin:$PATH"
+xp_kept xp12 "(x12): du cannot size the ignored entry → it counts 1 KiB and the tree is KEPT (unreadable is not empty)" kept_ignored_data
+
+# (x14) past the 200th entry the scan stops running du and each entry counts 1 KiB: 205 EMPTY ignored files and one data file listed after them still hold the tree
+xp_mk xp14; m5_tree xp14 w merged
+( cd "$TMP/xp14/rig/crew/w" && rm -rf pesquisa && for i in $(seq -f '%03g' 1 205); do : > "a$i.dat"; done && echo r > z.dat ) >/dev/null 2>&1; m5_age "$TMP/xp14/rig/crew/w" 14
+mkdir -p "$TMP/xp14-bin"; printf '#!/bin/sh\necho x >> "%s"\nexec %s "$@"\n' "$TMP/xp14.du" "$(command -v du)" > "$TMP/xp14-bin/du"; chmod +x "$TMP/xp14-bin/du"   # counts its calls
+xp_run xp14 PATH="$TMP/xp14-bin:$PATH"
+xp_kept xp14 "(x14): 205 empty ignored files and a data file after them (past the 200-entry du cap) → KEPT" kept_ignored_data
+N14="$(wc -l < "$TMP/xp14.du" 2>/dev/null | tr -d ' ')"
+if [ "${N14:-0}" -ge 1 ] && [ "${N14:-0}" -le 200 ]; then ok "ga-xpoj67 (x14): du ran ${N14} times for 206 entries — never more than 200 (the cost is bounded)"; else bad "ga-xpoj67 (x14): du calls = ${N14:-?}, want 1..200"; fi
+
+# (x13) junk is matched by directory NAME, not by substring: an ignored rebuild/ next to the junk list is data, and only it is reported
+xp_mk xp13; echo 'rebuild/' >> "$TMP/xp13/rig/.git/info/exclude"; xp_tree xp13 merged junk
+mkdir -p "$TMP/xp13/rig/crew/w/rebuild"; echo r > "$TMP/xp13/rig/crew/w/rebuild/o.csv"; m5_age "$TMP/xp13/rig/crew/w" 14; xp_run xp13
+xp_kept xp13 "(x13): an ignored rebuild/ among the junk (build/, dist/, .venv/ …) is data → KEPT, kept_ignored_data" kept_ignored_data
+grep '"event":"kept_ignored_data"' "$TMP/xp13.jsonl" | grep -Eq '"top":\[\{"path":"rebuild/","kb":[1-9][0-9]*\}\]' && ok "ga-xpoj67 (x13): only rebuild/ is reported, the junk is not" || bad "ga-xpoj67 (x13): top: $(grep kept_ignored_data "$TMP/xp13.jsonl" | head -1)"
+# (x13b) WORKTREE_REAPER_IGNORED_JUNK_RE replaces the junk list
+xp_mk xp13b; xp_tree xp13b merged data; xp_run xp13b WORKTREE_REAPER_IGNORED_JUNK_RE='(^|/)pesquisa(/|$)'
+xp_freed xp13b "(x13b): WORKTREE_REAPER_IGNORED_JUNK_RE names pesquisa/ as junk → the tree of (x1) is reaped"
+
+# (x2c) .claude/settings.local.json is ignored tool state beside TRACKED .claude files (this repo's own layout): junk by path → the tree is reaped
+xp_mk xp2c; m5_tree xp2c w unmerged
+( cd "$TMP/xp2c/rig/crew/w" && rm -rf pesquisa && mkdir -p .claude && echo k > .claude/keep.md && echo '{}' > .claude/settings.local.json && git add .claude/keep.md \
+  && GIT_AUTHOR_DATE=$M5_OLD GIT_COMMITTER_DATE=$M5_OLD git commit -qm claude ) >/dev/null 2>&1; m5_age "$TMP/xp2c/rig/crew/w" 14; xp_run xp2c
+xp_freed xp2c "(x2c): an ignored .claude/settings.local.json beside a tracked .claude/ file is junk → the tree is reaped"
+
+# (x9b)(x9c) the limit is inclusive: a total equal to WORKTREE_REAPER_IGNORED_MIN_KB holds the tree, one KiB more of limit lets it go
+xp_mk xp9b; xp_tree xp9b merged data; N9="$(du -sk "$TMP/xp9b/rig/crew/w/pesquisa" | awk '{print $1; exit}')"
+xp_run xp9b WORKTREE_REAPER_IGNORED_MIN_KB="$N9"
+xp_kept xp9b "(x9b): ignored data of exactly WORKTREE_REAPER_IGNORED_MIN_KB ($N9 KiB) → KEPT (the limit is inclusive)" kept_ignored_data
+xp_mk xp9c; xp_tree xp9c merged data; xp_run xp9c WORKTREE_REAPER_IGNORED_MIN_KB=$((N9+1))
+xp_freed xp9c "(x9c): the same data one KiB under the limit → reaped"
+# (x9d) a limit that is not a number reads as the strictest one (1 KiB), never as "no limit": the tree is KEPT
+xp_mk xp9d; xp_tree xp9d merged data; xp_run xp9d WORKTREE_REAPER_IGNORED_MIN_KB=abc
+xp_kept xp9d "(x9d): a non-numeric WORKTREE_REAPER_IGNORED_MIN_KB reads as 1 KiB → the tree of (x1) is KEPT" kept_ignored_data
+# (x9e)(x9f) 0 = every ignored non-junk entry holds the tree, even a file with no bytes in it; the default limit (1 KiB) lets an empty file go
+xp_mk xp9e; m5_tree xp9e w merged; ( cd "$TMP/xp9e/rig/crew/w" && rm -rf pesquisa && : > empty.dat ) >/dev/null 2>&1; m5_age "$TMP/xp9e/rig/crew/w" 14; xp_run xp9e WORKTREE_REAPER_IGNORED_MIN_KB=0
+xp_kept xp9e "(x9e): WORKTREE_REAPER_IGNORED_MIN_KB=0 → an ignored file with no bytes in it holds the tree" kept_ignored_data
+xp_mk xp9f; m5_tree xp9f w merged; ( cd "$TMP/xp9f/rig/crew/w" && rm -rf pesquisa && : > empty.dat ) >/dev/null 2>&1; m5_age "$TMP/xp9f/rig/crew/w" 14; xp_run xp9f
+xp_freed xp9f "(x9f): the same tree at the default limit → reaped (a file with no bytes is not data)"
+# (x9g)(x9h) 0 holds an entry that EXISTS: a tree with only junk, or with nothing ignored at all, has none, so the limit 0 does not hold it either
+xp_mk xp9g; xp_tree xp9g merged junk; xp_run xp9g WORKTREE_REAPER_IGNORED_MIN_KB=0
+xp_freed xp9g "(x9g): WORKTREE_REAPER_IGNORED_MIN_KB=0 and only junk inside → reaped (0 is 'any entry', not 'even an empty listing')"
+xp_mk xp9h; m5_tree xp9h w merged; ( cd "$TMP/xp9h/rig/crew/w" && rm -rf pesquisa ) >/dev/null 2>&1; m5_age "$TMP/xp9h/rig/crew/w" 14; xp_run xp9h WORKTREE_REAPER_IGNORED_MIN_KB=0
+xp_freed xp9h "(x9h): WORKTREE_REAPER_IGNORED_MIN_KB=0 and nothing ignored at all → reaped"
+
+# (x15) mktemp fails: the scan cannot even start — that is not 'nothing ignored': KEPT, kept_ignored_data_unknown
+xp_mk xp15; xp_tree xp15 merged data; mkdir -p "$TMP/xp15-bin"; printf '#!/bin/sh\nexit 1\n' > "$TMP/xp15-bin/mktemp"; chmod +x "$TMP/xp15-bin/mktemp"
+xp_run xp15 PATH="$TMP/xp15-bin:$PATH"
+xp_kept xp15 "(x15): mktemp fails → KEPT, kept_ignored_data_unknown logged" kept_ignored_data_unknown
+
+# (x16) a file name with a quote, a backslash and a space is escaped in the event, so the line stays one JSON object
+xp_mk xp16; m5_tree xp16 w merged; ( cd "$TMP/xp16/rig/crew/w" && rm -rf pesquisa && printf r > 'a"b\c d.dat' ) >/dev/null 2>&1; m5_age "$TMP/xp16/rig/crew/w" 14; xp_run xp16
+grep '"event":"kept_ignored_data"' "$TMP/xp16.jsonl" | grep -qF '"top":[{"path":"a\"b\\c d.dat","kb":' && ok "ga-xpoj67 (x16): quote, backslash and space in a file name are escaped in the event" || bad "ga-xpoj67 (x16): event: $(grep kept_ignored_data "$TMP/xp16.jsonl" 2>/dev/null | head -1)"
 
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"
