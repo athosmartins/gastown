@@ -718,7 +718,8 @@ printf '%s\n' "$*" >> "${FAKE_SECRET_LOG:-/dev/null}"
 case "${FAKE_SECRET_MODE:-}" in
   locked) echo "sk-ant-DECOYOUT0000000000000000"; echo "Error: vault is locked sk-ant-DECOYERR0000000000000000" >&2; exit 1;;
   notfound) echo "Not found: $1" >&2; exit 4;;
-  garbage) echo "isto nao e uma chave"; exit 0;;
+  garbage) echo "naoeumachave-0123456789abcdef"; exit 0;;
+  rc4other) echo "erro qualquer" >&2; exit 4;;
   spaced) echo "sk-ant-FAKEspaced 0123456789abcdef"; exit 0;;
 esac
 [ -f "$FAKE_VAULT/$1" ] || { echo "Not found: $1" >&2; exit 4; }
@@ -740,6 +741,7 @@ EOF
   setpool alfa@example.test; cfg 3 25 "$extra"; fresh
   pv --dry-run start remote-test-ac1 < <(req "claude $T/ac1.out"); r1=$RC
   [ $r1 = 0 ] && [ "$(jq -r '.claude_account.current' "$T/out")" = alfa@example.test ] && [ ! -s "$sl" ] && ! has "$T/out" "$KA" && nossh; ok $? "acct: dry-run diz de qual conta seria a chave, NÃO lê o cofre e não mostra chave nenhuma (rc=$r1)"
+  jq -r '.launcher[]' "$T/out" | grep -qE "^CLAUDE_CODE_OAUTH_TOKEN='<chave da conta atual do pool: não lida no dry-run>' sh -c " && ! has "$T/out" 'export CLAUDE_CODE_OAUTH_TOKEN'; ok $? "acct: a chave entra como prefixo do comando final do lançador (só o claude a herda), não como export"
   fresh; TMPDIR="$T/tmp" pv start remote-test-ac1 < <(req "claude $T/ac1.out"); ok $RC "acct: start de sessão claude abre (rc=$RC $(head -c 200 "$T/err"))"
   [ "$(cat "$T/ac1.out" 2>/dev/null)" = "$KA" ]; ok $? "acct: a sessão do host nasce com CLAUDE_CODE_OAUTH_TOKEN = a chave da conta current do pool (alfa)"
   [ "$(grep -c . "$sl")" = 1 ] && has "$sl" "claude-oauth-token-alfa@example.test"; ok $? "acct: o cofre foi lido UMA vez, pelo item da conta atual"
@@ -748,24 +750,29 @@ EOF
   setpool beta@example.test; fresh; TMPDIR="$T/tmp" pv start remote-test-ac2 < <(req "claude $T/ac2.out"); r1=$RC
   [ $r1 = 0 ] && [ "$(cat "$T/ac2.out" 2>/dev/null)" = "$KB" ]; ok $? "acct: o pool do mini trocou de conta → a sessão NOVA nasce com a chave da conta nova (beta) (rc=$r1)"
   ! leaks "$KB"; ok $? "acct: ...e a chave da conta nova também não vaza"
-  for mode in locked notfound garbage spaced; do
+  for mode in locked notfound garbage spaced rc4other; do
     : > "$sl"; fresh; FAKE_SECRET_MODE=$mode pv start remote-test-ac3 < <(req "claude $T/ac3.out"); r1=$RC
-    [ $r1 = 1 ] && nossh && [ ! -e "$T/ac3.out" ] && [ "$(count)" = 2 ] && ! has "$T/err" DECOY && ! has "$T/out" DECOY && ! ls "$RR/run" 2>/dev/null | grep -q ac3; ok $? "acct: secret '$mode' → o start RECUSA (rc 1) sem ssh, sem sessão, sem lançador, sem repetir o que o secret escreveu, e NÃO cai no login fixo do nó (rc=$r1)"
+    [ $r1 = 1 ] && nossh && has "$T/err" 'gc-session-ssh start: ' && [ ! -e "$T/ac3.out" ] && [ "$(count)" = 2 ] && ! has "$T/err" DECOY && ! has "$T/out" DECOY && ! ls "$RR/run" 2>/dev/null | grep -q ac3; ok $? "acct: secret '$mode' → o start RECUSA (rc 1) sem ssh, sem sessão, sem lançador, sem repetir o que o secret escreveu, e NÃO cai no login fixo do nó (rc=$r1)"
   done
   FAKE_SECRET_MODE=notfound pv start remote-test-ac3 < <(req "claude $T/ac3.out"); has "$T/err" 'sem chave cadastrada' && has "$T/err" beta@example.test; ok $? "acct: conta atual SEM item no cofre → o motivo diz 'sem chave cadastrada' e a conta (não é cofre ilegível)"
   FAKE_SECRET_MODE=locked pv start remote-test-ac3 < <(req "claude $T/ac3.out"); has "$T/err" 'ilegível' && has "$T/err" beta@example.test; ok $? "acct: cofre fechado → o motivo diz 'ilegível' e a conta"
+  FAKE_SECRET_MODE=rc4other pv start remote-test-ac3 < <(req "claude $T/ac3.out"); has "$T/err" 'ilegível' && ! has "$T/err" 'sem chave cadastrada'; ok $? "acct: rc 4 SEM 'Not found' no stderr não é 'sem chave cadastrada': é cofre ilegível"
+  grep -q '"event": "refused"' "$T/state/a/events.jsonl" && grep -q 'chave da conta Claude beta@example.test' "$T/state/a/events.jsonl" && [ ! -e "$T/state/a/running/remote-test-ac3" ]; ok $? "acct: a recusa vira evento refused (placar do host) com a conta, e a sessão não fica registrada como aberta"
   for bad in AUSENTE '{' '[]' '{}' '{"current":""}' '{"current":5}' '{"current":"a b@x.test"}' '{"current":"-x@y.test"}' '{"current":"x@y.test\nz"}' '{"current":"nao-e-email"}'; do
     if [ "$bad" = AUSENTE ]; then rm -f "$pool"; else printf '%s\n' "$bad" > "$pool"; fi
     : > "$sl"; fresh; pv start remote-test-ac4 < <(req "claude $T/ac4.out"); r1=$RC
     [ $r1 = 1 ] && nossh && [ ! -s "$sl" ] && [ ! -e "$T/ac4.out" ] && has "$T/err" 'conta atual'; ok $? "acct: arquivo do pool $bad → recusa (rc 1) dizendo que não sabe a conta atual, sem ssh e sem tocar no cofre (rc=$r1)"
   done
-  setpool alfa@example.test; : > "$sl"; FAKE_SECRET_MODE=locked pv start acct-cat < <(req "cat"); r1=$RC
+  setpool alfa@example.test; : > "$sl"; FAKE_SECRET_MODE=locked pv start acct-cl2 < <(req "claudette x"); [ ! -s "$sl" ]; ok $? "acct: comando que só COMEÇA com 'claude' (claudette) não é o claude: o cofre não é tocado"
+  jq 'del(.hosts.a.real_sessions_released_by)' "$T/cfg.json" > "$T/cfg2.json" && mv "$T/cfg2.json" "$T/cfg.json"; : > "$sl"; FAKE_SECRET_MODE=locked pv start acct-real < <(req "claude x"); r1=$RC
+  [ $r1 = 1 ] && has "$T/err" real_sessions_released_by && [ ! -s "$sl" ]; ok $? "acct: a política local (sessão real sem liberação) vale ANTES do cofre: recusa pela política e o cofre não é tocado (rc=$r1)"; cfg 3 25 "$extra"
+  : > "$sl"; FAKE_SECRET_MODE=locked pv start acct-cat < <(req "cat"); r1=$RC
   [ $r1 = 0 ] && [ ! -s "$sl" ]; ok $? "acct: sessão que NÃO é claude não toca no cofre (nem com ele fechado) e abre normalmente (rc=$r1)"; pv stop acct-cat </dev/null
   cfg 3; : > "$sl"; fresh; pv start remote-test-ac5 < <(req "claude $T/ac5.out"); r1=$RC
   [ $r1 = 0 ] && [ "$(cat "$T/ac5.out" 2>/dev/null)" = UNSET ] && [ ! -s "$sl" ]; ok $? "acct: host SEM o bloco claude_account = como antes: nenhuma env nova e o cofre não é tocado (rc=$r1)"
   for bad in '"texto"' '[]' '{}' '{"current_file":"relativo.json"}' '{"current_file":"/x/p.json","extra":1}' '{"current_file":5}' '{"current_file":"/x/p.json","secret":"relativo"}'; do
     cfg 3 25 "{\"claude_account\":$bad}"; fresh; pv start remote-test-ac6 < <(req "claude $T/ac6.out"); r1=$RC
-    [ $r1 = 1 ] && nossh && has "$T/err" claude_account; ok $? "acct: claude_account mal formado ($bad) recusa a config nomeando a chave, sem ssh (rc=$r1)"
+    [ $r1 = 1 ] && nossh && has "$T/err" 'gc-session-ssh start: host a: ' && has "$T/err" claude_account; ok $? "acct: claude_account mal formado ($bad) recusa a config nomeando a chave, sem ssh (rc=$r1)"
   done
   for x in remote-test-ac1 remote-test-ac2 remote-test-ac5; do pv stop $x </dev/null; done
   rm -f "$T/home/.local/bin/claude" "$T/bin/secret"; unset FAKE_VAULT FAKE_SECRET_LOG; cfg 3
@@ -884,9 +891,22 @@ echo "== $((n-fails))/$n ok =="
   mutant wt "o desfazer não tira o branch novo" 's/\[ "\$wub" = "\$wum" \] \&\& git/false \&\& git/'
   mutant wt "o desfazer não chama o wt-rm" 's/^  GT_REMOTE_GIT=@GR@ @BIN@ wt-rm @RIG@ @NAME@ >\/dev\/null 2>\&1$/  :/'
   mutant wt "aviso do git em stderr é jogado fora (parte da árvore não lida vira 'limpo')" 's/status --porcelain 2>"\$wse"/status --porcelain 2>\/dev\/null/'
+  mutant acct "claude_account nunca lido (a sessão nunca ganha a chave)" 's/^        if ca is not None:$/        if False:/'
+  mutant acct "claude_account de qualquer forma aceito" 's/            if not isinstance(ca, dict) or set(ca) - {"current_file", "secret"}:/            if False:/'
+  mutant acct "sessão que não é claude também ganha a chave (e toca no cofre)" 's/^    if cfg.acct and runs_claude(p\["command"\]):$/    if cfg.acct:/'
+  mutant acct "claudette lido como claude (sem a fronteira do fim)" '/^CLAUDE_CMD = /s/(?=\\s|\$)//'
+  mutant acct "o dry-run lê o cofre e imprime a chave" 's/^            secrets\[OAUTH_ENV\] = "<chave da conta atual do pool: não lida no dry-run>"$/            secrets[OAUTH_ENV] = acct_key(cfg, acct_view["current"] or "x@y.z")/'
+  mutant acct "e-mail da conta de qualquer forma (vai para o argv do secret)" 's/^ACCT_EMAIL = re.compile(.*$/ACCT_EMAIL = re.compile(r".+")/'
+  mutant acct "saída do secret com rc != 0 aceita como chave" 's/    if r.returncode == 0 and tok.startswith("sk-ant-")/    if tok.startswith("sk-ant-")/'
+  mutant acct "saída sem sk-ant- aceita como chave" 's/ and tok.startswith("sk-ant-") and len(tok) > 16//'
+  mutant acct "chave com espaço no meio aceita" 's/ and not any(c.isspace() for c in tok)//'
+  mutant acct "rc 4 sem 'Not found' lido como conta sem chave" 's/ and "not found" in r.stderr.decode("utf-8", "replace").lower()//'
+  mutant acct "recusa da chave sem evento refused" 's/^                cfg.event("refused", name, reason=f"chave da conta Claude {email} indisponível")$/                pass/'
+  mutant acct "chave como export (o vigia e o resto do lançador a herdam)" 's/    assign = "".join(f"{k}={q(v)} " for k, v in (secrets or {}).items())/    assign = "".join(f"export {k}={q(v)}; " for k, v in (secrets or {}).items())/'
+  mutant acct "mensagem de recusa repete o que o secret escreveu" 's/ilegível (cofre fechado ou secret falhou, rc={r.returncode}/ilegível (cofre fechado ou secret falhou, rc={r.returncode} saída={tok}/'
   echo "-- contra um stub que só sai 0 (a versão 'anterior' não tinha provider nenhum)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"
-  r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate,prep,wt" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
+  r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate,prep,wt,acct" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
   case "$r" in "RESULT 0/"*|"") ok 1 "stub deveria falhar quase tudo ($r)";; *) ok 0 "stub falha os casos novos ($r)";; esac
   echo "== final: $((n-fails))/$n ok =="
 }
