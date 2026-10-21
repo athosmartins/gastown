@@ -272,13 +272,23 @@ if [ -n "${ND_MUTANT:-}" ]; then echo "RESULT $FAIL/$((PASS+FAIL))"; [ "$FAIL" =
 if [ -z "${ND_NO_MUTANTS:-}" ]; then
   echo "── controle negativo: cada mutante tem que reprovar a bateria"
   nm=0
-  mutant() {  # mutant DESCRIÇÃO ANTES DEPOIS
+  # 4º argumento (opcional): a função onde a âncora vale. O _pilot_node_remote_rollback (ga-2hd02v.3.3) é quase cópia do _pilot_node_first_rollback; sem o escopo a âncora casa 2x e o mutante some sem testar nada.
+  # Função ausente ou repetida (exit 4), ou âncora que não casa exatamente 1 vez DENTRO dela (exit 3) → o mutante reprova a bateria; nunca um mutante que não mudou nada passa por "pego".
+  mutant() {  # mutant DESCRIÇÃO ANTES DEPOIS [FUNÇÃO]
     nm=$((nm+1)); local m="$WORK/disp.mut$nm.sh"
     python3 -I -c 'import sys
 s=open(sys.argv[1],encoding="utf-8").read()
-if s.count(sys.argv[2])!=1: sys.exit(3)
-open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))' "$DISPATCHER" "$2" "$3" "$m" 2>/dev/null \
-      || { bad "mutante '$1': a âncora não casa exatamente 1 vez"; return; }
+a,b=0,len(s)
+if sys.argv[5]:
+    d=sys.argv[5]+"() {\n"
+    if s.count(d)!=1: sys.exit(4)
+    a=s.index(d); b=s.find("\n}\n",a)
+    if b<0: sys.exit(4)
+    b+=3
+r=s[a:b]
+if r.count(sys.argv[2])!=1: sys.exit(3)
+open(sys.argv[4],"w",encoding="utf-8").write(s[:a]+r.replace(sys.argv[2],sys.argv[3])+s[b:])' "$DISPATCHER" "$2" "$3" "$m" "${4:-}" 2>/dev/null \
+      || { bad "mutante '$1': a âncora não casa exatamente 1 vez${4:+ em $4}"; return; }
     local r; r=$(ND_MUTANT=1 PILOT_DISPATCHER_PATH="$m" bash "$0" 2>&1 | tail -1)
     case "$r" in "RESULT 0/"*) bad "mutante '$1' NÃO foi pego ($r)" ;; "RESULT "*) ok "mutante '$1' pego ($r)" ;; *) bad "mutante '$1': sem resultado ($r)" ;; esac
   }
@@ -288,7 +298,7 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
   # o claim não é solto no erro: a escrita guardada de soltura some
   mutant "claim não solto no erro" 'timeout 15 bd -C "$_rb_city" update "$_rb_id" --if-assignee "$_rb_alias" --assignee "" --status open -q >/dev/null 2>&1 || true' 'true'
   # a soltura perde a guarda --if-assignee (pisaria em quem pegou a bead depois)
-  mutant "soltura sem --if-assignee" '--if-assignee "$_rb_alias" --assignee "" --status open' '--assignee "" --status open'
+  mutant "soltura sem --if-assignee" '--if-assignee "$_rb_alias" --assignee "" --status open' '--assignee "" --status open' _pilot_node_first_rollback
   # alias acima de effective
   mutant "alias > effective" 'range(1; $eff + 1)' 'range(1; $eff + 2)'
   # lista de sessões ilegível lida como vazia (escolheria dog-remote-1 às cegas)
@@ -312,11 +322,11 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
   # o aviso que falha não desfaz
   mutant "aviso falha sem desfazer" '[ "$_nd_rc" -eq 0 ] || _nd_step="o aviso falhou (rc=$_nd_rc)"' ':'
   # o desfazer não fecha a sessão
-  mutant "sessão não fechada no desfazer" $'    timeout 20 gc --city "$GC_CITY" session close "$_rb_alias" >/dev/null 2>&1 \\\n' $'    true \\\n'
+  mutant "sessão não fechada no desfazer" $'    timeout 20 gc --city "$GC_CITY" session close "$_rb_alias" >/dev/null 2>&1 \\\n' $'    true \\\n' _pilot_node_first_rollback
   # desfazer não confirmado (bead ilegível) devolvido como limpo
-  mutant "ilegível = confirmado" $'NÃO mando a bead ao mini; o claim fica para o TTL"\n    return 1' $'NÃO mando a bead ao mini; o claim fica para o TTL"\n    return 0'
+  mutant "ilegível = confirmado" $'NÃO mando a bead ao mini; o claim fica para o TTL"\n    return 1' $'NÃO mando a bead ao mini; o claim fica para o TTL"\n    return 0' _pilot_node_first_rollback
   # desfazer não confirmado (bead com outro dono) devolvido como limpo
-  mutant "outro dono = confirmado" $'o claim fica para o TTL"\n  return 1\n}' $'o claim fica para o TTL"\n  return 0\n}'
+  mutant "outro dono = confirmado" $'o claim fica para o TTL"\n  return 1\n}' $'o claim fica para o TTL"\n  return 0\n}' _pilot_node_first_rollback
   # status que não volta a open aceito como confirmado
   mutant "status não volta = confirmado" 'if [ -z "$_rb_asg" ] && [ "$_rb_st" = "open" ]; then return 0; fi' 'if [ -z "$_rb_asg" ]; then return 0; fi'
   # o orçamento de spawn do sweep é ignorado
