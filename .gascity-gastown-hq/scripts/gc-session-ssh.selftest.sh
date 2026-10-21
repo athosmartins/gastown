@@ -706,7 +706,72 @@ PY
   cfg 3; install_host
 }
 
-all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; return 0; }
+g_acct() {  # a sessão claude do host nasce na conta 'current' do pool do mini (ga-2hd02v.7.1): a chave é lida NO MINI pelo `secret` e vai só pela entrada padrão do ssh
+  local KA=sk-ant-FAKEalfa-0123456789abcdef KB=sk-ant-FAKEbeta-0123456789abcdef pool="$T/pool.json" vault="$T/vault" sl="$T/secret.log" extra mode bad x r1
+  extra=$(jq -n --arg f "$pool" --arg s "$T/bin/secret" '{claude_account:{current_file:$f,secret:$s}}')
+  mkdir -p "$vault" "$T/tmp" "$T/home/.local/bin"; : > "$sl"
+  printf '%s\n' "$KA" > "$vault/claude-oauth-token-alfa@example.test"; printf '%s\n' "$KB" > "$vault/claude-oauth-token-beta@example.test"
+  # o "secret" do cofre: um arquivo por item em $FAKE_VAULT; FAKE_SECRET_MODE simula cofre fechado (rc 1, com chaves-isca em stdout e stderr), item ausente (rc 4) e saída sem forma de chave
+  cat > "$T/bin/secret" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "${FAKE_SECRET_LOG:-/dev/null}"
+case "${FAKE_SECRET_MODE:-}" in
+  locked) echo "sk-ant-DECOYOUT0000000000000000"; echo "Error: vault is locked sk-ant-DECOYERR0000000000000000" >&2; exit 1;;
+  notfound) echo "Not found: $1" >&2; exit 4;;
+  garbage) echo "isto nao e uma chave"; exit 0;;
+  spaced) echo "sk-ant-FAKEspaced 0123456789abcdef"; exit 0;;
+esac
+[ -f "$FAKE_VAULT/$1" ] || { echo "Not found: $1" >&2; exit 4; }
+cat "$FAKE_VAULT/$1"
+EOF
+  chmod +x "$T/bin/secret"
+  printf '#!/bin/sh\nprintf %%s "${CLAUDE_CODE_OAUTH_TOKEN-UNSET}" > "$1"\nexec cat\n' > "$T/home/.local/bin/claude"; chmod +x "$T/home/.local/bin/claude"  # o claude do "host": grava a env que recebeu
+  export FAKE_VAULT="$vault" FAKE_SECRET_LOG="$sl"
+  setpool() { printf '{"current":"%s","since":"2026-10-20T20:00:00Z","reason":"selftest"}\n' "$1" > "$pool"; }
+  leaks() {  # 0 = a chave $1 apareceu em algum lugar por onde NÃO pode passar (argv do ssh, saída, estado/log do mini, disco do host, ps, scrollback, ambiente do tmux)
+    local k="$1" s found=1
+    for s in "$T/ssh.log" "$T/out" "$T/err" "$sl"; do has "$s" "$k" && found=0; done
+    grep -rqF "$k" "$T/state" "$RR" "$RH" "$T/tmp" 2>/dev/null && found=0
+    ps -eo args= | grep -F "$k" | grep -vF grep | grep -q . && found=0
+    for s in $(tmux -L "$SOCK" list-sessions -F '#{session_name}' 2>/dev/null); do tmux -L "$SOCK" capture-pane -p -S - -t "=$s:" 2>/dev/null | grep -qF "$k" && found=0; done
+    tmux -L "$SOCK" show-environment -g 2>/dev/null | grep -qF "$k" && found=0
+    return $found
+  }
+  setpool alfa@example.test; cfg 3 25 "$extra"; fresh
+  pv --dry-run start remote-test-ac1 < <(req "claude $T/ac1.out"); r1=$RC
+  [ $r1 = 0 ] && [ "$(jq -r '.claude_account.current' "$T/out")" = alfa@example.test ] && [ ! -s "$sl" ] && ! has "$T/out" "$KA" && nossh; ok $? "acct: dry-run diz de qual conta seria a chave, NÃO lê o cofre e não mostra chave nenhuma (rc=$r1)"
+  fresh; TMPDIR="$T/tmp" pv start remote-test-ac1 < <(req "claude $T/ac1.out"); ok $RC "acct: start de sessão claude abre (rc=$RC $(head -c 200 "$T/err"))"
+  [ "$(cat "$T/ac1.out" 2>/dev/null)" = "$KA" ]; ok $? "acct: a sessão do host nasce com CLAUDE_CODE_OAUTH_TOKEN = a chave da conta current do pool (alfa)"
+  [ "$(grep -c . "$sl")" = 1 ] && has "$sl" "claude-oauth-token-alfa@example.test"; ok $? "acct: o cofre foi lido UMA vez, pelo item da conta atual"
+  ! leaks "$KA"; ok $? "acct: a chave não aparece no argv do ssh, na saída, no estado/log do mini, no disco do host, no ps, no scrollback nem no ambiente do tmux"
+  printf '%s' "$KA" > "$T/tmp/controle"; leaks "$KA"; r1=$?; rm -f "$T/tmp/controle"; ok $r1 "acct: (controle positivo) a varredura de vazamento acusa a chave quando ela está de fato no disco do host"
+  setpool beta@example.test; fresh; TMPDIR="$T/tmp" pv start remote-test-ac2 < <(req "claude $T/ac2.out"); r1=$RC
+  [ $r1 = 0 ] && [ "$(cat "$T/ac2.out" 2>/dev/null)" = "$KB" ]; ok $? "acct: o pool do mini trocou de conta → a sessão NOVA nasce com a chave da conta nova (beta) (rc=$r1)"
+  ! leaks "$KB"; ok $? "acct: ...e a chave da conta nova também não vaza"
+  for mode in locked notfound garbage spaced; do
+    : > "$sl"; fresh; FAKE_SECRET_MODE=$mode pv start remote-test-ac3 < <(req "claude $T/ac3.out"); r1=$RC
+    [ $r1 = 1 ] && nossh && [ ! -e "$T/ac3.out" ] && [ "$(count)" = 2 ] && ! has "$T/err" DECOY && ! has "$T/out" DECOY && ! ls "$RR/run" 2>/dev/null | grep -q ac3; ok $? "acct: secret '$mode' → o start RECUSA (rc 1) sem ssh, sem sessão, sem lançador, sem repetir o que o secret escreveu, e NÃO cai no login fixo do nó (rc=$r1)"
+  done
+  FAKE_SECRET_MODE=notfound pv start remote-test-ac3 < <(req "claude $T/ac3.out"); has "$T/err" 'sem chave cadastrada' && has "$T/err" beta@example.test; ok $? "acct: conta atual SEM item no cofre → o motivo diz 'sem chave cadastrada' e a conta (não é cofre ilegível)"
+  FAKE_SECRET_MODE=locked pv start remote-test-ac3 < <(req "claude $T/ac3.out"); has "$T/err" 'ilegível' && has "$T/err" beta@example.test; ok $? "acct: cofre fechado → o motivo diz 'ilegível' e a conta"
+  for bad in AUSENTE '{' '[]' '{}' '{"current":""}' '{"current":5}' '{"current":"a b@x.test"}' '{"current":"-x@y.test"}' '{"current":"x@y.test\nz"}' '{"current":"nao-e-email"}'; do
+    if [ "$bad" = AUSENTE ]; then rm -f "$pool"; else printf '%s\n' "$bad" > "$pool"; fi
+    : > "$sl"; fresh; pv start remote-test-ac4 < <(req "claude $T/ac4.out"); r1=$RC
+    [ $r1 = 1 ] && nossh && [ ! -s "$sl" ] && [ ! -e "$T/ac4.out" ] && has "$T/err" 'conta atual'; ok $? "acct: arquivo do pool $bad → recusa (rc 1) dizendo que não sabe a conta atual, sem ssh e sem tocar no cofre (rc=$r1)"
+  done
+  setpool alfa@example.test; : > "$sl"; FAKE_SECRET_MODE=locked pv start acct-cat < <(req "cat"); r1=$RC
+  [ $r1 = 0 ] && [ ! -s "$sl" ]; ok $? "acct: sessão que NÃO é claude não toca no cofre (nem com ele fechado) e abre normalmente (rc=$r1)"; pv stop acct-cat </dev/null
+  cfg 3; : > "$sl"; fresh; pv start remote-test-ac5 < <(req "claude $T/ac5.out"); r1=$RC
+  [ $r1 = 0 ] && [ "$(cat "$T/ac5.out" 2>/dev/null)" = UNSET ] && [ ! -s "$sl" ]; ok $? "acct: host SEM o bloco claude_account = como antes: nenhuma env nova e o cofre não é tocado (rc=$r1)"
+  for bad in '"texto"' '[]' '{}' '{"current_file":"relativo.json"}' '{"current_file":"/x/p.json","extra":1}' '{"current_file":5}' '{"current_file":"/x/p.json","secret":"relativo"}'; do
+    cfg 3 25 "{\"claude_account\":$bad}"; fresh; pv start remote-test-ac6 < <(req "claude $T/ac6.out"); r1=$RC
+    [ $r1 = 1 ] && nossh && has "$T/err" claude_account; ok $? "acct: claude_account mal formado ($bad) recusa a config nomeando a chave, sem ssh (rc=$r1)"
+  done
+  for x in remote-test-ac1 remote-test-ac2 remote-test-ac5; do pv stop $x </dev/null; done
+  rm -f "$T/home/.local/bin/claude" "$T/bin/secret"; unset FAKE_VAULT FAKE_SECRET_LOG; cfg 3
+}
+
+all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group acct && g_acct; return 0; }
 
 if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
 all
