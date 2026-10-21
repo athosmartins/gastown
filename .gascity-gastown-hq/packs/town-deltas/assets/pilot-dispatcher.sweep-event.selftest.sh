@@ -153,10 +153,11 @@ b19 1 rig_native_pool_store_blind
 b20 1 rig_native_pool_store_migrated
 b21 1 remerge_branch_lookup_unknown
 b22 1 wa_node_unknown
-b23 1 disk_floor_node_only'
+b23 1 disk_floor_node_only
+b24 1 ps_node_unknown'
 run_sweep "$BATCH" >/dev/null 2>&1
 echo "=== A2: one bead per real exit ==="
-expect '.candidates' '23'          "A2: 23 candidates evaluated"
+expect '.candidates' '24'          "A2: 24 candidates evaluated"
 expect '.dispatched' '2'           "A2: rc=0 → dispatched (rig_native_ok, sling_ok)"
 expect '.queued_pool_cap' '2'      "A2: pool session cap → queued_pool_cap, counted per bead"
 expect '.queued_global_cap' '1'    "A2: global (ga-jezvn) cap → queued_global_cap, SEPARATE from the pool cap (different causes)"
@@ -171,8 +172,10 @@ expect '.refused_by_guard.rig_native_pool_store_migrated' '1' "A2: ...and so is 
 expect '.results.remerge_branch_lookup_unknown' '1' "A2: a gate:needs-remerge branch lookup that could not READ (ga-x7m5rg) shows up BY NAME in results"
 expect '.results.wa_node_unknown' '1' "A2: a node-route write whose outcome could not be read (ga-2hd02v.1.10) shows up BY NAME in results"
 expect '.refused_by_guard | has("wa_node_unknown")' 'false' "A2: ...and it is NOT a guard refusal: the Pilot stood down because it could not tell whether the write landed — a fault to look at, not a policy outcome (same call as remerge_branch_lookup_unknown)"
+expect '.results.ps_node_unknown' '1' "A2: the PS twin of wa_node_unknown (ga-2hd02v.4.4): a PS node-route write whose outcome could not be read shows up BY NAME in results"
+expect '.refused_by_guard | has("ps_node_unknown")' 'false' "A2: ...and it is NOT a guard refusal either: same call as wa_node_unknown, the Pilot stood down because it could not tell whether the write landed — a fault to look at, stays in failed_other"
 expect '.refused_by_guard | has("remerge_branch_lookup_unknown")' 'false' "A2: ...and it is NOT a guard refusal: nothing was decided, git/origin could not be read — a fault, not a policy outcome (same call as rig_native_pool_count_unreadable, ga-oa004t)"
-expect '.failed_other' '7'         "A2: assign/sling/inflight failures, an unreadable remerge lookup, a node-route write whose outcome could not be read (ga-2hd02v.1.10) and an UNKNOWN name → failed_other (unknown is never a success; rig_native_dog_store_migrated is NOT in it)"
+expect '.failed_other' '8'         "A2: assign/sling/inflight failures, an unreadable remerge lookup, a node-route write whose outcome could not be read (ga-2hd02v.1.10) and an UNKNOWN name → failed_other (unknown is never a success; rig_native_dog_store_migrated is NOT in it)"
 expect '.unclassified' '1'         "A2: non-zero exit with NO named result → unclassified (not dropped, not called a success)"
 expect '.results.some_future_result' '1' "A2: an unknown result still shows up BY NAME in results (the next vocabulary drift explains itself)"
 expect '.results.rig_native_pool_session_cap_queued' '2' "A2: results is the per-name ground truth (same vocabulary as pilot_dispatch.result)"
@@ -319,7 +322,7 @@ fi
 # B4 — drift guard. A new DISPATCH_RESULT literal that is not classified would silently land in
 # failed_other: a BENIGN new state (e.g. another kind of queue) would then read as a Pilot failure on
 # the painel. Adding a result now means classifying it in _pilot_sweep_emit AND listing it here.
-KNOWN_RESULTS=" sling_ok rig_native_ok dry_run rig_native_pool_session_cap_queued rig_native_global_session_cap_queued rig_native_spawn_failed pool_ownership_refuse rig_native_dog_store_blind rig_native_dog_store_migrated rig_native_pool_store_blind rig_native_pool_store_migrated rig_native_pool_target_only rig_dedup_skip rig_assign_failed sling_no_bead_id sling_phantom_bead inflight_unconfirmed rig_native_pool_count_unreadable rig_native_spawn_deferred_slow remerge_branch_lookup_unknown wa_node_unknown hq_pool_store_blind pool_store_unknown priority_yield node_ok node_rollback_unconfirmed disk_floor_node_only "
+KNOWN_RESULTS=" sling_ok rig_native_ok dry_run rig_native_pool_session_cap_queued rig_native_global_session_cap_queued rig_native_spawn_failed pool_ownership_refuse rig_native_dog_store_blind rig_native_dog_store_migrated rig_native_pool_store_blind rig_native_pool_store_migrated rig_native_pool_target_only rig_dedup_skip rig_assign_failed sling_no_bead_id sling_phantom_bead inflight_unconfirmed rig_native_pool_count_unreadable rig_native_spawn_deferred_slow remerge_branch_lookup_unknown wa_node_unknown ps_node_unknown hq_pool_store_blind pool_store_unknown priority_yield node_ok node_rollback_unconfirmed disk_floor_node_only "
 # (rig_native_pool_count_unreadable, ga-oa004t: the session count could not be READ, so the spawn was not
 #  attempted — a FAULT, deliberately left in failed_other and NOT in a *_queued bucket: a dead `session list`
 #  is not a busy pool, and filing it as saturation would hide it from the Step 5 stall gate.)
