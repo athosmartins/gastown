@@ -46,6 +46,10 @@
 #     0 switches the guard off; an UNREADABLE df is "cannot tell", not "enough" (anomaly).
 # O15b the DEFAULT floor is 18 GiB — above the dolt_gc job's headroom gate (max(200% of the store,
 #     store + 3 GB) ~ 15 GiB): a sweep that ate that headroom would block the GC that returns space.
+# O15c below the floor a SMALL tail still goes (ga-32t5ds): a database whose WHOLE orphan backlog is at most
+#     GC_REAPER_ORPHAN_TAIL_ROWS is swept while the free space is >= GC_REAPER_ORPHAN_TAIL_MIN_FREE_GB; a bigger
+#     backlog, less space, a tail probe that failed, or TAIL_ROWS=0 keep the floor absolute; and the >1000 count
+#     alert names the disk halt (stable text, no numbers: the mail dedupe keys on it).
 # O16 the seatbelt: children exist but `wisps` is empty -> nothing is deleted (every row would look
 #     orphaned) and it is reported; an empty database with no children raises nothing.
 # O17 the purge's failure breaker tripped -> the sweep does not add load, and says so.
@@ -498,11 +502,51 @@ run_reaper FAKE_DF_FAIL=1               # df unreadable: "cannot tell" must not 
 # default is 18 GiB. This pins the default at its boundary; lower it only with a written reason.
 echo "O15b: the default floor is 18 GiB — above the dolt_gc headroom gate"
 new_db; seed_orphans; : > "$CALLS"; rm -f "$CITY/.gc/runtime/reaper-anomaly-mailed"
-run_reaper FAKE_DF_AVAIL_KB=17825792    # 17 GiB free: under the default
+# TAIL_ROWS=9: one row under this fixture's 10 orphans, so O15c's tail rule does not apply and this still pins the FLOOR.
+run_reaper FAKE_DF_AVAIL_KB=17825792 GC_REAPER_ORPHAN_TAIL_ROWS=9    # 17 GiB free: under the default
 [ "$(orphans)" = "3,2,4,1" ] && [ "$(field orphan_halted_dbs)" = "1" ] && ok "O15b 17 GiB free: the sweep stays inert" || nok "O15b swept under the default floor" "$OUT | $(orphans)"
 printf '%s' "$OUT" | grep 'orphan_halt: free disk 17 GiB is below the floor of 18 GiB' >/dev/null && ok "O15b the DOG_DONE line names both numbers" || nok "O15b halt reason" "$OUT"
 run_reaper FAKE_DF_AVAIL_KB=19922944    # 19 GiB free: above it
 [ "$(orphans)" = "0,0,0,0" ] && [ "$(field orphan_halted_dbs)" = "0" ] && ok "O15b 19 GiB free: the sweep runs" || nok "O15b did not sweep above the default floor" "$OUT | $(orphans)"
+
+# ── O15c: below the floor, a SMALL tail still goes (ga-32t5ds) ────────────────
+# Measured live 21/10: 5-8 GiB free against the 18 GiB floor kept 1,396 orphan rows (~11 MB) for two days, with
+# no mail — the floor was sized to drain 1.87 M rows. A database whose WHOLE orphan backlog is at most
+# GC_REAPER_ORPHAN_TAIL_ROWS (default 20000, ~160 MB at ~8 KB/row) is swept anyway while the free space is at
+# least GC_REAPER_ORPHAN_TAIL_MIN_FREE_GB (default 4 GiB, above dolt-disk-floor-guard's CRITICAL 3 GB); the floor
+# stays absolute for a bigger backlog.
+echo "O15c: below the floor a small tail is swept, a big backlog is not (ga-32t5ds)"
+new_db; seed_orphans; : > "$CALLS"; rm -f "$CITY/.gc/runtime/reaper-anomaly-mailed"
+run_reaper FAKE_DF_AVAIL_KB=5242880     # 5 GiB free: under the 18 GiB floor, over the 4 GiB tail floor
+[ "$(orphans)" = "0,0,0,0" ] && [ "$(field orphan_swept)" = "10" ] && [ "$(field orphan_halted_dbs)" = "0" ] && ok "O15c 5 GiB free, 10 orphan rows: the tail is swept" || nok "O15c the tail was not swept under the floor" "$OUT | $(orphans)"
+[ "$(live)" = "3,1,3,1" ] && ok "O15c every row of a LIVE wisp is intact" || nok "O15c live rows changed" "$(live)"
+[ "$(field orphan_tail_dbs)" = "1" ] && [ "$(mail_count)" = "0" ] && ok "O15c the DOG_DONE line says the tail rule was used (orphan_tail_dbs:1); no mail" || nok "O15c tail not reported, or mailed" "$OUT | $(cat "$CALLS")"
+new_db; seed_orphans
+run_reaper FAKE_DF_AVAIL_KB=5242880 GC_REAPER_ORPHAN_TAIL_ROWS=10
+[ "$(orphans)" = "0,0,0,0" ] && ok "O15c a backlog exactly AT the ceiling (10 rows, ceiling 10) is swept" || nok "O15c ceiling boundary" "$OUT | $(orphans)"
+new_db; seed_orphans
+run_reaper FAKE_DF_AVAIL_KB=5242880 GC_REAPER_ORPHAN_TAIL_ROWS=9
+[ "$(orphans)" = "3,2,4,1" ] && [ "$(field orphan_swept)" = "0" ] && [ "$(field orphan_halted_dbs)" = "1" ] && [ "$(field orphan_tail_dbs)" = "0" ] && ok "O15c one row ABOVE the ceiling: the floor holds, nothing is deleted" || nok "O15c swept a backlog above the ceiling" "$OUT | $(orphans)"
+printf '%s' "$OUT" | grep 'orphan_halt: free disk 5 GiB is below the floor of 18 GiB.*above the tail ceiling of 9 rows' >/dev/null && ok "O15c the halt reason names the ceiling" || nok "O15c halt reason (ceiling)" "$OUT"
+new_db; seed_orphans
+run_reaper FAKE_DF_AVAIL_KB=3670016     # 3.5 GiB free: under the 4 GiB tail floor
+[ "$(orphans)" = "3,2,4,1" ] && [ "$(field orphan_halted_dbs)" = "1" ] && ok "O15c 3.5 GiB free: even a tiny tail waits (below the tail floor)" || nok "O15c swept below the tail floor" "$OUT | $(orphans)"
+printf '%s' "$OUT" | grep 'orphan_halt: free disk 3 GiB is below the floor of 18 GiB.*below the tail floor of 4 GiB' >/dev/null && ok "O15c the halt reason names the tail floor" || nok "O15c halt reason (tail floor)" "$OUT"
+new_db; seed_orphans
+run_reaper FAKE_DF_AVAIL_KB=5242880 GC_REAPER_ORPHAN_TAIL_ROWS=0
+[ "$(orphans)" = "3,2,4,1" ] && [ "$(field orphan_halted_dbs)" = "1" ] && [ "$(printf '%s' "$OUT" | grep -c 'tail ceiling')" = "0" ] && ok "O15c TAIL_ROWS=0 keeps the floor absolute (the behaviour before ga-32t5ds)" || nok "O15c tail off" "$OUT | $(orphans)"
+# A tail probe that did not ANSWER is not "small": the sweep stays inert (the cap is ceiling+1, so LIMIT 20001 is the probe).
+new_db; seed_orphans; : > "$CALLS"; rm -f "$CITY/.gc/runtime/reaper-anomaly-mailed"; echo 999 > "$T/failcount"
+run_reaper FAKE_DF_AVAIL_KB=5242880 FAIL_RE='LIMIT 20001'
+echo 0 > "$T/failcount"
+[ "$(orphans)" = "3,2,4,1" ] && [ "$(field orphan_swept)" = "0" ] && [ "$(field orphan_halted_dbs)" = "1" ] && ok "O15c a tail probe that FAILED is not 'small': nothing is deleted" || nok "O15c swept on a failed probe" "$OUT | $(orphans)"
+# The >1000 count alert says WHY the orphans stay when the disk floor halted the sweep, in text without numbers
+# (the mail dedupe keys on it): a second run with another free-disk figure is not re-mailed.
+new_db; seed_orphans; : > "$CALLS"; rm -f "$CITY/.gc/runtime/reaper-anomaly-mailed"
+run_reaper FAKE_DF_AVAIL_KB=1048576 GC_REAPER_ORPHAN_COUNT_ALERT=5
+[ "$(mail_count)" = "1" ] && grep -q 'child rows of wisps that no longer exist.*halted by the free-disk floor' "$CALLS" && ok "O15c the count alert names the disk halt as the cause" || nok "O15c the alert does not name the disk halt" "$OUT | $(cat "$CALLS")"
+run_reaper FAKE_DF_AVAIL_KB=2097152 GC_REAPER_ORPHAN_COUNT_ALERT=5
+[ "$(mail_count)" = "1" ] && ok "O15c the alert text has no free-disk number: the next run is not re-mailed" || nok "O15c the alert was re-mailed" "$(cat "$CALLS")"
 
 # ── O16:the empty-wisps seatbelt ─────────────────────────────────────────────
 echo "O16: children exist but wisps is empty — nothing is deleted"
