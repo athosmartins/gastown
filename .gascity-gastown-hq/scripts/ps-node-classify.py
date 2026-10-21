@@ -134,6 +134,18 @@ def labels_of(b):
     return lab
 
 
+def recusada_pelo_no(b):
+    """True se o worker do nó devolveu a bead (athos.node_recusa preenchido). Ela volta ao mini e FICA lá, mesmo com node:ok: sem isto o modo label a mandaria de volta ao nó a cada varredura.
+    vazio (sem metadata ou sem a chave) -> False; falhou/ilegível (metadata que não é objeto) -> Unreadable, o veredito é unknown."""
+    md = b.get("metadata")
+    if md is None:
+        return False
+    if not isinstance(md, dict):
+        raise Unreadable("metadata-ilegivel")
+    v = md.get("athos.node_recusa")
+    return v is not None and str(v).strip() != ""
+
+
 def extract_paths(text):
     """(caminhos válidos em ordem, motivos duros). Caminho fora do formato seguro vira motivo duro: nunca vai ao disco."""
     seen, out, hard = set(), [], []
@@ -255,6 +267,8 @@ def classify(b):
     info =[slug for slug, rx in INFO_RE if rx.search(ntext)]
     if "node:mini" in labels:
         return "mini", ["etiqueta-node:mini"], [], [], info
+    if recusada_pelo_no(b):
+        return "mini", ["recusada-pelo-no"], [], [], info
     if b.get("issue_type") == "epic":
         return "mini", ["epic"], [], [], info
     paths, hard = extract_paths(text)

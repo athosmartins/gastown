@@ -49,6 +49,10 @@ expect "node: telefone sintético (cauda repetida) não conta como dado" "$(DESC
 # ---- mini
 expect "mini: etiqueta node:mini vence node:ok" "$(labels "$GOOD" '["node:ok","node:mini"]')" 10 'etiqueta-node:mini'
 expect "mini: epic" "$(field "$GOOD" issue_type '"epic"')" 10 '"reasons": \["epic"\]'
+expect "mini: bead devolvida pelo nó (athos.node_recusa) fica no mini, mesmo com node:ok" "$(labels "$(field "$GOOD" metadata '{"athos.node_recusa":"precisa do banco"}')" '["node:ok"]')" 10 'recusada-pelo-no'
+expect "node: athos.node_recusa vazio não conta como devolvida" "$(field "$GOOD" metadata '{"athos.node_recusa":"  "}')" 0 '"verdict": "node"'
+expect "node: metadata sem a chave não conta como devolvida" "$(field "$GOOD" metadata '{"outra":"x"}')" 0 '"verdict": "node"'
+expect "unknown: metadata que não é objeto (ilegível) NÃO vira node" "$(field "$GOOD" metadata '"texto"')" 11 'metadata-ilegivel'
 expect "mini: banco .db citado (o filtro segura)" "$WITHDB" 10 'caminho-fora-do-filtro:queue\.db'
 expect "mini: pasta data/ citada (o filtro segura mesmo sendo .py)" "$(DESC 'lib/x.py usa data/helper.py; tests/test_x.py')" 10 'caminho-fora-do-filtro:data/helper\.py'
 expect "mini: credentials*.json citado" "$(DESC 'lib/x.py lê config/credentials_prod.json; tests/test_x.py')" 10 'caminho-fora-do-filtro:config/credentials_prod\.json'
@@ -225,6 +229,9 @@ mutant() { # mutant <nome> <trecho original> <trecho novo> <json> <rc> <regex> [
 }
 mutant sem-node-mini     '"node:mini" in labels'                       'False'                                  "$(labels "$GOOD" '["node:mini"]')" 10 'etiqueta-node:mini'
 mutant sem-epic          'b.get("issue_type") == "epic"'               'False'                                  "$(field "$GOOD" issue_type '"epic"')" 10 '"epic"'
+mutant sem-recusa        'if recusada_pelo_no(b):'                     'if False:'                              "$(labels "$(field "$GOOD" metadata '{"athos.node_recusa":"precisa do banco"}')" '["node:ok"]')" 10 'recusada-pelo-no'
+mutant recusa-vazia-conta 'return v is not None and str(v).strip() != ""' 'return v is not None'                  "$(field "$GOOD" metadata '{"athos.node_recusa":"  "}')" 0 '"verdict": "node"'
+mutant metadata-ilegivel-livre 'raise Unreadable("metadata-ilegivel")'   'return False'                            "$(field "$GOOD" metadata '"texto"')" 11 'metadata-ilegivel'
 mutant sem-pii           'if has_pii(json.dumps'                       'if False and has_pii(json.dumps'        "$(DESC 'lib/x.py tests/test_x.py (31) 98876-5432')" 10 'dado-no-texto'
 mutant pii-sem-cauda     'len(set(d[-8:])) > 3'                        'len(set(d[-8:])) >= 0'                  "$(DESC 'lib/x.py tests/test_x.py +55 31 99999-9999')" 0 '"verdict": "node"'
 mutant filtro-ignorado   'if p not in sent:'                           'if False:'                              "$WITHDB" 10 'caminho-fora-do-filtro'
