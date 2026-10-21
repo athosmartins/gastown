@@ -19,6 +19,7 @@ STATE=$T/state; SF=$STATE/hetzner-claude.state.json; RROOT=$HETZNER_REMOTE_ROOT
 cat >"$T/bin/ssh" <<'EOF'
 #!/bin/sh
 [ -f "$FAKE/ssh.stdin.on" ] && wc -c >>"$FAKE/ssh.stdin"
+[ -f "$FAKE/ssh.argv.on" ] && printf '%s\n' "$*" >>"$FAKE/ssh.argv"
 [ -f "$FAKE/sleep" ] && sleep "$(cat "$FAKE/sleep")"
 if [ -f "$FAKE/ssh.rc" ]; then  # ssh.rc.only (opcional): só falha o comando que contém este texto; sem ele, falha todos
   if [ ! -f "$FAKE/ssh.rc.only" ] || case "$*" in *"$(cat "$FAKE/ssh.rc.only")"*) true;; *) false;; esac; then
@@ -48,7 +49,10 @@ cat >"$SRV/.local/bin/claude" <<'EOF'
 F=$FAKE
 rd() { cat "$F/$1" 2>/dev/null; }
 case "$1 $2 $3" in
-  "auth status "*) echo auth >>"$F/calls"; rd auth.out; exit "$(rd auth.rc)";;
+  "auth status "*) echo auth >>"$F/calls"; echo "auth:${CLAUDE_CODE_OAUTH_TOKEN-UNSET}" >>"$F/env.seen"
+    # MEDIDO 21/10 com chave FALSA (claude 2.1.302): com CLAUDE_CODE_OAUTH_TOKEN o auth status diz loggedIn true e authMethod oauth_token, mesmo com outro login guardado; auth.ignores.env simula um claude que ignora a env
+    if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ ! -f "$F/auth.ignores.env" ]; then echo '{"loggedIn":true,"authMethod":"oauth_token","apiProvider":"firstParty"}'; exit 0; fi
+    rd auth.out; exit "$(rd auth.rc)";;
   "plugin marketplace list") rd mk.out; exit 0;;
   "plugin marketplace add") echo "$4" >>"$F/mk.added"; [ -f "$F/mk.addfail" ] && exit 1; echo '[{"name":"claude-plugins-official"}]' >"$F/mk.out"; exit 0;;
   "plugin install "*) grep -qx -- "$3" "$F/failinstall" 2>/dev/null && exit 1; echo "$3" >>"$F/installed.ids"; exit 0;;
@@ -63,7 +67,9 @@ PY
     exit 0;;
 esac
 case "$1" in
-  -p) echo probe >>"$F/calls"; echo "$*" >>"$F/probe.args"; { printf '<%s>' "$@"; echo; } >>"$F/probe.argv"; pwd >>"$F/probe.pwd"; rd probe.out; exit "$(rd probe.rc)";;
+  -p) echo probe >>"$F/calls"; echo "$*" >>"$F/probe.args"; { printf '<%s>' "$@"; echo; } >>"$F/probe.argv"; pwd >>"$F/probe.pwd"; echo "probe:${CLAUDE_CODE_OAUTH_TOKEN-UNSET}" >>"$F/env.seen"
+     k=${CLAUDE_CODE_OAUTH_TOKEN:-}; if [ -n "$k" ] && [ -f "$F/probe.out.$k" ]; then rd "probe.out.$k"; exit "$(rd "probe.rc.$k")"; fi  # resposta POR CHAVE: cada conta do pool tem a sua cota
+     rd probe.out; exit "$(rd probe.rc)";;
   --version) if [ -f "$F/version" ]; then cat "$F/version"; exit 0; fi; echo "claude: not found" >&2; exit 127;;
 esac
 exit 98
@@ -183,6 +189,50 @@ has "sonda não grava transcrição" "$(cat "$FAKE/probe.args")" "--no-session-p
 reset; g . 0 ok; age checked -1000; age probe -5000; g . 0 ok; eq "2 chamadas" "$(calls probe)" 2
 eq "a sonda roda sempre na mesma pasta (o claude cria um projeto por pasta: mktemp deixaria um novo por hora)" "$(sort -u "$FAKE/probe.pwd" | wc -l | tr -d ' ')" 1
 eq "e é a pasta fixa" "$(sort -u "$FAKE/probe.pwd")" "$SRV/gt-remote/probe"
+
+echo "== conta do pool do mini (ga-2hd02v.7.1): a sonda usa a MESMA chave que a sessão do nó, e o veredito é POR CONTA"
+KA=sk-ant-FAKEalfa-0123456789abcdef; KB=sk-ant-FAKEbeta-0123456789abcdef; mkdir -p "$T/vault"; : >"$T/secret.log"
+printf '%s\n' "$KA" >"$T/vault/claude-oauth-token-alfa@example.test"; printf '%s\n' "$KB" >"$T/vault/claude-oauth-token-beta@example.test"
+cat >"$T/bin/secret" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"${FAKE_SECRET_LOG:-/dev/null}"
+case "${FAKE_SECRET_MODE:-}" in
+  locked) echo "sk-ant-DECOYOUT0000000000000000"; echo "vault is locked" >&2; exit 1;;
+  notfound) echo "Not found: $1" >&2; exit 4;;
+esac
+[ -f "$FAKE_VAULT/$1" ] || { echo "Not found: $1" >&2; exit 4; }
+cat "$FAKE_VAULT/$1"
+EOF
+chmod +x "$T/bin/secret"
+export FAKE_VAULT=$T/vault FAKE_SECRET_LOG=$T/secret.log HETZNER_SESSION_SSH=$HERE/gc-session-ssh
+setpool() { printf '{"current":"%s","since":"2026-10-20T20:00:00Z","reason":"selftest"}\n' "$1" >"$T/pool.json"; }
+cfgprov() { printf '{"default_host":"a","hosts":{"a":{"ssh":"hetzner-teste","cap":2,"remote_root":"%s","remote_home":"%s"%s}}}\n' "$RROOT" "$SRV" "$1" >"$2"; }
+cfgprov ",\"claude_account\":{\"current_file\":\"$T/pool.json\",\"secret\":\"$T/bin/secret\"}" "$T/session-ssh.json"
+seen() { sort -u "$FAKE/env.seen" 2>/dev/null | tr '\n' ' '; }
+nocalls() { eq "$1" "$(calls auth)$(calls probe)" 00; }
+export GC_SSH_CONFIG=$T/session-ssh.json
+reset; setpool alfa@example.test; : >"$T/secret.log"; : >"$FAKE/ssh.argv.on"
+g "host que segue o pool: ok com a chave da conta atual" 0 ok
+eq "o claude do nó recebeu a chave de alfa (login e chamada de modelo)" "$(seen)" "auth:$KA probe:$KA "
+has "o estado diz de qual conta é a medida" "$(cat "$SF")" '"account": "alfa@example.test"'
+if grep -rqF -- "$KA" "$STATE" "$FAKE/ssh.argv" || printf '%s' "$GOUT" | grep -qF -- "$KA"; then bad "a chave apareceu no argv do ssh, no estado, no log ou na saída do gate"; else ok; fi
+printf '%s' "$KA" >"$STATE/controle"; if grep -rqF -- "$KA" "$STATE"; then ok; else bad "controle positivo da varredura de vazamento"; fi; rm -f "$STATE/controle"
+reset; setpool alfa@example.test; : >"$T/secret.log"; g . 0 ok; g "mesma conta dentro do TTL usa o cache" 0 ok
+eq "o cofre foi lido UMA vez (só quem mede pergunta a ele)" "$(grep -c . "$T/secret.log")" 1
+reset; setpool alfa@example.test; printf '%s' "$P_QUOTA" >"$FAKE/probe.out.$KA"; echo 1 >"$FAKE/probe.rc.$KA"; printf '%s' "$P_OK" >"$FAKE/probe.out.$KB"; echo 0 >"$FAKE/probe.rc.$KB"
+g "alfa sem cota: bloqueado" 1 quota; has "diz de qual conta" "$GOUT" "alfa@example.test"
+setpool beta@example.test; g "o pool trocou para beta: mede beta AGORA, sem esperar o TTL nem o retry de 15 min" 0 ok
+eq "e a chamada de modelo de beta usou a chave de beta" "$(grep -c "probe:$KB" "$FAKE/env.seen")" 1
+setpool alfa@example.test; g "voltou a alfa: não herda o veredito de beta, mede alfa de novo" 1 quota
+reset; setpool alfa@example.test; : >"$T/secret.log"; FAKE_SECRET_MODE=locked g "cofre fechado: bloqueado (unknown)" 1 unknown; nocalls "...sem falar com o claude do nó"; hasnt "...e sem repetir o que o secret escreveu" "$GOUT" DECOY
+reset; setpool beta@example.test; FAKE_SECRET_MODE=notfound g "conta atual sem chave no cofre: logged-out" 1 logged-out; has "diz sem chave cadastrada" "$GOUT" "sem chave cadastrada"; nocalls "...sem falar com o claude do nó"
+reset; rm -f "$T/pool.json"; : >"$T/secret.log"; g "arquivo do pool ausente: unknown" 1 unknown; has "diz que não sabe a conta atual" "$GOUT" "conta atual"; nocalls "...sem falar com o claude do nó"; eq "...e sem tocar no cofre" "$(grep -c . "$T/secret.log")" 0
+reset; setpool alfa@example.test; : >"$FAKE/auth.ignores.env"; g "claude do nó que ignora a env (authMethod != oauth_token): a medida não seria da conta do pool" 1 unknown; has "diz por quê" "$GOUT" "não usou a chave do pool"
+unset GC_SSH_CONFIG; reset; : >"$T/secret.log"
+g "sem config do provider: como sempre (login do próprio nó)" 0 ok; eq "o claude do nó não recebeu env nenhuma" "$(seen)" "auth:UNSET probe:UNSET "; eq "e o cofre não foi tocado" "$(grep -c . "$T/secret.log")" 0
+cfgprov "" "$T/session-ssh2.json"; reset; GC_SSH_CONFIG=$T/session-ssh2.json g "host da config SEM claude_account: como sempre" 0 ok; eq "...sem env" "$(seen)" "auth:UNSET probe:UNSET "
+echo '{' >"$T/session-ssh3.json"; reset; GC_SSH_CONFIG=$T/session-ssh3.json g "config do provider que existe e não lê: bloqueia, não vira 'não segue'" 1 unknown; nocalls "...sem falar com o claude do nó"
+unset FAKE_VAULT FAKE_SECRET_LOG
 
 echo "== status"
 reset; out=$(python3 -I "$S" status); eq "status ok" $? 0; has "json" "$out" '"state": "ok"'
