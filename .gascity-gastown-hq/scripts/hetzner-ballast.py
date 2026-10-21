@@ -1,31 +1,33 @@
 #!/usr/bin/env python3
-"""hetzner-ballast.py — o lastro do nó Hetzner: trabalho útil de baixa prioridade que ocupa a CPU que sobra e cede na hora. (ga-2hd02v.5, fatia 2/5) Python 3.9+, só biblioteca padrão.
+"""hetzner-ballast.py — o lastro do nó Hetzner: trabalho útil de baixa prioridade que ocupa a CPU que sobra e cede na hora. (ga-2hd02v.5) Python 3.9+, só biblioteca padrão.
 
 Contents
-  Para que serve · O contrato do nice · Um tick (esta fatia) · Itens · Três estados · Arquivos · Uso
+  Para que serve · Roda ONDE · O contrato do nice · Um tick · Itens · Três estados · Arquivos · Uso
 
 PARA QUE SERVE
   Athos (20/10): "se está 100% ocupado a gente fica feliz; o que não pode é ficar menos". Mesmo com toda bead elegível indo ao nó, a fila tem buracos (madrugada de 20/10: 7 h em 0-15% de CPU).
-  Este governo roda NO NÓ (cron do `runner`, a cada minuto, sem root) e, quando a CPU livre passa de 15% por 3 leituras seguidas, começa o próximo item da fila de lastro (hetzner-ballast.items.txt; no nó, items.tsv).
+  Este governo roda NO NÓ (cron do `runner`, a cada minuto) e, quando a CPU livre passa de 15% por 3 leituras seguidas, começa o próximo item da fila de lastro (hetzner-ballast.items.txt, no nó items.tsv).
+RODA ONDE
+  No nó, como `runner`, sem root e sem rede para o mini: um tick só lê /proc e arquivos da própria pasta. A instalação, a chave de ligar e o resultado são do mini (hetzner-ballast.sh).
 O CONTRATO DO NICE
   Todo item roda em nice 19 + SCHED_IDLE (chrt -i 0) + ionice classe 3: o escalonador entrega a CPU a qualquer sessão (nice 0) na hora, sem esperar este governo. O /proc/stat conta esse tempo
   na coluna `nice`, e é por isso que ele NÃO é carga: carga = user+system+irq+softirq+steal (nice <= 0). O hetzner-capacity.py lê a mesma coluna (CPU em nice > 0 é folga da cidade) — sem isso o
   lastro faria o nó parecer "quente" e a cidade deixaria de mandar bead para ele.
-UM TICK  (esta fatia: MEDE e COMEÇA. Encerrar a rodada, prazo, RAM, filler, desligar e stop são a fatia 3/5; nada disto está instalado: a ferramenta do mini é a 4/5)
-  1 lê o registro, /proc/stat, /proc/meminfo e a tabela de processos  2 CPU livre = núcleos - carga(nice<=0); a conta de leituras livres seguidas anda ou zera  3 com a chave `on`, começa itens
-  `work` enquanto couberem no orçamento (núcleos livres - reserva) e a RAM disponível deixar (>= piso de partida + o teto do item). Sem a chave `on` só mede.
+UM TICK  (exit 0 sempre que "não consegui ler" — vira nota no registro; 3 só se não dá para gravar)
+  1 lê o registro, /proc/stat, /proc/meminfo e a tabela de processos  2 dá fim aos itens que acabaram (results.jsonl)  3 sem a chave `on`: mata o que roda e sai  4 RAM: pausa (SIGSTOP),
+  retoma (SIGCONT) ou mata o maior  5 CPU livre = núcleos - carga(nice<=0); a conta de leituras livres seguidas anda ou zera  6 começa itens enquanto couberem no orçamento
+  (núcleos livres - reserva): `work` primeiro; `filler` só com o que sobrar e é morto quando um `work` vai começar.
 ITENS  (registro TSV, 8 colunas: nome papel núcleos rss_mb prazo_s cooldown_s requires comando)
-  papel work|filler (o filler só começa a partir da fatia 3/5) · núcleos inteiro ou `auto` (leva o resto do orçamento) · rss_mb teto da soma de RSS do item · requires `-` ou lista de
-  path:/exec:/cmd:/flag:/noflag: (todos verdadeiros; predicado desconhecido = item inerte) · comando relativo vale a partir da pasta de itens. Linha malformada = erro visível em
-  `registry_errors`; o item dela não roda e os outros seguem. O que roda é achado na TABELA DE PROCESSOS (o líder da sessão leva a marca `ballast-item:<item>:<rodada>` na linha de comando E a
-  pasta runs/<rodada> é DESTA pasta de lastro), não no state.json: perder o estado não duplica o que já roda, e processo com a marca de outra pasta não é nosso.
+  papel work|filler · núcleos inteiro ou `auto` (leva o resto do orçamento) · rss_mb teto da soma de RSS do item · requires `-` ou lista de path:/exec:/cmd:/flag:/noflag: (todos verdadeiros;
+  predicado desconhecido = item inerte) · comando relativo vale a partir da pasta de itens. Linha malformada = erro visível em `registry_errors`; o item dela não roda e os outros seguem.
+  O que roda é achado na TABELA DE PROCESSOS (o líder da sessão leva a marca `ballast-item:<item>:<rodada>` na linha de comando), não no state.json: perder o estado não duplica o que já roda.
 TRÊS ESTADOS
-  Toda leitura é leu / vazio / não consegui ler. "Não consegui ler" (registro, /proc/stat, meminfo, tabela de processos) nunca vira "livre": nada começa naquele tick.
+  Toda leitura é leu / vazio / não consegui ler. "Não consegui ler" (registro, /proc/stat, meminfo, tabela de processos) nunca vira "livre" nem "morto": nada começa e nada é morto naquele tick.
   state.json corrompido ou de forma errada vai para <arquivo>.corrupt-<época> e recomeça; ilegível por permissão = rc 3 (inerte). A escrita da pasta é conferida ANTES de qualquer efeito.
-  O que o tick não leu fica null no registro (running, registry_errors, mode), nunca []. NÃO INSTALAR antes da 3/5: runs/ nunca é limpo e o log de cada item não tem teto até lá.
+  O que o tick não leu fica null no registro (running, registry_errors, mode), nunca [].
 ARQUIVOS  (em $BALLAST_HOME, padrão ~/gt-remote/ballast)
-  items.tsv · items/ · on (a chave: presente = ligado) · state.json · lock · ticks.jsonl · runs/<rodada>/{meta.json,log}
-USO  hetzner-ballast.py tick | status      env: BALLAST_HOME BALLAST_PROC BALLAST_NOW BALLAST_ITEMS BALLAST_ITEMS_DIR BALLAST_LAUNCH_PREFIX (JSON, com `nice`; BALLAST_TEST=1 só no selftest) e os limites BALLAST_* de load_config
+  items.tsv · items/ · on (a chave: presente = ligado) · state.json · lock · ticks.jsonl · results.jsonl · runs/<rodada>/{meta.json,log,rc,final}
+USO  hetzner-ballast.py tick | status [--json] | stop      env: BALLAST_HOME BALLAST_PROC BALLAST_NOW BALLAST_ITEMS BALLAST_ITEMS_DIR BALLAST_LAUNCH_PREFIX (JSON, com `nice`; BALLAST_TEST=1 só no selftest) e os limites BALLAST_* de load_config
 """
 import fcntl
 import json
@@ -33,6 +35,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -85,7 +88,11 @@ def load_config(env):
         idle_min_pct=_num(env, "BALLAST_IDLE_MIN_PCT", 15.0, float, 0.0), idle_ticks=_num(env, "BALLAST_IDLE_TICKS", 3, int, 1),
         reserve=_num(env, "BALLAST_RESERVE_CORES", 1.0, float, 0.0), max_items=_num(env, "BALLAST_MAX_ITEMS", 4, int, 1),
         gap_s=_num(env, "BALLAST_GAP_S", 180, int, 1), page_kb=_num(env, "BALLAST_PAGE_KB", 4, int, 1),
-        ram_start_mb=_num(env, "BALLAST_RAM_START_MB", 14336, int, 0),
+        ram_start_mb=_num(env, "BALLAST_RAM_START_MB", 14336, int, 0), ram_pause_mb=_num(env, "BALLAST_RAM_PAUSE_MB", 10240, int, 0),
+        ram_resume_mb=_num(env, "BALLAST_RAM_RESUME_MB", 12288, int, 0), ram_kill_mb=_num(env, "BALLAST_RAM_KILL_MB", 7168, int, 0),
+        pause_kill_ticks=_num(env, "BALLAST_PAUSE_KILL_TICKS", 5, int, 1), term_grace_s=_num(env, "BALLAST_TERM_GRACE_S", 20, int, 1),
+        deadline_slack_s=_num(env, "BALLAST_DEADLINE_SLACK_S", 60, int, 0), fail_cooldown_s=_num(env, "BALLAST_FAIL_COOLDOWN_S", 600, int, 0),
+        keep_runs=_num(env, "BALLAST_KEEP_RUNS", 30, int, 0),
         launch_prefix=_prefix(prefix, env.get("BALLAST_TEST") == "1"))
 
 
@@ -292,7 +299,7 @@ def eligibility(cfg, item, st, running_names):
 
 # ---- estado -------------------------------------------------------------------------------------------------------------------------------------------
 def fresh_state():
-    return {"v": 1, "last": None, "free_ticks": 0, "cooldown": {}}
+    return {"v": 1, "last": None, "free_ticks": 0, "cooldown": {}, "term": {}, "killed": {}, "paused": False, "paused_ticks": 0}
 
 
 def _int(x):
@@ -300,8 +307,13 @@ def _int(x):
 
 
 def state_ok(st):
-    """Forma do state.json: v 1, cooldown {nome: época}, free_ticks inteiro >= 0, last None ou {t, vec de 8 inteiros}. JSON válido de forma errada é corrompido, não estado."""
+    """Forma do state.json: v 1, cooldown {nome: época}, free_ticks inteiro >= 0, last None ou {t, vec de 8 inteiros}; term {rodada: época}, killed {rodada: motivo}, paused bool e
+    paused_ticks inteiro >= 0 quando existem (estado da 2/5 não os tem: load_state os completa). JSON válido de forma errada é corrompido, não estado."""
     if not (isinstance(st, dict) and st.get("v") == 1 and isinstance(st.get("cooldown"), dict) and all(_int(x) for x in st["cooldown"].values())):
+        return False
+    if not (isinstance(st.get("term", {}), dict) and all(_int(x) for x in st.get("term", {}).values())
+            and isinstance(st.get("killed", {}), dict) and all(isinstance(x, str) for x in st.get("killed", {}).values())
+            and isinstance(st.get("paused", False), bool) and _int(st.get("paused_ticks", 0)) and st.get("paused_ticks", 0) >= 0):
         return False
     last = st.get("last")
     return (_int(st.get("free_ticks")) and st["free_ticks"] >= 0
@@ -322,6 +334,8 @@ def load_state(cfg):
         st = json.loads(raw.decode("utf-8"))
         if not state_ok(st):
             raise ValueError("formato")
+        for k, v in fresh_state().items():
+            st.setdefault(k, v)
         return st
     except (ValueError, RecursionError, UnicodeDecodeError):
         aside = "%s.corrupt-%d" % (path, cfg.now)
@@ -331,6 +345,19 @@ def load_state(cfg):
             raise Fail("%s: corrompido e não consegui pôr de lado (%s)" % (path, e))
         print("hetzner-ballast: %s corrompido; cópia em %s, recomeço" % (path, aside), file=sys.stderr)
         return fresh_state()
+
+
+def trim_log(path, cap, keep):
+    """Arquivo que o cron enche (cron.err): passou do teto, fica só o fim. O cron abre em modo de acréscimo, então segue escrevendo no novo fim. Ausente/ilegível → nada (log não derruba o tick)."""
+    try:
+        if os.path.getsize(path) > cap:
+            with open(path, "rb") as f:
+                f.seek(-keep, os.SEEK_END)
+                tail = f.read()
+            with open(path, "wb") as f:
+                f.write(tail)
+    except OSError:
+        pass
 
 
 def save_json(path, obj):
@@ -404,7 +431,42 @@ def start_item(cfg, item, cores):
     return {"item": item["name"], "run": run, "pid": p.pid, "cores": cores}
 
 
-# ---- rodadas (pasta runs/) ----------------------------------------------------------------------------------------------------------------------------
+# ---- sinais e fim de rodada ---------------------------------------------------------------------------------------------------------------------------
+def send(r, sig):
+    """Manda o sinal ao grupo inteiro do item (sessão própria) e a cada membro (um filho que mudou de grupo continua na sessão). Não existe mais = False."""
+    hit = False
+    try:
+        os.killpg(r["pid"], sig)
+        hit = True
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        return False
+    for m in r["members"]:
+        try:
+            os.kill(m, sig)
+            hit = True
+        except (ProcessLookupError, PermissionError):
+            pass
+    return hit
+
+
+def terminate(cfg, st, r, why, rec):
+    """TERM (+CONT, que um grupo parado não trata TERM); o KILL vem num tick depois se o grupo seguir vivo."""
+    send(r, signal.SIGTERM)
+    send(r, signal.SIGCONT)
+    st["term"][r["run"]] = cfg.now
+    st["killed"].setdefault(r["run"], why)
+    rec["killed"].append({"item": r["item"], "run": r["run"], "why": why, "sig": "TERM"})
+
+
+def kill_now(cfg, st, r, why, rec):
+    send(r, signal.SIGKILL)
+    st["term"][r["run"]] = cfg.now
+    st["killed"][r["run"]] = why
+    rec["killed"].append({"item": r["item"], "run": r["run"], "why": why, "sig": "KILL"})
+
+
 def read_meta(cfg, run):
     # vazio/ilegível → None (a rodada é encerrada com o nome do item tirado do nome da pasta, sem tamanho nem prazo)
     try:
@@ -413,6 +475,81 @@ def read_meta(cfg, run):
         return m if isinstance(m, dict) and isinstance(m.get("item"), str) else None
     except (OSError, ValueError, RecursionError):
         return None
+
+
+def read_summary(path):
+    """(resumo|None, porque). Vale a ÚLTIMA linha `BALLAST-SUMMARY: {json}` do fim do log; o que não for objeto JSON é ilegível, nunca dado."""
+    # vazio (nenhuma linha de resumo) → (None, 'ausente'); falhou/ilegível → (None, 'log-ilegivel'); resumo que não é objeto → (None, 'ilegivel')
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 65536))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None, "log-ilegivel"
+    lines = [ln for ln in tail.splitlines() if ln.startswith("BALLAST-SUMMARY: ")]
+    if not lines:
+        return None, "ausente"
+    try:
+        v = json.loads(lines[-1][len("BALLAST-SUMMARY: "):])
+    except (ValueError, RecursionError):
+        return None, "ilegivel"
+    return (v, "") if isinstance(v, dict) else (None, "ilegivel")
+
+
+def finalize(cfg, st, run, rec):
+    """Encerra uma rodada que não tem mais processo: results.jsonl, cooldown, marca final. rc ilegível/ausente NUNCA vira ok."""
+    rundir = os.path.join(cfg.home, "runs", run)
+    meta = read_meta(cfg, run)
+    item = meta["item"] if meta else re.sub(r"-[0-9]+(-[0-9]+)?$", "", run)
+    # vazio (sem arquivo rc) → rc None = morreu sem avisar; falhou/ilegível (não é inteiro) → também None
+    rc = None
+    try:
+        with open(os.path.join(rundir, "rc"), "r", encoding="ascii") as f:
+            rc = int(f.read().strip())
+    except (OSError, ValueError):
+        pass
+    killed = st["killed"].pop(run, None)
+    st["term"].pop(run, None)
+    why = killed or ("ok" if rc == 0 else ("rc-%d" % rc if rc is not None else "morreu-sem-rc"))
+    summ, summ_why = read_summary(os.path.join(rundir, "log"))
+    start = meta.get("start") if meta else None
+    row = {"ts": iso(cfg.now), "item": item, "run": run, "role": meta.get("role") if meta else None, "cores": meta.get("cores") if meta else None, "start": start,
+           "secs": (cfg.now - start) if isinstance(start, int) else None, "rc": rc, "why": why, "summary": summ, "summary_why": summ_why}
+    append_line(os.path.join(cfg.home, "results.jsonl"), row, 2000000)
+    try:
+        with open(os.path.join(rundir, "final"), "w") as f:
+            f.write("%d\n" % cfg.now)
+    except OSError as e:
+        raise Fail("%s: não marquei a rodada como final (%s)" % (rundir, e))
+    # vazio/ilegível (meta.json sumida ou cooldown_s que não é inteiro >= 0) → o cooldown de falha: não sei o do item, e errar para menos o recomeçaria em cima
+    cool = meta.get("cooldown_s") if meta else None
+    if not (_int(cool) and cool >= 0):
+        cool = cfg.fail_cooldown_s
+    if why not in ("ok", "desligado", "preempt", "stop"):
+        cool = max(cool, cfg.fail_cooldown_s)
+    st["cooldown"][item] = cfg.now + cool
+    rec["reaped"].append({"item": item, "run": run, "rc": rc, "why": why})
+
+
+def prune_runs(cfg):
+    """Fica com as `keep_runs` rodadas ENCERRADAS mais novas; a que roda e a sem marca final nunca são apagadas."""
+    base = os.path.join(cfg.home, "runs")
+    fin = []
+    try:
+        for d in os.listdir(base):
+            try:
+                with open(os.path.join(base, d, "final"), "r") as f:
+                    fin.append((int(f.read().strip()), d))
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        return
+    fin.sort()
+    for _, d in fin[:max(0, len(fin) - cfg.keep_runs)]:
+        path = os.path.join(base, d)
+        if os.path.dirname(os.path.realpath(path)) == os.path.realpath(base):
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def unfinished_runs(cfg):
@@ -480,9 +617,40 @@ def cpu_step(cfg, st, vec, ncpu, rec, notes):
     return ok
 
 
+def ram_step(cfg, st, run, mem, rec):
+    """RAM: abaixo do piso crítico mata o maior na hora; abaixo do de pausa congela (SIGSTOP) e, se não passar em N leituras, mata o maior; com folga retoma (SIGCONT)."""
+    biggest = max(run.values(), key=lambda r: r["rss_kb"]) if run else None
+    if mem < cfg.ram_kill_mb:
+        rec["ram"] = "critica"
+        if biggest:
+            kill_now(cfg, st, biggest, "ram-critica", rec)
+            del run[biggest["run"]]
+    elif mem < cfg.ram_pause_mb or (st["paused"] and mem < cfg.ram_resume_mb):
+        rec["ram"] = "pausa"
+        if run:
+            for r in run.values():
+                send(r, signal.SIGSTOP)
+            st["paused"] = True
+            st["paused_ticks"] += 1
+            if st["paused_ticks"] >= cfg.pause_kill_ticks:
+                kill_now(cfg, st, biggest, "ram-pausa", rec)
+                del run[biggest["run"]]
+                st["paused_ticks"] = 0
+    else:
+        rec["ram"] = "ok"
+        if st["paused"]:
+            for r in run.values():
+                send(r, signal.SIGCONT)
+        st["paused"], st["paused_ticks"] = False, 0
+    if not run:
+        st["paused"], st["paused_ticks"] = False, 0
+    rec["paused"] = st["paused"]
+
+
 def do_tick(cfg):
-    # o que este tick NÃO leu fica null (mode, running, registry_errors), nunca um valor padrão que pareça leitura
-    rec = {"ts": iso(cfg.now), "t": cfg.now, "mode": None, "note": "", "started": [], "running": None, "skipped": [], "registry_errors": None, "ram": None}
+    # o que este tick NÃO leu fica null (mode, running, registry_errors, paused), nunca um valor padrão que pareça leitura; started/killed/reaped/skipped são o que o tick FEZ: vazio = nada
+    rec = {"ts": iso(cfg.now), "t": cfg.now, "mode": None, "note": "", "started": [], "running": None, "killed": [], "reaped": [], "skipped": [], "registry_errors": None, "ram": None,
+           "paused": None}
     try:
         os.makedirs(cfg.home, exist_ok=True)
         lock = open(os.path.join(cfg.home, "lock"), "w")
@@ -501,7 +669,9 @@ def do_tick(cfg):
         os.remove(probe)
     except OSError as e:
         raise Fail("%s: não consigo gravar (%s)" % (cfg.home, e))
+    trim_log(os.path.join(cfg.home, "cron.err"), 262144, 65536)
     st = load_state(cfg)
+    rec["paused"] = st["paused"]
     on = os.path.exists(os.path.join(cfg.home, "on"))
     rec["mode"] = "ligado" if on else "desligado"
     items, notes = [], []
@@ -515,29 +685,62 @@ def do_tick(cfg):
     try:
         ncpu, vec = read_stat(cfg.proc)
         mem = read_mem_avail_mb(cfg.proc)
-        procs, _unf, run = current_runs(cfg)
+        procs, unf, run = current_runs(cfg)
+        # rodada sem processo vivo na sessão e sem marca final = acabou (ou morreu): encerra. Sem ler os processos NINGUÉM é dado por morto.
+        for r in unf:
+            if r not in run:
+                finalize(cfg, st, r, rec)
+        prune_runs(cfg)
     except Unreadable as e:
         notes.append("leitura-ilegivel")
         procs = None
         print("hetzner-ballast: %s" % e, file=sys.stderr)
     rec["ncpu"], rec["mem_avail_mb"] = ncpu, mem
+    seen_names = {r["item"] for r in run.values()}   # o que existia ANTES de qualquer sinal deste tick: quem leva TERM e ainda morre não pode ser recomeçado em cima
     free_ok = False
     if vec is not None:
         free_ok = cpu_step(cfg, st, vec, ncpu, rec, notes)
     rec["free_ticks"] = st["free_ticks"]
+    if procs is not None:
+        # quem já levou TERM e segue vivo depois da graça leva KILL; prazo estourado (+ folga) leva TERM
+        for r in list(run.values()):
+            t = st["term"].get(r["run"])
+            m = read_meta(cfg, r["run"]) or {}
+            # vazio/ilegível (meta.json sem start, timeout_s ou rss_mb inteiros) → sem prazo e sem teto de RSS para ESTE item neste tick: não mata por palpite (o `timeout -k` do lançamento ainda o limita)
+            start, tmo, cap = m.get("start"), m.get("timeout_s"), m.get("rss_mb")
+            if t is not None:
+                if cfg.now - t >= cfg.term_grace_s:
+                    kill_now(cfg, st, r, st["killed"].get(r["run"], "term-ignorado"), rec)
+                    del run[r["run"]]
+                else:
+                    del run[r["run"]]       # já foi avisado: não conta como rodando para o resto do tick
+            elif not on:
+                terminate(cfg, st, r, "desligado", rec)
+                del run[r["run"]]
+            elif _int(start) and _int(tmo) and cfg.now - start > tmo + cfg.deadline_slack_s:
+                terminate(cfg, st, r, "prazo", rec)
+                del run[r["run"]]
+            elif _int(cap) and r["rss_kb"] > cap * 1024:
+                terminate(cfg, st, r, "rss", rec)
+                del run[r["run"]]
+        if mem is not None and on:
+            ram_step(cfg, st, run, mem, rec)
     # vazio (nada roda) → []; falhou/ilegível (tabela de processos) → null, nunca []
     rec["running"] = sorted(r["item"] for r in run.values()) if procs is not None else None
-    # começar itens: ligado, tudo lido, CPU livre por idle_ticks leituras seguidas, orçamento = núcleos livres - reserva
+    # começar itens: ligado, tudo lido, CPU livre por idle_ticks leituras seguidas, orçamento = núcleos livres - reserva. `work` primeiro; `filler` só com o que sobrar.
     block = any(n.startswith(("leitura-ilegivel", "registro-ilegivel", "primeira-leitura", "lacuna")) for n in notes)
-    if on and procs is not None and not block and free_ok and mem is not None and st["free_ticks"] >= cfg.idle_ticks:
+    if on and procs is not None and not block and free_ok and mem is not None and not st["paused"] and st["free_ticks"] >= cfg.idle_ticks:
         budget = int(ncpu - rec["fg_cores"] - cfg.reserve + 1e-9)
-        names = {r["item"] for r in run.values()}
-        used = running_cores(cfg, run, items, budget, notes)
-        mem_left = mem   # a RAM é lida uma vez por tick: cada item começado já a desconta, senão dois itens "cabem" na mesma sobra
+        running_names = seen_names | {k["item"] for k in rec["killed"]}
+        # só `work` ocupa o orçamento do `work`; o filler que roda é o que sobrou e sai da frente (preempt) quando um work vai começar
+        used0 = running_cores(cfg, {k: r for k, r in run.items() if (read_meta(cfg, r["run"]) or {}).get("role") != "filler"}, items, budget, notes)
+        used = used0
+        mem_left = mem   # a RAM é lida uma vez por tick: cada item PLANEJADO já a desconta, senão dois itens "cabem" na mesma sobra (planejado que não começa só deixa o filler mais cauteloso)
+        plan = []
         for it in items:
             if it["role"] != "work":
                 continue
-            ok, why = eligibility(cfg, it, st, names)
+            ok, why = eligibility(cfg, it, st, running_names)
             cores = it["cores"] if it["cores"] != "auto" else budget - used
             if not ok or cores < 1 or used + cores > budget:
                 continue
@@ -545,11 +748,38 @@ def do_tick(cfg):
                 rec["skipped"].append({"item": it["name"], "why": "ram"})
                 rec["ram"] = "baixa"
                 continue
+            plan.append((it, cores))
+            used += cores
+            mem_left -= it["rss_mb"]
+        if plan:   # um work vai começar: os fillers saem da frente (e voltam no tick seguinte com o que sobrar)
+            for r in list(run.values()):
+                m = read_meta(cfg, r["run"]) or {}
+                if m.get("role") == "filler" and r["run"] not in st["term"]:
+                    terminate(cfg, st, r, "preempt", rec)
+                    del run[r["run"]]
+        for it, cores in plan:
             if len(run) + len(rec["started"]) >= cfg.max_items:
                 break
             try:
                 rec["started"].append(start_item(cfg, it, cores))
-                used += cores
+            except Unreadable as e:
+                notes.append("nao-comecou:%s" % it["name"])
+                print("hetzner-ballast: %s" % e, file=sys.stderr)
+        fill_used = used0 + sum(r["cores"] for r in rec["started"])
+        for it in items:
+            if it["role"] != "filler" or len(run) + len(rec["started"]) >= cfg.max_items:
+                continue
+            ok, why = eligibility(cfg, it, st, running_names)
+            cores = it["cores"] if it["cores"] != "auto" else budget - fill_used
+            if not ok or cores < 1 or (it["cores"] != "auto" and fill_used + cores > budget):
+                continue
+            if mem_left - it["rss_mb"] < cfg.ram_start_mb:
+                rec["skipped"].append({"item": it["name"], "why": "ram"})
+                rec["ram"] = "baixa"
+                continue
+            try:
+                rec["started"].append(start_item(cfg, it, cores))
+                fill_used += cores
                 mem_left -= it["rss_mb"]
             except Unreadable as e:
                 notes.append("nao-comecou:%s" % it["name"])
@@ -558,6 +788,57 @@ def do_tick(cfg):
     save_json(os.path.join(cfg.home, "state.json"), st)
     append_line(os.path.join(cfg.home, "ticks.jsonl"), rec)
     return rec
+
+
+def do_stop(cfg):
+    """Mata tudo o que roda (TERM+CONT, KILL 3 s depois no que sobrar) e anota o motivo `stop` na rodada, para o results.jsonl não dizer que ela morreu sozinha. Sem ler os processos não
+    mata nada e sai 3. Se um tick está rodando (lock tomado por mais de 5 s) ou o estado não abre, mata do mesmo jeito e a rodada sai como morreu-sem-rc: parar vale mais que a anotação."""
+    try:
+        run = current_runs(cfg)[2]
+    except Unreadable as e:
+        raise Fail("stop: não consegui ler os processos (%s)" % e)
+    out = {"stopped": []}
+    lock, st = None, None
+    try:
+        os.makedirs(cfg.home, exist_ok=True)
+        lock = open(os.path.join(cfg.home, "lock"), "w")
+        for _ in range(25):
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                st = load_state(cfg)
+                break
+            except OSError:
+                time.sleep(0.2)
+    except (OSError, Fail):
+        st = None
+    for r in run.values():
+        send(r, signal.SIGTERM)
+        send(r, signal.SIGCONT)
+        if st is not None:
+            st["killed"].setdefault(r["run"], "stop")
+        out["stopped"].append({"item": r["item"], "run": r["run"], "pid": r["pid"]})
+    if st is not None:
+        try:
+            save_json(os.path.join(cfg.home, "state.json"), st)
+        except Fail:
+            pass
+    end = time.time() + 3
+    while run and time.time() < end:
+        if not any(send_probe(r) for r in run.values()):
+            break
+        time.sleep(0.2)
+    for r in run.values():
+        if send_probe(r):
+            send(r, signal.SIGKILL)
+    return out
+
+
+def send_probe(r):
+    try:
+        os.killpg(r["pid"], 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
 
 
 # ---- status -------------------------------------------------------------------------------------------------------------------------------------------
@@ -607,10 +888,13 @@ def main(argv):
         if cmd == "status":
             print(json.dumps(do_status(cfg)))
             return 0
+        if cmd == "stop":
+            print(json.dumps(do_stop(cfg)))
+            return 0
     except Fail as e:
         print("hetzner-ballast: %s" % e, file=sys.stderr)
         return e.rc
-    print("uso: hetzner-ballast.py tick | status", file=sys.stderr)
+    print("uso: hetzner-ballast.py tick | status [--json] | stop", file=sys.stderr)
     return 2
 
 

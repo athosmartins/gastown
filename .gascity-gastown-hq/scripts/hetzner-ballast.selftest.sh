@@ -1,11 +1,28 @@
 #!/usr/bin/env bash
-# hetzner-ballast.selftest.sh — hermético (ga-2hd02v.5): o /proc é uma pasta de fixtures (BALLAST_PROC), o relógio é BALLAST_NOW, o "nó" é uma pasta temporária e os itens são scripts de
-# brinquedo. Nada fala com o nó de verdade e nada toca em ~/gt-remote.
-# Contents: Casos · Controle negativo (mutantes) · Variáveis
-# CASOS (fatia 2/5: MEDE e COMEÇA; encerrar, RAM, prazo, filler e stop são a 3/5): registro (g_reg) · tick (g_tick: chave on, histerese de 3 leituras, nice não é carga, orçamento, teto, lacuna, leituras
-#   ilegíveis, lock) · processos (g_run: marca + pasta runs/ desta pasta, duplicata, o que já roda ocupa núcleos e teto) · estado (g_state: forma, corrompido, permissão) · lançamento (g_launch).
+# hetzner-ballast.selftest.sh — hermético (ga-2hd02v.5): o /proc é uma pasta de fixtures (BALLAST_PROC), o relógio é BALLAST_NOW, o "nó" é uma pasta temporária e os itens
+# são scripts de brinquedo que dormem ou imprimem um resumo. Nada fala com o nó de verdade e nada toca em ~/gt-remote.
+#
+# Contents
+#   Casos · Controle negativo (mutantes) · Variáveis
+#
+# CASOS
+#   registro (g_reg): linhas válidas · coluna a mais/a menos, papel, núcleos, nome repetido e `requires` desconhecido viram erro VISÍVEL e o item fica inerte (os outros seguem) ·
+#     comentário e linha em branco ignorados · registro ausente/ilegível = nada começa e nada é morto · comando relativo vale a partir da pasta de itens.
+#   tick (g_tick): sem a chave `on` não começa nada · 1ª leitura só semeia · CPU livre >= 15% por 3 leituras seguidas antes de começar, e uma leitura abaixo zera a conta · o
+#     tempo em nice > 0 (o próprio lastro) NÃO conta como carga · orçamento = núcleos livres - reserva (item de N núcleos só cabe se rodando + N <= orçamento; `auto` leva o resto) ·
+#     teto de itens · contador que anda para trás ou lacuna de mais de 3 min recomeça a conta · /proc/stat ou meminfo ilegível = não começa e não mata · outra instância
+#     rodando = não faz nada · pasta sem permissão = rc 3.
+#   processos (g_run): o que roda é achado na tabela de processos (marca + pasta runs/<rodada> DESTA pasta; marca de outra pasta não é nossa) · duplicata · o que já roda ocupa núcleos (meta.json sumida = o que o registro diz) e teto · lista de processos ilegível ≠ ninguém roda.
+#   RAM (g_ram): abaixo do piso de partida não começa · abaixo do piso de pausa congela (SIGSTOP) e volta (SIGCONT) com folga · pausa que não passa em N leituras mata o maior ·
+#     abaixo do piso crítico mata o maior na hora · RSS do item acima do teto dele mata.
+#   fim e resultado (g_reap): rc 0 / rc≠0 / sem rc / resumo ilegível viram linha em results.jsonl, nunca "ok" por falta de leitura · cooldown · pid reaproveitado não é o item ·
+#     prazo estourado (TERM, depois KILL) · quem sumiu sem a leitura de processos não é dado por morto.
+#   enchimento (g_fill): item `filler` só entra com a flag, é morto quando um item `work` vai começar e nunca conta no orçamento do `work`.
+#   desligar (g_off): chave `on` apagada mata o que roda (TERM) · `stop` idem · `status` diz o estado sem gravar.
+#   estado (g_state): state.json corrompido vai para o lado e recomeça sem duplicar o que já roda (o processo é a fonte da verdade) · ilegível por permissão = inerte (rc 3).
+#   lançamento (g_launch): prefixo nice 19 + SCHED_IDLE + ionice idle + timeout -k, com o que existir no PATH; sem `timeout` o item não começa.
 # CONTROLE NEGATIVO: cada mutante (um trecho do script trocado) TEM que reprovar a bateria.
-# VARIÁVEIS: HB_UNDER_TEST (script a testar) · HB_PY (interpretador; padrão /usr/bin/python3) · HB_NO_MUTANTS=1 · HB_ONLY=<grupo> (reg tick run state launch; sem mutantes)
+# VARIÁVEIS: HB_UNDER_TEST (script a testar) · HB_PY (interpretador; padrão /usr/bin/python3) · HB_NO_MUTANTS=1 · HB_ONLY=<grupo> (reg tick run ram reap fill off state logs launch; sem mutantes)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 P="${HB_UNDER_TEST:-$HERE/hetzner-ballast.py}"
@@ -82,12 +99,21 @@ print(v if isinstance(v,str) else json.dumps(v))' "$1" 2>/dev/null
 nstart() { printf '%s' "$OUT" | "$PY" -I -c 'import sys,json; print(len(json.load(sys.stdin)["started"]))'; }
 started_pid() { jget started.0.pid; }
 started_run() { jget started.0.run; }
+isdead() {  # isdead PID — o grupo de processos sumiu (ou só sobrou zumbi): espera até 3 s
+  local i=0; while [ "$i" -lt 15 ]; do kill -0 -- "-$1" 2>/dev/null || return 0; [ "$(pstate "$1")" = Z ] && return 0; sleep 0.2; i=$((i+1)); done; return 1
+}
 running_one() {  # running_one — newhome + o hq (4 núcleos) já rodando e visível no /proc de mentira: PID e RUN
   newhome; seed; good 50; good 50; good 50; PID=$(started_pid); RUN=$(started_run); alive "$PID" hq "$RUN"
 }
+nkilled() { printf '%s' "$OUT" | "$PY" -I -c 'import sys,json; print(len(json.load(sys.stdin)["killed"]))'; }
+rj() { [ -f "$H/results.jsonl" ] && tail -n 1 "$H/results.jsonl" | "$PY" -I -c 'import sys,json; v=json.load(sys.stdin)
+for k in sys.argv[1].split("."):
+    v=v.get(k) if isinstance(v,dict) else None
+print(v if isinstance(v,str) else json.dumps(v))' "$1" || echo "sem-results"; }
 seed() { bt; }                                          # a 1ª leitura só semeia o baseline
 good() { adv "${1:-50}" "${2:-0}"; bt; }               # uma leitura com CPU livre (padrão: 50% de carga de sessões)
 lines() { [ -f "$1" ] && wc -l < "$1" | tr -d ' ' || echo 0; }
+pstate() { ps -o stat= -p "$1" 2>/dev/null | cut -c1; }   # S, R, T (parado), vazio = não existe
 
 # ── g_reg ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 g_reg() {
@@ -146,9 +172,6 @@ g_tick() {
   newhome; seed; good 0 100; good 0 100; good 0 100
   check "tick: tempo em nice > 0 (o próprio lastro) NÃO é carga: fg 0, livre 100%, começa" "0.0 100.0 hq" "$(jget fg_cores) $(jget free_pct) $(jget started.0.item)"
 
-  newhome; seed; setmem 15000; good 50; good 50; good 50
-  check "tick: 15000 MB livres < 14336 (piso de partida) + 1024 (teto de RSS do item) → não começa, ram baixa" "[] baixa" "$(jget started) $(jget ram)"
-  setmem 15400; good 50; check "tick: 15400 MB → cabe: começa" "hq" "$(jget started.0.item)"
   newhome; reg 'c|work|2|1024|3600|300|-|sleeper.sh'; setmem 15500; seed; good 25; good 25; good 25
   check "tick: 15500 MB cabem UM item (a RAM é lida uma vez, mas cada item começado a desconta): hq começa, c fica de fora, ram baixa" "hq 1 baixa" "$(jget started.0.item) $(nstart) $(jget ram)"
   newhome; seed; good 50; "$PY" -I -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["cooldown"]["hq"]=int(sys.argv[2])+600; json.dump(d, open(p,"w"))' "$H/state.json" "$NOW"; good 50; good 50
@@ -219,6 +242,167 @@ g_run() {
   check "run: /proc/stat e meminfo legíveis mas a LISTA de processos não → leitura-ilegivel e nada começa (não é 'ninguém roda'); running null, não []" "leitura-ilegivel [] null" "$(jget note) $(jget started) $(jget running)"
 }
 
+
+# ── g_ram ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+g_ram() {
+  newhome; seed; setmem 15000; good 50; good 50; good 50
+  check "ram: 15000 MB livres < 14336 (piso de partida) + 1024 (rss do item) → não começa, ram baixa" "[] baixa" "$(jget started) $(jget ram)"
+  setmem 15400; good 50; check "ram: 15400 MB → cabe: começa" "hq ok" "$(jget started.0.item) $(jget ram)"
+  PID=$(started_pid); RUN=$(started_run); alive "$PID" hq "$RUN"
+
+  setmem 9000; adv 50 0; bt
+  check "ram: 9000 MB < piso de pausa (10240) → pausa o grupo (SIGSTOP), ram pausa, paused" "pausa true" "$(jget ram) $(jget paused)"
+  sleep 0.3; check "ram: o processo do item ficou parado de verdade (estado T)" "T" "$(pstate "$PID")"
+  setmem 11000; adv 50 0; bt; check "ram: 11000 MB (entre pausa e retomada 12288) → segue pausado" "true" "$(jget paused)"
+  setmem 13000; adv 50 0; bt; sleep 0.3
+  check "ram: 13000 MB >= retomada → SIGCONT, paused false" "false" "$(jget paused)"
+  check "ram: o processo voltou a rodar (não está em T)" "1" "$([ "$(pstate "$PID")" != T ] && echo 1 || echo 0)"
+
+  running_one; setmem 9000; adv 50 0; bt; adv 50 0; bt; adv 50 0; bt; adv 50 0; bt
+  check "ram: pausado 4 leituras seguidas ainda vive" "0" "$(nkilled)"
+  adv 50 0; bt
+  check "ram: 5ª leitura pausada → mata o maior com SIGKILL (memória acabando não espera TERM) e o motivo ram-pausa" "1 ram-pausa KILL" "$(nkilled) $(jget killed.0.why) $(jget killed.0.sig)"
+  isdead "$PID"; check "ram: o grupo morreu de verdade" "0" "$?"
+
+  newhome; reg 'b|work|2|1024|3600|300|-|sleeper.sh'; seed; good 50; good 50; good 50
+  p1=$(jget started.0.pid); r1=$(jget started.0.run); p2=$(jget started.1.pid); r2=$(jget started.1.run); alive "$p1" hq "$r1" 500000; alive "$p2" b "$r2" 100000
+  setmem 6000; adv 50 0; bt
+  check "ram: 6000 MB < piso crítico (7168) → mata na hora UM item, o de maior RSS (hq), com SIGKILL, motivo ram-critica" "1 hq ram-critica KILL" "$(nkilled) $(jget killed.0.item) $(jget killed.0.why) $(jget killed.0.sig)"
+  isdead "$p1"; check "ram: o maior morreu" "0" "$?"
+  check "ram: o menor segue vivo" "1" "$(kill -0 -- "-$p2" 2>/dev/null && echo 1 || echo 0)"
+  kill -9 -- "-$p2" 2>/dev/null
+
+  running_one; member 7000001 "$PID" 2000000; setmem 28000; adv 50 0; bt
+  check "ram: soma de RSS do grupo (2 GB do filho + 1 MB) acima do teto do item (1024 MB) → mata, motivo rss" "1 rss" "$(nkilled) $(jget killed.0.why)"
+  isdead "$PID"; check "ram: o grupo estourou o teto e morreu" "0" "$?"
+}
+
+# ── g_reap ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+smitem() {  # smitem — o item 'sm' rodando e visível; espera (até 10 s: o mini carregado leva centenas de ms por exec) o log ter a linha de resumo
+  newhome; : > "$H/items.tsv"; reg 'sm|work|4|1024|3600|300|-|summary.sh'; seed; good 50; good 50; good 50; PID=$(started_pid); RUN=$(started_run); alive "$PID" sm "$RUN"
+  local i=0; while [ "$i" -lt 50 ] && ! grep -q 'BALLAST-SUMMARY' "$H/runs/$RUN/log" 2>/dev/null; do sleep 0.2; i=$((i+1)); done
+}
+g_reap() {
+  smitem; gone "$PID"; echo 0 > "$H/runs/$RUN/rc"; adv 50 0; bt
+  check "reap: rc 0 + resumo no log → reaped, why ok" "sm 0 ok" "$(jget reaped.0.item) $(jget reaped.0.rc) $(jget reaped.0.why)"
+  check "reap: results.jsonl ganha a linha com o resumo lido do log (pass 3)" "sm ok 3" "$(rj item) $(rj why) $(rj summary.pass)"
+  check "reap: a rodada fica marcada como final (não é encerrada duas vezes)" "1" "$([ -e "$H/runs/$RUN/final" ] && echo 1 || echo 0)"
+  adv 50 0; bt; check "reap: a mesma rodada não é reapada de novo" "1" "$(lines "$H/results.jsonl")"
+  adv 50 0; bt; check "reap: dentro do cooldown (300 s) o item não recomeça" "[]" "$(jget started)"
+  adv 50 0 300; bt; adv 50 0; bt; adv 50 0; bt; adv 50 0; bt
+  check "reap: passado o cooldown, com 3 leituras livres seguidas, começa de novo" "sm" "$(jget started.0.item)"
+
+  smitem; gone "$PID"; echo 3 > "$H/runs/$RUN/rc"; adv 50 0; bt
+  check "reap: rc 3 → why rc-3 (nunca ok)" "3 rc-3" "$(jget reaped.0.rc) $(jget reaped.0.why)"
+  adv 50 0 400; bt; adv 50 0; bt; adv 50 0; bt; adv 50 0; bt
+  check "reap: item que falhou espera ao menos 600 s (400 s depois ainda não recomeça)" "[]" "$(jget started)"
+
+  smitem; rm -f "$H/runs/$RUN/meta.json"; gone "$PID"; echo 0 > "$H/runs/$RUN/rc"; adv 50 0; bt
+  check "reap: meta.json sumida (não sei o cooldown do item) → o item sai pelo nome da pasta e espera o cooldown de FALHA (600 s), não 0" "sm 600" "$(rj item) $("$PY" -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["cooldown"]["sm"] - d["last"]["t"])' "$H/state.json")"
+
+  smitem; gone "$PID"; adv 50 0; bt
+  check "reap: sumiu sem rc → why morreu-sem-rc e rc null (não é ok, não é falha de teste)" "null morreu-sem-rc" "$(jget reaped.0.rc) $(jget reaped.0.why)"
+
+  smitem; gone "$PID"; echo 0 > "$H/runs/$RUN/rc"; printf 'x\nBALLAST-SUMMARY: {nope\n' > "$H/runs/$RUN/log"; adv 50 0; bt
+  check "reap: resumo que não é JSON → summary null e summary_why ilegivel (a rodada segue ok)" "ok null ilegivel" "$(rj why) $(rj summary) $(rj summary_why)"
+  smitem; gone "$PID"; echo 0 > "$H/runs/$RUN/rc"; printf 'sem resumo\n' > "$H/runs/$RUN/log"; adv 50 0; bt
+  check "reap: log sem linha de resumo → summary_why ausente" "null ausente" "$(rj summary) $(rj summary_why)"
+  smitem; gone "$PID"; echo 0 > "$H/runs/$RUN/rc"; printf 'BALLAST-SUMMARY: {"pass": 1}\nBALLAST-SUMMARY: {"pass": 9}\n' > "$H/runs/$RUN/log"; adv 50 0; bt
+  check "reap: valem as últimas linhas (a última vence)" "9" "$(rj summary.pass)"
+  smitem; gone "$PID"; echo 0 > "$H/runs/$RUN/rc"; printf 'BALLAST-SUMMARY: [1,2]\n' > "$H/runs/$RUN/log"; adv 50 0; bt
+  check "reap: resumo que é JSON mas não é objeto → ilegivel (não vira dado)" "null ilegivel" "$(rj summary) $(rj summary_why)"
+
+  smitem; member 7000002 "$PID" 2048; gone "$PID"; adv 50 0; bt
+  check "reap: o líder sumiu mas um filho segue na sessão → o item AINDA roda (nada encerrado, nada recomeçado)" "[] [] sm" "$(jget reaped) $(jget started) $(jget running.0)"
+  gone 7000002; adv 50 0; bt
+  check "reap: quando o último filho some, a rodada é encerrada" "sm" "$(jget reaped.0.item)"
+
+  smitem; printf 'sh\0-c\0x\0outro-programa\0' > "$FP/$PID/cmdline"; echo 0 > "$H/runs/$RUN/rc"; adv 50 0; bt
+  check "reap: pid reaproveitado por outro programa (sem a marca) NÃO é o item: a rodada é encerrada" "sm" "$(jget reaped.0.item)"
+
+  smitem; mv "$FP" "$FP.off"; NOW=$((NOW + 60)); bt; mv "$FP.off" "$FP"
+  check "reap: sem conseguir ler os processos NINGUÉM é dado por morto (nenhum reaped, sem final)" "leitura-ilegivel 0" "$(jget note) $([ -e "$H/runs/$RUN/final" ] && echo 1 || echo 0)"
+  smitem; chmod 311 "$FP"; adv 50 0; bt; chmod 755 "$FP"
+  check "reap: /proc/stat e meminfo legíveis mas a LISTA de processos não (pasta sem leitura) → leitura-ilegivel, ninguém é dado por morto" "leitura-ilegivel [] 0" "$(jget note) $(jget reaped) $([ -e "$H/runs/$RUN/final" ] && echo 1 || echo 0)"
+
+  newhome; : > "$H/items.tsv"; reg 'sl|work|4|1024|100|300|-|sleeper.sh'; seed; good 50; good 50; good 50; PID=$(started_pid); RUN=$(started_run); alive "$PID" sl "$RUN"
+  adv 50 0 120; bt
+  check "reap: dentro do prazo + 60 s de folga (120 s de 100) não mexe" "0" "$(nkilled)"
+  adv 50 0 70; bt
+  check "reap: passou prazo + folga (190 s > 160) e o grupo segue vivo → TERM, motivo prazo" "1 prazo" "$(nkilled) $(jget killed.0.why)"
+  isdead "$PID"; check "reap: o item que respeita TERM morreu" "0" "$?"
+  adv 50 0 10; bt
+  check "reap: o item que levou TERM e ainda aparece vivo (dentro da graça de 20 s) NÃO é recomeçado: nenhuma segunda cópia" "[] [] sl" "$(jget started) $(jget killed) $(jget running.0 | sed 's/null/sl/')"
+
+  newhome; : > "$H/items.tsv"; printf '#!/bin/sh\ntrap "" TERM\nsleep 300 &\nwait\n' > "$H/items/stubborn.sh"; chmod +x "$H/items/stubborn.sh"; reg 'st|work|4|1024|100|300|-|stubborn.sh'
+  seed; good 50; good 50; good 50; PID=$(started_pid); RUN=$(started_run); alive "$PID" st "$RUN"; sleep 0.5
+  adv 50 0 170; bt; sleep 0.3
+  check "reap: item que ignora TERM sobrevive ao primeiro golpe" "1" "$(kill -0 -- "-$PID" 2>/dev/null && echo 1 || echo 0)"
+  adv 50 0 30; bt; sleep 0.3
+  isdead "$PID"; check "reap: 20 s depois do TERM o governo manda KILL no que sobrou" "0" "$?"
+
+  newhome; EXTRA_ENV="BALLAST_KEEP_RUNS=2"; : > "$H/items.tsv"; reg 'q|work|1|1024|3600|0|-|summary.sh'; seed; good 50; good 50; good 50; p=$(started_pid); r=$(started_run)
+  for i in 1 2 3 4; do alive "$p" q "$r"; sleep 0.3; gone "$p"; kill -9 -- "-$p" 2>/dev/null; echo 0 > "$H/runs/$r/rc"; adv 50 0; bt; p=$(started_pid); r=$(started_run); done
+  check "reap: BALLAST_KEEP_RUNS=2 guarda só as 2 últimas rodadas ENCERRADAS em runs/ (a que roda não conta)" "2" "$(ls "$H"/runs/*/final 2>/dev/null | wc -l | tr -d ' ')"
+  check "reap: results.jsonl guarda a história inteira (4)" "4" "$(lines "$H/results.jsonl")"
+  kill -9 -- "-$p" 2>/dev/null
+}
+
+# ── g_fill ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+g_fill() {
+  newhome; reg 'queima|filler|auto|256|600|0|flag:burn.on|sleeper.sh'; seed; good 25; good 25; good 25
+  check "fill: sem a flag burn.on o filler não é elegível (só o hq começa)" "hq 1" "$(jget started.0.item) $(nstart)"
+  newhome; reg 'queima|filler|auto|256|600|0|flag:burn.on|sleeper.sh'; : > "$H/burn.on"; seed; good 25; good 25; good 25
+  check "fill: com a flag, o work vem primeiro e o filler leva o resto do orçamento (11 - 4 = 7)" "hq queima 7" "$(jget started.0.item) $(jget started.1.item) $(jget started.1.cores)"
+  p1=$(jget started.0.pid); r1=$(jget started.0.run); p2=$(jget started.1.pid); r2=$(jget started.1.run); alive "$p1" hq "$r1"; alive "$p2" queima "$r2"
+  gone "$p1"; echo 0 > "$H/runs/$r1/rc"; adv 25 0; bt
+  check "fill: o work acabou: filler segue rodando (cooldown do work corre)" "hq 0" "$(jget reaped.0.item) $(nkilled)"
+  for i in 1 2 3 4 5; do adv 25 0; bt; done
+  check "fill: cooldown do work acabou → o filler é morto (preempt) e o work começa NO MESMO tick" "queima preempt hq" "$(jget killed.0.item) $(jget killed.0.why) $(jget started.0.item)"
+  isdead "$p2"; check "fill: o filler morto saiu mesmo" "0" "$?"
+  p3=$(jget started.0.pid); r3=$(jget started.0.run); alive "$p3" hq "$r3"; gone "$p2"
+  adv 25 0; bt
+  check "fill: no tick seguinte o filler volta com o que sobrou do orçamento" "queima 7" "$(jget started.0.item) $(jget started.0.cores)"
+  kill -9 -- "-$p3" 2>/dev/null
+
+  newhome; : > "$H/items.tsv"; reg 'queima|filler|auto|256|600|0|flag:burn.on|sleeper.sh'; reg 'hq|work|4|1024|3600|300|-|sleeper.sh'; : > "$H/burn.on"; seed; good 25; good 25; good 25
+  check "fill: mesmo com o filler ANTES no registro, o work começa primeiro e o filler leva só o resto (hq, queima 7)" "hq queima 7" "$(jget started.0.item) $(jget started.1.item) $(jget started.1.cores)"
+  newhome; EXTRA_ENV="BALLAST_MAX_ITEMS=1"; reg 'queima|filler|auto|256|600|0|flag:burn.on|sleeper.sh'; : > "$H/burn.on"; seed; good 25; good 25; good 25
+  check "fill: o teto de itens vale para o filler também (max 1: só o hq)" "hq 1" "$(jget started.0.item) $(nstart)"
+  newhome; : > "$H/items.tsv"; reg 'queima|filler|auto|256|600|0|flag:burn.on|sleeper.sh'; : > "$H/burn.on"; setmem 14400; seed; good 25; good 25; good 25
+  check "fill: RAM de partida vale para o filler também: 14400 MB - 256 (rss dele) < 14336 → não começa, ram baixa" "[] baixa" "$(jget started) $(jget ram)"
+  newhome; reg 'queima|filler|auto|256|600|0|flag:burn.on|sleeper.sh'; : > "$H/burn.on"; setmem 15615; seed; good 25; good 25; good 25
+  check "fill: o work que vai começar já desconta a RAM do filler (15615 - 1024 - 256 = 14335 < 14336): só o hq, filler fica de fora, ram baixa" "hq 1 baixa" "$(jget started.0.item) $(nstart) $(jget ram)"
+  newhome; : > "$H/items.tsv"; reg 'q1|filler|2|256|600|0|-|sleeper.sh'; reg 'q2|filler|2|256|600|0|-|sleeper.sh'; setmem 14592; seed; good 25; good 25; good 25
+  check "fill: a RAM é lida uma vez: o filler que começou desconta a sobra do seguinte (14592 cabem UM de 256): q1 começa, q2 não, ram baixa" "q1 1 baixa" "$(jget started.0.item) $(nstart) $(jget ram)"
+}
+
+# ── g_off ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+g_off() {
+  newhome; rm -f "$H/on"; alive 7000100 estranho estranho-1700000000; seed; adv 50 0; bt
+  check "off: processo com a marca ballast-item de OUTRA pasta de lastro (ex.: o selftest do próprio governo rodando como item) NÃO é nosso: não aparece em running e não é morto" "[] 0" "$(jget running) $(nkilled)"
+  running_one; rm -f "$H/on"; adv 50 0; bt
+  check "off: apagar a chave on mata o que roda (TERM), motivo desligado, mode desligado" "desligado 1 desligado" "$(jget mode) $(nkilled) $(jget killed.0.why)"
+  isdead "$PID"; check "off: o item parou de verdade" "0" "$?"
+
+  running_one; mv "$FP" "$FP.off"; rm -f "$H/on"; NOW=$((NOW + 60)); bt; mv "$FP.off" "$FP"
+  check "off: desligado mas sem conseguir ler os processos → NÃO mata (leitura-ilegivel)" "leitura-ilegivel" "$(jget note)"
+  kill -9 -- "-$PID" 2>/dev/null
+
+  running_one; bt stop
+  check "stop: mata o que roda mesmo com a chave ligada, devolve o que parou, rc 0" "0 hq" "$RC $(jget stopped.0.item)"
+  isdead "$PID"; check "stop: o item morreu" "0" "$?"
+
+  running_one; bt stop; gone "$PID"; adv 50 0; bt
+  check "stop: a rodada parada à mão é encerrada com o motivo stop (não morreu-sem-rc) e SEM o cooldown de falha" "stop" "$(jget reaped.0.why)"
+  check "stop: o cooldown da rodada parada é o do registro (300 s), não o de falha (600 s)" "300" "$("$PY" -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["cooldown"]["hq"] - d["last"]["t"])' "$H/state.json")"
+
+  running_one; before=$(cd "$H" && find . -type f | sort | tr '\n' ' '); bt status --json; after=$(cd "$H" && find . -type f | sort | tr '\n' ' ')
+  check "status: não grava nada" "$before" "$after"
+  check "status: mostra o que roda e o modo" "hq ligado" "$(jget running.0) $(jget mode)"
+  kill -9 -- "-$PID" 2>/dev/null
+}
+
 # ── g_state ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 g_state() {
   running_one; printf 'isto não é json' > "$H/state.json"; good 50; good 50; good 50; good 50
@@ -226,8 +410,6 @@ g_state() {
   check "state: o item que JÁ roda (visto no /proc) não é duplicado depois de perder o estado" "[]" "$(jget started)"
   kill -9 -- "-$PID" 2>/dev/null
 
-  newhome; seed; head -c 1300000 /dev/zero | tr '\0' 'x' | fold -w 99 > "$H/ticks.jsonl"; good 50
-  check "state: ticks.jsonl acima de 1 MB perde a metade mais velha e a linha nova fica no fim" "1 1" "$([ "$(wc -c < "$H/ticks.jsonl")" -lt 800000 ] && echo 1 || echo 0) $(tail -n 1 "$H/ticks.jsonl" | grep -c '"free_ticks"')"
   newhome; printf '[1,2,3]' > "$H/state.json"; seed
   check "state: JSON válido de outra forma (lista) também é corrompido" "1" "$(ls "$H" | grep -c '^state.json.corrupt-')"
   newhome; printf '{"v":1,"last":5,"free_ticks":0,"cooldown":{}}' > "$H/state.json"; seed; r1=$RC; c1=$(ls "$H" | grep -c '^state.json.corrupt-'); good 50
@@ -242,6 +424,16 @@ g_state() {
   newhome; seed; good 50; good 50; mkdir -p "$H/runs"; chmod 500 "$H"; good 50
   check "state: pasta sem escrita (mas com runs/ gravável) e 3 leituras livres → rc 3 e NADA começou (a escrita é conferida ANTES de começar)" "3 0" "$RC $(ls "$H/runs" 2>/dev/null | wc -l | tr -d ' ')"
   chmod 700 "$H"
+}
+
+# ── g_logs ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+g_logs() {
+  newhome; seed; head -c 1300000 /dev/zero | tr '\0' 'x' | fold -w 99 > "$H/ticks.jsonl"; good 50
+  check "logs: ticks.jsonl acima de 1 MB perde a metade mais velha e a linha nova fica no fim" "1 1" "$([ "$(wc -c < "$H/ticks.jsonl")" -lt 800000 ] && echo 1 || echo 0) $(tail -n 1 "$H/ticks.jsonl" | grep -c '"free_ticks"')"
+  newhome; seed; head -c 400000 /dev/zero | tr '\0' 'e' | fold -w 99 > "$H/cron.err"; good 50
+  check "logs: cron.err acima de 256 KB é cortado para os últimos 64 KB (o cron escreve nele a cada erro)" "1" "$([ "$(wc -c < "$H/cron.err")" -le 70000 ] && echo 1 || echo 0)"
+  newhome; seed; printf 'erro antigo\n' > "$H/cron.err"; good 50
+  check "logs: cron.err pequeno não é mexido" "erro antigo" "$(cat "$H/cron.err")"
 }
 
 # ── g_launch ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -282,9 +474,9 @@ g_launch() {
   kill -9 -- "-$(started_pid)" 2>/dev/null
 }
 
-if [ -n "${HB_MUTANT:-}" ]; then g_reg; g_tick; g_run; g_state; g_launch; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
+if [ -n "${HB_MUTANT:-}" ]; then g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
 if [ -n "${HB_ONLY:-}" ]; then "g_$HB_ONLY"; echo "── $((n - fails))/$n ok (só g_$HB_ONLY)"; [ "$fails" = 0 ]; exit $?; fi
-g_reg; g_tick; g_run; g_state; g_launch
+g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch
 
 [ -n "${HB_NO_MUTANTS:-}" ] || {
   echo "── controle negativo: cada mutante tem que reprovar a bateria ──"
@@ -301,13 +493,49 @@ teto de itens ignorado@@if len(run) + len(rec["started"]) >= cfg.max_items:@@if 
 teto de itens não conta o que JÁ roda@@if len(run) + len(rec["started"]) >= cfg.max_items:@@if len(rec["started"]) >= cfg.max_items:
 contador que anda para trás é aceito@@if not last or any(v < l for v, l in zip(vec, last["vec"])):@@if not last:
 lacuna entre leituras ignorada@@if cfg.now - last["t"] > cfg.gap_s:@@if False:
-lock de instância única ignorado (o flock espera em vez de falhar)@@fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)@@fcntl.flock(lock, fcntl.LOCK_EX)
+lock de instância única ignorado (o flock espera em vez de falhar)@@        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        rec["note"] = "outra-instancia"@@        fcntl.flock(lock, fcntl.LOCK_EX)
+    except OSError:
+        rec["note"] = "outra-instancia"
 escrita não conferida antes de começar@@        raise Fail("%s: não consigo gravar (%s)" % (cfg.home, e))@@        pass
 /proc/stat ilegível vira leitura boa@@    if len(f) < 9 or f[0] != "cpu":@@    if False:
 meminfo sem MemAvailable vira 0 MB@@    raise Unreadable("/proc/meminfo: sem MemAvailable")@@    return 0
 tabela de processos ilegível vira lista vazia@@        raise Unreadable("%s: %s" % (root, e))@@        return []
+pausa manda CONT em vez de STOP@@send(r, signal.SIGSTOP)@@send(r, signal.SIGCONT)
+retomada nunca acontece (sem a histerese)@@    elif mem < cfg.ram_pause_mb or (st["paused"] and mem < cfg.ram_resume_mb):@@    elif mem < cfg.ram_pause_mb:
+pausa que não passa não mata (limite de leituras ignorado)@@if st["paused_ticks"] >= cfg.pause_kill_ticks:@@if st["paused_ticks"] >= 10**9:
+mata o MENOR em vez do maior RSS@@biggest = max(run.values(), key=lambda r: r["rss_kb"]) if run else None@@biggest = min(run.values(), key=lambda r: r["rss_kb"]) if run else None
+RAM crítica não mata na hora@@        if biggest:
+            kill_now(cfg, st, biggest, "ram-critica", rec)@@        if False:
+            kill_now(cfg, st, biggest, "ram-critica", rec)
+RAM crítica manda TERM (um grupo parado não trata)@@kill_now(cfg, st, biggest, "ram-pausa", rec)@@terminate(cfg, st, biggest, "ram-pausa", rec)
+teto de RSS do item ignorado@@elif _int(cap) and r["rss_kb"] > cap * 1024:@@elif False:
+sem rc vira ok@@why = killed or ("ok" if rc == 0 else@@why = killed or ("ok" if rc in (0, None) else
+resumo que não é objeto vira dado@@    return (v, "") if isinstance(v, dict) else (None, "ilegivel")@@    return (v, "")
+vale a primeira linha de resumo, não a última@@        v = json.loads(lines[-1][len("BALLAST-SUMMARY: "):])@@        v = json.loads(lines[0][len("BALLAST-SUMMARY: "):])
+meta.json sumida vira cooldown 0 (errar para menos recomeça em cima)@@    cool = meta.get("cooldown_s") if meta else None
+    if not (_int(cool) and cool >= 0):
+        cool = cfg.fail_cooldown_s@@    cool = meta.get("cooldown_s", 0) if meta else 0
+falha não ganha o cooldown mínimo@@    if why not in ("ok", "desligado", "preempt", "stop"):
+        cool = max(cool, cfg.fail_cooldown_s)@@    if False:
+        cool = max(cool, cfg.fail_cooldown_s)
+rodada encerrada duas vezes (sem a marca final)@@        with open(os.path.join(rundir, "final"), "w") as f:
+            f.write("%d\n" % cfg.now)@@        with open(os.path.join(rundir, "final2"), "w") as f:
+            f.write("%d\n" % cfg.now)
 pid reaproveitado vale como item (a marca não é conferida)@@        if run not in cand and (ldr is None or ldr["state"] == "Z"):@@        if run not in cand:
 filho vivo na sessão não segura a rodada (só o líder vale)@@        mem = [q for q in procs if q["sid"] == pid and q["state"] != "Z"]@@        mem = [q for q in procs if q["pid"] == pid and q["state"] != "Z"]
+prazo ignorado@@elif _int(start) and _int(tmo) and cfg.now - start > tmo + cfg.deadline_slack_s:@@elif False:
+meta.json sem start/timeout_s lido sem conferir (derruba o tick)@@            elif _int(start) and _int(tmo) and cfg.now - start@@            elif cfg.now - start
+meta.json sem rss_mb lido sem conferir (derruba o tick)@@            elif _int(cap) and r["rss_kb"] > cap * 1024:@@            elif r["rss_kb"] > cap * 1024:
+TERM ignorado nunca vira KILL@@if cfg.now - t >= cfg.term_grace_s:@@if False:
+desligar não mata@@            elif not on:
+                terminate(cfg, st, r, "desligado", rec)@@            elif False:
+                terminate(cfg, st, r, "desligado", rec)
+filler não é morto quando um work vai começar@@                if m.get("role") == "filler" and r["run"] not in st["term"]:@@                if False:
+filler entra antes do work (conta no orçamento do work)@@            if it["role"] != "work":
+                continue@@            if it["role"] not in ("work", "filler"):
+                continue
 estado corrompido não vai para o lado@@            os.replace(path, aside)@@            pass
 estado de outra forma (lista) passa por válido@@    if not (isinstance(st, dict) and st.get("v") == 1 and@@    if not (True and
 estado ilegível por permissão recomeça@@        raise Fail("%s: não abre (%s)" % (path, e))@@        return fresh_state()
@@ -320,19 +548,35 @@ o item herda o ambiente inteiro do tick (segredos vazam)@@    env = {"PATH": os.
 [linux] o item não entra com oom_score_adj@@{ echo 1000 > /proc/self/oom_score_adj; } 2>/dev/null; @@
 sem timeout no PATH o item começa assim mesmo@@if shutil.which("timeout") is None:@@if False:
 cooldown ignorado@@    if until > cfg.now:@@    if False:
+stop não devolve o que parou@@        out["stopped"].append({"item": r["item"], "run": r["run"], "pid": r["pid"]})@@        pass
 a marca ballast-item de OUTRA pasta de lastro vale como item nosso@@ and (valid is None or parts[1] in valid):@@ and True:
-RAM de partida ignora o teto de RSS do item@@if mem_left - it["rss_mb"] < cfg.ram_start_mb:@@if mem_left < cfg.ram_start_mb:
+RAM de partida do work ignora o teto de RSS do item@@used + cores > budget:
+                continue
+            if mem_left - it["rss_mb"] < cfg.ram_start_mb:@@used + cores > budget:
+                continue
+            if mem_left < cfg.ram_start_mb:
+RAM de partida do filler ignora o teto de RSS do item@@fill_used + cores > budget):
+                continue
+            if mem_left - it["rss_mb"] < cfg.ram_start_mb:@@fill_used + cores > budget):
+                continue
+            if mem_left < cfg.ram_start_mb:
+stop não anota o motivo da rodada@@            st["killed"].setdefault(r["run"], "stop")@@            pass
+rodada parada à mão ganha o cooldown de falha@@"preempt", "stop"):@@"preempt"):
+cron.err cresce sem teto@@    trim_log(os.path.join(cfg.home, "cron.err"), 262144, 65536)@@    pass
 ticks.jsonl cresce sem teto@@        if os.path.exists(path) and os.path.getsize(path) > cap:@@        if False:
+quem levou TERM e ainda morre é recomeçado em cima@@        running_names = seen_names | {k["item"] for k in rec["killed"]}@@        running_names = {r["item"] for r in run.values()} | {k["item"] for k in rec["killed"]}
 prefixo de lançamento inválido é aceito@@    if not (isinstance(v, list) and all(isinstance(x, str) for x in v)):@@    if False:
 prefixo sem nice aceito fora do selftest@@    if not test and "nice" not in v:@@    if False:
-a RAM lida uma vez: o item começado não desconta a sobra do seguinte@@                mem_left -= it["rss_mb"]@@                pass
+a RAM lida uma vez: o work planejado não desconta a sobra do seguinte@@            used += cores
+            mem_left -= it["rss_mb"]@@            used += cores
+a RAM lida uma vez: o filler começado não desconta a sobra do seguinte@@                mem_left -= it["rss_mb"]@@                pass
 item que roda não ocupa núcleos (running_cores zerado)@@        tot += c@@        tot += 0
 meta.json ausente conta 1 núcleo (errar para menos)@@            c = budget if c == "auto" else c@@            c = 1
 meta.json com núcleos 0 vale@@if not (_int(c) and c >= 1):@@if not _int(c):
 item que já roda pode ser começado de novo (rodando ignorado)@@    if item["name"] in running_names:@@    if False:
 tabela de processos ilegível aparece como running [] no registro@@ if procs is not None else None@@
 mode padrão ligado quando o tick não leu a chave on@@"mode": None, "note": ""@@"mode": "ligado", "note": ""
-registry_errors padrão [] quando o registro não foi lido@@"registry_errors": None, "ram": None}@@"registry_errors": [], "ram": None}
+registry_errors padrão [] quando o registro não foi lido@@"registry_errors": None, "ram": None,@@"registry_errors": [], "ram": None,
 estado com last de forma errada passa por válido@@last is None or (isinstance(last, dict)@@True or (isinstance(last, dict)
 status não valida a forma do estado@@            st = fresh_state()@@            pass
 status não distingue estado ausente@@        out["state"] = "ausente"@@        pass
