@@ -1,20 +1,9 @@
 #!/usr/bin/env bash
-# hetzner-ballast.selftest.sh — hermético (ga-2hd02v.5): o /proc é uma pasta de fixtures (BALLAST_PROC), o relógio é BALLAST_NOW, o "nó" é uma pasta temporária e os itens
-# são scripts de brinquedo que dormem ou imprimem um resumo. Nada fala com o nó de verdade e nada toca em ~/gt-remote.
-#
-# Contents
-#   Casos · Controle negativo (mutantes) · Variáveis
-#
-# CASOS (fatia 2/5: o governo MEDE e COMEÇA; encerrar a rodada, RAM, prazo, filler e stop são a fatia 3/5 e têm o selftest delas)
-#   registro (g_reg): linhas válidas · coluna a mais/a menos, papel, núcleos, nome repetido e `requires` desconhecido viram erro VISÍVEL e o item fica inerte (os outros seguem) · comentário e linha em
-#     branco ignorados · registro ausente/ilegível = nada começa · comando relativo vale a partir da pasta de itens, e sem permissão de execução é inerte.
-#   tick (g_tick): sem a chave `on` não começa nada · 1ª leitura só semeia · CPU livre >= 15% por 3 leituras seguidas antes de começar, e uma leitura abaixo zera a conta · o tempo em nice > 0 (o próprio
-#     lastro) NÃO conta como carga · orçamento = núcleos livres - reserva (item de N núcleos só cabe se rodando + N <= orçamento; `auto` leva o resto) · teto de itens · contador que anda para trás ou
-#     lacuna de mais de 3 min recomeça a conta · /proc/stat (inclusive sem a linha agregada) ou meminfo ilegível = não começa · outra instância rodando = não faz nada · pasta sem permissão = rc 3.
-#   processos (g_run): o que roda é achado na tabela de processos (marca + pasta runs/<rodada> DESTA pasta; marca de outra pasta não é nossa) · filho vivo na sessão segura o item · pid reaproveitado não é o
-#     item · lista de processos ilegível ≠ ninguém roda.
-#   estado (g_state): state.json corrompido vai para o lado e recomeça sem duplicar o que já roda · ilegível por permissão = inerte (rc 3) · a escrita é conferida ANTES de começar.
-#   lançamento (g_launch): prefixo nice 19 + SCHED_IDLE + ionice idle + timeout -k, com o que existir no PATH; prefixo inválido é recusado; sem `timeout` o item não começa; ambiente mínimo e oom_score_adj.
+# hetzner-ballast.selftest.sh — hermético (ga-2hd02v.5): o /proc é uma pasta de fixtures (BALLAST_PROC), o relógio é BALLAST_NOW, o "nó" é uma pasta temporária e os itens são scripts de
+# brinquedo. Nada fala com o nó de verdade e nada toca em ~/gt-remote.
+# Contents: Casos · Controle negativo (mutantes) · Variáveis
+# CASOS (fatia 2/5: MEDE e COMEÇA; encerrar, RAM, prazo, filler e stop são a 3/5): registro (g_reg) · tick (g_tick: chave on, histerese de 3 leituras, nice não é carga, orçamento, teto, lacuna, leituras
+#   ilegíveis, lock) · processos (g_run: marca + pasta runs/ desta pasta, duplicata, o que já roda ocupa núcleos e teto) · estado (g_state: forma, corrompido, permissão) · lançamento (g_launch).
 # CONTROLE NEGATIVO: cada mutante (um trecho do script trocado) TEM que reprovar a bateria.
 # VARIÁVEIS: HB_UNDER_TEST (script a testar) · HB_PY (interpretador; padrão /usr/bin/python3) · HB_NO_MUTANTS=1 · HB_ONLY=<grupo> (reg tick run state launch; sem mutantes)
 set -u
@@ -22,8 +11,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 P="${HB_UNDER_TEST:-$HERE/hetzner-ballast.py}"
 PY="${HB_PY:-/usr/bin/python3}"
 T=$(cd "$(mktemp -d /tmp/hb.XXXXXX)" && pwd -P)
-# killtree CAMINHO — mata, pelo GRUPO de processos, tudo que leva CAMINHO na linha de comando. O item de brinquedo roda em sessão própria e tem filhos (`sleep 300`) que NÃO levam o caminho:
-# `pkill -f` só os pega se o caminho aparecer, e o resto fica órfão (ppid 1) no mini/nó depois do teste (incidente de 20/10: 22 órfãos por rodada). O grupo do próprio teste é poupado.
+# killtree CAMINHO — mata, pelo GRUPO de processos, tudo que leva CAMINHO na linha de comando (o item roda em sessão própria e seus filhos `sleep 300` não levam o caminho: `pkill -f` os deixava órfãos; incidente 20/10). Poupa o grupo do teste.
 killtree() {
   local g self; self=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
   for g in $(ps -axo pgid=,command= 2>/dev/null | awk -v p="$1" 'index($0, p) { print $1 }' | sort -u); do
@@ -80,7 +68,7 @@ member() {  # member PID SID [RSS_KB] — um filho do item (mesma sessão)
 gone() { rm -rf "$FP/$1"; }   # o processo sumiu do /proc
 bt() {  # bt [ARGS…] → $OUT (stdout), $RC. Padrão: tick
   [ $# -gt 0 ] || set -- tick
-  OUT=$(env PATH="$W/bin:$PATH" BALLAST_HOME="$H" BALLAST_PROC="$FP" BALLAST_NOW="$NOW" BALLAST_LAUNCH_PREFIX="$LP" $EXTRA_ENV "$PY" -I "$P" "$@" 2>"$W/err"); RC=$?
+  OUT=$(env PATH="$W/bin:$PATH" BALLAST_HOME="$H" BALLAST_PROC="$FP" BALLAST_NOW="$NOW" BALLAST_LAUNCH_PREFIX="$LP" BALLAST_TEST=1 $EXTRA_ENV "$PY" -I "$P" "$@" 2>"$W/err"); RC=$?
 }
 jget() {  # jget CAMPO.PONTADO → valor do $OUT (JSON), texto simples; índice de lista como número; null/ausente → "null"
   printf '%s' "$OUT" | "$PY" -I -c 'import sys,json
@@ -130,7 +118,7 @@ g_reg() {
   check "reg: requires com path + flag + cmd todos verdadeiros → elegível" "true" "$(jget items.1.eligible)"
 
   newhome; rm -f "$H/items.tsv"; seed; adv 50 0; bt; adv 50 0; bt; adv 50 0; bt
-  check "reg: registro ausente → nada começa, nota registro-ilegivel, rc 0" "0 registro-ilegivel []" "$RC $(jget note) $(jget started)"
+  check "reg: registro ausente → nada começa, nota registro-ilegivel, rc 0, registry_errors null (não leu; [] seria 'leu e está limpo')" "0 registro-ilegivel [] null" "$RC $(jget note) $(jget started) $(jget registry_errors)"
   newhome; printf '\xff\xfe\x00bin\n' > "$H/items.tsv"; seed; adv 50 0; bt
   check "reg: registro que não é texto → registro-ilegivel, nada começa" "registro-ilegivel" "$(jget note)"
 }
@@ -161,6 +149,8 @@ g_tick() {
   newhome; seed; setmem 15000; good 50; good 50; good 50
   check "tick: 15000 MB livres < 14336 (piso de partida) + 1024 (teto de RSS do item) → não começa, ram baixa" "[] baixa" "$(jget started) $(jget ram)"
   setmem 15400; good 50; check "tick: 15400 MB → cabe: começa" "hq" "$(jget started.0.item)"
+  newhome; reg 'c|work|2|1024|3600|300|-|sleeper.sh'; setmem 15500; seed; good 25; good 25; good 25
+  check "tick: 15500 MB cabem UM item (a RAM é lida uma vez, mas cada item começado a desconta): hq começa, c fica de fora, ram baixa" "hq 1 baixa" "$(jget started.0.item) $(nstart) $(jget ram)"
   newhome; seed; good 50; "$PY" -I -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["cooldown"]["hq"]=int(sys.argv[2])+600; json.dump(d, open(p,"w"))' "$H/state.json" "$NOW"; good 50; good 50
   check "tick: item em cooldown (lido do state.json) não começa mesmo com a CPU livre" "[]" "$(jget started)"
   bt status --json; check "tick: o status diz o porquê (cooldown)" "1" "$(jget items.0.why | grep -c cooldown)"
@@ -195,7 +185,7 @@ g_tick() {
   # outra instância: o lock está com o python de um 'sleep' do teste — o tick que não pega o lock não faz nada
   "$PY" -I -c 'import fcntl,sys,time; f=open(sys.argv[1],"w"); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(4)' "$H/lock" & lk=$!
   sleep 1; adv 50 0; bt
-  check "tick: lock tomado por outra instância → nota outra-instancia, rc 0, nada muda" "0 outra-instancia" "$RC $(jget note)"
+  check "tick: lock tomado por outra instância → nota outra-instancia, rc 0, mode null (não leu a chave on)" "0 outra-instancia null" "$RC $(jget note) $(jget mode)"
   wait "$lk" 2>/dev/null
 
   newhome; seed; chmod 500 "$H"; good 50
@@ -203,23 +193,30 @@ g_tick() {
   chmod 700 "$H"
 }
 
-
 # ── g_run ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 g_run() {
   newhome; alive 7000100 estranho estranho-1700000000; seed; adv 50 0; bt
   check "run: processo com a marca ballast-item de OUTRA pasta de lastro (ex.: o selftest do próprio governo rodando como item) NÃO é nosso: não aparece em running" "[]" "$(jget running)"
   newhome; EXTRA_ENV="BALLAST_MAX_ITEMS=1"; alive 7000101 estranho estranho-1700000001; seed; good 50; good 50; good 50
   check "run: item estranho não gasta o teto de itens (max 1: o hq começa mesmo assim)" "hq" "$(jget started.0.item)"
-  running_one; adv 50 0; bt
-  check "run: o item que começou, visto no /proc, aparece em running e NÃO é duplicado enquanto roda" "hq []" "$(jget running.0) $(jget started)"
-  member 7000002 "$PID" 2048; gone "$PID"; adv 50 0; bt
+  running_one; reg 'big|work|12|1024|3600|300|-|sleeper.sh'; adv 0 0; bt
+  check "run: nó ocioso (orçamento 15): o hq que roda aparece em running e NÃO é duplicado, e o big(12) não cabe ao lado dos 4 que já rodam (16 > 15)" "hq []" "$(jget running.0) $(jget started)"
+  member 7000002 "$PID" 2048; gone "$PID"; adv 0 0; bt
   check "run: o líder sumiu mas um filho segue na sessão → o item AINDA roda (nada recomeçado em cima)" "hq []" "$(jget running.0) $(jget started)"
   gone 7000002; mkdir -p "$FP/$PID"; printf '%s (sh) S 1 %s %s 0 0\n' "$PID" "$PID" "$PID" > "$FP/$PID/stat"; printf '0 256 0 0 0 0 0\n' > "$FP/$PID/statm"; printf 'sh\0-c\0x\0outro-programa\0' > "$FP/$PID/cmdline"; adv 50 0; bt
   check "run: pid reaproveitado por outro programa (líder vivo SEM a marca da rodada) NÃO é o item" "[]" "$(jget running)"
+  newhome; EXTRA_ENV="BALLAST_MAX_ITEMS=2"; reg 'b|work|2|1024|3600|300|-|sleeper.sh'; seed; good 25; good 25; good 25
+  alive "$(jget started.0.pid)" hq "$(jget started.0.run)"; alive "$(jget started.1.pid)" b "$(jget started.1.run)"; reg 'c|work|2|1024|3600|300|-|sleeper.sh'; adv 0 0; bt
+  check "run: 2 itens já rodando e BALLAST_MAX_ITEMS=2: o c cabe no orçamento e na RAM, mas o teto conta o que JÁ roda" "[] b hq" "$(jget started) $(jget running.0) $(jget running.1)"
+  running_one; rm -f "$H/runs/$RUN/meta.json"; reg 'b|work|4|1024|3600|300|-|sleeper.sh'; adv 50 0; bt
+  check "run: item rodando com a meta.json sumida ocupa o que o REGISTRO diz (4), não 1: b(4) não cabe no orçamento 7, e a nota avisa" "[] 1" "$(jget started) $(jget note | grep -c cores-desconhecidos)"
+  printf '{"item":"hq","cores":0}' > "$H/runs/$RUN/meta.json"; adv 50 0; bt; check "run: meta.json com núcleos 0 também não vale (o item não encolhe o que ocupa)" "[]" "$(jget started)"
+  rm -f "$H/runs/$RUN/meta.json"; : > "$H/items.tsv"; reg 'b|work|1|1024|3600|300|-|sleeper.sh'; adv 50 0; bt; check "run: rodando, sem meta.json e FORA do registro → ocupa o orçamento inteiro: nem o b(1) começa" "[]" "$(jget started)"
+  newhome; seed; good 50; good 50; mkdir -p "$FP/4242"; printf 'lixo' > "$FP/4242/stat"; adv 50 0; bt; check "run: a tabela lista um processo e NENHUM é legível → leitura-ilegivel, nada começa e running null (não é 'ninguém roda')" "leitura-ilegivel [] null" "$(jget note) $(jget started) $(jget running)"
   newhome; seed; mv "$FP" "$FP.off"; NOW=$((NOW + 60)); bt; mv "$FP.off" "$FP"
   check "run: sem conseguir ler nada do /proc → leitura-ilegivel, rc 0, nada começa" "0 leitura-ilegivel []" "$RC $(jget note) $(jget started)"
   newhome; seed; good 50; good 50; chmod 311 "$FP"; adv 50 0; bt; chmod 755 "$FP"
-  check "run: /proc/stat e meminfo legíveis mas a LISTA de processos não → leitura-ilegivel e nada começa (não é 'ninguém roda')" "leitura-ilegivel []" "$(jget note) $(jget started)"
+  check "run: /proc/stat e meminfo legíveis mas a LISTA de processos não → leitura-ilegivel e nada começa (não é 'ninguém roda'); running null, não []" "leitura-ilegivel [] null" "$(jget note) $(jget started) $(jget running)"
 }
 
 # ── g_state ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -233,6 +230,10 @@ g_state() {
   check "state: ticks.jsonl acima de 1 MB perde a metade mais velha e a linha nova fica no fim" "1 1" "$([ "$(wc -c < "$H/ticks.jsonl")" -lt 800000 ] && echo 1 || echo 0) $(tail -n 1 "$H/ticks.jsonl" | grep -c '"free_ticks"')"
   newhome; printf '[1,2,3]' > "$H/state.json"; seed
   check "state: JSON válido de outra forma (lista) também é corrompido" "1" "$(ls "$H" | grep -c '^state.json.corrupt-')"
+  newhome; printf '{"v":1,"last":5,"free_ticks":0,"cooldown":{}}' > "$H/state.json"; seed; r1=$RC; c1=$(ls "$H" | grep -c '^state.json.corrupt-'); good 50
+  check "state: JSON válido com last de forma errada → vai para o lado (rc 0) e o tick seguinte funciona (não repete o erro)" "0 1 0" "$r1 $c1 $RC"
+  newhome; bt status --json; s1=$(jget state); printf '[1,2,3]' > "$H/state.json"; bt status --json
+  check "state: status com estado ausente → state ausente; com JSON de forma errada (lista) → ilegivel, rc 0, sem quebrar" "ausente ilegivel 0" "$s1 $(jget state) $RC"
   newhome; printf '\xff\xfe{' > "$H/state.json"; seed
   check "state: bytes que não são UTF-8 também" "0 1" "$RC $(ls "$H" | grep -c '^state.json.corrupt-')"
   newhome; seed; chmod 000 "$H/state.json"; good 50; good 50; good 50
@@ -258,6 +259,8 @@ waitlines() {  # waitlines ARQUIVO N — espera (até 10 s: o mini carregado lev
 g_launch() {
   newhome; LP='5'; bt status --json
   check "launch: BALLAST_LAUNCH_PREFIX que não é uma lista JSON de textos → configuração inválida, rc 3 (nunca um prefixo vazio por engano)" "3" "$RC"
+  newhome; EXTRA_ENV="BALLAST_TEST=0"; LP='[]'; bt status --json; r1=$RC; LP='["chrt","-i","0"]'; bt status --json; r2=$RC; LP='["nice","-n","19"]'; bt status --json
+  check "launch: fora do selftest o prefixo precisa ter nice: [] e um prefixo sem nice → rc 3; com nice → rc 0" "3 3 0" "$r1 $r2 $RC"
   newhome; LP='["nice", 3]'; bt status --json
   check "launch: lista com item que não é texto também é recusada (rc 3)" "3" "$RC"
   newhome; LP=""; D1="$W/lb1"; rm -rf "$D1"; mkstubs "$D1" nice chrt ionice timeout; EXTRA_ENV="PATH=$D1"; seed; good 50; good 50; good 50; waitlines "$D1/calls" 4
@@ -293,49 +296,47 @@ leitura abaixo de 15% não zera a conta@@st["free_ticks"] = st["free_ticks"] + 1
 começa na 1ª leitura livre (sem histerese)@@st["free_ticks"] >= cfg.idle_ticks:@@st["free_ticks"] >= 1:
 orçamento sem a reserva de núcleos@@budget = int(ncpu - rec["fg_cores"] - cfg.reserve + 1e-9)@@budget = int(ncpu - rec["fg_cores"] + 1e-9)
 item de N núcleos cabe mesmo estourando o orçamento (> vira >=... trocado por nunca)@@if not ok or cores < 1 or used + cores > budget:@@if not ok or cores < 1:
-auto leva o orçamento inteiro, sem descontar o que já roda@@cores = it["cores"] if it["cores"] != "auto" else budget - used
-            if not ok@@cores = it["cores"] if it["cores"] != "auto" else budget
-            if not ok
-teto de itens ignorado@@if len(run) + len(rec["started"]) >= cfg.max_items:
-                break@@if False:
-                break
+auto leva o orçamento inteiro, sem descontar o que já roda@@cores = it["cores"] if it["cores"] != "auto" else budget - used@@cores = it["cores"] if it["cores"] != "auto" else budget
+teto de itens ignorado@@if len(run) + len(rec["started"]) >= cfg.max_items:@@if False:
+teto de itens não conta o que JÁ roda@@if len(run) + len(rec["started"]) >= cfg.max_items:@@if len(rec["started"]) >= cfg.max_items:
 contador que anda para trás é aceito@@if not last or any(v < l for v, l in zip(vec, last["vec"])):@@if not last:
 lacuna entre leituras ignorada@@if cfg.now - last["t"] > cfg.gap_s:@@if False:
-lock de instância única ignorado@@    except OSError:
-        rec["note"] = "outra-instancia"@@    except ZeroDivisionError:
-        rec["note"] = "outra-instancia"
-escrita não conferida antes de começar@@        with open(probe, "w") as f:
-            f.write("x")
-        os.remove(probe)@@        pass
+lock de instância única ignorado (o flock espera em vez de falhar)@@fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)@@fcntl.flock(lock, fcntl.LOCK_EX)
+escrita não conferida antes de começar@@        raise Fail("%s: não consigo gravar (%s)" % (cfg.home, e))@@        pass
 /proc/stat ilegível vira leitura boa@@    if len(f) < 9 or f[0] != "cpu":@@    if False:
 meminfo sem MemAvailable vira 0 MB@@    raise Unreadable("/proc/meminfo: sem MemAvailable")@@    return 0
-tabela de processos ilegível vira lista vazia@@    except OSError as e:
-        raise Unreadable("%s: %s" % (root, e))
-    out = []@@    except OSError as e:
-        return []
-    out = []
+tabela de processos ilegível vira lista vazia@@        raise Unreadable("%s: %s" % (root, e))@@        return []
 pid reaproveitado vale como item (a marca não é conferida)@@        if run not in cand and (ldr is None or ldr["state"] == "Z"):@@        if run not in cand:
 filho vivo na sessão não segura a rodada (só o líder vale)@@        mem = [q for q in procs if q["sid"] == pid and q["state"] != "Z"]@@        mem = [q for q in procs if q["pid"] == pid and q["state"] != "Z"]
 estado corrompido não vai para o lado@@            os.replace(path, aside)@@            pass
-estado de outra forma (lista) passa por válido@@        if not (isinstance(st, dict) and st.get("v") == 1 and@@        if not (True and
+estado de outra forma (lista) passa por válido@@    if not (isinstance(st, dict) and st.get("v") == 1 and@@    if not (True and
 estado ilegível por permissão recomeça@@        raise Fail("%s: não abre (%s)" % (path, e))@@        return fresh_state()
-registro com nome repetido aceito@@            if name in seen:
-                raise ValueError("nome repetido %r" % name)@@            if False:
-                raise ValueError("nome repetido %r" % name)
+registro com nome repetido aceito@@if name in seen:@@if False:
 registro com coluna a menos aceito@@        if len(c) != 8:@@        if len(c) < 7:
 predicado de requires desconhecido vira verdadeiro@@            return False, "requires: predicado desconhecido %r" % term.strip()@@            continue
 comando sem permissão de execução aceito@@    if not (os.path.isfile(argv[0]) and os.access(argv[0], os.X_OK)):@@    if not os.path.isfile(argv[0]):
 nice 19 trocado por nice 0 no prefixo@@    pre = ["nice", "-n", "19"]@@    pre = ["nice", "-n", "0"]
 o item herda o ambiente inteiro do tick (segredos vazam)@@    env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"), "HOME": os.path.expanduser("~"),@@    env = {**os.environ, "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"), "HOME": os.path.expanduser("~"),
 [linux] o item não entra com oom_score_adj@@{ echo 1000 > /proc/self/oom_score_adj; } 2>/dev/null; @@
-sem timeout no PATH o item começa assim mesmo@@    if shutil.which("timeout") is None:
-        return False, "timeout ausente no PATH (sem prazo não começa)"@@    if False:
-        return False, "timeout ausente no PATH (sem prazo não começa)"
+sem timeout no PATH o item começa assim mesmo@@if shutil.which("timeout") is None:@@if False:
 cooldown ignorado@@    if until > cfg.now:@@    if False:
 a marca ballast-item de OUTRA pasta de lastro vale como item nosso@@ and (valid is None or parts[1] in valid):@@ and True:
-RAM de partida ignora o teto de RSS do item@@            if mem - it["rss_mb"] < cfg.ram_start_mb:@@            if mem < cfg.ram_start_mb:
+RAM de partida ignora o teto de RSS do item@@if mem_left - it["rss_mb"] < cfg.ram_start_mb:@@if mem_left < cfg.ram_start_mb:
 ticks.jsonl cresce sem teto@@        if os.path.exists(path) and os.path.getsize(path) > cap:@@        if False:
 prefixo de lançamento inválido é aceito@@    if not (isinstance(v, list) and all(isinstance(x, str) for x in v)):@@    if False:
+prefixo sem nice aceito fora do selftest@@    if not test and "nice" not in v:@@    if False:
+a RAM lida uma vez: o item começado não desconta a sobra do seguinte@@                mem_left -= it["rss_mb"]@@                pass
+item que roda não ocupa núcleos (running_cores zerado)@@        tot += c@@        tot += 0
+meta.json ausente conta 1 núcleo (errar para menos)@@            c = budget if c == "auto" else c@@            c = 1
+meta.json com núcleos 0 vale@@if not (_int(c) and c >= 1):@@if not _int(c):
+item que já roda pode ser começado de novo (rodando ignorado)@@    if item["name"] in running_names:@@    if False:
+tabela de processos ilegível aparece como running [] no registro@@ if procs is not None else None@@
+mode padrão ligado quando o tick não leu a chave on@@"mode": None, "note": ""@@"mode": "ligado", "note": ""
+registry_errors padrão [] quando o registro não foi lido@@"registry_errors": None, "ram": None}@@"registry_errors": [], "ram": None}
+estado com last de forma errada passa por válido@@last is None or (isinstance(last, dict)@@True or (isinstance(last, dict)
+status não valida a forma do estado@@            st = fresh_state()@@            pass
+status não distingue estado ausente@@        out["state"] = "ausente"@@        pass
+pids listados e nenhum legível viram "ninguém roda"@@    if seen and not out:@@    if False:
 MUT
   "$PY" -I - "$P" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import re, sys

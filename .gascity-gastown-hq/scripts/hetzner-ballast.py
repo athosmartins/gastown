@@ -21,10 +21,11 @@ ITENS  (registro TSV, 8 colunas: nome papel núcleos rss_mb prazo_s cooldown_s r
   pasta runs/<rodada> é DESTA pasta de lastro), não no state.json: perder o estado não duplica o que já roda, e processo com a marca de outra pasta não é nosso.
 TRÊS ESTADOS
   Toda leitura é leu / vazio / não consegui ler. "Não consegui ler" (registro, /proc/stat, meminfo, tabela de processos) nunca vira "livre": nada começa naquele tick.
-  state.json corrompido vai para <arquivo>.corrupt-<época> e recomeça; ilegível por permissão = rc 3 (inerte). A escrita da pasta é conferida ANTES de qualquer efeito.
+  state.json corrompido ou de forma errada vai para <arquivo>.corrupt-<época> e recomeça; ilegível por permissão = rc 3 (inerte). A escrita da pasta é conferida ANTES de qualquer efeito.
+  O que o tick não leu fica null no registro (running, registry_errors, mode), nunca []. NÃO INSTALAR antes da 3/5: runs/ nunca é limpo e o log de cada item não tem teto até lá.
 ARQUIVOS  (em $BALLAST_HOME, padrão ~/gt-remote/ballast)
   items.tsv · items/ · on (a chave: presente = ligado) · state.json · lock · ticks.jsonl · runs/<rodada>/{meta.json,log}
-USO  hetzner-ballast.py tick | status      env: BALLAST_HOME BALLAST_PROC BALLAST_NOW BALLAST_ITEMS BALLAST_ITEMS_DIR BALLAST_LAUNCH_PREFIX (JSON) e os limites BALLAST_* de load_config
+USO  hetzner-ballast.py tick | status      env: BALLAST_HOME BALLAST_PROC BALLAST_NOW BALLAST_ITEMS BALLAST_ITEMS_DIR BALLAST_LAUNCH_PREFIX (JSON, com `nice`; BALLAST_TEST=1 só no selftest) e os limites BALLAST_* de load_config
 """
 import fcntl
 import json
@@ -61,14 +62,16 @@ def _num(env, key, default, cast, lo):
     return v
 
 
-def _prefix(raw):
-    """BALLAST_LAUNCH_PREFIX: vazio → o prefixo padrão; senão uma lista JSON de textos. Qualquer outra coisa é configuração inválida (ValueError), nunca um prefixo vazio por engano:
-    sem o nice 19 o item NÃO seria lastro e a cidade o veria como carga."""
+def _prefix(raw, test=False):
+    """BALLAST_LAUNCH_PREFIX: vazio → o prefixo padrão; senão uma lista JSON de textos COM `nice` (BALLAST_TEST=1, só o selftest, dispensa). Qualquer outra coisa é configuração inválida
+    (ValueError), nunca um prefixo sem nice por engano: sem o nice 19 o item NÃO seria lastro e a cidade o veria como carga."""
     if not raw:
         return None
     v = json.loads(raw)
     if not (isinstance(v, list) and all(isinstance(x, str) for x in v)):
         raise ValueError("BALLAST_LAUNCH_PREFIX tem que ser uma lista JSON de textos")
+    if not test and "nice" not in v:
+        raise ValueError("BALLAST_LAUNCH_PREFIX sem `nice`: o item seria carga, não lastro")
     return v
 
 
@@ -83,7 +86,7 @@ def load_config(env):
         reserve=_num(env, "BALLAST_RESERVE_CORES", 1.0, float, 0.0), max_items=_num(env, "BALLAST_MAX_ITEMS", 4, int, 1),
         gap_s=_num(env, "BALLAST_GAP_S", 180, int, 1), page_kb=_num(env, "BALLAST_PAGE_KB", 4, int, 1),
         ram_start_mb=_num(env, "BALLAST_RAM_START_MB", 14336, int, 0),
-        launch_prefix=_prefix(prefix))
+        launch_prefix=_prefix(prefix, env.get("BALLAST_TEST") == "1"))
 
 
 # ---- leituras (cada uma com três estados) ---------------------------------------------------------------------------------------------------------------
@@ -125,16 +128,18 @@ def read_mem_avail_mb(root):
 
 
 def scan(root, page_kb):
-    """Tabela de processos: [{pid, sid, state, rss_kb, cmd}]. Processo que some no meio da leitura é ignorado; a pasta que não abre é Unreadable."""
-    # vazio → lista vazia (ninguém roda); falhou/ilegível → Unreadable (não dá para saber o que roda: nada começa, nada é morto)
+    """Tabela de processos: [{pid, sid, state, rss_kb, cmd}]. Processo que some no meio da leitura é ignorado; a pasta que não abre, ou que lista processos e NENHUM lê, é Unreadable."""
+    # vazio (nenhum pid listado) → lista vazia (ninguém roda); falhou/ilegível (pasta, ou pids listados e nenhum lido) → Unreadable (nada começa, nada é morto)
     try:
         names = os.listdir(root)
     except OSError as e:
         raise Unreadable("%s: %s" % (root, e))
     out = []
+    seen = 0
     for nm in names:
         if not nm.isdigit():
             continue
+        seen += 1
         d = os.path.join(root, nm)
         try:
             with open(os.path.join(d, "stat"), "rb") as f:
@@ -148,6 +153,8 @@ def scan(root, page_kb):
         except (OSError, ValueError, IndexError):
             continue
         out.append({"pid": int(nm), "sid": sid, "state": st, "rss_kb": rss, "cmd": cmd})
+    if seen and not out:
+        raise Unreadable("%s: %d processos listados, nenhum legível" % (root, seen))
     return out
 
 
@@ -288,9 +295,22 @@ def fresh_state():
     return {"v": 1, "last": None, "free_ticks": 0, "cooldown": {}}
 
 
+def _int(x):
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+def state_ok(st):
+    """Forma do state.json: v 1, cooldown {nome: época}, free_ticks inteiro >= 0, last None ou {t, vec de 8 inteiros}. JSON válido de forma errada é corrompido, não estado."""
+    if not (isinstance(st, dict) and st.get("v") == 1 and isinstance(st.get("cooldown"), dict) and all(_int(x) for x in st["cooldown"].values())):
+        return False
+    last = st.get("last")
+    return (_int(st.get("free_ticks")) and st["free_ticks"] >= 0
+            and (last is None or (isinstance(last, dict) and _int(last.get("t")) and isinstance(last.get("vec"), list) and len(last["vec"]) == 8 and all(_int(x) for x in last["vec"]))))
+
+
 def load_state(cfg):
     path = os.path.join(cfg.home, "state.json")
-    # vazio (arquivo ausente) → estado novo; falhou por permissão/E-S → Fail rc 3 (inerte); corrompido → vai para o lado e recomeça
+    # vazio (arquivo ausente) → estado novo; falhou por permissão/E-S → Fail rc 3 (inerte); corrompido ou de forma errada → vai para o lado e recomeça
     try:
         with open(path, "rb") as f:
             raw = f.read()
@@ -300,7 +320,7 @@ def load_state(cfg):
         raise Fail("%s: não abre (%s)" % (path, e))
     try:
         st = json.loads(raw.decode("utf-8"))
-        if not (isinstance(st, dict) and st.get("v") == 1 and isinstance(st.get("cooldown"), dict) and isinstance(st.get("free_ticks"), int)):
+        if not state_ok(st):
             raise ValueError("formato")
         return st
     except (ValueError, RecursionError, UnicodeDecodeError):
@@ -419,12 +439,18 @@ def load_registry(cfg):
     return parse_registry(read_text(cfg.registry))
 
 
-def running_cores(cfg, run):
+def running_cores(cfg, run, items, budget, notes):
+    reg = {it["name"]: it["cores"] for it in items}
     tot = 0
     for r in run.values():
         m = read_meta(cfg, r["run"])
-        # vazio/ilegível → conta pelo menos 1 núcleo: errar para menos começaria item demais
-        tot += int(m["cores"]) if m and isinstance(m.get("cores"), int) else 1
+        c = m.get("cores") if m else None
+        # vazio/ilegível (meta ausente, sem núcleos ou < 1) → o que o registro diz do item; `auto` ou fora do registro = o orçamento inteiro: errar para menos começaria item demais
+        if not (_int(c) and c >= 1):
+            c = reg.get(r["item"], "auto")
+            c = budget if c == "auto" else c
+            notes.append("cores-desconhecidos:%s" % r["run"])
+        tot += c
     return tot
 
 
@@ -455,7 +481,8 @@ def cpu_step(cfg, st, vec, ncpu, rec, notes):
 
 
 def do_tick(cfg):
-    rec = {"ts": iso(cfg.now), "t": cfg.now, "mode": "ligado", "note": "", "started": [], "running": [], "skipped": [], "registry_errors": [], "ram": None}
+    # o que este tick NÃO leu fica null (mode, running, registry_errors), nunca um valor padrão que pareça leitura
+    rec = {"ts": iso(cfg.now), "t": cfg.now, "mode": None, "note": "", "started": [], "running": None, "skipped": [], "registry_errors": None, "ram": None}
     try:
         os.makedirs(cfg.home, exist_ok=True)
         lock = open(os.path.join(cfg.home, "lock"), "w")
@@ -498,13 +525,15 @@ def do_tick(cfg):
     if vec is not None:
         free_ok = cpu_step(cfg, st, vec, ncpu, rec, notes)
     rec["free_ticks"] = st["free_ticks"]
-    rec["running"] = sorted(r["item"] for r in run.values())
+    # vazio (nada roda) → []; falhou/ilegível (tabela de processos) → null, nunca []
+    rec["running"] = sorted(r["item"] for r in run.values()) if procs is not None else None
     # começar itens: ligado, tudo lido, CPU livre por idle_ticks leituras seguidas, orçamento = núcleos livres - reserva
     block = any(n.startswith(("leitura-ilegivel", "registro-ilegivel", "primeira-leitura", "lacuna")) for n in notes)
     if on and procs is not None and not block and free_ok and mem is not None and st["free_ticks"] >= cfg.idle_ticks:
         budget = int(ncpu - rec["fg_cores"] - cfg.reserve + 1e-9)
         names = {r["item"] for r in run.values()}
-        used = running_cores(cfg, run)
+        used = running_cores(cfg, run, items, budget, notes)
+        mem_left = mem   # a RAM é lida uma vez por tick: cada item começado já a desconta, senão dois itens "cabem" na mesma sobra
         for it in items:
             if it["role"] != "work":
                 continue
@@ -512,7 +541,7 @@ def do_tick(cfg):
             cores = it["cores"] if it["cores"] != "auto" else budget - used
             if not ok or cores < 1 or used + cores > budget:
                 continue
-            if mem - it["rss_mb"] < cfg.ram_start_mb:
+            if mem_left - it["rss_mb"] < cfg.ram_start_mb:
                 rec["skipped"].append({"item": it["name"], "why": "ram"})
                 rec["ram"] = "baixa"
                 continue
@@ -521,6 +550,7 @@ def do_tick(cfg):
             try:
                 rec["started"].append(start_item(cfg, it, cores))
                 used += cores
+                mem_left -= it["rss_mb"]
             except Unreadable as e:
                 notes.append("nao-comecou:%s" % it["name"])
                 print("hetzner-ballast: %s" % e, file=sys.stderr)
@@ -532,16 +562,19 @@ def do_tick(cfg):
 
 # ---- status -------------------------------------------------------------------------------------------------------------------------------------------
 def do_status(cfg):
-    out = {"home": cfg.home, "mode": "ligado" if os.path.exists(os.path.join(cfg.home, "on")) else "desligado", "items": [], "registry_errors": [], "running": [],
+    out = {"home": cfg.home, "mode": "ligado" if os.path.exists(os.path.join(cfg.home, "on")) else "desligado", "state": "ok", "items": [], "registry_errors": [], "running": [],
            "launch_prefix": cfg.launch_prefix if cfg.launch_prefix is not None else default_prefix()}
     st = fresh_state()
     try:
         with open(os.path.join(cfg.home, "state.json"), "rb") as f:
             st = json.loads(f.read().decode("utf-8"))
-        if not isinstance(st.get("cooldown"), dict):
+        if not state_ok(st):
             st = fresh_state()
+            out["state"] = "ilegivel"
+    except FileNotFoundError:
+        out["state"] = "ausente"
     except (OSError, ValueError, UnicodeDecodeError, RecursionError):
-        pass   # status só LÊ: estado ausente/ilegível aparece como "sem cooldown", sem gravar nada
+        out["state"] = "ilegivel"   # status só LÊ: ausente = "sem cooldown"; ilegível/de forma errada = "sem cooldown" MAS avisado em `state`, sem gravar nada
     try:
         items, out["registry_errors"] = load_registry(cfg)
     except Unreadable as e:
