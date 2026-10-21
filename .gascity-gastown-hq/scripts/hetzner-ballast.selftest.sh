@@ -152,6 +152,9 @@ g_reg() {
   newhome; reg 'w|work|2|1024|3600|300|path:'"$H"'/items,flag:on,cmd:sh|sleeper.sh'; bt status --json
   check "reg: requires com path + flag + cmd todos verdadeiros → elegível" "true" "$(jget items.1.eligible)"
 
+  newhome; EXTRA_ENV="BALLAST_ITEMS=$HERE/hetzner-ballast.items.txt BALLAST_ITEMS_DIR=$HERE/hetzner-ballast-items"; bt status --json
+  check "reg: o registro que VAI no repo (hetzner-ballast.items.txt) lê sem erro: hq-selftests (work) e queima (filler)" "0 hq-selftests work queima filler" "$(printf '%s' "$OUT" | "$PY" -I -c 'import sys,json; print(len(json.load(sys.stdin)["registry_errors"]))') $(jget items.0.name) $(jget items.0.role) $(jget items.1.name) $(jget items.1.role)"
+  check "reg: todo comando do registro do repo existe em hetzner-ballast-items/ e é executável (o motivo de inerte, se houver, NÃO é 'comando')" "0 0" "$(jget items.0.why | grep -c comando) $(jget items.1.why | grep -c comando)"
   newhome; rm -f "$H/items.tsv"; seed; adv 50 0; bt; adv 50 0; bt; adv 50 0; bt
   check "reg: registro ausente → nada começa, nota registro-ilegivel, rc 0, registry_errors null (não leu; [] seria 'leu e está limpo')" "0 registro-ilegivel [] null" "$RC $(jget note) $(jget started) $(jget registry_errors)"
   newhome; printf '\xff\xfe\x00bin\n' > "$H/items.tsv"; seed; adv 50 0; bt

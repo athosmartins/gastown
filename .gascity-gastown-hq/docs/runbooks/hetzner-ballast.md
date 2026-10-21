@@ -1,0 +1,52 @@
+# Lastro do nó Hetzner (hetzner-ballast) · runbook
+
+## Contents
+
+• Estado · O que é e o contrato do nice · Instalar e ligar (Mayor) · Operar · O que roda (itens) · O que muda em outros vigias · Medido, inferido, não testado · O que falta
+
+Bead ga-2hd02v.5, filha da ga-2hd02v. Decisão do Athos (20/10, AskUserQuestion do Mayor): "se está 100% ocupado a gente fica feliz; o que não pode é ficar menos do que 100% ocupado" — quem ocupa não importa.
+
+## Estado
+**Mergeado ≠ vivo: nada disto está instalado no nó.** O código, o registro, os testes e este runbook entram no repo; o cron do nó e a chave `on` são passos do Mayor (abaixo). Sem a chave `on` o governo só mede e não começa nada, então instalar é seguro. A prova de aceite ("um dia inteiro com todas as horas ≥ ~85% de CPU no nó") só existe depois de ligado.
+
+## O que é e o contrato do nice
+Um governo (`scripts/hetzner-ballast.py`, Python 3.9+, só biblioteca padrão) roda **no nó**, no cron do `runner`, uma vez por minuto. Quando a CPU livre passa de 15% por 3 leituras seguidas, começa o próximo item da fila (`scripts/hetzner-ballast.items.txt`); o item roda em `nice -n 19` + `chrt -i 0` (SCHED_IDLE) + `ionice -c 3` + `oom_score_adj 1000`, então qualquer sessão (nice 0) toma a CPU na hora, sem esperar o governo; faltando memória, o kernel mata o lastro antes de uma sessão.
+
+**O contrato:** CPU em nice > 0 (coluna `nice` do `/proc/stat`) é **fundo**, não carga. O governo mede carga como user+system+irq+softirq+steal; o `hetzner-capacity.py` lê a mesma coluna (folga = ocioso + fundo, e o `load5` deixa de valer quando o fundo passa de 1% da amostra). Sem isso o lastro encheria a CPU, a capacidade leria "nó quente" e o Pilot mandaria as beads para o mini, o contrário do que se quer. Quem escrever outro leitor de CPU do nó (a ga-2hd02v.2 mexe na capacidade; a ga-2hd02v.6 no vigia) tem de manter o contrato.
+
+Orçamento = núcleos livres (16 − carga) − reserva (1). Item `work` de N núcleos só começa se rodando + N ≤ orçamento; `auto` leva o resto. Item `filler` só entra com o que sobrar e é morto quando um `work` vai começar. RAM (o nó não tem swap): só começa com ≥ 14 GB disponíveis (+ o teto do item); abaixo de 10 GB congela o lastro (SIGSTOP), volta com 12 GB; congelado por 5 leituras ou abaixo de 7 GB mata o maior (SIGKILL). Leitura que falha (registro, `/proc`, tabela de processos) nunca vira "livre" nem "morto": naquele tick nada começa e nada é morto.
+
+## Instalar e ligar (Mayor, depois do merge)
+Do mini, a partir do checkout com o commit mergeado (o `install` recusa arquivo do lastro com mudança não commitada; `--allow-dirty` libera e o `installed.json` diz `dirty: true`):
+```bash
+scripts/hetzner-ballast.sh install      # sobe governo + itens + registro (sha256 conferido ANTES de trocar) e UMA linha marcada "# gt-ballast" na crontab do runner
+scripts/hetzner-ballast.sh status       # cron: instalado · chave on: desligado · itens e por que cada um está elegível ou inerte
+scripts/hetzner-ballast.sh on           # liga: a partir daqui o governo começa itens
+```
+Desligar: `hetzner-ballast.sh off` (apaga a chave e para o que roda). Retirar: `hetzner-ballast.sh uninstall` (tira só a linha marcada e para; arquivos e resultados ficam no nó). Exige `.gc/hetzner-node.on` (a bandeira do nó) para `install` e `on`; os demais subcomandos não.
+
+## Operar
+- `status`: tick mais recente (há quantos segundos, modo, o que roda, CPU livre, RAM). **PARADO** = cron instalado e último tick com mais de 5 min: olhe `~/gt-remote/ballast/cron.err` no nó.
+- `pull`: traz `results.jsonl` do nó para `<cidade>/.gc/hetzner-ballast/results.jsonl` (lista branca de campos, valores curtos, sem duplicar a rodada). Cada linha: item, rodada, rc, `why` (`ok`, `rc-N`, `morreu-sem-rc`, `prazo`, `rss`, `ram-pausa`, `ram-critica`, `preempt`, `desligado`, `stop`), duração e o resumo (`BALLAST-SUMMARY: {json}` na última linha do log do item).
+- `burn on|off`: liga/desliga o item `queima` (CPU pura quando não há trabalho útil). **Nasce desligado** (abaixo).
+- No nó: `~/gt-remote/ballast/{state.json,ticks.jsonl,results.jsonl,runs/<rodada>/{meta.json,log,rc,final}}`. `ticks.jsonl` (teto 1 MB), `results.jsonl` (2 MB) e `cron.err` (256 KB) têm teto; `runs/` guarda as 30 últimas rodadas encerradas.
+- Variáveis (todas opcionais): `BALLAST_IDLE_MIN_PCT` (15) `BALLAST_IDLE_TICKS` (3) `BALLAST_RESERVE_CORES` (1) `BALLAST_MAX_ITEMS` (4) `BALLAST_RAM_START_MB` (14336) `BALLAST_RAM_PAUSE_MB` (10240) `BALLAST_RAM_RESUME_MB` (12288) `BALLAST_RAM_KILL_MB` (7168) `BALLAST_PAUSE_KILL_TICKS` (5) `BALLAST_KEEP_RUNS` (30). Defina no comando da crontab, não no código.
+
+## O que roda (itens)
+- **`hq-selftests`** (`work`, `auto`): `hetzner-remote-git.sh pull gascity`, árvore própria no `origin/main` do espelho do nó (`ballast-hq`; a árvore **e** a branch `worker/ballast-hq` saem no fim e no TERM: o `wt-rm` real só tira a árvore, e uma branch por merge entupiria o espelho), roda os `*.selftest.sh` do hq menos a lista só-macOS que vem na árvore (`scripts/hetzner-mac-only.hq.txt`; ausente, ilegível ou sem padrão = exit 3, nada roda), em paralelo, os mais lentos da rodada anterior primeiro. Reprovou → roda UMA vez de novo com metade do paralelismo (CPU disputada reprova por prazo de teste; passou na 2ª = `flaky`). Por selftest: rc 0 passou · 97 ambiente · 124/137 prazo (inconclusivo, não conta como reprovado) · outro = reprovou. O resumo traz contagens, **novas falhas contra a última rodada COMPLETA** (`new_fail`) e nomes de selftest, nada mais. Mesma ponta de antes = `sem-novidade` (cooldown de 10 min). **A 1ª rodada é a linha de base:** vem com reprovados que são do ambiente do nó (a lista só-macOS aprendida pela sombra mora no mini); o sinal é "novas falhas" a partir da 2ª.
+- **`queima`** (`filler`, flag `burn.on`): N laços de CPU pura. Existe porque o Athos pediu 100% "não importa quem ocupe" e a fila útil tem buracos; fica desligado por ser gasto sem trabalho e uso sustentado de um servidor alugado (cota/regra do provedor **não verificada**). **Decisão do Athos/Mayor:** ligar ou não (`burn on`).
+
+## O que muda em outros vigias
+- `hetzner-capacity.py` (feito na fatia 1/5, ga-2hd02v.5.1, já no main): fundo conta como folga; o load5 só vale sem fundo. Teste: `HC_ONLY=bg` (grupo `g_bg` do `hetzner-capacity.selftest.sh`) e a bateria inteira (números no fim da seção "Medido").
+- `hetzner-occupancy-watch.py`: conta nice como ocupado (user+nice+system+irq+softirq) — com o lastro ligado o nó **nunca fica "ocioso"**, o aviso "ocioso COM fila" (ga-2hd02v.1.15) se cala e a meta "CPU ≥ 85%" da ga-2hd02v.6 passa a ser cumprida pelo lastro. Isso é o desejado para CPU, mas o aviso deixa de dizer "tem bead aprovada esperando e o nó está vazio"; quem quiser essa pergunta deve olhar a capacidade (`hetzner-capacity.py verdict`, sessões ocupadas × degrau), não a CPU.
+- `mbp-run.sh` (preflight do nó) e `hetzner-scrape-round.sh` leem o load só para exibir, não recusam por ele (conferido por grep).
+
+## Medido, inferido, não testado
+**Medido no nó (20/10, hq-teste, 16 vCPU, com ~17 núcleos de Traço BIM em nice 0):** 4 laços normais deram 4,2 a 5,5 s de CPU cada numa janela de 6 s; 4 laços `nice 19` + SCHED_IDLE deram 1,05 s **no total** (≈ 1% do nó). Governo contra o `/proc` de verdade, com a CPU sintética (o nó estava saturado, e saturado ele corretamente não começa nada): item começou pelo prefixo real (`ps` mostra classe IDL em `timeout` e nos laços), `oom_score_adj` 1000 em todos os membros do grupo, SIGSTOP/SIGCONT reais pararam e retomaram o grupo (`Ts/TN` → `Ss/SN`), `stop` não deixou processo e a rodada foi encerrada, e um processo com a marca `ballast-item` de OUTRA pasta (o selftest do próprio governo roda como item do `hq-selftests`) foi ignorado — o drill achou o defeito de contá-lo, o conserto tem teste. Baterias no nó (mbp-run, `--repo hq`): ver o fim desta seção. **Hermético:** o `/proc` é uma pasta de fixtures; a bateria do governo exercita processos de verdade (SIGSTOP, TERM→KILL, sessão própria).
+**Inferido:** o tempo do lastro cai na coluna `nice` do `/proc/stat` porque o kernel conta como nice qualquer tarefa com `task_nice > 0` e o `chrt -i` não muda o nice (`account_user_time`); **não isolei isso no nó**: com ele saturado a coluna `nice` tinha outros consumidores (as baterias do próprio gate em nice > 0). O cron não mata os filhos de um job que termina (cron.service); a crontab do `runner` existe e está vazia. Python 3.12 no nó, `/usr/bin/python3`, `flock`, `chrt`, `ionice`, `timeout` presentes.
+**Não testado:** um tick pelo cron de verdade (só depois do `install`); o item `hq-selftests` contra o `hetzner-remote-git.sh` real (o teste usa um stub com `git worktree` de verdade); quanto dura uma rodada completa no nó e quantos reprovados são do ambiente; **um dia com todas as horas ≥ 85%** (o critério de aceite da bead); o veredito da capacidade com o lastro rodando na frota real (só por fórmula e hermético); a regra do provedor para uso sustentado de CPU.
+
+**Baterias no nó (21/10, `mbp-run.sh --repo hq`, main + esta fatia):** `hetzner-ballast-items.selftest.sh` 49/49 (89 s; 16 mutantes, todos pegos) · `hetzner-ballast.selftest.sh` 240/240 (739 s; 86 mutantes pegos) · `hetzner-ballast-ctl.selftest.sh` 107/107 (62 s; 42 mutantes pegos) · `hetzner-capacity.selftest.sh` 287/287 (2600 s com o nó dividido com outras baterias; 82 mutantes pegos). Os 2 casos do `g_reg` que leem o registro do repo reprovam sem ele (copia sem `hetzner-ballast.items.txt`: 17/18, com `veio '1 null null null null'`). O controle negativo achou um buraco na bateria dos itens como veio da branch wip: o mutante "a branch velha não sai antes do wt-add" passava, porque nenhum caso deixava a branch de pé (o fim normal da rodada e o TERM a apagam; só uma rodada morta com SIGKILL a deixa); o caso novo da rodada morta o pega.
+
+## O que falta
+Itens que só entram quando o dono entregar um comando que roda sozinho no nó, só com código e dado público que já está lá: calibração do Traço BIM (wa-eqp0dy), suíte completa do WA contra o `origin/main` (precisa do `gt-iso-run`, cujos processos de root o `runner` não consegue pausar nem matar com SIGSTOP/SIGKILL; o item precisa de desenho próprio), backfill do estudo de viabilidade (wa-ekvjuo, ainda aberta). Sem eles, a fila útil é o `hq-selftests` (uma rodada por merge no main) e a `queima` (se ligada). Também falta um alarme automático de lastro PARADO (cron instalado e tick velho): hoje só o `status` acusa.
