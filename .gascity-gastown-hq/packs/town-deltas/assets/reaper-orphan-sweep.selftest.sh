@@ -48,9 +48,9 @@
 #     store + 3 GB) ~ 15 GiB): a sweep that ate that headroom would block the GC that returns space.
 # O15c below the floor a SMALL tail still goes (ga-32t5ds): a database whose WHOLE orphan backlog is at most
 #     GC_REAPER_ORPHAN_TAIL_ROWS is swept while the free space is >= GC_REAPER_ORPHAN_TAIL_MIN_FREE_GB; a bigger
-#     backlog, less space, a tail probe that failed or ran past the sweep budget, or TAIL_ROWS=0 keep the floor
-#     absolute; and the >1000 count
-#     alert names the disk halt (stable text, no numbers: the mail dedupe keys on it).
+#     backlog (also one that sits in a single table), less space, a tail probe that failed or ran past the sweep
+#     budget, or TAIL_ROWS=0 keep the floor absolute; and the >1000 count alert names the disk halt (stable text,
+#     no numbers: the mail dedupe keys on it).
 # O16 the seatbelt: children exist but `wisps` is empty -> nothing is deleted (every row would look
 #     orphaned) and it is reported; an empty database with no children raises nothing.
 # O17 the purge's failure breaker tripped -> the sweep does not add load, and says so.
@@ -529,6 +529,14 @@ new_db; seed_orphans
 run_reaper FAKE_DF_AVAIL_KB=5242880 GC_REAPER_ORPHAN_TAIL_ROWS=9
 [ "$(orphans)" = "3,2,4,1" ] && [ "$(field orphan_swept)" = "0" ] && [ "$(field orphan_halted_dbs)" = "1" ] && [ "$(field orphan_tail_dbs)" = "0" ] && ok "O15c one row ABOVE the ceiling: the floor holds, nothing is deleted" || nok "O15c swept a backlog above the ceiling" "$OUT | $(orphans)"
 printf '%s' "$OUT" | grep 'orphan_halt: free disk 5 GiB is below the floor of 18 GiB.*above the tail ceiling of 9 rows' >/dev/null && ok "O15c the halt reason names the ceiling" || nok "O15c halt reason (ceiling)" "$OUT"
+# The ceiling is on the WHOLE backlog, and the probe's "+1" is what tells "exactly at it" from "above it" when ONE table
+# holds every orphan (the realistic case: wisp_events): 4 orphan events and nothing else, ceiling 3 -> the floor holds;
+# a probe with LIMIT 3 reads 3, the backlog "fits", and the 4 rows would be swept below the floor.
+# vazio → the equality is false: FAIL; falhou/ilegível → the same: a fixture that did not build never passes.
+new_db; seed_orphans
+sql "DELETE FROM wisp_labels WHERE issue_id LIKE 'gone-%'; DELETE FROM wisp_comments WHERE issue_id LIKE 'gone-%'; DELETE FROM wisp_dependencies WHERE issue_id LIKE 'gone-%'; CALL DOLT_COMMIT('-Am', 'orphans only in wisp_events', '--author', 't <t@t.local>');" >/dev/null
+run_reaper FAKE_DF_AVAIL_KB=5242880 GC_REAPER_ORPHAN_TAIL_ROWS=3
+[ "$(orphans)" = "0,0,4,0" ] && [ "$(field orphan_swept)" = "0" ] && [ "$(field orphan_halted_dbs)" = "1" ] && printf '%s' "$OUT" | grep 'above the tail ceiling of 3 rows' >/dev/null && ok "O15c 4 orphans all in ONE table, ceiling 3: the floor holds (the probe asks for ceiling+1)" || nok "O15c one-table backlog above the ceiling" "$OUT | $(orphans)"
 new_db; seed_orphans
 run_reaper FAKE_DF_AVAIL_KB=3670016     # 3.5 GiB free: under the 4 GiB tail floor
 [ "$(orphans)" = "3,2,4,1" ] && [ "$(field orphan_halted_dbs)" = "1" ] && ok "O15c 3.5 GiB free: even a tiny tail waits (below the tail floor)" || nok "O15c swept below the tail floor" "$OUT | $(orphans)"
