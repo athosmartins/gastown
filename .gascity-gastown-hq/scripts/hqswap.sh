@@ -129,15 +129,56 @@ mbp_identical() {
   log "MacBook: arquivos $lf/$rf, bytes $lb/$rb"
   [ "$lf" = "$rf" ] && [ "$lb" = "$rb" ]
 }
+dotdolt_mtimes() {  # horário em SEGUNDOS de .dolt e .dolt/noms: o ls -la só mostra o minuto, e quem abre o banco some em ~1 s (ga-06wmmp)
+  local m
+  # falhou/ilegível (qualquer um dos dois diretórios) → "?", nunca um número só nem vazio; o status do stat vem direto da
+  # atribuição, sem pipeline (não depende do pipefail de quem chama). stat GNU primeiro, o do macOS como reserva
+  m=$(stat -c '%Y' "$D/$DB/.dolt" "$D/$DB/.dolt/noms" 2>/dev/null) || m=""
+  [ -n "$m" ] || m=$(stat -f '%m' "$D/$DB/.dolt" "$D/$DB/.dolt/noms" 2>/dev/null) || m=""
+  [ -n "$m" ] && m=$(printf '%s' "$m" | tr '\n' ' ')
+  printf 'mtime(.dolt noms) %s\n' "${m:-?}"
+}
 watch_dotdolt() {  # registra cada mudança de entradas em $D/$DB/.dolt (pega quem abre o banco sem lock)
   local prev="" cur=""
   while [ ! -e "$X/stop-watch" ]; do
-    cur=$(ls -la "$D/$DB/.dolt" 2>/dev/null | awk 'NR>1{print $1,$5,$6,$7,$8,$9}')
+    cur=$(ls -la "$D/$DB/.dolt" 2>/dev/null | awk 'NR>1{print $1,$5,$6,$7,$8,$9}'; dotdolt_mtimes)
     if [ "$cur" != "$prev" ]; then
       { echo "--- $(date '+%T')"; printf '%s\n' "$cur"; lsof +D "$D/$DB" 2>/dev/null | awk 'NR>1{print $1,$2}' | sort -u; } >> "$X/dotdolt-watch.log"
       prev=$cur
     fi
     sleep 1
+  done
+}
+watch_dolt_procs() {  # QUEM abriu: a cada 0,5 s anota, uma vez por processo novo com "dolt" na linha de comando, a cadeia de pais e o cwd (ga-06wmmp)
+  local seen="$X/dotdolt-procs.seen" snap line pid cwd
+  : > "$seen"
+  # $$ é o PID do script principal também nesta subshell: se ele morrer sem tocar stop-watch (kill -9), o amostrador não vira órfão
+  while [ ! -e "$X/stop-watch" ] && kill -0 $$ 2>/dev/null; do
+    # vazio → nenhum processo dolt nesta amostra (o normal na janela); ps falhou/ilegível → amostra perdida, a próxima tenta de novo, nada é gravado
+    snap=$(ps -axww -o pid=,ppid=,command= 2>/dev/null) || snap=""
+    if [ -n "$snap" ]; then
+      printf '%s\n' "$snap" | awk -v seen="$seen" -v now="$(date '+%T')" '
+        BEGIN { while ((getline l < seen) > 0) S[l] = 1; close(seen) }
+        { c = $0; sub(/^ *[0-9]+ +[0-9]+ +/, "", c); P[$1] = $2; C[$1] = c }
+        END {
+          for (p in C) {
+            if (C[p] !~ /[Dd]olt/ || C[p] ~ /awk -v seen=|ps -axww/) continue
+            key = p " " substr(C[p], 1, 60)
+            if (key in S) continue
+            chain = ""; q = p; n = 0
+            while ((q in C) && n < 8) { chain = chain (chain == "" ? "" : "  <-  ") q ": " substr(C[q], 1, 110); q = P[q]; n++ }
+            print now " pid=" p " " chain
+            print key >> seen
+          }
+        }' | while IFS= read -r line; do
+          printf '%s\n' "$line"
+          pid=${line#*pid=}; pid=${pid%% *}
+          # falhou/ilegível → "?" (o processo pode já ter saído), nunca um caminho inventado
+          cwd=$(lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+          printf '  cwd: %s\n' "${cwd:-?}"
+        done >> "$X/dotdolt-procs.log"
+    fi
+    sleep 0.5 2>/dev/null || sleep 1
   done
 }
 prep() {  # passos 2-3 do runbook (só em produção)
@@ -182,7 +223,8 @@ lifecycle stop; rc=$?
 for _ in $(seq 1 30); do no_dolt_on "$D/$DB" && break; sleep 1; done
 no_dolt_on "$D/$DB" || die "ainda há processo dolt com o hq aberto depois do stop"
 log "5 Dolt parado"
-rm -f "$X/stop-watch"; watch_dotdolt & WATCH_PID=$!
+rm -f "$X/stop-watch"; watch_dotdolt & WATCH_PID=$!; watch_dolt_procs & WATCH_PROCS_PID=$!
+log "5b vigias ligados: $X/dotdolt-watch.log (horário em segundos de .dolt e noms) e $X/dotdolt-procs.log (QUEM: cadeia de pais e cwd de cada processo dolt novo)"
 
 # 6. travar o launchd (sobrevive a reboot)
 freeze_launchd || die "launchctl disable falhou"
