@@ -2169,6 +2169,11 @@ xp_mk xp9e; m5_tree xp9e w merged; ( cd "$TMP/xp9e/rig/crew/w" && rm -rf pesquis
 xp_kept xp9e "(x9e): WORKTREE_REAPER_IGNORED_MIN_KB=0 → an ignored file with no bytes in it holds the tree" kept_ignored_data
 xp_mk xp9f; m5_tree xp9f w merged; ( cd "$TMP/xp9f/rig/crew/w" && rm -rf pesquisa && : > empty.dat ) >/dev/null 2>&1; m5_age "$TMP/xp9f/rig/crew/w" 14; xp_run xp9f
 xp_freed xp9f "(x9f): the same tree at the default limit → reaped (a file with no bytes is not data)"
+# (x9g)(x9h) 0 holds an entry that EXISTS: a tree with only junk, or with nothing ignored at all, has none, so the limit 0 does not hold it either
+xp_mk xp9g; xp_tree xp9g merged junk; xp_run xp9g WORKTREE_REAPER_IGNORED_MIN_KB=0
+xp_freed xp9g "(x9g): WORKTREE_REAPER_IGNORED_MIN_KB=0 and only junk inside → reaped (0 is 'any entry', not 'even an empty listing')"
+xp_mk xp9h; m5_tree xp9h w merged; ( cd "$TMP/xp9h/rig/crew/w" && rm -rf pesquisa ) >/dev/null 2>&1; m5_age "$TMP/xp9h/rig/crew/w" 14; xp_run xp9h WORKTREE_REAPER_IGNORED_MIN_KB=0
+xp_freed xp9h "(x9h): WORKTREE_REAPER_IGNORED_MIN_KB=0 and nothing ignored at all → reaped"
 
 # (x15) mktemp fails: the scan cannot even start — that is not 'nothing ignored': KEPT, kept_ignored_data_unknown
 xp_mk xp15; xp_tree xp15 merged data; mkdir -p "$TMP/xp15-bin"; printf '#!/bin/sh\nexit 1\n' > "$TMP/xp15-bin/mktemp"; chmod +x "$TMP/xp15-bin/mktemp"
