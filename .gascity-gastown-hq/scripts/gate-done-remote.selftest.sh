@@ -509,6 +509,8 @@ reset_ps; run_ps GATE_DONE_REMOTE_MIRROR="$T/nao-existe.git" GATE_DONE_REMOTE_DR
 
 # ── 8. mutantes: cada guarda apagada tem de reprovar o caso que a prova ───────────────────────────────────────────────────────────────────────────
 mutant() {  # mutant NOME 'trecho' 'troca' CASO — CASO é uma função que devolve 0 se o comportamento BOM aparece
+  # CASO tem de estar definido ANTES da chamada: função indefinida sai 127 e o harness leria "morto" sem o caso ter rodado (ga-2hd02v.4.7, gate 1)
+  declare -F "$4" >/dev/null || { echo "FAIL mutante $1: o caso '$4' não está definido (definido DEPOIS da chamada, ou com o nome errado)"; fails=$((fails+1)); n=$((n+1)); return; }
   cp -p "$CITY/scripts/gate-done-remote.py" "$T/exe.good"
   python3 -I - "$CITY/scripts/gate-done-remote.py" "$2" "$3" <<'EOF' || { echo "FAIL mutante $1: o trecho não existe mais no executável"; fails=$((fails+1)); n=$((n+1)); return; }
 import sys
@@ -569,8 +571,8 @@ case_ps_no_routes() { reset_ps; printf '{"prefix":"ga","path":"."}\n' > "$CITY/.
 case_ps_unknown_prefix() { reset_ps; run_ps GC_SESSION_NAME=wa-worker-remote-abc123 GC_ALIAS=wa-worker-remote-1 BEADS_ACTOR=wa-worker-remote-1; [ "$RC" = 1 ] && ps_nothing; }
 case_unknown_role() { reset_ps; run_exe GC_SESSION_NAME=remote-e2e-1 GATE_DONE_REMOTE_DRY_RUN=1; [ "$RC" = 0 ] && has "$T/out" "bead=ga-t1 worker/remote-e2e-1@"; }
 case_release_empty_read() { reset_ps; run_ps FAKE_BD_SHOW_EMPTY_AFTER_UPDATE=ps-t1; has "$T/out" "NÃO ficou solta (resta ?" && ! has "$T/out" "bead solta: ps-t1"; }
-mutant ps-releitura-vazia-vira-solta 'if not isinstance(now, dict) or now.get("id") != bead:' 'if False:' case_release_other_bead
 case_release_other_bead() { reset_ps; run_ps FAKE_BD_SHOW_OTHER_AFTER_UPDATE=ps-t1; has "$T/out" "NÃO ficou solta (resta ?" && ! has "$T/out" "bead solta: ps-t1"; }
+mutant ps-releitura-de-outra-bead-vira-solta 'if not isinstance(now, dict) or now.get("id") != bead:' 'if False:' case_release_other_bead
 mutant ps-releitura-vazia-volta-a-or-vazio 'if not isinstance(now, dict) or now.get("id") != bead:' $'now = now or {}\n        if False:' case_release_empty_read
 case_node_mark_left() { reset_ps; run_ps FAKE_BD_KEEP_MARK=1; has "$T/out" "NÃO ficou solta (resta pilot.wa_node_alias"; }
 mutant ps-solta-nao-le-a-marca '("pilot.wa_node_alias", (now.get("metadata") or {}).get("pilot.wa_node_alias"))' '("x", None)' case_node_mark_left
