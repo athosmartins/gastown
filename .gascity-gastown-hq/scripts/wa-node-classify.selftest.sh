@@ -155,6 +155,8 @@ expect "mini: .txt neutro em docs/ também não" "$(DESC "${DOCS}docs/notas.txt"
 expect "mini: um .md entregue e um .db na mesma bead — o .db segura" "$(DESC "${DOCS}docs/guia.md e queue.db")" 10 'caminho-fora-do-filtro:queue\.db'
 expect "mini: .md entregue + .md sinalizado — só o sinalizado vira motivo" "$(DESC "${DOCS}docs/guia.md e docs/sinalizado.md")" 10 '"reasons": \["caminho-fora-do-filtro:docs/sinalizado\.md"\]'
 expect "unknown: só doc citado (sem código nem teste) deixa de ser mini, mas segue sem prova" "$(DESC 'ajustar docs/runbooks/guia.md')" 11 'sem-prova-de-codigo-e-teste.*via-espelho'
+expect "unknown: .md entregue pelo espelho em docs/tests/ NÃO é teste (casa tests?/ mas não é prova)" "$(DESC 'ajustar lib/x.py conforme docs/tests/plan.md')" 11 'sem-prova-de-codigo-e-teste.*via-espelho:docs/tests/plan\.md'
+expect "unknown: idem em docs/test/ (singular)" "$(DESC 'ajustar lib/x.py conforme docs/test/README.md')" 11 'sem-prova-de-codigo-e-teste.*via-espelho:docs/test/README\.md'
 expect "mini: telefone no texto vence o espelho" "$(DESC "${DOCS}docs/guia.md (31) 98876-5432")" 10 '"reasons": \["dado-no-texto"\]'
 expect "mini: palavra de banco vence o espelho (mole)" "$(DESC "${DOCS}docs/guia.md abre um sqlite")" 10 'moles:banco-de-dados'
 expect "node:ok + .md entregue" "$(labels "$(DESC 'ajustar docs/runbooks/guia.md')" '["node:ok"]')" 0 '"basis": "label".*via-espelho'
@@ -274,6 +276,7 @@ mutant mac-vazio-vale    'if not globs:'                               'if False
 # espelho git: cada mutante troca UMA linha da regra nova e o caso designado reprova; o ambiente do caso (stub do espelho) vem em "VAR=valor"
 mutant espelho-sem-negacoes 'open_sent = sent_by_filter(cands, only_denies=True)' 'open_sent = set(cands)' "$(DESC "${DOCS}shared/notas.md")" 10 'caminho-fora-do-filtro:shared/notas\.md' "WA_NODE_MIRROR=$T/mirror-ok"
 mutant espelho-sem-varredura 'denied = mirror_denied(mirror_rules(), ok)' 'denied = set()' "$(DESC "${DOCS}docs/sinalizado.md")" 10 'caminho-fora-do-filtro:docs/sinalizado\.md' "WA_NODE_MIRROR=$T/mirror-ok"
+mutant espelho-vira-teste 'elif p in via_mirror:' 'elif False:' "$(DESC 'ajustar lib/x.py conforme docs/tests/plan.md')" 11 'sem-prova-de-codigo-e-teste.*via-espelho:docs/tests/plan\.md' "WA_NODE_MIRROR=$T/mirror-ok"
 mutant espelho-ext-solta 'MIRROR_TEXT_EXT = ("md",)' 'MIRROR_TEXT_EXT = ("md", "json", "txt")' "$(DESC "${DOCS}docs/auto_response/ab_results/x.json")" 10 'caminho-fora-do-filtro:docs/auto_response/ab_results/x\.json' "WA_NODE_MIRROR=$T/mirror-ok"
 mutant espelho-falha-vira-chega 'return [], ["espelho-ilegivel:" + str(e)]' 'return cands, ["espelho-ilegivel:" + str(e)]' "$(DESC "${DOCS}docs/runbooks/guia.md")" 10 'espelho-ilegivel:espelho-sem-resposta'
 mutant espelho-rc-ignorado 'raise Unreadable("espelho-rc-%d" % r.returncode)' 'pass' "$(DESC "${DOCS}docs/runbooks/guia.md")" 10 'espelho-ilegivel:espelho-rc-75' "WA_NODE_MIRROR=$T/mirror-75"

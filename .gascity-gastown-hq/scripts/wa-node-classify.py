@@ -347,6 +347,8 @@ def classify(b):
             hard.append("caminho-fora-do-filtro:" + p)
         elif any(fnmatch.fnmatchcase(p, g) for g in globs):
             hard.append("so-no-mac:" + p)
+        elif p in via_mirror:
+            pass  # texto que o espelho entrega não é prova de nada, nem de código nem de teste: 'docs/tests/plan.md' casa TEST_RE mas não é teste (o rsync só manda /tests/ da raiz)
         elif TEST_RE.search(p):
             tests.append(p)
         elif p.rsplit(".", 1)[-1] in CODE_EXT:
