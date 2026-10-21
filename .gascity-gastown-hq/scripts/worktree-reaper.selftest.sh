@@ -1884,7 +1884,7 @@ dg_kept dg_m "WORKTREE_REAPER_GENERATED_RE narrowed to match nothing"
 # removed — a battery writing under an ignored pesquisa/ never touches it; (2) _worktree_in_use was asked for MERGED trees only; (3)
 # `git worktree remove` without --force refuses only a DIRTY tree and ignored files do not make one, so the outputs went with it.
 # Every scenario here ages the WHOLE tree (dir, files, index; commits carry an old date) and turns ACTIVITY_SCAN on. Run against the
-# pre-fix reaper they all fail except (b2)(c)(e)(l)(n)(k3), which pin what must NOT change: disk is still freed (a merged tree, the
+# pre-fix reaper they all fail except (b2)(c)(e)(l)(n)(k3)(r), which pin what must NOT change (and (s), whose outcome there is arbitrary: see its note below): disk is still freed (a merged tree, the
 # ordinary age path, a dead-holder lock) and the old rules stay one knob away.
 echo "── ga-m5i7e6: freshest-signal age, in-use on every path, pressure = merged only ──"
 M5_OLD=2020-01-01T00:00:00Z
@@ -2015,6 +2015,69 @@ m5_town1 m5t; mkdir -p "$TMP/m5t-bin"; printf '#!/bin/sh\nexit 1\n' > "$TMP/m5t-
 m5_run m5t PATH="$TMP/m5t-bin:$PATH"
 if [ -d "$TMP/m5t/.gc-worktrees/x" ] && [ "$(events m5t kept_activity_unknown)" = "1" ]; then ok "ga-m5i7e6 (p): town loop — the walk inside the tree FAILS → KEPT, kept_activity_unknown logged"
 else bad "ga-m5i7e6 (p): town loop unknown — present=$([ -d "$TMP/m5t/.gc-worktrees/x" ] && echo y || echo n) kept_activity_unknown=$(events m5t kept_activity_unknown)"; fi
+
+# ── ga-m5i7e6 gate-feedback (fix-attempt 1 FAILED review): the "in use" guard answered "free" for a live process on the real lsof ──
+# `lsof -Fn` prints ~1.7 MB on the mini (the old `-d cwd -Fn` ~19 KB). _worktree_in_use piped that into an awk that `exit`ed at its first
+# match; printf died of SIGPIPE (141), `set -o pipefail` made 141 the function's return, and every caller read it as "not in use".
+# Scenarios (a)(h)(k)(m) use the FAKE_LSOF file seam (no pipe) and (i) a 2-line stub (nothing to break the pipe), so none of them could
+# see it. These feed the real function an lsof that prints far more than a pipe holds (the premise is asserted, not assumed):
+#   (q) the live process's line comes FIRST in a ~450 KB listing → the tree is KEPT and kept_in_use is logged (fails on the shipped
+#       fix-attempt 0: the tree is reaped); (r) control, the same listing without the process → still reaped (disk is still freed);
+#   (s) the real lsof and a real `sleep` whose cwd is inside the tree → KEPT. Realism, not a pin: on attempt 0 it passed or failed from
+#       one run to the next, because whether the process is caught depends on where its lines fall in the real listing (the arbitrariness
+#       the reviewer measured); (q) and (t1) are the deterministic pins. (t) the function alone, 3 calls each: (t1) match FIRST → in use
+#       every time (fails on attempt 0, rc 141); (t4) an awk that fails (neither 0 nor 1) reads as "in use", never "free" (fails on
+#       attempt 0); (t2) match LAST and (t3) no match are controls that pass on attempt 0 too: a late match is still found, and "no
+#       match" is still the one answer that reads as free.
+M5_BIG="$TMP/m5_big_filler.txt"
+awk 'BEGIN { for (i = 0; i < 6000; i++) print "n/Users/someone/unrelated/path/" i "/padding/padding/padding/padding/padding" }' > "$M5_BIG"
+M5_BIG_N=$(( $(wc -c < "$M5_BIG") ))
+if [ "$M5_BIG_N" -gt 200000 ]; then ok "ga-m5i7e6 (q)-(t) premise: the stub listing is $M5_BIG_N bytes (> 200 KB, far past a pipe buffer)"
+else bad "ga-m5i7e6 (q)-(t) premise: the stub listing is only $M5_BIG_N bytes — too small to break a pipe, so (q)-(t) would pass on the broken code"; fi
+m5_stub() {   # <name> first|last|none <tree-path> — $TMP/<name>-bin/lsof prints the filler with <tree-path>'s file as an `n` line at the start, at the end, or not at all
+  mkdir -p "$TMP/$1-bin"
+  { [ "$2" != first ] || printf 'p1\nn%s/pesquisa/out/battery.csv\n' "$3"; cat "$M5_BIG"; [ "$2" != last ] || printf 'p2\nn%s/pesquisa/out/battery.csv\n' "$3"; } > "$TMP/$1.out"
+  printf '#!/usr/bin/env bash\ncat "%s"\n' "$TMP/$1.out" > "$TMP/$1-bin/lsof"; chmod +x "$TMP/$1-bin/lsof"
+}
+
+m5_mk m5q; m5_tree m5q w unmerged; m5_stub m5q first "$(m5_real m5q)"
+m5_run m5q WORKTREE_REAPER_FAKE_LSOF= PATH="$TMP/m5q-bin:$PATH"
+m5_kept m5q "(q): the REAL _worktree_in_use, a ~450 KB lsof listing with the live process FIRST → unmerged 14 h tree KEPT, kept_in_use logged" kept_in_use
+m5_mk m5r; m5_tree m5r w unmerged; m5_stub m5r none "$(m5_real m5r)"
+m5_run m5r WORKTREE_REAPER_FAKE_LSOF= PATH="$TMP/m5r-bin:$PATH"
+m5_gone m5r "(r): the same ~450 KB listing WITHOUT the process → reaped (control: a big listing alone does not freeze the reaper)"
+
+if command -v lsof >/dev/null 2>&1; then
+  m5_mk m5s; m5_tree m5s w unmerged
+  ( cd "$(m5_real m5s)/pesquisa/out" && exec sleep 60 ) & M5_SLEEP=$!
+  sleep 0.5
+  m5_run m5s WORKTREE_REAPER_FAKE_LSOF=
+  kill "$M5_SLEEP" 2>/dev/null; wait "$M5_SLEEP" 2>/dev/null
+  m5_kept m5s "(s): the real lsof and a real process with its cwd inside → unmerged 14 h tree KEPT, kept_in_use logged" kept_in_use
+else echo "  - ga-m5i7e6 (s) skipped: no lsof on this machine"; fi
+
+m5_fn="$(awk '/^_worktree_in_use\(\) \{/{p=1} p{print} p&&/^}/{exit}' "$REAPER")"
+m5_call() {   # <bindir> <path> — rc of the REAL function in its own `set -o pipefail` shell, <bindir> first on PATH, the file seam off
+  ( set -uo pipefail; unset WORKTREE_REAPER_FAKE_LSOF; PATH="$1:$PATH"; eval "$m5_fn"; _worktree_in_use "$2" ) >/dev/null 2>&1
+}
+if [ -z "$m5_fn" ]; then bad "ga-m5i7e6 (t): could not extract _worktree_in_use from the reaper (renamed?) — the function-level checks would test nothing"
+else
+  M5_P="$TMP/m5-fn-probe/tree"   # the function only compares strings, so the path need not exist: no dependence on a scenario tree surviving
+  m5_stub m5v first "$M5_P"; m5_stub m5w last "$M5_P"; m5_stub m5x none "$M5_P"
+  m5_call "$TMP/m5v-bin" "$M5_P"; t1=$?; m5_call "$TMP/m5v-bin" "$M5_P"; t2=$?; m5_call "$TMP/m5v-bin" "$M5_P"; t3=$?
+  if [ "$t1$t2$t3" = "000" ]; then ok "ga-m5i7e6 (t1): match first in a ~450 KB listing → in use (rc 0) on 3 calls out of 3"
+  else bad "ga-m5i7e6 (t1): match first in a big listing gave rc $t1/$t2/$t3 (want 0/0/0; 141 = SIGPIPE read as 'free')"; fi
+  m5_call "$TMP/m5w-bin" "$M5_P"; t4=$?
+  if [ "$t4" = 0 ]; then ok "ga-m5i7e6 (t2): match LAST in a ~450 KB listing → in use (the answer does not depend on where the match falls)"
+  else bad "ga-m5i7e6 (t2): match last in a big listing gave rc $t4 (want 0)"; fi
+  m5_call "$TMP/m5x-bin" "$M5_P"; t5=$?
+  if [ "$t5" = 1 ]; then ok "ga-m5i7e6 (t3): no match in a ~450 KB listing → rc 1, the only answer that reads as free"
+  else bad "ga-m5i7e6 (t3): no match in a big listing gave rc $t5 (want exactly 1)"; fi
+  mkdir -p "$TMP/m5u-bin"; cp "$TMP/m5x-bin/lsof" "$TMP/m5u-bin/lsof"; printf '#!/bin/sh\nexit 2\n' > "$TMP/m5u-bin/awk"; chmod +x "$TMP/m5u-bin/awk"
+  m5_call "$TMP/m5u-bin" "$M5_P"; t6=$?
+  if [ "$t6" = 0 ]; then ok "ga-m5i7e6 (t4): awk itself fails (rc 2) → 'cannot tell' = in use, never free"
+  else bad "ga-m5i7e6 (t4): a failing awk gave rc $t6 (want 0: only a clean rc 1 may read as free)"; fi
+fi
 
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"

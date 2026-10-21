@@ -290,14 +290,23 @@ _worktree_in_use() {
   #     verdict on what it actually printed, regardless of lsof's own exit code.
   # ga-m5i7e6: every open file counts, not only a cwd (-Fn lists the cwd, the executable, mapped files and each fd of every
   # process): a battery whose cwd is elsewhere but writes its output inside the tree is just as much "in use".
-  # vazio → "cannot tell" = in use (below); falhou → same, its exit code is not consulted at all
-  local lsof_out
+  # ga-m5i7e6 gate-feedback (fix-attempt 1): `lsof -Fn` printed 1.7 MB here (measured 21/10; `lsof -d cwd -Fn` printed 18 KB, which fit
+  # the pipe buffer). awk used to `exit` at its FIRST match while printf was still writing; printf then died of SIGPIPE (141) and, under
+  # `set -o pipefail`, 141 became this function's return, which every caller reads as "not in use" - a live process inside the tree
+  # answered "free". So awk now reads ALL of its input (no `exit` in the match branch; END decides), and only awk's own clean
+  # verdicts are trusted: 0 = a match, 1 = read it all and found none; any other status (awk missing or failing, a broken pipe)
+  # is "cannot tell" = in use, the same inert side as the empty-output case above.
+  # vazio → "cannot tell" = in use (below); falhou → same for lsof (its exit code is not consulted at all) and for awk (rc not 0/1)
+  local lsof_out rc
   lsof_out="$(lsof -Fn 2>/dev/null)"
   [ -n "$lsof_out" ] || return 0
   printf '%s\n' "$lsof_out" | awk -v p="$path" '
-    /^n/ { d = substr($0, 2); if (d == p || index(d, p "/") == 1) { found=1; exit } }
+    /^n/ { d = substr($0, 2); if (d == p || index(d, p "/") == 1) found=1 }
     END { exit(found ? 0 : 1) }
   '
+  rc=$?
+  [ "$rc" -eq 1 ] && return 1
+  return 0
 }
 
 # ── _mtime_of <path> — ga-m5i7e6: epoch mtime of a path. BSD `stat -f %m`; GNU stat answers `-f` with filesystem info, so
