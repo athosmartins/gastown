@@ -565,6 +565,21 @@ _PROBE="$CITY/scripts/gc-dolt-probe.sh"
 # shellcheck disable=SC1090
 [ -f "$_PROBE" ] && . "$_PROBE" 2>/dev/null || true
 
+# ga-3risy2: o hold do Dolt ("parado de propósito"). _resurrect_dolt o consulta. Sem a lib, a
+# resposta é "não sei" e SEGURA (loud, a cada ciclo): ela mora ao lado deste script, então a
+# ausência é checkout quebrado, e subir um Dolt por cima de uma pasta em troca é o ato que o hold
+# existe para impedir. Ver scripts/dolt-hold-lib.sh. Caminho relativo a ESTE script (como o
+# dolt-hang-watchdog faz com o dolt-pid-lib.sh), não a $CITY: o selftest roda uma cópia.
+_HOLD_LIB="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/dolt-hold-lib.sh"
+if [ -r "$_HOLD_LIB" ]; then
+  . "$_HOLD_LIB"
+else
+  dolt_hold_city_blocks() {
+    DOLT_HOLD_MESSAGE="dolt-hold-lib.sh ilegível ($_HOLD_LIB): não dá para saber se há hold; tratando como hold"
+    return 0
+  }
+fi
+
 # ════════════════════════════════════════════════════════════════════════════════
 # PURE DECISION FUNCTIONS — unit-tested by dolt-disk-floor-guard.selftest.sh.
 # No side effects (the df call is read-only); config is passed as explicit params
@@ -3299,6 +3314,14 @@ _resurrect_dolt() {
   local avail="$1" class="$2"
   if [ "$ENABLED" != "1" ]; then
     log "resurrect SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0 (notify-only mode)"
+    return 1
+  fi
+  # ga-3risy2: Dolt parado DE PROPÓSITO (hold). "Inalcançável" é o estado esperado, não uma
+  # queda: não sobe o Dolt (seria por cima de uma pasta em troca) e — de propósito, antes de
+  # qualquer escalada — não pagina ninguém por uma "ressurreição que falhou". Hold que não dá
+  # para ler segura do mesmo jeito. Solto (arquivo ausente ou vencido) → segue.
+  if dolt_hold_city_blocks "$CITY"; then
+    log "resurrect SKIP — HOLD em vigor (${DOLT_HOLD_MESSAGE}); Dolt parado de propósito, sem 'gc dolt start' e sem escalada"
     return 1
   fi
   log "resurrect: Dolt CONFIRMED unreachable (gc_dolt_probe_robust) with disk safe (class=${class} avail=${avail}GB) — attempting 'gc dolt start' …"

@@ -38,6 +38,19 @@ CITY="/Users/athos/gt/.gascity-gastown-hq"
 _DHW_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # shellcheck source=dolt-pid-lib.sh
 source "$_DHW_SCRIPT_DIR/dolt-pid-lib.sh"
+# ga-3risy2: o hold do Dolt (arquivo que diz "parado de propósito"). Veja dolt-hold-lib.sh.
+# Sem a lib a resposta é "não sei" e SEGURA (loud, a cada tick): ela mora ao lado deste script,
+# então a ausência é checkout quebrado, e reiniciar o Dolt por cima de uma pasta em troca é o
+# ato que o hold existe para impedir.
+if [ -r "$_DHW_SCRIPT_DIR/dolt-hold-lib.sh" ]; then
+  # shellcheck source=dolt-hold-lib.sh
+  source "$_DHW_SCRIPT_DIR/dolt-hold-lib.sh"
+else
+  dolt_hold_city_blocks() {
+    DOLT_HOLD_MESSAGE="dolt-hold-lib.sh ilegível ($_DHW_SCRIPT_DIR/dolt-hold-lib.sh): não dá para saber se há hold; tratando como hold"
+    return 0
+  }
+fi
 # ga-153cq: LOG/STRIKES overridable so a dry run can use scratch state. They were
 # hardcoded, which made even a DRY RUN unsafe: the strike counter is incremented
 # BEFORE the restart decision, so exercising this script against the live counter
@@ -565,6 +578,29 @@ restart_escalate() {
     log "WARN: escalate_emergency.py FAILED to page — NOT stamping, so the next held tick pages again"
   fi
 }
+
+# ga-3risy2 — HOLD: o Dolt está parado DE PROPÓSITO (troca de pasta, GC offline, ensaio de
+# restore). Sem este desvio, cada tick veria "Dolt inalcançável", contaria 3 strikes e rodaria
+# `gc dolt restart` — religando o Dolt por cima da pasta que alguém está trocando — e depois
+# paginaria "restart did not recover". Enquanto o hold segura: nenhuma sonda, nenhum strike,
+# nenhum restart, nenhum retrato forense. Hold que não dá para ler também segura (o ato que ele
+# protege é o destrutivo; sob dúvida o estado inerte é não mexer no Dolt).
+#
+# Zera o que seria estado velho no dia em que o hold soltar: os strikes e o contador do veto de
+# CPU (senão o primeiro tick depois da soltura herdaria 2 strikes de antes do hold e reiniciaria
+# um Dolt que ainda está subindo) e a linha de base do PID (senão o PID novo, depois da troca,
+# dispararia um "retrato de morte" para uma parada que foi planejada). Em DRY-RUN só diz o que
+# faria, como todo outro ponto de escrita deste arquivo.
+# hold: segura/ilegível → este bloco; solto (arquivo ausente ou vencido) → segue o fluxo normal
+if dolt_hold_city_blocks "$CITY"; then
+  if is_dry_run; then
+    log "DRY-RUN: HOLD em vigor (${DOLT_HOLD_MESSAGE}) — não sondaria, não contaria strike, não reiniciaria. Strikes, veto de CPU e linha de base do PID ficam como estão."
+  else
+    log "HOLD em vigor (${DOLT_HOLD_MESSAGE}) — Dolt parado de propósito: sem sonda, sem strike, sem restart."
+    rm -f "$STRIKES" "$CPU_VETO_FILE" "$LASTPID_FILE" 2>/dev/null || true
+  fi
+  exit 0
+fi
 
 # Runs UNCONDITIONALLY, before any health decision: a death+respawn can
 # complete well inside this watchdog's own polling interval, so probe_ok()

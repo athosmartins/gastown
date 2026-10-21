@@ -1,0 +1,1198 @@
+diff --git a/cmd/gc/bd_env.go b/cmd/gc/bd_env.go
+index 9617e9a86..327b1c42b 100644
+--- a/cmd/gc/bd_env.go
++++ b/cmd/gc/bd_env.go
+@@ -754,7 +754,17 @@ const recoverManagedBDCommandGateFileName = "recover-managed-bd-trigger.stamp"
+ // Fails open (returns true) on any error resolving or touching the gate
+ // file: this gate exists to suppress amplification, not to become a new,
+ // silent way for recovery to stop happening altogether.
++//
++// The one exception is a managed-Dolt hold (ga-3risy2, dolt_hold.go): while
++// the operator has parked Dolt on purpose, no recovery is allowed. That check
++// comes first and returns false without touching the cooldown stamp, so a
++// refused call spends nothing a real outage will need after the release. An
++// unreadable hold file also refuses; unlike the gate file above, it is an
++// explicit operator signal, so "could not tell" must not start Dolt.
+ func recoverManagedBDCommandAllowed(cityPath string) bool {
++	if readManagedDoltHold(cityPath).Blocks() {
++		return false
++	}
+ 	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
+ 	if err != nil {
+ 		return true
+diff --git a/cmd/gc/beads_provider_lifecycle.go b/cmd/gc/beads_provider_lifecycle.go
+index 55347cad0..0de98d834 100644
+--- a/cmd/gc/beads_provider_lifecycle.go
++++ b/cmd/gc/beads_provider_lifecycle.go
+@@ -1088,6 +1088,13 @@ func healthBeadsProvider(cityPath string) error {
+ 				if isBreakerOpenError(err) {
+ 					return err
+ 				}
++				// Held on purpose (ga-3risy2): an unhealthy managed Dolt is
++				// the expected state, not something to recover. Checked
++				// before the cooldown stamp so a refused attempt does not
++				// spend the window a real outage will need after release.
++				if hold := readManagedDoltHold(cityPath); hold.Blocks() {
++					return fmt.Errorf("%w: %s; health check failed (%w); not recovering", errManagedDoltHeld, hold.Describe(), err)
++				}
+ 				// Recover backoff: refuse a 2nd recover within
+ 				// providerRecoverCooldown of the prior one, keyed per
+ 				// city. This alone breaks the low-RSS restart-loop where
+diff --git a/cmd/gc/city_runtime.go b/cmd/gc/city_runtime.go
+index 862561fa9..9984c96e3 100644
+--- a/cmd/gc/city_runtime.go
++++ b/cmd/gc/city_runtime.go
+@@ -2717,6 +2717,12 @@ func ensureManagedDoltPublishedForRuntime(
+ 	if portFn(cityPath) != "" {
+ 		return
+ 	}
++	// A stopped Dolt with no published port is exactly what healthFn exists to
++	// recover; under a hold that is the one thing that must not happen (ga-3risy2).
++	if hold := readManagedDoltHold(cityPath); hold.Blocks() {
++		noteManagedDoltHeld(cityPath, stderr, logPrefix, hold)
++		return
++	}
+ 	if err := healthFn(cityPath); err != nil {
+ 		fmt.Fprintf(stderr, "%s: managed dolt health preflight: %v\n", logPrefix, err) //nolint:errcheck // best-effort stderr
+ 	}
+diff --git a/cmd/gc/dolt_hold.go b/cmd/gc/dolt_hold.go
+new file mode 100644
+index 000000000..5fda955b6
+--- /dev/null
++++ b/cmd/gc/dolt_hold.go
+@@ -0,0 +1,241 @@
++package main
++
++import (
++	"errors"
++	"fmt"
++	"io"
++	"io/fs"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++)
++
++// Managed-Dolt hold (ga-3risy2).
++//
++// Stopping the managed Dolt on purpose (swapping a database directory, an
++// offline GC, a restore drill) used to be impossible without shutting the
++// whole city down: the controller tick (ensureManagedDoltPublishedForRuntime),
++// the reactive bd retry (recoverManagedBDCommandAllowed) and
++// healthBeadsProvider each re-start a stopped Dolt within seconds, and so do
++// the city's own watchdogs. A hold is the supported way to say "Dolt is down
++// on purpose; nobody starts it until I release the hold".
++//
++// The hold is a file, <pack-state-dir>/dolt-hold (GC_DOLT_HOLD_FILE
++// overrides), so that shell watchdogs and the lifecycle scripts read the very
++// same signal. Format: optional "key=value" lines, "#" starts a comment line.
++//
++//	expires_at=<unix seconds>   optional; from then on the hold is released
++//	owner=<who placed it>       optional, shown in messages
++//	reason=<free text>          optional, shown in messages
++//
++// A bare `touch` is a valid hold and lasts until the file is removed. The
++// examples/bd/assets/scripts/dolt-hold.sh helper implements the same reading
++// for shell; keep the two in step.
++//
++// There are four states, never two: no hold, active hold, expired hold, and
++// "could not tell". The last one blocks, exactly like an active hold: the
++// action a hold guards (starting or killing a Dolt on a directory somebody is
++// swapping) is the destructive one, so under doubt the inert answer is "do
++// not touch Dolt". Only a missing file (ENOENT) or an expiry that has passed
++// releases the hold.
++const managedDoltHoldFileName = "dolt-hold"
++
++// managedDoltHoldReadLimit bounds how much of the hold file is read. A real
++// hold is a few lines; the cap keeps a wrong file (a log, a dump) from being
++// slurped into memory by every tick.
++const managedDoltHoldReadLimit = 4096
++
++type managedDoltHoldState int
++
++const (
++	// managedDoltHoldNone: the hold file does not exist.
++	managedDoltHoldNone managedDoltHoldState = iota
++	// managedDoltHoldActive: the file exists and has no expiry, or an expiry
++	// still in the future.
++	managedDoltHoldActive
++	// managedDoltHoldExpired: the file exists but its expires_at has passed.
++	// Read-only: nothing here deletes the file.
++	managedDoltHoldExpired
++	// managedDoltHoldUnreadable: the file (or the path to it) could not be
++	// read or understood. Blocks, like an active hold.
++	managedDoltHoldUnreadable
++)
++
++func (s managedDoltHoldState) String() string {
++	switch s {
++	case managedDoltHoldNone:
++		return "none"
++	case managedDoltHoldActive:
++		return "active"
++	case managedDoltHoldExpired:
++		return "expired"
++	case managedDoltHoldUnreadable:
++		return "unreadable"
++	default:
++		return "unknown"
++	}
++}
++
++type managedDoltHold struct {
++	State     managedDoltHoldState
++	Path      string
++	Owner     string
++	Reason    string
++	ExpiresAt time.Time // zero when the hold has no expiry
++	Err       error     // set when State is managedDoltHoldUnreadable
++}
++
++// Blocks reports whether lifecycle actions on the managed Dolt (start,
++// recover, restart) must be refused.
++func (h managedDoltHold) Blocks() bool {
++	return h.State == managedDoltHoldActive || h.State == managedDoltHoldUnreadable
++}
++
++// Describe is the one-line human explanation used in logs and errors.
++func (h managedDoltHold) Describe() string {
++	var b strings.Builder
++	switch h.State {
++	case managedDoltHoldUnreadable:
++		fmt.Fprintf(&b, "dolt hold file %s could not be read (%v); treating it as a hold", h.Path, h.Err)
++	default:
++		fmt.Fprintf(&b, "dolt is on hold (%s)", h.Path)
++		if h.Owner != "" {
++			fmt.Fprintf(&b, " by %s", h.Owner)
++		}
++		if h.Reason != "" {
++			fmt.Fprintf(&b, ": %s", h.Reason)
++		}
++		if !h.ExpiresAt.IsZero() {
++			fmt.Fprintf(&b, "; expires %s", h.ExpiresAt.UTC().Format(time.RFC3339))
++		}
++		b.WriteString("; remove the file to release it")
++	}
++	return b.String()
++}
++
++// errManagedDoltHeld is wrapped by every error returned because a hold
++// refused a lifecycle action; callers can tell "held on purpose" from
++// "broken" with errors.Is.
++var errManagedDoltHeld = errors.New("managed dolt hold active")
++
++// managedDoltHoldNow is the clock hold expiry is judged against. Stubbable.
++var managedDoltHoldNow = time.Now
++
++// managedDoltHoldPath resolves the hold file for the city.
++func managedDoltHoldPath(cityPath string) (string, error) {
++	if override := strings.TrimSpace(os.Getenv("GC_DOLT_HOLD_FILE")); override != "" {
++		return normalizePathForCompare(override), nil
++	}
++	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
++	if err != nil {
++		return "", err
++	}
++	return filepath.Join(layout.PackStateDir, managedDoltHoldFileName), nil
++}
++
++// readManagedDoltHold reads the hold for the city. It never returns a Go
++// error: a failure to read is the managedDoltHoldUnreadable state, which
++// blocks.
++func readManagedDoltHold(cityPath string) managedDoltHold {
++	// no resolvable path → unreadable (blocks): without the path there is no
++	// way to know whether a hold exists, and the same layout is what start and
++	// recover would use.
++	path, err := managedDoltHoldPath(cityPath)
++	if err != nil {
++		return managedDoltHold{State: managedDoltHoldUnreadable, Err: err}
++	}
++	// file absent (ENOENT) → no hold; open failed for any other reason
++	// (EACCES, EIO, ENOTDIR on the parent...) → unreadable, which blocks.
++	f, err := os.Open(path)
++	if err != nil {
++		if errors.Is(err, fs.ErrNotExist) {
++			return managedDoltHold{State: managedDoltHoldNone, Path: path}
++		}
++		return managedDoltHold{State: managedDoltHoldUnreadable, Path: path, Err: err}
++	}
++	defer f.Close() //nolint:errcheck // read-only
++	// empty file → an active hold with no expiry (a bare touch); read failed
++	// (a directory, EIO) → unreadable, which blocks.
++	data, err := io.ReadAll(io.LimitReader(f, managedDoltHoldReadLimit))
++	if err != nil {
++		return managedDoltHold{State: managedDoltHoldUnreadable, Path: path, Err: err}
++	}
++	return parseManagedDoltHold(path, data, managedDoltHoldNow())
++}
++
++// parseManagedDoltHold interprets the content of an existing hold file.
++func parseManagedDoltHold(path string, data []byte, now time.Time) managedDoltHold {
++	hold := managedDoltHold{State: managedDoltHoldActive, Path: path}
++	sawExpiry := false
++	for _, line := range strings.Split(string(data), "\n") {
++		line = strings.TrimSpace(line)
++		if line == "" || strings.HasPrefix(line, "#") {
++			continue
++		}
++		key, value, ok := strings.Cut(line, "=")
++		if !ok {
++			continue
++		}
++		key = strings.TrimSpace(key)
++		value = strings.TrimSpace(value)
++		switch key {
++		case "expires_at":
++			if sawExpiry {
++				continue // first one wins; the shell reader does the same
++			}
++			sawExpiry = true
++			// no expires_at line → the hold lasts until the file is removed;
++			// an expires_at that is blank, not plain digits or <= 0 →
++			// unreadable (blocks): the hold is there, but when to release it
++			// is unknown. Digits only, so the shell reader agrees on "+5".
++			secs, err := strconv.ParseInt(value, 10, 64)
++			if err != nil || secs <= 0 || strings.Trim(value, "0123456789") != "" {
++				return managedDoltHold{
++					State: managedDoltHoldUnreadable,
++					Path:  path,
++					Err:   fmt.Errorf("expires_at=%q is not a positive unix time", value),
++				}
++			}
++			hold.ExpiresAt = time.Unix(secs, 0)
++		case "owner":
++			hold.Owner = value
++		case "reason":
++			hold.Reason = value
++		}
++	}
++	if !hold.ExpiresAt.IsZero() && !now.Before(hold.ExpiresAt) {
++		hold.State = managedDoltHoldExpired
++	}
++	return hold
++}
++
++// managedDoltHoldError is the error a refused lifecycle action returns.
++func managedDoltHoldError(h managedDoltHold) error {
++	return fmt.Errorf("%w: %s", errManagedDoltHeld, h.Describe())
++}
++
++// managedDoltHoldNoticeInterval limits how often a repeated, expected refusal
++// (the controller tick fires every few seconds) is written to the log.
++var managedDoltHoldNoticeInterval = 10 * time.Minute
++
++var managedDoltHoldNoticeLast sync.Map // normalized city path -> time.Time
++
++// noteManagedDoltHeld logs that a lifecycle action was skipped because of the
++// hold, at most once per managedDoltHoldNoticeInterval per city.
++func noteManagedDoltHeld(cityPath string, stderr io.Writer, logPrefix string, h managedDoltHold) {
++	if stderr == nil {
++		return
++	}
++	key := normalizePathForCompare(cityPath)
++	now := managedDoltHoldNow()
++	if v, ok := managedDoltHoldNoticeLast.Load(key); ok {
++		if last, ok := v.(time.Time); ok && now.Sub(last) < managedDoltHoldNoticeInterval {
++			return
++		}
++	}
++	managedDoltHoldNoticeLast.Store(key, now)
++	fmt.Fprintf(stderr, "%s: managed dolt not started/recovered: %s\n", logPrefix, h.Describe()) //nolint:errcheck // best-effort stderr
++}
+diff --git a/cmd/gc/dolt_hold_script_test.go b/cmd/gc/dolt_hold_script_test.go
+new file mode 100644
+index 000000000..27c432779
+--- /dev/null
++++ b/cmd/gc/dolt_hold_script_test.go
+@@ -0,0 +1,66 @@
++package main
++
++import (
++	"errors"
++	"io/fs"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++// The shell lifecycle script is the one door every start/recover walks
++// through (gc dolt start, gc dolt restart, the supervisor's provider ops, the
++// city's watchdogs), so it carries the hold check too (ga-3risy2). These tests
++// run the real script with a minimal environment: under a hold it must exit
++// before it takes the start lock, touches the pid file or looks for a server.
++//
++// Deliberately NOT tested here: what the script does once the hold is gone.
++// That path pgrep's for dolt servers and would start one; the release logic is
++// covered by the dolt-hold.sh table in TestReadManagedDoltHoldStates.
++func TestGCBeadsBdRefusesStartAndRecoverUnderHold(t *testing.T) {
++	if _, err := exec.LookPath("sh"); err != nil {
++		t.Skip("sh not available")
++	}
++	script := filepath.Join(repoRootForLint(t), "examples", "bd", "assets", "scripts", "gc-beads-bd.sh")
++
++	for _, op := range []string{"start", "recover"} {
++		t.Run(op, func(t *testing.T) {
++			cityPath := t.TempDir()
++			stateDir := filepath.Join(cityPath, "state")
++			if err := os.MkdirAll(stateDir, 0o755); err != nil {
++				t.Fatal(err)
++			}
++			holdFile := filepath.Join(stateDir, "dolt-hold")
++			if err := os.WriteFile(holdFile, []byte("owner=mayor\nreason=hq table swap\n"), 0o644); err != nil {
++				t.Fatal(err)
++			}
++
++			cmd := exec.Command("sh", script, op)
++			cmd.Env = []string{
++				"PATH=/usr/bin:/bin",
++				"HOME=" + cityPath,
++				"GC_CITY_PATH=" + cityPath,
++				"GC_PACK_STATE_DIR=" + stateDir,
++			}
++			out, err := cmd.CombinedOutput()
++
++			var exitErr *exec.ExitError
++			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
++				t.Fatalf("gc-beads-bd %s under a hold: err = %v, want exit 1 (exit 2 would read as success to the Go caller)\n%s", op, err, out)
++			}
++			for _, want := range []string{"refused", "on hold", "mayor", "hq table swap", "remove the file"} {
++				if !strings.Contains(string(out), want) {
++					t.Fatalf("gc-beads-bd %s output %q lacks %q", op, out, want)
++				}
++			}
++			// Nothing past the gate ran: no start lock, no pid file, no state.
++			for _, name := range []string{"dolt.lock", "dolt.pid", "dolt-provider-state.json", "dolt-config.yaml"} {
++				if _, statErr := os.Stat(filepath.Join(stateDir, name)); !errors.Is(statErr, fs.ErrNotExist) {
++					t.Fatalf("%s exists after a refused %s (stat err = %v)", name, op, statErr)
++				}
++			}
++		})
++	}
++}
+diff --git a/cmd/gc/dolt_hold_test.go b/cmd/gc/dolt_hold_test.go
+new file mode 100644
+index 000000000..c8538aea3
+--- /dev/null
++++ b/cmd/gc/dolt_hold_test.go
+@@ -0,0 +1,470 @@
++package main
++
++import (
++	"bytes"
++	"errors"
++	"fmt"
++	"io"
++	"io/fs"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/gastownhall/gascity/internal/beads"
++)
++
++// holdTestCity returns a temp city and the path its hold file resolves to,
++// with every env override that could redirect the layout cleared.
++func holdTestCity(t *testing.T) (cityPath, holdPath string) {
++	t.Helper()
++	t.Setenv("GC_PACK_STATE_DIR", "")
++	t.Setenv("GC_CITY_RUNTIME_DIR", "")
++	t.Setenv("GC_DOLT_HOLD_FILE", "")
++	cityPath = t.TempDir()
++	holdPath, err := managedDoltHoldPath(cityPath)
++	if err != nil {
++		t.Fatalf("managedDoltHoldPath(%q): %v", cityPath, err)
++	}
++	return cityPath, holdPath
++}
++
++func writeHoldFile(t *testing.T, path, content string) {
++	t.Helper()
++	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func stubManagedDoltHoldClock(t *testing.T, now time.Time) {
++	t.Helper()
++	orig := managedDoltHoldNow
++	t.Cleanup(func() { managedDoltHoldNow = orig })
++	managedDoltHoldNow = func() time.Time { return now }
++}
++
++// shellHoldBlocks runs examples/bd/assets/scripts/dolt-hold.sh against the
++// hold file at holdPath and returns what the shell side decides. The shell
++// reads the real clock, so tests that compare it with Go must not stub the Go
++// clock.
++func shellHoldBlocks(t *testing.T, holdPath string) (blocks bool, message string) {
++	t.Helper()
++	helper := filepath.Join(repoRootForLint(t), "examples", "bd", "assets", "scripts", "dolt-hold.sh")
++	script := `. "$1"; if dolt_hold_blocks; then printf 'BLOCK\n%s' "$DOLT_HOLD_MESSAGE"; else printf 'FREE\n%s' "$DOLT_HOLD_MESSAGE"; fi`
++	cmd := exec.Command("sh", "-c", script, "sh", helper)
++	cmd.Env = append(os.Environ(), "GC_DOLT_HOLD_FILE="+holdPath, "PACK_STATE_DIR=")
++	out, err := cmd.CombinedOutput()
++	if err != nil {
++		t.Fatalf("running dolt-hold.sh: %v\n%s", err, out)
++	}
++	verdict, msg, _ := strings.Cut(string(out), "\n")
++	switch verdict {
++	case "BLOCK":
++		return true, msg
++	case "FREE":
++		return false, msg
++	default:
++		t.Fatalf("dolt-hold.sh printed %q, want BLOCK/FREE", out)
++		return false, ""
++	}
++}
++
++func TestReadManagedDoltHoldStates(t *testing.T) {
++	// Real clock on purpose: the shell reader is run on every case and has no
++	// way to be told a fake time. Offsets are an hour, far from any boundary
++	// except the "exactly now" case, which is expired on both sides at any
++	// sub-second instant.
++	now := time.Now().Truncate(time.Second)
++	future := now.Add(time.Hour).Unix()
++	past := now.Add(-time.Hour).Unix()
++
++	cases := []struct {
++		name       string
++		content    string // ignored when absent
++		absent     bool
++		wantState  managedDoltHoldState
++		wantBlocks bool
++	}{
++		{name: "no file", absent: true, wantState: managedDoltHoldNone, wantBlocks: false},
++		{name: "bare touch holds until removed", content: "", wantState: managedDoltHoldActive, wantBlocks: true},
++		{name: "owner and reason only", content: "owner=mayor\nreason=table swap\n", wantState: managedDoltHoldActive, wantBlocks: true},
++		{name: "future expiry still holds", content: fmt.Sprintf("expires_at=%d\n", future), wantState: managedDoltHoldActive, wantBlocks: true},
++		{name: "expiry exactly now is released", content: fmt.Sprintf("expires_at=%d\n", now.Unix()), wantState: managedDoltHoldExpired, wantBlocks: false},
++		{name: "past expiry is released", content: fmt.Sprintf("expires_at=%d\n", past), wantState: managedDoltHoldExpired, wantBlocks: false},
++		{name: "comments blanks and unknown keys are ignored", content: fmt.Sprintf("# placed by hand\n\n  mode = swap \nnot a pair\nexpires_at = %d\n", future), wantState: managedDoltHoldActive, wantBlocks: true},
++		{name: "first expires_at wins (future then past)", content: fmt.Sprintf("expires_at=%d\nexpires_at=%d\n", future, past), wantState: managedDoltHoldActive, wantBlocks: true},
++		{name: "first expires_at wins (past then future)", content: fmt.Sprintf("expires_at=%d\nexpires_at=%d\n", past, future), wantState: managedDoltHoldExpired, wantBlocks: false},
++		{name: "blank expires_at cannot be read, blocks", content: "expires_at=\n", wantState: managedDoltHoldUnreadable, wantBlocks: true},
++		{name: "text expires_at cannot be read, blocks", content: "expires_at=tomorrow\n", wantState: managedDoltHoldUnreadable, wantBlocks: true},
++		{name: "signed expires_at cannot be read, blocks", content: fmt.Sprintf("expires_at=+%d\n", future), wantState: managedDoltHoldUnreadable, wantBlocks: true},
++		{name: "negative expires_at cannot be read, blocks", content: "expires_at=-5\n", wantState: managedDoltHoldUnreadable, wantBlocks: true},
++		{name: "zero expires_at cannot be read, blocks", content: "expires_at=0\n", wantState: managedDoltHoldUnreadable, wantBlocks: true},
++		{name: "overflowing expires_at cannot be read, blocks", content: "expires_at=99999999999999999999999\n", wantState: managedDoltHoldUnreadable, wantBlocks: true},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			cityPath, holdPath := holdTestCity(t)
++			if !tc.absent {
++				writeHoldFile(t, holdPath, tc.content)
++			}
++			if shellBlocks, msg := shellHoldBlocks(t, holdPath); shellBlocks != tc.wantBlocks {
++				t.Fatalf("dolt-hold.sh blocks = %v (%q), want %v: shell and Go readers disagree", shellBlocks, msg, tc.wantBlocks)
++			}
++			got := readManagedDoltHold(cityPath)
++			if got.State != tc.wantState {
++				t.Fatalf("state = %v, want %v (hold=%+v)", got.State, tc.wantState, got)
++			}
++			if got.Blocks() != tc.wantBlocks {
++				t.Fatalf("Blocks() = %v, want %v", got.Blocks(), tc.wantBlocks)
++			}
++			if got.State == managedDoltHoldUnreadable && got.Err == nil {
++				t.Fatalf("unreadable hold carries no Err: %+v", got)
++			}
++		})
++	}
++}
++
++func TestReadManagedDoltHoldCarriesOwnerReasonAndExpiry(t *testing.T) {
++	now := time.Date(2026, 10, 21, 3, 0, 0, 0, time.UTC)
++	stubManagedDoltHoldClock(t, now)
++	cityPath, holdPath := holdTestCity(t)
++	expires := now.Add(2 * time.Hour)
++	writeHoldFile(t, holdPath, fmt.Sprintf("owner=mayor\nreason=hq table swap\nexpires_at=%d\n", expires.Unix()))
++
++	got := readManagedDoltHold(cityPath)
++	if got.Owner != "mayor" || got.Reason != "hq table swap" || !got.ExpiresAt.Equal(expires) {
++		t.Fatalf("hold = %+v, want owner=mayor reason=%q expires=%v", got, "hq table swap", expires)
++	}
++	msg := got.Describe()
++	for _, want := range []string{holdPath, "mayor", "hq table swap", "2026-10-21T05:00:00Z", "remove the file"} {
++		if !strings.Contains(msg, want) {
++			t.Fatalf("Describe() = %q, missing %q", msg, want)
++		}
++	}
++}
++
++// A hold that cannot be READ must block exactly like one that can: the
++// action it guards is the destructive one, so "could not tell" is not "no hold".
++func TestReadManagedDoltHoldUnreadableBlocks(t *testing.T) {
++	t.Run("directory where the file should be", func(t *testing.T) {
++		cityPath, holdPath := holdTestCity(t)
++		if err := os.MkdirAll(holdPath, 0o755); err != nil {
++			t.Fatal(err)
++		}
++		got := readManagedDoltHold(cityPath)
++		if got.State != managedDoltHoldUnreadable || !got.Blocks() {
++			t.Fatalf("hold = %+v, want unreadable+blocking", got)
++		}
++		if blocks, msg := shellHoldBlocks(t, holdPath); !blocks {
++			t.Fatalf("dolt-hold.sh let a directory-in-place-of-file through: %q", msg)
++		}
++	})
++	t.Run("a file where the parent directory should be", func(t *testing.T) {
++		cityPath, holdPath := holdTestCity(t)
++		// ENOTDIR is not ENOENT: nothing says "no hold" here.
++		parent := filepath.Dir(holdPath)
++		if err := os.MkdirAll(filepath.Dir(parent), 0o755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(parent, []byte("x"), 0o644); err != nil {
++			t.Fatal(err)
++		}
++		got := readManagedDoltHold(cityPath)
++		if got.State != managedDoltHoldUnreadable || !got.Blocks() {
++			t.Fatalf("hold = %+v, want unreadable+blocking", got)
++		}
++		if blocks, msg := shellHoldBlocks(t, holdPath); !blocks {
++			t.Fatalf("dolt-hold.sh read a file-where-the-directory-should-be as \"no hold\": %q", msg)
++		}
++	})
++	t.Run("permission denied", func(t *testing.T) {
++		if os.Geteuid() == 0 {
++			t.Skip("root reads any file")
++		}
++		cityPath, holdPath := holdTestCity(t)
++		writeHoldFile(t, holdPath, "owner=x\n")
++		if err := os.Chmod(holdPath, 0o000); err != nil {
++			t.Fatal(err)
++		}
++		t.Cleanup(func() { _ = os.Chmod(holdPath, 0o644) })
++		got := readManagedDoltHold(cityPath)
++		if got.State != managedDoltHoldUnreadable || !got.Blocks() {
++			t.Fatalf("hold = %+v, want unreadable+blocking", got)
++		}
++		if blocks, msg := shellHoldBlocks(t, holdPath); !blocks {
++			t.Fatalf("dolt-hold.sh let an unreadable file through: %q", msg)
++		}
++	})
++	t.Run("city path that does not resolve", func(t *testing.T) {
++		t.Setenv("GC_PACK_STATE_DIR", "")
++		t.Setenv("GC_CITY_RUNTIME_DIR", "")
++		t.Setenv("GC_DOLT_HOLD_FILE", "")
++		got := readManagedDoltHold("")
++		if got.State != managedDoltHoldUnreadable || !got.Blocks() {
++			t.Fatalf("hold = %+v, want unreadable+blocking", got)
++		}
++	})
++}
++
++func TestManagedDoltHoldPathEnvOverride(t *testing.T) {
++	cityPath, defaultPath := holdTestCity(t)
++	override := filepath.Join(t.TempDir(), "elsewhere", "my-hold")
++	t.Setenv("GC_DOLT_HOLD_FILE", override)
++	got, err := managedDoltHoldPath(cityPath)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got != normalizePathForCompare(override) || got == defaultPath {
++		t.Fatalf("managedDoltHoldPath = %q, want the override %q (default would be %q)", got, override, defaultPath)
++	}
++	writeHoldFile(t, override, "")
++	if hold := readManagedDoltHold(cityPath); !hold.Blocks() {
++		t.Fatalf("hold at the override path does not block: %+v", hold)
++	}
++}
++
++// The gate must refuse while held WITHOUT spending its cooldown window: the
++// first real outage after the release must still get its recovery.
++func TestRecoverManagedBDCommandAllowedRefusesUnderHold(t *testing.T) {
++	origNow := recoverManagedBDCommandGateNow
++	origCooldown := recoverManagedBDCommandCooldown
++	t.Cleanup(func() {
++		recoverManagedBDCommandGateNow = origNow
++		recoverManagedBDCommandCooldown = origCooldown
++	})
++	recoverManagedBDCommandCooldown = func() time.Duration { return 30 * time.Second }
++	fixedNow := time.Date(2026, 10, 21, 3, 0, 0, 0, time.UTC)
++	recoverManagedBDCommandGateNow = func() time.Time { return fixedNow }
++
++	cityPath, holdPath := holdTestCity(t)
++	writeHoldFile(t, holdPath, "owner=mayor\n")
++
++	for i := 0; i < 3; i++ {
++		if recoverManagedBDCommandAllowed(cityPath) {
++			t.Fatalf("call %d: gate opened while the managed dolt is on hold", i+1)
++		}
++	}
++	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
++	if err != nil {
++		t.Fatal(err)
++	}
++	stamp := filepath.Join(layout.PackStateDir, recoverManagedBDCommandGateFileName)
++	if _, err := os.Stat(stamp); !errors.Is(err, fs.ErrNotExist) {
++		t.Fatalf("a refused call touched the cooldown stamp %s (stat err = %v)", stamp, err)
++	}
++
++	if err := os.Remove(holdPath); err != nil {
++		t.Fatal(err)
++	}
++	if !recoverManagedBDCommandAllowed(cityPath) {
++		t.Fatal("gate stayed closed right after the hold was released: the refused calls spent the cooldown")
++	}
++}
++
++func TestBdCommandRunnerWithManagedRetryDoesNotRecoverUnderHold(t *testing.T) {
++	t.Setenv("GC_BEADS", "bd")
++
++	origRunner := beadsExecCommandRunnerWithEnv
++	origRecover := recoverManagedBDCommand
++	t.Cleanup(func() {
++		beadsExecCommandRunnerWithEnv = origRunner
++		recoverManagedBDCommand = origRecover
++	})
++	var recoverCalls, runCalls int32
++	recoverManagedBDCommand = func(string) error {
++		atomic.AddInt32(&recoverCalls, 1)
++		return nil
++	}
++	beadsExecCommandRunnerWithEnv = func(map[string]string) beads.CommandRunner {
++		return func(string, string, ...string) ([]byte, error) {
++			atomic.AddInt32(&runCalls, 1)
++			return nil, fmt.Errorf("connection refused")
++		}
++	}
++
++	cityPath, holdPath := holdTestCity(t)
++	writeHoldFile(t, holdPath, "owner=mayor\n")
++	runner := bdCommandRunnerWithManagedRetry(cityPath, func(string) map[string]string {
++		return map[string]string{"GC_DOLT_PORT": "3307"}
++	})
++	if _, err := runner(t.TempDir(), "bd", "list", "--json"); err == nil {
++		t.Fatal("runner returned nil error although every bd attempt failed")
++	}
++	if got := atomic.LoadInt32(&recoverCalls); got != 0 {
++		t.Fatalf("recoverManagedBDCommand called %d times while held, want 0", got)
++	}
++	if got := atomic.LoadInt32(&runCalls); got != 2 {
++		t.Fatalf("bd ran %d times, want 2 (the plain retry still happens, it just does not recover)", got)
++	}
++
++	// Released: the same failure triggers recovery again.
++	if err := os.Remove(holdPath); err != nil {
++		t.Fatal(err)
++	}
++	_, _ = runner(t.TempDir(), "bd", "list", "--json")
++	if got := atomic.LoadInt32(&recoverCalls); got != 1 {
++		t.Fatalf("recoverManagedBDCommand called %d times after the release, want 1", got)
++	}
++}
++
++func holdTickRuntime(t *testing.T, healthCalls *int, stderr io.Writer) *CityRuntime {
++	t.Helper()
++	return &CityRuntime{
++		cityPath:  "/tmp/test-city",
++		logPrefix: "gc test",
++		stderr:    stderr,
++		managedDoltHealth: func(string) error {
++			*healthCalls++
++			return nil
++		},
++		managedDoltOwned: func(string) (bool, error) { return true, nil },
++		managedDoltPort:  func(string) string { return "" },
++	}
++}
++
++func TestEnsureManagedDoltPublishedForTickSkipsHealthUnderHold(t *testing.T) {
++	t.Setenv("GC_BEADS", "bd")
++	t.Setenv("GC_PACK_STATE_DIR", "")
++	t.Setenv("GC_CITY_RUNTIME_DIR", "")
++	holdFile := filepath.Join(t.TempDir(), "dolt-hold")
++	t.Setenv("GC_DOLT_HOLD_FILE", holdFile)
++	now := time.Date(2026, 10, 21, 3, 0, 0, 0, time.UTC)
++	stubManagedDoltHoldClock(t, now)
++	managedDoltHoldNoticeLast.Delete(normalizePathForCompare("/tmp/test-city"))
++
++	var stderr bytes.Buffer
++	healthCalls := 0
++	cr := holdTickRuntime(t, &healthCalls, &stderr)
++
++	// No hold: the preflight runs, as before.
++	cr.ensureManagedDoltPublishedForTick()
++	if healthCalls != 1 {
++		t.Fatalf("healthCalls = %d without a hold, want 1", healthCalls)
++	}
++
++	// Held: no health preflight, one log line no matter how many ticks.
++	writeHoldFile(t, holdFile, "owner=mayor\nreason=hq swap\n")
++	for i := 0; i < 5; i++ {
++		cr.ensureManagedDoltPublishedForTick()
++	}
++	if healthCalls != 1 {
++		t.Fatalf("healthCalls = %d after 5 held ticks, want still 1", healthCalls)
++	}
++	if n := strings.Count(stderr.String(), "managed dolt not started/recovered"); n != 1 {
++		t.Fatalf("hold notice logged %d times in 5 ticks, want 1; stderr=%q", n, stderr.String())
++	}
++	if !strings.Contains(stderr.String(), "hq swap") {
++		t.Fatalf("hold notice lacks the reason: %q", stderr.String())
++	}
++
++	// The notice repeats once the interval passes, so a long hold stays visible.
++	stubManagedDoltHoldClock(t, now.Add(managedDoltHoldNoticeInterval+time.Second))
++	cr.ensureManagedDoltPublishedForTick()
++	if n := strings.Count(stderr.String(), "managed dolt not started/recovered"); n != 2 {
++		t.Fatalf("hold notice logged %d times after the interval, want 2", n)
++	}
++
++	// An unreadable hold file holds too.
++	writeHoldFile(t, holdFile, "expires_at=soon\n")
++	cr.ensureManagedDoltPublishedForTick()
++	if healthCalls != 1 {
++		t.Fatalf("healthCalls = %d with an unreadable hold, want 1 (blocked)", healthCalls)
++	}
++
++	// Released (file gone): the next tick recovers.
++	if err := os.Remove(holdFile); err != nil {
++		t.Fatal(err)
++	}
++	cr.ensureManagedDoltPublishedForTick()
++	if healthCalls != 2 {
++		t.Fatalf("healthCalls = %d after release, want 2", healthCalls)
++	}
++}
++
++func TestEnsureManagedDoltPublishedForTickRecoversWhenHoldExpired(t *testing.T) {
++	t.Setenv("GC_BEADS", "bd")
++	t.Setenv("GC_PACK_STATE_DIR", "")
++	t.Setenv("GC_CITY_RUNTIME_DIR", "")
++	holdFile := filepath.Join(t.TempDir(), "dolt-hold")
++	t.Setenv("GC_DOLT_HOLD_FILE", holdFile)
++	now := time.Date(2026, 10, 21, 3, 0, 0, 0, time.UTC)
++	stubManagedDoltHoldClock(t, now)
++	writeHoldFile(t, holdFile, fmt.Sprintf("expires_at=%d\n", now.Add(-time.Minute).Unix()))
++
++	healthCalls := 0
++	cr := holdTickRuntime(t, &healthCalls, io.Discard)
++	cr.ensureManagedDoltPublishedForTick()
++	if healthCalls != 1 {
++		t.Fatalf("healthCalls = %d with an expired hold, want 1 (expiry releases the hold)", healthCalls)
++	}
++}
++
++func TestHealthBeadsProviderDoesNotRecoverUnderHold(t *testing.T) {
++	cityPath, holdPath := holdTestCity(t)
++	writeMinimalCityToml(t, cityPath)
++	opsFile := writeBreakerAwarePreflightFakes(t, cityPath, "unhealthy")
++	cityKey := normalizePathForCompare(cityPath)
++	t.Cleanup(func() { lastBeadsProviderRecover.Delete(cityKey) })
++	writeHoldFile(t, holdPath, "owner=mayor\nreason=hq swap\n")
++
++	err := healthBeadsProvider(cityPath)
++	if !errors.Is(err, errManagedDoltHeld) {
++		t.Fatalf("healthBeadsProvider() error = %v, want errManagedDoltHeld", err)
++	}
++	if !strings.Contains(err.Error(), "unhealthy") {
++		t.Fatalf("error %q hides the underlying health failure", err)
++	}
++	ops, readErr := os.ReadFile(opsFile)
++	if readErr != nil {
++		t.Fatalf("read provider ops: %v", readErr)
++	}
++	if got := strings.Fields(strings.TrimSpace(string(ops))); len(got) != 1 || got[0] != "health" {
++		t.Fatalf("provider ops = %v, want only [health] (recover must not run under a hold)", got)
++	}
++	if _, loaded := lastBeadsProviderRecover.Load(cityKey); loaded {
++		t.Fatal("a refused recover stamped lastBeadsProviderRecover: the cooldown would block the post-release recovery")
++	}
++
++	// Released: the next call recovers at once.
++	if err := os.Remove(holdPath); err != nil {
++		t.Fatal(err)
++	}
++	_ = healthBeadsProvider(cityPath)
++	ops, readErr = os.ReadFile(opsFile)
++	if readErr != nil {
++		t.Fatalf("read provider ops: %v", readErr)
++	}
++	if _, r := countOps(strings.Fields(strings.TrimSpace(string(ops))), "health", "recover"); r != 1 {
++		t.Fatalf("provider ops = %q, want exactly one recover after the release", ops)
++	}
++}
++
++// Both low-level entry points refuse before they touch anything: recover would
++// otherwise stop a running server first, start would spawn one.
++func TestManagedDoltLifecycleEntryPointsRefuseUnderHold(t *testing.T) {
++	cityPath, holdPath := holdTestCity(t)
++	writeHoldFile(t, holdPath, "owner=mayor\n")
++	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if _, err := startManagedDoltProcess(cityPath, "127.0.0.1", "3399", "root", "", 5*time.Second); !errors.Is(err, errManagedDoltHeld) {
++		t.Fatalf("startManagedDoltProcess() error = %v, want errManagedDoltHeld", err)
++	}
++	if _, err := recoverManagedDoltProcess(cityPath, "127.0.0.1", "3399", "root", "", 5*time.Second); !errors.Is(err, errManagedDoltHeld) {
++		t.Fatalf("recoverManagedDoltProcess() error = %v, want errManagedDoltHeld", err)
++	}
++	// Neither got as far as the lifecycle lock, the config file or the log.
++	for _, p := range []string{layout.LockFile, layout.ConfigFile, layout.LogFile, layout.PIDFile} {
++		if _, err := os.Stat(p); !errors.Is(err, fs.ErrNotExist) {
++			t.Fatalf("%s exists after a refused lifecycle call (stat err = %v)", p, err)
++		}
++	}
++}
+diff --git a/cmd/gc/dolt_recover_managed.go b/cmd/gc/dolt_recover_managed.go
+index 676d60b8b..9e52b4f58 100644
+--- a/cmd/gc/dolt_recover_managed.go
++++ b/cmd/gc/dolt_recover_managed.go
+@@ -42,6 +42,11 @@ func recoverManagedDoltProcess(cityPath, host, port, user, logLevel string, time
+ 	}
+ 
+ 	report := managedDoltRecoverReport{}
++	// Recovery stops a running Dolt before it starts a new one; under a hold
++	// it must not even do the stop (ga-3risy2).
++	if hold := readManagedDoltHold(cityPath); hold.Blocks() {
++		return report, managedDoltHoldError(hold)
++	}
+ 	lockFile, layout, err := openManagedDoltLifecycleLock(cityPath)
+ 	if err != nil {
+ 		return report, err
+diff --git a/cmd/gc/dolt_start_managed.go b/cmd/gc/dolt_start_managed.go
+index 50f8391d8..85c029299 100644
+--- a/cmd/gc/dolt_start_managed.go
++++ b/cmd/gc/dolt_start_managed.go
+@@ -123,6 +123,11 @@ func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel str
+ 	if err != nil {
+ 		return managedDoltStartReport{}, err
+ 	}
++	// Last line of defence behind the call-site checks (ga-3risy2): every
++	// route that spawns the managed Dolt ends here.
++	if hold := readManagedDoltHold(cityPath); hold.Blocks() {
++		return managedDoltStartReport{}, managedDoltHoldError(hold)
++	}
+ 	if err := checkManagedDoltDiskPreflight(layout.DataDir, doltDiskMinFreeBytes(), doltDiskWarnFreeBytes(), os.Stderr); err != nil {
+ 		return managedDoltStartReport{}, err
+ 	}
+diff --git a/examples/bd/assets/scripts/dolt-hold.sh b/examples/bd/assets/scripts/dolt-hold.sh
+new file mode 100644
+index 000000000..d5da26267
+--- /dev/null
++++ b/examples/bd/assets/scripts/dolt-hold.sh
+@@ -0,0 +1,139 @@
++#!/bin/sh
++
++# dolt_hold_blocks returns 0 (true) when a managed-Dolt hold forbids starting,
++# recovering or restarting the server, and sets DOLT_HOLD_MESSAGE to a one-line
++# explanation. It returns 1 (false) when there is no hold, or the hold has
++# expired.
++#
++# A hold means "Dolt is down on purpose": a database directory is being
++# swapped, a GC is running offline, a restore is being rehearsed. Without it the
++# controller tick, the bd retry and the city's watchdogs bring a stopped Dolt
++# back within seconds (ga-3risy2).
++#
++# The hold is the file $PACK_STATE_DIR/dolt-hold (GC_DOLT_HOLD_FILE overrides).
++# Same file and same rules as cmd/gc/dolt_hold.go; keep the two in step:
++#   - optional "key=value" lines, "#" starts a comment line;
++#   - expires_at=<unix seconds, digits only> releases the hold at that time;
++#   - owner= and reason= are shown in the message;
++#   - an empty file (a bare touch) holds until it is removed.
++#
++# There are three answers, not two: no hold, hold, and "could not tell". The
++# last one blocks. What a hold guards is the destructive action (starting or
++# killing a Dolt on a directory somebody is swapping), so under doubt the inert
++# answer is "do not touch Dolt". Only an absent file or a passed expiry
++# releases it.
++#
++# Needs PACK_STATE_DIR unless GC_DOLT_HOLD_FILE is set. Read-only: it never
++# removes an expired file.
++dolt_hold_blocks() {
++    DOLT_HOLD_MESSAGE=""
++    _dh_file="${GC_DOLT_HOLD_FILE:-}"
++    if [ -z "$_dh_file" ]; then
++        if [ -z "${PACK_STATE_DIR:-}" ]; then
++            # No path to look at: cannot know whether a hold exists.
++            DOLT_HOLD_MESSAGE="dolt hold: pack state dir unknown, cannot look for the hold file; treating it as a hold"
++            return 0
++        fi
++        _dh_file="$PACK_STATE_DIR/dolt-hold"
++    fi
++
++    # Parent directory absent -> nobody can have placed a hold there. Parent
++    # present but not a directory, or not searchable -> unreadable (blocks),
++    # as ENOTDIR/EACCES are in Go. File absent -> no hold. File present but not
++    # a readable regular file -> unreadable. (Only the immediate parent is
++    # checked; a regular file further up the path reads as "absent" here.)
++    _dh_dir=$(dirname "$_dh_file")
++    if [ ! -e "$_dh_dir" ] && [ ! -h "$_dh_dir" ]; then
++        return 1
++    fi
++    if [ ! -d "$_dh_dir" ]; then
++        DOLT_HOLD_MESSAGE="dolt hold file $_dh_file could not be read ($_dh_dir is not a directory); treating it as a hold"
++        return 0
++    fi
++    if [ ! -x "$_dh_dir" ]; then
++        DOLT_HOLD_MESSAGE="dolt hold file $_dh_file could not be read (directory not searchable); treating it as a hold"
++        return 0
++    fi
++    if [ ! -e "$_dh_file" ] && [ ! -h "$_dh_file" ]; then
++        return 1
++    fi
++    if [ ! -f "$_dh_file" ] || [ ! -r "$_dh_file" ]; then
++        DOLT_HOLD_MESSAGE="dolt hold file $_dh_file could not be read (not a readable regular file); treating it as a hold"
++        return 0
++    fi
++
++    # Empty file -> hold with no expiry; read failure -> unreadable (blocks).
++    # Capped at 4 KiB like the Go reader, so a wrong file is not slurped.
++    if ! _dh_content=$(LC_ALL=C head -c 4096 "$_dh_file" 2>/dev/null); then
++        DOLT_HOLD_MESSAGE="dolt hold file $_dh_file could not be read; treating it as a hold"
++        return 0
++    fi
++
++    _dh_expires=""
++    _dh_owner=""
++    _dh_reason=""
++    _dh_saw_expiry=0
++    while IFS= read -r _dh_line; do
++        _dh_line=${_dh_line#"${_dh_line%%[![:space:]]*}"}
++        _dh_line=${_dh_line%"${_dh_line##*[![:space:]]}"}
++        case "$_dh_line" in
++            ''|'#'*) continue ;;
++            *=*) ;;
++            *) continue ;;
++        esac
++        _dh_key=${_dh_line%%=*}
++        _dh_val=${_dh_line#*=}
++        _dh_key=${_dh_key%"${_dh_key##*[![:space:]]}"}
++        _dh_val=${_dh_val#"${_dh_val%%[![:space:]]*}"}
++        case "$_dh_key" in
++            expires_at)
++                [ "$_dh_saw_expiry" -eq 1 ] && continue # first one wins, as in Go
++                _dh_saw_expiry=1
++                # No expires_at line -> holds until removed. Blank, non-digit
++                # or zero -> unreadable (blocks): the hold is there but when
++                # to release it is unknown.
++                case "$_dh_val" in
++                    ''|*[!0-9]*)
++                        DOLT_HOLD_MESSAGE="dolt hold file $_dh_file has expires_at='$_dh_val' (not a positive unix time); treating it as a hold"
++                        return 0
++                        ;;
++                esac
++                if ! [ "$_dh_val" -gt 0 ] 2>/dev/null; then
++                    DOLT_HOLD_MESSAGE="dolt hold file $_dh_file has expires_at='$_dh_val' (not a positive unix time); treating it as a hold"
++                    return 0
++                fi
++                _dh_expires="$_dh_val"
++                ;;
++            owner) _dh_owner="$_dh_val" ;;
++            reason) _dh_reason="$_dh_val" ;;
++        esac
++    done <<EOF
++$_dh_content
++EOF
++
++    if [ -n "$_dh_expires" ]; then
++        _dh_now=$(date +%s 2>/dev/null) || _dh_now=""
++        case "$_dh_now" in
++            ''|*[!0-9]*)
++                # The clock could not be read: cannot tell whether it expired.
++                DOLT_HOLD_MESSAGE="dolt hold file $_dh_file has an expiry but the clock could not be read; treating it as a hold"
++                return 0
++                ;;
++        esac
++        if [ "$_dh_now" -ge "$_dh_expires" ]; then
++            return 1 # expired -> released
++        fi
++    fi
++
++    DOLT_HOLD_MESSAGE="dolt is on hold ($_dh_file)"
++    [ -n "$_dh_owner" ] && DOLT_HOLD_MESSAGE="$DOLT_HOLD_MESSAGE by $_dh_owner"
++    [ -n "$_dh_reason" ] && DOLT_HOLD_MESSAGE="$DOLT_HOLD_MESSAGE: $_dh_reason"
++    if [ -n "$_dh_expires" ]; then
++        _dh_when=$(date -u -r "$_dh_expires" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) \
++            || _dh_when=$(date -u -d "@$_dh_expires" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) \
++            || _dh_when="unix $_dh_expires"
++        DOLT_HOLD_MESSAGE="$DOLT_HOLD_MESSAGE; expires $_dh_when"
++    fi
++    DOLT_HOLD_MESSAGE="$DOLT_HOLD_MESSAGE; remove the file to release it"
++    return 0
++}
+diff --git a/examples/bd/assets/scripts/gc-beads-bd.sh b/examples/bd/assets/scripts/gc-beads-bd.sh
+index 038baf936..fed703b9b 100755
+--- a/examples/bd/assets/scripts/gc-beads-bd.sh
++++ b/examples/bd/assets/scripts/gc-beads-bd.sh
+@@ -1908,6 +1908,14 @@ op_start() {
+         exit 2
+     fi
+ 
++    # A hold is "Dolt is down on purpose" (ga-3risy2). Refuse before anything
++    # is touched: no identity setup, no lock, and no kill of a server that is
++    # running but not reusable. Exit 1 (not 2: the Go side reads 2 as "not
++    # needed", i.e. success).
++    if dolt_hold_blocks; then
++        die "dolt start refused: $DOLT_HOLD_MESSAGE"
++    fi
++
+     local gc_helper_bin
+     gc_helper_bin=$(resolve_gc_helper_bin)
+ 
+@@ -2679,6 +2687,23 @@ else
+     }
+ fi
+ 
++# Managed-Dolt hold (ga-3risy2): a file that says "Dolt is down on purpose,
++# nobody starts it". op_start and op_recover refuse while it holds. Same
++# sibling-helper pattern as dolt-enospc.sh above.
++hold_helper="$(CDPATH= cd -- "$(dirname "$0")" && pwd)/dolt-hold.sh"
++if [ -r "$hold_helper" ]; then
++    . "$hold_helper"
++else
++    # Focused harnesses run this prelude without sibling assets. Production
++    # always has dolt-hold.sh next to this script. The fallback can only block
++    # MORE than the helper (the file's mere presence holds; expiry is not
++    # read), never less.
++    dolt_hold_blocks() {
++        DOLT_HOLD_MESSAGE="dolt hold file present (${PACK_STATE_DIR:-}/dolt-hold)"
++        [ -n "${PACK_STATE_DIR:-}" ] && [ -e "${GC_DOLT_HOLD_FILE:-$PACK_STATE_DIR/dolt-hold}" ]
++    }
++fi
++
+ # op_recover stops the dolt server, restarts it, and verifies health.
+ op_recover() {
+     local read_only_status
+@@ -2687,6 +2712,12 @@ op_recover() {
+         die "recovery not supported for remote dolt servers"
+     fi
+ 
++    # Recovery stops a running server before it starts a new one; under a
++    # hold it must not do the stop either (ga-3risy2).
++    if dolt_hold_blocks; then
++        die "dolt recovery refused: $DOLT_HOLD_MESSAGE"
++    fi
++
+     # Skip auto-recovery when dolt has been failing due to disk exhaustion.
+     # Restarting dolt does not free disk space, and the recovery cycle
+     # itself amplifies the failure: each restart triggers a conjoin/backup
+diff --git a/examples/dolt/commands/restart/run.sh b/examples/dolt/commands/restart/run.sh
+index 0a006747a..815d56f07 100755
+--- a/examples/dolt/commands/restart/run.sh
++++ b/examples/dolt/commands/restart/run.sh
+@@ -49,6 +49,20 @@ LOG_FILE="${GC_DOLT_LOG_FILE:-$PACK_STATE_DIR/dolt.log}"
+ BD_SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$GC_BEADS_BD_SCRIPT")" && pwd)"
+ . "$BD_SCRIPT_DIR/dolt-enospc.sh"
+ 
++# A managed-Dolt hold (ga-3risy2) means Dolt is down on purpose. Refuse BEFORE
++# the stop below: gc-beads-bd start would refuse too, but only after the stop
++# had already taken a running server down. --force does not override a hold;
++# remove the hold file instead. The helper is read when present; harnesses
++# that ship only gc-beads-bd skip this early check and still get the refusal
++# from gc-beads-bd start.
++if [ -r "$BD_SCRIPT_DIR/dolt-hold.sh" ]; then
++  . "$BD_SCRIPT_DIR/dolt-hold.sh"
++  if dolt_hold_blocks; then
++    echo "gc dolt restart: refused: $DOLT_HOLD_MESSAGE" >&2
++    exit 1
++  fi
++fi
++
+ if recovery_should_skip_due_to_enospc; then
+   if [ "$force_restart" != "true" ]; then
+     echo "gc dolt restart: recent Dolt log shows ENOSPC; refusing restart because it can amplify recovery writes" >&2
+diff --git a/examples/dolt/restart_test.go b/examples/dolt/restart_test.go
+index faf328de8..6e917a791 100644
+--- a/examples/dolt/restart_test.go
++++ b/examples/dolt/restart_test.go
+@@ -255,3 +255,83 @@ func TestRestartRejectsRemoteHostWithDiagnostic(t *testing.T) {
+ 		t.Fatalf("restart invoked gc-beads-bd despite remote-host refusal; ops log:\n%s\noutput:\n%s", data, out)
+ 	}
+ }
++
++// installHoldHelperForRestart copies the real dolt-hold.sh next to the fake
++// gc-beads-bd, the way the materialized bd pack ships it.
++func installHoldHelperForRestart(t *testing.T, cityPath, root string) {
++	t.Helper()
++	src, err := os.ReadFile(filepath.Join(root, "..", "bd", "assets", "scripts", "dolt-hold.sh"))
++	if err != nil {
++		t.Fatalf("read dolt-hold.sh: %v", err)
++	}
++	dst := filepath.Join(cityPath, ".gc", "system", "packs", "bd", "assets", "scripts", "dolt-hold.sh")
++	if err := os.WriteFile(dst, src, 0o644); err != nil {
++		t.Fatalf("write dolt-hold.sh: %v", err)
++	}
++}
++
++func writeRestartHold(t *testing.T, cityPath, content string) {
++	t.Helper()
++	holdDir := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt")
++	if err := os.MkdirAll(holdDir, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(holdDir, "dolt-hold"), []byte(content), 0o644); err != nil {
++		t.Fatal(err)
++	}
++}
++
++// A managed-Dolt hold (ga-3risy2) means Dolt is down on purpose. restart must
++// refuse BEFORE its stop step: refusing at start would already have taken a
++// running server down. --force is for ENOSPC evidence, not for holds.
++func TestRestartRefusesUnderHoldBeforeStopping(t *testing.T) {
++	for _, args := range [][]string{nil, {"--force"}} {
++		name := "plain"
++		if len(args) > 0 {
++			name = strings.Join(args, " ")
++		}
++		t.Run(name, func(t *testing.T) {
++			root := repoRoot(t)
++			cityPath := t.TempDir()
++			bdLog := writeFakeBeadsBDForRestart(t, cityPath, map[string]int{"stop": 0, "start": 0})
++			installHoldHelperForRestart(t, cityPath, root)
++			writeRestartHold(t, cityPath, "owner=mayor\nreason=hq table swap\n")
++
++			out, err := runRestartWithEnv(t, cityPath, root, nil, args...)
++			if err == nil {
++				t.Fatalf("gc dolt restart %v succeeded under a hold:\n%s", args, out)
++			}
++			for _, want := range []string{"refused", "on hold", "mayor", "hq table swap"} {
++				if !strings.Contains(string(out), want) {
++					t.Fatalf("output lacks %q:\n%s", want, out)
++				}
++			}
++			if data, readErr := os.ReadFile(bdLog); readErr == nil && strings.TrimSpace(string(data)) != "" {
++				t.Fatalf("restart ran lifecycle ops under a hold: %q", data)
++			}
++		})
++	}
++}
++
++func TestRestartProceedsOnceHoldExpired(t *testing.T) {
++	root := repoRoot(t)
++	port, cleanup := startReachableTCPListener(t)
++	defer cleanup()
++
++	cityPath := t.TempDir()
++	bdLog := writeFakeBeadsBDForRestart(t, cityPath, map[string]int{"stop": 0, "start": 0})
++	installHoldHelperForRestart(t, cityPath, root)
++	writeRestartHold(t, cityPath, "expires_at=1\nowner=mayor\n") // 1970: long gone
++
++	out, err := runRestart(t, cityPath, root, port)
++	if err != nil {
++		t.Fatalf("gc dolt restart refused with an expired hold: %v\n%s", err, out)
++	}
++	data, err := os.ReadFile(bdLog)
++	if err != nil {
++		t.Fatalf("read fake bd log: %v", err)
++	}
++	if got := strings.Join(strings.Fields(string(data)), " "); got != "stop start" {
++		t.Fatalf("expected ops 'stop start' after the hold expired, got %q\n%s", got, out)
++	}
++}

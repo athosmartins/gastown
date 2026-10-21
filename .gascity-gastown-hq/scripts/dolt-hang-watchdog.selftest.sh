@@ -270,14 +270,15 @@ else
   bad "nao achei o script ao lado — asserts do ramo de recuperacao nao rodaram"
 fi
 
-# (b) checagem estatica de cobertura: os 5 pontos de mutacao conhecidos (recuperacao
-# saudavel, saturacao, escrita de strike, veto/restart, ga-xyhl9d PID-change forensic
-# capture) tem de estar TODOS atras do mesmo helper — nao 4 de 5, que foi exatamente
-# o estado que passou pelo attempt 1 quando era 3 de 4.
+# (b) checagem estatica de cobertura: os 6 pontos de mutacao conhecidos (HOLD do Dolt
+# ga-3risy2 — apaga strikes/veto/lastpid —, recuperacao saudavel, saturacao, escrita de
+# strike, veto/restart, ga-xyhl9d PID-change forensic capture) tem de estar TODOS atras do
+# mesmo helper — nao 4 de 5, que foi exatamente o estado que passou pelo attempt 1 quando
+# era 3 de 4.
 if [ -f "$SRC" ]; then
   _gate_count=$(grep -cE '^[[:space:]]*if is_dry_run' "$SRC")
-  [ "$_gate_count" -eq 5 ] && ok "5/5 pontos de mutacao conhecidos usam is_dry_run (nenhum novo ficou de fora)" \
-                            || bad "regressao: esperava 5 call-sites de 'if is_dry_run', achei ${_gate_count} — algum ramo de mutacao ficou sem gate"
+  [ "$_gate_count" -eq 6 ] && ok "6/6 pontos de mutacao conhecidos usam is_dry_run (nenhum novo ficou de fora)" \
+                            || bad "regressao: esperava 6 call-sites de 'if is_dry_run', achei ${_gate_count} — algum ramo de mutacao ficou sem gate"
 fi
 
 # ── ga-xyhl9d (sling ga-oyw1tw): PID-change/death forensic snapshot.
@@ -847,6 +848,7 @@ if [ -f "$SRC" ]; then
 D="$FAKE_DIR"
 case "${1:-} ${2:-}" in
   "dolt health")
+    echo x >> "$D/health_calls"   # ga-3risy2: quantas sondas o script fez (sob hold tem de ser 0)
     if [ "$(cat "$D/health" 2>/dev/null)" = up ]; then echo '{"server":{"reachable":true}}'
     else echo '{"server":{"reachable":false}}'; fi
     exit 0 ;;
@@ -921,9 +923,10 @@ PYF
         DOLT_WATCHDOG_MAX_STRIKES=1 DOLT_WATCHDOG_PROBE_TIMEOUT=5 DOLT_WATCHDOG_SERVE_CONFIRM=2 \
         BEADS_DOLT_PORT=1 DOLT_WATCHDOG_POST_RESTART_WAIT=0 \
         ESCALATE_DRY_RUN=1 GC_LEDGER_DIR="$_sd/ledger" \
-        "$@" bash "$SRC" >/dev/null 2>&1
+        GC_DOLT_HOLD_FILE="$_sd/hold" \
+        "$@" bash "${SIM_SRC:-$SRC}" >/dev/null 2>&1
   }
-  _reset()    { chmod -R u+rwx "$_sd/state" 2>/dev/null; rm -rf "$_sd/state" "$_sd/l" "$_sd/restarts" "$_sd/refuse" "$_sd/escalate_fail" "$_sd/notify.log" "$_sd/lastpid"; mkdir -p "$_sd/state"
+  _reset()    { chmod -R u+rwx "$_sd/state" 2>/dev/null; rm -rf "$_sd/state" "$_sd/l" "$_sd/restarts" "$_sd/refuse" "$_sd/escalate_fail" "$_sd/notify.log" "$_sd/lastpid" "$_sd/hold" "$_sd/health_calls"; mkdir -p "$_sd/state"
                 echo down > "$_sd/health"; echo "${1:-down}" > "$_sd/after_restart"; echo "$_dpid" > "$_pidfile"; }
   _restarts() { cat "$_sd/restarts" 2>/dev/null || echo 0; }
   _pages()    { grep -c '\[ESCALATE\] \[DRY_RUN\]' "$_sd/l" 2>/dev/null || true; }
@@ -1068,6 +1071,63 @@ PYF
   [ "$(_restarts)" = "1" ] && _alive && [ ! -e "$_sd/got_quit" ] && grep -q 'DOLT_DUMP=1 but the Dolt PID is unknown' "$_sd/l" \
     && ok "H: DOLT_DUMP=1 e PID desconhecido -> nao chuta PID nenhum, restart segue sem dump" \
     || bad "H: PID desconhecido com DOLT_DUMP=1 sinalizou alguem, ou travou o restart"
+
+  # --- HOLD (ga-3risy2). Dolt parado DE PROPOSITO: nada de sonda, strike, restart, page ou sinal. ---
+  # Sem o hold, um Dolt parado para uma troca de pasta vira "3 strikes -> gc dolt restart", e o restart
+  # religa o Dolt por cima da pasta em troca. Aqui o Dolt esta fora (health=down), MAX_STRIKES=1, e o
+  # hold e um arquivo no caminho que o script le (GC_DOLT_HOLD_FILE, em scratch — nunca o da cidade).
+  _seed_state() { echo 2 > "$_sd/state/s"; echo 3 > "$_sd/state/v"; echo 99999 > "$_sd/lastpid"; }
+
+  _reset up
+  printf 'owner=mayor\nreason=troca do hq\n' > "$_sd/hold"
+  _seed_state
+  for _i in 1 2 3 4 5; do _sim; done
+  [ "$(_restarts)" = "0" ] && [ ! -e "$_sd/health_calls" ] && [ "$(_pages)" = "0" ] && _alive && [ ! -e "$_sd/got_quit" ] \
+    && ok "HOLD: Dolt fora + hold em vigor, 5 ticks -> 0 sondas, 0 restarts, 0 pages, nenhum sinal (sem hold seriam 3 strikes -> gc dolt restart)" \
+    || bad "HOLD: ga-3risy2 — o watchdog agiu sob hold (restarts=$(_restarts) sondas=$([ -e "$_sd/health_calls" ] && wc -l < "$_sd/health_calls" | tr -d ' ' || echo 0) pages=$(_pages))"
+  grep -q 'HOLD em vigor' "$_sd/l" && grep -q 'troca do hq' "$_sd/l" && grep -q 'mayor' "$_sd/l" \
+    && ok "HOLD: o log diz que o hold segurou, de quem e por que (nao e silencio)" \
+    || bad "HOLD: o log nao explica o hold: $(tail -1 "$_sd/l" 2>/dev/null)"
+  [ ! -e "$_sd/state/s" ] && [ ! -e "$_sd/state/v" ] && [ ! -e "$_sd/lastpid" ] \
+    && ok "HOLD: strikes, veto de CPU e linha de base do PID zerados (nada de estado velho no dia da soltura)" \
+    || bad "HOLD: estado velho sobreviveu ao hold (strikes=$([ -e "$_sd/state/s" ] && echo sim || echo nao) veto=$([ -e "$_sd/state/v" ] && echo sim || echo nao) lastpid=$([ -e "$_sd/lastpid" ] && echo sim || echo nao))"
+
+  # o mesmo cenario com DRY-RUN: diz o que faria e nao escreve nada (mesma promessa de todo ponto de escrita do arquivo)
+  _reset up; printf 'owner=mayor\n' > "$_sd/hold"; _seed_state
+  _sim DOLT_WATCHDOG_DRY_RUN=1
+  [ -e "$_sd/state/s" ] && [ -e "$_sd/state/v" ] && [ -e "$_sd/lastpid" ] && grep -q 'DRY-RUN: HOLD em vigor' "$_sd/l" && [ "$(_restarts)" = "0" ] \
+    && ok "HOLD: dry run -> relata o hold e NAO apaga strikes/veto/lastpid" \
+    || bad "HOLD: dry run mexeu no estado sob hold ($(tail -1 "$_sd/l" 2>/dev/null))"
+
+  # hold com validade no futuro segura; hold ilegivel (validade que nao e numero) tambem
+  for _c in "expires_at=$(( $(date +%s) + 3600 ))" "expires_at=amanha" "expires_at=" "expires_at=0"; do
+    _reset up; printf '%s\n' "$_c" > "$_sd/hold"
+    _sim
+    [ "$(_restarts)" = "0" ] && [ ! -e "$_sd/health_calls" ] \
+      && ok "HOLD: '$_c' -> segura (valida, ou ilegivel: sob duvida nao mexe no Dolt)" \
+      || bad "HOLD: ga-3risy2 — '$_c' nao segurou (restarts=$(_restarts))"
+  done
+
+  # hold VENCIDO e hold REMOVIDO soltam: o fluxo normal volta e o hang confirmado reinicia.
+  _reset up; printf 'owner=mayor\nexpires_at=%s\n' "$(( $(date +%s) - 60 ))" > "$_sd/hold"
+  _sim
+  [ "$(_restarts)" = "1" ] && ok "HOLD: validade vencida solta -> o watchdog volta a agir (hang confirmado -> 1 restart)" \
+                           || bad "HOLD: hold vencido continuou segurando (restarts=$(_restarts))"
+  _reset up; printf 'owner=mayor\n' > "$_sd/hold"; _sim; rm -f "$_sd/hold"; echo down > "$_sd/health"; rm -rf "$_sd/state"; mkdir -p "$_sd/state"
+  _sim
+  [ "$(_restarts)" = "1" ] && ok "HOLD: arquivo removido solta -> o watchdog volta a agir no tick seguinte" \
+                           || bad "HOLD: removido o hold, o watchdog nao voltou a agir (restarts=$(_restarts))"
+
+  # sem a lib do hold (checkout quebrado): "nao sei" SEGURA, e diz isso no log — nunca cai no fluxo antigo.
+  _nolib=$(mktemp -d)
+  cp "$SRC" "$_nolib/dolt-hang-watchdog.sh"; cp "$(dirname "$SRC")/dolt-pid-lib.sh" "$_nolib/"
+  _reset up
+  SIM_SRC="$_nolib/dolt-hang-watchdog.sh" _sim
+  [ "$(_restarts)" = "0" ] && [ ! -e "$_sd/health_calls" ] && grep -q 'dolt-hold-lib.sh ilegível' "$_sd/l" \
+    && ok "HOLD: sem dolt-hold-lib.sh ao lado do script -> trata como hold e DIZ por que (nao reinicia no escuro)" \
+    || bad "HOLD: sem a lib o watchdog agiu ou ficou mudo (restarts=$(_restarts); $(tail -1 "$_sd/l" 2>/dev/null))"
+  rm -rf "$_nolib"
+  _reset up   # deixa o cenario do caso I como estava
 
   # --- I. DOLT_DUMP=1 com PID conhecido: AGORA sim o SIGQUIT chega (ultimo: mata o sacrificial). ---
   _reset up

@@ -3199,6 +3199,10 @@ echo "=== _resurrect_dolt: escalation cooldown (ga-f4l2z, mirrors ga-q4cqr) ==="
 # STATE_TMP (which main()'s own scenarios set up later).
 RESURRECT_TEST_DIR="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-resurrect.XXXXXX)"
 STATE_RESURRECT_ESCALATE_FILE="$RESURRECT_TEST_DIR/.last-resurrect-escalate"
+# ga-3risy2: o hold do Dolt e lido de GC_DOLT_HOLD_FILE quando setado — em scratch, para estes testes
+# nunca olharem o hold da cidade de verdade (a sessao que roda o selftest pode ter GC_CITY_RUNTIME_DIR
+# apontando para o runtime real). Sem arquivo ali = sem hold, que e o que as secoes antigas assumem.
+export GC_DOLT_HOLD_FILE="$RESURRECT_TEST_DIR/hold"
 
 # Fake escalator script that just records it was called (never the real
 # escalate_emergency.py — no real page, no real ledger write, no real mail).
@@ -3294,6 +3298,69 @@ if [ "$NOTIFY_SUCCESS_CALLS" = "1" ] && [ "$CALLS_AFTER_SUCCESS" = "$CALLS_BEFOR
 else
   bad "_resurrect_dolt: success path wrong (notify_calls=$NOTIFY_SUCCESS_CALLS escalator_calls_before=$CALLS_BEFORE_SUCCESS after=$CALLS_AFTER_SUCCESS)"
 fi
+
+# ── ga-3risy2: _resurrect_dolt com o Dolt em HOLD (parado de proposito) ──────────────────────
+# Sem o desvio, um Dolt parado para uma troca de pasta e lido como "queda confirmada" e este guard
+# roda `gc dolt start` por cima da pasta em troca — e, se a subida falha, PAGINA o Athos por uma
+# "ressurreicao que falhou". Aqui o gc e um gravador (nunca sobe nada), a sonda diz "fora" (rc=1),
+# e o que se mede e: o gc foi chamado? alguem foi paginado? o log diz por que ficou parado?
+echo ""
+echo "=== _resurrect_dolt: Dolt em HOLD (ga-3risy2) ==="
+GC_CALLS="$RESURRECT_TEST_DIR/gc-calls.txt"; : > "$GC_CALLS"
+printf '#!/bin/sh\necho "$*" >> "%s"\n' "$GC_CALLS" > "$RESURRECT_TEST_DIR/gc-recorder"
+chmod +x "$RESURRECT_TEST_DIR/gc-recorder"
+GC="$RESURRECT_TEST_DIR/gc-recorder"
+gc_dolt_probe_robust() { return 1; }
+NOTIFY=true
+_gc_n()   { wc -l < "$GC_CALLS" | tr -d ' '; }
+_esc_n()  { grep -c CALLED "$ESCALATOR_CAPTURE" 2>/dev/null || true; }
+_skip_n() { grep -c 'resurrect SKIP — HOLD' "$LOG" 2>/dev/null || true; }
+rm -f "$STATE_RESURRECT_ESCALATE_FILE"
+
+printf 'owner=mayor\nreason=troca do hq\n' > "$GC_DOLT_HOLD_FILE"
+_e0=$(_esc_n); _s0=$(_skip_n)
+_resurrect_dolt 5 NONE >/dev/null 2>&1; _rc=$?
+if [ "$_rc" = "1" ] && [ "$(_gc_n)" = "0" ] && [ "$(_esc_n)" = "$_e0" ] && [ "$(_skip_n)" = "$((_s0 + 1))" ]; then
+  ok "_resurrect_dolt: hold em vigor -> rc=1, ZERO 'gc dolt start', ZERO escalada, e o log diz que o hold segurou"
+else
+  bad "_resurrect_dolt: sob hold agiu ou ficou mudo (rc=$_rc gc_calls=$(_gc_n) escalator=$(_esc_n)/$_e0 skip_lines=$(_skip_n)/$_s0)"
+fi
+grep 'resurrect SKIP — HOLD' "$LOG" | tail -1 | grep -q 'mayor' && grep 'resurrect SKIP — HOLD' "$LOG" | tail -1 | grep -q 'troca do hq' \
+  && ok "_resurrect_dolt: a linha do log traz de quem e o porque do hold" \
+  || bad "_resurrect_dolt: a linha de SKIP nao diz de quem nem por que: $(grep 'resurrect SKIP — HOLD' "$LOG" | tail -1)"
+
+# hold ilegivel (validade que nao e numero) tambem segura: sob duvida nao se sobe um Dolt
+printf 'expires_at=amanha\n' > "$GC_DOLT_HOLD_FILE"
+_resurrect_dolt 5 NONE >/dev/null 2>&1; _rc=$?
+[ "$_rc" = "1" ] && [ "$(_gc_n)" = "0" ] && [ "$(_esc_n)" = "$_e0" ] \
+  && ok "_resurrect_dolt: hold ilegivel -> segura (nao sobe, nao pagina)" \
+  || bad "_resurrect_dolt: hold ilegivel nao segurou (rc=$_rc gc_calls=$(_gc_n))"
+
+# hold VENCIDO e hold REMOVIDO soltam: o `gc dolt start` volta a acontecer
+printf 'owner=mayor\nexpires_at=%s\n' "$(( $(date +%s) - 60 ))" > "$GC_DOLT_HOLD_FILE"
+gc_dolt_probe_robust() { return 0; }   # a subida "funciona": o que importa e o gc ter sido chamado
+_resurrect_dolt 5 NONE >/dev/null 2>&1
+[ "$(_gc_n)" = "1" ] && grep -q '^dolt start$' "$GC_CALLS" \
+  && ok "_resurrect_dolt: hold vencido solta -> 'gc dolt start' roda (1 chamada)" \
+  || bad "_resurrect_dolt: hold vencido continuou segurando (gc_calls=$(_gc_n))"
+rm -f "$GC_DOLT_HOLD_FILE"
+_resurrect_dolt 5 NONE >/dev/null 2>&1
+[ "$(_gc_n)" = "2" ] \
+  && ok "_resurrect_dolt: sem arquivo de hold -> 'gc dolt start' roda (comportamento de sempre intacto)" \
+  || bad "_resurrect_dolt: sem hold o guard nao subiu o Dolt (gc_calls=$(_gc_n))"
+
+# sem a lib do hold ao lado do script (checkout quebrado): "nao sei" SEGURA, e diz isso
+_NOLIB_DIR="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-nolib.XXXXXX)"
+cp "$SCRIPT" "$_NOLIB_DIR/dolt-disk-floor-guard.sh"
+_nolib_out="$(DOLT_DISK_FLOOR_GUARD_LIB=1 DOLT_DISK_FLOOR_GUARD_LOG=/dev/null bash -c '. "$1" >/dev/null 2>&1; dolt_hold_city_blocks /nonexistent; echo "rc=$? msg=$DOLT_HOLD_MESSAGE"' bash "$_NOLIB_DIR/dolt-disk-floor-guard.sh" 2>&1 | tail -1)"
+case "$_nolib_out" in
+  rc=0\ msg=*ilegível*) ok "guard sem dolt-hold-lib.sh -> dolt_hold_city_blocks responde 'segura' e diz por que" ;;
+  *) bad "guard sem dolt-hold-lib.sh nao caiu no fallback que segura: '$_nolib_out'" ;;
+esac
+rm -rf "$_NOLIB_DIR"
+
+unset GC_DOLT_HOLD_FILE
+unset -f _gc_n _esc_n _skip_n 2>/dev/null || true
 
 rm -rf "$RESURRECT_TEST_DIR"
 CITY="$REAL_CITY_FOR_RESURRECT"
