@@ -34,6 +34,9 @@ region() { RA="$1" RB="$2" awk 'f==0 && $0 ~ ENVIRON["RA"] {f=1} f==1 && n>0 && 
 FUNC_ON="$(fn_src _pilot_node_only_wa_route_on)"; FUNC_WA="$(fn_src _pilot_node_only_wa_pre)"; FUNC_NC="$(fn_src _pilot_node_only_candidate_pre)"
 FUNC_TMPL="$(fn_src wa_worker_template)"; FUNC_ISPOOL="$(fn_src _pilot_priority_target_is_pool)"
 PNW_INIT="$(grep -E '^_PNW_PROBES=' "$DISPATCHER")"
+# ga-2hd02v.4: _pilot_node_only_candidate_pre também delega a bead ps-* a _pilot_node_only_ps_pre; o harness carrega o que a função sob teste chama (a prova do caminho de PS mora em pilot-dispatcher.ps-node-route.selftest.sh).
+# Aqui PILOT_PS_NODE_ROUTE nunca é definida: a bead ps-* segue NÃO candidata.
+FUNC_PSON="$(fn_src _pilot_node_only_ps_route_on)"; FUNC_PS="$(fn_src _pilot_node_only_ps_pre)"; PNP_INIT="$(grep -E '^_PNP_PROBES=' "$DISPATCHER")"
 ARM_SRC="$(region '^        local _RP_NODE_RC=0$' '^        : # pool: leave UNASSIGNED')"
 BLOCK_SRC="$(region '^  local _PYS_TARGET _PYS_NATIVE=0$' '^  # ── wa-root-worktree-isolation')"
 { [ -n "$FUNC_NC" ] && [ -n "$FUNC_TMPL" ] && [ -n "$FUNC_ISPOOL" ] && [ -n "$ARM_SRC" ] && [ -n "$BLOCK_SRC" ]; } \
@@ -79,7 +82,7 @@ run_pre() {
     eval "$PNW_INIT"
     _pilot_priority_pool_bound_pre() { return 0; }
     _pilot_priority_node_exempt_pre() { return "${PR_DOG_EXEMPT:-1}"; }
-    eval "$FUNC_ON"; eval "$FUNC_WA"; eval "$FUNC_NC"
+    eval "$FUNC_ON"; eval "$FUNC_WA"; eval "$FUNC_NC"; eval "$FUNC_PSON"; eval "$FUNC_PS"; eval "$PNP_INIT"
     c() { local x=0; _pilot_node_only_candidate_pre "$1" || x=$?; printf '%s ' "$x"; }
     eval "$1"
   ) 2>&1 | tail -1
