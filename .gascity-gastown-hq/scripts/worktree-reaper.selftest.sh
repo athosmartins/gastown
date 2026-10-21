@@ -61,6 +61,16 @@ export WORKTREE_REAPER_FAKE_SESSION_LIST="$EMPTY_SESSIONS"
 # variable on its own `bash "$REAPER"` call, which overrides this per call.
 export WORKTREE_REAPER_PRESSURE_FREE_GB=0
 
+# ga-m5i7e6: two more pins, both for the scenarios that PREDATE it. (1) A tree's age is now its FRESHEST sign of life (index,
+# HEAD commit, any file inside), but those scenarios backdate ONLY the root directory — the index, files and commits of their
+# fixtures are minutes old — so they run the old rule (ACTIVITY_SCAN=0); the ga-m5i7e6 scenarios age the whole tree and switch
+# it on per call. (2) _worktree_in_use now runs for every tree about to be removed, not only merged ones: unpinned, each of
+# those scenarios would shell out to this machine's REAL lsof (and an lsof that prints nothing reads as "in use"). Pinned to an
+# empty list = nothing in use; a scenario that wants a busy tree points the seam at its own list, the real-lsof ones unset it.
+export WORKTREE_REAPER_ACTIVITY_SCAN=0
+NO_LSOF="$TMP/no_lsof.txt"; : > "$NO_LSOF"
+export WORKTREE_REAPER_FAKE_LSOF="$NO_LSOF"
+
 # ga-yw18yk: the same hermeticity, for the BEAD lookup. An unparseable lock whose tree is clean/aged/unused
 # now asks `bd` whether the worktree's bead is closed; without a seam every scenario below that keeps such a
 # lock would shell out to the real `bd` against a temp repo with no beads database (slow, and dependent on
@@ -1182,7 +1192,7 @@ echo "n${REAL_BUSY_PATH}"
 exit 1
 EOF
 chmod +x "$FAKEBIN/lsof"
-PATH="$FAKEBIN:$PATH" \
+env -u WORKTREE_REAPER_FAKE_LSOF PATH="$FAKEBIN:$PATH" \
 WORKTREE_REAPER_GT="$R1TOWN" WORKTREE_REAPER_LOG="$TMP/reaperR1.jsonl" \
 WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
   bash "$REAPER" >/dev/null 2>&1
@@ -1207,7 +1217,7 @@ cat > "$FAKEBIN/lsof" <<'EOF'
 exit 1
 EOF
 chmod +x "$FAKEBIN/lsof"
-PATH="$FAKEBIN:$PATH" \
+env -u WORKTREE_REAPER_FAKE_LSOF PATH="$FAKEBIN:$PATH" \
 WORKTREE_REAPER_GT="$R2TOWN" WORKTREE_REAPER_LOG="$TMP/reaperR2.jsonl" \
 WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
   bash "$REAPER" >/dev/null 2>&1
@@ -1234,7 +1244,7 @@ echo "nSOME/OTHER/UNRELATED/PATH"
 exit 0
 EOF
 chmod +x "$FAKEBIN/lsof"
-PATH="$FAKEBIN:$PATH" \
+env -u WORKTREE_REAPER_FAKE_LSOF PATH="$FAKEBIN:$PATH" \
 WORKTREE_REAPER_GT="$R3TOWN" WORKTREE_REAPER_LOG="$TMP/reaperR3.jsonl" \
 WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
   bash "$REAPER" >/dev/null 2>&1
@@ -1867,6 +1877,144 @@ dg_wt dg_o && bad "ga-he2c1u (o): detached delivered tree of a closed bead NOT r
 mk_dg_town dg_m "$DG_GEN"
 run_dg dg_m "$DG_CLOSED" WORKTREE_REAPER_GENERATED_RE='^nothing-matches$'
 dg_kept dg_m "WORKTREE_REAPER_GENERATED_RE narrowed to match nothing"
+
+# ══ ga-m5i7e6: a tree's age is its FRESHEST sign of life; "in use" is checked on EVERY removal path; pressure removes only MERGED trees ══
+# Incident (21/10): in disk-pressure mode (age gate 12 h) the reaper removed six WORK trees of another repo at "13-14 h", one with a
+# calibration agent inside. Three holes: (1) age = the mtime of the root DIRECTORY, which only moves when a top-level entry is added or
+# removed — a battery writing under an ignored pesquisa/ never touches it; (2) _worktree_in_use was asked for MERGED trees only; (3)
+# `git worktree remove` without --force refuses only a DIRTY tree and ignored files do not make one, so the outputs went with it.
+# Every scenario here ages the WHOLE tree (dir, files, index; commits carry an old date) and turns ACTIVITY_SCAN on. Run against the
+# pre-fix reaper they all fail except (b2)(c)(e)(l)(n)(k3), which pin what must NOT change: disk is still freed (a merged tree, the
+# ordinary age path, a dead-holder lock) and the old rules stay one knob away.
+echo "── ga-m5i7e6: freshest-signal age, in-use on every path, pressure = merged only ──"
+M5_OLD=2020-01-01T00:00:00Z
+m5_mk() {   # <town> — a rig with origin/main (one OLD commit); pesquisa/ is excluded repo-wide so a tree holding it stays CLEAN
+  local t="$TMP/$1"; mkdir -p "$t"; git init -q --bare "$TMP/$1-remote.git"; git init -q -b main "$t/rig"
+  ( cd "$t/rig" && git remote add origin "$TMP/$1-remote.git" && echo a > a.txt && git add a.txt \
+    && GIT_AUTHOR_DATE=$M5_OLD GIT_COMMITTER_DATE=$M5_OLD git commit -qm base \
+    && git push -q origin main && git fetch -q origin && git remote set-head origin main \
+    && echo 'pesquisa/' >> .git/info/exclude ) >/dev/null 2>&1
+}
+m5_age() {   # <tree> <hours> — backdate the root dir and everything inside it (not .git), plus the tree's own index
+  local ts idx; ts="$(date -v-"$2"H +%Y%m%d%H%M 2>/dev/null || date -d "$2 hours ago" +%Y%m%d%H%M)"
+  find "$1" -path "$1/.git" -prune -o -exec touch -h -t "$ts" {} + 2>/dev/null
+  idx="$(git -C "$1" rev-parse --git-path index)"; case "$idx" in /*) : ;; *) idx="$1/$idx" ;; esac
+  touch -t "$ts" "$idx" 2>/dev/null
+}
+m5_tree() {   # <town> <name> merged|unmerged — <town>/rig/crew/<name> holding an ignored pesquisa/out/battery.csv, every signal 14 h old
+  local r="$TMP/$1/rig"
+  ( cd "$r" && git worktree add -q "$r/crew/$2" -b "crew/m5/$2" main && cd "$r/crew/$2" && mkdir -p pesquisa/out && echo r1 > pesquisa/out/battery.csv \
+    && { [ "$3" != unmerged ] || { echo b > b.txt && git add b.txt && GIT_AUTHOR_DATE=$M5_OLD GIT_COMMITTER_DATE=$M5_OLD git commit -qm ahead; }; } ) >/dev/null 2>&1
+  m5_age "$r/crew/$2" 14
+}
+m5_run() { local t="$1"; shift; env WORKTREE_REAPER_ACTIVITY_SCAN=1 WORKTREE_REAPER_GT="$TMP/$t" WORKTREE_REAPER_LOG="$TMP/$t.jsonl" WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 "$@" bash "$REAPER" >/dev/null 2>&1; }
+m5_has() { git -C "$TMP/$1/rig" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/crew/w\$" >/dev/null; }
+m5_real() { ( cd "$TMP/$1/rig/crew/w" && pwd -P ); }
+m5_kept() {   # <town> <label> [event] — the tree is still there (and, when given, the keep was logged exactly once under that event)
+  if m5_has "$1" && { [ -z "${3:-}" ] || [ "$(events "$1" "$3")" = "1" ]; }; then ok "ga-m5i7e6 $2"
+  else bad "ga-m5i7e6 $2 — present=$(m5_has "$1" && echo y || echo n) ${3:-event}=$([ -n "${3:-}" ] && events "$1" "$3" || echo -)"; fi
+}
+m5_gone() { if m5_has "$1"; then bad "ga-m5i7e6 $2 — tree still there"; else ok "ga-m5i7e6 $2"; fi; }
+PRESS=WORKTREE_REAPER_PRESSURE_FREE_GB=99999   # free GiB is always below this → pressure (a box without `df -g` reads 99)
+
+m5_mk m5a; m5_tree m5a w unmerged; m5_real m5a > "$TMP/m5a.lsof"
+m5_run m5a "$PRESS" WORKTREE_REAPER_FAKE_LSOF="$TMP/m5a.lsof"
+m5_kept m5a "(a): unmerged tree, 14 h idle, a live process inside, pressure mode → KEPT, kept_in_use logged" kept_in_use
+
+m5_mk m5b; m5_tree m5b w unmerged; m5_run m5b "$PRESS"
+m5_kept m5b "(b): unmerged tree, nobody inside, pressure mode → KEPT, kept_pressure_unmerged logged once" kept_pressure_unmerged
+grep -q '"event":"kept_pressure_unmerged".*"size_kb":[0-9]' "$TMP/m5b.jsonl" && ok "ga-m5i7e6 (b): the pressure keep names the tree's size" || bad "ga-m5i7e6 (b): no numeric size_kb on kept_pressure_unmerged"
+m5_mk m5b2; m5_tree m5b2 w unmerged; m5_run m5b2 "$PRESS" WORKTREE_REAPER_PRESSURE_REAP_UNMERGED=1
+m5_gone m5b2 "(b2): WORKTREE_REAPER_PRESSURE_REAP_UNMERGED=1 gives the old pressure rule back (reaped)"
+
+m5_mk m5c; m5_tree m5c w merged; m5_run m5c "$PRESS"
+if ! m5_has m5c && [ "$(events m5c reaped_pool)" = "1" ]; then ok "ga-m5i7e6 (c): MERGED tree, nobody inside, pressure mode → reaped (disk is still freed)"; else bad "ga-m5i7e6 (c): merged idle tree under pressure — present=$(m5_has m5c && echo y || echo n)"; fi
+
+m5_mk m5d; m5_tree m5d w unmerged; touch "$TMP/m5d/rig/crew/w/pesquisa/out/battery.csv"; m5_run m5d
+m5_kept m5d "(d): root dir 14 h old but a file two levels down written just now → KEPT (age is the freshest sign)"
+m5_mk m5e; m5_tree m5e w unmerged; m5_run m5e
+m5_gone m5e "(e): unmerged tree idle in EVERY signal, normal mode → reaped (the ordinary age path still frees disk)"
+m5_mk m5l; m5_tree m5l w unmerged; touch "$TMP/m5l/rig/crew/w/pesquisa/out/battery.csv"; m5_run m5l WORKTREE_REAPER_ACTIVITY_SCAN=0
+m5_gone m5l "(l): WORKTREE_REAPER_ACTIVITY_SCAN=0 → the old directory-mtime rule (the tree of (d) is reaped)"
+m5_mk m5o; m5_tree m5o w unmerged; touch "$TMP/m5o/rig/crew/w/pesquisa/out/battery.csv"
+env -u WORKTREE_REAPER_ACTIVITY_SCAN WORKTREE_REAPER_GT="$TMP/m5o" WORKTREE_REAPER_LOG="$TMP/m5o.jsonl" WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 bash "$REAPER" >/dev/null 2>&1
+m5_kept m5o "(d2): ACTIVITY_SCAN unset (the default) → the tree of (d) is KEPT"
+m5_mk m5p; m5_tree m5p w unmerged; touch "$TMP/m5p/rig/crew/w/pesquisa/out/battery.csv"; m5_run m5p WORKTREE_REAPER_ACTIVITY_SCAN=yes
+m5_kept m5p "(d3): a garbage ACTIVITY_SCAN value reads as 'scan', never as the old rule → the tree of (d) is KEPT"
+
+m5_mk m5f; m5_tree m5f w unmerged; touch "$(git -C "$TMP/m5f/rig/crew/w" rev-parse --git-path index)"; m5_run m5f
+m5_kept m5f "(f): only the tree's own index is fresh (a git command just ran in it) → KEPT"
+m5_mk m5g; m5_tree m5g w unmerged
+( cd "$TMP/m5g/rig/crew/w" && echo c > c.txt && git add c.txt && git commit -qm recent ) >/dev/null 2>&1; m5_age "$TMP/m5g/rig/crew/w" 14
+m5_run m5g
+m5_kept m5g "(g): only the HEAD commit is fresh (dir, files and index 14 h old) → KEPT"
+
+m5_mk m5h; m5_tree m5h w unmerged; echo "$(m5_real m5h)/pesquisa/out/battery.csv" > "$TMP/m5h.lsof"; m5_run m5h WORKTREE_REAPER_FAKE_LSOF="$TMP/m5h.lsof"
+m5_kept m5h "(h): a process has an OPEN FILE inside (its cwd is elsewhere) → KEPT, kept_in_use logged" kept_in_use
+m5_mk m5i; m5_tree m5i w unmerged
+cat > "$FAKEBIN/lsof" <<EOF
+#!/usr/bin/env bash
+# the open file shows only when lsof is NOT narrowed to cwd: the real _worktree_in_use must ask for every fd
+case "\$*" in *"-d cwd"*) echo "n/elsewhere" ;; *) echo "n/elsewhere"; echo "n$(m5_real m5i)/pesquisa/out/battery.csv" ;; esac
+EOF
+chmod +x "$FAKEBIN/lsof"
+env -u WORKTREE_REAPER_FAKE_LSOF PATH="$FAKEBIN:$PATH" WORKTREE_REAPER_ACTIVITY_SCAN=1 WORKTREE_REAPER_GT="$TMP/m5i" WORKTREE_REAPER_LOG="$TMP/m5i.jsonl" \
+  WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 bash "$REAPER" >/dev/null 2>&1
+m5_kept m5i "(i): the REAL lsof path asks for every open file, not just the cwd → tree with an open file KEPT" kept_in_use
+
+m5_mk m5j; m5_tree m5j w unmerged; mkdir -p "$TMP/m5j-bin"; printf '#!/bin/sh\nexit 1\n' > "$TMP/m5j-bin/find"; chmod +x "$TMP/m5j-bin/find"
+m5_run m5j PATH="$TMP/m5j-bin:$PATH"
+m5_kept m5j "(j): the walk inside the tree FAILS → unknown is not old: KEPT, kept_activity_unknown logged" kept_activity_unknown
+
+# (m)(n) a pid-confirmed ZOMBIE lock holder says nothing about OTHER processes working in the tree, and its reap is `remove -f -f`
+M5_PS="$TMP/m5_ps.txt"; echo "1001 dead 0 0" > "$M5_PS"
+m5_mk m5m; m5_tree m5m w unmerged; git -C "$TMP/m5m/rig" worktree lock --reason "claude agent agent-m5 pid 1001 start x" "$TMP/m5m/rig/crew/w"
+m5_real m5m > "$TMP/m5m.lsof"; m5_run m5m WORKTREE_REAPER_FAKE_PS="$M5_PS" WORKTREE_REAPER_FAKE_LSOF="$TMP/m5m.lsof"
+m5_kept m5m "(m): lock holder is a dead pid BUT another process is inside the tree → KEPT, kept_zombie_lock_in_use logged" kept_zombie_lock_in_use
+m5_mk m5n; m5_tree m5n w unmerged; git -C "$TMP/m5n/rig" worktree lock --reason "claude agent agent-m5 pid 1001 start x" "$TMP/m5n/rig/crew/w"
+m5_run m5n WORKTREE_REAPER_FAKE_PS="$M5_PS"
+m5_gone m5n "(n): the same dead-holder lock with nobody inside → reaped (positive control: the zombie reap itself still works)"
+
+# (k) loop 1 (the town's own .gc-worktrees) has the same two checks: a live process, or pressure with an unmerged tree
+m5_town1() {   # <town> — the TOWN is the repo; one unmerged tree <town>/.gc-worktrees/x, every signal 14 h old
+  local t="$TMP/$1"; git init -q --bare "$TMP/$1-remote.git"; git init -q -b main "$t"
+  ( cd "$t" && git remote add origin "$TMP/$1-remote.git" && echo a > a.txt && git add a.txt && GIT_AUTHOR_DATE=$M5_OLD GIT_COMMITTER_DATE=$M5_OLD git commit -qm base \
+    && git push -q origin main && git fetch -q origin && git remote set-head origin main && echo 'pesquisa/' >> .git/info/exclude && mkdir -p .gc-worktrees \
+    && git worktree add -q "$t/.gc-worktrees/x" -b w/x main && cd "$t/.gc-worktrees/x" && mkdir pesquisa && echo r > pesquisa/o.csv \
+    && echo b > b.txt && git add b.txt && GIT_AUTHOR_DATE=$M5_OLD GIT_COMMITTER_DATE=$M5_OLD git commit -qm ahead ) >/dev/null 2>&1
+  m5_age "$t/.gc-worktrees/x" 14
+}
+m5_town1 m5k; (cd "$TMP/m5k/.gc-worktrees/x" && pwd -P) > "$TMP/m5k.lsof"
+m5_run m5k WORKTREE_REAPER_FAKE_LSOF="$TMP/m5k.lsof"
+if [ -d "$TMP/m5k/.gc-worktrees/x" ] && [ "$(events m5k kept_in_use)" = "1" ]; then ok "ga-m5i7e6 (k): town .gc-worktrees loop — unmerged tree with a live process inside → KEPT, kept_in_use logged"
+else bad "ga-m5i7e6 (k): town loop in-use — present=$([ -d "$TMP/m5k/.gc-worktrees/x" ] && echo y || echo n) kept_in_use=$(events m5k kept_in_use)"; fi
+m5_town1 m5k2; m5_run m5k2 "$PRESS"
+if [ -d "$TMP/m5k2/.gc-worktrees/x" ] && [ "$(events m5k2 kept_pressure_unmerged)" = "1" ]; then ok "ga-m5i7e6 (k): town .gc-worktrees loop — unmerged tree under pressure → KEPT, kept_pressure_unmerged logged"
+else bad "ga-m5i7e6 (k): town loop pressure — present=$([ -d "$TMP/m5k2/.gc-worktrees/x" ] && echo y || echo n) event=$(events m5k2 kept_pressure_unmerged)"; fi
+
+# (k2)(k3) loop 1 and a LOCKED unmerged tree: the guard leaves it to the lock contract (as the pool loop does), in use or not, pressure or not
+m5_town1 m5q; git -C "$TMP/m5q" worktree lock --reason "claude agent agent-m5 pid 1001 start x" "$TMP/m5q/.gc-worktrees/x"
+(cd "$TMP/m5q/.gc-worktrees/x" && pwd -P) > "$TMP/m5q.lsof"
+m5_run m5q WORKTREE_REAPER_FAKE_PS="$M5_PS" WORKTREE_REAPER_FAKE_LSOF="$TMP/m5q.lsof"
+if [ -d "$TMP/m5q/.gc-worktrees/x" ] && [ "$(events m5q kept_zombie_lock_in_use)" = "1" ]; then ok "ga-m5i7e6 (k2): town loop — dead lock holder but another process inside → KEPT, kept_zombie_lock_in_use logged"
+else bad "ga-m5i7e6 (k2): town loop zombie-in-use — present=$([ -d "$TMP/m5q/.gc-worktrees/x" ] && echo y || echo n) kept_zombie_lock_in_use=$(events m5q kept_zombie_lock_in_use)"; fi
+m5_town1 m5r; git -C "$TMP/m5r" worktree lock --reason "claude agent agent-m5 pid 1001 start x" "$TMP/m5r/.gc-worktrees/x"
+m5_run m5r "$PRESS" WORKTREE_REAPER_FAKE_PS="$M5_PS"
+if [ ! -d "$TMP/m5r/.gc-worktrees/x" ]; then ok "ga-m5i7e6 (k3): town loop — the same dead-holder lock, nobody inside, PRESSURE → reaped (the pressure keep does not shadow the lock contract)"
+else bad "ga-m5i7e6 (k3): town loop dead-holder lock under pressure — tree still there, kept_pressure_unmerged=$(events m5r kept_pressure_unmerged)"; fi
+
+# (o) the tree's own root directory cannot be stat'ed: unknown is not "since 1970" (pressure would read that as ancient and keep the tree for
+# ANOTHER reason, so the event is what tells them apart) → KEPT, kept_activity_unknown. The fake stat fails for that one path, anything else is the real one.
+m5_mk m5s; m5_tree m5s w unmerged; mkdir -p "$TMP/m5s-bin"
+printf '#!/bin/sh\nfor a in "$@"; do l="$a"; done\ncase "$l" in */crew/w) exit 1 ;; esac\nexec /usr/bin/stat "$@"\n' > "$TMP/m5s-bin/stat"; chmod +x "$TMP/m5s-bin/stat"
+m5_run m5s "$PRESS" PATH="$TMP/m5s-bin:$PATH"
+m5_kept m5s "(o): the tree's root directory cannot be read (stat fails) → unknown is not 1970: KEPT, kept_activity_unknown logged" kept_activity_unknown
+
+# (p) the same unknown-is-kept rule in loop 1: the walk inside the tree fails
+m5_town1 m5t; mkdir -p "$TMP/m5t-bin"; printf '#!/bin/sh\nexit 1\n' > "$TMP/m5t-bin/find"; chmod +x "$TMP/m5t-bin/find"
+m5_run m5t PATH="$TMP/m5t-bin:$PATH"
+if [ -d "$TMP/m5t/.gc-worktrees/x" ] && [ "$(events m5t kept_activity_unknown)" = "1" ]; then ok "ga-m5i7e6 (p): town loop — the walk inside the tree FAILS → KEPT, kept_activity_unknown logged"
+else bad "ga-m5i7e6 (p): town loop unknown — present=$([ -d "$TMP/m5t/.gc-worktrees/x" ] && echo y || echo n) kept_activity_unknown=$(events m5t kept_activity_unknown)"; fi
 
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"
