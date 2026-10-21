@@ -6,24 +6,32 @@ Contents
 
 PARA QUÊ (Athos 20/10: "o que não pode é ficar menos do que 100% ocupado"): responder em um comando as duas perguntas que decidem os próximos passos da ga-2hd02v.3 —
   (1) quantas beads de WhatsApp o Pilot mandou ao nó, e a sombra já tem base para ligar `PILOT_WA_NODE_ROUTE=auto`? (2) quanto da CPU do nó foi usada, hora a hora?
-USO      wa-node-report.py [--hours N] [--city DIR] [--json] [--min-hours H] [--min-beads B] [--busy-pct P]
+USO      wa-node-report.py [--hours N] [--city DIR] [--json] [--min-hours H] [--min-beads B] [--busy-pct P] [--pilot-log ARQ] [--dispatchable ARQ]
          --hours N      janela, em horas, até agora (48; inteiro de 1 a 99999, "010" é dez)        --city DIR   a cidade (GC_CITY_PATH, senão /Users/athos/gt/.gascity-gastown-hq)
          --min-hours H  quantas HORAS UTC COM DADO bastam para REVISAR a flip para auto (24)        --min-beads B  quantas beads COM VEREDITO bastam (30)
          --busy-pct P   a partir de quantos % de CPU a leitura conta como "perto de 100%" (90)       --json       o mesmo em JSON
+         --pilot-log    o log do Pilot (<cidade>/.gc/logs/pilot-dispatcher.log; o horário dele não traz fuso: é lido no fuso de quem roda, o mini)   --dispatchable  a fila (~/.gc/pilot-dispatchable.json)
          (a janela padrão é 48 h porque 24 horas com dado numa janela de 24 h não deixam folga: ela toca 25 horas UTC no máximo, e uma hora sem veredito já reprova)
          exit 0 ok · 2 uso · 3 NENHUM dos dois logs deu para usar (ausente ou ilegível) · 4 relatório não formado
 O QUE DIZ  1. a rota (<cidade>/.gc/wa-node-route.jsonl: o que o despachante e o Pilot gravam): cobertura da sombra (horas COM VEREDITO — node/mini/não sei —, não o intervalo entre a primeira e a última nem hora só de "não li"),
               o veredito de cada bead (o ÚLTIMO da janela), as que foram ao nó de verdade, as que o classificador mandou ao nó mas não couberam (sem vaga), as que mudaram de veredito,
               que é onde mora o falso "node", e as de ESCRITA NÃO CONFIRMADA (rc 13 do despachante, ou o Pilot que estourou o prazo), que o relatório lista para conferir à mão.
               No modo `shadow` o Pilot só roda o `check` do despachante e NÃO grava `apply`: o veredito vem da linha `pilot-node-route` (rc 0/10/11 + o `verdict` do JSON em `out`);
-           2. a CPU do nó por hora, em UTC (<cidade>/.gc/hetzner-occupancy.jsonl: uma leitura a cada 15 min do hetzner-occupancy-watch), a média, quantas leituras ficaram perto de 100%
+           2. o FUNIL de WA até o gancho do nó (medido em 20/10: 222 beads de WA na fila, 2 despachadas no dia, e as duas deram `mini`): quantas a cedência por prioridade e o teto do pool do mini
+              seguraram ANTES do gancho (<cidade>/.gc/logs/pilot-dispatcher.log) e o tamanho da fila despachável (~/.gc/pilot-dispatchable.json). O nó só recebe o que chega ao gancho; é o primeiro limite do uso dele por WA;
+           3. a CPU do nó por hora, em UTC (<cidade>/.gc/hetzner-occupancy.jsonl: uma leitura a cada 15 min do hetzner-occupancy-watch), a média, quantas leituras ficaram perto de 100%
               e quantas sessões wa-worker-remote estavam vivas;
-           3. a prontidão MECÂNICA da sombra: horas e beads suficientes para alguém REVISAR. Não é aprovação: quem liga o `auto` é uma pessoa, depois de conferir uma a uma as beads `node` da lista.
+           4. a prontidão MECÂNICA da sombra: horas e beads suficientes para alguém REVISAR. Não é aprovação: quem liga o `auto` é uma pessoa, depois de conferir uma a uma as beads `node` da lista.
 ESTADOS QUE NÃO SE CONFUNDEM  log ausente ("ainda não houve rodada") ≠ log vazio ≠ log ilegível ≠ zero decisões na janela. Linha que não dá para ler vem CONTADA e avisada, nunca omitida em
            silêncio. Linha de outro assunto no mesmo log (o `tipo:"reaper"` que o reaper grava em hetzner-occupancy.jsonl; um `event` que o despachante não conhece) não é leitura nem decisão: fica fora das contas e vem CONTADA. CPU que não foi lida (a 1ª leitura só semeia o baseline; o ssh falhou) NUNCA vira 0%: entra em "sem CPU lida". Sessões não lidas, ou lidas com entrada ilegível
            (`sessoes.ilegiveis`: a lista pode estar incompleta), não viram "0 sessões". Linha do Pilot cujo rc e `verdict` discordam NUNCA vira mini nem node: vai a "outro" e à lista de conferência.
+           O log do Pilot e a fila têm os mesmos três estados (ausente / vazio / ilegível), e a fila que não é o objeto com `items` em lista é ilegível, nunca "0 candidatas". Sem o log de rota, "quantas chegaram ao gancho
+           e quantas pararam antes" é NÃO SEI (null no JSON), nunca 0 e nunca "todas pararam".
 O QUE NÃO DIZ  que nenhuma bead com dado de lead foi ao nó: o relatório não vê o conteúdo da bead. Lista as que foram (e por quê) para a conferência humana. A garantia de que dado de lead
            não chega ao nó é o espelho git com a varredura de CPF/telefone, não este relatório. Também não diz que o WA RODOU bem no nó: só que a bead foi atribuída lá.
+           No funil, "sem NENHUMA linha na rota" não é "o nó nunca viu": o gancho sai sem gravar com PILOT_WA_NODE_ROUTE=off, quando a bead já é do nó ou não deu para relê-la (label/auto), quando o despachante não
+           está executável e quando o orçamento de spawn do sweep acabou. Por isso o relatório diz o número com essas palavras e avisa quando o Pilot não gravou linha nenhuma na janela (`gancho_gravou`).
+           O horário do log do Pilot não traz fuso: é lido no fuso de quem roda o relatório. Rodá-lo em outra máquina, ou com TZ diferente do mini, desloca a janela do funil (a da rota e da CPU é UTC).
            A CPU de cada hora é a média das leituras cujo `epoch` cai nela (uma leitura vale uma, qualquer que seja a janela de medida `janela_s` dela) e a leitura de uma hora
            vai para a hora UTC do seu `epoch`, não da janela que ela mediu: a fronteira da hora é aproximada em até 15 min.
 """
@@ -272,6 +280,8 @@ def analyse_route(rows, lo, hi):
         "pilot_linhas": pilot_linhas, "veredito_final": final, "fora_do_veredito": outros, "apply_ilegivel": apply_ilegivel, "outras_ilegiveis": outras_ilegiveis,
         "leituras_que_falharam": leitura_falhou, "soltas": soltas, "avisos": avisos,
         "ao_no_de_verdade": sorted(bid for bid, b in beads.items() if b["despachada"]), "instaveis": sorted(instaveis),
+        # vazio → nenhuma bead com linha; falhou/ilegível → a linha com `rc` ilegível ou a leitura que falhou TAMBÉM entra: o funil quer "tem linha na rota" (o gancho rodou), não "tem veredito". Privado: main() tira antes do JSON
+        "_beads": set(beads),
         "escrita_nao_confirmada": sorted(bid for bid, b in beads.items() if b["incerta"]), "incoerentes": sorted(bid for bid, b in beads.items() if b["incoerente"]),
         # base e razões vêm do ÚLTIMO node da bead; se ela teve node e o veredito final já não é node (node e depois mini), elas são do node ANTERIOR, e `do_node_anterior` diz isso (bead que nunca foi node não tem o que rotular)
         "node_para_conferir": [{"bead": bid, "ultimo": beads[bid]["final"], "base": beads[bid]["base"], "razoes": beads[bid]["razoes"], "do_node_anterior": beads[bid]["final"] not in NODE_CATS and any(c in NODE_CATS for c in beads[bid]["cats"]),
@@ -360,6 +370,99 @@ def analyse_occ(rows, lo, hi, busy_pct):
     }
 
 
+# o log do Pilot: "[2026-10-20 15:50:54] [pilot-dispatcher] …". Só a bead de WA (id wa-…) entra; cada padrão é uma linha que o Pilot escreve ANTES do gancho do nó (ou no despacho ao mini)
+LOG_TS = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] ")
+# o id é `wa-` + base36 + sufixos `.N` (wa-hut4l5.4). O ponto final da frase ("Claim acquired on wa-qp98sy.") não é do id: com ele a mesma bead entraria duas vezes
+WA_ID = r"(wa-[A-Za-z0-9]+(?:\.[0-9]+)*)"
+FUNIL = (
+    ("cedida", re.compile(r"ga-5fn5p3: " + WA_ID + r" P\d+ cedida a P0/P1 ")),
+    ("teto", re.compile(r"ga-in9ebr: " + WA_ID + r" QUEUED — routed to wa-worker, pool at session cap")),
+    ("teto", re.compile(r"ga-in9ebr: wa-worker pool at session cap \(.*?\) — QUEUED " + WA_ID + r": claim released")),
+    ("claim", re.compile(r"Claim acquired on " + WA_ID)),
+    ("mini", re.compile(r"RIG-NATIVE dispatch \([^)]*\): assigning " + WA_ID + r" → wa-worker ")),
+)
+FUNIL_ROTULOS = (
+    ("cedida", "cedidas a P0/P1 (param ANTES do gancho do nó)"), ("teto", "paradas no teto do pool wa-worker do mini (idem)"),
+    ("claim", "reivindicadas (claim)"), ("mini", "despachadas ao wa-worker do MINI"),
+)
+SWEEP_START = "=== Pilot sweep start"
+
+
+def analyse_funil(path, lo, hi):
+    """(estado, análise). ausente → ('ausente'): o Pilot ainda não escreveu, NÃO é zero; falhou ao ler → ('ilegivel'): nunca vira zero; vazio → ('vazio').
+    Sem uma linha de WA na janela → zeros com estado ok (a resposta é "nenhuma"). A linha do funil cuja hora falta ou é impossível não entra nas contas e vem CONTADA em `sem_hora`;
+    linha de continuação que não casa com nenhum padrão não é do funil e não conta. A hora do log não traz fuso: é lida no fuso de quem roda."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read().decode("utf-8", "replace")
+    except FileNotFoundError:
+        return "ausente", None
+    except OSError:
+        return "ilegivel", None
+    cats = {c: {"linhas": 0, "_beads": set()} for c, _ in FUNIL_ROTULOS}
+    rodadas = sem_hora = 0
+    for ln in raw.split("\n"):
+        m = LOG_TS.match(ln)
+        e = None
+        if m:
+            try:
+                e = time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
+            except (ValueError, OverflowError):
+                e = None  # hora impossível (mês 13, 99:99): tratada como sem hora, abaixo
+        hit = None
+        if SWEEP_START not in ln:
+            for c, rx in FUNIL:
+                mm = rx.search(ln)
+                if mm:
+                    hit = (c, mm.group(1))
+                    break
+        if e is None:
+            # sem hora legível: só conta se for uma linha DO FUNIL (padrão ou início de rodada); o resto do log (continuações, linhas de outros assuntos) não é assunto daqui
+            if hit or SWEEP_START in ln:
+                sem_hora += 1
+            continue
+        if not (lo <= e <= hi):
+            continue
+        if SWEEP_START in ln:
+            rodadas += 1
+        elif hit:
+            cats[hit[0]]["linhas"] += 1
+            cats[hit[0]]["_beads"].add(hit[1])
+    return ("ok" if raw.strip() else "vazio"), {"rodadas": rodadas, "sem_hora": sem_hora, "categorias": cats}
+
+
+def read_fila(path, now):
+    """(estado, análise). ausente → ('ausente'); ilegível, ou JSON que não é o objeto com `items` em lista → ('ilegivel'): nunca vira '0 candidatas'.
+    Item que não é objeto não é candidata de WA: fica fora de `wa` e vem CONTADO em `itens_ilegiveis`. `generated_at` ausente, no futuro ou impossível → idade None (não sei), nunca 0."""
+    try:
+        with open(path, "rb") as f:
+            o = json.loads(f.read().decode("utf-8"))
+    except FileNotFoundError:
+        return "ausente", None
+    except (OSError, ValueError):
+        return "ilegivel", None
+    if not isinstance(o, dict) or not isinstance(o.get("items"), list):
+        return "ilegivel", None
+    wa, prio, ileg = 0, {}, 0
+    for it in o["items"]:
+        if not isinstance(it, dict):
+            ileg += 1
+        elif it.get("store") == "whatsapp_automation":
+            wa += 1
+            k = str(it.get("priority", "?"))
+            prio[k] = prio.get(k, 0) + 1
+    g = o.get("generated_at")
+    idade = None
+    if isinstance(g, str) and TS_RE.match(g):
+        try:
+            idade = now - calendar.timegm(time.strptime(g, "%Y-%m-%dT%H:%M:%SZ"))
+        except (ValueError, OverflowError):
+            idade = None  # tem a forma de uma hora mas é impossível (mês 13): não sei a idade
+        if idade is not None and idade < 0:  # gerada depois de "agora": o relógio de um dos dois está errado; não finge idade
+            idade = None
+    return "ok", {"wa": wa, "total": len(o["items"]), "itens_ilegiveis": ileg, "prioridades": prio, "idade_s": idade, "ttl_s": num(o.get("ttl_seconds"))}
+
+
 def prontidao(rota, min_hours, min_beads, hours):
     """horas = horas UTC COM VEREDITO (não o intervalo primeira→última, nem hora só de "não li"/"não elegível"); beads = só as que chegaram a um VEREDITO (não elegível/não li/falha de escrita não contam)"""
     falta = []
@@ -433,7 +536,38 @@ def render(res):
             if len(a["node_para_conferir"]) > 40:
                 L.append("    … mais %d (use --json)" % (len(a["node_para_conferir"]) - 40))
     L.append("")
-    L.append("[2] CPU DO NÓ POR HORA, UTC (%s) — média das leituras de cada hora (uma leitura vale uma; a fronteira da hora é a do `epoch`, ±15 min)" % res["ocupacao"]["arquivo"])
+    fu = res["funil"]
+    L.append("[2] FUNIL DE WA ATÉ O GANCHO DO NÓ (%s)" % fu["arquivo"])
+    aviso = estado_txt(fu["estado"], 0, fu["arquivo"])
+    if aviso:
+        L.append("  " + aviso)
+    fi = res["fila"]
+    aviso = estado_txt(fi["estado"], 0, fi["arquivo"])
+    if aviso:
+        L.append("  " + aviso)
+    if fi["estado"] == "ok":
+        q = fi["analise"]
+        idade = "gerada há %s min%s" % (fnum(q["idade_s"] / 60.0, 0), "" if q["ttl_s"] is None or q["idade_s"] <= q["ttl_s"] else ", VENCIDA") if q["idade_s"] is not None else "sem hora de geração legível"
+        extra = ("; %d item(ns) que não é(são) objeto, fora da conta de WA" % q["itens_ilegiveis"]) if q["itens_ilegiveis"] else ""
+        L.append("  fila despachável: %d de WA entre %d (%s); por prioridade: %s%s" % (q["wa"], q["total"], idade, ", ".join("P%s=%d" % kv for kv in sorted(q["prioridades"].items())) or "—", extra))
+    if fu["estado"] == "ok":
+        a = fu["analise"]
+        L.append("  %d rodada(s) do Pilot na janela (a hora do log é lida no fuso de quem roda). Beads de WA, na janela:" % a["rodadas"])
+        for c, rot in FUNIL_ROTULOS:
+            L.append("    %-52s %6d linha(s)  %4d bead(s)" % (rot, a["categorias"][c]["linhas"], a["categorias"][c]["beads"]))
+        if a["sem_hora"]:
+            L.append("  %d linha(s) do funil sem hora legível (ausente ou impossível), FORA das contas acima" % a["sem_hora"])
+        if a["no_gancho"] is None:
+            L.append("  quantas têm linha na rota e quantas pararam antes: NÃO SEI — o log de rota (seção 1) não foi lido, e sem ele não dá para dizer o que o gancho viu")
+        else:
+            L.append("    %-52s %6s           %4d bead(s)  (atribuídas ao nó: %d)" % ("com alguma linha na rota (o gancho gravou)", "", a["no_gancho"], a["ao_no"]))
+            L.append("  cedidas ou no teto e SEM NENHUMA linha na rota: %d bead(s)" % a["pararam_antes"])
+            if not a["gancho_gravou"]:
+                L.append("  ATENÇÃO — o Pilot não gravou NENHUMA linha de rota na janela (PILOT_WA_NODE_ROUTE=off? gancho fora do ar?): 'sem linha na rota' não diz nada sobre o nó")
+            else:
+                L.append("  (sem linha na rota não prova que o nó não viu: o gancho sai sem gravar se a bead já é do nó ou não deu para relê-la, e se o despachante não está executável; confira os modos do Pilot na seção 1)")
+    L.append("")
+    L.append("[3] CPU DO NÓ POR HORA, UTC (%s) — média das leituras de cada hora (uma leitura vale uma; a fronteira da hora é a do `epoch`, ±15 min)" % res["ocupacao"]["arquivo"])
     o = res["ocupacao"]
     aviso = estado_txt(o["estado"], o["ilegiveis"], o["arquivo"])
     if aviso:
@@ -463,7 +597,7 @@ def render(res):
             L.append("  %-14s %9d %8d %8s %6s %6s %8s %6s" % (h["hora"], h["leituras"], h["cpu_lidas"], fnum(h["pct_medio"]), fnum(h["pct_min"]), fnum(h["pct_max"]), fnum(h["nucleos_medio"], 2), fnum(h["wa_medio"], 2)))
     L.append("")
     p = res["prontidao"]
-    L.append("[3] PRONTIDÃO DA SOMBRA PARA REVISAR O `auto` (mecânica; NÃO é aprovação)")
+    L.append("[4] PRONTIDÃO DA SOMBRA PARA REVISAR O `auto` (mecânica; NÃO é aprovação)")
     if p is None:
         L.append("  sem log de rota utilizável (ausente ou ilegível): não dá para dizer")
     elif p["suficiente_para_revisar"]:
@@ -482,6 +616,8 @@ def parse_args(argv):
     ap.add_argument("--min-hours", default="24")
     ap.add_argument("--min-beads", default="30")
     ap.add_argument("--busy-pct", default="90")
+    ap.add_argument("--pilot-log", default=None)
+    ap.add_argument("--dispatchable", default=None)
     a = ap.parse_args(argv)
     # vazio ou fora de 'dígitos' → uso errado (rc 2), nunca um padrão silencioso; decimal mesmo com zero à esquerda
     for nome, v, lo_, hi_ in (("--hours", a.hours, 1, 99999), ("--min-hours", a.min_hours, 0, 99999), ("--min-beads", a.min_beads, 0, 99999), ("--busy-pct", a.busy_pct, 1, 100)):
@@ -489,6 +625,11 @@ def parse_args(argv):
             sys.stderr.write("wa-node-report: %s quer um inteiro de %d a %d (veio '%s')\n" % (nome, lo_, hi_, v))
             sys.exit(2)
     a.hours, a.min_hours, a.min_beads, a.busy_pct = int(a.hours, 10), int(a.min_hours, 10), int(a.min_beads, 10), int(a.busy_pct, 10)
+    # ausente (None) → o caminho padrão; vazio ("") → uso errado, rc 2: um caminho em branco não pode virar "o padrão" em silêncio
+    for nome, v in (("--pilot-log", a.pilot_log), ("--dispatchable", a.dispatchable)):
+        if v is not None and v == "":
+            sys.stderr.write("wa-node-report: %s quer um caminho (veio vazio)\n" % nome)
+            sys.exit(2)
     return a
 
 
@@ -512,10 +653,28 @@ def main(argv):
     oe, orows, obad = read_jsonl(occ_p)
     ra = analyse_route(rrows, lo, hi) if re_ in ("ok", "vazio") else None
     oa = analyse_occ(orows, lo, hi, a.busy_pct) if oe in ("ok", "vazio") else None
+    log_p = a.pilot_log if a.pilot_log is not None else os.path.join(city, ".gc", "logs", "pilot-dispatcher.log")
+    fila_p = a.dispatchable if a.dispatchable is not None else os.path.join(os.path.expanduser("~"), ".gc", "pilot-dispatchable.json")
+    fe, fa = analyse_funil(log_p, lo, hi)
+    qe, qa = read_fila(fila_p, now)
+    if fa is not None:
+        antes = fa["categorias"]["cedida"]["_beads"] | fa["categorias"]["teto"]["_beads"]
+        # rota ausente/ilegível (ra None) → None: "não sei o que o gancho viu", NUNCA "0 viram" nem "todas pararam antes". Rota vazia (ra com 0 beads) é uma resposta: nenhuma tem linha
+        fa["pararam_antes"] = len(antes - ra["_beads"]) if ra else None
+        fa["no_gancho"] = len(ra["_beads"]) if ra else None
+        fa["ao_no"] = len(ra["ao_no_de_verdade"]) if ra else None
+        # o Pilot gravou ALGUMA linha de rota na janela? Se não, "sem linha na rota" não diz nada do nó (modo off, gancho fora do ar). Rota não lida → None
+        fa["gancho_gravou"] = bool(ra["modos"]) if ra else None
+        for c in fa["categorias"].values():
+            c["beads"] = len(c.pop("_beads"))
+    if ra:
+        ra.pop("_beads", None)
     res = {
         "janela": {"horas": a.hours, "inicio": lo, "fim": hi},
         "rota": {"arquivo": rota_p, "estado": re_, "ilegiveis": rbad, "analise": ra},
         "ocupacao": {"arquivo": occ_p, "estado": oe, "ilegiveis": obad, "analise": oa},
+        "funil": {"arquivo": log_p, "estado": fe, "analise": fa},
+        "fila": {"arquivo": fila_p, "estado": qe, "analise": qa},
         "prontidao": prontidao(ra, a.min_hours, a.min_beads, a.hours) if ra else None,
     }
     try:

@@ -19,8 +19,14 @@
 #     wa-worker-remote (não o wa-worker do mini) · sessões não lidas não viram "0 sessões" · leitura de sessões lida pela metade (`ilegiveis` != 0/ausente: N>0, texto, bool) também não entra na conta de WA ·
 #     linhas sem epoch contadas · bordas da janela · a tabela de texto mostra as últimas 72 horas e avisa ·
 #     o que NÃO é leitura do vigia (a linha `tipo:"reaper"` que o reaper grava no mesmo arquivo, `tipo` que não é texto, linha sem cpu NEM sessoes) fica fora de leituras/hora/sem-CPU e vem CONTADA, inclusive num arquivo só de reaper.
+#   FUNIL (o log do Pilot): as cinco frases do Pilot contadas por categoria (linhas e beads distintas) e as rodadas, na janela FECHADA (as duas beads exatamente nas bordas entram, a de -25 h e a do futuro não) · a hora do log é lida no fuso de
+#     quem roda (UTC e BRT3 dão o mesmo número) · o id da bead não leva o ponto final da frase nem perde o sufixo `.N` · linha do funil sem hora ou com hora impossível (início de rodada inclusive) FORA das contas e CONTADA; continuação que não
+#     é do funil não conta · o cruzamento com a rota: "tem linha na rota" inclui a bead que só teve leitura que falhou; rota ausente/ilegível = NÃO SEI (null) em tudo, rota vazia = nenhuma tem linha; "o Pilot não gravou NENHUMA linha de rota"
+#     avisa, e com linha gravada a ressalva "sem linha na rota não prova que o nó não viu" · log ausente ≠ vazio ≠ ilegível ≠ ok com zeros (nada na janela)
+#   FILA (~/.gc/pilot-dispatchable.json): WA entre o total, por prioridade (sem prioridade = P?), item que não é objeto contado · idade/VENCIDA (idade == ttl não venceu) · `generated_at` ausente/no futuro/impossível = idade null, sem quebrar ·
+#     items que não é lista, JSON que não é objeto, lixo e pasta = ilegível; ausente ≠ ilegível · caminhos padrão (log na cidade, fila em $HOME/.gc, nunca a do usuário de verdade) · caminho vazio = rc 2, não o padrão
 #   ESTADOS: ausente ≠ vazio ≠ ilegível (lixo, pasta no lugar do arquivo) · rc 3 só quando NENHUM dos dois logs serve (e JSON mesmo assim) · rc 2 em uso errado (inclui "010" = dez, nunca octal) · só leitura (nada novo, nada alterado) ·
-#     --json é UMA linha de JSON com as quatro chaves.
+#     --json é UMA linha de JSON com as seis chaves (fila, funil, janela, ocupacao, prontidao, rota).
 # CONTROLE NEGATIVO: cada mutante troca UMA trecho do script numa cópia (e FALHA se o trecho sumiu ou se repete: o script mudou, atualize o mutante) e a função designada tem de reprovar; mutante que sobrevive reprova esta bateria.
 #   O piso (MIN_MUT) impede que apagar mutantes passe por "todos mortos".
 # O QUE NÃO COBRE: o formato exato de cada linha do DESPACHANTE (`apply`/`release`) além dos padrões fixados aqui (se ele mudar o texto, a bead cai em 'sem veredito'); a do PILOT é a que o gancho real grava (hook_real), mas só
@@ -31,7 +37,7 @@
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REAL="$HERE/wa-node-report.py"
-MIN_MUT=133
+MIN_MUT=187
 T=$(mktemp -d "${TMPDIR:-/tmp}/wa-node-report.XXXXXX")
 trap 'find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null' EXIT
 fails=0; n=0; MUTANTS=0
@@ -263,10 +269,121 @@ with open(os.path.join(city("lx"), ".gc", "hetzner-occupancy.jsonl"), "wb") as f
 os.makedirs(os.path.join(city("dr"), ".gc", "wa-node-route.jsonl"), exist_ok=True)
 os.makedirs(os.path.join(city("dn"), ".gc", "wa-node-route.jsonl"), exist_ok=True)
 
+# ---- o funil: o log do Pilot (hora local, sem fuso) em UTC e em BRT (UTC-3). Os checks usam --hours 24: as linhas de -25 h ficam de fora
+WA = "wa-hut4l5.4"
+
+
+def cedida(b):
+    return "ga-5fn5p3: %s P2 cedida a P0/P1 de whatsapp_automation (P1 %s waits behind wa-worker 3/2) — not claimed, no writes this sweep; stays story:approved and is re-evaluated every sweep." % (b, WA)
+
+
+def teto1(b):
+    return "ga-in9ebr: %s QUEUED — routed to wa-worker, pool at session cap (3 active/creating >= 2 max); not claimed, no writes this sweep (the ga-93yxc pool top-up opens a session once a slot frees)." % b
+
+
+def teto2(b):
+    return "  ga-in9ebr: wa-worker pool at session cap (3 active/creating >= 2 max) — QUEUED %s: claim released, story:approved + gc.routed_to=wa-worker kept, NOT marked in-flight/dispatched (ga-93yxc pool top-up opens a session once a slot frees)." % b
+
+
+SWEEP = "=== Pilot sweep start (DRY_RUN=0) ==="
+
+
+def mini(b, alvo="wa-worker (slot=wa-worker-1)"):
+    return "  RIG-NATIVE dispatch (ga-mfeip): assigning %s → %s in /Users/athos/gt/whatsapp_automation" % (b, alvo)
+
+
+def pilot_log(path, tzoff):
+    L = []
+
+    def a(off, msg):
+        L.append("[%s] [pilot-dispatcher] %s" % (time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(NOW + off + tzoff)), msg))
+    a(-25 * H, SWEEP)
+    a(-25 * H, cedida("wa-old1"))
+    a(-25 * H, "Claim acquired on wa-old2.")
+    a(-23 * H, cedida("wa-c1"))
+    a(-23 * H + 60, cedida("wa-c1"))
+    for off in (-20 * H, -10 * H, -5 * H):
+        a(off, SWEEP)
+    for off in (-20 * H, -10 * H, -5 * H):
+        a(off + 5, cedida("wa-c2"))
+    a(-5 * H, cedida("wa-c3"))
+    a(-5 * H, "ga-5fn5p3: ga-xyz P2 cedida a P0/P1 de gascity (P1 ga-abc waits behind x 3/2) — not claimed")
+    a(-5 * H, teto1(WA))
+    a(-4 * H, teto1(WA))
+    a(-4 * H, teto2("wa-t2"))
+    a(-4 * H, teto1("wa-c3"))
+    a(-3 * H, "Claim acquired on wa-k1.")
+    a(-2 * H, "Claim acquired on wa-k1.")
+    a(-2 * H, "Claim acquired on %s." % WA)
+    a(-2 * H, "Claim acquired on ga-dzzqvw.1.")
+    a(-1 * H, mini("wa-qp98sy"))
+    a(-1 * H, mini("wa-c2"))
+    a(-1 * H, mini("ga-zz", "gate-reviewer (slot=1)"))
+    a(-1 * H, mini("wa-nodeline", "wa-worker-remote (slot=wa-worker-remote-1)"))
+    a(-24 * H, "Claim acquired on wa-bordaa.")                                          # exatamente no início da janela: entra (janela fechada)
+    a(0, "Claim acquired on wa-bordab.")                                                # exatamente no fim da janela (agora): entra
+    L.append("    Claim acquired on wa-zz.")                                               # linha do funil SEM hora: contada em sem_hora, fora das contas
+    L.append("=== Pilot sweep start (DRY_RUN=0) ===")                                     # início de rodada SEM hora: idem (não é uma rodada da janela)
+    L.append("[2026-13-45 99:99:99] [pilot-dispatcher] Claim acquired on wa-bad.")         # hora impossível: idem
+    L.append("    uma continuação qualquer, sem padrão e sem hora: não é do funil e não conta")
+    a(60, SWEEP)                                                                          # no futuro
+    a(60, "Claim acquired on wa-fut.")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(L) + "\n")
+
+
+pilot_log(os.path.join(T, "pilot-utc.log"), 0)
+pilot_log(os.path.join(T, "pilot-brt.log"), -3 * H)
+open(os.path.join(T, "pilot-vazio.log"), "wb").close()
+os.makedirs(os.path.join(T, "pilot-dir.log"), exist_ok=True)
+# a rota do funil: o despachante gravou só `apply` (nenhuma linha do Pilot → o gancho não gravou nada)
+jl(os.path.join(city("funil"), ".gc", "wa-node-route.jsonl"), [ap("wa-c2", -1 * H, 10, "classificador:mini test-toca-banco"), ap("wa-qp98sy", -1 * H, 10, "classificador:mini test-toca-banco")])
+# a rota do funil com a linha do Pilot (o gancho gravou) e uma bead que só tem leitura que falhou (tem linha na rota, não tem veredito)
+jl(os.path.join(city("funil2"), ".gc", "wa-node-route.jsonl"), [ap("wa-c2", -1 * H, 10, "classificador:mini test-toca-banco"), pr("wa-c1", -1 * H, "shadow", 10, cj("mini", "", ["toca-banco"])),
+                                                                ap("wa-t2", -1 * H, 1, "bd show falhou", ev="read")])
+# os caminhos padrão: o log do Pilot na cidade e a fila em $HOME/.gc
+jl(os.path.join(city("padrao"), ".gc", "wa-node-route.jsonl"), [ap("wa-c2", -1 * H, 10, "classificador:mini test-toca-banco")])
+with open(os.path.join(T, "pilot-utc.log"), "rb") as f:
+    log_bytes = f.read()
+with open(os.path.join(city("padrao"), ".gc", "logs", "pilot-dispatcher.log"), "wb") as f:
+    f.write(log_bytes)
+
+# ---- a fila despachável
+itens = [{"id": "wa-a", "store": "whatsapp_automation", "priority": 0}, {"id": "wa-b", "store": "whatsapp_automation", "priority": 1},
+         {"id": "wa-c", "store": "whatsapp_automation", "priority": 1}, {"id": "wa-d", "store": "whatsapp_automation", "priority": 2},
+         {"id": "wa-e", "store": "whatsapp_automation", "priority": "3"}, {"id": "wa-f", "store": "whatsapp_automation"},
+         {"id": "ga-g", "store": "gascity", "priority": 0}, {"id": "ga-h", "store": "gascity", "priority": 1}, "lixo"]
+
+
+def fila(nome, gen, extra=None):
+    o = {"count": len(itens), "ttl_seconds": 1800, "items": itens}
+    if gen is not None:
+        o["generated_at"] = iso(gen)
+    with open(os.path.join(T, nome), "w", encoding="utf-8") as f:
+        json.dump(extra if extra is not None else o, f)
+
+
+fila("fila-ok.json", -2400)
+fila("fila-fresca.json", -100)
+fila("fila-na-borda.json", -1800)   # idade == ttl: ainda não venceu
+fila("fila-futura.json", 600)
+fila("fila-sem-hora.json", None)
+fila("fila-hora-impossivel.json", 0, extra={"items": itens, "ttl_seconds": 1800, "generated_at": "2026-13-45T99:99:99Z"})
+fila("fila-itens-texto.json", 0, extra={"items": "x", "ttl_seconds": 1800})
+fila("fila-lista.json", 0, extra=[])
+with open(os.path.join(T, "fila-lixo.json"), "w") as f:
+    f.write("isto nao e json")
+os.makedirs(os.path.join(T, "fila-dir.json"), exist_ok=True)
+os.makedirs(os.path.join(T, "home", ".gc"), exist_ok=True)
+fila(os.path.join("home", ".gc", "pilot-dispatchable.json"), -100)
+
 PYEOF
 python3 -I "$T/fx.py" "$FX" "$NOW" || { echo "o gerador de fixtures falhou"; exit 2; }
 # as cidades de fixture moram em $FX
 RT="$FX/rota"; OC="$FX/ocup"; MU="$FX/muitas"; SR="$FX/sr"; LR="$FX/lr"; DR="$FX/dr"; NA="$FX/na"; VZ="$FX/vz"; LX="$FX/lx"; DN="$FX/dn"; SP="$FX/span"; DIA="$FX/dia"; PV="$FX/pv"; OI="$FX/oi"; RL="$FX/real"; EV="$FX/ev"; SOR="$FX/sor"; SV="$FX/sv"
+FU="$FX/funil"; F2="$FX/funil2"; PD="$FX/padrao"; HM="$FX/home"
+# os arquivos soltos (logs do Pilot, filas) moram em $FX; NOPILOT/NOFILA não existem de propósito
+PLU="$FX/pilot-utc.log"; PLB="$FX/pilot-brt.log"; NOPILOT="$FX/nao-existe.log"; NOFILA="$FX/nao-existe.json"
 
 # ---- a linha REAL do Pilot: o gancho de verdade (_pilot_wa_node_decide, extraído palavra por palavra do pilot-dispatcher.sh) roda em shadow contra um despachante falso e grava em $RL.
 # O despachante falso devolve o par (rc, saída) que o `check` real devolve (classify_checked); a linha é a que o Pilot grava, não a que este selftest imagina.
@@ -309,10 +426,11 @@ PYEOF
 
 SCRIPT="$REAL"; VERBOSE=0; OUT=""; RC=0; J=""
 # run <TZ> <args…>: roda o relatório (SCRIPT) com a hora fixa; $OUT = stdout, $RC = rc. NOWENV (se definida, mesmo vazia) troca a hora fixa
-run() { local tz=$1; shift; OUT=$(WA_NODE_REPORT_NOW="${NOWENV-$NOW}" TZ="$tz" python3 -I "$SCRIPT" "$@" 2>"$T/err"); RC=$?; }
-# jrun <TZ> <cidade> [args…]: --json
-jrun() { local tz=$1 city=$2; shift 2; run "$tz" --city "$city" --json "$@"; J=$OUT; }
-trun() { local tz=$1 city=$2; shift 2; run "$tz" --city "$city" "$@"; }
+# HOME aponta para uma pasta que não existe: a fila padrão (~/.gc/pilot-dispatchable.json) nunca é a do usuário de verdade. HOMEENV (se definida) troca
+run() { local tz=$1; shift; OUT=$(HOME="${HOMEENV-$T/sem-home}" WA_NODE_REPORT_NOW="${NOWENV-$NOW}" TZ="$tz" python3 -I "$SCRIPT" "$@" 2>"$T/err"); RC=$?; }
+# jrun <TZ> <cidade> [args…]: --json (log do Pilot e fila inexistentes: os casos de rota/CPU/estado não dependem deles)
+jrun() { local tz=$1 city=$2; shift 2; run "$tz" --city "$city" --pilot-log "$NOPILOT" --dispatchable "$NOFILA" --json "$@"; J=$OUT; }
+trun() { local tz=$1 city=$2; shift 2; run "$tz" --city "$city" --pilot-log "$NOPILOT" --dispatchable "$NOFILA" "$@"; }
 jf() { printf '%s' "$J" | jq -r "$1" 2>/dev/null; }
 # eq <atual> <esperado> <rótulo>: no caso real (VERBOSE=1) diz o que veio; no mutante fica quieto
 # Número compara como número: o jq 1.7 devolve 24.0 como veio do Python e o 1.6 devolve 24 — o selftest não pode depender da versão do jq.
@@ -503,6 +621,113 @@ chk_ocup_ilegiveis() {
   trun UTC "$OI" --hours 24 && has "$OUT" "(de 1 com sessões lidas; 4 sem sessões lidas, 4 delas com entrada ilegível: a lista pode estar incompleta e não entra na conta)"
 }
 
+# ============================== FUNIL ==============================
+fc() { jf ".funil.analise.categorias.$1|\"\(.linhas)/\(.beads)\""; }
+# <TZ> <log do Pilot>: a mesma contagem, qualquer que seja o fuso de quem roda (o log grava a hora LOCAL, sem fuso)
+funil_esperado() {
+  run "$1" --city "$FU" --pilot-log "$2" --dispatchable "$NOFILA" --hours 24 --json; J=$OUT
+  eq "$RC" 0 rc && eq "$(jf .funil.estado)" ok estado && eq "$(jf .funil.analise.rodadas)" 3 rodadas &&
+  eq "$(fc cedida)" "6/3" cedida && eq "$(fc teto)" "4/3" teto && eq "$(fc claim)" "5/4" "claim (inclui as duas beads exatamente nas bordas da janela)" && eq "$(fc mini)" "2/2" mini &&
+  eq "$(jf .funil.analise.sem_hora)" 3 "sem hora legível (a claim sem hora, a hora impossível e o início de rodada sem hora)" &&
+  eq "$(jf .funil.analise.no_gancho)" 2 no_gancho && eq "$(jf .funil.analise.ao_no)" 0 ao_no && eq "$(jf .funil.analise.pararam_antes)" 4 pararam_antes && eq "$(jf .funil.analise.gancho_gravou)" false gancho_gravou
+}
+chk_funil_utc() { funil_esperado UTC "$PLU"; }
+chk_funil_fuso() { funil_esperado BRT3 "$PLB"; }
+chk_funil_texto() {
+  run UTC --city "$FU" --pilot-log "$PLU" --dispatchable "$NOFILA" --hours 24; has "$OUT" "3 rodada(s) do Pilot na janela" &&
+  has "$OUT" "cedidas ou no teto e SEM NENHUMA linha na rota: 4 bead(s)" && has "$OUT" "2 bead(s)  (atribuídas ao nó: 0)" &&
+  has "$OUT" "3 linha(s) do funil sem hora legível (ausente ou impossível), FORA das contas acima" &&
+  has "$OUT" "ATENÇÃO — o Pilot não gravou NENHUMA linha de rota na janela" && hasnt "$OUT" "o nó nunca viu"
+}
+# o gancho gravou (linha do Pilot) e uma bead só tem leitura que falhou: TEM linha na rota, mesmo sem veredito
+chk_funil_gancho() {
+  run UTC --city "$F2" --pilot-log "$PLU" --dispatchable "$NOFILA" --hours 24 --json; J=$OUT
+  eq "$(jf .funil.analise.no_gancho)" 3 "wa-c2, wa-c1 e wa-t2 (esta só com leitura que falhou) têm linha na rota" && eq "$(jf .funil.analise.pararam_antes)" 2 "só wa-c3 e wa-hut4l5.4 ficaram sem linha" &&
+  eq "$(jf .funil.analise.gancho_gravou)" true gancho_gravou &&
+  run UTC --city "$F2" --pilot-log "$PLU" --dispatchable "$NOFILA" --hours 24 && has "$OUT" "cedidas ou no teto e SEM NENHUMA linha na rota: 2 bead(s)" &&
+  has "$OUT" "sem linha na rota não prova que o nó não viu" && hasnt "$OUT" "ATENÇÃO — o Pilot não gravou NENHUMA linha"
+}
+# rota ausente ou ilegível → NÃO SEI (null), nunca 0 e nunca "todas pararam"; rota VAZIA é uma resposta (nenhuma bead tem linha → as 5 cedidas/no teto ficaram sem)
+chk_funil_sem_rota() {
+  local c
+  for c in "$SR" "$LR"; do
+    run UTC --city "$c" --pilot-log "$PLU" --dispatchable "$NOFILA" --hours 24 --json; J=$OUT
+    eq "$RC" 0 rc && eq "$(jf .funil.estado)" ok estado && eq "$(jf .funil.analise.pararam_antes)" null pararam_antes && eq "$(jf .funil.analise.no_gancho)" null no_gancho && eq "$(jf .funil.analise.ao_no)" null ao_no &&
+    eq "$(jf .funil.analise.gancho_gravou)" null gancho_gravou && eq "$(fc cedida)" "6/3" "cedida (a contagem do log não depende da rota)" || return 1
+  done
+  run UTC --city "$SR" --pilot-log "$PLU" --dispatchable "$NOFILA" --hours 24 && has "$OUT" "NÃO SEI — o log de rota (seção 1) não foi lido" &&
+  run UTC --city "$VZ" --pilot-log "$PLU" --dispatchable "$NOFILA" --hours 24 --json && J=$OUT && eq "$(jf .funil.analise.no_gancho)" 0 "rota vazia: nenhuma tem linha" && eq "$(jf .funil.analise.pararam_antes)" 5 "rota vazia: as 5 ficaram sem linha" &&
+  eq "$(jf .funil.analise.gancho_gravou)" false "rota vazia: o Pilot não gravou"
+}
+chk_funil_estados() {
+  run UTC --city "$FU" --pilot-log "$NOPILOT" --dispatchable "$NOFILA" --hours 24 --json; J=$OUT; eq "$(jf .funil.estado)" ausente "log do Pilot ausente" && eq "$(jf .funil.analise)" null "sem análise" &&
+  run UTC --city "$FU" --pilot-log "$FX/pilot-dir.log" --dispatchable "$NOFILA" --hours 24 --json && J=$OUT && eq "$(jf .funil.estado)" ilegivel "pasta no lugar do log" &&
+  run UTC --city "$FU" --pilot-log "$FX/pilot-vazio.log" --dispatchable "$NOFILA" --hours 24 --json && J=$OUT && eq "$(jf .funil.estado)" vazio "log vazio" &&
+  run UTC --city "$FU" --pilot-log "$NOPILOT" --dispatchable "$NOFILA" --hours 24 && has "$OUT" "AUSENTE" && has "$OUT" "NÃO é zero" || return 1
+  # o log existe e nada cai na janela: é "ok" com zeros (a resposta é "nenhuma"), não "vazio" nem "ausente"
+  NOWENV=$((NOW - 2592000)); run UTC --city "$FU" --pilot-log "$PLU" --dispatchable "$NOFILA" --hours 24 --json; J=$OUT; unset NOWENV
+  eq "$(jf .funil.estado)" ok "log com linhas, nenhuma na janela" && eq "$(jf .funil.analise.rodadas)" 0 rodadas && eq "$(fc cedida)" "0/0" cedida
+}
+chk_wa_id_sem_ponto() { # o id não leva o ponto final da frase: carrega o módulo e testa as linhas do Pilot de verdade
+  python3 -I - "$SCRIPT" <<'PYEOF' >/dev/null 2>&1
+import importlib.util, sys
+sys.dont_write_bytecode = True  # carregar o script não pode deixar um __pycache__ na árvore
+spec = importlib.util.spec_from_file_location("wa_node_report", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+casos = [("claim", "[2026-10-14 02:06:40] [pilot-dispatcher] Claim acquired on wa-qp98sy.", "wa-qp98sy"),
+         ("claim", "[2026-10-14 02:06:40] [pilot-dispatcher] Claim acquired on wa-hut4l5.4.", "wa-hut4l5.4")]
+for cat, linha, esperado in casos:
+    achou = [rx.search(linha) for c, rx in m.FUNIL if c == cat]
+    achou = [x for x in achou if x]
+    assert len(achou) == 1 and achou[0].group(1) == esperado, (linha, [x.group(1) for x in achou])
+PYEOF
+}
+
+# ============================== FILA ==============================
+fila_run() { run UTC --city "$FU" --pilot-log "$NOPILOT" --dispatchable "$1" "${@:2}"; }
+chk_fila_ok() {
+  fila_run "$FX/fila-ok.json" --json; J=$OUT
+  eq "$(jf .fila.estado)" ok estado && eq "$(jf .fila.analise.wa)" 6 wa && eq "$(jf .fila.analise.total)" 9 total && eq "$(jf .fila.analise.itens_ilegiveis)" 1 "o item que não é objeto" &&
+  eq "$(jf '.fila.analise.prioridades|tojson')" '{"0":1,"1":2,"2":1,"3":1,"?":1}' prioridades && eq "$(jf .fila.analise.idade_s)" 2400 idade && eq "$(jf .fila.analise.ttl_s)" 1800 ttl
+}
+chk_fila_texto() {
+  fila_run "$FX/fila-ok.json"; has "$OUT" "fila despachável: 6 de WA entre 9 (gerada há 40 min, VENCIDA); por prioridade: P0=1, P1=2, P2=1, P3=1, P?=1; 1 item(ns) que não é(são) objeto, fora da conta de WA" &&
+  fila_run "$FX/fila-fresca.json" && has "$OUT" "gerada há 2 min)" && hasnt "$OUT" "VENCIDA" &&
+  fila_run "$FX/fila-na-borda.json" && has "$OUT" "gerada há 30 min)" && hasnt "$OUT" "VENCIDA"
+}
+# gerada no futuro, sem hora ou com hora impossível (mês 13): idade null (não sei), nunca 0, nunca negativa — e o relatório NÃO cai
+chk_fila_hora_ruim() {
+  local f
+  for f in fila-futura fila-sem-hora fila-hora-impossivel; do
+    fila_run "$FX/$f.json" --json; J=$OUT
+    eq "$RC" 0 "$f: rc" && eq "$(jf .fila.estado)" ok "$f: estado" && eq "$(jf .fila.analise.idade_s)" null "$f: idade" || return 1
+  done
+  fila_run "$FX/fila-futura.json" && has "$OUT" "sem hora de geração legível" && hasnt "$OUT" "gerada há -"
+}
+chk_fila_estados() {
+  local f e
+  for f in fila-itens-texto fila-lista fila-lixo fila-dir; do
+    fila_run "$FX/$f.json" --json; J=$OUT; e=$(jf .fila.estado)
+    [ "$e" = ilegivel ] || { [ "$VERBOSE" = 1 ] && echo "      $f: esperado ilegivel, veio $e" >&2; return 1; }
+  done
+  fila_run "$NOFILA" --json; J=$OUT; eq "$(jf .fila.estado)" ausente "fila ausente" && eq "$(jf .fila.analise)" null "sem análise"
+}
+# os caminhos padrão: o log do Pilot na cidade, a fila em $HOME/.gc — e sem a fila no HOME ela é AUSENTE (nunca a do usuário de verdade)
+chk_caminhos_padrao() {
+  HOMEENV="$HM"; run UTC --city "$PD" --hours 24 --json; J=$OUT; unset HOMEENV
+  eq "$RC" 0 rc && eq "$(jf .funil.estado)" ok "log padrão da cidade" && eq "$(jf .funil.arquivo)" "$PD/.gc/logs/pilot-dispatcher.log" arquivo_log && eq "$(fc cedida)" "6/3" cedida &&
+  eq "$(jf .fila.estado)" ok "fila padrão em HOME/.gc" && eq "$(jf .fila.arquivo)" "$HM/.gc/pilot-dispatchable.json" arquivo_fila && eq "$(jf .fila.analise.wa)" 6 wa &&
+  run UTC --city "$PD" --hours 24 --json && J=$OUT && eq "$(jf .fila.estado)" ausente "HOME sem a fila: ausente"
+}
+# caminho vazio é uso errado (rc 2), nunca "o padrão"
+chk_caminho_vazio_rc2() {
+  local r1
+  run UTC --city "$RT" --pilot-log ""; r1=$RC
+  run UTC --city "$RT" --dispatchable ""
+  eq "$r1" 2 "--pilot-log vazio" && eq "$RC" 2 "--dispatchable vazio"
+}
+
 # ============================== ESTADOS E CÓDIGOS DE SAÍDA ==============================
 chk_rc3_nenhum_log() {
   jrun UTC "$NA"; eq "$RC" 3 "cidade sem logs" && eq "$(jf .rota.estado)" ausente rota && eq "$(jf .ocupacao.estado)" ausente ocupacao && eq "$(jf .prontidao)" null prontidao &&
@@ -531,7 +756,7 @@ chk_args_rc2() {
 }
 chk_args_validos() {
   local a
-  for a in "--hours 1" "--hours 99999" "--busy-pct 100" "--busy-pct 1" "--min-hours 0" "--min-beads 0"; do
+  for a in "--hours 1" "--hours 99999" "--busy-pct 100" "--busy-pct 1" "--min-hours 0" "--min-beads 0" "--pilot-log $NOPILOT" "--dispatchable $NOFILA"; do
     run UTC --city "$RT" $a
     [ "$RC" = 0 ] || { [ "$VERBOSE" = 1 ] && echo "      '$a' → rc $RC (esperado 0)" >&2; return 1; }
   done
@@ -548,18 +773,20 @@ chk_now_env() {
 chk_somente_leitura() {
   local a b d
   a=$(cd "$T" && { find fx -type f -exec cksum {} +; find fx; } | sort)
-  for d in rota ocup muitas sr lr dr na vz lx dn span dia pv oi; do jrun UTC "$FX/$d"; trun BRT3 "$FX/$d" --hours 100; done
+  for d in rota ocup muitas sr lr dr na vz lx dn span dia pv oi funil funil2 padrao; do jrun UTC "$FX/$d"; trun BRT3 "$FX/$d" --hours 100; done
+  run UTC --city "$FU" --pilot-log "$PLU" --dispatchable "$FX/fila-ok.json" --hours 24; run BRT3 --city "$F2" --pilot-log "$PLB" --dispatchable "$FX/fila-hora-impossivel.json" --json
+  HOMEENV="$HM"; run UTC --city "$PD" --hours 24; unset HOMEENV
   NOWENV=$(( $(date -u +%s) + 5 )); jrun UTC "$RL"; trun BRT3 "$RL" --hours 100; unset NOWENV
   b=$(cd "$T" && { find fx -type f -exec cksum {} +; find fx; } | sort)
   eq "$a" "$b" "a árvore de fixtures depois de rodar tudo"
 }
 chk_json_uma_linha() {
   local d
-  for d in rota ocup na vz; do
+  for d in rota ocup na vz funil; do
     jrun UTC "$FX/$d"
     printf '%s' "$J" | jq -e 'type=="object"' >/dev/null 2>&1 || { [ "$VERBOSE" = 1 ] && echo "      $d: a saída não é um objeto JSON" >&2; return 1; }
     eq "$(printf '%s\n' "$J" | wc -l | tr -d ' ')" 1 "$d: linhas" || return 1
-    eq "$(jf 'keys|join(",")')" "janela,ocupacao,prontidao,rota" "$d: chaves" || return 1
+    eq "$(jf 'keys|join(",")')" "fila,funil,janela,ocupacao,prontidao,rota" "$d: chaves" || return 1
   done
 }
 
@@ -599,6 +826,7 @@ for c in veredito_final sombra_nao_e_entrega ultimo_por_hora instaveis conferir_
          cobertura horas_com_dado aviso_pilot_sem_veredito modos soltas_leituras ordem_do_arquivo \
          prontidao_falta prontidao_beads_na_borda prontidao_so_veredito prontidao_horas_na_borda prontidao_inalcancavel prontidao_nunca_aprova \
          ocup_totais ocup_horas_utc ocup_hora09 ocup_wa_remoto ocup_hora_sem_cpu ocup_texto ocup_ilegiveis ocup_bordas sem_epoch tabela_72 ocup_nao_leitura ocup_so_reaper eventos_desconhecidos horas_so_sem_veredito node_anterior \
+         funil_utc funil_fuso funil_texto funil_gancho funil_sem_rota funil_estados wa_id_sem_ponto fila_ok fila_texto fila_hora_ruim fila_estados caminhos_padrao caminho_vazio_rc2 \
          rc3_nenhum_log rc0_basta_um rota_vazia ausente_nao_e_zero args_rc2 args_validos horas_decimal now_env somente_leitura json_uma_linha; do
   check "$c"
 done
@@ -759,6 +987,64 @@ mut janela-em-minutos chk_horas_decimal 'lo, hi = now - a.hours * 3600, now' 'lo
 mut escreve-na-cidade chk_somente_leitura '    rota_p, occ_p = os.path.join(city, ".gc", "wa-node-route.jsonl"), os.path.join(city, ".gc", "hetzner-occupancy.jsonl")' "    rota_p, occ_p = os.path.join(city, \".gc\", \"wa-node-route.jsonl\"), os.path.join(city, \".gc\", \"hetzner-occupancy.jsonl\")${nl}    open(os.path.join(city, \".gc\", \"x.tmp\"), \"w\").write(\"x\")"
 mut json-em-varias-linhas chk_json_uma_linha 'json.dumps(res, ensure_ascii=False, sort_keys=True)' 'json.dumps(res, ensure_ascii=False, sort_keys=True, indent=2)'
 mut json-sem-ordem-das-chaves chk_json_uma_linha 'json.dumps(res, ensure_ascii=False, sort_keys=True)' 'json.dumps({k: v for k, v in res.items() if k != "prontidao"}, ensure_ascii=False, sort_keys=True)'
+
+# -- funil (o log do Pilot) e a ligação com a rota
+mut funil-sem-fuso chk_funil_fuso 'e = time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))' 'e = calendar.timegm(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))'
+mut funil-janela-sem-teto chk_funil_utc '        if not (lo <= e <= hi):' '        if not (lo <= e):'
+mut funil-janela-sem-piso chk_funil_utc '        if not (lo <= e <= hi):' '        if not (e <= hi):'
+mut funil-janela-piso-exclusivo chk_funil_utc '        if not (lo <= e <= hi):' '        if not (lo < e <= hi):'
+mut funil-janela-teto-exclusivo chk_funil_utc '        if not (lo <= e <= hi):' '        if not (lo <= e < hi):'
+mut funil-rodadas-caladas chk_funil_utc '            rodadas += 1' '            rodadas += 0'
+mut funil-teto-so-um-padrao chk_funil_utc '    ("teto", re.compile(r"ga-in9ebr: wa-worker pool at session cap \(.*?\) — QUEUED " + WA_ID + r": claim released")),' '    ("teto", re.compile(r"NUNCA-CASA-" + WA_ID)),'
+mut funil-mini-pega-o-no chk_funil_utc '→ wa-worker "))' '→ wa-worker"))'
+mut funil-qualquer-prefixo chk_funil_utc 'WA_ID = r"(wa-[A-Za-z0-9]+(?:\.[0-9]+)*)"' 'WA_ID = r"([a-z]+-[A-Za-z0-9]+(?:\.[0-9]+)*)"'
+mut funil-id-leva-o-ponto-final chk_wa_id_sem_ponto 'WA_ID = r"(wa-[A-Za-z0-9]+(?:\.[0-9]+)*)"' 'WA_ID = r"(wa-[A-Za-z0-9.]+)"'
+mut funil-id-sem-sufixo chk_wa_id_sem_ponto 'WA_ID = r"(wa-[A-Za-z0-9]+(?:\.[0-9]+)*)"' 'WA_ID = r"(wa-[A-Za-z0-9]+)"'
+mut funil-sem-hora-calado chk_funil_utc '                sem_hora += 1' '                sem_hora += 0'
+mut funil-sem-hora-conta-tudo chk_funil_utc '            if hit or SWEEP_START in ln:' '            if True:'
+mut funil-sem-hora-sem-rodada chk_funil_utc '            if hit or SWEEP_START in ln:' '            if hit:'
+mut funil-hora-impossivel-quebra chk_funil_utc "            except (ValueError, OverflowError):${nl}                e = None" "            except OverflowError:${nl}                e = None"
+mut funil-ilegivel-vira-vazio chk_funil_estados "        return \"ilegivel\", None${nl}    cats = {c: {" "        return \"vazio\", None${nl}    cats = {c: {"
+mut funil-ausente-vira-vazio chk_funil_estados "        return \"ausente\", None${nl}    except OSError:" "        return \"vazio\", None${nl}    except OSError:"
+mut funil-vazio-vira-ok chk_funil_estados 'return ("ok" if raw.strip() else "vazio"), {"rodadas"' 'return "ok", {"rodadas"'
+mut funil-pararam-so-cedidas chk_funil_utc 'antes = fa["categorias"]["cedida"]["_beads"] | fa["categorias"]["teto"]["_beads"]' 'antes = fa["categorias"]["cedida"]["_beads"]'
+mut funil-pararam-com-claim chk_funil_utc 'antes = fa["categorias"]["cedida"]["_beads"] | fa["categorias"]["teto"]["_beads"]' 'antes = fa["categorias"]["cedida"]["_beads"] | fa["categorias"]["teto"]["_beads"] | fa["categorias"]["claim"]["_beads"]'
+mut funil-pararam-sem-rota-vira-todas chk_funil_sem_rota 'fa["pararam_antes"] = len(antes - ra["_beads"]) if ra else None' 'fa["pararam_antes"] = len(antes - (ra["_beads"] if ra else set()))'
+mut funil-no-gancho-sem-rota-vira-zero chk_funil_sem_rota 'fa["no_gancho"] = len(ra["_beads"]) if ra else None' 'fa["no_gancho"] = len(ra["_beads"]) if ra else 0'
+mut funil-ao-no-sem-rota-vira-zero chk_funil_sem_rota 'fa["ao_no"] = len(ra["ao_no_de_verdade"]) if ra else None' 'fa["ao_no"] = len(ra["ao_no_de_verdade"]) if ra else 0'
+mut funil-gancho-gravou-sem-rota chk_funil_sem_rota 'fa["gancho_gravou"] = bool(ra["modos"]) if ra else None' 'fa["gancho_gravou"] = bool(ra["modos"]) if ra else False'
+mut funil-gancho-gravou-sempre chk_funil_utc 'fa["gancho_gravou"] = bool(ra["modos"]) if ra else None' 'fa["gancho_gravou"] = True if ra else None'
+mut funil-rota-so-com-veredito chk_funil_gancho '"_beads": set(beads),' '"_beads": set(b for b in beads if beads[b]["cats"]),'
+mut funil-aviso-gancho-calado chk_funil_texto '            if not a["gancho_gravou"]:' '            if False:'
+mut funil-aviso-gancho-sempre chk_funil_gancho '            if not a["gancho_gravou"]:' '            if True:'
+mut funil-nao-sei-calado chk_funil_sem_rota '        if a["no_gancho"] is None:' '        if False:'
+mut funil-sem-hora-nao-dita chk_funil_texto '        if a["sem_hora"]:' '        if False:'
+mut funil-ressalva-trocada chk_funil_gancho '(sem linha na rota não prova que o nó não viu:' '(confira a rota:'
+# -- fila despachável
+mut fila-items-nao-lista chk_fila_estados 'if not isinstance(o, dict) or not isinstance(o.get("items"), list):' 'if not isinstance(o, dict):'
+mut fila-lista-sem-dict chk_fila_estados 'if not isinstance(o, dict) or not isinstance(o.get("items"), list):' 'if not isinstance(o.get("items"), list):'
+mut fila-toda-loja chk_fila_ok '        elif it.get("store") == "whatsapp_automation":' '        elif True:'
+mut fila-prioridade-fixa chk_fila_ok 'k = str(it.get("priority", "?"))' 'k = "0"'
+mut fila-prioridade-sem-padrao chk_fila_ok 'k = str(it.get("priority", "?"))' 'k = str(it.get("priority", 0))'
+mut fila-itens-ilegiveis-calado chk_fila_ok '            ileg += 1' '            ileg += 0'
+mut fila-total-so-wa chk_fila_ok '"total": len(o["items"])' '"total": wa'
+mut fila-idade-negativa chk_fila_hora_ruim '        if idade is not None and idade < 0:' '        if False:'
+mut fila-sem-hora-vira-zero chk_fila_hora_ruim "    idade = None${nl}    if isinstance(g, str) and TS_RE.match(g):" "    idade = 0${nl}    if isinstance(g, str) and TS_RE.match(g):"
+mut fila-hora-impossivel-quebra chk_fila_hora_ruim "        except (ValueError, OverflowError):${nl}            idade = None" "        except OverflowError:${nl}            idade = None"
+mut fila-vencida-invertida chk_fila_texto 'q["idade_s"] <= q["ttl_s"]' 'q["idade_s"] >= q["ttl_s"]'
+mut fila-vencida-na-borda chk_fila_texto 'q["idade_s"] <= q["ttl_s"]' 'q["idade_s"] < q["ttl_s"]'
+mut fila-ilegivel-vira-ausente chk_fila_estados "        return \"ausente\", None${nl}    except (OSError, ValueError):${nl}        return \"ilegivel\", None" "        return \"ausente\", None${nl}    except (OSError, ValueError):${nl}        return \"ausente\", None"
+mut fila-ausente-vira-ilegivel chk_fila_estados "    except FileNotFoundError:${nl}        return \"ausente\", None${nl}    except (OSError, ValueError):" "    except FileNotFoundError:${nl}        return \"ilegivel\", None${nl}    except (OSError, ValueError):"
+# -- caminhos e uso
+mut caminho-vazio-vira-padrao chk_caminho_vazio_rc2 '        if v is not None and v == "":' '        if False:'
+mut caminho-log-padrao-errado chk_caminhos_padrao 'os.path.join(city, ".gc", "logs", "pilot-dispatcher.log")' 'os.path.join(city, ".gc", "pilot-dispatcher.log")'
+mut caminho-fila-padrao-errado chk_caminhos_padrao 'os.path.join(os.path.expanduser("~"), ".gc", "pilot-dispatchable.json")' 'os.path.join(os.path.expanduser("~"), ".gc", "pilot-dispatchable.jsonl")'
+mut caminho-fila-padrao-na-cidade chk_caminhos_padrao 'os.path.join(os.path.expanduser("~"), ".gc", "pilot-dispatchable.json")' 'os.path.join(city, ".gc", "pilot-dispatchable.json")'
+mut caminho-log-explicito-ignorado chk_funil_utc 'log_p = a.pilot_log if a.pilot_log is not None else os.path.join(city, ".gc", "logs", "pilot-dispatcher.log")' 'log_p = os.path.join(city, ".gc", "logs", "pilot-dispatcher.log")'
+mut caminho-fila-explicito-ignorado chk_fila_ok 'fila_p = a.dispatchable if a.dispatchable is not None else os.path.join(os.path.expanduser("~"), ".gc", "pilot-dispatchable.json")' 'fila_p = os.path.join(os.path.expanduser("~"), ".gc", "pilot-dispatchable.json")'
+mut json-sem-funil chk_json_uma_linha '        "funil": {"arquivo": log_p, "estado": fe, "analise": fa},' '        "funil_": {"arquivo": log_p, "estado": fe, "analise": fa},'
+mut json-sem-fila chk_json_uma_linha '        "fila": {"arquivo": fila_p, "estado": qe, "analise": qa},' '        "fila_": {"arquivo": fila_p, "estado": qe, "analise": qa},'
+mut funil-escreve-no-log chk_somente_leitura "        with open(path, \"rb\") as f:${nl}            raw = f.read().decode(\"utf-8\", \"replace\")" "        with open(path, \"ab+\") as f:${nl}            f.write(b\"x\\\\n\"); f.seek(0)${nl}            raw = f.read().decode(\"utf-8\", \"replace\")"
 
 if [ -z "${WA_NODE_REPORT_ST_NOMUT:-}" ]; then
   [ "$MUTANTS" -ge "$MIN_MUT" ] || { echo "FAIL o piso: só $MUTANTS mutantes (mínimo $MIN_MUT) — apagar mutantes não passa por 'todos mortos'"; fails=$((fails+1)); n=$((n+1)); }
