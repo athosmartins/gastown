@@ -99,4 +99,4 @@ run_suite "despachante ps-node-dispatch (mutantes inclusos)"          48 timeout
 run_suite "gate-done-remote (rigs gascity + property_scrapers)"      280 timeout 900 "$BASH32" "$GDR_ST"
 PS_NODE_ROUTE_ST_NOMUT=1 run_suite "gancho do Pilot _pilot_ps_node_decide (sem mutantes)" 125 timeout 600 "$BASH32" "$PIL_ST"
 
-log "OK — classificação, roteamento e gate-done do nó para o PS prontos e INERTES; $NODE_NOTE. A bead real no nó é passo de ligar (docs/runbooks/hetzner-ps-node.md)."
+log "OK — classificação, roteamento e gate-done do nó para o PS prontos e INERTES nos arquivos versionados (o plist VIVO do Pilot e o ambiente do processo não são lidos aqui); $NODE_NOTE. A bead real no nó é passo de ligar (docs/runbooks/hetzner-ps-node.md)."

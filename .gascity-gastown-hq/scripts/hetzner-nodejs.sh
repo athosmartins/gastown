@@ -45,7 +45,7 @@ SHA=$(pin_get NODE_SHA256_LINUX_ARM64) || die 2 "NAO-CONSEGUI: $PIN não tem NOD
 # Só LÊ. Imprime ARCH, NODE e a sentinela FIM; sem a sentinela quem chama trata como "não consegui ler".
 remote_probe() { cat <<'EOF'
 V=$1
-# vazio/falhou → ~/.local ainda não existe: fica o literal (o node estará ausente de qualquer jeito); existindo, o caminho CANÔNICO, porque o readlink -f abaixo também resolve tudo e $HOME pode cruzar um symlink
+# vazio/falhou → ~/.local ainda não existe ou não é atravessável (permissão): fica o literal e o `-e` abaixo falha igual (o check diz ausente e o install falha alto no mkdir); existindo, o caminho CANÔNICO, porque o readlink -f abaixo também resolve tudo e $HOME pode cruzar um symlink
 H=$(cd "$HOME/.local" 2>/dev/null && pwd -P) || H=$HOME/.local
 echo "ARCH $(uname -s) $(uname -m)"
 n=$H/bin/node
