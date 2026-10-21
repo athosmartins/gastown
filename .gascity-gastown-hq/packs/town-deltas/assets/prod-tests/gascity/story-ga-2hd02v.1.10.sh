@@ -5,7 +5,7 @@
 #   O que verifica · O que não verifica · Por que é seguro rodar · O que é aviso e não falha
 #
 # O QUE VERIFICA (nos arquivos IMPLANTADOS, não numa cópia): o classificador, o despachante e o gancho do Pilot existem e parseiam; os três selftests terminam com "N/N ok" e o mínimo de casos
-#   (classificador com os mutantes dele, despachante com 60, gancho do Pilot com 29 — mutante que sobrevive derruba o selftest); o template wa-worker-remote nasce INERTE (min_active_sessions = 0; quantas sessões o teto deixa abrir é
+#   (classificador com os mutantes dele, despachante com 60, gancho do Pilot com 30 — mutante que sobrevive derruba o selftest); o template wa-worker-remote nasce INERTE (min_active_sessions = 0; quantas sessões o teto deixa abrir é
 #   conferido por story-ga-2hd02v.3.sh, que também cobre o modo `pilot` de N slots);
 #   o gancho do Pilot nasce DESLIGADO (padrão `off` no fonte, e nenhum arquivo de configuração da cidade o liga); o prompt do worker remoto não tem skill com barra no início (ga-7nxfa1).
 # O QUE NÃO VERIFICA — e não diz que verifica: as "3 beads reais entregues pelo nó" e a "varredura do nó sem arquivo de dado de lead" que a história pede. Elas dependem do flip da ga-2hd02v.1.6 e do
@@ -70,6 +70,6 @@ log "template inerte (min 0), sem skill com barra, aponta para o runbook ✓"
 # ── os selftests, contra a árvore viva ───────────────────────────────────────
 run_suite "classificador wa-node-classify (mínimo 85 itens, mutantes no selftest)" 85 timeout 600 "$BASH32" "$CLS_ST"
 run_suite "despachante wa-node-dispatch (319 itens, 60 mutantes)"        310 timeout 900 "$BASH32" "$DSP_ST"
-run_suite "gancho do Pilot _pilot_wa_node_decide (254 itens, 29 mutantes)" 245 timeout 900 "$BASH32" "$PIL_ST"
+run_suite "gancho do Pilot _pilot_wa_node_decide (257 itens, 30 mutantes)" 250 timeout 900 "$BASH32" "$PIL_ST"
 
 log "OK — classificação + roteamento prontos e INERTES. As 3 beads reais e a varredura do nó são passos de ligar (docs/runbooks/hetzner-wa-node.md)."

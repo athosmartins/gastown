@@ -4,26 +4,29 @@
 # Contents
 #   O que verifica · O que não verifica · Por que é seguro rodar · O que é aviso e não falha
 #
-# O QUE VERIFICA (nos arquivos IMPLANTADOS, não numa cópia): o modo `pilot` de N slots existe no despachante (wa-node-dispatch.sh) e no runbook; o teto de sessões do template wa-worker-remote (max_active_sessions) é um dígito ≥ 1 e o plist VERSIONADO e o plist VIVO do Pilot não ligam mais slots do que ele nem do que o `cap` do host
+# O QUE VERIFICA (nos arquivos IMPLANTADOS, não numa cópia): o modo `pilot` de N slots existe no gancho do Pilot e no despachante e o selftest do gancho nesse modo termina com "N/N ok" (N ≥ 240);
+#   o teto de sessões do template wa-worker-remote (max_active_sessions) é um dígito ≥ 1 e o plist VERSIONADO e o plist VIVO do Pilot não ligam mais slots do que ele nem do que o `cap` do host
 #   (.gc/session-ssh.json) deixam abrir — PILOT_WA_NODE_SLOTS acima do teto faria o Pilot atribuir a um alias que o engine não abre; PILOT_WA_NODE_SLOTS > 1 sem PILOT_WA_NODE_SPAWN=pilot não vale nada
-#   (o modo pool tem 1 slot); PILOT_WA_NODE_SPAWN que não seja pool|pilot vale pool em silêncio. O selftest do despachante (319 casos, 60 mutantes) roda em story-ga-2hd02v.1.10.sh, não aqui.
-# O QUE NÃO VERIFICA — e não diz que verifica: o gancho do Pilot que abre a sessão no modo `pilot` (_pilot_wa_node_open, fatia ga-2hd02v.3.3: até ela entrar, o Pilot não repassa PILOT_WA_NODE_SPAWN/SLOTS nem abre a sessão);
-#   que o nó rodou UMA bead de WhatsApp (o WA nunca rodou no nó), que a rota `auto` não mandou ao nó nenhuma bead com dado de lead (isso é a medida da sombra,
+#   (o modo pool tem 1 slot); PILOT_WA_NODE_SPAWN que não seja pool|pilot vale pool em silêncio; o runbook descreve o modo.
+# O QUE NÃO VERIFICA — e não diz que verifica: que o nó rodou UMA bead de WhatsApp (o WA nunca rodou no nó), que a rota `auto` não mandou ao nó nenhuma bead com dado de lead (isso é a medida da sombra,
 #   `.gc/wa-node-route.jsonl` mais os comentários `nó (...)` das beads), nem que o `pool` abre a sessão de uma bead da loja do WA (nunca provado; é por isso que mais de 1 slot usa o modo `pilot`).
 #   Este teste PASSAR não diz que o nó está ocupado: quem diz é o uso de CPU do nó por hora.
-# POR QUE É SEGURO RODAR: só lê arquivos (plist, toml, json, fonte). Não fala com o nó, não chama `gc` nem `bd`, não roda selftest, não toca em .gc/ vivo.
+# POR QUE É SEGURO RODAR: só lê arquivos (plist, toml, json, fonte) e roda o selftest do modo `pilot`, que usa bd/gc/despachante FALSOS numa pasta temporária. Não fala com o nó, não chama `gc` nem `bd`
+#   reais, não toca em .gc/ vivo.
 # O QUE É AVISO E NÃO FALHA: o plist vivo ou o config do host que não existem nesta máquina (não há o que conferir).
 #
 # Chamado por run.sh depois do deploy (STORY_ID=ga-2hd02v.3). Sai 0 se passar.
 set -uo pipefail
 
 CITY="${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}"
+ASSETS="$CITY/packs/town-deltas/assets"
 BASH32=/bin/bash
 log()  { echo "[prod-test:gascity ga-2hd02v.3] $*"; }
 warn() { echo "[prod-test:gascity ga-2hd02v.3] AVISO: $*"; }
 fail() { echo "[prod-test:gascity ga-2hd02v.3] FAIL: $*" >&2; exit 1; }
 [[ -x "$BASH32" ]] || fail "$BASH32 não executa — não dá para checar a sintaxe no interpretador de verdade"
 
+PIL="$ASSETS/pilot-dispatcher.sh"; SPAWN_ST="$ASSETS/pilot-dispatcher.wa-node-spawn.selftest.sh"
 DSP="$CITY/scripts/wa-node-dispatch.sh"
 AGENT="$CITY/agents/wa-worker-remote/agent.toml"
 RUNBOOK="$CITY/docs/runbooks/hetzner-wa-node.md"
@@ -31,14 +34,18 @@ PLIST_REPO="$CITY/scripts/com.gascity.pilot.plist"
 PLIST_LIVE="${PILOT_LIVE_PLIST:-$HOME/Library/LaunchAgents/com.gascity.pilot.plist}"
 HOSTCFG="$CITY/.gc/session-ssh.json"
 
-for f in "$DSP" "$AGENT" "$RUNBOOK" "$PLIST_REPO"; do [[ -f "$f" ]] || fail "arquivo implantado ausente: $f"; done
-"$BASH32" -n "$DSP" || fail "$DSP não parseia sob $BASH32"
+for f in "$PIL" "$SPAWN_ST" "$DSP" "$AGENT" "$RUNBOOK" "$PLIST_REPO"; do [[ -f "$f" ]] || fail "arquivo implantado ausente: $f"; done
+for f in "$PIL" "$SPAWN_ST" "$DSP"; do "$BASH32" -n "$f" || fail "$f não parseia sob $BASH32"; done
+[[ -x "$SPAWN_ST" ]] || fail "$SPAWN_ST sem permissão de execução"
 log "arquivos implantados presentes; sintaxe ok ✓"
 
-# ── o modo `pilot` existe no despachante e no runbook ────────────────────────
+# ── o modo `pilot` existe, e o padrão segue sendo o pool ─────────────────────
+grep -q '^_pilot_wa_node_spawn_mode() {' "$PIL" || fail "o gancho não tem _pilot_wa_node_spawn_mode ($PIL)"
+grep -q '^_pilot_node_remote_open() {' "$PIL" || fail "o gancho não tem _pilot_node_remote_open ($PIL)"
+grep -q '^_pilot_wa_node_open() {' "$PIL" || fail "o gancho não tem _pilot_wa_node_open ($PIL)"
 grep -q 'WA_NODE_SPAWN' "$DSP" && grep -q 'WA_NODE_SLOTS' "$DSP" && grep -q 'WA_NODE_SELF' "$DSP" || fail "o despachante não lê WA_NODE_SPAWN/WA_NODE_SLOTS/WA_NODE_SELF ($DSP)"
 grep -q '^## N slots: o modo `pilot`' "$RUNBOOK" || fail "o runbook não descreve o modo pilot ($RUNBOOK)"
-log "modo pilot presente no despachante e no runbook ✓"
+log "modo pilot presente no gancho, no despachante e no runbook ✓"
 
 # ── o teto: agent.toml, host e os dois plists ────────────────────────────────
 # vazio (sem a linha) → falha: não há como saber o teto; ilegível (não é um dígito) → o mesmo
@@ -87,4 +94,14 @@ check_plist() {
 check_plist "plist versionado" "$PLIST_REPO"
 if [[ -f "$PLIST_LIVE" ]]; then check_plist "plist vivo" "$PLIST_LIVE"; else warn "$PLIST_LIVE não existe nesta máquina: o plist vivo não foi conferido"; fi
 
-log "OK — despachante de N slots pronto e dentro do teto. O gancho do Pilot (ga-2hd02v.3.3), a rota auto e a prova do dia seguinte (wa-node-route.jsonl + CPU do nó por hora) são passos seguintes (docs/runbooks/hetzner-wa-node.md)."
+# ── o selftest do modo pilot, contra a árvore viva ──
+out="$(timeout 600 "$BASH32" "$SPAWN_ST" 2>&1)" || { echo "$out" | tail -25 >&2; fail "selftest do modo pilot falhou (ou estourou o tempo) contra a árvore viva"; }
+line=$(printf '%s\n' "$out" | grep -E '^[0-9]+/[0-9]+ ok$' | tail -1)
+[[ -n "$line" ]] || fail "selftest do modo pilot sem a linha de resultado 'N/N ok':
+$out"
+pass=${line%%/*}; rest=${line#*/}; total=${rest%% *}
+[[ "$pass" == "$total" && "$total" -ge 240 ]] || fail "selftest do modo pilot reportou '$line' (esperado todos ok e pelo menos 240 casos)"
+printf '%s\n' "$out" | grep -q 'SELFTEST OK' || fail "selftest do modo pilot sem a linha final de sucesso"
+log "selftest do modo pilot: $line ✓"
+
+log "OK — modo pilot de N slots pronto (despachante + gancho do Pilot) e dentro do teto. Rota auto, N slots vivos e a prova do dia seguinte (wa-node-route.jsonl + CPU do nó por hora) são passos de ligar (docs/runbooks/hetzner-wa-node.md)."
