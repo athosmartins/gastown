@@ -62,10 +62,10 @@ MERGED_MIN_AGE_MIN="${WORKTREE_REAPER_MERGED_MIN_AGE_MIN:-30}"
 case "$MERGED_MIN_AGE_MIN" in ''|*[!0-9]*) MERGED_MIN_AGE_MIN=30 ;; esac
 # ga-m5i7e6: how old a tree is = its FRESHEST sign of life (see _wt_fresh_epoch), not the mtime of its root directory, which
 # only moves when an entry is added or removed at the TOP level (a battery writing under pesquisa/ never touches it: six
-# traco-bim work trees, one with an agent inside, were reaped at "13-14 h"). 0 = the old rule, the directory mtime alone.
+# traco-bim work trees, one with an agent inside, were reaped at "13-14 h"). Only 0 = the old rule, the directory mtime alone.
 ACTIVITY_SCAN="${WORKTREE_REAPER_ACTIVITY_SCAN:-1}"
 # ga-m5i7e6: under disk pressure the age gate used to drop to PRESSURE_HOURS for EVERY tree. Now pressure removes only
-# MERGED trees (their work is in main); an unmerged one is kept and logged with its size. 1 = the old behavior.
+# MERGED trees (their work is in main); an unmerged one is kept and logged with its size. Only 1 = the old behavior.
 PRESSURE_REAP_UNMERGED="${WORKTREE_REAPER_PRESSURE_REAP_UNMERGED:-0}"
 PRESSURE_SIZE_BUDGET=20     # du runs for at most this many pressure keeps per sweep (a huge tree costs seconds); the rest log size_kb null
 # vazio/falhou → treated as GNU stat (-c %Y); if that is wrong too, every freshness read fails and every tree is KEPT
@@ -312,12 +312,13 @@ _mtime_of() {
 
 # ── _wt_fresh_epoch <wt> <now_s> — ga-m5i7e6: the newest sign of life of a worktree, as an epoch: its root directory's mtime,
 # its INDEX (every add/commit/checkout moves it), its HEAD commit, and any entry inside modified within the gate window
-# (`find -mmin`, the .git pointer pruned). Returns 1 when a signal that was asked for cannot be read: the caller KEEPS the
-# tree, an unreadable tree is not an old tree. ACTIVITY_SCAN=0 answers with the directory mtime alone (the old rule).
+# (`find -mmin`, the .git pointer pruned). Returns 1 when the directory's own mtime or the walk inside cannot be read: the
+# caller KEEPS the tree, an unreadable tree is not an old tree (an unreadable index or HEAD only adds no signal; the others
+# still count). Only ACTIVITY_SCAN=0 answers with the directory mtime alone (the old rule); any other value scans.
 _wt_fresh_epoch() {
   local wt="$1" now_s="$2" best t idx win inside rc
   best="$(_mtime_of "$wt")" || return 1
-  [ "$ACTIVITY_SCAN" = "1" ] || { printf '%s' "$best"; return 0; }
+  [ "$ACTIVITY_SCAN" != "0" ] || { printf '%s' "$best"; return 0; }
   # vazio → no index file adds no signal; falhou → same, the other signals still count
   idx="$(git -C "$wt" rev-parse --git-path index 2>/dev/null)"
   if [ -n "$idx" ]; then
@@ -342,8 +343,15 @@ _wt_fresh_epoch() {
   printf '%s' "$best"
 }
 
-# ── _keep_unsafe <repo> <wt> <br> <age_h> <merged> — ga-m5i7e6: the checks EVERY removal path passes before it touches a
-# tree (the plain remove, the dirty-preserve force-remove, the lock reaps). 0 = KEEP it (the event is logged here), 1 = go on.
+# ── _wt_lock_reason <repo> <wt> — ga-m5i7e6: the lock reason `git worktree list --porcelain` gives <wt> ("(no reason)" for a
+# bare lock); empty = not locked, or git itself failed (then the caller treats the tree as unlocked and applies _keep_unsafe).
+_wt_lock_reason() {
+  git -C "$1" worktree list --porcelain 2>/dev/null | awk -v p="$2" '$1=="worktree"{c=$2} $1=="locked"{ if(c==p){ $1=""; sub(/^ /,""); if ($0=="") $0="(no reason)"; print; exit } }'
+}
+
+# ── _keep_unsafe <repo> <wt> <br> <age_h> <merged> — ga-m5i7e6: the checks every tree passes before the plain remove and the
+# dirty-preserve force-remove (callers skip it for a LOCKED unmerged tree: the lock contract asks _worktree_in_use itself, and
+# reap_zombie_locked has its own check). 0 = KEEP it (the event is logged here), 1 = go on.
 #   (1) a live process has its cwd, its executable or any open file inside → kept_in_use (kept_merged_in_use when the tree is
 #       merged: the name older scenarios and dashboards know), merged or not, aged or not;
 #   (2) disk pressure removes only MERGED trees (PRESSURE_REAP_UNMERGED=1 restores the old rule): an unmerged one is
@@ -747,6 +755,12 @@ reap_zombie_locked() {
   case "$verdict" in zombie\ *) : ;; *) return 2 ;; esac
   pid="$(printf '%s' "$verdict" | awk '{print $2}')"
   why="$(printf '%s' "$verdict" | cut -d' ' -f3-)"
+  # ga-m5i7e6: a pid-confirmed zombie HOLDER says nothing about OTHER processes working in the tree, and the `remove -f -f`
+  # below takes their files with it (dirty or not): a process inside → KEPT, logged, no change to the lock.
+  if _worktree_in_use "$wt"; then
+    printf '{"ts":"%s","event":"kept_zombie_lock_in_use","repo":"%s","wt":"%s","branch":"%s","pid":%s,"age_h":%s,"label":"%s"}\n' "$(ts)" "$(_json_esc "$(basename "$repo")")" "$(_json_esc "$(basename "$wt")")" "$(_json_esc "$br")" "$pid" "$age" "$(_json_esc "$label")" >> "$LOG" 2>/dev/null
+    return 1
+  fi
   if [ "$ENABLED" != "1" ]; then
     printf '{"ts":"%s","event":"would_reap_zombie_lock","repo":"%s","wt":"%s","branch":"%s","pid":%s,"why":"%s","age_h":%s,"label":"%s"}\n' "$(ts)" "$(basename "$repo")" "$(basename "$wt")" "$br" "$pid" "$why" "$age" "$label" >> "$LOG" 2>/dev/null
     return 1
@@ -1212,11 +1226,14 @@ reap_pool_worktrees() {
         local merged=0
         if [ "$age_min" -ge "$MERGED_MIN_AGE_MIN" ] && _worktree_head_merged "$repo" "$wt"; then merged=1; fi
         if [ "$age" -le "$gate_hours" ] 2>/dev/null && [ "$merged" != "1" ]; then kept=$((kept+1)); wt=""; br=""; lock=""; continue; fi
-        # ga-m5i7e6: in use / disk-pressure-unmerged is checked for EVERY tree about to be removed (it used to be the merged
-        # branch only), before the lock contract and the remove below.
-        if _keep_unsafe "$repo" "$wt" "$br" "$age" "$merged"; then
-          kept=$((kept+1))
-          wt=""; br=""; lock=""; continue
+        # ga-m5i7e6: in use / disk-pressure-unmerged is checked for every tree about to be removed (it used to be the merged
+        # branch only). A LOCKED unmerged tree is left to the lock contract below: its own proofs (zombie holder, merged +
+        # clean + unused, closed bead) are what frees disk under pressure, and each already asks _worktree_in_use.
+        if [ "$merged" = "1" ] || [ -z "$lock" ]; then
+          if _keep_unsafe "$repo" "$wt" "$br" "$age" "$merged"; then
+            kept=$((kept+1))
+            wt=""; br=""; lock=""; continue
+          fi
         fi
         # ── LOCKED worktree — the LOCK CONTRACT (see ZOMBIE-LOCK DETECTION): a pid-confirmed zombie is
         # reaped; a pid-confirmed live holder is always kept; any other lock goes to
@@ -1304,10 +1321,14 @@ for WT_DIR in $WT_DIRS; do
     # "merged" check alone would reap a just-created, not-yet-touched worktree too.
     if [ "$age_min" -ge "$MERGED_MIN_AGE_MIN" ] && _worktree_head_merged "$GT" "$d"; then merged=1; fi
     if [ "$age" -le "$gate_hours" ] && [ "$merged" != "1" ]; then kept=$((kept+1)); continue; fi
-    # ga-m5i7e6: in use / disk-pressure-unmerged for EVERY tree about to go (was: merged only)
-    if _keep_unsafe "$GT" "$d" "" "$age" "$merged"; then
-      kept=$((kept+1))
-      continue
+    # ga-m5i7e6: in use / disk-pressure-unmerged for every tree about to go (was: merged only). A LOCKED unmerged tree is left
+    # to the lock contract below instead: its own proofs (zombie holder, closed bead) are what frees disk under pressure.
+    lock_reason="$(_wt_lock_reason "$GT" "$d")"
+    if [ "$merged" = "1" ] || [ -z "$lock_reason" ]; then
+      if _keep_unsafe "$GT" "$d" "" "$age" "$merged"; then
+        kept=$((kept+1))
+        continue
+      fi
     fi
     if [ "$ENABLED" != "1" ]; then
       printf '{"ts":"%s","event":"would_reap","wt":"%s","age_h":%s,"mode":"%s","merged":%s}\n' "$(ts)" "$(basename "$d")" "$age" "$mode" "$merged" >> "$LOG" 2>/dev/null
@@ -1320,9 +1341,7 @@ for WT_DIR in $WT_DIRS; do
     elif _reap_dirty_generated_only "$GT" "$d" "" "$age" "town"; then
       # ga-he2c1u: refused only because of generated files, delivered, bead closed — see the function
       reaped=$((reaped+1))
-    elif [ "$ZOMBIE_LOCK_ENABLED" = "1" ] && \
-         lock_reason="$(git -C "$GT" worktree list --porcelain 2>/dev/null | awk -v p="$d" '$1=="worktree"{c=$2} $1=="locked"{ if(c==p){ $1=""; sub(/^ /,""); if ($0=="") $0="(no reason)"; print; exit } }')" && \
-         [ -n "$lock_reason" ]; then
+    elif [ "$ZOMBIE_LOCK_ENABLED" = "1" ] && [ -n "$lock_reason" ]; then   # lock_reason: read above (_wt_lock_reason)
       # ga-vs6shu: a BARE lock (`git worktree lock` with no --reason) prints as a lone
       # `locked` line, so the awk above used to yield "" and `[ -n ]` failed — this loop
       # silently skipped it (skipped_dirty, no event) while the pool loop maps the same

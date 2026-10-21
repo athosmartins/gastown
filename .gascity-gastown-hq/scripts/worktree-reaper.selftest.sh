@@ -1935,6 +1935,11 @@ m5_mk m5e; m5_tree m5e w unmerged; m5_run m5e
 m5_gone m5e "(e): unmerged tree idle in EVERY signal, normal mode → reaped (the ordinary age path still frees disk)"
 m5_mk m5l; m5_tree m5l w unmerged; touch "$TMP/m5l/rig/crew/w/pesquisa/out/battery.csv"; m5_run m5l WORKTREE_REAPER_ACTIVITY_SCAN=0
 m5_gone m5l "(l): WORKTREE_REAPER_ACTIVITY_SCAN=0 → the old directory-mtime rule (the tree of (d) is reaped)"
+m5_mk m5o; m5_tree m5o w unmerged; touch "$TMP/m5o/rig/crew/w/pesquisa/out/battery.csv"
+env -u WORKTREE_REAPER_ACTIVITY_SCAN WORKTREE_REAPER_GT="$TMP/m5o" WORKTREE_REAPER_LOG="$TMP/m5o.jsonl" WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 bash "$REAPER" >/dev/null 2>&1
+m5_kept m5o "(d2): ACTIVITY_SCAN unset (the default) → the tree of (d) is KEPT"
+m5_mk m5p; m5_tree m5p w unmerged; touch "$TMP/m5p/rig/crew/w/pesquisa/out/battery.csv"; m5_run m5p WORKTREE_REAPER_ACTIVITY_SCAN=yes
+m5_kept m5p "(d3): a garbage ACTIVITY_SCAN value reads as 'scan', never as the old rule → the tree of (d) is KEPT"
 
 m5_mk m5f; m5_tree m5f w unmerged; touch "$(git -C "$TMP/m5f/rig/crew/w" rev-parse --git-path index)"; m5_run m5f
 m5_kept m5f "(f): only the tree's own index is fresh (a git command just ran in it) → KEPT"
@@ -1959,6 +1964,15 @@ m5_kept m5i "(i): the REAL lsof path asks for every open file, not just the cwd 
 m5_mk m5j; m5_tree m5j w unmerged; mkdir -p "$TMP/m5j-bin"; printf '#!/bin/sh\nexit 1\n' > "$TMP/m5j-bin/find"; chmod +x "$TMP/m5j-bin/find"
 m5_run m5j PATH="$TMP/m5j-bin:$PATH"
 m5_kept m5j "(j): the walk inside the tree FAILS → unknown is not old: KEPT, kept_activity_unknown logged" kept_activity_unknown
+
+# (m)(n) a pid-confirmed ZOMBIE lock holder says nothing about OTHER processes working in the tree, and its reap is `remove -f -f`
+M5_PS="$TMP/m5_ps.txt"; echo "1001 dead 0 0" > "$M5_PS"
+m5_mk m5m; m5_tree m5m w unmerged; git -C "$TMP/m5m/rig" worktree lock --reason "claude agent agent-m5 pid 1001 start x" "$TMP/m5m/rig/crew/w"
+m5_real m5m > "$TMP/m5m.lsof"; m5_run m5m WORKTREE_REAPER_FAKE_PS="$M5_PS" WORKTREE_REAPER_FAKE_LSOF="$TMP/m5m.lsof"
+m5_kept m5m "(m): lock holder is a dead pid BUT another process is inside the tree → KEPT, kept_zombie_lock_in_use logged" kept_zombie_lock_in_use
+m5_mk m5n; m5_tree m5n w unmerged; git -C "$TMP/m5n/rig" worktree lock --reason "claude agent agent-m5 pid 1001 start x" "$TMP/m5n/rig/crew/w"
+m5_run m5n WORKTREE_REAPER_FAKE_PS="$M5_PS"
+m5_gone m5n "(n): the same dead-holder lock with nobody inside → reaped (positive control: the zombie reap itself still works)"
 
 # (k) loop 1 (the town's own .gc-worktrees) has the same two checks: a live process, or pressure with an unmerged tree
 m5_town1() {   # <town> — the TOWN is the repo; one unmerged tree <town>/.gc-worktrees/x, every signal 14 h old
