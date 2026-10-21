@@ -9,10 +9,16 @@
 #   hq-selftests (g_hq): uma rodada completa conta passou/reprovou/ambiente/prazo e deixa de fora a lista só-macOS · 1ª rodada = "primeira" (sem comparação) · mesma ponta do main = "sem-novidade"
 #     e não cria árvore · commit novo = só as reprovações NOVAS contra a última rodada COMPLETA entram em new_fail · reprovação que passa na 2ª tentativa é "flaky", não reprovada ·
 #     pull que falha segue com o clone que há e diz pull=falhou · lista só-macOS ausente/vazia, árvore sem scripts/, wt-add que falha = exit 3, nada rodou e a ponta NÃO é gravada ·
-#     TERM no meio apaga a árvore e NÃO grava a ponta (a próxima rodada refaz) · log só de quem reprovou · resumo é JSON de uma linha `BALLAST-SUMMARY:`.
-#   queima (g_burn): sobe BALLAST_CORES laços, avisa o resumo na partida e sai no TERM sem deixar filho.
+#     TERM no meio apaga a árvore e NÃO grava a ponta (a próxima rodada refaz) · log só de quem reprovou · resumo é JSON de uma linha `BALLAST-SUMMARY:` · padrão só-macOS com espaço nas pontas é aparado ·
+#     o passo FINAL (resumo + gravação do estado) que falha — arquivo de durações que é pasta, ou o python do passo que morre — dá exit 3 com resumo `gravacao-falhou`/`resumo-falhou`, não consome a ponta nem a
+#     lista de reprovadas, e a rodada seguinte AINDA diz a falha nova.
+#   queima (g_burn): sobe BALLAST_CORES laços, avisa o resumo na partida e sai no TERM sem deixar filho · passado BALLAST_BURN_SECS termina SOZINHA com rc 0 (o `timeout` do prazo a mataria com 124 e o
+#     governo cobraria >= 600 s de cooldown de falha) · BALLAST_BURN_SECS inválido = exit 2 · o relógio (sleep) que falha dá rc 1, não 0 · o tempo padrão fica >= 60 s abaixo do prazo da linha `queima` do registro. Toda corrida de entrada inválida
+#     leva prazo (o queima agora dorme BALLAST_BURN_SECS: um que aceitasse a entrada ruim penduraria o teste).
 # CONTROLE NEGATIVO: sem a rodada de reprovadas · ambiente/prazo contados como reprovados · lista só-macOS ignorada ou aceita vazia · comparação sem a rodada anterior · ponta não gravada · árvore
-#   não removida (nem no TERM) · pull/wt-add que falham ignorados · queima que não leva os laços no TERM — cada um é aplicado numa cópia e a bateria TEM que falhar.
+#   não removida (nem no TERM) · pull/wt-add que falham ignorados · queima que não leva os laços no TERM · queima que espera o prazo (rc 124), sai com rc 1 no fim normal ou toma o relógio que falhou por fim normal · tempo padrão acima do prazo do registro ·
+#   BALLAST_BURN_SECS inválido aceito · falha do passo final vista como rc 0 · alvo de estado que é pasta sem a checagem prévia · passo do resumo que morre sem resumo · padrão só-macOS não aparado —
+#   cada um é aplicado numa cópia e a bateria TEM que falhar.
 # VARIÁVEIS: HBI_PY (python do teste; padrão /usr/bin/python3) · HBI_ONLY=<grupo> (hq burn) · HBI_NO_MUTANTS=1 · HBI_JOBS (mutantes em paralelo; padrão 4)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -54,6 +60,18 @@ kill "$kp" 2>/dev/null
 exit "$rc"
 EOF
 chmod +x "$W/bin/timeout"
+cat > "$W/bin/python3" <<'EOF'
+#!/bin/sh
+# python3 de brinquedo: o real, salvo que COM o arquivo $HBI_PY_CRASH o passo do RESUMO final (o único cujo texto tem "res1, res2, prev_p") quebra — rc 1 e nada na saída, como um OOM ou um erro do interpretador
+case "$1:$2" in
+  -I:-) src=$(cat)
+        if [ -f "$HBI_PY_CRASH" ] && printf '%s' "$src" | grep -q 'res1, res2, prev_p'; then echo "python3 (brinquedo): quebrou" >&2; exit 1; fi
+        printf '%s\n' "$src" | "$HBI_REAL_PY" "$@"; exit $? ;;
+esac
+exec "$HBI_REAL_PY" "$@"
+EOF
+chmod +x "$W/bin/python3"
+export HBI_REAL_PY="$PY" HBI_PY_CRASH="$W/py.crash"   # o python3 de brinquedo acima lê os dois (todo filho herda)
 
 # ── fixtures ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 mkst() {  # mkst CAMINHO RC [CORPO] — um selftest de brinquedo
@@ -137,6 +155,24 @@ g_hq() {
   check "hq: a ponta mudou entre a rodada morta e a seguinte (o caso não é vazio)" "1" "$([ "$old" != "$new" ] && echo 1 || echo 0)"
   check "hq: sobra de rodada morta (árvore + branch na ponta velha) → a rodada seguinte testa a ponta NOVA, não a branch velha" "0 ${new:0:9} 1" "$RC $(sj main) $([ "$(git -C "$GR/gascity/repo.git" branch --list 'worker/*' | wc -l | tr -d ' ')" = 0 ] && echo 1 || echo 0)"
 
+  # O passo FINAL (resumo + gravação do estado) que falha não pode virar rc 0 nem consumir o sinal (veredito do gate, 21/10): antes, a lista de reprovadas era gravada ANTES das durações, da ponta e do
+  # resumo, e uma exceção no meio deixava rc 0 sem BALLAST-SUMMARY, com as reprovadas da rodada já na linha de base — a falha nova sumia sem ter sido dita. Dois jeitos de quebrar o passo: o arquivo
+  # de durações vira PASTA (a troca falha até para root) e o python do passo morre (rc 1, sem saída). Nos dois: exit 3, o resumo diz o que houve, nada é consumido e a rodada seguinte AINDA diz a falha nova.
+  newrig; runhq
+  newcommit h.selftest.sh 1
+  prev0=$(cat "$BH/hq-selftests.failed" 2>/dev/null); last0=$(cat "$BH/hq-selftests.last" 2>/dev/null)
+  rm -f "$BH/hq-selftests.durations"; mkdir "$BH/hq-selftests.durations"; runhq
+  check "hq: gravação do estado que falha (durações é uma pasta) → exit 3, resumo gravacao-falhou (uma linha só), nunca rc 0" "3 gravacao-falhou 1" "$RC $(sj result) $(printf '%s\n' "$OUT" | grep -c '^BALLAST-SUMMARY: ')"
+  check "hq: ...e nada foi consumido: reprovadas e ponta seguem as da rodada anterior (a falha nova h não entrou na linha de base)" "1 1" "$([ "$(cat "$BH/hq-selftests.failed" 2>/dev/null)" = "$prev0" ] && echo 1 || echo 0) $([ "$(cat "$BH/hq-selftests.last" 2>/dev/null)" = "$last0" ] && echo 1 || echo 0)"
+  rmdir "$BH/hq-selftests.durations"; runhq
+  check "hq: ...e na rodada seguinte, com a gravação de volta, a falha nova AINDA é dita (new_fail = h)" "completo 1 scripts/h.selftest.sh" "$(sj result) $(sj new_fail_n) $(sj new_fail.0)"
+  prev1=$(cat "$BH/hq-selftests.failed" 2>/dev/null); last1=$(cat "$BH/hq-selftests.last" 2>/dev/null)
+  newcommit i.selftest.sh 1; : > "$W/py.crash"; runhq; rm -f "$W/py.crash"
+  check "hq: o passo do resumo que quebra (python rc 1, sem saída) → exit 3 com resumo-falhou, nunca rc 0" "3 resumo-falhou 1" "$RC $(sj result) $(printf '%s\n' "$OUT" | grep -c '^BALLAST-SUMMARY: ')"
+  check "hq: ...e também não consumiu nada (reprovadas e ponta seguem as da rodada anterior)" "1 1" "$([ "$(cat "$BH/hq-selftests.failed" 2>/dev/null)" = "$prev1" ] && echo 1 || echo 0) $([ "$(cat "$BH/hq-selftests.last" 2>/dev/null)" = "$last1" ] && echo 1 || echo 0)"
+  runhq
+  check "hq: ...e na rodada seguinte a falha nova AINDA é dita (new_fail = i)" "completo 1 scripts/i.selftest.sh" "$(sj result) $(sj new_fail_n) $(sj new_fail.0)"
+
   newrig; mkst "$SRC/.gascity-gastown-hq/scripts/flaky.selftest.sh" 0 'f="$TMPDIR_HBI/flaky.count"; n=$(cat "$f" 2>/dev/null || echo 0); echo $((n+1)) > "$f"; [ "$n" -ge 1 ] || exit 1'
   git -C "$SRC" add -A && git -C "$SRC" commit -q -m flaky && git -C "$GR/gascity/repo.git" fetch -q "$SRC" "+HEAD:refs/remotes/origin/main"; mkdir -p "$T/tmpd$N"
   runhq TMPDIR_HBI="$T/tmpd$N"
@@ -150,6 +186,8 @@ g_hq() {
   check "hq: lista só-macOS sem nenhum padrão → exit 3, nada rodou, ponta não gravada" "3 mac-only-ilegivel 0" "$RC $(sj result) $([ -e "$BH/hq-selftests.last" ] && echo 1 || echo 0)"
   newrig; git -C "$SRC" rm -q ".gascity-gastown-hq/scripts/hetzner-mac-only.hq.txt"; git -C "$SRC" commit -q -m sem; git -C "$GR/gascity/repo.git" fetch -q "$SRC" "+HEAD:refs/remotes/origin/main"; runhq
   check "hq: lista só-macOS ausente → exit 3 (o nó não é usado)" "3 mac-only-ilegivel" "$RC $(sj result)"
+  newrig; printf '# só-macOS\n  scripts/mac.selftest.sh \t\r\n' > "$SRC/.gascity-gastown-hq/scripts/hetzner-mac-only.hq.txt"; git -C "$SRC" add -A; git -C "$SRC" commit -q -m espaco; git -C "$GR/gascity/repo.git" fetch -q "$SRC" "+HEAD:refs/remotes/origin/main"; runhq
+  check "hq: padrão só-macOS com espaço, tab e CR nas pontas é aparado (como no mbp-run.sh) → mac.selftest segue de fora (5 contam, 1 pulado)" "5 1" "$(sj total) $(sj skipped_mac)"
   newrig; : > "$W/rg.wtadd.fail"; runhq
   check "hq: wt-add que falha → exit 3, ponta não gravada" "3 wt-add-falhou 0" "$RC $(sj result) $([ -e "$BH/hq-selftests.last" ] && echo 1 || echo 0)"
   newrig; git -C "$GR/gascity/repo.git" update-ref -d refs/remotes/origin/main; runhq
@@ -158,7 +196,7 @@ g_hq() {
   newrig; RDN=$((RDN+1)); RD="$T/rd$N.k"; mkdir -p "$RD"
   ( env PATH="$W/bin:$PATH" HOME="$T/home" BALLAST_HOME="$BH" BALLAST_RUN_DIR="$RD" BALLAST_CORES=2 BALLAST_REMOTE_GIT="$W/rg" GT_REMOTE_GIT="$GR" HQ_SELFTEST_TIMEOUT=20 bash "$ITEMS/hq-selftests.sh" > "$W/kill.out" 2>&1 ) & kp=$!
   sleep 3; pkill -TERM -P "$kp" 2>/dev/null; kill -TERM "$kp" 2>/dev/null; wait "$kp" 2>/dev/null
-  i=0; while [ "$i" -lt 50 ] && ! grep -q '^wt-rm gascity ballast-hq' "$W/rg.calls"; do sleep 0.2; i=$((i+1)); done
+  i=0; while [ "$i" -lt 100 ] && ! grep -q '^wt-rm gascity ballast-hq' "$W/rg.calls"; do sleep 0.2; i=$((i+1)); done   # até 20 s: o item só trata o TERM quando o xargs em primeiro plano volta (a rodada de brinquedo dura ~8 s); o governo manda o TERM ao GRUPO e isto não exercita isso
   check "hq: TERM no meio → a ponta NÃO é gravada (a próxima rodada refaz)" "0" "$([ -e "$BH/hq-selftests.last" ] && echo 1 || echo 0)"
   check "hq: TERM no meio → a árvore de trabalho é removida" "1" "$(grep -c '^wt-rm gascity ballast-hq' "$W/rg.calls")"
   check "hq: TERM no meio → a branch worker/* também não sobra" "0" "$(git -C "$GR/gascity/repo.git" branch --list 'worker/*' | wc -l | tr -d ' ')"
@@ -169,15 +207,36 @@ g_burn() {
   local out="$W/burn.out"; BR="$T/burnrun"; mkdir -p "$BR" "$T/qm"; cp "$ITEMS/queima.sh" "$T/qm/queima.sh" 2>/dev/null
   ( env PATH="$PATH" BALLAST_HOME="$T/bh0" BALLAST_RUN_DIR="$BR" BALLAST_CORES=3 bash "$T/qm/queima.sh" > "$out" 2>&1 ) & bp=$!
   sleep 1.5
-  check "burn: avisa o resumo na partida (cores 3)" "1" "$(grep -c '^BALLAST-SUMMARY: {"kind": "queima", "cores": 3}$' "$out")"
+  check "burn: avisa o resumo na partida (cores 3, secs 3300 = o padrão)" "1" "$(grep -c '^BALLAST-SUMMARY: {"kind": "queima", "cores": 3, "secs": 3300}$' "$out")"
   check "burn: 3 laços de CPU + o script = 4 processos com o caminho do item" "4" "$(pgrep -f "$T/qm/queima.sh" 2>/dev/null | wc -l | tr -d ' ')"
   kill -TERM "$(pgrep -o -f "$T/qm/queima.sh" 2>/dev/null)" 2>/dev/null; sleep 1.5
   check "burn: TERM só no processo mais velho (o script) → ele leva os laços junto, nada fica para trás" "0" "$(pgrep -f "$T/qm/queima.sh" 2>/dev/null | wc -l | tr -d ' ')"
   wait "$bp" 2>/dev/null
-  ( env BALLAST_RUN_DIR="$BR" BALLAST_CORES=abc bash "$T/qm/queima.sh" > "$out" 2>&1 ); rc=$?
+  ( env BALLAST_RUN_DIR="$BR" BALLAST_CORES=abc BALLAST_BURN_SECS=1 "$W/bin/timeout" 6 bash "$T/qm/queima.sh" > "$out" 2>&1 ); rc=$?
   check "burn: BALLAST_CORES que não é inteiro >= 1 → exit 2 e nada sobe" "2" "$rc"
-  ( env BALLAST_RUN_DIR="$BR" BALLAST_CORES=0 bash "$T/qm/queima.sh" > "$out" 2>&1 ); rc=$?
+  ( env BALLAST_RUN_DIR="$BR" BALLAST_CORES=0 BALLAST_BURN_SECS=1 "$W/bin/timeout" 6 bash "$T/qm/queima.sh" > "$out" 2>&1 ); rc=$?
   check "burn: BALLAST_CORES=0 também é recusado (exit 2)" "2" "$rc"
+  ( env BALLAST_RUN_DIR="$BR" BALLAST_CORES=1 BALLAST_BURN_SECS=abc "$W/bin/timeout" 6 bash "$T/qm/queima.sh" > "$out" 2>&1 ); rc=$?
+  check "burn: BALLAST_BURN_SECS que não é inteiro >= 1 → exit 2 e nada sobe" "2 0" "$rc $(pgrep -f "$T/qm/queima.sh" 2>/dev/null | wc -l | tr -d ' ')"
+  # O fim NORMAL de uma hora de queima tem que ser rc 0: o `timeout` do prazo devolve 124 e o governo (finalize) cobra cooldown >= 600 s de qualquer why que não seja ok. O `timeout` de brinquedo
+  # devolve 124 no estouro, como o GNU, então um queima que espera o prazo em vez de terminar sozinho aparece aqui como rc 124.
+  s0=$SECONDS
+  ( env BALLAST_RUN_DIR="$BR" BALLAST_CORES=2 BALLAST_BURN_SECS=2 "$W/bin/timeout" 8 bash "$T/qm/queima.sh" > "$out" 2>&1 ); rc=$?
+  check "burn: passado BALLAST_BURN_SECS termina sozinho com rc 0 (não 124 do timeout), sem esperar o prazo" "0 1" "$rc $([ $((SECONDS - s0)) -lt 7 ] && echo 1 || echo 0)"
+  sleep 0.5
+  check "burn: ao terminar sozinho não deixa laço nem relógio para trás" "0" "$(pgrep -f "$T/qm/queima.sh" 2>/dev/null | wc -l | tr -d ' ')"
+  check "burn: o resumo da partida diz por quanto tempo (secs 2)" "1" "$(grep -c '^BALLAST-SUMMARY: {"kind": "queima", "cores": 2, "secs": 2}$' "$out")"
+  # O relógio que falha não é fim normal: um `sleep` de brinquedo que sai com 1 só quando é o do queima (arg 2; o do `timeout` de brinquedo, 8, passa para o real) → rc 1 e nenhum laço sobrando
+  mkdir -p "$T/nosleep"; printf '#!/bin/sh\n[ "$1" = 2 ] && exit 1\nexec /bin/sleep "$@"\n' > "$T/nosleep/sleep"; chmod +x "$T/nosleep/sleep"
+  ( env PATH="$T/nosleep:$PATH" BALLAST_RUN_DIR="$BR" BALLAST_CORES=2 BALLAST_BURN_SECS=2 "$W/bin/timeout" 8 bash "$T/qm/queima.sh" > "$out" 2>&1 ); rc=$?
+  sleep 0.5
+  check "burn: o relógio (sleep) que falha NÃO é fim normal: rc 1 e leva os laços (rc 0 faria o governo recomeçá-lo a cada tick como 'ok', sem queimar nada)" "1 0" "$rc $(pgrep -f "$T/qm/queima.sh" 2>/dev/null | wc -l | tr -d ' ')"
+  # O tempo padrão vem do texto do próprio queima.sh e o prazo da linha `queima` do REGISTRO que vai no repo: se alguém subir um e esquecer o outro, o timeout volta a matar com 124.
+  # vazio/ilegível (não achei o padrão ou o prazo) → 0 e a bateria reprova; nunca "folga ok" por falta de leitura
+  dflt=$(grep -o 'BALLAST_BURN_SECS:-[0-9]*' "$T/qm/queima.sh" 2>/dev/null | head -n 1 | grep -o '[0-9]*$')
+  prazo=$(awk -F'\t' '$1 == "queima" { print $5 }' "$HERE/hetzner-ballast.items.txt" 2>/dev/null)
+  case "$dflt$prazo" in ''|*[!0-9]*) folga=0 ;; *) [ -n "$dflt" ] && [ -n "$prazo" ] && [ $((dflt + 60)) -le "$prazo" ] && folga=1 || folga=0 ;; esac
+  check "burn: o tempo padrão ($dflt s) fica pelo menos 60 s abaixo do prazo da linha queima do registro ($prazo s)" "1" "$folga"
 }
 
 if [ -n "${HBI_MUTANT:-}" ]; then g_hq; g_burn; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
@@ -191,7 +250,7 @@ g_hq; g_burn
 hq-selftests.sh@@sem a 2ª tentativa dos reprovados (flaky vira reprovado)@@awk -F'\t' '$2 != 0 && $2 != 97 && $2 != 124 && $2 != 137 {print $1}' "$RD/results.tsv" > "$RD/retry.txt"@@: > "$RD/retry.txt"
 hq-selftests.sh@@ambiente (rc 97) conta como reprovado@@    elif rc == 97:@@    elif rc == 9999:
 hq-selftests.sh@@prazo (rc 124/137) conta como reprovado@@    elif rc in (124, 137):@@    elif rc in (9999,):
-hq-selftests.sh@@a ponta testada nunca é gravada@@put(last_p, full + "\n")@@pass
+hq-selftests.sh@@a ponta testada nunca é gravada@@staged.append(stage(last_p, full + "\n"))@@pass
 hq-selftests.sh@@a lista só-macOS é ignorada (skip nunca vale)@@    case "$rel" in $pat) skip=1; break ;; esac@@    case "$rel" in $pat) skip=0; break ;; esac
 hq-selftests.sh@@lista só-macOS vazia é aceita (roda tudo)@@[ -n "$pats" ] || { say "lista só-macOS ausente@@[ -n "x" ] || { say "lista só-macOS ausente
 hq-selftests.sh@@a comparação ignora a rodada anterior (tudo que reprova é novo)@@new = sorted(set(kind["fail"]) - prev) if compare == "ok" else []@@new = sorted(set(kind["fail"])) if compare == "ok" else []
@@ -205,6 +264,17 @@ hq-selftests.sh@@clone sem origin/main segue em frente@@[ -n "$main" ] || { say 
 hq-selftests.sh@@pull que falha é dado como ok@@2>&1 || pull=falhou@@2>&1 || pull=ok
 queima.sh@@os laços ficam para trás no TERM@@trap 'kill $pids 2>/dev/null; exit 143' TERM INT@@trap 'exit 143' TERM INT
 queima.sh@@BALLAST_CORES inválido é aceito@@case "$n" in ''|*[!0-9]*|0) echo@@case "$n" in ''|*[!0-9]*) echo
+queima.sh@@não termina sozinho (espera os laços, que não têm fim; o prazo do registro o mataria com rc 124)@@wait "$sp"; rc=$?   # só o relógio@@wait; rc=$?   # só o relógio
+queima.sh@@termina sozinho mas com rc 1 (o governo cobraria o cooldown de falha)@@exit 1; }
+exit 0@@exit 1; }
+exit 1
+queima.sh@@o relógio que falha (sleep rc != 0) conta como fim normal@@[ "$rc" -eq 0 ] || { echo "queima: o relógio@@[ "$rc" -eq 99 ] && { echo "queima: o relógio
+queima.sh@@o tempo padrão passa do prazo do registro (volta o rc 124)@@${BALLAST_BURN_SECS:-3300}@@${BALLAST_BURN_SECS:-3600}
+queima.sh@@BALLAST_BURN_SECS inválido é aceito@@case "$secs" in ''|*[!0-9]*|0) echo@@case "$secs" in 'zzz') echo
+hq-selftests.sh@@falha do passo final (resumo e gravação do estado) vira rc 0@@[ "$prc" -ne 0 ] || exit 0@@exit 0
+hq-selftests.sh@@alvo de estado que é pasta só falha na troca, DEPOIS do resumo (sem a checagem antes)@@    if os.path.isdir(path):@@    if False:
+hq-selftests.sh@@o passo do resumo que morre sem imprimir não deixa resumo nenhum@@summary resumo-falhou main="${tested:0:9}" pull="$pull" python_rc="$prc"@@:
+hq-selftests.sh@@a lista só-macOS não é aparada nas pontas@@pat=${pat#"${pat%%[![:space:]]*}"}; pat=${pat%"${pat##*[![:space:]]}"}@@:
 MUT
   "$PY" -I - "$ITEMS" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import os, re, shutil, sys

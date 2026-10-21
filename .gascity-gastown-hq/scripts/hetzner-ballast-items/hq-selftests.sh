@@ -2,17 +2,21 @@
 # hq-selftests.sh — item `work` do lastro do nó Hetzner (ga-2hd02v.5): roda os *.selftest.sh do hq contra o origin/main do espelho do NÓ e resume. Roda NO nó, sob o governo (hetzner-ballast.py).
 #
 # Contents
-#   O que faz · Veredito · Três estados · Limites
+#   O que faz · Veredito · Três estados · Gravação do estado · Limites
 #
 # O QUE FAZ: (1) `hetzner-remote-git.sh pull` (falhou = segue com o clone que há e diz pull=falhou: código velho não é código errado) (2) se a ponta do main é a da última rodada COMPLETA, sai com
 #   "sem-novidade" (3) `wt-add` numa árvore só dele (ballast-hq, e a branch worker/ballast-hq: as duas saem no fim e também no TERM) (4) lista os *.selftest.sh, tira os da lista só-macOS que vem NA ÁRVORE
 #   (scripts/hetzner-mac-only.hq.txt, a mesma do mbp-run.sh) (5) roda em paralelo ($BALLAST_CORES), cada um com prazo, os mais lentos da rodada anterior primeiro (6) quem reprovou roda UMA vez
 #   de novo, com menos paralelismo (CPU disputada reprova por prazo de teste; passou na 2ª = flaky, não reprovada) (7) resumo numa linha `BALLAST-SUMMARY: {json}`: contagens e NOMES de selftest.
 # VEREDITO (por selftest, rc do `bash <x>.selftest.sh`): 0 passou · 97 ambiente (o espelho do nó não tem o que o teste quer: o mbp-run.sh chama de AMBIENTE) · 124/137 prazo (CPU disputada ou teste
-#   preso: inconclusivo, NÃO conta como reprovado) · outro = reprovou. "Novas falhas" = reprovadas que não estavam na última rodada COMPLETA. Ponta, lista de reprovadas e durações só são gravadas
-#   quando a rodada COMPLETOU (rc 0 do item); exit 3 = não rodou ou não terminou, e a próxima rodada refaz. Teste que reprova é dado, não falha do item.
+#   preso: inconclusivo, NÃO conta como reprovado) · outro = reprovou. "Novas falhas" = reprovadas que não estavam na última rodada COMPLETA. Teste que reprova é dado, não falha do item.
 # TRÊS ESTADOS: sem origin/main (sem-main), árvore sem scripts/ ou lista só-macOS ausente/ilegível/sem nenhum padrão (mac-only-ilegivel), wt-add que falha, rodada que não produziu o resultado de
 #   todos os testes agendados (incompleto) → exit 3, nada gravado. Lista só-macOS ilegível NUNCA vira "rode tudo": os testes de macOS reprovariam por ambiente e o sinal viraria ruído.
+# GRAVAÇÃO DO ESTADO (ponta, lista de reprovadas, durações): só depois de a rodada COMPLETAR, em dois tempos — (1) tudo vai para arquivos .tmp (disco cheio, pasta sem escrita ou um alvo que é pasta falham
+#   AQUI, antes de qualquer troca); (2) o resumo sai; (3) os arquivos são trocados, a lista de reprovadas depois das durações e a ponta POR ÚLTIMO (é ela que dá a rodada por feita). Falhou em (1): exit 3 com o
+#   resumo `gravacao-falhou`, nada trocado. O passo do resumo que morre sem imprimir: exit 3 com o resumo `resumo-falhou`. Nos dois a rodada NÃO conta como feita (a ponta é o último arquivo gravado) e a
+#   próxima refaz e diz de novo as falhas novas: repetir um aviso é o lado seguro; nunca rc 0 sem resumo. Caso raro, só depois de todos os .tmp gravados: uma TROCA que falha (exit 3, sem o resumo de erro): o
+#   resumo `completo` já saiu uma vez e a ponta, por ser a última, fica sem gravar — a rodada refaz, mas as falhas novas dessa rodada podem já estar na linha de base.
 # LIMITES: roda no nó como `runner`, sem rede de saída garantida (os selftests do hq são herméticos com stubs; é o mesmo ambiente do gate via mbp-run.sh --repo hq); a lista só-macOS APRENDIDA pela
 #   sombra mora no mini e não chega aqui (alguns reprovados por ambiente podem aparecer); nenhum dado sai do nó além deste resumo (nomes de arquivo de código e contagens).
 set -u
@@ -66,6 +70,8 @@ find "$TREE" -name '*.selftest.sh' -not -path '*/.git/*' 2> /dev/null | sed "s|^
 while IFS= read -r rel; do
   skip=0
   while IFS= read -r pat; do
+    pat=${pat#"${pat%%[![:space:]]*}"}; pat=${pat%"${pat##*[![:space:]]}"}   # aparada nas pontas, como o mbp-run.sh (mac_only_match): um espaço sobrando não pode deixar o teste de macOS rodar
+    [ -n "$pat" ] || continue
     case "$rel" in $pat) skip=1; break ;; esac
   done <<< "$pats"
   if [ "$skip" = 1 ]; then skipped=$((skipped + 1)); else echo "$rel" >> "$RD/todo.txt"; fi
@@ -146,18 +152,47 @@ if os.path.exists(prev_p):
     except (OSError, UnicodeDecodeError):
         compare = "indisponivel"
 new = sorted(set(kind["fail"]) - prev) if compare == "ok" else []
+# 60 nomes no máximo (25 reprovadas + 15 novas + 10 flaky + 10 prazo). Medido em 21/10 com os 60 selftests de nome mais longo do hq: 5495 caracteres no pior caso (os tetos antigos 40/20/20/20 davam 8728). O `pull` do
+# hetzner-ballast.sh troca o resumo INTEIRO por null/"grande-demais" acima de 8000, e isso levaria as contagens junto; as contagens (fail, flaky, …) seguem exatas, só a lista de nomes é cortada
 d = {"result": "completo", "main": short, "pull": pull, "total": len(r1), "pass": len(kind["pass"]), "fail": len(kind["fail"]), "flaky": len(kind["flaky"]),
-     "ambiente": len(kind["ambiente"]), "timeout": len(kind["timeout"]), "skipped_mac": int(skipped), "compare": compare, "new_fail_n": len(new), "new_fail": new[:20],
-     "fail_names": kind["fail"][:40], "flaky_names": kind["flaky"][:20], "timeout_names": kind["timeout"][:20], "secs": int(secs), "secs_tests": sum(s for _, s in r1.values()), "load1_start": load0, "load1_end": load1}
-def put(path, text):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+     "ambiente": len(kind["ambiente"]), "timeout": len(kind["timeout"]), "skipped_mac": int(skipped), "compare": compare, "new_fail_n": len(new), "new_fail": new[:15],
+     "fail_names": kind["fail"][:25], "flaky_names": kind["flaky"][:10], "timeout_names": kind["timeout"][:10], "secs": int(secs), "secs_tests": sum(s for _, s in r1.values()), "load1_start": load0, "load1_end": load1}
+def stage(path, text):
+    # falhou (OSError) → levanta: nada foi trocado ainda e o chamador sai com 3; um alvo que é PASTA falha aqui, não só na troca (que viria depois do resumo)
+    if os.path.isdir(path):
+        raise IsADirectoryError("%s é uma pasta" % path)
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
         f.write(text)
-    os.replace(tmp, path)
-if compare != "indisponivel":
-    put(prev_p, "".join(n + "\n" for n in kind["fail"]))
-put(dur_p, "".join("%s\t%d\n" % (k, s) for k, (_rc, s) in sorted(r1.items())))
-put(last_p, full + "\n")
-print("BALLAST-SUMMARY: " + json.dumps(d))
+    return (path + ".tmp", path)
+staged, err = [], ""
+try:
+    staged.append(stage(dur_p, "".join("%s\t%d\n" % (k, s) for k, (_rc, s) in sorted(r1.items()))))
+    if compare != "indisponivel":
+        staged.append(stage(prev_p, "".join(n + "\n" for n in kind["fail"])))
+    staged.append(stage(last_p, full + "\n"))   # a ponta é a última da fila: é ela que dá a rodada por feita
+except OSError as e:
+    err = "%s: %s" % (type(e).__name__, e)
+    for _p in (dur_p, prev_p, last_p):
+        try:
+            os.remove(_p + ".tmp")
+        except OSError:
+            pass   # sobra de .tmp é inofensiva: o próximo stage() o reescreve
+if err:
+    d["result"], d["erro"] = "gravacao-falhou", err[:160]
+print("BALLAST-SUMMARY: " + json.dumps(d), flush=True)
+if err:
+    print("hq-selftests: não gravei o estado (%s): nada foi trocado" % err, file=sys.stderr)
+    sys.exit(3)
+try:
+    for tmp, dst in staged:
+        os.replace(tmp, dst)
+except OSError as e:
+    print("hq-selftests: a troca do estado falhou (%s): a ponta é a última, a rodada não conta como feita" % e, file=sys.stderr)
+    sys.exit(3)
 PY
-exit 0
+prc=$?
+[ "$prc" -ne 0 ] || exit 0
+# rc 3: o passo já imprimiu o resumo (gravacao-falhou) e disse o motivo; outro rc: o interpretador morreu antes de imprimir e este é o ÚNICO resumo da rodada
+[ "$prc" -eq 3 ] || summary resumo-falhou main="${tested:0:9}" pull="$pull" python_rc="$prc"
+say "o resumo ou a gravação do estado falhou (rc $prc): a rodada NÃO conta como feita (a ponta é o último arquivo gravado) e a próxima refaz"
+exit 3

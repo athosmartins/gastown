@@ -154,7 +154,16 @@ g_reg() {
 
   newhome; EXTRA_ENV="BALLAST_ITEMS=$HERE/hetzner-ballast.items.txt BALLAST_ITEMS_DIR=$HERE/hetzner-ballast-items"; bt status --json
   check "reg: o registro que VAI no repo (hetzner-ballast.items.txt) lê sem erro: hq-selftests (work) e queima (filler)" "0 hq-selftests work queima filler" "$(printf '%s' "$OUT" | "$PY" -I -c 'import sys,json; print(len(json.load(sys.stdin)["registry_errors"]))') $(jget items.0.name) $(jget items.0.role) $(jget items.1.name) $(jget items.1.role)"
-  check "reg: todo comando do registro do repo existe em hetzner-ballast-items/ e é executável (o motivo de inerte, se houver, NÃO é 'comando')" "0 0" "$(jget items.0.why | grep -c comando) $(jget items.1.why | grep -c comando)"
+  # O governo confere `requires` ANTES de resolver o comando (eligibility): com os requires do registro do repo sem valer, o motivo é sempre "requires: … não vale" e a pasta de itens nunca é olhada — o gate
+  # (21/10) reproduziu o MESMO "0 0" com os scripts presentes, ausentes e sem permissão, então o check antigo ("o motivo NÃO é 'comando'") passava sem testar nada. Aqui o ambiente SATISFAZ os dois requires
+  # (HOME de mentira com o hetzner-remote-git.sh executável + a chave burn.on) e o que se afirma é a ELEGIBILIDADE: o governo real chegou ao comando de cada item e o achou, existente e executável.
+  # O controle negativo está na mesma bateria: uma cópia da pasta com o hq-selftests.sh renomeado e o queima.sh sem permissão TEM que dar inerte, com motivo "comando", nos dois.
+  mkdir -p "$H/home/gt-remote/bin"; printf '#!/bin/sh\n' > "$H/home/gt-remote/bin/hetzner-remote-git.sh"; chmod +x "$H/home/gt-remote/bin/hetzner-remote-git.sh"; : > "$H/burn.on"
+  EXTRA_ENV="HOME=$H/home BALLAST_ITEMS=$HERE/hetzner-ballast.items.txt BALLAST_ITEMS_DIR=$HERE/hetzner-ballast-items"; bt status --json
+  check "reg: com os requires do registro do repo satisfeitos, hq-selftests e queima ficam ELEGÍVEIS (o governo achou o comando de cada um: existe e é executável)" "true true" "$(jget items.0.eligible) $(jget items.1.eligible)"
+  cp -R "$HERE/hetzner-ballast-items" "$H/items-sem"; mv "$H/items-sem/hq-selftests.sh" "$H/items-sem/hq-selftests.renomeado"; chmod -x "$H/items-sem/queima.sh"
+  EXTRA_ENV="HOME=$H/home BALLAST_ITEMS=$HERE/hetzner-ballast.items.txt BALLAST_ITEMS_DIR=$H/items-sem"; bt status --json
+  check "reg: controle negativo — pasta com o hq-selftests.sh renomeado e o queima.sh sem permissão → os DOIS inertes, motivo 'comando' em cada um (o check acima não é vácuo)" "false false 1 1" "$(jget items.0.eligible) $(jget items.1.eligible) $(jget items.0.why | grep -c comando) $(jget items.1.why | grep -c comando)"
   newhome; rm -f "$H/items.tsv"; seed; adv 50 0; bt; adv 50 0; bt; adv 50 0; bt
   check "reg: registro ausente → nada começa, nota registro-ilegivel, rc 0, registry_errors null (não leu; [] seria 'leu e está limpo')" "0 registro-ilegivel [] null" "$RC $(jget note) $(jget started) $(jget registry_errors)"
   newhome; printf '\xff\xfe\x00bin\n' > "$H/items.tsv"; seed; adv 50 0; bt
