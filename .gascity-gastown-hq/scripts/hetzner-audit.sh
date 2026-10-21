@@ -27,9 +27,9 @@ SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o Serv
 # caminhos relativos ao home do servidor : o que são. Fora desta lista, credencial é achado.
 CRED_ALLOW=(".claude/.credentials.json:login do claude" ".ssh/mini_shim_ed25519:atalho ssh→mini" "gt-remote/keys/gt_mirror:chave do espelho git (fatia 4)")
 SKIP_TOP=" .cache .local .duckdb .ssh gt-remote "          # topo do home que NÃO é auditado por pasta: caches de ferramenta (o .duckdb tem verificação própria), .ssh (credenciais) e gt-remote (por filho)
-SKIP_GT=" bin bundle bundle-out git keys venv-wa "         # filhos de gt-remote sem dado: ferramentas, bundle, espelho (scan), chaves (credenciais), venv
+SKIP_GT=" bin bundle bundle-out git keys "         # filhos de gt-remote sem dado: ferramentas, bundle, espelho (scan), chaves (credenciais); venv-* (venv-wa, venv-ps…) é pulado no laço do audit_dados, por padrão de nome
 GT_PRUNE="prune=venv:env:.git:__pycache__"
-SKIP_NOTE=".cache .local .duckdb .ssh (topo) e gt-remote/{bin,bundle,bundle-out,git,keys,venv-wa}"   # o que SKIP_TOP/SKIP_GT deixam de fora: a linha LIMPO do dados o repete, para o "limpo" não parecer maior que a cobertura
+SKIP_NOTE=".cache .local .duckdb .ssh (topo) e gt-remote/{bin,bundle,bundle-out,git,keys,venv-*}"   # o que SKIP_TOP/SKIP_GT deixam de fora: a linha LIMPO do dados o repete, para o "limpo" não parecer maior que a cobertura
 n_bad=0; n_cant=0; n_ok=0
 emit() { # estado verificação detalhe
   case "$1" in ACHADO) n_bad=$((n_bad+1)) ;; NAO-CONSEGUI) n_cant=$((n_cant+1)) ;; *) n_ok=$((n_ok+1)) ;; esac
@@ -119,7 +119,7 @@ audit_dados() {
   local args=(--audit-node '.::maxdepth=1') n_dirs=1 d N n_rc states found ERRF
   for d in $(lines TOPDIR); do case "$SKIP_TOP" in *" $d "*) continue ;; esac
     case "$d" in .claude) args+=(--audit-node ".claude::prune=plugins:downloads:cache:security/agent-sdk-venv") ;; *) args+=(--audit-node "$d") ;; esac; n_dirs=$((n_dirs+1)); done
-  for d in $(lines GTDIR); do case "$SKIP_GT" in *" $d "*) continue ;; esac; args+=(--audit-node "gt-remote/$d::$GT_PRUNE"); n_dirs=$((n_dirs+1)); done
+  for d in $(lines GTDIR); do case "$SKIP_GT" in *" $d "*) continue ;; esac; case "$d" in venv-*) continue ;; esac; args+=(--audit-node "gt-remote/$d::$GT_PRUNE"); n_dirs=$((n_dirs+1)); done
   ERRF=$(mktemp) || { emit NAO-CONSEGUI dados "mktemp falhou no mini: não sei ler os achados"; return; }
   N=$("$MBP_RUN" --host linux "${args[@]}" 2>"$ERRF"); n_rc=$?
   states=$(printf '%s\n' "$N" | grep -c '^AUDIT-NODE ')

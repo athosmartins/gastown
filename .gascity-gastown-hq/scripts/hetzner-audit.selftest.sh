@@ -58,7 +58,7 @@ chmod +x "$FAKE"/*
 
 mk() {  # servidor limpo: as 3 credenciais conhecidas (600), diretórios do tipo certo, scan falso que sai 0
   chmod -R u+rwX "$SRV" 2>/dev/null; find "$SRV" -mindepth 1 -delete 2>/dev/null
-  mkdir -p "$SRV/.claude" "$SRV/.ssh" "$SRV/gt-remote/keys" "$SRV/gt-remote/bin" "$SRV/gt-remote/wa-base" "$SRV/gt-remote/hq-base" "$SRV/gt-remote/git" "$SRV/gt-remote/venv-wa" "$SRV/.cache"
+  mkdir -p "$SRV/.claude" "$SRV/.ssh" "$SRV/gt-remote/keys" "$SRV/gt-remote/bin" "$SRV/gt-remote/wa-base" "$SRV/gt-remote/hq-base" "$SRV/gt-remote/git" "$SRV/gt-remote/venv-wa" "$SRV/gt-remote/venv-ps" "$SRV/.cache"
   echo "$TOK_CLAUDE" > "$SRV/.claude/.credentials.json"; pem > "$SRV/.ssh/mini_shim_ed25519"; pem > "$SRV/gt-remote/keys/gt_mirror"
   chmod 600 "$SRV/.claude/.credentials.json" "$SRV/.ssh/mini_shim_ed25519" "$SRV/gt-remote/keys/gt_mirror"; echo "x = 1" > "$SRV/gt-remote/wa-base/app.py"
   printf '#!/bin/bash\necho "scan fake: ${FAKE_SCAN_MSG:-limpo}"; exit "${FAKE_SCAN_RC:-0}"\n' > "$SRV/gt-remote/bin/hetzner-remote-git.sh"; chmod +x "$SRV/gt-remote/bin/hetzner-remote-git.sh"
@@ -74,7 +74,7 @@ rcis() { [ "$rc" = "$1" ]; ok $? "  saída $1 (rc=$rc)"; }
 allbut() { local c; for c in "$@"; do [ "$(st "$c")" = LIMPO ] || return 1; done; }
 
 mk; run; is processo LIMPO "servidor limpo: processo"; is credenciais LIMPO "  credenciais"; is backup-de-bead LIMPO "  backup-de-bead"; is github-e-espelho LIMPO "  github-e-espelho"; is dados LIMPO "  dados"
-dets dados "NÃO auditados por dados: .cache .local .duckdb .ssh (topo) e gt-remote/{bin,bundle,bundle-out,git,keys,venv-wa}"
+dets dados "NÃO auditados por dados: .cache .local .duckdb .ssh (topo) e gt-remote/{bin,bundle,bundle-out,git,keys,venv-*}"
 rcis 0; printf '%s\n' "$out" | grep -q '^AUDITORIA RESULTADO LIMPO (achados=0 nao-consegui=0 limpos=5)'; ok $? "  RESULTADO LIMPO (0/0/5)"
 dets credenciais ".claude/.credentials.json .ssh/mini_shim_ed25519 gt-remote/keys/gt_mirror"
 
@@ -120,7 +120,7 @@ mk; mkdir -p "$SRV/.duckdb/ext"; : > "$SRV/.duckdb/ext/a.duckdb_extension"; : > 
 mk; mkdir -p "$SRV/.duckdb/ext"; : > "$SRV/.duckdb/ext/a.duckdb_extension"; : > "$SRV/.duckdb/dados.db"; FAKE_NODE=duck run; is dados ACHADO ".duckdb com um .db dentro: a exceção NÃO vale"
 mk; mkdir -p "$SRV/novidade" "$SRV/.config"; run; grep -qxF 'novidade' "$T/node-args"; ok $? "diretório de topo novo é auditado"
 grep -qxF '.config' "$T/node-args" && grep -qxF '.::maxdepth=1' "$T/node-args" && grep -qxF 'gt-remote/wa-base::prune=venv:env:.git:__pycache__' "$T/node-args"; ok $? "  .config, o topo (maxdepth=1) e cada filho de gt-remote entram"
-! grep -q -e '^\.ssh$' -e '^\.cache$' -e 'gt-remote/keys' -e 'gt-remote/venv-wa' -e 'gt-remote/git' -e 'gt-remote/bin' "$T/node-args"; ok $? "  .ssh, .cache, chaves, venv, espelho e bin NÃO entram"
+! grep -q -e '^\.ssh$' -e '^\.cache$' -e 'gt-remote/keys' -e 'gt-remote/venv-wa' -e 'gt-remote/venv-ps' -e 'gt-remote/git' -e 'gt-remote/bin' "$T/node-args"; ok $? "  .ssh, .cache, chaves, venv, espelho e bin NÃO entram"
 mk; mkdir -p "$SRV/.claude"; run; grep -qxF '.claude::prune=plugins:downloads:cache:security/agent-sdk-venv' "$T/node-args"; ok $? "  .claude entra com a poda de plugins/venv"
 
 # --- achado e não-consegui juntos: achar vale mais ---
