@@ -1,0 +1,12 @@
+# hetzner-nodejs.pin — a versão do Node.js que o nó Linux (aarch64) tem em ~/.local. DADO, não código: scripts/hetzner-nodejs.sh lê as duas linhas KEY=valor abaixo por grep (nunca `source`).
+#
+# Contents
+#   De onde vem o hash · Como atualizar
+#
+# DE ONDE VEM O HASH (conferido em 21/10/2026, ga-2hd02v.4.9): linha `node-v22.22.3-linux-arm64.tar.xz` do SHASUMS256.txt de https://nodejs.org/dist/v22.22.3/. O SHASUMS256.txt foi autenticado com a assinatura
+#   destacada (SHASUMS256.txt.sig) E com a clearsigned (SHASUMS256.txt.asc): as duas deram GOODSIG/VALIDSIG da chave CC68F5A3106FF448322E48ED27F5E38D5B0A215F (Marco Ippolito), que consta em
+#   nodejs/release-keys (keys.list) e no README do nodejs/node. A versão é a mesma que roda no mini (v22.22.3): teste no nó significa o mesmo que no mini. O nó é aarch64 (linux-arm64), não x64.
+# COMO ATUALIZAR: baixe SHASUMS256.txt e a assinatura da versão nova, confira a assinatura (gpg --verify) com a chave do release-keys, copie SÓ a linha linux-arm64.tar.xz para cá, troque as DUAS linhas
+#   de uma vez, rode `bash scripts/hetzner-nodejs.selftest.sh` e depois `bash scripts/hetzner-nodejs.sh install`. A versão antiga continua em ~/.local (desfazer = religar os links; ver o runbook).
+NODE_VERSION=22.22.3
+NODE_SHA256_LINUX_ARM64=1c4a9933a5e45bc88f54f70b5f91232c127ec49f1a5989d23fb85824c7adf9b7
