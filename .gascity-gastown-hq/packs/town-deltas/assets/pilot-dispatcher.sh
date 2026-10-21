@@ -398,6 +398,10 @@ PILOT_NODE_FIRST="${PILOT_NODE_FIRST:-off}"
 PILOT_NODE_FIRST_VETO_LABELS="${PILOT_NODE_FIRST_VETO_LABELS:-node:never needs:engine-window exec:manual}"
 PILOT_NODE_CAPACITY_BIN="${PILOT_NODE_CAPACITY_BIN:-$GC_CITY/scripts/hetzner-capacity.py}"
 PILOT_NODE_FIRST_LOG="${PILOT_NODE_FIRST_LOG:-$GC_CITY/.gc/logs/node-first-shadow.jsonl}"
+# ga-2hd02v.9: a passada de WA no nó (_pilot_wa_node_pass). off (padrão) | shadow | on. shadow classifica (`check`, só leitura) a fila de WA e REGISTRA o que iria ao nó; on FAZ: adota a rota carimbada pelo mini, entrega
+# a dispatch_one e, se o nó não ficar, devolve a rota e solta a claim. Só vale com PILOT_WA_NODE_ROUTE (on: label|auto · shadow: shadow|label|auto). Quem liga é uma pessoa; valor desconhecido = off. Os demais botões
+# (PILOT_WA_NODE_PASS_PROBES / _SECS / _CHECK_TIMEOUT / _MAX_FAILS / _MINI_TTL / _UNKNOWN_TTL / _RELEASED_TTL / _MEMO / _LOG) são lidos onde se usam, com padrão e valor ilegível = padrão.
+PILOT_WA_NODE_EXEMPT="${PILOT_WA_NODE_EXEMPT:-off}"
 
 # ── ga-vln2py (P0, 17/10): DISK FLOOR — a HARD pause on NEW dispatch ──────────────────────────────
 # Free disk below DISK_NEW_WORK_MIN_MB (5120 = 5 GB, packs/town-deltas/assets/scripts/disk-headroom-lib.sh — the one
@@ -12279,6 +12283,8 @@ _pilot_node_first_dispatch() {
 # A leitura do slot e das sessões tem os três estados dentro do wa-node-dispatch.sh (ocupado ou "não sei" = não vai).
 _pilot_wa_node_decide() {
   local _id="${1:-}" _store="${2:-}" _tgt="${3:-}" _mode="${PILOT_WA_NODE_ROUTE:-off}" _dir _out="" _rc=0 _basis=any _bj="" _bo=""
+  # ga-2hd02v.9: o rc do `apply` DESTA chamada, para a passada de WA decidir por ele (12 = nó cheio; 10/11 = a bead não é do nó). Zerado na entrada: sair antes do apply deixa vazio, nunca o rc de outra bead.
+  _PWN_APPLY_RC=""
   case "$_mode" in shadow|label|auto) ;; *) return 1 ;; esac
   [ "$_tgt" = "wa-worker" ] || return 1
   case "$_id" in wa-*) ;; *) return 1 ;; esac
@@ -12312,6 +12318,8 @@ _pilot_wa_node_decide() {
     fi
     _out=$(WA_NODE_SPAWN="$_PWN_SPAWN" WA_NODE_SLOTS="$_PWN_SLOTS" timeout "${PILOT_WA_NODE_TIMEOUT:-90}" "$_dir/wa-node-dispatch.sh" apply "$_id" --store "$_store" --basis "$_basis" 2>/dev/null) || _rc=$?
   fi
+  # ga-2hd02v.9: só o `apply` de verdade deixa o rc (o `check` da sombra e o `--dry-run` não são a escrita que a passada de WA precisa julgar)
+  if [ "$_mode" != shadow ] && [ "${DRY_RUN:-0}" != "1" ]; then _PWN_APPLY_RC="$_rc"; fi
   mkdir -p "$GC_CITY/.gc" 2>/dev/null || true
   jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg b "$_id" --arg m "$_mode" --argjson rc "$_rc" --arg o "$_out" --arg sp "$_PWN_SPAWN" --argjson sl "$_PWN_SLOTS" \
     '{ts:$ts,event:"pilot-node-route",bead:$b,mode:$m,rc:$rc,out:$o,spawn:$sp,slots:$sl}' >> "$GC_CITY/.gc/wa-node-route.jsonl" 2>/dev/null || true
@@ -12583,6 +12591,316 @@ _pilot_ps_node_settle() {
   if [ "$_PWR_STATUS" != in_progress ] || [ "$_PWR_MARK" != "$_PWR_ALIAS" ]; then return 0; fi
   warn "ps-node: $_ss_id ficou com o alias $_PWR_ALIAS depois de um apply incerto e sem sessão — desfaço (a próxima varredura tenta de novo)"
   _pilot_node_remote_rollback "$_PWR_ALIAS" "$_ss_id" "$_ss_store" 0 pilot.wa_node_alias || true
+  return 0
+}
+
+# ── ga-2hd02v.9: a passada de WA no nó — a bead de WA que o nó levaria chega ao gancho MESMO carimbada pelo mini ─────────────────────────────────
+# Medido 20-21/10: 193 beads de WA cedidas a P0/P1 e 59 no teto do pool em 24 h; 3 chegaram ao gancho (_pilot_wa_node_decide). Isentar essas beads do yield/do teto (como a 1.19 fez para dog) NÃO resolve: 173 de 182 já levam
+# gc.routed_to=wa-worker — o carimbo que o PRÓPRIO Pilot grava ao ceder ou enfileirar — e o `apply` do wa-node-dispatch.sh recusa (rc 12) bead com rota. Esta passada roda UMA vez por varredura, antes das pistas, e só olha WA:
+#   · classifica com `check` (só leitura; ~1 s com a bead mínima, não cronometrado com muitos caminhos) e memoriza o que o nó recusou (mini 6 h, unknown 1 h, solta 15 min; chave id+updated_at) — sem memória, as mesmas primeiras N beads gastariam a sonda toda varredura e a fila nunca andaria;
+#   · no modo `on`, entrega a candidata a dispatch_one com _PILOT_WA_NODE_PASS=1: sem yield e sem teto do pool (a vaga do nó não é a que a P0/P1 espera), ADOTA a rota carimbada (tira o carimbo, confirma lendo), chama o gancho e,
+#     se o nó não ficar, DEVOLVE o carimbo e solta a claim SÓ por rótulo — nunca cai no carimbo/spawn do mini. Para no 1º rc 12 do apply (o nó está cheio), no teto de sondas/segundos/falhas e no número de vagas do nó;
+#   · no modo `shadow`, só classifica e REGISTRA o que iria ao nó (jsonl + resumo), sem tocar em bead nenhuma: é o dado para a pessoa decidir ligar `auto`.
+# A capacidade do nó é a que o `apply` confere (slot do alias, sessões e, no modo pilot, o oráculo). A passada NÃO coordena com a cota _PNY_* do dog: dog-remote e wa-worker-remote já eram contados cada um por si (limite a vigiar no
+# runbook). Padrão off; valor desconhecido = off.
+_PWP_MODE=off        # off | shadow | on (saída de _pilot_wa_node_pass_mode)
+_PWP_WHY=""          # motivo curto quando _pilot_wa_node_pass_pre diz não
+_PWP_STAMPED=0       # 1 iff a bead elegível traz gc.routed_to=wa-worker
+_PWP_UPD=""          # updated_at da bead (a chave da memória junto com o id)
+_PWP_MEMO_V=""       # veredito lembrado por _pilot_wa_node_pass_memo_hit
+_PWP_V=""            # saída de _pilot_wa_node_pass_check: node | mini | unknown | timeout | error | missing
+_PWP_BASIS=""        # a base do veredito node (label | text)
+_PWP_ADOPTED=0       # 1 iff esta passada tirou o carimbo da bead que está em dispatch_one (o desfazer só devolve o que ela tirou)
+_PILOT_WA_NODE_PASS=0   # 1 SÓ enquanto a passada entrega uma bead a dispatch_one (modo on); dispatch_one lê
+_PWN_APPLY_RC=""     # o rc do `apply` da última _pilot_wa_node_decide (vazio = não chegou ao apply)
+
+# _pilot_wa_node_pass_mode — deixa em _PWP_MODE off|shadow|on. vazio / valor que não existe / rota que não permite → off; DRY_RUN (a passada sonda e grava memória) e a passada só-nó do disk floor (que tem a sua) → off.
+# `on` só com rota label|auto (com shadow o gancho nunca leva bead: seriam claims à toa); `shadow` com shadow|label|auto. Sempre devolve 0.
+_pilot_wa_node_pass_mode() {
+  local _pm_m="${PILOT_WA_NODE_EXEMPT:-off}" _pm_r="${PILOT_WA_NODE_ROUTE:-}"
+  _PWP_MODE=off
+  [ "${DRY_RUN:-0}" != "1" ] || return 0
+  [ "${_PILOT_NODE_ONLY:-0}" != "1" ] || return 0
+  case "$_pm_m" in
+    on)     case "$_pm_r" in label|auto) _PWP_MODE=on ;; esac ;;
+    shadow) case "$_pm_r" in shadow|label|auto) _PWP_MODE=shadow ;; esac ;;
+  esac
+  return 0
+}
+
+# _pilot_wa_node_pass_pre <bead-json> — exit 0 iff a candidata pode ser sondada. NENHUMA escrita. Deixa _PWP_WHY (o motivo do não), _PWP_STAMPED e _PWP_UPD.
+# vazio (assignee, rota e updated_at ausentes: o bd omite a chave vazia) → livre / sem chave de memória; falhou/ilegível (JSON que o jq não lê, id fora de [A-Za-z0-9._-] que iria para um TSV, recusa do probe do pool que não se
+# sabe dizer) → NÃO elegível, nunca "ninguém recusa". Recusa do probe do pool (pool-probe-vetoes.sh, a mesma lista do yield): se nenhum worker pegaria a bead, o nó também não.
+_pilot_wa_node_pass_pre() {
+  local _pp_b="${1:-}" _pp_rec _pp_id _pp_as _pp_rt _pp_labels _pp_veto _pp_ref _pp_st=0
+  _PWP_WHY=""; _PWP_STAMPED=0; _PWP_UPD=""
+  # vazio (assignee, rota, updated_at ou labels ausentes) → campo "" = livre / sem chave; falhou/ilegível (JSON que o jq não lê) → unreadable, NÃO elegível
+  _pp_rec=$(printf '%s' "$_pp_b" | jq -r '[(.id // ""), (.assignee // ""), (.metadata["gc.routed_to"] // ""), (.updated_at // ""), ((.labels // []) | join(","))] | join("\u001f")' 2>/dev/null) || { _PWP_WHY="unreadable"; return 1; }
+  IFS=$'\037' read -r _pp_id _pp_as _pp_rt _PWP_UPD _pp_labels <<EOF_PWP_PRE
+$_pp_rec
+EOF_PWP_PRE
+  case "$_pp_id" in wa-*) ;; *) _PWP_WHY="not-wa"; return 1 ;; esac
+  case "$_pp_id" in *[!A-Za-z0-9._-]*) _PWP_WHY="unreadable"; return 1 ;; esac
+  case "$_PWP_UPD" in *[!0-9A-Za-z:.+_-]*) _PWP_UPD="" ;; esac
+  [ -z "$_pp_as" ] || { _PWP_WHY="has-owner"; return 1; }
+  case "$_pp_rt" in
+    '') ;;
+    wa-worker) _pp_st=1 ;;
+    *) _PWP_WHY="routed:$_pp_rt"; return 1 ;;
+  esac
+  # vazio (nenhum rótulo de veto) → segue; falhou: a função só imprime e devolve 0, não há como falhar
+  _pp_veto=$(_pilot_node_first_veto "$_pp_labels")
+  [ -z "$_pp_veto" ] || { _PWP_WHY="veto:$_pp_veto"; return 1; }
+  case ",$_pp_labels," in *,node:mini,*) _PWP_WHY="node:mini"; return 1 ;; esac
+  if [ "${PILOT_WA_NODE_ROUTE:-}" = label ]; then
+    case ",$_pp_labels," in *,node:ok,*) ;; *) _PWP_WHY="no-node-ok"; return 1 ;; esac
+  fi
+  # vazio (a lista de recusas não recusa) → segue; falhou/ilegível (biblioteca ausente, sem config, bead que não lê) → refusal-unknown, NÃO elegível
+  if ! _pp_ref=$(_pilot_priority_refusal_of "$_pp_b"); then _PWP_WHY="refusal-unknown"; return 1; fi
+  [ -z "$_pp_ref" ] || { _PWP_WHY="refused:$_pp_ref"; return 1; }
+  _PWP_STAMPED="$_pp_st"
+  return 0
+}
+
+# _pilot_wa_node_pass_memo_hit <id> <updated_at> — exit 0 iff há veredito FRESCO para esta versão da bead (linhas `epoch<TAB>id<TAB>updated_at<TAB>veredito`; a ÚLTIMA linha da bead vale). TTL por veredito: mini 21600 s,
+# unknown 3600 s, released 900 s (PILOT_WA_NODE_PASS_{MINI,UNKNOWN,RELEASED}_TTL; ilegível = padrão). Deixa o veredito em _PWP_MEMO_V.
+# vazio (sem arquivo, sem id/updated_at = sem chave) → sem memória: sonda; falhou/ilegível (arquivo que não abre, awk que falha, linha ruim) → também sem memória — a sonda decide, NUNCA "mini" por chute.
+_pilot_wa_node_pass_memo_hit() {
+  local _mh_id="${1:-}" _mh_upd="${2:-}" _mh_f _mh_now _mh_tm _mh_tu _mh_tr _mh_v
+  _PWP_MEMO_V=""
+  { [ -n "$_mh_id" ] && [ -n "$_mh_upd" ]; } || return 1
+  _mh_f="${PILOT_WA_NODE_PASS_MEMO:-${GC_CITY:-/nonexistent}/.gc/wa-node-pass-memo.tsv}"
+  { [ -f "$_mh_f" ] && [ -r "$_mh_f" ]; } || return 1
+  # vazio/falhou/ilegível (relógio mudo) → sem memória: sonda
+  _mh_now=$(date +%s 2>/dev/null) || return 1
+  case "$_mh_now" in ''|*[!0-9]*) return 1 ;; esac
+  _mh_tm="${PILOT_WA_NODE_PASS_MINI_TTL:-21600}"; case "$_mh_tm" in ''|*[!0-9]*) _mh_tm=21600 ;; esac
+  _mh_tu="${PILOT_WA_NODE_PASS_UNKNOWN_TTL:-3600}"; case "$_mh_tu" in ''|*[!0-9]*) _mh_tu=3600 ;; esac
+  _mh_tr="${PILOT_WA_NODE_PASS_RELEASED_TTL:-900}"; case "$_mh_tr" in ''|*[!0-9]*) _mh_tr=900 ;; esac
+  # vazio (nenhuma linha da bead, ou a última venceu) → sem acerto: sonda; falhou/ilegível (awk que falha, linha ruim) → sem acerto também: a sonda decide, nunca "mini" por chute
+  _mh_v=$(awk -F'\t' -v id="$_mh_id" -v upd="$_mh_upd" -v now="$_mh_now" -v tm="$_mh_tm" -v tu="$_mh_tu" -v tr="$_mh_tr" '
+      $2 == id && $3 == upd { v = $4; ts = $1 + 0; hit = 1 }
+      END { if (!hit) exit 1; t = (v == "mini") ? tm : ((v == "unknown") ? tu : ((v == "released") ? tr : 0)); if (now - ts < t) { print v; exit 0 } exit 1 }' "$_mh_f" 2>/dev/null) || return 1
+  [ -n "$_mh_v" ] || return 1
+  _PWP_MEMO_V="$_mh_v"
+  return 0
+}
+
+# _pilot_wa_node_pass_memo_put <id> <updated_at> <veredito> — acrescenta a linha. Sempre devolve 0: a memória só poupa orçamento de sonda, e uma que não grava (pasta ausente, disco cheio) AVISA e segue.
+# vazio (sem id, updated_at ou veredito) → não grava (sem chave a memória nunca acertaria). O arquivo é aparado quando passa de 5000 linhas (fica o que tem menos de 24 h: nenhum TTL passa de 6 h).
+_pilot_wa_node_pass_memo_put() {
+  local _mp_id="${1:-}" _mp_upd="${2:-}" _mp_v="${3:-}" _mp_f _mp_now _mp_n
+  { [ -n "$_mp_id" ] && [ -n "$_mp_upd" ] && [ -n "$_mp_v" ]; } || return 0
+  _mp_f="${PILOT_WA_NODE_PASS_MEMO:-${GC_CITY:-/nonexistent}/.gc/wa-node-pass-memo.tsv}"
+  # vazio/falhou (relógio mudo) → não grava: sem hora a linha nunca venceria direito
+  _mp_now=$(date +%s 2>/dev/null) || return 0
+  mkdir -p "$(dirname "$_mp_f")" 2>/dev/null || true
+  { printf '%s\t%s\t%s\t%s\n' "$_mp_now" "$_mp_id" "$_mp_upd" "$_mp_v" >> "$_mp_f"; } 2>/dev/null \
+    || { warn "ga-2hd02v.9: não consegui gravar a memória de vereditos em $_mp_f — a próxima varredura sonda $_mp_id de novo (só custa orçamento)"; return 0; }
+  # vazio/falhou/ilegível (wc que não conta) → não apara; o arquivo só cresce até a próxima gravação que conte
+  _mp_n=$(wc -l < "$_mp_f" 2>/dev/null | tr -d ' ') || _mp_n=0
+  case "$_mp_n" in ''|*[!0-9]*) return 0 ;; esac
+  if [ "$_mp_n" -gt 5000 ]; then
+    awk -F'\t' -v now="$_mp_now" '$1 + 0 > now - 86400' "$_mp_f" > "$_mp_f.tmp" 2>/dev/null && mv "$_mp_f.tmp" "$_mp_f" 2>/dev/null || rm -f "$_mp_f.tmp" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# _pilot_wa_node_pass_check <id> [loja] — roda `wa-node-dispatch.sh check` (o classificador, SÓ LEITURA, não olha dono nem rota) e deixa _PWP_V e _PWP_BASIS. Só o rc 0 COM JSON de veredito node é node; 10 mini; 11 unknown;
+# 124/137/143 timeout; script ausente = missing (a passada para); qualquer outra coisa, inclusive rc 0 com saída que não é um veredito node, = error — o terceiro estado nunca vira node. Sem loja, o script a acha pelo routes.jsonl.
+# Sempre devolve 0.
+_pilot_wa_node_pass_check() {
+  local _pc_id="${1:-}" _pc_store="${2:-}" _pc_dir _pc_out="" _pc_rc=0 _pc_vb="" _pc_to
+  _PWP_V="error"; _PWP_BASIS=""
+  _pc_dir="${PILOT_WA_NODE_SCRIPTS:-${GC_CITY:-/nonexistent}/scripts}"
+  if [ ! -x "$_pc_dir/wa-node-dispatch.sh" ]; then _PWP_V="missing"; return 0; fi
+  _pc_to="${PILOT_WA_NODE_PASS_CHECK_TIMEOUT:-30}"; case "$_pc_to" in ''|*[!0-9]*) _pc_to=30 ;; esac
+  # vazio (saída sem veredito) → error; falhou (rc fora de 0/10/11/124) → error ou timeout, nunca node
+  if [ -n "$_pc_store" ]; then
+    _pc_out=$(timeout "$_pc_to" "$_pc_dir/wa-node-dispatch.sh" check "$_pc_id" --store "$_pc_store" 2>/dev/null) || _pc_rc=$?
+  else
+    _pc_out=$(timeout "$_pc_to" "$_pc_dir/wa-node-dispatch.sh" check "$_pc_id" 2>/dev/null) || _pc_rc=$?
+  fi
+  case "$_pc_rc" in
+    # vazio/ilegível (saída que não é JSON de veredito) → _pc_vb "" e fica error
+    0)  _pc_vb=$(printf '%s' "$_pc_out" | jq -r '[(.verdict // ""), (.basis // "")] | join("|")' 2>/dev/null) || _pc_vb=""
+        if [ "${_pc_vb%%|*}" = node ]; then _PWP_V=node; _PWP_BASIS="${_pc_vb#*|}"; fi ;;
+    10) _PWP_V=mini ;;
+    11) _PWP_V=unknown ;;
+    124|137|143) _PWP_V=timeout ;;
+  esac
+  return 0
+}
+
+# _pilot_wa_node_pass_state <id> <loja> — imprime "status|dono|rota" lido AGORA. vazio (dono ou rota ausentes: o bd omite a chave vazia) → campo vazio ("open||" é a bead livre); falhou/ilegível (bd falhou, saída vazia
+# ou que o jq não lê, bead de OUTRO id, status que não é texto) → imprime nada e devolve 1: quem chama NÃO trata como "livre".
+# (A condição do select está escrita de outro jeito que em _pilot_wa_node_read DE PROPÓSITO: os mutantes de pilot-dispatcher.wa-node-spawn.mutants.py trocam o trecho de lá exigindo que ele exista UMA vez no arquivo.)
+_pilot_wa_node_pass_state() {
+  local _ps_id="${1:-}" _ps_store="${2:-}" _ps_json _ps_rec
+  # vazio (dono/rota ausentes) → campo vazio = livre; falhou/ilegível (bd falhou, saída vazia, bead de outro id, status que não é texto) → 1: quem chama NÃO trata como livre
+  _ps_json=$(timeout "${PILOT_WA_NODE_READ_TIMEOUT:-20}" bd -C "$_ps_store" show "$_ps_id" --json 2>/dev/null) || return 1
+  _ps_rec=$(printf '%s' "$_ps_json" | jq -r --arg id "$_ps_id" 'if type == "array" then .[0] else . end | select(type == "object" and ((.status | type) == "string") and (.id == $id)) | [.status, (.assignee // ""), (.metadata["gc.routed_to"] // "")] | join("|")' 2>/dev/null) || return 1
+  [ -n "$_ps_rec" ] || return 1
+  printf '%s' "$_ps_rec"
+}
+
+# _pilot_wa_node_adopt <id> <loja> — deixa a bead SEM rota para o `apply` (que só aceita bead sem rota). Devolve 0 = a bead está sem rota agora (já estava, ou o carimbo wa-worker saiu e a releitura CONFIRMOU); 1 = não está
+# e nada mais deve ser escrito. Só adota bead exatamente "open||" ou "open||wa-worker" (lida agora): qualquer outro dono, status ou rota, ou leitura que falhou, = 1 sem escrever. Marca _PWP_ADOPTED=1 ANTES da escrita, para
+# o desfazer sempre rodar. rc 0 do bd que não gravou (a releitura ainda vê o carimbo) = 1: o efeito, não o retorno.
+_pilot_wa_node_adopt() {
+  local _ad_id="${1:-}" _ad_store="${2:-}" _ad_st _ad_now
+  _PWP_ADOPTED=0
+  # vazio (dono e rota ausentes) → "open||" = livre; falhou/ilegível → 1, nada escrito
+  _ad_st=$(_pilot_wa_node_pass_state "$_ad_id" "$_ad_store") || return 1
+  case "$_ad_st" in
+    "open||") return 0 ;;
+    "open||wa-worker") ;;
+    *) return 1 ;;
+  esac
+  _PWP_ADOPTED=1
+  if ! timeout "${PILOT_WA_NODE_READ_TIMEOUT:-20}" bd -C "$_ad_store" update "$_ad_id" --unset-metadata gc.routed_to -q 2>/dev/null; then
+    _pilot_wa_node_unadopt "$_ad_id" "$_ad_store" || true
+    return 1
+  fi
+  # vazio (sem rota) → "open||" = a escrita pegou; falhou/ilegível → "" e NÃO confirmado: devolve o carimbo (se ainda for o estado que deixei) e sai 1
+  _ad_now=$(_pilot_wa_node_pass_state "$_ad_id" "$_ad_store") || _ad_now=""
+  if [ "$_ad_now" != "open||" ]; then
+    _pilot_wa_node_unadopt "$_ad_id" "$_ad_store" || true
+    return 1
+  fi
+  return 0
+}
+
+# _pilot_wa_node_unadopt <id> <loja> — devolve o carimbo gc.routed_to=wa-worker que a passada tirou. Só devolve o que ELA tirou (_PWP_ADOPTED=1) e só se a bead, lida AGORA, está exatamente como foi deixada ("open||"):
+# se o nó ficou com ela, se outro dono ou outra rota apareceu, ou se a leitura falhou, NÃO escreve — a bead sem rota é o estado de primeira vista (inerte: a próxima varredura a trata como nova). Sempre devolve 0.
+_pilot_wa_node_unadopt() {
+  local _un_id="${1:-}" _un_store="${2:-}" _un_st
+  [ "${_PWP_ADOPTED:-0}" = "1" ] || return 0
+  _PWP_ADOPTED=0
+  # vazio (bead sem dono e sem rota) → "open||" = como foi deixada; falhou/ilegível → não escreve (a bead sem rota é inerte)
+  _un_st=$(_pilot_wa_node_pass_state "$_un_id" "$_un_store") || { warn "ga-2hd02v.9: não consegui reler $_un_id para devolver a rota — fica sem rota (estado de primeira vista), a próxima varredura a trata como nova"; return 0; }
+  [ "$_un_st" = "open||" ] || return 0
+  timeout "${PILOT_WA_NODE_READ_TIMEOUT:-20}" bd -C "$_un_store" update "$_un_id" --set-metadata "gc.routed_to=wa-worker" -q 2>/dev/null \
+    || warn "ga-2hd02v.9: não consegui recolocar gc.routed_to=wa-worker em $_un_id — fica sem rota (estado de primeira vista), a próxima varredura a trata como nova"
+  return 0
+}
+
+# _pilot_wa_node_pass — a passada. Uma vez por varredura, antes das pistas. Sempre devolve 0 (nada aqui derruba a varredura). Lê e, no modo on, reescreve SMALL_/BIG_CANDIDATES, _SLOTS e _COUNT e soma DISPATCHED.
+# Ordem de cada candidata: pré (sem escrita) → memória → orçamento (sondas e segundos) → `check` → (shadow: registra) / (on: dispatch_one). Para: despacho parado · vagas do nó esgotadas (_PWN_SLOTS) · falhas demais ·
+# apply rc 12 (nó cheio: capacidade é do nó, a bead NÃO é memorizada) · apply com outro rc (a escrita pode ter acontecido: para sem memorizar) · Dolt saturado (antes de escrever) · script ausente. Falha por bead (apply 10/11, ou nada chegou ao apply) é memorizada.
+_pilot_wa_node_pass() {
+  local _pw_lane _pw_pool _pw_slots _pw_wa _pw_n _pw_pick _pw_id _pw_upd _pw_tier _pw_rc _pw_keepmax _pw_cap _pw_secs _pw_maxfail _pw_t0 _pw_log _pw_sk _pw_skj
+  local _pw_total=0 _pw_elig=0 _pw_memo=0 _pw_probed=0 _pw_node=0 _pw_mini=0 _pw_unk=0 _pw_tmo=0 _pw_err=0 _pw_kept=0 _pw_rel=0 _pw_fails=0 _pw_stop="" _pw_skipped=""
+  _pilot_wa_node_pass_mode
+  if [ "$_PWP_MODE" = off ]; then
+    case "${PILOT_WA_NODE_EXEMPT:-off}" in
+      on|shadow) log "ga-2hd02v.9: PILOT_WA_NODE_EXEMPT=${PILOT_WA_NODE_EXEMPT} está INERTE nesta varredura (rota='${PILOT_WA_NODE_ROUTE:-}', DRY_RUN=${DRY_RUN:-0}, passada só-nó=${_PILOT_NODE_ONLY:-0}) — on pede rota label|auto; shadow, shadow|label|auto." ;;
+    esac
+    return 0
+  fi
+  _pw_cap="${PILOT_WA_NODE_PASS_PROBES:-12}"; case "$_pw_cap" in ''|*[!0-9]*) _pw_cap=12 ;; esac
+  _pw_secs="${PILOT_WA_NODE_PASS_SECS:-120}"; case "$_pw_secs" in ''|*[!0-9]*) _pw_secs=120 ;; esac
+  _pw_maxfail="${PILOT_WA_NODE_PASS_MAX_FAILS:-3}"; case "$_pw_maxfail" in ''|*[!0-9]*) _pw_maxfail=3 ;; esac
+  _pw_log="${PILOT_WA_NODE_PASS_LOG:-${GC_CITY:-/nonexistent}/.gc/wa-node-exempt.jsonl}"
+  _pilot_wa_node_spawn_mode; _pw_keepmax="$_PWN_SLOTS"
+  # a chave geral das pistas (DISPATCH_TO_CAPACITY != 1 → uma bead por pista) vale também aqui: o nó não recebe mais de uma bead por varredura enquanto ela estiver desligada
+  if [ "${DISPATCH_TO_CAPACITY:-1}" != "1" ] && [ "$_pw_keepmax" -gt 1 ]; then _pw_keepmax=1; fi
+  _pw_t0=$SECONDS
+  for _pw_lane in small big; do
+    [ -z "$_pw_stop" ] || break
+    case "$_pw_lane" in
+      small) _pw_pool="${SMALL_CANDIDATES:-[]}"; _pw_slots="${SMALL_SLOTS:-0}" ;;
+      big)   _pw_pool="${BIG_CANDIDATES:-[]}";   _pw_slots="${BIG_SLOTS:-0}" ;;
+    esac
+    case "$_pw_slots" in ''|*[!0-9]*) _pw_slots=0 ;; esac
+    # vazio ([]) → nada a fazer; falhou/ilegível (a pista que o jq não lê) → pula a pista e avisa: o estado inerte é a pista como estava
+    _pw_wa=$(printf '%s' "$_pw_pool" | jq -c '[ .[] | select((.id // "") | startswith("wa-")) ]' 2>/dev/null) || { warn "ga-2hd02v.9: a pista $_pw_lane não é uma lista que eu leia — a passada de WA a pula"; continue; }
+    [ -n "$_pw_wa" ] || continue
+    _pw_n=$(printf '%s' "$_pw_wa" | jq 'length' 2>/dev/null) || _pw_n=0
+    case "$_pw_n" in ''|*[!0-9]*) _pw_n=0 ;; esac
+    _pw_total=$((_pw_total + _pw_n))
+    while [ "$_pw_n" -gt 0 ]; do
+      if _pilot_dispatch_should_stop; then _pw_stop="should-stop"; break; fi
+      if [ "$_PWP_MODE" = on ]; then
+        [ "$_pw_kept" -lt "$_pw_keepmax" ] || { _pw_stop="keep-limit"; break; }
+        [ "$_pw_fails" -lt "$_pw_maxfail" ] || { _pw_stop="max-fails"; break; }
+        [ "$_pw_slots" -gt 0 ] || break
+      fi
+      # vazio (pista sem pick) → fim da pista; falhou/ilegível ("null", id que não lê) → fim da pista também: nada é tentado sem id
+      _pw_pick=$(_top_candidate "$_pw_wa")
+      { [ -n "$_pw_pick" ] && [ "$_pw_pick" != null ]; } || break
+      _pw_id=$(printf '%s' "$_pw_pick" | jq -r '.id // ""' 2>/dev/null) || _pw_id=""
+      [ -n "$_pw_id" ] || break
+      _pw_wa=$(printf '%s' "$_pw_wa" | jq -c --arg id "$_pw_id" '[ .[] | select(.id != $id) ]' 2>/dev/null) || break
+      _pw_n=$(printf '%s' "$_pw_wa" | jq 'length' 2>/dev/null) || _pw_n=0
+      case "$_pw_n" in ''|*[!0-9]*) _pw_n=0 ;; esac
+      if ! _pilot_wa_node_pass_pre "$_pw_pick"; then _pw_skipped="$_pw_skipped ${_PWP_WHY%%:*}"; continue; fi
+      _pw_elig=$((_pw_elig + 1)); _pw_upd="$_PWP_UPD"
+      if _pilot_wa_node_pass_memo_hit "$_pw_id" "$_pw_upd"; then _pw_memo=$((_pw_memo + 1)); continue; fi
+      if [ "$_pw_probed" -ge "$_pw_cap" ]; then _pw_stop="budget-probes"; break; fi
+      if [ $(( SECONDS - _pw_t0 )) -ge "$_pw_secs" ]; then _pw_stop="budget-secs"; break; fi
+      _pw_probed=$((_pw_probed + 1))
+      _pilot_wa_node_pass_check "$_pw_id" ""
+      case "$_PWP_V" in
+        node)
+          _pw_node=$((_pw_node + 1))
+          # no modo label o `apply --basis label` só aceita a base `label`; um node por texto não é o que o apply levaria
+          if [ "${PILOT_WA_NODE_ROUTE:-}" = label ] && [ "$_PWP_BASIS" != label ]; then _pw_skipped="$_pw_skipped basis"; continue; fi
+          if [ "$_PWP_MODE" = shadow ]; then
+            { jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg b "$_pw_id" --arg l "$_pw_lane" --arg ba "$_PWP_BASIS" --argjson st "$_PWP_STAMPED" --argjson p "$_pw_pick" \
+                '{ts:$ts,event:"wa-node-pass-shadow",bead:$b,lane:$l,basis:$ba,stamped:$st,prio:($p.priority // null)}' >> "$_pw_log"; } 2>/dev/null \
+              || warn "ga-2hd02v.9: não consegui gravar a linha-sombra de $_pw_id em $_pw_log"
+            continue
+          fi ;;
+        mini)    _pw_mini=$((_pw_mini + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" mini; continue ;;
+        unknown) _pw_unk=$((_pw_unk + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" unknown; continue ;;
+        timeout) _pw_tmo=$((_pw_tmo + 1)); continue ;;
+        missing) _pw_stop="check-missing"; break ;;
+        *)       _pw_err=$((_pw_err + 1)); continue ;;
+      esac
+      # ── modo on: a candidata que o classificador manda ao nó vai a dispatch_one com a bandeira ──
+      # O Dolt saturado (no início da varredura, ou agora) para as ESCRITAS, como nas pistas (dispatch_lane): claim + adoção + apply + soltura são ~10 escritas por tentativa. Sem sinal nenhum (_dolt_saturated devolve 0 com
+      # reason=unreadable) conta como saturado: o estado inerte é não escrever. As sondas acima são leitura e já correram.
+      if [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ] || _dolt_saturated; then _pw_stop="dolt-saturated"; break; fi
+      _PILOT_WA_NODE_PASS=1; _PWN_APPLY_RC=""; DISPATCH_RESULT=""
+      _pw_tier=$(_bead_tier "$_pw_pick")
+      _pw_rc=0
+      dispatch_one "$_pw_pick" "$_pw_lane" "$_pw_tier" || _pw_rc=$?
+      _PILOT_WA_NODE_PASS=0
+      if [ "$_pw_rc" = 0 ]; then
+        _pw_kept=$((_pw_kept + 1)); _pw_slots=$((_pw_slots - 1)); DISPATCHED=$((DISPATCHED + 1))
+        _pilot_sweep_note "$_pw_id" 0 "${DISPATCH_RESULT:-}"
+        # a bead que ficou com o nó SAI da pista: o laço normal a pegaria de novo. Se a pista não se reescreve, ela é esvaziada (inerte: nenhuma bead é despachada duas vezes).
+        _pw_pool=$(printf '%s' "$_pw_pool" | jq -c --arg id "$_pw_id" '[ .[] | select(.id != $id) ]' 2>/dev/null) || { warn "ga-2hd02v.9: não consegui tirar $_pw_id da pista $_pw_lane — a pista fica vazia nesta varredura"; _pw_pool="[]"; }
+      else
+        _pw_rel=$((_pw_rel + 1))
+        case "${_PWN_APPLY_RC:-}" in
+          10) _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" mini ;;
+          11) _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" unknown ;;
+          '') _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" released ;;
+          12) _pw_stop="capacity"; break ;;
+          *)  _pw_stop="hook-held"; break ;;
+        esac
+      fi
+    done
+    if [ "$_PWP_MODE" = on ]; then
+      case "$_pw_lane" in
+        small) SMALL_CANDIDATES="$_pw_pool"; SMALL_SLOTS="$_pw_slots"; SMALL_COUNT=$(printf '%s' "$_pw_pool" | jq 'length' 2>/dev/null || echo 0) ;;
+        big)   BIG_CANDIDATES="$_pw_pool";   BIG_SLOTS="$_pw_slots";   BIG_COUNT=$(printf '%s' "$_pw_pool" | jq 'length' 2>/dev/null || echo 0) ;;
+      esac
+    fi
+  done
+  _PILOT_WA_NODE_PASS=0
+  # vazio (nada pulado) → {} e "nenhuma"; falhou (jq) → {} também: é só o rótulo do log e do resumo, nenhuma decisão lê isto
+  _pw_skj=$(printf '%s' "$_pw_skipped" | jq -cR 'split(" ") | map(select(length > 0)) | group_by(.) | map({key: .[0], value: length}) | from_entries' 2>/dev/null) || _pw_skj="{}"
+  [ -n "$_pw_skj" ] || _pw_skj="{}"
+  _pw_sk=$(printf '%s' "$_pw_skj" | jq -r 'to_entries | map("\(.key)=\(.value)") | join(",")' 2>/dev/null) || _pw_sk=""
+  log "ga-2hd02v.9: passada de WA no nó (modo=$_PWP_MODE): candidatas WA=$_pw_total · elegíveis=$_pw_elig (puladas: ${_pw_sk:-nenhuma}) · memória=$_pw_memo · sondadas=$_pw_probed (node $_pw_node · mini $_pw_mini · unknown $_pw_unk · timeout $_pw_tmo · erro $_pw_err) · ficaram com o nó=$_pw_kept · soltas=$_pw_rel · parou: ${_pw_stop:-fim da lista}"
+  { jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg m "$_PWP_MODE" --arg r "${PILOT_WA_NODE_ROUTE:-}" --arg stop "${_pw_stop:-none}" --argjson sk "$_pw_skj" \
+      --argjson tot "$_pw_total" --argjson el "$_pw_elig" --argjson me "$_pw_memo" --argjson pr "$_pw_probed" --argjson nd "$_pw_node" --argjson mi "$_pw_mini" --argjson un "$_pw_unk" \
+      --argjson tm "$_pw_tmo" --argjson er "$_pw_err" --argjson kp "$_pw_kept" --argjson rl "$_pw_rel" \
+      '{ts:$ts,event:"wa-node-pass-summary",mode:$m,route:$r,wa_candidates:$tot,eligible:$el,skipped:$sk,memo_hits:$me,probed:$pr,node:$nd,mini:$mi,unknown:$un,timeout:$tm,error:$er,kept:$kp,released:$rl,stopped:$stop}' >> "$_pw_log"; } 2>/dev/null \
+    || warn "ga-2hd02v.9: não consegui gravar o resumo da passada de WA em $_pw_log"
   return 0
 }
 
@@ -13797,7 +14115,18 @@ LIVESEC
   _PYS_TARGET=$(wa_worker_template "$BUILDER_TARGET")
   [ "$STORY_BEAD_CITY" != "$GC_CITY" ] && _PYS_NATIVE=1
   _PNY_EXEMPT_THIS=0
-  if [ "${_PILOT_NODE_ONLY:-0}" = "1" ]; then
+  if [ "${_PILOT_WA_NODE_PASS:-0}" = "1" ]; then
+    # ga-2hd02v.9: passada de WA no nó — a vaga do nó não é a que a P0/P1 espera, então o yield NÃO se aplica; mas só segue a bead de WA do store do WA com alvo wa-worker (o único braço que chama o gancho do nó).
+    # Qualquer outra (bead do HQ, ps-worker, crew nomeada) solta a claim aqui, SEM carimbo: o 4º argumento do release não é wa-worker/ps-worker de propósito (carimbar mandaria a bead para a fila do pool do mini).
+    if [ "$_PYS_NATIVE" = "1" ] && [ "$_PYS_TARGET" = "wa-worker" ]; then
+      log "  ga-2hd02v.9: $STORY_ID segue na passada de WA no nó — alvo wa-worker no store do WA; o gancho do nó decide e, se ele não a levar, a rota volta e a claim solta (nunca o mini)."
+    else
+      log "  ga-2hd02v.9: $STORY_ID fica para a varredura normal — alvo $_PYS_TARGET não é o pool wa-worker do store do WA; claim solta, sem carimbo."
+      _pilot_priority_yield_release "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET" "wa-node-pass"
+      DISPATCH_RESULT="wa_node_pass_released"
+      return 1
+    fi
+  elif [ "${_PILOT_NODE_ONLY:-0}" = "1" ]; then
     # ga-2hd02v.1.20 (disk floor): passada só-nó — só a bead de dog do HQ que o nó quer segue; qualquer outra solta a claim aqui. O 4º argumento do release NÃO é wa-worker/ps-worker de propósito: ele só
     # carimba rota para esses alvos, e a pausa do disco não é espera de capacidade (carimbar mandaria a bead para a fila do pool).
     if _pilot_priority_node_exempt "$STORY_ID" "$_PYS_TARGET" "$_PYS_NATIVE" "$STORY_LABELS"; then
@@ -14483,13 +14812,31 @@ TASK
         # ficam como estão, sem reindentar (os selftests do WA as extraem verbatim); o fi deste if vem logo depois do `: # pool` mais abaixo.
         if [ "$_RP_PS_NODE_RC" != 0 ]; then
         local _RP_NODE_RC=0
+        # ga-2hd02v.9: passada de WA no nó — o `apply` do gancho só aceita bead SEM rota, e a bead que o Pilot cedeu ou enfileirou traz o carimbo wa-worker que ele mesmo gravou. Adota ANTES do gancho (tira o carimbo e
+        # confirma lendo); se não der (bead que mudou de dono ou de rota, leitura que falhou), o gancho nem é chamado e a claim solta SEM carimbo. Fora da passada nada disto roda.
+        if [ "${_PILOT_WA_NODE_PASS:-0}" = "1" ] && ! _pilot_wa_node_adopt "$STORY_ID" "$STORY_BEAD_CITY"; then
+          log "  ga-2hd02v.9: $STORY_ID — não consegui deixá-la sem rota para o apply (ou ela já não está livre); NÃO vai ao mini: claim solta, reavaliada na próxima varredura."
+          _pilot_priority_yield_release "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET" "wa-node-pass"
+          DISPATCH_RESULT="wa_node_pass_released"
+          return 1
+        fi
         _pilot_wa_node_decide "$STORY_ID" "$STORY_BEAD_CITY" "$_SLING_TARGET" || _RP_NODE_RC=$?
         if [ "$_RP_NODE_RC" = 0 ]; then
           _SLING_TARGET="wa-worker-remote"
+          # ga-2hd02v.9: a bead ficou com o nó — a vaga virtual de wa-worker-N que o dispatch_one marcou não é consumida no mini
+          if [ "${_PILOT_WA_NODE_PASS:-0}" = "1" ]; then unmark_pool_builder "$BUILDER_TARGET"; fi
         elif [ "$_RP_NODE_RC" = 2 ]; then
           bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
           bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
           DISPATCH_RESULT="wa_node_unknown"
+          return 1
+        elif [ "${_PILOT_WA_NODE_PASS:-0}" = "1" ]; then
+          # ga-2hd02v.9: rc 1 = nada foi escrito pelo gancho e o nó não ficou. Devolve o carimbo que a passada tirou (só se a bead ainda está como foi deixada) e solta a claim SÓ por rótulo: NÃO cai no carimbo
+          # wa-worker nem no gc session new do mini. (rc 2, acima, NÃO devolve: o nó pode ter ficado com a bead.)
+          _pilot_wa_node_unadopt "$STORY_ID" "$STORY_BEAD_CITY"
+          log "  ga-2hd02v.9: $STORY_ID — o gancho do nó não ficou com a bead (nada escrito); rota devolvida e claim solta, sem mini (apply rc=${_PWN_APPLY_RC:-n/d})."
+          _pilot_priority_yield_release "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET" "wa-node-pass"
+          DISPATCH_RESULT="wa_node_pass_released"
           return 1
         elif [ "${_PILOT_NODE_ONLY:-0}" = "1" ]; then
           # ga-8okir7: passada só-nó do disk floor, rc 1 = o gancho não levou a bead ao nó e nada foi escrito. O mini está pausado: ela NÃO cai no caminho do pool do mini (carimbo gc.routed_to=wa-worker + gc session new).
@@ -15417,7 +15764,7 @@ _pilot_sweep_emit() {
       elif $o.r == "rig_native_global_session_cap_queued" then "queued_global_cap"
       elif $o.r == "rig_native_spawn_failed" then "spawn_failed"
       elif $o.r == "priority_yield" then "yielded_priority"
-      elif ["pool_ownership_refuse", "rig_native_dog_store_blind", "rig_native_dog_store_migrated", "rig_native_pool_store_blind", "rig_native_pool_store_migrated", "hq_pool_store_blind", "rig_native_pool_target_only", "rig_dedup_skip", "rig_native_spawn_deferred_slow", "disk_floor_node_only"]
+      elif ["pool_ownership_refuse", "rig_native_dog_store_blind", "rig_native_dog_store_migrated", "rig_native_pool_store_blind", "rig_native_pool_store_migrated", "hq_pool_store_blind", "rig_native_pool_target_only", "rig_dedup_skip", "rig_native_spawn_deferred_slow", "disk_floor_node_only", "wa_node_pass_released"]
            | any(.[]; . == $o.r) then "refused_by_guard"
       elif $o.r == "" then "unclassified"
       else "failed_other" end;
@@ -15630,6 +15977,9 @@ dispatch_lane() {
 
   log "Lane $lane: dispatched ${filled} this sweep (cap=${cap}, slots_left=${slots})."
 }
+
+# ga-2hd02v.9: a passada de WA no nó roda UMA vez, antes das pistas, e (modo on) tira da pista o que ficou com o nó. Padrão off. Nunca derruba a varredura (devolve sempre 0; o `|| true` é a rede de segurança do set -e).
+_pilot_wa_node_pass || true
 
 # Small + big lanes are independent. Dispatch the full pool for each (the loop is
 # a no-op when a lane has no slots or no candidates).

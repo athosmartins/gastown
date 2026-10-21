@@ -2,7 +2,7 @@
 
 ## Contents
 
-• Regra e estado (INERTE) · O que há no repositório · Como o classificador decide · A escada de modos do Pilot · N slots: o modo `pilot` · Auditoria dos `wa-worker*` do Pilot
+• Regra e estado (INERTE) · O que há no repositório · Como o classificador decide · A escada de modos do Pilot · N slots: o modo `pilot` · A passada de WA no nó: `PILOT_WA_NODE_EXEMPT` (ga-2hd02v.9) · Auditoria dos `wa-worker*` do Pilot
 • Como ligar, passo a passo · Como desligar · O que depende de outras histórias (1.6, 1.13) · O que não foi provado
 
 Bead ga-2hd02v.1.10 (história de ga-2hd02v.1, "sessão remota no servidor Hetzner"). Regra do Athos (18/10): **nenhum dado de lead/cliente no nó**. Por isso a bead do WhatsApp Automation só vai ao nó quando é "código + teste sem banco real"; o resto roda no mini, como hoje.
@@ -96,6 +96,42 @@ Dois ambientes do Pilot (lidos a cada chamada) e o gancho os repassa ao `wa-node
 
 **A janela é o oráculo, não o N.** O N é só o teto de quantas sessões podem existir; quantas cabem agora quem diz é o `hetzner-capacity.py` (passos de CPU e RAM, `hetzner-capacity.md`). A sessão de WA conta como sempre-ocupada, então **não foi preciso mudar o oráculo**. O que segura a ocupação do nó hoje não são os slots, é a **elegibilidade**: medido em 20/10, dos 167 beads WA abertos e `story:approved`, só 5 são `node` (99 `mini`, 63 `unknown`). Mais de ~5 slots rende pouco até a elegibilidade subir; o `shadow` mede isso antes de alargar.
 
+## A passada de WA no nó: `PILOT_WA_NODE_EXEMPT` (ga-2hd02v.9)
+
+**Estado: construída, testada com falsos, desligada (`off`).** Resolve o funil que o `wa-node-report.py` mede: em 24 h (20-21/10) 193 beads de WA foram cedidas a P0/P1 e 59 ficaram no teto do pool do mini **antes** do gancho do nó, e só 3 o alcançaram.
+
+**Por que NÃO é a "isenção do yield" que o corpo da bead propunha** (revisão adversarial, conferida no artefato em 21/10). `wa-node-dispatch.sh apply` recusa (rc 12) toda bead com `gc.routed_to`, e das 182 beads de WA abertas que o Pilot cedeu nas varreduras recentes **173 (95%) já levam `gc.routed_to=wa-worker`**: o carimbo que o próprio Pilot grava quando cede ou enfileira. Isentar essas beads do yield só as levaria à claim, ao gancho e a um rc 12. A passada abaixo **adota a rota carimbada** (tira o carimbo e, se o nó não ficar, o recoloca).
+
+**Quanto isso pode mover (medido em 21/10).** `node:ok` não existe em nenhuma bead do WA, em nenhum status (`bd list --label node:ok --all` devolveu 0 em 21/10): em `label` a passada não acha o que levar. Duas medições do classificador em `auto` (por texto), 21/10: (1) amostra de 54 das 216 beads despacháveis: `node` em 5 (≈9%), `mini` em 34, `unknown` em 15; (2) a própria passada em `shadow`, com o código novo e o classificador real, sobre as 158 beads de WA `story:approved` e sem dono: `node` em 5 (3%), `mini` em 92, `unknown` em 61, **as 5 carimbadas** (P1, P1, P2, P2, P3), ~2 s por sonda na mini carregada. Em `auto` a ordem de grandeza é de **5 a 20 beads na fila**, não 200, e é pouco provável que isso sozinho leve o nó a 100%; o `shadow` diz isso com o tráfego de cada dia antes de alguém ligar `auto`. **Ligar `auto` continua sendo decisão de uma pessoa**; o `shadow` desta passada é o dado para ela.
+
+`PILOT_WA_NODE_EXEMPT` (lida a cada varredura; vazio ou valor que não existe vale `off`):
+
+| Valor | Rota exigida | O que faz |
+|---|---|---|
+| `off` (padrão) | qualquer | Nada. Se for `on`/`shadow` com rota que não serve, a varredura diz em UMA linha que está INERTE e por quê. |
+| `shadow` | `shadow`, `label` ou `auto` | Classifica a fila de WA com `wa-node-dispatch.sh check` (só leitura) e **registra** o que iria ao nó. Não toca em bead nenhuma. |
+| `on` | `label` ou `auto` | Faz: entrega a candidata a `dispatch_one` (sem yield, sem teto do pool), adota a rota, chama o gancho; se o nó não ficar, devolve a rota e solta a claim **só por rótulo**: nunca o carimbo `wa-worker` nem o `gc session new` do mini. |
+
+`DRY_RUN` e a passada só-nó do disk floor desligam a passada (a só-nó tem a sua).
+
+**Ordem por candidata, uma passada por varredura, antes das pistas** (as candidatas são as mesmas `SMALL_/BIG_CANDIDATES` das pistas, já filtradas por `_filter_candidates`: modo foco do gate, vetos e rótulos de estacionamento valem também aqui): pré-filtro sem escrita (id `wa-*`; sem dono; rota vazia ou exatamente `wa-worker`; sem `PILOT_NODE_FIRST_VETO_LABELS` nem `node:mini`; em `label`, com `node:ok`; que a sonda do pool não recuse, mesma lista do yield, e recusa que não se sabe dizer = não) → memória → orçamento → `check` → (shadow: registra) / (on: `dispatch_one`).
+
+* **Memória** (`.gc/wa-node-pass-memo.tsv`, `epoch<TAB>id<TAB>updated_at<TAB>veredito`): `mini` vale 6 h, `unknown` 1 h, `released` (a bead que nada devolveu do apply) 15 min; chave id + `updated_at`, então editar a bead a faz ser sondada de novo; a última linha da bead vale; aparada acima de 5000 linhas. **Sem ela, as mesmas primeiras beads da fila gastariam a sonda toda varredura** (≈91% da fila não é `node`) e a fila nunca andaria. O veredito `node` não é memorizado.
+* **Orçamento:** `PILOT_WA_NODE_PASS_PROBES` (12 sondas), `PILOT_WA_NODE_PASS_SECS` (120 s no total), `PILOT_WA_NODE_PASS_CHECK_TIMEOUT` (30 s por sonda), `PILOT_WA_NODE_PASS_MAX_FAILS` (3 tentativas que o nó não ficou). Valor ilegível volta ao padrão. Vagas do nó por varredura = `PILOT_WA_NODE_SLOTS` no modo `pilot` e 1 no modo `pool`. A capacidade é a que o `apply` confere (slot do alias, sessões e, no modo `pilot`, o oráculo). **A passada não coordena com a cota do dog**: `dog-remote` e `wa-worker-remote` já eram contados cada um por si, então num nó com `effective` 1 os dois podem rodar ao mesmo tempo; vale vigiar a CPU do nó (seção 3 do relatório) ao ligar `on`.
+* **Para quando:** `apply` rc 12 (o nó está cheio: capacidade é do nó, a bead NÃO é memorizada) · `apply` com outro rc (a escrita pode ter acontecido) · o teto de sondas/segundos/falhas · as vagas do nó · o despacho parado · o **Dolt saturado** (no início da varredura, ou agora; sem sinal nenhum conta como saturado) antes de qualquer escrita, como nas pistas · `wa-node-dispatch.sh` ausente. O motivo vai no resumo.
+* **O que sai:** uma linha `ga-2hd02v.9: passada de WA no nó (modo=…)` no log do Pilot por varredura, e em `.gc/wa-node-exempt.jsonl` um `wa-node-pass-summary` por varredura (`wa_candidates, eligible, skipped{motivo:n}, memo_hits, probed, node, mini, unknown, timeout, error, kept, released, stopped`) e, no `shadow`, um `wa-node-pass-shadow` por bead que iria ao nó (`bead, lane, basis, stamped, prio`). `stamped=1` é a bead que só a adoção da rota deixa o `apply` aceitar.
+* **Estado da bead.** A rota só sai depois de ler a bead agora ("open||wa-worker": aberta, sem dono, carimbada) e a escrita é CONFIRMADA lendo. O desfazer só recoloca o carimbo se a bead continua exatamente como foi deixada; se o nó ficou com ela, se outro dono apareceu ou se a leitura falhou, **não escreve** (a bead sem rota é o estado de primeira vista, inerte; o `pilot-missing-route-watchdog` a re-roteia depois do prazo dele). `apply` rc 2 do gancho (a escrita pode ter acontecido) nunca devolve a rota.
+* **Contabilidade:** a bead que o nó não levou sai como `wa_node_pass_released` (classe `refused_by_guard` do `pilot_sweep`: não é falha, nem fila, nem cessão); a que ficou conta como despachada e some da pista, e o `DISPATCHED` e a vaga da pista sobem e descem como num despacho normal. **Cuidado ao ler o "dispatched" da varredura:** com a passada ligada um despacho ao nó também zera a sequência do Step 5, então "dispatched>0" não prova que o mini escoa.
+
+**Para olhar o `shadow` no dia seguinte** (o relatório `wa-node-report.py` ainda não lê este arquivo):
+
+```
+jq -c 'select(.event=="wa-node-pass-summary") | {ts,mode,wa_candidates,eligible,probed,node,mini,unknown,kept,stopped}' "$GC_CITY/.gc/wa-node-exempt.jsonl" | tail -20
+jq -s '[.[] | select(.event=="wa-node-pass-shadow")] | {beads_distintas: (map(.bead)|unique|length), carimbadas: (map(select(.stamped==1).bead)|unique|length)}' "$GC_CITY/.gc/wa-node-exempt.jsonl"
+```
+
+Antes de passar para `on`: (1) `shadow` por pelo menos um dia inteiro, com `node` > 0 em beads que um humano confere uma a uma (a regra do dado de lead continua sendo do classificador e do filtro do rsync; esta passada não a afrouxa); (2) `PILOT_WA_NODE_ROUTE` em `label` com `node:ok` posto à mão em poucas beads reais, ou `auto` por decisão de uma pessoa; (3) preferir `PILOT_WA_NODE_SPAWN=pilot` (o modo `pool` depende de o pool criar a sessão de uma bead da loja do WA, o ponto 3 de "Como ligar", nunca provado).
+
 ## Auditoria dos `wa-worker*` do Pilot
 
 `wa-worker-remote-1` casa com `wa-worker-*` e `wa-worker*`; o pool do mini não pode contá-lo nem re-carimbá-lo por engano. Resultado da leitura de `pilot-dispatcher.sh` (por grep dos padrões, com leitura do entorno só nos três pontos de risco; os demais foram classificados pela linha do padrão e pelo comentário vizinho, **não** seguidos de ponta a ponta):
@@ -121,7 +157,7 @@ Pré-condição: o flip da ga-2hd02v.1.6 provado (o `dog-remote` entregando de v
 
 ## Como desligar
 
-`PILOT_WA_NODE_ROUTE=off` (ou tirar a variável) e recarregar o Pilot; tirar também `PILOT_WA_NODE_SPAWN` e `PILOT_WA_NODE_SLOTS`. Para cada bead ainda no nó: `scripts/wa-node-dispatch.sh release <bead>`; só toca bead cujo assignee é `wa-worker-remote-1..9` **e** que leva o carimbo da forma em que foi atribuída (a rota `wa-worker-remote` no modo `pool`; a marca `pilot.wa_node_alias` igual ao dono, sem rota, no modo `pilot`), nunca a de outro dono. A sessão ociosa se encerra em 15 min. Tirar `"wa-worker"` de `worktree_rigs` fecha também o caminho do provider.
+`PILOT_WA_NODE_EXEMPT=off` (ou tirar a variável) para a passada de WA, e `PILOT_WA_NODE_ROUTE=off` (ou tirar a variável) e recarregar o Pilot; tirar também `PILOT_WA_NODE_SPAWN` e `PILOT_WA_NODE_SLOTS`. Para cada bead ainda no nó: `scripts/wa-node-dispatch.sh release <bead>`; só toca bead cujo assignee é `wa-worker-remote-1..9` **e** que leva o carimbo da forma em que foi atribuída (a rota `wa-worker-remote` no modo `pool`; a marca `pilot.wa_node_alias` igual ao dono, sem rota, no modo `pilot`), nunca a de outro dono. A sessão ociosa se encerra em 15 min. Tirar `"wa-worker"` de `worktree_rigs` fecha também o caminho do provider.
 
 ## O que depende de outras histórias
 
@@ -163,6 +199,8 @@ Ler só a CPU não basta para saber se o WA está no nó: o `hetzner-capacity.py
 ## O que não foi provado
 
 Dito sem enfeite, porque o selftest passa sem nenhuma destas:
+
+* **Passada de WA (ga-2hd02v.9), o que os falsos não provam:** (a) o `bd` real com `--unset-metadata gc.routed_to` e depois `--set-metadata gc.routed_to=wa-worker` numa bead do WA (os mesmos verbos já são usados pelo Pilot em outras chaves; nesta, nunca foram vistos); (b) uma sessão `wa-worker` do mini pegando a bead no intervalo entre a leitura e a adoção (a releitura do `apply` e a do desfazer seguram, mas a corrida nunca foi vista); (c) o custo real de `check` por bead na mini carregada (o classificador sozinho leva ~1 s com a bead mínima; com `rsync -n` sobre muitos caminhos não foi cronometrado); (d) a taxa de ≈9% é de UMA amostra de 54 beads, no `auto`; (e) o `dispatch_one` inteiro nunca rodou com a bandeira: o bloco do yield e o braço do pool foram provados como regiões extraídas do arquivo, com falsos; (f) nenhuma varredura viva com `PILOT_WA_NODE_EXEMPT=shadow|on`. O selftest (`pilot-dispatcher.wa-node-pass.selftest.sh`) tem 133 itens e 65 mutantes (198 no total), rodados no nó Linux; a parte sem mutantes também no macOS. Dos 55 irmãos `pilot-dispatcher*.selftest.sh`, **53 passaram** (parte no nó Linux, parte no mini com os estágios de mutantes que têm botão para desligar desligados), 1 reprova igual na base (`topup-spawn-diagnostics`, pré-existente: "8 chamadas em 150 s, esperava 6") e 1 NÃO foi rodado por quem construiu: o `pilot-dispatcher.selftest.sh` inteiro (mac-only, ~1 h, trava de máquina) fica para os revisores do gate, como o cabeçalho dele manda.
 
 * Nenhuma bead real foi ao nó. As "3 beads" e a varredura da história são os passos 6 e 7 acima. **O WhatsApp nunca rodou no nó**: tudo o que há do modo `pilot` (ga-2hd02v.3) é provado com `bd`/`gc`/despachante falsos; o que roda de verdade no nó é só a bateria de testes.
 * A passada só-nó com bead de WA (ga-8okir7) só foi provada com o dispatcher extraído e `wa-node-dispatch.sh` e `bd` falsos: nenhuma varredura viva com o disco do mini abaixo do piso e `PILOT_WA_NODE_ROUTE=label|auto`. A sonda `apply --dry-run` por candidata não foi cronometrada na mini carregada, e o teto de 6 sondas por varredura é palpite a ajustar com o `wa-node-route.jsonl`. O custo em disco do mini de uma sessão remota **não foi medido** (o atalho do servidor não passa `du` nem `ps`): pelo que o runbook do provider descreve, o `start`, o lançador, o tmux e o worktree ficam no host, e no mini ficam o metadado da sessão e as escritas da bead; para medir, `du -sk` no mini antes e depois de uma sessão `wa-worker-remote` em `.gc/agents/wa-worker-remote` (o `work_dir` do agente) e no estado do provider (`<estado>/<host>/running/`, ver `gc-session-ssh.md`).
