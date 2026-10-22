@@ -127,7 +127,30 @@ echo x >> "$W/claude.calls"; : > "$W/claude.started"
 cat "$W/claude.out"
 exit "$(cat "$W/claude.rc")"
 EOF
-chmod +x "$W/ssh-stub" "$W/list-stub" "$W/gcl-stub" "$W/bd-stub" "$W/claude-stub"
+# o provider (`gc-session-ssh <op> <nome>`, ga-0k82lw): get-last-activity imprime $W/act.<nome> (act.rc≠0 = falha; sem o arquivo = não imprime nada); stop anota em stop.calls, falha com stop.rc
+# e tira o nome de list.extra (a não ser que stop.keep exista: o stop diz ok e a tmux continua)
+cat > "$W/prov-stub" <<'EOF'
+#!/bin/sh
+W="$(dirname "$0")"
+case "$1" in
+  get-last-activity) if [ -f "$W/act.rc" ] && [ "$(cat "$W/act.rc")" != 0 ]; then echo "provider: ssh falhou" >&2; exit "$(cat "$W/act.rc")"; fi
+                     [ -f "$W/act.$2" ] && cat "$W/act.$2"; exit 0;;
+  stop) echo "$2" >> "$W/stop.calls"
+        if [ -f "$W/stop.rc" ] && [ "$(cat "$W/stop.rc")" != 0 ]; then echo "provider: stop falhou" >&2; exit "$(cat "$W/stop.rc")"; fi
+        [ -f "$W/stop.keep" ] || { grep -vx "$2" "$W/list.extra" > "$W/list.extra.new"; mv "$W/list.extra.new" "$W/list.extra"; }
+        exit 0;;
+esac
+exit 2
+EOF
+# `bd show <id> --json` de uma bead de SESSÃO: o status vem de $W/show.<id> (sem o arquivo a bead não existe: rc 1); show.raw = a saída crua
+cat > "$W/show-stub" <<'EOF'
+#!/bin/sh
+W="$(dirname "$0")"
+[ -f "$W/show.raw" ] && { cat "$W/show.raw"; exit 0; }
+[ -f "$W/show.$1" ] || { echo "bd: no issue found matching $1" >&2; exit 1; }
+printf '[{"id":"%s","status":"%s","issue_type":"session"}]\n' "$1" "$(cat "$W/show.$1")"
+EOF
+chmod +x "$W/ssh-stub" "$W/list-stub" "$W/gcl-stub" "$W/bd-stub" "$W/claude-stub" "$W/prov-stub" "$W/show-stub"
 
 node() {  # node IDLE_PCT LOAD5 MEM_AVAIL_PCT  → resposta do nó com 16 núcleos, 32 GB, entre os marcadores (e com ruído de .bashrc antes)
   local idle="$1" load="$2" mem="$3" d=$(( $1 * 10 ))
@@ -164,7 +187,8 @@ nd=0
 hc() {  # hc ARGS → $OUT (stdout), $RC
   OUT=$(HETZNER_CAPACITY_DIR="$D" GC_SSH_CONFIG="$SSHJ" HETZNER_CAPACITY_SHIM_CONFIG="$SHIM" HETZNER_CAPACITY_NOW="$NOW" \
         HETZNER_CAPACITY_SSH_CMD="[\"$W/ssh-stub\"]" HETZNER_CAPACITY_LIST_CMD="[\"$W/list-stub\"]" \
-        HETZNER_CAPACITY_SESSIONS_CMD="[\"$W/gcl-stub\"]" HETZNER_CAPACITY_BEADS_CMD="[\"$W/bd-stub\"]" HETZNER_CAPACITY_CLAUDE_CMD="$CC" HETZNER_CAPACITY_READ_TIMEOUT_S="$RT" "$PY" -I "$P" "$@" 2>"$W/err"); RC=$?
+        HETZNER_CAPACITY_SESSIONS_CMD="[\"$W/gcl-stub\"]" HETZNER_CAPACITY_BEADS_CMD="[\"$W/bd-stub\"]" HETZNER_CAPACITY_CLAUDE_CMD="$CC" HETZNER_CAPACITY_READ_TIMEOUT_S="$RT" \
+        HETZNER_CAPACITY_PROVIDER_CMD="${PCMD:-[\"$W/prov-stub\"]}" HETZNER_CAPACITY_SHOW_CMD="[\"$W/show-stub\"]" "$PY" -I "$P" "$@" 2>"$W/err"); RC=$?
 }
 at() { NOW=$((T0 + $1)); }
 jget() {  # jget CAMPO.PONTADO → valor do $OUT (JSON), texto simples; null/ausente → "null"
@@ -671,9 +695,71 @@ print(m.claude_result(None)[:8], m.claude_result(F())[:8], m.claude_result(type(
   check "claude: status, read, step, pause e resume não perguntam ao gate" "no" "$([ -e "$W/claude.calls" ] && echo yes || echo no)"
 }
 
-if [ -n "${HC_MUTANT:-}" ]; then for g in ${HC_MGROUPS:-bg third read step verdict idle fill hourly claude}; do "g_$g"; done; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
+g_orphan() {  # a tmux do nó que o gc já deu por fechada (ga-0k82lw, camada 3): só morre com TODAS as provas, em ciclos seguidos; leitura que falha não age nem mexe nos relógios
+  X=dog-remote-gawispzz001; Y=dog-remote-gawispzz002; Z=dog-remote-gawispzz003
+  oc() {  # oc MODO → cidade nova com a varredura nesse modo; nó sem tmux; o gc lista só o Mayor
+    newcity; PCMD=""; rm -f "$W"/act.* "$W"/stop.* "$W"/show.* "$W/gcl.raw"
+    printf '{%s,"reap_orphans":"%s"}\n' "$LEGACY" "$1" > "$D/config.json"; sess 0; : > "$W/list.extra"; gcl
+  }
+  gcl() {  # gcl NOME… → o gc lista essas sessões como ABERTAS (mais o Mayor)
+    local s='{"session_name":"mayor","alias":"mayor","state":"active","closed":false}' x
+    for x in "$@"; do s="$s,{\"session_name\":\"$x\",\"alias\":\"$x\",\"state\":\"active\",\"closed\":false}"; done
+    printf '{"sessions":[%s]}\n' "$s" > "$W/gcl.raw"
+  }
+  node_has() { printf '%s\n' "$@" > "$W/list.extra"; }                  # as tmux vivas do nó
+  beadst() { echo "$2" > "$W/show.$1"; }                                # beadst ID STATUS
+  act_at() { "$PY" -I -c 'import sys,time;print(time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime(int(sys.argv[1]))))' $((T0 + $2)) > "$W/act.$1"; }      # act_at NOME SEGUNDOS (relativos ao T0)
+  full() { oc "$1"; node_has $X; beadst ga-wisp-zz001 closed; act_at $X -3600; }      # a órfã de verdade: fora do gc, bead fechada, parada há 1 h
+  runs() { local t; for t in "$@"; do at "$t"; hc --json step; done; }
+  stops() { local s; s=$(cat "$W/stop.calls" 2>/dev/null | tr '\n' ' '); printf '%s' "${s:- }"; }      # os nomes encerrados, cada um com um espaço atrás; um espaço só = nenhum stop
+  evn() { grep -c "\"state\": \"$1\"" "$D/events.jsonl" 2>/dev/null; true; }
+  onnode() { grep -qx "$1" "$W/list.extra" && echo yes || echo no; }
+
+  full kill; runs 0; check "órfã: no 1º ciclo é só vista (nada encerrado)" "dog-remote-gawispzz001| |1" "$(jget orphans.seen | tr -d '[]\"')|$(stops)|$(evn vista)"
+  runs 180; check "órfã: no 2º ciclo, com 180 s de idade (< 600), ainda não age" " |1" "$(stops)|$(evn vista)"
+  runs 700; check "órfã: 3 ciclos, 700 s, bead fechada, parada há 1 h → o provider encerra a tmux" "dog-remote-gawispzz001 |no" "$(stops)|$(onnode $X)"
+  check "órfã: encerrada e conferida (lista do nó sem ela): killed, estado morta, sai do orphans.json" "[\"dog-remote-gawispzz001\"] 1 []" "$(jget orphans.killed) $(evn morta) $("$PY" -I -c 'import json,sys;print(json.dumps(list(json.load(open(sys.argv[1]))["orphans"])))' "$D/orphans.json")"
+  check "órfã: o step segue com rc 0 e o degrau" "0" "$RC"
+
+  full log; runs 0 180 700; check "modo log: registra a elegível ('parada') e NÃO encerra" " |1|yes" "$(stops)|$(evn parada)|$(onnode $X)"
+  full kill; printf '{%s}\n' "$LEGACY" > "$D/config.json"; runs 0 180 700; check "sem a chave no config.json o padrão é log: não encerra" " |yes" "$(stops)|$(onnode $X)"
+  full off; runs 0 180 700; check "modo off: não olha (sem orphans.json), não encerra" " |no|off" "$(stops)|$([ -e "$D/orphans.json" ] && echo yes || echo no)|$(jget orphans.mode)"
+
+  full kill; printf '{%s,"reap_orphans":"kill","orphan_grace_s":1}\n' "$LEGACY" > "$D/config.json"; runs 700
+  check "um ciclo só não basta (ORPHAN_MIN_SEEN=2), mesmo com a carência cumprida" " " "$(stops)"; runs 710; check "o 2º ciclo seguido, com a carência cumprida, encerra" "dog-remote-gawispzz001 " "$(stops)"
+  full kill; runs 0 1000; check "ciclos longe demais um do outro (> max_age_s) não são 'seguidos': o relógio recomeça" " " "$(stops)"
+  full kill; runs 0 180; printf 'lixo' > "$D/orphans.json"; runs 360 700; check "orphans.json ilegível: os relógios recomeçam (nunca age cedo)" " " "$(stops)"; runs 1400; check "…e depois da carência de novo, age" "dog-remote-gawispzz001 " "$(stops)"
+
+  full kill; beadst ga-wisp-zz001 open; runs 0 180 700; check "bead da sessão ABERTA (o gc só não a listava): não é órfã, não encerra" " |1" "$(stops)|$(evn bead-open)"
+  for why in sem-bead outra-forma; do
+    full kill; [ $why = sem-bead ] && rm -f "$W/show.ga-wisp-zz001" || printf '[{"id":"ga-wisp-zz001","status":"closed","issue_type":"task"}]\n' > "$W/show.raw"
+    runs 0 180 700; check "bead ilegível ($why): terceiro estado, não encerra" " |1" "$(stops)|$(evn ilegivel)"
+  done
+  full kill; act_at $X 640; runs 0 180 700; check "tmux com atividade há 60 s: ainda trabalha, não encerra" " |1" "$(stops)|$(evn ativa)"
+  act_at $X -3600; runs 880; check "…e quando para há mais de orphan_idle_s, encerra" "dog-remote-gawispzz001 " "$(stops)"
+  full kill; echo 1 > "$W/act.rc"; runs 0 180 700; check "atividade ilegível (provider falhou): não encerra" " |1" "$(stops)|$(evn ilegivel)"
+  full kill; rm -f "$W/act.$X"; runs 0 180 700; check "atividade sem data (provider não imprimiu nada): não encerra" " " "$(stops)"
+
+  full kill; echo 1 > "$W/gcl.rc"; runs 0 180 700; check "gc session list falhou: não encerra e os relógios nem andam" " |no" "$(stops)|$([ -e "$D/orphans.json" ] && echo yes || echo no)"
+  check "gc session list falhou: o motivo vai na saída" "yes" "$([ -n "$(jget orphans.error)" ] && [ "$(jget orphans.error)" != null ] && echo yes || echo no)"
+  full kill; printf '{"sessions":[]}\n' > "$W/gcl.raw"; runs 0 180 700; check "gc com lista VAZIA é leitura suspeita (nunca 'nenhuma aberta'): não encerra" " " "$(stops)"
+  full kill; echo 1 > "$W/list.rc"; runs 0 180 700; check "list-running do nó falhou: não encerra" " " "$(stops)"
+  full kill; gcl $X; runs 0 180 700; check "o gc lista a sessão como aberta: não é órfã (nem com bead fechada e parada)" " |[]" "$(stops)|$(jget orphans.seen)"
+  full kill; node_has scratch-manual; runs 0 180 700; check "tmux com nome que o gc não gera: a varredura não toca" " |[]" "$(stops)|$(jget orphans.seen)"
+
+  oc kill; node_has $X $Y $Z; for b in 1 2 3; do beadst ga-wisp-zz00$b closed; done; act_at $X -3600; act_at $Y -3600; act_at $Z -3600; runs 0 180 700
+  check "no máximo 2 encerradas por ciclo (ORPHAN_MAX_KILLS)" "dog-remote-gawispzz001 dog-remote-gawispzz002 " "$(stops)"; runs 880; check "…a 3ª fica para o ciclo seguinte" "dog-remote-gawispzz001 dog-remote-gawispzz002 dog-remote-gawispzz003 " "$(stops)"
+  full kill; echo 1 > "$W/stop.rc"; runs 0 180 700; check "stop que falha: a tmux segue, estado falhou, killed vazio" "yes|1|[]" "$(onnode $X)|$(evn falhou)|$(jget orphans.killed)"
+  rm -f "$W/stop.rc"; runs 880; check "…e o ciclo seguinte tenta de novo e consegue" "no" "$(onnode $X)"
+  full kill; : > "$W/stop.keep"; runs 0 180 700; check "stop que diz ok mas a tmux continua no nó: 'continua', NÃO conta como encerrada" "1|[]" "$(evn continua)|$(jget orphans.killed)"
+  full kill; runs 0 180; PCMD='isto nao e json'; runs 700; PCMD=""; check "erro de configuração no meio da varredura: o step segue rc 0 e vai para o alarme" "0|yes" "$RC|$(grep -q '"event": "alarm"' "$D/events.jsonl" && echo yes || echo no)"
+  oc kill; printf '{%s,"reap_orphans":"sim"}\n' "$LEGACY" > "$D/config.json"; hc step; check "reap_orphans inválido é erro de configuração (rc 3)" "3" "$RC"
+  oc kill; printf '{%s,"orphan_grace_s":0}\n' "$LEGACY" > "$D/config.json"; hc step; check "orphan_grace_s < 1 é erro de configuração (rc 3)" "3" "$RC"
+}
+
+if [ -n "${HC_MUTANT:-}" ]; then for g in ${HC_MGROUPS:-bg third read step verdict idle fill hourly claude orphan}; do "g_$g"; done; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
 if [ -n "${HC_ONLY:-}" ]; then "g_$HC_ONLY"; echo "── $((n - fails))/$n ok (só g_$HC_ONLY)"; [ "$fails" = 0 ]; exit $?; fi
-g_fill; g_hourly; g_read; g_step; g_verdict; g_third; g_idle; g_bg; g_claude
+g_fill; g_hourly; g_read; g_step; g_verdict; g_third; g_idle; g_bg; g_claude; g_orphan
 
 [ -n "${HC_NO_MUTANTS:-}" ] || {
   echo "── controle negativo: cada mutante tem que reprovar a bateria ──"
