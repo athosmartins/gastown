@@ -773,19 +773,29 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
                               tmux=["tmux", "-L", cfg.socket, "new-session", "-d", "-s", name, "-c", p["work_dir"], f"sh {lpath}"],
                               ssh=ssh_argv(cfg)), indent=2, sort_keys=True))
         return 0
-    body = """s=$(sessions) || exit 1
+    # START ABANDONADO (ga-0k82lw): o mini pode desistir do start com o script do host ainda rodando (prazo do provider estourado: só o ssh LOCAL morre; engine que aborta o create e mata o processo do
+    # provider: nenhum handler roda, SIGKILL) e o `sh` do host seguiria até o new-session — uma tmux que o gc não conhece, ocupando vaga do nó. Antes de abrir o script confere as DUAS coisas que o mini
+    # só deixa de cumprir quando desistiu: o prazo (relógio do próprio host, sem depender de os relógios baterem) e o canal do ssh vivo (escrever num canal fechado falha; duas sondas com 1 s entre elas
+    # porque, com o provider morto e o ssh órfão ainda de pé, a 1ª escrita só faz o ssh perceber o fim e fechar o canal). A sonda depois de abrir derruba a sessão que ele mesmo acabou de criar.
+    body = """t0=$(date +%s)
+alive() { ( trap '' PIPE; echo >&2 ); }
+ab() { echo "start de @NAME@ abandonado: $1" >&2; exit 14; }
+s=$(sessions) || exit 1
 @GATE0@printf '%s\\n' "$s" | grep -qxF -- @NAME@ && { echo "session @NAME@ already exists" >&2; exit 11; }
 n=$(printf '%s\\n' "$s" | grep -c .)
 [ "$n" -lt @CAP@ ] || { echo "host @HOST@ está no teto: $n de @CAP@ sessões" >&2; exit 10; }
 @WTADD@@GATE1@@PREP@@PLIBCHECK@mkdir -p @RUN@ @WORKDIR@ && chmod 700 @RUN@ || exit 1
+[ $(( $(date +%s) - t0 )) -lt @BUDGET@ ] || ab "passou de @BUDGET@ s e o mini já desistiu"
+alive || ab "o ssh do mini já fechou"; sleep 1; alive || ab "o ssh do mini já fechou"
 rm -f @EXITF@; printf %s @B64@ | base64 -d >@LAUNCH@ || exit 1
 T new-session -d -s @NAME@ -c @WORKDIR@ "sh @LAUNCH@" || { rm -f @LAUNCH@; exit 1; }
 sleep 1
-T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após abrir: $(cat @EXITF@ 2>/dev/null)" >&2; rm -f @LAUNCH@; exit 1; }"""
+T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após abrir: $(cat @EXITF@ 2>/dev/null)" >&2; rm -f @LAUNCH@; exit 1; }
+alive || { T kill-session -t @TGT@ 2>/dev/null; rm -f @LAUNCH@ @EXITF@; ab "o ssh do mini fechou depois de abrir; derrubei a sessão"; }"""
     plib = f'[ -r {q(cfg.plib)} ] || {{ echo "host @HOST@: sem a biblioteca de presença ({cfg.plib}); rode mbp-offload.sh install-mbp" >&2; exit 12; }}\n' if cfg.gate else ""
     body = body.replace("@PLIBCHECK@", plib).replace("@PREP@", prepare_script(cfg)).replace("@WTADD@", wtadd_sh(wt, name) if wt else "")
     for k, v in {"@NAME@": q(name), "@CAP@": str(cap), "@HOST@": q(cfg.host), "@RUN@": q(run_dir), "@WORKDIR@": q(p["work_dir"]),
-                 "@EXITF@": q(exitf), "@LAUNCH@": q(lpath), "@TGT@": tgt(name),
+                 "@EXITF@": q(exitf), "@LAUNCH@": q(lpath), "@TGT@": tgt(name), "@BUDGET@": str(max(1, start_timeout - 3)),  # 3 s a menos que o prazo do mini: sobra o `sleep 1` de depois de abrir e o atraso de conectar
                  "@B64@": q(base64.b64encode(launcher(cfg, name, p, secrets).encode()).decode())}.items():
         body = body.replace(k, v)
     body = body.replace("@GATE0@", "" if wt else gate).replace("@GATE1@", gate if wt else "")  # sessão com worktree do provider: o guarda de clone vem DEPOIS do wt-add
