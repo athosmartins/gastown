@@ -782,7 +782,7 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     # Por isso o start são DUAS chamadas sob o mesmo lock: a 1ª prepara tudo o que é lento (teto, worktree, preparo, lançador) e termina SEM abrir tmux; a 2ª só abre (new-session + conferência, ~1 s).
     # Provider morto na parte lenta = nenhuma tmux, qualquer que seja o comportamento do ssh. Provider VIVO e o engine fechando a sessão (stop) na parte lenta: o stop grava `<nome>.stop`, a 1ª chamada apaga a marca antes
     # de preparar e a 2ª recusa abrir se ela voltou. Janelas que sobram: o stop que roda no host ANTES de a 1ª chamada apagar a marca (o ssh dela ainda conectando: igual a "stop, depois start") e o ~1 s da 2ª chamada entre
-    # o teste da marca e o new-session; o que escapar delas é da varredura do hetzner-capacity (órfã no nó sem sessão aberta no gc).
+    # o teste da marca e o new-session; o que escapar delas é da varredura do hetzner-capacity (tmux no nó sem sessão aberta no gc): ela nasce em modo `log` (só registra) e só encerra com reap_orphans="kill" no config.json dela, que é do Mayor ligar.
     prep_body = """rm -f @STOPF@
 s=$(sessions) || exit 1
 @GATE0@printf '%s\\n' "$s" | grep -qxF -- @NAME@ && { echo "session @NAME@ already exists" >&2; exit 11; }
