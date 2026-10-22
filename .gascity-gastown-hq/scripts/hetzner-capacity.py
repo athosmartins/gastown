@@ -862,7 +862,8 @@ def kill_orphan(env: Env, cfg: dict, name: str) -> tuple:
 def reap_orphans(env: Env, cfg: dict, now: int) -> dict:
     """Camada 3 da ga-0k82lw: a tmux do nó que o gc já deu por fechada segue ocupando vaga (e o oráculo a conta ocupada). Só age em tmux que cumpre TUDO: nome de sessão do gc, fora da lista de abertas do gc,
     bead da sessão `closed` (2ª prova), órfã há `orphan_grace_s` em ORPHAN_MIN_SEEN ciclos seguidos e parada há `orphan_idle_s`. Modo `log` só registra; `kill` também encerra (no máximo ORPHAN_MAX_KILLS
-    por ciclo) e confere. Leitura que não deu = não age e não mexe nos relógios (orphans.json). Cada mudança de estado de uma tmux vai para events.jsonl."""
+    por ciclo) e confere. A lista do nó ou a do gc que não deu = não age e não mexe nos relógios (orphans.json); a bead ou a atividade que não deu = só aquela tmux não é encerrada (o relógio dela segue).
+    Cada mudança de estado de uma tmux vai para events.jsonl."""
     out = {"mode": cfg["reap_orphans"], "seen": [], "killed": [], "error": ""}
     if out["mode"] == "off":
         return out
