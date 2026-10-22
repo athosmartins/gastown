@@ -12686,13 +12686,18 @@ _PWP_ADOPTED=0       # 1 iff esta passada tirou o carimbo da bead que está em d
 _PILOT_WA_NODE_PASS=0   # 1 SÓ enquanto a passada entrega uma bead a dispatch_one (modo on); dispatch_one lê
 _PWN_APPLY_RC=""     # o rc do `apply` da última _pilot_wa_node_decide (vazio = não chegou ao apply)
 
-# _pilot_wa_node_pass_mode — deixa em _PWP_MODE off|shadow|on. vazio / valor que não existe / rota que não permite → off; DRY_RUN (a passada sonda e grava memória) e a passada só-nó do disk floor (que tem a sua) → off.
+# _pilot_wa_node_pass_mode — deixa em _PWP_MODE off|shadow|on. vazio / valor que não existe / rota que não permite → off; DRY_RUN (a passada sonda e grava memória) → off.
 # `on` só com rota label|auto (com shadow o gancho nunca leva bead: seriam claims à toa); `shadow` com shadow|label|auto. Sempre devolve 0.
+# ga-2hd02v.3.9: a varredura SÓ-NÓ do disk floor (_PILOT_NODE_ONLY=1) NÃO desliga a passada. Ela desligava (a "só-nó tem a sua"), mas a só-nó descarta na pista a bead carimbada gc.routed_to=wa-worker
+# (_pilot_node_only_wa_pre exige dono e rota vazios) e o disco do mini oscila em volta do piso: medido 22/10, a passada ficava INERTE na maior parte das varreduras, justo quando o nó mais precisa de WA.
+# Rodar aqui não escreve em bead que o nó não levaria: até o veredito node a passada não toca em bead nenhuma (pré-filtro, memória, `check`; só acrescenta uma linha de TSV/jsonl em .gc/); a 1ª escrita em
+# bead é a claim em dispatch_one, depois de veredito node com a base que a rota pede, e o braço da passada em dispatch_one vem ANTES do da só-nó (a bead que o nó não levou volta ao carimbo e é solta
+# por rótulo, nunca cai no mini). Custo que fica, e é limitado: cada tentativa que o apply desmente gasta claim+adoção+devolução+soltura no Dolt do mini. Com o nó cheio (apply rc 12) a passada
+# para na 1ª (rc 12 não é memorizado, então repete a cada varredura); rc 10/11 ou nada que chegue ao apply contam como falha (PILOT_WA_NODE_PASS_MAX_FAILS, padrão 3) e são memorizados.
 _pilot_wa_node_pass_mode() {
   local _pm_m="${PILOT_WA_NODE_EXEMPT:-off}" _pm_r="${PILOT_WA_NODE_ROUTE:-}"
   _PWP_MODE=off
   [ "${DRY_RUN:-0}" != "1" ] || return 0
-  [ "${_PILOT_NODE_ONLY:-0}" != "1" ] || return 0
   case "$_pm_m" in
     on)     case "$_pm_r" in label|auto) _PWP_MODE=on ;; esac ;;
     shadow) case "$_pm_r" in shadow|label|auto) _PWP_MODE=shadow ;; esac ;;
@@ -12866,7 +12871,7 @@ _pilot_wa_node_pass() {
   _pilot_wa_node_pass_mode
   if [ "$_PWP_MODE" = off ]; then
     case "${PILOT_WA_NODE_EXEMPT:-off}" in
-      on|shadow) log "ga-2hd02v.9: PILOT_WA_NODE_EXEMPT=${PILOT_WA_NODE_EXEMPT} está INERTE nesta varredura (rota='${PILOT_WA_NODE_ROUTE:-}', DRY_RUN=${DRY_RUN:-0}, passada só-nó=${_PILOT_NODE_ONLY:-0}) — on pede rota label|auto; shadow, shadow|label|auto." ;;
+      on|shadow) log "ga-2hd02v.9: PILOT_WA_NODE_EXEMPT=${PILOT_WA_NODE_EXEMPT} está INERTE nesta varredura (rota='${PILOT_WA_NODE_ROUTE:-}', DRY_RUN=${DRY_RUN:-0}) — on pede rota label|auto; shadow, shadow|label|auto." ;;
     esac
     return 0
   fi

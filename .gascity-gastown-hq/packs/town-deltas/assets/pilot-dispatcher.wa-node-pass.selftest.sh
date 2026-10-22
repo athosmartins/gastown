@@ -9,7 +9,7 @@
 #   e a um rc 12. O que move carga é uma PASSADA própria de WA no nó (PILOT_WA_NODE_EXEMPT=off|shadow|on, padrão off) que classifica barato (`check`), adota a rota carimbada (tira e, se o nó não ficar, recoloca)
 #   e entrega a dispatch_one com a bandeira _PILOT_WA_NODE_PASS=1: sem yield, sem teto, e a bead que o nó não levou é solta SÓ por rótulo — nunca o carimbo nem o braço do mini.
 #
-# O QUE PROVA: (1) o modo: só `shadow|on` ligam, `on` só com rota label|auto, `shadow` com shadow|label|auto; DRY_RUN e passada do disk floor desligam · (2) a decisão pré-claim, sem escrita: bead com dono, rota
+# O QUE PROVA: (1) o modo: só `shadow|on` ligam, `on` só com rota label|auto, `shadow` com shadow|label|auto; DRY_RUN desliga, a passada só-nó do disk floor NÃO (ga-2hd02v.3.9: o disco do mini oscila em volta do piso e a só-nó é onde o nó mais precisa receber WA) · (2) a decisão pré-claim, sem escrita: bead com dono, rota
 #   que não seja wa-worker, rótulo de veto, node:mini, falta de node:ok no modo label, recusa do probe do pool (ou recusa que não se sabe dizer) = NÃO · (3) a memória de vereditos (mini 6 h, unknown 1 h, solta 15 min,
 #   chave id+updated_at) · (4) a sonda `check` (só o rc 0 com JSON node vale) · (5) adotar/devolver a rota com um bd falso COM estado: confirma lendo, restaura no desfazer, nunca toca bead que mudou de dono ·
 #   (6) a passada inteira: shadow só observa e grava; on tenta na ordem, para na capacidade (rc 12) e nos orçamentos (sondas, segundos, falhas, vagas do nó), memoriza o que o nó recusou, tira da pista o que ficou ·
@@ -154,7 +154,12 @@ for combo in "on auto on" "on label on" "on shadow off" "on off off" "on '' off"
   [ "$r" = "$want" ] && ok "EXEMPT='$ex' ROUTE='$rt' → $want" || bad "EXEMPT='$ex' ROUTE='$rt' deu '$r' (esperado $want)"
 done
 r=$(T_DRY=1 mode);       [ "$r" = off ] && ok "DRY_RUN=1: off (a passada sonda e grava memória)" || bad "DRY_RUN=1 ligou a passada ($r)"
-r=$(T_NODE_ONLY=1 mode); [ "$r" = off ] && ok "passada só-nó do disk floor em curso: off (ela tem a sua própria)" || bad "a passada correu junto da só-nó ($r)"
+r=$(T_NODE_ONLY=1 mode); [ "$r" = on ] && ok "passada só-nó do disk floor em curso + on/auto: on (ga-2hd02v.3.9: o mini no piso de disco é o caso normal, e a passada só escreve depois de veredito node)" || bad "a passada só-nó do disk floor desligou a passada de WA ($r)"
+r=$(T_NODE_ONLY=1 T_EXEMPT=shadow mode); [ "$r" = shadow ] && ok "só-nó + shadow: shadow (só leitura e linha-sombra; os dados do shadow não ficam sem as varreduras de disco baixo)" || bad "só-nó + shadow deu '$r'"
+r=$(T_NODE_ONLY=1 T_ROUTE=label mode);   [ "$r" = on ] && ok "só-nó + on/label: on" || bad "só-nó + on/label deu '$r'"
+r=$(T_NODE_ONLY=1 T_ROUTE=shadow mode);  [ "$r" = off ] && ok "só-nó + on com rota shadow: off (a regra da rota continua valendo na só-nó)" || bad "só-nó + on/shadow deu '$r'"
+r=$(T_NODE_ONLY=1 T_EXEMPT=off mode);    [ "$r" = off ] && ok "só-nó + EXEMPT=off: off (o padrão segue desligado)" || bad "só-nó + off deu '$r'"
+r=$(T_NODE_ONLY=1 T_DRY=1 mode);         [ "$r" = off ] && ok "só-nó + DRY_RUN: off (DRY_RUN continua vencendo)" || bad "DRY_RUN não venceu na só-nó ($r)"
 r=$(run_t 'unset PILOT_WA_NODE_EXEMPT; _pilot_wa_node_pass_mode; echo "$_PWP_MODE"'); [ "$r" = off ] && ok "variável nunca definida: off (o padrão)" || bad "sem a variável ligou ($r)"
 
 echo "── (2) a decisão pré-claim (sem escrita)"
@@ -354,6 +359,31 @@ reset; r=$(pass "isto não é json"); case "$r" in *"D=0"*) ok "pista ilegível:
 # DRY_RUN
 reset; chk wa-n1 0; T_DRY=1 pass "$S3" >/dev/null; [ "$(wnd_calls)" = 0 ] && ok "DRY_RUN: a passada não corre" || bad "DRY_RUN sondou"
 
+# ga-2hd02v.3.9 — a passada na varredura SÓ-NÓ do disk floor (_PILOT_NODE_ONLY=1). Medido 22/10 07:29: o log dizia 'INERTE ... passada só-nó=1' e a bead node:ok carimbada wa-worker nunca ia ao Hetzner.
+reset; chk wa-m1 10; chk wa-n1 0; chk wa-n2 0; echo 0 > "$WORK/d1.rc.wa-n1"
+r=$(T_NODE_ONLY=1 pass "$S3")
+[ "$r" = "S=wa-m1,wa-n2 B= SS=4 BS=5 D=1 C=2/0 PASSFLAG=0" ] && [ "$(d1)" = "wa-n1 small feature pass=1;" ] && ok "só-nó: a bead carimbada com veredito node é entregue a dispatch_one com a bandeira, sai da pista e consome a vaga — $r" || bad "só-nó, on: $r / d1=$(d1)"
+grep -q 'passada de WA no nó (modo=on)' "$WORK/lines" 2>/dev/null && ! grep -q 'INERTE' "$WORK/lines" 2>/dev/null && ok "só-nó: o log diz 'passada de WA no nó (modo=on)' e NÃO diz INERTE (o critério de pronto do ga-2hd02v.3.9)" || bad "log da só-nó: $(cut -c1-200 "$WORK/lines" 2>/dev/null | tr '\n' '|')"
+# nada é escrito em bead que o nó não levaria: veredito mini/unknown/timeout/erro → zero bd, zero dispatch_one (o disco do mini está baixo)
+reset; chk wa-m1 10; chk wa-n2 11; chk wa-x 124; chk wa-y 99
+r=$(T_NODE_ONLY=1 pass "[$(jb wa-m1 U1 wa-worker x),$(jb wa-n2 U1 wa-worker x),$(jb wa-x U1 wa-worker x),$(jb wa-y U1 wa-worker x)]")
+[ "$(d1)" = "-" ] && [ ! -f "$WORK/bd.calls" ] && ok "só-nó: veredito mini/unknown/timeout/erro → NENHUMA chamada ao bd e dispatch_one nunca chamado (4 sondas, 0 escritas)" || bad "só-nó escreveu em bead que o nó não levaria (d1=$(d1) bd=$(tr '\n' '|' < "$WORK/bd.calls" 2>/dev/null))"
+[ "$(wnd_calls)" = 4 ] && ok "só-nó: as 4 candidatas foram sondadas só com 'check' (leitura)" || bad "só-nó, sondas: $(wnd_calls)"
+# modo label: node por texto não é o que o apply levaria → não chega a dispatch_one, mesmo na só-nó
+reset; chk wa-l2 0; echo text > "$WORK/chk.wa-l2.basis"; echo 0 > "$WORK/d1.rc.wa-l2"
+T_NODE_ONLY=1 T_ROUTE=label pass "[$(jb wa-l2 U1 wa-worker x,node:ok)]" >/dev/null; [ "$(d1)" = "-" ] && [ ! -f "$WORK/bd.calls" ] && ok "só-nó + label com veredito node por base 'text': não tenta e não escreve" || bad "só-nó + label tentou com base text: d1=$(d1)"
+reset; chk wa-l2 0; echo label > "$WORK/chk.wa-l2.basis"; echo 0 > "$WORK/d1.rc.wa-l2"
+T_NODE_ONLY=1 T_ROUTE=label pass "[$(jb wa-l2 U1 wa-worker x,node:ok)]" >/dev/null; [ "$(d1)" = "wa-l2 small feature pass=1;" ] && ok "só-nó + label com node:ok e base 'label': entrega (a bead node:ok carimbada wa-worker do critério de pronto)" || bad "só-nó + label não entregou: d1=$(d1)"
+# Dolt saturado e despacho parado valem também na só-nó
+reset; chk wa-n1 0; echo 0 > "$WORK/d1.rc.wa-n1"
+T_NODE_ONLY=1 T_DOLT=1 pass "$S3" >/dev/null; [ "$(d1)" = "-" ] && ok "só-nó + Dolt saturado: sondou, não despachou" || bad "só-nó despachou com o Dolt saturado: $(d1)"
+reset; chk wa-n1 0; echo 0 > "$WORK/d1.rc.wa-n1"
+T_NODE_ONLY=1 T_STOP=1 pass "$S3" >/dev/null; [ "$(wnd_calls)" = 0 ] && [ "$(d1)" = "-" ] && ok "só-nó + despacho parado: nem sonda nem despacha" || bad "só-nó correu com o despacho parado"
+# nó cheio (apply rc 12) na só-nó: o custo é UMA tentativa por varredura — a passada para na 1ª e não memoriza a bead
+reset; chk wa-n1 0; chk wa-n2 0; echo 1 > "$WORK/d1.rc.wa-n1"; echo 12 > "$WORK/d1.apply.wa-n1"
+T_NODE_ONLY=1 pass "$S3" >/dev/null
+[ "$(d1)" = "wa-n1 small feature pass=1;" ] && ! grep -q 'wa-n1' "$MEMO" 2>/dev/null && ok "só-nó + nó cheio (rc 12): UMA tentativa por varredura (n2 nem é tentada) e a bead não é memorizada" || bad "só-nó + rc 12: d1=$(d1) memo=$(memo_of)"
+
 echo "── (7) dispatch_one: o bloco do yield e o braço do pool (regiões VERBATIM)"
 run_block() {
   (
@@ -362,12 +392,14 @@ run_block() {
     log() { :; }
     STORY_ID=wa-blk1; STORY_BEAD_CITY="${BL_CITY:-$WORK/wa-store}"; GC_CITY="$WORK/city"; STORY_LABELS=""; STORY='{}'
     BUILDER_TARGET="${BL_TARGET:-wa-worker-1}"; DISPATCH_RESULT=""; _PNY_EXEMPT_THIS=0
-    _PILOT_NODE_ONLY=0; _PILOT_WA_NODE_PASS="${BL_PASS:-1}"; DRY_RUN=0
+    _PILOT_NODE_ONLY="${BL_NODE_ONLY:-0}"; _PILOT_WA_NODE_PASS="${BL_PASS:-1}"; DRY_RUN=0
+    # as duas rotas ligadas: se a bandeira da passada NÃO vencesse a só-nó, o elif da só-nó seguiria a bead de ps-worker (rota do PS ligada) em vez de soltá-la; é o caso que distingue os dois ramos (o wa-worker do store do WA segue nos dois)
+    PILOT_WA_NODE_ROUTE=auto; PILOT_PS_NODE_ROUTE=auto
     _pilot_priority_node_exempt() { return 1; }
     _pilot_priority_yield_for() { echo YIELD_ASKED >> "$WORK/block.rel"; return 0; }
     _pilot_priority_yield_say() { :; }
     _pilot_priority_yield_release() { echo "RELEASE $4" >> "$WORK/block.rel"; }
-    eval "$(fn_src wa_worker_template)"; eval "$(fn_src _pilot_priority_target_is_pool)"; eval "$(fn_src _pilot_node_only_wa_route_on)"
+    eval "$(fn_src wa_worker_template)"; eval "$(fn_src _pilot_priority_target_is_pool)"; eval "$(fn_src _pilot_node_only_wa_route_on)"; eval "$(fn_src _pilot_node_only_ps_route_on)"
     blkfn() { eval "$BLOCK_SRC"; echo "CONTINUED"; }
     r=0; blkfn > "$WORK/blk.out" || r=$?
     out="$(cat "$WORK/blk.out" 2>/dev/null || true)"
@@ -380,6 +412,11 @@ r=$(BL_CITY="$WORK/city" blk);                                  [ "$r" = "rc=1 r
 r=$(BL_TARGET=ps-worker-1 blk);                                 case "$r" in "rc=1 result=wa_node_pass_released"*"RELEASE wa-node-pass,") ok "ps-worker: solta sem carimbo — $r" ;; *) bad "bloco, ps-worker: $r" ;; esac
 r=$(BL_TARGET=oracle-wa blk);                                   case "$r" in "rc=1 result=wa_node_pass_released"*"RELEASE wa-node-pass,") ok "crew nomeada: solta sem carimbo (a passada só leva ao nó, nunca a uma crew) — $r" ;; *) bad "bloco, crew: $r" ;; esac
 r=$(BL_PASS=0 blk);                                             case "$r" in *YIELD_ASKED*) ok "fora da passada: o yield é consultado, como sempre" ;; *) bad "fora da passada o yield não foi consultado: $r" ;; esac
+# ga-2hd02v.3.9: com a passada rodando na só-nó, a bandeira da passada vence o elif da só-nó (que seguiria o ps-worker e o wa-worker com rota ligada)
+r=$(BL_NODE_ONLY=1 blk);                                        [ "$r" = "rc=0 result= CONTINUED rel=" ] && ok "só-nó, passada de WA, wa-worker no store do WA: SEGUE, sem consultar o yield — $r" || bad "bloco, só-nó, caso feliz: $r"
+r=$(BL_NODE_ONLY=1 BL_TARGET=ps-worker-1 blk);                  case "$r" in "rc=1 result=wa_node_pass_released"*"RELEASE wa-node-pass,") ok "só-nó + passada, ps-worker (com a rota do PS ligada): solta sem carimbo — a bandeira da passada vence o elif da só-nó — $r" ;; *) bad "bloco, só-nó, ps-worker: $r" ;; esac
+r=$(BL_NODE_ONLY=1 BL_CITY="$WORK/city" blk);                   [ "$r" = "rc=1 result=wa_node_pass_released NOT-CONTINUED rel=RELEASE wa-node-pass," ] && ok "só-nó + passada, bead do HQ com alvo wa-worker: solta sem carimbo — $r" || bad "bloco, só-nó, HQ: $r"
+r=$(BL_NODE_ONLY=1 BL_TARGET=oracle-wa blk);                    case "$r" in "rc=1 result=wa_node_pass_released"*"RELEASE wa-node-pass,") ok "só-nó + passada, crew nomeada: solta sem carimbo — $r" ;; *) bad "bloco, só-nó, crew: $r" ;; esac
 
 run_arm() {
   (
@@ -407,6 +444,12 @@ reset; r=$(AR_RC=2 run_arm);  case "$r" in "rc=1 result=wa_node_unknown"*"ev=ADO
 reset; r=$(AR_ADOPT=1 AR_RC=0 run_arm); [ "$r" = "rc=1 result=wa_node_pass_released NOT-CONTINUED ev=ADOPT,RELEASE wa-node-pass," ] && ok "adotar falhou: o gancho NEM é chamado, solta sem carimbo — $r" || bad "arm, adotar falhou: $r"
 reset; r=$(AR_PASS=0 AR_RC=1 run_arm); [ "$r" = "rc=0 result= CONTINUED target=wa-worker ev=DECIDE," ] && ok "fora da passada: nada de adotar; rc 1 segue ao pool do mini, como sempre — $r" || bad "arm fora da passada: $r"
 reset; r=$(AR_PASS=0 AR_RC=0 run_arm); [ "$r" = "rc=0 result= CONTINUED target=wa-worker-remote ev=DECIDE," ] && ok "fora da passada, rc 0: alvo do nó e a vaga virtual NÃO é devolvida (comportamento de antes)" || bad "arm fora da passada rc 0: $r"
+# ga-2hd02v.3.9: na só-nó o braço da passada vem ANTES do elif da só-nó — rc 1 devolve a rota que a passada tirou (senão a bead perde o carimbo wa-worker) em vez de só soltar como disk_floor_node_only
+reset; r=$(AR_NODE_ONLY=1 AR_RC=0 run_arm);  [ "$r" = "rc=0 result= CONTINUED target=wa-worker-remote ev=ADOPT,DECIDE,UNMARK wa-worker-1," ] && ok "só-nó + passada, gancho rc 0: a bead é do nó e a vaga virtual do mini volta — $r" || bad "arm só-nó rc 0: $r"
+reset; r=$(AR_NODE_ONLY=1 AR_RC=1 run_arm);  [ "$r" = "rc=1 result=wa_node_pass_released NOT-CONTINUED ev=ADOPT,DECIDE,UNADOPT,RELEASE wa-node-pass," ] && ok "só-nó + passada, gancho rc 1: devolve a rota (UNADOPT) e solta com wa_node_pass_released, NÃO com disk_floor_node_only (que deixaria a bead sem o carimbo) — $r" || bad "arm só-nó rc 1: $r"
+reset; r=$(AR_NODE_ONLY=1 AR_RC=2 run_arm);  case "$r" in "rc=1 result=wa_node_unknown"*"ev=ADOPT,DECIDE,") ok "só-nó + passada, gancho rc 2: não devolve a rota e não despacha — $r" ;; *) bad "arm só-nó rc 2: $r" ;; esac
+reset; r=$(AR_NODE_ONLY=1 AR_ADOPT=1 AR_RC=0 run_arm); [ "$r" = "rc=1 result=wa_node_pass_released NOT-CONTINUED ev=ADOPT,RELEASE wa-node-pass," ] && ok "só-nó + passada, adotar falhou: o gancho NEM é chamado — $r" || bad "arm só-nó, adotar falhou: $r"
+reset; r=$(AR_NODE_ONLY=1 AR_PASS=0 AR_RC=1 run_arm); case "$r" in "rc=1 result=disk_floor_node_only"*"ev=DECIDE,"*) ok "só-nó FORA da passada (bead de lane), gancho rc 1: continua soltando com disk_floor_node_only, sem tocar na rota — $r" ;; *) bad "arm só-nó fora da passada: $r" ;; esac
 
 echo "── (8) o gancho exporta o rc do apply (a passada decide por ele: 12 = nó cheio)"
 dec() { ( eval "$PRELUDE"; eval "$F_DECIDE"; _pilot_wa_node_open() { return 0; }; _pilot_slow_spawn_budget_spent() { return 1; }; _pilot_wa_node_settle() { :; }

@@ -1,5 +1,5 @@
-DRY_RUN nao desliga a passada	  [ "${DRY_RUN:-0}" != "1" ] || return 0\n  [ "${_PILOT_NODE_ONLY:-0}" != "1" ] || return 0\n  case "$_pm_m" in	  [ "${_PILOT_NODE_ONLY:-0}" != "1" ] || return 0\n  case "$_pm_m" in
-passada so-no do disk floor nao desliga a passada	  [ "${_PILOT_NODE_ONLY:-0}" != "1" ] || return 0\n  case "$_pm_m" in	  case "$_pm_m" in
+DRY_RUN nao desliga a passada	  [ "${DRY_RUN:-0}" != "1" ] || return 0\n  case "$_pm_m" in	  case "$_pm_m" in
+a so-no do disk floor volta a desligar a passada	  [ "${DRY_RUN:-0}" != "1" ] || return 0\n  case "$_pm_m" in	  [ "${DRY_RUN:-0}" != "1" ] || return 0\n  [ "${_PILOT_NODE_ONLY:-0}" != "1" ] || return 0\n  case "$_pm_m" in
 on aceito com rota shadow	on)     case "$_pm_r" in label|auto) _PWP_MODE=on ;; esac ;;	on)     case "$_pm_r" in shadow|label|auto) _PWP_MODE=on ;; esac ;;
 shadow aceito com rota off	shadow) case "$_pm_r" in shadow|label|auto) _PWP_MODE=shadow ;; esac ;;	shadow) case "$_pm_r" in off|shadow|label|auto) _PWP_MODE=shadow ;; esac ;;
 bead com dono passa	  [ -z "$_pp_as" ] || { _PWP_WHY="has-owner"; return 1; }	  :
@@ -63,3 +63,5 @@ resultado novo fora do pilot_sweep	"disk_floor_node_only", "wa_node_pass_release
 Dolt saturado agora nao para a passada	if [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ] || _dolt_saturated; then _pw_stop="dolt-saturated"; break; fi	if [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ]; then _pw_stop="dolt-saturated"; break; fi
 Dolt saturado no inicio nao para a passada	if [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ] || _dolt_saturated; then _pw_stop="dolt-saturated"; break; fi	if _dolt_saturated; then _pw_stop="dolt-saturated"; break; fi
 a chave DISPATCH_TO_CAPACITY nao vale na passada	if [ "${DISPATCH_TO_CAPACITY:-1}" != "1" ] && [ "$_pw_keepmax" -gt 1 ]; then _pw_keepmax=1; fi	:
+bloco: a so-no vence a bandeira da passada	  if [ "${_PILOT_WA_NODE_PASS:-0}" = "1" ]; then\n    # ga-2hd02v.9: passada de WA no n	  if [ "${_PILOT_WA_NODE_PASS:-0}" = "1" ] && [ "${_PILOT_NODE_ONLY:-0}" != "1" ]; then\n    # ga-2hd02v.9: passada de WA no n
+braco: rc 1 na so-no solta sem devolver a rota	        elif [ "${_PILOT_WA_NODE_PASS:-0}" = "1" ]; then	        elif [ "${_PILOT_WA_NODE_PASS:-0}" = "1" ] && [ "${_PILOT_NODE_ONLY:-0}" != "1" ]; then
