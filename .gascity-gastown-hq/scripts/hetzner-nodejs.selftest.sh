@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# hetzner-nodejs.selftest.sh — hermético: ssh, curl e uname são stubs; o script REMOTO roda de verdade, num HOME temporário, com um tarball falso (um `node` que só responde --version). (ga-2hd02v.4.9)
+# hetzner-nodejs.selftest.sh — hermético: ssh, curl e uname são stubs; o script REMOTO roda de verdade, num HOME temporário, com um tarball falso (um `node` que responde --version e a carga do jsdom, e um `npm` que só entende `ci`). (ga-2hd02v.4.9, ga-yoyyj1)
 #
 # Contents
-#   Casos · Mutantes
+#   Casos · Casos do jsdom · Mutantes
 #
 # CASOS: check sem nada = ausente (rc 1) · install feliz (link, versão, sem sobra do diretório temporário, URL https da versão do pin) · install de novo não baixa nada · tarball adulterado e hash do pin errado = rc 4 e nada instalado
 #   · download que falha = rc 5, e o node antigo continua valendo · nó x86_64 = rc 3 (check e install), sem download · pin ausente, com versão fora do formato (injeção) ou com linha repetida = rc 2 SEM chamar o ssh
 #   · ssh que cai (antes e depois de responder) e resposta sem a sentinela = rc 2, nunca "ausente" · ~/.local/bin/node que é arquivo comum = rc 4 e o arquivo fica · upgrade de versão mantém o diretório antigo
 #   · diretório da versão que já existe e não é o node certo = rc 4 · tarball cujo binário diz outra versão = rc 4 · link quebrado = "quebrado" no check e o install conserta · node certo fora do diretório do pin = "diferente".
+# CASOS DO JSDOM (ga-yoyyj1, `check|install jsdom`; o npm e o node do tarball são falsos, o script remoto roda de verdade): o check do node segue rc 0 sem jsdom (é o que o guarda do PS lê) · install feliz (link, versão, npm ci --ignore-scripts, cache e registry fixos,
+#   sem sobra) e idempotente · lock local ou lock alterado no caminho = rc 4 antes do npm · npm que falha = rc 5, versão errada ou jsdom que não carrega = rc 4, e nada é ligado · cdp-drive que é diretório comum, ou diretório da versão que já existe e não serve = rc 4 e ficam como estavam
+#   · sem o node no nó = rc 4 · jsdom que não carrega = "quebrado" · link quebrado = o install conserta · outra versão OU outro lock com o mesmo jsdom = "diferente" (upgrade mantém o diretório antigo) · pin sem as chaves, com injeção ou hash fora do formato = rc 2 SEM ssh
+#   · x86_64 = rc 3 · ssh que cai (na sonda, depois do install, na conferência final) = rc 2 · palavra repetida ou desconhecida = rc 64.
 # MUTANTES: cada um troca UM trecho do script por uma versão frouxa (python3, substring exata e única); o caso que deveria pegá-lo tem de falhar. Mutante que sobrevive = caso faltando.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)

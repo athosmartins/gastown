@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
-# hetzner-nodejs.sh — Node.js no nó Linux (Hetzner) em nível de USUÁRIO (ga-2hd02v.4.9). Roda no MINI, fala com o nó por ssh e só escreve em ~/.local do usuário do nó. Doc: docs/runbooks/hetzner-nodejs.md
+# hetzner-nodejs.sh — Node.js (e o jsdom dos testes do WA) no nó Linux (Hetzner) em nível de USUÁRIO (ga-2hd02v.4.9, ga-yoyyj1). Roda no MINI, fala com o nó por ssh e só escreve em ~/.local do usuário do nó. Doc: docs/runbooks/hetzner-nodejs.md
 #
 # Contents
-#   Para que serve · Subcomandos · Códigos de saída · Por que é seguro · Limites
+#   Para que serve · Subcomandos · jsdom · Códigos de saída · Por que é seguro · Limites
 #
 # PARA QUE SERVE: os testes do property_scrapers que chamam `node` (shutil.which("node")) reprovavam no nó só porque o binário não existe: 242 dos 245 problemas da rodada vinham disso (scripts/hetzner-mac-only.ps.txt).
 #   Decisão do Mayor (ga-2hd02v.4, 21/10 02:40Z): instalar o Node no nó SEM sudo e SEM mexer no sistema, só para os testes do PS. O nó é aarch64 (Ubuntu 24.04): o tarball é linux-arm64, não x64.
-# SUBCOMANDOS: check [--pin ARQ] · install [--pin ARQ]      (pin padrão: scripts/hetzner-nodejs.pin; HETZNER_NODEJS_PIN troca)
+# SUBCOMANDOS: check [jsdom] [--pin ARQ] · install [jsdom] [--pin ARQ]      (pin padrão: scripts/hetzner-nodejs.pin; HETZNER_NODEJS_PIN troca; HETZNER_NODEJS_LIBS troca a pasta do package-lock.json do jsdom)
 #   check    só LÊ o nó. Diz se o node do nó é exatamente o do pin.
 #   install  baixa o tarball NO NÓ, confere o sha256 contra o hash do pin (que vem do mini, nunca de arquivo baixado pelo nó), extrai em ~/.local/node-v<V>-linux-arm64, roda o binário e só se ele disser v<V>
 #            troca os symlinks ~/.local/node e ~/.local/bin/node. Já está igual ao pin = não baixa nada (rc 0). Só o `node` ganha link: npm/npx ficam dentro do diretório, sem entrar no PATH.
+# JSDOM (ga-yoyyj1): `check jsdom` / `install jsdom` são um COMPONENTE À PARTE; sem a palavra jsdom os dois comandos falam só do node (é o `check` que o hetzner-nodejs-guard.sh do PS chama, e o rc dele não pode depender do jsdom).
+#   Os testes do WA procuram o jsdom em ROOT/node_modules, /Users/athos/gt/whatsapp_automation/node_modules e ~/.local/share/cdp-drive/node_modules e PULAM se nenhuma tem; no nó só a terceira existe (NODE_PATH no job não adianta: eles olham as pastas).
+#   O install monta ~/.local/share/cdp-drive-jsdom-<V>-<12 hex do lock> com `npm ci --ignore-scripts` a partir de scripts/hetzner-nodejs-libs/package-lock.json (o sha256 do lock vem do pin e é conferido no mini e no nó) e só então liga o link ~/.local/share/cdp-drive.
+#   Exige o node do pin ok no nó (senão rc 4: rode `install` antes). A identidade da instalação é (versão do jsdom, hash do lock): o `check` diz ok só com o link no diretório do pin, a versão do pin e o jsdom CARREGANDO com o ~/.local/bin/node do nó.
 # CÓDIGOS: 0 igual ao pin / instalado · 1 check: ausente, quebrado ou outra versão · install: depois de instalar a conferência final LEU o nó e ele não está ok (se não conseguiu ler é rc 2) · 2 NÃO consegui saber (pin ilegível ou ambíguo, ssh caiu, saída que não reconheço; nunca vira "ausente")
 #   3 o nó não é o que o pin cobre (SO/arquitetura) · 4 recusado (sha256 não confere, o binário diz outra versão, ARQUIVO COMUM no lugar de um dos links, diretório da versão que já existe e não é o node certo) · 5 download falhou · 64 uso errado (nunca 2, que é "não consegui saber")
 #   Um symlink que já exista em ~/.local/node ou ~/.local/bin/node é tratado como nosso e é trocado (o nó não tinha nenhum em 21/10); só arquivo ou diretório comum é recusado.
 # POR QUE É SEGURO: o estado antigo só muda nos dois `ln -sfn` do FIM do install; qualquer recusa antes deles deixa o nó como estava (o diretório novo da versão pode já existir, sem link apontando para ele). O pin é DADO (lido por grep, nunca `source`) e versão/hash passam por regex antes de ir ao ssh.
-#   O diretório de cada versão é imutável: trocar de versão não apaga a anterior (desfazer = religar os links; receita no runbook). Não usa sudo, apt, npm install nem toca no python/venv do nó.
+#   O diretório de cada versão é imutável: trocar de versão não apaga a anterior (desfazer = religar os links; receita no runbook). Não usa sudo, apt nem toca no python/venv do nó; o único npm é o `npm ci --ignore-scripts` do jsdom (nenhum script de pacote roda,
+#   o cache do npm fica no temporário e o registry é o oficial), e nele o link ~/.local/share/cdp-drive também é a última coisa que muda, com o mesmo diretório imutável por (versão, lock). Um ~/.local/share/cdp-drive que seja diretório comum é recusado (rc 4): o npm ci apagaria um repositório de módulos alheio.
 # LIMITES: duas instalações ao mesmo tempo não são serializadas (não há lock): a que chegar depois do `mv` da outra confere a versão do diretório e o reaproveita; numa corrida estrita dos dois `mv` o perdedor pode deixar
 #   um diretório aninhado inofensivo dentro do diretório da versão (os links continuam certos). Rode um install por vez. A troca de link por `ln -sfn` não é uma transação
 #   de duas peças: entre ~/.local/node e ~/.local/bin/node há alguns microssegundos em que o primeiro já mudou. Aceitável aqui: o nó só roda teste, e a troca só existe quando a versão do pin muda.
@@ -36,7 +41,7 @@ case "$cmd" in check|install) ;; *) usage ;; esac
 COMP=node
 while [ $# -gt 0 ]; do case "$1" in --pin) [ $# -ge 2 ] || usage; PIN=$2; shift 2 ;; jsdom) [ "$COMP" = node ] || usage; COMP=jsdom; shift ;; *) usage ;; esac; done
 
-# O pin é DADO: duas linhas KEY=valor, cada uma exatamente uma vez. Ausente, ilegível, repetida ou fora do formato = rc 2 (não sei qual versão), nunca uma versão padrão.
+# O pin é DADO: linhas KEY=valor, cada chave exatamente uma vez (as duas do node sempre; as duas do jsdom só no componente jsdom). Ausente, ilegível, repetida ou fora do formato = rc 2 (não sei qual versão), nunca uma versão padrão.
 pin_get() { local n; n=$(grep -c -E "^$1=" "$PIN" 2>/dev/null) || n=0; [ "$n" = 1 ] || return 1; grep -E "^$1=" "$PIN" | sed -e "s/^$1=//"; }
 [ -r "$PIN" ] || die 2 "NAO-CONSEGUI: pin ilegível ou ausente ($PIN)"
 # vazio → pin_get devolve 1 (rc 2 abaixo); falhou/ilegível → idem: nunca cai numa versão padrão
@@ -124,7 +129,7 @@ if [ -L "$L" ] || [ -e "$L" ]; then
   case "$real" in "$H/share/cdp-drive-jsdom-$V-$K") loc=certo ;; *) loc=outro ;; esac
   # vazio → sem package.json do jsdom (ou sem a linha version) = ERRO; falhou/ilegível → idem
   ver=$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' "$L/node_modules/jsdom/package.json" 2>/dev/null | head -n 1); [ -n "$ver" ] || ver=ERRO
-  # sem o node não há como provar a carga (semnode); node que roda e jsdom que não carrega = erro
+  # sem ~/.local/bin/node não há como provar a carga (semnode); com ele, carregar ou não carregar decide ok ou erro
   if [ -x "$H/bin/node" ]; then
     if NODE_PATH="$L/node_modules" "$H/bin/node" -e "$LOAD" >/dev/null 2>&1; then load=ok; else load=erro; fi
   else load=semnode; fi
@@ -155,7 +160,7 @@ printf '%s' "$PKGB64" | base64 -d > "$ST/package.json" || { echo "RECUSO package
 printf '%s' "$LOCKB64" | base64 -d > "$ST/package-lock.json" || { echo "RECUSO package-lock.json não decodificou"; exit 6; }
 printf '%s  %s\n' "$LSHA" "$ST/package-lock.json" | sha256sum -c - >/dev/null 2>&1 || { echo "RECUSO sha256 do lock não confere com o pin"; exit 4; }
 echo "STEP lock-sha256-ok"
-# nenhum script de pacote roda (--ignore-scripts); o cache do npm fica no temporário (nada em ~/.npm); o registry é fixo
+# nenhum script de pacote roda (--ignore-scripts); o cache do npm fica no temporário (nada em ~/.npm); o registry é fixo. A recusa lê a última linha do log do npm só para a mensagem: vazio/ilegível → mensagem sem detalhe, o rc 5 não muda
 ( cd "$ST" && PATH="$H/node/bin:$PATH" timeout 600 npm ci --ignore-scripts --no-audit --no-fund --no-update-notifier --loglevel=error --logs-max=0 --registry=https://registry.npmjs.org/ --cache "$T/npm-cache" ) > "$T/npm.log" 2>&1 || { echo "RECUSO npm ci falhou: $(tail -n 1 "$T/npm.log")"; exit 5; }
 echo "STEP npm-ci-ok"
 # vazio → sem package.json do jsdom = nada; falhou/ilegível → idem: a recusa abaixo diz 'nada'
@@ -260,7 +265,7 @@ libs_main() {
   got=$(sha_of "$LIBS/package-lock.json")
   [ "$got" = "$JSHA" ] || die 4 "RECUSO: $LIBS/package-lock.json tem sha256 '${got:-ilegível}' e o pin diz $JSHA"
   [ -r "$LIBS/package.json" ] || die 4 "RECUSO: $LIBS/package.json ilegível ou ausente"
-  # o jsdom roda no node do pin e usa o npm dele: ausente/outro/quebrado = recusa (nada foi tocado); não consegui ler = rc 2, outra arquitetura = rc 3
+  # o jsdom roda no node do pin e usa o npm dele: ausente/diferente/quebrado = recusa (nada foi tocado); não consegui ler = rc 2, outra arquitetura = rc 3
   probe
   case "$STATE" in
     ok) ;;
