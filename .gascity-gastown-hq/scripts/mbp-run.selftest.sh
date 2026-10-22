@@ -42,6 +42,9 @@
 #   dry-run (o comando remoto roda de verdade: o uv que falha dá 98, o `| tail` não engole o status), e a auditoria do destino: NOME (token incluso), arquivo > 4 MB, JWT e CONTEÚDO (lista de telefones/CPFs) = ALARME rc 98
 #   (e manda desligar o nó); auditoria que não consegue olhar = 98, nunca 'limpo'; auditoria que ACHOU e caiu antes de terminar = ALARME, não 'não consegui olhar'; hash que não se calculou (shasum falha, ou lixo)
 #   = 97, no nó e no caminho do MBP, nunca "já batem" (controle negativo: o mutante sem hash_valid volta ao defeito).
+# CHROMIUM DO NÓ (ga-aptlug): o pytest do nó exporta PLAYWRIGHT_BROWSERS_PATH e LD_LIBRARY_PATH (hetzner-chromium.sh install) SÓ com o marcador `ready` + browsers/ + libpath.txt legível e não vazio;
+#   marcador ausente/vazio, sem browsers/, libpath ausente/vazio/ilegível = NENHUMA das duas (e o LD_LIBRARY_PATH de antes fica como estava); o bloco que o mbp-run mandou roda DE VERDADE num HOME de teste; 4 mutantes (uma porta cada).
+#   Fora do pytest do nó (job do MBP, selftest do hq) o bloco não existe.
 # MBP_RUN_UNDER_TEST=<script> roda a mesma bateria contra outro mbp-run.sh (ex.: o antigo, para ver os testes novos falharem).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -971,7 +974,32 @@ reset; run -- tests/test_x.py >/dev/null; has "espelho do MBP: clone APFS (cp -c
 reset; date > "$NODEFLAG"; run -- tests/test_x.py >/dev/null; has "job do nó: PATH com ~/.local/bin (uv)" "$(lsf RUN hetzner)" 'export PATH="\$HOME/.local/bin:\$PATH"'; has "job do nó: o python é o venv-wa" "$(lsf RUN hetzner)" 'gt-remote/venv-wa/bin/python'
 has "job do nó: nice (o taskpolicy do macOS não existe lá)" "$(lsf RUN hetzner)" 'nice -n'; hasnt "job do nó: sem a biblioteca de presença do macOS (ioreg)" "$(lsf RUN hetzner)" 'ioreg'
 has "job do nó: presença dedicada/livre" "$(lsf RUN hetzner)" 'PR_WHY=dedicada'
+# ga-aptlug: o Chromium do Playwright do nó (hetzner-chromium.sh install) entra SÓ no pytest do nó, e só com o marcador `ready` (o install o grava por último). As 2 linhas que o mbp-run mandou ao nó rodam DE VERDADE aqui, num HOME de teste.
+has "job do nó: o ambiente do Chromium do Playwright entra no pytest (ga-aptlug)" "$(lsf RUN hetzner)" '^_pwc=\$HOME/gt-remote/pw-chromium/env$'
+pwblock() { grep -E '^_pwc=|^if \[ -s "\$_pwc/ready"' "$(lsf RUN hetzner)"; }
+pwhome() { # nome [defeito]: HOME de teste com marcador, browsers/ e libpath.txt; o defeito tira ou estraga UMA peça
+  local d="$T/pwh/$1/gt-remote/pw-chromium/env"; mkdir -p "$d/browsers"; printf 'PLAYWRIGHT_VERSION=1.58.0\n' > "$d/ready"; printf '/x/lib:/x/lib/gbm\n' > "$d/libpath.txt"
+  case "${2:-}" in sem-ready) rm -f "$d/ready" ;; ready-vazio) : > "$d/ready" ;; sem-browsers) rmdir "$d/browsers" ;; sem-libpath) rm -f "$d/libpath.txt" ;; libpath-vazio) : > "$d/libpath.txt" ;; ilegivel) chmod 000 "$d/libpath.txt" ;; esac
+  echo "$T/pwh/$1"
+}
+pwenv() { local blk=${3:-$(pwblock)}; env -u PLAYWRIGHT_BROWSERS_PATH -u LD_LIBRARY_PATH ${2:+LD_LIBRARY_PATH="$2"} HOME="$1" bash -c "$blk"$'\n''echo "PBP=${PLAYWRIGHT_BROWSERS_PATH:-} LD=${LD_LIBRARY_PATH:-}"' 2>&1; }   # HOME [LD_LIBRARY_PATH prévio] [bloco]: as duas variáveis como o job do nó as veria
+pwmut() { local blk pre post; blk=$(pwblock); case "$blk" in *"$1"*) ;; *) echo ANCORA-AUSENTE; return ;; esac; pre=${blk%%"$1"*}; post=${blk#*"$1"}; printf '%s%s%s' "$pre" "$2" "$post"; }   # o bloco com uma porta trocada (texto fixo, sem sed nem ${//}: o bash 3.2 do mini e o sed BSD variam)
+PWH=$(pwhome ok); PWE="$PWH/gt-remote/pw-chromium/env"
+eq "Chromium do nó: marcador + browsers + libpath → as DUAS variáveis, juntas" "PBP=$PWE/browsers LD=/x/lib:/x/lib/gbm" "$(pwenv "$PWH")"
+eq "Chromium do nó: o LD_LIBRARY_PATH que já existia fica DEPOIS do libpath (acrescenta, não substitui)" "PBP=$PWE/browsers LD=/x/lib:/x/lib/gbm:/sys/lib" "$(pwenv "$PWH" /sys/lib)"
+for df in sem-ready ready-vazio sem-browsers sem-libpath libpath-vazio; do
+  eq "Chromium do nó: $df → NENHUMA das duas, e o LD_LIBRARY_PATH de antes fica como estava (os e2e pulam como antes)" "PBP= LD=/sys/lib" "$(pwenv "$(pwhome "d-$df" "$df")" /sys/lib)"; done
+PWH=$(pwhome d-ilegivel ilegivel)
+if [ -r "$PWH/gt-remote/pw-chromium/env/libpath.txt" ]; then ok "Chromium do nó: libpath.txt ilegível (pulado: este usuário lê arquivo 000)"
+else eq "Chromium do nó: libpath.txt ilegível → NENHUMA das duas" "PBP= LD=/sys/lib" "$(pwenv "$PWH" /sys/lib)"; fi
+# controle negativo: sem cada porta o defeito reaparece em ALGUM caso (o teste enxerga a porta); as 2 últimas voltam a "uma variável só" e "libpath vazio exportado"
+for mut in '[ -s "$_pwc/ready" ] && |' ' && [ -d "$_pwc/browsers" ]|' ' && [ -n "$_pwl" ]|' 'export PLAYWRIGHT_BROWSERS_PATH="$_pwc/browsers" LD_LIBRARY_PATH=|export LD_LIBRARY_PATH='; do
+  mb=$(pwmut "${mut%%|*}" "${mut#*|}"); dead=no
+  if [ "$mb" = ANCORA-AUSENTE ]; then bad "Chromium do nó: mutante '${mut%%|*}' sem âncora no bloco"; continue; fi
+  for df in ok sem-ready ready-vazio sem-browsers libpath-vazio; do [ "$(pwenv "$(pwhome "d-$df" "$df")" /sys/lib "$mb")" = "$(pwenv "$(pwhome "d-$df" "$df")" /sys/lib)" ] || dead=yes; done
+  if [ $dead = yes ]; then ok "Chromium do nó: mutante sem '${mut%%|*}' morto"; else bad "Chromium do nó: mutante sem '${mut%%|*}' SOBREVIVEU"; fi; done
 reset; run -- tests/test_x.py >/dev/null; has "job do MBP: PATH do Homebrew (como sempre)" "$(lsf RUN mbp)" '/opt/homebrew/bin'; has "job do MBP: a biblioteca de presença" "$(lsf RUN mbp)" 'ioreg'
+hasnt "job do MBP: sem o ambiente do Chromium do nó (ga-aptlug)" "$(lsf RUN mbp)" 'pw-chromium'
 
 # opção que pede valor, na última posição: o laço de argumentos avança (antes `shift 2` falhava e girava para sempre)
 for opt in --host --repo --dir; do timeout 10 "$RUN" $opt >/dev/null 2>&1; rc=$?; if [ $rc -ne 124 ]; then ok "$opt como ÚLTIMO argumento termina (rc=$rc), não gira"; else bad "$opt como último argumento girou até o timeout"; fi; done
@@ -1412,6 +1440,7 @@ hreset; date > "$NODEFLAG"; rc=$(hrun -- scripts/x.selftest.sh); expect "hq: sel
 has "hq: log repo=hq mode=selftest host=hetzner" "$J" '"repo":"hq","mode":"selftest".*"host":"hetzner"'; hasnt "hq: o MBP nunca é chamado" "$STUB_LOG" 'HOSTCALL:mbp'; has "hq: diz onde rodou" "$T/err" 'rodou em hetzner \(nó Linux\)'
 has "hq: o job é bash <selftest>, não pytest" "$(lsf RUN hetzner)" 'nice -n "\$MBP_NICE" bash scripts/x.selftest.sh'; hasnt "hq: sem -m pytest" "$(lsf RUN hetzner)" '\-m pytest'; hasnt "hq: sem xdist (-n N)" "$(lsf RUN hetzner)" 'bash -n [0-9]'
 has "hq: identidade git fixa (selftest que cria repositório temporário)" "$(lsf RUN hetzner)" 'GIT_COMMITTER_EMAIL=gt@no'
+hasnt "hq: sem o ambiente do Chromium do nó (ga-aptlug)" "$(lsf RUN hetzner)" 'pw-chromium'
 has "hq: o espelho parte de hq-base" "$(lsf MIRROR hetzner)" 'gt-remote/hq-base'; hasnt "hq: o MIRROR não exige venv" "$(lsf MIRROR hetzner)" 'NOVENV'
 has "hq: o rsync usa o filtro do hq" "$STUB_LOG" 'hetzner-rsync-filter\.hq\.txt'; hasnt "hq: …e não o do wa" "$STUB_LOG" 'hetzner-rsync-filter\.wa\.txt'
 hreset; date > "$NODEFLAG"; rc=$(STUB_RUN_RC_NODE=1 hrun -- scripts/x.selftest.sh); expect "hq: rc do selftest propagado (1)" 1 "$rc"; has "…e logado" "$J" '"rc":1.*"host":"hetzner"'
