@@ -38,6 +38,8 @@
 #   antes de um start que só chega depois dele não é guardada: ssh falso que SEGURA a resposta); erro, ssh fora e resposta cortada continuam erro e nada fica guardado, e cache vencido + host fora do ar é erro, não a lista
 #   velha; cache vencido, do futuro, vazio, ilegível ou de forma errada pergunta ao host; [] é resposta; geração ilegível = sem cache; dry-run não usa nem altera; list_cache_s (0 desliga, padrão 10, 0-120, o resto recusa a
 #   config); só o host com cache é poupado; lista do cache não mexe no registro de sessões; falha ao invalidar não derruba o start. A base de cfg()/cfgm() fixa list_cache_s=0 em todo host: os outros grupos esperam um ssh por list-running.
+#   abort (ga-0k82lw) — o start que o mini ABANDONOU (prazo do provider estourado; provider morto com kill -9 na parte lenta) não deixa tmux no host, com o ssh falso dos dois jeitos: plain (fecha o canal ao matar o provider) e orphan (deixa o
+#   script do host gravável, como o sshd com ControlMaster); o stop que chega na parte lenta do start com o provider vivo faz o start desistir dizendo que foi abandonado; controles: start lento dentro do prazo abre, stop e depois start novo do mesmo nome abre.
 # CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar: teto do host, nome
 #   exato (sessão, is-running, start), alvo de painel =nome:, guarda de /Users/, filtro de env, exit 2 das desconhecidas, marcador de fim,
 #   erro de ssh, flock, "tmux sem acesso" tolerado como "sem servidor", o `has` que engole o erro do tmux, melhor esforço da sessão
@@ -871,7 +873,7 @@ g_lr() {
 }
 
 g_abort() {  # ga-0k82lw: o start que o mini ABANDONOU (prazo do provider estourado, ou o engine mata o processo no meio) não pode deixar sessão no host: o script do host ainda roda e abriria a tmux "depois do close"
-  local bin="$T/home/.local/bin" real i pid mode; real=$(command -v sha256sum); mkdir -p "$bin"
+  local bin="$T/home/.local/bin" real i pid mode srt brc; real=$(command -v sha256sum); mkdir -p "$bin"
   slowhost() {  # passo lento ANTES do new-session: o portão de uma sessão real roda `sha256sum` no host (real_gate); o falso marca que começou, espera $1 s e chama o de verdade
     rm -f "$T/slow.mark"; printf '#!/bin/sh\n: > "%s"\nsleep %s\nexec "%s" "$@"\n' "$T/slow.mark" "$1" "$real" > "$bin/sha256sum"; chmod +x "$bin/sha256sum"
   }
@@ -890,6 +892,14 @@ g_abort() {  # ga-0k82lw: o start que o mini ABANDONOU (prazo do provider estour
     tmux -L "$SOCK" kill-server 2>/dev/null
   done
   unset FAKE_SSH_ORPHAN
+  cfg 3; slowhost 4; fresh  # o engine fecha a sessão com o provider do start VIVO na parte lenta (a 1ª chamada ainda não gravou o lançador): o stop não acha sessão e volta 0; o start não pode abrir a tmux depois
+  env HOME="$T/home" GC_SSH_CONFIG="$T/cfg.json" GC_SSH_BIN="$T/bin/ssh" GC_EXEC_STATE_DIR="$T/state" "$P" start abort-4 < <(req cat) >"$T/out.bg" 2>"$T/err.bg" & pid=$!
+  waitfor "$T/slow.mark"; pv stop abort-4 </dev/null; srt=$RC; wait $pid; brc=$?
+  [ $srt = 0 ] && [ $brc != 0 ] && has "$T/err.bg" 'abandonado'; ok $? "abort: stop no meio da parte lenta do start → o start desiste dizendo que foi abandonado (stop rc=$srt, start rc=$brc: $(head -c 120 "$T/err.bg"))"
+  [ "$(count)" = 0 ]; ok $? "abort: ...e o host NÃO ganha a sessão (tmux: $(count))"
+  cfg 3; slowhost 0; fresh  # controle: um stop de ANTES de um start novo do mesmo nome (a marca ficou no host) não o impede: o preparo da 1ª chamada apaga a marca
+  pv stop abort-4 </dev/null; pv start abort-4 < <(req cat); [ $RC = 0 ] && [ "$(count)" = 1 ]; ok $? "abort: (controle) stop e depois um start novo do mesmo nome abre a sessão (rc=$RC, tmux: $(count))"
+  pv stop abort-4 </dev/null
   cfg 3; slowhost 2; fresh
   pv start abort-3 < <(req cat); ok $RC "abort: (controle) start lento mas dentro do prazo abre a sessão (rc=$RC $(head -c 160 "$T/err"))"
   [ "$(count)" = 1 ]; ok $? "abort: (controle) ...e ela está no host (tmux: $(count))"

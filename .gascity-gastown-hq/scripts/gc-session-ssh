@@ -780,14 +780,18 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     # provider: nenhum handler roda, SIGKILL) e o `sh` do host seguiria até o new-session — uma tmux que o gc não conhece, ocupando vaga do nó. O host não tem como saber que o mini desistiu: medido com ssh
     # de verdade e o ControlMaster daqui, escrever no stderr do ssh órfão segue dando certo por 12 s, e um prazo no relógio do host só pegaria o timeout do próprio provider, não um kill antes dele.
     # Por isso o start são DUAS chamadas sob o mesmo lock: a 1ª prepara tudo o que é lento (teto, worktree, preparo, lançador) e termina SEM abrir tmux; a 2ª só abre (new-session + conferência, ~1 s).
-    # Provider morto na parte lenta = nenhuma tmux, qualquer que seja o comportamento do ssh; a janela que sobra é a 2ª chamada (a varredura do hetzner-capacity pega o que escapar dela).
-    prep_body = """s=$(sessions) || exit 1
+    # Provider morto na parte lenta = nenhuma tmux, qualquer que seja o comportamento do ssh. Provider VIVO e o engine fechando a sessão (stop) na parte lenta: o stop grava `<nome>.stop`, a 1ª chamada apaga a marca antes
+    # de preparar e a 2ª recusa abrir se ela voltou. Janelas que sobram: o stop que roda no host ANTES de a 1ª chamada apagar a marca (o ssh dela ainda conectando: igual a "stop, depois start") e o ~1 s da 2ª chamada entre
+    # o teste da marca e o new-session; o que escapar delas é da varredura do hetzner-capacity (órfã no nó sem sessão aberta no gc).
+    prep_body = """rm -f @STOPF@
+s=$(sessions) || exit 1
 @GATE0@printf '%s\\n' "$s" | grep -qxF -- @NAME@ && { echo "session @NAME@ already exists" >&2; exit 11; }
 n=$(printf '%s\\n' "$s" | grep -c .)
 [ "$n" -lt @CAP@ ] || { echo "host @HOST@ está no teto: $n de @CAP@ sessões" >&2; exit 10; }
 @WTADD@@GATE1@@PREP@@PLIBCHECK@mkdir -p @RUN@ @WORKDIR@ && chmod 700 @RUN@ || exit 1
 rm -f @EXITF@; printf %s @B64@ | base64 -d >@LAUNCH@ || exit 1"""
     open_body = """@WTTRAP@[ -r @LAUNCH@ ] || { echo "start de @NAME@ abandonado: o lançador do preparo não está mais lá" >&2; exit 14; }
+[ ! -e @STOPF@ ] || { echo "start de @NAME@ abandonado: o stop chegou durante o preparo" >&2; rm -f @LAUNCH@; exit 14; }
 T new-session -d -s @NAME@ -c @WORKDIR@ "sh @LAUNCH@" || { rm -f @LAUNCH@; exit 1; }
 sleep 1
 T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após abrir: $(cat @EXITF@ 2>/dev/null)" >&2; rm -f @LAUNCH@; exit 1; }"""
@@ -795,7 +799,7 @@ T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após
     prep_body = prep_body.replace("@PLIBCHECK@", plib).replace("@PREP@", prepare_script(cfg)).replace("@WTADD@", wtadd_sh(wt, name) if wt else "")
     open_body = open_body.replace("@WTTRAP@", wtclean_sh(wt, name) + "trap '[ \"$?\" -eq 0 ] || wtclean >&2' EXIT\n" if wt else "")  # a 2ª chamada que falha recolhe o worktree que a 1ª criou (wtclean mantém o que tiver trabalho)
     for k, v in {"@NAME@": q(name), "@CAP@": str(cap), "@HOST@": q(cfg.host), "@RUN@": q(run_dir), "@WORKDIR@": q(p["work_dir"]),
-                 "@EXITF@": q(exitf), "@LAUNCH@": q(lpath), "@TGT@": tgt(name),
+                 "@EXITF@": q(exitf), "@LAUNCH@": q(lpath), "@TGT@": tgt(name), "@STOPF@": q(f"{run_dir}/{name}.stop"),
                  "@B64@": q(base64.b64encode(launcher(cfg, name, p, secrets).encode()).decode())}.items():
         prep_body, open_body = prep_body.replace(k, v), open_body.replace(k, v)
     prep_body = prep_body.replace("@GATE0@", "" if wt else gate).replace("@GATE1@", gate if wt else "")  # sessão com worktree do provider: o guarda de clone vem DEPOIS do wt-add
@@ -834,7 +838,9 @@ T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após
 # ---------- as demais operações ----------
 
 def op_stop(cfg: Cfg, name: str, args: list, dry: bool) -> int:
-    body = """has @NAME@; [ $? -ne 2 ] || exit 1
+    # a marca `<nome>.stop` é para o start que ainda PREPARA este nome (ga-0k82lw): o stop que chega nessa hora não acha sessão e volta 0, e a 2ª chamada do start vê a marca e desiste em vez de abrir a tmux depois do close
+    body = """mkdir -p @RUN@ && : > @RUN@/@NAME@.stop
+has @NAME@; [ $? -ne 2 ] || exit 1
 pp=$(T list-panes -t @PTGT@ -F '#{pane_pid}' 2>/dev/null | head -1); pids=
 [ -z "$pp" ] || pids=$(tree "$pp")
 T kill-session -t @TGT@ 2>/dev/null
