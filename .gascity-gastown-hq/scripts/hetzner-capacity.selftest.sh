@@ -127,13 +127,14 @@ echo x >> "$W/claude.calls"; : > "$W/claude.started"
 cat "$W/claude.out"
 exit "$(cat "$W/claude.rc")"
 EOF
-# o provider (`gc-session-ssh <op> <nome>`, ga-0k82lw): get-last-activity imprime $W/act.<nome> (act.rc≠0 = falha; sem o arquivo = não imprime nada); stop anota em stop.calls, falha com stop.rc
+# o provider (`gc-session-ssh <op> <nome>`, ga-0k82lw): get-last-activity imprime $W/act.<nome> (act.rc≠0 = falha; sem o arquivo = não imprime nada; com act.reopen troca gcl.raw por gcl.reopen ANTES de responder: o gc reabre a sessão depois da decisão); stop anota em stop.calls, falha com stop.rc
 # e tira o nome de list.extra (a não ser que stop.keep exista: o stop diz ok e a tmux continua)
 cat > "$W/prov-stub" <<'EOF'
 #!/bin/sh
 W="$(dirname "$0")"
 case "$1" in
   get-last-activity) if [ -f "$W/act.rc" ] && [ "$(cat "$W/act.rc")" != 0 ]; then echo "provider: ssh falhou" >&2; exit "$(cat "$W/act.rc")"; fi
+                     [ -f "$W/act.reopen" ] && cp "$W/gcl.reopen" "$W/gcl.raw"
                      [ -f "$W/act.$2" ] && cat "$W/act.$2"; exit 0;;
   stop) echo "$2" >> "$W/stop.calls"
         if [ -f "$W/stop.rc" ] && [ "$(cat "$W/stop.rc")" != 0 ]; then echo "provider: stop falhou" >&2; exit "$(cat "$W/stop.rc")"; fi
@@ -706,6 +707,7 @@ g_orphan() {  # a tmux do nó que o gc já deu por fechada (ga-0k82lw, camada 3)
     for x in "$@"; do s="$s,{\"session_name\":\"$x\",\"alias\":\"$x\",\"state\":\"active\",\"closed\":false}"; done
     printf '{"sessions":[%s]}\n' "$s" > "$W/gcl.raw"
   }
+  gcs() { printf '{"sessions":[{"session_name":"mayor","alias":"mayor","state":"active","closed":false},{"session_name":"%s","alias":"%s","state":"%s","closed":%s}]}\n' "$1" "$1" "$2" "$3" > "$W/gcl.raw"; }      # gcs NOME ESTADO CLOSED → o gc lista essa sessão com esse estado
   node_has() { printf '%s\n' "$@" > "$W/list.extra"; }                  # as tmux vivas do nó
   beadst() { echo "$2" > "$W/show.$1"; }                                # beadst ID STATUS
   act_at() { "$PY" -I -c 'import sys,time;print(time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime(int(sys.argv[1]))))' $((T0 + $2)) > "$W/act.$1"; }      # act_at NOME SEGUNDOS (relativos ao T0)
@@ -731,8 +733,13 @@ g_orphan() {  # a tmux do nó que o gc já deu por fechada (ga-0k82lw, camada 3)
   full kill; runs 0 180; printf 'lixo' > "$D/orphans.json"; runs 360 700; check "orphans.json ilegível: os relógios recomeçam (nunca age cedo)" " " "$(stops)"; runs 1400; check "…e depois da carência de novo, age" "dog-remote-gawispzz001 " "$(stops)"
 
   full kill; beadst ga-wisp-zz001 open; runs 0 180 700; check "bead da sessão ABERTA (o gc só não a listava): não é órfã, não encerra" " |1" "$(stops)|$(evn bead-open)"
-  for why in sem-bead outra-forma; do
-    full kill; [ $why = sem-bead ] && rm -f "$W/show.ga-wisp-zz001" || printf '[{"id":"ga-wisp-zz001","status":"closed","issue_type":"task"}]\n' > "$W/show.raw"
+  for why in sem-bead outra-forma outro-id; do
+    full kill
+    case $why in
+      sem-bead) rm -f "$W/show.ga-wisp-zz001";;
+      outra-forma) printf '[{"id":"ga-wisp-zz001","status":"closed","issue_type":"task"}]\n' > "$W/show.raw";;
+      outro-id) printf '[{"id":"ga-wisp-outra","status":"closed","issue_type":"session"}]\n' > "$W/show.raw";;
+    esac
     runs 0 180 700; check "bead ilegível ($why): terceiro estado, não encerra" " |1" "$(stops)|$(evn ilegivel)"
   done
   full kill; act_at $X 640; runs 0 180 700; check "tmux com atividade há 60 s: ainda trabalha, não encerra" " |1" "$(stops)|$(evn ativa)"
@@ -745,6 +752,11 @@ g_orphan() {  # a tmux do nó que o gc já deu por fechada (ga-0k82lw, camada 3)
   full kill; printf '{"sessions":[]}\n' > "$W/gcl.raw"; runs 0 180 700; check "gc com lista VAZIA é leitura suspeita (nunca 'nenhuma aberta'): não encerra" " " "$(stops)"
   full kill; echo 1 > "$W/list.rc"; runs 0 180 700; check "list-running do nó falhou: não encerra" " " "$(stops)"
   full kill; gcl $X; runs 0 180 700; check "o gc lista a sessão como aberta: não é órfã (nem com bead fechada e parada)" " |[]" "$(stops)|$(jget orphans.seen)"
+  full kill; gcs $X failed-create false; runs 0 180 700; check "o gc lista a sessão como failed-create (o caso da ga-0k82lw): não conta como aberta, a tmux é encerrada" "dog-remote-gawispzz001 " "$(stops)"
+  full kill; gcs $X active true; runs 0 180 700; check "o gc lista a sessão com closed=true: não conta como aberta, a tmux é encerrada" "dog-remote-gawispzz001 " "$(stops)"
+  full kill; gcs $X asleep false; runs 0 180 700; check "o gc lista a sessão adormecida (asleep, closed=false): segue aberta, não encerra" " |[]" "$(stops)|$(jget orphans.seen)"
+  full kill; gcs $X active false; cp "$W/gcl.raw" "$W/gcl.reopen"; gcl; : > "$W/act.reopen"; runs 0 180 700
+  check "o gc volta a listar a sessão entre a decisão e o stop (reaberta): não encerra e ela sai dos relógios" " |1|[]" "$(stops)|$(evn reaberta)|$(jget orphans.seen)"
   full kill; node_has scratch-manual; runs 0 180 700; check "tmux com nome que o gc não gera: a varredura não toca" " |[]" "$(stops)|$(jget orphans.seen)"
 
   oc kill; node_has $X $Y $Z; for b in 1 2 3; do beadst ga-wisp-zz00$b closed; done; act_at $X -3600; act_at $Y -3600; act_at $Z -3600; runs 0 180 700
@@ -759,12 +771,13 @@ g_orphan() {  # a tmux do nó que o gc já deu por fechada (ga-0k82lw, camada 3)
 
 if [ -n "${HC_MUTANT:-}" ]; then for g in ${HC_MGROUPS:-bg third read step verdict idle fill hourly claude orphan}; do "g_$g"; done; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
 if [ -n "${HC_ONLY:-}" ]; then "g_$HC_ONLY"; echo "── $((n - fails))/$n ok (só g_$HC_ONLY)"; [ "$fails" = 0 ]; exit $?; fi
-g_fill; g_hourly; g_read; g_step; g_verdict; g_third; g_idle; g_bg; g_claude; g_orphan
+[ -n "${HC_MUT_ONLY:-}" ] || { g_fill; g_hourly; g_read; g_step; g_verdict; g_third; g_idle; g_bg; g_claude; g_orphan; }
 
 [ -n "${HC_NO_MUTANTS:-}" ] || {
   echo "── controle negativo: cada mutante tem que reprovar a bateria ──"
   nm=0
-  mutant() {  # mutant DESCRIÇÃO ANTES DEPOIS — troca EXATAMENTE uma ocorrência numa cópia
+  mutant() {  # mutant DESCRIÇÃO ANTES DEPOIS — troca EXATAMENTE uma ocorrência numa cópia (HC_MUT_ONLY=<grupo>: só os mutantes marcados MG=<grupo>, sem a bateria normal)
+    [ -z "${HC_MUT_ONLY:-}" ] || [ "${MG:-}" = "$HC_MUT_ONLY" ] || return 0
     nm=$((nm+1)); local m="$T/mut$nm.py"
     "$PY" -I -c 'import sys
 s=open(sys.argv[1],encoding="utf-8").read()
@@ -891,6 +904,33 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
         os.makedirs(env.dir, exist_ok=True); atomic_write(env.pause, "{}")
         return out("local", "claude_blocked",'
   mutant "o step também pergunta ao gate do Claude" 'submit(claude_gate) if args.cmd == "verdict" else None' 'submit(claude_gate) if args.cmd in ("verdict", "step") else None'
+  # ga-0k82lw, camada 3 (tmux órfã): cada prova e cada guarda da varredura tem o seu mutante; só o grupo orphan os pega
+  MG=orphan mutant "(ga-0k82lw) a bead da sessão não precisa estar fechada" 'if st != "closed":' 'if False:'
+  MG=orphan mutant "(ga-0k82lw) bead que não é de sessão vale" ' or row.get("issue_type") != "session"' ''
+  MG=orphan mutant "(ga-0k82lw) bead de OUTRO id vale" 'row.get("id") != bead or ' ''
+  MG=orphan mutant "(ga-0k82lw) um ciclo só basta (ORPHAN_MIN_SEEN=1)" 'ORPHAN_MIN_SEEN = 2 ' 'ORPHAN_MIN_SEEN = 1 '
+  MG=orphan mutant "(ga-0k82lw) a carência orphan_grace_s é ignorada" 'if e["n"] >= ORPHAN_MIN_SEEN and now - e["first"] >= cfg["orphan_grace_s"]:' 'if e["n"] >= ORPHAN_MIN_SEEN:'
+  MG=orphan mutant "(ga-0k82lw) a parada orphan_idle_s é ignorada (qualquer atividade vale como parada)" 'elif idle_for_s(cfg["host"], n, now) >= cfg["orphan_idle_s"]:' 'elif idle_for_s(cfg["host"], n, now) >= 0:'
+  MG=orphan mutant "(ga-0k82lw) atividade sem data legível vale como parada" 'raise Unreadable(f"get-last-activity {name}: sem data legível ({out[:40]!r})")' 'return 10 ** 9'
+  MG=orphan mutant "(ga-0k82lw) o modo log também encerra" 'if tag == "parada" and out["mode"] == "kill" and kills < ORPHAN_MAX_KILLS:' 'if tag == "parada" and kills < ORPHAN_MAX_KILLS:'
+  MG=orphan mutant "(ga-0k82lw) sem o teto de encerradas por ciclo (ORPHAN_MAX_KILLS)" 'out["mode"] == "kill" and kills < ORPHAN_MAX_KILLS:' 'out["mode"] == "kill":'
+  MG=orphan mutant "(ga-0k82lw) o modo off também olha" 'if out["mode"] == "off":' 'if False:'
+  MG=orphan mutant "(ga-0k82lw) lista do gc vazia vale como 'nenhuma aberta'" 'if not isinstance(rows, list) or not rows:' 'if not isinstance(rows, list):'
+  MG=orphan mutant "(ga-0k82lw) failed-create conta como sessão aberta" '("closed", "archived", "failed-create")' '("closed", "archived")'
+  MG=orphan mutant "(ga-0k82lw) sessão adormecida (asleep) conta como fechada" '("closed", "archived", "failed-create")' '("closed", "archived", "failed-create", "asleep")'
+  MG=orphan mutant "(ga-0k82lw) o closed=true do gc não tira a sessão das abertas" 'x.get("closed") is not True and x.get("state") not in ("closed", "archived", "failed-create")' 'x.get("state") not in ("closed", "archived", "failed-create")'
+  MG=orphan mutant "(ga-0k82lw) sem a releitura do gc antes do stop" 'if name in open_session_names():
+            return "reaberta", ""' 'if False:
+            return "reaberta", ""'
+  MG=orphan mutant "(ga-0k82lw) a sessão reaberta fica nos relógios" '("morta", "reaberta")' '("morta",)'
+  MG=orphan mutant "(ga-0k82lw) ciclos longe demais um do outro contam como seguidos" 'if p is None or not 0 <= now - p["last"] <= cfg["max_age_s"]:' 'if p is None:'
+  MG=orphan mutant "(ga-0k82lw) tmux com nome que o gc não gera entra na varredura" 'if WISP_NAME.fullmatch(n) is None or n in open_now:' 'if n in open_now:'
+  MG=orphan mutant "(ga-0k82lw) stop que diz ok vale como encerrada sem conferir o nó" 'return ("continua" if name in list_sessions(env, cfg["host"]) else "morta"), ""' 'return "morta", ""'
+  MG=orphan mutant "(ga-0k82lw) provider com rc≠0 vale como saída vazia" 'if p.returncode != 0:
+        raise Unreadable(f"{op} {name} saiu com' 'if False:
+        raise Unreadable(f"{op} {name} saiu com'
+  MG=orphan mutant "(ga-0k82lw) o estado vai ao events.jsonl a cada ciclo, não só na mudança" 'if tag != e["said"]:' 'if True:'
+  MG=orphan mutant "(ga-0k82lw) erro da varredura derruba o step" 'except Exception as e:      # a varredura é um extra do ciclo' 'except KeyboardInterrupt as e:      # a varredura é um extra do ciclo'
 }
 echo "── $((n - fails))/$n ok"
 [ "$fails" = 0 ]
