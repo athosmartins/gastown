@@ -41,7 +41,7 @@
 		<key>PILOT_WA_NODE_ROUTE</key>
 		<string>label</string>
 		<key>PILOT_WA_NODE_SLOTS</key>
-		<string>1</string>
+		<string>3</string>
 		<key>PILOT_WA_NODE_SPAWN</key>
 		<string>pilot</string>
 		<key>PILOT_WA_WORKER_MAX</key>
