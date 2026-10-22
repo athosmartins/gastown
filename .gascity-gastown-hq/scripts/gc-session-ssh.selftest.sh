@@ -45,7 +45,7 @@
 #   erro de ssh, flock, "tmux sem acesso" tolerado como "sem servidor", o `has` que engole o erro do tmux, melhor esforço da sessão
 #   ausente, o stop que não confere que a sessão sumiu, e o portão (sem a liberação, liberação de qualquer tipo, nome de teste frouxo ou sem
 #   âncora, sem conferir o sha do guarda, sem rodar o --selfcheck, script do host que sai 0, guarda irmão ilegível), e a regra de presença do MBP (grupo mbp: guarda de /Users/, validação da config, recusa/pausa/slot_cap, vigia, PATH extra,
-#   registro de sessões do list-running); 132 mutantes no total (20 do grupo lr: o cache nunca lido, start sem invalidar antes / depois, stop sem invalidar, gravação sem conferir a geração, prazo e relógio, geração e forma do arquivo, dry-run, list_cache_s em cinco formas, geração ilegível ou ausente, registro acertado com lista do cache, falha ao invalidar derrubando o start; 26 do grupo wt: wt-add/wt-rm do provider, o guarda DEPOIS do wt-add, o recolhimento só do que não perde trabalho e os nomes do engine; 9 do ambiente limpo da sessão, grupo mbp: session_env, ZDOTDIR, PATH explícito e claude absoluto, ga-w7qwl1.1.5).
+#   registro de sessões do list-running); 135 mutantes no total (3 do grupo abort: a marca <nome>.stop do stop, ga-0k82lw — o stop não a grava, o preparo do start não a apaga, a 2ª chamada não olha para ela; 20 do grupo lr: o cache nunca lido, start sem invalidar antes / depois, stop sem invalidar, gravação sem conferir a geração, prazo e relógio, geração e forma do arquivo, dry-run, list_cache_s em cinco formas, geração ilegível ou ausente, registro acertado com lista do cache, falha ao invalidar derrubando o start; 26 do grupo wt: wt-add/wt-rm do provider, o guarda DEPOIS do wt-add, o recolhimento só do que não perde trabalho e os nomes do engine; 9 do ambiente limpo da sessão, grupo mbp: session_env, ZDOTDIR, PATH explícito e claude absoluto, ga-w7qwl1.1.5).
 #   Mais: contra um stub que só sai 0, quase tudo falha.
 # VARIÁVEIS: GCSSH_UNDER_TEST (script a testar) · GCSSH_ONLY (grupos separados por vírgula) · GCSSH_NO_MUTANTS=1 · GCSSH_MUTANTS_ONLY=<grupo> (pula os casos e roda só os mutantes desse grupo)
 set -u
@@ -1052,6 +1052,9 @@ if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails 
   mutant lr "geração ausente conta como ilegível (cache nunca liga antes do 1º start)" '/^def lr_gen/,/^def lr_invalidate/s/^        return ""$/        return None/'
   mutant lr "lista do cache reconcilia o registro de sessões" 's/if not dry and t0 is not None:/if not dry:/'
   mutant lr "falha ao invalidar derruba o start" 's/^        cfg.log(f"list-running: não consegui trocar a geração do cache.*$/        raise/'
+  mutant abort "stop não grava a marca <nome>.stop" 's/mkdir -p @RUN@ && : > @RUN@\/@NAME@\.stop/true/'
+  mutant abort "1ª chamada do start não apaga a marca (um stop antigo trava o start novo)" 's/^    prep_body = """rm -f @STOPF@$/    prep_body = """true/'
+  mutant abort "2ª chamada do start não olha a marca (abre depois do stop)" 's/^\[ ! -e @STOPF@ \] || .*$/true/'
   [ -n "${GCSSH_MUTANTS_ONLY:-}" ] || {
   echo "-- contra um stub que só sai 0 (a versão 'anterior' não tinha provider nenhum)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"
