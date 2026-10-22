@@ -1,0 +1,15 @@
+# hetzner-chromium.pin — o Chromium do Playwright que o nó Linux (aarch64) tem em ~/gt-remote/pw-chromium/env. DADO, não código: scripts/hetzner-chromium.sh lê as três linhas KEY=valor abaixo por grep (nunca `source`).
+#
+# Contents
+#   De onde vem o hash · Como atualizar
+#
+# DE ONDE VEM O HASH (medido em 22/10/2026, ga-aptlug): sha256 do arquivo `chromium_headless_shell-1208/chrome-linux/headless_shell` (287892096 bytes) que o CLI oficial do Playwright 1.58.0 (o do venv-wa)
+#   instala com `playwright install chromium-headless-shell`, baixado por https de cdn.playwright.dev (Chrome Headless Shell 145.0.7632.6, build 1208, linux-arm64). O Playwright não publica hash: é a confiança no primeiro uso,
+#   confirmada por DOIS downloads independentes que deram o mesmo hash (o da sessão que mediu e o da sessão que entregou; ver o runbook). O que o pin garante é que o install só vale se o binário for ESTE; trocar de build pede trocar o pin.
+# DEB_PACKAGES: as bibliotecas de sistema que o headless shell pede e o nó não tem (ldd: 12 não encontradas antes), baixadas sem root por `apt-get download` e extraídas em ~/gt-remote/pw-chromium/env/root. É a mesma lista de 13
+#   que o bootstrap do scrape (hetzner-scrape-round.sh) já usa neste nó; medido: com ela o ldd dá 0 faltando e os 49 e2e do WA passam (serial e com xdist).
+# COMO ATUALIZAR: suba o Playwright do venv-wa (o build do navegador muda junto), instale uma vez no nó com o hash antigo para ver a recusa `sha256 do navegador não confere`, confira o hash do arquivo novo em DOIS downloads,
+#   troque as DUAS primeiras linhas de uma vez, rode `bash scripts/hetzner-chromium.selftest.sh` e depois `bash scripts/hetzner-chromium.sh install`. Biblioteca nova que o ldd acuse entra em DEB_PACKAGES.
+PLAYWRIGHT_VERSION=1.58.0
+HEADLESS_SHELL_SHA256_LINUX_ARM64=3d7ae069d9c2e7f049998f6871be2381fb6967f7a06c26ea0b346321e3dc496f
+DEB_PACKAGES=libnspr4 libnss3 libatk1.0-0t64 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 libgbm1 libasound2t64 libatspi2.0-0t64 libxrender1 libxi6
