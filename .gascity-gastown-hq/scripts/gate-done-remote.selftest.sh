@@ -610,7 +610,7 @@ mkdir -p "$OUTER/.git/hooks"; printf '#!/bin/sh\necho "hq-hook rodou" >> "%s"\ne
 reset_db; git --git-dir="$ORIGIN" update-ref -d "refs/heads/$BR"; rm -f "$T/hq-hook.log"; run_exe; ok $((RC != 0)) "HQ com hook: sai 0"; has "$T/hq-hook.log" "hq-hook rodou"; ok $? "HQ: o pre-push do repositório RODOU (o hook do HQ é confiável e funciona sem checkout)"
 rm -f "$OUTER/.git/hooks/pre-push"; reset_db; git --git-dir="$ORIGIN" update-ref -d "refs/heads/$BR"
 # hooks_off direto (a ordem das entradas de GIT_CONFIG_*: acrescenta NO FIM, nunca sobrescreve o que o main() já pôs; o que não consegue ler recusa)
-python3 -B -I - "$CITY/scripts/gate-done-remote.py" "$T/hoff" <<'PYEOF'; ok $? "hooks_off: acrescenta core.hooksPath no fim de GIT_CONFIG_*, e recusa contagem ilegível, pasta com arquivo, arquivo no lugar da pasta e contagem negativa"
+python3 -B -I - "$CITY/scripts/gate-done-remote.py" "$T/hoff" <<'PYEOF'; ok $? "hooks_off: acrescenta core.hooksPath no fim de GIT_CONFIG_*, e recusa contagem ilegível, pasta com arquivo, arquivo no lugar da pasta, pasta ilegível (PermissionError) e contagem negativa"
 import importlib.util, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("gdr", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
@@ -629,6 +629,12 @@ assert refuses({"GIT_CONFIG_COUNT": "abc"}, w) and refuses({"GIT_CONFIG_COUNT": 
 assert refuses({}, w)
 w2 = Path(sys.argv[2] + "-arquivo"); w2.mkdir(); (w2 / "no-hooks").write_text("x")   # um ARQUIVO no lugar da pasta: não dá para criar nem ler → recusa, não traceback
 assert refuses({}, w2)
+w3 = Path(sys.argv[2] + "-ilegivel"); w3.mkdir()
+import os; real_listdir = os.listdir
+def listdir_negado(p, *a, **k): raise PermissionError(13, "negado", str(p))   # a pasta sem hooks existe mas o mini não consegue LÊ-LA (falhou/ilegível ≠ vazia)
+os.listdir = listdir_negado
+try: assert refuses({}, w3)
+finally: os.listdir = real_listdir
 PYEOF
 
 # ── 8. mutantes: cada guarda apagada tem de reprovar o caso que a prova ───────────────────────────────────────────────────────────────────────────
