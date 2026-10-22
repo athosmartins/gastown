@@ -36,6 +36,11 @@
 #     meio quebra a sequência) · cpu_lowers_ceiling=true devolve a regra antiga e valor que não é bool é NÃO SEI · o plist agenda `step` a cada 180 s e o ciclo cabe em refresh_s / max_age_s.
 #   CPU por hora (g_hourly, ga-2hd02v.2): média = 100 - ocioso por hora cheia UTC, só as horas COMPLETAS · hora sem leitura é sem_leitura (rc 1), nunca 0% nem ok · leitura que falhou fica
 #     fora da média e entra em falhas · linha ruim é contada e pulada · lê o readings.jsonl.1 · arquivo que não abre é erro (rc 3), não "sem leitura" · --hours / --min-pct inválidos = rc 3.
+#   tmux órfã (g_orphan, ga-0k82lw camada 3): a tmux do nó que o gc não lista como aberta só é encerrada com TODAS as provas — bead da sessão `closed` (aberta, ilegível, sem bead, de outro id ou de outro tipo = não),
+#     2 ciclos contados seguidos e a carência de 600 s, parada há 600 s (atividade recente, ilegível ou sem data = não), o gc relido antes do stop (sessão reaberta = não), no máximo 2 por ciclo · modos log (o padrão: só
+#     registra), kill e off · o gc listando a sessão como failed-create ou closed=true = não aberta (o caso da bead); asleep = aberta · TERCEIRO ESTADO: lista do nó ou do gc que falha ou vem vazia, orphans.json ilegível
+#     ou com relógio velho e contagem 0 = não age e os relógios nem andam · stop que falha, ou que diz ok com a tmux ainda no nó, não conta como encerrada · tmux com nome que o gc não gera não é tocada ·
+#     erro dentro da varredura vai ao alarme e o step segue rc 0 · reap_orphans / orphan_grace_s inválidos = rc 3.
 # CONTROLE NEGATIVO: ilegível contado como verde · sem prova de carga · degrau que pula · evidência que vale duas vezes · `present()` que engole erro · veredito sem o
 #   gate_done · cap ignorado · `>` no lugar de `>=` na vaga · sessões ilegíveis viram 0 · leitura velha autoriza · leitura sem `state` válida · leitura no futuro autoriza ·
 #   vermelho só com CPU E RAM · âmbar vira verde · `max` no lugar de `min` na CPU · estado ilegível recomeça · falha de ssh vira leitura ok · load5 `nan` aceito ·
@@ -46,7 +51,11 @@
 #   prazo de teste que alonga o padrão · prazo inválido/<=0 vira quase zero · prova de carga que aceita leitura com idle_why com motivo / sem idle_why — cada um é aplicado numa cópia e a bateria TEM que falhar.
 #   (ga-2hd02v.2) a CPU cheia derruba o degrau · decide() volta à regra antiga · a RAM não derruba · leitura que falhou/âmbar desce · padrões de volta (35%, 1800 s, 10%, cpu_lowers_ceiling) ·
 #   bool não validado · hourly: hora sem leitura como ok, falha na média, hora parcial, arquivo que não abre como vazio, linha ruim que derruba, linha sem t, --min-pct ignorado, rc 0 sempre, .1 não lido.
-# VARIÁVEIS: HC_UNDER_TEST (script a testar) · HC_PY (interpretador; padrão /usr/bin/python3 = o 3.9 do mini) · HC_NO_MUTANTS=1 · HC_ONLY=<grupo> (só g_<grupo>: read, step, verdict, third, idle, bg, fill, hourly; sem mutantes)
+#   (ga-0k82lw, grupo orphan; HC_MUT_ONLY=orphan roda só estes 22) bead fechada dispensada / de outro tipo / de outro id · ORPHAN_MIN_SEEN=1 · carência e parada ignoradas · atividade sem data vale como parada ·
+#   modo log que encerra · sem teto por ciclo · modo off que olha · lista vazia do gc vale · failed-create / closed=true / asleep tratados errado · sem a releitura do gc · reaberta que fica nos relógios ·
+#   ciclos distantes contados como seguidos · nome fora do padrão entra · stop sem conferir o nó · provider com rc≠0 vale como vazio · estado repetido a cada ciclo · erro da varredura derruba o step.
+# VARIÁVEIS: HC_UNDER_TEST (script a testar) · HC_PY (interpretador; padrão /usr/bin/python3 = o 3.9 do mini) · HC_NO_MUTANTS=1 · HC_ONLY=<grupo> (só g_<grupo>: read, step, verdict, third, idle, bg, fill, hourly, claude, orphan; sem mutantes)
+#   HC_MUT_ONLY=<grupo> (só os mutantes marcados MG=<grupo>, sem a bateria normal; ex.: orphan)
 #   HC_MGROUPS (uso interno do `mutant`: quais grupos a cópia mutada roda; vazio = todos)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -728,7 +737,9 @@ g_orphan() {  # a tmux do nó que o gc já deu por fechada (ga-0k82lw, camada 3)
   full off; runs 0 180 700; check "modo off: não olha (sem orphans.json), não encerra" " |no|off" "$(stops)|$([ -e "$D/orphans.json" ] && echo yes || echo no)|$(jget orphans.mode)"
 
   full kill; printf '{%s,"reap_orphans":"kill","orphan_grace_s":1}\n' "$LEGACY" > "$D/config.json"; runs 700
-  check "um ciclo só não basta (ORPHAN_MIN_SEEN=2), mesmo com a carência cumprida" " " "$(stops)"; runs 710; check "o 2º ciclo seguido, com a carência cumprida, encerra" "dog-remote-gawispzz001 " "$(stops)"
+  check "um ciclo só não basta: a carência de 1 s só se cumpre no 2º ciclo" " " "$(stops)"; runs 710; check "o 2º ciclo seguido, com a carência cumprida, encerra" "dog-remote-gawispzz001 " "$(stops)"
+  full kill; printf '{"orphans":{"%s":{"first":%d,"last":%d,"n":0,"said":""}}}\n' $X $((T0 - 3000)) $((T0 + 650)) > "$D/orphans.json"; runs 700
+  check "orphans.json com relógio velho e contagem 0 (não são ciclos seguidos): o 1º ciclo contado não encerra (ORPHAN_MIN_SEEN)" " " "$(stops)"; runs 880; check "…e o 2º ciclo contado encerra" "dog-remote-gawispzz001 " "$(stops)"
   full kill; runs 0 1000; check "ciclos longe demais um do outro (> max_age_s) não são 'seguidos': o relógio recomeça" " " "$(stops)"
   full kill; runs 0 180; printf 'lixo' > "$D/orphans.json"; runs 360 700; check "orphans.json ilegível: os relógios recomeçam (nunca age cedo)" " " "$(stops)"; runs 1400; check "…e depois da carência de novo, age" "dog-remote-gawispzz001 " "$(stops)"
 

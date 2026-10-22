@@ -2,7 +2,7 @@
 """hetzner-capacity.py — o teto de sessões do nó Hetzner por MEDIÇÃO e o veredito "nó ou mini". ga-2hd02v.1.11. Python 3.9+, só biblioteca padrão.
 
 Contents
-  Para que serve · Comandos · Os degraus · Meta: encher o nó · O veredito · Sessão ocupada × ociosa · Três estados · Arquivos · O que NÃO faz
+  Para que serve · Comandos · Os degraus · Meta: encher o nó · O veredito · Sessão ocupada × ociosa · Três estados · Tmux órfã · Arquivos · O que NÃO faz
 
 PARA QUE SERVE
   O mini vive em swap; o nó (16 núcleos, 32 GB, sem swap) fica ocioso. Esta ferramenta responde duas perguntas com número medido, nunca com chute:
@@ -15,6 +15,7 @@ COMANDOS  (todos aceitam --json; --dir muda a pasta de estado)
             Quem chama trata 1 e 2 do mesmo jeito (fica no mini); a diferença está no motivo, para o log.
   step      o mesmo ciclo (mede se vencido, avalia, grava) sem dar veredito. Para um agendador. exit 0 se rodou, 3 se não conseguiu gravar/ler a configuração (ou erro interno).
             Quem agenda é o job com.gascity.hetzner-capacity-step (180 s; o plist está em scripts/ e instalar é do Mayor): o degrau não pode depender de o Pilot pedir veredito (ga-2hd02v.2).
+            Depois do degrau o `step` roda a varredura de tmux órfã (seção TMUX ÓRFÃ; ga-0k82lw): um erro dela vai para o alarme e para a saída, e não muda o degrau nem o exit.
   hourly    só LÊ readings.jsonl: CPU OCUPADA (100 - ocioso) média por hora cheia UTC das últimas --hours (24) horas completas. exit 0 = toda hora tem leitura e média >= --min-pct (85),
             1 = alguma hora abaixo ou SEM leitura (hora sem leitura não prova nada: não é 0% nem é OK), 3 = não consegui ler o arquivo ou argumento fora de faixa. É a consulta da prova ao vivo da meta.
   status    só LÊ (sem ssh, sem gravar): degrau, leituras, o que falta para subir, tetos fixos (cap do provider) e as condições do veredito.
@@ -79,16 +80,31 @@ TRÊS ESTADOS
   = erro, não "recomeça". O mesmo vale para config.json: ilegível por qualquer motivo = erro (NÃO SEI no veredito), nunca o padrão.
   Se o ssh nem executa (sem o binário, sem permissão) a leitura é `unreadable` (ferramenta quebrada), não `unreachable` (nó fora).
 
+TMUX ÓRFÃ  (ga-0k82lw, camada 3: rede de segurança para o que o provider e o `close` do gc deixaram escapar)
+  Medido 22/10: um create remoto abortado no mini deixou a tmux viva no nó (4 sessões claude, 2/3 do teto, e o oráculo as contava ocupadas) enquanto o gc não tinha sessão aberta nenhuma. As camadas 1 e 2
+  (gc-session-ssh: o start em duas chamadas e a marca <nome>.stop) fecham essa origem; esta varredura pega o que ainda escapar. Roda no fim do `step` (a cada 180 s), em `reap_orphans`.
+  ÓRFÃ = tmux do nó com nome de sessão do gc (`<template>-<prefixo>wisp<id>`, derivado da bead de sessão) que NÃO está entre as sessões ABERTAS do `gc session list --json` (qualquer alias; `closed` ou estado
+  closed/archived/failed-create = não aberta). Só é encerrada com TODAS as provas: (1) a bead da sessão (`bd show`, tipo session) está `closed`, 2ª prova independente da lista do gc, que pode vir cortada ·
+  (2) vista órfã em ORPHAN_MIN_SEEN (2) ciclos contados seguidos e há `orphan_grace_s` (600 s) · (3) parada há `orphan_idle_s` (600 s; `get-last-activity` do provider) · (4) o gc, relido logo antes do stop, ainda
+  não a lista (se voltou: estado `reaberta`) · (5) no máximo ORPHAN_MAX_KILLS (2) por ciclo. O stop é o do provider (`gc-session-ssh stop`); depois dele o nó é relido: tmux que continua lá é `continua`, nunca encerrada.
+  Três estados: a lista do nó ou a do gc que não deu, ou a do gc VAZIA (leitura suspeita: a cidade sempre tem o Mayor) = não age e não mexe nos relógios; a bead ou a atividade que não deu = só aquela tmux não é
+  encerrada (o relógio dela segue). Nenhuma delas vira "órfã de verdade" nem "ativa".
+  Modo, em `reap_orphans` do config.json: "log" (padrão) só registra em events.jsonl (`orphan` com o estado: vista, bead-<status>, ilegivel, ativa, parada, reaberta, continua, falhou, morta, uma vez por mudança);
+  "kill" também encerra; "off" não olha. Ligar o "kill" é do Mayor, depois de ler os `parada` do events.jsonl atrás de falso positivo.
+
 ARQUIVOS  (pasta de estado: $HETZNER_CAPACITY_DIR, senão <cidade>/.gc/hetzner-capacity, cidade = pasta acima de scripts/)
   state.json (degrau, desde quando, últimas leituras) · readings.jsonl (toda medição, para o antes×depois) · events.jsonl (mudança de degrau, pausa, alarme) ·
-  config.json (opcional; chave desconhecida ou valor inválido = erro, não "usa o padrão") · pause.json · lock (um ciclo por vez; quem não pega o lock lê o cache).
+  config.json (opcional; chave desconhecida ou valor inválido = erro, não "usa o padrão") · pause.json · lock (um ciclo por vez; quem não pega o lock lê o cache) ·
+  orphans.json (os relógios da varredura de tmux órfã: nome → primeira e última vez vista, ciclos contados, último estado dito; ausente ou ilegível = os relógios recomeçam, nunca a varredura age cedo).
   Lê também: $GC_SSH_CONFIG ou <cidade>/.gc/session-ssh.json (host, cap, liberação) e $HETZNER_CAPACITY_SHIM_CONFIG ou ~/.gastown/remote-shim.json (gate_done_bin).
   Para os testes: HETZNER_CAPACITY_SSH_CMD e HETZNER_CAPACITY_LIST_CMD (lista JSON de argumentos) trocam o ssh e o list-running; HETZNER_CAPACITY_SESSIONS_CMD e
   HETZNER_CAPACITY_BEADS_CMD trocam o `gc session list --json` e o `bd list --status in_progress --json`; HETZNER_CAPACITY_READ_TIMEOUT_S ENCURTA o prazo dessas duas leituras
-  (25 s o gc, 15 s o bd; nunca alonga) e o do gate do Claude (30 s); HETZNER_CAPACITY_CLAUDE_CMD (lista JSON) troca o `hetzner-claude.py gate`; HETZNER_CAPACITY_NOW (época) troca o relógio.
+  (25 s o gc, 15 s o bd; nunca alonga) e o do gate do Claude (30 s); HETZNER_CAPACITY_CLAUDE_CMD (lista JSON) troca o `hetzner-claude.py gate`; HETZNER_CAPACITY_NOW (época) troca o relógio;
+  HETZNER_CAPACITY_PROVIDER_CMD (lista JSON) troca o `gc-session-ssh` (a varredura chama `get-last-activity <nome>` e `stop <nome>`) e HETZNER_CAPACITY_SHOW_CMD troca o `bd -C <cidade> show` (o id da bead e `--json` vão no fim).
 
 O QUE NÃO FAZ
-  Não abre sessão, não encerra sessão, não atribui bead (só LÊ gc e bd e pergunta o login do Claude do nó ao `hetzner-claude.py gate`), não mexe em city.toml, agents/ nem session-ssh.json. O degrau é o teto de OPERAÇÃO; os tetos FIXOS (`cap` do host no provider
+  Não abre sessão, não atribui bead (só LÊ gc e bd e pergunta o login do Claude do nó ao `hetzner-claude.py gate`), não mexe em city.toml, agents/ nem session-ssh.json. A única coisa que encerra é a tmux ÓRFÃ da
+  varredura (seção TMUX ÓRFÃ), e só com `reap_orphans` = "kill" no config.json; nunca fecha sessão no gc. O degrau é o teto de OPERAÇÃO; os tetos FIXOS (`cap` do host no provider
   e `max_active_sessions` do dog-remote) continuam sendo o limite duro, e o veredito usa o MENOR dos dois. Quem leva a bead ao nó (atribuir ao alias dog-remote-<n> e
   abrir a sessão) é outra fatia: aqui só se diz se pode.
 """
