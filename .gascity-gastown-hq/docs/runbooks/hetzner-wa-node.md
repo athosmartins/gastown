@@ -162,7 +162,7 @@ Pré-condição: o flip da ga-2hd02v.1.6 provado (o `dog-remote` entregando de v
 ## O que depende de outras histórias
 
 * **1.6** (flip do `dog-remote`): pré-condição para ligar. A receita de atribuição vem dela.
-* **1.13** (`gate-done` remoto e liberação do assignee e da rota depois da entrega): o `release` daqui é a ponte manual. O worker remoto roda `gate-done` pelo atalho; que o gate aceite uma bead entregue pelo nó, e libere a rota sozinho, é da 1.13.
+* **1.13** (`gate-done` remoto e liberação do assignee e da rota depois da entrega): o `release` daqui é a ponte manual. O worker remoto roda `gate-done` pelo atalho; que o gate aceite uma bead entregue pelo nó, e libere a rota sozinho, é da 1.13. **ga-2hd02v.3.10:** o `gate-done` do WA no mini roda SEM o `pre-push` do WA (ele executaria scripts da árvore do nó no mini; medição dos guards e a brecha que resta em `docs/runbooks/remote-shim.md`, "O pre-push do rig no mini").
 
 ## A prova do dia seguinte: `wa-node-report.py` (ga-2hd02v.3)
 

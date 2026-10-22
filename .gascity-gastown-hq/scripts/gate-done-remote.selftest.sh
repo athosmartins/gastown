@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # gate-done-remote.selftest.sh — prova hermética de scripts/gate-done-remote.py (ga-2hd02v.1.13): cidade, origin e espelho FALSOS em tmp, `bd`/`gc` falsos,
 # e o commands/gate-done.md DE VERDADE (a fonte única que o executável reaproveita: se ele mudar de forma, este teste quebra). Uma seção final roda a cadeia
-# pelo remote-shim-wrapper.py real (ambiente montado do zero, cwd = cidade) e outra mata 12 mutantes. Nada toca a cidade nem o origin de verdade.
+# pelo remote-shim-wrapper.py real (ambiente montado do zero, cwd = cidade) e outra mata os mutantes (a seção 11, ga-2hd02v.3.10: o rig WA roda SEM o pre-push que executaria a árvore do nó). Nada toca a cidade nem o origin de verdade.
 # ga-2hd02v.1.18: as seções 9 e 9b cobrem `gate-done <bead> <ref> <sha>` (2ª bead da sessão, sha conferido antes do marcador, refs que a sessão não pode submeter) e a volta do gate.
 # Uso: bash scripts/gate-done-remote.selftest.sh   (FAILFAST=1 para no 1º caso que reprova)
 set -u
@@ -29,6 +29,7 @@ with open(T + "/bd.log", "a") as f: f.write(" ".join(a) + "\n")
 with open(T + "/bd.cwd", "a") as f: f.write(os.getcwd() + " " + " ".join(x for x in a[:3] if not x.startswith("/")) + "\n")   # onde a chamada rodou (o cwd do `create` do marcador é o do worktree)
 if a[:1] == ["-C"]:
     if os.path.realpath(a[1]) == os.path.realpath(T + "/rigs/property_scrapers"): db_path = T + "/db-ps.json"   # a loja do rig PS (ga-2hd02v.4); qualquer outro -C é a da cidade
+    if os.path.realpath(a[1]) == os.path.realpath(T + "/rigs/whatsapp_automation"): db_path = T + "/db-wa.json"   # a loja do rig WA (ga-2hd02v.3.10)
     a = a[2:]
 db = json.load(open(db_path)); beads = db["beads"]
 def save(): json.dump(db, open(db_path, "w"))
@@ -81,7 +82,7 @@ import json, os, sys
 a = sys.argv[1:]
 if "rig" in a and "list" in a:
     t = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-    print(json.dumps({"rigs": [{"name": "gascity", "path": t + "/outer/city", "prefix": "ga"}, {"name": "property_scrapers", "path": t + "/rigs/property_scrapers", "prefix": "ps"}]})); sys.exit(0)
+    print(json.dumps({"rigs": [{"name": "gascity", "path": t + "/outer/city", "prefix": "ga"}, {"name": "property_scrapers", "path": t + "/rigs/property_scrapers", "prefix": "ps"}, {"name": "whatsapp_automation", "path": t + "/rigs/whatsapp_automation", "prefix": "wa"}]})); sys.exit(0)
 sys.stderr.write("fake gc: comando nao previsto: %s\n" % a); sys.exit(64)
 EOF
 REAL_GIT=$(command -v git)
@@ -116,7 +117,7 @@ db, alias = sys.argv[1:]
 json.dump({"n": 0, "beads": {"ga-t1": {"id": "ga-t1", "title": "Remoto: teste do atalho", "status": "in_progress", "assignee": alias, "issue_type": "bug",
            "labels": ["story:approved"], "metadata": {"gc.routed_to": "dog-remote"}, "created_by": "gastown.mayor", "owner": "x@y"}}}, open(db, "w"))
 EOF
-  rm -f "$T/db-ps.json"
+  rm -f "$T/db-ps.json" "$T/db-wa.json"
   : > "$BDLOG"; : > "$T/bd.cwd"
 }
 dbq() { jq -r "$1" "$DB"; }   # lê o banco falso com um programa jq
@@ -507,15 +508,140 @@ mv "$PSMIRROR" "$T/psmirror.moved"; run_ps; ok $((RC != 1)) "PS sem o espelho pr
 mv "$T/psmirror.moved" "$PSMIRROR"
 reset_ps; run_ps GATE_DONE_REMOTE_MIRROR="$T/nao-existe.git" GATE_DONE_REMOTE_DRY_RUN=1; ok $((RC != 0)) "PS: GATE_DONE_REMOTE_MIRROR (variável de teste do HQ) NÃO desvia o espelho do PS"
 
+# ── 11. o rig WA (ga-2hd02v.3.10): o pre-push do WA executa scripts da ÁRVORE empurrada ($REPO_ROOT/scripts/check_*.py) e o worktree é sem checkout de propósito (nada do nó roda no mini antes da revisão).
+#    Sem o conserto o push do passo 1 era recusado ("Guard 6 FAILED": scripts/check_mds_registry_guard.py não existe no worktree) e o gate-done recusava 2x. Com ele, o atalho desliga o hook SÓ para o WA (core.hooksPath → pasta vazia da cidade) e diz isso no marcador.
+WAORIGIN="$T/wa-origin.git"; WARIG="$T/rigs/whatsapp_automation"; WAMIRROR="$CITY/.gc/hetzner-mirror/repos/whatsapp_automation.git"; WADB="$T/db-wa.json"; WAW="$T/wa-work"
+WASESS="wa-worker-remote-abc123"; WAALIAS="wa-worker-remote-1"; WABR="fix/wa-t1-wa-remoto-teste"; WAHOOKLOG="$T/wa-hook.log"; WASENT="$T/wa-executed"
+git init -q --bare -b main "$WAORIGIN"; git clone -q "$WAORIGIN" "$WAW" 2>/dev/null
+mkdir -p "$WAW/lib" "$WAW/scripts/hooks"; printf 'x = 1\n' > "$WAW/lib/x.py"
+# o hook de verdade (scripts/hooks/pre-push do WA) acha $REPO_ROOT pelo `git rev-parse --show-toplevel` e roda os guards DE LÁ (G6 check_mds_registry_guard.py, G7, G12…): aqui, o menor que mostra a mesma forma
+cat > "$WAW/scripts/hooks/pre-push" <<WAHOOK
+#!/bin/sh
+REPO_ROOT="\$(git rev-parse --show-toplevel)"
+echo "pre-push em \$REPO_ROOT" >> "$WAHOOKLOG"
+python3 "\$REPO_ROOT/scripts/check_mds_registry_guard.py" || { echo "Guard 6 FAILED: scripts/check_mds_registry_guard.py" >&2; exit 1; }
+exit 0
+WAHOOK
+chmod +x "$WAW/scripts/hooks/pre-push"
+printf 'open("%s", "a").write("guard rodou: " + __file__ + "\\n")\n' "$WASENT" > "$WAW/scripts/check_mds_registry_guard.py"   # o guard da ÁRVORE: se ele rodar em algum lugar, deixa rastro
+G -C "$WAW" add lib scripts >/dev/null && G -C "$WAW" commit -qm "base" && G -C "$WAW" push -q origin HEAD:main 2>/dev/null
+# o rig como o de verdade: checkout principal (confiável) com core.hooksPath apontando para <rig>/.git/hooks, onde pre-push é um link para scripts/hooks/pre-push do próprio checkout
+git clone -q "$WAORIGIN" "$WARIG" 2>/dev/null; mkdir -p "$WARIG/.git/hooks"; ln -s "$WARIG/scripts/hooks/pre-push" "$WARIG/.git/hooks/pre-push"
+git -C "$WARIG" config core.hooksPath "$WARIG/.git/hooks"
+git clone -q --bare "$WAORIGIN" "$WAMIRROR"
+wa_work() {  # wa_work ARQUIVO REF → NEWSHA: commit em cima de main que também mexe no guard e no hook DA ÁRVORE (o que o nó pode empurrar), empurrado ao espelho do WA em refs/heads/REF
+  G -C "$WAW" checkout -q -b work-tmp main && printf 'v = 1\n' > "$WAW/lib/$1" && printf '# do no\n' >> "$WAW/scripts/check_mds_registry_guard.py" && printf 'echo hostil >> "%s"\n' "$WASENT" >> "$WAW/scripts/hooks/pre-push" \
+    && G -C "$WAW" add "lib/$1" scripts >/dev/null && G -C "$WAW" commit -qm "feat(wa): $1" && NEWSHA=$(git -C "$WAW" rev-parse HEAD) && git -C "$WAW" push -q -f "$WAMIRROR" "HEAD:refs/heads/$2"
+  r=$?; G -C "$WAW" checkout -q main; git -C "$WAW" branch -q -D work-tmp; return $r
+}
+wa_work y.py "worker/$WASESS"; WASHA=$NEWSHA
+nohooks_clear() { rm -f "$CITY/.gc/gate-done-remote/no-hooks/"* 2>/dev/null; rmdir "$CITY/.gc/gate-done-remote/no-hooks" 2>/dev/null; return 0; }
+reset_wa() {  # reset_wa: wa-t1 do alias WA na loja do rig (rota do nó); a loja da cidade com a ga-t1 do dog; sem rastro de hook/guard
+  reset_db; git --git-dir="$WAORIGIN" update-ref -d "refs/heads/$WABR" 2>/dev/null; rm -f "$WAHOOKLOG" "$WASENT"; : > "$T/git.log"; nohooks_clear
+  python3 -I - "$WADB" "$WAALIAS" <<'PYEOF'
+import json, sys
+p, alias = sys.argv[1:]
+json.dump({"n": 0, "beads": {"wa-t1": {"id": "wa-t1", "title": "WA remoto: teste", "status": "in_progress", "assignee": alias, "issue_type": "bug",
+           "labels": ["story:approved"], "metadata": {"gc.routed_to": "wa-worker-remote", "pilot.wa_node_alias": alias}, "created_by": "gastown.mayor", "owner": "x@y"}}}, open(p, "w"))
+PYEOF
+}
+waq() { jq -r "$1" "$WADB"; }
+run_wa() {  # run_wa [VAR=valor ...] [-- arg...] → RC, $T/out, $T/err (sessão wa-worker-remote; a rota do prefixo wa só existe DENTRO da chamada: a seção 10 prova a recusa sem ela)
+  envs=(); while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done; [ $# -gt 0 ] && shift
+  cp "$CITY/.beads/routes.jsonl" "$T/routes.keep"; printf '{"prefix":"ga","path":"."}\n{"prefix":"wa","path":"../../rigs/whatsapp_automation"}\n' > "$CITY/.beads/routes.jsonl"
+  ( cd "$CITY" && env -i HOME="$T/home" USER=t LOGNAME=t LANG=en_US.UTF-8 PATH="$BIN:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" \
+      BEADS_ACTOR="$WAALIAS" GC_ALIAS="$WAALIAS" GC_SESSION_NAME="$WASESS" GC_TEMPLATE=wa-worker-remote ${envs[@]+"${envs[@]}"} \
+      "$CITY/scripts/gate-done-remote.py" "$@" ) > "$T/out" 2> "$T/err"; RC=$?
+  cp "$T/routes.keep" "$CITY/.beads/routes.jsonl"
+}
+wa_origin_has() { git --git-dir="$WAORIGIN" rev-parse --verify -q "refs/heads/$1" 2>/dev/null; }
+wa_clean() {  # nada do que a execução criou sobra no rig do WA
+  [ ! -e "$WARIG/.gc-worktrees/gate-done-remote/wt-wa-t1" ] && ! git -C "$WARIG" show-ref -q --verify "refs/heads/$WABR" && [ -z "$(git -C "$WARIG" for-each-ref refs/gt-remote)" ] && [ "$(git -C "$WARIG" worktree list | wc -l | tr -d ' ')" = 1 ]
+}
+wa_nothing() { [ "$(mut_count)" = 0 ] && ! wa_origin_has "$WABR" >/dev/null; }
+wa_no_trace() { [ ! -e "$WAHOOKLOG" ] && [ ! -e "$WASENT" ]; }   # o hook do rig não rodou e nenhum arquivo da árvore empurrada foi executado
+# controles do fixture (sem o atalho): o hook liga num checkout de verdade e REPRODUZ o bug num worktree sem checkout; sem isto os testes de "hook desligado" passariam no vazio
+reset_wa; git -C "$WARIG" fetch -q "$WAMIRROR" "+refs/heads/worker/$WASESS:refs/probe/wa" 2>/dev/null; git -C "$WARIG" push -q --dry-run origin "$WASHA:refs/heads/probe" 2>"$T/err"; ok $? "WA controle: o push do checkout principal passa pelo hook do rig (o guard roda de $WARIG)"
+has "$WAHOOKLOG" "pre-push em $WARIG"; ok $? "WA controle: o hook do fixture rodou de verdade (a config core.hooksPath vale)"; [ -s "$WASENT" ]; ok $? "WA controle: o guard do checkout principal rodou (deixou rastro)"
+reset_wa; git -C "$WARIG" worktree add -q --no-checkout -b probe-nc "$T/probe-wt" "$WASHA" 2>/dev/null; git -C "$T/probe-wt" push --dry-run origin HEAD:refs/heads/probe >/dev/null 2>"$T/err"; r=$?
+ok $((r == 0)) "WA controle (o bug): push de worktree sem checkout é RECUSADO pelo hook do rig (o guard não existe lá)"; has "$T/err" "Guard 6 FAILED"; ok $? "WA controle (o bug): a recusa é a do Guard 6, a de produção"
+git -C "$WARIG" worktree remove --force "$T/probe-wt" 2>/dev/null; git -C "$WARIG" branch -q -D probe-nc 2>/dev/null; git -C "$WARIG" update-ref -d refs/probe/wa 2>/dev/null
+# ensaio: resolve tudo, não escreve nada
+reset_wa; run_wa GATE_DONE_REMOTE_DRY_RUN=1
+ok $((RC != 0)) "WA ensaio: sai 0"; has "$T/out" "bead=wa-t1 worker/$WASESS@${WASHA:0:12} → $WABR"; ok $? "WA ensaio: diz alias, bead (da loja do rig), sha e branch"
+wa_nothing && wa_no_trace; ok $? "WA ensaio: nada escrito, nada empurrado, nenhum hook"
+# caminho feliz: o atalho submete o WA, SEM o pre-push do rig e sem rodar nada da árvore do nó
+reset_wa; run_wa
+ok $((RC != 0)) "WA feliz: sai 0 (sem o conserto o hook recusava o push: Guard 6 FAILED, rc 1)"
+[ "$(wa_origin_has "$WABR")" = "$WASHA" ]; ok $? "WA feliz: o origin do WA tem $WABR no sha do espelho do WA"
+! origin_has "$WABR" >/dev/null; ok $? "WA feliz: o origin do HQ NÃO recebeu o branch do WA"
+has "$T/out" "Marker created: ga-mk1"; ok $? "WA feliz: o marcador foi criado (na loja da CIDADE)"
+[ "$(dbq '.beads["ga-mk1"].metadata["gate.submitted_by"] // ""')" = "$WAALIAS" ]; ok $? "WA feliz: gate.submitted_by = alias do WA"
+[ "$(dbq '[.beads["ga-mk1"].labels[] | select(startswith("source-bead:") or startswith("bead-rig:") or startswith("branch:"))] | sort | join(",")')" = "bead-rig:whatsapp_automation,branch:$WABR,source-bead:wa-t1" ]; ok $? "WA feliz: o marcador leva source-bead:wa-t1, bead-rig:whatsapp_automation e o branch"
+[ "$(waq '.beads["wa-t1"].labels | index("gate:queued") != null')" = true ]; ok $? "WA feliz: gate:queued na bead, NA LOJA DO RIG"
+[ -z "$(waq '.beads["wa-t1"].assignee // ""')" ] && [ "$(waq '.beads["wa-t1"].metadata | has("gc.routed_to")')" = false ]; ok $? "WA feliz: a bead foi SOLTA na loja do rig"
+wa_no_trace; ok $? "WA feliz: o pre-push do rig NÃO rodou e NENHUM arquivo da árvore empurrada foi executado no mini (sem hook, sem rastro do guard nem do hook hostil)"
+has "$T/err" "AVISO: o pre-push de whatsapp_automation NÃO roda no mini"; ok $? "WA feliz: o cliente é avisado de que o pre-push foi pulado (não fica calado)"
+dbq '.beads["ga-mk1"].description' | grep -qF -- "o pre-push de whatsapp_automation NAO rodou no mini"; ok $? "WA feliz: o marcador (self_audit:, o que o revisor do gate lê) registra que o pre-push NÃO rodou"
+dbq '.beads["ga-mk1"].description' | grep -qF -- "NAO verificada aqui"; ok $? "WA feliz: a nota de auto-auditoria de sempre continua no marcador"
+wa_clean; ok $? "WA feliz: worktree, branch local e ref temporária foram recolhidos (no rig do WA)"
+[ "$(git -C "$WARIG" rev-parse HEAD)" = "$(git --git-dir="$WAORIGIN" rev-parse main)" ] && [ -z "$(git -C "$WARIG" status --porcelain)" ]; ok $? "WA feliz: o checkout principal do rig não mudou (nem arquivo novo)"
+[ "$(git -C "$WARIG" config core.hooksPath)" = "$WARIG/.git/hooks" ]; ok $? "WA feliz: a config do rig continua apontando para o hook dele (o desligamento vale só dentro da chamada, por ambiente)"
+[ -d "$CITY/.gc/gate-done-remote/no-hooks" ] && [ -z "$(ls -A "$CITY/.gc/gate-done-remote/no-hooks")" ]; ok $? "WA feliz: a pasta sem hooks (da cidade) existe e segue vazia"
+grep -q '^cfg=3$' "$T/git.log" && ! grep -qvE '^cfg=(2|3)$' "$T/git.log"; ok $? "WA feliz: os git dos blocos levam 3 entradas (gc.auto, maintenance.auto e core.hooksPath); nenhum git do exe perde as duas de antes"
+# forma com argumentos (2ª bead da sessão) vale igual
+wa_work z.py "worker/$WASESS-2"; WASHA2=$NEWSHA
+reset_wa; python3 -I - "$WADB" <<'PYEOF'
+import json, sys
+d = json.load(open(sys.argv[1])); d["beads"]["wa-t2"] = dict(d["beads"]["wa-t1"], id="wa-t2", title="Segunda do WA"); json.dump(d, open(sys.argv[1], "w"))
+PYEOF
+run_wa -- wa-t2 "worker/$WASESS-2" "$WASHA2"; ok $((RC != 0)) "WA 2ª bead: gate-done wa-t2 worker/<sessão>-2 <sha> sai 0"; [ "$(wa_origin_has "fix/wa-t2-segunda-do-wa")" = "$WASHA2" ]; ok $? "WA 2ª bead: o origin do WA tem o branch no sha dito"
+wa_no_trace; ok $? "WA 2ª bead: nenhum hook nem guard rodou"
+# a pasta sem hooks é da cidade e tem de estar VAZIA: um hook plantado nela rodaria no mini → recusa antes de escrever (falhou/ilegível nunca vira "sem hooks")
+reset_wa; mkdir -p "$CITY/.gc/gate-done-remote/no-hooks"; printf '#!/bin/sh\necho plantado >> "%s"\nexit 0\n' "$WASENT" > "$CITY/.gc/gate-done-remote/no-hooks/pre-push"; chmod +x "$CITY/.gc/gate-done-remote/no-hooks/pre-push"
+run_wa; ok $((RC != 1)) "WA pasta sem hooks com um hook plantado: recusa 1"; has "$T/err" "não está vazia"; ok $? "WA hook plantado: diz o motivo"; wa_nothing && [ ! -e "$WASENT" ]; ok $? "WA hook plantado: nada escrito, nada empurrado, o hook plantado não rodou"; wa_clean; ok $? "WA hook plantado: o que a execução criou foi recolhido"
+nohooks_clear
+# o desligamento é SÓ do WA: HQ e PS seguem com o hook do próprio rig (o do PS é um shim do bd; o do HQ roda de /Users/athos/gt/.git/hooks). Hook de teste: deixa rastro e passa
+mkdir -p "$PSRIG/.repo.git/hooks"; printf '#!/bin/sh\necho "ps-hook rodou" >> "%s"\nexit 0\n' "$T/ps-hook.log" > "$PSRIG/.repo.git/hooks/pre-push"; chmod +x "$PSRIG/.repo.git/hooks/pre-push"
+reset_ps; rm -f "$T/ps-hook.log"; run_ps; ok $((RC != 0)) "PS com hook: sai 0"; has "$T/ps-hook.log" "ps-hook rodou"; ok $? "PS: o pre-push do rig RODOU (só o WA o pula)"; ! has "$T/err" "AVISO: o pre-push"; ok $? "PS: nenhum aviso de hook pulado"
+! dbq '.beads["ga-mk1"].description' | grep -qF -- "NAO rodou no mini"; ok $? "PS: o marcador não diz que o pre-push foi pulado"
+rm -f "$PSRIG/.repo.git/hooks/pre-push"
+mkdir -p "$OUTER/.git/hooks"; printf '#!/bin/sh\necho "hq-hook rodou" >> "%s"\nexit 0\n' "$T/hq-hook.log" > "$OUTER/.git/hooks/pre-push"; chmod +x "$OUTER/.git/hooks/pre-push"
+reset_db; git --git-dir="$ORIGIN" update-ref -d "refs/heads/$BR"; rm -f "$T/hq-hook.log"; run_exe; ok $((RC != 0)) "HQ com hook: sai 0"; has "$T/hq-hook.log" "hq-hook rodou"; ok $? "HQ: o pre-push do repositório RODOU (o hook do HQ é confiável e funciona sem checkout)"
+rm -f "$OUTER/.git/hooks/pre-push"; reset_db; git --git-dir="$ORIGIN" update-ref -d "refs/heads/$BR"
+# hooks_off direto (a ordem das entradas de GIT_CONFIG_*: acrescenta NO FIM, nunca sobrescreve o que o main() já pôs; o que não consegue ler recusa)
+python3 -B -I - "$CITY/scripts/gate-done-remote.py" "$T/hoff" <<'PYEOF'; ok $? "hooks_off: acrescenta core.hooksPath no fim de GIT_CONFIG_*, e recusa contagem ilegível, pasta com arquivo, arquivo no lugar da pasta e contagem negativa"
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("gdr", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+w = Path(sys.argv[2]); w.mkdir()
+e = m.hooks_off({"GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "gc.auto", "GIT_CONFIG_VALUE_0": "0", "GIT_CONFIG_KEY_1": "maintenance.auto", "GIT_CONFIG_VALUE_1": "false"}, w)
+assert e["GIT_CONFIG_COUNT"] == "3" and e["GIT_CONFIG_KEY_2"] == "core.hooksPath" and e["GIT_CONFIG_VALUE_2"] == str(w / "no-hooks"), e
+assert e["GIT_CONFIG_KEY_0"] == "gc.auto" and e["GIT_CONFIG_KEY_1"] == "maintenance.auto", e
+e = m.hooks_off({}, w)
+assert e["GIT_CONFIG_COUNT"] == "1" and e["GIT_CONFIG_KEY_0"] == "core.hooksPath", e
+def refuses(env, wd):
+    try: m.hooks_off(env, wd)
+    except m.Stop: return True
+    return False
+assert refuses({"GIT_CONFIG_COUNT": "abc"}, w) and refuses({"GIT_CONFIG_COUNT": "-1"}, w)
+(w / "no-hooks" / "pre-push").write_text("x")
+assert refuses({}, w)
+w2 = Path(sys.argv[2] + "-arquivo"); w2.mkdir(); (w2 / "no-hooks").write_text("x")   # um ARQUIVO no lugar da pasta: não dá para criar nem ler → recusa, não traceback
+assert refuses({}, w2)
+PYEOF
+
 # ── 8. mutantes: cada guarda apagada tem de reprovar o caso que a prova ───────────────────────────────────────────────────────────────────────────
-mutant() {  # mutant NOME 'trecho' 'troca' CASO — CASO é uma função que devolve 0 se o comportamento BOM aparece
+mutant() {  # mutant NOME 'trecho' 'troca' CASO ['trecho2' 'troca2'] — CASO é uma função que devolve 0 se o comportamento BOM aparece
   # CASO tem de estar definido ANTES da chamada: função indefinida sai 127 e o harness leria "morto" sem o caso ter rodado (ga-2hd02v.4.7, gate 1)
   declare -F "$4" >/dev/null || { echo "FAIL mutante $1: o caso '$4' não está definido (definido DEPOIS da chamada, ou com o nome errado)"; fails=$((fails+1)); n=$((n+1)); return; }
   cp -p "$CITY/scripts/gate-done-remote.py" "$T/exe.good"
-  python3 -I - "$CITY/scripts/gate-done-remote.py" "$2" "$3" <<'EOF' || { echo "FAIL mutante $1: o trecho não existe mais no executável"; fails=$((fails+1)); n=$((n+1)); return; }
+  python3 -I - "$CITY/scripts/gate-done-remote.py" "$2" "$3" ${5+"$5"} ${6+"$6"} <<'EOF' || { echo "FAIL mutante $1: o trecho não existe mais no executável"; fails=$((fails+1)); n=$((n+1)); return; }
 import sys
-p, a, b = sys.argv[1:]; s = open(p).read(); assert s.count(a) == 1, "trecho ausente ou repetido"
-open(p, "w").write(s.replace(a, b))
+p, *pairs = sys.argv[1:]; s = open(p).read()
+for a, b in zip(pairs[0::2], pairs[1::2]):  # um ou dois pares trecho/troca; cada trecho tem de existir UMA vez
+    assert s.count(a) == 1, "trecho ausente ou repetido"; s = s.replace(a, b)
+open(p, "w").write(s)
 EOF
   reset_db; git --git-dir="$ORIGIN" update-ref -d "refs/heads/$BR"; mkdir -p "$T/mut"
   if "$4" >/dev/null 2>&1; then ok 1 "mutante $1 SOBREVIVEU (o caso não pegou)"; else ok 0 "mutante $1 morto"; fi
@@ -589,6 +715,25 @@ mutant ps-nao-solta-a-marca-do-no '"--unset-metadata", "gc.routed_to", "--unset-
 mutant ps-pasta-do-rig-nao-conferida 'if os.path.basename(path) != rig.name or not os.path.isdir(path):' 'if False:' case_ps_wrong_dir
 mutant ps-rota-ausente-vira-cidade 'raise Stop(f"não achei a rota do prefixo {prefix!r} em {city}/.beads/routes.jsonl ({type(e).__name__}): sem ela não sei em que loja a bead mora")' 'return Ctx(rig, city, city, f"{city}/.gc/hetzner-mirror/repos/{rig.name}.git", str(Path(city) / ".gc" / "gate-done-remote"))' case_ps_no_routes
 mutant ps-papel-desconhecido-vira-ps 'return next((p for p, r in RIGS.items() if m and r.role == m.group(1)), "ga")' 'return next((p for p, r in RIGS.items() if m and r.role == m.group(1)), "ps")' case_unknown_role
+
+# ga-2hd02v.3.10: os mutantes do desligamento do pre-push do WA (cada caso devolve 0 quando o comportamento BOM aparece)
+case_wa_happy() { reset_wa; run_wa; [ "$RC" = 0 ] && [ "$(wa_origin_has "$WABR")" = "$WASHA" ]; }
+case_wa_no_exec() { reset_wa; run_wa; [ "$RC" = 0 ] && wa_no_trace; }
+case_wa_audit_note() { reset_wa; run_wa; dbq '.beads["ga-mk1"].description' | grep -qF -- "o pre-push de whatsapp_automation NAO rodou no mini"; }
+case_wa_warn() { reset_wa; run_wa; has "$T/err" "AVISO: o pre-push de whatsapp_automation NÃO roda no mini"; }
+case_wa_cfg() { reset_wa; run_wa; grep -q '^cfg=3$' "$T/git.log"; }
+case_wa_planted() { reset_wa; mkdir -p "$CITY/.gc/gate-done-remote/no-hooks"; printf '#!/bin/sh\nexit 0\n' > "$CITY/.gc/gate-done-remote/no-hooks/pre-push"; chmod +x "$CITY/.gc/gate-done-remote/no-hooks/pre-push"
+  run_wa; r=$RC; nohooks_clear; [ "$r" = 1 ] && wa_nothing; }
+case_ps_hook_runs() { mkdir -p "$PSRIG/.repo.git/hooks"; printf '#!/bin/sh\necho "ps-hook rodou" >> "%s"\nexit 0\n' "$T/ps-hook.log" > "$PSRIG/.repo.git/hooks/pre-push"; chmod +x "$PSRIG/.repo.git/hooks/pre-push"
+  reset_ps; rm -f "$T/ps-hook.log"; run_ps; r=$RC; rm -f "$PSRIG/.repo.git/hooks/pre-push"; [ "$r" = 0 ] && has "$T/ps-hook.log" "ps-hook rodou"; }
+mutant wa-hook-ligado-no-rig-wa      'prepush=False),' '),' case_wa_happy
+mutant wa-hook-ligado-pelo-if        'if not ctx.rig.prepush:' 'if False:' case_wa_happy
+mutant wa-aposentada-checkout-e-hook 'if not ctx.rig.prepush:' 'if False:' case_wa_no_exec '"worktree", "add", "-q", "--no-checkout", "-b"' '"worktree", "add", "-q", "-b"'
+mutant wa-hook-desligado-em-todo-rig 'if not ctx.rig.prepush:' 'if True:' case_ps_hook_runs
+mutant wa-aviso-calado-no-marcador   'env["SELF_AUDIT_SUMMARY"] += f"' '_ = f"' case_wa_audit_note
+mutant wa-aviso-calado-no-cliente    'say(f"AVISO: o pre-push de' '(f"AVISO: o pre-push de' case_wa_warn
+mutant wa-pasta-sem-hooks-nao-vazia  'if found:' 'if False:' case_wa_planted
+mutant wa-config-sobrescreve-a-do-main 'n = int(env.get("GIT_CONFIG_COUNT") or "0")' 'n = int(env.get("GIT_CONFIG_COUNT") or "0") * 0' case_wa_cfg
 
 echo
 echo "$((n - fails))/$n ok, $fails falhas"

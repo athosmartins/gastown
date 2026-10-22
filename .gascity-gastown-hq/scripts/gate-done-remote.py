@@ -36,6 +36,8 @@ O QUE NÃO FAZ
   `git rev-parse HEAD` (se diferir, o `git push origin HEAD` não chegou ou veio depois: empurre e rode de novo; o gate junta marcadores do mesmo branch). Com
   argumentos o dog passa o sha e a divergência é recusada antes do marcador. Em nenhuma forma ele confere se o ref empurrado é filho do que o origin já tem:
   isso é do passo 1 do gate-done.md (nunca força).
+  Não roda o pre-push do WA (ga-2hd02v.3.10): o hook dele executa ~12 scripts da ÁRVORE empurrada (`$REPO_ROOT/scripts/check_*.py`, suítes pytest) e o worktree é sem checkout de propósito (nenhum código do nó roda no mini antes da revisão). Rig com
+  `prepush=False` na tabela RIGS (hoje só o WA) roda os blocos do gate-done.md com core.hooksPath numa pasta vazia da cidade (por ambiente; o gate-done.md e a config do rig ficam como estão), e o aviso vai ao cliente e ao `self_audit:` do marcador. HQ e PS seguem com o hook.
   Não roda a checagem "NEW READS NEED A FAILURE TEST" nem a auto-auditoria do diff (são do construtor, antes do push): o marcador registra
   `self_audit: … auto-auditoria do diff NÃO verificada aqui`, visível, não calado.
   Só os rigs da tabela RIGS (gascity, property_scrapers, whatsapp_automation; ga-2hd02v.4): o PAPEL da sessão
@@ -81,13 +83,14 @@ class Rig(NamedTuple):
     name: str      # nome do rig = nome do espelho (<cidade>/.gc/hetzner-mirror/repos/<name>.git) e da pasta do rig
     role: str      # o papel das sessões remotas que submetem DESTE rig (a parte do nome da sessão antes do sufixo)
     routes: tuple  # gc.routed_to de uma volta do gate neste rig: o pool do mini (o que o dispatcher RESTAURA ao reprovar) e o do nó
+    prepush: bool = True  # False = o pre-push do rig NÃO roda no mini (ga-2hd02v.3.10): ele executa scripts da ÁRVORE empurrada, e o worktree é sem checkout de propósito (código do nó não roda no mini antes da revisão)
 
 
 # ga-2hd02v.4: a tabela do que o atalho atende. Rig fora dela = recusa (nunca "tenta e vê").
 RIGS = {
     "ga": Rig("ga", "gascity", "dog-remote", ROUTES),
     "ps": Rig("ps", "property_scrapers", "ps-worker-remote", ("ps-worker", "ps-worker-remote")),
-    "wa": Rig("wa", "whatsapp_automation", "wa-worker-remote", ("wa-worker", "wa-worker-remote")),
+    "wa": Rig("wa", "whatsapp_automation", "wa-worker-remote", ("wa-worker", "wa-worker-remote"), prepush=False),  # medido 22/10: ~12 dos ~15 guards do pre-push do WA rodam arquivos de $REPO_ROOT (a árvore empurrada); HQ e PS seguem com o hook (PS: só um shim do bd)
 }
 ROLE_RE = re.compile(r"(dog-remote|ps-worker-remote|wa-worker-remote)(?:-|$)")  # o papel de um nome de sessão; gate-reviewer-remote e nomes de teste não casam → vale o rig do HQ, como antes
 
@@ -278,6 +281,28 @@ def release(city: str, bead: str, alias: str, marker: str, store: str = "") -> N
         print(f"bead solta: {bead} sem assignee e sem gc.routed_to", flush=True)
 
 
+def hooks_off(env: dict, work: Path) -> dict:
+    """O ambiente dos blocos do gate-done.md SEM hooks do git: core.hooksPath → uma pasta vazia da cidade (a trava mora ao lado), por GIT_CONFIG_* (a config de linha de comando vence a do repositório, que aponta para o hook do rig).
+    Em vez de editar o gate-done.md ou injetar `--no-verify` no texto dele: o push do passo 1 segue idêntico, só que sem hook, e nenhum arquivo da árvore do nó roda no mini."""
+    nohooks = work / "no-hooks"
+    # vazio (pasta sem nada) → segue; achou arquivo (um hook plantado) ou pasta que não dá para criar/ler → Stop: o pre-push alheio rodaria NO MINI antes do marcador (nada foi escrito)
+    try:
+        nohooks.mkdir(parents=True, exist_ok=True, mode=0o700)
+        found = sorted(os.listdir(nohooks))
+    except OSError as e:
+        raise Stop(f"não consegui criar/ler a pasta sem hooks {nohooks} ({type(e).__name__}): não submeto")
+    if found:
+        raise Stop(f"a pasta sem hooks {nohooks} não está vazia ({', '.join(found[:3])}): um hook plantado rodaria no mini; esvazie à mão")
+    # vazio (nenhum GIT_CONFIG_COUNT) → 0; ilegível (não é número) → Stop: sem o índice certo eu sobrescreveria a config que o main() já pôs (gc.auto, maintenance.auto)
+    try:
+        n = int(env.get("GIT_CONFIG_COUNT") or "0")
+        if n < 0:
+            raise ValueError(n)
+    except ValueError:
+        raise Stop(f"GIT_CONFIG_COUNT={env.get('GIT_CONFIG_COUNT')!r} ilegível: não sei onde acrescentar core.hooksPath")
+    return {**env, "GIT_CONFIG_COUNT": str(n + 1), f"GIT_CONFIG_KEY_{n}": "core.hooksPath", f"GIT_CONFIG_VALUE_{n}": str(nohooks)}
+
+
 def submit(city: str, ctx: Ctx, alias: str, sess: str, bid: str, sha: str, src: str, branch: str, script: str) -> int:
     repo, mirror = ctx.repo, ctx.mirror
     work = Path(city) / ".gc" / "gate-done-remote"    # a trava mora na cidade; o worktree, sob o caminho do rig (HQ: a mesma pasta de antes)
@@ -312,6 +337,10 @@ def submit(city: str, ctx: Ctx, alias: str, sess: str, bid: str, sha: str, src: 
             raise Stop(f"o worktree ficou em {head[:12]!r}, não em {sha[:12]}")
         env = {**os.environ, "GC_CITY_PATH": city, "GC_ALIAS": os.environ.get("GC_ALIAS", alias), "GIT_TERMINAL_PROMPT": "0",
                "SELF_AUDIT_SUMMARY": f"submetido pelo atalho remoto (gate-done-remote.py) em nome de {alias}, sessão {sess}, ref {src}, sha {sha[:12]}; auto-auditoria do diff NAO verificada aqui"}
+        if not ctx.rig.prepush:  # o aviso vai ao cliente E ao marcador (self_audit:, o que o revisor do gate lê): pular o hook nunca fica calado
+            env = hooks_off(env, work)
+            env["SELF_AUDIT_SUMMARY"] += f"; ATENCAO: o pre-push de {ctx.rig.name} NAO rodou no mini (executaria codigo do no antes da revisao): os guards dele nao foram verificados"
+            say(f"AVISO: o pre-push de {ctx.rig.name} NÃO roda no mini (ele executaria scripts da árvore do nó antes da revisão); o marcador registra isso em self_audit")
         SCRIPT_RAN[0] = True
         p = subprocess.run(["bash", "-c", script], cwd=wt, env=env, stdout=subprocess.PIPE, text=True, errors="replace")  # o stderr do script segue direto ao cliente
         print(p.stdout, end="", flush=True)
