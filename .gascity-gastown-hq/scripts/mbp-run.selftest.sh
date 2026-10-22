@@ -566,7 +566,7 @@ reset; "$RUN" --go --check >"$T/out" 2>"$T/err"; expect "--go com --check: 97 (u
 reset; "$RUN" --go --seed wa >"$T/out" 2>"$T/err"; expect "--go com --seed: 97" 97 "$?"; hasnt "--go com --seed: nada foi falado com o MBP" "$STUB_LOG" 'SEED|RSYNC|HOSTCALL'
 reset; "$RUN" --host linux --exec --go -- "$T/bin/gocmd" >"$T/out" 2>"$T/err"; expect "--host linux --exec --go: 97 (o nó não roda --exec)" 97 "$?"
 # erro de configuração dentro do MBP: sem o espelho, rc 97
-reset; rmdir "$T/home/gt-remote/mirror/wa-1"; rc=$(STUB_RUNMODE=exec runs -- tests/test_x.py); expect "espelho ausente: rc 97 (como antes)" 97 "$rc"; mkdir -p "$T/home/gt-remote/mirror/wa-1"
+reset; find "$T/home/gt-remote/mirror/wa-1" -delete; rc=$(STUB_RUNMODE=exec runs -- tests/test_x.py); expect "espelho ausente: rc 97 (como antes)" 97 "$rc"; mkdir -p "$T/home/gt-remote/mirror/wa-1"
 
 reset
 }
@@ -831,7 +831,7 @@ LEAKS="x.duckdb lib/leak.duckdb tests/fixtures/y.duckdb tests/y.db .env lib/.env
 # a classe que o gate achou (14/10): credencial com nome que nenhuma denylist conhecia + formato/pasta que nenhuma lista previa
 # a classe da 2ª revisão (14/10): arquivo de NOME NEUTRO com dado de cliente dentro, em pasta que a lista por extensão deixava sair; e o que TEM que chegar (config por caminho + código)
 NEUTRAL="docs/auto_response/ab_results/cycle1_new_rules_200.json scripts/campanhas_aprovar_enriquecer_estado.json docs/pix_verdicts/pix_verdicts.json analysis/numero_certo/results/baseline.json scripts/peter/mrv_bh/socios_cache.json state.json config.json hex_cells/fixtures/status.json daemons/static/map_viewer/piloto3d.json docs/relatorio.md docs/page.html processo_lookup/consulta.html lib/export.sql scripts/export.sql assets/warming_docs/pool.json lib/README.md lib/export.html"
-OKCFG="lib/changelog.d/a.json lib/silence.yml daemons/deploy_deps.json daemons/restart_policy.yaml daemons/anuncios/changelog.d/app/c.json templates/auto_responses/a.json templates/pregao.html daemons/templates/d.html migrations/0001.sql launchd/l.plist deploy/d.plist daemons/launchd/dl.plist scripts/s.plist pytest.ini CLAUDE.md AGENTS.md docs/superpowers/runbooks/job-agendado-veredito-alerta.md viewer/app.js viewer/x.mjs lib/x.ts lib/style.css"
+OKCFG="lib/changelog.d/a.json lib/silence.yml daemons/deploy_deps.json daemons/restart_policy.yaml daemons/anuncios/changelog.d/app/c.json templates/auto_responses/a.json templates/pregao.html daemons/templates/d.html migrations/0001.sql launchd/l.plist deploy/d.plist daemons/launchd/dl.plist scripts/s.plist pytest.ini requirements.txt CLAUDE.md AGENTS.md docs/superpowers/runbooks/job-agendado-veredito-alerta.md viewer/app.js viewer/x.mjs lib/x.ts lib/style.css"
 # o CONTEÚDO que o node_guard olha: LISTA de telefones/CPFs fica no mini mesmo em nome e pasta liberados (HELDF); 3 números, ou 32 de cauda sintética, passam (PASSF)
 HELDF="lib/leads_list.py lib/changelog.d/dump.json tests/fixtures/cpfs.json"; PASSF="lib/few.py lib/synthetic.py"
 LEAKS="$LEAKS processo_lookup/.pdpj_token.txt .netrc lib/.pgpass token.txt lib/api_token lib/access_token.json service_account.json secrets.json lib/app.keystore lib/token.pickle lib/GOOGLE_TOKEN.json lib/Secrets.YAML tests/fixtures/token.json tests/fixtures/.token tests/fixtures/secrets.yaml lib/dump.zip lib/leads.ndjson lib/notes.txt lib/shot.png run.log .runtime/s.json witness/s.json docs/mrv_artifacts/mrv_decisores.json lib.bak-1/a.py .gc-worktrees/wa-x/lib/a.py .worktrees/wa-y/lib/a.py"
@@ -971,7 +971,13 @@ reset; run -- tests/test_x.py >/dev/null; has "espelho do MBP: clone APFS (cp -c
 reset; date > "$NODEFLAG"; run -- tests/test_x.py >/dev/null; has "job do nó: PATH com ~/.local/bin (uv)" "$(lsf RUN hetzner)" 'export PATH="\$HOME/.local/bin:\$PATH"'; has "job do nó: o python é o venv-wa" "$(lsf RUN hetzner)" 'gt-remote/venv-wa/bin/python'
 has "job do nó: nice (o taskpolicy do macOS não existe lá)" "$(lsf RUN hetzner)" 'nice -n'; hasnt "job do nó: sem a biblioteca de presença do macOS (ioreg)" "$(lsf RUN hetzner)" 'ioreg'
 has "job do nó: presença dedicada/livre" "$(lsf RUN hetzner)" 'PR_WHY=dedicada'
+hasnt "job do nó: sem o node@22 do Homebrew (no Linux ele não existe; o node do nó vem do hetzner-nodejs.sh)" "$(lsf RUN hetzner)" 'node@22'
+has "job do nó: cria logs/ no espelho (o filtro deixa logs/ no mini; teste que abre logs/x.log dava FileNotFoundError, vermelho falso)" "$(lsf RUN hetzner)" 'return 97; mkdir -p logs'
 reset; run -- tests/test_x.py >/dev/null; has "job do MBP: PATH do Homebrew (como sempre)" "$(lsf RUN mbp)" '/opt/homebrew/bin'; has "job do MBP: a biblioteca de presença" "$(lsf RUN mbp)" 'ioreg'
+# ga-00unl0: o `node` padrão do Homebrew do mini (25.x) não abre (falta libsimdjson.33.dylib) e o `shutil.which("node")` dos testes o achava primeiro: 19 vermelhos falsos do ps em 3 dias; o node@22 abre
+has "job do MBP: o node@22 do Homebrew vem ANTES do node padrão (o 25 não abre: libsimdjson)" "$(lsf RUN mbp)" 'export PATH=/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:'
+has "job do MBP: o /opt/homebrew/bin segue no PATH (git, python, uv… como sempre)" "$(lsf RUN mbp)" 'node@22/bin:/opt/homebrew/bin:\$PATH'
+has "job do MBP: cria logs/ no espelho (rsync não leva /logs; teste que abre logs/x.log dava FileNotFoundError)" "$(lsf RUN mbp)" 'return 97; mkdir -p logs'
 
 # opção que pede valor, na última posição: o laço de argumentos avança (antes `shift 2` falhava e girava para sempre)
 for opt in --host --repo --dir; do timeout 10 "$RUN" $opt >/dev/null 2>&1; rc=$?; if [ $rc -ne 124 ]; then ok "$opt como ÚLTIMO argumento termina (rc=$rc), não gira"; else bad "$opt como último argumento girou até o timeout"; fi; done
@@ -1096,6 +1102,9 @@ reset; date > "$NODEFLAG"; : > "$MACONLY"; printf 'tests/test_x.py\n' > "$LEARNE
 reset; date > "$NODEFLAG"; chmod 000 "$MACONLY"; run -- tests/test_x.py >/dev/null; has "lista estática ilegível (sem permissão): o nó NÃO é usado" "$J" '"reason":"mac-only-ilegivel"'; hasnt "…nenhuma chamada ao nó" "$STUB_LOG" 'HOSTCALL:hetzner'; chmod 644 "$MACONLY"
 reset; date > "$NODEFLAG"; rc=$(HETZNER_MAC_ONLY_LIST="$T/nao-existe.txt" run -- tests/test_x.py); expect "lista estática AUSENTE: o nó NÃO é usado, cai no MBP" 0 "$rc"; has "…motivo" "$J" '"reason":"mac-only-ilegivel"'
 reset; date > "$NODEFLAG"; : > "$MACONLY"; rc=$(run -- tests/test_x.py); has "lista vazia é válida (nenhum glob casa): vai ao nó" "$J" '"host":"hetzner"'
+# ga-00unl0: a lista REAL (não a de teste): o ratchet de timeout lê os plists do launchd do mini; no nó dava vermelho falso a cada gate com um plist novo
+reset; date > "$NODEFLAG"; HETZNER_MAC_ONLY_LIST="$HERE/hetzner-mac-only.txt" run -- tests/test_launchd_timeout_ratchet.py >/dev/null; has "lista REAL: test_launchd_timeout_ratchet.py é mac-only (vai ao MBP, não ao nó)" "$J" '"reason":"mac-only"'; hasnt "…nada vai ao nó" "$STUB_LOG" 'HOSTCALL:hetzner'
+reset; date > "$NODEFLAG"; HETZNER_MAC_ONLY_LIST="$HERE/hetzner-mac-only.txt" run -- tests/test_x.py >/dev/null; has "lista REAL: um teste comum segue indo ao nó (a entrada nova não é um coringa)" "$J" '"host":"hetzner"'
 reset; : > "$MACONLY"; mc=$("$RUN" --host linux --check 2>/dev/null | sed -n 's/^node_mac_only_rc=//p'); eq "--check: lista vazia = rc 1 (nenhum alvo)" 1 "$mc"; chmod 000 "$MACONLY"; mc=$("$RUN" --host linux --check 2>/dev/null | sed -n 's/^node_mac_only_rc=//p'); eq "--check: lista ilegível = rc 2" 2 "$mc"; chmod 644 "$MACONLY"
 
 # ===== paralelismo (xdist) =====

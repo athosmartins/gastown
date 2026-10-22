@@ -31,7 +31,7 @@ tests/test_inbound_ungrounded_ask_wa_97scg.py
 tests/test_painel_visibilidade.py
 tests/test_warming_engine.py
 
-# ASSERT (16): launchd/plist/launchctl, python do Homebrew (/opt/homebrew/bin/python3), PATH do mini ou binário do macOS: o comportamento testado é o do macOS
+# ASSERT (17): launchd/plist/launchctl, python do Homebrew (/opt/homebrew/bin/python3), PATH do mini ou binário do macOS: o comportamento testado é o do macOS
 tests/test_area_por_fracao_wa_tch5r.py
 tests/test_ban_risk_monitor_launch_path_wa_646bd.py
 tests/test_build_ficha360_search_index_wa_598mf.py
@@ -41,6 +41,7 @@ tests/test_fleet_quiet_hold_wa_zqed1.py
 tests/test_inbound_writers_chat_id_dedup.py
 tests/test_iptu_bh_sweep_wrapper.py
 tests/test_launchd_auto_reinstall_path.py
+tests/test_launchd_timeout_ratchet.py
 tests/test_lotes_rebuild_pix_atributos_step_wa_wcux2.py
 tests/test_painel_regate_wa_8v3nb.py
 tests/test_pbh_edificacao_scrape_wrapper.py

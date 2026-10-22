@@ -134,6 +134,7 @@
 + /daemons/launchd/*.plist
 + /scripts/*.plist
 + /pytest.ini
++ /requirements.txt
 + /CLAUDE.md
 + /AGENTS.md
 + /docs/superpowers/runbooks/job-agendado-veredito-alerta.md

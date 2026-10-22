@@ -1154,8 +1154,9 @@ EOF
   xn=$(node_xdist_n "$@")
   if [ -n "$xn" ]; then set -- -n "$xn" "$@"; say "xdist: $xn workers (núcleos do nó / baterias em curso)"; fi
   qargs=$(printf '%q ' "$@")
+  # node@22 na frente: o `node` padrão do Homebrew do mini (25.x) não abre (falta libsimdjson.33.dylib) e o shutil.which("node") dos testes o achava primeiro — vermelho falso do ps (ga-00unl0); sem o node@22 instalado o diretório só não existe no PATH
   if [ "$HOSTKIND" = linux ]; then pathline='export PATH="$HOME/.local/bin:$PATH" PYTHONDONTWRITEBYTECODE=1'
-  else pathline='export PATH=/opt/homebrew/bin:$PATH PYTHONDONTWRITEBYTECODE=1'; fi
+  else pathline='export PATH=/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:$PATH PYTHONDONTWRITEBYTECODE=1'; fi
   [ -z "$ISO" ] || pathline="$pathline"$'\n''[ -x "$HOME/gt-remote/bin/gt-iso-run" ] || { echo "GTN-ISO: inerte wrapper-ausente (~/gt-remote/bin/gt-iso-run)"; exit 97; }'
   if [ "$KIND" = selftest ]; then
   # hq: `bash <x>.selftest.sh` no espelho do slot; identidade git fixa porque muito selftest cria repositório temporário e o nó não tem ~/.gitconfig
@@ -1166,9 +1167,10 @@ job() { cd "\$HOME/$M" || return 97; \$MBP_BG nice -n "\$MBP_NICE" ${ISO}bash $q
 mbp_supervise job
 EOF
   else
+  # mkdir -p logs: o rsync não leva /logs (nem o filtro do nó) e o import de daemons/admin_dashboard.py abre logs/admin_dashboard.log — sem a pasta o ARQUIVO de teste nem coleta (vermelho falso, ga-00unl0)
   IFS= read -r -d '' JOBDEF <<EOF || true
 $pathline
-job() { cd "\$HOME/$M" || return 97; \$MBP_BG nice -n "\$MBP_NICE" ${ISO}"\$HOME/gt-remote/$rv/bin/python" -m pytest -p no:cacheprovider $qargs; }
+job() { cd "\$HOME/$M" || return 97; mkdir -p logs; \$MBP_BG nice -n "\$MBP_NICE" ${ISO}"\$HOME/gt-remote/$rv/bin/python" -m pytest -p no:cacheprovider $qargs; }
 mbp_supervise job
 EOF
   fi

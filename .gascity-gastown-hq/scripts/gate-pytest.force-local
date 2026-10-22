@@ -7,3 +7,9 @@
 #   O wrapper já manda para cá sozinho todo arquivo que cita shared/data, e confere aqui todo vermelho/pulado do MBP — esta
 #   lista só poupa a ida e volta de um arquivo que já se sabe ambiente-dependente. O glob casa o caminho relativo ao worktree,
 #   ex.: tests/test_algo_que_le_config.py ou tests/integration/*
+
+# ga-00unl0 — conferem o /Users/athos/shared/config/chip_features.json DO MINI (o flag ligado em produção; CHIP_FEATURES_PATH padrão). No MBP e no nó o arquivo
+#   não existe e o teste *_real_config_on_and_excludes_a10 reprovava (7 vermelhos falsos em 3 dias, todos "isolado-passou"). O resto dos dois arquivos é hermético e
+#   rápido: ficar aqui custa segundos.
+tests/test_warming_mesh_group_lane.py
+tests/test_warming_channels_lane.py

@@ -349,6 +349,14 @@ hasnt "lista sem newline final: sem MBP" "$STUB_LOG" 'MBP_CALL'; has "lista sem 
 reset; printf '# c\r\ntests/test_b.py\r\n' > "$T/force-local.txt"; rc=$(run -- tests/test_b.py -q); expect "lista: linhas CRLF" 0 "$rc"; hasnt "lista CRLF: sem MBP" "$STUB_LOG" 'MBP_CALL'
 reset; printf '   tests/test_b.py  \n' > "$T/force-local.txt"; rc=$(run -- tests/test_b.py -q); expect "lista: espaço sobrando em volta" 0 "$rc"; hasnt "lista com espaço: sem MBP" "$STUB_LOG" 'MBP_CALL'
 reset; printf 'tests/test_a.py\ntests/test_zzz.py' > "$T/force-local.txt"; mbp_out "1 passed in 0.1s"; rc=$(run -- tests/test_b.py -q); expect "lista sem newline: o que não casa continua indo ao MBP" 0 "$rc"; has "lista sem newline: o outro alvo vai ao MBP" "$STUB_LOG" 'MBP_CALL'
+# ga-00unl0: a lista REAL (não a do $T). Os dois testes *_real_config_on_and_excludes_a10 do WA conferem o /Users/athos/shared/config/chip_features.json DO MINI
+#   (o flag ligado em produção): no MBP e no nó o arquivo não existe e eles reprovavam (7 vermelhos falsos em 3 dias, todos "isolado-passou"). Ficam aqui.
+for lt in tests/test_warming_mesh_group_lane.py tests/test_warming_channels_lane.py; do
+  : > "$T/wt/$lt"   # alvo que não abre fica aqui por OUTRO motivo (alvo-ilegivel) e esconderia a lista: o arquivo tem de existir no worktree do stub
+  reset; rc=$(GATE_PYTEST_FORCE_LOCAL_LIST="$HERE/gate-pytest.force-local" run -- "$lt" -q); expect "lista REAL: $lt fica aqui" 0 "$rc"
+  hasnt "lista REAL: $lt sem MBP" "$STUB_LOG" 'MBP_CALL'; has "lista REAL: $lt motivo" "$LOG" "lista-local:$lt"
+done
+reset; mbp_out "1 passed in 0.1s"; rc=$(GATE_PYTEST_FORCE_LOCAL_LIST="$HERE/gate-pytest.force-local" run -- tests/test_a.py -q); expect "lista REAL: um teste fora dela continua indo ao MBP" 0 "$rc"; has "lista REAL: o outro alvo vai ao MBP" "$STUB_LOG" 'MBP_CALL'
 # a lista é O remédio do verde vazio: lista AUSENTE ou ilegível não é "lista vazia". Não dá para saber o que deveria ficar aqui → nada vai ao MBP, e a falta é DITA.
 reset; mbp_out "1 passed in 0.1s"; rc=$(GATE_PYTEST_FORCE_LOCAL_LIST="$T/nao-existe.txt" run -- tests/test_a.py -q); expect "lista force-local ausente: roda aqui" 0 "$rc"
 hasnt "lista ausente: sem MBP" "$STUB_LOG" 'MBP_CALL'; has "lista ausente: motivo no log" "$LOG" 'lista-force-local-ilegivel'; has "lista ausente: o AVISO diz qual lista" "$T/out" 'AVISO: .*force-local.*nao-existe.txt'
