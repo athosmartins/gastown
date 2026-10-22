@@ -45,7 +45,7 @@
 #   erro de ssh, flock, "tmux sem acesso" tolerado como "sem servidor", o `has` que engole o erro do tmux, melhor esforço da sessão
 #   ausente, o stop que não confere que a sessão sumiu, e o portão (sem a liberação, liberação de qualquer tipo, nome de teste frouxo ou sem
 #   âncora, sem conferir o sha do guarda, sem rodar o --selfcheck, script do host que sai 0, guarda irmão ilegível), e a regra de presença do MBP (grupo mbp: guarda de /Users/, validação da config, recusa/pausa/slot_cap, vigia, PATH extra,
-#   registro de sessões do list-running); 135 mutantes no total (3 do grupo abort: a marca <nome>.stop do stop, ga-0k82lw — o stop não a grava, o preparo do start não a apaga, a 2ª chamada não olha para ela; 20 do grupo lr: o cache nunca lido, start sem invalidar antes / depois, stop sem invalidar, gravação sem conferir a geração, prazo e relógio, geração e forma do arquivo, dry-run, list_cache_s em cinco formas, geração ilegível ou ausente, registro acertado com lista do cache, falha ao invalidar derrubando o start; 26 do grupo wt: wt-add/wt-rm do provider, o guarda DEPOIS do wt-add, o recolhimento só do que não perde trabalho e os nomes do engine; 9 do ambiente limpo da sessão, grupo mbp: session_env, ZDOTDIR, PATH explícito e claude absoluto, ga-w7qwl1.1.5).
+#   registro de sessões do list-running); 137 mutantes no total (5 do grupo abort: a marca <nome>.stop do stop, ga-0k82lw — o stop não a grava, o preparo do start não a apaga, a 2ª chamada não olha para ela, o stop não poda as marcas antigas (> 24 h), a poda sem limite de idade leva a marca recém-gravada; 20 do grupo lr: o cache nunca lido, start sem invalidar antes / depois, stop sem invalidar, gravação sem conferir a geração, prazo e relógio, geração e forma do arquivo, dry-run, list_cache_s em cinco formas, geração ilegível ou ausente, registro acertado com lista do cache, falha ao invalidar derrubando o start; 26 do grupo wt: wt-add/wt-rm do provider, o guarda DEPOIS do wt-add, o recolhimento só do que não perde trabalho e os nomes do engine; 9 do ambiente limpo da sessão, grupo mbp: session_env, ZDOTDIR, PATH explícito e claude absoluto, ga-w7qwl1.1.5).
 #   Mais: contra um stub que só sai 0, quase tudo falha.
 # VARIÁVEIS: GCSSH_UNDER_TEST (script a testar) · GCSSH_ONLY (grupos separados por vírgula) · GCSSH_NO_MUTANTS=1 · GCSSH_MUTANTS_ONLY=<grupo> (pula os casos e roda só os mutantes desse grupo)
 set -u
@@ -900,6 +900,8 @@ g_abort() {  # ga-0k82lw: o start que o mini ABANDONOU (prazo do provider estour
   cfg 3; slowhost 0; fresh  # controle: um stop de ANTES de um start novo do mesmo nome (a marca ficou no host) não o impede: o preparo da 1ª chamada apaga a marca
   pv stop abort-4 </dev/null; pv start abort-4 < <(req cat); [ $RC = 0 ] && [ "$(count)" = 1 ]; ok $? "abort: (controle) stop e depois um start novo do mesmo nome abre a sessão (rc=$RC, tmux: $(count))"
   pv stop abort-4 </dev/null
+  cfg 3; slowhost 0; fresh; mkdir -p "$RR/run"; : > "$RR/run/old-x.stop"; touch -t 202001010000 "$RR/run/old-x.stop"  # a marca de um stop de anos atrás: ninguém mais a apagaria
+  pv stop abort-5 </dev/null; [ $RC = 0 ] && [ ! -e "$RR/run/old-x.stop" ] && [ -e "$RR/run/abort-5.stop" ]; ok $? "abort: o stop poda a marca .stop antiga (> 24 h) e mantém a que acabou de gravar (rc=$RC)"
   cfg 3; slowhost 2; fresh
   pv start abort-3 < <(req cat); ok $RC "abort: (controle) start lento mas dentro do prazo abre a sessão (rc=$RC $(head -c 160 "$T/err"))"
   [ "$(count)" = 1 ]; ok $? "abort: (controle) ...e ela está no host (tmux: $(count))"
@@ -1055,6 +1057,8 @@ if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails 
   mutant abort "stop não grava a marca <nome>.stop" 's/mkdir -p @RUN@ && : > @RUN@\/@NAME@\.stop/true/'
   mutant abort "1ª chamada do start não apaga a marca (um stop antigo trava o start novo)" 's/^    prep_body = """rm -f @STOPF@$/    prep_body = """true/'
   mutant abort "2ª chamada do start não olha a marca (abre depois do stop)" 's/^\[ ! -e @STOPF@ \] || .*$/true/'
+  mutant abort "stop não poda as marcas .stop antigas (elas se acumulam para sempre)" 's/^find @RUN@ -maxdepth 1 -name .*\.stop. -mmin +1440 .*$/true/'
+  mutant abort "a poda não tem limite de idade (leva a marca que o stop acabou de gravar)" 's/ -mmin +1440//'
   [ -n "${GCSSH_MUTANTS_ONLY:-}" ] || {
   echo "-- contra um stub que só sai 0 (a versão 'anterior' não tinha provider nenhum)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"

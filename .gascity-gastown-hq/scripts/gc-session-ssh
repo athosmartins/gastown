@@ -839,7 +839,10 @@ T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após
 
 def op_stop(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     # a marca `<nome>.stop` é para o start que ainda PREPARA este nome (ga-0k82lw): o stop que chega nessa hora não acha sessão e volta 0, e a 2ª chamada do start vê a marca e desiste em vez de abrir a tmux depois do close
+    # O nome de sessão é único por bead e não volta, então ninguém mais apagaria a marca: o stop poda as de mais de 24 h (o preparo de um start dura minutos), depois de gravar a sua, que tem idade 0 e fica.
+    # vazio (nenhuma marca velha) → nada a podar; falhou (find sem permissão ou sem a opção) → o stop segue sem podar, e a marca velha só ocupa um inode
     body = """mkdir -p @RUN@ && : > @RUN@/@NAME@.stop
+find @RUN@ -maxdepth 1 -name '*.stop' -mmin +1440 -exec rm -f {} + 2>/dev/null
 has @NAME@; [ $? -ne 2 ] || exit 1
 pp=$(T list-panes -t @PTGT@ -F '#{pane_pid}' 2>/dev/null | head -1); pids=
 [ -z "$pp" ] || pids=$(tree "$pp")
