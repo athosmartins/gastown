@@ -15,10 +15,12 @@ USO
   gc-session-ssh gate <host>      (não é do protocolo do engine) o veredito de um start AGORA nesse host, sem abrir nada: JSON, exit 0/1
 
 O QUE FAZ
-  Cada operação é UM ssh (ControlMaster em ~/.ssh/cm, o mesmo do mbp-run.sh) que leva um script sh pela entrada padrão; o
-  script usa um tmux em socket próprio (`tmux -L <socket>`), então só as sessões deste provider existem lá. A saída vem entre
-  marcadores: ruído de .bashrc não vira dado e resposta cortada é erro, não "lista vazia".
-  start: confere o teto do host (`cap`) e a existência NO MESMO script que abre a sessão, sob flock no mini; reescreve os caminhos do
+  Cada operação é UM ssh (ControlMaster em ~/.ssh/cm, o mesmo do mbp-run.sh) que leva um script sh pela entrada padrão (o start são
+  DOIS, ver abaixo); o script usa um tmux em socket próprio (`tmux -L <socket>`), então só as sessões deste provider existem lá. A saída
+  vem entre marcadores: ruído de .bashrc não vira dado e resposta cortada é erro, não "lista vazia".
+  start (DUAS chamadas ssh sob o mesmo flock, ga-0k82lw): a 1ª confere o teto do host (`cap`) e a existência, cria o worktree, prepara e
+  deixa o lançador, SEM abrir tmux; a 2ª só abre (new-session + conferência). O host não percebe que o mini desistiu (ssh com ControlMaster
+  não fecha o canal do script): provider morto ou com prazo estourado na parte lenta = nenhuma tmux no nó. Reescreve os caminhos do
   mini para os do host com as MESMAS regras do remote-bundle-build.py (cidade → <remote_root>/city, ~/gt → <remote_root>/work, home →
   remote_home, e <cidade>/.gc/settings.json → <remote_root>/city/settings.json, onde o bundle o instala); passa o comando como veio
   (--settings, --dangerously-skip-permissions, --model, --remote-control...; o lançador de pool do mini, claude-ctxcap-ab.sh ou claude-lowprio.sh,
