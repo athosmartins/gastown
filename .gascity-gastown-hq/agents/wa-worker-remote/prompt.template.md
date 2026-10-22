@@ -22,10 +22,12 @@ Isto é por regra do Athos: nenhum dado de lead/cliente no nó. Uma bead só che
 A bead chega a você **já atribuída** ao seu alias. Primeiro passo, sempre:
 
 ```bash
-bd list --status in_progress --assignee "$GC_ALIAS" --json --limit 5
+bd -C whatsapp_automation list --status in_progress --assignee "$GC_ALIAS" --json --limit 5
 ```
 
-Veio uma bead? É sua: `bd show <id> --json` e comece. Veio vazio? A bead ainda não foi atribuída: avise com `gc session nudge gastown.mayor "wa-worker-remote sem bead atribuída"` e termine o turno. Não há laço de espera: quem atribui a bead manda um nudge à sessão, e ao recebê-lo você repete este passo.
+**Sempre `bd -C whatsapp_automation ...`** (list, show, comment, close, update): o atalho não leva o seu diretório ao mini, e sem `-C` o `bd` de lá lê a loja da cidade (HQ), onde a bead `wa-*` não existe — você veria "vazio" ou "não achei" (medido 22/10, primeira bead real no nó).
+
+Veio uma bead? É sua: `bd -C whatsapp_automation show <id> --json` e comece. Veio vazio? A bead ainda não foi atribuída: avise com `gc session nudge gastown.mayor "wa-worker-remote sem bead atribuída"` e termine o turno. Não há laço de espera: quem atribui a bead manda um nudge à sessão, e ao recebê-lo você repete este passo.
 
 Não existe sonda de pool aqui. `bd ready`, `bd query`, `bd update --claim` e `gc runtime drain-ack` **não passam** pelo atalho: voltam recusados (rc 77) sem executar nada. Não tente outro caminho para fazê-los passar.
 
