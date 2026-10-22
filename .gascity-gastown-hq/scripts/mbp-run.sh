@@ -1154,8 +1154,9 @@ EOF
   xn=$(node_xdist_n "$@")
   if [ -n "$xn" ]; then set -- -n "$xn" "$@"; say "xdist: $xn workers (núcleos do nó / baterias em curso)"; fi
   qargs=$(printf '%q ' "$@")
+  # NODE_PATH só no nó (ga-yoyyj1): teste do WA que faz require('jsdom') num node sem NODE_PATH acha o módulo no node_modules do repositório do mini; no nó ele mora em ~/.local/share/cdp-drive (hetzner-nodejs.sh install jsdom). Pasta ausente é inofensiva: o node ignora a entrada.
   # node@22 na frente: o `node` padrão do Homebrew do mini (25.x) não abre (falta libsimdjson.33.dylib) e o shutil.which("node") dos testes o achava primeiro — vermelho falso do ps (ga-00unl0); sem o node@22 instalado o diretório só não existe no PATH
-  if [ "$HOSTKIND" = linux ]; then pathline='export PATH="$HOME/.local/bin:$PATH" PYTHONDONTWRITEBYTECODE=1'
+  if [ "$HOSTKIND" = linux ]; then pathline='export PATH="$HOME/.local/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 NODE_PATH="$HOME/.local/share/cdp-drive/node_modules"'
   else pathline='export PATH=/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:$PATH PYTHONDONTWRITEBYTECODE=1'; fi
   [ -z "$ISO" ] || pathline="$pathline"$'\n''[ -x "$HOME/gt-remote/bin/gt-iso-run" ] || { echo "GTN-ISO: inerte wrapper-ausente (~/gt-remote/bin/gt-iso-run)"; exit 97; }'
   if [ "$KIND" = selftest ]; then

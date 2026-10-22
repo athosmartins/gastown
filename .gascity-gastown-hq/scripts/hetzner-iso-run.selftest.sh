@@ -83,6 +83,7 @@ case_canary() { local m
   GT_NETNS_HELPER="$T/nao-existe" go "$1" --canary; ck "helper ausente: inerte helper-ausente" has "$OUT" '^GTN-ISO: inerte helper-ausente'; ck "helper ausente: rc 97" rcis 97; }
 case_run() { CMD_RC=5 go "$1" -- python -m pytest tests/ -n 14
   ck "isolado: o comando roda e o rc dele é o do wrapper" rcis 5; ck "isolado: ambiente do comando (workers, semente, plugin)" has "$CALLS" "^CMD: WA_PYTEST_MAX_WORKERS=14 PYTHONHASHSEED=0 PYTHONPATH=$T/home/gt-remote/bin PATH=.* python -m pytest tests/ -n 14$"
+  ck "isolado: o NODE_PATH do jsdom do nó chega ao comando (ga-yoyyj1)" has "$CALLS" "^CMD: .* NODE_PATH=$T/home/.local/share/cdp-drive/node_modules python -m pytest"
   GTN_WORKERS=4 go "$1" -- true; ck "GTN_WORKERS troca o número de workers" has "$CALLS" 'WA_PYTEST_MAX_WORKERS=4 '
   PROBE_MODE=leak go "$1" -- touch /tmp/NUNCA; ck "vazou: o comando NÃO roda" nocalls; ck "vazou: rc 97" rcis 97
   CNT=0 go "$1" -- true; ck "contador zerado: o comando NÃO roda" nocalls
@@ -108,6 +109,7 @@ mutant W3-rc-da-sonda-ignorado 's/^  \[ \$rc -eq 0 \] || inert.*$/  true/' canar
 mutant W4-helper-ausente-nao-checado 's/^  \[ -x "\$HELPER" \] || inert.*$/  true/' canary
 mutant W5-comando-sem-canario 's/^canary$/true/' run
 mutant W6-sem-semente-de-hash 's/ PYTHONHASHSEED=0//' run
+mutant W7-sem-node-path 's/ NODE_PATH="\$HOME\/\.local\/share\/cdp-drive\/node_modules"//' run
 mutant P1-sonda-sem-segredo 's/^if sec: leak.append.*$/pass/' probe
 mutant P2-sonda-sem-dns 's/; leak.append("dns")/; pass/' probe
 mutant P3-sonda-sem-interface 's/^if bad: leak.append.*$/pass/' probe

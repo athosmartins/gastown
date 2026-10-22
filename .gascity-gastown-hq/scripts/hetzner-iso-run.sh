@@ -63,4 +63,5 @@ canary
 # WA_PYTEST_MAX_WORKERS: sem ele o conftest do WA limita o xdist a 2 workers (wa-9c620); 14 x ~1 GB cabem nos 30 GB do nó.
 # PYTHONHASHSEED=0: a ordem de parametrização por set é a mesma em todos os workers (medido: com semente aleatória duas coletas diferem na ordem de um teste de launchd).
 # PYTHONPATH: onde está o plugin gtn_stable_ids (ids com relógio dentro; o pytest o carrega com `-p gtn_stable_ids`, passado por quem chama).
-exec sudo -n "$HELPER" -- WA_PYTEST_MAX_WORKERS="${GTN_WORKERS:-14}" PYTHONHASHSEED=0 PYTHONPATH="$HOME/gt-remote/bin" PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" "$@"
+# NODE_PATH (ga-yoyyj1): onde o hetzner-nodejs.sh põe o jsdom. O mbp-run.sh a exporta no job, mas o sudo e o env -i do helper a descartariam; sem repassá-la, teste que chama o node sem NODE_PATH não acha o módulo na bateria noturna.
+exec sudo -n "$HELPER" -- WA_PYTEST_MAX_WORKERS="${GTN_WORKERS:-14}" PYTHONHASHSEED=0 PYTHONPATH="$HOME/gt-remote/bin" PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" NODE_PATH="$HOME/.local/share/cdp-drive/node_modules" "$@"

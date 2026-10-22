@@ -1,12 +1,25 @@
-# hetzner-nodejs.pin — a versão do Node.js que o nó Linux (aarch64) tem em ~/.local. DADO, não código: scripts/hetzner-nodejs.sh lê as duas linhas KEY=valor abaixo por grep (nunca `source`).
+# hetzner-nodejs.pin — o que o nó Linux (aarch64) tem em nível de usuário: o Node.js em ~/.local e o jsdom em ~/.local/share. DADO, não código: scripts/hetzner-nodejs.sh lê as linhas KEY=valor abaixo por grep (nunca `source`).
 #
 # Contents
-#   De onde vem o hash · Como atualizar
+#   De onde vem o hash · Como atualizar · jsdom: por que aqui, versão e lock · jsdom: como atualizar
 #
 # DE ONDE VEM O HASH (conferido em 21/10/2026, ga-2hd02v.4.9): linha `node-v22.22.3-linux-arm64.tar.xz` do SHASUMS256.txt de https://nodejs.org/dist/v22.22.3/. O SHASUMS256.txt foi autenticado com a assinatura
 #   destacada (SHASUMS256.txt.sig) E com a clearsigned (SHASUMS256.txt.asc): as duas deram GOODSIG/VALIDSIG da chave CC68F5A3106FF448322E48ED27F5E38D5B0A215F (Marco Ippolito), que consta em
 #   nodejs/release-keys (keys.list) e no README do nodejs/node. A versão é a mesma que roda no mini (v22.22.3): teste no nó significa o mesmo que no mini. O nó é aarch64 (linux-arm64), não x64.
 # COMO ATUALIZAR: baixe SHASUMS256.txt e a assinatura da versão nova, confira a assinatura (gpg --verify) com a chave do release-keys, copie SÓ a linha linux-arm64.tar.xz para cá, troque as DUAS linhas
 #   de uma vez, rode `bash scripts/hetzner-nodejs.selftest.sh` e depois `bash scripts/hetzner-nodejs.sh install`. A versão antiga continua em ~/.local (desfazer = religar os links; ver o runbook).
+# JSDOM: POR QUE AQUI, VERSÃO E LOCK (ga-yoyyj1, 22/10/2026). Os testes do WA que rodam o jsdom procuram a pasta node_modules em ROOT/node_modules, em /Users/athos/gt/whatsapp_automation/node_modules e em ~/.local/share/cdp-drive/node_modules,
+#   e PULAM ("jsdom indisponível") quando nenhuma tem o jsdom. No nó só a terceira é possível (o rsync do espelho apaga node_modules); `install jsdom` põe lá o link cdp-drive → cdp-drive-jsdom-<V>-<12 hex do lock>. Isso sozinho não basta: outros ~20
+#   arquivos de teste fazem `require('jsdom')` num `node` SEM passar NODE_PATH (o mini acha o módulo no node_modules do repositório; o nó não) e reprovam; para eles o mbp-run.sh exporta NODE_PATH=~/.local/share/cdp-drive/node_modules no job do nó e o
+#   gt-iso-run repassa à bateria noturna. As duas pontas se completam: só a pasta tira o pulo dos testes que checam a pasta, só a variável conserta os que não a passam. Versão: 25.0.1, a última 25.x, porque o rig WA do mini carrega jsdom 25.x
+#   (comentário de docs/reports/token-por-bead-e8/build-estudo.sh, 01/10); o patch exato do mini não é legível do nó:
+#   confira no mini com `node -p "require('/Users/athos/gt/whatsapp_automation/node_modules/jsdom/package.json').version"` e, se diferir, troque as duas chaves (receita abaixo).
+#   LOCK: scripts/hetzner-nodejs-libs/package-lock.json fixa os 60 pacotes (o jsdom e 59 dependências) por sha512; JSDOM_LOCK_SHA256 é o sha256 do arquivo e entra no nome do diretório (lock novo = diretório novo). Gerado em 22/10/2026 com o npm 10.9.8 do Node do pin
+#   (`npm install --package-lock-only --ignore-scripts`); as 60 URLs são de registry.npmjs.org, nenhum pacote tem script de instalação (o install roda `npm ci --ignore-scripts` de qualquer jeito). `npm audit signatures` na árvore instalada:
+#   60 pacotes com assinatura do registro verificada, 1 com atestado de proveniência. Não há GPG para npm: a garantia é o sha512 por pacote no lock + a assinatura do registro conferida na geração.
+# JSDOM: COMO ATUALIZAR: em scripts/hetzner-nodejs-libs/ troque a versão no package.json e rode `npm install --package-lock-only --ignore-scripts` (npm do Node do pin), confira `npm audit signatures` depois de um `npm ci` em pasta de teste, troque JSDOM_VERSION e
+#   JSDOM_LOCK_SHA256 (`shasum -a 256 package-lock.json`) de uma vez, rode `bash scripts/hetzner-nodejs.selftest.sh` e depois `bash scripts/hetzner-nodejs.sh install jsdom`. O diretório da versão antiga fica em ~/.local/share (desfazer = religar o link; ver o runbook).
 NODE_VERSION=22.22.3
 NODE_SHA256_LINUX_ARM64=1c4a9933a5e45bc88f54f70b5f91232c127ec49f1a5989d23fb85824c7adf9b7
+JSDOM_VERSION=25.0.1
+JSDOM_LOCK_SHA256=715f1221ea01fa510cf2ddd77fbe7ce1ddc1756f64c769b7b1fc1902b7209529

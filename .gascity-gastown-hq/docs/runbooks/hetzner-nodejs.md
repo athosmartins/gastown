@@ -2,7 +2,7 @@
 
 ## Contents
 • O que é e por que existe · Comandos · Como o hash foi autenticado · Estado vivo e o que foi MEDIDO
-• Como atualizar a versão · Como desfazer · O que NÃO foi testado · Limites
+• Como atualizar a versão · Como desfazer · O que NÃO foi testado · Limites · jsdom dos testes do WA (ga-yoyyj1)
 
 Bead ga-2hd02v.4.9 (filha da ga-2hd02v.4, ps-worker remoto). Decisão do Mayor (comentário em ga-2hd02v.4, 2026-10-21T02:40:06Z): instalar o Node no nó **em nível de usuário** (tarball fixado em `~/.local`, sem sudo, sem mexer no sistema), só para os testes do PS.
 
@@ -58,3 +58,52 @@ ssh hetzner-teste 'rm -rf ~/.local/node-v22.22.3-linux-arm64'
 - Duas instalações simultâneas não são serializadas (não há lock): quem chega depois do `mv` da outra confere a versão e reaproveita o diretório; numa corrida estrita o perdedor pode deixar um diretório aninhado inofensivo dentro do da versão. Rode um `install` por vez.
 - A troca `ln -sfn` de dois links não é uma transação única: há microssegundos entre `~/.local/node` e `~/.local/bin/node`. Aceitável: o nó só roda teste e a troca só acontece quando o pin muda.
 - A auditoria de dados do nó (`hetzner-audit.sh`) agora pula qualquer filho `gt-remote/venv-*` por padrão de nome (antes só `venv-wa`, e o `venv-ps` da ga-2hd02v.4.8 aparecia como 33 achados `GRANDE` de pacotes). É o que o cabeçalho dela já dizia em LIMITES (`venv*` não é lido por conteúdo); a linha `LIMPO` de dados continua dizendo o que ficou de fora.
+
+## jsdom dos testes do WA (ga-yoyyj1)
+Achado da ga-00unl0 (pulos do `gate-pytest` no remoto). Seis arquivos de teste do WA montam a tela real em jsdom (`test_termo_chamariz_wa_7x7gdh.py`, `test_app_como_funciona_wa_fdxr7o.py`, `test_superlike_baralho_wa_awicsu_2.py`, `test_superlike_acomp_wa_awicsu_3.py`, `test_hetzner_resumo_painel_wa_7ykup6_3.py`, `test_teto_liberados_wa_1d97lb_5.py`) e **pulavam** no nó com `jsdom indisponível (npm i jsdom)`. Pulo não reprova, mas é cobertura que o remoto não dava. O nó tinha o Node (seções acima) e não tinha o jsdom.
+
+**Duas pontas, e nenhuma substitui a outra.** Os testes do WA acham o jsdom de dois jeitos:
+- Os seis da bead (e mais ~24 arquivos) usam `_node_modules()`, que olha três pastas fixas (`ROOT/node_modules`, `/Users/athos/gt/whatsapp_automation/node_modules`, `~/.local/share/cdp-drive/node_modules`) e só então passa `NODE_PATH=<a pasta>` ao `node` que chamam. O `skipif` testa a **pasta**, não a variável. A primeira some no espelho (o rsync apaga `node_modules`) e a segunda é do mini, então no nó só a terceira serve: é o que o `install jsdom` monta (a mesma pasta que o mini usa no `vitest.config.js` e na skill browser-control).
+- Outros ~20 arquivos (um deles é um helper) fazem `require('jsdom')` num `node` **sem** NODE_PATH e só pulam se faltar o próprio `node`. No mini acham o módulo no `node_modules` do repositório; no nó ele não existe, e eles reprovavam com `Cannot find module 'jsdom'` desde que o Node foi instalado (ga-2hd02v.4.9). Para eles o `mbp-run.sh` exporta `NODE_PATH=$HOME/.local/share/cdp-drive/node_modules` nos jobs do nó, e o `gt-iso-run` a repassa à bateria noturna (o helper roda o comando com `env -i`, que a descartaria).
+
+**Comandos** (no mini). `jsdom` é um componente à parte: o `check` sem a palavra continua falando só do node, que é o que o `hetzner-nodejs-guard.sh` do PS lê (um rc 1 por falta de jsdom o faria acusar "sem Node" com o Node presente).
+
+```bash
+bash scripts/hetzner-nodejs.sh check jsdom     # só lê. rc 0 igual ao pin e carregando · 1 ausente/quebrado/diferente · 2 não consegui saber · 3 nó que o pin não cobre
+bash scripts/hetzner-nodejs.sh install jsdom   # idempotente. rc 4 recusado · 5 npm ci falhou · 64 uso errado. Termina com a MESMA conferência do check
+```
+
+O pin ganhou `JSDOM_VERSION` e `JSDOM_LOCK_SHA256`; o lock mora em `scripts/hetzner-nodejs-libs/` (`package.json` com o jsdom em versão exata e `package-lock.json` com 60 pacotes por sha512). Versão **25.0.1**, a última 25.x, porque o rig WA do mini carrega jsdom 25.x; o patch exato do mini não é legível do nó (confira com o `node -p` do cabeçalho do pin).
+
+**O que o `install jsdom` faz no nó, nesta ordem:** exige o node do pin ok (senão rc 4: rode `install` antes) · o mini confere o sha256 do lock contra o pin antes de abrir o ssh · o nó decodifica o `package.json` e o lock recebidos e confere de novo o sha256 · `npm ci --ignore-scripts` num diretório temporário de `~/.local/share` (registry oficial fixo; cache do npm dentro do temporário, nada em `~/.npm`) · exige que o jsdom instalado diga a versão do pin e **carregue** · move para `~/.local/share/cdp-drive-jsdom-<V>-<12 hex do lock>` · **só então** liga `~/.local/share/cdp-drive` (`ln -sfn`). Qualquer recusa antes deixa o nó como estava; o diretório temporário sai no trap de EXIT (SIGKILL ou queda de energia deixam um `~/.local/share/.jsdom-install.*` de algumas dezenas de MB para apagar à mão). Um `~/.local/share/cdp-drive` que seja diretório comum é recusado (rc 4): o `npm ci` apagaria um repositório de módulos que não é nosso.
+
+**Estado vivo e o que foi MEDIDO** (22/10/2026, 06:19Z a 07:10Z, no próprio nó):
+- O `install jsdom` rodou de verdade aqui por um ssh de mentira (um script que ignora as opções e o host e executa o comando remoto como o mesmo usuário: `MBP_SSH=<script> HETZNER_NODE_HOST=local`): 3,4 s, rc 0, `~/.local/share/cdp-drive` → `cdp-drive-jsdom-25.0.1-715f1221ea01` (19 MB), `~/.npm` não foi criado. Um segundo `install` e o `check jsdom` dizem ok sem baixar nada; o `check` do node segue rc 0 com a mesma linha de antes.
+- `npm audit signatures` na árvore do lock: 60 pacotes com assinatura do registro verificada, 1 com atestado de proveniência.
+- Selftest `hetzner-nodejs.selftest.sh`: 197 verificações, 0 falha, em bash 5.2 **e** num bash 3.2.57 de verdade; 41 mutantes mortos; contra o script ANTIGO o mesmo selftest dá 76 falhas em 12 s. `hetzner-iso-run.selftest.sh` 46/46 (12 mutantes, um novo: W7); `hetzner-nodejs-guard.selftest.sh` 67/0.
+- Os seis arquivos da bead (cópia privada do slot wa-1 do espelho, main de 05:20Z, venv-wa, node v22.22.3): sem o jsdom, 87 passaram e 8 pularam; com a pasta, 94 passaram e 1 reprovou (item 1 abaixo).
+- Os 89 arquivos do WA que citam jsdom, mesmo conjunto nos três estados (falhas / passam / pulos / erros): **sem jsdom** 292 / 1214 / 194 / 109 · **com a pasta** 294 / 1244 / 162 / 109 (32 pulos a menos: 30 viraram passes e 2 viraram falhas) · **com a pasta e o NODE_PATH** 175 / 1664 / 27 / 104. O NODE_PATH corrige 122 falhas e 5 erros em 15 arquivos e faz rodar 135 testes que ainda pulavam; traz 3 falhas novas (itens 3 e 4).
+- O que o jsdom **expõe** (vermelhos reais que o pulo escondia; nenhum é do jsdom nem do nó, e nenhum foi posto na lista mac-only de propósito: ela os mandaria ao mini, onde estariam vermelhos do mesmo jeito):
+  1. `test_teto_liberados_wa_1d97lb_5.py::test_telas_em_jsdom[test_teto_global_painel_wa_1d97lb_5.cjs]`: o `.cjs` não existe em nenhum slot do espelho desde pelo menos 20/10, embora o filtro do rsync o levaria (conferido em dry-run).
+  2. `test_prioridade_azul_botao_wa_taez1x_1.py::test_prioridade_azul_e_botao_no_computador_em_jsdom`: asserção de conteúdo (`o hex do azul só na definição do token`, 8 !== 1).
+  3. `test_ficha360_localize_nome_contrato_front_wa_3dysn.py::test_o_front_renderiza_a_faixa_e_o_aviso_no_jsdom`: `fixture ausente` (`tests/fixtures/ficha360_ln_busca_wa_3dysn.json` não está no espelho, o vizinho `ficha360_ln_vinculado_wa_3dysn.json` está, e o filtro levaria os dois).
+  4. `test_map_viewer_selecao_remover_register_wa_5460ap.py::test_cenario[...]` (2 cenários): `ReferenceError: REG_VIVO is not defined` no harness que extrai funções do template.
+- O que as duas pontas **não** mudam: o erro de coleta de `test_viewer_secoes_colapsaveis_wa_kybk4a.py` (lê `viewer/index.html`, que o espelho não leva), os testes de Playwright (sem Chromium no nó: uns 100 erros de setup e dezenas de falhas), sqlite e lxml.
+
+**Como atualizar o jsdom.** Receita no cabeçalho do pin (`JSDOM: COMO ATUALIZAR`): trocar a versão no `package.json`, `npm install --package-lock-only --ignore-scripts` com o npm do Node do pin, `npm ci` + `npm audit signatures` numa pasta de teste, trocar as duas chaves do pin de uma vez (`shasum -a 256 package-lock.json`), rodar o selftest e o `install jsdom`. O diretório da versão antiga continua em `~/.local/share`.
+
+**Como desfazer o jsdom.** Tudo mora em `~/.local/share` do usuário `runner`:
+
+```bash
+# desligar o jsdom (tira só o link; os testes do WA voltam a pular com "jsdom indisponível"):
+ssh hetzner-teste 'rm -f ~/.local/share/cdp-drive'
+# voltar a uma instalação que continua em ~/.local/share, sem apagar nada:
+ssh hetzner-teste 'ln -sfn cdp-drive-jsdom-<V>-<12 hex do lock> ~/.local/share/cdp-drive'
+# liberar os 19 MB de uma instalação (depois de desligar):
+ssh hetzner-teste 'rm -rf ~/.local/share/cdp-drive-jsdom-<V>-<12 hex do lock>'
+```
+Para tirar só o NODE_PATH, reverta a linha `pathline` do `mbp-run.sh` e o `NODE_PATH=` do `exec sudo` do `hetzner-iso-run.sh`.
+
+**O que NÃO foi testado no jsdom.** O ssh de verdade entre o mini e o nó (a prova ao vivo usou o ssh de mentira acima: o texto remoto é o mesmo, o transporte não); o macOS (o selftest só rodou em Linux, bash 5.2 e o bash 3.2.57 da GNU; há atalhos para `timeout`, `base64 -d` e `sha256sum` que o macOS não tem, não exercitados lá); a bateria do gate e a noturna de ponta a ponta com o NODE_PATH (os selftests do `mbp-run.sh` e do `hetzner-iso-run.sh` cobrem a **forma** da chamada; o `sudo` do helper não roda sem root); os números acima vêm de uma cópia do slot wa-1 rodada à mão com `nice 19`, não de um job real do gate. O `mbp-run.selftest.sh` tem 45 falhas que já existiam neste nó antes da mudança (ioreg/plist do macOS); o conjunto de falhas é idêntico depois.
+
+**Limites do jsdom.** Rode um `install jsdom` por vez (não há lock, como no node). O `install jsdom` não repara um diretório de versão que existe e não carrega: ele recusa (rc 4) e o conserto é apagar o diretório à mão. Não rode `skills/browser-control/install.sh` no nó: ele faz `npm install` dentro de `~/.local/share/cdp-drive` e, atravessando o link, mexeria no diretório imutável do jsdom.

@@ -973,7 +973,8 @@ has "job do nó: nice (o taskpolicy do macOS não existe lá)" "$(lsf RUN hetzne
 has "job do nó: presença dedicada/livre" "$(lsf RUN hetzner)" 'PR_WHY=dedicada'
 hasnt "job do nó: sem o node@22 do Homebrew (no Linux ele não existe; o node do nó vem do hetzner-nodejs.sh)" "$(lsf RUN hetzner)" 'node@22'
 has "job do nó: cria logs/ no espelho (o filtro deixa logs/ no mini; teste que abre logs/x.log dava FileNotFoundError, vermelho falso)" "$(lsf RUN hetzner)" 'return 97; mkdir -p logs'
-reset; run -- tests/test_x.py >/dev/null; has "job do MBP: PATH do Homebrew (como sempre)" "$(lsf RUN mbp)" '/opt/homebrew/bin'; has "job do MBP: a biblioteca de presença" "$(lsf RUN mbp)" 'ioreg'
+has "job do nó: NODE_PATH aponta para o jsdom do nó (ga-yoyyj1)" "$(lsf RUN hetzner)" 'NODE_PATH="\$HOME/.local/share/cdp-drive/node_modules"'
+reset; run -- tests/test_x.py >/dev/null; has "job do MBP: PATH do Homebrew (como sempre)" "$(lsf RUN mbp)" '/opt/homebrew/bin'; has "job do MBP: a biblioteca de presença" "$(lsf RUN mbp)" 'ioreg'; hasnt "job do MBP: sem o NODE_PATH do nó (ga-yoyyj1)" "$(lsf RUN mbp)" 'NODE_PATH'
 # ga-00unl0: o `node` padrão do Homebrew do mini (25.x) não abre (falta libsimdjson.33.dylib) e o `shutil.which("node")` dos testes o achava primeiro: 19 vermelhos falsos do ps em 3 dias; o node@22 abre
 has "job do MBP: o node@22 do Homebrew vem ANTES do node padrão (o 25 não abre: libsimdjson)" "$(lsf RUN mbp)" 'export PATH=/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:'
 has "job do MBP: o /opt/homebrew/bin segue no PATH (git, python, uv… como sempre)" "$(lsf RUN mbp)" 'node@22/bin:/opt/homebrew/bin:\$PATH'
