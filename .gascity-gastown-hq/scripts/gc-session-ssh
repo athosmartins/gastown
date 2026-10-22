@@ -191,6 +191,7 @@ RIG_RE = re.compile(r"[a-z][a-z0-9_-]{0,40}")
 WT_NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,60}")  # o nome da sessão vira o nome do worktree e o do branch worker/<nome>
 ROLE_RE = re.compile(r"[a-z][a-z0-9-]*")
 WT_START_FLOOR = 150  # o wt-add puxa o espelho antes de criar o worktree: os 60 s padrão do start não bastam (o engine espera 180 s, [session] startup_timeout)
+OPEN_MIN = 5  # a 2ª chamada do start (new-session + conferência, ~1 s) tem pelo menos isto, mesmo que a 1ª tenha gasto o prazo todo (ga-0k82lw)
 WT_STOP_FLOOR = 90  # o stop com worktree também roda git status + wt-rm (du + worktree remove): os 25 s padrão podem estourar com o nó ou o disco ocupados (não medido), e um estouro chega depois da sessão já ter caído
 # Recolhe o worktree da sessão SÓ se nada se perde (limpo, e todo commit já está no main do origin ou na ref da sessão no espelho). Imprime `WT removed`, `WT kept <motivo>` ou `WT none`
 # e NUNCA devolve erro (o wtclean cria um arquivo temporário para o stderr do git e o apaga): o stop não falha por causa dele, e o start que falhou depois do wt-add o usa no EXIT. Dúvida (git ilegível, ref ausente) = MANTÉM.
@@ -774,39 +775,40 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
                               ssh=ssh_argv(cfg)), indent=2, sort_keys=True))
         return 0
     # START ABANDONADO (ga-0k82lw): o mini pode desistir do start com o script do host ainda rodando (prazo do provider estourado: só o ssh LOCAL morre; engine que aborta o create e mata o processo do
-    # provider: nenhum handler roda, SIGKILL) e o `sh` do host seguiria até o new-session — uma tmux que o gc não conhece, ocupando vaga do nó. Antes de abrir o script confere as DUAS coisas que o mini
-    # só deixa de cumprir quando desistiu: o prazo (relógio do próprio host, sem depender de os relógios baterem) e o canal do ssh vivo (escrever num canal fechado falha; duas sondas com 1 s entre elas
-    # porque, com o provider morto e o ssh órfão ainda de pé, a 1ª escrita só faz o ssh perceber o fim e fechar o canal). A sonda depois de abrir derruba a sessão que ele mesmo acabou de criar.
-    body = """t0=$(date +%s)
-alive() { ( trap '' PIPE; echo >&2 ); }
-ab() { echo "start de @NAME@ abandonado: $1" >&2; exit 14; }
-s=$(sessions) || exit 1
+    # provider: nenhum handler roda, SIGKILL) e o `sh` do host seguiria até o new-session — uma tmux que o gc não conhece, ocupando vaga do nó. O host não tem como saber que o mini desistiu: medido com ssh
+    # de verdade e o ControlMaster daqui, escrever no stderr do ssh órfão segue dando certo por 12 s, e um prazo no relógio do host só pegaria o timeout do próprio provider, não um kill antes dele.
+    # Por isso o start são DUAS chamadas sob o mesmo lock: a 1ª prepara tudo o que é lento (teto, worktree, preparo, lançador) e termina SEM abrir tmux; a 2ª só abre (new-session + conferência, ~1 s).
+    # Provider morto na parte lenta = nenhuma tmux, qualquer que seja o comportamento do ssh; a janela que sobra é a 2ª chamada (a varredura do hetzner-capacity pega o que escapar dela).
+    prep_body = """s=$(sessions) || exit 1
 @GATE0@printf '%s\\n' "$s" | grep -qxF -- @NAME@ && { echo "session @NAME@ already exists" >&2; exit 11; }
 n=$(printf '%s\\n' "$s" | grep -c .)
 [ "$n" -lt @CAP@ ] || { echo "host @HOST@ está no teto: $n de @CAP@ sessões" >&2; exit 10; }
 @WTADD@@GATE1@@PREP@@PLIBCHECK@mkdir -p @RUN@ @WORKDIR@ && chmod 700 @RUN@ || exit 1
-[ $(( $(date +%s) - t0 )) -lt @BUDGET@ ] || ab "passou de @BUDGET@ s e o mini já desistiu"
-alive || ab "o ssh do mini já fechou"; sleep 1; alive || ab "o ssh do mini já fechou"
-rm -f @EXITF@; printf %s @B64@ | base64 -d >@LAUNCH@ || exit 1
+rm -f @EXITF@; printf %s @B64@ | base64 -d >@LAUNCH@ || exit 1"""
+    open_body = """@WTTRAP@[ -r @LAUNCH@ ] || { echo "start de @NAME@ abandonado: o lançador do preparo não está mais lá" >&2; exit 14; }
 T new-session -d -s @NAME@ -c @WORKDIR@ "sh @LAUNCH@" || { rm -f @LAUNCH@; exit 1; }
 sleep 1
-T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após abrir: $(cat @EXITF@ 2>/dev/null)" >&2; rm -f @LAUNCH@; exit 1; }
-alive || { T kill-session -t @TGT@ 2>/dev/null; rm -f @LAUNCH@ @EXITF@; ab "o ssh do mini fechou depois de abrir; derrubei a sessão"; }"""
+T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após abrir: $(cat @EXITF@ 2>/dev/null)" >&2; rm -f @LAUNCH@; exit 1; }"""
     plib = f'[ -r {q(cfg.plib)} ] || {{ echo "host @HOST@: sem a biblioteca de presença ({cfg.plib}); rode mbp-offload.sh install-mbp" >&2; exit 12; }}\n' if cfg.gate else ""
-    body = body.replace("@PLIBCHECK@", plib).replace("@PREP@", prepare_script(cfg)).replace("@WTADD@", wtadd_sh(wt, name) if wt else "")
+    prep_body = prep_body.replace("@PLIBCHECK@", plib).replace("@PREP@", prepare_script(cfg)).replace("@WTADD@", wtadd_sh(wt, name) if wt else "")
+    open_body = open_body.replace("@WTTRAP@", wtclean_sh(wt, name) + "trap '[ \"$?\" -eq 0 ] || wtclean >&2' EXIT\n" if wt else "")  # a 2ª chamada que falha recolhe o worktree que a 1ª criou (wtclean mantém o que tiver trabalho)
     for k, v in {"@NAME@": q(name), "@CAP@": str(cap), "@HOST@": q(cfg.host), "@RUN@": q(run_dir), "@WORKDIR@": q(p["work_dir"]),
-                 "@EXITF@": q(exitf), "@LAUNCH@": q(lpath), "@TGT@": tgt(name), "@BUDGET@": str(max(1, start_timeout - 3)),  # 3 s a menos que o prazo do mini: sobra o `sleep 1` de depois de abrir e o atraso de conectar
+                 "@EXITF@": q(exitf), "@LAUNCH@": q(lpath), "@TGT@": tgt(name),
                  "@B64@": q(base64.b64encode(launcher(cfg, name, p, secrets).encode()).decode())}.items():
-        body = body.replace(k, v)
-    body = body.replace("@GATE0@", "" if wt else gate).replace("@GATE1@", gate if wt else "")  # sessão com worktree do provider: o guarda de clone vem DEPOIS do wt-add
+        prep_body, open_body = prep_body.replace(k, v), open_body.replace(k, v)
+    prep_body = prep_body.replace("@GATE0@", "" if wt else gate).replace("@GATE1@", gate if wt else "")  # sessão com worktree do provider: o guarda de clone vem DEPOIS do wt-add
     with open(os.path.join(cfg.mkstate(), "lock"), "a") as lf:  # cap + criação são um passo só; entre processos do mini, um por vez
         fcntl.flock(lf, fcntl.LOCK_EX)
         # registra ANTES do ssh: um start ambíguo (ssh cai ou estoura o tempo depois do script já ter rodado no host) deixa o registro,
         # e o list-running com o host fora do ar diz "não sei" em vez de "nada nosso lá"; só uma recusa clara do host o apaga
         cfg.mark(name, True)
         lr_invalidate(cfg)  # o list-running guardado deixa de valer ANTES do ssh que muda o host e de novo DEPOIS (mesmo se o ssh falhar ou ficar ambíguo): quem perguntou no meio não grava a lista de antes
+        t_start = time.monotonic()
         try:
-            rc, out, err = remote(cfg, body, start_timeout)
+            rc, out, err = remote(cfg, prep_body, start_timeout)
+            if rc == 0:  # preparou sem abrir nada: só agora, com o provider vivo e o que sobrou do prazo (mínimo OPEN_MIN), abre a tmux
+                rc, out2, err = remote(cfg, open_body, max(OPEN_MIN, int(start_timeout - (time.monotonic() - t_start))))
+                out = out if rc == 0 else out2  # ok: o que vale é o worktree que a 1ª imprimiu; falhou: o motivo da abertura
         finally:
             lr_invalidate(cfg)  # depois do ssh do start
         if rc not in (0, EX_EXISTS):
