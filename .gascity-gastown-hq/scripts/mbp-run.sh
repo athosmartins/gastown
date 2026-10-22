@@ -1159,6 +1159,12 @@ EOF
   if [ "$HOSTKIND" = linux ]; then pathline='export PATH="$HOME/.local/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 NODE_PATH="$HOME/.local/share/cdp-drive/node_modules"'
   else pathline='export PATH=/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:$PATH PYTHONDONTWRITEBYTECODE=1'; fi
   [ -z "$ISO" ] || pathline="$pathline"$'\n''[ -x "$HOME/gt-remote/bin/gt-iso-run" ] || { echo "GTN-ISO: inerte wrapper-ausente (~/gt-remote/bin/gt-iso-run)"; exit 97; }'
+  # ga-aptlug: o Chromium do Playwright do nó (hetzner-chromium.sh install), só no pytest do nó (nem o selftest do hq nem o MBP). As DUAS variáveis saem juntas ou nenhuma: navegador sem biblioteca dá VERMELHO (o erro não casa o skip dos testes), navegador ausente dá PULO.
+  # vazio → sem o marcador `ready` (o install o grava por último), sem browsers/ ou libpath.txt vazio: nada é exportado e os e2e pulam como antes; falhou/ilegível (o cat não lê o libpath.txt) → idem. Com HETZNER_ISOLATE=1 o gt-iso-run roda o comando com ambiente limpo (é o que o cabeçalho dele diz; não medido aqui): as duas variáveis somem juntas, nunca uma só.
+  pwline=
+  if [ "$HOSTKIND" = linux ] && [ "$KIND" != selftest ]; then
+    pwline=$'\n''_pwc=$HOME/gt-remote/pw-chromium/env'$'\n''if [ -s "$_pwc/ready" ] && [ -d "$_pwc/browsers" ] && _pwl=$(cat "$_pwc/libpath.txt" 2>/dev/null) && [ -n "$_pwl" ]; then export PLAYWRIGHT_BROWSERS_PATH="$_pwc/browsers" LD_LIBRARY_PATH="$_pwl${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; fi'
+  fi
   if [ "$KIND" = selftest ]; then
   # hq: `bash <x>.selftest.sh` no espelho do slot; identidade git fixa porque muito selftest cria repositório temporário e o nó não tem ~/.gitconfig
   IFS= read -r -d '' JOBDEF <<EOF || true
@@ -1170,7 +1176,7 @@ EOF
   else
   # mkdir -p logs: o rsync não leva /logs (nem o filtro do nó) e o import de daemons/admin_dashboard.py abre logs/admin_dashboard.log — sem a pasta o ARQUIVO de teste nem coleta (vermelho falso, ga-00unl0)
   IFS= read -r -d '' JOBDEF <<EOF || true
-$pathline
+$pathline$pwline
 job() { cd "\$HOME/$M" || return 97; mkdir -p logs; \$MBP_BG nice -n "\$MBP_NICE" ${ISO}"\$HOME/gt-remote/$rv/bin/python" -m pytest -p no:cacheprovider $qargs; }
 mbp_supervise job
 EOF
