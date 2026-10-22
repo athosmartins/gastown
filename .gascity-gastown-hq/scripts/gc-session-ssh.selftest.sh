@@ -176,6 +176,11 @@ g_live() {
   pv process-alive live-1 < <(printf 'cat\n'); [ "$(cat "$T/out")" = true ]; ok $? "live: process-alive cat → true"
   pv process-alive live-1 < <(printf 'nao-existe-xyz\n'); [ "$(cat "$T/out")" = false ]; ok $? "live: process-alive de processo que não roda → false"
   pv get-last-activity live-1 </dev/null; grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$' "$T/out"; ok $? "live: get-last-activity em RFC3339"
+  # ga-2hd02v.11: saída SEM input tem de contar como atividade (session_activity só anda com input; o engine dormia a sessão no meio do trabalho)
+  pv start live-out < <(req "sh -c 'sleep 3; echo saida-sem-input; exec cat'"); t0=$(date +%s); sleep 4.5
+  pv get-last-activity live-out </dev/null; la=$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$(cat "$T/out")" +%s 2>/dev/null || date -u -d "$(cat "$T/out")" +%s 2>/dev/null)
+  [ -n "$la" ] && [ "$la" -ge $((t0 + 2)) ]; ok $? "live: get-last-activity anda com a SAÍDA da sessão, sem input (t0=$t0 la=${la:-?})"
+  pv stop live-out </dev/null
   pv clear-scrollback live-1 </dev/null; ok $RC "live: clear-scrollback rc 0"
   pv start live-int < <(req "sh -c 'trap \"echo GOT-INT\" INT; while :; do sleep 0.2; done'"); pv interrupt live-int </dev/null; sleep 0.5; pv peek live-int 20 </dev/null
   has "$T/out" 'GOT-INT'; ok $? "live: interrupt chega à sessão (Ctrl-C)"

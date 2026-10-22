@@ -1043,9 +1043,12 @@ def op_list_running(prefix: str, dry: bool) -> int:
 
 
 def op_last_activity(cfg: Cfg, name: str, args: list, dry: bool) -> int:
-    out = run(cfg, "get-last-activity", f"live {q(name)}; T display-message -p -t {ptgt(name)} '#{{session_activity}}' 2>/dev/null; exit 0", dry)[1].strip()
-    if out.isdigit():
-        print(datetime.fromtimestamp(int(out), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    # ga-2hd02v.11: session_activity só anda com input (start/nudge); a saída do claude anda o window_activity. Só com session_activity o engine via
+    # toda sessão remota "ociosa" 15 min depois de abrir e a dormia no meio do trabalho (11 reaberturas seguidas em 22/10). Vale o MAIOR dos dois.
+    out = run(cfg, "get-last-activity", f"live {q(name)}; T display-message -p -t {ptgt(name)} '#{{session_activity}} #{{window_activity}}' 2>/dev/null; exit 0", dry)[1].strip()
+    ts = [int(x) for x in out.split() if x.isdigit()]   # vazio/ilegível → nada impresso, como antes (melhor esforço do contrato)
+    if ts:
+        print(datetime.fromtimestamp(max(ts), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
     return 0
 
 
