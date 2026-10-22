@@ -76,6 +76,9 @@ if [ -n "${FAKE_SSH_JUNK:-}" ]; then cat >/dev/null; echo "saida sem marcadores"
 [ -z "${FAKE_SSH_TIMES:-}" ] || echo "B $$ $(python3 -c 'import time;print(time.time())')" >> "$FAKE_SSH_TIMES"
 if [ -n "${FAKE_SSH_CUT:-}" ]; then sh -c "$*" | grep -v '@@GC-END@@'; exit 0; fi
 if [ -n "${FAKE_SSH_RAN_255:-}" ]; then sh -c "$*" >/dev/null 2>&1; echo "Connection reset by peer" >&2; exit 255; fi  # o script RODOU no host, a conexão caiu depois
+if [ -n "${FAKE_SSH_ORPHAN:-}" ]; then  # script do host solto dos canais do chamador (escrever em stdout/stderr nunca falha): o sshd com ControlMaster segue drenando os pipes do filho depois da morte do cliente (ga-0k82lw)
+  o=$(mktemp -d); cat > "$o/in"; sh -c "$*" < "$o/in" > "$o/out" 2> "$o/err"; rc=$?; cat "$o/out"; cat "$o/err" >&2; rm -rf "$o"; exit $rc
+fi
 sh -c "$*"; rc=$?
 [ -z "${FAKE_SSH_AFTER_MARK:-}" ] || : > "$FAKE_SSH_AFTER_MARK"  # o comando já rodou no "host" e a resposta ainda não voltou (o teste do cache espera por este arquivo)
 [ -z "${FAKE_SSH_DELAY_AFTER:-}" ] || sleep "$FAKE_SSH_DELAY_AFTER"  # resposta lenta: a lista é lida AGORA e só chega ao chamador N s depois
@@ -868,21 +871,25 @@ g_lr() {
 }
 
 g_abort() {  # ga-0k82lw: o start que o mini ABANDONOU (prazo do provider estourado, ou o engine mata o processo no meio) não pode deixar sessão no host: o script do host ainda roda e abriria a tmux "depois do close"
-  local bin="$T/home/.local/bin" real i pid; real=$(command -v sha256sum); mkdir -p "$bin"
+  local bin="$T/home/.local/bin" real i pid mode; real=$(command -v sha256sum); mkdir -p "$bin"
   slowhost() {  # passo lento ANTES do new-session: o portão de uma sessão real roda `sha256sum` no host (real_gate); o falso marca que começou, espera $1 s e chama o de verdade
     rm -f "$T/slow.mark"; printf '#!/bin/sh\n: > "%s"\nsleep %s\nexec "%s" "$@"\n' "$T/slow.mark" "$1" "$real" > "$bin/sha256sum"; chmod +x "$bin/sha256sum"
   }
-  cfg 3 2; slowhost 5; fresh
-  pv start abort-1 < <(req cat); [ $RC = 1 ] && has "$T/err" 'não respondeu em 2s'; ok $? "abort: prazo do start estourado → o start falha dizendo o prazo (rc=$RC)"
-  sleep 6   # o passo lento acaba aqui e o script do host (que ninguém espera mais) seguiria até o new-session
-  [ "$(count)" = 0 ]; ok $? "abort: ...e o host NÃO ganha a sessão depois (o script abandonado não a abre) (tmux: $(count))"
-  tmux -L "$SOCK" kill-server 2>/dev/null
-  cfg 3; slowhost 5; fresh
-  env HOME="$T/home" GC_SSH_CONFIG="$T/cfg.json" GC_SSH_BIN="$T/bin/ssh" GC_EXEC_STATE_DIR="$T/state" "$P" start abort-2 < <(req cat) >"$T/out" 2>"$T/err" & pid=$!
-  waitfor "$T/slow.mark"; kill -9 $pid; wait $pid 2>/dev/null   # o engine aborta o create e mata o processo do provider: nenhum handler roda, o ssh e o script do host ficam órfãos
-  sleep 7
-  [ "$(count)" = 0 ]; ok $? "abort: provider morto no meio do start (kill -9) → o host NÃO ganha a sessão (tmux: $(count))"
-  tmux -L "$SOCK" kill-server 2>/dev/null
+  for mode in plain orphan; do  # orphan = o ssh falso solta o script do host dos canais do chamador (stdout/stderr em arquivo: escrever nunca falha), como o sshd com ControlMaster, que segue drenando os pipes do filho depois da morte do cliente (medido com ssh de verdade); sem ele o teste não separa "o host percebe o canal fechado" de "o start não abre nada na parte lenta"
+    if [ $mode = orphan ]; then export FAKE_SSH_ORPHAN=1; else unset FAKE_SSH_ORPHAN; fi
+    cfg 3 2; slowhost 5; fresh
+    pv start abort-1-$mode < <(req cat); [ $RC = 1 ] && has "$T/err" 'não respondeu em 2s'; ok $? "abort/$mode: prazo do start estourado → o start falha dizendo o prazo (rc=$RC)"
+    sleep 6   # o passo lento acaba aqui e o script do host (que ninguém espera mais) seguiria até o new-session
+    [ "$(count)" = 0 ]; ok $? "abort/$mode: ...e o host NÃO ganha a sessão depois (o script abandonado não a abre) (tmux: $(count))"
+    tmux -L "$SOCK" kill-server 2>/dev/null
+    cfg 3; slowhost 5; fresh
+    env HOME="$T/home" GC_SSH_CONFIG="$T/cfg.json" GC_SSH_BIN="$T/bin/ssh" GC_EXEC_STATE_DIR="$T/state" "$P" start abort-2-$mode < <(req cat) >"$T/out" 2>"$T/err" & pid=$!
+    waitfor "$T/slow.mark"; kill -9 $pid; wait $pid 2>/dev/null   # o engine aborta o create e mata o processo do provider: nenhum handler roda, o ssh e o script do host ficam órfãos
+    sleep 7
+    [ "$(count)" = 0 ]; ok $? "abort/$mode: provider morto no meio do start (kill -9) → o host NÃO ganha a sessão (tmux: $(count))"
+    tmux -L "$SOCK" kill-server 2>/dev/null
+  done
+  unset FAKE_SSH_ORPHAN
   cfg 3; slowhost 2; fresh
   pv start abort-3 < <(req cat); ok $RC "abort: (controle) start lento mas dentro do prazo abre a sessão (rc=$RC $(head -c 160 "$T/err"))"
   [ "$(count)" = 1 ]; ok $? "abort: (controle) ...e ela está no host (tmux: $(count))"
