@@ -5711,7 +5711,8 @@ fi
 # above. No push per sweep: a sweep runs every few minutes and the alarm already belongs to
 # dolt-disk-floor-guard.sh (WARN/CRITICAL with its own cooldowns); this gate only holds the door.
 # `|| rc=$?`: the reader answers 1 for "no pause", and the dispatcher runs under set -e.
-# ga-2hd02v.1.20: _PILOT_NODE_ONLY=1 is the NODE-ONLY pass. Only this gate sets it (a CONFIRMED low disk + PILOT_NODE_FIRST=on, outside DRY_RUN); dispatch_lane, dispatch_one, the pool top-up (inside _pilot_pool_topup, its first gate),
+# ga-2hd02v.1.20: _PILOT_NODE_ONLY=1 is the NODE-ONLY pass. Two gates set it: this one (a CONFIRMED low disk + PILOT_NODE_FIRST=on, outside DRY_RUN) and the
+# cross-stage yield below when the contention is the mini's memory alone (ga-2hd02v.13); dispatch_lane, dispatch_one, the pool top-up (inside _pilot_pool_topup, its first gate),
 # the pause-clearing below, the Step 5 stall streak and the cede-only streak check (_pilot_yield_stall_check) read it. Always 0 otherwise.
 _PILOT_NODE_ONLY=0
 _disk_floor_rc=0
@@ -5826,10 +5827,19 @@ if [ "$CROSS_STAGE_PRIORITY_ENABLED" = "1" ]; then
       warn "Cross-stage YIELD (ga-d0hz3): Gate is CONGESTED and resources are CONTENDED (quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot} mem_tight=${_xstage_mem_tight}${PILOT_MEM_TIGHT_REASON:+ [$PILOT_MEM_TIGHT_REASON]}; ${PILOT_MEM_TIGHT_DETAIL}) — DEFERRING new builds this sweep so the more-advanced Gate stage can drain first. Approved stories stay queued; auto-resumes when Dolt calms / quota frees / the Gate drains (swap used is sticky, so memory alone may stay tight until it does). Most-advanced-first."
       notify -t "⏸️ Pilot cede ao Gate" -p 2 "Pilot adiou despachar builds novos — Gate congestionado + recurso contido (dolt_hot=${_xstage_dolt_hot}, quota_limited=${_xstage_quota_limited}, mem_tight=${_xstage_mem_tight}). Retoma quando o recurso aliviar (ga-d0hz3, ga-9e446u)." 2>/dev/null || true
       _pilot_write_sweep_pause_state 1 "cross-stage-yield" "gate_congested=1 quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot} mem_tight=${_xstage_mem_tight}"
-      log "=== Pilot sweep complete: dispatched=0 (deferred: cross-stage gate-congested + resource-contended, ga-d0hz3) ==="
-      exit 0
+      # ga-2hd02v.13: a memória apertada é a do MINI; a sessão do nó não gasta RAM do mini. Contido SÓ por memória (cota e Dolt calmos: o nó segue a conta do
+      # pool do mini e a passada escreve no Dolt) + PILOT_NODE_FIRST=on + fora do DRY_RUN → a varredura segue na passada só-nó do disk floor (ga-2hd02v.1.20), o mini
+      # continua cedendo. 22/10 o yield saía antes da passada de WA no nó a noite toda (swap 7 GB) e o Hetzner ficou sem bead. off/shadow/vazio/DRY_RUN/cota/Dolt → sai como sempre.
+      if [ "$_xstage_quota_limited" != "1" ] && [ "$_xstage_dolt_hot" != "1" ] && [ "${PILOT_NODE_FIRST:-off}" = "on" ] && [ "${DRY_RUN:-0}" != "1" ]; then
+        _PILOT_NODE_ONLY=1
+        log "Cross-stage YIELD só por memória do mini + PILOT_NODE_FIRST=on: o MINI cede, a varredura segue na passada só-nó (ga-2hd02v.13)."
+      else
+        log "=== Pilot sweep complete: dispatched=0 (deferred: cross-stage gate-congested + resource-contended, ga-d0hz3) ==="
+        exit 0
+      fi
+    else
+      log "Cross-stage check (ga-d0hz3): resources contended (quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot} mem_tight=${_xstage_mem_tight}) but Gate NOT congested — dispatching normally."
     fi
-    log "Cross-stage check (ga-d0hz3): resources contended (quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot} mem_tight=${_xstage_mem_tight}) but Gate NOT congested — dispatching normally."
   fi
 fi
 # ga-nq0jo: reaching here means neither whole-sweep pause fired this cycle —
