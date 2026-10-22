@@ -95,6 +95,7 @@ O QUE NÃO FAZ
 from __future__ import annotations
 
 import argparse
+import calendar
 import fcntl
 import json
 import os
@@ -126,8 +127,11 @@ DEFAULTS = {
     "ssh_timeout_s": 25,
     "require_load_proof": True,
     "cpu_lowers_ceiling": False,       # False: só a RAM desce o degrau (o nó não tem swap). True: a regra antiga, CPU livre < cpu_down_headroom_pct também desce
+    "reap_orphans": "log",             # tmux no nó que o gc já deu por fechada (ga-0k82lw): "off" não olha, "log" só registra em events.jsonl, "kill" também a encerra (`gc-session-ssh stop`). Ligar o "kill" é do Mayor
+    "orphan_grace_s": 600,             # a tmux tem que estar órfã há tanto (e em ORPHAN_MIN_SEEN ciclos seguidos) para a varredura poder agir
+    "orphan_idle_s": 600,              # e parada (sem atividade na tmux) há tanto: o que ainda trabalha espera
 }
-BG_MIN_PCT = 1.0             # a partir de tanto de CPU em nice > 0 na amostra, a folga é ocioso + fundo e o load5 deixa de valer (abaixo disso, a regra de sempre)
+BG_MIN_PCT = 1.0            # a partir de tanto de CPU em nice > 0 na amostra, a folga é ocioso + fundo e o load5 deixa de valer (abaixo disso, a regra de sempre)
 MAX_READINGS = 500
 LOG_MAX_BYTES = 2_000_000
 BEGIN, END = "@@CAP-BEGIN@@", "@@CAP-END@@"
@@ -198,6 +202,11 @@ def load_config(path: str) -> dict:
     for k in ("require_load_proof", "cpu_lowers_ceiling"):
         if not isinstance(cfg[k], bool):
             raise ConfigError(f"{path}: {k} tem que ser true/false")
+    if cfg["reap_orphans"] not in ("off", "log", "kill"):
+        raise ConfigError(f"{path}: reap_orphans tem que ser \"off\", \"log\" ou \"kill\"")
+    for k in ("orphan_grace_s", "orphan_idle_s"):
+        if not isinstance(cfg[k], int) or isinstance(cfg[k], bool) or cfg[k] < 1:
+            raise ConfigError(f"{path}: {k} tem que ser inteiro >= 1")
     return cfg
 
 
@@ -395,9 +404,10 @@ def read_timeout(default: float) -> float:
     return min(v, default) if v > 0 else default
 
 
-def read_json_cmd(name: str, default: list, what: str, timeout_s: float):
-    """Roda um comando de leitura (gc/bd) e devolve o JSON dele. Qualquer coisa que não seja um JSON lido = Unreadable (rc≠0, prazo, não executa, vazio, não é JSON)."""
-    cmd = json_env_cmd(name, default)
+def read_json_cmd(name: str, default: list, what: str, timeout_s: float, extra: tuple = ()):
+    """Roda um comando de leitura (gc/bd) e devolve o JSON dele. Qualquer coisa que não seja um JSON lido = Unreadable (rc≠0, prazo, não executa, vazio, não é JSON).
+    `extra` são argumentos que vão DEPOIS do comando (do padrão ou do trocado por `name`): o id que se pergunta."""
+    cmd = json_env_cmd(name, default) + list(extra)
     limit = read_timeout(timeout_s)
     try:
         p = subprocess.run(cmd, capture_output=True, timeout=limit, stdin=subprocess.DEVNULL, cwd=CITY)
@@ -765,6 +775,148 @@ def hourly_text(res: dict) -> str:
 
 # ───────────────────────────────── linha de comando ─────────────────────────────────
 
+# ───────────────────────────────── tmux órfã (ga-0k82lw, camada 3) ─────────────────────────────────
+
+WISP_NAME = re.compile(r"(.+)-([a-z]+)wisp([a-z0-9]+)")     # o nome que o gc dá à sessão a partir do id da bead de sessão: dog-remote-gawispop6olf ← ga-wisp-op6olf. Tmux de outra forma não é do gc: a varredura não toca nela
+ORPHAN_MIN_SEEN = 2        # ciclos seguidos (o `step` roda a cada 180 s) em que a tmux tem que aparecer órfã antes de a varredura poder agir
+ORPHAN_MAX_KILLS = 2       # por ciclo: uma leitura errada em massa não esvazia o nó de uma vez
+
+
+def provider_run(host: str, op: str, name: str, timeout_s: float) -> str:
+    """stdout de `gc-session-ssh <op> <nome>` para o host. Não executa, estoura o prazo ou sai com rc≠0 = Unreadable; saída vazia com rc 0 volta '' e quem chama decide o que ela quer dizer."""
+    cmd = json_env_cmd("HETZNER_CAPACITY_PROVIDER_CMD", [sys.executable, "-I", os.path.join(HERE, "gc-session-ssh")]) + [op, name]
+    # vazio (rc 0 sem saída) → '' e quem chama decide; falhou/ilegível (não executa, prazo, rc≠0) → Unreadable: ninguém age em cima disso
+    try:
+        p = subprocess.run(cmd, capture_output=True, timeout=timeout_s, env=dict(os.environ, GC_SSH_HOST=host), stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        raise Unreadable(f"{op} {name} estourou o prazo ({timeout_s:g}s)")
+    except OSError as ex:
+        raise Unreadable(f"{op} {name} não rodou ({ex})")
+    if p.returncode != 0:
+        raise Unreadable(f"{op} {name} saiu com {p.returncode}: {p.stderr.decode('utf-8', 'replace').strip()[:120]}")
+    return p.stdout.decode("utf-8", "replace")
+
+
+def open_session_names() -> set:
+    """Os nomes das sessões que o gc tem ABERTAS (qualquer alias, qualquer template). Lista sem linha nenhuma é leitura suspeita (a cidade sempre tem ao menos o Mayor), não 'nenhuma aberta'."""
+    # vazio (.sessions sem nenhuma linha) → Unreadable: a varredura não age; falhou/ilegível (rc≠0, prazo, não é JSON, sem .sessions) → Unreadable também
+    doc = read_json_cmd("HETZNER_CAPACITY_SESSIONS_CMD", ["gc", "--city", CITY, "session", "list", "--json"], "gc session list", READ_TIMEOUT_GC_S)
+    rows = doc.get("sessions") if isinstance(doc, dict) else None
+    if not isinstance(rows, list) or not rows:
+        raise Unreadable("gc session list: sem a lista .sessions, ou vazia (leitura suspeita)")
+    return {x["session_name"] for x in rows if isinstance(x, dict) and isinstance(x.get("session_name"), str)
+            and x.get("closed") is not True and x.get("state") not in ("closed", "archived", "failed-create")}
+
+
+def session_bead_status(name: str) -> str:
+    """O status ('open', 'in_progress', 'closed'…) da bead de sessão do nome da tmux: a 2ª prova, independente da lista do gc (que pode vir cortada). Só `closed` deixa a varredura seguir."""
+    m = WISP_NAME.fullmatch(name)
+    if m is None:
+        raise Unreadable(f"{name}: o nome não tem a forma de sessão do gc")
+    bead = f"{m.group(2)}-wisp-{m.group(3)}"
+    # vazio (o bd não achou a bead) → Unreadable: sem a bead não há prova de que a sessão acabou; falhou/ilegível (rc≠0, prazo, não é JSON, bead que não é de sessão, sem status) → Unreadable também
+    rows = read_json_cmd("HETZNER_CAPACITY_SHOW_CMD", ["bd", "-C", CITY, "show"], "bd show", READ_TIMEOUT_BD_S, extra=(bead, "--json"))
+    row = rows[0] if isinstance(rows, list) and len(rows) == 1 else None
+    if not isinstance(row, dict) or row.get("id") != bead or row.get("issue_type") != "session" or not isinstance(row.get("status"), str) or not row["status"]:
+        raise Unreadable(f"bd show {bead}: não é a bead de sessão esperada")
+    return row["status"]
+
+
+def idle_for_s(host: str, name: str, now: int) -> int:
+    """Segundos desde a última atividade da tmux (op `get-last-activity` do provider). Sem data legível = Unreadable, nunca 'parada'."""
+    # vazio (o provider não imprimiu data: a tmux sumiu ou não respondeu) → Unreadable; falhou/ilegível (rc≠0, prazo, data fora do formato) → Unreadable também
+    out = provider_run(host, "get-last-activity", name, 60).strip()
+    try:
+        return now - calendar.timegm(time.strptime(out, "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        raise Unreadable(f"get-last-activity {name}: sem data legível ({out[:40]!r})")
+
+
+def read_orphans(path: str) -> dict:
+    """Os relógios das tmux órfãs já vistas: nome → {first, last, n, said}. Ausente ou ilegível = {}: os relógios recomeçam, e o pior caso é a varredura demorar mais ciclos para agir, nunca agir cedo."""
+    # vazio (arquivo ausente) → {}; falhou/ilegível (JSON ruim, forma errada, campo de tipo errado) → {} também (a entrada ruim some, as boas ficam)
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError, RecursionError):
+        return {}
+    d = d.get("orphans") if isinstance(d, dict) else None
+    if not isinstance(d, dict):
+        return {}
+    num = lambda v: isinstance(v, int) and not isinstance(v, bool)
+    return {k: v for k, v in d.items() if isinstance(v, dict) and num(v.get("first")) and num(v.get("last")) and num(v.get("n")) and isinstance(v.get("said"), str)}
+
+
+def kill_orphan(env: Env, cfg: dict, name: str) -> tuple:
+    """(estado, detalhe) de uma tentativa de encerrar a tmux órfã: 'morta' · 'reaberta' (o gc voltou a listá-la: não é órfã) · 'continua' (o stop disse ok e o nó ainda a tem) · 'falhou'."""
+    # falhou/ilegível (a releitura do gc, o stop ou a conferência no nó) → 'falhou', que NÃO é 'morta': a tmux segue na conta e o ciclo seguinte tenta de novo
+    try:
+        if name in open_session_names():
+            return "reaberta", ""
+        provider_run(cfg["host"], "stop", name, 90)
+        return ("continua" if name in list_sessions(env, cfg["host"]) else "morta"), ""
+    except Unreadable as e:
+        return "falhou", str(e)
+
+
+def reap_orphans(env: Env, cfg: dict, now: int) -> dict:
+    """Camada 3 da ga-0k82lw: a tmux do nó que o gc já deu por fechada segue ocupando vaga (e o oráculo a conta ocupada). Só age em tmux que cumpre TUDO: nome de sessão do gc, fora da lista de abertas do gc,
+    bead da sessão `closed` (2ª prova), órfã há `orphan_grace_s` em ORPHAN_MIN_SEEN ciclos seguidos e parada há `orphan_idle_s`. Modo `log` só registra; `kill` também encerra (no máximo ORPHAN_MAX_KILLS
+    por ciclo) e confere. Leitura que não deu = não age e não mexe nos relógios (orphans.json). Cada mudança de estado de uma tmux vai para events.jsonl."""
+    out = {"mode": cfg["reap_orphans"], "seen": [], "killed": [], "error": ""}
+    if out["mode"] == "off":
+        return out
+    os.makedirs(env.dir, exist_ok=True)
+    with open(env.lock, "a+") as lk:
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            out["error"] = "outro ciclo está rodando (lock)"
+            return out
+        # vazio (nó sem tmux, ou todas abertas no gc) → nenhum candidato e os relógios esvaziam; falhou/ilegível (list-running ou gc) → não age e NÃO mexe nos relógios
+        try:
+            names = list_sessions(env, cfg["host"])      # o nó ANTES do gc: a sessão que nasce entre as duas leituras tem a bead criada antes da tmux, então já está na lista do gc
+            open_now = open_session_names()
+        except Unreadable as e:
+            out["error"] = str(e)
+            return out
+        path = os.path.join(env.dir, "orphans.json")
+        old, cur, kills = read_orphans(path), {}, 0
+        for n in sorted(names):
+            if WISP_NAME.fullmatch(n) is None or n in open_now:
+                continue
+            p = old.get(n)
+            if p is None or not 0 <= now - p["last"] <= cfg["max_age_s"]:      # nunca vista, ou vista há tanto (ou no futuro) que "ciclos seguidos" não vale: o relógio recomeça
+                p = {"first": now, "last": now, "n": 0, "said": ""}
+            cur[n] = dict(p, last=now, n=p["n"] + 1)
+        for n in sorted(cur):
+            e, tag, why = cur[n], "vista", ""
+            if e["n"] >= ORPHAN_MIN_SEEN and now - e["first"] >= cfg["orphan_grace_s"]:
+                try:
+                    st = session_bead_status(n)
+                    if st != "closed":
+                        tag = f"bead-{st}"      # o gc não a lista mas a bead segue aberta: lista cortada ou sessão em transição, NÃO órfã
+                    elif idle_for_s(cfg["host"], n, now) >= cfg["orphan_idle_s"]:
+                        tag = "parada"
+                    else:
+                        tag = "ativa"
+                except Unreadable as ex:
+                    tag, why = "ilegivel", str(ex)
+            if tag == "parada" and out["mode"] == "kill" and kills < ORPHAN_MAX_KILLS:
+                kills += 1
+                tag, why = kill_orphan(env, cfg, n)
+            if tag != e["said"]:
+                append_log(env.events, {"t": now, "event": "orphan", "name": n, "state": tag, "why": why, "seen": e["n"], "since_s": now - e["first"], "mode": out["mode"]})
+                e["said"] = tag
+            if tag == "morta":
+                out["killed"].append(n)
+        for n in [n for n, e in cur.items() if e["said"] in ("morta", "reaberta")]:
+            del cur[n]
+        atomic_write(path, json.dumps({"orphans": cur}, ensure_ascii=False, sort_keys=True))
+        out["seen"] = sorted(cur)
+    return out
+
+
 def say(args, obj: dict, text: str) -> None:
     print(json.dumps(obj, ensure_ascii=False, sort_keys=True) if args.json else text)
 
@@ -867,8 +1019,14 @@ def main(argv=None) -> int:
         res = tick(env, cfg, now, ssh_dest, refresh=ssh_dest is not None)
         if args.cmd == "step":
             d = res["decision"]
-            say(args, {"ceiling": res["state"]["ceiling"], "refreshed": res["refreshed"], "locked": res["locked"], "decision": d, "alarms": res["alarms"]},
-                f"degrau {res['state']['ceiling']}" + (f" — {d['action']}: {d['why']}" if d else " — leitura em dia (ou outro ciclo rodando)"))
+            try:
+                orph = reap_orphans(env, cfg, now)
+            except Exception as e:      # a varredura é um extra do ciclo: um bug nela não derruba o degrau (já gravado); vai para o alarme e para a saída, não some
+                orph = {"mode": cfg["reap_orphans"], "seen": [], "killed": [], "error": f"erro interno: {type(e).__name__}: {e}"}
+                append_log(env.events, {"t": now, "event": "alarm", "why": f"varredura de tmux órfã: {orph['error']}"})
+            say(args, {"ceiling": res["state"]["ceiling"], "refreshed": res["refreshed"], "locked": res["locked"], "decision": d, "alarms": res["alarms"], "orphans": orph},
+                f"degrau {res['state']['ceiling']}" + (f" — {d['action']}: {d['why']}" if d else " — leitura em dia (ou outro ciclo rodando)")
+                + (f"; tmux órfã: {len(orph['seen'])} vista(s), {len(orph['killed'])} encerrada(s)" if orph["seen"] or orph["killed"] else "") + (f"; varredura de órfã: {orph['error']}" if orph["error"] else ""))
             return 0
         v = verdict(env, cfg, res["state"], now, claude)
         v["alarms"] = res["alarms"]
