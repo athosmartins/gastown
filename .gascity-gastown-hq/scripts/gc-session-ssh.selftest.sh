@@ -867,7 +867,29 @@ g_lr() {
   for x in lr-1 lr-5 lr-6; do pv stop $x </dev/null; done; rm -f "$T/state/a/running/"* 2>/dev/null; cfg 3
 }
 
-all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group acct && g_acct; group lr && g_lr; return 0; }
+g_abort() {  # ga-0k82lw: o start que o mini ABANDONOU (prazo do provider estourado, ou o engine mata o processo no meio) não pode deixar sessão no host: o script do host ainda roda e abriria a tmux "depois do close"
+  local bin="$T/home/.local/bin" real i pid; real=$(command -v sha256sum); mkdir -p "$bin"
+  slowhost() {  # passo lento ANTES do new-session: o portão de uma sessão real roda `sha256sum` no host (real_gate); o falso marca que começou, espera $1 s e chama o de verdade
+    rm -f "$T/slow.mark"; printf '#!/bin/sh\n: > "%s"\nsleep %s\nexec "%s" "$@"\n' "$T/slow.mark" "$1" "$real" > "$bin/sha256sum"; chmod +x "$bin/sha256sum"
+  }
+  cfg 3 2; slowhost 5; fresh
+  pv start abort-1 < <(req cat); [ $RC = 1 ] && has "$T/err" 'não respondeu em 2s'; ok $? "abort: prazo do start estourado → o start falha dizendo o prazo (rc=$RC)"
+  sleep 6   # o passo lento acaba aqui e o script do host (que ninguém espera mais) seguiria até o new-session
+  [ "$(count)" = 0 ]; ok $? "abort: ...e o host NÃO ganha a sessão depois (o script abandonado não a abre) (tmux: $(count))"
+  tmux -L "$SOCK" kill-server 2>/dev/null
+  cfg 3; slowhost 5; fresh
+  env HOME="$T/home" GC_SSH_CONFIG="$T/cfg.json" GC_SSH_BIN="$T/bin/ssh" GC_EXEC_STATE_DIR="$T/state" "$P" start abort-2 < <(req cat) >"$T/out" 2>"$T/err" & pid=$!
+  waitfor "$T/slow.mark"; kill -9 $pid; wait $pid 2>/dev/null   # o engine aborta o create e mata o processo do provider: nenhum handler roda, o ssh e o script do host ficam órfãos
+  sleep 7
+  [ "$(count)" = 0 ]; ok $? "abort: provider morto no meio do start (kill -9) → o host NÃO ganha a sessão (tmux: $(count))"
+  tmux -L "$SOCK" kill-server 2>/dev/null
+  cfg 3; slowhost 2; fresh
+  pv start abort-3 < <(req cat); ok $RC "abort: (controle) start lento mas dentro do prazo abre a sessão (rc=$RC $(head -c 160 "$T/err"))"
+  [ "$(count)" = 1 ]; ok $? "abort: (controle) ...e ela está no host (tmux: $(count))"
+  pv stop abort-3 </dev/null; rm -f "$bin/sha256sum" "$T/state/a/running/"* 2>/dev/null; cfg 3
+}
+
+all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group acct && g_acct; group lr && g_lr; group abort && g_abort; return 0; }
 
 if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
 [ -n "${GCSSH_MUTANTS_ONLY:-}" ] || { all; echo "== $((n-fails))/$n ok =="; }  # GCSSH_MUTANTS_ONLY=grupo: pula os casos e roda só os mutantes cujo grupo é esse
