@@ -12,7 +12,7 @@
        written and a named alert says which login is missing. Never calls claude, costs no credit.
 
        KILL SWITCH (no reload needed): touch /Users/athos/gt/.gascity-gastown-hq/.gc/no-crew-account.
-       Dry run: python3 .../claude-crew-account.py --dry-run (stderr only: no write, no notify, no real log).
+       Dry run: python3 .../claude-crew-account.py with its dry-run option (stderr only: no write, no notify, no real log).
 
        ACTIVATION is a separate, human step (merged != live): copy to ~/Library/LaunchAgents and `launchctl load` it
        AFTER the script exists on main and Athos has OK'd the live acceptance (switch + back). See docs/claude-crew-account.md. -->

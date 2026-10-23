@@ -7,7 +7,7 @@
   <!-- Child-Priority Janitor (2026-10-18, ga-p7hymz). A slice is born with the priority of its
        parent or lower, never lower than the parent's.
 
-       PROBLEM: `bd create --parent` does not inherit the parent's priority (default P2) and
+       PROBLEM: `bd create` with the parent option does not inherit the parent's priority (default P2) and
        slicers forget `-p`. 4 cuts of ga-w7qwl1.1 (P0) were born P2, and the Pilot, which orders
        by priority, treated P0 work as P2.
 

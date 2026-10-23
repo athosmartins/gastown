@@ -5,7 +5,7 @@
   <key>Label</key><string>com.gascity.mbp-nightly-reseed</string>
 
   <!-- Reseed noturno da arvore-base e do site-packages do MBP (ga-wuwuk7, epico ga-sokx7u):
-       mbp-run.sh --seed wa e --seed ps, com veredito OK/FALHOU/PULADO no stdout e em
+       mbp-run.sh no modo de semeadura (seed), uma vez para wa e outra para ps, com veredito OK/FALHOU/PULADO no stdout e em
        .gc/logs/mbp-nightly-reseed.jsonl, e notify quando falha. Chave do offload desligada
        (.gc/mbp-offload.on ausente, com .gc acessivel) = PULADO, sem notify; o que o script nao
        consegue olhar, criar, remover ou gravar (chave, lock, pid do dono) = FALHOU, com notify.

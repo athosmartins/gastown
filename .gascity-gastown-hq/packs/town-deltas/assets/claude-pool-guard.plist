@@ -11,7 +11,7 @@
           fingerprint, never a key. Repeated only after 6 h if nobody fixed it; nothing is sent about it once it is fixed.
        2. PER-VERSION TEST: whenever the installed claude version has not been tested (and every 30 min while it is failing), ask claude
           — on a scratch item, never the pool's — whether it still reads the credential the way the pool writes it. The result per version
-          is recorded (`claude-pool-guard.py status [--json]`). A FAIL writes <city>/.gc/pool-account-degraded: the daemon stops switching,
+          is recorded (`claude-pool-guard.py status`, optionally with its json option). A FAIL writes <city>/.gc/pool-account-degraded: the daemon stops switching,
           the wrapper stops pointing new launches at the pool item (they answer on the current login), ONE alert says "troca automática
           DESLIGADA". Nothing is deleted, no running session is touched. A later PASS removes the marker by itself.
        3. LIVENESS: no clean daemon run for 10 min -> one alert.

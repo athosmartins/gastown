@@ -6,7 +6,7 @@
 
   <!-- Production-stall watchdog (2026-06-18). Closes the gap that left the system
        producing NOTHING for ~2h: the WA rig root was AHEAD of origin/main (unpushed
-       commits) → the deploy cron's `git pull --ff-only` aborted → no daemon deployed,
+       commits) → the deploy cron's fast-forward-only `git pull` aborted → no daemon deployed,
        and NO monitor acted. town-root-reconciler only ntfy-alerts a sleeping human and
        won't auto-reconcile an ahead/diverged root; pipeline-throughput-heartbeat
        watches only gate-merge / pilot FLOW (blind to deploy-block + stuck execution).

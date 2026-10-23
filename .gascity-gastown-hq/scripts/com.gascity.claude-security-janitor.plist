@@ -22,7 +22,7 @@
        and in `launchctl print`). Symlinks and look-alike names are never touched.
 
        KILL-SWITCH: CLAUDE_SECURITY_JANITOR_ENABLED=0 -> no-op. DRY-RUN: CLAUDE_SECURITY_JANITOR_DRY_RUN=1
-       (or `claude-security-janitor.py --dry-run` by hand: nothing deleted, nothing sent, no state written).
+       (or `claude-security-janitor.py` run by hand with its dry-run option: nothing deleted, nothing sent, no state written).
        CLAUDE_SECURITY_JANITOR_PROD=1 below is what lets it act on the REAL ~/.claude/security and the real
        user temp dir; without it those targets are only ever a dry run.
        CADENCE: StartInterval=3593 (~1 h), far above the measured run (5.6 s wall on 19/10 at load 44,
@@ -30,7 +30,7 @@
        No KeepAlive. Single instance (flock). Nice 10 + low-priority IO: the mini lives at load 40-60.
 
        NOT LOADED BY MERGING THIS FILE. Mergeado != vivo: copy it to ~/Library/LaunchAgents and
-       `launchctl bootstrap` it; see docs/runbooks/claude-security-janitor.md. Run it with --dry-run first. -->
+       `launchctl bootstrap` it; see docs/runbooks/claude-security-janitor.md. Run it in dry-run mode first. -->
 
   <key>ProgramArguments</key>
   <array>
