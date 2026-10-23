@@ -6,9 +6,10 @@
 #
 # O QUE PROVA: o bloco do topo do disk-snapshot-guard.sh, quando roda como ROOT e a cópia do root ainda não está confirmada,
 #   executa UMA vez o instalador (--no-reload) com o hash fixado neste commit, e depois não faz mais nada. E o contrário, que
-#   dá dentes ao teste: instalador adulterado, ausente ou symlink = NADA instalado e o guard segue (rc 0); sem root (ou com
-#   $EUID importado do ambiente) = nada; o launchctl falso NUNCA recebe bootout/bootstrap (a rodada não é morta no meio e o
-#   job não fica descarregado); a segunda rodada e a rodada da própria cópia do root não chamam o instalador.
+#   dá dentes ao teste: instalador adulterado, ausente ou symlink = NADA instalado e o guard segue (rc 0); sem root = nada, e um
+#   $EUID importado do ambiente não muda o que roda (o uid vem de `id -u`); na rodada 1 o launchctl falso NUNCA recebe
+#   bootout/bootstrap (a rodada não é morta no meio e o job não fica descarregado); a segunda rodada e a rodada da própria
+#   cópia do root não chamam o instalador. Mutantes (8): o mesmo núcleo contra cópias do guard com uma proteção desligada.
 #
 # COMO É HERMÉTICO: sem sudo, sem launchd, sem /usr/local nem /Library reais. Uma "raiz falsa" (DSG_ROOT_PFX) faz o papel de
 #   "/", o uid de quem roda faz o papel do root (DSG_ROOT_UID, DSG_OWNER) e launchctl e PlistBuddy são stubs de bash. Os ganchos só
@@ -165,6 +166,7 @@ core() {
   expect_rc 0 "instalador ausente: o guard segue (rc 0)"
   [ ! -e "$PROG" ] && [ ! -e "$MARK" ] && ok "instalador ausente: nada instalado" || bad "instalador ausente: algo foi instalado"
   new_world; mv "$REPO/scripts/install-disk-snapshot-guard-root.sh" "$W/real-installer.sh"; ln -s "$W/real-installer.sh" "$REPO/scripts/install-disk-snapshot-guard-root.sh"; run_guard
+  expect_rc 0 "instalador symlink: o guard segue (rc 0)"
   [ ! -e "$PROG" ] && [ ! -e "$MARK" ] && ok "instalador symlink: recusado, nada instalado" || bad "instalador symlink: instalou"
 
   # 6. instalador que falha (plist sumiu → rc ≠ 0): sem marcador, guard rc 0
