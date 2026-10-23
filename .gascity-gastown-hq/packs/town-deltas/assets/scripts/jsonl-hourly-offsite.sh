@@ -33,7 +33,13 @@
 #     Este script lê esse `partial=` do HEAD, grava no manifest (`partial` {note, tables}) e em latest.json, e CONTA execuções seguidas com tabela atrasada (`consecutive_partial`
 #     no estado): JHO_ALERT_AFTER (2) seguidas => `notify` forçado, no máx. 1 a cada JHO_ALERT_EVERY_S, com contagem e alerta próprios (não gasta o limite do alerta de falha).
 #     Um HEAD limpo zera. NÃO veta o upload: as outras tabelas e os issues verificados continuam subindo (vetar pararia o RPO de tudo por causa de uma tabela).
-#   - RPO real = intervalo entre runs do exporter + 60 min + duração do run: típico ~1h35, pior medido ~4h15 (runbook). `data_as_of` é quando o dado MUDOU (cidade ociosa o envelhece).
+#   - cadência (ga-c0939v.7): o order roda a cada 30 min, não a cada 1 h. Todo order `cooldown` da cidade dispara com SOBRA sobre o intervalo (mediana ~6 min, p90 ~18 min, cauda de
+#     40-80 min: despacho do controller sob load 60; 706 intervalos de 8 orders). Com `1h`, 93% dos 124 gaps entre publicações do latest.json (16-23/10) passaram de 60 min, mediana 1h10.
+#     Com 30 min, 3,7% dos disparos passam de 60 min; o resto é parada do controller, e quem cobre é o alarme `--age-check`. RPO real = idade do dado no HEAD que o exporter comitou +
+#     tempo até a próxima publicação; `data_as_of` é quando o dado MUDOU (cidade ociosa o envelhece). Medir de novo: jsonl_hourly_cadence.py (docs/runbooks/jsonl-hourly-offsite.md).
+#   - disco (ga-c0939v.7): o piso é proporcional ao pacote (need_free_mb: 2x o último pacote + 256 MB de folga, mínimo 512 MB), não 1024 MB fixos. O fixo barrou o upload com 797 MB e 867 MB
+#     livres (2 runs em 7 dias, 2 h+ sem snapshot cada) para escrever um arquivo de ~175 MB. Abaixo do piso: rc 2 (conta, e o alarme de idade cobre). NÃO cobre o exporter: com o disco baixo ele se
+#     espaça de propósito (ga-j2f5v5), e aí o `latest.json` continua em dia enquanto o `data_as_of` envelhece.
 #
 # ESTADOS (três, e o neutro é inerte): rc 0 = snapshot novo verificado, ou HEAD igual ao último verificado, objeto ainda no S3 e exporter vivo (só atualiza `checked_at`) ·
 #   rc 1 = falhou, ficou "broken" ou "suspect" (queda brusca) ou FONTE PARADA: o exporter não reescreve os bancos obrigatórios (mtime de <db>/issues.jsonl) há mais de JHO_STALE_SOURCE_S (6 h), ou escreve e não
@@ -41,6 +47,7 @@
 #   ainda sobe e move latest.json (um `checked_at` novo, uma vez), sem zerar a contagem. HEAD velho com a árvore igual NÃO é fonte parada: o exporter só comita quando o dado muda (7 intervalos > 6 h em 12 dias, até 10 h 22, com ele rodando) ·
 #   rc 2 = não deu para avaliar (sem aws/git/python3/jq, archive ilegível, pouco disco, estado ou lock sem como criar/gravar): nada foi tentado e conta como run sem snapshot ·
 #   rc 3 = uso. Outro run em andamento (pid vivo no lock) => rc 0 em silêncio.
+#   (--age-check tem os próprios códigos, abaixo: 0 em dia · 1 atrasado ou ausente · 2 sem leitura.)
 #
 # RETENÇÃO (só no prefixo jsonl-hourly/snap/, só no formato exato de chave; depois do snapshot novo verificado):
 #   últimas JHO_KEEP_RECENT_H (48) horas + o 1º snapshot de cada dia UTC até JHO_KEEP_DAILY_DAYS (14) + os JHO_KEEP_FLOOR (6) mais novos + o apontado por
@@ -50,9 +57,15 @@
 #   `notify` com NOTIFY_FORCE_PUSH=1 NOTIFY_STRICT_EXIT=1 (sem o force o roteador manda esta fonte ao digest mudo: rc 0, nada no telefone). Só rc 0 conta como entregue:
 #   grava last_alert_epoch (no máx. 1 a cada JHO_ALERT_EVERY_S, 6 h) e loga "alerta enviado"; senão loga AVISO e o run seguinte tenta de novo.
 #   Sem como gravar o estado, avisa sem esperar o 2º run e, sem registro do último aviso, a cada run: nunca mudo.
-# MODO --status: lê latest.json do S3: há quanto tempo o script bateu o ponto (OK < 2h30 => o exporter escrevia naquela hora) e quando o dado mudou (rc 0 OK, 1 STALE, 2 sem leitura ou futuro).
+# MODO --status: lê latest.json do S3: há quanto tempo o script bateu o ponto (OK <= 75 min, o mesmo limite do --age-check => o exporter escrevia naquela hora) e quando o dado mudou (rc 0 OK, 1 STALE, 2 sem leitura ou futuro).
+# MODO --age-check (ga-c0939v.7): alarme de idade, só leitura, em order próprio de 10 min (o run que atrasa não pode ser quem avisa). head-object do latest.json no S3 -> LastModified (relógio do S3, não um
+#   campo que este script escreve) -> idade. TRÊS estados, e só o primeiro é "em dia":
+#   rc 0 EM DIA (idade <= JHO_AGE_ALERT_S, 75 min) · rc 1 ATRASADO (acima) ou AUSENTE (404: nenhum snapshot verificado está publicado) => notify forçado na hora, no máx. 1 a cada JHO_ALERT_EVERY_S (6 h);
+#   recuperou e atrasou de novo => avisa de novo na hora · rc 2 SEM LEITURA (aws/jq/python3 ausente, S3 mudo, 403, LastModified ausente, ilegível, sem fuso ou no futuro) => NUNCA "em dia": conta, e avisa na
+#   JHO_AGE_UNREADABLE_AFTER-ésima (2) seguida, para uma falha de rede isolada não acordar ninguém. Estado próprio (jsonl-hourly-offsite-age-state.json), sem lock, nada escrito no S3 nem no estado do upload.
+#   NÃO vê o controller parado (o order roda nele). A perna launchd que não depende dele está pronta e NÃO instalada: docs/runbooks/jsonl-hourly-offsite-age.plist.example, bead ga-c0939v.8.
 #
-# COSTURAS DE TESTE: JHO_LIB=1 só define funções; JHO_ARCHIVE, JHO_STATE_DIR, JHO_LOG, JHO_AWS, JHO_NOTIFY, JHO_NOW (epoch) apontam para fixtures.
+# COSTURAS DE TESTE: JHO_LIB=1 só define funções; JHO_ARCHIVE, JHO_STATE_DIR, JHO_LOG, JHO_AWS, JHO_NOTIFY, JHO_NOW (epoch), JHO_FREE_MB (espaço livre, em MB) apontam para fixtures.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -72,7 +85,10 @@ NOTIFY="${JHO_NOTIFY:-/Users/athos/.local/bin/notify}"
 TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
 S3_TIMEOUT="${JHO_S3_TIMEOUT:-1200}"
 BUILD_TIMEOUT="${JHO_BUILD_TIMEOUT:-900}"
-MIN_FREE_MB="${JHO_MIN_FREE_MB:-1024}"
+MIN_FREE_MB="${JHO_MIN_FREE_MB:-}"                    # vazio = proporcional ao pacote (need_free_mb); um número explícito vence
+MIN_FREE_FLOOR_MB="${JHO_MIN_FREE_FLOOR_MB:-512}"
+MIN_FREE_SLACK_MB="${JHO_MIN_FREE_SLACK_MB:-256}"     # folga para o resto do volume (o Dolt da cidade vive nele)
+ARTIFACT_GUESS_MB="${JHO_ARTIFACT_GUESS_MB:-200}"     # tamanho presumido do pacote quando o último não é legível (medido em 23/10: ~175 MB)
 LOCK_STALE_MIN="${JHO_LOCK_STALE_MIN:-120}"
 KEEP_RECENT_H="${JHO_KEEP_RECENT_H:-48}"
 KEEP_DAILY_DAYS="${JHO_KEEP_DAILY_DAYS:-14}"
@@ -83,7 +99,12 @@ REQUIRED_DBS="${JHO_REQUIRED_DBS:-hq,whatsapp_automation}"
 # bancos de teste/benchmark que o jsonl-export arquiva (bench_hq_copy tem config/metadata com 0 bytes; fixdepkeys_* são de teste): NÃO entram no
 # artefato e não vetam o snapshot. `-` e não `:-`: JHO_IGNORE_DBS="" (vazio) desliga de propósito. Um obrigatório que case com o padrão => broken.
 IGNORE_DBS="${JHO_IGNORE_DBS-bench_*,fixdepkeys_*}"
-STATUS_MAX_CHECK_AGE_S="${JHO_STATUS_MAX_CHECK_AGE_S:-9000}"   # 2h30: dois ciclos horários + folga
+AGE_ALERT_S="${JHO_AGE_ALERT_S:-4500}"                          # 75 min (ga-c0939v.7): latest.json mais velho que isso no S3 => ATRASADO
+AGE_UNREADABLE_AFTER="${JHO_AGE_UNREADABLE_AFTER:-2}"           # verificações seguidas sem leitura até avisar
+AGE_S3_TIMEOUT="${JHO_AGE_S3_TIMEOUT:-60}"                      # o alarme é um head-object: não espera 20 min por um S3 mudo
+AGE_STATE_FILE="$STATE_DIR/jsonl-hourly-offsite-age-state.json"
+MAIN_STATE_FILE="$STATE_FILE"                                   # o estado do upload: o alarme só o LÊ (contexto do aviso)
+STATUS_MAX_CHECK_AGE_S="${JHO_STATUS_MAX_CHECK_AGE_S:-$AGE_ALERT_S}"   # o mesmo limite do alarme (antes 2h30, quando o order era horário)
 STALE_SOURCE_S="${JHO_STALE_SOURCE_S:-21600}"                  # exporter sem reescrever os bancos obrigatórios há mais de 6 h => fonte parada (medido: runs a cada 27 min, máx 189)
 # ga-tyaozh: sem isso o aws-cli embrulha o corpo num AwsChunkedWrapper que não rebobina e aborta o retry (mesma razão do dolt-s3-backup.sh)
 export AWS_REQUEST_CHECKSUM_CALCULATION=when_required
@@ -166,6 +187,79 @@ register_partial() {
   fi
 }
 
+# Quanto disco livre o run exige: 2x o último pacote (o tar.gz + uma cópia de folga) + MIN_FREE_SLACK_MB, nunca menos que MIN_FREE_FLOOR_MB. JHO_MIN_FREE_MB explícito vence.
+# vazio → palpite (ARTIFACT_GUESS_MB); falhou/ilegível → palpite também (state_get devolve o default nos dois): sem tamanho legível, texto, 0 ou ausente nunca vira "não precisa de nada".
+need_free_mb() {
+  local b mb need
+  if [ -n "$MIN_FREE_MB" ]; then echo "$MIN_FREE_MB"; return 0; fi
+  b="$(state_get '.last_success_bytes' '')"
+  case "$b" in ""|*[!0-9]*) mb="$ARTIFACT_GUESS_MB" ;; *) mb=$(( (b + 1048575) / 1048576 )); [ "$mb" -ge 1 ] || mb="$ARTIFACT_GUESS_MB" ;; esac
+  need=$(( 2 * mb + MIN_FREE_SLACK_MB ))
+  [ "$need" -ge "$MIN_FREE_FLOOR_MB" ] || need="$MIN_FREE_FLOOR_MB"
+  echo "$need"
+}
+
+# Idade, em segundos, de um LastModified (ISO-8601 com fuso, do aws-cli v2, ou RFC 1123, do v1) no instante $2 (epoch). Sai 1 e não escreve nada se não for uma data COM fuso:
+# sem fuso não dá para saber a hora, e sem hora não há idade.
+lm_age_s() { # lastmodified now_epoch
+  python3 -I -c '
+import datetime, email.utils, sys
+s, now = sys.argv[1], int(sys.argv[2])
+try:
+    d = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+except ValueError:
+    try:
+        d = email.utils.parsedate_to_datetime(s)
+    except (TypeError, ValueError):
+        sys.exit(1)
+if d.tzinfo is None:
+    sys.exit(1)
+print(now - int(d.timestamp()))' "$1" "$2" 2>/dev/null
+}
+
+# Mesmo contrato do notify_fail (push forçado, saída estrita, só rc 0 é entregue), com título próprio: aqui o aviso é "o S3 está velho", não "um run falhou".
+notify_age() { NOTIFY_FORCE_PUSH=1 NOTIFY_STRICT_EXIT=1 "$NOTIFY" -t "Jsonl offsite: S3 atrasado" -p 4 "🚨 $*" >/dev/null 2>&1; }
+
+# Aviso do alarme, no máx. 1 a cada ALERT_EVERY_S. Só rc 0 conta como entregue: grava last_alert_epoch; senão AVISO e o run seguinte tenta de novo.
+# Sem como ler/gravar o estado do alarme o limite não existe e o aviso sai a cada run: nunca mudo.
+age_alert() { # texto
+  local now last arc
+  now="$(now_epoch)"; last="$(state_get '.last_alert_epoch' 0)"
+  [ $((now - last)) -ge "$ALERT_EVERY_S" ] || return 0
+  notify_age "$*"; arc=$?
+  if [ $arc -eq 0 ]; then
+    state_update '.last_alert_epoch = $e' --argjson e "$now" || log "IDADE: AVISO: alerta saiu mas last_alert_epoch não gravou (repete no próximo run)"
+    log "IDADE: alerta enviado"
+  else
+    log "IDADE: AVISO: alerta NÃO entregue (rc=$arc); o próximo run tenta de novo"
+  fi
+}
+
+# Não consegui medir a idade (ferramenta ausente, S3 mudo, 403, LastModified ausente/ilegível/no futuro): NÃO é "em dia". Conta; avisa na AGE_UNREADABLE_AFTER-ésima seguida.
+age_unreadable() { # motivo
+  local reason="$1" n
+  n="$(state_get '.consecutive_unreadable' 0)"; n=$((n + 1))
+  state_update '.consecutive_unreadable = $n | .last_check_at = $t | .last_state = "unreadable" | .last_reason = $r' --argjson n "$n" --arg t "$(iso_now)" --arg r "$reason" \
+    || { log "IDADE: AVISO: não gravei o estado do alarme; sem contador, aviso já"; n=$AGE_UNREADABLE_AFTER; }
+  log "IDADE: SEM LEITURA ($n seguida(s)): $reason"
+  echo "AGE: UNKNOWN $reason"
+  if [ "$n" -ge "$AGE_UNREADABLE_AFTER" ]; then
+    age_alert "não consegui medir a idade do latest.json no S3 ($n verificações seguidas sem leitura): $reason. Sem leitura não é 'em dia': o upload horário pode estar parado sem ninguém ver."
+  fi
+  exit 2
+}
+
+# Contexto SÓ para o texto do aviso: o que o upload sabe de si (estado dele, lido e nunca escrito). Motivo só quando há falhas seguidas: com 0 ele é o da última falha de dias atrás.
+# vazio → sem contexto; falhou/ilegível → sem contexto: o aviso sai igual, ele não depende disto.
+age_context() {
+  local ok n why
+  ok="$(jq -r '.last_success_at // empty' "$MAIN_STATE_FILE" 2>/dev/null)"; n="$(jq -r '.consecutive_not_ok // empty' "$MAIN_STATE_FILE" 2>/dev/null)"
+  case "$n" in ""|*[!0-9]*) n="" ;; esac
+  why=""; if [ -n "$n" ] && [ "$n" -gt 0 ]; then why="$(jq -r '.last_not_ok_reason // empty' "$MAIN_STATE_FILE" 2>/dev/null)"; fi
+  [ -n "$ok$n" ] || return 0
+  printf ' Estado do upload: último ok %s; %s run(s) seguido(s) sem snapshot novo%s.' "${ok:-?}" "${n:-?}" "${why:+ (último motivo: $why)}"
+}
+
 s3key_artifact() { echo "$PREFIX/snap/$1.tar.gz"; }       # $1 = stem <stamp>-<sha12>
 s3key_manifest() { echo "$PREFIX/snap/$1.manifest.json"; }
 s3key_latest()   { echo "$PREFIX/latest.json"; }
@@ -203,19 +297,23 @@ if [ "${JHO_LIB:-0}" = "1" ]; then return 0 2>/dev/null || exit 0; fi
 MODE="run"
 case "${1:-}" in
   --status) MODE="status" ;;
+  --age-check) MODE="age"; STATE_FILE="$AGE_STATE_FILE"; S3_TIMEOUT="$AGE_S3_TIMEOUT" ;;   # estado e timeout próprios; o do upload (MAIN_STATE_FILE) só é lido
   "") ;;
   -h|--help) sed -n '2,/^set -uo/{/^set -uo/!p;}' "${BASH_SOURCE[0]}"; exit 0 ;;
-  *) echo "uso: jsonl-hourly-offsite.sh [--status]" >&2; exit 3 ;;
+  *) echo "uso: jsonl-hourly-offsite.sh [--status | --age-check]" >&2; exit 3 ;;
 esac
 
-unknown() { # rc 2, sem veredito. Em run conta como run sem snapshot (antes só stderr: PATH sem /opt/homebrew/bin falhava toda hora, mudo); em --status só diz
-  if [ "$MODE" = run ]; then log "UNKNOWN: $*"; register_not_ok "unknown: $*"; echo "RESULT: unknown $*"; else echo "UNKNOWN: $*" >&2; fi
+unknown() { # rc 2, sem veredito. Em run conta como run sem snapshot (antes só stderr: PATH sem /opt/homebrew/bin falhava toda hora, mudo); em --age-check conta como verificação sem leitura; em --status só diz
+  if [ "$MODE" = run ]; then log "UNKNOWN: $*"; register_not_ok "unknown: $*"; echo "RESULT: unknown $*"
+  elif [ "$MODE" = age ]; then age_unreadable "$*"
+  else echo "UNKNOWN: $*" >&2; fi
   exit 2
 }
+NEED_TOOLS="jq git python3"; [ "$MODE" != age ] || NEED_TOOLS="jq python3"   # o alarme só lê o S3: não usa git nem o helper
 [ -n "$TIMEOUT_BIN" ] || unknown "timeout (GNU) ausente"
-for t in jq git python3; do command -v "$t" >/dev/null 2>&1 || unknown "$t ausente"; done
+for t in $NEED_TOOLS; do command -v "$t" >/dev/null 2>&1 || unknown "$t ausente"; done
 [ -x "$AWS" ] || command -v "$AWS" >/dev/null 2>&1 || unknown "aws ausente ($AWS)"
-[ -f "$PY" ] || unknown "helper ausente: $PY"
+[ "$MODE" = age ] || [ -f "$PY" ] || unknown "helper ausente: $PY"
 
 # ── --status ─────────────────────────────────────────────────────────────────────────────
 if [ "$MODE" = status ]; then
@@ -236,6 +334,47 @@ now=int(sys.argv[3]); print(now-ep(sys.argv[1]), now-ep(sys.argv[2]))' "$checked
   # third-state-waiver: o veredito (OK/STALE) já saiu das datas acima; esta leitura só monta o texto da linha (vazio = latest.json sem `partial`, que é o normal)
   echo "STATUS: $verdict checked_at=$checked (há ${check_age}s) data_as_of=$asof (há ${asof_age}s) snapshot=$(jq -r '.snapshot_key' "$tmp")$(jq -r 'if (.partial // "") != "" then " partial=" + .partial else "" end' "$tmp" 2>/dev/null)"
   exit $rc
+fi
+
+# ── --age-check (ga-c0939v.7) ─────────────────────────────────────────────────────────────────────────
+if [ "$MODE" = age ]; then
+  now="$(now_epoch)"
+  herr="$(mktemp "${TMPDIR:-/tmp}/jho-age.XXXXXX")" || unknown "mktemp falhou"
+  trap 'rm -f "$herr"' EXIT
+  # head-object do latest.json: 0 existe · 1 não existe (404) · 2 não sei (403, rede, timeout).
+  # vazio → 404: o objeto não existe, nenhum snapshot verificado está publicado: AUSENTE, rc 1, avisa já; falhou/ilegível (rc 2) → SEM LEITURA, nunca "em dia"
+  hjson="$(s3_head "$(s3key_latest)" 2>"$herr")"; hrc=$?
+  if [ $hrc -eq 1 ]; then
+    ctx="$(age_context)"
+    state_update '.consecutive_unreadable = 0 | .last_check_at = $t | .last_state = "missing"' --arg t "$(iso_now)" || log "IDADE: AVISO: estado do alarme não gravado (sem relógio de aviso, o aviso sai a cada run)"
+    log "IDADE: AUSENTE: $(s3key_latest) não existe em s3://$BUCKET$ctx"
+    echo "AGE: MISSING $(s3key_latest) não existe em s3://$BUCKET"
+    age_alert "o latest.json do upload horário NÃO EXISTE no S3 (s3://$BUCKET/$(s3key_latest)): nenhum snapshot verificado está publicado.$ctx"
+    exit 1
+  elif [ $hrc -ne 0 ]; then
+    unknown "S3 não respondeu ao head-object de $(s3key_latest): $(tail -c 200 "$herr" | tr '\n' ' ')"
+  fi
+  # vazio → o head-object veio sem LastModified: SEM LEITURA; falhou/ilegível (jq, data sem fuso, lixo) → SEM LEITURA também
+  lm="$(printf '%s' "$hjson" | jq -r '.LastModified // empty' 2>/dev/null)"
+  [ -n "$lm" ] || unknown "head-object de $(s3key_latest) sem LastModified"
+  age="$(lm_age_s "$lm" "$now")" || unknown "LastModified ilegível ou sem fuso horário: '$lm'"
+  [[ "$age" =~ ^-?[0-9]+$ ]] || unknown "idade ilegível ('$age') para o LastModified '$lm'"
+  # relógio daqui ou do S3 fora de hora: idade negativa grande não é "recente" (até 5 min de diferença é tolerada e vale idade 0)
+  if [ "$age" -lt -300 ]; then unknown "LastModified $lm está ${age#-}s no futuro: relógio daqui ou do S3 fora de hora"; fi
+  [ "$age" -ge 0 ] || age=0
+  prev="$(state_get '.last_state' '')"
+  if [ "$age" -le "$AGE_ALERT_S" ]; then
+    state_update '.consecutive_unreadable = 0 | .last_alert_epoch = 0 | .last_check_at = $t | .last_state = "ok" | .last_age_s = $a' --arg t "$(iso_now)" --argjson a "$age" || log "IDADE: AVISO: estado do alarme não gravado"
+    case "$prev" in late|missing|unreadable) log "IDADE: voltou ao normal (latest.json com ${age}s; antes: $prev)" ;; esac
+    echo "AGE: OK age=${age}s limit=${AGE_ALERT_S}s last_modified=$lm"
+    exit 0
+  fi
+  ctx="$(age_context)"
+  state_update '.consecutive_unreadable = 0 | .last_check_at = $t | .last_state = "late" | .last_age_s = $a' --arg t "$(iso_now)" --argjson a "$age" || log "IDADE: AVISO: estado do alarme não gravado (sem relógio de aviso, o aviso sai a cada run)"
+  log "IDADE: ATRASADO: latest.json com ${age}s (limite ${AGE_ALERT_S}s, LastModified $lm)$ctx"
+  echo "AGE: LATE age=${age}s limit=${AGE_ALERT_S}s last_modified=$lm"
+  age_alert "latest.json no S3 tem $((age / 60)) min (limite $((AGE_ALERT_S / 60)) min): o upload horário do JSONL não renovou o objeto desde $lm.$ctx"
+  exit 1
 fi
 
 # ── lock (mkdir atômico; dono = pid; reclama se o dono morreu ou passou de LOCK_STALE_MIN) ─────────────
@@ -283,8 +422,12 @@ case "$HEAD_EPOCH" in ""|*[!0-9]*) unknown "não li a data do HEAD $SHA" ;; esac
 HEAD_SUBJ="$(git -C "$ARCHIVE" log -1 --format=%s "$SHA" 2>/dev/null)" || unknown "não li o assunto do HEAD $SHA"
 PARTIAL_NOTE=""
 case "$HEAD_SUBJ" in *" partial="*) PARTIAL_NOTE="${HEAD_SUBJ##* partial=}"; PARTIAL_NOTE="${PARTIAL_NOTE%% *}" ;; esac
-FREE="$(df -Pk "$STATE_DIR" | awk 'NR==2 {print int($4/1024)}')"
-[ -n "$FREE" ] && [ "$FREE" -ge "$MIN_FREE_MB" ] || unknown "pouco disco em $STATE_DIR (${FREE:-?} MB < $MIN_FREE_MB MB)"
+# vazio → o df não respondeu; falhou/ilegível → idem: sem número não há veredito (rc 2), nunca "tem espaço". JHO_FREE_MB é só para os testes.
+FREE="${JHO_FREE_MB:-$(df -Pk "$STATE_DIR" | awk 'NR==2 {print int($4/1024)}')}"
+case "$FREE" in ""|*[!0-9]*) unknown "não li o espaço livre em $STATE_DIR (leitura: '${FREE:-vazia}')" ;; esac
+NEED_MB="$(need_free_mb)"
+if [ -n "$MIN_FREE_MB" ]; then NEED_WHY="JHO_MIN_FREE_MB"; else NEED_WHY="2x o último pacote + ${MIN_FREE_SLACK_MB} MB de folga, mínimo ${MIN_FREE_FLOOR_MB} MB"; fi
+[ "$FREE" -ge "$NEED_MB" ] || unknown "pouco disco em $STATE_DIR (${FREE} MB livres < ${NEED_MB} MB: $NEED_WHY)"
 
 SHA12="${SHA:0:12}"
 STAMP="$(stamp_now)"

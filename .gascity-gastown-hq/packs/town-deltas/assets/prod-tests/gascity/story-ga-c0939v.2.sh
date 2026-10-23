@@ -10,7 +10,7 @@
 # Um snapshot fresco no S3 com restore nunca provado NÃO é RPO.
 #
 # Estados (nunca dois): ok / fail / unproven. `--status` UNKNOWN (sem credencial, S3 fora, latest.json ilegível) nunca vira PASS limpo:
-#   sem o order ter disparado é "unproven" (um deploy novo ainda não chegou ao 1º tick de 1h); depois que disparou é FAIL.
+#   sem o order ter disparado é "unproven" (um deploy novo ainda não chegou ao 1º tick de 30 min); depois que disparou é FAIL.
 
 set -uo pipefail
 
@@ -36,7 +36,8 @@ done
 [[ -x "$SCRIPT" ]] || fail "deployed script not executable: $SCRIPT"
 [[ -f "$ORDER_FILE" ]] || fail "deployed order file missing: $ORDER_FILE"
 grep -q -- '--checksum-sha256' "$SCRIPT" || fail "deployed script does not send --checksum-sha256 — the unverified-upload version is live"
-grep -q 'trigger = "cooldown"' "$ORDER_FILE" && grep -q 'interval = "1h"' "$ORDER_FILE" || fail "order file is not cooldown/1h: $(grep -E '^(trigger|interval)' "$ORDER_FILE" | tr '\n' ' ')"
+# interval: "30m" since ga-c0939v.7 (was "1h": every cooldown order overshoots its interval by a median ~6 min, so "1h" never gave a <= 60 min gap — see story-ga-c0939v.7.sh for the measured proof)
+grep -q 'trigger = "cooldown"' "$ORDER_FILE" && grep -q 'interval = "30m"' "$ORDER_FILE" || fail "order file is not cooldown/30m: $(grep -E '^(trigger|interval)' "$ORDER_FILE" | tr '\n' ' ')"
 log "script, helper and order file deployed ✓"
 
 # ── 2. `gc order list` resolves the order from the deployed pack (CLI-side scan) ──
@@ -57,7 +58,7 @@ if [[ "$hrc" -ne 0 || ! "$fired" =~ ^[0-9]+$ ]]; then
   _unproven "controller firing UNKNOWN (gc order history unreadable)"
 elif [[ "$fired" -eq 0 ]]; then
   FIRED=0
-  log "WARN: gc order history has 0 runs of jsonl-hourly-offsite — the controller has NOT fired it yet, so 'the controller loaded the order' is UNPROVEN. Re-run this test after >= 1h."
+  log "WARN: gc order history has 0 runs of jsonl-hourly-offsite — the controller has NOT fired it yet, so 'the controller loaded the order' is UNPROVEN. Re-run this test after >= 30 min."
   _unproven "controller has not fired the order yet (0 runs)"
 else
   FIRED="$fired"
@@ -68,7 +69,7 @@ fi
 out="$(JHO_AWS="$AWS_BIN" _to 120 "$SCRIPT" --status 2>&1)"; rc=$?
 printf '%s\n' "$out" | sed 's/^/    /'
 case "$rc" in
-  0) log "last check is recent ✓ (checked_at < 2h30; the script only moves it while the exporter writes AND commits the databases — data_as_of is when the data last CHANGED)" ;;
+  0) log "last check is recent ✓ (checked_at <= 75 min; the script only moves it while the exporter writes AND commits the databases — data_as_of is when the data last CHANGED)" ;;
   1) if [[ "$FIRED" == "0" ]]; then
        _unproven "latest.json is STALE but the order has not fired yet (a manual first upload is old)"
      else

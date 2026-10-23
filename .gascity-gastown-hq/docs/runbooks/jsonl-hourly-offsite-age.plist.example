@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.jsonl-hourly-offsite-age</string>
+
+  <!-- Age alarm of the JSONL upload to S3, the leg that does NOT depend on the gc controller (2026-10-23, ga-c0939v.7).
+
+       WHAT: runs the age check mode of packs/town-deltas/assets/scripts/jsonl-hourly-offsite.sh. It reads the LastModified of
+       s3://urblink-dolt-backups/jsonl-hourly/latest.json (S3 clock) and pushes a phone alert when it is older than 75 min, absent,
+       or could not be read twice in a row. Read only: head-object, no lock, nothing written to S3 or to the upload state.
+
+       WHY A LAUNCHD JOB AND NOT ONLY AN ORDER: there is also a gc order with the same check (orders/jsonl-hourly-offsite-age.toml),
+       and it goes live on merge, but an order is dispatched by the controller, and the controller is exactly what stalls.
+       Measured on 2026-10-23 from the upload log (jsonl_hourly_cadence.py): no publication between 11:12Z and 14:45Z (3h33m) and
+       none between 14:45Z and 17:06Z (2h20m), with no failure logged in either window, so the order was simply not dispatched.
+       An alarm riding the same dispatcher is blind during that stall, which is the case it exists for.
+       Same reasoning and same shape as reconciler-stall-detector: a raw launchd StartInterval job, not a gc order.
+
+       SHARED STATE ON PURPOSE: this job and the order use the same alarm state file, so the 6 h alert throttle holds across both
+       and one incident pushes one alert, not two. They can race on that file once in a long while (two reads in the same second);
+       the worst case is one extra alert.
+
+       CADENCE: StartInterval=600. A check takes about 2 s (one head-object, 60 s cap). PATH has /opt/homebrew/bin on purpose: aws,
+       jq and GNU timeout live there, and without it every run would end as UNKNOWN (tool missing) and alert on the second one.
+       Credentials come from ~/.aws (file based), the same ones the nightly S3 backup uses.
+
+       STAGED, NOT INSTALLED (follow-up bead ga-c0939v.8, owner: the Mayor). This file is named .example and lives in
+       docs/runbooks on purpose: the PRESENCE-DRIFT sweep of daemon-presence-watchdog.sh scans scripts/ and
+       packs/town-deltas/assets/ for com.gascity.* plists that are not loaded, and would push a phone alert and mail the Mayor
+       every 3 h for as long as this one sat there unloaded. To install, in ONE change and in this order: (1) copy it to
+       scripts/com.gascity.jsonl-hourly-offsite-age.plist; (2) copy it to ~/Library/LaunchAgents and load it with launchctl
+       bootstrap; (3) register the label in daemon-presence-watchdog.sh (DPW_CRITICAL plus the heartbeat line pointing at the
+       StandardOutPath below, limit above 2x the interval). Registering before loading lights CRITICAL; loading without
+       registering lets the job die unseen. The same bead has the commands and the alternative (a supervisor watchdog that
+       already covers a stalled controller makes this job redundant). -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/jsonl-hourly-offsite.sh</string>
+    <string>--age-check</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartInterval</key><integer>600</integer>
+  <key>RunAtLoad</key><true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/jsonl-hourly-offsite-age.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/jsonl-hourly-offsite-age.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+  </dict>
+</dict>
+</plist>

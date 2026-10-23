@@ -1,23 +1,25 @@
 ## Contents
-- Ver o estado · O que cada código e alerta significa · Tabela cortada: o gate do export e o veredito `suspect` (ga-l6v576) · Provar o restore · Custo e desligar
+- Ver o estado · O que cada código e alerta significa · Cadência medida e alarme de idade (ga-c0939v.7) · Tabela cortada: o gate do export e o veredito `suspect` (ga-l6v576) · Provar o restore · Custo e desligar
 
 # Upload horário do dump JSONL ao S3 (ga-c0939v.2)
 
-A cada hora o order `jsonl-hourly-offsite` roda `assets/scripts/jsonl-hourly-offsite.sh`: empacota o HEAD do repo do `jsonl-export`, confere o pacote lendo-o
-tabela por tabela, sobe para `s3://urblink-dolt-backups/jsonl-hourly/` e só então move `latest.json`. Meta do Athos (15/10): perder no máximo 1 h de beads.
-RPO real = intervalo entre runs do `jsonl-export` + 60 min + duração do run. Medido em 48 h (78 runs, 14-16/10): intervalo mediana 27 min, p90 73, máx 189 =>
-típico ~1h35, p90 ~2h20, pior medido ~4h15. **Só este order não entrega 1 h**: o gargalo é a cadência do exporter (decisão de produto).
-Com o disco do mini baixo o exporter se espaça de propósito (ga-j2f5v5): abaixo de 5 GB livres exporta no máximo 1 vez por hora, e na classe CRÍTICA do Dolt (GiB livres, arredondado para baixo, <= 3) só com o último export > 3 h; então o RPO sobe até ~3 h + 15 min + 60 min nesse caso. `skipped-low-disk (cadência estendida)` em `.gc/logs/jsonl-export.log` é isso, não defeito; disco ilegível ou `last_export_at` ilegível exporta normalmente.
+A cada 30 min o order `jsonl-hourly-offsite` roda `assets/scripts/jsonl-hourly-offsite.sh`: empacota o HEAD do repo do `jsonl-export`, confere o pacote lendo-o
+tabela por tabela, sobe para `s3://urblink-dolt-backups/jsonl-hourly/` e só então move `latest.json`. (O nome diz "hourly" por história: o order era de hora em hora até 23/10, ver "Cadência medida".) Meta do Athos (15/10): perder no máximo 1 h de beads.
+RPO real = intervalo entre runs do `jsonl-export` (até o dado entrar no HEAD) + espera até o upload pegar esse HEAD (até 30 min + a sobra do controller) + duração do run (~3,5 min). Medido em 48 h (78 runs, 14-16/10): intervalo do exporter mediana 27 min, p90 73, máx 189.
+**O upload entrega a sua parte (gap entre publicações perto de 40 min); a outra metade é a cadência do exporter**, que se espaça de propósito com o disco baixo (decisão de produto, abaixo).
+Com o disco do mini baixo o exporter se espaça de propósito (ga-j2f5v5): abaixo de 5 GB livres exporta no máximo 1 vez por hora, e na classe CRÍTICA do Dolt (GiB livres, arredondado para baixo, <= 3) só com o último export > 3 h; então o RPO sobe até ~3 h + 15 min + 30 min nesse caso. `skipped-low-disk (cadência estendida)` em `.gc/logs/jsonl-export.log` é isso, não defeito; disco ilegível ou `last_export_at` ilegível exporta normalmente. Nesse caso o `latest.json` continua renovado (o alarme de idade fica verde) enquanto o `data_as_of` envelhece: **o alarme mede o upload, não o exporter**.
 Que o restore funciona se prova com `jsonl-hourly-restore.sh` (seção "Provar o restore"): sem essa rodada, um snapshot fresco no S3 é upload verificado, não RPO provado.
 
 ## Ver o estado
-- `bash $GC_CITY_PATH/packs/town-deltas/assets/scripts/jsonl-hourly-offsite.sh --status` — só leitura, lê `latest.json` do S3: rc 0 `OK` (ponto batido há menos de 2h30, `checked_at`), rc 1 `STALE`,
+- `bash $GC_CITY_PATH/packs/town-deltas/assets/scripts/jsonl-hourly-offsite.sh --age-check` — só leitura, o alarme de idade (seção "Cadência medida e alarme de idade"): rc 0 `AGE: OK`, rc 1 `AGE: LATE`/`AGE: MISSING`, rc 2 `AGE: UNKNOWN`.
+- `python3 -I $GC_CITY_PATH/packs/town-deltas/assets/scripts/jsonl_hourly_cadence.py [--since AAAA-MM-DD] [--list]` — mede, pelo log, o gap real entre publicações do `latest.json` e a causa de cada gap acima de 1 h.
+- `bash $GC_CITY_PATH/packs/town-deltas/assets/scripts/jsonl-hourly-offsite.sh --status` — só leitura, lê `latest.json` do S3: rc 0 `OK` (ponto batido há no máximo 75 min, `checked_at`; o mesmo limite do alarme), rc 1 `STALE`,
   rc 2 `UNKNOWN` (S3 ou `latest.json` ilegível, ou `checked_at` no futuro: **não** é "tudo bem"). Num run de HEAD igual o ponto só é batido se o exporter reescreveu os bancos obrigatórios nas últimas 6 h;
   um snapshot novo com a fonte parada move o ponto uma vez, mas o run sai rc 1 e conta. `data_as_of` é quando o dado MUDOU: cidade ociosa o envelhece sem defeito (o exporter só comita quando o dado muda; 7 intervalos > 6 h em 12 dias, até 10 h 22, com ele rodando).
   Limite: "fonte viva" é o mtime dos arquivos; export que falha e restaura do HEAD deixa mtime novo com dado velho, e isso este order não vê.
 - Log: `tail -5 $GC_CITY_PATH/.gc/logs/jsonl-hourly-offsite.log` (`OK`, `FALHOU:`, `UNKNOWN:`, `AVISO:`). O `RESULT: ok new|ok unchanged|fail|unknown` sai só na saída do run: não fica no log nem em `gc order history` (que mostra só quando o order disparou).
 - Estado local: `$GC_CITY_PATH/.gc/runtime/packs/town-deltas/jsonl-hourly-offsite-state.json` (`consecutive_not_ok`, `last_not_ok_reason`, `last_success_at`).
-- "Mergeado" não é "vivo": `gc order list` tem que listar o order e `gc order history jsonl-hourly-offsite` tem que mostrar runs.
+- "Mergeado" não é "vivo": `gc order list` tem que listar os DOIS orders (`jsonl-hourly-offsite` e `jsonl-hourly-offsite-age`) e `gc order history <nome>` tem que mostrar runs de cada um.
 
 ## O que cada código e alerta significa
 | Código do run | Quer dizer | O que fazer |
@@ -29,12 +31,34 @@ Que o restore funciona se prova com `jsonl-hourly-restore.sh` (seção "Provar o
 | `rc 1` `fail ... suspect` | o snapshot é legível, mas uma tabela caiu mais de 20% (e tinha 100 linhas ou mais) contra o anterior — o de `latest.json` — sem queda correspondente de `issues` no mesmo banco: **nada sobe e `latest.json` não anda**, como no `broken` | o log diz `suspeito: hq/comments: 35132 -> 10112 linhas (-71%) ...`; compare com o `SELECT COUNT(*)` da fonte. Export cortado: o gate do `jsonl-export.sh` já mantém a versão anterior da tabela e o run seguinte volta sozinho. Queda real (purga deliberada): rode **uma vez** `JHO_ACCEPT_DROP=1 bash .../jsonl-hourly-offsite.sh`; o manifest guarda `suspect` e `baseline.accepted`, e o snapshot aceito vira o anterior |
 | `rc 2` `unknown` | não deu para avaliar (sem `aws`/`git`/`python3`/`jq`, archive ilegível, pouco disco, estado ou lock sem como criar/gravar) | nada foi tentado; ver o log. Conta como run sem snapshot (alerta no 2º seguido) |
 | `rc 3` | uso errado da linha de comando | só em chamada manual |
-- Alerta: no 2º run seguido sem snapshot novo (`fail`, `unknown` ou run morto pelo timeout do order/kill/reboot, que o run seguinte conta) o script chama o `notify`
+- Alerta de falha: no 2º run seguido sem snapshot novo (`fail`, `unknown` ou run morto pelo timeout do order/kill/reboot, que o run seguinte conta) o script chama o `notify`
   com push forçado (`NOTIFY_FORCE_PUSH=1 NOTIFY_STRICT_EXIT=1`, "Jsonl hourly offsite", prioridade 4). Só conta como enviado se o `notify` sair `rc 0`: senão o log diz
   `AVISO: alerta NÃO entregue (rc=N)` e o run seguinte tenta de novo; se entregou, no máximo 1 a cada 6 h. Sem como gravar o estado, o alerta não espera o 2º run e, sem registro do último aviso, sai a cada run.
   Credencial do `aws` ausente no ambiente do order aparece assim, no 2º run: não inventar credencial, escalar para o Mayor.
 - Retenção (só `jsonl-hourly/snap/`, formato exato de chave): últimas 48 h, o primeiro snapshot de cada dia UTC por 14 dias, os 6 mais novos e o apontado por `latest.json`.
   Listagem do S3 ilegível ou helper falhando => `AVISO: retenção pulada (...)`, nada é apagado e o run segue `rc 0`; se o aviso se repetir por horas, o bucket só cresce.
+
+## Cadência medida e alarme de idade (ga-c0939v.7)
+**Estado em 23/10: o order passou de `1h` para `30m`, o piso de disco ficou proporcional ao pacote e há um alarme de idade do `latest.json` no S3.** Por quê, com número (log de 16 a 23/10, `jsonl_hourly_cadence.py`):
+- **Gap real entre publicações do `latest.json`:** 124 publicações, 123 gaps; **94% passaram de 1 h**, mediana 1h10, p90 1h33, p99 5h18, máx 16h12 (o máx é o 1º dia, 16/10, com o upload ainda sendo montado). Atraso do dado até o S3 (HEAD já comitado + duração do run), 21-23/10: mediana 23 min, p90 51.
+- **Causa de cada gap acima de 1 h (a mais grave de cada):** `disparo atrasado` 111 (nenhum run falhou no meio), `disco` 2, `fonte parada` 2. Lock e Dolt lento: nenhum (o log não tem "outro run em andamento", e o upload lê o `git` do archive, não o Dolt).
+  - `disco`: `UNKNOWN: pouco disco` com 797 MB (16-17/10, 2h29 sem snapshot) e 867 MB (18/10, 2h17) livres, contra um piso FIXO de 1024 MB para escrever um arquivo de ~175 MB.
+  - `fonte parada`: 2h21 (21/10) e 5h18 (22/10), o exporter escrevia e não comitava (`FALHOU: fonte parada`); por desenho o run não bate o ponto (o `--status` vira STALE), então isso é o alarme funcionando, não cadência.
+  - `disparo atrasado` é o grosso: o `interval = "1h"` do order soma-se à **sobra de despacho do controller**. Medido em 8 orders `cooldown` (706 intervalos): sobra sobre o intervalo mediana 6,3 min, p90 18 min, p99 60 min, máx 81 min, e **não depende do intervalo** (10 min ou 1 h dão a mesma sobra). O cron também atrasa (3-13 min, medido em 2 orders cron: `mol-dog-stale-db` e `engine-window-reboot-noon`). Resultado: gap mediano 1h10 com `1h`.
+- **Intervalo escolhido, sobre os 706 intervalos reais** (fração de disparos com gap acima de 60 min): `1h` 100% · `45m` 13,2% · **`30m` 3,7%** · `20m` 2,1% · `15m` 1,4%. Abaixo de `30m` quase nada se ganha: o que sobra é parada do controller, que nenhum intervalo resolve. Quem cobre a cauda é o alarme.
+- **Conferir depois do deploy** (não é para acreditar neste texto): `python3 -I .../jsonl_hourly_cadence.py --since <data do deploy> --list`. Esperado com `30m`: mediana do gap perto de 40 min e poucos gaps acima de 1 h, cada um com causa. Mediana ainda acima de 1 h = o order novo não está em vigor (`gc order list`).
+
+**Alarme `--age-check` (order `jsonl-hourly-offsite-age`, a cada 10 min).** Lê o `LastModified` do `latest.json` no S3 (relógio do S3: um upload que "diz que subiu" e não subiu não engana o alarme) e compara com 75 min (`JHO_AGE_ALERT_S`). Roda num order separado do upload: o run que atrasa, trava ou perde a credencial não pode ser o que avisa. Só leitura, sem lock, estado próprio (`.gc/runtime/packs/town-deltas/jsonl-hourly-offsite-age-state.json`).
+| rc | Linha | Quer dizer | O que faz |
+|---|---|---|---|
+| 0 | `AGE: OK age=...s` | o `latest.json` foi renovado há no máximo 75 min | nada; se vinha de atraso, o log registra `IDADE: voltou ao normal` e o relógio de aviso zera |
+| 1 | `AGE: LATE` | passou de 75 min | `notify` forçado **na hora** (prioridade 4, "Jsonl offsite: S3 atrasado"), repete a cada 6 h; recuperou e atrasou outra vez = avisa de novo na hora |
+| 1 | `AGE: MISSING` | o `latest.json` não existe (404): nenhum snapshot verificado está publicado | igual ao `LATE` |
+| 2 | `AGE: UNKNOWN <motivo>` | não deu para medir: `aws`/`jq`/`python3` ausente, S3 mudo ou 403 (403 **não** é 404), `LastModified` ausente/ilegível/sem fuso, ou mais de 5 min no futuro | **nunca "em dia"**: conta, e avisa na 2ª verificação seguida (uma falha de rede isolada não acorda ninguém); repete a cada 6 h |
+O texto do aviso traz o que o upload sabe de si (último ok, execuções seguidas sem snapshot e, se houver, o último motivo). **Pode avisar junto com o alerta de falha** (2 runs seguidos sem snapshot) pela mesma causa, por exemplo `fonte parada`: o do alarme diz "o S3 está velho há N min", o outro diz "por que o run falhou"; leia os dois como um só incidente.
+- **Quando dispara, nesta ordem:** `--status` (o `latest.json` e o `data_as_of`) · `gc order history jsonl-hourly-offsite` (o order disparou? se a última execução é antiga, o problema é o controller/despacho, não o upload) · `tail -20 $GC_CITY_PATH/.gc/logs/jsonl-hourly-offsite.log` (`FALHOU:`, `UNKNOWN:`, `fonte parada`) · `df -h /` (disco abaixo do piso: ver o próximo item) · credencial do `aws`.
+- **Piso de disco proporcional (`need_free_mb`):** o run exige 2x o tamanho do último pacote + 256 MB de folga (o volume é o do Dolt), nunca menos de 512 MB (hoje ~590 MB para o pacote de 167 MB); sem tamanho legível do último pacote usa 200 MB de palpite. Abaixo do piso: `rc 2`, o log diz quanto havia e quanto precisava, e o alarme de idade cobre. `JHO_MIN_FREE_MB=N` (explícito) vence o cálculo. Escrever 175 MB com 600 MB livres deixa ~425 MB: se isso continuar derrubando o Dolt, o problema é o disco, não o piso.
+- **Limites, de propósito:** (1) o alarme roda no controller: controller parado não é visto por ele. O caso é real: em 23/10 o log do upload tem 3h33 sem publicação (11:12Z a 14:45Z) e depois 2h20 (14:45Z a 17:06Z), sem nenhuma falha registrada, porque o order não foi despachado. A perna que não depende do controller (job launchd com o mesmo `--age-check`) está pronta e **NÃO instalada**: `docs/runbooks/jsonl-hourly-offsite-age.plist.example`, bead ga-c0939v.8 (dono: Mayor). Ela ficou fora de `scripts/` de propósito: o PRESENCE-DRIFT do `daemon-presence-watchdog.sh` varre `scripts/` atrás de plist `com.gascity.*` não carregado e avisaria o telefone e o Mayor a cada 3 h; (2) mede o objeto do upload, não o dado: com o disco baixo o exporter se espaça (seção acima) e o `data_as_of` envelhece com o alarme verde; (3) `LastModified` vem do S3, e o relógio daqui precisa estar certo (diferença acima de 5 min vira `UNKNOWN`, não "em dia"); (4) o limite de 75 min e o intervalo de 10 min dão um aviso uns 15-30 min depois de cruzar o limite (a mesma sobra de despacho).
 
 ## Tabela cortada: o gate do export e o veredito `suspect` (ga-l6v576)
 Duas camadas, a primeira é a que conserta:
@@ -73,6 +97,5 @@ Fora da prova: histórico de commits do Dolt, branches, issues escrubbadas e as 
 Disco: o store embutido cresce dezenas de vezes o import (~38-57× nos três bancos medidos; hq 44×) e ocupa o volume do Dolt; rode um banco por vez e confira `df -h /` antes.
 
 ## Custo e desligar
-~75 MB gzip por snapshot e build de ~4 min (medido em 16/10, local; o upload não foi medido): com a retenção, ~60 guardados, ordem de 4,5 GB. `interval = "30m"` tira 30 min do RPO
-(típico ~1h05, pior ~3h45) e dobra o tráfego (decisão de produto).
-Desligar: remover `packs/town-deltas/orders/jsonl-hourly-offsite.toml` (o `gc order` recarrega); os objetos em `jsonl-hourly/` podem ficar (expiram em 30 dias pela regra do bucket) ou sair com `aws s3 rm --recursive`.
+~175 MB gzip por snapshot (23/10; eram ~75 MB em 16/10) e run de ~3,5 min (mediana 206 s, p90 326 s, máx 579 s em 86 runs, build com `nice 15`). Com `interval = "30m"` são até 2 snapshots por hora (só quando o HEAD mudou; HEAD igual só reescreve o `latest.json`) e, com a retenção (48 h + 1 por dia por 14 dias), ordem de 100 objetos, ~20 GB no S3 (centavos por mês). Voltar a `interval = "1h"` corta o tráfego pela metade e devolve a cadência medida acima (gap mediano 1h10), não 1 h.
+Desligar: remover `packs/town-deltas/orders/jsonl-hourly-offsite.toml` **e** `jsonl-hourly-offsite-age.toml` (o `gc order` recarrega; sem o upload o alarme avisa em 75 min, de propósito); os objetos em `jsonl-hourly/` podem ficar (expiram em 30 dias pela regra do bucket) ou sair com `aws s3 rm --recursive`.

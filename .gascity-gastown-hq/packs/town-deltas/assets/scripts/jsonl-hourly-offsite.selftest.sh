@@ -11,6 +11,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="${JHO_SCRIPT:-$HERE/jsonl-hourly-offsite.sh}"
 PYH="$(dirname "$SCRIPT")/jsonl_hourly.py"
+ORDERS_DIR="${JHO_ORDERS_DIR:-$HERE/../../orders}"
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 
@@ -66,6 +67,8 @@ case "$op" in
     fi
     mkdir -p "$(dirname "$D/obj/$key")" "$(dirname "$D/meta/$key")"
     cp "$body" "$D/obj/$key"; printf '%s %s\n' "$(wc -c < "$body" | tr -d ' ')" "${cs:+$got}" > "$D/meta/$key"
+    mkdir -p "$(dirname "$D/lastmod/$key")"
+    python3 -I -c 'import datetime,sys;print(datetime.datetime.fromtimestamp(int(sys.argv[1]),datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00"))' "${STUB_NOW:-$(date +%s)}" > "$D/lastmod/$key"
     echo "$key" >> "$D/puts.log"; echo '{"ETag":"\"x\""}' ;;
   head-object)
     injected fail_head_generic && { echo "An error occurred (403) when calling the HeadObject operation: Forbidden (request id 4047QZ)" >&2; exit 254; }
@@ -74,7 +77,8 @@ case "$op" in
     read -r size sum < "$D/meta/$key" || true
     injected lie_size && size=$((size + 1))
     injected lie_checksum && sum="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-    if [ -n "${sum:-}" ]; then printf '{"ContentLength": %s, "ChecksumSHA256": "%s"}\n' "$size" "$sum"; else printf '{"ContentLength": %s}\n' "$size"; fi ;;
+    lmj=""; [ -s "$D/lastmod/$key" ] && lmj=", \"LastModified\": \"$(cat "$D/lastmod/$key")\""
+    if [ -n "${sum:-}" ]; then printf '{"ContentLength": %s, "ChecksumSHA256": "%s"%s}\n' "$size" "$sum" "$lmj"; else printf '{"ContentLength": %s%s}\n' "$size" "$lmj"; fi ;;
   get-object)
     injected fail_get && { echo "An error occurred (500) when calling the GetObject operation: injected" >&2; exit 254; }
     [ -f "$D/obj/$key" ] || { echo "An error occurred (NoSuchKey) when calling the GetObject operation: The specified key does not exist." >&2; exit 254; }
@@ -88,7 +92,7 @@ p=sys.argv[1]; ks=[l.strip() for l in sys.stdin if l.strip().startswith(p)]
 print(json.dumps({"Contents":[{"Key":k} for k in ks]} if ks else {}))' "$prefix" ;;
   delete-object)
     injected fail_delete && { echo "An error occurred (500) when calling the DeleteObject operation: injected" >&2; exit 254; }
-    rm -f "$D/obj/$key" "$D/meta/$key"; echo "$key" >> "$D/deletes.log"; echo '{}' ;;
+    rm -f "$D/obj/$key" "$D/meta/$key" "$D/lastmod/$key"; echo "$key" >> "$D/deletes.log"; echo '{}' ;;
   *) echo "stub: operação não suportada: $op" >&2; exit 2 ;;
 esac
 STUB
@@ -141,7 +145,7 @@ offsite() { # args... ; env extra via prefixo `env`; define OUT, RC
   # exporter vivo: reescreve os bancos na hora do relógio de mentira (mtime); SRC_STOP=n => parou n s depois de T0
   python3 -I -c 'import glob,os,sys;t=int(sys.argv[1]);[os.utime(p,(t,t)) for p in glob.glob(sys.argv[2]+"/*/issues.jsonl")]' $((T0 + (${SRC_STOP:-$NOW_OFF} < NOW_OFF ? ${SRC_STOP:-$NOW_OFF} : NOW_OFF))) "$ARCH"
   OUT="$(JHO_ARCHIVE="$ARCH" JHO_STATE_DIR="${STATE_OVR:-$S/state}" JHO_LOG="$S/log/offsite.log" JHO_AWS="${AWS_BIN:-$WORK/bin/aws}" JHO_NOTIFY="${NOTIFY_BIN:-$WORK/bin/notify}" \
-        STUB_DIR="$S/bucket" NOTIFY_LOG="$S/notify.log" JHO_REQUIRED_DBS="${REQ:-hq,wa}" JHO_NOW=$((T0 + NOW_OFF)) JHO_S3_TIMEOUT=60 JHO_MIN_FREE_MB=1 \
+        STUB_DIR="$S/bucket" STUB_NOW=$((T0 + NOW_OFF)) NOTIFY_LOG="$S/notify.log" JHO_REQUIRED_DBS="${REQ:-hq,wa}" JHO_NOW=$((T0 + NOW_OFF)) JHO_S3_TIMEOUT=60 JHO_MIN_FREE_MB="${MINFREE_OVR-1}" \
         "$SCRIPT" "$@" 2>"$S/stderr")"
   RC=$?
 }
@@ -580,6 +584,146 @@ new_env gitdiff; NOW_OFF=0; offsite; NOW_OFF=$((7 * 3600)); GIT_FAIL_DIFF=1 PATH
 eq "git diff falha (HEAD de 7 h): não sei, e não sei não é vivo: rc 1, fail fonte parada" "$RC:${OUT:0:25}:$(printf '%s' "$OUT" | grep -c 'comparar a árvore')" "1:RESULT: fail fonte parada:1"
 new_env nomtime; NOW_OFF=0; offsite; rm -f "$ARCH/wa/issues.jsonl"; NOW_OFF=600; offsite
 eq "sem como ler quando o exporter escreveu (arquivo ausente): não vale como vivo, rc 1" "$RC:${OUT:0:25}" "1:RESULT: fail fonte parada"
+
+# ── 13c. piso de disco proporcional ao pacote (ga-c0939v.7) ─────────────────────────────────────────
+# Medido no log (16-23/10): 2 runs viraram `UNKNOWN: pouco disco` com 797 MB e 867 MB livres contra o piso FIXO de 1024 MB, e cada um deixou o S3 sem snapshot por 2 h+ (2h28 e 2h17).
+# O pacote é um tar.gz de ~175 MB: o piso passa a acompanhar o tamanho real (2x o último pacote + 256 MB de folga para o Dolt, mínimo 512 MB) em vez de um número escrito no código.
+echo "-- 13c. piso de disco proporcional ao pacote (ga-c0939v.7)"
+S="$WORK/lib"; mkdir -p "$S/state"; LS="$S/state/jsonl-hourly-offsite-state.json"
+need() { rm -f "$LS"; [ -z "${1:-}" ] || printf '{"last_success_bytes":%s}\n' "$1" > "$LS"; lib need_free_mb; }
+eq "need_free_mb sem estado (nunca subiu): palpite de 200 MB => 2x200 + 256" "$(need)" 656
+eq "need_free_mb com o último pacote real (174565885 B = 167 MB): 2x167 + 256" "$(need 174565885)" 590
+eq "need_free_mb com pacote de 1 GiB: acompanha (2x1024 + 256), não fica preso num número fixo" "$(need 1073741824)" 2304
+eq "need_free_mb com pacote minúsculo: piso de 512 MB" "$(need 1048576)" 512
+eq "need_free_mb com last_success_bytes = 0 (estado estranho): volta ao palpite, não vira 'precisa de nada'" "$(need 0)" 656
+eq "need_free_mb com last_success_bytes ilegível (texto): palpite, nunca zero" "$(need '"abc"')" 656
+eq "JHO_MIN_FREE_MB explícito vence o cálculo" "$(JHO_MIN_FREE_MB=77 need 174565885)" 77
+eq "JHO_MIN_FREE_FLOOR_MB / JHO_MIN_FREE_SLACK_MB / JHO_ARTIFACT_GUESS_MB trocam as parcelas" "$(JHO_MIN_FREE_FLOOR_MB=100 JHO_MIN_FREE_SLACK_MB=10 JHO_ARTIFACT_GUESS_MB=50 need)" 110
+
+new_env floor
+MINFREE_OVR= JHO_FREE_MB=600 offsite
+eq "sem estado (precisa de 656 MB): com 600 MB livres => rc 2, unknown, o aws nem foi chamado" "$RC:${OUT:0:15}:$([ -e "$S/bucket/calls.log" ] && echo called || echo none)" "2:RESULT: unknown:none"
+case "$OUT" in *"600 MB"*"656 MB"*) ok "a mensagem diz quanto havia e quanto o run precisa" ;; *) bad "mensagem sem os números: $OUT" ;; esac
+eq "e conta como run sem snapshot (alerta no 2º seguido)" "$(jqf .consecutive_not_ok "$ST")" 1
+MINFREE_OVR= JHO_FREE_MB=700 offsite
+eq "com 700 MB livres (> 656; o piso antigo de 1024 MB barraria): rc 0 e o snapshot sobe" "$RC:$(count_objs '\.tar\.gz$')" "0:1"
+MINFREE_OVR= JHO_FREE_MB=511 offsite
+eq "depois de um pacote pequeno o piso cai para 512 MB: 511 MB => rc 2 (o pré-voo vem antes do atalho de HEAD igual)" "$RC:${OUT:0:15}" "2:RESULT: unknown"
+MINFREE_OVR= JHO_FREE_MB=512 offsite
+eq "512 MB => passa" "$RC:${OUT%% key=*}" "0:RESULT: ok unchanged"
+JHO_FREE_MB=2 offsite
+eq "JHO_MIN_FREE_MB explícito (1 MB, como as outras seções) vence o cálculo: 2 MB livres passam" "$RC" 0
+MINFREE_OVR= JHO_FREE_MB=abc offsite
+eq "espaço livre ilegível não vira 'tem espaço': rc 2" "$RC:${OUT:0:15}" "2:RESULT: unknown"
+
+# ── 13d. alarme de idade do último objeto no S3 (ga-c0939v.7) ────────────────────────────────────
+# `--age-check` lê o LastModified do latest.json NO S3 (relógio do servidor, não um campo que o próprio script escreve) e compara com o limite de 75 min.
+# Três estados, e só o primeiro é "em dia": EM DIA (rc 0) / ATRASADO ou AUSENTE (rc 1) / SEM LEITURA (rc 2). Roda num order próprio (10 min): o run que atrasa não pode ser o que avisa.
+echo "-- 13d. --age-check: alarme de idade do latest.json no S3 (ga-c0939v.7)"
+AGEF() { echo "$S/state/jsonl-hourly-offsite-age-state.json"; }
+AST() { jqf "$1" "$(AGEF)"; }
+LMF() { echo "$S/bucket/lastmod/jsonl-hourly/latest.json"; }
+age_at() { NOW_OFF="$1"; shift; offsite --age-check "$@"; }
+seed_latest() { # idade em s (no relógio de mentira, NOW_OFF) — cria um latest.json no bucket sem rodar o upload inteiro
+  mkdir -p "$S/bucket/obj/jsonl-hourly" "$S/bucket/lastmod/jsonl-hourly" "$S/bucket/meta/jsonl-hourly"
+  printf '{"schema":1}\n' > "$S/bucket/obj/jsonl-hourly/latest.json"; printf '13 \n' > "$S/bucket/meta/jsonl-hourly/latest.json"
+  python3 -I -c 'import datetime,sys;print(datetime.datetime.fromtimestamp(int(sys.argv[1]),datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00"))' $((T0 + NOW_OFF - $1)) > "$(LMF)"
+}
+
+# (a) de ponta a ponta: o upload de verdade carimba o latest.json, e o alarme lê esse carimbo
+new_env agee2e; NOW_OFF=0; offsite
+eq "upload: rc 0 (o latest.json recebe o carimbo do S3)" "$RC" 0
+NOW_OFF=4400; offsite --status; eq "--status usa o mesmo limite de 75 min: 4400 s => OK" "$RC:$(echo "$OUT" | awk '{print $2}')" "0:OK"
+NOW_OFF=4600; offsite --status; eq "--status: 4600 s => STALE (antes o limite era 2h30)" "$RC:$(echo "$OUT" | awk '{print $2}')" "1:STALE"
+age_at 600
+eq "latest.json de 10 min: rc 0, 'AGE: OK', sem alerta" "$RC:${OUT:0:7}:$(pushed):$(AST .last_state)" "0:AGE: OK:0:ok"
+case "$OUT" in *"age=600s"*) ok "a linha diz a idade medida (age=600s)" ;; *) bad "sem age=600s: $OUT" ;; esac
+age_at 4500; eq "exatamente no limite (4500 s): ainda em dia, rc 0" "$RC:${OUT:0:7}" "0:AGE: OK"
+age_at 4501; eq "1 s além do limite: ATRASADO, rc 1, e o alerta CHEGA ao telefone (push forçado)" "$RC:${OUT:0:9}:$(pushed)" "1:AGE: LATE:1"
+grep -q -- '-p 4' "$S/notify.log" && grep -q 'S3 atrasado' "$S/notify.log" && ok "alerta: título próprio e prioridade 4" || bad "alerta mal formado: $(cat "$S/notify.log")"
+case "$(cat "$S/notify.pushed" 2>/dev/null)" in *latest.json*S3*) ok "o texto do alerta nomeia o objeto e o S3" ;; *) bad "texto do alerta: $(cat "$S/notify.pushed" 2>/dev/null)" ;; esac
+age_at 5401; eq "15 min depois, ainda atrasado: rc 1, sem novo alerta (1 a cada 6 h)" "$RC:$(pushed)" "1:1"
+age_at $((4501 + 21600)); eq "6 h depois, ainda atrasado: o alerta repete" "$(pushed)" 2
+NOW_OFF=40000; offsite
+eq "o upload volta (HEAD igual: ponto batido): rc 0" "$RC:${OUT%% key=*}" "0:RESULT: ok unchanged"
+age_at 40100
+eq "recuperou: rc 0, 'AGE: OK', o relógio do alerta zera e o log registra a volta" "$RC:${OUT:0:7}:$(AST .last_alert_epoch):$(grep -c 'voltou ao normal' "$S/log/offsite.log")" "0:AGE: OK:0:1"
+age_at $((40000 + 4501)); eq "novo atraso logo depois de recuperar: alerta NA HORA (não fica mudo pelo alerta da série anterior)" "$RC:$(pushed)" "1:3"
+
+# (b) latest.json ausente: não é "sem leitura", é "sem backup no S3"
+new_env agemiss; NOW_OFF=0; age_at 0
+eq "latest.json não existe (404): rc 1, AGE: MISSING, alerta na hora" "$RC:${OUT:0:12}:$(pushed)" "1:AGE: MISSING:1"
+
+# (c) SEM LEITURA nunca é "em dia": rc 2, conta, e só avisa na 2ª seguida (uma falha isolada de rede não acorda ninguém)
+new_env ageunk; NOW_OFF=0; seed_latest 100; inject fail_head
+age_at 0;    eq "S3 não responde: rc 2, 'AGE: UNKNOWN' (não é OK), 1ª falha sem alerta, contador 1" "$RC:${OUT:0:12}:$(pushed):$(AST .consecutive_unreadable)" "2:AGE: UNKNOWN:0:1"
+age_at 900;  eq "2ª seguida: o alerta sai (nomeia que não conseguiu medir)" "$RC:$(pushed):$(AST .consecutive_unreadable)" "2:1:2"
+case "$(cat "$S/notify.pushed" 2>/dev/null)" in *"não consegui"*) ok "o texto diz que não conseguiu medir (e não que está atrasado)" ;; *) bad "texto: $(cat "$S/notify.pushed" 2>/dev/null)" ;; esac
+age_at 1800; eq "3ª seguida dentro das 6 h: sem novo alerta, contador segue" "$(pushed):$(AST .consecutive_unreadable)" "1:3"
+clear_inject fail_head; age_at 1900
+eq "S3 volta: rc 0 e o contador de ilegível zera" "$RC:${OUT:0:7}:$(AST .consecutive_unreadable)" "0:AGE: OK:0"
+new_env age403; NOW_OFF=0; seed_latest 100; inject fail_head_generic; age_at 0
+eq "403 Forbidden não é 404: rc 2 (sem leitura), não 'ausente'" "$RC:${OUT:0:12}" "2:AGE: UNKNOWN"
+
+# (d) LastModified que não dá para confiar: ausente, lixo, sem fuso ou no futuro => SEM LEITURA; pequena diferença de relógio => idade 0; RFC 1123 (aws-cli v1) é lido
+new_env agelm; NOW_OFF=0; seed_latest 100
+rm -f "$(LMF)"; age_at 0;               eq "head-object sem LastModified: rc 2, sem leitura" "$RC:${OUT:0:12}" "2:AGE: UNKNOWN"
+seed_latest 100; printf 'ontem' > "$(LMF)"; age_at 0
+eq "LastModified lixo: rc 2" "$RC:${OUT:0:12}" "2:AGE: UNKNOWN"
+seed_latest 100; printf '2026-10-23T11:11:39' > "$(LMF)"; age_at 0
+eq "LastModified sem fuso horário (não dá para saber a hora): rc 2" "$RC:${OUT:0:12}" "2:AGE: UNKNOWN"
+seed_latest -3600; age_at 0
+eq "LastModified 1 h NO FUTURO (relógio torto): rc 2, não 'em dia'" "$RC:${OUT:0:12}" "2:AGE: UNKNOWN"
+seed_latest -120; age_at 0
+eq "2 min no futuro (diferença de relógio tolerável): idade 0, rc 0" "$RC:${OUT:0:7}" "0:AGE: OK"
+seed_latest 100; python3 -I -c 'import email.utils,sys;print(email.utils.formatdate(int(sys.argv[1]),usegmt=True))' $((T0 - 600)) > "$(LMF)"; age_at 0
+eq "LastModified em RFC 1123 (Fri, 23 Oct 2026 ... GMT): lido, idade 600 s" "$RC:${OUT:0:7}:$(echo "$OUT" | grep -c 'age=600s')" "0:AGE: OK:1"
+
+# (e) alerta que não foi entregue não gasta o limite de 6 h: o run seguinte tenta de novo
+new_env agenotif; NOW_OFF=0; seed_latest 5000; NOTIFY_RC=12 age_at 0
+eq "notify sai rc 12 (digest mudo): AVISO no log, sem 'enviado', sem last_alert_epoch" "$RC:$(grep -c 'alerta NÃO entregue' "$S/log/offsite.log"):$(grep -c 'alerta enviado' "$S/log/offsite.log"):$(AST '.last_alert_epoch // "none"')" "1:1:0:none"
+age_at 60; eq "run seguinte (notify de volta): entrega" "$(pushed)" 1
+
+# (f) é só leitura e independente: não pega o lock do upload, não mexe no estado dele, e contadores próprios
+new_env agelock; NOW_OFF=0; seed_latest 100
+printf '{"consecutive_not_ok":3,"last_not_ok_reason":"fonte parada: teste","last_success_at":"2026-10-23T11:12:00Z"}\n' > "$ST"; SUM0="$(cksum < "$ST")"
+sleep 120 & BG_PID=$!; mkdir -p "$S/state/jsonl-hourly-offsite.lock.d"; echo "$BG_PID" > "$S/state/jsonl-hourly-offsite.lock.d/pid"
+age_at 0
+eq "com o lock do upload tomado por outro run: o alarme roda igual (rc 0)" "$RC:${OUT:0:7}" "0:AGE: OK"
+eq "e deixa o lock do upload intacto" "$([ "$(cat "$S/state/jsonl-hourly-offsite.lock.d/pid" 2>/dev/null)" = "$BG_PID" ] && echo kept || echo gone)" kept
+kill "$BG_PID" 2>/dev/null; wait "$BG_PID" 2>/dev/null; BG_PID=""; rm -rf "$S/state/jsonl-hourly-offsite.lock.d"
+eq "e não toca o estado do upload (mesmo conteúdo)" "$(cksum < "$ST")" "$SUM0"
+new_env ageaws; NOW_OFF=0; AWS_BIN=/nao/existe age_at 0
+eq "aws ausente: rc 2 'AGE: UNKNOWN', contado no estado DO ALARME, e o estado do upload nem é criado" "$RC:${OUT:0:12}:$(AST .consecutive_unreadable):$([ -e "$ST" ] && echo main-state-touched || echo untouched)" "2:AGE: UNKNOWN:1:untouched"
+
+# (g) o texto do alerta diz o que o upload sabe (o alarme só lê esse estado)
+new_env agectx; NOW_OFF=0; seed_latest 5000
+printf '{"consecutive_not_ok":3,"last_not_ok_reason":"fonte parada: teste","last_success_at":"2026-10-23T11:12:00Z"}\n' > "$ST"
+age_at 0
+case "$(cat "$S/notify.pushed" 2>/dev/null)" in *"fonte parada: teste"*"2026-10-23T11:12:00Z"*|*"2026-10-23T11:12:00Z"*"fonte parada: teste"*) ok "o alerta traz o último ok e o motivo do upload" ;; *) bad "alerta sem o contexto do upload: $(cat "$S/notify.pushed" 2>/dev/null)" ;; esac
+new_env agectx2; NOW_OFF=0; seed_latest 5000; age_at 0
+eq "estado do upload ausente: o alerta sai mesmo assim (o contexto é enfeite, o aviso não)" "$RC:$(pushed)" "1:1"
+
+# (h) o limite é configurável e o padrão é 75 min
+new_env agethr; NOW_OFF=0; seed_latest 700; JHO_AGE_ALERT_S=600 age_at 0
+eq "JHO_AGE_ALERT_S=600 e idade 700 s: ATRASADO" "$RC:${OUT:0:9}" "1:AGE: LATE"
+seed_latest 500; JHO_AGE_ALERT_S=600 age_at 0
+eq "JHO_AGE_ALERT_S=600 e idade 500 s: em dia" "$RC:${OUT:0:7}" "0:AGE: OK"
+
+# ── 13e. os orders: 30 min no upload, 10 min no alarme (ga-c0939v.7) ───────────────────────────────
+# Medido: todo order `cooldown` da cidade dispara com sobra mediana de ~6 min e p90 de ~18 min sobre o intervalo (706 intervalos, 8 orders); `interval = "1h"` nunca entrega
+# gap <= 60 min (93% dos 124 gaps reais passaram de 1 h, mediana 1h10). Com 30 min, 3,7% dos disparos passam de 60 min (a cauda é parada do controller).
+echo "-- 13e. orders (ga-c0939v.7)"
+OFF_TOML="$ORDERS_DIR/jsonl-hourly-offsite.toml"; AGE_TOML="$ORDERS_DIR/jsonl-hourly-offsite-age.toml"
+toml_get() { sed -n -E "s/^$2 *= *\"([^\"]*)\".*/\1/p" "$1" | head -1; }
+eq "upload: cooldown de 30m" "$(toml_get "$OFF_TOML" trigger):$(toml_get "$OFF_TOML" interval)" "cooldown:30m"
+[ -f "$AGE_TOML" ] && ok "order do alarme existe" || bad "order do alarme ausente: $AGE_TOML"
+eq "alarme: cooldown de 10m" "$(toml_get "$AGE_TOML" trigger):$(toml_get "$AGE_TOML" interval)" "cooldown:10m"
+eq "alarme chama o MESMO script com --age-check" "$(toml_get "$AGE_TOML" exec)" '$PACK_DIR/assets/scripts/jsonl-hourly-offsite.sh --age-check'
+AGE_EXEC="$(toml_get "$AGE_TOML" exec)"; AGE_EXEC="${AGE_EXEC%% --age-check}"
+[ -x "${AGE_EXEC/\$PACK_DIR/$ORDERS_DIR/..}" ] && ok "o exec do alarme resolve para um script executável" || bad "exec do alarme não resolve: $AGE_EXEC"
+tsec() { case "$1" in *s) echo "${1%s}" ;; *m) echo $(( ${1%m} * 60 )) ;; *h) echo $(( ${1%h} * 3600 )) ;; *) echo "?" ;; esac; }
+[ "$(tsec "$(toml_get "$AGE_TOML" timeout)")" -lt 600 ] 2>/dev/null && ok "o alarme tem timeout curto (menor que o intervalo)" || bad "timeout do alarme: $(toml_get "$AGE_TOML" timeout)"
 
 echo "-- 14. helper python (suíte própria)"
 if [ -n "${JHO_SKIP_PYSUITE:-}" ]; then

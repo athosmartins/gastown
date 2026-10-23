@@ -1,12 +1,15 @@
-# ga-c0939v.2: sobe a cada hora o dump JSONL (jsonl-export, um run a cada 27 min em mediana) ao S3, com manifest e sha256 conferido.
+# ga-c0939v.2: sobe o dump JSONL (jsonl-export, um run a cada 27 min em mediana) ao S3, com manifest e sha256 conferido. O nome diz "hourly" por história: a cadência é a de baixo.
 # Por quê, garantias, códigos de saída, alerta, desligar e conferir: cabeçalho de assets/scripts/jsonl-hourly-offsite.sh e docs/runbooks/jsonl-hourly-offsite.md.
-# interval 1h: pedido do Athos (15/10: perder no máximo 1 h de beads). RPO real medido (típico ~1h35, pior ~4h15; depende do exporter) e a opção interval = "30m" (decisão de produto): runbook.
-# timeout 2400s: típico ~5 min (build ~4 min, medido); o teto cobre o build (≤ 900 s) e o upload. interval (3600 s) > timeout e o script tem lock single-flight: runs não empilham.
+# interval 30m (ga-c0939v.7; era 1h): pedido do Athos (15/10: perder no máximo 1 h de beads). Medido em 16-23/10: todo order `cooldown` da cidade dispara com sobra sobre o intervalo (mediana ~6 min, p90 ~18 min,
+#   cauda de 40-80 min; 706 intervalos de 8 orders), então `1h` nunca entrega gap <= 60 min: 93% dos 124 gaps reais entre publicações do latest.json passaram de 1 h (mediana 1h10). Com 30m, 3,7% dos
+#   disparos passam de 60 min (a cauda é parada do controller, que o alarme `jsonl-hourly-offsite-age` cobre). Custo: até 2 snapshots por hora (~175 MB cada, build ~4 min com nice 15) em vez de 1; voltar a 1h
+#   devolve a cadência medida acima, não 1 h.
+# timeout 2400s: típico ~3 min (medido: mediana 206 s, p90 326 s, máx 579 s em 86 runs); o teto cobre o build (<= 900 s) e o upload. interval (1800 s) < timeout: um run lento não empilha outro porque o script tem lock single-flight.
 # Run morto pelo timeout (ou kill, ou reboot) não chega a registrar a falha: o run seguinte o conta (`attempt_open` no estado).
 # Credencial: o aws precisa estar acessível ao ambiente do order (a mesma do dolt-s3-backup.sh); sem ela o run sai fail/unknown e o alerta sai no 2º seguido.
 [order]
-description = "Hourly offsite upload of the JSONL dump archive to S3 with manifest + sha256 verification (ga-c0939v — RPO 1h for beads)"
+description = "Upload every 30 min of the JSONL dump archive to S3 with manifest + sha256 verification (ga-c0939v — lose at most 1h of beads)"
 trigger = "cooldown"
-interval = "1h"
+interval = "30m"
 timeout = "2400s"
 exec = "$PACK_DIR/assets/scripts/jsonl-hourly-offsite.sh"

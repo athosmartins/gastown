@@ -1,0 +1,13 @@
+# ga-c0939v.7: alarme de idade do último objeto do upload JSONL no S3. Lê o LastModified do latest.json (relógio do S3) e avisa quando passa de 75 min.
+# Três estados, e só o primeiro é "em dia": em dia / atrasado ou ausente / não consegui ler o S3 (este último avisa na 2ª verificação seguida). Detalhe: cabeçalho de assets/scripts/jsonl-hourly-offsite.sh (MODO --age-check)
+# e docs/runbooks/jsonl-hourly-offsite.md.
+# É um order SEPARADO do upload de propósito: o run que atrasa, trava ou perde a credencial não pode ser o que avisa. Só leitura (head-object), sem lock, estado próprio.
+# interval 10m: o order dispara com sobra mediana de ~6 min e p90 de ~18 min sobre o intervalo (medido), então o aviso sai uns 15-30 min depois de cruzar os 75 min. Isto roda no controller:
+#   controller parado NÃO é visto por aqui (em 23/10 houve 3h33 sem publicação, sem falha no log). A perna que não depende do controller está pronta e NÃO instalada: ga-c0939v.8.
+# timeout 180s: o head-object tem teto próprio de 60 s (JHO_AGE_S3_TIMEOUT); o run termina antes disto ou diz por quê.
+[order]
+description = "Alarm: age of the hourly JSONL upload's latest.json in S3 (ga-c0939v.7) — late/absent/unreadable are all distinct from up-to-date"
+trigger = "cooldown"
+interval = "10m"
+timeout = "180s"
+exec = "$PACK_DIR/assets/scripts/jsonl-hourly-offsite.sh --age-check"
