@@ -711,8 +711,8 @@ def is_duplicate_refusal_slug(slug):
     return bool(_DUPLICATE_REFUSAL_RE.search(slug or ""))
 
 
-def drop_duplicate_refusals_for_live_builder(labels, bridge_sources, has_live_session):
-    """ga-32a4bo: take the duplicate-class refusals out of what reclaim_decision() will see, when the bead's builder is LIVE.
+def drop_duplicate_refusals(labels, bridge_sources, has_live_session):
+    """ga-32a4bo: take the duplicate-class refusals out of what reclaim_decision() will see.
 
     Incident (ga-8hcnvb.3, 06/10): the Pilot slung a bead dog-1 was already building; the extra dispatch was refused `duplicate-of-in-flight` on its sling
     wrapper and run_cycle() bridged that onto the SOURCE bead as an explicit refusal. A refusal bypasses the stranding wait, and once it has stood for
@@ -720,15 +720,20 @@ def drop_duplicate_refusals_for_live_builder(labels, bridge_sources, has_live_se
     pilot:refused-reason + pilot:refusal-count; a second one escalated at once (the count-crossing escalate sits ahead of has_live_session). Those are all
     conclusions about the bead drawn from a refusal that says the opposite: somebody IS building it.
 
-    Pure, no I/O. Returns (labels, bridge_sources, dropped_labels): both lists without the duplicate-class entries (genuine reasons and a bare pool:refused
-    stay, so a mixed bead still reclaims for the genuine one and the duplicate one is never promoted into pilot:refused-reason), and the labels dropped.
-    Without a live builder nothing is dropped — the refusal then reads as before (the 'in flight' it names is not there) — and the inputs come back as they were.
+    Pure, no I/O. Returns (labels, bridge_sources, dropped_labels): both lists without the duplicate-class entries, and the labels dropped. A duplicate-class
+    refusal BRIDGED from a sling wrapper is always dropped: it is about the extra dispatch, whether or not the builder is alive, and the wrapper keeps the
+    label for up to an hour (sling-task-janitor), so a builder that dies in that window must not be fast-pathed into a refusal park by a stale one. The same
+    label on the bead ITSELF is dropped only with a live builder (without one the 'in flight' it names is not there, and it reads as before). Genuine reasons
+    and a bare pool:refused stay either way: a mixed bead still reclaims for the genuine one and the duplicate one is never promoted into pilot:refused-reason.
     The label itself is left on the bead/wrapper: this hides it from the decision, it does not consume it.
     """
-    if not has_live_session:
-        return labels, bridge_sources, []
-    dropped = [lbl for lbl in labels if is_duplicate_refusal_slug(_refusal_slug_of_label(lbl))]
-    if not dropped:
+    bridged_dup = {e[0] for e in bridge_sources if is_duplicate_refusal_slug(e[0])}
+    dropped = []
+    for lbl in labels:
+        slug = _refusal_slug_of_label(lbl)
+        if is_duplicate_refusal_slug(slug) and (has_live_session or slug in bridged_dup):
+            dropped.append(lbl)
+    if not dropped and not bridged_dup:
         return labels, bridge_sources, []
     kept_labels = [lbl for lbl in labels if lbl not in dropped]
     kept_sources = [e for e in bridge_sources if not is_duplicate_refusal_slug(e[0])]
@@ -4788,10 +4793,10 @@ def run_cycle(state, escalated_alerted):
         if not has_live_session and bead_id in live_sling_owner_beads:
             has_live_session = True
 
-        # ga-32a4bo: a duplicate-of-in-flight refusal says the extra DISPATCH was redundant because a builder is already on this bead — with that builder
-        # live it is no refusal of the BEAD: hidden from the decision, so it can neither age into a reclaim (ga-5ure2d) nor count toward
-        # REFUSAL_ESCALATE_THRESHOLD. See drop_duplicate_refusals_for_live_builder() for the incident.
-        labels, bridge_sources, _dup_dropped = drop_duplicate_refusals_for_live_builder(labels, bridge_sources, has_live_session)
+        # ga-32a4bo: a duplicate-of-in-flight refusal says the extra DISPATCH was redundant because a builder is already on this bead — it is no refusal of the
+        # BEAD: hidden from the decision (a bridged one always, one on the bead itself while its builder is live), so it can neither age into a reclaim
+        # (ga-5ure2d) nor count toward REFUSAL_ESCALATE_THRESHOLD. See drop_duplicate_refusals() for the incident.
+        labels, bridge_sources, _dup_dropped = drop_duplicate_refusals(labels, bridge_sources, has_live_session)
 
         # ga-be4x: explicit refusal is a label read — pure, cheap, and, unlike
         # provably_dead, not scoped to bare-pool-zombie assignees. A worker's
@@ -4811,8 +4816,8 @@ def run_cycle(state, escalated_alerted):
         bead_state = state.setdefault(bead_id, {})
         refusal_age_secs = update_refusal_clock(bead_state, has_explicit_refusal, now)
         if _dup_dropped and bead_state.get("dup_refusal_logged") != _dup_dropped:
-            print(f"[INFLIGHT-RECLAIM] ga-32a4bo: bead={bead_id} assignee={assignee!r} is live — ignoring duplicate-of-in-flight refusal(s) {_dup_dropped!r} "
-                  f"(a redundant dispatch, not a refusal of the bead); claim left intact", flush=True)
+            print(f"[INFLIGHT-RECLAIM] ga-32a4bo: bead={bead_id} assignee={assignee!r} live_session={has_live_session} — ignoring duplicate-of-in-flight refusal(s) "
+                  f"{_dup_dropped!r} (a redundant dispatch, not a refusal of the bead)", flush=True)
             bead_state["dup_refusal_logged"] = _dup_dropped
 
         # Branch check is potentially slow (git fetch); only run when needed.
@@ -10048,10 +10053,18 @@ def _selftest():
     _c = _dup_cycle(_dup_inflight + ["pool:refused:duplicate-of-in-flight"], [], live=True, refusal_age=_dup_age)
     check("DUP-4 (ga-32a4bo): the same label stamped on the bead ITSELF (no sling wrapper) with a live builder is not reclaimed either",
           _c["reclaim"] == [] and _c["escalate"] == [], f"reclaim={len(_c['reclaim'])} escalate={len(_c['escalate'])}")
-    _c = _dup_cycle(_dup_inflight, [_dup_br], live=False)
-    check("DUP-5 (control): the builder is NOT live → the refusal still reclaims, as before (the exemption needs a live builder)",
+    _c = _dup_cycle(_dup_inflight + ["pool:refused:duplicate-of-in-flight"], [], live=False)
+    check("DUP-5 (control): the same label on the bead ITSELF with NO live builder still reclaims as a refusal, as before (for the bead's own label the exemption needs a live builder)",
           len(_c["reclaim"]) == 1 and _c["reclaim"][0][1].get("has_explicit_refusal") is True and _c["escalate"] == [],
           f"reclaim={len(_c['reclaim'])} escalate={len(_c['escalate'])}")
+    _c = _dup_cycle(_dup_inflight, [_dup_br], live=False)
+    check("DUP-5b (ga-32a4bo): a duplicate refusal BRIDGED from a sling wrapper is about the extra dispatch whether or not the builder is alive — a stale one (the wrapper keeps the label up to an "
+          "hour) must not fast-path a bead whose builder just died into a refusal park",
+          _c["reclaim"] == [] and _c["escalate"] == [], f"reclaim={len(_c['reclaim'])} escalate={len(_c['escalate'])}")
+    _c = _dup_cycle(_dup_inflight, [_dup_br], live=False, stranded_age=POOL_ZOMBIE_TTL + 60)
+    check("DUP-5c (control): …and the dead-builder bead is still reclaimed the ordinary way once it has stood stranded long enough (not as a refusal, no refusal alert)",
+          len(_c["reclaim"]) == 1 and _c["reclaim"][0][1].get("has_explicit_refusal") is False and _c["alert"] == [],
+          f"reclaim={len(_c['reclaim'])} kw={[k for _, k in _c['reclaim']]!r} alerts={len(_c['alert'])}")
     _c = _dup_cycle(_dup_inflight, [_dup_genuine], live=True, refusal_age=_dup_age)
     check("DUP-6 (control): a GENUINE refusal (cross-rig-framework) with a live builder, standing past the grace, still reclaims (ga-5ure2d is not undone)",
           len(_c["reclaim"]) == 1 and _c["reclaim"][0][1].get("has_explicit_refusal") is True, f"reclaim={len(_c['reclaim'])}")
@@ -10090,15 +10103,21 @@ def _selftest():
         check(f"DUP-U1 (ga-32a4bo): is_duplicate_refusal_slug({_slug!r}) is {_want}", _got is _want, f"got={_got!r}")
     _du_labels = ["story:in-flight", "pool:refused:duplicate-of-in-flight", "pool:refused:cross-rig-framework", "pool:refused"]
     _du_src = [_dup_br, _dup_genuine]
+    _du_native = ["story:in-flight", "pool:refused:duplicate-of-in-flight"]
     try:
-        _du_live = drop_duplicate_refusals_for_live_builder(_du_labels, _du_src, True)
-        _du_dead = drop_duplicate_refusals_for_live_builder(_du_labels, _du_src, False)
+        _du_live = drop_duplicate_refusals(_du_labels, _du_src, True)
+        _du_dead = drop_duplicate_refusals(_du_labels, _du_src, False)
+        _du_nat_live = drop_duplicate_refusals(_du_native, [], True)
+        _du_nat_dead = drop_duplicate_refusals(_du_native, [], False)
     except Exception as _e:
-        _du_live = _du_dead = repr(_e)
-    check("DUP-U2 (ga-32a4bo): with a live builder only the duplicate-class refusal label and bridge entry are dropped (genuine and bare pool:refused stay), the drop is reported",
-          _du_live == (["story:in-flight", "pool:refused:cross-rig-framework", "pool:refused"], [_dup_genuine], ["pool:refused:duplicate-of-in-flight"]), f"got={_du_live!r}")
-    check("DUP-U3 (ga-32a4bo): without a live builder nothing is dropped and the inputs come back as they were",
-          _du_dead == (_du_labels, _du_src, []), f"got={_du_dead!r}")
+        _du_live = _du_dead = _du_nat_live = _du_nat_dead = repr(_e)
+    _du_want = (["story:in-flight", "pool:refused:cross-rig-framework", "pool:refused"], [_dup_genuine], ["pool:refused:duplicate-of-in-flight"])
+    check("DUP-U2 (ga-32a4bo): a duplicate-class refusal bridged from a wrapper is dropped (label and bridge entry), genuine and bare pool:refused stay, the drop is reported — with a live builder",
+          _du_live == _du_want, f"got={_du_live!r}")
+    check("DUP-U3 (ga-32a4bo): …and without one too (the bridged label describes the extra dispatch either way)", _du_dead == _du_want, f"got={_du_dead!r}")
+    check("DUP-U4 (ga-32a4bo): the same label on the bead ITSELF is dropped only with a live builder; without one it is kept (the inputs come back as they were)",
+          _du_nat_live == (["story:in-flight"], [], ["pool:refused:duplicate-of-in-flight"]) and _du_nat_dead == (_du_native, [], []),
+          f"live={_du_nat_live!r} dead={_du_nat_dead!r}")
 
     # the Mayor alert's own call: one `gc mail send mayor`, and a failing mail is said but never raises
     _alr_calls = []
