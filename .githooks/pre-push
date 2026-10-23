@@ -209,7 +209,8 @@ outer-repo work; the deployed tree agents actually run from is
       # ga-btjhat (ga-taa25c): a plist with '--' inside an XML comment loads in launchd, but plistlib
       # rejects it and the WA daemon scan goes blind to that job. Same tradeoff as park_labels above:
       # rc 1 (a plist does not parse) blocks; rc 2 (could not decide) warns and lets the push through.
-      mapfile -t plist_touch < <(git diff --name-only --diff-filter=ACM "$orphan_range" -- '*.plist' 2>/dev/null)
+      plist_touch=()   # bash 3.2 (macOS /bin/bash) has no mapfile
+      while IFS= read -r _pf; do [[ -n "$_pf" ]] && plist_touch+=("$_pf"); done < <(git diff --name-only --diff-filter=ACM "$orphan_range" -- '*.plist' 2>/dev/null)
       if [[ ${#plist_touch[@]} -gt 0 ]] && command -v python3 &>/dev/null; then
         _plist_rc=0
         python3 .gascity-gastown-hq/scripts/plist-comment-lint.py "${plist_touch[@]}" || _plist_rc=$?
