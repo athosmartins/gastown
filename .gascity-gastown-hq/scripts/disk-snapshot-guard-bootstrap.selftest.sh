@@ -9,11 +9,15 @@
 #   dá dentes ao teste: instalador adulterado, ausente ou symlink = NADA instalado e o guard segue (rc 0); sem root = nada, e um
 #   $EUID importado do ambiente não muda o que roda (o uid vem de `id -u`); na rodada 1 o launchctl falso NUNCA recebe
 #   bootout/bootstrap (a rodada não é morta no meio e o job não fica descarregado); a segunda rodada e a rodada da própria
-#   cópia do root não chamam o instalador. Mutantes (8): o mesmo núcleo contra cópias do guard com uma proteção desligada.
+#   cópia do root não chamam o instalador. Mutantes (8): o mesmo núcleo contra cópias do guard com uma proteção desligada, mais um
+#   mutante NULO (nada muda) que tem de SOBREVIVER: sem esse controle limpo, "mutante morto" não prova nada.
 #
 # COMO É HERMÉTICO: sem sudo, sem launchd, sem /usr/local nem /Library reais. Uma "raiz falsa" (DSG_ROOT_PFX) faz o papel de
 #   "/", o uid de quem roda faz o papel do root (DSG_ROOT_UID, DSG_OWNER) e launchctl e PlistBuddy são stubs de bash. Os ganchos só
-#   valem SEM root, por isso este selftest RECUSA rodar como root.
+#   valem SEM root, por isso este selftest RECUSA rodar como root. Depois do bloco de bootstrap o guard segue para o rabo REAL
+#   (df → tmutil → sleep 3 → sudo notify): com PATH na frente, o df é um stub SAUDÁVEL (o guard sai sem agir) e tmutil, sudo e
+#   sleep são ALARMES que gravam a chamada e reprovam o teste; um caso de controle com disco baixo prova que os alarmes disparam.
+#   O TMP é canonicalizado (pwd -P): o mktemp -d do macOS devolve /var/folders/… e o guard compara com /private/var/….
 #
 # SAÍDA: "Results: N passed, M failed"; exit 0 só com M = 0.
 
@@ -42,6 +46,9 @@ done
 
 TMP="$(mktemp -d)" || { echo "BAD: mktemp falhou"; exit 2; }
 trap 'rm -rf "$TMP"' EXIT
+# vazio/falhou → sem o caminho FÍSICO não sigo (exit 2): o guard compara `pwd -P` com prog_dir, e um TMP lógico (/var → /private/var) faria a
+# "cópia do root" nunca casar consigo mesma e rodar o instalador (blocker 1 do gate); nunca prossigo com um TMP que não confirmei.
+TMP="$(cd "$TMP" && pwd -P)" || { echo "BAD: não consegui canonicalizar o TMP"; exit 2; }
 MY_UID="$(id -u)"
 MY_OWNER="$(id -un):$(id -gn)"
 STUBS="$TMP/stubs"
@@ -82,6 +89,21 @@ case "${1:-}" in
 esac
 STUB
 chmod 0755 "$STUBS/PlistBuddy" "$STUBS/launchctl"
+
+# Hermético de verdade (blocker 3 do gate). df SAUDÁVEL: o 4º campo (Available, em KB) é o que o guard lê, e FAKE_DF_KB baixa o disco só no caso de controle.
+VIOL="$TMP/violations.log"; : > "$VIOL"
+export FAKE_VIOLATIONS="$VIOL"
+cat > "$STUBS/df" <<'STUB'
+#!/bin/bash
+echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+echo "/dev/fake 976490576 1000 ${FAKE_DF_KB:-900000000} 1% /System/Volumes/Data"
+STUB
+# tmutil, sudo e sleep são ALARMES: se o guard chegar neles, a chamada fica gravada em $FAKE_VIOLATIONS (nunca executam nada de verdade)
+for n in tmutil sudo sleep; do
+  printf '#!/bin/bash\necho "%s $*" >> "${FAKE_VIOLATIONS:?}"\nexit 0\n' "$n" > "$STUBS/$n"
+done
+chmod 0755 "$STUBS/df" "$STUBS/tmutil" "$STUBS/sudo" "$STUBS/sleep"
+PATH="$STUBS:$PATH"; export PATH   # vale para TODA invocação do guard (a função de bootstrap fixa o próprio PATH, o instalador não vê os stubs)
 
 sha_of() {
   local out=""
@@ -189,17 +211,45 @@ core() {
   # 9. $EUID importado não muda o que roda: com os ganchos o uid vem de `id -u`, e a rodada instala igual
   new_world; run_guard EUID=0
   expect_out "RESULTADO: instalado e confirmado" "EUID=0 no ambiente: o uid vem de id -u, a rodada instala igual"
+
+  # 10. controle dos alarmes: com o disco BAIXO o guard chega ao rabo real e cada alarme dispara. Sem isto, "nenhuma violação" nos outros casos não provaria que os stubs
+  #     enxergam o rabo. A violação vai para um arquivo à parte e não suja a checagem de hermeticidade do núcleo.
+  new_world; run_guard FAKE_DF_KB=2000000 FAKE_VIOLATIONS="$W/violations.low"
+  expect_rc 0 "controle do disco baixo: o guard termina bem"
+  for a in tmutil sleep sudo; do
+    if grep -q "^$a " "$W/violations.low" 2>/dev/null; then ok "controle do disco baixo: o alarme '$a' disparou (os stubs enxergam o rabo do guard)"; else bad "controle do disco baixo: o alarme '$a' NÃO disparou" "$(cat "$W/violations.low" 2>/dev/null)"; fi
+  done
 }
 
 core
+# vazio (log sem linhas) → o guard parou no bloco de bootstrap em todos os casos; qualquer linha → chegou ao rabo real (tmutil/sudo/sleep) e o teste reprova
+if [ ! -s "$VIOL" ]; then ok "hermético: em todos os casos o guard parou antes do rabo real (nenhuma chamada a tmutil/sudo/sleep)"; else bad "hermético: o guard chegou ao rabo real" "$(head -n 5 "$VIOL")"; fi
 
 # --- mutantes: o mesmo núcleo contra cópias do guard com UMA proteção desligada por vez; cada um tem de ser pego -------------
-mutate() { # <nome> <texto antigo> <texto novo>: o antigo tem de aparecer em exatamente 1 linha do guard
-  local name="$1" old="$2" new="$3" out="$TMP/mut-$1.sh"
-  awk -v old="$old" -v new="$new" '
+# core_fails <guard>: roda o núcleo sob esse guard na MESMA subshell dos mutantes e imprime o nº de falhas, ou "?" se o núcleo nem terminou
+core_fails() {
+  local n=""
+  n=$( ( GUARD="$1"; QUIET=1; PASS=0; FAIL=0; core >/dev/null 2>&1; echo "$FAIL" ) 2>/dev/null ) || n="?"
+  case "$n" in (''|*[!0-9]*) n="?" ;; esac
+  printf '%s' "$n"
+}
+# mutant_file <guard> <saída> <texto antigo> <texto novo>: rc 0 só se o antigo aparece em exatamente 1 linha
+mutant_file() {
+  awk -v old="$3" -v new="$4" '
     { i = index($0, old); if (i > 0) { c++; $0 = substr($0, 1, i-1) new substr($0, i+length(old)) } print }
-    END { exit (c == 1 ? 0 : 3) }' "$GUARD" > "$out" || { bad "mutante $name: o texto antigo não aparece em exatamente 1 linha"; return 0; }
-  if ( GUARD="$out"; QUIET=1; PASS=0; FAIL=0; core >/dev/null 2>&1; [ "$FAIL" -gt 0 ] ); then ok "mutante $name morto"; else bad "mutante $name SOBREVIVEU"; fi
+    END { exit (c == 1 ? 0 : 3) }' "$1" > "$2"
+}
+# CONTROLE (blocker 2 do gate): um mutante NULO (texto novo == antigo) passa pelo MESMO awk, arquivo e subshell e tem de SOBREVIVER com o guard idêntico. Se ele reprovar,
+# o baseline está sujo e toda "morte" abaixo seria vazia (um baseline que reprova mata qualquer mutante); falhou/não terminou ("?") conta como sujo.
+NULL_FILE="$TMP/mut-nulo.sh"; NULL_FAILS="?"
+if mutant_file "$GUARD" "$NULL_FILE" 'set -uo pipefail' 'set -uo pipefail' && cmp -s "$GUARD" "$NULL_FILE"; then NULL_FAILS="$(core_fails "$NULL_FILE")"; fi
+if [ "$NULL_FAILS" = "0" ]; then ok "controle: o mutante NULO (nada muda) sobrevive e o núcleo passa limpo pela subshell dos mutantes"; else bad "controle: o mutante NULO não sobreviveu limpo (falhas=$NULL_FAILS): nenhuma morte de mutante abaixo vale"; fi
+mutate() { # <nome> <texto antigo> <texto novo>: o antigo tem de aparecer em exatamente 1 linha do guard
+  local name="$1" out="$TMP/mut-$1.sh" f=""
+  mutant_file "$GUARD" "$out" "$2" "$3" || { bad "mutante $name: o texto antigo não aparece em exatamente 1 linha"; return 0; }
+  if [ "$NULL_FAILS" != "0" ]; then bad "mutante $name: sem baseline limpo (o controle nulo reprovou), 'morto' não prova nada"; return 0; fi
+  f="$(core_fails "$out")"
+  case "$f" in (0) bad "mutante $name SOBREVIVEU" ;; ('?') bad "mutante $name: o núcleo não terminou (inconclusivo, não é morte)" ;; (*) ok "mutante $name morto" ;; esac
 }
 mutate sem-hash-fixo 'elif [ "$inst_sha" != "$DSG_INSTALLER_SHA256" ]; then' 'elif false; then'
 mutate reload-mata-a-rodada '--no-reload --expect-sha256 "$guard_sha"' '--expect-sha256 "$guard_sha"'
