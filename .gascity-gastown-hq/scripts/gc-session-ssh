@@ -943,8 +943,8 @@ T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após
         t_start = time.monotonic()
         try:
             rc, out, err = remote(cfg, prep_body, start_timeout)
-            if rc == 0:  # preparou sem abrir nada: só agora, com o provider vivo e o que sobrou do prazo (mínimo OPEN_MIN), abre a tmux
-                rc, out2, err = remote(cfg, open_body, max(OPEN_MIN, int(start_timeout - (time.monotonic() - t_start))))
+            if rc == 0:  # preparou sem abrir nada: só agora, com o provider vivo e o que sobrou do prazo, abre a tmux. Mínimo OPEN_MIN; num host gráfico, mais o gui_wait_s: o agente leva até isso para dar o veredito do login (o `claude auth status` + o tmux), e um ssh cortado antes disso deixaria o agente subindo sem ninguém esperando
+                rc, out2, err = remote(cfg, open_body, max(OPEN_MIN + (cfg.gui_wait if cfg.gui else 0), int(start_timeout - (time.monotonic() - t_start))))
                 out = out if rc == 0 else out2  # ok: o que vale é o worktree que a 1ª imprimiu; falhou: o motivo da abertura
         finally:
             lr_invalidate(cfg)  # depois do ssh do start
