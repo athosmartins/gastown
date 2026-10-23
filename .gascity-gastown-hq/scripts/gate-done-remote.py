@@ -18,11 +18,17 @@ O QUE FAZ, EM ORDEM (passo que não consegue saber algo para sem escrever nada: 
      Com argumentos, a que o dog NOMEOU (o prefixo dela tem de ser o do rig do papel): (A) in_progress com assignee = alias, ou (B) a VOLTA DO GATE: sem assignee, `gate:needs-fix`, gc.routed_to = a rota do pool do rig
      (gastown.dog no HQ, ps-worker, wa-worker: a que o dispatcher RESTAURA ao reprovar; medida em 3 beads do HQ) ou a do nó (posta à mão) e a última entrega (o marcador MAIS NOVO com source-bead:<bead>, de qualquer status) é deste alias, por gate.submitted_by OU pela linha `author:` do marcador
      (sem assignee o gate-done.md congela o CRIADOR em submitted_by; só o author guarda o alias). Sem marcador, leitura que falha ou ilegível → recusa.
-  3. O trabalho: a ponta de `worker/<sessão>` no espelho do rig (<cidade>/.gc/hetzner-mirror/repos/<rig>.git; gascity para o HQ), onde o `git push` do servidor chegou. Com argumentos: a do
-     <ref> (check_ref: `worker/<sessão>` ou `worker/<sessão>-N`, casamento EXATO com GC_SESSION_NAME, ou `fix/<bead>[-<resumo>]` com o id da bead pedida; o `-N` é
-     recusado para sessão sem cauda, onde `<sessão>-N` pode ser OUTRA sessão), que tem de ser IGUAL ao <sha> (40 hex) que o dog diz, conferido ANTES do marcador.
+  3. O trabalho, no espelho do rig (<cidade>/.gc/hetzner-mirror/repos/<rig>.git; gascity para o HQ), onde o `git push` do servidor chegou. Sem argumento (pick_ref): entre os
+     `worker/<sessão>` e `worker/<sessão>-<cauda>` (`-v2`, `-<bead>`; a cauda é recusada para sessão sem cauda, onde `<sessão>-<cauda>` pode ser OUTRA sessão) fica o que tem commit PRÓPRIO
+     (que refs/remotes/origin/main do espelho não tem) citando a bead; o que já está no main, ou cita só outra bead, é ignorado com a razão dita; vários que citam → o que contém os outros; se nenhum contém os outros (o worker deu amend/rebase e o espelho,
+     que só avança por FF, guardou a versão nova em OUTRO ref) vale o de commit mais novo, dito na saída com a forma de trocar; empate de hora ou hora ilegível recusa. Nunca o ref fixo `worker/<sessão>` às cegas: ele fica preso na entrega anterior (ga-2hd02v.3.13). Com argumentos: a do
+     <ref> (check_ref: `worker/<sessão>` ou `worker/<sessão>-<cauda>`, casamento EXATO com GC_SESSION_NAME, ou `fix/<bead>[-<resumo>]` com o id da bead pedida), que tem de ser IGUAL ao <sha> (40 hex) que
+     o dog diz, conferido ANTES do marcador, e passa pela mesma prova do commit que cita a bead (regra do guarda ga-pj5va; no ensaio também).
      O nome `worker/<sessão>` não leva o id da bead e o gate extrai o id do nome do branch; por isso a submissão sai de um branch
      `fix/<bead>-<resumo>` no MESMO sha (o do próprio ref quando ele já é fix/…), criado num worktree descartável do mini, sob o caminho do rig (sem checkout: o gate-done só lê objetos).
+  3b. O fix/<bead>-… que o origin já tem (lease_push, antes de qualquer escrita no banco): ausente, igual ao sha ou ancestral dele → o passo 1 empurra como sempre. Não-FF (o dispatcher rebaseou) →
+     busca o branch e o main do origin em refs temporárias e só empurra se NADA se perde (`rev-list --right-only --cherry-pick`: todo commit do origin já está no main ou existe no sha como patch
+     equivalente), com --force-with-lease=<ref>:<sha lido>; senão recusa dizendo para refazer sobre o que o origin tem. Nunca força às cegas.
   4. A submissão É o /gate-done: os blocos bash dos passos 1 a 4 de commands/gate-done.md são lidos DAQUI, a cada execução, e rodados juntos no worktree
      (push do branch, bead e rig, marcador, gate:queued, gate.submitted_by). Não há cópia deles neste arquivo: mudar o gate-done.md muda isto também.
      Se o arquivo mudar de forma (não achar exatamente um bloco bash por passo), nada é empurrado.
@@ -32,18 +38,17 @@ O QUE FAZ, EM ORDEM (passo que não consegue saber algo para sem escrever nada: 
   6. Recolhe o que esta execução criou (worktree, branch local, ref temporária) e imprime o sha submetido. Nenhum git daqui dispara gc/manutenção.
 
 O QUE NÃO FAZ
-  Não vê o HEAD do servidor: sem argumento submete o que o ESPELHO tem em worker/<sessão> e imprime esse sha, e quem rodou o `gate-done` compara com
+  Não vê o HEAD do servidor: sem argumento submete o que o ESPELHO tem no ref escolhido (worker/<sessão>[-<cauda>]) e imprime esse sha, e quem rodou o `gate-done` compara com
   `git rev-parse HEAD` (se diferir, o `git push origin HEAD` não chegou ou veio depois: empurre e rode de novo; o gate junta marcadores do mesmo branch). Com
-  argumentos o dog passa o sha e a divergência é recusada antes do marcador. Em nenhuma forma ele confere se o ref empurrado é filho do que o origin já tem:
-  isso é do passo 1 do gate-done.md (nunca força).
+  argumentos o dog passa o sha e a divergência é recusada antes do marcador. O que está no servidor e não chegou ao espelho ele não vê.
   Não roda o pre-push do WA (ga-2hd02v.3.10): o hook dele executa ~12 scripts da ÁRVORE empurrada (`$REPO_ROOT/scripts/check_*.py`, suítes pytest) e o worktree é sem checkout de propósito (nenhum código do nó roda no mini antes da revisão). Rig com
   `prepush=False` na tabela RIGS (hoje só o WA) roda os blocos do gate-done.md com core.hooksPath numa pasta vazia da cidade (por ambiente; o gate-done.md e a config do rig ficam como estão), e o aviso vai ao cliente e ao `self_audit:` do marcador. HQ e PS seguem com o hook.
   Não roda a checagem "NEW READS NEED A FAILURE TEST" nem a auto-auditoria do diff (são do construtor, antes do push): o marcador registra
   `self_audit: … auto-auditoria do diff NÃO verificada aqui`, visível, não calado.
   Só os rigs da tabela RIGS (gascity, property_scrapers, whatsapp_automation; ga-2hd02v.4): o PAPEL da sessão
   (dog-remote, ps-worker-remote, wa-worker-remote) decide o rig, e com ele a loja da bead, o repositório do worktree e o espelho; o PREFIXO da bead só é CONFERIDO contra o do rig do papel (alias e sessão de
-  papéis diferentes, bead de outro prefixo, ou prefixo fora da tabela → recusa; nome de sessão que não é de nenhum papel vale como dog-remote, o comportamento de antes). O marcador do gate mora SEMPRE na loja da cidade; a bead, na do rig. Não força push: um branch fix/<bead>-… que já está no
-  origin e não é ancestral do novo sha (histórico reescrito) é recusado pelo próprio passo 1 do gate-done.md.
+  papéis diferentes, bead de outro prefixo, ou prefixo fora da tabela → recusa; nome de sessão que não é de nenhum papel vale como dog-remote, o comportamento de antes). O marcador do gate mora SEMPRE na loja da cidade; a bead, na do rig. Só reescreve um branch fix/<bead>-… do origin com --force-with-lease e quando
+  nada do origin se perde (passo 3b); fora disso o push é o do passo 1 do gate-done.md, que recusa o não-FF.
   Se uma execução morrer no meio (kill do wrapper), sobra o worktree/branch: a próxima recusa e diz o que recolher (nunca apaga o que não criou).
 
 CÓDIGOS DE SAÍDA (o wrapper devolve o do executável; 77 e 124-127 são DELE, e o stderr diz de quem é cada um)
@@ -61,6 +66,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import unicodedata
 from pathlib import Path
 from typing import NamedTuple
@@ -73,7 +79,10 @@ SHA_RE = re.compile(r"[0-9a-f]{40}")  # o sha que o dog diz: inteiro, para a con
 USAGE = "gate-done <bead> <ref> <sha>   (ou `gate-done` sem argumento: a ÚNICA bead in_progress do alias, de worker/<sessão>)"
 FIX_LABEL = "gate:needs-fix"  # o que o dispatcher põe na bead-fonte quando o gate reprova: a "volta do gate"
 ROUTES = ("gastown.dog", "dog-remote")  # (rig gascity; os outros: RIGS) gc.routed_to de uma volta do gate: gastown.dog é o que o dispatcher RESTAURA ao reprovar (gate_fail_restore_route → default_pool_route_for_rig; medido em ga-9636op, ga-2hd02v.1.12 e .1.18); dog-remote é a rota posta à mão. Quem prova que a bead é DESTE alias é a última entrega, não a rota
-BARE_ROLE_RE = re.compile(r"(?:dog|gate-reviewer|wa-worker|ps-worker)-remote")  # nome de sessão SEM cauda: pelo IDENTITY_PATTERN (gc-session-ssh.md) `<papel>-remote-<1-3 dígitos>` TAMBÉM é nome válido de sessão
+BARE_ROLE_RE = re.compile(r"(?:dog|gate-reviewer|wa-worker|ps-worker)-remote(?:-adhoc)?")  # nome de sessão SEM cauda: pelo IDENTITY_PATTERN (gc-session-ssh.md) `<papel>-remote-<1-3 dígitos | 3-12 alnum>` TAMBÉM é nome válido de sessão, e `<papel>-remote-adhoc-<10 alnum>` idem (ga-2hd02v.3.13)
+SUFFIX_RE = r"-[A-Za-z0-9][A-Za-z0-9._-]{0,40}"  # a cauda de worker/<sessão>-<cauda>: o `-v2`, o `-<bead>`, o `-a2lb9b` que os dogs usam quando worker/<sessão> está preso em outra entrega (ga-2hd02v.3.13)
+MIRROR_MAIN = "refs/remotes/origin/main"  # no espelho de produção o main mora SÓ aqui (o hetzner-mirror.sh o sincroniza); não há refs/heads/main
+MAX_CANDS = 40  # worker/<sessão>-… acima disso não se confere um a um: recusa e manda usar a forma com argumentos
 TIMEOUT_CMD = 120  # um bd/git que pendura não segura a submissão para sempre (o wrapper também corta tudo em timeout_s)
 SCRIPT_RAN = [False]  # vira True quando os blocos do gate-done.md começam: daí em diante um erro NÃO é "nada foi escrito" (marcador pode existir)
 
@@ -113,10 +122,10 @@ def say(msg: str) -> None:
     print(f"gate-done-remote: {msg}", file=sys.stderr, flush=True)
 
 
-def run(cmd: list, timeout: int = TIMEOUT_CMD) -> subprocess.CompletedProcess:
-    """Sem shell. Não levanta: comando que não rodou ou pendurou vira rc 255 com o motivo no stderr (quem chama decide; nunca lido como sucesso vazio)."""
+def run(cmd: list, timeout: int = TIMEOUT_CMD, env: dict | None = None) -> subprocess.CompletedProcess:
+    """Sem shell. Não levanta: comando que não rodou ou pendurou vira rc 255 com o motivo no stderr (quem chama decide; nunca lido como sucesso vazio). `env` None = o do processo."""
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
     except (OSError, subprocess.SubprocessError) as e:
         return subprocess.CompletedProcess(cmd, 255, "", f"{type(e).__name__}: {e}")
 
@@ -157,16 +166,16 @@ def one_bead(city: str, alias: str) -> dict:
 
 
 def check_ref(raw: str, sess: str, bid: str) -> str:
-    """O branch do espelho que o dog pede para submeter, sem `refs/heads/`. Só vale o que é DESTA sessão (worker/<sessão> ou worker/<sessão>-N: casamento
+    """O branch do espelho que o dog pede para submeter, sem `refs/heads/`. Só vale o que é DESTA sessão (worker/<sessão> ou worker/<sessão>-<cauda>: casamento
     EXATO, nunca prefixo, senão a sessão `x4` passaria por `x`) ou leva o id da bead pedida (fix/<bead> ou fix/<bead>-<resumo>). Qualquer outra coisa → Stop (nada foi lido
     nem escrito). Função pura: a identidade vem do ambiente do atalho (GC_SESSION_NAME), nunca do que o dog escreve."""
     name = raw[len("refs/heads/"):] if raw.startswith("refs/heads/") else raw
-    mine = re.fullmatch(rf"worker/{re.escape(sess)}(?:-[0-9]{{1,3}})?", name)
+    mine = re.fullmatch(rf"worker/{re.escape(sess)}(?:{SUFFIX_RE})?", name)
     fixed = re.fullmatch(rf"fix/{re.escape(bid)}(?:-[A-Za-z0-9._-]{{1,80}})?", name)
     if not (mine or fixed):
-        raise Stop(f"{raw[:80]!r} está fora do que esta sessão pode submeter (worker/{sess} ou worker/{sess}-N, ou fix/{bid} / fix/{bid}-<resumo>)")
-    if mine and not fixed and name != f"worker/{sess}" and BARE_ROLE_RE.fullmatch(sess):  # `-N` só é inequívoco se `<sessão>-N` NÃO for ele mesmo nome de sessão (revisão lateral, ga-2hd02v.1.18)
-        raise Stop(f"{name!r}: a sessão {sess!r} não tem cauda, então worker/{sess}-N pode ser o branch principal de OUTRA sessão ({sess}-N é nome válido): empurre fix/{bid}-<resumo> e submeta esse ref")
+        raise Stop(f"{raw[:80]!r} está fora do que esta sessão pode submeter (worker/{sess} ou worker/{sess}-<cauda>, ou fix/{bid} / fix/{bid}-<resumo>)")
+    if mine and not fixed and name != f"worker/{sess}" and BARE_ROLE_RE.fullmatch(sess):  # a cauda só é inequívoca se `<sessão>-<cauda>` NÃO for ele mesmo nome de sessão (revisão lateral, ga-2hd02v.1.18)
+        raise Stop(f"{name!r}: a sessão {sess!r} não tem cauda, então worker/{sess}-<cauda> pode ser o branch principal de OUTRA sessão ({sess}-N é nome válido): empurre fix/{bid}-<resumo> e submeta esse ref")
     if run(["git", "check-ref-format", f"refs/heads/{name}"]).returncode != 0:
         raise Stop(f"{name!r} não é um nome de branch válido")
     return name
@@ -225,6 +234,122 @@ def mirror_sha(mirror: str, src: str, rig: str = "gascity") -> str:
     if r.returncode != 0 or not SHA_RE.fullmatch(sha):
         raise Stop(f"não consegui ler {src} no espelho (git rc={r.returncode}: {r.stderr.strip()[:120]})")
     return sha
+
+
+def my_ref(name: str, sess: str) -> bool:
+    """`name` (sem refs/heads/) é um branch principal DESTA sessão: worker/<sessão> exato, ou worker/<sessão>-<cauda> (a cauda só vale se `<sessão>-<cauda>` não puder ser OUTRA sessão: BARE_ROLE_RE)."""
+    if name == f"worker/{sess}":
+        return True
+    return not BARE_ROLE_RE.fullmatch(sess) and re.fullmatch(rf"worker/{re.escape(sess)}{SUFFIX_RE}", name) is not None
+
+
+def cites(bid: str, text: str) -> bool:
+    """O texto cita a bead? Ancorado como o guarda (ga-pj5va): `ga-t5` casa `ga-t5` e `ga-t5.2`, mas não `ga-t50` nem `xga-t5`."""
+    return re.search(rf"(?<![A-Za-z0-9]){re.escape(bid)}(?![A-Za-z0-9])", text) is not None
+
+
+def mirror_main(mirror: str) -> str:
+    # vazio (rc 1, sem saída: o espelho não tem refs/remotes/origin/main) → Stop; falhou/ilegível → Stop com o rc: sem o main eu não sei o que já foi entregue, e "tudo é próprio" deixaria passar o commit alheio
+    r = run(["git", f"--git-dir={mirror}", "rev-parse", "--verify", "-q", f"{MIRROR_MAIN}^{{commit}}"])
+    sha = r.stdout.strip()
+    if r.returncode == 1 and not sha:
+        raise Stop(f"o espelho não tem {MIRROR_MAIN} (o hetzner-mirror.sh o sincroniza): sem o main não sei quais commits são desta bead; não submeto")
+    if r.returncode != 0 or not SHA_RE.fullmatch(sha):
+        raise Stop(f"não consegui ler {MIRROR_MAIN} no espelho (git rc={r.returncode}: {r.stderr.strip()[:120]})")
+    return sha
+
+
+def cite_verdict(mirror: str, main: str, sha: str, bid: str) -> tuple:
+    """(veredito, n) dos commits PRÓPRIOS de `sha` (os que o main não tem): "no-own" (nenhum: já está no main), "no" (n commits, nenhum cita a bead), "yes".
+    vazio (nenhum commit além do main) → "no-own"; falhou (git log) → Stop: nunca vira "sem commits" nem "cita"."""
+    r = run(["git", f"--git-dir={mirror}", "log", "-z", "--format=%B", f"{main}..{sha}"])
+    if r.returncode != 0:
+        raise Stop(f"não consegui ler os commits de {sha[:12]} no espelho (git rc={r.returncode}: {r.stderr.strip()[:120]})")
+    msgs = r.stdout.split("\0")
+    msgs = msgs[:-1] if msgs[-1] == "" else msgs
+    if not msgs:
+        return "no-own", 0
+    return ("yes" if any(cites(bid, m) for m in msgs) else "no"), len(msgs)
+
+
+def why_not(verdict: str, n: int, bid: str) -> str:
+    return "já está no main (nenhum commit além do main)" if verdict == "no-own" else f"{n} commit(s) próprio(s), nenhum cita {bid}"
+
+
+def is_ancestor(gitargs: list, a: str, b: str) -> bool:
+    # rc 0 → é ancestral; rc 1 → não é; qualquer outro (falhou, objeto ausente) → Stop: "não consegui comparar" nunca vira "não é ancestral"
+    r = run(["git"] + gitargs + ["merge-base", "--is-ancestor", a, b])
+    if r.returncode not in (0, 1):
+        raise Stop(f"não consegui comparar {a[:12]} com {b[:12]} (git rc={r.returncode}: {r.stderr.strip()[:120]})")
+    return r.returncode == 0
+
+
+def commit_time(mirror: str, sha: str) -> int:
+    # falhou/ilegível (rc != 0, ou a saída não é um inteiro) → Stop: sem a hora não sei qual dos refs é o mais novo, e "hora 0" faria o ref sem data perder em silêncio
+    r = run(["git", f"--git-dir={mirror}", "log", "-1", "--format=%ct", sha])
+    if r.returncode != 0 or not re.fullmatch(r"[0-9]{1,12}", r.stdout.strip()):
+        raise Stop(f"não consegui ler a hora do commit {sha[:12]} no espelho (git rc={r.returncode}: {(r.stderr.strip() or r.stdout.strip())[:120]})")
+    return int(r.stdout.strip())
+
+
+def utc(ts: int) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def pick_ref(mirror: str, sess: str, bid: str, rig: str) -> tuple:
+    """Sem argumento: de qual worker/<sessão>[-<cauda>] do espelho sai a entrega de `bid`? Só vale o que tem commit PRÓPRIO (que o main não tem) que cita a bead; entre os
+    que valem, o que contém os outros. Se nenhum contém os outros (o worker deu amend/rebase e o espelho, que só avança por FF, guardou a versão nova em OUTRO ref: é o caso
+    comum), vale o de commit mais novo; empate de hora ou hora ilegível → Stop. Nenhum que sirva → Stop (nunca o ref fixo worker/<sessão> às cegas: ele fica preso na entrega
+    anterior). Cada ref que fica de fora é dito, com o motivo. Devolve (ref sem refs/heads/, sha). Nunca olha fix/…: quem quer esse ref usa a forma com argumentos."""
+    if not os.path.isdir(mirror):
+        raise Stop(f"espelho {mirror} não existe neste mini")
+    # for-each-ref e não `git branch --list`: o HEAD do espelho aponta para refs/remotes/origin/main (o main só vive lá), e o `branch` morre com "HEAD not found below refs/heads!"
+    # vazio (nenhum worker/<sessão>…) → Stop "o espelho não tem"; falhou/ilegível → Stop: sem a lista não sei o que o servidor empurrou
+    r = run(["git", f"--git-dir={mirror}", "for-each-ref", "--format=%(objectname) %(refname)", f"refs/heads/worker/{sess}", f"refs/heads/worker/{sess}-*"])
+    if r.returncode != 0:
+        raise Stop(f"não consegui ler worker/{sess}… no espelho (git rc={r.returncode}: {r.stderr.strip()[:120]})")
+    cands = []
+    for ln in r.stdout.splitlines():
+        m = re.fullmatch(r"([0-9a-f]{40}) refs/heads/(\S+)", ln)
+        if not m:
+            raise Stop(f"a lista de worker/{sess}… do espelho veio ilegível ({ln[:80]!r})")
+        if my_ref(m.group(2), sess):
+            cands.append((m.group(2), m.group(1)))
+    if not cands:
+        raise Stop(f"o espelho não tem worker/{sess}: o `git push origin HEAD:refs/heads/worker/{sess}` do servidor não chegou (ou a sessão é de outro rig; este espelho é o do {rig})")
+    if len(cands) > MAX_CANDS:
+        raise Stop(f"{len(cands)} refs worker/{sess}… no espelho (mais que {MAX_CANDS}): não confiro um a um; use `gate-done {bid} <ref> <sha>`")
+    main = mirror_main(mirror)
+    kept, why = [], []
+    for ref, sha in sorted(cands):
+        verdict, n = cite_verdict(mirror, main, sha, bid)
+        if verdict == "yes":
+            kept.append((ref, sha))
+        else:
+            why.append(f"{ref} {why_not(verdict, n, bid)}")
+            say(f"ignorei {ref} ({why_not(verdict, n, bid)})")
+    if not kept:
+        raise Stop(f"nenhum worker/{sess}… do espelho serve para {bid}: {'; '.join(why)}. Empurre o commit da bead (que cite {bid}) e repita")
+    gd = [f"--git-dir={mirror}"]
+    tip = kept[0]
+    for c in kept[1:]:  # o candidato a "mais novo": passa para c quando o atual é ancestral dele; a conferência abaixo diz se de fato é o topo
+        if is_ancestor(gd, tip[1], c[1]):
+            tip = c
+    if not all(is_ancestor(gd, c[1], tip[1]) for c in kept if c is not tip):
+        # nenhum contém os outros: vale o commit mais novo (a hora do COMMIT: amend e rebase a renovam); empate entre os dois mais novos → Stop, não chuto
+        stamped = sorted(((commit_time(mirror, c[1]), c) for c in kept), key=lambda x: x[0], reverse=True)
+        if stamped[0][0] == stamped[1][0]:
+            raise Stop(f"{len(kept)} refs do espelho citam {bid} e divergem ({', '.join(x[0] for x in kept)}), e os dois mais novos ({stamped[0][1][0]}, {stamped[1][1][0]}) têm a mesma hora de commit ({utc(stamped[0][0])}): "
+                       f"não escolho. Diga qual: `gate-done {bid} <ref> <sha>`")
+        tip = stamped[0][1]
+    for c in kept:
+        if c is tip:
+            continue
+        if is_ancestor(gd, c[1], tip[1]):
+            say(f"ignorei {c[0]} (é ancestral de {tip[0]}: o commit mais novo da bead já o contém)")
+        else:
+            say(f"ignorei {c[0]} (diverge de {tip[0]}, que tem o commit mais novo: {utc(commit_time(mirror, tip[1]))} contra {utc(commit_time(mirror, c[1]))}; se o certo era esse: `gate-done {bid} {c[0]} {c[1]}`)")
+    return tip
 
 
 def gate_done_script(md: Path) -> str:
@@ -303,6 +428,50 @@ def hooks_off(env: dict, work: Path) -> dict:
     return {**env, "GIT_CONFIG_COUNT": str(n + 1), f"GIT_CONFIG_KEY_{n}": "core.hooksPath", f"GIT_CONFIG_VALUE_{n}": str(nohooks)}
 
 
+def origin_tip(wt: str, env: dict, branch: str) -> str:
+    # vazio (o origin não tem o branch) → "": o push do gate-done.md o cria; falhou/ilegível → Stop: "não consegui ler" nunca vira "não tem" (empurrar às cegas por cima do que talvez exista)
+    r = run(["git", "-C", wt, "ls-remote", "--heads", "origin", f"refs/heads/{branch}"], env=env)
+    if r.returncode != 0:
+        raise Stop(f"não consegui ler {branch} no origin (git rc={r.returncode}: {r.stderr.strip()[:120]})")
+    out = r.stdout.strip()
+    if not out:
+        return ""
+    m = re.fullmatch(rf"([0-9a-f]{{40}})\trefs/heads/{re.escape(branch)}", out)
+    if not m:
+        raise Stop(f"{branch} no origin: a resposta do ls-remote veio ilegível ({out[:80]!r})")
+    return m.group(1)
+
+
+def lease_push(repo: str, wt: str, env: dict, sess: str, branch: str, sha: str, tmp: list) -> None:
+    """O origin já tem `branch` e o novo `sha` não o contém (o dispatcher REBASEOU o fix/<bead>-… sobre o main novo, ou alguém empurrou algo): o `git push origin HEAD` do passo 1 do gate-done.md
+    seria recusado (não-FF; wa-xr1xwt). Aqui: se NADA se perde (todo commit do origin, fora o que já está no main, existe em `sha` como o mesmo commit ou como patch equivalente),
+    empurra com --force-with-lease=<ref>:<o que li>, que o origin recusa se mudou depois da leitura; senão recusa com o que fazer. Sem branch no origin, igual ao sha, ou ancestral do sha
+    (FF) → não faz nada: o passo 1 empurra como sempre. As refs temporárias que a busca cria entram em `tmp` (o `finally` do submit as recolhe). Nada foi escrito se levantar Stop."""
+    tip = origin_tip(wt, env, branch)
+    if not tip or tip == sha:
+        return
+    t_ref, m_ref = f"refs/gt-remote/{sess}.origin", f"refs/gt-remote/{sess}.main"
+    tmp += [t_ref, m_ref]
+    r = run(["git", "-C", repo, "fetch", "-q", "--no-tags", "--no-write-fetch-head", "origin", f"+refs/heads/{branch}:{t_ref}", f"+refs/heads/main:{m_ref}"], timeout=240, env=env)
+    if r.returncode != 0:
+        raise Stop(f"não consegui buscar {branch} do origin (git rc={r.returncode}: {r.stderr.strip()[:160]})")
+    if is_ancestor(["-C", wt], tip, sha):
+        return
+    # vazio (nada no origin que `sha` não tenha) → empurra com lease; tem commit → Stop "refaça"; falhou (objeto ausente, git que não leu) → Stop: "não consegui conferir" nunca vira "nada a perder"
+    lost = run(["git", "-C", wt, "rev-list", "--right-only", "--cherry-pick", f"{sha}...{tip}", f"^{m_ref}"])
+    if lost.returncode != 0:
+        raise Stop(f"não consegui conferir se o origin tem algo que {sha[:12]} não tem (git rc={lost.returncode}: {lost.stderr.strip()[:120]}): não reescrevo {branch}")
+    extra = lost.stdout.split()
+    if extra:
+        raise Stop(f"o origin tem {len(extra)} commit(s) em {branch} (a ponta é {tip[:12]}, ex.: {extra[0][:12]}) que {sha[:12]} não tem, nem como patch equivalente, e que o main também não tem: empurrar os perderia. "
+                   f"Refaça o commit em cima do que o origin tem (git fetch origin; git rebase origin/{branch}), empurre ao servidor e rode de novo. Nada foi escrito")
+    say(f"AVISO: {branch} no origin está em {tip[:12]}, que não é ancestral de {sha[:12]} (o dispatcher reescreveu o fix/?), mas tudo o que ele tem já está no main ou aqui como patch equivalente: "
+        f"empurro com --force-with-lease={branch}:{tip[:12]} (o origin recusa se mudou depois da minha leitura)")
+    p = run(["git", "-C", wt, "push", f"--force-with-lease=refs/heads/{branch}:{tip}", "origin", f"{sha}:refs/heads/{branch}"], timeout=240, env=env)
+    if p.returncode != 0:
+        raise Stop(f"o push com --force-with-lease de {branch} (esperando {tip[:12]} no origin) falhou: o origin mudou depois que li, ou o hook do push recusou (git rc={p.returncode}: {p.stderr.strip()[:200]}). Nada foi submetido")
+
+
 def submit(city: str, ctx: Ctx, alias: str, sess: str, bid: str, sha: str, src: str, branch: str, script: str) -> int:
     repo, mirror = ctx.repo, ctx.mirror
     work = Path(city) / ".gc" / "gate-done-remote"    # a trava mora na cidade; o worktree, sob o caminho do rig (HQ: a mesma pasta de antes)
@@ -312,6 +481,7 @@ def submit(city: str, ctx: Ctx, alias: str, sess: str, bid: str, sha: str, src: 
     wtd.mkdir(parents=True, exist_ok=True, mode=0o700)
     wt, ref = str(wtd / f"wt-{bid}"), f"refs/gt-remote/{sess}"
     made_wt = made_ref = False
+    tmp_refs: list = []  # as refs temporárias que a busca no origin cria (lease_push); recolhidas no finally
     try:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -341,6 +511,7 @@ def submit(city: str, ctx: Ctx, alias: str, sess: str, bid: str, sha: str, src: 
             env = hooks_off(env, work)
             env["SELF_AUDIT_SUMMARY"] += f"; ATENCAO: o pre-push de {ctx.rig.name} NAO rodou no mini (executaria codigo do no antes da revisao): os guards dele nao foram verificados"
             say(f"AVISO: o pre-push de {ctx.rig.name} NÃO roda no mini (ele executaria scripts da árvore do nó antes da revisão); o marcador registra isso em self_audit")
+        lease_push(repo, wt, env, sess, branch, sha, tmp_refs)  # antes de qualquer escrita no banco: o origin com o fix/ reescrito não derruba o passo 1 do gate-done.md
         SCRIPT_RAN[0] = True
         p = subprocess.run(["bash", "-c", script], cwd=wt, env=env, stdout=subprocess.PIPE, text=True, errors="replace")  # o stderr do script segue direto ao cliente
         print(p.stdout, end="", flush=True)
@@ -355,7 +526,8 @@ def submit(city: str, ctx: Ctx, alias: str, sess: str, bid: str, sha: str, src: 
         return 0
     finally:  # recolhe só o que ESTA execução criou; falha aqui é aviso (o resultado já foi dito acima)
         steps = ([["git", "-C", repo, "worktree", "remove", "--force", wt], ["git", "-C", repo, "branch", "-D", branch]] if made_wt else []) \
-            + ([["git", "-C", repo, "update-ref", "-d", ref]] if made_ref else [])
+            + ([["git", "-C", repo, "update-ref", "-d", ref]] if made_ref else []) \
+            + [["git", "-C", repo, "update-ref", "-d", t] for t in tmp_refs]
         for cmd in steps:
             r = run(cmd)
             if r.returncode != 0:
@@ -424,13 +596,18 @@ def main() -> int:
     else:
         ctx = rig_ctx(city, role_prefix, mirror)
         bead = one_bead(ctx.store, alias)
-        src = f"worker/{sess}"
     bid = bead["id"]
     if bid.split("-", 1)[0] != role_prefix:  # a lista da loja do rig só devolve bead dele; se não for, algo está errado e eu não submeto
         raise Stop(f"a bead {bid} não é do rig {ctx.rig.name} (prefixo {role_prefix}): não submeto")
-    sha = mirror_sha(ctx.mirror, src, ctx.rig.name)
-    if want is not None and sha != want:  # antes do marcador: o gate nunca recebe um sha que o dog não disse
-        raise Stop(f"o espelho tem {sha[:12]} em {src}, mas você disse {want[:12]}: o push não chegou ou veio depois; empurre de novo (git push origin HEAD:refs/heads/{src}) e repita. Nada foi submetido")
+    if want is None:  # sem argumento: o ref é o que tem commit PRÓPRIO que cita a bead (worker/<sessão> fica preso na entrega anterior; ga-2hd02v.3.13)
+        src, sha = pick_ref(ctx.mirror, sess, bid, ctx.rig.name)
+    else:
+        sha = mirror_sha(ctx.mirror, src, ctx.rig.name)
+        if sha != want:  # antes do marcador: o gate nunca recebe um sha que o dog não disse
+            raise Stop(f"o espelho tem {sha[:12]} em {src}, mas você disse {want[:12]}: o push não chegou ou veio depois; empurre de novo (git push origin HEAD:refs/heads/{src}) e repita. Nada foi submetido")
+        verdict, n = cite_verdict(ctx.mirror, mirror_main(ctx.mirror), sha, bid)  # a regra do guarda (ga-pj5va): o commit entregue cita a bead; nunca o sha de outra bead
+        if verdict != "yes":
+            raise Stop(f"{src}@{sha[:12]}: {why_not(verdict, n, bid)}: não submeto o commit de outra bead (ou já entregue). Empurre o commit desta bead, que cite {bid}, e repita")
     branch = src if src.startswith("fix/") else f"fix/{bid}-{slugify(bead.get('title', ''))}"  # o nome no origin SEMPRE leva o id da bead (o gate o extrai dele); worker/… não leva
     if run(["git", "check-ref-format", "--branch", branch]).returncode != 0:
         raise Stop(f"{branch!r} não é um nome de branch válido")
