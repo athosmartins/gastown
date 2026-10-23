@@ -39,7 +39,11 @@ protocolo obrigatório" (ga-g7x0si; ficava no `CLAUDE.md` do rig até o wa-jo2qb
 `--direcao v2` (depois `v3`, `2v2`…); ela entra como nova aba no mesmo card.
 Antes de publicar, confira o nome EXATO do grupo — um `--grupo` com uma letra
 diferente cria um card novo em silêncio:
-`curl -s http://127.0.0.1:8097/api/mockups | jq -r '.grupos[].grupo'`.
+`curl -sSf http://127.0.0.1:8097/api/mockups | jq -r '.grupos[].grupo'`.
+Se o curl reclamar, a leitura FALHOU e isso não é "o grupo não existe" (com o
+catálogo ilegível a rota responde HTTP 500 com `grupos: []`, e o `-f` faz o curl
+falhar): repita antes de publicar com um `--grupo` novo. Só sem erro do curl e
+sem o grupo na lista ele é novo.
 
 ```bash
 python3 /Users/athos/gt/whatsapp_automation/scripts/publicar_mockup.py dirA.html \

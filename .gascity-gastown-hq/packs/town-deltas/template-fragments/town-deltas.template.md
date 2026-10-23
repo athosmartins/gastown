@@ -542,7 +542,11 @@ direções — publique só a versão atualizada pelo mesmo comando, com o MESMO
 ABA no MESMO card; compartilhe o link do grupo (+ `#v2`). Antes de publicar,
 confira o nome EXATO do grupo existente — um `--grupo` com uma letra diferente
 cria um card novo em silêncio:
-`curl -s http://127.0.0.1:8097/api/mockups | jq -r '.grupos[].grupo'`.
+`curl -sSf http://127.0.0.1:8097/api/mockups | jq -r '.grupos[].grupo'`.
+Se o curl reclamar, a leitura FALHOU e isso não é "o grupo não existe" (com o
+catálogo ilegível a rota responde HTTP 500 com `grupos: []`, e o `-f` faz o curl
+falhar): repita antes de publicar com um `--grupo` novo. Só sem erro do curl e
+sem o grupo na lista ele é novo.
 Se o ajuste for decisão de produto (não visual), pergunta múltipla-escolha
 normal serve; não precisa reconstruir alternativas visuais pra isso.
 
