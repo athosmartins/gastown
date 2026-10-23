@@ -414,6 +414,7 @@ case "$m" in
   both)    printf '"loggedIn": true\n"loggedIn": false\n'; exit 0;;
   crash)   exit 2;;
   hang)    exec sleep 60;;
+  slow)    sleep 7; printf '{\n  "loggedIn": true,\n  "authMethod": "claude.ai"\n}\n'; exit 0;;
 esac
 exit 0
 EOF
@@ -668,6 +669,19 @@ g_gui() {
   lcreset; pv start w-remote-m-9 < <(req "sh -c 'exit 3'"); [ $RC = 1 ] && has "$T/err" 'terminou logo após abrir' && [ "$(nload)" = 0 ] && [ "$(nrun)" = 0 ]; ok $? "gui: sessão que morre logo depois de abrir leva o agente junto, provado — não deixa órfão (rc=$RC $(head -c 140 "$T/err"))"
   lcreset; mode uso; fresh; pv start w-remote-m-9 < <(req cat); [ $RC = 1 ] && has "$T/err" 'Athos está no MBP' && [ ! -s "$T/lc.log" ] && [ "$(nrun)" = 0 ] && nossh; ok $? "gui: Athos usando o MBP → o start recusa ANTES de tocar no launchd: a regra de presença vem primeiro e o agente não a contorna (7) (rc=$RC)"
   mode livre
+  # --- o start são DUAS chamadas ssh (ga-0k82lw): o que a 1.8 põe dentro delas tem que caber nas regras desse desenho ---
+  # a 2ª chamada carrega o agente e espera o veredito do login (até gui_wait_s): com o prazo do start já gasto, o piso dela tem que cobrir essa espera, senão o ssh é cortado com o agente ainda subindo
+  lcreset; echo slow > "$T/auth.mode"; cfgm '{"gui_proof_s":2,"start_timeout":3}'; fresh
+  pv start w-remote-m-8 < <(req cat); [ $RC = 0 ] && [ "$(count x "${SOCK}m")" = 1 ] && [ -e "$T/lc/loaded/${L}w-remote-m-8" ]; ok $? "gui: 'auth status' de 7 s com start_timeout 3 → a 2ª chamada tem o piso do veredito (OPEN_MIN + gui_wait_s) e o start abre (rc=$RC $(head -c 140 "$T/err"))"
+  pv stop w-remote-m-8 </dev/null; echo in > "$T/auth.mode"; cfgm '{"gui_proof_s":2}'
+  # o stop chega na parte lenta do start: a 2ª chamada desiste ANTES de tocar no launchd — e é o rc 14 ('abandonado'), não o 15 da recusa do domínio gráfico (um evento 'refused' de gui_agent para um start que o mini abandonou seria mentira)
+  lcreset; : > "$T/state/m/events.jsonl"; fresh; rm -f "$T/slow.mark"
+  printf '#!/bin/sh\n: > "%s"\nsleep 4\nexec "%s" "$@"\n' "$T/slow.mark" "$(command -v sha256sum)" > "$T/extra/sha256sum"; chmod +x "$T/extra/sha256sum"  # a sessão w-remote-* é REAL: o portão roda sha256sum no host, na 1ª chamada
+  env HOME="$T/home" GC_SSH_CONFIG="$T/cfg.json" GC_SSH_BIN="$T/bin/ssh" GC_EXEC_STATE_DIR="$T/state" "$P" start w-remote-m-9 < <(req cat) >"$T/out.bg" 2>"$T/err.bg" & i=$!
+  waitfor "$T/slow.mark"; pv stop w-remote-m-9 </dev/null; rc=$RC; wait $i; k=$?; rm -f "$T/extra/sha256sum"
+  [ -e "$T/slow.mark" ] && [ $rc = 0 ] && [ $k = 1 ] && has "$T/err.bg" 'abandonado' && ! grep -q ' bootstrap ' "$T/lc.log" && [ "$(nload)" = 0 ] && [ "$(nrun)" = 0 ] && [ "$(count x "${SOCK}m")" = 0 ] \
+    && ! jq -e 'select(.event=="refused" and .session=="w-remote-m-9")' "$T/state/m/events.jsonl" >/dev/null 2>&1; ok $? "gui: stop no meio da parte lenta do start → o start desiste ('abandonado') sem tocar no launchd e sem evento 'refused' de gui_agent (stop rc=$rc, start rc=$k: $(head -c 120 "$T/err.bg"))"
+  rm -f "$T/state/m/running/w-remote-m-9"
   # --- config: gui_agent é decisão explícita; no notebook é obrigatória; o agente precisa do claude que confere o login ---
   for v in '"true"' 1 null; do cfgm '{"gui_agent":'"$v"'}'; fresh; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "'gui_agent'" && nossh; ok $? "gui: gui_agent=$v (não é true/false) recusa a config, sem ssh (rc=$RC)"; done
   cfgm '{"gui_agent":false}'; fresh; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "'gui_agent' é obrigatório" && nossh; ok $? "gui: notebook (sleeps) sem gui_agent recusa a config — senão o tmux nasceria no ssh e a sessão, deslogada (rc=$RC)"
@@ -1283,6 +1297,9 @@ if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails 
   mutant gui "sessão que morre logo depois de abrir deixa o agente" 's/\.replace("@ADOWN@", adown)/.replace("@ADOWN@", "")/'
   mutant gui "recusa do domínio gráfico sem a linha 'refused'" 's/^        if rc == EX_GUI:$/        if False:/'
   mutant gui "órfã varrida não vai para o log" 's/if ln.startswith("gui_agent: varreu"):/if False:/'
+  mutant gui "2ª chamada sem o piso do veredito do agente (o ssh é cortado com o agente subindo)" 's/max(OPEN_MIN + (cfg.gui_wait if cfg.gui else 0), int(/max(OPEN_MIN, int(/'
+  mutant gui "start abandonado lido como recusa do domínio gráfico (o rc 14 vira o do gui_agent)" 's/^EX_GUI = 15/EX_GUI = 14/;s/exit 15/exit 14/g'
+  mutant gui "2ª chamada sem as funções do agente (agent_down e o U do gui/<uid> não existem lá)" 's/\.replace("@AGENT1@", agent1)/.replace("@AGENT1@", "")/'
   [ -n "${GCSSH_MUTANTS_ONLY:-}" ] || {
   echo "-- contra um stub que só sai 0 (a versão 'anterior' não tinha provider nenhum)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"
