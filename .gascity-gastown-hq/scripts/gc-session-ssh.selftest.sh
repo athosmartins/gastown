@@ -52,7 +52,7 @@
 #   âncora, sem conferir o sha do guarda, sem rodar o --selfcheck, script do host que sai 0, guarda irmão ilegível), e a regra de presença do MBP (grupo mbp: guarda de /Users/, validação da config, recusa/pausa/slot_cap, vigia, PATH extra,
 #   registro de sessões do list-running); @TOTAL@ mutantes no total (30 do grupo gui: bootout/arquivos/prova de ausência do stop e da recusa, a varredura de órfãs e a ordem dela, o veredito do `auth status` (ilegível, rc, contraditório), plist fora de run/, label sem prefixo, KeepAlive, Aqua, validação da config; 5 do grupo abort: a marca <nome>.stop do stop, ga-0k82lw — o stop não a grava, o preparo do start não a apaga, a 2ª chamada não olha para ela, o stop não poda as marcas antigas (> 24 h), a poda sem limite de idade leva a marca recém-gravada; 20 do grupo lr: o cache nunca lido, start sem invalidar antes / depois, stop sem invalidar, gravação sem conferir a geração, prazo e relógio, geração e forma do arquivo, dry-run, list_cache_s em cinco formas, geração ilegível ou ausente, registro acertado com lista do cache, falha ao invalidar derrubando o start; 26 do grupo wt: wt-add/wt-rm do provider, o guarda DEPOIS do wt-add, o recolhimento só do que não perde trabalho e os nomes do engine; 9 do ambiente limpo da sessão, grupo mbp: session_env, ZDOTDIR, PATH explícito e claude absoluto, ga-w7qwl1.1.5).
 #   Mais: contra um stub que só sai 0, quase tudo falha.
-# VARIÁVEIS: GCSSH_UNDER_TEST (script a testar) · GCSSH_ONLY (grupos separados por vírgula) · GCSSH_NO_MUTANTS=1 · GCSSH_MUTANTS_ONLY=<grupo> (pula os casos e roda só os mutantes desse grupo)
+# VARIÁVEIS: GCSSH_UNDER_TEST (script a testar) · GCSSH_ONLY (grupos separados por vírgula) · GCSSH_NO_MUTANTS=1 · GCSSH_MUTANTS_ONLY=<grupo> (pula os casos e roda só os mutantes desse grupo) · GCSSH_SHARD=K/N (pula os casos e roda só os mutantes de ordem ≡ K mod N, K de 0 a N-1; o stub só no K=0: a campanha de mutantes em N processos)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 P="${GCSSH_UNDER_TEST:-$HERE/gc-session-ssh}"
@@ -1118,11 +1118,14 @@ g_abort() {  # ga-0k82lw: o start que o mini ABANDONOU (prazo do provider estour
 all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group gui && g_gui; group acct && g_acct; group lr && g_lr; group abort && g_abort; return 0; }
 
 if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
-[ -n "${GCSSH_MUTANTS_ONLY:-}" ] || { all; echo "== $((n-fails))/$n ok =="; }  # GCSSH_MUTANTS_ONLY=grupo: pula os casos e roda só os mutantes cujo grupo é esse
+case "${GCSSH_SHARD:-0/1}" in [0-9]*/[1-9]*) ;; *) echo "GCSSH_SHARD tem que ser K/N (K de 0 a N-1, N >= 1): ${GCSSH_SHARD}"; exit 2;; esac
+[ -n "${GCSSH_MUTANTS_ONLY:-}${GCSSH_SHARD:-}" ] || { all; echo "== $((n-fails))/$n ok =="; }  # GCSSH_MUTANTS_ONLY=grupo ou GCSSH_SHARD=K/N: pula os casos e roda só os mutantes (do grupo / da fatia K de N)
 
 [ -n "${GCSSH_NO_MUTANTS:-}" ] || [ -n "${GCSSH_ONLY:-}" ] || {
   echo "-- controle negativo: cada guarda removida TEM que fazer o grupo que a cobre falhar"
+  mn=0; : "${GCSSH_SHARD:=0/1}"
   mutant() {  # mutant GRUPOS DESCRIÇÃO SED-EXPR  (a cópia mutada tem que diferir do original, senão o mutante não testou nada)
+    mn=$((mn+1)); [ $((mn % ${GCSSH_SHARD#*/})) = "${GCSSH_SHARD%/*}" ] || return  # GCSSH_SHARD=K/N: só o mutante de ordem ≡ K (mod N); a ordem conta TODOS, de qualquer grupo
     [ -z "${GCSSH_MUTANTS_ONLY:-}" ] || case ",$1," in *",$GCSSH_MUTANTS_ONLY,"*) ;; *) return;; esac
     local m="$T/mut.$RANDOM"; mkdir -p "$m"; sed -e "$3" "$P" > "$m/gc-session-ssh"; chmod +x "$m/gc-session-ssh"; cp "$(dirname "$P")/$GUARDF" "$m/$GUARDF" 2>/dev/null
     if cmp -s "$P" "$m/gc-session-ssh"; then ok 1 "mutante '$2': o sed não mudou nada (o teste do mutante está errado)"; return; fi
@@ -1300,7 +1303,7 @@ if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails 
   mutant gui "2ª chamada sem o piso do veredito do agente (o ssh é cortado com o agente subindo)" 's/max(OPEN_MIN + (cfg.gui_wait if cfg.gui else 0), int(/max(OPEN_MIN, int(/'
   mutant gui "start abandonado lido como recusa do domínio gráfico (o rc 14 vira o do gui_agent)" 's/^EX_GUI = 15/EX_GUI = 14/;s/exit 15/exit 14/g'
   mutant gui "2ª chamada sem as funções do agente (agent_down e o U do gui/<uid> não existem lá)" 's/\.replace("@AGENT1@", agent1)/.replace("@AGENT1@", "")/'
-  [ -n "${GCSSH_MUTANTS_ONLY:-}" ] || {
+  [ -n "${GCSSH_MUTANTS_ONLY:-}" ] || [ "${GCSSH_SHARD%/*}" != 0 ] || {
   echo "-- contra um stub que só sai 0 (a versão 'anterior' não tinha provider nenhum)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"
   r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate,prep,wt,gui,acct" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
