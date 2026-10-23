@@ -33,7 +33,7 @@
 # anterior tem que ser sempre possivel. O detector horario que cobre o resto:
 # packs/town-deltas/assets/scripts/engine-binary-backup-guard.sh.
 #
-# POR QUE O SWAP TAMBEM ANDA O origin/main (ga-z36a88, Mayor 21/09 e 23/10/2026)
+# POR QUE O SWAP TAMBEM ANDA O origin/main (ga-z36a88: achado em 21/09; Mayor pediu o ff em 23/10/2026)
 # origin/main do engine ficou 17 dias / 12 commits atras do que RODAVA na cidade (so a
 # consolidated/engine-window-* tinha a verdade). Quem ramificasse de "main" -- a escolha
 # obvia -- reverteria em silencio correcoes vivas: o build passa, o binario roda, so as
@@ -283,10 +283,13 @@ phase_build() {
 # ga-z36a88: aviso de que origin/main NAO andou. Log + notify: se o aviso so ficasse no log, o main
 # voltaria a envelhecer calado -- que e exatamente o defeito que este passo existe pra acabar.
 # Sempre retorna 1, pra quem chama poder fazer `|| { main_ff_warn ...; return 1; }` numa linha so.
+# O veredito e "NAO AVANCOU" (sabemos que nao andou) ou, so quando o push saiu mas o efeito nao foi
+# confirmado, "NAO CONFIRMADO" (o main PODE ter andado): quem chama escolhe por MAIN_FF_VERDICT=... main_ff_warn.
 main_ff_warn() {
-  log "  origin/main .. NAO AVANCOU: $*"
+  local verdict="${MAIN_FF_VERDICT:-NAO AVANCOU}"
+  log "  origin/main .. $verdict: $*"
   log "                 Nada foi forcado nem apagado. Depois de resolver, refaca so este passo: $(basename "$0") advance-main"
-  command -v notify >/dev/null 2>&1 && notify -t 'Engine window: origin/main NAO avancou' \
+  command -v notify >/dev/null 2>&1 && notify -t "Engine window: origin/main $verdict" \
     "$* -- refazer: engine-window-run.sh advance-main" >/dev/null 2>&1
   return 1
 }
@@ -370,7 +373,7 @@ advance_origin_main() {
     log "  origin/main .. AVANCOU: $remote/$mbranch $old_s -> $(printf '%.9s' "$main_tip") (fast-forward, sem force)."
     return 0
   fi
-  main_ff_warn "o push retornou 0 mas nao consegui confirmar $remote/$mbranch em $(printf '%.9s' "$target") (main: ${main_tip:-?}; fetch: ${EB_FETCH_STATE:-?}) -- nao dou como feito."
+  MAIN_FF_VERDICT="NAO CONFIRMADO" main_ff_warn "o push retornou 0 mas depois dele nao consegui confirmar $remote/$mbranch em $(printf '%.9s' "$target") (main: ${main_tip:-?}; fetch: ${EB_FETCH_STATE:-?}) -- o main PODE ter andado; confira com 'git -C $SRC ls-remote $remote $mbranch'. Nao dou como feito."
   return 1
 }
 

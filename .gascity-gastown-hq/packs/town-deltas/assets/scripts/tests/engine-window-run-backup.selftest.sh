@@ -219,7 +219,7 @@ assert_has "  diz NAO AVANCOU" "$OUT" "origin/main .. NAO AVANCOU"
 assert_has "  e que divergiu" "$OUT" "divergiu"
 assert_lacks "  e nao tentou empurrar" "$OUT" "empurrando"
 assert_eq "  origin/main ficou EXATAMENTE como estava (o commit do outro; nada de force)" "$DIV_MAIN" "$(remote_main)"
-assert_has "  o aviso saiu por notify (senao o main volta a envelhecer calado)" "$(cat "$NOTIFY_LOG")" "origin/main NAO avancou"
+assert_has "  o aviso saiu por notify (senao o main volta a envelhecer calado)" "$(cat "$NOTIFY_LOG")" "origin/main NAO AVANCOU"
 assert_has "  e diz como refazer depois de resolver" "$OUT" "advance-main"
 run_win -- rollback
 run_win -- swap
@@ -257,6 +257,32 @@ run_win -- advance-main
 assert_eq "remoto sem main -> rc=1" "1" "$RC"
 assert_has "  diz que nao cria" "$OUT" "nao crio"
 assert_eq "  e o main continua ausente" "<ausente>" "$(remote_main)"
+echo "── 8j. o push SAIU mas o fetch que confere o efeito falha: 'NAO CONFIRMADO', nunca 'AVANCOU' (nem 'NAO AVANCOU': o main pode ter andado) ──"
+# git de mentira na frente do PATH (fakebin ja e o 1o do PATH em run_win): repassa tudo pro git de verdade, e depois de um
+# push que deu certo faz todo fetch falhar -- o estado "empurrei e nao consigo ver" que um rc=0 do push nao distingue.
+REAL_GIT=$(command -v git)
+rm -f "$WORK/pushed.flag"
+cat > "$WORK/fakebin/git" <<SHIM
+#!/bin/sh
+for a in "\$@"; do
+  case "\$a" in
+    push) "$REAL_GIT" "\$@"; rc=\$?; [ "\$rc" -eq 0 ] && : > "$WORK/pushed.flag"; exit "\$rc" ;;
+    fetch) [ -e "$WORK/pushed.flag" ] && exit 1 ;;
+  esac
+done
+exec "$REAL_GIT" "\$@"
+SHIM
+chmod +x "$WORK/fakebin/git"
+set_remote_main "$B_TIP"
+: > "$NOTIFY_LOG"
+run_win -- advance-main
+assert_eq "push saiu, fetch de conferencia falhou -> rc=1 (nao dou como feito)" "1" "$RC"
+assert_has "  diz NAO CONFIRMADO" "$OUT" "origin/main .. NAO CONFIRMADO"
+assert_lacks "  e NAO afirma que AVANCOU" "$OUT" "origin/main .. AVANCOU"
+assert_lacks "  nem que NAO AVANCOU (o main pode ter andado)" "$OUT" "origin/main .. NAO AVANCOU"
+assert_has "  o aviso saiu por notify" "$(cat "$NOTIFY_LOG")" "origin/main NAO CONFIRMADO"
+assert_eq "  e o push de fato aconteceu (so o teste le o bare remote)" "$M_TIP" "$(remote_main)"
+rm -f "$WORK/fakebin/git" "$WORK/pushed.flag"
 # estado normal pos-janela, pro resto do teste: main na ponta da janela e o binario da janela.
 set_remote_main "$T1_TIP"
 fx_fake_gc "$LIBEXEC/gc-fixture" "$(short "$T1_TIP")"
