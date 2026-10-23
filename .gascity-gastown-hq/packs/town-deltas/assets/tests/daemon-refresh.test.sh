@@ -4744,7 +4744,8 @@ echo "$OUTE" | grep -qF 'com.test.fallback: $DIR/app.py (wrapper launchd/fallbac
   || nok "T144 fallback" "out=[$(echo "$OUTE" | grep fallback)]"
 
 # T145: whatever cannot be placed is REPORTED, never guessed. Six RUNNING labels; for each the
-# tempting file exists and is changed, and none may come out AFFECTED — all six are named in
+# tempting file exists (and is changed, except u3's, which lies outside the checkout and so
+# cannot be part of a diff), and none may come out AFFECTED — all six are named in
 # UNRESOLVED_ENTRYPOINTS instead. u1 computed value; u2 single-quoted (the `$` is literal);
 # u3 a `..` that leaves the checkout (the directory exists there); u4 the assigned directory
 # exists but does not hold the file (it lives next door); u5 a `..` in the use; u6 a variable
