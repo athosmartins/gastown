@@ -231,6 +231,10 @@ assert_eq "  origin/main segue no commit do outro" "$DIV_MAIN" "$(remote_main)"
 
 echo "── 8g. SEM REDE: nao sei != posso avancar -> nao mexe e nem tenta empurrar ──"
 set_remote_main "$B_TIP"
+# O ref remoto LOCAL do engine fica velho de PROPOSITO num estado que seria um fast-forward valido (B -> M): se o
+# script confiasse nele sem um fetch fresco, tentaria empurrar. Sem isto, o ref velho era o commit divergente da 8f e a
+# deteccao de divergencia segurava o push sozinha -- o teste passava mesmo sem a exigencia de fetch fresco (mutante M5).
+git -C "$E" fetch -q origin
 git -C "$E" remote set-url origin "$WORK/nao-existe.git"
 run_win -- advance-main
 assert_eq "remoto inalcancavel -> rc=1" "1" "$RC"
