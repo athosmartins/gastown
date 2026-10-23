@@ -14,15 +14,18 @@ COMO FUNCIONA  (por que o mini puxa em vez do MBP chamar: docs/runbooks/remote-s
         a MESMA identidade e o MESMO log de auditoria do caminho do Hetzner (o wrapper não sabe o transporte)
         put:  grava resp/<id>.json (inteiro, por rename) só para um pedido que está em claimed/
   O agente também varre arquivos velhos do spool (15 min) e toca pump.alive: o cliente no MBP recusa na hora (75) quando ele está parado.
+  Última faxina (ga-w7qwl1.1.7): no `stop`, depois de encerrar o puxador (ou de ver que não havia um), o agente roda em modo `reap` e apaga o que tem mais de REAP_GRACE_S (90 s) em req/, resp/ e claimed/
+        (a resposta de um cliente que morreu antes de ler); o que é mais novo fica, porque um puxador novo pode já ter escrito uma resposta que o cliente ainda vai ler.
+        Desfechos, numa linha: limpei · não havia (saem 0) · NÃO DEU PARA VER · NÃO DEU PARA LIMPAR (saem 1, com o rc e a última linha do erro). Não cria nada no MBP e não roda com o puxador ainda vivo.
 
 USO  (host e caminhos vêm de `hosts.<host>.shim` em session-ssh.json: spool_dir (no MBP), wrapper_config (no mini), parallel, idle_exit_s, poll_s)
   remote-shim-pump.py ensure --host mbp    sobe o puxador se não houver um (o provedor chama isto depois de abrir uma sessão)
   remote-shim-pump.py run    --host mbp    em primeiro plano (o `ensure` o lança desacoplado)
   remote-shim-pump.py status --host mbp    roda? há quanto tempo? últimos pedidos
-  remote-shim-pump.py stop   --host mbp    encerra o puxador (os pedidos em andamento terminam)
+  remote-shim-pump.py stop   --host mbp    encerra o puxador (os pedidos em andamento terminam) e faz a última faxina do spool no MBP
 
 LIMITES E O QUE O PUXADOR NUNCA FAZ
-  - só roda enquanto <estado>/<host>/running/ tem sessão nossa; sem sessão, sai depois de idle_exit_s (padrão 90 s) e o MBP não é mais tocado
+  - só roda enquanto <estado>/<host>/running/ tem sessão nossa; sem sessão, sai depois de idle_exit_s (padrão 90 s) e o MBP não é mais tocado (a única exceção é a faxina do `stop`, uma vez, a pedido de quem parou o puxador)
   - não grava nada no MBP fora do spool; não guarda nem repassa argv no log (só ts, host, id, rc, tamanhos, duração)
   - pedido: cmd até 200000 caracteres, entrada padrão até 1 MiB; resposta: stdout e stderr até 8 MiB cada (corta com marca); não repete pedido que o wrapper já iniciou (rc 125 = pode ter rodado: o cliente decide)
   - ssh falhando: espera 2^n s (até 60 s) e tenta de novo; o MBP dormindo/fora não derruba nada, só deixa os pedidos sem resposta (rc 75/125)
