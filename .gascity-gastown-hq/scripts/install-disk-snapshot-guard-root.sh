@@ -95,6 +95,8 @@ PLIST_REAL="${ROOT_PFX}${PLIST_PATH}"
 
 MODE="install"
 PIN=""
+NO_RELOAD=0
+PEND_RELOAD=0
 WHY=""
 M_MODE=""
 M_UID=""
@@ -300,6 +302,11 @@ audit_state() {
     (0)
       if [ "$LD_ARGS" = "$want_args" ]; then
         f_ok "argumentos carregados: $SHELL_BIN $PROG_PATH"
+      elif [ "$NO_RELOAD" = "1" ]; then
+        # --no-reload: o job que roda este instalador não pode ser descarregado no meio da rodada; a definição velha segue
+        # carregada e a nova vale no próximo carregamento (reboot ou bootout+bootstrap). Pendência, não falha.
+        PEND_RELOAD=1
+        printf '  pend   o launchd ainda tem a definição antiga carregada (argumentos: %s)\n' "$(printf '%s' "$LD_ARGS" | tr '\n' ' ')"
       else
         f_bad "o launchd carregou outra definição (argumentos: $(printf '%s' "$LD_ARGS" | tr '\n' ' ')): recarregue com bootout + bootstrap"
       fi ;;
@@ -419,7 +426,9 @@ do_install() {
   fi
 
   # --- 5. recarrega; se não carregar, volta ao plist anterior ---
-  if ! reload_job; then
+  if [ "$NO_RELOAD" = "1" ]; then
+    say "  launchctl: sem bootout/bootstrap (--no-reload): o plist novo vale no próximo carregamento do job"
+  elif ! reload_job; then
     if [ -z "$BACKUP" ]; then
       die 3 "o launchd não carregou o job e não houve edição para desfazer: o guard pode estar DESCARREGADO. Rode: sudo launchctl bootstrap system $PLIST_PATH"
     fi
@@ -440,7 +449,8 @@ do_install() {
     undo="para desfazer: sudo launchctl bootout system/$LABEL; sudo cp $BACKUP $PLIST_PATH; sudo launchctl bootstrap system $PLIST_PATH"
   fi
   case "$rc" in
-    (0) say "RESULTADO: instalado e confirmado. O root agora executa $PROG_PATH." ;;
+    (0) say "RESULTADO: instalado e confirmado. O root agora executa $PROG_PATH."
+        if [ "$PEND_RELOAD" = "1" ]; then say "RECARGA PENDENTE: o job carregado segue com a definição antiga até o próximo carregamento do launchd."; fi ;;
     (1) say "RESULTADO: instalado, mas a conferência achou FALHA (acima)." ;;
     (*) say "RESULTADO: instalado, mas algo não deu para confirmar (acima): confira com --check." ;;
   esac
@@ -452,6 +462,7 @@ do_install() {
 while [ $# -gt 0 ]; do
   case "$1" in
     (--check) MODE="check"; shift ;;
+    (--no-reload) NO_RELOAD=1; shift ;;
     (--expect-sha256)
       [ $# -ge 2 ] || die 2 "--expect-sha256 pede o hash (64 hexadecimais)"
       PIN="$2"; shift 2 ;;
