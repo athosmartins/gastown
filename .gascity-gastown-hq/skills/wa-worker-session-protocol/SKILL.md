@@ -54,6 +54,8 @@ Cite as URLs no bead de origem (comentário): as da OPÇÃO (`✓ publicado:`) E
 
 🚨 NUNCA publique CPF, telefone, endereço, situação sucessória/óbito ou qualquer dado que identifique uma pessoa específica num mockup. O script varre o HTML e recusa sozinho (exit 1), mas em exemplo use número obviamente falso (98888-7777). Dossiê de pessoa ou imóvel específico não é mockup: o lugar é `shared/data/estudos` (também no admin, atrás do Cloudflare Access).
 
+✅ **Exceção (Athos, 10/10, wa-sq2wsa): mockup de tela do app do incorporador com o conteúdo da MBE** (Martins Bernardes Empreendimentos, a empresa de referência do app do incorporador, `terreno_publico`; o Athos é sócio dela) **pode mostrar endereço, desenho e quarteirão reais dos terrenos** — a página Mockups tem o mesmo login do admin (o guia do rig registra a verificação de 10/10: `/mockups` redireciona para o Cloudflare Access). Pergunta e resposta, verbatim: *"Então: nos mockups com o conteúdo da MBE, libero endereço e desenho real dos terrenos?"* → *"Libera endereço e desenho (Recomendado)"*. Continua **PROIBIDO** mesmo nesse caso: nome, CPF/CNPJ, telefone, e-mail, óbito/situação sucessória e processo de **proprietário**. Fora desse caso (outra empresa, outro tema), a regra acima vale inteira. O conteúdo da MBE entra no mockup só por leitura: agir na conta dela continua proibido sem ordem do Athos naquele momento (guia do rig, `docs/agent-guide/mockups-e-mbe.md`, seção "Martins Bernardes Empreendimentos").
+
 ## Notifications
 
 ```bash
