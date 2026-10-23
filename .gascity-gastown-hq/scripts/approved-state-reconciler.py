@@ -909,8 +909,9 @@ def _extra_alarm_suppress_reason(labels):
                 if hit is None:
                     continue
                 rule = "prefix %s" % hit
-            return ("%s (%s in pool-probe-vetoes.sh: the pool probes refuse it, so no pool worker picks the bead "
-                    "up — parked, not starving, ga-d3b5yr)" % (lab, rule))
+            return ("%s (%s in pool-probe-vetoes.sh: at least one pool probe refuses it, so it is counted as parked, "
+                    "not starving — the list is the union of the pools, so this also holds for a bead routed to a pool "
+                    "that does not refuse it, ga-d3b5yr)" % (lab, rule))
     return None
 
 
@@ -4999,12 +5000,16 @@ def _selftest():
                 i: a failed send is logged; j: prune + corrupt record; k: a direct
                 _process_store() call aggregates too; l: the reason classifier on the
                 REAL log shapes
-      (ga-d3b5yr-a..b) a bead PARKED by a label the pool probes refuse is not starving —
+      (ga-d3b5yr-a..c) a bead PARKED by a label the pool probes refuse is not starving —
                 a: per bead (needs-human-decision / blocked-reason:decision / needs-human-
                 followup → no 'dispatch failing' mail); b: replay of the 19/10 "nota #12"
                 (a Pilot paused in 17 of 56 sweeps, the only two waiting beads parked for the
                 Athos → no 'Pilot pausado' note) plus its control (parked + one buildable
-                bead → the note counts and names ONLY the buildable one)
+                bead → the note counts and names ONLY the buildable one); c: layer 2 end to
+                end against a throwaway pool-probe-vetoes.sh (an exact label / a prefix that
+                lives only in the list is quiet, an unrelated bead alarms, an unreadable list
+                puts both back to alarming). The selftest pins the REAL list to a missing file
+                everywhere else, so (u) and (ga-it3e8-a) are answered by their own handlers
     """
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers, _sh
@@ -5042,6 +5047,19 @@ def _selftest():
     # cap point PILOT_PLIST at a throwaway plist and restore this afterwards.
     _NO_PILOT_PLIST = "/nonexistent/approved-state-reconciler-selftest/com.gascity.pilot.plist"
     globals()["PILOT_PLIST"] = _NO_PILOT_PLIST
+    # Hermetic default for the pool probes' veto list (ga-d3b5yr): _pool_probe_vetoes() reads
+    # pool-probe-vetoes.sh from the LIVE city tree (the sibling of the pilot-dispatcher.sh launchd runs), not from the
+    # branch under test — and it answers for exec:manual and ctx:thin BEFORE their dedicated handlers in
+    # _process_store. Unpinned, scenarios (u) and (ga-it3e8-a) pass through that list on a machine that has the city
+    # tree and through the handlers on one that does not (gate 19/10: with either handler disabled the suite still
+    # said 192/0), so the handlers — the only guard when the list is unreadable — would be unguarded. A path that
+    # cannot exist → "could not tell" → the handlers answer. The scenario that DOES test the derived layer points the
+    # reader at a throwaway list and restores this afterwards. WARNED starts True: the one-time "list unusable" line
+    # is for a file that went missing by accident, not for the one this suite hides on purpose.
+    _NO_VETO_FILE = "/nonexistent/approved-state-reconciler-selftest/pool-probe-vetoes.sh"
+    globals()["_pool_probe_vetoes_path"] = lambda: _NO_VETO_FILE
+    globals()["_POOL_PROBE_VETOES"] = None
+    globals()["_POOL_PROBE_VETOES_WARNED"] = True
 
     # ── capture lists ─────────────────────────────────────────────────────────
     label_adds = []
@@ -9696,6 +9714,58 @@ def _selftest():
         _bad("(ga-d3b5yr-b2)", "; ".join(_d3b2_problems))
     else:
         _ok("(ga-d3b5yr-b2): 1 buildable + 2 parked → ONE note, '1 bead(s)', only the buildable bead named")
+
+    print("\nScenario (ga-d3b5yr-c): layer 2 END TO END — the reader pointed at a throwaway pool-probe-vetoes.sh. A starving "
+          "bead whose ONLY park signal is an exact label (listed by one pool) or a prefix (listed by the other) that "
+          "lives nowhere else raises no alarm. Controls: an unrelated bead still alarms with the list loaded, and the "
+          "SAME exact-label bead alarms once the list is unreadable — so the list is what silenced it, and a "
+          "missing list ends as 'could not tell', never as 'nothing refused'")
+    _d3c_exact = ["selftest-veto-%02d" % _i for _i in range(12)]
+    _d3c_vars = {
+        "POOL_VETO_EXACT_DOG": _d3c_exact[:8], "POOL_VETO_EXACT_WA": _d3c_exact[4:],
+        "POOL_VETO_PREFIX_DOG": ["selftest-pfx-a:", "selftest-pfx-b"],
+        "POOL_VETO_PREFIX_WA": ["selftest-pfx-b", "selftest-pfx-c:"],
+    }
+    _d3c_ex, _d3c_pf, _d3c_plain = "ga-d3b5yr-c-exact", "ga-d3b5yr-c-prefix", "ga-d3b5yr-c-plain"
+    _d3c_labels = {_d3c_ex: "selftest-veto-11",           # only POOL_VETO_EXACT_WA lists it
+                   _d3c_pf: "selftest-pfx-c:anything",    # only POOL_VETO_PREFIX_WA lists it
+                   _d3c_plain: "selftest-not-in-any-list"}
+    _d3c_fd, _d3c_file = tempfile.mkstemp(prefix="arc-selftest-vetoes-", suffix=".sh")
+    with os.fdopen(_d3c_fd, "w", encoding="utf-8") as _f:
+        _f.write("".join("%s='%s'\n" % (k, json.dumps(v)) for k, v in _d3c_vars.items()))
+
+    def _d3c_cycle(path, ids):
+        """One starving cycle over `ids` with the veto reader pointed at `path`; returns the ids that drew a
+        'dispatch failing' mail. Clears the reader's memo so no run answers from the one before, and keeps its
+        one-time WARN quiet (the missing-file run is on purpose)."""
+        globals()["_pool_probe_vetoes_path"] = lambda: path
+        globals()["_POOL_PROBE_VETOES"] = None
+        globals()["_POOL_PROBE_VETOES_WARNED"] = True
+        globals()["_bd_approved"] = lambda root: [
+            _make_bead(b, labels=["story:approved", "ctx:ready", "exec:auto", _d3c_labels[b]]) for b in ids]
+        st = _reset()
+        for b in ids:
+            st["first_seen_approved"][b] = NOW - (_STARVE + 5) * 60
+        run_cycle(NOW, st)
+        return {b for b in ids if any(b in s for s, _ in _df_mails())}
+
+    _read_pilot_sweep_pause_state_file = _pause_off
+    _read_pilot_dispatchable_file = lambda: None
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    try:
+        _d3c_loaded = _d3c_cycle(_d3c_file, [_d3c_ex, _d3c_pf, _d3c_plain])
+        _d3c_missing = _d3c_cycle(_NO_VETO_FILE, [_d3c_ex, _d3c_pf])
+    finally:
+        os.unlink(_d3c_file)
+        globals()["_pool_probe_vetoes_path"] = lambda: _NO_VETO_FILE
+        globals()["_POOL_PROBE_VETOES"] = None
+        globals()["_POOL_PROBE_VETOES_WARNED"] = True
+    if _d3c_loaded == {_d3c_plain} and _d3c_missing == {_d3c_ex, _d3c_pf}:
+        _ok("(ga-d3b5yr-c): list loaded → the exact-label and the prefix bead are quiet, the unrelated bead alarms; "
+            "list unreadable → both alarm again (fail-open, never a muted-everything)")
+    else:
+        _bad("(ga-d3b5yr-c)", "loaded: alarmed=%r want only %r; missing: alarmed=%r want %r" % (
+             sorted(_d3c_loaded), [_d3c_plain], sorted(_d3c_missing), sorted([_d3c_ex, _d3c_pf])))
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
