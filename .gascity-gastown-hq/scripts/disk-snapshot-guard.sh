@@ -52,9 +52,10 @@ notify_athos() {
 # out mid-round; the loaded job keeps the repo path until launchd loads the plist again, the plist on disk is already
 # the root copy). It never exits and never fails the guard: any doubt (hash differs, installer missing, rc != 0) is one
 # log line and the guard carries on exactly as before. Once the marker exists, or when we ARE the root copy, it does nothing.
-# NOT READ FROM ANYTHING athos CAN WRITE: the pin below is a literal in this commit. This file cannot carry its own
-# sha256, so the pin is the INSTALLER's; the guard's hash handed to the installer is that of root's private copy of this
-# file (round 1 trusts the bytes at the repo path, which root already runs today: the block only moves the anchor).
+# THE PIN IS A LITERAL IN THIS COMMIT, never read from a file athos can write. The installer and this file are copied into
+# a private 0700 directory and only the COPIES are hashed and run. This file cannot carry its own sha256, so the pin is the
+# INSTALLER's; the guard's hash handed to the installer is that of root's private copy of this file (round 1 trusts the
+# bytes at the repo path, which root already runs today: the block only moves the anchor).
 DSG_INSTALLER_SHA256="509865570a97683653aaa68f74f975aa1d9a81b0d5c596a86d401ac519f80125"
 DSG_PROG_DIR="/usr/local/libexec/gascity"
 DSG_MARKER_NAME=".disk-snapshot-guard.bootstrap-ok"
@@ -116,6 +117,7 @@ dsg_bootstrap_root() {
     elif [ "$inst_sha" != "$DSG_INSTALLER_SHA256" ]; then
       log "bootstrap root: SKIP — sha256 do instalador (${inst_sha}) difere do fixado neste commit: nada instalado."
     else
+      # vazio → sem a linha RESULTADO não há marcador; falhou (rc ≠ 0) → idem: só "rc 0 + instalado e confirmado" grava o marcador
       out=$(cd "$stage" && /bin/bash "${stage}/${inst}" --no-reload --expect-sha256 "$guard_sha" 2>&1); rc=$?
       printf '%s\n' "$out"
       log "bootstrap root: instalador rc=${rc}: $(printf '%s\n' "$out" | grep -m1 '^RESULTADO:')"
