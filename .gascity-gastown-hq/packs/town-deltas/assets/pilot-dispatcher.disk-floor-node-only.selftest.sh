@@ -284,8 +284,10 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
   }
   # as âncoras são ASCII de propósito (o python3 lê o argv no locale do shell e o arquivo em UTF-8: uma âncora com acento não casaria sob LC_ALL=C)
   mutant "o gate não liga a passada só-nó" $'  _PILOT_NODE_ONLY=1\n  warn "Disk floor' $'  :\n  warn "Disk floor'
-  mutant "o gate liga a passada fora do on" '[ "${PILOT_NODE_FIRST:-off}" = "on" ] && ' ''
-  mutant "o gate liga a passada no DRY_RUN" '"on" ] && [ "${DRY_RUN:-0}" != "1" ]; then' '"on" ]; then'
+  # ga-31xxl5: as duas âncoras abaixo casavam 2x no dispatcher (a linha do gate do disk floor e a do gate do yield por memória, ga-2hd02v.13), então o controle negativo nem chegava
+  # a aplicar o mutante. Cada uma agora começa em `$_disk_floor_rc`, que só existe na linha do gate do disk floor (a do yield por memória começa em `$_xstage_quota_limited`).
+  mutant "o gate liga a passada fora do on" '[ "$_disk_floor_rc" -eq 0 ] && [ "${PILOT_NODE_FIRST:-off}" = "on" ] && ' '[ "$_disk_floor_rc" -eq 0 ] && '
+  mutant "o gate liga a passada no DRY_RUN" '[ "$_disk_floor_rc" -eq 0 ] && [ "${PILOT_NODE_FIRST:-off}" = "on" ] && [ "${DRY_RUN:-0}" != "1" ]; then' '[ "$_disk_floor_rc" -eq 0 ] && [ "${PILOT_NODE_FIRST:-off}" = "on" ]; then'
   mutant "o gate liga a passada sem disco confirmado baixo" 'if [ "$_disk_floor_rc" -eq 0 ] && [ "${PILOT_NODE_FIRST:-off}" = "on" ]' 'if [ "${PILOT_NODE_FIRST:-off}" = "on" ]'
   mutant "o limpa-pausa roda na passada só-nó" $'if [ "${_PILOT_NODE_ONLY:-0}" != "1" ]; then\n  _pilot_write_sweep_pause_state 0 "" ""\nfi' '_pilot_write_sweep_pause_state 0 "" ""'
   mutant "o top-up abre sessão na passada só-nó" $'  if [ "${_PILOT_NODE_ONLY:-0}" = "1" ]; then\n    log "  ga-2hd02v.1.20: passada' $'  if false; then\n    log "  ga-2hd02v.1.20: passada'
