@@ -270,6 +270,10 @@ def t_cache_read_table_is_explicit(m, W):
     ck(set(table) == set(m.PRICES), f"PRICES e CACHE_READ_MULT têm que ter os MESMOS modelos; só em PRICES: {sorted(set(m.PRICES) - set(table))}; "
                                     f"só em CACHE_READ_MULT: {sorted(set(table) - set(m.PRICES))}")
     ck(set(PAGE_PRICES) <= set(m.PRICES), f"modelos da página que o medidor não precifica: {sorted(set(PAGE_PRICES) - set(m.PRICES))}")
+    # as duas tabelas auxiliares indexam PRICES/CACHE_READ_MULT: um nome errado numa delas estouraria o relatório (KeyError) — aqui estoura no merge
+    for name in ("CACHE_READ_CHANGES", "PRICE_TIER_CEILING"):
+        extra = set(getattr(m, name, {})) - set(m.PRICES)
+        ck(not extra, f"{name} cita modelo fora de PRICES: {sorted(extra)}")
 
 
 def t_prices_command(m, W):
@@ -1799,6 +1803,7 @@ MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
     "sonnet-5-5 volta a ler cache a 0,1x (o defeito do ga-lsju40)": ('"claude-sonnet-5-5": 0.05,', '"claude-sonnet-5-5": 0.10,', t_price_per_model),
     "fable-5-1 lê cache no multiplicador padrão": ('"claude-fable-5-1": 0.025,', '"claude-fable-5-1": 0.10,', t_price_per_model),
     "modelo da PRICES sem multiplicador de leitura explícito": ('    "claude-haiku-5-5": 0.10,\n', '', t_cache_read_table_is_explicit),
+    "mudança de regra citando modelo fora de PRICES": ('CACHE_READ_CHANGES = {"claude-sonnet-5-5": ("2026-10-07", 0.10)}', 'CACHE_READ_CHANGES = {"claude-sonnet-5-9": ("2026-10-07", 0.10)}', t_cache_read_table_is_explicit),
     "--assume-price usa o multiplicador do modelo original": ('+ c["cr"] * pin * CACHE_READ_MULT[pm]) / 1e6', '+ c["cr"] * pin * CACHE_READ_MULT.get(model, 0.10)) / 1e6',
                                                               t_assume_price_uses_the_assumed_models_read_multiplier),
     "seção 1c com multiplicador global": ("tokens * p_[0] * CACHE_READ_MULT[pm_] / 1e6", "tokens * p_[0] * 0.10 / 1e6", t_context_caps),
