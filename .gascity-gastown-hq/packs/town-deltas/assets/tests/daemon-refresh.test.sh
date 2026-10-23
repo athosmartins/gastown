@@ -4544,6 +4544,37 @@ echo "$OUTE" | grep -q "com.test.flaskjob: no .py/.sh/-m entrypoint resolved, bu
   && ok "T140 ...with no NÃO RESOLVIDO line for it" \
   || nok "T140 NÃO RESOLVIDO said for a non-running label" "out=[$(echo "$OUTE" | grep flaskjob)]"
 
+# T141: a wrapper that cannot be READ is not "a wrapper with no `-m` in it". The wrapper file
+# exists under the runtime (so the plist is followed to it) but its text is unreadable: no
+# `-m` and no `.py` can be learned from it. For a RUNNING label that must land in the visible
+# state — named in UNRESOLVED_ENTRYPOINTS — never in a quiet "nothing to check".
+# The file is kept out of git (.git/info/exclude) so run_helper's `git add -A` never has to
+# open a mode-000 file. Running as root reads it anyway, so the case is reported as skipped there.
+new_case t141
+mkdir -p "$RUNTIME/lib/predictive_dialer" "$RUNTIME/dashboard"
+cat > "$RUNTIME/lib/predictive_dialer/locked_app.py" <<<'print("locked")'
+cat > "$RUNTIME/launchd/locked-wrapper.sh" <<'WRAP'
+#!/bin/bash
+cd "$BASEDIR/lib"
+exec /usr/bin/env python3 -m predictive_dialer.locked_app
+WRAP
+echo "launchd/locked-wrapper.sh" >> "$RUNTIME/.git/info/exclude"
+chmod 000 "$RUNTIME/launchd/locked-wrapper.sh"
+make_plist_wd "$AGENTS" com.test.lockedwrap "$RUNTIME" /bin/bash "$RUNTIME/launchd/locked-wrapper.sh"
+seed_running com.test.lockedwrap 41001 "$STALE_LSTART"
+if [ -r "$RUNTIME/launchd/locked-wrapper.sh" ]; then
+  ok "T141 skipped: this user can read a mode-000 file (root), so the unreadable-wrapper case cannot be built"
+else
+  OUT=$(run_helper dashboard/unrelated.py); RC=$?
+  [ "$(field UNRESOLVED_ENTRYPOINTS "$OUT")" = "com.test.lockedwrap" ] \
+    && ok "T141 an unreadable wrapper of a RUNNING label is named in UNRESOLVED_ENTRYPOINTS (not read as 'no -m')" \
+    || nok "T141 unreadable wrapper collapsed into 'nothing to check'" "got [$(field UNRESOLVED_ENTRYPOINTS "$OUT")] out=[$OUT]"
+  ! t131_in com.test.lockedwrap "$(field AFFECTED "$OUT")" \
+    && ok "T141 ...and the report did not invent an AFFECTED for it" \
+    || nok "T141 invented AFFECTED" "AFFECTED=[$(field AFFECTED "$OUT")]"
+fi
+chmod 644 "$RUNTIME/launchd/locked-wrapper.sh" 2>/dev/null || true
+
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "daemon-refresh tests: $PASS passed, $FAIL failed"
