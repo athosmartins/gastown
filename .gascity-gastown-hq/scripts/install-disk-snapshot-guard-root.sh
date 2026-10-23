@@ -24,6 +24,9 @@
 #   /bin/bash scripts/install-disk-snapshot-guard-root.sh --check                      # sem sudo: só lê e diz o que está errado
 #   sudo /bin/bash scripts/install-disk-snapshot-guard-root.sh --expect-sha256 <hex>   # instala (uma vez)
 #   sudo /bin/bash scripts/install-disk-snapshot-guard-root.sh --check                 # confere depois, com o launchd
+#   --no-reload: instala no disco (cópia + plist) SEM bootout/bootstrap. É o modo do próprio guard (ga-xpswpd.2): o job que
+#   roda este instalador não pode ser descarregado no meio da rodada. O job carregado segue com a definição antiga até o
+#   launchd carregar o plist de novo (reboot, ou um bootout+bootstrap); a conferência diz "pend" e o RESULTADO "RECARGA PENDENTE".
 #   --expect-sha256 <hex>: OBRIGATÓRIO para instalar (sem ele: uso errado, rc 2, nada muda). É o `shasum -a 256
 #   scripts/disk-snapshot-guard.sh` do arquivo revisado: o root lê esse arquivo de uma pasta do athos e só instala o que tem este
 #   hash. A cópia nasce 0700 (só do root) e só vira 0755 depois de o hash dela conferir, para que um arquivo trocado no meio do
@@ -121,7 +124,7 @@ cleanup() {
 trap cleanup EXIT
 
 usage() {
-  say "uso: sudo /bin/bash $0 --expect-sha256 <64 hex>       (instala; o hash é obrigatório)"
+  say "uso: sudo /bin/bash $0 --expect-sha256 <64 hex> [--no-reload]  (instala; o hash é obrigatório)"
   say "     /bin/bash $0 --check [--expect-sha256 <64 hex>]  (só lê e confere; sem root o launchd não é lido)"
 }
 

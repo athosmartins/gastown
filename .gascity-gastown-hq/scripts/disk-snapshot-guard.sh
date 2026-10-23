@@ -55,7 +55,7 @@ notify_athos() {
 # NOT READ FROM ANYTHING athos CAN WRITE: the pin below is a literal in this commit. This file cannot carry its own
 # sha256, so the pin is the INSTALLER's; the guard's hash handed to the installer is that of root's private copy of this
 # file (round 1 trusts the bytes at the repo path, which root already runs today: the block only moves the anchor).
-DSG_INSTALLER_SHA256="0000000000000000000000000000000000000000000000000000000000000000"
+DSG_INSTALLER_SHA256="509865570a97683653aaa68f74f975aa1d9a81b0d5c596a86d401ac519f80125"
 DSG_PROG_DIR="/usr/local/libexec/gascity"
 DSG_MARKER_NAME=".disk-snapshot-guard.bootstrap-ok"
 
