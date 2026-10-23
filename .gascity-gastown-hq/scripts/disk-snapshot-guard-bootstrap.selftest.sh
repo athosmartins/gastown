@@ -147,7 +147,7 @@ core() {
   if [ "$(calls)" = "$n" ] && cmp -s "$PL" "$W/plist.before"; then ok "rodada 2: nenhuma chamada ao launchd e o plist não mudou"; else bad "rodada 2: mexeu em algo"; fi
 
   # 3. a própria cópia do root, mesmo sem marcador, nunca roda o instalador do repo
-  rm -f "$MARK"; n=$(calls)
+  rm -f "$MARK"; n=$(calls); cp "$REPO/scripts/install-disk-snapshot-guard-root.sh" "$PROG_D/"
   OUT=$(env DSG_ROOT_PFX="$ROOT" DSG_ROOT_UID="$MY_UID" DSG_OWNER="$MY_OWNER" DSG_LAUNCHCTL="$STUBS/launchctl" DSG_PLISTBUDDY="$STUBS/PlistBuddy" \
     DSG_LOG="$W/guard.log" FAKE_LCTL_STATE="$ST" /bin/bash "$PROG" 2>&1); RC=$?
   expect_rc 0 "cópia do root: o guard termina bem"
@@ -168,7 +168,7 @@ core() {
   [ ! -e "$PROG" ] && [ ! -e "$MARK" ] && ok "instalador symlink: recusado, nada instalado" || bad "instalador symlink: instalou"
 
   # 6. instalador que falha (plist sumiu → rc ≠ 0): sem marcador, guard rc 0
-  new_world; rm -f "$PL"; run_guard
+  new_world; rm -f "$PL"; mkdir -p "$PROG_D"; chmod 0755 "$ROOT/usr/local/libexec" "$PROG_D"; run_guard
   expect_rc 0 "instalador falha: o guard segue (rc 0)"
   [ ! -e "$MARK" ] && ok "instalador falha: sem marcador (a próxima rodada tenta de novo)" || bad "instalador falha: gravou marcador"
 
@@ -183,9 +183,30 @@ core() {
   new_world; mkdir -p "$PROG_D"; chmod 0755 "$PROG_D"; : > "$MARK"; chmod 0666 "$MARK"
   run_guard
   expect_out "instalador do disk-snapshot-guard" "marcador gravável por outros: não vale, o instalador roda"
+
+  # 9. $EUID importado não muda o que roda: com os ganchos o uid vem de `id -u`, e a rodada instala igual
+  new_world; run_guard EUID=0
+  expect_out "RESULTADO: instalado e confirmado" "EUID=0 no ambiente: o uid vem de id -u, a rodada instala igual"
 }
 
 core
+
+# --- mutantes: o mesmo núcleo contra cópias do guard com UMA proteção desligada por vez; cada um tem de ser pego -------------
+mutate() { # <nome> <texto antigo> <texto novo>: o antigo tem de aparecer em exatamente 1 linha do guard
+  local name="$1" old="$2" new="$3" out="$TMP/mut-$1.sh"
+  awk -v old="$old" -v new="$new" '
+    { i = index($0, old); if (i > 0) { c++; $0 = substr($0, 1, i-1) new substr($0, i+length(old)) } print }
+    END { exit (c == 1 ? 0 : 3) }' "$GUARD" > "$out" || { bad "mutante $name: o texto antigo não aparece em exatamente 1 linha"; return 0; }
+  if ( GUARD="$out"; QUIET=1; PASS=0; FAIL=0; core >/dev/null 2>&1; [ "$FAIL" -gt 0 ] ); then ok "mutante $name morto"; else bad "mutante $name SOBREVIVEU"; fi
+}
+mutate sem-hash-fixo 'elif [ "$inst_sha" != "$DSG_INSTALLER_SHA256" ]; then' 'elif false; then'
+mutate reload-mata-a-rodada '--no-reload --expect-sha256 "$guard_sha"' '--expect-sha256 "$guard_sha"'
+mutate segunda-rodada-reinstala 'if dsg_root_only "$prog_dir" d "$root_uid" && [ -f "$marker" ] && dsg_root_only "$marker" - "$root_uid"; then return 0; fi' 'if false; then return 0; fi'
+mutate uid-do-ambiente 'me=$(/usr/bin/id -u 2>/dev/null) || return 0' 'me="$EUID"'
+mutate copia-do-root-roda-o-instalador '[ "$self_dir" = "$prog_dir" ] && return 0' 'false'
+mutate instalador-symlink 'if [ -L "${self_dir}/${inst}" ] || [ ! -f "${self_dir}/${inst}" ]; then' 'if [ ! -f "${self_dir}/${inst}" ]; then'
+mutate marcador-sempre 'if [ "$rc" = "0" ] && printf' 'if true || printf'
+mutate marcador-gravavel-por-outros '[ "${mode:5:1}" != "w" ] && [ "${mode:8:1}" != "w" ]' 'true'
 
 # --- caso estático: o hash fixado no commit é o do instalador deste commit (travessia: editar o instalador exige atualizar o hash) ---
 PINNED=$(sed -n 's/^DSG_INSTALLER_SHA256="\([0-9a-f]*\)".*/\1/p' "$GUARD" | head -n 1)
