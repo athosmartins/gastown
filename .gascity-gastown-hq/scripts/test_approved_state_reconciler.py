@@ -1533,6 +1533,36 @@ def test_a_file_that_is_not_text_is_could_not_tell_not_a_crash(tmp_path, monkeyp
     assert asr._extra_alarm_suppress_reason(["story:approved", "story:unrefined"]) is None
 
 
+@pytest.mark.parametrize("breaks", ["open", "json"])
+def test_a_read_that_raises_on_a_good_file_is_could_not_tell_not_a_crash_and_not_a_mute(
+        tmp_path, monkeypatch, capsys, breaks):
+    """The file is there and well-formed, but the read itself fails: open() raises (permission denied, not
+    'missing'), or json.loads does. Same third state as a missing file: None, one visible WARN, the labels that
+    live only in the list alarm again — never an exception out of the daemon, never an empty list read as
+    'nothing is refused'."""
+    p = _vetoes_file(tmp_path)
+    _point_reader_at(monkeypatch, p)
+    if breaks == "open":
+        real_open = open
+
+        def failing_open(path, *a, **k):
+            if str(path) == str(p):
+                raise PermissionError(13, "Permission denied", str(p))
+            return real_open(path, *a, **k)
+        monkeypatch.setattr("builtins.open", failing_open)
+    else:
+        real_loads = json.loads
+
+        def failing_loads(s, *a, **k):
+            if isinstance(s, str) and s.startswith('["lab:'):   # the list this fixture wrote, and nothing else
+                raise ValueError("injected: not JSON")
+            return real_loads(s, *a, **k)
+        monkeypatch.setattr(asr.json, "loads", failing_loads)
+    assert asr._pool_probe_vetoes() is None
+    assert "WARN ga-d3b5yr" in capsys.readouterr().out
+    assert asr._extra_alarm_suppress_reason(["story:approved", "story:unrefined"]) is None
+
+
 def test_the_reader_looks_where_the_pilot_sources_the_list_from(monkeypatch):
     """The path is derived exactly as pilot-dispatcher.sh derives its own (scripts/ beside the live Pilot), so
     the reader cannot answer from a different copy than the one that gates dispatch. Held against the Pilot's
