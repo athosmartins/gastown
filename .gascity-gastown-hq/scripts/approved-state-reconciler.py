@@ -9769,7 +9769,7 @@ def _selftest():
     _pf_src_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "packs", "town-deltas",
                                 "assets", "pilot-dispatcher.sh")
     try:
-        with open(_pf_src_path) as _f:
+        with open(_pf_src_path) as _f:   # third-state-waiver: test-only read; unreadable source sets _pf_lines=None and the scenario FAILS via _bad
             _pf_lines = [l for l in _f.read().splitlines()
                          if 'startswith("gate:fix-attempt:")' in l and "impacto:dano-ao-vivo" in l]
     except Exception as _e:
@@ -9804,7 +9804,7 @@ def _selftest():
 
     def _true_sh(args, timeout=20):
         try:
-            return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+            return subprocess.run(args, capture_output=True, text=True, timeout=timeout)   # third-state-waiver: test-only copy of _sh; the reader's handling of its None answer is injected in this scenario (shnone)
         except Exception:
             return None
 
@@ -9826,6 +9826,8 @@ def _selftest():
         _pf_res["nolib"] = _read_gate_focus(NOW)
         globals()["GATE_FOCUS_LIB"] = _pf_fake_lib
         _pf_res["garbage"] = _read_gate_focus(NOW)
+        _sh = lambda *a, **kw: None     # what _sh answers when bash cannot run or times out
+        _pf_res["shnone"] = _read_gate_focus(NOW)
     finally:
         globals()["GATE_FOCUS_LIB"], globals()["GATE_FOCUS_STATE_FILE"] = _pf_saved[0], _pf_saved[1]
         _sh, _read_gate_focus_file = _pf_saved[2], lambda: None   # hermetic again for anything after this
@@ -9835,10 +9837,11 @@ def _selftest():
         os.rmdir(_pf_dir)
     if (_pf_res.get("on") == {"active": True, "depth": "16"}
             and _pf_res.get("off") == {"active": False, "depth": "4"}
-            and all(_pf_res.get(k) is None for k in ("stale", "future", "corrupt", "missing", "nolib", "garbage"))):
+            and all(_pf_res.get(k, "unset") is None for k in (
+                "stale", "future", "corrupt", "missing", "nolib", "garbage", "shnone"))):
         _ok("(ga-pfnfr5-h): on/off read through the real lib against this cycle's clock (NOW is in 2025, so "
             "fresh-vs-the-real-clock would have read stale); stale, future-dated, corrupt, missing, lib "
-            "missing and lib answering 'banana' → None")
+            "missing, lib answering 'banana' and bash that cannot run (_sh → None) → None")
     else:
         _bad("(ga-pfnfr5-h)", "results=%r" % (_pf_res,))
 
