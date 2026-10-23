@@ -5,8 +5,8 @@
 #   Por que existe · O que faz · Fim da missão · O que conta como noite · Variáveis
 #
 # POR QUE EXISTE  O mini reinicia toda noite (23:41); um processo lançado uma vez não chega à janela 03:30-05:10 do dia seguinte. As noites 18 e 19/10 se perderam assim (o loop da ga-sh8t23.3
-#   morreu às 05:26 de 17/10 e o plist dele não ficava em ~/Library/LaunchAgents). Este script roda como LaunchAgent (packs/town-deltas/assets/com.gascity.job-ram-probe-loop.plist: RunAtLoad, SEM
-#   KeepAlive): a cada boot ele recomeça sozinho, espera a janela e mede.
+#   morreu às 05:26 de 17/10 e o plist dele não ficava em ~/Library/LaunchAgents). Este script roda como LaunchAgent (com.gascity.job-ram-probe-loop.plist: RunAtLoad, SEM
+#   KeepAlive; o plist saiu do repo em 23/10, ga-l0glof, e a receita de reinstalar está em docs/runbooks/grade-noturna.md): a cada boot ele recomeça sozinho, espera a janela e mede.
 # O QUE FAZ       Uma noite por volta: `job-ram-probe.py --start 03:30 --until 05:10` grava `.gc/job-ram-probe-AAAAMMDD.jsonl` (um arquivo por noite) e a volta é anotada em
 #   `.gc/job-ram-probe-run/loop.log` (`<hora> noite AAAAMMDD rc=N [parcial] cego=Ns`). Com menos de 3 GB livres o probe NÃO amostra e só grava a linha `pulado: disco` (--skip-free-gb 3, ~100 B por passo; se nem
 #   ela couber, o probe conta e segue). O piso duro --min-free-gb 0.1 só é conferido depois de uma amostra TIRADA, então com o disco já abaixo de 3 GB ele não chega a rodar.

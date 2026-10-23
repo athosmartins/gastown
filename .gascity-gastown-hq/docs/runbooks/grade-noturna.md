@@ -120,7 +120,7 @@ Probe de 03:30 a 05:10 (-03), 1176 amostras, passo mediano 5 s, custo mediano de
 
 **Por que 3 noites e não 1.** O amostrador de 5 min viu +2,2 GB de swap nas janelas 04:00-04:18 de 14, 15 e 16/10 (3 de 3 noites); a única noite com o probe (17/10) deu +133 MB na mesma janela. A noite medida é a que NÃO reproduziu o sintoma, então "nenhum horário muda por RAM" com ela sozinha inverteria a evidência (decisão do Mayor em 19/10: opção 1, coletor que sobrevive ao reboot).
 
-**O que é.** `com.gascity.job-ram-probe-loop`: LaunchAgent em `~/Library/LaunchAgents` (`RunAtLoad`, **sem** `KeepAlive`) que roda `scripts/job-ram-probe-loop.sh`. A cópia versionada do plist está em `packs/town-deltas/assets/`. A cada boot o script recomeça sozinho, espera a janela e roda `job-ram-probe.py --start 03:30 --until 05:10 --interval 5 --max-mb 60 --min-free-gb 0.1 --skip-free-gb 3` (um arquivo `.gc/job-ram-probe-AAAAMMDD.jsonl` por noite). Cada volta é uma linha em `.gc/job-ram-probe-run/loop.log`: `<hora> noite AAAAMMDD rc=N [parcial] cego=Ns` (`cego` = segundos sem leitura utilizável na noite; ver abaixo). A linha da noite de 17/10, do loop anterior, não tem `cego=` e vale como estava.
+**O que é.** `com.gascity.job-ram-probe-loop`: LaunchAgent em `~/Library/LaunchAgents` (`RunAtLoad`, **sem** `KeepAlive`) que roda `scripts/job-ram-probe-loop.sh`. **Encerrado em 22/10 (ga-sh8t23.8 leu as 4 noites) e o plist versionado saiu do repo em 23/10 (ga-l0glof):** o `daemon-presence-watchdog` acusa PRESENCE-DRIFT de todo plist de `packs/town-deltas/assets/` ou `scripts/` que não esteja carregado (fora os rótulos críticos e os desligados de propósito com `launchctl disable`), e um coletor de execução única se remove de propósito, então a cópia ali alarmava a cada 3 h para sempre. Como reinstalar, se um dia for medir de novo: "Reinstalar" abaixo. A cada boot o script recomeça sozinho, espera a janela e roda `job-ram-probe.py --start 03:30 --until 05:10 --interval 5 --max-mb 60 --min-free-gb 0.1 --skip-free-gb 3` (um arquivo `.gc/job-ram-probe-AAAAMMDD.jsonl` por noite). Cada volta é uma linha em `.gc/job-ram-probe-run/loop.log`: `<hora> noite AAAAMMDD rc=N [parcial] cego=Ns` (`cego` = segundos sem leitura utilizável na noite; ver abaixo). A linha da noite de 17/10, do loop anterior, não tem `cego=` e vale como estava.
 
 **Quando termina (as duas saídas apagam o plist, escrevem `fim: <motivo>` no loop.log e dão `launchctl bootout`):**
 
@@ -129,10 +129,13 @@ Probe de 03:30 a 05:10 (-03), 1176 amostras, passo mediano 5 s, custo mediano de
 
 **Disco: o preço do piso de 3 GB.** Abaixo de 3 GB livres o coletor não amostra (grava `pulado: disco`). Na noite de 17/10 o reseed da `whatsapp_automation` levou o livre a **1499 MB entre 04:04:37 e 04:08:27**: se isso se repetir, o coletor fica cego esses ~4 minutos, DENTRO do lote das 04:00. O resumo diz quantas amostras foram puladas, trecho a trecho; não leia "sem salto de swap" em 04:04-04:08 como "sem salto" se houver `AVISO: … NÃO tiradas por falta de disco livre` cobrindo esse trecho. Uma noite com mais de 600 s cegos nem conta para as 4 (`parcial` no `loop.log`), então o coletor segue medindo até a data-limite em vez de dar por completa uma noite com buraco. (A ga-sh8t23.5, que tratava o pico de disco do reseed, está fechada: se ele já não cai abaixo de 3 GB, não haverá puladas.)
 
-**Instalar (depois do merge) e provar que carregou:**
+**Reinstalar (só para uma nova rodada de medição) e provar que carregou.** Duas armadilhas: (1) a data-limite do script (`JRL_DEADLINE`, padrão `202610230530`) já passou, então o plist antigo, sozinho, se removeria no 1º início: ponha um `JRL_DEADLINE` novo (AAAAMMDDhhmm) em `EnvironmentVariables` do plist; (2) NÃO devolva o plist para `packs/town-deltas/assets/` nem `scripts/` (o watchdog volta a alarmar): escreva-o direto em `~/Library/LaunchAgents/`.
 
 ```bash
-cp $GC_CITY_PATH/packs/town-deltas/assets/com.gascity.job-ram-probe-loop.plist ~/Library/LaunchAgents/
+# recupera o plist do histórico (a última versão antes da retirada); se o git não achar a retirada ou o show falhar, nada chega em LaunchAgents (o .new não é lido pelo launchd)
+cd ~/gt && p=.gascity-gastown-hq/packs/town-deltas/assets/com.gascity.job-ram-probe-loop.plist && out=~/Library/LaunchAgents/com.gascity.job-ram-probe-loop.plist
+del=$(git log --diff-filter=D --format=%h -1 -- "$p") && [ -n "$del" ] && git show "$del^:$p" > "$out.new" && mv "$out.new" "$out" || echo "plist NÃO recuperado do histórico"
+# edite o plist: acrescente <key>JRL_DEADLINE</key><string>AAAAMMDDhhmm</string> em EnvironmentVariables
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gascity.job-ram-probe-loop.plist
 launchctl print gui/$(id -u)/com.gascity.job-ram-probe-loop | head -20      # rc 0 = carregado
 ```
