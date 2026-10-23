@@ -20,6 +20,7 @@
 #   S11 discovery root that is not a git repo             -> 2
 #   S12 the real tree (no args)                           -> 0  (every tracked plist source parses)
 #   S13 a comment with ONE hyphen and a hyphenated word   -> 0  (the rule is two in a row, not one)
+#   S14 git cannot even start (no git on PATH)            -> 2  (a missing tool is undecided, never a clean 0 nor a crash)
 #
 # Exit 0 iff every scenario behaves as expected.
 set -uo pipefail
@@ -157,6 +158,13 @@ expect_rc 0 "no tracked plist source carries the defect"
 echo "S13: one hyphen / hyphenated words in a comment are fine"
 mk "$TMP/s13.plist" "pip-unpack-* dirs, a - b, and ~/.local/bin are all fine"
 run "$TMP/s13.plist"; expect_rc 0 "single hyphens are not the defect"
+
+echo "S14: git cannot start (empty PATH): the lint must say 'undecided', not crash and not pass"
+NOGITBIN="$TMP/no-git-bin"; mkdir -p "$NOGITBIN"
+PYABS="$(command -v python3)"
+OUT="$(PATH="$NOGITBIN" PLIST_LINT_ROOT="$HERE/.." "$PYABS" -I "$LINT" 2>"$TMP/err")"; RC=$?; ERR="$(cat "$TMP/err")"
+expect_rc 2 "git missing is undecided"
+printf '%s' "$ERR" | grep -q "cannot list the plists" && ok "reported on stderr, no traceback" || bad "expected 'cannot list the plists' on stderr" "$ERR"
 
 echo
 echo "plist-comment-lint.selftest: $PASS ok, $FAIL bad"
