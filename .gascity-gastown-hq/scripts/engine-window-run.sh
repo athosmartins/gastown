@@ -9,7 +9,9 @@
 #   engine-window-run.sh            # = check. Read-only. Nao muda nada.
 #   engine-window-run.sh push       # empurra a branch da janela pro remoto e VERIFICA o efeito
 #   engine-window-run.sh build      # push (acima) + builda; NAO troca o binario vivo
-#   engine-window-run.sh swap       # exige backup verificado da fonte; troca o symlink
+#   engine-window-run.sh swap       # exige backup verificado da fonte; troca o symlink;
+#                                   # depois do swap OK, origin/main anda (so ff) ate o commit do binario
+#   engine-window-run.sh advance-main # so este ultimo passo (refazer apos um aviso "NAO AVANCOU")
 #   engine-window-run.sh rollback   # volta pro binario anterior
 #
 # A ORDEM E SEMPRE check -> push -> build -> swap ('build' e 'arm' ja fazem o
@@ -30,6 +32,16 @@
 # (ex.: GitHub fora do ar num P0). Rollback NUNCA e barrado: voltar pro binario
 # anterior tem que ser sempre possivel. O detector horario que cobre o resto:
 # packs/town-deltas/assets/scripts/engine-binary-backup-guard.sh.
+#
+# POR QUE O SWAP TAMBEM ANDA O origin/main (ga-z36a88, Mayor 21/09 e 23/10/2026)
+# origin/main do engine ficou 17 dias / 12 commits atras do que RODAVA na cidade (so a
+# consolidated/engine-window-* tinha a verdade). Quem ramificasse de "main" -- a escolha
+# obvia -- reverteria em silencio correcoes vivas: o build passa, o binario roda, so as
+# correcoes somem. O swap e o instante em que "o que roda" muda; e nele que "o que e o
+# main" muda junto. Regras: so fast-forward (nunca force; se divergiu, avisa e nao mexe);
+# publica o commit que o BINARIO declara, nao a ponta da branch (se a branch andou depois
+# do build, o main nao recebe commit que nunca foi compilado); falha aqui avisa (log +
+# notify) mas nunca derruba o swap, que ja aconteceu; 'build', 'push' e 'rollback' nao mexem.
 #
 # POR QUE O SWAP NAO DERRUBA A CIDADE
 # O SO resolve o symlink no exec. Processo que ja esta rodando continua com o
@@ -69,6 +81,7 @@ PREV_FILE="${ENGINE_WINDOW_PREV_FILE:-$HOME/.gastown/run/engine-window-prev-targ
 LOG="${ENGINE_WINDOW_LOG:-/Users/athos/gt/.gascity-gastown-hq/.gc/logs/engine-window-run.log}"
 PREFLIGHT="${ENGINE_WINDOW_PREFLIGHT:-/Users/athos/gt/.gascity-gastown-hq/scripts/engine-build-preflight.sh}"
 PUSH_REMOTE="${ENGINE_WINDOW_PUSH_REMOTE:-origin}"
+MAIN_BRANCH="${ENGINE_WINDOW_MAIN_BRANCH:-main}"   # ga-z36a88: a branch do remoto que o swap anda (so ff)
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG"; }
 die() { log "ABORTADO: $*"; exit 1; }
@@ -267,6 +280,111 @@ phase_build() {
   log "PRONTO. Nada foi trocado ainda — rode 'swap' quando quiser expor a cidade."
 }
 
+# ga-z36a88: aviso de que origin/main NAO andou. Log + notify: se o aviso so ficasse no log, o main
+# voltaria a envelhecer calado -- que e exatamente o defeito que este passo existe pra acabar.
+# Sempre retorna 1, pra quem chama poder fazer `|| { main_ff_warn ...; return 1; }` numa linha so.
+main_ff_warn() {
+  log "  origin/main .. NAO AVANCOU: $*"
+  log "                 Nada foi forcado nem apagado. Depois de resolver, refaca so este passo: $(basename "$0") advance-main"
+  command -v notify >/dev/null 2>&1 && notify -t 'Engine window: origin/main NAO avancou' \
+    "$* -- refazer: engine-window-run.sh advance-main" >/dev/null 2>&1
+  return 1
+}
+
+# ga-z36a88: anda origin/main do engine (so fast-forward) ate o commit que o binario <bin> declara no
+# PROPRIO stamp (main.commit). Ver "POR QUE O SWAP TAMBEM ANDA O origin/main" no topo.
+# Cada leitura tem TRES estados (tem / nao-tem / nao-consegui-saber) e so "tem, provado" empurra:
+# o resto avisa e deixa tudo como esta. O push e UMA tentativa sem retry: falhar aqui e barato e
+# refazivel com `advance-main`, e um retry com sleep seguraria o post-boot atras de uma rede ruim.
+# rc 0 = main ja estava nesse commit (ou a frente dele), ou AVANCOU com o efeito verificado; rc 1 = nao andou.
+advance_origin_main() {
+  local bin="$1" remote="$PUSH_REMOTE" mbranch="$MAIN_BRANCH" stamp target main_tip old_s out rc
+  log "=== ORIGIN/MAIN (fast-forward ate o commit que o binario carrega) ==="
+
+  # vazio → binario sem commit no stamp: nao ha o que publicar, avisa e nao mexe; falhou/ilegivel → idem (eb_binary_commit devolve rc=1 nos dois)
+  stamp=$(eb_binary_commit "$bin" gc) \
+    || { main_ff_warn "o binario $bin nao traz commit no stamp (main.commit) -- nao sei o que publicar."; return 1; }
+
+  # vazio → o commit do stamp nao existe em $SRC: avisa e nao mexe; falhou/ilegivel → idem (rev-parse nao distingue, os dois ficam inertes)
+  target=$(git -C "$SRC" rev-parse --verify --quiet "${stamp}^{commit}" 2>/dev/null) || target=""
+  [ -n "$target" ] \
+    || { main_ff_warn "o commit do binario ($stamp) nao resolve em $SRC (ausente, ambiguo ou repo ilegivel)."; return 1; }
+
+  # So publica o que a branch da janela tem. tem (rc 0) segue; nao-tem (rc 1) recusa; nao-sei (outro rc, ex.: branch ausente) recusa.
+  git -C "$SRC" merge-base --is-ancestor "$target" "refs/heads/$BRANCH" 2>/dev/null; rc=$?
+  case "$rc" in
+    0) ;;
+    1) main_ff_warn "o commit do binario ($(printf '%.9s' "$target")) NAO esta em $BRANCH -- nao publico no main algo que a branch da janela nao tem."
+       return 1 ;;
+    *) main_ff_warn "nao consegui comparar o commit do binario com $BRANCH (rc=$rc; a branch existe em $SRC?)."
+       return 1 ;;
+  esac
+
+  # Visao FRESCA do remoto, so do remote do push: so fetch "ok" vale; falhou → nao sei o estado do main → nao empurro.
+  EB_REMOTES="$remote" eb_fetch_all "$SRC"
+  [ "$EB_FETCH_STATE" = "ok" ] \
+    || { main_ff_warn "nao consegui ler $remote agora (${EB_FETCH_NOTE:-fetch nao executado}) -- sem visao fresca de $mbranch nao empurro."; return 1; }
+
+  # vazio → depois de um fetch ok, $remote nao tem a branch $mbranch: nao crio (criar branch e decisao de humano); falhou/ilegivel → idem
+  main_tip=$(git -C "$SRC" rev-parse --verify --quiet "refs/remotes/$remote/${mbranch}^{commit}" 2>/dev/null) || main_tip=""
+  [ -n "$main_tip" ] \
+    || { main_ff_warn "$remote nao tem a branch $mbranch (ou nao consegui le-la): nao crio branch -- isso e decisao de humano."; return 1; }
+  old_s=$(printf '%.9s' "$main_tip")
+
+  if [ "$main_tip" = "$target" ]; then
+    log "  origin/main .. OK -- $remote/$mbranch ja esta em $(printf '%.9s' "$target") (nada a empurrar)."
+    return 0
+  fi
+  # main ja CONTEM o commit do binario (main esta a frente) nao e erro e NAO recua. rc 1 = nao contem; outro rc = nao sei.
+  git -C "$SRC" merge-base --is-ancestor "$target" "$main_tip" 2>/dev/null; rc=$?
+  case "$rc" in
+    0) log "  origin/main .. OK -- $remote/$mbranch ($old_s) ja contem o commit do binario ($(printf '%.9s' "$target")); o main esta a frente, nao recuo."
+       return 0 ;;
+    1) ;;
+    *) main_ff_warn "nao consegui comparar $remote/$mbranch com o commit do binario (rc=$rc)."
+       return 1 ;;
+  esac
+  # fast-forward? tem (rc 0) empurra; nao-tem (rc 1) = divergiu; nao-sei (outro rc) recusa.
+  git -C "$SRC" merge-base --is-ancestor "$main_tip" "$target" 2>/dev/null; rc=$?
+  case "$rc" in
+    0) ;;
+    1) main_ff_warn "$remote/$mbranch ($old_s) divergiu do commit do binario ($(printf '%.9s' "$target")): nao e fast-forward e eu NAO forco -- um humano decide (reconciliar ou refazer a janela sobre o main)."
+       return 1 ;;
+    *) main_ff_warn "nao consegui comparar $remote/$mbranch com o commit do binario (rc=$rc)."
+       return 1 ;;
+  esac
+
+  log "  origin/main .. empurrando $(printf '%.9s' "$target") -> $remote/$mbranch (so fast-forward, sem force)..."
+  out=$(eb_bounded "$EB_PUSH_TIMEOUT_S" env GIT_TERMINAL_PROMPT=0 \
+    git -C "$SRC" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 \
+    push "$remote" "${target}:refs/heads/${mbranch}" 2>&1) && rc=0 || rc=$?
+  [ "$rc" = "0" ] \
+    || { main_ff_warn "o push para $remote/$mbranch falhou (rc=$rc; remoto rejeitou ou sem rede): $(printf '%s' "$out" | tail -2 | tr '\n' ' ')"; return 1; }
+
+  # O EFEITO, nao o rc do push: um fetch novo tem que mostrar o main no commit (ou a frente dele).
+  # vazio/falhou → nao confirmo: avisa em vez de declarar sucesso.
+  EB_REMOTES="$remote" eb_fetch_all "$SRC"
+  main_tip=$(git -C "$SRC" rev-parse --verify --quiet "refs/remotes/$remote/${mbranch}^{commit}" 2>/dev/null) || main_tip=""
+  if [ "$EB_FETCH_STATE" = "ok" ] && [ -n "$main_tip" ] \
+      && git -C "$SRC" merge-base --is-ancestor "$target" "$main_tip" 2>/dev/null; then
+    log "  origin/main .. AVANCOU: $remote/$mbranch $old_s -> $(printf '%.9s' "$main_tip") (fast-forward, sem force)."
+    return 0
+  fi
+  main_ff_warn "o push retornou 0 mas nao consegui confirmar $remote/$mbranch em $(printf '%.9s' "$target") (main: ${main_tip:-?}; fetch: ${EB_FETCH_STATE:-?}) -- nao dou como feito."
+  return 1
+}
+
+# ga-z36a88: o passo acima, avulso, sobre o binario que esta NO AR agora (o alvo do symlink) -- pra refazer
+# depois de um aviso "NAO AVANCOU" ou de um swap com ENGINE_WINDOW_SKIP_BACKUP_CHECK=1 sem rede.
+phase_advance_main() {
+  local live
+  # vazio/falhou → nao sei qual binario esta no ar: avisa e nao mexe (publicar sem saber o que roda e o defeito original).
+  live=$(readlink "$SYMLINK" 2>/dev/null) || live=""
+  [ -n "$live" ] \
+    || { main_ff_warn "nao consegui ler $SYMLINK -- sem saber qual binario esta no ar nao publico nada."; return 1; }
+  advance_origin_main "$live"
+}
+
 phase_swap() {
   local out="$LIBEXEC/$LABEL"
   [ -x "$out" ] || die "nao existe $out — rode 'build' primeiro."
@@ -290,6 +408,12 @@ phase_swap() {
   log "novas pegam o novo. Nao e preciso derrubar a cidade."
   command -v notify >/dev/null 2>&1 && notify -t 'Engine window: swap feito' \
     "gc agora aponta pra $LABEL. Rollback: engine-window-run.sh rollback"
+  # ga-z36a88: o swap JA aconteceu. Daqui pra baixo, falha de ff do origin/main avisa (log + notify, dentro da
+  # funcao) e NUNCA vira falha do swap. O `return 0` e explicito de proposito: o rc do swap deixa de depender do
+  # ultimo comando (antes era o `command -v notify`, que da 1 sem notify instalado e fazia o post-boot logar
+  # "SWAP FALHOU" depois de um swap que deu certo).
+  advance_origin_main "$out" || true
+  return 0
 }
 
 phase_rollback() {
@@ -422,9 +546,10 @@ case "${1:-check}" in
   push)     log "=== PUSH ==="; ensure_backed_up ;;
   build)    phase_build "$@" ;;
   swap)     phase_swap ;;
+  advance-main) phase_advance_main ;;
   rollback)  phase_rollback ;;
   arm)       phase_arm ;;
   disarm)    phase_disarm ;;
   post-boot) phase_post_boot ;;
-  *) echo "uso: $(basename "$0") [check|push|build|swap|rollback|arm|disarm]"; exit 2 ;;
+  *) echo "uso: $(basename "$0") [check|push|build|swap|advance-main|rollback|arm|disarm]"; exit 2 ;;
 esac

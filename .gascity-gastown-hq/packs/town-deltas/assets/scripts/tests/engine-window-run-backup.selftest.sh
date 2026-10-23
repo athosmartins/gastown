@@ -64,11 +64,17 @@ ln -s "$WORK/old-gc" "$GCLINK"
 git -C "$E" add Makefile
 git -C "$E" commit -q -m "makefile de mentira"
 git -C "$E" push -q origin main
+# ga-z36a88: M = o main do remoto ANTES da janela; B = o commit anterior a M (base). A janela T1 nasce de M.
+M_TIP=$(git -C "$E" rev-parse HEAD)
+B_TIP=$(git -C "$E" rev-parse HEAD~1)
 
 git -C "$E" worktree add -q "$WT" -b consolidated/engine-window-T1 main
 T1_TIP=$(fx_commit "$WT" "janela-T1")
 T1_BRANCH=consolidated/engine-window-T1
 remote_tip() { git -C "$FX_REMOTE" rev-parse --verify --quiet "refs/heads/$T1_BRANCH" 2>/dev/null || echo "<ausente>"; }
+# ga-z36a88: o main do remoto. set_remote_main e SO montagem de cenario do teste (o script nunca faz isso).
+remote_main() { git -C "$FX_REMOTE" rev-parse --verify --quiet "refs/heads/main" 2>/dev/null || echo "<ausente>"; }
+set_remote_main() { git -C "$FX_REMOTE" update-ref refs/heads/main "$1"; }
 short() { printf '%.9s' "$1"; }
 notify_count() { wc -l < "$NOTIFY_LOG" | tr -d ' '; }
 
@@ -150,6 +156,7 @@ run_win -- push
 assert_eq "push -> rc=0" "0" "$RC"
 assert_eq "  o remoto tem a ponta da branch (lido no repo bare)" "$T1_TIP" "$(remote_tip)"
 assert_has "  log diz OK" "$OUT" "backup ....... OK"
+assert_eq "  e o push da janela NAO mexe em origin/main (ga-z36a88: main so anda depois do swap)" "$M_TIP" "$(remote_main)"
 run_win -- check
 assert_has "  e o check agora mostra OK" "$OUT" "backup ....... OK"
 
@@ -158,6 +165,7 @@ git -C "$FX_REMOTE" branch -q -D "$T1_BRANCH"      # remoto vazio de novo: o bui
 run_win -- build --force
 assert_eq "build --force -> rc=0" "0" "$RC"
 assert_eq "  o remoto agora tem a ponta (o BUILD empurrou)" "$T1_TIP" "$(remote_tip)"
+assert_eq "  e o build NAO mexe em origin/main (o binario ainda nao esta no ar)" "$M_TIP" "$(remote_main)"
 assert_eq "  binario compilado existe" "yes" "$([ -x "$LIBEXEC/gc-fixture" ] && echo yes || echo no)"
 assert_has "  e declara o commit da ponta (stamp main.commit)" "$("$LIBEXEC/gc-fixture" version --long)" "$(git -C "$WT" rev-parse --short HEAD)"
 PUSH_LINE=$(grep -n '=== PUSH' "$WLOG" | tail -1 | cut -d: -f1)
@@ -170,6 +178,84 @@ assert_eq "swap -> rc=0" "0" "$RC"
 assert_eq "  symlink agora aponta pro binario novo" "$LIBEXEC/gc-fixture" "$(readlink "$GCLINK")"
 assert_eq "  e o alvo anterior ficou guardado (rollback)" "$WORK/old-gc" "$(cat "$PREV")"
 assert_has "  o gate registrou 'backup ....... OK'" "$OUT" "backup ....... OK"
+
+echo "── 8b. swap OK -> origin/main anda (so fast-forward) ate o commit que o binario carrega (ga-z36a88) ──"
+# Origem: origin/main do engine ficou 17 dias/12 commits atras do que RODAVA (ga-z36a88) -- quem ramificasse
+# do "main" reverteria em silencio correcoes vivas. Aqui o main estava em M e a janela T1 e M + 1 commit.
+assert_eq "origin/main saiu de M e foi pra ponta da janela (= o commit do binario)" "$T1_TIP" "$(remote_main)"
+assert_has "  o log diz que AVANCOU" "$OUT" "origin/main .. AVANCOU"
+
+echo "── 8c. advance-main (o mesmo passo, avulso): idempotente ──"
+run_win -- advance-main
+assert_eq "origin/main ja no commit do binario -> rc=0" "0" "$RC"
+assert_has "  diz que ja esta la" "$OUT" "origin/main .. OK"
+assert_lacks "  e nao empurra de novo" "$OUT" "empurrando"
+assert_eq "  origin/main nao mudou" "$T1_TIP" "$(remote_main)"
+
+echo "── 8d. binario mais VELHO que a ponta da janela: publica o que foi COMPILADO, nao o que a branch virou depois ──"
+set_remote_main "$B_TIP"
+fx_fake_gc "$LIBEXEC/gc-fixture" "$(short "$M_TIP")"      # binario do commit M; a branch da janela ja esta em T1 (M + 1)
+run_win -- advance-main
+assert_eq "origin/main (em B) -> fast-forward ate M, rc=0" "0" "$RC"
+assert_eq "  origin/main foi ate M, o commit do binario" "$M_TIP" "$(remote_main)"
+assert_eq "  e NAO ate a ponta da branch T1, que o binario nunca viu" "no" "$([ "$(remote_main)" = "$T1_TIP" ] && echo yes || echo no)"
+
+echo "── 8e. origin/main ja esta A FRENTE do binario: nao recua ──"
+set_remote_main "$T1_TIP"
+run_win -- advance-main
+assert_eq "main a frente -> rc=0" "0" "$RC"
+assert_has "  diz OK (ja contem o commit do binario)" "$OUT" "origin/main .. OK"
+assert_eq "  e origin/main NAO voltou pra M" "$T1_TIP" "$(remote_main)"
+
+echo "── 8f. origin/main DIVERGIU: avisa, NAO forca; e a falha do ff nao vira falha do swap ──"
+git -C "$WORK/other" fetch -q origin
+git -C "$WORK/other" checkout -q -B main-divergida "$B_TIP"
+DIV_MAIN=$(fx_commit "$WORK/other" "alguem-empurrou-no-main")
+git -C "$WORK/other" push -q --force origin main-divergida:refs/heads/main      # montagem do cenario: so o TESTE forca
+: > "$NOTIFY_LOG"
+run_win -- advance-main
+assert_eq "main divergido -> rc=1" "1" "$RC"
+assert_has "  diz NAO AVANCOU" "$OUT" "origin/main .. NAO AVANCOU"
+assert_has "  e que divergiu" "$OUT" "divergiu"
+assert_lacks "  e nao tentou empurrar" "$OUT" "empurrando"
+assert_eq "  origin/main ficou EXATAMENTE como estava (o commit do outro; nada de force)" "$DIV_MAIN" "$(remote_main)"
+assert_has "  o aviso saiu por notify (senao o main volta a envelhecer calado)" "$(cat "$NOTIFY_LOG")" "origin/main NAO avancou"
+assert_has "  e diz como refazer depois de resolver" "$OUT" "advance-main"
+run_win -- rollback
+run_win -- swap
+assert_eq "swap com origin/main divergido -> rc=0 (o swap ja tinha acontecido)" "0" "$RC"
+assert_eq "  symlink trocado mesmo assim" "$LIBEXEC/gc-fixture" "$(readlink "$GCLINK")"
+assert_has "  e o aviso do main aparece no log do swap" "$OUT" "origin/main .. NAO AVANCOU"
+assert_eq "  alvo anterior (rollback) ficou guardado" "$WORK/old-gc" "$(cat "$PREV")"
+assert_eq "  origin/main segue no commit do outro" "$DIV_MAIN" "$(remote_main)"
+
+echo "── 8g. SEM REDE: nao sei != posso avancar -> nao mexe e nem tenta empurrar ──"
+set_remote_main "$B_TIP"
+git -C "$E" remote set-url origin "$WORK/nao-existe.git"
+run_win -- advance-main
+assert_eq "remoto inalcancavel -> rc=1" "1" "$RC"
+assert_has "  diz NAO AVANCOU" "$OUT" "origin/main .. NAO AVANCOU"
+assert_lacks "  e nao tentou empurrar" "$OUT" "empurrando"
+assert_eq "  origin/main intacto" "$B_TIP" "$(remote_main)"
+git -C "$E" remote set-url origin "$FX_REMOTE"
+
+echo "── 8h. binario SEM commit no stamp: nao ha o que publicar ──"
+fx_fake_gc_unstamped "$LIBEXEC/gc-fixture"
+run_win -- advance-main
+assert_eq "binario sem stamp -> rc=1" "1" "$RC"
+assert_has "  diz NAO AVANCOU" "$OUT" "origin/main .. NAO AVANCOU"
+assert_eq "  origin/main intacto" "$B_TIP" "$(remote_main)"
+
+echo "── 8i. remoto SEM branch main: nao crio (criar branch e decisao de humano) ──"
+fx_fake_gc "$LIBEXEC/gc-fixture" "$(short "$M_TIP")"
+git -C "$FX_REMOTE" update-ref -d refs/heads/main
+run_win -- advance-main
+assert_eq "remoto sem main -> rc=1" "1" "$RC"
+assert_has "  diz que nao cria" "$OUT" "nao crio"
+assert_eq "  e o main continua ausente" "<ausente>" "$(remote_main)"
+# estado normal pos-janela, pro resto do teste: main na ponta da janela e o binario da janela.
+set_remote_main "$T1_TIP"
+fx_fake_gc "$LIBEXEC/gc-fixture" "$(short "$T1_TIP")"
 
 echo "── 9. rollback funciona sempre ──"
 run_win -- rollback
@@ -188,14 +274,23 @@ assert_has "  diz SWAP RECUSADO" "$OUT" "SWAP RECUSADO"
 assert_has "  e que nenhum remoto contem o commit" "$OUT" "NENHUM remoto contem"
 assert_eq "  o symlink NAO foi tocado" "$WORK/old-gc" "$(readlink "$GCLINK")"
 assert_eq "  e o alvo anterior NAO foi (re)gravado" "<ausente>" "$([ -f "$PREV" ] && cat "$PREV" || echo '<ausente>')"
+assert_eq "  e origin/main nao se mexeu (swap recusado nao publica nada)" "$T1_TIP" "$(remote_main)"
 
 echo "── 11. bypass DELIBERADO: funciona, e e barulhento ──"
+# ga-z36a88: com origin/main em M, C_LOCAL (filho de M) seria um fast-forward VALIDO -- entao e a regra "so publica o
+# que a branch da janela tem" (e nao a deteccao de divergencia) que tem que segurar o main aqui.
+set_remote_main "$M_TIP"
 : > "$NOTIFY_LOG"
 run_win ENGINE_WINDOW_SKIP_BACKUP_CHECK=1 -- swap
 assert_eq "swap com ENGINE_WINDOW_SKIP_BACKUP_CHECK=1 -> rc=0" "0" "$RC"
 assert_has "  o log grita IGNORADO" "$OUT" "IGNORADO"
 assert_has "  e o notify de prioridade 4 saiu" "$(cat "$NOTIFY_LOG")" "-p 4"
 assert_eq "  symlink trocado (era deliberado)" "$LIBEXEC/gc-fixture" "$(readlink "$GCLINK")"
+# ga-z36a88: o bypass libera o SWAP, nao libera publicar no main um commit que a branch da janela nao tem.
+# O binario aqui e de C_LOCAL (commit que so existe no branch scratch do disco local).
+assert_has "  mas o ff de origin/main RECUSA: o commit do binario nao esta na branch da janela" "$OUT" "origin/main .. NAO AVANCOU"
+assert_has "  pelo motivo certo (nao esta na branch), nao por divergencia" "$OUT" "NAO esta em $T1_BRANCH"
+assert_eq "  e origin/main nao recebeu o commit so-local" "$M_TIP" "$(remote_main)"
 run_win -- rollback
 assert_eq "  e o rollback do bypass tambem funciona" "$WORK/old-gc" "$(readlink "$GCLINK")"
 
@@ -240,10 +335,11 @@ assert_has "  diz 'nao armo'" "$OUT" "nao armo"
 assert_eq "  e nenhum plist foi escrito" "no" "$([ -e "$WORK/home/Library/LaunchAgents/com.gascity.engine-window-postboot.plist" ] && echo yes || echo no)"
 git -C "$WT" checkout -q -- f.txt
 
-echo "── 15. subcomando desconhecido lista o novo 'push' no uso ──"
+echo "── 15. subcomando desconhecido lista o novo 'push' e o 'advance-main' no uso ──"
 run_win -- nao-existe
 assert_eq "rc=2" "2" "$RC"
 assert_has "  o uso lista push" "$OUT" "push"
+assert_has "  e lista advance-main (ga-z36a88)" "$OUT" "advance-main"
 
 echo "── 15b. engine-window-swap.sh (o OUTRO caminho de swap): recusa ANTES de instalar qualquer coisa ──"
 mkdir -p "$WORK/libexec2"
@@ -285,6 +381,22 @@ RB_START=$(grep -n '^phase_rollback()' "$RUN" | head -1 | cut -d: -f1)
 RB=$(awk -v s="$RB_START" 'NR>s && /^}/ {print NR; exit}' "$RUN")
 RB_GATE=$(awk -v s="$RB_START" -v e="$RB" 'NR>s && NR<e && /eb_require_backed_up|ensure_backed_up/ {print NR; exit}' "$RUN")
 assert_eq "engine-window-run.sh: o rollback NAO passa por gate nenhum" "" "$RB_GATE"
+# ga-z36a88: o ff de origin/main so roda DEPOIS do swap ter dado certo, nunca forca, e o rollback nao o chama.
+FF_CALL=$(awk -v s="$SW_START" 'NR>s && /^[[:space:]]*advance_origin_main[[:space:]]/ {print NR; exit}' "$RUN")
+assert_eq "engine-window-run.sh: o ff de origin/main (linha $FF_CALL) vem DEPOIS do 'ln -sfn' (linha $LS)" "yes" "$([ -n "$FF_CALL" ] && [ -n "$LS" ] && [ "$LS" -lt "$FF_CALL" ] && echo yes || echo no)"
+RB_FF=$(awk -v s="$RB_START" -v e="$RB" 'NR>s && NR<e && /advance_origin_main/ {print NR; exit}' "$RUN")
+assert_eq "engine-window-run.sh: o rollback NAO avanca origin/main" "" "$RB_FF"
+FF_START=$(grep -n '^advance_origin_main()' "$RUN" | head -1 | cut -d: -f1)
+FF_END=$(awk -v s="${FF_START:-0}" 'NR>s && /^}/ {print NR; exit}' "$RUN")
+assert_eq "engine-window-run.sh: advance_origin_main existe (linhas ${FF_START:-?}-${FF_END:-?})" "yes" "$([ -n "$FF_START" ] && [ -n "$FF_END" ] && echo yes || echo no)"
+# Linhas de CODIGO (comentario fora) da funcao: nada de force, de refspec com '+', de --mirror ou de apagar branch remoto.
+# Funcao ausente nao pode passar "sem force" por vacuidade: sem intervalo valido o resultado e a falha explicita.
+if [ -n "$FF_START" ] && [ -n "$FF_END" ]; then
+    FF_FORCE=$(awk -v s="$FF_START" -v e="$FF_END" 'NR>=s && NR<=e && $0 !~ /^[[:space:]]*#/ && /--force|--mirror|--delete|[[:space:]]-f[[:space:]]|"\+|:\+|push[^|]*[[:space:]]:/ {print NR": "$0}' "$RUN")
+else
+    FF_FORCE="<funcao ausente: nao deu pra varrer>"
+fi
+assert_eq "engine-window-run.sh: advance_origin_main nao tem force/'+'/--delete/--mirror em linha de codigo" "" "$FF_FORCE"
 
 echo "── 17. o symlink VIVO da cidade nao foi tocado por nenhum teste ──"
 LIVE_AFTER=$(readlink "$LIVE_LINK" 2>/dev/null || echo "<sem-symlink>")
