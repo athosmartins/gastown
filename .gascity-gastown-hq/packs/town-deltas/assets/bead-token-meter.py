@@ -20,7 +20,7 @@ O que um transcrito conta (medido em 01/10 nos 1.786 transcritos locais):
   * O Claude Code grava UM registro JSONL por bloco de conteúdo (thinking / text / tool_use) e TODOS repetem o `usage` da mesma
     resposta (512 registros = 187 respostas num worker). Somar linhas inflaria o gasto ~2,7x: a contagem é por message.id.
   * Cada resposta carrega `model` e `effort` — o effort de cada turno está GRAVADO, não precisa ser inferido da config.
-  * `cache_creation` separa escrita de cache em 5 min (1,25x o preço de entrada) e 1 h (2x); leitura de cache custa 0,1x.
+  * `cache_creation` separa escrita de cache em 5 min (1,25x o preço de entrada) e 1 h (2x); a leitura de cache custa 0,05x no sonnet/opus 5.5, 0,025x no fable 5.1 e 0,1x no haiku 5.5 (CACHE_READ_MULT, por modelo).
   * Sessões de subagente vivem em <projeto>/<sessão>/subagents/*.jsonl: entram na sessão-mãe (o gasto é dela).
 
 Como uma sessão vira bead (tentativas, em ordem de confiança):
@@ -86,15 +86,33 @@ SCHEMA = 4     # 4 = ramo do revisor juntado com a continuação do cabeçalho q
 AWS = os.environ.get("BTM_AWS") or "aws"
 S3_BUCKET = os.environ.get("BTM_S3_BUCKET") or "urblink-claude-history-backup"
 
-# US$ por milhão de tokens (entrada, saída). Fonte: skill claude-api / bead ga-5c3msy (30/09/2026). Modelo fora desta tabela NÃO é
-# precificado (aparece como "não precificado"): inventar preço é pior que mostrar a lacuna.
+# US$ por milhão de tokens (entrada, saída). Fonte: a página oficial de preços (https://platform.claude.com/docs/en/about-claude/pricing),
+# lida em 2026-10-23 (ga-lsju40); a mudança de leitura do sonnet-5-5 em 07/10 vem das release notes da Anthropic. Modelo fora desta tabela
+# NÃO é precificado (aparece como "não precificado"): inventar preço é pior que mostrar a lacuna.
 PRICES = {
     "claude-sonnet-5-5": (2.0, 10.0),
     "claude-opus-5-5": (4.0, 20.0),
+    "claude-fable-5-1": (10.0, 50.0),
+    "claude-haiku-5-5": (0.10, 0.50),     # só o tier "prompt até 100.000 tokens" = o PISO do modelo (PRICE_TIER_CEILING)
 }
-# multiplicadores do preço de ENTRADA (documentação de prompt caching): escrita 5 min 1,25x, escrita 1 h 2x, leitura 0,1x.
 ASSUMED = {}   # modelo -> modelo cujo preço se ASSUME (só via --assume-price; sempre rotulado na saída)
-CACHE_MULT = {"cw5": 1.25, "cw1": 2.0, "cr": 0.10}
+# multiplicadores do preço de ENTRADA que valem para todo modelo da tabela: escrita de cache 5 min 1,25x e 1 h 2x.
+CACHE_MULT = {"cw5": 1.25, "cw1": 2.0}
+# leitura de cache POR MODELO (notas da página: 0,025x no Fable 5.1, 0,05x no Opus 5.5 e no Sonnet 5.5, 0,1x nos demais). Todo modelo de
+# PRICES tem entrada AQUI (o selftest trava): modelo novo na tabela obriga a decidir, em vez de herdar 0,1x calado.
+CACHE_READ_MULT = {
+    "claude-sonnet-5-5": 0.05,
+    "claude-opus-5-5": 0.05,
+    "claude-fable-5-1": 0.025,
+    "claude-haiku-5-5": 0.10,
+}
+# mudança de regra NO MEIO do histórico: modelo -> (primeiro dia UTC do multiplicador de hoje, multiplicador de ANTES). O medidor aplica o de
+# hoje à janela inteira; o relatório diz quanto fica subestimado antes da data (decisão de recalcular ou marcar é do Mayor/Athos).
+# Opus 5.5 (lançado em 22/09): as release notes não registram mudança de leitura de cache nem dizem que valia 0,05x desde o lançamento — NÃO verificado.
+CACHE_READ_CHANGES = {"claude-sonnet-5-5": ("2026-10-07", 0.10)}
+# modelo precificado só no tier mais barato -> fator do tier mais caro (haiku-5-5 acima de 100.000 tokens de prompt: 5x em TODAS as categorias).
+# O ledger agrega por dia/modelo/effort e não guarda o tamanho do prompt por resposta, então o US$ desse modelo é um PISO e o teto é fator x piso.
+PRICE_TIER_CEILING = {"claude-haiku-5-5": 5.0}
 
 ROLE_RES = [  # ordem importa: refino-gate-reviewer antes de gate-reviewer
     (re.compile(r"^gastown\.dog-\d+"), "dog"),
@@ -176,24 +194,36 @@ def msg_usage(msg):
                 think=int((u.get("output_tokens_details") or {}).get("thinking_tokens") or 0))
 
 
+def priced_as(model):
+    """Chave de PRICES que precifica `model`: ele mesmo, ou o modelo assumido por --assume-price. None = sem preço (n/p, nunca US$ 0)."""
+    if model in PRICES:
+        return model
+    # vazio (nenhuma suposição para este modelo) -> None = sem preço; falhou/ilegível (suposição que não está em PRICES) -> None também: sem preço, nunca preço inventado
+    assumed = ASSUMED.get(model)
+    return assumed if assumed in PRICES else None
+
+
 def usd_of(model, c):
     """US$ de um conjunto de contadores, ou None se o modelo não tem preço (NUNCA 0 por falta de preço)."""
-    p = PRICES.get(model) or PRICES.get(ASSUMED.get(model, ""))
+    pm = priced_as(model)
+    p = PRICES.get(pm)
     if p is None:
         return None
     pin, pout = p
+    # pm está em PRICES, e todo modelo de PRICES tem entrada em CACHE_READ_MULT (o selftest trava): faltar aqui é KeyError alto, nunca um 0,1x calado
     return (c["inp"] * pin + c["out"] * pout + c["cw5"] * pin * CACHE_MULT["cw5"] + c["cw1"] * pin * CACHE_MULT["cw1"]
-            + c["cr"] * pin * CACHE_MULT["cr"]) / 1e6
+            + c["cr"] * pin * CACHE_READ_MULT[pm]) / 1e6
 
 
 def usd_parts(model, c):
     """O mesmo US$ de usd_of(), aberto por categoria: (entrada nova, saída, escrita de cache, leitura de cache). None sem preço."""
-    p = PRICES.get(model) or PRICES.get(ASSUMED.get(model, ""))
+    pm = priced_as(model)
+    p = PRICES.get(pm)
     if p is None:
         return None
     pin, pout = p
     return (c["inp"] * pin / 1e6, c["out"] * pout / 1e6,
-            (c["cw5"] * CACHE_MULT["cw5"] + c["cw1"] * CACHE_MULT["cw1"]) * pin / 1e6, c["cr"] * CACHE_MULT["cr"] * pin / 1e6)
+            (c["cw5"] * CACHE_MULT["cw5"] + c["cw1"] * CACHE_MULT["cw1"]) * pin / 1e6, c["cr"] * CACHE_READ_MULT[pm] * pin / 1e6)
 
 
 def total_tokens(c):
@@ -946,6 +976,45 @@ def flatten(rows, since_day):
     return out
 
 
+def cache_read_rule_changes(flat):
+    """A leitura de cache que o multiplicador de HOJE (CACHE_READ_MULT) não descreve: a de antes de uma mudança de regra (CACHE_READ_CHANGES).
+    -> {modelo: dict(before, old_mult, new_mult, cache_read_tokens_before, extra_usd, undated_cache_read_tokens)}, só para quem tem leitura em jogo.
+    extra_usd = quanto a leitura anterior à data fica SUBestimada (o que foi cobrado a mais do que o medidor calcula)."""
+    out = {}
+    for model, (first_day, old_mult) in CACHE_READ_CHANGES.items():
+        before = undated = 0
+        for _s, day, mo, _effort, c, _usd in flat:
+            if mo != model:
+                continue
+            # vazio (modelo sem leitura de cache) -> soma 0; falhou/ilegível (dia "?" ou fora do formato AAAA-MM-DD) -> não dá para dizer se é antes ou depois:
+            # conta À PARTE (undated), nunca como anterior nem como posterior
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(day)):
+                undated += c["cr"]
+            elif day < first_day:
+                before += c["cr"]
+        if before or undated:
+            new_mult = CACHE_READ_MULT[model]
+            out[model] = dict(before=first_day, old_mult=old_mult, new_mult=new_mult, cache_read_tokens_before=before,
+                              extra_usd=round(before * PRICES[model][0] * (old_mult - new_mult) / 1e6, 4), undated_cache_read_tokens=undated)
+    return out
+
+
+def price_tier_floor(flat):
+    """Modelos precificados só no tier mais barato (PRICE_TIER_CEILING): o US$ deles é um PISO e o teto é fator x piso.
+    -> {modelo: dict(tokens, usd_floor, usd_ceiling, factor)}, só para quem tem tokens com preço na janela."""
+    out = {}
+    for model, factor in PRICE_TIER_CEILING.items():
+        tokens, usd = 0, 0.0
+        for _s, _day, mo, _effort, c, u in flat:
+            # vazio (nenhuma linha do modelo) -> fora do mapa; falhou/ilegível (u é None: sem preço) -> não soma tokens nem US$ (sem preço não há piso)
+            if mo == model and u is not None:
+                tokens += total_tokens(c)
+                usd += u
+        if tokens:
+            out[model] = dict(tokens=tokens, usd_floor=round(usd, 4), usd_ceiling=round(usd * factor, 4), factor=factor)
+    return out
+
+
 UNATTRIBUTED_TARGET_PCT = 5.0     # meta do ga-v2qox1: sessões SEM papel atribuído < 5% do custo
 CREW_DIR_NAMES = ("peter", "oracle", "batista", "thies", "mila", "digo")   # espelha a linha `crew` de ROLE_RES (o selftest trava a deriva entre as duas)
 
@@ -1204,6 +1273,18 @@ def _report(a, result):
     result["by_role"] = by_role
     result["total_usd_priced"] = round(tot_usd, 4)
     result["unpriced_tokens"] = tot_unpriced
+    # o que o preço de hoje NÃO sabe (ga-lsju40): regra de leitura de cache que mudou no meio do histórico, e modelo precificado só no piso do tier
+    rule, tier = cache_read_rule_changes(flat), price_tier_floor(flat)
+    result["cache_read_rule_changes"], result["price_tier_floor"] = rule, tier
+    for model, x in rule.items():
+        print(f"   ⚠ regra de preço mudou no meio do histórico: {model} cobrava a leitura de cache a {x['old_mult']:g}x antes de {x['before']} (UTC) e cobra "
+              f"{x['new_mult']:g}x desde então. O medidor aplica {x['new_mult']:g}x à janela TODA: {x['cache_read_tokens_before'] / 1e6:.2f} Mtok de leitura "
+              f"anteriores a essa data saem SUBestimados em US$ {x['extra_usd']:.2f}"
+              + (f" (+ {x['undated_cache_read_tokens'] / 1e6:.2f} Mtok de leitura SEM data, que não dá para posicionar)" if x["undated_cache_read_tokens"] else "")
+              + ". O histórico NÃO foi reescrito: recalcular ou marcar a data é decisão do Mayor/Athos (ga-lsju40, item 3).")
+    for model, x in tier.items():
+        print(f"   ⚠ {model}: US$ {x['usd_floor']:.2f} no preço do tier ≤100k tokens de prompt (PISO). Acima de 100k cada categoria custa {x['factor']:g}x e o ledger "
+              f"não guarda o tamanho do prompt por resposta: o teto é US$ {x['usd_ceiling']:.2f}.")
 
     # ---- 1b. composição do custo: ONDE o gasto está (decide qual alavanca vale testar)
     comp = defaultdict(lambda: dict(parts=[0.0, 0.0, 0.0, 0.0], msgs=0, ctx=0, out=0, think=0, sessions=set()))
@@ -1251,10 +1332,11 @@ def _report(a, result):
             if day < since_day:
                 continue
             for model, caps in models.items():
-                p_ = PRICES.get(model) or PRICES.get(ASSUMED.get(model, ""))
+                pm_ = priced_as(model)
+                p_ = PRICES.get(pm_)
                 if p_:
                     for cap, tokens in caps.items():
-                        g["above"][cap] += tokens * p_[0] * CACHE_MULT["cr"] / 1e6
+                        g["above"][cap] += tokens * p_[0] * CACHE_READ_MULT[pm_] / 1e6
     for role, g in cap_rows.items():
         g["total_read_usd"] = comp[role]["parts"][3] if role in comp else 0.0
     print(f"\n== 1c. TETO DE CONTEXTO — US$ de LEITURA de cache acima de um teto por turno (limite SUPERIOR da economia de compactar mais cedo; ignora o custo da compactação e o risco de qualidade)")
@@ -1578,9 +1660,13 @@ def power_section(first_session, first_run, per, ever_pass, measured, first_sid)
 def cmd_prices(a):
     print("US$ por milhão de tokens (entrada / saída) — modelo fora da tabela NÃO é precificado (n/p):")
     for m, (i, o) in PRICES.items():
-        print(f"  {m:22s} {i:6.2f} / {o:6.2f}   escrita cache 5m {i * CACHE_MULT['cw5']:.2f}  1h {i * CACHE_MULT['cw1']:.2f}  leitura {i * CACHE_MULT['cr']:.2f}")
-    print("fonte entrada/saída: skill claude-api via bead ga-5c3msy (30/09/2026); multiplicadores de cache: documentação de prompt caching "
-          "(5m 1,25x · 1h 2x · leitura 0,1x). Confira antes de decidir com base em US$ — tokens são exatos, preços são parâmetro.")
+        rd = CACHE_READ_MULT[m]
+        tier = f"   (só o tier ≤100k tokens de prompt = PISO; acima de 100k, {PRICE_TIER_CEILING[m]:g}x)" if m in PRICE_TIER_CEILING else ""
+        print(f"  {m:22s} {i:6.2f} / {o:6.2f}   escrita cache 5m {i * CACHE_MULT['cw5']:.3f}  1h {i * CACHE_MULT['cw1']:.3f}  leitura {i * rd:.3f} ({rd:g}x){tier}")
+    for m, (day, old) in CACHE_READ_CHANGES.items():
+        print(f"  {m}: a leitura de cache custava {old:g}x antes de {day} (UTC) — o medidor aplica o multiplicador de hoje à janela inteira e o relatório diz quanto fica subestimado.")
+    print("fonte: página oficial de preços https://platform.claude.com/docs/en/about-claude/pricing, lida em 2026-10-23 (bead ga-lsju40); escrita de cache "
+          "5m 1,25x e 1h 2x; leitura de cache POR MODELO (tabela acima). Confira antes de decidir com base em US$ — tokens são exatos, preços são parâmetro.")
     return 0
 
 

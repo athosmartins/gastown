@@ -5,7 +5,11 @@
 Cada caso existe por um erro real que a medição já teve (01/10, nos 1.783 transcritos locais) ou poderia ter:
   * dedup por message.id: o Claude Code grava UM registro por bloco (thinking/text/tool_use) e todos repetem o `usage` — 512 registros
     para 187 respostas num worker; somar linhas inflaria o gasto ~2,7x (e o dedup tem que valer ENTRE o transcrito e o de subagente)
-  * preço: escrita de cache 5m (1,25x) e 1h (2x) e leitura (0,1x) conferidos à mão; modelo SEM preço = None, nunca US$ 0
+  * preço: escrita de cache 5m (1,25x) e 1h (2x) conferidos à mão; modelo SEM preço = None, nunca US$ 0
+  * leitura de cache POR MODELO (ga-lsju40): 0,05x no sonnet-5-5 e no opus-5-5, 0,025x no fable-5-1, 0,1x no haiku-5-5 — a tabela inteira (entrada,
+    escritas, leitura, saída) conferida contra a página oficial de preços, e todo modelo da tabela PRICES tem multiplicador explícito; o
+    --assume-price usa o multiplicador do modelo ASSUMIDO; o haiku-5-5 sai no preço do tier ≤100k (PISO) com o teto (5x) dito; a mudança de
+    regra do sonnet-5-5 em 07/10 vira aviso com o US$ em jogo, sem reescrever o histórico (decisão do Mayor/Athos)
   * <synthetic> (resposta do cliente, uso 0 ou lixo) não é chamada de modelo
   * bead de um worker = claim COM resultado ok; claim que falhou não conta; id citado no preâmbulo (93 ids de doutrina) não é bead;
     sessão de pool sem claim e sem referência = spawn OCIOSO (custo real, linha própria); worker com bead já atribuído (sem claim) cai
@@ -78,11 +82,11 @@ def load(src_path=None, source=None, name="btm"):
 
 
 # ----------------------------------------------------------------------------- fixtures
-U_SMALL = dict(input_tokens=10, output_tokens=20, cache_creation_input_tokens=30, cache_read_input_tokens=40)   # 100 tokens, US$ 0.000303 (sonnet-5-5)
-USD_SMALL = (10 * 2 + 20 * 10 + 30 * 2 * 1.25 + 40 * 2 * 0.1) / 1e6
+U_SMALL = dict(input_tokens=10, output_tokens=20, cache_creation_input_tokens=30, cache_read_input_tokens=40)   # 100 tokens, US$ 0.000299 (sonnet-5-5)
+USD_SMALL = (10 * 2 + 20 * 10 + 30 * 2 * 1.25 + 40 * 2 * 0.05) / 1e6      # leitura de cache do sonnet-5-5 = 0,05x da entrada (ga-lsju40)
 U_BIG = dict(input_tokens=1000, output_tokens=2000, cache_creation_input_tokens=7000, cache_read_input_tokens=5000,
              cache_creation={"ephemeral_5m_input_tokens": 3000, "ephemeral_1h_input_tokens": 4000})
-USD_BIG_SONNET = (1000 * 2 + 2000 * 10 + 3000 * 2 * 1.25 + 4000 * 2 * 2 + 5000 * 2 * 0.1) / 1e6      # 0.0465 (calculado à mão)
+USD_BIG_SONNET = (1000 * 2 + 2000 * 10 + 3000 * 2 * 1.25 + 4000 * 2 * 2 + 5000 * 2 * 0.05) / 1e6     # 0.046 (calculado à mão)
 
 
 def user(text, ts, content=None):
@@ -236,11 +240,138 @@ def t_price(m, W):
     ck((u["cw5"], u["cw1"]) == (25, 5), f"escrita sem TTL declarado (30-15) cai em 5m, mediu {u}")
 
 
+# ---- ga-lsju40: leitura de cache POR MODELO, fable-5-1 e haiku-5-5. Tabela copiada da página oficial de preços
+# (https://platform.claude.com/docs/en/about-claude/pricing, lida em 2026-10-23), US$ por milhão de tokens:
+# modelo -> (entrada, escrita 5m, escrita 1h, leitura de cache, saída). O haiku-5-5 é a linha "prompts até 100.000 tokens" (o PISO do modelo).
+PAGE_PRICES = {
+    "claude-sonnet-5-5": (2.0, 2.5, 4.0, 0.10, 10.0),
+    "claude-opus-5-5": (4.0, 5.0, 8.0, 0.20, 20.0),
+    "claude-fable-5-1": (10.0, 12.5, 20.0, 0.25, 50.0),
+    "claude-haiku-5-5": (0.10, 0.125, 0.20, 0.01, 0.50),
+}
+CR_1M = dict(input_tokens=0, output_tokens=0, cache_creation_input_tokens=0, cache_read_input_tokens=1_000_000)
+
+
+def t_price_per_model(m, W):
+    """Cada categoria de cada modelo da tabela bate com a página: 1M tokens de UMA categoria custa exatamente o US$/MTok dela (erro e vazio
+    não são o mesmo valor: modelo fora da tabela é None, e o fable-5-1 deixou de ser)."""
+    for model, (pin, w5, w1, rd, pout) in PAGE_PRICES.items():
+        for key, want in (("inp", pin), ("cw5", w5), ("cw1", w1), ("cr", rd), ("out", pout)):
+            c = dict(inp=0, out=0, cw5=0, cw1=0, cr=0, think=0, msgs=1)
+            c[key] = 1_000_000
+            got = m.usd_of(model, c)
+            ck(approx(got, want, 1e-9), f"{model} {key}: a página diz US$ {want}/MTok, o medidor deu {got}")
+
+
+def t_cache_read_table_is_explicit(m, W):
+    """Todo modelo da PRICES tem multiplicador de leitura EXPLÍCITO — um modelo novo na tabela força a decisão em vez de herdar 0,1x calado —
+    e a tabela de multiplicadores não tem modelo sobrando."""
+    table = getattr(m, "CACHE_READ_MULT", {})
+    ck(set(table) == set(m.PRICES), f"PRICES e CACHE_READ_MULT têm que ter os MESMOS modelos; só em PRICES: {sorted(set(m.PRICES) - set(table))}; "
+                                    f"só em CACHE_READ_MULT: {sorted(set(table) - set(m.PRICES))}")
+    ck(set(PAGE_PRICES) <= set(m.PRICES), f"modelos da página que o medidor não precifica: {sorted(set(PAGE_PRICES) - set(m.PRICES))}")
+
+
+def t_prices_command(m, W):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = m.main(["prices"])
+    txt = out.getvalue()
+    lines = {ln.split()[0]: ln for ln in txt.splitlines() if ln.strip().startswith("claude-")}
+    ck(code == 0, f"prices saiu {code}")
+    ck("leitura 0.250 (0.025x)" in lines.get("claude-fable-5-1", ""), f"fable-5-1: leitura US$ 0.250 = 0.025x; achei {lines.get('claude-fable-5-1')}")
+    ck("leitura 0.100 (0.05x)" in lines.get("claude-sonnet-5-5", ""), f"sonnet-5-5: leitura US$ 0.100 = 0.05x; achei {lines.get('claude-sonnet-5-5')}")
+    ck("leitura 0.200 (0.05x)" in lines.get("claude-opus-5-5", ""), f"opus-5-5: leitura US$ 0.200 = 0.05x; achei {lines.get('claude-opus-5-5')}")
+    ck("leitura 0.010 (0.1x)" in lines.get("claude-haiku-5-5", "") and "100k" in lines.get("claude-haiku-5-5", ""),
+       f"haiku-5-5: leitura US$ 0.010 = 0.1x e a linha diz que é o tier ≤100k; achei {lines.get('claude-haiku-5-5')}")
+    ck("platform.claude.com/docs/en/about-claude/pricing" in txt and "2026-10-23" in txt, "a fonte (URL) e a data de leitura saem no `prices`")
+
+
+def t_assume_price_uses_the_assumed_models_read_multiplier(m, W):
+    """--assume-price: o preço E o multiplicador de leitura são os do modelo ASSUMIDO (opus-5-5: 0,05x de US$ 4 = US$ 0,20/MTok), nunca um global."""
+    c = dict(inp=0, out=0, cw5=0, cw1=0, cr=1_000_000, think=0, msgs=1)
+    m.ASSUMED["claude-sonnet-5"] = "claude-opus-5-5"
+    try:
+        got, parts = m.usd_of("claude-sonnet-5", c), m.usd_parts("claude-sonnet-5", c)
+    finally:
+        m.ASSUMED.clear()
+    ck(approx(got, 0.20, 1e-9), f"leitura de 1M assumida como opus-5-5 = US$ 0,20, deu {got}")
+    ck(parts is not None and approx(parts[3], 0.20, 1e-9), f"usd_parts segue o mesmo multiplicador; achei {parts}")
+    ck(m.usd_of("claude-sonnet-5", c) is None, "sem a suposição o modelo volta a ser n/p (None)")
+
+
+def dated_world(m, W, items):
+    """items = (sid, instante, modelo, usage): 1 sessão de dog (beacon + 1 resposta) cada, nas datas escolhidas; o gate tem 1 PASS (o relatório exige o log)."""
+    W.mkdir(parents=True, exist_ok=True)
+    P = W / "projects"
+    for sid, ts, model, usage in items:
+        write_session(P, "-proj", sid, [beacon("gastown.dog-7", ts)] + asst(f"{sid}-1", ts, usage=usage, model=model))
+    gate = W / "gate.jsonl"
+    gate.write_text(json.dumps({"ts": items[0][1], "event": "dispatcher_complete", "branch": "feat/ga-dt1", "bead": "ga-dt1",
+                                "rig": "gascity", "result": "PASS", "dry_run": "0"}) + "\n")
+    w = dict(projects=P, gate=gate, ledger=W / "ledger" / "sessions.jsonl")
+    m.PROJECTS, m.GATE_LOG, m.LEDGER = [P], gate, w["ledger"]
+    harvest(m, w)
+    return w
+
+
+def t_cache_read_rule_change_is_quantified(m, W):
+    """Em 07/10/2026 o sonnet-5-5 passou de 0,10x para 0,05x na leitura de cache (release notes da Anthropic). O medidor aplica o multiplicador de HOJE
+    à janela inteira, então a leitura anterior a 07/10 sai SUBestimada: o relatório diz quanto (tokens e US$), sem reescrever o histórico —
+    recalcular ou marcar a data é decisão do Mayor/Athos (ga-lsju40, item 3). Sem leitura anterior à data, nada a avisar."""
+    w = dated_world(m, W, [("a", "2026-10-06T10:00:00.000Z", "claude-sonnet-5-5", CR_1M),     # antes da mudança: foi cobrado a 0,10x
+                           ("b", "2026-10-07T10:00:00.000Z", "claude-sonnet-5-5", CR_1M),     # no dia da mudança: já é 0,05x
+                           ("c", "2026-10-06T11:00:00.000Z", "claude-opus-5-5", CR_1M)])      # nenhuma mudança registrada para o opus-5-5
+    code, r = report(m, w, "--from", "2026-10-01")
+    ck(code == 0, f"report saiu {code} {r.get('error')}")
+    ch = r.get("cache_read_rule_changes") or {}
+    ck(set(ch) == {"claude-sonnet-5-5"}, f"só o sonnet-5-5 tem mudança de regra registrada; achei {sorted(ch)}")
+    s = ch["claude-sonnet-5-5"]
+    ck(s["before"] == "2026-10-07" and approx(s["old_mult"], 0.10) and approx(s["new_mult"], 0.05), f"a regra antiga e a nova: {s}")
+    ck(s["cache_read_tokens_before"] == 1_000_000, f"1M de leitura em 06/10 (o de 07/10 já é 0,05x e não conta): {s}")
+    ck(approx(s["extra_usd"], 1_000_000 * 2.0 * (0.10 - 0.05) / 1e6, 1e-9), f"US$ subestimado = 1M x US$ 2 x (0,10 - 0,05) = 0,10: {s}")
+    code, txt = report_text(m, w, "--from", "2026-10-01")
+    ck("regra de preço" in txt and "claude-sonnet-5-5" in txt, "o texto traz o aviso, com o modelo")
+    code, r2 = report(m, w, "--from", "2026-10-07")
+    ck(r2.get("cache_read_rule_changes") == {}, f"janela que começa no dia da mudança: nada anterior, mapa vazio (a chave existe); achei {r2.get('cache_read_rule_changes')}")
+    code, txt2 = report_text(m, w, "--from", "2026-10-07")
+    ck("regra de preço" not in txt2, "sem leitura anterior à data, o texto não avisa")
+    # três estados na função pura: antes da data / depois / dia ilegível ("?" e fora do formato) — este último NÃO é anterior nem posterior, vai para `undated`
+    row = lambda day, cr, model="claude-sonnet-5-5": (None, day, model, "xhigh", dict(inp=0, out=0, cw5=0, cw1=0, cr=cr, think=0, msgs=1), None)
+    got = m.cache_read_rule_changes([row("2026-10-06", 1000), row("2026-10-07", 700), row("?", 500), row("2026-10", 300), row("2026-10-05", 40, "claude-opus-5-5")])
+    s = got.get("claude-sonnet-5-5") or {}
+    ck(s.get("cache_read_tokens_before") == 1000 and s.get("undated_cache_read_tokens") == 800, f"antes=1000, sem data=500+300, o dia da mudança fora; achei {s}")
+    ck(m.cache_read_rule_changes([]) == {} and m.cache_read_rule_changes([row("2026-10-08", 9)]) == {}, "sem leitura em jogo: mapa vazio")
+
+
+def t_haiku_is_priced_as_a_floor(m, W):
+    """O ledger agrega por dia/modelo/effort e não guarda o tamanho do prompt por resposta; o haiku-5-5 custa 5x acima de 100k de prompt em TODAS as
+    categorias. Então ele sai no preço do tier ≤100k (PISO) e o relatório diz o teto (5x) — nunca um número só com cara de exato."""
+    use = dict(input_tokens=1_000_000, output_tokens=1_000_000, cache_creation_input_tokens=0, cache_read_input_tokens=1_000_000)
+    w = dated_world(m, W, [("h", "2026-10-08T10:00:00.000Z", "claude-haiku-5-5", use), ("s", "2026-10-08T11:00:00.000Z", "claude-sonnet-5-5", CR_1M)])
+    code, r = report(m, w, "--from", "2026-10-01")
+    ck(code == 0, f"report saiu {code} {r.get('error')}")
+    t = r.get("price_tier_floor") or {}
+    ck(set(t) == {"claude-haiku-5-5"}, f"só o haiku-5-5 é preço de piso; achei {sorted(t)}")
+    h = t["claude-haiku-5-5"]
+    ck(h["tokens"] == 3_000_000 and h["factor"] == 5.0, f"3M tokens, fator 5: {h}")
+    ck(approx(h["usd_floor"], 0.10 + 0.50 + 0.01, 1e-9) and approx(h["usd_ceiling"], 5 * 0.61, 1e-9), f"piso = 0,10 + 0,50 + 0,01 = 0,61; teto = 5x: {h}")
+    hr = [x for x in r["by_role"] if x["model"] == "claude-haiku-5-5"]
+    ck(hr and approx(hr[0]["usd"], 0.61, 1e-9), f"é o PISO que entra no total do modelo; achei {hr}")
+    code, txt = report_text(m, w, "--from", "2026-10-01")
+    ck("claude-haiku-5-5" in txt and "tier ≤100k" in txt, "o texto diz que o haiku-5-5 está no tier ≤100k")
+    w2 = dated_world(m, W / "ctl", [("s", "2026-10-08T11:00:00.000Z", "claude-sonnet-5-5", CR_1M)])
+    code, r2 = report(m, w2, "--from", "2026-10-01")
+    ck(r2.get("price_tier_floor") == {}, f"controle: sem haiku, mapa vazio (a chave existe); achei {r2.get('price_tier_floor')}")
+    code, txt2 = report_text(m, w2, "--from", "2026-10-01")
+    ck("tier ≤100k" not in txt2, "controle: sem haiku, o texto não avisa")
+
+
 def t_composition(m, W):
     c = dict(inp=1000, out=2000, cw5=3000, cw1=4000, cr=5000, think=0, msgs=1)
     parts = m.usd_parts("claude-sonnet-5-5", c)
     ck(approx(sum(parts), m.usd_of("claude-sonnet-5-5", c)), "as 4 categorias somam o MESMO total do usd_of (uma fórmula só)")
-    ck(approx(parts[3], 5000 * 2 * 0.1 / 1e6) and approx(parts[2], (3000 * 1.25 + 4000 * 2) * 2 / 1e6), f"leitura e escrita de cache separadas, achei {parts}")
+    ck(approx(parts[3], 5000 * 2 * 0.05 / 1e6) and approx(parts[2], (3000 * 1.25 + 4000 * 2) * 2 / 1e6), f"leitura e escrita de cache separadas, achei {parts}")
     ck(m.usd_parts("claude-sonnet-5", c) is None, "sem preço = None também na composição")
     w, _ = setup(m, W)
     code, r = report(m, w)
@@ -398,8 +529,9 @@ def t_context_caps(m, W):
     with contextlib.redirect_stdout(io.StringIO()):
         m.cmd_harvest(type("A", (), dict(ledger=str(w["ledger"]), since_hours=0))())
     code, r = report(m, w)
-    ck(approx(r["context_caps"]["dog"]["above"]["250000"], 400_000 * 2 * 0.1 / 1e6 + 0.0, 1e-6) or r["context_caps"]["dog"]["above"]["250000"] > 0,
-       f"US$ acima do teto de 250k aparece no report, achei {r['context_caps'].get('dog')}")
+    # 400k tokens acima do teto de 250k, no multiplicador de leitura do sonnet-5-5 (0,05x de US$ 2/MTok): US$ 0,04 — a seção 1c usa o MESMO multiplicador por modelo do usd_of
+    ck(approx(r["context_caps"]["dog"]["above"]["250000"], 400_000 * 2 * 0.05 / 1e6, 1e-9),
+       f"US$ acima do teto de 250k = 0,04 no report, achei {r['context_caps'].get('dog')}")
     ck(r["context_caps"]["dog"]["above"]["150000"] > r["context_caps"]["dog"]["above"]["250000"] > r["context_caps"]["dog"]["above"]["350000"],
        "o excesso só pode CAIR quando o teto sobe")
     # registro antigo (sem days_ctx) é reescaneado pela colheita, não fica sem o campo
@@ -1509,7 +1641,7 @@ def t_assistant_record_with_user_word_is_counted(m, W):
 
 # ---- ga-v2qox1: custo por CREW e sessões SEM papel por origem. 1 resposta = 1M tokens de entrada => sonnet-5-5 US$ 2,00, opus-5-5 US$ 4,00 (conta exata, sem arredondar)
 U_1M = dict(input_tokens=1_000_000, output_tokens=0, cache_creation_input_tokens=0, cache_read_input_tokens=0)
-FABLE = "claude-fable-5-1"      # fora da tabela PRICES de propósito: é o modelo que deixa o crew sem custo medido
+UNPRICED = "claude-sem-preco-teste"      # fora da tabela PRICES de propósito (nome sintético: um modelo real ganha preço um dia e o caso deixaria de testar "sem preço") — deixa o crew sem custo medido
 
 
 DOG_TOK, DOG_USD = 2 * 100, 2 * USD_SMALL          # o dog de mini_world: 2 respostas de U_SMALL (100 tokens) em sonnet-5-5
@@ -1542,14 +1674,14 @@ def beacon_of(alias):
 
 def t_crew_cost_and_unattributed(m, W):
     """ga-v2qox1: o custo por crew e o que NÃO tem papel (meta < 5%) têm que sair do relatório — texto e --json — sem inventar preço.
-    Mundo: dog (DOG_TOK tok, DOG_USD: desprezível) + peter-wa 3 resp sonnet (US$ 6) + oracle-wa em 2 sessões (2 resp opus US$ 8; 4 resp FABLE sem preço, alias com
-    -adhoc- que tem que cair no MESMO crew) + mila-wa só FABLE (1 resp: US$ n/p, nunca 0) + title-summary (reconhecido pelo conteúdo, NÃO é sem papel)
+    Mundo: dog (DOG_TOK tok, DOG_USD: desprezível) + peter-wa 3 resp sonnet (US$ 6) + oracle-wa em 2 sessões (2 resp opus US$ 8; 4 resp UNPRICED sem preço, alias com
+    -adhoc- que tem que cair no MESMO crew) + mila-wa só UNPRICED (1 resp: US$ n/p, nunca 0) + title-summary (reconhecido pelo conteúdo, NÃO é sem papel)
     + 4 sem papel: home-dir 5 resp (US$ 10), crew/digo 2 resp (US$ 4), worktree 1 (US$ 2), alias fora da tabela 1 (US$ 2).
     Tokens: 20M + DOG_TOK no total, 9M sem papel (45%); US$ precificado 34 + DOG_USD, sem papel 18 (53%) => ACIMA da meta."""
     sessions = [(beacon_of("peter-wa"), "claude-sonnet-5-5", 3, None),
                 (beacon_of("oracle-wa"), "claude-opus-5-5", 2, None),
-                (beacon_of("oracle-wa-adhoc-x7"), FABLE, 4, None),
-                (beacon_of("mila-wa"), FABLE, 1, None),
+                (beacon_of("oracle-wa-adhoc-x7"), UNPRICED, 4, None),
+                (beacon_of("mila-wa"), UNPRICED, 1, None),
                 (user("Summarize the following user message in 5 words", D + "09:00:00.000Z"), "claude-sonnet-5-5", 1, None),
                 (user("faça isso", D + "09:00:00.000Z"), "claude-sonnet-5-5", 5, "/Users/athos"),
                 (user("faça aquilo", D + "09:00:00.000Z"), "claude-sonnet-5-5", 2, "/Users/athos/gt/whatsapp_automation/crew/digo"),
@@ -1591,12 +1723,12 @@ def t_crew_cost_and_unattributed(m, W):
 
 
 def t_unattributed_within_target_and_unpriced(m, W):
-    """Abaixo da meta NO QUE TEM PREÇO: dog (desprezível) + peter-wa 40 resp (US$ 80) + 1 sem papel (home, 1 resp US$ 2) + 1 sem papel em FABLE (1M tok sem
+    """Abaixo da meta NO QUE TEM PREÇO: dog (desprezível) + peter-wa 40 resp (US$ 80) + 1 sem papel (home, 1 resp US$ 2) + 1 sem papel em UNPRICED (1M tok sem
     preço) => 2,4% do US$ (2 de 82) e 4,8% dos tokens (2M de 42M). Mas o sem papel em modelo SEM preço não vira US$ 0 calado NEM aprova a meta: os tokens
     aparecem à parte, o US$ é piso (`+`), a origem toda sem preço é n/p com % n/d, e o veredito é INDETERMINADO — 'dentro' só com tudo precificado."""
     w = cw_world(m, W, [(beacon_of("peter-wa"), "claude-sonnet-5-5", 40, None),
                         (user("sozinho", D + "09:00:00.000Z"), "claude-sonnet-5-5", 1, "/Users/athos"),
-                        (user("sem preço", D + "09:00:00.000Z"), FABLE, 1, "/Users/athos/gt")])
+                        (user("sem preço", D + "09:00:00.000Z"), UNPRICED, 1, "/Users/athos/gt")])
     code, r = report(m, w)
     u = r["unattributed"]
     ck(code == 0 and u["verdict"] == "indeterminado", f"token sem papel e sem preço: nem dentro nem acima: {code} {u['verdict']} usd={u['pct_usd']} tok={u['pct_tokens']}")
@@ -1612,7 +1744,7 @@ def t_unattributed_within_target_and_unpriced(m, W):
     ck(len(row) == 1 and " n/p " in row[0] and " n/d " in row[0], f"a linha toda sem preço mostra n/p no US$ e n/d no %US$, não 0.0: {row}")
     # TODO o sem papel sem preço (nenhum token dele tem preço): o agregado é n/p e n/d (None), não US$ 0 nem 0%, e o veredito segue indeterminado
     w3 = cw_world(m, W / "allun", [(beacon_of("peter-wa"), "claude-sonnet-5-5", 40, None),
-                                   (user("só sem preço", D + "09:00:00.000Z"), FABLE, 1, "/Users/athos")])
+                                   (user("só sem preço", D + "09:00:00.000Z"), UNPRICED, 1, "/Users/athos")])
     code, r3 = report(m, w3)
     u3 = r3["unattributed"]
     ck(code == 0 and u3["usd"] is None and u3["pct_usd"] is None and not u3["usd_is_floor"] and u3["unpriced_tokens"] == 1_000_000,
@@ -1620,7 +1752,7 @@ def t_unattributed_within_target_and_unpriced(m, W):
     ck(u3["verdict"] == "indeterminado" and approx(u3["pct_tokens"], 100 * 1e6 / (41e6 + DOG_TOK)), f"2,4% dos tokens mas sem preço: indeterminado: {u3['verdict']} {u3['pct_tokens']}")
     code, txt3 = report_text(m, w3)
     ck("SEM PAPEL: n/d do US$" in txt3 and "n/d%" not in txt3, "o texto diz n/d (sem o '%' grudado), não 0.0%")
-    # controle: o MESMO mundo sem o sem-papel em FABLE — tudo precificado e abaixo da meta => DENTRO de verdade
+    # controle: o MESMO mundo sem o sem-papel em UNPRICED — tudo precificado e abaixo da meta => DENTRO de verdade
     w2 = cw_world(m, W / "ctl", [(beacon_of("peter-wa"), "claude-sonnet-5-5", 40, None),
                                  (user("sozinho", D + "09:00:00.000Z"), "claude-sonnet-5-5", 1, "/Users/athos")])
     code, r2 = report(m, w2)
@@ -1663,8 +1795,17 @@ def t_unattributed_pure_functions(m, W):
 
 MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
     "soma linhas (sem dedup)": ('if v > rec["use"][k]:\n                                rec["use"][k] = v', 'rec["use"][k] += v', t_dedup),
-    "leitura de cache a preço cheio": ('"cr": 0.10}', '"cr": 1.0}', t_price),
-    "sem preço vira US$ 0": ('        return None\n    pin, pout = p\n    return (c["inp"] * pin + c["out"] * pout', '        return 0.0\n    pin, pout = p\n    return (c["inp"] * pin + c["out"] * pout', t_price),
+    "leitura de cache a preço cheio": ('"claude-opus-5-5": 0.05,', '"claude-opus-5-5": 1.0,', t_price_per_model),
+    "sonnet-5-5 volta a ler cache a 0,1x (o defeito do ga-lsju40)": ('"claude-sonnet-5-5": 0.05,', '"claude-sonnet-5-5": 0.10,', t_price_per_model),
+    "fable-5-1 lê cache no multiplicador padrão": ('"claude-fable-5-1": 0.025,', '"claude-fable-5-1": 0.10,', t_price_per_model),
+    "modelo da PRICES sem multiplicador de leitura explícito": ('    "claude-haiku-5-5": 0.10,\n', '', t_cache_read_table_is_explicit),
+    "--assume-price usa o multiplicador do modelo original": ('+ c["cr"] * pin * CACHE_READ_MULT[pm]) / 1e6', '+ c["cr"] * pin * CACHE_READ_MULT.get(model, 0.10)) / 1e6',
+                                                              t_assume_price_uses_the_assumed_models_read_multiplier),
+    "seção 1c com multiplicador global": ("tokens * p_[0] * CACHE_READ_MULT[pm_] / 1e6", "tokens * p_[0] * 0.10 / 1e6", t_context_caps),
+    "o dia da mudança de regra conta como anterior": ("elif day < first_day:", "elif day <= first_day:", t_cache_read_rule_change_is_quantified),
+    "dia sem data conta como anterior à mudança de regra": ('if not re.fullmatch(r"\\d{4}-\\d{2}-\\d{2}", str(day)):', "if False:", t_cache_read_rule_change_is_quantified),
+    "teto do haiku igual ao piso": ('PRICE_TIER_CEILING = {"claude-haiku-5-5": 5.0}', 'PRICE_TIER_CEILING = {"claude-haiku-5-5": 1.0}', t_haiku_is_priced_as_a_floor),
+    "sem preço vira US$ 0": ('        return None\n    pin, pout = p\n    # pm está em PRICES', '        return 0.0\n    pin, pout = p\n    # pm está em PRICES', t_price),
     "claim que falhou conta": ('for c in claims if c["state"] in ("ok", "noresult")]', 'for c in claims if c["state"] != "unconfirmed"]', t_claims),
     "só o 1º ramo do revisor": ("len(branches) < 6", "len(branches) < 1", t_reviewer),
     "janela por início de sessão": ('(s.get("days") or {}).items():\n            if day < since_day:\n                continue\n', '(s.get("days") or {}).items():\n', t_window_by_message_day),
@@ -1831,7 +1972,13 @@ CASES = [("dedup por message.id (entre registros e entre arquivos)", t_dedup), (
          ("registro de assistente cuja linha contém \"user\" é contado, não pulado como linha de usuário", t_assistant_record_with_user_word_is_counted),
          ("ga-v2qox1: custo por crew (-adhoc- no mesmo crew, sem preço = n/p) e sessões sem papel por origem contra a meta de 5%", t_crew_cost_and_unattributed),
          ("ga-v2qox1: sem papel dentro da meta; origem inteira sem preço é n/p e os tokens aparecem à parte", t_unattributed_within_target_and_unpriced),
-         ("ga-v2qox1: funções puras — fronteira da meta, sem base ≠ 0%, origem pelo cwd, CREW_DIR_NAMES = ROLE_RES", t_unattributed_pure_functions)]
+         ("ga-v2qox1: funções puras — fronteira da meta, sem base ≠ 0%, origem pelo cwd, CREW_DIR_NAMES = ROLE_RES", t_unattributed_pure_functions),
+         ("ga-lsju40: cada categoria de cada modelo (sonnet/opus 5.5, fable 5.1, haiku 5.5) custa o US$/MTok da página oficial", t_price_per_model),
+         ("ga-lsju40: todo modelo da PRICES tem multiplicador de leitura de cache explícito", t_cache_read_table_is_explicit),
+         ("ga-lsju40: `prices` mostra leitura por modelo, o tier ≤100k do haiku, a fonte e a data de leitura", t_prices_command),
+         ("ga-lsju40: --assume-price usa o multiplicador de leitura do modelo ASSUMIDO", t_assume_price_uses_the_assumed_models_read_multiplier),
+         ("ga-lsju40: mudança de regra do sonnet-5-5 em 07/10 avisada com tokens e US$ em jogo; sem leitura anterior, sem aviso", t_cache_read_rule_change_is_quantified),
+         ("ga-lsju40: haiku-5-5 no preço do tier ≤100k (piso) com o teto 5x dito; sem haiku, sem aviso", t_haiku_is_priced_as_a_floor)]
 
 
 def run(name, fn, m):
