@@ -741,6 +741,30 @@ mutant wa-aviso-calado-no-cliente    'say(f"AVISO: o pre-push de' '(f"AVISO: o p
 mutant wa-pasta-sem-hooks-nao-vazia  'if found:' 'if False:' case_wa_planted
 mutant wa-config-sobrescreve-a-do-main 'n = int(env.get("GIT_CONFIG_COUNT") or "0")' 'n = int(env.get("GIT_CONFIG_COUNT") or "0") * 0' case_wa_cfg
 
+# ── 12. ga-2hd02v.3.12: o prompt de cada worker remoto descreve a volta do gate COMO o executável a implementa ──
+# A wa-worker-remote-2 rodou `gate-done` sem argumentos numa bead que voltou do gate (aberta, sem assignee) e foi recusada; depois o push para worker/<sessão> deu non-fast-forward (wa-xr1xwt, 23/10).
+# O prompt do dog-remote tinha a receita (forma com argumentos + o ref worker/<sessão>-N); o do WA e o do PS não. Aqui o prompt é ligado ao executável: a recusa que ele cita existe no código e as rotas
+# que ele nomeia são as da tabela RIGS, então mudar um sem o outro reprova. Texto ausente = reprova (nunca "não achei, passa").
+MSG='nenhuma bead in_progress atribuída a'
+has "$EXE_SRC" "$MSG"; ok $? "prompts: o executável ainda recusa com «$MSG <alias>: não sei o que submeter»"
+for role in wa-worker-remote ps-worker-remote; do
+  P="$HQ/agents/$role/prompt.template.md"
+  [ -s "$P" ]; ok $? "prompts: $P existe e não está vazio"
+  has "$P" '## Bead que voltou do gate'; ok $? "prompts: $role tem a seção da volta do gate"
+  has "$P" "$MSG"; ok $? "prompts: $role cita a recusa do executável (a que a wa-worker-remote-2 recebeu)"
+  has "$P" 'gate-done <bead> worker/<seu nome de sessão>-N $(git rev-parse HEAD)'; ok $? "prompts: $role manda nomear a bead e o ref (forma com argumentos)"
+  has "$P" 'git push origin HEAD:refs/heads/worker/<seu nome de sessão>-2'; ok $? "prompts: $role dá a saída do non-fast-forward (outro ref worker/<sessão>-N)"
+  has "$P" 'gate-done <bead> worker/<seu nome de sessão>-2 $(git rev-parse HEAD)'; ok $? "prompts: $role manda submeter esse outro ref com o sha"
+  has "$P" 'Não peça ao Mayor para atribuir'; ok $? "prompts: $role não manda esperar atribuição à mão"
+  has "$P" 'gate:needs-fix'; ok $? "prompts: $role diz que a volta do gate vem com gate:needs-fix"
+  grep -nE '(^|[[:space:]`(])/[a-z][a-z-]+' "$P" > /dev/null 2>&1; [ $? -eq 1 ]; ok $? "prompts: $role não tem skill com barra no início (ga-7nxfa1; o grep leu e não achou: rc 1, arquivo ilegível é rc 2 e reprova)"
+done
+has "$HQ/agents/wa-worker-remote/prompt.template.md" '`wa-worker` ou `wa-worker-remote`'; ok $? "prompts: o WA nomeia as rotas do pool de WA"
+has "$EXE_SRC" '("wa-worker", "wa-worker-remote")'; ok $? "prompts: ... e são as da tabela RIGS do executável (wa)"
+has "$HQ/agents/ps-worker-remote/prompt.template.md" '`ps-worker` ou `ps-worker-remote`'; ok $? "prompts: o PS nomeia as rotas do pool de PS"
+has "$EXE_SRC" '("ps-worker", "ps-worker-remote")'; ok $? "prompts: ... e são as da tabela RIGS do executável (ps)"
+has "$HQ/agents/ps-worker-remote/prompt.template.md" 'bd -C property_scrapers comment'; ok $? "prompts: o PS segue mandando comentar com bd -C property_scrapers"
+
 echo
 echo "$((n - fails))/$n ok, $fails falhas"
 [ "$fails" = 0 ]

@@ -41,8 +41,17 @@ Não existe sonda de pool aqui. `bd ready`, `bd query`, `bd update --claim` e `g
 2. Rode só testes que não precisam de banco, rede de produção nem do Mac. Se um teste pedir arquivo que o nó não tem, **isso é sinal de que a bead não cabe aqui**: veja a próxima seção, não crie dado falso para passar.
 3. Os commits saem com o autor `<seu nome de sessão>@gastown.invalid`; não mude a identidade git.
 4. `git push origin HEAD` leva o branch ao espelho do mini, que só aceita `worker/*` e `crew/*`. Merge é do gate, nunca seu.
-5. Bead de código: ao terminar, rode `gate-done` e deixe um `bd comment <id> "entregue: <resumo>"`. **Não feche** a bead; o gate fecha. O skill de mesmo nome não existe nesta sessão: o que vale é o atalho.
+5. Bead de código: ao terminar, rode `gate-done` e deixe um `bd comment <id> "entregue: <resumo>"`. **Não feche** a bead; o gate fecha. O skill de mesmo nome não existe nesta sessão: o que vale é o atalho. `gate-done` sem argumentos serve só para a ÚNICA bead `in_progress` sua e submete o que o ESPELHO tem em `worker/<seu nome de sessão>`; para a bead que voltou do gate, veja a seção "Bead que voltou do gate".
 6. Depois disso, termine o turno. A sessão ociosa se encerra sozinha em 15 minutos e o worktree só é recolhido se estiver limpo e com todo commit publicado: commit não publicado e arquivo novo ou alterado ficam guardados e o worktree é mantido. Arquivos que o git ignora (build, cache) não contam e somem junto quando ele é recolhido.
+
+## Bead que voltou do gate, ou 2ª bead da sessão
+
+Quando o gate reprova, a bead volta **aberta, sem assignee**, com `gate:needs-fix`, e o gate reescreve (rebase) a branch `fix/<bead>-<resumo>` no origin: o sha que ele revisou pode não ser o da sua cópia. Duas coisas barraram um conserto de verdade (a wa-xr1xwt, em 23/10):
+
+1. `gate-done` sem argumentos só aceita a ÚNICA bead `in_progress` atribuída ao seu alias. Na volta do gate a bead não é de ninguém, e a recusa diz «nenhuma bead in_progress atribuída a <seu alias>: não sei o que submeter». **Não peça ao Mayor para atribuir**: nomeie a bead e o ref, `gate-done <bead> worker/<seu nome de sessão>-N $(git rev-parse HEAD)`. O atalho aceita uma bead sem assignee quando ela tem `gate:needs-fix`, `gc.routed_to` igual a ``wa-worker` ou `wa-worker-remote`` e a última entrega dela foi do seu alias; o sha é conferido antes de criar o marcador.
+2. `worker/<seu nome de sessão>` fica preso na 1ª entrega: depois que o gate reescreve a branch, o push seguinte para ele volta `non-fast-forward`. Não force e não use `git pull`. Antes de consertar, `git fetch origin` e comece de `origin/<branch>` (`<branch>` é o `fix/<bead>-<resumo>` que o veredito do gate cita); conserte, empurre com outro nome, `git push origin HEAD:refs/heads/worker/<seu nome de sessão>-2` (o próximo N livre), e rode `gate-done <bead> worker/<seu nome de sessão>-2 $(git rev-parse HEAD)`. O ref e o sha são conferidos um a um, então não importa o que `worker/<seu nome de sessão>` guarda; `gate-done` sem argumentos leria justamente essa ponta velha e submeteria o sha errado.
+
+Duas beads na mesma sessão seguem a mesma regra: cada uma com o seu ref e o seu `gate-done <bead> <ref> <sha>`. Se o atalho recusar, deixe a bead como está com um `bd comment` que diga o nome do ref, o sha empurrado e o motivo da recusa; a entrega desse caso é do Mayor.
 
 {{/* e12-doctrine:begin — GENERATED from e12_block_text (assets/e12-arms.sh) by assets/e12-crew-doctrine.sh (ga-0nz1wi). Edit the text there, then run 'bash e12-crew-doctrine.sh write'. */}}
 ## Write-time doctrine — experiment E12 (ga-4q2zo5)
