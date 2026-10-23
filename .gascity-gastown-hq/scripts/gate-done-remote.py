@@ -35,7 +35,7 @@ O QUE FAZ, EM ORDEM (passo que não consegue saber algo para sem escrever nada: 
   5. Só depois do marcador, e só se `gate.submitted_by` aparece nele: solta a bead (tira `gc.routed_to`, depois o assignee, que só sai se ainda for o
      alias). Sem isso o pool do dog-remote recria uma sessão fresca a cada idle_timeout (15 min) enquanto a bead seguir atribuída ao alias (achado do
      dog-4 em ga-2hd02v.1.6). O guarda do gate faz o mesmo ao claimar; aqui é antes, para a janela não existir.
-  6. Recolhe o que esta execução criou (worktree, branch local, ref temporária) e imprime o sha submetido. Nenhum git daqui dispara gc/manutenção.
+  6. Recolhe o que esta execução criou (worktree, branch local, ref temporária, pasta temporária dos guards) e imprime o sha submetido. Nenhum git daqui dispara gc/manutenção.
 
 O QUE NÃO FAZ
   Não vê o HEAD do servidor: sem argumento submete o que o ESPELHO tem no ref escolhido (worker/<sessão>[-<cauda>]) e imprime esse sha, e quem rodou o `gate-done` compara com
@@ -43,6 +43,9 @@ O QUE NÃO FAZ
   argumentos o dog passa o sha e a divergência é recusada antes do marcador. O que está no servidor e não chegou ao espelho ele não vê.
   Não roda o pre-push do WA (ga-2hd02v.3.10): o hook dele executa ~12 scripts da ÁRVORE empurrada (`$REPO_ROOT/scripts/check_*.py`, suítes pytest) e o worktree é sem checkout de propósito (nenhum código do nó roda no mini antes da revisão). Rig com
   `prepush=False` na tabela RIGS (hoje só o WA) roda os blocos do gate-done.md com core.hooksPath numa pasta vazia da cidade (por ambiente; o gate-done.md e a config do rig ficam como estão), e o aviso vai ao cliente e ao `self_audit:` do marcador. HQ e PS seguem com o hook.
+  Em troca (ga-2hd02v.3.11), rig com `guards=True` (hoje só o WA) roda G12 (daemon agendado pago sem aprovação), G6 (registro MDS), G7 (ntfy direto) e G7b (ação do notify) ANTES do worktree, por wa-remote-guards.py: o código é o de
+  `origin/main` do rig e os dados são os OBJETOS do sha, exportados como arquivos inertes (nada do nó é importado nem executado). Reprovou (rc 1 dele COM `RESULT=BLOCKED` do mesmo sha) → recusa 1; não deu para verificar (inclusive um estouro, que também sai 1) → recusa 2; nos dois casos nenhum marcador nasce. As suítes pytest e o resto do hook
+  seguem NÃO verificados e o `self_audit:` do marcador diz exatamente isso (só G12, G6, G7 e G7b foram verificados).
   Não roda a checagem "NEW READS NEED A FAILURE TEST" nem a auto-auditoria do diff (são do construtor, antes do push): o marcador registra
   `self_audit: … auto-auditoria do diff NÃO verificada aqui`, visível, não calado.
   Só os rigs da tabela RIGS (gascity, property_scrapers, whatsapp_automation; ga-2hd02v.4): o PAPEL da sessão
@@ -53,7 +56,7 @@ O QUE NÃO FAZ
 
 CÓDIGOS DE SAÍDA (o wrapper devolve o do executável; 77 e 124-127 são DELE, e o stderr diz de quem é cada um)
   0 submetido (marcador criado; a linha `bead solta:` ou `AVISO:` diz se a bead foi solta) · 1 recusado ou falhou ANTES do marcador (a bead não mudou; um branch
-  fix/… pode ter chegado ao origin) · 2 ambiente ou gate-done.md fora do esperado (nada foi escrito) · 4 o script terminou 0 sem UM marcador identificável (NÃO
+  fix/… pode ter chegado ao origin) · 2 ambiente ou gate-done.md fora do esperado, ou os guards do WA não puderam ser verificados (nada foi escrito) · 4 o script terminou 0 sem UM marcador identificável (NÃO
   repita às cegas: `bd list -l type:quality-gate-marker -l source-bead:<bead>`).
 
 MODO DE ENSAIO: `GATE_DONE_REMOTE_DRY_RUN=1` resolve tudo (alias, bead, sha, branch, blocos) e imprime o plano; não cria worktree, não empurra, não escreve.
@@ -64,8 +67,10 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 from pathlib import Path
@@ -93,14 +98,19 @@ class Rig(NamedTuple):
     role: str      # o papel das sessões remotas que submetem DESTE rig (a parte do nome da sessão antes do sufixo)
     routes: tuple  # gc.routed_to de uma volta do gate neste rig: o pool do mini (o que o dispatcher RESTAURA ao reprovar) e o do nó
     prepush: bool = True  # False = o pre-push do rig NÃO roda no mini (ga-2hd02v.3.10): ele executa scripts da ÁRVORE empurrada, e o worktree é sem checkout de propósito (código do nó não roda no mini antes da revisão)
+    guards: bool = False  # True = G12/G6/G7/G7b do pre-push rodam no lugar do hook, pelos OBJETOS do sha e com o código de origin/main (wa-remote-guards.py, ga-2hd02v.3.11); só faz sentido com prepush=False
 
 
 # ga-2hd02v.4: a tabela do que o atalho atende. Rig fora dela = recusa (nunca "tenta e vê").
 RIGS = {
     "ga": Rig("ga", "gascity", "dog-remote", ROUTES),
     "ps": Rig("ps", "property_scrapers", "ps-worker-remote", ("ps-worker", "ps-worker-remote")),
-    "wa": Rig("wa", "whatsapp_automation", "wa-worker-remote", ("wa-worker", "wa-worker-remote"), prepush=False),  # medido 22/10: ~12 dos ~15 guards do pre-push do WA rodam arquivos de $REPO_ROOT (a árvore empurrada); HQ e PS seguem com o hook (PS: só um shim do bd)
+    "wa": Rig("wa", "whatsapp_automation", "wa-worker-remote", ("wa-worker", "wa-worker-remote"), prepush=False, guards=True),  # medido 22/10: ~12 dos ~15 guards do pre-push do WA rodam arquivos de $REPO_ROOT (a árvore empurrada); HQ e PS seguem com o hook (PS: só um shim do bd)
 }
+GUARDS_BIN = Path(__file__).resolve().with_name("wa-remote-guards.py")
+GUARDS_TIMEOUT = 180  # medido 23/10 com o mini a load 55: 17 s (WA main, 304 plists) a 65 s; o wrapper corta tudo em timeout_s (300 por padrão), então estourar aqui vira recusa limpa antes de qualquer escrita
+GUARDS_PASS_RE = re.compile(r"^wa-remote-guards: RESULT=PASS sha=([0-9a-f]{40}) trusted=([0-9a-f]{40})\s*$", re.M)  # o "certificado": sem esta linha um rc 0 não vale
+GUARDS_BLOCK_RE = re.compile(r"^wa-remote-guards: RESULT=BLOCKED sha=([0-9a-f]{40}) trusted=([0-9a-f]{40})\s*$", re.M)  # idem para o rc 1: um Python que estoura também sai 1, e isso NÃO é "reprovou"
 ROLE_RE = re.compile(r"(dog-remote|ps-worker-remote|wa-worker-remote)(?:-|$)")  # o papel de um nome de sessão; gate-reviewer-remote e nomes de teste não casam → vale o rig do HQ, como antes
 
 
@@ -472,6 +482,30 @@ def lease_push(repo: str, wt: str, env: dict, sess: str, branch: str, sha: str, 
         raise Stop(f"o push com --force-with-lease de {branch} (esperando {tip[:12]} no origin) falhou: o origin mudou depois que li, ou o hook do push recusou (git rc={p.returncode}: {p.stderr.strip()[:200]}). Nada foi submetido")
 
 
+def wa_guards(ctx: Ctx, sha: str, work: Path) -> str:
+    """Roda G12/G6/G7/G7b sobre os OBJETOS de `sha` (wa-remote-guards.py, em subprocesso: código de confiança de origin/main do rig, dados inertes do sha). Devolve a nota do self_audit.
+    Reprovou (rc 1 dele COM `RESULT=BLOCKED sha=<este sha>`) → Stop rc 1; não deu para saber (rc 2, timeout, estouro que também sai 1, saída sem o certificado, qualquer outra coisa) → Stop rc 2. Nunca chega ao marcador sem o certificado `RESULT=PASS sha=<este sha>`."""
+    scratch = tempfile.mkdtemp(prefix="guards-", dir=work)  # falhou (disco, permissão) → OSError sobe como erro interno antes do script: nada foi escrito
+    try:
+        # vazio (sem saída) → sem certificado → Stop rc 2; falhou/ilegível (rc != 0, timeout 255, sem a linha RESULT, sha diferente) → Stop; nunca "passou"
+        r = run([sys.executable, "-I", "-B", str(GUARDS_BIN), "--repo", ctx.repo, "--sha", sha, "--scratch", scratch], timeout=GUARDS_TIMEOUT)
+        for ln in r.stdout.splitlines():
+            say(ln[len("wa-remote-guards: "):] if ln.startswith("wa-remote-guards: ") else ln)
+        blocked = GUARDS_BLOCK_RE.findall(r.stdout)
+        if r.returncode == 1 and len(blocked) == 1 and blocked[0][0] == sha:
+            raise Stop(f"os guards G12/G6/G7/G7b do pre-push de {ctx.rig.name} reprovaram {sha[:12]} (linhas BLOQUEADO acima): corrija no branch, empurre e submeta de novo. Nenhum marcador foi criado", 1)
+        found = GUARDS_PASS_RE.findall(r.stdout)
+        if r.returncode != 0 or len(found) != 1 or found[0][0] != sha:
+            raise Stop(f"não consegui verificar G12/G6/G7/G7b em {sha[:12]} (wa-remote-guards.py rc={r.returncode}, {len(found)} certificado(s); stderr: {r.stderr.strip()[:160]!r}): "
+                       f"não submeto sem saber. O problema está no mini, não no seu diff: avise o Mayor", 2)
+        return (f"so G12, G6, G7 e G7b foram verificados (pelos OBJETOS de {sha[:12]}, com os guards de origin/main @ {found[0][1][:12]}, wa-remote-guards.py); "
+                f"os demais guards do pre-push e as suites pytest nao foram verificados")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+        if os.path.exists(scratch):
+            say(f"AVISO: não recolhi a pasta temporária dos guards {scratch}")
+
+
 def submit(city: str, ctx: Ctx, alias: str, sess: str, bid: str, sha: str, src: str, branch: str, script: str) -> int:
     repo, mirror = ctx.repo, ctx.mirror
     work = Path(city) / ".gc" / "gate-done-remote"    # a trava mora na cidade; o worktree, sob o caminho do rig (HQ: a mesma pasta de antes)
@@ -498,6 +532,7 @@ def submit(city: str, ctx: Ctx, alias: str, sess: str, bid: str, sha: str, src: 
         r = run(["git", "-C", repo, "fetch", "-q", "--no-tags", "--no-write-fetch-head", mirror, f"+refs/heads/{src}:{ref}"], timeout=240)
         if r.returncode != 0:
             raise Stop(f"não consegui buscar {src} do espelho (git rc={r.returncode}: {r.stderr.strip()[:160]})")
+        guards_note = wa_guards(ctx, sha, work) if ctx.rig.guards else ""  # depois do fetch (os objetos já estão em `repo`) e ANTES de criar o worktree: reprovou → nada além da ref temporária, que o finally recolhe
         r = run(["git", "-C", repo, "worktree", "add", "-q", "--no-checkout", "-b", branch, wt, sha], timeout=240)
         if r.returncode != 0:
             raise Stop(f"não consegui criar o worktree de {branch} em {sha[:12]} (git rc={r.returncode}: {r.stderr.strip()[:160]})")
@@ -509,8 +544,9 @@ def submit(city: str, ctx: Ctx, alias: str, sess: str, bid: str, sha: str, src: 
                "SELF_AUDIT_SUMMARY": f"submetido pelo atalho remoto (gate-done-remote.py) em nome de {alias}, sessão {sess}, ref {src}, sha {sha[:12]}; auto-auditoria do diff NAO verificada aqui"}
         if not ctx.rig.prepush:  # o aviso vai ao cliente E ao marcador (self_audit:, o que o revisor do gate lê): pular o hook nunca fica calado
             env = hooks_off(env, work)
-            env["SELF_AUDIT_SUMMARY"] += f"; ATENCAO: o pre-push de {ctx.rig.name} NAO rodou no mini (executaria codigo do no antes da revisao): os guards dele nao foram verificados"
-            say(f"AVISO: o pre-push de {ctx.rig.name} NÃO roda no mini (ele executaria scripts da árvore do nó antes da revisão); o marcador registra isso em self_audit")
+            env["SELF_AUDIT_SUMMARY"] += f"; ATENCAO: o pre-push de {ctx.rig.name} NAO rodou no mini (executaria codigo do no antes da revisao): " + (guards_note or "os guards dele nao foram verificados")
+            say(f"AVISO: o pre-push de {ctx.rig.name} NÃO roda no mini (ele executaria scripts da árvore do nó antes da revisão); o marcador registra isso em self_audit"
+                + ("; G12, G6, G7 e G7b passaram pelos objetos do sha, o resto do hook (suítes pytest incluídas) NÃO foi verificado" if guards_note else ""))
         lease_push(repo, wt, env, sess, branch, sha, tmp_refs)  # antes de qualquer escrita no banco: o origin com o fix/ reescrito não derruba o passo 1 do gate-done.md
         SCRIPT_RAN[0] = True
         p = subprocess.run(["bash", "-c", script], cwd=wt, env=env, stdout=subprocess.PIPE, text=True, errors="replace")  # o stderr do script segue direto ao cliente
@@ -615,6 +651,8 @@ def main() -> int:
     print(f"gate-done-remote: alias={alias} sessão={sess} bead={bid} {src}@{sha[:12]} → {branch}", flush=True)
     if os.environ.get("GATE_DONE_REMOTE_DRY_RUN") == "1":
         print(f"ensaio: nada foi escrito (blocos do gate-done.md: {len(script.splitlines())} linhas)", flush=True)
+        if ctx.rig.guards:
+            print(f"ensaio: no envio de verdade G12/G6/G7/G7b de {ctx.rig.name} rodam antes do worktree, pelos objetos de {sha[:12]} (wa-remote-guards.py); o ensaio não os roda", flush=True)
         return 0
     return submit(city, ctx, alias, sess, bid, sha, src, branch, script)
 

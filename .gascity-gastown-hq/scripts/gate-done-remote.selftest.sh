@@ -115,6 +115,7 @@ G -C "$OUTER" checkout -q -b work-tmp && printf 'trabalho do dog remoto\n' > "$C
   && G -C "$OUTER" commit -qm "feat(ga-t1): trabalho do dog remoto" && SHA=$(git -C "$OUTER" rev-parse HEAD) \
   && git -C "$OUTER" push -q "$MIRROR" "HEAD:refs/heads/worker/$SESS" && G -C "$OUTER" checkout -q main && git -C "$OUTER" branch -q -D work-tmp
 cp -p "$EXE_SRC" "$CITY/scripts/gate-done-remote.py"; chmod +x "$CITY/scripts/gate-done-remote.py"
+cp -p "${GUARDS_UNDER_TEST:-$HERE/wa-remote-guards.py}" "$CITY/scripts/wa-remote-guards.py"   # ga-2hd02v.3.11: o atalho chama este irmão (GUARDS_BIN) para o rig WA
 MAINSHA=$(git -C "$OUTER" rev-parse main)
 
 reset_db() {  # estado inicial: ga-t1 atribuída ao alias, com rota de pool
@@ -520,24 +521,24 @@ reset_ps; run_ps GATE_DONE_REMOTE_MIRROR="$T/nao-existe.git" GATE_DONE_REMOTE_DR
 WAORIGIN="$T/wa-origin.git"; WARIG="$T/rigs/whatsapp_automation"; WAMIRROR="$CITY/.gc/hetzner-mirror/repos/whatsapp_automation.git"; WADB="$T/db-wa.json"; WAW="$T/wa-work"
 WASESS="wa-worker-remote-abc123"; WAALIAS="wa-worker-remote-1"; WABR="fix/wa-t1-wa-remoto-teste"; WAHOOKLOG="$T/wa-hook.log"; WASENT="$T/wa-executed"
 git init -q --bare -b main "$WAORIGIN"; git clone -q "$WAORIGIN" "$WAW" 2>/dev/null
-mkdir -p "$WAW/lib" "$WAW/scripts/hooks"; printf 'x = 1\n' > "$WAW/lib/x.py"
+mkdir -p "$WAW/lib" "$WAW/scripts/hooks" "$WAW/launchd"; printf 'x = 1\n' > "$WAW/lib/x.py"
+cp -R "$HERE/wa-remote-guards.fixture/." "$WAW/"; printf '#!/bin/sh\n# ACTION_PREFIX_OK\n' > "$WAW/scripts/notify"   # ga-2hd02v.3.11: G12/G6/G7/G7b de confiança (a mesma interface dos reais) que o wa-remote-guards.py lê de origin/main
 # o hook de verdade (scripts/hooks/pre-push do WA) acha $REPO_ROOT pelo `git rev-parse --show-toplevel` e roda os guards DE LÁ (G6 check_mds_registry_guard.py, G7, G12…): aqui, o menor que mostra a mesma forma
 cat > "$WAW/scripts/hooks/pre-push" <<WAHOOK
 #!/bin/sh
 REPO_ROOT="\$(git rev-parse --show-toplevel)"
 echo "pre-push em \$REPO_ROOT" >> "$WAHOOKLOG"
-python3 "\$REPO_ROOT/scripts/check_mds_registry_guard.py" || { echo "Guard 6 FAILED: scripts/check_mds_registry_guard.py" >&2; exit 1; }
+FIXTURE_TRACE="$WASENT" python3 "\$REPO_ROOT/scripts/check_mds_registry_guard.py" || { echo "Guard 6 FAILED: scripts/check_mds_registry_guard.py" >&2; exit 1; }
 exit 0
 WAHOOK
 chmod +x "$WAW/scripts/hooks/pre-push"
-printf 'open("%s", "a").write("guard rodou: " + __file__ + "\\n")\n' "$WASENT" > "$WAW/scripts/check_mds_registry_guard.py"   # o guard da ÁRVORE: se ele rodar em algum lugar, deixa rastro
 G -C "$WAW" add lib scripts >/dev/null && G -C "$WAW" commit -qm "base" && G -C "$WAW" push -q origin HEAD:main 2>/dev/null
 # o rig como o de verdade: checkout principal (confiável) com core.hooksPath apontando para <rig>/.git/hooks, onde pre-push é um link para scripts/hooks/pre-push do próprio checkout
 git clone -q "$WAORIGIN" "$WARIG" 2>/dev/null; mkdir -p "$WARIG/.git/hooks"; ln -s "$WARIG/scripts/hooks/pre-push" "$WARIG/.git/hooks/pre-push"
 git -C "$WARIG" config core.hooksPath "$WARIG/.git/hooks"
 git clone -q --bare "$WAORIGIN" "$WAMIRROR"; mirror_prod_shape "$WAMIRROR"
 wa_work() {  # wa_work ARQUIVO REF BEAD → NEWSHA: commit (cita a BEAD) em cima de main que também mexe no guard e no hook DA ÁRVORE (o que o nó pode empurrar), empurrado ao espelho do WA em refs/heads/REF
-  G -C "$WAW" checkout -q -b work-tmp main && printf 'v = 1\n' > "$WAW/lib/$1" && printf '# do no\n' >> "$WAW/scripts/check_mds_registry_guard.py" && printf 'echo hostil >> "%s"\n' "$WASENT" >> "$WAW/scripts/hooks/pre-push" \
+  G -C "$WAW" checkout -q -b work-tmp main && printf 'v = 1\n' > "$WAW/lib/$1" && printf 'open("%s", "a").write("guard do no rodou: " + __file__ + "\\n")\n' "$WASENT" >> "$WAW/scripts/check_mds_registry_guard.py" && printf 'echo hostil >> "%s"\n' "$WASENT" >> "$WAW/scripts/hooks/pre-push" \
     && G -C "$WAW" add "lib/$1" scripts >/dev/null && G -C "$WAW" commit -qm "feat($3): $1" && NEWSHA=$(git -C "$WAW" rev-parse HEAD) && git -C "$WAW" push -q -f "$WAMIRROR" "HEAD:refs/heads/$2"
   r=$?; G -C "$WAW" checkout -q main; git -C "$WAW" branch -q -D work-tmp; return $r
 }
@@ -596,6 +597,95 @@ wa_clean; ok $? "WA feliz: worktree, branch local e ref temporária foram recolh
 [ "$(git -C "$WARIG" config core.hooksPath)" = "$WARIG/.git/hooks" ]; ok $? "WA feliz: a config do rig continua apontando para o hook dele (o desligamento vale só dentro da chamada, por ambiente)"
 [ -d "$CITY/.gc/gate-done-remote/no-hooks" ] && [ -z "$(ls -A "$CITY/.gc/gate-done-remote/no-hooks")" ]; ok $? "WA feliz: a pasta sem hooks (da cidade) existe e segue vazia"
 grep -q '^cfg=3$' "$T/git.log" && ! grep -qvE '^cfg=(2|3)$' "$T/git.log"; ok $? "WA feliz: os git dos blocos levam 3 entradas (gc.auto, maintenance.auto e core.hooksPath); nenhum git do exe perde as duas de antes"
+# ── 11b. ga-2hd02v.3.11: no lugar do pre-push o atalho roda G12/G6/G7/G7b pelos OBJETOS do sha (wa-remote-guards.py, código de origin/main do rig) ANTES de qualquer escrita.
+#    Reprovou → rc 1; não deu para saber → rc 2; nos dois, nenhum marcador, nada empurrado, a bead continua do alias. Só rc 0 COM o certificado `RESULT=PASS sha=<este sha>` vale. Aqui o ponta a ponta usa o wa-remote-guards.py DE VERDADE
+#    com os guards de confiança do fixture; os casos de contrato (rc, certificado, timeout) usam um irmão falso que obedece FAKE_GUARDS_MODE.
+GOODGUARDS="$T/wa-remote-guards.real.py"; cp -p "$CITY/scripts/wa-remote-guards.py" "$GOODGUARDS"
+wa_paid_files() {  # daemon AGENDADO cujo script contém o marcador de chamada paga, sem aprovação no registro
+  mkdir -p scripts launchd; printf 'API = "PAID_API"\n' > scripts/paid.py
+  printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>Label</key><string>com.fixture.paid</string><key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>scripts/paid.py</string></array><key>StartInterval</key><integer>3600</integer></dict></plist>\n' > launchd/com.fixture.paid.plist
+}
+wa_work_x() {  # wa_work_x REF BEAD 'edições em $WAW' → NEWSHA: como wa_work, com as edições que o caso pede (o commit cita a BEAD)
+  G -C "$WAW" checkout -q -b work-tmp main && ( cd "$WAW" && eval "$3" ) && G -C "$WAW" add -A >/dev/null && G -C "$WAW" commit -qm "feat($2): caso do guard" && NEWSHA=$(git -C "$WAW" rev-parse HEAD) && git -C "$WAW" push -q -f "$WAMIRROR" "HEAD:refs/heads/$1"
+  r=$?; G -C "$WAW" checkout -q main; git -C "$WAW" branch -q -D work-tmp; return $r
+}
+wa_ref() { git -C "$WAW" push -q -f "$WAMIRROR" "$1:refs/heads/worker/$WASESS"; }   # o ref que a sessão WA empurrou passa a apontar para o sha dado (só um ref worker/<sessão> por vez)
+wa_work_x "worker/$WASESS" wa-t1 'wa_paid_files'; WASHA_PAID=$NEWSHA
+wa_work_x "worker/$WASESS" wa-t1 'wa_paid_files; printf "APPROVED_SCHEDULED_PAID_DAEMONS = {\"com.fixture.approved\": {}, \"com.fixture.paid\": {}}\n" > lib/approved_scheduled_paid_daemons.py'; WASHA_PAID_OK=$NEWSHA
+wa_ref "$WASHA"
+guards_left() { ls "$CITY/.gc/gate-done-remote" 2>/dev/null | grep -q '^guards-'; }
+fake_guards() {  # troca o irmão do exe por um que registra cada chamada em $T/guards.calls e obedece FAKE_GUARDS_MODE
+  cat > "$CITY/scripts/wa-remote-guards.py" <<FG
+#!/usr/bin/env python3
+import os, sys, time
+a = sys.argv[1:]; sha = a[a.index("--sha") + 1]; mode = os.environ.get("FAKE_GUARDS_MODE", "pass"); cert = "wa-remote-guards: RESULT=PASS sha=%s trusted=%s" % (sha, "a" * 40)
+with open("$T/guards.calls", "a") as f: f.write(" ".join(a) + "\n")
+if mode == "pass": print("wa-remote-guards: G12 PASS (fake)"); print(cert)
+elif mode == "other-sha": print(cert.replace(sha, "b" * 40))
+elif mode == "twice": print(cert); print(cert)
+elif mode == "no-cert": print("wa-remote-guards: G12 PASS (fake)")
+elif mode == "rc3-with-cert": print(cert); sys.exit(3)
+elif mode == "blocked-cert-rc0": print("wa-remote-guards: RESULT=BLOCKED sha=%s trusted=%s" % (sha, "a" * 40))
+elif mode == "rc1": print("wa-remote-guards:   BLOQUEADO Label=com.fake"); print("wa-remote-guards: RESULT=BLOCKED sha=%s trusted=%s" % (sha, "a" * 40)); sys.exit(1)
+elif mode == "rc1-other-sha": print("wa-remote-guards: RESULT=BLOCKED sha=%s trusted=%s" % ("c" * 40, "a" * 40)); sys.exit(1)
+elif mode == "rc2": print("wa-remote-guards: RESULT=UNKNOWN sha=%s trusted=?" % sha); sys.exit(2)
+elif mode == "hang": time.sleep(30)
+elif mode == "crash": raise RuntimeError("boom")
+else: sys.exit(99)
+FG
+  chmod +x "$CITY/scripts/wa-remote-guards.py"; : > "$T/guards.calls"
+}
+real_guards() { cp -p "$GOODGUARDS" "$CITY/scripts/wa-remote-guards.py"; }
+fake_case() { fake_guards; reset_wa; run_wa FAKE_GUARDS_MODE="$1"; GR=$RC; real_guards; }   # GR = rc da execução com o irmão falso
+refused2() { [ "$GR" = 2 ] && has "$T/err" "não consegui verificar G12/G6/G7/G7b" && wa_nothing && wa_clean && ! guards_left && wa_no_trace; }
+case_wg_paid() { wa_ref "$WASHA_PAID"; reset_wa; run_wa; GR=$RC; wa_ref "$WASHA"; [ "$GR" = 1 ] && has "$T/err" "BLOQUEADO Label=com.fixture.paid" && has "$T/err" "reprovaram" && wa_nothing && wa_clean && ! guards_left && wa_no_trace \
+  && [ "$(waq '.beads["wa-t1"].assignee')" = "$WAALIAS" ]; }
+case_wg_paid_approved() { wa_ref "$WASHA_PAID_OK"; reset_wa; run_wa; GR=$RC; wa_ref "$WASHA"; [ "$GR" = 0 ] && has "$T/out" "Marker created: ga-mk1" && wa_clean && ! guards_left; }
+case_wg_note() { wa_ref "$WASHA"; reset_wa; run_wa; dbq '.beads["ga-mk1"].description' | grep -qF -- "so G12, G6, G7 e G7b foram verificados (pelos OBJETOS de ${WASHA:0:12}, com os guards de origin/main @" \
+  && dbq '.beads["ga-mk1"].description' | grep -qF -- "os demais guards do pre-push e as suites pytest nao foram verificados" && has "$T/err" "G12 PASS" && has "$T/err" "G7b PASS"; }
+case_wg_unknown_trusted() { reset_wa; E=$(git -C "$WARIG" commit-tree "$(git -C "$WARIG" hash-object -w -t tree /dev/null)" -m vazio 2>/dev/null); git -C "$WARIG" update-ref refs/remotes/origin/main "$E"
+  run_wa; GR=$RC; git -C "$WARIG" update-ref refs/remotes/origin/main "$(git --git-dir="$WAORIGIN" rev-parse main)"; refused2; }
+case_wg_sibling_missing() { rm -f "$CITY/scripts/wa-remote-guards.py"; reset_wa; run_wa; GR=$RC; real_guards; refused2; }
+case_wg_pass() { fake_case pass; [ "$GR" = 0 ] && has "$T/out" "Marker created: ga-mk1" && [ "$(wc -l < "$T/guards.calls" | tr -d ' ')" = 1 ] && grep -qE "^--repo $WARIG --sha $WASHA --scratch $CITY/.gc/gate-done-remote/guards-" "$T/guards.calls" \
+  && dbq '.beads["ga-mk1"].description' | grep -qF -- "origin/main @ aaaaaaaaaaaa" && has "$T/err" "G12 PASS (fake)" && ! guards_left; }
+case_wg_other_sha() { fake_case other-sha; refused2; }
+case_wg_twice() { fake_case twice; refused2; }
+case_wg_nocert() { fake_case no-cert; refused2; }
+case_wg_rc3() { fake_case rc3-with-cert; refused2; }
+case_wg_blocked_cert() { fake_case blocked-cert-rc0; refused2; }
+case_wg_rc2() { fake_case rc2; refused2; }
+case_wg_crash() { fake_case crash; refused2; }
+case_wg_blocked_other_sha() { fake_case rc1-other-sha; refused2; }
+case_wg_rc1() { fake_case rc1; [ "$GR" = 1 ] && has "$T/err" "BLOQUEADO Label=com.fake" && has "$T/err" "reprovaram" && wa_nothing && wa_clean && ! guards_left; }
+case_wg_default_off() { fake_guards; reset_ps; run_ps FAKE_GUARDS_MODE=rc2; GR=$RC; k=0; [ -s "$T/guards.calls" ] && k=1; reset_db; git --git-dir="$ORIGIN" update-ref -d "refs/heads/$BR"; run_exe FAKE_GUARDS_MODE=rc2; [ -s "$T/guards.calls" ] && k=1; HQRC=$RC
+  reset_wa; run_wa GATE_DONE_REMOTE_DRY_RUN=1 FAKE_GUARDS_MODE=rc2; [ -s "$T/guards.calls" ] && k=1; real_guards; [ "$GR" = 0 ] && [ "$HQRC" = 0 ] && [ "$k" = 0 ]; }
+case_wg_hang() { fake_guards; cp -p "$CITY/scripts/gate-done-remote.py" "$T/exe.keep"; python3 -I - "$CITY/scripts/gate-done-remote.py" <<'PYEOF'
+import sys
+p = sys.argv[1]; s = open(p).read(); a = "GUARDS_TIMEOUT = 180"; assert s.count(a) == 1; open(p, "w").write(s.replace(a, "GUARDS_TIMEOUT = 2"))
+PYEOF
+  reset_wa; t0=$SECONDS; run_wa FAKE_GUARDS_MODE=hang; GR=$RC; dt=$((SECONDS - t0)); cp -p "$T/exe.keep" "$CITY/scripts/gate-done-remote.py"; real_guards; refused2 && [ "$dt" -lt 25 ]; }
+wa_ref "$WASHA"
+# o ponta a ponta, com o wa-remote-guards.py DE VERDADE (guards de confiança do fixture) — o "pronto quando" da bead: daemon pago sem aprovação entregue pelo atalho é recusado antes do gate, e nada da árvore do nó roda no mini
+ck_wg() { "case_$1"; ok $? "$2"; }
+ck_wg wg_paid "WA + guards: daemon agendado pago SEM aprovação no sha → recusa 1 com BLOQUEADO Label=…, nenhum marcador, nada no origin, bead continua do alias, nenhum arquivo do nó executado, pasta dos guards recolhida"
+ck_wg wg_paid_approved "WA + guards: o mesmo daemon COM a aprovação no registro do próprio sha (a mudança que o gate revisa) → submetido"
+ck_wg wg_note "WA + guards: o marcador (self_audit:) diz que SÓ G12, G6, G7 e G7b foram verificados, pelos objetos do sha e com o origin/main do rig, e que o resto e as suítes pytest NÃO; o cliente vê os PASS"
+ck_wg wg_unknown_trusted "WA + guards: guards de confiança ilegíveis (origin/main sem eles) → recusa 2 (\"não consegui verificar\"), nada escrito"
+ck_wg wg_sibling_missing "WA + guards: wa-remote-guards.py ausente ao lado do exe → recusa 2, nada escrito (ausência nunca vira passou)"
+# contrato do exe com o irmão (rc, certificado, timeout), com o irmão falso
+ck_wg wg_pass "irmão falso 'pass': 1 chamada com --repo <rig> --sha <sha> --scratch <pasta da cidade>, submetido, a nota leva a confiança (origin/main @ …) e a pasta dos guards é recolhida"
+ck_wg wg_other_sha "irmão falso com certificado de OUTRO sha → recusa 2"
+ck_wg wg_twice "irmão falso com DOIS certificados → recusa 2 (um só vale)"
+ck_wg wg_nocert "irmão falso rc 0 sem a linha RESULT → recusa 2 (rc 0 sozinho não vale)"
+ck_wg wg_rc3 "irmão falso rc 3 mesmo com certificado → recusa 2"
+ck_wg wg_blocked_cert "irmão falso rc 0 com RESULT=BLOCKED → recusa 2"
+ck_wg wg_rc2 "irmão falso rc 2 (não consegui saber) → recusa 2"
+ck_wg wg_crash "irmão falso que estoura (Python sai 1 sem certificado) → recusa 2, NÃO \"reprovou\""
+ck_wg wg_blocked_other_sha "irmão falso rc 1 com RESULT=BLOCKED de OUTRO sha → recusa 2"
+ck_wg wg_rc1 "irmão falso rc 1 (reprovou) → recusa 1, linhas BLOQUEADO no cliente, nada escrito"
+ck_wg wg_hang "irmão falso que pendura → corta no timeout e recusa 2 (não pendura a submissão)"
+ck_wg wg_default_off "HQ, PS e o ensaio do WA NÃO chamam os guards (só o rig com guards=True, na submissão de verdade)"
+wa_ref "$WASHA"
 # forma com argumentos (2ª bead da sessão) vale igual
 wa_work z.py "worker/$WASESS-2" wa-t2; WASHA2=$NEWSHA
 reset_wa; python3 -I - "$WADB" <<'PYEOF'
@@ -905,7 +995,7 @@ case_wa_planted() { reset_wa; mkdir -p "$CITY/.gc/gate-done-remote/no-hooks"; pr
   run_wa; r=$RC; nohooks_clear; [ "$r" = 1 ] && wa_nothing; }
 case_ps_hook_runs() { mkdir -p "$PSRIG/.repo.git/hooks"; printf '#!/bin/sh\necho "ps-hook rodou" >> "%s"\nexit 0\n' "$T/ps-hook.log" > "$PSRIG/.repo.git/hooks/pre-push"; chmod +x "$PSRIG/.repo.git/hooks/pre-push"
   reset_ps; rm -f "$T/ps-hook.log"; run_ps; r=$RC; rm -f "$PSRIG/.repo.git/hooks/pre-push"; [ "$r" = 0 ] && has "$T/ps-hook.log" "ps-hook rodou"; }
-mutant wa-hook-ligado-no-rig-wa      'prepush=False),' '),' case_wa_happy
+mutant wa-hook-ligado-no-rig-wa      'prepush=False, guards=True),' 'guards=True),' case_wa_happy
 mutant wa-hook-ligado-pelo-if        'if not ctx.rig.prepush:' 'if False:' case_wa_happy
 mutant wa-aposentada-checkout-e-hook 'if not ctx.rig.prepush:' 'if False:' case_wa_no_exec '"worktree", "add", "-q", "--no-checkout", "-b"' '"worktree", "add", "-q", "-b"'
 mutant wa-hook-desligado-em-todo-rig 'if not ctx.rig.prepush:' 'if True:' case_ps_hook_runs
@@ -913,6 +1003,20 @@ mutant wa-aviso-calado-no-marcador   'env["SELF_AUDIT_SUMMARY"] += f"' '_ = f"' 
 mutant wa-aviso-calado-no-cliente    'say(f"AVISO: o pre-push de' '(f"AVISO: o pre-push de' case_wa_warn
 mutant wa-pasta-sem-hooks-nao-vazia  'if found:' 'if False:' case_wa_planted
 mutant wa-config-sobrescreve-a-do-main 'n = int(env.get("GIT_CONFIG_COUNT") or "0")' 'n = int(env.get("GIT_CONFIG_COUNT") or "0") * 0' case_wa_cfg
+
+# ga-2hd02v.3.11: os mutantes dos guards do WA (G12/G6/G7/G7b antes do worktree): cada caso devolve 0 quando o comportamento BOM aparece
+mutant wg-guards-nao-chamados          'guards_note = wa_guards(ctx, sha, work) if ctx.rig.guards else ""' 'guards_note = ""' case_wg_paid
+mutant wg-reprovou-vira-nao-sei        'if r.returncode == 1 and len(blocked) == 1 and blocked[0][0] == sha:' 'if False:' case_wg_rc1
+mutant wg-estouro-vira-reprovou        ' and len(blocked) == 1 and blocked[0][0] == sha:' ':' case_wg_crash
+mutant wg-reprovou-de-outro-sha        ' and blocked[0][0] == sha:' ':' case_wg_blocked_other_sha
+mutant wg-rc-do-irmao-ignorado         'if r.returncode != 0 or len(found) != 1 or found[0][0] != sha:' 'if len(found) != 1 or found[0][0] != sha:' case_wg_rc3
+mutant wg-certificado-de-outro-sha     ' or found[0][0] != sha:' ':' case_wg_other_sha
+mutant wg-certificado-duplicado        'r.returncode != 0 or len(found) != 1' 'r.returncode != 0 or len(found) < 1' case_wg_twice
+mutant wg-nota-calada-no-marcador      '(guards_note or "os guards dele nao foram verificados")' '"os guards dele nao foram verificados"' case_wg_note
+mutant wg-pasta-dos-guards-sobra       'shutil.rmtree(scratch, ignore_errors=True)' 'pass' case_wg_paid
+mutant wg-guards-em-todo-rig           'guards: bool = False' 'guards: bool = True' case_wg_default_off
+mutant wg-aprovacao-so-no-codigo-velho 'GUARDS_PASS_RE = re.compile(r"^wa-remote-guards: RESULT=PASS sha=([0-9a-f]{40}) trusted=([0-9a-f]{40})\s*$", re.M)' 'GUARDS_PASS_RE = re.compile(r"^wa-remote-guards: RESULT=(?:PASS|BLOCKED) sha=([0-9a-f]{40}) trusted=([0-9a-f]{40})\s*$", re.M)' case_wg_blocked_cert
+wa_ref "$WASHA"
 
 # ── 8b. mutantes da ga-2hd02v.3.13 (qual ref sai, prova da bead, lease): cada caso monta o SEU estado (c12_start limpa o espelho, o origin e o main) ──────────────────────────
 c12_start() { wipe12 "$B1" "$B2" "$B3" "$B5"; git --git-dir="$ORIGIN" update-ref -d refs/heads/intruso12 2>/dev/null; return 0; }
