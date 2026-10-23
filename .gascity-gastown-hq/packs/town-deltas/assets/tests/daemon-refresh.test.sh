@@ -4271,6 +4271,279 @@ field_is_empty LSTART_EPOCHS "$OUT" \
   && ok "T130 ...and is named in LSTART_UNPINNED (cannot be tied to the runtime checkout)" \
   || nok "T130 LSTART_UNPINNED" "got [$(field LSTART_UNPINNED "$OUT")] out=[$OUT]"
 
+# ════════════════════════════════════════════════════════════════════════════
+# T131-T139 (ga-lksmar): `python -m pkg.mod` entrypoints.
+#
+# The WA discador-cockpit's plist runs /bin/bash <wrapper>.sh; the wrapper does
+# `cd "$BASEDIR/lib"` and then `exec …/python3 -m predictive_dialer.screen_pop_web`.
+# Step 2 only followed `.py` tokens inside a wrapper, so the cockpit resolved to NO
+# entrypoint and no diff could ever mark it AFFECTED (wa-8uld04.5.1, 23/10: the
+# post-merge check listed map-viewer and not the cockpit, which kept serving the old
+# code until it was restarted by hand). T131 is that shape; T132-T139 pin the edges:
+# a comment is not a launch, the cd target / WorkingDirectory / root bases, the
+# package form, the direct plist `-m` branch (which used to hand resolve_relpath a bare
+# relative path and so never resolved anything), and — the other half of the bead —
+# that whatever still cannot be resolved is REPORTED (UNRESOLVED_ENTRYPOINTS= and a
+# "NÃO RESOLVIDO" stderr line), never dropped without a word.
+# ════════════════════════════════════════════════════════════════════════════
+
+# make_plist_wd <dir> <label> <WorkingDirectory> <prog-arg>...: like make_plist, plus a
+# WorkingDirectory key (make_plist writes none; the `-m` cases depend on it).
+make_plist_wd() {
+  local dir="$1" label="$2" wd="$3"; shift 3
+  local args="" a
+  for a in "$@"; do args="$args      <string>$a</string>
+"; done
+  cat > "$dir/$label.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key>
+  <array>
+$args  </array>
+  <key>WorkingDirectory</key><string>$wd</string>
+</dict>
+</plist>
+EOF
+}
+
+# t131_in <label> <list>: is <label> a whole word of the space-separated <list>?
+t131_in() { case " $2 " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+# T131: the cockpit shape. The module lives under lib/ and the wrapper cd's there; the
+# module file itself changes → the cockpit is AFFECTED, restarted and verified fresh.
+new_case t131
+mkdir -p "$RUNTIME/lib/predictive_dialer"
+cat > "$RUNTIME/lib/predictive_dialer/screen_pop_web.py" <<<'print("cockpit")'
+cat > "$RUNTIME/launchd/cockpit-wrapper.sh" <<EOF
+#!/bin/bash
+set -e
+BASEDIR="$RUNTIME"
+cd "\$BASEDIR/lib"     # so \`python -m predictive_dialer.screen_pop_web\` resolves
+export PYTHONPATH="\$BASEDIR"
+exec "\$BASEDIR/venv/bin/python3" -m predictive_dialer.screen_pop_web \\
+    --port 5599 --host 127.0.0.1
+EOF
+make_plist_wd "$AGENTS" com.test.cockpit "$RUNTIME" /bin/bash "$RUNTIME/launchd/cockpit-wrapper.sh"
+seed_running com.test.cockpit 31001 "$STALE_LSTART"
+seed_restart com.test.cockpit 31099 "$FRESH_LSTART"
+OUT=$(run_helper lib/predictive_dialer/screen_pop_web.py); RC=$?
+t131_in com.test.cockpit "$(field AFFECTED "$OUT")" \
+  && ok "T131 a daemon launched as \`python -m\` from a wrapper that cd's into lib/ is AFFECTED when its module changes" \
+  || nok "T131 affected" "AFFECTED=[$(field AFFECTED "$OUT")] out=[$OUT]"
+t131_in com.test.cockpit "$(field RESTARTED "$OUT")" \
+  && ok "T131 ...and is restarted" || nok "T131 restarted" "RESTARTED=[$(field RESTARTED "$OUT")]"
+[ "$(field PROOF "$OUT")" = "verified" ] && ok "T131 PROOF=verified" || nok "T131 proof" "got '$(field PROOF "$OUT")'"
+field_is_empty UNRESOLVED_ENTRYPOINTS "$OUT" \
+  && ok "T131 a resolved \`-m\` launch is NOT reported unresolved (the line is present and empty)" \
+  || nok "T131 UNRESOLVED_ENTRYPOINTS" "got [$(field UNRESOLVED_ENTRYPOINTS "$OUT")] out=[$OUT]"
+
+# T132: a COMMENT that mentions `python -m <module>` is documentation, not a launch. The
+# real wrapper has exactly that on its `cd` line. The decoy module exists, so if the
+# comment counted it would be an entrypoint and its change would flag the daemon.
+t132_fixture() {
+  mkdir -p "$RUNTIME/lib/predictive_dialer"
+  cat > "$RUNTIME/lib/predictive_dialer/real_app.py" <<<'print("real")'
+  cat > "$RUNTIME/lib/predictive_dialer/decoy.py" <<<'print("decoy")'
+  cat > "$RUNTIME/launchd/doc-wrapper.sh" <<EOF
+#!/bin/bash
+# This wrapper used to run \`python -m predictive_dialer.decoy\` before the move.
+BASEDIR="$RUNTIME"
+cd "\$BASEDIR/lib"     # \`python -m predictive_dialer.decoy\` would also resolve from here
+exec "\$BASEDIR/venv/bin/python3" -m predictive_dialer.real_app
+EOF
+  make_plist_wd "$AGENTS" com.test.docwrap "$RUNTIME" /bin/bash "$RUNTIME/launchd/doc-wrapper.sh"
+  seed_running com.test.docwrap 32001 "$STALE_LSTART"
+  seed_restart com.test.docwrap 32099 "$FRESH_LSTART"
+}
+new_case t132
+t132_fixture
+OUT=$(run_helper lib/predictive_dialer/decoy.py); RC=$?
+! t131_in com.test.docwrap "$(field AFFECTED "$OUT")" \
+  && ok "T132 a module named only in a wrapper COMMENT is not an entrypoint (the decoy's change flags nothing)" \
+  || nok "T132 comment counted as a launch" "AFFECTED=[$(field AFFECTED "$OUT")]"
+new_case t132b
+t132_fixture
+OUT=$(run_helper lib/predictive_dialer/real_app.py); RC=$?
+t131_in com.test.docwrap "$(field AFFECTED "$OUT")" \
+  && ok "T132 ...while the module on the real exec line IS the entrypoint (its change flags the daemon)" \
+  || nok "T132 real module not resolved" "AFFECTED=[$(field AFFECTED "$OUT")] out=[$OUT]"
+
+# T133: no `cd` in the wrapper — the plist's WorkingDirectory (here lib/) is the base python
+# would use, so the module resolves through it. The same module name also exists at the
+# runtime root: the more specific base (WorkingDirectory) must win over the root.
+t133_fixture() {
+  mkdir -p "$RUNTIME/lib/predictive_dialer"
+  cat > "$RUNTIME/lib/predictive_dialer/app.py" <<<'print("lib app")'
+  cat > "$RUNTIME/launchd/wd-wrapper.sh" <<'EOF'
+#!/bin/bash
+exec /usr/bin/env python3 -m predictive_dialer.app
+EOF
+  make_plist_wd "$AGENTS" com.test.wdbase "$RUNTIME/lib" /bin/bash "$RUNTIME/launchd/wd-wrapper.sh"
+  seed_running com.test.wdbase 33001 "$STALE_LSTART"
+  seed_restart com.test.wdbase 33099 "$FRESH_LSTART"
+}
+new_case t133
+t133_fixture
+mkdir -p "$RUNTIME/predictive_dialer"
+cat > "$RUNTIME/predictive_dialer/app.py" <<<'print("root app")'
+OUTE=$(run_helper_stderr lib/predictive_dialer/app.py)
+echo "$OUTE" | grep -q "python -m predictive_dialer.app (wrapper launchd/wd-wrapper.sh) resolved to lib/predictive_dialer/app.py" \
+  && ok "T133 WorkingDirectory (lib/) beats the runtime root when both hold the module" \
+  || nok "T133 wrong base won" "out=[$(echo "$OUTE" | grep 'python -m')]"
+new_case t133b
+t133_fixture
+OUT=$(run_helper lib/predictive_dialer/app.py); RC=$?
+t131_in com.test.wdbase "$(field AFFECTED "$OUT")" \
+  && ok "T133 a wrapper with no cd resolves its module through the plist's WorkingDirectory" \
+  || nok "T133 WorkingDirectory base" "AFFECTED=[$(field AFFECTED "$OUT")] out=[$OUT]"
+
+# T134: package form (`-m pkg` runs pkg/__main__.py) from the runtime-root base.
+new_case t134
+mkdir -p "$RUNTIME/svcpkg"
+cat > "$RUNTIME/svcpkg/__main__.py" <<<'print("svc")'
+cat > "$RUNTIME/launchd/pkg-wrapper.sh" <<'EOF'
+#!/bin/bash
+exec /usr/bin/env python3 -m svcpkg --serve
+EOF
+make_plist_wd "$AGENTS" com.test.svcpkg "$RUNTIME" /bin/bash "$RUNTIME/launchd/pkg-wrapper.sh"
+seed_running com.test.svcpkg 34001 "$STALE_LSTART"
+seed_restart com.test.svcpkg 34099 "$FRESH_LSTART"
+OUT=$(run_helper svcpkg/__main__.py); RC=$?
+t131_in com.test.svcpkg "$(field AFFECTED "$OUT")" \
+  && ok "T134 \`-m pkg\` resolves to pkg/__main__.py from the runtime root" \
+  || nok "T134 package form" "AFFECTED=[$(field AFFECTED "$OUT")] out=[$OUT]"
+
+# T135: the DIRECT plist `-m` branch. It used to pass resolve_relpath() a bare relative
+# path, which that function only accepts absolute or $VAR-prefixed, so it never resolved.
+new_case t135
+mkdir -p "$RUNTIME/lib/predictive_dialer"
+cat > "$RUNTIME/lib/predictive_dialer/direct.py" <<<'print("direct")'
+make_plist_wd "$AGENTS" com.test.direct "$RUNTIME/lib" "$RUNTIME/venv/bin/python3" -m predictive_dialer.direct --port 1
+seed_running com.test.direct 35001 "$STALE_LSTART"
+seed_restart com.test.direct 35099 "$FRESH_LSTART"
+OUT=$(run_helper lib/predictive_dialer/direct.py); RC=$?
+t131_in com.test.direct "$(field AFFECTED "$OUT")" \
+  && ok "T135 a plist that carries \`-m pkg.mod\` itself resolves it through its WorkingDirectory" \
+  || nok "T135 direct plist -m" "AFFECTED=[$(field AFFECTED "$OUT")] out=[$OUT]"
+
+# T136: UNRESOLVED is reported, not dropped. `-m flask` is a third-party module (no file
+# under the runtime); the plist's WorkingDirectory IS under the runtime so the label is
+# still registered (ga-fzfqsu), but it can never be AFFECTED by a diff — it must be named
+# in UNRESOLVED_ENTRYPOINTS and in a "NÃO RESOLVIDO" stderr line.
+new_case t136
+mkdir -p "$RUNTIME/dashboard"
+cat > "$RUNTIME/dashboard/app.py" <<<'print("dash")'
+cat > "$RUNTIME/launchd/flask-wrapper.sh" <<'EOF'
+#!/bin/bash
+exec /usr/bin/env python3 -m flask run --port 7842
+EOF
+make_plist_wd "$AGENTS" com.test.flaskdash "$RUNTIME" /bin/bash "$RUNTIME/launchd/flask-wrapper.sh"
+seed_running com.test.flaskdash 36001 "$STALE_LSTART"
+OUT=$(run_helper dashboard/app.py); RC=$?
+[ "$(field UNRESOLVED_ENTRYPOINTS "$OUT")" = "com.test.flaskdash" ] \
+  && ok "T136 an unresolvable \`-m flask\` launch is named in UNRESOLVED_ENTRYPOINTS" \
+  || nok "T136 UNRESOLVED_ENTRYPOINTS" "got [$(field UNRESOLVED_ENTRYPOINTS "$OUT")] out=[$OUT]"
+! t131_in com.test.flaskdash "$(field AFFECTED "$OUT")" \
+  && ok "T136 ...and the report did not invent an AFFECTED for it" \
+  || nok "T136 invented AFFECTED" "AFFECTED=[$(field AFFECTED "$OUT")]"
+OUTE=$(run_helper_stderr dashboard/app.py)
+echo "$OUTE" | grep -q "com.test.flaskdash: NÃO RESOLVIDO" \
+  && ok "T136 stderr carries a per-label \"NÃO RESOLVIDO\" line" \
+  || nok "T136 stderr line" "out=[$OUTE]"
+echo "$OUTE" | grep -q "python -m flask named by the launch matches no file" \
+  && ok "T136 ...that names the module it could not resolve" \
+  || nok "T136 module named" "out=[$OUTE]"
+
+# T137: only part of the launch resolves. The wrapper names a real .py AND a -m module that
+# matches nothing: the daemon is checked on the part that resolved, and the part that did
+# not is reported — not silently ignored just because something else did resolve.
+new_case t137
+mkdir -p "$RUNTIME/daemons"
+cat > "$RUNTIME/daemons/mixed.py" <<<'print("mixed")'
+cat > "$RUNTIME/launchd/mixed-wrapper.sh" <<EOF
+#!/bin/bash
+"$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/mixed.py" &
+exec /usr/bin/env python3 -m not_in_this_repo.worker
+EOF
+make_plist_wd "$AGENTS" com.test.mixed "$RUNTIME" /bin/bash "$RUNTIME/launchd/mixed-wrapper.sh"
+seed_running com.test.mixed 37001 "$STALE_LSTART"
+seed_restart com.test.mixed 37099 "$FRESH_LSTART"
+OUT=$(run_helper daemons/mixed.py); RC=$?
+t131_in com.test.mixed "$(field AFFECTED "$OUT")" \
+  && ok "T137 the part of the launch that resolved (daemons/mixed.py) still flags the daemon" \
+  || nok "T137 resolved part lost" "AFFECTED=[$(field AFFECTED "$OUT")] out=[$OUT]"
+[ "$(field UNRESOLVED_ENTRYPOINTS "$OUT")" = "com.test.mixed" ] \
+  && ok "T137 ...and the unresolved \`-m\` is reported anyway" \
+  || nok "T137 unresolved part not reported" "got [$(field UNRESOLVED_ENTRYPOINTS "$OUT")]"
+
+# T138: no noise. (a) a plist that is NOT this rig's (WorkingDirectory outside the runtime,
+# no wrapper in it) with an unresolvable `-m` is nobody's business here; (b) a `-m` that
+# comes AFTER the script belongs to the script (daemon.py -m 5), not to python.
+new_case t138
+mkdir -p "$RUNTIME/daemons" "$CASE_DIR/elsewhere"
+cat > "$RUNTIME/daemons/scripted.py" <<<'print("scripted")'
+make_plist_wd "$AGENTS" com.test.otherrig "$CASE_DIR/elsewhere" /usr/bin/env python3 -m some.other.rig.app
+make_plist_wd "$AGENTS" com.test.scripted "$RUNTIME" "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/scripted.py" -m 5
+seed_running com.test.scripted 38001 "$STALE_LSTART"
+seed_restart com.test.scripted 38099 "$FRESH_LSTART"
+OUT=$(run_helper daemons/scripted.py); RC=$?
+field_is_empty UNRESOLVED_ENTRYPOINTS "$OUT" \
+  && ok "T138 another rig's \`-m\` and a script-owned \`-m 5\` raise no NÃO RESOLVIDO (the line is present and empty)" \
+  || nok "T138 noise" "got [$(field UNRESOLVED_ENTRYPOINTS "$OUT")] out=[$OUT]"
+t131_in com.test.scripted "$(field AFFECTED "$OUT")" \
+  && ok "T138 ...and the script's own .py still flags it as before" \
+  || nok "T138 regression" "AFFECTED=[$(field AFFECTED "$OUT")]"
+
+# T139: a wrapper that lives in this runtime but whose launch resolves to nothing, with a
+# WorkingDirectory OUTSIDE the runtime. Behaviour is unchanged (it is not registered as a
+# rig daemon: not in ALL_LABELS), but it is no longer dropped in silence.
+new_case t139
+mkdir -p "$CASE_DIR/elsewhere"
+cat > "$RUNTIME/launchd/orphan-wrapper.sh" <<'EOF'
+#!/bin/bash
+exec /usr/bin/env python3 -m not_in_this_repo.worker
+EOF
+make_plist_wd "$AGENTS" com.test.orphanwrap "$CASE_DIR/elsewhere" /bin/bash "$RUNTIME/launchd/orphan-wrapper.sh"
+seed_running com.test.orphanwrap 39001 "$STALE_LSTART"
+mkdir -p "$RUNTIME/daemons"
+cat > "$RUNTIME/daemons/unrelated.py" <<<'print("unrelated")'
+OUT=$(run_helper daemons/unrelated.py); RC=$?
+[ "$(field UNRESOLVED_ENTRYPOINTS "$OUT")" = "com.test.orphanwrap" ] \
+  && ok "T139 a runtime wrapper whose launch resolves to nothing is named in UNRESOLVED_ENTRYPOINTS" \
+  || nok "T139 UNRESOLVED_ENTRYPOINTS" "got [$(field UNRESOLVED_ENTRYPOINTS "$OUT")] out=[$OUT]"
+! t131_in com.test.orphanwrap "$(field ALL_LABELS "$OUT")" \
+  && ok "T139 ...and it is still NOT registered as a rig daemon (behaviour unchanged)" \
+  || nok "T139 registered" "ALL_LABELS=[$(field ALL_LABELS "$OUT")]"
+
+# T140: NÃO RESOLVIDO is for a label that is RUNNING. Same unresolvable `-m flask` launch as
+# T136, but the job is not running (a scheduled job between runs): it loads current code at
+# its next start, so nothing about it can be stale. It must not be listed (on the WA rig the
+# unfiltered list was 59 labels, 52 of them not running, and buried the real ones), and the
+# log line this branch always had must stay as it was — no "NÃO RESOLVIDO" wording.
+new_case t140
+mkdir -p "$RUNTIME/dashboard"
+cat > "$RUNTIME/dashboard/app.py" <<<'print("dash")'
+cat > "$RUNTIME/launchd/flask-wrapper.sh" <<'WRAP'
+#!/bin/bash
+exec /usr/bin/env python3 -m flask run --port 7842
+WRAP
+make_plist_wd "$AGENTS" com.test.flaskjob "$RUNTIME" /bin/bash "$RUNTIME/launchd/flask-wrapper.sh"
+seed_loaded com.test.flaskjob
+OUT=$(run_helper dashboard/app.py); RC=$?
+field_is_empty UNRESOLVED_ENTRYPOINTS "$OUT" \
+  && ok "T140 a loaded-but-not-running job with an unresolvable \`-m\` is NOT listed (the line is present and empty)" \
+  || nok "T140 listed a non-running label" "got [$(field UNRESOLVED_ENTRYPOINTS "$OUT")] out=[$OUT]"
+OUTE=$(run_helper_stderr dashboard/app.py)
+echo "$OUTE" | grep -q "com.test.flaskjob: no .py/.sh/-m entrypoint resolved, but WorkingDirectory" \
+  && ok "T140 ...and it keeps the pre-existing log line" \
+  || nok "T140 old log line lost" "out=[$(echo "$OUTE" | grep flaskjob)]"
+! echo "$OUTE" | grep -q "com.test.flaskjob: NÃO RESOLVIDO" \
+  && ok "T140 ...with no NÃO RESOLVIDO line for it" \
+  || nok "T140 NÃO RESOLVIDO said for a non-running label" "out=[$(echo "$OUTE" | grep flaskjob)]"
+
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "daemon-refresh tests: $PASS passed, $FAIL failed"

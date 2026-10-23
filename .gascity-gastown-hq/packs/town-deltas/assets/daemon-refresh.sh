@@ -725,6 +725,51 @@
 #      (pinned but no live pid / ps or date unreadable). Nothing is ever written as 0 or
 #      as "fresh": absent means "não sei".
 #
+#  25. (ga-lksmar) `python -m pkg.mod` launches. Step 2 used to learn a daemon's
+#      entrypoint only from a `.py` token — in the plist's ProgramArguments, or in
+#      a wrapper .sh the plist runs. The WA discador-cockpit is neither: its
+#      wrapper does `cd "$BASEDIR/lib"` and then `exec …/python3 -m
+#      predictive_dialer.screen_pop_web`. It resolved to NO entrypoint, was
+#      registered (ga-fzfqsu) with an empty entry set, and so no diff could ever
+#      mark it AFFECTED: wa-8uld04.5.1 changed lib/fila_ligacoes.py, which the
+#      cockpit executes (route /ligacoes), and the post-merge check listed
+#      map-viewer alone — the cockpit kept running the old code until someone
+#      restarted it by hand ("merged" is not "live").
+#      Now: resolve_dash_m() ties a `-m` module to a file by trying, in order, the
+#      dirs the wrapper `cd`s into (the last one first), the plist's
+#      WorkingDirectory and the runtime root, each as <mod>.py then
+#      <mod>/__main__.py. It reads the wrapper's text only (cd targets and
+#      `python… -m <module>` on one line, comments stripped) — it never runs or
+#      sources it. Also fixed: the direct plist `-m` branch passed a bare
+#      relative path to resolve_relpath(), which only accepts absolute or
+#      $VAR-prefixed tokens, so that branch never resolved anything. MEASURED on
+#      the WA rig (DRY_RUN, 23/10): 8 labels that were registered with no
+#      entrypoint now resolve (the cockpit, discador-metrics, 4 email-companion-*,
+#      2 cpf-status-monitor*); a change to
+#      lib/predictive_dialer/screen_pop_web.py went from AFFECTED=<empty> ("touches
+#      no live daemon") to AFFECTED=com.whatsapp.discador-cockpit.
+#      What it does NOT do:
+#        - follow a launch shaped `"$PY" -m mod`, a `-m` on one line and its module
+#          on the next, a computed `cd`, or PYTHONPATH entries other than the
+#          runtime root. Those are not guessed.
+#        - reach further than Step 3 already does. Resolving the entrypoint is
+#          necessary, not sufficient, for the exact wa-8uld04.5.1 case: the cockpit
+#          reaches lib/fila_ligacoes.py through lib/predictive_dialer/
+#          fila_ligacoes_web.py (two hops, the first not under routes/), which the
+#          one-hop-plus-routes rule of point 11 does not follow — the same dry-run on
+#          that commit still says "touches no live daemon". That half belongs to the
+#          deploy_deps.json closure generator (wa-8tgg8s, WA repo).
+#      Not silent any more: when a launch leaves a RUNNING label with no entrypoint
+#      at all, or names a `-m` module that matches no file, stderr gets a "NÃO
+#      RESOLVIDO" line per label and stdout gets UNRESOLVED_ENTRYPOINTS=. A label
+#      with no live process is not listed (it loads current code at its next start;
+#      measured on the WA rig: 52 of the 59 unresolved labels were not running, so
+#      the list is 7 instead of 59). A launch
+#      that merely HAS a missed `-m` next to a `.py` that did resolve is not seen at
+#      all, so it is not reported. A third-party module (`-m flask`) is correctly
+#      unresolved and reported too: "which file does flask run" is exactly what
+#      this script cannot tell.
+#
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
 #
@@ -858,6 +903,15 @@
 #     always present, even empty — launchd-loaded vs. not, for any plist
 #     that failed to parse; see header point 10. Informational only, never
 #     feeds VERDICT.)
+#   UNRESOLVED_ENTRYPOINTS=<labels>   (ga-lksmar, header point 25: always
+#     present, even empty. Labels whose launch named a `python -m <module>` (in
+#     the plist or in the wrapper .sh it runs) that matches no file under
+#     $RUNTIME_DIR, or that ended with no entrypoint at all — and that have a LIVE
+#     process (a scheduled job between runs loads current code at its next start, so
+#     nothing about it can be stale). For these, not being in AFFECTED means "could
+#     not (fully) check", never "checked clean". Annotation only —
+#     VERDICT and every other list are unchanged by it. The same labels get a
+#     "NÃO RESOLVIDO" line on stderr.)
 #   REASON=<text>   PROOF=verified|not_applicable|asset_served_per_request|not_verified
 # Exit 0 when VERDICT is OK/SKIPPED (or DRY_RUN=1); non-zero otherwise.
 #
@@ -1533,6 +1587,11 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   # see daemon_is_loaded()/the discovery-loop split above for what feeds it.
   echo "PARSE_ERROR_LOADED=${PARSE_ERROR_LOADED:-}"
   echo "PARSE_ERROR_UNLOADED=${PARSE_ERROR_UNLOADED:-}"
+  # ga-lksmar: always present, even empty (and empty on every early-precondition
+  # emit, before discovery ran — nothing to report). Labels whose launch named a
+  # `-m` module / entrypoint this run could not tie to a file under the runtime.
+  # Annotation only: VERDICT and the other lists never change because of it.
+  echo "UNRESOLVED_ENTRYPOINTS=${UNRESOLVED_ENTRYPOINTS:-}"
   echo "REASON=$reason"
   echo "PROOF=$proof"
   # ga-agracx: a Step 1b plist gap this bead's own merge did NOT introduce —
@@ -2200,6 +2259,133 @@ working_directory_under_runtime() {  # working_directory_under_runtime <dir>
   return 1
 }
 
+# ── `python -m <module>` entrypoints (ga-lksmar) ──────────────────────────────
+# A daemon started as `python -m pkg.mod` names no .py anywhere in argv. The
+# plist may carry the -m itself, or (the WA cockpit's case) hand off to a
+# wrapper .sh that does `cd "$BASEDIR/lib"` and then `exec python3 -m
+# predictive_dialer.screen_pop_web`. Before this, the wrapper-follow only grepped
+# `*.py` tokens, so the cockpit resolved to NO entrypoint, was registered with an
+# empty entry set and could never be AFFECTED: a merge that changed the code it
+# serves was neither restarted nor listed (wa-8uld04.5.1, 23/10).
+#
+# Everything below answers "which file under RUNTIME_DIR does this module name?"
+# and nothing more — it never evaluates the wrapper (no `source`, no `eval`): the
+# wrapper's text is only read for `cd <dir>` and `python... -m <module>` tokens.
+
+# resolve_reldir <token>: a directory token (absolute under a runtime root, or
+# $VAR/-prefixed like resolve_relpath, or a bare $VAR) → the directory relative to
+# RUNTIME_DIR ("." for the root). A leading $VAR (bare or followed by /sub) is ASSUMED
+# to be the wrapper's base directory — which variable it is cannot be told without
+# evaluating the wrapper, and resolve_relpath() makes the same assumption for file
+# tokens. The assumption can only add a base that is then tried for the module file;
+# it never makes a module resolve unless that file exists there. Nothing printed + rc 1
+# when it cannot be tied to an existing directory under the runtime (a `..`
+# component never counts — it would leave the checkout).
+resolve_reldir() {  # resolve_reldir <token>
+  local t="$1" c root
+  case "$t" in
+    "$RUNTIME_DIR") echo "."; return 0 ;;
+    "$RUNTIME_DIR"/*) c="${t#"$RUNTIME_DIR"/}" ;;
+    *)
+      c=""
+      for root in $EXTRA_RUNTIME_ROOTS; do
+        case "$t" in
+          "$root") c="."; break ;;
+          "$root"/*) c="${t#"$root"/}"; break ;;
+        esac
+      done
+      if [ -z "$c" ]; then
+        if printf '%s' "$t" | grep -qE '^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/?$'; then
+          c="."
+        else
+          c="$(printf '%s' "$t" | sed -E 's#^.*\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/##')"
+          [ "$c" != "$t" ] || c=""
+        fi
+      fi
+      ;;
+  esac
+  c="${c%/}"
+  [ -n "$c" ] || return 1
+  case "/$c/" in */../*) return 1 ;; esac
+  [ -d "$RUNTIME_DIR/$c" ] || return 1
+  echo "$c"
+}
+
+# wrapper_cd_dirs <wrapper file>: the runtime-relative directories the wrapper
+# `cd`s into, in file order, one per line. A `cd` whose target is not a plain
+# token under the runtime (`cd "$(dirname "$0")"`, `cd -`, a computed path) is
+# skipped — the caller then falls back to the plist's WorkingDirectory and the
+# runtime root, and a module none of those explain is reported NÃO RESOLVIDO.
+# Comment text is stripped first so `# cd somewhere` documentation never counts.
+wrapper_cd_dirs() {  # wrapper_cd_dirs <file>
+  local tok
+  sed -E 's/^[[:space:]]*#.*$//; s/[[:space:]]#.*$//' "$1" 2>/dev/null \
+    | grep -oE '(^|[;&|[:space:]])cd[[:space:]]+"?[^"[:space:];&|]+' \
+    | sed -E 's/^.*cd[[:space:]]+"?//' \
+    | while IFS= read -r tok; do resolve_reldir "$tok" || true; done
+}
+
+# wrapper_dash_m_modules <wrapper file>: the dotted module names of every
+# `python… -m <module>` in the wrapper, one per line. Only a line that names a
+# python interpreter counts, so a `-m` on a line with no python in it (grep -m 1,
+# ssh -m hmac-…) is not taken for a module. A launch the shape does not cover
+# (`"$PY" -m mod`, -m and the module on different lines) yields nothing: if nothing
+# else in the launch resolves either, the daemon is reported NÃO RESOLVIDO; if
+# something else does (a .py token), the missed `-m` is NOT seen, so no report.
+wrapper_dash_m_modules() {  # wrapper_dash_m_modules <file>
+  sed -E 's/^[[:space:]]*#.*$//; s/[[:space:]]#.*$//' "$1" 2>/dev/null \
+    | grep -E 'python[0-9.]*([^A-Za-z0-9_]|$)' \
+    | grep -oE '(^|[[:space:]])-m[[:space:]]+[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*' \
+    | sed -E 's/^.*-m[[:space:]]+//'
+}
+
+# resolve_dash_m <module> <plist> [<wrapper relpath>]: the runtime-relative file a
+# `-m <module>` runs, or nothing + rc 1. Python puts the process's cwd on
+# sys.path, so the bases are tried in the order a running shell would see them:
+# the directories the wrapper `cd`s into (the LAST cd first), then the plist's
+# WorkingDirectory, then the runtime root. For each base, <mod>.py and then the
+# package form <mod>/__main__.py. First hit wins; no hit is "unresolved", never
+# a guess (a third-party module such as `flask` is correctly unresolved).
+resolve_dash_m() {  # resolve_dash_m <module> <plist> [<wrapper relpath>]
+  local mod="$1" plist="$2" wrel="${3:-}" mpath bases="" wd wdrel base pfx cand
+  mpath="$(printf '%s' "$mod" | tr '.' '/')"
+  if [ -n "$wrel" ]; then
+    # reverse file order (awk: `tail -r` is BSD-only) so the last cd wins
+    bases="$(wrapper_cd_dirs "$RUNTIME_DIR/$wrel" | awk '{ a[NR] = $0 } END { for (i = NR; i >= 1; i--) print a[i] }')"
+  fi
+  wd="$(plist_working_directory "$plist")"
+  wdrel=""
+  [ -n "$wd" ] && wdrel="$(resolve_reldir "$wd" || true)"
+  [ -n "$wdrel" ] && bases="$bases
+$wdrel"
+  bases="$bases
+."
+  while IFS= read -r base; do
+    [ -n "$base" ] || continue
+    if [ "$base" = "." ]; then pfx=""; else pfx="$base/"; fi
+    for cand in "${pfx}${mpath}.py" "${pfx}${mpath}/__main__.py"; do
+      [ -f "$RUNTIME_DIR/$cand" ] && { echo "$cand"; return 0; }
+    done
+  done <<< "$bases"
+  return 1
+}
+
+# note_unresolved <label> <why>: say "NÃO RESOLVIDO" for a label whose launch this run
+# could not tie to a file, and list it in UNRESOLVED_ENTRYPOINTS — but ONLY when the
+# label has a live process. Only a running process can be serving stale code that
+# nobody can check; a scheduled job between runs loads current code at its next
+# start, so listing it would bury the cockpit-type signal (measured on the WA rig,
+# 23/10: 59 unresolved labels, nearly all of them calendar jobs). rc 0 = reported,
+# rc 1 = not running, nothing said (the caller keeps whatever it logged before this
+# bead). `launchctl list` printing no PID, or failing, is "not running" here — the
+# same reading daemon_pid() has everywhere else in this script.
+note_unresolved() {  # note_unresolved <label> <why>
+  [ -n "$(daemon_pid "$1")" ] || return 1
+  log "$1: NÃO RESOLVIDO — $2"
+  UNRESOLVED_ENTRYPOINTS="$UNRESOLVED_ENTRYPOINTS $1"
+  return 0
+}
+
 # label -> space-separated entrypoint relpaths (parallel arrays via temp files)
 DISCO_DIR="$(mktemp -d "${TMPDIR:-/tmp}/daemon-disco.XXXXXX")"
 trap 'rm -rf "$DISCO_DIR"' EXIT
@@ -2213,12 +2399,19 @@ PARSE_ERROR_LABELS=""
 # ("of what it couldn't read, was any of it actually live?").
 PARSE_ERROR_LOADED=""
 PARSE_ERROR_UNLOADED=""
+# ga-lksmar: labels whose launch named a `-m <module>` we could not tie to a file
+# under the runtime, or that ended with no entrypoint at all. Reported (stderr
+# "NÃO RESOLVIDO" line + UNRESOLVED_ENTRYPOINTS=), never silently dropped.
+UNRESOLVED_ENTRYPOINTS=""
 
 shopt -s nullglob
 for plist in "$LAUNCH_AGENTS_DIR"/*.plist; do
   label="$(basename "$plist" .plist)"
   entry=""
   prev_arg=""
+  unres_mods=""      # ga-lksmar: `-m` modules named by this launch that resolved to no file
+  wrapper_rel=""     # ga-lksmar: the wrapper .sh (runtime-relative) this plist hands off to
+  seen_script=""     # ga-lksmar: set once a .py/.sh arg is seen — a later `-m` belongs to that script, not to python
   args_out="$(plist_args "$plist")"; rc=$?
   if [ "$rc" -ne 0 ]; then
     PARSE_ERROR_LABELS="$PARSE_ERROR_LABELS $label"
@@ -2241,17 +2434,33 @@ for plist in "$LAUNCH_AGENTS_DIR"/*.plist; do
     [ -n "$arg" ] || continue
     case "$arg" in
       *.py)
+        seen_script=1
         rel="$(resolve_relpath "$arg" || true)"
         [ -n "$rel" ] && entry="$entry $rel"
         ;;
       *.sh)
+        seen_script=1
         # wrapper under runtime → follow to the .py it execs
         wrel="$(resolve_relpath "$arg" || true)"
         if [ -n "$wrel" ]; then
+          wrapper_rel="$wrel"
           while IFS= read -r tok; do
             prel="$(resolve_relpath "$tok" || true)"
             [ -n "$prel" ] && entry="$entry $prel"
           done < <(grep -oE '[^"[:space:]]+\.py' "$RUNTIME_DIR/$wrel" 2>/dev/null || true)
+          # ga-lksmar: the wrapper may exec `python -m pkg.mod` instead of a .py
+          # path (the WA cockpit does). Resolve the module against the dirs the
+          # wrapper cd's into, then the plist's WorkingDirectory, then the root.
+          while IFS= read -r mod; do
+            [ -n "$mod" ] || continue
+            mrel="$(resolve_dash_m "$mod" "$plist" "$wrel" || true)"
+            if [ -n "$mrel" ]; then
+              entry="$entry $mrel"
+              log "$label: python -m $mod (wrapper $wrel) resolved to $mrel"
+            else
+              unres_mods="$unres_mods $mod"
+            fi
+          done < <(wrapper_dash_m_modules "$RUNTIME_DIR/$wrel")
         fi
         ;;
     esac
@@ -2263,9 +2472,19 @@ for plist in "$LAUNCH_AGENTS_DIR"/*.plist; do
     # gunicorn` — a globally-installed package, lexbh's real case) fails to
     # resolve here exactly like any other unmatched token, falling through to
     # the WorkingDirectory fallback below.
-    if [ "$prev_arg" = "-m" ]; then
-      mrel="$(resolve_relpath "$(echo "$arg" | tr '.' '/').py" || true)"
-      [ -n "$mrel" ] && entry="$entry $mrel"
+    # ga-lksmar: this used to hand resolve_relpath() a BARE relative path
+    # (pkg/mod.py), which that function only accepts when absolute-under-runtime
+    # or $VAR-prefixed — so a real in-repo `-m` module never resolved here. It now
+    # goes through resolve_dash_m (plist WorkingDirectory, then the runtime root),
+    # and one that still does not resolve is remembered for the NÃO RESOLVIDO line.
+    if [ "$prev_arg" = "-m" ] && [ -z "$seen_script" ]; then
+      mrel="$(resolve_dash_m "$arg" "$plist" || true)"
+      if [ -n "$mrel" ]; then
+        entry="$entry $mrel"
+        log "$label: python -m $arg resolved to $mrel"
+      else
+        unres_mods="$unres_mods $arg"
+      fi
     fi
     prev_arg="$arg"
   done <<< "$args_out"
@@ -2283,10 +2502,28 @@ for plist in "$LAUNCH_AGENTS_DIR"/*.plist; do
     # instead of vanishing from discovery entirely.
     wd="$(plist_working_directory "$plist")"
     if working_directory_under_runtime "$wd"; then
-      log "$label: no .py/.sh/-m entrypoint resolved, but WorkingDirectory ($wd) is under this rig's runtime — registering as a rig daemon with no known entrypoint (reachable via FORCE_RESTART_LABELS / daemon_restarts, not ad-hoc scanning)."
+      # ga-lksmar: with no entrypoint, a diff can never mark this label AFFECTED (only
+      # FORCE_RESTART_LABELS can), so a reader must be able to tell "checked, nothing
+      # changed" from "could not be checked". For a RUNNING label that is said as
+      # NÃO RESOLVIDO and listed in UNRESOLVED_ENTRYPOINTS (see note_unresolved);
+      # any other label keeps the log line this branch always had, unchanged.
+      note_unresolved "$label" "no .py/.sh/-m entrypoint resolved${unres_mods:+ (python -m$unres_mods named by the launch matches no file under the runtime)}, but WorkingDirectory ($wd) is under this rig's runtime — registering as a rig daemon with no known entrypoint (reachable via FORCE_RESTART_LABELS / daemon_restarts, not ad-hoc scanning)." \
+        || log "$label: no .py/.sh/-m entrypoint resolved, but WorkingDirectory ($wd) is under this rig's runtime — registering as a rig daemon with no known entrypoint (reachable via FORCE_RESTART_LABELS / daemon_restarts, not ad-hoc scanning)."
+    elif [ -n "$wrapper_rel" ]; then
+      # ga-lksmar: the plist hands off to a wrapper that lives in this rig's runtime
+      # but nothing it launches resolved, and the plist's own WorkingDirectory is
+      # elsewhere. It is still not registered (unchanged behaviour: an unresolvable
+      # plist is not a rig daemon), but while its process is running it is no longer
+      # dropped without a word.
+      note_unresolved "$label" "wrapper $wrapper_rel is under this rig's runtime but names no entrypoint that resolves to a file${unres_mods:+ (python -m$unres_mods matches no file under the runtime)}; WorkingDirectory ${wd:-<none>} is outside the runtime, so the label is NOT registered as a rig daemon and no diff can mark it AFFECTED." || true
+      continue
     else
       continue
     fi
+  elif [ -n "$unres_mods" ]; then
+    # ga-lksmar: part of the launch resolved but a `-m` module did not — the diff
+    # check below only sees the part that did.
+    note_unresolved "$label" "python -m$unres_mods named by the launch matches no file under the runtime (entrypoint(s) that did resolve:$entry)." || true
   fi
   echo "$entry" > "$DISCO_DIR/$label"
   DAEMON_LABELS="$DAEMON_LABELS $label"
@@ -2299,6 +2536,11 @@ shopt -u nullglob
 # never reaches a caller doing an exact-match comparison on a single label.
 PARSE_ERROR_LOADED="$(echo "$PARSE_ERROR_LOADED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
 PARSE_ERROR_UNLOADED="$(echo "$PARSE_ERROR_UNLOADED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+UNRESOLVED_ENTRYPOINTS="$(echo "$UNRESOLVED_ENTRYPOINTS" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+
+if [ -n "${UNRESOLVED_ENTRYPOINTS// /}" ]; then
+  log "NÃO RESOLVIDO: $(echo "$UNRESOLVED_ENTRYPOINTS" | wc -w | tr -d ' ') daemon launch(es) whose entrypoint could not be (fully) tied to a file under the runtime — for these, \"not affected\" means \"could not check\", not \"checked clean\":$UNRESOLVED_ENTRYPOINTS"
+fi
 
 if [ -n "${PARSE_ERROR_LOADED// /}" ]; then
   log "ERROR: $(echo "$PARSE_ERROR_LOADED" | wc -w | tr -d ' ') LOADED daemon plist(s) could not be parsed — real discovery coverage gap:$PARSE_ERROR_LOADED"
