@@ -108,6 +108,17 @@ PILOT_DISPATCHABLE_FILE = os.environ.get(
 PILOT_SWEEP_PAUSE_STATE_FILE = os.environ.get(
     "PILOT_SWEEP_PAUSE_STATE_FILE",
     os.path.join(os.environ.get("HOME", os.path.expanduser("~")), ".gc/pilot-sweep-pause-state.json"))
+# GATE_FOCUS_LIB / GATE_FOCUS_STATE_FILE (ga-pfnfr5): the gate focus mode (ga-kqa08j) is decided
+# by ONE owner, gate-focus-mode.sh, which writes GATE_FOCUS_STATE_FILE; the READ side (what
+# counts as fresh, what counts as unknown) lives in gate-focus-lib.sh and is called, not
+# re-implemented, so there is no second copy of that rule to drift from the Pilot's. Same env
+# names as the lib and the Pilot use, so an override means the same thing in each process
+# (it still has to be set in each: the environment is per process).
+GATE_FOCUS_LIB = os.environ.get(
+    "GATE_FOCUS_LIB",
+    os.path.join(CITY, "packs/town-deltas/assets/scripts/gate-focus-lib.sh"))
+GATE_FOCUS_STATE_FILE = os.environ.get(
+    "GATE_FOCUS_STATE_FILE", os.path.join(CITY, ".gc/gate-focus.state"))
 # QPOS_ABSENT/QPOS_UNREADABLE (ga-tky97 GATE-FEEDBACK fix): a bead's queue
 # position can fail to resolve to an int for two causally different reasons —
 # the dispatch queue snapshot itself was unreadable this cycle (unmeasured),
@@ -483,6 +494,8 @@ _pilot_dispatchable_reason_file = None  # () -> "absent"|"malformed"|"stale"|Non
                                           # _read_pilot_dispatchable_file seam above)
 _read_pilot_sweep_pause_state_file = None  # () -> dict|None; parsed+freshness-checked
                                              # pilot-sweep-pause-state.json (ga-nq0jo test seam)
+_read_gate_focus_file = None  # () -> {"active": bool, "depth": str}|None; the gate focus mode
+                                # as _read_gate_focus() would answer it (ga-pfnfr5 test seam)
 
 
 # ── guarded subprocess ────────────────────────────────────────────────────────
@@ -2416,7 +2429,7 @@ def _alarm_record(state, bead_id):
 
 
 def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_throughput=None,
-                     dispatchable=None, cap_evidence=None):
+                     dispatchable=None, cap_evidence=None, gate_focus=None):
     """Fire a starve alarm for a buildable bead that has not been dispatched.
 
     This is case 3 of the core guarantee: the bead matched NONE of this
@@ -2454,6 +2467,12 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
     line a reader cannot tell "checked, not the cap" from "could not check" —
     the two states the old alarm silently collapsed together with the third
     (cap-contained).
+
+    gate_focus (ga-pfnfr5): the once-per-cycle _read_gate_focus() answer (None = NÃO
+    MEDIDO; the default for a caller that did not measure it). A bead the focus mode
+    is MEASURED to hold never gets here — _process_store() consulted
+    _gate_focus_suppress_reason() first — so this only renders which state applies, via
+    _gate_focus_body_line().
     """
     bead_id = bead.get("id") or bead.get("issue_id") or ""
     if not bead_id:
@@ -2531,6 +2550,7 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
     # signals the reconciler simply didn't know). Say what was actually
     # checked, and hedge honestly that the list can itself go stale again.
     gate_line = _gate_queue_body_line(gate_depth, gate_throughput, age_min)
+    focus_line = _gate_focus_body_line(gate_focus, _get_labels(bead))
 
     # ga-tky97 AC4: a repeat alarm should say what changed since the last one
     # (position improved/worsened/unchanged), not just repeat the same claim —
@@ -2613,11 +2633,13 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
         "%s\n"
         "%s\n"
         "%s\n"
+        "%s\n"
         "%s\n\n"
         "This bead matched NONE of this reconciler's known non-buildable signals\n"
         "(blocked-on:*, waiting-on:*, depends-on:*, next-action:*, pool:refused:*,\n"
         "gate:{needs-fix,failed,queued,reviewing,needs-human}, exec:manual, ctx:thin,\n"
-        "pilot:held(-until:*), pilot:reclaim-count:N). It should have been\n"
+        "pilot:held(-until:*), pilot:reclaim-count:N, gate focus mode ON for a non-fix\n"
+        "bead). It should have been\n"
         "dispatched within %dmin.\n\n"
         "INVESTIGAR:\n"
         "1. tail -40 .gc/logs/pilot-dispatcher.log — o Pilot está varrendo?\n"
@@ -2629,7 +2651,7 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
         "   _extra_alarm_suppress_reason() em scripts/approved-state-reconciler.py antes\n"
         "   de re-despachar manualmente ou adicionar story:approved de volta.\n"
     ) % (bead_id, title, int(age_min), alarm_ordinal, gate_line, queue_line, pause_line,
-         cap_line, STARVE_MIN, rig_root, bead_id)
+         focus_line, cap_line, STARVE_MIN, rig_root, bead_id)
 
     notify_msg = ("STARVE ALARM%s: bead %s story:approved há %dmin, pilot alive, "
                   "não despachado — dispatch path failing" % (
@@ -3442,6 +3464,99 @@ def _pilot_sweep_pause_suppress_reason(sweep_pause_state):
             at, reason, (": " + detail) if detail else ""))
 
 
+# ── gate focus mode (ga-pfnfr5) ───────────────────────────────────────────────
+# While the gate is the bottleneck (gate-focus-mode.sh, ga-kqa08j: ON when the gate queue is deep,
+# OFF when it has drained — the thresholds are that script's, and have already been retuned once)
+# the Pilot hands a session ONLY to a bead of the fix class — a decision by Athos (07/10), not a
+# failure. This reconciler did not know the mode existed, so a new build held
+# back by it looked like "buildable bead starving — dispatch failing" (ga-9t9acg.11 1737 min and
+# 1908 min on 07/10, wa-xmr1fw.2.2 154 min on 13/10: the same false alarm three times).
+#
+# The label set below is the predicate of the focus clause in _filter_candidates
+# (pilot-dispatcher.sh) and of the `focus_fix` field of its dispatchable emit — keep the three
+# in sync. A bead that carries one of them is NOT held by the mode, so a starve on it is real.
+GATE_FOCUS_FIX_LABELS = (park_labels.GATE_NEEDS_FIX_LABEL, "origem:auto-healer-notify",
+                         "impacto:dano-ao-vivo")
+GATE_FOCUS_FIX_PREFIX = "gate:fix-attempt:"
+
+
+def _is_gate_focus_fix(labels):
+    """True if `labels` (a frozenset from _get_labels) put the bead in the focus mode's fix class."""
+    return any(l in GATE_FOCUS_FIX_LABELS or l.startswith(GATE_FOCUS_FIX_PREFIX) for l in labels)
+
+
+def _read_gate_focus(now):
+    """The gate focus mode as {"active": bool, "depth": str}, or None when it cannot be told.
+
+    Asks gate-focus-lib.sh (gate_focus_active) instead of parsing gate-focus.state here: what
+    counts as fresh (GATE_FOCUS_STALE_S) and as unknown lives in ONE place, the one the Pilot
+    reads too. `now` goes to the lib as GATE_FOCUS_NOW so staleness is judged against this
+    cycle's clock, like every other reader in this file.
+
+    Three answers, never two (root-class:error-vs-empty): ON, OFF, and None = NÃO MEDIDO. None
+    covers everything that is not a clean 0/1 from the lib — state file missing, corrupt or
+    stale (the lib says "unknown"), lib missing or not sourceable, bash failing or timing out,
+    output that is not 0/1. Callers must read None as "cannot confirm the mode is on", never as
+    OFF-confirmed and never as ON: it neither licenses a suppression nor is reported as a fact.
+    """
+    if _read_gate_focus_file is not None:
+        return _read_gate_focus_file()   # test seam
+    script = ('export GATE_FOCUS_NOW="$2" GATE_FOCUS_STATE_FILE="$3"; '
+              '. "$1" || exit 97; gate_focus_active; printf " "; gate_focus_depth')
+    # vazio → n/a (a missing state file is "unknown" for the lib, not an empty answer);
+    # falhou/ilegível → None (NÃO MEDIDO: no suppression, the alarm says it did not know)
+    r = _sh(["bash", "-c", script, "gate-focus", GATE_FOCUS_LIB, str(int(now)),
+             GATE_FOCUS_STATE_FILE], timeout=10)
+    if r is None or r.returncode != 0:
+        return None
+    parts = (r.stdout or "").split()
+    if not parts or parts[0] not in ("0", "1"):
+        return None
+    depth = parts[1] if len(parts) > 1 and parts[1].isdigit() else ""
+    return {"active": parts[0] == "1", "depth": depth}
+
+
+def _gate_focus_suppress_reason(gate_focus, labels):
+    """Suppress reason when the gate focus mode is MEASURED ON and the bead is not of the fix
+    class — its wait is the mode doing what Athos asked, not a dispatch failure — else None.
+
+    None (do NOT suppress; fall through to the other checks and possibly the alarm) when:
+      - gate_focus is None (NÃO MEDIDO: an unmeasured mode must never license a suppression);
+      - the mode is measured OFF (it explains nothing);
+      - the bead is of the fix class (the mode lets it through, so a starve on it is real).
+    The 24 h "focus has lasted too long" escalation is gate-focus-mode.sh's own; repeating it
+    here per bead would be the same alarm N times.
+    """
+    if gate_focus is None or gate_focus.get("active") is not True:
+        return None
+    if _is_gate_focus_fix(labels):
+        return None
+    return ("modo foco do gate LIGADO (fila=%s) — build NOVA pausada por decisão (ga-kqa08j), só "
+            "conserto despacha; este bead não é da classe conserto, então a espera é "
+            "intencional, não falha de despacho" % (gate_focus.get("depth") or "?"))
+
+
+def _gate_focus_body_line(gate_focus, labels):
+    """The alarm-body line for the gate focus mode: which of its three states this alarm is in.
+    By the time an alarm fires the mode did not explain the wait — either it is OFF, it let this
+    bead through, or nobody could tell; the line says which, so the reader does not have to
+    guess whether the mode was ruled out (the "NÃO MEDIDO" wording matches cap_line's)."""
+    if gate_focus is None:
+        return ("Modo foco do gate: NÃO MEDIDO — gate-focus.state ausente, ilegível ou velho "
+                "(ou a lib não respondeu); o Pilot lê isso como DESLIGADO, mas se o modo estiver "
+                "ligado de fato esta espera pode ser a pausa por decisão (só conserto despacha).")
+    if gate_focus.get("active") is True:
+        depth = gate_focus.get("depth") or "?"
+        if _is_gate_focus_fix(labels):
+            return ("Modo foco do gate: LIGADO (fila=%s), mas este bead é da classe conserto — o "
+                    "modo não o segura, então não explica a espera." % depth)
+        # _process_store suppresses this case before it gets here; a direct caller can still
+        # reach it, and then the honest sentence is the opposite of the one above.
+        return ("Modo foco do gate: LIGADO (fila=%s) e este bead NÃO é da classe conserto — o "
+                "modo o segura, esta espera é provavelmente a pausa por decisão." % depth)
+    return "Modo foco do gate: DESLIGADO (medido) — não explica a espera."
+
+
 def _pilot_queue_position(bead_id, dispatchable):
     """Return (index, total, ahead_by_priority) for bead_id within an already-
     read `dispatchable` dict (see _read_pilot_dispatchable), or None if
@@ -3881,7 +3996,8 @@ def _branch_stranded_reason(bead_id):
 # ── process one store ─────────────────────────────────────────────────────────
 def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
                     gate_depth=None, gate_throughput=None, dispatchable=None,
-                    sweep_pause_state=None, cap_evidence=None, pause_agg=None):
+                    sweep_pause_state=None, cap_evidence=None, pause_agg=None,
+                    gate_focus=None):
     """Scan story:approved open beads in rig_root; classify and act on each one.
 
     built_ids: set of bead ids with a live BUILT marker (from _gate_marker_source_beads(),
@@ -3919,6 +4035,10 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
     in common is folded into it instead of getting its own "dispatch failing" mail — and is NOT
     counted in `alarmed`, same as a capacity wait. None (a direct call) → this function makes
     its own and flushes it before returning, so the feature never depends on the caller opting in.
+
+    gate_focus (ga-pfnfr5): the gate focus mode from _read_gate_focus(), read ONCE per cycle in
+    run_cycle() — {"active", "depth"}, or None = NÃO MEDIDO (also what a direct call that does not
+    pass it gets). Measured ON suppresses the alarm of a bead outside the fix class; None never does.
 
     Returns (processed, routed, alarmed) int counts.
     On query error: logs + returns (0, 0, 0) — fail-open; other stores are unaffected.
@@ -4334,6 +4454,20 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
                  bead_id, starve_age_min, sweep_pause_reason))
             continue
 
+        # GATE FOCUS MODE (ga-pfnfr5): a whole-sweep pause for everything that is not a fix,
+        # decided by Athos (07/10) while the gate queue is the bottleneck. The Pilot never hands
+        # such a bead a session, so its wait is the mode working — three false "dispatch
+        # failing" mails on 07/10-13/10 (ga-9t9acg.11 twice, wa-xmr1fw.2.2) before this. Same
+        # family and place as the sweep pause above: cheap, no per-bead lookup beyond labels.
+        # Checked AFTER built/blocked/branch-stranded, so those more specific findings still
+        # win; a fix-class bead or an unmeasured mode is not suppressed here and goes on to the
+        # checks below (and, if none explains the wait, to the alarm, whose body names the mode).
+        focus_reason = _gate_focus_suppress_reason(gate_focus, labels)
+        if focus_reason is not None:
+            _log("  %s: no signal, daemon-age=%.0fmin, %s — no alarm" % (
+                 bead_id, starve_age_min, focus_reason))
+            continue
+
         # PILOT DISPATCH-QUEUE POSITION (ga-tky97): the Pilot's own fully-
         # filtered, dispatch-ordered candidate queue (pilot-dispatchable.json)
         # is a more direct, per-bead signal than any label or backlog estimate
@@ -4400,7 +4534,7 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
 
         # ALARM: buildable bead starving, pilot alive, pool has capacity, dispatch failing.
         _alarm_starving(rig_root, bead, starve_age_min, now, state, gate_depth, gate_throughput,
-                         dispatchable, cap_evidence)
+                         dispatchable, cap_evidence, gate_focus)
         alarmed += 1
 
     if own_pause_agg:
@@ -4521,6 +4655,19 @@ def run_cycle(now, state):
              if getattr(cap_evidence, "walked_all", False) else
              "UNMEASURED (%s)" % (getattr(cap_evidence, "why", "") or _CapEvidence.why)))
 
+    # Gate focus mode (ga-pfnfr5): also city-wide, read once per cycle. None = NÃO MEDIDO (state
+    # file missing/corrupt/stale or the lib did not answer); _gate_focus_suppress_reason() reads
+    # that as "cannot confirm the mode is on" — it never suppresses — and the alarm body says so.
+    gate_focus = _read_gate_focus(now)
+    if gate_focus is None:
+        _log("  gate focus mode NÃO MEDIDO (gate-focus.state missing/corrupt/stale, or "
+             "gate-focus-lib.sh did not answer) — a new build held back by the mode is not "
+             "recognised this cycle, the alarm keeps firing and says so (see ga-pfnfr5)")
+    else:
+        _log("  gate focus mode: %s%s" % (
+             "ON" if gate_focus.get("active") else "OFF",
+             " (gate queue=%s)" % gate_focus.get("depth") if gate_focus.get("depth") else ""))
+
     total_p = total_r = total_a = 0
     pause_agg = _PauseAggregator(now)   # ga-5bzrzu: one per cycle, shared by every rig
 
@@ -4544,7 +4691,7 @@ def run_cycle(now, state):
             p, r, a = _process_store(rig_root, now, state, pilot_alive, built_ids,
                                       blocked_ids, gate_depth, gate_throughput,
                                       dispatchable, sweep_pause_state, cap_evidence,
-                                      pause_agg)
+                                      pause_agg, gate_focus)
             total_p += p
             total_r += r
             total_a += a
@@ -4866,6 +5013,13 @@ def _selftest():
                 16:37/16:52/17:07 sweeps, verbatim — wa-c8s2w stays explained
                 across the dispatching sweep, ONE note naming the pool's newest
                 cap although the kept lines mix caps 4 and 2
+      (ga-pfnfr5-a..h) gate focus mode: a new build held back by the mode (ON, outside the fix class)
+                is not "dispatch failing" — a: the repro, log names the mode; b: fix-class beads
+                still alarm, mixed cycle; c: OFF does not suppress; d: NOT MEASURED does not
+                suppress and the body says NÃO MEDIDO; e: a caller that did not measure it; f: the
+                predicate and its near-misses; g: drift guard against the Pilot's own label set;
+                h: the REAL reader through the real lib (ON/OFF/stale/future/corrupt/missing/
+                lib missing/garbage)
       (ga-5bzrzu-a..l) one note per COMMON CAUSE for the "Pilot pausado" starving
                 mails — a: replay of the 11/10 flood (12 beads x 3 rigs → 1 note,
                 count + 5 oldest, no push/ledger/flow-authority); b: a bead whose OWN
@@ -4881,6 +5035,7 @@ def _selftest():
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers, _sh
     global _bd_blocked, _bd_show_full, _bd_has_built_branch, _bd_branch_stranded
     global _read_pilot_dispatchable_file, _read_pilot_sweep_pause_state_file
+    global _read_gate_focus_file
     global _pilot_dispatchable_reason_file
     global _arc_ledger, _write_flow_authority
     global DRY_RUN, STARVE_MIN, FLOW_GRACE_MIN, ROUTE_COOLDOWN_SEC, ALARM_COOLDOWN_SEC
@@ -5060,6 +5215,11 @@ def _selftest():
     # so it always reads as fresh. None → "cannot confirm pause state" → never suppresses, the
     # same alarm-preserving default as the dispatchable read above.
     _read_pilot_sweep_pause_state_file = lambda: None
+    # Same hermetic default for the gate focus mode (ga-pfnfr5): unstubbed, _read_gate_focus()
+    # runs the real gate-focus-lib.sh against the LIVE .gc/gate-focus.state, so whether the
+    # city's gate queue happened to be deep would decide the outcome of unrelated scenarios.
+    # None (NÃO MEDIDO) never suppresses — the same alarm-preserving default as the two reads above.
+    _read_gate_focus_file = lambda: None
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _make_bead(bid, labels=None, title="Test story", assignee="",
@@ -9482,6 +9642,205 @@ def _selftest():
             "'4/20', body names the disk")
     else:
         _bad("(ga-oa0fe1-f)", "window=%r text=%r mails=%r" % (_oa_f_win, _oa_f_text, _oa_f))
+
+    # ── ga-pfnfr5: gate focus mode ───────────────────────────────────────────────
+    # While the gate focus mode (ga-kqa08j) is ON the Pilot dispatches only fixes, so a new build
+    # waiting behind it is the mode working, not a dispatch failure. 07/10-13/10: three false
+    # "buildable bead starving — dispatch failing" mails (ga-9t9acg.11 x2, wa-xmr1fw.2.2).
+    import contextlib
+    import io
+    import tempfile
+
+    def _run_logged(st):
+        """One run_cycle(NOW, st), returning what it logged (the reason must be named, not just silent)."""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            run_cycle(NOW, st)
+        return buf.getvalue()
+
+    _FOCUS_ON = {"active": True, "depth": "16"}
+    _FNEW = ["story:approved", "ctx:ready", "exec:auto"]   # a new build: no fix label
+
+    print("\nScenario (ga-pfnfr5-a): THE REPRO — focus mode measured ON (gate queue 16), a new build "
+          "(no fix label) starving past STARVE_MIN → NO alarm, and the log names the mode as the reason")
+    _read_gate_focus_file = lambda: dict(_FOCUS_ON)
+    _read_pilot_dispatchable_file = lambda: None
+    _bd_approved = lambda root: [_make_bead("ga-pfnfr5a", labels=list(_FNEW), age_min=_STARVE + 5.0)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st = _reset()
+    st["first_seen_approved"]["ga-pfnfr5a"] = NOW - (_STARVE + 5) * 60
+    _pf_out = _run_logged(st)
+    if (not mail_calls and not notify_calls
+            and any("ga-pfnfr5a" in l and "modo foco do gate LIGADO (fila=16)" in l and "no alarm" in l
+                    for l in _pf_out.splitlines())):
+        _ok("(ga-pfnfr5-a): focus ON + non-fix bead → no mail, no notify; the log line names 'modo foco do gate LIGADO (fila=16)'")
+    else:
+        _bad("(ga-pfnfr5-a)", "mail_calls=%s notify_calls=%s log=%r" % (
+             mail_calls, notify_calls, [l for l in _pf_out.splitlines() if "ga-pfnfr5a" in l]))
+
+    print("\nScenario (ga-pfnfr5-b): focus ON, ONE cycle with a new build AND three fix-class beads → only "
+          "the fix-class ones alarm (the mode does not hold them, so their starve is real), and their body "
+          "says the mode is ON but does not explain the wait")
+    _read_gate_focus_file = lambda: dict(_FOCUS_ON)
+    _pf_fix = {"ga-pfnfr5b1": "gate:fix-attempt:2", "ga-pfnfr5b2": "origem:auto-healer-notify",
+               "ga-pfnfr5b3": "impacto:dano-ao-vivo"}
+    _bd_approved = lambda root: [_make_bead("ga-pfnfr5b0", labels=list(_FNEW), age_min=_STARVE + 5.0)] + [
+        _make_bead(b, labels=["story:approved", "ctx:ready", "exec:auto", lab], age_min=_STARVE + 5.0)
+        for b, lab in _pf_fix.items()]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st = _reset()
+    for _b in ["ga-pfnfr5b0"] + list(_pf_fix):
+        st["first_seen_approved"][_b] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)
+    _pf_mailed = sorted(b for b in ["ga-pfnfr5b0"] + list(_pf_fix)
+                        if any(b in s and "dispatch failing" in s for s, _ in mail_calls))
+    _pf_bodies_ok = all("Modo foco do gate: LIGADO (fila=16), mas este bead é da classe conserto" in body
+                        for s, body in mail_calls if "dispatch failing" in s)
+    if _pf_mailed == sorted(_pf_fix) and _pf_bodies_ok:
+        _ok("(ga-pfnfr5-b): the three fix-class beads alarm, the new build does not; each body says "
+            "'LIGADO (fila=16), mas este bead é da classe conserto'")
+    else:
+        _bad("(ga-pfnfr5-b)", "mailed=%s bodies_ok=%s subjects=%s" % (
+             _pf_mailed, _pf_bodies_ok, [s for s, _ in mail_calls]))
+
+    print("\nScenario (ga-pfnfr5-c): falsification — focus mode measured OFF → the same new build STILL "
+          "alarms (the fix must not become a blanket mute), and the body says OFF was MEASURED")
+    _read_gate_focus_file = lambda: {"active": False, "depth": "4"}
+    _bd_approved = lambda root: [_make_bead("ga-pfnfr5c", labels=list(_FNEW), age_min=_STARVE + 5.0)]
+    st = _reset()
+    st["first_seen_approved"]["ga-pfnfr5c"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)
+    _pf_c = [b for s, b in mail_calls if "ga-pfnfr5c" in s and "dispatch failing" in s]
+    if len(_pf_c) == 1 and "Modo foco do gate: DESLIGADO (medido)" in _pf_c[0]:
+        _ok("(ga-pfnfr5-c): focus OFF does not suppress; body says 'DESLIGADO (medido)'")
+    else:
+        _bad("(ga-pfnfr5-c)", "SAFETY VIOLATION or wrong body — mails=%s" % (_pf_c,))
+
+    print("\nScenario (ga-pfnfr5-d): falsification (root-class:error-vs-empty) — focus mode NOT MEASURED "
+          "(seam returns None) → the new build STILL alarms, and the body says NÃO MEDIDO — 'could not "
+          "tell' is neither 'off' nor 'on'")
+    _read_gate_focus_file = lambda: None
+    _bd_approved = lambda root: [_make_bead("ga-pfnfr5d", labels=list(_FNEW), age_min=_STARVE + 5.0)]
+    st = _reset()
+    st["first_seen_approved"]["ga-pfnfr5d"] = NOW - (_STARVE + 5) * 60
+    _pf_out = _run_logged(st)
+    _pf_d = [b for s, b in mail_calls if "ga-pfnfr5d" in s and "dispatch failing" in s]
+    if (len(_pf_d) == 1 and "Modo foco do gate: NÃO MEDIDO" in _pf_d[0]
+            and "Modo foco do gate: DESLIGADO" not in _pf_d[0]
+            and "gate focus mode NÃO MEDIDO" in _pf_out):
+        _ok("(ga-pfnfr5-d): unmeasured mode does NOT suppress; body 'NÃO MEDIDO' (not 'DESLIGADO'); cycle log says so too")
+    else:
+        _bad("(ga-pfnfr5-d)", "SAFETY VIOLATION — an UNMEASURED focus mode silenced or mislabelled a "
+             "starving bead (root-class:error-vs-empty); mails=%s" % (_pf_d,))
+
+    print("\nScenario (ga-pfnfr5-e): a direct _process_store() call that never heard of the focus mode "
+          "(gate_focus not passed) keeps the old behaviour — alarm, body NÃO MEDIDO")
+    _read_gate_focus_file = lambda: dict(_FOCUS_ON)    # would suppress IF run_cycle had passed it down
+    _bd_approved = lambda root: [_make_bead("ga-pfnfr5e", labels=list(_FNEW), age_min=_STARVE + 5.0)]
+    st = _reset()
+    st["first_seen_approved"]["ga-pfnfr5e"] = NOW - (_STARVE + 5) * 60
+    _process_store(RIG_ROOTS[0].strip(), NOW, st, True, set(), set())
+    _pf_e = [b for s, b in mail_calls if "ga-pfnfr5e" in s and "dispatch failing" in s]
+    if len(_pf_e) == 1 and "Modo foco do gate: NÃO MEDIDO" in _pf_e[0]:
+        _ok("(ga-pfnfr5-e): a caller that did not measure the mode gets no suppression and an honest NÃO MEDIDO")
+    else:
+        _bad("(ga-pfnfr5-e)", "mails=%s" % (_pf_e,))
+
+    print("\nScenario (ga-pfnfr5-f): the fix-class predicate — each label of the class, the prefix, and the "
+          "near-misses that must NOT count")
+    _pf_yes = [["gate:needs-fix"], ["gate:fix-attempt:1"], ["gate:fix-attempt:3", "x"],
+               ["origem:auto-healer-notify"], ["impacto:dano-ao-vivo"]]
+    _pf_no = [[], ["story:approved"], ["gate:fix-attempt"], ["gate:fix-attemptX"], ["gate:failed"],
+              ["impacto:dano-ao-vivo-x"], ["origem:auto-healer"], ["gate:needs-fix-x"]]
+    _pf_yes_bad = [l for l in _pf_yes if not _is_gate_focus_fix(frozenset(l))]
+    _pf_no_bad = [l for l in _pf_no if _is_gate_focus_fix(frozenset(l))]
+    _pf_unit = (_gate_focus_suppress_reason(None, frozenset(_FNEW)),
+                _gate_focus_suppress_reason({"active": False, "depth": "4"}, frozenset(_FNEW)),
+                _gate_focus_suppress_reason(dict(_FOCUS_ON), frozenset(_FNEW + ["impacto:dano-ao-vivo"])),
+                _gate_focus_suppress_reason(dict(_FOCUS_ON), frozenset(_FNEW)))
+    if (not _pf_yes_bad and not _pf_no_bad and _pf_unit[:3] == (None, None, None)
+            and _pf_unit[3] and "fila=16" in _pf_unit[3]):
+        _ok("(ga-pfnfr5-f): predicate and suppress-reason: unmeasured/OFF/fix-class → None; ON + new build → reason with the depth")
+    else:
+        _bad("(ga-pfnfr5-f)", "yes_bad=%s no_bad=%s unit=%s" % (_pf_yes_bad, _pf_no_bad, _pf_unit))
+
+    print("\nScenario (ga-pfnfr5-g): drift guard — the label set above is EXACTLY the one the Pilot filters on "
+          "(its focus clause and the focus_fix field of its dispatchable emit)")
+    _pf_src_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "packs", "town-deltas",
+                                "assets", "pilot-dispatcher.sh")
+    try:
+        with open(_pf_src_path) as _f:
+            _pf_lines = [l for l in _f.read().splitlines()
+                         if 'startswith("gate:fix-attempt:")' in l and "impacto:dano-ao-vivo" in l]
+    except Exception as _e:
+        _pf_lines = None
+    _pf_mine = set(GATE_FOCUS_FIX_LABELS) | {GATE_FOCUS_FIX_PREFIX}
+    if _pf_lines:
+        _pf_theirs = [set(re.findall(r'"((?:gate|origem|impacto):[a-z:-]+)"', l)) for l in _pf_lines]
+    else:
+        _pf_theirs = []
+    if _pf_lines and all(t == _pf_mine for t in _pf_theirs):
+        _ok("(ga-pfnfr5-g): %d Pilot line(s) carry the focus predicate and all equal this file's set %s"
+            % (len(_pf_lines), sorted(_pf_mine)))
+    else:
+        _bad("(ga-pfnfr5-g)", "pilot lines=%s sets=%s mine=%s (unreadable pilot source or the Pilot's focus "
+             "predicate drifted from GATE_FOCUS_FIX_LABELS)" % (
+             None if _pf_lines is None else len(_pf_lines), _pf_theirs, sorted(_pf_mine)))
+
+    print("\nScenario (ga-pfnfr5-h): REAL _read_gate_focus() (seam OFF, real bash + the checked-out "
+          "gate-focus-lib.sh, real state files) — ON / OFF / stale / future-dated / missing / corrupt / "
+          "lib missing / lib answering garbage; every non-clean answer is None, never OFF and never ON")
+    _pf_lib = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "packs", "town-deltas",
+                           "assets", "scripts", "gate-focus-lib.sh")
+    _pf_dir = tempfile.mkdtemp(prefix="arc-selftest-gate-focus-")
+    _pf_state = os.path.join(_pf_dir, "gate-focus.state")
+    _pf_fake_lib = os.path.join(_pf_dir, "garbage-lib.sh")
+    with open(_pf_fake_lib, "w") as _f:
+        _f.write("gate_focus_active() { printf 'banana'; }\ngate_focus_depth() { :; }\n")
+
+    def _pf_write(active, at, depth="16"):
+        with open(_pf_state, "w") as _f:
+            _f.write("active=%s\nsince=%d\ndepth=%s\nat=%s\nescalated=0\n" % (active, NOW - 3600, depth, at))
+
+    def _true_sh(args, timeout=20):
+        try:
+            return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        except Exception:
+            return None
+
+    _pf_saved = (GATE_FOCUS_LIB, GATE_FOCUS_STATE_FILE, _sh, _read_gate_focus_file)
+    _pf_res = {}
+    try:
+        globals()["GATE_FOCUS_LIB"] = _pf_lib
+        globals()["GATE_FOCUS_STATE_FILE"] = _pf_state
+        _sh = _true_sh
+        _read_gate_focus_file = None     # un-stub — force the real function body
+        _pf_write(1, int(NOW) - 60); _pf_res["on"] = _read_gate_focus(NOW)
+        _pf_write(0, int(NOW) - 60, depth="4"); _pf_res["off"] = _read_gate_focus(NOW)
+        _pf_write(1, int(NOW) - 7200 - 120); _pf_res["stale"] = _read_gate_focus(NOW)
+        _pf_write(1, int(NOW) + 600); _pf_res["future"] = _read_gate_focus(NOW)
+        _pf_write("maybe", int(NOW) - 60); _pf_res["corrupt"] = _read_gate_focus(NOW)
+        os.remove(_pf_state); _pf_res["missing"] = _read_gate_focus(NOW)
+        _pf_write(1, int(NOW) - 60)
+        globals()["GATE_FOCUS_LIB"] = os.path.join(_pf_dir, "no-such-lib.sh")
+        _pf_res["nolib"] = _read_gate_focus(NOW)
+        globals()["GATE_FOCUS_LIB"] = _pf_fake_lib
+        _pf_res["garbage"] = _read_gate_focus(NOW)
+    finally:
+        globals()["GATE_FOCUS_LIB"], globals()["GATE_FOCUS_STATE_FILE"] = _pf_saved[0], _pf_saved[1]
+        _sh, _read_gate_focus_file = _pf_saved[2], lambda: None   # hermetic again for anything after this
+        for _p in (_pf_state, _pf_fake_lib):
+            if os.path.exists(_p):
+                os.remove(_p)
+        os.rmdir(_pf_dir)
+    if (_pf_res.get("on") == {"active": True, "depth": "16"}
+            and _pf_res.get("off") == {"active": False, "depth": "4"}
+            and all(_pf_res.get(k) is None for k in ("stale", "future", "corrupt", "missing", "nolib", "garbage"))):
+        _ok("(ga-pfnfr5-h): on/off read through the real lib against this cycle's clock (NOW is in 2025, so "
+            "fresh-vs-the-real-clock would have read stale); stale, future-dated, corrupt, missing, lib "
+            "missing and lib answering 'banana' → None")
+    else:
+        _bad("(ga-pfnfr5-h)", "results=%r" % (_pf_res,))
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
