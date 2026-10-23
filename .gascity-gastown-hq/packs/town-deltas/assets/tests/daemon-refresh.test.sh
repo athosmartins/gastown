@@ -4626,11 +4626,12 @@ echo "$OUTE" | grep -qF 'com.test.anuncios: $DIR/anuncios_dashboard.py (wrapper 
 # T143: the other spellings of the same thing, one label each. (a) `export`, an unquoted
 # value and ${DIR} in the use; (b) the closing quote right before the slash, in the
 # assignment and in the use; (c) `readonly`, an absolute value under the runtime and a
-# sub-path after the variable. Every file is changed in ONE run: each label must come out
-# AFFECTED through its own file.
+# sub-path after the variable; (d) a `; cmd` and a `# comment` after the value on the same
+# line. Every file is changed in ONE run: each label must come out AFFECTED through its own
+# file.
 new_case t143
-mkdir -p "$RUNTIME/daemons/spa" "$RUNTIME/daemons/spb" "$RUNTIME/daemons/spc/sub"
-for f in spa/app_a.py spb/app_b.py spc/sub/app_c.py; do cat > "$RUNTIME/daemons/$f" <<<'print("x")'; done
+mkdir -p "$RUNTIME/daemons/spa" "$RUNTIME/daemons/spb" "$RUNTIME/daemons/spc/sub" "$RUNTIME/daemons/spd"
+for f in spa/app_a.py spb/app_b.py spc/sub/app_c.py spd/app_d.py; do cat > "$RUNTIME/daemons/$f" <<<'print("x")'; done
 cat > "$RUNTIME/launchd/spa-wrapper.sh" <<'EOF'
 #!/bin/bash
 BASEDIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -4648,14 +4649,20 @@ cat > "$RUNTIME/launchd/spc-wrapper.sh" <<EOF
 readonly APPDIR="$RUNTIME/daemons/spc"
 exec python3 "\${APPDIR}/sub/app_c.py"
 EOF
+cat > "$RUNTIME/launchd/spd-wrapper.sh" <<'EOF'
+#!/bin/bash
+BASEDIR="$(cd "$(dirname "$0")/.." && pwd)"
+DIR="$BASEDIR/daemons/spd"; export DIR   # exported for the child, as in the old plist
+exec python3 "$DIR/app_d.py"
+EOF
 pid=43001
-for l in spa spb spc; do
+for l in spa spb spc spd; do
   make_plist_wd "$AGENTS" "com.test.$l" "$RUNTIME" /bin/bash "$RUNTIME/launchd/$l-wrapper.sh"
   seed_running "com.test.$l" "$pid" "$STALE_LSTART"
   seed_restart "com.test.$l" "$((pid + 98))" "$FRESH_LSTART"
   pid=$((pid + 1))
 done
-OUT=$(run_helper daemons/spa/app_a.py daemons/spb/app_b.py daemons/spc/sub/app_c.py); RC=$?
+OUT=$(run_helper daemons/spa/app_a.py daemons/spb/app_b.py daemons/spc/sub/app_c.py daemons/spd/app_d.py); RC=$?
 t131_in com.test.spa "$(field AFFECTED "$OUT")" \
   && ok "T143 (a) \`export DIR=\$BASEDIR/daemons/spa\` (unquoted) + \${DIR}/app_a.py resolves" \
   || nok "T143 (a)" "AFFECTED=[$(field AFFECTED "$OUT")] out=[$OUT]"
@@ -4665,8 +4672,11 @@ t131_in com.test.spb "$(field AFFECTED "$OUT")" \
 t131_in com.test.spc "$(field AFFECTED "$OUT")" \
   && ok "T143 (c) \`readonly\` + an absolute value under the runtime + a sub-path after the variable resolves" \
   || nok "T143 (c)" "AFFECTED=[$(field AFFECTED "$OUT")] out=[$OUT]"
+t131_in com.test.spd "$(field AFFECTED "$OUT")" \
+  && ok "T143 (d) a \`; export DIR\` and a trailing comment after the value are cut off it" \
+  || nok "T143 (d)" "AFFECTED=[$(field AFFECTED "$OUT")] out=[$OUT]"
 field_is_empty UNRESOLVED_ENTRYPOINTS "$OUT" \
-  && ok "T143 ...and none of the three is reported unresolved" \
+  && ok "T143 ...and none of the four is reported unresolved" \
   || nok "T143 UNRESOLVED_ENTRYPOINTS" "got [$(field UNRESOLVED_ENTRYPOINTS "$OUT")]"
 
 # T144: what is NOT an assignment, and which assignment wins. Step 3 also matches an

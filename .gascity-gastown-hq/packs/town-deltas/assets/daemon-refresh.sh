@@ -2415,11 +2415,14 @@ wrapper_var_py_tokens() {  # wrapper_var_py_tokens <file>
 }
 
 # wrapper_var_dirs <wrapper file> <VAR>: the runtime-relative directory of every plain
-# assignment to VAR in the wrapper (`VAR=…`, `export VAR=…`, `readonly VAR=…`), the LAST
-# assignment first, one per line ("." for the runtime root). An assignment whose value
-# cannot be placed prints nothing: a computed one (`$(…)` or backticks), a single-quoted
-# one (its `$` is literal), and whatever resolve_reldir() refuses (outside the runtime, a
-# `..` component, no such directory). A leading `$X/` in the value is ASSUMED to be the
+# assignment to VAR in the wrapper (`VAR=…`, `export VAR=…`, `readonly VAR=…` at the start
+# of a line, so a commented-out assignment never matches), the LAST assignment first, one
+# per line ("." for the runtime root). The value is the first word after the `=`, so a
+# trailing `; cmd` or `# comment` is cut off. An assignment whose value cannot be placed
+# prints nothing: a computed one (`$(…)` or backticks), a single-quoted one (its `$` is
+# literal), and whatever resolve_reldir() refuses (outside the runtime, a `..` component,
+# no such directory — that directory test is also what stops a malformed value from ever
+# resolving). A leading `$X/` in the value is ASSUMED to be the
 # wrapper's base directory, exactly as resolve_reldir() assumes it for a `cd` target; a
 # chain (`A="$B/x"` after `B="$BASEDIR/y"`) is not followed: B counts as the root like any
 # other `$X`, so the chain falls short (NÃO RESOLVIDO) unless a directory of that name
@@ -2427,7 +2430,7 @@ wrapper_var_py_tokens() {  # wrapper_var_py_tokens <file>
 # resolve_var_py() registers a file only if it exists there.
 wrapper_var_dirs() {  # wrapper_var_dirs <file> <VAR>
   local line val
-  # vazio → nothing printed (VAR is not assigned in the wrapper); falhou/ilegível (sed
+  # vazio → nothing printed (VAR is not assigned in the wrapper); falhou/ilegível (grep
   # cannot open it) → the same nothing, an unplaced directory is never a guessed one
   while IFS= read -r line; do
     val="${line#*=}"
@@ -2440,8 +2443,7 @@ wrapper_var_dirs() {  # wrapper_var_dirs <file> <VAR>
       *'$('*|*'`'*) continue ;;
     esac
     resolve_reldir "$val" || true
-  done < <(sed -E 's/^[[:space:]]*#.*$//; s/[[:space:]]#.*$//' "$1" 2>/dev/null \
-             | grep -E "^[[:space:]]*((export|readonly)[[:space:]]+)?$2=" \
+  done < <(grep -E "^[[:space:]]*((export|readonly)[[:space:]]+)?$2=" "$1" 2>/dev/null \
              | awk '{ a[NR] = $0 } END { for (i = NR; i >= 1; i--) print a[i] }')
 }
 
