@@ -79,8 +79,9 @@ short() { printf '%.9s' "$1"; }
 notify_count() { wc -l < "$NOTIFY_LOG" | tr -d ' '; }
 
 # run_win [env=VAL ...] -- args...  -> OUT, RC. O script roda sob /bin/bash (3.2).
+# RUN_WITH (vazio = o script sob teste): outro arquivo de script a rodar no lugar, so pro 8j (ver shim_wins_copy).
 run_win() {
-    local extra=""
+    local extra="" script="${RUN_WITH:-$RUN}"
     while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do extra="$extra $1"; shift; done
     [ "${1:-}" = "--" ] && shift
     # shellcheck disable=SC2086
@@ -90,8 +91,21 @@ run_win() {
         ENGINE_WINDOW_PREV_FILE="$PREV" ENGINE_WINDOW_LOG="$WLOG" \
         ENGINE_WINDOW_PREFLIGHT="$WORK/preflight-stub.sh" ENGINE_WINDOW_LABEL=gc-fixture \
         ENGINE_WINDOW_TAG=engwin-T1 ENGINE_BACKUP_LIB="$LIBPATH" EB_RETRY_SLEEP_S=0 EB_PUSH_TRIES=2 \
-        $extra /bin/bash "$RUN" "$@" 2>&1)
+        $extra /bin/bash "$script" "$@" 2>&1)
     RC=$?
+}
+
+# shim_wins_copy <script> <saida>: copia <script> com o prepend do PATH virado em append. Motivo: o script poe
+# /opt/homebrew/bin NA FRENTE do proprio PATH (export PATH="/opt/homebrew/bin:...:$PATH", ga-tp5hyj), e o PATH que run_win
+# monta ($WORK/fakebin na frente) e so o de ENTRADA dele: num host que tem /opt/homebrew/bin/git (o mini) o git de verdade
+# ganha do shim e o shim nunca roda (gate 23/10, ga-z36a88). Com o append o fakebin continua na frente. rc 3 = nao achei
+# EXATAMENTE uma linha nesse formato (a linha mudou: ajuste aqui, nao deixe passar calado).
+shim_wins_copy() {
+    awk '
+        /^export PATH="[^"]*:\$PATH"$/ { n++; d = $0; sub(/^export PATH="/, "", d); sub(/:\$PATH"$/, "", d); print "export PATH=\"$PATH:" d "\""; next }
+        { print }
+        END { if (n != 1) exit 3 }
+    ' "$1" > "$2"
 }
 
 echo "── 1. sintaxe do script sob teste e do swap (bash 3.2 e o do PATH) ──"
@@ -258,8 +272,20 @@ assert_eq "remoto sem main -> rc=1" "1" "$RC"
 assert_has "  diz que nao cria" "$OUT" "nao crio"
 assert_eq "  e o main continua ausente" "<ausente>" "$(remote_main)"
 echo "── 8j. o push SAIU mas o fetch que confere o efeito falha: 'NAO CONFIRMADO', nunca 'AVANCOU' (nem 'NAO AVANCOU': o main pode ter andado) ──"
-# git de mentira na frente do PATH (fakebin ja e o 1o do PATH em run_win): repassa tudo pro git de verdade, e depois de um
-# push que deu certo faz todo fetch falhar -- o estado "empurrei e nao consigo ver" que um rc=0 do push nao distingue.
+# git de mentira em $WORK/fakebin: repassa tudo pro git de verdade, e depois de um push que deu certo faz todo fetch falhar
+# -- o estado "empurrei e nao consigo ver" que um rc=0 do push nao distingue.
+# O fakebin so e o 1o do PATH de ENTRADA do script; ele proprio poe /opt/homebrew/bin na frente (shim_wins_copy). Por isso
+# este cenario roda a copia com o prepend virado em append, e o CANARIO abaixo falha com UMA mensagem se o shim for
+# contornado mesmo assim (antes: 4 assercoes vermelhas sem dizer por que).
+RUN_SHIM_WINS="$WORK/shimwins/$(basename "$RUN")"
+mkdir -p "$WORK/shimwins"
+if shim_wins_copy "$RUN" "$RUN_SHIM_WINS"; then
+    ok "a copia do 8j (shim_wins_copy) achou EXATAMENTE uma linha 'export PATH=...:\$PATH' no script sob teste"
+else
+    bad "shim_wins_copy: o script sob teste nao tem exatamente uma linha 'export PATH=\"...:\$PATH\"' -- a linha mudou, ajuste o teste"
+fi
+assert_eq "  e a copia difere do script sob teste em UMA linha so (a do PATH)" "1" "$(diff "$RUN" "$RUN_SHIM_WINS" | grep -c '^<')"
+assert_has "  e nela o PATH de entrada vem primeiro (os dirs do script vao pro fim)" "$(diff "$RUN" "$RUN_SHIM_WINS" | grep '^>')" 'export PATH="$PATH:'
 REAL_GIT=$(command -v git)
 rm -f "$WORK/pushed.flag"
 cat > "$WORK/fakebin/git" <<SHIM
@@ -275,13 +301,20 @@ SHIM
 chmod +x "$WORK/fakebin/git"
 set_remote_main "$B_TIP"
 : > "$NOTIFY_LOG"
+RUN_WITH="$RUN_SHIM_WINS"
 run_win -- advance-main
-assert_eq "push saiu, fetch de conferencia falhou -> rc=1 (nao dou como feito)" "1" "$RC"
-assert_has "  diz NAO CONFIRMADO" "$OUT" "origin/main .. NAO CONFIRMADO"
-assert_lacks "  e NAO afirma que AVANCOU" "$OUT" "origin/main .. AVANCOU"
-assert_lacks "  nem que NAO AVANCOU (o main pode ter andado)" "$OUT" "origin/main .. NAO AVANCOU"
-assert_has "  o aviso saiu por notify" "$(cat "$NOTIFY_LOG")" "origin/main NAO CONFIRMADO"
-assert_eq "  e o push de fato aconteceu (so o teste le o bare remote)" "$M_TIP" "$(remote_main)"
+RUN_WITH=""
+if [ -e "$WORK/pushed.flag" ]; then
+    ok "  CANARIO: o shim de git RODOU (o push passou por ele)"
+    assert_eq "push saiu, fetch de conferencia falhou -> rc=1 (nao dou como feito)" "1" "$RC"
+    assert_has "  diz NAO CONFIRMADO" "$OUT" "origin/main .. NAO CONFIRMADO"
+    assert_lacks "  e NAO afirma que AVANCOU" "$OUT" "origin/main .. AVANCOU"
+    assert_lacks "  nem que NAO AVANCOU (o main pode ter andado)" "$OUT" "origin/main .. NAO AVANCOU"
+    assert_has "  o aviso saiu por notify" "$(cat "$NOTIFY_LOG")" "origin/main NAO CONFIRMADO"
+    assert_eq "  e o push de fato aconteceu (so o teste le o bare remote)" "$M_TIP" "$(remote_main)"
+else
+    bad "  CANARIO: o shim de git NAO rodou -- o git de verdade ganhou de $WORK/fakebin no PATH do script, e as outras assercoes do 8j nao provam nada (rc=$RC; fim da saida: $(printf '%s' "$OUT" | tail -3 | tr '\n' ' '))"
+fi
 rm -f "$WORK/fakebin/git" "$WORK/pushed.flag"
 # estado normal pos-janela, pro resto do teste: main na ponta da janela e o binario da janela.
 set_remote_main "$T1_TIP"
