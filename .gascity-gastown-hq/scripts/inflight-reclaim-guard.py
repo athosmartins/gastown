@@ -702,7 +702,7 @@ def _refusal_reason_slugs(labels):
 
 # ga-32a4bo: reason slugs that say "the DISPATCH this worker was handed collided with work already in flight". The refusing worker picks the slug, so this is
 # a CLASS of spellings (duplicate-of-in-flight, duplicate-dispatch, already-in-flight, dup-of-<bead>, in-flight-elsewhere…); hyphen-delimited tokens only, so
-# `dupont-schema` is not one. Such a refusal is a statement about the extra dispatch, never about whether the bead can be built.
+# `dupont-schema` is not one. Such a refusal says the extra DISPATCH was redundant; that is not a conclusion that the bead cannot be built.
 _DUPLICATE_REFUSAL_RE = re.compile(r"(?:^|-)(?:duplicate|dup|already-in-flight|in-flight|inflight)(?:-|$)")
 
 
@@ -4980,7 +4980,8 @@ def run_cycle(state, escalated_alerted):
                 f"{_reclaim_tag}{_refusal_tag} title={title!r}"
             )
             # ga-32a4bo item 2: the 1st refusal that parks a bead (pilot:refused-reason:* is a park label) goes to the Mayor now, not 21 h later. Only on a
-            # reclaim that took (ok): a failed one is retried next sweep, and the 2nd refusal (escalate below) has its own mail.
+            # reclaim that took (ok): a failed one is retried next sweep, and the 2nd refusal goes through the escalate branch below (gate:needs-human, + its own
+            # mail for pool assignees).
             if has_explicit_refusal and ok:
                 alert_mayor_refusal_parked(bead_id, title, assignee, _refusal_reason_slugs(labels), refusal_count + 1)
             # Reset state clock — bead left in-flight (or will be re-tracked if partially failed)
@@ -9977,10 +9978,11 @@ def _selftest():
 
     _dup_absent = object()
 
-    def _dup_cycle(own_labels, bridged, live, refusal_age=None, stranded_age=None, assignee="dog-1"):
+    def _dup_cycle(own_labels, bridged, live, refusal_age=None, stranded_age=None, assignee="dog-1", reclaim_ok=True):
         """run_cycle() over ONE in-flight bead (ga-dup1) → {"reclaim": [...], "escalate": [...], "alert": [...]}, each entry the (args, kwargs) the call got.
-        live: the assignee has a fresh active session. refusal_age / stranded_age: seconds the refusal / the stranding has already been standing."""
-        calls = {"reclaim": [], "escalate": [], "alert": []}
+        live: the assignee has a fresh active session. refusal_age / stranded_age: seconds the refusal / the stranding has already been standing.
+        reclaim_ok: what the faked do_reclaim() returns (False = the reclaim did not take)."""
+        calls = {"reclaim": [], "escalate": [], "alert": [], "leak": []}
         now = time.time()
         bead = {"id": "ga-dup1", "title": "fix the thing", "labels": list(own_labels), "assignee": assignee, "status": "in_progress",
                 "updated_at": _dup_iso(now - 90), "rig_root": None, "metadata": {"pilot.sling_bead": "ga-dups1"}}
@@ -9998,19 +10000,28 @@ def _selftest():
             "list_refused_sling_source_beads": lambda: ({"ga-dup1": list(bridged)} if bridged else {}),
             "account_is_rate_limited": lambda: False, "get_branch_recent": lambda *a, **k: False,
             "_check_pool_dead": lambda *a, **k: None, "_irg_ledger": lambda *a, **k: None, "emit": lambda msg: None,
-            "do_reclaim": _rec("reclaim", True), "do_escalate": _rec("escalate", []), "alert_mayor_refusal_parked": _rec("alert", True),
+            "do_reclaim": _rec("reclaim", reclaim_ok), "do_escalate": _rec("escalate", []), "alert_mayor_refusal_parked": _rec("alert", True),
         }
         state = {"ga-dup1": {"last_assignee": assignee}}
         if refusal_age is not None:
             state["ga-dup1"]["refusal_first_seen"] = now - refusal_age
         if stranded_age is not None:
             state["ga-dup1"]["first_seen_stranded"] = now - stranded_age
+        class _LeakR:
+            returncode, stdout, stderr = 1, "", "leaked into the harness"
+
+        def _leak(cmd, **kw):   # a real bd/gc/git call that no fake answered: recorded (and failed), so DUP-0 says so
+            calls["leak"].append(list(cmd) if isinstance(cmd, (list, tuple)) else cmd)
+            return _LeakR()
         saved = {n: globals().get(n, _dup_absent) for n in fakes}
+        _dup_real_run = subprocess.run
         globals().update(fakes)
+        subprocess.run = _leak
         try:
             with _dup_contextlib.redirect_stdout(_dup_io.StringIO()):
                 run_cycle(state, {})
         finally:
+            subprocess.run = _dup_real_run
             for n, v in saved.items():
                 if v is _dup_absent:
                     globals().pop(n, None)
@@ -10024,6 +10035,7 @@ def _selftest():
     _dup_genuine = ("cross-rig-framework", "ga-dups2", None, "pool:refused:cross-rig-framework")
 
     _c = _dup_cycle(_dup_inflight, [_dup_br], live=True, refusal_age=_dup_age)
+    check("DUP-0 (harness): run_cycle() ran with NO real subprocess call — every query it makes was a canned answer", _c["leak"] == [], f"leaked={_c['leak']!r}")
     check("DUP-1 (ga-32a4bo): a LIVE builder + a duplicate-of-in-flight refusal bridged from the duplicate sling, standing past the live-session grace → the claim is NOT reclaimed",
           _c["reclaim"] == [] and _c["escalate"] == [], f"reclaim={len(_c['reclaim'])} escalate={len(_c['escalate'])}")
     _c = _dup_cycle(_dup_inflight + ["pilot:refusal-count:1"], [_dup_br], live=True, refusal_age=0.0)
@@ -10059,6 +10071,9 @@ def _selftest():
           f"reclaim={len(_c['reclaim'])} alerts={_c['alert']!r}")
     _c = _dup_cycle(_dup_inflight, [], live=False, stranded_age=POOL_ZOMBIE_TTL + 60)   # dog-1 is a pool assignee: the 2 h pool-zombie TTL applies, not the 25 min one
     check("DUP-8b (control): a plain dead-builder reclaim (no refusal) sends no refusal alert",
+          len(_c["reclaim"]) == 1 and _c["alert"] == [], f"reclaim={len(_c['reclaim'])} alerts={len(_c['alert'])}")
+    _c = _dup_cycle(_dup_inflight, [_dup_genuine], live=False, reclaim_ok=False)
+    check("DUP-8d (ga-32a4bo item 2): a refusal reclaim that did NOT take (RECLAIM-FAILED, retried next sweep) sends no alert yet — the bead is not parked",
           len(_c["reclaim"]) == 1 and _c["alert"] == [], f"reclaim={len(_c['reclaim'])} alerts={len(_c['alert'])}")
     _c = _dup_cycle(_dup_inflight + ["pilot:refusal-count:1"], [_dup_genuine], live=False)
     check("DUP-8c (control): the escalation keeps its own Mayor mail and does not also fire the new alert",
