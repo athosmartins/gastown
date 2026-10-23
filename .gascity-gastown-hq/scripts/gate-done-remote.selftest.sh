@@ -989,6 +989,15 @@ has "$EXE_SRC" '("wa-worker", "wa-worker-remote")'; ok $? "prompts: ... e são a
 has "$HQ/agents/ps-worker-remote/prompt.template.md" '`ps-worker` ou `ps-worker-remote`'; ok $? "prompts: o PS nomeia as rotas do pool de PS"
 has "$EXE_SRC" '("ps-worker", "ps-worker-remote")'; ok $? "prompts: ... e são as da tabela RIGS do executável (ps)"
 has "$HQ/agents/ps-worker-remote/prompt.template.md" 'bd -C property_scrapers comment'; ok $? "prompts: o PS segue mandando comentar com bd -C property_scrapers"
+# ga-2hd02v.3.12.2 (achados Low do gate em ga-2hd02v.3.12.1): o caminho de recusa do atalho tem de comentar na loja CERTA (o bd sem -C lê a do HQ, onde wa-* não existe), os dois prompts avisam
+# do -N recusado em sessão sem cauda, o PS não cita bead de WA e o par de rotas não vira span de crase dupla. Ausente = reprova; "não consegui ler" nunca vale por "não tem" (grep rc 1 = leu e não achou).
+has "$HQ/agents/wa-worker-remote/prompt.template.md" 'bd -C whatsapp_automation comment'; ok $? "prompts: o WA manda comentar com bd -C whatsapp_automation (espelha o teste do PS)"
+for role in wa-worker-remote ps-worker-remote; do
+  P="$HQ/agents/$role/prompt.template.md"
+  has "$P" 'sem cauda, o atalho recusa o `-N`'; ok $? "prompts: $role avisa que sessão sem cauda no nome não pode o -N"
+  grep -qE '[^`]``[^`]' "$P" 2>/dev/null; [ $? -eq 1 ]; ok $? "prompts: $role não tem span de crase dupla no texto (cerca de código com 3 crases não conta; o grep leu e não achou: rc 1)"
+done
+grep -qF 'wa-xr1xwt' "$HQ/agents/ps-worker-remote/prompt.template.md" 2>/dev/null; [ $? -eq 1 ]; ok $? "prompts: o do PS não cita bead de WA (o grep leu e não achou: rc 1)"
 
 echo
 echo "$((n - fails))/$n ok, $fails falhas"
