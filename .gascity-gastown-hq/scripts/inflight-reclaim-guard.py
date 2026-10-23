@@ -722,7 +722,8 @@ def drop_duplicate_refusals(labels, bridge_sources, has_live_session):
 
     Pure, no I/O. Returns (labels, bridge_sources, dropped_labels): both lists without the duplicate-class entries, and the labels dropped. A duplicate-class
     refusal BRIDGED from a sling wrapper is always dropped: it is about the extra dispatch, whether or not the builder is alive, and the wrapper keeps the
-    label for up to an hour (sling-task-janitor), so a builder that dies in that window must not be fast-pathed into a refusal park by a stale one. The same
+    label for an hour or more (sling-task-janitor closes a refused stub only after its 60 min minimum age), so a builder that dies in that window must not be
+    fast-pathed into a refusal park by a stale one. The same
     label on the bead ITSELF is dropped only with a live builder (without one the 'in flight' it names is not there, and it reads as before). Genuine reasons
     and a bare pool:refused stay either way: a mixed bead still reclaims for the genuine one and the duplicate one is never promoted into pilot:refused-reason.
     The label itself is left on the bead/wrapper: this hides it from the decision, it does not consume it.
@@ -10058,8 +10059,8 @@ def _selftest():
           len(_c["reclaim"]) == 1 and _c["reclaim"][0][1].get("has_explicit_refusal") is True and _c["escalate"] == [],
           f"reclaim={len(_c['reclaim'])} escalate={len(_c['escalate'])}")
     _c = _dup_cycle(_dup_inflight, [_dup_br], live=False)
-    check("DUP-5b (ga-32a4bo): a duplicate refusal BRIDGED from a sling wrapper is about the extra dispatch whether or not the builder is alive — a stale one (the wrapper keeps the label up to an "
-          "hour) must not fast-path a bead whose builder just died into a refusal park",
+    check("DUP-5b (ga-32a4bo): a duplicate refusal BRIDGED from a sling wrapper is about the extra dispatch whether or not the builder is alive — a stale one (the wrapper keeps the label an hour or more) "
+          "must not fast-path a bead whose builder just died into a refusal park",
           _c["reclaim"] == [] and _c["escalate"] == [], f"reclaim={len(_c['reclaim'])} escalate={len(_c['escalate'])}")
     _c = _dup_cycle(_dup_inflight, [_dup_br], live=False, stranded_age=POOL_ZOMBIE_TTL + 60)
     check("DUP-5c (control): …and the dead-builder bead is still reclaimed the ordinary way once it has stood stranded long enough (not as a refusal, no refusal alert)",
