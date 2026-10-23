@@ -25,15 +25,9 @@
        jq and GNU timeout live there, and without it every run would end as UNKNOWN (tool missing) and alert on the second one.
        Credentials come from ~/.aws (file based), the same ones the nightly S3 backup uses.
 
-       STAGED, NOT INSTALLED (follow-up bead ga-c0939v.8, owner: the Mayor). This file is named .example and lives in
-       docs/runbooks on purpose: the PRESENCE-DRIFT sweep of daemon-presence-watchdog.sh scans scripts/ and
-       packs/town-deltas/assets/ for com.gascity.* plists that are not loaded, and would push a phone alert and mail the Mayor
-       every 3 h for as long as this one sat there unloaded. To install, in ONE change and in this order: (1) copy it to
-       scripts/com.gascity.jsonl-hourly-offsite-age.plist; (2) copy it to ~/Library/LaunchAgents and load it with launchctl
-       bootstrap; (3) register the label in daemon-presence-watchdog.sh (DPW_CRITICAL plus the heartbeat line pointing at the
-       StandardOutPath below, limit above 2x the interval). Registering before loading lights CRITICAL; loading without
-       registering lets the job die unseen. The same bead has the commands and the alternative (a supervisor watchdog that
-       already covers a stalled controller makes this job redundant). -->
+       INSTALLED 2026-10-23 by the Mayor (ga-c0939v.8): copied here from docs/runbooks, loaded from ~/Library/LaunchAgents with
+       launchctl bootstrap, and registered in daemon-presence-watchdog.sh (DPW_CRITICAL plus a heartbeat line on the StandardOutPath
+       below, limit 1500 s, above 2x the interval). The watchdog's PRESENCE-DRIFT sweep now expects this job to be loaded. -->
 
   <key>ProgramArguments</key>
   <array>

@@ -98,7 +98,7 @@ _deliberately_disabled() {
 # system sleep, NOT to a hung daemon); 0 = legacy behaviour (flag regardless).
 DPW_WAKE_GRACE="${DPW_WAKE_GRACE:-1}"
 
-DPW_CRITICAL="${DPW_CRITICAL:-com.gascity.pilot com.gascity.context-check-dispatcher com.gascity.quality-gate-dispatcher com.gascity.auto-refino-dispatcher com.gascity.refino-gate-dispatcher com.gascity.story-delivery com.gascity.supervisor com.gascity.supervisor-config-guard com.gascity.inflight-reclaim-guard com.gascity.gate-recovery-watchdog com.gascity.dolt-hang-watchdog com.gascity.production-stall-watchdog com.gascity.crew-hang-detector com.gascity.lifecycle-coherence-janitor com.gascity.crew-autopin-guard com.gascity.lifecycle-correctness-auditor com.gascity.throughput-stall-watchdog com.gascity.gate-throughput-stall-watchdog com.gascity.git-lock-hygiene com.gascity.crew-liveness-probe com.gascity.agent-stuck-escalation com.gascity.quorum-convergence-watchdog com.gascity.approved-state-reconciler com.gascity.auto-rehome-janitor com.gascity.sling-task-janitor com.gascity.gate-marker-rehome-janitor com.gascity.silent-ignorance-watch com.gascity.child-priority-janitor com.gascity.hetzner-occupancy-watch}"
+DPW_CRITICAL="${DPW_CRITICAL:-com.gascity.pilot com.gascity.context-check-dispatcher com.gascity.quality-gate-dispatcher com.gascity.auto-refino-dispatcher com.gascity.refino-gate-dispatcher com.gascity.story-delivery com.gascity.supervisor com.gascity.supervisor-config-guard com.gascity.inflight-reclaim-guard com.gascity.gate-recovery-watchdog com.gascity.dolt-hang-watchdog com.gascity.production-stall-watchdog com.gascity.crew-hang-detector com.gascity.lifecycle-coherence-janitor com.gascity.crew-autopin-guard com.gascity.lifecycle-correctness-auditor com.gascity.throughput-stall-watchdog com.gascity.gate-throughput-stall-watchdog com.gascity.git-lock-hygiene com.gascity.crew-liveness-probe com.gascity.agent-stuck-escalation com.gascity.quorum-convergence-watchdog com.gascity.approved-state-reconciler com.gascity.auto-rehome-janitor com.gascity.sling-task-janitor com.gascity.gate-marker-rehome-janitor com.gascity.silent-ignorance-watch com.gascity.child-priority-janitor com.gascity.hetzner-occupancy-watch com.gascity.jsonl-hourly-offsite-age}"
 
 HQ="${DPW_HQ:-/Users/athos/gt/.gascity-gastown-hq}"
 
@@ -142,7 +142,8 @@ com.gascity.auto-rehome-janitor|$HQ/.gc/logs/auto-rehome-janitor.out|3000
 com.gascity.sling-task-janitor|$HQ/.gc/logs/sling-task-janitor.out|4500
 com.gascity.gate-marker-rehome-janitor|$HQ/.gc/logs/gate-marker-rehome-janitor.out|1600
 com.gascity.child-priority-janitor|$HQ/.gc/logs/child-priority-janitor.out|900
-com.gascity.hetzner-occupancy-watch|$HQ/.gc/logs/hetzner-occupancy-watch.out|2700}"
+com.gascity.hetzner-occupancy-watch|$HQ/.gc/logs/hetzner-occupancy-watch.out|2700
+com.gascity.jsonl-hourly-offsite-age|$HQ/.gc/logs/jsonl-hourly-offsite-age.out|1500}"
 
 # ── RECYCLER — memory-bounded restart of known-leaky Python dashboards ────────
 # Knobs (override via env or the launchd plist EnvironmentVariables):
