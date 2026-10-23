@@ -700,6 +700,41 @@ def _refusal_reason_slugs(labels):
     return slugs
 
 
+# ga-32a4bo: reason slugs that say "the DISPATCH this worker was handed collided with work already in flight". The refusing worker picks the slug, so this is
+# a CLASS of spellings (duplicate-of-in-flight, duplicate-dispatch, already-in-flight, dup-of-<bead>, in-flight-elsewhere…); hyphen-delimited tokens only, so
+# `dupont-schema` is not one. Such a refusal is a statement about the extra dispatch, never about whether the bead can be built.
+_DUPLICATE_REFUSAL_RE = re.compile(r"(?:^|-)(?:duplicate|dup|already-in-flight|in-flight|inflight)(?:-|$)")
+
+
+def is_duplicate_refusal_slug(slug):
+    """True if a pool:refused reason slug says the refused DISPATCH was redundant because the work is already in flight (ga-32a4bo)."""
+    return bool(_DUPLICATE_REFUSAL_RE.search(slug or ""))
+
+
+def drop_duplicate_refusals_for_live_builder(labels, bridge_sources, has_live_session):
+    """ga-32a4bo: take the duplicate-class refusals out of what reclaim_decision() will see, when the bead's builder is LIVE.
+
+    Incident (ga-8hcnvb.3, 06/10): the Pilot slung a bead dog-1 was already building; the extra dispatch was refused `duplicate-of-in-flight` on its sling
+    wrapper and run_cycle() bridged that onto the SOURCE bead as an explicit refusal. A refusal bypasses the stranding wait, and once it has stood for
+    REFUSAL_LIVE_GRACE_SECS (ga-5ure2d) it also stops honouring has_live_session, so the guard reset the claim under a live builder and parked the bead with
+    pilot:refused-reason + pilot:refusal-count; a second one escalated at once (the count-crossing escalate sits ahead of has_live_session). Those are all
+    conclusions about the bead drawn from a refusal that says the opposite: somebody IS building it.
+
+    Pure, no I/O. Returns (labels, bridge_sources, dropped_labels): both lists without the duplicate-class entries (genuine reasons and a bare pool:refused
+    stay, so a mixed bead still reclaims for the genuine one and the duplicate one is never promoted into pilot:refused-reason), and the labels dropped.
+    Without a live builder nothing is dropped — the refusal then reads as before (the 'in flight' it names is not there) — and the inputs come back as they were.
+    The label itself is left on the bead/wrapper: this hides it from the decision, it does not consume it.
+    """
+    if not has_live_session:
+        return labels, bridge_sources, []
+    dropped = [lbl for lbl in labels if is_duplicate_refusal_slug(_refusal_slug_of_label(lbl))]
+    if not dropped:
+        return labels, bridge_sources, []
+    kept_labels = [lbl for lbl in labels if lbl not in dropped]
+    kept_sources = [e for e in bridge_sources if not is_duplicate_refusal_slug(e[0])]
+    return kept_labels, kept_sources, dropped
+
+
 def _is_ephemeral_pool_assignee(assignee):
     """True if assignee is an ephemeral-pool bead assignee (bare template,
     concrete adhoc form, or dog-pool concrete session form).
@@ -3697,6 +3732,32 @@ def do_escalate(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=N
     return []
 
 
+def alert_mayor_refusal_parked(bead_id, title, assignee, reason_slugs, refusal_n):
+    """Tell the Mayor, the moment an explicit refusal reclaims a bead, that it is now PARKED (ga-32a4bo item 2). True if the mail went out, False if it could not
+    (said on stdout, never raises: an alert must not break the cycle).
+
+    do_reclaim() on a refusal folds the reason into a permanent pilot:refused-reason:<slug> label, and that family is a park label: the pool probes skip a bead
+    that carries it, so nothing dispatches it again until a human acts. Only the 2nd refusal (do_escalate) used to mail the Mayor; the 1st left a bead comment and
+    an ntfy line among the routine [RECLAIMED] ones, and ga-8hcnvb.3 (P0) sat parked for 21 h until the orphan-label watchdog noticed. A mail, not a nudge:
+    the Mayor has to act on it even if the session that would have seen a nudge is gone.
+    """
+    reasons = ", ".join(reason_slugs) or "unspecified"
+    subject = f"[POOL-REFUSED] bead {bead_id} reclaimed after a worker refusal ({reasons}) — parked against dispatch"
+    body = (f"Bead {bead_id!r} ({title!r}, last assignee {assignee!r}) was EXPLICITLY REFUSED by a pool worker — reason(s): {reasons} — and the in-flight guard "
+            f"reclaimed it (refusal {refusal_n}/{REFUSAL_ESCALATE_THRESHOLD}). The permanent pilot:refused-reason:<slug> label is a park label: the pool probes skip "
+            f"a bead that carries it, so NOTHING will dispatch it again until you act — re-route or re-scope it and remove that label, or close it. A second "
+            f"independent refusal escalates it to gate:needs-human. (ga-32a4bo: this first refusal used to be silent; ga-8hcnvb.3 sat parked 21 h.)")
+    try:
+        r = subprocess.run(["gc", "mail", "send", "mayor", "-s", subject, "-m", body], timeout=20, capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"[INFLIGHT-RECLAIM] warn: refusal-parked mail to the Mayor failed for {bead_id} rc={r.returncode}: {(r.stderr or '').strip()[:200]}", flush=True)
+            return False
+        return True
+    except Exception as exc:
+        print(f"[INFLIGHT-RECLAIM] warn: refusal-parked mail to the Mayor failed for {bead_id}: {exc}", flush=True)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # ga-seuh4 / ga-a8t68: self-heal order:orphan-sweep's false resets
 # ---------------------------------------------------------------------------
@@ -4727,6 +4788,11 @@ def run_cycle(state, escalated_alerted):
         if not has_live_session and bead_id in live_sling_owner_beads:
             has_live_session = True
 
+        # ga-32a4bo: a duplicate-of-in-flight refusal says the extra DISPATCH was redundant because a builder is already on this bead — with that builder
+        # live it is no refusal of the BEAD: hidden from the decision, so it can neither age into a reclaim (ga-5ure2d) nor count toward
+        # REFUSAL_ESCALATE_THRESHOLD. See drop_duplicate_refusals_for_live_builder() for the incident.
+        labels, bridge_sources, _dup_dropped = drop_duplicate_refusals_for_live_builder(labels, bridge_sources, has_live_session)
+
         # ga-be4x: explicit refusal is a label read — pure, cheap, and, unlike
         # provably_dead, not scoped to bare-pool-zombie assignees. A worker's
         # STATED conclusion is unambiguous regardless of what kind of assignee
@@ -4744,6 +4810,10 @@ def run_cycle(state, escalated_alerted):
         # strand-clock update further down still shares this same bead_state.
         bead_state = state.setdefault(bead_id, {})
         refusal_age_secs = update_refusal_clock(bead_state, has_explicit_refusal, now)
+        if _dup_dropped and bead_state.get("dup_refusal_logged") != _dup_dropped:
+            print(f"[INFLIGHT-RECLAIM] ga-32a4bo: bead={bead_id} assignee={assignee!r} is live — ignoring duplicate-of-in-flight refusal(s) {_dup_dropped!r} "
+                  f"(a redundant dispatch, not a refusal of the bead); claim left intact", flush=True)
+            bead_state["dup_refusal_logged"] = _dup_dropped
 
         # Branch check is potentially slow (git fetch); only run when needed.
         # ga-vu718 gate-fix-2: see should_fetch_branch_for_reclaim()'s
@@ -4909,6 +4979,10 @@ def run_cycle(state, escalated_alerted):
                 f"idle={idle_min:.0f}min no_live_session no_recent_branch "
                 f"{_reclaim_tag}{_refusal_tag} title={title!r}"
             )
+            # ga-32a4bo item 2: the 1st refusal that parks a bead (pilot:refused-reason:* is a park label) goes to the Mayor now, not 21 h later. Only on a
+            # reclaim that took (ok): a failed one is retried next sweep, and the 2nd refusal (escalate below) has its own mail.
+            if has_explicit_refusal and ok:
+                alert_mayor_refusal_parked(bead_id, title, assignee, _refusal_reason_slugs(labels), refusal_count + 1)
             # Reset state clock — bead left in-flight (or will be re-tracked if partially failed)
             state.pop(bead_id, None)
 
@@ -9886,6 +9960,171 @@ def _selftest():
               f"mutations={_noc_ctrl_mutations!r}")
     finally:
         subprocess.run = _orig_run_noc
+
+    # -------------------------------------------------------------------
+    # Section: ga-32a4bo — a duplicate-of-in-flight refusal never reclaims (or escalates) a bead whose builder is LIVE
+    # -------------------------------------------------------------------
+    # Incident (ga-8hcnvb.3, 06/10): the Pilot slung a bead that dog-1 was already building; the extra dispatch was refused
+    # `duplicate-of-in-flight` on its sling WRAPPER, run_cycle() bridged that onto the SOURCE bead as an explicit refusal and, once the refusal had
+    # aged past REFUSAL_LIVE_GRACE_SECS (ga-5ure2d), reclaim_decision() stopped honouring dog-1's live session: the claim was reset under a live
+    # builder, and pilot:refused-reason / pilot:refusal-count parked the bead for 21 h with nobody told. These cases drive the REAL run_cycle(): every
+    # query it makes is swapped for a canned answer, and do_reclaim / do_escalate / emit / the Mayor alert only RECORD that they were called.
+    import contextlib as _dup_contextlib
+    import io as _dup_io
+
+    def _dup_iso(t):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+    _dup_absent = object()
+
+    def _dup_cycle(own_labels, bridged, live, refusal_age=None, stranded_age=None, assignee="dog-1"):
+        """run_cycle() over ONE in-flight bead (ga-dup1) → {"reclaim": [...], "escalate": [...], "alert": [...]}, each entry the (args, kwargs) the call got.
+        live: the assignee has a fresh active session. refusal_age / stranded_age: seconds the refusal / the stranding has already been standing."""
+        calls = {"reclaim": [], "escalate": [], "alert": []}
+        now = time.time()
+        bead = {"id": "ga-dup1", "title": "fix the thing", "labels": list(own_labels), "assignee": assignee, "status": "in_progress",
+                "updated_at": _dup_iso(now - 90), "rig_root": None, "metadata": {"pilot.sling_bead": "ga-dups1"}}
+        sessions = ([{"id": "s-1", "name": assignee, "session_name": assignee, "state": "active", "last_active": _dup_iso(now - 30)}] if live else [])
+
+        def _rec(kind, ret):
+            def _f(*a, **k):
+                calls[kind].append((a, k))
+                return ret
+            return _f
+        fakes = {
+            "list_inflight_beads": lambda: [bead], "list_stranded_inprogress_beads": lambda: [], "list_active_sessions": lambda: sessions,
+            "heal_orphan_sweep_false_resets": lambda *a, **k: None, "list_suspended_agents": lambda: set(),
+            "list_gate_active_source_beads": lambda: frozenset(), "list_live_sling_source_beads": lambda *a, **k: frozenset(),
+            "list_refused_sling_source_beads": lambda: ({"ga-dup1": list(bridged)} if bridged else {}),
+            "account_is_rate_limited": lambda: False, "get_branch_recent": lambda *a, **k: False,
+            "_check_pool_dead": lambda *a, **k: None, "_irg_ledger": lambda *a, **k: None, "emit": lambda msg: None,
+            "do_reclaim": _rec("reclaim", True), "do_escalate": _rec("escalate", []), "alert_mayor_refusal_parked": _rec("alert", True),
+        }
+        state = {"ga-dup1": {"last_assignee": assignee}}
+        if refusal_age is not None:
+            state["ga-dup1"]["refusal_first_seen"] = now - refusal_age
+        if stranded_age is not None:
+            state["ga-dup1"]["first_seen_stranded"] = now - stranded_age
+        saved = {n: globals().get(n, _dup_absent) for n in fakes}
+        globals().update(fakes)
+        try:
+            with _dup_contextlib.redirect_stdout(_dup_io.StringIO()):
+                run_cycle(state, {})
+        finally:
+            for n, v in saved.items():
+                if v is _dup_absent:
+                    globals().pop(n, None)
+                else:
+                    globals()[n] = v
+        return calls
+
+    _dup_age = REFUSAL_LIVE_GRACE_SECS + 120   # the refusal has been standing past the live-session grace (ga-5ure2d)
+    _dup_inflight = ["story:in-flight", "pilot:dispatched"]
+    _dup_br = ("duplicate-of-in-flight", "ga-dups2", None, "pool:refused:duplicate-of-in-flight")
+    _dup_genuine = ("cross-rig-framework", "ga-dups2", None, "pool:refused:cross-rig-framework")
+
+    _c = _dup_cycle(_dup_inflight, [_dup_br], live=True, refusal_age=_dup_age)
+    check("DUP-1 (ga-32a4bo): a LIVE builder + a duplicate-of-in-flight refusal bridged from the duplicate sling, standing past the live-session grace → the claim is NOT reclaimed",
+          _c["reclaim"] == [] and _c["escalate"] == [], f"reclaim={len(_c['reclaim'])} escalate={len(_c['escalate'])}")
+    _c = _dup_cycle(_dup_inflight + ["pilot:refusal-count:1"], [_dup_br], live=True, refusal_age=0.0)
+    check("DUP-2 (ga-32a4bo): …and a SECOND duplicate refusal does not escalate the bead to gate:needs-human either (the count-crossing escalate sat ahead of has_live_session)",
+          _c["reclaim"] == [] and _c["escalate"] == [], f"reclaim={len(_c['reclaim'])} escalate={len(_c['escalate'])}")
+    for _slug in ("duplicate-dispatch", "already-in-flight", "dup-of-ga-abc1", "in-flight-elsewhere"):
+        _c = _dup_cycle(_dup_inflight, [(_slug, "ga-dups2", None, "pool:refused:" + _slug)], live=True, refusal_age=_dup_age)
+        check(f"DUP-3 (ga-32a4bo): the CLASS, not the one spelling — pool:refused:{_slug} with a live builder is not reclaimed",
+              _c["reclaim"] == [] and _c["escalate"] == [], f"reclaim={len(_c['reclaim'])} escalate={len(_c['escalate'])}")
+    _c = _dup_cycle(_dup_inflight + ["pool:refused:duplicate-of-in-flight"], [], live=True, refusal_age=_dup_age)
+    check("DUP-4 (ga-32a4bo): the same label stamped on the bead ITSELF (no sling wrapper) with a live builder is not reclaimed either",
+          _c["reclaim"] == [] and _c["escalate"] == [], f"reclaim={len(_c['reclaim'])} escalate={len(_c['escalate'])}")
+    _c = _dup_cycle(_dup_inflight, [_dup_br], live=False)
+    check("DUP-5 (control): the builder is NOT live → the refusal still reclaims, as before (the exemption needs a live builder)",
+          len(_c["reclaim"]) == 1 and _c["reclaim"][0][1].get("has_explicit_refusal") is True and _c["escalate"] == [],
+          f"reclaim={len(_c['reclaim'])} escalate={len(_c['escalate'])}")
+    _c = _dup_cycle(_dup_inflight, [_dup_genuine], live=True, refusal_age=_dup_age)
+    check("DUP-6 (control): a GENUINE refusal (cross-rig-framework) with a live builder, standing past the grace, still reclaims (ga-5ure2d is not undone)",
+          len(_c["reclaim"]) == 1 and _c["reclaim"][0][1].get("has_explicit_refusal") is True, f"reclaim={len(_c['reclaim'])}")
+    _c = _dup_cycle(_dup_inflight, [_dup_br, _dup_genuine], live=True, refusal_age=_dup_age)
+    _mixed_labels = _c["reclaim"][0][0][4] if _c["reclaim"] else []
+    _mixed_src = [e[0] for e in (_c["reclaim"][0][1].get("bridge_sources") or [])] if _c["reclaim"] else []
+    check("DUP-7 (ga-32a4bo): duplicate + genuine together → the genuine refusal still reclaims, but the duplicate one is not promoted (no pool:refused:duplicate-* in the labels, none in bridge_sources)",
+          len(_c["reclaim"]) == 1 and "pool:refused:cross-rig-framework" in _mixed_labels
+          and not any(l.startswith("pool:refused:duplicate") for l in _mixed_labels) and _mixed_src == ["cross-rig-framework"],
+          f"reclaim={len(_c['reclaim'])} labels={_mixed_labels!r} sources={_mixed_src!r}")
+
+    # the first refusal that DOES park a bead (pilot:refused-reason:* keeps every pool worker off it) must reach the Mayor at once, not 21 h later
+    _c = _dup_cycle(_dup_inflight, [_dup_genuine], live=False)
+    _al = _c["alert"][0][0] if len(_c["alert"]) == 1 else ()
+    check("DUP-8 (ga-32a4bo item 2): a refusal-triggered RECLAIM alerts the Mayor right away, once, naming the bead and the reason",
+          len(_c["reclaim"]) == 1 and len(_al) >= 4 and _al[0] == "ga-dup1" and "cross-rig-framework" in _al[3],
+          f"reclaim={len(_c['reclaim'])} alerts={_c['alert']!r}")
+    _c = _dup_cycle(_dup_inflight, [], live=False, stranded_age=POOL_ZOMBIE_TTL + 60)   # dog-1 is a pool assignee: the 2 h pool-zombie TTL applies, not the 25 min one
+    check("DUP-8b (control): a plain dead-builder reclaim (no refusal) sends no refusal alert",
+          len(_c["reclaim"]) == 1 and _c["alert"] == [], f"reclaim={len(_c['reclaim'])} alerts={len(_c['alert'])}")
+    _c = _dup_cycle(_dup_inflight + ["pilot:refusal-count:1"], [_dup_genuine], live=False)
+    check("DUP-8c (control): the escalation keeps its own Mayor mail and does not also fire the new alert",
+          len(_c["escalate"]) == 1 and _c["alert"] == [], f"escalate={len(_c['escalate'])} alerts={len(_c['alert'])}")
+
+    # the pure pieces
+    for _slug, _want in (("duplicate-of-in-flight", True), ("duplicate-dispatch", True), ("already-in-flight", True), ("dup-of-ga-abc1", True),
+                         ("in-flight-elsewhere", True), ("unspecified", False), ("cross-rig-framework", False), ("engine-rebuild-required", False),
+                         ("dupont-schema", False), ("no-completion-path", False), ("mayor-deferred", False)):
+        try:
+            _got = is_duplicate_refusal_slug(_slug)
+        except Exception as _e:
+            _got = repr(_e)
+        check(f"DUP-U1 (ga-32a4bo): is_duplicate_refusal_slug({_slug!r}) is {_want}", _got is _want, f"got={_got!r}")
+    _du_labels = ["story:in-flight", "pool:refused:duplicate-of-in-flight", "pool:refused:cross-rig-framework", "pool:refused"]
+    _du_src = [_dup_br, _dup_genuine]
+    try:
+        _du_live = drop_duplicate_refusals_for_live_builder(_du_labels, _du_src, True)
+        _du_dead = drop_duplicate_refusals_for_live_builder(_du_labels, _du_src, False)
+    except Exception as _e:
+        _du_live = _du_dead = repr(_e)
+    check("DUP-U2 (ga-32a4bo): with a live builder only the duplicate-class refusal label and bridge entry are dropped (genuine and bare pool:refused stay), the drop is reported",
+          _du_live == (["story:in-flight", "pool:refused:cross-rig-framework", "pool:refused"], [_dup_genuine], ["pool:refused:duplicate-of-in-flight"]), f"got={_du_live!r}")
+    check("DUP-U3 (ga-32a4bo): without a live builder nothing is dropped and the inputs come back as they were",
+          _du_dead == (_du_labels, _du_src, []), f"got={_du_dead!r}")
+
+    # the Mayor alert's own call: one `gc mail send mayor`, and a failing mail is said but never raises
+    _alr_calls = []
+    _orig_run_alr = subprocess.run
+
+    class _AlrR:
+        def __init__(self, rc):
+            self.returncode, self.stdout, self.stderr = rc, "", "mail broke" if rc else ""
+
+    def _alr_stub(cmd, **kw):
+        _alr_calls.append(list(cmd))
+        return _AlrR(0)
+
+    def _alr_stub_rc1(cmd, **kw):
+        return _AlrR(1)
+
+    def _alr_stub_raises(cmd, **kw):
+        raise OSError("gc not found")
+    try:
+        subprocess.run = _alr_stub
+        try:
+            _alr_ok = alert_mayor_refusal_parked("ga-dupA", "fix the thing", "dog-1", ["cross-rig-framework"], 1)
+        except Exception as _e:
+            _alr_ok = repr(_e)
+        subprocess.run = _alr_stub_rc1
+        try:
+            _alr_rc1 = alert_mayor_refusal_parked("ga-dupA", "fix the thing", "dog-1", ["cross-rig-framework"], 1)
+        except Exception as _e:
+            _alr_rc1 = repr(_e)
+        subprocess.run = _alr_stub_raises
+        try:
+            _alr_exc = alert_mayor_refusal_parked("ga-dupA", "fix the thing", "dog-1", ["cross-rig-framework"], 1)
+        except Exception as _e:
+            _alr_exc = repr(_e)
+    finally:
+        subprocess.run = _orig_run_alr
+    check("DUP-A1 (ga-32a4bo item 2): the alert is ONE `gc mail send mayor` whose subject names the bead and whose body names the reason, the refusal count and how to unpark",
+          _alr_ok is True and len(_alr_calls) == 1 and _alr_calls[0][:4] == ["gc", "mail", "send", "mayor"] and "ga-dupA" in " ".join(_alr_calls[0])
+          and "cross-rig-framework" in " ".join(_alr_calls[0]) and "pilot:refused-reason" in " ".join(_alr_calls[0]), f"ok={_alr_ok!r} calls={_alr_calls!r}")
+    check("DUP-A2 (ga-32a4bo item 2): a mail that fails (rc≠0) or cannot even start is reported as False and never raises (an alert must not break the cycle)",
+          _alr_rc1 is False and _alr_exc is False, f"rc1={_alr_rc1!r} exc={_alr_exc!r}")
 
     print(f"\nResults: {PASS} passed, {FAIL} failed")
     return FAIL == 0
