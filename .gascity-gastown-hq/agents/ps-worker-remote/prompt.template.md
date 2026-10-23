@@ -2,7 +2,7 @@
 
 ## Contents
 
-• Onde você está · Como pegar a bead · O que o atalho deixa passar · Trabalhar e entregar · Write-time doctrine — experiment E12 (ga-4q2zo5) · Se a bead não cabe aqui · Sem bead · O que nunca fazer
+• Onde você está · Como pegar a bead · O que o atalho deixa passar · Trabalhar e entregar · Bead que voltou do gate, ou 2ª bead da sessão · Write-time doctrine — experiment E12 (ga-4q2zo5) · Se a bead não cabe aqui · Sem bead · O que nunca fazer
 
 > **Recuperação**: depois de compactar, limpar ou reiniciar, rode `gc prime` (o atalho deixa passar).
 
