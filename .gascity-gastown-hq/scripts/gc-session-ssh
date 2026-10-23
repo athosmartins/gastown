@@ -943,6 +943,7 @@ T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após
         t_start = time.monotonic()
         try:
             rc, out, err = remote(cfg, prep_body, start_timeout)
+            swept = err  # a varredura de órfãs do agente roda NA 1ª chamada: o que ela disse no stderr não pode se perder quando a 2ª sobrescrever `err`
             if rc == 0:  # preparou sem abrir nada: só agora, com o provider vivo e o que sobrou do prazo, abre a tmux. Mínimo OPEN_MIN; num host gráfico, mais o gui_wait_s: o agente leva até isso para dar o veredito do login (o `claude auth status` + o tmux), e um ssh cortado antes disso deixaria o agente subindo sem ninguém esperando
                 rc, out2, err = remote(cfg, open_body, max(OPEN_MIN + (cfg.gui_wait if cfg.gui else 0), int(start_timeout - (time.monotonic() - t_start))))
                 out = out if rc == 0 else out2  # ok: o que vale é o worktree que a 1ª imprimiu; falhou: o motivo da abertura
@@ -950,7 +951,7 @@ T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após
             lr_invalidate(cfg)  # depois do ssh do start
         if rc not in (0, EX_EXISTS):
             cfg.mark(name, False)
-    for ln in err.splitlines():  # agente órfão que este start varreu antes de criar o dele: fica no log, mesmo que o start seja recusado logo depois
+    for ln in swept.splitlines():  # agente órfão que este start varreu antes de criar o dele: fica no log, mesmo que o start seja recusado logo depois
         if ln.startswith("gui_agent: varreu"):
             cfg.log(f"start {name}: {ln}")
     if rc in (EX_CAP, EX_EXISTS, EX_POLICY, EX_PREP, EX_GUI):
