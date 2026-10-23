@@ -48,9 +48,9 @@ python3 /Users/athos/gt/whatsapp_automation/scripts/publicar_mockup.py dirA.html
 # → imprime DUAS URLs: "✓ publicado: …/mockups/<slug>" (a OPÇÃO, o HTML cru) e "grupo: …/mockups/g/<grupo>#<aba>" (o CARD, já na aba da opção; sem #<aba> na URL, abre na 1ª aba) — é a do GRUPO que vai pro Athos
 ```
 
-Cite as URLs no bead de origem (comentário): as da OPÇÃO (`✓ publicado:`) E a do GRUPO. O Guard #13 do pre-push (`scripts/check_mockup_protocol_guard.py` do rig) só reconhece URL de OPÇÃO (`…/mockups/<slug>-<8 hex>`); a URL do grupo (`…/mockups/g/<grupo>`) NÃO o satisfaz — citar só o link do grupo não destrava o push.
-
 ⚠️ Use SEMPRE esse caminho ABSOLUTO, de qualquer cwd: rodar `scripts/publicar_mockup.py` de dentro de um worktree sai 3 sem publicar nada (`shared/data` é gitignored no whatsapp_automation e o worktree de worker não o tem). Códigos de saída: 0 publicado; 1 recusado (dado pessoal ou entrada inválida); 3 erro de infraestrutura — NADA foi publicado; 4 FICOU gravado mas a conferência falhou — NÃO republique (duplica), confira `https://admin.urblink.com.br/mockups`; 2 é uso errado da linha de comando. O HTML roda isolado no admin: `localStorage`/`sessionStorage`/cookie falham lá — proteja com try/catch (o script avisa).
+
+Cite as URLs no bead de origem (comentário): as da OPÇÃO (`✓ publicado:`) E a do GRUPO. O Guard #13 do pre-push (`scripts/check_mockup_protocol_guard.py` do rig) só reconhece URL de OPÇÃO (`…/mockups/<slug>-<8 hex>`); a URL do grupo (`…/mockups/g/<grupo>`) NÃO o satisfaz — citar só o link do grupo não destrava o push.
 
 🚨 NUNCA publique CPF, telefone, endereço, situação sucessória/óbito ou qualquer dado que identifique uma pessoa específica num mockup. O script varre o HTML e recusa sozinho (exit 1), mas em exemplo use número obviamente falso (98888-7777). Dossiê de pessoa ou imóvel específico não é mockup: o lugar é `shared/data/estudos` (também no admin, atrás do Cloudflare Access).
 
