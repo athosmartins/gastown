@@ -4575,6 +4575,251 @@ else
 fi
 chmod 644 "$RUNTIME/launchd/locked-wrapper.sh" 2>/dev/null || true
 
+# ════════════════════════════════════════════════════════════════════════════
+# T142-T146 (ga-5ul9r0): `$VAR/file.py` where the wrapper itself assigns VAR.
+#
+# anuncios-dashboard-wrapper.sh does DIR="$BASEDIR/daemons/anuncios" and then
+# `exec python3 "$DIR/anuncios_dashboard.py"` (leiloes-dashboard has the same shape). The
+# wrapper-follow dropped the `$DIR/` prefix and looked for the bare file name at the runtime
+# ROOT, where it is not, so two LIVE dashboards stayed NÃO RESOLVIDO and no diff could ever
+# mark them AFFECTED (found by ga-lksmar, 23/10). T142 is that shape; T143 the other ways to
+# spell the assignment and the use; T144 what must not count (a comment, an assignment that
+# is not the last) and what is only a fallback; T145 what must stay visible as NÃO RESOLVIDO
+# instead of being guessed; T146 that a token the wrapper does not assign resolves as before.
+# ════════════════════════════════════════════════════════════════════════════
+
+# T142: the bead's wrapper, with the base directory computed the way a real one does it.
+t142_fixture() {
+  mkdir -p "$RUNTIME/daemons/anuncios"
+  cat > "$RUNTIME/daemons/anuncios/anuncios_dashboard.py" <<<'print("anuncios")'
+  cat > "$RUNTIME/launchd/anuncios-dashboard-wrapper.sh" <<'EOF'
+#!/bin/bash
+set -e
+BASEDIR="$(cd "$(dirname "$0")/.." && pwd)"
+DIR="$BASEDIR/daemons/anuncios"
+cd "$BASEDIR"
+exec "$BASEDIR/venv/bin/python3" "$DIR/anuncios_dashboard.py"
+EOF
+  make_plist_wd "$AGENTS" com.test.anuncios "$RUNTIME" /bin/bash "$RUNTIME/launchd/anuncios-dashboard-wrapper.sh"
+  seed_running com.test.anuncios 42001 "$STALE_LSTART"
+  seed_restart com.test.anuncios 42099 "$FRESH_LSTART"
+}
+new_case t142
+t142_fixture
+OUT=$(run_helper daemons/anuncios/anuncios_dashboard.py); RC=$?
+t131_in com.test.anuncios "$(field AFFECTED "$OUT")" \
+  && ok "T142 a dashboard whose wrapper execs \"\$DIR/x.py\" with DIR=\"\$BASEDIR/daemons/anuncios\" is AFFECTED when daemons/anuncios/x.py changes" \
+  || nok "T142 affected" "AFFECTED=[$(field AFFECTED "$OUT")] out=[$OUT]"
+t131_in com.test.anuncios "$(field RESTARTED "$OUT")" \
+  && ok "T142 ...and is restarted" || nok "T142 restarted" "RESTARTED=[$(field RESTARTED "$OUT")]"
+[ "$(field PROOF "$OUT")" = "verified" ] && ok "T142 PROOF=verified" || nok "T142 proof" "got '$(field PROOF "$OUT")'"
+field_is_empty UNRESOLVED_ENTRYPOINTS "$OUT" \
+  && ok "T142 ...and is NOT reported unresolved any more (the line is present and empty)" \
+  || nok "T142 UNRESOLVED_ENTRYPOINTS" "got [$(field UNRESOLVED_ENTRYPOINTS "$OUT")] out=[$OUT]"
+new_case t142b
+t142_fixture
+OUTE=$(run_helper_stderr daemons/anuncios/anuncios_dashboard.py)
+echo "$OUTE" | grep -qF 'com.test.anuncios: $DIR/anuncios_dashboard.py (wrapper launchd/anuncios-dashboard-wrapper.sh) resolved to daemons/anuncios/anuncios_dashboard.py' \
+  && ok "T142 the log line names the token, the wrapper and the file it resolved to" \
+  || nok "T142 log line" "out=[$(echo "$OUTE" | grep anuncios)]"
+
+# T143: the other spellings of the same thing, one label each. (a) `export`, an unquoted
+# value and ${DIR} in the use; (b) the closing quote right before the slash, in the
+# assignment and in the use; (c) `readonly`, an absolute value under the runtime and a
+# sub-path after the variable. Every file is changed in ONE run: each label must come out
+# AFFECTED through its own file.
+new_case t143
+mkdir -p "$RUNTIME/daemons/spa" "$RUNTIME/daemons/spb" "$RUNTIME/daemons/spc/sub"
+for f in spa/app_a.py spb/app_b.py spc/sub/app_c.py; do cat > "$RUNTIME/daemons/$f" <<<'print("x")'; done
+cat > "$RUNTIME/launchd/spa-wrapper.sh" <<'EOF'
+#!/bin/bash
+BASEDIR="$(cd "$(dirname "$0")/.." && pwd)"
+export DIR=$BASEDIR/daemons/spa
+exec python3 ${DIR}/app_a.py
+EOF
+cat > "$RUNTIME/launchd/spb-wrapper.sh" <<'EOF'
+#!/bin/bash
+BASEDIR="$(cd "$(dirname "$0")/.." && pwd)"
+DIR="$BASEDIR"/daemons/spb
+exec python3 "$DIR"/app_b.py
+EOF
+cat > "$RUNTIME/launchd/spc-wrapper.sh" <<EOF
+#!/bin/bash
+readonly APPDIR="$RUNTIME/daemons/spc"
+exec python3 "\${APPDIR}/sub/app_c.py"
+EOF
+pid=43001
+for l in spa spb spc; do
+  make_plist_wd "$AGENTS" "com.test.$l" "$RUNTIME" /bin/bash "$RUNTIME/launchd/$l-wrapper.sh"
+  seed_running "com.test.$l" "$pid" "$STALE_LSTART"
+  seed_restart "com.test.$l" "$((pid + 98))" "$FRESH_LSTART"
+  pid=$((pid + 1))
+done
+OUT=$(run_helper daemons/spa/app_a.py daemons/spb/app_b.py daemons/spc/sub/app_c.py); RC=$?
+t131_in com.test.spa "$(field AFFECTED "$OUT")" \
+  && ok "T143 (a) \`export DIR=\$BASEDIR/daemons/spa\` (unquoted) + \${DIR}/app_a.py resolves" \
+  || nok "T143 (a)" "AFFECTED=[$(field AFFECTED "$OUT")] out=[$OUT]"
+t131_in com.test.spb "$(field AFFECTED "$OUT")" \
+  && ok "T143 (b) DIR=\"\$BASEDIR\"/daemons/spb + \"\$DIR\"/app_b.py (quote closed before the slash) resolves" \
+  || nok "T143 (b)" "AFFECTED=[$(field AFFECTED "$OUT")] out=[$OUT]"
+t131_in com.test.spc "$(field AFFECTED "$OUT")" \
+  && ok "T143 (c) \`readonly\` + an absolute value under the runtime + a sub-path after the variable resolves" \
+  || nok "T143 (c)" "AFFECTED=[$(field AFFECTED "$OUT")] out=[$OUT]"
+field_is_empty UNRESOLVED_ENTRYPOINTS "$OUT" \
+  && ok "T143 ...and none of the three is reported unresolved" \
+  || nok "T143 UNRESOLVED_ENTRYPOINTS" "got [$(field UNRESOLVED_ENTRYPOINTS "$OUT")]"
+
+# T144: what is NOT an assignment, and which assignment wins. Step 3 also matches an
+# entrypoint by BASENAME (a changed app.py anywhere flags every label whose entrypoint is an
+# app.py), so a decoy with the same file name in another directory cannot be told apart by
+# AFFECTED; the log line "resolved to <file>" is what names the directory that won.
+# The wrapper has a COMMENT that re-points DIR at daemons/old AFTER the real assignment, and a
+# commented-out launch of commented.py: neither is a launch, the entrypoint is
+# daemons/real/app.py. Then two real assignments: the LAST wins when its directory holds the
+# file; an earlier one is the fallback when the last directory does not.
+new_case t144
+mkdir -p "$RUNTIME/daemons/real" "$RUNTIME/daemons/old"
+cat > "$RUNTIME/daemons/real/app.py" <<<'print("real")'
+cat > "$RUNTIME/daemons/real/commented.py" <<<'print("commented")'
+cat > "$RUNTIME/daemons/old/app.py" <<<'print("old")'
+cat > "$RUNTIME/launchd/docvar-wrapper.sh" <<'EOF'
+#!/bin/bash
+BASEDIR="$(cd "$(dirname "$0")/.." && pwd)"
+DIR="$BASEDIR/daemons/real"
+# DIR="$BASEDIR/daemons/old"          <- the old home, kept here as documentation
+# it used to run: exec python3 "$DIR/commented.py"
+exec python3 "$DIR/app.py"
+EOF
+make_plist_wd "$AGENTS" com.test.docvar "$RUNTIME" /bin/bash "$RUNTIME/launchd/docvar-wrapper.sh"
+seed_running com.test.docvar 44001 "$STALE_LSTART"
+OUTE=$(run_helper_stderr daemons/real/app.py)
+echo "$OUTE" | grep -qF 'com.test.docvar: $DIR/app.py (wrapper launchd/docvar-wrapper.sh) resolved to daemons/real/app.py' \
+  && ok "T144 a commented-out re-assignment of DIR does not win: the real assignment's directory is used" \
+  || nok "T144 comment counted as an assignment" "out=[$(echo "$OUTE" | grep docvar)]"
+! echo "$OUTE" | grep -qF 'com.test.docvar: $DIR/commented.py' \
+  && ok "T144 ...and a commented-out launch is not a token" \
+  || nok "T144 commented-out launch resolved" "out=[$(echo "$OUTE" | grep docvar)]"
+new_case t144c
+mkdir -p "$RUNTIME/daemons/first" "$RUNTIME/daemons/last" "$RUNTIME/daemons/hasit" "$RUNTIME/daemons/nofile"
+for d in first last hasit; do cat > "$RUNTIME/daemons/$d/app.py" <<<'print("x")'; done
+cat > "$RUNTIME/launchd/lastwins-wrapper.sh" <<'EOF'
+#!/bin/bash
+BASEDIR="$(cd "$(dirname "$0")/.." && pwd)"
+DIR="$BASEDIR/daemons/first"
+DIR="$BASEDIR/daemons/last"
+exec python3 "$DIR/app.py"
+EOF
+cat > "$RUNTIME/launchd/fallback-wrapper.sh" <<'EOF'
+#!/bin/bash
+BASEDIR="$(cd "$(dirname "$0")/.." && pwd)"
+DIR="$BASEDIR/daemons/hasit"
+DIR="$BASEDIR/daemons/nofile"
+exec python3 "$DIR/app.py"
+EOF
+pid=45001
+for l in lastwins fallback; do
+  make_plist_wd "$AGENTS" "com.test.$l" "$RUNTIME" /bin/bash "$RUNTIME/launchd/$l-wrapper.sh"
+  seed_running "com.test.$l" "$pid" "$STALE_LSTART"
+  pid=$((pid + 1))
+done
+OUTE=$(run_helper_stderr daemons/last/app.py)
+echo "$OUTE" | grep -qF 'com.test.lastwins: $DIR/app.py (wrapper launchd/lastwins-wrapper.sh) resolved to daemons/last/app.py' \
+  && ok "T144 two assignments both holding the file: the LAST one's directory is used" \
+  || nok "T144 last assignment" "out=[$(echo "$OUTE" | grep lastwins)]"
+! echo "$OUTE" | grep -qF 'com.test.lastwins: $DIR/app.py (wrapper launchd/lastwins-wrapper.sh) resolved to daemons/first/app.py' \
+  && ok "T144 ...and the first one's is not" \
+  || nok "T144 first assignment won" "out=[$(echo "$OUTE" | grep lastwins)]"
+echo "$OUTE" | grep -qF 'com.test.fallback: $DIR/app.py (wrapper launchd/fallback-wrapper.sh) resolved to daemons/hasit/app.py' \
+  && ok "T144 an earlier assignment is the fallback when the last directory does not hold the file" \
+  || nok "T144 fallback" "out=[$(echo "$OUTE" | grep fallback)]"
+
+# T145: whatever cannot be placed is REPORTED, never guessed. Six RUNNING labels; for each the
+# tempting file exists and is changed, and none may come out AFFECTED — all six are named in
+# UNRESOLVED_ENTRYPOINTS instead. u1 computed value; u2 single-quoted (the `$` is literal);
+# u3 a `..` that leaves the checkout (the directory exists there); u4 the assigned directory
+# exists but does not hold the file (it lives next door); u5 a `..` in the use; u6 a variable
+# the wrapper never assigns (it comes from the environment).
+new_case t145
+mkdir -p "$RUNTIME/daemons/u1" "$RUNTIME/daemons/u2" "$RUNTIME/daemons/u4" "$RUNTIME/daemons/u4_other" \
+  "$RUNTIME/daemons/u5" "$RUNTIME/daemons/u5_up" "$RUNTIME/daemons/u6" "$CASE_DIR/daemons/u3"
+for f in "$RUNTIME/daemons/u1/app.py" "$RUNTIME/daemons/u2/app.py" "$CASE_DIR/daemons/u3/app.py" \
+         "$RUNTIME/daemons/u4_other/app.py" "$RUNTIME/daemons/u5_up/app.py" "$RUNTIME/daemons/u6/app.py"; do
+  cat > "$f" <<<'print("x")'
+done
+t145_wrapper() {  # t145_wrapper <label-suffix> <assignment line> <exec path>
+  { echo '#!/bin/bash'
+    echo 'BASEDIR="$(cd "$(dirname "$0")/.." && pwd)"'
+    [ -n "$2" ] && echo "$2"
+    echo "exec python3 \"$3\""
+  } > "$RUNTIME/launchd/$1-wrapper.sh"
+}
+t145_wrapper u1 'DIR="$(dirname "$0")/../daemons/u1"' '$DIR/app.py'
+t145_wrapper u2 "DIR='\$BASEDIR/daemons/u2'"           '$DIR/app.py'
+t145_wrapper u3 'DIR="$BASEDIR/../daemons/u3"'         '$DIR/app.py'
+t145_wrapper u4 'DIR="$BASEDIR/daemons/u4"'            '$DIR/app.py'
+t145_wrapper u5 'DIR="$BASEDIR/daemons/u5"'            '$DIR/../u5_up/app.py'
+t145_wrapper u6 ''                                     '$APPDIR/app.py'
+pid=46001
+for l in u1 u2 u3 u4 u5 u6; do
+  make_plist_wd "$AGENTS" "com.test.$l" "$RUNTIME" /bin/bash "$RUNTIME/launchd/$l-wrapper.sh"
+  seed_running "com.test.$l" "$pid" "$STALE_LSTART"
+  pid=$((pid + 1))
+done
+OUT=$(run_helper daemons/u1/app.py daemons/u2/app.py daemons/u4_other/app.py daemons/u5_up/app.py daemons/u6/app.py); RC=$?
+[ "$(field UNRESOLVED_ENTRYPOINTS "$OUT")" = "com.test.u1 com.test.u2 com.test.u3 com.test.u4 com.test.u5 com.test.u6" ] \
+  && ok "T145 a computed value, a single-quoted one, a \`..\` out of the checkout, a directory without the file, a \`..\` in the use and an unassigned variable are ALL named in UNRESOLVED_ENTRYPOINTS" \
+  || nok "T145 UNRESOLVED_ENTRYPOINTS" "got [$(field UNRESOLVED_ENTRYPOINTS "$OUT")] out=[$OUT]"
+t145_hit=""
+for l in u1 u2 u3 u4 u5 u6; do t131_in "com.test.$l" "$(field AFFECTED "$OUT")" && t145_hit="$t145_hit $l"; done
+[ -z "$t145_hit" ] \
+  && ok "T145 ...and none of them is guessed into AFFECTED by the changed file next to it" \
+  || nok "T145 guessed AFFECTED" "labels:$t145_hit AFFECTED=[$(field AFFECTED "$OUT")]"
+
+# T146: a token whose variable the wrapper assigns to the runtime root itself, and one whose
+# variable it never assigns, keep resolving the way they did (the pass that strips the
+# `$VAR/` prefix). The first must not be announced a second time by the new pass.
+new_case t146
+mkdir -p "$RUNTIME/daemons"
+cat > "$RUNTIME/daemons/classic.py" <<<'print("classic")'
+cat > "$RUNTIME/daemons/classic2.py" <<<'print("classic2")'
+cat > "$RUNTIME/launchd/classic-wrapper.sh" <<EOF
+#!/bin/bash
+BASEDIR="$RUNTIME"
+exec python3 "\$BASEDIR/daemons/classic.py"
+EOF
+cat > "$RUNTIME/launchd/classic2-wrapper.sh" <<'EOF'
+#!/bin/bash
+exec python3 "$BASEDIR/daemons/classic2.py"
+EOF
+pid=47001
+for l in classic classic2; do
+  make_plist_wd "$AGENTS" "com.test.$l" "$RUNTIME" /bin/bash "$RUNTIME/launchd/$l-wrapper.sh"
+  seed_running "com.test.$l" "$pid" "$STALE_LSTART"
+  seed_restart "com.test.$l" "$((pid + 98))" "$FRESH_LSTART"
+  pid=$((pid + 1))
+done
+OUT=$(run_helper daemons/classic.py daemons/classic2.py); RC=$?
+t131_in com.test.classic "$(field AFFECTED "$OUT")" && t131_in com.test.classic2 "$(field AFFECTED "$OUT")" \
+  && ok "T146 \$BASEDIR/daemons/x.py resolves whether BASEDIR is assigned (to the root) in the wrapper or not" \
+  || nok "T146 classic tokens" "AFFECTED=[$(field AFFECTED "$OUT")] out=[$OUT]"
+field_is_empty UNRESOLVED_ENTRYPOINTS "$OUT" \
+  && ok "T146 ...with nothing reported unresolved" \
+  || nok "T146 UNRESOLVED_ENTRYPOINTS" "got [$(field UNRESOLVED_ENTRYPOINTS "$OUT")]"
+new_case t146b
+mkdir -p "$RUNTIME/daemons"
+cat > "$RUNTIME/daemons/classic.py" <<<'print("classic")'
+cat > "$RUNTIME/launchd/classic-wrapper.sh" <<EOF
+#!/bin/bash
+BASEDIR="$RUNTIME"
+exec python3 "\$BASEDIR/daemons/classic.py"
+EOF
+make_plist_wd "$AGENTS" com.test.classic "$RUNTIME" /bin/bash "$RUNTIME/launchd/classic-wrapper.sh"
+seed_running com.test.classic 47201 "$STALE_LSTART"
+OUTE=$(run_helper_stderr daemons/classic.py)
+! echo "$OUTE" | grep -q 'com.test.classic: \$BASEDIR/daemons/classic.py (wrapper' \
+  && ok "T146 a file the first pass already resolved is not announced again by the new one" \
+  || nok "T146 announced twice" "out=[$(echo "$OUTE" | grep classic)]"
+
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "daemon-refresh tests: $PASS passed, $FAIL failed"

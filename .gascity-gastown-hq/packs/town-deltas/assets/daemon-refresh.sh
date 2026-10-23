@@ -770,6 +770,29 @@
 #      unresolved and reported too: "which file does flask run" is exactly what
 #      this script cannot tell.
 #
+#  26. (ga-5ul9r0) `$VAR/file.py` where the WRAPPER assigns VAR. The WA
+#      anuncios-dashboard and leiloes-dashboard wrappers do
+#      DIR="$BASEDIR/daemons/anuncios" and then `exec python3
+#      "$DIR/anuncios_dashboard.py"`. The `.py` pass of the wrapper-follow drops the
+#      `$DIR/` prefix and looks for the bare file name at the runtime root, where it
+#      is not (it is under daemons/anuncios/), so both — live processes — stayed
+#      NÃO RESOLVIDO (point 25) and no diff could mark them AFFECTED.
+#      Now: for every `$VAR/rest.py`, `${VAR}/rest.py` or `"$VAR"/rest.py` in the
+#      wrapper's non-comment text, resolve_var_py() tries the directory of each plain
+#      assignment to VAR (`VAR=…`, `export VAR=…`, `readonly VAR=…`; the last one
+#      first) and takes the first that holds rest.py. Same text-only rule as point
+#      25: the wrapper is never run, sourced or eval'd. A leading `$X/` in the value
+#      is ASSUMED to be the wrapper's base directory (it is the runtime root), as
+#      resolve_reldir() assumes for a `cd` target; the file must exist there.
+#      What it does NOT do (each stays NÃO RESOLVIDO for a running label, none is
+#      guessed): a computed value (`$(…)`, backticks), a single-quoted one, a `..`
+#      component in the value or in rest, a directory that does not hold the file, a
+#      variable the wrapper never assigns, and a chain (`A="$B/x"` after
+#      `B="$BASEDIR/y"`: B is taken as the root, so only a lucky same-named
+#      directory could resolve it). Not covered either: the wrappers that exec
+#      nothing from the repo (com.phoneproxy.adbforward*, com.phoneproxy.relay*,
+#      com.urblink.dialer-ari-tunnel) — "could not check" is the right answer there.
+#
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
 #
@@ -2370,6 +2393,74 @@ $wdrel"
   return 1
 }
 
+# ── `$VAR/file.py` where the wrapper itself assigns VAR (ga-5ul9r0) ───────────
+# launchd/anuncios-dashboard-wrapper.sh does DIR="$BASEDIR/daemons/anuncios" and then
+# `exec python3 "$DIR/anuncios_dashboard.py"` (leiloes-dashboard is the same shape). The
+# `.py` pass of the wrapper-follow hands that token to resolve_relpath(), which drops the
+# `$DIR/` prefix and looks for the bare file name at the runtime ROOT — the file is under
+# daemons/anuncios/ — so two LIVE dashboards stayed NÃO RESOLVIDO (found by ga-lksmar,
+# 23/10). The three helpers below read what the wrapper says DIR is, and only that: the same
+# text-only rule as resolve_dash_m (no `source`, no `eval`, the wrapper is never run),
+# comments stripped.
+
+# wrapper_var_py_tokens <wrapper file>: one "VAR rest.py" line for every `$VAR/rest.py`,
+# `${VAR}/rest.py` or `"$VAR"/rest.py` in the wrapper's non-comment text.
+wrapper_var_py_tokens() {  # wrapper_var_py_tokens <file>
+  # vazio → nothing printed, the caller adds nothing; falhou/ilegível (sed cannot open the
+  # wrapper) → the same nothing, and a label left with no entrypoint at all is then said
+  # NÃO RESOLVIDO by the branch below (T141), never read as "checked clean"
+  sed -E 's/^[[:space:]]*#.*$//; s/[[:space:]]#.*$//' "$1" 2>/dev/null \
+    | grep -oE '\$\{?[A-Za-z_][A-Za-z0-9_]*\}?"?/[^"[:space:]]+\.py' \
+    | sed -E 's/^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?"?\/(.*)$/\1 \2/'
+}
+
+# wrapper_var_dirs <wrapper file> <VAR>: the runtime-relative directory of every plain
+# assignment to VAR in the wrapper (`VAR=…`, `export VAR=…`, `readonly VAR=…`), the LAST
+# assignment first, one per line ("." for the runtime root). An assignment whose value
+# cannot be placed prints nothing: a computed one (`$(…)` or backticks), a single-quoted
+# one (its `$` is literal), and whatever resolve_reldir() refuses (outside the runtime, a
+# `..` component, no such directory). A leading `$X/` in the value is ASSUMED to be the
+# wrapper's base directory, exactly as resolve_reldir() assumes it for a `cd` target; a
+# chain (`A="$B/x"` after `B="$BASEDIR/y"`) is not followed: B counts as the root like any
+# other `$X`, so the chain falls short (NÃO RESOLVIDO) unless a directory of that name
+# happens to hold the file at the root. Every directory is only a place to LOOK:
+# resolve_var_py() registers a file only if it exists there.
+wrapper_var_dirs() {  # wrapper_var_dirs <file> <VAR>
+  local line val
+  # vazio → nothing printed (VAR is not assigned in the wrapper); falhou/ilegível (sed
+  # cannot open it) → the same nothing, an unplaced directory is never a guessed one
+  while IFS= read -r line; do
+    val="${line#*=}"
+    case "$val" in
+      \'*) continue ;;
+    esac
+    val="${val%%[[:space:];&|)]*}"
+    val="${val//\"/}"
+    case "$val" in
+      *'$('*|*'`'*) continue ;;
+    esac
+    resolve_reldir "$val" || true
+  done < <(sed -E 's/^[[:space:]]*#.*$//; s/[[:space:]]#.*$//' "$1" 2>/dev/null \
+             | grep -E "^[[:space:]]*((export|readonly)[[:space:]]+)?$2=" \
+             | awk '{ a[NR] = $0 } END { for (i = NR; i >= 1; i--) print a[i] }')
+}
+
+# resolve_var_py <wrapper file> <VAR> <rest.py>: the runtime-relative file `$VAR/rest.py`
+# names, or nothing + rc 1. VAR's directories come from wrapper_var_dirs (the last assignment
+# first) and the first one that holds the file wins; a file that is not there is
+# "unresolved", never a guess. A `rest` with a `..` component never counts — it would leave
+# the checkout.
+resolve_var_py() {  # resolve_var_py <wrapper file> <VAR> <rest.py>
+  local file="$1" var="$2" rest="$3" dir cand
+  case "/$rest/" in */../*) return 1 ;; esac
+  while IFS= read -r dir; do
+    [ -n "$dir" ] || continue
+    if [ "$dir" = "." ]; then cand="$rest"; else cand="$dir/$rest"; fi
+    [ -f "$RUNTIME_DIR/$cand" ] && { echo "$cand"; return 0; }
+  done < <(wrapper_var_dirs "$file" "$var")
+  return 1
+}
+
 # note_unresolved <label> <why>: say "NÃO RESOLVIDO" for a label whose launch this run
 # could not tie to a file, and list it in UNRESOLVED_ENTRYPOINTS — but ONLY when the
 # label has a live process. Only a running process can be serving stale code that
@@ -2448,6 +2539,21 @@ for plist in "$LAUNCH_AGENTS_DIR"/*.plist; do
             prel="$(resolve_relpath "$tok" || true)"
             [ -n "$prel" ] && entry="$entry $prel"
           done < <(grep -oE '[^"[:space:]]+\.py' "$RUNTIME_DIR/$wrel" 2>/dev/null || true)
+          # ga-5ul9r0: `$DIR/x.py` where the wrapper itself says DIR="$BASEDIR/sub". The
+          # pass above looks for x.py at the runtime root; this one looks in sub/ (the
+          # directory the wrapper assigns to DIR).
+          # vazio → no entry added; falhou/ilegível → the same, and a label left with no
+          # entrypoint at all is said NÃO RESOLVIDO below (never "checked clean")
+          while read -r wvar wrest; do
+            [ -n "$wvar" ] || continue
+            vrel="$(resolve_var_py "$RUNTIME_DIR/$wrel" "$wvar" "$wrest" || true)"
+            [ -n "$vrel" ] || continue
+            case " $entry " in
+              *" $vrel "*) ;;   # the pass above already had it: nothing new to say
+              *) entry="$entry $vrel"
+                 log "$label: \$$wvar/$wrest (wrapper $wrel) resolved to $vrel" ;;
+            esac
+          done < <(wrapper_var_py_tokens "$RUNTIME_DIR/$wrel")
           # ga-lksmar: the wrapper may exec `python -m pkg.mod` instead of a .py
           # path (the WA cockpit does). Resolve the module against the dirs the
           # wrapper cd's into, then the plist's WorkingDirectory, then the root.
