@@ -1,0 +1,457 @@
+diff --git a/cmd/gc/beads_provider_lifecycle.go b/cmd/gc/beads_provider_lifecycle.go
+index 0de98d834..53835a5a7 100644
+--- a/cmd/gc/beads_provider_lifecycle.go
++++ b/cmd/gc/beads_provider_lifecycle.go
+@@ -8,7 +8,6 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"log"
+-	"net"
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
+@@ -1347,16 +1346,13 @@ func pidAlive(pid int) bool {
+ 	return pidutil.Alive(pid)
+ }
+ 
++// doltPortReachable reports whether the managed Dolt port accepted a
++// connection. The probe retries a dial that timed out (a saturated host drops
++// SYNs; a single 250ms attempt read that as "down"), but a probe that never
++// completed still answers false here: the callers of this bool decide on port
++// selection and publication, where "assume it is alive" needs a per-site audit.
+ func doltPortReachable(port string) bool {
+-	if strings.TrimSpace(port) == "" {
+-		return false
+-	}
+-	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", port), 250*time.Millisecond)
+-	if err != nil {
+-		return false
+-	}
+-	_ = conn.Close()
+-	return true
++	return contract.ProbePort("127.0.0.1", strings.TrimSpace(port)) == contract.PortProbeReachable
+ }
+ 
+ // writeDoltPortFile writes the managed Dolt port into dir/.beads/dolt-server.port.
+diff --git a/internal/beads/contract/connection.go b/internal/beads/contract/connection.go
+index cc0e6d21d..f60a992e8 100644
+--- a/internal/beads/contract/connection.go
++++ b/internal/beads/contract/connection.go
+@@ -5,13 +5,11 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+-	"net"
+ 	"net/netip"
+ 	"os"
+ 	"path/filepath"
+ 	"strconv"
+ 	"strings"
+-	"time"
+ 
+ 	"github.com/gastownhall/gascity/internal/fsys"
+ 	"github.com/gastownhall/gascity/internal/pidutil"
+@@ -700,6 +698,16 @@ func readManagedRuntimeState(fs fsys.FS, cityRoot string) (managedRuntimeState,
+ 	return state, nil
+ }
+ 
++// validManagedRuntimeState reports whether the published managed-runtime state
++// still describes a Dolt this caller should dial. The state file is written
++// atomically, so once its fields, data dir and (for a local host) PID check out,
++// the only thing the port probe can add is "nobody listens". A probe that never
++// completed — a saturated host dropping SYNs — says nothing of the sort, so on a
++// local host (where the live PID corroborates the state) it keeps the state valid
++// and lets the real client dial the real port and report its own failure;
++// discarding the state there sends bd to port 0 (ga-e5jbpl). On a non-local host
++// there is no PID to lean on, the probe is the only evidence, and a miss stays a
++// miss.
+ func validManagedRuntimeState(state managedRuntimeState, cityRoot string) bool {
+ 	if !state.Running || state.Port <= 0 || state.PID <= 0 {
+ 		return false
+@@ -709,24 +717,20 @@ func validManagedRuntimeState(state managedRuntimeState, cityRoot string) bool {
+ 		return false
+ 	}
+ 	host := managedCityHost()
+-	if managedCityHostRequiresLocalPID(host) && !contractPIDAlive(state.PID) {
++	pidCorroborates := managedCityHostRequiresLocalPID(host)
++	if pidCorroborates && !contractPIDAlive(state.PID) {
++		return false
++	}
++	switch ProbePort(host, strconv.Itoa(state.Port)) {
++	case PortProbeReachable:
++		return true
++	case PortProbeInconclusive:
++		return pidCorroborates
++	default:
+ 		return false
+ 	}
+-	return contractPortReachable(host, strconv.Itoa(state.Port))
+ }
+ 
+ func contractPIDAlive(pid int) bool {
+ 	return pidutil.Alive(pid)
+ }
+-
+-func contractPortReachable(host, port string) bool {
+-	if strings.TrimSpace(port) == "" {
+-		return false
+-	}
+-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), 250*time.Millisecond)
+-	if err != nil {
+-		return false
+-	}
+-	_ = conn.Close()
+-	return true
+-}
+diff --git a/internal/beads/contract/connection_test.go b/internal/beads/contract/connection_test.go
+index 0290ca8ce..4cd17507b 100644
+--- a/internal/beads/contract/connection_test.go
++++ b/internal/beads/contract/connection_test.go
+@@ -403,6 +403,90 @@ func TestResolveDoltConnectionTargetRejectsManagedRuntimeStateWithUnreachablePor
+ 	}
+ }
+ 
++// A saturated host can leave the port probe without an answer (timeouts, not a
++// refusal) while Dolt is alive and the state file is intact. The state must stay
++// valid and carry its port; discarding it sent bd to port 0 (ga-e5jbpl).
++func TestResolveDoltConnectionTargetKeepsManagedRuntimeStateWhenPortProbeIsInconclusive(t *testing.T) {
++	fs := fsys.OSFS{}
++	city := t.TempDir()
++	writeCanonicalConfig(t, fs, city, ConfigState{
++		IssuePrefix:    "gc",
++		EndpointOrigin: EndpointOriginManagedCity,
++		EndpointStatus: EndpointStatusVerified,
++	})
++	writeCanonicalMetadata(t, fs, city, "hq")
++	writeRuntimeState(t, fs, city, fmt.Sprintf(`{"running":true,"pid":%d,"port":52756,"data_dir":%q}`, os.Getpid(), filepath.Join(city, ".beads", "dolt")))
++	calls, _ := stubPortProbe(t, func(int) (net.Conn, error) { return nil, dialTimedOut() })
++
++	target, err := ResolveDoltConnectionTarget(fs, city, city)
++	if err != nil {
++		t.Fatalf("ResolveDoltConnectionTarget() error = %v, want the state kept while the probe is inconclusive", err)
++	}
++	if target.Host != "127.0.0.1" || target.Port != "52756" || target.External {
++		t.Fatalf("target = %+v, want managed 127.0.0.1:52756", target)
++	}
++	if len(*calls) != len(portProbeTimeouts) {
++		t.Fatalf("probe dials = %d, want %d (every attempt spent before giving up)", len(*calls), len(portProbeTimeouts))
++	}
++}
++
++func TestResolveDoltConnectionTargetKeepsInheritedRigRuntimeStateWhenPortProbeIsInconclusive(t *testing.T) {
++	fs := fsys.OSFS{}
++	city := t.TempDir()
++	rig := filepath.Join(t.TempDir(), "frontend")
++	writeCanonicalConfig(t, fs, rig, ConfigState{IssuePrefix: "fe"})
++	writeCanonicalMetadata(t, fs, rig, "fe")
++	writeRuntimeState(t, fs, city, fmt.Sprintf(`{"running":true,"pid":%d,"port":52756,"data_dir":%q}`, os.Getpid(), filepath.Join(city, ".beads", "dolt")))
++	stubPortProbe(t, func(int) (net.Conn, error) { return nil, dialTimedOut() })
++
++	target, err := ResolveDoltConnectionTarget(fs, city, rig)
++	if err != nil {
++		t.Fatalf("ResolveDoltConnectionTarget() error = %v, want the state kept while the probe is inconclusive", err)
++	}
++	if target.EndpointOrigin != EndpointOriginInheritedCity || target.Host != "127.0.0.1" || target.Port != "52756" {
++		t.Fatalf("target = %+v, want inherited-city 127.0.0.1:52756", target)
++	}
++}
++
++// Without a local PID to corroborate it, the probe is the only evidence of life
++// for a non-local host, so an inconclusive probe there must not keep the state.
++func TestResolveDoltConnectionTargetRejectsNonLocalManagedRuntimeStateWhenPortProbeIsInconclusive(t *testing.T) {
++	t.Setenv(ManagedCityHostEnv, "192.0.2.1")
++	fs := fsys.OSFS{}
++	city := t.TempDir()
++	writeCanonicalConfig(t, fs, city, ConfigState{
++		IssuePrefix:    "gc",
++		EndpointOrigin: EndpointOriginManagedCity,
++		EndpointStatus: EndpointStatusVerified,
++	})
++	writeCanonicalMetadata(t, fs, city, "hq")
++	writeRuntimeState(t, fs, city, fmt.Sprintf(`{"running":true,"pid":%d,"port":52756,"data_dir":%q}`, os.Getpid(), filepath.Join(city, ".beads", "dolt")))
++	stubPortProbe(t, func(int) (net.Conn, error) { return nil, dialTimedOut() })
++
++	if _, err := ResolveDoltConnectionTarget(fs, city, city); err == nil || !IsManagedRuntimeUnavailable(err) {
++		t.Fatalf("ResolveDoltConnectionTarget() error = %v, want ErrManagedRuntimeUnavailable: nothing corroborates a non-local state", err)
++	}
++}
++
++// The other half of the same rule: a refusal is an answer, so a stale state
++// whose port nobody listens on is still rejected.
++func TestResolveDoltConnectionTargetRejectsManagedRuntimeStateWhenPortProbeIsRefused(t *testing.T) {
++	fs := fsys.OSFS{}
++	city := t.TempDir()
++	writeCanonicalConfig(t, fs, city, ConfigState{
++		IssuePrefix:    "gc",
++		EndpointOrigin: EndpointOriginManagedCity,
++		EndpointStatus: EndpointStatusVerified,
++	})
++	writeCanonicalMetadata(t, fs, city, "hq")
++	writeRuntimeState(t, fs, city, fmt.Sprintf(`{"running":true,"pid":%d,"port":52756,"data_dir":%q}`, os.Getpid(), filepath.Join(city, ".beads", "dolt")))
++	stubPortProbe(t, func(int) (net.Conn, error) { return nil, dialRefused() })
++
++	if _, err := ResolveDoltConnectionTarget(fs, city, city); err == nil || !IsManagedRuntimeUnavailable(err) {
++		t.Fatalf("ResolveDoltConnectionTarget() error = %v, want ErrManagedRuntimeUnavailable for a refused port", err)
++	}
++}
++
+ func TestResolveDoltConnectionTargetRejectsManagedRuntimeStateWithWrongDataDir(t *testing.T) {
+ 	fs := fsys.OSFS{}
+ 	city := t.TempDir()
+diff --git a/internal/beads/contract/portprobe.go b/internal/beads/contract/portprobe.go
+new file mode 100644
+index 000000000..40a2c48aa
+--- /dev/null
++++ b/internal/beads/contract/portprobe.go
+@@ -0,0 +1,78 @@
++package contract
++
++import (
++	"errors"
++	"net"
++	"strconv"
++	"syscall"
++	"time"
++)
++
++// PortProbe is the outcome of ProbePort. A dial has three answers, not two:
++// somebody accepted, nobody is listening, or the dial never finished. The last
++// one is what a saturated host produces (a full accept queue drops the SYN and
++// the kernel retransmits after 1s), and it must not be read as "nobody is
++// listening" — that reading is what made `bd` fall through to port 0 while
++// Dolt was alive and merely slow (ga-e5jbpl).
++type PortProbe int
++
++const (
++	// PortProbeReachable means a TCP connection was accepted.
++	PortProbeReachable PortProbe = iota
++	// PortProbeRefused means nothing is listening: the kernel refused the
++	// connection, or there was no port to dial.
++	PortProbeRefused
++	// PortProbeInconclusive means every attempt timed out or failed in a way
++	// that says nothing about whether a server is listening.
++	PortProbeInconclusive
++)
++
++// portProbeTimeouts is the dial budget of each attempt. The first attempt keeps
++// the historical 250ms so a healthy server costs exactly what it always cost;
++// the later ones only run after a dial that neither connected nor was refused.
++// 2s on the last attempt covers one kernel SYN retransmit (1s) with margin.
++var portProbeTimeouts = []time.Duration{250 * time.Millisecond, time.Second, 2 * time.Second}
++
++// portProbeBackoff is the pause between attempts.
++const portProbeBackoff = 50 * time.Millisecond
++
++// Seams for tests; production uses the net and time implementations.
++var (
++	portProbeDial  = net.DialTimeout
++	portProbeSleep = time.Sleep
++)
++
++// ProbePort dials host:port over TCP and classifies the result. Only a refused
++// connection is final; any other failure is retried with a longer budget and,
++// when the attempts run out, reported as PortProbeInconclusive — never as
++// PortProbeRefused.
++func ProbePort(host, port string) PortProbe {
++	// A port that is not a number in 1..65535 cannot be dialed at all, so there is nothing
++	// to wait for: it is "no port to dial", not a dial that failed.
++	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
++		return PortProbeRefused
++	}
++	addr := net.JoinHostPort(host, port)
++	timeouts := portProbeTimeouts
++	if !DoltHostIsLocal(host) {
++		// No local PID can corroborate a miss on another host, and callers treat that miss as
++		// down, so waiting longer only delays the same verdict (and slows every call to a dead host).
++		timeouts = timeouts[:1]
++	}
++	for i, timeout := range timeouts {
++		if i > 0 {
++			portProbeSleep(portProbeBackoff)
++		}
++		// empty (ECONNREFUSED: nobody listens) → Refused, no retry;
++		// failed (timeout, EADDRNOTAVAIL, EMFILE, ...) → retry, then Inconclusive — never Refused
++		conn, err := portProbeDial("tcp", addr, timeout)
++		if err == nil {
++			_ = conn.Close()
++			return PortProbeReachable
++		}
++		if errors.Is(err, syscall.ECONNREFUSED) {
++			return PortProbeRefused
++		}
++	}
++	return PortProbeInconclusive
++}
+diff --git a/internal/beads/contract/portprobe_test.go b/internal/beads/contract/portprobe_test.go
+new file mode 100644
+index 000000000..cfc6a43f6
+--- /dev/null
++++ b/internal/beads/contract/portprobe_test.go
+@@ -0,0 +1,167 @@
++package contract
++
++import (
++	"fmt"
++	"net"
++	"os"
++	"reflect"
++	"syscall"
++	"testing"
++	"time"
++)
++
++type probeDialCall struct {
++	addr    string
++	timeout time.Duration
++}
++
++// stubPortProbe replaces the probe's dial and sleep for one test. dial receives
++// the 0-based attempt number. It returns the calls seen and the sleeps taken.
++func stubPortProbe(t *testing.T, dial func(attempt int) (net.Conn, error)) (*[]probeDialCall, *[]time.Duration) {
++	t.Helper()
++	var calls []probeDialCall
++	var sleeps []time.Duration
++	origDial, origSleep := portProbeDial, portProbeSleep
++	portProbeDial = func(network, addr string, timeout time.Duration) (net.Conn, error) {
++		if network != "tcp" {
++			t.Errorf("dial network = %q, want tcp", network)
++		}
++		calls = append(calls, probeDialCall{addr: addr, timeout: timeout})
++		return dial(len(calls) - 1)
++	}
++	portProbeSleep = func(d time.Duration) { sleeps = append(sleeps, d) }
++	t.Cleanup(func() { portProbeDial, portProbeSleep = origDial, origSleep })
++	return &calls, &sleeps
++}
++
++func dialRefused() error {
++	return &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
++}
++
++func dialTimedOut() error {
++	return &net.OpError{Op: "dial", Net: "tcp", Err: os.ErrDeadlineExceeded}
++}
++
++func TestProbePortRefusedIsFinalAndNotRetried(t *testing.T) {
++	calls, sleeps := stubPortProbe(t, func(int) (net.Conn, error) { return nil, dialRefused() })
++
++	if got := ProbePort("127.0.0.1", "3307"); got != PortProbeRefused {
++		t.Fatalf("ProbePort() = %v, want PortProbeRefused", got)
++	}
++	if len(*calls) != 1 || len(*sleeps) != 0 {
++		t.Fatalf("dials = %d, sleeps = %d; a refused connection is an answer and must not be retried", len(*calls), len(*sleeps))
++	}
++}
++
++func TestProbePortRetriesATimeoutUntilItConnects(t *testing.T) {
++	server, client := net.Pipe()
++	t.Cleanup(func() { _ = server.Close(); _ = client.Close() })
++	calls, sleeps := stubPortProbe(t, func(attempt int) (net.Conn, error) {
++		if attempt < 2 {
++			return nil, dialTimedOut()
++		}
++		return client, nil
++	})
++
++	if got := ProbePort("127.0.0.1", "3307"); got != PortProbeReachable {
++		t.Fatalf("ProbePort() = %v, want PortProbeReachable after two timeouts", got)
++	}
++	if len(*calls) != 3 {
++		t.Fatalf("dials = %d, want 3", len(*calls))
++	}
++	if len(*sleeps) != 2 {
++		t.Fatalf("sleeps = %d, want 2 (one between each pair of attempts)", len(*sleeps))
++	}
++}
++
++func TestProbePortExhaustedTimeoutsAreInconclusiveNeverRefused(t *testing.T) {
++	calls, _ := stubPortProbe(t, func(int) (net.Conn, error) { return nil, dialTimedOut() })
++
++	if got := ProbePort("127.0.0.1", "3307"); got != PortProbeInconclusive {
++		t.Fatalf("ProbePort() = %v, want PortProbeInconclusive: a dial that never finished is not 'nobody listens'", got)
++	}
++	var gotTimeouts []time.Duration
++	for _, c := range *calls {
++		if c.addr != "127.0.0.1:3307" {
++			t.Fatalf("dialed %q, want 127.0.0.1:3307", c.addr)
++		}
++		gotTimeouts = append(gotTimeouts, c.timeout)
++	}
++	if !reflect.DeepEqual(gotTimeouts, portProbeTimeouts) {
++		t.Fatalf("per-attempt timeouts = %v, want %v", gotTimeouts, portProbeTimeouts)
++	}
++	// The retries only help if the budget outlasts the kernel's 1s SYN retransmit.
++	if last := portProbeTimeouts[len(portProbeTimeouts)-1]; last <= time.Second {
++		t.Fatalf("last attempt budget = %v, must exceed the 1s SYN retransmit", last)
++	}
++}
++
++func TestProbePortOtherTransientErrorsAreInconclusiveToo(t *testing.T) {
++	// The exact failure bd reported in ga-e5jbpl is EADDRNOTAVAIL ("can't assign requested address").
++	stubPortProbe(t, func(int) (net.Conn, error) {
++		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.EADDRNOTAVAIL)}
++	})
++
++	if got := ProbePort("127.0.0.1", "3307"); got != PortProbeInconclusive {
++		t.Fatalf("ProbePort() = %v, want PortProbeInconclusive", got)
++	}
++}
++
++func TestProbePortOnAnotherHostIsProbedOnce(t *testing.T) {
++	calls, sleeps := stubPortProbe(t, func(int) (net.Conn, error) { return nil, dialTimedOut() })
++
++	if got := ProbePort("192.0.2.1", "3307"); got != PortProbeInconclusive {
++		t.Fatalf("ProbePort() = %v, want PortProbeInconclusive", got)
++	}
++	if len(*calls) != 1 || len(*sleeps) != 0 {
++		t.Fatalf("dials = %d, sleeps = %d; a non-local host keeps the single fast attempt", len(*calls), len(*sleeps))
++	}
++	if (*calls)[0].timeout != portProbeTimeouts[0] {
++		t.Fatalf("timeout = %v, want %v", (*calls)[0].timeout, portProbeTimeouts[0])
++	}
++}
++
++func TestProbePortRefusedAfterATimeoutIsFinal(t *testing.T) {
++	calls, _ := stubPortProbe(t, func(attempt int) (net.Conn, error) {
++		if attempt == 0 {
++			return nil, dialTimedOut()
++		}
++		return nil, dialRefused()
++	})
++
++	if got := ProbePort("127.0.0.1", "3307"); got != PortProbeRefused {
++		t.Fatalf("ProbePort() = %v, want PortProbeRefused", got)
++	}
++	if len(*calls) != 2 {
++		t.Fatalf("dials = %d, want 2 (timeout, then the refusal ends it)", len(*calls))
++	}
++}
++
++func TestProbePortWithoutADialablePortNeverDials(t *testing.T) {
++	calls, _ := stubPortProbe(t, func(int) (net.Conn, error) { return nil, dialTimedOut() })
++
++	for _, port := range []string{"", " ", "0", "-1", "abc", "65536", "3307 "} {
++		if got := ProbePort("127.0.0.1", port); got != PortProbeRefused {
++			t.Errorf("ProbePort(%q) = %v, want PortProbeRefused", port, got)
++		}
++	}
++	if len(*calls) != 0 {
++		t.Fatalf("dials = %d, want 0: there is nothing to dial", len(*calls))
++	}
++}
++
++func TestProbePortRealSockets(t *testing.T) {
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	port := fmt.Sprintf("%d", listener.Addr().(*net.TCPAddr).Port)
++	if got := ProbePort("127.0.0.1", port); got != PortProbeReachable {
++		t.Fatalf("ProbePort(listening) = %v, want PortProbeReachable", got)
++	}
++
++	_ = listener.Close()
++	if got := ProbePort("127.0.0.1", port); got != PortProbeRefused {
++		t.Fatalf("ProbePort(closed) = %v, want PortProbeRefused", got)
++	}
++}
