@@ -1,4 +1,4 @@
-# pilot-dispatcher.wa-node-spawn.mutants.py — o mutador do pilot-dispatcher.wa-node-spawn.selftest.sh (ga-2hd02v.3): 86 quebras de UMA linha do pilot-dispatcher.sh, cada uma com um nome.
+# pilot-dispatcher.wa-node-spawn.mutants.py — o mutador do pilot-dispatcher.wa-node-spawn.selftest.sh (ga-2hd02v.3): 89 quebras de UMA linha do pilot-dispatcher.sh, cada uma com um nome.
 #
 # Contents
 #   Uso · Como cada mutante é escrito
@@ -318,6 +318,22 @@ def _():
     rep('[ "$_ro_rc" -eq 0 ] || _ro_step="o aviso falhou (rc=$_ro_rc)"', ':')
 
 
+# ga-2hd02v.4.13: o aviso tem de dar ao worker do nó o MESMO `bd -C <rig> …` que o prompt dele manda (sem -C o atalho lê a cidade e a lista volta vazia)
+@m("aviso-sem-c")
+def _():
+    rep("ache com 'bd -C $_ro_rig list", "ache com 'bd list")
+
+
+@m("aviso-rig-vazio")
+def _():
+    rep('  [ -n "$_ro_rig" ] || _ro_rig="$_ro_store"\n', '')
+
+
+@m("aviso-sempre-pasta")
+def _():
+    rep("ache com 'bd -C $_ro_rig list", "ache com 'bd -C $_ro_store list")
+
+
 @m("sem-nota-de-prazo")
 def _():
     rep('    _pilot_note_spawn_timing "$_ro_rc" "$_ro_t0"\n', '')
@@ -465,12 +481,12 @@ def _():
 
 @m("ocioso-wa-sem-optar")
 def _():
-    rep('pilot.wa_node_alias "$(_pilot_node_idle_secs)" || _wo_rc=$?', 'pilot.wa_node_alias || _wo_rc=$?')
+    rep('pilot.wa_node_alias "$(_pilot_node_idle_secs)" whatsapp_automation || _wo_rc=$?', 'pilot.wa_node_alias "" whatsapp_automation || _wo_rc=$?')
 
 
 @m("ocioso-ps-sem-optar")
 def _():
-    rep('pilot.wa_node_alias "$(_pilot_node_idle_secs)" || _po_rc=$?', 'pilot.wa_node_alias || _po_rc=$?')
+    rep('pilot.wa_node_alias "$(_pilot_node_idle_secs)" property_scrapers || _po_rc=$?', 'pilot.wa_node_alias "" property_scrapers || _po_rc=$?')
 
 
 @m("idle-secs-padrao")

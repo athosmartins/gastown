@@ -176,7 +176,7 @@ D() { # D <modo> <rc do script> [dry] — o decide inteiro, alvo wa-worker
   export PILOT_WA_NODE_ROUTE="$1" FAKE_RC="${2:-0}" DRY_RUN="${3:-0}"
   H _pilot_wa_node_decide "$ID" "$ST" wa-worker
 }
-O() { H _pilot_node_remote_open wa-worker-remote "$1" "$ID" "$ST" "${2-Título X}" pilot.wa_node_alias; }   # O <alias> [título]
+O() { H _pilot_node_remote_open wa-worker-remote "$1" "$ID" "$ST" "${2-Título X}" pilot.wa_node_alias "" whatsapp_automation; }   # O <alias> [título]   (o 8º argumento é o rig do `bd -C`, como o chamador real passa; o 7º, a quietude, vai vazio = ociosa desligada)
 W() { H _pilot_wa_node_open "$ID" "$ST"; }
 OR() { H _pilot_node_remote_open wa-worker-remote "$1" "$ID" "$ST" "${2-Título X}" pilot.wa_node_alias "${3-300}"; }   # OR <alias> [título] [quietude mínima, s]: com o 7º argumento a sessão ociosa vale (ga-2hd02v.3.12)
 PSO() { H _pilot_ps_node_open "$ID" "$ST"; }
@@ -240,8 +240,18 @@ hasgc 'session|list|--json' && ok "lê as sessões com 'session list --json'" ||
 hasgc 'session|new|wa-worker-remote|--alias|wa-worker-remote-2|--no-attach|--title-hint|build wa-abc12: Título X' && ok "abre 'session new wa-worker-remote --alias wa-worker-remote-2 --no-attach --title-hint …' (o template e o alias vêm dos argumentos)" || fail "new: $(cat "$T/gccalls")"
 grep -qF -- "|--city|$T/city|session|nudge|wa-worker-remote-2|Bead nova para você: $ID — Título X. Ela já está atribuída ao seu alias (GC_ALIAS=wa-worker-remote-2): ache com " "$T/gccalls" \
   && grep -qF -- '--assignee "$GC_ALIAS" --json --limit 5' "$T/gccalls" && ok "o aviso diz a bead, o título, o alias e como achá-la por GC_ALIAS" || fail "nudge: $(cat "$T/gccalls")"
+# ga-2hd02v.4.13: o worker do nó roda `bd` por um atalho que, SEM -C, lê a loja da cidade — onde a bead do rig não existe —, e o prompt dele manda usar `bd -C <rig>`. O aviso tem de dar o MESMO comando,
+# senão a lista volta vazia e "vazio" é "bead não atribuída" (o worker avisa o Mayor e para, com a bead presa ao alias). Texto exato do que o worker recebe (argv do `gc session nudge`):
+grep -qF -- "ache com 'bd -C whatsapp_automation list --status in_progress --assignee \"\$GC_ALIAS\" --json --limit 5' e siga o seu protocolo." "$T/gccalls" \
+  && ok "o aviso manda 'bd -C <rig> list …' (o mesmo comando do prompt do worker), com o rig vindo do argumento" || fail "nudge sem -C <rig>: $(cat "$T/gccalls")"
+grep -qF -- "ache com 'bd list " "$T/gccalls" && fail "o aviso ainda traz o 'bd list' SEM -C (lista vazia no nó): $(cat "$T/gccalls")" || ok "o aviso não traz mais o 'bd list' sem -C"
 eq "sessão aberta sem escrever na bead: o estado segue o do apply" "$(stt)" "$AP2"
 eq "sessão rápida não gasta o orçamento de spawn" "$(slow)" "0"
+
+# --- sem o rig (chamador antigo, 6 argumentos — nem quietude nem rig): o -C leva a pasta da loja, que o atalho também aceita; nunca o comando sem -C ---
+reset; cp "$T/b.ap2.json" "$T/state.json"
+H _pilot_node_remote_open wa-worker-remote wa-worker-remote-2 "$ID" "$ST" "Título X" pilot.wa_node_alias > "$T/r"; r=$(cat "$T/r")
+grep -qF -- "ache com 'bd -C $ST list --status in_progress --assignee " "$T/gccalls" && eq "sem o rig (8º argumento): devolve 0 e o aviso usa 'bd -C <pasta da loja>'" "$r" "rc=0" || fail "nudge sem o rig: $(cat "$T/gccalls") / $r"
 
 # --- sessão dormindo vira wake ---
 reset; cp "$T/b.ap2.json" "$T/state.json"
@@ -628,8 +638,8 @@ for f in _pilot_node_remote_open _pilot_node_remote_rollback; do
 done
 bash -n "$DISPATCHER" && ok "bash -n do pilot-dispatcher.sh" || fail "bash -n do pilot-dispatcher.sh"
 # ga-2hd02v.3.12: os DOIS chamadores (WA e PS) optam pelo reaproveitamento da sessão ociosa; a peça sem o 7º argumento não reaproveita
-[ "$(grep -c '_pilot_node_remote_open wa-worker-remote "\$_PWR_ALIAS" "\$_wo_id" "\$_wo_store" "\$_PWR_TITLE" pilot.wa_node_alias "\$(_pilot_node_idle_secs)"' "$DISPATCHER")" = 1 ] && ok "o gancho do WA passa a quietude mínima à peça" || fail "WA não passa a quietude mínima"
-[ "$(grep -c '_pilot_node_remote_open ps-worker-remote "\$_PWR_ALIAS" "\$_po_id" "\$_po_store" "\$_PWR_TITLE" pilot.wa_node_alias "\$(_pilot_node_idle_secs)"' "$DISPATCHER")" = 1 ] && ok "o gancho do PS passa a quietude mínima à peça" || fail "PS não passa a quietude mínima"
+[ "$(grep -c '_pilot_node_remote_open wa-worker-remote "\$_PWR_ALIAS" "\$_wo_id" "\$_wo_store" "\$_PWR_TITLE" pilot.wa_node_alias "\$(_pilot_node_idle_secs)" whatsapp_automation ||' "$DISPATCHER")" = 1 ] && ok "o gancho do WA passa a quietude mínima (7º) e o rig whatsapp_automation (8º) à peça" || fail "WA não passa a quietude mínima e o rig"
+[ "$(grep -c '_pilot_node_remote_open ps-worker-remote "\$_PWR_ALIAS" "\$_po_id" "\$_po_store" "\$_PWR_TITLE" pilot.wa_node_alias "\$(_pilot_node_idle_secs)" property_scrapers ||' "$DISPATCHER")" = 1 ] && ok "o gancho do PS passa a quietude mínima (7º) e o rig property_scrapers (8º) à peça" || fail "PS não passa a quietude mínima e o rig"
 # o CONTRATO com o script: a leitura "esta sessão está ociosa?" mora em dois lugares (o script escolhe o alias, a peça confere). O trecho que decide a quietude tem de ser LITERALMENTE o mesmo nos dois.
 WAND="$(cd "$SELF_DIR/../../.." && pwd)/scripts/wa-node-dispatch.sh"
 CONTRACT='select((.last_active | type) == "string") | select(((.last_active | sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch null) as $ts | (($ts | type) == "number") and (($now - $ts) >= $idle)))'
@@ -663,9 +673,9 @@ fi
 if [ -z "${WA_NODE_SPAWN_SELFTEST_FILE:-}" ] && [ -z "${WA_NODE_SPAWN_ST_NOMUT:-}" ]; then
   echo
   echo "=== G. mutantes (cada um tem de derrubar o selftest) ==="
-  # o mutador mora em arquivo próprio. ausente/ilegível (python falha) → `fail`; vazio (lista sem nomes) ou com menos que o piso de hoje (86) → `fail` também: tirar um mutante tem de ser decisão visível, nunca "todos mortos" por lista curta
+  # o mutador mora em arquivo próprio. ausente/ilegível (python falha) → `fail`; vazio (lista sem nomes) ou com menos que o piso de hoje (89) → `fail` também: tirar um mutante tem de ser decisão visível, nunca "todos mortos" por lista curta
   MUT_LIST="$(python3 -I "$MUTATOR" --list)" || { fail "o mutador não carregou"; MUT_LIST=""; }
-  [ "$(echo "$MUT_LIST" | wc -w | tr -d ' ')" -ge 86 ] || fail "o mutador listou menos de 86 mutantes ($(echo "$MUT_LIST" | wc -w | tr -d ' '))"
+  [ "$(echo "$MUT_LIST" | wc -w | tr -d ' ')" -ge 89 ] || fail "o mutador listou menos de 89 mutantes ($(echo "$MUT_LIST" | wc -w | tr -d ' '))"
   run_mut() { # run_mut <nome> — escreve $T/res.<nome>: morto | SOBREVIVEU | ERRO
     local n="$1"
     if ! python3 -I "$MUTATOR" "$DISPATCHER" "$T/mut.$n.sh" "$n" > "$T/res.$n.apply" 2>&1; then echo ERRO > "$T/res.$n"; return; fi

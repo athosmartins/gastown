@@ -12493,7 +12493,7 @@ _pilot_node_idle_secs() {
   printf '%s' "$_is"
 }
 
-# _pilot_node_remote_open <template> <alias> <id> <loja> <titulo> <chave_da_marca> [<quietude_min_s>] — abre (ou acorda) a sessão <template> com o alias a que a bead JÁ foi atribuída e a avisa. Devolve 0 = sessão aberta e avisada ·
+# _pilot_node_remote_open <template> <alias> <id> <loja> <titulo> <chave_da_marca> [<quietude_min_s>] [<rig>] — abre (ou acorda) a sessão <template> com o alias a que a bead JÁ foi atribuída e a avisa. Devolve 0 = sessão aberta e avisada ·
 # 1 = falhou, o despacho foi desfeito e CONFIRMADO (bead livre e open: segue no mini) · 2 = SEGURA (o desfazer não se confirmou: a bead pode estar com o alias; NÃO a mande ao mini).
 # Uma sessão lenta (prazo ou >= PILOT_SLOW_SPAWN_SECS) gasta o orçamento de spawn do sweep (_pilot_note_spawn_timing, que tem de rodar no shell de quem chama).
 # vazio (nenhuma sessão viva tem o alias) → `session new`; só sessões do <template> dormindo → `session wake` (o idle_timeout põe a sessão para dormir SEM soltar o alias); falhou/ilegível (lista que não leu, sem o array
@@ -12503,9 +12503,13 @@ _pilot_node_idle_secs() {
 # "idle": a bead já foi atribuída a um alias cuja sessão existe e está parada, então SÓ se avisa — nada de `session new` nem `wake`, e o desfazer NUNCA fecha essa sessão (ela já existia: pode estar trabalhando).
 # vazio (sem 7º argumento) → idle desligado, o alias ativo segue "busy" como sempre (o dog e qualquer chamador antigo); ilegível (não é número inteiro) → desligado também; last_active ausente, nulo, número,
 # sem Z, data inválida ou no futuro, estado ≠ active, outro template, duas sessões no alias → "busy": ocupada, o inerte. O trecho que mede a quietude é o MESMO do wa-node-dispatch.sh (o selftest compara o texto).
+# 8º argumento (ga-2hd02v.4.13, opcional): <rig> é o nome que o worker do nó põe em `bd -C`: o atalho dele, sem -C, lê a loja da CIDADE, onde a bead do rig não existe, e o prompt do worker lê a lista vazia como "bead não atribuída" (avisa o Mayor e para,
+# com a bead presa ao alias). O aviso tem de dar o MESMO comando do prompt. vazio (chamador que não passou o rig) → a pasta da loja, forma que o atalho também aceita (`bd -C <caminho real do rig>`, remote-shim.selftest.sh); a loja
+# aqui nunca vem vazia (o chamador acabou de relê-la).
 _pilot_node_remote_open() {
-  local _ro_tpl="$1" _ro_alias="$2" _ro_id="$3" _ro_store="$4" _ro_title="$5" _ro_key="$6" _ro_idle="${7:-}" _ro_sj="" _ro_st="" _ro_rc=0 _ro_t0=0 _ro_step="" _ro_sess=0 _ro_msg=""
+  local _ro_tpl="$1" _ro_alias="$2" _ro_id="$3" _ro_store="$4" _ro_title="$5" _ro_key="$6" _ro_idle="${7:-}" _ro_rig="${8:-}" _ro_sj="" _ro_st="" _ro_rc=0 _ro_t0=0 _ro_step="" _ro_sess=0 _ro_msg=""
   case "$_ro_idle" in ''|*[!0-9]*) _ro_idle=-1 ;; esac
+  [ -n "$_ro_rig" ] || _ro_rig="$_ro_store"
   _ro_sj=$(gc_json_or_unknown timeout 20 gc --city "$GC_CITY" session list --json) || _ro_sj=""
   if ! printf '%s' "$_ro_sj" | jq -e '.sessions | type == "array"' >/dev/null 2>&1; then
     _ro_step="não consegui ler a lista de sessões"
@@ -12537,7 +12541,7 @@ _pilot_node_remote_open() {
     fi
   fi
   if [ -z "$_ro_step" ]; then
-    _ro_msg="Bead nova para você: $_ro_id — $_ro_title. Ela já está atribuída ao seu alias (GC_ALIAS=$_ro_alias): ache com 'bd list --status in_progress --assignee \"\$GC_ALIAS\" --json --limit 5' e siga o seu protocolo."
+    _ro_msg="Bead nova para você: $_ro_id — $_ro_title. Ela já está atribuída ao seu alias (GC_ALIAS=$_ro_alias): ache com 'bd -C $_ro_rig list --status in_progress --assignee \"\$GC_ALIAS\" --json --limit 5' e siga o seu protocolo."
     _ro_rc=0
     timeout 15 gc --city "$GC_CITY" session nudge "$_ro_alias" "$_ro_msg" >/dev/null 2>&1 || _ro_rc=$?
     [ "$_ro_rc" -eq 0 ] || _ro_step="o aviso falhou (rc=$_ro_rc)"
@@ -12569,7 +12573,7 @@ _pilot_wa_node_open() {
     warn "wa-node: $_wo_id depois do apply está com marca '${_PWR_MARK:-}' e status '$_PWR_STATUS' (esperava marca=$_PWR_ALIAS e in_progress) — seguro: sem sessão e sem desfazer; a próxima varredura relê"
     return 2
   fi
-  _pilot_node_remote_open wa-worker-remote "$_PWR_ALIAS" "$_wo_id" "$_wo_store" "$_PWR_TITLE" pilot.wa_node_alias "$(_pilot_node_idle_secs)" || _wo_rc=$?
+  _pilot_node_remote_open wa-worker-remote "$_PWR_ALIAS" "$_wo_id" "$_wo_store" "$_PWR_TITLE" pilot.wa_node_alias "$(_pilot_node_idle_secs)" whatsapp_automation || _wo_rc=$?
   return "$_wo_rc"
 }
 
@@ -12636,9 +12640,8 @@ _pilot_ps_node_decide() {
     fi
     _out=$(timeout "${PILOT_PS_NODE_TIMEOUT:-90}" "$_dir/ps-node-dispatch.sh" apply "$_id" --store "$_store" --basis "$_basis" 2>/dev/null) || _rc=$?
   fi
-  mkdir -p "$GC_CITY/.gc" 2>/dev/null || true
-  jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg b "$_id" --arg m "$_mode" --argjson rc "$_rc" --arg o "$_out" \
-    '{ts:$ts,event:"pilot-node-route",bead:$b,mode:$m,rc:$rc,out:$o}' >> "$GC_CITY/.gc/ps-node-route.jsonl" 2>/dev/null || true
+  # a linha que não gravou já deixou o aviso dentro da peça (e a contagem, se o contador gravou); o despacho segue o mesmo (o log é medição, não decisão)
+  _pilot_ps_node_log "$_id" "$_mode" "$_rc" "$_out" || true
   [ "$_mode" = shadow ] && return 1
   if [ "${DRY_RUN:-0}" = "1" ]; then
     # só o rc 0 do `apply --dry-run` diz "iria ao nó"; 10/11/12 e o resto = não iria (ou o script não soube dizer), e o log não anuncia o que o script não disse
@@ -12655,6 +12658,33 @@ _pilot_ps_node_decide() {
   esac
   # o apply só escreveu (dono + marca); a sessão do alias é do gancho: 0 aberta e avisada · 1 desfeito e confirmado (segue no mini) · 2 segura
   _pilot_ps_node_open "$_id" "$_store"
+}
+
+# _pilot_ps_node_log <id> <modo> <rc> <saída> — grava a linha da decisão em $GC_CITY/.gc/ps-node-route.jsonl. Devolve 0 = gravada · 1 = NÃO gravada (sempre avisada; contada em ps-node-route.lost quando o contador grava).
+# Em shadow esta linha é a ÚNICA saída do gancho e dela o passo 9 do runbook tira a taxa de acerto para ligar o auto: gravar nunca muda o despacho (é medição, não decisão), mas a linha que se perde não pode sumir sem
+# rastro, senão a amostra fica subcontada e a taxa sai errada sem aviso (ga-2hd02v.4.13). O `|| true` mudo que havia aqui tratava "gravou" e "não consegui gravar" como a mesma coisa.
+# vazio → n/a (sempre há uma linha a gravar); falhou/ilegível (o jq não montou a linha; o mkdir ou o >> falharam: disco cheio, pasta sem permissão, .gc que virou arquivo) → WARN com bead, modo, rc e o erro do sistema,
+# e UMA linha em ps-node-route.lost (a contagem que scripts/ps-node-route-report.sh lê). Se nem o contador grava (a mesma pasta falhou), o aviso diz isso: é o único rastro que sobra.
+_pilot_ps_node_log() {
+  local _lg_id="${1:-}" _lg_mode="${2:-}" _lg_rc="${3:-0}" _lg_out="${4:-}" _lg_dir="$GC_CITY/.gc" _lg_line="" _lg_err="" _lg_why="" _lg_n="" _lg_cnt=""
+  _lg_line=$(jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg b "$_lg_id" --arg m "$_lg_mode" --argjson rc "$_lg_rc" --arg o "$_lg_out" \
+    '{ts:$ts,event:"pilot-node-route",bead:$b,mode:$m,rc:$rc,out:$o}' 2>/dev/null) || _lg_line=""
+  if [ -z "$_lg_line" ]; then
+    _lg_why="o jq não montou a linha"
+  else
+    # o erro do sistema vem de dentro do grupo: a falha do próprio redirecionamento (>>) sai antes de qualquer 2>/dev/null que viesse depois dele
+    _lg_err=$({ mkdir -p "$_lg_dir" && printf '%s\n' "$_lg_line" >> "$_lg_dir/ps-node-route.jsonl"; } 2>&1) && return 0
+    _lg_why=$(printf '%s' "${_lg_err:-erro sem mensagem}" | tr '\n\t' '  ' | cut -c1-200)
+  fi
+  if { mkdir -p "$_lg_dir" && printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_lg_id" "$_lg_mode" "$_lg_why" >> "$_lg_dir/ps-node-route.lost"; } 2>/dev/null; then
+    # vazio ou falhou (o wc não leu o contador que acabou de gravar) → "?" no aviso: a perda JÁ está gravada, só o total não se sabe; nunca um número inventado
+    _lg_n=$(wc -l < "$_lg_dir/ps-node-route.lost" 2>/dev/null | tr -d ' ') || _lg_n=""
+    _lg_cnt="contada em ps-node-route.lost (${_lg_n:-?} até agora)"
+  else
+    _lg_cnt="NEM O CONTADOR gravou — esta perda só existe neste aviso"
+  fi
+  warn "ps-node: linha de $_lg_id ($_lg_mode, rc=$_lg_rc) NÃO gravada em ps-node-route.jsonl: $_lg_why — a amostra do shadow fica subcontada; $_lg_cnt"
+  return 1
 }
 
 # _pilot_ps_node_open <id> <loja> — depois do apply: lê a bead e abre (ou acorda) a sessão do alias a que ela foi atribuída. Só abre para a cara exata do que o apply escreve (dono ps-worker-remote-1..9, marca
@@ -12674,7 +12704,7 @@ _pilot_ps_node_open() {
     warn "ps-node: $_po_id depois do apply está com marca '${_PWR_MARK:-}' e status '$_PWR_STATUS' (esperava marca=$_PWR_ALIAS e in_progress) — seguro: sem sessão e sem desfazer; a próxima varredura relê"
     return 2
   fi
-  _pilot_node_remote_open ps-worker-remote "$_PWR_ALIAS" "$_po_id" "$_po_store" "$_PWR_TITLE" pilot.wa_node_alias "$(_pilot_node_idle_secs)" || _po_rc=$?
+  _pilot_node_remote_open ps-worker-remote "$_PWR_ALIAS" "$_po_id" "$_po_store" "$_PWR_TITLE" pilot.wa_node_alias "$(_pilot_node_idle_secs)" property_scrapers || _po_rc=$?
   return "$_po_rc"
 }
 

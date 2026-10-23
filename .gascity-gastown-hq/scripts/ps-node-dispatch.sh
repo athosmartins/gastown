@@ -13,7 +13,7 @@
 #   $GC_CITY/.gc/ps-node-route.jsonl (o do WA é wa-node-route.jsonl: as duas medições não se misturam) — e COMO a sessão nasce: sempre no modo pilot (WA_NODE_SPAWN=pilot, ga-2hd02v.3). A bead do PS mora na loja do rig e
 #   o pool de um template sem `dir` só lê a cidade: o pool nunca a veria. Então o apply escreve só o dono e a marca pilot.wa_node_alias (SEM gc.routed_to) e o Pilot abre a sessão (_pilot_ps_node_open).
 # O QUE ESTA CASCA GARANTE (e o selftest cobra):
-#   1. as variáveis de identidade (alias, rota, classificador, log) e o modo de abrir a sessão (pilot) são FIXADOS aqui, sobrescrevendo qualquer WA_NODE_* que já estivesse no ambiente: um ambiente com o alias do WA
+#   1. as variáveis de identidade (alias, prefixo de alias do release, rota, classificador, log) e o modo de abrir a sessão (pilot) são FIXADOS aqui, sobrescrevendo qualquer WA_NODE_* que já estivesse no ambiente: um ambiente com o alias do WA
 #      nunca faz uma bead de PS ser carimbada com a rota do WA, nem o contrário, e um WA_NODE_SPAWN=pool herdado nunca devolve a bead do PS ao pool que não a enxerga. 1 slot (o alias único ps-worker-remote-1): o agente
 #      ps-worker-remote tem max 1 sessão; mais slots é mudar o agente e esta casca juntos;
 #   2. só bead `ps-*`: id de outro prefixo sai 11 sem rodar nada ("não sei decidir", fica onde está), porque o classificador, o filtro e o alias aqui são do PS;
@@ -44,9 +44,11 @@ fi
 export GC_CITY="$CITY"
 export WA_NODE_ALIAS="${PS_NODE_ALIAS:-ps-worker-remote-1}"
 export WA_NODE_ROUTE_TEMPLATE="${PS_NODE_ROUTE_TEMPLATE:-ps-worker-remote}"
+# o prefixo só vale no release (o apply usa o alias único acima): sem ele o despachante real cairia no wa-worker-remote- e soltaria um dono do WA numa bead ps-* (ga-2hd02v.4.13). Fixo: nenhum WA_NODE_ALIAS_PREFIX do ambiente o troca (e não há PS_NODE_* para ele).
+export WA_NODE_ALIAS_PREFIX="ps-worker-remote-"
 export WA_NODE_CLASSIFY="${PS_NODE_CLASSIFY:-$HERE/ps-node-classify.py}"
 export WA_NODE_LOG="${PS_NODE_LOG:-$CITY/.gc/ps-node-route.jsonl}"
-# modo pilot (a sessão do alias é aberta pelo Pilot); o alias único acima já faz o nó de PS ter 1 slot, com o prefixo e o N de slots do ambiente fora da conta
+# modo pilot (a sessão do alias é aberta pelo Pilot); o alias único acima já faz o nó de PS ter 1 slot no apply, com o N de slots do ambiente fora da conta (o prefixo, que só o release lê, é o fixado acima)
 export WA_NODE_SPAWN="pilot"
 # só o TEXTO das mensagens e dos comentários da bead (o despachante do WA os lê desde o ga-2hd02v.3)
 export WA_NODE_SELF="ps-node-dispatch.sh" WA_NODE_STORY="ga-2hd02v.4"

@@ -8,7 +8,8 @@
 #
 # As funções são as REAIS (extraídas palavra por palavra do pilot-dispatcher.sh); bd, gc e ps-node-dispatch.sh são falsos, o bd com estado.
 #   A. modos e alvos: off e qualquer valor que não seja um dos 4 não chama nada · alvo que não é ps-worker, id que não é ps-*, script ausente → bead segue no mini.
-#   B. shadow só chama `check` e nunca devolve 0 · dry-run só chama `apply --dry-run`, loga "WOULD" só para o rc 0 e nunca devolve 0.
+#   B. shadow só chama `check` e nunca devolve 0 · dry-run só chama `apply --dry-run`, loga "WOULD" só para o rc 0 e nunca devolve 0 · o log ps-node-route.jsonl que NÃO grava vira aviso + contagem (ps-node-route.lost) e
+#      nunca muda o despacho (ga-2hd02v.4.13).
 #   C. label/auto: leitura em três estados (do nó=2, ilegível=2, lida e livre=segue) · mapa de rc do script · sessão aberta=0 · falha ao abrir=desfaz (1) ou segura (2).
 #   D. rc incerto do apply (13, prazo, sinal): desfaz SÓ a cara do apply, nunca pisa em bead de outro, e devolve 2. Orçamento de spawn.
 #   E. a passada só-nó do disk floor (_pilot_node_only_ps_route_on/_pre).
@@ -34,7 +35,7 @@ eq() { if [ "$2" = "$3" ]; then ok "$1"; else fail "$1 — obtido '$2', esperado
 [ -f "$DISPATCHER" ] || { echo "FATAL: $DISPATCHER não existe" >&2; exit 2; }
 fn_of() { awk -v n="$1" '$0 ~ "^"n"\\(\\)"{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER"; }
 FNS=""
-for _f in _pilot_ps_node_decide _pilot_ps_node_open _pilot_ps_node_settle _pilot_node_only_ps_route_on _pilot_node_only_ps_pre _pilot_wa_node_read _pilot_node_remote_open _pilot_node_remote_rollback _pilot_slow_spawn_budget_spent _pilot_note_spawn_timing gc_json_or_unknown; do
+for _f in _pilot_ps_node_decide _pilot_ps_node_log _pilot_ps_node_open _pilot_ps_node_settle _pilot_node_only_ps_route_on _pilot_node_only_ps_pre _pilot_wa_node_read _pilot_node_remote_open _pilot_node_remote_rollback _pilot_slow_spawn_budget_spent _pilot_note_spawn_timing gc_json_or_unknown; do
   _b="$(fn_of "$_f")"
   [ -n "$_b" ] || { echo "FATAL: $_f() não está em $DISPATCHER" >&2; exit 2; }
   FNS="$FNS"$'\n'"$_b"
@@ -138,7 +139,12 @@ mkb "$T/b.node.json" in_progress ps-worker-remote-1 ""
 mkb "$T/b.routed.json" open "" "" "Título X" "$ID" ps-worker-remote
 mkb "$T/b.foreign.json" in_progress mila-ps ""
 
+# logfix — devolve a pasta .gc do city falso ao normal depois de um cenário que a quebrou (jsonl que virou pasta, .gc que virou arquivo, sem permissão) e apaga o contador de perdas
+CITYGC="$T/city/.gc"
+logfix() { [ -d "$CITYGC" ] || rm -f "$CITYGC"; chmod u+w "$CITYGC" 2>/dev/null || true; rmdir "$CITYGC/ps-node-route.jsonl" 2>/dev/null || true; rm -f "$CITYGC/ps-node-route.lost"; }
+lostn() { wc -l < "$CITYGC/ps-node-route.lost" 2>/dev/null | tr -d ' '; }   # linhas perdidas contadas (vazio se o contador não existe)
 reset() {
+  logfix
   : > "$T/calls"; : > "$T/bdcalls"; : > "$T/gccalls"; : > "$T/err"; : > "$T/order"; echo 0 > "$T/nshow"
   rm -f "$T/city/.gc/ps-node-route.jsonl"
   cp "$T/b.free.json" "$T/state.json"
@@ -185,6 +191,42 @@ eq "dry-run: nada escrito, nenhuma sessão" "$(stt) $(wc -l < "$T/gccalls" | tr 
 for c in 10 11 12 13; do reset; r=$(D auto $c 1); eq "dry-run com rc $c: 1" "$r" "rc=1"; grep -q 'would NOT go' "$T/err" && ok "dry-run rc $c: o log diz 'would NOT go', não 'WOULD route'" || fail "dry-run $c: $(cat "$T/err")"; done
 reset; r=$(D shadow 0 1); eq "shadow tem precedência sobre o dry-run: só 'check'" "$r $(cat "$T/calls")" "rc=1 check $ID --store $ST"
 
+# ── o log que NÃO grava (ga-2hd02v.4.13). Em shadow ps-node-route.jsonl é a ÚNICA saída do gancho e dele sai a taxa de acerto para ligar o auto: gravar a linha nunca muda o despacho, mas perdê-la tem de deixar rastro.
+# Os quebrados são à prova de root (jsonl que virou PASTA; .gc que virou ARQUIVO) e, fora do root, a pasta sem permissão de escrita.
+reset; mkdir -p "$CITYGC/ps-node-route.jsonl"; r=$(D shadow 0)
+eq "log impossível de gravar (jsonl é uma pasta): shadow segue devolvendo 1 — o despacho não muda" "$r" "rc=1"
+grep -q 'WARN ps-node: linha de ps-abc12 (shadow, rc=0) NÃO gravada em ps-node-route.jsonl' "$T/err" && ok "...e AVISA qual linha se perdeu (bead, modo, rc)" || fail "sem aviso da linha perdida: $(cat "$T/err")"
+eq "...e a perda é CONTADA em ps-node-route.lost: 1 linha" "$(lostn)" "1"
+eq "...com bead e modo na linha da contagem" "$(awk -F'\t' '{print $2" "$3}' "$CITYGC/ps-node-route.lost")" "ps-abc12 shadow"
+_why=$(awk -F'\t' '{print $4}' "$CITYGC/ps-node-route.lost")
+{ [ -n "$_why" ] && [ "$_why" != "erro sem mensagem" ]; } && ok "...e o motivo é o erro do sistema (não o texto de reserva 'erro sem mensagem')" || fail "contagem sem o erro do sistema: '$_why'"
+grep -q 'contada em ps-node-route.lost (1 até agora)' "$T/err" && ok "o aviso diz que contou e quantas perdas há até agora" || fail "aviso sem a contagem: $(cat "$T/err")"
+r=$(D shadow 10); eq "uma 2ª perda soma, não sobrescreve: 2 linhas" "$(lostn)" "2"
+grep -q 'rc=10) NÃO gravada' "$T/err" && grep -q '(2 até agora)' "$T/err" && ok "...e o aviso da 2ª já diz 2" || fail "aviso da 2ª perda: $(cat "$T/err")"
+logfix
+reset; mv "$CITYGC" "$CITYGC.keep" 2>/dev/null; : > "$CITYGC"; r=$(D shadow 0)
+eq ".gc que virou arquivo (nem a pasta nem o contador existem): shadow segue devolvendo 1" "$r" "rc=1"
+grep -q 'NÃO gravada em ps-node-route.jsonl' "$T/err" && grep -q 'NEM O CONTADOR gravou' "$T/err" && ok "...e o aviso diz que NEM O CONTADOR gravou (o aviso é o único rastro)" || fail "aviso sem 'NEM O CONTADOR': $(cat "$T/err")"
+eq "...e nenhum ps-node-route.lost apareceu em lugar nenhum" "$([ -e "$CITYGC/ps-node-route.lost" ] && echo existe || echo não)" "não"
+rm -f "$CITYGC"; mv "$CITYGC.keep" "$CITYGC" 2>/dev/null || mkdir -p "$CITYGC"
+if [ "$(id -u)" != 0 ]; then
+  reset; mkdir -p "$CITYGC"; chmod 555 "$CITYGC"; r=$(D shadow 0); chmod 755 "$CITYGC"
+  eq "pasta .gc sem permissão de escrita: shadow segue devolvendo 1" "$r" "rc=1"
+  grep -q 'NÃO gravada em ps-node-route.jsonl' "$T/err" && grep -q 'NEM O CONTADOR gravou' "$T/err" && ok "...e avisa que perdeu a linha e o contador" || fail "aviso (pasta sem permissão): $(cat "$T/err")"
+else
+  echo "  (pasta sem permissão: pulado — root escreve em qualquer pasta; os cenários acima são à prova de root)"
+fi
+reset; mkdir -p "$CITYGC/ps-node-route.jsonl"; r=$(D label 0)
+eq "label com o log impossível de gravar: o despacho segue (0), a sessão abre e avisa — o log é medição, não decisão" "$r $(ord)" "rc=0 bd:show script:apply bd:show gc:list gc:new gc:nudge "
+reset; mkdir -p "$CITYGC/ps-node-route.jsonl"; r=$(D auto 12); eq "auto com o script em 12 e o log impossível de gravar: segue devolvendo 1 (a bead fica no mini)" "$r" "rc=1"
+# a peça sozinha: devolve 1 só quando perdeu
+reset; r=$(H _pilot_ps_node_log "$ID" shadow 0 'texto'); eq "_pilot_ps_node_log com a pasta normal: grava e devolve 0" "$r $(jsonl | jq -r .bead) $(lostn)" "rc=0 $ID "
+[ ! -s "$T/err" ] && ok "...sem aviso nenhum quando grava" || fail "aviso à toa: $(cat "$T/err")"
+reset; r=$(H _pilot_ps_node_log "$ID" shadow naonumero 'texto'); eq "rc que o jq não aceita (a linha nem se monta): devolve 1, e não grava nada no jsonl" "$r $(jsonl | wc -l | tr -d ' ')" "rc=1 0"
+grep -q 'o jq não montou a linha' "$T/err" && eq "...e a perda é contada (1) com o motivo certo" "$(lostn)" "1" || fail "jq que falha: $(cat "$T/err")"
+reset; mkdir -p "$CITYGC/ps-node-route.jsonl"; r=$(H _pilot_ps_node_log "$ID" shadow 0 'texto'); eq "_pilot_ps_node_log com o jsonl impossível de gravar: devolve 1" "$r" "rc=1"
+logfix
+
 echo; echo "=== C. label/auto: leitura de três estados, mapa de rc, sessão ==="
 reset; r=$(D label 0)
 eq "label, tudo certo: 0" "$r" "rc=0"
@@ -192,6 +234,9 @@ eq "ordem: lê a bead, apply, relê a bead, lista as sessões, abre, avisa" "$(o
 eq "apply com a base da etiqueta" "$(cat "$T/calls")" "apply $ID --store $ST --basis label"
 grep -qF -- "|--city|$T/city|session|new|ps-worker-remote|--alias|ps-worker-remote-1|--no-attach|--title-hint|build $ID: Título X" "$T/gccalls" && ok "abre 'session new ps-worker-remote --alias ps-worker-remote-1 --no-attach' (template e alias do PS)" || fail "new: $(cat "$T/gccalls")"
 grep -qF -- 'session|nudge|ps-worker-remote-1|Bead nova para você: ps-abc12 — Título X.' "$T/gccalls" && ok "e avisa o alias do PS" || fail "nudge: $(cat "$T/gccalls")"
+# ga-2hd02v.4.13: o prompt do ps-worker-remote manda `bd -C property_scrapers ...` (sem -C o atalho lê a cidade e a lista volta vazia, que o prompt lê como "bead não atribuída"). O aviso tem de dar o mesmo comando:
+grep -qF -- "ache com 'bd -C property_scrapers list --status in_progress --assignee \"\$GC_ALIAS\" --json --limit 5' e siga o seu protocolo." "$T/gccalls" \
+  && ok "o aviso do PS manda 'bd -C property_scrapers list …' (igual ao prompt do worker)" || fail "nudge do PS sem -C property_scrapers: $(cat "$T/gccalls")"
 eq "a bead fica como o apply a deixou" "$(stt)" "$AP1"
 reset; r=$(D auto 0); eq "auto: 0, com a base 'any'" "$r $(cat "$T/calls")" "rc=0 apply $ID --store $ST --basis any"
 jsonl | jq -e 'select(.mode=="auto" and .rc==0)' >/dev/null && ok "auto grava a linha com o modo e o rc" || fail "jsonl: $(jsonl)"
@@ -338,7 +383,7 @@ open(sys.argv[2], "w", encoding="utf-8").write(src[:i] + new + src[i + len(old):
 EOF
   if PS_NODE_ROUTE_SELFTEST_FILE="$copy" bash "$SELF" >/dev/null 2>&1; then fail "mutante $name SOBREVIVEU"; else ok "mutante $name morreu"; fi
 }
-D1=_pilot_ps_node_decide; O1=_pilot_ps_node_open; S1=_pilot_ps_node_settle
+D1=_pilot_ps_node_decide; O1=_pilot_ps_node_open; S1=_pilot_ps_node_settle; L1=_pilot_ps_node_log
 mut off-roda          $D1 'case "$_mode" in shadow|label|auto) ;; *) return 1 ;; esac' 'case "$_mode" in off|shadow|label|auto) ;; *) return 1 ;; esac'
 mut sem-guarda-alvo   $D1 '[ "$_tgt" = "ps-worker" ] || return 1' ':'
 mut sem-guarda-id     $D1 'case "$_id" in ps-*) ;; *) return 1 ;; esac' ':'
@@ -350,16 +395,28 @@ mut label-sem-base    $D1 '[ "$_mode" = label ] && _basis=label' ':'
 mut dry-run-devolve-0 $D1 'nothing written)"; fi
     return 1' 'nothing written)"; fi
     return 0'
+mut log-sem-chamada    $D1 '_pilot_ps_node_log "$_id" "$_mode" "$_rc" "$_out" || true' ':'
+mut log-muda-despacho $D1 '_pilot_ps_node_log "$_id" "$_mode" "$_rc" "$_out" || true' '_pilot_ps_node_log "$_id" "$_mode" "$_rc" "$_out" || return 2'
+mut log-sem-aviso     $L1 '  warn "ps-node: linha de' '  : "ps-node: linha de'
+mut log-sem-contagem  $L1 '>> "$_lg_dir/ps-node-route.lost"' '>> /dev/null'
+mut log-falha-devolve-0 $L1 '  return 1
+}' '  return 0
+}'
+mut log-sucesso-avisa $L1 '2>&1) && return 0' '2>&1); :'
+mut log-erro-engolido $L1 '; } 2>&1) && return 0' '; } 2>/dev/null) && return 0'
+mut log-contador-calado $L1 '_lg_cnt="NEM O CONTADOR gravou — esta perda só existe neste aviso"' '_lg_cnt="contada em ps-node-route.lost (?? até agora)"'
 mut sem-orcamento     $D1 'if _pilot_slow_spawn_budget_spent; then' 'if false; then'
 mut sem-13            $D1 '13|124|137|143)' '124|137|143)'
 mut sem-sinal         $D1 '12[89]|1[3-9][0-9]|' '1[3-9][0-9]|'
 mut sem-settle-13     $D1 '_pilot_ps_node_settle "$_id" "$_store"; return 2 ;;' 'return 2 ;;'
-mut log-do-wa         $D1 'ps-node-route.jsonl' 'wa-node-route.jsonl'
+mut log-do-wa         $L1 '>> "$_lg_dir/ps-node-route.jsonl"' '>> "$_lg_dir/wa-node-route.jsonl"'
 mut open-vira-0       $D1 '_pilot_ps_node_open "$_id" "$_store"' '_pilot_ps_node_open "$_id" "$_store"; return 0'
 mut open-sem-alias    $O1 'ps-worker-remote-[1-9]) ;;' '*) ;;'
 mut open-sem-marca    $O1 'if [ "$_PWR_STATUS" != in_progress ] || [ "$_PWR_MARK" != "$_PWR_ALIAS" ]; then' 'if false; then'
 mut open-template     $O1 '_pilot_node_remote_open ps-worker-remote ' '_pilot_node_remote_open wa-worker-remote '
-mut open-chave        $O1 'pilot.wa_node_alias "$(_pilot_node_idle_secs)" || _po_rc=$?' 'pilot.ps_node_alias "$(_pilot_node_idle_secs)" || _po_rc=$?'
+mut open-chave        $O1 'pilot.wa_node_alias "$(_pilot_node_idle_secs)" property_scrapers || _po_rc=$?' 'pilot.ps_node_alias "$(_pilot_node_idle_secs)" property_scrapers || _po_rc=$?'
+mut open-sem-rig      $O1 'pilot.wa_node_alias "$(_pilot_node_idle_secs)" property_scrapers || _po_rc=$?' 'pilot.wa_node_alias "$(_pilot_node_idle_secs)" || _po_rc=$?'
+mut open-rig-do-wa    $O1 'property_scrapers || _po_rc=$?' 'whatsapp_automation || _po_rc=$?'
 mut open-rc-engolido  $O1 'return "$_po_rc"' 'return 0'
 mut settle-sem-forma  $S1 'if [ "$_PWR_STATUS" != in_progress ] || [ "$_PWR_MARK" != "$_PWR_ALIAS" ]; then return 0; fi' ':'
 mut settle-chave      $S1 '0 pilot.wa_node_alias || true' '0 pilot.ps_node_alias || true'

@@ -6,7 +6,7 @@
 #
 # CASOS: a casca aponta o despachante do WA para o PS (alias ps-worker-remote-1, classificador do PS, log ps-node-route.jsonl) no modo PILOT (a bead leva dono + marca pilot.wa_node_alias, SEM gc.routed_to: o pool do PS
 #   não a enxerga e quem abre a sessão é o Pilot) · um ambiente com as variáveis do WA (alias, rota, modo pool, slots) NÃO desvia nada · o oráculo de capacidade do nó manda: sem vaga/ilegível a bead fica no mini · só bead ps-* (wa-*, ga-*, vazio: 11 sem nenhuma chamada) · despachante ausente = 11 · o slot do PS é independente do slot do WA (sessão e bead do WA não ocupam o do PS, e
-#   o contrário vale) · release só solta bead do alias E da rota do PS (a do WA não é tocada) · bead com rota do WA não é carimbada de novo · o classificador real do PS manda ao nó uma bead com código + teste e deixa
+#   o contrário vale) · release só solta bead do alias E da rota do PS (a do WA não é tocada; o PREFIXO de alias também é do PS: dono wa-worker-remote-<N> com a marca igual NÃO é solto, ga-2hd02v.4.13) · bead com rota do WA não é carimbada de novo · o classificador real do PS manda ao nó uma bead com código + teste e deixa
 #   no mini a que cita banco.
 # CONTROLE NEGATIVO: cada mutante troca UMA linha da casca numa cópia e o caso designado tem de reprovar; mutante que sobrevive reprova esta bateria.
 # COMO RODAR: bash scripts/ps-node-dispatch.selftest.sh   (macOS /bin/bash 3.2 e Linux; precisa de jq e python3)
@@ -188,6 +188,15 @@ fresh '{"assignee":"wa-worker-remote-1","status":"in_progress","metadata":{"gc.r
 expect_rc "release: bead com alias e rota do WA -> 12 sem escrita (não é do nó do PS)" 12 w0
 fresh '{"assignee":"ps-worker-remote-1","status":"in_progress","metadata":{"gc.routed_to":"ps-worker"}}'; d release ps-t1
 expect_rc "release: dono do PS mas rota de outro pool -> 12 sem escrita" 12 w0
+# ---- release: o PREFIXO de alias também é do PS (ga-2hd02v.4.13). O despachante real solta o dono que for o alias OU <prefixo>1..9; sem o prefixo do PS fixado na casca, valia o do WA (wa-worker-remote-) e um
+#      dono do WA numa bead ps-* com a marca do Pilot igual ao dono (a forma que o release do PS aceita) TENTAVA escrever. Inalcançável hoje (1 slot, comando manual): o caso fecha a porta, não um incêndio.
+fresh '{"assignee":"wa-worker-remote-1","status":"in_progress","metadata":{"pilot.wa_node_alias":"wa-worker-remote-1"}}'; d release ps-t1
+expect_rc "release: dono wa-worker-remote-1 com a marca do Pilot igual numa bead ps-* -> 12 sem escrita (o prefixo é do PS)" 12 w0
+fresh '{"assignee":"wa-worker-remote-3","status":"in_progress","metadata":{"pilot.wa_node_alias":"wa-worker-remote-3"}}'; WA_NODE_ALIAS_PREFIX=wa-worker-remote- d release ps-t1
+expect_rc "release: dono wa-worker-remote-3 mesmo com WA_NODE_ALIAS_PREFIX=wa-worker-remote- no ambiente -> 12 sem escrita (a casca fixa o prefixo)" 12 w0
+fresh '{"assignee":"ps-worker-remote-2","status":"in_progress","metadata":{"pilot.wa_node_alias":"ps-worker-remote-2"}}'; d release ps-t1
+expect_rc "release: dono ps-worker-remote-2 (prefixo do PS, N maior que o de hoje) com a marca igual -> 0" 0
+[ -z "$(bead '."ps-t1".assignee')" ] && [ "$(bead '."ps-t1".metadata["pilot.wa_node_alias"] // ""')" = "" ] && ok "release: dono e marca de ps-worker-remote-2 soltos" || bad "release (ps-worker-remote-2): estado: $(jq -c '."ps-t1"' "$STATE")"
 # ---- o classificador REAL do PS, ponta a ponta (sem PS_NODE_CLASSIFY): o padrão da casca aponta para scripts/ps-node-classify.py
 fresh '{"description":"Em lib/foo_parser.py a funcao quebra com string vazia. Teste em lib/tests/test_foo_parser.py."}'
 REAL_CLS_SAVED="$PS_NODE_CLASSIFY"; unset PS_NODE_CLASSIFY; d check ps-t1; export PS_NODE_CLASSIFY="$REAL_CLS_SAVED"; expect_rc "classificador real: código + teste citados -> node (0)" 0 w0
@@ -231,6 +240,9 @@ sc_missing()  { fresh; SC_ARGS="apply ps-t1"; export PS_NODE_DISPATCH="$CITY/scr
 st_ps()       { [ "$(bead '."ps-t1".assignee')" = ps-worker-remote-1 ] && [ "$(bead '."ps-t1".metadata["pilot.wa_node_alias"]')" = ps-worker-remote-1 ]; }
 st_log()      { [ -s "$PSLOG" ] && [ ! -e "$WALOG" ]; }
 st_clean()    { ! wrote; }
+# release de uma bead ps-* cujo dono é do WA e cuja marca do Pilot é igual ao dono: só o prefixo de alias do PS a protege (ga-2hd02v.4.13)
+sc_rel_wa()   { fresh '{"assignee":"wa-worker-remote-1","status":"in_progress","metadata":{"pilot.wa_node_alias":"wa-worker-remote-1"}}'; SC_ARGS="release ps-t1"; }
+sc_rel_wa_env(){ sc_rel_wa; export WA_NODE_ALIAS_PREFIX=wa-worker-remote-; }
 mutant alias-do-wa        'WA_NODE_ALIAS="${PS_NODE_ALIAS:-ps-worker-remote-1}"'           'WA_NODE_ALIAS="${PS_NODE_ALIAS:-wa-worker-remote-1}"'           sc_apply 0 st_ps
 mutant rota-do-wa         'WA_NODE_ROUTE_TEMPLATE="${PS_NODE_ROUTE_TEMPLATE:-ps-worker-remote}"' 'WA_NODE_ROUTE_TEMPLATE="${PS_NODE_ROUTE_TEMPLATE:-wa-worker-remote}"' sc_tpl 12 st_clean
 mutant log-do-wa          '${PS_NODE_LOG:-$CITY/.gc/ps-node-route.jsonl}'                  '${PS_NODE_LOG:-$CITY/.gc/wa-node-route.jsonl}'                  sc_apply 0 st_log
@@ -239,6 +251,9 @@ mutant rota-do-ambiente-vence 'export WA_NODE_ROUTE_TEMPLATE="${PS_NODE_ROUTE_TE
 mutant log-do-ambiente-vence 'export WA_NODE_LOG="${PS_NODE_LOG:-$CITY/.gc/ps-node-route.jsonl}"' 'export WA_NODE_LOG="${WA_NODE_LOG:-${PS_NODE_LOG:-$CITY/.gc/ps-node-route.jsonl}}"' sc_apply_env 0 st_log
 mutant modo-pool          'export WA_NODE_SPAWN="pilot"'                                                    'export WA_NODE_SPAWN="pool"'                                                     sc_apply 0 st_pilot
 mutant modo-do-ambiente-vence 'export WA_NODE_SPAWN="pilot"'                                              'export WA_NODE_SPAWN="${WA_NODE_SPAWN:-pilot}"'                                  sc_pilot_env 0 st_pilot
+mutant prefixo-do-wa      'export WA_NODE_ALIAS_PREFIX="ps-worker-remote-"'                'export WA_NODE_ALIAS_PREFIX="wa-worker-remote-"'                sc_rel_wa 12 st_clean
+mutant sem-prefixo-de-alias 'export WA_NODE_ALIAS_PREFIX="ps-worker-remote-"'              ':'                                                               sc_rel_wa 12 st_clean
+mutant prefixo-do-ambiente-vence 'export WA_NODE_ALIAS_PREFIX="ps-worker-remote-"'         'export WA_NODE_ALIAS_PREFIX="${WA_NODE_ALIAS_PREFIX:-ps-worker-remote-}"' sc_rel_wa_env 12 st_clean
 mutant sem-guarda-de-prefixo 'case "$2" in ps-*) ;; *) say "$2 não é uma bead do PS (prefixo ps-): não decido — fica onde está"; exit 11 ;; esac' ':' sc_wa 11 st_clean
 mutant sem-guarda-do-despachante '[ -x "$REAL" ] || { say "despachante $REAL ausente ou não executável — fica no mini"; exit 11; }' ':' sc_missing 11 st_clean
 echo "---"; echo "$((n-fails))/$n ok"

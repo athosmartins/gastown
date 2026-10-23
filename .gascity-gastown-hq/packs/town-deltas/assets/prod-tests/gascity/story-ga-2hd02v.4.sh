@@ -44,19 +44,22 @@ $out"
 CLS="$CITY/scripts/ps-node-classify.py";  CLS_ST="$CITY/scripts/ps-node-classify.selftest.sh"
 DSP="$CITY/scripts/ps-node-dispatch.sh";  DSP_ST="$CITY/scripts/ps-node-dispatch.selftest.sh"
 GDR="$CITY/scripts/gate-done-remote.py";  GDR_ST="$CITY/scripts/gate-done-remote.selftest.sh"
+RPT="$CITY/scripts/ps-node-route-report.sh"; RPT_ST="$CITY/scripts/ps-node-route-report.selftest.sh"   # ga-2hd02v.4.13: o que o shadow gravou e quanto NÃO gravou
 PIL="$ASSETS/pilot-dispatcher.sh";        PIL_ST="$ASSETS/pilot-dispatcher.ps-node-route.selftest.sh"
 FILTER_PS="$CITY/scripts/hetzner-rsync-filter.ps.txt"; FILTER_WA="$CITY/scripts/hetzner-rsync-filter.wa.txt"; MAC_PS="$CITY/scripts/hetzner-mac-only.ps.txt"
 AGENT="$CITY/agents/ps-worker-remote/agent.toml"; PROMPT="$CITY/agents/ps-worker-remote/prompt.template.md"
 RUNBOOK="$CITY/docs/runbooks/hetzner-ps-node.md"
-need "$CLS" "$CLS_ST" "$DSP" "$DSP_ST" "$GDR" "$GDR_ST" "$PIL" "$PIL_ST" "$FILTER_PS" "$FILTER_WA" "$MAC_PS" "$AGENT" "$PROMPT" "$RUNBOOK"
-[[ -x "$DSP" && -x "$DSP_ST" && -x "$CLS_ST" && -x "$GDR_ST" ]] || fail "ps-node-dispatch.sh / os selftests sem permissão de execução"
-syntax "$DSP" "$DSP_ST" "$CLS_ST" "$GDR_ST" "$PIL" "$PIL_ST"
+need "$CLS" "$CLS_ST" "$DSP" "$DSP_ST" "$GDR" "$GDR_ST" "$RPT" "$RPT_ST" "$PIL" "$PIL_ST" "$FILTER_PS" "$FILTER_WA" "$MAC_PS" "$AGENT" "$PROMPT" "$RUNBOOK"
+[[ -x "$DSP" && -x "$DSP_ST" && -x "$CLS_ST" && -x "$GDR_ST" && -x "$RPT" && -x "$RPT_ST" ]] || fail "ps-node-dispatch.sh / ps-node-route-report.sh / os selftests sem permissão de execução"
+syntax "$DSP" "$DSP_ST" "$CLS_ST" "$GDR_ST" "$RPT" "$RPT_ST" "$PIL" "$PIL_ST"
 python3 -I -c 'import ast,sys; [ast.parse(open(f, encoding="utf-8").read()) for f in sys.argv[1:]]' "$CLS" "$GDR" || fail "$CLS ou $GDR não parseia"
 log "arquivos implantados presentes; sintaxe ok ✓"
 
 # ── inerte por padrão ────────────────────────────────────────────────────────
 grep -qE '^min_active_sessions *= *0$' "$AGENT" && grep -qE '^max_active_sessions *= *1$' "$AGENT" || fail "ps-worker-remote não é 0..1 sessão ($AGENT)"
 grep -q 'PILOT_PS_NODE_ROUTE:-off' "$PIL" || fail "o padrão do gancho do Pilot não é off ($PIL)"
+grep -q '^export WA_NODE_ALIAS_PREFIX="ps-worker-remote-"' "$DSP" || fail "o ps-node-dispatch.sh não fixa o prefixo de alias do PS: sem ele o release aceitaria um dono do WA (wa-worker-remote-<N>) numa bead ps-* ($DSP)"
+grep -q 'pilot.wa_node_alias property_scrapers ||' "$PIL" || fail "o aviso ao worker do nó não leva 'bd -C property_scrapers': sem -C o atalho lê a cidade e a lista volta vazia ($PIL)"
 grep -q '^export WA_NODE_SPAWN="pilot"' "$DSP" || fail "o ps-node-dispatch.sh não fixa o modo pilot: sem ele a bead do PS (loja do rig) ficaria numa rota que o pool não enxerga ($DSP)"
 live=0
 for f in "$CITY/city.toml" "$CITY"/packs/town-deltas/orders/*.toml "$CITY"/packs/town-deltas/*.toml "$CITY"/packs/town-deltas/assets/*.toml "$CITY"/scripts/com.gascity.pilot.plist; do
@@ -95,8 +98,9 @@ esac
 
 # ── os selftests, contra a árvore viva ───────────────────────────────────────
 run_suite "classificador ps-node-classify (mutantes inclusos)"       130 timeout 600 "$BASH32" "$CLS_ST"
-run_suite "despachante ps-node-dispatch (mutantes inclusos)"          48 timeout 600 "$BASH32" "$DSP_ST"
+run_suite "despachante ps-node-dispatch (mutantes inclusos)"          56 timeout 600 "$BASH32" "$DSP_ST"
+run_suite "relatório ps-node-route-report (mutantes inclusos)"        40 timeout 600 "$BASH32" "$RPT_ST"
 run_suite "gate-done-remote (rigs gascity + property_scrapers)"      280 timeout 900 "$BASH32" "$GDR_ST"
-PS_NODE_ROUTE_ST_NOMUT=1 run_suite "gancho do Pilot _pilot_ps_node_decide (sem mutantes)" 125 timeout 600 "$BASH32" "$PIL_ST"
+PS_NODE_ROUTE_ST_NOMUT=1 run_suite "gancho do Pilot _pilot_ps_node_decide (sem mutantes)" 147 timeout 600 "$BASH32" "$PIL_ST"
 
 log "OK — classificação, roteamento e gate-done do nó para o PS prontos e INERTES nos arquivos versionados (o plist VIVO do Pilot e o ambiente do processo não são lidos aqui); $NODE_NOTE. A bead real no nó é passo de ligar (docs/runbooks/hetzner-ps-node.md)."
