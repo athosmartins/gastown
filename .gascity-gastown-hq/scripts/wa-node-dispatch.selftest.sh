@@ -323,6 +323,79 @@ fresh; sessions "[$(asleep 1)]"; WA_NODE_SPAWN=pool WA_NODE_SLOTS=3 d apply wa-t
 fresh; sessions '[{"template":"wa-worker","state":"asleep","closed":false,"alias":"wa-worker-remote-1"}]'; SL=1 pm apply wa-t1; expect_rc "dormindo: sessão dormindo de OUTRO template com o alias do nó segue viva -> 12" 12 w0
 fresh; sessions '[{"template":"wa-worker-remote","state":"suspended","closed":false,"alias":"wa-worker-remote-1"}]'; SL=1 pm apply wa-t1; expect_rc "dormindo: estado que não conheço (suspended) conta como vivo -> 12" 12 w0
 fresh; sessions '[{"template":"wa-worker-remote","state":"Asleep","closed":false,"alias":"wa-worker-remote-1"}]'; SL=1 pm apply wa-t1; expect_rc "dormindo: 'Asleep' (outra grafia) não é o estado que conheço -> vivo -> 12" 12 w0
+# -- sessão viva e OCIOSA (ga-2hd02v.3.12). Sem bead no alias E quieta há >= WA_NODE_IDLE_SECS (padrão 300 s) ela é VAGA, não lugar tomado. Antes, o `live >= SLOTS` contava toda sessão viva: 3 sessões
+#    (uma já sem bead) davam "sessao-viva n=3" em toda varredura (27 recusas em ~19 h no wa-node-route.jsonl, a fila node:ok parada). Três estados: ociosa PROVADA = vaga; ocupada = bead em andamento no alias
+#    OU quieta há pouco; não deu para saber (last_active ausente/ilegível/no futuro, estado que não é `active`, outro template, alias repetido) = OCUPADA, o inerte.
+ago() { python3 -I -c 'import sys,time; print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - int(sys.argv[1]))))' "$1"; }   # o carimbo de N segundos atrás (negativo = no futuro)
+quiet() { printf '{"template":"wa-worker-remote","state":"active","closed":false,"alias":"wa-worker-remote-%s","last_active":"%s"}' "$1" "$(ago "${2:-600}")"; }   # sessão viva do alias N, quieta há $2 s (600 se não dito)
+closedat() { jq -c --arg a "wa-worker-remote-$1" '. + {("wa-done-"+$a):{"id":("wa-done-"+$a),"status":"closed","assignee":$a,"metadata":{}}}' "$STATE" > "$STATE.n" && mv "$STATE.n" "$STATE"; }   # uma bead FECHADA do alias N
+# o caso medido: 3 sessões vivas, o -3 acabou de fechar a bead (fechada, sem bead em andamento), fila node:ok
+fresh; busyat 1; busyat 2; closedat 3; sessions "[$(live 1),$(live 2),$(quiet 3)]"; pm apply wa-t1
+expect_rc "ociosa: 3 sessões vivas, o -3 sem bead em andamento e quieto há 10 min -> 0 (antes: 12 sessao-viva)" 0
+[ "$(who)" = wa-worker-remote-3 ] && ok "ociosa: a bead vai para a sessão ociosa (-3), não para um alias novo" || bad "ociosa: foi para $(who)"
+[ "$(mark)" = wa-worker-remote-3 ] && [ "$(rota)" = vazio ] && ok "ociosa: leva a marca do alias e nunca gc.routed_to" || bad "ociosa: marca=$(mark) rota=$(rota)"
+[ "$(grep -c '|update|' "$CALLS")" = 1 ] && ok "ociosa: UMA escrita" || bad "ociosa: $(grep -c '|update|' "$CALLS") escritas"
+grep '|update|' "$CALLS" | head -n 1 | grep -q -- '--if-assignee||--if-status|open|' && ok "ociosa: a escrita segue com comparação atômica" || bad "ociosa: escrita sem comparação"
+grep -q 'session new' "$GCCALLS" && bad "ociosa: o despachante rodou gc session new" || ok "ociosa: o despachante não abre sessão (a do alias já está viva)"
+grep -q 'sessao-viva' "$CITY/.gc/wa-node-route.jsonl" && bad "ociosa: o log ainda registra sessao-viva" || ok "ociosa: nenhuma recusa sessao-viva no log"
+grep -q 'reaproveitada' "$CITY/.gc/wa-node-route.jsonl" && ok "ociosa: o log diz que a sessão ociosa foi reaproveitada (rastro)" || bad "ociosa: log sem rastro: $(cat "$CITY/.gc/wa-node-route.jsonl")"
+bead '."wa-t1".comments[0]' | grep -q 'já está viva' && ok "ociosa: o comentário da bead diz que a sessão do alias já estava viva" || bad "ociosa: comentário: $(bead '."wa-t1".comments[0]')"
+[ "$(bead '."wa-t1".comments[0]' | grep -c 'O Pilot abre a sessão')" = 1 ] && ok "ociosa: a parte fixa do comentário não muda" || bad "ociosa: parte fixa mudou"
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2),$(quiet 3)]"; pm apply wa-t1; expect_rc "ociosa: -2 e -3 ociosas -> 0" 0
+[ "$(who)" = wa-worker-remote-2 ] && ok "ociosa: com duas ociosas, a 1ª na ordem dos aliases (-2)" || bad "ociosa: foi para $(who)"
+fresh; sessions "[$(quiet 3)]"; pm apply wa-t1; expect_rc "ociosa: só o -3 vivo e ocioso (-1 e -2 sem sessão) -> 0" 0
+[ "$(who)" = wa-worker-remote-3 ] && ok "ociosa: prefere reaproveitar a sessão ociosa a abrir alias novo (nó não ganha uma tmux a mais)" || bad "ociosa: foi para $(who)"
+fresh; sessions "[$(quiet 1)]"; SL=1 pm apply wa-t1; expect_rc "ociosa: 1 slot, a sessão do -1 ociosa -> 0 (antes: 12)" 0
+[ "$(who)" = wa-worker-remote-1 ] && ok "ociosa: 1 slot reaproveita o -1" || bad "ociosa: foi para $(who)"
+# quieta há pouco ou sem prova de quietude = ocupada (pode estar trabalhando sem bead: o autor esperando o gate, uma ferramenta longa)
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2 60),$(quiet 3 60)]"; pm apply wa-t1; expect_rc "ociosa: quietas há só 60 s (< 300 s) -> 12 sem escrita" 12 w0
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2 240),$(quiet 3 240)]"; pm apply wa-t1; expect_rc "ociosa: quietas há 240 s (< 300 s, com folga: o relógio anda durante o teste) -> 12 sem escrita" 12 w0
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2 300),$(quiet 3 300)]"; pm apply wa-t1; expect_rc "ociosa: quietas há 300 s (no corte; o teste só envelhece a sessão) -> 0" 0
+fresh; busyat 1; sessions "[$(live 1),$(live 2),$(live 3)]"; pm apply wa-t1; expect_rc "ociosa: sessões sem last_active -> ocupadas -> 12 sem escrita" 12 w0
+for la in '"ontem"' 'null' '""' '1792760000' '"2026-10-23T12:59:50-03:00"' '"2026-13-45T99:99:99Z"'; do
+  fresh; busyat 1; sessions "[$(live 1),{\"template\":\"wa-worker-remote\",\"state\":\"active\",\"closed\":false,\"alias\":\"wa-worker-remote-2\",\"last_active\":$la},{\"template\":\"wa-worker-remote\",\"state\":\"active\",\"closed\":false,\"alias\":\"wa-worker-remote-3\",\"last_active\":$la}]"
+  pm apply wa-t1; expect_rc "ociosa: last_active=$la (não dá para saber) -> ocupadas -> 12 sem escrita" 12 w0
+done
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2 -3600),$(quiet 3 -3600)]"; pm apply wa-t1; expect_rc "ociosa: last_active uma hora NO FUTURO (relógio) -> ocupadas -> 12 sem escrita" 12 w0
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2 600 | sed 's/Z"/.123456Z"/'),$(quiet 3)]"; pm apply wa-t1; expect_rc "ociosa: last_active com fração de segundo é lido -> 0" 0
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2 | sed 's/"active"/"start-pending"/'),$(quiet 3 | sed 's/"active"/"start-pending"/')]"; pm apply wa-t1; expect_rc "ociosa: estado start-pending (subindo) nunca é ociosa -> 12 sem escrita" 12 w0
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2 | sed 's/"active"/"suspended"/'),$(quiet 3 | sed 's/"active"/"suspended"/')]"; pm apply wa-t1; expect_rc "ociosa: estado que não conheço (suspended) nunca é ociosa -> 12 sem escrita" 12 w0
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2 | sed 's/"wa-worker-remote"/"wa-worker"/'),$(quiet 3 | sed 's/"wa-worker-remote"/"wa-worker"/')]"; pm apply wa-t1; expect_rc "ociosa: sessão de OUTRO template com o alias do nó nunca é ociosa -> 12 sem escrita" 12 w0
+# o alias tem bead em andamento: quieta ou não, NÃO é vaga (a bead é o sinal de trabalho)
+fresh; busyat 1; busyat 2; busyat 3; sessions "[$(quiet 1),$(quiet 2),$(quiet 3)]"; pm apply wa-t1; expect_rc "ociosa: 3 quietas MAS com bead em andamento -> 12 sem escrita" 12 w0
+fresh; busyat 1; busyat 2; sessions "[$(live 1),$(quiet 2),$(live 3)]"; pm apply wa-t1; expect_rc "ociosa: a única quieta tem bead; a outra sessão viva é ativa -> 12 sem escrita" 12 w0
+fresh; busyat 1; busyat 2; sessions "[$(quiet 1),$(quiet 2),$(live 3)]"; pm apply wa-t1; expect_rc "ociosa: -1 e -2 quietas MAS com bead (o -3 livre, mas ativo) -> 12 sem escrita: bead no alias nunca é vaga" 12 w0
+# duas sessões vivas com o MESMO alias: não há uma só sessão para reaproveitar
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2),$(quiet 2),$(quiet 3)]"; pm apply wa-t1
+expect_rc "ociosa: 4 vivas (o -2 duplicado) em 3 slots -> 12 sem escrita (a duplicata não vira vaga)" 12 w0
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2),$(quiet 2),$(quiet 3)]"; SL=4 pm apply wa-t1
+expect_rc "ociosa: 4 slots, o -2 duplicado e o -3 ocioso -> 0" 0
+[ "$(who)" = wa-worker-remote-3 ] && ok "ociosa: alias repetido não é reaproveitado (vai para o -3)" || bad "ociosa: foi para $(who)"
+# modo pool não muda: o alias da sessão do pool não é nomeável, a sessão viva segue segurando o slot
+fresh; sessions "[$(quiet 1)]"; d apply wa-t1; expect_rc "ociosa: modo POOL com sessão ociosa -> 12 (o pool não muda)" 12 w0
+# o limiar
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2 60),$(quiet 3 60)]"; WA_NODE_IDLE_SECS=30 pm apply wa-t1; expect_rc "ociosa: WA_NODE_IDLE_SECS=30 e quietas há 60 s -> 0" 0
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2 0),$(quiet 3 0)]"; WA_NODE_IDLE_SECS=0 pm apply wa-t1; expect_rc "ociosa: WA_NODE_IDLE_SECS=0 vale (qualquer sessão sem bead) -> 0" 0
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2 400),$(quiet 3 400)]"; WA_NODE_IDLE_SECS=900 pm apply wa-t1; expect_rc "ociosa: WA_NODE_IDLE_SECS=900 e quietas há 400 s -> 12 sem escrita" 12 w0
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2 400),$(quiet 3 400)]"; WA_NODE_IDLE_SECS=0300 pm apply wa-t1; expect_rc "ociosa: WA_NODE_IDLE_SECS=0300 (zero à esquerda) lê 300 e 400 s passa -> 0" 0
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2 250),$(quiet 3 250)]"; WA_NODE_IDLE_SECS=0300 pm apply wa-t1; expect_rc "ociosa: WA_NODE_IDLE_SECS=0300 é decimal 300, não octal 192: 250 s não passa -> 12 sem escrita" 12 w0
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2 60),$(quiet 3 60)]"; WA_NODE_IDLE_SECS=09 pm apply wa-t1; expect_rc "ociosa: WA_NODE_IDLE_SECS=09 é decimal 9 (octal quebraria o script) -> 0" 0
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2 -3600),$(quiet 3 -3600)]"; WA_NODE_IDLE_SECS=0 pm apply wa-t1; expect_rc "ociosa: corte 0 e last_active NO FUTURO -> 12 sem escrita (idade negativa nunca vale)" 12 w0
+for iv in abc -5 3.5 '3 0' '' 99999999999999999999; do
+  fresh; busyat 1; sessions "[$(live 1),$(quiet 2 60),$(quiet 3 60)]"; WA_NODE_IDLE_SECS="$iv" pm apply wa-t1; expect_rc "ociosa: WA_NODE_IDLE_SECS='$iv' (ilegível/vazio) volta a 300 s: quietas há 60 s -> 12 sem escrita" 12 w0
+done
+# o oráculo continua mandando: reaproveitar a sessão não o dispensa
+fresh; busyat 1; cap "$CAP_LOCAL" 1; sessions "[$(live 1),$(quiet 2),$(quiet 3)]"; pm apply wa-t1; expect_rc "ociosa: oráculo diz local -> 12 sem escrita (reaproveitar não dispensa o oráculo)" 12 w0
+fresh; busyat 1; cap '{"verdict":"unknown","reason":"stale"}' 2; sessions "[$(live 1),$(quiet 2),$(quiet 3)]"; pm apply wa-t1; expect_rc "ociosa: oráculo não sabe -> 11 sem escrita" 11 w0
+fresh; busyat 1; cap '{"verdict":"node","free":1}' 0; sessions "[$(live 1),$(quiet 2),$(quiet 3)]"; pm apply wa-t1; expect_rc "ociosa: oráculo com 1 vaga e nenhuma bead à espera de sessão -> 0" 0
+fresh; busyat 1; busyat 2; cap '{"verdict":"node","free":1}' 0; sessions "[$(live 1),$(quiet 3)]"; pm apply wa-t1; expect_rc "ociosa: o -2 tem bead e a sessão não subiu (desconta 1 vaga do oráculo) -> 12 sem escrita" 12 w0
+# a leitura de sessões que falha segue 11 (não vira "ociosa por falta de leitura")
+fresh; busyat 1; export STUB_FAIL_GC=1; pm apply wa-t1; expect_rc "ociosa: lista de sessões falha -> 11 sem escrita" 11 w0
+# o jq que avalia a ociosidade falha (rc ≠ 0): NÃO sei avaliar -> 11 sem escrita, nunca "ociosa" nem "ocupada por padrão". Injeção: um jq na frente do PATH que só falha na consulta de ociosidade (a que lê last_active).
+mkdir -p "$T/failjq"; REAL_JQ=$(command -v jq)
+printf '#!/bin/sh\ncase "$*" in *fromdateiso8601*) exit 5 ;; esac\nexec "%s" "$@"\n' "$REAL_JQ" > "$T/failjq/jq"; chmod +x "$T/failjq/jq"
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2),$(quiet 3)]"; PATH="$T/failjq:$PATH" pm apply wa-t1; expect_rc "ociosa: o jq da ociosidade falha (rc 5) -> 11 sem escrita" 11 w0
+grep -q 'ociosidade-ilegivel' "$CITY/.gc/wa-node-route.jsonl" && ok "ociosa: o log diz ociosidade-ilegivel" || bad "ociosa: log: $(cat "$CITY/.gc/wa-node-route.jsonl")"
 # -- leituras ilegíveis: qualquer uma = 11, nunca livre
 fresh; STUB_FAIL_LIST_ALIAS=wa-worker-remote-2 pm apply wa-t1; expect_rc "slots: a leitura do -2 falha (o -1 estava livre) -> 11 sem escrita" 11 w0
 fresh; STUB_FAIL_LIST_ALIAS=wa-worker-remote-3 pm apply wa-t1; expect_rc "slots: a leitura do -3 falha -> 11 sem escrita" 11 w0
@@ -492,7 +565,7 @@ mutant sem-comparacao '--if-assignee "" --if-status open ' ''
 fresh; d apply wa-t1; if grep '|update|' "$CALLS" | head -n 1 | grep -q -- '--if-assignee||--if-status|open|'; then survived; else killed; fi
 mutant slot-ignorado '*) busy_a="$busy_a $A"; busy_n=$((busy_n+n)) ;; esac' '*) free_a="$free_a $A" ;; esac'
 fresh; jq -c '. + {"wa-busy":{"id":"wa-busy","status":"in_progress","assignee":"wa-worker-remote-1","metadata":{}}}' "$STATE" > "$STATE.n" && mv "$STATE.n" "$STATE"; d apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
-mutant sessao-ignorada 'if [ "$live" -ge "$SLOTS" ]; then jlog apply' 'if false; then jlog apply'
+mutant sessao-ignorada 'if [ $((live - n_reuse)) -ge "$SLOTS" ]; then jlog apply' 'if false; then jlog apply'
 fresh; echo '{"ok":true,"sessions":[{"template":"wa-worker-remote","state":"active"}]}' > "$SESS"; d apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
 mutant veredito-ignorado 'if [ "$rc" != 0 ]; then jlog apply' 'if false; then jlog apply'
 fresh; cls "$MINI" 10; d apply wa-t1; if [ "$RC" = 10 ] && ! wrote; then survived; else killed; fi
@@ -612,6 +685,40 @@ mutant self-vazio-quebra 'SELF="${WA_NODE_SELF:-wa-node-dispatch.sh}"' 'SELF="${
 fresh; WA_NODE_SELF= d apply wa-t1; case "$(cmt)" in *" Ao fim da entrega: wa-node-dispatch.sh release wa-t1.") survived ;; *) killed ;; esac
 mutant story-vazio-quebra 'STORY="${WA_NODE_STORY:-ga-2hd02v.1.10}"' 'STORY="${WA_NODE_STORY-ga-2hd02v.1.10}"'
 fresh; WA_NODE_STORY= d apply wa-t1; case "$(cmt)" in "nó (ga-2hd02v.1.10): "*) survived ;; *) killed ;; esac
+
+# -- sessão ociosa (ga-2hd02v.3.12): cada mutante quebra UMA linha da regra e o caso designado tem de notar
+mutant ociosa-nao-desconta 'if [ $((live - n_reuse)) -ge "$SLOTS" ]; then' 'if [ "$live" -ge "$SLOTS" ]; then'
+fresh; busyat 1; busyat 2; closedat 3; sessions "[$(live 1),$(live 2),$(quiet 3)]"; pm apply wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
+mutant ociosa-sem-quietude ' and (($now - $ts) >= $idle)))' '))'
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2 60),$(quiet 3 60)]"; pm apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
+mutant ociosa-estado-qualquer ' and ((.state // .State // "") == "active")' ''
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2 | sed 's/"active"/"start-pending"/'),$(quiet 3 | sed 's/"active"/"start-pending"/')]"; pm apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
+mutant ociosa-template-qualquer 'select(((.template // .Template // "") == $t) and .closed != true and ((.state' 'select((true) and .closed != true and ((.state'
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2 | sed 's/"wa-worker-remote"/"wa-worker"/'),$(quiet 3 | sed 's/"wa-worker-remote"/"wa-worker"/')]"; pm apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
+mutant ociosa-tipo-last-active 'select((.last_active | type) == "string") | ' ''
+fresh; busyat 1; sessions "[$(live 1),{\"template\":\"wa-worker-remote\",\"state\":\"active\",\"closed\":false,\"alias\":\"wa-worker-remote-2\",\"last_active\":1792760000},{\"template\":\"wa-worker-remote\",\"state\":\"active\",\"closed\":false,\"alias\":\"wa-worker-remote-3\",\"last_active\":1792760000}]"; pm apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
+mutant ociosa-pool-reaproveita $'  if [ "$SPAWN" = pilot ]; then\n    idle_json=' $'  if true; then\n    idle_json='
+fresh; sessions "[$(quiet 1)]"; d apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
+mutant ociosa-alias-repetido '[ "$(printf '"'"'%s\n'"'"' "$live_al" | grep -cxF -- "$A")" = 1 ] || continue' 'true'
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2),$(quiet 2),$(quiet 3)]"; SL=4 pm apply wa-t1; if [ "$RC" = 0 ] && [ "$(who)" = wa-worker-remote-3 ]; then survived; else killed; fi
+mutant ociosa-ignora-bead $'    for A in $free_a; do\n      [ "$(printf' $'    for A in $ALIASES; do\n      [ "$(printf'
+fresh; busyat 1; busyat 2; sessions "[$(quiet 1),$(quiet 2),$(live 3)]"; pm apply wa-t1; if [ "$RC" = 12 ] && ! wrote; then survived; else killed; fi
+mutant ociosa-prefere-novo 'for A in $reuse_a; do PICK="$A"; REUSED=1; break; done' ':'
+fresh; sessions "[$(quiet 3)]"; pm apply wa-t1; if [ "$(who)" = wa-worker-remote-3 ]; then survived; else killed; fi
+mutant ociosa-idle-padrao 'IDLE="${WA_NODE_IDLE_SECS:-300}"' 'IDLE="${WA_NODE_IDLE_SECS:-0}"'
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2 60),$(quiet 3 60)]"; pm apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
+mutant ociosa-idle-ilegivel-zero "''|*[!0-9]*) IDLE=300 ;; *) if" "''|*[!0-9]*) IDLE=0 ;; *) if"
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2 60),$(quiet 3 60)]"; WA_NODE_IDLE_SECS=abc pm apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
+mutant ociosa-idle-octal 'IDLE=$((10#$IDLE))' 'IDLE=$((IDLE))'
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2 250),$(quiet 3 250)]"; WA_NODE_IDLE_SECS=0300 pm apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
+mutant ociosa-idle-longo 'else IDLE=300; fi' 'else IDLE=0; fi'
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2 60),$(quiet 3 60)]"; WA_NODE_IDLE_SECS=99999999999999999999 pm apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
+mutant ociosa-comentario '[ "$REUSED" = 1 ] && who="$who A sessão do alias já está viva e ociosa (reaproveitada): o Pilot só a avisa."' ':'
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2),$(quiet 3)]"; pm apply wa-t1; if bead '."wa-t1".comments[0]' | grep -q 'já está viva'; then survived; else killed; fi
+mutant ociosa-rastro 'rn=" [sessão ociosa reaproveitada]"' 'rn=""'
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2),$(quiet 3)]"; pm apply wa-t1; if grep -q 'reaproveitada' "$CITY/.gc/wa-node-route.jsonl"; then survived; else killed; fi
+mutant ociosa-ilegivel-segue 'ok) ;; *) jlog apply "$id" 11 "ociosidade-ilegivel"; die 11 "não consegui avaliar quais sessões estão ociosas — fica no mini" ;; esac' 'ok) ;; *) ;; esac'
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2),$(quiet 3)]"; PATH="$T/failjq:$PATH" pm apply wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

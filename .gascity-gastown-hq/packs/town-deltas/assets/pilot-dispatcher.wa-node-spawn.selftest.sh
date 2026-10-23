@@ -44,7 +44,7 @@ eq() { # eq <descrição> <obtido> <esperado>
 [ -f "$DISPATCHER" ] || { echo "FATAL: $DISPATCHER não existe" >&2; exit 2; }
 fn_of() { awk -v n="$1" '$0 ~ "^"n"\\(\\)"{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER"; }
 FNS=""
-for _f in _pilot_wa_node_decide _pilot_wa_node_spawn_mode _pilot_wa_node_read _pilot_wa_node_open _pilot_wa_node_settle _pilot_node_remote_open _pilot_node_remote_rollback _pilot_slow_spawn_budget_spent _pilot_note_spawn_timing gc_json_or_unknown; do
+for _f in _pilot_wa_node_decide _pilot_wa_node_spawn_mode _pilot_wa_node_read _pilot_wa_node_open _pilot_wa_node_settle _pilot_node_remote_open _pilot_node_remote_rollback _pilot_slow_spawn_budget_spent _pilot_note_spawn_timing gc_json_or_unknown _pilot_ps_node_open _pilot_node_idle_secs; do
   _b="$(fn_of "$_f")"
   [ -n "$_b" ] || { echo "FATAL: $_f() não está em $DISPATCHER" >&2; exit 2; }
   FNS="$FNS"$'\n'"$_b"
@@ -178,6 +178,10 @@ D() { # D <modo> <rc do script> [dry] — o decide inteiro, alvo wa-worker
 }
 O() { H _pilot_node_remote_open wa-worker-remote "$1" "$ID" "$ST" "${2-Título X}" pilot.wa_node_alias; }   # O <alias> [título]
 W() { H _pilot_wa_node_open "$ID" "$ST"; }
+OR() { H _pilot_node_remote_open wa-worker-remote "$1" "$ID" "$ST" "${2-Título X}" pilot.wa_node_alias "${3-300}"; }   # OR <alias> [título] [quietude mínima, s]: com o 7º argumento a sessão ociosa vale (ga-2hd02v.3.12)
+PSO() { H _pilot_ps_node_open "$ID" "$ST"; }
+ago() { python3 -I -c 'import sys,time; print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - int(sys.argv[1]))))' "$1"; }   # o carimbo de N segundos atrás (negativo = futuro)
+qs() { printf '[{"alias":"%s","template":"%s","state":"active","closed":false,"last_active":"%s"}]' "${2:-wa-worker-remote-2}" "${3:-wa-worker-remote}" "$(ago "${1:-600}")"; }   # qs [s quieta] [alias] [template]: a sessão ativa do alias, quieta há N s
 
 ord()   { tr '\n' ' ' < "$T/order"; }   # cada chamada + 1 espaço (inclusive a última): quem junta com outra coisa não põe espaço
 nupd()  { grep -c '|update|' "$T/bdcalls" || true; }
@@ -213,6 +217,17 @@ for v in 0 10 12 99 "3 " " 3" -1 2.5 abc "" "1;2" 01 "1 2"; do
 done
 
 # ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
+echo
+echo "=== A2. _pilot_node_idle_secs (WA_NODE_IDLE_SECS lida do mesmo jeito que o wa-node-dispatch.sh) ==="
+I() { ( if [ "$1" = "-" ]; then unset WA_NODE_IDLE_SECS; else export WA_NODE_IDLE_SECS="$1"; fi; bash -c "$PRELUDE"$'\n'"$FNS"$'\n''_pilot_node_idle_secs' ); }
+eq "ausente: 300" "$(I -)" "300"
+eq "vazio: 300" "$(I '')" "300"
+eq "90: 90" "$(I 90)" "90"
+eq "0 vale: 0" "$(I 0)" "0"
+eq "0300 é decimal (nunca octal): 300" "$(I 0300)" "300"
+eq "010 é decimal: 10" "$(I 010)" "10"
+for v in abc -5 3.5 ' 30' '30 ' '3 0' 1e3 99999999999999999999 0x10; do eq "'$v' (ilegível) volta a 300" "$(I "$v")" "300"; done
+
 echo
 echo "=== B. _pilot_node_remote_open (genérica) ==="
 
@@ -270,6 +285,78 @@ for spec in \
 done
 reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.busy.json" '[{"alias":"wa-worker-remote-2","template":"wa-worker-remote","state":"active"}]'; export FAKE_SESSIONS="$T/s.busy.json"
 r=$(O wa-worker-remote-2); hasbd "$(UPD wa-worker-remote-2)" && ok "o desfazer é UMA escrita guardada: --if-assignee <alias> --assignee '' --status open --unset-metadata <chave> -q" || fail "update: $(cat "$T/bdcalls")"
+
+# --- sessão OCIOSA reaproveitada (ga-2hd02v.3.12) ---
+# O wa-node-dispatch.sh só escolhe um alias com sessão viva se ela está sem bead e quieta há >= WA_NODE_IDLE_SECS. A peça confere DE NOVO (as duas leituras têm de concordar, senão o script escolheria
+# para sempre um alias que a peça recusa) e, se confere, SÓ avisa: nada de session new nem wake, e o desfazer NUNCA fecha uma sessão que já existia (ela pode estar trabalhando). O 7º argumento é a opção
+# do chamador: sem ele (o dog, qualquer chamador antigo) o alias ativo segue ocupado, como antes.
+reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.idle.json" "$(qs 600)"; export FAKE_SESSIONS="$T/s.idle.json"
+r=$(OR wa-worker-remote-2); eq "ociosa (quieta há 10 min), reaproveitamento ligado: devolve 0" "$r" "rc=0"
+eq "ociosa: lê as sessões e SÓ avisa — nada de session new nem wake" "$(ord)" "gc:list gc:nudge "
+grep -qF -- "|--city|$T/city|session|nudge|wa-worker-remote-2|Bead nova para você: $ID — Título X. Ela já está atribuída ao seu alias (GC_ALIAS=wa-worker-remote-2)" "$T/gccalls" && ok "ociosa: o aviso é o de sempre (bead, título, alias)" || fail "nudge: $(cat "$T/gccalls")"
+eq "ociosa: a bead segue como o apply a deixou" "$(stt)" "$AP2"
+eq "ociosa: não gasta o orçamento de spawn (ninguém foi aberto)" "$(slow)" "0"
+grep -q 'alias wa-worker-remote-2 (sessão idle), avisada' "$T/err" && ok "ociosa: o log diz que a sessão do alias era a ociosa" || fail "log: $(cat "$T/err")"
+reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.idle.json" "$(qs 600)"; export FAKE_SESSIONS="$T/s.idle.json"
+r=$(O wa-worker-remote-2); eq "SEM o 7º argumento o mesmo alias ativo e quieto segue OCUPADO: não avisa, desfaz (quem não optou não muda)" "$r $(ord)$(stt)" "rc=1 gc:list bd:update bd:show $FREE"
+reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.idle.json" "$(qs 300)"; export FAKE_SESSIONS="$T/s.idle.json"
+r=$(OR wa-worker-remote-2 "Título X" 300); eq "ociosa: quieta há 300 s com corte 300 -> reaproveita (o teste só envelhece a sessão)" "$r" "rc=0"
+reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.idle.json" "$(qs 240)"; export FAKE_SESSIONS="$T/s.idle.json"
+r=$(OR wa-worker-remote-2 "Título X" 300); eq "ociosa: quieta há 240 s com corte 300 (folga: o relógio anda durante o teste) -> ocupada (desfaz, sem fechar sessão)" "$r $(ord)$(stt)" "rc=1 gc:list bd:update bd:show $FREE"
+reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.idle.json" "$(qs 60)"; export FAKE_SESSIONS="$T/s.idle.json"
+r=$(OR wa-worker-remote-2 "Título X" 30); eq "ociosa: quieta há 60 s com corte 30 -> reaproveita" "$r" "rc=0"
+reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.idle.json" "$(qs 0)"; export FAKE_SESSIONS="$T/s.idle.json"
+r=$(OR wa-worker-remote-2 "Título X" 0); eq "ociosa: corte 0 (vale qualquer sessão sem bead) -> reaproveita" "$r" "rc=0"
+# sem prova de ociosidade = ocupada: o inerte (não avisa a sessão, não abre outra, solta a bead SEM fechar a sessão que está lá)
+BS='[{"alias":"wa-worker-remote-2","template":"wa-worker-remote","state":"active","closed":false'
+for spec in \
+  "sem-last_active|${BS}}]" \
+  "last_active-nulo|${BS},\"last_active\":null}]" \
+  "last_active-vazio|${BS},\"last_active\":\"\"}]" \
+  "last_active-numero|${BS},\"last_active\":1792760000}]" \
+  "last_active-texto|${BS},\"last_active\":\"ontem\"}]" \
+  "last_active-com-fuso|${BS},\"last_active\":\"2026-10-23T12:59:50-03:00\"}]" \
+  "last_active-data-invalida|${BS},\"last_active\":\"2026-13-45T99:99:99Z\"}]" \
+  "no-futuro|$(qs -3600)" \
+  "subindo|$(qs 600 | sed 's/"active"/"start-pending"/')" \
+  "criando|$(qs 600 | sed 's/"active"/"creating"/')" \
+  "estado-desconhecido|$(qs 600 | sed 's/"active"/"suspended"/')" \
+  "outro-template|$(qs 600 wa-worker-remote-2 dog-remote)" \
+  "duas-sessoes-quietas|$(qs 600 | sed 's/}]$/},{"alias":"wa-worker-remote-2","template":"wa-worker-remote","state":"active","closed":false,"last_active":"'"$(ago 600)"'"}]/')" \
+  "uma-quieta-uma-dormindo|$(qs 600 | sed 's/}]$/},{"alias":"wa-worker-remote-2","template":"wa-worker-remote","state":"asleep","closed":false}]/')"; do
+  nm="${spec%%|*}"; arr="${spec#*|}"
+  reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.busy.json" "$arr"; export FAKE_SESSIONS="$T/s.busy.json"
+  r=$(OR wa-worker-remote-2)
+  eq "ociosa ($nm): sem prova de ociosidade -> ocupada: não avisa, não abre, não fecha, desfaz — devolve 1" "$r $(ord)$(stt)" "rc=1 gc:list bd:update bd:show $FREE"
+done
+reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.fut.json" "$(qs -3600)"; export FAKE_SESSIONS="$T/s.fut.json"
+r=$(OR wa-worker-remote-2 "Título X" 0); eq "ociosa: corte 0 e last_active NO FUTURO -> ocupada (idade negativa nunca vale)" "$r $(ord)$(stt)" "rc=1 gc:list bd:update bd:show $FREE"
+for iv in abc -1 3.5 '' '3 0'; do
+  reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.idle.json" "$(qs 600)"; export FAKE_SESSIONS="$T/s.idle.json"
+  r=$(OR wa-worker-remote-2 "Título X" "$iv"); eq "ociosa: quietude mínima '$iv' (ilegível/vazia) desliga o reaproveitamento -> ocupada" "$r $(ord)" "rc=1 gc:list bd:update bd:show "
+done
+# o aviso falhou numa sessão que JÁ EXISTIA: desfaz a bead e NÃO fecha a sessão (ela pode estar trabalhando); desfazer não confirmado = 2 (segura), também sem fechar
+reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.idle.json" "$(qs 600)"; export FAKE_SESSIONS="$T/s.idle.json" FAKE_GC_NUDGE_RC=1
+r=$(OR wa-worker-remote-2); eq "ociosa, o aviso falhou: solta a bead e NÃO fecha a sessão que já existia" "$r $(ord)$(stt)" "rc=1 gc:list gc:nudge bd:update bd:show $FREE"
+hasgc 'session|close|wa-worker-remote-2' && fail "ociosa: o desfazer FECHOU a sessão ociosa que já existia" || ok "ociosa: nenhum session close foi chamado"
+reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.idle.json" "$(qs 600)"; export FAKE_SESSIONS="$T/s.idle.json" FAKE_GC_NUDGE_RC=1 FAKE_BD_UPDATE_MODE=noop
+r=$(OR wa-worker-remote-2); eq "ociosa, o aviso falhou e o desfazer não se confirma: 2 (segura), sem fechar a sessão" "$r $(ord)$(stt)" "rc=2 gc:list gc:nudge bd:update bd:show $AP2"
+reset; cp "$T/b.ap2.json" "$T/state.json"; export FAKE_SESSIONS="$T/s.bad.json" FAKE_GC_LIST_RC=1; printf '' > "$T/s.bad.json"
+r=$(OR wa-worker-remote-2); eq "ociosa: a lista de sessões não leu -> não reaproveita (três estados), desfaz" "$r $(stt)" "rc=1 $FREE"
+# os dois chamadores optam: o gancho do WA e o do PS (o PS usa o mesmo despachante, com um alias só)
+reset; pilot 3; export FAKE_BEAD2="$T/b.ap2.json" FAKE_SESSIONS="$T/s.idle.json"; sj "$T/s.idle.json" "$(qs 600)"; r=$(D label 0)
+eq "WA, o decide inteiro: o script escolheu o -2 e a sessão dele é a ociosa -> só avisa" "$r $(ord)" "rc=0 bd:show script:apply bd:show gc:list gc:nudge "
+mkb "$T/b.ps1.json" in_progress ps-worker-remote-1 ps-worker-remote-1 "Titulo PS"
+reset; cp "$T/b.ps1.json" "$T/state.json"; sj "$T/s.psidle.json" "$(qs 600 ps-worker-remote-1 ps-worker-remote)"; export FAKE_SESSIONS="$T/s.psidle.json"
+r=$(PSO); eq "PS: a sessão ociosa do ps-worker-remote-1 é reaproveitada (relê a bead, lê as sessões, só avisa)" "$r $(ord)" "rc=0 bd:show gc:list gc:nudge "
+grep -qF -- "|session|nudge|ps-worker-remote-1|" "$T/gccalls" && ok "PS: o aviso vai para o alias do PS" || fail "PS: $(cat "$T/gccalls")"
+reset; cp "$T/b.ps1.json" "$T/state.json"; sj "$T/s.psbusy.json" "$(qs 60 ps-worker-remote-1 ps-worker-remote)"; export FAKE_SESSIONS="$T/s.psbusy.json"
+r=$(PSO); eq "PS: quieta há só 60 s -> ocupada, desfaz sem fechar" "$r $(ord)" "rc=1 bd:show gc:list bd:update bd:show "
+# a quietude mínima vem do ambiente (WA_NODE_IDLE_SECS), a MESMA variável que o script lê
+reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.idle.json" "$(qs 60)"; export FAKE_SESSIONS="$T/s.idle.json"
+r=$(WA_NODE_IDLE_SECS=30 W); eq "WA_NODE_IDLE_SECS=30 chega à peça: quieta há 60 s -> reaproveita" "$r" "rc=0"
+reset; cp "$T/b.ap2.json" "$T/state.json"; sj "$T/s.idle.json" "$(qs 60)"; export FAKE_SESSIONS="$T/s.idle.json"
+r=$(W); eq "sem WA_NODE_IDLE_SECS o corte é 300 s: quieta há 60 s -> ocupada" "$r" "rc=1"
 
 # --- lista de sessões ilegível: não abre ---
 for spec in 'rc1|' 'objeto-vazio|{}' 'sessions-texto|{"sessions":"x"}' 'sessions-objeto|{"sessions":{}}' 'lixo|isto não é json' 'vazio|' 'ok-false|{"ok":false,"sessions":[]}' 'nulo|null'; do
@@ -540,6 +627,16 @@ for f in _pilot_node_remote_open _pilot_node_remote_rollback; do
   printf '%s' "$body" | grep -qE 'wa-|wa_node|PILOT_WA' && fail "$f cita WA no código (a peça tem de ser genérica: template, alias e chave entram por argumento)" || ok "$f não cita WA no código (genérica)"
 done
 bash -n "$DISPATCHER" && ok "bash -n do pilot-dispatcher.sh" || fail "bash -n do pilot-dispatcher.sh"
+# ga-2hd02v.3.12: os DOIS chamadores (WA e PS) optam pelo reaproveitamento da sessão ociosa; a peça sem o 7º argumento não reaproveita
+[ "$(grep -c '_pilot_node_remote_open wa-worker-remote "\$_PWR_ALIAS" "\$_wo_id" "\$_wo_store" "\$_PWR_TITLE" pilot.wa_node_alias "\$(_pilot_node_idle_secs)"' "$DISPATCHER")" = 1 ] && ok "o gancho do WA passa a quietude mínima à peça" || fail "WA não passa a quietude mínima"
+[ "$(grep -c '_pilot_node_remote_open ps-worker-remote "\$_PWR_ALIAS" "\$_po_id" "\$_po_store" "\$_PWR_TITLE" pilot.wa_node_alias "\$(_pilot_node_idle_secs)"' "$DISPATCHER")" = 1 ] && ok "o gancho do PS passa a quietude mínima à peça" || fail "PS não passa a quietude mínima"
+# o CONTRATO com o script: a leitura "esta sessão está ociosa?" mora em dois lugares (o script escolhe o alias, a peça confere). O trecho que decide a quietude tem de ser LITERALMENTE o mesmo nos dois.
+WAND="$(cd "$SELF_DIR/../../.." && pwd)/scripts/wa-node-dispatch.sh"
+CONTRACT='select((.last_active | type) == "string") | select(((.last_active | sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch null) as $ts | (($ts | type) == "number") and (($now - $ts) >= $idle)))'
+[ -f "$WAND" ] || fail "contrato: $WAND não existe"
+grep -qF -- "$CONTRACT" "$WAND" && ok "contrato: o script usa o trecho de quietude combinado" || fail "contrato: o script mudou o trecho de quietude"
+grep -qF -- "$CONTRACT" "$DISPATCHER" && ok "contrato: a peça usa o MESMO trecho de quietude" || fail "contrato: a peça mudou o trecho de quietude (o script e a peça têm de concordar)"
+[ "$(grep -c 'WA_NODE_IDLE_SECS:-300' "$WAND")" = 1 ] && [ "$(grep -c 'WA_NODE_IDLE_SECS:-300' "$DISPATCHER")" = 1 ] && ok "contrato: o mesmo padrão (300 s) nos dois" || fail "contrato: o padrão de WA_NODE_IDLE_SECS difere"
 
 # ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
 MUTATOR="$SELF_DIR/pilot-dispatcher.wa-node-spawn.mutants.py"
@@ -566,9 +663,9 @@ fi
 if [ -z "${WA_NODE_SPAWN_SELFTEST_FILE:-}" ] && [ -z "${WA_NODE_SPAWN_ST_NOMUT:-}" ]; then
   echo
   echo "=== G. mutantes (cada um tem de derrubar o selftest) ==="
-  # o mutador mora em arquivo próprio. ausente/ilegível (python falha) → `fail`; vazio (lista sem nomes) ou com menos que o piso de hoje (72) → `fail` também: tirar um mutante tem de ser decisão visível, nunca "todos mortos" por lista curta
+  # o mutador mora em arquivo próprio. ausente/ilegível (python falha) → `fail`; vazio (lista sem nomes) ou com menos que o piso de hoje (86) → `fail` também: tirar um mutante tem de ser decisão visível, nunca "todos mortos" por lista curta
   MUT_LIST="$(python3 -I "$MUTATOR" --list)" || { fail "o mutador não carregou"; MUT_LIST=""; }
-  [ "$(echo "$MUT_LIST" | wc -w | tr -d ' ')" -ge 72 ] || fail "o mutador listou menos de 72 mutantes ($(echo "$MUT_LIST" | wc -w | tr -d ' '))"
+  [ "$(echo "$MUT_LIST" | wc -w | tr -d ' ')" -ge 86 ] || fail "o mutador listou menos de 86 mutantes ($(echo "$MUT_LIST" | wc -w | tr -d ' '))"
   run_mut() { # run_mut <nome> — escreve $T/res.<nome>: morto | SOBREVIVEU | ERRO
     local n="$1"
     if ! python3 -I "$MUTATOR" "$DISPATCHER" "$T/mut.$n.sh" "$n" > "$T/res.$n.apply" 2>&1; then echo ERRO > "$T/res.$n"; return; fi

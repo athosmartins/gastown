@@ -1,4 +1,4 @@
-# pilot-dispatcher.wa-node-spawn.mutants.py — o mutador do pilot-dispatcher.wa-node-spawn.selftest.sh (ga-2hd02v.3): 72 quebras de UMA linha do pilot-dispatcher.sh, cada uma com um nome.
+# pilot-dispatcher.wa-node-spawn.mutants.py — o mutador do pilot-dispatcher.wa-node-spawn.selftest.sh (ga-2hd02v.3): 86 quebras de UMA linha do pilot-dispatcher.sh, cada uma com um nome.
 #
 # Contents
 #   Uso · Como cada mutante é escrito
@@ -420,6 +420,77 @@ def _():
 @m("confirma-outro-id")
 def _():
     rep('select(type == "object" and .id == $id and (.status | type == "string")) | "\\(.assignee', 'select(type == "object" and (.status | type == "string")) | "\\(.assignee')
+
+
+# ── H. a sessão ociosa reaproveitada (ga-2hd02v.3.12) ──
+@m("ocioso-sempre-ligado")
+def _():
+    rep("case \"$_ro_idle\" in ''|*[!0-9]*) _ro_idle=-1 ;; esac", "case \"$_ro_idle\" in ''|*[!0-9]*) _ro_idle=0 ;; esac")
+
+
+@m("ocioso-desligado-vale")
+def _():
+    rep('elif $idle >= 0 and', 'elif true and')
+
+
+@m("ocioso-sem-quietude")
+def _():
+    rep(' and (($now - $ts) >= $idle)))', '))')
+
+
+@m("ocioso-estado-qualquer")
+def _():
+    rep('select(.template == $t and .state == "active")', 'select(.template == $t)')
+
+
+@m("ocioso-template-qualquer")
+def _():
+    rep('select(.template == $t and .state == "active")', 'select(.state == "active")')
+
+
+@m("ocioso-varias-sessoes")
+def _():
+    rep('$idle >= 0 and ($h | length) == 1 and ([$h[]', '$idle >= 0 and ([$h[]')
+
+
+@m("ocioso-abre-sessao")
+def _():
+    rep('if [ -z "$_ro_step" ] && [ "$_ro_st" != idle ]; then', 'if [ -z "$_ro_step" ]; then')
+
+
+@m("ocioso-fecha-ao-desfazer")
+def _():
+    rep('_ro_step="" _ro_sess=0 _ro_msg=""', '_ro_step="" _ro_sess=1 _ro_msg=""')
+
+
+@m("ocioso-wa-sem-optar")
+def _():
+    rep('pilot.wa_node_alias "$(_pilot_node_idle_secs)" || _wo_rc=$?', 'pilot.wa_node_alias || _wo_rc=$?')
+
+
+@m("ocioso-ps-sem-optar")
+def _():
+    rep('pilot.wa_node_alias "$(_pilot_node_idle_secs)" || _po_rc=$?', 'pilot.wa_node_alias || _po_rc=$?')
+
+
+@m("idle-secs-padrao")
+def _():
+    rep('local _is="${WA_NODE_IDLE_SECS:-300}"', 'local _is="${WA_NODE_IDLE_SECS:-0}"')
+
+
+@m("idle-secs-octal")
+def _():
+    rep('_is=$((10#$_is))', '_is=$((_is))')
+
+
+@m("idle-secs-ilegivel-zero")
+def _():
+    rep("''|*[!0-9]*) _is=300 ;; *) if", "''|*[!0-9]*) _is=0 ;; *) if")
+
+
+@m("idle-secs-longo")
+def _():
+    rep('else _is=300; fi', 'else _is=0; fi')
 
 
 if len(sys.argv) == 2 and sys.argv[1] == "--list":

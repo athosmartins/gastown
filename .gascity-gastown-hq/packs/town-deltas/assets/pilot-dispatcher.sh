@@ -12484,30 +12484,45 @@ _pilot_node_remote_rollback() {
   return 1
 }
 
-# _pilot_node_remote_open <template> <alias> <id> <loja> <titulo> <chave_da_marca> — abre (ou acorda) a sessão <template> com o alias a que a bead JÁ foi atribuída e a avisa. Devolve 0 = sessão aberta e avisada ·
+# _pilot_node_idle_secs — imprime a quietude mínima (s) que uma sessão sem bead precisa ter para valer como vaga, lida de WA_NODE_IDLE_SECS do MESMO jeito que o wa-node-dispatch.sh (ga-2hd02v.3.12): o script escolhe
+# o alias e esta conta confere de novo, então os dois têm de ler o mesmo número. vazio (variável ausente) → 300; ilegível (letra, sinal, ponto, espaço, mais de 9 dígitos) → 300 também: o erro cai no prazo mais LONGO,
+# nunca no mais curto. 0 vale. Zero à esquerda é decimal (o 10# evita o octal).
+_pilot_node_idle_secs() {
+  local _is="${WA_NODE_IDLE_SECS:-300}"
+  case "$_is" in ''|*[!0-9]*) _is=300 ;; *) if [ "${#_is}" -le 9 ]; then _is=$((10#$_is)); else _is=300; fi ;; esac
+  printf '%s' "$_is"
+}
+
+# _pilot_node_remote_open <template> <alias> <id> <loja> <titulo> <chave_da_marca> [<quietude_min_s>] — abre (ou acorda) a sessão <template> com o alias a que a bead JÁ foi atribuída e a avisa. Devolve 0 = sessão aberta e avisada ·
 # 1 = falhou, o despacho foi desfeito e CONFIRMADO (bead livre e open: segue no mini) · 2 = SEGURA (o desfazer não se confirmou: a bead pode estar com o alias; NÃO a mande ao mini).
 # Uma sessão lenta (prazo ou >= PILOT_SLOW_SPAWN_SECS) gasta o orçamento de spawn do sweep (_pilot_note_spawn_timing, que tem de rodar no shell de quem chama).
 # vazio (nenhuma sessão viva tem o alias) → `session new`; só sessões do <template> dormindo → `session wake` (o idle_timeout põe a sessão para dormir SEM soltar o alias); falhou/ilegível (lista que não leu, sem o array
 # .sessions, alias ocupado por sessão viva ou de outro template, jq que falha) → NÃO abre: desfaz. O que conta como viva é o que o script conta (nem closed, nem closed|stopped|archived|drained): os dois têm de concordar,
 # senão o script escolheria para sempre um alias que o gancho recusa.
+# 7º argumento (ga-2hd02v.3.12, opcional): a quietude mínima em segundos. Só com ele uma sessão VIVA do alias (template certo, `active`, a única com o alias, last_active lido e velho >= o corte, nunca no futuro) é
+# "idle": a bead já foi atribuída a um alias cuja sessão existe e está parada, então SÓ se avisa — nada de `session new` nem `wake`, e o desfazer NUNCA fecha essa sessão (ela já existia: pode estar trabalhando).
+# vazio (sem 7º argumento) → idle desligado, o alias ativo segue "busy" como sempre (o dog e qualquer chamador antigo); ilegível (não é número inteiro) → desligado também; last_active ausente, nulo, número,
+# sem Z, data inválida ou no futuro, estado ≠ active, outro template, duas sessões no alias → "busy": ocupada, o inerte. O trecho que mede a quietude é o MESMO do wa-node-dispatch.sh (o selftest compara o texto).
 _pilot_node_remote_open() {
-  local _ro_tpl="$1" _ro_alias="$2" _ro_id="$3" _ro_store="$4" _ro_title="$5" _ro_key="$6" _ro_sj="" _ro_st="" _ro_rc=0 _ro_t0=0 _ro_step="" _ro_sess=0 _ro_msg=""
+  local _ro_tpl="$1" _ro_alias="$2" _ro_id="$3" _ro_store="$4" _ro_title="$5" _ro_key="$6" _ro_idle="${7:-}" _ro_sj="" _ro_st="" _ro_rc=0 _ro_t0=0 _ro_step="" _ro_sess=0 _ro_msg=""
+  case "$_ro_idle" in ''|*[!0-9]*) _ro_idle=-1 ;; esac
   _ro_sj=$(gc_json_or_unknown timeout 20 gc --city "$GC_CITY" session list --json) || _ro_sj=""
   if ! printf '%s' "$_ro_sj" | jq -e '.sessions | type == "array"' >/dev/null 2>&1; then
     _ro_step="não consegui ler a lista de sessões"
   else
-    _ro_st=$(printf '%s' "$_ro_sj" | jq -r --arg a "$_ro_alias" --arg t "$_ro_tpl" '
+    _ro_st=$(printf '%s' "$_ro_sj" | jq -r --arg a "$_ro_alias" --arg t "$_ro_tpl" --argjson now "$(date +%s)" --argjson idle "$_ro_idle" '
       [.sessions[] | select(type == "object" and .closed != true and .alias == $a) | select((.state // "") | test("closed|stopped|archived|drained") | not)] as $h
       | if ($h | length) == 0 then "new"
         elif ($h | all(.template == $t and .state == "asleep")) then "asleep"
+        elif $idle >= 0 and ($h | length) == 1 and ([$h[] | select(.template == $t and .state == "active") | select((.last_active | type) == "string") | select(((.last_active | sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch null) as $ts | (($ts | type) == "number") and (($now - $ts) >= $idle)))] | length) == 1 then "idle"
         else "busy" end' 2>/dev/null) || _ro_st=""
     case "$_ro_st" in
-      new|asleep) ;;
+      new|asleep|idle) ;;
       busy) _ro_step="o alias já tem uma sessão viva (ou de outro template)" ;;
       *) _ro_step="não consegui decidir entre abrir e acordar a sessão" ;;
     esac
   fi
-  if [ -z "$_ro_step" ]; then
+  if [ -z "$_ro_step" ] && [ "$_ro_st" != idle ]; then
     _ro_sess=1; _ro_rc=0; _ro_t0=$SECONDS
     if [ "$_ro_st" = asleep ]; then
       timeout "${PILOT_SPAWN_TIMEOUT_SECS:-150}" gc --city "$GC_CITY" session wake "$_ro_alias" >/dev/null 2>&1 || _ro_rc=$?
@@ -12554,7 +12569,7 @@ _pilot_wa_node_open() {
     warn "wa-node: $_wo_id depois do apply está com marca '${_PWR_MARK:-}' e status '$_PWR_STATUS' (esperava marca=$_PWR_ALIAS e in_progress) — seguro: sem sessão e sem desfazer; a próxima varredura relê"
     return 2
   fi
-  _pilot_node_remote_open wa-worker-remote "$_PWR_ALIAS" "$_wo_id" "$_wo_store" "$_PWR_TITLE" pilot.wa_node_alias || _wo_rc=$?
+  _pilot_node_remote_open wa-worker-remote "$_PWR_ALIAS" "$_wo_id" "$_wo_store" "$_PWR_TITLE" pilot.wa_node_alias "$(_pilot_node_idle_secs)" || _wo_rc=$?
   return "$_wo_rc"
 }
 
@@ -12659,7 +12674,7 @@ _pilot_ps_node_open() {
     warn "ps-node: $_po_id depois do apply está com marca '${_PWR_MARK:-}' e status '$_PWR_STATUS' (esperava marca=$_PWR_ALIAS e in_progress) — seguro: sem sessão e sem desfazer; a próxima varredura relê"
     return 2
   fi
-  _pilot_node_remote_open ps-worker-remote "$_PWR_ALIAS" "$_po_id" "$_po_store" "$_PWR_TITLE" pilot.wa_node_alias || _po_rc=$?
+  _pilot_node_remote_open ps-worker-remote "$_PWR_ALIAS" "$_po_id" "$_po_store" "$_PWR_TITLE" pilot.wa_node_alias "$(_pilot_node_idle_secs)" || _po_rc=$?
   return "$_po_rc"
 }
 

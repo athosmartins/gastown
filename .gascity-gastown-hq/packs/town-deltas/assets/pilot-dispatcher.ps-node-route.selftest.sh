@@ -359,7 +359,7 @@ mut open-vira-0       $D1 '_pilot_ps_node_open "$_id" "$_store"' '_pilot_ps_node
 mut open-sem-alias    $O1 'ps-worker-remote-[1-9]) ;;' '*) ;;'
 mut open-sem-marca    $O1 'if [ "$_PWR_STATUS" != in_progress ] || [ "$_PWR_MARK" != "$_PWR_ALIAS" ]; then' 'if false; then'
 mut open-template     $O1 '_pilot_node_remote_open ps-worker-remote ' '_pilot_node_remote_open wa-worker-remote '
-mut open-chave        $O1 'pilot.wa_node_alias || _po_rc=$?' 'pilot.ps_node_alias || _po_rc=$?'
+mut open-chave        $O1 'pilot.wa_node_alias "$(_pilot_node_idle_secs)" || _po_rc=$?' 'pilot.ps_node_alias "$(_pilot_node_idle_secs)" || _po_rc=$?'
 mut open-rc-engolido  $O1 'return "$_po_rc"' 'return 0'
 mut settle-sem-forma  $S1 'if [ "$_PWR_STATUS" != in_progress ] || [ "$_PWR_MARK" != "$_PWR_ALIAS" ]; then return 0; fi' ':'
 mut settle-chave      $S1 '0 pilot.wa_node_alias || true' '0 pilot.ps_node_alias || true'

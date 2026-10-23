@@ -13,16 +13,19 @@
 #   ainda pode entrar, então nada está garantido e o Pilot segura a bead e relê na próxima varredura · 2 uso. Em dúvida o código é 10-13, nunca 0; a única exceção é a releitura PROVAR o estado (o bd update disse
 #   que falhou e a releitura confere a bead inteira do nó = 0, anotado no log). O Pilot lê 10/11/12 como "fica no mini" só para a bead que ELE leu como não-do-nó; a que já é do nó ele segura (2) sem olhar o rc.
 # O QUE FAZ (apply): relê a bead → exige aberta, sem dono e sem rota → classifica (scripts/wa-node-classify.py, na MESMA leitura; o exit code só vale se o JSON concorda — falha, saída ilegível ou código e veredito que discordam = 11, nunca 0) → exige o slot do nó livre (nenhuma bead em andamento do alias
-#   e nenhuma sessão do template) → UMA escrita com comparação atômica (bd update --if-assignee '' --if-status open: quem chegou antes vence, rc 13 do bd) que atribui ao alias, põe
+#   e nenhuma sessão do template — no modo pilot, uma sessão viva OCIOSA e sem bead conta como vaga, ver N SLOTS) → UMA escrita com comparação atômica (bd update --if-assignee '' --if-status open: quem chegou antes vence, rc 13 do bd) que atribui ao alias, põe
 #   em andamento e carimba gc.routed_to → relê e confere → comenta. Falha na conferência desfaz. A escrita que o bd diz ter falhado (rc ≠ 0 e ≠ 13) cai na MESMA releitura: o rc de um update que não respondeu não diz o estado.
 #   `release` só mexe em bead que é do alias E da rota.
 # O QUE NÃO FAZ: não cria sessão (quem abre a sessão do alias é o pool, em WA_NODE_SPAWN=pool, ou o Pilot, em =pilot: ver abaixo). `gc session new` à mão em template remoto ROTEADO gera duas sessões e o
 #   crew-session-dedup derruba uma. Não mexe no city.toml, no config do host nem no Pilot. Não escreve dado da bead em lugar nenhum além do comentário curto (id, veredito, motivos).
 # N SLOTS (ga-2hd02v.3): WA_NODE_SPAWN=pool (PADRÃO, o desenho da 1.10: 1 slot, alias wa-worker-remote-1, gc.routed_to=wa-worker-remote, o pool cria a sessão — NUNCA provado para bead da loja do WA) ou =pilot
 #   (o Pilot abre `gc session new wa-worker-remote --alias <alias>` como faz com o dog-remote, receita PROVADA; a bead leva só o dono e a marca `pilot.wa_node_alias`, SEM gc.routed_to, senão o pool abriria
-#   uma 2ª sessão). Só `pilot` tem mais de 1 slot: WA_NODE_SLOTS (1..9, padrão 1) aliases wa-worker-remote-1..N; em `pool` o N vale 1 (o alias da sessão do pool não é nomeável). Em `pilot` o apply escolhe o 1º alias
-#   sem bead em andamento e sem sessão viva e CONSULTA o oráculo de capacidade (hetzner-capacity.py verdict): só `node` com vaga livre (descontadas as beads já atribuídas cuja sessão ainda não subiu) deixa passar.
-# Env: WA_NODE_SPAWN (pool|pilot, padrão pool; outro valor = pool), WA_NODE_SLOTS (1..9, padrão 1; vazio ou ilegível = 1), WA_NODE_ALIAS_PREFIX (wa-worker-remote-), WA_NODE_CAPACITY (hetzner-capacity.py), WA_NODE_CAPACITY_TIMEOUT (45 s).
+#   uma 2ª sessão). Só `pilot` tem mais de 1 slot: WA_NODE_SLOTS (1..9, padrão 1) aliases wa-worker-remote-1..N; em `pool` o N vale 1 (o alias da sessão do pool não é nomeável). Em `pilot` o apply escolhe a sessão OCIOSA (ver abaixo) ou, senão, o 1º alias
+#   sem bead em andamento e sem sessão viva, e CONSULTA o oráculo de capacidade (hetzner-capacity.py verdict): só `node` com vaga livre (descontadas as beads já atribuídas cuja sessão ainda não subiu) deixa passar.
+#   SESSÃO OCIOSA (ga-2hd02v.3.12): em `pilot`, uma sessão viva do template SEM bead em andamento no alias e quieta há >= WA_NODE_IDLE_SECS (padrão 300 s) é VAGA, não lugar tomado: o apply a PREFERE a abrir um alias
+#   novo (nenhuma tmux a mais no nó) e a bead vai para o alias dela. Três estados: ociosa PROVADA = vaga · bead em andamento ou quieta há pouco = ocupada · não deu para saber (last_active ausente, ilegível ou no futuro,
+#   estado que não é `active`, outro template, dois alias iguais) = OCUPADA, o inerte. Antes, toda sessão viva enchia um slot: 3 vivas (uma já sem bead) = 12 `sessao-viva` em toda varredura (27 em ~19 h).
+# Env: WA_NODE_SPAWN (pool|pilot, padrão pool; outro valor = pool), WA_NODE_SLOTS (1..9, padrão 1; vazio ou ilegível = 1), WA_NODE_ALIAS_PREFIX (wa-worker-remote-), WA_NODE_CAPACITY (hetzner-capacity.py), WA_NODE_CAPACITY_TIMEOUT (45 s), WA_NODE_IDLE_SECS (300 s: quanto tempo uma sessão sem bead fica quieta antes de valer como vaga; só modo pilot).
 # Env (identidade, para o wrapper de OUTRA loja — o ps-node-dispatch.sh da bead de PS): WA_NODE_SELF (nome que as mensagens e o comentário da bead usam, padrão wa-node-dispatch.sh), WA_NODE_STORY (bead que o comentário cita, padrão ga-2hd02v.1.10).
 # Env (teste): GC_CITY, WA_NODE_BD (bd), WA_NODE_GC (gc), WA_NODE_CLASSIFY, WA_NODE_PY, WA_NODE_ALIAS (alias único: ganha de SLOTS e do prefixo; padrão <prefixo>1), WA_NODE_ROUTE_TEMPLATE (wa-worker-remote), WA_NODE_LOG, WA_NODE_TIMEOUT (20 s), WA_NODE_SESSION_TIMEOUT (60 s, só para `gc session list`).
 set -u
@@ -48,6 +51,9 @@ case "$TMO" in ''|*[!0-9]*) TMO=20 ;; esac     # prazo ilegível volta ao padrã
 # `gc session list --json` levou 14–22 s na mini carregada (medido 19/10) — com o prazo de 20 s a leitura estourava e o despacho nunca passava; esta leitura tem prazo próprio
 STMO="${WA_NODE_SESSION_TIMEOUT:-60}"
 case "$STMO" in ''|*[!0-9]*) STMO=60 ;; esac
+# ga-2hd02v.3.12: quietude mínima de uma sessão sem bead para valer como vaga (só modo pilot). vazio → 300 s; ilegível (letra, sinal, ponto, espaço, mais de 9 dígitos) → 300 s também: o erro cai no prazo mais LONGO,
+# nunca no mais curto. 0 vale (qualquer sessão sem bead). Zero à esquerda é decimal (0300 = 300: o bash o leria como octal sem o 10#).
+IDLE="${WA_NODE_IDLE_SECS:-300}"; case "$IDLE" in ''|*[!0-9]*) IDLE=300 ;; *) if [ "${#IDLE}" -le 9 ]; then IDLE=$((10#$IDLE)); else IDLE=300; fi ;; esac
 
 # como o script se chama nas mensagens e qual bead o comentário cita (ga-2hd02v.3). Um wrapper de outra loja (PS) troca os dois sem copiar o script.
 # vazio → o nome e a bead de sempre; ilegível (espaço, aspas, barra, $, `, ;, quebra de linha, acima de 64 caracteres) → o mesmo: o valor vai para a mensagem e para um comentário DA BEAD, então nunca entra solto.
@@ -141,11 +147,30 @@ apply)
   live_json=$(printf '%s' "$sess" | jq -c --arg t "$ROUTE" --arg sp "$SPAWN" --argjson al "$al_json" 'if type=="object" and (.sessions|type)=="array" then [.sessions[] | select(((.template // .Template // "") == $t) or ((.alias // .Alias // "") as $x | $al | any(. == $x))) | select(.closed != true) | select((.state // .State // "") | test("closed|stopped|archived|drained") | not) | select(($sp == "pilot" and ((.state // .State // "") == "asleep") and ((.template // .Template // "") == $t)) | not) | (.alias // .Alias // "")] else "x" end' 2>/dev/null)
   live=$(printf '%s' "$live_json" | jq -r 'if type=="array" then length else "x" end' 2>/dev/null)
   case "$live" in ''|x|*[!0-9]*) jlog apply "$id" 11 "sessoes-ilegiveis"; die 11 "lista de sessões ilegível — fica no mini" ;; esac
-  if [ "$live" -ge "$SLOTS" ]; then jlog apply "$id" 12 "sessao-viva n=$live"; die 12 "já há $live sessão(ões) de $ROUTE/${ALIASES// /,} — slot do nó ocupado"; fi
   live_al=$(printf '%s' "$live_json" | jq -r '.[]' 2>/dev/null) || live_al=""   # lista vazia lida → nenhum alias vivo; o formato já foi provado acima
-  # o 1º alias sem bead que também não tem sessão viva. Sessão viva (ativa ou subindo) sem bead NÃO é reaproveitada: o alias dela ainda não está livre. No modo pilot a que dorme é reaproveitada (o Pilot a acorda, ver acima).
-  PICK=""
-  for A in $free_a; do printf '%s\n' "$live_al" | grep -qxF -- "$A" || { PICK="$A"; break; }; done
+  # ga-2hd02v.3.12: sessão viva OCIOSA é vaga, não lugar tomado (só modo pilot). Provada = do template do nó, `active`, alias candidato, last_active lido como texto ISO com Z e velho (>= IDLE s, nunca no futuro), SEM bead
+  # em andamento no alias (free_a) e a ÚNICA viva com aquele alias. vazio (nenhuma assim) → reuse_a vazio e toda sessão viva segue contando, como antes; falhou/ilegível (last_active ausente, nulo, número, sem Z, fração
+  # lida mas data inválida, no futuro; estado ≠ active; outro template; alias repetido) → essa sessão NÃO é vaga: segue ocupada, o inerte. Só o jq que não roda (idle_json não é lista) vira 11: não sei avaliar, fica no mini.
+  reuse_a=""; n_reuse=0
+  if [ "$SPAWN" = pilot ]; then
+    idle_json=$(printf '%s' "$sess" | jq -c --arg t "$ROUTE" --argjson al "$al_json" --argjson now "$(date +%s)" --argjson idle "$IDLE" 'if type=="object" and (.sessions|type)=="array" then [.sessions[] | select(type=="object") | select(((.template // .Template // "") == $t) and .closed != true and ((.state // .State // "") == "active")) | select((.alias // .Alias // "") as $x | $x != "" and ($al | any(. == $x))) | select((.last_active | type) == "string") | select(((.last_active | sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch null) as $ts | (($ts | type) == "number") and (($now - $ts) >= $idle))) | (.alias // .Alias)] else "x" end' 2>/dev/null) || idle_json="x"
+    case "$(printf '%s' "$idle_json" | jq -r 'if type=="array" then "ok" else "x" end' 2>/dev/null)" in ok) ;; *) jlog apply "$id" 11 "ociosidade-ilegivel"; die 11 "não consegui avaliar quais sessões estão ociosas — fica no mini" ;; esac
+    idle_al=$(printf '%s' "$idle_json" | jq -r '.[]' 2>/dev/null) || idle_al=""   # lista vazia lida → nenhuma ociosa provada; o formato já foi provado acima
+    for A in $free_a; do
+      [ "$(printf '%s\n' "$live_al" | grep -cxF -- "$A")" = 1 ] || continue   # exatamente UMA sessão viva com o alias; duas = não há uma só para reaproveitar
+      printf '%s\n' "$idle_al" | grep -qxF -- "$A" || continue                # e é a ociosa provada
+      reuse_a="$reuse_a $A"; n_reuse=$((n_reuse+1))
+    done
+  fi
+  # as ociosas provadas saem da conta: a sessão já existe, reaproveitá-la não ocupa slot novo (o `n=` do log segue sendo o das vivas, o que o wa-node-report.py lê como sessao-viva)
+  if [ $((live - n_reuse)) -ge "$SLOTS" ]; then jlog apply "$id" 12 "sessao-viva n=$live"; die 12 "já há $live sessão(ões) de $ROUTE/${ALIASES// /,} — slot do nó ocupado"; fi
+  # a sessão ociosa PROVADA primeiro (nenhuma tmux a mais no nó, responde na hora); senão o 1º alias sem bead que também não tem sessão viva. Sessão viva sem prova de ociosidade (ativa ou subindo) NÃO é reaproveitada:
+  # o alias dela ainda não está livre. No modo pilot a que dorme é reaproveitada (o Pilot a acorda, ver acima).
+  PICK=""; REUSED=0
+  for A in $reuse_a; do PICK="$A"; REUSED=1; break; done
+  if [ -z "$PICK" ]; then
+    for A in $free_a; do printf '%s\n' "$live_al" | grep -qxF -- "$A" || { PICK="$A"; break; }; done
+  fi
   [ -n "$PICK" ] || { jlog apply "$id" 12 "slot-sem-alias-livre"; die 12 "todo alias sem bead em andamento ($free_a ) ainda tem sessão viva — sem slot livre agora"; }
   if [ "$SPAWN" = pilot ]; then
     # teto do nó (ga-2hd02v.3): o oráculo diz se cabe mais uma sessão (degrau × cap do provider × CPU/RAM medidos). Beads já atribuídas cuja sessão ainda não subiu o oráculo não vê: descontam da vaga dele.
@@ -163,7 +188,8 @@ apply)
     case "$cfree" in ''|*[!0-9]*|0) jlog apply "$id" 11 "oraculo-sem-free"; die 11 "o oráculo disse node sem um número de vagas livres (>= 1) — fica no mini" ;; esac
     if [ $((cfree - pend)) -lt 1 ]; then jlog apply "$id" 12 "oraculo-sem-vaga free=$cfree pendentes=$pend"; die 12 "o oráculo vê $cfree vaga(s) livre(s) e $pend bead(s) já atribuída(s) esperam a sessão subir — sem vaga agora"; fi
   fi
-  if [ "$dry" = 1 ]; then jlog apply "$id" 0 "dry-run: iria para $PICK ($b)"; say "dry-run: $id iria para $PICK (base=$b); nada foi escrito"; printf '%s\n' "$out"; exit 0; fi
+  rn=""; [ "$REUSED" = 1 ] && rn=" [sessão ociosa reaproveitada]"   # só o log e a mensagem: a sessão do alias já está viva, ninguém abre outra
+  if [ "$dry" = 1 ]; then jlog apply "$id" 0 "dry-run: iria para $PICK ($b)$rn"; say "dry-run: $id iria para $PICK (base=$b)$rn; nada foi escrito"; printf '%s\n' "$out"; exit 0; fi
   # o que a escrita carimba: pool → a rota (o pool cria a sessão); pilot → só a marca (o Pilot abre a sessão do alias; a rota abriria uma 2ª)
   if [ "$SPAWN" = pilot ]; then wmeta="pilot.wa_node_alias=$PICK"; umeta="pilot.wa_node_alias"; else wmeta="gc.routed_to=$ROUTE"; umeta="gc.routed_to"; fi
   # a bead é "nossa" se o dono é o alias e o carimbo do modo está lá; pool: dono OU rota; pilot: dono OU marca. (a conferência abaixo usa o conjunto, o desfazer usa o "nada nosso")
@@ -199,9 +225,10 @@ apply)
   fi
   if [ "$SPAWN" = pilot ]; then who="atribuída a $PICK (marca pilot.wa_node_alias, sem rota) — veredito node (base $b: $(printf '%s' "$out" | jq -r '(.reasons // []) | join(", ")')). O Pilot abre a sessão do alias; sem gc session new à mão."
   else who="atribuída a $PICK, rota $ROUTE — veredito node (base $b: $(printf '%s' "$out" | jq -r '(.reasons // []) | join(", ")')). O pool cria a sessão; sem gc session new à mão (a duplicata é derrubada pelo dedup)."; fi
+  [ "$REUSED" = 1 ] && who="$who A sessão do alias já está viva e ociosa (reaproveitada): o Pilot só a avisa."
   T "$BD" -C "$store" comment "$id" "nó ($STORY): $who Ao fim da entrega: $SELF release $id." >/dev/null 2>&1 || say "aviso: comentário em $id não gravado"
   wn=""; [ "$w" = 0 ] || wn=" [bd update rc=$w, a releitura confere]"   # o rc do bd mentiu (resposta perdida): fica no log
-  jlog apply "$id" 0 "despachada para $PICK ($b)$wn"; say "$id → $PICK ($([ "$SPAWN" = pilot ] && echo sessão-do-pilot || echo "$ROUTE")), base=$b$wn"; printf '%s\n' "$out"; exit 0 ;;
+  jlog apply "$id" 0 "despachada para $PICK ($b)$wn$rn"; say "$id → $PICK ($([ "$SPAWN" = pilot ] && echo sessão-do-pilot || echo "$ROUTE")), base=$b$wn$rn"; printf '%s\n' "$out"; exit 0 ;;
 
 release)
   as=$(printf '%s' "$B" | jq -r '.assignee // ""'); rt=$(printf '%s' "$B" | jq -r '.metadata["gc.routed_to"] // ""'); mk=$(printf '%s' "$B" | jq -r '.metadata["pilot.wa_node_alias"] // ""')
