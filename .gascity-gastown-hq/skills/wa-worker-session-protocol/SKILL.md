@@ -1,6 +1,6 @@
 ---
 name: wa-worker-session-protocol
-description: Use this when you (a crew worker in whatsapp_automation — batista, mila, oracle, thies, digo, peter, or a wa-worker pool session) need to deliver an HTML mockup to Athos for review, OR when you're wrapping up work and ending a session (mid-session handoff, or work fully done and ready for the quality gate). Covers the mockup publishing procedure (admin Mockups page, permanent URL) and the commit-identity + gate-done completion flow.
+description: Use this when you (a crew worker in whatsapp_automation — batista, mila, oracle, thies, digo, peter, or a wa-worker pool session) need to deliver an HTML mockup to Athos for review, OR when you're wrapping up work and ending a session (mid-session handoff, or work fully done and ready for the quality gate). Covers the mockup publishing procedure (admin Mockups page, permanent URL, one card per theme with the options as tabs) and the commit-identity + gate-done completion flow.
 ---
 
 # wa-worker session protocol — mockups + session end
@@ -14,7 +14,11 @@ description: Use this when you (a crew worker in whatsapp_automation — batista
 
 Mockup NÃO vai mais pro S3 (wa-cyvf1f): `publicar_mockup.py` grava na página Mockups do admin, atrás do Cloudflare Access, e imprime a URL PERMANENTE `https://admin.urblink.com.br/mockups/<slug>` — não expira, então não há chave nem link temporário pra gerar. (Links antigos de `mockups/` no bucket S3 seguem valendo até expirar; não publique mais nada novo lá.)
 
-NUNCA entregue mockup como PNG, localhost ou tunnel (cloudflared já deu 404). Athos decide VENDO no celular.
+NUNCA entregue mockup como PNG, localhost ou tunnel (cloudflared já deu 404). Athos decide VENDO no celular — o entregável É a URL permanente do admin (a do GRUPO, abaixo).
+
+🗂️ **1 tema = 1 grupo = 1 card (Athos, 04/10, wa-b0zjk4).** Cada card da página Mockups é um TEMA (ex.: "Associar demanda"); ao abrir o card (`/mockups/g/<grupo>`) o Athos vê uma barra de ABAS — A, B, C, v2, 2v2… — e o mockup troca ali mesmo. O `--grupo` escolhe o CARD, a `--direcao` escolhe a ABA. Daí duas regras, e as duas já foram violadas na prática:
+- Opções do mesmo tema = o MESMO `--grupo`, uma `--direcao` por aba (A, B, C, D).
+- Versão nova de um tema que já existe (v2, 2v2…) = o MESMO `--grupo` + uma `--direcao` nova → entra como NOVA ABA do card. **Regra de ouro: mesmo --grupo, nunca grupo novo** — grupo novo para o mesmo tema racha o card em dois e o Athos perde o fio (foi o que aconteceu com `pregao-associar-demanda` e `pregao-associar-demanda-v2`, medido em 04/10).
 
 **Mockup NOVO (1ª versão): gere 3-4 direções visuais distintas antes de
 construir a definitiva** — paleta/tipografia/densidade diferentes, cada uma
@@ -22,19 +26,29 @@ com 1 frase de tradeoff, nomeando no prompt de geração os padrões de "visual
 padrão de IA" a evitar (gradiente genérico, cards idênticos em grade, emoji
 como ícone — guia mais fundo: skill `frontend-design`). Publique as 3-4 — uma
 chamada por arquivo, mesmo `--grupo`, uma letra de `--direcao` cada — e
-apresente via **AskUserQuestion** (1ª opção = sua recomendação, nunca links
-soltos pedindo escolha em texto livre). Protocolo completo, com o passo a
-passo numerado: `whatsapp_automation/CLAUDE.md` → "Mockups de UI/UX —
-protocolo obrigatório" (ga-g7x0si). Ajuste incremental num mockup já aprovado
-NÃO repete as 3-4 direções — publique só a versão atualizada, com o mesmo
-`--grupo` e `--direcao v2` (depois `v3`…).
+apresente via **AskUserQuestion** (1ª opção = sua recomendação, Regra Nº 1;
+nunca links soltos pedindo escolha em texto livre): o contexto da pergunta
+leva o link do GRUPO, uma vez (a linha `grupo:` do script) — é UM card com as
+opções em abas — e depois vai uma opção por ABA (A, B, C…), com o tradeoff na
+descrição e o link com `#<aba>` (`…/g/<grupo>#a`) pra abrir direto nela.
+Protocolo completo, com o passo a passo numerado:
+`whatsapp_automation/docs/agent-guide/mockups-e-mbe.md` → "Mockups de UI/UX —
+protocolo obrigatório" (ga-g7x0si; ficava no `CLAUDE.md` do rig até o wa-jo2qbg,
+15/10). Ajuste incremental / versão nova num mockup que JÁ existe NÃO repete as
+3-4 direções — publique só a versão atualizada, com o mesmo `--grupo` e
+`--direcao v2` (depois `v3`, `2v2`…); ela entra como nova aba no mesmo card.
+Antes de publicar, confira o nome EXATO do grupo — um `--grupo` com uma letra
+diferente cria um card novo em silêncio:
+`curl -s http://127.0.0.1:8097/api/mockups | jq -r '.grupos[].grupo'`.
 
 ```bash
 python3 /Users/athos/gt/whatsapp_automation/scripts/publicar_mockup.py dirA.html \
   --titulo "<nome do mockup>" --bead <id-do-bead> \
   --grupo <slug-do-mockup> --direcao A --tradeoff "Ganha: … Perde: …"
-# → a linha "✓ publicado: <URL>" vira uma opção por direção no AskUserQuestion, não um envio solto
+# → imprime DUAS URLs: "✓ publicado: …/mockups/<slug>" (a OPÇÃO, o HTML cru) e "grupo: …/mockups/g/<grupo>#<aba>" (o CARD, já na aba da opção; sem #<aba> na URL, abre na 1ª aba) — é a do GRUPO que vai pro Athos
 ```
+
+Cite as URLs no bead de origem (comentário): as da OPÇÃO (`✓ publicado:`) E a do GRUPO. O Guard #13 do pre-push (`scripts/check_mockup_protocol_guard.py` do rig) só reconhece URL de OPÇÃO (`…/mockups/<slug>-<8 hex>`); a URL do grupo (`…/mockups/g/<grupo>`) NÃO o satisfaz — citar só o link do grupo não destrava o push.
 
 ⚠️ Use SEMPRE esse caminho ABSOLUTO, de qualquer cwd: rodar `scripts/publicar_mockup.py` de dentro de um worktree sai 3 sem publicar nada (`shared/data` é gitignored no whatsapp_automation e o worktree de worker não o tem). Códigos de saída: 0 publicado; 1 recusado (dado pessoal ou entrada inválida); 3 erro de infraestrutura — NADA foi publicado; 4 FICOU gravado mas a conferência falhou — NÃO republique (duplica), confira `https://admin.urblink.com.br/mockups`; 2 é uso errado da linha de comando. O HTML roda isolado no admin: `localStorage`/`sessionStorage`/cookie falham lá — proteja com try/catch (o script avisa).
 

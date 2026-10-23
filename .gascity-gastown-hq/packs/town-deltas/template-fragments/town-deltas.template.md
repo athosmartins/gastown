@@ -464,16 +464,29 @@ migração COMPLETA de todos os rigs pro Gas City.)
 {{ if or (not .TD_ROLE) (eq .TD_ROLE "ps-worker") (eq .TD_ROLE "wa-worker") -}}{{/* td:mockup-s3 */ -}}
 **Mockups / web-UI para aprovação do Athos — OBRIGATÓRIO: publicar na página
 Mockups do admin + 3-4 direções em múltipla escolha antes de construir a versão
-final (ga-g7x0si, wa-cyvf1f).**
+final (ga-g7x0si, wa-cyvf1f, wa-b0zjk4).**
 Mockup NÃO vai mais pro S3: `publicar_mockup.py` (abaixo) grava na página
 Mockups do admin, atrás do Cloudflare Access, e imprime a URL PERMANENTE
 `https://admin.urblink.com.br/mockups/<slug>` — não expira, então não há chave
 nem link temporário pra gerar. (Links antigos de `mockups/` no bucket S3 seguem
 valendo até expirar; não publique mais nada novo lá.)
 
+🗂️ **1 tema = 1 grupo = 1 card (Athos, 04/10, wa-b0zjk4).** Cada card da página
+Mockups é um TEMA (ex.: "Associar demanda"); ao abrir o card (`/mockups/g/<grupo>`)
+o Athos vê uma barra de ABAS — A, B, C, v2, 2v2… — e o mockup troca ali mesmo.
+O `--grupo` escolhe o CARD, a `--direcao` escolhe a ABA. Daí duas regras, e as
+duas já foram violadas na prática:
+- Opções do mesmo tema = o MESMO `--grupo`, uma `--direcao` por aba (A, B, C, D).
+- Versão nova de um tema que já existe (v2, 2v2…) = o MESMO `--grupo` + uma
+  `--direcao` nova → entra como NOVA ABA do card. **Regra de ouro: mesmo
+  --grupo, nunca grupo novo** — grupo novo para o mesmo tema racha o card em
+  dois e o Athos perde o fio (foi o que aconteceu com `pregao-associar-demanda`
+  e `pregao-associar-demanda-v2`, medido em 04/10).
+
 NUNCA entregue mockup como PNG, localhost URL ou servidor local/tunnel. O
-Athos DECIDE VENDO no celular — e decide em MÚLTIPLA ESCOLHA (Regra Nº 1),
-nunca escolhendo em prosa livre entre links soltos numa mensagem.
+Athos DECIDE VENDO no celular — o entregável É a URL permanente do admin (a do
+GRUPO) — e decide em MÚLTIPLA ESCOLHA (Regra Nº 1), nunca escolhendo em prosa
+livre entre links soltos numa mensagem.
 
 **Mockup NOVO (1ª versão de uma tela/fluxo) → gere 3-4 DIREÇÕES visuais
 distintas antes da versão final, nunca construa direto uma só:**
@@ -486,36 +499,52 @@ distintas antes da versão final, nunca construa direto uma só:**
    como ícone, sombra difusa em tudo, tipografia default do framework sem
    hierarquia. (Guia mais fundo, com o porquê de cada um: skill
    `frontend-design`.)
-3. Publique as 3-4 direções — UMA chamada por arquivo, mesmo `--grupo`, uma
-   letra de `--direcao` cada, com o tradeoff da frase do passo 1:
+3. Publique as 3-4 direções — UMA chamada por arquivo, MESMO `--grupo` (o tema =
+   o card), uma letra de `--direcao` cada (a aba), com o tradeoff da frase do
+   passo 1 em `--tradeoff`:
    ```bash
    python3 /Users/athos/gt/whatsapp_automation/scripts/publicar_mockup.py dirA.html \
      --titulo "<nome do mockup>" --bead <id-do-bead> \
      --grupo <slug-do-mockup> --direcao A --tradeoff "Ganha: … Perde: …"
    ```
+   O script imprime DUAS URLs: `✓ publicado: …/mockups/<slug>` (a OPÇÃO, o HTML
+   cru) e `grupo: …/mockups/g/<grupo>#<aba>` (o CARD do tema, já aberto na aba
+   dessa opção; se a URL sair sem `#<aba>`, abre na 1ª aba). A do GRUPO é a que
+   vai pro Athos (passo 5).
    ⚠️ Use SEMPRE esse caminho ABSOLUTO, de qualquer cwd — inclusive no
    ps-worker (property_scrapers), que não tem o script no próprio repo. Rodar
    `scripts/publicar_mockup.py` de dentro de um worktree sai 3 sem publicar
    nada: `shared/data` é gitignored no whatsapp_automation, e o worktree de
-   worker não o tem. A saída `✓ publicado: <URL>` é a URL que vai na opção do
-   passo 4. O HTML roda isolado no admin: `localStorage`/`sessionStorage`/
-   cookie falham lá — proteja com try/catch (o script avisa).
+   worker não o tem. O HTML roda isolado no admin: `localStorage`/
+   `sessionStorage`/cookie falham lá — proteja com try/catch (o script avisa).
    Códigos de saída: 0 publicado; 1 recusado (dado pessoal ou entrada
    inválida); 3 erro de infraestrutura — NADA foi publicado; 4 FICOU gravado
    mas a conferência falhou — NÃO republique (duplica), confira a página
    `https://admin.urblink.com.br/mockups`; 2 é uso errado da linha de comando.
-4. Pergunte via **AskUserQuestion** qual direção seguir: uma opção por
-   direção (URL + o tradeoff da frase acima na descrição), 1ª opção = SUA
-   recomendação (Regra Nº 1). Nunca mande os 3-4 links soltos pedindo "qual
-   você prefere" em texto livre — a pergunta É a escolha entre as opções.
-5. Só depois de escolhida a direção, construa/refine a versão final nela.
+4. Cite as URLs no bead de origem (comentário): as da OPÇÃO (`✓ publicado:`) E a
+   do GRUPO. O Guard #13 do pre-push (`scripts/check_mockup_protocol_guard.py`
+   do rig) só reconhece URL de OPÇÃO (`…/mockups/<slug>-<8 hex>`); a URL do
+   grupo (`…/mockups/g/<grupo>`) NÃO o satisfaz — citar só o link do grupo não
+   destrava o push.
+5. Pergunte via **AskUserQuestion** qual direção seguir: o contexto da
+   pergunta leva o link do GRUPO, uma vez (a linha `grupo:` do script) — é UM
+   card com as opções em abas. Depois, uma opção por ABA (A, B, C…): o tradeoff
+   da frase do passo 1 na descrição e, pra levar o Athos direto na aba, o link
+   com `#<aba>` (`…/g/<grupo>#a`). 1ª opção = SUA recomendação (Regra Nº 1).
+   Nunca mande os 3-4 links soltos pedindo "qual você prefere" em texto livre —
+   a pergunta É a escolha entre as opções.
+6. Só depois de escolhida a direção, construa/refine a versão final nela.
 
-**Ajuste incremental num mockup JÁ aprovado** (mudar texto, corrigir bug
-visual, adicionar uma seção): não repita as 3-4 direções — publique só a
-versão atualizada pelo mesmo comando, com o mesmo `--grupo` e `--direcao v2`
-(depois `v3`…). Se o ajuste for decisão de produto (não visual), pergunta
-múltipla-escolha normal serve; não precisa reconstruir alternativas visuais
-pra isso.
+**Ajuste incremental / versão nova num mockup que JÁ existe** (mudar texto,
+corrigir bug visual, adicionar uma seção; "v2", "2v2"): não repita as 3-4
+direções — publique só a versão atualizada pelo mesmo comando, com o MESMO
+`--grupo` do tema e `--direcao v2` (depois `v3`, `2v2`…). Ela entra como NOVA
+ABA no MESMO card; compartilhe o link do grupo (+ `#v2`). Antes de publicar,
+confira o nome EXATO do grupo existente — um `--grupo` com uma letra diferente
+cria um card novo em silêncio:
+`curl -s http://127.0.0.1:8097/api/mockups | jq -r '.grupos[].grupo'`.
+Se o ajuste for decisão de produto (não visual), pergunta múltipla-escolha
+normal serve; não precisa reconstruir alternativas visuais pra isso.
 
 🚨 NUNCA publique CPF, telefone, endereço, situação sucessória/óbito ou qualquer
 dado que identifique uma pessoa específica num mockup. O script varre o HTML e
