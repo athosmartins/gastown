@@ -674,13 +674,13 @@ g_gui() {
   lcreset; echo slow > "$T/auth.mode"; cfgm '{"gui_proof_s":2,"start_timeout":3}'; fresh
   pv start w-remote-m-8 < <(req cat); [ $RC = 0 ] && [ "$(count x "${SOCK}m")" = 1 ] && [ -e "$T/lc/loaded/${L}w-remote-m-8" ]; ok $? "gui: 'auth status' de 7 s com start_timeout 3 → a 2ª chamada tem o piso do veredito (OPEN_MIN + gui_wait_s) e o start abre (rc=$RC $(head -c 140 "$T/err"))"
   pv stop w-remote-m-8 </dev/null; echo in > "$T/auth.mode"; cfgm '{"gui_proof_s":2}'
-  # o stop chega na parte lenta do start: a 2ª chamada desiste ANTES de tocar no launchd — e é o rc 14 ('abandonado'), não o 15 da recusa do domínio gráfico (um evento 'refused' de gui_agent para um start que o mini abandonou seria mentira)
+  # o stop chega na parte lenta do start: a 2ª chamada desiste ANTES de carregar o agente (a 1ª só LEU o launchd, na varredura) — e é o rc 14 ('abandonado'), não o 15 da recusa do domínio gráfico (um evento 'refused' de gui_agent para um start que o mini abandonou seria mentira)
   lcreset; : > "$T/state/m/events.jsonl"; fresh; rm -f "$T/slow.mark"
   printf '#!/bin/sh\n: > "%s"\nsleep 4\nexec "%s" "$@"\n' "$T/slow.mark" "$(command -v sha256sum)" > "$T/extra/sha256sum"; chmod +x "$T/extra/sha256sum"  # a sessão w-remote-* é REAL: o portão roda sha256sum no host, na 1ª chamada
   env HOME="$T/home" GC_SSH_CONFIG="$T/cfg.json" GC_SSH_BIN="$T/bin/ssh" GC_EXEC_STATE_DIR="$T/state" "$P" start w-remote-m-9 < <(req cat) >"$T/out.bg" 2>"$T/err.bg" & i=$!
   waitfor "$T/slow.mark"; pv stop w-remote-m-9 </dev/null; rc=$RC; wait $i; k=$?; rm -f "$T/extra/sha256sum"
   [ -e "$T/slow.mark" ] && [ $rc = 0 ] && [ $k = 1 ] && has "$T/err.bg" 'abandonado' && ! grep -q ' bootstrap ' "$T/lc.log" && [ "$(nload)" = 0 ] && [ "$(nrun)" = 0 ] && [ "$(count x "${SOCK}m")" = 0 ] \
-    && ! jq -e 'select(.event=="refused" and .session=="w-remote-m-9")' "$T/state/m/events.jsonl" >/dev/null 2>&1; ok $? "gui: stop no meio da parte lenta do start → o start desiste ('abandonado') sem tocar no launchd e sem evento 'refused' de gui_agent (stop rc=$rc, start rc=$k: $(head -c 120 "$T/err.bg"))"
+    && ! jq -e 'select(.event=="refused" and .session=="w-remote-m-9")' "$T/state/m/events.jsonl" >/dev/null 2>&1; ok $? "gui: stop no meio da parte lenta do start → o start desiste ('abandonado') sem carregar agente e sem evento 'refused' de gui_agent (stop rc=$rc, start rc=$k: $(head -c 120 "$T/err.bg"))"
   rm -f "$T/state/m/running/w-remote-m-9"
   # --- config: gui_agent é decisão explícita; no notebook é obrigatória; o agente precisa do claude que confere o login ---
   for v in '"true"' 1 null; do cfgm '{"gui_agent":'"$v"'}'; fresh; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "'gui_agent'" && nossh; ok $? "gui: gui_agent=$v (não é true/false) recusa a config, sem ssh (rc=$RC)"; done
