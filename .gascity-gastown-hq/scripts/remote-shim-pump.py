@@ -49,6 +49,7 @@ WRAPPER = os.path.join(HERE, "remote-shim-wrapper.py")
 SPOOL_ID = re.compile(r"[0-9]{13}-[0-9]{1,10}-[0-9a-f]{8}")  # o mesmo formato do cliente (remote-shim.py)
 PATH_RE = re.compile(r"/[A-Za-z0-9_./+-]+")
 HOST_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
+REAP_OUT = re.compile(r"reap ([0-9]+) ([0-9]+) ([0-9]+)")  # o que o modo `reap` do agente imprime: apagados, poupados (dentro da carência), que não saíram
 MAX_CMD, MAX_STDIN, MAX_OUT, MAX_BATCH = 200_000, 1 << 20, 8 << 20, 16
 WRAPPER_LIMIT_S = 420  # acima do timeout_s padrão (300) do wrapper: se estourar aqui o wrapper travou, e o grupo dele é encerrado
 
@@ -58,13 +59,18 @@ import base64, json, os, re, sys, time
 sp, mode = sys.argv[1], sys.argv[2]
 ID = re.compile(r"[0-9]{13}-[0-9]{1,10}-[0-9a-f]{8}")
 MAXREQ, KEEP_S, ALIVE_EVERY_S = 1500000, 900, 10
+REAP_GRACE_S = 90  # carência da faxina do `stop` (modo reap): só sai o que tem MAIS que isto; um puxador novo pode já ter escrito uma resposta que o cliente ainda vai ler
 POLL_S = max(1, min(30, int(sys.argv[4]))) if len(sys.argv) > 4 else 15
 os.umask(0o077)
-st = os.lstat(sp)
+try: st = os.lstat(sp)
+except FileNotFoundError:  # sem a pasta: reap diz "sem-spool" e sai 0 (a faxina não cria spool no MBP); get/put: o erro sobe como sempre; falhou/ilegível (EACCES…): sobe também
+    if mode != "reap": raise
+    print("reap sem-spool"); sys.exit(0)
 if os.path.islink(sp) or not os.path.isdir(sp) or st.st_uid != os.getuid() or st.st_mode & 0o077:
     sys.stderr.write("spool %s nao e uma pasta minha com modo 0700\n" % sp); sys.exit(78)
-for d in ("req", "resp", "claimed"):
-    os.makedirs(sp + "/" + d, 0o700, exist_ok=True)
+if mode != "reap":  # a faxina de parada não cria nada no MBP
+    for d in ("req", "resp", "claimed"):
+        os.makedirs(sp + "/" + d, 0o700, exist_ok=True)
 
 def alive():
     p = sp + "/pump.alive"
@@ -128,6 +134,21 @@ elif mode == "put":
         write_resp(rid, d["rc"], d["stdout_b64"], d["stderr_b64"])
         os.unlink(sp + "/claimed/" + rid + ".json"); n += 1
     print("ok", n)
+elif mode == "reap":
+    cut, gone, kept, bad = time.time() - REAP_GRACE_S, 0, 0, 0
+    for d in ("req", "resp", "claimed"):
+        # vazio ou sem a pasta → nada ali; listdir que FALHA (EACCES…) → o erro sobe: sai ≠ 0 e o mini diz que não deu para ver, nunca "nada a limpar"
+        try: names = os.listdir(sp + "/" + d)
+        except FileNotFoundError: continue
+        for n in names:
+            f = sp + "/" + d + "/" + n
+            # sumiu entre o listdir e agora (o cliente leu a resposta, o puxador pegou o pedido) → já saiu, não conta; mtime ilegível ou unlink que falha → conta em `bad`, nunca como apagado
+            try:
+                if os.lstat(f).st_mtime >= cut: kept += 1
+                else: os.unlink(f); gone += 1
+            except FileNotFoundError: pass
+            except OSError: bad += 1
+    print("reap", gone, kept, bad)
 else:
     sys.stderr.write("modo desconhecido\n"); sys.exit(64)
 '''
@@ -387,6 +408,56 @@ def held(cfg: Cfg) -> bool:
         f.close()
 
 
+def stop_pump(cfg: Cfg) -> int:
+    """Encerra o puxador (os pedidos em andamento terminam): 0 = encerrado ou não havia; 1 = não consegui."""
+    if not held(cfg):
+        print("remote-shim-pump: não há puxador rodando")
+        return 0
+    pid = pid_of(cfg)
+    if not pid:
+        print("remote-shim-pump: o lock está preso (há um puxador), mas não consegui ler o pid dele; não encerro às cegas", file=sys.stderr)
+        return 1
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(100):
+        if not held(cfg):
+            print("remote-shim-pump: encerrado")
+            return 0
+        time.sleep(0.2)
+    print("remote-shim-pump: SIGTERM enviado, mas ainda termina pedidos em andamento", file=sys.stderr)
+    return 1
+
+
+def reap_spool(cfg: Cfg) -> int:
+    """A última faxina do spool no MBP, depois do `stop` (ga-w7qwl1.1.7): a resposta que ninguém leu não fica lá até o próximo `ensure`.
+    Quatro desfechos: limpei · não havia (saem 0) · NÃO DEU PARA VER · NÃO DEU PARA LIMPAR (saem 1, e a linha diz por quê): faxina que não rodou, ou rodou pela metade, nunca vira "ok" calado."""
+    try:
+        rc, out, err = Pump(cfg).ssh_run("reap", timeout=25)
+    except OSError as e:  # nem consegui lançar o ssh (binário ausente…): o mesmo desfecho de um ssh que falhou
+        rc, out, err = 255, b"", f"não consegui lançar o ssh: {e.strerror}".encode()
+    text = out.decode(errors="replace").strip()
+    # vazio ou fora da forma → NÃO DEU PARA VER, nunca "não havia"; falhou (ssh fora, 78 do spool, traceback do agente) → o mesmo, com o rc e a ÚLTIMA linha do erro (a do traceback é a que nomeia a exceção)
+    m = REAP_OUT.fullmatch(text) if rc == 0 else None
+    code = 1
+    if rc == 0 and text == "reap sem-spool":
+        msg, code = "não havia (o MBP não tem a pasta do spool)", 0
+    elif m is None:
+        lines = err.decode(errors="replace").strip().splitlines()
+        why = lines[-1] if lines else (f"resposta fora da forma: {text[:60]!r}" if rc == 0 else "sem mensagem")
+        msg = f"NÃO DEU PARA VER (ssh/agente rc={rc}: {why[:160]})"
+    else:
+        gone, kept, bad = (int(x) for x in m.groups())
+        spared = f"; poupei {kept} dentro da carência" if kept else ""
+        if bad:
+            msg = f"NÃO DEU PARA LIMPAR TUDO: limpei {gone}, mas {bad} arquivo(s) velho(s) não saíram (apagar falhou); a sobra fica para o próximo sweep ou stop{spared}"
+        elif gone:
+            msg, code = f"limpei {gone} arquivo(s) velho(s){spared}", 0
+        else:
+            msg, code = f"não havia nada velho{spared}", 0
+    cfg.log(f"faxina de parada: {msg}")
+    print(f"remote-shim-pump: faxina do spool: {msg}", file=sys.stderr if code else sys.stdout)
+    return code
+
+
 def main(argv: list) -> int:
     ap = argparse.ArgumentParser(prog="remote-shim-pump.py", description=__doc__.split("## Contents")[0].strip())
     ap.add_argument("cmd", choices=["run", "ensure", "status", "stop"])
@@ -405,21 +476,10 @@ def main(argv: list) -> int:
             print(f"log do puxador ilegível ({e.strerror})")
         return 0
     if a.cmd == "stop":
-        if not held(cfg):
-            print("remote-shim-pump: não há puxador rodando")
-            return 0
-        pid = pid_of(cfg)
-        if not pid:
-            print("remote-shim-pump: o lock está preso (há um puxador), mas não consegui ler o pid dele; não encerro às cegas", file=sys.stderr)
-            return 1
-        os.kill(pid, signal.SIGTERM)
-        for _ in range(100):
-            if not held(cfg):
-                print("remote-shim-pump: encerrado")
-                return 0
-            time.sleep(0.2)
-        print("remote-shim-pump: SIGTERM enviado, mas ainda termina pedidos em andamento", file=sys.stderr)
-        return 1
+        rc = stop_pump(cfg)
+        if rc:
+            return rc  # não parou: com o puxador vivo há pedido em andamento em claimed/, e o sweep dele cuida do resto
+        return reap_spool(cfg)
     # ensure: lança desacoplado se ninguém segura o lock; falhar aqui nunca pode derrubar quem chamou (o provedor)
     if held(cfg):
         return 0

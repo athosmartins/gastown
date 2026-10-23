@@ -302,6 +302,69 @@ r = get("import builtins\n_o = builtins.open\ndef _f(p, *a, **k):\n    if '/clai
 d = json.load(open(sp + "/resp/" + rid + ".json"))
 assert r.returncode == 0 and r.stdout == b"" and d["rc"] == 78 and not os.listdir(sp + "/claimed") and not os.path.exists(sp + "/req/" + rid + ".json"), (r, d)
 PYEOF
+# --- a última faxina do spool no stop (ga-w7qwl1.1.7): resposta que ninguém leu não fica no MBP até o próximo ensure. Velhos = 300 s (acima da carência de 90 s e abaixo do KEEP_S de 900: o sweep do
+# puxador vivo NÃO os leva, então quem apaga é a faxina do stop); poupados = 60 s e 0 s (dentro da carência: um puxador novo pode já ter escrito uma resposta que o cliente ainda vai ler)
+pump stop --host mbp >/dev/null 2>&1; rm -f "$STATE/mbp/shim-pump."*; mkdir -p "$STATE/mbp/running"; touch "$STATE/mbp/running/remote-test-remote-mbp-1"
+age() { python3 -I -c 'import os,sys,time; t=time.time()-float(sys.argv[2]); os.utime(sys.argv[1],(t,t))' "$1" "$2"; }   # age ARQUIVO SEGUNDOS: o mtime volta SEGUNDOS no tempo
+oldid=1700000000500-1-aaaaaaaa; midid=1700000000600-1-bbbbbbbb; newid=1700000000700-1-cccccccc
+plant() {  # plant [req]: spool novo com velhos em resp/ e claimed/ (com "req": também em req/ e um .tmp velho em resp/) e dois poupados em resp/; req/ só sem puxador vivo, que pegaria o pedido
+  rm -rf "$SPOOL"; mkdir -p "$SPOOL/req" "$SPOOL/resp" "$SPOOL/claimed"; chmod 700 "$SPOOL"; touch "$SPOOL/pump.alive"
+  : > "$SPOOL/resp/$oldid.json"; age "$SPOOL/resp/$oldid.json" 300; : > "$SPOOL/claimed/$oldid.json"; age "$SPOOL/claimed/$oldid.json" 300
+  : > "$SPOOL/resp/$midid.json"; age "$SPOOL/resp/$midid.json" 60; : > "$SPOOL/resp/$newid.json"
+  if [ "${1:-}" = req ]; then : > "$SPOOL/req/$oldid.json"; age "$SPOOL/req/$oldid.json" 300; : > "$SPOOL/resp/.$oldid.tmp"; age "$SPOOL/resp/.$oldid.tmp" 300; fi
+}
+stopr() { pump stop --host mbp > "$T/st.out" 2> "$T/st.err"; SRC=$?; }   # → SRC, $T/st.out, $T/st.err
+plant; up; stopr
+[ "$SRC" = 0 ] && grep -q "encerrado" "$T/st.out" && grep -q "faxina do spool: limpei" "$T/st.out" && [ ! -e "$SPOOL/resp/$oldid.json" ] && [ ! -e "$SPOOL/claimed/$oldid.json" ]; ok $? "stop com o puxador vivo: depois de encerrar, a faxina apaga a resposta e o claimed/ velhos (300 s, acima da carência) e diz 'limpei'"
+[ -e "$SPOOL/resp/$midid.json" ] && [ -e "$SPOOL/resp/$newid.json" ] && [ -e "$SPOOL/pump.alive" ] && grep -q "limpei 2 arquivo(s) velho(s); poupei 2 dentro da carência" "$T/st.out" && grep -q "faxina de parada: limpei 2 " "$STATE/mbp/shim-pump.log"; ok $? "a faxina do stop poupa o que está DENTRO da carência (o de 60 s e o de 0 s) e o pump.alive; a conta (limpei 2, poupei 2) vai ao stdout e ao log do puxador"
+plant req; stopr
+[ "$SRC" = 0 ] && grep -q "não há puxador rodando" "$T/st.out" && grep -q "limpei 4 arquivo(s) velho(s)" "$T/st.out" && [ -z "$(ls -A "$SPOOL/req")" ] && [ -z "$(ls -A "$SPOOL/claimed")" ] && [ ! -e "$SPOOL/resp/$oldid.json" ] && [ ! -e "$SPOOL/resp/.$oldid.tmp" ] && [ -e "$SPOOL/resp/$midid.json" ] && [ -e "$SPOOL/resp/$newid.json" ]; ok $? "stop de quem já tinha saído sozinho: a faxina roda também, em req/, resp/ (inclusive o .tmp velho) e claimed/ (4 saem), ao lado de 'não há puxador rodando'"
+stopr
+[ "$SRC" = 0 ] && grep -q "não havia nada velho; poupei 2 dentro da carência" "$T/st.out" && ! grep -q "limpei" "$T/st.out" && [ -e "$SPOOL/resp/$midid.json" ] && [ -e "$SPOOL/resp/$newid.json" ]; ok $? "stop sem nada velho no spool: 'não havia', sai 0, e os 2 poupados da carência continuam lá"
+rm -rf "$SPOOL"; stopr
+[ "$SRC" = 0 ] && grep -q "não havia" "$T/st.out" && [ ! -e "$SPOOL" ]; ok $? "stop sem a pasta do spool no MBP: 'não havia', sai 0, e a faxina não cria a pasta"
+plant req; FAKE_SSH_FAIL=1 stopr
+[ "$SRC" != 0 ] && grep -q "NÃO DEU PARA VER" "$T/st.err" && grep -q "rc=255" "$T/st.err" && ! grep -qE "limpei|não havia" "$T/st.out" "$T/st.err" && [ -e "$SPOOL/resp/$oldid.json" ] && [ -e "$SPOOL/req/$oldid.json" ]; ok $? "stop com o ssh fora (rc 255): NÃO DEU PARA VER com o rc, sai ≠ 0, e não diz 'limpei' nem 'não havia' (o que sobrou segue lá)"
+plant req; chmod 755 "$SPOOL"; stopr; chmod 700 "$SPOOL"
+[ "$SRC" != 0 ] && grep -q "NÃO DEU PARA VER" "$T/st.err" && grep -q "rc=78" "$T/st.err" && [ -e "$SPOOL/resp/$oldid.json" ] && [ -e "$SPOOL/req/$oldid.json" ] && [ -e "$SPOOL/resp/$newid.json" ]; ok $? "stop com o spool de modo largo (0755): o agente recusa (78), NÃO DEU PARA VER, sai ≠ 0, e nada é apagado numa pasta que não é minha"
+plant; mkdir "$SPOOL/resp/pasta-velha"; age "$SPOOL/resp/pasta-velha" 300; stopr
+[ "$SRC" != 0 ] && grep -q "NÃO DEU PARA LIMPAR" "$T/st.err" && grep -q "limpei 2" "$T/st.err" && [ ! -e "$SPOOL/resp/$oldid.json" ] && [ -d "$SPOOL/resp/pasta-velha" ] && [ -e "$SPOOL/resp/$newid.json" ]; ok $? "stop com um velho que não sai (uma pasta onde devia haver arquivo): apaga o que dá, NÃO DEU PARA LIMPAR com a conta, sai ≠ 0 (apagar que falha não é 'limpei')"
+python3 -I - "$PUMP" "$T/reap-spool" <<'PYEOF'; ok $? "agente reap: a carência é de 1 a 2 minutos; sem a pasta do spool diz 'sem-spool' e não cria nada; listdir que FALHA (PermissionError) não vira 'nada a limpar' (sai ≠ 0, nada apagado); uma pasta que falta dentro do spool é só 'nada ali'"
+import importlib.util, os, re, subprocess, sys, time
+s = importlib.util.spec_from_file_location("pump", sys.argv[1]); m = importlib.util.module_from_spec(s); sys.modules["pump"] = m; s.loader.exec_module(m)
+sp = sys.argv[2]
+def reap(prelude=""): return subprocess.run([sys.executable, "-I", "-c", prelude + m.AGENT, sp, "reap"], capture_output=True, timeout=30)
+g = re.search(r"REAP_GRACE_S = ([0-9]+)", m.AGENT)
+assert g and 60 <= int(g.group(1)) <= 120, g
+r = reap()
+assert r.returncode == 0 and r.stdout.split() == [b"reap", b"sem-spool"] and not os.path.exists(sp), (r, os.path.exists(sp))
+os.makedirs(sp + "/resp", 0o700); os.chmod(sp, 0o700)
+f = sp + "/resp/1700000000800-1-dddddddd.json"; open(f, "w").close(); os.utime(f, (time.time() - 300,) * 2)
+r = reap("import os\ndef _boom(*a, **k): raise PermissionError(13, 'injetado')\nos.listdir = _boom\n")
+assert r.returncode != 0 and b"PermissionError" in r.stderr and r.stdout == b"" and os.path.exists(f), r
+r = reap()
+assert r.returncode == 0 and r.stdout.split() == [b"reap", b"1", b"0", b"0"] and not os.path.exists(f) and not os.path.exists(sp + "/req"), r
+PYEOF
+python3 -I - "$PUMP" <<'PYEOF'; ok $? "puxador: a resposta do agente que não entendo (vazia, lixo, forma errada, rc ≠ 0, ssh que nem lança) é NÃO DEU PARA VER e sai 1, nunca 'não havia'; as formas certas dão limpei / não havia e sai 0; apagar que falhou (3º número) é NÃO DEU PARA LIMPAR e sai 1"
+import contextlib, importlib.util, io, sys
+s = importlib.util.spec_from_file_location("pump", sys.argv[1]); m = importlib.util.module_from_spec(s); sys.modules["pump"] = m; s.loader.exec_module(m)
+cfg = m.Cfg("mbp")
+def run(reply):
+    def fake(self, *a, **k):
+        if isinstance(reply, Exception): raise reply
+        return reply
+    m.Pump.ssh_run = fake
+    o, e = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(o), contextlib.redirect_stderr(e): rc = m.reap_spool(cfg)
+    return rc, o.getvalue(), e.getvalue()
+for reply in [(0, b"", b""), (0, b"lixo\n", b""), (0, b"reap 1 2\n", b""), (0, b"reap 1 2 x\n", b""), (255, b"", b"ssh: sem rota"), (78, b"reap 0 0 0\n", b"modo errado"), OSError(2, "No such file or directory")]:
+    rc, o, e = run(reply)
+    assert rc == 1 and "NÃO DEU PARA VER" in e and "limpei" not in o + e and "não havia" not in o + e, (reply, rc, o, e)
+rc, o, e = run((0, b"reap sem-spool\n", b"")); assert rc == 0 and "não havia" in o and e == "", (rc, o, e)
+rc, o, e = run((0, b"reap 0 3 0\n", b"")); assert rc == 0 and "não havia nada velho; poupei 3 dentro da carência" in o and e == "", (rc, o, e)
+rc, o, e = run((0, b"reap 3 1 0\n", b"")); assert rc == 0 and "limpei 3 arquivo(s) velho(s); poupei 1 dentro da carência" in o and e == "", (rc, o, e)
+rc, o, e = run((0, b"reap 3 1 2\n", b"")); assert rc == 1 and "NÃO DEU PARA LIMPAR" in e and "limpei 3" in e and o == "", (rc, o, e)
+PYEOF
 fi
 
 echo
