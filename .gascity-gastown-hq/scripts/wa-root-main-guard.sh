@@ -17,7 +17,7 @@
 # DETACHED HEAD (ga-a7mti1). Since 10/10 the live clone sits on a detached HEAD at origin/main (the updater merges
 # origin/main onto it), so "no branch name" is the HEALTHY state: the old WARN fired every cycle (10161 lines in
 # October) and hid the one case that matters, a HEAD on code origin/main does not contain. A detached HEAD is now
-# classified against the local origin/main ref (as of the last fetch; this guard does not fetch):
+# classified against the local origin/main ref, as of the last fetch (this path does not fetch; only the restore does):
 #   on-main   HEAD is reachable from origin/main → silent: no line, no notify; an open episode is cleared
 #   off-main  HEAD is NOT reachable → unreviewed code is live → OFF-MAIN-DETACHED
 #   unknown   cannot tell (origin/main missing, HEAD unreadable, merge-base failed) → UNKNOWN-DETACHED, never "healthy"
@@ -49,7 +49,7 @@ WINDOW_MIN="${WA_ROOT_GUARD_ALARM_WINDOW_MIN:-60}"
 # vazio → o padrão (2 ciclos / 60 min); falhou/ilegível (não numérico) → o padrão: um knob torto nunca cala o alerta
 case "$CONFIRM" in ''|*[!0-9]*) CONFIRM=2 ;; esac
 case "$WINDOW_MIN" in ''|*[!0-9]*) WINDOW_MIN=60 ;; esac
-# vazio → o relógio real; falhou/ilegível → NOW=0 e CLOCK_OK=0: sem relógio não há janela, o alerta sai a cada ciclo (visível)
+# vazio → o relógio real; falhou/ilegível → NOW=0 e CLOCK_OK=0: sem relógio não há janela, então o alerta, uma vez confirmado, sai a cada ciclo (visível)
 NOW="${WA_ROOT_GUARD_NOW:-}"   # the epoch seam is for the selftest only
 case "$NOW" in ''|*[!0-9]*) NOW="$(date +%s 2>/dev/null)" ;; esac
 CLOCK_OK=1
