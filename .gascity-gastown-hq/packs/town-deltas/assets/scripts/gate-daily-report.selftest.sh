@@ -114,11 +114,13 @@ EOF
 cat > "$FB/notify" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >> "$FAKE_DIR/notify.log"
+echo "notify: fake failure text" >&2
+exit "${FAKE_NOTIFY_RC:-0}"
 EOF
 cp "$FB/notify" "$FBN/notify"; chmod +x "$FB/bd" "$FB/notify" "$FBN/notify"
 post_run() {  # $1 = how many bd calls fail first, $2 = PATH; leaves POUT (stdout+stderr) and PRC
   rm -f "$FAKE_DIR/bd.count" "$FAKE_DIR/notify.log"
-  POUT="$(PATH="$2" FAKE_DIR="$FAKE_DIR" FAKE_BD_FAIL_UNTIL="$1" GATE_DAILY_RETRY_SLEEP=0 /usr/bin/python3 "$HERE/gate-daily-report.py" --city "$C" --day 2026-10-06 --post 2>&1)"; PRC=$?
+  POUT="$(PATH="$2" FAKE_DIR="$FAKE_DIR" FAKE_BD_FAIL_UNTIL="$1" FAKE_NOTIFY_RC="${FAKE_NOTIFY_RC:-0}" GATE_DAILY_RETRY_SLEEP=0 /usr/bin/python3 "$HERE/gate-daily-report.py" --city "$C" --day 2026-10-06 --post 2>&1)"; PRC=$?
 }
 bd_calls()    { cat "$FAKE_DIR/bd.count" 2>/dev/null || echo 0; }
 notify_calls(){ [ -f "$FAKE_DIR/notify.log" ] && wc -l < "$FAKE_DIR/notify.log" | tr -d ' ' || echo 0; }
@@ -147,6 +149,13 @@ post_run 0 "$FBN"
 [ "$PRC" = "1" ] && grep -q 'relatório NÃO gravado na ga-ufskhy' "$FAKE_DIR/notify.log" 2>/dev/null && ok || bad "T8d: bd missing must read as not recorded (exit $PRC): $(cat "$FAKE_DIR/notify.log" 2>/dev/null)"
 # scoped to the WARN line: the report body itself says "FileNotFoundError" for other unreadable sources
 echo "$POUT" | grep 'WARN' | grep -q 'FileNotFoundError' && ok || bad "T8d: the reason (FileNotFoundError) must be on the WARN line, got: $(echo "$POUT" | grep WARN)"
+
+# T8e: the "NÃO gravado" alarm travels by notify — a notify that exits non-zero must not pass silently (exit 1 + a WARN
+# with notify's own stderr), whether the report was recorded or not
+FAKE_NOTIFY_RC=3 post_run 99 "$FB:$PATH"
+[ "$PRC" = "1" ] && echo "$POUT" | grep 'WARN' | grep 'notify' | grep -q 'rc=3' && echo "$POUT" | grep -q 'notify: fake failure text' && ok || bad "T8e: failing notify (not-recorded case) must show WARN with rc and stderr (exit $PRC): $(echo "$POUT" | grep -E 'WARN|notify')"
+FAKE_NOTIFY_RC=3 post_run 0 "$FB:$PATH"
+[ "$PRC" = "1" ] && echo "$POUT" | grep 'WARN' | grep -q 'notify.*rc=3' && ok || bad "T8e: failing notify (recorded case) must exit 1 with a WARN (exit $PRC): $(echo "$POUT" | grep -E 'WARN|notify')"
 
 echo "gate-daily-report selftest: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

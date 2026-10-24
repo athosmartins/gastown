@@ -21,7 +21,8 @@ THREE STATES everywhere: a number, or "não medido (<why>)". A file that cannot 
 Usage: gate-daily-report.py [--day YYYY-MM-DD] [--post] [--city PATH]
   --post   comment on ga-ufskhy via `bd` (3 tries; each failure prints bd's own stderr to stderr, which launchd
            keeps in gate-daily-report-launchd.err) and send `notify`; without it, print only (dry run). If the
-           comment is still not recorded, exit 1 and the notify says so (priority 4).
+           comment is still not recorded, exit 1 and the notify says so (priority 4). A notify that itself fails
+           (rc≠0, timeout, not found) also exits 1, with a WARN carrying notify's stderr.
 """
 import argparse, datetime, glob, json, os, re, statistics, subprocess, sys, time
 
@@ -389,8 +390,12 @@ def main():
         body = f"relatório NÃO gravado na {PROGRAM_BEAD} (bd falhou {POST_ATTEMPTS}x: {why[:200]}) · {short}"
         if logged:
             body += " · texto completo em .gc/logs/gate-daily-report.log"
+    # falhou (rc≠0 / timeout / notify não inicia) → WARN with notify's own words + exit 1: the "NÃO gravado" alarm
+    # rides on this call, so a notify that never delivered must not look like a clean run
     try:
-        subprocess.run(["notify", "-t", title, "-p", prio, body], timeout=30, capture_output=True)
+        r = subprocess.run(["notify", "-t", title, "-p", prio, body], timeout=30, capture_output=True)
+        if r.returncode != 0:
+            print(f"WARN: notify saiu com rc={r.returncode}{stderr_note(r.stderr)}", file=sys.stderr); rc = 1
     except Exception as e:  # noqa: BLE001
         print(f"WARN: notify falhou: {e}", file=sys.stderr); rc = 1
     return rc
