@@ -9,7 +9,7 @@
 #       mbp-node-dispatch.sh release <bead>                          depois da entrega: solta o dono e a marca
 #       --store DIR  pasta do store da bead (default: o que routes.jsonl diz para o prefixo `wa`)
 # O QUE É: o MESMO despachante do WA (scripts/wa-node-dispatch.sh: comparação atômica, slots, três estados, desfazer com releitura) apontado para o MBP por variável de ambiente, como o ps-node-dispatch.sh o aponta para o PS: não há
-#   segunda cópia da lógica de escrita. Sempre no modo pilot (dono + marca pilot.wa_node_alias, SEM gc.routed_to): nenhuma bead é roteada ao pool do MBP, que pede ZERO sessões por construção. Nada o chama ainda (gancho do Pilot = corte 2) e,
+#   segunda cópia da lógica de escrita. Sempre no modo pilot (dono + marca pilot.wa_node_alias, SEM gc.routed_to): nenhuma bead é roteada ao pool do MBP, que pede ZERO sessões por construção. Quem o chama é o gancho do Pilot (_pilot_mbp_node_decide, corte 2, PILOT_WA_MBP_ROUTE, padrão off) e,
 #   sem o host `mbp` na config, o oráculo devolve `unknown` e esta casca sai 11 sem escrever. Cadeia e decisões: docs/runbooks/mbp-wa-node.md.
 # O QUE ESTA CASCA GARANTE (e o selftest cobra):
 #   1. alias `wa-worker-remote-mbp-1..2`, template, classificador, log (.gc/mbp-node-route.jsonl), modo pilot, slots e, acima de tudo, O ORÁCULO (mbp-node-capacity.py: Athos fora e MBP saudável) são FIXADOS aqui e vencem qualquer
