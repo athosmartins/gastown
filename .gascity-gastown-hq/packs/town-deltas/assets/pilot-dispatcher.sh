@@ -15093,9 +15093,10 @@ TASK
           DISPATCH_RESULT="disk_floor_node_only"
           return 1
         fi
-        # ga-w7qwl1.2.2: o MBP vem DEPOIS do Hetzner (o nó 24/7 não perde a vez). Só chega aqui o rc 1 do Hetzner na varredura normal: o rc 2, a passada de WA e a só-nó do disk floor soltaram a bead e saíram acima, e o rc 0
+        : # pool: leave UNASSIGNED + open so RoutedPoolQuery finds it (claim happens worker-side)
+        # ga-w7qwl1.2.2: o MBP vem DEPOIS do Hetzner (o nó 24/7 não perde a vez), depois do `: # pool` acima, que fecha a cadeia dele (os selftests do Hetzner leem uma janela fixa de linhas depois da chamada e a adjacência do fi com esse `: #`). Só chega aqui o rc 1 do Hetzner na varredura normal: o rc 2, a passada de WA e a só-nó do disk floor soltaram a bead e saíram acima, e o rc 0
         # (a bead já é do nó, alvo wa-worker-remote) não precisa dele. rc 0 do MBP: a bead já está com ele e a sessão aberta, o mesmo caminho do nó (o braço wa-worker-remote do spawn só loga); rc 2: segura, solta a claim;
-        # rc 1 (e sempre, com o padrão PILOT_WA_MBP_ROUTE=off): nada muda, o caminho do mini segue. As linhas do gancho do Hetzner acima ficam como estavam (os selftests dele leem uma janela fixa de linhas depois da chamada).
+        # rc 1 (e sempre, com o padrão PILOT_WA_MBP_ROUTE=off): nada muda, o caminho do mini segue.
         if [ "$_RP_NODE_RC" = 1 ]; then
           local _RP_MBP_RC=0
           _pilot_mbp_node_decide "$STORY_ID" "$STORY_BEAD_CITY" "$_SLING_TARGET" || _RP_MBP_RC=$?
@@ -15108,7 +15109,6 @@ TASK
             return 1
           fi
         fi
-        : # pool: leave UNASSIGNED + open so RoutedPoolQuery finds it (claim happens worker-side)
         fi
         ;;
       *)
