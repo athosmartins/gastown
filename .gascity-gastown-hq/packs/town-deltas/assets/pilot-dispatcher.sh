@@ -12728,7 +12728,7 @@ _pilot_ps_node_settle() {
 # próprios: sessão do MBP não entra na conta do pool wa-worker do mini, na do teto global (ga-jezvn) nem na do Hetzner, e este gancho não escreve em nenhuma delas.
 # PILOT_WA_MBP_ROUTE = off|shadow|on — qualquer outro valor (vazio, erro de digitação, label, auto) é off.
 #   off     nada roda: volta antes de ler qualquer coisa (nem a contagem de sessões, nem o despachante).
-#   shadow  com o mini cheio roda `apply --dry-run` (classificador + slots + oráculo, sem escrever) e grava UMA linha em $GC_CITY/.gc/mbp-node-route.jsonl: o que iria ao MBP. NÃO muda o despacho.
+#   shadow  com o mini cheio roda `apply --dry-run` (classificador + slots + oráculo, sem escrever) e grava UMA linha em $GC_CITY/.gc/mbp-node-route.jsonl: o que iria ao MBP. NÃO muda o despacho (a única leitura que ele acrescenta é a contagem de sessões do mini, a mesma que o braço do pool faz logo a seguir).
 #   on      além disso, a bead que o despachante manda ao MBP vai: dono wa-worker-remote-mbp-<1|2> + marca pilot.wa_node_alias (SEM gc.routed_to) e a sessão é aberta aqui.
 # Retorno 0 = a bead JÁ está com o MBP e a sessão está aberta e avisada · 1 = nada ficou escrito, ela segue o caminho do mini · 2 = SEGURA (o chamador solta a claim e não despacha: a bead já é do nó, não deu para relê-la, a escrita pode
 # ter pegado e não sei dizer, ou a sessão não abriu e o desfazer não se confirmou). Limite deste corte: o `apply` recusa a bead que já traz gc.routed_to=wa-worker (rc 12), então a que o mini carimbou numa tentativa anterior não chega ao MBP.

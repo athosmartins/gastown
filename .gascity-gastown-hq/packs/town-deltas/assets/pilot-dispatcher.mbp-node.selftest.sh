@@ -309,6 +309,39 @@ reset; r=$(D on 0 >/dev/null; D on 0); eq "o gancho nunca chama o despachante do
 reset; r=$(D shadow 0 >/dev/null; D on 12 >/dev/null; D on 0 1 >/dev/null); eq "...nem em shadow, nem com a recusa, nem no dry-run" "$(wc -l < "$T/hcalls" | tr -d ' ')" "0"
 reset; r=$(PILOT_WA_NODE_ROUTE=auto PILOT_WA_NODE_SPAWN=pilot PILOT_WA_NODE_SLOTS=3 WA_NODE_ALIAS=wa-worker-remote-1 D on 0); eq "as variáveis do Hetzner no ambiente não mexem no gancho do MBP" "$r $(stt) $(cat "$T/calls")" "rc=0 $AP1 apply $ID --store $ST --basis any"
 
+# O teto do Hetzner, medido no despachante REAL (scripts/wa-node-dispatch.sh --dry-run, com bd, gc, classificador e oráculo falsos): sessão do MBP viva não ocupa o slot dele; uma do Hetzner ocupa (o controle).
+# Os mutantes mexem no dispatcher do Pilot, não neste script: a seção não roda nas cópias.
+if [ -z "${MBP_NODE_SELFTEST_FILE:-}" ]; then
+  echo; echo "=== E2. o teto do Hetzner, no despachante real ==="
+  HZS="$SELF_DIR/../../../scripts/wa-node-dispatch.sh"
+  if [ -x "$HZS" ]; then
+    mkdir -p "$T/h/store" "$T/h/city/.gc"
+    cat > "$T/h/bd" <<'EOF'
+#!/usr/bin/env bash
+[ "${1:-}" = -C ] && shift 2
+case "${1:-}" in
+  show) printf '[{"id":"wa-hz1","title":"t","status":"open","metadata":{}}]\n' ;;
+  list) printf '[]\n' ;;
+  *) exit 1 ;;
+esac
+EOF
+    cat > "$T/h/gc" <<'EOF'
+#!/bin/sh
+[ "$1 $2" = "session list" ] && { printf '%s' "$FAKE_HSESS"; exit 0; }
+exit 1
+EOF
+    printf 'import sys\nsys.stdin.read()\nsys.stdout.write(\x27{"verdict":"node","basis":"text","reasons":[],"paths":[],"tests":[],"info":[]}\x27)\n' > "$T/h/cls.py"
+    printf 'import sys\nsys.stdout.write(\x27{"verdict":"node","reason":"free_slot","effective":3,"active":0,"free":3}\x27)\n' > "$T/h/cap.py"
+    chmod +x "$T/h/bd" "$T/h/gc"
+    hz() { GC_CITY="$T/h/city" WA_NODE_BD="$T/h/bd" WA_NODE_GC="$T/h/gc" WA_NODE_CLASSIFY="$T/h/cls.py" WA_NODE_CAPACITY="$T/h/cap.py" WA_NODE_LOG="$T/h/city/.gc/log.jsonl" WA_NODE_SPAWN=pilot WA_NODE_SLOTS=1 FAKE_HSESS="$1" bash "$HZS" apply wa-hz1 --store "$T/h/store" --basis any --dry-run 2>&1; echo "rc=$?"; }
+    r=$(hz '{"sessions":[]}'); eq "controle: sem sessão nenhuma o Hetzner (1 slot) aceita a bead" "$(printf '%s' "$r" | tail -1) $(printf '%s' "$r" | grep -c 'iria para wa-worker-remote-1')" "rc=0 1"
+    r=$(hz "$(sess 0 2 0)"); eq "2 sessões do MBP vivas: o slot do Hetzner segue livre (o teto dele não muda com o MBP ligado)" "$(printf '%s' "$r" | tail -1) $(printf '%s' "$r" | grep -c 'iria para wa-worker-remote-1')" "rc=0 1"
+    r=$(hz '{"sessions":[{"template":"wa-worker-remote","alias":"wa-worker-remote-1","state":"active"}]}'); eq "controle: uma sessão do Hetzner viva ocupa o slot (12) — o caso é sensível" "$(printf '%s' "$r" | tail -1)" "rc=12"
+  else
+    fail "scripts/wa-node-dispatch.sh não está em $HZS"
+  fi
+fi
+
 echo; echo "=== F. a fiação em dispatch_one ==="
 lnof() { grep -nF -- "$1" "$DISPATCHER" | head -n "${2:-1}" | tail -n 1 | cut -d: -f1; }
 eq "o gancho do MBP é chamado em UM lugar de dispatch_one" "$(grep -cF -- '_pilot_mbp_node_decide "$STORY_ID"' "$DISPATCHER")" "1"
