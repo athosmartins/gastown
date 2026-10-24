@@ -26,6 +26,7 @@
 #   S12     a crew branch left in the root is still backed up and restored
 #   S13     the production defaults of the test seams are the real paths
 #   S14     a notify that fails does not spend the alert window: the next cycle retries, and the line says it failed
+#   S15     a corrupt episode state file counts as no episode: the first cycle after it is silent, the next one alerts
 # HOW. Real git: a bare "origin" plus a clone as the live root, in a throwaway dir. The guard runs as a subprocess
 # with WA_ROOT_GUARD_{ROOT,CITY,HOOKS,NOW} pointing there and a fake `notify` first on PATH; nothing under /Users/athos
 # is read, no network, no daemons. WRMG_GUARD=<path> runs the harness against another copy of the guard (that is how it
@@ -298,6 +299,22 @@ eq "S14 only the failed attempt reports a failure" "$(grep -c 'NOTIFY-FAILED' "$
 cycle 4
 eq "S14 once delivered, the window is spent: no new notification" "$(nl "$NOTES")" 1
 eq "S14 once delivered, no new line" "$(nl "$LOG")" 3
+
+echo "S15: the episode state file is corrupt — it counts as NO episode: no confirmation for free, and no wedge"
+# Every shape carries a known kind and a high count with a later field missing or twisted (the 3rd: only the alarm) —
+# read as they stand, they would confirm the alert on the very first cycle.
+s15() {  # s15 <world> <state content>
+  mk_world "$1"; fx checkout -q --detach "$U"; printf '%s\n' "$2" > "$STATE"
+  cycle 1
+  eq "S15 [$2] the 1st cycle after the corruption is silent (the count restarts)" "$(nl "$LOG")" 0
+  eq "S15 [$2] and notifies nobody" "$(nl "$NOTES")" 0
+  cycle 2
+  eq "S15 [$2] the next cycle confirms and alerts once (the state healed, it is not wedged)" "$(nl "$LOG")" 1
+  eq "S15 [$2] and notifies once" "$(nl "$NOTES")" 1
+}
+s15 s15a 'off-main 99'
+s15 s15b 'off-main 99 abc 0'
+s15 s15c 'off-main 99 1800000000 x'
 
 echo ""
 echo "──────────────────────────────────────────"
