@@ -2390,26 +2390,26 @@ done
 unset JAC_WATCH_FREE_FILE JAC_SYSCTL JAC_SWAP_USED_FILE
 
 echo "=== S40: the TIGHT-DISK TAIL — a disk at the floor is not a deadlock: when the comfortable rule refuses the tail pass, a smaller one runs, lean and watched (ga-ft1iv6) ==="
-# 24/10: packs/maintenance/jsonl-archive was 8.3GB in 9 packs — one of 6.7GB and eight of 150-224MB, ALL made on 23/10 (1.4GB/day) — because every tier that could merge them said no to the disk. Each batch pack carries its own
+# 24/10: packs/maintenance/jsonl-archive was 8.3GB in 9 packs — one of 6.7GB and eight of 150-224MB, the eight all made on 23/10 (1.4GB/day) — because every tier that could merge them said no to the disk. Each batch pack carries its own
 # first copy ("seed") of every giant file; the tail pass (tier 2a) turns N seeds into one, but asks for free >= the packs + a quarter of the loose bytes + 512MiB + (Dolt's CRITICAL class + 1) GiB — ~5GB for two packs of 200MB —
 # and the mini lives at 3-4.7GB; the gc and the room pass ask for more and run only at night. Nothing consolidated, the archive grew, the disk stayed at the floor: a loop. The tight road is the tail pass again, SMALLER: the
 # packs it planned whose bytes fit over TAIL_TIGHT_FLOOR_GB (Dolt's CRITICAL line, 1GiB under the comfortable rule's floor), at least two, with the room pass's lean pack.* settings under its watchdog (free disk, swap, lost readings).
 # Fixture: the S36 repo (a base pack + N batch packs of ~125KiB, 3 objects each), Dolt's CRITICAL class 1GiB (T_CRIT=1, so the comfortable rule wants 2GiB free), the tight floor 1GiB, and free = floor + TAVAIL KiB: TAVAIL is the room
 # the tight pass may use. By day (12h) unless a test says otherwise: the tail pass was never gated on the window.
 TFLOOR=1048576
-trun() {  # trun <repo> — one TAIL run on a tight disk: free = the tight floor + TAVAIL KiB (default 400), the swap seam at TSWAP0 (none = unreadable), a 0.2s watch with no slack
+trun() {  # trun <repo(s)> — one TAIL run on a tight disk: free = the tight floor + TAVAIL KiB (default 400), the swap seam at TSWAP0 (none = unreadable), a 0.2s watch with TSLACK KiB of slack (default 0), TGIT = the git stand-in
   local avail="${TAVAIL:-400}"
   rm -f "$WORK/room-args" "$WORK/room-sleep.pid"
   printf '%s\n' "$(( TFLOOR + avail ))" > "$WORK/watch-free"
   if [ "${TSWAP0:-1000}" = none ]; then rm -f "$WORK/swap-used"; else printf '%s\n' "${TSWAP0:-1000}" > "$WORK/swap-used"; fi
   if [ "${TFREEFILE:-0}" = 1 ]; then export JAC_WATCH_FREE_FILE="$WORK/watch-free"; else unset JAC_WATCH_FREE_FILE; fi
   export JAC_SWAP_USED_FILE="$WORK/swap-used"
-  JAC_TAIL_TIGHT="${TTIGHT:-1}" JAC_TAIL_TIGHT_FLOOR_GB="${TFLOORGB:-1}" JAC_WATCH_INTERVAL_S=0.2 JAC_WATCH_SLACK_KIB=0 JAC_WATCH_KILL_GRACE_S=2 \
-  T_TAIL=300 T_TAIL_OBJS=20 T_CRIT=1 T_HEADROOM=0 T_HOUR="${THOUR:-12}" T_FREE="${TFREE:-$(( TFLOOR + avail ))}" T_GIT="$WORK/git-room" run_tail "$1"
+  JAC_TAIL_TIGHT="${TTIGHT:-1}" JAC_TAIL_TIGHT_FLOOR_GB="${TFLOORGB:-1}" JAC_WATCH_INTERVAL_S=0.2 JAC_WATCH_SLACK_KIB="${TSLACK:-0}" JAC_WATCH_KILL_GRACE_S=2 \
+  T_TAIL=300 T_TAIL_OBJS=20 T_CRIT=1 T_HEADROOM=0 T_HOUR="${THOUR:-12}" T_FREE="${TFREE:-$(( TFLOOR + avail ))}" T_GIT="${TGIT:-$WORK/git-room}" run_tail "$1"
 }
 small_kib() { local p; for p in "$1"/.git/objects/pack/*.pack; do [ "$p" = "$(base_pack "$1")" ] || echo $(( ($(wc -c < "$p") + 1023) / 1024 )); done | tr '\n' ' '; }
 # A. the loop broken: 400KiB over the tight floor, ~2GiB short of the comfortable rule, BY DAY — three of the four small packs become one, lean and watched; the base pack and the fourth small pack are kept
-TT="$WORK/tt"; tailrepo "$TT" 4; rm -f "$WORK/state.json" "$WORK/log"
+TT="$WORK/s40-tt"; tailrepo "$TT" 4; rm -f "$WORK/state.json" "$WORK/log"
 TT_BP="$(base_pack "$TT")"; TT_SUM="$(cksum < "$TT_BP")"; TT_PC="$(pack_count "$TT")"; TT_H="$(history "$TT")"; TT_N="$(commits "$TT")"; TT_SZ="$(small_kib "$TT")"
 out="$(trun "$TT")"; rc=$?
 { [ "$TT_PC" = 5 ] && [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$TT")" = 3 ]; } \
@@ -2425,23 +2425,53 @@ out="$(trun "$TT")"; rc=$?
   || bad "A. repack command line wrong: $(cat "$WORK/room-args" 2>/dev/null)"
 printf '%s' "$out" | grep -q 'TIGHT disk' && ! printf '%s' "$out" | grep -q 'status=skipped-low-disk' && ok "A. the log says it is the tight road, and there is no skipped-low-disk line" || bad "A. log wrong: $out"
 # A2. 300KiB of room: two packs of ~125KiB fit and three do not, so exactly two are taken — the pass takes what FITS in bytes, not what the object cap would allow
-TT2="$WORK/tt2"; tailrepo "$TT2" 4; rm -f "$WORK/state.json" "$WORK/log"; TT2_PC="$(pack_count "$TT2")"; TT2_SZ="$(small_kib "$TT2")"
+TT2="$WORK/s40-tt2"; tailrepo "$TT2" 4; rm -f "$WORK/state.json" "$WORK/log"; TT2_PC="$(pack_count "$TT2")"; TT2_SZ="$(small_kib "$TT2")"
 out="$(TAVAIL=300 trun "$TT2")"; rc=$?
 { [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$TT2")" = $(( TT2_PC - 1 )) ] && printf '%s' "$out" | grep -q 'tail consolidation: 2 packs'; } \
   && ok "A2. 300KiB of room, small packs of ${TT2_SZ}KiB: exactly 2 are merged (packs $TT2_PC -> $(pack_count "$TT2"))" || bad "A2. byte-fit wrong (rc=$rc packs $TT2_PC -> $(pack_count "$TT2") status=$(last_status), small packs ${TT2_SZ}KiB): $out"
 # B. a comfortable disk is NOT the tight road: same repo, plenty of free space — the pass runs as before (default pack.* settings, no watchdog, no 'TIGHT' in the log)
-TT3="$WORK/tt3"; tailrepo "$TT3" 4; rm -f "$WORK/state.json" "$WORK/log"
+TT3="$WORK/s40-tt3"; tailrepo "$TT3" 4; rm -f "$WORK/state.json" "$WORK/log"
 out="$(TFREE=90000000 trun "$TT3")"; rc=$?
 { [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$TT3")" = 2 ] && ! printf '%s' "$out" | grep -q 'TIGHT disk' && [ "$(grep -o 'pack.windowMemory=[0-9a-z]*' "$WORK/room-args" | tail -n 1)" = "pack.windowMemory=256m" ]; } \
   && ok "B. 86GiB free: all 4 small packs merged the usual way (256m window, no tight road in the log)" || bad "B. comfortable disk handled wrong (rc=$rc packs=$(pack_count "$TT3") status=$(last_status)): $out"
 # C. no room even for the two smallest packs → nothing is repacked and the answer is the old one: skipped-low-disk (exit 1), now with the tight road's reason
-TB2="$WORK/tb2"; tailrepo "$TB2" 4; TB2_PC="$(pack_count "$TB2")"; rm -f "$WORK/state.json" "$WORK/log"
+TB2="$WORK/s40-tb2"; tailrepo "$TB2" 4; TB2_PC="$(pack_count "$TB2")"; rm -f "$WORK/state.json" "$WORK/log"
 out="$(TAVAIL=200 trun "$TB2")"; rc=$?
 { [ "$rc" -eq 1 ] && [ "$(last_status)" = "skipped-low-disk" ] && [ ! -e "$WORK/room-args" ] && [ "$(pack_count "$TB2")" = "$TB2_PC" ] && printf '%s' "$out" | grep -q 'status=skipped-low-disk (tail)' \
   && printf '%s' "$out" | grep -q 'two smallest packs do not fit'; } \
   && ok "C. 200KiB of room (< 2 packs): no repack, status skipped-low-disk, exit 1, the '(tail)' line says the two smallest packs do not fit" || bad "C. no-room handled wrong (rc=$rc status=$(last_status) packs=$(pack_count "$TB2")): $out"
+# C2. the watchdog's slack counts: 400KiB over the floor, but 200KiB of slack leaves 200KiB for the packs — fewer than two fit, so the pass does not start into the slack it must be stopped in front of
+TB3="$WORK/s40-tb3"; tailrepo "$TB3" 4; TB3_PC="$(pack_count "$TB3")"; rm -f "$WORK/state.json" "$WORK/log"
+out="$(TSLACK=200 trun "$TB3")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "skipped-low-disk" ] && [ ! -e "$WORK/room-args" ] && [ "$(pack_count "$TB3")" = "$TB3_PC" ] && printf '%s' "$out" | grep -q 'two smallest packs do not fit'; } \
+  && ok "C2. 400KiB over the floor with a 200KiB slack: no repack, skipped-low-disk — the slack is taken off the room before the packs are counted" || bad "C2. slack ignored (rc=$rc status=$(last_status) packs=$(pack_count "$TB3")): $out"
+# C3. the loose bytes count: one loose version (about 130KiB on disk, a quarter of it ~32KiB, packed too by `repack -a`) takes the room from 390KiB to ~358: two packs fit, three do not
+TB4="$WORK/s40-tb4"; tailrepo "$TB4" 4; addcommits "$TB4" 1; TB4_PC="$(pack_count "$TB4")"; rm -f "$WORK/state.json" "$WORK/log"
+out="$(TAVAIL=390 trun "$TB4")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$TB4")" = $(( TB4_PC - 1 )) ] && printf '%s' "$out" | grep -q 'tail consolidation: 2 packs' && [ "$(loose_count "$TB4")" = 0 ]; } \
+  && ok "C3. 390KiB of room and a loose version: exactly 2 packs taken (a quarter of the loose bytes is held back), and the loose objects were packed by the same pass" || bad "C3. loose bytes not counted (rc=$rc packs $TB4_PC -> $(pack_count "$TB4") loose=$(loose_count "$TB4") status=$(last_status)): $out"
+# C4. a cut time dated in the FUTURE (a clock that moved, a state edited by hand) is not "never cut": the road stays closed and the backoff clock starts now
+TB5="$WORK/s40-tb5"; tailrepo "$TB5" 4; TB5_PC="$(pack_count "$TB5")"; rm -f "$WORK/log"; T0="$(date +%s)"
+jq -n --arg r "$TB5" '{($r): {room_cut_epoch: ((now | floor) + 100000)}}' > "$WORK/state.json"
+out="$(trun "$TB5")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "skipped-low-disk" ] && [ ! -e "$WORK/room-args" ] && [ "$(pack_count "$TB5")" = "$TB5_PC" ] && printf '%s' "$out" | grep -q 'dated in the future'; } \
+  && ok "C4. a cut time in the future: no repack, skipped-low-disk, the log says so" || bad "C4. future-dated cut handled wrong (rc=$rc status=$(last_status)): $out"
+{ [ "$(state_field "$TB5" room_cut_epoch)" -ge "$T0" ] && [ "$(state_field "$TB5" room_cut_epoch)" -lt $(( T0 + 1000 )) ]; } 2>/dev/null \
+  && ok "C4. ...and the cut time in the state is now (the backoff clock starts)" || bad "C4. state after a future-dated cut: room_cut_epoch=$(state_field "$TB5" room_cut_epoch)"
+# C5. the remembered cut time cannot be READ (jq fails on that one read): not "never cut" — the road stays closed and the log names the read. A jq shim fails only the read named
+mkdir -p "$WORK/jqshim-tight"; REAL_JQ_T="$(command -v jq)"
+cat > "$WORK/jqshim-tight/jq" <<EOF
+#!/bin/bash
+case "\$*" in *"room_cut_epoch // empty"*) echo "jq: forced failure (selftest)" >&2; exit 5 ;; esac
+exec "$REAL_JQ_T" "\$@"
+EOF
+chmod +x "$WORK/jqshim-tight/jq"
+TB6="$WORK/s40-tb6"; tailrepo "$TB6" 4; TB6_PC="$(pack_count "$TB6")"; rm -f "$WORK/state.json" "$WORK/log"
+out="$(PATH="$WORK/jqshim-tight:$PATH" trun "$TB6")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "skipped-low-disk" ] && [ ! -e "$WORK/room-args" ] && [ "$(pack_count "$TB6")" = "$TB6_PC" ] && printf '%s' "$out" | grep -q 'remembered cut time of .* could not be read'; } \
+  && ok "C5. the remembered cut time cannot be read: no repack, skipped-low-disk, the log names the read" || bad "C5. unreadable cut time handled wrong (rc=$rc status=$(last_status) packs=$(pack_count "$TB6")): $out"
 # D. the road is OFF (JAC_TAIL_TIGHT=0), its floor is not a number, or swap cannot be read: the old answer, with the reason — and nothing repacked (a pass that cannot be watched is never started)
-TD1="$WORK/td1"; tailrepo "$TD1" 4; TD1_PC="$(pack_count "$TD1")"
+TD1="$WORK/s40-td1"; tailrepo "$TD1" 4; TD1_PC="$(pack_count "$TD1")"
 for dcase in "off|TTIGHT=0|tight-disk road is off" "floor|TFLOORGB=abc|is not a whole number" "swap|TSWAP0=none|swap in use cannot be read"; do
   DN="${dcase%%|*}"; DREST="${dcase#*|}"; DENV="${DREST%%|*}"; DWHY="${DREST#*|}"; rm -f "$WORK/state.json" "$WORK/log"
   out="$(eval "$DENV trun \"\$TD1\"")"; rc=$?
@@ -2449,27 +2479,42 @@ for dcase in "off|TTIGHT=0|tight-disk road is off" "floor|TFLOORGB=abc|is not a 
     && ok "D. $DN ($DENV): no repack, skipped-low-disk (exit 1), the log says '$DWHY'" || bad "D. $DN handled wrong (rc=$rc status=$(last_status) packs=$(pack_count "$TD1")): $out"
 done
 # F. swap grows while the tight pass runs → the watchdog stops it (well before the 60s the fake would hang), aborted + exit 1, the repo untouched; the object cap is halved, the cut is recorded, the next try waits
-TF="$WORK/tf"; tailrepo "$TF" 4; TF_PC="$(pack_count "$TF")"; TF_H="$(history "$TF")"; rm -f "$WORK/state.json" "$WORK/log"; T0="$(date +%s)"
-out="$(ROOM_ACT=swap trun "$TF")"; rc=$?; took=$(( $(date +%s) - T0 ))
-{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "aborted" ] && [ "$took" -lt 30 ] && sleeper_gone && [ "$(pack_count "$TF")" = "$TF_PC" ] && [ "$(history "$TF")" = "$TF_H" ] && git --git-dir="$TF/.git" fsck --strict >/dev/null 2>&1; } \
+XF="$WORK/s40-tf"; tailrepo "$XF" 4; XF_PC="$(pack_count "$XF")"; XF_H="$(history "$XF")"; rm -f "$WORK/state.json" "$WORK/log"; T0="$(date +%s)"
+out="$(ROOM_ACT=swap trun "$XF")"; rc=$?; took=$(( $(date +%s) - T0 ))
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "aborted" ] && [ "$took" -lt 30 ] && sleeper_gone && [ "$(pack_count "$XF")" = "$XF_PC" ] && [ "$(history "$XF")" = "$XF_H" ] && git --git-dir="$XF/.git" fsck --strict >/dev/null 2>&1; } \
   && ok "F. swap 1000 -> 3000000KiB during the tight pass: stopped by the watchdog in ${took}s, status aborted, exit 1, the hung process is gone, repo untouched" || bad "F. swap growth handled wrong (rc=$rc status=$(last_status) took=${took}s): $out"
 printf '%s' "$out" | grep -q 'WATCHDOG' && printf '%s' "$out" | grep -qi 'swap in use grew' && ok "F. the log names the watchdog and the swap" || bad "F. no watchdog line naming the swap: $out"
-TF_CUT="$(state_field "$TF" room_cut_epoch)"; TF_CAP="$(state_field "$TF" tail_objects)"
-{ [ "$TF_CUT" -ge "$T0" ] 2>/dev/null && [ "$TF_CAP" = 15 ] && [ "$(state_field "$TF" bad_streak)" = 1 ]; } \
-  && ok "F. state: cut time recorded (room_cut_epoch, the backoff the room pass keeps), object cap halved to its floor (tail_objects=15), bad_streak 1" || bad "F. state wrong: room_cut_epoch=$TF_CUT tail_objects=$TF_CAP bad_streak=$(state_field "$TF" bad_streak)"
-out="$(trun "$TF")"; rc=$?
-{ [ "$rc" -eq 1 ] && [ ! -e "$WORK/room-args" ] && [ "$(pack_count "$TF")" = "$TF_PC" ] && [ "$(last_status)" = "skipped-low-disk" ] && printf '%s' "$out" | grep -q 'backing off'; } \
-  && ok "F. right after the cut: no repack, skipped-low-disk (the old answer), the log says it is backing off" || bad "F. no backoff after a cut (rc=$rc status=$(last_status) packs=$(pack_count "$TF")): $out"
-[ "$(state_field "$TF" room_cut_epoch)" = "$TF_CUT" ] && [ "$(state_field "$TF" tail_objects)" = 15 ] && ok "F. a run that did not try keeps the remembered cut time and cap" || bad "F. the backoff run changed the state"
-jq --arg r "$TF" '.[$r].room_cut_epoch = ((now | floor) - 10000)' "$WORK/state.json" > "$WORK/state.new" && mv "$WORK/state.new" "$WORK/state.json"
-out="$(trun "$TF")"; rc=$?
-{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$TF")" -lt "$TF_PC" ] && [ -s "$WORK/room-args" ] && [ "$(state_field "$TF" room_cut_epoch)" = 0 ]; } \
-  && ok "F. after the backoff the pass runs again and succeeds (packs $TF_PC -> $(pack_count "$TF")), the cut time is cleared" || bad "F. retry after the backoff wrong (rc=$rc status=$(last_status) packs=$(pack_count "$TF") cut=$(state_field "$TF" room_cut_epoch)): $out"
+XF_CUT="$(state_field "$XF" room_cut_epoch)"; XF_CAP="$(state_field "$XF" tail_objects)"
+{ [ "$XF_CUT" -ge "$T0" ] 2>/dev/null && [ "$XF_CAP" = 15 ] && [ "$(state_field "$XF" bad_streak)" = 1 ]; } \
+  && ok "F. state: cut time recorded (room_cut_epoch, the backoff the room pass keeps), object cap halved to its floor (tail_objects=15), bad_streak 1" || bad "F. state wrong: room_cut_epoch=$XF_CUT tail_objects=$XF_CAP bad_streak=$(state_field "$XF" bad_streak)"
+out="$(trun "$XF")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ ! -e "$WORK/room-args" ] && [ "$(pack_count "$XF")" = "$XF_PC" ] && [ "$(last_status)" = "skipped-low-disk" ] && printf '%s' "$out" | grep -q 'backing off'; } \
+  && ok "F. right after the cut: no repack, skipped-low-disk (the old answer), the log says it is backing off" || bad "F. no backoff after a cut (rc=$rc status=$(last_status) packs=$(pack_count "$XF")): $out"
+[ "$(state_field "$XF" room_cut_epoch)" = "$XF_CUT" ] && [ "$(state_field "$XF" tail_objects)" = 15 ] && ok "F. a run that did not try keeps the remembered cut time and cap" || bad "F. the backoff run changed the state"
+jq --arg r "$XF" '.[$r].room_cut_epoch = ((now | floor) - 10000)' "$WORK/state.json" > "$WORK/state.new" && mv "$WORK/state.new" "$WORK/state.json"
+out="$(trun "$XF")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$XF")" -lt "$XF_PC" ] && [ -s "$WORK/room-args" ] && [ "$(state_field "$XF" room_cut_epoch)" = 0 ]; } \
+  && ok "F. after the backoff the pass runs again and succeeds (packs $XF_PC -> $(pack_count "$XF")), the cut time is cleared" || bad "F. retry after the backoff wrong (rc=$rc status=$(last_status) packs=$(pack_count "$XF") cut=$(state_field "$XF" room_cut_epoch)): $out"
 # G. free disk falls under the tight floor while the pass runs
-TG="$WORK/tg"; tailrepo "$TG" 4; TG_PC="$(pack_count "$TG")"; rm -f "$WORK/state.json" "$WORK/log"
-out="$(TFREEFILE=1 ROOM_ACT=free trun "$TG")"; rc=$?
-{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "aborted" ] && sleeper_gone && [ "$(pack_count "$TG")" = "$TG_PC" ] && printf '%s' "$out" | grep -q 'free disk fell'; } \
+XG="$WORK/s40-tg"; tailrepo "$XG" 4; XG_PC="$(pack_count "$XG")"; rm -f "$WORK/state.json" "$WORK/log"
+out="$(TFREEFILE=1 ROOM_ACT=free trun "$XG")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "aborted" ] && sleeper_gone && [ "$(pack_count "$XG")" = "$XG_PC" ] && printf '%s' "$out" | grep -q 'free disk fell'; } \
   && ok "G. free disk 1000KiB (< the 1GiB tight floor) during the pass: stopped, aborted, the log names the free disk" || bad "G. free-disk drop handled wrong (rc=$rc status=$(last_status)): $out"
+# E. nothing of the tight road leaks into the NEXT repo of the same run: a second repo with a loose backlog is batched by tier 1 with git's ordinary pack.* settings (no 128m window) and UNWATCHED — the stand-in
+# below makes the swap "grow" during every batch, which a watchdog left switched on would take for a reason to kill it
+cat > "$WORK/git-logall" <<EOF
+#!/bin/bash
+printf '%s\n' "\$*" >> "$WORK/all-args"
+case " \$* " in *" maintenance run "*) printf '%s\n' 3000000 > "$WORK/swap-used"; sleep 1 ;; esac
+exec "$WORK/git-room" "\$@"
+EOF
+chmod +x "$WORK/git-logall"
+TE1="$WORK/s40-te1"; tailrepo "$TE1" 4; TE2="$WORK/s40-te2"; mkrepo "$TE2" 20; TE1_PC="$(pack_count "$TE1")"; TE2_LOOSE="$(loose_count "$TE2")"; rm -f "$WORK/state.json" "$WORK/log" "$WORK/all-args"
+out="$(TGIT="$WORK/git-logall" trun "$TE1 $TE2")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(pack_count "$TE1")" -lt "$TE1_PC" ] && [ "$TE2_LOOSE" -gt 0 ] && [ "$(loose_count "$TE2")" = 0 ] && [ "$(last_status)" = "packed-loose" ]; } \
+  && ok "E. repo 1 on the tight road (packs $TE1_PC -> $(pack_count "$TE1")), repo 2 drained by tier 1 afterwards ($TE2_LOOSE -> $(loose_count "$TE2") loose, status packed-loose): the watchdog was switched off again" || bad "E. second repo of the run handled wrong (rc=$rc te1 packs=$(pack_count "$TE1") te2 loose=$(loose_count "$TE2") status=$(last_status)): $out"
+{ grep -q 'maintenance run' "$WORK/all-args" && ! grep 'maintenance run' "$WORK/all-args" | grep -q 'pack.windowMemory=128m'; } \
+  && ok "E. the batches of repo 2 ran with git's ordinary pack.* settings — the lean ones were put back after the tight pass" || bad "E. lean pack.* settings leaked into the next repo's batches: $(grep 'maintenance run' "$WORK/all-args" | head -n 1)"
 # H. THE MEASUREMENT the bead asks for: 9 backups in a row on a tight disk, each a new batch pack followed by one compaction run. Without the road (JAC_TAIL_TIGHT=0, which is what the mini had) every backup is a
 # seed that stays; with it the seeds are folded back as they arrive, in passes the disk can carry.
 tight_growth() {  # tight_growth <dir> <0|1> — prints "<size-pack KiB> <commits> <fsck ok|FSCK FAILED> <hash of the commit subjects>"
@@ -2479,9 +2524,9 @@ tight_growth() {  # tight_growth <dir> <0|1> — prints "<size-pack KiB> <commit
   f="fsck ok"; git --git-dir="$d/.git" fsck --strict >/dev/null 2>&1 || f="FSCK FAILED"
   echo "$(pack_kib "$d") $(commits "$d") $f $(git --git-dir="$d/.git" log --format=%s | shasum | cut -d' ' -f1)"
 }
-TH0="$WORK/th0"; tailrepo "$TH0" 0; TH_BASE="$(pack_kib "$TH0")"
-read -r TH_OFF_KIB TH_OFF_N TH_OFF_F1 TH_OFF_F2 TH_OFF_H <<<"$(tight_growth "$WORK/th-off" 0)"; TH_OFF_F="$TH_OFF_F1 $TH_OFF_F2"
-read -r TH_ON_KIB TH_ON_N TH_ON_F1 TH_ON_F2 TH_ON_H <<<"$(tight_growth "$WORK/th-on" 1)"; TH_ON_F="$TH_ON_F1 $TH_ON_F2"
+TH0="$WORK/s40-th0"; tailrepo "$TH0" 0; TH_BASE="$(pack_kib "$TH0")"
+read -r TH_OFF_KIB TH_OFF_N TH_OFF_F1 TH_OFF_F2 TH_OFF_H <<<"$(tight_growth "$WORK/s40-th-off" 0)"; TH_OFF_F="$TH_OFF_F1 $TH_OFF_F2"
+read -r TH_ON_KIB TH_ON_N TH_ON_F1 TH_ON_F2 TH_ON_H <<<"$(tight_growth "$WORK/s40-th-on" 1)"; TH_ON_F="$TH_ON_F1 $TH_ON_F2"
 rm -f "$WORK/gc-calls"      # the runs without the road end BAD 9 times in a row: the alarm mail went to the stub, which later sections must not count
 G_OFF=$(( TH_OFF_KIB - TH_BASE )); G_ON=$(( TH_ON_KIB - TH_BASE ))
 { [ "$G_OFF" -gt 0 ] && [ $(( G_ON * 100 )) -le $(( G_OFF * 60 )) ]; } \
