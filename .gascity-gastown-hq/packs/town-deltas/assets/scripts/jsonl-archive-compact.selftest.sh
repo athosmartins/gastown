@@ -2393,7 +2393,7 @@ echo "=== S40: the TIGHT-DISK TAIL — a disk at the floor is not a deadlock: wh
 # 24/10: packs/maintenance/jsonl-archive was 8.3GB in 9 packs — one of 6.7GB and eight of 150-224MB, the eight all made on 23/10 (1.4GB/day) — because every tier that could merge them said no to the disk. Each batch pack carries its own
 # first copy ("seed") of every giant file; the tail pass (tier 2a) turns N seeds into one, but asks for free >= the packs + a quarter of the loose bytes + 512MiB + (Dolt's CRITICAL class + 1) GiB — ~5GB for two packs of 200MB —
 # and the mini lives at 3-4.7GB; the gc and the room pass ask for more and run only at night. Nothing consolidated, the archive grew, the disk stayed at the floor: a loop. The tight road is the tail pass again, SMALLER: the
-# packs it planned whose bytes fit over TAIL_TIGHT_FLOOR_GB (Dolt's CRITICAL line, 1GiB under the comfortable rule's floor), at least two, with the room pass's lean pack.* settings under its watchdog (free disk, swap, lost readings).
+# packs it planned whose bytes fit over TAIL_TIGHT_FLOOR_GB (DOLT_DISK_FLOOR_CRITICAL_GB itself, 1GiB under the 4GiB where the guard's CRITICAL class begins), at least two, with the room pass's lean pack.* settings under its watchdog (free disk, swap, lost readings).
 # Fixture: the S36 repo (a base pack + N batch packs of ~125KiB, 3 objects each), Dolt's CRITICAL class 1GiB (T_CRIT=1, so the comfortable rule wants 2GiB free), the tight floor 1GiB, and free = floor + TAVAIL KiB: TAVAIL is the room
 # the tight pass may use. By day (12h) unless a test says otherwise: the tail pass was never gated on the window.
 TFLOOR=1048576
@@ -2470,9 +2470,9 @@ TB6="$WORK/s40-tb6"; tailrepo "$TB6" 4; TB6_PC="$(pack_count "$TB6")"; rm -f "$W
 out="$(PATH="$WORK/jqshim-tight:$PATH" trun "$TB6")"; rc=$?
 { [ "$rc" -eq 1 ] && [ "$(last_status)" = "skipped-low-disk" ] && [ ! -e "$WORK/room-args" ] && [ "$(pack_count "$TB6")" = "$TB6_PC" ] && printf '%s' "$out" | grep -q 'remembered cut time of .* could not be read'; } \
   && ok "C5. the remembered cut time cannot be read: no repack, skipped-low-disk, the log names the read" || bad "C5. unreadable cut time handled wrong (rc=$rc status=$(last_status) packs=$(pack_count "$TB6")): $out"
-# D. the road is OFF (JAC_TAIL_TIGHT=0), its floor is not a number, or swap cannot be read: the old answer, with the reason — and nothing repacked (a pass that cannot be watched is never started)
+# D. the road is OFF (JAC_TAIL_TIGHT=0), its floor is not a number or is under 1GiB (the ENOSPC zone of 17/10), or swap cannot be read: the old answer, with the reason — and nothing repacked (a pass that cannot be watched is never started)
 TD1="$WORK/s40-td1"; tailrepo "$TD1" 4; TD1_PC="$(pack_count "$TD1")"
-for dcase in "off|TTIGHT=0|tight-disk road is off" "floor|TFLOORGB=abc|is not a whole number" "swap|TSWAP0=none|swap in use cannot be read"; do
+for dcase in "off|TTIGHT=0|tight-disk road is off" "floor|TFLOORGB=abc|is not a whole number" "zero|TFLOORGB=0|is under 1GiB" "swap|TSWAP0=none|swap in use cannot be read"; do
   DN="${dcase%%|*}"; DREST="${dcase#*|}"; DENV="${DREST%%|*}"; DWHY="${DREST#*|}"; rm -f "$WORK/state.json" "$WORK/log"
   out="$(eval "$DENV trun \"\$TD1\"")"; rc=$?
   { [ "$rc" -eq 1 ] && [ "$(last_status)" = "skipped-low-disk" ] && [ ! -e "$WORK/room-args" ] && [ "$(pack_count "$TD1")" = "$TD1_PC" ] && printf '%s' "$out" | grep -q "$DWHY"; } \
@@ -2534,8 +2534,8 @@ G_OFF=$(( TH_OFF_KIB - TH_BASE )); G_ON=$(( TH_ON_KIB - TH_BASE ))
   || bad "H. growth with the tight road (${G_ON}KiB) is not below 60% of the growth without it (${G_OFF}KiB)"
 { [ "$TH_OFF_N" = "$TH_ON_N" ] && [ "$TH_OFF_N" = 18 ] && [ "$TH_OFF_H" = "$TH_ON_H" ] && [ "$TH_ON_F" = "fsck ok" ] && [ "$TH_OFF_F" = "fsck ok" ]; } \
   && ok "H. no commit lost: $TH_ON_N commits in both runs (8 + ballast + 9 backups), the same subjects, fsck --strict clean" || bad "H. commits differ or fsck failed: off=$TH_OFF_N/$TH_OFF_F on=$TH_ON_N/$TH_ON_F"
-# I. the settings are visible, and the floor follows Dolt's CRITICAL line unless it is set
-"$SCRIPT" --print-config | grep -q 'tail_tight=1 tail_tight_floor_gb=3' && ok "I. --print-config shows the tight road on, floor 3GiB (= Dolt's CRITICAL line, the default)" || bad "I. tail_tight missing from --print-config"
+# I. the settings are visible, and the floor follows DOLT_DISK_FLOOR_CRITICAL_GB unless it is set
+"$SCRIPT" --print-config | grep -q 'tail_tight=1 tail_tight_floor_gb=3' && ok "I. --print-config shows the tight road on, floor 3GiB (= DOLT_DISK_FLOOR_CRITICAL_GB, the default)" || bad "I. tail_tight missing from --print-config"
 DOLT_DISK_FLOOR_CRITICAL_GB=5 "$SCRIPT" --print-config | grep -q 'tail_tight_floor_gb=5' && JAC_TAIL_TIGHT_FLOOR_GB=2 DOLT_DISK_FLOOR_CRITICAL_GB=5 "$SCRIPT" --print-config | grep -q 'tail_tight_floor_gb=2' \
   && ok "I. the floor follows DOLT_DISK_FLOOR_CRITICAL_GB (5 -> 5) and JAC_TAIL_TIGHT_FLOOR_GB overrides it (2)" || bad "I. the tight floor does not follow Dolt's variable"
 unset JAC_WATCH_FREE_FILE JAC_SWAP_USED_FILE
