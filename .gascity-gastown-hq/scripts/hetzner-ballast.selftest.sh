@@ -22,8 +22,10 @@
 #     timeout do GNU, leva KILL; sobrevivente → rc 5 `survivors`; tabela ilegível depois do TERM → rc 5 `unverified`, sem KILL às cegas) · `status` diz o estado sem gravar.
 #   estado (g_state): state.json corrompido vai para o lado e recomeça sem duplicar o que já roda (o processo é a fonte da verdade) · ilegível por permissão = inerte (rc 3).
 #   lançamento (g_launch): prefixo nice 19 + SCHED_IDLE + ionice idle + timeout -k, com o que existir no PATH; sem `timeout` o item não começa.
+#   sinais (g_send): send() com um membro da sessão que o runner não pode sinalizar (o bash root do helper do gt-iso-run, item wa-suite): o sinal chega aos outros, inclusive aos que vêm depois do que recusou, sem levantar ·
+#     grupo do líder já sumido (o timeout do GNU muda de grupo) ainda sinaliza os membros · ninguém aceitou o sinal = False, nunca True por ter tentado.
 # CONTROLE NEGATIVO: cada mutante (um trecho do script trocado) TEM que reprovar a bateria.
-# VARIÁVEIS: HB_UNDER_TEST (script a testar) · HB_PY (interpretador; padrão /usr/bin/python3) · HB_NO_MUTANTS=1 · HB_ONLY=<grupo> (reg tick run ram reap fill off state logs launch; sem mutantes)
+# VARIÁVEIS: HB_UNDER_TEST (script a testar) · HB_PY (interpretador; padrão /usr/bin/python3) · HB_NO_MUTANTS=1 · HB_ONLY=<grupo> (reg tick run ram reap fill off state logs launch send; sem mutantes)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 P="${HB_UNDER_TEST:-$HERE/hetzner-ballast.py}"
@@ -550,9 +552,49 @@ g_launch() {
   kill -9 -- "-$(started_pid)" 2>/dev/null
 }
 
-if [ -n "${HB_MUTANT:-}" ]; then g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
+# ── g_send ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# send() com um membro da sessão que o runner NÃO pode sinalizar (ga-2hd02v.8). O item wa-suite roda sob `sudo -n gt-netns-run` e o bash do helper é root; medido no nó em 24/10, ele é o ÚNICO membro
+# root da sessão (a carga roda com o uid do runner: setpriv --reuid). O sinal tem que chegar a todos os outros, sem levantar e sem parar no que recusou. kill/killpg são de mentira: root de verdade não cabe aqui.
+g_send() {
+  local o
+  o=$("$PY" -I - "$P" <<'PYEOF'
+import importlib.util, os, signal, sys
+spec = importlib.util.spec_from_file_location("hb", sys.argv[1]); hb = importlib.util.module_from_spec(spec); spec.loader.exec_module(hb)
+LEADER, ROOT, A, GONE, B = 100, 101, 102, 103, 104   # B vem DEPOIS do que recusa: parar no primeiro EPERM o deixaria sem o sinal
+def run(pg_exc, members, refuse=(), gone=()):
+    att = []
+    def killpg(pg, sig):
+        if pg_exc is not None:
+            raise pg_exc
+    def kill(pid, sig):
+        att.append(pid)
+        if pid in refuse:
+            raise PermissionError(1, "Operation not permitted")
+        if pid in gone:
+            raise ProcessLookupError(3, "No such process")
+    os.killpg, os.kill = killpg, kill
+    try:
+        res = hb.send({"pid": LEADER, "members": members}, signal.SIGSTOP)
+    except BaseException as e:
+        return "levantou:%s" % type(e).__name__
+    return "%s tentou=%s" % (res, ",".join(map(str, att)))
+print("1", run(None, [A, ROOT, GONE, B], refuse={ROOT}, gone={GONE}))
+print("2", run(ProcessLookupError(3, "x"), [A, B]))
+print("3", run(ProcessLookupError(3, "x"), [ROOT], refuse={ROOT}))
+print("4", run(PermissionError(1, "x"), [ROOT], refuse={ROOT}))
+print("5", run(ProcessLookupError(3, "x"), [GONE], gone={GONE}))
+PYEOF
+)
+  check "send: grupo aceita, um membro root recusa (EPERM) e um sumiu → o sinal é tentado em TODOS, também no que vem DEPOIS do que recusou, sem levantar; hit True" "True tentou=102,101,103,104" "$(printf '%s\n' "$o" | sed -n 's/^1 //p')"
+  check "send: o grupo do líder já não existe (o timeout do GNU muda de grupo) → os membros ainda recebem o sinal" "True tentou=102,104" "$(printf '%s\n' "$o" | sed -n 's/^2 //p')"
+  check "send: ninguém aceitou o sinal (grupo vazio e o único membro recusa) → False, nunca True por ter tentado" "False tentou=101" "$(printf '%s\n' "$o" | sed -n 's/^3 //p')"
+  check "send: o grupo inteiro recusa (EPERM no killpg) → False e não levanta" "False" "$(printf '%s\n' "$o" | sed -n 's/^4 //p' | awk '{print $1}')"
+  check "send: nada existe mais (grupo e membros sumidos) → False e não levanta" "False tentou=103" "$(printf '%s\n' "$o" | sed -n 's/^5 //p')"
+}
+
+if [ -n "${HB_MUTANT:-}" ]; then g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
 if [ -n "${HB_ONLY:-}" ]; then "g_$HB_ONLY"; echo "── $((n - fails))/$n ok (só g_$HB_ONLY)"; [ "$fails" = 0 ]; exit $?; fi
-g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch
+g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send
 
 [ -n "${HB_NO_MUTANTS:-}" ] || {
   echo "── controle negativo: cada mutante tem que reprovar a bateria ──"
@@ -677,6 +719,33 @@ nome do item pela pasta tira todo número final@@r"-[0-9]{9,}(-[0-9]+)?$"@@r"-[0
 meminfo ilegível derruba também a leitura dos processos (leituras juntas)@@        procs, unf, run = current_runs(cfg)@@        if bad:
             raise Unreadable("juntas")
         procs, unf, run = current_runs(cfg)
+send não tolera o membro que recusa o sinal (o EPERM do bash root do helper derruba o resto)@@        except (ProcessLookupError, PermissionError):
+            pass
+    return hit@@        except ProcessLookupError:
+            pass
+    return hit
+send para no primeiro membro que recusa (os de depois ficam sem o sinal)@@        except (ProcessLookupError, PermissionError):
+            pass
+    return hit@@        except (ProcessLookupError, PermissionError):
+            break
+    return hit
+send conta como sinalizado o membro que recusou@@        except (ProcessLookupError, PermissionError):
+            pass
+    return hit@@        except (ProcessLookupError, PermissionError):
+            hit = True
+    return hit
+send só sinaliza o grupo do líder (o timeout do GNU muda de grupo e fica de fora)@@    for m in r["members"]:
+        try:
+            os.kill(m, sig)@@    for m in []:
+        try:
+            os.kill(m, sig)
+send desiste dos membros quando o grupo do líder já não existe@@    except ProcessLookupError:
+        pass
+    except PermissionError:
+        return False@@    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return False
 MUT
   "$PY" -I - "$P" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import re, sys
