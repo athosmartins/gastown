@@ -1575,3 +1575,106 @@ def test_the_reader_looks_where_the_pilot_sources_the_list_from(monkeypatch):
     assert got.is_file(), got
     pilot_src = (assets / "pilot-dispatcher.sh").read_text(encoding="utf-8")
     assert '/scripts/pool-probe-vetoes.sh"' in pilot_src, "the Pilot no longer sources the list from scripts/ beside itself"
+
+
+# ── ga-9lcp7m: a bead that was BLOCKED waits from the release, not from the approval ─────────────────
+# The _process_store wiring of approved-state-reconciler.py is covered end to end by its --selftest
+# (scenarios ga-9lcp7m-a..i); these are the pure reads under it, with the failure injected: `bd show` not answering, answering garbage, answering
+# for another bead, a closed blocker without a readable closed_at. Every one of them has to land in
+# "unknown" (None) — never in "no dependency" ([]) or "released long ago" (an old epoch), because the
+# caller turns unknown into "no alarm this cycle" and a made-up release time into a false verdict.
+
+def _bd_show_stub(monkeypatch, *, rc=0, stdout="", none=False):
+    seen = []
+
+    def _fake(args, timeout=20):
+        seen.append(args)
+        return None if none else subprocess.CompletedProcess(args, rc, stdout, "")
+    monkeypatch.setattr(asr, "_bd_blocker_rows", None)
+    monkeypatch.setattr(asr, "_sh", _fake)
+    return seen
+
+
+def _closed_row(dep_id, closed_at, dtype="blocks"):
+    return {"id": dep_id, "status": "closed", "closed_at": closed_at, "dependency_type": dtype}
+
+
+def test_blocker_rows_returns_the_dependency_rows_bd_show_expands(monkeypatch):
+    rows = [_closed_row("wa-d1", "2026-10-24T03:45:42Z")]
+    seen = _bd_show_stub(monkeypatch, stdout=json.dumps([{"id": "wa-b", "dependencies": rows}]))
+    assert asr._blocker_rows("/rig", "wa-b") == rows
+    assert seen[0][-3:] == ["show", "wa-b", "--json"]
+
+
+def test_blocker_rows_no_dependency_rows_is_empty_not_unknown(monkeypatch):
+    _bd_show_stub(monkeypatch, stdout=json.dumps([{"id": "wa-b"}]))
+    assert asr._blocker_rows("/rig", "wa-b") == []
+
+
+@pytest.mark.parametrize("what,kw", [
+    ("bd exits non-zero", dict(rc=1, stdout="")),
+    ("bd cannot be run (timeout / no process)", dict(none=True)),
+    ("stdout is not JSON", dict(stdout="Dolt server unreachable")),
+    ("stdout is empty", dict(stdout="")),
+    ("JSON is corrupt mid-way", dict(stdout='[{"id": "wa-b", "dependencies": [')),
+    ("error envelope instead of the bead", dict(stdout=json.dumps({"error": "boom"}))),
+    ("payload of ANOTHER bead", dict(stdout=json.dumps([{"id": "wa-other", "dependencies": []}]))),
+    ("dependencies is not a list", dict(stdout=json.dumps([{"id": "wa-b", "dependencies": "wa-d1"}]))),
+])
+def test_blocker_rows_failure_is_unknown_never_empty(monkeypatch, what, kw):
+    _bd_show_stub(monkeypatch, **kw)
+    assert asr._blocker_rows("/rig", "wa-b") is None, what
+
+
+def _bead_with(*dep_pairs):
+    return {"id": "wa-b", "dependencies": [
+        {"issue_id": "wa-b", "depends_on_id": d, "type": t} for d, t in dep_pairs]}
+
+
+def test_release_epoch_is_the_last_blocker_to_close_and_ignores_parent_child(monkeypatch):
+    monkeypatch.setattr(asr, "_blocker_rows", lambda root, bid: [
+        _closed_row("wa-d1", "2026-10-22T23:01:43Z"),
+        _closed_row("wa-d2", "2026-10-24T03:45:42Z"),
+        _closed_row("wa-epic", "2026-10-24T09:00:00Z", dtype="parent-child"),
+    ])
+    bead = _bead_with(("wa-d1", "blocks"), ("wa-d2", "blocks"), ("wa-epic", "parent-child"))
+    assert asr._blockers_release_epoch("/rig", bead, 1_792_820_000.0) == (1_792_813_542.0, "wa-d2")
+
+
+def test_release_epoch_no_blocking_dependency_means_no_floor_and_no_bd_show(monkeypatch):
+    def _boom(root, bid):
+        raise AssertionError("bd show spent on a bead with no blocking dependency")
+    monkeypatch.setattr(asr, "_blocker_rows", _boom)
+    assert asr._blockers_release_epoch("/rig", {"id": "wa-b"}, 1.0)[0] == 0.0
+    assert asr._blockers_release_epoch("/rig", _bead_with(("wa-epic", "parent-child")), 1.0)[0] == 0.0
+
+
+@pytest.mark.parametrize("what,rows", [
+    ("rows unreadable", None),
+    ("declared blocker missing from the rows", []),
+    ("closed blocker without closed_at", [{"id": "wa-d1", "status": "closed", "dependency_type": "blocks"}]),
+    ("closed_at is garbage", [_closed_row("wa-d1", "ontem")]),
+    ("closed_at is in the future", [_closed_row("wa-d1", "2026-10-25T03:45:42Z")]),
+])
+def test_release_epoch_that_cannot_be_told_is_unknown_not_zero(monkeypatch, what, rows):
+    monkeypatch.setattr(asr, "_blocker_rows", lambda root, bid: rows)
+    epoch, why = asr._blockers_release_epoch("/rig", _bead_with(("wa-d1", "blocks")), 1_792_813_542.0)
+    assert epoch is None and why, what
+
+
+@pytest.mark.parametrize("deps", [["wa-d1"], "wa-d1", [None]])
+def test_release_epoch_malformed_dependency_list_is_unknown(monkeypatch, deps):
+    monkeypatch.setattr(asr, "_blocker_rows", lambda root, bid: [_closed_row("wa-d1", "2026-10-24T03:45:42Z")])
+    assert asr._blockers_release_epoch("/rig", {"id": "wa-b", "dependencies": deps}, 1_792_820_000.0)[0] is None
+
+
+@pytest.mark.parametrize("raw", [
+    "2026-10-24T03:45:42Z", "2026-10-24T03:45:42.123456789Z", "2026-10-24T03:45:42.5Z",
+    "2026-10-24T03:45:42", "2026-10-24 03:45:42", "2026-10-24T00:45:42-03:00", " 2026-10-24T03:45:42Z "])
+def test_utc_epoch_reads_what_bd_writes_on_any_python(raw):
+    assert asr._utc_epoch(raw) == 1_792_813_542.0
+
+
+@pytest.mark.parametrize("raw", ["", "   ", None, 0, "ontem", "2026-13-40T99:99:99Z", "2026-10-24", "1792813542"])
+def test_utc_epoch_refuses_what_is_not_a_timestamp(raw):
+    assert asr._utc_epoch(raw) is None
