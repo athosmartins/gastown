@@ -18,11 +18,13 @@
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 export MBP_GUARD_UNDER_TEST="${MBP_GUARD_UNDER_TEST:-$HERE/inflight-reclaim-guard.py}"
+export MBP_HERE="$HERE"
 [ -f "$MBP_GUARD_UNDER_TEST" ] || { echo "FATAL: guard ausente: $MBP_GUARD_UNDER_TEST"; exit 2; }
 
 python3 -I - <<'PY'
-import copy, datetime, importlib.util, os, sys, time as _real_time
+import copy, datetime, importlib.util, os, subprocess, sys, time as _real_time
 
+REAL_RUN = subprocess.run   # o do_reclaim abaixo roda com `subprocess.run` trocado por um falso (o módulo é o mesmo): o executor de mutantes usa este
 GUARD = os.environ["MBP_GUARD_UNDER_TEST"]
 spec = importlib.util.spec_from_file_location("irg_mbp_under_test", GUARD)
 g = importlib.util.module_from_spec(spec)
@@ -246,6 +248,13 @@ check("do_reclaim: a marca sai DEPOIS de o dono sair", 0 <= i_assign < i_unset, 
 calls.clear()
 real.do_reclaim("wa-t1", "t", 0, 30.0, ["story:in-flight", "pilot:dispatched"])
 check("do_reclaim sem unset_metadata não mexe em metadata (as outras beads não mudam)", not [c for c in calls if "--unset-metadata" in c], "chamadas=%r" % calls)
+
+# ── O executor de mutantes lê o guard: arquivo que não abre é FATAL rc 2, nunca "0 mutantes, todos mortos".
+runner = os.path.join(os.environ["MBP_HERE"], "inflight-reclaim-guard.mbp.mutants.py")
+r = REAL_RUN([sys.executable, "-I", runner], env=dict(os.environ, MBP_MUTANTS_GUARD="/nonexistent/inflight-reclaim-guard.py"),
+             capture_output=True, text=True, timeout=60)
+check("executor de mutantes (inflight-reclaim-guard.mbp.mutants.py): guard que não abre = FATAL rc 2, sem 'MUTANTES:'",
+      r.returncode == 2 and "FATAL" in r.stdout and "MUTANTES:" not in r.stdout, "rc=%d saída=%r" % (r.returncode, r.stdout[:120]))
 
 print("RESULT: %d passed, %d failed" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
