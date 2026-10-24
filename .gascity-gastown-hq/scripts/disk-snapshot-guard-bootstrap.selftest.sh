@@ -328,13 +328,15 @@ core() {
   expect_out "RESULTADO: instalado e confirmado" "backoff, mesmo pin: no fim da espera o instalador roda"
   if [ ! -e "$STATE" ]; then ok "backoff, mesmo pin: o sucesso apaga o registro"; else bad "backoff, mesmo pin: o registro sobrou" "$(cat "$STATE")"; fi
   # registro que o root não pode confiar (ou que não é nosso) é IGNORADO: o instalador tenta
-  for variant in gravavel lixo futuro outro-pin; do
+  for variant in gravavel lixo futuro outro-pin ilegivel; do
     new_world; fake_installer 'echo "ERRO: falha de teste"; exit 1'; P16=$(pin16)
     case "$variant" in
       (gravavel)  printf '%s 1 %s\n' "$P16" 1001000 > "$STATE"; chmod 0666 "$STATE" ;;
       (lixo)      printf 'isto nao e um registro\n' > "$STATE"; chmod 0644 "$STATE" ;;
       (futuro)    printf '%s 1 %s\n' "$P16" 99999999999 > "$STATE"; chmod 0644 "$STATE" ;;
       (outro-pin) printf '0123456789abcdef 1 %s\n' 1001000 > "$STATE"; chmod 0644 "$STATE" ;;
+      # registro válido que ADIARIA a tentativa (retry em 1001000, agora 1000000), mas do root e sem leitura (modo 0000): o read falha → sem registro → tenta já
+      (ilegivel)  printf '%s 1 %s\n' "$P16" 1001000 > "$STATE"; chmod 0000 "$STATE" ;;
     esac
     run_guard DSG_NOW=1000000
     if [ "$(n_inst)" = "1" ]; then ok "backoff: registro '$variant' é ignorado e o instalador tenta"; else bad "backoff: registro '$variant' adiou a tentativa (chamadas=$(n_inst))"; fi
