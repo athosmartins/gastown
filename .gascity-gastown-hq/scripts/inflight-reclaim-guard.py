@@ -774,6 +774,46 @@ def _is_ephemeral_pool_assignee(assignee):
     return False
 
 
+# ga-w7qwl1.2.3 (corte 3 do MBP): a bead cujo dono é um alias do MBP (wa-worker-remote-mbp-1..9, o que `mbp-node-dispatch.sh apply` escreve; o `release` aceita o mesmo 1..9).
+# Num notebook os dois sinais de vida que o guard lê mentem sem a sessão ter morrido: tampa fechada ou wifi trocando de rede (o `is-running` sai com erro, o engine o lê como "parou" e o roster
+# mostra asleep; `get-last-activity` e o peek também falham), o Athos de volta com a árvore rebaixada quieta por uma hora (last_active velho com o roster active). Tratada como a sessão de um
+# servidor, a bead era reclamada no mini com a sessão do MBP ainda dona dela (dois construtores quando a tampa abre). Por isso aqui só há DOIS estados, nunca "morta por falta de sinal":
+#   hold  o engine ainda tem uma sessão desse alias (viva, quieta, dormindo, em quarentena: não sei) → a bead SEGURA, sem reclaim. Segurar não é esquecer: passado o teto sem sair do hold
+#         (RECLAIM_MBP_HOLD_ALERT_SECS, padrão 6 h) sai UM aviso por teto, e quem decide é o Mayor;
+#   gone  o roster NÃO tem sessão alguma desse alias (o engine a fechou) → nada vai acordá-la: a bead segue o reclaim de sempre (histerese de RECLAIM_TTL) e a marca do nó sai junto.
+# Roster vazio não prova nada (mesma regra do claimant_provably_dead): é hold. Depois de um reclaim (`gone`) a sessão do MBP que reaparecesse não deveria conseguir entregar: o gate-done do Hetzner só
+# entrega a bead in_progress com dono = o alias dele (gate-done-remote.py). O gate-done do MBP é do corte 4 e esta fatia NÃO prova isso para ele.
+MBP_NODE_ALIAS_RE = re.compile(r"^wa-worker-remote-mbp-[1-9]$")
+MBP_NODE_MARK_KEYS = ("pilot.wa_node_alias",)   # a marca do modo em que o Pilot abre a sessão do alias (sem gc.routed_to); sobrar depois do reclaim faria a bead parecer atribuída ao MBP
+
+
+def _mbp_hold_alert_secs():
+    """Teto do hold antes do aviso: RECLAIM_MBP_HOLD_ALERT_SECS (padrão 21600 = 6 h). vazio/ausente → padrão; falhou/ilegível (texto, zero, negativo) → o mesmo padrão: erro de digitação nunca cala o aviso."""
+    try:
+        v = int(os.environ.get("RECLAIM_MBP_HOLD_ALERT_SECS", "") or "21600")
+    except ValueError:
+        return 21600
+    return v if v > 0 else 21600
+
+
+def is_mbp_node_alias(assignee):
+    """True sse o dono é um alias de sessão do MBP (wa-worker-remote-mbp-1..9, nome exato)."""
+    return bool(assignee) and bool(MBP_NODE_ALIAS_RE.match(assignee))
+
+
+def mbp_owner_state(assignee, sessions):
+    """None (o dono não é um alias do MBP: as regras de sempre) | "hold" | "gone" — ver o bloco acima. Pura, sem I/O."""
+    if not is_mbp_node_alias(assignee):
+        return None
+    if not sessions:
+        return "hold"   # roster vazio não prova ausência
+    for s in sessions:
+        ids = {s.get("id", ""), s.get("name", ""), s.get("session_name", ""), s.get("alias", ""), s.get("agent_name", "")}
+        if assignee in ids:
+            return "hold"
+    return "gone"
+
+
 # ---------------------------------------------------------------------------
 # Pure decision function (unit-testable, zero side effects)
 # ---------------------------------------------------------------------------
@@ -3238,9 +3278,12 @@ def _close_orphaned_sling(bd_prefix, sling_bead_id, target_bead_id, hold_secs):
 
 def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=None,
                 has_explicit_refusal=False, refusal_count=0, bridge_sources=None,
-                sling_bead_id=None, never_had_owner=False):
+                sling_bead_id=None, never_had_owner=False, unset_metadata=()):
     """Strip story:in-flight (+pilot:dispatched if present), clear assignee,
     bump reclaim label.
+
+    ga-w7qwl1.2.3: unset_metadata = chaves de metadata que saem DEPOIS de o dono sair (passo 2c). Hoje só a marca do nó do MBP (MBP_NODE_MARK_KEYS): sem isto a bead reaberta
+    seguia carregando pilot.wa_node_alias = um alias que já não é dono (dois donos na leitura). Padrão vazio: nenhuma outra bead muda.
 
     ga-oc6knj: never_had_owner=True (from update_never_claimed_flag, via
     run_cycle) means this bead's entire stranded streak had assignee=''
@@ -3397,6 +3440,19 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
     except Exception as exc:
         print(f"[INFLIGHT-RECLAIM] warn: clear assignee {bead_id}: {exc}", flush=True)
         # Non-fatal: Pilot can still re-dispatch without assignee being empty
+
+    # 2c. ga-w7qwl1.2.3: marcas de nó que seguem o dono (pilot.wa_node_alias do MBP). Depois do passo 2b de propósito: com o dono ainda no lugar a marca é o que prova que a bead é do nó.
+    #     Melhor esforço, como o 2b: o bd que falha aqui só deixa a marca velha (o pior caso de antes desta fatia), e o `bd update --unset-metadata` repetido é inofensivo.
+    for _mk in (unset_metadata or ()):
+        try:
+            r = subprocess.run(
+                _bd + ["update", bead_id, "--unset-metadata", _mk, "-q"],
+                capture_output=True, text=True, timeout=15)
+            if r.returncode != 0:
+                print(f"[INFLIGHT-RECLAIM] warn: unset metadata {_mk} on {bead_id} "
+                      f"rc={r.returncode}: {(r.stderr or '').strip()[:200]}", flush=True)
+        except Exception as exc:
+            print(f"[INFLIGHT-RECLAIM] warn: unset metadata {_mk} on {bead_id}: {exc}", flush=True)
 
     # 3. Bump reclaim count label (remove old, add new) — UNLESS this reclaim
     #    is pure queue starvation (ga-oc6knj: never_had_owner), in which case
@@ -4750,6 +4806,12 @@ def run_cycle(state, escalated_alerted):
         # Owner deliberately SUSPENDED → the bead is parked, not stranded. Holds (waits
         # for the crew to resume) instead of re-pooling — the wa-wbub / digo-wa churn.
         has_suspended_owner  = bool(assignee) and assignee in suspended_agents
+        # ga-w7qwl1.2.3: dono = alias do MBP e o engine ainda tem a sessão dele → a bead SEGURA, no mesmo degrau do dono suspenso (reclaim_decision noop, sem fetch de branch, sem relógio de
+        # encalhe, sem caminho rápido de "morto provado"): num notebook "sem sinal" não prova morte (ver mbp_owner_state). Só o alias que o roster NÃO tem (mbp_state == "gone") segue o reclaim.
+        mbp_state = mbp_owner_state(assignee, sessions)
+        has_mbp_hold = mbp_state == "hold"
+        if has_mbp_hold:
+            has_suspended_owner = True
         # ga-64usm: the bead's own last-update age is the secondary progress
         # signal that rescues a stale-activity session whose builder is still
         # touching the bead (workers should bd-update during long work).
@@ -4844,7 +4906,20 @@ def run_cycle(state, escalated_alerted):
             not has_dispatching_marker and
             not has_suspended_owner
         )
-        if has_suspended_owner:
+        # ga-w7qwl1.2.3: o relógio do hold do MBP conta o tempo SEGURA E SEM SESSÃO SAUDÁVEL à vista (has_live_session falso) e vive no estado da bead (sobrevive a reinício do guard). Sessão que volta
+        # a responder (viva e com atividade fresca) ou a bead que sai do alias zera o relógio e o último aviso: uma queda nova recomeça a contagem. Aviso: UM por teto (emit pagina), nunca um por varredura.
+        if has_mbp_hold and not has_live_session:
+            _hold_since = bead_state.setdefault("mbp_hold_since", now)
+            _hold_every = _mbp_hold_alert_secs()
+            if (now - _hold_since) >= _hold_every and (now - bead_state.get("mbp_hold_alerted_at", 0)) >= _hold_every:
+                emit(f"[INFLIGHT-RECLAIM] [MBP-HOLD] bead={bead_id} assignee={assignee!r} segura há {(now - _hold_since) / 3600:.1f}h com o alias do MBP sem sinal confiável — NÃO reclamada "
+                     f"(a sessão pode seguir viva no notebook). O Mayor decide: esperar o notebook ou soltar à mão com `mbp-node-dispatch.sh release {bead_id}` DEPOIS de conferir que a sessão "
+                     f"não existe mais lá; o guard reclama a bead solta no prazo de sempre. title={title!r}")
+                bead_state["mbp_hold_alerted_at"] = now
+        else:
+            bead_state.pop("mbp_hold_since", None)
+            bead_state.pop("mbp_hold_alerted_at", None)
+        if has_suspended_owner and not has_mbp_hold:
             if not bead_state.get("suspended_hold_logged"):
                 print(f"[INFLIGHT-RECLAIM] HOLD (suspended owner): bead={bead_id} "
                       f"assignee={assignee!r} — not re-pooling; waits for crew resume "
@@ -4967,7 +5042,8 @@ def run_cycle(state, escalated_alerted):
             ok = do_reclaim(bead_id, title, reclaim_count, idle_min, labels, rig_root=rig_root,
                              has_explicit_refusal=has_explicit_refusal, refusal_count=refusal_count,
                              bridge_sources=bridge_sources, sling_bead_id=sling_bead_id,
-                             never_had_owner=never_had_owner)
+                             never_had_owner=never_had_owner,
+                             unset_metadata=(MBP_NODE_MARK_KEYS if is_mbp_node_alias(assignee) else ()))
             status = "RECLAIMED" if ok else "RECLAIM-FAILED"
             _refusal_tag = (f" refusal={refusal_count + 1}/{REFUSAL_ESCALATE_THRESHOLD}"
                              if has_explicit_refusal else "")

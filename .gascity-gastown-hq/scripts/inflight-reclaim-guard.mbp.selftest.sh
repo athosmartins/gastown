@@ -63,8 +63,9 @@ class Clock:
 
 
 class World:
-    def __init__(self, alias=ALIAS, mark=True, session=None, mbp_alive=True):
+    def __init__(self, alias=ALIAS, mark=True, session=None, mbp_alive=True, others=True):
         self.now = T0
+        self.others = others            # o roster tem outras sessões da cidade (o normal); sem elas ele está vazio e vazio não prova ausência
         self.bead = {"id": "wa-t1", "title": "bead de teste do MBP", "issue_type": "task", "status": "in_progress",
                      "assignee": alias, "labels": ["story:in-flight", "pilot:dispatched"],
                      "metadata": ({MARK: alias} if mark else {}), "updated_at": iso(T0 - 7200)}
@@ -78,6 +79,9 @@ class World:
 
     def roster(self):
         out = []
+        if self.others:
+            out.append({"id": "s-other", "name": "dog-remote-2", "session_name": "dog-remote-2", "alias": "dog-remote-2",
+                        "template": "dog-remote", "state": "active", "last_active": iso(self.now), "closed": False})
         if self.session is not None:
             out.append({"id": "s-mbp", "name": "wa-worker-remote-mbp-gawisp1", "session_name": "wa-worker-remote-mbp-gawisp1",
                         "alias": self.alias, "template": "wa-worker-remote-mbp", "state": self.session["state"],
@@ -184,6 +188,12 @@ check("T5: UM aviso (não um por varredura) depois de 6 h", len(w.mbp_alerts()) 
 w.run(36)   # mais 6 h (13 h no total)
 check("T5: o segundo aviso só vem um teto depois", len(w.mbp_alerts()) == 2, "avisos=%d" % len(w.mbp_alerts()))
 one_owner(w, "T5", ALIAS)
+
+# ── Roster vazio não prova que a sessão sumiu (a lista veio sem nada, o que também acontece com o engine subindo): segura, como o claimant_provably_dead.
+w = World(session=None, others=False)
+w.run(18)
+check("roster vazio: o guard segura (vazio não prova ausência)", w.reclaims == [], "reclaims=%d" % len(w.reclaims))
+one_owner(w, "roster vazio", ALIAS)
 
 # ── Controles: o tratamento é só do alias do MBP.
 w = World(alias="wa-worker-remote-1", session={"state": "asleep", "age": 3600})
