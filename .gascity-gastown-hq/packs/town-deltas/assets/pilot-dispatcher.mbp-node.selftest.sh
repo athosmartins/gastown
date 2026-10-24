@@ -143,6 +143,7 @@ mkb() {
 mkb "$T/b.free.json" open "" ""
 mkb "$T/b.ap1.json" in_progress wa-worker-remote-mbp-1 wa-worker-remote-mbp-1
 mkb "$T/b.hetz.json" in_progress wa-worker-remote-1 ""
+mkb "$T/b.hz1.json" in_progress wa-worker-remote-1 wa-worker-remote-1   # a forma EXATA que o apply do Hetzner escreve (dono = marca): só o alias separa esta bead de uma do MBP
 mkb "$T/b.mbp.json" in_progress wa-worker-remote-mbp-1 ""
 mkb "$T/b.routed.json" open "" "" "Título X" "$ID" wa-worker-remote
 mkb "$T/b.stamped.json" open "" "" "Título X" "$ID" wa-worker
@@ -291,7 +292,7 @@ for c in 13 124 143 130; do
 done
 reset; r=$(FAKE_APPLY_WRITES=0 D on 13); eq "rc 13 e a bead segue livre: não escreve nada — 2" "$r $(nupd)" "rc=2 0"
 reset; export FAKE_BEAD2="$T/b.foreign.json"; r=$(FAKE_APPLY_WRITES=1 D on 13); eq "rc 13 e a bead é de OUTRO dono: não toca — 2" "$r $(stt) $(nupd)" "rc=2 in_progress,mila-wa,- 0"
-reset; export FAKE_BEAD2="$T/b.hetz.json"; r=$(FAKE_APPLY_WRITES=1 D on 13); eq "rc 13 e a bead é de um alias do HETZNER: não toca — 2" "$r $(nupd)" "rc=2 0"
+reset; export FAKE_BEAD2="$T/b.hz1.json"; r=$(FAKE_APPLY_WRITES=1 D on 13); eq "rc 13 e a bead tem a forma do apply do HETZNER (dono = marca = wa-worker-remote-1): não toca — 2" "$r $(nupd) $(stt)" "rc=2 0 in_progress,wa-worker-remote-1,wa-worker-remote-1"
 reset; mkb "$T/b.y.json" in_progress wa-worker-remote-mbp-1 wa-worker-remote-mbp-2; export FAKE_BEAD2="$T/b.y.json"; r=$(FAKE_APPLY_WRITES=1 D on 13); eq "rc 13 e a marca é de outro alias: não toca — 2" "$r $(nupd)" "rc=2 0"
 reset; r=$(FAKE_APPLY_WRITES=1 FAKE_BD_SHOW_FAIL_FROM=2 D on 13); eq "rc 13 e a releitura falha: não toca — 2" "$r $(nupd)" "rc=2 0"
 reset; r=$(PRE_SLOW=1 D on 0); eq "sessão lenta já gastou o orçamento do sweep: nem escreve — 1" "$r $(ncalls)" "rc=1 0"
