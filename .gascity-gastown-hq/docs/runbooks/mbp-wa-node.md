@@ -52,7 +52,7 @@ Só depois dos cortes 2–4. Ligar é decisão do Mayor (sessão real no MBP) e 
 
 **A regra (só para dono `wa-worker-remote-mbp-1..9`, nome exato).** Só há dois estados, nunca "morta por falta de sinal":
 * **HOLD**: o roster ainda tem uma sessão desse alias (ativa, quieta, dormindo, em quarentena: não sei) → o guard SEGURA a bead, no mesmo degrau do dono suspenso (sem reclaim, sem fetch de branch, sem caminho rápido de "morto provado"). Roster vazio também segura: vazio não prova ausência.
-* **GONE**: o roster lista outras sessões mas nenhuma desse alias (o engine a fechou) → nada vai acordá-la: o reclaim de sempre (histerese de 25 min) e o `do_reclaim` tira também `pilot.wa_node_alias` (novo `unset_metadata`, depois de o dono sair); a bead reaberta não fica com a marca de um alias que já não é dono.
+* **GONE**: o roster lista outras sessões mas nenhuma desse alias (o engine a fechou) → nada vai acordá-la: o reclaim de sempre (histerese de 25 min) e o `do_reclaim` tira também `pilot.wa_node_alias` (novo `unset_metadata`, depois de o dono sair); a bead reaberta não fica com a marca de um alias que já não é dono. **A marca só sai se o `bd assign` que solta o dono devolveu rc 0.** Se ele falhou (rc != 0) ou estourou o prazo, o guard NÃO sabe que o dono saiu: a marca fica (a bead reaberta segue no nome do alias COM a marca, e o `release` só solta quando marca == dono, então a saída à mão continua existindo), o guard escreve `warn` no log e o comentário de auditoria da bead diz `assignee NOT cleared` e qual marca ficou, em vez do `assignee unset` de sempre.
 * **Segurar não é esquecer**: o relógio do hold (`mbp_hold_since`, no estado do guard) conta o tempo sem sessão saudável à vista; passado `RECLAIM_MBP_HOLD_ALERT_SECS` (padrão 6 h; texto, zero ou negativo voltam ao padrão) o guard emite UM aviso `[MBP-HOLD]` por teto, com o comando para soltar. Quem decide é o Mayor: esperar o notebook, ou soltar à mão com `mbp-node-dispatch.sh release <bead>` DEPOIS de conferir que a sessão não existe mais lá (o guard reclama a bead solta no prazo de sempre). Sessão que volta a responder zera o relógio.
 
 **As quatro transições (`scripts/inflight-reclaim-guard.mbp.selftest.sh`: o `run_cycle` REAL num mundo simulado, conta os construtores no fim; cada caso reprova na base).**
@@ -69,7 +69,7 @@ Na base, as três primeiras reaviam a bead no mini com a sessão do MBP viva (2 
 ## Medido, inferido, não testado
 
 **MEDIDO no corte 3 (24/10, hermético, nó Linux; Python 3.12)**
-* `inflight-reclaim-guard.mbp.selftest.sh`: **34/34**, **14/14 mutantes mortos** (4 s); na base (o guard sem a correção) 10 ok / 20 FAIL, e os 3 controles (alias do Hetzner, `xwa-worker-remote-mbp-1`, `wa-worker-remote-mbp-10`) seguem reclamados como antes.
+* `inflight-reclaim-guard.mbp.selftest.sh`: **48/48**, **17/17 mutantes mortos** (8 s no nó, mutantes incluídos). Os 10 casos do portão do passo 2b (bd assign com rc 1, bd assign que estoura o prazo, e o controle com rc 0) foram escritos antes da correção: no guard sem o portão deram 42 ok / 6 FAIL (a marca saía mesmo com o dono ainda na bead) e passam com ele; e os 3 controles (alias do Hetzner, `xwa-worker-remote-mbp-1`, `wa-worker-remote-mbp-10`) seguem reclamados como antes.
 * Sem regressão no guard: o `--selftest` embutido dá **482/0** na base e no novo; `inflight-reclaim-guard.selftest.sh` 26/0, `…label-removal-durability.selftest.sh` 7/0, `packs/town-deltas/assets/inflight-reclaim-guard.selftest.sh` 50/0.
 
 **MEDIDO (24/10, hermético e contra o provider real em `--dry-run`)**

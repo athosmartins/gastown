@@ -3284,7 +3284,7 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
     """Strip story:in-flight (+pilot:dispatched if present), clear assignee,
     bump reclaim label.
 
-    ga-w7qwl1.2.3: unset_metadata = chaves de metadata que saem DEPOIS de o dono sair (passo 2c). Hoje só a marca do nó do MBP (MBP_NODE_MARK_KEYS): sem isto a bead reaberta
+    ga-w7qwl1.2.3: unset_metadata = chaves de metadata que saem DEPOIS de o dono sair (passo 2c) — e só se o bd assign do passo 2b confirmou (rc 0): falhou ou não respondeu, a marca fica (o `release` só solta quando marca == dono). Hoje só a marca do nó do MBP (MBP_NODE_MARK_KEYS): sem isto a bead reaberta
     seguia carregando pilot.wa_node_alias = um alias que já não é dono (dois donos na leitura). Padrão vazio: nenhuma outra bead muda.
 
     ga-oc6knj: never_had_owner=True (from update_never_claimed_flag, via
@@ -3431,6 +3431,9 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
         # Non-fatal: the next cycle re-finds the bead (still in_progress +
         # pilot:reclaim-count) and retries.
 
+    # ga-w7qwl1.2.3: _owner_cleared = o dono SAIU, e só vale True com o bd assign do passo 2b devolvendo rc 0. Três estados: saiu (rc 0) / não saiu (rc != 0) / não consegui saber (exceção, prazo);
+    #     os dois últimos ficam False — o passo 2c e o comentário de auditoria só agem sobre "saiu".
+    _owner_cleared = False
     # 2b. Clear assignee so Pilot can claim it fresh.
     try:
         r = subprocess.run(
@@ -3439,14 +3442,21 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
         if r.returncode != 0:
             print(f"[INFLIGHT-RECLAIM] warn: clear assignee {bead_id} "
                   f"rc={r.returncode}: {(r.stderr or '').strip()[:200]}", flush=True)
+        else:
+            _owner_cleared = True
     except Exception as exc:
         print(f"[INFLIGHT-RECLAIM] warn: clear assignee {bead_id}: {exc}", flush=True)
         # Non-fatal: Pilot can still re-dispatch without assignee being empty
 
-    # 2c. ga-w7qwl1.2.3: marcas de nó que seguem o dono (pilot.wa_node_alias do MBP). Depois do passo 2b de propósito: se o processo morrer entre os dois sobra só a marca velha (inofensiva para o
-    #     despacho); na ordem inversa sobraria um dono sem marca, que o `release` e os ganchos de nó leem como bead que não é do nó. Melhor esforço, como o 2b: o bd que falha aqui só deixa a marca
-    #     velha (o estado de antes desta fatia), e o `bd update --unset-metadata` repetido é inofensivo.
-    for _mk in (unset_metadata or ()):
+    # 2c. ga-w7qwl1.2.3: marcas de nó que seguem o dono (pilot.wa_node_alias do MBP). Só depois de o dono sair (_owner_cleared, passo 2b com rc 0) e depois dele de propósito: se o processo morrer entre os
+    #     dois sobra só a marca velha (inofensiva para o despacho); na ordem inversa sobraria um dono sem marca, que o `release` e os ganchos de nó leem como bead que não é do nó. Se o 2b falhou ou não
+    #     respondeu, a marca FICA: o guard só varre in_progress (a bead aberta não volta a ser tentada) e o `release` solta a bead do Pilot (a que não tem rota) só quando marca == dono (recusa com rc 12 se a marca sumiu; wa-node-dispatch.sh, caso `release`). O `bd update
+    #     --unset-metadata` que falha aqui só deixa a marca velha (o estado de antes desta fatia), e repetido é inofensivo.
+    _marks_to_unset = tuple(unset_metadata or ()) if _owner_cleared else ()
+    if unset_metadata and not _owner_cleared:
+        print(f"[INFLIGHT-RECLAIM] warn: {bead_id}: o dono não saiu (ou não sei se saiu): mantenho a marca do nó "
+              f"{','.join(unset_metadata)}", flush=True)
+    for _mk in _marks_to_unset:
         try:
             r = subprocess.run(
                 _bd + ["update", bead_id, "--unset-metadata", _mk, "-q"],
@@ -3602,13 +3612,17 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
         f"stamped); pilot:starvation-count now {new_starvation_count} (audit-only, "
         f"never caps or escalates)."
         if never_had_owner else "")
+    # ga-w7qwl1.2.3: "assignee unset" só quando o passo 2b confirmou (rc 0); senão o comentário diz que o dono pode seguir na bead (e, se a marca do nó ficou, qual) em vez de afirmar o que o código não sabe.
+    _assignee_note = ("assignee unset" if _owner_cleared else
+                      "assignee NOT cleared (bd assign failed or gave no answer — the old owner may still hold the bead)"
+                      + (f"; node mark kept: {', '.join(unset_metadata)} (it goes only after the owner leaves)" if unset_metadata else ""))
     try:
         subprocess.run(
             _bd + ["comment", bead_id,
              f"inflight-reclaim-guard (ga-se62o): reclaimed — no live builder and "
              f"no recent branch progress for {idle_min:.0f}min "
              f"(> {RECLAIM_TTL//60}min TTL). {cleared} "
-             f"cleared; assignee unset; status reset to open (ga-vw26y)."
+             f"cleared; {_assignee_note}; status reset to open (ga-vw26y)."
              f"{_hold_note}"
              f"{_sling_note}"
              f"{_preserve_note}"
