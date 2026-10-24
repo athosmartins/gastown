@@ -271,6 +271,8 @@ TAIL_DEPTH="${JAC_TAIL_DEPTH:-250}"                  # pack-objects --depth: the
 TAIL_MIN_OBJECTS="${JAC_TAIL_MIN_OBJECTS:-15}"       # the floor of the adaptive object cap: a cut pass is followed by one with half its objects, never fewer than this (or than the configured max, if that is lower)
 TAIL_RETRY_S="${JAC_TAIL_RETRY_S:-21600}"            # a cap lowered by a cut that leaves no two packs to merge is doubled once this long has passed since the cut (6h)
 DOLT_CRIT_GB="${DOLT_DISK_FLOOR_CRITICAL_GB:-3}"     # Dolt's CRITICAL disk class (dolt-disk-floor-guard.sh: free whole GiB <= this): the tail pass must leave the disk above it. Same variable, same default as the guard (a selftest compares them)
+TAIL_TIGHT="${JAC_TAIL_TIGHT:-1}"                    # tier 2a on a TIGHT disk (header, ga-ft1iv6): 1 = when the comfortable rule above refuses the tail pass, a smaller one may still run, lean and under the watchdog; 0 = off (the old answer, skipped-low-disk)
+TAIL_TIGHT_FLOOR_GB="${JAC_TAIL_TIGHT_FLOOR_GB:-$DOLT_CRIT_GB}"   # ...and it must leave the disk at least this many GiB free (plus the watchdog's slack): by default Dolt's CRITICAL line itself, one GiB under the comfortable rule's floor
 BATCH_OBJECTS="${JAC_BATCH_OBJECTS:-60}"             # starting batch (~7 commits, ~300MiB loose); adapts, see header
 BATCH_MIN=5
 BATCH_MAX="${JAC_BATCH_MAX:-200}"
@@ -342,6 +344,7 @@ loose_limit_kib=$LOOSE_LIMIT_KIB loose_alarm_kib=$LOOSE_ALARM_KIB
 packs_limit=$PACKS_LIMIT packs_alarm=$PACKS_ALARM batch_objects=$BATCH_OBJECTS batch_max=$BATCH_MAX max_batches=$MAX_BATCHES
 tail_limit_kib=$TAIL_LIMIT_KIB tail_max_objects=$TAIL_MAX_OBJECTS tail_timeout_s=$TAIL_TIMEOUT_S tail_window=$TAIL_WINDOW tail_depth=$TAIL_DEPTH
 tail_min_objects=$TAIL_MIN_OBJECTS tail_retry_s=$TAIL_RETRY_S dolt_critical_gb=$DOLT_CRIT_GB
+tail_tight=$TAIL_TIGHT tail_tight_floor_gb=$TAIL_TIGHT_FLOOR_GB
 git_timeout_s=$GIT_TIMEOUT_S gc_timeout_s=$GC_TIMEOUT_S prune_timeout_s=$PRUNE_TIMEOUT_S prune_min_s=$PRUNE_MIN_S deadline_s=$DEADLINE_S min_batch_s=$MIN_BATCH_S
 list_timeout_s=$LIST_TIMEOUT_S lsof_timeout_s=$LSOF_TIMEOUT_S reclaim_wait_s=$RECLAIM_WAIT_S ps_timeout_s=$PS_TIMEOUT_S
 alert_after=$ALERT_AFTER alert_every_s=$ALERT_EVERY_S mail_timeout_s=$MAIL_TIMEOUT_S check_fresh_s=$CHECK_FRESH_S
@@ -704,7 +707,7 @@ watch_check() {
   local fr sw
   fr="$(watch_free_kib)"; sw="$(swap_used_kib)"
   if is_uint "$fr" && [ "$fr" -lt "$WATCH_FREE_MIN_KIB" ]; then
-    WATCH_WHY="free disk fell to ${fr}KiB, below Dolt's floor + slack (${WATCH_FREE_MIN_KIB}KiB)"
+    WATCH_WHY="free disk fell to ${fr}KiB, below the floor + slack this pass may not cross (${WATCH_FREE_MIN_KIB}KiB)"
     return 1
   fi
   if is_uint "$sw" && [ "$sw" -gt $(( WATCH_SWAP_BASE_KIB + WATCH_SWAP_MAX_KIB )) ]; then
@@ -996,7 +999,7 @@ pack_objects() {
 tail_plan() {
   local cap="$1" dir="$R_GITDIR/objects/pack" p b n sz sorted
   local -a rows=()
-  TAIL_PICK=(); TAIL_KEEP=(); TAIL_N=0; TAIL_OBJ=0; TAIL_KIB=0; TAIL_CAPPED=0
+  TAIL_PICK=(); TAIL_PICK_KIB=(); TAIL_PICK_OBJ=(); TAIL_KEEP=(); TAIL_N=0; TAIL_OBJ=0; TAIL_KIB=0; TAIL_CAPPED=0
   # vazio → a directory without a .pack is a repo with nothing to consolidate (the loop below sees only the literal pattern and skips it); falhou/ilegível → a directory that is missing or cannot be read and entered is "could not be listed" (return 1, the caller logs it): never an empty list
   [ -d "$dir" ] && [ -r "$dir" ] && [ -x "$dir" ] || return 1
   for p in "$dir"/*.pack; do
@@ -1015,7 +1018,7 @@ tail_plan() {
     while IFS='|' read -r n sz b; do
       [ -n "$b" ] || continue
       if [ $(( TAIL_OBJ + n )) -le "$cap" ]; then
-        TAIL_PICK+=("$b"); TAIL_OBJ=$(( TAIL_OBJ + n )); TAIL_KIB=$(( TAIL_KIB + (sz + 1023) / 1024 ))
+        TAIL_PICK+=("$b"); TAIL_PICK_KIB+=("$(( (sz + 1023) / 1024 ))"); TAIL_PICK_OBJ+=("$n"); TAIL_OBJ=$(( TAIL_OBJ + n )); TAIL_KIB=$(( TAIL_KIB + (sz + 1023) / 1024 ))
       else
         TAIL_KEEP+=("--keep-pack=$b")
         if [ $(( TAIL_OBJ + n )) -le "$TAIL_MAX_OBJECTS" ]; then TAIL_CAPPED=1; fi
@@ -1082,13 +1085,60 @@ tail_unstick() {
   return 1
 }
 
+# tail_tight_plan <repo> <free_kib> — the TIGHT-DISK road of the tail pass (header, 2a-tight, ga-ft1iv6). tail_pass asks the disk for the packs it takes + a quarter of the loose bytes + HEADROOM_KIB + Dolt's whole CRITICAL class — ~5GB for two
+# packs of 200MB — and the mini lives at 3-4.7GB, so the pass that gives the disk back never ran and every backup left one more seed pack. When that rule has said no, this decides whether a SMALLER pass can still run: the packs of the plan
+# that fit, in plan order, into what is free over the tight floor (TAIL_TIGHT_FLOOR_GB) less the watchdog's slack and a quarter of the loose bytes — at least two (one pack has no seed to merge) — and every pack left out is kept untouched. The caller then
+# runs it lean (the room pass's pack.* settings) under the room pass's WATCHDOG, which is what makes the bound below safe to rely on: the bytes of the packs taken are the most the new pack can be IF the delta search does no worse than the packs it replaces
+# (measured, git 2.43, synthetic: two seed packs of 29.5MiB became one of 29.5MiB, and its temp file peaked at 29.5MiB); when it does worse, the watchdog stops the step before the disk crosses the floor.
+# Returns 0 with TAIL_PICK / TAIL_KEEP / TAIL_N / TAIL_OBJ / TAIL_KIB narrowed to that smaller plan, TIGHT_FLOOR_KIB (the floor, KiB) and TIGHT_SWP0 (swap in use now, KiB, for the watchdog). Returns 1 with TIGHT_WHY naming the reason and the plan UNCHANGED:
+# the caller says skipped-low-disk exactly as before this road existed. Under doubt it is 1 — the road is off, a setting is not a number, the cut time cannot be read, a pass was stopped less than ROOM_RETRY_S ago, swap cannot be read, fewer than
+# two packs fit. The backoff is the room pass's (room_cut_epoch in the state): the host that could not carry a pass is no different 30 minutes later.
+tail_tight_plan() {
+  local repo="$1" fr="$2" floor swp0 avail cut now jrc i kib nobj total=0 n=0 objs=0
+  local -a pick=() keep=()
+  TIGHT_WHY=""
+  if [ "$TAIL_TIGHT" != 1 ]; then TIGHT_WHY="the tight-disk road is off (JAC_TAIL_TIGHT='$TAIL_TIGHT')"; return 1; fi
+  if ! room_settings_ok; then TIGHT_WHY="a JAC_ROOM_* / JAC_WATCH_* setting cannot be used ($ROOM_BAD)"; return 1; fi
+  if ! { is_uint "$TAIL_TIGHT_FLOOR_GB" && [ "${#TAIL_TIGHT_FLOOR_GB}" -le 9 ]; }; then TIGHT_WHY="JAC_TAIL_TIGHT_FLOOR_GB='$TAIL_TIGHT_FLOOR_GB' is not a whole number of at most 9 digits"; return 1; fi
+  floor=$(( 10#$TAIL_TIGHT_FLOOR_GB * 1048576 ))
+  # vazio → no cut time on record (a first run, or a malformed one that load_state dropped): never cut, the road may run; falhou/ilegível → jq failing says nothing about a pass that may have been stopped a moment ago: the road stays closed this run
+  cut="$(jq -r --arg r "$repo" '.[$r].room_cut_epoch // empty' <<<"$STATE_JSON" 2>/dev/null)"; jrc=$?
+  if [ "$jrc" -ne 0 ]; then TIGHT_WHY="the remembered cut time of $repo could not be read — a pass the watchdog stopped a moment ago is not repeated blind"; return 1; fi
+  is_uint "$cut" || cut=""
+  now="$(date +%s)"
+  if [ -n "$cut" ] && [ "$cut" -gt 0 ]; then
+    if [ "$cut" -gt "$now" ]; then R_ROOM_CUT_SAVE="$now"; TIGHT_WHY="the last cut is dated in the future ($cut > $now) — the backoff clock starts now"; return 1; fi
+    if [ $(( now - cut )) -lt "$ROOM_RETRY_S" ]; then TIGHT_WHY="the last pass was cut $(( now - cut ))s ago — backing off until ${ROOM_RETRY_S}s have passed"; return 1; fi
+  fi
+  # vazio/falhou/ilegível → swap in use that cannot be read is not "no swap": the watchdog would have nothing to compare against, and a pass that cannot be watched does not start
+  swp0="$(swap_used_kib)"
+  if ! is_uint "$swp0"; then TIGHT_WHY="swap in use cannot be read — the watchdog would have nothing to compare against"; return 1; fi
+  avail=$(( fr - floor - WATCH_SLACK_KIB - M_LOOSE_KIB / 4 )); [ "$avail" -ge 0 ] || avail=0
+  i=0
+  while [ "$i" -lt "${#TAIL_PICK[@]}" ]; do
+    kib="${TAIL_PICK_KIB[$i]}"; nobj="${TAIL_PICK_OBJ[$i]}"
+    if [ $(( total + kib )) -le "$avail" ]; then pick+=("${TAIL_PICK[$i]}"); total=$(( total + kib )); objs=$(( objs + nobj )); n=$(( n + 1 ))
+    else keep+=("--keep-pack=${TAIL_PICK[$i]}"); fi
+    i=$(( i + 1 ))
+  done
+  if [ "$n" -lt 2 ]; then
+    TIGHT_WHY="free $(fmt "$fr") leaves ${avail}KiB over the tight floor ($(fmt "$floor")) less the watchdog's slack and a quarter of the loose bytes, and the two smallest packs do not fit in it — a pass of fewer than two packs consolidates nothing"
+    return 1
+  fi
+  i=0
+  while [ "$i" -lt "${#keep[@]}" ]; do TAIL_KEEP+=("${keep[$i]}"); i=$(( i + 1 )); done
+  TAIL_PICK=("${pick[@]}"); TAIL_N="$n"; TAIL_OBJ="$objs"; TAIL_KIB="$total"
+  TIGHT_FLOOR_KIB="$floor"; TIGHT_SWP0="$swp0"
+  return 0
+}
+
 # tail_pass <repo> — tier 2a (header): the small packs the batches left, held >= TAIL_LIMIT_KIB (scaled to the object cap), become ONE pack whose deltas are recomputed (-f), by BYTES and not by how many packs there are. Obeys the same
 # rules as the consolidating gc: a step that did NOTHING (busy, cut by the run's deadline, not started) may only replace a status that is not a failure; one that finished (rc 0) is `consolidated` unless
 # something before it had failed (that failure stays visible). Inert under doubt: an unreadable pack directory, a setting that is not a number, loose objects still waiting for tier 1, a repacker it
 # cannot rule out, and a disk it cannot show would stay above Dolt's CRITICAL class all mean "not started", with the reason in the log. Needs a fresh `measure` (M_LOOSE_KIB, M_LOOSE_COUNT) and the repo's entry
 # in STATE_JSON (load_state). Sets R_TAIL (the object cap of this pass), and R_TAIL_SAVE / R_TAIL_CUT_SAVE when the state must remember a change (write_state).
 tail_pass() {
-  local repo="$1" need orc out rc t_left by_deadline b0 took lim fl fr floor_kib next jrc after
+  local repo="$1" need orc out rc t_left by_deadline b0 took lim fl fr floor_kib next jrc after tight=0
   if [ "$TAIL_LIMIT_KIB" = 0 ]; then return 0; fi
   if ! { is_uint "$TAIL_LIMIT_KIB" && is_uint "$TAIL_MAX_OBJECTS" && is_uint "$TAIL_TIMEOUT_S" && is_uint "$TAIL_WINDOW" && is_uint "$TAIL_DEPTH" && is_uint "$TAIL_MIN_OBJECTS" && is_uint "$TAIL_RETRY_S" \
          && [ "${#TAIL_LIMIT_KIB}" -le 8 ] && [ "${#TAIL_MAX_OBJECTS}" -le 10 ]; }; then
@@ -1145,10 +1195,17 @@ tail_pass() {
   fi
   floor_kib=$(( (DOLT_CRIT_GB + 1) * 1048576 ))
   if [ "$fr" -lt $(( need + floor_kib )) ]; then
-    bad_status "$STATUS" || STATUS="skipped-low-disk"
-    after="below zero"; if [ "$fr" -ge "$need" ]; then after="$(fmt $(( fr - need )))"; fi
-    log "repo=$repo status=skipped-low-disk (tail) free=$(fmt "$fr") need~$(fmt "$need") — free after the pass would be $after, and Dolt's CRITICAL class is a free disk of ${DOLT_CRIT_GB}GiB or less (the pass needs $(fmt "$floor_kib") left) small packs=$TAIL_N ($(fmt "$TAIL_KIB"))"
-    return 0
+    # THE TIGHT ROAD (header, 2a-tight): the comfortable rule has said no. On a disk at the floor that was the end of it — no pass, one more seed pack per backup, a disk that stays at the floor. Now a SMALLER pass
+    # (tail_tight_plan: the packs that fit over the tight floor, at least two) may still run, lean and watched; when it cannot, the answer below is the old one, with the road's reason added.
+    if tail_tight_plan "$repo" "$fr"; then
+      tight=1
+      log "  tail consolidation on a TIGHT disk: free $(fmt "$fr") is under the comfortable rule (need~$(fmt "$need") + the $(fmt "$floor_kib") that keeps Dolt out of its CRITICAL class) — taking only $TAIL_N pack(s) that fit over the tight floor of $(fmt "$TIGHT_FLOOR_KIB"), lean (${ROOM_THREADS} thread, windowMemory $ROOM_WINDOW_MEM, deltaCacheSize $ROOM_DELTA_CACHE), under the watchdog (swap in use now $(( TIGHT_SWP0 / 1024 ))MiB; it stops the pass above +$(( WATCH_SWAP_MAX_KIB / 1024 ))MiB of swap or under $(fmt $(( TIGHT_FLOOR_KIB + WATCH_SLACK_KIB ))) free)"
+    else
+      bad_status "$STATUS" || STATUS="skipped-low-disk"
+      after="below zero"; if [ "$fr" -ge "$need" ]; then after="$(fmt $(( fr - need )))"; fi
+      log "repo=$repo status=skipped-low-disk (tail) free=$(fmt "$fr") need~$(fmt "$need") — free after the pass would be $after, and Dolt's CRITICAL class is a free disk of ${DOLT_CRIT_GB}GiB or less (the pass needs $(fmt "$floor_kib") left); the tight-disk road did not start either: $TIGHT_WHY; small packs=$TAIL_N ($(fmt "$TAIL_KIB"))"
+      return 0
+    fi
   fi
   # ONE REPACKER AT A TIME (header): the same check, and the same answer, as before the consolidating gc
   other_repacker "$repo"; orc=$?
@@ -1163,13 +1220,30 @@ tail_pass() {
   fi
   budget_for "$TAIL_TIMEOUT_S"
   log "  tail consolidation: $TAIL_N packs ($(fmt "$TAIL_KIB"), $TAIL_OBJ objects, + ${M_LOOSE_COUNT:-?} loose) -> one pack, deltas recomputed; ${#TAIL_KEEP[@]} other pack(s) kept untouched; object cap $R_TAIL (max $TAIL_MAX_OBJECTS)"
+  # the tight road runs the way the room pass does (header): lean pack.* settings, and under the WATCHDOG with the tight floor — run_step reads WATCH_*, git_arch reads R_PACK_EXTRA — both put back right after the step
+  if [ "$tight" -eq 1 ]; then
+    R_PACK_EXTRA=(-c "pack.threads=$ROOM_THREADS" -c "pack.windowMemory=$ROOM_WINDOW_MEM" -c "pack.deltaCacheSize=$ROOM_DELTA_CACHE")
+    WATCH_ON=1; WATCH_FREE_MIN_KIB=$(( TIGHT_FLOOR_KIB + WATCH_SLACK_KIB )); WATCH_SWAP_BASE_KIB="$TIGHT_SWP0"
+  fi
   b0="$(date +%s)"
   run_step "$t_left" repack --quiet -a -d -l -f --window="$TAIL_WINDOW" --depth="$TAIL_DEPTH" --cruft --cruft-expiration=2.weeks.ago ${TAIL_KEEP[@]+"${TAIL_KEEP[@]}"}; out="$STEP_OUT"; rc="$STEP_RC"
   took=$(( $(date +%s) - b0 ))
+  if [ "$tight" -eq 1 ]; then WATCH_ON=0; WATCH_FREE_MIN_KIB=0; WATCH_SWAP_BASE_KIB=0; R_PACK_EXTRA=(); fi
   if [ "$rc" -eq 0 ]; then
     bad_status "$STATUS" || STATUS="consolidated"
+    if [ "$tight" -eq 1 ]; then R_ROOM_CUT_SAVE=0; fi      # a tight pass that finished clears the room pass's cut time (the backoff they share)
     # tier 1's rule: a pass that used under a quarter of its budget while the cap kept a pack out that the configured max would have taken says the cap is tighter than the host needs
     if [ "$TAIL_CAPPED" -eq 1 ] && [ $(( took * 4 )) -lt "$t_left" ]; then tail_grow "the pass took ${took}s of its ${t_left}s and the cap left a pack out"; fi
+  elif [ -n "$STEP_WATCH" ]; then
+    # the watchdog ended it (its WATCHDOG line is in the log): LOUD, not deferred — the host showed it cannot carry a pass this size on this disk. Nothing is kept of a stopped repack (run_step reclaimed its temp pack or the garbage count says so).
+    # The next pass takes at most half of what this one carried (never below the floor), and the cut time starts the backoff tail_tight_plan reads (the room pass's room_cut_epoch)
+    STATUS="aborted"
+    next=$(( TAIL_OBJ / 2 ))
+    [ "$next" -ge "$fl" ] || next="$fl"
+    [ "$next" -le "$R_TAIL" ] || next="$R_TAIL"
+    R_ROOM_CUT_SAVE="$(date +%s)"; R_TAIL_CUT="$R_ROOM_CUT_SAVE"; R_TAIL_CUT_SAVE="$R_ROOM_CUT_SAVE"
+    if [ "$next" -lt "$R_TAIL" ]; then R_TAIL="$next"; R_TAIL_SAVE="$next"; fi
+    log "  tail repack on a tight disk STOPPED by the watchdog after ${took}s: $STEP_WATCH — it carried $TAIL_OBJ objects; the next pass takes at most $next (half of that, never below the floor of $fl) and not before ${ROOM_RETRY_S}s have passed"
   elif [ "$rc" -eq 124 ] && [ "$by_deadline" -eq 1 ]; then
     # it did NOTHING useful (a killed repack keeps no packed work — and leaves a tmp_pack, which run_step has just reclaimed or the garbage measurement will report): it cannot turn a failed / stalled / timed-out / skipped tier 1 green
     bad_status "$STATUS" || STATUS="deferred"
