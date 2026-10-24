@@ -2,7 +2,7 @@
 
 ## Contents
 
-• Estado · O que é e o contrato do nice · Instalar e ligar (Mayor) · Operar · O que roda (itens) · O que muda em outros vigias · Medido, inferido, não testado · O que falta
+• Estado · O que é e o contrato do nice · Instalar e ligar (Mayor, depois do merge) · Operar · O que roda (itens) · O que muda em outros vigias · Medido, inferido, não testado · O que falta
 
 Bead ga-2hd02v.5, filha da ga-2hd02v. Decisão do Athos (20/10, AskUserQuestion do Mayor): "se está 100% ocupado a gente fica feliz; o que não pode é ficar menos do que 100% ocupado" — quem ocupa não importa.
 
