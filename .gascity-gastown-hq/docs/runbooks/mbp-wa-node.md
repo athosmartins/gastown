@@ -1,0 +1,59 @@
+# MBP como destino de bead do WhatsApp · runbook
+
+## Contents
+
+• Estado · Como a bead chega ao MBP (a cadeia) · Decisões · Como ligar (passos do Mayor — nada disto foi feito) · O que falta antes de uma sessão real · Medido, inferido, não testado
+
+## Estado
+
+**Corte 1 de 5 do ga-w7qwl1.2 (ga-w7qwl1.2.1): o destino existe e está INERTE; nada o chama.** Entregue: o agente `wa-worker-remote-mbp` (teto 2, `min_active_sessions = 0`), o despachante `scripts/mbp-node-dispatch.sh`, o oráculo `scripts/mbp-node-capacity.py` e os selftests dos dois. Nada vivo muda: sem edição de `city.toml`, de `.gc/session-ssh.json` nem do Pilot; o host `mbp` **não está** na config do provider (`gc-session-ssh gate mbp` hoje recusa por isso), e o gancho do Pilot é o corte 2 (ga-w7qwl1.2.2). Nenhuma sessão abriu no MBP e nada foi escrito nele. Os cortes seguintes: 2 gancho do Pilot · 3 Athos volta / notebook cai da rede · 4 prova ao vivo (a–e) + camada `home/.claude` + guarda de clone + liberação de sessão real · 5 noite de canário e placar.
+
+## Como a bead chega ao MBP (a cadeia)
+
+1. **Pilot** (corte 2) oferece ao MBP a bead de WA que o gancho do Hetzner deixou no mini e que o mini não comporta. Hoje não existe.
+2. **`mbp-node-dispatch.sh apply <bead>`** (esta fatia) relê a bead → classifica (`wa-node-classify.py`: só código + teste, sem banco, segredo ou dado) → confere os 2 slots → pergunta ao **oráculo** → UMA escrita com comparação atômica: dono `wa-worker-remote-mbp-<1|2>` + marca `pilot.wa_node_alias`, **sem `gc.routed_to`**.
+3. **Oráculo** (`mbp-node-capacity.py --json verdict`): `gc-session-ssh gate mbp` (Athos fora, MBP saudável, bandeira ligada, pausa, `slot_cap`) **e** as sessões do MBP que o engine vê. `node` só com o gate liberando E vaga = `min(cap, slot_cap)` − vivas ≥ 1.
+4. **Pilot abre a sessão do alias** (`gc session new wa-worker-remote-mbp --alias wa-worker-remote-mbp-<n>`, a receita do dog-remote). O engine dá à sessão o nome `wa-worker-remote-mbp-ga<cauda>`; o `-remote-` casa o `remote_match` do híbrido e o provider lê `…-remote-mbp-…` como pedido do host `mbp`.
+5. **Provider** (`gc-session-ssh start`): checa a presença DE NOVO antes de qualquer ssh (a regra do Athos vale em todo start, não só na decisão do passo 3), cria o worktree e o LaunchAgent do domínio gráfico, e roda a sessão em `nice 10` com o vigia.
+6. **Sessão** acha a bead por `bd -C whatsapp_automation list --status in_progress --assignee "$GC_ALIAS"` e entrega pelo `gate-done`.
+
+## Decisões
+
+Todas técnicas, tomadas pelo dog-1 no rascunho (24/10) e conferidas pelo dog-4 na conclusão (24/10), com o motivo:
+
+* **O MBP é um 3º destino do despachante que já existe, não um despachante novo.** `wa-node-dispatch.sh` já é parametrizado por ambiente e o `ps-node-dispatch.sh` mostrou o molde da casca fina (53 linhas). Uma segunda cópia da lógica de escrita (comparação atômica, desfazer com releitura, três estados) seria dois lugares para consertar o mesmo defeito.
+* **Demanda zero por construção.** Nenhuma bead recebe `gc.routed_to` para o pool do MBP, então o pool não tem o que pedir: com o Athos no MBP, em pausa, sem saúde ou com a bandeira desligada, o oráculo diz `local`, o despachante sai 12 sem escrever e o Pilot (corte 2) não abre sessão. Escolher a rota por `gc.routed_to` exigiria um `scale_check` que lê o gate a cada ciclo do reconciliador, e deixaria a bead roteada esperando um pool que não abre.
+* **O oráculo não tem regra de presença própria.** Ele só lê o veredito do `gc-session-ssh gate mbp`, o mesmo que o `start` aplica. Duas regras de presença que podem discordar são o pior caso (o oráculo liberaria, o start recusaria, e a bead ficaria atribuída a um alias sem sessão).
+* **O oráculo da casca é FIXO.** Um `WA_NODE_CAPACITY` herdado do ambiente (o do Hetzner) deixaria um `node` do Hetzner autorizar uma sessão no MBP com o Athos usando. O selftest cobre isso (caso e mutante `oraculo-do-ambiente-vence`). Pelo mesmo motivo `WA_NODE_ALIAS`, prefixo, template, log, modo e slots são fixados.
+* **Slots: 2.** O teto do agente é 2 e o `cap` previsto para o host `mbp` também ("começa em 2", aceite do ga-w7qwl1.2; o bloco `mbp` ainda não está na config). `MBP_NODE_SLOTS=1` baixa para 1 (canário); qualquer outro valor definido (vazio, 0, 3, texto) vale 1 — erro de digitação nunca vira mais sessões. O `slot_cap` de RAM só baixa.
+* **Classificador do WA, sem mudança.** O MBP não ganha segredo novo, então a bead tem de provar-se só com código e teste, o mesmo critério do nó. O filtro do classificador é o do espelho git do Hetzner; para o MBP isso é CONSERVADOR (bead que só falta no espelho, mas existiria no clone do MBP, fica no mini). Afrouxar é medir antes.
+* **Contagem de sessões pelo engine (`gc session list --json`), não por ssh.** Não pesa o MBP dormindo nem gasta outra ida e volta; é a mesma fonte que o despachante já lê. Sessão fechada ou dormindo não ocupa; estado ausente ou desconhecido ocupa (menos vaga, o lado inerte).
+* **Registros do E12:** o novo prompt cita `gate-done`, então entra na lista de alvos do `e12-crew-doctrine.sh` (14 alvos) e em `POOL_TEMPLATES` do `pool-prompt-skill-mention.selftest.sh`; sem isso o `coverage` do gate reprova.
+
+## Como ligar (passos do Mayor — nada disto foi feito)
+
+Só depois dos cortes 2–4. Ligar é decisão do Mayor (sessão real no MBP) e exige o MBP livre.
+
+1. **Host `mbp` em `.gc/session-ssh.json`** (bloco em `gc-session-ssh.md`, "O MBP como host"), mais `"worktree_rigs": {"wa-worker": "whatsapp_automation"}` e `real_sessions_released_by` (decisão EXPLÍCITA do Mayor, com a evidência do corte 4). O `ssh` é o nome do Tailscale, não o `.local`.
+2. **Atalho bd/gc do MBP:** o `identity_pattern` de `~/.gastown/remote-shim-mbp.json` hoje só deixa passar `^remote-test-remote-mbp-[0-9]{1,3}$`. Para a sessão real `wa-worker-remote-mbp-ga<cauda>` o padrão precisa mudar, e `gate_done_bin` hoje é nulo (o `gate-done` do MBP recusa). Ver `remote-shim.md`, "Identidade".
+3. **Gancho do Pilot** (corte 2): `PILOT_WA_MBP_ROUTE` em `shadow` por uma noite e depois `on`.
+4. Conferir antes de ligar: `gc-session-ssh gate mbp` responde JSON com `ok` e `slot_cap`; `python3 -I scripts/mbp-node-capacity.py --json verdict` dá `node` com o Athos fora e `local` com ele no MBP.
+
+## O que falta antes de uma sessão real
+
+* **Identidade do atalho e `gate-done` no MBP** (acima, passo 2): sem isso a sessão acha a bead e trabalha, mas não consegue entregar. O prompt já diz ao worker o que fazer se o `gate-done` for recusado (comentar ref + sha e avisar o Mayor). **O corte 4 precisa confirmar que o prompt bate com a realidade do atalho** (lista permitida, ref `worker/<sessão>-N`, push direto ao origin).
+* **A prova ao vivo (a)–(e)** que a ga-w7qwl1.1.8 deixou em fatia própria (corte 4): sem ela o provider pode abrir sessão que morre no 1º prompt.
+* **Consumidores só do Hetzner** que casam `wa-worker-remote*` e NÃO foram mexidos porque não se aplicam ao MBP: `hetzner-idle-session-reaper.py` (exclui o wa-worker-remote de propósito), `wa-node-report.py` (lê o tmux do nó), `hetzner-capacity.py`. O `gate-done-remote.py` (`ROLE_RE`) lê `wa-worker-remote-mbp-…` como o papel WA, mas o caminho de entrega do MBP é o atalho por puxada, não ele.
+* **O gancho do Hetzner (`_pilot_wa_node_open`) espera dono `wa-worker-remote-<1-9>`**; uma bead do MBP lida por ele cai no ramo "já é do nó" (dono casa `wa-worker-remote*`) e é SEGURADA, nunca re-carimbada. O gancho do MBP (corte 2) é separado por isso.
+
+## Medido, inferido, não testado
+
+**MEDIDO (24/10, hermético e contra o provider real em `--dry-run`)**
+* `python3 -I scripts/gc-session-ssh --dry-run start <nome>` com uma config de teste de dois hosts: `wa-worker-remote-mbp-gawisp4oaui3` e `wa-worker-remote-mbp-1` → host `mbp`; `wa-worker-remote-gawisp4oaui3` e `wa-worker-remote-1` → host `hetzner`. É o nome que o engine dá a uma sessão de pool aberta com `--alias` (visto nos eventos do Hetzner: `wa-worker-remote-gawisp4oaui3`).
+* `gc-session-ssh gate mbp` na cidade viva: `host 'mbp' não está em …/session-ssh.json`, rc 1, sem JSON. O oráculo lê isso como `unknown` (11 no despachante), nunca como `local` nem `node`.
+* Selftests, rodados no nó Linux por `mbp-run.sh --repo hq` (o disco do mini estava em 5,1 GB, abaixo do piso de 6 GB do `heavy-guard.sh`): `mbp-node-capacity.selftest.sh` **103/103, 19 mutantes mortos** (45 s); `mbp-node-dispatch.selftest.sh` **73/73, 16 mutantes mortos** (29 s). Fora do nó: `e12-crew-doctrine.sh check` (14 alvos) e `coverage` ok; `pool-prompt-skill-mention.selftest.sh` 43/0.
+* O contrato do oráculo com o gate foi conferido contra o código real: `op_gate` do `gc-session-ssh` imprime `host`, `ok`, `reason`, `slot_cap` e acrescenta `cap` (`dict(v, cap=cfg.cap)`), com exit 0 libera, 1 recusa, 2 dry-run; o teto do Hetzner na config viva é 6 e o `max_active_sessions` do `wa-worker` do mini é 2.
+
+**INFERIDO** (do código, sem rodar o engine novo): o engine nomeia a sessão do template `wa-worker-remote-mbp` como `wa-worker-remote-mbp-<cauda>`, pela mesma regra que gerou `wa-worker-remote-gawisp4oaui3` para o template do Hetzner.
+
+**NÃO TESTADO**: qualquer sessão real no MBP; o Pilot abrindo sessão para o alias do MBP (corte 2); o oráculo contra um `gc-session-ssh gate mbp` VIVO com o host configurado e o Athos fora (precisa do bloco `mbp` na config); o `gate-done` e a identidade do atalho para uma sessão real; o comportamento do engine quando o notebook cai da rede com sessão aberta (corte 3).

@@ -66,7 +66,7 @@ edit() { sed "$2" "$1" > "$1.new" && ! cmp -s "$1" "$1.new" && mv "$1.new" "$1";
 echo "== A. real tree: every target is current and every builder is covered =="
 E12_CREW_AGENTS_DIR="$HQ/agents" E12_FRAGMENT="$FRAG" E12_CITY_TOML="$HQ/city.toml" /bin/bash "$GEN" check >"$W/a.out" 2>"$W/a.err"; rc=$?
 [ "$rc" = 0 ] && ok "check on the real tree: $(cat "$W/a.out")" || bad "check on the real tree: rc=$rc $(cat "$W/a.err")"
-grep -q '(13 targets)' "$W/a.out" && ok "the targets are the 6 crews + batista-ps, batista-lx, thies-ps + dog-remote, wa-worker-remote (ga-wmylcp), ps-worker-remote (ga-2hd02v.4) + the fragment section" || bad "expected '(13 targets)', got: $(cat "$W/a.out")"
+grep -q '(14 targets)' "$W/a.out" && ok "the targets are the 6 crews + batista-ps, batista-lx, thies-ps + dog-remote, wa-worker-remote (ga-wmylcp), ps-worker-remote (ga-2hd02v.4), wa-worker-remote-mbp (ga-w7qwl1.2.1) + the fragment section" || bad "expected '(14 targets)', got: $(cat "$W/a.out")"
 E12_CREW_AGENTS_DIR="$HQ/agents" E12_FRAGMENT="$FRAG" E12_CITY_TOML="$HQ/city.toml" /bin/bash "$GEN" coverage >"$W/a.out" 2>"$W/a.err"; rc=$?
 [ "$rc" = 0 ] && ok "coverage on the real tree passes" || bad "coverage on the real tree: rc=$rc $(cat "$W/a.err")"
 for who in wa-worker ps-worker batista-ps thies-ps "dog"; do
@@ -205,7 +205,7 @@ PYEOF
 
   d="$(mkwt clean)"
   run2d "$d" "$TOUCH_PROMPT"
-  if [ "$W_RC" = 0 ] && printf '%s' "$W_OUT" | grep -q 'coverage ok' && printf '%s' "$W_OUT" | grep -q 'current (13 targets)'; then ok "a covered tree: a prompt in the diff -> check and coverage run, TEST_EXIT 0"; else bad "covered tree: TEST_EXIT=$W_RC :: $W_OUT"; fi
+  if [ "$W_RC" = 0 ] && printf '%s' "$W_OUT" | grep -q 'coverage ok' && printf '%s' "$W_OUT" | grep -q 'current (14 targets)'; then ok "a covered tree: a prompt in the diff -> check and coverage run, TEST_EXIT 0"; else bad "covered tree: TEST_EXIT=$W_RC :: $W_OUT"; fi
 
   d="$(mkwt drift)"; edit "$d/wt/$HQP/packs/town-deltas/template-fragments/town-deltas.template.md" "s/in last week's gate reviews/in the last weeks' gate reviews/" || bad "drift fixture: the edit changed nothing"
   for f in "$TOUCH_PROMPT" "$HQP/city.toml" "$HQP/packs/town-deltas/template-fragments/town-deltas.template.md" "$HQP/packs/town-deltas/assets/e12-arms.sh" \

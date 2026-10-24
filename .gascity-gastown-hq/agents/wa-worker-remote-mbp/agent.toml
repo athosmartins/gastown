@@ -1,0 +1,21 @@
+# wa-worker-remote-mbp: o wa-worker que roda no MacBook Pro do Athos, SÓ enquanto ele está fora e o mini está cheio (ga-w7qwl1.2; corte 1 = ga-w7qwl1.2.1). Irmão do wa-worker-remote (Hetzner): mesmo desenho, outro destino, outro teto.
+#
+# Contents
+#   O que é · INERTE até ligar · Por que 2 · O que o provider faz com este arquivo
+#
+# O QUE É: um wa-worker de pool (headless, sonnet) cujo nome de sessão contém `-remote-mbp-`; o `remote_match` do provider híbrido manda essa sessão ao host `mbp` (scripts/gc-session-ssh; sem o host em .gc/session-ssh.json o start recusa).
+#   QUE bead vem para cá é scripts/mbp-node-dispatch.sh (só código + teste, sem banco, segredo ou dado); QUANDO é scripts/mbp-node-capacity.py, que lê `gc-session-ssh gate mbp`. Cadeia e passos de ligar: docs/runbooks/mbp-wa-node.md.
+# INERTE ATÉ LIGAR: min_active_sessions = 0 e NENHUMA bead leva `gc.routed_to=wa-worker-remote-mbp` (o despachante escreve só o dono e a marca `pilot.wa_node_alias`), então o pool pede ZERO sessões por construção.
+#   Quem abre a sessão do alias é o Pilot (gancho do corte 2, ga-w7qwl1.2.2, ainda inexistente); o host `mbp` ainda não está na config do provider.
+# POR QUE 2: o `cap` previsto para o host `mbp` é 2 (aceite do ga-w7qwl1.2, "começa em 2"; o host ainda não está na config) e o MBP é a máquina do Athos; o teto é CONTADO À PARTE do teto do mini (wa-worker, max 2) e do `cap` do Hetzner (6 POR HOST, dividido entre todas as sessões `*-remote-*` dele: wa-worker-remote, ps-worker-remote, dog-remote e gate-reviewer-remote). O `slot_cap` de RAM do mbp-run.sh só baixa.
+# O QUE O PROVIDER FAZ COM ESTE ARQUIVO: ignora `work_dir` (a pasta não existe no MBP) e abre a sessão num worktree git novo do rig `whatsapp_automation`; o tmux nasce num LaunchAgent do domínio gráfico (ga-w7qwl1.1.8), em `nice 10` com o vigia de prioridade: se o Athos volta, a sessão termina em prioridade de fundo e a bead NÃO volta à fila. `pre_start` não existe aqui: o provider não o executa no host.
+# literal, sem {{.AgentBase}}: o provider ignora a pasta (troca pelo worktree do host), então as sessões não precisam de pasta própria; só o engine a exige
+work_dir = ".gc/agents/wa-worker-remote-mbp"
+min_active_sessions = 0
+max_active_sessions = 2
+# Sem `gc runtime drain-ack` no atalho, quem encerra a sessão ociosa é este prazo (o stop do provider recolhe o worktree se nada se perde). Curto de propósito: sessão parada segura um slot do MBP.
+# Dormir NÃO solta o alias: o Pilot acorda a sessão do alias (gc session wake) em vez de abrir outra, e o despachante em modo pilot não conta sessão dormindo como slot ocupado.
+idle_timeout = "15m"
+wake_mode = "fresh"
+model = "sonnet"
+provider = "claude-headless"
