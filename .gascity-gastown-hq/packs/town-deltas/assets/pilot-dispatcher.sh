@@ -12721,6 +12721,121 @@ _pilot_ps_node_settle() {
   return 0
 }
 
+# ── ga-w7qwl1.2.2: bead WA → MBP (wa-worker-remote-mbp). PADRÃO: DESLIGADO ─────────────────────────────
+# Irmão do gancho do Hetzner (_pilot_wa_node_decide) e do de PS (_pilot_ps_node_decide), chamado DEPOIS do do Hetzner e só com o mini CHEIO: a bead que o nó 24/7 não aceitou e que o pool wa-worker do mini não comporta
+# (sessões vivas >= PILOT_WA_WORKER_MAX) é oferecida ao MBP. O MBP nunca rouba a vez do Hetzner nem a de uma vaga do mini. Quem classifica, consulta o oráculo (gc-session-ssh gate mbp: Athos fora, MBP saudável, bandeira
+# ligada, vaga) e escreve é scripts/mbp-node-dispatch.sh; a sessão do alias a abre o Pilot (_pilot_node_remote_open, a receita do dog-remote). Os 2 slots do MBP são contados pelo despachante dele, com template e alias
+# próprios: sessão do MBP não entra na conta do pool wa-worker do mini, na do teto global (ga-jezvn) nem na do Hetzner, e este gancho não escreve em nenhuma delas.
+# PILOT_WA_MBP_ROUTE = off|shadow|on — qualquer outro valor (vazio, erro de digitação, label, auto) é off.
+#   off     nada roda: volta antes de ler qualquer coisa (nem a contagem de sessões, nem o despachante).
+#   shadow  com o mini cheio roda `apply --dry-run` (classificador + slots + oráculo, sem escrever) e grava UMA linha em $GC_CITY/.gc/mbp-node-route.jsonl: o que iria ao MBP. NÃO muda o despacho.
+#   on      além disso, a bead que o despachante manda ao MBP vai: dono wa-worker-remote-mbp-<1|2> + marca pilot.wa_node_alias (SEM gc.routed_to) e a sessão é aberta aqui.
+# Retorno 0 = a bead JÁ está com o MBP e a sessão está aberta e avisada · 1 = nada ficou escrito, ela segue o caminho do mini · 2 = SEGURA (o chamador solta a claim e não despacha: a bead já é do nó, não deu para relê-la, a escrita pode
+# ter pegado e não sei dizer, ou a sessão não abriu e o desfazer não se confirmou). Limite deste corte: o `apply` recusa a bead que já traz gc.routed_to=wa-worker (rc 12), então a que o mini carimbou numa tentativa anterior não chega ao MBP.
+
+# _pilot_mbp_mini_full — exit 0 iff o pool wa-worker do MINI está POSITIVAMENTE cheio (sessões vivas >= PILOT_WA_WORKER_MAX, o mesmo teto e a mesma contagem do braço do pool e do skip pré-claim; a contagem é a da varredura).
+# vazio (PILOT_WA_WORKER_MAX vazio) → 4, o padrão do mini; falhou/ilegível (teto que não é número, contagem que não leu) → 1: NÃO sei que está cheio, a bead fica no mini. Só contagem positiva >= teto devolve 0.
+_pilot_mbp_mini_full() {
+  local _mf_max="${PILOT_WA_WORKER_MAX:-4}"
+  [ "${PILOT_SPAWN_WA_WORKER:-1}" = "1" ] || return 1
+  case "$_mf_max" in ''|*[!0-9]*) return 1 ;; esac
+  # vazio (pool sem sessão viva) → contagem 0, que não enche; falhou/ilegível (session list que não leu, número que não é inteiro) → 1 e a contagem sticky da varredura, como no skip pré-claim
+  _pilot_pool_live_count wa-worker || return 1
+  [ "$_PCAP_N" -ge "$_mf_max" ]
+}
+
+_pilot_mbp_node_decide() {
+  local _id="${1:-}" _store="${2:-}" _tgt="${3:-}" _mode="${PILOT_WA_MBP_ROUTE:-off}" _dir _out="" _rc=0 _bj="" _bo="" _dry=0
+  case "$_mode" in shadow|on) ;; *) return 1 ;; esac
+  [ "$_tgt" = "wa-worker" ] || return 1
+  case "$_id" in wa-*) ;; *) return 1 ;; esac
+  _pilot_mbp_mini_full || return 1
+  _dir="${PILOT_WA_MBP_SCRIPTS:-$GC_CITY/scripts}"
+  if [ ! -x "$_dir/mbp-node-dispatch.sh" ]; then
+    warn "mbp-node: $_dir/mbp-node-dispatch.sh não está executável — $_id segue no mini"
+    return 1
+  fi
+  if [ "$_mode" = shadow ] || [ "${DRY_RUN:-0}" = "1" ]; then
+    _dry=1
+  else
+    # três estados, nunca dois: "é do nó" (dono ou rota wa-worker-remote*, do Hetzner OU do MBP) / "lida e não é do nó" / "não consegui ler". Só o segundo segue; o terceiro NÃO vira "livre".
+    # vazio (bd sem saída) → "" e 2; falhou/ilegível (bd falhou, saída que não é JSON, bead de outro id) → 2 também, nunca "livre"
+    _bj=$(timeout "${PILOT_WA_MBP_READ_TIMEOUT:-20}" bd -C "$_store" show "$_id" --json 2>/dev/null) || _bj=""
+    _bo=$(printf '%s' "$_bj" | jq -r --arg id "$_id" 'if type=="array" then .[0] else . end | select(type=="object" and .id == $id) | if (((.assignee // "") | startswith("wa-worker-remote")) or ((.metadata["gc.routed_to"] // "") | startswith("wa-worker-remote"))) then "node" else "other" end' 2>/dev/null) || _bo=""
+    case "$_bo" in
+      other) ;;
+      node) warn "mbp-node: $_id já é do nó (dono ou rota wa-worker-remote*) — seguro: sem carimbo do mini e sem sessão do mini; a próxima varredura relê"; return 2 ;;
+      *) warn "mbp-node: não consegui reler $_id — não sei se já é do nó; seguro: sem carimbo do mini e sem sessão do mini; a próxima varredura relê"; return 2 ;;
+    esac
+    # a sessão lenta deste sweep já gastou o orçamento de spawn → nem escreve (o apply grava a bead; sem poder abrir a sessão seria só um desfazer a mais). Nada escrito → 1 (segue no mini).
+    if _pilot_slow_spawn_budget_spent; then
+      log "  ga-w7qwl1.2.2: $_id fica no mini — uma sessão lenta já gastou o orçamento de spawn deste sweep (só uma sessão lenta por sweep); nada escrito"
+      return 1
+    fi
+  fi
+  if [ "$_dry" = 1 ]; then
+    _out=$(timeout "${PILOT_WA_MBP_TIMEOUT:-90}" "$_dir/mbp-node-dispatch.sh" apply "$_id" --store "$_store" --basis any --dry-run 2>/dev/null) || _rc=$?
+  else
+    _out=$(timeout "${PILOT_WA_MBP_TIMEOUT:-90}" "$_dir/mbp-node-dispatch.sh" apply "$_id" --store "$_store" --basis any 2>/dev/null) || _rc=$?
+  fi
+  # a linha da decisão é medição, não decisão: a que não grava avisa (em shadow ela é a ÚNICA saída do gancho) e o despacho segue o mesmo
+  mkdir -p "$GC_CITY/.gc" 2>/dev/null || true
+  jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg b "$_id" --arg m "$_mode" --argjson rc "$_rc" --arg o "$_out" \
+    '{ts:$ts,event:"pilot-node-route",bead:$b,mode:$m,rc:$rc,out:$o}' >> "$GC_CITY/.gc/mbp-node-route.jsonl" 2>/dev/null \
+    || warn "mbp-node: linha de $_id ($_mode, rc=$_rc) NÃO gravada em mbp-node-route.jsonl — a amostra do shadow fica subcontada"
+  if [ "$_dry" = 1 ]; then
+    # só o rc 0 do `apply --dry-run` diz "iria ao MBP"; 10/11/12 e o resto = não iria (ou o script não soube dizer). O shadow só grava a linha (acima): nada no log do Pilot por bead.
+    if [ "$_mode" = on ]; then
+      if [ "$_rc" = 0 ]; then log "  ga-w7qwl1.2.2: WOULD route $_id to the MBP (dry-run: nothing written)"
+      else log "  ga-w7qwl1.2.2: dry-run: $_id would NOT go to the MBP (mbp-node-dispatch.sh rc=$_rc; nothing written)"; fi
+    fi
+    return 1
+  fi
+  case "$_rc" in
+    0) ;;
+    13|124|137|143) warn "mbp-node: $_id — resultado da escrita desconhecido (rc=$_rc); não despacho esta varredura"; _pilot_mbp_node_settle "$_id" "$_store"; return 2 ;;
+    # morto por qualquer outro sinal (128+n) = o mesmo "não sei se já escreveu"; 125-127 (o timeout falhou, não deu para executar, não achou) e o resto: nada rodou
+    12[89]|1[3-9][0-9]|2[0-4][0-9]|25[0-5]) warn "mbp-node: $_id — o despachante morreu por sinal (rc=$_rc); a escrita pode ter acontecido; não despacho esta varredura"; _pilot_mbp_node_settle "$_id" "$_store"; return 2 ;;
+    *) return 1 ;;
+  esac
+  # o apply só escreveu (dono + marca); a sessão do alias é do gancho: 0 aberta e avisada · 1 desfeito e confirmado (segue no mini) · 2 segura
+  _pilot_mbp_node_open "$_id" "$_store"
+}
+
+# _pilot_mbp_node_open <id> <loja> — depois do apply: lê a bead e abre (ou acorda) a sessão do alias a que ela foi atribuída. Só abre para a cara exata do que o apply escreve (dono wa-worker-remote-mbp-1..2, marca
+# pilot.wa_node_alias igual ao dono, in_progress); o alias do Hetzner (wa-worker-remote-<k>) nunca vale aqui. Qualquer outra coisa = 2 sem escrever e sem abrir. A leitura e a abertura são as genéricas do WA.
+# vazio (dono ou marca vazios) → 2; falhou/ilegível (a bead não releu, dono fora de wa-worker-remote-mbp-1..2, marca diferente do dono, status que não é in_progress) → 2, sem sessão e sem desfazer: a próxima varredura relê.
+_pilot_mbp_node_open() {
+  local _mo_id="${1:-}" _mo_store="${2:-}" _mo_rc=0
+  if ! _pilot_wa_node_read "$_mo_id" "$_mo_store"; then
+    warn "mbp-node: não consegui reler $_mo_id depois do apply — não sei a qual alias abrir a sessão; seguro: sem sessão e sem desfazer; a próxima varredura relê"
+    return 2
+  fi
+  case "$_PWR_ALIAS" in
+    wa-worker-remote-mbp-[1-2]) ;;
+    *) warn "mbp-node: $_mo_id depois do apply está com dono '${_PWR_ALIAS:-}' (esperava wa-worker-remote-mbp-<1|2>) — seguro: sem sessão e sem desfazer; a próxima varredura relê"; return 2 ;;
+  esac
+  if [ "$_PWR_STATUS" != in_progress ] || [ "$_PWR_MARK" != "$_PWR_ALIAS" ]; then
+    warn "mbp-node: $_mo_id depois do apply está com marca '${_PWR_MARK:-}' e status '$_PWR_STATUS' (esperava marca=$_PWR_ALIAS e in_progress) — seguro: sem sessão e sem desfazer; a próxima varredura relê"
+    return 2
+  fi
+  _pilot_node_remote_open wa-worker-remote-mbp "$_PWR_ALIAS" "$_mo_id" "$_mo_store" "$_PWR_TITLE" pilot.wa_node_alias "$(_pilot_node_idle_secs)" whatsapp_automation || _mo_rc=$?
+  return "$_mo_rc"
+}
+
+# _pilot_mbp_node_settle <id> <loja> — depois de um rc incerto do apply (13, prazo, sinal). A escrita pode ter pegado e então NINGUÉM abriria a sessão (a marca não é rota): a bead ficaria dona de um alias sem sessão e toda
+# varredura a seguraria como "já é do nó". Desfaz SÓ o que tem a cara do que o apply escreve (in_progress, dono wa-worker-remote-mbp-<1|2>, marca igual ao dono). Quem chama devolve 2 (segura) de qualquer jeito.
+# vazio (bead livre: a escrita não pegou) → não escreve nada; falhou/ilegível (a bead não leu) → não escreve nada (não sei o que há lá); dono, marca ou status de outro jeito → não toca (é de outro).
+_pilot_mbp_node_settle() {
+  local _ms_id="${1:-}" _ms_store="${2:-}"
+  _pilot_wa_node_read "$_ms_id" "$_ms_store" || return 0
+  case "$_PWR_ALIAS" in wa-worker-remote-mbp-[1-2]) ;; *) return 0 ;; esac
+  if [ "$_PWR_STATUS" != in_progress ] || [ "$_PWR_MARK" != "$_PWR_ALIAS" ]; then return 0; fi
+  warn "mbp-node: $_ms_id ficou com o alias $_PWR_ALIAS depois de um apply incerto e sem sessão — desfaço (a próxima varredura tenta de novo)"
+  _pilot_node_remote_rollback "$_PWR_ALIAS" "$_ms_id" "$_ms_store" 0 pilot.wa_node_alias || true
+  return 0
+}
+
 # ── ga-2hd02v.9: a passada de WA no nó — a bead de WA que o nó levaria chega ao gancho MESMO carimbada pelo mini ─────────────────────────────────
 # Medido 20-21/10: 193 beads de WA cedidas a P0/P1 e 59 no teto do pool em 24 h; 3 chegaram ao gancho (_pilot_wa_node_decide). Isentar essas beads do yield/do teto (como a 1.19 fez para dog) NÃO resolve: 173 de 182 já levam
 # gc.routed_to=wa-worker — o carimbo que o PRÓPRIO Pilot grava ao ceder ou enfileirar — e o `apply` do wa-node-dispatch.sh recusa (rc 12) bead com rota. Esta passada roda UMA vez por varredura, antes das pistas, e só olha WA:
@@ -14953,6 +15068,13 @@ TASK
           return 1
         fi
         _pilot_wa_node_decide "$STORY_ID" "$STORY_BEAD_CITY" "$_SLING_TARGET" || _RP_NODE_RC=$?
+        # ga-w7qwl1.2.2: o MBP vem DEPOIS do Hetzner (o nó 24/7 não perde a vez) e só na varredura normal: a passada de WA e a só-nó do disk floor soltam a bead por rótulo, mais abaixo, e não passam por aqui.
+        # rc 0: a bead já está com o MBP e a sessão aberta, o mesmo caminho do nó (o braço wa-worker-remote do spawn só loga); rc 2: segura; rc 1 (padrão PILOT_WA_MBP_ROUTE=off): nada muda, o caminho do mini segue.
+        if [ "$_RP_NODE_RC" = 1 ] && [ "${_PILOT_WA_NODE_PASS:-0}" != "1" ] && [ "${_PILOT_NODE_ONLY:-0}" != "1" ]; then
+          local _RP_MBP_RC=0
+          _pilot_mbp_node_decide "$STORY_ID" "$STORY_BEAD_CITY" "$_SLING_TARGET" || _RP_MBP_RC=$?
+          case "$_RP_MBP_RC" in 0) _RP_NODE_RC=0 ;; 2) _RP_NODE_RC=2 ;; esac
+        fi
         if [ "$_RP_NODE_RC" = 0 ]; then
           _SLING_TARGET="wa-worker-remote"
           # ga-2hd02v.9: a bead ficou com o nó — a vaga virtual de wa-worker-N que o dispatch_one marcou não é consumida no mini
