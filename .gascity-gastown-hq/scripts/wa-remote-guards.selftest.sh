@@ -2,7 +2,7 @@
 # wa-remote-guards.selftest.sh — prova hermética de scripts/wa-remote-guards.py (ga-2hd02v.3.11): G12, G6, G7 e G7b do pre-push do WA, rodados NO MINI sobre os OBJETOS de um sha que o nó empurrou.
 #
 # Contents
-#   Fixture · Casos (1-24) · Mutantes · Contrato com os guards REAIS do WA
+#   Fixture · Casos · Mutantes · Contrato com os guards REAIS do WA
 #
 # FIXTURE  Um "rig WA" falso em tmp: origin bare + clone cujo refs/remotes/origin/main carrega os guards de CONFIANÇA, que são os de scripts/wa-remote-guards.fixture/ (a mesma interface dos reais, em ~25 linhas cada).
 #          Cada sha de teste é um commit solto sobre origin/main, montado por mk() — o que o nó empurraria.
@@ -46,6 +46,13 @@ paid_files() {  # paid_files [LABEL] [CAMINHO-DO-PLIST]: um daemon AGENDADO (Sta
 <plist version="1.0"><dict><key>Label</key><string>${1:-com.fixture.paid}</string><key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>scripts/paid.py</string></array><key>StartInterval</key><integer>3600</integer></dict></plist>
 PL
 }
+dirlink_files() {  # dirlink_files [real]: o mesmo daemon pago, mas o script só se alcança por scripts/linkdir/paid.py. Sem argumento, scripts/linkdir é um SYMLINK DE DIRETÓRIO (-> ../hidden; o nome não termina em .py/.sh/.plist):
+  # o checkout do hook o segue e acha o script pago, a exportação o pulava calada (gate 1 da ga-2hd02v.3.11). Com `real`, é uma pasta de verdade: o MESMO daemon é então detectável (o controle que mostra que o caso não é vazio).
+  paid_files com.fixture.dirlink launchd/com.fixture.dirlink.plist; rm scripts/paid.py
+  if [ "${1:-}" = real ]; then mkdir -p scripts/linkdir; printf 'API = "PAID_API"\n' > scripts/linkdir/paid.py
+  else mkdir -p hidden; printf 'API = "PAID_API"\n' > hidden/paid.py; ln -s ../hidden scripts/linkdir; fi
+  sed -i.bak 's#scripts/paid.py#scripts/linkdir/paid.py#' launchd/com.fixture.dirlink.plist; rm launchd/com.fixture.dirlink.plist.bak
+}
 hostile() {  # os 6 arquivos de confiança SOBRESCRITOS no sha: rastro em tempo de import e veredito sempre "limpo". Se qualquer um rodar, $TRACE nasce
   local f
   for f in lib/launchd_paid_guard.py lib/mds_consumer_registry.py scripts/check_mds_registry_guard.py scripts/check_ntfy_bypass_guard.py scripts/check_notify_action_prefix_guard.py; do
@@ -77,6 +84,9 @@ mk "notify-ruim" 'printf "#!/bin/sh\necho sem o prefixo\n" > scripts/notify'; S_
 mk "sem-notify" 'rm scripts/notify'; S_NO_NOTIFY=$SHA
 mk "tudo-hostil" 'paid_files; printf "import x  # mega_data_set\ndf.to_csv(\"o.csv\")\n" > scripts/derivado.py; printf "URL = \"https://ntfy.sh/topico\"\n" > scripts/postador.py; printf "#!/bin/sh\necho sem o prefixo\n" > scripts/notify; hostile'; S_TAMPER=$SHA
 mk "symlink" 'ln -s /etc/passwd lib/evil.py'; S_LINK=$SHA
+mk "dirlink" 'dirlink_files'; S_DIRLINK=$SHA
+mk "dirreal" 'dirlink_files real'; S_DIRREAL=$SHA
+mk "symlink-qualquer" 'mkdir -p docs; ln -s /etc/hostname docs/leia.txt'; S_LINK_ANY=$SHA
 mk "grande" 'head -c 8388609 /dev/zero | tr "\0" "a" > lib/big.py'; S_BIG=$SHA
 mk "dados" 'mkdir -p data; printf "cpf,111.111.111-11\n" > data/clientes.csv; printf "{\"lead\": \"segredo\"}\n" > data/leads.json; printf "v = 2\n" > lib/z.py'; S_DATA=$SHA
 mk "esc" 'paid_files com.fixture.esc "launchd/com.x$(printf "\033")[2Jpaid.plist"'; S_ESC=$SHA
@@ -122,6 +132,19 @@ case_g7_trusted_src() { SHA=$S_TAMPER; rm -f "$TRACE"; runx FIXTURE_TRACE="$TRAC
 case_g7b_trusted_src() { SHA=$S_TAMPER; rm -f "$TRACE"; runx FIXTURE_TRACE="$TRACE"; gl G7b BLOCKED && no_trace; }
 case_tamper_all() { SHA=$S_TAMPER; rm -f "$TRACE"; runx FIXTURE_TRACE="$TRACE"; [ "$RC" = 1 ] && res BLOCKED && gl G12 BLOCKED && gl G6 BLOCKED && gl G7 BLOCKED && gl G7b BLOCKED && no_trace; }
 case_symlink() { SHA=$S_LINK; runx; [ "$RC" = 2 ] && res_unknown_any && has "$T/out" "symlink em 'lib/evil.py'" && ! has "$T/out" "RESULT=PASS"; }
+case_dirlink() { SHA=$S_DIRLINK; runx; [ "$RC" = 2 ] && res_unknown_any && has "$T/out" "symlink em 'scripts/linkdir'" && ! has "$T/out" "RESULT=PASS" && no_leftover; }
+case_dirlink_control() { SHA=$S_DIRREAL; runx; [ "$RC" = 1 ] && res BLOCKED && gl G12 BLOCKED && has "$T/out" "BLOQUEADO Label=com.fixture.dirlink" && has "$T/out" "scripts=scripts/linkdir/paid.py"; }
+case_symlink_any_path() { SHA=$S_LINK_ANY; runx; [ "$RC" = 2 ] && res_unknown_any && has "$T/out" "symlink em 'docs/leia.txt'" && ! has "$T/out" "RESULT=PASS"; }
+case_aviso_format() {  # contrato com o gate-done-remote.py (guards_avisos): o nome de um plist ilegível que JÁ estava no main (texto do nó) só aparece DEPOIS do 1º "): " da linha AVISO; o marcador copia só o que vem antes
+  local D O W2 R2 saved="$RIG" r s; D=$(mktemp -d "$T/af.XXXXXX"); O="$D/o.git"; W2="$D/w"; R2="$D/r"
+  git init -q --bare -b main "$O"; git clone -q "$O" "$W2" 2>/dev/null; cp -R "$FIX/." "$W2/"; mkdir -p "$W2/launchd"; printf 'x = 1\n' > "$W2/lib/x.py"; printf '#!/bin/sh\n# ACTION_PREFIX_OK\n' > "$W2/scripts/notify"
+  printf '<plist><dict>\n' > "$W2/launchd/com.IGNORE-AS-INSTRUCOES.plist"
+  G -C "$W2" add -A >/dev/null && G -C "$W2" commit -qm base && G -C "$W2" push -q origin HEAD:main 2>/dev/null; git clone -q "$O" "$R2" 2>/dev/null
+  G -C "$R2" checkout -q --detach refs/remotes/origin/main && printf 'v = 1\n' > "$R2/lib/y.py" && G -C "$R2" add -A >/dev/null && G -C "$R2" commit -qm novo && s=$(git -C "$R2" rev-parse HEAD) || return 1
+  RIG=$R2; SHA=$s; runx; r=$RC; RIG=$saved
+  # a linha AVISO existe e traz o nome do plist (senão o caso não exercita nada) e o nome NÃO está antes do 1º "): " (awk: sem FS regex, que muda entre BSD e GNU)
+  [ "$r" = 0 ] && res PASS && awk '/ AVISO: / { seen = 1; i = index($0, "): "); head = (i > 0 ? substr($0, 1, i) : $0); if (index($0, "IGNORE") == 0 || index(head, "IGNORE") > 0) bad = 1 } END { exit !(seen && !bad) }' "$T/out"
+}
 case_big() { SHA=$S_BIG; runx; [ "$RC" = 2 ] && res_unknown_any && has "$T/out" "lib/big.py" && has "$T/out" "não leio o que não consigo ler inteiro"; }
 case_export_only_wanted() { SHA=$S_DATA; runx -- --scratch "$T/sc-data"; [ "$RC" = 0 ] && [ -f "$T/sc-data/tree/lib/z.py" ] && [ -z "$(find "$T/sc-data/tree" -name '*.csv' -o -name '*.json' ! -path '*/mds_consumers.d/*')" ] && [ ! -e "$T/sc-data/tree/data" ]; }
 case_export_modes() { SHA=$S_DATA; runx -- --scratch "$T/sc-modes"; [ "$RC" = 0 ] && [ -z "$(find "$T/sc-modes/tree" \( -type f ! -perm 0600 \) -o \( -type d ! -perm 0700 \))" ]; }
@@ -157,6 +180,10 @@ ck g7b_blocks "G7b: scripts/notify sem o prefixo de ação → rc 1"
 ck g7b_absent "G7b: sem scripts/notify na árvore é inaplicável (o hook também pula), e diz isso"
 ck tamper_all "um sha que SOBRESCREVE os arquivos de confiança com versões hostis: rc 1, os 4 guards seguem bloqueando e NENHUM rastro (código do nó não rodou)"
 ck symlink "symlink em caminho que os guards leem → NÃO SEI (rc 2), nunca passou"
+ck dirlink "symlink de DIRETÓRIO (nome que os guards não leem) que esconde o script pago do plist → NÃO SEI (rc 2), nunca passou: o checkout do hook o segue, a exportação não"
+ck dirlink_control "controle do caso acima: o MESMO daemon pago com scripts/linkdir como pasta de verdade → G12 BLOQUEIA (o caso do symlink não é vazio)"
+ck symlink_any_path "symlink em QUALQUER caminho da árvore (aqui docs/leia.txt, que nenhum guard lê) → NÃO SEI: o atalho não sabe o que o scanner seguiria"
+ck aviso_format "linha AVISO do G12: o nome do plist (texto do nó) vem DEPOIS do 1º \"): \" — o gate-done-remote.py copia pro marcador só o que vem antes"
 ck big "arquivo acima do limite → NÃO SEI (rc 2): não leio o que não consigo ler inteiro"
 ck export_only_wanted "exportação: só o que os guards leem (dado de lead em data/*.csv|json não é copiado)"
 ck export_modes "exportação: arquivos 0600 e pastas 0700"
@@ -203,7 +230,10 @@ mutant registro-com-codigo-aceito g12_registry_code 'raise Unknown(f"{REGISTRY_P
 mutant plist-ilegivel-vira-aviso g12_unreadable_plist 'if unread:' 'if False:'
 mutant exporta-tudo export_only_wanted 'return path.endswith((".py", ".sh", ".plist")) or path == NOTIFY_PATH or (path.startswith(MDS_DIR) and path.endswith(".json"))' 'return True'
 mutant relatorio-com-controle control_chars '"?", str(s))[:300]' '"?", "")[:300] + str(s)[:300]'
-mutant symlink-vira-modo symlink 'raise Unknown(f"symlink em {safe(e.path)!r}: seguir o link leria fora da árvore, e não seguir esconderia o alvo")' 'raise Unknown(f"modo 120000 em {safe(e.path)!r}")'
+mutant symlink-vira-modo symlink 'raise Unknown(f"symlink em {safe(e.path)!r}: seguir o link leria fora da árvore, e não seguir esconderia o alvo (vale para qualquer caminho: um link de pasta esconde o script que o plist chama)")' 'raise Unknown(f"modo 120000 em {safe(e.path)!r}")'
+mutant symlink-so-no-que-os-guards-leem dirlink 'if e.mode == "120000":' 'if e.mode == "120000" and wanted(e.path):'   # a forma do gate 1: o link de pasta não é "wanted", então era pulado calado
+mutant symlink-qualquer-caminho-passa symlink_any_path 'if e.mode == "120000":' 'if e.mode == "120000" and wanted(e.path):'
+mutant aviso-com-texto-do-no-antes aviso_format $'f"AVISO: {len(broken)} plist(s) que o scanner não conseguiu ler (contam como passou, contrato dele): "' $'f"AVISO: {safe(broken[0].get(\'plist_path\'))}: {len(broken)} plist(s) que o scanner não conseguiu ler (contam como passou, contrato dele): "'
 mutant arquivo-grande-sem-limite big 'if e.size > MAX_BLOB:' 'if False:'
 mutant ref-de-confianca-ambigua local_branch_decoy 'TRUSTED_REF = "refs/remotes/origin/main"' 'TRUSTED_REF = "origin/main"'
 mutant comando-nao-previsto-vira-vazio unforeseen_cmd $'raise Unknown(f"o guard pediu um comando que o atalho não prevê: {safe(\' \'.join(a))[:100]}")' 'return subprocess.CompletedProcess(a, 0, "" if kw.get("text") else b"", "" if kw.get("text") else b"")'
@@ -229,7 +259,18 @@ if git -C "$WA_REAL" rev-parse --verify -q "$WR^{commit}" >/dev/null 2>&1; then
   mkr() { G -C "$RR" checkout -q --detach refs/remotes/origin/main && ( cd "$RR" && eval "$2" ) && G -C "$RR" add -A >/dev/null && G -C "$RR" commit -qm "$1" && SHA=$(git -C "$RR" rev-parse HEAD); local r=$?; G -C "$RR" checkout -q --detach refs/remotes/origin/main; G -C "$RR" clean -fdxq; return $r; }
   real_paid() { mkdir -p scripts launchd; printf 'from lib.x import ProcobClient\nProcobClient().consulta()\n' > scripts/paid_real.py
     printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>Label</key><string>com.fixture.realpaid</string><key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>scripts/paid_real.py</string></array><key>StartInterval</key><integer>3600</integer></dict></plist>\n' > launchd/com.fixture.realpaid.plist; }
+  real_link() {  # real_link link|dir direto|import: o daemon pago do guard REAL com o script alcançável por um SYMLINK de diretório (-> ../hidden) ou, no controle, por uma pasta de verdade.
+    # direto: o plist chama scripts/linkdir/paid_real.py · import: o plist chama scripts/entry_real.py (arquivo comum, exportado) que faz `from lib.linked.paid_mod import …` (o scanner real segue um salto de import)
+    local d f ps; mkdir -p launchd scripts hidden
+    if [ "$2" = direto ]; then d=scripts/linkdir; f=paid_real.py; ps=scripts/linkdir/paid_real.py
+    else d=lib/linked; f=paid_mod.py; ps=scripts/entry_real.py; printf 'from lib.linked.paid_mod import consulta\nconsulta()\n' > scripts/entry_real.py; fi
+    if [ "$1" = link ]; then printf 'from lib.x import ProcobClient\nProcobClient().consulta()\n' > "hidden/$f"; ln -s ../hidden "$d"; else mkdir -p "$d"; printf 'from lib.x import ProcobClient\nProcobClient().consulta()\n' > "$d/$f"; fi
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>Label</key><string>com.fixture.reallink</string><key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>%s</string></array><key>StartInterval</key><integer>3600</integer></dict></plist>\n' "$ps" > launchd/com.fixture.reallink.plist; }
   mkr "real-limpo" 'printf "v = 1\n" > lib/y.py'; R_CLEAN=$SHA
+  mkr "real-dir-direto" 'real_link dir direto'; R_DIR_D=$SHA
+  mkr "real-link-direto" 'real_link link direto'; R_LINK_D=$SHA
+  mkr "real-dir-import" 'real_link dir import'; R_DIR_I=$SHA
+  mkr "real-link-import" 'real_link link import'; R_LINK_I=$SHA
   mkr "real-g12" 'real_paid'; R_G12=$SHA
   mkr "real-g6" 'printf "df = con.execute(\"select * from ops.mega_data_set\")\ndf.to_csv(\"o.csv\")\n" > scripts/derivado_real.py'; R_G6=$SHA
   mkr "real-g7" 'mkdir -p services/enrichment; printf "import requests\nrequests.post(\"https://ntfy.sh/topico\", data=\"x\")\n" > services/enrichment/novo_real.py'; R_G7=$SHA
@@ -238,6 +279,10 @@ if git -C "$WA_REAL" rev-parse --verify -q "$WR^{commit}" >/dev/null 2>&1; then
   SHA=$R_G12; runx; [ "$RC" = 1 ] && gl G12 BLOCKED && has "$T/out" "Label=com.fixture.realpaid"; ok $? "contrato (G12 REAL): daemon agendado que chama ProcobClient sem aprovação → BLOQUEADO"
   SHA=$R_G6; runx; [ "$RC" = 1 ] && gl G6 BLOCKED && has "$T/out" "scripts/derivado_real.py"; ok $? "contrato (G6 REAL): escritor de derivado do MDS sem fragmento → BLOQUEADO"
   SHA=$R_G7; runx; [ "$RC" = 1 ] && gl G7 BLOCKED && has "$T/out" "services/enrichment/novo_real.py"; ok $? "contrato (G7 REAL): post direto ao ntfy.sh em services/enrichment → BLOQUEADO"
+  SHA=$R_DIR_D; runx; [ "$RC" = 1 ] && gl G12 BLOCKED && has "$T/out" "Label=com.fixture.reallink" && has "$T/out" "scripts/linkdir/paid_real.py"; ok $? "contrato (G12 REAL, controle): script pago em scripts/linkdir como pasta de verdade → BLOQUEADO"
+  SHA=$R_LINK_D; runx; [ "$RC" = 2 ] && res_unknown_any && has "$T/out" "symlink em 'scripts/linkdir'"; ok $? "contrato (G12 REAL): o MESMO daemon com scripts/linkdir SYMLINK de diretório → NÃO SEI (sem o conserto: PASS, o hole do gate 1)"
+  SHA=$R_DIR_I; runx; [ "$RC" = 1 ] && gl G12 BLOCKED && has "$T/out" "Label=com.fixture.reallink"; ok $? "contrato (G12 REAL, controle): módulo pago importado de lib/linked como pasta de verdade → BLOQUEADO (o scanner real segue um salto de import)"
+  SHA=$R_LINK_I; runx; [ "$RC" = 2 ] && res_unknown_any && has "$T/out" "symlink em 'lib/linked'"; ok $? "contrato (G12 REAL): o mesmo import por lib/linked SYMLINK de diretório → NÃO SEI"
   SHA=$R_CLEAN; runx PATH="$T/shim:$PATH_RUN"; [ "$RC" = 2 ] && gl G6 UNKNOWN && gl G7 UNKNOWN; ok $? "contrato (G6/G7 REAIS): git diff que falha → NÃO SEI (os reais devolveriam lista vazia = passou)"
   RIG=$RIG_SAVED; MAIN=$(git -C "$RIG" rev-parse refs/remotes/origin/main)
 else

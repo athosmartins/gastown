@@ -17,7 +17,7 @@ POR QUE NÃO RODA O HOOK
 COMO RODA, EM ORDEM (passo que não consegue saber algo para sem dizer "passou": "não sei" nunca vira "pode")
   1. Confere o sha (um commit do rig) e resolve `origin/main` UMA vez: esse commit é a CONFIANÇA (de onde vêm os guards) e a base do diff (`origin/main...sha`, como o `origin/main...HEAD` do hook).
   2. Lê a árvore do sha (`git ls-tree -r`) e exporta, como arquivos regulares 0600 sob `<scratch>/tree`, só o que os guards leem: *.py, *.sh, *.plist, scripts/notify e
-     lib/mds_consumers.d/*.json. Symlink nesses caminhos, arquivo maior que 8 MB, caminho com `..`/`.git`, colisão de nome (macOS não distingue maiúscula) ou pouco disco → "não sei".
+     lib/mds_consumers.d/*.json. Symlink em QUALQUER caminho da árvore (o scanner do G12 segue link: um link de pasta esconde o script que o plist chama), arquivo maior que 8 MB, caminho com `..`/`.git`, colisão de nome (macOS não distingue maiúscula) ou pouco disco → "não sei".
   3. Carrega os arquivos de confiança de `origin/main` em memória (lib/launchd_paid_guard.py, scripts/check_mds_registry_guard.py, lib/mds_consumer_registry.py, scripts/check_ntfy_bypass_guard.py,
      scripts/check_notify_action_prefix_guard.py) e aponta a raiz deles para a exportação. Chama o `check()` de cada guard, NUNCA o `main()` (o main de G6 e G7 devolve 0 se der exceção:
      "fail OPEN"). O `subprocess` do módulo é trocado por um que só entende `git diff --name-only … A...B` e `git ls-files -z -- *.plist` e que RECUSA (em vez de devolver lista vazia) quando o git falha.
@@ -143,13 +143,15 @@ def export_tree(repo: str, entries: list, root: Path) -> dict:
     """Grava como arquivos inertes só o que os guards leem. Devolve contagens. Qualquer coisa que impeça uma leitura fiel → Unknown (a exportação incompleta daria PASS por ausência)."""
     todo = []
     for e in entries:
+        # QUALQUER symlink da árvore, antes do filtro wanted(): o scanner do G12 resolve por Path.resolve()/is_file(), que seguem link, então um link de DIRETÓRIO (nome que nenhum guard lê) esconde o script que o plist chama
+        # ou o módulo que ele importa; pulá-lo calado dava PASS onde o checkout do hook dá BLOQUEADO (gate 1 da ga-2hd02v.3.11). O origin/main do WA tem 0 symlinks, então isto não recusa nada legítimo hoje.
+        if e.mode == "120000":
+            raise Unknown(f"symlink em {safe(e.path)!r}: seguir o link leria fora da árvore, e não seguir esconderia o alvo (vale para qualquer caminho: um link de pasta esconde o script que o plist chama)")
         if not wanted(e.path):
             continue
         check_path(e.path)
         if e.mode == "160000":  # submódulo: o hook também não o vê num checkout sem `submodule update`
             continue
-        if e.mode == "120000":
-            raise Unknown(f"symlink em {safe(e.path)!r}: seguir o link leria fora da árvore, e não seguir esconderia o alvo")
         if e.mode not in ("100644", "100755"):
             raise Unknown(f"modo {e.mode} em {safe(e.path)!r}")
         if e.size > MAX_BLOB:
@@ -321,6 +323,7 @@ def guard_g12(c: Run) -> tuple:
     unread = [os.path.relpath(i.get("plist_path", "?"), c.root) for i in broken if os.path.relpath(i.get("plist_path", "?"), c.root) in changed]
     if unread:
         raise Unknown(f"plist alterado neste sha que o scanner não conseguiu ler ({safe(unread[0])}; {len(unread)} no total): não sei se agenda algo pago")
+    # CONTRATO com o gate-done-remote.py (guards_avisos): numa linha AVISO, o que vem do nó (Label, caminho, nome de arquivo, motivo) vai SEMPRE depois do 1º "): "; o marcador copia só o que vem antes. AVISO novo segue a mesma forma (o caso aviso_format do selftest pega o G12).
     lines = []
     if broken:
         lines.append(f"AVISO: {len(broken)} plist(s) que o scanner não conseguiu ler (contam como passou, contrato dele): " + ", ".join(safe(os.path.relpath(i.get('plist_path', '?'), c.root)) for i in broken[:5]))
@@ -347,6 +350,7 @@ def guard_g6(c: Run) -> tuple:
         raise
     except Exception as e:  # o main() do guard devolveria 0 aqui ("fail OPEN"); o atalho não
         raise Unknown(f"G6 levantou {type(e).__name__}: {safe(e)[:120]}")
+    # mesma forma de AVISO que o G12 (texto do nó depois do 1º "): "): ver o CONTRATO em guard_g12
     lines = [f"AVISO: fragmento MDS registrado mas inválido (não bloqueia, como no hook): {safe(s.get('file'))}: {safe(s.get('reason'))}" for s in skipped]
     lines += [f"BLOQUEADO {safe(p)}: lê ops.mega_data_set e parece gravar um derivado, sem fragmento em lib/mds_consumers.d/<nome>.json" for p in offenders]
     if offenders:

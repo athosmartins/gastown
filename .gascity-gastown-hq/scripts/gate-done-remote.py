@@ -45,7 +45,7 @@ O QUE NÃO FAZ
   `prepush=False` na tabela RIGS (hoje só o WA) roda os blocos do gate-done.md com core.hooksPath numa pasta vazia da cidade (por ambiente; o gate-done.md e a config do rig ficam como estão), e o aviso vai ao cliente e ao `self_audit:` do marcador. HQ e PS seguem com o hook.
   Em troca (ga-2hd02v.3.11), rig com `guards=True` (hoje só o WA) roda G12 (daemon agendado pago sem aprovação), G6 (registro MDS), G7 (ntfy direto) e G7b (ação do notify) ANTES do worktree, por wa-remote-guards.py: o código é o de
   `origin/main` do rig e os dados são os OBJETOS do sha, exportados como arquivos inertes (nada do nó é importado nem executado). Reprovou (rc 1 dele COM `RESULT=BLOCKED` do mesmo sha) → recusa 1; não deu para verificar (inclusive um estouro, que também sai 1) → recusa 2; nos dois casos nenhum marcador nasce. As suítes pytest e o resto do hook
-  seguem NÃO verificados e o `self_audit:` do marcador diz exatamente isso (só G12, G6, G7 e G7b foram verificados).
+  seguem NÃO verificados e o `self_audit:` do marcador diz exatamente isso (só G12, G6, G7 e G7b foram verificados) e conta os AVISO que os guards imprimiram (sem copiar o texto que veio do nó).
   Não roda a checagem "NEW READS NEED A FAILURE TEST" nem a auto-auditoria do diff (são do construtor, antes do push): o marcador registra
   `self_audit: … auto-auditoria do diff NÃO verificada aqui`, visível, não calado.
   Só os rigs da tabela RIGS (gascity, property_scrapers, whatsapp_automation; ga-2hd02v.4): o PAPEL da sessão
@@ -111,6 +111,7 @@ GUARDS_BIN = Path(__file__).resolve().with_name("wa-remote-guards.py")
 GUARDS_TIMEOUT = 180  # medido 23/10 com o mini a load 55: 17 s (WA main, 304 plists) a 65 s; o wrapper corta tudo em timeout_s (300 por padrão), então estourar aqui vira recusa limpa antes de qualquer escrita
 GUARDS_PASS_RE = re.compile(r"^wa-remote-guards: RESULT=PASS sha=([0-9a-f]{40}) trusted=([0-9a-f]{40})\s*$", re.M)  # o "certificado": sem esta linha um rc 0 não vale
 GUARDS_BLOCK_RE = re.compile(r"^wa-remote-guards: RESULT=BLOCKED sha=([0-9a-f]{40}) trusted=([0-9a-f]{40})\s*$", re.M)  # idem para o rc 1: um Python que estoura também sai 1, e isso NÃO é "reprovou"
+GUARDS_WARN_RE = re.compile(r"^wa-remote-guards:\s+AVISO:\s*(.*?)\s*$", re.M)  # uma linha AVISO do exe (G12: plist ilegível / agendado sem entrypoint; G6: fragmento MDS inválido); o grupo é o texto depois de "AVISO:"
 ROLE_RE = re.compile(r"(dog-remote|ps-worker-remote|wa-worker-remote)(?:-|$)")  # o papel de um nome de sessão; gate-reviewer-remote e nomes de teste não casam → vale o rig do HQ, como antes
 
 
@@ -482,6 +483,22 @@ def lease_push(repo: str, wt: str, env: dict, sess: str, branch: str, sha: str, 
         raise Stop(f"o push com --force-with-lease de {branch} (esperando {tip[:12]} no origin) falhou: o origin mudou depois que li, ou o hook do push recusou (git rc={p.returncode}: {p.stderr.strip()[:200]}). Nada foi submetido")
 
 
+def guards_avisos(out: str) -> str:
+    """O que o marcador (self_audit:) diz dos AVISO que os guards imprimiram: não bloqueiam (o hook também deixaria passar), mas o revisor do gate os lê onde decide, não só no stderr do cliente
+    (um plist agendado sem entrypoint resolvido foi o único rastro de um buraco medido no gate 1 da ga-2hd02v.3.11). Só entra a parte escrita pelo wa-remote-guards.py, até o 1º "): " de cada linha: o que
+    vem depois (Label de plist, nome de arquivo, motivo) é texto do NÓ, e o revisor lê este campo como fato, então ele nunca é copiado. Linha de forma que não reconheço entra contada e sem o texto."""
+    # vazio (nenhuma linha AVISO) → "nenhum AVISO": quem chama só chega aqui com o certificado conferido, então o exe foi até o fim e a ausência é resposta; ilegível (linha sem "): ") → conta e diz "forma desconhecida", nunca copia
+    linhas = GUARDS_WARN_RE.findall(out)
+    if not linhas:
+        return "nenhum AVISO dos guards"
+    shown = []
+    for ln in linhas[:4]:
+        head, sep, _ = ln.partition("): ")
+        shown.append(unicodedata.normalize("NFKD", head + ")").encode("ascii", "ignore").decode()[:160] if sep else "forma desconhecida (texto nao copiado)")
+    return (f"{len(linhas)} AVISO(s) dos guards (nao bloqueiam; o hook tambem deixaria passar; confira no diff): " + " | ".join(shown)
+            + (f" | (+{len(linhas) - 4} nao listado(s))" if len(linhas) > 4 else ""))
+
+
 def wa_guards(ctx: Ctx, sha: str, work: Path) -> str:
     """Roda G12/G6/G7/G7b sobre os OBJETOS de `sha` (wa-remote-guards.py, em subprocesso: código de confiança de origin/main do rig, dados inertes do sha). Devolve a nota do self_audit.
     Reprovou (rc 1 dele COM `RESULT=BLOCKED sha=<este sha>`) → Stop rc 1; não deu para saber (rc 2, timeout, estouro que também sai 1, saída sem o certificado, qualquer outra coisa) → Stop rc 2. Nunca chega ao marcador sem o certificado `RESULT=PASS sha=<este sha>`."""
@@ -499,7 +516,7 @@ def wa_guards(ctx: Ctx, sha: str, work: Path) -> str:
             raise Stop(f"não consegui verificar G12/G6/G7/G7b em {sha[:12]} (wa-remote-guards.py rc={r.returncode}, {len(found)} certificado(s); stderr: {r.stderr.strip()[:160]!r}): "
                        f"não submeto sem saber. O problema está no mini, não no seu diff: avise o Mayor", 2)
         return (f"so G12, G6, G7 e G7b foram verificados (pelos OBJETOS de {sha[:12]}, com os guards de origin/main @ {found[0][1][:12]}, wa-remote-guards.py); "
-                f"os demais guards do pre-push e as suites pytest nao foram verificados")
+                f"os demais guards do pre-push e as suites pytest nao foram verificados; " + guards_avisos(r.stdout))
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
         if os.path.exists(scratch):
