@@ -17,7 +17,8 @@
 #           a blip that is not on consecutive cycles never alerts
 #   S8-S10  "cannot tell" (origin/main gone, merge-base fails, HEAD unreadable): UNKNOWN-DETACHED, visible, never filed
 #           as healthy and never as off-main
-#   S11     an alert that cannot be remembered (state path unwritable) is loud on the first cycle, not silent
+#   S11     an alert that cannot be remembered (state path unwritable) is loud on the first cycle, not silent, and says
+#           so instead of promising a window; S11b the same when there is no usable clock
 #   S12     a crew branch left in the root is still backed up and restored
 #   S13     the production defaults of the test seams are the real paths
 # HOW. Real git: a bare "origin" plus a clone as the live root, in a throwaway dir. The guard runs as a subprocess
@@ -200,6 +201,15 @@ mk_world s11; fx checkout -q --detach "$U"; mkdir -p "$STATE"
 cycle 1
 has "S11 alert on the first cycle" "$LOG" "OFF-MAIN-DETACHED"
 eq "S11 notified on the first cycle" "$(nl "$NOTES")" 1
+has "S11 the line says why it will alert again" "$LOG" "Episode state unwritable"
+hasnt "S11 and does not promise a window it cannot keep" "$LOG" "Next alert in"
+
+echo "S11b: no usable clock — no window can be kept, so the alert must not go quiet"
+mk_world s11b; fx checkout -q --detach "$U"
+printf '#!/bin/sh\nexit 1\n' > "$BIN/date"; chmod +x "$BIN/date"
+cycle 1 WA_ROOT_GUARD_NOW=; cycle 2 WA_ROOT_GUARD_NOW=; cycle 3 WA_ROOT_GUARD_NOW=
+eq "S11b alerts on the 2nd and the 3rd cycle" "$(nl "$LOG")" 2
+has "S11b says there is no window" "$LOG" "No usable clock"
 
 echo "S12: a crew branch left in the root is still backed up and restored"
 mk_world s12; fx checkout -q -b crew/x; echo w > "$ROOT/w.txt"; fx add w.txt; fx commit -q -m crewwork

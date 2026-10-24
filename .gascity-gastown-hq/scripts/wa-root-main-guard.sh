@@ -115,7 +115,7 @@ clear_episode() {
 
 # No branch name: a detached HEAD (healthy when it sits on origin/main) or a HEAD git cannot read. Never restores; always exits 0.
 handle_detached() {
-  local rc=0 kind="" why="" head_sha="" om_sha="" count=0 first=0 alarm=0 fire=0 age="" why_state="" h12="" o12=""
+  local rc=0 kind="" why="" head_sha="" om_sha="" count=0 first=0 alarm=0 fire=0 age="" again="" h12="" o12=""
   # symbolic-ref -q: 0 = still a branch (only its name was unreadable), 1 = detached, >=128 = git failed → unknown, nunca saudável
   g symbolic-ref -q HEAD >/dev/null 2>&1; rc=$?
   case "$rc" in
@@ -154,18 +154,21 @@ handle_detached() {
       fire=1; alarm="$NOW"
     fi
   fi
+  # what the alert says about the next one has to be what the code does
+  again="Next alert in ${WINDOW_MIN}min if it persists."
+  if [ "$CLOCK_OK" = 0 ]; then again="No usable clock, so no window: alerting on every cycle."; fi
   if ! write_state "$kind" "$count" "$first" "$alarm"; then
-    fire=1; why_state=" [episode state unwritable: $STATE — alerting on every cycle until it is fixed]"
+    fire=1; again="Episode state unwritable ($STATE): alerting on every cycle until it is fixed."
   fi
 
   if [ "$fire" = 1 ]; then
     h12="${head_sha:0:12}"; o12="${om_sha:0:12}"; h12="${h12:-?}"; o12="${o12:-?}"
     age="$(age_min "$first")"
     if [ "$kind" = off-main ]; then
-      log "OFF-MAIN-DETACHED: production root is on a DETACHED HEAD ($h12) that origin/main ($o12) does not contain — unreviewed code is live (cycles=$count, ~$age). Detection only, NOT restoring; who/when: git -C $ROOT reflog. Next alert in ${WINDOW_MIN}min if it is still there.$why_state"
+      log "OFF-MAIN-DETACHED: production root is on a DETACHED HEAD ($h12) that origin/main ($o12) does not contain — unreviewed code is live (cycles=$count, ~$age). Detection only, NOT restoring; who/when: git -C $ROOT reflog. $again"
       note -p 4 -t 'wa-root-guard' "WA root DETACHED on $h12, NOT in origin/main — unreviewed code is live ($count cycles, ~$age). Detection only, NEEDS HUMAN"
     else
-      log "UNKNOWN-DETACHED: cannot tell whether the production root is on reviewed code — $why (HEAD $h12, origin/main $o12; cycles=$count, ~$age). NOT assuming healthy; detection only. Next alert in ${WINDOW_MIN}min if it persists.$why_state"
+      log "UNKNOWN-DETACHED: cannot tell whether the production root is on reviewed code — $why (HEAD $h12, origin/main $o12; cycles=$count, ~$age). NOT assuming healthy; detection only. $again"
       note -p 4 -t 'wa-root-guard' "WA root HEAD state UNKNOWN: $why — cannot confirm it is on origin/main, NEEDS HUMAN"
     fi
   fi
