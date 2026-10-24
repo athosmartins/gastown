@@ -476,6 +476,8 @@ _do_mail_mayor = None       # (subject, body) -> bool
 _read_pilot_log_lines = None  # () -> list[str]
 _bd_gate_markers = None     # () -> list[dict]|None; OPEN quality-gate-markers in the HQ store
 _bd_blocked = None          # (rig_root) -> list[dict]|None; None return = query error
+_bd_blocker_rows = None      # (rig_root, bead_id) -> list[dict]|None; the `dependencies` rows `bd show`
+                            # expands (id/status/closed_at/dependency_type); None = could not read (ga-9lcp7m)
 _bd_has_built_branch = None  # (bead_id) -> bool; True iff a delivery branch for the bead
                               # (the shared delivery-branch-patterns.sh list) exists (local or
                               # origin remote-tracking) anywhere
@@ -3830,6 +3832,140 @@ def _blocked_bead_ids(rig_root):
     return out
 
 
+# ── when a blocked bead was RELEASED (ga-9lcp7m) ─────────────────────────────────────────────────────
+# The starve clock (first_seen_approved) starts the first cycle this daemon sees the bead approved and
+# not flowing — and a bead held by an open `blocks` dependency is, correctly, never alarmed (above), so
+# nothing ever refreshes the clock while it waits. The cycle right after the LAST blocker closes then
+# reads the whole blocked time as starvation: measured 24/10 ~00:50, wa-bwo99o.7 and .8, blocked by
+# wa-bwo99o.5 (closed 03:45:42Z), alarmed "starving 2026min — dispatch failing ... may indicate a real
+# filter/query bug" — a sequential program turning every slice into a false alarm. The wait that can
+# indicate a dispatch failure only starts when nothing blocks the bead any more.
+# The dependency types the engine's own ready-work probe counts as blocking (the Pilot asks `bd blocked`
+# instead, and so does the check that gates this one). parent-child is containment, not a block: the
+# epic wa-bwo99o is still open and its slices were dispatched once their `blocks` dependency closed.
+_BLOCKING_DEP_TYPES = ("blocks", "waits-for", "conditional-blocks")
+# A closed_at later than this past `now` is not a clock skew, it is garbage: unreadable, not "just now".
+_BLOCKER_FUTURE_SKEW_SEC = 300
+
+
+def _blocker_rows(rig_root, bead_id):
+    """The `dependencies` rows `bd show` expands for the bead — {id, status, closed_at,
+    dependency_type, ...}, which the list-mode rows ({depends_on_id, type}) do not carry — or None
+    when they could not be read (ga-9lcp7m; root-class:error-vs-empty).
+
+    [] means "bd answered and this bead has no dependency rows"; a failed call, a payload that is not
+    JSON, an error envelope or the payload of ANOTHER bead is None. Only a payload that IS this bead
+    (.id matches) is allowed to speak for it — same rule as _read_assignee()."""
+    if _bd_blocker_rows is not None:
+        return _bd_blocker_rows(rig_root, bead_id)
+    # vazio → [] (bd answered, no dependency rows); falhou/ilegível/payload de outra bead → None
+    # (the caller does not alarm on a release time it could not read)
+    r = _sh([BD_BIN, "-C", rig_root, "show", bead_id, "--json"], timeout=BD_TIMEOUT)
+    if r is None or r.returncode != 0:
+        return None
+    out = (r.stdout or "").strip()
+    starts = [i for i in (out.find("["), out.find("{")) if i >= 0]
+    if not starts:
+        return None
+    try:
+        d = json.loads(out[min(starts):])
+    except Exception:
+        return None
+    if isinstance(d, list):
+        d = d[0] if d else None
+    if not isinstance(d, dict) or d.get("id") != bead_id:
+        return None
+    rows = d.get("dependencies")
+    if rows is None:
+        return []
+    if not isinstance(rows, list):
+        return None
+    return [x for x in rows if isinstance(x, dict)]
+
+
+_RFC3339_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?\s*(Z|[+-]\d{2}:?\d{2})?$")
+
+
+def _utc_epoch(raw):
+    """Epoch of an RFC 3339 timestamp as bd writes it ("2026-10-24T03:45:42Z"; any fraction of a second
+    is dropped, a numeric offset is honored, no offset means UTC), or None when it is missing or not a
+    timestamp. Parsed by hand, not with datetime.fromisoformat: the launchd job runs /usr/bin/python3
+    (3.9), whose fromisoformat refuses a fraction that is not 3 or 6 digits — a closed_at bd wrote with
+    nanoseconds would read as "unreadable" and mute the alarm of that bead for good."""
+    if not isinstance(raw, str):
+        return None
+    m = _RFC3339_RE.match(raw.strip())
+    if not m:
+        return None
+    try:
+        y, mo, d, h, mi, sec = (int(g) for g in m.groups()[:6])
+        dt = datetime.datetime(y, mo, d, h, mi, sec, tzinfo=datetime.timezone.utc)
+    except Exception:
+        return None
+    off = m.group(7)
+    if off and off != "Z":
+        sign = -1 if off[0] == "-" else 1
+        digits = off[1:].replace(":", "")
+        dt -= sign * datetime.timedelta(hours=int(digits[:2]), minutes=int(digits[2:]))
+    return dt.timestamp()
+
+
+def _blockers_release_epoch(rig_root, bead, now):
+    """(epoch, detail): when the LAST blocking dependency of `bead` closed, so the caller can start the
+    starve clock there (ga-9lcp7m). Meant for a bead that `bd blocked` says is NOT blocked (the caller
+    checks that — bd's own computation stays the authority, as in the Pilot's _filter_unblocked).
+
+      * (0.0, ...)   — the bead declares no blocking dependency: there is no release to wait for, the
+                       clock stays where it is (and no `bd show` is spent on it).
+      * (epoch, id)  — latest closed_at among its closed blocking dependencies; `id` is that blocker.
+      * (None, why)  — it could not be told: the rows are unreadable, a declared blocker is missing from
+                       them, or a closed blocker has no readable (or a future) closed_at. Unknown is not
+                       "released long ago": the caller does not alarm on it.
+
+    A blocking dependency that is still open is skipped, not held against the bead: the caller only asks
+    for a bead `bd blocked` does not list, i.e. one the Pilot dispatches, so its wait is real."""
+    bead_id = bead.get("id") or bead.get("issue_id") or ""
+    declared = []
+    # vazio/ausente → 0.0 (no dependency declared, the clock stays); ilegível (não é lista, ou linha que
+    # não é objeto) → None (unknown: a row we cannot read could be the blocker)
+    deps = bead.get("dependencies")
+    if deps is None:
+        deps = []
+    if not isinstance(deps, list):
+        return None, "the bead's dependency list is not a list"
+    for d in deps:
+        if not isinstance(d, dict):
+            return None, "a dependency row of the bead is not an object"
+        if (d.get("type") or d.get("dependency_type") or "") in _BLOCKING_DEP_TYPES:
+            dep_id = d.get("depends_on_id") or d.get("id") or ""
+            if dep_id:
+                declared.append(dep_id)
+    if not declared:
+        return 0.0, "no blocking dependency declared"
+    rows = _blocker_rows(rig_root, bead_id)
+    if rows is None:
+        return None, "`bd show` dependency rows unreadable"
+    by_id = {x.get("id"): x for x in rows}
+    latest, latest_id = 0.0, ""
+    for dep_id in declared:
+        # vazio (não está nas linhas) → None: a declared blocker bd did not show is unknown, not released
+        row = by_id.get(dep_id)
+        if row is None:
+            return None, "blocker %s missing from `bd show`" % dep_id
+        if (row.get("status") or "") != "closed":
+            continue
+        # vazio/ilegível closed_at → None: closed at an unknown time is not "closed long ago"
+        closed = _utc_epoch(row.get("closed_at"))
+        if closed is None:
+            return None, "blocker %s is closed but its closed_at is unreadable" % dep_id
+        if closed > now + _BLOCKER_FUTURE_SKEW_SEC:
+            return None, "blocker %s closed_at is in the future (%s)" % (dep_id, row.get("closed_at"))
+        if closed > latest:
+            latest, latest_id = closed, dep_id
+    return latest, latest_id
+
+
 # ── built-branch check (ga-tkcam, ga-lzxhi) ───────────────────────────────────
 # _built_branch_reason() is called per-bead from _process_store(), and only for
 # a bead that has already survived every cheaper suppression this cycle (see
@@ -4352,6 +4488,31 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
                  "< STARVE_MIN=%d (priority=%s) — grace" % (
                  bead_id, starve_age_min, effective_starve_min, priority))
             continue
+
+        # ga-9lcp7m: a bead that was BLOCKED waits from the release, not from the approval. The clock
+        # above was started when the daemon first saw the bead and is not refreshed while an open
+        # `blocks` dependency holds it (that wait is never alarmed, see the bd-blocked check below), so
+        # the cycle after the last blocker closes would otherwise read the whole blocked time as
+        # starvation (wa-bwo99o.7/.8: "2026min — dispatch failing" for a slice the Pilot had correctly
+        # excluded until minutes before). Only asked for a bead bd says is NOT blocked, and only once
+        # the naive age is past the grace — so a blocked bead costs no `bd show`, and neither does one
+        # still inside the grace. blocked_ids is None → skipped here; the bd-blocked check below keeps
+        # that bead out of the starve alarm.
+        if blocked_ids is not None and bead_id not in blocked_ids:
+            release_epoch, release_what = _blockers_release_epoch(rig_root, bead, now)
+            if release_epoch is None:
+                _log("  %s: no signal, daemon-age=%.0fmin, when its blocking dependencies closed could "
+                     "not be told (%s) — fail-safe, no alarm" % (bead_id, starve_age_min, release_what))
+                continue
+            if release_epoch > fsa[bead_id]:
+                fsa[bead_id] = release_epoch
+                starve_age_min = (now - release_epoch) / 60.0
+                _log("  %s: released from its blocking dependencies by %s — the wait counts from there "
+                     "(%.1fmin), not from the approval" % (bead_id, release_what, starve_age_min))
+                if starve_age_min < effective_starve_min:
+                    _log("  %s: no signal, released %.1fmin ago < STARVE_MIN=%d (priority=%s) — grace" % (
+                         bead_id, starve_age_min, effective_starve_min, priority))
+                    continue
 
         # pilot:held / pilot:held-until:<epoch> — mirrors pilot-dispatcher.sh's
         # _filter_candidates (ga-6om6a RE-FIX, held-until-alone clause ga-80yi6w):
@@ -5167,7 +5328,7 @@ def _selftest():
     """
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers, _sh
-    global _bd_blocked, _bd_show_full, _bd_has_built_branch, _bd_branch_stranded
+    global _bd_blocked, _bd_blocker_rows, _bd_show_full, _bd_has_built_branch, _bd_branch_stranded
     global _read_pilot_dispatchable_file, _read_pilot_sweep_pause_state_file
     global _read_gate_focus_file
     global _pilot_dispatchable_reason_file
@@ -6613,6 +6774,199 @@ def _selftest():
     else:
         _bad("(nn)", "FALSELY alarmed when bd-blocked query failed (dep-state unknown); "
              "mail_calls=%s" % mail_calls)
+
+    # ── ga-9lcp7m: the wait of a bead that was BLOCKED is counted from the release ─────────────────
+    # Measured 24/10 ~00:50: wa-bwo99o.7 and .8 depended (blocks) on wa-bwo99o.5, which closed at
+    # 03:45:42Z; the Pilot (correctly) excluded them until then, and the cycle right after the close
+    # alarmed "starving 2026min — dispatch failing": first_seen_approved is never refreshed while the
+    # bead is blocked, so the moment the blocker closed the age jumped to the whole blocked time. The
+    # clock has to restart at the closing of the LAST blocking dependency (bd's closed_at).
+    def _iso_utc_9l(epoch):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+    def _blocked_bead_9l(bid, dep_ids, dtype="blocks"):
+        b = _make_bead(bid, age_min=0.1)
+        b["dependencies"] = [{"issue_id": bid, "depends_on_id": d, "type": dtype} for d in dep_ids]
+        return b
+
+    def _run_9l(bead, rows, blocked, fsa_age_min=2026):
+        """One cycle over `bead` with `rows` as what `bd show` expands (or None = unreadable) and
+        `blocked` as the `bd blocked` set. Returns (alarmed, fsa after, seam calls)."""
+        global _bd_approved, _bd_blocked, _bd_blocker_rows, _read_pilot_log_lines
+        calls = []
+
+        def _rows(root, bid):
+            calls.append(bid)
+            return rows
+        _bd_approved = lambda root: [bead]
+        _bd_blocked = lambda root: [{"id": x} for x in blocked]
+        _bd_blocker_rows = _rows
+        _read_pilot_log_lines = lambda: _pilot_recent()
+        st_9l = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+        st_9l["first_seen_approved"][bead["id"]] = NOW - fsa_age_min * 60
+        _reset_captures()
+        run_cycle(NOW, st_9l)
+        _bd_blocked = None
+        _bd_blocker_rows = None
+        return (any(bead["id"] in subj for subj, _ in mail_calls),
+                st_9l["first_seen_approved"].get(bead["id"]), calls)
+
+    def _blk_row_9l(dep_id, closed_ago_min, dtype="blocks"):
+        return {"id": dep_id, "status": "closed", "dependency_type": dtype,
+                "closed_at": _iso_utc_9l(NOW - closed_ago_min * 60)}
+
+    print("\nScenario (ga-9lcp7m-a): blocker closed 5 min ago (bead no longer in `bd blocked`), "
+          "approved 2026 min ago → NO alarm, and the wait restarts at the close")
+    al, fsa, calls = _run_9l(_blocked_bead_9l("wa-9l1", ["wa-d1"]), [_blk_row_9l("wa-d1", 5)], [])
+    if not al and fsa == NOW - 5 * 60:
+        _ok("(ga-9lcp7m-a): no alarm; first_seen_approved moved to the blocker's closed_at")
+    else:
+        _bad("(ga-9lcp7m-a)", "alarmed=%s fsa=%r (want no alarm, fsa=%r)" % (al, fsa, NOW - 5 * 60))
+
+    print("\nScenario (ga-9lcp7m-b): blocker closed LONGER ago than the threshold → STILL alarms "
+          "(the fix must not mute a bead that is really starving after its release)")
+    al, fsa, calls = _run_9l(_blocked_bead_9l("wa-9l2", ["wa-d1"]),
+                             [_blk_row_9l("wa-d1", _STARVE + 3)], [])
+    if al and fsa == NOW - (_STARVE + 3) * 60:
+        _ok("(ga-9lcp7m-b): alarms, with the wait counted from the close (%d min), not from the approval" % (_STARVE + 3))
+    else:
+        _bad("(ga-9lcp7m-b)", "alarmed=%s fsa=%r (want alarm, fsa=%r)" % (al, fsa, NOW - (_STARVE + 3) * 60))
+
+    print("\nScenario (ga-9lcp7m-c): still in `bd blocked` → no alarm, clock untouched, no `bd show` spent")
+    al, fsa, calls = _run_9l(_blocked_bead_9l("wa-9l3", ["wa-d1"]),
+                             [{"id": "wa-d1", "status": "open", "dependency_type": "blocks"}], ["wa-9l3"])
+    if not al and fsa == NOW - 2026 * 60 and calls == []:
+        _ok("(ga-9lcp7m-c): blocked bead: no alarm, first_seen_approved untouched, seam not called")
+    else:
+        _bad("(ga-9lcp7m-c)", "alarmed=%s fsa=%r calls=%r" % (al, fsa, calls))
+
+    print("\nScenario (ga-9lcp7m-d): several blockers → the clock starts at the LAST one to close; "
+          "a parent-child epic closed a minute ago is not a blocker and does not move it")
+    al, fsa, calls = _run_9l(_blocked_bead_9l("wa-9l4", ["wa-d1", "wa-d2"]),
+                             [_blk_row_9l("wa-d1", 90), _blk_row_9l("wa-d2", 5)], [])
+    if not al and fsa == NOW - 5 * 60:
+        _ok("(ga-9lcp7m-d): last of two blockers wins (closed 5 min ago → no alarm)")
+    else:
+        _bad("(ga-9lcp7m-d)", "alarmed=%s fsa=%r (want no alarm, fsa=%r)" % (al, fsa, NOW - 5 * 60))
+    bead_d2 = _blocked_bead_9l("wa-9l5", ["wa-d1"])
+    bead_d2["dependencies"].append({"issue_id": "wa-9l5", "depends_on_id": "wa-epic", "type": "parent-child"})
+    al, fsa, calls = _run_9l(bead_d2, [_blk_row_9l("wa-d1", _STARVE + 3),
+                                       _blk_row_9l("wa-epic", 1, dtype="parent-child")], [])
+    if al and fsa == NOW - (_STARVE + 3) * 60:
+        _ok("(ga-9lcp7m-d): parent-child dependency ignored (still alarms, clock at the real blocker's close)")
+    else:
+        _bad("(ga-9lcp7m-d)", "alarmed=%s fsa=%r (want alarm, fsa=%r)" % (al, fsa, NOW - (_STARVE + 3) * 60))
+
+    print("\nScenario (ga-9lcp7m-e): `bd show` unreadable / blocker missing / closed_at missing, garbage or "
+          "future-dated → NO alarm and the clock is left alone (error is not 'empty', ga-05604)")
+    cases_e = [
+        ("unreadable (None)", None),
+        ("blocker missing from the rows", []),
+        ("closed without closed_at", [{"id": "wa-d1", "status": "closed", "dependency_type": "blocks"}]),
+        ("closed_at garbage", [{"id": "wa-d1", "status": "closed", "dependency_type": "blocks",
+                                "closed_at": "ontem"}]),
+        ("closed_at in the future", [_blk_row_9l("wa-d1", -60)]),
+    ]
+    for i, (what, rows) in enumerate(cases_e):
+        al, fsa, calls = _run_9l(_blocked_bead_9l("wa-9le%d" % i, ["wa-d1"]), rows, [])
+        if not al and fsa == NOW - 2026 * 60:
+            _ok("(ga-9lcp7m-e): %s → fail-safe, no alarm, first_seen_approved untouched" % what)
+        else:
+            _bad("(ga-9lcp7m-e)", "%s: alarmed=%s fsa=%r" % (what, al, fsa))
+
+    for what, deps in (("dependency row is not an object", ["wa-d1"]),
+                       ("dependency list is not a list", "wa-d1")):
+        bead_m = _make_bead("wa-9lm", age_min=0.1)
+        bead_m["dependencies"] = deps
+        al, fsa, calls = _run_9l(bead_m, [_blk_row_9l("wa-d1", 5)], [])
+        if not al and fsa == NOW - 2026 * 60 and calls == []:
+            _ok("(ga-9lcp7m-e): bead's %s → fail-safe, no alarm, nothing guessed" % what)
+        else:
+            _bad("(ga-9lcp7m-e)", "%s: alarmed=%s fsa=%r calls=%r" % (what, al, fsa, calls))
+
+    print("\nScenario (ga-9lcp7m-f): no blocking dependency declared → no extra `bd show`, alarms as before")
+    plain_f = _make_bead("wa-9l6", age_min=0.1)
+    al, fsa, calls = _run_9l(plain_f, None, [])
+    child_f = _blocked_bead_9l("wa-9l7", ["wa-epic"], dtype="parent-child")
+    al2, fsa2, calls2 = _run_9l(child_f, None, [])
+    if al and calls == [] and al2 and calls2 == [] and fsa2 == NOW - 2026 * 60:
+        _ok("(ga-9lcp7m-f): no dependencies / only parent-child → seam not called, alarm unchanged")
+    else:
+        _bad("(ga-9lcp7m-f)", "plain: alarmed=%s calls=%r | parent-child: alarmed=%s calls=%r fsa=%r" % (
+             al, calls, al2, calls2, fsa2))
+
+    print("\nScenario (ga-9lcp7m-g): a dep that is still open but NOT in `bd blocked` is no reason to hold "
+          "the clock — bd blocked is the authority (the Pilot dispatches it), the closed one sets the floor")
+    al, fsa, calls = _run_9l(_blocked_bead_9l("wa-9l8", ["wa-d1", "wa-d2"]),
+                             [_blk_row_9l("wa-d1", _STARVE + 3),
+                              {"id": "wa-d2", "status": "open", "dependency_type": "blocks"}], [])
+    if al and fsa == NOW - (_STARVE + 3) * 60:
+        _ok("(ga-9lcp7m-g): open-but-unlisted blocker ignored; alarms from the closed blocker's close")
+    else:
+        _bad("(ga-9lcp7m-g)", "alarmed=%s fsa=%r" % (al, fsa))
+
+    print("\nScenario (ga-9lcp7m-i): _utc_epoch() reads what bd writes on every python the job may run on "
+          "(3.9 has no fromisoformat for a 9-digit fraction) and refuses what is not a timestamp")
+    _want_i = 1_792_813_542.0   # 2026-10-24T03:45:42Z
+    _fmt_i = {"2026-10-24T03:45:42Z": _want_i,
+              "2026-10-24T03:45:42.123456789Z": _want_i,
+              "2026-10-24T03:45:42.5Z": _want_i,
+              "2026-10-24T03:45:42": _want_i,
+              "2026-10-24 03:45:42": _want_i,
+              "2026-10-24T00:45:42-03:00": _want_i,
+              "2026-10-24T06:45:42+0300": _want_i,
+              " 2026-10-24T03:45:42Z ": _want_i}
+    _bad_i = [x for x, w in _fmt_i.items() if _utc_epoch(x) != w]
+    _junk_i = [x for x in ("", "   ", None, 0, "ontem", "2026-13-40T99:99:99Z", "2026-10-24", "1792813542")
+               if _utc_epoch(x) is not None]
+    if not _bad_i and not _junk_i:
+        _ok("(ga-9lcp7m-i): Z / fraction of any size / offsets / no offset parse to the same instant; "
+            "empty, None, a number, a date alone and an impossible date → None")
+    else:
+        _bad("(ga-9lcp7m-i)", "wrongly parsed=%r wrongly accepted=%r" % (_bad_i, _junk_i))
+
+    print("\nScenario (ga-9lcp7m-h): the REAL _blocker_rows() (seam OFF) — rows / empty / failure / "
+          "payload of another bead; failure is None, never []")
+    _argv_h = []
+
+    class _RH:
+        def __init__(self, rc, out):
+            self.returncode, self.stdout = rc, out
+
+    def _fake_sh_h(out, rc=0):
+        def _f(args, timeout=20):
+            _argv_h.append(args)
+            return _RH(rc, out) if out is not None else None
+        return _f
+    _bd_blocker_rows = None
+    _saved_sh_h = _sh
+    try:
+        _sh = _fake_sh_h(json.dumps([{"id": "wa-9lh", "dependencies": [_blk_row_9l("wa-d1", 5)]}]))
+        rows_ok = _blocker_rows("/rig", "wa-9lh")
+        _sh = _fake_sh_h(json.dumps([{"id": "wa-9lh"}]))
+        rows_empty = _blocker_rows("/rig", "wa-9lh")
+        _sh = _fake_sh_h("", rc=1)
+        rows_rc = _blocker_rows("/rig", "wa-9lh")
+        _sh = _fake_sh_h(None)
+        rows_none = _blocker_rows("/rig", "wa-9lh")
+        _sh = _fake_sh_h("not json at all")
+        rows_garbage = _blocker_rows("/rig", "wa-9lh")
+        _sh = _fake_sh_h(json.dumps([{"id": "wa-OTHER", "dependencies": [_blk_row_9l("wa-d1", 5)]}]))
+        rows_other = _blocker_rows("/rig", "wa-9lh")
+        _sh = _fake_sh_h(json.dumps({"error": "boom"}))
+        rows_err = _blocker_rows("/rig", "wa-9lh")
+    finally:
+        _sh = _saved_sh_h
+    if (isinstance(rows_ok, list) and len(rows_ok) == 1 and rows_ok[0]["id"] == "wa-d1"
+            and rows_empty == [] and rows_rc is None and rows_none is None
+            and rows_garbage is None and rows_other is None and rows_err is None
+            and _argv_h and _argv_h[0][-3:] == ["show", "wa-9lh", "--json"]):
+        _ok("(ga-9lcp7m-h): rows → list; no dependencies → []; rc≠0 / no process / garbage / another "
+            "bead's payload / error envelope → None")
+    else:
+        _bad("(ga-9lcp7m-h)", "ok=%r empty=%r rc=%r none=%r garbage=%r other=%r err=%r argv0=%r" % (
+             rows_ok, rows_empty, rows_rc, rows_none, rows_garbage, rows_other, rows_err,
+             _argv_h[0] if _argv_h else None))
 
     print("\nScenario (oo): ga-hzt8s deliverable 1 — the real bd-list query's --status "
           "arg is widened to 'open,in_progress,deferred' (not just 'open')")
