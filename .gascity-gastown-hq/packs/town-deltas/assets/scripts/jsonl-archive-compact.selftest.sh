@@ -2478,7 +2478,7 @@ for dcase in "off|TTIGHT=0|tight-disk road is off" "floor|TFLOORGB=abc|is not a 
   { [ "$rc" -eq 1 ] && [ "$(last_status)" = "skipped-low-disk" ] && [ ! -e "$WORK/room-args" ] && [ "$(pack_count "$TD1")" = "$TD1_PC" ] && printf '%s' "$out" | grep -q "$DWHY"; } \
     && ok "D. $DN ($DENV): no repack, skipped-low-disk (exit 1), the log says '$DWHY'" || bad "D. $DN handled wrong (rc=$rc status=$(last_status) packs=$(pack_count "$TD1")): $out"
 done
-# F. swap grows while the tight pass runs → the watchdog stops it (well before the 60s the fake would hang), aborted + exit 1, the repo untouched; the object cap is halved, the cut is recorded, the next try waits
+# F. swap grows while the tight pass runs → the watchdog stops it (well before the 60s the fake would hang), aborted + exit 1, the repo untouched; the next pass's object cap drops to half of what this one carried (its floor of 15 here), the cut is recorded, the next try waits
 XF="$WORK/s40-tf"; tailrepo "$XF" 4; XF_PC="$(pack_count "$XF")"; XF_H="$(history "$XF")"; rm -f "$WORK/state.json" "$WORK/log"; T0="$(date +%s)"
 out="$(ROOM_ACT=swap trun "$XF")"; rc=$?; took=$(( $(date +%s) - T0 ))
 { [ "$rc" -eq 1 ] && [ "$(last_status)" = "aborted" ] && [ "$took" -lt 30 ] && sleeper_gone && [ "$(pack_count "$XF")" = "$XF_PC" ] && [ "$(history "$XF")" = "$XF_H" ] && git --git-dir="$XF/.git" fsck --strict >/dev/null 2>&1; } \
