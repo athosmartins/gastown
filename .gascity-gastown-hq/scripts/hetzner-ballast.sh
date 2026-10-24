@@ -13,7 +13,7 @@
 #   pull                     traz results.jsonl do nó para <cidade>/.gc/hetzner-ballast/results.jsonl: só a lista branca de campos, valores curtos, sem duplicar a rodada.
 # CÓDIGOS DE SAÍDA: 0 ok · 2 uso · 3 recusado ou NÃO consegui (árvore suja, arquivo que chegou diferente, git ilegível, crontab ilegível, stop que não parou, results.jsonl ilegível, status com leitura que falhou)
 #   · 98 ssh fora (não conectou, ou caiu antes de eu ler o resultado de um stop ou da crontab: o que não deu para ler não vale como feito) · 99 nó desligado (falta .gc/hetzner-node.on)
-# O QUE SOBE: só código e config do próprio lastro, do que está COMMITADO (o que sobe é, byte a byte, o blob do HEAD; com --allow-dirty o instalado.json diz dirty:true). Nenhum dado, segredo ou credencial.
+# O QUE SOBE: só código e config do próprio lastro (o governo, o registro, os itens e o plugin gtn_stable_ids.py do pytest), do que está COMMITADO (o que sobe é, byte a byte, o blob do HEAD; com --allow-dirty o instalado.json diz dirty:true). Nenhum dado, segredo ou credencial.
 #   O que volta: resumos (contagens e nomes de arquivo de código), nunca log inteiro. A troca de arquivos do install (fase 2) não é atômica entre eles: falha no meio = rc 3 e geração mista no nó — rode install de novo.
 # LEITURA QUE FALHA: toda leitura tem três respostas — tem · não tem · não consegui saber — e a terceira nunca vira "vazio", "não instalado", "sem itens" nem "parado": o comando diz que não leu e sai com rc ≠ 0.
 #   Quem escreve a partir de uma leitura (crontab) não escreve se não leu; "off" e "uninstall" só dizem que o que rodava foi parado se o stop do governo respondeu rc 0.
@@ -25,7 +25,7 @@ SSH=${HB_SSH:-ssh}
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
 OUTDIR="$CITY/.gc/hetzner-ballast"
 MARK="# gt-ballast"
-GOV=hetzner-ballast.py; REG=hetzner-ballast.items.txt; ITEMS_DIR=hetzner-ballast-items
+GOV=hetzner-ballast.py; REG=hetzner-ballast.items.txt; ITEMS_DIR=hetzner-ballast-items; PLUG=gtn_stable_ids.py
 USO="uso: hetzner-ballast.sh install [--allow-dirty] | uninstall | on | off | burn on|off | status | pull"
 say() { echo "hetzner-ballast: $*"; }
 die() { local rc=$1; shift; echo "hetzner-ballast: $*" >&2; exit "$rc"; }
@@ -60,12 +60,13 @@ cmd_install() {
   local allow=0 f rel dst files=() dirty head want got rc p mode a b now sums=""
   [ "${1:-}" = "--allow-dirty" ] && allow=1
   need_node_flag
-  [ -r "$SELF/$GOV" ] && [ -r "$SELF/$REG" ] && [ -d "$SELF/$ITEMS_DIR" ] || die 3 "faltam arquivos do lastro em $SELF ($GOV, $REG, $ITEMS_DIR/)"
-  # nome local → destino remoto. O registro vira items.tsv; os itens vão para items/
-  local pairs=("$GOV|\$HOME/gt-remote/bin/hetzner-ballast.py|755" "$REG|\$HOME/gt-remote/ballast/items.tsv|644")
+  [ -r "$SELF/$GOV" ] && [ -r "$SELF/$REG" ] && [ -d "$SELF/$ITEMS_DIR" ] && [ -r "$SELF/$PLUG" ] || die 3 "faltam arquivos do lastro em $SELF ($GOV, $REG, $ITEMS_DIR/, $PLUG)"
+  # nome local → destino remoto. O registro vira items.tsv; os itens vão para items/. O plugin do pytest (item wa-suite, ga-2hd02v.8) vai para ~/gt-remote/bin/: o gt-iso-run fixa PYTHONPATH lá
+  # (a bateria noturna põe o mesmo arquivo no mesmo lugar). Mesmas conferências dos outros: sha256 no nó, blob do HEAD, árvore limpa.
+  local pairs=("$GOV|\$HOME/gt-remote/bin/hetzner-ballast.py|755" "$REG|\$HOME/gt-remote/ballast/items.tsv|644" "$PLUG|\$HOME/gt-remote/bin/gtn_stable_ids.py|644")
   for f in "$SELF/$ITEMS_DIR"/*.sh; do [ -f "$f" ] && pairs+=("$ITEMS_DIR/$(basename "$f")|\$HOME/gt-remote/ballast/items/$(basename "$f")|755"); done
   # vazio (nada mudado) → limpo; falhou/ilegível (sem git ou fora de um repo) → NÃO sei: recuso, nunca "limpo"
-  dirty=$(git -C "$SELF" status --porcelain --untracked-files=all -- "$GOV" "$REG" "$ITEMS_DIR" 2> /dev/null; echo "rc=$?")
+  dirty=$(git -C "$SELF" status --porcelain --untracked-files=all -- "$GOV" "$REG" "$ITEMS_DIR" "$PLUG" 2> /dev/null; echo "rc=$?")
   case "$dirty" in
     "rc=0") dirty=false ;;
     rc=*) die 3 "não consegui ler o estado do git em $SELF: não subo o que não sei se está commitado" ;;
