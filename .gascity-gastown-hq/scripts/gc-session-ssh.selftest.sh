@@ -50,9 +50,9 @@
 #   erro de ssh, flock, "tmux sem acesso" tolerado como "sem servidor", o `has` que engole o erro do tmux, melhor esforço da sessão
 #   ausente, o stop que não confere que a sessão sumiu, e o portão (sem a liberação, liberação de qualquer tipo, nome de teste frouxo ou sem
 #   âncora, sem conferir o sha do guarda, sem rodar o --selfcheck, script do host que sai 0, guarda irmão ilegível), e a regra de presença do MBP (grupo mbp: guarda de /Users/, validação da config, recusa/pausa/slot_cap, vigia, PATH extra,
-#   registro de sessões do list-running); @TOTAL@ mutantes no total (30 do grupo gui: bootout/arquivos/prova de ausência do stop e da recusa, a varredura de órfãs e a ordem dela, o veredito do `auth status` (ilegível, rc, contraditório), plist fora de run/, label sem prefixo, KeepAlive, Aqua, validação da config; 5 do grupo abort: a marca <nome>.stop do stop, ga-0k82lw — o stop não a grava, o preparo do start não a apaga, a 2ª chamada não olha para ela, o stop não poda as marcas antigas (> 24 h), a poda sem limite de idade leva a marca recém-gravada; 20 do grupo lr: o cache nunca lido, start sem invalidar antes / depois, stop sem invalidar, gravação sem conferir a geração, prazo e relógio, geração e forma do arquivo, dry-run, list_cache_s em cinco formas, geração ilegível ou ausente, registro acertado com lista do cache, falha ao invalidar derrubando o start; 26 do grupo wt: wt-add/wt-rm do provider, o guarda DEPOIS do wt-add, o recolhimento só do que não perde trabalho e os nomes do engine; 9 do ambiente limpo da sessão, grupo mbp: session_env, ZDOTDIR, PATH explícito e claude absoluto, ga-w7qwl1.1.5).
+#   registro de sessões do list-running); 170 mutantes no total (33 do grupo gui: bootout/arquivos/prova de ausência do stop e da recusa, a varredura de órfãs e a ordem dela, o veredito do `auth status` (ilegível, rc, contraditório), plist fora de run/, label sem prefixo, KeepAlive, Aqua, validação da config, e os do start em duas chamadas: o piso da 2ª chamada, o rc 14 do abandonado contra o 15 do gui_agent, as funções do agente na 2ª; 5 do grupo abort: a marca <nome>.stop do stop, ga-0k82lw — o stop não a grava, o preparo do start não a apaga, a 2ª chamada não olha para ela, o stop não poda as marcas antigas (> 24 h), a poda sem limite de idade leva a marca recém-gravada; 20 do grupo lr: o cache nunca lido, start sem invalidar antes / depois, stop sem invalidar, gravação sem conferir a geração, prazo e relógio, geração e forma do arquivo, dry-run, list_cache_s em cinco formas, geração ilegível ou ausente, registro acertado com lista do cache, falha ao invalidar derrubando o start; 26 do grupo wt: wt-add/wt-rm do provider, o guarda DEPOIS do wt-add, o recolhimento só do que não perde trabalho e os nomes do engine; 9 do ambiente limpo da sessão, grupo mbp: session_env, ZDOTDIR, PATH explícito e claude absoluto, ga-w7qwl1.1.5).
 #   Mais: contra um stub que só sai 0, quase tudo falha.
-# VARIÁVEIS: GCSSH_UNDER_TEST (script a testar) · GCSSH_ONLY (grupos separados por vírgula) · GCSSH_NO_MUTANTS=1 · GCSSH_MUTANTS_ONLY=<grupo> (pula os casos e roda só os mutantes desse grupo) · GCSSH_SHARD=K/N (pula os casos e roda só os mutantes de ordem ≡ K mod N, K de 0 a N-1; o stub só no K=0: a campanha de mutantes em N processos)
+# VARIÁVEIS: GCSSH_UNDER_TEST (script a testar) · GCSSH_ONLY (grupos separados por vírgula) · GCSSH_NO_MUTANTS=1 · GCSSH_MUTANTS_ONLY=<grupo> (pula os casos e roda só os mutantes desse grupo) · GCSSH_SHARD=K/N (pula os casos e roda só os mutantes de ordem ≡ K mod N; K e N decimais sem sinal nem zero à esquerda, N de 1 a 9999, K de 0 a N-1, senão exit 2; o stub só no K=0: a campanha de mutantes em N processos). Rodar ZERO casos e ZERO mutantes (grupo que não existe em GCSSH_ONLY/GCSSH_MUTANTS_ONLY, fatia K/N sem mutante nenhum) FALHA com 'NADA RODOU' (exit 1), nunca sai como '0/0 ok'; o grupo `shard` prova isso
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 P="${GCSSH_UNDER_TEST:-$HERE/gc-session-ssh}"
@@ -1115,10 +1115,42 @@ g_abort() {  # ga-0k82lw: o start que o mini ABANDONOU (prazo do provider estour
   pv stop abort-3 </dev/null; rm -f "$bin/sha256sum" "$T/state/a/running/"* 2>/dev/null; cfg 3
 }
 
-all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group gui && g_gui; group acct && g_acct; group lr && g_lr; group abort && g_abort; return 0; }
+g_shard() {  # o filtro do PRÓPRIO selftest (GCSSH_SHARD, GCSSH_ONLY, GCSSH_MUTANTS_ONLY): fatia inválida, ou filtro que não pega nada, não pode sair verde (gate de 23/10 da ga-w7qwl1.1.8: GCSSH_SHARD=10/10 rodava zero e saía 0)
+  # cada filho é ESTE arquivo com um filtro; os de recusa levam GCSSH_NO_MUTANTS=1: se a validação voltar a deixar passar, o filho roda "zero casos" e não a campanha de mutantes
+  local s oo rr
+  shard_child() { env -u GCSSH_ONLY -u GCSSH_NO_MUTANTS -u GCSSH_MUTANTS_ONLY -u GCSSH_SHARD -u GCSSH_MUTANT GCSSH_UNDER_TEST="$P" "$@" bash "$0" 2>&1; }  # o filho NÃO herda os filtros de quem roda este grupo (GCSSH_ONLY=shard pulava o bloco de mutantes do controle positivo)
+  for s in 10/10 3/3 0/0 5 /3 3/ 1x/2 1/2x 1/2/3 -1/3 1/-3 ' 1/3' '1/ 3' '1 /3' '1/3 ' 08/10 00/10 0/00 1/0 1/010 1.5/3 12345/99999 99999999999999999999/100000000000000000001; do
+    oo=$(shard_child GCSSH_NO_MUTANTS=1 GCSSH_SHARD="$s"); rr=$?
+    [ $rr = 2 ] && [ "$(printf '%s\n' "$oo" | grep -c 'GCSSH_SHARD tem que ser K/N')" = 1 ]; ok $? "shard: GCSSH_SHARD='$s' é recusada com exit 2 e a causa (rc=$rr: $(printf '%s' "$oo" | head -c 90))"
+  done
+  # fatia VÁLIDA que não pega nada: passa pela validação (não é exit 2) e a falha é a de "nada rodou" (exit 1), nunca um 0/0 verde
+  for s in 0/1 0/2 1/2 9/10 0/9999 9998/9999; do
+    oo=$(shard_child GCSSH_NO_MUTANTS=1 GCSSH_SHARD="$s"); rr=$?
+    [ $rr = 1 ] && printf '%s\n' "$oo" | grep -q 'NADA RODOU'; ok $? "shard: GCSSH_SHARD='$s' é aceita, e sem nada para rodar o selftest falha com 'NADA RODOU' (rc=$rr: $(printf '%s' "$oo" | head -c 90))"
+  done
+  oo=$(shard_child GCSSH_SHARD=9998/9999); rr=$?
+  [ $rr = 1 ] && printf '%s\n' "$oo" | grep -q 'NADA RODOU' && ! printf '%s\n' "$oo" | grep -q 'mutante '; ok $? "shard: fatia válida que cai em ZERO mutantes (9998/9999, mutantes ligados) falha em vez de '0/0 ok' (rc=$rr: $(printf '%s' "$oo" | tail -c 90))"
+  oo=$(shard_child GCSSH_NO_MUTANTS=1 GCSSH_ONLY=grupo-que-nao-existe); rr=$?
+  [ $rr = 1 ] && printf '%s\n' "$oo" | grep -q 'NADA RODOU'; ok $? "shard: GCSSH_ONLY com grupo que não existe (erro de digitação) falha em vez de '0/0 ok' (rc=$rr: $(printf '%s' "$oo" | tail -c 90))"
+  oo=$(shard_child GCSSH_MUTANTS_ONLY=grupo-que-nao-existe); rr=$?
+  [ $rr = 1 ] && printf '%s\n' "$oo" | grep -q 'NADA RODOU'; ok $? "shard: GCSSH_MUTANTS_ONLY com grupo que não existe falha em vez de '0/0 ok' (rc=$rr: $(printf '%s' "$oo" | tail -c 90))"
+  # controle positivo: fatia válida que PEGA um mutante roda exatamente esse e sai 0 (a ordem 1 é o primeiro mutante do arquivo; N=9999 > o total, então só a ordem K cai na fatia)
+  oo=$(shard_child GCSSH_SHARD=1/9999); rr=$?
+  [ $rr = 0 ] && [ "$(printf '%s\n' "$oo" | grep -c '^ok   mutante .* pego')" = 1 ] && printf '%s\n' "$oo" | grep -q '^== final: 1/1 ok ==$' && ! printf '%s\n' "$oo" | grep -q 'NADA RODOU'; ok $? "shard: (controle) GCSSH_SHARD=1/9999 roda exatamente 1 mutante, pego, e sai 0 (rc=$rr: $(printf '%s' "$oo" | tail -c 110))"
+}
+
+all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group gui && g_gui; group acct && g_acct; group lr && g_lr; group abort && g_abort; group shard && g_shard; return 0; }
 
 if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
-case "${GCSSH_SHARD:-0/1}" in [0-9]*/[1-9]*) ;; *) echo "GCSSH_SHARD tem que ser K/N (K de 0 a N-1, N >= 1): ${GCSSH_SHARD}"; exit 2;; esac
+# GCSSH_SHARD=K/N: dois decimais canônicos (sem sinal, sem espaço, sem zero à esquerda: `[ 3 = 03 ]` é falso e $((mn % 010)) é octal, então a fatia ficaria vazia ou trocada sem aviso), N de 1 a 9999 e K de 0 a N-1
+# vazio → vale 0/1 (todos os mutantes); qualquer outra forma, ou K >= N → exit 2 e nada roda (nunca um "0/0 ok" verde: o gate de 23/10 reproduziu GCSSH_SHARD=10/10 saindo 0 sem rodar nada)
+shard_bad() { echo "GCSSH_SHARD tem que ser K/N (decimais sem sinal nem zero à esquerda, N de 1 a 9999, K de 0 a N-1): '${GCSSH_SHARD}'"; exit 2; }
+shv=${GCSSH_SHARD:-0/1}
+case "$shv" in */*/*|*[!0123456789/]*|/*|*/) shard_bad;; */*) ;; *) shard_bad;; esac
+shk=${shv%/*}; shn=${shv#*/}
+case "$shk" in 0|[1-9]*) ;; *) shard_bad;; esac
+case "$shn" in [1-9]*) ;; *) shard_bad;; esac
+[ ${#shk} -le 4 ] && [ ${#shn} -le 4 ] && [ "$shk" -lt "$shn" ] || shard_bad
 [ -n "${GCSSH_MUTANTS_ONLY:-}${GCSSH_SHARD:-}" ] || { all; echo "== $((n-fails))/$n ok =="; }  # GCSSH_MUTANTS_ONLY=grupo ou GCSSH_SHARD=K/N: pula os casos e roda só os mutantes (do grupo / da fatia K de N)
 
 [ -n "${GCSSH_NO_MUTANTS:-}" ] || [ -n "${GCSSH_ONLY:-}" ] || {
@@ -1311,4 +1343,6 @@ case "${GCSSH_SHARD:-0/1}" in [0-9]*/[1-9]*) ;; *) echo "GCSSH_SHARD tem que ser
   }
   echo "== final: $((n-fails))/$n ok =="
 }
+# rodar ZERO casos e ZERO mutantes não é sucesso: GCSSH_ONLY / GCSSH_MUTANTS_ONLY com grupo que não existe, GCSSH_NO_MUTANTS junto de outro filtro, ou uma fatia K/N sem nenhum mutante. n é o contador de ok() deste processo (não uma leitura de fora).
+[ "$n" -gt 0 ] || { echo "== NADA RODOU: 0 casos e 0 mutantes (GCSSH_ONLY='${GCSSH_ONLY:-}' GCSSH_MUTANTS_ONLY='${GCSSH_MUTANTS_ONLY:-}' GCSSH_SHARD='${GCSSH_SHARD:-}' GCSSH_NO_MUTANTS='${GCSSH_NO_MUTANTS:-}': algum filtro aponta para um grupo ou uma fatia vazia) =="; exit 1; }
 [ "$fails" = 0 ]
