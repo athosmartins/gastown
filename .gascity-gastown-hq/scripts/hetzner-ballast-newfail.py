@@ -13,17 +13,20 @@ O QUE LÊ
 O QUE FAZ
   Lista vazia e nenhuma bead nossa aberta → nada. Lista com impressão digital nova → abre a bead (bug, P2, labels origem:lastro-wa-suite e area:testes, SEM rota: quem triagem decide) ou, se a que abrimos
   segue aberta, a atualiza por comentário com a lista inteira. Bead que o dono fechou e uma lista DIFERENTE depois → abre outra (a MESMA lista com a bead fechada não reabre nada). Lista que zera → um comentário "corrigidas" (não fecha: quem corrigiu fecha). Mesma lista = nada.
+  ANTES de abrir, sempre lista o rig (`bd list -l origem:lastro-wa-suite`): se já existe uma nossa não fechada (a criação anterior pode ter nascido sem eu saber), comenta nela em vez de abrir outra.
   Sem a bandeira do nó (.gc/hetzner-node.on) não faz nada, como as outras orders do nó.
 TRÊS ESTADOS
   Toda leitura é leu / vazio / não consegui ler. Arquivo ausente no nó = "nada confirmado ainda" (rc 0). ssh que não conectou = rc 98. Arquivo que não é o JSON esperado, estado local ilegível ou bead que não consigo
-  ler = rc 3 e NADA é aberto nem comentado: avisar de novo sobre uma bead que já existe duplicaria. Escrita do estado local que falha depois do `bd` ter respondido = rc 3 e a frase "NÃO gravei", nunca traceback: num comentário a próxima volta o repete (repetido é melhor que perdido); depois de um create ela abriria OUTRA bead, e por isso a frase manda conferir.
+  ler = rc 3 e NADA é aberto nem comentado: avisar de novo sobre uma bead que já existe duplicaria. Escrita do estado local que falha depois do `bd` ter respondido = rc 3 e a frase "NÃO gravei", nunca traceback: num comentário a próxima volta o repete (repetido é melhor que perdido); depois de um create ela lista o rig e comenta na bead que nasceu.
+  `bd create` sem resposta certa (não executou, estourou o prazo, rc ≠ 0 ou respondeu sem o id) = a bead PODE ter nascido: rc 3, estado intacto, e a volta seguinte olha o rig antes de abrir. Rig que não consigo listar = rc 3 e nada feito ("não achei nenhuma nossa" e "não consegui listar" nunca são a mesma resposta).
 ESTADO LOCAL
   <cidade>/.gc/hetzner-ballast/newfail.json: {"v": 1, "fp": <impressão digital da última lista avisada>, "bead": <id>, "n": <quantas>}.
 AMBIENTE
-  GC_CITY_PATH · HETZNER_NODE_HOST (padrão hetzner-teste) · HB_SSH (padrão ssh) · HB_BD (padrão bd) · HB_WA_RIG (padrão /Users/athos/gt/whatsapp_automation). Saída: 0 ok · 3 recusado ou não consegui · 98 ssh fora.
+  GC_CITY_PATH · HETZNER_NODE_HOST (padrão hetzner-teste) · HB_SSH (padrão ssh) · HB_BD (padrão bd) · HB_WA_RIG (padrão /Users/athos/gt/whatsapp_automation) · HB_BD_TIMEOUT (segundos do `bd create` e do `bd list`; padrão 90, valor que não é número > 0 = 90). Saída: 0 ok · 3 recusado ou não consegui · 98 ssh fora.
 """
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -39,6 +42,18 @@ WA_RIG = os.environ.get("HB_WA_RIG", "/Users/athos/gt/whatsapp_automation")
 OUTDIR = os.path.join(CITY, ".gc", "hetzner-ballast")
 STATE = os.path.join(OUTDIR, "newfail.json")
 LABELS = ("origem:lastro-wa-suite", "area:testes")
+
+
+def _bd_timeout():
+    # vazio (variável ausente ou vazia) → 90 s; ilegível (não é número finito > 0) → 90 s também: o prazo é só um teto e o padrão é o que já valia
+    try:
+        v = float(os.environ.get("HB_BD_TIMEOUT") or 90)
+    except ValueError:
+        return 90.0
+    return v if math.isfinite(v) and v > 0 else 90.0
+
+
+BD_TIMEOUT = _bd_timeout()
 REMOTE = ('B="$HOME/gt-remote/ballast"; F="$B/wa-suite.confirmed"; if cat "$F" 2> /dev/null; then exit 0; fi; '
           'if [ -d "$B" ] && [ -x "$B" ] && [ ! -e "$F" ]; then exit 10; fi; exit 11')
 
@@ -53,7 +68,7 @@ def die(rc, msg):
 
 
 def run(args, inp=None, timeout=90):
-    # vazio (comando sem saída) → stdout ""; falhou (não executou, estourou o prazo) → None: quem chama recusa, nunca lê como "vazio"
+    # vazio (comando sem saída) → stdout ""; falhou (não executou OU estourou o prazo e foi morto) → None: quem chama recusa, nunca lê como "vazio". None NÃO prova que nada aconteceu: o comando morto pelo prazo pode ter gravado antes"
     try:
         return subprocess.run(args, input=inp, capture_output=True, text=True, errors="replace", timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
@@ -150,25 +165,54 @@ def bead_status(bead):
     return ("closed" if st == "closed" else "open") if isinstance(st, str) else None
 
 
-def create(items, fp):
+def find_ours():
+    """(ids, motivo): ids = as beads NOSSAS não fechadas do rig do WA (label LABELS[0]), em ordem; ids None = não consegui listar (motivo diz por quê)."""
+    r = run([BD, "-C", WA_RIG, "list", "-l", LABELS[0], "--json", "--limit", "0"], timeout=BD_TIMEOUT)
+    # vazio ([]) → ([], ""): nenhuma nossa aberta; falhou (não executou, prazo, rc ≠ 0, saída que não é uma lista de objetos com id e status) → (None, motivo): quem chama recusa, nunca lê como "nenhuma"
+    if r is None or r.returncode != 0:
+        return None, "não consegui listar o rig do WA (o bd não respondeu, estourou o prazo de %g s ou saiu com erro)" % BD_TIMEOUT
+    try:
+        v = json.loads(r.stdout)
+    except (ValueError, RecursionError):
+        return None, "o bd list do rig do WA não devolveu JSON"
+    forma = "o bd list do rig do WA devolveu uma forma que não conheço (esperava uma lista de beads com id e status)"
+    if not isinstance(v, list):
+        return None, forma
+    ids = []
+    for x in v:
+        labels = x.get("labels") if isinstance(x, dict) else None   # o bd omite a chave quando não há label: ausente = não tem
+        if not (isinstance(x, dict) and isinstance(x.get("id"), str) and x["id"] and isinstance(x.get("status"), str)
+                and (labels is None or (isinstance(labels, list) and all(isinstance(lb, str) for lb in labels)))):
+            return None, forma
+        if LABELS[0] in (labels or []) and x["status"] != "closed":
+            ids.append(x["id"])
+    return sorted(ids), ""
+
+
+def create(items):
     title = "wa-suite do lastro: %d regressão(ões) confirmada(s) no main" % len(items)
     args = [BD, "-C", WA_RIG, "create", title, "-t", "bug", "-p", "2", "--stdin", "--json"]
     for lb in LABELS:
         args += ["-l", lb]
-    r = run(args, inp=render(items), timeout=90)
-    if r is None or r.returncode != 0:
-        die(3, "bd create falhou (rc=%s): nada foi registrado; a próxima volta repete" % (r.returncode if r else "sem resposta"))
-    try:
-        v = json.loads(r.stdout)
-        v = v[0] if isinstance(v, list) and v else v
-        bead = v.get("id") if isinstance(v, dict) else None
-    except (ValueError, RecursionError):
-        bead = None
+    r = run(args, inp=render(items), timeout=BD_TIMEOUT)
+    bead = None
+    # vazio (resposta sem id) e falhou (não executou, prazo, rc ≠ 0, JSON ilegível) dão o MESMO bead None, de propósito: o `bd` pode ter gravado antes de falhar ou de ser morto, então nenhum dos quatro prova que
+    # nada nasceu. A saída é a mesma nos quatro (rc 3, estado local intacto) e quem decide é a volta seguinte, que lista o rig antes de abrir
+    if r is not None and r.returncode == 0:
+        try:
+            v = json.loads(r.stdout)
+            v = v[0] if isinstance(v, list) and v else v
+            bead = v.get("id") if isinstance(v, dict) else None
+        except (ValueError, RecursionError):
+            bead = None
     if not (isinstance(bead, str) and bead):
-        # a bead pode ter sido criada: guardo a impressão digital com bead '?' para a próxima volta NÃO abrir outra, e digo
-        save_state_or_die(fp, "?", len(items), "bd create respondeu sem o id da bead (ela pode ter sido criada no rig do WA)",
-                          "sem a marca '?' a próxima volta pode abrir outra: confira o rig do WA e grave %s à mão" % STATE)
-        die(3, "bd create respondeu sem o id da bead: ela pode ter sido criada no rig do WA (confira); não abro outra")
+        if r is None:
+            why = "o bd não respondeu (não executou ou estourou o prazo de %g s)" % BD_TIMEOUT
+        elif r.returncode != 0:
+            why = "o bd saiu com rc=%d" % r.returncode
+        else:
+            why = "o bd respondeu sem o id da bead"
+        die(3, "bd create: %s. Não sei se a bead nasceu no rig do WA; o estado local não mudou e a próxima volta lista o rig (label %s) e comenta na nossa que achar, em vez de abrir outra" % (why, LABELS[0]))
     return bead
 
 
@@ -191,7 +235,7 @@ def main():
     bead, last_fp, last_n = state.get("bead"), state.get("fp"), state.get("n", 0)
     fp = fingerprint(items)
     if not items:
-        if bead and bead != "?" and last_n:
+        if bead and last_n:
             r = run([BD, "-C", WA_RIG, "comment", bead, "--stdin"], inp="As regressões confirmadas pelo lastro do nó (item wa-suite) foram corrigidas: a lista atual está vazia. "
                     "Quem corrigiu fecha esta bead.", timeout=60)
             if r is None or r.returncode != 0:
@@ -201,8 +245,6 @@ def main():
         else:
             say("0 regressões confirmadas")
         return 0
-    if bead == "?":   # a criação anterior não devolveu o id: a bead pode existir. Fica ruidoso (rc 3) a cada volta até um humano acertar o estado; abrir outra duplicaria
-        die(3, "uma bead desta lista pode já existir no rig do WA (o id não voltou na criação): confira e apague/ajuste %s; não abro outra" % STATE)
     if bead and fp == last_fp:
         say("%d confirmada(s), a mesma lista já avisada em %s: nada a fazer" % (len(items), bead))
         return 0
@@ -212,15 +254,25 @@ def main():
         if status is None:
             die(3, "não consegui ler a bead %s no rig do WA: não abro outra nem comento (a próxima volta repete)" % bead)
         action = "comentar" if status == "open" else "criar"
+    lead = "A lista de regressões confirmadas MUDOU (agora %d)." % len(items)
+    if action == "criar":
+        # nunca abro sem olhar o rig: uma criação anterior pode ter nascido sem eu saber (prazo, rc ≠ 0, resposta sem id, estado local que não gravou)
+        ours, why = find_ours()
+        if ours is None:
+            die(3, "%s: não abro nem comento (a próxima volta repete)" % why)
+        if ours:
+            bead, action = ours[0], "comentar"
+            lead = "Esta bead foi reencontrada no rig do WA (uma volta anterior não confirmou se a criou). Lista atual de regressões confirmadas (%d)." % len(items)
+            say("já existe uma bead nossa aberta no rig do WA (%s): comento em %s em vez de abrir outra" % (", ".join(ours), bead))
     if action == "comentar":
-        r = run([BD, "-C", WA_RIG, "comment", bead, "--stdin"], inp="A lista de regressões confirmadas MUDOU (agora %d).\n\n%s" % (len(items), render(items)), timeout=90)
+        r = run([BD, "-C", WA_RIG, "comment", bead, "--stdin"], inp="%s\n\n%s" % (lead, render(items)), timeout=90)
         if r is None or r.returncode != 0:
             die(3, "bd comment falhou em %s: o estado local não mudou; a próxima volta repete" % bead)
         save_state_or_die(fp, bead, len(items), "comentei a lista nova em %s" % bead, "a próxima volta repete o comentário")
         say("%d confirmada(s): comentei a lista nova em %s" % (len(items), bead))
         return 0
-    new = create(items, fp)
-    save_state_or_die(fp, new, len(items), "abri %s" % new, "a próxima volta abriria outra; apague a bead ou grave %s à mão" % STATE)
+    new = create(items)
+    save_state_or_die(fp, new, len(items), "abri %s" % new, "a próxima volta lista o rig e comenta nela em vez de abrir outra")
     say("%d confirmada(s): abri %s no rig do WA" % (len(items), new))
     return 0
 
