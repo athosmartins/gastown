@@ -26,10 +26,12 @@
 # kept in $CITY/.gc/wa-root-main-guard.state; when that cannot be written the alert fires at once, because a confirmation
 # that can never be remembered would never come. The detached cases are DETECTION ONLY: a restore cannot tell a forgotten
 # checkout from a deliberate one (a reviewer reading the files would suddenly read main's), so only a named non-main
-# branch is still backed up and restored below. The alert window is spent only by an alert that was delivered: a notify
-# that fails leaves a NOTIFY-FAILED line and the next cycle tries again; a clock that stepped back behind the last
-# alert alerts again. Every git call is fenced to the root (g(), below): the production root sits INSIDE the HQ repo, and
-# a root whose own .git is broken or missing would otherwise be read as the HQ's `main`.
+# branch is still backed up and restored below. The alert window is spent only by an alert notify accepted (exit 0 — what it
+# does with it afterwards, hold, digest or dedupe, this script cannot see): a notify that fails leaves a NOTIFY-FAILED line
+# and the next cycle tries again; a clock that stepped back behind the last alert alerts again. Every git call is fenced to
+# the root (g(), below): the production root sits INSIDE the HQ repo, and a root whose own .git is broken or missing would
+# otherwise be read as the HQ's `main`. The two knobs are read as decimal (08 is 8; empty, non-numeric or past 12 digits is
+# the default), and a state file field with a leading zero or past 12 digits makes it count as no episode.
 # Test seams (selftest only): WA_ROOT_GUARD_{ROOT,CITY,HOOKS,NOW}.
 #
 # SAFETY: conservative. Never `git checkout -f` / `reset --hard`. If the root is in a
@@ -50,9 +52,16 @@ ENABLED="${WA_ROOT_GUARD_ENABLED:-1}"
 HOOKS="${WA_ROOT_GUARD_HOOKS:-/tmp/empty-hooks}"   # bypass any in-root hooks that could block the switch/merge
 CONFIRM="${WA_ROOT_GUARD_CONFIRM_CYCLES:-2}"
 WINDOW_MIN="${WA_ROOT_GUARD_ALARM_WINDOW_MIN:-60}"
-# vazio → o padrão (2 ciclos / 60 min); falhou/ilegível (não numérico) → o padrão: um knob torto nunca cala o alerta
-case "$CONFIRM" in ''|*[!0-9]*) CONFIRM=2 ;; esac
-case "$WINDOW_MIN" in ''|*[!0-9]*) WINDOW_MIN=60 ;; esac
+# Every number below ends up in $(( )) or `[ -gt ]`. "Only digits" is not enough for either: bash reads 08/09 in $(( )) as an
+# invalid octal (an ERROR that ends the enclosing command — see the guard after handle_detached), 010 as 8, and a string past
+# 12 digits wraps silently in $(( )) while `[` refuses it (rc 2, read as false). plain() is the one test for that: 1-12 digits,
+# no leading zero ("0" alone is fine). The two knobs are hand-typed, so they are normalised instead (10#): 08 means 8. (The
+# clock is `date +%s`, or the selftest seam: neither is typed by hand.)
+plain() { case "$1" in ''|0[0-9]*|*[!0-9]*|?????????????*) return 1 ;; esac; return 0; }
+# vazio → o padrão (2 ciclos / 60 min); falhou/ilegível (não numérico, ou mais de 12 dígitos) → o padrão: um knob torto nunca cala o alerta
+case "$CONFIRM" in ''|*[!0-9]*|?????????????*) CONFIRM=2 ;; esac
+case "$WINDOW_MIN" in ''|*[!0-9]*|?????????????*) WINDOW_MIN=60 ;; esac
+CONFIRM=$((10#$CONFIRM)); WINDOW_MIN=$((10#$WINDOW_MIN))
 # vazio → o relógio real; falhou/ilegível → NOW=0 e CLOCK_OK=0: sem relógio não há janela, então o alerta, uma vez confirmado, sai a cada ciclo (visível)
 NOW="${WA_ROOT_GUARD_NOW:-}"   # the epoch seam is for the selftest only
 case "$NOW" in ''|*[!0-9]*) NOW="$(date +%s 2>/dev/null)" ;; esac
@@ -95,13 +104,12 @@ fi
 read_state() {
   PREV_KIND=""; PREV_COUNT=0; PREV_FIRST=0; PREV_ALARM=0
   local k="" c="" f="" a="" rest=""
-  # vazio (sem arquivo) → nenhum episódio aberto; falhou/ilegível (diretório, campo torto) → idem: a contagem recomeça, nunca confirma de graça
+  # vazio (sem arquivo) → nenhum episódio aberto; falhou/ilegível (diretório, campo torto, zero à esquerda, número longo demais) → idem: a contagem recomeça, nunca confirma de graça
+  # (só este script escreve o arquivo, e $(( )) nunca imprime zero à esquerda: um campo assim é corrupção, não "8" — e um alarm gigante calaria o alerta para sempre)
   [ -f "$STATE" ] || return 0
   read -r k c f a rest 2>/dev/null < "$STATE" || [ -n "$k" ] || return 0
   case "$k" in off-main|unknown) ;; *) return 0 ;; esac
-  case "$c" in ''|*[!0-9]*) return 0 ;; esac
-  case "$f" in ''|*[!0-9]*) return 0 ;; esac
-  case "$a" in ''|*[!0-9]*) return 0 ;; esac
+  plain "$c" && plain "$f" && plain "$a" || return 0
   PREV_KIND="$k"; PREV_COUNT="$c"; PREV_FIRST="$f"; PREV_ALARM="$a"
 }
 
@@ -115,9 +123,10 @@ write_state() {
   [ "$got" = "$want" ]
 }
 
-# age_min <first_epoch> → "NNmin", or "?" without a usable clock.
+# age_min <first_epoch> → "NNmin", or "?" without a usable clock, or when the episode began without one (first_epoch 0:
+# NOW - 0 would print ~30 million minutes) or in the future (the clock stepped back).
 age_min() {
-  if [ "$CLOCK_OK" = 1 ] && [ "$1" -le "$NOW" ]; then echo "$(( (NOW - $1) / 60 ))min"; else echo "?"; fi
+  if [ "$CLOCK_OK" = 1 ] && [ "$1" -gt 0 ] && [ "$1" -le "$NOW" ]; then echo "$(( (NOW - $1) / 60 ))min"; else echo "?"; fi
 }
 
 # clear_episode <where> — the HEAD is no longer detached (on origin/main, or the root is on a branch again): the episode
@@ -198,15 +207,15 @@ handle_detached() {
       nmsg="WA root HEAD state UNKNOWN: $why — cannot confirm it is on origin/main, NEEDS HUMAN"
     fi
     log "$line"   # the log is the durable copy: written before notify, which may take long or fail
-    # notify delivered → 0; falhou/ausente → ≠0: o alerta só chegou ao log
+    # notify rc 0 → ele aceitou o alerta (o canal ainda pode segurar, agrupar ou deduplicar: isso este script não vê); falhou/ausente → ≠0: o alerta só está no log
     note -p 4 -t 'wa-root-guard' "$nmsg"; nrc=$?
     if [ "$nrc" != 0 ]; then
-      # a window is spent only by an alert somebody received: put the previous last_alarm back, so the next cycle tries again.
+      # a window is spent only by an alert notify accepted (rc 0): put the previous last_alarm back, so the next cycle tries again.
       # (with no clock or no writable state the alert already repeats every cycle, and the line above says so)
       if [ "$unwritable" = 0 ] && [ "$CLOCK_OK" = 1 ] && write_state "$kind" "$count" "$first" "$alarm_before"; then
-        log "NOTIFY-FAILED: the alert above reached only this log (notify rc=$nrc) — the window is NOT spent; trying again on the next cycle."
+        log "NOTIFY-FAILED: notify did not take the alert above (rc=$nrc), so this log is its only copy — the window is NOT spent; trying again on the next cycle."
       else
-        log "NOTIFY-FAILED: the alert above reached only this log (notify rc=$nrc)."
+        log "NOTIFY-FAILED: notify did not take the alert above (rc=$nrc), so this log is its only copy."
       fi
     fi
   fi
@@ -219,6 +228,16 @@ BRANCH="$(g branch --show-current 2>/dev/null || true)"
 # No branch name: never restored here (see DETACHED HEAD above).
 if [ -z "$BRANCH" ]; then
   handle_detached
+fi
+# handle_detached always ends in `exit 0`, so getting here with no branch name means it was ABORTED: an expansion error (a bad
+# number in $(( ))) ends the whole enclosing command, this `if`, and bash resumes at the NEXT statement — which is the restore
+# below, run with BRANCH='' (a CLEARED line, a backup tag, the root moved off its detached HEAD). A check written inside that
+# `if`, after the call, would be skipped along with it; this has to be a statement of its own. The numbers are validated above,
+# so this is the net under them.
+# vazio → o handler não terminou; falhou/ilegível → idem: INERTE — uma linha WARN no log, o root intocado, nunca o restauro
+if [ -z "$BRANCH" ]; then
+  log "WARN: the detached-HEAD handler did not finish (an internal error) — the production root was NOT touched; bash's own error is in $CITY/.gc/logs/wa-root-main-guard-launchd.err."
+  exit 0
 fi
 
 # On a branch: a detached episode, if one was open, is over — but "on a branch" is only "back on main" when it is main.
