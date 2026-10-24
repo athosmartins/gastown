@@ -14,21 +14,46 @@
 # (stash daemon syncs, switch main, fetch, ff-only merge, drop stash), then log + notify.
 # Daemons likely need a RESTART afterwards — this guard does NOT restart them (oracle's job).
 #
+# DETACHED HEAD (ga-a7mti1). Since 10/10 the live clone sits on a detached HEAD at origin/main (the updater merges
+# origin/main onto it), so "no branch name" is the HEALTHY state: the old WARN fired every cycle (10161 lines in
+# October) and hid the one case that matters, a HEAD on code origin/main does not contain. A detached HEAD is now
+# classified against the local origin/main ref (as of the last fetch; this guard does not fetch):
+#   on-main   HEAD is reachable from origin/main → silent: no line, no notify; an open episode is cleared
+#   off-main  HEAD is NOT reachable → unreviewed code is live → OFF-MAIN-DETACHED
+#   unknown   cannot tell (origin/main missing, HEAD unreadable, merge-base failed) → UNKNOWN-DETACHED, never "healthy"
+# off-main/unknown alert (one log line + one notify) on the 2nd consecutive cycle (WA_ROOT_GUARD_CONFIRM_CYCLES), so a
+# 19 s reviewer detour is not an alert, then once per WA_ROOT_GUARD_ALARM_WINDOW_MIN (60), not per cycle. The episode is
+# kept in $CITY/.gc/wa-root-main-guard.state; when that cannot be written the alert fires at once, because a confirmation
+# that can never be remembered would never come. The detached cases are DETECTION ONLY: a restore cannot tell a forgotten
+# checkout from a deliberate one (a reviewer reading the files would suddenly read main's), so only a named non-main
+# branch is still backed up and restored below. Test seams (selftest only): WA_ROOT_GUARD_{ROOT,CITY,HOOKS,NOW}.
+#
 # SAFETY: conservative. Never `git checkout -f` / `reset --hard`. If the root is in a
 # genuine merge-conflict / dirty-unswitchable state or the switch fails, do NOT force —
 # log + notify "needs human" and LEAVE it untouched.
 #
 # STOPGAP: this masks the bug, it does not fix it. Remove once crew-commit / Pilot
-# worktree isolation lands. On-disk only (not pack-committed) — same as the other guards.
+# worktree isolation lands. Committed under scripts/ since ga-qb6yg (before that it ran live with no commit).
 #
 # Kill switch: WA_ROOT_GUARD_ENABLED=0 → check + log only, never restore.
 set -uo pipefail
 
-CITY="/Users/athos/gt/.gascity-gastown-hq"
-ROOT="/Users/athos/gt/whatsapp_automation"
+CITY="${WA_ROOT_GUARD_CITY:-/Users/athos/gt/.gascity-gastown-hq}"
+ROOT="${WA_ROOT_GUARD_ROOT:-/Users/athos/gt/whatsapp_automation}"
 LOG="$CITY/.gc/logs/wa-root-main-guard.log"
+STATE="$CITY/.gc/wa-root-main-guard.state"   # the open detached episode: kind count first_epoch last_alarm_epoch
 ENABLED="${WA_ROOT_GUARD_ENABLED:-1}"
-HOOKS="/tmp/empty-hooks"   # bypass any in-root hooks that could block the switch/merge
+HOOKS="${WA_ROOT_GUARD_HOOKS:-/tmp/empty-hooks}"   # bypass any in-root hooks that could block the switch/merge
+CONFIRM="${WA_ROOT_GUARD_CONFIRM_CYCLES:-2}"
+WINDOW_MIN="${WA_ROOT_GUARD_ALARM_WINDOW_MIN:-60}"
+# vazio → o padrão (2 ciclos / 60 min); falhou/ilegível (não numérico) → o padrão: um knob torto nunca cala o alerta
+case "$CONFIRM" in ''|*[!0-9]*) CONFIRM=2 ;; esac
+case "$WINDOW_MIN" in ''|*[!0-9]*) WINDOW_MIN=60 ;; esac
+# vazio → o relógio real; falhou/ilegível → NOW=0 e CLOCK_OK=0: sem relógio não há janela, o alerta sai a cada ciclo (visível)
+NOW="${WA_ROOT_GUARD_NOW:-}"   # the epoch seam is for the selftest only
+case "$NOW" in ''|*[!0-9]*) NOW="$(date +%s 2>/dev/null)" ;; esac
+CLOCK_OK=1
+case "$NOW" in ''|*[!0-9]*) NOW=0; CLOCK_OK=0 ;; esac
 
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null; }
@@ -45,14 +70,118 @@ if [ ! -d "$ROOT/.git" ] && ! g rev-parse --git-dir >/dev/null 2>&1; then
   exit 0
 fi
 
+# ── Detached HEAD (ga-a7mti1) ────────────────────────────────────────────────────────────────────────────────────
+# Loads PREV_KIND/PREV_COUNT/PREV_FIRST/PREV_ALARM from $STATE; PREV_KIND empty = no episode open.
+read_state() {
+  PREV_KIND=""; PREV_COUNT=0; PREV_FIRST=0; PREV_ALARM=0
+  local k="" c="" f="" a="" rest=""
+  # vazio (sem arquivo) → nenhum episódio aberto; falhou/ilegível (diretório, campo torto) → idem: a contagem recomeça, nunca confirma de graça
+  [ -f "$STATE" ] || return 0
+  read -r k c f a rest 2>/dev/null < "$STATE" || [ -n "$k" ] || return 0
+  case "$k" in off-main|unknown) ;; *) return 0 ;; esac
+  case "$c" in ''|*[!0-9]*) return 0 ;; esac
+  case "$f" in ''|*[!0-9]*) return 0 ;; esac
+  case "$a" in ''|*[!0-9]*) return 0 ;; esac
+  PREV_KIND="$k"; PREV_COUNT="$c"; PREV_FIRST="$f"; PREV_ALARM="$a"
+}
+
+# write_state <kind> <count> <first> <alarm> → 0 only when the file reads back exactly as written.
+write_state() {
+  local want="$1 $2 $3 $4" got=""
+  mkdir -p "${STATE%/*}" 2>/dev/null
+  printf '%s\n' "$want" > "$STATE.tmp" 2>/dev/null && mv -f "$STATE.tmp" "$STATE" 2>/dev/null
+  # vazio/falhou/ilegível (caminho que é diretório, disco cheio) → não bate com o escrito → rc 1 e o chamador alerta já
+  got="$(cat "$STATE" 2>/dev/null)" || got=""
+  [ "$got" = "$want" ]
+}
+
+# age_min <first_epoch> → "NNmin", or "?" without a usable clock.
+age_min() {
+  if [ "$CLOCK_OK" = 1 ] && [ "$1" -le "$NOW" ]; then echo "$(( (NOW - $1) / 60 ))min"; else echo "?"; fi
+}
+
+# A healthy cycle (HEAD on origin/main, or the root back on a branch) ends the episode: one CLEARED line, no notify, and
+# only when the episode had alerted — a blip nobody was told about stays unmentioned.
+clear_episode() {
+  [ -e "$STATE" ] || return 0
+  read_state
+  rm -f "$STATE" 2>/dev/null
+  # falhou (não removeu) → WARN visível; o episódio velho seria contado como continuação, no máximo um ciclo cedo demais
+  if [ -e "$STATE" ]; then log "WARN: could not remove the episode state $STATE — a later blip may be counted as a continuation."; fi
+  if [ -n "$PREV_KIND" ] && [ "$PREV_ALARM" != 0 ]; then
+    log "CLEARED: production root is back on reviewed code (the '$PREV_KIND' episode lasted ~$(age_min "$PREV_FIRST"), $PREV_COUNT cycles)."
+  fi
+}
+
+# No branch name: a detached HEAD (healthy when it sits on origin/main) or a HEAD git cannot read. Never restores; always exits 0.
+handle_detached() {
+  local rc=0 kind="" why="" head_sha="" om_sha="" count=0 first=0 alarm=0 fire=0 age="" why_state="" h12="" o12=""
+  # symbolic-ref -q: 0 = still a branch (only its name was unreadable), 1 = detached, >=128 = git failed → unknown, nunca saudável
+  g symbolic-ref -q HEAD >/dev/null 2>&1; rc=$?
+  case "$rc" in
+    1)
+      # vazio (HEAD sem commit) → unknown; falhou/ilegível → unknown (nunca on-main)
+      head_sha="$(g rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)" || head_sha=""
+      # vazio (sem origin/main neste clone) → unknown; falhou/ilegível → unknown (nunca on-main)
+      om_sha="$(g rev-parse -q --verify 'origin/main^{commit}' 2>/dev/null)" || om_sha=""
+      if [ -z "$head_sha" ]; then
+        kind=unknown; why="the detached HEAD does not resolve to a commit"
+      elif [ -z "$om_sha" ]; then
+        kind=unknown; why="origin/main does not resolve (never fetched, or deleted)"
+      else
+        # 0 → on-main; 1 → off-main; qualquer outro rc (git falhou) → unknown
+        g merge-base --is-ancestor "$head_sha" "$om_sha" >/dev/null 2>&1; rc=$?
+        case "$rc" in
+          0) kind=on-main ;;
+          1) kind=off-main ;;
+          *) kind=unknown; why="git merge-base --is-ancestor failed (rc=$rc)" ;;
+        esac
+      fi ;;
+    0) kind=unknown; why="HEAD is a branch whose name could not be read" ;;
+    *) kind=unknown; why="HEAD is unreadable (git rc=$rc)" ;;
+  esac
+
+  if [ "$kind" = on-main ]; then clear_episode; exit 0; fi
+
+  read_state
+  if [ "$PREV_KIND" = "$kind" ]; then
+    count=$((PREV_COUNT + 1)); first="$PREV_FIRST"; alarm="$PREV_ALARM"
+  else
+    count=1; first="$NOW"; alarm=0
+  fi
+  if [ "$count" -ge "$CONFIRM" ]; then
+    if [ "$alarm" = 0 ] || [ "$CLOCK_OK" = 0 ] || [ $((NOW - alarm)) -ge $((WINDOW_MIN * 60)) ]; then
+      fire=1; alarm="$NOW"
+    fi
+  fi
+  if ! write_state "$kind" "$count" "$first" "$alarm"; then
+    fire=1; why_state=" [episode state unwritable: $STATE — alerting on every cycle until it is fixed]"
+  fi
+
+  if [ "$fire" = 1 ]; then
+    h12="${head_sha:0:12}"; o12="${om_sha:0:12}"; h12="${h12:-?}"; o12="${o12:-?}"
+    age="$(age_min "$first")"
+    if [ "$kind" = off-main ]; then
+      log "OFF-MAIN-DETACHED: production root is on a DETACHED HEAD ($h12) that origin/main ($o12) does not contain — unreviewed code is live (cycles=$count, ~$age). Detection only, NOT restoring; who/when: git -C $ROOT reflog. Next alert in ${WINDOW_MIN}min if it is still there.$why_state"
+      note -p 4 -t 'wa-root-guard' "WA root DETACHED on $h12, NOT in origin/main — unreviewed code is live ($count cycles, ~$age). Detection only, NEEDS HUMAN"
+    else
+      log "UNKNOWN-DETACHED: cannot tell whether the production root is on reviewed code — $why (HEAD $h12, origin/main $o12; cycles=$count, ~$age). NOT assuming healthy; detection only. Next alert in ${WINDOW_MIN}min if it persists.$why_state"
+      note -p 4 -t 'wa-root-guard' "WA root HEAD state UNKNOWN: $why — cannot confirm it is on origin/main, NEEDS HUMAN"
+    fi
+  fi
+  exit 0
+}
+
+# vazio → sem nome de branch (HEAD destacado, ou git falhou): handle_detached separa os dois; falhou/ilegível → idem, nunca "main"
 BRANCH="$(g branch --show-current 2>/dev/null || true)"
 
-# Detached HEAD or unreadable branch — unusual; alert but do NOT force.
+# No branch name: never restored here (see DETACHED HEAD above).
 if [ -z "$BRANCH" ]; then
-  log "WARN: $ROOT has empty/detached branch — leaving untouched (needs human)."
-  note -p 4 -t 'wa-root-guard' "WA root in detached/empty-branch state — NEEDS HUMAN (guard left it untouched)"
-  exit 0
+  handle_detached
 fi
+
+# On a branch: a detached episode, if one was open, is over.
+clear_episode
 
 # Clean: already on main → silent success.
 if [ "$BRANCH" = "main" ]; then
