@@ -21,7 +21,10 @@
 #   registro (g_reg): a linha wa-suite do hetzner-ballast.items.txt (a REAL) lê limpa no governo, é `work` com núcleos FIXOS (um `auto` levaria o orçamento inteiro e o hq-selftests passaria horas sem rodar),
 #     exige o helper, o gt-iso-run, o python do venv, o plugin e `noflag:wa-suite.leak`, e o comando existe na pasta de itens. CALIBRAÇÃO DA RAM (ga-weaih6): o rss_mb cobre núcleos × MB por worker + base + filho de coleta
 #     MEDIDOS no nó, e passa a regra de partida e o piso de pausa do governo no p10 de MemAvailable (um wa-suite de 8 núcleos com teto de 12 GB morria por `rss` aos 5 min em toda rodada).
-#   agenda (g_sched): com o GOVERNO REAL e as colunas papel/núcleos/rss/prazo/cooldown da linha real: com o wa-suite rodando, o hq-selftests (auto) ainda começa com o que sobra do orçamento.
+#     ga-r4lw72: o hq-selftests também tem núcleos FIXOS (o `auto` ficou com 1 núcleo por 3 h), que cabem junto do wa-suite no orçamento de 9 núcleos (16 - 6 de sessões - 1 de reserva); o prazo dele é pelo menos o dobro
+#     de (soma ~12.555 s de selftest / núcleos); e o cooldown dos dois fica entre 120 s (cada pergunta é um pull ao espelho do mini) e 300 s (o main já mudou durante a rodada de 44 a 80 min).
+#   agenda (g_sched): com o GOVERNO REAL e as colunas papel/núcleos/rss/prazo/cooldown da linha real: com o wa-suite rodando, o hq-selftests ainda começa (núcleos fixos da linha real); e com o hq-selftests JÁ rodando, o wa-suite
+#     começa no tick seguinte (ga-r4lw72: com `auto` o hq levava o orçamento inteiro e o wa-suite, com o cooldown vencido, ficava de fora até ele acabar: 18:47Z a 20:06Z de 24/10).
 # CONTROLE NEGATIVO: cada mutante (um trecho do item ou do registro trocado) TEM que reprovar a bateria.
 # VARIÁVEIS: HBW_ANCHORS_ONLY=1 (só confere que cada âncora de mutante casa 1 vez) · HBW_PY (python do teste; padrão /usr/bin/python3) · HBW_ITEMS_DIR (pasta de itens; um mutante traz também a cópia do registro) · HBW_ONLY=<grupo> (run iso read frozen prep state reg sched; com HBW_MUTANT roda só esse grupo) ·
 #   HBW_NO_MUTANTS=1 · HBW_JOBS (mutantes em paralelo; padrão 4)
@@ -419,6 +422,17 @@ PYEOF
   check "reg: o rss_mb ($rss) cobre o pior caso MEDIDO de $cores núcleos ($cores × $worker_mb + $base_mb + $collect_mb = $need MB); abaixo disso o governo mata a rodada com why=rss" "1" "$([ "$cores" -ge 1 ] && [ "$rss" -ge 1 ] && [ "$rss" -ge "$need" ] && echo 1 || echo 0)"
   check "reg: o rss_mb ($rss) passa a regra de partida do governo no p10 do nó ($rss + $start_mb <= $p10_mb MB); acima disso o wa-suite quase nunca começa" "1" "$([ "$rss" -ge 1 ] && [ "$start_mb" -ge 1 ] && [ $((rss + start_mb)) -le "$p10_mb" ] && echo 1 || echo 0)"
   check "reg: wa-suite ($rss) + hq-selftests ($hq) rodando juntos não cruzam o piso de pausa de RAM ($pause_mb) no p10 do nó ($p10_mb MB)" "1" "$([ "$rss" -ge 1 ] && [ "$hq" -ge 1 ] && [ "$pause_mb" -ge 1 ] && [ $((rss + hq + pause_mb)) -le "$p10_mb" ] && echo 1 || echo 0)"
+  # NÚCLEOS E COOLDOWN (ga-r4lw72, medido no nó em 24/10): o `auto` do hq-selftests é decidido UMA vez, na partida. Às 15:34Z ele começou ao lado do wa-suite de 8 núcleos (orçamento 9 - 8 = 1) e ficou com 1 núcleo por
+  # 3 h (rc 124, prazo); sozinho levava o orçamento inteiro e o wa-suite não começava (18:47Z-20:06Z). O trabalho do hq soma ~12.555 s de selftest (maior: 1.200 s), então 1 núcleo não cabe nos 10800 s do prazo.
+  local hqc wac cdn it
+  hqc=$(num_or_0 "$(reg_field 3 hq-selftests)"); wac=$(num_or_0 "$(reg_field 3)")
+  check "reg: o hq-selftests tem núcleos FIXOS (inteiro >= 2), não auto: o auto decidido na partida já deu 1 núcleo por 3 h" "1" "$([ "$hqc" -ge 2 ] && echo 1 || echo 0)"
+  check "reg: hq-selftests ($hqc) + wa-suite ($wac) cabem juntos no orçamento de 9 núcleos (16 - 6 de sessões - 1 de reserva): senão o segundo só começa quando o primeiro acaba" "1" "$([ "$hqc" -ge 1 ] && [ "$wac" -ge 1 ] && [ $((hqc + wac)) -le 9 ] && echo 1 || echo 0)"
+  check "reg: o prazo do hq-selftests ($(reg_field 5 hq-selftests) s) é pelo menos o dobro de (12555 s de selftest / $hqc núcleos): rodada que estoura o prazo não deixa resultado" "1" "$([ "$hqc" -ge 1 ] && [ "$(num_or_0 "$(reg_field 5 hq-selftests)")" -ge $((2 * 12555 / hqc)) ] && echo 1 || echo 0)"
+  for it in wa-suite hq-selftests; do
+    cdn=$(num_or_0 "$(reg_field 6 "$it")")
+    check "reg: $it espera de 120 a 300 s depois de uma rodada completa (o main já mudou durante a rodada; e cada pergunta é um pull ao espelho do mini, que só atualiza a cada ~5 min)" "1" "$([ "$cdn" -ge 120 ] && [ "$cdn" -le 300 ] && echo 1 || echo 0)"
+  done
 }
 
 # ── g_sched ──────────────────────────────────────────────────────────────────────────────────────────
@@ -442,8 +456,21 @@ print(v if isinstance(v,str) else json.dumps(v))' "$1"; }
   mkdir -p "$FP/$pid"; printf '%s (sh) S 1 %s %s 0 0\n' "$pid" "$pid" "$pid" > "$FP/$pid/stat"; printf '0 256 0 0 0 0 0\n' > "$FP/$pid/statm"; printf 'sh\0-c\0x\0ballast-item:wa-suite:%s\0' "$run" > "$FP/$pid/cmdline"
   grep '^hq-selftests' "$T/reg.both" >> "$H/items.tsv"
   adv; gv
-  # orçamento = 16 - 4 (sessões) - 1 (reserva) = 11; o wa-suite leva os núcleos da linha real → sobra o resto para o hq-selftests (auto)
-  check "sched: com o wa-suite rodando, o hq-selftests (auto) AINDA começa, com o que sobra do orçamento (11 - núcleos do wa-suite)" "hq-selftests $((11 - $(reg_field 3)))" "$(field started.0.item) $(field started.0.cores)"
+  # orçamento = 16 - 4 (sessões) - 1 (reserva) = 11; o wa-suite leva os núcleos da linha real e o hq-selftests começa ao lado dele com os DELE (fixos)
+  check "sched: com o wa-suite rodando, o hq-selftests AINDA começa, com os núcleos fixos da linha real" "hq-selftests $(reg_field 3 hq-selftests)" "$(field started.0.item) $(field started.0.cores)"
+  killtree "$H/"
+  # O hq-selftests entra PRIMEIRO (era o único elegível: o wa-suite estava em cooldown). Com `auto` ele levava o orçamento inteiro e o wa-suite, com o cooldown já vencido, ficava de fora até o hq acabar (24/10, 18:47Z a
+  # 20:06Z, medido). A RAM não impede: com o hq rodando MemAvailable fica em 29 GB (mediana dos ticks do nó), então o wa-suite só espera o orçamento de CPU.
+  H="$T/hs2"; FP="$T/ps2"; NOW=1800000000; U=0; NI=0; ID=0; mkdir -p "$H/items" "$FP"; : > "$H/on"; printf '#!/bin/sh\nsleep 300\n' > "$H/items/sleeper.sh"; chmod +x "$H/items/sleeper.sh"
+  grep '^hq-selftests' "$T/reg.both" > "$H/items.tsv"
+  printf 'MemTotal: 32000000 kB\nMemFree: 100 kB\nMemAvailable: %s kB\n' $((28000 * 1024)) > "$FP/meminfo"
+  stat; gv; adv; gv; adv; gv; adv; gv
+  check "sched: sozinho, o hq-selftests começa com os núcleos fixos da linha real" "hq-selftests $(reg_field 3 hq-selftests)" "$(field started.0.item) $(field started.0.cores)"
+  pid=$(field started.0.pid); run=$(field started.0.run)
+  mkdir -p "$FP/$pid"; printf '%s (sh) S 1 %s %s 0 0\n' "$pid" "$pid" "$pid" > "$FP/$pid/stat"; printf '0 256 0 0 0 0 0\n' > "$FP/$pid/statm"; printf 'sh\0-c\0x\0ballast-item:hq-selftests:%s\0' "$run" > "$FP/$pid/cmdline"
+  grep '^wa-suite' "$T/reg.both" >> "$H/items.tsv"
+  adv; gv
+  check "sched: com o hq-selftests JÁ rodando, o wa-suite (cooldown vencido) começa no tick seguinte, com os núcleos da linha real (com auto o hq levava o orçamento inteiro e ele ficava de fora)" "wa-suite $(reg_field 3)" "$(field started.0.item) $(field started.0.cores)"
   killtree "$H/"
 }
 
@@ -515,6 +542,14 @@ wa-suite.sh@@frozen@@o sleep do laço de relógio fica órfão no fim@@{ pkill -
 wa-suite.sh@@prep@@pull que falha com a ponta da última rodada vira sem-novidade@@[ "$pull" = ok ] || { say "o pull falhou@@true || { say "o pull falhou
 wa-suite.sh@@prep@@árvore velha que o wt-rm não tirou segue para o wt-add@@[ ! -e "$GR/$RIG/wt/$bead" ] || { say "a árvore velha@@true || { say "a árvore velha
 wa-suite.sh@@state@@o TERM antes do pytest espera os 10 s@@[ -n "$PYPID" ] && kill -0 "$PYPID" 2> /dev/null || break@@[ -z "$PYPID" ] || kill -0 "$PYPID" 2> /dev/null || break
+hetzner-ballast.items.txt@@reg@@o hq-selftests volta a auto (decidido na partida: já deu 1 núcleo por 3 h)@@hq-selftests\twork\t4\t@@hq-selftests\twork\tauto\t
+hetzner-ballast.items.txt@@sched@@o hq-selftests volta a auto (levava o orçamento inteiro e o wa-suite não começava ao lado dele)@@hq-selftests\twork\t4\t@@hq-selftests\twork\tauto\t
+hetzner-ballast.items.txt@@reg@@o hq-selftests sobe para 8 núcleos (com o wa-suite não cabem no orçamento de 9)@@hq-selftests\twork\t4\t@@hq-selftests\twork\t8\t
+hetzner-ballast.items.txt@@sched@@o hq-selftests sobe para 8 núcleos (o wa-suite não começa ao lado dele)@@hq-selftests\twork\t4\t@@hq-selftests\twork\t8\t
+hetzner-ballast.items.txt@@reg@@o hq-selftests cai para 1 núcleo (12555 s de selftest não cabem no prazo)@@hq-selftests\twork\t4\t@@hq-selftests\twork\t1\t
+hetzner-ballast.items.txt@@reg@@o cooldown do hq-selftests volta a 600 s (espera pura depois da rodada)@@\t4096\t10800\t180\t@@\t4096\t10800\t600\t
+hetzner-ballast.items.txt@@reg@@o cooldown do wa-suite volta a 600 s@@\t5\t13312\t21600\t180\t@@\t5\t13312\t21600\t600\t
+hetzner-ballast.items.txt@@reg@@o cooldown do hq-selftests cai a 0 (um pull ao espelho a cada tick)@@\t4096\t10800\t180\t@@\t4096\t10800\t0\t
 MUT
   "$PY" -I - "$ITEMS" "$REGF" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import os, re, shutil, sys

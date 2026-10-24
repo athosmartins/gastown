@@ -7,16 +7,20 @@
 #   o termina 60 s depois) · cooldown_s (espera entre rodadas; falha espera no mínimo 600 s) · requires (`-` ou lista de path:/exec:/cmd:/flag:/noflag:, todos verdadeiros; predicado desconhecido = item inerte) ·
 #   comando (relativo = a partir de ~/gt-remote/ballast/items/). Detalhes em scripts/hetzner-ballast.py e docs/runbooks/hetzner-ballast.md.
 #
-# ITENS DE HOJE: hq-selftests roda os *.selftest.sh do hq contra o origin/main do espelho do nó (acha vermelho antes do gate). wa-suite roda a suíte INTEIRA do WA (a da bateria noturna) contra o origin/main do
+# ITENS DE HOJE: hq-selftests roda os *.selftest.sh do hq contra o origin/main do espelho do nó (acha vermelho antes do gate; 4 núcleos FIXOS, ver NÚCLEOS E COOLDOWN). wa-suite roda a suíte INTEIRA do WA (a da bateria noturna) contra o origin/main do
 #   espelho do nó, dentro do gt-iso-run (rede cortada e provada); tem núcleos FIXOS de propósito (`auto` levaria o orçamento inteiro e o hq-selftests ficaria horas sem rodar) e se TRANCA com o arquivo
 #   wa-suite.leak se o canário medir vazamento de rede. 5 núcleos e rss_mb 13312 são MEDIDOS (ga-weaih6, 24/10, nó de 31 GB): cada worker do xdist termina em ~2 GB de memória PRÓPRIA (PSS ≈ 94% do RSS: não é
 #   página de fork contada em dobro); 8 workers já somavam 15,2 GB com a suíte em 35% (extrapolado: ~19 GB no fim), acima do que o governo admite (MemAvailable − rss_mb ≥ 14336); 5 workers deram pico de
 #   11795 MB na suíte inteira (43 min). Conta e números: docs/runbooks/hetzner-ballast.md ("Medido"); o teste hetzner-ballast-wa-suite.selftest.sh (grupo reg) falha se núcleos × MB por worker + base
 #   deixar de caber no rss_mb. queima é o último recurso — CPU pura quando não há trabalho útil — e nasce DESLIGADO (flag burn.on; hetzner-ballast.sh burn on).
+# NÚCLEOS E COOLDOWN (ga-r4lw72, 24/10, medido no nó): o hq-selftests tem 4 núcleos FIXOS porque o `auto` é decidido UMA vez, na partida: uma rodada que começou ao lado do wa-suite de 8 núcleos ficou com 1 núcleo por
+#   3 h e estourou o prazo (o trabalho dele soma ~12.555 s de selftest: 1 núcleo não cabe nos 10.800 s do prazo, 4 cabem com folga), e sozinho o `auto` levava o orçamento inteiro, então o wa-suite (cooldown vencido) não
+#   começava até ele acabar (18:47Z-20:06Z). 4 + 5 do wa-suite = 9 = o orçamento com 6 núcleos de sessões; com mais carga de sessões o segundo espera. Cooldown 180 s nos dois: depois de uma rodada COMPLETA o main já
+#   mudou (a rodada leva 44 a 80 min) e 600 s eram espera pura; o espelho do mini só atualiza a cada ~5 min, então perguntar com mais frequência não ganha nada. Falha espera no mínimo 600 s (BALLAST_FAIL_COOLDOWN_S).
 # O QUE FALTA (cada um entra aqui quando o dono entregar um comando que roda sozinho no nó, só com código e dado público que já está lá): calibração do Traço BIM (wa-eqp0dy), backfill do estudo de
 #   viabilidade (wa-ekvjuo).
 #
 # nome	papel	núcleos	rss_mb	prazo_s	cooldown_s	requires	comando
-hq-selftests	work	auto	4096	10800	600	exec:~/gt-remote/bin/hetzner-remote-git.sh	hq-selftests.sh
+hq-selftests	work	4	4096	10800	180	exec:~/gt-remote/bin/hetzner-remote-git.sh	hq-selftests.sh
 queima	filler	auto	512	3600	0	flag:burn.on	queima.sh
-wa-suite	work	5	13312	21600	600	exec:~/gt-remote/bin/hetzner-remote-git.sh,exec:~/gt-remote/bin/gt-iso-run,exec:/usr/local/sbin/gt-netns-run,exec:~/gt-remote/venv-wa/bin/python,path:~/gt-remote/bin/gtn_stable_ids.py,noflag:wa-suite.leak	wa-suite.sh
+wa-suite	work	5	13312	21600	180	exec:~/gt-remote/bin/hetzner-remote-git.sh,exec:~/gt-remote/bin/gt-iso-run,exec:/usr/local/sbin/gt-netns-run,exec:~/gt-remote/venv-wa/bin/python,path:~/gt-remote/bin/gtn_stable_ids.py,noflag:wa-suite.leak	wa-suite.sh
