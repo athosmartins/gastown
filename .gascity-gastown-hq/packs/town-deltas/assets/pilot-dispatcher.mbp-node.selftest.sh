@@ -347,8 +347,9 @@ lnof() { grep -nF -- "$1" "$DISPATCHER" | head -n "${2:-1}" | tail -n 1 | cut -d
 eq "o gancho do MBP é chamado em UM lugar de dispatch_one" "$(grep -cF -- '_pilot_mbp_node_decide "$STORY_ID"' "$DISPATCHER")" "1"
 w1=$(lnof '_pilot_wa_node_decide "$STORY_ID" "$STORY_BEAD_CITY" "$_SLING_TARGET"'); m1=$(lnof '_pilot_mbp_node_decide "$STORY_ID" "$STORY_BEAD_CITY" "$_SLING_TARGET"')
 l1=$(lnof ': # pool: leave UNASSIGNED + open so RoutedPoolQuery')
-{ [ -n "$w1" ] && [ -n "$m1" ] && [ -n "$l1" ] && [ "$w1" -lt "$m1" ] && [ "$m1" -lt "$l1" ]; } && ok "o gancho do MBP vem DEPOIS da chamada do Hetzner (e do tratamento do rc dele, que não muda) e ANTES de deixar a bead sem dono" || fail "ordem das chamadas ($w1, $m1, $l1)"
-ARM="$(awk 'f==0 && $0 ~ /^        local _RP_NODE_RC=0$/ {f=1} f==1 {print} f==1 && $0 ~ /^        : # pool: leave UNASSIGNED/ {exit}' "$DISPATCHER")"
+{ [ -n "$w1" ] && [ -n "$m1" ] && [ -n "$l1" ] && [ "$w1" -lt "$l1" ] && [ "$l1" -lt "$m1" ]; } && ok "o gancho do MBP vem DEPOIS da chamada do Hetzner, do tratamento do rc dele e do ': # pool' que fecha a cadeia (as linhas do Hetzner ficam como estavam)" || fail "ordem das chamadas ($w1, $l1, $m1)"
+# a região vai de `local _RP_NODE_RC=0` até o `fi` (8 espaços) que fecha o bloco do MBP, o 1º depois de `: # pool` (os `fi` de dentro têm mais espaços)
+ARM="$(awk 'f==0 && $0 ~ /^        local _RP_NODE_RC=0$/ {f=1} f==1 {print} f==1 && $0 ~ /^        : # pool: leave UNASSIGNED/ {p=1} f==1 && p==1 && $0 ~ /^        fi$/ {exit}' "$DISPATCHER")"
 [ -n "$ARM" ] || fail "a região do gancho do WA não foi achada em $DISPATCHER"
 # armrun <rc do gancho do Hetzner> <rc do gancho do MBP> <_PILOT_WA_NODE_PASS> <_PILOT_NODE_ONLY> → "rc=<rc da região> fell=<0|1> target=<alvo no fim> result=<DISPATCH_RESULT> calls=<ganchos e escritas>"
 armrun() {
@@ -470,15 +471,13 @@ mut fia-rc0-vira-1      - 'if [ "$_RP_MBP_RC" = 0 ]; then
 mut fia-rc2-sem-soltar  - 'elif [ "$_RP_MBP_RC" = 2 ]; then
             bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true' 'elif [ "$_RP_MBP_RC" = 2 ]; then
             :'
-mut fia-rc2-despacha    - 'DISPATCH_RESULT="wa_node_unknown"
+mut fia-rc2-despacha    - '            DISPATCH_RESULT="wa_node_unknown"
             return 1
           fi
-        fi
-        : # pool' 'DISPATCH_RESULT="wa_node_unknown"
+        fi' '            DISPATCH_RESULT="wa_node_unknown"
             :
           fi
-        fi
-        : # pool'
+        fi'
 
 echo "---"; echo "$PASS/$((PASS+FAIL)) ok"
 [ $FAIL -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($FAIL)"; exit 1; }
