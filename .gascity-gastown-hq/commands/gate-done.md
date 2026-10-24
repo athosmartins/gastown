@@ -254,6 +254,14 @@ echo "Push verified: $BRANCH present on origin at $_LOCAL_SHA."
 
 If push fails, fix the issue (auth, network, conflict) and retry.
 
+**Mini's disk low (ga-pwd2h6).** A push with 5000-6144 MB free needs NO exception from the Mayor: `git push` has its own floor
+(5000 MB), lower than the 6144 MB that other heavy steps need. When the disk is the reason a push is held back (or a pre-push
+hook is heavy), run it through the guard, which waits for the disk, watches it while the push runs and lets one push at a time
+through: `bash "$GC_CITY_PATH/scripts/heavy-guard.sh" --what pre-push --wait-secs 600 -- git push origin HEAD` (then the
+verification above as usual). Below 5000 MB it waits up to 600 s, then refuses with rc 75: wait and retry, never `--no-verify`.
+rc 78 = the disk fell under 4000 MB while the push ran and the guard stopped it: do NOT repeat it, tell the Mayor. rc 79 = another
+push holds the lock: retry in a minute. Details: `docs/runbooks/disk-trabalho-pesado.md`, "Push (ga-pwd2h6)".
+
 ## Step 2: Gather context
 
 ```bash

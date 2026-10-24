@@ -4,7 +4,7 @@
 # are `sh`); no side effect at source time.
 #
 # ## Contents
-#   Why · The three floors · Three states · Seams
+#   Why · The floors (three + the push pair) · Three states · Seams
 #
 # WHY. 17/10 12:40-12:56 the mini's disk went to ~0 while three agents were INSIDE heavy steps (a git repack,
 # a selftest copying hq.jsonl, `go build` + golangci-lint). Dolt got ENOSPC writing its journal and the whole
@@ -28,6 +28,16 @@
 #                                      the heavy floor for a Go step, and its refusal sends the step to the MacBook
 #                                      (mbp-run.sh --exec --go). The mini had ~7 GB free on 19/10, so in practice this
 #                                      reads as "Go does not run on the mini" until someone frees space.
+#   DISK_PUSH_MIN_MB       5000 (~5 GB) the floor a `git push` (and the pre-push hook behind it) needs to START (ga-pwd2h6).
+#                                      LOWER than the heavy floor on purpose: measured 24/10 the mini's disk sits at
+#                                      4.8-6.1 GB all day (swap) and a push only writes ~0-200 MB (worktree + tmp), minimum
+#                                      seen 5052 MB during five pushes, yet at 6144 every WA worker push stopped and asked
+#                                      the Mayor for an exception (wa-bwo99o.7/.8/.9, five times that day). heavy-guard.sh
+#                                      applies it to a push step and nothing else, and pairs it with the stop floor below.
+#   DISK_PUSH_STOP_MB      4000 (~4 GB) while a push RUNS under heavy-guard.sh, a disk that falls UNDER this interrupts it
+#                                      (TERM to its process group, rc 78). It is the margin over dolt-disk-floor-guard's
+#                                      CRITICAL floor (3 GB). It is clamped to DISK_PUSH_MIN_MB: a stop floor above the
+#                                      start floor would kill a push the moment it started.
 #
 # THREE STATES, never two (the error-vs-empty family): disk_headroom_state prints
 #   ok       a reading, and it is at or above the floor (or the lib is switched off)
@@ -72,6 +82,14 @@ case "$DISK_GO_MIN_MB" in ''|*[!0-9]*) DISK_GO_MIN_MB=13312 ;; esac
 [ "${#DISK_NEW_WORK_MIN_MB}" -le 9 ] || DISK_NEW_WORK_MIN_MB=5120
 [ "${#DISK_HEAVY_MIN_MB}" -le 9 ] || DISK_HEAVY_MIN_MB=6144
 [ "${#DISK_GO_MIN_MB}" -le 9 ] || DISK_GO_MIN_MB=13312
+DISK_PUSH_MIN_MB="${DISK_PUSH_MIN_MB:-5000}"
+DISK_PUSH_STOP_MB="${DISK_PUSH_STOP_MB:-4000}"
+case "$DISK_PUSH_MIN_MB" in ''|*[!0-9]*) DISK_PUSH_MIN_MB=5000 ;; esac
+case "$DISK_PUSH_STOP_MB" in ''|*[!0-9]*) DISK_PUSH_STOP_MB=4000 ;; esac
+[ "${#DISK_PUSH_MIN_MB}" -le 9 ] || DISK_PUSH_MIN_MB=5000
+[ "${#DISK_PUSH_STOP_MB}" -le 9 ] || DISK_PUSH_STOP_MB=4000
+# both are numbers of at most 9 digits here, so `[` can compare them: a stop floor above the start floor is pulled down to it
+[ "$DISK_PUSH_STOP_MB" -le "$DISK_PUSH_MIN_MB" ] || DISK_PUSH_STOP_MB="$DISK_PUSH_MIN_MB"
 
 # disk_free_mb — free MB as an integer on stdout and rc 0; rc 1 and NO stdout when it cannot be read.
 disk_free_mb() {

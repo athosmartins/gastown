@@ -19,6 +19,7 @@ check() { # check <desc> <expected-rc> <actual-rc>
 export GC_CITY_PATH="$W/city"; mkdir -p "$GC_CITY_PATH/.gc/logs"
 export HEAVY_GUARD_LOG="$W/city/.gc/logs/heavy-guard.log"
 unset DISK_FREE_OVERRIDE_MB DISK_HEADROOM_PATH DISK_HEADROOM_ENABLED DISK_NEW_WORK_MIN_MB DISK_HEAVY_MIN_MB HEAVY_GUARD_POLL_SECS
+unset DISK_GO_MIN_MB DISK_PUSH_MIN_MB DISK_PUSH_STOP_MB HEAVY_GUARD_WATCH_SECS HEAVY_GUARD_KILL_GRACE_SECS HEAVY_GUARD_PUSH_LOCK_DIR HEAVY_GUARD_PUSH_LOCK_WAIT_SECS HEAVY_GUARD_PUSH_LOCK_POLL_SECS HEAVY_GUARD_PUSH_LOCK_MAXAGE_SECS
 
 # ── lib cases: lib_cases <lib> ───────────────────────────────────────────────────────────────────────────────
 lib_cases() {
@@ -64,6 +65,18 @@ lib_cases() {
   [ "$(gf DISK_GO_MIN_MB=99999999999999999999)" = 13312 ]              || bad "lib: a Go floor past int64 must fall back to 13312 (got '$(gf DISK_GO_MIN_MB=99999999999999999999)')"
   [ "$(gf DISK_GO_MIN_MB=1234567890)" = 13312 ]                        || bad "lib: a Go floor of more than 9 digits must fall back to 13312 (got '$(gf DISK_GO_MIN_MB=1234567890)')"
   [ "$(gf DISK_GO_MIN_MB=123456789)" = 123456789 ]                     || bad "lib: a 9-digit Go floor is still a floor (got '$(gf DISK_GO_MIN_MB=123456789)')"
+  # the PUSH floors (ga-pwd2h6): a `git push` may START at 5000 MB and is STOPPED below 4000 MB; same rule as the other floors for a bad value
+  pf() { env "$@" sh -c '. "$1"; echo "$DISK_PUSH_MIN_MB/$DISK_PUSH_STOP_MB"' _ "$lib"; }
+  [ "$(pf X=1)" = 5000/4000 ]                                          || bad "lib: the default push floors must be 5000 (start) / 4000 (stop) (got '$(pf X=1)')"
+  [ "$(pf DISK_PUSH_MIN_MB=4500 DISK_PUSH_STOP_MB=3500)" = 4500/3500 ] || bad "lib: DISK_PUSH_MIN_MB / DISK_PUSH_STOP_MB must be honoured (got '$(pf DISK_PUSH_MIN_MB=4500 DISK_PUSH_STOP_MB=3500)')"
+  [ "$(pf DISK_PUSH_MIN_MB=garbage)" = 5000/4000 ]                     || bad "lib: a push start floor that is not a number must fall back to 5000 (got '$(pf DISK_PUSH_MIN_MB=garbage)')"
+  [ "$(pf DISK_PUSH_STOP_MB=)" = 5000/4000 ]                           || bad "lib: an empty push stop floor must fall back to 4000 (got '$(pf DISK_PUSH_STOP_MB=)')"
+  [ "$(pf DISK_PUSH_STOP_MB=garbage)" = 5000/4000 ]                    || bad "lib: a push stop floor that is not a number must fall back to 4000, not be clamped to the start floor (got '$(pf DISK_PUSH_STOP_MB=garbage)')"
+  [ "$(pf DISK_PUSH_MIN_MB=1234567890)" = 5000/4000 ]                  || bad "lib: a push start floor of more than 9 digits must fall back to 5000 (got '$(pf DISK_PUSH_MIN_MB=1234567890)')"
+  [ "$(pf DISK_PUSH_STOP_MB=99999999999999999999)" = 5000/4000 ]       || bad "lib: a push stop floor past int64 must fall back to 4000 (got '$(pf DISK_PUSH_STOP_MB=99999999999999999999)')"
+  # a stop floor ABOVE the start floor would kill a push the moment it starts: it is pulled down to the start floor
+  [ "$(pf DISK_PUSH_MIN_MB=3500)" = 3500/3500 ]                        || bad "lib: a stop floor above the start floor must be pulled down to it (got '$(pf DISK_PUSH_MIN_MB=3500)')"
+  [ "$(pf DISK_PUSH_STOP_MB=6000)" = 5000/5000 ]                       || bad "lib: DISK_PUSH_STOP_MB=6000 must be pulled down to the start floor 5000 (got '$(pf DISK_PUSH_STOP_MB=6000)')"
   # the reader must not die under set -e when the state is not ok (callers run it inside $(...) with set -e on)
   s="$( DISK_FREE_OVERRIDE_MB=1 sh -ec '. "$1"; x=$(disk_headroom_state 5120); echo "alive:$x"' _ "$lib" )"
   [ "$s" = "alive:low" ]             || bad "lib: set -e safety (got '$s')"
@@ -288,6 +301,373 @@ go test ./...'; do
   grep -q "REFUSED what='other' free_mb=3000 min_mb=6144 rc=75" "$HEAVY_GUARD_LOG" || bad "go: a non-Go refusal keeps its old log line ($(cat "$HEAVY_GUARD_LOG"))"
 }
 
+# ── PUSH class cases (ga-pwd2h6): push_cases <guard> <lib> ───────────────────────────────────────────────────
+# A `git push` (and the pre-push hook behind it) writes ~0-200 MB, so it gets a floor of its own: starts at 5000 MB (the heavy
+# floor is 6144), and a watch STOPS it if the disk falls under 4000 MB while it runs; one push at a time (lock). A fake `git` on
+# PATH marks whether the command RAN, so "refused" is proved by the command not running, not only by the rc; a fake `df`
+# whose answer the fake git can change makes the disk fall DURING the push. The real git is never called.
+push_cases() {
+  local g="$1" lib="$2" rc out i lbl cmdline hp dp r1 r2 gp seq
+  local PB="$W/pbin" PD="$W/pdf" LK="$W/plock"
+  export HEAVY_GUARD_PUSH_LOCK_DIR="$LK"
+  mkdir -p "$PB" "$PD"
+  cat > "$PB/git" <<EOF
+#!/bin/sh
+echo "start \$\$" >> "$W/gitlog"
+echo "git \$*" > "$W/gitargs"
+[ -n "\$FAKE_GIT_LOCKDIR" ] && [ -d "\$FAKE_GIT_LOCKDIR" ] && echo held >> "$W/lockseen"
+[ -n "\$FAKE_GIT_DF" ] && echo "\$FAKE_GIT_DF" > "$W/dfnow"
+[ -n "\$FAKE_GIT_DFBAD" ] && : > "$W/dfbad"
+[ -n "\$FAKE_GIT_IGNORE_TERM" ] && trap '' TERM
+[ -n "\$FAKE_GIT_GRANDCHILD" ] && { "$PB/hook" >/dev/null 2>&1 & echo \$! > "$W/grandchild"; }
+if [ -n "\$FAKE_GIT_TERM0" ]; then
+  trap 'echo "end \$\$" >> "$W/gitlog"; exit 0' TERM
+  [ -n "\$FAKE_GIT_SLEEP" ] && { sleep "\$FAKE_GIT_SLEEP" & wait \$!; }
+elif [ -n "\$FAKE_GIT_SLEEP" ]; then
+  sleep "\$FAKE_GIT_SLEEP"
+fi
+echo "end \$\$" >> "$W/gitlog"
+exit \${FAKE_GIT_RC:-0}
+EOF
+  # the push's hook: a child in the push's process group that cleans up when it gets TERM (the proof the TERM reached the group)
+  cat > "$PB/hook" <<EOF
+#!/bin/sh
+trap 'echo termed > "$W/hooktermed"; exit 0' TERM
+while :; do sleep 1; done
+EOF
+  cat > "$PD/df" <<EOF
+#!/bin/sh
+if [ -e "$W/dfbad" ]; then echo "df: no usable answer"; exit 0; fi
+echo "Filesystem 1048576-blocks Used Available Capacity Mounted on"
+echo "/dev/fake 100000 90000 \$(cat "$W/dfnow") 90% /"
+EOF
+  chmod +x "$PB/git" "$PB/hook" "$PD/df"
+  # prun: the reading is pinned by the caller (DISK_FREE_OVERRIDE_MB); wenv: the live fake df, polled every second by the watch
+  prun() { PATH="$PB:$PATH" HEAVY_GUARD_LIB="$lib" "$g" "$@"; }
+  local -a wenv
+  wenv=(PATH="$PD:$PB:$PATH" DISK_HEADROOM_PATH=/ HEAVY_GUARD_LIB="$lib" HEAVY_GUARD_WATCH_SECS=1 HEAVY_GUARD_KILL_GRACE_SECS=3)
+  pbounded() { # pbounded <secs> <cmd...>: the command's rc, or 124 when it was still running after <secs> (it is killed)
+    local p n=$(( $1 * 10 )) k=0; shift; "$@" & p=$!
+    while kill -0 "$p" 2>/dev/null && [ "$k" -lt "$n" ]; do sleep 0.1; k=$((k+1)); done
+    if kill -0 "$p" 2>/dev/null; then kill "$p" 2>/dev/null; wait "$p" 2>/dev/null; return 124; fi
+    wait "$p"
+  }
+  p_reset() {
+    rm -f "$W/gitlog" "$W/gitargs" "$W/dfbad" "$W/grandchild" "$W/hooktermed" "$W/lockseen" "$W/err" "$LK/owner"; rmdir "$LK" 2>/dev/null
+    echo 9000 > "$W/dfnow"; : > "$HEAVY_GUARD_LOG"
+  }
+
+  # sections: PUSH_SECTIONS="floor busy" runs only those (default: all); the mutants below name the sections that can notice them
+  want() { case " ${PUSH_SECTIONS:-all} " in *" all "*|*" $1 "*) return 0 ;; esac; return 1; }
+  if want floor; then
+  # (a) the floor: a push starts at 5000 MB; every other heavy step still needs 6144
+  p_reset
+  DISK_FREE_OVERRIDE_MB=5500 prun --what pre-push -- git push origin HEAD >/dev/null 2>&1; rc=$?
+  check "push: git push at 5500 MB (between the push floor and the heavy floor) goes ahead" 0 "$rc"
+  [ "$(cat "$W/gitargs" 2>/dev/null)" = "git push origin HEAD" ] || bad "push: the push did not run with its own arguments (got '$(cat "$W/gitargs" 2>/dev/null)')"
+  p_reset; rm -f "$W/ran"
+  DISK_FREE_OVERRIDE_MB=5500 prun --what t -- sh -c 'touch "$1"' _ "$W/ran" >/dev/null 2>&1; rc=$?
+  check "push: another heavy step at 5500 MB is still refused (75)" 75 "$rc"; [ ! -e "$W/ran" ] || bad "push: a non-push heavy step RAN at 5500 MB"
+  p_reset
+  DISK_FREE_OVERRIDE_MB=4999 prun --what pre-push -- git push origin HEAD 2>"$W/err" >/dev/null; rc=$?
+  check "push: one MB under the push floor (4999) is refused with 75" 75 "$rc"
+  [ ! -e "$W/gitlog" ] || bad "push: git push RAN below the push floor"
+  grep -q '4999 MB free < 5000 MB floor for a git push' "$W/err" || bad "push: the refusal must show the push floor ($(cat "$W/err"))"
+  grep -q -e '--no-verify' "$W/err" || bad "push: the refusal must tell the worker not to use --no-verify ($(cat "$W/err"))"
+  grep -q 'rc 75' "$W/err" || bad "push: the refusal must say rc 75"
+  grep -q "REFUSED what='pre-push' free_mb=4999 min_mb=5000 class=push rc=75" "$HEAVY_GUARD_LOG" || bad "push: refusal not in the log with class=push ($(cat "$HEAVY_GUARD_LOG"))"
+  p_reset
+  DISK_FREE_OVERRIDE_MB=5000 prun --what pre-push -- git push origin HEAD >/dev/null 2>&1; rc=$?
+  check "push: exactly the push floor (5000) goes ahead" 0 "$rc"
+  p_reset
+  DISK_FREE_OVERRIDE_MB=x prun --what pre-push -- git push origin HEAD >/dev/null 2>&1; rc=$?
+  check "push: an unreadable disk refuses a push with 76" 76 "$rc"; [ ! -e "$W/gitlog" ] || bad "push: git push RAN with no reading of the disk"
+  # a non-push refusal is the old one: no push wording
+  p_reset
+  DISK_FREE_OVERRIDE_MB=5500 prun --what t -- sh -c 'true' 2>"$W/err"; rc=$?
+  ! grep -q 'git push' "$W/err" || bad "push: a non-push refusal must not talk about git push ($(cat "$W/err"))"
+
+  fi
+  if want detect; then
+  # (b) what is a push: the command (git, then its own options, then `push`), or a push label when there is no command to look at
+  while IFS= read -r cmdline; do
+    p_reset
+    # shellcheck disable=SC2086
+    DISK_FREE_OVERRIDE_MB=5500 prun --what step -- $cmdline >/dev/null 2>&1; rc=$?
+    check "push: the command '$cmdline' is a git push (5500 passes)" 0 "$rc"
+  done <<'EOF'
+git push
+git push origin HEAD
+git push --force-with-lease origin HEAD
+git -C /tmp/some/dir push origin HEAD
+git -c core.hooksPath=/dev/null push origin HEAD
+git --no-pager push origin HEAD
+EOF
+  p_reset
+  DISK_FREE_OVERRIDE_MB=5500 prun --what step -- "$PB/git" push origin HEAD >/dev/null 2>&1; rc=$?
+  check "push: a git given by path ($PB/git push) is a git push" 0 "$rc"
+  # NOT pushes: the heavy floor applies (5500 is refused) and the command does not run
+  while IFS= read -r cmdline; do
+    p_reset
+    # shellcheck disable=SC2086
+    DISK_FREE_OVERRIDE_MB=5500 prun --what step -- $cmdline >/dev/null 2>&1; rc=$?
+    check "push: the command '$cmdline' is NOT a git push (5500 is refused)" 75 "$rc"; [ ! -e "$W/gitlog" ] || bad "push: '$cmdline' RAN at 5500 MB"
+  done <<'EOF'
+git status
+git pull
+git push-foo
+git -C push status
+git commit -m push
+git fetch push
+git -x push
+echo push
+EOF
+  for cmdline in 'git push origin HEAD' 'cd /tmp && git push' 'echo git push'; do
+    p_reset
+    DISK_FREE_OVERRIDE_MB=5500 prun --what step -- sh -c "$cmdline" >/dev/null 2>&1; rc=$?
+    check "push: sh -c '$cmdline' is not seen as a git push (the heavy floor applies, 5500 is refused)" 75 "$rc"; [ ! -e "$W/gitlog" ] || bad "push: sh -c '$cmdline' RAN at 5500 MB"
+  done
+  # a label alone (--check has no command)
+  for lbl in push git-push pre-push Push "git push" pre_push "git-push origin"; do
+    DISK_FREE_OVERRIDE_MB=5500 prun --check --what "$lbl" 2>/dev/null; rc=$?
+    check "push: the label '$lbl' is a push (5500 passes)" 0 "$rc"
+    DISK_FREE_OVERRIDE_MB=4999 prun --check --what "$lbl" 2>/dev/null; rc=$?
+    check "push: the label '$lbl' under the push floor (4999) is refused" 75 "$rc"
+  done
+  for lbl in pushover unpush wa-push cargo-push "heavy step" go; do
+    DISK_FREE_OVERRIDE_MB=5500 prun --check --what "$lbl" 2>/dev/null; rc=$?
+    check "push: the label '$lbl' is NOT a push (the heavy floor refuses 5500)" 75 "$rc"
+  done
+  # a label cannot make another command a push: with a command to look at, only the command counts
+  p_reset; rm -f "$W/ran"
+  DISK_FREE_OVERRIDE_MB=5500 prun --what push -- sh -c 'touch "$1"' _ "$W/ran" >/dev/null 2>&1; rc=$?
+  check "push: --what push on a command that is not a git push keeps the heavy floor (5500 refused)" 75 "$rc"; [ ! -e "$W/ran" ] || bad "push: a push label let a non-push command run at 5500 MB"
+  # a Go step stays a Go step: the higher floor wins over the push class
+  p_reset
+  DISK_FREE_OVERRIDE_MB=9000 prun --what go-test -- git push >/dev/null 2>&1; rc=$?
+  check "push: --what go-test on a git push keeps the Go floor (9000 refused)" 75 "$rc"; [ ! -e "$W/gitlog" ] || bad "push: a Go-labelled step RAN under the Go floor"
+
+  fi
+  if want minfree; then
+  # (c) --min-free-mb can RAISE the push floor, never lower it (the stop floor is the Dolt CRITICAL margin)
+  p_reset
+  DISK_FREE_OVERRIDE_MB=4500 prun --min-free-mb 3000 --what pre-push -- git push >/dev/null 2>&1; rc=$?
+  check "push: --min-free-mb 3000 cannot lower the push floor (4500 refused)" 75 "$rc"; [ ! -e "$W/gitlog" ] || bad "push: a lowered --min-free-mb let a push run under 5000"
+  DISK_FREE_OVERRIDE_MB=5500 prun --min-free-mb 6144 --what pre-push -- git push >/dev/null 2>&1; rc=$?
+  check "push: --min-free-mb 6144 raises the push floor (5500 refused)" 75 "$rc"
+  DISK_FREE_OVERRIDE_MB=5000 prun --min-free-mb 5000 --what pre-push -- git push >/dev/null 2>&1; rc=$?
+  check "push: the workers' own --min-free-mb 5000 keeps working (5000 goes ahead)" 0 "$rc"
+  # the env knob moves the push floor, and only that
+  p_reset
+  DISK_FREE_OVERRIDE_MB=4600 DISK_PUSH_MIN_MB=4500 prun --what pre-push -- git push >/dev/null 2>&1; rc=$?
+  check "push: DISK_PUSH_MIN_MB=4500 lets 4600 through" 0 "$rc"
+  DISK_FREE_OVERRIDE_MB=4400 DISK_PUSH_MIN_MB=4500 prun --what pre-push -- git push >/dev/null 2>&1; rc=$?
+  check "push: DISK_PUSH_MIN_MB=4500 refuses 4400" 75 "$rc"
+  DISK_FREE_OVERRIDE_MB=4600 DISK_PUSH_MIN_MB=garbage prun --what pre-push -- git push >/dev/null 2>&1; rc=$?
+  check "push: a garbage DISK_PUSH_MIN_MB falls back to 5000 (4600 refused)" 75 "$rc"
+  fi
+  if want nopushlib; then
+  # a lib from before the push class cannot give the push floors: the step keeps the heavy floor (the old behaviour), it is not blocked
+  grep -v 'DISK_PUSH_' "$lib" > "$W/lib-nopush.sh"
+  p_reset
+  HEAVY_GUARD_LIB="$W/lib-nopush.sh" DISK_FREE_OVERRIDE_MB=5500 PATH="$PB:$PATH" "$g" --what pre-push -- git push >/dev/null 2>&1; rc=$?
+  check "push: a lib without the push floors keeps the heavy floor (5500 refused)" 75 "$rc"; [ ! -e "$W/gitlog" ] || bad "push: a push RAN on a lib without the push floors under the heavy floor"
+  HEAVY_GUARD_LIB="$W/lib-nopush.sh" DISK_FREE_OVERRIDE_MB=20000 PATH="$PB:$PATH" "$g" --what pre-push -- git push >/dev/null 2>&1; rc=$?
+  check "push: a lib without the push floors still lets a push through when the disk is plentiful" 0 "$rc"; [ -e "$W/gitlog" ] || bad "push: the push did not run on a lib without the push floors"
+
+  fi
+  if want stop; then
+  # (d) the watch: under the stop floor while the push runs → TERM to its whole process group, rc 78, nothing left alive
+  p_reset
+  pbounded 20 env "${wenv[@]}" FAKE_GIT_DF=3900 FAKE_GIT_SLEEP=8 FAKE_GIT_GRANDCHILD=1 "$g" --what pre-push -- git push origin HEAD 2>"$W/err" >/dev/null; rc=$?
+  check "push watch: a disk that falls to 3900 MB (< 4000) during the push interrupts it with rc 78" 78 "$rc"
+  ! grep -q '^end' "$W/gitlog" 2>/dev/null || bad "push watch: the push ran to the end although the disk fell under the stop floor"
+  grep -q 'INTERRUPTED' "$W/err" && grep -q 'rc 78' "$W/err" || bad "push watch: stderr must say INTERRUPTED and rc 78 ($(cat "$W/err"))"
+  grep -q '3[0-9][0-9][0-9] MB free < 4000 MB stop floor' "$W/err" || bad "push watch: the message must show the reading and the 4000 stop floor ($(cat "$W/err"))"
+  grep -q 'Do NOT repeat it' "$W/err" && grep -q 'Tell the Mayor' "$W/err" || bad "push watch: the message must say not to repeat it and to tell the Mayor ($(cat "$W/err"))"
+  grep -q "INTERRUPTED what='pre-push'.*stop_mb=4000.*rc=78" "$HEAVY_GUARD_LOG" || bad "push watch: the interruption is not in the log ($(cat "$HEAVY_GUARD_LOG"))"
+  gp="$(cat "$W/grandchild" 2>/dev/null)"
+  if [ -n "$gp" ] && kill -0 "$gp" 2>/dev/null; then bad "push watch: a child of the push (pid $gp) is still alive: the TERM did not go to the whole process group"; kill "$gp" 2>/dev/null; fi
+  [ -e "$W/hooktermed" ] || bad "push watch: the push's hook never saw the TERM (the whole group must be told first, the KILL comes only after the grace)"
+  [ ! -e "$LK" ] || bad "push watch: the lock was not released after an interruption"
+  fi
+  if want ignoreterm; then
+  # a push that ignores TERM is KILLed after the grace (3 s here), and the guard still answers 78 well before the push would have ended by itself
+  p_reset; i=$(date +%s)
+  pbounded 25 env "${wenv[@]}" FAKE_GIT_DF=3900 FAKE_GIT_SLEEP=15 FAKE_GIT_IGNORE_TERM=1 "$g" --what pre-push -- git push origin HEAD 2>/dev/null >/dev/null; rc=$?
+  check "push watch: a push that ignores TERM is KILLed after the grace and the guard answers 78" 78 "$rc"
+  ! grep -q '^end' "$W/gitlog" 2>/dev/null || bad "push watch: a push that ignores TERM ran to its end"
+  [ $(( $(date +%s) - i )) -lt 13 ] || bad "push watch: the KILL after the grace came too late ($(( $(date +%s) - i )) s)"
+  fi
+  if want term0; then
+  # a push that exits 0 even when told to stop did finish: its 0 comes through, it is not turned into a 78
+  p_reset
+  pbounded 25 env "${wenv[@]}" FAKE_GIT_DF=3900 FAKE_GIT_SLEEP=8 FAKE_GIT_TERM0=1 "$g" --what pre-push -- git push origin HEAD 2>/dev/null >/dev/null; rc=$?
+  check "push watch: a push that ended with 0 keeps its 0 even after the watch told it to stop" 0 "$rc"
+  fi
+  if want stopfloor; then
+  # exactly the stop floor is NOT under it; a dip that stays above it does not interrupt
+  for i in 4000 4100; do
+    p_reset
+    pbounded 20 env "${wenv[@]}" FAKE_GIT_DF=$i FAKE_GIT_SLEEP=3 "$g" --what pre-push -- git push origin HEAD 2>"$W/err" >/dev/null; rc=$?
+    check "push watch: a disk that falls to $i MB (not under 4000) does not interrupt the push" 0 "$rc"
+    grep -q '^end' "$W/gitlog" 2>/dev/null || bad "push watch: the push was stopped at $i MB"
+    [ ! -s "$W/err" ] || bad "push watch: a push that was not stopped must leave stderr empty (got '$(cat "$W/err")')"
+  done
+  p_reset
+  pbounded 20 env "${wenv[@]}" FAKE_GIT_DF=3999 FAKE_GIT_SLEEP=8 "$g" --what pre-push -- git push origin HEAD 2>/dev/null >/dev/null; rc=$?
+  check "push watch: one MB under the stop floor (3999) interrupts" 78 "$rc"
+  fi
+  if want blind; then
+  # a reading the watch cannot take is not a reason to kill a push: it keeps running, and the log says the watch was blind
+  p_reset
+  pbounded 20 env "${wenv[@]}" FAKE_GIT_DFBAD=1 FAKE_GIT_SLEEP=3 "$g" --what pre-push -- git push origin HEAD 2>"$W/err" >/dev/null; rc=$?
+  check "push watch: a df that stops answering during the push does not kill it" 0 "$rc"
+  grep -q '^end' "$W/gitlog" 2>/dev/null || bad "push watch: the push was stopped because df stopped answering"
+  grep -q 'WATCH_UNREADABLE' "$HEAVY_GUARD_LOG" || bad "push watch: an unreadable reading during the watch must leave a log line ($(cat "$HEAVY_GUARD_LOG"))"
+  fi
+  if want rc; then
+  # the command's own rc comes through, and the lock is let go
+  for i in 1 128; do
+    p_reset
+    pbounded 20 env "${wenv[@]}" FAKE_GIT_RC=$i "$g" --what pre-push -- git push origin HEAD >/dev/null 2>&1; rc=$?
+    check "push watch: the push's own rc ($i) comes through" "$i" "$rc"
+    [ ! -e "$LK" ] || bad "push watch: the lock was not released after a push that exited $i"
+  done
+  # arguments reach the push intact
+  p_reset
+  pbounded 20 env "${wenv[@]}" "$g" --what pre-push -- git push "origin" "a b" >/dev/null 2>&1
+  [ "$(cat "$W/gitargs" 2>/dev/null)" = "git push origin a b" ] || bad "push watch: arguments did not reach the push ($(cat "$W/gitargs" 2>/dev/null))"
+  fi
+  if want nonpush; then
+  # not a push: no watch and no lock, the command is exec'd as before
+  p_reset
+  DISK_FREE_OVERRIDE_MB=20000 prun --what t -- sh -c '[ -d "$1" ] && exit 5; exit 0' _ "$LK" >/dev/null 2>&1; rc=$?
+  check "push: a heavy step that is not a push takes no lock" 0 "$rc"
+
+  fi
+  if want posint; then
+  # hg_posint reads every push tunable: loaded from the guard under test and called directly (a $(...) per call keeps each case apart)
+  pi() { ( eval "$(sed -n '/^hg_posint() {/,/^}/p' "$g")"; hg_posint X "$1" "$2" "$3" 2>/dev/null; printf '%s' "${X-<unset>}" ); }
+  [ "$(pi 08 3 0)" = 8 ]               || bad "posint: '08' is the decimal 8, not an octal error (got '$(pi 08 3 0)')"
+  [ "$(pi 09 3 0)" = 9 ]               || bad "posint: '09' is the decimal 9 (got '$(pi 09 3 0)')"
+  [ "$(pi 0 3 0)" = 3 ]                || bad "posint: a 0 where 0 is not allowed falls back to the default (got '$(pi 0 3 0)')"
+  [ "$(pi 0 900 1)" = 0 ]              || bad "posint: a 0 where 0 is allowed stays 0 (got '$(pi 0 900 1)')"
+  [ "$(pi abc 3 0)" = 3 ]              || bad "posint: text falls back to the default (got '$(pi abc 3 0)')"
+  [ "$(pi -5 3 0)" = 3 ]               || bad "posint: a negative number falls back to the default (got '$(pi -5 3 0)')"
+  [ "$(pi '' 3 0)" = 3 ]               || bad "posint: empty falls back to the default (got '$(pi '' 3 0)')"
+  [ "$(pi 1234567890 3 0)" = 3 ]       || bad "posint: more than 9 digits falls back to the default (got '$(pi 1234567890 3 0)')"
+  [ "$(pi 123456789 3 0)" = 123456789 ] || bad "posint: 9 digits is still a number (got '$(pi 123456789 3 0)')"
+  fi
+  if want serial; then
+  # (e) the lock: one pre-push at a time
+  p_reset
+  pbounded 30 env "${wenv[@]}" FAKE_GIT_SLEEP=2 HEAVY_GUARD_PUSH_LOCK_POLL_SECS=1 "$g" --what pre-push -- git push a >/dev/null 2>&1 &
+  r1=$!; sleep 0.7
+  pbounded 30 env "${wenv[@]}" FAKE_GIT_SLEEP=2 HEAVY_GUARD_PUSH_LOCK_POLL_SECS=1 "$g" --what pre-push -- git push b >/dev/null 2>&1 &
+  r2=$!
+  wait "$r1"; rc=$?; check "push lock: the first push finishes with 0" 0 "$rc"
+  wait "$r2"; rc=$?; check "push lock: the second push waits for the lock and then finishes with 0" 0 "$rc"
+  seq="$(awk '{printf "%s ", $1}' "$W/gitlog" 2>/dev/null)"
+  [ "$seq" = "start end start end " ] || bad "push lock: two pushes at once must run one after the other (events: $seq)"
+  [ ! -e "$LK" ] || bad "push lock: the lock was left behind"
+  # the lock really is held while the push runs, in the default place too (GC_CITY_PATH/.gc/heavy-guard-push.lock)
+  p_reset
+  pbounded 20 env "${wenv[@]}" FAKE_GIT_LOCKDIR="$LK" "$g" --what pre-push -- git push >/dev/null 2>&1
+  [ -e "$W/lockseen" ] || bad "push lock: the lock was not held while the push ran"
+  p_reset
+  pbounded 20 env -u HEAVY_GUARD_PUSH_LOCK_DIR "${wenv[@]}" FAKE_GIT_LOCKDIR="$GC_CITY_PATH/.gc/heavy-guard-push.lock" "$g" --what pre-push -- git push >/dev/null 2>&1
+  [ -e "$W/lockseen" ] || bad "push lock: the default lock is not \$GC_CITY_PATH/.gc/heavy-guard-push.lock"
+  fi
+  if want busy; then
+  # a live holder that never lets go: the waiter gives up after its wait with rc 79 (not 75: the disk is fine), names the holder, and does not run
+  p_reset; sleep 60 & hp=$!
+  mkdir "$LK"; echo "$hp $(date +%s)" > "$LK/owner"
+  pbounded 20 env "${wenv[@]}" HEAVY_GUARD_PUSH_LOCK_WAIT_SECS=2 HEAVY_GUARD_PUSH_LOCK_POLL_SECS=1 "$g" --what pre-push -- git push 2>"$W/err" >/dev/null; rc=$?
+  check "push lock: a lock held by a live push for the whole wait is refused with 79" 79 "$rc"; [ ! -e "$W/gitlog" ] || bad "push lock: the push RAN without the lock"
+  grep -q "pid $hp" "$W/err" && grep -q 'rc 79' "$W/err" || bad "push lock: the refusal must name the holder's pid and say rc 79 ($(cat "$W/err"))"
+  grep -q "REFUSED what='pre-push' push_lock_busy.*rc=79" "$HEAVY_GUARD_LOG" || bad "push lock: refusal not in the log ($(cat "$HEAVY_GUARD_LOG"))"
+  [ -d "$LK" ] || bad "push lock: a waiter that gave up must not remove the lock it never held"
+  # a wait of 0 is "do not wait", and a zero-padded number is a decimal ("09" is invalid OCTAL to $(( )))
+  p_reset; mkdir "$LK"; echo "$hp $(date +%s)" > "$LK/owner"
+  i=$(date +%s)
+  pbounded 20 env "${wenv[@]}" HEAVY_GUARD_PUSH_LOCK_WAIT_SECS=0 "$g" --what pre-push -- git push 2>/dev/null >/dev/null; rc=$?
+  check "push lock: HEAVY_GUARD_PUSH_LOCK_WAIT_SECS=0 refuses a busy lock at once (79)" 79 "$rc"
+  [ $(( $(date +%s) - i )) -lt 3 ] || bad "push lock: a wait of 0 waited"
+  pbounded 20 env "${wenv[@]}" HEAVY_GUARD_PUSH_LOCK_WAIT_SECS=2 HEAVY_GUARD_PUSH_LOCK_POLL_SECS=09 "$g" --what pre-push -- git push 2>/dev/null >/dev/null; rc=$?
+  check "push lock: a zero-padded poll (09) is a decimal, not an octal error" 79 "$rc"
+  # --check takes no lock: a decision, nothing runs
+  DISK_FREE_OVERRIDE_MB=5500 prun --check --what push 2>/dev/null; rc=$?
+  check "push lock: --check does not need the lock" 0 "$rc"
+  kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
+  fi
+  if want age; then
+  # a lock whose holder is older than the max age is stale even if its pid is alive (pid reuse / a hung push): taken over
+  p_reset; sleep 60 & hp=$!
+  mkdir "$LK"; echo "$hp $(( $(date +%s) - 100000 ))" > "$LK/owner"
+  pbounded 20 env "${wenv[@]}" HEAVY_GUARD_PUSH_LOCK_WAIT_SECS=2 HEAVY_GUARD_PUSH_LOCK_POLL_SECS=1 "$g" --what pre-push -- git push >/dev/null 2>&1; rc=$?
+  check "push lock: a lock older than the max age is taken over" 0 "$rc"
+  kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
+  fi
+  if want dead; then
+  # a dead holder: taken over
+  p_reset; true & dp=$!; wait "$dp"
+  mkdir "$LK"; echo "$dp $(date +%s)" > "$LK/owner"
+  pbounded 20 env "${wenv[@]}" HEAVY_GUARD_PUSH_LOCK_WAIT_SECS=2 HEAVY_GUARD_PUSH_LOCK_POLL_SECS=1 "$g" --what pre-push -- git push >/dev/null 2>&1; rc=$?
+  check "push lock: a lock whose holder is dead is taken over" 0 "$rc"; [ -e "$W/gitlog" ] || bad "push lock: the push did not run after taking over a dead holder's lock"
+  fi
+  if want garbage; then
+  # an owner file nobody can read as "<pid> <epoch>" is a lock that cannot be judged: respected, never taken
+  p_reset; mkdir "$LK"; echo "garbage" > "$LK/owner"
+  pbounded 20 env "${wenv[@]}" HEAVY_GUARD_PUSH_LOCK_WAIT_SECS=2 HEAVY_GUARD_PUSH_LOCK_POLL_SECS=1 "$g" --what pre-push -- git push >/dev/null 2>&1; rc=$?
+  check "push lock: an owner file that cannot be judged is respected (79)" 79 "$rc"; [ ! -e "$W/gitlog" ] || bad "push lock: the push RAN over a lock whose owner could not be judged"
+  [ -d "$LK" ] || bad "push lock: a lock that could not be judged was removed"
+  # an owner file that EXISTS but cannot be read (chmod 000; as root it stays readable and the case is skipped): the same, respected
+  p_reset; sleep 60 & hp=$!
+  mkdir "$LK"; echo "$hp $(date +%s)" > "$LK/owner"; chmod 000 "$LK/owner" 2>/dev/null
+  if [ ! -r "$LK/owner" ]; then
+    pbounded 20 env "${wenv[@]}" HEAVY_GUARD_PUSH_LOCK_WAIT_SECS=2 HEAVY_GUARD_PUSH_LOCK_POLL_SECS=1 "$g" --what pre-push -- git push >/dev/null 2>"$W/err"; rc=$?
+    check "push lock: an owner file that cannot be READ is respected (79)" 79 "$rc"; [ ! -e "$W/gitlog" ] || bad "push lock: the push RAN over a lock whose owner file was unreadable"
+    [ -d "$LK" ] || bad "push lock: a lock whose owner file was unreadable was removed"
+  fi
+  chmod 600 "$LK/owner" 2>/dev/null; kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
+  fi
+  if want fresh; then
+  # no owner file: a FRESH directory is somebody still writing it (wait), an OLD one is a crash between mkdir and the owner (taken over)
+  p_reset; mkdir "$LK"
+  pbounded 20 env "${wenv[@]}" HEAVY_GUARD_PUSH_LOCK_WAIT_SECS=2 HEAVY_GUARD_PUSH_LOCK_POLL_SECS=1 "$g" --what pre-push -- git push >/dev/null 2>&1; rc=$?
+  check "push lock: a fresh lock directory without an owner is respected (79)" 79 "$rc"; [ ! -e "$W/gitlog" ] || bad "push lock: the push RAN over a fresh ownerless lock"
+  touch -t 202001010000 "$LK"
+  pbounded 20 env "${wenv[@]}" HEAVY_GUARD_PUSH_LOCK_WAIT_SECS=2 HEAVY_GUARD_PUSH_LOCK_POLL_SECS=1 "$g" --what pre-push -- git push >/dev/null 2>&1; rc=$?
+  check "push lock: an old lock directory without an owner is taken over" 0 "$rc"
+  fi
+  if want nocreate; then
+  # a lock that cannot be created at all: refused 76 (fail closed), never run unlocked
+  p_reset; : > "$W/pfile"
+  pbounded 20 env PATH="$PB:$PATH" HEAVY_GUARD_LIB="$lib" HEAVY_GUARD_PUSH_LOCK_DIR="$W/pfile/sub" HEAVY_GUARD_PUSH_LOCK_WAIT_SECS=2 HEAVY_GUARD_PUSH_LOCK_POLL_SECS=1 DISK_FREE_OVERRIDE_MB=9000 "$g" --what pre-push -- git push >/dev/null 2>"$W/err"; rc=$?
+  check "push lock: a lock that cannot be created refuses with 76" 76 "$rc"; [ ! -e "$W/gitlog" ] || bad "push lock: the push RAN with no lock"
+  fi
+  if want diskrelease; then
+  # a refusal for the disk lets the lock go
+  p_reset
+  DISK_FREE_OVERRIDE_MB=4000 prun --what pre-push -- git push >/dev/null 2>&1; rc=$?
+  check "push lock: a push refused for the disk is 75" 75 "$rc"; [ ! -e "$LK" ] || bad "push lock: the lock was left behind by a refused push"
+  fi
+  if want sigterm; then
+  # the guard itself told to stop (the session is killed): it takes the push group down with it and lets the lock go
+  p_reset
+  env "${wenv[@]}" FAKE_GIT_SLEEP=30 "$g" --what pre-push -- git push >/dev/null 2>&1 &
+  gp=$!
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -s "$W/gitlog" ] && break; sleep 0.25; done
+  kill -TERM "$gp" 2>/dev/null; wait "$gp" 2>/dev/null; rc=$?
+  check "push lock: a guard that is told to stop exits 143" 143 "$rc"
+  [ ! -e "$LK" ] || bad "push lock: a guard that was told to stop left the lock behind"
+  hp="$(awk '$1=="start"{print $2}' "$W/gitlog" 2>/dev/null | head -1)"
+  sleep 0.3
+  if [ -n "$hp" ] && kill -0 "$hp" 2>/dev/null; then bad "push lock: the push (pid $hp) outlived the guard that was told to stop"; kill "$hp" 2>/dev/null; fi
+  fi
+}
+
 # ── lookup cases (ga-g9ptej): the guard run from places that have NO packs/ next to it ───────────────────────
 # HEAVY_GUARD_LIB is never set here (lg unsets it): the lookup itself is what is under test. Each layout is a
 # copy of the guard under test, so a mutant of the guard goes through exactly the same places as the real one.
@@ -368,6 +748,7 @@ mk_mutant() { # mk_mutant <src> <dst> <sed-expr>  — fails the selftest if the 
 before=$FAIL; lib_cases "$REAL_LIB";                      [ "$FAIL" -eq "$before" ] || echo "(lib cases failed on the real lib)"
 before=$FAIL; guard_cases "$REAL_GUARD" "$REAL_LIB";      [ "$FAIL" -eq "$before" ] || echo "(guard cases failed on the real files)"
 before=$FAIL; go_cases "$REAL_GUARD" "$REAL_LIB";         [ "$FAIL" -eq "$before" ] || echo "(go cases failed on the real files)"
+before=$FAIL; push_cases "$REAL_GUARD" "$REAL_LIB";       [ "$FAIL" -eq "$before" ] || echo "(push cases failed on the real files)"
 before=$FAIL; lookup_cases "$REAL_GUARD";                 [ "$FAIL" -eq "$before" ] || echo "(lookup cases failed on the real guard)"
 
 # mutants: each must make at least one case fail
@@ -418,6 +799,49 @@ gom g-go-no98     "guard: the Go refusal does not warn that 97/98 are not 'MacBo
 gom g-go-nolog    "guard: the Go refusal log has no class=go"                 's# class=go rc=75# rc=75#'
 gom g-go-no76     "guard: a lib without the Go floor is not refused"          's#^  if \[ -z "\${DISK_GO_MIN_MB:-}" \]; then$#  if false; then#'
 gom g-go-wrongrc  "guard: the Go refusal uses the run-local rc 97"            's#^      exit 75$#      exit 97#'
+
+# push class mutants (ga-pwd2h6): each one removes or bends one rule of the class; the sections named are the cases that can notice it
+pgm() { # pgm <file> <name> <sections> <sed-expr>  (a mutant of the GUARD)
+  mk_mutant "$REAL_GUARD" "$M/$1.sh" "$4" && { before=$FAIL; PUSH_SECTIONS="$3" push_cases "$M/$1.sh" "$REAL_LIB" >/dev/null 2>&1; survive "$2"; }
+}
+plm() { # plm <file> <name> <sed-expr>  (a mutant of the LIB)
+  mk_mutant "$REAL_LIB" "$M/$1.sh" "$3" && { before=$FAIL; lib_cases "$M/$1.sh" >/dev/null 2>&1; survive "$2"; }
+}
+plm lib-pclamp   "lib: a push stop floor above the start floor is kept"       's#^\[ "\$DISK_PUSH_STOP_MB" -le "\$DISK_PUSH_MIN_MB" \] || DISK_PUSH_STOP_MB="\$DISK_PUSH_MIN_MB"$#:#'
+plm lib-pgarb    "lib: a push start floor that is not a number is kept"        '/^case "\$DISK_PUSH_MIN_MB" in/d'
+plm lib-pgarbs   "lib: a push stop floor that is not a number is kept"         '/^case "\$DISK_PUSH_STOP_MB" in/d'
+plm lib-pcap     "lib: no magnitude cap on the push floors"                    '/^\[ "\${#DISK_PUSH_[A-Z_]*}" -le 9 \]/d'
+plm lib-pdef     "lib: the default push start floor is the heavy one"          's/DISK_PUSH_MIN_MB:-5000/DISK_PUSH_MIN_MB:-6144/'
+plm lib-pstopdef "lib: the default push stop floor is wrong"                   's/DISK_PUSH_STOP_MB:-4000/DISK_PUSH_STOP_MB:-3000/'
+pgm p-nolabel    "push: a push label is not recognised"                         detect      's#^    \[\[ \$label =~ \$lre \]\] && return 0#    :#'
+pgm p-labelwins  "push: a push label makes a non-push command a push"           detect      's|^  if \[ \$# -eq 0 \]; then$|  if [ $# -eq 0 ] \|\| [[ $label =~ ^[Pp]ush ]]; then|'
+pgm p-anyprog    "push: any program followed by push counts"                    detect      's#^  case "\$1" in git|\*/git) ;; \*) return 1 ;; esac$#  :#'
+pgm p-shift1     "push: a git option that takes a value eats only itself"       detect      's#--namespace) shift 2 || return 1 ;;#--namespace) shift ;;#'
+pgm p-skipword   "push: an unknown word before push is skipped"                 detect      's#^      \*) return 1 ;;$#      *) shift ;;#'
+pgm p-goover     "push: a Go step can also be a push (lower floor)"             detect      's#if \[ "\$go_class" = 0 \] && hg_push_step#if hg_push_step#'
+pgm p-defheavy   "push: the default push floor is the heavy one"                floor       's#^      min="\$DISK_PUSH_MIN_MB"$#      :#'
+pgm p-noverify   "push: the refusal does not say not to use --no-verify"        floor       's# and do NOT use --no-verify to get around the hook##'
+pgm p-nolower    "push: --min-free-mb can lower the push floor"                 minfree     's#\[ "\$min" -ge "\$DISK_PUSH_MIN_MB" \] 2>/dev/null || min="\$DISK_PUSH_MIN_MB"#:#'
+pgm p-nolibchk   "push: a lib without the push floors is not detected"          nopushlib   's#if \[ -n "\${DISK_PUSH_MIN_MB:-}" \] && \[ -n "\${DISK_PUSH_STOP_MB:-}" \]; then#if true; then#'
+pgm p-nowatch    "push: a push runs without the watch and the lock"             stop        's#\[ "\$push_class" = 1 \] && hg_run_watched "\$@"#:#'
+pgm p-stopmin    "push: the watch stops at the start floor, not the stop floor" stopfloor   's#disk_state_of "\$f" "\$DISK_PUSH_STOP_MB"#disk_state_of "$f" "$DISK_PUSH_MIN_MB"#'
+pgm p-nousr1     "push: the watch does not tell the guard it interrupted"       stop        's#^        kill -USR1 "\$main" 2>/dev/null$#        :#'
+pgm p-leaderonly "push: the TERM goes to the push only, not its group"          stop        's#kill -TERM -- "-\$p" 2>/dev/null || kill -TERM "\$p" 2>/dev/null || return 0#kill -TERM "$p" 2>/dev/null || return 0#'
+pgm p-nokill     "push: a push that ignores TERM is never KILLed"               ignoreterm  's#^    kill -KILL .*$#    :#'
+pgm p-noloop     "push: the guard stops waiting at the first signal"            term0       's#^    \[ "\$HG_INTERRUPTED" = 1 \] && \[ "\$seen" = 0 \] || break$#    break#'
+pgm p-rc0        "push: a push that ended with 0 is turned into a 78"           term0       's#^  if \[ "\$HG_INTERRUPTED" = 1 \] && \[ "\$rc" -ne 0 \]; then$#  if [ "$HG_INTERRUPTED" = 1 ]; then#'
+pgm p-blindkills "push: a reading the watch cannot take kills the push"         blind       's#^      low)$#      low|*)#'
+pgm p-nolock     "push: no lock is taken"                                       serial      's#then hg_push_lock_acquire; fi#then :; fi#'
+pgm p-norelease  "push: the lock is never let go"                               serial      's#^  rmdir "\$HG_LOCK_DIR" 2>/dev/null$#  :#'
+pgm p-noexittrap "push: a refused push leaves the lock behind"                  diskrelease "s#^  trap 'hg_lock_release' EXIT\$#  :#"
+pgm p-zerowait   "push: a wait of 0 is not allowed"                             posint        's#\[ "\$4" = 1 \] ||#false ||#'
+pgm p-octal      "push: a zero-padded number is read as octal"                  posint        's@^  v=\$(( 10#\$v ))$@  v=$(( v ))@'
+pgm p-maxage     "push: a lock older than the max age is never stale"           age         's@\*) \[ \$(( now - 10#\$at )) -le "\$HG_LOCK_MAXAGE" \] || { HG_LOCK_VERDICT=stale; return 0; } ;;@*) : ;;@'
+pgm p-deadholder "push: a lock whose holder is dead is never stale"             dead        's#^    kill -0 "\$pid" 2>/dev/null || HG_LOCK_VERDICT=stale$#    :#'
+pgm p-garbage    "push: a lock that cannot be judged is taken"                  garbage     '/case "\$pid" in/s#return 0 ;; esac#{ HG_LOCK_VERDICT=stale; return 0; } ;; esac#'
+pgm p-freshdir   "push: a fresh ownerless lock directory is taken"              fresh       's#^  \[ "\$old" != "\$HG_LOCK_DIR" \] || HG_LOCK_VERDICT=stale$#  HG_LOCK_VERDICT=stale#'
+pgm p-nocreate   "push: a lock that cannot be created is waited on"             nocreate    's#^    if \[ ! -d "\$HG_LOCK_DIR" \]; then$#    if false; then#'
+pgm p-nosigtrap  "push: the guard does not forward a TERM to the push"          sigterm     "s#^  trap 'hg_on_signal' TERM INT HUP\$#  :#"
 
 # lookup mutants (ga-g9ptej): each one removes or bends one rule of the lib lookup
 lkm() { # lkm <file> <name> <sed-expr>

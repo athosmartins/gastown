@@ -1,7 +1,7 @@
 ## Contents
 
 - O que isto resolve
-- Os três pisos
+- Os pisos (três, mais o par do push)
 - Quem faz o quê (4 peças, entregues em fatias)
 - heavy-guard.sh: uso e códigos de saída
 - Trecho pronto para o pre-commit do repo beads
@@ -17,7 +17,7 @@
 
 A ga-vln2py foi recusada pelo gate no teto de tamanho (E11) e entregue em 4 fatias, uma branch e um marker cada. Este runbook cresce com elas: cada fatia acrescenta o que entrega (peças, interruptores, como conferir).
 
-## Os três pisos
+## Os pisos (três, mais o par do push)
 
 Uma fonte só: `packs/town-deltas/assets/scripts/disk-headroom-lib.sh` (MB livres no volume do swap e do Dolt).
 
@@ -26,6 +26,8 @@ Uma fonte só: `packs/town-deltas/assets/scripts/disk-headroom-lib.sh` (MB livre
 | `DISK_HEAVY_MIN_MB` | 6144 (6 GB) | passo pesado não começa nesta máquina (`heavy-guard.sh` recusa) |
 | `DISK_GO_MIN_MB` | 13312 (13 GB) | `go build/test/vet/install` não começa nesta máquina (ga-edkfip). O `heavy-guard.sh` usa o MAIOR entre este e o de passo pesado; a recusa manda o passo ao MBP (`mbp-run.sh --exec --go`, receita em `mbp-offload.md`, "Go no MBP") |
 | `DISK_NEW_WORK_MIN_MB` | 5120 (5 GB) | nada NOVO deve começar. Quem lê este piso: as sondas do pool (peça 3, ga-09hfgh) e, em outra fatia, o Pilot (ga-ydaslo); o `heavy-guard.sh` não lê (usa o seu) |
+| `DISK_PUSH_MIN_MB` | 5000 (~5 GB) | um `git push` (e o pre-push atrás dele) não começa sob o `heavy-guard.sh` (ga-pwd2h6). MENOR que o de passo pesado de propósito: em 24/10 o disco do mini oscilou entre 4,8 e 6,1 GB o dia todo, um push só escreve ~0-200 MB (worktree e tmp; mínimo visto durante 5 pushes: 5052 MB) e, a 6144, todo push de worker WA parava e pedia exceção ao Mayor (5 vezes naquele dia) |
+| `DISK_PUSH_STOP_MB` | 4000 (~4 GB) | um push EM CURSO sob o guarda é interrompido (rc 78) se o livre cair abaixo disso. É a margem sobre o piso CRÍTICO do Dolt (3 GB). Nunca fica acima do de início: o valor maior é puxado para ele |
 
 O de Go (ga-edkfip) existe porque 6 GB não bastou: 19/10 06:03-06:09 um build frio de `cmd/gc` começou com o disco logo acima de 6 GB, escreveu ~4 GB de cache em 6 minutos e deixou 2 GB — o Dolt ficou no piso CRÍTICO por dois ciclos até alguém matar o build à mão. Um build/teste frio do engine escreve 4–10 GB (medido) e o `dolt-disk-floor-guard` vai a CRÍTICO com 3 GB: 10 + 3 = 13. Com ~7 GB livres (19/10) isso significa "Go não roda no mini": roda no MBP.
 
@@ -51,10 +53,14 @@ heavy-guard.sh --check [--min-free-mb N] [--wait-secs S] [--what RÓTULO]
 |---|---|---|
 | (o do comando) | rodou | — |
 | 75 | disco abaixo do piso (6 GB; 13 GB para um passo Go), mesmo depois da espera | NÃO rode por outro caminho. Selftest do hq: `mbp-run.sh --repo hq` (nó Linux). `go test/build/vet/install`: MBP, `mbp-run.sh --exec --go` (a mensagem da recusa traz o comando). `golangci-lint` não tem destino remoto hoje. Ou espere e tente de novo; se não voltar, avise o Mayor |
-| 76 | não consegui ler o disco (df falhou, leitura com mais de 9 dígitos, ou a lib não carregou: esta última também vai ao log) | o passo também é recusado; tente de novo; se persistir, avise o Mayor |
+| 76 | não consegui ler o disco (df falhou, leitura com mais de 9 dígitos, ou a lib não carregou: esta última também vai ao log). No push, também: a trava não pôde ser criada (nenhum push roda sem trava) | o passo também é recusado; tente de novo; se persistir, avise o Mayor |
+| 78 | (só push) o disco caiu abaixo do piso de PARADA (4 GB) com o push em curso e o guarda o interrompeu | NÃO repita e NÃO contorne (nem `--no-verify`, nem outro caminho): avise o Mayor |
+| 79 | (só push) outro push segurou a trava durante toda a espera | não é disco e o push NÃO começou: tente de novo em um minuto; se a trava não solta e o dono sumiu, avise o Mayor |
 | 64 | uso errado (inclui `--min-free-mb` ou `--wait-secs` com mais de 9 dígitos: acima do que `[ -lt ]` compara, um piso assim valeria "folga") | corrija a chamada |
 
 **Passo Go (ga-edkfip).** Conta como Go o passo cujo `--what` começa com `go` + `-`, `_` ou espaço + `test|build|vet|install` (maiúsculas não importam: `go-test`, `Go build ./cmd/gc`; `go-testdata` e `gopher-build` não são Go), ou cujo comando traz `go <verbo>` como palavra — também dentro de `sh -c '…'`, depois de `;`, `&&`, `|`, `(`, e atrás de `env K=V` ou de um caminho (`/opt/homebrew/bin/go test`). Um script que roda go por dentro (`bash scripts/x.sh`) NÃO é visto: rotule `--what go-test`. Também NÃO são vistos `go -C <dir> test`, `go run`, `go generate` (builds frios também) e rótulos no plural (`go-tests`). Falso positivo (um `echo go test`, um `git commit -m "fix go test"`) só aplica o piso mais alto, nunca o mais baixo; a recusa então aponta uma receita que não serve — ponha esse texto fora da linha de comando (num arquivo de script) para voltar ao piso de 6 GB. O reconhecedor é bash puro, sem comando externo: nada nele pode "não rodar" e virar "não é Go" (a primeira versão separava o comando com `tr`, e com o fork falhando um `cd /tmp;go test` passava no piso de 6 GB; gate ga-7dd84s). `--min-free-mb` pode SUBIR o piso de uma chamada Go, nunca baixá-lo. Lib sem `DISK_GO_MIN_MB` (mais velha que o guarda) recusa o passo Go com 76 e diz por quê; ela não cai para o piso de 6 GB. O log da recusa leva `class=go`.
+
+**Push (ga-pwd2h6).** `heavy-guard.sh --what pre-push --wait-secs 600 -- git push origin HEAD`: com o disco entre 5000 e 6144 MB o push passa sem exceção do Mayor; abaixo de 5000 espera (`--wait-secs`) e, se não voltar, recusa com 75 (a mensagem diz para não usar `--no-verify`). Enquanto o push roda, uma vigia lê o `df` a cada 3 s: abaixo de 4000 MB ela manda TERM ao grupo de processos do push (KILL 5 s depois, para o que sobrar) e o guarda sai com **78**. Uma leitura que a vigia não consegue fazer (df falhou) NUNCA mata o push: ele segue, e o log ganha UMA linha `WATCH_UNREADABLE`. **Um pre-push por vez:** trava em `$GC_CITY_PATH/.gc/heavy-guard-push.lock` (diretório com `owner` = `<pid> <epoch>`); o segundo push espera até 15 min (`HEAVY_GUARD_PUSH_LOCK_WAIT_SECS`) e, se a trava não soltar, sai com **79**. A trava é retomada quando o dono morreu, quando passou de 2 h (pid reaproveitado, push pendurado) ou quando o diretório está sem `owner` e tem mais de ~1 min (o dono morreu entre o `mkdir` e a escrita); uma trava que o guarda não consegue ler ou julgar é respeitada, nunca retomada. É push o comando `git [-C dir] [-c k=v] … push …` (git puro ou por caminho); com `--check`, sem comando, vale o rótulo `push`, `git push` ou `pre-push`. Com comando, só o comando conta: o rótulo não faz de outro passo um push. **NÃO é visto:** `sh -c 'git push'`, `env git push`, alias do git — ficam no piso de 6144, o lado seguro (a classe do push é a ÚNICA que BAIXA um piso, então toda dúvida cai no piso mais alto). `--min-free-mb` pode subir o piso do push, nunca baixar; um passo Go nunca é push; uma lib sem `DISK_PUSH_*` (mais velha que o guarda) deixa o push no piso de 6144 e num `exec` simples, como antes. `--check` na classe é só o piso: sem trava e sem vigia (nada roda sob o guarda), então quem dá `git push` depois de um `--check` não está coberto por 78/79.
 
 75/76 ficam FORA da faixa 96..99 do `mbp-run.sh` ("rode local") de propósito: uma recusa nunca pode ser lida como licença para rodar aqui. Cada recusa vai (melhor esforço) para `$GC_CITY_PATH/.gc/logs/heavy-guard.log`.
 
@@ -87,11 +93,14 @@ Um commit recusado com 75 não é um commit falho: espere o disco ou rode o comm
 | `DISK_HEADROOM_ENABLED=0` | toda leitura da lib vira `ok` (guarda, sondas e Pilot). O guarda avisa no stderr ("NOTE: ... bypassed") e grava `BYPASS` no log quando deixa passar por este interruptor ou por `DISK_FREE_OVERRIDE_MB`; o Pilot deixa um WARN `Disk floor gate bent by the environment` a cada sweep | nunca em produção |
 | `PILOT_DISK_FLOOR_ENABLED` | só o texto `0` desliga o gate do Pilot; `1` liga; outro valor mantém ligado e é nomeado no log (`neither 0 nor 1`) | nunca `0` em produção |
 | `DISK_FREE_OVERRIDE_MB=<n>` | fixa a leitura (n = MB; não numérico = ilegível) | selftests |
-| `DISK_NEW_WORK_MIN_MB` / `DISK_HEAVY_MIN_MB` / `DISK_GO_MIN_MB` | ajusta os pisos (valor não numérico volta ao padrão). No Pilot, `DISK_NEW_WORK_MIN_MB` diferente de 5120 vira o WARN `bent by the environment` com o piso em vigor | só com decisão registrada |
+| `DISK_NEW_WORK_MIN_MB` / `DISK_HEAVY_MIN_MB` / `DISK_GO_MIN_MB` / `DISK_PUSH_MIN_MB` / `DISK_PUSH_STOP_MB` | ajusta os pisos (valor não numérico volta ao padrão). No Pilot, `DISK_NEW_WORK_MIN_MB` diferente de 5120 vira o WARN `bent by the environment` com o piso em vigor | só com decisão registrada |
+
+| `HEAVY_GUARD_WATCH_SECS` · `HEAVY_GUARD_KILL_GRACE_SECS` · `HEAVY_GUARD_PUSH_LOCK_DIR` · `_WAIT_SECS` · `_POLL_SECS` · `_MAXAGE_SECS` | classe do push: intervalo da vigia (3), graça do TERM antes do KILL (5), onde fica a trava, quanto o segundo push espera (900), de quanto em quanto confere (2) e a idade a partir da qual uma trava é velha (7200). Número com zero à esquerda vale como decimal; texto, negativo ou 0 fora de hora volta ao padrão | selftests; em produção só com decisão registrada |
 
 ## Como conferir que está vivo
 
 - Guarda: `scripts/heavy-guard.sh --check --what teste; echo rc=$?` (0 com folga; `DISK_FREE_OVERRIDE_MB=3000` dá 75).
+- Push: `DISK_FREE_OVERRIDE_MB=5500 scripts/heavy-guard.sh --check --what pre-push; echo rc=$?` dá 0 (a 5500 o push passa e outro passo pesado não); com `4999` dá 75. No log: `INTERRUPTED …` (a vigia parou um push), `WATCH_UNREADABLE …` (a vigia ficou cega, o push seguiu), `REFUSED … push_lock_busy …` (79) e `PUSH_LOCK_TAKEOVER …` (trava velha retomada). `ls $GC_CITY_PATH/.gc/heavy-guard-push.lock` fora de um push em curso = trava que sobrou (o próximo push a retoma se o dono estiver morto).
 - Recusas e bypass: `tail $GC_CITY_PATH/.gc/logs/heavy-guard.log` (`REFUSED ...` / `BYPASS ...`; uma linha `BYPASS` fora de selftest = um `export` esquecido).
 - Pilot entortado por variável: `grep 'bent by the environment' $GC_CITY_PATH/.gc/logs/pilot-dispatcher.log` (uma linha por sweep enquanto a variável existir; vazio em produção normal).
 - Sonda do dog: `DISK_FREE_OVERRIDE_MB=3000 POOL_PROBE_LOG=/dev/null sh packs/town-deltas/assets/scripts/pool-probe.sh gastown.dog` (só história some; exit 0 e nada no stderr; o trabalho de fórmula do dog continua saindo). O `POOL_PROBE_LOG=/dev/null` é para a conferência não deixar uma linha "tier 1 held back" no `pool-probe.log` de produção, que pareceria disco baixo de verdade. Leitura ilegível: `grep 'free disk unreadable' $GC_CITY_PATH/.gc/logs/pool-probe.log`.
@@ -104,7 +113,8 @@ Um commit recusado com 75 não é um commit falho: espere o disco ou rode o comm
 - `go test/build/vet/install` têm destino remoto: o MBP, por `mbp-run.sh --exec --go` (não o nó Linux: `--exec` roda só no MBP). Com o MBP fora (rc 96..99) o passo ESPERA, não volta ao mini. `golangci-lint` não tem destino remoto hoje; com disco baixo ele espera.
 - A detecção de passo Go olha o rótulo e a linha de comando, não o que um script faz por dentro; um build disparado por `make`, `bash x.sh` ou um hook só é guardado se quem chama rotular o passo `go-…`. Fora do reconhecimento também: `go -C <dir> test`, `go run`, `go generate`, rótulo no plural.
 - O parágrafo do gate sobre baterias do hq (`gate_hq_selftest_rules`) só sai com o nó ligado (`.gc/hetzner-node.on`); com o nó desligado o revisor não recebe a instrução do guarda por ali (o pool recebe pela seção `hq-selftest-node`, sempre).
-- Uma sessão que JÁ está dentro de um passo quando o disco cai não é interrompida por esta fatia.
+- Uma sessão que JÁ está dentro de um passo quando o disco cai não é interrompida por esta fatia. Exceção: o push, que leva a sua própria vigia (acima).
+- A trava do push é exclusão mútua de MELHOR ESFORÇO: dois que esperam podem julgar a mesma trava velha e disputar a retomada (o `mv` atômico deixa só um passar, mas um terceiro pode ter criado uma trava nova no meio). Quem protege o disco é o piso de PARADA, não a trava. Se o `fork` da vigia falhar (máquina sem processos), o push roda sem ela.
 - A sonda longa `sh -c '…'` que o ENGINE renderiza no prompt do dog não passa pelo hold (só o `pool-probe.sh` passa; é ele que a doutrina manda usar desde a ga-witezg). O risco são as beads já roteadas ao dog (por qualquer caminho) enquanto ele usa a sonda longa.
 - As sondas do wa-worker e do ps-worker respondem `[]` sem separar fórmula de história, porque hoje não há fórmula nelas: medido em 17/10, as 1125 beads roteadas ao wa-worker e as 51 do ps-worker são todas de tipo história sem marca de fórmula, e nenhuma ordem do `city.toml` aponta para esses pools. Se um dia houver, aquelas duas sondas passam a usar `DISK_HOLD_NEW_STORIES_JQ`. Pelo mesmo motivo a classe de CONSERTO fica segurada ali com < 5 GB (sem exceção); o que existe é o aviso ao Mayor descrito na peça 3, não uma isenção.
 - No dog, a bead de REPARO criada por agente (tipo task, sem marca de fórmula) também é segurada com < 5 GB: é trabalho novo. Quem precisar dela rodando com o disco baixo avisa o Mayor.
