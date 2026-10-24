@@ -19,12 +19,15 @@ went unexplained for a week).
 THREE STATES everywhere: a number, or "não medido (<why>)". A file that cannot be read never prints as 0.
 
 Usage: gate-daily-report.py [--day YYYY-MM-DD] [--post] [--city PATH]
-  --post   comment on ga-ufskhy via `bd` and send `notify`; without it, print only (dry run).
+  --post   comment on ga-ufskhy via `bd` (3 tries; each failure prints bd's own stderr to stderr, which launchd
+           keeps in gate-daily-report-launchd.err) and send `notify`; without it, print only (dry run). If the
+           comment is still not recorded, exit 1 and the notify says so (priority 4).
 """
-import argparse, datetime, glob, json, os, re, statistics, subprocess, sys
+import argparse, datetime, glob, json, os, re, statistics, subprocess, sys, time
 
 TZ = datetime.timezone(datetime.timedelta(hours=-3))
 PROGRAM_BEAD = os.environ.get("GATE_DAILY_PROGRAM_BEAD", "ga-ufskhy")
+POST_ATTEMPTS = 3   # tries of `bd comment` before the report counts as NOT recorded (ga-3xrr3l)
 ROLES = ("gate-reviewer", "wa-worker", "ps-worker", "refino-gate-reviewer", "auto-refiner",
          "digo-wa", "oracle-wa", "peter-wa", "thies-wa", "mila-wa", "batista-wa")
 
@@ -300,6 +303,59 @@ def build(city, day):
     return "\n".join(L), m
 
 
+def retry_sleep_base():
+    """Seconds of backoff between `bd comment` tries (try n waits base*n). GATE_DAILY_RETRY_SLEEP overrides the 5 s default."""
+    # vazio → 5 s; ilegível/negativo → 5 s (a mistyped value must neither crash the retry nor turn it into a busy loop)
+    raw = os.environ.get("GATE_DAILY_RETRY_SLEEP", "").strip()
+    try:
+        v = float(raw) if raw else 5.0
+    except ValueError:
+        return 5.0
+    return min(v, 60.0) if v >= 0 else 5.0
+
+
+def stderr_note(raw):
+    """'; stderr: <bd's own words>' for a failure line. Silent bd and unavailable stderr are told apart."""
+    # vazio → "(vazio)" (bd ran and said nothing); None → "indisponível" (a timeout can leave no stderr); bytes → decoded
+    if raw is None:
+        return "; stderr indisponível"
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    raw = " | ".join(raw.strip().splitlines())
+    return "; stderr: " + (raw[-500:] if raw else "(vazio)")
+
+
+def try_comment(city, text):
+    """One `bd comment`. None when it was recorded, else a one-line reason with bd's own stderr."""
+    # falhou (rc≠0 / timeout / bd não inicia) → a reason string, never None; só rc=0 conta como gravado
+    try:
+        r = subprocess.run(["bd", "-C", city, "comment", PROGRAM_BEAD, text], timeout=120,
+                           capture_output=True, text=True, errors="replace")
+    except subprocess.TimeoutExpired as e:
+        return "TimeoutExpired: bd passou de %ss sem terminar%s" % (e.timeout, stderr_note(e.stderr))
+    except OSError as e:  # FileNotFoundError / PermissionError: bd could not even start
+        return "%s: %s" % (e.__class__.__name__, e)
+    return None if r.returncode == 0 else "bd saiu com rc=%d%s" % (r.returncode, stderr_note(r.stderr))
+
+
+def post_comment(city, text):
+    """Records the report on the program bead, trying POST_ATTEMPTS times (a transient Dolt hiccup is the common
+    failure). Returns (recorded, last_reason). A retry after a TIMEOUT can leave a duplicate comment (the first try
+    may have landed after all) — a duplicated day is a smaller loss than a missing one."""
+    base = retry_sleep_base()
+    reason = "nenhuma tentativa feita"
+    for n in range(1, POST_ATTEMPTS + 1):
+        reason = try_comment(city, text)
+        if reason is None:
+            if n > 1:
+                print(f"NOTE: comentário em {PROGRAM_BEAD} gravado na tentativa {n}/{POST_ATTEMPTS}", file=sys.stderr)
+            return True, ""
+        print(f"WARN: comentário em {PROGRAM_BEAD} falhou (tentativa {n}/{POST_ATTEMPTS}): {reason}", file=sys.stderr)
+        if n < POST_ATTEMPTS:
+            time.sleep(base * n)
+    return False, reason
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--day")
@@ -309,22 +365,32 @@ def main():
     day = datetime.date.fromisoformat(a.day) if a.day else (datetime.datetime.now(tz=TZ).date() - datetime.timedelta(days=1))
     text, m = build(a.city, day)
     print(text)
+    logged = False
     try:
         os.makedirs(os.path.join(a.city, ".gc", "logs"), exist_ok=True)
         with open(os.path.join(a.city, ".gc", "logs", "gate-daily-report.log"), "a", encoding="utf-8") as fh:
             fh.write(text + "\n---\n")
+        logged = True
     except OSError:
         pass
     if not a.post:
         return 0
     rc = 0
+    recorded, why = post_comment(a.city, text)
+    if not recorded:
+        rc = 1
+    short = " · ".join(s.strip() for s in text.split("\n")[1:4])
+    day_s = day.strftime("%d/%m")
+    if recorded:
+        title, prio, body = f"Gate {day_s}", "3", short
+    else:
+        # the bead is the record; the phone getting the numbers must not pass for "recorded" (ga-3xrr3l)
+        title, prio = f"Gate {day_s} — NÃO gravado", "4"
+        body = f"relatório NÃO gravado na {PROGRAM_BEAD} (bd falhou {POST_ATTEMPTS}x: {why[:200]}) · {short}"
+        if logged:
+            body += " · texto completo em .gc/logs/gate-daily-report.log"
     try:
-        subprocess.run(["bd", "-C", a.city, "comment", PROGRAM_BEAD, text], check=True, timeout=120, capture_output=True)
-    except Exception as e:  # noqa: BLE001 — report the failure, never hide it
-        print(f"WARN: comentário em {PROGRAM_BEAD} falhou: {e}", file=sys.stderr); rc = 1
-    short = text.split("\n")[1:4]
-    try:
-        subprocess.run(["notify", "-t", f"Gate {day.strftime('%d/%m')}", "-p", "3", " · ".join(s.strip() for s in short)], timeout=30, capture_output=True)
+        subprocess.run(["notify", "-t", title, "-p", prio, body], timeout=30, capture_output=True)
     except Exception as e:  # noqa: BLE001
         print(f"WARN: notify falhou: {e}", file=sys.stderr); rc = 1
     return rc

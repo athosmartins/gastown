@@ -99,5 +99,54 @@ echo "$OUT6" | grep -q '6) E11 (teto 800 linhas de produção): 1 recusa(s)' && 
 OUT7=$(/usr/bin/python3 "$HERE/gate-daily-report.py" --city "$C" --day 2026-10-06 2>&1)
 echo "$OUT7" | grep -q '6) E11 (teto 800 linhas de produção): 0 decisões registradas' && ok || bad "empty guard log for the day = '0 decisões registradas' (distinct from unreadable): $(echo "$OUT7" | grep '^6)')"
 
+# ── ga-3xrr3l 24/10: --post must not lose the day silently. The bd comment is retried (3 tries), bd's own stderr is
+# shown, and when it still fails the notify says "NÃO gravado" at a higher priority (it used to be the normal notify,
+# so the phone got the numbers and nobody knew the bead — the record — was missing the day). Fake bd/notify come first
+# on PATH, so nothing here can reach the real ga-ufskhy; the retry sleep is 0. ──
+FAKE_DIR="$W/fake"; FB="$W/fakebin"; FBN="$W/fakebin-nobd"; mkdir -p "$FAKE_DIR" "$FB" "$FBN"
+cat > "$FB/bd" <<'EOF'
+#!/bin/sh
+# counts every call; fails the first $FAKE_BD_FAIL_UNTIL calls with a message on stderr, then succeeds
+n=$(cat "$FAKE_DIR/bd.count" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$FAKE_DIR/bd.count"
+if [ "$n" -le "${FAKE_BD_FAIL_UNTIL:-0}" ]; then echo "boom: dolt gone (call $n)" >&2; exit 1; fi
+exit 0
+EOF
+cat > "$FB/notify" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_DIR/notify.log"
+EOF
+cp "$FB/notify" "$FBN/notify"; chmod +x "$FB/bd" "$FB/notify" "$FBN/notify"
+post_run() {  # $1 = how many bd calls fail first, $2 = PATH; leaves POUT (stdout+stderr) and PRC
+  rm -f "$FAKE_DIR/bd.count" "$FAKE_DIR/notify.log"
+  POUT="$(PATH="$2" FAKE_DIR="$FAKE_DIR" FAKE_BD_FAIL_UNTIL="$1" GATE_DAILY_RETRY_SLEEP=0 /usr/bin/python3 "$HERE/gate-daily-report.py" --city "$C" --day 2026-10-06 --post 2>&1)"; PRC=$?
+}
+bd_calls()    { cat "$FAKE_DIR/bd.count" 2>/dev/null || echo 0; }
+notify_calls(){ [ -f "$FAKE_DIR/notify.log" ] && wc -l < "$FAKE_DIR/notify.log" | tr -d ' ' || echo 0; }
+
+# T8a: bd keeps failing -> 3 tries, bd's stderr on screen, exit 1, ONE notify that says the report was NOT recorded
+post_run 99 "$FB:$PATH"
+[ "$(bd_calls)" = "3" ] && ok || bad "T8a: bd comment must be tried 3 times, was tried $(bd_calls)x"
+echo "$POUT" | grep -q 'boom: dolt gone' && ok || bad "T8a: bd's own stderr must reach the log, got: $(echo "$POUT" | grep WARN)"
+[ "$PRC" = "1" ] && ok || bad "T8a: exit code must be 1 when the report was not recorded, got $PRC"
+[ "$(notify_calls)" = "1" ] && ok || bad "T8a: exactly one notify, got $(notify_calls)"
+grep -q 'relatório NÃO gravado na ga-ufskhy' "$FAKE_DIR/notify.log" 2>/dev/null && ok || bad "T8a: notify must say the report was not recorded on ga-ufskhy, got: $(cat "$FAKE_DIR/notify.log" 2>/dev/null)"
+grep -q -e '-p 4' "$FAKE_DIR/notify.log" 2>/dev/null && ok || bad "T8a: the not-recorded notify must be priority 4, got: $(cat "$FAKE_DIR/notify.log" 2>/dev/null)"
+
+# T8b: a transient failure (first 2 calls) -> the 3rd try records it: exit 0, the NORMAL notify (priority 3, no alarm)
+post_run 2 "$FB:$PATH"
+[ "$(bd_calls)" = "3" ] && ok || bad "T8b: expected 3 bd calls (2 fail + 1 ok), got $(bd_calls)"
+[ "$PRC" = "0" ] && ok || bad "T8b: a retry that recorded the report must exit 0, got $PRC"
+grep -q -e '-p 3' "$FAKE_DIR/notify.log" 2>/dev/null && ! grep -q 'NÃO gravado' "$FAKE_DIR/notify.log" && ok || bad "T8b: a recorded report gets the normal notify, got: $(cat "$FAKE_DIR/notify.log" 2>/dev/null)"
+
+# T8c: first try works -> no retry, no alarm
+post_run 0 "$FB:$PATH"
+[ "$(bd_calls)" = "1" ] && [ "$PRC" = "0" ] && ok || bad "T8c: clean path = 1 bd call and exit 0, got $(bd_calls) call(s), exit $PRC"
+
+# T8d: bd cannot even be started (not on PATH) is the same "not recorded", with the reason on screen
+post_run 0 "$FBN"
+[ "$PRC" = "1" ] && grep -q 'relatório NÃO gravado na ga-ufskhy' "$FAKE_DIR/notify.log" 2>/dev/null && ok || bad "T8d: bd missing must read as not recorded (exit $PRC): $(cat "$FAKE_DIR/notify.log" 2>/dev/null)"
+# scoped to the WARN line: the report body itself says "FileNotFoundError" for other unreadable sources
+echo "$POUT" | grep 'WARN' | grep -q 'FileNotFoundError' && ok || bad "T8d: the reason (FileNotFoundError) must be on the WARN line, got: $(echo "$POUT" | grep WARN)"
+
 echo "gate-daily-report selftest: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
