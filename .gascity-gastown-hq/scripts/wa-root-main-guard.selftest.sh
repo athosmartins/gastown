@@ -13,14 +13,19 @@
 #   S4-S6   detached on a commit NOT reachable from origin/main: nothing on the 1st cycle, ONE OFF-MAIN-DETACHED line
 #           + ONE notify on the 2nd consecutive cycle, then one per window (60 min); a hop between unreviewed shas is
 #           the same episode; the root is never touched (no switch, no backup tag)
+#   S5b     a clock that steps back past the last alert alerts again (a window in the future cannot be trusted)
 #   S7      the episode ends when the root is back on origin/main (or by hand on main): one CLEARED line, no notify;
-#           a blip that is not on consecutive cycles never alerts
+#           a blip that is not on consecutive cycles never alerts; S7d the root moving to a crew branch is not "back on
+#           reviewed code"; S7e an alert that carried no timestamp (no clock) is still closed
 #   S8-S10  "cannot tell" (origin/main gone, merge-base fails, HEAD unreadable): UNKNOWN-DETACHED, visible, never filed
-#           as healthy and never as off-main
+#           as healthy and never as off-main. S10-S10c run with the root NESTED in a repo on main (the production
+#           topology: whatsapp_automation inside the HQ) and the harness ceiling off: a broken or missing .git of the
+#           root must not be read as the outer repo's main, also when the root is reached through a symlink
 #   S11     an alert that cannot be remembered (state path unwritable) is loud on the first cycle, not silent, and says
 #           so instead of promising a window; S11b the same when there is no usable clock
 #   S12     a crew branch left in the root is still backed up and restored
 #   S13     the production defaults of the test seams are the real paths
+#   S14     a notify that fails does not spend the alert window: the next cycle retries, and the line says it failed
 # HOW. Real git: a bare "origin" plus a clone as the live root, in a throwaway dir. The guard runs as a subprocess
 # with WA_ROOT_GUARD_{ROOT,CITY,HOOKS,NOW} pointing there and a fake `notify` first on PATH; nothing under /Users/athos
 # is read, no network, no daemons. WRMG_GUARD=<path> runs the harness against another copy of the guard (that is how it
@@ -55,6 +60,8 @@ mk_world() {
   mkdir -p "$CITY/.gc/logs" "$BIN" "$W/hooks"; : > "$NOTES"
   cat > "$BIN/notify" <<'EOF'
 #!/bin/sh
+# NOTIFY_FAIL=1 → the channel is down: nothing delivered, non-zero exit. The log only counts what was delivered.
+[ -n "${NOTIFY_FAIL:-}" ] && exit 1
 printf '%s\n' "$*" >> "${NOTIFY_LOG:-/dev/null}"
 EOF
   chmod +x "$BIN/notify"
@@ -73,6 +80,15 @@ EOF
   echo u1 > "$ROOT/u.txt"; fx add u.txt; fx commit -q -m u1; U="$(fx rev-parse HEAD)"
   echo u2 >> "$ROOT/u.txt"; fx add u.txt; fx commit -q -m u2; U2="$(fx rev-parse HEAD)"
   fx checkout -q main
+}
+
+# mk_nested <name> — mk_world, plus an enclosing repo on main at $W: production's root lives INSIDE another repo
+# (/Users/athos/gt, the HQ, on main), and that is what a git that loses sight of the root's own .git climbs into.
+mk_nested() {
+  mk_world "$1"
+  "$REAL_GIT" init -q "$W"; "$REAL_GIT" -C "$W" symbolic-ref HEAD refs/heads/main
+  "$REAL_GIT" -C "$W" -c user.email=selftest@local -c user.name=selftest -c commit.gpgsign=false -c core.hooksPath=/dev/null \
+    commit -q --allow-empty -m outer
 }
 
 # cycle <k> [VAR=val ...] — the k-th guard run, 114 s apart on the fake clock; sets RC.
@@ -135,6 +151,16 @@ eq "S5 both lines are OFF-MAIN-DETACHED" "$(grep -c 'OFF-MAIN-DETACHED' "$LOG")"
 cycle 8 WA_ROOT_GUARD_NOW=$((A + 3700))
 eq "S5 next cycle inside the new window: silent" "$(nl "$LOG")" 2
 
+echo "S5b: the clock steps back after an alert — a window that lies in the future cannot be trusted, so alert again"
+mk_world s5b; fx checkout -q --detach "$U"; cycle 1; cycle 2
+A=$((T0 + 114 * 2))   # when the alert fired
+eq "S5b the alert fired" "$(nl "$NOTES")" 1
+cycle 3 WA_ROOT_GUARD_NOW=$((A - 1000))
+eq "S5b clock 1000 s behind the last alert: alerts again (the old test said -1000 < 3600, silent)" "$(nl "$LOG")" 2
+eq "S5b ... and notifies" "$(nl "$NOTES")" 2
+cycle 4 WA_ROOT_GUARD_NOW=$((A - 1000 + 114))
+eq "S5b the new window starts at the stepped-back clock: the next cycle is silent" "$(nl "$LOG")" 2
+
 echo "S6: HEAD hops between unreviewed shas — still one episode"
 mk_world s6; fx checkout -q --detach "$U"; cycle 1; fx checkout -q --detach "$U2"; cycle 2
 eq "S6 the 2nd consecutive off-main cycle alerts although the sha changed" "$(nl "$LOG")" 1
@@ -162,6 +188,22 @@ eq "S7c a healthy cycle in between resets the count: no line" "$(nl "$LOG")" 0
 cycle 4
 eq "S7c off, on, off, off: now two in a row" "$(nl "$LOG")" 1
 
+echo "S7d: an alerted episode ends because the root moved to a crew branch — CLEARED must not say it is on reviewed code"
+mk_world s7d; fx checkout -q --detach "$U"; cycle 1; cycle 2; fx checkout -q -b crew/y
+cycle 3
+has "S7d the episode is closed" "$LOG" "CLEARED"
+hasnt "S7d the CLEARED line does not claim the root is back on reviewed code" "$LOG" "back on reviewed code"
+has "S7d it says what changed instead" "$LOG" "no longer detached"
+has "S7d the crew branch is still restored" "$LOG" "RESTORED"
+
+echo "S7e: an alert that went out with no clock (last_alarm = 0) is still closed with a CLEARED"
+mk_world s7e; fx checkout -q --detach "$U"
+printf '#!/bin/sh\nexit 1\n' > "$BIN/date"; chmod +x "$BIN/date"
+cycle 1 WA_ROOT_GUARD_NOW=; cycle 2 WA_ROOT_GUARD_NOW=
+eq "S7e the alert fired" "$(nl "$LOG")" 1
+fx checkout -q --detach "$M3"; cycle 3 WA_ROOT_GUARD_NOW=
+has "S7e recovery is logged although the alert carried no timestamp" "$LOG" "CLEARED"
+
 echo "S8: origin/main missing — cannot tell, must not be filed as healthy"
 mk_world s8; fx checkout -q --detach "$M3"; fx update-ref -d refs/remotes/origin/main
 cycle 1
@@ -188,13 +230,30 @@ has "S9 the line is UNKNOWN-DETACHED" "$LOG" "UNKNOWN-DETACHED"
 hasnt "S9 not reported as off-main" "$LOG" "OFF-MAIN-DETACHED"
 eq "S9 notified" "$(nl "$NOTES")" 1
 
-echo "S10: HEAD unreadable"
-mk_world s10; fx checkout -q --detach "$U"; printf 'garbage\n' > "$ROOT/.git/HEAD"
-cycle 1; cycle 2
-eq "S10 log lines" "$(nl "$LOG")" 1
+# S10-S10c are the production topology: the root sits INSIDE another repo that is on main. GIT_CEILING_DIRECTORIES= (empty)
+# switches the harness ceiling off, so only the guard's own protection stands between a broken root and that outer main.
+echo "S10: HEAD unreadable, root nested in a repo on main"
+mk_nested s10; fx checkout -q --detach "$U"; printf 'garbage\n' > "$ROOT/.git/HEAD"
+eq "S10 fixture: without a ceiling a bare git on the broken root sees the OUTER main" \
+  "$(env -u GIT_CEILING_DIRECTORIES git -C "$ROOT" branch --show-current 2>/dev/null)" main
+cycle 1 GIT_CEILING_DIRECTORIES=; cycle 2 GIT_CEILING_DIRECTORIES=
+eq "S10 log lines (the unfixed guard read the outer 'main': rc 0, empty log)" "$(nl "$LOG")" 1
 has "S10 the line is UNKNOWN-DETACHED" "$LOG" "UNKNOWN-DETACHED"
 hasnt "S10 not reported as off-main" "$LOG" "OFF-MAIN-DETACHED"
 eq "S10 notified" "$(nl "$NOTES")" 1
+
+echo "S10b: the root's .git is gone, root nested in a repo on main"
+mk_nested s10b; mv "$ROOT/.git" "$W/git-gone"
+cycle 1 GIT_CEILING_DIRECTORIES=
+eq "S10b exit code" "$RC" 0
+has "S10b it is logged as not a git repo, not read as the outer main" "$LOG" "not a git repo"
+
+echo "S10c: the root is reached through a symlink, nested in a repo on main"
+mk_nested s10c; fx checkout -q --detach "$U"; printf 'garbage\n' > "$ROOT/.git/HEAD"
+LINK="$TMP/s10c-link"; ln -s "$ROOT" "$LINK"   # its textual parent ($TMP) is NOT an ancestor of where git stands
+cycle 1 GIT_CEILING_DIRECTORIES= WA_ROOT_GUARD_ROOT="$LINK"; cycle 2 GIT_CEILING_DIRECTORIES= WA_ROOT_GUARD_ROOT="$LINK"
+eq "S10c log lines" "$(nl "$LOG")" 1
+has "S10c the line is UNKNOWN-DETACHED" "$LOG" "UNKNOWN-DETACHED"
 
 echo "S11: the state path is unwritable — the alert must not wait for a confirmation it cannot remember"
 mk_world s11; fx checkout -q --detach "$U"; mkdir -p "$STATE"
@@ -224,6 +283,21 @@ echo "S13: the production defaults of the seams are the real paths"
 has "S13 default ROOT" "$GUARD" 'WA_ROOT_GUARD_ROOT:-/Users/athos/gt/whatsapp_automation'
 has "S13 default CITY" "$GUARD" 'WA_ROOT_GUARD_CITY:-/Users/athos/gt/.gascity-gastown-hq'
 has "S13 default HOOKS" "$GUARD" 'WA_ROOT_GUARD_HOOKS:-/tmp/empty-hooks'
+
+echo "S14: the notify channel is down — the window must not be spent on an alert nobody received"
+mk_world s14; fx checkout -q --detach "$U"
+cycle 1; cycle 2 NOTIFY_FAIL=1
+has "S14 the alert line is still written (the log is the durable copy)" "$LOG" "OFF-MAIN-DETACHED"
+has "S14 and a second line says the alert reached only the log" "$LOG" "NOTIFY-FAILED"
+eq "S14 alert line + failure line" "$(nl "$LOG")" 2
+eq "S14 nothing was delivered" "$(nl "$NOTES")" 0
+cycle 3
+eq "S14 channel back: the next cycle retries (the unfixed guard spent the window and stayed silent for an hour)" "$(nl "$NOTES")" 1
+eq "S14 the retry writes its own alert line, and no failure line" "$(nl "$LOG")" 3
+eq "S14 only the failed attempt reports a failure" "$(grep -c 'NOTIFY-FAILED' "$LOG")" 1
+cycle 4
+eq "S14 once delivered, the window is spent: no new notification" "$(nl "$NOTES")" 1
+eq "S14 once delivered, no new line" "$(nl "$LOG")" 3
 
 echo ""
 echo "──────────────────────────────────────────"

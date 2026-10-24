@@ -26,7 +26,11 @@
 # kept in $CITY/.gc/wa-root-main-guard.state; when that cannot be written the alert fires at once, because a confirmation
 # that can never be remembered would never come. The detached cases are DETECTION ONLY: a restore cannot tell a forgotten
 # checkout from a deliberate one (a reviewer reading the files would suddenly read main's), so only a named non-main
-# branch is still backed up and restored below. Test seams (selftest only): WA_ROOT_GUARD_{ROOT,CITY,HOOKS,NOW}.
+# branch is still backed up and restored below. The alert window is spent only by an alert that was delivered: a notify
+# that fails leaves a NOTIFY-FAILED line and the next cycle tries again; a clock that stepped back behind the last
+# alert alerts again. Every git call is fenced to the root (g(), below): the production root sits INSIDE the HQ repo, and
+# a root whose own .git is broken or missing would otherwise be read as the HQ's `main`.
+# Test seams (selftest only): WA_ROOT_GUARD_{ROOT,CITY,HOOKS,NOW}.
 #
 # SAFETY: conservative. Never `git checkout -f` / `reset --hard`. If the root is in a
 # genuine merge-conflict / dirty-unswitchable state or the switch fails, do NOT force —
@@ -57,10 +61,26 @@ case "$NOW" in ''|*[!0-9]*) NOW=0; CLOCK_OK=0 ;; esac
 
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null; }
-note() { command -v notify >/dev/null 2>&1 && notify "$@" >/dev/null 2>&1 || true; }
+# note → 0 only when notify ran and exited 0; 1 when there is no `notify` on PATH; else notify's own rc. Callers that do
+# not care about delivery ignore it (no `set -e` here); the detached alert reads it, because it spends a window.
+note() {
+  command -v notify >/dev/null 2>&1 || return 1
+  notify "$@" >/dev/null 2>&1
+}
 
-# git wrapper for the root, with hooks neutralised (mirrors the Mayor's manual recipe).
-g() { git -C "$ROOT" -c core.hooksPath="$HOOKS" "$@"; }
+# Fence for git: it must not climb out of the root. The production root lives INSIDE another repo (the HQ, /Users/athos/gt,
+# on main); when the root's own .git is broken or gone, git silently keeps looking upward and every read answers for the
+# HQ — `branch --show-current` prints the HQ's "main" and the guard files an error as "healthy". The ceiling is the parent
+# of the REAL root (symlinks resolved): for a root reached through a symlink, the textual parent is not an ancestor of where
+# git actually stands, and the fence would stand in the wrong place.
+# vazio (ROOT não existe) → sem teto; git -C ROOT falha sozinho (rc 128) e o guard cai no "skip:" abaixo; falhou/ilegível
+# (cd -P falha) → idem: sem como subir a partir de um diretório que o git também não consegue abrir
+ROOT_REAL="$(cd -P "$ROOT" 2>/dev/null && pwd -P)" || ROOT_REAL=""
+CEILING=""
+if [ -n "$ROOT_REAL" ]; then CEILING="${ROOT_REAL%/*}"; CEILING="${CEILING:-/}"; fi
+
+# git wrapper for the root, with hooks neutralised (mirrors the Mayor's manual recipe) and fenced to the root (see above).
+g() { GIT_CEILING_DIRECTORIES="$CEILING" git -C "$ROOT" -c core.hooksPath="$HOOKS" "$@"; }
 
 mkdir -p "$HOOKS" 2>/dev/null || true
 
@@ -100,22 +120,26 @@ age_min() {
   if [ "$CLOCK_OK" = 1 ] && [ "$1" -le "$NOW" ]; then echo "$(( (NOW - $1) / 60 ))min"; else echo "?"; fi
 }
 
-# A healthy cycle (HEAD on origin/main, or the root back on a branch) ends the episode: one CLEARED line, no notify, and
-# only when the episode had alerted — a blip nobody was told about stays unmentioned.
+# clear_episode <where> — the HEAD is no longer detached (on origin/main, or the root is on a branch again): the episode
+# ends. One CLEARED line, no notify, and only when the episode had alerted — a blip nobody was told about stays
+# unmentioned. <where> says what the root is now, because "no longer detached" is not "on reviewed code": a crew branch is
+# not (the restore below deals with it). "Had alerted" is count >= CONFIRM, not last_alarm != 0: an alert sent with no
+# clock records last_alarm 0. Limit: an episode whose state could not be written leaves no state to close, so no CLEARED.
 clear_episode() {
   [ -e "$STATE" ] || return 0
   read_state
   rm -f "$STATE" 2>/dev/null
   # falhou (não removeu) → WARN visível; o episódio velho seria contado como continuação, no máximo um ciclo cedo demais
   if [ -e "$STATE" ]; then log "WARN: could not remove the episode state $STATE — a later blip may be counted as a continuation."; fi
-  if [ -n "$PREV_KIND" ] && [ "$PREV_ALARM" != 0 ]; then
-    log "CLEARED: production root is back on reviewed code (the '$PREV_KIND' episode lasted ~$(age_min "$PREV_FIRST"), $PREV_COUNT cycles)."
+  if [ -n "$PREV_KIND" ] && [ "$PREV_COUNT" -ge "$CONFIRM" ]; then
+    log "CLEARED: production root is $1 (the '$PREV_KIND' episode lasted ~$(age_min "$PREV_FIRST"), $PREV_COUNT cycles)."
   fi
 }
 
 # No branch name: a detached HEAD (healthy when it sits on origin/main) or a HEAD git cannot read. Never restores; always exits 0.
 handle_detached() {
-  local rc=0 kind="" why="" head_sha="" om_sha="" count=0 first=0 alarm=0 fire=0 age="" again="" h12="" o12=""
+  local rc=0 kind="" why="" head_sha="" om_sha="" count=0 first=0 alarm=0 alarm_before=0 fire=0 unwritable=0 nrc=0
+  local age="" again="" h12="" o12="" line="" nmsg=""
   # symbolic-ref -q: 0 = still a branch (only its name was unreadable), 1 = detached, >=128 = git failed → unknown, nunca saudável
   g symbolic-ref -q HEAD >/dev/null 2>&1; rc=$?
   case "$rc" in
@@ -141,16 +165,18 @@ handle_detached() {
     *) kind=unknown; why="HEAD is unreadable (git rc=$rc)" ;;
   esac
 
-  if [ "$kind" = on-main ]; then clear_episode; exit 0; fi
+  if [ "$kind" = on-main ]; then clear_episode "back on reviewed code (HEAD is contained in origin/main)"; exit 0; fi
 
   read_state
   if [ "$PREV_KIND" = "$kind" ]; then
-    count=$((PREV_COUNT + 1)); first="$PREV_FIRST"; alarm="$PREV_ALARM"
+    count=$((PREV_COUNT + 1)); first="$PREV_FIRST"; alarm="$PREV_ALARM"; alarm_before="$PREV_ALARM"
   else
-    count=1; first="$NOW"; alarm=0
+    count=1; first="$NOW"; alarm=0; alarm_before=0
   fi
   if [ "$count" -ge "$CONFIRM" ]; then
-    if [ "$alarm" = 0 ] || [ "$CLOCK_OK" = 0 ] || [ $((NOW - alarm)) -ge $((WINDOW_MIN * 60)) ]; then
+    # alert when: never alerted, no clock, the window is spent — or the last alert lies in the FUTURE (the clock stepped
+    # back; $NOW - $alarm would be negative and the next alert would wait for the clock to catch up plus a whole window)
+    if [ "$alarm" = 0 ] || [ "$CLOCK_OK" = 0 ] || [ "$alarm" -gt "$NOW" ] || [ $((NOW - alarm)) -ge $((WINDOW_MIN * 60)) ]; then
       fire=1; alarm="$NOW"
     fi
   fi
@@ -158,18 +184,30 @@ handle_detached() {
   again="Next alert in ${WINDOW_MIN}min if it persists."
   if [ "$CLOCK_OK" = 0 ]; then again="No usable clock, so no window: alerting on every cycle."; fi
   if ! write_state "$kind" "$count" "$first" "$alarm"; then
-    fire=1; again="Episode state unwritable ($STATE): alerting on every cycle until it is fixed."
+    unwritable=1; fire=1; again="Episode state unwritable ($STATE): alerting on every cycle until it is fixed."
   fi
 
   if [ "$fire" = 1 ]; then
     h12="${head_sha:0:12}"; o12="${om_sha:0:12}"; h12="${h12:-?}"; o12="${o12:-?}"
     age="$(age_min "$first")"
     if [ "$kind" = off-main ]; then
-      log "OFF-MAIN-DETACHED: production root is on a DETACHED HEAD ($h12) that origin/main ($o12) does not contain — unreviewed code is live (cycles=$count, ~$age). Detection only, NOT restoring; who/when: git -C $ROOT reflog. $again"
-      note -p 4 -t 'wa-root-guard' "WA root DETACHED on $h12, NOT in origin/main — unreviewed code is live ($count cycles, ~$age). Detection only, NEEDS HUMAN"
+      line="OFF-MAIN-DETACHED: production root is on a DETACHED HEAD ($h12) that origin/main ($o12) does not contain — unreviewed code is live (cycles=$count, ~$age). Detection only, NOT restoring; who/when: git -C $ROOT reflog. $again"
+      nmsg="WA root DETACHED on $h12, NOT in origin/main — unreviewed code is live ($count cycles, ~$age). Detection only, NEEDS HUMAN"
     else
-      log "UNKNOWN-DETACHED: cannot tell whether the production root is on reviewed code — $why (HEAD $h12, origin/main $o12; cycles=$count, ~$age). NOT assuming healthy; detection only. $again"
-      note -p 4 -t 'wa-root-guard' "WA root HEAD state UNKNOWN: $why — cannot confirm it is on origin/main, NEEDS HUMAN"
+      line="UNKNOWN-DETACHED: cannot tell whether the production root is on reviewed code — $why (HEAD $h12, origin/main $o12; cycles=$count, ~$age). NOT assuming healthy; detection only. $again"
+      nmsg="WA root HEAD state UNKNOWN: $why — cannot confirm it is on origin/main, NEEDS HUMAN"
+    fi
+    log "$line"   # the log is the durable copy: written before notify, which may take long or fail
+    # notify delivered → 0; falhou/ausente → ≠0: o alerta só chegou ao log
+    note -p 4 -t 'wa-root-guard' "$nmsg"; nrc=$?
+    if [ "$nrc" != 0 ]; then
+      # a window is spent only by an alert somebody received: put the previous last_alarm back, so the next cycle tries again.
+      # (with no clock or no writable state the alert already repeats every cycle, and the line above says so)
+      if [ "$unwritable" = 0 ] && [ "$CLOCK_OK" = 1 ] && write_state "$kind" "$count" "$first" "$alarm_before"; then
+        log "NOTIFY-FAILED: the alert above reached only this log (notify rc=$nrc) — the window is NOT spent; trying again on the next cycle."
+      else
+        log "NOTIFY-FAILED: the alert above reached only this log (notify rc=$nrc)."
+      fi
     fi
   fi
   exit 0
@@ -183,8 +221,12 @@ if [ -z "$BRANCH" ]; then
   handle_detached
 fi
 
-# On a branch: a detached episode, if one was open, is over.
-clear_episode
+# On a branch: a detached episode, if one was open, is over — but "on a branch" is only "back on main" when it is main.
+if [ "$BRANCH" = "main" ]; then
+  clear_episode "back on main"
+else
+  clear_episode "no longer detached: it is on branch '$BRANCH' (handled below)"
+fi
 
 # Clean: already on main → silent success.
 if [ "$BRANCH" = "main" ]; then
@@ -250,12 +292,12 @@ if [ -n "$STASH_AFTER" ] && [ "$STASH_AFTER" != "$STASH_BEFORE" ]; then
   g stash drop >/dev/null 2>&1 || true
 fi
 
-NOW="$(g branch --show-current 2>/dev/null || echo '?')"
-if [ "$NOW" = "main" ]; then
+AFTER="$(g branch --show-current 2>/dev/null || echo '?')"
+if [ "$AFTER" = "main" ]; then
   log "RESTORED: production root back on main (was '$BRANCH' @ $SHA, backed up to tag $BACKUP_TAG). Daemon RESTART likely needed (oracle's job — guard does NOT restart)."
   note -p 4 -t 'wa-root-guard' "WA root was OFF-MAIN on '$BRANCH' (@ $SHA) — RESTORED to main. Backup tag $BACKUP_TAG. Daemons likely need RESTART (oracle)."
 else
-  log "WARN: after restore attempt root is on '$NOW' (expected main) — NEEDS HUMAN. Backup tag=$BACKUP_TAG."
-  note -p 5 -t 'wa-root-guard' "WA root restore did NOT land on main (now '$NOW') — NEEDS HUMAN (backup $BACKUP_TAG)"
+  log "WARN: after restore attempt root is on '$AFTER' (expected main) — NEEDS HUMAN. Backup tag=$BACKUP_TAG."
+  note -p 5 -t 'wa-root-guard' "WA root restore did NOT land on main (now '$AFTER') — NEEDS HUMAN (backup $BACKUP_TAG)"
 fi
 exit 0
