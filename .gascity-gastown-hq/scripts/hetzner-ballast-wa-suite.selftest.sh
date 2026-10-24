@@ -8,20 +8,21 @@
 #
 # CASOS
 #   completo (g_run): rodada completa conta total/passou/reprovou/pulou, grava a lista de reprovadas (id com " - " dentro inteiro) e a ponta, apaga a árvore e a branch, deixa UMA linha BALLAST-SUMMARY · o
-#     pytest recebe os argumentos da noturna, o -n do governo e GTN_WORKERS · 1ª rodada = "primeira" · mesma ponta = "sem-novidade" (sem canário, sem árvore) · commit novo = só as reprovações NOVAS
+#     pytest recebe os argumentos da noturna, o -n do governo e GTN_WORKERS · 1ª rodada = "primeira" · mesma ponta = "sem-novidade" (sem canário, sem árvore; se o pull FALHOU e a ponta é a mesma, não é "sem novidade": `pull-falhou`, exit 3) · commit novo = só as reprovações NOVAS
 #     (e as corrigidas) · zero falhas · falha de prazo de teste é contada à parte.
-#   isolamento (g_iso): canário `nao-isolado` = vazamento, tranca o item (flag) e NADA roda · `inerte`/vazio = nada roda, sem flag · `nao-isolado` DENTRO da rodada idem · sem a linha `ok ns=` ou sem
+#   isolamento (g_iso): canário `nao-isolado` = vazamento, tranca o item (flag) e NADA roda · `inerte`/vazio = nada roda, sem flag · `nao-isolado` DENTRO da rodada idem · a flag do vazamento que não dá para gravar (`trava=falhou` no resumo, exit 3) nos dois caminhos · sem a linha `ok ns=` ou sem
 #     `GTN-EGRESS` = resultado descartado (sem-prova-de-isolamento) e o estado não anda.
-#   leitura (g_read): pytest rc fora de 0/1 · sem linha de resumo · total abaixo do piso · lista de ids ausente/parcial/com `reports` errado/duplicada/não JSON · linha de base ilegível ou de forma errada
+#   leitura (g_read): pytest rc fora de 0/1 · sem linha de resumo · total abaixo do piso · lista de ids ausente/parcial/com `reports` errado/duplicada/não JSON (ou um `GTN-FAIL` que é lista, não objeto) · linha de base ilegível ou de forma errada (inclusive uma linha que é JSON válido mas não é texto)
 #     (nunca "0 novas": compare indisponível, a base NÃO anda, a ponta anda) · base vazia = toda falha é nova.
-#   pausa (g_frozen): salto de relógio >= 60 s (sessão congelada) = comparação indisponível, base intacta · sem salto = comparação normal.
-#   preparo (g_prep): pull que falha segue · sem origin/main · wt-add que falha · árvore sem tests/ · plugin ou gt-iso-run ausente — exit 3, nada gravado.
-#   estado (g_state): a lista de falhas que é pasta, e o passo final que morre, dão exit 3 (gravacao-falhou / resumo-falhou) sem consumir a ponta · TERM no meio repassa ao pytest, apaga a árvore e não grava.
+#   pausa (g_frozen): salto de relógio >= 60 s (sessão congelada) = comparação indisponível, base intacta · sem salto = comparação normal · arquivo de relógio ilegível ou vigia MORTO = desconhecido (`frozen_s` nulo, comparação indisponível) · o `sleep` do vigia não fica órfão
+#     depois do pytest. O caso do salto ESPERA o vigia gravar o relógio (`py.waitfrozen`) em vez de dormir um tempo fixo: o flake do gate 1/3 era o laço de verdade sobrescrevendo o arquivo semeado.
+#   preparo (g_prep): pull que falha segue · sem origin/main · wt-add que falha · árvore sem tests/ · plugin ou gt-iso-run ausente — exit 3, nada gravado · `wt-rm` que não leva a árvore velha embora = `arvore-velha`, exit 3.
+#   estado (g_state): a lista de falhas que é pasta, e o passo final que morre, dão exit 3 (gravacao-falhou / resumo-falhou) sem consumir a ponta · TERM no meio repassa ao pytest, apaga a árvore e não grava · TERM com o pytest ainda não nascido (canário pendurado) sai 143 na hora, sem esperar os 10 s do laço.
 #   registro (g_reg): a linha wa-suite do hetzner-ballast.items.txt (a REAL) lê limpa no governo, é `work` com núcleos FIXOS (um `auto` levaria o orçamento inteiro e o hq-selftests passaria horas sem rodar),
 #     exige o helper, o gt-iso-run, o python do venv, o plugin e `noflag:wa-suite.leak`, e o comando existe na pasta de itens.
 #   agenda (g_sched): com o GOVERNO REAL e as colunas papel/núcleos/rss/prazo/cooldown da linha real: com o wa-suite rodando, o hq-selftests (auto) ainda começa com o que sobra do orçamento.
 # CONTROLE NEGATIVO: cada mutante (um trecho do item ou do registro trocado) TEM que reprovar a bateria.
-# VARIÁVEIS: HBW_ANCHORS_ONLY=1 (só confere que cada âncora de mutante casa 1 vez) · HBW_PY (python do teste; padrão /usr/bin/python3) · HBW_ITEMS_DIR (pasta de itens; um mutante traz também a cópia do registro) · HBW_ONLY=<grupo> (run iso read frozen prep state reg sched) ·
+# VARIÁVEIS: HBW_ANCHORS_ONLY=1 (só confere que cada âncora de mutante casa 1 vez) · HBW_PY (python do teste; padrão /usr/bin/python3) · HBW_ITEMS_DIR (pasta de itens; um mutante traz também a cópia do registro) · HBW_ONLY=<grupo> (run iso read frozen prep state reg sched; com HBW_MUTANT roda só esse grupo) ·
 #   HBW_NO_MUTANTS=1 · HBW_JOBS (mutantes em paralelo; padrão 4)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -101,16 +102,17 @@ case "$1" in
           g="git -C $GT_REMOTE_GIT/$2/repo.git"
           if $g rev-parse -q --verify "refs/heads/worker/$3" > /dev/null; then $g worktree add -q "$GT_REMOTE_GIT/$2/wt/$3" "worker/$3" || exit 3
           else $g worktree add -q -b "worker/$3" "$GT_REMOTE_GIT/$2/wt/$3" refs/remotes/origin/main || exit 3; fi; echo "{}"; exit 0 ;;
-  wt-rm) git -C "$GT_REMOTE_GIT/$2/repo.git" worktree remove --force "$GT_REMOTE_GIT/$2/wt/$3" 2>/dev/null; exit 0 ;;
+  wt-rm) [ -f "$W/rg.wtrm.fail" ] && exit 1; git -C "$GT_REMOTE_GIT/$2/repo.git" worktree remove --force "$GT_REMOTE_GIT/$2/wt/$3" 2>/dev/null; exit 0 ;;
 esac
 exit 2
 EOF
 cat > "$W/iso" <<'EOF'
 #!/bin/bash
 # gt-iso-run de brinquedo. --canary: imprime $W/iso.canary (padrão: isolado). -- CMD: imprime a linha do canário, a do helper (`ok ns=`) e, no fim, o contador; cada uma some com o seu arquivo
-# (iso.noproof, iso.noegress); $W/iso.runfirst troca a linha do canário DENTRO da rodada por outra (e sai 97, como o real). Repassa TERM ao filho (o sudo faz isso no nó).
+# (iso.noproof, iso.noegress); $W/iso.runfirst troca a linha do canário DENTRO da rodada por outra (e sai 97, como o real); $W/iso.hang pendura o --canary (grava o pid em iso.pid). Repassa TERM ao filho (o sudo faz isso no nó).
 W="$(cd "$(dirname "$0")" && pwd)"; echo "$*" >> "$W/iso.calls"
 if [ "${1:-}" = --canary ]; then
+  [ ! -f "$W/iso.hang" ] || { echo $$ > "$W/iso.pid"; exec sleep 60; }
   if [ -f "$W/iso.canary" ]; then cat "$W/iso.canary"; else echo "GTN-ISO: isolado (sonda barrou 6 tentativas)"; fi
   exit 0
 fi
@@ -128,11 +130,18 @@ exit $rc
 EOF
 cat > "$W/py" <<'EOF'
 #!/bin/bash
-# "python -m pytest" de brinquedo: anota os argumentos, o diretório e GTN_WORKERS; dorme $W/py.sleep s se existir; imprime $W/py.out; sai com $W/py.rc (padrão: 1 se há FAILED, senão 0)
+# "python -m pytest" de brinquedo: anota os argumentos, o diretório e GTN_WORKERS; dorme $W/py.sleep s se existir; com $W/py.waitfrozen espera (até 20 s) o laço de relógio do item gravar o arquivo frozen;
+# com $W/py.killwatch mata o laço de relógio do item (o filho do item que não é o gt-iso-run); imprime $W/py.out; sai com $W/py.rc (padrão: 1 se há FAILED, senão 0)
 W="$(cd "$(dirname "$0")" && pwd)"
 { echo "args: $*"; echo "pwd: $(pwd)"; echo "workers: ${GTN_WORKERS:-}"; } > "$W/py.args"
 echo $$ > "$W/py.pid"
 [ ! -f "$W/py.sleep" ] || { : > "$W/py.started"; sleep "$(cat "$W/py.sleep")"; }
+i=0; while [ -f "$W/py.waitfrozen" ] && [ ! -e "$BALLAST_RUN_DIR/frozen" ] && [ "$i" -lt 100 ]; do sleep 0.2; i=$((i+1)); done
+if [ -f "$W/py.killwatch" ]; then
+  ip=$(ps -o ppid= -p "$PPID" | tr -d ' '); i=0   # $PPID = o gt-iso-run de brinquedo; o pai dele é o item
+  while [ -z "${wp:-}" ] && [ "$i" -lt 50 ]; do wp=$(ps -axo pid=,ppid= | awk -v p="$ip" -v s="$PPID" '$2 == p && $1 != s { print $1 }'); [ -n "$wp" ] || sleep 0.1; i=$((i+1)); done
+  kill -KILL $wp 2>/dev/null; sleep 0.5
+fi
 cat "$W/py.out"
 if [ -f "$W/py.rc" ]; then exit "$(cat "$W/py.rc")"; fi
 grep -q '^FAILED' "$W/py.out" && exit 1
@@ -149,7 +158,7 @@ newrig() {  # newrig [notests] — repo-fonte com uma árvore de WA de mentira +
   [ "${1:-}" = notests ] || { mkdir -p "$SRC/tests"; echo 'def test_a(): pass' > "$SRC/tests/test_a.py"; }
   git -C "$SRC" add -A && git -C "$SRC" commit -q -m um && git clone -q --bare "$SRC" "$GR/whatsapp_automation/repo.git" 2>/dev/null
   git -C "$GR/whatsapp_automation/repo.git" update-ref refs/remotes/origin/main "$(git -C "$SRC" rev-parse HEAD)"
-  rm -f "$W"/rg.*.fail "$W"/iso.canary "$W"/iso.runfirst "$W"/iso.noproof "$W"/iso.noegress "$W"/iso.env "$W"/py.args "$W"/py.rc "$W"/py.sleep "$W"/py.started "$W"/py.pid "$W"/py.crash "$W"/jump "$W"/jump.n
+  rm -f "$W"/rg.*.fail "$W"/iso.canary "$W"/iso.runfirst "$W"/iso.noproof "$W"/iso.noegress "$W"/iso.env "$W"/py.args "$W"/py.rc "$W"/py.sleep "$W"/py.started "$W"/py.pid "$W"/py.crash "$W"/py.waitfrozen "$W"/py.killwatch "$W"/iso.hang "$W"/iso.pid "$W"/jump "$W"/jump.n
   : > "$W/rg.calls"; : > "$W/iso.calls"; mkout 990 8 "tests/a.py::t1" "tests/b.py::t2[ADE V - Setor 4]"
 }
 newcommit() {  # newcommit — um commit novo no main (o espelho avança)
@@ -165,12 +174,12 @@ mkout() {  # mkout PASSOU PULOU [ID_REPROVADO…] — a saída de um pytest -q c
     echo "GTN-FAILED: n=$nf reports=$nf"
   } > "$W/py.out"
 }
-runwa() {  # runwa [VAR=valor…] → $OUT (stdout inteiro), $RC; BALLAST_RUN_DIR novo a cada rodada
-  RDN=$((${RDN:-0}+1)); RD="$T/rd$N.$RDN"; mkdir -p "$RD"
-  [ -z "${PRE_FROZEN:-}" ] || printf '%s\n' "$PRE_FROZEN" > "$RD/frozen"
-  OUT=$(env PATH="$W/bin:$PATH" HOME="$T/home" BALLAST_HOME="$BH" BALLAST_RUN_DIR="$RD" BALLAST_CORES=2 BALLAST_REMOTE_GIT="$W/rg" GT_REMOTE_GIT="$GR" BALLAST_ISO_RUN="$W/iso" BALLAST_WA_PYTHON="$W/py" \
-        BALLAST_WA_PLUGIN="$W/plugin.py" WA_SUITE_MIN_TOTAL=10 WA_SUITE_WATCH_S=1 "$@" bash "$ITEMS/wa-suite.sh" 2>"$W/err"); RC=$?
+newrd() { RDN=$((${RDN:-0}+1)); RD="$T/rd$N.$RDN"; mkdir -p "$RD"; [ -z "${PRE_FROZEN:-}" ] || printf '%s\n' "$PRE_FROZEN" > "$RD/frozen"; }   # BALLAST_RUN_DIR novo a cada rodada (PRE_FROZEN semeia o arquivo do relógio)
+envwa() {  # envwa [VAR=valor…] — o item no ambiente de brinquedo, em $RD (as variáveis do chamador vêm DEPOIS e ganham). SÓ em subshell ($(…) ou &): o exec faz o pid do subshell ser o do item (é nele que o TERM tem que cair)
+  exec env PATH="$W/bin:$PATH" HOME="$T/home" BALLAST_HOME="$BH" BALLAST_RUN_DIR="$RD" BALLAST_CORES=2 BALLAST_REMOTE_GIT="$W/rg" GT_REMOTE_GIT="$GR" BALLAST_ISO_RUN="$W/iso" BALLAST_WA_PYTHON="$W/py" \
+      BALLAST_WA_PLUGIN="$W/plugin.py" WA_SUITE_MIN_TOTAL=10 WA_SUITE_WATCH_S=1 "$@" bash "$ITEMS/wa-suite.sh"
 }
+runwa() { newrd; OUT=$(envwa "$@" 2>"$W/err"); RC=$?; }   # runwa [VAR=valor…] → $OUT (stdout inteiro), $RC
 sj() {  # sj CAMPO — campo do último BALLAST-SUMMARY (JSON) do $OUT; lista por índice (new_fail.0); null/ausente → "null"
   printf '%s\n' "$OUT" | grep '^BALLAST-SUMMARY: ' | tail -n 1 | sed 's/^BALLAST-SUMMARY: //' | "$PY" -I -c 'import sys,json
 v=json.load(sys.stdin)
@@ -226,7 +235,7 @@ g_run() {
 # ── g_iso ────────────────────────────────────────────────────────────────────────────────────────────
 g_iso() {
   newrig; echo "GTN-ISO: nao-isolado tcp:1.1.1.1:53" > "$W/iso.canary"; runwa
-  check "iso: canário nao-isolado → vazamento, exit 3" "3 vazamento" "$RC $(sj result)"
+  check "iso: canário nao-isolado → vazamento, exit 3, trava gravada (trava=ok)" "3 vazamento ok" "$RC $(sj result) $(sj trava)"
   check "iso: vazamento TRANCA o item (wa-suite.leak) e nada roda: sem árvore, sem pytest, sem ponta" "1 0 ausente ausente" "$([ -e "$BH/wa-suite.leak" ] && echo 1 || echo 0) $(calls '^wt-add' "$W/rg.calls") $([ -e "$W/py.args" ] && echo roda || echo ausente) $([ -e "$BH/wa-suite.last" ] && echo gravou || echo ausente)"
   check "iso: o resumo diz o que a sonda achou" "nao-isolado tcp:1.1.1.1:53" "$(sj iso)"
 
@@ -236,7 +245,12 @@ g_iso() {
   check "iso: canário que não imprime NADA nunca vira isolado: isolamento-inerte" "3 isolamento-inerte ausente" "$RC $(sj result) $([ -e "$W/py.args" ] && echo roda || echo ausente)"
 
   newrig; echo "GTN-ISO: nao-isolado dns" > "$W/iso.runfirst"; runwa
-  check "iso: nao-isolado DENTRO da rodada (o canário do pré-teste passou) → vazamento, tranca, ponta não anda" "3 vazamento 1 ausente" "$RC $(sj result) $([ -e "$BH/wa-suite.leak" ] && echo 1 || echo 0) $([ -e "$BH/wa-suite.last" ] && echo gravou || echo ausente)"
+  check "iso: nao-isolado DENTRO da rodada (o canário do pré-teste passou) → vazamento, tranca (trava=ok), ponta não anda" "3 vazamento ok 1 ausente" "$RC $(sj result) $(sj trava) $([ -e "$BH/wa-suite.leak" ] && echo 1 || echo 0) $([ -e "$BH/wa-suite.last" ] && echo gravou || echo ausente)"
+  # a trava que não grava (wa-suite.leak é pasta): o item NÃO ficou trancado e o resumo tem que dizer, nos dois caminhos (canário do bash e passo de leitura do python)
+  newrig; echo "GTN-ISO: nao-isolado dns" > "$W/iso.canary"; mkdir "$BH/wa-suite.leak"; runwa
+  check "iso: canário nao-isolado e a trava NÃO grava → vazamento com trava=falhou, exit 3" "3 vazamento falhou" "$RC $(sj result) $(sj trava)"
+  newrig; echo "GTN-ISO: nao-isolado dns" > "$W/iso.runfirst"; mkdir "$BH/wa-suite.leak"; runwa
+  check "iso: nao-isolado DENTRO da rodada e a trava NÃO grava → vazamento com trava=falhou, exit 3" "3 vazamento falhou" "$RC $(sj result) $(sj trava)"
 
   newrig; : > "$W/iso.noproof"; runwa
   check "iso: sem a linha 'GTN-ISO: ok ns=' o resultado é descartado (sem-prova-de-isolamento), nada é gravado" "3 sem-prova-de-isolamento ausente ausente" "$RC $(sj result) $([ -e "$BH/wa-suite.last" ] && echo gravou || echo ausente) $([ -e "$BH/wa-suite.failed" ] && echo gravou || echo ausente)"
@@ -270,12 +284,16 @@ g_read() {
   check "read: a linha GTN-FAILED duas vezes → indisponivel" "indisponivel" "$(sj compare)"
   newcommit; mkout 990 8 "tests/a.py::t1" "tests/n.py::tn"; sed -i.bak 's/^GTN-FAIL: "tests\/n.py::tn"/GTN-FAIL: tests\/n.py::tn/' "$W/py.out"; runwa
   check "read: GTN-FAIL que não é JSON → indisponivel" "indisponivel" "$(sj compare)"
+  newcommit; mkout 990 8 "tests/a.py::t1" "tests/n.py::tn"; sed -i.bak 's/^GTN-FAIL: "tests\/n.py::tn"/GTN-FAIL: ["tn"]/' "$W/py.out"; runwa
+  check "read: GTN-FAIL que é uma lista JSON (não hashable) → indisponivel, rc 0" "0 indisponivel" "$RC $(sj compare)"
 
   # linha de base
   newrig; runwa; newcommit; printf 'isto nao e json\n' > "$BH/wa-suite.failed"; cp "$BH/wa-suite.failed" "$T/bad.$N"; runwa
   check "read: base ilegível (texto solto) → indisponivel, NUNCA '0 novas'; a base fica como estava" "indisponivel null $(cat "$T/bad.$N")" "$(sj compare) $(sj new_fail_n) $(cat "$BH/wa-suite.failed")"
   newcommit; printf '123\n456\n' > "$BH/wa-suite.failed"; runwa
   check "read: base que é JSON mas não é lista de ids em texto (números) → indisponivel" "indisponivel null" "$(sj compare) $(sj new_fail_n)"
+  newcommit; printf '["a"]\n{"k": 1}\n' > "$BH/wa-suite.failed"; cp "$BH/wa-suite.failed" "$T/bad2.$N"; runwa
+  check "read: base com linha JSON que é lista/objeto (não hashable: TypeError) → indisponivel, rc 0 (nunca o passo derrubado e 3 h de suíte repetidas a cada 10 min), base intacta" "0 completo indisponivel null $(cat "$T/bad2.$N")" "$RC $(sj result) $(sj compare) $(sj new_fail_n) $(cat "$BH/wa-suite.failed")"
   newcommit; rm -f "$BH/wa-suite.failed"; mkdir "$BH/wa-suite.failed"; runwa
   check "read: base que é uma PASTA (não abre) → indisponivel, rc 0, nunca '0 novas'" "0 indisponivel null" "$RC $(sj compare) $(sj new_fail_n)"
   rmdir "$BH/wa-suite.failed"; newcommit; : > "$BH/wa-suite.failed"; runwa
@@ -284,27 +302,37 @@ g_read() {
 
 # ── g_frozen ─────────────────────────────────────────────────────────────────────────────────────────
 g_frozen() {
-  newrig; runwa; cp "$BH/wa-suite.failed" "$T/fz.$N"; newcommit; echo 3 > "$W/py.sleep"; echo 100 > "$W/jump"; runwa
+  newrig; runwa; cp "$BH/wa-suite.failed" "$T/fz.$N"; newcommit; : > "$W/py.waitfrozen"; echo 100 > "$W/jump"; runwa   # o pytest de brinquedo espera o laço gravar o salto (nada de sleep fixo: carga alta atrasava o laço)
   check "frozen: relógio que salta 100 s entre dois sleeps (sessão congelada) → frozen_s >= 60, compare indisponivel, rc 0" "0 completo 1 indisponivel null" "$RC $(sj result) $([ "$(sj frozen_s)" -ge 60 ] 2>/dev/null && echo 1 || echo 0) $(sj compare) $(sj new_fail_n)"
   check "frozen: o resumo diz que foi a pausa/fome de CPU" "1" "$(sj why | grep -c 'parada')"
   check "frozen: a base NÃO anda numa rodada suspeita, a ponta anda" "$(cat "$T/fz.$N") $(tip)" "$(cat "$BH/wa-suite.failed") $(cat "$BH/wa-suite.last")"
-  rm -f "$W/jump" "$W/jump.n"   # o relógio de brinquedo volta ao real: os dois casos abaixo semeiam o arquivo `frozen` à mão
-  newcommit; PRE_FROZEN=abc runwa
+  # o relógio de brinquedo volta ao real e o laço de relógio NÃO anda (WA_SUITE_WATCH_S enorme): nos dois casos abaixo só vale o arquivo `frozen` semeado à mão, nenhum salto de 1 s o sobrescreve
+  rm -f "$W/jump" "$W/jump.n" "$W/py.waitfrozen" "$W/py.sleep"
+  newcommit; PRE_FROZEN=abc runwa WA_SUITE_WATCH_S=3600
   check "frozen: arquivo de relógio ilegível (não é inteiro) = rodada suspeita: comparação indisponível, frozen_s null (nunca 0)" "indisponivel null" "$(sj compare) $(sj frozen_s)"
-  newcommit; PRE_FROZEN=0 runwa
+  newcommit; PRE_FROZEN=0 runwa WA_SUITE_WATCH_S=3600
   check "frozen: salto 0 (o laço rodou e o relógio andou direito) é normal" "ok" "$(sj compare)"
   newcommit; echo 3 > "$W/py.sleep"; rm -f "$W/jump" "$W/jump.n"; runwa
   check "frozen: sem salto de relógio → frozen_s pequeno e comparação normal (ok)" "ok 1" "$(sj compare) $([ "$(sj frozen_s)" -lt 60 ] 2>/dev/null && echo 1 || echo 0)"
+  newcommit; : > "$W/py.killwatch"; runwa; rm -f "$W/py.killwatch"
+  check "frozen: o laço de relógio que MORRE no meio da rodada = relógio desconhecido: comparação indisponível, frozen_s null (o arquivo ausente leria como 'sem salto')" "indisponivel null" "$(sj compare) $(sj frozen_s)"
+  # duração curta e única (a vida de um órfão é essa): se o fim do item deixasse o `sleep` do laço solto (ppid 1), ele some sozinho em < 1 min em vez de ficar horas no nó
+  d=$((31 + RANDOM % 28)); b=$(orphans "$d"); newcommit; echo 1 > "$W/py.sleep"; runwa WA_SUITE_WATCH_S=$d
+  check "frozen: ao fim o item não deixa o sleep do laço de relógio órfão" "0" "$(( $(orphans "$d") - b ))"
 }
 
 # ── g_prep ───────────────────────────────────────────────────────────────────────────────────────────
 g_prep() {
   newrig; : > "$W/rg.pull.fail"; runwa
   check "prep: pull que falha segue com o clone que há e diz pull=falhou" "0 completo falhou" "$RC $(sj result) $(sj pull)"
+  newrig; runwa; : > "$W/rg.pull.fail"; runwa
+  check "prep: pull que falha COM a ponta da última rodada → pull-falhou, exit 3 (um pull que falha para sempre não pode parecer fila parada), nada roda de novo" "3 pull-falhou falhou 1" "$RC $(sj result) $(sj pull) $(calls '^wt-add' "$W/rg.calls")"
   newrig; git -C "$GR/whatsapp_automation/repo.git" update-ref -d refs/remotes/origin/main; runwa
   check "prep: clone sem origin/main → sem-main, exit 3" "3 sem-main" "$RC $(sj result)"
   newrig; : > "$W/rg.wtadd.fail"; runwa
   check "prep: wt-add que falha → wt-add-falhou, exit 3, pytest não roda, ponta não anda" "3 wt-add-falhou ausente ausente" "$RC $(sj result) $([ -e "$W/py.args" ] && echo roda || echo ausente) $([ -e "$BH/wa-suite.last" ] && echo gravou || echo ausente)"
+  newrig; mkdir -p "$GR/whatsapp_automation/wt/ballast-wa"; : > "$W/rg.wtrm.fail"; runwa
+  check "prep: árvore velha que o wt-rm não tira → arvore-velha, exit 3, o pytest não roda (o wt-add diria 'já existe' e a rodada testaria código de outro dia)" "3 arvore-velha ausente" "$RC $(sj result) $([ -e "$W/py.args" ] && echo roda || echo ausente)"
   newrig notests; runwa
   check "prep: árvore sem tests/ → arvore-sem-testes, exit 3, e a árvore é removida" "3 arvore-sem-testes 1" "$RC $(sj result) $(calls '^wt-rm whatsapp_automation ballast-wa' "$W/rg.calls")"
   newrig; runwa BALLAST_WA_PLUGIN="$T/nao-existe.py"
@@ -331,9 +359,7 @@ g_state() {
   check "state: e há exatamente UM resumo" "1" "$(nsum)"
 
   # TERM no meio: o item repassa ao pytest, apaga a árvore e não grava
-  newrig; echo 30 > "$W/py.sleep"; RDN=$((${RDN:-0}+1)); RD="$T/rd$N.$RDN"; mkdir -p "$RD"
-  env PATH="$W/bin:$PATH" HOME="$T/home" BALLAST_HOME="$BH" BALLAST_RUN_DIR="$RD" BALLAST_CORES=2 BALLAST_REMOTE_GIT="$W/rg" GT_REMOTE_GIT="$GR" BALLAST_ISO_RUN="$W/iso" BALLAST_WA_PYTHON="$W/py" \
-    BALLAST_WA_PLUGIN="$W/plugin.py" WA_SUITE_MIN_TOTAL=10 WA_SUITE_WATCH_S=1 bash "$ITEMS/wa-suite.sh" > "$W/term.out" 2>&1 &
+  newrig; echo 30 > "$W/py.sleep"; newrd; envwa > "$W/term.out" 2>&1 &
   ipid=$!; i=0; while [ ! -e "$W/py.started" ] && [ "$i" -lt 100 ]; do sleep 0.2; i=$((i+1)); done
   ppid_py=$(cat "$W/py.pid" 2>/dev/null)
   kill -TERM "$ipid" 2>/dev/null; wait "$ipid" 2>/dev/null; rc=$?
@@ -341,6 +367,11 @@ g_state() {
   i=0; while [ -n "$ppid_py" ] && kill -0 "$ppid_py" 2>/dev/null && [ "$i" -lt 30 ]; do sleep 0.2; i=$((i+1)); done
   check "state: TERM repassado ao pytest (o processo do pytest de brinquedo morreu)" "morto" "$(kill -0 "$ppid_py" 2>/dev/null && echo vivo || echo morto)"
   check "state: TERM apaga a árvore e a branch e NÃO grava a ponta" "1 0 ausente" "$(calls '^wt-rm whatsapp_automation ballast-wa' "$W/rg.calls") $(git -C "$GR/whatsapp_automation/repo.git" branch --list 'worker/*' | wc -l | tr -d ' ') $([ -e "$BH/wa-suite.last" ] && echo gravou || echo ausente)"
+  # TERM ANTES do pytest (no canário): o governo manda TERM a todos os membros da sessão, o filho morre e o item tem que sair na hora, não esperar 10 s por um pytest que não existe
+  newrig; : > "$W/iso.hang"; newrd; envwa > "$W/term.out" 2>&1 &
+  ipid=$!; i=0; while [ ! -s "$W/iso.pid" ] && [ "$i" -lt 100 ]; do sleep 0.2; i=$((i+1)); done
+  s0=$(date +%s); kill -TERM "$ipid" "$(cat "$W/iso.pid" 2>/dev/null)" 2>/dev/null; wait "$ipid" 2>/dev/null; rc=$?
+  check "state: TERM antes do pytest nascer (canário pendurado) → o item sai 143 na hora (< 7 s; sem PYPID não há o que esperar)" "143 1" "$rc $([ $(( $(date +%s) - s0 )) -lt 7 ] && echo 1 || echo 0)"
 }
 
 # ── g_reg ────────────────────────────────────────────────────────────────────────────────────────────
@@ -395,66 +426,78 @@ print(v if isinstance(v,str) else json.dumps(v))' "$1"; }
   killtree "$H/"
 }
 
-if [ -n "${HBW_MUTANT:-}" ]; then g_run; g_iso; g_read; g_frozen; g_prep; g_state; g_reg; g_sched; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
+GRUPOS="run iso read frozen prep state reg sched"
+if [ -n "${HBW_MUTANT:-}" ]; then for g in ${HBW_ONLY:-$GRUPOS}; do "g_$g"; done; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
 if [ -n "${HBW_ONLY:-}" ]; then "g_$HBW_ONLY"; echo "── $((n - fails))/$n ok (só g_$HBW_ONLY)"; [ "$fails" = 0 ]; exit $?; fi
-[ -n "${HBW_ANCHORS_ONLY:-}" ] || { g_run; g_iso; g_read; g_frozen; g_prep; g_state; g_reg; g_sched; }
+[ -n "${HBW_ANCHORS_ONLY:-}" ] || { for g in $GRUPOS; do "g_$g"; done; }
 
 [ -n "${HBW_NO_MUTANTS:-}" ] || {
+  # a bateria SEM mutante tem que estar verde: com ela vermelha (carga, relógio, ambiente) qualquer mutante "reprovaria" por motivo nenhum e o controle negativo não prova nada
+  [ "$fails" = 0 ] || { echo "── bateria sem mutante VERMELHA ($fails falhas): o controle negativo não vale, nenhum mutante contado"; exit 1; }
   echo "── controle negativo: cada mutante tem que reprovar a bateria ──"
-  # ARQUIVO@@DESCRIÇÃO@@ANTES@@DEPOIS — troca EXATAMENTE uma ocorrência numa cópia da pasta de itens (e do registro)
+  # ARQUIVO@@GRUPO@@DESCRIÇÃO@@ANTES@@DEPOIS — troca EXATAMENTE uma ocorrência numa cópia da pasta de itens (e do registro). GRUPO é o único que roda contra o mutante: quem o pega é o grupo que o mutante mira (uma falha de OUTRO grupo, de carga ou de relógio, não conta como "pego")
   cat > "$T/mutants.txt" <<'MUT'
-wa-suite.sh@@o vazamento do canário não tranca o item@@: > "$LEAK" 2> /dev/null; @@
-wa-suite.sh@@canário inerte/vazio segue para a suíte@@summary isolamento-inerte main="${main:0:9}" pull=$pull iso="${canary#GTN-ISO: }"; exit 3 ;;@@: ;;
-wa-suite.sh@@sem-novidade nunca é reconhecido@@if [ "$main" = "$(cat "$LAST" 2> /dev/null)" ]; then@@if false; then
-wa-suite.sh@@a árvore de trabalho nunca é removida@@{ "$RG" wt-rm "$RIG" "$bead" > /dev/null 2>&1; branch_rm; }; }@@{ :; }; }
-wa-suite.sh@@a branch worker/* não sai no fim da rodada@@> /dev/null 2>&1; branch_rm; }; }@@> /dev/null 2>&1; }; }
-wa-suite.sh@@a branch velha não sai antes do wt-add (a rodada testaria a ponta de outro dia)@@branch_rm
+wa-suite.sh@@iso@@o vazamento do canário não tranca o item@@{ : > "$LEAK"; } 2> /dev/null || lock=falhou@@:
+wa-suite.sh@@iso@@canário inerte/vazio segue para a suíte@@summary isolamento-inerte main="${main:0:9}" pull=$pull iso="${canary#GTN-ISO: }"; exit 3 ;;@@: ;;
+wa-suite.sh@@run@@sem-novidade nunca é reconhecido@@if [ "$main" = "$(cat "$LAST" 2> /dev/null)" ]; then@@if false; then
+wa-suite.sh@@run@@a árvore de trabalho nunca é removida@@{ "$RG" wt-rm "$RIG" "$bead" > /dev/null 2>&1; branch_rm; }; }@@{ :; }; }
+wa-suite.sh@@run@@a branch worker/* não sai no fim da rodada@@> /dev/null 2>&1; branch_rm; }; }@@> /dev/null 2>&1; }; }
+wa-suite.sh@@run@@a branch velha não sai antes do wt-add (a rodada testaria a ponta de outro dia)@@branch_rm
 if ! timeout 900 "$RG" wt-add@@if ! timeout 900 "$RG" wt-add
-wa-suite.sh@@resultado sem a prova de isolamento é aceito@@if not (iso.startswith("isolado") and ok_line and eg != ""):@@if False:
-wa-suite.sh@@a linha `ok ns=` do helper não é exigida@@iso.startswith("isolado") and ok_line and eg != ""@@iso.startswith("isolado") and eg != ""
-wa-suite.sh@@a linha GTN-EGRESS não é exigida@@iso.startswith("isolado") and ok_line and eg != ""@@iso.startswith("isolado") and ok_line
-wa-suite.sh@@o nao-isolado de DENTRO da rodada não tranca@@        open(leak_p, "w").close()@@        pass
-wa-suite.sh@@pytest que aborta (rc fora de 0/1) vira resultado@@if prc not in (0, 1):@@if False:
-wa-suite.sh@@total abaixo do piso é aceito@@if total < min_total:@@if False:
-wa-suite.sh@@lista GTN ausente vira zero falhas (confiável)@@    why = "o pytest não imprimiu a linha GTN-FAILED (o plugin não rodou ou falhou ao montar a lista)"@@    listok = True
-wa-suite.sh@@lista parcial (n != ids lidos) é aceita@@if len(ids) != int(mm.group(1)):@@if False:
-wa-suite.sh@@reports != falhas+erros do resumo é aceito@@elif int(mm.group(2)) != failed + errors:@@elif False:
-wa-suite.sh@@GTN-FAILED duplicada é aceita@@elif len(sent) > 1:@@elif False:
-wa-suite.sh@@GTN-FAIL que não é JSON derruba o passo em vez de virar indisponível@@        except (ValueError, TypeError):@@        except (KeyError,):
-wa-suite.sh@@base com JSON que não é texto é aceita@@if not all(isinstance(x, str) for x in prev):@@if False:
-wa-suite.sh@@a comparação ignora a base (tudo que reprova é novo)@@new = sorted(set(ids) - prev)@@new = sorted(set(ids))
-wa-suite.sh@@base ilegível vira 'comparação ok, 0 novas'@@        why = "a linha de base %s não pôde ser lida como lista de ids em JSON" % os.path.basename(prev_p)@@        compare = "ok"
-wa-suite.sh@@rodada congelada ainda compara@@elif frozen < 0 or frozen >= 60:@@elif False:
-wa-suite.sh@@o limiar do congelamento é alto demais (6000 s)@@elif frozen < 0 or frozen >= 60:@@elif frozen < 0 or frozen >= 6000:
-wa-suite.sh@@relógio ilegível conta como zero (não suspeito)@@        frozen = -1@@        frozen = 0
-wa-suite.sh@@a base anda mesmo com comparação indisponível@@if compare in ("ok", "primeira"):@@if True:
-wa-suite.sh@@a ponta testada nunca é gravada@@staged.append(stage(last_p, full + "\n"))   # a ponta@@pass   # a ponta
-wa-suite.sh@@alvo de estado que é pasta só falha na troca, DEPOIS do resumo@@    if os.path.isdir(path):@@    if False:
-wa-suite.sh@@falha do passo final vira rc 0@@[ "$prc" -ne 0 ] || exit 0@@exit 0
-wa-suite.sh@@o passo que morre sem imprimir não deixa resumo nenhum@@[ "$prc" -eq 3 ] || summary resumo-falhou main="${tested:0:9}" pull="$pull" python_rc="$prc"@@:
-wa-suite.sh@@o TERM não é repassado ao pytest@@[ -z "$PYPID" ] || kill -TERM "$PYPID" 2> /dev/null@@:
-wa-suite.sh@@GTN_WORKERS não chega ao gt-iso-run@@GTN_WORKERS="$CORES" "$ISO" --@@"$ISO" --
-wa-suite.sh@@o -n é fixo em vez de seguir o governo@@-n "$CORES" -p gtn_stable_ids@@-n 2 -p gtn_stable_ids
-wa-suite.sh@@pull que falha é dado como ok@@2>&1 || pull=falhou@@2>&1 || pull=ok
-wa-suite.sh@@falha de prazo de teste não é contada@@Timeout \(?>[0-9.]+s@@NUNCA-CASA
-wa-suite.sh@@árvore sem tests/ segue em frente@@[ -d "$WT/tests" ] || {@@true || {
-wa-suite.sh@@wt-add que falha segue em frente@@if ! timeout 900 "$RG" wt-add "$RIG" "$bead" main > "$RD/wt-add.out" 2>&1; then@@if false; then
-wa-suite.sh@@clone sem origin/main segue em frente@@[ -n "$main" ] || { say "o clone não tem origin/main"@@[ -n "x" ] || { say "o clone não tem origin/main"
-wa-suite.sh@@plugin ausente não impede a rodada@@[ -f "$PLUG" ] || {@@true || {
-wa-suite.sh@@gt-iso-run ou python do venv ausente não impedem a rodada@@  [ -x "$need" ] || {@@  true || {
-hetzner-ballast.items.txt@@núcleos viram auto (o hq-selftests passaria horas sem rodar)@@wa-suite\twork\t8\t@@wa-suite\twork\tauto\t
-hetzner-ballast.items.txt@@o prazo do registro não cabe a suíte@@\t8\t12288\t21600\t@@\t8\t12288\t600\t
-hetzner-ballast.items.txt@@o registro deixa de exigir a flag de vazamento@@,noflag:wa-suite.leak@@
-hetzner-ballast.items.txt@@o registro deixa de exigir o plugin@@path:~/gt-remote/bin/gtn_stable_ids.py,@@
-hetzner-ballast.items.txt@@o registro deixa de exigir o gt-iso-run@@exec:~/gt-remote/bin/gt-iso-run,@@
-hetzner-ballast.items.txt@@o registro deixa de exigir o helper de root@@exec:/usr/local/sbin/gt-netns-run,@@
+wa-suite.sh@@iso@@resultado sem a prova de isolamento é aceito@@if not (iso.startswith("isolado") and ok_line and eg != ""):@@if False:
+wa-suite.sh@@iso@@a linha `ok ns=` do helper não é exigida@@iso.startswith("isolado") and ok_line and eg != ""@@iso.startswith("isolado") and eg != ""
+wa-suite.sh@@iso@@a linha GTN-EGRESS não é exigida@@iso.startswith("isolado") and ok_line and eg != ""@@iso.startswith("isolado") and ok_line
+wa-suite.sh@@iso@@o nao-isolado de DENTRO da rodada não tranca@@        open(leak_p, "w").close()@@        pass
+wa-suite.sh@@read@@pytest que aborta (rc fora de 0/1) vira resultado@@if prc not in (0, 1):@@if False:
+wa-suite.sh@@read@@total abaixo do piso é aceito@@if total < min_total:@@if False:
+wa-suite.sh@@read@@lista GTN ausente vira zero falhas (confiável)@@    why = "o pytest não imprimiu a linha GTN-FAILED (o plugin não rodou ou falhou ao montar a lista)"@@    listok = True
+wa-suite.sh@@read@@lista parcial (n != ids lidos) é aceita@@if len(ids) != int(mm.group(1)):@@if False:
+wa-suite.sh@@read@@reports != falhas+erros do resumo é aceito@@elif int(mm.group(2)) != failed + errors:@@elif False:
+wa-suite.sh@@read@@GTN-FAILED duplicada é aceita@@elif len(sent) > 1:@@elif False:
+wa-suite.sh@@read@@GTN-FAIL que não é JSON derruba o passo em vez de virar indisponível@@        except (ValueError, TypeError):@@        except (KeyError,):
+wa-suite.sh@@read@@base com JSON que não é texto é aceita@@if not all(isinstance(x, str) for x in rows):@@if False:
+wa-suite.sh@@run@@a comparação ignora a base (tudo que reprova é novo)@@new = sorted(set(ids) - prev)@@new = sorted(set(ids))
+wa-suite.sh@@read@@base ilegível vira 'comparação ok, 0 novas'@@        why = "a linha de base %s não pôde ser lida como lista de ids em JSON" % os.path.basename(prev_p)@@        compare = "ok"
+wa-suite.sh@@frozen@@rodada congelada ainda compara@@elif frozen < 0 or frozen >= 60:@@elif False:
+wa-suite.sh@@frozen@@o limiar do congelamento é alto demais (6000 s)@@elif frozen < 0 or frozen >= 60:@@elif frozen < 0 or frozen >= 6000:
+wa-suite.sh@@frozen@@relógio ilegível conta como zero (não suspeito)@@        frozen = -1@@        frozen = 0
+wa-suite.sh@@read@@a base anda mesmo com comparação indisponível@@if compare in ("ok", "primeira"):@@if True:
+wa-suite.sh@@run@@a ponta testada nunca é gravada@@staged.append(stage(last_p, full + "\n"))   # a ponta@@pass   # a ponta
+wa-suite.sh@@state@@alvo de estado que é pasta só falha na troca, DEPOIS do resumo@@    if os.path.isdir(path):@@    if False:
+wa-suite.sh@@state@@falha do passo final vira rc 0@@[ "$prc" -ne 0 ] || exit 0@@exit 0
+wa-suite.sh@@state@@o passo que morre sem imprimir não deixa resumo nenhum@@[ "$prc" -eq 3 ] || summary resumo-falhou main="${tested:0:9}" pull="$pull" python_rc="$prc"@@:
+wa-suite.sh@@state@@o TERM não é repassado ao pytest@@[ -z "$PYPID" ] || kill -TERM "$PYPID" 2> /dev/null@@:
+wa-suite.sh@@run@@GTN_WORKERS não chega ao gt-iso-run@@GTN_WORKERS="$CORES" "$ISO" --@@"$ISO" --
+wa-suite.sh@@run@@o -n é fixo em vez de seguir o governo@@-n "$CORES" -p gtn_stable_ids@@-n 2 -p gtn_stable_ids
+wa-suite.sh@@prep@@pull que falha é dado como ok@@2>&1 || pull=falhou@@2>&1 || pull=ok
+wa-suite.sh@@run@@falha de prazo de teste não é contada@@Timeout \(?>[0-9.]+s@@NUNCA-CASA
+wa-suite.sh@@prep@@árvore sem tests/ segue em frente@@[ -d "$WT/tests" ] || {@@true || {
+wa-suite.sh@@prep@@wt-add que falha segue em frente@@if ! timeout 900 "$RG" wt-add "$RIG" "$bead" main > "$RD/wt-add.out" 2>&1; then@@if false; then
+wa-suite.sh@@prep@@clone sem origin/main segue em frente@@[ -n "$main" ] || { say "o clone não tem origin/main"@@[ -n "x" ] || { say "o clone não tem origin/main"
+wa-suite.sh@@prep@@plugin ausente não impede a rodada@@[ -f "$PLUG" ] || {@@true || {
+wa-suite.sh@@prep@@gt-iso-run ou python do venv ausente não impedem a rodada@@  [ -x "$need" ] || {@@  true || {
+hetzner-ballast.items.txt@@reg@@núcleos viram auto (o hq-selftests passaria horas sem rodar)@@wa-suite\twork\t8\t@@wa-suite\twork\tauto\t
+hetzner-ballast.items.txt@@reg@@o prazo do registro não cabe a suíte@@\t8\t12288\t21600\t@@\t8\t12288\t600\t
+hetzner-ballast.items.txt@@reg@@o registro deixa de exigir a flag de vazamento@@,noflag:wa-suite.leak@@
+hetzner-ballast.items.txt@@reg@@o registro deixa de exigir o plugin@@path:~/gt-remote/bin/gtn_stable_ids.py,@@
+hetzner-ballast.items.txt@@reg@@o registro deixa de exigir o gt-iso-run@@exec:~/gt-remote/bin/gt-iso-run,@@
+hetzner-ballast.items.txt@@reg@@o registro deixa de exigir o helper de root@@exec:/usr/local/sbin/gt-netns-run,@@
+wa-suite.sh@@iso@@a trava que não gravou é dada como gravada (caminho do canário)@@{ : > "$LEAK"; } 2> /dev/null || lock=falhou@@{ : > "$LEAK"; } 2> /dev/null || lock=ok
+wa-suite.sh@@iso@@a trava que não gravou é dada como gravada (caminho do passo de leitura)@@        lock = "falhou"   # não gravou a trava@@        lock = "ok"   # não gravou a trava
+wa-suite.sh@@read@@base com linha JSON não hashable derruba o passo (TypeError) em vez de virar indisponível@@rows = [json.loads(l) for l in f if l.strip()]@@rows = {json.loads(l) for l in f if l.strip()}
+wa-suite.sh@@read@@GTN-FAIL que é lista JSON derruba o passo (só ValueError é pego)@@        except (ValueError, TypeError):@@        except ValueError:
+wa-suite.sh@@frozen@@laço de relógio morto não vira desconhecido@@kill -0 "$WATCH" 2> /dev/null || echo -1 > "$RD/frozen"@@:
+wa-suite.sh@@frozen@@o sleep do laço de relógio fica órfão no fim@@{ pkill -P "$WATCH" 2> /dev/null; kill "$WATCH" 2> /dev/null; }@@{ kill "$WATCH" 2> /dev/null; }
+wa-suite.sh@@prep@@pull que falha com a ponta da última rodada vira sem-novidade@@[ "$pull" = ok ] || { say "o pull falhou@@true || { say "o pull falhou
+wa-suite.sh@@prep@@árvore velha que o wt-rm não tirou segue para o wt-add@@[ ! -e "$GR/$RIG/wt/$bead" ] || { say "a árvore velha@@true || { say "a árvore velha
+wa-suite.sh@@state@@o TERM antes do pytest espera os 10 s@@[ -n "$PYPID" ] && kill -0 "$PYPID" 2> /dev/null || break@@[ -z "$PYPID" ] || kill -0 "$PYPID" 2> /dev/null || break
 MUT
   "$PY" -I - "$ITEMS" "$REGF" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import os, re, shutil, sys
 items, regf, lst, tmp = sys.argv[1:5]
 entries, cur = [], None
-for line in open(lst, encoding="utf-8").read().split("\n"):
-    if cur is None or (cur.count("@@") >= 3 and re.match(r"^[a-z][a-z0-9.-]*\.(sh|txt)@@", line)):
+for line in open(lst, encoding="utf-8").read().rstrip("\n").split("\n"):   # sem o rstrip a última entrada ganhava um "\n" no fim (o mutante do TERM virava erro de sintaxe e "reprovava" por outro motivo)
+    if cur is None or (cur.count("@@") >= 4 and re.match(r"^[a-z][a-z0-9.-]*\.(sh|txt)@@", line)):
         if cur is not None:
             entries.append(cur)
         cur = line
@@ -464,9 +507,9 @@ if cur:
     entries.append(cur)
 for i, e in enumerate(entries, 1):
     parts = e.split("@@")
-    if len(parts) != 4:
-        print("%d\tBAD\t%s" % (i, e[:60])); continue
-    fn, desc, a, b = parts
+    if len(parts) != 5:
+        print("%d\tBAD\t-\t%s" % (i, e[:60])); continue
+    fn, grp, desc, a, b = parts
     a, b = a.replace("\\t", "\t"), b.replace("\\t", "\t")   # \t nas âncoras do registro (TSV)
     d = "%s/mi%d" % (tmp, i)
     shutil.copytree(items, d)
@@ -474,22 +517,22 @@ for i, e in enumerate(entries, 1):
     path = os.path.join(d, fn)
     src = open(path, encoding="utf-8").read()
     if src.count(a) != 1:
-        print("%d\tBAD\t%s" % (i, desc)); continue
+        print("%d\tBAD\t-\t%s" % (i, desc)); continue
     open(path, "w", encoding="utf-8").write(src.replace(a, b))
-    print("%d\tOK\t%s" % (i, desc))
+    print("%d\tOK\t%s\t%s" % (i, grp, desc))
 PYEOF
-  [ -z "${HBW_ANCHORS_ONLY:-}" ] || { cat "$T/mutants.idx" | awk -F'\t' '{ c[$2]++; if ($2 != "OK") print "ÂNCORA RUIM: " $3 } END { print "âncoras: OK=" c["OK"]+0 " ruins=" c["BAD"]+0 }'; exit 0; }
+  [ -z "${HBW_ANCHORS_ONLY:-}" ] || { cat "$T/mutants.idx" | awk -F'\t' '{ c[$2]++; if ($2 != "OK") print "ÂNCORA RUIM: " $4 } END { print "âncoras: OK=" c["OK"]+0 " ruins=" c["BAD"]+0 }'; exit 0; }
   JOBS=${HBW_JOBS:-4}
-  while IFS="$(printf '\t')" read -r idx st desc; do
+  while IFS="$(printf '\t')" read -r idx st grp desc; do
     if [ "$st" != OK ]; then ok 1 "mutante '$desc': a âncora não casa exatamente 1 vez (o arquivo mudou?)"; continue; fi
     while [ "$(jobs -r | wc -l | tr -d ' ')" -ge "$JOBS" ]; do sleep 0.3; done
-    ( HBW_MUTANT=1 HBW_ITEMS_DIR="$T/mi$idx" bash "$0" 2>&1 | tail -1 > "$T/mres.$idx" ) &
+    ( HBW_MUTANT=1 HBW_ONLY="$grp" HBW_ITEMS_DIR="$T/mi$idx" bash "$0" > "$T/mres.$idx" 2>&1 ) &
   done < "$T/mutants.idx"
   wait
-  while IFS="$(printf '\t')" read -r idx st desc; do
+  while IFS="$(printf '\t')" read -r idx st grp desc; do
     [ "$st" = OK ] || continue
-    r=$(cat "$T/mres.$idx" 2>/dev/null)
-    case "$r" in "RESULT 0/"*) ok 1 "mutante '$desc' NÃO foi pego ($r)";; "RESULT "*) ok 0 "mutante '$desc' pego ($r)";; *) ok 1 "mutante '$desc': sem resultado ($r)";; esac
+    r=$(tail -n 1 "$T/mres.$idx" 2>/dev/null); f=$(grep -m 1 '^FAIL ' "$T/mres.$idx" 2>/dev/null | cut -c6-300)   # f = o check que reprovou (o mutante é pego POR ele; o texto pode ter várias linhas, a 1ª basta)
+    case "$r" in "RESULT 0/"*) ok 1 "mutante '$desc' NÃO foi pego pelo grupo $grp ($r)";; "RESULT "*) ok 0 "mutante '$desc' pego em $grp: $f";; *) ok 1 "mutante '$desc': sem resultado ($r)";; esac
   done < "$T/mutants.idx"
 }
 echo "── $((n - fails))/$n ok"
