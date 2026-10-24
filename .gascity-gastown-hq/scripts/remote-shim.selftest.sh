@@ -202,6 +202,78 @@ denied "gc nudge drain --inject --" "sem nada depois" gc nudge drain --inject --
 denied "bd show <id> --" "sem nada depois" bd show ga-1 --
 allowed "controle: o -- COM algo depois continua valendo (bd show -- <id>)" bd show -- ga-1; lastis "argv=[show][--][ga-1]"; ok $? "  argv na ordem do cliente"
 
+echo "== devolver a bead ao mini (ga-dxszii): UMA escrita guardada pelo próprio bd, só da PRÓPRIA bead, com o veto node:never; nada além"
+# O dog que não pode construir a bead (ela só roda no mini) a devolve sozinho. A forma é UMA e cada flag tem o valor EXATO: --if-assignee = o alias DESTA sessão e --if-status in_progress (o
+# compare-and-swap é do bd: o wrapper não lê a bead antes, então não há janela entre ler e escrever), dono vazio, status open, o veto node:never (sem ele o Pilot a manda de volta ao nó a
+# cada varredura) e, se quiser, os rótulos de despacho. Fora disso NADA muda: nem outro status, nem outro rótulo, nem metadata, nem bead de rig, e `bd label` segue fora da lista (ga-6auslu).
+RA=(--if-assignee gastown.dog-1); RS=(--if-status in_progress); RO=(--assignee ''); RT=(--status open); RV=(--add-label node:never)
+RL=("${RA[@]}" "${RS[@]}" "${RO[@]}" "${RT[@]}" "${RV[@]}")
+# vazio → sem log de leituras (-1); falhou/ilegível → número vazio, que o -ge abaixo reprova. O caso exige ≥ 1 leitura ANTES (as beads de veredito acima já leram): sem isso "nenhuma leitura nova" passaria vazio
+r0=-1; [ -r "$FB/reads.log" ] && r0=$(wc -l < "$FB/reads.log" | tr -d ' ')
+allowed "devolver a PRÓPRIA bead (a forma mínima)" bd update ga-r1 "${RL[@]}"
+lastis "argv=[update][ga-r1][--if-assignee][gastown.dog-1][--if-status][in_progress][--assignee][][--status][open][--add-label][node:never]"; ok $? "  argv canônico: o do cliente, na ordem dele (o dono vazio chega como argumento vazio)"
+lastis "bd	cwd=$CITY	actor=gastown.dog-1	alias=gastown.dog-1"; ok $? "  cwd=cidade, BEADS_ACTOR=alias"
+r1=-1; [ -r "$FB/reads.log" ] && r1=$(wc -l < "$FB/reads.log" | tr -d ' ')
+[ "$r0" -ge 1 ] 2>/dev/null && [ "$r1" = "$r0" ]; ok $? "  e NÃO faz a leitura de estado do bd show: a guarda é o --if-assignee/--if-status do próprio bd (ler antes e escrever depois deixaria uma janela)"
+allowed "devolver com os 3 rótulos de despacho, --json e as flags ANTES do id" bd update --json --remove-label pilot:dispatched --remove-label pilot:dispatching --remove-label story:in-flight "${RL[@]}" ga-r2
+lastis "argv=[update][--json][--remove-label][pilot:dispatched][--remove-label][pilot:dispatching][--remove-label][story:in-flight][--if-assignee][gastown.dog-1]"; ok $? "  argv canônico, na ordem do cliente"
+allowed "devolver com -C ." bd -C . update ga-r1 "${RL[@]}"; lastis "cwd=$CITY"; ok $? "  cwd=cidade"
+allowed "devolver bead de wisp" bd update ga-wisp-072rx "${RL[@]}"
+# o comando que o PROMPT do dog-remote ensina é o que o wrapper aceita (sem isto o prompt e a lista andam cada um para um lado, e o dog só descobre na hora de devolver uma bead)
+python3 -I - "$HERE/../agents/dog-remote/prompt.template.md" gastown.dog-1 ga-r1 > "$T/prompt-cmd.bin" <<'EOF2'
+import shlex, sys
+lines = [l.strip() for l in open(sys.argv[1], encoding="utf-8").read().splitlines() if l.strip().startswith("bd update <id> --if-assignee")]
+if len(lines) != 1:  # UM comando de devolver no prompt: zero ou dois é o prompt que mudou de forma
+    sys.exit(3)
+sys.stdout.write("\0".join(shlex.split(lines[0].replace("<id>", sys.argv[3]).replace('"$GC_ALIAS"', sys.argv[2]))) + "\0")
+EOF2
+PCMD=(); while IFS= read -r -d '' _a; do PCMD+=("$_a"); done < "$T/prompt-cmd.bin"
+[ "${#PCMD[@]}" -ge 12 ] && [ "${PCMD[0]}" = bd ] && [ "${PCMD[1]}" = update ] && [ "${PCMD[2]}" = ga-r1 ]; ok $? "o prompt do dog-remote traz UM comando de devolver, e o <id> e o \$GC_ALIAS dele foram trocados (${#PCMD[@]} palavras)"
+[ "${#PCMD[@]}" -ge 12 ] && allowed "o comando de devolver que o PROMPT do dog-remote ensina é aceito pelo wrapper" "${PCMD[@]}"
+rel_denied() {  # rel_denied "descrição" "trecho do motivo" ARG... → `bd update ga-r1 ARG...` recusado (77, o falso NÃO é chamado)
+  local d=$1 w=$2; shift 2; denied "devolver: $d" "$w" bd update ga-r1 "$@"
+}
+rel_denied "sem --if-assignee (a escrita não seria guardada)" "falta --if-assignee" "${RS[@]}" "${RO[@]}" "${RT[@]}" "${RV[@]}"
+rel_denied "--if-assignee de OUTRO alias (só se devolve a PRÓPRIA bead)" "só se devolve a PRÓPRIA bead" --if-assignee gastown.dog-2 "${RS[@]}" "${RO[@]}" "${RT[@]}" "${RV[@]}"
+rel_denied "--if-assignee do Mayor" "só se devolve a PRÓPRIA bead" --if-assignee gastown.mayor "${RS[@]}" "${RO[@]}" "${RT[@]}" "${RV[@]}"
+rel_denied "--if-assignee que casa só em parte do alias" "só se devolve a PRÓPRIA bead" --if-assignee gastown.dog-1x "${RS[@]}" "${RO[@]}" "${RT[@]}" "${RV[@]}"
+rel_denied "--if-assignee vazio (o compare-and-swap de 'sem dono' é o claim do Pilot, não é daqui)" "<alias>" --if-assignee '' "${RS[@]}" "${RO[@]}" "${RT[@]}" "${RV[@]}"
+rel_denied "--if-assignee repetido" "flag repetida" "${RL[@]}" --if-assignee gastown.dog-1
+rel_denied "sem --if-status" "falta --if-status" "${RA[@]}" "${RO[@]}" "${RT[@]}" "${RV[@]}"
+for st in open closed blocked deferred; do rel_denied "--if-status $st (só se devolve a bead que está in_progress: não reabre bead fechada)" "--if-status sem valor ou com valor fora do formato in_progress" "${RA[@]}" --if-status "$st" "${RO[@]}" "${RT[@]}" "${RV[@]}"; done
+rel_denied "sem --assignee" "falta --assignee" "${RA[@]}" "${RS[@]}" "${RT[@]}" "${RV[@]}"
+for as in gastown.dog-2 dog-remote-9 gastown.mayor " "; do rel_denied "--assignee '$as' (devolver não é passar a bead adiante)" "--assignee sem valor ou com valor fora do formato ''" "${RA[@]}" "${RS[@]}" --assignee "$as" "${RT[@]}" "${RV[@]}"; done
+rel_denied "sem --status" "falta --status" "${RA[@]}" "${RS[@]}" "${RO[@]}" "${RV[@]}"
+for st in closed in_progress blocked deferred hooked pinned OPEN; do rel_denied "--status $st (só open)" "--status sem valor ou com valor fora do formato open" "${RA[@]}" "${RS[@]}" "${RO[@]}" --status "$st" "${RV[@]}"; done
+rel_denied "sem --add-label (sem o veto o Pilot a manda de volta ao nó)" "falta --add-label" "${RA[@]}" "${RS[@]}" "${RO[@]}" "${RT[@]}"
+# o rótulo que se ACRESCENTA é um só; qualquer outro é o `bd label add` que a ga-6auslu proíbe, só que por outra porta (verdict:PASS aprovaria código sem revisão)
+for l in verdict:PASS verdict:FAIL verdict:pending verdict:REQUEUED gate:needs-fix gate:passed gate-status:passed pilot:no-auto-dispatch pilot:dispatched story:approved story:in-flight type:quality-gate-verdict exec:manual needs:engine-window node:ok node:mini node:never-ever NODE:NEVER "node:never " ""; do
+  rel_denied "--add-label '$l' (só node:never)" "--add-label sem valor ou com valor fora do formato node:never" "${RA[@]}" "${RS[@]}" "${RO[@]}" "${RT[@]}" --add-label "$l"
+done
+rel_denied "--add-label repetido (node:never duas vezes)" "flag repetida" "${RL[@]}" --add-label node:never
+rel_denied "--add-label com um 2º rótulo além do node:never" "flag repetida" "${RL[@]}" --add-label verdict:PASS
+# os rótulos que se TIRAM são os três do despacho; tirar o veto (node:never) ou qualquer outro mexeria no que o Pilot e o gate leem
+for l in node:never verdict:pending type:quality-gate-verdict ctx:ready exec:auto lane:small story:approved gate:needs-fix pilot:no-auto-dispatch pilot:held-until:1792865101 pilot:dispatche story:in-flightx "" ; do
+  rel_denied "--remove-label '$l' (só os 3 do despacho)" "--remove-label sem valor ou com valor fora do formato <pilot:dispatched|pilot:dispatching|story:in-flight>" "${RL[@]}" --remove-label "$l"
+done
+rel_denied "dois ids" "argumento a mais" ga-r9 "${RL[@]}"
+denied "devolver: sem id" "faltam argumentos" bd update "${RL[@]}"
+for x in "--set-metadata story.x=y" "--unset-metadata gc.routed_to" "--notes x" "--claim" "--force" "--priority 0" "--title x" "--set-labels x" "--actor mayor" "-a x" "-s open" "--status=open" "--assignee=" "--if-assignee=gastown.dog-1"; do
+  rel_denied "flag a mais: $x" "flag fora da lista" "${RL[@]}" $x
+done
+denied "devolver: bead de RIG (-C <rig>) não se devolve por aqui (o veto node:never é do HQ)" "só vale na cidade" bd -C wa_rig update wa-1 "${RL[@]}"
+denied "devolver: -C com o caminho real do rig" "só vale na cidade" bd -C "$WA" update wa-1 "${RL[@]}"
+for _lk in "remove pilot:dispatched" "remove pilot:dispatching" "remove story:in-flight" "add node:never"; do
+  denied "devolver NÃO abre o bd label: bd label $_lk" "comando fora da lista" bd label "${_lk%% *}" ga-r1 "${_lk#* }"
+done
+# o TEXTO que a regra mostra (no log e na recusa) vem por último: um mutante que alarga uma guarda também muda esse texto, e o caso da própria guarda tem que ser o 1º a reprovar
+has "$LOGF" "gastown.dog-1	ok	bd [-C .] update <id> [--json] --if-assignee <alias> --if-status in_progress --assignee '' --status open --add-label node:never"; ok $? "o log de auditoria guarda a regra de devolver (a linha pode ser cortada nos 200 caracteres do campo; o começo basta)"
+FORMA="bd [-C .] update <id> [--json] --if-assignee <alias> --if-status in_progress --assignee '' --status open --add-label node:never [--remove-label <pilot:dispatched|pilot:dispatching|story:in-flight>]..."
+rel_denied "a receita SEM a guarda (--status open --assignee '') não é aceita, e a recusa mostra a forma inteira" "$FORMA" "${RT[@]}" "${RO[@]}"
+rel_denied "  a mesma recusa ainda diz o que a forma de --set-metadata achou" "flag fora da lista: '--status'" "${RT[@]}" "${RO[@]}"
+allowed "controle: bd update --set-metadata segue valendo ao lado da forma nova" bd update ga-r1 --set-metadata story.a=b
+denied "controle: bd update --status closed segue recusado (a forma nova é a única com --status)" "flag fora da lista" bd update ga-r1 --status closed
+
 echo "== protocolo, identidade e config"
 badreq "pedido vazio" "sem comando" ""
 badreq "pedido sem rs1" "fora do formato" "bd show ga-1"

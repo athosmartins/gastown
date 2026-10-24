@@ -52,6 +52,8 @@ b=$(calls); shim gc prime --hook; [ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ] && 
 shim gc nudge drain --inject; [ "$RC" = 0 ] && lastis "argv=[nudge][drain][--inject]"; ok $? "gc nudge drain --inject pelo shim"
 shim gc handoff --auto "context cycle"; [ "$RC" = 0 ] && lastis "argv=[handoff][--auto][context cycle]"; ok $? 'gc handoff --auto "context cycle" pelo shim (aspas e espaço intactos)'
 shim gate-done; [ "$RC" = 0 ] && lastis "gatedone	cwd=$CITY"; ok $? "gate-done pelo shim"
+b=$(calls); shim bd update ga-1 --if-assignee gastown.dog-1 --if-status in_progress --assignee '' --status open --add-label node:never --remove-label pilot:dispatched; [ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ] && lastis "argv=[update][ga-1][--if-assignee][gastown.dog-1][--if-status][in_progress][--assignee][][--status][open][--add-label][node:never][--remove-label][pilot:dispatched]"; ok $? "devolver a bead pelo shim (ga-dxszii): o dono vazio chega como argumento VAZIO ao bd falso, na ordem do cliente"
+b=$(calls); shim bd update ga-1 --if-assignee gastown.dog-2 --if-status in_progress --assignee '' --status open --add-label node:never; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && has "$T/err" "só se devolve a PRÓPRIA bead"; ok $? "devolver com o alias de OUTRO dog pelo shim: 77, o bd falso não é chamado (o alias é o do ambiente da sessão, não o que o comando diz)"
 shim bd close ga-1 --reason FAIL7; [ "$RC" = 7 ] && has "$T/err" "fake-err"; ok $? "código de saída e stderr do comando remoto passam pelo shim"
 STDIN_FILE="$T/stdin.txt" shim bd comment ga-1 --stdin; has "$T/out" "STDIN<texto vindo do stdin>"; ok $? "stdin passa pelo shim (hook que lê o JSON da sessão)"
 b=$(calls); shim bd sql "select 1"; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && has "$T/err" "RECUSADO"; ok $? "bd sql pelo shim: 77 e o bd falso não é chamado"
@@ -140,11 +142,12 @@ if start_sshd; then
   b=$(calls); realshim bd show ga-1 --json; [ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ] && has "$T/out" "FAKE-bd-OUT" && lastis "argv=[show][ga-1][--json]"; ok $? "cadeia inteira: shim → ssh → sshd → forced-command → wrapper → bd falso"
   b=$(calls); realshim gc prime --hook; [ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ] && lastis "argv=[prime][--hook]"; ok $? "  gc prime --hook pela cadeia real"
   realshim gc handoff --auto "context cycle"; [ "$RC" = 0 ] && lastis "argv=[handoff][--auto][context cycle]"; ok $? '  gc handoff --auto "context cycle" pela cadeia real'
+  b=$(calls); realshim bd update ga-1 --if-assignee gastown.dog-1 --if-status in_progress --assignee '' --status open --add-label node:never; [ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ] && lastis "argv=[update][ga-1][--if-assignee][gastown.dog-1][--if-status][in_progress][--assignee][][--status][open][--add-label][node:never]"; ok $? "  devolver a bead (ga-dxszii) pela cadeia real: o argumento vazio atravessa o ssh, o sshd e o shell de login"
   b=$(calls); realshim bd sql "select 1"; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && has "$T/err" "RECUSADO"; ok $? "  bd sql pela cadeia real: 77 e nada executa no mini"
   ls "$CM"/cm-* >/dev/null 2>&1; ok $? "  o ControlMaster criou o socket de multiplexação"
 else
-  skip "sshd de verdade: não subiu (sshd=${SSHD:-ausente}) — 5 casos da cadeia inteira ficaram SEM rodar; os casos com ssh falso acima NÃO provam que o pedido atravessa um sshd de verdade"
-  skipped=$((skipped+4))
+  skip "sshd de verdade: não subiu (sshd=${SSHD:-ausente}) — 6 casos da cadeia inteira ficaram SEM rodar; os casos com ssh falso acima NÃO provam que o pedido atravessa um sshd de verdade"
+  skipped=$((skipped+5))
 fi
 
 echo

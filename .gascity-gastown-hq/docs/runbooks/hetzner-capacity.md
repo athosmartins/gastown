@@ -123,7 +123,7 @@ Só depois do merge, e é do Mayor. Reversível tirando a chave.
 2. Confira com `launchctl print gui/$(id -u)/com.gascity.pilot | grep PILOT_NODE_FIRST` e, na primeira varredura com bead de dog, a linha `node-first (sombra): …` no log do Pilot.
 3. Cada consulta pode custar um ssh (≈ 3 s) no máximo a cada 60 s; entre elas o cache responde. Se o ssh ao nó travar, o Pilot espera no máximo 40 s por bead (`timeout`) e registra `unknown`.
 
-Entram só beads de dog do HQ (pool `gastown.dog`, bead da própria cidade). Ficam fora, sem consulta, as marcadas com `node:never`, `needs:engine-window` ou `exec:manual` (`PILOT_NODE_FIRST_VETO_LABELS`; o veto vale por token inteiro).
+Entram só beads de dog do HQ (pool `gastown.dog`, bead da própria cidade). Ficam fora, sem consulta, as marcadas com `node:never`, `needs:engine-window` ou `exec:manual` (`PILOT_NODE_FIRST_VETO_LABELS`; o veto vale por token inteiro). O `node:never` também é o que o dog do nó põe ao **devolver ao mini** uma bead que só roda lá, na mesma escrita que a solta (`remote-shim.md`, decisão 6, ga-dxszii): sem o veto o Pilot a mandaria de volta ao nó na varredura seguinte.
 
 ## Como ler a sombra
 

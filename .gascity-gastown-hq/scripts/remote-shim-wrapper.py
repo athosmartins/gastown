@@ -29,6 +29,10 @@ LISTA PERMITIDA
   TRAVA DE DONO (`+dono` na lista; ga-2hd02v.1.16): `bd comment` e `bd close` leem a bead antes (`bd show <id> --json`, mesmo cwd e ambiente, BD_READONLY=true) e, se ela
   tem o rótulo `type:quality-gate-verdict`, só passam quando o assignee é o alias declarado da sessão (o dispatcher lê o `VERDICT:` dos comentários dela, PASS antes de FAIL: uma sessão
   do nó que comentasse na bead de um revisor morto forjaria o veredito). Bead sem esse rótulo passa como antes. Leitura que falhou ou veio fora da forma = recusa (77, "nada foi executado, pode repetir").
+  DEVOLVER A BEAD (ga-dxszii): `bd update <id> --if-assignee <alias> --if-status in_progress --assignee '' --status open --add-label node:never [--remove-label <rótulo do despacho>]...`.
+  Cada flag leva o valor EXATO (F(lit=…)); `<alias>` tem que ser o da sessão (Rule.apply); só na cidade (`city_only`); a guarda de dono é o compare-and-swap do próprio bd, então o wrapper
+  NÃO lê a bead antes. É a ÚNICA forma de `bd` da lista que muda dono ou rótulo e o único `bd update` que muda status (o `bd close` fecha por outro caminho; o `gate-done` solta a bead por conta própria, no mini). Um pedido que nenhuma forma de um comando aceita é
+  recusado com o motivo de CADA forma (decide), não só o da primeira.
 
 POR QUE RECUSA EM VEZ DE ADAPTAR (está na lista / não está / não consegui saber — o último não vira "está")
   Config ilegível, routes.jsonl ilegível, log de auditoria que não grava, identidade fora do padrão, ferramenta que não achei → não executa.
@@ -126,35 +130,46 @@ VAL = {"id": _fm(ID), "ids": _fm(ID + "(?:," + ID + "){0,49}"), "word": _fm(r"[A
        # gate-done <bead> <ref> <sha> (ga-2hd02v.1.18): o ref é nome de branch do espelho (começa por letra/dígito: nunca vira flag; sem `:` nem `@`); o sha é inteiro, 40 hex
        "ref": v_ref, "sha": _fm(r"[0-9a-f]{40}")}
 _IDENT = r"[A-Za-z0-9][A-Za-z0-9._@/-]{0,95}"
+VAL["alias"] = _fm(_IDENT)  # o formato de um alias (o MESMO que o env aceita); quem o confere contra a sessão é Rule.apply
 # única entrada de ambiente aceita do cliente (e o valor tem formato): o servidor declara QUEM é a sessão, nada que aponte caminho
 ENV_VAL = {"GC_AGENT": _IDENT, "GC_ALIAS": _IDENT, "GC_SESSION_NAME": _IDENT, "GC_TEMPLATE": _IDENT,
            "GC_SESSION_ORIGIN": r"[a-z]{1,20}", "GC_MANAGED_SESSION_HOOK": r"1", "GC_HOOK_EVENT_NAME": r"[A-Za-z]{1,30}"}
 
 
-class F:  # uma flag: val = nome em VAL (ou None se não leva valor), rep = pode repetir, req = obrigatória, short = apelido curto
-    def __init__(self, val=None, rep=False, req=False, short=None):
-        self.val, self.rep, self.req, self.short = val, rep, req, short
+class F:  # uma flag: val = nome em VAL (ou None se não leva valor), lit = os valores LITERAIS que ela aceita (no lugar de val), rep = pode repetir, req = obrigatória, short = apelido curto
+    def __init__(self, val=None, rep=False, req=False, short=None, lit=None):
+        self.val, self.rep, self.req, self.short, self.lit = ("lit" if lit is not None else val), rep, req, short, lit
+
+    def ok(self, s: str) -> bool:
+        return s in self.lit if self.lit is not None else VAL[self.val](s)
+
+    def fmt(self) -> str:  # como o `list` e a recusa mostram o valor: um literal como está (o vazio vira ''), vários como <a|b|c>, o resto pelo nome do formato
+        if self.lit is None:
+            return f"<{self.val}>"
+        return shlex.quote(self.lit[0]) if len(self.lit) == 1 else "<" + "|".join(self.lit) + ">"
 
 
 class Rule:
-    def __init__(self, tool, words, pos=(), flags=None, owner_lock=False, hint=""):
+    def __init__(self, tool, words, pos=(), flags=None, owner_lock=False, hint="", city_only=False):
         self.tool, self.words, self.pos, self.flags = tool, tuple(words), list(pos), dict(flags or {})
         self.short = {f.short: n for n, f in self.flags.items() if f.short}
         self.owner_lock = owner_lock  # escreve na bead <id>: em bead de veredito (VERDICT_LABEL) só passa para o dono (owner_gate); o serve() lê o estado antes
         self.hint = f" (forma: {hint})" if hint else ""  # só entra na recusa por contagem de posicionais: a mensagem diz a forma inteira, não só o 1º grupo que faltou
+        self.city_only = city_only  # só vale na cidade (sem -C, ou -C . / o nome da cidade): bead de rig fica de fora (decide)
 
     def label(self) -> str:  # a linha que o runbook mostra: gerada da regra, então não há duas verdades
         w = " ".join(shlex.quote(x) if " " in x else x for x in self.words)
-        s = [self.tool + (" [-C <rig>]" if self.tool == "bd" else ""), w] if w else [self.tool]
+        s = [self.tool + (" [-C .]" if self.city_only else " [-C <rig>]" if self.tool == "bd" else ""), w] if w else [self.tool]
         for val, lo, hi in self.pos:
             s.append(f"<{val}>" + ("..." if hi > 1 else ""))
         for n, f in self.flags.items():
-            nm = n + (f"|{f.short}" if f.short else "") + (f" <{'key=value' if f.val == 'kv' else f.val}>" if f.val else "")
+            nm = n + (f"|{f.short}" if f.short else "") + (f" {'<key=value>' if f.val == 'kv' else f.fmt()}" if f.val else "")
             s.append((nm if f.req else f"[{nm}]") + ("..." if f.rep else ""))
         return " ".join(s) + (" +dono" if self.owner_lock else "")
 
-    def apply(self, args: list[str]) -> tuple[list[str], list[str]]:
-        """Recebe o argv depois das palavras fixas; devolve (argumentos a executar na ORDEM do cliente, flags curtas viram longas; só os posicionais, na ordem) ou levanta Refused."""
+    def apply(self, args: list[str], alias: str | None = None) -> tuple[list[str], list[str]]:
+        """Recebe o argv depois das palavras fixas; devolve (argumentos a executar na ORDEM do cliente, flags curtas viram longas; só os posicionais, na ordem) ou levanta Refused.
+        `alias` é o da sessão: a flag do tipo <alias> só vale com ELE (sem alias para conferir recusa: "não sei quem pede" nunca vira "é você")."""
         out, pos, seen, i, dd, after_dd = [], [], set(), 0, False, 0
         while i < len(args):
             a = args[i]
@@ -178,8 +193,10 @@ class Rule:
                     out.append(name)
                     i += 1
                 else:
-                    if i + 1 >= len(args) or not VAL[f.val](args[i + 1]):
-                        raise Refused(f"{name} sem valor ou com valor fora do formato <{f.val}>")
+                    if i + 1 >= len(args) or not f.ok(args[i + 1]):
+                        raise Refused(f"{name} sem valor ou com valor fora do formato {f.fmt()}")
+                    if f.val == "alias" and args[i + 1] != alias:  # tem o formato de um alias, mas tem que ser o DESTA sessão: o compare-and-swap do bd só guarda se o valor for o dono de verdade
+                        raise Refused(f"{name} tem que ser o alias desta sessão ({(alias or '?')[:60]!r}): só se devolve a PRÓPRIA bead")
                     out += [name, args[i + 1]]
                     i += 2
         if dd and not after_dd:  # `--` sem nada depois não é "forma EXATA": o executável receberia argc=1 argv=[--] (o gate-done é um script, não um cobra que o absorve)
@@ -202,12 +219,20 @@ class Rule:
 
 
 _J = {"--json": F()}
+DISPATCH_LABELS = ("pilot:dispatched", "pilot:dispatching", "story:in-flight")  # o que o Pilot grava ao despachar a bead a um dog: devolvê-la tira estes e só estes
 RULES = [
     Rule("bd", ["show"], [("id", 1, 1)], _J),
     Rule("bd", ["list"], [], {**_J, "--status": F("status", short="-s"), "--assignee": F("word", short="-a"),
                               "--label": F("word", rep=True, short="-l"), "--parent": F("id"), "--limit": F("n", short="-n"),
                               "--id": F("ids")}),
     Rule("bd", ["update"], [("id", 1, 1)], {**_J, "--set-metadata": F("kv", rep=True, req=True)}),
+    # ga-dxszii: o dog do nó DEVOLVE ao mini a bead que não pode construir (ela só roda lá), numa escrita só e guardada pelo próprio bd: --if-assignee = o alias DESTA sessão e --if-status
+    # in_progress (compare-and-swap: sem ler antes, então sem janela), dono vazio, status open, o veto node:never (sem ele o Pilot a manda de volta ao nó a cada varredura) e, se quiser, os rótulos
+    # do despacho. Cada flag tem o valor EXATO; nada mais passa (metadata, outro rótulo, outro status). Só na cidade: o veto node:never é do HQ. Fica DEPOIS da regra de --set-metadata: na recusa
+    # de um pedido torto o motivo daquela vem primeiro e o desta vem junto (decide), com a forma inteira
+    Rule("bd", ["update"], [("id", 1, 1)], {**_J, "--if-assignee": F("alias", req=True), "--if-status": F(lit=("in_progress",), req=True), "--assignee": F(lit=("",), req=True),
+                                           "--status": F(lit=("open",), req=True), "--add-label": F(lit=("node:never",), req=True), "--remove-label": F(lit=DISPATCH_LABELS, rep=True)},
+         city_only=True),
     Rule("bd", ["comment"], [("id", 1, 1), ("text", 1, 50)], {}, owner_lock=True),
     Rule("bd", ["comment"], [("id", 1, 1)], {"--stdin": F(req=True)}, owner_lock=True),
     Rule("bd", ["close"], [("id", 1, 1)], {**_J, "--reason": F("text", short="-r")}, owner_lock=True),
@@ -323,18 +348,23 @@ def decide(cfg: dict, tool: str, argv: list[str], env: dict) -> tuple[Rule, list
     cand = [r for r in RULES if r.tool == tool and list(r.words) == argv[:len(r.words)]]
     if not cand:
         raise Refused(f"comando fora da lista: {tool} {' '.join(a[:20] for a in argv[:2])}")
-    reason = None
+    reasons = []  # (regra, motivo) de cada forma que NÃO serviu
     for r in sorted(cand, key=lambda r: -len(r.words)):
         try:
             args = argv[len(r.words):]
-            out, pos = r.apply(args)
+            out, pos = r.apply(args, alias)
             final = list(r.words) + out
+            if r.city_only and cwd != os.path.realpath(cfg["city"]):
+                raise Refused("esta forma só vale na cidade (sem -C, ou -C .): bead de rig fica de fora")
             if r.words == ("session", "nudge") and not (cfg["nudge_re"] and cfg["nudge_re"].fullmatch(pos[0])):  # pos[0] é o alvo que o gc usa; args[0] podia ser uma flag
                 raise Refused("alvo do nudge fora do nudge_pattern da config (sem a chave na config, nudge não roda)")
             return r, final, cwd, env
         except Refused as e:
-            reason = reason or str(e)
-    raise Refused(f"{tool} {' '.join(argv[:len(cand[0].words)])}: {reason}")
+            reasons.append((r, str(e)))
+    # o motivo da 1ª forma vem primeiro, como sempre; as outras formas que falharam por OUTRO motivo vêm junto, com a forma inteira: quem tentou uma receita incompleta (--status open --assignee '')
+    # lê o que falta e a forma certa, em vez de só o "flag fora da lista" da regra de --set-metadata, que a rejeita na 1ª flag e esconde que existe outra forma (ga-dxszii)
+    others = "".join(f" | ou, em outra forma da lista, {r.label()}: {why}" for r, why in reasons[1:] if why != reasons[0][1])
+    raise Refused(f"{tool} {' '.join(argv[:len(cand[0].words)])}: {reasons[0][1]}{others}")
 
 
 LOG_BAD = CTRL  # o MESMO objeto que o v_line usa: não há duas listas para divergir
@@ -457,7 +487,7 @@ def serve(config: str) -> int:
         child = {"HOME": home, "USER": user, "LOGNAME": user, "LANG": "en_US.UTF-8",
                  "PATH": ":".join(cfg["bin_dirs"] + ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]), "BEADS_ACTOR": alias, **env}
         if rule.owner_lock:  # antes de gravar o `ok`: recusa por dono ou por leitura que falhou não executa nada, e fica no log como `refused`
-            bead = rule.apply(final[len(rule.words):])[1][0]  # o <id> (a 1ª posicional; `bd close --reason x <id>` tem flag antes dele em `final`)
+            bead = rule.apply(final[len(rule.words):], alias)[1][0]  # o <id> (a 1ª posicional; `bd close --reason x <id>` tem flag antes dele em `final`)
             owner_gate(read_bead(exe, cwd, child, bead, cfg["timeout_s"]), bead, alias)
         t0 = time.time()
         rid = hashlib.sha256(json.dumps([tool, argv]).encode()).hexdigest()[:12]  # a linha `ok` e a `done` do mesmo pedido levam o mesmo ts e esta hash: é assim que se pareiam

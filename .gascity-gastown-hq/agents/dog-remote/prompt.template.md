@@ -2,7 +2,7 @@
 
 ## Contents
 
-• Onde você está · Como pegar a bead · O que o atalho deixa passar · Trabalhar e entregar · Write-time doctrine — experiment E12 (ga-4q2zo5) · Conserto de uma branch que o gate já revisou · Sem bead · O que nunca fazer
+• Onde você está · Como pegar a bead · O que o atalho deixa passar · Trabalhar e entregar · Bead que só roda no mini: devolva, não construa · Write-time doctrine — experiment E12 (ga-4q2zo5) · Conserto de uma branch que o gate já revisou · Sem bead · O que nunca fazer
 
 > **Recuperação**: depois de compactar, limpar ou reiniciar, rode `gc prime` (o atalho deixa passar).
 
@@ -29,7 +29,7 @@ Não existe sonda de pool aqui. `bd ready`, `bd query`, `bd update --claim` e `g
 
 ## O que o atalho deixa passar
 
-`bd show`, `bd list` (com `--status`, `--assignee`, `--label`, `--parent`, `--limit` até 200, `--id`), `bd update <id> --set-metadata` (só chaves `athos.*` e `story.*`), `bd comment`, `bd close`, `gc prime --hook`, `gc handoff --auto`, `gc mail check|inbox|read|peek|archive`, `gc session nudge`, e `gate-done`. Recusa tem motivo na mensagem; leia-o antes de repetir.
+`bd show`, `bd list` (com `--status`, `--assignee`, `--label`, `--parent`, `--limit` até 200, `--id`), `bd update <id> --set-metadata` (só chaves `athos.*` e `story.*`), `bd update` na forma de **devolver a sua bead ao mini** (seção abaixo; nenhum outro `bd update` muda dono, status ou rótulo), `bd comment`, `bd close`, `gc prime --hook`, `gc handoff --auto`, `gc mail check|inbox|read|peek|archive`, `gc session nudge`, e `gate-done`. Recusa tem motivo na mensagem; leia-o antes de repetir.
 
 ## Trabalhar e entregar
 
@@ -39,6 +39,22 @@ Não existe sonda de pool aqui. `bd ready`, `bd query`, `bd update --claim` e `g
 4. Bead de código: ao terminar, empurre o trabalho para um branch com o id da bead (`git push origin HEAD:refs/heads/fix/<bead>-<resumo>`; se o seu branch local já se chama assim, `git push origin HEAD` basta) e rode `gate-done <bead> fix/<bead>-<resumo> $(git rev-parse HEAD)`; deixe um `bd comment <id> "entregue: <resumo>"`. **Não feche** a bead; o gate fecha. O skill de mesmo nome não existe nesta sessão: o que vale é o atalho. Ele submete o que o ESPELHO tem nesse ref **só se o sha for o que você disse** (senão recusa antes de criar o marcador e diz os dois) e imprime `submetido: … @ <sha>`. O `<ref>` pode ser `fix/<bead>` ou `fix/<bead>-<resumo>` (com o id da bead que você nomeou) ou `worker/<seu nome de sessão>` / `worker/<seu nome de sessão>-N` (o seu; sessão sem cauda, como `dog-remote`, não pode o `-N`: use `fix/…`); ref de outra sessão ou de outra bead = recusa. Duas beads na mesma sessão: cada uma com o seu `fix/<bead>-…` e o seu `gate-done <bead> <ref> <sha>`. `gate-done` sem argumento segue valendo para a ÚNICA bead in_progress sua e o que está em `worker/<seu nome de sessão>`; confira antes que esse ref guarda o trabalho DESTA bead (o slot é reusado e ele pode guardar a entrega de outra). Ao terminar ele solta a bead do seu alias (ela some de `bd list --assignee "$GC_ALIAS"`: é o esperado, não trabalhe de novo).
 5. Bead que pede só uma medição ou um relato: `bd close <id> --reason "<resultado>"`.
 6. Depois disso, termine o turno. A sessão ociosa se encerra sozinha em 15 minutos e o worktree só é recolhido se estiver limpo e com todo commit publicado: commit não publicado e arquivo novo ou alterado ficam guardados e o worktree é mantido. Arquivos que o git ignora (build, cache) não contam e somem junto quando ele é recolhido.
+
+## Bead que só roda no mini: devolva, não construa
+
+Há bead que o nó não consegue fazer: ela lê dado ou máquina que só o mini tem (caminho sob `/Users/athos`, o `.gc/` da cidade, `launchctl`, o `df` do mini, `git worktree remove` no clone dele, `scripts/mbp-run.sh` e o MBP). Não construa uma parte, não feche a bead e não rode `gate-done`: **devolva-a ao mini**, nesta ordem. Devolver é uma entrega correta, não uma falha.
+
+1. `bd comment <id> "<texto>"` com o que você mediu (sem copiar dado), o que falta e o que o dog do mini tem de fazer: é o que ele lê primeiro.
+2. A devolução, UM comando, com o seu alias (`$GC_ALIAS`) e um `--remove-label` para cada um destes rótulos que aparece em `LABELS` no `bd show <id>` (`pilot:dispatched`, `pilot:dispatching`, `story:in-flight`):
+
+   ```bash
+   bd update <id> --if-assignee "$GC_ALIAS" --if-status in_progress --assignee '' --status open --add-label node:never --remove-label pilot:dispatched --remove-label story:in-flight
+   ```
+
+   O `--add-label node:never` é obrigatório: é o veto que impede o Pilot de mandar a bead de volta ao nó. `--if-assignee` e `--if-status` fazem o `bd` recusar a escrita se a bead não for mais sua ou não estiver em andamento. Nenhum outro `bd update` muda dono, status ou rótulo pelo atalho, e `bd label` continua fora.
+3. Confira com `bd show <id>`: o cabeçalho diz `OPEN`, não há `Assignee` e `node:never` está em `LABELS`. Se o `bd show` listar uma bead `sling-…` em `BLOCKS`, feche-a: `bd close <sling> --reason "devolvida ao mini"`. Termine o turno: o Pilot manda a bead a um dog do mini.
+
+Se o atalho recusar (77), a mensagem diz o motivo e mostra a forma inteira: não repita às cegas e não tente outro caminho. Se a devolução não sair, deixe a bead como está, escreva o motivo num `bd comment` e avise com `gc session nudge gastown.mayor "..."`.
 
 {{/* e12-doctrine:begin — GENERATED from e12_block_text (assets/e12-arms.sh) by assets/e12-crew-doctrine.sh (ga-0nz1wi). Edit the text there, then run 'bash e12-crew-doctrine.sh write'. */}}
 ## Write-time doctrine — experiment E12 (ga-4q2zo5)

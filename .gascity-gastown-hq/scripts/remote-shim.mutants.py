@@ -81,6 +81,20 @@ MUTANTS = [
     ("leitura-no-cwd-errado", "w", '[exe, "show", bead, "--json"], cwd=cwd,', '[exe, "show", bead, "--json"], cwd="/",', r"a leitura de estado é UM bd show"),
     ("leitura-com-stderr-junto", "w", "stderr=subprocess.DEVNULL, ", "stderr=subprocess.STDOUT, ", r"aviso do Dolt no stderr"),
     ("leitura-sem-prazo", "w", "timeout=min(timeout_s, OWNER_READ_S)", "timeout=None", r"bd show que não responde"),
+    # ga-dxszii: devolver a PRÓPRIA bead ao mini (`bd update <id> --if-assignee <alias> --if-status in_progress --assignee '' --status open --add-label node:never [--remove-label …]`). Cada guarda dela,
+    # apagada ou alargada, reprova o caso que a exercita; "alargar" aqui é o jeito de a regra virar `bd label`/`bd update` livre por outra porta (verdict:PASS aprovaria código sem revisão: ga-6auslu)
+    ("devolver-alias-qualquer", "w", 'if f.val == "alias" and args[i + 1] != alias:', "if False:", r"devolver: --if-assignee de OUTRO alias"),
+    ("devolver-rotulo-largo", "w", '"--add-label": F(lit=("node:never",), req=True)', '"--add-label": F("word", req=True)', r"--add-label 'verdict:PASS'"),
+    ("devolver-tira-qualquer-rotulo", "w", '"--remove-label": F(lit=DISPATCH_LABELS, rep=True)', '"--remove-label": F("word", rep=True)', r"--remove-label 'node:never'"),
+    ("devolver-status-qualquer", "w", '"--status": F(lit=("open",), req=True)', '"--status": F("word", req=True)', r"--status closed"),
+    ("devolver-passa-a-bead-adiante", "w", '"--assignee": F(lit=("",), req=True)', '"--assignee": F(lit=("", "gastown.dog-2"), req=True)', r"--assignee 'gastown.dog-2'"),
+    ("devolver-sem-if-status", "w", '"--if-status": F(lit=("in_progress",), req=True)', '"--if-status": F(lit=("in_progress",))', r"devolver: sem --if-status"),
+    ("devolver-reabre-bead-fechada", "w", '"--if-status": F(lit=("in_progress",), req=True)', '"--if-status": F(lit=("in_progress", "open", "closed"), req=True)', r"--if-status open"),
+    ("devolver-sem-veto", "w", '"--add-label": F(lit=("node:never",), req=True)', '"--add-label": F(lit=("node:never",))', r"devolver: sem --add-label"),
+    ("devolver-em-bead-de-rig", "w", 'if r.city_only and cwd != os.path.realpath(cfg["city"]):', "if False:", r"bead de RIG"),
+    ("devolver-aceita-metadata", "w", '"--remove-label": F(lit=DISPATCH_LABELS, rep=True)},', '"--remove-label": F(lit=DISPATCH_LABELS, rep=True), "--set-metadata": F("kv", rep=True)},', r"flag a mais: --set-metadata"),
+    ("devolver-le-a-bead-antes", "w", "city_only=True),", "city_only=True, owner_lock=True),", r"NÃO faz a leitura de estado do bd show"),  # ler e depois escrever deixa uma janela: a guarda é o compare-and-swap do bd
+    ("recusa-so-a-primeira-forma", "w", "for r, why in reasons[1:] if why != reasons[0][1])", "for r, why in reasons[:0] if why != reasons[0][1])", r"devolver: sem --if-assignee"),  # o 1º caso que lê o motivo da 2ª forma (o "falta --if-assignee" só vem junto)
     # ga-2hd02v.1.18: `gate-done <bead> <ref> <sha>`: a regra, o formato do sha e do ref (o executável confere o resto) e a recusa que diz a forma
     ("gate-done-3-args-sem-regra", "w", '    Rule("gate-done", [], [("id", 1, 1), ("ref", 1, 1), ("sha", 1, 1)], hint="gate-done <bead> <ref> <sha>, ou gate-done sem argumento"),\n', "", r"gate-done <bead> <ref> <sha>"),
     ("gate-done-sha-prefixo", "w", '"sha": _fm(r"[0-9a-f]{40}")', '"sha": _fm(r"[0-9a-f]{4,40}")', r"gate-done com sha curto"),
