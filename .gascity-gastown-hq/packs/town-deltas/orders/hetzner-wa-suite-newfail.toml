@@ -1,0 +1,19 @@
+# ga-r4lw72: dá DONO às regressões que o item wa-suite do lastro do nó Hetzner confirma. O wa-suite roda a suíte INTEIRA do WA a cada main novo e, desde esta fatia, grava no nó a lista COMPLETA das falhas que
+# apareceram numa rodada completa e AINDA reprovam na rodada completa seguinte (wa-suite.confirmed). Antes disso o `new_fail` do resumo (cortado em 15) ninguém lia: 24/10 tinha 237 numa rodada, ruído até separar o
+# tropeço da regressão.
+#
+# O QUE FAZ: hetzner-ballast-newfail.py lê ~/gt-remote/ballast/wa-suite.confirmed no nó (ssh) e mantém UMA bead no rig do WA com a lista COMPLETA: abre quando a lista é nova, comenta quando ela muda ou zera, abre outra
+# se o dono fechou a anterior. A bead nasce SEM rota (bug, P2, labels origem:lastro-wa-suite e area:testes): quem triagem decide quem corrige. Ler o nó ou o estado local que falha = exit 3 e NADA é aberto; o nó
+# desligado (falta .gc/hetzner-node.on) = não faz nada, como as outras orders do nó. Estado local: .gc/hetzner-ballast/newfail.json.
+#
+# 30 min: a rodada do wa-suite leva 44 a 80 min e a lista é o estado ATUAL (não um evento), então olhar mais devagar que a rodada não perde nada; cada volta custa um ssh e, se a lista mudou, um bd no rig do WA.
+# timeout 300s: um ssh (até 60 s) + um bd (até 90 s) cabem com folga; o script não empilha com a volta seguinte porque o cooldown conta do fim.
+#
+# Conferir depois de um reload:  gc order show hetzner-wa-suite-newfail      -> Source: .../packs/town-deltas/...
+#                                cat $GC_CITY_PATH/.gc/hetzner-ballast/newfail.json   (a lista que já foi avisada e a bead)
+[order]
+description = "Cada 30 min: a lista COMPLETA das regressões que o wa-suite do lastro (nó Hetzner) confirmou em 2 rodadas seguidas vira UMA bead no rig do WA (abre / comenta quando muda / comenta quando zera); no-op com o nó desligado (ga-r4lw72)"
+trigger = "cooldown"
+interval = "30m"
+timeout = "300s"
+exec = "python3 -I $PACK_DIR/../../scripts/hetzner-ballast-newfail.py"

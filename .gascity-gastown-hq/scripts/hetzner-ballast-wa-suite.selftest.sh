@@ -26,7 +26,7 @@
 #   agenda (g_sched): com o GOVERNO REAL e as colunas papel/núcleos/rss/prazo/cooldown da linha real: com o wa-suite rodando, o hq-selftests ainda começa (núcleos fixos da linha real); e com o hq-selftests JÁ rodando, o wa-suite
 #     começa no tick seguinte (ga-r4lw72: com `auto` o hq levava o orçamento inteiro e o wa-suite, com o cooldown vencido, ficava de fora até ele acabar: 18:47Z a 20:06Z de 24/10).
 # CONTROLE NEGATIVO: cada mutante (um trecho do item ou do registro trocado) TEM que reprovar a bateria.
-# VARIÁVEIS: HBW_ANCHORS_ONLY=1 (só confere que cada âncora de mutante casa 1 vez) · HBW_PY (python do teste; padrão /usr/bin/python3) · HBW_ITEMS_DIR (pasta de itens; um mutante traz também a cópia do registro) · HBW_ONLY=<grupo> (run iso read frozen prep state reg sched; com HBW_MUTANT roda só esse grupo) ·
+# VARIÁVEIS: HBW_ANCHORS_ONLY=1 (só confere que cada âncora de mutante casa 1 vez) · HBW_PY (python do teste; padrão /usr/bin/python3) · HBW_ITEMS_DIR (pasta de itens; um mutante traz também a cópia do registro) · HBW_ONLY=<grupo> (run iso read conf frozen prep state reg sched; com HBW_MUTANT roda só esse grupo) ·
 #   HBW_NO_MUTANTS=1 · HBW_JOBS (mutantes em paralelo; padrão 4)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -304,6 +304,56 @@ g_read() {
   check "read: base VAZIA (a última rodada completa não teve falha) → toda falha de hoje é nova (2 de 2)" "ok 2" "$(sj compare) $(sj new_fail_n)"
 }
 
+# ── g_conf ───────────────────────────────────────────────────────────────────────────────────────────
+jfile() {  # jfile ARQUIVO CAMPO — campo de topo do JSON de estado ('ausente' se o arquivo não existe, 'ilegivel' se não abre)
+  "$PY" -I -c 'import sys, json
+try:
+    v = json.load(open(sys.argv[1]))
+except FileNotFoundError:
+    print("ausente"); sys.exit(0)
+except (OSError, ValueError):
+    print("ilegivel"); sys.exit(0)
+v = v.get(sys.argv[2]) if isinstance(v, dict) else None
+print(v if isinstance(v, str) else json.dumps(v, sort_keys=True))' "$1" "$2"
+}
+jitem() {  # jitem ARQUIVO ID CAMPO — items[ID][CAMPO] do wa-suite.confirmed ('null' se não há)
+  "$PY" -I -c 'import sys, json
+v = json.load(open(sys.argv[1])).get("items", {}).get(sys.argv[2])
+v = v.get(sys.argv[3]) if isinstance(v, dict) else None
+print(v if isinstance(v, str) else json.dumps(v))' "$1" "$2" "$3"
+}
+# REGRESSÃO CONFIRMADA (ga-r4lw72): falha NOVA numa rodada completa que AINDA reprova na rodada completa seguinte. A base anda a cada rodada, então o new_fail de duas rodadas seguidas nunca repete o id: o item
+# guarda os SUSPEITOS de ontem (wa-suite.suspect) e a lista ATUAL de confirmadas (wa-suite.confirmed, completa), com a faixa de pontas em que a falha apareceu.
+g_conf() {
+  local A="tests/a.py::t1" C="tests/c.py::t3" D="tests/d.py::t4" E="tests/e.py::t5" r1 r2 r3 before ids20
+  newrig; runwa; r1=$(tip)
+  check "conf: 1ª rodada (sem base): a ponta da base é gravada, nenhum suspeito e nenhuma confirmada" "$r1 [] ausente" "$(cat "$BH/wa-suite.failed.main" 2>/dev/null) $(jfile "$BH/wa-suite.suspect" ids) $(jfile "$BH/wa-suite.confirmed" items)"
+  newcommit; r2=$(tip); mkout 990 8 "$A" "$C" "$D"; runwa
+  check "conf: 2ª rodada: t3 e t4 são NOVAS → viram suspeitos (de r1 até r2), ainda nenhuma confirmada" "ok 2 0 [\"$C\", \"$D\"] $r1 $r2" "$(sj compare) $(sj suspect_n) $(sj confirmed_n) $(jfile "$BH/wa-suite.suspect" ids) $(jfile "$BH/wa-suite.suspect" from) $(jfile "$BH/wa-suite.suspect" to)"
+  newcommit; r3=$(tip); mkout 990 8 "$A" "$C" "$E"; runwa
+  check "conf: 3ª rodada: t3 (suspeito) AINDA reprova → CONFIRMADA; t4 (suspeito) passou → descartada (tropeço); t5 é suspeito novo" "1 1 1 $C" "$(sj confirmed_n) $(sj confirmed_new_n) $(sj suspect_n) $(sj confirmed.0)"
+  check "conf: a faixa da confirmada: de = r1 (a base de antes), até = r2 (onde apareceu), visto = r3 (onde se confirmou); t4 não está na lista" "$r1 $r2 $r3 null" "$(jitem "$BH/wa-suite.confirmed" "$C" from) $(jitem "$BH/wa-suite.confirmed" "$C" to) $(jitem "$BH/wa-suite.confirmed" "$C" seen) $(jitem "$BH/wa-suite.confirmed" "$D" to)"
+  check "conf: os suspeitos de hoje (t5) são gravados com a faixa r2 → r3" "[\"$E\"] $r2 $r3" "$(jfile "$BH/wa-suite.suspect" ids) $(jfile "$BH/wa-suite.suspect" from) $(jfile "$BH/wa-suite.suspect" to)"
+  # rodada sem lista confiável não mexe em nada (a base também não anda)
+  before="$(cat "$BH/wa-suite.suspect" "$BH/wa-suite.confirmed" "$BH/wa-suite.failed.main")"
+  newcommit; mkout 990 8 "$A" "$C" "$E"; grep -v '^GTN-FAILED' "$W/py.out" > "$W/py.out.x"; mv "$W/py.out.x" "$W/py.out"; runwa
+  check "conf: rodada com comparação indisponível (sem GTN-FAILED) NÃO mexe em suspeitos, confirmadas nem na ponta da base" "indisponivel 1" "$(sj compare) $([ "$before" = "$(cat "$BH/wa-suite.suspect" "$BH/wa-suite.confirmed" "$BH/wa-suite.failed.main")" ] && echo 1 || echo 0)"
+  newcommit; mkout 990 8 "$A" "$C"; runwa
+  check "conf: 4ª rodada boa: a confirmada que segue reprovando FICA (estado, não evento) e o suspeito t5 que passou sai" "1 0 0 []" "$(sj confirmed_n) $(sj confirmed_new_n) $(sj suspect_n) $(jfile "$BH/wa-suite.suspect" ids)"
+  newcommit; mkout 990 8 "$A"; runwa
+  check "conf: quando o teste confirmado passa (corrigido) ele sai da lista" "0 {}" "$(sj confirmed_n) $(jfile "$BH/wa-suite.confirmed" items)"
+  # estado ilegível: não anda, o resumo diz, nada é sobrescrito (nunca "nenhuma confirmada" por falta de leitura)
+  printf 'isto nao e json\n' > "$BH/wa-suite.suspect"; before="$(cat "$BH/wa-suite.confirmed")"
+  newcommit; mkout 990 8 "$A" "$C"; runwa
+  check "conf: arquivo de suspeitos ilegível → rodada normal (rc 0), confirmed_why no resumo, sem confirmed_n, o arquivo NÃO é sobrescrito e as confirmadas ficam como estavam" "0 1 null isto nao e json 1" "$RC $(sj confirmed_why | grep -c ilegível) $(sj confirmed_n) $(cat "$BH/wa-suite.suspect") $([ "$before" = "$(cat "$BH/wa-suite.confirmed")" ] && echo 1 || echo 0)"
+  rm -f "$BH/wa-suite.suspect" "$BH/wa-suite.confirmed"; mkdir "$BH/wa-suite.confirmed"
+  newcommit; mkout 990 8 "$A" "$C"; runwa
+  check "conf: arquivo de confirmadas que é PASTA → ilegível: rc 0, confirmed_why, nada gravado nos suspeitos" "0 1 ausente" "$RC $(sj confirmed_why | grep -c ilegível) $(jfile "$BH/wa-suite.suspect" ids)"
+  # a lista COMPLETA não é cortada em 15 (o resumo corta; o arquivo não)
+  newrig; mkout 1000 0; runwa; newcommit; ids20=$(seq -f 'tests/m.py::t%02g' 1 20); mkout 980 0 $ids20; runwa; newcommit; mkout 980 0 $ids20; runwa
+  check "conf: 20 confirmadas → o resumo traz 15 ids (corte do resumo), confirmed_n diz 20 e o ARQUIVO tem os 20" "20 15 20" "$(sj confirmed_n) $(printf '%s\n' "$OUT" | grep '^BALLAST-SUMMARY: ' | tail -n 1 | "$PY" -I -c 'import sys,json; print(len(json.loads(sys.stdin.read().split(": ", 1)[1])["confirmed"]))') $("$PY" -I -c 'import sys,json; print(len(json.load(open(sys.argv[1]))["items"]))' "$BH/wa-suite.confirmed")"
+}
+
 # ── g_frozen ─────────────────────────────────────────────────────────────────────────────────────────
 g_frozen() {
   newrig; runwa; cp "$BH/wa-suite.failed" "$T/fz.$N"; newcommit; : > "$W/py.waitfrozen"; echo 100 > "$W/jump"; runwa   # o pytest de brinquedo espera o laço gravar o salto (nada de sleep fixo: carga alta atrasava o laço)
@@ -474,7 +524,7 @@ print(v if isinstance(v,str) else json.dumps(v))' "$1"; }
   killtree "$H/"
 }
 
-GRUPOS="run iso read frozen prep state reg sched"
+GRUPOS="run iso read conf frozen prep state reg sched"
 if [ -n "${HBW_MUTANT:-}" ]; then for g in ${HBW_ONLY:-$GRUPOS}; do "g_$g"; done; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
 if [ -n "${HBW_ONLY:-}" ]; then "g_$HBW_ONLY"; echo "── $((n - fails))/$n ok (só g_$HBW_ONLY)"; [ "$fails" = 0 ]; exit $?; fi
 [ -n "${HBW_ANCHORS_ONLY:-}" ] || { for g in $GRUPOS; do "g_$g"; done; }
@@ -550,6 +600,15 @@ hetzner-ballast.items.txt@@reg@@o hq-selftests cai para 1 núcleo (12555 s de se
 hetzner-ballast.items.txt@@reg@@o cooldown do hq-selftests volta a 600 s (espera pura depois da rodada)@@\t4096\t10800\t180\t@@\t4096\t10800\t600\t
 hetzner-ballast.items.txt@@reg@@o cooldown do wa-suite volta a 600 s@@\t5\t13312\t21600\t180\t@@\t5\t13312\t21600\t600\t
 hetzner-ballast.items.txt@@reg@@o cooldown do hq-selftests cai a 0 (um pull ao espelho a cada tick)@@\t4096\t10800\t180\t@@\t4096\t10800\t0\t
+wa-suite.sh@@conf@@todo suspeito vira confirmado (não confere se ainda reprova hoje)@@newly = [i for i in s_ids if i in now_set and i not in items]@@newly = [i for i in s_ids if i not in items]
+wa-suite.sh@@conf@@a confirmada que passou (corrigida) não sai da lista@@items = {k: v for k, v in c_items.items() if k in now_set}@@items = dict(c_items)
+wa-suite.sh@@conf@@os suspeitos de hoje não são gravados (a próxima rodada não confirma nada)@@"to": full, "ids": new})@@"to": full, "ids": []})
+wa-suite.sh@@conf@@a ponta da base não é gravada (a faixa perde o "de")@@staged.append(stage(pm_p, full + "\n"))@@pass
+wa-suite.sh@@conf@@estado ilegível de suspeitos/confirmadas é sobrescrito em vez de recusado@@if "ilegivel" in (s_st, c_st) or not shape_ok:@@if False:
+wa-suite.sh@@conf@@o arquivo de confirmadas é cortado em 15 como o resumo@@conf_out = json.dumps({"v": 1, "main": full, "items": items}, sort_keys=True)@@conf_out = json.dumps({"v": 1, "main": full, "items": dict(sorted(items.items())[:15])}, sort_keys=True)
+wa-suite.sh@@conf@@rodada com comparação indisponível também mexe no estado das confirmadas@@elif compare == "ok":@@elif compare in ("ok", "indisponivel"):
+wa-suite.sh@@conf@@o "até" da faixa é a ponta de hoje e não a do suspeito@@items[i] = {"from": s_from, "to": s_to, "seen": full}@@items[i] = {"from": s_from, "to": full, "seen": full}
+wa-suite.sh@@conf@@o "de" dos suspeitos novos é a ponta de hoje e não a da base@@"from": load_main(pm_p)@@"from": full
 MUT
   "$PY" -I - "$ITEMS" "$REGF" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import os, re, shutil, sys

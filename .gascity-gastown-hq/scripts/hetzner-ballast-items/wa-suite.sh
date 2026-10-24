@@ -3,7 +3,7 @@
 # Roda NO nó, sob o governo (hetzner-ballast.py). É a bateria noturna (hetzner-nightly-tests.sh) repetida a cada merge no main, com os mesmos argumentos do pytest e as mesmas regras de leitura.
 #
 # Contents
-#   O que faz · O root no meio · Veredito · Três estados · Gravação do estado · Pausa e fome de CPU · Limites
+#   O que faz · O root no meio · Veredito · Três estados · Gravação do estado · Regressão confirmada · Pausa e fome de CPU · Limites
 #
 # O QUE FAZ: (1) `hetzner-remote-git.sh pull whatsapp_automation` (falhou = segue com o clone que há e diz pull=falhou: código velho não é código errado) (2) ponta do main = a da última rodada que o item
 #   deu por feita → "sem-novidade" (só com o pull que respondeu; com o pull falho é `pull-falhou`, exit 3: a ponta velha não prova que não há novidade) (3) canário de rede (`gt-iso-run --canary`) ANTES de baixar qualquer coisa (4) `wt-add` numa árvore só dele (ballast-wa; a árvore e a branch worker/ballast-wa saem
@@ -21,6 +21,11 @@
 # GRAVAÇÃO DO ESTADO (lista de reprovadas e ponta): só depois da rodada COMPLETAR, em dois tempos, como o hq-selftests: tudo vai para .tmp, o resumo sai, os arquivos são trocados e a ponta POR ÚLTIMO (é ela
 #   que dá a rodada por feita). Falhou ao gravar → exit 3 com resumo `gravacao-falhou`, nada trocado, a próxima rodada refaz. A ponta anda numa rodada COMPLETA mesmo com a lista não confiável (repetir 3 h
 #   de suíte na mesma ponta não consertaria um plugin quebrado); a LISTA só anda quando confiável.
+# REGRESSÃO CONFIRMADA (ga-r4lw72): o `new_fail` de uma rodada é ruído até separar o tropeço (flaky, ambiente) da regressão. Falha NOVA numa rodada completa de comparação ok que AINDA reprova na rodada completa
+#   seguinte vira CONFIRMADA. O item guarda os SUSPEITOS de ontem (`wa-suite.suspect`: os `new` da última rodada boa, com a ponta de antes e a de depois) e a lista ATUAL de confirmadas (`wa-suite.confirmed`: id →
+#   de/até/visto, COMPLETA, sem o corte de 15 do resumo). Como a base anda a cada rodada, o `new_fail` de duas rodadas seguidas nunca repete o id; compara-se o suspeito de ontem com a lista de hoje. Confirmada fica até o
+#   teste passar (estado, não evento: quem lê não perde nada se olhar menos vezes que a rodada). A faixa: `de` = ponta da rodada que gerou a base (`wa-suite.failed.main`; desconhecida = null), `até` = a ponta da rodada em
+#   que o id apareceu: o commit que quebrou está em (de, até]. Rodada com comparação indisponível não mexe em nada; estado ilegível = não anda e o resumo diz `confirmed_why` (nunca "nenhuma confirmada" por falta de leitura).
 # PAUSA E FOME DE CPU: SIGSTOP (RAM baixa) congela também o relógio de prazo dos testes (pytest-timeout é tempo de parede): o teste em curso estoura ao retomar e vira falha "nova" que não é. Um laço dentro
 #   do item (membro da mesma sessão, então também congela) mede o salto do relógio entre dois sleeps; salto >= 60 s = `frozen_s` e a comparação fica indisponível (laço morto = relógio desconhecido, a mesma resposta). Por isso o prazo por teste é 900 s (WA_SUITE_TEST_TIMEOUT),
 #   o triplo da noturna: em nice 19 + SCHED_IDLE, uma sessão do dia pode tirar a CPU do lastro por minutos (inferido, não medido).
@@ -38,6 +43,7 @@ PERTEST=${WA_SUITE_TEST_TIMEOUT:-900}; case "$PERTEST" in ''|*[!0-9]*|0) PERTEST
 MIN_TOTAL=${WA_SUITE_MIN_TOTAL:-1000}; case "$MIN_TOTAL" in ''|*[!0-9]*|0) MIN_TOTAL=1000 ;; esac
 WATCHS=${WA_SUITE_WATCH_S:-5}; case "$WATCHS" in ''|*[!0-9]*|0) WATCHS=5 ;; esac   # intervalo do laço de relógio (o selftest o encurta)
 LAST="$BH/wa-suite.last"; PREV="$BH/wa-suite.failed"; LEAK="$BH/wa-suite.leak"
+PREVMAIN="$BH/wa-suite.failed.main"; SUSP="$BH/wa-suite.suspect"; CONF="$BH/wa-suite.confirmed"   # regressão confirmada (ga-r4lw72): ponta da base · suspeitos de ontem · lista ATUAL de confirmadas
 export PATH="$HOME/.local/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 GIT_AUTHOR_NAME=gt GIT_AUTHOR_EMAIL=gt@no GIT_COMMITTER_NAME=gt GIT_COMMITTER_EMAIL=gt@no
 bead=""; PYPID=""; WATCH=""; t0=$(date +%s)
 say() { echo "wa-suite: $*" >&2; }
@@ -121,9 +127,10 @@ wait "$PYPID"; prc=$?
 kill -0 "$WATCH" 2> /dev/null || echo -1 > "$RD/frozen"
 stop_watch; PYPID=""
 
-python3 -I - "$RD/pytest.out" "$prc" "$PREV" "$LAST" "$RD/frozen" "${tested:0:9}" "$tested" "$pull" "$(( $(date +%s) - t0 ))" "$CORES" "$MIN_TOTAL" "$LEAK" << 'PY'
+python3 -I - "$RD/pytest.out" "$prc" "$PREV" "$LAST" "$RD/frozen" "${tested:0:9}" "$tested" "$pull" "$(( $(date +%s) - t0 ))" "$CORES" "$MIN_TOTAL" "$LEAK" "$SUSP" "$CONF" "$PREVMAIN" << 'PY'
 import json, os, re, sys
 out_p, prc, prev_p, last_p, frozen_p, short, full, pull, secs_total, workers, min_total, leak_p = sys.argv[1:13]
+susp_p, conf_p, pm_p = sys.argv[13:16]
 prc, min_total = int(prc), int(min_total)
 d = {"result": None, "main": short, "pull": pull, "workers": int(workers), "rc": prc, "secs_total": int(secs_total)}
 
@@ -237,6 +244,51 @@ d["fixed_n"] = fixed if compare == "ok" else None
 if compare == "indisponivel":
     d["why"] = why[:150]
 
+# REGRESSÃO CONFIRMADA (ga-r4lw72): falha NOVA numa rodada completa que AINDA reprova na rodada completa seguinte não é um tropeço de uma rodada só. A base anda a cada rodada, então o `new_fail` de duas
+# rodadas seguidas nunca repete o id (o de ontem já está na base de hoje): o que se compara é o SUSPEITO de ontem (os novos) com a lista de hoje. `confirmed` é o estado ATUAL, não um evento: o id fica até o
+# teste passar, e quem lê (o consumidor no mini) não perde nada se olhar menos vezes que a rodada. Só anda em rodada com comparação ok; estado ilegível = não anda e o resumo diz (nunca "nenhuma confirmada").
+def load_obj(path):
+    # vazio (arquivo ausente) → ("ausente", None); falhou/ilegível (não abre, não é JSON, não é objeto) → ("ilegivel", None): quem chama NÃO sobrescreve o que não conseguiu ler
+    if not os.path.exists(path):
+        return "ausente", None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            v = json.load(f)
+    except (OSError, ValueError, RecursionError):
+        return "ilegivel", None
+    return ("ok", v) if isinstance(v, dict) else ("ilegivel", None)
+def load_main(path):
+    # vazio (sem arquivo) → None; falhou/ilegível → None também: é só o rótulo do "de" da faixa (nada decide por ele) e None sai como desconhecido, nunca como uma ponta
+    try:
+        with open(path, "r", encoding="ascii") as f:
+            v = f.read().strip()
+    except (OSError, ValueError):
+        return None
+    return v if re.fullmatch(r"[0-9a-f]{7,64}", v) else None
+susp_out = conf_out = None   # texto a gravar; None = não mexe no arquivo
+if compare == "primeira":
+    susp_out = json.dumps({"v": 1, "from": None, "to": full, "ids": []})
+elif compare == "ok":
+    s_st, s_v = load_obj(susp_p)
+    c_st, c_v = load_obj(conf_p)
+    s_ids = s_v.get("ids", []) if s_st == "ok" else []
+    c_items = c_v.get("items", {}) if c_st == "ok" else {}
+    shape_ok = isinstance(s_ids, list) and all(isinstance(x, str) for x in s_ids) and isinstance(c_items, dict) and all(isinstance(k, str) and isinstance(v, dict) for k, v in c_items.items())
+    if "ilegivel" in (s_st, c_st) or not shape_ok:
+        d["confirmed_why"] = "o estado das regressões confirmadas (wa-suite.suspect / wa-suite.confirmed) está ilegível: não andou"
+    else:
+        now_set = set(ids)
+        s_from = s_v.get("from") if s_st == "ok" and isinstance(s_v.get("from"), str) else None
+        s_to = s_v.get("to") if s_st == "ok" and isinstance(s_v.get("to"), str) else None
+        items = {k: v for k, v in c_items.items() if k in now_set}   # ainda reprova → fica; passou → corrigida, sai
+        newly = [i for i in s_ids if i in now_set and i not in items]
+        for i in newly:
+            items[i] = {"from": s_from, "to": s_to, "seen": full}
+        conf_out = json.dumps({"v": 1, "main": full, "items": items}, sort_keys=True)
+        susp_out = json.dumps({"v": 1, "from": load_main(pm_p), "to": full, "ids": new})
+        d["confirmed_n"], d["confirmed_new_n"], d["suspect_n"] = len(items), len(newly), len(new)
+        d["confirmed"] = [x[:150] for x in sorted(items)[:15]]
+
 def stage(path, text):
     # falhou (OSError) → levanta: nada foi trocado ainda e o chamador sai com 3; um alvo que é PASTA falha aqui, não só na troca (que viria depois do resumo)
     if os.path.isdir(path):
@@ -248,10 +300,15 @@ staged, err = [], ""
 try:
     if compare in ("ok", "primeira"):
         staged.append(stage(prev_p, "".join(json.dumps(x, ensure_ascii=True) + "\n" for x in ids)))
+        staged.append(stage(pm_p, full + "\n"))   # a ponta DA BASE: o "de" da faixa das regressões confirmadas
+    if susp_out is not None:
+        staged.append(stage(susp_p, susp_out + "\n"))
+    if conf_out is not None:
+        staged.append(stage(conf_p, conf_out + "\n"))
     staged.append(stage(last_p, full + "\n"))   # a ponta é a última da fila: é ela que dá a rodada por feita
 except OSError as e:
     err = "%s: %s" % (type(e).__name__, e)
-    for _p in (prev_p, last_p):
+    for _p in (prev_p, pm_p, susp_p, conf_p, last_p):
         try:
             os.remove(_p + ".tmp")
         except OSError:
