@@ -16,7 +16,7 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-GUARD = os.path.join(HERE, "inflight-reclaim-guard.py")
+GUARD = os.environ.get("MBP_MUTANTS_GUARD") or os.path.join(HERE, "inflight-reclaim-guard.py")   # o selftest aponta para um caminho inexistente para provar o FATAL
 SELFTEST = os.path.join(HERE, "inflight-reclaim-guard.mbp.selftest.sh")
 
 # (nome, trecho antigo, trecho novo)
@@ -68,8 +68,14 @@ MUTANTS = [
 
 
 def main():
-    with open(GUARD, encoding="utf-8") as f:
-        text = f.read()
+    # vazio → o guard sem texto não tem trecho de mutante: o `count` abaixo dá 0 e para com FATAL; falhou/ilegível (arquivo que não abre, pasta que não lista) → FATAL rc 2, nunca "0 mutantes, todos mortos"
+    try:
+        with open(GUARD, encoding="utf-8") as f:
+            text = f.read()
+        siblings = [e for e in os.listdir(HERE) if e != "inflight-reclaim-guard.py"]   # os irmãos (bead_state.py, gc_ledger.py, ...) por link: o guard os importa pelo diretório dele
+    except OSError as exc:
+        print("FATAL: não consegui ler o guard (%s) ou a pasta dos irmãos: %s" % (GUARD, exc))
+        return 2
     killed = 0
     for name, old, new in MUTANTS:
         n = text.count(old)
@@ -78,9 +84,8 @@ def main():
             return 2
         tmp = tempfile.mkdtemp(prefix="irg-mbp-mut.")
         try:
-            for entry in os.listdir(HERE):   # os irmãos (bead_state.py, gc_ledger.py, ...) por link: o guard os importa pelo diretório dele
-                if entry != "inflight-reclaim-guard.py":
-                    os.symlink(os.path.join(HERE, entry), os.path.join(tmp, entry))
+            for entry in siblings:
+                os.symlink(os.path.join(HERE, entry), os.path.join(tmp, entry))
             copy = os.path.join(tmp, "inflight-reclaim-guard.py")
             with open(copy, "w", encoding="utf-8") as f:
                 f.write(text.replace(old, new))
