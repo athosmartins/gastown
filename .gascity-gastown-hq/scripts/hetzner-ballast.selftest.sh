@@ -125,6 +125,12 @@ seed() { bt; }                                          # a 1ª leitura só seme
 good() { adv "${1:-50}" "${2:-0}"; bt; }               # uma leitura com CPU livre (padrão: 50% de carga de sessões)
 lines() { [ -f "$1" ] && wc -l < "$1" | tr -d ' ' || echo 0; }
 pstate() { ps -o stat= -p "$1" 2>/dev/null | cut -c1; }   # S, R, T (parado), vazio = não existe
+rcnow() {  # rcnow CONTEÚDO [ÉPOCA=$NOW] — grava o rc da rodada $RUN com o carimbo no relógio de mentira (o governo mede a idade do rc contra BALLAST_NOW; o relógio do arquivo é o de verdade)
+  printf '%s\n' "$1" > "$H/runs/$RUN/rc"; "$PY" -I -c 'import os, sys; os.utime(sys.argv[1], (int(sys.argv[2]), int(sys.argv[2])))' "$H/runs/$RUN/rc" "${2:-$NOW}"
+}
+orfao() {  # orfao CONTEÚDO_DO_RC [ÉPOCA] — o item 'sm' acabou: rc gravado, o líder sumiu do /proc de mentira e um órfão (7000002) segue na sessão; o grupo REAL do item ainda vive, para o TERM ser visível
+  smitem; rcnow "$1" "${2:-$NOW}"; gone "$PID"; member 7000002 "$PID" 2048
+}
 
 # ── g_reg ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 g_reg() {
@@ -371,6 +377,28 @@ g_reap() {
   check "reap: item que ignora TERM sobrevive ao primeiro golpe" "1" "$(kill -0 -- "-$PID" 2>/dev/null && echo 1 || echo 0)"
   adv 50 0 30; bt; sleep 0.3
   isdead "$PID"; check "reap: 20 s depois do TERM o governo manda KILL no que sobrou" "0" "$?"
+
+  # ÓRFÃOS (ga-r4lw72): o item JÁ gravou o rc e a sessão ainda tem gente. Medido no nó em 24/10: toda rodada completa do hq-selftests ficava 16 a 45 min "rodando" depois do item acabar (órfão do
+  # mbp-proof na sessão), com os núcleos do `auto` no orçamento e o wa-suite sem poder começar. A cauda é sobra: depois da graça o governo manda TERM e fecha a rodada pelo rc do ITEM.
+  orfao 0
+  adv 50 0 100; bt
+  check "reap: item que JÁ gravou o rc e deixou órfão: dentro da graça (100 s de 180) nada é morto e a rodada segue rodando" "0 sm" "$(nkilled) $(jget running.0)"
+  adv 50 0 100; bt
+  check "reap: passada a graça (200 s depois do rc) o órfão leva TERM (motivo orfaos) e a rodada sai do orçamento no mesmo tick" "1 orfaos []" "$(nkilled) $(jget killed.0.why) $(jget running)"
+  isdead "$PID"; check "reap: o grupo do item morreu com o TERM" "0" "$?"
+  gone 7000002; adv 50 0; bt
+  check "reap: quando o órfão sai a rodada fecha pelo rc do ITEM (ok), não por orfaos, e a linha diz que houve órfãos" "ok true" "$(rj why) $(rj orfaos)"
+  check "reap: rodada boa que teve órfão ganha o cooldown do item (300 s), não o de falha (600 s)" "300" "$("$PY" -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["cooldown"]["sm"] - d["last"]["t"])' "$H/state.json")"
+  orfao 3; adv 50 0 200; bt; gone 7000002; adv 50 0; bt
+  check "reap: item que FALHOU (rc 3) e deixou órfão fecha como rc-3: limpar o órfão não apaga a falha, e a falha espera 600 s" "rc-3 true 600" "$(rj why) $(rj orfaos) $("$PY" -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["cooldown"]["sm"] - d["last"]["t"])' "$H/state.json")"
+  smitem; gone "$PID"; member 7000002 "$PID" 2048; adv 50 0 1000; bt
+  check "reap: SEM rc o item pode estar vivo: o órfão NÃO é tocado, por mais velha que seja a rodada" "0 sm" "$(nkilled) $(jget running.0)"
+  orfao x; adv 50 0 500; bt
+  check "reap: rc que não é um inteiro (ilegível) NÃO conta como item terminado: nada é morto" "0 sm" "$(nkilled) $(jget running.0)"
+  orfao 0 1700000000; adv 50 0 500; bt
+  check "reap: rc com carimbo ANTERIOR ao início da rodada (outro relógio) não dá idade: nada é morto" "0 sm" "$(nkilled) $(jget running.0)"
+  orfao 0; EXTRA_ENV="BALLAST_ORPHAN_GRACE_S=30"; adv 50 0 40; bt
+  check "reap: BALLAST_ORPHAN_GRACE_S muda a graça (30 s: o TERM vem 40 s depois do rc)" "1 orfaos" "$(nkilled) $(jget killed.0.why)"
 
   newhome; EXTRA_ENV="BALLAST_KEEP_RUNS=2"; : > "$H/items.tsv"; reg 'q|work|1|1024|3600|0|-|summary.sh'; seed; good 50; good 50; good 50; p=$(started_pid); r=$(started_run)
   for i in 1 2 3 4; do alive "$p" q "$r"; sleep 0.3; gone "$p"; kill -9 -- "-$p" 2>/dev/null; echo 0 > "$H/runs/$r/rc"; adv 50 0; bt; p=$(started_pid); r=$(started_run); done
@@ -629,7 +657,7 @@ RAM crítica não mata na hora@@        if biggest:
             kill_now(cfg, st, biggest, "ram-critica", rec)
 RAM crítica manda TERM (um grupo parado não trata)@@kill_now(cfg, st, biggest, "ram-pausa", rec)@@terminate(cfg, st, biggest, "ram-pausa", rec)
 teto de RSS do item ignorado@@elif _int(cap) and r["rss_kb"] > cap * 1024:@@elif False:
-sem rc vira ok@@why = killed or ("ok" if rc == 0 else@@why = killed or ("ok" if rc in (0, None) else
+sem rc vira ok@@why = (None if orph else killed) or ("ok" if rc == 0 else@@why = (None if orph else killed) or ("ok" if rc in (0, None) else
 resumo que não é objeto vira dado@@    return (v, "") if isinstance(v, dict) else (None, "ilegivel")@@    return (v, "")
 vale a primeira linha de resumo, não a última@@        v = json.loads(lines[-1][len("BALLAST-SUMMARY: "):])@@        v = json.loads(lines[0][len("BALLAST-SUMMARY: "):])
 meta.json sumida vira cooldown 0 (errar para menos recomeça em cima)@@    cool = meta.get("cooldown_s") if meta else None
@@ -746,6 +774,20 @@ send desiste dos membros quando o grupo do líder já não existe@@    except Pr
         return False
     except PermissionError:
         return False
+órfão nunca é limpo (a rodada fica rodando até o último sair)@@    return _int(start) and t >= start and cfg.now - t >= cfg.orphan_grace_s@@    return False
+a graça é ignorada (o órfão leva TERM no tick do rc)@@t >= start and cfg.now - t >= cfg.orphan_grace_s@@t >= start
+BALLAST_ORPHAN_GRACE_S não é lida (graça fixa em 180 s)@@orphan_grace_s=_num(env, "BALLAST_ORPHAN_GRACE_S", 180, int, 0)@@orphan_grace_s=180
+rc que não é inteiro conta como item terminado@@            int(f.read().strip())@@            f.read()
+carimbo de outro relógio vale como idade do rc (sem conferir o início da rodada)@@_int(start) and t >= start and cfg.now - t@@_int(start) and cfg.now - t
+sem rc o item é dado por terminado (qualquer rodada velha perde os órfãos… e o item vivo)@@    except (OSError, ValueError):
+        return False
+    return _int(start)@@    except (OSError, ValueError):
+        return True
+    return _int(start)
+a rodada com órfão sai do orçamento só no tick seguinte (o run não é tirado da lista)@@                terminate(cfg, st, r, "orfaos", rec)
+                del run[r["run"]]@@                terminate(cfg, st, r, "orfaos", rec)
+a rodada limpa de órfãos fecha como orfaos e não pelo rc do item (ganharia o cooldown de falha)@@why = (None if orph else killed) or (@@why = killed or (
+a linha da rodada não diz que houve órfãos@@        row["orfaos"] = True@@        pass
 MUT
   "$PY" -I - "$P" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import re, sys

@@ -14,7 +14,8 @@ O CONTRATO DO NICE
   na coluna `nice`, e é por isso que ele NÃO é carga: carga = user+system+irq+softirq+steal (nice <= 0). O hetzner-capacity.py lê a mesma coluna (CPU em nice > 0 é folga da cidade) — sem isso o
   lastro faria o nó parecer "quente" e a cidade deixaria de mandar bead para ele.
 UM TICK  (exit 0 sempre que "não consegui ler" — vira nota no registro; 3 só se não dá para gravar)
-  1 lê o registro, /proc/stat, /proc/meminfo e a tabela de processos  2 dá fim aos itens que acabaram (results.jsonl)  3 sem a chave `on`: mata o que roda e sai  4 RAM: pausa (SIGSTOP),
+  1 lê o registro, /proc/stat, /proc/meminfo e a tabela de processos  2 dá fim aos itens que acabaram (results.jsonl); sobrevivente na sessão de um item que já gravou o rc (órfão) leva TERM depois
+  de BALLAST_ORPHAN_GRACE_S (180 s) e a rodada fecha pelo rc do item, com `orfaos` na linha  3 sem a chave `on`: mata o que roda e sai  4 RAM: pausa (SIGSTOP),
   retoma (SIGCONT) ou mata o maior  5 CPU livre = núcleos - carga(nice<=0); a conta de leituras livres seguidas anda ou zera  6 começa itens enquanto couberem no orçamento
   (núcleos livres - reserva): `work` primeiro; `filler` só com o que sobrar e é morto quando um `work` vai começar.
 ITENS  (registro TSV, 8 colunas: nome papel núcleos rss_mb prazo_s cooldown_s requires comando)
@@ -95,7 +96,7 @@ def load_config(env):
         ram_resume_mb=_num(env, "BALLAST_RAM_RESUME_MB", 12288, int, 0), ram_kill_mb=_num(env, "BALLAST_RAM_KILL_MB", 7168, int, 0),
         pause_kill_ticks=_num(env, "BALLAST_PAUSE_KILL_TICKS", 5, int, 1), term_grace_s=_num(env, "BALLAST_TERM_GRACE_S", 20, int, 1),
         deadline_slack_s=_num(env, "BALLAST_DEADLINE_SLACK_S", 60, int, 0), fail_cooldown_s=_num(env, "BALLAST_FAIL_COOLDOWN_S", 600, int, 0),
-        keep_runs=_num(env, "BALLAST_KEEP_RUNS", 30, int, 0),
+        keep_runs=_num(env, "BALLAST_KEEP_RUNS", 30, int, 0), orphan_grace_s=_num(env, "BALLAST_ORPHAN_GRACE_S", 180, int, 0),
         launch_prefix=_prefix(prefix, env.get("BALLAST_TEST") == "1"))
 
 
@@ -501,6 +502,21 @@ def read_summary(path):
     return (v, "") if isinstance(v, dict) else (None, "ilegivel")
 
 
+def orphaned(cfg, run, start):
+    """True = a rodada ainda tem gente na sessão MAS o item já terminou: o `rc` do lançamento foi gravado há pelo menos a graça (BALLAST_ORPHAN_GRACE_S). O que sobra depois do rc é órfão (selftest que
+    não limpa, mux do ssh…). Sem isto a rodada fica 'rodando' até o último órfão sair (16 a 45 min nas rodadas do hq-selftests de 24/10) e segura os núcleos dela no orçamento."""
+    # vazio (sem rc: o item ainda roda) → False; falhou/ilegível (rc que não é inteiro, sem permissão, meta sem start, carimbo anterior ao início da rodada = relógio que não é o desta rodada) → False
+    # também: o lado que NÃO mata (a idade do rc só vale se o carimbo é desta rodada)
+    p = os.path.join(cfg.home, "runs", run, "rc")
+    try:
+        with open(p, "r", encoding="ascii") as f:
+            int(f.read().strip())
+        t = int(os.stat(p).st_mtime)
+    except (OSError, ValueError):
+        return False
+    return _int(start) and t >= start and cfg.now - t >= cfg.orphan_grace_s
+
+
 def finalize(cfg, st, run, rec):
     """Encerra uma rodada que não tem mais processo: results.jsonl, cooldown, marca final. rc ilegível/ausente NUNCA vira ok."""
     rundir = os.path.join(cfg.home, "runs", run)
@@ -515,11 +531,15 @@ def finalize(cfg, st, run, rec):
         pass
     killed = st["killed"].pop(run, None)
     st["term"].pop(run, None)
-    why = killed or ("ok" if rc == 0 else ("rc-%d" % rc if rc is not None else "morreu-sem-rc"))
+    # órfãos: o item JÁ tinha gravado o rc e o governo só limpou o que sobrou; o desfecho é o do item (ok / rc-N), nunca "orfaos" (uma rodada boa ganharia o cooldown de falha)
+    orph = killed == "orfaos"
+    why = (None if orph else killed) or ("ok" if rc == 0 else ("rc-%d" % rc if rc is not None else "morreu-sem-rc"))
     summ, summ_why = read_summary(os.path.join(rundir, "log"))
     start = meta.get("start") if meta else None
     row = {"ts": iso(cfg.now), "item": item, "run": run, "role": meta.get("role") if meta else None, "cores": meta.get("cores") if meta else None, "start": start,
            "secs": (cfg.now - start) if isinstance(start, int) else None, "rc": rc, "why": why, "summary": summ, "summary_why": summ_why}
+    if orph:
+        row["orfaos"] = True
     # a linha de resultado vem ANTES da marca: se a marca não grava, o tick seguinte repete a linha (repetida é melhor que perdida)
     append_line(os.path.join(cfg.home, "results.jsonl"), row, 2000000)
     try:
@@ -742,6 +762,9 @@ def do_tick(cfg):
                 del run[r["run"]]
             elif _int(cap) and r["rss_kb"] > cap * 1024:
                 terminate(cfg, st, r, "rss", rec)
+                del run[r["run"]]
+            elif orphaned(cfg, r["run"], start):   # o item acabou (rc gravado) e a sessão ainda tem gente: limpa; sai do orçamento já neste tick
+                terminate(cfg, st, r, "orfaos", rec)
                 del run[r["run"]]
         if mem is not None and on:
             ram_step(cfg, st, run, mem, rec)
