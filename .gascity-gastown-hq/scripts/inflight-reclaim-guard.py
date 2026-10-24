@@ -781,7 +781,7 @@ def _is_ephemeral_pool_assignee(assignee):
 # aqui só há DOIS estados, nunca "morta por falta de sinal":
 #   hold  o engine ainda tem uma sessão desse alias (viva, quieta, dormindo, em quarentena: não sei) → a bead SEGURA, sem reclaim. Segurar não é esquecer: passado o teto sem sair do hold
 #         (RECLAIM_MBP_HOLD_ALERT_SECS, padrão 6 h) sai UM aviso por teto, e quem decide é o Mayor;
-#   gone  o roster NÃO tem sessão alguma desse alias (o engine a fechou) → nada vai acordá-la: o guard a reclama no prazo de sempre (histerese de RECLAIM_TTL) e a marca do nó sai junto. A ordem
+#   gone  o roster NÃO tem sessão alguma desse alias (o engine a fechou) → nada vai acordá-la: o guard a reclama no prazo de sempre (histerese de RECLAIM_TTL) e a marca do nó sai junto, se o `bd assign` do reclaim confirmou que o dono saiu (senão a marca fica; ver o passo 2c do do_reclaim). A ordem
 #         orphan-sweep pode reabri-la antes, sem tirar a marca (inofensiva para o despacho: o `apply` a regrava; ver mbp-wa-node.md).
 # Roster vazio não prova nada (mesma regra do claimant_provably_dead): é hold. Depois de um reclaim (`gone`) a sessão do MBP que reaparecesse não deveria conseguir entregar: o gate-done do Hetzner só
 # entrega a bead in_progress com dono = o alias dele (gate-done-remote.py). O gate-done do MBP é do corte 4 e esta fatia NÃO prova isso para ele.
