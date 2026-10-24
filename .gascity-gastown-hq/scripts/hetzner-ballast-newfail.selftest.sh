@@ -91,8 +91,12 @@ g_all() {
   # (o show da volta acima não existe: a mesma lista nem lê a bead) — a lista MUDA, a bead está aberta → comentário na mesma bead
   mkconf 4; nf
   check "newfail: lista que MUDA com a bead aberta → comentário na MESMA bead (nenhum create novo), com o id novo no corpo" "0 1 1 1 wa-new1" "$RC $(calls 'comment wa-new1 --stdin' bd.calls) $(calls 'create' bd.calls) $(grep -c 'tests/t003.py::t' "$W/bd.stdin.3") $(state bead)"
+  b=$(wc -l < "$W/bd.calls" | tr -d ' '); nf
+  check "newfail: a lista que acabou de ser comentada, de novo → nada (o comentário gravou o estado)" "$b" "$(wc -l < "$W/bd.calls" | tr -d ' ')"
   echo closed > "$W/bd.status"; mkconf 5; nf
   check "newfail: bead FECHADA pelo dono → abre outra (2 creates no total), o estado passa a ter a nova" "0 2 1" "$RC $(calls 'create' bd.calls) $(state bead | grep -c '^wa-new')"
+  : > "$W/bd.calls"; nf
+  check "newfail: bead fechada pelo dono e a MESMA lista → nada (só uma lista DIFERENTE abre outra bead; o doc diz isso)" "0 0" "$RC $(wc -l < "$W/bd.calls" | tr -d ' ')"
   rm -f "$W/bd.status"; mkconf 6; : > "$W/bd.calls"; touch "$W/bd.show.fail"; nf
   check "newfail: bead que NÃO consigo ler (show falha) → rc 3 e nem create nem comment" "3 0 0" "$RC $(calls 'create' bd.calls) $(calls 'comment' bd.calls)"
 
@@ -111,6 +115,16 @@ g_all() {
   check "newfail: bd create sem o id na resposta → rc 3, estado com bead '?' (pode ter sido criada)" "3 ?" "$RC $(state bead)"
   rm -f "$W/bd.create.noid"; : > "$W/bd.calls"; nf
   check "newfail: na volta seguinte NÃO abre outra (a anterior pode existir): rc 3, nenhum create" "3 0" "$RC $(calls 'create' bd.calls)"
+
+  # estado local que NÃO grava (uma PASTA no lugar do .tmp faz o open falhar): o bd JÁ respondeu, então a saída é rc 3 com a frase "NÃO gravei" e o estado antigo intacto, nunca traceback (rc 1)
+  newcity; mkconf 3; mkdir -p "$CITY/.gc/hetzner-ballast/newfail.json.tmp"; nf
+  check "newfail: abriu a bead mas o estado local não grava → rc 3 e 'NÃO gravei' (a próxima volta abriria outra)" "3 1 1" "$RC $(calls 'create' bd.calls) $(printf '%s' "$OUT" | grep -c 'NÃO gravei')"
+  newcity; mkconf 3; nf; mkdir "$CITY/.gc/hetzner-ballast/newfail.json.tmp"; mkconf 4; : > "$W/bd.calls"; nf
+  check "newfail: comentou a lista nova mas o estado local não grava → rc 3, 'NÃO gravei' e o estado antigo fica (n 3)" "3 1 1 3" "$RC $(calls 'comment wa-new1 --stdin' bd.calls) $(printf '%s' "$OUT" | grep -c 'NÃO gravei') $(state n)"
+  newcity; mkconf 2; nf; mkdir "$CITY/.gc/hetzner-ballast/newfail.json.tmp"; echo '{"v": 1, "main": "c", "items": {}}' > "$W/node.confirmed"; : > "$W/bd.calls"; nf
+  check "newfail: comentou 'corrigidas' mas o estado local não grava → rc 3, 'NÃO gravei' e n continua 2" "3 1 1 2" "$RC $(calls 'comment' bd.calls) $(printf '%s' "$OUT" | grep -c 'NÃO gravei') $(state n)"
+  newcity; mkconf 3; mkdir -p "$CITY/.gc/hetzner-ballast/newfail.json.tmp"; touch "$W/bd.create.noid"; nf
+  check "newfail: bd create sem id e a marca '?' não grava → rc 3 e 'NÃO gravei' (a bead pode existir sem marca)" "3 1 ausente" "$RC $(printf '%s' "$OUT" | grep -c 'NÃO gravei') $(state fp)"
 
   newcity; mkconf 237; nf
   check "newfail: 237 confirmadas → o corpo traz os 237 ids (a lista COMPLETA, sem o corte de 15 do resumo)" "237" "$(grep -c '^  tests/t[0-9]*.py::t$' "$W/bd.stdin.1")"
@@ -136,7 +150,11 @@ estado local ilegível vira estado vazio@@        return None, "newfail.json ile
 bd create que falha é tratado como ok@@    if r is None or r.returncode != 0:
         die(3, "bd create falhou@@    if False:
         die(3, "bd create falhou
-bd create sem id não deixa a marca '?'@@        save_state(fp, "?", len(items))@@        pass
+bd create sem id não deixa a marca '?'@@        save_state_or_die(fp, "?", len(items), "bd create respondeu sem o id da bead (ela pode ter sido criada no rig do WA)",@@        print("x", "bd create respondeu sem o id da bead (ela pode ter sido criada no rig do WA)",
+escrita do estado local que falha vira silêncio (rc 0)@@        die(3, "%s, mas NÃO gravei o estado local (%s): %s" % (done, e, next_round))@@        pass
+a criação não grava o estado (a próxima volta abre outra)@@    save_state_or_die(fp, new, len(items), "abri %s" % new, "a próxima volta abriria outra; apague a bead ou grave %s à mão" % STATE)@@    pass
+o comentário da lista nova não grava o estado (repete a cada volta)@@        save_state_or_die(fp, bead, len(items), "comentei a lista nova em %s" % bead, "a próxima volta repete o comentário")@@        pass
+o comentário 'corrigidas' não grava o estado (repete a cada volta)@@            save_state_or_die(fp, bead, 0, "comentei em %s que foram corrigidas" % bead, "a próxima volta repete o comentário")@@            pass
 na volta seguinte à criação sem id abre outra@@    if bead == "?":@@    if False:
 lista que zera não comenta@@        if bead and bead != "?" and last_n:@@        if False:
 MUT

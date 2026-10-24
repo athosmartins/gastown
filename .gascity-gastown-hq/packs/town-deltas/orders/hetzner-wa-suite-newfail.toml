@@ -3,7 +3,7 @@
 # tropeço da regressão.
 #
 # O QUE FAZ: hetzner-ballast-newfail.py lê ~/gt-remote/ballast/wa-suite.confirmed no nó (ssh) e mantém UMA bead no rig do WA com a lista COMPLETA: abre quando a lista é nova, comenta quando ela muda ou zera, abre outra
-# se o dono fechou a anterior. A bead nasce SEM rota (bug, P2, labels origem:lastro-wa-suite e area:testes): quem triagem decide quem corrige. Ler o nó ou o estado local que falha = exit 3 e NADA é aberto; o nó
+# se o dono fechou a anterior E a lista mudou depois (a mesma lista com a bead fechada não reabre nada). A bead nasce SEM rota (bug, P2, labels origem:lastro-wa-suite e area:testes): quem triagem decide quem corrige. Ler o nó ou o estado local que falha = exit 3 e NADA é aberto; o nó
 # desligado (falta .gc/hetzner-node.on) = não faz nada, como as outras orders do nó. Estado local: .gc/hetzner-ballast/newfail.json.
 #
 # 30 min: a rodada do wa-suite leva 44 a 80 min e a lista é o estado ATUAL (não um evento), então olhar mais devagar que a rodada não perde nada; cada volta custa um ssh e, se a lista mudou, um bd no rig do WA.

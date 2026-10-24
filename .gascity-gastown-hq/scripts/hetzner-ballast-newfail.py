@@ -12,11 +12,11 @@ O QUE LÊ
   É o estado ATUAL (o id fica até o teste passar), então olhar menos vezes que a rodada não perde nada.
 O QUE FAZ
   Lista vazia e nenhuma bead nossa aberta → nada. Lista com impressão digital nova → abre a bead (bug, P2, labels origem:lastro-wa-suite e area:testes, SEM rota: quem triagem decide) ou, se a que abrimos
-  segue aberta, a atualiza por comentário com a lista inteira. Bead que o dono fechou → abre outra. Lista que zera → um comentário "corrigidas" (não fecha: quem corrigiu fecha). Mesma lista = nada.
+  segue aberta, a atualiza por comentário com a lista inteira. Bead que o dono fechou e uma lista DIFERENTE depois → abre outra (a MESMA lista com a bead fechada não reabre nada). Lista que zera → um comentário "corrigidas" (não fecha: quem corrigiu fecha). Mesma lista = nada.
   Sem a bandeira do nó (.gc/hetzner-node.on) não faz nada, como as outras orders do nó.
 TRÊS ESTADOS
   Toda leitura é leu / vazio / não consegui ler. Arquivo ausente no nó = "nada confirmado ainda" (rc 0). ssh que não conectou = rc 98. Arquivo que não é o JSON esperado, estado local ilegível ou bead que não consigo
-  ler = rc 3 e NADA é aberto nem comentado: avisar de novo sobre uma bead que já existe duplicaria. Escrita que falha depois do `bd` ter respondido = rc 3 (a próxima volta repete: repetido é melhor que perdido).
+  ler = rc 3 e NADA é aberto nem comentado: avisar de novo sobre uma bead que já existe duplicaria. Escrita do estado local que falha depois do `bd` ter respondido = rc 3 e a frase "NÃO gravei", nunca traceback: num comentário a próxima volta o repete (repetido é melhor que perdido); depois de um create ela abriria OUTRA bead, e por isso a frase manda conferir.
 ESTADO LOCAL
   <cidade>/.gc/hetzner-ballast/newfail.json: {"v": 1, "fp": <impressão digital da última lista avisada>, "bead": <id>, "n": <quantas>}.
 AMBIENTE
@@ -103,6 +103,14 @@ def save_state(fp, bead, n):
     os.replace(tmp, STATE)
 
 
+def save_state_or_die(fp, bead, n, done, next_round):
+    """Grava o estado local DEPOIS de o bd ter respondido. Falhou (disco, pasta no lugar do arquivo) → rc 3 dizendo o que já foi feito (`done`) e o que a próxima volta fará (`next_round`); o estado antigo fica."""
+    try:
+        save_state(fp, bead, n)
+    except OSError as e:
+        die(3, "%s, mas NÃO gravei o estado local (%s): %s" % (done, e, next_round))
+
+
 def fingerprint(items):
     return hashlib.sha256(json.dumps(sorted([k, v.get("from"), v.get("to")] for k, v in items.items()), ensure_ascii=True).encode("utf-8")).hexdigest()[:16]
 
@@ -158,7 +166,8 @@ def create(items, fp):
         bead = None
     if not (isinstance(bead, str) and bead):
         # a bead pode ter sido criada: guardo a impressão digital com bead '?' para a próxima volta NÃO abrir outra, e digo
-        save_state(fp, "?", len(items))
+        save_state_or_die(fp, "?", len(items), "bd create respondeu sem o id da bead (ela pode ter sido criada no rig do WA)",
+                          "sem a marca '?' a próxima volta pode abrir outra: confira o rig do WA e grave %s à mão" % STATE)
         die(3, "bd create respondeu sem o id da bead: ela pode ter sido criada no rig do WA (confira); não abro outra")
     return bead
 
@@ -187,7 +196,7 @@ def main():
                     "Quem corrigiu fecha esta bead.", timeout=60)
             if r is None or r.returncode != 0:
                 die(3, "bd comment falhou em %s: o estado local não mudou; a próxima volta repete" % bead)
-            save_state(fp, bead, 0)
+            save_state_or_die(fp, bead, 0, "comentei em %s que foram corrigidas" % bead, "a próxima volta repete o comentário")
             say("lista vazia: comentei em %s que foram corrigidas" % bead)
         else:
             say("0 regressões confirmadas")
@@ -207,14 +216,11 @@ def main():
         r = run([BD, "-C", WA_RIG, "comment", bead, "--stdin"], inp="A lista de regressões confirmadas MUDOU (agora %d).\n\n%s" % (len(items), render(items)), timeout=90)
         if r is None or r.returncode != 0:
             die(3, "bd comment falhou em %s: o estado local não mudou; a próxima volta repete" % bead)
-        save_state(fp, bead, len(items))
+        save_state_or_die(fp, bead, len(items), "comentei a lista nova em %s" % bead, "a próxima volta repete o comentário")
         say("%d confirmada(s): comentei a lista nova em %s" % (len(items), bead))
         return 0
     new = create(items, fp)
-    try:
-        save_state(fp, new, len(items))
-    except OSError as e:
-        die(3, "abri %s mas NÃO gravei o estado local (%s): a próxima volta abriria outra; apague a bead ou grave %s à mão" % (new, e, STATE))
+    save_state_or_die(fp, new, len(items), "abri %s" % new, "a próxima volta abriria outra; apague a bead ou grave %s à mão" % STATE)
     say("%d confirmada(s): abri %s no rig do WA" % (len(items), new))
     return 0
 
