@@ -303,8 +303,14 @@ eq "S14 once delivered, no new line" "$(nl "$LOG")" 3
 echo "S15: the episode state file is corrupt — it counts as NO episode: no confirmation for free, and no wedge"
 # Every shape carries a known kind and a high count with a later field missing or twisted (the 3rd: only the alarm) —
 # read as they stand, they would confirm the alert on the very first cycle.
-s15() {  # s15 <world> <state content>
+s15() {  # s15 <world> <state content> [unreadable]
   mk_world "$1"; fx checkout -q --detach "$U"; printf '%s\n' "$2" > "$STATE"
+  if [ "${3:-}" = unreadable ]; then
+    # a valid-looking state the guard cannot read (permissions); as root chmod 000 stops nothing, so the case is skipped
+    if [ "$(id -u)" = 0 ]; then echo "  skip: S15 [$2] unreadable — running as root"; return 0; fi
+    chmod 000 "$STATE"
+    if [ -r "$STATE" ]; then bad "S15 fixture: the state file is still readable"; return 0; fi
+  fi
   cycle 1
   eq "S15 [$2] the 1st cycle after the corruption is silent (the count restarts)" "$(nl "$LOG")" 0
   eq "S15 [$2] and notifies nobody" "$(nl "$NOTES")" 0
@@ -315,6 +321,7 @@ s15() {  # s15 <world> <state content>
 s15 s15a 'off-main 99'
 s15 s15b 'off-main 99 abc 0'
 s15 s15c 'off-main 99 1800000000 x'
+s15 s15d 'off-main 99 1800000000 0' unreadable
 
 echo ""
 echo "──────────────────────────────────────────"
