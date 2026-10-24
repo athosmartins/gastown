@@ -249,6 +249,40 @@ calls.clear()
 real.do_reclaim("wa-t1", "t", 0, 30.0, ["story:in-flight", "pilot:dispatched"])
 check("do_reclaim sem unset_metadata não mexe em metadata (as outras beads não mudam)", not [c for c in calls if "--unset-metadata" in c], "chamadas=%r" % calls)
 
+# ── O dono NÃO saiu (bd assign falhou): a marca fica. Sem saber que o dono saiu, tirar a marca deixa a bead aberta, ainda no nome do alias do MBP e sem marca: o guard só olha in_progress (não tenta de novo) e o
+#    `release` só solta quando marca == dono (recusa com rc 12). Três estados: o dono saiu (bd assign rc 0) / o dono não saiu (rc != 0) / não consegui saber (exceção, timeout) — os dois últimos ficam no estado inerte.
+def reclaim_com_assign(modo):
+    """Roda o do_reclaim real com `bd assign` falhando (modo 'rc'), estourando o prazo (modo 'timeout') ou funcionando (modo 'ok'). Devolve as chamadas ao bd."""
+    seen = []
+
+    def _run(cmd, **kw):
+        seen.append(list(cmd))
+        if list(cmd[:2]) == ["bd", "assign"]:
+            if modo == "timeout":
+                raise real.subprocess.TimeoutExpired(cmd, 15)
+            if modo == "rc":
+                return type("RF", (), {"returncode": 1, "stdout": "", "stderr": "bd: assign recusado"})()
+        return R()
+    real.subprocess.run = _run
+    real.do_reclaim("wa-t1", "t", 0, 30.0, ["story:in-flight", "pilot:dispatched"], unset_metadata=(MARK,))
+    return seen
+
+
+def comentario_de_auditoria(seen):
+    return next((c[3] for c in seen if c[:2] == ["bd", "comment"] and len(c) > 3), "")
+
+
+for modo, quem in (("rc", "bd assign devolve rc 1 (o dono NÃO saiu)"), ("timeout", "bd assign estoura o prazo (não sei se o dono saiu)")):
+    seen = reclaim_com_assign(modo)
+    check("do_reclaim, %s: não tira a marca do nó (nenhum --unset-metadata)" % quem, not [c for c in seen if "--unset-metadata" in c], "chamadas=%r" % [c for c in seen if "--unset-metadata" in c])
+    check("do_reclaim, %s: o resto do reclaim segue (status volta a open)" % quem, any(c[:2] == ["bd", "update"] and "open" in c for c in seen), "chamadas=%r" % seen[:4])
+    texto = comentario_de_auditoria(seen)
+    check("do_reclaim, %s: o comentário de auditoria não diz 'assignee unset'" % quem, texto != "" and "assignee unset" not in texto, "comentário=%r" % texto[:160])
+    check("do_reclaim, %s: o comentário diz que o dono não foi solto e que a marca ficou" % quem, "assignee NOT cleared" in texto and "node mark kept: " + MARK in texto, "comentário=%r" % texto[:160])
+seen = reclaim_com_assign("ok")
+check("controle: bd assign rc 0 (o dono saiu) — a marca sai como antes", any(c[:3] == ["bd", "update", "wa-t1"] and "--unset-metadata" in c and MARK in c for c in seen), "chamadas=%r" % seen)
+check("controle: bd assign rc 0 — o comentário segue dizendo 'assignee unset'", "assignee unset" in comentario_de_auditoria(seen) and "NOT cleared" not in comentario_de_auditoria(seen), "comentário=%r" % comentario_de_auditoria(seen)[:160])
+
 # ── O executor de mutantes lê o guard: arquivo que não abre é FATAL rc 2, nunca "0 mutantes, todos mortos".
 runner = os.path.join(os.environ["MBP_HERE"], "inflight-reclaim-guard.mbp.mutants.py")
 r = REAL_RUN([sys.executable, "-I", runner], env=dict(os.environ, MBP_MUTANTS_GUARD="/nonexistent/inflight-reclaim-guard.py"),
