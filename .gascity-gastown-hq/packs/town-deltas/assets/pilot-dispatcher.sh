@@ -15068,13 +15068,6 @@ TASK
           return 1
         fi
         _pilot_wa_node_decide "$STORY_ID" "$STORY_BEAD_CITY" "$_SLING_TARGET" || _RP_NODE_RC=$?
-        # ga-w7qwl1.2.2: o MBP vem DEPOIS do Hetzner (o nó 24/7 não perde a vez) e só na varredura normal: a passada de WA e a só-nó do disk floor soltam a bead por rótulo, mais abaixo, e não passam por aqui.
-        # rc 0: a bead já está com o MBP e a sessão aberta, o mesmo caminho do nó (o braço wa-worker-remote do spawn só loga); rc 2: segura; rc 1 (padrão PILOT_WA_MBP_ROUTE=off): nada muda, o caminho do mini segue.
-        if [ "$_RP_NODE_RC" = 1 ] && [ "${_PILOT_WA_NODE_PASS:-0}" != "1" ] && [ "${_PILOT_NODE_ONLY:-0}" != "1" ]; then
-          local _RP_MBP_RC=0
-          _pilot_mbp_node_decide "$STORY_ID" "$STORY_BEAD_CITY" "$_SLING_TARGET" || _RP_MBP_RC=$?
-          case "$_RP_MBP_RC" in 0) _RP_NODE_RC=0 ;; 2) _RP_NODE_RC=2 ;; esac
-        fi
         if [ "$_RP_NODE_RC" = 0 ]; then
           _SLING_TARGET="wa-worker-remote"
           # ga-2hd02v.9: a bead ficou com o nó — a vaga virtual de wa-worker-N que o dispatch_one marcou não é consumida no mini
@@ -15099,6 +15092,21 @@ TASK
           bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
           DISPATCH_RESULT="disk_floor_node_only"
           return 1
+        fi
+        # ga-w7qwl1.2.2: o MBP vem DEPOIS do Hetzner (o nó 24/7 não perde a vez). Só chega aqui o rc 1 do Hetzner na varredura normal: o rc 2, a passada de WA e a só-nó do disk floor soltaram a bead e saíram acima, e o rc 0
+        # (a bead já é do nó, alvo wa-worker-remote) não precisa dele. rc 0 do MBP: a bead já está com ele e a sessão aberta, o mesmo caminho do nó (o braço wa-worker-remote do spawn só loga); rc 2: segura, solta a claim;
+        # rc 1 (e sempre, com o padrão PILOT_WA_MBP_ROUTE=off): nada muda, o caminho do mini segue. As linhas do gancho do Hetzner acima ficam como estavam (os selftests dele leem uma janela fixa de linhas depois da chamada).
+        if [ "$_RP_NODE_RC" = 1 ]; then
+          local _RP_MBP_RC=0
+          _pilot_mbp_node_decide "$STORY_ID" "$STORY_BEAD_CITY" "$_SLING_TARGET" || _RP_MBP_RC=$?
+          if [ "$_RP_MBP_RC" = 0 ]; then
+            _SLING_TARGET="wa-worker-remote"
+          elif [ "$_RP_MBP_RC" = 2 ]; then
+            bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+            bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+            DISPATCH_RESULT="wa_node_unknown"
+            return 1
+          fi
         fi
         : # pool: leave UNASSIGNED + open so RoutedPoolQuery finds it (claim happens worker-side)
         fi

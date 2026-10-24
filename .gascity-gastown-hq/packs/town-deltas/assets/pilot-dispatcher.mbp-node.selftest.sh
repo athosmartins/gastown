@@ -346,8 +346,8 @@ echo; echo "=== F. a fiação em dispatch_one ==="
 lnof() { grep -nF -- "$1" "$DISPATCHER" | head -n "${2:-1}" | tail -n 1 | cut -d: -f1; }
 eq "o gancho do MBP é chamado em UM lugar de dispatch_one" "$(grep -cF -- '_pilot_mbp_node_decide "$STORY_ID"' "$DISPATCHER")" "1"
 w1=$(lnof '_pilot_wa_node_decide "$STORY_ID" "$STORY_BEAD_CITY" "$_SLING_TARGET"'); m1=$(lnof '_pilot_mbp_node_decide "$STORY_ID" "$STORY_BEAD_CITY" "$_SLING_TARGET"')
-i1=$(awk -v a="${w1:-0}" 'NR>a && index($0,"        if [ \"$_RP_NODE_RC\" = 0 ]; then")==1 {print NR; exit}' "$DISPATCHER")
-{ [ -n "$w1" ] && [ -n "$m1" ] && [ -n "$i1" ] && [ "$w1" -lt "$m1" ] && [ "$m1" -lt "$i1" ]; } && ok "o gancho do MBP vem DEPOIS do do Hetzner e ANTES do tratamento do rc (se o Hetzner levou, ele nem é chamado)" || fail "ordem das chamadas ($w1, $m1, $i1)"
+l1=$(lnof ': # pool: leave UNASSIGNED + open so RoutedPoolQuery')
+{ [ -n "$w1" ] && [ -n "$m1" ] && [ -n "$l1" ] && [ "$w1" -lt "$m1" ] && [ "$m1" -lt "$l1" ]; } && ok "o gancho do MBP vem DEPOIS da chamada do Hetzner (e do tratamento do rc dele, que não muda) e ANTES de deixar a bead sem dono" || fail "ordem das chamadas ($w1, $m1, $l1)"
 ARM="$(awk 'f==0 && $0 ~ /^        local _RP_NODE_RC=0$/ {f=1} f==1 {print} f==1 && $0 ~ /^        : # pool: leave UNASSIGNED/ {exit}' "$DISPATCHER")"
 [ -n "$ARM" ] || fail "a região do gancho do WA não foi achada em $DISPATCHER"
 # armrun <rc do gancho do Hetzner> <rc do gancho do MBP> <_PILOT_WA_NODE_PASS> <_PILOT_NODE_ONLY> → "rc=<rc da região> fell=<0|1> target=<alvo no fim> result=<DISPATCH_RESULT> calls=<ganchos e escritas>"
@@ -460,12 +460,25 @@ mut settle-sem-forma    $S1 'if [ "$_PWR_STATUS" != in_progress ] || [ "$_PWR_MA
 mut settle-chave        $S1 '0 pilot.wa_node_alias || true' '0 pilot.mbp_node_alias || true'
 mut settle-sem-alias    $S1 'case "$_PWR_ALIAS" in wa-worker-remote-mbp-[1-2]) ;; *) return 0 ;; esac' ':'
 mut fia-sem-chamada     - '_pilot_mbp_node_decide "$STORY_ID" "$STORY_BEAD_CITY" "$_SLING_TARGET" || _RP_MBP_RC=$?' ':'
-mut fia-sem-guarda-pass - '[ "${_PILOT_WA_NODE_PASS:-0}" != "1" ] && [ "${_PILOT_NODE_ONLY:-0}" != "1" ]; then
-          local _RP_MBP_RC=0' 'true; then
+mut fia-sempre-chama    - 'if [ "$_RP_NODE_RC" = 1 ]; then
+          local _RP_MBP_RC=0' 'if true; then
           local _RP_MBP_RC=0'
-mut fia-sempre-chama    - 'if [ "$_RP_NODE_RC" = 1 ] && [ "${_PILOT_WA_NODE_PASS:-0}" != "1" ]' 'if [ "${_PILOT_WA_NODE_PASS:-0}" != "1" ]'
-mut fia-rc2-vira-1      - 'case "$_RP_MBP_RC" in 0) _RP_NODE_RC=0 ;; 2) _RP_NODE_RC=2 ;; esac' 'case "$_RP_MBP_RC" in 0) _RP_NODE_RC=0 ;; esac'
-mut fia-rc0-vira-1      - 'case "$_RP_MBP_RC" in 0) _RP_NODE_RC=0 ;; 2) _RP_NODE_RC=2 ;; esac' 'case "$_RP_MBP_RC" in 2) _RP_NODE_RC=2 ;; esac'
+mut fia-rc2-vira-1      - 'elif [ "$_RP_MBP_RC" = 2 ]; then' 'elif false; then'
+mut fia-rc0-vira-1      - 'if [ "$_RP_MBP_RC" = 0 ]; then
+            _SLING_TARGET="wa-worker-remote"' 'if false; then
+            _SLING_TARGET="wa-worker-remote"'
+mut fia-rc2-sem-soltar  - 'elif [ "$_RP_MBP_RC" = 2 ]; then
+            bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true' 'elif [ "$_RP_MBP_RC" = 2 ]; then
+            :'
+mut fia-rc2-despacha    - 'DISPATCH_RESULT="wa_node_unknown"
+            return 1
+          fi
+        fi
+        : # pool' 'DISPATCH_RESULT="wa_node_unknown"
+            :
+          fi
+        fi
+        : # pool'
 
 echo "---"; echo "$PASS/$((PASS+FAIL)) ok"
 [ $FAIL -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($FAIL)"; exit 1; }
