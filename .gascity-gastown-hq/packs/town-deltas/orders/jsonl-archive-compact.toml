@@ -30,6 +30,9 @@
 # selftest S11 fails if the timeout stops covering the script's deadline and the window, or if the
 # interval passes 1h.
 #
+# ga-ft1iv6: on a disk at the floor (the mini lives at 3-4.7GB free) the tail pass used to answer skipped-low-disk forever, so every backup's ~200MB seed pack stayed (1.4GB/day) and the disk stayed at the floor.
+# It now has a tight-disk road ("2a-tight" in the script header): a smaller pass, lean and under a disk/swap watchdog. JAC_TAIL_TIGHT=0 in this order's environment turns it off.
+#
 # Only ONE instance exists (this pack's orders register for the city scope); the script is
 # single-flight anyway.
 #
