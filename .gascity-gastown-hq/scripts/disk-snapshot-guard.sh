@@ -56,7 +56,7 @@ notify_athos() {
 # a private 0700 directory and only the COPIES are hashed and run. This file cannot carry its own sha256, so the pin is the
 # INSTALLER's; the guard's hash handed to the installer is that of root's private copy of this file (round 1 trusts the
 # bytes at the repo path, which root already runs today: the block only moves the anchor).
-DSG_INSTALLER_SHA256="509865570a97683653aaa68f74f975aa1d9a81b0d5c596a86d401ac519f80125"
+DSG_INSTALLER_SHA256="6c3e14e2fe5d5049eb7f7bf351bf5b4e75baf1e01d147032ee2a77a466e15e6d"
 DSG_PROG_DIR="/usr/local/libexec/gascity"
 DSG_MARKER_NAME=".disk-snapshot-guard.bootstrap-ok"
 
@@ -88,9 +88,11 @@ dsg_bootstrap_root() {
   me=$(/usr/bin/id -u 2>/dev/null) || return 0
   if [ -n "$me" ] && [ "$me" != "0" ]; then
     # ganchos de teste: só valem SEM root (como root nenhum DSG_* muda o que roda)
-    root_uid="${DSG_ROOT_UID:-0}"; pfx="${DSG_ROOT_PFX:-}"; LOG="${DSG_LOG:-$LOG}"
+    root_uid="${DSG_ROOT_UID:-0}"; pfx="${DSG_ROOT_PFX:-}"
   fi
   [ "$me" = "$root_uid" ] || return 0
+  # o log de teste só vale depois de confirmado que ESTE processo faz o papel de root: um DSG_LOG solto numa rodada manual sem root não redireciona o log do guard
+  if [ "$me" != "0" ]; then LOG="${DSG_LOG:-$LOG}"; fi
   prog_dir="${pfx}${DSG_PROG_DIR}"
   marker="${prog_dir}/${DSG_MARKER_NAME}"
   # vazio → sem caminho próprio não sei se sou a cópia do root, não ajo; falhou/ilegível → idem
@@ -120,11 +122,15 @@ dsg_bootstrap_root() {
       # vazio → sem a linha RESULTADO não há marcador; falhou (rc ≠ 0) → idem: só "rc 0 + instalado e confirmado" grava o marcador
       out=$(cd "$stage" && /bin/bash "${stage}/${inst}" --no-reload --expect-sha256 "$guard_sha" 2>&1); rc=$?
       printf '%s\n' "$out"
-      log "bootstrap root: instalador rc=${rc}: $(printf '%s\n' "$out" | grep -m1 '^RESULTADO:')"
+      # a linha RECARGA PENDENTE conta: "confirmado no disco" não é "o job carregado já roda a cópia do root"; o ERRO conta: é o motivo quando o instalador recusa (vai no stderr dele)
+      log "bootstrap root: instalador rc=${rc}: $(printf '%s\n' "$out" | grep -E '^(RESULTADO|RECARGA PENDENTE|ERRO):' | tr '\n' ' ')"
       if [ "$rc" = "0" ] && printf '%s\n' "$out" | grep -q '^RESULTADO: instalado e confirmado'; then
+        # o modo do marcador é explícito (0644): com `>` ele herdaria o umask do ambiente, e um 0664/0666 é recusado pelo próprio dsg_root_only
+        # (escrita de grupo/outros) — o instalador rodaria de novo a cada rodada, para sempre
         { printf 'sha256 %s\n' "$guard_sha"; date '+%Y-%m-%d %H:%M:%S'; } > "${marker}.new.$$" 2>/dev/null \
+          && chmod 0644 "${marker}.new.$$" 2>/dev/null \
           && mv -f "${marker}.new.$$" "$marker" 2>/dev/null \
-          || log "bootstrap root: instalou mas não gravei o marcador em ${prog_dir}: a próxima rodada confere de novo"
+          || { log "bootstrap root: instalou mas não gravei o marcador em ${prog_dir}: a próxima rodada confere de novo"; rm -f "${marker}.new.$$" 2>/dev/null; }
       fi
     fi
   else

@@ -422,9 +422,80 @@ c_euid_env() {
   expect_rc 0 "com EUID=0 no ambiente a instalação segue pelos ganchos (o uid vem do id -u)"
 }
 
+# --- --no-reload (ga-xpswpd.2): instala no disco, o job carregado só troca no próximo carregamento ------------------------
+c_no_reload() {
+  echo "== --no-reload: instala no disco, o job carregado fica como estava"
+  new_world; run_inst --no-reload
+  expect_rc 0 "--no-reload instala"
+  expect_out "RESULTADO: instalado e confirmado no disco" "o RESULTADO diz 'no disco'"
+  expect_no_out "O root agora executa" "e não afirma que o root já executa a cópia"
+  expect_out "RECARGA PENDENTE" "e diz que a recarga está pendente"
+  expect_out "pend   o launchd ainda tem a definição antiga" "a conferência marca pend"
+  assert_root_only "$PROG" - "cópia do guard (--no-reload)"
+  if [ "$(plist_val "$PL" ProgramArguments:1)" = "$WANT_ARG1" ]; then ok "--no-reload: o plist no disco já aponta para a cópia do root"; else bad "--no-reload: ProgramArguments[1] = $(plist_val "$PL" ProgramArguments:1)"; fi
+  if lctl_mutated; then bad "--no-reload: o launchctl recebeu bootout/bootstrap" "$(cat "$ST/calls.log")"; else ok "--no-reload: nenhum bootout/bootstrap"; fi
+  if cmp -s "$ST/loaded.args" "$W/loaded.before"; then ok "--no-reload: o job carregado ficou igual"; else bad "--no-reload: o job carregado mudou: $(tr '\n' ' ' < "$ST/loaded.args" 2>/dev/null)"; fi
+  # a conferência SEM --no-reload reprova enquanto o launchd não recarregou (é o estado que --check --no-reload escondia)
+  run_inst --check
+  expect_rc 1 "--check reprova enquanto o job carregado é o velho"
+  expect_out "o launchd carregou outra definição" "e diz que o launchd carregou outra definição"
+  expect_no_out "RESULTADO: seguro" "e não diz seguro"
+  # reinstalar com --no-reload (o plist já aponta para a cópia): continua pendente, sem erro
+  run_inst --no-reload
+  expect_rc 0 "reinstalar com --no-reload não quebra"
+  expect_out "RECARGA PENDENTE" "e a recarga segue pendente"
+}
+c_check_no_reload() {
+  echo "== --check --no-reload é uso errado"
+  # o estado do achado do gate: instalado no disco, job carregado ainda o velho
+  new_world; run_inst --no-reload
+  n_calls=$(wc -l < "$ST/calls.log" | tr -d ' ')
+  run_inst --check --no-reload
+  expect_rc 2 "--check --no-reload é uso errado (rc 2)"
+  expect_no_out "RESULTADO: seguro" "e não diz seguro com o job carregado ainda no velho"
+  expect_out "--no-reload só vale ao instalar" "e diz o motivo"
+  if [ "$(wc -l < "$ST/calls.log" | tr -d ' ')" = "$n_calls" ]; then ok "e nem chega a perguntar ao launchd"; else bad "--check --no-reload chamou o launchctl"; fi
+}
+c_no_reload_other_def() {
+  echo "== --no-reload com o job carregado numa definição que não é a nova nem a anterior"
+  # cada definição abaixo NÃO é "bash + <caminho>/disk-snapshot-guard.sh": pend esconderia isso, então é "?" (rc 3)
+  local i=0
+  while [ "$i" -lt 4 ]; do
+    new_world
+    case "$i" in
+      (0) printf '%s\n' /bin/bash /tmp/outro.sh ;;                              # outro script
+      (1) printf '%s\n' /bin/bash /x/disk-snapshot-guard.sh --x ;;              # um 3º argumento
+      (2) printf '%s\n' /bin/sh /x/disk-snapshot-guard.sh ;;                    # outro interpretador
+      (3) printf '%s\n' /bin/bash ;;                                            # só um argumento
+    esac > "$ST/loaded.args"
+    run_inst --no-reload
+    expect_rc 3 "definição carregada [$(tr '\n' ' ' < "$ST/loaded.args")] vira rc 3, não pendência"
+    expect_no_out "RECARGA PENDENTE" "e não diz que a recarga está pendente"
+    expect_out "nem a definição nova nem a anterior" "e diz que a definição carregada não é conhecida"
+    i=$((i+1))
+  done
+}
+c_no_reload_loaded_new() {
+  echo "== --no-reload com o job já carregado na cópia do root"
+  install_good; run_inst --no-reload
+  expect_rc 0 "reinstalar com --no-reload"
+  expect_out "RESULTADO: instalado e confirmado. O root agora executa" "nada pendente: diz que o root já executa a cópia"
+  expect_no_out "RECARGA PENDENTE" "e não fala em recarga pendente"
+}
+c_no_reload_print_fails() {
+  echo "== --no-reload sem conseguir ler o launchd (terceiro estado)"
+  new_world; rm -f "$ST/loaded.args"; run_inst --no-reload
+  expect_rc 3 "launchctl print falhando vira rc 3, nunca 'confirmado'"
+  expect_no_out "RESULTADO: instalado e confirmado" "e não diz confirmado"
+  expect_no_out "RECARGA PENDENTE" "e não finge uma pendência que não leu"
+}
+
 suite_core() {
   c_happy
   c_euid_env
+  c_check_no_reload
+  c_no_reload
+  c_no_reload_other_def
   c_pin_required
   c_staging_private
   c_not_root
@@ -447,6 +518,8 @@ suite_extra() {
   c_pin
   c_boot_fail
   c_launchd_unreadable
+  c_no_reload_loaded_new
+  c_no_reload_print_fails
 }
 
 # --- mutantes: UMA troca literal por vez, no instalador copiado ---------------------------------------------------
@@ -493,6 +566,10 @@ if [ "$SKIP_MUT" = "0" ]; then
   mutant "launchd-nao-conferido" 'if [ "$LD_ARGS" = "$want_args" ]; then' 'if true; then'
   mutant "sem-checagem-de-root" 'if [ "$MY_UID" != "$ROOT_UID" ]; then' 'if false; then'
   mutant "uid-do-ambiente" 'MY_UID=$(/usr/bin/id -u 2>/dev/null) || MY_UID=""' 'MY_UID="${EUID:-}"'
+  mutant "check-aceita-no-reload" 'if [ "$MODE" = "check" ] && [ "$NO_RELOAD" = "1" ]; then' 'if false; then'
+  mutant "pend-aceita-qualquer-definicao" 'elif [ "$NO_RELOAD" = "1" ] && old_guard_loaded; then' 'elif [ "$NO_RELOAD" = "1" ]; then'
+  mutant "recarga-pendente-calada" 'if [ "$PEND_RELOAD" = "1" ]; then say "RECARGA PENDENTE' 'if false; then say "RECARGA PENDENTE'
+  mutant "resultado-diz-que-ja-executa" 'say "RESULTADO: instalado e confirmado no disco. O root só passa a executar' 'say "RESULTADO: instalado e confirmado. O root agora executa'
 fi
 
 echo

@@ -27,6 +27,9 @@
 #   --no-reload: instala no disco (cópia + plist) SEM bootout/bootstrap. É o modo do próprio guard (ga-xpswpd.2): o job que
 #   roda este instalador não pode ser descarregado no meio da rodada. O job carregado segue com a definição antiga até o
 #   launchd carregar o plist de novo (reboot, ou um bootout+bootstrap); a conferência diz "pend" e o RESULTADO "RECARGA PENDENTE".
+#   "pend" só vale quando o que o launchd carregou é a definição de antes (bash + <algum caminho>/disk-snapshot-guard.sh); qualquer
+#   outra coisa carregada é "?" (rc 3), porque não dá para dizer quando a cópia do root passa a valer. --no-reload SÓ existe para
+#   instalar: com --check é uso errado (rc 2, nada muda), senão "o launchd ainda roda a definição velha" viraria "seguro".
 #   --expect-sha256 <hex>: OBRIGATÓRIO para instalar (sem ele: uso errado, rc 2, nada muda). É o `shasum -a 256
 #   scripts/disk-snapshot-guard.sh` do arquivo revisado: o root lê esse arquivo de uma pasta do athos e só instala o que tem este
 #   hash. A cópia nasce 0700 (só do root) e só vira 0755 depois de o hash dela conferir, para que um arquivo trocado no meio do
@@ -125,7 +128,7 @@ trap cleanup EXIT
 
 usage() {
   say "uso: sudo /bin/bash $0 --expect-sha256 <64 hex> [--no-reload]  (instala; o hash é obrigatório)"
-  say "     /bin/bash $0 --check [--expect-sha256 <64 hex>]  (só lê e confere; sem root o launchd não é lido)"
+  say "     /bin/bash $0 --check [--expect-sha256 <64 hex>]  (só lê e confere; sem root o launchd não é lido; não combina com --no-reload)"
 }
 
 # meta_of <caminho> → M_MODE (os 10 caracteres de `ls -l`) e M_UID numérico; rc 1 se não deu para ler.
@@ -247,6 +250,19 @@ launchd_args() {
   return 0
 }
 
+# old_guard_loaded → rc 0 só se o launchd carregou EXATAMENTE "bash <caminho>/disk-snapshot-guard.sh" (a definição de antes desta
+# instalação, que aponta para o guard do repo). vazio/ilegível/outra forma → rc 1: quem chama NÃO trata como pendência esperada.
+old_guard_loaded() {
+  local a0="" a1="" extra=""
+  # vazio → a0 vazio e o teste abaixo dá rc 1; falhou/ilegível → idem: sem as duas linhas inteiras não afirmo que é a definição velha
+  { IFS= read -r a0; IFS= read -r a1; IFS= read -r extra; } <<< "$LD_ARGS" || true
+  [ "$a0" = "$SHELL_BIN" ] && [ -n "$a1" ] && [ -z "$extra" ] || return 1
+  case "$a1" in
+    (*/"$GUARD_NAME") return 0 ;;
+  esac
+  return 1
+}
+
 # audit_state — confere o estado instalado, só lendo. Imprime uma linha por achado; F_BAD/F_UNK contam.
 # rc 0 tudo certo · 1 algum achado FALHA · 3 nenhuma falha, mas algo não deu para ler.
 audit_state() {
@@ -305,11 +321,14 @@ audit_state() {
     (0)
       if [ "$LD_ARGS" = "$want_args" ]; then
         f_ok "argumentos carregados: $SHELL_BIN $PROG_PATH"
-      elif [ "$NO_RELOAD" = "1" ]; then
-        # --no-reload: o job que roda este instalador não pode ser descarregado no meio da rodada; a definição velha segue
-        # carregada e a nova vale no próximo carregamento (reboot ou bootout+bootstrap). Pendência, não falha.
+      elif [ "$NO_RELOAD" = "1" ] && old_guard_loaded; then
+        # --no-reload (só existe ao instalar): o job que roda este instalador não pode ser descarregado no meio da rodada; a
+        # definição velha segue carregada e a nova vale no próximo carregamento (reboot ou bootout+bootstrap). Pendência, não falha.
         PEND_RELOAD=1
         printf '  pend   o launchd ainda tem a definição antiga carregada (argumentos: %s)\n' "$(printf '%s' "$LD_ARGS" | tr '\n' ' ')"
+      elif [ "$NO_RELOAD" = "1" ]; then
+        # carregado não é a nova NEM a anterior do guard: "pend" esconderia isso. Não sei quando a cópia do root passa a valer.
+        f_unk "o launchd carregou algo que não é nem a definição nova nem a anterior do guard (argumentos: $(printf '%s' "$LD_ARGS" | tr '\n' ' ')): confira com launchctl print"
       else
         f_bad "o launchd carregou outra definição (argumentos: $(printf '%s' "$LD_ARGS" | tr '\n' ' ')): recarregue com bootout + bootstrap"
       fi ;;
@@ -452,11 +471,15 @@ do_install() {
     undo="para desfazer: sudo launchctl bootout system/$LABEL; sudo cp $BACKUP $PLIST_PATH; sudo launchctl bootstrap system $PLIST_PATH"
   fi
   case "$rc" in
-    (0) say "RESULTADO: instalado e confirmado. O root agora executa $PROG_PATH."
-        if [ "$PEND_RELOAD" = "1" ]; then say "RECARGA PENDENTE: o job carregado segue com a definição antiga até o próximo carregamento do launchd."; fi ;;
+    (0) if [ "$PEND_RELOAD" = "1" ]; then
+          say "RESULTADO: instalado e confirmado no disco. O root só passa a executar $PROG_PATH quando o launchd carregar o plist de novo."
+        else
+          say "RESULTADO: instalado e confirmado. O root agora executa $PROG_PATH."
+        fi ;;
     (1) say "RESULTADO: instalado, mas a conferência achou FALHA (acima)." ;;
     (*) say "RESULTADO: instalado, mas algo não deu para confirmar (acima): confira com --check." ;;
   esac
+  if [ "$PEND_RELOAD" = "1" ]; then say "RECARGA PENDENTE: o job carregado segue com a definição antiga até o próximo carregamento do launchd (reboot, ou bootout + bootstrap)."; fi
   if [ -n "$undo" ]; then say "$undo"; fi
   return "$rc"
 }
@@ -479,6 +502,11 @@ if [ -n "$PIN" ]; then
     (*[!0-9a-f]*) die 2 "--expect-sha256 só aceita hexadecimais" ;;
   esac
   [ "${#PIN}" = "64" ] || die 2 "--expect-sha256 pede 64 hexadecimais (sha256), recebi ${#PIN}"
+fi
+# --no-reload só existe para instalar: com --check o "pend" transformaria "o launchd ainda roda a definição velha" (FALHA) em "seguro"
+if [ "$MODE" = "check" ] && [ "$NO_RELOAD" = "1" ]; then
+  usage >&2
+  die 2 "--no-reload só vale ao instalar: com --check ele esconderia que o launchd ainda roda a definição velha. Nada foi alterado"
 fi
 # vazio → instalar sem hash é recusado (o root copia um arquivo de pasta do athos: sem hash não há prova do que entra); falhou → n/a, é teste de string
 if [ "$MODE" = "install" ] && [ -z "$PIN" ]; then

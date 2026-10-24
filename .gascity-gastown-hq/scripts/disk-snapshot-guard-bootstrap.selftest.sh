@@ -9,7 +9,7 @@
 #   dá dentes ao teste: instalador adulterado, ausente ou symlink = NADA instalado e o guard segue (rc 0); sem root = nada, e um
 #   $EUID importado do ambiente não muda o que roda (o uid vem de `id -u`); na rodada 1 o launchctl falso NUNCA recebe
 #   bootout/bootstrap (a rodada não é morta no meio e o job não fica descarregado); a segunda rodada e a rodada da própria
-#   cópia do root não chamam o instalador. Mutantes (8): o mesmo núcleo contra cópias do guard com uma proteção desligada, mais um
+#   cópia do root não chamam o instalador. Mutantes (10): o mesmo núcleo contra cópias do guard com uma proteção desligada, mais um
 #   mutante NULO (nada muda) que tem de SOBREVIVER: sem esse controle limpo, "mutante morto" não prova nada.
 #
 # COMO É HERMÉTICO: sem sudo, sem launchd, sem /usr/local nem /Library reais. Uma "raiz falsa" (DSG_ROOT_PFX) faz o papel de
@@ -160,6 +160,8 @@ core() {
   if [ "$(cat "$ST/loaded.args")" = "$(printf '/bin/bash\n%s' "$REPO/scripts/disk-snapshot-guard.sh")" ]; then ok "rodada 1: o job carregado segue carregado (definição velha até o próximo carregamento)"; else bad "rodada 1: o job carregado mudou ou sumiu"; fi
   expect_out "RECARGA PENDENTE" "rodada 1: a saída diz que a recarga está pendente"
   expect_log "instalador rc=0" "rodada 1: o log registra o rc do instalador"
+  expect_log "RECARGA PENDENTE" "rodada 1: o log registra que a recarga está pendente (confirmado no disco não é o job já rodando a cópia)"
+  expect_log "instalado e confirmado no disco" "rodada 1: o log não diz que o root já executa a cópia"
   if [ -z "$(ls -A "$ROOT/var/tmp")" ]; then ok "rodada 1: a pasta privada de trabalho foi removida"; else bad "rodada 1: sobrou lixo em /var/tmp" "$(ls -A "$ROOT/var/tmp")"; fi
 
   # 2. rodada 2: idempotente — o instalador nem é chamado
@@ -195,6 +197,7 @@ core() {
   new_world; rm -f "$PL"; mkdir -p "$PROG_D"; chmod 0755 "$ROOT/usr/local/libexec" "$PROG_D"; run_guard
   expect_rc 0 "instalador falha: o guard segue (rc 0)"
   [ ! -e "$MARK" ] && ok "instalador falha: sem marcador (a próxima rodada tenta de novo)" || bad "instalador falha: gravou marcador"
+  expect_log "ERRO:" "instalador falha: o log guarda o motivo (a linha ERRO: do instalador), não só o rc"
 
   # 7. sem root: nada. E $EUID importado do ambiente não vira root.
   new_world
@@ -211,6 +214,14 @@ core() {
   # 9. $EUID importado não muda o que roda: com os ganchos o uid vem de `id -u`, e a rodada instala igual
   new_world; run_guard EUID=0
   expect_out "RESULTADO: instalado e confirmado" "EUID=0 no ambiente: o uid vem de id -u, a rodada instala igual"
+
+  # 9b. o umask do ambiente não decide a confiança do marcador: com umask 000 (ou 002, o padrão de muita conta Linux) um marcador criado com `>` nasce 0666/0664, o
+  #     bloco o recusa (escrita de grupo/outros) e o instalador rodaria de novo a cada rodada. O modo é explícito (0644), então a rodada 2 não reinstala.
+  new_world; OLD_UMASK=$(umask); umask 000; run_guard; umask "$OLD_UMASK"
+  expect_out "RESULTADO: instalado e confirmado" "umask 000: a rodada 1 instala"
+  if [ "$(mode_of "$MARK")" = "-rw-r--r--" ]; then ok "umask 000: o marcador nasce -rw-r--r-- (modo explícito, não herdado do umask)"; else bad "umask 000: modo do marcador: $(mode_of "$MARK")"; fi
+  run_guard
+  expect_no_out "instalador do disk-snapshot-guard" "umask 000: a rodada 2 não roda o instalador de novo"
 
   # 10. controle dos alarmes: com o disco BAIXO o guard chega ao rabo real e cada alarme dispara. Sem isto, "nenhuma violação" nos outros casos não provaria que os stubs
   #     enxergam o rabo. A violação vai para um arquivo à parte e não suja a checagem de hermeticidade do núcleo.
@@ -259,6 +270,16 @@ mutate copia-do-root-roda-o-instalador '[ "$self_dir" = "$prog_dir" ] && return 
 mutate instalador-symlink 'if [ -L "${self_dir}/${inst}" ] || [ ! -f "${self_dir}/${inst}" ]; then' 'if [ ! -f "${self_dir}/${inst}" ]; then'
 mutate marcador-sempre 'if [ "$rc" = "0" ] && printf' 'if true || printf'
 mutate marcador-gravavel-por-outros '[ "${mode:5:1}" != "w" ] && [ "${mode:8:1}" != "w" ]' 'true'
+mutate marcador-herda-o-umask '&& chmod 0644 "${marker}.new.$$" 2>/dev/null' '&& true'
+mutate log-sem-recarga-nem-erro "grep -E '^(RESULTADO|RECARGA PENDENTE|ERRO):'" "grep -m1 '^RESULTADO:'"
+
+# --- caso estático: o log de teste (DSG_LOG) só vale DEPOIS de confirmado que este processo faz o papel de root. Uma rodada manual sem root com um DSG_LOG solto
+#     não pode redirecionar o log do guard; isso não dá para ver rodando (o rabo real do guard escreveria no log verdadeiro da cidade), então a ordem é conferida no texto.
+# vazio → os números ficam vazios e o caso reprova; falhou/ilegível → idem: sem as linhas não provo a ordem
+L_ROOTCHK=$(grep -n -F '[ "$me" = "$root_uid" ] || return 0' "$GUARD" | head -n 1 | cut -d: -f1)
+L_LOGHOOK=$(grep -n -F 'LOG="${DSG_LOG:-$LOG}"' "$GUARD" | head -n 1 | cut -d: -f1)
+N_LOGHOOK=$(grep -c -F 'LOG="${DSG_LOG:-$LOG}"' "$GUARD")
+if [ -n "$L_ROOTCHK" ] && [ -n "$L_LOGHOOK" ] && [ "$N_LOGHOOK" = "1" ] && [ "$L_ROOTCHK" -lt "$L_LOGHOOK" ]; then ok "estático: DSG_LOG só é lido depois da checagem de root (linha $L_ROOTCHK → $L_LOGHOOK)"; else bad "estático: DSG_LOG é lido antes de confirmar o papel de root (root='$L_ROOTCHK' log='$L_LOGHOOK' ocorrências='$N_LOGHOOK')"; fi
 
 # --- caso estático: o hash fixado no commit é o do instalador deste commit (travessia: editar o instalador exige atualizar o hash) ---
 PINNED=$(sed -n 's/^DSG_INSTALLER_SHA256="\([0-9a-f]*\)".*/\1/p' "$GUARD" | head -n 1)
