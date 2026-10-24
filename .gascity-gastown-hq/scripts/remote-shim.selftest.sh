@@ -272,7 +272,7 @@ FORMA="bd [-C .] update <id> [--json] --if-assignee <alias> --if-status in_progr
 rel_denied "a receita SEM a guarda (--status open --assignee '') não é aceita, e a recusa mostra a forma inteira" "$FORMA" "${RT[@]}" "${RO[@]}"
 rel_denied "  a mesma recusa ainda diz o que a forma de --set-metadata achou" "flag fora da lista: '--status'" "${RT[@]}" "${RO[@]}"
 allowed "controle: bd update --set-metadata segue valendo ao lado da forma nova" bd update ga-r1 --set-metadata story.a=b
-denied "controle: bd update --status closed segue recusado (a forma nova é a única com --status)" "flag fora da lista" bd update ga-r1 --status closed
+denied "controle: bd update --status closed segue recusado (a forma nova é o único bd update com --status)" "flag fora da lista" bd update ga-r1 --status closed
 
 echo "== protocolo, identidade e config"
 badreq "pedido vazio" "sem comando" ""

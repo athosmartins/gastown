@@ -81,8 +81,8 @@ MUTANTS = [
     ("leitura-no-cwd-errado", "w", '[exe, "show", bead, "--json"], cwd=cwd,', '[exe, "show", bead, "--json"], cwd="/",', r"a leitura de estado é UM bd show"),
     ("leitura-com-stderr-junto", "w", "stderr=subprocess.DEVNULL, ", "stderr=subprocess.STDOUT, ", r"aviso do Dolt no stderr"),
     ("leitura-sem-prazo", "w", "timeout=min(timeout_s, OWNER_READ_S)", "timeout=None", r"bd show que não responde"),
-    # ga-dxszii: devolver a PRÓPRIA bead ao mini (`bd update <id> --if-assignee <alias> --if-status in_progress --assignee '' --status open --add-label node:never [--remove-label …]`). Cada guarda dela,
-    # apagada ou alargada, reprova o caso que a exercita; "alargar" aqui é o jeito de a regra virar `bd label`/`bd update` livre por outra porta (verdict:PASS aprovaria código sem revisão: ga-6auslu)
+    # ga-dxszii: devolver a PRÓPRIA bead ao mini (`bd update <id> --if-assignee <alias> --if-status in_progress --assignee '' --status open --add-label node:never [--remove-label …]`). Cada mutante abaixo,
+    # apagando ou alargando UMA guarda dela, reprova o caso que a exercita (nem toda guarda tem mutante: o `req` de --if-assignee, --assignee e --status, o formato do <alias> e o `rep` do --remove-label só têm os casos do selftest); "alargar" aqui é o jeito de a regra virar `bd label`/`bd update` livre por outra porta (verdict:PASS aprovaria código sem revisão: ga-6auslu)
     ("devolver-alias-qualquer", "w", 'if f.val == "alias" and args[i + 1] != alias:', "if False:", r"devolver: --if-assignee de OUTRO alias"),
     ("devolver-rotulo-largo", "w", '"--add-label": F(lit=("node:never",), req=True)', '"--add-label": F("word", req=True)', r"--add-label 'verdict:PASS'"),
     ("devolver-tira-qualquer-rotulo", "w", '"--remove-label": F(lit=DISPATCH_LABELS, rep=True)', '"--remove-label": F("word", rep=True)', r"--remove-label 'node:never'"),
