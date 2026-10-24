@@ -378,8 +378,8 @@ g_reap() {
   adv 50 0 30; bt; sleep 0.3
   isdead "$PID"; check "reap: 20 s depois do TERM o governo manda KILL no que sobrou" "0" "$?"
 
-  # ÓRFÃOS (ga-r4lw72): o item JÁ gravou o rc e a sessão ainda tem gente. Medido no nó em 24/10: toda rodada completa do hq-selftests ficava 16 a 45 min "rodando" depois do item acabar (órfão do
-  # mbp-proof na sessão), com os núcleos do `auto` no orçamento e o wa-suite sem poder começar. A cauda é sobra: depois da graça o governo manda TERM e fecha a rodada pelo rc do ITEM.
+  # ÓRFÃOS (ga-r4lw72): o item JÁ gravou o rc e a sessão ainda tem gente. Medido no nó em 24/10: toda rodada completa do hq-selftests ficava 16 a 45 min "rodando" depois do item acabar (visto ao vivo:
+  # processos do mbp-proof.selftest.sh na sessão; NÃO provado que sejam eles a segurar a cauda), com os núcleos do `auto` contando no orçamento (leitura do running_cores) e o wa-suite sem poder começar. A cauda é sobra: depois da graça o governo manda TERM e fecha a rodada pelo rc do ITEM.
   orfao 0
   adv 50 0 100; bt
   check "reap: item que JÁ gravou o rc e deixou órfão: dentro da graça (100 s de 180) nada é morto e a rodada segue rodando" "0 sm" "$(nkilled) $(jget running.0)"
