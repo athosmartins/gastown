@@ -189,6 +189,12 @@ w.run(36)   # mais 6 h (13 h no total)
 check("T5: o segundo aviso só vem um teto depois", len(w.mbp_alerts()) == 2, "avisos=%d" % len(w.mbp_alerts()))
 one_owner(w, "T5", ALIAS)
 
+# ── O Mayor soltou a bead à mão (`mbp-node-dispatch.sh release`: sem dono e sem marca, ainda in_progress): o guard a reclama no prazo de sempre, não fica presa.
+w = World(alias="", mark=False, session=None, mbp_alive=False)
+w.run(8)
+check("bead solta à mão (sem dono, in_progress): o guard a reclama uma vez, no prazo", len(w.reclaims) == 1, "reclaims=%d" % len(w.reclaims))
+one_owner(w, "bead solta à mão", MINI)
+
 # ── Roster vazio não prova que a sessão sumiu (a lista veio sem nada, o que também acontece com o engine subindo): segura, como o claimant_provably_dead.
 w = World(session=None, others=False)
 w.run(18)
