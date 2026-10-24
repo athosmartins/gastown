@@ -775,12 +775,14 @@ def _is_ephemeral_pool_assignee(assignee):
 
 
 # ga-w7qwl1.2.3 (corte 3 do MBP): a bead cujo dono é um alias do MBP (wa-worker-remote-mbp-1..9, o que `mbp-node-dispatch.sh apply` escreve; o `release` aceita o mesmo 1..9).
-# Num notebook os dois sinais de vida que o guard lê mentem sem a sessão ter morrido: tampa fechada ou wifi trocando de rede (o `is-running` sai com erro, o engine o lê como "parou" e o roster
-# mostra asleep; `get-last-activity` e o peek também falham), o Athos de volta com a árvore rebaixada quieta por uma hora (last_active velho com o roster active). Tratada como a sessão de um
-# servidor, a bead era reclamada no mini com a sessão do MBP ainda dona dela (dois construtores quando a tampa abre). Por isso aqui só há DOIS estados, nunca "morta por falta de sinal":
+# Num notebook os dois sinais de vida que o guard lê mentem sem a sessão ter morrido: tampa fechada ou wifi trocando de rede (o `is-running` sai com erro; o engine o lê como "parou" — INFERIDO, nunca
+# observado, ponto em aberto 5 do gc-session-ssh.md — e o roster pode mostrar asleep; `get-last-activity` e o peek também falham), o Athos de volta com a árvore rebaixada quieta por uma hora
+# (last_active velho com o roster active). Tratada como a sessão de um servidor, a bead era reclamada no mini com a sessão do MBP ainda dona dela (dois construtores quando a tampa abre). Por isso
+# aqui só há DOIS estados, nunca "morta por falta de sinal":
 #   hold  o engine ainda tem uma sessão desse alias (viva, quieta, dormindo, em quarentena: não sei) → a bead SEGURA, sem reclaim. Segurar não é esquecer: passado o teto sem sair do hold
 #         (RECLAIM_MBP_HOLD_ALERT_SECS, padrão 6 h) sai UM aviso por teto, e quem decide é o Mayor;
-#   gone  o roster NÃO tem sessão alguma desse alias (o engine a fechou) → nada vai acordá-la: a bead segue o reclaim de sempre (histerese de RECLAIM_TTL) e a marca do nó sai junto.
+#   gone  o roster NÃO tem sessão alguma desse alias (o engine a fechou) → nada vai acordá-la: o guard a reclama no prazo de sempre (histerese de RECLAIM_TTL) e a marca do nó sai junto. A ordem
+#         orphan-sweep pode reabri-la antes, sem tirar a marca (inofensiva para o despacho: o `apply` a regrava; ver mbp-wa-node.md).
 # Roster vazio não prova nada (mesma regra do claimant_provably_dead): é hold. Depois de um reclaim (`gone`) a sessão do MBP que reaparecesse não deveria conseguir entregar: o gate-done do Hetzner só
 # entrega a bead in_progress com dono = o alias dele (gate-done-remote.py). O gate-done do MBP é do corte 4 e esta fatia NÃO prova isso para ele.
 MBP_NODE_ALIAS_RE = re.compile(r"^wa-worker-remote-mbp-[1-9]$")
@@ -3441,8 +3443,9 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
         print(f"[INFLIGHT-RECLAIM] warn: clear assignee {bead_id}: {exc}", flush=True)
         # Non-fatal: Pilot can still re-dispatch without assignee being empty
 
-    # 2c. ga-w7qwl1.2.3: marcas de nó que seguem o dono (pilot.wa_node_alias do MBP). Depois do passo 2b de propósito: com o dono ainda no lugar a marca é o que prova que a bead é do nó.
-    #     Melhor esforço, como o 2b: o bd que falha aqui só deixa a marca velha (o pior caso de antes desta fatia), e o `bd update --unset-metadata` repetido é inofensivo.
+    # 2c. ga-w7qwl1.2.3: marcas de nó que seguem o dono (pilot.wa_node_alias do MBP). Depois do passo 2b de propósito: se o processo morrer entre os dois sobra só a marca velha (inofensiva para o
+    #     despacho); na ordem inversa sobraria um dono sem marca, que o `release` e os ganchos de nó leem como bead que não é do nó. Melhor esforço, como o 2b: o bd que falha aqui só deixa a marca
+    #     velha (o estado de antes desta fatia), e o `bd update --unset-metadata` repetido é inofensivo.
     for _mk in (unset_metadata or ()):
         try:
             r = subprocess.run(
