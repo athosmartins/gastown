@@ -51,6 +51,7 @@ else:
 PYG
   printf '#!/bin/bash\necho item hq\n' > "$R/scripts/hetzner-ballast-items/hq-selftests.sh"; printf '#!/bin/bash\necho item queima\n' > "$R/scripts/hetzner-ballast-items/queima.sh"
   printf '# registro\nhq-selftests\twork\tauto\t4096\t10800\t600\t-\thq-selftests.sh\n' > "$R/scripts/hetzner-ballast.items.txt"
+  printf '# plugin de brinquedo\n' > "$R/scripts/gtn_stable_ids.py"   # o install leva o plugin do pytest (item wa-suite, ga-2hd02v.8) para ~/gt-remote/bin/
   git -C "$R" init -q && git -C "$R" add -A && git -C "$R" commit -q -m base
   : > "$R/.gc/hetzner-node.on"; : > "$T/crontab$N"; rm -f "$T/ssh.fail" "$T/ssh.fail.stop" "$T/ssh.fail.status" "$T/ssh.corrupt"
   # crontab de mentira: lê/grava $T/crontab<N>. Sem crontab (arquivo vazio) o -l diz "no crontab for runner" (rc 1, o vazio de verdade); com $T/crontab<N>.readfail o -l falha de outro jeito
@@ -92,6 +93,11 @@ g_install() {
   check "install: sem a bandeira do nó (.gc/hetzner-node.on) → rc 99, nada enviado" "99 0" "$RC $(wc -l < "$T/ssh.calls" | tr -d ' ')"
   newenv; echo '# mexido' >> "$R/scripts/hetzner-ballast.py"; ctl install
   check "install: arquivo do lastro com mudança NÃO commitada → rc 3 (sobe o que está no git), nada enviado" "3 0" "$RC $(wc -l < "$T/ssh.calls" | tr -d ' ')"
+  newenv; echo '# mexido' >> "$R/scripts/gtn_stable_ids.py"; ctl install
+  check "install: plugin do pytest com mudança NÃO commitada → rc 3, nada enviado (ele roda dentro do isolamento: sobe o que está no git)" "3 0" "$RC $(wc -l < "$T/ssh.calls" | tr -d ' ')"
+  # o arquivo é removido E a remoção é commitada: com a árvore LIMPA a checagem de "mudança não commitada" não responde, e só a de "faltam arquivos do lastro" pode dar este rc 3 (apagar sem commitar caía na checagem de sujeira e o mutante da guarda passava)
+  newenv; git -C "$R" rm -q -f scripts/gtn_stable_ids.py && git -C "$R" commit -q -m "sem plugin"; ctl install
+  check "install: sem o plugin do pytest na árvore (removido e commitado: árvore limpa) → rc 3 'faltam arquivos do lastro' citando o plugin, nada enviado" "3 1 1 0" "$RC $(printf '%s\n' "$OUT" | grep -c 'faltam arquivos do lastro') $(printf '%s\n' "$OUT" | grep -c 'gtn_stable_ids.py') $(wc -l < "$T/ssh.calls" | tr -d ' ')"
   newenv; rm -rf "$R/.git"; ctl install
   check "install: git ilegível (fora de um repo) → rc 3, nada enviado (não sei se está commitado: nunca 'limpo')" "3 0" "$RC $(wc -l < "$T/ssh.calls" | tr -d ' ')"
   newenv; echo '# mexido' >> "$R/scripts/hetzner-ballast.py"; ctl install --allow-dirty
@@ -101,6 +107,7 @@ g_install() {
   check "install: rc 0" "0" "$RC"
   check "install: governo no nó em ~/gt-remote/bin/hetzner-ballast.py, executável" "1" "$([ -x "$NODE/gt-remote/bin/hetzner-ballast.py" ] && echo 1 || echo 0)"
   check "install: itens em ~/gt-remote/ballast/items/ (hq-selftests.sh e queima.sh) e o registro em items.tsv" "1 1 1" "$([ -x "$NODE/gt-remote/ballast/items/hq-selftests.sh" ] && echo 1 || echo 0) $([ -x "$NODE/gt-remote/ballast/items/queima.sh" ] && echo 1 || echo 0) $([ -s "$NODE/gt-remote/ballast/items.tsv" ] && echo 1 || echo 0)"
+  check "install: o plugin do pytest chega em ~/gt-remote/bin/gtn_stable_ids.py (o gt-iso-run fixa PYTHONPATH lá), igual ao do git, e o sha256 que o nó conferiu fica no installed.json" "0 $(sha "$R/scripts/gtn_stable_ids.py")" "$(diff -q "$R/scripts/gtn_stable_ids.py" "$NODE/gt-remote/bin/gtn_stable_ids.py" > /dev/null 2>&1; echo $?) $("$PY" -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["files"].get("gtn_stable_ids.py"))' "$NODE/gt-remote/ballast/installed.json")"
   check "install: o conteúdo que chegou é o do git (diff vazio)" "0" "$(diff -q "$R/scripts/hetzner-ballast.py" "$NODE/gt-remote/bin/hetzner-ballast.py" > /dev/null 2>&1; echo $?)"
   check "install: instalado.json guarda o commit (HEAD), o sha256 do governo que o nó conferiu e dirty false" "$(git -C "$R" rev-parse HEAD) $(sha "$R/scripts/hetzner-ballast.py") False" "$("$PY" -I -c 'import json, sys; d = json.load(open(sys.argv[1])); print(d["head"], d["files"]["hetzner-ballast.py"], d["dirty"])' "$NODE/gt-remote/ballast/installed.json")"
   check "install: UMA linha marcada na crontab, a cada minuto, com flock e sem saída no stdout" "1 1 1" "$(cron_lines) $(grep -c '^\* \* \* \* \* ' "$T/crontab$N") $(grep -c 'flock -n' "$T/crontab$N")"
@@ -269,6 +276,8 @@ status ignora o rc do ssh que caiu no meio@@[ "$rc" -eq 0 ] || die 3 "o comando 
 status ignora o governo que não leu os processos@@    if "running" in st and st["running"] is None:
         bad = 1@@    if "running" in st and st["running"] is None:
         bad = 0
+o plugin do pytest não sobe com o resto@@ "$PLUG|\$HOME/gt-remote/bin/gtn_stable_ids.py|644")@@)
+o install não exige o plugin do pytest na árvore@@ && [ -r "$SELF/$PLUG" ] || die 3@@ || die 3
 ssh fora no install não vira 98@@    [ "$rc" -ne 255 ] || die 98 "ssh não conectou ($NODE): nada foi instalado"@@    true
 o ssh não leva ServerAlive (conexão que morre no meio pendura)@@ -o ServerAliveInterval=15 -o ServerAliveCountMax=3)@@)
 ligar sem nada instalado não avisa@@[ "$out" != "instalado=0" ] ||@@true ||

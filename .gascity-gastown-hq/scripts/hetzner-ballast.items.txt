@@ -7,11 +7,13 @@
 #   o termina 60 s depois) · cooldown_s (espera entre rodadas; falha espera no mínimo 600 s) · requires (`-` ou lista de path:/exec:/cmd:/flag:/noflag:, todos verdadeiros; predicado desconhecido = item inerte) ·
 #   comando (relativo = a partir de ~/gt-remote/ballast/items/). Detalhes em scripts/hetzner-ballast.py e docs/runbooks/hetzner-ballast.md.
 #
-# ITENS DE HOJE: hq-selftests roda os *.selftest.sh do hq contra o origin/main do espelho do nó (acha vermelho antes do gate). queima é o último recurso — CPU pura quando não há trabalho útil — e nasce
-#   DESLIGADO (flag burn.on; hetzner-ballast.sh burn on).
-# O QUE FALTA (cada um entra aqui quando o dono entregar um comando que roda sozinho no nó, só com código e dado público que já está lá): calibração do Traço BIM (wa-eqp0dy), suíte completa do WA contra
-#   o origin/main (precisa do gt-iso-run, cujos processos de root o `runner` não consegue pausar nem matar: o item precisa de desenho próprio), backfill do estudo de viabilidade (wa-ekvjuo).
+# ITENS DE HOJE: hq-selftests roda os *.selftest.sh do hq contra o origin/main do espelho do nó (acha vermelho antes do gate). wa-suite roda a suíte INTEIRA do WA (a da bateria noturna) contra o origin/main do
+#   espelho do nó, dentro do gt-iso-run (rede cortada e provada); tem núcleos FIXOS de propósito (`auto` levaria o orçamento inteiro e o hq-selftests ficaria horas sem rodar) e se TRANCA com o arquivo
+#   wa-suite.leak se o canário medir vazamento de rede. queima é o último recurso — CPU pura quando não há trabalho útil — e nasce DESLIGADO (flag burn.on; hetzner-ballast.sh burn on).
+# O QUE FALTA (cada um entra aqui quando o dono entregar um comando que roda sozinho no nó, só com código e dado público que já está lá): calibração do Traço BIM (wa-eqp0dy), backfill do estudo de
+#   viabilidade (wa-ekvjuo).
 #
 # nome	papel	núcleos	rss_mb	prazo_s	cooldown_s	requires	comando
 hq-selftests	work	auto	4096	10800	600	exec:~/gt-remote/bin/hetzner-remote-git.sh	hq-selftests.sh
 queima	filler	auto	512	3600	0	flag:burn.on	queima.sh
+wa-suite	work	8	12288	21600	600	exec:~/gt-remote/bin/hetzner-remote-git.sh,exec:~/gt-remote/bin/gt-iso-run,exec:/usr/local/sbin/gt-netns-run,exec:~/gt-remote/venv-wa/bin/python,path:~/gt-remote/bin/gtn_stable_ids.py,noflag:wa-suite.leak	wa-suite.sh

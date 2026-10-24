@@ -151,12 +151,31 @@ it arrives is to wait for it per the poll loop above.
 
 ## Read-Only Enforcement
 
-You review; you do not modify. Before reviewing, capture a baseline:
+You review; you do not modify — and moving a repository to another commit counts as modifying it.
+The rig clones under `/Users/athos/gt/<rig>` (e.g. `/Users/athos/gt/whatsapp_automation`) are LIVE: their
+daemons run from the files on disk. `git checkout`, `git switch`, `git reset`, `git restore`, `git clean`,
+`git stash`, `git merge`, `git pull` or `git rebase` there puts unreviewed code under a running system, and even a
+round trip of a few seconds rewrites file mtimes, which the deploy guards then read as "changed after the process
+started". On 24/10 a reviewer ran `git checkout --detach <sha>` in the WA clone to count one string in one file;
+it was back 19 s later and still cost an investigation (ga-eei1o4).
+
+Read the branch under review without touching the clone, and do not `cd` into it (your shell stays wherever
+you leave it between commands): always `git -C <rig-path> ...`.
+- a file at the commit: `git -C <rig-path> show <sha>:<path>`
+- search: `git -C <rig-path> grep -n <pattern> <sha> -- <path>`; diff: `git -C <rig-path> diff <base> <sha> -- <path>`
+- files on disk (to run a test or a script): `git -C <rig-path> worktree add --detach <scratchpad>/review <sha>`,
+  work there, and remove it before your verdict (`git -C <rig-path> worktree remove --force <path>`).
+
+Before reviewing, capture a baseline of every repository you read:
 ```bash
 git status --porcelain=v1 -z
+git rev-parse HEAD; git symbolic-ref -q HEAD || echo detached
 ```
-After reviewing, run the same command and confirm no files were modified.
+After reviewing, run the same commands and confirm nothing changed. `git status` alone cannot see a moved HEAD
+(a detached checkout of a clean tree leaves it empty), which is why HEAD is part of the baseline.
 Pre-existing dirty state is not your responsibility — only delta you introduced.
+If you did move a live clone by mistake, put it back at once, to exactly where it was (`git -C <path> reflog -n 3`
+shows the old sha or branch), and say so in one line of your verdict comment.
 
 ## Path Verification: Working Directory ≠ Git Root
 
