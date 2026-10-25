@@ -2204,3 +2204,44 @@ def test_the_modal_whose_escapes_failed_is_not_reset_when_only_the_escape_is_arm
     _switch_crypto_to_amb(w)
     _run_to(w, 90, 150, 215, 280, 700)
     assert len(w.keys()) == 2 and w.gc_calls() == []
+
+
+# ── the reads of the last rung, failing: every one lands on "unknown"/"no session", never on a reset ─────────────
+def test_a_transcript_that_is_absent_unreadable_or_corrupt_says_unknown_and_a_real_one_says_limit(w):
+    sf = {"sessionId": "sess-7-0000", "cwd": "/work/Mayor"}
+    assert crew.transcript_says(sf) == ("unknown", None)                                   # no such file
+    _transcript(w, "Mayor", 7, "garbage")
+    assert crew.transcript_says(sf) == ("unknown", None)                                   # the tail is not JSON
+    proj = w.d / "projects" / re.sub(r"[^A-Za-z0-9]", "-", "/work/Mayor")
+    (proj / "sess-7-0000.jsonl").unlink()
+    (proj / "sess-7-0000.jsonl").mkdir()
+    assert crew.transcript_says(sf) == ("unknown", None)                                   # there, but it cannot be read as a file
+    assert crew.transcript_says({"sessionId": "../escape", "cwd": "/work/Mayor"}) == ("unknown", None)
+    assert crew.transcript_says({}) == ("unknown", None)
+    (proj / "sess-7-0000.jsonl").rmdir()
+    _transcript(w, "Mayor", 7, "limit")
+    what, when = crew.transcript_says(sf)
+    assert what == "limit" and abs(when - (w.now + 30)) < 2
+
+
+def test_a_gc_that_cannot_run_times_out_or_answers_garbage_names_no_session(w, monkeypatch):
+    field = "gastown__mayor:@3.%5"
+    w.gc_sessions(("gh-050", "gastown__mayor"))
+    assert crew.gc_session_id(field) == ("gh-050", "")                                      # the control: the fake answers
+    for bad in ("{not json", '{"sessions": "x"}', "[]"):
+        (w.d / "gcd" / "sessions.json").write_text(bad)
+        sid, why = crew.gc_session_id(field)
+        assert sid is None and "could not list" in why, bad
+    def cannot_start(*a, **k):
+        raise OSError("gc: not found")
+    def too_slow(*a, **k):
+        raise subprocess.TimeoutExpired("gc", 1)
+    for boom in (cannot_start, too_slow):
+        with monkeypatch.context() as m:
+            m.setattr(crew.subprocess, "run", boom)
+            assert crew.gc_run(["session", "list", "--json"]) == (None, "")
+            sid, why = crew.gc_session_id(field)
+            assert sid is None and "could not list" in why
+    with monkeypatch.context() as m:
+        m.setenv("CLAUDE_CREW_GC", str(w.d / "no-such-gc"))
+        assert crew.gc_run(["session", "list", "--json"]) == (None, "")                      # no gc binary at all
