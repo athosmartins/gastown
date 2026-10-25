@@ -15,7 +15,11 @@
 #           carrega (e nesse caso gravar ERROR no log) e log que não grava NÃO podem virar "bloqueado": é trava contra engano, não sandbox;
 #           e o que se libera SEM saber onde o git roda (cd/-C/--git-dir/--work-tree por variável, lançador opaco, aninhado fundo; sessão fora do vivo)
 #           fica CONTADO: uma linha result=UNRESOLVED, exit 0 (dentro do vivo, barra); stdin que não é o objeto do hook libera MAS grava ERROR
-#           (se o Claude Code mudar o payload o guarda morre em toda chamada, e sem a linha ninguém vê);
+#           (se o Claude Code mudar o payload o guarda morre em toda chamada, e sem a linha ninguém vê). Vale para QUALQUER payload que o guarda não lê
+#           (ga-70d0su): tool_input.command ausente/null/vazio/renomeado, tool_name ausente ou "bash", cwd que não é texto, JSON fundo demais → ERROR, exit 0,
+#           sem traceback. Também fica CONTADO (UNRESOLVED) o que se libera sem saber O QUE o git roda (subcomando por variável, operandos do xargs/parallel;
+#           com a sessão no vivo, barra) e o comando acima do teto de 32 KB, que não paga o parser; o log que não codifica o texto (surrogate solto) não
+#           derruba o exit 2;
 #   log   — cada bloqueio vira UMA linha em LCG_LOG com a sessão/alias de quem tentou, e a mensagem diz o que viu e o que fazer;
 #   self  — `--selfcheck [settings.json]`: 0 só se o guarda decide como deveria E (com o settings) todo PreToolUse de Bash é exatamente
 #           `python3 -I <guarda>`; 1 caso contrário.
@@ -127,12 +131,13 @@ b 2 "block: X=checkout; git \$X --detach (subcomando por variável: não sei O Q
 b 2 "block: git \$(echo checkout) --detach (substituição no lugar do subcomando), sessão NO vivo" 'git $(echo checkout) --detach abc'
 b 2 "block: echo --detach abc | xargs git checkout (os operandos chegam em tempo de execução), sessão NO vivo" 'echo --detach abc | xargs git checkout'
 b 2 "block: echo --detach abc | parallel git checkout (idem, lançador opaco), sessão NO vivo" 'echo --detach abc | parallel git checkout'
+b 2 "block: x''args (aspas dentro do nome) acrescenta operandos do mesmo jeito, sessão NO vivo" "echo --detach abc | x''args git checkout"
 b 2 "block: git -C <vivo> \$X (o clone é o vivo, o subcomando não leio), de outro cwd" "X=checkout; git -C $LIVE \$X --detach abc" "$OUT"
 run < <(mk Bash "$LIVE" command 'X=checkout; git $X --detach abc'); blocked && grep -q 'não consegui ver o que' "$T/err" && grep -qF 'git $X --detach abc' "$T/err" && grep -qF "$LIVE" "$T/err"; ok $? "block: o 'não sei O QUE' diz que não viu o que o git faz, cita o comando e o clone vivo"
 # ga-70d0su (achado 4): abaixo do teto o parser ainda confere (o teto só vale para o que passa dele)
 PAD20=$(head -c 20000 /dev/zero | tr '\0' x)
 b 2 "block: comando de 20 KB que cita checkout ainda passa pelo parser (abaixo do teto)" "git checkout --detach $SHA; echo $PAD20"
-# ga-70d0su (achado 2): o log NUNCA muda o veredito — um surrogate solto no comando levantava UnicodeEncodeError dentro do log() e o exit 2 virava exit 1 (o checkout rodava)
+# ga-70d0su (achado 2): o veredito não depende do log — um surrogate solto no comando levantava UnicodeEncodeError dentro do log() e o exit 2 virava exit 1 (o checkout rodava)
 : > "$T/guard.log"; run < <(printf '{"tool_name":"Bash","cwd":"%s","tool_input":{"command":"git checkout --detach x \\ud800"}}' "$LIVE"); blocked && grep -q 'result=BLOCK' "$T/guard.log"; ok $? "block: surrogate solto no comando NÃO derruba o veredito (exit 2 e a linha BLOCK ficam) (rc=$RC)"
 fi
 
@@ -322,7 +327,7 @@ PY
   mut "parser que não carrega bloqueia"     open  'return 0  # sem parser' 'return 2  # sem parser'
   mut "parser que não carrega some do log"  open  'log("ERROR", "", "parser: " + str(e)[:100], "")' 'pass'
   mut "raiz padrão errada"                  block '"~/gt/whatsapp_automation"' '"/nao/existe"'
-  mut "sem log de BLOCK"                    log   'log("BLOCK", root, op, inp.get("cwd") or "")' 'pass'
+  mut "sem log de BLOCK"                    log   'log("BLOCK", root, op, cwd)' 'pass'
   mut "sem sessão no log"                   log   '"session=" + os.environ.get("GC_SESSION_NAME", "")' '"session="'
   mut "mensagem sem o idioma seguro"        log   'worktree add --detach <pasta-fora-do-clone>' 'worktree add <pasta-fora-do-clone>'
   mut "mensagem sem a volta"                log   'a volta é liberada: git checkout main.' 'a volta é liberada: git status.'
@@ -333,7 +338,7 @@ PY
   mut "aninhado fundo demais libera"        block '    if res:  # (None, motivo)' '    if False:  # (None, motivo)'
   mut "arquivo sem pathspec conta"          block 'if sub == "checkout" and "--" in rest and rest[rest.index("--") + 1:]:' 'if sub == "checkout" and "--" in rest:'
   mut "mensagem do não-sei some"            block 'não consegui ver em que pasta' 'bloqueado em que pasta'
-  mut "UNRESOLVED não grava"                open  'log("UNRESOLVED", "", blind[0], inp.get("cwd") or "")' 'pass'
+  mut "UNRESOLVED não grava"                open  'log("UNRESOLVED", "", blind[0], cwd)' 'pass'
   mut "não-sei fora do vivo não conta"      open  'blind.append(op)  # sessão fora do vivo: libera, mas conta' 'pass'
   mut "aninhado fundo fora do vivo não conta" open 'blind.append(op)  # aninhado fundo demais fora do vivo: libera, mas conta' 'pass'
   mut "prefiltro ignora ANSI-C"             block 'if ANSI_C not in cmd and not PREFILTER.search' 'if not PREFILTER.search'
@@ -345,6 +350,25 @@ PY
   mut "cwd conta mesmo com --git-dir"                     pass  'if not gd:  # sem --git-dir' 'if True:  # sem --git-dir'
   mut "stdin ilegível não grava"                          open  'log("ERROR", "", "stdin: " + str(e)[:100], "")' 'pass'
   mut "payload que não é objeto não grava"                open  'log("ERROR", "", "stdin: payload não é um objeto", "")' 'pass'
+  # ga-70d0su: achado 1 (payload renomeado), 2 (cwd/JSON fora do tipo, o log não derruba o veredito), 3 (não sei O QUE roda), 4 (teto de tamanho)
+  mut "payload sem command não grava"                     open  'log("ERROR", "", "payload: sem tool_input.command", cwd)' 'pass'
+  mut "command vazio passa calado"                        open  'if not isinstance(cmd, str) or not cmd:' 'if not isinstance(cmd, str):'
+  mut "tool_name ausente não grava"                       open  'log("ERROR", "", "payload: sem tool_name", cwd)' 'pass'
+  mut "tool_name em outra caixa não grava"                open  'if name.casefold() == "bash":' 'if False:'
+  mut "cwd fora do tipo passa direto"                     open  'cwd = cwd if isinstance(cwd, str) else ""' 'cwd = cwd or ""'
+  mut "cwd fora do tipo não grava"                        open  'log("ERROR", "", "payload: cwd não é texto", "")' 'pass'
+  mut "JSON fundo demais derruba o guarda"                open  'except (ValueError, OSError, RecursionError) as e:' 'except (ValueError, OSError) as e:'
+  mut "log sem backslashreplace perde o veredito"         block 'open(path, "a", errors="backslashreplace")' 'open(path, "a")'
+  mut "subcomando ilegível libera"                        block 'bool(SHELLY.search(sub)) or ' ''
+  mut "operandos do xargs/parallel liberam"               block '(sub in HEAD_MOVERS and not rest and appends)' 'False'
+  mut "xargs entre aspas passa batido"                    block 'APPENDERS.search(UNQUOTE.sub("", cmd))' 'APPENDERS.search(cmd)'
+  mut "mensagem do não-sei-O-QUE some"                    block 'não consegui ver o que' 'bloqueado o que'
+  mut "não sei O QUE não vale como não sei onde"          open  'unsure = what or tree is None' 'unsure = tree is None'
+  mut "teto removido"                                     open  'if len(cmd) > MAX_CMD:' 'if False:'
+  mut "acima do teto barra"                               open  'return 0  # acima do teto: libera' 'return 2  # acima do teto: libera'
+  mut "teto pequeno demais"                               block 'MAX_CMD = 32768' 'MAX_CMD = 1000'
+  mut "selfcheck não confere o subcomando ilegível"       self  'bool(SHELLY.search(sub)) or ' ''
+  mut "selfcheck não confere o xargs"                     self  '(sub in HEAD_MOVERS and not rest and appends)' 'False'
   wait
   for k in $(seq 1 "$mn"); do
     rc=$(cat "$T/rc.$k" 2>/dev/null || echo ausente)

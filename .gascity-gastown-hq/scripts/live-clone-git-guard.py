@@ -13,20 +13,26 @@ PARA QUE SERVE
 COMO DECIDE
   Reaproveita o leitor de shell do remote-clone-guard.py (scan: cd/pushd, `-C`, `bash -c`, eval, subshell, função, find -exec, VAR=x, env/sudo…) e troca só a
   pergunta feita a cada `git`: o subcomando é checkout/switch, ele MOVE o HEAD, e o clone onde roda é um dos protegidos?
-  · move o HEAD = tudo, menos (a) sem argumento, (b) só `main` com no máximo -q/--quiet (a volta), (c) `checkout [<árvore>] -- <arquivo>` (ao menos um arquivo depois do `--`) sem -b/-d/--detach/--orphan (arquivo, HEAD fica).
+  · move o HEAD = tudo, menos (a) sem argumento (salvo se um xargs/parallel do comando pode acrescentá-los: aí é "não sei O QUE roda", abaixo), (b) só `main` com no máximo -q/--quiet (a volta), (c) `checkout [<árvore>] -- <arquivo>` (ao menos um arquivo depois do `--`) sem -b/-d/--detach/--orphan (arquivo, HEAD fica).
   · clone = o ancestral mais próximo do alvo que tem `.git`; só vale se for um dos protegidos (LCG_ROOTS, separados por `:`; padrão ~/gt/whatsapp_automation).
     Clone aninhado (crew/x) e worktree ligado têm `.git` próprio e ficam livres. Um checkout toca DUAS coisas e as duas contam: a árvore que ele reescreve
     (--work-tree/GIT_WORK_TREE, senão o cwd) e o repositório cujo HEAD anda (o pai de --git-dir/GIT_DIR, senão o achado a partir do cwd — mesmo com --work-tree apontando para outro
     lugar). O cwd vem do hook, de `-C` e de `cd`. Qualquer das duas sem resposta (variável, glob) é "não sei", nunca "é outro lugar".
   · FALHA ABERTA, de propósito: é trava contra engano (o slip de cwd), não sandbox, e roda em TODA sessão do mini — um defeito dele não pode derrubar o trabalho dos outros.
-    JSON ilegível ou que não é o objeto do hook, parser que não carrega, qualquer exceção → libera (todos viram result=ERROR no log; `--selfcheck` falha para o ativador ver o parser).
+    Payload que o guarda não sabe ler → libera, mas SEMPRE com uma linha result=ERROR (um guarda morto tem de aparecer no log): JSON ilegível (inclusive aninhado fundo demais) ou que não é o objeto do hook; sem tool_name
+    (ou "bash" em outra caixa); Bash sem tool_input.command em texto não vazio (`cmd`, `command` null, embrulho `input`…); cwd que não é texto (123, lista). Parser que não carrega ou exceção na decisão → idem
+    (`--selfcheck` falha para o ativador ver o parser). O veredito não depende do log: gravar falhou (pasta que não existe, disco cheio) ou o texto não codifica (surrogate solto sai escapado) → o exit 2 fica.
     Pasta que o parser não resolve (variável em cd/-C/--git-dir/--work-tree, glob, lançador opaco como flock/watch, aninhado fundo demais) → libera, EXCETO quando o cwd da sessão é o clone vivo: aí é o
     escorregão do incidente e barra, pedindo `git -C <pasta-absoluta>` (a mensagem explica; com a pasta dita por extenso e fora do vivo, passa). O que libera sem saber onde roda
     NÃO é silencioso: uma linha result=UNRESOLVED (op, cwd, sessão) no log, exit 0 — contar essas linhas diz quantas vezes o guarda ficou cego.
+    Não saber O QUE o git roda vale o mesmo: subcomando por variável/substituição (`X=checkout; git $X --detach abc`) ou operandos que o xargs/parallel acrescentam em tempo de execução (`echo --detach abc | xargs git checkout`:
+    o parser vê `git checkout` sem argumento) → barra se o git roda no vivo ou a sessão está nele, senão libera e CONTA (UNRESOLVED).
 CÓDIGOS: 0 liberado · 2 bloqueado. `--selfcheck [settings.json…]`: 0 se o guarda decide como deveria numa pasta de teste E (com settings) todo PreToolUse de Bash é EXATAMENTE
   `python3 -I <este arquivo>` (só type/command/timeout — um `if` limitaria o disparo a `git -C *`, e `|| true` apagaria o exit 2) sem `disableAllHooks`; 1 caso contrário.
 CUSTO: roda em TODA chamada de Bash. Comando que não cita checkout/switch (nem abre `$'…'`) sai no pré-filtro, perto do Python vazio (~85-120 ms no mini, que mede ruidoso sob load alto); o que cita carrega o parser
   e custa ~140-220 ms. O parser traz `import tempfile` só para o --selfcheck dele (shutil → compression.zstd, +~270 ms): load_rcg() põe um módulo vazio no lugar. Não importe nada pesado no topo deste arquivo.
+  Texto de mais de MAX_CMD (32768 caracteres) que cita checkout/switch NÃO vai ao parser: o custo dele é superlinear nesse texto (medido: ~110 ms a 25 KB, ~170 ms a 50 KB, ~950 ms a 200 KB com load ~12; ~10 s a 200 KB com load ~43, segundo o revisor do
+  gate). Libera e grava result=UNRESOLVED op="comando grande demais…" (nunca barra: o escorregão do incidente é um comando curto).
 LOG: uma linha TSV por bloqueio (result=BLOCK), erro (ERROR) ou liberação às cegas (UNRESOLVED, exit 0) em $LCG_LOG, senão $GC_CITY_PATH/.gc/logs/live-clone-git-guard.log (ts result root op cwd session agent alias). Liberar sabendo onde roda não grava. Sem LCG_LOG e sem GC_CITY_PATH (terminal fora do gc) nada grava: o BLOCK ainda avisa no stderr, ERROR/UNRESOLVED não deixam rastro.
 ATIVAÇÃO (decisão do Mayor/Athos: o settings do usuário não é editado por agente): em PreToolUse, matcher "Bash", UM hook
   {"type": "command", "command": "python3 -I /Users/athos/gt/.gascity-gastown-hq/scripts/live-clone-git-guard.py"}   — sem `if`.
@@ -34,6 +40,9 @@ ATIVAÇÃO (decisão do Mayor/Athos: o settings do usuário não é editado por 
 LIMITES (não vê, e o que isso quer dizer): checkout feito FORA do Claude (launchd, script, terminal do Athos — o post-checkout cobre com log); `git rebase`/`bisect`/`reset --hard` (também mexem no HEAD ou
   na árvore, mas não foram o incidente; `git reset --hard` já tem o guarda dangerous-command); alvo que só se sabe em tempo de execução (`cd "$(…)"`, `cd $VAR`) quando o cwd da sessão NÃO é o vivo; aninhamento além de 3 níveis (o parser desiste: o que vem depois no mesmo comando não é conferido — armadilha de propósito é fora do escopo); alias do git; `gh pr checkout <n>` (o parser só olha `git`); `$"…"` (aspas de locale: `ch$"e"ckout`, só o `$'…'` é decodificado); caminho do clone escrito com outra caixa (o APFS ignora a caixa, o guarda compara o texto do realpath);
   `g''it`/`che''ckout` e `$'\x63heckout'` não escapam do pré-filtro mas um git por variável (`$G checkout`) sim. Depende do remote-clone-guard.py (scan/res): mudar a assinatura de lá quebra este selftest.
+  Subcomando por variável SEM a palavra checkout/switch em lugar nenhum do texto (`git $CMD abc` com CMD vindo do ambiente) não chega ao parser: alargar o pré-filtro mandaria ao parser todo `git … $VAR` e toda mensagem de commit em heredoc
+  (+~100 ms em toda chamada com `git … $VAR` ou `$(…)`, para pegar um caso que não é o do incidente). xargs/parallel são vistos como PALAVRA no texto (sem aspas): `git checkout` sem argumento em comando que cita xargs em outro lugar conta como não sei; `x$'\x61'rgs` não é visto;
+  comando acima de MAX_CMD não é conferido (só contado).
 """
 from __future__ import annotations
 
@@ -48,8 +57,13 @@ HEAD_MOVERS = ("checkout", "switch")
 QUIET = {"-q", "--quiet"}
 BRANCHY = re.compile(r"-[A-Za-z]*[bBdt][A-Za-z]*|--(?:detach|orphan|track)(?:=.*)?")  # opção do checkout que cria branch ou destaca: `--` depois dela NÃO vira modo arquivo
 PREFILTER = re.compile(r"checkout|switch")
+UNQUOTE = re.compile(r"['\"\\]")  # aspas e barras: tiradas, o texto deixa ver `che''ckout` e `x''args` como o shell os junta
 ANSI_C = "$" + "'"  # abre uma string ANSI-C ($'\x63heckout'): esconde letras por escape, o pré-filtro não enxerga a palavra e só o parser decodifica
 UNKNOWN = "pasta desconhecida: "  # prefixo do `op` quando o parser não disse onde o git roda e o cwd da sessão é o clone vivo (message() troca o texto)
+UNKNOWN_WHAT = "subcomando desconhecido: "  # prefixo do `op` quando não sei O QUE o git roda e ele roda no clone vivo, ou a sessão está nele (message() troca o texto)
+SHELLY = re.compile(r"[$`*?\[{]")  # a mesma classe de caracteres com que o parser diz "não sei" a um caminho (res): variável, substituição, glob, chave
+APPENDERS = re.compile(r"\b(?:xargs|parallel)\b")  # programas que acrescentam operandos ao git em tempo de execução: o `git checkout` sem argumento que o parser vê não é o que roda
+MAX_CMD = 32768  # caracteres; o parser tem custo superlinear no texto que cita checkout/switch (medido aqui, load ~12: ~110 ms a 25 KB, ~170 ms a 50 KB, ~950 ms a 200 KB; o revisor do gate viu ~10 s a 200 KB sob load ~43): acima disto ele não roda, libera e CONTA
 
 
 def load_rcg():
@@ -93,9 +107,9 @@ def moves_head(sub: str, rest: list) -> bool:
     return not (words == ["main"] and all(f in QUIET for f in flags))
 
 
-def make_hit(rcg, roots: set, hook_cwd, blind: list):
+def make_hit(rcg, roots: set, hook_cwd, blind: list, appends: bool = False):
     def hit(seg: list, env: dict, cwd, terr, own):
-        """Substitui rcg.git_hit (mesma assinatura): (raiz, operação) se este `git` move o HEAD de um clone protegido; None se não (ou se não sei onde roda e a sessão não está no clone vivo: falha aberta, anotada em `blind`)."""
+        """Substitui rcg.git_hit (mesma assinatura): (raiz, operação) se este `git` move o HEAD de um clone protegido; None se não (ou se não sei onde roda, ou o que faz, e a sessão não está no clone vivo: falha aberta, anotada em `blind`)."""
         # vazio (sem GIT_WORK_TREE/GIT_DIR) → o cwd manda; ilegível ($VAR, glob) → res devolve None e o alvo vira "não sei"
         wt, gd, i = env.get("GIT_WORK_TREE"), env.get("GIT_DIR"), 1
         while i < len(seg) and seg[i].startswith("-"):
@@ -116,7 +130,9 @@ def make_hit(rcg, roots: set, hook_cwd, blind: list):
             else:  # opção de topo sem valor (--no-pager, -p…) ou que não conheço: segue; o pior caso é não achar o subcomando e liberar
                 i += 1
         sub, rest = (seg[i] if i < len(seg) else ""), seg[i + 1:]
-        if sub not in HEAD_MOVERS or not moves_head(sub, rest):
+        # vazio (sem subcomando) → não é checkout/switch; ilegível ($VAR, $(…), glob no lugar do subcomando) ou operandos que o xargs/parallel acrescentam depois (o `rest` vazio que vejo não é o que roda) → "não sei O QUE roda", nunca "não move o HEAD"
+        what = bool(SHELLY.search(sub)) or (sub in HEAD_MOVERS and not rest and appends)
+        if not what and (sub not in HEAD_MOVERS or not moves_head(sub, rest)):
             return None
         # um checkout toca DUAS coisas e as duas contam: a ÁRVORE que reescreve (--work-tree, senão o cwd) e o repositório cujo HEAD anda (--git-dir, senão o achado a partir do cwd)
         wtp = rcg.res(wt, cwd) if wt else None
@@ -128,26 +144,28 @@ def make_hit(rcg, roots: set, hook_cwd, blind: list):
         elif gdp and os.path.basename(gdp) == ".git":  # o checkout de --git-dir=<clone>/.git cai no cwd, mas o HEAD que se move é o do <clone>
             cands.append(os.path.dirname(gdp))
         # vazio (sem --git-dir/--work-tree) → o cwd responde pelos dois; ilegível ($VAR, glob, lançador opaco → res/cwd None) → "não sei" de UMA das duas já basta, nunca "é outro lugar"
-        unsure = tree is None or (gd and gdp is None) or (not gd and cwd is None)
+        unsure = what or tree is None or (gd and gdp is None) or (not gd and cwd is None)  # não sei O QUE roda vale como não sei ONDE: pode ser um checkout em qualquer lugar
         op = " ".join(["git", sub] + rest)[:200]
         for c in cands:
             root = protected(c, roots) if c else None
             if root:
-                return root, op
-        if unsure:  # não sei onde este git roda (cd $VAR, lançador opaco, -C/--git-dir/--work-tree $VAR): só barro se o cwd da SESSÃO é o clone vivo — o escorregão do incidente; fora dele, libera, mas CONTADO (blind → result=UNRESOLVED no log)
+                return root, (UNKNOWN_WHAT if what else "") + op
+        if unsure:  # não sei onde este git roda (cd $VAR, lançador opaco, -C/--git-dir/--work-tree $VAR) ou o que ele faz: só barro se o cwd da SESSÃO é o clone vivo — o escorregão do incidente; fora dele, libera, mas CONTADO (blind → result=UNRESOLVED no log)
             root = protected(hook_cwd, roots) if hook_cwd else None
             if root:
-                return root, UNKNOWN + op
+                return root, (UNKNOWN_WHAT if what else UNKNOWN) + op
             blind.append(op)  # sessão fora do vivo: libera, mas conta
         return None
     return hit
 
 
 def decide(cmd: str, cwd, roots: set, rcg, blind: list):
-    """None = liberado; (raiz, operação) = bloqueado. Onde o git roda e o parser não resolveu (variável, lançador opaco, aninhado fundo demais) = não sei: libera, salvo se o cwd da sessão é o clone vivo; o que liberou sem saber vai para `blind`."""
+    """None = liberado; (raiz, operação) = bloqueado. Onde o git roda, ou o que ele faz, e o parser não resolveu (variável, lançador opaco, aninhado fundo demais, subcomando por variável, operandos do xargs) = não sei: libera, salvo se o cwd da sessão é o clone vivo; o que liberou sem saber vai para `blind`."""
     # vazio (sem cwd no JSON) → None: não há de onde desconfiar, e o parser também recebe "não sei"
     real = os.path.realpath(cwd) if cwd else None
-    rcg.git_hit = make_hit(rcg, roots, real, blind)  # scan chama git_hit pelo nome do módulo: trocar aqui troca a pergunta, não o leitor de shell
+    # texto sem aspas/barras (como o pré-filtro): `x''args` também conta; vazio → False (nenhum xargs/parallel no comando)
+    appends = bool(APPENDERS.search(UNQUOTE.sub("", cmd)))
+    rcg.git_hit = make_hit(rcg, roots, real, blind, appends)  # scan chama git_hit pelo nome do módulo: trocar aqui troca a pergunta, não o leitor de shell
     res = rcg.scan(cmd, real, "", None)
     if res and res[0]:
         return res
@@ -161,21 +179,25 @@ def decide(cmd: str, cwd, roots: set, rcg, blind: list):
 
 
 def log(result: str, root: str, op: str, cwd: str) -> None:
-    # vazio (sem LCG_LOG e sem GC_CITY_PATH) → sem destino, não grava; falhou/ilegível (pasta que não existe, disco cheio) → segue sem log: o veredito já está dado e não depende dele
+    # vazio (sem LCG_LOG e sem GC_CITY_PATH) → sem destino, não grava; falhou/ilegível (pasta que não existe, disco cheio) → segue sem log: o veredito já está dado e não depende dele;
+    # texto que não codifica (surrogate solto num comando que veio do JSON) sai escapado (errors=backslashreplace): sem isso o UnicodeEncodeError trocava o exit 2 por traceback + exit 1 e o checkout rodava
     path = os.environ.get("LCG_LOG") or (os.path.join(os.environ["GC_CITY_PATH"], ".gc", "logs", "live-clone-git-guard.log") if os.environ.get("GC_CITY_PATH") else "")
     if not path:
         return
     row = [time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "result=" + result, "root=" + root, "op=" + re.sub(r"\s+", " ", op), "cwd=" + cwd,
            "session=" + os.environ.get("GC_SESSION_NAME", ""), "agent=" + os.environ.get("GC_AGENT", ""), "alias=" + os.environ.get("GC_ALIAS", "")]
     try:
-        with open(path, "a") as f:
+        with open(path, "a", errors="backslashreplace") as f:
             f.write("\t".join(row) + "\n")
     except OSError:
         pass
 
 
 def message(root: str, op: str) -> str:
-    if op.startswith(UNKNOWN):
+    if op.startswith(UNKNOWN_WHAT):
+        what = (f"BLOQUEADO: não consegui ver o que `{op[len(UNKNOWN_WHAT):]}` faz (subcomando escrito por variável/substituição, ou operandos que xargs/parallel acrescentam em tempo de execução) e ele pode ser um checkout/switch que tira o HEAD do clone vivo de produção.\n"
+                f"Clone: {root}\nRefaça com o subcomando e os operandos por extenso na linha: git checkout main (a volta) ou git -C <pasta-fora-do-vivo> checkout … (se a pasta NÃO é o clone vivo, passa).\n")
+    elif op.startswith(UNKNOWN):
         what = (f"BLOQUEADO: não consegui ver em que pasta `{op[len(UNKNOWN):]}` roda (variável em cd/-C/--git-dir/--work-tree, lançador como flock/watch, ou comando aninhado fundo demais) e o cwd desta sessão é o clone vivo de produção.\n"
                 f"Clone: {root}\nRefaça dizendo a pasta por extenso e sem aninhar tanto: git -C <pasta-absoluta> checkout … (se ela NÃO é o clone vivo, passa).\n")
     else:
@@ -205,7 +227,7 @@ def selfcheck(args: list) -> int:
         os.makedirs(nested + "/.git")
         for cmd, cwd, want in (("git checkout --detach abc", live, True), ("git switch --detach", live, True), ("cd " + live + " && git checkout abc", d, True),
                                ("git checkout main", live, False), ("git checkout -- f", live, False), ("git status", live, False),
-                               ("git checkout --detach abc", nested, False)):
+                               ("git checkout --detach abc", nested, False), ("X=checkout; git $X --detach abc", live, True), ("echo abc | xargs git checkout", live, True)):
             try:
                 got = decide(cmd, cwd, {live}, rcg, []) is not None
             except Exception as e:  # noqa: BLE001
@@ -238,38 +260,57 @@ def main(argv: list) -> int:
     if argv[1:2] == ["--selfcheck"]:
         return selfcheck(argv[2:])
     try:
-        # vazio ou ilegível (não é JSON, bytes ruins) → libera, mas grava ERROR: se o Claude Code mudar o payload do hook o guarda morre em toda chamada, e sem a linha ninguém vê
+        # vazio ou ilegível (não é JSON, bytes ruins, aninhado fundo demais → RecursionError) → libera, mas grava ERROR: se o Claude Code mudar o payload do hook o guarda morre em toda chamada, e sem a linha ninguém vê
         inp = json.loads(sys.stdin.read())
-    except (ValueError, OSError) as e:
+    except (ValueError, OSError, RecursionError) as e:
         log("ERROR", "", "stdin: " + str(e)[:100], "")
         return 0
     if not isinstance(inp, dict):  # JSON válido que não é o objeto do hook: o mesmo defeito de payload
         log("ERROR", "", "stdin: payload não é um objeto", "")
         return 0
-    if inp.get("tool_name") != "Bash":
+    # vazio (sem cwd no JSON) → "" e o parser recebe "não sei"; ilegível (cwd que não é texto: 123, lista) → também "" e, num Bash legível, uma linha ERROR `payload: cwd não é texto` — texto é o único tipo que o resto do guarda aceita (realpath, "cwd=" + cwd)
+    cwd = inp.get("cwd")
+    bad_cwd = cwd is not None and not isinstance(cwd, str)
+    cwd = cwd if isinstance(cwd, str) else ""
+    # vazio (sem tool_name) ou ilegível (não é texto) → libera + ERROR `payload: sem tool_name`; texto que não é Bash → libera calado (é outra ferramenta), salvo "bash" em outra caixa (ERROR: o payload mudou)
+    name = inp.get("tool_name")
+    if not isinstance(name, str):  # a chave que diz a ferramenta sumiu ou foi renomeada: o guarda não sabe o que está olhando
+        log("ERROR", "", "payload: sem tool_name", cwd)
         return 0
-    # vazio (sem tool_input/command) → cmd "" → o pré-filtro libera; ilegível (tool_input que não é objeto) → também "" e libera, sem traceback
+    if name != "Bash":
+        if name.casefold() == "bash":  # a mesma ferramenta com outra grafia: o payload mudou e o guarda deixou de reconhecê-la
+            log("ERROR", "", "payload: tool_name inesperado: " + name[:40], cwd)
+        return 0
+    # vazio ou ilegível (sem tool_input, tool_input que não é objeto, command ausente/null/vazio/que não é texto — `cmd`, embrulho `input`…) → libera, mas grava ERROR: é o mesmo payload que mudou, e sem a linha um guarda morto parece um guarda calado
     ti = inp.get("tool_input")
-    cmd = str(ti.get("command") or "") if isinstance(ti, dict) else ""
-    if ANSI_C not in cmd and not PREFILTER.search(re.sub(r"['\"\\]", "", cmd)):  # sem a palavra (nem escondida por aspas/barra/ANSI-C), nada a conferir: não paga o parser
+    cmd = ti.get("command") if isinstance(ti, dict) else None
+    if not isinstance(cmd, str) or not cmd:
+        log("ERROR", "", "payload: sem tool_input.command", cwd)
         return 0
+    if bad_cwd:
+        log("ERROR", "", "payload: cwd não é texto", "")
+    if ANSI_C not in cmd and not PREFILTER.search(UNQUOTE.sub("", cmd)):  # sem a palavra (nem escondida por aspas/barra/ANSI-C), nada a conferir: não paga o parser
+        return 0
+    if len(cmd) > MAX_CMD:  # o parser custa mais que linear aqui: não roda, libera e CONTA (o escorregão do incidente é um comando curto; um texto deste tamanho não é ele)
+        log("UNRESOLVED", "", f"comando grande demais para conferir ({len(cmd)} caracteres): {cmd[:100]}", cwd)
+        return 0  # acima do teto: libera
     try:
         rcg = load_rcg()
     except Exception as e:  # noqa: BLE001 — trava contra engano: parser quebrado não derruba a sessão de ninguém
         log("ERROR", "", "parser: " + str(e)[:100], "")
         return 0  # sem parser
-    blind = []  # ops de checkout/switch que liberei sem saber onde rodam
+    blind = []  # ops de checkout/switch que liberei sem saber onde rodam (ou o que fazem)
     try:
-        hit = decide(cmd, inp.get("cwd") or None, roots_from_env(), rcg, blind)
+        hit = decide(cmd, cwd or None, roots_from_env(), rcg, blind)
     except Exception as e:  # noqa: BLE001
-        log("ERROR", "", "decide: " + str(e)[:100], inp.get("cwd") or "")
+        log("ERROR", "", "decide: " + str(e)[:100], cwd)
         return 0  # falhou
     if not hit:
         if blind:  # liberado sem saber: o veredito (0) não muda, mas fica contado e visível — sem isso ninguém mede quantas vezes o guarda ficou cego
-            log("UNRESOLVED", "", blind[0], inp.get("cwd") or "")
+            log("UNRESOLVED", "", blind[0], cwd)
         return 0
     root, op = hit
-    log("BLOCK", root, op, inp.get("cwd") or "")
+    log("BLOCK", root, op, cwd)
     print(message(root, op), file=sys.stderr)
     return 2
 
