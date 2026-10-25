@@ -1846,11 +1846,14 @@ def _transcript(w, name, pid, kind):
 def _stalled(w, pid, pane="%5", text=STALLED, *, name="Mayor", status="idle", transcript="limit", gc_name="gastown__mayor", **kw):
     """A Remote Control session whose screen shows the limit message as its last output, in the shape of a real session file."""
     _rc(w, pid, pane, text, name=name, **kw)
-    f = w.d / "sessions" / f"{pid}.json"
-    d = json.loads(f.read_text())
-    d.update(status=status, sessionId=f"sess-{pid}-0000", cwd=f"/work/{name}", tmux=f"{gc_name}:@3.{pane}")
-    f.write_text(json.dumps(d))
+    _edit_session(w, pid, status=status, sessionId=f"sess-{pid}-0000", cwd=f"/work/{name}", tmux=f"{gc_name}:@3.{pane}")
     _transcript(w, name, pid, transcript)
+
+
+def _edit_session(w, pid, **fields):
+    """Set fields of the session file (a None value drops the field)."""
+    f = w.d / "sessions" / f"{pid}.json"
+    f.write_text(json.dumps({k: v for k, v in {**json.loads(f.read_text()), **fields}.items() if v is not None}))
 
 
 def _run_to(w, *offsets):
@@ -2060,91 +2063,31 @@ def test_arming_the_escape_does_not_arm_the_reset(w, monkeypatch):
     assert w.gc_calls() == [] and w.keys() == [] and crew.reset_armed() is False
 
 
-def _v_transcript_later(w, me):
-    _transcript(w, "Mayor", me, "later")
-
-
-def _v_transcript_before_the_switch(w, me):
-    _transcript(w, "Mayor", me, "before")
-
-
-def _v_transcript_undated(w, me):
-    _transcript(w, "Mayor", me, "undated")
-
-
-def _v_transcript_missing(w, me):
-    _transcript(w, "Mayor", me, None)
-
-
-def _v_transcript_garbage(w, me):
-    _transcript(w, "Mayor", me, "garbage")
-
-
-def _v_busy(w, me):
-    f = w.d / "sessions" / f"{me}.json"
-    f.write_text(json.dumps({**json.loads(f.read_text()), "status": "busy"}))
-
-
-def _v_no_status(w, me):
-    f = w.d / "sessions" / f"{me}.json"
-    d = json.loads(f.read_text())
-    d.pop("status")
-    f.write_text(json.dumps(d))
-
-
-def _v_exhausted(w, me):
-    w.decide("amb", exhausted=["amb"])
-
-
-def _v_pane_changed_at_the_key(w, me):
-    w.pane_set("%5", captures=0, flip_after=1, flip_text=STALLED_TYPING)
-
-
-def _v_no_gc_match(w, me):
-    w.gc_sessions(("ga-1ioaom", "dog-ga1ioaom"))
-
-
-def _v_two_gc_matches(w, me):
-    w.gc_sessions(("gh-050", "gastown__mayor"), ("gh-051", "gastown__mayor"))
-
-
-def _v_gc_list_fails(w, me):
-    os.environ["FAKE_GC_LIST_FAIL"] = "1"
-
-
-def _v_default_item_changed(w, me):
-    w.default("crypto", blob("crypto", rt="crypto-again"))
-
-
-def _v_not_this_process(w, me):
-    f = w.d / "sessions" / f"{me}.json"
-    f.write_text(json.dumps({**json.loads(f.read_text()), "tmux": "gastown__mayor:@3.%9"}))     # %9 is nobody's pane in the fake
+def _tr(kind):
+    return lambda w, me: _transcript(w, "Mayor", me, kind)
 
 
 @pytest.mark.parametrize("variant,why", [
-    (_v_transcript_later, "does not confirm"),          # the message is old: work came after it
-    (_v_transcript_before_the_switch, "not dated after the switch"),   # idle on an old message since before the switch: nothing is wrong
-    (_v_transcript_undated, "not dated after the switch"),             # cannot tell when = no
-    (_v_transcript_missing, "does not confirm"),         # cannot tell = no
-    (_v_transcript_garbage, "does not confirm"),
-    (_v_busy, "not idle"),                               # the session file says it is working
-    (_v_no_status, "not idle"),
-    (_v_exhausted, "itself registered exhausted"),
-    (_v_pane_changed_at_the_key, "not stopped any more"),
-    (_v_no_gc_match, "no gc session"),
-    (_v_two_gc_matches, "more than one gc session"),
-    (_v_gc_list_fails, "could not list"),
-    (_v_default_item_changed, "cannot tell that the default item holds"),
-    (_v_not_this_process, "another pane"),
-], ids=lambda v: v.__name__[3:] if callable(v) else None)
+    pytest.param(_tr("later"), "does not confirm", id="transcript_later"),                        # the message is old: work came after it
+    pytest.param(_tr("before"), "not dated after the switch", id="transcript_before_the_switch"),  # idle on an old message since before the switch
+    pytest.param(_tr("undated"), "not dated after the switch", id="transcript_undated"),          # cannot tell when = no
+    pytest.param(_tr(None), "does not confirm", id="transcript_missing"),                         # cannot tell = no
+    pytest.param(_tr("garbage"), "does not confirm", id="transcript_garbage"),
+    pytest.param(lambda w, me: _edit_session(w, me, status="busy"), "not idle", id="busy"),        # the session file says it is working
+    pytest.param(lambda w, me: _edit_session(w, me, status=None), "not idle", id="no_status"),
+    pytest.param(lambda w, me: w.decide("amb", exhausted=["amb"]), "itself registered exhausted", id="exhausted"),
+    pytest.param(lambda w, me: w.pane_set("%5", captures=0, flip_after=1, flip_text=STALLED_TYPING), "not stopped any more", id="pane_changed_at_the_key"),
+    pytest.param(lambda w, me: w.gc_sessions(("ga-1ioaom", "dog-ga1ioaom")), "no gc session", id="no_gc_match"),
+    pytest.param(lambda w, me: w.gc_sessions(("gh-050", "gastown__mayor"), ("gh-051", "gastown__mayor")), "more than one gc session", id="two_gc_matches"),
+    pytest.param(lambda w, me: w.mp.setenv("FAKE_GC_LIST_FAIL", "1"), "could not list", id="gc_list_fails"),
+    pytest.param(lambda w, me: w.default("crypto", blob("crypto", rt="crypto-again")), "cannot tell that the default item holds", id="default_item_changed"),
+    pytest.param(lambda w, me: _edit_session(w, me, tmux="gastown__mayor:@3.%9"), "another pane", id="not_this_process"),   # %9 is nobody's pane in the fake
+])
 def test_armed_but_one_guard_says_no_and_nothing_is_reset(w, monkeypatch, variant, why):
     me = _armed_stalled(w, monkeypatch)
     _run_to(w, 90, 400)
     variant(w, me)
-    try:
-        _run_to(w, 690)
-    finally:
-        os.environ.pop("FAKE_GC_LIST_FAIL", None)
+    _run_to(w, 690)
     assert not any(c[-3:-1] == ["session", "reset"] for c in w.gc_calls()), w.gc_calls()
     assert why in w.log(), w.log()[-800:]
     assert "reset" not in " ".join(w.notified()).replace("gc session reset", "")           # the stall push may name the command; no "was reset"
@@ -2182,9 +2125,7 @@ def test_the_modal_whose_escapes_failed_gets_the_reset_after_ten_minutes_only_wh
     monkeypatch.setenv("GC_CREW_RESET", "1")
     me = os.getpid()
     _rc(w, me, "%5", LIMIT_MODAL)
-    d = json.loads((w.d / "sessions" / f"{me}.json").read_text())
-    d.update(tmux="gastown__mayor:@3.%5")
-    (w.d / "sessions" / f"{me}.json").write_text(json.dumps(d))
+    _edit_session(w, me, tmux="gastown__mayor:@3.%5")
     w.gc_sessions(("gh-050", "gastown__mayor"))
     _switch_crypto_to_amb(w)
     _run_to(w, 90, 150, 215, 280)                                                         # two Escapes, neither takes
