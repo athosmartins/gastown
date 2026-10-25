@@ -26,6 +26,10 @@ PRODUCTION_CAP_REAL_DEFAULT_PATHS="$LOG_REAPER_CAP_REAL_DEFAULT_PATHS"
 # sources the script and runs main() with PROD=1 must never reach the city's
 # real logs through the second class.
 CAP_PATHS_AT_SOURCE="$LOG_REAPER_CAP_PATHS"
+# Same for the glob class (wa-4j6gip): library mode comes up with NO glob
+# directory, and the real one is captured before any scenario reassigns it.
+PRODUCTION_GLOB_REAL_DEFAULT_DIRS="$LOG_REAPER_GLOB_REAL_DEFAULT_DIRS"
+GLOB_DIRS_AT_SOURCE="$LOG_REAPER_GLOB_DIRS"
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }
@@ -513,6 +517,213 @@ SA_LOG="$CAPDIR/standalone.log"
 env -u LOG_REAPER_LIB -u LOG_REAPER_CAP_PATHS -u LOG_REAPER_PROD LOG_REAPER_LOG="$SA_LOG" LOG_REAPER_PATHS="$CAPDIR/none.log" bash "$SCRIPT"
 grep -q "SENTINEL: capped-log list" "$SA_LOG" && grep -q "cap cycle complete: .* dry_run=1" "$SA_LOG" && ! grep -q "^\[[^]]*\] capped: " "$SA_LOG" && ok "standalone run, no PROD opt-in: capped class is forced to dry-run" || bad "standalone run did not dry-run the capped class — log: $(cat "$SA_LOG")"
 
+echo ""
+echo "=== glob class (wa-4j6gip): pure helpers ==="
+[ -z "$GLOB_DIRS_AT_SOURCE" ] && ok "library mode: glob directory list is empty unless a test names it" || bad "library mode must not default to the real glob directory, got '$GLOB_DIRS_AT_SOURCE'"
+_alloc_is_sparse 1000 1000; [ "$?" = "1" ] && ok "alloc_is_sparse: fully allocated -> dense (1)" || bad "alloc_is_sparse 1000/1000"
+_alloc_is_sparse 1000 500;  [ "$?" = "1" ] && ok "alloc_is_sparse: exactly half is still dense (boundary)" || bad "alloc_is_sparse 1000/500"
+_alloc_is_sparse 1000 499;  [ "$?" = "0" ] && ok "alloc_is_sparse: just under half -> sparse (0)" || bad "alloc_is_sparse 1000/499"
+_alloc_is_sparse 1000 0;    [ "$?" = "0" ] && ok "alloc_is_sparse: nothing allocated -> sparse (0)" || bad "alloc_is_sparse 1000/0"
+cant_tell() { _alloc_is_sparse "$1" "$2"; [ "$?" = "2" ] && ok "alloc_is_sparse: size='$1' alloc='$2' -> 2 (cannot tell, never 'dense')" || bad "alloc_is_sparse: size='$1' alloc='$2' did not answer 2"; }
+cant_tell 1000 ""; cant_tell 1000 abc; cant_tell "" 500; cant_tell abc 500; cant_tell 0 0; cant_tell 1000 -5
+_glob_denied "keepme.log" "keepme.log" && ok "glob_denied: an exact name on the list is denied" || bad "glob_denied exact name"
+_glob_denied "job_state.log" "other.log
+*_state.log" && ok "glob_denied: a glob pattern on the second line matches" || bad "glob_denied glob pattern"
+_glob_denied "daemon.log" "keepme.log
+*_state.log" && bad "glob_denied: a name matching no pattern must not be denied" || ok "glob_denied: a name matching no pattern is not denied"
+_glob_denied "daemon.log" "" && bad "glob_denied: an empty list must deny nothing" || ok "glob_denied: an empty list denies nothing"
+_glob_denied "daemon.log" "
+
+" && bad "glob_denied: blank lines must deny nothing" || ok "glob_denied: blank lines deny nothing"
+[ "$(_bytes_to_mb_or_unknown 10485760)" = "10" ]   && ok "bytes_to_mb_or_unknown: 10MiB -> 10"                        || bad "bytes_to_mb_or_unknown 10485760"
+[ "$(_bytes_to_mb_or_unknown 0)" = "0" ]           && ok "bytes_to_mb_or_unknown: a real 0 is 0"                       || bad "bytes_to_mb_or_unknown 0"
+[ "$(_bytes_to_mb_or_unknown "")" = "unknown" ]    && ok "bytes_to_mb_or_unknown: empty -> unknown, not 0"             || bad "bytes_to_mb_or_unknown empty"
+[ "$(_bytes_to_mb_or_unknown abc)" = "unknown" ]   && ok "bytes_to_mb_or_unknown: non-numeric -> unknown"              || bad "bytes_to_mb_or_unknown abc"
+
+echo ""
+echo "=== glob class: _glob_list_dir lists only plain, over-cap *.log files of ONE directory ==="
+CAPB=$(( 2 * 1024 * 1024 ))
+GD="$CAPDIR/glob-list"; rm -rf "$GD"; mkdir -p "$GD/sub" "$GD/adir.log" "$CAPDIR/outside"
+head -c $(( CAPB + 1 )) /dev/zero > "$GD/over.log"
+head -c "$CAPB" /dev/zero > "$GD/exact.log"
+head -c $(( CAPB - 1 )) /dev/zero > "$GD/under.log"
+head -c $(( CAPB + 1 )) /dev/zero > "$GD/data.jsonl"
+head -c $(( CAPB + 1 )) /dev/zero > "$GD/state.db"
+head -c $(( CAPB + 1 )) /dev/zero > "$GD/old.log.1"
+head -c $(( CAPB + 1 )) /dev/zero > "$GD/sub/nested.log"
+head -c $(( CAPB + 1 )) /dev/zero > "$CAPDIR/outside/target.log"
+ln -s "$CAPDIR/outside/target.log" "$GD/link.log"
+GOT="$(_glob_list_dir "$GD" "$CAPB")"; GRC=$?
+GOT_SORTED="$(printf '%s\n' "$GOT" | grep -v '^$' | sort)"
+[ "$GRC" = "0" ] && [ "$GOT_SORTED" = "$(printf '%s\n%s' "$GD/exact.log" "$GD/over.log")" ] && ok "glob_list_dir: only the two plain *.log files at/over the cap (boundary inclusive); not .jsonl/.db/.log.1/nested/symlink/dir/under-cap" || bad "glob_list_dir: rc=$GRC list: $GOT_SORTED"
+mkdir -p "$CAPDIR/glob-empty"
+GOT="$(_glob_list_dir "$CAPDIR/glob-empty" "$CAPB")"; GRC=$?
+[ "$GRC" = "0" ] && [ -z "$(printf '%s\n' "$GOT" | grep -v '^$')" ] && ok "glob_list_dir: an empty directory is rc 0 with nothing listed (nothing over the cap)" || bad "glob_list_dir: empty dir rc=$GRC out='$GOT'"
+_glob_list_dir "$CAPDIR/no-such-dir" "$CAPB" >/dev/null; [ "$?" = "2" ] && ok "glob_list_dir: a missing directory is rc 2 (cannot look), not 'nothing over the cap'" || bad "glob_list_dir: missing dir"
+_glob_list_dir "$GD/over.log" "$CAPB" >/dev/null;        [ "$?" = "2" ] && ok "glob_list_dir: a regular file given as the directory is rc 2" || bad "glob_list_dir: file as dir"
+for badcap in "" abc 0 -5 "1 2"; do
+  _glob_list_dir "$GD" "$badcap" >/dev/null; [ "$?" = "2" ] && ok "glob_list_dir: cap='$badcap' is rc 2 (no cap to look for)" || bad "glob_list_dir: cap='$badcap' did not answer 2"
+done
+if [ "$(id -u)" != "0" ]; then
+  mkdir -p "$CAPDIR/glob-locked"; chmod 000 "$CAPDIR/glob-locked"
+  _glob_list_dir "$CAPDIR/glob-locked" "$CAPB" >/dev/null; RCL=$?
+  chmod 755 "$CAPDIR/glob-locked"
+  [ "$RCL" = "2" ] && ok "glob_list_dir: an unreadable directory is rc 2" || bad "glob_list_dir: unreadable dir rc=$RCL"
+fi
+# shellcheck disable=SC2329  # overrides the external find inside this subshell; _glob_list_dir calls it
+FOUT="$( find() { echo "$GD/over.log"; return 1; }; _glob_list_dir "$GD" "$CAPB"; echo "rc=$?" )"
+[ "$FOUT" = "rc=1" ] && ok "glob_list_dir: find fails -> rc 1 and the PARTIAL list is dropped (a half list is 'cannot tell')" || bad "glob_list_dir: find failure gave '$FOUT'"
+
+echo ""
+echo "=== glob class: main() end-to-end ==="
+# One ordinary-fixture setup per scenario: the named classes idle, the glob class
+# pointed at a disposable directory that is NOT the "real default".
+glob_env() {
+  CAP_MB=2; KEEP_MB=1; ENABLED=1; DRY_RUN=0; PROD=0
+  LOG_REAPER_PATHS=""; LOG_REAPER_CAP_PATHS=""
+  LOG_REAPER_REAL_DEFAULT_PATHS="/tmp/log-reaper-nonexistent-marker-g-$$"
+  LOG_REAPER_CAP_REAL_DEFAULT_PATHS="/tmp/log-reaper-nonexistent-cap-marker-g-$$"
+  LOG_REAPER_GLOB_REAL_DEFAULT_DIRS="/tmp/log-reaper-nonexistent-glob-marker-$$"
+  LOG_REAPER_GLOB_DIRS="$1"; LOG_REAPER_GLOB_DENY=""
+  : > "$LOG_REAPER_LOG"
+}
+GD="$CAPDIR/glob-e2e"; rm -rf "$GD"; mkdir -p "$GD/sub" "$CAPDIR/outside2"
+mkfile "$GD/newdaemon.log" 60000                  # ~3.1MB, a name no named list knows
+head -c "$CAPB" /dev/zero > "$GD/edge.log"        # exactly the cap
+mkfile "$GD/small.log" 30000                      # ~1.5MB, under
+for f in data.jsonl state.db old.log.1 sub/nested.log; do mkfile "$GD/$f" 60000; done
+mkfile "$CAPDIR/outside2/target.log" 60000; ln -s "$CAPDIR/outside2/target.log" "$GD/link.log"
+tail -c "$KEEP" "$GD/newdaemon.log" > "$EXPECT_TAIL"
+INODE_ND="$(stat -f %i "$GD/newdaemon.log")"; ND_SIZE="$(_file_size_bytes "$GD/newdaemon.log")"
+untouched_sums() { ( cd "$GD" && cksum small.log data.jsonl state.db old.log.1 sub/nested.log "$CAPDIR/outside2/target.log" ); }
+UNTOUCHED_BEFORE="$(untouched_sums)"
+glob_env "$GD"
+main
+FREED_E2E=$(( ND_SIZE - KEEP + CAPB - KEEP ))
+[ "$(_file_size_bytes "$GD/newdaemon.log")" = "$KEEP" ] && cmp -s "$GD/newdaemon.log" "$EXPECT_TAIL" && ok "glob: a NEW over-cap *.log (on no named list) is cut to its last keep-MB, byte for byte" || bad "glob: newdaemon.log size '$(_file_size_bytes "$GD/newdaemon.log")' or content wrong"
+[ "$(stat -f %i "$GD/newdaemon.log")" = "$INODE_ND" ] && ok "glob: inode preserved" || bad "glob: inode changed"
+[ "$(_file_size_bytes "$GD/edge.log")" = "$KEEP" ] && ok "glob: a file exactly at the cap is capped (boundary inclusive)" || bad "glob: edge.log size '$(_file_size_bytes "$GD/edge.log")'"
+[ "$(untouched_sums)" = "$UNTOUCHED_BEFORE" ] && [ -L "$GD/link.log" ] && ok "glob: under-cap, .jsonl, .db, .log.1, nested and the symlink's TARGET are untouched" || bad "glob: something that must not be cut changed"
+[ ! -e "$GD/newdaemon.log.tailcap.tmp" ] && ok "glob: no side file left behind" || bad "glob: left a .tailcap.tmp"
+grep -E -q "glob-cap complete: dirs=1 dirs_failed=0 over_cap=2 denied=0 capped=2 freed_bytes=$FREED_E2E avail_before_mb=[0-9]+ avail_after_mb=[0-9]+ dry_run=0" "$LOG_REAPER_LOG" && ok "glob: the glob-cap line reports dirs, candidates, bytes freed and free space before/after" || bad "glob: glob-cap line mismatch — got: $(grep 'glob-cap complete' "$LOG_REAPER_LOG")"
+grep -q "cap cycle complete: checked=2 capped=2 skipped=0 missing=0 unreadable=0 failed=0 freed_bytes=$FREED_E2E cap_mb=2 keep_mb=1 dry_run=0" "$LOG_REAPER_LOG" && ok "glob: the cap-cycle summary counts the glob files too" || bad "glob: cap summary mismatch — got: $(grep 'cap cycle complete' "$LOG_REAPER_LOG")"
+# the free-space reading is a third state too: unreadable prints "unknown", never 0
+glob_env "$GD"; mkfile "$GD/newdaemon.log" 60000
+# shellcheck disable=SC2329  # overrides the sourced function inside this subshell; _cap_pass calls it
+( _free_bytes() { :; }; main ) 2>/dev/null
+grep -q "avail_before_mb=unknown avail_after_mb=unknown" "$LOG_REAPER_LOG" && ok "glob: free space that cannot be read is logged as 'unknown', not 0" || bad "glob: unreadable free space — got: $(grep 'glob-cap complete' "$LOG_REAPER_LOG")"
+
+echo ""
+echo "=== glob class: a writer that holds the file open keeps working after the cut ==="
+GD="$CAPDIR/glob-live"; rm -rf "$GD"; mkdir -p "$GD"
+W="$GD/live-daemon.log"; mkfile "$W" 60000
+READY="$CAPDIR/writer.ready"; STOP="$CAPDIR/writer.stop"; rm -f "$READY" "$STOP"
+INODE_W="$(stat -f %i "$W")"
+# A real separate process: opens O_APPEND (`>>`, like launchd's StandardOutPath), keeps the fd open, and
+# keeps writing while main() cuts the file under it. It only stops when told to, so the cut always lands
+# mid-stream, whatever the machine load.
+( exec 9>>"$W"; echo "writer start" >&9; : > "$READY"; while [ ! -e "$STOP" ]; do echo "writer tick" >&9; sleep 0.02; done; echo "writer final" >&9 ) &
+WPID=$!
+WAIT=0; while [ ! -e "$READY" ] && [ "$WAIT" -lt 250 ]; do sleep 0.02; WAIT=$((WAIT+1)); done
+glob_env "$GD"
+main
+: > "$STOP"; wait "$WPID"
+[ -e "$READY" ] && ok "live writer: the writer process started" || bad "live writer: the writer never became ready"
+[ "$(tail -n 1 "$W")" = "writer final" ] && ok "live writer: its line written AFTER the cut is in the file (no restart needed)" || bad "live writer: last line is '$(tail -n 1 "$W")'"
+[ "$(stat -f %i "$W")" = "$INODE_W" ] && ok "live writer: same inode" || bad "live writer: inode changed"
+[ "$(tr -d '\000' < "$W" | wc -c | tr -d ' ')" = "$(_file_size_bytes "$W")" ] && ok "live writer: no NUL holes (the file did not go sparse)" || bad "live writer: the file has NUL bytes"
+[ "$(_file_size_bytes "$W")" -lt "$(( KEEP + 1024 * 1024 ))" ] && ok "live writer: the file is back near keep-MB, not at its old 3MB" || bad "live writer: size is '$(_file_size_bytes "$W")'"
+
+echo ""
+echo "=== glob class: a writer that is NOT O_APPEND is cut once, then left alone (no NUL-rewrite every cycle) ==="
+GD="$CAPDIR/glob-nonappend"; rm -rf "$GD"; mkdir -p "$GD"
+NA="$GD/nonappend.log"
+exec 8>"$NA"                                       # NOT append: the writer keeps its own offset
+head -c 3000000 /dev/zero | tr '\0' 'x' >&8       # a dense 3MB, over the 2MB cap
+glob_env "$GD"
+main                                               # cycle 1: dense and over the cap -> cut
+[ "$(_file_size_bytes "$NA")" = "$KEEP" ] && ok "non-append: cycle 1 cuts the (still dense) file to keep-MB" || bad "non-append: cycle 1 size '$(_file_size_bytes "$NA")'"
+echo "after the cut" >&8                           # lands at offset 3,000,000: the file is sparse again
+exec 8>&-
+NA_SUM="$(cksum < "$NA")"
+_alloc_is_sparse "$(_file_size_bytes "$NA")" "$(_file_alloc_bytes "$NA")"
+[ "$?" = "0" ] && ok "non-append: premise holds — the writer's next write left a sparse file on this filesystem" || bad "non-append: the fixture is not sparse (size '$(_file_size_bytes "$NA")', allocated '$(_file_alloc_bytes "$NA")')"
+: > "$LOG_REAPER_LOG"
+main                                               # cycle 2: over the cap by SIZE, but sparse
+[ "$(cksum < "$NA")" = "$NA_SUM" ] && ok "non-append: cycle 2 leaves the sparse file byte-identical" || bad "non-append: the sparse file was rewritten"
+grep -q "WARN glob-cap: $NA is sparse" "$LOG_REAPER_LOG" && ! grep -q "^\[[^]]*\] capped: " "$LOG_REAPER_LOG" && ok "non-append: the log says why it was skipped, and nothing is reported as capped" || bad "non-append: log — $(cat "$LOG_REAPER_LOG")"
+grep -q "cap cycle complete: checked=1 capped=0 skipped=1 missing=0 unreadable=0 failed=0 " "$LOG_REAPER_LOG" && ok "non-append: counted as skipped" || bad "non-append: summary — $(grep 'cap cycle complete' "$LOG_REAPER_LOG")"
+# the allocation read is a third state: unreadable -> not cut, counted unreadable
+mkfile "$GD/alloc.log" 60000; ALLOC_SUM="$(cksum < "$GD/alloc.log")"; rm -f "$NA"
+glob_env "$GD"
+# shellcheck disable=SC2329  # overrides the sourced function inside this subshell; _cap_loop calls it
+( _file_alloc_bytes() { :; }; main ) 2>/dev/null
+[ "$(cksum < "$GD/alloc.log")" = "$ALLOC_SUM" ] && grep -q "cannot read the disk allocation of $GD/alloc.log" "$LOG_REAPER_LOG" && grep -q "cap cycle complete: checked=1 capped=0 skipped=0 missing=0 unreadable=1 failed=0 " "$LOG_REAPER_LOG" && ok "allocation unreadable: the file is NOT cut, the log says so and it is counted unreadable" || bad "allocation unreadable: log — $(cat "$LOG_REAPER_LOG")"
+
+echo ""
+echo "=== glob class: the deny list ==="
+GD="$CAPDIR/glob-deny"; rm -rf "$GD"; mkdir -p "$GD"
+for f in keepme.log job_state.log other.log; do mkfile "$GD/$f" 60000; done
+KEEPME_SUM="$(cksum < "$GD/keepme.log")"; STATE_SUM="$(cksum < "$GD/job_state.log")"
+glob_env "$GD"
+LOG_REAPER_GLOB_DENY="keepme.log
+*_state.log"
+main
+[ "$(cksum < "$GD/keepme.log")" = "$KEEPME_SUM" ] && [ "$(cksum < "$GD/job_state.log")" = "$STATE_SUM" ] && [ "$(_file_size_bytes "$GD/other.log")" = "$KEEP" ] && ok "deny list: the named file and the pattern match are untouched, the third file is cut" || bad "deny list: sizes keepme=$(_file_size_bytes "$GD/keepme.log") state=$(_file_size_bytes "$GD/job_state.log") other=$(_file_size_bytes "$GD/other.log")"
+grep -q "glob-cap complete: dirs=1 dirs_failed=0 over_cap=3 denied=2 capped=1 " "$LOG_REAPER_LOG" && grep -q "glob-cap: $GD/keepme.log is on the deny list" "$LOG_REAPER_LOG" && ok "deny list: logged per file and counted (over_cap=3 denied=2 capped=1)" || bad "deny list: log — $(grep 'glob-cap' "$LOG_REAPER_LOG")"
+
+echo ""
+echo "=== glob class: 'could not look' is never 'nothing to do' ==="
+GD="$CAPDIR/glob-good"; rm -rf "$GD"; mkdir -p "$GD"; mkfile "$GD/good.log" 60000
+MISSING_DIR="$CAPDIR/glob-no-such-dir"
+glob_env "$GD
+$MISSING_DIR"
+main
+[ "$(_file_size_bytes "$GD/good.log")" = "$KEEP" ] && ok "unlistable dir: the OTHER directory is still processed" || bad "unlistable dir: good.log size '$(_file_size_bytes "$GD/good.log")'"
+grep -q "FAILED glob-cap: cannot list $MISSING_DIR (rc=2" "$LOG_REAPER_LOG" && ok "unlistable dir: the log names the directory and the reason" || bad "unlistable dir: log — $(cat "$LOG_REAPER_LOG")"
+grep -q "glob-cap complete: dirs=2 dirs_failed=1 over_cap=1 denied=0 capped=1 " "$LOG_REAPER_LOG" && grep -q "cap cycle complete: checked=2 capped=1 skipped=0 missing=0 unreadable=0 failed=1 " "$LOG_REAPER_LOG" && ok "unlistable dir: counted as failed in both summaries, so the cycle cannot read like a healthy one" || bad "unlistable dir: summaries — $(grep -E 'glob-cap complete|cap cycle' "$LOG_REAPER_LOG")"
+mkfile "$GD/x.log" 60000; X_SUM="$(cksum < "$GD/x.log")"; rm -f "$GD/good.log"
+glob_env "$GD"
+# shellcheck disable=SC2329  # overrides the external find inside this subshell; _glob_list_dir calls it
+( find() { echo "$GD/x.log"; return 1; }; main ) 2>/dev/null
+[ "$(cksum < "$GD/x.log")" = "$X_SUM" ] && grep -q "FAILED glob-cap: cannot list $GD (rc=1" "$LOG_REAPER_LOG" && grep -q "cap cycle complete: checked=1 capped=0 skipped=0 missing=0 unreadable=0 failed=1 " "$LOG_REAPER_LOG" && ok "find fails mid-listing: the partial list is not used, nothing is cut, counted failed" || bad "find fails: log — $(cat "$LOG_REAPER_LOG")"
+glob_env "$GD"
+# shellcheck disable=SC2329  # overrides the sourced function inside this subshell; _cap_pass calls it
+( _cap_keep_bytes() { echo ""; }; main ) 2>/dev/null
+[ "$(cksum < "$GD/x.log")" = "$X_SUM" ] && grep -q "limits are not usable" "$LOG_REAPER_LOG" && grep -q "cap cycle complete: checked=1 capped=0 skipped=0 missing=0 unreadable=0 failed=1 " "$LOG_REAPER_LOG" && ok "unusable limits: no glob directory is even listed, nothing is cut, the directory is counted failed" || bad "unusable limits (glob): log — $(cat "$LOG_REAPER_LOG")"
+glob_env ""
+main
+[ "$(cksum < "$GD/x.log")" = "$X_SUM" ] && ! grep -q "glob-cap" "$LOG_REAPER_LOG" && ok "empty LOG_REAPER_GLOB_DIRS: the class is off — no listing, no glob-cap line" || bad "empty glob dirs: log — $(cat "$LOG_REAPER_LOG")"
+
+echo ""
+echo "=== glob class: DRY_RUN, ENABLED=0 and the production sentinel never mutate ==="
+glob_env "$GD"; DRY_RUN=1
+main
+[ "$(cksum < "$GD/x.log")" = "$X_SUM" ] && grep -q "DRY-RUN would cap: $GD/x.log" "$LOG_REAPER_LOG" && grep -q "glob-cap complete: .* dry_run=1" "$LOG_REAPER_LOG" && ok "DRY_RUN=1: the glob class logs the intended cut and touches nothing" || bad "DRY_RUN=1 (glob): log — $(cat "$LOG_REAPER_LOG")"
+glob_env "$GD"; ENABLED=0
+main; ENABLED=1
+[ "$(cksum < "$GD/x.log")" = "$X_SUM" ] && ok "ENABLED=0: a total no-op for the glob class too" || bad "ENABLED=0 still cut a glob file"
+glob_env "$GD"; LOG_REAPER_GLOB_REAL_DEFAULT_DIRS="$GD"     # pretend this IS the real directory
+main
+[ "$(cksum < "$GD/x.log")" = "$X_SUM" ] && grep -q "SENTINEL: glob-cap directory list" "$LOG_REAPER_LOG" && grep -q "glob-cap complete: .* dry_run=1" "$LOG_REAPER_LOG" && ok "sentinel: dirs == real default and no PROD opt-in -> forced dry-run, and it says so" || bad "sentinel (glob): log — $(cat "$LOG_REAPER_LOG")"
+PROD=1
+main
+[ "$(_file_size_bytes "$GD/x.log")" = "$KEEP" ] && ok "sentinel: PROD=1 lets the real directory through" || bad "sentinel (glob): PROD=1 did not cap, size '$(_file_size_bytes "$GD/x.log")'"
+PROD=0
+
+echo ""
+echo "=== glob class: script run standalone (non-library) ==="
+# The true production shape. With PROD unset and nothing said about the directory, the default is the REAL
+# ~/shared/logs and the sentinel must turn the class into a dry-run: this cannot cut any real log.
+SA_LOG="$CAPDIR/standalone-glob.log"; : > "$SA_LOG"
+env -u LOG_REAPER_LIB -u LOG_REAPER_GLOB_DIRS -u LOG_REAPER_PROD LOG_REAPER_LOG="$SA_LOG" LOG_REAPER_PATHS="$CAPDIR/none.log" LOG_REAPER_CAP_PATHS="" bash "$SCRIPT"
+grep -q "SENTINEL: glob-cap directory list" "$SA_LOG" && grep -q "glob-cap complete: .* dry_run=1" "$SA_LOG" && ! grep -q "^\[[^]]*\] capped: " "$SA_LOG" && ok "standalone, no PROD opt-in: the real default directory is forced to dry-run" || bad "standalone (glob): did not dry-run — log: $(cat "$SA_LOG")"
+# An explicit directory that is not the real default is cut for real by the same entry point.
+GD="$CAPDIR/glob-standalone"; rm -rf "$GD"; mkdir -p "$GD"; mkfile "$GD/s.log" 60000
+: > "$SA_LOG"
+env -u LOG_REAPER_LIB -u LOG_REAPER_PROD LOG_REAPER_LOG="$SA_LOG" LOG_REAPER_PATHS="$CAPDIR/none.log" LOG_REAPER_CAP_PATHS="" LOG_REAPER_GLOB_DIRS="$GD" LOG_REAPER_CAP_MB=2 LOG_REAPER_KEEP_MB=1 bash "$SCRIPT"
+[ "$(_file_size_bytes "$GD/s.log")" = "$KEEP" ] && ok "standalone, LOG_REAPER_GLOB_DIRS=<fixture>: the knob is read and the file is cut" || bad "standalone (glob fixture): size '$(_file_size_bytes "$GD/s.log")' — log: $(cat "$SA_LOG")"
+
 rm -rf "$CAPDIR"
 
 echo ""
@@ -538,6 +749,8 @@ EXPECTED_CAP_PATHS="/Users/athos/gt/.gascity-gastown-hq/.gc/runtime/control-disp
 /Users/athos/gt/.gascity-gastown-hq/.gc/logs/lifecycle-coherence-janitor.log
 /Users/athos/gt/.gascity-gastown-hq/.gc/logs/production-drift-guard-launchd.err"
 [ "$PRODUCTION_CAP_REAL_DEFAULT_PATHS" = "$EXPECTED_CAP_PATHS" ] && ok "production constant: capped-log list matches the seven files from ga-52drsg" || bad "production constant drifted (capped list): got '$PRODUCTION_CAP_REAL_DEFAULT_PATHS'"
+
+[ "$PRODUCTION_GLOB_REAL_DEFAULT_DIRS" = "/Users/athos/shared/logs" ] && ok "production constant: the glob directory is the app-log directory of wa-4j6gip" || bad "production constant drifted (glob dir): got '$PRODUCTION_GLOB_REAL_DEFAULT_DIRS'"
 
 rm -f "$LOG_REAPER_LOG"
 

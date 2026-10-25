@@ -95,6 +95,36 @@
 # is STILL not usable the capped class touches no file that cycle: it logs why
 # and counts every configured path as failed (ga-52drsg gate-fix 1).
 #
+# THIRD CLASS — GLOB (wa-4j6gip): every top-level *.log of the app-log directory.
+# 2026-10-16 the Mayor found 23 app logs of 40-160MB (~1.5GB) under
+# ~/shared/logs while this reaper logged "checked=6 rotated=0": the first class
+# only knows six names, so every daemon whose log was not on that list grew
+# without bound (on 2026-10-25 twenty were still over 20MB, ~730MB above a 10MB
+# tail). Naming files one by one cannot keep up with new daemons, so this class
+# looks at the directory: each cycle it finds the regular files named *.log
+# directly inside LOG_REAPER_GLOB_DIRS (no recursion; symlinks, *.jsonl, *.db and
+# the `*.log.1` backups do not match, so nothing but plain logs is ever cut) that
+# are at or over the cap, and gives each the tail-cap treatment of the second
+# class (same LOG_REAPER_CAP_MB / LOG_REAPER_KEEP_MB, same _tail_cap_one). Two
+# guards the named classes did not need, because nobody checked how each of these
+# writers opens its file:
+#   - a SPARSE file is left alone: one that occupies less than half of its length
+#     on disk belongs to a writer that is NOT O_APPEND (the selftest's CONTROL
+#     scenario) and has already put its offset back. A second cut would be undone
+#     by that writer's next write and would only rewrite the tail as NULs every
+#     cycle, and such a file costs little disk, which is what this reaper is for.
+#     WARN line, counted as skipped.
+#   - LOG_REAPER_GLOB_DENY: basename patterns (shell globs, one per line) that are
+#     never cut. Empty today; add a line when a *.log turns out not to be an
+#     append log.
+# LOG_REAPER_GLOB_DIRS (newline-joined; empty value = class off; unset = the real
+# directory, except in library mode) has its own production sentinel: the class is
+# forced to a dry-run when the list equals the real default and LOG_REAPER_PROD!=1.
+# A directory that cannot be listed is counted as failed and NOTHING in it is cut
+# that cycle ("could not look" is not "nothing over the cap"). Each cycle that has
+# a glob directory logs one extra "glob-cap complete: ..." line with the bytes
+# freed and the free space before/after.
+#
 # Kill switch: LOG_REAPER_ENABLED=0 -> no-op every cycle (logs skip reason).
 #
 # PRODUCTION SENTINEL (same ga-h565g pattern as scratchpad-reaper.sh /
@@ -136,13 +166,21 @@ $CITY/.gc/logs/gate-merge-survival-sweep-launchd.out
 $CITY/.gc/logs/lifecycle-coherence-janitor.log
 $CITY/.gc/logs/production-drift-guard-launchd.err"
 
+# wa-4j6gip glob class (see header): directories whose top-level *.log files are
+# capped. Same newline-joined-string idiom.
+LOG_REAPER_GLOB_REAL_DEFAULT_DIRS="/Users/athos/shared/logs"
+
 LOG_REAPER_PATHS="${LOG_REAPER_PATHS:-$LOG_REAPER_REAL_DEFAULT_PATHS}"
-# No colon in `-`: an explicitly empty value means "no capped paths".
+# No colon in `-`: an explicitly empty value means "no capped paths" / "no glob dirs".
 if [ "${LOG_REAPER_LIB:-0}" = "1" ]; then
   LOG_REAPER_CAP_PATHS="${LOG_REAPER_CAP_PATHS-}"
+  LOG_REAPER_GLOB_DIRS="${LOG_REAPER_GLOB_DIRS-}"
 else
   LOG_REAPER_CAP_PATHS="${LOG_REAPER_CAP_PATHS-$LOG_REAPER_CAP_REAL_DEFAULT_PATHS}"
+  LOG_REAPER_GLOB_DIRS="${LOG_REAPER_GLOB_DIRS-$LOG_REAPER_GLOB_REAL_DEFAULT_DIRS}"
 fi
+# Basename patterns the glob class never cuts (header). Empty = deny nothing.
+LOG_REAPER_GLOB_DENY="${LOG_REAPER_GLOB_DENY-}"
 CAP_MB="${LOG_REAPER_CAP_MB:-20}"
 KEEP_MB="${LOG_REAPER_KEEP_MB:-10}"
 LOG="${LOG_REAPER_LOG:-$CITY/.gc/logs/log-reaper.log}"
@@ -231,6 +269,34 @@ _cap_keep_bytes() {
   echo "$keep"
 }
 
+# _alloc_is_sparse <size_bytes> <alloc_bytes> → the glob class's guard against a
+# writer that is not O_APPEND (header). THREE answers, never two:
+#   0 = sparse: the file occupies less than half of its length on disk
+#   1 = dense:  it occupies at least half (a normal log; block rounding and the odd
+#               compressed extent never get near that line)
+#   2 = cannot tell: either number is missing or not a plain byte count, or the size
+#       is 0. The caller treats this as "do not cut", never as "dense".
+_alloc_is_sparse() {
+  local size="$1" alloc="$2"
+  case "$size" in ''|*[!0-9]*|0) return 2 ;; esac
+  case "$alloc" in ''|*[!0-9]*) return 2 ;; esac
+  if [ $(( alloc * 2 )) -lt "$size" ]; then return 0; fi
+  return 1
+}
+
+# _glob_denied <basename> <patterns> → 0 (true) iff the basename matches one of the
+# shell-glob patterns (one per line) of the deny list. An empty list, or empty lines
+# in it, match nothing: the deny list only ever REMOVES candidates.
+_glob_denied() {
+  local name="$1" pats="$2" pat
+  while IFS= read -r pat; do
+    [ -n "$pat" ] || continue
+    # shellcheck disable=SC2254  # an unquoted case pattern is the point: $pat is a glob
+    case "$name" in $pat) return 0 ;; esac
+  done <<< "$pats"
+  return 1
+}
+
 # ════════════════════════════════════════════════════════════════════════════
 # EXECUTION (side-effecting; NOT exercised by the selftest's pure-function
 # assertions, but exercised end-to-end via main() against fixture paths)
@@ -255,6 +321,35 @@ _free_bytes() {
   kb="$(df -k "$1" 2>/dev/null | awk 'NR==2 {print $4}')"
   case "$kb" in ''|*[!0-9]*) return 0 ;; esac
   echo $(( kb * 1024 ))
+}
+
+# _file_alloc_bytes <path> → bytes the file really occupies on disk (`stat -f %b`
+# counts 512-byte blocks), or EMPTY when stat cannot say. EMPTY is "cannot tell",
+# never 0: _alloc_is_sparse answers 2 to it and the caller cuts nothing.
+_file_alloc_bytes() {
+  local blocks
+  # vazio/falhou/ilegível → blocks não-numérico → imprime nada (o chamador não corta)
+  blocks="$(stat -f %b "$1" 2>/dev/null)"
+  case "$blocks" in ''|*[!0-9]*) return 0 ;; esac
+  echo $(( blocks * 512 ))
+}
+
+# _glob_list_dir <dir> <cap_bytes> → the regular files named *.log directly inside
+# <dir> (no recursion; `-type f` leaves symlinks out) that are at least cap_bytes
+# long, one per line. One `find` for the whole directory, so a cycle does not fork a
+# `stat` per file of a directory with hundreds of them; the caller still re-reads
+# each candidate's size before cutting. How it ended:
+#   0 = listed (an EMPTY output means nothing is over the cap)
+#   1 = find failed (unreadable entry, I/O error): the output is DROPPED, because a
+#       half list is "cannot tell", and the caller cuts nothing in this directory
+#   2 = <dir> is not a readable directory, or cap_bytes is not a positive byte count
+_glob_list_dir() {
+  local dir="$1" cap="$2" out
+  case "$cap" in ''|*[!0-9]*|0*) return 2 ;; esac
+  [ -d "$dir" ] && [ -r "$dir" ] || return 2
+  # vazio → rc 0 e saída vazia (nada acima do teto); falhou/ilegível → rc 1 e a saída parcial é descartada (o chamador conta failed e não corta)
+  out="$(find "$dir" -maxdepth 1 -type f -name '*.log' -size +"$(( cap - 1 ))"c 2>/dev/null)" || return 1
+  printf '%s\n' "$out"
 }
 
 # _tail_cap_one <path> <keep_bytes> → how the file ended up (the caller logs
@@ -318,35 +413,15 @@ _tail_cap_one() {
   return 1
 }
 
-# Second class (ga-52drsg, see header): cap each path in LOG_REAPER_CAP_PATHS at
-# CAP_MB, keeping the last KEEP_MB. Runs after the first class, shares ENABLED /
-# DRY_RUN, and has its own production sentinel (a test that overrides only the
-# first list must still never reach the real city logs).
-_cap_pass() {
-  local cap_dry="$DRY_RUN"
-  if _prod_sentinel_active "$LOG_REAPER_CAP_PATHS" "$LOG_REAPER_CAP_REAL_DEFAULT_PATHS" "$PROD"; then
-    log "SENTINEL: capped-log list equals the real default and no production opt-in is set (LOG_REAPER_PROD=1) — forcing dry-run for the tail-cap class (ga-h565g production sentinel)"
-    cap_dry=1
-  fi
-
-  # A knob that cannot be read as a size runs with the default (documented in the
-  # header) -- and the log says so, because the summary below echoes the RAW knob
-  # and would otherwise hide which limit really ran.
-  _mb_valid "$CAP_MB"  || log "WARN log-cap: LOG_REAPER_CAP_MB='$CAP_MB' is not a usable size — using the default 20 MB"
-  _mb_valid "$KEEP_MB" || log "WARN log-cap: LOG_REAPER_KEEP_MB='$KEEP_MB' is not a usable size — using the default 10 MB"
-
-  local cap_bytes keep_bytes limits_ok=1
-  cap_bytes="$(_mb_to_bytes "$CAP_MB" 20)"
-  keep_bytes="$(_cap_keep_bytes "$KEEP_MB" "$cap_bytes")"
-  # Gate in front of the loop below. A pair that is not two positive byte
-  # counts with keep < cap is "cannot tell what the limits are" -- not "under the
-  # cap" (nothing to do) and not "disk full" (cut everything): the cycle is inert.
-  if ! _cap_limits_usable "$cap_bytes" "$keep_bytes"; then
-    limits_ok=0
-    log "FAILED log-cap: the limits are not usable (cap_bytes='$cap_bytes' keep_bytes='$keep_bytes', from LOG_REAPER_CAP_MB='$CAP_MB' LOG_REAPER_KEEP_MB='$KEEP_MB') — NO capped log is touched this cycle"
-  fi
-  local checked=0 capped=0 skipped=0 missing=0 unreadable=0 failed=0 freed_bytes=0
-  local path size rc
+# The per-path step shared by the second class (named paths) and the glob class
+# (paths found in a directory): one line per path of <list>. <dry> = "1" only logs
+# what would be cut; <check_sparse> = "1" is the glob class, whose writers nobody
+# checked (header), so a sparse file is skipped there. The counters, cap_bytes,
+# keep_bytes and limits_ok are the LOCALS of _cap_pass, shared by dynamic scope:
+# this function only adds to the counters.
+_cap_loop() {
+  local list="$1" dry="$2" check_sparse="$3"
+  local path size alloc rc src
 
   while IFS= read -r path; do
     [ -n "$path" ] || continue
@@ -381,7 +456,27 @@ _cap_pass() {
       continue
     fi
 
-    if [ "$cap_dry" = "1" ]; then
+    if [ "$check_sparse" = "1" ]; then
+      # vazio/falhou/ilegível → alloc vazio → rc 2 → conta unreadable e NÃO corta; esparso (rc 0) → pula com aviso; denso (rc 1) → segue pro corte
+      alloc="$(_file_alloc_bytes "$path")"
+      _alloc_is_sparse "$size" "$alloc"
+      src=$?
+      case "$src" in
+        1) ;;
+        0)
+          skipped=$((skipped + 1))
+          log "WARN glob-cap: $path is sparse (${alloc} bytes on disk for ${size} bytes long) — its writer is probably not O_APPEND; NOT capped (a cut would be undone by its next write)"
+          continue
+          ;;
+        *)
+          unreadable=$((unreadable + 1))
+          log "glob-cap: cannot read the disk allocation of $path (size '${size}', allocated '${alloc}') — NOT capped this cycle"
+          continue
+          ;;
+      esac
+    fi
+
+    if [ "$dry" = "1" ]; then
       log "DRY-RUN would cap: $path (${size} bytes >= cap ${cap_bytes} bytes, would keep the last ${keep_bytes})"
       capped=$((capped + 1))
       freed_bytes=$((freed_bytes + size - keep_bytes))
@@ -415,7 +510,99 @@ _cap_pass() {
         log "FAILED to cap: $path (nothing freed)"
         ;;
     esac
-  done <<< "$LOG_REAPER_CAP_PATHS"
+  done <<< "$list"
+}
+
+# _bytes_to_mb_or_unknown <bytes> → whole megabytes, or the word "unknown" when the
+# number is missing: a free-space reading that failed must not print as "0 MB free".
+_bytes_to_mb_or_unknown() {
+  case "$1" in ''|*[!0-9]*) echo unknown ;; *) echo $(( $1 / 1048576 )) ;; esac
+}
+
+# Glob class (wa-4j6gip, see header), first half: turn LOG_REAPER_GLOB_DIRS into the
+# list of files to cut. Fills glob_list / glob_over / glob_denied / glob_dirs /
+# glob_dirs_failed and adds a directory it cannot list to checked and failed — all
+# LOCALS of _cap_pass, shared by dynamic scope like in _cap_loop.
+_glob_collect() {
+  local gdir gout grc gpath
+  while IFS= read -r gdir; do
+    [ -n "$gdir" ] || continue
+    glob_dirs=$((glob_dirs + 1))
+    # Unusable limits: there is no cap to look for, so no directory can be listed.
+    # Counted as failed (the FAILED line in _cap_pass says why), never as clean.
+    if [ "$limits_ok" != "1" ]; then
+      checked=$((checked + 1)); failed=$((failed + 1)); glob_dirs_failed=$((glob_dirs_failed + 1))
+      continue
+    fi
+    # vazio → grc 0 e gout vazio (nada acima do teto); falhou/ilegível → grc != 0: o diretório conta como failed e nada dele é cortado
+    gout="$(_glob_list_dir "$gdir" "$cap_bytes")"
+    grc=$?
+    if [ "$grc" != "0" ]; then
+      checked=$((checked + 1)); failed=$((failed + 1)); glob_dirs_failed=$((glob_dirs_failed + 1))
+      log "FAILED glob-cap: cannot list $gdir (rc=$grc; 1 = find failed, 2 = not a readable directory) — nothing in it is capped this cycle"
+      continue
+    fi
+    while IFS= read -r gpath; do
+      [ -n "$gpath" ] || continue
+      glob_over=$((glob_over + 1))
+      if _glob_denied "${gpath##*/}" "$LOG_REAPER_GLOB_DENY"; then
+        glob_denied=$((glob_denied + 1))
+        log "glob-cap: $gpath is on the deny list — skip"
+        continue
+      fi
+      glob_list="$glob_list$gpath"$'\n'
+    done <<< "$gout"
+  done <<< "$LOG_REAPER_GLOB_DIRS"
+}
+
+# Second class (ga-52drsg, see header): cap each path in LOG_REAPER_CAP_PATHS at
+# CAP_MB, keeping the last KEEP_MB. Runs after the first class, shares ENABLED /
+# DRY_RUN, and has its own production sentinel (a test that overrides only the
+# first list must still never reach the real city logs). Then the glob class
+# (wa-4j6gip): the *.log files found in LOG_REAPER_GLOB_DIRS, same limits, own
+# sentinel.
+_cap_pass() {
+  local cap_dry="$DRY_RUN" glob_dry="$DRY_RUN"
+  if _prod_sentinel_active "$LOG_REAPER_CAP_PATHS" "$LOG_REAPER_CAP_REAL_DEFAULT_PATHS" "$PROD"; then
+    log "SENTINEL: capped-log list equals the real default and no production opt-in is set (LOG_REAPER_PROD=1) — forcing dry-run for the tail-cap class (ga-h565g production sentinel)"
+    cap_dry=1
+  fi
+  if _prod_sentinel_active "$LOG_REAPER_GLOB_DIRS" "$LOG_REAPER_GLOB_REAL_DEFAULT_DIRS" "$PROD"; then
+    log "SENTINEL: glob-cap directory list equals the real default and no production opt-in is set (LOG_REAPER_PROD=1) — forcing dry-run for the glob class (ga-h565g production sentinel)"
+    glob_dry=1
+  fi
+
+  # A knob that cannot be read as a size runs with the default (documented in the
+  # header) -- and the log says so, because the summary below echoes the RAW knob
+  # and would otherwise hide which limit really ran.
+  _mb_valid "$CAP_MB"  || log "WARN log-cap: LOG_REAPER_CAP_MB='$CAP_MB' is not a usable size — using the default 20 MB"
+  _mb_valid "$KEEP_MB" || log "WARN log-cap: LOG_REAPER_KEEP_MB='$KEEP_MB' is not a usable size — using the default 10 MB"
+
+  local cap_bytes keep_bytes limits_ok=1
+  cap_bytes="$(_mb_to_bytes "$CAP_MB" 20)"
+  keep_bytes="$(_cap_keep_bytes "$KEEP_MB" "$cap_bytes")"
+  # Gate in front of the loop below. A pair that is not two positive byte
+  # counts with keep < cap is "cannot tell what the limits are" -- not "under the
+  # cap" (nothing to do) and not "disk full" (cut everything): the cycle is inert.
+  if ! _cap_limits_usable "$cap_bytes" "$keep_bytes"; then
+    limits_ok=0
+    log "FAILED log-cap: the limits are not usable (cap_bytes='$cap_bytes' keep_bytes='$keep_bytes', from LOG_REAPER_CAP_MB='$CAP_MB' LOG_REAPER_KEEP_MB='$KEEP_MB') — NO capped log is touched this cycle"
+  fi
+  local checked=0 capped=0 skipped=0 missing=0 unreadable=0 failed=0 freed_bytes=0
+  local glob_list="" glob_dirs=0 glob_dirs_failed=0 glob_over=0 glob_denied=0
+
+  _cap_loop "$LOG_REAPER_CAP_PATHS" "$cap_dry" 0
+
+  if [ -n "$LOG_REAPER_GLOB_DIRS" ]; then
+    local capped0="$capped" freed0="$freed_bytes" avail_before avail_after
+    # vazio/falhou/ilegível → _free_bytes imprime nada → o log diz "unknown", nunca "0"
+    avail_before="$(_free_bytes "${LOG_REAPER_GLOB_DIRS%%$'\n'*}")"
+    _glob_collect
+    _cap_loop "$glob_list" "$glob_dry" 1
+    # vazio/falhou/ilegível → idem
+    avail_after="$(_free_bytes "${LOG_REAPER_GLOB_DIRS%%$'\n'*}")"
+    log "glob-cap complete: dirs=$glob_dirs dirs_failed=$glob_dirs_failed over_cap=$glob_over denied=$glob_denied capped=$((capped - capped0)) freed_bytes=$((freed_bytes - freed0)) avail_before_mb=$(_bytes_to_mb_or_unknown "$avail_before") avail_after_mb=$(_bytes_to_mb_or_unknown "$avail_after") dry_run=$glob_dry"
+  fi
 
   log "cap cycle complete: checked=$checked capped=$capped skipped=$skipped missing=$missing unreadable=$unreadable failed=$failed freed_bytes=$freed_bytes cap_mb=$CAP_MB keep_mb=$KEEP_MB dry_run=$cap_dry"
 }
