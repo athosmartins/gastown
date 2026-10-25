@@ -13,6 +13,7 @@
 #   D. a contabilidade (_pilot_mbp_stamped_after) e o rc do apply guardado pelo gancho.
 #   E. a fiação: trechos reais de dispatch_lane (pulos pré-claim, bandeira) e de dispatch_one (yield, adoção, gancho, desfazer).
 #   F. o caminho inteiro (lane → claim → adoção → apply → sessão) com o bd falso com estado, e a prova de que o carimbo é o que o `apply` real recusa.
+#   H. o resumo por varredura (_pilot_mbp_stamped_summary): uma linha de log + um evento em mbp-node-route.jsonl com o que o passo fez e POR QUE parou — o terceiro estado (oráculo/check que falha) nunca é silêncio.
 #   G. mutantes: cada quebra tem de derrubar este selftest. Cada um roda o arquivo inteiro e para no 1º FAIL.
 #
 # Run:  bash packs/town-deltas/assets/pilot-dispatcher.mbp-stamped.selftest.sh
@@ -30,7 +31,7 @@ eq() { if [ "$2" = "$3" ]; then ok "$1"; else fail "$1 — obtido '$2', esperado
 [ -f "$DISPATCHER" ] || { echo "FATAL: $DISPATCHER não existe" >&2; exit 2; }
 fn_of() { awk -v n="$1" '$0 ~ "^"n"\\(\\)"{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER"; }
 FNS=""
-for _f in _pilot_mbp_stamped_pre _pilot_mbp_stamped_gate _pilot_mbp_stamped_check _pilot_mbp_stamped_after \
+for _f in _pilot_mbp_stamped_pre _pilot_mbp_stamped_gate _pilot_mbp_stamped_check _pilot_mbp_stamped_after _pilot_mbp_stamped_skip _pilot_mbp_stamped_tally _pilot_mbp_stamped_summary _pilot_mbp_stamped_upd_now \
           _pilot_wa_node_pass_memo_hit _pilot_wa_node_pass_memo_put _pilot_wa_node_pass_state _pilot_wa_node_adopt _pilot_wa_node_unadopt _pilot_bead_home_store \
           _pilot_mbp_node_decide _pilot_mbp_mini_full _pilot_mbp_node_open _pilot_mbp_node_settle _pilot_pool_live_count _pilot_live_session_count _pilot_wa_node_read _pilot_node_remote_open _pilot_node_remote_rollback \
           _pilot_node_idle_secs _pilot_slow_spawn_budget_spent _pilot_note_spawn_timing gc_json_or_unknown; do
@@ -39,7 +40,7 @@ for _f in _pilot_mbp_stamped_pre _pilot_mbp_stamped_gate _pilot_mbp_stamped_chec
   FNS="$FNS"$'\n'"$_b"
 done
 # as declarações REAIS dos globais do passo (um global sem declaração quebra em `set -u`, como no despachante)
-INIT_G="$(grep -E '^(_PMS_[A-Z]+|_PILOT_WA_MBP_PASS|_PMN_APPLY_RC|_PWP_LAST_STOP|_PWP_MODE|_PWP_MEMO_V|_PWP_ADOPTED)=' "$DISPATCHER")"
+INIT_G="$(grep -E '^(_PMS_[A-Z_]+|_PILOT_WA_MBP_PASS|_PMN_APPLY_RC|_PWP_LAST_STOP|_PWP_MODE|_PWP_MEMO_V|_PWP_ADOPTED)=' "$DISPATCHER")"
 [ -n "$INIT_G" ] || { echo "FATAL: os globais do passo (_PMS_*) não estão declarados em $DISPATCHER" >&2; exit 2; }
 # os trechos REAIS de dispatch_lane e dispatch_one
 YREG="$(awk 'f==0 && $0=="  _PNY_EXEMPT_THIS=0" {f=1; next} f==1 {print} f==1 && /^  fi$/ {exit}' "$DISPATCHER")"
@@ -85,7 +86,7 @@ if out is None:
 sys.stdout.write(out)
 sys.exit(int(os.environ.get("FAKE_CAP_RC", "0")))
 EOF
-# bd falso COM ESTADO: `bd -C <loja> show <id> --json` e `bd -C <loja> update <id> [--if-assignee X] [--assignee Y] [--status S] [--unset-metadata K] [--set-metadata K=V] -q`. Knobs: FAKE_BD_UPDATE_MODE=noop (sai 0 e não muda nada).
+# bd falso COM ESTADO: `bd -C <loja> show <id> --json` e `bd -C <loja> update <id> [--if-assignee X] [--assignee Y] [--status S] [--unset-metadata K] [--set-metadata K=V] -q`. Knobs: FAKE_BD_UPDATE_MODE=noop (sai 0 e não muda nada); FAKE_BD_SHOW_RC=N (o show sai com N).
 cat > "$T/bin/bd" <<'EOF'
 #!/usr/bin/env bash
 j=""; for x in "$@"; do j="$j|$x"; done
@@ -94,7 +95,7 @@ printf '%s\n' "$j" >> "$FAKE_BD_LOG"
 verb="${3:-}"
 echo "bd:$verb" >> "$FAKE_ORDER"
 case "$verb" in
-  show) printf '['; cat "$FAKE_STATE"; printf ']\n'; exit 0 ;;
+  show) [ -z "${FAKE_BD_SHOW_RC:-}" ] || exit "$FAKE_BD_SHOW_RC"; printf '['; cat "$FAKE_STATE"; printf ']\n'; exit 0 ;;
   update)
     [ "${FAKE_BD_UPDATE_MODE:-}" = noop ] && exit 0
     shift 4
@@ -163,11 +164,12 @@ sb() {
 }
 ID=wa-abc12
 UPD=2026-10-25T10:00:00Z
+CUR=2026-10-25T10:07:00Z   # o updated_at da bead DEPOIS da claim/adoção/soltura (medido: a claim move o updated_at; a chave lida antes nunca mais bate)
 BASE="$(sb $ID "" wa-worker "story:approved")"
 # mkb <arquivo> <status> <dono> <marca> <rota> — a bead no formato de `bd show` (o bd omite dono, marca e rota vazios)
 mkb() {
-  jq -n --arg id "$ID" --arg s "$2" --arg a "$3" --arg m "$4" --arg r "$5" \
-    '{id:$id,status:$s,title:"Título X",metadata:((if $m=="" then {} else {"pilot.wa_node_alias":$m} end) + (if $r=="" then {} else {"gc.routed_to":$r} end))} + (if $a=="" then {} else {assignee:$a} end)' > "$1"
+  jq -n --arg id "$ID" --arg s "$2" --arg a "$3" --arg m "$4" --arg r "$5" --arg u "$CUR" \
+    '{id:$id,status:$s,title:"Título X",updated_at:$u,metadata:((if $m=="" then {} else {"pilot.wa_node_alias":$m} end) + (if $r=="" then {} else {"gc.routed_to":$r} end))} + (if $a=="" then {} else {assignee:$a} end)' > "$1"
 }
 mkb "$T/b.stamped.json" open "" "" wa-worker
 mkb "$T/b.free.json" open "" "" ""
@@ -181,7 +183,7 @@ reset() {
   [ -f "$T/city/.beads/routes.jsonl" ] || printf '{"prefix":"wa","path":"rigs/whatsapp_automation"}\n' > "$T/city/.beads/routes.jsonl"
   [ -x "$T/scripts/mbp-node-dispatch.sh" ] || mv "$T/scripts/x.sh" "$T/scripts/mbp-node-dispatch.sh" 2>/dev/null
   cp "$T/b.stamped.json" "$T/state.json"
-  unset FAKE_VETO FAKE_REFUSAL FAKE_REFUSAL_RC FAKE_DOLT_SAT FAKE_CAP_OUT FAKE_CAP_RC FAKE_CHECK_OUT FAKE_CHECK_RC FAKE_APPLY_WRITES FAKE_RC FAKE_OUT FAKE_SESSIONS FAKE_GC_LIST_RC FAKE_GC_NEW_RC FAKE_BD_UPDATE_MODE \
+  unset FAKE_VETO FAKE_REFUSAL FAKE_REFUSAL_RC FAKE_DOLT_SAT FAKE_CAP_OUT FAKE_CAP_RC FAKE_CHECK_OUT FAKE_CHECK_RC FAKE_APPLY_WRITES FAKE_RC FAKE_OUT FAKE_SESSIONS FAKE_GC_LIST_RC FAKE_GC_NEW_RC FAKE_BD_UPDATE_MODE FAKE_BD_SHOW_RC \
         PRE_SLOW PRE DRY_RUN PILOT_DOLT_SATURATED_AT_START PILOT_WA_NODE_ROUTE PILOT_SPAWN_WA_WORKER PILOT_WA_MBP_STAMPED_PROBES PILOT_WA_MBP_STAMPED_MAX PILOT_WA_MBP_STAMPED_MAX_FAILS \
         PILOT_WA_NODE_PASS_MINI_TTL PILOT_WA_NODE_PASS_UNKNOWN_TTL PILOT_WA_NODE_PASS_RELEASED_TTL MBP_NODE_PY MBP_NODE_CAPACITY
   export PILOT_WA_MBP_ROUTE=on PILOT_TEST_WA_WORKER_LIVE_COUNT=4 PILOT_WA_WORKER_MAX=4 FAKE_BEAD2="$T/b.ap1.json"
@@ -212,6 +214,24 @@ eq "oráculo ausente: não abre" "$r" "rc=1 gate=no"; grep -q 'o oráculo .* nã
 reset; r=$(R '_pilot_mbp_stamped_gate; _pilot_mbp_stamped_gate; echo done' | tail -1); eq "duas perguntas na mesma varredura, uma ida ao oráculo (resposta ok guardada)" "$(ncap)" "1"
 reset; r=$(FAKE_CAP_OUT='{"verdict":"mini","free":0}' R '_pilot_mbp_stamped_gate || true; _pilot_mbp_stamped_gate || true; echo done' | tail -1); eq "...e a resposta 'não' também fica guardada (uma ida só)" "$(ncap)" "1"
 reset; r=$(MBP_NODE_CAPACITY="$T/scripts/mbp-node-capacity.py" MBP_NODE_PY=python3 gate); eq "MBP_NODE_CAPACITY e MBP_NODE_PY (os nomes de teste do despachante do MBP) valem" "$r" "rc=0 gate=ok"
+# ── o terceiro estado do oráculo AVISA (fail-closed mas nunca silencioso); a recusa limpa não
+gate2() { R 'rc=0; _pilot_mbp_stamped_gate || rc=$?; echo "rc=$rc gate=$_PMS_GATE why=${_PMS_GATE_WHY:-}"' | tail -1; }
+nwarn() { grep -c '^WARN' "$T/err" | tr -d ' '; }
+reset; r=$(gate2); eq "oráculo ok: abre, sem motivo de recusa e sem aviso" "$r $(nwarn)" "rc=0 gate=ok why= 0"
+reset; r=$(FAKE_CAP_RC=1 FAKE_CAP_OUT='{"verdict":"local","reason":"sem_vaga"}' gate2); eq "recusa LIMPA (rc 1, verdict local: Athos em casa ou sem vaga) é o 'não' normal: fecha SEM aviso" "$r $(nwarn)" "rc=1 gate=no why=local 0"
+reset; r=$(FAKE_CAP_RC=2 FAKE_CAP_OUT='{"verdict":"unknown","reason":"config"}' gate2); eq "oráculo que NÃO SOUBE dizer (rc 2, verdict unknown): fecha e AVISA" "$r $(nwarn)" "rc=1 gate=no why=unknown 1"
+grep -q 'não soube' "$T/err" && ok "...e o aviso diz que o oráculo não soube" || fail "aviso do rc 2: $(cat "$T/err")"
+for c in 124 137 143; do reset; r=$(FAKE_CAP_RC=$c FAKE_CAP_OUT='' gate2); eq "oráculo morto por prazo/sinal (rc $c): fecha e AVISA" "$r $(nwarn)" "rc=1 gate=no why=timeout 1"; done
+grep -q 'prazo' "$T/err" && ok "...e o aviso do prazo diz 'prazo'" || fail "aviso do prazo: $(cat "$T/err")"
+for spec in '0|não é json' '0|' '0|[]' '0|{"verdict":"mini","free":2}' '0|{"verdict":"node","free":0}' '0|{"verdict":"node"}' '0|{"verdict":"local"}' '1|' '1|lixo' '2|lixo' '2|{"verdict":"local"}' '1|{"verdict":"unknown"}' '1|{"verdict":"node","free":2}'; do
+  reset; r=$(FAKE_CAP_RC="${spec%%|*}" FAKE_CAP_OUT="${spec#*|}" gate2); eq "rc ${spec%%|*} com a saída '${spec#*|}' (não é um veredito coerente com o rc): fecha e AVISA como ilegível" "$r $(nwarn)" "rc=1 gate=no why=unreadable 1"
+done
+grep -q 'ilegível' "$T/err" && ok "...e o aviso diz 'ilegível'" || fail "aviso do ilegível: $(cat "$T/err")"
+for spec in '3|' '5|{"verdict":"node","free":2}' '126|' '127|'; do
+  reset; r=$(FAKE_CAP_RC="${spec%%|*}" FAKE_CAP_OUT="${spec#*|}" gate2); eq "rc ${spec%%|*} do oráculo (o python nem rodou direito): fecha e AVISA como erro" "$r $(nwarn)" "rc=1 gate=no why=error 1"
+done
+reset; mv "$T/scripts/mbp-node-capacity.py" "$T/scripts/x.py"; r=$(gate2); mv "$T/scripts/x.py" "$T/scripts/mbp-node-capacity.py"; eq "oráculo ausente: fecha, motivo missing, e o aviso de sempre" "$r $(nwarn)" "rc=1 gate=no why=missing 1"
+reset; r=$(FAKE_CAP_RC=2 FAKE_CAP_OUT='{"verdict":"unknown","reason":"config"}' R '_pilot_mbp_stamped_gate || true; _pilot_mbp_stamped_gate || true; _pilot_mbp_stamped_gate || true; echo done' | tail -1); eq "o 'não' guardado não repete o aviso: uma ida ao oráculo, UM aviso por varredura" "$(ncap) $(nwarn)" "1 1"
 echo; echo "=== B. o check: o terceiro estado nunca vira node ==="
 chk() { R '_pilot_mbp_stamped_check wa-abc12 '"$STORE"'; echo "v=$_PMS_V basis=$_PMS_BASIS"' | tail -1; }
 reset; r=$(chk); eq "node/label" "$r" "v=node basis=label"
@@ -223,6 +243,17 @@ for spec in '10|mini' '11|unknown' '124|timeout' '137|timeout' '143|timeout' '1|
   reset; r=$(FAKE_CHECK_RC="${spec%|*}" chk); eq "rc ${spec%|*} do check: ${spec#*|} (o rc decide, mesmo com a saída de node)" "$r" "v=${spec#*|} basis="
 done
 reset; mv "$T/scripts/mbp-node-dispatch.sh" "$T/scripts/x.sh"; r=$(chk); mv "$T/scripts/x.sh" "$T/scripts/mbp-node-dispatch.sh"; eq "mbp-node-dispatch.sh ausente: missing" "$r" "v=missing basis="
+# ── o check que falha AVISA (timeout/erro/ausente); o veredito limpo (node/mini/unknown) não
+reset; r=$(FAKE_CHECK_RC=10 chk); eq "check mini (rc 10): veredito limpo, sem aviso" "$r $(nwarn)" "v=mini basis= 0"
+reset; r=$(FAKE_CHECK_RC=11 chk); eq "check unknown (rc 11): veredito limpo, sem aviso" "$r $(nwarn)" "v=unknown basis= 0"
+reset; r=$(chk); eq "check node: sem aviso" "$r $(nwarn)" "v=node basis=label 0"
+reset; r=$(FAKE_CHECK_RC=124 chk); eq "check que estourou o prazo: timeout e UM aviso" "$r $(nwarn)" "v=timeout basis= 1"
+grep -q 'prazo' "$T/err" && ok "...que diz 'prazo' e o id da bead" || fail "aviso do timeout: $(cat "$T/err")"
+reset; r=$(FAKE_CHECK_RC=3 chk); eq "check com rc 3: error e UM aviso" "$r $(nwarn)" "v=error basis= 1"
+grep -q 'rc=3' "$T/err" && ok "...que traz o rc" || fail "aviso do error: $(cat "$T/err")"
+reset; r=$(FAKE_CHECK_OUT='lixo' chk); eq "check rc 0 com saída que não é veredito: error e UM aviso" "$r $(nwarn)" "v=error basis= 1"
+reset; mv "$T/scripts/mbp-node-dispatch.sh" "$T/scripts/x.sh"; r=$(chk); mv "$T/scripts/x.sh" "$T/scripts/mbp-node-dispatch.sh"; eq "mbp-node-dispatch.sh ausente: missing e UM aviso (o passo para por isso)" "$r $(nwarn)" "v=missing basis= 1"
+grep -q 'mbp-node-dispatch.sh' "$T/err" && ok "...que nomeia o script" || fail "aviso do missing: $(cat "$T/err")"
 echo; echo "=== C. a decisão: _pilot_mbp_stamped_pre ==="
 reset; r=$(P "$BASE")
 eq "carimbada livre, mini cheio, oráculo node, check node: oferece (0), uma sonda" "$r" "rc=0 why= stop= probes=1"
@@ -236,10 +267,12 @@ done
 reset; r=$(PILOT_WA_MBP_ROUTE=shadow P "$BASE"); eq "shadow: devolve 1 (nunca oferece), a sonda foi feita" "$r" "rc=1 why=shadow stop= probes=1"
 eq "shadow: nenhuma escrita em bead, uma linha em mbp-node-route.jsonl" "$(nbd) $(wc -l < "$JSONL" | tr -d ' ')" "0 1"
 jq -e --arg b "$ID" 'select(.event=="pilot-node-route" and .mode=="shadow" and .bead==$b and .stamped==true and .verdict=="node" and .basis=="label" and .prio=="2")' "$JSONL" >/dev/null && ok "...a linha traz bead, modo shadow, stamped:true, veredito node, base label e a prioridade" || fail "jsonl: $(cat "$JSONL")"
+reset; r=$(PILOT_WA_MBP_ROUTE=shadow DRY_RUN=1 P "$BASE"); eq "shadow com DRY_RUN=1: a linha grava, mas o dry-run NÃO lembra a bead (nenhuma memória)" "$r $(wc -l < "$JSONL" | tr -d ' ') $([ -e "$MEMO" ] && echo memo || echo -)" "rc=1 why=shadow stop= probes=1 1 -"
 reset; r=$(DRY_RUN=1 P "$BASE"); eq "on com DRY_RUN=1: devolve 1, sem escrita em bead" "$r $(nbd)" "rc=1 why=shadow stop= probes=1 0"
 jq -e 'select(.mode=="on-dry-run" and .stamped==true)' "$JSONL" >/dev/null && ok "...e a linha diz on-dry-run" || fail "jsonl: $(cat "$JSONL")"
 reset; mkdir -p "$CITYGC/mbp-node-route.jsonl"; r=$(PILOT_WA_MBP_ROUTE=shadow P "$BASE"); eq "jsonl impossível de gravar (é uma pasta): o shadow segue devolvendo 1" "$r" "rc=1 why=shadow stop= probes=1"
 grep -q 'linha-sombra de wa-abc12 (shadow, carimbada) NÃO gravada' "$T/err" && ok "...e AVISA a linha que se perdeu" || fail "sem aviso: $(cat "$T/err")"
+eq "...e NÃO lembra a bead (linha que não gravou = amostra perdida: volta na próxima varredura)" "$([ -e "$MEMO" ] && echo memo || echo -)" "-"
 rmdir "$CITYGC/mbp-node-route.jsonl"
 reset; r=$(PRE='_PMS_STOP=gate' P "$BASE"); eq "parada da varredura (_PMS_STOP) é pegajosa: não oferece, nada chamado" "$r $(ncalls) $(ncap)" "rc=1 why=stop:gate stop=gate probes=0 0 0"
 # a candidata
@@ -319,15 +352,40 @@ reset; r=$(FAKE_DOLT_SAT=1 P "$BASE"); eq "Dolt saturado agora: não oferece (cl
 reset; r=$(PILOT_DOLT_SATURATED_AT_START=1 P "$BASE"); eq "Dolt saturado no início da varredura: o mesmo" "$r" "rc=1 why=dolt-saturated stop=dolt-saturated probes=1"
 reset; r=$(FAKE_DOLT_SAT=1 PILOT_WA_MBP_ROUTE=shadow P "$BASE"); eq "o shadow não escreve em bead e por isso segue medindo com o Dolt saturado" "$r" "rc=1 why=shadow stop= probes=1"
 eq "NENHUMA das decisões acima escreveu em bead (o bd falso nunca foi chamado)" "$(nbd)" "0"
+# ── o que o resumo precisa saber (contadores) e as duas correções de escrita (DRY_RUN sem memória; shadow amostra cada bead UMA vez)
+PC() { BEAD="$1" R "${PRE:-:}"$'\n''rc=0; _pilot_mbp_stamped_pre "$BEAD" || rc=$?; echo "rc=$rc seen=${_PMS_SEEN:-} offered=${_PMS_OFFERED:-} checked=[${_PMS_CHECKED:-}] gate_why=${_PMS_GATE_WHY:-}"' | tail -1; }
+reset; r=$(PC "$BASE"); eq "oferecida: vista 1, oferecida 1, um check node" "$r" "rc=0 seen=1 offered=1 checked=[ node] gate_why="
+reset; r=$(PILOT_WA_MBP_ROUTE=off PC "$BASE"); eq "modo off: nem vista (o contador só anda com o passo ligado)" "$r" "rc=1 seen=0 offered=0 checked=[] gate_why="
+reset; r=$(PC "$(sb $ID mila-wa wa-worker "story:approved")"); eq "bead com dono: vista, não oferecida, nenhum check" "$r" "rc=1 seen=1 offered=0 checked=[] gate_why="
+reset; r=$(FAKE_CHECK_RC=10 PC "$BASE"); eq "check mini: vista, não oferecida, o veredito entra na lista" "$r" "rc=1 seen=1 offered=0 checked=[ mini] gate_why="
+reset; r=$(FAKE_CHECK_RC=124 PC "$BASE"); eq "check timeout: o veredito entra na lista" "$r" "rc=1 seen=1 offered=0 checked=[ timeout] gate_why="
+reset; r=$(FAKE_CHECK_RC=3 PC "$BASE"); eq "check error: o veredito entra na lista" "$r" "rc=1 seen=1 offered=0 checked=[ error] gate_why="
+reset; mv "$T/scripts/mbp-node-dispatch.sh" "$T/scripts/x.sh"; r=$(PC "$BASE"); mv "$T/scripts/x.sh" "$T/scripts/mbp-node-dispatch.sh"; eq "check ausente: o veredito entra na lista" "$r" "rc=1 seen=1 offered=0 checked=[ missing] gate_why="
+reset; r=$(FAKE_CAP_RC=1 FAKE_CAP_OUT='{"verdict":"local","reason":"sem_vaga"}' PC "$BASE"); eq "oráculo fechado (recusa limpa): nenhum check, o motivo do oráculo fica" "$r" "rc=1 seen=1 offered=0 checked=[] gate_why=local"
+reset; r=$(FAKE_CAP_RC=2 FAKE_CAP_OUT='{"verdict":"unknown"}' PC "$BASE"); eq "oráculo que não soube: o motivo do oráculo fica" "$r" "rc=1 seen=1 offered=0 checked=[] gate_why=unknown"
+reset; r=$(FAKE_CHECK_RC=10 B1="$BASE" B2="$(sb wa-def34 "" wa-worker "story:approved")" R 'for b in "$B1" "$B2"; do _pilot_mbp_stamped_pre "$b" || true; done; echo "seen=$_PMS_SEEN checked=[$_PMS_CHECKED]"' | tail -1); eq "duas candidatas: os contadores acumulam" "$r" "seen=2 checked=[ mini mini]"
+# DRY_RUN não escreve nem a memória (a "NENHUMA escrita" do comentário vale para bead E para o estado local, menos a linha-medição do jsonl)
+reset; r=$(DRY_RUN=1 FAKE_CHECK_RC=10 P "$BASE"); eq "DRY_RUN + check mini: não oferece e NÃO grava memória" "$r $([ -e "$MEMO" ] && echo memo || echo -)" "rc=1 why=check-mini stop= probes=1 -"
+reset; r=$(DRY_RUN=1 FAKE_CHECK_RC=11 P "$BASE"); eq "DRY_RUN + check unknown: NÃO grava memória" "$r $([ -e "$MEMO" ] && echo memo || echo -)" "rc=1 why=check-unknown stop= probes=1 -"
+reset; r=$(DRY_RUN=1 P "$BASE"); eq "DRY_RUN + check node: a linha-medição do jsonl sim, memória não" "$r $(wc -l < "$JSONL" | tr -d ' ') $([ -e "$MEMO" ] && echo memo || echo -)" "rc=1 why=shadow stop= probes=1 1 -"
+# shadow: a amostra anda — a bead que o check disse node é lembrada (sampled, 6 h) e a próxima varredura sonda OUTRAS
+reset; r=$(PILOT_WA_MBP_ROUTE=shadow P "$BASE"); eq "shadow: 1ª varredura mede a bead" "$r" "rc=1 why=shadow stop= probes=1"
+eq "...e a lembra como sampled (chave mbp:, updated_at, veredito)" "$(memo_last)" "mbp:$ID|$UPD|sampled"
+r=$(PILOT_WA_MBP_ROUTE=shadow P "$BASE"); eq "shadow: 2ª varredura NÃO sonda a mesma bead de novo (memo:sampled), sem 2ª linha no jsonl" "$r $(ncalls) $(wc -l < "$JSONL" | tr -d ' ')" "rc=1 why=memo:sampled stop= probes=0 1 1"
+r=$(PILOT_WA_MBP_ROUTE=shadow P "$(sb wa-def34 "" wa-worker "story:approved")"); eq "...e a candidata seguinte é medida (a amostra anda)" "$r $(wc -l < "$JSONL" | tr -d ' ')" "rc=1 why=shadow stop= probes=1 2"
+reset; PILOT_WA_MBP_ROUTE=shadow P "$BASE" >/dev/null; r=$(PILOT_WA_NODE_PASS_SAMPLED_TTL=0 PILOT_WA_MBP_ROUTE=shadow P "$BASE"); eq "shadow: PILOT_WA_NODE_PASS_SAMPLED_TTL=0 vence a amostra (sonda de novo)" "$r" "rc=1 why=shadow stop= probes=1"
+reset; PILOT_WA_MBP_ROUTE=shadow P "$BASE" >/dev/null; r=$(PILOT_WA_NODE_PASS_SAMPLED_TTL=abc PILOT_WA_MBP_ROUTE=shadow P "$BASE"); eq "TTL do sampled ilegível: vale o padrão (a amostra segue lembrada)" "$r" "rc=1 why=memo:sampled stop= probes=0"
+reset; r=$(PILOT_WA_MBP_ROUTE=on P "$BASE" >/dev/null; PILOT_WA_MBP_ROUTE=on P "$BASE"); eq "modo on NUNCA lembra node (a bead que o MBP leva é decidida a cada varredura)" "$r $([ -e "$MEMO" ] && echo memo || echo -)" "rc=0 why= stop= probes=1 -"
+reset; PILOT_WA_MBP_ROUTE=shadow P "$BASE" >/dev/null; r=$(PILOT_WA_MBP_ROUTE=on P "$BASE" | cut -d' ' -f1); eq "a amostra do shadow NÃO segura o modo on (quem liga o on com a amostra de 6 h na memória não perde a bead): oferece" "$r" "rc=0"
 echo; echo "=== D. a contabilidade: _pilot_mbp_stamped_after ==="
 # aft <rc de dispatch_one> [pré-trecho] — imprime "taken=N fails=N stop=… memo=…"
 aft() { RC="$1" R "_PMS_UPD='$UPD'; ${PRE:-:}"$'\n''_pilot_mbp_stamped_after wa-abc12 "$RC"; echo "taken=$_PMS_TAKEN fails=$_PMS_FAILS stop=$_PMS_STOP"' | tail -1; }
 reset; r=$(aft 0); eq "o MBP levou (rc 0): conta na varredura, nada mais" "$r $([ -e "$MEMO" ] && echo memo || echo -)" "taken=1 fails=0 stop= -"
 reset; r=$(PRE='_PMN_APPLY_RC=10' aft 0); eq "rc 0 não olha o rc do apply guardado (é o de outra tentativa)" "$r" "taken=1 fails=0 stop="
 reset; r=$(PRE='_PMS_TAKEN=1' aft 0); eq "contagem acumula" "$r" "taken=2 fails=0 stop="
-reset; r=$(PRE='_PMN_APPLY_RC=10' aft 1); eq "apply 10 (a bead não é do nó): falha, sem parar" "$r" "taken=0 fails=1 stop="; eq "...e memoriza mini" "$(memo_last)" "mbp:$ID|$UPD|mini"
-reset; r=$(PRE='_PMN_APPLY_RC=11' aft 1); eq "apply 11: falha" "$r" "taken=0 fails=1 stop="; eq "...e memoriza unknown" "$(memo_last)" "mbp:$ID|$UPD|unknown"
-reset; r=$(PRE='_PMN_APPLY_RC=' aft 1); eq "não chegou ao apply (adoção que falhou, mini sem lotar): falha" "$r" "taken=0 fails=1 stop="; eq "...e memoriza released" "$(memo_last)" "mbp:$ID|$UPD|released"
+reset; r=$(PRE='_PMN_APPLY_RC=10' aft 1); eq "apply 10 (a bead não é do nó): falha, sem parar" "$r" "taken=0 fails=1 stop="; eq "...e memoriza mini (sob o updated_at ATUAL da bead, que a claim moveu: não o de antes da claim)" "$(memo_last)" "mbp:$ID|$CUR|mini"
+reset; r=$(PRE='_PMN_APPLY_RC=11' aft 1); eq "apply 11: falha" "$r" "taken=0 fails=1 stop="; eq "...e memoriza unknown (updated_at atual)" "$(memo_last)" "mbp:$ID|$CUR|unknown"
+reset; r=$(PRE='_PMN_APPLY_RC=' aft 1); eq "não chegou ao apply (adoção que falhou, mini sem lotar): falha" "$r" "taken=0 fails=1 stop="; eq "...e memoriza released (updated_at atual)" "$(memo_last)" "mbp:$ID|$CUR|released"
 reset; r=$(PRE='_PMN_APPLY_RC=12' aft 1); eq "apply 12 (o MBP encheu ou a bead mudou): para a varredura, sem falha" "$r $([ -e "$MEMO" ] && echo memo || echo -)" "taken=0 fails=0 stop=capacity -"
 for c in 13 1 2 124 137 255; do reset; r=$(PRE="_PMN_APPLY_RC=$c" aft 1); eq "apply $c (a escrita pode ter pegado ou o gancho não leu): para sem memorizar" "$r $([ -e "$MEMO" ] && echo memo || echo -)" "taken=0 fails=0 stop=hook-held -"; done
 reset; r=$(PRE='_PMN_APPLY_RC=10; DISPATCH_RESULT=wa_node_unknown' aft 1); eq "o gancho segurou a bead (wa_node_unknown): para, mesmo com o rc 10 guardado, sem falha e sem memória" "$r $([ -e "$MEMO" ] && echo memo || echo -)" "taken=0 fails=0 stop=hook-held -"
@@ -336,6 +394,25 @@ reset; r=$(PILOT_WA_MBP_STAMPED_MAX_FAILS=1 PRE='_PMN_APPLY_RC=10' aft 1); eq "P
 reset; r=$(PILOT_WA_MBP_STAMPED_MAX_FAILS=abc PRE='_PMN_APPLY_RC=10; _PMS_FAILS=1' aft 1); eq "teto de falhas ilegível vale 3 (2 falhas: segue)" "$r" "taken=0 fails=2 stop="
 reset; r=$(PRE='_PMN_APPLY_RC=10; _PMS_FAILS=2; _PMS_STOP=gate' aft 1); eq "uma parada que já existe não é sobrescrita" "$r" "taken=0 fails=3 stop=gate"
 reset; r=$(PRE='_PMN_APPLY_RC=10; _PMS_UPD=' aft 1); eq "sem updated_at: a falha conta e não há linha de memória" "$r $([ -e "$MEMO" ] && echo memo || echo -)" "taken=0 fails=1 stop= -"
+# a chave é a que a PRÓXIMA varredura vai ler no `bd list`: o updated_at de DEPOIS da claim/adoção/soltura (medido 25/10: a claim moveu 05:12:20Z → 05:13:25Z)
+reset; r=$(PRE='_PMN_APPLY_RC=10' aft 1); r2=$(P "$(sb $ID "" wa-worker "story:approved" "$CUR")"); eq "a chave de agora acerta na varredura seguinte (a bead com o updated_at atual cai na memória)" "$r2" "rc=1 why=memo:mini stop= probes=0"
+reset; PRE='_PMN_APPLY_RC=10' aft 1 >/dev/null; r2=$(P "$BASE" | cut -d' ' -f1); eq "...e a chave de ANTES da claim (a que o passo guardava) não acertaria nunca: sonda" "$r2" "rc=0"
+reset; r=$(PRE='_PMN_APPLY_RC=10' aft 0 >/dev/null; nbd); eq "só lê a bead quando vai gravar memória: o rc 0 (levou) não chama o bd" "$r" "0"
+reset; r=$(PRE='_PMN_APPLY_RC=12' aft 1 >/dev/null; nbd); eq "...nem o apply 12 (capacidade, não memoriza)" "$r" "0"
+reset; r=$(PRE='_PMN_APPLY_RC=13' aft 1 >/dev/null; nbd); eq "...nem o apply 13 (incerto, não memoriza)" "$r" "0"
+reset; r=$(PRE='_PMN_APPLY_RC=10; _PMS_UPD=' aft 1 >/dev/null; nbd); eq "...nem sem updated_at capturado (a varredura seguinte também não teria chave)" "$r" "0"
+reset; PRE='_PMN_APPLY_RC=10' aft 1 >/dev/null; eq "...e, quando memoriza, lê UMA vez (show, só leitura)" "$(nbd) $(nupd)" "1 0"
+# o leitor do updated_at atual, direto: sem id ou sem loja nem chama o bd (vazio ≠ lido)
+reset; r=$(R "x=\$(_pilot_mbp_stamped_upd_now '' '$STORE') && echo \"rc=0 x=\$x\" || echo rc=1" | tail -1); eq "upd_now sem id: rc 1, nenhuma ida ao bd" "$r $(nbd)" "rc=1 0"
+reset; r=$(R "x=\$(_pilot_mbp_stamped_upd_now wa-abc12 '') && echo \"rc=0 x=\$x\" || echo rc=1" | tail -1); eq "upd_now sem loja: rc 1, nenhuma ida ao bd" "$r $(nbd)" "rc=1 0"
+reset; r=$(R "x=\$(_pilot_mbp_stamped_upd_now wa-abc12 '$STORE') && echo \"rc=0 x=\$x\" || echo rc=1" | tail -1); eq "upd_now com id e loja: devolve o updated_at atual, UMA ida ao bd" "$r $(nbd)" "rc=0 x=$CUR 1"
+# ilegível NÃO é vazio, e nenhum dos dois vira chave: sem releitura boa a memória fica de fora (inerte) e o aviso diz por quê
+reset; r=$(FAKE_BD_SHOW_RC=1 PRE='_PMN_APPLY_RC=10' aft 1); eq "show que falha: a falha conta, NÃO memoriza (sem chave confiável), UM aviso" "$r $([ -e "$MEMO" ] && echo memo || echo -) $(nwarn)" "taken=0 fails=1 stop= - 1"
+grep -q 'updated_at' "$T/err" && ok "...que fala do updated_at" || fail "aviso: $(cat "$T/err")"
+reset; jq 'del(.updated_at)' "$T/state.json" > "$T/state.new" && mv "$T/state.new" "$T/state.json"; r=$(PRE='_PMN_APPLY_RC=10' aft 1); eq "bead sem updated_at na releitura: NÃO memoriza, UM aviso" "$r $([ -e "$MEMO" ] && echo memo || echo -) $(nwarn)" "taken=0 fails=1 stop= - 1"
+reset; jq '.id="wa-outra"' "$T/state.json" > "$T/state.new" && mv "$T/state.new" "$T/state.json"; r=$(PRE='_PMN_APPLY_RC=10' aft 1); eq "releitura de OUTRA bead: NÃO memoriza (nunca a chave de outra), UM aviso" "$r $([ -e "$MEMO" ] && echo memo || echo -) $(nwarn)" "taken=0 fails=1 stop= - 1"
+reset; jq '.updated_at="não é data"' "$T/state.json" > "$T/state.new" && mv "$T/state.new" "$T/state.json"; r=$(PRE='_PMN_APPLY_RC=10' aft 1); eq "updated_at com cara de lixo: NÃO memoriza (a mesma regra de chave do passo), UM aviso" "$r $([ -e "$MEMO" ] && echo memo || echo -) $(nwarn)" "taken=0 fails=1 stop= - 1"
+reset; mv "$T/city/.beads/routes.jsonl" "$T/city/.beads/x.jsonl"; r=$(PRE='_PMN_APPLY_RC=10' aft 1); mv "$T/city/.beads/x.jsonl" "$T/city/.beads/routes.jsonl"; eq "loja desconhecida: NÃO memoriza, UM aviso, e a falha conta" "$r $([ -e "$MEMO" ] && echo memo || echo -) $(nwarn)" "taken=0 fails=1 stop= - 1"
 # o rc do apply guardado pelo gancho
 dec() { R "${PRE:-:}"$'\n''rc=0; _pilot_mbp_node_decide wa-abc12 '"$STORE"' wa-worker || rc=$?; echo "rc=$rc apply=[$_PMN_APPLY_RC]"' | tail -1; }
 reset; cp "$T/b.free.json" "$T/state.json"; r=$(FAKE_RC=12 dec); eq "o gancho em on guarda o rc do apply (12)" "$r" "rc=1 apply=[12]"
@@ -417,6 +494,7 @@ lrun() {   # lrun <pre rc> → "out=continue|break|fell pass=N calls=…"; o amb
 set -euo pipefail
 log() { :; }
 _pilot_mbp_stamped_pre() { echo pre >> "$FAKE_REG"; return "$FPRE"; }
+_pilot_mbp_stamped_skip() { :; }
 _pilot_priority_pool_bound_pre() { echo bound >> "$FAKE_REG"; return "${F_BOUND:-0}"; }
 _pilot_priority_yield_for() { echo yf >> "$FAKE_REG"; return "${F_YIELD:-0}"; }
 _pilot_priority_node_exempt_pre() { echo ne >> "$FAKE_REG"; return 1; }
@@ -445,6 +523,37 @@ r=$(PILOT_WA_MBP_ROUTE=on F_BOUND=1 lrun 1); eq "on, pre recusa: o pulo do teto 
 r=$(PILOT_WA_MBP_ROUTE=on F_BOUND=1 F_CAP=1 F_UNREAD=x lrun 1); eq "on, pre recusa: a parada por contagem ilegível" "$r" "out=break pass=0 calls=pre,bound,cap,note:rig_native_pool_count_unreadable,halt,"
 r=$(PILOT_WA_MBP_ROUTE=on F_UNREAD=x lrun 0); eq "on, pre oferece (0): NÃO pula pelo yield, NÃO pula pelo teto do pool, NÃO para pela contagem — vai a dispatch_one" "$r" "out=fell pass=1 calls=pre,"
 r=$(PILOT_WA_MBP_ROUTE=shadow lrun 1); eq "shadow chama o passo (que só registra) e o resto decide como sempre" "$r" "out=continue pass=0 calls=pre,bound,yf,ne,note:priority_yield,"
+# --- dispatch_lane: o motivo de cada "não" do passo entra no resumo (a função de verdade, o trecho de verdade)
+SKIPFN="$(fn_of _pilot_mbp_stamped_skip)"
+krun() {   # krun <pre rc> <_PMS_WHY que o pre deixou> → "out=… pass=N skipped=[…]"
+  : > "$T/reg"
+  FPRE="$1" FWHY="$2" SKIPFN="$SKIPFN" bash -c '
+set -euo pipefail
+log() { :; }
+_pilot_mbp_stamped_pre() { echo pre >> "$FAKE_REG"; _PMS_WHY="$FWHY"; return "$FPRE"; }
+_pilot_priority_pool_bound_pre() { return 1; }
+_pilot_pool_cap_full_for() { return 1; }
+_pilot_priority_waiter_note() { :; }
+_pilot_sweep_note() { :; }
+_PMS_WHY="stale"; _PMS_SKIPPED=""
+eval "$SKIPFN"
+lane() {
+  local pick="{}" pick_id=wa-abc12 OUT=break ITER=0
+  while :; do
+    ITER=$((ITER+1)); if [ "$ITER" -ge 2 ]; then OUT=continue; break; fi
+'"$LREG"'
+    OUT=fell; break
+  done
+  echo "out=$OUT pass=${_mbp_pass:-?} skipped=[${_PMS_SKIPPED:-}] calls=$(tr "\n" "," < "$FAKE_REG")"
+}
+lane' 2>/dev/null | tail -1
+}
+r=$(PILOT_WA_MBP_ROUTE=on krun 1 has-owner); eq "on, o passo recusa (has-owner): o motivo entra na lista do resumo" "$r" "out=fell pass=0 skipped=[ has-owner] calls=pre,"
+r=$(PILOT_WA_MBP_ROUTE=on krun 1 'refused:a b'); eq "...o motivo com espaço vira um token só (a lista é separada por espaço)" "$r" "out=fell pass=0 skipped=[ refused:a_b] calls=pre,"
+r=$(PILOT_WA_MBP_ROUTE=on krun 1 ''); eq "...motivo vazio vira '?' (nunca um buraco na lista)" "$r" "out=fell pass=0 skipped=[ ?] calls=pre,"
+r=$(PILOT_WA_MBP_ROUTE=on krun 0 ''); eq "on, o passo oferece (0): nada entra na lista" "$r" "out=fell pass=1 skipped=[] calls=pre,"
+r=$(PILOT_WA_MBP_ROUTE=off krun 1 has-owner); eq "off: o passo nem é chamado e a lista não anda (o _PMS_WHY velho não vaza)" "$r" "out=fell pass=0 skipped=[] calls="
+r=$(PILOT_WA_MBP_ROUTE=shadow krun 1 shadow); eq "shadow: o 'não' do passo (shadow) entra na lista" "$r" "out=fell pass=0 skipped=[ shadow] calls=pre,"
 # --- dispatch_lane: a bandeira em volta de dispatch_one ---
 drun() {   # drun <_mbp_pass> <rc de dispatch_one> → "flag_in=… apply_in=[…] res_in=[…] flag_out=… calls=…"
   : > "$T/reg"
@@ -532,7 +641,7 @@ eq "...nenhuma sessão aberta" "$(ngc)" "0"
 # F3 — o apply diz que a bead não é do nó (10): mesma devolução, e a bead é memorizada
 reset; r=$(FAKE_RC=10 e2e "$BASE")
 eq "apply 10: devolve o carimbo e conta a falha" "$r $(st4)" "out=dispatched res=rig_native_pool_session_cap_queued taken=0 fails=1 stop= flag=0 reg=claim,wa,rcq,note:rig_native_pool_session_cap_queued, open,-,-,wa-worker"
-eq "...e memoriza mini com a chave do MBP (o Hetzner não herda)" "$(memo_last)" "mbp:$ID|$UPD|mini"
+eq "...e memoriza mini com a chave do MBP (o Hetzner não herda) e o updated_at DEPOIS da claim e da soltura" "$(memo_last)" "mbp:$ID|$CUR|mini"
 # F4 — a adoção não pega (o bd não mudou nada): o gancho nem é chamado
 reset; r=$(FAKE_BD_UPDATE_MODE=noop e2e "$BASE")
 eq "adoção que não se confirma: o apply NÃO é chamado, o carimbo segue, a claim solta como fila" "$r $(st4) $(cat "$T/calls" | grep -c apply)" "out=dispatched res=rig_native_pool_session_cap_queued taken=0 fails=1 stop= flag=0 reg=claim,wa,rcq,note:rig_native_pool_session_cap_queued, open,-,-,wa-worker 0"
@@ -554,6 +663,85 @@ reset; r=$(FAKE_CAP_OUT='{"verdict":"mini","free":0}' e2e "$BASE")
 eq "oráculo do MBP fechado: o passo não oferece, o yield de sempre decide, nada escrito" "$r $(nbd) $(ngc)" "out=skipped res= taken=0 fails=0 stop=gate flag=0 reg=BOUND,YIELD,note:priority_yield, 0 0"
 reset; r=$(e2e "$(sb $ID "" "" "story:approved")")
 eq "bead de primeira vista (sem carimbo): o passo não a toca; segue o caminho de sempre (aqui, o yield)" "$r $(nbd)" "out=skipped res= taken=0 fails=0 stop= flag=0 reg=BOUND,YIELD,note:priority_yield, 0"
+# ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
+echo; echo "=== H. o resumo por varredura: o que o passo fez e por que parou ==="
+# A fonte disse: o oráculo que falha, o check que estoura e as paradas (capacity, hook-held, max-fails) eram FECHADO-EM-SILÊNCIO — o passo ligado parecia "sem MBP livre" quando na verdade estava cego.
+# Agora cada varredura com o passo ligado deixa UMA linha de log e UM evento em mbp-node-route.jsonl; o aviso do 3º estado sai onde ele acontece (A e B acima).
+sum() { R "${PRE:-:}"$'\n''rc=0; _pilot_mbp_stamped_summary || rc=$?; echo "rc=$rc"' | tail -1; }
+evl() { tail -1 "$JSONL" | jq -r "$1"; }
+nev() { [ -f "$JSONL" ] && wc -l < "$JSONL" | tr -d ' ' || echo 0; }
+reset; r=$(sum); eq "varredura sem nada a decidir: o resumo sai (rc 0) com UM evento" "$r $(nev)" "rc=0 1"
+eq "...evento mbp-stamped-summary, modo on, oráculo não perguntado, tudo zerado, sem parada" "$(evl '[.event,.mode,.gate,.seen,.probes,.offered,.taken,.fails,.stopped,(.skipped|length),(.checks|length),.dry_run]|join(",")')" "mbp-stamped-summary,on,not-asked,0,0,0,0,0,none,0,0,false"
+evl '.ts' | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$' && ok "...com ts em UTC" || fail "ts: $(evl .ts)"
+grep -qF 'LOG ga-w7qwl1.2.6: passo da carimbada no MBP (modo=on)' "$T/err" && ok "...e UMA linha de log com o modo" || fail "log: $(cat "$T/err")"
+eq "...e nenhum aviso" "$(nwarn)" "0"
+reset; r=$(PRE='_PMS_SEEN=5; _PMS_OFFERED=2; _PMS_SKIPPED=" has-owner has-owner not-stamped"; _PMS_CHECKED=" node mini timeout"; _PMS_PROBES=3; _PMS_TAKEN=1; _PMS_FAILS=1; _PMS_STOP=capacity; _PMS_GATE=ok' sum)
+eq "varredura com histórico: o resumo sai" "$r" "rc=0"
+eq "...contadores no evento" "$(evl '[.seen,.probes,.offered,.taken,.fails,.stopped,.gate]|join(",")')" "5,3,2,1,1,capacity,ok"
+eq "...as puladas agrupadas por motivo" "$(evl '.skipped|tojson')" '{"has-owner":2,"not-stamped":1}'
+eq "...os checks agrupados por veredito" "$(evl '.checks|tojson')" '{"mini":1,"node":1,"timeout":1}'
+for f in 'candidatas=5' 'has-owner=2' 'not-stamped=1' 'oráculo=ok' 'sondas=3 (node 1 · mini 1 · unknown 0 · timeout 1 · erro 0 · ausente 0)' 'oferecidas=2' 'levadas=1' 'falhas=1' 'parou: capacity'; do
+  grep -qF -- "$f" "$T/err" && ok "...a linha de log traz '$f'" || fail "log sem '$f': $(cat "$T/err")"
+done
+reset; sum >/dev/null; grep -qF 'parou: fim da lista' "$T/err" && ok "sem parada o log diz 'fim da lista'" || fail "log: $(cat "$T/err")"
+reset; sum >/dev/null; grep -qF 'puladas: nenhuma' "$T/err" && ok "sem puladas o log diz 'nenhuma'" || fail "log: $(cat "$T/err")"
+# o estado do oráculo, de cada jeito
+for spec in '||not-asked' 'ok||ok' 'no|local|local' 'no|unknown|unknown' 'no|timeout|timeout' 'no|error|error' 'no|unreadable|unreadable' 'no|missing|missing' 'no||no'; do
+  g="${spec%%|*}"; rest="${spec#*|}"; w="${rest%%|*}"; want="${rest#*|}"
+  reset; PRE="_PMS_GATE='$g'; _PMS_GATE_WHY='$w'" sum >/dev/null; eq "oráculo '$g' motivo '$w': o evento diz '$want'" "$(evl .gate)" "$want"
+done
+reset; PRE='_PMS_GATE=no; _PMS_GATE_WHY=unknown' sum >/dev/null; grep -qF 'oráculo=unknown' "$T/err" && ok "...e o log também" || fail "log: $(cat "$T/err")"
+# modo e dry-run
+reset; PILOT_WA_MBP_ROUTE=shadow sum >/dev/null; eq "shadow: o evento diz shadow" "$(evl '[.mode,.dry_run]|join(",")')" "shadow,false"
+reset; DRY_RUN=1 sum >/dev/null; eq "DRY_RUN: o evento marca dry_run" "$(evl '[.mode,.dry_run]|join(",")')" "on,true"
+grep -qF 'modo=on dry-run' "$T/err" && ok "...e o log também" || fail "log: $(cat "$T/err")"
+# o resumo nunca derruba a varredura
+reset; mkdir -p "$CITYGC/mbp-node-route.jsonl"; r=$(sum); eq "jsonl impossível de gravar (é uma pasta): o resumo sai com rc 0" "$r" "rc=0"
+grep -q 'resumo do passo da carimbada NÃO gravado' "$T/err" && ok "...AVISA que perdeu o evento" || fail "sem aviso: $(cat "$T/err")"
+grep -qF 'LOG ga-w7qwl1.2.6: passo da carimbada no MBP' "$T/err" && ok "...e a linha de log saiu mesmo assim" || fail "log: $(cat "$T/err")"
+rmdir "$CITYGC/mbp-node-route.jsonl"
+# os agrupadores
+tal() { R '_pilot_mbp_stamped_tally "$1"' _ "$1" 2>/dev/null | tail -1; }
+r=$(R 'x=$(_pilot_mbp_stamped_tally " a b a c"); echo "$x"' | tail -1); eq "tally agrupa e conta" "$r" '{"a":2,"b":1,"c":1}'
+r=$(R 'x=$(_pilot_mbp_stamped_tally ""); echo "$x"' | tail -1); eq "tally de lista vazia: {}" "$r" '{}'
+mkdir -p "$T/failbin"; printf '#!/bin/sh\nexit 5\n' > "$T/failbin/jq"; chmod +x "$T/failbin/jq"
+r=$(PATH="$T/failbin:$PATH" R 'x=$(_pilot_mbp_stamped_tally " a b"); echo "$x"' | tail -1); eq "tally com jq que falha: {\"tally-unreadable\":1} — NUNCA {} (falhou não é vazio)" "$r" '{"tally-unreadable":1}'
+reset; r=$(PATH="$T/failbin:$PATH" PRE='_PMS_SKIPPED=" a"' sum); eq "resumo com jq que falha: rc 0 mesmo assim (nunca derruba a varredura)" "$r" "rc=0"
+grep -qF 'puladas: ilegível' "$T/err" && ok "...a linha de log diz 'ilegível' (não soube contar NÃO é 'nenhuma pulada')" || fail "log: $(cat "$T/err")"
+grep -q 'resumo do passo da carimbada NÃO gravado' "$T/err" && ok "...e AVISA que o evento não saiu" || fail "sem aviso: $(cat "$T/err")"
+# a ponta a ponta: o oráculo que não soube dizer aparece no resumo, com UM aviso e a parada certa
+reset; r=$(FAKE_CAP_RC=2 FAKE_CAP_OUT='{"verdict":"unknown","reason":"config"}' B1="$BASE" B2="$(sb wa-def34 "" wa-worker "story:approved")" B3="$(sb wa-ghi56 mila-wa wa-worker "story:approved")" R '
+for b in "$B1" "$B2" "$B3"; do _pilot_mbp_stamped_pre "$b" || _pilot_mbp_stamped_skip; done
+_pilot_mbp_stamped_summary; echo done' | tail -1)
+eq "3 candidatas com o oráculo em rc 2: o evento diz gate unknown, 3 vistas, parada gate, 0 sondas" "$(evl '[.gate,.seen,.probes,.stopped,(.checks|length)]|join(",")')" "unknown,3,0,gate,0"
+eq "...as puladas: a que fechou o oráculo e as que a parada barrou" "$(evl '.skipped|tojson')" '{"gate":1,"stop:gate":2}'
+eq "...UM aviso só (o do oráculo), uma ida ao oráculo, nenhum check" "$(nwarn) $(ncap) $(ncalls)" "1 1 0"
+reset; r=$(FAKE_CHECK_RC=124 B1="$BASE" B2="$(sb wa-def34 "" wa-worker "story:approved")" R '
+for b in "$B1" "$B2"; do _pilot_mbp_stamped_pre "$b" || _pilot_mbp_stamped_skip; done
+_pilot_mbp_stamped_summary; echo done' | tail -1)
+eq "2 candidatas com o check estourando: 2 sondas, checks {timeout:2}, sem parada, oráculo ok" "$(evl '[.gate,.seen,.probes,(.checks|tojson),.stopped]|join(",")')" 'ok,2,2,{"timeout":2},none'
+eq "...um aviso por check que estourou (o orçamento de sondas limita)" "$(nwarn)" "2"
+reset; r=$(FAKE_CAP_RC=1 FAKE_CAP_OUT='{"verdict":"local","reason":"sem_vaga"}' B1="$BASE" R '
+_pilot_mbp_stamped_pre "$B1" || _pilot_mbp_stamped_skip
+_pilot_mbp_stamped_summary; echo done' | tail -1)
+eq "oráculo com recusa limpa: o evento diz gate local, parada gate, e NENHUM aviso (é o 'não' normal)" "$(evl '[.gate,.stopped]|join(",")') $(nwarn)" "local,gate 0"
+reset; r=$(FAKE_CHECK_RC=10 B1="$BASE" R '
+_pilot_mbp_stamped_pre "$B1" || _pilot_mbp_stamped_skip
+_pilot_mbp_stamped_summary; echo done' | tail -1)
+eq "check mini: checks {mini:1}, puladas {check-mini:1}, nenhum aviso" "$(evl '[(.checks|tojson),(.skipped|tojson)]|join(" ")') $(nwarn)" '{"mini":1} {"check-mini":1} 0'
+# a fiação no fluxo principal: UMA chamada, só com o passo ligado, antes do evento agregado da varredura
+SUMLINE="$(grep -F -- '_pilot_mbp_stamped_summary; fi' "$DISPATCHER" | head -1)"
+[ -n "$SUMLINE" ] || { echo "FATAL: a chamada do resumo no fluxo principal não foi achada em $DISPATCHER" >&2; exit 2; }
+srun() { PILOT_WA_MBP_ROUTE="$1" bash -c '_pilot_mbp_stamped_summary() { echo called; }
+'"$SUMLINE" 2>/dev/null; }
+unset PILOT_WA_MBP_ROUTE; r=$(bash -c '_pilot_mbp_stamped_summary() { echo called; }
+'"$SUMLINE" 2>/dev/null); eq "fluxo principal, PILOT_WA_MBP_ROUTE sem valor: o resumo NÃO é chamado" "$r" ""
+eq "fluxo principal, off: NÃO é chamado" "$(srun off)" ""
+eq "fluxo principal, on: chamado" "$(srun on)" "called"
+eq "fluxo principal, shadow: chamado" "$(srun shadow)" "called"
+eq "o resumo é chamado em UM lugar" "$(grep -cF -- '_pilot_mbp_stamped_summary; fi' "$DISPATCHER")" "1"
+w1=$(awk -v l="$SUMLINE" '$0 == l {print NR; exit}' "$DISPATCHER"); e1=$(awk '$0 == "_pilot_sweep_emit" {print NR; exit}' "$DISPATCHER"); d1=$(awk '$0 ~ /^dispatch_lane\(\)/ {print NR; exit}' "$DISPATCHER")
+{ [ -n "$w1" ] && [ -n "$e1" ] && [ -n "$d1" ] && [ "$d1" -lt "$w1" ] && [ "$w1" -lt "$e1" ] && [ $((e1 - w1)) -le 4 ]; } && ok "o resumo vem depois das pistas e logo ANTES do evento agregado da varredura (uma falha adiante não o perde)" || fail "ordem (dispatch_lane $d1, resumo $w1, evento $e1)"
 # O carimbo é mesmo o que o `apply` REAL recusa: o despachante do MBP de verdade, com bd, gc, classificador e oráculo falsos.
 # Os mutantes mexem no dispatcher do Pilot, não neste script: a seção não roda nas cópias.
 if [ -z "${MBP_STAMPED_SELFTEST_FILE:-}" ]; then
@@ -617,18 +805,36 @@ EOF
   if MBP_STAMPED_SELFTEST_FILE="$copy" bash "$SELF" >/dev/null 2>&1; then fail "mutante $name SOBREVIVEU"; else ok "mutante $name morreu"; fi
 }
 PRE_=_pilot_mbp_stamped_pre; GATE_=_pilot_mbp_stamped_gate; CHK_=_pilot_mbp_stamped_check; AFT_=_pilot_mbp_stamped_after; DEC_=_pilot_mbp_node_decide
+UPD_=_pilot_mbp_stamped_upd_now; SKP_=_pilot_mbp_stamped_skip; TAL_=_pilot_mbp_stamped_tally; SUM_=_pilot_mbp_stamped_summary
 # ── _pilot_mbp_stamped_gate
 mut gate-free-0          $GATE_ '(.free >= 1)' '(.free >= 0)'
 mut gate-qualquer-veredito $GATE_ '(.verdict == "node") and' '(.verdict != "") and'
-mut gate-rc-ignorado     $GATE_ '[ "$_g_rc" = 0 ] || return 1' ':'
+mut gate-rc-ignorado     $GATE_ '0:node) _PMS_GATE=ok; return 0 ;;' '*:node) _PMS_GATE=ok; return 0 ;;'
 mut gate-sem-cache       $GATE_ 'case "${_PMS_GATE:-}" in ok) return 0 ;; no) return 1 ;; esac' ':'
 mut gate-free-texto      $GATE_ '((.free | type) == "number") and' ''
+mut gate-rc1-node-abre   $GATE_ '0:node) _PMS_GATE=ok; return 0 ;;' '0:node|1:node) _PMS_GATE=ok; return 0 ;;'
+mut gate-sem-aviso-unknown $GATE_ 'warn "mbp-node: o oráculo do MBP não soube dizer' ': "mbp-node: o oráculo do MBP não soube dizer'
+mut gate-sem-aviso-prazo $GATE_ 'warn "mbp-node: o oráculo do MBP estourou o prazo' ': "mbp-node: o oráculo do MBP estourou o prazo'
+mut gate-sem-aviso-ilegivel $GATE_ 'warn "mbp-node: a resposta do oráculo do MBP é ilegível' ': "mbp-node: a resposta do oráculo do MBP é ilegível'
+mut gate-sem-aviso-erro  $GATE_ 'warn "mbp-node: o oráculo do MBP falhou' ': "mbp-node: o oráculo do MBP falhou'
+mut gate-sem-aviso-ausente $GATE_ 'warn "mbp-node: o oráculo $_g_cap não existe' ': "mbp-node: o oráculo $_g_cap não existe'
+mut gate-local-avisa     $GATE_ '1:local) _PMS_GATE_WHY=local ;;' '1:local) _PMS_GATE_WHY=local; warn "mbp-node: oráculo disse local" ;;'
+mut gate-porque-local-some $GATE_ '1:local) _PMS_GATE_WHY=local ;;' '1:local) : ;;'
+mut gate-porque-unknown-some $GATE_ '2:unknown) _PMS_GATE_WHY=unknown;' '2:unknown) :;'
+mut gate-prazo-vira-erro $GATE_ '124:*|137:*|143:*) _PMS_GATE_WHY=timeout;' '124:*|137:*|143:*) _PMS_GATE_WHY=error;'
+mut gate-ilegivel-vira-erro $GATE_ '0:*|1:*|2:*) _PMS_GATE_WHY=unreadable;' '0:*|1:*|2:*) _PMS_GATE_WHY=error;'
+mut gate-ausente-sem-porque $GATE_ '_PMS_GATE_WHY=missing; warn' ':; warn'
 # ── _pilot_mbp_stamped_check
 mut check-rc0-qualquer   $CHK_ 'if [ "${_sc_vb%%|*}" = node ]; then' 'if true; then'
 mut check-10-node        $CHK_ '10) _PMS_V=mini ;;' '10) _PMS_V=node ;;'
 mut check-erro-node      $CHK_ '_PMS_V="error"; _PMS_BASIS=""' '_PMS_V="node"; _PMS_BASIS=""'
 mut check-timeout-erro   $CHK_ '124|137|143) _PMS_V=timeout ;;' '124|137|143) _PMS_V=error ;;'
 mut check-sem-loja       $CHK_ 'check "$_sc_id" --store "$_sc_store"' 'check "$_sc_id"'
+mut check-sem-aviso-prazo $CHK_ 'timeout) warn "mbp-node: o check de' 'timeout) : "mbp-node: o check de'
+mut check-sem-aviso-erro $CHK_ 'warn "mbp-node: o check de $_sc_id falhou ou deu' ': "mbp-node: o check de $_sc_id falhou ou deu'
+mut check-sem-aviso-ausente $CHK_ 'warn "mbp-node: $_sc_dir/mbp-node-dispatch.sh não existe' ': "mbp-node: $_sc_dir/mbp-node-dispatch.sh não existe'
+mut check-limpo-avisa    $CHK_ '    timeout) warn "mbp-node: o check de' '    node|mini|unknown) warn "mbp-node: check limpo" ;;
+    timeout) warn "mbp-node: o check de'
 # ── _pilot_mbp_stamped_pre
 mut pre-off-roda         $PRE_ 'case "$_sp_mode" in shadow|on) ;; *) _PMS_WHY="off"; return 1 ;; esac' 'case "$_sp_mode" in off|shadow|on) ;; *) _PMS_WHY="off"; return 1 ;; esac'
 mut pre-stop-ignorada    $PRE_ '[ -z "${_PMS_STOP:-}" ] || { _PMS_WHY="stop:${_PMS_STOP}"; return 1; }' ':'
@@ -651,9 +857,9 @@ mut pre-teto-levadas-gt  $PRE_ 'if [ "${_PMS_TAKEN:-0}" -ge "$_sp_max" ]; then' 
 mut pre-sem-slow         $PRE_ 'if _pilot_slow_spawn_budget_spent; then' 'if false; then'
 mut pre-sem-mini-cheio   $PRE_ '_pilot_mbp_mini_full || { _PMS_WHY="mini-not-full"; return 1; }' ':'
 mut pre-sem-loja         $PRE_ '[ -n "$_sp_store" ] || { _PMS_WHY="store-unknown"; return 1; }' ':'
-mut pre-sem-memoria      $PRE_ 'if _pilot_wa_node_pass_memo_hit "mbp:$_sp_id" "$_PMS_UPD"; then' 'if false; then'
-mut pre-memoria-hetzner  $PRE_ 'if _pilot_wa_node_pass_memo_hit "mbp:$_sp_id" "$_PMS_UPD"; then' 'if _pilot_wa_node_pass_memo_hit "$_sp_id" "$_PMS_UPD"; then'
-mut pre-memo-put-hetzner $PRE_ 'mini|unknown) _pilot_wa_node_pass_memo_put "mbp:$_sp_id"' 'mini|unknown) _pilot_wa_node_pass_memo_put "$_sp_id"'
+mut pre-sem-memoria      $PRE_ 'if _pilot_wa_node_pass_memo_hit "mbp:$_sp_id" "$_PMS_UPD" &&' 'if false &&'
+mut pre-memoria-hetzner  $PRE_ 'if _pilot_wa_node_pass_memo_hit "mbp:$_sp_id" "$_PMS_UPD" &&' 'if _pilot_wa_node_pass_memo_hit "$_sp_id" "$_PMS_UPD" &&'
+mut pre-memo-put-hetzner $PRE_ '_pilot_wa_node_pass_memo_put "mbp:$_sp_id" "$_PMS_UPD" "$_PMS_V"' '_pilot_wa_node_pass_memo_put "$_sp_id" "$_PMS_UPD" "$_PMS_V"'
 mut pre-sem-recusa       $PRE_ '[ -z "$_sp_ref" ] || { _PMS_WHY="refused:$_sp_ref"; return 1; }' ':'
 mut pre-recusa-ilegivel  $PRE_ 'if ! _sp_ref=$(_pilot_priority_refusal_of "$_sp_b"); then _PMS_WHY="refusal-unknown"; return 1; fi' ':'
 mut pre-sem-oraculo      $PRE_ 'if ! _pilot_mbp_stamped_gate; then' 'if false; then'
@@ -661,8 +867,8 @@ mut pre-oraculo-nao-para $PRE_ '_PMS_STOP="gate"; _PMS_WHY="gate"; return 1;' '_
 mut pre-sem-teto-sondas  $PRE_ 'if [ "${_PMS_PROBES:-0}" -ge "$_sp_cap" ]; then' 'if false; then'
 mut pre-sonda-nao-conta  $PRE_ '_PMS_PROBES=$(( ${_PMS_PROBES:-0} + 1 ))' ':'
 mut pre-mini-passa       $PRE_ '    node) ;;
-    mini|unknown)' '    node|mini) ;;
-    mini|unknown)'
+    # DRY_RUN' '    node|mini) ;;
+    # DRY_RUN'
 mut pre-erro-passa       $PRE_ '*) _PMS_WHY="check-$_PMS_V"; return 1 ;;' '*) ;;'
 mut pre-missing-nao-para $PRE_ 'missing) _PMS_STOP="check-missing"; _PMS_WHY="check-missing"; return 1 ;;' 'missing) _PMS_WHY="check-missing"; return 1 ;;'
 mut pre-shadow-devolve-0 $PRE_ '    _PMS_WHY="shadow"
@@ -670,7 +876,7 @@ mut pre-shadow-devolve-0 $PRE_ '    _PMS_WHY="shadow"
     return 0'
 mut pre-dry-run-oferece  $PRE_ 'if [ "$_sp_mode" = shadow ] || [ "${DRY_RUN:-0}" = "1" ]; then' 'if [ "$_sp_mode" = shadow ]; then'
 mut pre-linha-sem-modo   $PRE_ '"$([ "$_sp_mode" = shadow ] && echo shadow || echo on-dry-run)"' 'shadow'
-mut pre-linha-sem-aviso  $PRE_ '|| warn "mbp-node: linha-sombra de' '|| : "mbp-node: linha-sombra de'
+mut pre-linha-sem-aviso  $PRE_ 'warn "mbp-node: linha-sombra de' ': "mbp-node: linha-sombra de'
 mut pre-dolt-ignorado    $PRE_ 'if [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ] || _dolt_saturated; then' 'if false; then'
 mut pre-dolt-so-no-inicio $PRE_ '[ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ] || _dolt_saturated' '[ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ]'
 mut pre-escreve          $PRE_ '  return 0
@@ -679,15 +885,65 @@ mut pre-escreve          $PRE_ '  return 0
   return 0
 }
 '
+mut pre-dry-run-memoriza $PRE_ 'mini|unknown) [ "${DRY_RUN:-0}" = "1" ] || _pilot_wa_node_pass_memo_put' 'mini|unknown) _pilot_wa_node_pass_memo_put'
+mut pre-sampled-vale-no-on $PRE_ ' && { [ "${_PWP_MEMO_V:-}" != sampled ] || [ "$_sp_mode" = shadow ]; }' ''
+mut pre-sampled-nunca-vale $PRE_ '|| [ "$_sp_mode" = shadow ]; }' '|| false; }'
+mut pre-shadow-sem-sampled $PRE_ 'then _pilot_wa_node_pass_memo_put "mbp:$_sp_id" "$_PMS_UPD" sampled; fi' 'then :; fi'
+mut pre-sampled-no-dry-run $PRE_ 'if [ "$_sp_mode" = shadow ] && [ "${DRY_RUN:-0}" != "1" ]; then' 'if [ "$_sp_mode" = shadow ]; then'
+mut pre-sampled-sem-linha $PRE_ '>> "$GC_CITY/.gc/mbp-node-route.jsonl"; } 2>/dev/null; then' '>> "$GC_CITY/.gc/mbp-node-route.jsonl"; } 2>/dev/null || true; then'
+mut pre-seen-nao-conta   $PRE_ '_PMS_SEEN=$(( ${_PMS_SEEN:-0} + 1 ))' ':'
+mut pre-seen-no-off      $PRE_ 'case "$_sp_mode" in shadow|on) ;; *) _PMS_WHY="off"; return 1 ;; esac
+  _PMS_SEEN=$(( ${_PMS_SEEN:-0} + 1 ))' '_PMS_SEEN=$(( ${_PMS_SEEN:-0} + 1 ))
+  case "$_sp_mode" in shadow|on) ;; *) _PMS_WHY="off"; return 1 ;; esac'
+mut pre-oferecida-nao-conta $PRE_ '_PMS_OFFERED=$(( ${_PMS_OFFERED:-0} + 1 ))' ':'
+mut pre-check-nao-lista  $PRE_ '_PMS_CHECKED="${_PMS_CHECKED:-} $_PMS_V"' ':'
 # ── _pilot_mbp_stamped_after e o rc do apply
 mut after-0-nao-conta    $AFT_ 'if [ "$_sa_rc" = 0 ]; then _PMS_TAKEN=$(( ${_PMS_TAKEN:-0} + 1 )); return 0; fi' 'if [ "$_sa_rc" = 0 ]; then return 0; fi'
-mut after-10-sem-memo    $AFT_ '10) _PMS_FAILS=$(( ${_PMS_FAILS:-0} + 1 )); _pilot_wa_node_pass_memo_put "mbp:$_sa_id" "${_PMS_UPD:-}" mini ;;' '10) _PMS_FAILS=$(( ${_PMS_FAILS:-0} + 1 )) ;;'
+mut after-10-sem-memo    $AFT_ '10) _PMS_FAILS=$(( ${_PMS_FAILS:-0} + 1 )); _sa_mv=mini ;;' '10) _PMS_FAILS=$(( ${_PMS_FAILS:-0} + 1 )) ;;'
 mut after-vazio-sem-falha $AFT_ "'') _PMS_FAILS=\$(( \${_PMS_FAILS:-0} + 1 )); " "'') "
-mut after-12-memoriza    $AFT_ '12) _PMS_STOP="capacity" ;;' '12) _PMS_STOP="capacity"; _pilot_wa_node_pass_memo_put "mbp:$_sa_id" "${_PMS_UPD:-}" mini ;;'
+mut after-12-memoriza    $AFT_ '12) _PMS_STOP="capacity" ;;' '12) _PMS_STOP="capacity"; _sa_mv=mini ;;'
 mut after-12-nao-para    $AFT_ '12) _PMS_STOP="capacity" ;;' '12) : ;;'
 mut after-outro-nao-para $AFT_ '*)  _PMS_STOP="hook-held" ;;' '*)  : ;;'
 mut after-hold-nao-para  $AFT_ 'if [ "${DISPATCH_RESULT:-}" = "wa_node_unknown" ]; then' 'if false; then'
 mut after-sem-max-fails  $AFT_ 'if [ -z "${_PMS_STOP:-}" ] && [ "${_PMS_FAILS:-0}" -ge "$_sa_mf" ]; then' 'if false; then'
+mut after-chave-capturada $AFT_ '"mbp:$_sa_id" "$_sa_cur" "$_sa_mv"' '"mbp:$_sa_id" "${_PMS_UPD:-}" "$_sa_mv"'
+mut after-releitura-falha-memoriza $AFT_ 'if [ -n "$_sa_store" ] && _sa_cur=$(_pilot_mbp_stamped_upd_now "$_sa_id" "$_sa_store"); then' 'if [ -n "$_sa_store" ] && { _sa_cur=$(_pilot_mbp_stamped_upd_now "$_sa_id" "$_sa_store") || _sa_cur="${_PMS_UPD:-}"; }; then'
+mut after-sem-aviso-releitura $AFT_ 'warn "mbp-node: não consegui ler o updated_at atual' ': "mbp-node: não consegui ler o updated_at atual'
+mut after-le-sempre      $AFT_ 'if [ -n "$_sa_mv" ] && [ -n "${_PMS_UPD:-}" ]; then' 'if [ -n "${_PMS_UPD:-}" ]; then'
+mut after-sem-upd-memoriza $AFT_ 'if [ -n "$_sa_mv" ] && [ -n "${_PMS_UPD:-}" ]; then' 'if [ -n "$_sa_mv" ]; then'
+mut updnow-outro-id      $UPD_ 'select(type == "object" and .id == $id)' 'select(type == "object")'
+mut updnow-vazio-ok      $UPD_ "case \"\$_un_u\" in ''|*[!0-9A-Za-z:.+_-]*) return 1 ;; esac" 'case "$_un_u" in *[!0-9A-Za-z:.+_-]*) return 1 ;; esac'
+mut updnow-charset       $UPD_ "case \"\$_un_u\" in ''|*[!0-9A-Za-z:.+_-]*) return 1 ;; esac" "case \"\$_un_u\" in '') return 1 ;; esac"
+mut updnow-array         $UPD_ 'if type == "array" then .[0] else . end |' ''
+mut updnow-sem-id-loja   $UPD_ '{ [ -n "$_un_id" ] && [ -n "$_un_store" ]; } || return 1' ':'
+# ── o resumo da varredura (skip · tally · summary) e a fiação em dispatch_lane e no fluxo principal
+mut skip-vazio-buraco    $SKP_ '[ -n "$_ss_w" ] || _ss_w="?"' ':'
+mut skip-espaco          $SKP_ '${_ss_w// /_}' '${_ss_w}'
+mut skip-nao-grava       $SKP_ '_PMS_SKIPPED="${_PMS_SKIPPED:-} ${_ss_w// /_}"' ':'
+mut tally-falha-vira-vazio $TAL_ "printf '%s' '{\"tally-unreadable\":1}'" "printf '%s' '{}'"
+mut tally-conta-vazio    $TAL_ 'map(select(length > 0))' 'map(.)'
+mut tally-sem-contar     $TAL_ 'map({key: .[0], value: length})' 'map({key: .[0], value: 1})'
+mut sum-gate-sem-porque  $SUM_ 'no) _ss_gate="${_PMS_GATE_WHY:-no}" ;;' 'no) _ss_gate=no ;;'
+mut sum-gate-ok-some     $SUM_ 'ok) _ss_gate=ok ;;' 'ok) ;;'
+mut sum-log-sem-parada   $SUM_ 'parou: ${_ss_stop:-fim da lista}' 'parou: fim da lista'
+mut sum-evento-sem-parada $SUM_ '--arg stopped "${_ss_stop:-none}"' '--arg stopped "none"'
+mut sum-sem-log          $SUM_ '  log "ga-w7qwl1.2.6: passo da carimbada no MBP' '  : "ga-w7qwl1.2.6: passo da carimbada no MBP'
+mut sum-nao-grava        $SUM_ '>> "$_ss_f"; }' '>> /dev/null; }'
+mut sum-sem-aviso        $SUM_ 'warn "mbp-node: resumo do passo da carimbada NÃO gravado' ': "mbp-node: resumo do passo da carimbada NÃO gravado'
+mut sum-evento-vazio-ok  $SUM_ 'if [ -z "$_ss_ev" ] || ! {' 'if ! {'
+mut sum-dry-nao-marca    $SUM_ 'if [ "${DRY_RUN:-0}" = "1" ]; then _ss_dry=true;' 'if false; then _ss_dry=true;'
+mut sum-dry-sem-texto    $SUM_ '_ss_mt="$_ss_mt dry-run"' ':'
+mut sum-conta-node       $SUM_ 'node) _ss_cn=$(( _ss_cn + 1 )) ;;' 'node) ;;'
+mut sum-conta-prazo-erro $SUM_ 'timeout) _ss_ct=$(( _ss_ct + 1 )) ;;' 'timeout) _ss_ce=$(( _ss_ce + 1 )) ;;'
+mut sum-rc-1             $SUM_ '  return 0
+}
+' '  return 1
+}
+'
+mut sum-ilegivel-nenhuma $SUM_ '[ -n "$_ss_skl" ] || _ss_skl="ilegível"' '[ -n "$_ss_skl" ] || _ss_skl="nenhuma"'
+mut sum-sem-puladas      $SUM_ '--argjson skipped "$_ss_skt"' "--argjson skipped '{}'"
+mut sum-sem-checks       $SUM_ '--argjson checks "$_ss_ckt"' "--argjson checks '{}'"
+mut sum-candidatas-zero  $SUM_ 'candidatas=${_PMS_SEEN:-0}' 'candidatas=0'
 mut apply-rc-nao-grava   $DEC_ 'if [ "$_dry" != 1 ]; then _PMN_APPLY_RC="$_rc"; fi' ':'
 mut apply-rc-nao-zera    $DEC_ '  _PMN_APPLY_RC=""
   case "$_mode" in' '  case "$_mode" in'
@@ -708,6 +964,23 @@ mut lane-bandeira-fica-falha - '      _PILOT_WA_MBP_PASS=0
 mut lane-sem-after-ok    - '_pilot_mbp_stamped_after "$pick_id" 0; fi' ':; fi'
 mut lane-sem-after-falha - '_pilot_mbp_stamped_after "$pick_id" 1; fi' ':; fi'
 mut lane-after-sempre    - 'if [ "$_mbp_pass" = 1 ]; then _pilot_mbp_stamped_after "$pick_id" 1; fi' '_pilot_mbp_stamped_after "$pick_id" 1'
+mut lane-sem-skip        - 'if [ "$_mbp_pass" != 1 ] && [ "${PILOT_WA_MBP_ROUTE:-off}" != off ]; then _pilot_mbp_stamped_skip; fi' ':'
+mut lane-skip-off        - '[ "$_mbp_pass" != 1 ] && [ "${PILOT_WA_MBP_ROUTE:-off}" != off ]; then _pilot_mbp_stamped_skip' '[ "$_mbp_pass" != 1 ]; then _pilot_mbp_stamped_skip'
+mut lane-skip-oferecida  - '[ "$_mbp_pass" != 1 ] && [ "${PILOT_WA_MBP_ROUTE:-off}" != off ]; then _pilot_mbp_stamped_skip' '[ "${PILOT_WA_MBP_ROUTE:-off}" != off ]; then _pilot_mbp_stamped_skip'
+# ── o fluxo principal: o resumo sai com o passo ligado, antes do evento agregado
+mut main-resumo-sempre   - 'if [ "${PILOT_WA_MBP_ROUTE:-off}" != off ]; then _pilot_mbp_stamped_summary; fi' 'if true; then _pilot_mbp_stamped_summary; fi'
+mut main-resumo-so-on    - '!= off ]; then _pilot_mbp_stamped_summary; fi' '= on ]; then _pilot_mbp_stamped_summary; fi'
+mut main-resumo-sem-chamada - 'then _pilot_mbp_stamped_summary; fi' 'then :; fi'
+mut main-resumo-depois   - 'if [ "${PILOT_WA_MBP_ROUTE:-off}" != off ]; then _pilot_mbp_stamped_summary; fi
+
+# ga-ov3gow: the sweep'\''s ONE aggregate `pilot_sweep` line (schema: the block above dispatch_lane). After
+# _pool_saturated_sweep exists — it is a field — and before Step 5, so a Step 5 failure cannot cost the event.
+_pilot_sweep_emit
+' '# ga-ov3gow: the sweep'\''s ONE aggregate `pilot_sweep` line (schema: the block above dispatch_lane). After
+# _pool_saturated_sweep exists — it is a field — and before Step 5, so a Step 5 failure cannot cost the event.
+_pilot_sweep_emit
+if [ "${PILOT_WA_MBP_ROUTE:-off}" != off ]; then _pilot_mbp_stamped_summary; fi
+'
 # ── dispatch_one
 mut um-yield-contornado-nao - '  elif [ "${_PILOT_WA_MBP_PASS:-0}" = "1" ]; then
     # ga-w7qwl1.2.6: a carimbada que dispatch_lane entregou ao MBP' '  elif false; then

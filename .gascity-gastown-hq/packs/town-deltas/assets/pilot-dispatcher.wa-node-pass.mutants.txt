@@ -15,7 +15,9 @@ memoria ignora updated_at	$2 == id && $3 == upd { v = $4;	$2 == id { v = $4;
 memoria ignora o TTL	if (now - ts < t) { print v; exit 0 } exit 1 }	print v; exit 0 }
 unknown usa o TTL do mini	((v == "unknown") ? tu :	((v == "unknown") ? tm :
 memoria vale a PRIMEIRA linha	$2 == id && $3 == upd { v = $4; ts = $1 + 0; hit = 1 }	$2 == id && $3 == upd && !hit { v = $4; ts = $1 + 0; hit = 1 }
-memoria: released sem TTL proprio	((v == "released") ? tr : 0)	((v == "released") ? tm : 0)
+memoria: released sem TTL proprio	((v == "released") ? tr : ((v == "sampled") ? tsm : 0))	((v == "released") ? tm : ((v == "sampled") ? tsm : 0))
+memoria: sampled sem TTL proprio	((v == "sampled") ? tsm : 0)	((v == "sampled") ? 0 : 0)
+memoria: sampled usa o TTL do mini	((v == "sampled") ? tsm : 0)	((v == "sampled") ? tm : 0)
 memoria nao apara	  if [ "$_mp_n" -gt 5000 ]; then	  if false; then
 rc 0 com JSON que nao e node vira node	if [ "${_pc_vb%%|*}" = node ]; then _PWP_V=node; _PWP_BASIS="${_pc_vb#*|}"; fi ;;	_PWP_V=node; _PWP_BASIS="${_pc_vb#*|}" ;;
 rc 10 vira node	    10) _PWP_V=mini ;;	    10) _PWP_V=node ;;

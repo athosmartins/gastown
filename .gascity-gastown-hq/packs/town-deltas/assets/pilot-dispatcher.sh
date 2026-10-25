@@ -12843,14 +12843,17 @@ _pilot_mbp_node_settle() {
 
 # ── ga-w7qwl1.2.6: adoção do carimbo — a bead do WA que o mini enfileirou também pode ir ao MBP ─────────────────────────────────────────────
 # O gancho do corte 2 (_pilot_mbp_node_decide) roda dentro de dispatch_one, depois da claim, e o `apply` recusa (rc 12) a bead que já traz gc.routed_to=wa-worker — o carimbo que o PRÓPRIO Pilot grava quando a cede ao yield ou a enfileira no teto do pool.
-# Só que a bead carimbada é pulada em dispatch_lane ANTES da claim, sem escrever nada, justamente quando o pool do mini está cheio: a condição do MBP. Medido 24/10 à noite: 106 de 113 beads de WA aprovadas e livres traziam o carimbo e o gancho nunca foi chamado
+# Só que a bead carimbada é pulada em dispatch_lane ANTES da claim, sem escrever em bead, justamente quando o pool do mini está cheio: a condição do MBP. Medido 24/10 à noite: 106 de 113 beads de WA aprovadas e livres traziam o carimbo e o gancho nunca foi chamado
 # para elas (mbp-node-route.jsonl: 5 linhas, todas `apply` rc 12). Este passo roda em dispatch_lane, depois da guarda só-nó do disk floor e ANTES dos pulos de yield e de teto do pool, para a bead de WA livre com rota EXATAMENTE wa-worker; só com PILOT_WA_MBP_ROUTE on|shadow:
 #   _pilot_mbp_stamped_pre   decide, sem escrever em bead nenhuma, se a candidata é oferecida ao MBP: pré-filtro, Hetzner primeiro, orçamentos, mini cheio, memória, oráculo do MBP (uma vez por varredura), `check` (só leitura). Devolve 0 → dispatch_lane NÃO pula a bead e a entrega a dispatch_one com _PILOT_WA_MBP_PASS=1.
 #   dispatch_one com a bandeira: sem yield (a vaga do MBP não é a que a P0/P1 espera); claim; guarda de dono; o gancho do Hetzner (que recusa a carimbada com rc 12 e devolve 1); então ADOTA o carimbo (_pilot_wa_node_adopt: tira e confirma lendo) e chama _pilot_mbp_node_decide.
 #     rc 0 → a bead ficou com o MBP e a sessão está aberta, e o resto é o caminho de sempre do nó (story:in-flight etc.). rc 1 → devolve o carimbo (só se a bead segue como foi deixada), solta a claim (tira pilot:dispatching e os carimbos de tempo) e conta como fila de capacidade: NUNCA cai no carimbo/spawn do mini.
 #     rc 2 → segura, sem devolver o carimbo (o MBP pode ter ficado com a bead).
 #   _pilot_mbp_stamped_after contabiliza o resultado: levou (conta contra o teto da varredura) · apply 12 (MBP cheio: o passo para na varredura) · 10/11 (a bead não é do nó: memoriza) · qualquer outro rc (para).
-# shadow (e DRY_RUN) só registram em $GC_CITY/.gc/mbp-node-route.jsonl o que iria ao MBP (stamped:true): nenhuma escrita em bead. Padrão off: sem a variável o passo volta antes de ler qualquer coisa.
+#   _pilot_mbp_stamped_summary (uma vez por varredura, antes do evento agregado) deixa UMA linha de log e UM evento `mbp-stamped-summary` em mbp-node-route.jsonl: candidatas, puladas por motivo, estado do oráculo, sondas por veredito, oferecidas/levadas/falhas e POR QUE parou.
+#   O oráculo ou o `check` que falha (prazo, rc de erro, saída ilegível, script ausente, verdict unknown) AVISA onde acontece: o passo segue fechado, mas nunca em silêncio. A recusa limpa do oráculo (verdict local) é o "não" normal e não avisa.
+# shadow (e DRY_RUN) só registram em $GC_CITY/.gc/mbp-node-route.jsonl o que iria ao MBP (stamped:true): nenhuma escrita em bead (o jsonl e a memória de vereditos são arquivos locais: o shadow lembra a bead medida por 6 h para a amostra andar, o DRY_RUN não grava nem a memória).
+# Padrão off: sem a variável o passo volta antes de ler qualquer coisa.
 # Risco que fica, e é limitado: o carimbo sai com `bd update --unset-metadata` (sem comparação atômica); entre a retirada e o `apply` a bead está livre e sem rota. A comparação atômica do `apply` (--if-assignee "" --if-status open) e a releitura do dono antes do gancho cobrem a corrida com um segundo construtor.
 # Orçamentos da varredura: PILOT_WA_MBP_STAMPED_PROBES (sondas de `check`, padrão 12) · PILOT_WA_MBP_STAMPED_MAX (beads levadas, padrão 2 = os slots do MBP; 0 desliga só este passo) · PILOT_WA_MBP_STAMPED_MAX_FAILS (tentativas que o apply/adoção desmentiu, padrão 3).
 _PMS_STOP=""              # motivo (sticky) de não oferecer mais nenhuma carimbada ao MBP nesta varredura
@@ -12860,37 +12863,57 @@ _PMS_PROBES=0             # sondas de `check` gastas nesta varredura
 _PMS_TAKEN=0              # carimbadas que o MBP levou nesta varredura
 _PMS_FAILS=0              # tentativas que o apply ou a adoção desmentiram nesta varredura
 _PMS_GATE=""              # veredito do oráculo do MBP nesta varredura: "" (não lido) | ok | no
+_PMS_GATE_WHY=""          # por que o oráculo disse não: "" | local (recusa limpa) | unknown | timeout | error | unreadable | missing
 _PMS_V=""                 # saída de _pilot_mbp_stamped_check: node | mini | unknown | timeout | error | missing
 _PMS_BASIS=""             # a base do veredito node (label | text)
+_PMS_SEEN=0               # candidatas que _pilot_mbp_stamped_pre viu nesta varredura (só com o passo ligado)
+_PMS_OFFERED=0            # as que o passo ofereceu a dispatch_one (pre devolveu 0)
+_PMS_SKIPPED=""           # o motivo do "não" de cada candidata, um token por candidata (lista separada por espaço, ver _pilot_mbp_stamped_skip)
+_PMS_CHECKED=""           # o veredito de cada sonda de `check`, um token por sonda (lista separada por espaço)
 _PILOT_WA_MBP_PASS=0      # 1 SÓ enquanto dispatch_lane entrega uma carimbada a dispatch_one; dispatch_one lê
 _PMN_APPLY_RC=""          # o rc do `apply` da última _pilot_mbp_node_decide (vazio = não chegou ao apply de verdade)
 
 # _pilot_mbp_stamped_gate — o oráculo do MBP (mbp-node-capacity.py --json verdict: Athos fora, MBP saudável, bandeira ligada, vaga), perguntado UMA vez por varredura. exit 0 iff `node` com vaga. Sem ele cada carimbada gastaria claim + adoção + apply + soltura
 # só para o `apply` ouvir o mesmo "não" do oráculo. O `apply` repete a pergunta antes de escrever: este é só o filtro barato, a decisão continua sendo dele.
-# vazio (sem saída) → no; falhou/ilegível (script ausente, prazo, rc fora de 0, JSON ruim, `node` sem free inteiro >= 1) → no também: só rc 0 + verdict node + free >= 1 deixa passar.
+# vazio (sem saída) → no; falhou/ilegível (script ausente, prazo, rc fora de 0, JSON ruim, `node` sem free inteiro >= 1) → no também: só rc 0 + verdict node + free >= 1 deixa passar. O contrato do oráculo: exit 0 node · exit 1 local (a recusa
+# LIMPA: Athos em casa, sem vaga — o "não" normal, sem aviso) · exit 2 unknown (não soube dizer). Tudo que não é a recusa limpa fecha E AVISA, uma vez por varredura (a resposta fica guardada), e deixa o porquê em _PMS_GATE_WHY
+# para o resumo: local | unknown | timeout | error (rc fora do contrato) | unreadable (rc e saída que não combinam, ou JSON ruim) | missing (script ausente).
 _pilot_mbp_stamped_gate() {
-  local _g_dir _g_cap _g_py _g_out="" _g_rc=0 _g_v=""
+  local _g_dir _g_cap _g_py _g_out="" _g_rc=0 _g_v="" _g_snip=""
   case "${_PMS_GATE:-}" in ok) return 0 ;; no) return 1 ;; esac
-  _PMS_GATE=no
+  _PMS_GATE=no; _PMS_GATE_WHY=""
   _g_dir="${PILOT_WA_MBP_SCRIPTS:-${GC_CITY:-/nonexistent}/scripts}"
   _g_cap="${MBP_NODE_CAPACITY:-$_g_dir/mbp-node-capacity.py}"
   _g_py="${MBP_NODE_PY:-python3}"
-  [ -f "$_g_cap" ] || { warn "mbp-node: o oráculo $_g_cap não existe — nenhuma carimbada vai ao MBP nesta varredura"; return 1; }
+  [ -f "$_g_cap" ] || { _PMS_GATE_WHY=missing; warn "mbp-node: o oráculo $_g_cap não existe — nenhuma carimbada vai ao MBP nesta varredura"; return 1; }
   _g_out=$(timeout "${PILOT_WA_MBP_GATE_TIMEOUT:-50}" "$_g_py" -I "$_g_cap" --json verdict 2>/dev/null </dev/null) || _g_rc=$?
-  [ "$_g_rc" = 0 ] || return 1
-  _g_v=$(printf '%s' "$_g_out" | jq -r 'if (.verdict == "node") and ((.free | type) == "number") and (.free >= 1) then "ok" else "no" end' 2>/dev/null) || _g_v=""
-  [ "$_g_v" = ok ] || return 1
-  _PMS_GATE=ok
-  return 0
+  # vazio (sem saída) → bad; falhou/ilegível (jq que não lê, JSON que não é objeto, verdict de outro tipo, node sem free >= 1) → bad também: o rc e este veredito juntos decidem, e só 0 + node abre
+  _g_v=$(printf '%s' "$_g_out" | jq -r 'if (.verdict == "node") and ((.free | type) == "number") and (.free >= 1) then "node" elif .verdict == "local" then "local" elif .verdict == "unknown" then "unknown" else "bad" end' 2>/dev/null) || _g_v=bad
+  [ -n "$_g_v" ] || _g_v=bad
+  _g_snip="${_g_out:0:120}"; _g_snip="${_g_snip//$'\n'/ }"
+  case "$_g_rc:$_g_v" in
+    0:node) _PMS_GATE=ok; return 0 ;;
+    1:local) _PMS_GATE_WHY=local ;;
+    2:unknown) _PMS_GATE_WHY=unknown; warn "mbp-node: o oráculo do MBP não soube dizer se há vaga (verdict unknown, saída '$_g_snip') — nenhuma carimbada vai ao MBP nesta varredura" ;;
+    124:*|137:*|143:*) _PMS_GATE_WHY=timeout; warn "mbp-node: o oráculo do MBP estourou o prazo (rc=$_g_rc, ${PILOT_WA_MBP_GATE_TIMEOUT:-50}s) — nenhuma carimbada vai ao MBP nesta varredura" ;;
+    0:*|1:*|2:*) _PMS_GATE_WHY=unreadable; warn "mbp-node: a resposta do oráculo do MBP é ilegível (rc=$_g_rc, saída '$_g_snip') — nenhuma carimbada vai ao MBP nesta varredura" ;;
+    *) _PMS_GATE_WHY=error; warn "mbp-node: o oráculo do MBP falhou (rc=$_g_rc, saída '$_g_snip') — nenhuma carimbada vai ao MBP nesta varredura" ;;
+  esac
+  return 1
 }
 
 # _pilot_mbp_stamped_check <id> <loja> — roda `mbp-node-dispatch.sh check` (o classificador do despachante do WA, SÓ LEITURA, não olha dono nem rota) e deixa _PMS_V e _PMS_BASIS. Só o rc 0 COM JSON de veredito node é node; 10 mini; 11 unknown; 124/137/143 timeout;
 # script ausente = missing (o passo para); qualquer outra coisa, inclusive rc 0 com saída que não é um veredito node, = error — o terceiro estado nunca vira node. Sempre devolve 0.
+# O veredito limpo (node, mini rc 10, unknown rc 11) não avisa; timeout, error e missing AVISAM (o passo segue fechado, mas quem lê o log vê que a sonda não soube dizer).
 _pilot_mbp_stamped_check() {
-  local _sc_id="${1:-}" _sc_store="${2:-}" _sc_dir _sc_out="" _sc_rc=0 _sc_vb="" _sc_to
+  local _sc_id="${1:-}" _sc_store="${2:-}" _sc_dir _sc_out="" _sc_rc=0 _sc_vb="" _sc_to _sc_snip=""
   _PMS_V="error"; _PMS_BASIS=""
   _sc_dir="${PILOT_WA_MBP_SCRIPTS:-${GC_CITY:-/nonexistent}/scripts}"
-  if [ ! -x "$_sc_dir/mbp-node-dispatch.sh" ]; then _PMS_V="missing"; return 0; fi
+  if [ ! -x "$_sc_dir/mbp-node-dispatch.sh" ]; then
+    _PMS_V="missing"
+    warn "mbp-node: $_sc_dir/mbp-node-dispatch.sh não existe ou não executa — o passo da carimbada PARA nesta varredura (sem o check nenhuma carimbada vai ao MBP)"
+    return 0
+  fi
   _sc_to="${PILOT_WA_MBP_CHECK_TIMEOUT:-30}"; case "$_sc_to" in ''|*[!0-9]*) _sc_to=30 ;; esac
   # vazio (saída sem veredito) → error; falhou (rc fora de 0/10/11/124) → error ou timeout, nunca node
   _sc_out=$(timeout "$_sc_to" "$_sc_dir/mbp-node-dispatch.sh" check "$_sc_id" --store "$_sc_store" 2>/dev/null) || _sc_rc=$?
@@ -12902,16 +12925,23 @@ _pilot_mbp_stamped_check() {
     11) _PMS_V=unknown ;;
     124|137|143) _PMS_V=timeout ;;
   esac
+  case "$_PMS_V" in
+    timeout) warn "mbp-node: o check de $_sc_id estourou o prazo (rc=$_sc_rc, ${_sc_to}s) — a bead segue o caminho de sempre nesta varredura" ;;
+    error)
+      _sc_snip="${_sc_out:0:120}"; _sc_snip="${_sc_snip//$'\n'/ }"
+      warn "mbp-node: o check de $_sc_id falhou ou deu uma resposta sem veredito node (rc=$_sc_rc, saída '$_sc_snip') — a bead segue o caminho de sempre nesta varredura" ;;
+  esac
   return 0
 }
 
-# _pilot_mbp_stamped_pre <bead-json> — exit 0 iff a bead carimbada (WA, livre, gc.routed_to=wa-worker) é entregue a dispatch_one para o MBP (modo on). NENHUMA escrita em bead. Deixa _PMS_WHY (o motivo do não) e _PMS_UPD.
+# _pilot_mbp_stamped_pre <bead-json> — exit 0 iff a bead carimbada (WA, livre, gc.routed_to=wa-worker) é entregue a dispatch_one para o MBP (modo on). NENHUMA escrita em bead (arquivos locais: a memória de vereditos e, em shadow/DRY_RUN, a linha-medição do jsonl). Deixa _PMS_WHY (o motivo do não) e _PMS_UPD, e conta a candidata para o resumo (_PMS_SEEN, _PMS_CHECKED, _PMS_OFFERED).
 # Ordem, do barato ao caro: modo · parada da varredura · JSON da candidata · carimbo · vetos · Hetzner primeiro · orçamentos (levadas, sessão lenta) · mini cheio · loja · memória · recusa do pool · oráculo (1×/varredura) · orçamento de sondas · `check` · shadow · Dolt.
 # Devolver 1 NUNCA muda o despacho: a bead segue o caminho de sempre (yield, teto do pool, fila).
 _pilot_mbp_stamped_pre() {
   local _sp_b="${1:-}" _sp_mode="${PILOT_WA_MBP_ROUTE:-off}" _sp_rec _sp_id _sp_as _sp_rt _sp_prio _sp_labels _sp_veto _sp_ref _sp_store _sp_cap _sp_max _sp_h=0
   _PMS_WHY=""; _PMS_UPD=""
   case "$_sp_mode" in shadow|on) ;; *) _PMS_WHY="off"; return 1 ;; esac
+  _PMS_SEEN=$(( ${_PMS_SEEN:-0} + 1 ))
   [ -z "${_PMS_STOP:-}" ] || { _PMS_WHY="stop:${_PMS_STOP}"; return 1; }
   # vazio (assignee, rota, updated_at, prioridade ou labels ausentes: o bd omite a chave vazia) → campo "" = livre / sem chave; falhou/ilegível (JSON que o jq não lê, id fora de [A-Za-z0-9._-] que iria para um TSV) → NÃO oferece, nunca "livre"
   _sp_rec=$(printf '%s' "$_sp_b" | jq -r '[(.id // ""), (.assignee // ""), (.metadata["gc.routed_to"] // ""), (.updated_at // ""), ((.priority // "") | tostring), ((.labels // []) | join(","))] | join("\u001f")' 2>/dev/null) || { _PMS_WHY="unreadable"; return 1; }
@@ -12950,7 +12980,8 @@ EOF_PMS_PRE
   _sp_store=$(_pilot_bead_home_store "$_sp_id")
   [ -n "$_sp_store" ] || { _PMS_WHY="store-unknown"; return 1; }
   # vazio (sem arquivo, sem updated_at = sem chave) → sem memória: sonda; falhou/ilegível (arquivo que não abre, linha ruim) → também sem memória, a sonda decide — NUNCA "mini" por chute. A chave leva o prefixo mbp: (a do Hetzner tem outro TTL de "solta")
-  if _pilot_wa_node_pass_memo_hit "mbp:$_sp_id" "$_PMS_UPD"; then _PMS_WHY="memo:${_PWP_MEMO_V:-?}"; return 1; fi
+  # `sampled` é a bead que o shadow já mediu (node): só vale no shadow — quem passa do shadow para o on não perde a bead por 6 h
+  if _pilot_wa_node_pass_memo_hit "mbp:$_sp_id" "$_PMS_UPD" && { [ "${_PWP_MEMO_V:-}" != sampled ] || [ "$_sp_mode" = shadow ]; }; then _PMS_WHY="memo:${_PWP_MEMO_V:-?}"; return 1; fi
   # vazio (a lista de recusas não recusa) → segue; falhou/ilegível (biblioteca ausente, sem config, bead que não lê) → refusal-unknown, NÃO oferece: o pulo de sempre decide
   if ! _sp_ref=$(_pilot_priority_refusal_of "$_sp_b"); then _PMS_WHY="refusal-unknown"; return 1; fi
   [ -z "$_sp_ref" ] || { _PMS_WHY="refused:$_sp_ref"; return 1; }
@@ -12959,46 +12990,126 @@ EOF_PMS_PRE
   if [ "${_PMS_PROBES:-0}" -ge "$_sp_cap" ]; then _PMS_STOP="budget-probes"; _PMS_WHY="budget-probes"; return 1; fi
   _PMS_PROBES=$(( ${_PMS_PROBES:-0} + 1 ))
   _pilot_mbp_stamped_check "$_sp_id" "$_sp_store"
+  _PMS_CHECKED="${_PMS_CHECKED:-} $_PMS_V"
   case "$_PMS_V" in
     node) ;;
-    mini|unknown) _pilot_wa_node_pass_memo_put "mbp:$_sp_id" "$_PMS_UPD" "$_PMS_V"; _PMS_WHY="check-$_PMS_V"; return 1 ;;
+    # DRY_RUN não grava nem a memória: o dry-run não deixa rastro que mude a varredura de verdade
+    mini|unknown) [ "${DRY_RUN:-0}" = "1" ] || _pilot_wa_node_pass_memo_put "mbp:$_sp_id" "$_PMS_UPD" "$_PMS_V"; _PMS_WHY="check-$_PMS_V"; return 1 ;;
     missing) _PMS_STOP="check-missing"; _PMS_WHY="check-missing"; return 1 ;;
     *) _PMS_WHY="check-$_PMS_V"; return 1 ;;
   esac
   if [ "$_sp_mode" = shadow ] || [ "${DRY_RUN:-0}" = "1" ]; then
-    # a linha é medição, não decisão: a que não grava avisa (em shadow ela é a ÚNICA saída do passo) e o despacho segue o mesmo
+    # a linha é medição, não decisão: a que não grava avisa (em shadow ela é a ÚNICA saída do passo) e o despacho segue o mesmo.
+    # O shadow lembra a bead medida (sampled, 6 h) SÓ depois de a linha gravar: sem a lembrança as mesmas primeiras candidatas seriam sondadas e reescritas a cada varredura e a amostra nunca andaria;
+    # linha que não gravou → não lembra (a amostra perdida volta na próxima varredura). DRY_RUN não lembra (ver acima).
     mkdir -p "$GC_CITY/.gc" 2>/dev/null || true
-    { jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg b "$_sp_id" --arg m "$([ "$_sp_mode" = shadow ] && echo shadow || echo on-dry-run)" --arg ba "$_PMS_BASIS" --arg p "$_sp_prio" \
-        '{ts:$ts,event:"pilot-node-route",bead:$b,mode:$m,stamped:true,verdict:"node",basis:$ba,prio:$p}' >> "$GC_CITY/.gc/mbp-node-route.jsonl"; } 2>/dev/null \
-      || warn "mbp-node: linha-sombra de $_sp_id ($_sp_mode, carimbada) NÃO gravada em mbp-node-route.jsonl — a amostra do shadow fica subcontada"
+    if { jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg b "$_sp_id" --arg m "$([ "$_sp_mode" = shadow ] && echo shadow || echo on-dry-run)" --arg ba "$_PMS_BASIS" --arg p "$_sp_prio" \
+        '{ts:$ts,event:"pilot-node-route",bead:$b,mode:$m,stamped:true,verdict:"node",basis:$ba,prio:$p}' >> "$GC_CITY/.gc/mbp-node-route.jsonl"; } 2>/dev/null; then
+      if [ "$_sp_mode" = shadow ] && [ "${DRY_RUN:-0}" != "1" ]; then _pilot_wa_node_pass_memo_put "mbp:$_sp_id" "$_PMS_UPD" sampled; fi
+    else
+      warn "mbp-node: linha-sombra de $_sp_id ($_sp_mode, carimbada) NÃO gravada em mbp-node-route.jsonl — a amostra do shadow fica subcontada"
+    fi
     _PMS_WHY="shadow"
     return 1
   fi
   # O Dolt saturado (no início da varredura, ou agora) para as ESCRITAS: claim + adoção + apply + soltura são ~10 por tentativa. Sem sinal nenhum (_dolt_saturated devolve 0 com reason=unreadable) conta como saturado: o estado inerte é não escrever.
   # vazio/falhou/ilegível (sem sinal de saúde do Dolt) → saturado: NÃO oferece
   if [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ] || _dolt_saturated; then _PMS_STOP="dolt-saturated"; _PMS_WHY="dolt-saturated"; return 1; fi
+  _PMS_OFFERED=$(( ${_PMS_OFFERED:-0} + 1 ))
   return 0
 }
 
 # _pilot_mbp_stamped_after <id> <rc-de-dispatch_one> — contabiliza a tentativa que dispatch_lane acabou de fazer com a bandeira. rc 0 → o MBP levou (conta contra o teto da varredura). Senão, pelo rc do `apply` (_PMN_APPLY_RC), a bead sendo a de _PMS_UPD:
 #   10 / 11 a bead não é do nó → conta falha e memoriza (mini 6 h, unknown 1 h) · vazio (não chegou ao apply: adoção que não deu, mini já não cheio, orçamento de spawn) → conta falha e memoriza `released` (15 min) · 12 MBP cheio ou bead que mudou → para o passo (capacidade é do MBP, NÃO memoriza)
 #   · qualquer outro rc, ou o gancho segurou a bead (DISPATCH_RESULT=wa_node_unknown) → para o passo, sem memorizar (a escrita pode ter acontecido). Falhas demais (PILOT_WA_MBP_STAMPED_MAX_FAILS, padrão 3) também param. Sempre devolve 0.
+# A chave da memória é o updated_at de AGORA, lido de novo: a claim, a adoção e a soltura movem o updated_at (medido 25/10: 05:12:20Z → 05:13:25Z) e a chave de ANTES da claim (_PMS_UPD) nunca mais bateria com a que a próxima varredura lê no `bd list`.
 _pilot_mbp_stamped_after() {
-  local _sa_id="${1:-}" _sa_rc="${2:-1}" _sa_mf
+  local _sa_id="${1:-}" _sa_rc="${2:-1}" _sa_mf _sa_mv="" _sa_store="" _sa_cur=""
   if [ "$_sa_rc" = 0 ]; then _PMS_TAKEN=$(( ${_PMS_TAKEN:-0} + 1 )); return 0; fi
   _sa_mf="${PILOT_WA_MBP_STAMPED_MAX_FAILS:-3}"; case "$_sa_mf" in ''|*[!0-9]*) _sa_mf=3 ;; esac
   if [ "${DISPATCH_RESULT:-}" = "wa_node_unknown" ]; then
     _PMS_STOP="hook-held"
   else
     case "${_PMN_APPLY_RC:-}" in
-      10) _PMS_FAILS=$(( ${_PMS_FAILS:-0} + 1 )); _pilot_wa_node_pass_memo_put "mbp:$_sa_id" "${_PMS_UPD:-}" mini ;;
-      11) _PMS_FAILS=$(( ${_PMS_FAILS:-0} + 1 )); _pilot_wa_node_pass_memo_put "mbp:$_sa_id" "${_PMS_UPD:-}" unknown ;;
-      '') _PMS_FAILS=$(( ${_PMS_FAILS:-0} + 1 )); _pilot_wa_node_pass_memo_put "mbp:$_sa_id" "${_PMS_UPD:-}" released ;;
+      10) _PMS_FAILS=$(( ${_PMS_FAILS:-0} + 1 )); _sa_mv=mini ;;
+      11) _PMS_FAILS=$(( ${_PMS_FAILS:-0} + 1 )); _sa_mv=unknown ;;
+      '') _PMS_FAILS=$(( ${_PMS_FAILS:-0} + 1 )); _sa_mv=released ;;
       12) _PMS_STOP="capacity" ;;
       *)  _PMS_STOP="hook-held" ;;
     esac
   fi
+  # vazio (a candidata não tinha updated_at: nunca houve chave) → não memoriza e não avisa; falhou/ilegível (loja desconhecida, show que não leu, bead de outro id, updated_at ausente ou com cara de lixo) → NÃO memoriza e AVISA:
+  # sem chave confiável a memória nunca acertaria (ou acertaria a versão errada), e a bead é sondada de novo na próxima varredura
+  if [ -n "$_sa_mv" ] && [ -n "${_PMS_UPD:-}" ]; then
+    _sa_store=$(_pilot_bead_home_store "$_sa_id")
+    if [ -n "$_sa_store" ] && _sa_cur=$(_pilot_mbp_stamped_upd_now "$_sa_id" "$_sa_store"); then
+      _pilot_wa_node_pass_memo_put "mbp:$_sa_id" "$_sa_cur" "$_sa_mv"
+    else
+      warn "mbp-node: não consegui ler o updated_at atual de $_sa_id depois da tentativa — a memória '$_sa_mv' NÃO foi gravada (a próxima varredura sonda de novo)"
+    fi
+  fi
   if [ -z "${_PMS_STOP:-}" ] && [ "${_PMS_FAILS:-0}" -ge "$_sa_mf" ]; then _PMS_STOP="max-fails"; fi
+  return 0
+}
+
+# _pilot_mbp_stamped_upd_now <id> <loja> — imprime o updated_at ATUAL da bead (`bd show --json`, só leitura; o mesmo formato que o `bd list` entrega à próxima varredura). Devolve 0 com o valor, 1 sem ele.
+# vazio (show sem saída, bead sem updated_at) → 1; falhou/ilegível (bd que falha ou estoura o prazo, JSON que o jq não lê, bead de OUTRO id, updated_at fora de [0-9A-Za-z:.+_-], a mesma regra de chave do pre) → 1 também: nunca uma chave que não seja desta bead.
+_pilot_mbp_stamped_upd_now() {
+  local _un_id="${1:-}" _un_store="${2:-}" _un_json="" _un_u=""
+  { [ -n "$_un_id" ] && [ -n "$_un_store" ]; } || return 1
+  _un_json=$(timeout "${PILOT_WA_NODE_READ_TIMEOUT:-20}" bd -C "$_un_store" show "$_un_id" --json 2>/dev/null </dev/null) || return 1
+  _un_u=$(printf '%s' "$_un_json" | jq -r --arg id "$_un_id" 'if type == "array" then .[0] else . end | select(type == "object" and .id == $id) | (.updated_at // "")' 2>/dev/null) || return 1
+  case "$_un_u" in ''|*[!0-9A-Za-z:.+_-]*) return 1 ;; esac
+  printf '%s' "$_un_u"
+  return 0
+}
+
+# _pilot_mbp_stamped_skip — dispatch_lane chama quando o passo disse "não": acrescenta o motivo (_PMS_WHY, sem espaço) à lista do resumo, um token por candidata. Motivo vazio vira "?" — nunca um buraco na lista. Sempre devolve 0.
+_pilot_mbp_stamped_skip() {
+  local _ss_w="${_PMS_WHY:-}"
+  [ -n "$_ss_w" ] || _ss_w="?"
+  _PMS_SKIPPED="${_PMS_SKIPPED:-} ${_ss_w// /_}"
+  return 0
+}
+
+# _pilot_mbp_stamped_tally <palavras separadas por espaço> — imprime o mapa {palavra: quantas vezes} em JSON (compacto). Lista vazia → {}.
+# vazio → {}; falhou/ilegível (jq que não roda) → {"tally-unreadable":1}, bem diferente de {}: o resumo nunca mostra "nada aconteceu" quando na verdade não soube contar.
+_pilot_mbp_stamped_tally() {
+  printf '%s\n' "${1:-}" | jq -cR 'split(" ") | map(select(length > 0)) | group_by(.) | map({key: .[0], value: length}) | from_entries' 2>/dev/null || printf '%s' '{"tally-unreadable":1}'
+}
+
+# _pilot_mbp_stamped_summary — uma vez por varredura, depois das pistas, com o passo ligado (on|shadow): UMA linha de log e UM evento `mbp-stamped-summary` em $GC_CITY/.gc/mbp-node-route.jsonl (o par do `wa-node-pass-summary` da passada do Hetzner) com o que o passo viu,
+# por que pulou cada candidata, o que o oráculo disse, quantas sondas gastou e com que veredito, quantas ofereceu/levou/falhou e POR QUE parou. Sem ele o passo ligado e cego (oráculo em erro, `check` estourando) parecia "sem MBP livre".
+# vazio (varredura sem candidata) → o resumo sai mesmo assim, zerado, com `oráculo=not-asked`; falhou/ilegível (jq que não conta → {"tally-unreadable":1}, jsonl que não grava) → o resumo diz que não leu ou AVISA que perdeu o evento: nunca silêncio. Sempre devolve 0: o resumo nunca derruba a varredura.
+_pilot_mbp_stamped_summary() {
+  local _ss_mode="${PILOT_WA_MBP_ROUTE:-off}" _ss_mt _ss_dry=false _ss_gate="not-asked" _ss_stop="${_PMS_STOP:-}" _ss_skt _ss_ckt _ss_skl _ss_w _ss_ev="" _ss_f="${GC_CITY:-/nonexistent}/.gc/mbp-node-route.jsonl"
+  local _ss_cn=0 _ss_cm=0 _ss_cu=0 _ss_ct=0 _ss_ce=0 _ss_cx=0
+  _ss_mt="modo=$_ss_mode"
+  if [ "${DRY_RUN:-0}" = "1" ]; then _ss_dry=true; _ss_mt="$_ss_mt dry-run"; fi
+  case "${_PMS_GATE:-}" in ok) _ss_gate=ok ;; no) _ss_gate="${_PMS_GATE_WHY:-no}" ;; esac
+  for _ss_w in ${_PMS_CHECKED:-}; do
+    case "$_ss_w" in
+      node) _ss_cn=$(( _ss_cn + 1 )) ;;
+      mini) _ss_cm=$(( _ss_cm + 1 )) ;;
+      unknown) _ss_cu=$(( _ss_cu + 1 )) ;;
+      timeout) _ss_ct=$(( _ss_ct + 1 )) ;;
+      error) _ss_ce=$(( _ss_ce + 1 )) ;;
+      missing) _ss_cx=$(( _ss_cx + 1 )) ;;
+    esac
+  done
+  _ss_skt=$(_pilot_mbp_stamped_tally "${_PMS_SKIPPED:-}")
+  _ss_ckt=$(_pilot_mbp_stamped_tally "${_PMS_CHECKED:-}")
+  # vazio (nenhuma pulada) → "nenhuma"; falhou/ilegível (jq que não lê o mapa) → "ilegível"
+  _ss_skl=$(printf '%s' "$_ss_skt" | jq -r 'if length == 0 then "nenhuma" else (to_entries | map("\(.key)=\(.value)") | join(", ")) end' 2>/dev/null) || _ss_skl=""
+  [ -n "$_ss_skl" ] || _ss_skl="ilegível"
+  log "ga-w7qwl1.2.6: passo da carimbada no MBP ($_ss_mt): candidatas=${_PMS_SEEN:-0} · puladas: $_ss_skl · oráculo=$_ss_gate · sondas=${_PMS_PROBES:-0} (node $_ss_cn · mini $_ss_cm · unknown $_ss_cu · timeout $_ss_ct · erro $_ss_ce · ausente $_ss_cx) · oferecidas=${_PMS_OFFERED:-0} · levadas=${_PMS_TAKEN:-0} · falhas=${_PMS_FAILS:-0} · parou: ${_ss_stop:-fim da lista}"
+  _ss_ev=$(jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg mode "$_ss_mode" --argjson dry "$_ss_dry" --arg gate "$_ss_gate" --argjson seen "${_PMS_SEEN:-0}" --argjson skipped "$_ss_skt" --argjson probes "${_PMS_PROBES:-0}" --argjson checks "$_ss_ckt" \
+      --argjson offered "${_PMS_OFFERED:-0}" --argjson taken "${_PMS_TAKEN:-0}" --argjson fails "${_PMS_FAILS:-0}" --arg stopped "${_ss_stop:-none}" \
+      '{ts:$ts,event:"mbp-stamped-summary",mode:$mode,dry_run:$dry,gate:$gate,seen:$seen,skipped:$skipped,probes:$probes,checks:$checks,offered:$offered,taken:$taken,fails:$fails,stopped:$stopped}' 2>/dev/null) || _ss_ev=""
+  mkdir -p "$(dirname "$_ss_f")" 2>/dev/null || true
+  if [ -z "$_ss_ev" ] || ! { printf '%s\n' "$_ss_ev" >> "$_ss_f"; } 2>/dev/null; then
+    warn "mbp-node: resumo do passo da carimbada NÃO gravado em $_ss_f — a linha de log acima é o único registro desta varredura"
+  fi
   return 0
 }
 
@@ -13077,10 +13188,10 @@ EOF_PWP_PRE
 }
 
 # _pilot_wa_node_pass_memo_hit <id> <updated_at> — exit 0 iff há veredito FRESCO para esta versão da bead (linhas `epoch<TAB>id<TAB>updated_at<TAB>veredito`; a ÚLTIMA linha da bead vale). TTL por veredito: mini 21600 s,
-# unknown 3600 s, released 900 s (PILOT_WA_NODE_PASS_{MINI,UNKNOWN,RELEASED}_TTL; ilegível = padrão). Deixa o veredito em _PWP_MEMO_V.
+# unknown 3600 s, released 900 s, sampled 21600 s (PILOT_WA_NODE_PASS_{MINI,UNKNOWN,RELEASED,SAMPLED}_TTL; ilegível = padrão). `sampled` é a bead que o shadow do passo da carimbada já mediu como node (ga-w7qwl1.2.6). Deixa o veredito em _PWP_MEMO_V.
 # vazio (sem arquivo, sem id/updated_at = sem chave) → sem memória: sonda; falhou/ilegível (arquivo que não abre, awk que falha, linha ruim) → também sem memória — a sonda decide, NUNCA "mini" por chute.
 _pilot_wa_node_pass_memo_hit() {
-  local _mh_id="${1:-}" _mh_upd="${2:-}" _mh_f _mh_now _mh_tm _mh_tu _mh_tr _mh_v
+  local _mh_id="${1:-}" _mh_upd="${2:-}" _mh_f _mh_now _mh_tm _mh_tu _mh_tr _mh_ts _mh_v
   _PWP_MEMO_V=""
   { [ -n "$_mh_id" ] && [ -n "$_mh_upd" ]; } || return 1
   _mh_f="${PILOT_WA_NODE_PASS_MEMO:-${GC_CITY:-/nonexistent}/.gc/wa-node-pass-memo.tsv}"
@@ -13091,10 +13202,11 @@ _pilot_wa_node_pass_memo_hit() {
   _mh_tm="${PILOT_WA_NODE_PASS_MINI_TTL:-21600}"; case "$_mh_tm" in ''|*[!0-9]*) _mh_tm=21600 ;; esac
   _mh_tu="${PILOT_WA_NODE_PASS_UNKNOWN_TTL:-3600}"; case "$_mh_tu" in ''|*[!0-9]*) _mh_tu=3600 ;; esac
   _mh_tr="${PILOT_WA_NODE_PASS_RELEASED_TTL:-900}"; case "$_mh_tr" in ''|*[!0-9]*) _mh_tr=900 ;; esac
+  _mh_ts="${PILOT_WA_NODE_PASS_SAMPLED_TTL:-21600}"; case "$_mh_ts" in ''|*[!0-9]*) _mh_ts=21600 ;; esac
   # vazio (nenhuma linha da bead, ou a última venceu) → sem acerto: sonda; falhou/ilegível (awk que falha, linha ruim) → sem acerto também: a sonda decide, nunca "mini" por chute
-  _mh_v=$(awk -F'\t' -v id="$_mh_id" -v upd="$_mh_upd" -v now="$_mh_now" -v tm="$_mh_tm" -v tu="$_mh_tu" -v tr="$_mh_tr" '
+  _mh_v=$(awk -F'\t' -v id="$_mh_id" -v upd="$_mh_upd" -v now="$_mh_now" -v tm="$_mh_tm" -v tu="$_mh_tu" -v tr="$_mh_tr" -v tsm="$_mh_ts" '
       $2 == id && $3 == upd { v = $4; ts = $1 + 0; hit = 1 }
-      END { if (!hit) exit 1; t = (v == "mini") ? tm : ((v == "unknown") ? tu : ((v == "released") ? tr : 0)); if (now - ts < t) { print v; exit 0 } exit 1 }' "$_mh_f" 2>/dev/null) || return 1
+      END { if (!hit) exit 1; t = (v == "mini") ? tm : ((v == "unknown") ? tu : ((v == "released") ? tr : ((v == "sampled") ? tsm : 0))); if (now - ts < t) { print v; exit 0 } exit 1 }' "$_mh_f" 2>/dev/null) || return 1
   [ -n "$_mh_v" ] || return 1
   _PWP_MEMO_V="$_mh_v"
   return 0
@@ -16314,9 +16426,11 @@ dispatch_lane() {
 
     # ── ga-w7qwl1.2.6: a bead de WA carimbada (gc.routed_to=wa-worker, livre) que o MBP levaria NÃO é pulada pelo yield nem pelo teto do pool ──
     # Esses dois pulos (abaixo) são zero escrita e valem exatamente quando o pool do mini está cheio — a condição do MBP; sem este passo a carimbada nunca chega ao gancho dentro de dispatch_one (ver _pilot_mbp_stamped_pre).
-    # NENHUMA escrita aqui: _pilot_mbp_stamped_pre só lê e devolve 0 quando o MBP tem vaga e o `check` disse node. Devolver 1 (o padrão, e sempre com PILOT_WA_MBP_ROUTE=off, que nem chama a função) deixa os pulos de sempre decidirem.
+    # nenhuma escrita em bead aqui: _pilot_mbp_stamped_pre só lê e devolve 0 quando o MBP tem vaga e o `check` disse node. Devolver 1 (o padrão, e sempre com PILOT_WA_MBP_ROUTE=off, que nem chama a função) deixa os pulos de sempre decidirem.
+    # O motivo de cada "não" entra na lista do resumo da varredura (_pilot_mbp_stamped_skip → _pilot_mbp_stamped_summary).
     local _mbp_pass=0
     if [ "${PILOT_WA_MBP_ROUTE:-off}" != off ] && _pilot_mbp_stamped_pre "$pick"; then _mbp_pass=1; fi
+    if [ "$_mbp_pass" != 1 ] && [ "${PILOT_WA_MBP_ROUTE:-off}" != off ]; then _pilot_mbp_stamped_skip; fi
 
     # ── ga-in9ebr AC2: skip a bead QUEUED behind a full worker pool BEFORE the claim ──
     # A candidate already committed to wa-worker/ps-worker (gc.routed_to, stamped by any
@@ -16517,6 +16631,9 @@ fi
 if [ -n "${_PILOT_HALT:-}" ]; then
   log "ga-5je3zv: dispatch phase was HALTED this sweep (${_PILOT_HALT}) after $(( SECONDS - ${_PILOT_DISPATCH_T0:-$SECONDS} ))s; dispatched=$DISPATCHED — candidates not attempted stay story:approved for the next sweep."
 fi
+
+# ga-w7qwl1.2.6: o resumo do passo da carimbada no MBP (uma linha de log + um evento), só com o passo ligado e antes do evento agregado, para uma falha adiante não o perder.
+if [ "${PILOT_WA_MBP_ROUTE:-off}" != off ]; then _pilot_mbp_stamped_summary; fi
 
 # ga-ov3gow: the sweep's ONE aggregate `pilot_sweep` line (schema: the block above dispatch_lane). After
 # _pool_saturated_sweep exists — it is a field — and before Step 5, so a Step 5 failure cannot cost the event.
