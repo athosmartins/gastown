@@ -171,5 +171,20 @@ sleep 1; kill -TERM "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; RC=$?
 check "T14 SIGTERM com P escondido: rc 143" "$RC" 143
 untouched && ok "T14 rollback no sinal: estado de antes" || bad "T14 rollback no sinal: estado de antes"
 
+# ── T15 a leitura da lista de ids falha (cat-file --batch-check sai com erro e não diz nada): "não li" reprova e faz rollback; nunca vira "0 ausentes" ──
+newfix; printf '#!/bin/sh\ncase "$*" in *"cat-file --batch-check"*) exit 1 ;; esac\nexec git "$@"\n' > "$F/failids"; chmod +x "$F/failids"
+objs "$F/w" > "$F/before"
+swap JDS_GIT="$F/failids"
+check "T15 cat-file dos ids falhou: rc 30 (rollback feito)" "$RC" 30
+untouched && ok "T15 rollback: P de volta, nenhum pack novo, sem staging/hold" || bad "T15 rollback restaurou o estado"
+objs "$F/w" > "$F/after"; cmp -s "$F/before" "$F/after" && ok "T15 conjunto de objetos igual ao de antes" || bad "T15 conjunto de objetos igual ao de antes"
+grep -q "ids-nao-li" "$F/out.txt" && ok "T15 motivo: ids-nao-li" || bad "T15 motivo: ids-nao-li"
+grep -q "0 ausentes" "$F/out.txt" && bad "T15 NÃO pode dizer '0 ausentes'" || ok "T15 não diz '0 ausentes'"
+
+# ── T16 NEED_MB ausente no manifesto: segue (a cópia não muda o repo; o vigia de df protege), mas DIZ que não checou ──
+newfix; sed -i.bak '/^NEED_MB=/d' "$F/art/manifest.env"
+swap; check "T16 sem NEED_MB: rc 0" "$RC" 0
+grep -q "AVISO: NEED_MB ausente" "$F/out.txt" && ok "T16 avisa que não pré-checou o espaço" || bad "T16 avisa que não pré-checou o espaço"
+
 echo "---"; echo "passou $PASS, falhou $FAIL"
 [ "$FAIL" -eq 0 ]

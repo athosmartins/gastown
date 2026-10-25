@@ -246,8 +246,11 @@ log "ANTES: $OBJ_B objetos, $REACH_B alcançáveis, $COMMITS_B commits, garbage 
 STAGE="$GITDIR/swap-stage.$$"; mkdir -p "$STAGE" || { log "ABORT 24: sem staging"; exit 24; }
 FILES=""
 for n in $NEW_PACKS; do FILES="$FILES $n.pack $n.idx $n.rev"; done
+# NEED_MB vazio/ilegível no manifesto → segue SEM a pré-checagem, mas dizendo: a cópia fica só com o vigia de df (a cópia não muda o repo; o piso de partida de 5500 MB já dá folga)
 if [ -n "${NEED_MB:-}" ] && is_uint "$NEED_MB"; then
   [ $(( FREE0 - NEED_MB )) -ge "$FLOOR_MB" ] || { log "ABORT 20: df $FREE0 MB - $NEED_MB MB da troca ficaria abaixo do piso $FLOOR_MB MB"; exit 20; }
+else
+  log "AVISO: NEED_MB ausente/ilegível no manifesto ('${NEED_MB:-}') — sem pré-checagem de espaço; só o vigia de df (piso $FLOOR_MB MB) protege a cópia"
 fi
 ARGS=""; for f in $FILES; do ARGS="$ARGS ${SRC%/}/$f"; done
 log "copiando $(echo $FILES | wc -w | tr -d ' ') arquivos de $SRC (vigia de df: para abaixo de $FLOOR_MB MB)"
@@ -318,10 +321,18 @@ if [ -z "$FAIL" ]; then
   if [ "$FRC" -ne 0 ] || grep -q -i -E "^(missing|broken|error|fatal)" "$STATE/fsck.txt"; then FAIL="$FAIL fsck(rc=$FRC)"; head -5 "$STATE/fsck.txt" | while IFS= read -r l; do log "  fsck: $l"; done; else log "fsck --connectivity-only ok"; fi
 fi
 if [ -z "$FAIL" ] && [ -s "$MAN/ids.txt" ]; then
-  MISS="$(g cat-file --batch-check < "$MAN/ids.txt" | grep -c ' missing$')"
-  NIDS="$(wc -l < "$MAN/ids.txt" | tr -d ' ')"
-  log "lista de ids ($NIDS): $MISS ausentes"
-  [ "$MISS" = 0 ] || FAIL="$FAIL ids-ausentes($MISS)"
+  # cat-file que falhou (rc != 0) ou que respondeu menos linhas do que ids → "não li" = REPROVA; nunca vira "0 ausentes" (grep -c sobre uma saída vazia imprime 0)
+  NIDS="$(awk 'END { print NR }' "$MAN/ids.txt")"
+  g cat-file --batch-check < "$MAN/ids.txt" > "$STATE/ids.check"; IRC=$?
+  NANS="$(awk 'END { print NR }' "$STATE/ids.check")"
+  MISS="$(grep -c ' missing$' "$STATE/ids.check")"
+  if [ "$IRC" -ne 0 ] || [ "$NANS" != "$NIDS" ]; then
+    log "lista de ids ($NIDS): cat-file rc=$IRC e respondeu $NANS linhas — não consegui ler"
+    FAIL="$FAIL ids-nao-li(rc=$IRC,$NANS/$NIDS)"
+  else
+    log "lista de ids ($NIDS): $MISS ausentes"
+    [ "$MISS" = 0 ] || FAIL="$FAIL ids-ausentes($MISS)"
+  fi
 fi
 if [ -z "$FAIL" ] && [ -s "$MAN/ids.txt" ] && [ -z "${JDS_SKIP_FSCK_SAMPLE:-}" ]; then
   # amostra lida INTEIRA do estado sem P: primeiro, do meio e último da lista (inflata e resolve a cadeia de delta de verdade)
