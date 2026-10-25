@@ -2,7 +2,7 @@
 
 ## Contents
 
-• O que faz (a cada 60 s, sob flock) · A tela do limite e o Escape (ga-ci3uao) · Garantias · Liga/desliga · Riscos abertos (não medidos)
+• O que faz (a cada 60 s, sob flock) · A tela do limite e o Escape (ga-ci3uao) · A mensagem de limite sem o modal e o último degrau (ga-yqzedv) · Garantias · Liga/desliga · Riscos abertos (não medidos)
 
 Fase 2 da ga-xoe5ao. O pool headless (ga-8hcnvb.1, `claude-pool-account.py`) decide a conta; este script **segue** a decisão
 para quem usa Remote Control (Mayor + crews), reescrevendo o item DEFAULT do Keychain `Claude Code-credentials`.
@@ -83,9 +83,62 @@ do access token, no "sibling-login watch" (só com aviso de login na tela) e na 
 de limite semanal. Não rastreei todos os chamadores (`hae`/`lve` limpam o cache e relêem; não vi quem os chama por requisição), então isto é
 indício de leitura de código, NÃO medição ao vivo, e não descarta a hipótese (c) (sessão parada no modal, que o pool mediu em 2.1.291).
 Consequência: o Escape cura o caso em que a sessão está parada no MODAL; se a sessão estiver com o token antigo em memória e a tela só com a
-mensagem, o modal não existe, o VERIFY diz `NOT VERIFIED` e o Escape não ajuda — aí só reiniciar a sessão (fora do escopo: derrubaria o link
-de RC que a Fase 2 existe para preservar). O aceite ao vivo (esgotar uma conta de verdade e ver Mayor + crews responderem sozinhos) continua
+mensagem, o modal não existe e o Escape não ajuda — esse caso é o da seção seguinte (ga-yqzedv). O aceite ao vivo (esgotar uma conta de verdade e ver Mayor + crews responderem sozinhos) continua
 pendente e precisa do OK do Athos.
+
+## A mensagem de limite sem o modal e o último degrau (ga-yqzedv)
+**O que aconteceu:** de 07/10 a 25/10 o Escape automático NUNCA disparou (0 linhas de `limit_watch` / `no Escape sent` em 19 mil linhas de log,
+com `crew-unstick-on` armado desde 14/10). A vigia só entrava com o MODAL, mas nos 3 casos reais de crew a tela era outra: o 429 **encerra o
+turno** e deixa "You've hit your weekly limit · resets ..." como a ÚLTIMA saída, acima da caixa do prompt, sessão ociosa, sem modal — nada a
+apertar. Essa tela era "não sei" para sempre (podia ser linha velha do scrollback): sem push, sem vigia, sem tecla. Caso de 25/10: oracle-wa
+ficou 10 min assim (troca 15:40Z → saiu só quando a varredura fechou a sessão às 15:49Z).
+
+**Atual × velha, sem chute.** A pergunta "a mensagem é de agora ou é velha?" se responde pela tela, não por palpite. Na tela de layout medido
+(claude 2.1.310: transcript, régua `────`, caixa `❯ ...`, régua, statusline) a sessão entra em `banner_watch` (no estado) se a mensagem é uma das
+3 últimas linhas do transcript, **começando** a linha (frase do agente que cita a mensagem não conta) — ou seja, ela é a última saída. A
+**impressão** da tela (transcript + caixa do prompt, SEM a statusline, que muda sozinha: contexto %, workers, relógio) é guardada:
+- mudou entre duas leituras → a sessão está **andando** (ou alguém digitando): o relógio recomeça, nunca é "parada";
+- igual por `STALL_S` = 10 min → **parada**: UM push nomeado `rc-limit-stalled` (nomes das sessões, "10 min", e se o reset automático está
+  ligado ou desligado e como armar). O push NÃO afirma que a sessão "não pegou o login novo": a tela sozinha não separa "ficou presa no 429 depois
+  da troca" de "está ociosa nessa mensagem desde antes" — só diz o que se viu (ociosa no 429, ninguém vai dar um turno a ela). A distinção
+  que importa para o degrau destrutivo é feita pelo transcript, abaixo;
+- a mensagem some / vem trabalho depois dela → sai da vigia, sem push; o modal abre → vai para a `limit_watch` (Escape);
+- sessão que terminou, pane que não é mais dela, tmux mudo → "não sei", mantida, nada afirmado; a vigia cai em 1 h (`BANNER_WATCH_S`), o push fica.
+O veredito do VERIFY continua `NOT VERIFIED` (uma leitura só não separa atual de velha); o que muda é que agora há vigia que separa.
+**Nenhuma tecla vai para essa tela** (não há modal para responder). Layout que este script não mediu (a caixa `╭─╮ │ > │` antiga, por exemplo)
+continua "não sei" e sem vigia.
+
+**O último degrau: `gc session reset` — DESLIGADO por padrão, a conversa NÃO é preservada.** Medição pedida pelo bead (a conversa sobrevive ao reset?):
+**não sobrevive.** Evidência: o `--help` do gc ("restart ... with fresh provider conversation state") e o caso oracle-wa de 25/10 — sessão
+recriada pelo gc voltou com `session_key` novo e transcript novo, começando do zero (c7df7649 às 15:52Z; o anterior, 75201ece, terminou 15:40Z).
+O primeiro registro de conversa do c7df7649 é o prompt de partida (15:52:53Z), sem nenhum trecho da conversa antiga; o "continuou o trabalho com ctx 20%"
+veio da bead e do prime, não da conversa. `generation=2` / `continuation_epoch=1` em ga-mbl3wp são os contadores da bead NOVA (criada 15:49:37Z) e
+não provam preservação (e não medi se o reset mexe neles: nenhum `gc session reset` rodou nela). Do reset, o `--help` diz que ficam a identidade,
+o alias, o mail e o trabalho na fila; o que se perde é a conversa com o provider.
+**O que NÃO foi medido:** rodei o `gc session reset` ao vivo? Não — derrubaria uma conversa de verdade; a evidência é o texto do gc e a
+recriação do oracle (que não foi por `reset`). Por isso o degrau nasce desarmado e com chave PRÓPRIA (autorização não é herdada: armar o Escape
+não arma o reset): `touch /Users/athos/gt/.gascity-gastown-hq/.gc/crew-reset-on` (ou `GC_CREW_RESET=1`; `GC_CREW_RESET=0` desarma mesmo com o arquivo).
+Armado, roda `gc --city <cidade> session reset <id>` em UMA sessão por rodada, uma vez por sessão na vida, quando ela está parada há 10 min
+(banner: impressão da tela igual; modal: Escapes esgotados e 10 min desde que foi achada) e TODOS valem:
+```
+ a mesma lista de contas do Escape (decisão do pool ainda é a conta da troca, não esgotada, default legível e do dono certo, >= 45 s da troca)
+ · o arquivo da sessão tem hora de início e AGORA relata o mesmo pane de antes (senão "another pane")
+ · [mensagem] o arquivo da sessão diz `status: idle` e o PRÓPRIO transcript da sessão (~/.claude/projects/<cwd>/<sessionId>.jsonl, últimos 256 KB) termina no
+   erro `rate_limit` (assistant, isApiErrorMessage) — qualquer registro de conversa depois dele, arquivo ausente ou linha ilegível = "não confirma" —
+   E o erro tem data IGUAL OU POSTERIOR à da troca (sem data = não). Sessão parada numa mensagem de ANTES da troca não está errada: o próximo turno
+   dela lê o login novo, e o reset só perderia a conversa. (No caso real de 25/10 o erro veio 32 s DEPOIS da troca: 15:40:18Z troca, 15:40:50Z erro.)
+ · uma leitura nova da tela, imediatamente antes: ainda a mesma impressão (banner) / ainda o modal (modal)
+ · `gc session list --json` tem EXATAMENTE uma sessão com `session_name` igual ao tmux da sessão (zero ou duas = não reseta)
+```
+Contado ANTES de rodar. Se o gc recusa: push `rc-limit-reset-failed`, sem repetir. Se roda: push `rc-limit-reset` dizendo que a conversa NÃO foi preservada.
+`--dry-run` diz "would run gc session reset for <nome> (<pid>)" e não chama o gc. **Cuidado:** o Mayor também é uma sessão RC — com o reset armado, um
+Mayor parado 10 min nessa tela é resetado como qualquer crew. Alternativa não destrutiva (um nudge para a sessão ociosa, que poderia disparar um turno
+novo) existe mas **não foi medida**, por isso não foi implementada.
+
+**Fixture e o que falta provar:** o teste usa o chrome REAL do claude 2.1.310 (medido em panes vivos) e o TEXTO real da mensagem (do registro
+`rate_limit` do transcript), mas não havia nenhum pane nesse estado para capturar: o glifo na frente da mensagem não é medido (o casamento aceita
+qualquer prefixo não-alfanumérico). Se o claude real desenhar outra coisa, a consequência é "não sei" (sem vigia), nunca "parada" por engano.
+Rodando o arquivo de testes novo contra o script do HEAD anterior (`cb6afb9d9`): 45 reprovam e 145 passam (os antigos, mais os novos que só afirmam que nada acontece: layout não medido, mensagem velha com trabalho depois, só o Escape armado).
 
 ## Garantias
 - Nunca chama `claude`; custo de crédito zero (só o perfil, grátis). Nunca escreve no item hasheado do pool.
@@ -105,6 +158,7 @@ pendente e precisa do OK do Athos.
 ## Liga/desliga
 - Kill switch: `touch /Users/athos/gt/.gascity-gastown-hq/.gc/no-crew-account` (ou `GC_CREW_ACCOUNT=0`).
 - Escape nas sessões presas no limite (ga-ci3uao): `touch /Users/athos/gt/.gascity-gastown-hq/.gc/crew-unstick-on` arma; apagar o arquivo (ou `GC_CREW_UNSTICK=0`) desarma. Nasce desarmado.
+- `gc session reset` na sessão parada (ga-yqzedv): `touch /Users/athos/gt/.gascity-gastown-hq/.gc/crew-reset-on` arma; apagar o arquivo (ou `GC_CREW_RESET=0`) desarma. Nasce desarmado e **perde a conversa**. Chave própria: armar o Escape não arma o reset.
 - Ativação (humana, separada do merge): copiar `packs/town-deltas/assets/claude-crew-account.plist` para
   `~/Library/LaunchAgents` e `launchctl load`. Aceite ao vivo (trocar e voltar) só com OK do Athos.
 
@@ -127,8 +181,10 @@ pendente e precisa do OK do Athos.
 - O perfil (`oauthAccount`) pode ficar na conta antiga enquanto o token é da nova.
 - A conta terrenos não tem login completo guardado: precisa de re-login humano (ga-xknkke); NÃO logar sozinho.
 - 2ª etapa (reinício em momento ocioso se o RC cair) fora de escopo.
+- (ga-yqzedv) O glifo que o claude real põe na frente da mensagem de limite não foi medido (nenhum pane nesse estado existia); o caminho do
+  `gc session reset` só rodou contra um `gc` falso nos testes, nunca ao vivo; se o layout do claude mudar, as telas viram "não sei" (sem vigia).
 
-Testes: `scripts/test_claude_crew_account.py` (140 testes, shim de `security`, servidor de perfil em loopback, `tmux` falso que registra cada argv e cada tecla). O harness é
+Testes: `scripts/test_claude_crew_account.py` (190 testes, shim de `security`, servidor de perfil em loopback, `tmux` falso que registra cada argv e cada tecla, `gc` falso que registra cada chamada). O harness é
 selado: todo teste roda com `CLAUDE_CREW_NOTIFY`, `CLAUDE_CREW_SECURITY` e `GC_CITY_PATH` fixados em stubs/tmp e `PATH`
 sem o `notify` real; no fim da sessão afirma que o log/estado/lock reais não mudaram e que nenhum sentinela foi executado;
 e o script roda de verdade sob `env -i`, com `python3` do pytest e com `/usr/bin/python3` (3.9, o do plist).
