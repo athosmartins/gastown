@@ -13,7 +13,7 @@ PARA QUE SERVE
 COMO DECIDE
   Reaproveita o leitor de shell do remote-clone-guard.py (scan: cd/pushd, `-C`, `bash -c`, eval, subshell, função, find -exec, VAR=x, env/sudo…) e troca só a
   pergunta feita a cada `git`: o subcomando é checkout/switch, ele MOVE o HEAD, e o clone onde roda é um dos protegidos?
-  · move o HEAD = tudo, menos (a) sem argumento (salvo se um xargs/parallel do comando pode acrescentá-los: aí é "não sei O QUE roda", abaixo), (b) só `main` com no máximo -q/--quiet (a volta), (c) `checkout [<árvore>] -- <arquivo>` (ao menos um arquivo depois do `--`) sem -b/-d/--detach/--orphan (arquivo, HEAD fica).
+  · move o HEAD = tudo, menos (a) sem argumento, (b) só `main` com no máximo -q/--quiet (a volta), (c) `checkout [<árvore>] -- <arquivo>` (ao menos um arquivo depois do `--`) sem -b/-d/--detach/--orphan (arquivo, HEAD fica).
   · clone = o ancestral mais próximo do alvo que tem `.git`; só vale se for um dos protegidos (LCG_ROOTS, separados por `:`; padrão ~/gt/whatsapp_automation).
     Clone aninhado (crew/x) e worktree ligado têm `.git` próprio e ficam livres. Um checkout toca DUAS coisas e as duas contam: a árvore que ele reescreve
     (--work-tree/GIT_WORK_TREE, senão o cwd) e o repositório cujo HEAD anda (o pai de --git-dir/GIT_DIR, senão o achado a partir do cwd — mesmo com --work-tree apontando para outro
@@ -25,14 +25,14 @@ COMO DECIDE
     Pasta que o parser não resolve (variável em cd/-C/--git-dir/--work-tree, glob, lançador opaco como flock/watch, aninhado fundo demais) → libera, EXCETO quando o cwd da sessão é o clone vivo: aí é o
     escorregão do incidente e barra, pedindo `git -C <pasta-absoluta>` (a mensagem explica; com a pasta dita por extenso e fora do vivo, passa). O que libera sem saber onde roda
     NÃO é silencioso: uma linha result=UNRESOLVED (op, cwd, sessão) no log, exit 0 — contar essas linhas diz quantas vezes o guarda ficou cego.
-    Não saber O QUE o git roda vale o mesmo: subcomando por variável/substituição (`X=checkout; git $X --detach abc`) ou operandos que o xargs/parallel acrescentam em tempo de execução (`echo --detach abc | xargs git checkout`:
-    o parser vê `git checkout` sem argumento) → barra se o git roda no vivo ou a sessão está nele, senão libera e CONTA (UNRESOLVED).
+    Não saber O QUE o git roda vale o mesmo: subcomando por variável/substituição (`X=checkout; git $X --detach abc`) ou git checkout/switch (ou git sem subcomando) num comando que cita xargs/parallel: o subcomando ou os operandos chegam em tempo de execução
+    (`echo --detach | xargs git checkout main` NÃO é a volta; `echo checkout --detach abc | xargs git`) → barra se o git roda no vivo ou a sessão está nele, senão libera e CONTA (UNRESOLVED).
 CÓDIGOS: 0 liberado · 2 bloqueado. `--selfcheck [settings.json…]`: 0 se o guarda decide como deveria numa pasta de teste E (com settings) todo PreToolUse de Bash é EXATAMENTE
   `python3 -I <este arquivo>` (só type/command/timeout — um `if` limitaria o disparo a `git -C *`, e `|| true` apagaria o exit 2) sem `disableAllHooks`; 1 caso contrário.
 CUSTO: roda em TODA chamada de Bash. Comando que não cita checkout/switch (nem abre `$'…'`) sai no pré-filtro, perto do Python vazio (~85-120 ms no mini, que mede ruidoso sob load alto); o que cita carrega o parser
   e custa ~140-220 ms. O parser traz `import tempfile` só para o --selfcheck dele (shutil → compression.zstd, +~270 ms): load_rcg() põe um módulo vazio no lugar. Não importe nada pesado no topo deste arquivo.
   Texto de mais de MAX_CMD (32768 caracteres) que cita checkout/switch NÃO vai ao parser: o custo dele é superlinear nesse texto (medido: ~110 ms a 25 KB, ~170 ms a 50 KB, ~950 ms a 200 KB com load ~12; ~10 s a 200 KB com load ~43, segundo o revisor do
-  gate). Libera e grava result=UNRESOLVED op="comando grande demais…" (nunca barra: o escorregão do incidente é um comando curto).
+  gate). Fora do vivo libera e grava result=UNRESOLVED op="comando grande demais…"; com o cwd da sessão no vivo barra, como todo "não sei" (o escorregão pode estar escondido no texto).
 LOG: uma linha TSV por bloqueio (result=BLOCK), erro (ERROR) ou liberação às cegas (UNRESOLVED, exit 0) em $LCG_LOG, senão $GC_CITY_PATH/.gc/logs/live-clone-git-guard.log (ts result root op cwd session agent alias). Liberar sabendo onde roda não grava. Sem LCG_LOG e sem GC_CITY_PATH (terminal fora do gc) nada grava: o BLOCK ainda avisa no stderr, ERROR/UNRESOLVED não deixam rastro.
 ATIVAÇÃO (decisão do Mayor/Athos: o settings do usuário não é editado por agente): em PreToolUse, matcher "Bash", UM hook
   {"type": "command", "command": "python3 -I /Users/athos/gt/.gascity-gastown-hq/scripts/live-clone-git-guard.py"}   — sem `if`.
@@ -41,8 +41,8 @@ LIMITES (não vê, e o que isso quer dizer): checkout feito FORA do Claude (laun
   na árvore, mas não foram o incidente; `git reset --hard` já tem o guarda dangerous-command); alvo que só se sabe em tempo de execução (`cd "$(…)"`, `cd $VAR`) quando o cwd da sessão NÃO é o vivo; aninhamento além de 3 níveis (o parser desiste: o que vem depois no mesmo comando não é conferido — armadilha de propósito é fora do escopo); alias do git; `gh pr checkout <n>` (o parser só olha `git`); `$"…"` (aspas de locale: `ch$"e"ckout`, só o `$'…'` é decodificado); caminho do clone escrito com outra caixa (o APFS ignora a caixa, o guarda compara o texto do realpath);
   `g''it`/`che''ckout` e `$'\x63heckout'` não escapam do pré-filtro mas um git por variável (`$G checkout`) sim. Depende do remote-clone-guard.py (scan/res): mudar a assinatura de lá quebra este selftest.
   Subcomando por variável SEM a palavra checkout/switch em lugar nenhum do texto (`git $CMD abc` com CMD vindo do ambiente) não chega ao parser: alargar o pré-filtro mandaria ao parser todo `git … $VAR` e toda mensagem de commit em heredoc
-  (+~100 ms em toda chamada com `git … $VAR` ou `$(…)`, para pegar um caso que não é o do incidente). xargs/parallel são vistos como PALAVRA no texto (sem aspas): `git checkout` sem argumento em comando que cita xargs em outro lugar conta como não sei; `x$'\x61'rgs` não é visto;
-  comando acima de MAX_CMD não é conferido (só contado).
+  (+~100 ms em toda chamada com `git … $VAR` ou `$(…)`, para pegar um caso que não é o do incidente). xargs/parallel são vistos como PALAVRA no texto (sem aspas), não por git: qualquer git checkout/switch num comando que também cita xargs conta como não sei, até a volta `git checkout main` (separe em duas chamadas);
+  `x$'\x61'rgs` não é visto; comando acima de MAX_CMD não é conferido (fora do vivo só contado, com a sessão no vivo barra).
 """
 from __future__ import annotations
 
@@ -63,7 +63,8 @@ UNKNOWN = "pasta desconhecida: "  # prefixo do `op` quando o parser não disse o
 UNKNOWN_WHAT = "subcomando desconhecido: "  # prefixo do `op` quando não sei O QUE o git roda e ele roda no clone vivo, ou a sessão está nele (message() troca o texto)
 SHELLY = re.compile(r"[$`*?\[{]")  # a mesma classe de caracteres com que o parser diz "não sei" a um caminho (res): variável, substituição, glob, chave
 APPENDERS = re.compile(r"\b(?:xargs|parallel)\b")  # programas que acrescentam operandos ao git em tempo de execução: o `git checkout` sem argumento que o parser vê não é o que roda
-MAX_CMD = 32768  # caracteres; o parser tem custo superlinear no texto que cita checkout/switch (medido aqui, load ~12: ~110 ms a 25 KB, ~170 ms a 50 KB, ~950 ms a 200 KB; o revisor do gate viu ~10 s a 200 KB sob load ~43): acima disto ele não roda, libera e CONTA
+BIG = "comando grande demais para conferir"  # começo do `op` do comando acima de MAX_CMD, na linha UNRESOLVED e no BLOCK (message() troca o texto)
+MAX_CMD = 32768  # caracteres; o parser tem custo superlinear no texto que cita checkout/switch (medido aqui, load ~12: ~110 ms a 25 KB, ~170 ms a 50 KB, ~950 ms a 200 KB; o revisor do gate viu ~10 s a 200 KB sob load ~43): acima disto ele não roda: com a sessão no vivo barra, senão libera e CONTA
 
 
 def load_rcg():
@@ -130,8 +131,9 @@ def make_hit(rcg, roots: set, hook_cwd, blind: list, appends: bool = False):
             else:  # opção de topo sem valor (--no-pager, -p…) ou que não conheço: segue; o pior caso é não achar o subcomando e liberar
                 i += 1
         sub, rest = (seg[i] if i < len(seg) else ""), seg[i + 1:]
-        # vazio (sem subcomando) → não é checkout/switch; ilegível ($VAR, $(…), glob no lugar do subcomando) ou operandos que o xargs/parallel acrescentam depois (o `rest` vazio que vejo não é o que roda) → "não sei O QUE roda", nunca "não move o HEAD"
-        what = bool(SHELLY.search(sub)) or (sub in HEAD_MOVERS and not rest and appends)
+        # vazio (sem subcomando) → não é checkout/switch; ilegível ($VAR, $(…), glob no lugar do subcomando) ou git num comando com xargs/parallel: o subcomando ou os operandos chegam em tempo de execução, e
+        # `xargs git checkout main` recebendo `--detach` NÃO é a volta, `xargs git` recebendo `checkout --detach abc` não tem subcomando para eu ler → "não sei O QUE roda", nunca "não move o HEAD" (qualquer `rest`)
+        what = bool(SHELLY.search(sub)) or (appends and (sub == "" or sub in HEAD_MOVERS))
         if not what and (sub not in HEAD_MOVERS or not moves_head(sub, rest)):
             return None
         # um checkout toca DUAS coisas e as duas contam: a ÁRVORE que reescreve (--work-tree, senão o cwd) e o repositório cujo HEAD anda (--git-dir, senão o achado a partir do cwd)
@@ -163,6 +165,13 @@ def decide(cmd: str, cwd, roots: set, rcg, blind: list):
     """None = liberado; (raiz, operação) = bloqueado. Onde o git roda, ou o que ele faz, e o parser não resolveu (variável, lançador opaco, aninhado fundo demais, subcomando por variável, operandos do xargs) = não sei: libera, salvo se o cwd da sessão é o clone vivo; o que liberou sem saber vai para `blind`."""
     # vazio (sem cwd no JSON) → None: não há de onde desconfiar, e o parser também recebe "não sei"
     real = os.path.realpath(cwd) if cwd else None
+    if len(cmd) > MAX_CMD:  # o parser custa mais que linear neste texto e não roda: é um "não sei" como os outros — com a sessão NO vivo barra (o escorregão pode estar escondido aqui), senão libera e CONTA
+        op = f"{BIG} ({len(cmd)} caracteres): {cmd[:100]}"
+        root = protected(real, roots) if real else None
+        if root:
+            return root, op
+        blind.append(op)  # acima do teto, fora do vivo: libera, mas conta
+        return None
     # texto sem aspas/barras (como o pré-filtro): `x''args` também conta; vazio → False (nenhum xargs/parallel no comando)
     appends = bool(APPENDERS.search(UNQUOTE.sub("", cmd)))
     rcg.git_hit = make_hit(rcg, roots, real, blind, appends)  # scan chama git_hit pelo nome do módulo: trocar aqui troca a pergunta, não o leitor de shell
@@ -197,6 +206,9 @@ def message(root: str, op: str) -> str:
     if op.startswith(UNKNOWN_WHAT):
         what = (f"BLOQUEADO: não consegui ver o que `{op[len(UNKNOWN_WHAT):]}` faz (subcomando escrito por variável/substituição, ou operandos que xargs/parallel acrescentam em tempo de execução) e ele pode ser um checkout/switch que tira o HEAD do clone vivo de produção.\n"
                 f"Clone: {root}\nRefaça com o subcomando e os operandos por extenso na linha: git checkout main (a volta) ou git -C <pasta-fora-do-vivo> checkout … (se a pasta NÃO é o clone vivo, passa).\n")
+    elif op.startswith(BIG):
+        what = (f"BLOQUEADO: {op.split(': ', 1)[0]}, teto {MAX_CMD}, e o texto cita checkout/switch: não consegui conferi-lo, e o cwd desta sessão é o clone vivo de produção.\n"
+                f"Clone: {root}\nRefaça com um comando menor (escreva arquivos com a ferramenta Write/Edit, não com o Bash) ou rode de fora do clone vivo.\n")
     elif op.startswith(UNKNOWN):
         what = (f"BLOQUEADO: não consegui ver em que pasta `{op[len(UNKNOWN):]}` roda (variável em cd/-C/--git-dir/--work-tree, lançador como flock/watch, ou comando aninhado fundo demais) e o cwd desta sessão é o clone vivo de produção.\n"
                 f"Clone: {root}\nRefaça dizendo a pasta por extenso e sem aninhar tanto: git -C <pasta-absoluta> checkout … (se ela NÃO é o clone vivo, passa).\n")
@@ -291,9 +303,6 @@ def main(argv: list) -> int:
         log("ERROR", "", "payload: cwd não é texto", "")
     if ANSI_C not in cmd and not PREFILTER.search(UNQUOTE.sub("", cmd)):  # sem a palavra (nem escondida por aspas/barra/ANSI-C), nada a conferir: não paga o parser
         return 0
-    if len(cmd) > MAX_CMD:  # o parser custa mais que linear aqui: não roda, libera e CONTA (o escorregão do incidente é um comando curto; um texto deste tamanho não é ele)
-        log("UNRESOLVED", "", f"comando grande demais para conferir ({len(cmd)} caracteres): {cmd[:100]}", cwd)
-        return 0  # acima do teto: libera
     try:
         rcg = load_rcg()
     except Exception as e:  # noqa: BLE001 — trava contra engano: parser quebrado não derruba a sessão de ninguém
