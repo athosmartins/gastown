@@ -573,6 +573,12 @@ fi
 # shellcheck disable=SC2329  # overrides the external find inside this subshell; _glob_list_dir calls it
 FOUT="$( find() { echo "$GD/over.log"; return 1; }; _glob_list_dir "$GD" "$CAPB"; echo "rc=$?" )"
 [ "$FOUT" = "rc=1" ] && ok "glob_list_dir: find fails -> rc 1 and the PARTIAL list is dropped (a half list is 'cannot tell')" || bad "glob_list_dir: find failure gave '$FOUT'"
+# `-type f` keeps symlinks and directories out. At a real cap (>= 1MB) neither can pass the -size filter on its
+# own, so only a deliberately tiny cap can tell the difference: a symlink and a directory named *.log that are
+# bigger than the 2-byte cap must still not be listed.
+GD="$CAPDIR/glob-types"; mkdir -p "$GD/adir.log"; echo "payload" > "$GD/real.log"; ln -s "$GD/real.log" "$GD/link.log"
+GOT="$(_glob_list_dir "$GD" 2)"; GRC=$?
+[ "$GRC" = "0" ] && [ "$(printf '%s\n' "$GOT" | grep -v '^$')" = "$GD/real.log" ] && ok "glob_list_dir: with a tiny cap only the regular file is listed (-type f keeps the symlink and the directory out)" || bad "glob_list_dir: tiny-cap listing rc=$GRC: $(printf '%s\n' "$GOT" | grep -v '^$' | tr '\n' ' ')"
 
 echo ""
 echo "=== glob class: main() end-to-end ==="
