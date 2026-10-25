@@ -63,10 +63,11 @@
 #      versions chained. Not the cause, each measured: handing the repack only object ids (the tier-1 batch: the WA versions chain there), pack.windowMemory 384m/512m (still hq), threads=1 (still hq).
 #      Nor can a config key do it: git has NO pack.nameHashVersion (`git help -c` on 2.54.0 lists none, and the name is in the binary only as the repack/pack-objects flag). Only the FLAG exists, so
 #      the tail and the room pass pass it (JAC_NAME_HASH_VERSION: 2 default, 1 = git's old hash, 0 = pass nothing); a git without the flag runs the pass as before and says so in the log, and every
-#      pass logs "repack name hash: ..." with what it ran with, so the LIVE script can be told from a merged one. `-c repack.writeBitmaps=false` rides in
-#      git_arch: with bitmaps on (a bare repo's default) git warns "--write-bitmap-index requires --name-hash-version=1" — the two cannot be asked together (seen on the MBP copy, which is bare). The
-#      archive is not bare, so this only guarantees the pass is never asked for both. The consolidating gc takes no such flag (and no config key stands in for it); it does not redo the deltas that
-#      already exist (no -f), so it keeps what the passes above chose.
+#      pass logs "repack name hash: ..." with what it ran with, so the LIVE script can be told from a merged one. Whether the git takes the flag is read from the NAME of the option in
+#      `git pack-objects -h` (not from its dashes: Apple's 2.50.1 lists it only as --[no-]name-hash-version <n>, 2.54.0 also in the synopsis as [--name-hash-version=<n>]). `-c repack.writeBitmaps=false`
+#      rides with the two repacks only (git_arch adds it when the subcommand is `repack`): with bitmaps on (a bare repo's default) git warns "--write-bitmap-index requires --name-hash-version=1" — the two
+#      cannot be asked together (seen on the MBP copy, which is bare). The archive is not bare, so this only guarantees the pass is never asked for both; maintenance and the gc keep the repo's own setting.
+#      The consolidating gc takes no such flag (and no config key stands in for it); it does not redo the deltas that already exist (no -f), so it keeps what the passes above chose.
 #      It never starts while loose bytes are still over the loose limit (`repack -a` would pack those too, an amount of work the object cap does not bound: tier 1 drains them first), nor
 #      while another git process is repacking the repo (ONE REPACKER AT A TIME, below), and it takes a pack only when it can count its objects from the .idx (cruft packs, .keep packs and
 #      packs it cannot read stay kept). Status: `consolidated` when it ended 0 and nothing before it had failed (the tail never overwrites a failure with a green); a pass that did NOTHING (busy,
@@ -420,8 +421,11 @@ _bounded() {  # _bounded <seconds> <cmd...>
 R_PACK_EXTRA=()      # more `-c` settings for the NEXT git_arch, after the defaults below so that they win (git takes the last value): the room pass sets leaner pack.* here and empties it afterwards
 git_arch() {  # git_arch <seconds> <git args...>   — uses $R_GITDIR and the repo's current batch size $R_BATCH
   local t="$1"; shift
+  # repack.writeBitmaps=false only for the `repack` steps (the tail and the room pass, which get --name-hash-version): maintenance and the consolidating gc keep the repo's own setting, so a bare copy still gets its bitmaps from them
+  local -a bm=()
+  if [ "${1:-}" = repack ]; then bm=(-c repack.writeBitmaps=false); fi
   _bounded "$t" "$GITBIN" --git-dir="$R_GITDIR" \
-    -c pack.threads=2 -c pack.windowMemory="$PACK_WINDOW_MEM" -c pack.deltaCacheSize=64m -c repack.writeBitmaps=false \
+    -c pack.threads=2 -c pack.windowMemory="$PACK_WINDOW_MEM" -c pack.deltaCacheSize=64m ${bm[@]+"${bm[@]}"} \
     -c maintenance.loose-objects.batchSize="${R_BATCH:-$BATCH_OBJECTS}" ${R_PACK_EXTRA[@]+"${R_PACK_EXTRA[@]}"} "$@"
 }
 
@@ -449,8 +453,10 @@ nhv_args() {
     # vazio → git printed nothing: not an answer, so NHV_PROBED stays 0 and the next pass asks again; falhou/ilegível → text that is not a usage (a timeout, a missing git, an error line): the same, and
     # this pass goes without the flag — what it did before ga-1lr9qp, never a flag the git may refuse
     help="$(git_usage pack-objects)"
+    # the option is matched by its NAME, not by its dashes: git 2.54.0 lists it twice in this usage ([--name-hash-version=<n>] in the synopsis, --[no-]name-hash-version <n> in the options), Apple's 2.50.1
+    # (/usr/bin/git) only the second, where the literal --name-hash-version never appears (ga-1lr9qp, gate FAIL 1: it read as "this git has no flag" and the incident hash came back)
     case "$help" in
-      *--name-hash-version*) NHV_OK=1; NHV_PROBED=1 ;;
+      *name-hash-version*) NHV_OK=1; NHV_PROBED=1 ;;
       *[Uu]sage:*) NHV_OK=0; NHV_PROBED=1; log "  this git has no repack --name-hash-version: the passes keep git's default hash, so hq/ and whatsapp_automation/ comments.jsonl share one group (ga-1lr9qp)" ;;
       *) NHV_OK=0; log "  could not read this git's pack-objects usage (got: '$(printf '%s' "$help" | head -c 80 | tr '\n' ' ')') — this pass runs without --name-hash-version, the next one asks again (ga-1lr9qp)" ;;
     esac
@@ -1283,6 +1289,8 @@ tail_pass() {
     log "  tail consolidation not started: cannot tell whether another git process is repacking $repo (no ps or lsof, one cut at its cap or failed, or a candidate lsof gave no directory for) — under doubt it waits; retried next run"
     return 0
   fi
+  # the git is asked BEFORE the budget is read: its probe (up to 20 s, on every pass while the git cannot answer) is part of the run's time, so t_left already has it taken out and `took` below is the repack's alone
+  nhv_args
   budget_for "$TAIL_TIMEOUT_S"
   log "  tail consolidation: $TAIL_N packs ($(fmt "$TAIL_KIB"), $TAIL_OBJ objects, + ${M_LOOSE_COUNT:-?} loose) -> one pack, deltas recomputed; ${#TAIL_KEEP[@]} other pack(s) kept untouched; object cap $R_TAIL (max $TAIL_MAX_OBJECTS)"
   # the tight road runs the way the room pass does (header): lean pack.* settings, and under the WATCHDOG with the tight floor — run_step reads WATCH_*, git_arch reads R_PACK_EXTRA — both put back right after the step
@@ -1291,7 +1299,6 @@ tail_pass() {
     WATCH_ON=1; WATCH_FREE_MIN_KIB=$(( TIGHT_FLOOR_KIB + WATCH_SLACK_KIB )); WATCH_SWAP_BASE_KIB="$TIGHT_SWP0"
   fi
   b0="$(date +%s)"
-  nhv_args
   run_step "$t_left" repack --quiet -a -d -l -f --window="$TAIL_WINDOW" --depth="$TAIL_DEPTH" --cruft --cruft-expiration=2.weeks.ago ${NHV_ARGS[@]+"${NHV_ARGS[@]}"} ${TAIL_KEEP[@]+"${TAIL_KEEP[@]}"}; out="$STEP_OUT"; rc="$STEP_RC"
   took=$(( $(date +%s) - b0 ))
   if [ "$tight" -eq 1 ]; then WATCH_ON=0; WATCH_FREE_MIN_KIB=0; WATCH_SWAP_BASE_KIB=0; R_PACK_EXTRA=(); fi
@@ -1471,6 +1478,7 @@ room_pass() {
     return 0
   fi
   cap_s="$GC_CAP"; [ "$cap_s" -le "$ROOM_TIMEOUT_S" ] || cap_s="$ROOM_TIMEOUT_S"
+  nhv_args      # before the budget is read, as in the tail pass: the probe is charged to t_left, not to `took`
   budget_for "$cap_s"
   swp_txt="$(( swp0 / 1024 ))MiB"
   log "  room pass: the whole-repo gc cannot have its room (free $(fmt "$fr"), Dolt's floor $(fmt "$floor")) — consolidating $ROOM_N pack(s) ($(fmt "$ROOM_KIB"); adaptive cap ${R_ROOM}KiB, room over the floor ${avail}KiB) into one with the largest pack ($ROOM_BIG) kept untouched; ${ROOM_THREADS} thread, windowMemory $ROOM_WINDOW_MEM, deltaCacheSize $ROOM_DELTA_CACHE; swap in use now $swp_txt, the watchdog stops it above +$(( WATCH_SWAP_MAX_KIB / 1024 ))MiB or free disk under $(fmt $(( floor + WATCH_SLACK_KIB ))), at most ${t_left}s"
@@ -1478,7 +1486,6 @@ room_pass() {
   R_PACK_EXTRA=(-c "pack.threads=$ROOM_THREADS" -c "pack.windowMemory=$ROOM_WINDOW_MEM" -c "pack.deltaCacheSize=$ROOM_DELTA_CACHE")
   WATCH_ON=1; WATCH_FREE_MIN_KIB=$(( floor + WATCH_SLACK_KIB )); WATCH_SWAP_BASE_KIB="$swp0"
   b0="$(date +%s)"
-  nhv_args
   run_step "$t_left" repack --quiet -a -d -l -f --window="$TAIL_WINDOW" --depth="$TAIL_DEPTH" --cruft --cruft-expiration=2.weeks.ago ${NHV_ARGS[@]+"${NHV_ARGS[@]}"} ${ROOM_KEEP[@]+"${ROOM_KEEP[@]}"}; out="$STEP_OUT"; rc="$STEP_RC"
   took=$(( $(date +%s) - b0 ))
   WATCH_ON=0; WATCH_FREE_MIN_KIB=0; WATCH_SWAP_BASE_KIB=0; R_PACK_EXTRA=()

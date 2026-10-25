@@ -72,8 +72,10 @@ loose_kib()   { git --git-dir="$1/.git" count-objects -v 2>/dev/null | awk '/^si
 pack_count()  { git --git-dir="$1/.git" count-objects -v 2>/dev/null | awk '/^packs:/{print $2}'; }
 commits()     { git --git-dir="$1/.git" rev-list --count HEAD; }
 history()     { git --git-dir="$1/.git" log --format='%H %T' HEAD | shasum | cut -d' ' -f1; }   # every commit id + its tree id
-# git_has_nhv — does the git under test have `repack --name-hash-version` (2.50.1 and 2.54.0 do)? The help text is captured first: a pipe into `grep -q` would end git on SIGPIPE.
-git_has_nhv() { local h; h="$(git repack -h 2>&1)"; case "$h" in *--name-hash-version*) return 0 ;; *) return 1 ;; esac; }
+# git_has_nhv — does the git under test have `repack --name-hash-version` (2.50.1 and 2.54.0 do)? It asks the question the SCRIPT asks (nhv_args: the usage of `pack-objects`, matched on the option NAME): 2.54.0 prints
+# the option as [--name-hash-version=<n>] in the synopsis AND as --[no-]name-hash-version <n> in the options, Apple's 2.50.1 only the second. Two different questions made S43 go red on a git the script runs
+# fine on (ga-1lr9qp, gate FAIL 1: the selftest said "has it", the script said "no"); one question skips exactly where the script would run without the flag. The help text is captured first: a pipe into `grep -q` would end git on SIGPIPE.
+git_has_nhv() { local h; h="$(git pack-objects -h 2>&1)"; case "$h" in *name-hash-version*) return 0 ;; *) return 1 ;; esac; }
 
 cat > "$WORK/gc-stub" <<EOF
 #!/bin/bash
@@ -2685,6 +2687,61 @@ TE="$WORK/nh-e"; tailrepo "$TE" 4; rm -f "$WORK/state.json" "$WORK/log" "$WORK/a
 out="$(ARGV_LOG="$WORK/argv" T_GIT="$WORK/git-blindnhv" T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TE")"; rc=$?
 { [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ -s "$WORK/argv" ] && ! grep -q -- 'name-hash-version' "$WORK/argv" && printf '%s' "$out" | grep -q "could not read this git's pack-objects usage" && ! printf '%s' "$out" | grep -q 'this git has no repack' && printf '%s' "$out" | grep -F -q 'repack name hash: git default hash (no flag passed)'; } \
   && ok "S43 E. a git that cannot be asked: the tail pass still consolidates (no flag passed) and the log says it COULD NOT READ the usage, not that the flag is missing" || bad "S43 E. unreadable-probe road wrong (rc=$rc status=$(last_status)): $out / $(cat "$WORK/argv" 2>/dev/null)"
+# F. the git that LISTS the flag in a different wording. Apple's 2.50.1 (/usr/bin/git) prints it in `pack-objects -h` ONLY as `--[no-]name-hash-version <n>` (no synopsis form), so the literal --name-hash-version is nowhere in
+# the text; 2.54.0 also has [--name-hash-version=<n>] in its synopsis. The script used to look for the dashes: on 2.50.1 it read "this git has no flag" and the pass ran on git's default hash (the incident) — gate FAIL 1
+# of ga-1lr9qp. The stub prints the 2.50.1 wording and runs the real git for the rest, so this check does not depend on which git the host has.
+cat > "$WORK/git-nhv250" <<'EOF'
+#!/bin/bash
+case " $* " in
+  *" pack-objects -h "*) cat >&2 <<'USAGE'
+usage: git pack-objects --stdout [<options>] [< <ref-list> | < <object-list>]
+   or: git pack-objects [<options>] <base-name> [< <ref-list> | < <object-list>]
+
+    -q, --[no-]quiet      do not show progress meter
+    --[no-]name-hash-version <n>
+                          use the specified name-hash function to group similar objects
+USAGE
+    exit 129 ;;
+  *" repack "*) printf '%s\n' "$*" >> "${ARGV_LOG:?}" ;;
+esac
+exec git "$@"
+EOF
+chmod +x "$WORK/git-nhv250"
+TF="$WORK/nh-f"; tailrepo "$TF" 4; rm -f "$WORK/state.json" "$WORK/log" "$WORK/argv"
+out="$(ARGV_LOG="$WORK/argv" T_GIT="$WORK/git-nhv250" T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TF")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && grep -E -q -- ' --name-hash-version=2( |$)' "$WORK/argv" && printf '%s' "$out" | grep -F -q 'repack name hash: --name-hash-version=2' && ! printf '%s' "$out" | grep -q 'this git has no repack'; } \
+  && ok "S43 F. a git that lists the flag only as --[no-]name-hash-version <n> (Apple's 2.50.1): it IS taken for a git with the flag — the repack carries --name-hash-version=2" \
+  || bad "S43 F. the flag listed as --[no-]name-hash-version was read as missing (rc=$rc status=$(last_status)): $out / $(cat "$WORK/argv" 2>/dev/null)"
+# G. the probe is part of the run's time. nhv_args asks the git (up to 20 s, on every pass while the git cannot answer): it runs BEFORE budget_for, so the repack gets what is left of the RUN after the probe — a probe of
+# 6 s in a 16 s run leaves at most 10 s. Read AFTER budget_for (what it was), the repack was handed the whole 16 s and the run's deadline came 6 s late. The stub's probe sleeps, then answers as the real git does.
+cat > "$WORK/git-slowprobe" <<'EOF'
+#!/bin/bash
+case " $* " in
+  *" pack-objects -h "*) sleep "${PROBE_SLEEP:-6}" ;;
+  *" repack "*) sleep 60 ;;
+esac
+exec git "$@"
+EOF
+chmod +x "$WORK/git-slowprobe"
+TG="$WORK/nh-g"; tailrepo "$TG" 4; rm -f "$WORK/state.json" "$WORK/log"
+out="$(PROBE_SLEEP=6 T_GIT="$WORK/git-slowprobe" T_TAIL=300 T_TAIL_OBJS=20 T_DEADLINE=16 T_MIN_GC=2 run_tail "$TG")"; rc=$?
+if printf '%s' "$out" | grep -q 'tail consolidation deferred to the next run'; then skip "S43 G: the tail pass never started inside this test's 16s budget (host too loaded)"
+else
+  GT="$(printf '%s\n' "$out" | sed -n 's/.*tail repack was cut by the run deadline after \([0-9][0-9]*\)s.*/\1/p' | head -n 1)"
+  { [ "$rc" -eq 0 ] && [ -n "$GT" ] && [ "$GT" -le 10 ]; } \
+    && ok "S43 G. the probe's 6s are charged to the run's budget: the repack was handed ${GT}s of the 16s run (at most 10), not all of it" \
+    || bad "S43 G. the repack was handed ${GT:-?}s of a 16s run after a 6s probe (rc=$rc, want <= 10s): $out"
+fi
+# H. repack.writeBitmaps=false belongs to the REPACKS (the tail and the room pass, which get --name-hash-version) and to nothing else: maintenance and the consolidating gc keep the repo's own bitmap setting. The stub
+# logs every git_arch call (the one that carries pack.deltaCacheSize); the fixture drains loose objects with a batch first and then runs the tail, so both kinds of call are there.
+printf '#!/bin/bash\ncase " $* " in *" -c pack.deltaCacheSize="*) printf "%%s\\n" "$*" >> "${ARGV_LOG:?}" ;; esac\nexec git "$@"\n' > "$WORK/git-bmlog"; chmod +x "$WORK/git-bmlog"
+TH="$WORK/nh-h"; tailrepo "$TH" 4; addcommits "$TH" 3; rm -f "$WORK/state.json" "$WORK/log" "$WORK/argv"
+out="$(ARGV_LOG="$WORK/argv" T_GIT="$WORK/git-bmlog" T_LIMIT=100 T_TAIL=300 T_TAIL_OBJS=40 run_tail "$TH")"; rc=$?
+HM="$(grep -c ' maintenance run ' "$WORK/argv" 2>/dev/null || true)"; HR="$(grep -c ' repack ' "$WORK/argv" 2>/dev/null || true)"
+HRB="$(grep ' repack ' "$WORK/argv" 2>/dev/null | grep -c 'repack.writeBitmaps=false' || true)"; HOB="$(grep -v ' repack ' "$WORK/argv" 2>/dev/null | grep -c 'repack.writeBitmaps' || true)"
+{ [ "$rc" -eq 0 ] && [ "${HM:-0}" -ge 1 ] && [ "${HR:-0}" -ge 1 ] && [ "${HRB:-x}" = "${HR:-y}" ] && [ "${HOB:-x}" = 0 ]; } \
+  && ok "S43 H. repack.writeBitmaps=false rides with the repack steps only: $HRB of $HR repack call(s) carry it, $HOB of the other git steps do (they include $HM maintenance run call(s))" \
+  || bad "S43 H. repack.writeBitmaps=false is on the wrong steps (rc=$rc; maintenance calls=$HM, repack calls=$HR, repacks carrying it=$HRB, other steps carrying it=$HOB): $(cat "$WORK/argv" 2>/dev/null)"
 fi
 
 echo ""
