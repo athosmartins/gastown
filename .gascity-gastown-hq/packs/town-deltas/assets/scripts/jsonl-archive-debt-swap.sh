@@ -318,7 +318,8 @@ if [ -z "$FAIL" ]; then
 fi
 if [ -z "$FAIL" ]; then
   g fsck --connectivity-only --no-dangling --no-progress > "$STATE/fsck.txt" 2>&1; FRC=$?
-  if [ "$FRC" -ne 0 ] || grep -q -i -E "^(missing|broken|error|fatal)" "$STATE/fsck.txt"; then FAIL="$FAIL fsck(rc=$FRC)"; head -5 "$STATE/fsck.txt" | while IFS= read -r l; do log "  fsck: $l"; done; else log "fsck --connectivity-only ok"; fi
+  # fsck.txt é escrito pela linha de cima: se a escrita falhar o redirect devolve rc 1 → FRC != 0 → reprova (T17 injeta o rc != 0 e o "missing" com rc 0)
+  if [ "$FRC" -ne 0 ] || grep -q -i -E "^(missing|broken|error|fatal)" "$STATE/fsck.txt"; then FAIL="$FAIL fsck(rc=$FRC)"; head -5 "$STATE/fsck.txt" | while IFS= read -r l; do log "  fsck: $l"; done; else log "fsck --connectivity-only ok"; fi  # third-state-waiver: o arquivo é a saída da linha anterior; escrita que falha já vira FRC != 0 (reprova)
 fi
 if [ -z "$FAIL" ] && [ -s "$MAN/ids.txt" ]; then
   # cat-file que falhou (rc != 0) ou que respondeu menos linhas do que ids → "não li" = REPROVA; nunca vira "0 ausentes" (grep -c sobre uma saída vazia imprime 0)
