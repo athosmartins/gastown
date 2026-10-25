@@ -1913,6 +1913,16 @@ def test_stopped_for_ten_minutes_is_pushed_once_by_name_and_by_default_nothing_i
     assert not secrets_in(w.log() + (w.d / "crew_state.json").read_text() + "".join(pushes), w)
 
 
+def test_a_stall_inside_the_window_of_an_earlier_push_is_logged_every_run_and_not_swallowed(w):
+    _stalled(w, os.getpid(), name="Thies")
+    _switch_crypto_to_amb(w)
+    st = w.state()
+    st.setdefault("alerts", {})["rc-limit-stalled"] = w.now + 60                           # an earlier push, minutes ago: inside the 6 h window
+    (w.d / "crew_state.json").write_text(json.dumps(st))
+    _run_to(w, 90, 690, 750)
+    assert w.log().count("has had the limit message as the last thing") == 2 and not w.notified()   # in the log on every run, a push on none
+
+
 def test_the_banner_watch_runs_even_when_there_is_no_tmux_to_ask_and_says_so(w, monkeypatch):
     _stalled(w, os.getpid())
     _switch_crypto_to_amb(w)
@@ -2089,7 +2099,7 @@ def _tr(kind):
     pytest.param(lambda w, me: _edit_session(w, me, status="busy"), "not idle", id="busy"),        # the session file says it is working
     pytest.param(lambda w, me: _edit_session(w, me, status=None), "not idle", id="no_status"),
     pytest.param(lambda w, me: w.decide("amb", exhausted=["amb"]), "itself registered exhausted", id="exhausted"),
-    pytest.param(lambda w, me: w.pane_set("%5", captures=0, flip_after=1, flip_text=STALLED_TYPING), "not stopped any more", id="pane_changed_at_the_key"),
+    pytest.param(lambda w, me: w.pane_set("%5", captures=0, flip_after=1, flip_text=STALLED_TYPING), "not confirmed stopped", id="pane_changed_at_the_key"),
     pytest.param(lambda w, me: w.gc_sessions(("ga-1ioaom", "dog-ga1ioaom")), "no gc session", id="no_gc_match"),
     pytest.param(lambda w, me: w.gc_sessions(("gh-050", "gastown__mayor"), ("gh-051", "gastown__mayor")), "more than one gc session", id="two_gc_matches"),
     pytest.param(lambda w, me: w.mp.setenv("FAKE_GC_LIST_FAIL", "1"), "could not list", id="gc_list_fails"),

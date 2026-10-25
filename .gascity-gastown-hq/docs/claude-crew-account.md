@@ -103,7 +103,7 @@ ficou 10 min assim (troca 15:40Z → saiu só quando a varredura fechou a sessã
   da troca" de "está ociosa nessa mensagem desde antes" — só diz o que se viu (ociosa no 429, ninguém vai dar um turno a ela). A distinção
   que importa para o degrau destrutivo é feita pelo transcript, abaixo;
 - a mensagem some / vem trabalho depois dela → sai da vigia, sem push; o modal abre → vai para a `limit_watch` (Escape);
-- sessão que terminou sozinha → sai da vigia (o log diz); pane que não é mais dela, tmux mudo, tela num layout não medido (rodapé maior que o medido, por exemplo) → "não sei", mantida, nada afirmado (a impressão e o relógio guardados valem quando o layout volta); a vigia cai em 1 h (`BANNER_WATCH_S`), o push fica.
+- sessão que terminou sozinha → sai da vigia (o log diz); pane que não é mais dela, tmux mudo, tela num layout não medido (rodapé maior que o medido, por exemplo) → "não sei", mantida, nada afirmado (o registro fica como estava: se o layout volta com a MESMA impressão, os 10 min contam da primeira leitura; com outra, recomeçam); a vigia cai em 1 h (`BANNER_WATCH_S`), o push fica.
 O veredito do VERIFY continua `NOT VERIFIED` (uma leitura só não separa atual de velha); o que muda é que agora há vigia que separa.
 **Nenhuma tecla vai para essa tela** (não há modal para responder). Layout que este script não mediu (a caixa `╭─╮ │ > │` antiga, por exemplo)
 continua "não sei" e sem vigia.
