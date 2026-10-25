@@ -19,7 +19,7 @@ COMO DECIDE
     (--work-tree/GIT_WORK_TREE, senão o cwd) e o repositório cujo HEAD anda (o pai de --git-dir/GIT_DIR, senão o achado a partir do cwd — mesmo com --work-tree apontando para outro
     lugar). O cwd vem do hook, de `-C` e de `cd`. Qualquer das duas sem resposta (variável, glob) é "não sei", nunca "é outro lugar".
   · FALHA ABERTA, de propósito: é trava contra engano (o slip de cwd), não sandbox, e roda em TODA sessão do mini — um defeito dele não pode derrubar o trabalho dos outros.
-    Payload que o guarda não sabe ler → libera, mas SEMPRE com uma linha result=ERROR (um guarda morto tem de aparecer no log): JSON ilegível (inclusive aninhado fundo demais) ou que não é o objeto do hook; sem tool_name
+    Payload que o guarda não sabe ler → libera, mas grava uma linha result=ERROR (um guarda morto tem de aparecer no log; sem onde gravar, ver LOG): JSON ilegível (inclusive aninhado fundo demais) ou que não é o objeto do hook; sem tool_name
     (ou "bash" em outra caixa); Bash sem tool_input.command em texto não vazio (`cmd`, `command` null, embrulho `input`…); cwd que não é texto (123, lista). Parser que não carrega ou exceção na decisão → idem
     (`--selfcheck` falha para o ativador ver o parser). O veredito não depende do log: gravar falhou (pasta que não existe, disco cheio) ou o texto não codifica (surrogate solto sai escapado) → o exit 2 fica.
     Pasta que o parser não resolve (variável em cd/-C/--git-dir/--work-tree, glob, lançador opaco como flock/watch, aninhado fundo demais) → libera, EXCETO quando o cwd da sessão é o clone vivo: aí é o
