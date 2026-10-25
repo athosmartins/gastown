@@ -62,7 +62,8 @@ echo "── 0. the E11 functions exist ──"
 E11_FNS="gate_e11_switch_state gate_e11_enabled gate_e11_arm_for_bead gate_e11_path_is_production gate_e11_count_production_lines
 gate_e11_cap_lines gate_e11_cap_state gate_e11_exempt_label gate_e11_exempt_reason gate_e11_exempt_state gate_e11_exempt_merge gate_e11_verdict gate_e11_force_all
 gate_e11_path_is_generated gate_e11_path_counts_for_total gate_e11_count_lines_by gate_e11_count_total_lines gate_e11_total_cap gate_e11_total_cap_state
-gate_e11_fix_attempt_label gate_e11_fix_attempt_state gate_e11_total_verdict gate_e11_combine_verdicts gate_e11_caps_exceeded gate_e11_refused_by"
+gate_e11_fix_attempt_label gate_e11_fix_attempt_state gate_e11_total_verdict gate_e11_combine_verdicts gate_e11_caps_exceeded gate_e11_refused_by
+gate_e11_label_state gate_e11_labels_as_wanted gate_e11_label_write_verified gate_e11_refusal_count"
 E11_MISSING=0
 for f in $E11_FNS; do
   if declare -F "$f" >/dev/null 2>&1; then ok "function $f is defined"; else bad "function $f is NOT defined in $GUARD"; E11_MISSING=1; fi
@@ -511,6 +512,46 @@ eq "refused_by: the total refuses alone" "$(rb dentro-do-teto recusa)" "total"
 eq "refused_by: nobody refuses" "$(rb isento nao-medido)" "nenhum"
 
 # ── 8. the guard block, run LIVE ─────────────────────────────────────────────
+echo "── 7c. the refusal's label readings: has / lacks / desconhecido (ga-emc197) ──"
+# The refusal used to write labels with `|| true` and no read-back, and to turn an unreadable bead into "no refusals yet".
+# These are the three-state readings it decides on now: "I could not tell" is its own answer, never "lacks" / "0".
+R_ARR='[{"id":"x-1","labels":["gate:queued","story:approved"]}]'
+R_OBJ='{"id":"x-1","labels":["gate:needs-fix"]}'
+R_EMPTYLBL='[{"id":"x-1","labels":[]}]'
+R_NOKEY='[{"id":"x-1"}]'
+R_ERR='{"error":"database is locked"}'
+eq "label_state: array, label present → has" "$(gate_e11_label_state "$R_ARR" gate:queued)" "has"
+eq "label_state: single object, label present → has" "$(gate_e11_label_state "$R_OBJ" gate:needs-fix)" "has"
+eq "label_state: label absent → lacks" "$(gate_e11_label_state "$R_ARR" gate:needs-fix)" "lacks"
+eq "label_state: empty labels → lacks (the bead was READ)" "$(gate_e11_label_state "$R_EMPTYLBL" gate:queued)" "lacks"
+eq "label_state: no labels key → lacks (bd omits it when empty)" "$(gate_e11_label_state "$R_NOKEY" gate:queued)" "lacks"
+eq "label_state: empty output → desconhecido, NOT lacks" "$(gate_e11_label_state "" gate:queued)" "desconhecido"
+eq "label_state: text that is not JSON → desconhecido" "$(gate_e11_label_state "Error: no such bead" gate:queued)" "desconhecido"
+eq "label_state: bd's {error} object → desconhecido" "$(gate_e11_label_state "$R_ERR" gate:queued)" "desconhecido"
+eq "label_state: empty array → desconhecido" "$(gate_e11_label_state '[]' gate:queued)" "desconhecido"
+eq "label_state: no label named → desconhecido" "$(gate_e11_label_state "$R_ARR" "")" "desconhecido"
+eq "as_wanted: every label present → yes" "$(gate_e11_labels_as_wanted "$R_ARR" has gate:queued story:approved)" "yes"
+eq "as_wanted: one of two present → no" "$(gate_e11_labels_as_wanted "$R_ARR" has gate:queued gate:needs-fix)" "no"
+eq "as_wanted: every label absent → yes" "$(gate_e11_labels_as_wanted "$R_ARR" lacks gate:needs-fix gate:needs-human)" "yes"
+eq "as_wanted: one of two still there → no" "$(gate_e11_labels_as_wanted "$R_ARR" lacks gate:needs-fix gate:queued)" "no"
+eq "as_wanted: unreadable bead → desconhecido, for has" "$(gate_e11_labels_as_wanted "" has gate:needs-fix)" "desconhecido"
+eq "as_wanted: unreadable bead → desconhecido, for lacks (a failed read is not proof of absence)" "$(gate_e11_labels_as_wanted "" lacks gate:queued)" "desconhecido"
+eq "as_wanted: a word nobody defined → desconhecido" "$(gate_e11_labels_as_wanted "$R_ARR" banana gate:queued)" "desconhecido"
+eq "as_wanted: no label named → desconhecido" "$(gate_e11_labels_as_wanted "$R_ARR" has)" "desconhecido"
+eq "refusal_count: no counter label on a READ bead → 0" "$(gate_e11_refusal_count "$R_ARR")" "0"
+eq "refusal_count: empty labels → 0" "$(gate_e11_refusal_count "$R_EMPTYLBL")" "0"
+eq "refusal_count: no labels key → 0" "$(gate_e11_refusal_count "$R_NOKEY")" "0"
+eq "refusal_count: one counter label → N" "$(gate_e11_refusal_count '[{"id":"x-1","labels":["gate:e11-refusals:2"]}]')" "2"
+eq "refusal_count: several counter labels → the highest" "$(gate_e11_refusal_count '[{"id":"x-1","labels":["gate:e11-refusals:1","gate:e11-refusals:3","gate:e11-refusals:2"]}]')" "3"
+eq "refusal_count: single object also reads" "$(gate_e11_refusal_count '{"id":"x-1","labels":["gate:e11-refusals:2"]}')" "2"
+eq "refusal_count: empty output → desconhecido, NOT 0 (it used to restart at '1 of 3')" "$(gate_e11_refusal_count "")" "desconhecido"
+eq "refusal_count: text that is not JSON → desconhecido" "$(gate_e11_refusal_count "Error: database is locked")" "desconhecido"
+eq "refusal_count: bd's {error} object → desconhecido" "$(gate_e11_refusal_count "$R_ERR")" "desconhecido"
+eq "refusal_count: empty array → desconhecido" "$(gate_e11_refusal_count '[]')" "desconhecido"
+eq "refusal_count: a junk number is not a count" "$(gate_e11_refusal_count '[{"id":"x-1","labels":["gate:e11-refusals:abc"]}]')" "0"
+eq "refusal_count: a negative number is not a count" "$(gate_e11_refusal_count '[{"id":"x-1","labels":["gate:e11-refusals:-3"]}]')" "0"
+eq "refusal_count: junk beside a real counter does not hide it" "$(gate_e11_refusal_count '[{"id":"x-1","labels":["gate:e11-refusals:abc","gate:e11-refusals:2"]}]')" "2"
+
 echo "── 8. the live block in quality-gate-guard.sh ──"
 E11_FILE="$TMPD/e11-block.sh"
 sed -n '/# SELFTEST-EXTRACT e11-diff-cap: BEGIN/,/# SELFTEST-EXTRACT e11-diff-cap: END/p' "$GUARD" > "$E11_FILE"
@@ -607,14 +648,41 @@ bd() {
   done
   verb="${rest[0]:-}"; id="${rest[1]:-}"
   case "$verb" in
-    show)     [ -n "$dir" ] && [ -f "$dir/show-$id.json" ] && cat "$dir/show-$id.json" || return 1 ;;
+    # E11_STUB_SRC_SHOW_FAIL_N=<n> [E11_STUB_SRC_SHOW_FAIL_FROM=<k>, default 1]: n reads of the SOURCE bead, counting from the k-th,
+    # do not answer (E11_STUB_SRC_SHOW_FAIL_MODE=rc: rc 1 and nothing; =error: rc 0 and bd's {"error": ...} object) — the
+    # unreadable counter / read-back of ga-emc197. The live block reads the source bead 1st for the exemption (only on an
+    # over-cap submission) and 2nd for the counter, then once per read-back: FROM=2 N=1 is "the counter cannot be read".
+    show)     if [ "$dir" = "$SRC_STORE" ] && [ "${E11_STUB_SRC_SHOW_FAIL_N:-0}" -gt 0 ]; then
+                local n=0; [ -f "$TMPD/src-show-n" ] && n=$(cat "$TMPD/src-show-n"); n=$((n+1)); echo "$n" > "$TMPD/src-show-n"
+                if [ "$n" -ge "${E11_STUB_SRC_SHOW_FAIL_FROM:-1}" ] && [ "$n" -lt $(( ${E11_STUB_SRC_SHOW_FAIL_FROM:-1} + ${E11_STUB_SRC_SHOW_FAIL_N:-0} )) ]; then
+                  if [ "${E11_STUB_SRC_SHOW_FAIL_MODE:-rc}" = "error" ]; then echo '{"error":"database is locked"}'; return 0; fi
+                  return 1
+                fi
+              fi
+              [ -n "$dir" ] && [ -f "$dir/show-$id.json" ] && cat "$dir/show-$id.json" || return 1 ;;
     comments) [ -n "$dir" ] && [ -f "$dir/comments-$id.json" ] && cat "$dir/comments-$id.json" || return 1 ;;
     # A tiny fake store, so the guard's READ-BACKS see what a real bd would show: `label add/remove` persist into
     # show-<id>.json (unless E11_STUB_LABELS_VANISH=1 — the silent-failure shape the guard must detect), `close`
     # flips status to closed (unless E11_STUB_CLOSE_FAILS=1 — rc 1 and nothing persists). A bead with no file:
     # the write "succeeds" and persists nothing.
+    # E11_STUB_LABELS_VANISH: 1 = no store keeps a label write; marker / source = only that store drops them (the refusal
+    # label on the MARKER vanishing is a different fact from the SOURCE bead's labels vanishing — ga-emc197).
+    # E11_STUB_DROP="<op> <labels>[|<op> <labels>]": that exact write on the SOURCE bead persists nothing and returns
+    # E11_STUB_DROP_RC (default 0 — the silent shape); E11_STUB_DROP_TIMES=n drops only the first n such writes (a retry lands).
     label)    op="${rest[1]:-}"; id="${rest[2]:-}"; labs="${rest[3]:-}"; f="$dir/show-$id.json"
-      if [ -n "$dir" ] && [ -f "$f" ] && [ "${E11_STUB_LABELS_VANISH:-0}" != "1" ]; then
+      local drop=0 drop_rc=0
+      case "${E11_STUB_LABELS_VANISH:-0}" in
+        1) drop=1 ;;
+        marker) [ "$dir" = "$MRK_STORE" ] && drop=1 ;;
+        source) [ "$dir" = "$SRC_STORE" ] && drop=1 ;;
+      esac
+      case "|${E11_STUB_DROP:-}|" in
+        *"|$op $labs|"*)
+          local dn=0; [ -f "$TMPD/drop-n" ] && dn=$(cat "$TMPD/drop-n"); dn=$((dn+1)); echo "$dn" > "$TMPD/drop-n"
+          if [ "$dn" -le "${E11_STUB_DROP_TIMES:-999}" ]; then drop=1; drop_rc="${E11_STUB_DROP_RC:-0}"; fi ;;
+      esac
+      [ "$drop_rc" != "0" ] && return "$drop_rc"
+      if [ -n "$dir" ] && [ -f "$f" ] && [ "$drop" = "0" ]; then
         case "$op" in
           add)    jq -c --arg l "$labs" '.[0].labels = (((.[0].labels // []) + ($l|split(","))) | unique)' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
           remove) jq -c --arg l "$labs" '.[0].labels = ((.[0].labels // []) - ($l|split(",")))' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
@@ -647,7 +715,7 @@ PLAIN='["story:approved"]'; EXEMPT='["story:approved","gate:size-exempt"]'
 # run_e11 <on 1|0> <RIG_PATH> <BEAD_ID> <BRANCH>  → rc; log/calls in $LOGF/$CALLS. Subshell under the guard's real
 # `set -euo pipefail`; `exit 1` in a refusal ends only the subshell.
 run_e11() {
-  : > "$LOGF"; : > "$CALLS"
+  : > "$LOGF"; : > "$CALLS"; rm -f "$TMPD/src-show-n" "$TMPD/drop-n"
   ( set -euo pipefail
     export GATE_E11_ENABLED="$1"
     RIG_PATH="$2"; BEAD_ID="$3"; BRANCH="$4"; MARKER_ID="m-e11"; GC_CITY="$MRK_STORE"; BEAD_CITY="$SRC_STORE"
@@ -754,7 +822,9 @@ slice_type_case "" "<tipo de $BB>"
 
 echo "  — refusal label write that does not persist: said, and the close still ends it —"
 set_beads "$BB" "$PLAIN" "$PLAIN"
-E11_STUB_LABELS_VANISH=1 run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+# only the MARKER store drops its label writes: this section is about the marker's refusal label. With every store dropping,
+# the source bead's labels vanish too and the old guard still logged "-> gate:needs-fix" and closed (the ga-emc197 defect).
+E11_STUB_LABELS_VANISH=marker run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
 eq "label vanish: still refused (rc 1)" "$RC" "1"
 eq "label vanish: label add was RETRIED (2 attempts)" "$(grep -c 'label add m-e11 gate-guard:refused-e11' "$CALLS")" "2"
 has "label vanish: the warning names it" "$LOGF" "WARN E11-DIFF-CAP: refusal label gate-guard:refused-e11 NOT persisted on m-e11 after 2 attempts"
@@ -775,6 +845,174 @@ has "refusal: a comment goes on the marker" "$CALLS" "BD -C $TMPD/city comment m
 has "refusal: the comment tells the builder to split into slices" "$CALLS" "fatias"
 has "refusal: the comment names the exemption label" "$CALLS" "gate:size-exempt"
 has "refusal: the comment gives the count and the cap" "$CALLS" "900"
+
+echo "  — ga-emc197: the source bead's labels are WRITTEN, READ BACK, and only then is anything claimed or closed —"
+# The audit of 00634ad5a: the refusal removed gate:queued BEFORE adding gate:needs-fix, both with `|| true` and no read-back.
+# If the add did not land (bd's batch is all-or-nothing), the bead had NO gate:* label — nothing watches that — the marker
+# was closed anyway and the log said "-> gate:needs-fix". Each case below must FAIL on the guard as it was at 00634ad5a.
+stub_reset() { unset E11_STUB_DROP E11_STUB_DROP_RC E11_STUB_DROP_TIMES E11_STUB_SRC_SHOW_FAIL_N E11_STUB_SRC_SHOW_FAIL_FROM E11_STUB_SRC_SHOW_FAIL_MODE E11_STUB_LABELS_VANISH; rm -f "$TMPD/src-show-n" "$TMPD/drop-n"; }
+src_has() { jq -r --arg l "$1" '.[0].labels|index($l) != null' "$SRC_STORE/show-$BB.json" 2>/dev/null; }
+calls_count() { grep -cF -- "$1" "$CALLS"; }
+
+echo "  · write_verified, on the fake store —"
+stub_reset; : > "$CALLS"
+set_beads "$BB" '["story:approved","gate:queued"]' "$PLAIN"
+eq "write_verified: an add that lands → yes" "$(gate_e11_label_write_verified "$SRC_STORE" "$BB" add gate:needs-fix)" "yes"
+eq "write_verified: ...and the label is really there" "$(src_has gate:needs-fix)" "true"
+eq "write_verified: a remove that lands → yes" "$(gate_e11_label_write_verified "$SRC_STORE" "$BB" remove gate:queued)" "yes"
+eq "write_verified: ...and the label is really gone" "$(src_has gate:queued)" "false"
+eq "write_verified: removing a label the bead never had → yes (it is not there)" "$(gate_e11_label_write_verified "$SRC_STORE" "$BB" remove gate:needs-human)" "yes"
+eq "write_verified: a batch of two labels lands → yes" "$(gate_e11_label_write_verified "$SRC_STORE" "$BB" add gate:needs-human,gate:e11-refusals:3)" "yes"
+set_beads "$BB" '["story:approved","gate:queued"]' "$PLAIN"; : > "$CALLS"
+export E11_STUB_DROP="add gate:needs-fix"
+eq "write_verified: an add that returns 0 and persists NOTHING → no" "$(gate_e11_label_write_verified "$SRC_STORE" "$BB" add gate:needs-fix)" "no"
+eq "write_verified: ...it tried twice, not once" "$(calls_count "label add $BB gate:needs-fix")" "2"
+stub_reset; : > "$CALLS"; export E11_STUB_DROP="add gate:needs-fix" E11_STUB_DROP_RC=1
+eq "write_verified: an add that FAILS (rc 1) → no" "$(gate_e11_label_write_verified "$SRC_STORE" "$BB" add gate:needs-fix)" "no"
+stub_reset; : > "$CALLS"; export E11_STUB_DROP="add gate:needs-fix" E11_STUB_DROP_TIMES=1
+eq "write_verified: the first attempt dropped, the retry lands → yes" "$(gate_e11_label_write_verified "$SRC_STORE" "$BB" add gate:needs-fix)" "yes"
+eq "write_verified: ...after exactly two writes" "$(calls_count "label add $BB gate:needs-fix")" "2"
+stub_reset; : > "$CALLS"; export E11_STUB_SRC_SHOW_FAIL_N=99
+set_beads "$BB" '["story:approved","gate:queued"]' "$PLAIN"
+eq "write_verified: the read-back itself fails → desconhecido, NOT yes" "$(gate_e11_label_write_verified "$SRC_STORE" "$BB" add gate:needs-fix)" "desconhecido"
+eq "write_verified: a failed read-back is not proof of absence either (remove) → desconhecido" "$(gate_e11_label_write_verified "$SRC_STORE" "$BB" remove gate:queued)" "desconhecido"
+stub_reset; : > "$CALLS"; export E11_STUB_SRC_SHOW_FAIL_N=99 E11_STUB_SRC_SHOW_FAIL_MODE=error
+eq "write_verified: bd answers {error} on the read-back → desconhecido" "$(gate_e11_label_write_verified "$SRC_STORE" "$BB" add gate:needs-fix)" "desconhecido"
+stub_reset; : > "$CALLS"
+eq "write_verified: a bead the store does not have → desconhecido" "$(gate_e11_label_write_verified "$SRC_STORE" "no-such-bead" add gate:needs-fix)" "desconhecido"
+: > "$CALLS"
+eq "write_verified: an op nobody defined → desconhecido, and nothing was written" "$(gate_e11_label_write_verified "$SRC_STORE" "$BB" toggle gate:needs-fix)|$(calls_n)" "desconhecido|0"
+eq "write_verified: no label named → desconhecido, and nothing was written" "$(gate_e11_label_write_verified "$SRC_STORE" "$BB" add "")|$(calls_n)" "desconhecido|0"
+
+echo "  · refusal 1: the add to the source bead does not land —"
+# Both shapes of the failure: bd returns 0 and persists nothing (ga-ehbw5, ga-kgtiw), and bd fails outright.
+src_add_fails_case() { # <rc the failed write returns> <branch>
+  local rc="$1" br="${2:-feat/prod900}"
+  stub_reset
+  set_beads "$BB" '["story:approved","gate:queued"]' "$PLAIN"
+  E11_STUB_DROP="add gate:needs-fix,gate:e11-refusals:1" E11_STUB_DROP_RC="$rc" run_e11 1 "$RIG_OK" "$BB" "$br"; RC=$?
+  eq "add fails [rc $rc]: still refused (rc 1), and the block ran to its end (no unbound variable)" "$RC|$(grep -cF 'SUPPRESSED PUSH (wa-uthi non-terminal): diff-size cap (E11) refused m-e11.' "$LOGF")" "1|1"
+  eq "add fails [rc $rc]: the source bead KEEPS gate:queued (it is the state a watchdog can see)" "$(src_has gate:queued)" "true"
+  eq "add fails [rc $rc]: ...and did not get gate:needs-fix" "$(src_has gate:needs-fix)" "false"
+  hasnt "add fails [rc $rc]: gate:queued is never removed before the add is confirmed" "$CALLS" "label remove $BB gate:queued"
+  eq "add fails [rc $rc]: the add was retried once, not hammered" "$(calls_count "label add $BB gate:needs-fix,gate:e11-refusals:1")" "2"
+  hasnt "add fails [rc $rc]: the marker is NOT closed" "$CALLS" "BD -C $MRK_STORE close m-e11"
+  has "add fails [rc $rc]: gate-status:error is left for the recovery watchdog" "$CALLS" "STATUS m-e11 error"
+  hasnt "add fails [rc $rc]: never gate-status:failed" "$CALLS" "STATUS m-e11 failed"
+  hasnt "add fails [rc $rc]: the log never says '-> gate:needs-fix'" "$LOGF" "-> gate:needs-fix"
+  hasnt "add fails [rc $rc]: the log never says CLOSED (verified" "$LOGF" "CLOSED (verified"
+  has "add fails [rc $rc]: the warning says the writes were NOT confirmed and the marker NOT closed" "$LOGF" "WARN E11-DIFF-CAP refused: the label writes on source $BB were NOT confirmed — gate:needs-fix was not confirmed on the source bead after the add"
+  has "add fails [rc $rc]: ...and names what the watchdog will do" "$LOGF" "gate-recovery-watchdog closes it (close:guard-refused) after its error grace if the refusal label stuck (persisted=1), else it requeues it"
+  has "add fails [rc $rc]: the marker comment says it was not closed" "$CALLS" "BD -C $MRK_STORE comment m-e11 Gate guard rejected marker: diff-size cap (ga-lzidpo / E11)."
+  has "add fails [rc $rc]: ...in words" "$CALLS" "Marker NOT closed: the guard could not confirm its label writes on the source bead $BB"
+  hasnt "add fails [rc $rc]: no VERDICT: FAIL comment on a bead nobody confirmed (the builder is not sent away)" "$CALLS" "BD -C $SRC_STORE comment $BB"
+  hasnt "add fails [rc $rc]: no mail to anyone" "$CALLS" "mail send"
+}
+src_add_fails_case 0
+src_add_fails_case 1
+src_add_fails_case 0 crew/oracle/wa-abc123
+hasnt "add fails on a crew branch: the author is NOT mailed a reason about labels nobody saw land" "$CALLS" "mail send oracle"
+stub_reset
+
+echo "  · refusal 1: gate:needs-fix landed, the removal of gate:queued is not confirmed —"
+set_beads "$BB" '["story:approved","gate:queued"]' "$PLAIN"
+E11_STUB_DROP="remove gate:queued" run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "queued stays: still refused (rc 1)" "$RC" "1"
+eq "queued stays: gate:needs-fix IS on the bead (the add was read back)" "$(src_has gate:needs-fix)" "true"
+eq "queued stays: ...and so is gate:queued, which the guard knows" "$(src_has gate:queued)" "true"
+hasnt "queued stays: the marker is NOT closed" "$CALLS" "BD -C $MRK_STORE close m-e11"
+has "queued stays: gate-status:error" "$CALLS" "STATUS m-e11 error"
+hasnt "queued stays: the log never says '-> gate:needs-fix'" "$LOGF" "-> gate:needs-fix"
+has "queued stays: the warning names the removal that was not confirmed" "$LOGF" "gate:needs-fix is on the source bead, but the removal of gate:queued was not confirmed (read-back: no)"
+hasnt "queued stays: no VERDICT: FAIL comment promising 'sem gate:queued'" "$CALLS" "sem gate:queued"
+
+echo "  · refusal 1: the source bead cannot be READ after the exemption was (bd goes down mid-run) —"
+set_beads "$BB" '["story:approved","gate:queued"]' "$PLAIN"
+E11_STUB_SRC_SHOW_FAIL_FROM=2 E11_STUB_SRC_SHOW_FAIL_N=99 run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "bd down: still refused (rc 1) — the exemption was read before bd went down" "$RC" "1"
+hasnt "bd down: gate:queued is not removed on an unconfirmed add" "$CALLS" "label remove $BB gate:queued"
+hasnt "bd down: the marker is NOT closed" "$CALLS" "BD -C $MRK_STORE close m-e11"
+has "bd down: gate-status:error" "$CALLS" "STATUS m-e11 error"
+hasnt "bd down: the log never says '-> gate:needs-fix'" "$LOGF" "-> gate:needs-fix"
+has "bd down: the count was unreadable, said, and NOT restarted at 1" "$LOGF" "WARN E11-DIFF-CAP: could not read the refusal count of $BB"
+has "bd down: the warning gives the read-back state" "$LOGF" "(read-back: desconhecido)"
+hasnt "bd down: no counter label written on a count nobody read" "$CALLS" "gate:e11-refusals:"
+
+echo "  · refusal with an unreadable COUNTER (the read-backs answer): not '1 of 3' again —"
+unread_count_case() { # <mode rc|error> <labels json>
+  stub_reset
+  set_beads "$BB" "$2" "$PLAIN"
+  E11_STUB_SRC_SHOW_FAIL_FROM=2 E11_STUB_SRC_SHOW_FAIL_N=1 E11_STUB_SRC_SHOW_FAIL_MODE="$1" run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+  eq "unreadable count [$1]: still refused (rc 1)" "$RC" "1"
+  has "unreadable count [$1]: said, in a warning, that it is NOT restarting at 1" "$LOGF" "WARN E11-DIFF-CAP: could not read the refusal count of $BB (bd show answered nothing usable) — NOT restarting at 1"
+  eq "unreadable count [$1]: no counter label is written (not 'gate:e11-refusals:1')" "$(calls_count "gate:e11-refusals:")" "0"
+  has "unreadable count [$1]: gate:needs-fix still goes on (the refusal is real)" "$CALLS" "BD -C $SRC_STORE label add $BB gate:needs-fix"
+  has "unreadable count [$1]: ...and gate:queued off, once that was read back" "$CALLS" "BD -C $SRC_STORE label remove $BB gate:queued"
+  has "unreadable count [$1]: the comment says 'refusal ? of 3', not 'refusal 1 of 3'" "$CALLS" "refusal ? of 3 for this bead"
+  hasnt "unreadable count [$1]: ...never 'refusal 1 of 3'" "$CALLS" "refusal 1 of 3"
+  has "unreadable count [$1]: the comment says the count could not be read" "$CALLS" "A contagem de recusas deste bead nao pode ser lida desta vez"
+  hasnt "unreadable count [$1]: no escalation decided on a number nobody read" "$CALLS" "gate:needs-human"
+  hasnt "unreadable count [$1]: ...no mail to the mayor" "$CALLS" "mail send mayor"
+  has "unreadable count [$1]: the log says '?'" "$LOGF" "(refusal ?/3)"
+}
+unread_count_case rc '["story:approved","gate:queued","gate:e11-refusals:2"]'
+unread_count_case error '["story:approved","gate:queued"]'
+stub_reset
+
+echo "  · refusal 1: the first write is dropped, the retry lands (a hiccup is not a failure) —"
+set_beads "$BB" '["story:approved","gate:queued"]' "$PLAIN"
+E11_STUB_DROP="add gate:needs-fix,gate:e11-refusals:1" E11_STUB_DROP_TIMES=1 run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "retry lands: refused (rc 1)" "$RC" "1"
+eq "retry lands: the add was written twice" "$(calls_count "label add $BB gate:needs-fix,gate:e11-refusals:1")" "2"
+eq "retry lands: gate:needs-fix is on the bead, gate:queued is not" "$(src_has gate:needs-fix)|$(src_has gate:queued)" "true|false"
+has "retry lands: the marker IS closed, verified" "$LOGF" "CLOSED (verified, gate-status:failed); source $BB -> gate:needs-fix (refusal 1/3); refusal label persisted=1"
+hasnt "retry lands: nothing to warn about" "$LOGF" "NOT confirmed"
+stub_reset
+
+echo "  · 3rd refusal: gate:needs-human is read back BEFORE gate:needs-fix goes, and the mayor is told the truth —"
+set_beads "$BB" '["story:approved","gate:queued","gate:e11-refusals:2"]' "$PLAIN"
+run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "3rd, all lands: refused (rc 1)" "$RC" "1"
+eq "3rd, all lands: needs-human yes, needs-fix no, queued no" "$(src_has gate:needs-human)|$(src_has gate:needs-fix)|$(src_has gate:queued)" "true|false|false"
+has "3rd, all lands: the log names where the bead ENDED (gate:needs-human), not where it passed" "$LOGF" "CLOSED (verified, gate-status:failed); source $BB -> gate:needs-human (refusal 3/3)"
+hasnt "3rd, all lands: the log never says '-> gate:needs-fix'" "$LOGF" "-> gate:needs-fix"
+has "3rd, all lands: the mail says it is parked, byte for byte" "$CALLS" "Ficou com gate:needs-human (gate:needs-fix removido); o Pilot nao redespacha. Decida: fatiar voce mesmo"
+has "3rd, all lands: the comment on the bead says so too" "$CALLS" "Esta foi a 3a recusa: Ficou com gate:needs-human (gate:needs-fix removido); o Pilot nao redespacha."
+hasnt "3rd, all lands: the comment no longer promises 'o Pilot despacha o conserto' about a bead going to a human" "$CALLS" "o Pilot despacha o conserto"
+
+set_beads "$BB" '["story:approved","gate:queued","gate:e11-refusals:2"]' "$PLAIN"
+E11_STUB_DROP="add gate:needs-human" run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "3rd, needs-human NOT confirmed: refused (rc 1)" "$RC" "1"
+eq "3rd, needs-human NOT confirmed: gate:needs-fix is KEPT (removing it would leave no gate:* label)" "$(src_has gate:needs-fix)|$(src_has gate:needs-human)" "true|false"
+hasnt "3rd, needs-human NOT confirmed: gate:needs-fix is never removed" "$CALLS" "label remove $BB gate:needs-fix"
+has "3rd, needs-human NOT confirmed: the mayor is still mailed (somebody must hear it)" "$CALLS" "GC --city $MRK_STORE mail send mayor -s Gate E11: $BB recusado 3x por tamanho"
+has "3rd, needs-human NOT confirmed: ...and the mail says it could NOT confirm" "$CALLS" "ATENCAO: nao consegui CONFIRMAR gate:needs-human no bead (releitura: no): ele segue com gate:needs-fix e o Pilot PODE redespachar"
+hasnt "3rd, needs-human NOT confirmed: ...and never claims 'Ficou com gate:needs-human'" "$CALLS" "Ficou com gate:needs-human"
+has "3rd, needs-human NOT confirmed: the comment on the bead says the escalation is pending" "$CALLS" "gate:needs-human NAO foi confirmado"
+has "3rd, needs-human NOT confirmed: a warning" "$LOGF" "WARN E11-DIFF-CAP: 3rd refusal of $BB but gate:needs-human was NOT confirmed (read-back: no)"
+has "3rd, needs-human NOT confirmed: the log says where the bead really is" "$LOGF" "source $BB -> gate:needs-fix (refusal 3/3)"
+hasnt "3rd, needs-human NOT confirmed: ...never gate:needs-human" "$LOGF" "-> gate:needs-human"
+
+set_beads "$BB" '["story:approved","gate:queued","gate:e11-refusals:2"]' "$PLAIN"
+E11_STUB_DROP="add gate:needs-human" E11_STUB_DROP_RC=1 run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "3rd, needs-human add FAILS (rc 1): same end state, gate:needs-fix kept" "$RC|$(src_has gate:needs-fix)|$(src_has gate:needs-human)" "1|true|false"
+has "3rd, needs-human add FAILS: the mayor is told it was not confirmed" "$CALLS" "ATENCAO: nao consegui CONFIRMAR gate:needs-human"
+
+set_beads "$BB" '["story:approved","gate:queued","gate:e11-refusals:2"]' "$PLAIN"
+E11_STUB_DROP="remove gate:needs-fix" run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "3rd, needs-human landed but needs-fix stays: refused (rc 1)" "$RC" "1"
+eq "3rd, ...the bead carries both, and the guard knows" "$(src_has gate:needs-human)|$(src_has gate:needs-fix)" "true|true"
+has "3rd, ...the log says gate:needs-human (it IS there)" "$LOGF" "source $BB -> gate:needs-human (refusal 3/3)"
+has "3rd, ...a warning about the removal that was not confirmed" "$LOGF" "WARN E11-DIFF-CAP: gate:needs-human is on $BB but the removal of gate:needs-fix was not confirmed (read-back: no)"
+has "3rd, ...the mail to the mayor says both labels may be there" "$CALLS" "a remocao de gate:needs-fix NAO foi confirmada (releitura: no): o bead pode carregar os dois labels."
+
+set_beads "$BB" '["story:approved","gate:queued","gate:e11-refusals:2"]' "$PLAIN"
+E11_STUB_DROP="add gate:needs-fix,gate:e11-refusals:3" run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "3rd, the first add (needs-fix + counter 3) not confirmed: nothing escalated, nothing removed" "$RC|$(src_has gate:queued)|$(src_has gate:needs-human)" "1|true|false"
+hasnt "3rd, ...no mail to the mayor claiming anything" "$CALLS" "mail send mayor"
+hasnt "3rd, ...the marker is not closed" "$CALLS" "BD -C $MRK_STORE close m-e11"
+stub_reset
+set_beads "$BB" "$PLAIN" "$PLAIN"   # later sections start from a plain source bead again
 
 run_e11 1 "$RIG_OK" "$BB" feat/prod800; RC=$?
 eq "arm B, exactly 800 prod lines: accepted (the cap is 'over 800')" "$RC" "0"

@@ -5184,6 +5184,78 @@ gate_e11_fix_attempt_state() {
   case "${1:-}" in yes) printf 'exempt' ;; no) printf 'nao' ;; *) printf 'desconhecido' ;; esac
 }
 
+# ── The refusal's writes to the SOURCE bead (ga-emc197, audit of 00634ad5a) ──
+# A label write in this city can return 0 and persist nothing (ga-ehbw5, ga-kgtiw), and the refusal used to remove
+# gate:queued BEFORE adding gate:needs-fix, with `|| true` on both and no read-back: one hiccup left the bead with no
+# gate:* label at all while the log said "-> gate:needs-fix". Nothing watches a bead with no gate:* label. These helpers
+# are the three-state reading the refusal now decides on: the label is there / it is not there / I could not tell.
+
+# gate_e11_label_state <bead_show_json> <label> — has | lacks | desconhecido. Takes `bd show <id> --json` (an array of one,
+# or one object). Empty output, text that is not JSON, or an object with no id (bd's {"error": ...}) is `desconhecido`,
+# NOT `lacks`. A bead that bd shows without a `labels` key has none (bd omits the key when empty): that is `lacks`.
+gate_e11_label_state() {
+  local raw="${1:-}" want="${2:-}" out
+  [ -n "$raw" ] && [ -n "$want" ] || { printf 'desconhecido'; return 0; }
+  out=$(printf '%s' "$raw" | jq -r --arg l "$want" '
+      (if type=="array" then (.[0] // {}) else . end)
+      | if (type=="object" and ((.id // "") | tostring | length) > 0)
+        then (if ((.labels // []) | map(tostring == $l) | any) then "has" else "lacks" end)
+        else "desconhecido" end' 2>/dev/null) || out=""
+  case "$out" in has|lacks|desconhecido) printf '%s' "$out" ;; *) printf 'desconhecido' ;; esac
+}
+
+# gate_e11_labels_as_wanted <bead_show_json> <has|lacks> <label>... — yes | no | desconhecido: is EVERY label named present
+# (has) / absent (lacks)? `no` only when the bead was READ and at least one label is not as wanted; a bead that could not
+# be read is `desconhecido`. A caller treats anything but `yes` as "not confirmed" (the inert side).
+gate_e11_labels_as_wanted() {
+  local raw="${1:-}" want="${2:-}" l st seen_no=0 seen_unknown=0
+  case "$want" in has|lacks) ;; *) printf 'desconhecido'; return 0 ;; esac
+  shift 2 2>/dev/null || { printf 'desconhecido'; return 0; }
+  [ "$#" -gt 0 ] || { printf 'desconhecido'; return 0; }
+  for l in "$@"; do
+    st=$(gate_e11_label_state "$raw" "$l")
+    case "$st" in
+      has|lacks) [ "$st" = "$want" ] || seen_no=1 ;;
+      *)         seen_unknown=1 ;;
+    esac
+  done
+  if [ "$seen_no" = 1 ]; then printf 'no'; elif [ "$seen_unknown" = 1 ]; then printf 'desconhecido'; else printf 'yes'; fi
+}
+
+# gate_e11_label_write_verified <bd-dir> <bead> <add|remove> <label[,label...]> — does the write (one batched bd call: the
+# batch is all-or-nothing) and READS IT BACK from the same store, at most 2 attempts. Prints yes (the read-back shows
+# every label as wanted) | no (the bead was read and the write is not there) | desconhecido (the read-back itself failed).
+# Anything but `yes` means "not confirmed" — the caller must not act as if it had landed. The write's own rc is ignored
+# on purpose: rc 0 proves nothing here and a non-zero rc is settled by the read-back.
+gate_e11_label_write_verified() {
+  local dir="${1:-}" bead="${2:-}" op="${3:-}" labels="${4:-}" want try show st="desconhecido"
+  case "$op" in add) want=has ;; remove) want=lacks ;; *) printf 'desconhecido'; return 0 ;; esac
+  [ -n "$dir" ] && [ -n "$bead" ] && [ -n "$labels" ] || { printf 'desconhecido'; return 0; }
+  for try in 1 2; do
+    bd -C "$dir" label "$op" "$bead" "$labels" 2>/dev/null || true
+    # vazio/falhou -> show="" -> desconhecido (not confirmed, retried once, never read as "landed")
+    show=$(bd -C "$dir" show "$bead" --json 2>/dev/null) || show=""
+    st=$(gate_e11_labels_as_wanted "$show" "$want" ${labels//,/ })
+    [ "$st" = "yes" ] && break
+  done
+  printf '%s' "$st"
+}
+
+# gate_e11_refusal_count <bead_show_json> — how many times E11 already refused this bead: the highest N among its
+# gate:e11-refusals:N labels, 0 when the bead was READ and carries none; `desconhecido` when it could not be read (empty,
+# not JSON, no id). The unreadable bead is NOT "no refusals": counting it as 0 restarted the bead at "1 of 3" and
+# delayed the escalation to a human without saying so. A label whose number is not a non-negative integer is junk, not a count.
+gate_e11_refusal_count() {
+  local raw="${1:-}" out
+  [ -n "$raw" ] || { printf 'desconhecido'; return 0; }
+  out=$(printf '%s' "$raw" | jq -r '
+      (if type=="array" then (.[0] // {}) else . end)
+      | if (type=="object" and ((.id // "") | tostring | length) > 0)
+        then ([(.labels // [])[] | tostring | select(startswith("gate:e11-refusals:")) | sub("^gate:e11-refusals:";"") | tonumber? | select(. >= 0)] | max // 0 | floor | tostring)
+        else "desconhecido" end' 2>/dev/null) || out=""
+  case "$out" in ''|*[!0-9]*) printf 'desconhecido' ;; *) printf '%s' "$out" ;; esac
+}
+
 # gate_e11_verdict <arm> <production_lines> <exempt_state> [cap] — the pure decision. Prints one of:
 #   controle            arm A: today's behavior, nothing measured, nothing touched
 #   sem-braco           no arm (unidentifiable bead / no sha tool): never refused, in neither arm
@@ -8293,13 +8365,16 @@ if [ "$(gate_e11_enabled)" = "1" ]; then
     # gate:queued with no open marker and nobody could re-dispatch it — a silent strand):
     #   1. the refusal label on the marker, READ BACK (label writes have failed silently in this city — ga-ehbw5,
     #      ga-kgtiw); it is what gate-recovery-watchdog.py keys close:guard-refused on if the close below fails;
-    #   2. the SOURCE bead: gate:queued off, gate:needs-fix on (the Pilot and the focus-mode keep-filter route
-    #      fix-class beads to a builder), the reason as a VERDICT: FAIL comment (what a fix sling carries), a
-    #      refusal counter; the 3rd refusal of the same bead ends in gate:needs-human + mail to the mayor;
+    #   2. the SOURCE bead: gate:needs-fix on, THEN gate:queued off — each READ BACK, in that order (the Pilot and the
+    #      focus-mode keep-filter route fix-class beads to a builder), the reason as a VERDICT: FAIL comment (what a
+    #      fix sling carries), a refusal counter; the 3rd refusal of the same bead ends in gate:needs-human (read back
+    #      before gate:needs-fix goes) + mail to the mayor, which says needs-human only if it landed (ga-emc197);
     #   3. a mail to the author when the branch names a crew (/gate-done promised one); best-effort — the bead
     #      labels are the durable path, a pool author has already exited and the Pilot re-dispatches the fix;
-    #   4. the marker CLOSED here, VERIFIED (ga-o2dlg8 shape); gate-status:error only when the close itself fails,
-    #      and then the log says so and the watchdog's close:guard-refused (keyed on 1.) is the backstop.
+    #      sent only when 2. was confirmed;
+    #   4. the marker CLOSED here, VERIFIED (ga-o2dlg8 shape), only when 2. was confirmed; gate-status:error when the
+    #      close itself fails OR when 2. was not confirmed (then it is not even tried), and then the log says so and
+    #      the watchdog's close:guard-refused (keyed on 1.) is the backstop.
     _E11_LBL_OK=0
     for _e11_try in 1 2; do
       bd -C "$GC_CITY" label add "$MARKER_ID" gate-guard:refused-e11 2>/dev/null || true
@@ -8330,10 +8405,20 @@ if [ "$(gate_e11_enabled)" = "1" ]; then
         _E11_OVER_TXT="" ;;
     esac
     err "  diff-size cap (ga-lzidpo/E11): $_E11_WHAT_EN (arm B${_E11_FORCED:+, forced by the 100% switch}). Refusing at submission."
+    # vazio (read, no gate:e11-refusals label) -> 0, so this is refusal 1; falhou/ilegivel (bd show answered nothing usable) ->
+    # the count is UNKNOWN: no counter label is written, the escalation is not decided on a number nobody read, and the
+    # comment, the log and a warning say so (ga-emc197: it used to become 0 and restart at "1 de 3", postponing the human).
     _E11_SRC_SHOW=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null) || _E11_SRC_SHOW=""
-    _E11_REFUSALS=$(printf '%s' "$_E11_SRC_SHOW" | jq -r 'if type=="array" then .[0] else . end | [(.labels // [])[] | select(startswith("gate:e11-refusals:")) | sub("^gate:e11-refusals:";"") | tonumber?] | max // 0' 2>/dev/null) || _E11_REFUSALS=0
-    case "$_E11_REFUSALS" in ''|*[!0-9]*) _E11_REFUSALS=0 ;; esac
-    _E11_REFUSALS=$((_E11_REFUSALS + 1))
+    _E11_REFUSALS=$(gate_e11_refusal_count "$_E11_SRC_SHOW")
+    if [ "$_E11_REFUSALS" = "desconhecido" ]; then
+      _E11_REF_TXT="?"
+      _E11_ADD_LABELS="gate:needs-fix"
+      warn "E11-DIFF-CAP: could not read the refusal count of $BEAD_ID (bd show answered nothing usable) — NOT restarting at 1: this refusal is applied as gate:needs-fix with no counter label and no escalation decision (ga-emc197)"
+    else
+      _E11_REFUSALS=$((_E11_REFUSALS + 1))
+      _E11_REF_TXT="$_E11_REFUSALS"
+      _E11_ADD_LABELS="gate:needs-fix,gate:e11-refusals:$_E11_REFUSALS"
+    fi
     # ga-2xdj1x: the slices of THIS bead must be born with the bead's own type. `bd create --parent` with no -t makes a
     # task, and a slice of a feature that is a task loses its turn in the gate order (priority > type > age) and inflates
     # 'tasks' on the painel (measured 12/10). The instruction names the real type when the source bead says it (an epic's
@@ -8348,26 +8433,88 @@ if [ "$(gate_e11_enabled)" = "1" ]; then
     # ga-x8mmt7: slice VERTICALLY. An AI told to slice cuts by layer (schema, then API, then screen) and the feedback only
     # arrives at the end; a slice that delivers one behavior end to end gets feedback at once (study ga-ugtch8). The line
     # "Fatie na VERTICAL" sits between the typed-slice command and the minimum-test line, which it completes.
-    _E11_REASON="VERDICT: FAIL (gate guard, diff-size cap E11 — refusal $_E11_REFUSALS of 3 for this bead; no reviewer was spawned)
+    # The body below is what the refusal says in every outcome. The LAST sentence — where the bead ended up — is appended
+    # further down (_E11_REASON_TAIL), once the writes to the source bead were READ BACK: this text used to end with "Marker
+    # fechado ... ficou com gate:needs-fix e sem gate:queued" before any of that was true, and on the 3rd refusal (the
+    # bead ends in gate:needs-human, not needs-fix) it was never true (ga-emc197).
+    _E11_REASON_BODY="VERDICT: FAIL (gate guard, diff-size cap E11 — refusal $_E11_REF_TXT of 3 for this bead; no reviewer was spawned)
 O diff de $BRANCH contra origin/main tem $_E11_TOTAL linhas no TOTAL (codigo + testes + docs; arquivos gerados, vendor, lockfiles e fragmentos de changelog nao contam) e $_E11_COUNT linhas de codigo de PRODUCAO (testes, fixtures, arquivos gerados, lockfiles e .md nao contam). Os tetos por submissao sao $_E11_TOTAL_CAP no total e $_E11_CAP de producao. $_E11_OVER_TXT
 Diff grande reprova na primeira tentativa bem mais (aprovacao na 1a revisao por tamanho total: 81% ate 200 linhas, 68% de 201 a 500, 50% de 501 a 800, 36% acima de 800): o revisor nao cobre tudo numa passada.
 O QUE FAZER: dividir em fatias, cada uma com o seu proprio marker (/gate-done): uma branch por fatia, cada uma abaixo dos tetos, citando o bead da fatia nos commits. Nao reenvie a mesma branch inteira.
 Crie cada fatia como bead FILHO deste e do MESMO TIPO dele: bd create '<titulo da fatia>' --parent $BEAD_ID -t $_E11_PTYPE. Sem o -t o bd cria 'task', e fatia de feature que nasce task perde a vez na fila do gate (prioridade > tipo > idade) e infla o numero de tasks no painel.
 Fatie na VERTICAL: cada fatia entrega um comportamento visivel e testavel de ponta a ponta, nao uma camada (so schema, so API ou so infra) — o feedback de uma fatia por camada so chega quando todas as outras ficam prontas.
 Em cada fatia mantenha so o teste minimo que prova o comportamento (guia: linhas de teste <= linhas de codigo): o excesso de teste e o que mais incha o diff.
-Se o diff e grande por natureza (renome ou migracao mecanica), ponha o label gate:size-exempt no bead $BEAD_ID e comente o MOTIVO (um comentario que COMECE com gate:size-exempt: seguido do motivo), depois reenvie.
-Marker $MARKER_ID fechado (recusado na submissao). Este bead ficou com gate:needs-fix e sem gate:queued: o Pilot despacha o conserto."
-    bd -C "$BEAD_CITY" label remove "$BEAD_ID" gate:queued 2>/dev/null || true
-    bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-fix,gate:e11-refusals:$_E11_REFUSALS" 2>/dev/null || true
-    bd -C "$BEAD_CITY" comment "$BEAD_ID" "$_E11_REASON" 2>/dev/null || true
-    if [ "$_E11_REFUSALS" -ge 3 ]; then
-      bd -C "$BEAD_CITY" label add "$BEAD_ID" gate:needs-human 2>/dev/null || true
-      bd -C "$BEAD_CITY" label remove "$BEAD_ID" gate:needs-fix 2>/dev/null || true
+Se o diff e grande por natureza (renome ou migracao mecanica), ponha o label gate:size-exempt no bead $BEAD_ID e comente o MOTIVO (um comentario que COMECE com gate:size-exempt: seguido do motivo), depois reenvie."
+    # ── The writes to the SOURCE bead, in the order that cannot strand it (ga-emc197, audit of 00634ad5a) ──
+    #   1. gate:needs-fix (+ the counter) is ADDED first and READ BACK. Removing gate:queued before this left a bead with
+    #      NO gate:* label when the add failed (the bd batch is all-or-nothing), and nothing watches a bead like that;
+    #   2. only then gate:queued is REMOVED, and read back. A bead that keeps gate:queued is the state
+    #      gate-orphaned-label-watchdog flags; a bead with none is invisible;
+    #   3. the 3rd refusal adds gate:needs-human and reads it back BEFORE gate:needs-fix is removed;
+    #   4. the marker is closed only when 1 and 2 are confirmed. Otherwise it stays in gate-status:error and every line
+    #      written below says what was NOT confirmed — never "-> gate:needs-fix" about a write nobody saw land.
+    _E11_SRC_OK=0
+    _E11_SRC_WHY=""
+    _E11_SRC_END="gate:needs-fix"
+    _E11_HUMAN_TXT=""
+    _E11_ADD_ST=$(gate_e11_label_write_verified "$BEAD_CITY" "$BEAD_ID" add "$_E11_ADD_LABELS")
+    if [ "$_E11_ADD_ST" != "yes" ]; then
+      _E11_SRC_WHY="gate:needs-fix was not confirmed on the source bead after the add (read-back: $_E11_ADD_ST); gate:queued was left untouched"
+    else
+      _E11_Q_ST=$(gate_e11_label_write_verified "$BEAD_CITY" "$BEAD_ID" remove gate:queued)
+      if [ "$_E11_Q_ST" != "yes" ]; then
+        _E11_SRC_WHY="gate:needs-fix is on the source bead, but the removal of gate:queued was not confirmed (read-back: $_E11_Q_ST); the bead may still carry gate:queued"
+      else
+        _E11_SRC_OK=1
+      fi
+    fi
+    # The escalation needs a count somebody READ (>= 3) and a source bead that already holds the refusal.
+    if [ "$_E11_SRC_OK" = "1" ] && [ "$_E11_REF_TXT" != "?" ] && [ "$_E11_REFUSALS" -ge 3 ]; then
+      _E11_H_ST=$(gate_e11_label_write_verified "$BEAD_CITY" "$BEAD_ID" add gate:needs-human)
+      if [ "$_E11_H_ST" = "yes" ]; then
+        _E11_SRC_END="gate:needs-human"
+        _E11_NF_ST=$(gate_e11_label_write_verified "$BEAD_CITY" "$BEAD_ID" remove gate:needs-fix)
+        if [ "$_E11_NF_ST" = "yes" ]; then
+          _E11_HUMAN_TXT="Ficou com gate:needs-human (gate:needs-fix removido); o Pilot nao redespacha."
+        else
+          _E11_HUMAN_TXT="Ficou com gate:needs-human (confirmado na releitura), mas a remocao de gate:needs-fix NAO foi confirmada (releitura: $_E11_NF_ST): o bead pode carregar os dois labels."
+          warn "E11-DIFF-CAP: gate:needs-human is on $BEAD_ID but the removal of gate:needs-fix was not confirmed (read-back: $_E11_NF_ST)"
+        fi
+      else
+        _E11_HUMAN_TXT="ATENCAO: nao consegui CONFIRMAR gate:needs-human no bead (releitura: $_E11_H_ST): ele segue com gate:needs-fix e o Pilot PODE redespachar. Ponha gate:needs-human voce mesmo."
+        warn "E11-DIFF-CAP: 3rd refusal of $BEAD_ID but gate:needs-human was NOT confirmed (read-back: $_E11_H_ST) — gate:needs-fix stays, the bead is NOT parked for a human; the mayor is told so"
+      fi
+    fi
+    if [ "$_E11_SRC_OK" = "1" ]; then
+      if [ "$_E11_REF_TXT" = "?" ]; then
+        _E11_REASON_TAIL="Marker $MARKER_ID recusado na submissao. Este bead ficou com gate:needs-fix e sem gate:queued: o Pilot despacha o conserto.
+A contagem de recusas deste bead nao pode ser lida desta vez (o bd show nao respondeu): nao sei se e a 1a, a 2a ou a 3a recusa, nenhum contador foi gravado e a escalacao para humano nao foi decidida."
+      elif [ "$_E11_SRC_END" = "gate:needs-human" ]; then
+        _E11_REASON_TAIL="Marker $MARKER_ID recusado na submissao. Esta foi a 3a recusa: $_E11_HUMAN_TXT Um humano decide: fatiar ou gate:size-exempt com motivo."
+      elif [ "$_E11_REFUSALS" -ge 3 ]; then
+        _E11_REASON_TAIL="Marker $MARKER_ID recusado na submissao. Esta foi a 3a recusa, mas gate:needs-human NAO foi confirmado: este bead segue com gate:needs-fix e sem gate:queued, entao o Pilot PODE redespachar. A escalacao para humano esta pendente."
+      else
+        _E11_REASON_TAIL="Marker $MARKER_ID recusado na submissao. Este bead ficou com gate:needs-fix e sem gate:queued: o Pilot despacha o conserto."
+      fi
+      _E11_REASON="$_E11_REASON_BODY
+$_E11_REASON_TAIL"
+      # rc is meaningful for a single comment write: the reason is what a fix sling carries, so a failure is said, not swallowed
+      if bd -C "$BEAD_CITY" comment "$BEAD_ID" "$_E11_REASON" 2>/dev/null; then
+        _E11_ON_SRC="$_E11_SRC_END and the reason"
+      else
+        _E11_ON_SRC="$_E11_SRC_END (the reason comment was NOT written)"
+        warn "E11-DIFF-CAP: the VERDICT: FAIL comment was NOT written on $BEAD_ID (bd comment failed) — the labels are on it ($_E11_SRC_END) but the builder will not find the reason there"
+      fi
+    fi
+    if [ "$_E11_SRC_OK" = "1" ] && [ "$_E11_HUMAN_TXT" != "" ]; then
       gc --city "$GC_CITY" mail send mayor -s "Gate E11: $BEAD_ID recusado 3x por tamanho — precisa de humano" \
-        -m "$BEAD_ID (branch $BRANCH) foi recusado na submissao pela 3a vez: $_E11_WHAT. Ficou com gate:needs-human (gate:needs-fix removido); o Pilot nao redespacha. Decida: fatiar voce mesmo (cada fatia: bd create '<titulo>' --parent $BEAD_ID -t $_E11_PTYPE — fatia de feature nasce feature; e fatia VERTICAL: um comportamento testavel de ponta a ponta, nao uma camada so de schema/API/infra), ou gate:size-exempt com motivo no bead." 2>/dev/null \
+        -m "$BEAD_ID (branch $BRANCH) foi recusado na submissao pela 3a vez: $_E11_WHAT. $_E11_HUMAN_TXT Decida: fatiar voce mesmo (cada fatia: bd create '<titulo>' --parent $BEAD_ID -t $_E11_PTYPE — fatia de feature nasce feature; e fatia VERTICAL: um comportamento testavel de ponta a ponta, nao uma camada so de schema/API/infra), ou gate:size-exempt com motivo no bead." 2>/dev/null \
         || warn "E11-DIFF-CAP: could not mail the mayor about the 3rd refusal of $BEAD_ID — the bead carries gate:needs-human"
     fi
-    _E11_AUTHOR=$(printf '%s' "$BRANCH" | sed -n 's#^crew/\([^/]\{1,\}\)/.*#\1#p')
+    # The author is mailed the reason only on the confirmed path: the mail says what the bead carries, and on the other path
+    # nobody has seen what it carries (_E11_REASON does not even exist there).
+    _E11_AUTHOR=""
+    [ "$_E11_SRC_OK" = "1" ] && _E11_AUTHOR=$(printf '%s' "$BRANCH" | sed -n 's#^crew/\([^/]\{1,\}\)/.*#\1#p')
     if [ -n "$_E11_AUTHOR" ]; then
       _E11_MAILED=0
       for _e11_to in "$_E11_AUTHOR" "${_E11_AUTHOR}-${BEAD_ID%%-*}"; do
@@ -8375,14 +8522,25 @@ Marker $MARKER_ID fechado (recusado na submissao). Este bead ficou com gate:need
       done
       [ "$_E11_MAILED" = "1" ] || log "E11-DIFF-CAP: no author mail delivered for $BEAD_ID (candidates: $_E11_AUTHOR, ${_E11_AUTHOR}-${BEAD_ID%%-*}) — the bead carries gate:needs-fix and the reason; the Pilot routes it"
     fi
-    bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: diff-size cap (ga-lzidpo / E11). $_E11_WHAT_EN. Marker closed; the reason and gate:needs-fix are on the source bead $BEAD_ID (refusal $_E11_REFUSALS of 3)." 2>/dev/null || true
-    if bd -C "$GC_CITY" close "$MARKER_ID" -r "refused at submission by the gate guard: diff-size cap E11 ($_E11_WHAT_EN); source bead $BEAD_ID carries gate:needs-fix and the reason" >/dev/null 2>&1 \
-       && [ "$(bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .status // ""' 2>/dev/null)" = "closed" ]; then
-      set_gate_status "$MARKER_ID" "failed"
-      log "E11-DIFF-CAP refused: marker $MARKER_ID CLOSED (verified, gate-status:failed); source $BEAD_ID -> gate:needs-fix (refusal $_E11_REFUSALS/3); refusal label persisted=$_E11_LBL_OK"
-    else
+    if [ "$_E11_SRC_OK" != "1" ]; then
+      # The source bead was NOT confirmed to hold the refusal, so the marker is not closed (a closed marker is the only thing
+      # that would have sent the builder away) and no line below says "-> gate:needs-fix". gate-status:error is the signal the
+      # gate-recovery-watchdog reads: after its grace it closes the marker as close:guard-refused when the refusal label stuck
+      # on it, else it requeues it and this refusal runs again. The source bead then keeps gate:queued (or whatever the
+      # read-back last showed) — the state gate-orphaned-label-watchdog flags once it goes stale. Nothing is promised past that.
+      bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: diff-size cap (ga-lzidpo / E11). $_E11_WHAT_EN. Marker NOT closed: the guard could not confirm its label writes on the source bead $BEAD_ID — $_E11_SRC_WHY. Left in gate-status:error for the gate-recovery-watchdog (refusal label on this marker persisted=$_E11_LBL_OK)." 2>/dev/null || true
       set_gate_status "$MARKER_ID" "error"
-      warn "E11-DIFF-CAP refused: marker $MARKER_ID close NOT verified — left in gate-status:error; gate-recovery-watchdog closes it (close:guard-refused) after its error grace if the refusal label stuck (persisted=$_E11_LBL_OK), else it will requeue it — a human should look"
+      warn "E11-DIFF-CAP refused: the label writes on source $BEAD_ID were NOT confirmed — $_E11_SRC_WHY. Marker $MARKER_ID NOT closed, left in gate-status:error: gate-recovery-watchdog closes it (close:guard-refused) after its error grace if the refusal label stuck (persisted=$_E11_LBL_OK), else it requeues it and this refusal runs again; a source bead still carrying gate:queued is what gate-orphaned-label-watchdog flags — a human should look at $BEAD_ID"
+    else
+      bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: diff-size cap (ga-lzidpo / E11). $_E11_WHAT_EN. $_E11_ON_SRC are on the source bead $BEAD_ID (refusal $_E11_REF_TXT of 3)." 2>/dev/null || true
+      if bd -C "$GC_CITY" close "$MARKER_ID" -r "refused at submission by the gate guard: diff-size cap E11 ($_E11_WHAT_EN); source bead $BEAD_ID carries $_E11_ON_SRC" >/dev/null 2>&1 \
+         && [ "$(bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .status // ""' 2>/dev/null)" = "closed" ]; then
+        set_gate_status "$MARKER_ID" "failed"
+        log "E11-DIFF-CAP refused: marker $MARKER_ID CLOSED (verified, gate-status:failed); source $BEAD_ID -> $_E11_SRC_END (refusal $_E11_REF_TXT/3); refusal label persisted=$_E11_LBL_OK"
+      else
+        set_gate_status "$MARKER_ID" "error"
+        warn "E11-DIFF-CAP refused: marker $MARKER_ID close NOT verified — left in gate-status:error; gate-recovery-watchdog closes it (close:guard-refused) after its error grace if the refusal label stuck (persisted=$_E11_LBL_OK), else it will requeue it — a human should look"
+      fi
     fi
     log "SUPPRESSED PUSH (wa-uthi non-terminal): diff-size cap (E11) refused $MARKER_ID."
     exit 1
