@@ -5,8 +5,9 @@
 # esses objetos SEM o hq (N, ~99 MiB) e reescreveu P sem eles (P', ~857 MiB; pack-objects --stdin-packs com ^N). Este script, NO MINI, pega P'+N, confere, instala,
 # ESCONDE o .idx de P (git ignora um pack sem .idx), verifica que NADA se perdeu com P escondido e SÓ ENTÃO apaga P. Qualquer divergência = devolve o .idx e remove o que instalou.
 #
-# Ordem (cada passo só começa se o anterior passou; até o passo 9 o repositório é o de antes + arquivos de staging):
-#   1 pré-condições (nada muda): df >= MIN_START_MB lido NA HORA; houve um reboot DEPOIS da autorização (AUTH_EPOCH); sem multi-pack-index; P presente e não já trocado
+# Ordem (cada passo só começa se o anterior passou; até o passo 6 o repositório é o de antes + arquivos de staging; do 7 em diante há packs a mais e, do 8, P fora de vista):
+#   1 pré-condições (nada muda): df >= MIN_START_MB lido NA HORA; houve um reboot DEPOIS da autorização (AUTH_EPOCH); sem multi-pack-index; P presente e não já trocado;
+#     manifesto buscado e ids.txt conferido contra o sha256 do manifesto e não vazio
 #   2 lock do compactador (mesmo diretório que jsonl-archive-compact.sh e jsonl-export.sh respeitam) + nenhum outro repacker do repo
 #   3 identidade: o checksum do pack P (trailer do .idx) é o que o MBP usou
 #   4 retrato ANTES: objetos, alcançáveis, commits, garbage
@@ -16,13 +17,16 @@
 #   8 esconde P.idx  (mv para P.idx.swap-hold)
 #   9 verifica COM P ESCONDIDO: objetos antes ⊆ depois; alcançáveis antes ⊆ depois; commits depois >= antes; fsck --connectivity-only; a lista de ids lê; amostra lê inteira
 #  10 aprovado: apaga P (.pack .idx.swap-hold .rev); reprovado: ROLLBACK (devolve o .idx, remove P' e N instalados)
-# Um repositório fica consistente em qualquer ponto de parada: se o processo morrer entre 8 e 10 (SIGKILL), `--recover` devolve o .idx (os packs a mais são só duplicata).
+# Sinal (INT/TERM/HUP) em qualquer passo: a cópia em segundo plano é morta, o staging some e, se já havia pack instalado ou P escondido, o ROLLBACK roda.
+# Morte sem sinal tratável (SIGKILL): entre 7 e 8 P segue visível e P'/N são só duplicata. Entre 8 e 10 o .idx de P fica escondido e o repositório depende de P' e N, que só o
+# passo 9 verifica; `--recover` devolve o .idx (e remove staging de PID morto). Ele NÃO apaga os packs P'/N a mais: duplicata de objetos, por nome, a critério de quem opera.
 #
 # Saída: 0 trocado | 10 uso | 20 não pode começar (df/reboot/estado) | 21 lock em uso | 22 outro repacker (ou não deu para saber) | 23 identidade do P não confere |
-#        24 cópia corrompida ou nome já existe | 25 vigia de df parou a cópia | 26 multi-pack-index presente | 27 já trocado | 30 verificação reprovou (rollback FEITO) |
-#        31 rollback FALHOU (alto: ver o log) | 40 falha ao apagar P depois de aprovado | 50 recover não achou nada a recuperar
+#        24 cópia/manifesto/ids.txt corrompido, vazio ou nome já existe | 25 vigia de df parou a cópia | 26 multi-pack-index presente | 27 já trocado |
+#        30 verificação reprovou ou P não pôde ser escondido (rollback FEITO) | 31 rollback FALHOU (alto: ver o log; P' e N ficam instalados quando P não está visível) |
+#        40 falha ao apagar P depois de aprovado | 50 recover não achou nada a recuperar
 #
-# Testes (selftest): JDS_FREE_MB_CMD (imprime MB livres), JDS_BOOT_EPOCH, JDS_GIT, JDS_RSYNC, JDS_WATCH_S, JDS_SKIP_FSCK_SAMPLE.
+# Testes (selftest): JDS_FREE_MB_CMD (imprime MB livres), JDS_BOOT_EPOCH, JDS_GIT, JDS_RSYNC, JDS_WATCH_S. Nenhuma variável de ambiente desliga uma conferência de segurança.
 set -u
 set -o pipefail
 
@@ -44,7 +48,7 @@ usage() {
 uso: $PROG.sh --src <[host:]dir com os artefatos> --auth-epoch <epoch da autorização> [--repo <dir com .git>] [--recover]
   --src          diretório (local ou host:caminho para o rsync) com manifest.env, manifest.sha256, ids.txt e os packs P' e N
   --auth-epoch   epoch da autorização do Mayor; o mini tem de ter dado boot DEPOIS dele (o reboot noturno)
-  --recover      só devolve o .idx escondido de uma troca interrompida e remove o que ela instalou
+  --recover      só devolve o .idx escondido de uma troca interrompida e remove staging de PID morto (NÃO apaga os packs P'/N já instalados)
   env: JDS_MIN_START_MB=$MIN_START_MB  JDS_FLOOR_MB=$FLOOR_MB  JAC_LOCK=$LOCK
 EOF
 }
@@ -151,23 +155,47 @@ EOF
 }
 
 # ── estado da troca (para o rollback e o recover) ──
-OLD=""; INSTALLED=""; HOLD=""; STAGE=""; PHASE="pre"
-rollback() {  # devolve o .idx e tira o que foi instalado; 0 = estado de antes restaurado, 1 = falhou (ALTO)
+OLD=""; INSTALLED=""; HOLD=""; STAGE=""; PHASE="pre"; RSP=""
+rollback() {  # devolve o .idx e tira o que foi instalado; 0 = estado de antes restaurado (P visível: .idx e .pack), 1 = falhou (ALTO)
   local rc=0 f
   if [ -n "$HOLD" ] && [ -e "$HOLD" ]; then
     if [ -e "$PACKDIR/$OLD.idx" ]; then log "ROLLBACK: $OLD.idx já existe e o hold também — NÃO sobrescrevo"; rc=1
     else mv "$HOLD" "$PACKDIR/$OLD.idx" || { log "ROLLBACK: não consegui devolver o .idx de $OLD"; rc=1; }; fi
   fi
+  # P tem de estar VISÍVEL (.idx e .pack não vazios) antes de tirar P' e N: sem isso P' e N são a única cópia legível dos objetos e apagá-los é perda de dado
+  # (hold sumido por fora, mv que falhou...). Ilegível/ausente NÃO vira "voltou": fica tudo instalado, rc 1 → exit 31, e o log diz por quê.
+  if [ -z "$OLD" ] || [ ! -s "$PACKDIR/$OLD.idx" ] || [ ! -s "$PACKDIR/$OLD.pack" ]; then
+    log "ROLLBACK FALHOU: $OLD.idx/.pack NÃO estão visíveis em $PACKDIR — NÃO removo o que instalei (${INSTALLED:-nada}); P' e N seguem sendo a cópia legível dos objetos"
+    return 1
+  fi
   for f in $INSTALLED; do  # .idx primeiro: o pack some do git antes dos arquivos
     rm -f "$PACKDIR/$f.idx" "$PACKDIR/$f.rev" "$PACKDIR/$f.pack" 2>/dev/null
   done
   [ -n "$STAGE" ] && [ -d "$STAGE" ] && { find "$STAGE" -mindepth 1 -delete 2>/dev/null; rmdir "$STAGE" 2>/dev/null; }
-  if [ "$rc" -eq 0 ] && [ -n "$OLD" ] && [ -s "$PACKDIR/$OLD.idx" ] && [ -s "$PACKDIR/$OLD.pack" ]; then log "ROLLBACK: feito — $OLD.idx de volta, instalados removidos"; else [ "$rc" -eq 0 ] && log "ROLLBACK: nada a devolver"; fi
+  if [ "$rc" -eq 0 ]; then log "ROLLBACK: feito — $OLD.idx visível, instalados removidos"; fi
   return $rc
+}
+# a cópia em segundo plano (rsync, e o ssh dele) morre com o script: um sinal só no PID do script não a alcança, e um rsync solto continuaria
+# gravando no staging sem ninguém vigiando o piso de df (nem o on_exit nem o vigia estão mais vivos) e RECRIARIA o diretório que o on_exit acabou de apagar
+stop_copy() {
+  local i
+  [ -n "$RSP" ] || return 0
+  if kill -0 "$RSP" 2>/dev/null; then
+    pkill -TERM -P "$RSP" 2>/dev/null; kill "$RSP" 2>/dev/null
+    for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$RSP" 2>/dev/null || break; sleep 0.5; done
+    if kill -0 "$RSP" 2>/dev/null; then pkill -KILL -P "$RSP" 2>/dev/null; kill -9 "$RSP" 2>/dev/null; fi
+  fi
+  wait "$RSP" 2>/dev/null
+  RSP=""   # PID já recolhido: nunca sinalizar um número que o sistema pode ter reciclado
 }
 on_exit() {
   local rc=$?
-  if [ "$PHASE" = hidden ]; then log "interrompido com o .idx escondido — rollback"; rollback || log "ROLLBACK FALHOU: rode --recover"; fi
+  stop_copy   # ANTES de apagar o staging
+  case "$PHASE" in
+    installing|hidden)
+      log "interrompido com a troca em andamento (fase $PHASE) — rollback"
+      rollback || { log "ROLLBACK FALHOU: ver as linhas acima; o .idx escondido (se ainda existir) volta com --recover"; rc=31; } ;;
+  esac
   [ -n "$STAGE" ] && [ -d "$STAGE" ] && { find "$STAGE" -mindepth 1 -delete 2>/dev/null; rmdir "$STAGE" 2>/dev/null; }
   lock_release
   exit $rc
@@ -179,13 +207,25 @@ trap 'log "sinal recebido"; exit 143' INT TERM HUP
 if [ "$MODE" = recover ]; then
   log "=== RECOVER $PROG repo=$REPO ==="
   lock_take || { log "lock em uso — não recupero com outro processo vivo"; exit 21; }
+  # diretório que não lista ≠ diretório sem hold: o primeiro é "não sei se há .idx escondido" (31), só o segundo é "nada a recuperar" (50)
+  ls "$PACKDIR" >/dev/null 2>&1 || { log "RECOVER: não consegui listar $PACKDIR — não sei se há .idx escondido"; exit 31; }
+  did=0
   holds="$(ls "$PACKDIR"/*.idx.swap-hold 2>/dev/null)"
-  [ -n "$holds" ] || { log "nenhum .idx.swap-hold — nada a recuperar"; exit 50; }
   for h in $holds; do
     b="$(basename "$h" .idx.swap-hold)"
     if [ -e "$PACKDIR/$b.idx" ]; then log "$b.idx já existe — não sobrescrevo $h"; exit 31; fi
     mv "$h" "$PACKDIR/$b.idx" && log "devolvi $b.idx" || { log "falhou ao devolver $b.idx"; exit 31; }
+    did=1
   done
+  # staging deixado por uma execução morta sem sinal tratável (SIGKILL): o nome carrega o PID; PID vivo (ou reciclado) = não toco
+  for d in "$GITDIR"/swap-stage.*; do
+    [ -d "$d" ] || continue
+    sp="${d##*swap-stage.}"
+    if ! is_uint "$sp" || kill -0 "$sp" 2>/dev/null; then log "staging $d: PID '$sp' vivo ou ilegível — não toco"; continue; fi
+    find "$d" -mindepth 1 -delete 2>/dev/null; rmdir "$d" 2>/dev/null || { log "falhou ao remover o staging $d"; exit 31; }
+    log "removi o staging de PID morto: $d"; did=1
+  done
+  [ "$did" -eq 1 ] || { log "nenhum .idx.swap-hold nem staging de PID morto — nada a recuperar"; exit 50; }
   log "RECOVER feito. Os packs pack-* instalados pela troca (se houver) ficam como duplicata; apague por nome se quiser o disco de volta."
   exit 0
 fi
@@ -218,6 +258,14 @@ OLD_PACK="$(mget OLD_PACK)"; OLD_CHECKSUM="$(mget OLD_CHECKSUM)"; NEW_PACKS="$(m
 for v in "$OLD_PACK" "$OLD_CHECKSUM" "$NEW_PACKS" "$NEED_MB"; do safe "$v" || { log "ABORT 24: manifest.env tem caractere fora do permitido"; exit 24; }; done
 [ -n "$OLD_PACK" ] && [ -n "$OLD_CHECKSUM" ] && [ -n "$NEW_PACKS" ] || { log "ABORT 24: manifest.env incompleto"; exit 24; }
 OLD="$OLD_PACK"
+# ids.txt é a ÚNICA leitura de conteúdo do que o MBP prometeu: conferido AGORA contra o sha256 do manifesto (vazio → ABORT; truncado/trocado → ABORT; fora do manifesto → ABORT),
+# para que "não consegui ler a evidência" nunca vire "verificado" lá no passo 9 (ele só roda sobre uma lista que este passo aprovou)
+IDS_SHA="$(awk '$2 == "ids.txt" || $2 == "*ids.txt" { print $1; exit }' "$MAN/manifest.sha256" 2>/dev/null)"
+[ -n "$IDS_SHA" ] || { log "ABORT 24: manifest.sha256 não cobre ids.txt (ou não deu para ler) — não começo sem a evidência conferida"; exit 24; }
+[ -s "$MAN/ids.txt" ] || { log "ABORT 24: ids.txt vazio ou ausente — sem a lista não há o que conferir depois (vazio não é 'verificado')"; exit 24; }
+IDS_GOT="$(shasum -a 256 "$MAN/ids.txt" 2>/dev/null | awk '{ print $1 }')"
+[ -n "$IDS_GOT" ] && [ "$IDS_GOT" = "$IDS_SHA" ] || { log "ABORT 24: sha256 do ids.txt ($IDS_GOT) != o do manifesto ($IDS_SHA)"; exit 24; }
+log "ids.txt confere com o manifesto ($(awk 'END { print NR }' "$MAN/ids.txt") ids)"
 if [ ! -e "$PACKDIR/$OLD.pack" ]; then log "ABORT 27: $OLD.pack não está mais em $PACKDIR — troca já feita (ou o pack foi consolidado por outro caminho)"; exit 27; fi
 [ -s "$PACKDIR/$OLD.idx" ] || { log "ABORT 20: $OLD.idx ausente (hold de uma troca interrompida? rode --recover)"; exit 20; }
 
@@ -267,6 +315,7 @@ while kill -0 "$RSP" 2>/dev/null; do
   if [ -n "$TRIP" ]; then kill "$RSP" 2>/dev/null; sleep 1; kill -9 "$RSP" 2>/dev/null; break; fi
 done
 wait "$RSP" 2>/dev/null; RSRC=$?
+RSP=""   # recolhido: o on_exit não tem mais cópia para parar
 if [ -n "$TRIP" ]; then log "ABORT 25: vigia de df parou a cópia: $TRIP — staging removido, nada mudou no repo"; exit 25; fi
 [ "$RSRC" -eq 0 ] || { log "ABORT 24: rsync rc=$RSRC"; exit 24; }
 log "cópia feita em $(( $(date +%s) - t ))s; df agora $(free_mb) MB"
@@ -278,24 +327,26 @@ t=$(date +%s)
 log "sha256 ok em $(echo $FILES | wc -w | tr -d ' ') arquivos ($(( $(date +%s) - t ))s)"
 
 # 7) instala (nomes pack-<hash>; .pack e .rev antes, .idx POR ÚLTIMO)
-NEWNAMES=""
+# os pré-checks de "já existe" rodam TODOS antes do primeiro mv: o que entra em INSTALLED (e o rollback apaga) é sempre arquivo que esta execução pôs lá
 for n in $NEW_PACKS; do
   b="pack-${n#*-}"
-  if [ -e "$PACKDIR/$b.pack" ] || [ -e "$PACKDIR/$b.idx" ]; then log "ABORT 24: $b já existe em $PACKDIR — não sobrescrevo"; exit 24; fi
-  NEWNAMES="$NEWNAMES $b"
+  if [ -e "$PACKDIR/$b.pack" ] || [ -e "$PACKDIR/$b.idx" ] || [ -e "$PACKDIR/$b.rev" ]; then log "ABORT 24: $b já existe em $PACKDIR — não sobrescrevo"; exit 24; fi
 done
+# PHASE=installing e INSTALLED ANTES do mv: um sinal entre o mv do .pack/.rev e o do .idx deixaria um pack-X.pack órfão que faria a próxima execução abortar 24 "já existe";
+# agora o on_exit faz o rollback (rm -f do que ainda não chegou é inofensivo)
+PHASE=installing
 for n in $NEW_PACKS; do
   b="pack-${n#*-}"
-  mv "$STAGE/$n.pack" "$PACKDIR/$b.pack" && mv "$STAGE/$n.rev" "$PACKDIR/$b.rev" && mv "$STAGE/$n.idx" "$PACKDIR/$b.idx" || { INSTALLED="$INSTALLED $b"; log "ABORT 24: mv de $n falhou"; rollback; exit 24; }
   INSTALLED="$INSTALLED $b"
+  mv "$STAGE/$n.pack" "$PACKDIR/$b.pack" && mv "$STAGE/$n.rev" "$PACKDIR/$b.rev" && mv "$STAGE/$n.idx" "$PACKDIR/$b.idx" || { log "ABORT 24: mv de $n falhou — o on_exit faz o rollback"; exit 24; }
 done
 rmdir "$STAGE" 2>/dev/null; STAGE=""
 log "instalados:$INSTALLED"
 
-# 8) esconde o .idx de P
+# 8) esconde o .idx de P — HOLD e PHASE=hidden ANTES do mv: um sinal entre o mv e a atribuição deixaria P escondido sem rollback (o rollback tolera hold que ainda não existe)
 HOLD="$PACKDIR/$OLD.idx.swap-hold"
-mv "$PACKDIR/$OLD.idx" "$HOLD" || { log "ABORT 31: não escondi $OLD.idx"; HOLD=""; rollback; exit 31; }
 PHASE=hidden
+mv "$PACKDIR/$OLD.idx" "$HOLD" || { log "ABORT 30: não escondi $OLD.idx — o on_exit faz o rollback (e troca o rc por 31 se ele falhar)"; exit 30; }
 log "$OLD.idx ESCONDIDO — verificando com P fora de vista"
 
 # 9) verificação com P escondido
@@ -303,44 +354,66 @@ FAIL=""
 t=$(date +%s)
 g cat-file --batch-all-objects --batch-check='%(objectname)' | sort > "$STATE/objs.after" || FAIL="$FAIL cat-file-depois"
 if [ -z "$FAIL" ]; then
-  LOST="$(comm -23 "$STATE/objs.before" "$STATE/objs.after" | wc -l | tr -d ' ')"
-  OBJ_A="$(wc -l < "$STATE/objs.after" | tr -d ' ')"
-  log "objetos: antes $OBJ_B, depois $OBJ_A, sumiram $LOST (acréscimos do exportador são esperados)"
-  [ "$LOST" = 0 ] || FAIL="$FAIL objetos-sumiram($LOST)"
+  # comm que falha (arquivo ilegível, EIO) NÃO pode virar "sumiram 0": a saída vai para arquivo, o rc do comm é lido, e a contagem só vale se foi lida (não-uint → reprova)
+  if comm -23 "$STATE/objs.before" "$STATE/objs.after" > "$STATE/lost.objs"; then
+    LOST="$(awk 'END { print NR }' "$STATE/lost.objs")"
+    OBJ_A="$(wc -l < "$STATE/objs.after" | tr -d ' ')"
+    log "objetos: antes $OBJ_B, depois $OBJ_A, sumiram $LOST (acréscimos do exportador são esperados)"
+    { is_uint "$LOST" && [ "$LOST" = 0 ]; } || FAIL="$FAIL objetos-sumiram(${LOST:-?})"
+  else
+    FAIL="$FAIL comm-objetos-falhou"
+  fi
 fi
 g rev-list --objects --all | awk '{print $1}' | sort -u > "$STATE/reach.after" || FAIL="$FAIL rev-list-depois"
 if [ -z "$FAIL" ]; then
-  RLOST="$(comm -23 "$STATE/reach.before" "$STATE/reach.after" | wc -l | tr -d ' ')"
-  COMMITS_A="$(g rev-list --all --count)"
-  log "alcançáveis: antes $REACH_B, depois $(wc -l < "$STATE/reach.after" | tr -d ' '), sumiram $RLOST; commits antes $COMMITS_B, depois $COMMITS_A"
-  [ "$RLOST" = 0 ] || FAIL="$FAIL alcancaveis-sumiram($RLOST)"
-  is_uint "$COMMITS_A" && [ "$COMMITS_A" -ge "$COMMITS_B" ] || FAIL="$FAIL commits($COMMITS_B->$COMMITS_A)"
+  # mesma regra do comm acima: falhou = reprova, nunca "0 sumiram"
+  if comm -23 "$STATE/reach.before" "$STATE/reach.after" > "$STATE/lost.reach"; then
+    RLOST="$(awk 'END { print NR }' "$STATE/lost.reach")"
+    COMMITS_A="$(g rev-list --all --count)"
+    log "alcançáveis: antes $REACH_B, depois $(wc -l < "$STATE/reach.after" | tr -d ' '), sumiram $RLOST; commits antes $COMMITS_B, depois $COMMITS_A"
+    { is_uint "$RLOST" && [ "$RLOST" = 0 ]; } || FAIL="$FAIL alcancaveis-sumiram(${RLOST:-?})"
+    { is_uint "$COMMITS_A" && [ "$COMMITS_A" -ge "$COMMITS_B" ]; } || FAIL="$FAIL commits($COMMITS_B->${COMMITS_A:-?})"
+  else
+    FAIL="$FAIL comm-alcancaveis-falhou"
+  fi
 fi
 if [ -z "$FAIL" ]; then
   g fsck --connectivity-only --no-dangling --no-progress > "$STATE/fsck.txt" 2>&1; FRC=$?
   # fsck.txt é escrito pela linha de cima: se a escrita falhar o redirect devolve rc 1 → FRC != 0 → reprova (T17 injeta o rc != 0 e o "missing" com rc 0)
   if [ "$FRC" -ne 0 ] || grep -q -i -E "^(missing|broken|error|fatal)" "$STATE/fsck.txt"; then FAIL="$FAIL fsck(rc=$FRC)"; head -5 "$STATE/fsck.txt" | while IFS= read -r l; do log "  fsck: $l"; done; else log "fsck --connectivity-only ok"; fi  # third-state-waiver: o arquivo é a saída da linha anterior; escrita que falha já vira FRC != 0 (reprova)
 fi
-if [ -z "$FAIL" ] && [ -s "$MAN/ids.txt" ]; then
-  # cat-file que falhou (rc != 0) ou que respondeu menos linhas do que ids → "não li" = REPROVA; nunca vira "0 ausentes" (grep -c sobre uma saída vazia imprime 0)
-  NIDS="$(awk 'END { print NR }' "$MAN/ids.txt")"
-  g cat-file --batch-check < "$MAN/ids.txt" > "$STATE/ids.check"; IRC=$?
-  NANS="$(awk 'END { print NR }' "$STATE/ids.check")"
-  MISS="$(grep -c ' missing$' "$STATE/ids.check")"
-  if [ "$IRC" -ne 0 ] || [ "$NANS" != "$NIDS" ]; then
-    log "lista de ids ($NIDS): cat-file rc=$IRC e respondeu $NANS linhas — não consegui ler"
-    FAIL="$FAIL ids-nao-li(rc=$IRC,$NANS/$NIDS)"
+if [ -z "$FAIL" ]; then
+  # a lista de ids é a ÚNICA conferência de conteúdo: nunca pulada em silêncio. O passo 1 a aprovou (sha256 do manifesto, não vazia); se ela mudou desde então, REPROVA —
+  # "não consegui ler a evidência" não pode virar "verificado". Vazio/ilegível → reprova; cat-file que falha, responde de menos ou grep que erra → "não li" = reprova.
+  IDS_NOW="$(shasum -a 256 "$MAN/ids.txt" 2>/dev/null | awk '{ print $1 }')"
+  NIDS="$(awk 'END { print NR }' "$MAN/ids.txt" 2>/dev/null)"
+  if [ -z "$IDS_NOW" ] || [ "$IDS_NOW" != "$IDS_SHA" ]; then
+    log "ids.txt mudou depois de conferido (sha256 agora '${IDS_NOW:-?}' != manifesto '$IDS_SHA') — sem evidência de conteúdo; REPROVA"
+    FAIL="$FAIL ids-mudou"
+  elif ! is_uint "$NIDS" || [ "$NIDS" -lt 1 ]; then
+    log "ids.txt sem linhas legíveis (${NIDS:-?}) — sem evidência de conteúdo; REPROVA"
+    FAIL="$FAIL ids-vazio(${NIDS:-?})"
   else
-    log "lista de ids ($NIDS): $MISS ausentes"
-    [ "$MISS" = 0 ] || FAIL="$FAIL ids-ausentes($MISS)"
+    g cat-file --batch-check < "$MAN/ids.txt" > "$STATE/ids.check"; IRC=$?
+    NANS="$(awk 'END { print NR }' "$STATE/ids.check" 2>/dev/null)"
+    MISS="$(grep -c ' missing$' "$STATE/ids.check" 2>/dev/null)"; MRC=$?   # grep -c: rc 1 = nenhuma linha (MISS 0), rc >= 2 = erro de leitura
+    if [ "$IRC" -ne 0 ] || [ "$NANS" != "$NIDS" ] || [ "$MRC" -gt 1 ] || ! is_uint "$MISS"; then
+      log "lista de ids ($NIDS): cat-file rc=$IRC, respondeu $NANS linhas, grep rc=$MRC (ausentes '${MISS:-?}') — não consegui ler"
+      FAIL="$FAIL ids-nao-li(rc=$IRC,$NANS/$NIDS,grep=$MRC)"
+    else
+      log "lista de ids ($NIDS): $MISS ausentes"
+      [ "$MISS" = 0 ] || FAIL="$FAIL ids-ausentes($MISS)"
+    fi
   fi
 fi
-if [ -z "$FAIL" ] && [ -s "$MAN/ids.txt" ] && [ -z "${JDS_SKIP_FSCK_SAMPLE:-}" ]; then
-  # amostra lida INTEIRA do estado sem P: primeiro, do meio e último da lista (inflata e resolve a cadeia de delta de verdade)
+if [ -z "$FAIL" ]; then
+  # amostra lida INTEIRA do estado sem P: primeiro, do meio e último da lista (inflata e resolve a cadeia de delta de verdade). Sem chave de ambiente que a pule:
+  # é a única leitura de conteúdo de P'/N no mini. NIDS é uint >= 1 aqui (o bloco acima reprova antes)
   for pos in 1 $(( NIDS / 2 + 1 )) "$NIDS"; do
     id="$(sed -n "${pos}p" "$MAN/ids.txt")"
-    sz="$(g cat-file -s "$id" 2>/dev/null)"; got="$(g cat-file blob "$id" 2>/dev/null | wc -c | tr -d ' ')"
-    if is_uint "$sz" && [ "$sz" = "$got" ]; then log "amostra $pos ($id): $got bytes lidos = tamanho declarado"; else FAIL="$FAIL amostra($id:$sz!=$got)"; fi
+    # tamanho ilegível → reprova; leitura que sai com erro (pipefail: o rc é o do cat-file, não o do wc) → reprova mesmo que os bytes batam (objeto de 0 bytes: 0 = 0 não prova leitura)
+    sz="$(g cat-file -s "$id" 2>/dev/null)"; got="$(g cat-file blob "$id" 2>/dev/null | wc -c | tr -d ' ')"; GRC=$?
+    if is_uint "$sz" && [ "$GRC" -eq 0 ] && [ "$sz" = "$got" ]; then log "amostra $pos ($id): $got bytes lidos = tamanho declarado"; else FAIL="$FAIL amostra($id:${sz:-?}!=$got,rc=$GRC)"; fi
   done
 fi
 log "verificação levou $(( $(date +%s) - t ))s"
