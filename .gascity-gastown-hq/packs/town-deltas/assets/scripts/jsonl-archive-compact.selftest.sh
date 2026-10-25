@@ -1488,7 +1488,9 @@ tailrepo() {  # tailrepo <dir> <n-small-packs>
   head -c 1048576 /dev/urandom > "$d/ballast.bin"
   git -C "$d" add ballast.bin && git -C "$d" -c maintenance.auto=false -c gc.auto=0 commit -q -m ballast
   git --git-dir="$d/.git" -c maintenance.auto=false repack -a -d -q
-  for i in $(seq 201 $((200 + n))); do addpack "$d" "$i"; done
+  # an arithmetic loop, not `seq 201 $((200 + n))`: for n=0 that is `seq 201 200`, which is EMPTY on GNU seq (the Linux node) but counts DOWN on BSD seq (macOS: 201, 200) — tailrepo <dir> 0 then made 2 packs and
+  # 2 commits more on the mini than on the node (S40 H counted 20 where it meant 18, ga-azfgyn). The other seq loops in this file take a count that is never 0.
+  for ((i = 201; i <= 200 + n; i++)); do addpack "$d" "$i"; done
 }
 pack_kib() { git --git-dir="$1/.git" count-objects -v 2>/dev/null | awk '/^size-pack:/{print $2}'; }
 base_pack() { ls -S "$1"/.git/objects/pack/*.pack | head -1; }       # the biggest pack: the ballast lives there
@@ -1882,24 +1884,26 @@ out="$(T_TAIL=300 T_TAIL_OBJS=26 T_TAIL_MIN=2 run_tail "$TM8")"; rc=$?
 { [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'field(s) .*tail_objects.*tail_cut_epoch.* are not non-negative whole numbers' && printf '%s' "$out" | grep -q 'object cap 26 (max 26)'; } \
   && ok "M8 a remembered cap/cut time that is not a number is dropped with a line in the log and read as unset (cap = the configured max)" || bad "M8 a corrupt remembered cap was handled wrong (rc=$rc): $out"
 # M9. DISK (1): free − need must stay above Dolt's CRITICAL class → skipped-low-disk, exit 1, and git is NEVER asked to repack
+# JAC_TAIL_TIGHT=0 on the four runs below: what is under test is the COMFORTABLE rule's floor. The tight road (on by default since ga-ft1iv6) is a second answer to the same refusal and reads the host's swap, so on the mini it ran
+# this pass (rc=0, one repack) while on the node, where swap cannot be read, it refused and the test passed — a result that depended on the machine (ga-azfgyn). S40 tests the road, with the swap seam.
 TD9="$WORK/td9"; tailrepo "$TD9" 4; PS9="$(packs_sum "$TD9")"; NEED9="$(tail_need_kib "$TD9")"
 repack_calls() { [ -s "$WORK/argv" ] && grep -c . "$WORK/argv" || echo 0; }
 rm -f "$WORK/state.json" "$WORK/log" "$WORK/argv"
-out="$(ARGV_LOG="$WORK/argv" T_GIT="$WORK/git-argv" T_TAIL=300 T_TAIL_OBJS=20 T_FREE=$(( NEED9 + 4 * 1048576 - 50 )) run_tail "$TD9")"; rc=$?
+out="$(JAC_TAIL_TIGHT=0 ARGV_LOG="$WORK/argv" T_GIT="$WORK/git-argv" T_TAIL=300 T_TAIL_OBJS=20 T_FREE=$(( NEED9 + 4 * 1048576 - 50 )) run_tail "$TD9")"; rc=$?
 { [ "$rc" -eq 1 ] && [ "$(last_status)" = "skipped-low-disk" ] && [ "$(repack_calls)" = 0 ] && [ "$(packs_sum "$TD9")" = "$PS9" ] && [ "$(state_field "$TD9" bad_streak)" = 1 ] && printf '%s' "$out" | grep -q 'status=skipped-low-disk (tail) .*Dolt.s CRITICAL class'; } \
   && ok "M9 free − need = 4GiB − 50KiB (the free GiB would round DOWN to 3 = Dolt's CRITICAL class) → skipped-low-disk, exit 1, streak 1, NO git repack was called, packs unchanged" || bad "M9 a pass that would leave the disk CRITICAL was not stopped (rc=$rc status=$(last_status) repack calls=$(repack_calls)): $out"
 # the control: a hair more room (free − need >= 4GiB) → the same fixture runs, and git IS asked to repack once
 rm -f "$WORK/state.json" "$WORK/log" "$WORK/argv"
-out="$(ARGV_LOG="$WORK/argv" T_GIT="$WORK/git-argv" T_TAIL=300 T_TAIL_OBJS=20 T_FREE=$(( NEED9 + 4 * 1048576 + 100 )) run_tail "$TD9")"; rc=$?
+out="$(JAC_TAIL_TIGHT=0 ARGV_LOG="$WORK/argv" T_GIT="$WORK/git-argv" T_TAIL=300 T_TAIL_OBJS=20 T_FREE=$(( NEED9 + 4 * 1048576 + 100 )) run_tail "$TD9")"; rc=$?
 { [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(repack_calls)" = 1 ] && [ "$(pack_count "$TD9")" = 2 ]; } \
   && ok "M9 control: free − need = 4GiB + 50KiB → the pass runs (one repack call, packs 5 -> $(pack_count "$TD9")): the stop above is the floor, not the fixture" || bad "M9 control: a roomy disk did not run the pass (rc=$rc status=$(last_status) repack calls=$(repack_calls) packs=$(pack_count "$TD9")): $out"
 # the floor is the guard's setting, not a constant: DOLT_DISK_FLOOR_CRITICAL_GB=0 → only 1GiB must remain
 TD9B="$WORK/td9b"; tailrepo "$TD9B" 4; PS9B="$(packs_sum "$TD9B")"; rm -f "$WORK/state.json" "$WORK/log" "$WORK/argv"
-out="$(T_CRIT=0 ARGV_LOG="$WORK/argv" T_GIT="$WORK/git-argv" T_TAIL=300 T_TAIL_OBJS=20 T_FREE=$(( NEED9 + 1048576 - 50 )) run_tail "$TD9B")"; rc=$?
+out="$(JAC_TAIL_TIGHT=0 T_CRIT=0 ARGV_LOG="$WORK/argv" T_GIT="$WORK/git-argv" T_TAIL=300 T_TAIL_OBJS=20 T_FREE=$(( NEED9 + 1048576 - 50 )) run_tail "$TD9B")"; rc=$?
 { [ "$rc" -eq 1 ] && [ "$(last_status)" = "skipped-low-disk" ] && [ "$(repack_calls)" = 0 ] && [ "$(packs_sum "$TD9B")" = "$PS9B" ]; } \
   && ok "M9 DOLT_DISK_FLOOR_CRITICAL_GB=0: free − need = 1GiB − 50KiB is still CRITICAL (floor of the free GiB = 0) → skipped, no repack" || bad "M9 the critical floor setting is not honoured at 0 (rc=$rc status=$(last_status) repack calls=$(repack_calls)): $out"
 rm -f "$WORK/state.json" "$WORK/log" "$WORK/argv"
-out="$(T_CRIT=0 ARGV_LOG="$WORK/argv" T_GIT="$WORK/git-argv" T_TAIL=300 T_TAIL_OBJS=20 T_FREE=$(( NEED9 + 1048576 + 100 )) run_tail "$TD9B")"; rc=$?
+out="$(JAC_TAIL_TIGHT=0 T_CRIT=0 ARGV_LOG="$WORK/argv" T_GIT="$WORK/git-argv" T_TAIL=300 T_TAIL_OBJS=20 T_FREE=$(( NEED9 + 1048576 + 100 )) run_tail "$TD9B")"; rc=$?
 { [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(repack_calls)" = 1 ]; } \
   && ok "M9 DOLT_DISK_FLOOR_CRITICAL_GB=0 and 1GiB + 100KiB left → the pass runs" || bad "M9 critical floor 0: the pass did not run with 1GiB left (rc=$rc status=$(last_status) repack calls=$(repack_calls)): $out"
 # M10. DISK (2): a floor or a free-space reading that cannot be read is not 'plenty' — the pass does not start, and says so in the words of a low disk
