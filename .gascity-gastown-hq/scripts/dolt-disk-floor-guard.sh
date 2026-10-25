@@ -2169,14 +2169,16 @@ _reap_hf_cache() {
 
 # _reap_growing_logs — fifth reclaim lever, alongside _safe_reclaim,
 # _reap_dead_scratch, _reap_dead_transcripts, and _reap_hf_cache (ga-dnc2m):
-# known app logs under /private/tmp and ~/shared/logs that nothing ever
-# rotated — a distinct leak class from the others (none of them look at
+# app logs under /private/tmp and ~/shared/logs that nothing ever rotated
+# (a few named files, plus every top-level *.log of ~/shared/logs since
+# wa-4j6gip) — a distinct leak class from the others (none of them look at
 # app-log files at all). Delegates to the standalone, independently-selftested log-reaper.sh
 # so its size-cap logic is unit-tested in isolation rather than inlined here
 # — same pattern as the scratch/transcript levers. Cheap and bounded by
 # timeout so it can safely run on every cycle (see the UNLIKE note in this
-# file's own header): a handful of `stat` calls, with a `cp`+truncate only
-# for a file that is actually over threshold.
+# file's own header): a handful of `stat` calls and one `find` per glob
+# directory, with a `cp`+truncate or a tail-cap only for a file that is
+# actually over its limit.
 #
 # LOG_REAPER_PROD=1 (same ga-h565g pattern as the other two reapers): this
 # function IS the real, launchd-driven caller log-reaper.sh's own
