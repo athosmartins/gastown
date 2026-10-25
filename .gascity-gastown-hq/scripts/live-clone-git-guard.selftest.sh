@@ -13,7 +13,9 @@
 #           o MESMO checkout num clone aninhado (crew/x), num worktree ligado e fora do clone vivo, e comando que só CITA o checkout;
 #   open  — falhar ABERTO: stdin que não é JSON, ferramenta que não é Bash, diretório que não sei resolver, o módulo do parser que não
 #           carrega (e nesse caso gravar ERROR no log) e log que não grava NÃO podem virar "bloqueado": é trava contra engano, não sandbox;
-#           e o que se libera SEM saber onde o git roda (sessão fora do vivo) fica CONTADO: uma linha result=UNRESOLVED, exit 0 (dentro do vivo, barra);
+#           e o que se libera SEM saber onde o git roda (cd/-C/--git-dir/--work-tree por variável, lançador opaco, aninhado fundo; sessão fora do vivo)
+#           fica CONTADO: uma linha result=UNRESOLVED, exit 0 (dentro do vivo, barra); stdin que não é o objeto do hook libera MAS grava ERROR
+#           (se o Claude Code mudar o payload o guarda morre em toda chamada, e sem a linha ninguém vê);
 #   log   — cada bloqueio vira UMA linha em LCG_LOG com a sessão/alias de quem tentou, e a mensagem diz o que viu e o que fazer;
 #   self  — `--selfcheck [settings.json]`: 0 só se o guarda decide como deveria E (com o settings) todo PreToolUse de Bash é exatamente
 #           `python3 -I <guarda>`; 1 caso contrário.
@@ -111,6 +113,13 @@ b 2 "block: cd \$VAR && git checkout, com a sessão NO vivo (não sei onde roda)
 b 2 "block: git -C \$VAR checkout, com a sessão NO vivo"                    'git -C "$WHERE" checkout --detach abc'
 b 2 "block: lançador opaco (flock) na frente do git, sessão NO vivo"        "flock $T/l git checkout --detach $SHA"
 b 2 "block: eval aninhado além do limite do parser, sessão NO vivo"         "eval eval eval eval eval git checkout --detach $SHA"
+b 2 "block: --git-dir=\$VAR/.git de um cwd que resolvo, sessão NO vivo (o HEAD que anda é de uma pasta que não vejo)" "cd $OUT && git --git-dir=\"\$X/.git\" checkout --detach abc"
+b 2 "block: GIT_DIR=\$VAR/.git de um cwd que resolvo, sessão NO vivo"      "cd $OUT && GIT_DIR=\$X/.git git checkout --detach abc"
+b 2 "block: o repro do gate (WA=<vivo>; git --git-dir=\$WA/.git checkout --detach HEAD), sessão NO vivo" "WA=$LIVE; git --git-dir=\$WA/.git checkout --detach HEAD"
+b 2 "block: --work-tree=<outro> com o cwd NO vivo (o repositório vem do cwd e o HEAD do vivo anda)" "git --work-tree=$OUT checkout --detach $SHA"
+b 2 "block: GIT_WORK_TREE=<outro> com o cwd NO vivo"                         "GIT_WORK_TREE=$OUT git checkout --detach $SHA"
+b 2 "block: --git-dir=<outro>/.git sem --work-tree com o cwd NO vivo (a árvore reescrita é o cwd)" "git --git-dir=$OUT/.git checkout --detach $SHA"
+b 2 "block: cd \$VAR && git --work-tree=<fora> (o cwd é desconhecido), sessão NO vivo" "cd \"\$WHERE\" && git --work-tree=$WT checkout --detach $SHA"
 run < <(mk Bash "$LIVE" command 'cd "$WHERE" && git checkout --detach abc'); blocked && grep -q 'não consegui ver' "$T/err" && grep -qF "$LIVE" "$T/err"; ok $? "block: o 'não sei' diz que não conseguiu ver a pasta e cita o clone vivo"
 run < <(mk Bash "$LIVE" command "eval eval eval eval eval git checkout --detach $SHA"); blocked && grep -q 'não consegui ver' "$T/err" && grep -qF "eval eval eval eval eval git checkout --detach $SHA" "$T/err"; ok $? "block: o 'não sei' do aninhamento fundo cita o COMANDO (não o motivo interno do parser)"
 fi
@@ -125,6 +134,7 @@ b 0 "pass: cd <vivo> && git switch main"                                    "cd 
 b 0 "pass: git checkout sem argumento (só mostra o estado)"                 "git checkout"
 b 0 "pass: git checkout -- arquivo (não move o HEAD)"                       "git checkout -- scripts/x.sh"
 b 0 "pass: git -C <worktree> atrás de lançador opaco, sessão no vivo (o -C absoluto resolve)" "flock $T/l git -C $WT checkout --detach $SHA" "$LIVE"
+b 0 "pass: --git-dir e --work-tree de OUTRO repositório, sessão no vivo (nem a árvore nem o HEAD são do vivo)" "git --git-dir=$OUT/.git --work-tree=$OUT checkout --detach $SHA" "$LIVE"
 b 0 "pass: git checkout <sha> -- arquivo (não move o HEAD)"                 "git checkout $SHA -- scripts/x.sh"
 b 0 "pass: git -C <vivo> checkout HEAD -- arquivo"                          "git -C $LIVE checkout HEAD -- f" "$OUT"
 b 0 "pass: git status"                                                      "git status"
@@ -157,14 +167,25 @@ b 0 "open: git checkout num cwd que não existe e fora do vivo"              "gi
 b 0 "open: lançador opaco (flock) com a sessão FORA do vivo → libera"       "flock $T/l git checkout --detach $SHA" "$OUT"
 b 0 "open: eval aninhado além do limite com a sessão FORA do vivo → libera" "eval eval eval eval eval git checkout --detach $SHA" "$OUT"
 b 0 "open: git -C \$VAR checkout com a sessão FORA do vivo → libera"        'git -C "$WHERE" checkout --detach abc' "$OUT"
+b 0 "open: --git-dir=\$VAR/.git com a sessão FORA do vivo → libera"          "WA=$LIVE; git --git-dir=\$WA/.git checkout --detach HEAD" "$OUT"
+b 0 "open: GIT_DIR=\$VAR/.git com a sessão FORA do vivo → libera"            "WA=$LIVE; GIT_DIR=\$WA/.git git checkout --detach HEAD" "$OUT"
 nlog() { wc -l < "$T/guard.log" | tr -d ' '; }
 : > "$T/guard.log"; run < <(mk Bash "$OUT" command 'cd "$WHERE" && git checkout --detach abc'); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=UNRESOLVED' "$T/guard.log" && grep -q 'op=git checkout --detach abc' "$T/guard.log" && grep -qF "cwd=$OUT" "$T/guard.log"; ok $? "open: liberar sem saber onde roda deixa UMA linha result=UNRESOLVED com o op e o cwd, exit 0 (rc=$RC)"
 : > "$T/guard.log"; run < <(mk Bash "$OUT" command "flock $T/l git checkout --detach $SHA"); [ "$RC" = 0 ] && grep -q 'result=UNRESOLVED' "$T/guard.log"; ok $? "open: lançador opaco liberado também é contado (UNRESOLVED)"
 : > "$T/guard.log"; run < <(mk Bash "$OUT" command "eval eval eval eval eval git checkout --detach $SHA"); [ "$RC" = 0 ] && grep -q 'result=UNRESOLVED.*op=eval eval eval eval eval git checkout' "$T/guard.log"; ok $? "open: aninhado fundo demais liberado também é contado (UNRESOLVED, op = o comando)"
 : > "$T/guard.log"; run < <(mk Bash "$OUT" command "git -C $WT checkout --detach $SHA; git checkout main; cd \"\$WHERE\" && git checkout main"); [ "$RC" = 0 ] && [ "$(nlog)" = 0 ]; ok $? "open: o que resolve (ou não move o HEAD) NÃO vira UNRESOLVED — a contagem não enche de ruído"
 : > "$T/guard.log"; run < <(mk Bash "$LIVE" command 'cd "$WHERE" && git checkout --detach abc'); blocked && [ "$(nlog)" = 1 ] && grep -q 'result=BLOCK' "$T/guard.log"; ok $? "open: o 'não sei' barrado no vivo é UMA linha BLOCK, sem UNRESOLVED junto"
-run < <(printf 'garbage not json: git checkout --detach'); [ "$RC" = 0 ]; ok $? "open: stdin que não é JSON (rc=$RC)"
-run < /dev/null; [ "$RC" = 0 ]; ok $? "open: stdin vazio (rc=$RC)"
+# (a linha UNRESOLVED do --git-dir/GIT_DIR por variável: o mesmo comando que o gate reproduziu, agora CONTADO)
+: > "$T/guard.log"; run < <(mk Bash "$OUT" command "WA=$LIVE; git --git-dir=\$WA/.git checkout --detach HEAD"); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=UNRESOLVED.*op=git checkout --detach HEAD' "$T/guard.log"; ok $? "open: --git-dir=\$VAR liberado fora do vivo deixa UMA linha UNRESOLVED (rc=$RC)"
+: > "$T/guard.log"; run < <(mk Bash "$OUT" command "WA=$LIVE; GIT_DIR=\$WA/.git git checkout --detach HEAD"); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=UNRESOLVED' "$T/guard.log"; ok $? "open: GIT_DIR=\$VAR liberado fora do vivo deixa UMA linha UNRESOLVED (rc=$RC)"
+: > "$T/guard.log"; run < <(mk Bash "$OUT" command "WA=$LIVE; git -C \$WA checkout --detach HEAD"); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=UNRESOLVED' "$T/guard.log"; ok $? "open: controle — git -C \$VAR já era contado e continua sendo (rc=$RC)"
+: > "$T/guard.log"; run < <(mk Bash "$OUT" command "cd \"\$WHERE\" && git --work-tree=$WT checkout --detach $SHA"); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=UNRESOLVED' "$T/guard.log"; ok $? "open: cwd desconhecido mesmo com --work-tree conhecido é contado (o repositório vem do cwd) (rc=$RC)"
+: > "$T/guard.log"; run < <(mk Bash "$LIVE" command "git --git-dir=$OUT/.git --work-tree=$OUT checkout --detach $SHA"); [ "$RC" = 0 ] && [ "$(nlog)" = 0 ]; ok $? "open: --git-dir e --work-tree que resolvo para outro repositório NÃO viram UNRESOLVED (rc=$RC)"
+: > "$T/guard.log"; run < <(mk Bash "$OUT" command "git --work-tree=$OUT checkout --detach $SHA"); [ "$RC" = 0 ] && [ "$(nlog)" = 0 ]; ok $? "open: --work-tree que resolvo, cwd que resolvo, fora do vivo: sem linha (rc=$RC)"
+: > "$T/guard.log"; run < <(printf 'garbage not json: git checkout --detach'); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=ERROR.*op=stdin:' "$T/guard.log"; ok $? "open: stdin que não é JSON → libera E grava ERROR stdin: (rc=$RC)"
+: > "$T/guard.log"; run < /dev/null; [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=ERROR.*op=stdin:' "$T/guard.log"; ok $? "open: stdin vazio → libera E grava ERROR stdin: (rc=$RC)"
+: > "$T/guard.log"; run < <(printf '["git checkout --detach x"]'); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=ERROR.*payload não é um objeto' "$T/guard.log" && [ ! -s "$T/err" ]; ok $? "open: JSON que não é objeto → libera sem traceback E grava ERROR (rc=$RC)"
+: > "$T/guard.log"; run < <(mk Edit "$LIVE" file_path "$LIVE/scripts/x.sh"); [ "$RC" = 0 ] && [ "$(nlog)" = 0 ]; ok $? "open: outra ferramenta NÃO grava ERROR (não é defeito de payload) (rc=$RC)"
 run < <(printf '{"tool_name":"Bash"}'); [ "$RC" = 0 ]; ok $? "open: Bash sem tool_input (rc=$RC)"
 run < <(printf '{"tool_name":"Bash","tool_input":"git checkout --detach x"}'); [ "$RC" = 0 ] && [ ! -s "$T/err" ]; ok $? "open: tool_input texto em vez de objeto → libera sem traceback (rc=$RC)"
 run < <(printf '{"tool_name":"Bash","tool_input":["git checkout --detach x"]}'); [ "$RC" = 0 ] && [ ! -s "$T/err" ]; ok $? "open: tool_input lista em vez de objeto → libera sem traceback (rc=$RC)"
@@ -266,7 +287,7 @@ PY
   mut "selfcheck ignora o if"               self  'set(h) <= {"type", "command", "timeout"}' 'True'
   mut "selfcheck aceita sufixo"             self  'h.get("command", "").strip() == "python3 -I " + me' 'h.get("command", "").strip().startswith("python3 -I " + me)'
   mut "selfcheck ignora disableAllHooks"    self  'if s.get("disableAllHooks"):' 'if False:'
-  mut "cwd da sessão não vale no não-sei"  block 'if cands[0] is None:' 'if False:'
+  mut "cwd da sessão não vale no não-sei"  block 'if unsure:  # não sei onde este git roda' 'if False:  # não sei onde este git roda'
   mut "aninhado fundo demais libera"        block '    if res:  # (None, motivo)' '    if False:  # (None, motivo)'
   mut "arquivo sem pathspec conta"          block 'if sub == "checkout" and "--" in rest and rest[rest.index("--") + 1:]:' 'if sub == "checkout" and "--" in rest:'
   mut "mensagem do não-sei some"            block 'não consegui ver em que pasta' 'bloqueado em que pasta'
@@ -274,6 +295,14 @@ PY
   mut "não-sei fora do vivo não conta"      open  'blind.append(op)  # sessão fora do vivo: libera, mas conta' 'pass'
   mut "aninhado fundo fora do vivo não conta" open 'blind.append(op)  # aninhado fundo demais fora do vivo: libera, mas conta' 'pass'
   mut "prefiltro ignora ANSI-C"             block 'if ANSI_C not in cmd and not PREFILTER.search' 'if not PREFILTER.search'
+  mut "--git-dir ilegível não é não-sei (sessão no vivo)" block 'or (gd and gdp is None)' 'or False'
+  mut "--git-dir ilegível fora do vivo não conta"         open  'or (gd and gdp is None)' 'or False'
+  mut "cwd desconhecido com --work-tree conhecido libera" block 'or (not gd and cwd is None)' 'or False'
+  mut "cwd desconhecido com --work-tree fora do vivo não conta" open 'or (not gd and cwd is None)' 'or False'
+  mut "--work-tree fora ignora o cwd do repositório"      block 'cands.append(cwd)' 'pass'
+  mut "cwd conta mesmo com --git-dir"                     pass  'if not gd:  # sem --git-dir' 'if True:  # sem --git-dir'
+  mut "stdin ilegível não grava"                          open  'log("ERROR", "", "stdin: " + str(e)[:100], "")' 'pass'
+  mut "payload que não é objeto não grava"                open  'log("ERROR", "", "stdin: payload não é um objeto", "")' 'pass'
   wait
   for k in $(seq 1 "$mn"); do
     rc=$(cat "$T/rc.$k" 2>/dev/null || echo ausente)
