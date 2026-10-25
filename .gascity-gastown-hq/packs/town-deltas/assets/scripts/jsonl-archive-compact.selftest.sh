@@ -72,6 +72,8 @@ loose_kib()   { git --git-dir="$1/.git" count-objects -v 2>/dev/null | awk '/^si
 pack_count()  { git --git-dir="$1/.git" count-objects -v 2>/dev/null | awk '/^packs:/{print $2}'; }
 commits()     { git --git-dir="$1/.git" rev-list --count HEAD; }
 history()     { git --git-dir="$1/.git" log --format='%H %T' HEAD | shasum | cut -d' ' -f1; }   # every commit id + its tree id
+# git_has_nhv — does the git under test have `repack --name-hash-version` (2.50.1 and 2.54.0 do)? The help text is captured first: a pipe into `grep -q` would end git on SIGPIPE.
+git_has_nhv() { local h; h="$(git repack -h 2>&1)"; case "$h" in *--name-hash-version*) return 0 ;; *) return 1 ;; esac; }
 
 cat > "$WORK/gc-stub" <<EOF
 #!/bin/bash
@@ -149,6 +151,7 @@ run_jac() {
   JAC_PRUNE_TIMEOUT_S="${T_PRUNE_TIMEOUT:-}" JAC_PRUNE_MIN_S="${T_PRUNE_MIN:-}" JAC_MAIL_TIMEOUT_S="${T_MAIL_TIMEOUT:-}" \
   JAC_TAIL_LIMIT_KIB="${T_TAIL:-0}" JAC_TAIL_MAX_OBJECTS="${T_TAIL_OBJS:-}" JAC_TAIL_TIMEOUT_S="${T_TAIL_TIMEOUT:-}" \
   JAC_TAIL_MIN_OBJECTS="${T_TAIL_MIN:-}" JAC_TAIL_RETRY_S="${T_TAIL_RETRY:-}" DOLT_DISK_FLOOR_CRITICAL_GB="${T_CRIT:-}" \
+  JAC_PACK_WINDOW_MEM="${T_WINMEM:-}" JAC_NAME_HASH_VERSION="${T_NHV:-}" \
   JAC_LSOF="${T_LSOF:-}" JAC_RECLAIM_WAIT_S="${T_RECLAIM_WAIT:-}" JAC_PS="${T_PS:-}" JAC_PS_TIMEOUT_S="${T_PS_TIMEOUT:-}" \
   JAW_HOUR="${T_HOUR:-2}" JAW_LOG="${T_WLOG:-$WORK/window.log}" JAW_SWAP_KIB="${T_SWAP:-}" \
   JAW_SECS_OF_DAY="${T_SECS:-}" JAC_NIGHT_GC_MAX_S="${T_NIGHT_MAX:-0}" JAC_NIGHT_MARGIN_S="${T_MARGIN:-}" JAC_GC_PACK_FACTOR="${T_FACTOR:-}" \
@@ -1307,29 +1310,37 @@ echo "=== S34: STRUCTURE — a git step only runs through run_step, so no step c
 # S30 pins the places that DISCARD a failure; this pins the places that RUN a git step. The gate reported the leak for the batch, and on this host's git the gc
 # leaks the same way: three call sites, one rule, and nothing stopped a fourth from being added without it (the fourth, the tail repack of ga-3sf9r8, went through run_step and into the pin). The rule lives in ONE function (run_step: snapshot the temp
 # files, run the step, and after a step that did not end 0 reclaim what it left). git_arch may be called from there and nowhere else; the git seam ($GITBIN) may be used
-# nowhere but in git_arch (a step could otherwise bypass both); the only git run BARE on the repo is the read-only `count-objects`; and the set of steps that go through
+# nowhere but in git_arch and in git_usage, whose one git command is a read-only `<sub> -h` (pinned below; a step could otherwise bypass both); the only git run BARE on the repo is the read-only `count-objects`; and the set of steps that go through
 # run_step is PINNED below.
-lint_steps() {  # lint_steps <file> — "OUTSIDE|<line>|<code>": a git_arch call outside run_step, or $GITBIN used outside git_arch; "BARE|<sub>": a git run bare on the repo; "STEP|<what>": a run_step call site
+lint_steps() {  # lint_steps <file> — "OUTSIDE|<line>|<code>": a git_arch call outside run_step, or $GITBIN used outside git_arch and git_usage; "USAGE|<code>": the $GITBIN line inside git_usage; "BARE|<sub>": a git run bare on the repo; "STEP|<what>": a run_step call site
   awk '
     /^run_step\(\) *\{/ { in_rs = 1; next }
     in_rs && /^\}/ { in_rs = 0; next }
     /^git_arch\(\) *\{/ { in_ga = 1; next }
     in_ga && /^\}/ { in_ga = 0; next }
+    /^git_usage\(\) *\{/ { in_gu = 1; next }
+    in_gu && /^\}/ { in_gu = 0; next }
     /^[ \t]*#/ { next }
     /^GITBIN=/ { next }
-    (!in_rs && !in_ga) && (/(^|[^a-z_])git_arch / || /\$\{?GITBIN/) { printf "OUTSIDE|%d|%s\n", NR, $0 }
+    in_gu && /\$\{?GITBIN/ { printf "USAGE|%s\n", $0; next }
+    (!in_rs && !in_ga && !in_gu) && (/(^|[^a-z_])git_arch / || /\$\{?GITBIN/) { printf "OUTSIDE|%d|%s\n", NR, $0 }
     !in_ga && match($0, /git --git-dir="\$R_GITDIR" [a-z-]+/) { b = substr($0, RSTART, RLENGTH); sub(/.* /, "", b); printf "BARE|%s\n", b }
     /(^|[ \t;])run_step "\$[a-z_]+" / { st = $0; sub(/.*run_step "\$[a-z_]+" /, "", st); sub(/;.*$/, "", st); printf "STEP|%s\n", st }
   ' "$1"
 }
 LS="$(lint_steps "$SCRIPT")"
 [ -n "$(printf '%s\n' "$LS" | grep '^STEP|')" ] && ok "the lint sees the run_step call sites ($(printf '%s\n' "$LS" | grep -c '^STEP|') of them)" || bad "the lint found no run_step call sites — it is not looking"
-[ -z "$(printf '%s\n' "$LS" | grep '^OUTSIDE|')" ] && ok "git_arch is called from run_step only, and the \$GITBIN seam is used in git_arch only" || bad "a git step outside run_step/git_arch (it would skip the leak accounting): $(printf '%s\n' "$LS" | grep '^OUTSIDE|' | cut -c1-120 | tr '\n' ';')"
+[ -z "$(printf '%s\n' "$LS" | grep '^OUTSIDE|')" ] && ok "git_arch is called from run_step only, and the \$GITBIN seam is used in git_arch and git_usage only" || bad "a git step outside run_step/git_arch (it would skip the leak accounting): $(printf '%s\n' "$LS" | grep '^OUTSIDE|' | cut -c1-120 | tr '\n' ';')"
 got_bare="$(printf '%s\n' "$LS" | grep '^BARE|' | cut -d'|' -f2 | sort -u | tr '\n' ',')"
 [ "$got_bare" = "count-objects," ] && ok "the only git run bare on the repo is the read-only count-objects (measure)" || bad "bare git subcommand(s) [$got_bare] — want only count-objects: a git that WRITES must go through run_step"
 got_steps="$(printf '%s\n' "$LS" | grep '^STEP|' | cut -d'|' -f2 | sed 's/ *--quiet.*$//' | tr '\n' ',')"
 want_steps="repack,repack,maintenance run --task=loose-objects,prune-packed,-c gc.autoDetach=false gc,"      # file order: the tail pass (tier 2a) and the room pass (tier 2b, ga-978f1y) are defined above compact_repo
 [ "$got_steps" = "$want_steps" ] && ok "the steps that go through run_step are exactly the pinned five (tail repack, room repack, batch, prune-packed, gc)" || bad "steps differ from the pin — got [$got_steps] want [$want_steps]: read the new/removed step (does it write objects? then it can leak), then update the pin"
+got_usage="$(printf '%s\n' "$LS" | grep '^USAGE|')"
+[ "$got_usage" = 'USAGE|  _bounded 20 "$GITBIN" "$1" -h 2>&1' ] && ok "git_usage runs one git command, the read-only \`<sub> -h\` (bounded to 20 s), and nothing else" || bad "git_usage changed — got [$got_usage]: a help text is the only thing it may ask of git; anything that writes goes through run_step"
+sed 's/"\$1" -h 2>&1/"$1" gc 2>\&1/' "$SCRIPT" > "$WORK/usage-mutant.sh"
+mu="$(lint_steps "$WORK/usage-mutant.sh" | grep '^USAGE|')"
+{ [ -n "$mu" ] && [ "$mu" != "$got_usage" ]; } && ok "the lint bites: a git_usage that runs \`gc\` instead of \`-h\` no longer matches the pin" || bad "lint did not catch a git_usage that runs gc (got [$mu])"
 cp "$SCRIPT" "$WORK/steps-mutant.sh"
 printf '%s\n' 'x="$(git_arch 5 repack 2>&1)"' 'run_step "$t_left" repack --quiet' 'y="$("$GITBIN" gc)"' 'git --git-dir="$R_GITDIR" repack -d' >> "$WORK/steps-mutant.sh"
 MS="$(lint_steps "$WORK/steps-mutant.sh")"
@@ -1750,6 +1761,7 @@ out="$(ARGV_LOG="$WORK/argv" T_GIT="$WORK/git-argv" T_TAIL=300 T_TAIL_OBJS=20 ru
 argv="$(cat "$WORK/argv" 2>/dev/null)"; missing=""
 for w in -a -d -l -f --window=10 --depth=250 --cruft --cruft-expiration=2.weeks.ago; do case " $argv " in *" $w "*) ;; *) missing="$missing $w" ;; esac; done
 case " $argv " in *" --keep-pack=pack-"*) ;; *) missing="$missing --keep-pack=<the base>" ;; esac
+if git_has_nhv; then case " $argv " in *" --name-hash-version=2 "*) ;; *) missing="$missing --name-hash-version=2" ;; esac; fi      # ga-1lr9qp: the tail groups by the FULL path (S43 shows what happens without it)
 { [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ -z "$missing" ] && [ "$(printf '%s\n' "$argv" | grep -c .)" = 1 ]; } \
   && ok "the tail issues ONE repack with -a -d -l -f --window=10 --depth=250 --cruft --cruft-expiration=2.weeks.ago and a --keep-pack for the pack it leaves alone (its EFFECT: -f in K1; --depth=250 has none that a selftest-sized fixture has shown — tried: versions that only append, versions edited in place, strict --window=1 chains; git kept every chain under 31 deep whatever depth was asked — so it rests on the 15/10 production measurement)" \
   || bad "the tail's repack command line is wrong (rc=$rc status=$(last_status), missing:${missing:- none}, calls=$(printf '%s\n' "$argv" | grep -c .)): $argv"
@@ -2208,6 +2220,9 @@ out="$(rrun "$RA")"; rc=$?
 { grep -q -- ' -f ' "$WORK/room-args" && grep -q -- '--cruft' "$WORK/room-args" && grep -q -- ' -a -d -l ' "$WORK/room-args" && [ "$(grep -o 'pack.threads=[0-9]*' "$WORK/room-args" | tail -n 1)" = "pack.threads=1" ] \
   && [ "$(grep -o 'pack.windowMemory=[0-9a-z]*' "$WORK/room-args" | tail -n 1)" = "pack.windowMemory=128m" ] && [ "$(grep -o 'pack.deltaCacheSize=[0-9a-z]*' "$WORK/room-args" | tail -n 1)" = "pack.deltaCacheSize=32m" ]; } \
   && ok "A. the repack recomputes deltas (-f), writes a cruft pack, and the LAST pack.* settings are the lean ones (1 thread, windowMemory 128m, deltaCacheSize 32m)" || bad "A. repack command line wrong: $(cat "$WORK/room-args" 2>/dev/null)"
+if git_has_nhv; then
+  grep -E -q -- ' --name-hash-version=2( |$)' "$WORK/room-args" && printf '%s' "$out" | grep -F -q 'repack name hash: --name-hash-version=2' && ok "A. the room pass groups by the FULL path too (--name-hash-version=2): it recomputes the same hq/ and whatsapp_automation/ comments.jsonl (ga-1lr9qp)" || bad "A. the room pass repack has no --name-hash-version=2: $(cat "$WORK/room-args" 2>/dev/null)"
+fi
 { grep -q 'INSIDE the window' "$WORK/window.log" 2>/dev/null && grep -q 'room pass' "$WORK/window.log" 2>/dev/null; } \
   && ok "A. the window log has the lib's in-window refusal AND the room pass that followed it" || bad "A. window log: $(cat "$WORK/window.log" 2>/dev/null)"
 # B. the lib allows it (T_SWAP=0 takes the swap headroom out of its rule) but the gc's own disk gate — all the packs + the headroom, here 3GiB through the count-objects stand-in against 1GiB+400KiB free — does not: the same pass
@@ -2566,6 +2581,111 @@ deadline="$(sed -n 's/^DEADLINE_S="\${JAC_DEADLINE_S:-\([0-9]*\)}".*/\1/p' "$SCR
 win_s=$(( ( $(sed -n 's/^JAW_END_H="${JAW_END_H:-\([0-9]*\)}".*/\1/p' "$LIB") - $(sed -n 's/^JAW_START_H="${JAW_START_H:-\([0-9]*\)}".*/\1/p' "$LIB") ) * 3600 ))
 { [ "${deadline:-0}" -gt 0 ] && [ "$tsecs" -gt "${deadline:-0}" ] && [ "$win_s" -eq 21600 ] && [ "$tsecs" -gt $(( win_s + 120 )) ]; } && ok "order: timeout ${timeout_s} > script deadline ${deadline}s (it logs its own outcome) and > the ${win_s}s repack window + cleanup (a night gc can last that long)" || bad "order timeout inconsistent (interval=$isecs timeout=$tsecs deadline=${deadline:-?} window=${win_s:-?})"
 [ "$exec_line" = '$PACK_DIR/assets/scripts/jsonl-archive-compact.sh' ] && ok "order: exec points at the script" || bad "order exec is '$exec_line'"
+
+# ── S43. NAME HASH: the tail and the room pass group files by their FULL path (ga-1lr9qp) ─────────────────────────────────────────────────────────────────────────────────────────────────
+# The incident: 515 versions of whatsapp_automation/comments.jsonl sat in the big pack as 11MB deltas against hq/comments.jsonl (5.8GiB), not as ~1KB deltas against the previous WA version. They were made by the
+# tail/room repack (`-f`, WITH names): git's default name hash keeps the last 16 characters of a path, so hq/, whatsapp_automation/ and dc/ comments.jsonl are ONE group, sorted by size; with the window memory
+# below the size of the hq file the search picks the hq file as the base. MEASURED on the real archive, the exact tail command: 3 batch packs 506MiB -> 237MiB (6 WA versions on hq, 79MiB) with git's hash, 179MiB
+# (WA chained, 20MiB) with --name-hash-version=2. Not the cause (each measured): ids without paths, windowMemory 384m/512m, threads=1. Nor is there a config key to set instead: git has no pack.nameHashVersion.
+# The fixture is that archive in miniature: 5 batch packs, each the next version of hq/comments.jsonl (3.1MB) and whatsapp_automation/comments.jsonl (1.5MB, half of its rows copied from the hq file), as JSON
+# rows (random letters in place of the rows do NOT reproduce it — measured), and T_WINMEM=1m so the window is smaller than the hq file the way 256m is smaller than the real 412MB one.
+if ! command -v python3 >/dev/null 2>&1; then skip "S43: no python3 on this host — the name-hash checks did NOT run"
+elif ! git_has_nhv; then skip "S43: this git has no repack --name-hash-version — the name-hash checks did NOT run"
+else
+nhrepo() {  # nhrepo <dir>
+  python3 -I - "$1" <<'PY'
+import json, os, random, subprocess, sys
+repo = sys.argv[1]; HQ, WA, NV = 15000, 7500, 5
+random.seed(7)
+def row(i, tag): return json.dumps({"id": i, "issue": f"{tag}-{i % 977}", "author": f"u{random.randrange(10**6)}", "ts": 1700000000 + i * 37, "body": "".join(random.choice("abcdefghij klmnopqrstuvwxyz0123456789") for _ in range(120))}) + "\n"
+def git(*a): return subprocess.run(["git", "-C", repo, *a], check=True, capture_output=True)
+subprocess.run(["git", "init", "-q", repo], check=True)
+os.makedirs(f"{repo}/hq"); os.makedirs(f"{repo}/whatsapp_automation")
+hq = [row(i, "hq") for i in range(HQ)]
+wa = [hq[random.randrange(HQ)] for _ in range(WA // 2)] + [row(10 ** 6 + i, "wa") for i in range(WA - WA // 2)]
+random.shuffle(wa)
+for v in range(NV):
+    hq += [row(HQ + v * 50 + j, "hq") for j in range(50)]; wa += [row(2 * 10 ** 6 + v * 20 + j, "wa") for j in range(20)]
+    open(f"{repo}/hq/comments.jsonl", "w").writelines(hq); open(f"{repo}/whatsapp_automation/comments.jsonl", "w").writelines(wa)
+    git("add", "-A"); git("-c", "maintenance.auto=false", "-c", "gc.auto=0", "commit", "-q", "-m", f"backup {v}")
+    objs = git("rev-list", "--objects", "--all", "--unpacked").stdout     # freeze exactly this version's new objects into their OWN pack (a batch pack)
+    subprocess.run(["git", "-C", repo, "pack-objects", "-q", ".git/objects/pack/pack"], input=objs, check=True, capture_output=True)
+    git("prune-packed")
+PY
+}
+# wa_shape <dir> — "<WA versions based on a WA version> <based on hq> <whole copies> <KiB on disk>" for whatsapp_automation/comments.jsonl in the biggest pack
+wa_shape() {
+  local d="$1" p; p="$(ls -S "$d"/.git/objects/pack/*.pack | head -n 1)"
+  git --git-dir="$d/.git" rev-list --objects --all | awk 'NF>1' > "$WORK/nh-names"
+  git verify-pack -v "${p%.pack}.idx" | awk -v names="$WORK/nh-names" 'BEGIN { while ((getline l < names) > 0) { split(l, a, " "); n[a[1]] = a[2] } }
+    NF==7 && n[$1] ~ /^whatsapp_automation\// { if (n[$7] ~ /^whatsapp_automation\//) w++; else h++; b += $4 }
+    NF==5 && $2=="blob" && n[$1] ~ /^whatsapp_automation\// { s++; b += $4 }
+    END { printf "%d %d %d %d\n", w, h, s, b / 1024 }'
+}
+# A. the fix: the default (2) chains the WA versions
+NH="$WORK/nh-a"; nhrepo "$NH"; rm -f "$WORK/state.json" "$WORK/log"; NH_PC="$(pack_count "$NH")"; NH_H="$(history "$NH")"; NH_N="$(commits "$NH")"
+out="$(T_TAIL=1 T_TAIL_OBJS=60 T_WINMEM=1m run_tail "$NH")"; rc=$?
+{ [ "$NH_PC" = 5 ] && [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$NH")" = 1 ]; } \
+  && ok "S43 A. 5 batch packs -> ONE (packs $NH_PC -> $(pack_count "$NH")), status consolidated, exit 0" || bad "S43 A. tail pass wrong (packs $NH_PC -> $(pack_count "$NH"), rc=$rc, status=$(last_status)): $out"
+read -r NW NHQ NS NK <<EOF
+$(wa_shape "$NH")
+EOF
+{ [ "${NHQ:-9}" -le 1 ] && [ "${NW:-0}" -ge 3 ]; } \
+  && ok "S43 A. the whatsapp_automation/comments.jsonl versions are CHAINED: $NW on the previous WA version, $NS whole copy, $NHQ on hq (${NK}KiB)" || bad "S43 A. WA versions not chained: on WA=$NW on hq=$NHQ whole=$NS (${NK}KiB)"
+{ [ "$(history "$NH")" = "$NH_H" ] && [ "$(commits "$NH")" = "$NH_N" ] && git --git-dir="$NH/.git" fsck --strict >/dev/null 2>&1; } \
+  && ok "S43 A. history identical (same commit+tree ids), fsck --strict clean" || bad "S43 A. the pass changed or damaged history"
+printf '%s' "$out" | grep -q 'write-bitmap-index' && bad "S43 A. git warned about bitmaps: the pass was asked for bitmaps and the v2 hash together: $out" || ok "S43 A. no bitmap warning (the pass never asks git for bitmaps AND the v2 hash)"
+printf '%s' "$out" | grep -F -q 'repack name hash: --name-hash-version=2' && ok "S43 A. the log says which hash the pass ran with (repack name hash: --name-hash-version=2): the LIVE script can be told from a merged one" || bad "S43 A. the pass did not log the hash it ran with: $out"
+# B. the defect, pinned: the SAME fixture with git's own hash (JAC_NAME_HASH_VERSION=1) puts the WA versions on hq. If this ever stops holding, the fixture no longer reproduces the incident (git changed its
+# default, or the fixture drifted) and A proves nothing — fix the fixture, do not delete B.
+NHB="$WORK/nh-b"; nhrepo "$NHB"; rm -f "$WORK/state.json" "$WORK/log"
+out="$(T_NHV=1 T_TAIL=1 T_TAIL_OBJS=60 T_WINMEM=1m run_tail "$NHB")"; rc=$?
+read -r NW NHQ NS NKB <<EOF
+$(wa_shape "$NHB")
+EOF
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "${NHQ:-0}" -ge 3 ] && [ "${NS:-x}" = 0 ]; } \
+  && ok "S43 B. with git's default hash the WA versions sit on hq/comments.jsonl ($NHQ of 5, ${NKB}KiB vs ${NK}KiB chained): the fixture reproduces the incident" \
+  || bad "S43 B. the fixture does NOT reproduce the incident with JAC_NAME_HASH_VERSION=1 (rc=$rc on WA=$NW on hq=$NHQ whole=$NS ${NKB}KiB): $out"
+# C. 0 = no flag at all (git's default, the same defect); an invalid value is 2 and the log says so; the command line carries exactly what was asked
+TC="$WORK/nh-c"; tailrepo "$TC" 4; rm -f "$WORK/state.json" "$WORK/log" "$WORK/argv"
+out="$(ARGV_LOG="$WORK/argv" T_GIT="$WORK/git-argv" T_NHV=0 T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TC")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ -s "$WORK/argv" ] && ! grep -q -- 'name-hash-version' "$WORK/argv" && printf '%s' "$out" | grep -F -q 'repack name hash: git default hash (no flag passed)'; } \
+  && ok "S43 C. JAC_NAME_HASH_VERSION=0: the repack carries no --name-hash-version at all, and the log says it ran on git's default hash" || bad "S43 C. NHV=0 handled wrong (rc=$rc status=$(last_status)): $(cat "$WORK/argv" 2>/dev/null)"
+TC2="$WORK/nh-c2"; tailrepo "$TC2" 4; rm -f "$WORK/state.json" "$WORK/log" "$WORK/argv"
+out="$(ARGV_LOG="$WORK/argv" T_GIT="$WORK/git-argv" T_NHV=7 T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TC2")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && grep -E -q -- ' --name-hash-version=2( |$)' "$WORK/argv" && printf '%s' "$out" | grep -q "JAC_NAME_HASH_VERSION='7' is not 0, 1 or 2 — using 2" && printf '%s' "$out" | grep -F -q 'repack name hash: --name-hash-version=2'; } \
+  && ok "S43 C. JAC_NAME_HASH_VERSION=7: not 'off, quietly' — the log says it is 2, and the repack carries --name-hash-version=2" || bad "S43 C. NHV=7 handled wrong (rc=$rc status=$(last_status)): $out / $(cat "$WORK/argv" 2>/dev/null)"
+# D. a git WITHOUT the flag (one that predates it): the pass runs as before, no flag is passed, and the log says why — a refused flag would fail every tail pass forever
+cat > "$WORK/git-nonhv" <<'EOF'
+#!/bin/bash
+# a git that predates repack --name-hash-version: the usage of pack-objects (where repack hands the flag) does not list it, and the flag itself is an unknown option
+case " $* " in
+  *" pack-objects -h "*) echo "usage: git pack-objects [-q | --progress | --all-progress] [--all-progress-implied]"; exit 129 ;;
+  *" repack "*) printf '%s\n' "$*" >> "${ARGV_LOG:?}"; case " $* " in *" --name-hash-version"*) echo "error: unknown option \`name-hash-version'" >&2; exit 129 ;; esac ;;
+esac
+exec git "$@"
+EOF
+chmod +x "$WORK/git-nonhv"
+TD="$WORK/nh-d"; tailrepo "$TD" 4; rm -f "$WORK/state.json" "$WORK/log" "$WORK/argv"
+out="$(ARGV_LOG="$WORK/argv" T_GIT="$WORK/git-nonhv" T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TD")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ -s "$WORK/argv" ] && ! grep -q -- 'name-hash-version' "$WORK/argv" && printf '%s' "$out" | grep -q 'this git has no repack --name-hash-version' && printf '%s' "$out" | grep -F -q 'repack name hash: git default hash (no flag passed)'; } \
+  && ok "S43 D. a git without the flag: the tail pass still consolidates (no flag passed) and the log says the flag is missing" || bad "S43 D. old-git road wrong (rc=$rc status=$(last_status)): $out / $(cat "$WORK/argv" 2>/dev/null)"
+# E. a git that CANNOT BE ASKED (no usage text: killed, hung past its bound, not a git): that is not "no flag" — the pass still runs as before without the flag, and the log says it could not read, not that
+# the flag is missing (a hung git is no verdict on its version; the next pass asks again)
+cat > "$WORK/git-blindnhv" <<'EOF'
+#!/bin/bash
+case " $* " in
+  *" pack-objects -h "*) echo "fatal: injected: git could not answer" >&2; exit 1 ;;
+  *" repack "*) printf '%s\n' "$*" >> "${ARGV_LOG:?}" ;;
+esac
+exec git "$@"
+EOF
+chmod +x "$WORK/git-blindnhv"
+TE="$WORK/nh-e"; tailrepo "$TE" 4; rm -f "$WORK/state.json" "$WORK/log" "$WORK/argv"
+out="$(ARGV_LOG="$WORK/argv" T_GIT="$WORK/git-blindnhv" T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TE")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ -s "$WORK/argv" ] && ! grep -q -- 'name-hash-version' "$WORK/argv" && printf '%s' "$out" | grep -q "could not read this git's pack-objects usage" && ! printf '%s' "$out" | grep -q 'this git has no repack' && printf '%s' "$out" | grep -F -q 'repack name hash: git default hash (no flag passed)'; } \
+  && ok "S43 E. a git that cannot be asked: the tail pass still consolidates (no flag passed) and the log says it COULD NOT READ the usage, not that the flag is missing" || bad "S43 E. unreadable-probe road wrong (rc=$rc status=$(last_status)): $out / $(cat "$WORK/argv" 2>/dev/null)"
+fi
 
 echo ""
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL SKIP=$SKIP ==="

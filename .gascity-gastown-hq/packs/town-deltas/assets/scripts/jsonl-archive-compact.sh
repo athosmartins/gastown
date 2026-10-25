@@ -56,6 +56,17 @@
 #      a 378MB pack was born), and tier 2 only fires at 8 packs (there were 3). Repacking just the small packs with -f collapses N seeds into one (synthetic 58MB history, 12 versions:
 #      19s, 1 seed + 11 deltas of ~5KiB, vs 81s for the first loose->pack conversion), needs only the SMALL packs' size free, and its cost is bounded by objects (the delta search),
 #      not by the size of the archive. A pack it grew to the cap is left alone by the next pass (it no longer fits), so history costs one seed per ~120 objects instead of one per batch.
+#      NAME HASH (ga-1lr9qp, 24/10): the repack above must group files by their FULL path (`--name-hash-version=2`), or it undoes itself. git's default hash keeps only the last 16 characters of a
+#      path, so hq/comments.jsonl, whatsapp_automation/comments.jsonl and dc/comments.jsonl all land in ONE group, sorted by size, and the delta search (window 10) then picks the hq file as the base of
+#      the WA versions: 13.5MB of delta each instead of ~1KB against the previous WA version. MEASURED on the real archive (copy on the MBP, the exact tail command, 3 batch packs of 506MiB): default hash ->
+#      237MiB, the 6 WA versions all based on hq (79MiB); --name-hash-version=2 -> 179MiB, the WA versions chained (20MiB, 1 seed), 80s instead of 331s. A second set (3 packs, 602MiB) -> 174MiB, 12 WA
+#      versions chained. Not the cause, each measured: handing the repack only object ids (the tier-1 batch: the WA versions chain there), pack.windowMemory 384m/512m (still hq), threads=1 (still hq).
+#      Nor can a config key do it: git has NO pack.nameHashVersion (`git help -c` on 2.54.0 lists none, and the name is in the binary only as the repack/pack-objects flag). Only the FLAG exists, so
+#      the tail and the room pass pass it (JAC_NAME_HASH_VERSION: 2 default, 1 = git's old hash, 0 = pass nothing); a git without the flag runs the pass as before and says so in the log, and every
+#      pass logs "repack name hash: ..." with what it ran with, so the LIVE script can be told from a merged one. `-c repack.writeBitmaps=false` rides in
+#      git_arch: with bitmaps on (a bare repo's default) git warns "--write-bitmap-index requires --name-hash-version=1" — the two cannot be asked together (seen on the MBP copy, which is bare). The
+#      archive is not bare, so this only guarantees the pass is never asked for both. The consolidating gc takes no such flag (and no config key stands in for it); it does not redo the deltas that
+#      already exist (no -f), so it keeps what the passes above chose.
 #      It never starts while loose bytes are still over the loose limit (`repack -a` would pack those too, an amount of work the object cap does not bound: tier 1 drains them first), nor
 #      while another git process is repacking the repo (ONE REPACKER AT A TIME, below), and it takes a pack only when it can count its objects from the .idx (cruft packs, .keep packs and
 #      packs it cannot read stay kept). Status: `consolidated` when it ended 0 and nothing before it had failed (the tail never overwrites a failure with a green); a pass that did NOTHING (busy,
@@ -128,7 +139,8 @@
 # killer — leaves the temp file of the pack it was writing: objects/pack/tmp_pack_*, partial and read-only. Measured on this host's git 2026-09-27: a killed
 # `maintenance run` leaves it (11.9MB of a 12MB blob in the test, 153MiB in the reviewer's), a killed `gc` leaves it too; git's own prune keeps it two weeks. On the
 # filesystem this script exists to protect, that is one batch pack per cut, and in a big drain every run ends with a cut batch. Three rules, one place each:
-#   1. Every git step goes through run_step (selftest S34 pins it: git_arch is called from there only, the $GITBIN seam is used nowhere but in git_arch, the only git run
+#   1. Every git step goes through run_step (selftest S34 pins it: git_arch is called from there only, the $GITBIN seam is used nowhere but in git_arch and in git_usage (the
+#      one read-only `<sub> -h` that asks what the git can do), the only git run
 #      bare on the repo is the read-only count-objects of measure(), and the set of steps is pinned). It lists the temp files
 #      before the step; after a step that did NOT end 0, the ones that APPEARED during it are that step's leak, and reclaim_leak removes them — only if lsof
 #      positively says no process has any of them open. An lsof that says one is open, no lsof, an lsof that is cut or fails or answers in any way but a clean "nothing
@@ -279,6 +291,8 @@ TAIL_MAX_OBJECTS="${JAC_TAIL_MAX_OBJECTS:-120}"      # ...which takes at most th
 TAIL_TIMEOUT_S="${JAC_TAIL_TIMEOUT_S:-600}"          # per tail pass (a 58MB blob costs ~1.6s per version to re-delta on this host: 120 objects is minutes at most, under load)
 TAIL_WINDOW="${JAC_TAIL_WINDOW:-10}"                 # pack-objects --window: a small window — the versions of one file are neighbours
 TAIL_DEPTH="${JAC_TAIL_DEPTH:-250}"                  # pack-objects --depth: the default (50) leaves one seed per 50 versions (~156 x 12MB on the WA comments); 250 leaves ~31
+NAME_HASH_VERSION="${JAC_NAME_HASH_VERSION:-2}"      # repack --name-hash-version for the tail and the room pass (header, NAME HASH): 2 = group by the full path (the fix); 1 = git's old 16-character hash (the ga-1lr9qp defect — only a test wants it); 0 = pass no flag
+PACK_WINDOW_MEM="${JAC_PACK_WINDOW_MEM:-256m}"       # pack.windowMemory of every git step: the value jsonl-export.sh writes to the repo's config. A seam — the selftest shrinks it so a 3MB fixture meets the same window the real 400MB file does
 TAIL_MIN_OBJECTS="${JAC_TAIL_MIN_OBJECTS:-15}"       # the floor of the adaptive object cap: a cut pass is followed by one with half its objects, never fewer than this (or than the configured max, if that is lower)
 TAIL_RETRY_S="${JAC_TAIL_RETRY_S:-21600}"            # a cap lowered by a cut that leaves no two packs to merge is doubled once this long has passed since the cut (6h)
 DOLT_CRIT_GB="${DOLT_DISK_FLOOR_CRITICAL_GB:-3}"     # Dolt's CRITICAL disk class (dolt-disk-floor-guard.sh: free whole GiB <= this): the tail pass must leave the disk above it. Same variable, same default as the guard (a selftest compares them)
@@ -407,8 +421,46 @@ R_PACK_EXTRA=()      # more `-c` settings for the NEXT git_arch, after the defau
 git_arch() {  # git_arch <seconds> <git args...>   — uses $R_GITDIR and the repo's current batch size $R_BATCH
   local t="$1"; shift
   _bounded "$t" "$GITBIN" --git-dir="$R_GITDIR" \
-    -c pack.threads=2 -c pack.windowMemory=256m -c pack.deltaCacheSize=64m \
+    -c pack.threads=2 -c pack.windowMemory="$PACK_WINDOW_MEM" -c pack.deltaCacheSize=64m -c repack.writeBitmaps=false \
     -c maintenance.loose-objects.batchSize="${R_BATCH:-$BATCH_OBJECTS}" ${R_PACK_EXTRA[@]+"${R_PACK_EXTRA[@]}"} "$@"
+}
+
+# git_usage <subcommand> — what `git <subcommand> -h` prints (stdout and stderr together; git exits 129 for it on every version, so the text is the answer and the exit code is not). It READS: no repo, no
+# object written, so it needs none of run_step's leak accounting. It is the ONE place besides git_arch that uses the $GITBIN seam, and selftest S34 pins that its only git command is this `-h`. 20 s is
+# generous for a help text: a git that hangs here has not answered.
+git_usage() {
+  _bounded 20 "$GITBIN" "$1" -h 2>&1
+}
+
+# nhv_args — sets NHV_ARGS (the repack flag of the tail and the room pass, header NAME HASH). The flag exists only on newer gits (2.50.1 and 2.54.0 have it), so the answer is ASKED of the git that will run, once per run: the usage of
+# pack-objects, because repack only hands the flag to it (its docs say so) and the selftest stubs count every `repack` call, a `repack -h` among them. A git that listed the flag in pack-objects but whose repack refused it
+# would FAIL the pass loudly (status failed), never quietly, and JAC_NAME_HASH_VERSION=0 is the way out. FOUR answers, never two: the git takes the flag (2 or 1 is passed), it does not (usage printed, flag absent: the pass runs as before, the log says so),
+# the git could not be asked (no usage text: the pass runs as before, the log says so, and the NEXT pass asks again — a hung git is not a verdict on its version), or the setting is 0 (nothing is passed, by
+# choice). A bad JAC_NAME_HASH_VERSION is not "off, quietly": it is 2 and the log says so. The text is captured BEFORE it is searched: a pipe into `grep -q` would end git on SIGPIPE and, under pipefail, read as "no".
+NHV_ARGS=(); NHV_PROBED=0; NHV_OK=0
+nhv_args() {
+  local help said
+  NHV_ARGS=()
+  case "$NAME_HASH_VERSION" in
+    0|1|2) ;;
+    *) log "  JAC_NAME_HASH_VERSION='$NAME_HASH_VERSION' is not 0, 1 or 2 — using 2"; NAME_HASH_VERSION=2 ;;
+  esac
+  if [ "$NAME_HASH_VERSION" -ne 0 ] && [ "$NHV_PROBED" -eq 0 ]; then
+    # vazio → git printed nothing: not an answer, so NHV_PROBED stays 0 and the next pass asks again; falhou/ilegível → text that is not a usage (a timeout, a missing git, an error line): the same, and
+    # this pass goes without the flag — what it did before ga-1lr9qp, never a flag the git may refuse
+    help="$(git_usage pack-objects)"
+    case "$help" in
+      *--name-hash-version*) NHV_OK=1; NHV_PROBED=1 ;;
+      *[Uu]sage:*) NHV_OK=0; NHV_PROBED=1; log "  this git has no repack --name-hash-version: the passes keep git's default hash, so hq/ and whatsapp_automation/ comments.jsonl share one group (ga-1lr9qp)" ;;
+      *) NHV_OK=0; log "  could not read this git's pack-objects usage (got: '$(printf '%s' "$help" | head -c 80 | tr '\n' ' ')') — this pass runs without --name-hash-version, the next one asks again (ga-1lr9qp)" ;;
+    esac
+  fi
+  if [ "$NAME_HASH_VERSION" -ne 0 ] && [ "$NHV_OK" -eq 1 ]; then NHV_ARGS=("--name-hash-version=$NAME_HASH_VERSION"); fi
+  # the pass says which hash it runs with: after a merge, this line is how a reader of the log tells the LIVE script from a merely merged one.
+  # (a plain variable, no quote character inside a ${...:-word}: bash 3.2, the shebang's, reads an apostrophe there as the start of a quote and the script no longer parses)
+  said="git default hash (no flag passed)"; [ "${#NHV_ARGS[@]}" -eq 0 ] || said="${NHV_ARGS[0]}"
+  log "  repack name hash: $said"
+  return 0
 }
 
 is_uint() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
@@ -1239,7 +1291,8 @@ tail_pass() {
     WATCH_ON=1; WATCH_FREE_MIN_KIB=$(( TIGHT_FLOOR_KIB + WATCH_SLACK_KIB )); WATCH_SWAP_BASE_KIB="$TIGHT_SWP0"
   fi
   b0="$(date +%s)"
-  run_step "$t_left" repack --quiet -a -d -l -f --window="$TAIL_WINDOW" --depth="$TAIL_DEPTH" --cruft --cruft-expiration=2.weeks.ago ${TAIL_KEEP[@]+"${TAIL_KEEP[@]}"}; out="$STEP_OUT"; rc="$STEP_RC"
+  nhv_args
+  run_step "$t_left" repack --quiet -a -d -l -f --window="$TAIL_WINDOW" --depth="$TAIL_DEPTH" --cruft --cruft-expiration=2.weeks.ago ${NHV_ARGS[@]+"${NHV_ARGS[@]}"} ${TAIL_KEEP[@]+"${TAIL_KEEP[@]}"}; out="$STEP_OUT"; rc="$STEP_RC"
   took=$(( $(date +%s) - b0 ))
   if [ "$tight" -eq 1 ]; then WATCH_ON=0; WATCH_FREE_MIN_KIB=0; WATCH_SWAP_BASE_KIB=0; R_PACK_EXTRA=(); fi
   if [ "$rc" -eq 0 ]; then
@@ -1425,7 +1478,8 @@ room_pass() {
   R_PACK_EXTRA=(-c "pack.threads=$ROOM_THREADS" -c "pack.windowMemory=$ROOM_WINDOW_MEM" -c "pack.deltaCacheSize=$ROOM_DELTA_CACHE")
   WATCH_ON=1; WATCH_FREE_MIN_KIB=$(( floor + WATCH_SLACK_KIB )); WATCH_SWAP_BASE_KIB="$swp0"
   b0="$(date +%s)"
-  run_step "$t_left" repack --quiet -a -d -l -f --window="$TAIL_WINDOW" --depth="$TAIL_DEPTH" --cruft --cruft-expiration=2.weeks.ago ${ROOM_KEEP[@]+"${ROOM_KEEP[@]}"}; out="$STEP_OUT"; rc="$STEP_RC"
+  nhv_args
+  run_step "$t_left" repack --quiet -a -d -l -f --window="$TAIL_WINDOW" --depth="$TAIL_DEPTH" --cruft --cruft-expiration=2.weeks.ago ${NHV_ARGS[@]+"${NHV_ARGS[@]}"} ${ROOM_KEEP[@]+"${ROOM_KEEP[@]}"}; out="$STEP_OUT"; rc="$STEP_RC"
   took=$(( $(date +%s) - b0 ))
   WATCH_ON=0; WATCH_FREE_MIN_KIB=0; WATCH_SWAP_BASE_KIB=0; R_PACK_EXTRA=()
   swp1="$(swap_used_kib)"
