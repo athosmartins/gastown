@@ -103,7 +103,7 @@ ficou 10 min assim (troca 15:40Z → saiu só quando a varredura fechou a sessã
   da troca" de "está ociosa nessa mensagem desde antes" — só diz o que se viu (ociosa no 429, ninguém vai dar um turno a ela). A distinção
   que importa para o degrau destrutivo é feita pelo transcript, abaixo;
 - a mensagem some / vem trabalho depois dela → sai da vigia, sem push; o modal abre → vai para a `limit_watch` (Escape);
-- sessão que terminou, pane que não é mais dela, tmux mudo → "não sei", mantida, nada afirmado; a vigia cai em 1 h (`BANNER_WATCH_S`), o push fica.
+- sessão que terminou sozinha → sai da vigia (o log diz); pane que não é mais dela, tmux mudo, tela num layout não medido (rodapé maior que o medido, por exemplo) → "não sei", mantida, nada afirmado (a impressão e o relógio guardados valem quando o layout volta); a vigia cai em 1 h (`BANNER_WATCH_S`), o push fica.
 O veredito do VERIFY continua `NOT VERIFIED` (uma leitura só não separa atual de velha); o que muda é que agora há vigia que separa.
 **Nenhuma tecla vai para essa tela** (não há modal para responder). Layout que este script não mediu (a caixa `╭─╮ │ > │` antiga, por exemplo)
 continua "não sei" e sem vigia.
@@ -118,7 +118,7 @@ o alias, o mail e o trabalho na fila; o que se perde é a conversa com o provide
 **O que NÃO foi medido:** rodei o `gc session reset` ao vivo? Não — derrubaria uma conversa de verdade; a evidência é o texto do gc e a
 recriação do oracle (que não foi por `reset`). Por isso o degrau nasce desarmado e com chave PRÓPRIA (autorização não é herdada: armar o Escape
 não arma o reset): `touch /Users/athos/gt/.gascity-gastown-hq/.gc/crew-reset-on` (ou `GC_CREW_RESET=1`; `GC_CREW_RESET=0` desarma mesmo com o arquivo).
-Armado, roda `gc --city <cidade> session reset <id>` em UMA sessão por rodada, uma vez por sessão na vida, quando ela está parada há 10 min
+Armado, roda `gc --city <cidade> session reset <id>` em UMA sessão por rodada, uma vez por registro de vigia (sessão que sai e volta numa troca futura é outro episódio, com todas as guardas de novo), quando ela está parada há 10 min
 (banner: impressão da tela igual; modal: Escapes esgotados e 10 min desde que foi achada) e TODOS valem:
 ```
  a mesma lista de contas do Escape (decisão do pool ainda é a conta da troca, não esgotada, default legível e do dono certo, >= 45 s da troca)
@@ -130,7 +130,7 @@ Armado, roda `gc --city <cidade> session reset <id>` em UMA sessão por rodada, 
  · uma leitura nova da tela, imediatamente antes: ainda a mesma impressão (banner) / ainda o modal (modal)
  · `gc session list --json` tem EXATAMENTE uma sessão com `session_name` igual ao tmux da sessão (zero ou duas = não reseta)
 ```
-Contado ANTES de rodar. Se o gc recusa: push `rc-limit-reset-failed`, sem repetir. Se roda: push `rc-limit-reset` dizendo que a conversa NÃO foi preservada.
+Contado ANTES de rodar. Se o gc recusa: push `rc-limit-reset-failed`, sem repetir; sem resposta do gc (timeout) o push diz que o desfecho é DESCONHECIDO (pode ter valido). Armado e parada, uma rodada gasta até 2 × 60 s no gc (list + reset) antes de seguir a troca, com o flock na mão: o tick seguinte pula. Se roda: push `rc-limit-reset` dizendo que a conversa NÃO foi preservada.
 `--dry-run` diz "would run gc session reset for <nome> (<pid>)" e não chama o gc. **Cuidado:** o Mayor também é uma sessão RC — com o reset armado, um
 Mayor parado 10 min nessa tela é resetado como qualquer crew. Alternativa não destrutiva (um nudge para a sessão ociosa, que poderia disparar um turno
 novo) existe mas **não foi medida**, por isso não foi implementada.
