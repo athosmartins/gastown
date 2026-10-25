@@ -101,6 +101,15 @@ b 2 "block: função que faz o checkout, chamada no vivo"                     "f
 ( LCG_ROOTS=""; export LCG_ROOTS; run < <(mk Bash "$LIVE" command "git checkout --detach $SHA"); blocked ); ok $? "block: LCG_ROOTS vazio vale como ausente (raiz padrão)"
 ( LCG_ROOTS="$OUT"; export LCG_ROOTS; run < <(mk Bash "$LIVE" command "git checkout --detach $SHA"); [ "$RC" = 0 ] ); ok $? "block: LCG_ROOTS preenchido troca a lista (o vivo deixa de ser protegido)"
 b 2 "block: git checkout em find -exec no vivo"                             "find $LIVE -maxdepth 0 -exec git checkout --detach $SHA \\;" "$LIVE"
+b 2 "block: git checkout <sha> -- (sem arquivo depois do -- o HEAD MOVE)"   "git checkout $SHA --"
+b 2 "block: git checkout outra-branch -- (idem, nome desambiguado)"         "git checkout feature --"
+b 2 "block: git checkout -b nova <sha> -- arquivo (o git recusa; o guarda não confia nisso)" "git checkout -b nova $SHA -- f"
+b 2 "block: cd \$VAR && git checkout, com a sessão NO vivo (não sei onde roda)" 'cd "$WHERE" && git checkout --detach abc'
+b 2 "block: git -C \$VAR checkout, com a sessão NO vivo"                    'git -C "$WHERE" checkout --detach abc'
+b 2 "block: lançador opaco (flock) na frente do git, sessão NO vivo"        "flock $T/l git checkout --detach $SHA"
+b 2 "block: eval aninhado além do limite do parser, sessão NO vivo"         "eval eval eval eval eval git checkout --detach $SHA"
+run < <(mk Bash "$LIVE" command 'cd "$WHERE" && git checkout --detach abc'); blocked && grep -q 'não consegui ver' "$T/err" && grep -qF "$LIVE" "$T/err"; ok $? "block: o 'não sei' diz que não conseguiu ver a pasta e cita o clone vivo"
+run < <(mk Bash "$LIVE" command "eval eval eval eval eval git checkout --detach $SHA"); blocked && grep -q 'não consegui ver' "$T/err" && grep -qF "eval eval eval eval eval git checkout --detach $SHA" "$T/err"; ok $? "block: o 'não sei' do aninhamento fundo cita o COMANDO (não o motivo interno do parser)"
 fi
 
 if grp pass; then
@@ -112,6 +121,7 @@ b 0 "pass: git -C <vivo> checkout main, de outro cwd"                       "git
 b 0 "pass: cd <vivo> && git switch main"                                    "cd $LIVE && git switch main" "$OUT"
 b 0 "pass: git checkout sem argumento (só mostra o estado)"                 "git checkout"
 b 0 "pass: git checkout -- arquivo (não move o HEAD)"                       "git checkout -- scripts/x.sh"
+b 0 "pass: git -C <worktree> atrás de lançador opaco, sessão no vivo (o -C absoluto resolve)" "flock $T/l git -C $WT checkout --detach $SHA" "$LIVE"
 b 0 "pass: git checkout <sha> -- arquivo (não move o HEAD)"                 "git checkout $SHA -- scripts/x.sh"
 b 0 "pass: git -C <vivo> checkout HEAD -- arquivo"                          "git -C $LIVE checkout HEAD -- f" "$OUT"
 b 0 "pass: git status"                                                      "git status"
@@ -141,6 +151,9 @@ fi
 if grp open; then
 b 0 "open: cd \$VAR && git checkout (diretório que não resolvo)"            'cd "$WHERE" && git checkout --detach abc' "$OUT"
 b 0 "open: git checkout num cwd que não existe e fora do vivo"              "git checkout --detach $SHA" "$T/nao/existe"
+b 0 "open: lançador opaco (flock) com a sessão FORA do vivo → libera"       "flock $T/l git checkout --detach $SHA" "$OUT"
+b 0 "open: eval aninhado além do limite com a sessão FORA do vivo → libera" "eval eval eval eval eval git checkout --detach $SHA" "$OUT"
+b 0 "open: git -C \$VAR checkout com a sessão FORA do vivo → libera"        'git -C "$WHERE" checkout --detach abc' "$OUT"
 run < <(printf 'garbage not json: git checkout --detach'); [ "$RC" = 0 ]; ok $? "open: stdin que não é JSON (rc=$RC)"
 run < /dev/null; [ "$RC" = 0 ]; ok $? "open: stdin vazio (rc=$RC)"
 run < <(printf '{"tool_name":"Bash"}'); [ "$RC" = 0 ]; ok $? "open: Bash sem tool_input (rc=$RC)"
@@ -230,7 +243,7 @@ PY
   mut "main liberado com qualquer flag"     block 'and all(f in QUIET for f in flags)' ''
   mut "flags liberadas inclui --detach"     block 'QUIET = {"-q", "--quiet"}' 'QUIET = {"-q", "--quiet", "--detach", "-f"}'
   mut "-- libera até -b/--detach"           block 'return any(BRANCHY.fullmatch(a) for a in before if a.startswith("-"))' 'return False'
-  mut "modo arquivo sem -- não existe"      pass  'if sub == "checkout" and "--" in rest:' 'if False:'
+  mut "modo arquivo sem -- não existe"      pass  'if sub == "checkout" and "--" in rest and rest[rest.index("--") + 1:]:' 'if False:'
   mut "checkout sem argumento bloqueia"     pass  'if not rest:' 'if False:'
   mut "clone aninhado conta como vivo"      pass  'if os.path.exists(os.path.join(p, ".git")):' 'if p in roots:'
   mut "falha do guarda fecha"               open  'return 0  # falhou' 'return 2  # falhou'
@@ -244,6 +257,10 @@ PY
   mut "selfcheck ignora o if"               self  'set(h) <= {"type", "command", "timeout"}' 'True'
   mut "selfcheck aceita sufixo"             self  'h.get("command", "").strip() == "python3 -I " + me' 'h.get("command", "").strip().startswith("python3 -I " + me)'
   mut "selfcheck ignora disableAllHooks"    self  'if s.get("disableAllHooks"):' 'if False:'
+  mut "cwd da sessão não vale no não-sei"  block 'if cands[0] is None:' 'if False:'
+  mut "aninhado fundo demais libera"        block '    if res:  # (None, motivo)' '    if False:  # (None, motivo)'
+  mut "arquivo sem pathspec conta"          block 'if sub == "checkout" and "--" in rest and rest[rest.index("--") + 1:]:' 'if sub == "checkout" and "--" in rest:'
+  mut "mensagem do não-sei some"            block 'não consegui ver em que pasta' 'bloqueado em que pasta'
   wait
   for k in $(seq 1 "$mn"); do
     rc=$(cat "$T/rc.$k" 2>/dev/null || echo ausente)
