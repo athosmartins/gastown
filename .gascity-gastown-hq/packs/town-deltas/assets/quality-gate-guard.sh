@@ -5226,13 +5226,16 @@ gate_e11_labels_as_wanted() {
 # batch is all-or-nothing) and READS IT BACK from the same store, at most 2 attempts. Prints yes (the read-back shows
 # every label as wanted) | no (the bead was read and the write is not there) | desconhecido (the read-back itself failed).
 # Anything but `yes` means "not confirmed" — the caller must not act as if it had landed. The write's own rc is ignored
-# on purpose: rc 0 proves nothing here and a non-zero rc is settled by the read-back.
+# on purpose: rc 0 proves nothing here and a non-zero rc is settled by the read-back. Its OUTPUT is discarded too, stdout
+# included: every caller reads this function's stdout with $(...) and compares it to `yes`, and a real bd prints
+# "✓ Added labels ..." on stdout — left in, that line rode along in front of the verdict and no write was ever confirmed
+# (ga-pdt6lc: 18 refusals of one bead, every one logged "not confirmed" with bd's success line as the "read-back").
 gate_e11_label_write_verified() {
   local dir="${1:-}" bead="${2:-}" op="${3:-}" labels="${4:-}" want try show st="desconhecido"
   case "$op" in add) want=has ;; remove) want=lacks ;; *) printf 'desconhecido'; return 0 ;; esac
   [ -n "$dir" ] && [ -n "$bead" ] && [ -n "$labels" ] || { printf 'desconhecido'; return 0; }
   for try in 1 2; do
-    bd -C "$dir" label "$op" "$bead" "$labels" 2>/dev/null || true
+    bd -C "$dir" label "$op" "$bead" "$labels" >/dev/null 2>&1 || true
     # vazio/falhou -> show="" -> desconhecido (not confirmed, retried once, never read as "landed")
     show=$(bd -C "$dir" show "$bead" --json 2>/dev/null) || show=""
     st=$(gate_e11_labels_as_wanted "$show" "$want" ${labels//,/ })

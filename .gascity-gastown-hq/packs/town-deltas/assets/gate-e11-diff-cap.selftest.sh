@@ -688,6 +688,17 @@ bd() {
           remove) jq -c --arg l "$labs" '.[0].labels = ((.[0].labels // []) - ($l|split(",")))' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
         esac
       fi
+      # A real bd prints a line on STDOUT when a label write succeeds — "✓ Added labels 'a', 'b' to <id>" is quoted from the
+      # guard log in ga-pdt6lc; the "Removed ... from" wording is the same shape by analogy, not copied from bd. This stub used
+      # to print nothing, so a guard that let that line leak into the $(...) its verdict is read from (ga-pdt6lc:
+      # gate_e11_label_write_verified, `bd label` with only 2>/dev/null) passed every case here while no write was ever
+      # confirmed live.
+      local shown="" l
+      for l in ${labs//,/ }; do shown="${shown:+$shown, }'$l'"; done
+      case "$op" in
+        add)    echo "✓ Added labels $shown to $id" ;;
+        remove) echo "✓ Removed labels $shown from $id" ;;
+      esac
       return 0 ;;
     close)    f="$dir/show-$id.json"
       [ "${E11_STUB_CLOSE_FAILS:-0}" = "1" ] && return 1
@@ -863,6 +874,32 @@ eq "write_verified: a remove that lands → yes" "$(gate_e11_label_write_verifie
 eq "write_verified: ...and the label is really gone" "$(src_has gate:queued)" "false"
 eq "write_verified: removing a label the bead never had → yes (it is not there)" "$(gate_e11_label_write_verified "$SRC_STORE" "$BB" remove gate:needs-human)" "yes"
 eq "write_verified: a batch of two labels lands → yes" "$(gate_e11_label_write_verified "$SRC_STORE" "$BB" add gate:needs-human,gate:e11-refusals:3)" "yes"
+# ga-pdt6lc: the write's own stdout must not reach the verdict. The fake bd prints "✓ Added labels ..." like the real one, and
+# every caller reads the verdict with $(...) and compares it to `yes` — with the line leaking, `yes` never matched and the
+# refusal of ga-yqzedv was logged "not confirmed" 18 times while it sat in gate:queued.
+set_beads "$BB" '["story:approved","gate:queued"]' "$PLAIN"
+eq "stub fidelity: the fake bd prints a success line on stdout when an add returns 0 (as the real bd does)" "$(bd -C "$SRC_STORE" label add "$BB" gate:needs-fix,gate:e11-refusals:1)" "✓ Added labels 'gate:needs-fix', 'gate:e11-refusals:1' to $BB"
+set_beads "$BB" '["story:approved","gate:queued"]' "$PLAIN"
+WV_OUT="$(gate_e11_label_write_verified "$SRC_STORE" "$BB" add gate:needs-fix,gate:e11-refusals:1)"
+eq "write_verified [ga-pdt6lc]: a bd that prints its success line → stdout is EXACTLY the verdict (add)" "$WV_OUT" "yes"
+WV_OUT="$(gate_e11_label_write_verified "$SRC_STORE" "$BB" remove gate:queued)"
+eq "write_verified [ga-pdt6lc]: a bd that prints its success line → stdout is EXACTLY the verdict (remove)" "$WV_OUT" "yes"
+# The same function WITHOUT the redirect (the pre-fix line) must read as "not confirmed" on this stub — otherwise the two cases
+# above would pass on a guard that has the bug. Built from the live function text, so it follows the guard, not a copy.
+WV_LIVE="$(declare -f gate_e11_label_write_verified)"
+WV_MUT="$(printf '%s\n' "$WV_LIVE" | sed 's#> */dev/null 2>&1 || true#2>/dev/null || true#')"
+if [ "$WV_MUT" != "$WV_LIVE" ] && ! printf '%s\n' "$WV_MUT" | grep -q '> */dev/null 2>&1 || true'; then
+  ok "write_verified [ga-pdt6lc]: the mutant (bd label with only 2>/dev/null) was built from the live function"
+else
+  bad "write_verified [ga-pdt6lc]: could not build the mutant from the live function (the bd label line changed shape?)"
+fi
+set_beads "$BB" '["story:approved","gate:queued"]' "$PLAIN"
+WV_MUT_OUT="$( eval "$WV_MUT"; gate_e11_label_write_verified "$SRC_STORE" "$BB" add gate:needs-fix,gate:e11-refusals:1 )"
+if [ "$WV_MUT_OUT" != "yes" ] && [ -n "$WV_MUT_OUT" ]; then
+  ok "write_verified [ga-pdt6lc]: the mutant never reads as confirmed (its stdout is bd's line + the verdict, not 'yes')"
+else
+  bad "write_verified [ga-pdt6lc]: the mutant still reads as 'yes' — this suite would not catch the leak (got '$WV_MUT_OUT')"
+fi
 set_beads "$BB" '["story:approved","gate:queued"]' "$PLAIN"; : > "$CALLS"
 export E11_STUB_DROP="add gate:needs-fix"
 eq "write_verified: an add that returns 0 and persists NOTHING → no" "$(gate_e11_label_write_verified "$SRC_STORE" "$BB" add gate:needs-fix)" "no"
