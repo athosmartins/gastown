@@ -694,9 +694,12 @@ glob_env "$GD"
 ( find() { echo "$GD/x.log"; return 1; }; main ) 2>/dev/null
 [ "$(cksum < "$GD/x.log")" = "$X_SUM" ] && grep -q "FAILED glob-cap: cannot list $GD (rc=1" "$LOG_REAPER_LOG" && grep -q "cap cycle complete: checked=1 capped=0 skipped=0 missing=0 unreadable=0 failed=1 " "$LOG_REAPER_LOG" && ok "find fails mid-listing: the partial list is not used, nothing is cut, counted failed" || bad "find fails: log — $(cat "$LOG_REAPER_LOG")"
 glob_env "$GD"
-# shellcheck disable=SC2329  # overrides the sourced function inside this subshell; _cap_pass calls it
-( _cap_keep_bytes() { echo ""; }; main ) 2>/dev/null
-[ "$(cksum < "$GD/x.log")" = "$X_SUM" ] && grep -q "limits are not usable" "$LOG_REAPER_LOG" && grep -q "cap cycle complete: checked=1 capped=0 skipped=0 missing=0 unreadable=0 failed=1 " "$LOG_REAPER_LOG" && ok "unusable limits: no glob directory is even listed, nothing is cut, the directory is counted failed" || bad "unusable limits (glob): log — $(cat "$LOG_REAPER_LOG")"
+# The listing itself is what must not happen: `find` is replaced by a stub that leaves a marker, because with a
+# usable cap the per-file loop would also refuse every path and the counts alone could not tell the two apart.
+FIND_MARK="$CAPDIR/find.called"
+# shellcheck disable=SC2329  # overrides the sourced function / external find inside this subshell; _cap_pass reaches them
+( _cap_keep_bytes() { echo ""; }; find() { : > "$FIND_MARK"; return 0; }; main ) 2>/dev/null
+[ "$(cksum < "$GD/x.log")" = "$X_SUM" ] && [ ! -e "$FIND_MARK" ] && grep -q "limits are not usable" "$LOG_REAPER_LOG" && grep -q "cap cycle complete: checked=1 capped=0 skipped=0 missing=0 unreadable=0 failed=1 " "$LOG_REAPER_LOG" && ok "unusable limits: no glob directory is even listed (find never called), nothing is cut, the directory is counted failed" || bad "unusable limits (glob): find called=$([ -e "$FIND_MARK" ] && echo yes || echo no) — log — $(cat "$LOG_REAPER_LOG")"
 glob_env ""
 main
 [ "$(cksum < "$GD/x.log")" = "$X_SUM" ] && ! grep -q "glob-cap" "$LOG_REAPER_LOG" && ok "empty LOG_REAPER_GLOB_DIRS: the class is off — no listing, no glob-cap line" || bad "empty glob dirs: log — $(cat "$LOG_REAPER_LOG")"
