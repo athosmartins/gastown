@@ -27,6 +27,10 @@
 #   HOST (ga-bmmxka; MBP_SELFTEST_ONLY=host roda só esta parte): sem MBP_HOST o ssh vai ao nome do Tailscale, nunca ao .local; a LAN só com a porta 22 dela respondendo
 #   e a do Tailscale muda; nada respondeu = Tailscale; MBP_HOST do chamador vale como está e nunca é sondado (a sonda é um stub: nada toca a rede).
 #   MBP_SELFTEST_SKIP=presenca pula a presença (a suíte antiga, sozinha, cabe nos 900 s do prod test do ga-9e2rjh).
+# TETO DE TEMPO DO LADO REMOTO (ga-vg16lk; MBP_SELFTEST_ONLY=teto roda só esta parte): o `timeout` do chamador só mata o ssh LOCAL, e o `bash -s` do outro lado não tem tty (não recebe SIGHUP) e segue —
+#   medido em 25/10: um selftest preso 15 h no nó, 10 GB de /tmp. O stub põe o "remoto" numa sessão própria (perl setsid, como o sshd), senão o `timeout` mataria o grupo inteiro e o defeito não apareceria.
+#   Casos: ssh cortado pelo timeout local ⇒ o trabalho remoto MORRE sozinho (rc 124, nada sobra) · o script remoto, sem ninguém do outro lado, se encerra no próprio teto (rc 124 + aviso) ·
+#   trabalho que ignora TERM leva KILL · execução normal não deixa o relógio do teto para trás · teto = RUN_TIMEOUT + folga (MBP_REMOTE_GRACE_S) · um mutante sem o relógio do teto reprova.
 # NÓ LINUX (ga-zri39b; MBP_SELFTEST_ONLY=node roda só esta parte): a cadeia nó -> MBP -> local com os códigos 96..99 (nó fora, sem RAM, base/venv ausentes, slots cheios,
 #   ssh que cai no meio) e a bandeira própria do nó (independe do mbp-offload.on e da pausa do Athos) · o preflight do nó roda DE VERDADE contra um /proc falso
 #   (MemAvailable, SwapTotal/SwapFree e crescimento, PSI → níveis 1/2/4, disco, núcleos; ilegível ≠ baixo) · SEGURANÇA: o rsync REAL com os argumentos do mbp-run, contra uma árvore
@@ -71,7 +75,17 @@ echo "$name" >> "$STUB_LOG"
 echo "HOSTCALL:$host:$name" >> "$STUB_LOG"
 [ "$name" = DIRECT ] || printf '%s\n' "$s" > "$(dirname "$STUB_LOG")/last-script-$name-$host.sh"
 # HOME falso: a biblioteca de presença e a listagem de tarefas leem $HOME/gt-remote (PAUSE, slots/) no "MBP"
-rexec() { printf '%s\n' "$s" | HOME="$STUB_HOME" PATH="$FAKE:$PATH" STUB_REAL_SLEEP="${1:-0}" "$STUB_REMOTE_BASH" -s -- ${2:-}; }
+rexec() {
+  # STUB_REMOTE_DETACH=1 (ga-vg16lk): o "remoto" nasce numa SESSÃO própria (perl setsid; não há `setsid` no macOS) e a saída dele vai para um arquivo, só repassada se o ssh viver até o fim.
+  # É o que o sshd faz: o `timeout` do chamador só alcança o ssh LOCAL (ele mata o grupo de processos, e o remoto está fora dele), e o canal que fecha não derruba o `bash -s` sem tty.
+  # Sem isso o remoto ficaria no grupo do stub, morreria junto com o timeout e o defeito não apareceria.
+  if [ -n "${STUB_REMOTE_DETACH:-}" ]; then
+    local od rp rrc; od=$(mktemp "$(dirname "$STUB_LOG")/remote-out.XXXXXX")
+    ( printf '%s\n' "$s" | HOME="$STUB_HOME" PATH="$FAKE:$PATH" STUB_REAL_SLEEP="${1:-0}" perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' "$STUB_REMOTE_BASH" -s -- ${2:-} ) >"$od" 2>&1 &
+    rp=$!; wait "$rp"; rrc=$?; cat "$od"; rm -f "$od"; return "$rrc"
+  fi
+  printf '%s\n' "$s" | HOME="$STUB_HOME" PATH="$FAKE:$PATH" STUB_REAL_SLEEP="${1:-0}" "$STUB_REMOTE_BASH" -s -- ${2:-}
+}
 # /proc falso do nó Linux, gerado a cada chamada a partir de STUB_N_* (raiz em $STUB_PROCDIR, passada ao script remoto como 2º argumento)
 mkproc() {
   local d="$STUB_PROCDIR"; mkdir -p "$d/pressure"
@@ -331,6 +345,13 @@ cat "$HOME"/gt-remote/slots/*/info >> "$STUB_SEEN" 2>/dev/null
 # gatilhos de virada RELATIVOS ao início do trabalho (um temporizador do teste correria contra o preflight e o rsync, que numa máquina carregada demoram)
 if [ -n "${STUB_FLIP_STATE:-}" ]; then ( /bin/sleep 1.5; printf '%b' "$STUB_FLIP_STATE" > "$STUB_STATE_FILE" ) </dev/null >/dev/null 2>&1 & fi
 if [ -n "${STUB_FLIP_PAUSE:-}" ]; then ( /bin/sleep 1.5; echo "origem=mbp desde=agora" > "$HOME/gt-remote/PAUSE" ) </dev/null >/dev/null 2>&1 & fi
+# STUB_RUN_HANG=1 (ga-vg16lk): o trabalho nunca termina (laço de sleep de 1 s, como o selftest que ficou 15 h no nó); =term: além disso ignora TERM (só o KILL o derruba).
+# STUB_HANG_PID=<arquivo> recebe o pid: é a prova de que o trabalho chegou a rodar (sem ela, "não sobrou nada" passaria com um trabalho que nem começou).
+if [ -n "${STUB_RUN_HANG:-}" ]; then
+  [ "$STUB_RUN_HANG" = term ] && trap '' TERM
+  [ -z "${STUB_HANG_PID:-}" ] || echo $$ > "$STUB_HANG_PID"
+  while :; do /bin/sleep 1; done
+fi
 /bin/sleep "${STUB_RUN_SLEEP:-0}"
 # espera (limitada: N voltas de 0,5 s) o vigia rebaixar a árvore, em vez de dormir um tempo fixo: numa máquina com load 90 cada ioreg/ps do vigia
 # leva segundos, e um sleep fixo faria o teste medir a carga da máquina, não o rebaixamento
@@ -363,7 +384,7 @@ FLAG_PAUSE="$T/city/.gc/mbp-offload.pause"
 J="$T/city/.gc/logs/mbp-run.jsonl"
 fails=0; n=0
 reset() { : > "$STUB_LOG"; rm -f "$STUB_REAPED" "$J" "$STUB_STATE_FILE" "$STUB_SEEN" "$FLAG_PAUSE" "$T/home/gt-remote/PAUSE"; mkdir -p "$T/home/gt-remote/slots"; find "$T/home/gt-remote/slots" -mindepth 1 -delete 2>/dev/null
-  unset STUB_LOCKED STUB_IDLE_S STUB_HOLD STUB_ASSERT_FAIL STUB_ASSERT_RAW STUB_NCPU STUB_NCPU_FAIL STUB_RSYNC_FAIL_BIN STUB_WAIT_RENICE STUB_RUNMODE STUB_RUN_SLEEP STUB_FLIP_STATE STUB_FLIP_PAUSE STUB_DIRECT_OUT STUB_DIRECT_RC STUB_REAL_SLEEP MBP_FORCE_PRESENCE MBP_MAX_SLOTS MBP_USE_SLOTS MBP_SLOT_MEM_MB MBP_AWAY_IDLE_S MBP_WATCH_S PRESENCE_FORCE_USO PRESENCE_AWAY_S
+  unset STUB_LOCKED STUB_IDLE_S STUB_HOLD STUB_ASSERT_FAIL STUB_ASSERT_RAW STUB_NCPU STUB_NCPU_FAIL STUB_RSYNC_FAIL_BIN STUB_WAIT_RENICE STUB_RUNMODE STUB_RUN_SLEEP STUB_RUN_HANG STUB_HANG_PID STUB_REMOTE_DETACH MBP_RUN_TIMEOUT_S MBP_REMOTE_GRACE_S MBP_REMOTE_KILL_S STUB_FLIP_STATE STUB_FLIP_PAUSE STUB_DIRECT_OUT STUB_DIRECT_RC STUB_REAL_SLEEP MBP_FORCE_PRESENCE MBP_MAX_SLOTS MBP_USE_SLOTS MBP_SLOT_MEM_MB MBP_AWAY_IDLE_S MBP_WATCH_S PRESENCE_FORCE_USO PRESENCE_AWAY_S
   rm -f "$T/city/.gc/hetzner-node.on" "$T/city/.gc/hetzner-mac-only.learned" "$T/city/.gc/logs/hetzner-shadow.jsonl" "$T"/last-script-*-hetzner.sh "$T"/last-script-*-mbp.sh "$T/freeze-sent.txt"
   unset STUB_UNREACHABLE_NODE STUB_UNREACHABLE_MBP STUB_PF_RAW_NODE STUB_NOBASE_NODE STUB_NOVENV_NODE STUB_RUN_RC_NODE STUB_RUN_RC_MBP STUB_RUN_OUT_NODE STUB_RUN_OUT_MBP STUB_RUN_SLEEP_NODE STUB_RUN_SLEEP_MBP \
     STUB_N_MEMINFO_RAW STUB_N_AVAIL_MB STUB_N_SWAPTOTAL_MB STUB_N_SWAPFREE_MB STUB_N_SWAPFREE2_MB STUB_N_PSI_MISSING STUB_N_PSI_RAW STUB_N_PSI_SOME STUB_N_PSI_FULL STUB_N_NPROC STUB_N_NPROC_FAIL STUB_N_DISK_MB STUB_N_DISK_FAIL STUB_N_DISK_RAW \
@@ -1566,9 +1587,108 @@ else bad "detector hq: git ls-files falhou em $HQROOT ($(head -c 200 "$T/git-ls.
 hreset
 }
 
+# ---- TETO DE TEMPO DO LADO REMOTO (ga-vg16lk) ----------------------------------------------------------------------------------
+# O `timeout` do run_remote só mata o ssh LOCAL; o `bash -s` do outro lado não tem tty (não recebe SIGHUP) e segue sozinho. O STUB_REMOTE_DETACH do stub põe o "remoto" fora do grupo do
+# timeout, como o sshd; o que se confere é o HOST (pgrep pelo token na linha de comando do trabalho), não o rc do chamador — o rc 124 sai igual com ou sem o teto remoto.
+teto_wait_file() { local f="$1" lim="$2" k=0; while [ ! -s "$f" ] && [ "$k" -lt $((lim*2)) ]; do /bin/sleep 0.5; k=$((k+1)); done; }
+teto_kill() { local p; for p in $(pgrep -f -- "$1" 2>/dev/null); do kill -KILL "$p" 2>/dev/null; done; }   # por PID, nunca pkill: o guard das sessões do Gas Town o barra (e o 2>/dev/null esconderia o bloqueio)
+teto_gone() { # token limite-s: espera o trabalho com <token> na linha de comando sumir; diz gone, ou vivo (e o derruba, para o teste não deixar lixo)
+  local tok="$1" lim="$2" k=0
+  while pgrep -f -- "$tok" >/dev/null 2>&1; do
+    k=$((k+1)); [ "$k" -le $((lim*2)) ] || { teto_kill "$tok"; echo vivo; return 0; }
+    /bin/sleep 0.5
+  done
+  echo gone
+}
+teto_remote() { # script limite-s [VAR=valor...]: roda o script RUN guardado pelo stub como o sshd o roda (bash -s, sem tty, sem ninguém do outro lado); "rc:segundos" (999 = não terminou no limite e foi derrubado)
+  local sc="$1" lim="$2" k=0 t0=$SECONDS rp rrc; shift 2
+  env HOME="$T/home" PATH="$FAKE:$PATH" STUB_REAL_SLEEP=1 "$@" "$STUB_REMOTE_BASH" -s < "$sc" >"$T/teto.out" 2>&1 &
+  rp=$!
+  while kill -0 "$rp" 2>/dev/null; do
+    k=$((k+1)); [ "$k" -le $((lim*2)) ] || { kill -TERM "$rp" 2>/dev/null; wait "$rp" 2>/dev/null; echo "999:$((SECONDS-t0))"; return 0; }
+    /bin/sleep 0.5
+  done
+  wait "$rp"; rrc=$?; echo "$rrc:$((SECONDS-t0))"
+}
+teto_cases() {
+echo "--- teto de tempo do lado remoto (ga-vg16lk)"
+local hp="$T/hang.pid" rc o SCRIPT XSCRIPT
+SCRIPT="$(dirname "$STUB_LOG")/last-script-RUN.sh"; XSCRIPT="$(dirname "$STUB_LOG")/last-script-EXEC.sh"
+treset() { reset; rm -f "$SCRIPT" "$XSCRIPT" "$hp"; }   # o script guardado pelo stub é apagado: uma recusa antes do ssh não pode reaproveitar o de um caso anterior
+rm -f "$NODEFLAG"; date > "$FLAG"
+# A. o caso do defeito: o timeout LOCAL corta o ssh; o trabalho remoto (sessão própria, nunca recebe o sinal) tem de morrer SOZINHO pelo teto remoto (RUN_TIMEOUT 3 + folga 2)
+treset
+rc=$(STUB_REMOTE_DETACH=1 STUB_HANG_PID="$hp" STUB_RUN_HANG=1 STUB_RUNMODE=exec MBP_RUN_TIMEOUT_S=3 MBP_REMOTE_GRACE_S=2 MBP_REMOTE_KILL_S=1 runs -- tests/test_x.py -k gc-teto-a)
+expect "ssh cortado pelo timeout local: o chamador recebe rc 124" 124 "$rc"
+teto_wait_file "$hp" 15
+if [ -s "$hp" ]; then ok "…o trabalho preso chegou a rodar (pid $(cat "$hp"))"; else bad "…o trabalho preso nem chegou a rodar (sem pid em $hp): o caso não prova nada"; fi
+eq "…e depois do teto remoto não sobra processo dele no host" gone "$(teto_gone gc-teto-a 20)"
+# B. sem ninguém do outro lado (o script roda como o sshd o deixa): se encerra no teto, rc 124, e avisa
+treset; MBP_RUN_TIMEOUT_S=2 MBP_REMOTE_GRACE_S=1 MBP_REMOTE_KILL_S=1 runs -- tests/test_x.py -k gc-teto-b >/dev/null
+o=$(teto_remote "$SCRIPT" 12 STUB_HANG_PID="$hp" STUB_RUN_HANG=1)
+eq "script remoto sem chamador: encerra sozinho no teto e dá rc 124" 124 "${o%%:*}"
+if [ "${o##*:}" -ge 3 ] && [ "${o##*:}" -lt 12 ]; then ok "…no teto (2 + 1 s), nem antes nem muito depois (${o##*:}s)"; else bad "…fora do teto de 3 s: ${o##*:}s"; fi
+if [ -s "$hp" ]; then ok "…o trabalho preso chegou a rodar"; else bad "…o trabalho preso nem chegou a rodar: o caso não prova nada"; fi
+has "…e avisa na saída" "$T/teto.out" '^\[mbp-run:timeout\]'
+eq "…e nada do trabalho sobra" gone "$(teto_gone gc-teto-b 5)"
+# C. trabalho que IGNORA TERM: leva KILL depois da folga
+treset; MBP_RUN_TIMEOUT_S=2 MBP_REMOTE_GRACE_S=1 MBP_REMOTE_KILL_S=1 runs -- tests/test_x.py -k gc-teto-c >/dev/null
+o=$(teto_remote "$SCRIPT" 14 STUB_HANG_PID="$hp" STUB_RUN_HANG=term)
+eq "trabalho que ignora TERM: encerrado do mesmo jeito, rc 124" 124 "${o%%:*}"
+eq "…e o KILL não deixa nada dele no host" gone "$(teto_gone gc-teto-c 5)"
+# D. execução normal: rc intacto e o relógio do teto não fica para trás (número de sleep único: RUN_TIMEOUT 3611 + folga 7)
+treset; rc=$(STUB_RUNMODE=exec MBP_RUN_TIMEOUT_S=3611 MBP_REMOTE_GRACE_S=7 runs -- tests/test_x.py -k gc-teto-d)
+expect "execução normal, teto folgado: rc 0" 0 "$rc"
+if pgrep -f 'sleep 3618' >/dev/null 2>&1; then bad "…o relógio do teto (sleep 3618) ficou para trás"; teto_kill 'sleep 3618'; else ok "…nenhum relógio do teto fica para trás"; fi
+treset; rc=$(STUB_RUNMODE=exec STUB_RUN_RC=7 MBP_RUN_TIMEOUT_S=3612 MBP_REMOTE_GRACE_S=7 runs -- tests/test_x.py -k gc-teto-d2)
+expect "…e o rc do trabalho continua passando (7)" 7 "$rc"; teto_kill 'sleep 3619'
+# E. a conta do teto: RUN_TIMEOUT + folga; folga/KILL inválidos, RUN_TIMEOUT que não é número ou é 0 caem no padrão (o teto remoto nunca desliga)
+treset; MBP_RUN_TIMEOUT_S=100 MBP_REMOTE_GRACE_S=25 MBP_REMOTE_KILL_S=4 runs -- tests/test_x.py >/dev/null
+has "teto remoto = RUN_TIMEOUT + folga (100 + 25)" "$SCRIPT" '^MBP_DEADLINE_S=125$'; has "…e o prazo entre TERM e KILL" "$SCRIPT" '^MBP_KILL_S=4$'
+treset; runs -- tests/test_x.py >/dev/null
+has "padrão: 3600 + 60" "$SCRIPT" '^MBP_DEADLINE_S=3660$'; has "…e KILL depois de 10 s" "$SCRIPT" '^MBP_KILL_S=10$'
+treset; MBP_REMOTE_GRACE_S=abc MBP_REMOTE_KILL_S=0 runs -- tests/test_x.py >/dev/null
+has "folga que não é número: padrão (60)" "$SCRIPT" '^MBP_DEADLINE_S=3660$'; has "…KILL 0 não vale: padrão (10)" "$SCRIPT" '^MBP_KILL_S=10$'
+treset; MBP_RUN_TIMEOUT_S=0 runs -- tests/test_x.py >/dev/null
+has "RUN_TIMEOUT 0 (o timeout local desliga): o remoto não desliga junto, base 3600" "$SCRIPT" '^MBP_DEADLINE_S=3660$'
+treset; MBP_RUN_TIMEOUT_S=30m runs -- tests/test_x.py >/dev/null
+has "RUN_TIMEOUT com sufixo (30m): base 3600" "$SCRIPT" '^MBP_DEADLINE_S=3660$'
+# --exec (REA/APK) usa o mesmo supervisor: o teto vale lá também
+treset; printf '#!/usr/bin/env bash\nexit 0\n' > "$T/bin/fakecmd"; chmod +x "$T/bin/fakecmd"; MBP_RUN_TIMEOUT_S=100 MBP_REMOTE_GRACE_S=25 "$RUN" --exec -- "$T/bin/fakecmd" >/dev/null 2>&1
+has "--exec: o script mandado leva o mesmo teto (100 + 25)" "$XSCRIPT" '^MBP_DEADLINE_S=125$'
+}
+# controles negativos: cada mutante tira UMA peça do teto (marcadores `# teto:` em mbp-run.sh) e TEM de voltar ao defeito
+neg_teto() {
+  echo "--- controles negativos (teto remoto)"
+  local hp="$T/hang.pid"
+  cp "$HERE/mbp-presence.sh" "$T/mbp-presence.sh"; cp "$HERE/mbp-controle.sh" "$T/mbp-controle.sh"; cp "$HERE/mbp-host.sh" "$T/mbp-host.sh"
+  rm -f "$NODEFLAG"; date > "$FLAG"
+  sm_teto_hang() { # modo-do-trabalho token real|mut: "rc:estado" do script remoto com um trabalho que não termina (a mutante tira uma peça do teto)
+    reset; rm -f "$hp" "$(dirname "$STUB_LOG")/last-script-RUN.sh"; local s=$RUN o; [ "$3" = mut ] && s="$T/mut.sh"
+    MBP_RUN_TIMEOUT_S=2 MBP_REMOTE_GRACE_S=1 MBP_REMOTE_KILL_S=1 runx "$s" tests/test_x.py -k "$2" >/dev/null
+    o=$(teto_remote "$(dirname "$STUB_LOG")/last-script-RUN.sh" 9 STUB_HANG_PID="$hp" STUB_RUN_HANG="$1")
+    echo "${o%%:*}:$(teto_gone "$2" 1)"
+  }
+  sm_teto_relogio() { sm_teto_hang 1 gc-teto-m1 "$1"; }
+  sm_teto_kill()    { sm_teto_hang term gc-teto-m2 "$1"; }
+  sm_teto_limpa() { reset; local s=$RUN; [ "$1" = mut ] && s="$T/mut.sh"
+    STUB_RUNMODE=exec MBP_RUN_TIMEOUT_S=3613 MBP_REMOTE_GRACE_S=7 runx "$s" tests/test_x.py -k gc-teto-m3 >/dev/null
+    if pgrep -f 'sleep 3620' >/dev/null 2>&1; then teto_kill 'sleep 3620'; echo relogio-sobrou; else echo limpo; fi; }
+  # cada mutante tem de ao menos passar no parse: sintaxe quebrada faria o script remoto nem rodar e o controle reprovaria pela razão errada
+  local m_relogio='/# teto:relogio$/d' m_kill='/# teto:kill$/d' m_limpa='s/mbp_kill_tree "\$MBP_DEADLINE_W"   # teto:limpa$/true/' m   # a 3ª troca por `true`, não apaga: um `else` vazio não passa do parse
+  for m in "$m_relogio" "$m_kill" "$m_limpa"; do
+    sed -e "$m" "$RUN" > "$T/mut-parse.sh"
+    if bash -n "$T/mut-parse.sh" 2>/dev/null && ! cmp -s "$RUN" "$T/mut-parse.sh"; then ok "mutante ($m) muda o script e passa no parse"; else bad "mutante ($m) não muda o script, ou não passa no parse"; fi
+  done
+  mut_compare "teto: sem o relógio do teto (o defeito original)" "124:gone" sm_teto_relogio "$RUN" "$m_relogio" "$T/mut.sh"
+  mut_compare "teto: sem o KILL (trabalho que ignora TERM sobrevive)" "124:gone" sm_teto_kill "$RUN" "$m_kill" "$T/mut.sh"
+  mut_compare "teto: o relógio não é recolhido ao fim normal" "limpo" sm_teto_limpa "$RUN" "$m_limpa" "$T/mut.sh"
+}
+
 if [ -n "${MBP_SELFTEST_ONLY:-}" ]; then
   date > "$FLAG"
   case "$MBP_SELFTEST_ONLY" in
+    teto) teto_cases; neg_teto ;;
     presenca) presenca_cases; neg_presenca ;;
     chave) chave_cases ;;
     node) node_cases ;;
@@ -1783,5 +1903,6 @@ if [ "${MBP_SELFTEST_SKIP:-}" != presenca ]; then
 fi
 host_cases
 node_cases
+teto_cases; neg_teto
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

@@ -123,6 +123,13 @@ WATCH_S=$(num_or "${MBP_WATCH_S:-5}" 5)            # intervalo do vigia que reba
 [ "$WATCH_S" -ge 1 ] || WATCH_S=5
 SLOT_MAX_AGE=${MBP_SLOT_MAX_AGE_S:-14400}
 RUN_TIMEOUT=${MBP_RUN_TIMEOUT_S:-3600}
+# Teto de tempo DO LADO REMOTO (ga-vg16lk). O `timeout` do run_remote só mata o ssh LOCAL; o `bash -s` do outro lado não tem tty (não recebe SIGHUP) e seguia sozinho: um selftest ficou 15 h no nó, 1 núcleo e 10 GB de /tmp.
+# O script remoto agora leva o próprio prazo: RUN_TIMEOUT + folga (o `timeout` local dispara primeiro e dá o rc 124 de sempre; o remoto é a rede de segurança) e, depois do TERM, o KILL após MBP_KILL_S.
+# RUN_TIMEOUT que não é número >= 1 (vazio, texto, sufixo como 30m, 0 = "sem teto" do `timeout`) conta como 3600: o teto remoto nunca desliga. Folga: inteiro >= 0 (padrão 60); KILL: inteiro >= 1 (padrão 10).
+REMOTE_GRACE_S=$(num_or "${MBP_REMOTE_GRACE_S:-}" 60)
+REMOTE_KILL_S=$(num_or "${MBP_REMOTE_KILL_S:-}" 10); REMOTE_KILL_S=$(( 10#$REMOTE_KILL_S )); [ "$REMOTE_KILL_S" -ge 1 ] || REMOTE_KILL_S=10
+DEADLINE_BASE=$(num_or "$RUN_TIMEOUT" 3600); [ "$DEADLINE_BASE" -ge 1 ] || DEADLINE_BASE=3600
+REMOTE_DEADLINE_S=$(( 10#$DEADLINE_BASE + 10#$REMOTE_GRACE_S ))
 SSH_BIN=${MBP_SSH:-ssh}
 umask 077
 mkdir -p "$HOME/.ssh/cm" 2>/dev/null && chmod 700 "$HOME/.ssh/cm" 2>/dev/null   # sockets do ssh ficam num dir privado, nunca em /tmp (mbp-sec 11/10)
@@ -470,6 +477,19 @@ remote_supervisor() {
 MBP_BG=""; MBP_NICE=10
 mbp_tree() { ps -A -o pid=,ppid= 2>/dev/null | awk -v r="$1" '{ pp[$1] = $2 } END { out[r] = 1; ch = 1; while (ch) { ch = 0; for (p in pp) if (!(p in out) && (pp[p] in out)) { out[p] = 1; ch = 1 } } for (p in out) print p }'; }
 mbp_kill_tree() { local t; t=$(mbp_tree "$1"); [ -z "$t" ] || kill $t 2>/dev/null; return 0; }
+# O relógio do teto (ga-vg16lk): dorme até MBP_DEADLINE_S e, se o trabalho ainda vive, deixa o aviso em arquivo (como o vigia, roda sem stdout), manda TERM à árvore e, passados MBP_KILL_S,
+# KILL aos que ignoraram o TERM. A lista é tirada ANTES do TERM: quem perde o pai quando ele morre vai para o pid 1 e sumiria de uma segunda caminhada. Os padrões abaixo impedem `sleep ""`,
+# que falha na hora e derrubaria o trabalho no primeiro segundo.
+mbp_deadline() {
+  local job=$1 t
+  sleep "${MBP_DEADLINE_S:-3660}"
+  kill -0 "$job" 2>/dev/null || return 0
+  echo "${MBP_DEADLINE_S:-3660}" > "$MBP_TIMEDOUT" 2>/dev/null
+  t=$(mbp_tree "$job"); kill $t 2>/dev/null
+  sleep "${MBP_KILL_S:-10}"
+  kill -KILL $t $(mbp_tree "$job") 2>/dev/null   # teto:kill
+  return 0
+}
 mbp_demote() {
   local p
   for p in $(mbp_tree "$1"); do
@@ -498,6 +518,7 @@ mbp_watch() {
 }
 mbp_supervise() {
   MBP_DEMOTED="${TMPDIR:-/tmp}/gascity-demoted.$$"; rm -f "$MBP_DEMOTED"
+  MBP_TIMEDOUT="${TMPDIR:-/tmp}/gascity-timeout.$$"; rm -f "$MBP_TIMEDOUT"
   presence_eval
   MBP_STARTED_CALM=1
   if ! mbp_calm; then MBP_STARTED_CALM=0; MBP_NICE=19; command -v taskpolicy >/dev/null 2>&1 && MBP_BG="taskpolicy -b"; fi
@@ -505,11 +526,20 @@ mbp_supervise() {
   MBP_JOB=$!
   mbp_watch "$MBP_JOB" >/dev/null 2>&1 </dev/null &
   MBP_WATCHER=$!
-  trap 'mbp_kill_tree "$MBP_JOB"; mbp_kill_tree "$MBP_WATCHER"; rm -f "$MBP_DEMOTED"; exit 143' HUP TERM INT
+  mbp_deadline "$MBP_JOB" >/dev/null 2>&1 </dev/null & MBP_DEADLINE_W=$!   # teto:relogio
+  trap 'mbp_kill_tree "$MBP_JOB"; mbp_kill_tree "$MBP_WATCHER"; mbp_kill_tree "$MBP_DEADLINE_W"; rm -f "$MBP_DEMOTED" "$MBP_TIMEDOUT"; exit 143' HUP TERM INT
   wait "$MBP_JOB"; MBP_RC=$?
   mbp_kill_tree "$MBP_WATCHER"
+  if [ -e "$MBP_TIMEDOUT" ]; then
+    # o relógio disparou: ele ainda pode estar na espera do KILL (um descendente que ignorou o TERM sobrevive à morte do trabalho); deixa-o terminar, não o recolhe
+    wait "$MBP_DEADLINE_W" 2>/dev/null
+    echo "[mbp-run:timeout] o trabalho passou do teto de ${MBP_DEADLINE_S:-3660}s no lado remoto (RUN_TIMEOUT + folga) — a árvore dele foi encerrada (TERM; KILL após ${MBP_KILL_S:-10}s para quem ignorou)"
+    MBP_RC=124
+  else
+    mbp_kill_tree "$MBP_DEADLINE_W"   # teto:limpa
+  fi
   if [ -s "$MBP_DEMOTED" ]; then echo "[mbp-run:demoted] $(cat "$MBP_DEMOTED"): os processos desta execução foram para prioridade de fundo"; fi
-  rm -f "$MBP_DEMOTED"
+  rm -f "$MBP_DEMOTED" "$MBP_TIMEDOUT"
   exit "$MBP_RC"
 }
 EOF
@@ -518,7 +548,7 @@ EOF
 # $1 = marcador (RUN|EXEC), $2 = texto que define `job` e chama `mbp_supervise job`. Deixa o rc do ssh em RC e a saída em $TMPOUT.
 run_remote() {
   local script
-  script=$(remote_header "$1"; remote_supervisor; printf '%s\n' "$2")
+  script=$(remote_header "$1"; printf 'MBP_DEADLINE_S=%s\nMBP_KILL_S=%s\n' "$REMOTE_DEADLINE_S" "$REMOTE_KILL_S"; remote_supervisor; printf '%s\n' "$2")
   timeout "$RUN_TIMEOUT" "$SSH_BIN" $SSH_OPTS "$MBP_HOST" bash -s 2>&1 <<<"$script" | tee "$TMPOUT"
   RC=${PIPESTATUS[0]}
   DEMOTED=0; grep -q '^\[mbp-run:demoted\]' "$TMPOUT" 2>/dev/null && DEMOTED=1
