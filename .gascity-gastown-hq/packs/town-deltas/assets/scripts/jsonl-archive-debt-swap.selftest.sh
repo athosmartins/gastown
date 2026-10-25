@@ -186,5 +186,16 @@ newfix; sed -i.bak '/^NEED_MB=/d' "$F/art/manifest.env"
 swap; check "T16 sem NEED_MB: rc 0" "$RC" 0
 grep -q "AVISO: NEED_MB ausente" "$F/out.txt" && ok "T16 avisa que não pré-checou o espaço" || bad "T16 avisa que não pré-checou o espaço"
 
+# ── T17 o fsck com P escondido reprova (rc != 0, ou rc 0 mas dizendo "missing"): rollback, P de volta ──
+newfix; printf '#!/bin/sh\ncase "$*" in *fsck*) echo "missing blob 0123456789abcdef0123456789abcdef01234567"; exit 2 ;; esac\nexec git "$@"\n' > "$F/failfsck"; chmod +x "$F/failfsck"
+swap JDS_GIT="$F/failfsck"
+check "T17 fsck rc 2: rc 30 (rollback feito)" "$RC" 30
+untouched && ok "T17 rollback: P de volta, nenhum pack novo, sem staging/hold" || bad "T17 rollback restaurou o estado"
+grep -q "fsck(rc=2)" "$F/out.txt" && ok "T17 motivo: fsck(rc=2)" || bad "T17 motivo: fsck(rc=2)"
+newfix; printf '#!/bin/sh\ncase "$*" in *fsck*) echo "missing blob 0123456789abcdef0123456789abcdef01234567"; exit 0 ;; esac\nexec git "$@"\n' > "$F/saysmissing"; chmod +x "$F/saysmissing"
+swap JDS_GIT="$F/saysmissing"
+check "T17b fsck rc 0 mas diz 'missing': rc 30 (rollback feito)" "$RC" 30
+untouched && ok "T17b rollback: P de volta" || bad "T17b rollback: P de volta"
+
 echo "---"; echo "passou $PASS, falhou $FAIL"
 [ "$FAIL" -eq 0 ]
