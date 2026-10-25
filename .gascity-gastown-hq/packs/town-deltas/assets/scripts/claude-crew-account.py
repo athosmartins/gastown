@@ -130,8 +130,8 @@ S_LIMIT, S_BANNER, S_CLEAR, S_UNKNOWN = "limit", "banner", "clear", "unknown"
 TMUX_FIELD_RE = re.compile(r"[A-Za-z0-9_.-]{1,80}:@\d+\.(%\d+)")   # the `tmux` field of a session file: <session>:@<window>.%<pane>
 SOCKET_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 BANNER_RE = re.compile(r"hit your\b.{0,40}\blimit\b", re.I)         # "You've hit your weekly limit · resets 8pm"
-# the same message as a LINE of its own (any glyph before it, nothing but the message after the glyph): a sentence of an agent that
-# merely mentions it does not start with it
+# the same message as the START of a line: only non-word characters (the glyph, spaces) may come before it, anything may follow. A
+# sentence of an agent that merely mentions the message starts with a word, so it does not match
 STOP_MSG_RE = re.compile(r"^[^\w]*you['’]ve hit your\b.{0,40}\blimit\b", re.I)
 RULE_RE = re.compile(r"^─{10,}$")                                    # the rules around claude's prompt box (2.1.310)
 TMUX_SESSION_RE = re.compile(r"([A-Za-z0-9_.-]{1,80}):@\d+\.%\d+")     # the session-name half of the `tmux` field
