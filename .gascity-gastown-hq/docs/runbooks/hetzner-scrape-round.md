@@ -20,7 +20,7 @@ A rodada diária dos raspadores (`com.scrapers.daily`, 00:01, `runner.py --scrap
 | `bonsucesso` | 10 tentados, 0 erro | permitido |
 | `imoview` (decisao, valore) | 20 de 20 cada, em 22 s e 24 s | permitido (homes de todos os tenants ativos respondem igual) |
 | `quintoandar` | 10 arquivos, 0 erro | permitido com `--limit`; **bloqueado em escala cheia por custo** (17/10, ver a seção seguinte) |
-| `loft` (`--use-api`) | 30 de 30; a API de condomínios devolve 429 após ~15 chamadas e o raspador a desliga no meio da rodada | ~~permitido~~ **bloqueado em 18/10** (ver a nota abaixo) |
+| `loft` (`--use-api`) | 30 de 30; a API de condomínios devolve 429 após ~15 chamadas e o raspador a desliga no meio da rodada | ~~permitido~~ ~~bloqueado em 18/10~~ **permitido de novo em 25/10** (ver a nota abaixo) |
 | `silvioximenes` | 10 de 10 | permitido |
 | `anuar_donato` | 40 raspados (21 novos), 0 erro | permitido |
 | `zap_vivareal` (+`_contagem`) | **403 em toda chamada de listagem da glue-api; 0 arquivo em 120 s** | **bloqueado** (é a maior do mini: ~4400 s) |
@@ -45,7 +45,7 @@ Bead ga-qeqxsb. Os 11 liberados rodaram **sem `--limit`**, juntos (11 `run` em p
 | `bonsucesso` | 2124 s | 2252 s | 952 / 941 | 941 (100%; +11) | 0 | permitido |
 | `oksite` | 404 s | 573 s | 804 / 805 | 804 (99,9%) | 0 | permitido |
 | `primeimoveisdeluxo` | 464 s | 437 s | 28 / 28 | 28 (100%) | 0 | permitido |
-| `loft` (`--use-api`) | 201 s | 167 s | 9347 / 9369 | 9099 (97,1%) | API de condomínios devolve 429 e o raspador a desliga, igual no mini (linhas "condomínio DESLIGADO" em 17/10: mini 14, nó 15) | ~~permitido~~ **bloqueado em 18/10** (ver a nota abaixo) |
+| `loft` (`--use-api`) | 201 s | 167 s | 9347 / 9369 | 9099 (97,1%) | API de condomínios devolve 429 e o raspador a desliga, igual no mini (linhas "condomínio DESLIGADO" em 17/10: mini 14, nó 15) | ~~permitido~~ ~~bloqueado em 18/10~~ **permitido de novo em 25/10** (ver a nota abaixo) |
 | `silvioximenes` | 158 s | 138 s | 549 / 549 | 549 (100%) | 0 | permitido |
 | `quintoandar` | **3146 s** | **193 s** | 9688 / 9986 | 9370 (93,8%) | 25 × 503 (o mini teve 1 erro de anúncio, de qualquer status); **0** × 403/429 | **bloqueado por custo** |
 
@@ -60,6 +60,8 @@ Bead ga-qeqxsb. Os 11 liberados rodaram **sem `--limit`**, juntos (11 `run` em p
 
 ## Quem roda no nó e quem não roda
 **Nota 18/10 (ga-hpf4w4): `loft` saiu do nó (`!loft`).** Na rodada real de 18/10, 9 dos 10 raspadores ficaram idênticos ao mini, mas o `loft` veio com 7752 em vez de ~9300 (-17,5%): HTTP 503 truncou 4 lotes e o lote foi promovido como completo (rc 0, erros 0). Volta à lista `PERMITIDOS` quando a ps-jo75 (property_scrapers) fechar. Os outros 9 seguem no nó e `.gc/hetzner-node.on` não muda.
+
+**Nota 25/10 (ga-8m610x): `loft` voltou ao nó.** Fecharam a ps-jo75 (lote truncado por 503 vira resultado=local, não snapshot completo) e a ps-5kh1 (resultado do nó que o runner reprova não volta ao nó nas retentativas). A 1ª rodada diária depois desta mudança é a prova ao vivo, conferida na ps-hpp1: um loft truncado no nó tem de sair `resultado=local`.
 
 A fonte única é `scripts/hetzner-scrape-eligible.txt` (comentada com a medição). Sintaxe: `raspador` permite; `raspador:tenant` permite só o tenant; `!raspador` (ou `!raspador:tenant`) **bloqueia e vence a permissão**; o texto depois de `#` é o motivo mostrado a quem pedir. **Sem `--tenant` o raspador roda TODOS os tenants ativos**, então um `!raspador:tenant` bloqueia a rodada inteira (o `run` e o `eligible` recusam, citam o tenant e mandam rodar com `--tenant <outro>`); `raspador:tenant` sem `--tenant` também não roda. Espaço em volta de `!` e `:` e maiúsculas são ignorados; uma linha que não seja `nome` nem `nome:tenant` (ex.: `!alpha beta`) faz o script recusar a lista **inteira** (ilegível, rc 97), porque um bloqueio que não casa liberaria em silêncio. O `--tenant` tem de vir **antes** do `--`: um `--tenant` (inteiro, abreviado como `--ten`, ou com `=`) depois do `--` é recusado, porque o raspador ficaria com o último e rodaria outro tenant que não o checado. A chave é o **nome da pasta** em `scrapers/`, não o id do `runner.py` (`zap_vivareal_contagem` e `netimoveis_contagem` usam as pastas `zap_vivareal` e `netimoveis`). Raspador que não aparece **não roda** no nó: "não medi" não é "libera" (`alfenas`, `leilao_comprei`, `leilao_spy`, `mybrokerbh`, `myside`, `provincia_imoveis`, `sancruza`, `terreno_livre` nunca foram medidos).
 
