@@ -700,7 +700,7 @@ L_YTOP="$(grep -n -m1 '_pilot_priority_yield_for_id "\$_pool" "\$_pending"' "$DI
 L_SPAWN="$(grep -n -m1 '_pilot_topup_spawn "\$_pool" "\$_pending"' "$DISPATCHER" | cut -d: -f1)"
 { [ -n "$L_YTOP" ] && [ -n "$L_SPAWN" ] && [ "$L_YTOP" -lt "$L_SPAWN" ]; } && ok "I3 the top-up asks the yield BEFORE it spawns" || bad "I3 yield=$L_YTOP spawn=$L_SPAWN"
 L_YLANE="$(grep -n -m1 '_pilot_priority_pool_bound_pre "\$pick" && _pilot_priority_yield_for "\$pick"' "$DISPATCHER" | cut -d: -f1)"
-L_CAPLANE="$(grep -n -m1 'if _pilot_pool_cap_full_for "\$pick"; then' "$DISPATCHER" | cut -d: -f1)"
+L_CAPLANE="$(grep -n -m1 '_pilot_pool_cap_full_for "\$pick"; then' "$DISPATCHER" | cut -d: -f1)"
 { [ -n "$L_YLANE" ] && [ -n "$L_CAPLANE" ] && [ "$L_YLANE" -lt "$L_CAPLANE" ]; } && ok "I4 dispatch_lane asks the yield BEFORE the pre-claim cap skip (a ceded P2 in a full pool reads 'cedida', not 'QUEUED')" || bad "I4 yield=$L_YLANE cap=$L_CAPLANE"
 L_YONE="$(grep -n -m1 '_pilot_priority_target_is_pool "\$_PYS_TARGET" && _pilot_priority_yield_for "\$STORY"' "$DISPATCHER" | cut -d: -f1)"
 L_PROMPT="$(grep -n -m1 'WORKTREE_DIRECTIVE=\$(worktree_directive_for' "$DISPATCHER" | cut -d: -f1)"

@@ -473,11 +473,9 @@ mut fia-rc2-sem-soltar  - 'elif [ "$_RP_MBP_RC" = 2 ]; then
             :'
 mut fia-rc2-despacha    - '            DISPATCH_RESULT="wa_node_unknown"
             return 1
-          fi
-        fi' '            DISPATCH_RESULT="wa_node_unknown"
+          elif [ "${_PILOT_WA_MBP_PASS:-0}" = "1" ]; then' '            DISPATCH_RESULT="wa_node_unknown"
             :
-          fi
-        fi'
+          elif [ "${_PILOT_WA_MBP_PASS:-0}" = "1" ]; then'
 
 echo "---"; echo "$PASS/$((PASS+FAIL)) ok"
 [ $FAIL -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($FAIL)"; exit 1; }
