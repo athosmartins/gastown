@@ -140,6 +140,8 @@ b 2 "block: echo checkout --detach abc | xargs git (o próprio subcomando vem do
 b 2 "block: echo checkout --detach abc | parallel git -C <vivo> (git sem subcomando atrás de parallel, o -C é o vivo), de outro cwd" "echo checkout --detach abc | parallel git -C $LIVE" "$OUT"
 b 2 "block: git -C <vivo> \$X (o clone é o vivo, o subcomando não leio), de outro cwd" "X=checkout; git -C $LIVE \$X --detach abc" "$OUT"
 run < <(mk Bash "$LIVE" command 'X=checkout; git $X --detach abc'); blocked && grep -q 'não consegui ver o que' "$T/err" && grep -qF 'git $X --detach abc' "$T/err" && grep -qF "$LIVE" "$T/err"; ok $? "block: o 'não sei O QUE' diz que não viu o que o git faz, cita o comando e o clone vivo"
+# ga-70d0su (gate, tentativa 1, achado não-bloqueante): xargs/parallel valem como PALAVRA no texto inteiro, então um git já por extenso (-C pasta-fora) barrado por causa de 'parallel' numa mensagem de commit recebia o conselho "se a pasta NÃO é o clone vivo, passa", que aqui é falso. A mensagem tem de dizer o motivo e a saída (duas chamadas)
+run < <(mk Bash "$LIVE" command "git -C $OUT checkout --detach abc && git commit -m 'run in parallel'"); blocked && grep -q 'xargs/parallel só aparece noutro trecho' "$T/err" && grep -q 'separe em duas chamadas' "$T/err"; ok $? "block: git -C <fora> checkout barrado só porque 'parallel' está na mensagem de commit → a mensagem diz o motivo e manda separar em duas chamadas (rc=$RC)"
 # acima do teto o parser não roda: é um "não sei" como os outros — com a sessão NO vivo barra (liberar aqui deixava um comando preenchido com lixo escapar do guarda onde ele existe), fora dele libera e conta (grupo open)
 : > "$T/guard.log"; run < <(mk Bash "$LIVE" command "git checkout --detach $SHA; echo $BIG"); blocked && grep -q 'comando grande demais' "$T/err" && grep -q 'não consegui conferi-lo' "$T/err" && grep -qF "$LIVE" "$T/err" && [ "$(wc -l < "$T/guard.log" | tr -d ' ')" = 1 ] && grep -q 'result=BLOCK.*op=comando grande demais' "$T/guard.log"; ok $? "block: comando acima do teto com a sessão NO vivo barra (é um 'não sei' como os outros), UMA linha BLOCK (rc=$RC)"
 # ga-70d0su (achado 2): o veredito não depende do log — um surrogate solto no comando levantava UnicodeEncodeError dentro do log() e o exit 2 virava exit 1 (o checkout rodava)
@@ -233,7 +235,16 @@ perr "tool no lugar de tool_name" "{\"tool\":\"Bash\",\"cwd\":\"$OUT\",\"tool_in
 # ── ga-70d0su (achado 2): a promessa "qualquer exceção → libera + ERROR" vale também para cwd fora do tipo e JSON fundo demais (antes: traceback, exit 1, nenhuma linha)
 : > "$T/guard.log"; run < <(printf '{"tool_name":"Bash","cwd":123,"tool_input":{"command":"git status"}}'); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=ERROR.*op=payload: cwd não é texto' "$T/guard.log" && [ ! -s "$T/err" ]; ok $? "open: cwd que não é texto (123) → ERROR, exit 0, sem traceback (rc=$RC)"
 : > "$T/guard.log"; run < <(printf '{"tool_name":"Bash","cwd":["/x"],"tool_input":{"command":"git checkout --detach x"}}'); [ "$RC" = 0 ] && grep -q 'result=ERROR.*op=payload: cwd não é texto' "$T/guard.log" && [ ! -s "$T/err" ]; ok $? "open: cwd lista + comando com checkout → ERROR, exit 0, sem traceback (rc=$RC)"
-: > "$T/guard.log"; run < <(head -c 100000 /dev/zero | tr '\0' '['); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=ERROR.*op=stdin:' "$T/guard.log" && [ ! -s "$T/err" ]; ok $? "open: JSON aninhado fundo demais (RecursionError) → ERROR stdin:, exit 0, sem traceback (rc=$RC)"
+# 2 MB de "[": o limiar do RecursionError depende do interpretador (medido: 100 KB chega lá no python 3.9.6; no 3.14.5, pilha de ~16 MB, 100 KB dá JSONDecodeError — que o guarda já pegava antes —, e o limiar fica entre 100 e 500 KB). O CONTROLE prova, no MESMO python3 que o `run` usa, que este payload levanta RecursionError: se não levantar, o teste abaixo passaria sem tocar a cláusula que diz testar, então o controle reprova alto em vez de deixar o teste mentir por interpretador (gate de ga-70d0su, tentativa 1).
+head -c 2000000 /dev/zero | tr '\0' '[' | python3 -I -c 'import json, sys
+try:
+    json.loads(sys.stdin.read())
+except RecursionError:
+    sys.exit(0)
+except Exception:
+    sys.exit(3)
+sys.exit(4)'; ok $? "open: controle — 2 MB de '[' levantam RecursionError (e não JSONDecodeError) neste python3, senão o teste de baixo não testa a cláusula"
+: > "$T/guard.log"; run < <(head -c 2000000 /dev/zero | tr '\0' '['); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=ERROR.*op=stdin:' "$T/guard.log" && [ ! -s "$T/err" ]; ok $? "open: JSON aninhado fundo demais (RecursionError) → ERROR stdin:, exit 0, sem traceback (rc=$RC)"
 # ── ga-70d0su (achado 3): não sei O QUE o git roda (subcomando por variável; operandos do xargs/parallel) → libera fora do vivo, mas CONTADO
 : > "$T/guard.log"; run < <(mk Bash "$OUT" command 'X=checkout; git $X --detach abc'); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=UNRESOLVED.*op=git \$X --detach abc' "$T/guard.log" && grep -qF "cwd=$OUT" "$T/guard.log"; ok $? "open: subcomando por variável liberado fora do vivo deixa UMA linha UNRESOLVED com o op e o cwd (rc=$RC)"
 : > "$T/guard.log"; run < <(mk Bash "$OUT" command 'echo --detach abc | xargs git checkout'); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=UNRESOLVED.*op=git checkout' "$T/guard.log"; ok $? "open: operandos que o xargs acrescenta, liberado fora do vivo, deixa UMA linha UNRESOLVED (rc=$RC)"
@@ -372,6 +383,7 @@ PY
   mut "git sem subcomando atrás do xargs passa"           block '(sub == "" or sub in HEAD_MOVERS)' 'sub in HEAD_MOVERS'
   mut "xargs entre aspas passa batido"                    block 'APPENDERS.search(UNQUOTE.sub("", cmd))' 'APPENDERS.search(cmd)'
   mut "mensagem do não-sei-O-QUE some"                    block 'não consegui ver o que' 'bloqueado o que'
+  mut "mensagem do xargs sem a saída das duas chamadas"   block ': separe em duas chamadas, o git sozinho numa e o resto na outra.' '.'
   mut "não sei O QUE não vale como não sei onde"          open  'unsure = what or tree is None' 'unsure = tree is None'
   mut "teto removido"                                     open  'if len(cmd) > MAX_CMD:' 'if False:'
   mut "acima do teto com a sessão no vivo libera"         block '            return root, op' '            return None'

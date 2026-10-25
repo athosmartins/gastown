@@ -205,7 +205,8 @@ def log(result: str, root: str, op: str, cwd: str) -> None:
 def message(root: str, op: str) -> str:
     if op.startswith(UNKNOWN_WHAT):
         what = (f"BLOQUEADO: não consegui ver o que `{op[len(UNKNOWN_WHAT):]}` faz (subcomando escrito por variável/substituição, ou operandos que xargs/parallel acrescentam em tempo de execução) e ele pode ser um checkout/switch que tira o HEAD do clone vivo de produção.\n"
-                f"Clone: {root}\nRefaça com o subcomando e os operandos por extenso na linha: git checkout main (a volta) ou git -C <pasta-fora-do-vivo> checkout … (se a pasta NÃO é o clone vivo, passa).\n")
+                f"Clone: {root}\nRefaça com o subcomando e os operandos por extenso na linha: git checkout main (a volta) ou git -C <pasta-fora-do-vivo> checkout … (se a pasta NÃO é o clone vivo, passa).\n"
+                "Se o git JÁ está por extenso e xargs/parallel só aparece noutro trecho do comando (mensagem de commit, echo), o guarda lê essa palavra no texto inteiro e barra do mesmo jeito: separe em duas chamadas, o git sozinho numa e o resto na outra.\n")
     elif op.startswith(BIG):
         what = (f"BLOQUEADO: {op.split(': ', 1)[0]}, teto {MAX_CMD}, e o texto cita checkout/switch: não consegui conferi-lo, e o cwd desta sessão é o clone vivo de produção.\n"
                 f"Clone: {root}\nRefaça com um comando menor (escreva arquivos com a ferramenta Write/Edit, não com o Bash) ou rode de fora do clone vivo.\n")
