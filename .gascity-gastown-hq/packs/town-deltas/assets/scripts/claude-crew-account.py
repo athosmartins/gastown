@@ -50,13 +50,30 @@ What it does, every run (launchd StartInterval, single instance via flock):
      of the pool daemon's Escape exception (docs/claude-pool-account.md) - see unstick_blocker() and watch_limits(). Every guard is a reason NOT to
      press and "cannot tell" presses nothing. This reverses, for Mayor and the crews, the pool doc's "never pressed": it is
      off until a human turns it on.
+  6. THE MESSAGE WITHOUT THE MODAL (ga-yqzedv, opt-in only for the last rung): the real stall of 07/10-25/10 was not the modal. A
+     429 ends the turn and leaves "You've hit your weekly limit - resets ..." as the LAST output above the prompt box, the session
+     idle, no modal and so nothing to press. That screen used to be "cannot tell" for ever. Now, on claude's measured layout
+     (a rule, the `❯` prompt, a rule, the statusline) a session whose last output IS that message goes on `banner_watch`, and the
+     difference between current and old is read from the screen, not guessed: the fingerprint of everything above the statusline
+     (transcript + prompt box) is kept; it CHANGED = the session is moving (the clock starts over); UNCHANGED for STALL_S = it is
+     stopped, and ONE named push (`rc-limit-stalled`) says so. No key is ever sent to that screen (there is no modal: an Escape
+     would answer nothing). A layout this script has not measured stays "cannot tell". The last rung, `gc session reset`, exists for
+     a stopped session (and for a modal whose Escapes failed), but it is OFF: it starts a FRESH provider conversation (the gc
+     docs say so - "fresh provider conversation state" - and 25/10 oracle-wa, recreated by gc, came back with a new session key and
+     a transcript that starts empty; `gc session reset` itself was NOT run live, it would have dropped a real conversation), so it
+     loses what the session knew. It needs its own arm switch (`<city>/.gc/crew-reset-on` or GC_CREW_RESET=1; arming the Escape does not
+     arm it), the same account checklist as the Escape, the session file saying `idle`, the session's own transcript ending in a
+     rate_limit error dated AFTER the switch (so "current" is proven, not inferred from the pane: a session idle on an old message
+     since before the switch has nothing wrong, its next turn reads the new login), a fresh look right before, and exactly one gc session
+     with that tmux name. Once per session, ever; gc refusing is a named push, never a retry.
 
 Secrets: held in memory; the only place they leave is `security -i` STDIN (hex). Never argv, env, log, state or alert.
 Accounts are named by e-mail + sha256[:8] fingerprints.
 
 KNOBS: GC_CREW_ACCOUNT=0 or <city>/.gc/no-crew-account -> the run does nothing. `--dry-run` prints what it WOULD do.
 GC_CREW_UNSTICK=1 or <city>/.gc/crew-unstick-on -> the Escape of step 5 is armed; GC_CREW_UNSTICK=0 disarms it whatever the file says.
-SEAMS (tests): CLAUDE_CREW_STATE, CLAUDE_CREW_DECISION, CLAUDE_CREW_ACCOUNTS (json), CLAUDE_CREW_ACCOUNTS_DIR,
+GC_CREW_RESET=1 or <city>/.gc/crew-reset-on -> the `gc session reset` of step 6 is armed (conversation NOT preserved); GC_CREW_RESET=0 disarms it.
+SEAMS (tests): CLAUDE_CREW_GC (the gc binary), CLAUDE_CREW_STATE, CLAUDE_CREW_DECISION, CLAUDE_CREW_ACCOUNTS (json), CLAUDE_CREW_ACCOUNTS_DIR,
 CLAUDE_CREW_SECURITY, CLAUDE_CREW_SESSIONS_DIR, CLAUDE_CREW_NOTIFY, CLAUDE_CREW_NOW, CLAUDE_CREW_USER,
 CLAUDE_CREW_TMUX (the tmux binary), CLAUDE_CREW_TMUX_SOCKET (default "gascity"),
 CLAUDE_CREW_PROFILE_URL (honoured ONLY for a loopback host).
@@ -101,11 +118,24 @@ LOOK_AGAIN_S = 30                # the limit screen must be seen on two runs at 
 MAX_ESC_TRIES = 2                # per session: an Escape that does not take is not repeated for ever
 ESC_RETRY_S = 60                 # ... and a second one waits at least this long after the first
 MAX_ESC_PER_RUN = 6              # and never an unbounded burst of keys
+MAX_RESET_PER_RUN = 1            # a reset loses a conversation: one per run, and one per session ever
 LOOK_BUDGET_S = 25                # all the screens of one run, together: the screen check runs BEFORE the follow step, which must not wait minutes for it
+STALL_S = 600                    # ga-yqzedv: the limit message is the last output and the screen has not changed for this long = stopped
+BANNER_WATCH_S = 3600            # a session on the banner watch is followed this long, then the watch is dropped (the push stands)
+LAST_OUTPUT_LINES = 3            # "the last output": the message is among the last lines above the prompt box (a hint line may follow it)
+BOX_FOOTER_MAX = 8               # claude's statusline under the prompt box is a handful of lines; more than this is a layout not measured
+TRANSCRIPT_TAIL = 262144         # the end of a session's transcript is read, never the whole file
+GC_TIMEOUT_S = 60                # gc list / gc session reset
 S_LIMIT, S_BANNER, S_CLEAR, S_UNKNOWN = "limit", "banner", "clear", "unknown"
 TMUX_FIELD_RE = re.compile(r"[A-Za-z0-9_.-]{1,80}:@\d+\.(%\d+)")   # the `tmux` field of a session file: <session>:@<window>.%<pane>
 SOCKET_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 BANNER_RE = re.compile(r"hit your\b.{0,40}\blimit\b", re.I)         # "You've hit your weekly limit · resets 8pm"
+# the same message as a LINE of its own (any glyph before it, nothing but the message after the glyph): a sentence of an agent that
+# merely mentions it does not start with it
+STOP_MSG_RE = re.compile(r"^[^\w]*you['’]ve hit your\b.{0,40}\blimit\b", re.I)
+RULE_RE = re.compile(r"^─{10,}$")                                    # the rules around claude's prompt box (2.1.310)
+TMUX_SESSION_RE = re.compile(r"([A-Za-z0-9_.-]{1,80}):@\d+\.%\d+")     # the session-name half of the `tmux` field
+GC_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 NAME_RE = re.compile(r"[^A-Za-z0-9 ._-]")
 # measured 07/10: `security -i` cuts a stdin line at 4096 bytes and runs the remainder as a second command (a truncated
 # secret would be stored). The hex doubles the blob, so a command longer than this is refused, never sent.
@@ -615,27 +645,64 @@ def screen_verdict(text: str) -> str:
     return S_BANNER if any(BANNER_RE.search(ln) for ln in lines[-25:]) else S_CLEAR
 
 
-def look(pid: int, tmux_field: str) -> Tuple[str, str, str]:
-    """(verdict, pane id, why). The pane is trusted only if the session's own process lives in it (a recycled pane id is another
-    session's screen); anything that cannot be established is S_UNKNOWN with the reason."""
+def screen_parts(text: str) -> Optional[Tuple[List[str], List[str]]]:
+    """(transcript lines, prompt-box lines) of claude's screen, or None when it is not the layout measured on 2.1.310 (25/10): the
+    transcript, then a rule, the `❯` prompt (one or more lines), a rule, and the statusline (a handful of lines) to the end. The
+    statusline is left out on purpose: it changes by itself (context %, workers, clock) and says nothing about the session."""
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    rules = [i for i, ln in enumerate(lines) if RULE_RE.match(ln.strip())]
+    if len(rules) < 2:
+        return None
+    top, bottom = rules[-2], rules[-1]
+    if sum(1 for ln in lines[bottom + 1:] if ln.strip()) > BOX_FOOTER_MAX:
+        return None
+    box = [ln for ln in lines[top + 1:bottom] if ln.strip()]
+    if not box or not box[0].lstrip().startswith("❯"):
+        return None
+    return [ln for ln in lines[:top] if ln.strip()], box
+
+
+def banner_last(text: str) -> Optional[str]:
+    """ga-yqzedv: the fingerprint of the screen iff the limit MESSAGE (no modal) is the last output of claude's measured layout, else None.
+    "Last output" = it is one of the last LAST_OUTPUT_LINES lines of the transcript, directly above the prompt box, and it STARTS the
+    line (an agent's sentence that mentions it does not). The fingerprint covers the transcript and the prompt box, not the statusline:
+    equal on two looks = nothing happened on that screen between them; different = the session is moving (or somebody is typing).
+    None is "not that" and also "cannot tell" (a layout not measured) - neither is ever treated as stopped."""
+    parts = screen_parts(text)
+    if parts is None:
+        return None
+    body, box = parts
+    if not any(STOP_MSG_RE.search(ln.strip()) for ln in body[-LAST_OUTPUT_LINES:]):
+        return None
+    return hashlib.sha256("\n".join(body + ["\x1e"] + box).encode()).hexdigest()[:12]
+
+
+def look_screen(pid: int, tmux_field: str) -> Tuple[str, str, str, str]:
+    """(verdict, pane id, why, the screen's text). The pane is trusted only if the session's own process lives in it (a recycled pane id
+    is another session's screen); anything that cannot be established is S_UNKNOWN with the reason and no text."""
     m = TMUX_FIELD_RE.fullmatch(tmux_field or "")
     if not m:
-        return S_UNKNOWN, "", "it reports no tmux pane of the city (not started under the city's tmux)"
+        return S_UNKNOWN, "", "it reports no tmux pane of the city (not started under the city's tmux)", ""
     pane = m.group(1)
     rc, out = tmux(["display-message", "-p", "-t", pane, "#{pane_pid}"])
     if rc is None:
-        return S_UNKNOWN, pane, "tmux could not be run"
+        return S_UNKNOWN, pane, "tmux could not be run", ""
     if rc != 0 or not out.strip().isdigit():
-        return S_UNKNOWN, pane, f"tmux does not know pane {pane}"
+        return S_UNKNOWN, pane, f"tmux does not know pane {pane}", ""
     mine = in_pane(pid, int(out.strip()))
     if mine is None:
-        return S_UNKNOWN, pane, "ps could not say whose pane it is"
+        return S_UNKNOWN, pane, "ps could not say whose pane it is", ""
     if not mine:
-        return S_UNKNOWN, pane, f"pane {pane} is not this session's any more"
+        return S_UNKNOWN, pane, f"pane {pane} is not this session's any more", ""
     rc, text = tmux(["capture-pane", "-p", "-J", "-t", pane])
     if rc != 0:
-        return S_UNKNOWN, pane, f"the screen of {pane} could not be read"
-    return screen_verdict(text), pane, ""
+        return S_UNKNOWN, pane, f"the screen of {pane} could not be read", ""
+    return screen_verdict(text), pane, "", text
+
+
+def look(pid: int, tmux_field: str) -> Tuple[str, str, str]:
+    """(verdict, pane id, why): look_screen() without the text."""
+    return look_screen(pid, tmux_field)[:3]
 
 
 def carry_check(old: dict, new: dict) -> dict:
@@ -737,16 +804,66 @@ def look_many(targets: List[Tuple[int, str]]) -> Dict[int, Tuple[str, str, str]]
     return out
 
 
+def look_screens(targets: List[Tuple[int, str]]) -> Dict[int, Tuple[str, str, str, str]]:
+    """look_many() that keeps the screen's text too (look_screen), inside the same LOOK_BUDGET_S."""
+    out, deadline = {}, time.monotonic() + LOOK_BUDGET_S
+    for pid, field in targets:
+        out[pid] = look_screen(pid, field) if time.monotonic() < deadline else (
+            S_UNKNOWN, "", "no time was left to look at every screen in this run", "")
+    return out
+
+
+def watch_limit(st: dict, to, recs: Dict[int, dict], t: float) -> None:
+    """Put sessions (pid -> {start, tmux, name}) on the limit watch: they are on claude's limit screen (the modal)."""
+    lw = st.get("limit_watch") if isinstance(st.get("limit_watch"), dict) else {}
+    pids = lw.get("pids") if isinstance(lw.get("pids"), dict) else {}
+    for p, r in recs.items():
+        old = pids.get(str(p)) if isinstance(pids.get(str(p)), dict) else {}
+        pids[str(p)] = {"start": r.get("start", ""), "tmux": r.get("tmux", ""), "name": r["name"],
+                        "first": _num(old.get("first"), t), "tries": int(_num(old.get("tries"))), "last_try": _num(old.get("last_try"))}
+    st["limit_watch"] = {"to": to, "found": _num(lw.get("found"), t), "pids": pids}
+
+
+def watch_banner(st: dict, to, recs: Dict[int, dict], found: Dict[int, str], t: float) -> None:
+    """Put sessions whose last output is the limit message (pid -> screen fingerprint) on the banner watch (ga-yqzedv). A session
+    already there with the same fingerprint keeps its clock; a different one starts over."""
+    bw = st.get("banner_watch") if isinstance(st.get("banner_watch"), dict) else {}
+    pids = bw.get("pids") if isinstance(bw.get("pids"), dict) else {}
+    for p, f in found.items():
+        r = recs[p]
+        old = pids.get(str(p)) if isinstance(pids.get(str(p)), dict) else {}
+        same = old.get("fp") == f
+        pids[str(p)] = {"start": r.get("start", ""), "tmux": r.get("tmux", ""), "name": r["name"], "fp": f,
+                        "since": _num(old.get("since"), t) if same else t, "stalled": old.get("stalled") if same else None,
+                        "told": old.get("told") if same else None, "reset": old.get("reset")}
+        log("INFO", f"switch to {to}: {r['name']}: the limit message is the last thing on the screen (no modal) - on the watch: stopped "
+                    f"if the screen stays unchanged for {STALL_S // 60} min")
+    st["banner_watch"] = {"to": to, "found": t, "pids": pids}
+
+
 def judge_screens(st: dict, to, now_b: Dict[int, dict], up_pids: List[int], bridge_doubt: bool, t: float) -> None:
     """The second half of the post-switch check (ga-ci3uao): a bridge that is up does not say which account the session uses. Looks at
     the screen of every session whose bridge is up and ends in ONE verdict line - `VERIFY ok` only when every one of them was looked at
     and none is on claude's limit screen; `VERIFY FAILED` (a named push, and the session goes on the watch) when one is; `VERIFY NOT
-    VERIFIED` for everything else (no tmux pane, tmux or ps silent, the limit message without the modal, a bridge that is in doubt)."""
+    VERIFIED` for everything else (no tmux pane, tmux or ps silent, the limit message without the modal, a bridge that is in doubt).
+    The limit message without the modal stays "not verified" (one look cannot say current from old), but when it is the LAST output of
+    claude's measured layout the session also goes on the banner watch, which can (ga-yqzedv)."""
     seen = look_many([(p, now_b[p].get("tmux", "")) for p in sorted(up_pids)])
     stuck = [p for p, v in seen.items() if v[0] == S_LIMIT]
     clear = [p for p, v in seen.items() if v[0] == S_CLEAR]
     cant = [p for p, v in seen.items() if v[0] in (S_UNKNOWN, S_BANNER)]
     label = lambda ps: ", ".join(now_b[p]["name"] for p in ps)  # noqa: E731
+    last = {}                                              # pid -> fingerprint: the limit message is the last output, no modal
+    try:                                                   # (a second read, of the message-only sessions: look() does not keep the text)
+        for p, v in look_screens([(p, now_b[p].get("tmux", "")) for p in cant if seen[p][0] == S_BANNER]).items():
+            f = banner_last(v[3]) if v[0] == S_BANNER else None
+            if f:
+                last[p] = f
+        if last:
+            watch_banner(st, to, now_b, last, t)
+    except Exception as e:  # noqa: BLE001 - the banner watch is an addition: a bug in it must not cost the verdict below
+        log("ERROR", f"switch to {to}: the banner probe failed ({type(e).__name__}) - the limit message is not watched")
+        last = {}
     if not seen:
         verdict = "nothing-to-look-at"
     elif stuck:
@@ -760,8 +877,9 @@ def judge_screens(st: dict, to, now_b: Dict[int, dict], up_pids: List[int], brid
     if verdict == "ok":
         log("INFO", f"switch to {to}: VERIFY ok - none of the {len(seen)} sessions looked at is on claude's limit screen")
     elif verdict == "not-verified":
-        why = "; ".join(sorted({f"{now_b[p]['name']}: {seen[p][2] or 'the limit message is on screen but not the modal (old or current: cannot tell)'}"
-                                for p in cant})[:3])
+        why = "; ".join(sorted({f"{now_b[p]['name']}: " + (seen[p][2] or (
+            f"the limit message is the last thing on the screen, no modal: watched, stopped if unchanged for {STALL_S // 60} min"
+            if p in last else "the limit message is on screen but not the modal (old or current: cannot tell)")) for p in cant})[:3])
         log("WARN", f"switch to {to}: VERIFY NOT VERIFIED - which account the sessions use was NOT established ({len(clear)} of "
                     f"{len(seen)} looked at are clear, {len(cant)} could not be told" + (f": {why}" if why else "")
                     + ("; a bridge is also in doubt" if bridge_doubt else "") + ")")
@@ -772,13 +890,7 @@ def judge_screens(st: dict, to, now_b: Dict[int, dict], up_pids: List[int], brid
         log("WARN", f"switch to {to}: VERIFY FAILED - {label(stuck)} still on claude's limit screen: they did NOT pick up the new login")
         alert(st, "rc-limit-stuck", f"after the switch to {to} the session(s) {label(stuck)} are still on claude's limit screen: they did "
                                     f"NOT pick up the new login (a session on that screen never re-reads it); {how}", t)
-        lw = st.get("limit_watch") if isinstance(st.get("limit_watch"), dict) else {}
-        pids = lw.get("pids") if isinstance(lw.get("pids"), dict) else {}
-        for p in stuck:
-            old = pids.get(str(p)) if isinstance(pids.get(str(p)), dict) else {}
-            pids[str(p)] = {"start": now_b[p].get("start", ""), "tmux": now_b[p].get("tmux", ""), "name": now_b[p]["name"],
-                            "first": _num(old.get("first"), t), "tries": int(_num(old.get("tries"))), "last_try": _num(old.get("last_try"))}
-        st["limit_watch"] = {"to": to, "found": _num(lw.get("found"), t), "pids": pids}
+        watch_limit(st, to, {p: now_b[p] for p in stuck}, t)
 
 
 UNSTICK_OFF = "off"
@@ -792,18 +904,32 @@ def unstick_armed() -> bool:
     return bool(c and (c / ".gc" / "crew-unstick-on").exists())
 
 
+def reset_armed() -> bool:
+    """The `gc session reset` of step 6 has its OWN switch (an authorization is not inherited from the Escape's): the env beats the file, and
+    anything but "0"/"1" in the env is not a decision. OFF by default - a reset loses the conversation."""
+    v = os.environ.get("GC_CREW_RESET")
+    if v in ("0", "1"):
+        return v == "1"
+    c = city()
+    return bool(c and (c / ".gc" / "crew-reset-on").exists())
+
+
 def unstick_blocker(st: dict, dec, lw: dict, t: float) -> Optional[str]:
-    """None = nothing account-level stands in the way of an Escape; else WHY NOT (UNSTICK_OFF = it is not armed). Every line is a reason
-    not to press, and a read that cannot tell is a no - the same checklist as the pool daemon's Escape (docs/claude-pool-account.md)."""
+    """None = nothing account-level stands in the way of an Escape; else WHY NOT (UNSTICK_OFF = it is not armed)."""
     if not unstick_armed():
         return UNSTICK_OFF
-    to = lw.get("to")
+    return account_blocker(st, dec, lw.get("to"), t)
+
+
+def account_blocker(st: dict, dec, to, t: float) -> Optional[str]:
+    """None = nothing account-level stands in the way of touching a session that sits on the limit; else WHY NOT. Every line is a reason
+    not to act, and a read that cannot tell is a no - the same checklist as the pool daemon's Escape (docs/claude-pool-account.md)."""
     if not isinstance(dec, dict) or not isinstance(dec.get("current"), str):
         return "there is no pool decision to check the account against"
     if dec["current"].strip().lower() != to or st.get("current") != to:
         return f"the crews are no longer on the {to} of that switch"
     if exhausted(dec, to, t):
-        return f"{to} is itself registered exhausted (an Escape would only land on the next 429)"
+        return f"{to} is itself registered exhausted (a session touched now would only land on the next 429)"
     sw = st.get("last_switch")
     if not isinstance(sw, dict) or sw.get("to") != to or t - _num(sw.get("at"), t) < SETTLE_S:
         return "the new login has not been in place long enough for claude to re-read it"
@@ -829,8 +955,248 @@ def send_escape(pid: int, rec: dict) -> bool:
     return True
 
 
-def watch_limits(st: dict, dec, t: float) -> None:
-    """Every run while a session is known to sit on claude's limit screen: has it left? and, when armed, press its Escape (step 5).
+def session_file(pid: int) -> Optional[dict]:
+    """The session file of `pid` as it is NOW (the watch's copy is minutes old), or None when it cannot be read or is not that pid's."""
+    d = load_json(sessions_dir() / f"{pid}.json")
+    return d if d is not None and _int(d.get("pid") or pid) == pid else None
+
+
+def _epoch(v) -> Optional[float]:
+    """A transcript record's `timestamp` ("2026-10-25T15:40:50.388Z") as epoch seconds; None when it is absent or not that shape."""
+    if not isinstance(v, str):
+        return None
+    try:
+        return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def transcript_says(sf: dict) -> Tuple[str, Optional[float]]:
+    """(what, when) the session's OWN transcript says its last conversation record is. what: "limit" (the rate_limit API error), "later"
+    (anything else - it did something after, or something other than hit the limit) or "unknown" (no file, unreadable tail, no record to
+    decide on). when: the epoch of that record, for "limit" only, None if it has none. The tail is read, never the whole file; the first
+    conversation record from the end decides; a line that cannot be parsed before that is "unknown", not skipped. The transcript lives at
+    <config>/projects/<cwd, every non-alphanumeric as ->/<sessionId>.jsonl."""
+    sid, cwd = sf.get("sessionId"), sf.get("cwd")
+    if not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,80}", sid) or not isinstance(cwd, str) or not cwd:
+        return "unknown", None
+    p = sessions_dir().parent / "projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd) / f"{sid}.jsonl"
+    try:
+        with open(p, "rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            f.seek(max(0, size - TRANSCRIPT_TAIL))
+            raw = f.read(TRANSCRIPT_TAIL)
+            cut = size > TRANSCRIPT_TAIL
+    except OSError:
+        return "unknown", None
+    lines = raw.decode("utf-8", "replace").splitlines()
+    if cut:
+        lines = lines[1:]                                   # the first line of a tail starts in the middle of a record
+    for ln in reversed(lines):
+        if not ln.strip():
+            continue
+        try:
+            rec = json.loads(ln)
+        except (ValueError, RecursionError):
+            return "unknown", None
+        if not isinstance(rec, dict):
+            return "unknown", None
+        if rec.get("type") in ("assistant", "user"):
+            if rec.get("type") == "assistant" and rec.get("isApiErrorMessage") is True and rec.get("error") == "rate_limit":
+                return "limit", _epoch(rec.get("timestamp"))
+            return "later", None
+    return "unknown", None
+
+
+def gc_bin() -> Optional[str]:
+    p = os.environ.get("CLAUDE_CREW_GC")
+    if p:
+        return p if os.access(p, os.X_OK) else None
+    return shutil.which("gc") or next((c for c in ("/opt/homebrew/bin/gc", "/usr/local/bin/gc") if os.access(c, os.X_OK)), None)
+
+
+def gc_run(args: List[str]) -> Tuple[Optional[int], str]:
+    """(exit code, stdout) of `gc --city <city> <args>`; (None, "") when it could not be run at all (no gc, no city, timeout)."""
+    b, c = gc_bin(), city()
+    if not b or not c:
+        return None, ""
+    try:
+        r = subprocess.run([b, "--city", str(c)] + args, capture_output=True, text=True, errors="replace", timeout=GC_TIMEOUT_S,
+                           check=False, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None, ""
+    return r.returncode, r.stdout
+
+
+def gc_session_id(tmux_field: str) -> Tuple[Optional[str], str]:
+    """(gc session id, "") of the ONE gc session whose tmux session is the one in the `tmux` field of a session file, else (None, why).
+    Two matches or none is a no: a reset goes to the session that was proven, never to one picked by a guess."""
+    m = TMUX_SESSION_RE.fullmatch(tmux_field or "")
+    if not m:
+        return None, "no gc session can be named: the session reports no tmux session of the city"
+    rc, out = gc_run(["session", "list", "--json"])
+    try:
+        rows = json.loads(out).get("sessions") if rc == 0 else None
+    except (ValueError, RecursionError, AttributeError):
+        rows = None
+    if not isinstance(rows, list):
+        return None, f"could not list the gc sessions (exit={rc})"
+    ids = [r.get("id") for r in rows if isinstance(r, dict) and r.get("session_name") == m.group(1)]
+    if len(ids) > 1:
+        return None, f"more than one gc session is called {m.group(1)}"
+    if not ids or not isinstance(ids[0], str) or not GC_ID_RE.fullmatch(ids[0]):
+        return None, f"no gc session is called {m.group(1)}"
+    return ids[0], ""
+
+
+def reset_stopped(st: dict, dec, to, pid: int, rec: dict, t: float, banner: bool) -> bool:
+    """The last rung (step 6): `gc session reset` on a session that has been stopped STALL_S. True = gc was asked to (it worked or not;
+    the outcome is pushed and `reset` is set so it is never asked twice); False = a guard said no (logged). It starts a FRESH provider
+    conversation (the gc docs, and oracle-wa recreated on 25/10; never run live), so every guard is a reason NOT to: armed (its own
+    switch), the account checklist, the same process, the same pane, a fresh look at the screen right before, and - for the limit
+    message - the session file saying idle and its own transcript ending in a rate_limit error dated AFTER the switch (an old message
+    of a session that has been idle since before it says nothing is wrong: its next turn reads the new login). Once per session ever
+    (`reset` in its record); gc refusing is a push, never a retry."""
+    name = rec.get("name")
+
+    def no(why: str) -> bool:
+        log("INFO", f"switch to {to}: {name} was NOT reset - {why}")
+        return False
+
+    if not reset_armed():
+        return False
+    why = account_blocker(st, dec, to, t)
+    if why:
+        return no(why)
+    if not rec.get("start"):
+        return no("its session file has no start time, so it cannot be proven to be the same process")
+    sf = session_file(pid)
+    if sf is None:
+        return no("its session file cannot be read now")
+    if sf.get("tmux") != rec.get("tmux"):
+        return no("its session file now reports another pane than the one that was watched")
+    if banner:
+        if sf.get("status") != "idle":
+            return no(f"not idle: its session file says {sf.get('status')!r}")
+        says, when = transcript_says(sf)
+        if says != "limit":
+            return no(f"its own transcript does not confirm that the limit message is its last word ({says})")
+        if when is None or when < _num((st.get("last_switch") or {}).get("at"), t):
+            return no("its limit message is not dated after the switch: it may have been idle on it since before the account changed, "
+                      "and then its next turn reads the new login - a reset would only lose the conversation")
+    verdict, _, why, text = look_screen(pid, str(rec.get("tmux") or ""))
+    still = (verdict == S_BANNER and banner_last(text) == rec.get("fp")) if banner else verdict == S_LIMIT
+    if not still:
+        return no(f"not stopped any more: the screen changed right before the reset ({why or verdict})")
+    if DRY:
+        log("INFO", f"DRY-RUN would run gc session reset for {name} ({pid})")
+        return False
+    sid, why = gc_session_id(str(rec.get("tmux") or ""))
+    if not sid:
+        return no(why)
+    rec["reset"] = t                                        # counted BEFORE it runs: whatever happens next, it is not run again
+    rc, _ = gc_run(["session", "reset", sid])
+    key, al = ("rc-limit-reset" if rc == 0 else "rc-limit-reset-failed"), st.setdefault("alerts", {})
+    al.pop(key, None)                                       # one per session ever, and each one is news: not held back by another's 6 h window
+    if rc == 0:
+        log("WARN", f"switch to {to}: {name} was stopped {STALL_S // 60} min on the limit and was reset with gc session reset {sid}")
+        alert(st, key, f"{name} was stopped on claude's limit for {STALL_S // 60} min and was reset (gc session reset {sid}): its conversation is "
+                       "NOT preserved - it starts a fresh one", t)
+    else:
+        log("ERROR", f"switch to {to}: gc session reset {sid} for {name} failed (exit={rc})")
+        alert(st, key, f"{name} is stopped on claude's limit and could not be reset (gc session reset {sid} failed, exit={rc}): "
+                       "restart it by hand at an idle moment", t)
+    return True
+
+
+def watch_banners(st: dict, dec, t: float, resets: Optional[List[int]] = None) -> None:
+    """Every run while a session is on the banner watch (step 6): where is the limit message now? gone = off the watch; the modal = it moves
+    to the limit watch; still the LAST output = unchanged for STALL_S is "stopped" (one push, then the reset rung when armed), changed
+    = moving (the clock starts over). No key is ever sent from here: there is no modal to answer."""
+    if "banner_watch" not in st:
+        return
+    bw = st["banner_watch"]
+    pids = bw.get("pids") if isinstance(bw, dict) else None
+    if not isinstance(pids, dict) or not isinstance(bw.get("to"), str):
+        log("WARN", "the banner_watch record in the state cannot be read - dropped")
+        st.pop("banner_watch", None)
+        return
+    resets = [0] if resets is None else resets
+    to, living = bw["to"], []
+    for pid_s, rec in list(pids.items()):
+        pid = _int(pid_s)
+        name = rec.get("name") if isinstance(rec, dict) else None
+        if pid is None or not isinstance(rec, dict) or not alive(pid, rec.get("start") or None):
+            log("INFO", f"{name or pid_s} ended on its own while on the banner watch - not watched any more")
+            pids.pop(pid_s, None)
+        else:
+            living.append((pid_s, pid, rec))
+    looked = look_screens([(pid, str(rec.get("tmux") or "")) for _, pid, rec in living])
+    stalled = []
+    for pid_s, pid, rec in living:
+        name = rec.get("name")
+        verdict, _, why, text = looked[pid]
+        if verdict == S_CLEAR:
+            log("INFO", f"{name} left the limit message - not watched any more")
+            pids.pop(pid_s, None)
+        elif verdict == S_LIMIT:
+            log("INFO", f"{name}: the limit modal is on screen now - moved to the limit watch")
+            watch_limit(st, to, {pid: rec}, t)
+            pids.pop(pid_s, None)
+        elif verdict == S_BANNER:
+            f = banner_last(text)
+            if f is None:
+                log("INFO", f"{name}: the limit message is still on screen but is not the last output any more - not watched any more")
+                pids.pop(pid_s, None)
+            elif f != rec.get("fp"):
+                log("INFO", f"{name}: the screen changed since the last look - it is moving, not stopped (the {STALL_S // 60} min start over)")
+                rec.update(fp=f, since=t, stalled=None, told=None)
+            elif t - _num(rec.get("since"), t) >= STALL_S:
+                stalled.append((pid_s, pid, rec))
+        else:
+            log("WARN", f"{name}: cannot tell what is on its screen ({why or verdict}) - kept, nothing claimed")
+    if not pids:
+        log("INFO", f"switch to {to}: no session is on the banner watch any more")
+        st.pop("banner_watch", None)
+        return
+    if t - _num(bw.get("found"), t) > BANNER_WATCH_S:
+        log("WARN", f"switch to {to}: {', '.join(str(r.get('name')) for r in pids.values() if isinstance(r, dict))} still on the limit message "
+                    f"{BANNER_WATCH_S // 60} min after it was found - the watch is dropped (the push stands, nothing more is tried)")
+        st.pop("banner_watch", None)
+        return
+    new = [x for x in stalled if not x[2].get("told")]
+    if new:
+        for _, _, rec in new:
+            rec["stalled"] = _num(rec.get("stalled"), t)
+        names = ", ".join(str(r.get("name")) for _, _, r in new)
+        c = city()
+        how = ("the automatic gc session reset is armed and will be tried (the conversation is NOT preserved)" if reset_armed() else
+               f"the automatic gc session reset is off (touch {c / '.gc' if c else '<city>/.gc'}/crew-reset-on arms it; the conversation is NOT "
+               "preserved) - restart it by hand at an idle moment")
+        al = st.get("alerts") if isinstance(st.get("alerts"), dict) else {}
+        if DRY or t - _num(al.get("rc-limit-stalled")) >= ALERT_EVERY_S:
+            one = len(new) == 1
+            if alert(st, "rc-limit-stalled", f"after the switch to {to}, {names} {'has' if one else 'have'} had the limit message as the last "
+                                             f"thing on the screen for {STALL_S // 60} min and nothing moves: {'it is' if one else 'they are'} "
+                                             f"idle at the 429 and nothing will give {'it' if one else 'them'} a new turn by itself ({'it' if one else 'they'} "
+                                             f"may also have been idle there since before the switch) - {how}", t):
+                for _, _, rec in new:
+                    rec["told"] = t
+    if not reset_armed():
+        return
+    for pid_s, pid, rec in stalled:
+        if rec.get("reset") or resets[0] >= MAX_RESET_PER_RUN:
+            continue
+        if reset_stopped(st, dec, to, pid, rec, t, banner=True):
+            resets[0] += 1
+            pids.pop(pid_s, None)
+            if not pids:
+                st.pop("banner_watch", None)
+
+
+def watch_limits(st: dict, dec, t: float, resets: Optional[List[int]] = None) -> None:
+    """Every run while a session is known to sit on claude's limit screen: has it left? and, when armed, press its Escape (step 5), and,
+    when the Escapes did not take and the reset is armed too, the last rung (step 6).
     Looking is read-only and cheap; tmux and ps are not even asked when nothing is on the watch."""
     if "limit_watch" not in st:
         return
@@ -877,12 +1243,18 @@ def watch_limits(st: dict, dec, t: float) -> None:
     if why_not:
         log("INFO", f"switch to {to}: no Escape sent - {why_not}")
         return
-    sent = 0
+    sent, resets = 0, [0] if resets is None else resets
     for pid_s, pid, rec in due:
         tries, name = int(_num(rec.get("tries"))), rec.get("name")
         if tries >= MAX_ESC_TRIES:
             alert(st, "rc-limit-unstick-failed", f"{name} is still on claude's limit screen after {tries} Escape(s) from this script: press "
                                                   "Esc in it by hand, or restart it at an idle moment", t)
+            if t - _num(rec.get("first"), t) >= STALL_S and not rec.get("reset") and resets[0] < MAX_RESET_PER_RUN:
+                if reset_stopped(st, dec, to, pid, rec, t, banner=False):
+                    resets[0] += 1
+                    pids.pop(pid_s, None)
+                    if not pids:
+                        st.pop("limit_watch", None)
         elif sent >= MAX_ESC_PER_RUN or t - _num(rec.get("first"), t) < LOOK_AGAIN_S or t - _num(rec.get("last_try")) < ESC_RETRY_S:
             continue
         elif not rec.get("start"):
@@ -1195,10 +1567,15 @@ def run_once(dry: bool = False) -> int:
     check_bridges(st, t)                                       # first, and on EVERY path: a pending check must not wait for a quiet run
     retry_rc_lost_push(st, t)
     dec = load_json(decision_path())
+    resets = [0]                                               # a reset loses a conversation: at most MAX_RESET_PER_RUN in all, by either watch
     try:
-        watch_limits(st, dec, t)
+        watch_limits(st, dec, t, resets)
     except Exception as e:  # noqa: BLE001 - watching the screens must never cost the switch itself
         log("ERROR", f"the limit-screen watch failed ({type(e).__name__}) - the switch goes on")
+    try:
+        watch_banners(st, dec, t, resets)
+    except Exception as e:  # noqa: BLE001 - same: the banner watch is an addition, never a reason to skip the switch
+        log("ERROR", f"the banner-watch failed ({type(e).__name__}) - the switch goes on")
     if not dec or not isinstance(dec.get("current"), str):
         log("WARN", "no pool decision to follow yet - the crews stay")
         rc = 0

@@ -114,6 +114,28 @@ if a[:1] == ["send-keys"]:
 sys.exit(2)
 '''
 
+FAKE_GC = r'''#!/usr/bin/env python3
+import json, os, sys
+d = os.environ["FAKE_GC_DIR"]
+a = sys.argv[1:]
+with open(os.path.join(d, "gc.log"), "a") as f:
+    f.write(json.dumps(a) + "\n")
+if a[:1] == ["--city"]:
+    a = a[2:]
+if a[:2] == ["session", "list"]:
+    if os.environ.get("FAKE_GC_LIST_FAIL"):
+        sys.exit(1)
+    p = os.path.join(d, "sessions.json")
+    sys.stdout.write(open(p).read() if os.path.exists(p) else '{"ok": true, "schema_version": "1", "sessions": []}')
+    sys.exit(0)
+if a[:2] == ["session", "reset"]:
+    if os.environ.get("FAKE_GC_RESET_FAIL"):
+        sys.stderr.write("boom\n")
+        sys.exit(1)
+    sys.exit(0)
+sys.exit(2)
+'''
+
 NOTIFY = "#!/bin/sh\necho \"$@\" >> \"$FAKE_SEC_DIR/notify.log\"\n[ -n \"$FAKE_NOTIFY_FAIL\" ] && exit 7\nexit 0\n"
 EMAIL = {"crypto": "athoscrypto@gmail.com", "amb": "throw.away.amb@gmail.com", "b85": "athosb85@gmail.com",
          "terr": "terrenos.incorporacoes@gmail.com", "martins": "athosmartins@gmail.com"}
@@ -223,17 +245,19 @@ def _nothing_real_was_touched(tmp_path_factory):
     _sentinel(guard / "bin" / "security", hits)
     _sentinel(guard / "tmux", hits)
     _sentinel(guard / "bin" / "tmux", hits)
+    _sentinel(guard / "gc", hits)
+    _sentinel(guard / "bin" / "gc", hits)
     _GUARD.update(dir=guard, hits=hits)
     with _watching(_real_files()) as touched:
         yield
-    assert not hits.exists(), "a test reached the REAL notify/security (sentinel executed):\n" + hits.read_text()
+    assert not hits.exists(), "a test reached the REAL notify/security/tmux/gc (sentinel executed):\n" + hits.read_text()
     assert not touched, "a test touched the REAL claude-crew-account log/state/lock:\n" + "\n".join(touched)
 
 
 @pytest.fixture(autouse=True)
 def _pin_env(monkeypatch, tmp_path):
     g = _GUARD["dir"]
-    for k, v in {"CLAUDE_CREW_NOTIFY": g / "notify", "CLAUDE_CREW_SECURITY": g / "security", "CLAUDE_CREW_TMUX": g / "tmux",
+    for k, v in {"CLAUDE_CREW_NOTIFY": g / "notify", "CLAUDE_CREW_SECURITY": g / "security", "CLAUDE_CREW_TMUX": g / "tmux", "CLAUDE_CREW_GC": g / "gc",
                  "GC_CITY_PATH": tmp_path / "pinned-city", "CLAUDE_CREW_STATE": tmp_path / "pinned-state.json",
                  "CLAUDE_CREW_DECISION": tmp_path / "pinned-decision.json", "CLAUDE_CREW_SESSIONS_DIR": tmp_path / "pinned-sessions",
                  "CLAUDE_CREW_ACCOUNTS_DIR": tmp_path / "pinned-accts", "HOME": tmp_path / "pinned-home"}.items():
@@ -365,7 +389,8 @@ class World:
         self.srv = http.server.HTTPServer(("127.0.0.1", 0), H)
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
         (self.d / "tmuxd").mkdir()
-        for name, body in (("security", FAKE_SECURITY), ("notify", NOTIFY), ("tmux", FAKE_TMUX)):
+        (self.d / "gcd").mkdir()
+        for name, body in (("security", FAKE_SECURITY), ("notify", NOTIFY), ("tmux", FAKE_TMUX), ("gc", FAKE_GC)):
             p = self.d / name
             p.write_text(body.replace("#!/usr/bin/env python3", f"#!{sys.executable}"))   # not the PATH's python: PATH is pinned to the sentinels
             p.chmod(p.stat().st_mode | stat.S_IEXEC)
@@ -375,6 +400,7 @@ class World:
         for k, v in {
             "FAKE_SEC_DIR": str(self.d), "CLAUDE_CREW_SECURITY": str(self.d / "security"),
             "FAKE_TMUX_DIR": str(self.d / "tmuxd"), "CLAUDE_CREW_TMUX": str(self.d / "tmux"),
+            "FAKE_GC_DIR": str(self.d / "gcd"), "CLAUDE_CREW_GC": str(self.d / "gc"),
             "CLAUDE_CREW_NOTIFY": str(self.d / "notify"), "CLAUDE_CREW_STATE": str(self.d / "crew_state.json"),
             "CLAUDE_CREW_DECISION": str(self.d / "pool_decision.json"), "CLAUDE_CREW_SESSIONS_DIR": str(self.d / "sessions"),
             "CLAUDE_CREW_ACCOUNTS_DIR": str(self.d / "accts"), "CLAUDE_CREW_USER": "athos", "GC_CITY_PATH": str(self.d / "city"),
@@ -382,7 +408,7 @@ class World:
         }.items():
             monkeypatch.setenv(k, v)
         for k in ("GC_CREW_ACCOUNT", "CLAUDE_CREW_ACCOUNTS", "FAKE_SEC_FAIL", "FAKE_SEC_WFAIL", "FAKE_SEC_DROP", "FAKE_NOTIFY_FAIL",
-                  "GC_CREW_UNSTICK", "FAKE_TMUX_DOWN", "CLAUDE_CREW_TMUX_SOCKET"):
+                  "GC_CREW_UNSTICK", "FAKE_TMUX_DOWN", "CLAUDE_CREW_TMUX_SOCKET", "GC_CREW_RESET", "FAKE_GC_LIST_FAIL", "FAKE_GC_RESET_FAIL"):
             monkeypatch.delenv(k, raising=False)
         self.mp = monkeypatch
         # the world must be sealed: every seam inside this tmp dir, none of them a sentinel
@@ -467,6 +493,15 @@ class World:
 
     def tmux_calls(self):
         p = self.d / "tmuxd" / "tmux.log"
+        return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
+
+    # gc (ga-yqzedv): the fake logs every argv; `session list --json` answers from sessions.json
+    def gc_sessions(self, *pairs):
+        rows = [{"id": i, "alias": n, "session_name": n, "state": "active"} for i, n in pairs]
+        (self.d / "gcd" / "sessions.json").write_text(json.dumps({"ok": True, "schema_version": "1", "sessions": rows}))
+
+    def gc_calls(self):
+        p = self.d / "gcd" / "gc.log"
         return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
 
     def log(self):
@@ -1734,3 +1769,438 @@ def test_when_there_is_no_time_left_the_screens_are_cannot_tell_and_nothing_slow
     assert "no time was left to look at every screen in this run" in w.log()
     assert w.state()["verify_last"]["verdict"] == "not-verified" and "limit_watch" not in w.state()
     assert w.tmux_calls() == [] and not w.notified()                     # not looked at is not "stuck" and not "clear"
+
+
+# ══ ga-yqzedv: the limit MESSAGE without the modal is the real stall, and nothing watched it ══════════════════════
+# 07/10 on: the automatic Escape never fired. The watch only started from the MODAL, but the real cases show the 429 arriving as a
+# turn that ENDS with "You've hit your weekly limit · resets ..." as its last output - no modal, the session idle above its prompt box.
+# That screen was "cannot tell" for ever (it may be an old line in the scrollback), so there was no push, no watch, no key.
+#
+# The fixtures use claude 2.1.310's REAL chrome (measured on live panes 25/10: a rule, the `❯` prompt, a rule, a changing statusline).
+# The old PROMPT_BOX above (╭─╮ │ > │) is not what that version draws. HONEST CAVEAT: no pane in this state existed to capture, so the
+# message line is the measured TEXT (from the transcript's rate_limit record) placed where claude puts a turn's last output; the glyph
+# in front of it is not measured, which is why the match tolerates any non-word prefix.
+RULE = "─" * 80
+REAL_BOX = (f"{RULE}\n❯ \n{RULE}\n  👥 0 workers · 🚦 running 2/3 6c179cf040677bf559f74e\n  [Opus 5.5] ctx: 22.0% (220k/1000k)\n"
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent\n")
+LIMIT_MSG = "  ⎿  You've hit your weekly limit · resets Oct 28 at 8pm (America/Sao_Paulo)\n"
+STALLED = "⏺ Vou rodar o teste.\n\n⏺ Bash(pytest -q)\n  ⎿  12 passed\n\n" + LIMIT_MSG + "\n" + REAL_BOX
+STALLED_FOOTER_MOVED = STALLED.replace("ctx: 22.0%", "ctx: 23.4%")                       # the statusline ticks on its own: not activity
+STALLED_TYPING = STALLED.replace("❯ \n", "❯ continua\n")                                  # somebody typed in the prompt: activity
+OLD_MESSAGE_THEN_WORK = ("⏺ Vou rodar o teste.\n\n" + LIMIT_MSG + "\n⏺ Voltei, rodando de novo.\n  ⎿  13 passed\n\n"
+                         "✻ Baked for 2m 1s · done 1:01 PM\n\n" + REAL_BOX)
+QUOTED_IN_PROSE = ("⏺ A mensagem que a crew viu foi You've hit your weekly limit · resets 8pm, e o modal não abriu.\n"
+                   "  Vou olhar o pane.\n\n" + REAL_BOX)
+NO_MESSAGE = "⏺ Done.\n\n✻ Baked for 11m 51s · done 1:01 PM\n\n" + REAL_BOX
+
+
+@pytest.mark.parametrize("text,stopped", [
+    (STALLED, True),
+    (STALLED_FOOTER_MOVED, True),
+    (STALLED_TYPING, True),
+    (OLD_MESSAGE_THEN_WORK, False),     # something was written after it: it is not the last output, the session moved on
+    (QUOTED_IN_PROSE, False),           # the words inside a sentence of the agent's own: not the message
+    (NO_MESSAGE, False),
+    (BANNER_ONLY, False),               # the OUTDATED box: a layout this script has not measured is "cannot tell", never "stopped"
+    (LIMIT_MODAL, False),               # the modal has its own verdict
+    (REAL_BOX, False),
+    ("", False),
+])
+def test_the_limit_message_is_the_last_output_only_on_the_measured_layout(text, stopped):
+    assert (crew.banner_last(text) is not None) is stopped
+
+
+def test_the_screen_fingerprint_follows_what_the_session_does_and_not_the_statusline():
+    f = crew.banner_last(STALLED)
+    assert crew.banner_last(STALLED_FOOTER_MOVED) == f                                   # footer: not activity
+    assert crew.banner_last(STALLED_TYPING) != f                                         # the prompt box: activity
+    assert crew.banner_last(STALLED.replace("12 passed", "11 passed")) != f              # the transcript: activity
+
+
+def _transcript(w, name, pid, kind):
+    """The session's transcript where claude keeps it (<config>/projects/<cwd with every non-alphanumeric as ->/<sessionId>.jsonl).
+    kind: 'limit' = the last conversation record is the rate_limit API error (what the 25/10 oracle transcript really ends with: the
+    error, then a `system` record), dated 30 s AFTER the switch (the real one came 32 s after: 15:40:18Z switch, 15:40:50Z error);
+    'before' = the same, dated an hour BEFORE it (a session idle on an old message); 'undated' = no timestamp on the error;
+    'later' = work after it; 'garbage' = the tail cannot be parsed; None = no file at all."""
+    proj = w.d / "projects" / re.sub(r"[^A-Za-z0-9]", "-", f"/work/{name}")
+    proj.mkdir(parents=True, exist_ok=True)
+    f = proj / f"sess-{pid}-0000.jsonl"
+    if kind is None:
+        f.unlink(missing_ok=True)
+        return
+    err = {"type": "assistant", "isApiErrorMessage": True, "error": "rate_limit", "timestamp": crew._iso(w.now + (-3600 if kind == "before" else 30)),
+           "message": {"role": "assistant", "model": "<synthetic>", "content": [{"type": "text", "text": "You've hit your weekly limit · resets Oct 28 at 8pm"}]}}
+    recs = [{"type": "user", "message": {"role": "user", "content": "roda o teste"}},
+            {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash"}]}},
+            {"type": "api-request-blob", "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash"}]}},
+            {"type": "api-request"}, err, {"type": "system"}]
+    if kind == "undated":
+        err.pop("timestamp")
+    if kind == "later":
+        recs += [{"type": "user", "message": {"role": "user", "content": "continua"}},
+                 {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}}, {"type": "system"}]
+    f.write_text("\n".join(json.dumps(r) for r in recs) + ("\n{not json" if kind == "garbage" else "") + "\n")
+
+
+def _stalled(w, pid, pane="%5", text=STALLED, *, name="Mayor", status="idle", transcript="limit", gc_name="gastown__mayor", **kw):
+    """A Remote Control session whose screen shows the limit message as its last output, in the shape of a real session file."""
+    _rc(w, pid, pane, text, name=name, **kw)
+    f = w.d / "sessions" / f"{pid}.json"
+    d = json.loads(f.read_text())
+    d.update(status=status, sessionId=f"sess-{pid}-0000", cwd=f"/work/{name}", tmux=f"{gc_name}:@3.{pane}")
+    f.write_text(json.dumps(d))
+    _transcript(w, name, pid, transcript)
+
+
+def _run_to(w, *offsets):
+    for k in offsets:
+        w.run(at=w.now + k)
+
+
+def test_the_stall_window_is_ten_minutes():
+    assert crew.STALL_S == 600
+
+
+def test_the_message_as_last_output_goes_on_the_banner_watch_and_the_verify_stays_not_verified(w):
+    me = os.getpid()
+    _stalled(w, me)
+    _switch_crypto_to_amb(w)
+    w.run(at=w.now + 90)
+    st = w.state()
+    assert st["verify_last"]["verdict"] == "not-verified" and "limit_watch" not in st       # unproven: still "cannot tell" at the first look
+    rec = st["banner_watch"]["pids"][str(me)]
+    assert st["banner_watch"]["to"] == EMAIL["amb"] and rec["fp"] == crew.banner_last(STALLED) and rec["since"] == w.now + 90
+    assert "last thing on the screen" in w.log() and w.keys() == [] and not w.notified()
+
+
+def test_a_pane_that_keeps_changing_is_moving_and_is_never_called_stopped(w):
+    me = os.getpid()
+    _stalled(w, me)
+    _switch_crypto_to_amb(w)
+    _run_to(w, 90, 300)
+    w.pane_set("%5", text=STALLED_TYPING)                                                 # activity at +400: the clock starts over
+    _run_to(w, 400, 690)                                                                  # 600 s after the FIRST look, only 290 s after the change
+    assert not w.notified() and w.state()["banner_watch"]["pids"][str(me)]["since"] == w.now + 400
+    assert "moving" in w.log()
+    _run_to(w, 1000)                                                                      # 600 s unchanged now
+    assert len(w.notified()) == 1 and "limit message" in w.notified()[0]
+
+
+def test_a_statusline_that_ticks_does_not_keep_a_stopped_session_looking_alive(w):
+    _stalled(w, os.getpid())
+    _switch_crypto_to_amb(w)
+    _run_to(w, 90, 300)
+    w.pane_set("%5", text=STALLED_FOOTER_MOVED)
+    _run_to(w, 690)
+    assert len(w.notified()) == 1
+
+
+def test_stopped_for_ten_minutes_is_pushed_once_by_name_and_by_default_nothing_is_pressed_or_reset(w):
+    me = os.getpid()
+    _stalled(w, me, name="Thies")
+    _switch_crypto_to_amb(w)
+    _run_to(w, 90, 400, 689)
+    assert not w.notified()                                                               # 599 s: not yet
+    _run_to(w, 690, 750, 810, 1000)
+    pushes = w.notified()
+    assert len(pushes) == 1 and "job falhou" in pushes[0] and "Thies" in pushes[0] and "10 min" in pushes[0] and "off" in pushes[0]
+    assert "rc-limit-stalled" in w.state()["alerts"] and w.state()["banner_watch"]["pids"][str(me)]["stalled"] == w.now + 690
+    assert w.keys() == [] and w.gc_calls() == []                                          # not a key, not even a `gc session list`
+    assert not secrets_in(w.log() + (w.d / "crew_state.json").read_text() + "".join(pushes), w)
+
+
+def test_the_banner_watch_runs_even_when_there_is_no_tmux_to_ask_and_says_so(w, monkeypatch):
+    _stalled(w, os.getpid())
+    _switch_crypto_to_amb(w)
+    w.run(at=w.now + 90)
+    monkeypatch.setenv("FAKE_TMUX_DOWN", "1")
+    _run_to(w, 400, 700, 1000)
+    assert not w.notified() and "cannot tell" in w.log() and "banner_watch" in w.state()   # nothing seen = nothing claimed
+
+
+def test_an_old_message_with_work_after_it_is_not_watched_at_all(w):
+    _stalled(w, os.getpid(), text=OLD_MESSAGE_THEN_WORK)
+    _switch_crypto_to_amb(w)
+    _run_to(w, 90, 400, 700, 1000)
+    assert "banner_watch" not in w.state() and not w.notified() and w.keys() == []
+
+
+def test_a_layout_that_was_never_measured_stays_cannot_tell_and_unwatched(w, monkeypatch):
+    monkeypatch.setenv("GC_CREW_UNSTICK", "1")
+    monkeypatch.setenv("GC_CREW_RESET", "1")
+    _stalled(w, os.getpid(), text=BANNER_ONLY)
+    _switch_crypto_to_amb(w)
+    _run_to(w, 90, 400, 700, 1000)
+    assert "banner_watch" not in w.state() and not w.notified() and w.keys() == [] and w.gc_calls() == []
+
+
+def test_the_message_leaving_the_screen_ends_the_watch(w):
+    me = os.getpid()
+    _stalled(w, me)
+    _switch_crypto_to_amb(w)
+    w.run(at=w.now + 90)
+    w.pane_set("%5", text=NO_MESSAGE)
+    w.run(at=w.now + 150)
+    assert "banner_watch" not in w.state() and "left the limit message" in w.log() and not w.notified()
+
+
+def test_work_after_the_message_ends_the_watch_without_a_push(w):
+    _stalled(w, os.getpid())
+    _switch_crypto_to_amb(w)
+    w.run(at=w.now + 90)
+    w.pane_set("%5", text=OLD_MESSAGE_THEN_WORK)
+    _run_to(w, 150, 800)
+    assert "banner_watch" not in w.state() and not w.notified()
+
+
+def test_when_the_modal_opens_on_a_watched_session_it_moves_to_the_limit_watch(w):
+    me = os.getpid()
+    _stalled(w, me)
+    _switch_crypto_to_amb(w)
+    w.run(at=w.now + 90)
+    w.pane_set("%5", text=LIMIT_MODAL)
+    w.run(at=w.now + 150)
+    st = w.state()
+    assert "banner_watch" not in st and str(me) in st["limit_watch"]["pids"]
+
+
+def test_a_session_that_ended_is_dropped_from_the_banner_watch(w):
+    b = subprocess.Popen(["sleep", "60"])
+    try:
+        _stalled(w, b.pid)
+        _switch_crypto_to_amb(w)
+        w.run(at=w.now + 90)
+    finally:
+        b.kill()
+        b.wait()
+    w.run(at=w.now + 150)
+    assert "banner_watch" not in w.state() and "ended on its own" in w.log()
+
+
+def test_the_banner_watch_is_dropped_after_an_hour_and_the_push_stands(w):
+    _stalled(w, os.getpid())
+    _switch_crypto_to_amb(w)
+    _run_to(w, 90, 700)
+    assert len(w.notified()) == 1
+    _run_to(w, 90 + crew.BANNER_WATCH_S + 60)
+    assert "banner_watch" not in w.state() and "the watch is dropped" in w.log() and len(w.notified()) == 1
+
+
+def test_a_banner_watch_record_that_cannot_be_read_is_dropped_and_the_switch_still_happens(w):
+    (w.d / "crew_state.json").write_text(json.dumps({"banner_watch": "garbage"}))
+    _switch_crypto_to_amb(w)
+    assert "banner_watch record in the state cannot be read" in w.log()
+    assert w.state()["last_switch"]["to"] == EMAIL["amb"] and "banner_watch" not in w.state()
+
+
+def test_a_bug_in_the_banner_watch_does_not_cost_the_switch(w, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("bug")
+    monkeypatch.setattr(crew, "banner_last", boom)
+    _stalled(w, os.getpid())
+    _switch_crypto_to_amb(w)
+    _run_to(w, 90, 150)
+    assert w.state()["last_switch"]["to"] == EMAIL["amb"] and "RuntimeError" in w.log() and not w.notified()
+
+
+# ── the last rung: gc session reset (opt-in, OFF, conversation NOT preserved) ──────────────────────────────────
+def _armed_stalled(w, monkeypatch, *, reset="1", **kw):
+    monkeypatch.setenv("GC_CREW_RESET", reset)
+    me = os.getpid()
+    _stalled(w, me, **kw)
+    w.gc_sessions(("gh-050", "gastown__mayor"), ("ga-1ioaom", "dog-ga1ioaom"))
+    _switch_crypto_to_amb(w)
+    return me
+
+
+def _city_args(w):
+    return ["--city", str(w.d / "city")]
+
+
+def test_armed_a_session_stopped_for_ten_minutes_is_reset_once_and_the_push_says_the_conversation_is_lost(w, monkeypatch):
+    me = _armed_stalled(w, monkeypatch)
+    _run_to(w, 90, 400, 689)
+    assert w.gc_calls() == [] and w.keys() == []
+    _run_to(w, 690)
+    assert w.gc_calls() == [_city_args(w) + ["session", "list", "--json"], _city_args(w) + ["session", "reset", "gh-050"]]
+    assert w.keys() == []                                                                 # the reset is not a key either
+    msgs = " | ".join(w.notified())
+    assert "reset" in msgs and "NOT preserved" in msgs and "Mayor" in msgs
+    assert str(me) not in w.state().get("banner_watch", {}).get("pids", {})
+    _run_to(w, 750, 900, 2000)
+    assert len(w.gc_calls()) == 2                                                         # once, never again
+    assert not secrets_in(w.log() + (w.d / "crew_state.json").read_text() + msgs, w)
+
+
+def test_unarmed_the_reset_is_not_even_looked_up(w, monkeypatch):
+    _armed_stalled(w, monkeypatch, reset="0")
+    _run_to(w, 90, 690, 2000)
+    assert w.gc_calls() == [] and len(w.notified()) == 1 and "rc-limit-stalled" in w.state()["alerts"]
+
+
+def test_the_reset_knob_the_env_beats_the_file_and_off_is_the_default(w, monkeypatch):
+    assert crew.reset_armed() is False
+    (w.d / "city" / ".gc" / "crew-reset-on").write_text("")
+    assert crew.reset_armed() is True
+    monkeypatch.setenv("GC_CREW_RESET", "0")
+    assert crew.reset_armed() is False
+    (w.d / "city" / ".gc" / "crew-reset-on").unlink()
+    monkeypatch.setenv("GC_CREW_RESET", "1")
+    assert crew.reset_armed() is True
+    monkeypatch.setenv("GC_CREW_RESET", "maybe")
+    assert crew.reset_armed() is False
+
+
+def test_arming_the_escape_does_not_arm_the_reset(w, monkeypatch):
+    monkeypatch.setenv("GC_CREW_UNSTICK", "1")
+    (w.d / "city" / ".gc" / "crew-unstick-on").write_text("")
+    _armed_stalled(w, monkeypatch, reset="0")
+    _run_to(w, 90, 690, 2000)
+    assert w.gc_calls() == [] and w.keys() == [] and crew.reset_armed() is False
+
+
+def _v_transcript_later(w, me):
+    _transcript(w, "Mayor", me, "later")
+
+
+def _v_transcript_before_the_switch(w, me):
+    _transcript(w, "Mayor", me, "before")
+
+
+def _v_transcript_undated(w, me):
+    _transcript(w, "Mayor", me, "undated")
+
+
+def _v_transcript_missing(w, me):
+    _transcript(w, "Mayor", me, None)
+
+
+def _v_transcript_garbage(w, me):
+    _transcript(w, "Mayor", me, "garbage")
+
+
+def _v_busy(w, me):
+    f = w.d / "sessions" / f"{me}.json"
+    f.write_text(json.dumps({**json.loads(f.read_text()), "status": "busy"}))
+
+
+def _v_no_status(w, me):
+    f = w.d / "sessions" / f"{me}.json"
+    d = json.loads(f.read_text())
+    d.pop("status")
+    f.write_text(json.dumps(d))
+
+
+def _v_exhausted(w, me):
+    w.decide("amb", exhausted=["amb"])
+
+
+def _v_pane_changed_at_the_key(w, me):
+    w.pane_set("%5", captures=0, flip_after=1, flip_text=STALLED_TYPING)
+
+
+def _v_no_gc_match(w, me):
+    w.gc_sessions(("ga-1ioaom", "dog-ga1ioaom"))
+
+
+def _v_two_gc_matches(w, me):
+    w.gc_sessions(("gh-050", "gastown__mayor"), ("gh-051", "gastown__mayor"))
+
+
+def _v_gc_list_fails(w, me):
+    os.environ["FAKE_GC_LIST_FAIL"] = "1"
+
+
+def _v_default_item_changed(w, me):
+    w.default("crypto", blob("crypto", rt="crypto-again"))
+
+
+def _v_not_this_process(w, me):
+    f = w.d / "sessions" / f"{me}.json"
+    f.write_text(json.dumps({**json.loads(f.read_text()), "tmux": "gastown__mayor:@3.%9"}))     # %9 is nobody's pane in the fake
+
+
+@pytest.mark.parametrize("variant,why", [
+    (_v_transcript_later, "does not confirm"),          # the message is old: work came after it
+    (_v_transcript_before_the_switch, "not dated after the switch"),   # idle on an old message since before the switch: nothing is wrong
+    (_v_transcript_undated, "not dated after the switch"),             # cannot tell when = no
+    (_v_transcript_missing, "does not confirm"),         # cannot tell = no
+    (_v_transcript_garbage, "does not confirm"),
+    (_v_busy, "not idle"),                               # the session file says it is working
+    (_v_no_status, "not idle"),
+    (_v_exhausted, "itself registered exhausted"),
+    (_v_pane_changed_at_the_key, "not stopped any more"),
+    (_v_no_gc_match, "no gc session"),
+    (_v_two_gc_matches, "more than one gc session"),
+    (_v_gc_list_fails, "could not list"),
+    (_v_default_item_changed, "cannot tell that the default item holds"),
+    (_v_not_this_process, "another pane"),
+], ids=lambda v: v.__name__[3:] if callable(v) else None)
+def test_armed_but_one_guard_says_no_and_nothing_is_reset(w, monkeypatch, variant, why):
+    me = _armed_stalled(w, monkeypatch)
+    _run_to(w, 90, 400)
+    variant(w, me)
+    try:
+        _run_to(w, 690)
+    finally:
+        os.environ.pop("FAKE_GC_LIST_FAIL", None)
+    assert not any(c[-3:-1] == ["session", "reset"] for c in w.gc_calls()), w.gc_calls()
+    assert why in w.log(), w.log()[-800:]
+    assert "reset" not in " ".join(w.notified()).replace("gc session reset", "")           # the stall push may name the command; no "was reset"
+
+
+def test_a_reset_that_gc_refuses_is_pushed_and_not_retried(w, monkeypatch):
+    me = _armed_stalled(w, monkeypatch)
+    monkeypatch.setenv("FAKE_GC_RESET_FAIL", "1")
+    _run_to(w, 90, 690, 750, 900)
+    resets = [c for c in w.gc_calls() if "reset" in c]
+    assert len(resets) == 1 and any("could not be reset" in n for n in w.notified())
+    assert "rc-limit-reset-failed" in w.state()["alerts"]
+
+
+def test_dry_run_says_it_would_reset_and_runs_nothing(w, monkeypatch, capsys):
+    _armed_stalled(w, monkeypatch)
+    _run_to(w, 90)
+    w.run(dry=True, at=w.now + 690)
+    assert w.gc_calls() == [] and w.keys() == [] and w.notified() == []
+    assert f"DRY-RUN would run gc session reset for Mayor ({os.getpid()})" in capsys.readouterr().err
+
+
+def test_the_reset_needs_the_process_to_be_provably_the_same(w, monkeypatch):
+    me = _armed_stalled(w, monkeypatch)
+    _run_to(w, 90)
+    st = w.state()
+    st["banner_watch"]["pids"][str(me)]["start"] = ""
+    (w.d / "crew_state.json").write_text(json.dumps(st))
+    _run_to(w, 690)
+    assert not [c for c in w.gc_calls() if "reset" in c] and "no start time" in w.log()
+
+
+def test_the_modal_whose_escapes_failed_gets_the_reset_after_ten_minutes_only_when_both_are_armed(w, monkeypatch):
+    monkeypatch.setenv("GC_CREW_UNSTICK", "1")
+    monkeypatch.setenv("GC_CREW_RESET", "1")
+    me = os.getpid()
+    _rc(w, me, "%5", LIMIT_MODAL)
+    d = json.loads((w.d / "sessions" / f"{me}.json").read_text())
+    d.update(tmux="gastown__mayor:@3.%5")
+    (w.d / "sessions" / f"{me}.json").write_text(json.dumps(d))
+    w.gc_sessions(("gh-050", "gastown__mayor"))
+    _switch_crypto_to_amb(w)
+    _run_to(w, 90, 150, 215, 280)                                                         # two Escapes, neither takes
+    assert len(w.keys()) == 2 and w.gc_calls() == []
+    _run_to(w, 400, 600)
+    assert w.gc_calls() == []                                                             # found at +90: not ten minutes yet
+    _run_to(w, 700)
+    assert [c[-2:] for c in w.gc_calls() if "reset" in c] == [["reset", "gh-050"]]
+    assert "limit_watch" not in w.state() or str(me) not in w.state()["limit_watch"]["pids"]
+
+
+def test_the_modal_whose_escapes_failed_is_not_reset_when_only_the_escape_is_armed(w, monkeypatch):
+    monkeypatch.setenv("GC_CREW_UNSTICK", "1")
+    me = os.getpid()
+    _rc(w, me, "%5", LIMIT_MODAL)
+    w.gc_sessions(("gh-050", "gastown__mayor"))
+    _switch_crypto_to_amb(w)
+    _run_to(w, 90, 150, 215, 280, 700)
+    assert len(w.keys()) == 2 and w.gc_calls() == []
