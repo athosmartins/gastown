@@ -20,18 +20,19 @@ COMO DECIDE
   · FALHA ABERTA, de propósito: é trava contra engano (o slip de cwd), não sandbox, e roda em TODA sessão do mini — um defeito dele não pode derrubar o trabalho dos outros.
     JSON ilegível, parser que não carrega, qualquer exceção → libera (o parser que não carrega e o erro viram result=ERROR no log; `--selfcheck` falha para o ativador ver).
     Diretório que o parser não resolve (variável, glob, lançador opaco como flock/watch, aninhado fundo demais) → libera, EXCETO quando o cwd da sessão é o clone vivo: aí é o
-    escorregão do incidente e barra, pedindo `git -C <pasta-absoluta>` (a mensagem explica; com a pasta dita por extenso e fora do vivo, passa).
+    escorregão do incidente e barra, pedindo `git -C <pasta-absoluta>` (a mensagem explica; com a pasta dita por extenso e fora do vivo, passa). O que libera sem saber onde roda
+    NÃO é silencioso: uma linha result=UNRESOLVED (op, cwd, sessão) no log, exit 0 — contar essas linhas diz quantas vezes o guarda ficou cego.
 CÓDIGOS: 0 liberado · 2 bloqueado. `--selfcheck [settings.json…]`: 0 se o guarda decide como deveria numa pasta de teste E (com settings) todo PreToolUse de Bash é EXATAMENTE
   `python3 -I <este arquivo>` (só type/command/timeout — um `if` limitaria o disparo a `git -C *`, e `|| true` apagaria o exit 2) sem `disableAllHooks`; 1 caso contrário.
-CUSTO: roda em TODA chamada de Bash. Comando que não cita checkout/switch sai no pré-filtro, perto do Python vazio (~85-120 ms no mini, que mede ruidoso sob load alto); o que cita carrega o parser
+CUSTO: roda em TODA chamada de Bash. Comando que não cita checkout/switch (nem abre `$'…'`) sai no pré-filtro, perto do Python vazio (~85-120 ms no mini, que mede ruidoso sob load alto); o que cita carrega o parser
   e custa ~140-220 ms. O parser traz `import tempfile` só para o --selfcheck dele (shutil → compression.zstd, +~270 ms): load_rcg() põe um módulo vazio no lugar. Não importe nada pesado no topo deste arquivo.
-LOG: uma linha TSV por bloqueio/erro em $LCG_LOG, senão $GC_CITY_PATH/.gc/logs/live-clone-git-guard.log (ts result root op cwd session agent alias). Liberar não grava.
+LOG: uma linha TSV por bloqueio (result=BLOCK), erro (ERROR) ou liberação às cegas (UNRESOLVED, exit 0) em $LCG_LOG, senão $GC_CITY_PATH/.gc/logs/live-clone-git-guard.log (ts result root op cwd session agent alias). Liberar sabendo onde roda não grava.
 ATIVAÇÃO (decisão do Mayor/Athos: o settings do usuário não é editado por agente): em PreToolUse, matcher "Bash", UM hook
   {"type": "command", "command": "python3 -I /Users/athos/gt/.gascity-gastown-hq/scripts/live-clone-git-guard.py"}   — sem `if`.
   Depois: `python3 -I <este arquivo> --selfcheck ~/.claude/settings.json` tem que sair 0.
 LIMITES (não vê, e o que isso quer dizer): checkout feito FORA do Claude (launchd, script, terminal do Athos — o post-checkout cobre com log); `git rebase`/`bisect`/`reset --hard` (também mexem no HEAD ou
-  na árvore, mas não foram o incidente; `git reset --hard` já tem o guarda dangerous-command); alvo que só se sabe em tempo de execução (`cd "$(…)"`, `cd $VAR`) quando o cwd da sessão NÃO é o vivo; aninhamento além de 3 níveis (o parser desiste: o que vem depois no mesmo comando não é conferido — armadilha de propósito é fora do escopo); alias do git; `g''it`/`che''ckout`
-  não escapam do pré-filtro mas um git por variável (`$G checkout`) sim. Depende do remote-clone-guard.py (scan/res): mudar a assinatura de lá quebra este selftest.
+  na árvore, mas não foram o incidente; `git reset --hard` já tem o guarda dangerous-command); alvo que só se sabe em tempo de execução (`cd "$(…)"`, `cd $VAR`) quando o cwd da sessão NÃO é o vivo; aninhamento além de 3 níveis (o parser desiste: o que vem depois no mesmo comando não é conferido — armadilha de propósito é fora do escopo); alias do git; caminho do clone escrito com outra caixa (o APFS ignora a caixa, o guarda compara o texto do realpath);
+  `g''it`/`che''ckout` e `$'\x63heckout'` não escapam do pré-filtro mas um git por variável (`$G checkout`) sim. Depende do remote-clone-guard.py (scan/res): mudar a assinatura de lá quebra este selftest.
 """
 from __future__ import annotations
 
@@ -46,6 +47,7 @@ HEAD_MOVERS = ("checkout", "switch")
 QUIET = {"-q", "--quiet"}
 BRANCHY = re.compile(r"-[A-Za-z]*[bBdt][A-Za-z]*|--(?:detach|orphan|track)(?:=.*)?")  # opção do checkout que cria branch ou destaca: `--` depois dela NÃO vira modo arquivo
 PREFILTER = re.compile(r"checkout|switch")
+ANSI_C = "$" + "'"  # abre uma string ANSI-C ($'\x63heckout'): esconde letras por escape, o pré-filtro não enxerga a palavra e só o parser decodifica
 UNKNOWN = "pasta desconhecida: "  # prefixo do `op` quando o parser não disse onde o git roda e o cwd da sessão é o clone vivo (message() troca o texto)
 
 
@@ -90,9 +92,9 @@ def moves_head(sub: str, rest: list) -> bool:
     return not (words == ["main"] and all(f in QUIET for f in flags))
 
 
-def make_hit(rcg, roots: set, hook_cwd):
+def make_hit(rcg, roots: set, hook_cwd, blind: list):
     def hit(seg: list, env: dict, cwd, terr, own):
-        """Substitui rcg.git_hit (mesma assinatura): (raiz, operação) se este `git` move o HEAD de um clone protegido; None se não (ou se não sei onde roda e a sessão não está no clone vivo: falha aberta)."""
+        """Substitui rcg.git_hit (mesma assinatura): (raiz, operação) se este `git` move o HEAD de um clone protegido; None se não (ou se não sei onde roda e a sessão não está no clone vivo: falha aberta, anotada em `blind`)."""
         # vazio (sem GIT_WORK_TREE/GIT_DIR) → o cwd manda; ilegível ($VAR, glob) → res devolve None e o alvo vira "não sei"
         wt, gd, i = env.get("GIT_WORK_TREE"), env.get("GIT_DIR"), 1
         while i < len(seg) and seg[i].startswith("-"):
@@ -124,24 +126,29 @@ def make_hit(rcg, roots: set, hook_cwd):
             root = protected(c, roots) if c else None
             if root:
                 return root, op
-        if cands[0] is None:  # não sei onde este git roda (cd $VAR, lançador opaco, -C $VAR): só barro se o cwd da SESSÃO é o clone vivo — o escorregão do incidente; fora dele, libera
+        if cands[0] is None:  # não sei onde este git roda (cd $VAR, lançador opaco, -C $VAR): só barro se o cwd da SESSÃO é o clone vivo — o escorregão do incidente; fora dele, libera, mas CONTADO (blind → result=UNRESOLVED no log)
             root = protected(hook_cwd, roots) if hook_cwd else None
-            return (root, UNKNOWN + op) if root else None
+            if root:
+                return root, UNKNOWN + op
+            blind.append(op)  # sessão fora do vivo: libera, mas conta
         return None
     return hit
 
 
-def decide(cmd: str, cwd, roots: set, rcg):
-    """None = liberado; (raiz, operação) = bloqueado. Onde o git roda e o parser não resolveu (variável, lançador opaco, aninhado fundo demais) = não sei: libera, salvo se o cwd da sessão é o clone vivo."""
+def decide(cmd: str, cwd, roots: set, rcg, blind: list):
+    """None = liberado; (raiz, operação) = bloqueado. Onde o git roda e o parser não resolveu (variável, lançador opaco, aninhado fundo demais) = não sei: libera, salvo se o cwd da sessão é o clone vivo; o que liberou sem saber vai para `blind`."""
     # vazio (sem cwd no JSON) → None: não há de onde desconfiar, e o parser também recebe "não sei"
     real = os.path.realpath(cwd) if cwd else None
-    rcg.git_hit = make_hit(rcg, roots, real)  # scan chama git_hit pelo nome do módulo: trocar aqui troca a pergunta, não o leitor de shell
+    rcg.git_hit = make_hit(rcg, roots, real, blind)  # scan chama git_hit pelo nome do módulo: trocar aqui troca a pergunta, não o leitor de shell
     res = rcg.scan(cmd, real, "", None)
     if res and res[0]:
         return res
     if res:  # (None, motivo): o parser desistiu no meio (aninhado fundo demais) e o resto do comando não foi conferido: mesmo critério do `não sei` acima; o `op` é o comando (o motivo do parser não diz nada a quem lê a mensagem)
+        op = " ".join(cmd.split())[:200]
         root = protected(real, roots) if real else None
-        return (root, UNKNOWN + " ".join(cmd.split())[:200]) if root else None
+        if root:
+            return root, UNKNOWN + op
+        blind.append(op)  # aninhado fundo demais fora do vivo: libera, mas conta
     return None
 
 
@@ -192,7 +199,7 @@ def selfcheck(args: list) -> int:
                                ("git checkout main", live, False), ("git checkout -- f", live, False), ("git status", live, False),
                                ("git checkout --detach abc", nested, False)):
             try:
-                got = decide(cmd, cwd, {live}, rcg) is not None
+                got = decide(cmd, cwd, {live}, rcg, []) is not None
             except Exception as e:  # noqa: BLE001
                 got = f"erro {type(e).__name__}"
             if got != want:
@@ -232,19 +239,22 @@ def main(argv: list) -> int:
     # vazio (sem tool_input/command) → cmd "" → o pré-filtro libera; ilegível (tool_input que não é objeto) → também "" e libera, sem traceback
     ti = inp.get("tool_input")
     cmd = str(ti.get("command") or "") if isinstance(ti, dict) else ""
-    if not PREFILTER.search(re.sub(r"['\"\\]", "", cmd)):  # sem a palavra (nem escondida por aspas/barra), nada a conferir: não paga o parser
+    if ANSI_C not in cmd and not PREFILTER.search(re.sub(r"['\"\\]", "", cmd)):  # sem a palavra (nem escondida por aspas/barra/ANSI-C), nada a conferir: não paga o parser
         return 0
     try:
         rcg = load_rcg()
     except Exception as e:  # noqa: BLE001 — trava contra engano: parser quebrado não derruba a sessão de ninguém
         log("ERROR", "", "parser: " + str(e)[:100], "")
         return 0  # sem parser
+    blind = []  # ops de checkout/switch que liberei sem saber onde rodam
     try:
-        hit = decide(cmd, inp.get("cwd") or None, roots_from_env(), rcg)
+        hit = decide(cmd, inp.get("cwd") or None, roots_from_env(), rcg, blind)
     except Exception as e:  # noqa: BLE001
         log("ERROR", "", "decide: " + str(e)[:100], inp.get("cwd") or "")
         return 0  # falhou
     if not hit:
+        if blind:  # liberado sem saber: o veredito (0) não muda, mas fica contado e visível — sem isso ninguém mede quantas vezes o guarda ficou cego
+            log("UNRESOLVED", "", blind[0], inp.get("cwd") or "")
         return 0
     root, op = hit
     log("BLOCK", root, op, inp.get("cwd") or "")

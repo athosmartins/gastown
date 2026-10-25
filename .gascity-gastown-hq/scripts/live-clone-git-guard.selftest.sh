@@ -13,6 +13,7 @@
 #           o MESMO checkout num clone aninhado (crew/x), num worktree ligado e fora do clone vivo, e comando que só CITA o checkout;
 #   open  — falhar ABERTO: stdin que não é JSON, ferramenta que não é Bash, diretório que não sei resolver, o módulo do parser que não
 #           carrega (e nesse caso gravar ERROR no log) e log que não grava NÃO podem virar "bloqueado": é trava contra engano, não sandbox;
+#           e o que se libera SEM saber onde o git roda (sessão fora do vivo) fica CONTADO: uma linha result=UNRESOLVED, exit 0 (dentro do vivo, barra);
 #   log   — cada bloqueio vira UMA linha em LCG_LOG com a sessão/alias de quem tentou, e a mensagem diz o que viu e o que fazer;
 #   self  — `--selfcheck [settings.json]`: 0 só se o guarda decide como deveria E (com o settings) todo PreToolUse de Bash é exatamente
 #           `python3 -I <guarda>`; 1 caso contrário.
@@ -104,6 +105,8 @@ b 2 "block: git checkout em find -exec no vivo"                             "fin
 b 2 "block: git checkout <sha> -- (sem arquivo depois do -- o HEAD MOVE)"   "git checkout $SHA --"
 b 2 "block: git checkout outra-branch -- (idem, nome desambiguado)"         "git checkout feature --"
 b 2 "block: git checkout -b nova <sha> -- arquivo (o git recusa; o guarda não confia nisso)" "git checkout -b nova $SHA -- f"
+b 2 "block: git checkout --det <sha> -- (abreviação do --detach, nada depois do --)" "git checkout --det $SHA --"
+Q="'"; b 2 "block: git \$'\\x63heckout' --detach (ANSI-C esconde a palavra do pré-filtro, o parser decodifica)" "git \$${Q}\\x63heckout${Q} --detach $SHA"
 b 2 "block: cd \$VAR && git checkout, com a sessão NO vivo (não sei onde roda)" 'cd "$WHERE" && git checkout --detach abc'
 b 2 "block: git -C \$VAR checkout, com a sessão NO vivo"                    'git -C "$WHERE" checkout --detach abc'
 b 2 "block: lançador opaco (flock) na frente do git, sessão NO vivo"        "flock $T/l git checkout --detach $SHA"
@@ -154,6 +157,12 @@ b 0 "open: git checkout num cwd que não existe e fora do vivo"              "gi
 b 0 "open: lançador opaco (flock) com a sessão FORA do vivo → libera"       "flock $T/l git checkout --detach $SHA" "$OUT"
 b 0 "open: eval aninhado além do limite com a sessão FORA do vivo → libera" "eval eval eval eval eval git checkout --detach $SHA" "$OUT"
 b 0 "open: git -C \$VAR checkout com a sessão FORA do vivo → libera"        'git -C "$WHERE" checkout --detach abc' "$OUT"
+nlog() { wc -l < "$T/guard.log" | tr -d ' '; }
+: > "$T/guard.log"; run < <(mk Bash "$OUT" command 'cd "$WHERE" && git checkout --detach abc'); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=UNRESOLVED' "$T/guard.log" && grep -q 'op=git checkout --detach abc' "$T/guard.log" && grep -qF "cwd=$OUT" "$T/guard.log"; ok $? "open: liberar sem saber onde roda deixa UMA linha result=UNRESOLVED com o op e o cwd, exit 0 (rc=$RC)"
+: > "$T/guard.log"; run < <(mk Bash "$OUT" command "flock $T/l git checkout --detach $SHA"); [ "$RC" = 0 ] && grep -q 'result=UNRESOLVED' "$T/guard.log"; ok $? "open: lançador opaco liberado também é contado (UNRESOLVED)"
+: > "$T/guard.log"; run < <(mk Bash "$OUT" command "eval eval eval eval eval git checkout --detach $SHA"); [ "$RC" = 0 ] && grep -q 'result=UNRESOLVED.*op=eval eval eval eval eval git checkout' "$T/guard.log"; ok $? "open: aninhado fundo demais liberado também é contado (UNRESOLVED, op = o comando)"
+: > "$T/guard.log"; run < <(mk Bash "$OUT" command "git -C $WT checkout --detach $SHA; git checkout main; cd \"\$WHERE\" && git checkout main"); [ "$RC" = 0 ] && [ "$(nlog)" = 0 ]; ok $? "open: o que resolve (ou não move o HEAD) NÃO vira UNRESOLVED — a contagem não enche de ruído"
+: > "$T/guard.log"; run < <(mk Bash "$LIVE" command 'cd "$WHERE" && git checkout --detach abc'); blocked && [ "$(nlog)" = 1 ] && grep -q 'result=BLOCK' "$T/guard.log"; ok $? "open: o 'não sei' barrado no vivo é UMA linha BLOCK, sem UNRESOLVED junto"
 run < <(printf 'garbage not json: git checkout --detach'); [ "$RC" = 0 ]; ok $? "open: stdin que não é JSON (rc=$RC)"
 run < /dev/null; [ "$RC" = 0 ]; ok $? "open: stdin vazio (rc=$RC)"
 run < <(printf '{"tool_name":"Bash"}'); [ "$RC" = 0 ]; ok $? "open: Bash sem tool_input (rc=$RC)"
@@ -261,6 +270,10 @@ PY
   mut "aninhado fundo demais libera"        block '    if res:  # (None, motivo)' '    if False:  # (None, motivo)'
   mut "arquivo sem pathspec conta"          block 'if sub == "checkout" and "--" in rest and rest[rest.index("--") + 1:]:' 'if sub == "checkout" and "--" in rest:'
   mut "mensagem do não-sei some"            block 'não consegui ver em que pasta' 'bloqueado em que pasta'
+  mut "UNRESOLVED não grava"                open  'log("UNRESOLVED", "", blind[0], inp.get("cwd") or "")' 'pass'
+  mut "não-sei fora do vivo não conta"      open  'blind.append(op)  # sessão fora do vivo: libera, mas conta' 'pass'
+  mut "aninhado fundo fora do vivo não conta" open 'blind.append(op)  # aninhado fundo demais fora do vivo: libera, mas conta' 'pass'
+  mut "prefiltro ignora ANSI-C"             block 'if ANSI_C not in cmd and not PREFILTER.search' 'if not PREFILTER.search'
   wait
   for k in $(seq 1 "$mn"); do
     rc=$(cat "$T/rc.$k" 2>/dev/null || echo ausente)
