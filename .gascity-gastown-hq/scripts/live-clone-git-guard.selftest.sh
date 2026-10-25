@@ -18,7 +18,7 @@
 #           (se o Claude Code mudar o payload o guarda morre em toda chamada, e sem a linha ninguém vê). Vale para QUALQUER payload que o guarda não lê
 #           (ga-70d0su): tool_input.command ausente/null/vazio/renomeado, tool_name ausente ou "bash", cwd que não é texto, JSON fundo demais → ERROR, exit 0,
 #           sem traceback. Também fica CONTADO (UNRESOLVED) o que se libera sem saber O QUE o git roda (subcomando por variável, operandos do xargs/parallel;
-#           com a sessão no vivo, barra) e o comando acima do teto de 32 KB, que não paga o parser; o log que não codifica o texto (surrogate solto) não
+#           com a sessão no vivo, barra) e o comando acima do teto de 32 KB, que não paga o parser (com a sessão no vivo, barra); o log que não codifica o texto (surrogate solto) não
 #           derruba o exit 2;
 #   log   — cada bloqueio vira UMA linha em LCG_LOG com a sessão/alias de quem tentou, e a mensagem diz o que viu e o que fazer;
 #   self  — `--selfcheck [settings.json]`: 0 só se o guarda decide como deveria E (com o settings) todo PreToolUse de Bash é exatamente
@@ -57,6 +57,8 @@ b() {  # b QUERO "descrição" "comando" [cwd]   (cwd padrão: o clone vivo — 
   run < <(mk Bash "${4-$LIVE}" command "$3"); if [ "$1" = 2 ]; then blocked; else [ "$RC" = 0 ]; fi; ok $? "$2 (rc=$RC, queria $1)"
 }
 
+BIG=$(head -c 40000 /dev/zero | tr '\0' x)   # enche o comando ACIMA do teto de 32 KB (MAX_CMD) do guarda; os grupos block e open o usam
+PAD20=$(head -c 20000 /dev/zero | tr '\0' x) # enche o comando ABAIXO do teto (o parser ainda roda); o grupo pass o usa
 if grp block; then
 b 2 "block: git checkout --detach <sha> no cwd (a forma de 24/10)"          "git checkout --detach $SHA"
 b 2 "block: git checkout <sha> (restaurar por SHA mantém o HEAD solto)"     "git checkout $SHA"
@@ -132,17 +134,22 @@ b 2 "block: git \$(echo checkout) --detach (substituição no lugar do subcomand
 b 2 "block: echo --detach abc | xargs git checkout (os operandos chegam em tempo de execução), sessão NO vivo" 'echo --detach abc | xargs git checkout'
 b 2 "block: echo --detach abc | parallel git checkout (idem, lançador opaco), sessão NO vivo" 'echo --detach abc | parallel git checkout'
 b 2 "block: x''args (aspas dentro do nome) acrescenta operandos do mesmo jeito, sessão NO vivo" "echo --detach abc | x''args git checkout"
+b 2 "block: echo --detach | xargs git checkout main (a volta recebe --detach em tempo de execução: NÃO é a volta), sessão NO vivo" 'echo --detach | xargs git checkout main'
+b 2 "block: echo --detach | xargs git switch main (idem com switch)" 'echo --detach | xargs git switch main'
+b 2 "block: echo checkout --detach abc | xargs git (o próprio subcomando vem do xargs), sessão NO vivo" 'echo checkout --detach abc | xargs git'
+b 2 "block: echo checkout --detach abc | parallel git -C <vivo> (git sem subcomando atrás de parallel, o -C é o vivo), de outro cwd" "echo checkout --detach abc | parallel git -C $LIVE" "$OUT"
 b 2 "block: git -C <vivo> \$X (o clone é o vivo, o subcomando não leio), de outro cwd" "X=checkout; git -C $LIVE \$X --detach abc" "$OUT"
 run < <(mk Bash "$LIVE" command 'X=checkout; git $X --detach abc'); blocked && grep -q 'não consegui ver o que' "$T/err" && grep -qF 'git $X --detach abc' "$T/err" && grep -qF "$LIVE" "$T/err"; ok $? "block: o 'não sei O QUE' diz que não viu o que o git faz, cita o comando e o clone vivo"
-# ga-70d0su (achado 4): abaixo do teto o parser ainda confere (o teto só vale para o que passa dele)
-PAD20=$(head -c 20000 /dev/zero | tr '\0' x)
-b 2 "block: comando de 20 KB que cita checkout ainda passa pelo parser (abaixo do teto)" "git checkout --detach $SHA; echo $PAD20"
+# acima do teto o parser não roda: é um "não sei" como os outros — com a sessão NO vivo barra (liberar aqui deixava um comando preenchido com lixo escapar do guarda onde ele existe), fora dele libera e conta (grupo open)
+: > "$T/guard.log"; run < <(mk Bash "$LIVE" command "git checkout --detach $SHA; echo $BIG"); blocked && grep -q 'comando grande demais' "$T/err" && grep -q 'não consegui conferi-lo' "$T/err" && grep -qF "$LIVE" "$T/err" && [ "$(wc -l < "$T/guard.log" | tr -d ' ')" = 1 ] && grep -q 'result=BLOCK.*op=comando grande demais' "$T/guard.log"; ok $? "block: comando acima do teto com a sessão NO vivo barra (é um 'não sei' como os outros), UMA linha BLOCK (rc=$RC)"
 # ga-70d0su (achado 2): o veredito não depende do log — um surrogate solto no comando levantava UnicodeEncodeError dentro do log() e o exit 2 virava exit 1 (o checkout rodava)
 : > "$T/guard.log"; run < <(printf '{"tool_name":"Bash","cwd":"%s","tool_input":{"command":"git checkout --detach x \\ud800"}}' "$LIVE"); blocked && grep -q 'result=BLOCK' "$T/guard.log"; ok $? "block: surrogate solto no comando NÃO derruba o veredito (exit 2 e a linha BLOCK ficam) (rc=$RC)"
 fi
 
 if grp pass; then
 b 0 "pass: git checkout main (a volta)"                                     "git checkout main"
+# ga-70d0su (achado 4): abaixo do teto o parser ainda confere — a volta num comando de 20 KB, com a sessão NO vivo, é liberada (acima do teto ela seria barrada: o parser não roda e a sessão está no vivo)
+b 0 "pass: a volta (git checkout main) num comando de 20 KB, abaixo do teto, segue liberada" "git checkout main; echo $PAD20"
 b 0 "pass: git checkout -q main"                                            "git checkout -q main"
 b 0 "pass: git switch main"                                                 "git switch main"
 b 0 "pass: git switch -q main"                                              "git switch -q main"
@@ -232,10 +239,10 @@ perr "tool no lugar de tool_name" "{\"tool\":\"Bash\",\"cwd\":\"$OUT\",\"tool_in
 : > "$T/guard.log"; run < <(mk Bash "$OUT" command 'echo --detach abc | xargs git checkout'); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=UNRESOLVED.*op=git checkout' "$T/guard.log"; ok $? "open: operandos que o xargs acrescenta, liberado fora do vivo, deixa UMA linha UNRESOLVED (rc=$RC)"
 : > "$T/guard.log"; run < <(mk Bash "$OUT" command 'echo abc | parallel git checkout'); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=UNRESOLVED' "$T/guard.log"; ok $? "open: idem com parallel (rc=$RC)"
 : > "$T/guard.log"; run < <(mk Bash "$OUT" command 'git checkout; git switch'); [ "$RC" = 0 ] && [ "$(nlog)" = 0 ]; ok $? "open: controle — git checkout/switch SEM argumento e sem xargs/parallel segue sem linha (só mostra o estado) (rc=$RC)"
-# ── ga-70d0su (achado 4): teto de tamanho — o parser tem custo superlinear no texto que cita checkout/switch; acima do teto não paga o parser, libera e CONTA
-BIG=$(head -c 40000 /dev/zero | tr '\0' x)
+: > "$T/guard.log"; run < <(mk Bash "$OUT" command 'echo --detach | xargs git checkout main'); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=UNRESOLVED.*op=git checkout main' "$T/guard.log"; ok $? "open: xargs git checkout main (a volta com operando acrescentado) fora do vivo deixa UMA linha UNRESOLVED (rc=$RC)"
+: > "$T/guard.log"; run < <(mk Bash "$OUT" command 'echo checkout --detach abc | xargs git'); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=UNRESOLVED.*op=git' "$T/guard.log"; ok $? "open: git sem subcomando atrás de xargs fora do vivo deixa UMA linha UNRESOLVED (rc=$RC)"
+# ── ga-70d0su (achado 4): teto de tamanho — o parser tem custo superlinear no texto que cita checkout/switch; acima do teto não paga o parser: fora do vivo libera e CONTA (com a sessão NO vivo barra: grupo block)
 : > "$T/guard.log"; run < <(mk Bash "$OUT" command "git checkout --detach $SHA; echo $BIG"); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=UNRESOLVED.*op=comando grande demais' "$T/guard.log" && grep -qF "cwd=$OUT" "$T/guard.log"; ok $? "open: comando acima do teto que cita checkout → libera E conta (UNRESOLVED), sem pagar o parser (rc=$RC)"
-: > "$T/guard.log"; run < <(mk Bash "$LIVE" command "git checkout --detach $SHA; echo $BIG"); [ "$RC" = 0 ] && grep -q 'result=UNRESOLVED.*op=comando grande demais' "$T/guard.log"; ok $? "open: acima do teto libera mesmo com a sessão NO vivo (é liberar e contar, não barrar) (rc=$RC)"
 : > "$T/guard.log"; run < <(mk Bash "$OUT" command "echo $BIG"); [ "$RC" = 0 ] && [ "$(nlog)" = 0 ]; ok $? "open: comando grande que NÃO cita checkout/switch sai no pré-filtro, sem linha (rc=$RC)"
 : > "$T/guard.log"
 ( LCG_RCG="$T/nao-existe.py"; export LCG_RCG; run < <(mk Bash "$LIVE" command "git checkout --detach $SHA"); [ "$RC" = 0 ] ); ok $? "open: parser que não carrega → libera, não bloqueia"
@@ -360,15 +367,19 @@ PY
   mut "JSON fundo demais derruba o guarda"                open  'except (ValueError, OSError, RecursionError) as e:' 'except (ValueError, OSError) as e:'
   mut "log sem backslashreplace perde o veredito"         block 'open(path, "a", errors="backslashreplace")' 'open(path, "a")'
   mut "subcomando ilegível libera"                        block 'bool(SHELLY.search(sub)) or ' ''
-  mut "operandos do xargs/parallel liberam"               block '(sub in HEAD_MOVERS and not rest and appends)' 'False'
+  mut "operandos do xargs/parallel liberam"               block '(appends and (sub == "" or sub in HEAD_MOVERS))' 'False'
+  mut "xargs com operando na linha passa (a volta)"       block 'appends and (sub == ""' 'appends and not rest and (sub == ""'
+  mut "git sem subcomando atrás do xargs passa"           block '(sub == "" or sub in HEAD_MOVERS)' 'sub in HEAD_MOVERS'
   mut "xargs entre aspas passa batido"                    block 'APPENDERS.search(UNQUOTE.sub("", cmd))' 'APPENDERS.search(cmd)'
   mut "mensagem do não-sei-O-QUE some"                    block 'não consegui ver o que' 'bloqueado o que'
   mut "não sei O QUE não vale como não sei onde"          open  'unsure = what or tree is None' 'unsure = tree is None'
   mut "teto removido"                                     open  'if len(cmd) > MAX_CMD:' 'if False:'
-  mut "acima do teto barra"                               open  'return 0  # acima do teto: libera' 'return 2  # acima do teto: libera'
-  mut "teto pequeno demais"                               block 'MAX_CMD = 32768' 'MAX_CMD = 1000'
+  mut "acima do teto com a sessão no vivo libera"         block '            return root, op' '            return None'
+  mut "acima do teto fora do vivo não conta"              open  'blind.append(op)  # acima do teto, fora do vivo: libera, mas conta' 'pass'
+  mut "mensagem do teto some"                             block 'e o texto cita checkout/switch: não consegui conferi-lo' 'e o texto cita checkout/switch: bloqueado'
+  mut "teto pequeno demais"                               pass  'MAX_CMD = 32768' 'MAX_CMD = 1000'
   mut "selfcheck não confere o subcomando ilegível"       self  'bool(SHELLY.search(sub)) or ' ''
-  mut "selfcheck não confere o xargs"                     self  '(sub in HEAD_MOVERS and not rest and appends)' 'False'
+  mut "selfcheck não confere o xargs"                     self  '(appends and (sub == "" or sub in HEAD_MOVERS))' 'False'
   wait
   for k in $(seq 1 "$mn"); do
     rc=$(cat "$T/rc.$k" 2>/dev/null || echo ausente)
