@@ -696,7 +696,7 @@ bd() {
     *) return 0 ;;
   esac
 }
-gc() { echo "GC $*" >> "$CALLS"; return 0; }
+gc() { echo "GC $*" >> "$CALLS"; [ "${E11_STUB_GC_FAILS:-0}" = "1" ] && return 1; return 0; }
 SRC_STORE="$TMPD/beadcity"; MRK_STORE="$TMPD/city"
 mkdir -p "$SRC_STORE"
 
@@ -850,7 +850,7 @@ echo "  — ga-emc197: the source bead's labels are WRITTEN, READ BACK, and only
 # The audit of 00634ad5a: the refusal removed gate:queued BEFORE adding gate:needs-fix, both with `|| true` and no read-back.
 # If the add did not land (bd's batch is all-or-nothing), the bead had NO gate:* label — nothing watches that — the marker
 # was closed anyway and the log said "-> gate:needs-fix". Each case below must FAIL on the guard as it was at 00634ad5a.
-stub_reset() { unset E11_STUB_DROP E11_STUB_DROP_RC E11_STUB_DROP_TIMES E11_STUB_SRC_SHOW_FAIL_N E11_STUB_SRC_SHOW_FAIL_FROM E11_STUB_SRC_SHOW_FAIL_MODE E11_STUB_LABELS_VANISH; rm -f "$TMPD/src-show-n" "$TMPD/drop-n"; }
+stub_reset() { unset E11_STUB_DROP E11_STUB_DROP_RC E11_STUB_DROP_TIMES E11_STUB_SRC_SHOW_FAIL_N E11_STUB_SRC_SHOW_FAIL_FROM E11_STUB_SRC_SHOW_FAIL_MODE E11_STUB_LABELS_VANISH E11_STUB_GC_FAILS; rm -f "$TMPD/src-show-n" "$TMPD/drop-n"; }
 src_has() { jq -r --arg l "$1" '.[0].labels|index($l) != null' "$SRC_STORE/show-$BB.json" 2>/dev/null; }
 calls_count() { grep -cF -- "$1" "$CALLS"; }
 
@@ -1011,6 +1011,17 @@ E11_STUB_DROP="add gate:needs-fix,gate:e11-refusals:3" run_e11 1 "$RIG_OK" "$BB"
 eq "3rd, the first add (needs-fix + counter 3) not confirmed: nothing escalated, nothing removed" "$RC|$(src_has gate:queued)|$(src_has gate:needs-human)" "1|true|false"
 hasnt "3rd, ...no mail to the mayor claiming anything" "$CALLS" "mail send mayor"
 hasnt "3rd, ...the marker is not closed" "$CALLS" "BD -C $MRK_STORE close m-e11"
+stub_reset
+
+echo "  · the mail fails: the log says what the bead was READ BACK to carry, not what the old text assumed —"
+set_beads "$BB" '["story:approved","gate:queued","gate:e11-refusals:2"]' "$PLAIN"
+E11_STUB_GC_FAILS=1 run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "3rd, mayor mail fails: still refused, bead parked (rc 1)" "$RC|$(src_has gate:needs-human)" "1|true"
+has "3rd, mayor mail fails: the warning names the read-back state" "$LOGF" "WARN E11-DIFF-CAP: could not mail the mayor about the 3rd refusal of $BB — the source bead carries gate:needs-human and the reason (read back): a human should look"
+set_beads "$BB" '["story:approved","gate:queued"]' "$PLAIN"
+E11_STUB_GC_FAILS=1 run_e11 1 "$RIG_OK" "$BB" crew/oracle/wa-abc123; RC=$?
+eq "crew, author mail fails: still refused (rc 1)" "$RC" "1"
+has "crew, author mail fails: the log names the read-back state, no promise about the Pilot" "$LOGF" "no author mail delivered for $BB (candidates: oracle, oracle-${BB%%-*}) — the source bead carries gate:needs-fix and the reason"
 stub_reset
 set_beads "$BB" "$PLAIN" "$PLAIN"   # later sections start from a plain source bead again
 

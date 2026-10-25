@@ -8509,7 +8509,7 @@ $_E11_REASON_TAIL"
     if [ "$_E11_SRC_OK" = "1" ] && [ "$_E11_HUMAN_TXT" != "" ]; then
       gc --city "$GC_CITY" mail send mayor -s "Gate E11: $BEAD_ID recusado 3x por tamanho — precisa de humano" \
         -m "$BEAD_ID (branch $BRANCH) foi recusado na submissao pela 3a vez: $_E11_WHAT. $_E11_HUMAN_TXT Decida: fatiar voce mesmo (cada fatia: bd create '<titulo>' --parent $BEAD_ID -t $_E11_PTYPE — fatia de feature nasce feature; e fatia VERTICAL: um comportamento testavel de ponta a ponta, nao uma camada so de schema/API/infra), ou gate:size-exempt com motivo no bead." 2>/dev/null \
-        || warn "E11-DIFF-CAP: could not mail the mayor about the 3rd refusal of $BEAD_ID — the bead carries gate:needs-human"
+        || warn "E11-DIFF-CAP: could not mail the mayor about the 3rd refusal of $BEAD_ID — the source bead carries $_E11_ON_SRC (read back): a human should look"
     fi
     # The author is mailed the reason only on the confirmed path: the mail says what the bead carries, and on the other path
     # nobody has seen what it carries (_E11_REASON does not even exist there).
@@ -8520,7 +8520,7 @@ $_E11_REASON_TAIL"
       for _e11_to in "$_E11_AUTHOR" "${_E11_AUTHOR}-${BEAD_ID%%-*}"; do
         if gc --city "$GC_CITY" mail send "$_e11_to" -s "Gate recusou $BEAD_ID na submissao: $_E11_WHAT (E11)" -m "$_E11_REASON" >/dev/null 2>&1; then _E11_MAILED=1; break; fi
       done
-      [ "$_E11_MAILED" = "1" ] || log "E11-DIFF-CAP: no author mail delivered for $BEAD_ID (candidates: $_E11_AUTHOR, ${_E11_AUTHOR}-${BEAD_ID%%-*}) — the bead carries gate:needs-fix and the reason; the Pilot routes it"
+      [ "$_E11_MAILED" = "1" ] || log "E11-DIFF-CAP: no author mail delivered for $BEAD_ID (candidates: $_E11_AUTHOR, ${_E11_AUTHOR}-${BEAD_ID%%-*}) — the source bead carries $_E11_ON_SRC"
     fi
     if [ "$_E11_SRC_OK" != "1" ]; then
       # The source bead was NOT confirmed to hold the refusal, so the marker is not closed (a closed marker is the only thing
