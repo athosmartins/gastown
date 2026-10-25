@@ -1938,6 +1938,19 @@ def test_a_layout_that_was_never_measured_stays_cannot_tell_and_unwatched(w, mon
     assert "banner_watch" not in w.state() and not w.notified() and w.keys() == [] and w.gc_calls() == []
 
 
+def test_a_layout_that_stops_being_measured_while_watched_is_cannot_tell_and_is_kept(w):
+    me = os.getpid()
+    _stalled(w, me)
+    _switch_crypto_to_amb(w)
+    _run_to(w, 90, 300)
+    w.pane_set("%5", text=STALLED + "  more statusline\n" * crew.BOX_FOOTER_MAX)           # taller than the measured layout: cannot tell
+    _run_to(w, 400, 500)
+    assert str(me) in w.state().get("banner_watch", {}).get("pids", {}) and not w.notified() and "layout this script has not measured" in w.log()
+    w.pane_set("%5", text=STALLED)
+    _run_to(w, 690)                                                                       # unchanged again: 600 s from the FIRST look
+    assert len(w.notified()) == 1 and w.state()["banner_watch"]["pids"][str(me)]["since"] == w.now + 90
+
+
 def test_the_message_leaving_the_screen_ends_the_watch(w):
     me = os.getpid()
     _stalled(w, me)
