@@ -122,6 +122,18 @@ b 2 "block: --git-dir=<outro>/.git sem --work-tree com o cwd NO vivo (a árvore 
 b 2 "block: cd \$VAR && git --work-tree=<fora> (o cwd é desconhecido), sessão NO vivo" "cd \"\$WHERE\" && git --work-tree=$WT checkout --detach $SHA"
 run < <(mk Bash "$LIVE" command 'cd "$WHERE" && git checkout --detach abc'); blocked && grep -q 'não consegui ver' "$T/err" && grep -qF "$LIVE" "$T/err"; ok $? "block: o 'não sei' diz que não conseguiu ver a pasta e cita o clone vivo"
 run < <(mk Bash "$LIVE" command "eval eval eval eval eval git checkout --detach $SHA"); blocked && grep -q 'não consegui ver' "$T/err" && grep -qF "eval eval eval eval eval git checkout --detach $SHA" "$T/err"; ok $? "block: o 'não sei' do aninhamento fundo cita o COMANDO (não o motivo interno do parser)"
+# ga-70d0su (achado 3): não sei O QUE o git roda — subcomando por variável/substituição, ou operandos que o xargs/parallel acrescentam em tempo de execução. Mesmo critério do "não sei ONDE": barra com a sessão no vivo
+b 2 "block: X=checkout; git \$X --detach (subcomando por variável: não sei O QUE roda), sessão NO vivo" 'X=checkout; git $X --detach abc'
+b 2 "block: git \$(echo checkout) --detach (substituição no lugar do subcomando), sessão NO vivo" 'git $(echo checkout) --detach abc'
+b 2 "block: echo --detach abc | xargs git checkout (os operandos chegam em tempo de execução), sessão NO vivo" 'echo --detach abc | xargs git checkout'
+b 2 "block: echo --detach abc | parallel git checkout (idem, lançador opaco), sessão NO vivo" 'echo --detach abc | parallel git checkout'
+b 2 "block: git -C <vivo> \$X (o clone é o vivo, o subcomando não leio), de outro cwd" "X=checkout; git -C $LIVE \$X --detach abc" "$OUT"
+run < <(mk Bash "$LIVE" command 'X=checkout; git $X --detach abc'); blocked && grep -q 'não consegui ver o que' "$T/err" && grep -qF 'git $X --detach abc' "$T/err" && grep -qF "$LIVE" "$T/err"; ok $? "block: o 'não sei O QUE' diz que não viu o que o git faz, cita o comando e o clone vivo"
+# ga-70d0su (achado 4): abaixo do teto o parser ainda confere (o teto só vale para o que passa dele)
+PAD20=$(head -c 20000 /dev/zero | tr '\0' x)
+b 2 "block: comando de 20 KB que cita checkout ainda passa pelo parser (abaixo do teto)" "git checkout --detach $SHA; echo $PAD20"
+# ga-70d0su (achado 2): o log NUNCA muda o veredito — um surrogate solto no comando levantava UnicodeEncodeError dentro do log() e o exit 2 virava exit 1 (o checkout rodava)
+: > "$T/guard.log"; run < <(printf '{"tool_name":"Bash","cwd":"%s","tool_input":{"command":"git checkout --detach x \\ud800"}}' "$LIVE"); blocked && grep -q 'result=BLOCK' "$T/guard.log"; ok $? "block: surrogate solto no comando NÃO derruba o veredito (exit 2 e a linha BLOCK ficam) (rc=$RC)"
 fi
 
 if grp pass; then
@@ -190,6 +202,36 @@ run < <(printf '{"tool_name":"Bash"}'); [ "$RC" = 0 ]; ok $? "open: Bash sem too
 run < <(printf '{"tool_name":"Bash","tool_input":"git checkout --detach x"}'); [ "$RC" = 0 ] && [ ! -s "$T/err" ]; ok $? "open: tool_input texto em vez de objeto → libera sem traceback (rc=$RC)"
 run < <(printf '{"tool_name":"Bash","tool_input":["git checkout --detach x"]}'); [ "$RC" = 0 ] && [ ! -s "$T/err" ]; ok $? "open: tool_input lista em vez de objeto → libera sem traceback (rc=$RC)"
 run < <(printf '{"tool_name":"Bash","tool_input":{"command":"git checkout --detach x"}}'); [ "$RC" = 0 ]; ok $? "open: sem cwd e comando sem caminho (rc=$RC)"
+# ── ga-70d0su (achado 1): payload que o guarda não sabe ler (campo renomeado) é defeito de payload: libera MAS grava ERROR — sem a linha um guarda morto parece guarda calado
+perr() {  # perr "descrição" 'JSON do hook' 'op esperado'  → exit 0, sem traceback, UMA linha ERROR com esse op
+  : > "$T/guard.log"; run < <(printf '%s' "$2"); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q "result=ERROR.*op=$3" "$T/guard.log" && [ ! -s "$T/err" ]; ok $? "open: $1 → libera sem traceback E grava UMA linha ERROR $3 (rc=$RC)"
+}
+CK='git checkout --detach x'
+perr "tool_input com cmd no lugar de command" "{\"tool_name\":\"Bash\",\"cwd\":\"$OUT\",\"tool_input\":{\"cmd\":\"$CK\"}}" 'payload: sem tool_input.command'
+grep -qF "cwd=$OUT" "$T/guard.log"; ok $? "open: a linha ERROR de payload leva o cwd da sessão"
+perr "tool_input.command null" "{\"tool_name\":\"Bash\",\"cwd\":\"$OUT\",\"tool_input\":{\"command\":null}}" 'payload: sem tool_input.command'
+perr "tool_input {}" "{\"tool_name\":\"Bash\",\"cwd\":\"$OUT\",\"tool_input\":{}}" 'payload: sem tool_input.command'
+perr "embrulho input no lugar de tool_input" "{\"tool_name\":\"Bash\",\"cwd\":\"$OUT\",\"input\":{\"command\":\"$CK\"}}" 'payload: sem tool_input.command'
+perr "tool_input.command vazio" "{\"tool_name\":\"Bash\",\"cwd\":\"$OUT\",\"tool_input\":{\"command\":\"\"}}" 'payload: sem tool_input.command'
+perr "tool_input.command que não é texto (lista)" "{\"tool_name\":\"Bash\",\"cwd\":\"$OUT\",\"tool_input\":{\"command\":[\"$CK\"]}}" 'payload: sem tool_input.command'
+perr "Bash sem tool_input" "{\"tool_name\":\"Bash\",\"cwd\":\"$OUT\"}" 'payload: sem tool_input.command'
+perr "tool_name bash (outra caixa)" "{\"tool_name\":\"bash\",\"cwd\":\"$OUT\",\"tool_input\":{\"command\":\"$CK\"}}" 'payload: tool_name inesperado'
+perr "tool no lugar de tool_name" "{\"tool\":\"Bash\",\"cwd\":\"$OUT\",\"tool_input\":{\"command\":\"$CK\"}}" 'payload: sem tool_name'
+: > "$T/guard.log"; run < <(mk Bash "$OUT" command "ls -la"); [ "$RC" = 0 ] && [ "$(nlog)" = 0 ]; ok $? "open: controle — Bash legítimo NÃO grava ERROR (rc=$RC)"
+# ── ga-70d0su (achado 2): a promessa "qualquer exceção → libera + ERROR" vale também para cwd fora do tipo e JSON fundo demais (antes: traceback, exit 1, nenhuma linha)
+: > "$T/guard.log"; run < <(printf '{"tool_name":"Bash","cwd":123,"tool_input":{"command":"git status"}}'); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=ERROR.*op=payload: cwd não é texto' "$T/guard.log" && [ ! -s "$T/err" ]; ok $? "open: cwd que não é texto (123) → ERROR, exit 0, sem traceback (rc=$RC)"
+: > "$T/guard.log"; run < <(printf '{"tool_name":"Bash","cwd":["/x"],"tool_input":{"command":"git checkout --detach x"}}'); [ "$RC" = 0 ] && grep -q 'result=ERROR.*op=payload: cwd não é texto' "$T/guard.log" && [ ! -s "$T/err" ]; ok $? "open: cwd lista + comando com checkout → ERROR, exit 0, sem traceback (rc=$RC)"
+: > "$T/guard.log"; run < <(head -c 100000 /dev/zero | tr '\0' '['); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=ERROR.*op=stdin:' "$T/guard.log" && [ ! -s "$T/err" ]; ok $? "open: JSON aninhado fundo demais (RecursionError) → ERROR stdin:, exit 0, sem traceback (rc=$RC)"
+# ── ga-70d0su (achado 3): não sei O QUE o git roda (subcomando por variável; operandos do xargs/parallel) → libera fora do vivo, mas CONTADO
+: > "$T/guard.log"; run < <(mk Bash "$OUT" command 'X=checkout; git $X --detach abc'); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=UNRESOLVED.*op=git \$X --detach abc' "$T/guard.log" && grep -qF "cwd=$OUT" "$T/guard.log"; ok $? "open: subcomando por variável liberado fora do vivo deixa UMA linha UNRESOLVED com o op e o cwd (rc=$RC)"
+: > "$T/guard.log"; run < <(mk Bash "$OUT" command 'echo --detach abc | xargs git checkout'); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=UNRESOLVED.*op=git checkout' "$T/guard.log"; ok $? "open: operandos que o xargs acrescenta, liberado fora do vivo, deixa UMA linha UNRESOLVED (rc=$RC)"
+: > "$T/guard.log"; run < <(mk Bash "$OUT" command 'echo abc | parallel git checkout'); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=UNRESOLVED' "$T/guard.log"; ok $? "open: idem com parallel (rc=$RC)"
+: > "$T/guard.log"; run < <(mk Bash "$OUT" command 'git checkout; git switch'); [ "$RC" = 0 ] && [ "$(nlog)" = 0 ]; ok $? "open: controle — git checkout/switch SEM argumento e sem xargs/parallel segue sem linha (só mostra o estado) (rc=$RC)"
+# ── ga-70d0su (achado 4): teto de tamanho — o parser tem custo superlinear no texto que cita checkout/switch; acima do teto não paga o parser, libera e CONTA
+BIG=$(head -c 40000 /dev/zero | tr '\0' x)
+: > "$T/guard.log"; run < <(mk Bash "$OUT" command "git checkout --detach $SHA; echo $BIG"); [ "$RC" = 0 ] && [ "$(nlog)" = 1 ] && grep -q 'result=UNRESOLVED.*op=comando grande demais' "$T/guard.log" && grep -qF "cwd=$OUT" "$T/guard.log"; ok $? "open: comando acima do teto que cita checkout → libera E conta (UNRESOLVED), sem pagar o parser (rc=$RC)"
+: > "$T/guard.log"; run < <(mk Bash "$LIVE" command "git checkout --detach $SHA; echo $BIG"); [ "$RC" = 0 ] && grep -q 'result=UNRESOLVED.*op=comando grande demais' "$T/guard.log"; ok $? "open: acima do teto libera mesmo com a sessão NO vivo (é liberar e contar, não barrar) (rc=$RC)"
+: > "$T/guard.log"; run < <(mk Bash "$OUT" command "echo $BIG"); [ "$RC" = 0 ] && [ "$(nlog)" = 0 ]; ok $? "open: comando grande que NÃO cita checkout/switch sai no pré-filtro, sem linha (rc=$RC)"
 : > "$T/guard.log"
 ( LCG_RCG="$T/nao-existe.py"; export LCG_RCG; run < <(mk Bash "$LIVE" command "git checkout --detach $SHA"); [ "$RC" = 0 ] ); ok $? "open: parser que não carrega → libera, não bloqueia"
 grep -q 'result=ERROR' "$T/guard.log"; ok $? "open: parser que não carrega → ERROR no log (não some em silêncio)"
