@@ -138,7 +138,7 @@ novo) existe mas **não foi medida**, por isso não foi implementada.
 **Fixture e o que falta provar:** o teste usa o chrome REAL do claude 2.1.310 (medido em panes vivos) e o TEXTO real da mensagem (do registro
 `rate_limit` do transcript), mas não havia nenhum pane nesse estado para capturar: o glifo na frente da mensagem não é medido (o casamento aceita
 qualquer prefixo não-alfanumérico). Se o claude real desenhar outra coisa, a consequência é "não sei" (sem vigia), nunca "parada" por engano.
-Rodando o arquivo de testes novo contra o script do HEAD anterior (`cb6afb9d9`): 45 reprovam e 145 passam (os antigos, mais os novos que só afirmam que nada acontece: layout não medido, mensagem velha com trabalho depois, só o Escape armado).
+Rodando o arquivo de testes novo contra o script do HEAD anterior (`cb6afb9d9`): 47 reprovam e 145 passam (os antigos, mais os novos que só afirmam que nada acontece: layout não medido, mensagem velha com trabalho depois, só o Escape armado). Medi em duas rodadas: 45 reprovam / 145 passam na versão de 190 testes; os 2 testes de falha injetada (transcript ausente/ilegível/corrompido, `gc` que não roda/estoura/responde lixo) foram rodados à parte e reprovam com `AttributeError`, porque `transcript_says` e `gc_session_id` não existem lá (reprovam por ausência da função, não por comportamento errado).
 
 ## Garantias
 - Nunca chama `claude`; custo de crédito zero (só o perfil, grátis). Nunca escreve no item hasheado do pool.
@@ -184,7 +184,7 @@ Rodando o arquivo de testes novo contra o script do HEAD anterior (`cb6afb9d9`):
 - (ga-yqzedv) O glifo que o claude real põe na frente da mensagem de limite não foi medido (nenhum pane nesse estado existia); o caminho do
   `gc session reset` só rodou contra um `gc` falso nos testes, nunca ao vivo; se o layout do claude mudar, as telas viram "não sei" (sem vigia).
 
-Testes: `scripts/test_claude_crew_account.py` (190 testes, shim de `security`, servidor de perfil em loopback, `tmux` falso que registra cada argv e cada tecla, `gc` falso que registra cada chamada). O harness é
+Testes: `scripts/test_claude_crew_account.py` (192 testes, shim de `security`, servidor de perfil em loopback, `tmux` falso que registra cada argv e cada tecla, `gc` falso que registra cada chamada). O harness é
 selado: todo teste roda com `CLAUDE_CREW_NOTIFY`, `CLAUDE_CREW_SECURITY` e `GC_CITY_PATH` fixados em stubs/tmp e `PATH`
 sem o `notify` real; no fim da sessão afirma que o log/estado/lock reais não mudaram e que nenhum sentinela foi executado;
 e o script roda de verdade sob `env -i`, com `python3` do pytest e com `/usr/bin/python3` (3.9, o do plist).
