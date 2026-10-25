@@ -156,9 +156,9 @@ check "a lista de elegíveis real existe e tem ao menos um permitido e um bloque
 check "na lista real, zap_vivareal e chavesnamao (403 medido do nó) estão bloqueados e não permitidos" \
   '! grep -E "^(zap_vivareal|chavesnamao|netimoveis)[[:space:]]*(#|$)" "$REAL_ELIG" | grep -q . && grep -q -E "^!zap_vivareal" "$REAL_ELIG" && grep -q -E "^!chavesnamao" "$REAL_ELIG"'
 
-check "na lista real, loft está BLOQUEADO (ga-hpf4w4: 503 truncou 4 lotes e foi promovido como completo) e não permitido" \
-  '! grep -E "^loft[[:space:]]*(#|$)" "$REAL_ELIG" | grep -q . && grep -q -E "^!loft[[:space:]]*#.+" "$REAL_ELIG"'
-hsr HETZNER_SCRAPE_ELIGIBLE="$REAL_ELIG" -- eligible loft;  check "eligible na lista REAL: loft -> BLOCK com o motivo, rc 97" '[ $RC -eq 97 ] && has "^BLOCK .*503 truncou 4 lotes"'
+check "na lista real, loft voltou a PERMITIDO (ga-8m610x: ps-jo75 + ps-5kh1 fechadas) e não há !loft" \
+  'grep -q -E "^loft[[:space:]]*#.+" "$REAL_ELIG" && ! grep -q -E "^[[:space:]]*![[:space:]]*loft([[:space:]:#]|$)" "$REAL_ELIG"'
+hsr HETZNER_SCRAPE_ELIGIBLE="$REAL_ELIG" -- eligible loft;  check "eligible na lista REAL: loft -> ALLOW, rc 0" '[ $RC -eq 0 ] && [ "$OUT" = ALLOW ]'
 hsr HETZNER_SCRAPE_ELIGIBLE="$REAL_ELIG" -- eligible vistaimobi;  check "eligible na lista REAL: os outros permitidos seguem ALLOW (vistaimobi), rc 0" '[ $RC -eq 0 ] && [ "$OUT" = ALLOW ]'
 
 # ---------- 2. elegibilidade ----------

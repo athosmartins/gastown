@@ -29,9 +29,9 @@ bonsucesso              # 10 tentados, 0 erro (9 fora do escopo)
 imoview                 # tenants decisao e valore: 20 de 20 cada (decisao em 22 s, valore em 24 s); as homes de TODOS os tenants ativos respondem igual. Escala cheia: 10 de 11 tenants idênticos ao mini; valore levou HTTP 500 na rodada em paralelo (0 arquivo, rc 0 do raspador!) e sozinho deu 546 de 546
 silvioximenes           # 10 de 10
 anuar_donato            # 40 raspados (21 novos), 0 erro
+loft                    # volta 25/10 (ga-8m610x): bloqueado 18-25/10 (ga-hpf4w4) por lote truncado por 503 promovido como completo; ps-jo75 (lote truncado → resultado=local) e ps-5kh1 (reprovado no nó não volta ao nó) fechadas. A 1ª rodada depois é a prova da ps-hpp1
 #
-# BLOQUEADOS — 403 do Cloudflare (ou sem resposta) vindo do IP do nó; do mini funcionam (exceção: loft, bloqueado em 18/10 por lote truncado por 503, não por IP — ga-hpf4w4)
-!loft                   # 18/10 rodada real: 503 truncou 4 lotes e o lote foi promovido como completo (rc 0, erros 0) — volta quando a ps-jo75 (property_scrapers) fechar
+# BLOQUEADOS — 403 do Cloudflare (ou sem resposta) vindo do IP do nó; do mini funcionam
 !chavesnamao            # home e listagem de BH: 403 "Just a moment" do nó, 200 do mini
 !netimoveis             # 403 do nó, na home e em /pesquisa; vale também para netimoveis_contagem
 !larimoveis             # 403 do nó
