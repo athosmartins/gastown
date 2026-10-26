@@ -2,7 +2,7 @@
 
 ## Contents
 
-• O que esta fatia é — e o que não é · Como ligar (config, city.toml, janela do engine) · Operações (preparo do worktree · **worktree da sessão: o provider cria e recolhe, e a identidade do atalho (ga-2hd02v.1.7)** · o comando do `start` · **a sessão `claude` segue a conta do pool do mini (ga-2hd02v.7.1)** · **cache do `list-running` (ga-it7qiq.5)**)
+• O que esta fatia é — e o que não é · Como ligar (config, city.toml, janela do engine) · Operações (preparo do worktree · **worktree da sessão: o provider cria e recolhe, e a identidade do atalho (ga-2hd02v.1.7)** · o comando do `start` · **a sessão `claude` segue a conta do pool do mini (ga-2hd02v.7.1)** · **perfil de modelo por papel: o Kimi pela OpenRouter (ga-do1ixn.2)** · **cache do `list-running` (ga-it7qiq.5)**)
 • Teto do host · **O MBP como host (ga-w7qwl1)** (**o tmux nasce num LaunchAgent do domínio gráfico (ga-w7qwl1.1.8)**) · Quando o ssh não responde · Medido, inferido, não testado · Pontos em aberto · Limites
 
 Bead ga-2hd02v.1.1 (fatia 2 do ga-2hd02v, desenho do estudo ga-ukxa3k, aprovada por Athos em 14/10 18:42). **Entrega duas peças:** (1) `scripts/gc-session-ssh`, o provider no protocolo `exec:` do engine, que abre as sessões de pool num host remoto por ssh com a mesma interface das locais; (2) um patch do engine, `docs/pending-engine-window/ga-2hd02v-hybrid-remote-exec.patch`, que deixa o provider híbrido usar esse script como lado remoto. **O patch NÃO está aplicado**: nada foi compilado, trocado nem reiniciado em produção. Sem o patch o script já funciona sozinho (`GC_SESSION=exec:<cidade>/scripts/gc-session-ssh` serve um teste isolado), mas só o patch deixa a cidade rodar sessões locais e remotas juntas.
@@ -157,6 +157,24 @@ A recusa vem **antes** de registrar a sessão, de travar e de abrir o ssh (nada 
 **Limite que continua.** Quem roda `env` (ou lê o `environ` do processo, no mesmo usuário) dentro da sessão vê a chave, igual no mini: ela é uma variável de ambiente do `claude`. A chave não rotaciona, então mini e nó usam a mesma ao mesmo tempo.
 
 **Medido × não medido.** Medido com `secret`, arquivo do pool e `claude` falsos (nada do cofre real): os três estados, o prefixo (não `export`), o vazamento (argv do ssh, saída, estado e log do mini, `ps`, scrollback e ambiente do tmux, com controle positivo) e 13 mutantes mortos; ver o grupo `acct` do `gc-session-ssh.selftest.sh`. **Não medido e não medível do servidor:** o `secret` real, o arquivo real do pool e a conta real (só no mini).
+
+### Perfil de modelo por papel: o Kimi pela OpenRouter (ga-do1ixn.2)
+
+**Decisão do Athos (26/10):** testar o Claude Code com o Kimi por baixo, “Teste sem dado pessoal”, fornecedor “OpenRouter”, teto “US$ 50” (chave `openrouter-api-key`, ver `~/gt/SECRETS.md`). O lugar (Hetzner, não o mini) é decisão do Mayor, registrada na bead.
+
+**O que o `start` faz.** Num host com `model_profiles`, a sessão `claude` cujo papel (`<papel>-remote-*`) está no mapa nasce com `ANTHROPIC_BASE_URL` = `base_url`, `ANTHROPIC_AUTH_TOKEN` = a chave do item `secret` (lida no mini com o `secret` do `claude_account`, ou `<mini_home>/.local/bin/secret`; mesmo prefixo do comando final que a chave da conta, nunca `export`), os slots `ANTHROPIC_MODEL`/`…_OPUS_…`/`…_SONNET_…`/`CLAUDE_CODE_SUBAGENT_MODEL` = `model` e `…_HAIKU_…`/`ANTHROPIC_SMALL_FAST_MODEL` = `small_model`, e `CLAUDE_CODE_OAUTH_TOKEN` e `ANTHROPIC_API_KEY` **vazios**. A conta do pool não é lida. Chave ausente, cofre ilegível ou chave sem o `key_prefix` = o start recusa (evento `refused`) e **não** cai na conta do pool. Papel fora do mapa = como antes.
+
+**Config (no host do Hetzner, `<cidade>/.gc/session-ssh.json`):**
+
+```json
+"worktree_rigs": {"kimi-worker": "gascity", "…": "…"},
+"model_profiles": {"kimi-worker": {"base_url": "https://openrouter.ai/api", "secret": "openrouter-api-key", "key_prefix": "sk-or-",
+                                   "model": "moonshotai/kimi-k3.1-pro", "small_model": "moonshotai/kimi-k2.7-code"}}
+```
+
+**Medido (26/10, Mayor).** Na API direta: os dois modelos fazem `tool_use` certo e o cache de prompt funciona (2ª chamada lê ~11,7k do cache, custo cai ~85%). No Hetzner, com o claude 2.1.302: chave inválida → `401 User not found` e a sessão para sem responder, **mesmo com o `.credentials.json` da Anthropic no disco do nó** (o `ANTHROPIC_AUTH_TOKEN` tem precedência e o endereço base não muda); chave real → Bash/Read/Edit no worktree do gascity, modelo único `moonshotai/kimi-k3.1-pro`. Pelo provider (este script, sessão `kimi-worker-remote-smoke01`): abre com worktree e guarda de clone, a tela mostra `moonshotai/kimi-k3.1-pro · API Usage Billing`, faz a tarefa e o stop recolhe o worktree. Custo de todas as fumaças: US$ 0,086 (painel da chave).
+
+**O que ainda não funciona:** o atalho `bd`/`gc` e o `gate-done-remote` não conhecem o papel `kimi-worker-remote` (rc 77) — fatia ga-do1ixn.5. A fila só com beads sem dado pessoal é a ga-do1ixn.3.
 
 ### Cache do `list-running` (ga-it7qiq.5)
 

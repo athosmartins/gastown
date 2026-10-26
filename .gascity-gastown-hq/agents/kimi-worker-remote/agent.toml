@@ -1,0 +1,20 @@
+# kimi-worker-remote: worker de teste que roda no servidor Hetzner com o Claude Code apontado para o Kimi (OpenRouter), não para a Anthropic (ga-do1ixn.2;
+# Athos 26/10: "Teste sem dado pessoal", "OpenRouter", "US$ 50").
+#
+# Contents
+#   O que é · Por que 1 · De onde vem o modelo · O que NÃO tem aqui
+#
+# O QUE É: o mesmo claude headless dos outros papéis remotos; o nome de sessão contém `-remote-`, então o provider híbrido o manda para scripts/gc-session-ssh.
+#   Lá o papel `kimi-worker` está em `model_profiles` de .gc/session-ssh.json: a sessão nasce com ANTHROPIC_BASE_URL da OpenRouter, a chave openrouter-api-key (lida no
+#   mini, chave com teto de US$ 50) e os slots de modelo do Kimi. A conta Claude do pool NÃO entra; sem a chave a sessão não abre.
+# POR QUE 1: é um teste (ga-do1ixn.4 mede custo e qualidade por uma semana contra os workers Claude). Subir o teto é decisão depois da medição.
+# DE ONDE VEM O MODELO: de `model_profiles.kimi-worker` (model / small_model), NÃO do `model` abaixo: o `--model sonnet` do provider cai no slot
+#   ANTHROPIC_DEFAULT_SONNET_MODEL, que o perfil aponta para o Kimi.
+# O QUE NÃO TEM AQUI: dado de lead/cliente (o nó não tem), Dolt, credencial do GitHub. Só pega bead sem dado pessoal (fila lane:kimi, ga-do1ixn.3).
+work_dir = ".gc/agents/kimi-worker-remote"
+min_active_sessions = 0
+max_active_sessions = 1
+idle_timeout = "15m"
+wake_mode = "fresh"
+model = "sonnet"
+provider = "claude-headless"

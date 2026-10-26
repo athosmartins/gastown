@@ -996,6 +996,86 @@ EOF
   rm -f "$T/home/.local/bin/claude" "$T/bin/secret"; unset FAKE_VAULT FAKE_SECRET_LOG; cfg 3
 }
 
+g_prof() {  # perfil de modelo por papel (ga-do1ixn.2): a sessão <papel>-remote-* do papel listado nasce apontada para o fornecedor do perfil, com a chave DELE e nunca a da conta do pool
+  local KO=sk-or-v1-FAKEkimi0123456789abcdef KA=sk-ant-FAKEalfa-0123456789abcdef pool="$T/pool.json" vault="$T/vault" sl="$T/secret.log" prof extra mode bad r1 f
+  prof='{"kimi-worker":{"base_url":"https://openrouter.ai/api","secret":"openrouter-api-key","key_prefix":"sk-or-","model":"moonshotai/kimi-k3.1-pro","small_model":"moonshotai/kimi-k2.7-code"}}'
+  extra=$(jq -n --arg f "$pool" --arg s "$T/bin/secret" --argjson mp "$prof" '{claude_account:{current_file:$f,secret:$s}, model_profiles:$mp}')
+  mkdir -p "$vault" "$T/tmp" "$T/home/.local/bin"; : > "$sl"
+  printf '%s\n' "$KO" > "$vault/openrouter-api-key"; printf '%s\n' "$KA" > "$vault/claude-oauth-token-alfa@example.test"
+  printf '{"current":"alfa@example.test","since":"2026-10-26T20:00:00Z","reason":"selftest"}\n' > "$pool"
+  cat > "$T/bin/secret" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "${FAKE_SECRET_LOG:-/dev/null}"
+case "${FAKE_SECRET_MODE:-}" in
+  locked) echo "sk-or-DECOYOUT0000000000000000"; echo "Error: vault is locked sk-or-DECOYERR0000000000000000" >&2; exit 1;;
+  notfound) echo "Not found: $1" >&2; exit 4;;
+  noprefix) echo "sk-ant-FAKEwrongkind0123456789"; exit 0;;
+  spaced) echo "sk-or-FAKEspaced 0123456789abcdef"; exit 0;;
+esac
+[ -f "$FAKE_VAULT/$1" ] || { echo "Not found: $1" >&2; exit 4; }
+cat "$FAKE_VAULT/$1"
+EOF
+  chmod +x "$T/bin/secret"
+  # o claude do "host": grava o que recebeu (UNSET ≠ vazio: o perfil manda OAUTH e API_KEY VAZIOS de propósito)
+  cat > "$T/home/.local/bin/claude" <<'EOF'
+#!/bin/sh
+for v in ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_SMALL_FAST_MODEL CLAUDE_CODE_SUBAGENT_MODEL; do
+  eval "printf '%s=%s\n' $v \"\${$v-UNSET}\""
+done > "$1"
+exec cat
+EOF
+  chmod +x "$T/home/.local/bin/claude"
+  export FAKE_VAULT="$vault" FAKE_SECRET_LOG="$sl"
+  envis() { grep -qxF "$2" "$1" 2>/dev/null; }  # envis ARQUIVO LINHA
+  pleaks() {  # 0 = a chave $1 apareceu onde não pode (argv do ssh, saída, estado do mini, disco do host, ps, scrollback, ambiente do tmux)
+    local k="$1" s found=1
+    for s in "$T/ssh.log" "$T/out" "$T/err" "$sl"; do has "$s" "$k" && found=0; done
+    grep -rqF "$k" "$T/state" "$RR" "$RH" "$T/tmp" 2>/dev/null && found=0
+    ps -eo args= | grep -F "$k" | grep -vF grep | grep -q . && found=0
+    for s in $(tmux -L "$SOCK" list-sessions -F '#{session_name}' 2>/dev/null); do tmux -L "$SOCK" capture-pane -p -S - -t "=$s:" 2>/dev/null | grep -qF "$k" && found=0; done
+    tmux -L "$SOCK" show-environment -g 2>/dev/null | grep -qF "$k" && found=0
+    return $found
+  }
+  cfg 12 25 "$extra"; fresh
+  pv --dry-run start kimi-worker-remote-p1 < <(req "claude $T/p1.out"); r1=$RC
+  [ $r1 = 0 ] && [ "$(jq -r '.model_profile.model' "$T/out")" = moonshotai/kimi-k3.1-pro ] && [ "$(jq -r '.claude_account' "$T/out")" = null ] && [ ! -s "$sl" ] && ! has "$T/out" "$KO" && nossh; ok $? "prof: dry-run mostra o perfil do papel, NÃO lê o cofre, não mostra a chave e não abre ssh (rc=$r1)"
+  f=$(jq -r '.launcher[]' "$T/out" | grep -E ' sh -c ')
+  printf '%s' "$f" | grep -qF "ANTHROPIC_BASE_URL=https://openrouter.ai/api " && printf '%s' "$f" | grep -qF "CLAUDE_CODE_OAUTH_TOKEN='' " && printf '%s' "$f" | grep -qF "ANTHROPIC_API_KEY='' " && printf '%s' "$f" | grep -qF "ANTHROPIC_AUTH_TOKEN='<chave do perfil" && ! has "$T/out" 'export ANTHROPIC'; ok $? "prof: fornecedor, chave e os dois vazios entram como PREFIXO do comando final, não como export"
+  fresh; TMPDIR="$T/tmp" pv start kimi-worker-remote-p1 < <(req "claude $T/p1.out"); ok $RC "prof: start da sessão do papel com perfil abre (rc=$RC $(head -c 200 "$T/err"))"
+  envis "$T/p1.out" "ANTHROPIC_AUTH_TOKEN=$KO" && envis "$T/p1.out" ANTHROPIC_BASE_URL=https://openrouter.ai/api; ok $? "prof: a sessão nasce com a chave do perfil e o endereço do fornecedor"
+  envis "$T/p1.out" CLAUDE_CODE_OAUTH_TOKEN= && envis "$T/p1.out" ANTHROPIC_API_KEY= && ! has "$T/p1.out" "$KA"; ok $? "prof: CLAUDE_CODE_OAUTH_TOKEN e ANTHROPIC_API_KEY chegam VAZIOS (não UNSET) e a chave da conta do pool não está em lugar nenhum da sessão"
+  envis "$T/p1.out" ANTHROPIC_MODEL=moonshotai/kimi-k3.1-pro && envis "$T/p1.out" ANTHROPIC_DEFAULT_SONNET_MODEL=moonshotai/kimi-k3.1-pro && envis "$T/p1.out" ANTHROPIC_DEFAULT_OPUS_MODEL=moonshotai/kimi-k3.1-pro && envis "$T/p1.out" CLAUDE_CODE_SUBAGENT_MODEL=moonshotai/kimi-k3.1-pro && envis "$T/p1.out" ANTHROPIC_DEFAULT_HAIKU_MODEL=moonshotai/kimi-k2.7-code && envis "$T/p1.out" ANTHROPIC_SMALL_FAST_MODEL=moonshotai/kimi-k2.7-code; ok $? "prof: os slots de modelo (principal, sonnet, opus, subagente = model; haiku e small-fast = small_model)"
+  [ "$(grep -c . "$sl")" = 1 ] && has "$sl" openrouter-api-key && ! has "$sl" claude-oauth-token; ok $? "prof: o cofre foi lido UMA vez, pelo item do perfil — a conta do pool nem foi consultada"
+  ! pleaks "$KO"; ok $? "prof: a chave do perfil não aparece no argv do ssh, na saída, no estado do mini, no disco do host, no ps, no scrollback nem no ambiente do tmux"
+  printf '%s' "$KO" > "$T/tmp/controle"; pleaks "$KO"; r1=$?; rm -f "$T/tmp/controle"; ok $r1 "prof: (controle positivo) a varredura acusa a chave quando ela está de fato no disco do host"
+  for mode in locked notfound noprefix spaced; do
+    : > "$sl"; fresh; FAKE_SECRET_MODE=$mode pv start kimi-worker-remote-p2 < <(req "claude $T/p2.out"); r1=$RC
+    [ $r1 = 1 ] && nossh && [ ! -e "$T/p2.out" ] && ! has "$T/err" DECOY && ! has "$sl" claude-oauth-token && has "$T/err" 'NÃO cai na conta do pool' && ! ls "$RR/run" 2>/dev/null | grep -q p2; ok $? "prof: secret '$mode' → o start RECUSA (rc 1) sem ssh, sem sessão, sem repetir o que o secret escreveu, e NÃO cai na conta do pool (rc=$r1)"
+  done
+  grep -q 'chave do perfil openrouter-api-key' "$T/state/a/events.jsonl" && [ ! -e "$T/state/a/running/kimi-worker-remote-p2" ]; ok $? "prof: a recusa vira evento refused com o item, e a sessão não fica registrada como aberta"
+  : > "$sl"; fresh; TMPDIR="$T/tmp" pv start dog-remote-p3 < <(req "claude $T/p3.out"); r1=$RC
+  [ $r1 = 0 ] && envis "$T/p3.out" "CLAUDE_CODE_OAUTH_TOKEN=$KA" && envis "$T/p3.out" ANTHROPIC_BASE_URL=UNSET && ! has "$sl" openrouter-api-key; ok $? "prof: papel FORA do mapa (dog) segue na conta do pool, sem nada do perfil (rc=$r1)"
+  : > "$sl"; FAKE_SECRET_MODE=locked pv start kimi-worker-remote-p4 < <(req "cat"); r1=$RC
+  [ $r1 = 0 ] && [ ! -s "$sl" ]; ok $? "prof: sessão do papel que NÃO é claude não toca no cofre e abre normalmente (rc=$r1)"; pv stop kimi-worker-remote-p4 </dev/null
+  cfg 12 25 "$(jq -n --arg f "$pool" --arg s "$T/bin/secret" '{claude_account:{current_file:$f,secret:$s}}')"; : > "$sl"; fresh; TMPDIR="$T/tmp" pv start kimi-worker-remote-p5 < <(req "claude $T/p5.out"); r1=$RC
+  [ $r1 = 0 ] && envis "$T/p5.out" "CLAUDE_CODE_OAUTH_TOKEN=$KA" && envis "$T/p5.out" ANTHROPIC_BASE_URL=UNSET; ok $? "prof: host SEM model_profiles = como antes, até para o nome do papel (rc=$r1)"
+  cfg 12 25 "{\"model_profiles\":$prof}"; : > "$sl"; fresh; pv start kimi-worker-remote-p6 < <(req "claude $T/p6.out"); r1=$RC
+  [ $r1 = 1 ] && nossh && [ ! -e "$T/p6.out" ] && has "$T/err" 'chave do perfil'; ok $? "prof: perfil sem claude_account usa o secret de <mini_home>; secret que não roda = recusa, sem ssh (rc=$r1)"
+  for bad in '"texto"' '[]' '{"Kimi":{}}' '{"kimi-worker":{}}' \
+      '{"kimi-worker":{"base_url":"https://openrouter.ai/api","secret":"openrouter-api-key","key_prefix":"sk-or-","model":"m"}}' \
+      '{"kimi-worker":{"base_url":"https://openrouter.ai/api","secret":"openrouter-api-key","key_prefix":"sk-or-","model":"m","small_model":"s","extra":1}}' \
+      '{"kimi-worker":{"base_url":"http://openrouter.ai/api","secret":"openrouter-api-key","key_prefix":"sk-or-","model":"m","small_model":"s"}}' \
+      '{"kimi-worker":{"base_url":"https://openrouter.ai/api","secret":"-x","key_prefix":"sk-or-","model":"m","small_model":"s"}}' \
+      '{"kimi-worker":{"base_url":"https://openrouter.ai/api","secret":"openrouter-api-key","key_prefix":"sk-or-","model":"a b","small_model":"s"}}' \
+      '{"kimi-worker":{"base_url":"https://openrouter.ai/api","secret":"openrouter-api-key","key_prefix":"","model":"m","small_model":"s"}}' \
+      '{"kimi-worker":{"base_url":"https://openrouter.ai/api","secret":"openrouter-api-key","key_prefix":"sk-or-","model":5,"small_model":"s"}}'; do
+    cfg 12 25 "{\"model_profiles\":$bad}"; fresh; pv start kimi-worker-remote-p7 < <(req "claude $T/p7.out"); r1=$RC
+    [ $r1 = 1 ] && nossh && has "$T/err" model_profiles; ok $? "prof: model_profiles mal formado ($(printf '%s' "$bad" | head -c 60)…) recusa a config nomeando a chave, sem ssh (rc=$r1)"
+  done
+  cfg 12 25 "$extra"; for x in kimi-worker-remote-p1 dog-remote-p3 kimi-worker-remote-p5; do pv stop $x </dev/null; done
+  rm -f "$T/home/.local/bin/claude" "$T/bin/secret"; unset FAKE_VAULT FAKE_SECRET_LOG; cfg 3
+}
+
 # ---------- lr: cache de TTL curto do list-running (ga-it7qiq.5) — só resposta BOA entra, start/stop invalidam, erro nunca vira lista ----------
 calls() { wc -l < "$T/ssh.log" | tr -d ' '; }
 lrv() { GC_SSH_HOST=a pv "$@"; }  # um host só: o número de linhas do ssh.log é o número de perguntas ao host
@@ -1139,7 +1219,7 @@ g_shard() {  # o filtro do PRÓPRIO selftest (GCSSH_SHARD, GCSSH_ONLY, GCSSH_MUT
   [ $rr = 0 ] && [ "$(printf '%s\n' "$oo" | grep -c '^ok   mutante .* pego')" = 1 ] && printf '%s\n' "$oo" | grep -q '^== final: 1/1 ok ==$' && ! printf '%s\n' "$oo" | grep -q 'NADA RODOU'; ok $? "shard: (controle) GCSSH_SHARD=1/9999 roda exatamente 1 mutante, pego, e sai 0 (rc=$rr: $(printf '%s' "$oo" | tail -c 110))"
 }
 
-all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group gui && g_gui; group acct && g_acct; group lr && g_lr; group abort && g_abort; group shard && g_shard; return 0; }
+all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group gui && g_gui; group acct && g_acct; group prof && g_prof; group lr && g_lr; group abort && g_abort; group shard && g_shard; return 0; }
 
 if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
 # GCSSH_SHARD=K/N: dois decimais canônicos (sem sinal, sem espaço, sem zero à esquerda: `[ 3 = 03 ]` é falso e $((mn % 010)) é octal, então a fatia ficaria vazia ou trocada sem aviso), N de 1 a 9999 e K de 0 a N-1
@@ -1265,7 +1345,7 @@ case "$shn" in [1-9]*) ;; *) shard_bad;; esac
   mutant wt "aviso do git em stderr é jogado fora (parte da árvore não lida vira 'limpo')" 's/status --porcelain 2>"\$wse"/status --porcelain 2>\/dev\/null/'
   mutant acct "claude_account nunca lido (a sessão nunca ganha a chave)" 's/^        if ca is not None:$/        if False:/'
   mutant acct "claude_account de qualquer forma aceito" 's/            if not isinstance(ca, dict) or set(ca) - {"current_file", "secret"}:/            if False:/'
-  mutant acct "sessão que não é claude também ganha a chave (e toca no cofre)" 's/^    if cfg.acct and runs_claude(p\["command"\]):$/    if cfg.acct:/'
+  mutant acct "sessão que não é claude também ganha a chave (e toca no cofre)" 's/^    elif cfg.acct and runs_claude(p\["command"\]):$/    elif cfg.acct:/'
   mutant acct "claudette lido como claude (sem a fronteira do fim)" '/^CLAUDE_CMD = /s/(?=\\s|\$)//'
   mutant acct "o dry-run lê o cofre e imprime a chave" 's/^            secrets\[OAUTH_ENV\] = "<chave da conta atual do pool: não lida no dry-run>"$/            secrets[OAUTH_ENV] = acct_key(cfg, acct_view["current"] or "x@y.z")/'
   mutant acct "e-mail da conta de qualquer forma (vai para o argv do secret)" 's/^ACCT_EMAIL = re.compile(.*$/ACCT_EMAIL = re.compile(r".+")/'
@@ -1327,6 +1407,18 @@ case "$shn" in [1-9]*) ;; *) shard_bad;; esac
   mutant gui "agente que se reergue sozinho (KeepAlive true)" 's/<key>KeepAlive<\/key><false\/>/<key>KeepAlive<\/key><true\/>/'
   mutant gui "agente que carrega fora da sessão gráfica (sem LimitLoadToSessionType)" '/<key>LimitLoadToSessionType<\/key>/d'
   mutant gui "notebook sem gui_agent aceito" 's/^        if self.sleeps and not self.gui:$/        if False:/'
+  mutant prof "model_profiles nunca lido (o papel cai na conta do pool)" 's/^        mp = h.get("model_profiles", {})$/        mp = {}/'
+  mutant prof "model_profiles de qualquer forma aceito" 's/        if not isinstance(mp, dict) or not all(isinstance(k, str) and ROLE_RE.*$/        if False:/'
+  mutant prof "campo do perfil sem validação" 's/                if not isinstance(v\[k\], str) or not rx.fullmatch(v\[k\]) or v\[k\].startswith("-"):/                if False:/'
+  mutant prof "chave do perfil ilegível vira chave vazia (a sessão abre sem chave)" 's/^    raise Fail(f"chave do perfil ({item}) ilegível (rc=.*$/    return ""/'
+  mutant prof "perfil não esvazia o OAuth (a Anthropic fica de reserva calada)" 's/"ANTHROPIC_API_KEY": "", OAUTH_ENV: "",/"ANTHROPIC_API_KEY": "",/'
+  mutant prof "perfil não esvazia a ANTHROPIC_API_KEY" 's/"ANTHROPIC_API_KEY": "", OAUTH_ENV: "",/OAUTH_ENV: "",/'
+  mutant prof "perfil e conta do pool juntos (o elif vira if)" 's/^    elif cfg.acct and runs_claude(p\["command"\]):$/    if cfg.acct and runs_claude(p["command"]):/'
+  mutant prof "qualquer papel ganha o perfil" 's/    return cfg.profiles.get(m.group(1)) if m else None/    return next(iter(cfg.profiles.values()), None) if m else None/'
+  mutant prof "chave sem o key_prefix aceita" 's/ and tok.startswith(prof\["key_prefix"\]) and len(tok) > 16//'
+  mutant prof "chave do perfil com rc != 0 aceita" 's/    if r.returncode == 0 and tok.startswith(prof/    if tok.startswith(prof/'
+  mutant prof "slot haiku com o modelo grande" 's/"ANTHROPIC_DEFAULT_HAIKU_MODEL": small/"ANTHROPIC_DEFAULT_HAIKU_MODEL": big/'
+  mutant prof "o dry-run lê o cofre do perfil" 's/^            secrets.update(profile_env(prof, f"<chave do perfil.*$/            secrets.update(profile_env(prof, profile_key(cfg, prof)))/'
   mutant gui "gui_agent fora de true/false aceito" 's/if "gui_agent" in h and not isinstance(h\["gui_agent"\], bool):/if False:/'
   mutant gui "gui_agent sem o claude da session_env aceito" 's/if self.gui and not self.claude_bin:/if False:/'
   mutant gui "sessão que morre logo depois de abrir deixa o agente" 's/\.replace("@ADOWN@", adown)/.replace("@ADOWN@", "")/'
@@ -1338,7 +1430,7 @@ case "$shn" in [1-9]*) ;; *) shard_bad;; esac
   [ -n "${GCSSH_MUTANTS_ONLY:-}" ] || [ "${GCSSH_SHARD%/*}" != 0 ] || {
   echo "-- contra um stub que só sai 0 (a versão 'anterior' não tinha provider nenhum)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"
-  r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate,prep,wt,gui,acct" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
+  r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate,prep,wt,gui,acct,prof" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
   case "$r" in "RESULT 0/"*|"") ok 1 "stub deveria falhar quase tudo ($r)";; *) ok 0 "stub falha os casos novos ($r)";; esac
   }
   echo "== final: $((n-fails))/$n ok =="

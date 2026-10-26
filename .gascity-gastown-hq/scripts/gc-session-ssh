@@ -92,6 +92,10 @@ CONFIGURAÇÃO  $GC_SSH_CONFIG ou <cidade>/.gc/session-ssh.json (cidade = pasta 
   comando é o claude nasce na conta 'current' do pool do mini, com a chave dela (`secret claude-oauth-token-<e-mail>`, lida no mini, prazo de 15 s) em CLAUDE_CODE_OAUTH_TOKEN como PREFIXO do
   comando final do lançador (que vai pela entrada padrão do ssh e se apaga ao rodar; nunca no argv, log, evento nem dry-run). Conta sem item no cofre, cofre ilegível ou arquivo do pool
   ilegível = o start recusa e NÃO cai no login fixo do nó. Host sem o bloco = como antes. Ver docs/runbooks/gc-session-ssh.md.
+  model_profiles ({"kimi-worker": {"base_url": "https://openrouter.ai/api", "secret": "openrouter-api-key", "key_prefix": "sk-or-", "model": "<id>", "small_model": "<id>"}}; ga-do1ixn.2): a sessão
+  claude de papel listado (`<papel>-remote-*`) roda apontada para esse fornecedor: ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN (a chave do item `secret`, lida no mini com o secret do claude_account ou
+  <mini_home>/.local/bin/secret, mesmo prefixo de comando que a da conta) e os slots de modelo (opus/sonnet/subagente = model; haiku/small-fast = small_model); CLAUDE_CODE_OAUTH_TOKEN e ANTHROPIC_API_KEY
+  vão vazios e a conta do pool NÃO é lida. Chave ausente, cofre ilegível ou chave sem o key_prefix = o start recusa e NÃO cai na conta do pool. As 5 chaves são obrigatórias; forma errada recusa a config.
   Estado no mini:
   $GC_EXEC_STATE_DIR ou <cidade>/.gc/runtime/session-ssh, sempre em <estado>/<host>/. Não há padrão para o cap: sem ele não abre sessão.
 
@@ -127,6 +131,13 @@ ACCT_EMAIL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._%+-]*@[A-Za-z0-9][A-Za-z0-9.-]*
 ACCT_ITEM = "claude-oauth-token-"
 OAUTH_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
 SECRET_TIMEOUT = 15
+# Perfil de modelo por PAPEL (ga-do1ixn.2, teste do Athos 26/10: "Claude Code com Kimi por baixo", só em tarefa sem dado pessoal): a sessão `<papel>-remote-*` cujo papel está em `model_profiles`
+# roda o MESMO claude apontado para outro fornecedor que fala o protocolo da Anthropic (OpenRouter). A chave sai do cofre NO MINI (item `secret` do perfil), entra como prefixo do comando final, igual à
+# da conta do pool, e a conta do pool NÃO entra: sem chave do perfil a sessão não abre (nunca cai na Anthropic calada). CLAUDE_CODE_OAUTH_TOKEN e ANTHROPIC_API_KEY vão VAZIOS de propósito.
+PROFILE_KEYS = {"base_url", "secret", "key_prefix", "model", "small_model"}
+PROFILE_URL = re.compile(r"https://[A-Za-z0-9.-]+(?:/[A-Za-z0-9._/-]*)?")
+PROFILE_MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:-]{0,100}")
+PROFILE_PREFIX = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{1,20}")
 CLAUDE_CMD = re.compile(r"(?:\S*/)?claude(?=\s|$)")  # o comando do start é o claude (ou o caminho absoluto dele): só ele ganha a chave
 IGNORED = ("pre_start", "session_setup", "session_setup_script", "session_live", "pack_overlay_dirs", "overlay_dir", "copy_files", "nudge")
 BEGIN, END = "@@GC-BEGIN@@", "@@GC-END@@"
@@ -439,6 +450,17 @@ class Cfg:
                 raise Fail(f"host {self.host}: 'claude_account' tem que ser {{\"current_file\": \"/abs/claude_pool_current_account.json\", \"secret\": \"/abs/secret\"}} (secret é opcional) ({ca!r})")
             self.acct = {"file": self.need({"claude_account.current_file": ca.get("current_file")}, "claude_account.current_file", PATH_RE),
                          "secret": self.need({"claude_account.secret": ca.get("secret", self.mini_home + "/.local/bin/secret")}, "claude_account.secret", PATH_RE)}
+        # perfis de modelo por papel (ga-do1ixn.2): ausente → {} e nada muda; mal formado → recusa a config (um perfil que sumisse calado abriria o papel na conta do pool, na Anthropic)
+        mp = h.get("model_profiles", {})
+        if not isinstance(mp, dict) or not all(isinstance(k, str) and ROLE_RE.fullmatch(k) and isinstance(v, dict) and set(v) == PROFILE_KEYS for k, v in mp.items()):
+            raise Fail(f"host {self.host}: 'model_profiles' tem que ser um objeto papel → {{{', '.join(sorted(PROFILE_KEYS))}}} ({str(mp)[:200]!r})")
+        self.profiles = {}
+        for role, v in mp.items():
+            for k, rx in (("base_url", PROFILE_URL), ("secret", KEY_RE), ("key_prefix", PROFILE_PREFIX), ("model", PROFILE_MODEL), ("small_model", PROFILE_MODEL)):
+                if not isinstance(v[k], str) or not rx.fullmatch(v[k]) or v[k].startswith("-"):
+                    raise Fail(f"host {self.host}: 'model_profiles.{role}.{k}' inválido ({str(v[k])[:80]!r})")
+            self.profiles[role] = dict(v)
+        self.prof_secret = self.acct["secret"] if self.acct else self.mini_home + "/.local/bin/secret"
         base = os.environ.get("GC_EXEC_STATE_DIR") or os.path.join(self.city_guess, ".gc", "runtime", "session-ssh")
         self.state = os.path.join(base, re.sub(r"[^A-Za-z0-9_.-]", "_", str(self.host)))
 
@@ -733,6 +755,35 @@ def acct_key(cfg: Cfg, email: str) -> str:
     raise Fail(f"chave da conta {email} ilegível (cofre fechado ou secret falhou, rc={r.returncode}{', saída sem forma de chave' if r.returncode == 0 else ''}); a sessão não abre no host e NÃO cai no login fixo do nó")
 
 
+def model_profile(cfg: Cfg, name: str) -> dict | None:
+    """O perfil de modelo do papel da sessão (`<papel>-remote-*`), ou None: sem `-remote-` no nome ou papel fora de `model_profiles` = a sessão segue na conta do pool, como sempre."""
+    m = re.match(r"(.+?)-remote-", name)
+    return cfg.profiles.get(m.group(1)) if m else None
+
+
+def profile_key(cfg: Cfg, prof: dict) -> str:
+    """A chave do perfil, lida NO MINI pelo `secret`. Só a forma esperada (key_prefix, ASCII imprimível, sem espaço) abre sessão; o que o secret escreveu nunca entra na mensagem, só o rc."""
+    item = prof["secret"]
+    try:
+        r = subprocess.run([cfg.prof_secret, item], capture_output=True, timeout=SECRET_TIMEOUT, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        raise Fail(f"chave do perfil ({item}) ilegível: o secret não respondeu em {SECRET_TIMEOUT}s; a sessão não abre no host e NÃO cai na conta do pool")
+    except OSError as e:
+        raise Fail(f"chave do perfil ({item}) ilegível: não consegui rodar {cfg.prof_secret} ({type(e).__name__}); a sessão não abre no host e NÃO cai na conta do pool")
+    tok = r.stdout.decode("utf-8", "replace").strip()
+    if r.returncode == 0 and tok.startswith(prof["key_prefix"]) and len(tok) > 16 and tok.isascii() and tok.isprintable() and not any(c.isspace() for c in tok):
+        return tok
+    raise Fail(f"chave do perfil ({item}) ilegível (rc={r.returncode}{', saída sem forma de chave' if r.returncode == 0 else ''}); a sessão não abre no host e NÃO cai na conta do pool")
+
+
+def profile_env(prof: dict, key: str) -> dict:
+    """O ambiente do claude com o perfil: fornecedor, chave e os slots de modelo (o `--model sonnet` do provider cai no slot SONNET). Os dois vazios fecham a porta da Anthropic."""
+    big, small = prof["model"], prof["small_model"]
+    return {"ANTHROPIC_BASE_URL": prof["base_url"], "ANTHROPIC_AUTH_TOKEN": key, "ANTHROPIC_API_KEY": "", OAUTH_ENV: "",
+            "ANTHROPIC_MODEL": big, "ANTHROPIC_DEFAULT_OPUS_MODEL": big, "ANTHROPIC_DEFAULT_SONNET_MODEL": big, "CLAUDE_CODE_SUBAGENT_MODEL": big,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": small, "ANTHROPIC_SMALL_FAST_MODEL": small, "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
+
+
 def gate_check(cfg: Cfg) -> dict:
     """A regra do Athos para o MBP (ga-77c1qg), a mesma do mbp-run.sh: só evidência POSITIVA de "Athos fora e MBP saudável" libera.
     Pausa, bandeira desligada, em uso, sem saúde ou qualquer coisa que a checagem não deixe ler recusa (o lado que protege o Athos)."""
@@ -871,7 +922,18 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
             raise Fail(f"host {cfg.host}: não abro sessão nova — {g['reason']}")
         cap = min(cap, g["slot_cap"])  # o teto de RAM do mbp-run.sh (slot_cap) também vale para as sessões
     secrets, acct_view = {}, None  # a chave da conta atual do pool (ga-2hd02v.7.1): só sessão claude de host com `claude_account`; o resto do start não a vê
-    if cfg.acct and runs_claude(p["command"]):
+    prof = model_profile(cfg, name) if runs_claude(p["command"]) else None
+    prof_view = {"base_url": prof["base_url"], "model": prof["model"], "small_model": prof["small_model"], "key": "não lida no dry-run" if dry else "lida"} if prof else None
+    if prof:  # perfil de modelo do papel (ga-do1ixn.2): a chave dele no lugar da conta do pool, lida no mesmo ponto (depois das políticas, antes do ssh)
+        if dry:
+            secrets.update(profile_env(prof, f"<chave do perfil ({prof['secret']}): não lida no dry-run>"))
+        else:
+            try:
+                secrets.update(profile_env(prof, profile_key(cfg, prof)))
+            except Fail:
+                cfg.event("refused", name, reason=f"chave do perfil {prof['secret']} indisponível")
+                raise
+    elif cfg.acct and runs_claude(p["command"]):
         if dry:  # o dry-run não abre o cofre: diz a conta (o arquivo do pool é local e barato) e que a chave NÃO foi lida; arquivo do pool ilegível entra em would_refuse
             acct_view = {"current": None, "env": OAUTH_ENV, "key": "não lida no dry-run"}
             try:
@@ -890,7 +952,7 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     lpath = f"{run_dir}/{name}.sh"
     if dry:
         wtd = {"worktree": {"rig": wt["rig"], "path": wt["path"], "add": f"{wt['bin']} wt-add {wt['rig']} {name}", "rm": f"{wt['bin']} wt-rm {wt['rig']} {name}", "start_timeout": start_timeout}} if wt else {}
-        print(json.dumps(dict(p, **wtd, host=cfg.host, session=name, session_kind="teste" if TEST_RE.fullmatch(name) else "real", would_refuse=would_refuse, claude_account=acct_view, launcher=launcher(cfg, name, p, secrets).split("\n"),
+        print(json.dumps(dict(p, **wtd, host=cfg.host, session=name, session_kind="teste" if TEST_RE.fullmatch(name) else "real", would_refuse=would_refuse, claude_account=acct_view, model_profile=prof_view, launcher=launcher(cfg, name, p, secrets).split("\n"),
                               prepare=({"git_user": name, "git_email": f"{name}@gastown.invalid", "trust_file": f"{cfg.home}/.claude.json", "work_dir": p["work_dir"]} if cfg.prepare else None),
                               gate=cfg.gate_cmd if cfg.gate else None, path_extra=cfg.path_extra,
                               session_env={"path": cfg.spath, "claude": cfg.claude_bin, "zdot": cfg.zdot} if cfg.spath else None,
