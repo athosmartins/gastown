@@ -10,10 +10,17 @@
 # and nobody saw it until the Mayor ran the selftest by hand on 26/10.
 #
 # WHAT. When <base>..<tip> touches an INPUT of that detector (a prompt, city.toml, a template fragment, a skill or
-# command name, the detector itself) this runs the detector of the TIP tree on the TIP tree, and, only if that is red,
-# the detector of the BASE tree on the BASE tree, to tell what the diff broke from what main already carried (the
-# gate's own rule: "a failing test blocks only when this diff made it fail"). A diff that touches no input costs one
-# `git diff` and runs nothing.
+# command name) this runs the detector on the TIP tree, and, only if that is red, on the BASE tree, to tell what the
+# diff broke from what main already carried (the gate's own rule: "a failing test blocks only when this diff made it
+# fail"). A diff that touches no input costs one `git diff` and runs nothing.
+#
+# TRUST. The guard runs this with its own privileges, and the branch may come from a sandboxed node (the Hetzner
+# dogs), so nothing the branch supplies is ever EXECUTED here: the branch's files are read as DATA by a detector that
+# the diff did not touch, i.e. byte for byte the copy already merged to main. That is also why a diff that edits the
+# detector itself is NOT judged (reason detector-alterado-no-diff): its own copy cannot vouch for it, and running it
+# would be running branch code. The reviewers read that diff. Tree paths are data too: an entry with a "." / ".." /
+# ".git" component (git mktree builds those) is refused before anything is written, so extraction cannot climb out
+# of its scratch directory.
 #
 # OUTPUT. Exactly one verdict line first, then (fail / debito-previo only) the detector's red lines, capped:
 #   VERDICT=<token> reason=<slug> hits=<n> tip=<green|red|unknown|-> base=<green|red|unknown|->
@@ -30,8 +37,8 @@
 # red = M > 0 and rc 1, everything else unknown. (rc 1 alone is not red: a `set -u` crash exits 1 too.)
 #
 # ENV. GATE_PSC_TIMEOUT seconds per detector run (default 60; a garbage value is the default, never "no limit").
-# The detector runs with a scrubbed environment (PATH, HOME, TMPDIR inside the scratch tree, the locale vars): it is
-# branch-supplied code run by the guard, like the ga-rstae base test, so it gets no tokens.
+# The detector runs with a scrubbed environment (PATH, HOME, TMPDIR inside the scratch tree, the locale vars): it
+# needs no token, so it gets none.
 #
 # bash 3.2 (the macOS /bin/bash the guard's launchd job runs under): no arrays, no mapfile, no ${v,,}; case patterns are
 # parenthesised so they are safe inside $( ) too. No `set -e`: every step that can fail is handled where it happens.
@@ -84,6 +91,10 @@ extract_tree() {
   mkdir -p "$dest" 2>/dev/null || return 1
   while IFS= read -r -d '' f; do
     is_input "$f" || continue
+    # A tree path is data from the branch, and git mktree builds entries named "." / ".." / ".git": with the `*` of
+    # is_input spanning "/", such a path would match and the write below would land outside $dest. Refuse it as
+    # "could not extract" (return 1 = nao-consegui-medir), never skip it and go on with a tree that lacks it.
+    case "/$f/" in (*/./*|*/../*|*/.git/*) return 1 ;; esac
     mkdir -p "$dest/$(dirname "$f")" 2>/dev/null || return 1
     # falhou/ilegível (gitlink, objeto ausente) → return 1; nunca segue com a árvore pela metade
     git -C "$TOP" show "$sha:$f" > "$dest/$f" 2>/dev/null || return 1
@@ -125,10 +136,15 @@ main() {
   # vazio → o diff foi lido e não tem nenhuma entrada do detector = zero MEDIDO (sem-prompt-alterado); falhou (sha desconhecido, objeto ausente) → diff-falhou, nunca zero
   git -C "$TOP" diff -z --name-only --no-renames "${base}..${tip}" -- "$HQ" .claude > "$SCRATCH/diff" 2>/dev/null || emit nao-consegui-medir diff-falhou
   HITS=0
+  DET_TOUCHED=0
   while IFS= read -r -d '' f; do
     if is_input "$f"; then HITS=$((HITS + 1)); fi
+    if [ "$f" = "$SELFTEST_REL" ]; then DET_TOUCHED=1; fi
   done < "$SCRATCH/diff"
   if [ "$HITS" -eq 0 ]; then emit sem-prompt-alterado diff-sem-entradas-do-detector; fi
+  # The detector is in the diff (edited, added, deleted or renamed): the copy that would run is the branch's own, which
+  # may not be run and cannot vouch for itself. Nothing is run and nothing is vouched for: unmeasured, said out loud.
+  if [ "$DET_TOUCHED" -eq 1 ]; then emit nao-consegui-medir detector-alterado-no-diff; fi
 
   extract_tree "$tip" "$SCRATCH/tip" || emit nao-consegui-medir extracao-tip
   cls=$(run_detector "$SCRATCH/tip" "$SCRATCH/tip.out")

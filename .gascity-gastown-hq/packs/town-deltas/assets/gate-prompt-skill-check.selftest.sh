@@ -178,7 +178,32 @@ run_sut "$R" "$RBASE" "$TIP"
 expect "base red, tip green: the repair passes" ok
 git_in "$R" checkout -q main
 
-echo "G. third states: a check that cannot measure never blocks and never vouches"
+echo "G. the detector is trusted code: the branch's copy is never run, and a diff that edits it is not judged"
+git_in "$R" checkout -q main; branch_from_main "$R" det_edit
+CANARY="$WORK/canary-detector"
+printf '#!/usr/bin/env bash\ntouch "%s"\necho "pool-prompt-skill-mention selftest: 9 passed, 0 failed"\nexit 0\n' "$CANARY" > "$R/$DET_REL"
+printf 'use /gate-done here.\n' >> "$R/$HQ/agents/gate-reviewer/prompt.template.md"
+TIP="$(commit_all "$R" "weakened detector + a token in one push")"
+run_sut "$R" "$BASE" "$TIP"
+expect "weakened detector + a token in the same diff is NOT vouched for" nao-consegui-medir detector-alterado-no-diff
+[ "$VERDICT" != "ok" ] && ok "never 'ok' for a diff that attests for itself" || bad "a self-attesting diff read ok"
+[ ! -e "$CANARY" ] && ok "the branch's detector was never executed (canary absent)" || bad "the branch's detector RAN (canary exists)"
+
+git_in "$R" checkout -q main; branch_from_main "$R" det_gone
+git_in "$R" rm -q "$DET_REL"
+TIP="$(commit_all "$R" "detector deleted")"
+run_sut "$R" "$BASE" "$TIP"
+expect "detector deleted in the diff" nao-consegui-medir detector-alterado-no-diff
+
+git_in "$R" checkout -q main; branch_from_main "$R" data_only
+CANARY2="$WORK/c2"
+printf 'harmless $(touch %s) and `touch %s` and ; touch %s text.\n' "$CANARY2" "$CANARY2" "$CANARY2" >> "$R/$HQ/agents/gate-reviewer/prompt.template.md"
+TIP="$(commit_all "$R" "shell syntax inside prompt text")"
+run_sut "$R" "$BASE" "$TIP"
+expect "shell syntax inside a prompt is data" ok
+[ ! -e "$CANARY2" ] && ok "nothing in the prompt text was executed" || bad "prompt text was EXECUTED (canary exists)"
+
+echo "H. third states: a check that cannot measure never blocks and never vouches"
 run_sut "" "" ""
 expect "empty arguments" nao-consegui-medir entrada-vazia
 run_sut "$WORK" "$BASE" "$BASE"
@@ -186,46 +211,36 @@ expect "rig path is not a git repository" nao-consegui-medir sem-toplevel
 run_sut "$R" "$BASE" "0000000000000000000000000000000000000000"
 expect "tip sha unknown to git (the diff fails)" nao-consegui-medir diff-falhou
 
-git_in "$R" checkout -q main; branch_from_main "$R" det_crash
-printf '#!/usr/bin/env bash\necho boom >&2\nexit 3\n' > "$R/$DET_REL"
-printf 'plain.\n' >> "$R/$HQ/agents/gate-reviewer/prompt.template.md"
-TIP="$(commit_all "$R" "detector crashes")"
-run_sut "$R" "$BASE" "$TIP"
-expect "detector crashes without a summary line" nao-consegui-medir selftest-inconclusivo-tip
+# A detector that is part of the base lineage (unchanged by the diff, so it is the one that runs) but misbehaves.
+broken_detector_case() { # broken_detector_case <label> <detector text> [VAR=value ...]
+  local lab="$1" text="$2" cb="" tip=""; shift 2
+  git_in "$R" checkout -q main; git_in "$R" checkout -q -b "bd_$RANDOM"
+  printf '%s' "$text" > "$R/$DET_REL"; cb="$(commit_all "$R" "base lineage with a broken detector")"
+  git_in "$R" checkout -q -b "bt_$RANDOM"
+  printf 'plain.\n' >> "$R/$HQ/agents/gate-reviewer/prompt.template.md"; tip="$(commit_all "$R" "prompt edit")"
+  run_sut "$R" "$cb" "$tip" "$@"
+  expect "$lab" nao-consegui-medir selftest-inconclusivo-tip
+}
+broken_detector_case "detector crashes without a summary line" $'#!/usr/bin/env bash\necho boom >&2\nexit 3\n'
+broken_detector_case "exit 0 with no summary line is not a pass" $'#!/usr/bin/env bash\nexit 0\n'
+broken_detector_case "a summary that disagrees with the exit code" $'#!/usr/bin/env bash\necho "pool-prompt-skill-mention selftest: 5 passed, 0 failed"\nexit 1\n'
+broken_detector_case "detector hits the timeout" $'#!/usr/bin/env bash\nsleep 5\necho "pool-prompt-skill-mention selftest: 1 passed, 0 failed"\n' GATE_PSC_TIMEOUT=1
 
-git_in "$R" checkout -q main; branch_from_main "$R" det_gone
-git_in "$R" rm -q "$DET_REL"
-TIP="$(commit_all "$R" "detector deleted")"
-run_sut "$R" "$BASE" "$TIP"
-expect "detector deleted in the tip" nao-consegui-medir selftest-ausente-no-tip
+git_in "$R" checkout -q main; git_in "$R" checkout -q -b nodet_base
+git_in "$R" rm -q "$DET_REL"; NB="$(commit_all "$R" "base lineage without any detector")"
+git_in "$R" checkout -q -b nodet_tip
+printf 'plain.\n' >> "$R/$HQ/agents/gate-reviewer/prompt.template.md"; TIP="$(commit_all "$R" "prompt edit")"
+run_sut "$R" "$NB" "$TIP"
+expect "no detector in the tree at all" nao-consegui-medir selftest-ausente-no-tip
 
-git_in "$R" checkout -q main; branch_from_main "$R" det_silent
-printf '#!/usr/bin/env bash\nexit 0\n' > "$R/$DET_REL"
-TIP="$(commit_all "$R" "detector that prints nothing")"
-run_sut "$R" "$BASE" "$TIP"
-expect "exit 0 with no summary line is not a pass" nao-consegui-medir selftest-inconclusivo-tip
-
-git_in "$R" checkout -q main; branch_from_main "$R" det_liar
-printf '#!/usr/bin/env bash\necho "pool-prompt-skill-mention selftest: 5 passed, 0 failed"\nexit 1\n' > "$R/$DET_REL"
-TIP="$(commit_all "$R" "summary says green, exit says red")"
-run_sut "$R" "$BASE" "$TIP"
-expect "a summary that disagrees with the exit code" nao-consegui-medir selftest-inconclusivo-tip
-
-git_in "$R" checkout -q main; branch_from_main "$R" det_slow
-printf '#!/usr/bin/env bash\nsleep 5\necho "pool-prompt-skill-mention selftest: 1 passed, 0 failed"\n' > "$R/$DET_REL"
-TIP="$(commit_all "$R" "detector that hangs")"
-run_sut "$R" "$BASE" "$TIP" GATE_PSC_TIMEOUT=1
-expect "detector hits the timeout" nao-consegui-medir selftest-inconclusivo-tip
-
-git_in "$R" checkout -q main; branch_from_main "$R" base_broken_a
-printf '#!/usr/bin/env bash\necho boom >&2\nexit 3\n' > "$R/$DET_REL"
-BB="$(commit_all "$R" "base with a broken detector")"
-branch_from_main "$R" base_broken_b
-cp "$DET" "$R/$DET_REL"
-printf 'use /gate-done here.\n' >> "$R/$HQ/agents/gate-reviewer/prompt.template.md"
-TIP="$(commit_all "$R" "tip red, base detector unusable")"
+# A detector that reads the tree it runs in: red on the tip (REDWORD), crashing on the base (CRASHWORD).
+STUB_TREE=$'#!/usr/bin/env bash\nf=".gascity-gastown-hq/agents/gate-reviewer/prompt.template.md"\nif grep -q CRASHWORD "$f"; then echo boom >&2; exit 3; fi\nif grep -q REDWORD "$f"; then echo "pool-prompt-skill-mention selftest: 1 passed, 1 failed"; exit 1; fi\necho "pool-prompt-skill-mention selftest: 2 passed, 0 failed"\n'
+git_in "$R" checkout -q main; git_in "$R" checkout -q -b stub_lineage
+printf '%s' "$STUB_TREE" > "$R/$DET_REL"; SB="$(commit_all "$R" "lineage with a tree-reading detector")"
+git_in "$R" checkout -q -b stub_base; printf 'CRASHWORD\n' >> "$R/$HQ/agents/gate-reviewer/prompt.template.md"; BB="$(commit_all "$R" "base: detector crashes here")"
+git_in "$R" checkout -q -b stub_tip "$SB"; printf 'REDWORD\n' >> "$R/$HQ/agents/gate-reviewer/prompt.template.md"; TIP="$(commit_all "$R" "tip: detector is red here")"
 run_sut "$R" "$BB" "$TIP"
-expect "tip red but the base cannot be measured" nao-consegui-medir selftest-inconclusivo-base
+expect "tip red but the detector cannot answer on the base" nao-consegui-medir selftest-inconclusivo-base
 
 git_in "$R" checkout -q main; branch_from_main "$R" gitlink
 git_in "$R" update-index --add --cacheinfo 160000,1111111111111111111111111111111111111111,"$HQ/skills/ghost/SKILL.md"
@@ -235,7 +250,29 @@ run_sut "$R" "$BASE" "$TIP"
 expect "an input entry that cannot be extracted" nao-consegui-medir extracao-tip
 git_in "$R" checkout -q main
 
-echo "H. contract: one VERDICT line first, red lines only for fail/debito-previo, nothing left behind"
+echo "I. a tree path that climbs out of the scratch directory is refused (git mktree builds such entries)"
+# tree = main's tree + .gascity-gastown-hq/skills/<5 x '..'>/planted/SKILL.md; unpatched, the write lands in $WORK/planted
+mk_climb_commit() { # mk_climb_commit <repo> <parent> -> prints the commit
+  local r="$1" par="$2" b="" leaf="" t="" i="" newsk="" newhq="" newroot=""
+  b="$(printf 'planted\n' | git -C "$r" hash-object -w --stdin)"
+  leaf="$(printf '100644 blob %s\tSKILL.md\n' "$b" | git -C "$r" mktree)"
+  t="$(printf '040000 tree %s\tplanted\n' "$leaf" | git -C "$r" mktree)"
+  for i in 1 2 3 4; do t="$(printf '040000 tree %s\t..\n' "$t" | git -C "$r" mktree)"; done
+  newsk="$( { git -C "$r" ls-tree "$par:$HQ/skills"; printf '040000 tree %s\t..\n' "$t"; } | git -C "$r" mktree)"
+  newhq="$( { git -C "$r" ls-tree "$par:$HQ" | awk -F'\t' '$2 != "skills"'; printf '040000 tree %s\tskills\n' "$newsk"; } | git -C "$r" mktree)"
+  newroot="$( { git -C "$r" ls-tree "$par" | awk -F'\t' -v n="$HQ" '$2 != n'; printf '040000 tree %s\t%s\n' "$newhq" "$HQ"; } | git -C "$r" mktree)"
+  git -C "$r" commit-tree "$newroot" -p "$par" -m "climbing path"
+}
+TIP="$(mk_climb_commit "$R" main)"
+if [ -n "$TIP" ]; then
+  run_sut "$R" "$BASE" "$TIP"
+  expect "a tree path with '..' components" nao-consegui-medir extracao-tip
+  [ ! -e "$WORK/planted" ] && ok "nothing was written outside the scratch directory" || bad "the climbing path WROTE $WORK/planted"
+else
+  bad "could not build the climbing-path commit (plumbing failed): the traversal case did not run"
+fi
+
+echo "J. contract: one VERDICT line first, red lines only for fail/debito-previo, nothing left behind"
 run_sut "$R" "$BASE" "$BASE"
 FIRST="$(printf '%s\n' "$OUT" | head -n 1)"
 case "$FIRST" in (VERDICT=*) ok "first line is the verdict line" ;; (*) bad "first line is not the verdict line: $FIRST" ;; esac
