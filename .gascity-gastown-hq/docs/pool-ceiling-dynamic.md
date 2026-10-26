@@ -125,8 +125,8 @@ Hoje o teto do motor (2/1/3) esconde estes dois pontos; viram reais quando ele s
   operador) e `0` (pausa) ficam; fragmento ilegível ou estranho = o piso do motor. Com o motor em `wa-worker=3`, plist em 2 e 2 vivos o reconciler lê "tem folga (2/3)" e o caminho de fome fica aberto
   (antes lia "saturado 2/2" e podia pular um alarme legítimo: número baixo demais ESCONDE falha, o lado ruim do ga-zowwdz). A origem na nota é `plist+engine`; a lib que não responde (ausente, não
   carrega, resposta fora do formato) deixa o número do plist e diz "engine cap NOT MEASURED", como o Pilot sem a lib. A linha "pool at session cap … max=M" do log só vale contra o número JÁ seguido, e só
-  se não for mais velha que o plist nem que o fragmento (uma linha de antes da subida do motor descreve o nível anterior). `POOL_CEILING_LIB=` vazio no plist do reconciler desliga o seguimento (volta
-  ao comportamento anterior). O selftest do reconciler roda o `pool-ceiling.sh` e o bloco REAL do clamp do Pilot sobre uma matriz de plist × fragmento × `agent.toml`, então os três não se afastam sem a
+  se não for mais velha que o plist nem que o fragmento (uma linha de antes da subida do motor descreve o nível anterior). `POOL_CEILING_LIB` aponta a lib (o mesmo nome e a mesma leitura do Pilot e do gate: vazio no
+  ambiente vale o caminho padrão, nunca "desligado"). O selftest do reconciler roda o `pool-ceiling.sh` e o bloco REAL do clamp do Pilot sobre uma matriz de plist × fragmento × `agent.toml`, então os três não se afastam sem a
   suíte avisar. **O teto dinâmico ele ainda não conhece** (`.gc/pool-ceiling/<pool>.state`): **com o teto APLICADO (fora da sombra)**, `PILOT_*_WORKER_MAX` passa a ter uma segunda
   fonte que ele ignora: enquanto o teto estiver abaixo do valor do plist ele loga "DIVERGED … plist edited without reloading the Pilot job?" (enganoso) e,
   sem linha de cap fresca, pode ler um pool freado como "tem folga" e levantar alarme falso de fome (classe wa-ho1ol). A direção é conservadora (alarme a mais,

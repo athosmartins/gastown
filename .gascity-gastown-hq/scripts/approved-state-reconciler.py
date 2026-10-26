@@ -1690,12 +1690,13 @@ _POOL_CAP_LOG_FUTURE_SKEW_SEC = 300
 # "saturated" at 2 sessions while the Pilot is free to open a third: the number too LOW, the side that hides a failure.
 # That one definition is CALLED here (_read_engine_cap), not re-implemented, so there is no second copy of it to drift
 # from the Pilot's and the gate's — the same reason GATE_FOCUS_LIB is called. Same env name as the Pilot and the gate
-# use, so an override means the same thing in each process (it still has to be set in each). EMPTY = do not follow the
-# engine at all: _pool_cap() then reads the plist number exactly as it did before ga-m9x0lb.6 (the selftest's hermetic
-# default, and an instant rollback for an operator who sets POOL_CEILING_LIB= in this job's plist).
-POOL_CEILING_LIB = os.environ.get(
-    "POOL_CEILING_LIB",
-    os.path.join(CITY, "packs/town-deltas/assets/pool-ceiling.sh"))
+# use, and the same reading of it (${POOL_CEILING_LIB:-default}: an EMPTY value means the default path), so an
+# override means the same thing in each process (it still has to be set in each). This global being EMPTY means do
+# not follow the engine at all — _pool_cap() then reads the plist number exactly as it did before ga-m9x0lb.6 — and
+# only the selftest sets it so (its hermetic default): the ENVIRONMENT cannot, so a stray empty variable cannot
+# switch the follow off in silence.
+POOL_CEILING_LIB = os.environ.get("POOL_CEILING_LIB") or os.path.join(
+    CITY, "packs/town-deltas/assets/pool-ceiling.sh")
 
 
 def _read_pilot_plist_cap(cap_env):
@@ -1867,7 +1868,8 @@ def _follow_engine_cap(pool, cur):
     number `cur`; `mtime` is when the engine's fragment was last written (None = no date).
 
     Nothing to follow — `cur` comes back as it is, with no note and no date — when POOL_CEILING_LIB is empty
-    (the switch) or `cur` is 0 (the operator's pause; the Pilot skips it too: `[ cur -gt 0 ] || continue`).
+    (the selftest's hermetic seam, never the environment) or `cur` is 0 (the operator's pause; the Pilot
+    skips it too: `[ cur -gt 0 ] || continue`).
     When the engine cannot be read at all the number also stands, but the note says it did not look.
     """
     if not POOL_CEILING_LIB or cur <= 0:
@@ -6428,8 +6430,27 @@ def _selftest():
         _ec_c.append(("bash that cannot run (_sh → None) → None", _r is None, _r))
         with _ec_on(_ec_root, lib=""):
             _r = _ec_try("_follow_engine_cap", "wa-worker", 2)
-        _ec_c.append(("empty lib path (the switch) → the plist number, no note, no date",
+        _ec_c.append(("empty lib path (the selftest's hermetic seam) → the plist number, no note, no date",
                       _r == (2, "", None), _r))
+        # The ENVIRONMENT cannot reach that seam: the Pilot and the gate read ${POOL_CEILING_LIB:-default}, so an
+        # empty value there means the default path — one stray empty variable must not switch the follow off in silence.
+        _ec_envs = {}
+        for _env_val in ("", "/x/own-lib.sh"):
+            _env = dict(os.environ, POOL_CEILING_LIB=_env_val, GC_CITY_PATH="/x/city")
+            try:
+                # third-state-waiver: test-only; a python that cannot run leaves the answer None and the check below FAILS via _bad
+                _p = subprocess.run(
+                    [sys.executable, "-I", "-c",
+                     "import importlib.util as u,sys; s=u.spec_from_file_location('arc',sys.argv[1]); "
+                     "m=u.module_from_spec(s); s.loader.exec_module(m); print(m.POOL_CEILING_LIB)",
+                     os.path.abspath(__file__)],
+                    capture_output=True, text=True, timeout=60, env=_env)
+                _ec_envs[_env_val] = _p.stdout.strip() if _p.returncode == 0 else None
+            except Exception:   # noqa: BLE001
+                _ec_envs[_env_val] = None
+        _ec_c.append(("POOL_CEILING_LIB empty in the environment → the default path under CITY; set → that path",
+                      _ec_envs.get("") == "/x/city/packs/town-deltas/assets/pool-ceiling.sh"
+                      and _ec_envs.get("/x/own-lib.sh") == "/x/own-lib.sh", _ec_envs))
     for _lab, _good, _det in _ec_c:
         if _good:
             _ok("(ga-m9x0lb.6-c) %s" % _lab)
