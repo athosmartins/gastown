@@ -306,6 +306,23 @@ mk_city p28; mkplist 2 9; frag "wa-worker=09"
 eq "$(prod)" "1" "a fragment entry wa-worker=09 (the engine never renders it; gc rejects it): FAILS"
 has "$(cat "$TMPROOT/prod.out")" "FOREIGN content" "as foreign"
 
+# ga-m9x0lb.5: the prod-test says what the code says. The dispatchers' effective ceiling stops at the engine's raise ceiling (wa-worker 3, or
+# agent.toml's value when higher), so a wa-worker entry above it would be a state the controller runs and the dispatchers do not follow.
+mk_city p29; mkplist 2 9; frag "wa-worker=4"
+if need_toml p29; then
+  eq "$(prod)" "1" "wa-worker=4 over agent.toml 2 is ABOVE the engine's raise ceiling 3: FAILS (the dispatchers stop at 3, the controller would run 4)"
+  has "$(cat "$TMPROOT/prod.out")" "raise ceiling 3" "naming the ceiling"
+fi
+mk_city p29b; printf 'min_active_sessions = 0\nmax_active_sessions = 4\n' > "$C/agents/wa-worker/agent.toml"; mkplist 4 9; frag "wa-worker=4"
+if need_toml p29b; then
+  eq "$(prod)" "0" "agent.toml 4 + fragment wa-worker=4: the raise ceiling is max(3, agent.toml) = 4, so it passes (the 3 is not a flat bound)"
+fi
+mk_city p29c; mkplist 2 9; frag "wa-worker=4"; mkdir -p "$TMPROOT/nolib/prod-tests/gascity"; cp "$PROD" "$TMPROOT/nolib/prod-tests/gascity/story-ga-o3o09z.sh"
+if need_toml p29c; then
+  eq "$(PROD="$TMPROOT/nolib/prod-tests/gascity/story-ga-o3o09z.sh" prod)" "0" "the lib that holds the raise ceiling is NOT next to the prod-test: the check is skipped, never passed by default"
+  has "$(cat "$TMPROOT/prod.out")" "wa-worker-raise-ceiling" "and the verdict line names it in NOT CHECKED"
+fi
+
 echo
 SKIPNOTE=""; [ "$SKIP" -gt 0 ] && SKIPNOTE=" ($SKIP scenario(s) SKIPPED, see above)"
 if [ "$FAIL" -eq 0 ]; then echo "PASS: $PASS checks$SKIPNOTE"; exit 0; fi

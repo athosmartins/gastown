@@ -30,7 +30,7 @@ teto, **no máximo 1 passo por varredura**, dentro de `[min, max]` do pool:
 `min..max` padrão: wa-worker 1..4 (4 = decisão do Athos em 19/09), ps-worker 1..2,
 gate-reviewer 2..6 (o min sobe até `GATE_REVIEWERS_PER_RUN`, para uma run caber sob o teto — salvo se o
 teto do **motor** for menor que isso: aí nenhuma run sai inteira de qualquer jeito, e o "motor N" da linha de
-log mostra por quê) — **sempre limitados ao `max_active_sessions` do agent.toml do pool** (ver "O teto do motor").
+log mostra por quê) — **sempre limitados ao teto efetivo do pool** (a entrada do fragmento do motor, senão o `max_active_sessions` do agent.toml; ver "O teto do motor").
 Override: `POOL_CEILING_<POOL>_MIN` / `_MAX` (pool em maiúsculas, `-` vira `_`).
 
 `GC_VARIABLE_SESSION_MAX` (9, decisão do Athos) continua um teto **fixo** por cima dos três.
@@ -125,6 +125,10 @@ Hoje o teto do motor (2/1/3) esconde estes dois pontos; viram reais quando ele s
   sem linha de cap fresca, pode ler um pool freado como "tem folga" e levantar alarme falso de fome (classe wa-ho1ol). A direção é conservadora (alarme a mais,
   nada escondido) e só aparece aplicando — **na sombra não há efeito**, que é mais uma razão para a sombra vir primeiro. Ensinar o reconciler a ler o teto
   efetivo (`.gc/pool-ceiling/<pool>.state`) é trabalho do bead que ligar o teto de verdade.
+  **Direção oposta, e pior, desde o ga-m9x0lb.5:** com o motor em `wa-worker=3` o Pilot admite 3 com o plist em 2 (ele segue o teto efetivo do motor). O reconciler lê o 2 do plist enquanto
+  o pool NÃO está no teto (só a linha "pool at session cap … max=3" do Pilot, que existe com o pool CHEIO, o corrige) e, com 2 vivos, lê "saturado": pode pular um alarme de fome legítimo
+  (um número baixo demais ESCONDE uma falha de despacho: o lado ruim do ga-zowwdz). Aceito, **não corrigido** aqui (é Python, fora do escopo da .5): o conserto é o reconciler ler o teto efetivo
+  (o mesmo `pool_ceiling_engine_cap_resolve`); levar o plist a 3 também o resolveria, mas o prod-test (regra 4) o reprova enquanto o motor estiver em 2.
 - **`POOL_CEILING_DYNAMIC` só aceita `0` ou `1`.** Qualquer outro valor (ex.: `true`) é tratado como não definido e cai no teste do arquivo `.on` — sem aviso.
   Use `0`/`1` (ou o arquivo `.on`).
 - **Swap recém-criado.** `vm.swapusage` pode mostrar total 0 logo depois de um reboot (o macOS cria o swapfile sob demanda); "swap livre < 512 MB" lê como baixo mesmo
@@ -149,12 +153,12 @@ Hoje o teto do motor (2/1/3) esconde estes dois pontos; viram reais quando ele s
   `max_active_sessions` do engine (dog: bloco gerido pelo `eval-window-concurrency-guard` no
   `city.toml`). Torná-los dinâmicos exige reescrever esse valor + `gc reload --soft` — outro mecanismo.
 - `auto-refiner`: roda sob lock de instância única (no máximo 1 em voo), não há o que dimensionar.
-- **O teto do motor.** O controller aplica `max_active_sessions` de `agents/<pool>/agent.toml` por conta
-  própria, sem olhar o dispatcher (25/09: agent.toml=4, plist do Pilot=2 → 4 workers ativos, ga-o3o09z;
+- **O teto do motor.** O controller aplica por conta própria o teto **efetivo** do pool — a entrada do fragmento do motor (abaixo) quando existe, senão o
+  `max_active_sessions` de `agents/<pool>/agent.toml` —, sem olhar o dispatcher (25/09: agent.toml=4, plist do Pilot=2 → 4 workers ativos, ga-o3o09z;
   `prod-tests/gascity/story-ga-o3o09z.sh` fixa que o teto do Pilot nunca pode ser MAIOR que o do motor).
-  Por isso o teto dinâmico é **limitado ao `max_active_sessions` do agent.toml** (ilegível → limitado ao
-  teto fixo conhecido). Hoje isso dá faixa efetiva wa-worker 1..2, ps-worker 1..1, gate-reviewer 2..3:
-  **esta entrega só FREIA e religa dentro do teto do motor; não sobe acima dele.**
+  Por isso o teto dinâmico é **limitado ao teto efetivo** (ilegível → limitado ao teto fixo conhecido). Sem entrada no fragmento isso dá faixa efetiva
+  wa-worker 1..2, ps-worker 1..1, gate-reviewer 2..3; com o motor em `wa-worker=3`, wa-worker 1..3 (ga-m9x0lb.5):
+  **o teto dinâmico só FREIA e religa dentro do teto do motor; quem SOBE o teto é o motor.**
   **NÃO suba o `max_active_sessions` do agent.toml esperando que o dinâmico segure**: o controller
   admite até esse valor sozinho, e o dispatcher não o impede.
   Subir de verdade (o caso da fila de 69 com teto 2) exige o teto do MOTOR acompanhar o dinâmico. Isso **não** reescreve o
@@ -231,15 +235,22 @@ O `status` roda no `/bin/bash` 3.2 do plist (o selftest usa o mesmo interpretado
 4. `touch .gc/pool-ceiling-engine.on`; acompanhar as primeiras varreduras no log;
 5. **treino do kill switch**: `touch .off` → conferir que o valor do motor voltou (`gc config show`) → conferir que um spawn acima do commitado é recusado → `rm .off`;
 6. **medir drain**: `max_active_sessions` entra no fingerprint do pool (por fonte, **não provado**): contar `session.stopped`/drain do pool tocado antes e depois da 1ª escrita;
-7. subir `PILOT_WA_WORKER_MAX` do plist do Pilot só se quiser que o **Pilot** também use o 3º slot (hoje quem passa de 2 é o controller; o prod-test v2 aceita o Pilot até o teto efetivo).
+7. **não** suba `PILOT_WA_WORKER_MAX` no plist para o Pilot usar o 3º slot: ele segue o teto efetivo do motor sozinho (ga-m9x0lb.5). Com o plist em 2 (o do agent.toml) e `wa-worker=3` no fragmento o Pilot **sobe** a 3 e loga
+   `PILOT_WA_WORKER_MAX 2 sobe ao teto do motor 3 (…)`; quando o motor volta a 2 ele **desce** na varredura seguinte. Um número ABAIXO do agent.toml (1) é freio do operador e vale; 0 é a pausa. Com o pool cheio o log mostra `pool at session cap (… >= 3 max)`.
 
-**Limites conhecidos.** (a) O elo "mudar max ⇒ drain das sessões vivas" é por leitura de fonte, **não** medido: por isso o passo 6 e o limite de escritas. (b) ~~`pool_ceiling_engine_cap` lia só o `agent.toml`~~ — **corrigido em ga-m9x0lb.4**: a lib do freio tem `pool_ceiling_engine_cap_resolve`, que devolve o teto **efetivo**
-= o **menor** entre o `agent.toml` e a entrada do fragmento para o pool (nunca acima do `agent.toml`: um fragmento que *sobe* o wa-worker não é seguido para cima por um freio). Quem usa: o passo do teto dinâmico
-(`pool_ceiling_step`), o clamp do gate (`_gate_clamp_to_engine_cap`, que antes logava "clamped to the engine cap 3" com o motor em 2) e o clamp estático do Pilot (`_pilot_clamp_to_engine_cap`, para `PILOT_WA_WORKER_MAX`/`PILOT_PS_WORKER_MAX`
-quando o teto dinâmico está desligado ou em sombra). Fragmento ausente / vazio / sem entrada para o pool → vale o `agent.toml`; fragmento que **existe mas não se lê** (estranho, ilegível, leitor `pool-ceiling-engine.sh` ausente) → vale o
-`agent.toml` (nunca sobe na dúvida) e a nota do log diz "NAO consultado" e por quê. Lacuna aceita: um fragmento estranho não é "salvo" para um número menor — o motor o reescreve no próximo ciclo (5 min). **Não medido**: o que o controller
+**Limites conhecidos.** (a) O elo "mudar max ⇒ drain das sessões vivas" é por leitura de fonte, **não** medido: por isso o passo 6 e o limite de escritas. (b) ~~`pool_ceiling_engine_cap` lia só o `agent.toml`~~ — **corrigido em ga-m9x0lb.4, redefinido em ga-m9x0lb.5**: a lib do freio tem `pool_ceiling_engine_cap_resolve`, que devolve o teto **efetivo**, UMA definição por pool:
+a entrada do fragmento quando existe, senão o `agent.toml`, **nunca acima do teto de subida do motor** (wa-worker: 3, ou o `agent.toml` se maior; ps-worker e gate-reviewer: o `agent.toml`, logo seguem o **menor** entre
+`agent.toml` e fragmento, e um fragmento escrito à mão acima do `agent.toml` não é seguido). É a conta do próprio motor (passo 6, `cur` preso ao teto): o que o controller aplica. Quem usa: o passo do teto dinâmico
+(`pool_ceiling_step`), o clamp do gate (`_gate_clamp_to_engine_cap`, que antes logava "clamped to the engine cap 3" com o motor em 2) e o clamp do Pilot (`_pilot_clamp_to_engine_cap`, que roda **antes** do passo dinâmico — depois dele desfaria uma rampa que apertou — e leva `PILOT_WA_WORKER_MAX`/`PILOT_PS_WORKER_MAX` ao teto efetivo:
+para baixo sempre; para cima só quando o motor elevou o pool acima do `agent.toml` e o número digitado é o do `agent.toml` ou maior). Fragmento ausente / vazio / sem entrada para o pool → vale o `agent.toml`;
+fragmento que **existe mas não se lê** (estranho — inclusive um `max_active_sessions = 1 # nota`, TOML válido que o parser estrito do motor chama de estranho —, ilegível, que não é arquivo comum [diretório, link pendurado],
+em diretório sem permissão de busca, ou com o leitor `pool-ceiling-engine.sh` ausente) → vale o **piso do motor** (wa-worker 2, ps-worker 1, gate-reviewer 2, sempre ≤ `agent.toml`), de onde o próprio motor recomeça um pool que
+não consegue ler: uma falha de leitura nunca sobe o que se admite, e a nota do log diz "NAO consultado" e por quê. O piso e o teto de subida moram numa tabelinha da lib (`_pc_engine_floor`/`_pc_engine_ceil`), espelho de
+`pce_floor`/`pce_ceil` — o arquivo do motor é justamente o que pode faltar —, e `pool-ceiling-effective-cap.selftest.sh` a confere contra as funções do motor; os knobs `POOL_CEILING_ENGINE_<POOL>_FLOOR/_CEIL` vivem no ambiente
+do job do motor, não no dos dispatchers, e não são espelhados. Lacuna aceita: um fragmento estranho não é "salvo" para um número maior — o motor o reescreve no próximo ciclo (5 min). **Não medido**: o que o controller
 faz com um spawn ACIMA do teto (recusa, fila em start-pending, ou aceita) — o conserto só alinha o que os dispatchers *admitem* com o que o controller *aplica*. (c) Os outros pools só baixam até haver série medida no `pool-ceiling.log`; subir qualquer um é decisão do Mayor (as variáveis `POOL_CEILING_ENGINE_<POOL>_CEIL`/`_FLOOR` existem para calibrar, não para o uso normal).
-(d) `story-ga-o3o09z.sh` (v2, aprovado pelo Mayor) passou a exigir: Pilot ≤ teto **efetivo** do motor (agent.toml + fragmento), fragmento presente se incluído e bem-formado, outros pools nunca acima do commitado, soma ≤ `GC_VARIABLE_SESSION_MAX`.
+(d) `story-ga-o3o09z.sh` (v2, aprovado pelo Mayor) exige: Pilot ≤ teto **efetivo** do motor (a entrada do fragmento, senão o agent.toml), fragmento presente se incluído e bem-formado, outros pools nunca acima do commitado, soma ≤ `GC_VARIABLE_SESSION_MAX`;
+a v3 (ga-m9x0lb.5) diz o mesmo que o código e acrescenta que uma entrada do wa-worker acima do teto de subida do motor (tirado da tabela da lib) reprova.
 
 ## Verificação
 

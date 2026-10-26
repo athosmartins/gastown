@@ -21,6 +21,14 @@
 #   5. the sum of the effective ceilings of the three variable pools (wa-worker + ps-worker + gate-reviewer) stays within
 #      GC_VARIABLE_SESSION_MAX (read from the Pilot's plist).
 #
+# v3 (ga-m9x0lb.5): the CODE says the same. pool_ceiling_engine_cap_resolve (pool-ceiling.sh) is ONE definition of the effective ceiling
+# per pool: the fragment's entry when it has one, else agent.toml, never above the engine's raise ceiling (wa-worker 3, or agent.toml's value
+# when higher; every other pool: its agent.toml, so ps-worker / gate-reviewer are min(agent.toml, fragment)). The Pilot follows it at run time
+# (_pilot_clamp_to_engine_cap): DOWN to it every sweep, UP to it when the engine raised wa-worker above agent.toml and the plist number is
+# agent.toml's own or higher. So raising the plist is no longer how the Pilot gets the 3rd slot, and rule 4 below is a static safety net on the
+# typed number (never the higher one), not the mechanism. Rule 3 gained its missing half: a wa-worker entry above the engine's raise ceiling FAILS
+# (the dispatchers would stop at the ceiling while the controller ran the entry), like a ps-worker / gate-reviewer entry above agent.toml.
+#
 # Why not just agent.toml: before ga-o3o09z the controller ignored the Pilot's PILOT_WA_WORKER_MAX entirely (it only gates what
 # the Pilot itself dispatches), so the two ceilings could silently diverge (measured 25/09: agent.toml=4, plist=2, 4 wa-workers
 # actually active). Checking only the file would pass even if the plist drifted out of sync, or if a fragment raised the pool
@@ -181,6 +189,11 @@ else
     SKIPPED="$SKIPPED city.toml-include-check"
 fi
 frag_level() { local e; for e in $FRAG_ENTRIES; do case "$e" in "$1="*) printf '%s' "${e#*=}"; return 0 ;; esac; done; return 0; }
+# The engine's raise ceiling for wa-worker comes from the lib's own table (_pc_engine_ceil, mirrored from pce_ceil and drift-guarded by
+# pool-ceiling-effective-cap.selftest.sh), so this script holds no second copy of the 3. vazio (lib absent) / falhou (does not load, prints no
+# integer) -> WA_CEIL stays empty and the check below is a SOFT skip named in the verdict, never a pass by default.
+ASSETS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)"
+WA_CEIL=$( . "$ASSETS_DIR/pool-ceiling.sh" >/dev/null 2>&1 && _pc_engine_ceil wa-worker "$WA_BASE" 2>/dev/null ) || WA_CEIL=""
 for e in $FRAG_ENTRIES; do
     pool="${e%%=*}"; lvl="${e#*=}"
     case "$pool" in
@@ -192,6 +205,10 @@ for e in $FRAG_ENTRIES; do
         base=$(agent_cap "$CITY/agents/$pool/agent.toml")
         [[ "$base" =~ $INT_RE ]] || fail "fragment entry $pool=$lvl but $CITY/agents/$pool/agent.toml has no readable max_active_sessions to compare with"
         [[ "$lvl" -le "$base" ]] || fail "fragment entry $pool=$lvl is ABOVE agent.toml's $base — only wa-worker may be raised (the others only go down)"
+    elif [[ "$WA_CEIL" =~ $INT_RE ]]; then
+        [[ "$lvl" -le "$WA_CEIL" ]] || fail "fragment entry wa-worker=$lvl is ABOVE the engine's raise ceiling $WA_CEIL — the dispatchers (pool_ceiling_engine_cap_resolve) stop at $WA_CEIL while the controller would run $lvl"
+    else
+        SKIPPED="$SKIPPED wa-worker-raise-ceiling"
     fi
 done
 WA_EFF=$(frag_level wa-worker); WA_EFF="${WA_EFF:-$WA_BASE}"
@@ -201,7 +218,9 @@ log "wa-worker effective engine ceiling = $WA_EFF (agent.toml $WA_BASE) ✓"
 # PILOT_WA_WORKER_MAX only bounds what the Pilot itself dispatches — it never
 # reaches the controller — so it is allowed to be MORE conservative than the
 # effective engine ceiling, but must never be HIGHER (that would let the Pilot
-# dispatch past the controller's real ceiling under the false belief it is capped).
+# dispatch past the controller's real ceiling under the false belief it is capped). v3: at run time the Pilot also settles this number on the
+# effective ceiling itself every sweep (down always; up to it when the engine raised wa-worker above agent.toml), so the typed number is a
+# static net here, not the way the 3rd slot is opened.
 if [[ -f "$PILOT_PLIST" ]]; then
     PLIST_MAX=$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:PILOT_WA_WORKER_MAX" "$PILOT_PLIST" 2>/dev/null || true)
     if [[ -z "$PLIST_MAX" ]]; then
