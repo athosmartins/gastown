@@ -119,16 +119,19 @@ Hoje o teto do motor (2/1/3) esconde estes dois pontos; viram reais quando ele s
   limita a 1 run na faixa 101–180% de cpu, e o teto lê essa faixa como `ok` (grow). Inofensivo — o freio do gate continua valendo — mas o teto pode
   subir com o Dolt morno.
 - **`.off` e a biblioteca ausente.** Com `.on`, `.off` e a lib ausente, a linha "LIGADO … vale o teto FIXO" ainda aparece; a conclusão (teto fixo) está certa.
-- **O `approved-state-reconciler` não conhece este teto.** `scripts/approved-state-reconciler.py` (`_pool_cap`) lê o cap do Pilot do plist instalado
-  e usa a linha "pool at session cap … max=M" do log só como conferência. **Com o teto APLICADO (fora da sombra)**, `PILOT_*_WORKER_MAX` passa a ter uma segunda
+- **O `approved-state-reconciler` segue o teto efetivo do MOTOR (ga-m9x0lb.6), mas não conhece o teto dinâmico.** `scripts/approved-state-reconciler.py` (`_pool_cap`) lê o cap do Pilot do plist
+  instalado e, como o Pilot (`_pilot_clamp_to_engine_cap`), o SEGUE ao teto efetivo do motor: `_read_engine_cap` chama `pool_ceiling_engine_cap_resolve` (a mesma definição do Pilot e do gate, nada
+  reimplementada) e `_pilot_static_cap` espelha o clamp — desce sempre; sobe só num pool que o motor elevou (`agent.toml` conhecido e plist ≥ `agent.toml`); plist abaixo de `agent.toml` (freio do
+  operador) e `0` (pausa) ficam; fragmento ilegível ou estranho = o piso do motor. Com o motor em `wa-worker=3`, plist em 2 e 2 vivos o reconciler lê "tem folga (2/3)" e o caminho de fome fica aberto
+  (antes lia "saturado 2/2" e podia pular um alarme legítimo: número baixo demais ESCONDE falha, o lado ruim do ga-zowwdz). A origem na nota é `plist+engine`; a lib que não responde (ausente, não
+  carrega, resposta fora do formato) deixa o número do plist e diz "engine cap NOT MEASURED", como o Pilot sem a lib. A linha "pool at session cap … max=M" do log só vale contra o número JÁ seguido, e só
+  se não for mais velha que o plist nem que o fragmento (uma linha de antes da subida do motor descreve o nível anterior). `POOL_CEILING_LIB=` vazio no plist do reconciler desliga o seguimento (volta
+  ao comportamento anterior). O selftest do reconciler roda o `pool-ceiling.sh` e o bloco REAL do clamp do Pilot sobre uma matriz de plist × fragmento × `agent.toml`, então os três não se afastam sem a
+  suíte avisar. **O teto dinâmico ele ainda não conhece** (`.gc/pool-ceiling/<pool>.state`): **com o teto APLICADO (fora da sombra)**, `PILOT_*_WORKER_MAX` passa a ter uma segunda
   fonte que ele ignora: enquanto o teto estiver abaixo do valor do plist ele loga "DIVERGED … plist edited without reloading the Pilot job?" (enganoso) e,
   sem linha de cap fresca, pode ler um pool freado como "tem folga" e levantar alarme falso de fome (classe wa-ho1ol). A direção é conservadora (alarme a mais,
   nada escondido) e só aparece aplicando — **na sombra não há efeito**, que é mais uma razão para a sombra vir primeiro. Ensinar o reconciler a ler o teto
-  efetivo (`.gc/pool-ceiling/<pool>.state`) é trabalho do bead que ligar o teto de verdade.
-  **Direção oposta, e pior, desde o ga-m9x0lb.5:** com o motor em `wa-worker=3` o Pilot admite 3 com o plist em 2 (ele segue o teto efetivo do motor). O reconciler lê o 2 do plist enquanto
-  o pool NÃO está no teto (só a linha "pool at session cap … max=3" do Pilot, que existe com o pool CHEIO, o corrige) e, com 2 vivos, lê "saturado": pode pular um alarme de fome legítimo
-  (um número baixo demais ESCONDE uma falha de despacho: o lado ruim do ga-zowwdz). Aceito, **não corrigido** aqui (é Python, fora do escopo da .5): o conserto é o reconciler ler o teto efetivo
-  (o mesmo `pool_ceiling_engine_cap_resolve`); levar o plist a 3 também o resolveria, mas o prod-test (regra 4) o reprova enquanto o motor estiver em 2.
+  dinâmico (`.gc/pool-ceiling/<pool>.state`) é trabalho do bead que ligar o teto de verdade.
 - **`POOL_CEILING_DYNAMIC` só aceita `0` ou `1`.** Qualquer outro valor (ex.: `true`) é tratado como não definido e cai no teste do arquivo `.on` — sem aviso.
   Use `0`/`1` (ou o arquivo `.on`).
 - **Swap recém-criado.** `vm.swapusage` pode mostrar total 0 logo depois de um reboot (o macOS cria o swapfile sob demanda); "swap livre < 512 MB" lê como baixo mesmo

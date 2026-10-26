@@ -1837,8 +1837,8 @@ def _pilot_static_cap(cur, eng):
 
     A MIRROR of _pilot_clamp_to_engine_cap (pilot-dispatcher.sh, between its SELFTEST-EXTRACT
     pilot-clamp-engine-cap markers), not a call: that block lives in a sweep script. Scenario ga-m9x0lb.6-b runs
-    the Pilot's REAL block against this function over a matrix of plist numbers and fragment/agent.toml shapes,
-    so the two cannot drift apart unnoticed.
+    the Pilot's REAL block against _follow_engine_cap (this function fed by the real lib) over a matrix of plist
+    numbers and fragment/agent.toml shapes, so the two cannot drift apart unnoticed.
       cur above the engine's cap                         -> the engine's cap (it LOWERS any pool under pressure);
       cur below it, agent.toml known, cur >= agent.toml  -> the engine's cap (it RAISES wa-worker over the
                                                             committed 2, Athos rule 03/10; only a fragment entry
@@ -1846,7 +1846,8 @@ def _pilot_static_cap(cur, eng):
       cur below agent.toml                               -> cur: a deliberate operator throttle is never raised;
       the lib could not tell (cap None)                  -> cur, said in the note (the Pilot warns, leaves it);
       fragment in doubt, nothing to change               -> cur, said in the note (the cap is the engine's floor).
-    No note contains the word the caller keys "capacity unknown" off (see _pool_has_capacity).
+    The notes written here never contain the word the caller keys "capacity unknown" off (see
+    _pool_has_capacity); the lib's own `src` text is Portuguese, and scenario ga-m9x0lb.6-f pins the notes.
     """
     cap, base = eng["cap"], eng["base"]
     src = ("fragment in doubt, so the cap is the engine's floor: " if eng["doubt"] else "") + eng["src"]
@@ -1894,18 +1895,22 @@ def _pool_cap(template, cap_env, now):
                                    DIVERGED (why says both numbers).
       (None, "unread",       why)  neither source could say. The caller must not invent a number.
 
-    DIVERGED = the plist says X, yet a fresh Pilot log line written AFTER that file was last
-    written says the Pilot enforced M != X — the plist was edited without reloading the
-    Pilot job. The log line is what the running Pilot actually did, so it wins; and it is the
+    DIVERGED = the plist (followed to the engine's effective cap, ga-m9x0lb.6) says X, yet a
+    fresh Pilot log line written AFTER the plist AND the engine's fragment were last written
+    says the Pilot enforced M != X — the plist was edited without reloading the Pilot job, or
+    the Pilot is not following the engine yet. The log line is what the running Pilot actually
+    did, so it wins; and it is the
     safe side in BOTH directions (M > X: trusting the plist would call a pool with room
     "saturated" and silently skip a real dispatch failure; M < X: trusting it would call a
-    capped pool "has capacity" and raise a false alarm). A log line older than the plist's
-    last write describes the PREVIOUS setting and is not used against it.
+    capped pool "has capacity" and raise a false alarm). A log line older than the last write
+    of the plist or of the engine's fragment describes the PREVIOUS setting and is not used
+    against it.
 
     Two known limits, stated so they are not mistaken for guarantees. (1) With no fresh log
     line (the pool is not at its cap) there is nothing to cross-check the plist against, so an
     edited-but-not-reloaded plist is trusted as written. (2) The reverse window: a line logged
     by a sweep that was already running when the plist was edited (and the job then reloaded)
+    or the engine's fragment rewritten
     still carries the OLD cap but is dated after the edit, so it reads as DIVERGED and wins —
     for at most POOL_CAP_LOG_TTL_SEC, until a newer line or its expiry replaces it. In both
     cases the note at every skip names the cap and where it came from, so the number stays
@@ -1956,7 +1961,8 @@ def _pool_has_capacity(rig_root, now):
 
     Mirrors Pilot's own saturation check (pilot-dispatcher.sh ~4163-4171): count sessions
     whose template matches the rig's builder pool and whose state is active or creating,
-    compare against that pool's max — read live by _pool_cap(), not copied.
+    compare against that pool's max — read live by _pool_cap() (the plist's number followed to the
+    engine's effective cap, as the Pilot follows it), not copied.
 
     Every note that returns a decision names the cap it used AND where it came from
     ("cap 2 from plist"), because _process_store() logs this note at the moment it skips a
@@ -6305,6 +6311,8 @@ def _selftest():
         ("agent.toml unreadable, engine raised", dict(drop=("wa-worker", "ps-worker"),
                                                       frag={"wa-worker": 3, "ps-worker": 1})),
         ("agent.toml unreadable, no fragment", dict(drop=("wa-worker", "ps-worker"))),
+        # a pool committed at 0 with the engine at 3: only the pause guard keeps plist 0 at 0 (0 >= base 0 would read as a RAISE)
+        ("agent.toml 0 (a closed pool), engine at 3", dict(wa=0, ps=0, frag={"wa-worker": 3, "ps-worker": 1})),
     ]
     _EC_CURS = (0, 1, 2, 3, 4)
     _ec_diffs, _ec_cells = [], 0
@@ -6396,6 +6404,11 @@ def _selftest():
             ("lib that does not load (return 1)", _ec_fake_lib(_ec_root, "noload.sh", "return 1\n")),
             ("lib without the resolver", _ec_fake_lib(_ec_root, "nofn.sh", ":\n")),
             ("lib that prints noise while loading", _ec_fake_lib(_ec_root, "noisy.sh", "echo noise\n" + _ec_resolver("3", "2", "", "x"))),
+            # four blank lines shift every field by four: cap/base/doubt all read EMPTY and the sentinel lands in the
+            # fragment slot — without the sentinel check that would pass as "the lib looked and could not tell"
+            ("lib that prints four blank lines while loading", _ec_fake_lib(_ec_root, "blank4.sh", "echo;echo;echo;echo\n" + _ec_resolver("3", "2", "", "x"))),
+            # a COMPLETE answer on stdout from a bash that then failed is the output of a process that failed
+            ("lib that prints a complete answer and then exits 7", _ec_fake_lib(_ec_root, "exit7.sh", "printf 'ec1\\n3\\n2\\n\\n\\nx'\nexit 7\n")),
             ("resolver answering a non-number cap", _ec_fake_lib(_ec_root, "banana.sh", _ec_resolver("banana", "2", "", "x"))),
             ("resolver answering a non-number base", _ec_fake_lib(_ec_root, "banana2.sh", _ec_resolver("3", "two", "", "x"))),
             ("resolver answering a doubt flag that is neither empty nor 1", _ec_fake_lib(_ec_root, "maybe.sh", _ec_resolver("3", "2", "maybe", "x"))),
