@@ -163,7 +163,7 @@ Read the branch under review without touching the clone, and do not `cd` into it
 you leave it between commands): always `git -C <rig-path> ...`.
 - a file at the commit: `git -C <rig-path> show <sha>:<path>`
 - search: `git -C <rig-path> grep -n <pattern> <sha> -- <path>`; diff: `git -C <rig-path> diff <base> <sha> -- <path>`
-- files on disk (to run a test or a script): `git -C <rig-path> worktree add --detach <scratchpad>/review <sha>`,
+- files on disk (to run a test or a script): `git -C <rig-path> worktree add --detach <scratchpad>/rev-tree <sha>`,
   work there, and remove it before your verdict (`git -C <rig-path> worktree remove --force <path>`).
 
 Before reviewing, capture a baseline of every repository you read:
