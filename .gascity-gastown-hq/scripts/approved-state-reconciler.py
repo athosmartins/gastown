@@ -1683,6 +1683,19 @@ POOL_CAP_LOG_TTL_SEC = int(os.environ.get("ARC_POOL_CAP_LOG_TTL_SEC", "1800"))
 # this process reads its own clock). Beyond that it is dropped: a future-dated line cannot
 # be shown to be fresh.
 _POOL_CAP_LOG_FUTURE_SKEW_SEC = 300
+# POOL_CEILING_LIB (ga-m9x0lb.6): since ga-m9x0lb.5 the Pilot does not run the plist's number, it runs that number
+# FOLLOWED to the pool's effective cap — the engine's fragment entry over agents/<pool>/agent.toml, resolved by
+# pool_ceiling_engine_cap_resolve() in pool-ceiling.sh (it LOWERS any pool under pressure and RAISES wa-worker to 3 over
+# its committed 2; in doubt the engine's floor). The plist still says 2, so a reader of the plist alone sees a pool
+# "saturated" at 2 sessions while the Pilot is free to open a third: the number too LOW, the side that hides a failure.
+# That one definition is CALLED here (_read_engine_cap), not re-implemented, so there is no second copy of it to drift
+# from the Pilot's and the gate's — the same reason GATE_FOCUS_LIB is called. Same env name as the Pilot and the gate
+# use, so an override means the same thing in each process (it still has to be set in each). EMPTY = do not follow the
+# engine at all: _pool_cap() then reads the plist number exactly as it did before ga-m9x0lb.6 (the selftest's hermetic
+# default, and an instant rollback for an operator who sets POOL_CEILING_LIB= in this job's plist).
+POOL_CEILING_LIB = os.environ.get(
+    "POOL_CEILING_LIB",
+    os.path.join(CITY, "packs/town-deltas/assets/pool-ceiling.sh"))
 
 
 def _read_pilot_plist_cap(cap_env):
@@ -1765,15 +1778,121 @@ def _logged_pool_cap(template, now):
     return best_cap, best_epoch
 
 
+def _read_engine_cap(pool):
+    """The engine's EFFECTIVE cap for `pool`, as pool-ceiling.sh resolves it, or None when it could not be told.
+
+    A dict {"cap", "base", "doubt", "src", "frag_mtime"}:
+      cap         what the controller applies: the fragment's entry over agent.toml, never above the engine's
+                  ceiling for the pool; with the fragment in doubt, the engine's FLOOR. None = the lib looked
+                  and could not tell (agent.toml unreadable and nothing else to lean on): an ANSWER of the lib.
+      base        agent.toml's value alone (None = unreadable) — what tells a RAISE from an operator's throttle.
+      doubt       True iff the fragment EXISTS but could not be consulted (foreign, unreadable, reader missing).
+      src         the lib's own one-line account of where the number came from, for the audit note.
+      frag_mtime  when the fragment was last written (None = absent or not stat-able): it dates the setting.
+
+    Three answers, never two (root-class:error-vs-empty): a dict with a cap (found); a dict whose cap is None
+    (the lib looked and could not tell); and None = NÃO MEDIDO — lib missing or not loading, no resolver, output
+    that is not the expected shape, bash failing or timing out. None is never "the engine changed nothing": the
+    caller keeps the plist number AND says it did not look (what the Pilot does when its lib is not loaded).
+    """
+    # vazio → n/a (a pool with no fragment entry is an ANSWER of the lib: agent.toml's number, not an empty read);
+    # falhou/ilegível → None (NÃO MEDIDO: the plist number stands, said out loud in the note)
+    script = ('export GC_CITY="$2"; . "$1" || exit 97; '
+              'type pool_ceiling_engine_cap_resolve >/dev/null 2>&1 || exit 96; '
+              'pool_ceiling_engine_cap_resolve "$3" || exit 95; '
+              'printf "ec1\\n%s\\n%s\\n%s\\n%s\\n%s" "$POOL_CEILING_ENGINE_CAP" '
+              '"$POOL_CEILING_ENGINE_CAP_BASE" "$POOL_CEILING_ENGINE_CAP_DOUBT" '
+              '"$(pool_ceiling_engine_fragment)" "$POOL_CEILING_ENGINE_CAP_SRC"')
+    r = _sh(["bash", "-c", script, "engine-cap", POOL_CEILING_LIB, CITY, pool], timeout=10)
+    if r is None or r.returncode != 0:
+        return None
+    parts = (r.stdout or "").split("\n", 5)
+    if len(parts) != 6 or parts[0] != "ec1":
+        return None
+    _sentinel, cap_s, base_s, doubt_s, frag, src = parts
+    nums = []
+    for s in (cap_s, base_s):
+        if s == "":
+            nums.append(None)
+        elif s.isascii() and s.isdigit():
+            nums.append(int(s))
+        else:
+            return None
+    if doubt_s not in ("", "1"):
+        return None
+    # vazio (the lib names no fragment path) → no date; falhou (absent / not stat-able) → no date: the number
+    # stays, only the DATING of the setting is dropped (the plist's date alone, as before ga-m9x0lb.6)
+    frag_mtime = None
+    if frag:
+        try:
+            frag_mtime = os.stat(frag).st_mtime
+        except OSError:
+            frag_mtime = None
+    return {"cap": nums[0], "base": nums[1], "doubt": doubt_s == "1", "src": src, "frag_mtime": frag_mtime}
+
+
+def _pilot_static_cap(cur, eng):
+    """(cap, note): the number the Pilot's static cap ends at once it has followed the engine. `cur` is the plist
+    number (> 0: 0 is the operator's pause and never gets here), `eng` a dict from _read_engine_cap().
+
+    A MIRROR of _pilot_clamp_to_engine_cap (pilot-dispatcher.sh, between its SELFTEST-EXTRACT
+    pilot-clamp-engine-cap markers), not a call: that block lives in a sweep script. Scenario ga-m9x0lb.6-b runs
+    the Pilot's REAL block against this function over a matrix of plist numbers and fragment/agent.toml shapes,
+    so the two cannot drift apart unnoticed.
+      cur above the engine's cap                         -> the engine's cap (it LOWERS any pool under pressure);
+      cur below it, agent.toml known, cur >= agent.toml  -> the engine's cap (it RAISES wa-worker over the
+                                                            committed 2, Athos rule 03/10; only a fragment entry
+                                                            that WAS read puts the cap above agent.toml);
+      cur below agent.toml                               -> cur: a deliberate operator throttle is never raised;
+      the lib could not tell (cap None)                  -> cur, said in the note (the Pilot warns, leaves it);
+      fragment in doubt, nothing to change               -> cur, said in the note (the cap is the engine's floor).
+    No note contains the word the caller keys "capacity unknown" off (see _pool_has_capacity).
+    """
+    cap, base = eng["cap"], eng["base"]
+    src = ("fragment in doubt, so the cap is the engine's floor: " if eng["doubt"] else "") + eng["src"]
+    if cap is None:
+        return cur, "engine cap unreadable (%s) — the Pilot leaves its number alone then, and so does this" % src
+    if cur > cap:
+        return cap, "plist %d limited DOWN to the engine's effective cap %d (%s)" % (cur, cap, src)
+    if base is not None and cur < cap and cur >= base:
+        return cap, "plist %d followed UP to the engine's effective cap %d (%s)" % (cur, cap, src)
+    if eng["doubt"]:
+        return cur, "plist %d stands under the engine's cap %d (%s)" % (cur, cap, src)
+    return cur, ""
+
+
+def _follow_engine_cap(pool, cur):
+    """(cap, note, mtime): the Pilot's static cap for `pool` once it has followed the engine, given the plist
+    number `cur`; `mtime` is when the engine's fragment was last written (None = no date).
+
+    Nothing to follow — `cur` comes back as it is, with no note and no date — when POOL_CEILING_LIB is empty
+    (the switch) or `cur` is 0 (the operator's pause; the Pilot skips it too: `[ cur -gt 0 ] || continue`).
+    When the engine cannot be read at all the number also stands, but the note says it did not look.
+    """
+    if not POOL_CEILING_LIB or cur <= 0:
+        return cur, "", None
+    eng = _read_engine_cap(pool)
+    if eng is None:
+        return cur, ("engine cap NOT MEASURED (pool-ceiling.sh gave no usable answer) — the plist number "
+                     "stands, as it does for the Pilot when its lib is not loaded"), None
+    cap, note = _pilot_static_cap(cur, eng)
+    return cap, note, eng["frag_mtime"]
+
+
 def _pool_cap(template, cap_env, now):
     """Derive a pool's live session cap at runtime. Returns (cap, origin, note).
 
-    Three outcomes, never collapsed into one another:
-      (int,  "plist",     "")   read from the installed Pilot plist, not contradicted.
-      (int,  "pilot-log", why)  the Pilot's OWN log line is what was used — either the plist
-                                could not give a value (why says which failure), or the two
-                                DIVERGED (why says both numbers).
-      (None, "unread",    why)  neither source could say. The caller must not invent a number.
+    Four outcomes, never collapsed into one another:
+      (int,  "plist",        why)  read from the installed Pilot plist, not contradicted, and the engine's
+                                   effective cap leaves it as it is. `why` is "" unless the engine could not be
+                                   read or was in doubt (ga-m9x0lb.6): then it says so, and the number stands.
+      (int,  "plist+engine", why)  the plist's number FOLLOWED to the engine's effective cap, as the Pilot's own
+                                   clamp does since ga-m9x0lb.4/.5 (down always, up for a pool the engine
+                                   raised); `why` says from what to what, and where the engine's number came from.
+      (int,  "pilot-log",    why)  the Pilot's OWN log line is what was used — either the plist
+                                   could not give a value (why says which failure), or the two
+                                   DIVERGED (why says both numbers).
+      (None, "unread",       why)  neither source could say. The caller must not invent a number.
 
     DIVERGED = the plist says X, yet a fresh Pilot log line written AFTER that file was last
     written says the Pilot enforced M != X — the plist was edited without reloading the
@@ -1799,13 +1918,23 @@ def _pool_cap(template, cap_env, now):
         return time.strftime("%H:%M:%S", time.localtime(epoch))
 
     if plist_cap is not None:
-        if log_cap is not None and log_cap != plist_cap and log_epoch >= plist_mtime:
+        # What the Pilot enforces is the plist's number FOLLOWED to the engine's effective cap (ga-m9x0lb.6), so
+        # that — not the raw plist number — is what its log line is compared with. The setting this cap rests on
+        # is as new as the LATER of the plist and the engine's fragment: a line logged before the engine moved the
+        # pool describes the previous level (the usual case right after a RAISE — the pool filled at 2, which is
+        # why the engine raised it) and must not hold the cap at the old number.
+        cap, eng_note, eng_mtime = _follow_engine_cap(template, plist_cap)
+        set_mtime = plist_mtime
+        if eng_mtime is not None and eng_mtime > plist_mtime:
+            set_mtime = eng_mtime
+        if log_cap is not None and log_cap != cap and log_epoch >= set_mtime:
+            followed = "" if cap == plist_cap else " (%d once followed to the engine's effective cap)" % cap
             return log_cap, "pilot-log", (
-                "DIVERGED: %s=%d in the Pilot plist, but the Pilot itself logged max=%d at %s "
-                "— after that file was last written; plist edited without reloading the "
-                "Pilot job? using what the Pilot enforced" % (
-                    cap_env, plist_cap, log_cap, _hms(log_epoch)))
-        return plist_cap, "plist", ""
+                "DIVERGED: %s=%d in the Pilot plist%s, but the Pilot itself logged max=%d at %s "
+                "— after the plist and the engine's fragment were last written; plist edited without "
+                "reloading the Pilot job? using what the Pilot enforced" % (
+                    cap_env, plist_cap, followed, log_cap, _hms(log_epoch)))
+        return cap, ("plist" if cap == plist_cap else "plist+engine"), eng_note
     if log_cap is not None:
         return log_cap, "pilot-log", "%s; using the max the Pilot itself logged at %s" % (
             plist_why, _hms(log_epoch))
@@ -5363,6 +5492,13 @@ def _selftest():
     # cap point PILOT_PLIST at a throwaway plist and restore this afterwards.
     _NO_PILOT_PLIST = "/nonexistent/approved-state-reconciler-selftest/com.gascity.pilot.plist"
     globals()["PILOT_PLIST"] = _NO_PILOT_PLIST
+    # Hermetic default for the engine's effective cap (ga-m9x0lb.6): _pool_cap() asks pool-ceiling.sh for
+    # it — a bash call against the agents/ and the fragment of whichever city is under test, and the blanket
+    # _sh stub below would answer that call "[]". An EMPTY lib path is how the reader is told not to follow
+    # the engine at all (the plist number stands, nothing is said), which is what every scenario written
+    # before the engine mattered expects. The scenarios that DO test the follow switch it on with _ec_on()
+    # and restore this afterwards.
+    globals()["POOL_CEILING_LIB"] = ""
     # Hermetic default for the pool probes' veto list (ga-d3b5yr): _pool_probe_vetoes() reads
     # pool-probe-vetoes.sh from the LIVE city tree (the sibling of the pilot-dispatcher.sh launchd runs), not from the
     # branch under test — and it answers for exec:manual and ctx:thin BEFORE their dedicated handlers in
@@ -5797,19 +5933,23 @@ def _selftest():
         pool mapping in play is unambiguous."""
         return lambda root: [bead] if os.path.basename(root.rstrip("/")) == "whatsapp_automation" else []
 
-    def _fake_session_list(template, n):
+    def _fake_session_list(template, n, real_bash=False):
         """A `gc session list --json` reporting `n` active `template` sessions; every other
-        _sh call falls through to the suite's blanket stub."""
+        _sh call falls through to the suite's blanket stub. real_bash=True lets ONE more call
+        through to a real bash — the engine-cap read of ga-m9x0lb.6 (its $0 is "engine-cap") —
+        so a whole run_cycle can be driven against the real pool-ceiling.sh."""
         payload = json.dumps({"sessions": [{"template": template, "state": "active"}] * n})
 
         def _fake(args, timeout=20):
             if list(args[:3]) == [GC_BIN, "session", "list"]:
                 return subprocess.CompletedProcess(args=args, returncode=0, stdout=payload,
                                                    stderr="")
+            if real_bash and list(args[:2]) == ["bash", "-c"] and list(args[3:4]) == ["engine-cap"]:
+                return _ec_true_sh(args, timeout)
             return _stub_sh_fast(args, timeout)
         return _fake
 
-    def _run_wa_cap_cycle(bead_id, live_cap, active):
+    def _run_wa_cap_cycle(bead_id, live_cap, active, real_bash=False):
         """One run_cycle over a starving WA bead with a throwaway Pilot plist setting
         PILOT_WA_WORKER_MAX=live_cap and `active` wa-worker sessions running. Returns
         (alarmed, captured_stdout); the suite's globals are restored afterwards."""
@@ -5818,7 +5958,7 @@ def _selftest():
         with os.fdopen(fd, "wb") as f:
             plistlib.dump({"EnvironmentVariables": {"PILOT_WA_WORKER_MAX": str(live_cap)}}, f)
         globals()["PILOT_PLIST"] = plist_path
-        _sh = _fake_session_list("wa-worker", active)
+        _sh = _fake_session_list("wa-worker", active, real_bash)
         try:
             globals()["_bd_approved"] = _wa_store_only(
                 _make_bead(bead_id, age_min=_STARVE + 5.0))
@@ -5996,6 +6136,418 @@ def _selftest():
     _read_pilot_log_lines = lambda: _pilot_recent()
     for _p in _tmp_plists:
         os.unlink(_p)
+
+    # ── (ga-m9x0lb.6) the pool cap FOLLOWS the engine's effective cap, as the Pilot does ──
+    # Since ga-m9x0lb.5 the Pilot admits wa-worker up to the engine's EFFECTIVE cap (the fragment's entry
+    # over agents/wa-worker/agent.toml, resolved by pool-ceiling.sh) while the plist keeps saying 2.
+    # _pool_cap() went on reading the plist: with the engine at 3 and 2 sessions up the pool read as
+    # saturated and a starvation alarm the Pilot would answer by opening a third session was skipped —
+    # the number too LOW, the side that hides a failure. These scenarios run the REAL pool-ceiling.sh
+    # against a throwaway city (agent.toml + fragment) and the Pilot's REAL clamp block, so the Python
+    # side cannot drift from either of them without this suite saying so.
+    print("\nScenario (ga-m9x0lb.6): the pool cap follows the engine's effective cap")
+    _EC_ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "packs",
+                              "town-deltas", "assets")
+    _EC_LIB = os.path.join(_EC_ASSETS, "pool-ceiling.sh")
+    _EC_PILOT = os.path.join(_EC_ASSETS, "pilot-dispatcher.sh")
+    _EC_SEAMS = ("POOL_CEILING_AGENTS_DIR", "POOL_CEILING_ENGINE_FRAGMENT", "POOL_CEILING_ENGINE_SH")
+    _EC_FRAG_HEAD = "# GENERATED by pool-ceiling-engine.sh\n# Empty or comment-only = no override.\n"
+
+    def _ec_true_sh(args, timeout=20):
+        try:
+            return subprocess.run(args, capture_output=True, text=True, timeout=timeout)   # third-state-waiver: test-only copy of _sh; the reader's handling of its None answer is injected in scenario (c) (_sh -> None)
+        except Exception:
+            return None
+
+    def _ec_city(root, wa=2, ps=1, frag=None, frag_text=None, frag_age=3600, drop=()):
+        """(Re)build the throwaway city under `root`: agents/<pool>/agent.toml (max_active_sessions =
+        wa / ps; a pool in `drop` gets none, i.e. an agent.toml the lib cannot read) and the engine's
+        fragment — `frag` {pool: level} in the shape the engine writes, or `frag_text` verbatim, or none
+        at all — last written `frag_age` seconds before NOW (its real mtime is wall-clock, this suite's
+        NOW is fixed in the past). Returns the fragment's path."""
+        frag_path = os.path.join(root, ".gc", "pool-ceiling-engine.toml")
+        os.makedirs(os.path.dirname(frag_path), exist_ok=True)
+        for pool, level in (("wa-worker", wa), ("ps-worker", ps)):
+            adir = os.path.join(root, "agents", pool)
+            os.makedirs(adir, exist_ok=True)
+            toml = os.path.join(adir, "agent.toml")
+            if pool in drop:
+                if os.path.exists(toml):
+                    os.unlink(toml)
+            else:
+                with open(toml, "w") as f:
+                    f.write("min_active_sessions = 0\nmax_active_sessions = %d\n" % level)
+        if os.path.exists(frag_path):
+            os.unlink(frag_path)
+        text = frag_text
+        if text is None and frag is not None:
+            text = _EC_FRAG_HEAD + "".join(
+                '\n[[patches.agent]]\ndir = ""\nname = "%s"\nmax_active_sessions = %d\n' % (p, n)
+                for p, n in frag.items())
+        if text is not None:
+            with open(frag_path, "w") as f:
+                f.write(text)
+            os.utime(frag_path, (NOW - frag_age, NOW - frag_age))
+        return frag_path
+
+    @contextlib.contextmanager
+    def _ec_on(root, lib=None, via_city=False):
+        """Point the engine reader at the REAL pool-ceiling.sh (or `lib`) and at the throwaway city
+        `root`, with the real _sh. Default: through the lib's own hermetic seam (POOL_CEILING_AGENTS_DIR;
+        the fragment is the `.gc` next to it). via_city=True: through CITY alone, i.e. the production
+        wiring (the reader exports GC_CITY and the lib derives agents/ and .gc/ from it). Every seam of
+        the lib is cleared first, so nothing of the machine running the suite leaks in."""
+        global _sh
+        saved = {k: os.environ.get(k) for k in _EC_SEAMS}
+        saved_lib, saved_city, saved_sh = globals()["POOL_CEILING_LIB"], globals()["CITY"], _sh
+        for k in _EC_SEAMS:
+            os.environ.pop(k, None)
+        if via_city:
+            globals()["CITY"] = root
+        else:
+            os.environ["POOL_CEILING_AGENTS_DIR"] = os.path.join(root, "agents")
+        globals()["POOL_CEILING_LIB"] = _EC_LIB if lib is None else lib
+        _sh = _ec_true_sh
+        try:
+            yield
+        finally:
+            _sh = saved_sh
+            globals()["POOL_CEILING_LIB"], globals()["CITY"] = saved_lib, saved_city
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def _ec_try(fn, *a):
+        """fn(*a), or the exception it raised. `fn` may be the NAME of a module-level function, looked
+        up inside the try: on the pre-fix code the new functions do not exist, and a NameError raised
+        while the call is being written must come out as a FAIL line of its own scenario, not abort
+        the whole suite."""
+        try:
+            if isinstance(fn, str):
+                fn = globals()[fn]
+            return fn(*a)
+        except Exception as e:   # noqa: BLE001
+            return e
+
+    # (a) the bead's own acceptance, through the real run_cycle → _process_store → _pool_has_capacity
+    print("\nScenario (ga-m9x0lb.6-a): plist 2, agent.toml 2, fragment wa-worker=3, 2 sessions up, an "
+          "approved bead without an owner → the starvation path OPENS; fragment at 2 → saturated, as today")
+    _ec_acc = {}
+    with tempfile.TemporaryDirectory(prefix="arc-selftest-engine-") as _ec_root:
+        for _lvl in (3, 2):
+            _ec_city(_ec_root, wa=2, frag={"wa-worker": _lvl})
+            with _ec_on(_ec_root):
+                _ec_acc[_lvl] = _ec_try(_run_wa_cap_cycle, "wa-ec%d" % _lvl, 2, 2, True)
+    _reset()
+    _a3, _a2 = _ec_acc.get(3), _ec_acc.get(2)
+    if isinstance(_a3, tuple) and _a3[0] and "SATURATED" not in _a3[1]:
+        _ok("(ga-m9x0lb.6-a) engine at 3 over plist 2 / agent.toml 2, 2 sessions up → the pool has room "
+            "and the starving bead ALARMS (the plist-only cap skipped it as 'saturated 2/2')")
+    else:
+        _bad("(ga-m9x0lb.6-a) engine at 3", "got %r" % (
+             ((_a3[0], "SATURATED" in _a3[1]) if isinstance(_a3, tuple) else _a3),))
+    if isinstance(_a2, tuple) and not _a2[0] and "SATURATED" in _a2[1] and "cap 2 from plist" in _a2[1]:
+        _ok("(ga-m9x0lb.6-a) engine at 2 (= plist = agent.toml), 2 sessions up → saturated and no alarm, "
+            "'cap 2 from plist' in the skip line, exactly as before the change")
+    else:
+        _bad("(ga-m9x0lb.6-a) engine at 2", "got %r" % (
+             ((_a2[0], "SATURATED" in _a2[1], "cap 2 from plist" in _a2[1]) if isinstance(_a2, tuple) else _a2),))
+
+    # (b) the Python mirror of the Pilot's clamp against the Pilot's REAL block, over a matrix
+    print("\nScenario (ga-m9x0lb.6-b): the cap the reconciler derives == the number the Pilot's REAL "
+          "_pilot_clamp_to_engine_cap leaves in PILOT_WA/PS_WORKER_MAX, for every plist number and "
+          "every fragment/agent.toml shape (raise, squeeze, none, empty, foreign, unreadable)")
+    _ec_block = None
+    try:
+        with open(_EC_PILOT, encoding="utf-8") as _f:   # third-state-waiver: test-only read; an unreadable or marker-less Pilot source leaves _ec_block None and scenario (b) FAILS via _bad
+            _ec_src = _f.read().splitlines()
+        _ec_bi = [i for i, l in enumerate(_ec_src) if "SELFTEST-EXTRACT pilot-clamp-engine-cap: BEGIN" in l]
+        _ec_ei = [i for i, l in enumerate(_ec_src) if "SELFTEST-EXTRACT pilot-clamp-engine-cap: END" in l]
+        if len(_ec_bi) == 1 and len(_ec_ei) == 1 and _ec_bi[0] < _ec_ei[0]:
+            _ec_block = "\n".join(_ec_src[_ec_bi[0]:_ec_ei[0] + 1])
+    except OSError:
+        _ec_block = None
+
+    def _ec_pilot_clamp(root, curs):
+        """{cur: (wa, ps)} as the Pilot's real block leaves PILOT_WA_WORKER_MAX / PILOT_PS_WORKER_MAX
+        when both start at `cur`, run in bash against the city `root`; None if it could not run."""
+        env = {k: v for k, v in os.environ.items() if k not in _EC_SEAMS}
+        env["POOL_CEILING_AGENTS_DIR"] = os.path.join(root, "agents")
+        script = ('. "$1" || exit 97; _POOL_CEILING_OK=1; log() { :; }; warn() { :; }; eval "$2"; '
+                  'for c in $3; do PILOT_WA_WORKER_MAX=$c; PILOT_PS_WORKER_MAX=$c; '
+                  '_pilot_clamp_to_engine_cap; echo "$c $PILOT_WA_WORKER_MAX $PILOT_PS_WORKER_MAX"; done')
+        try:
+            r = subprocess.run(["bash", "-c", script, "pilot-clamp", _EC_LIB, _ec_block,
+                                " ".join(str(c) for c in curs)],
+                               capture_output=True, text=True, timeout=30, env=env)   # third-state-waiver: test-only; a bash that cannot run returns None and scenario (b) FAILS via _bad
+        except Exception:
+            return None
+        if r.returncode != 0:
+            return None
+        out = {}
+        for line in r.stdout.splitlines():
+            p = line.split()
+            if len(p) == 3:
+                out[p[0]] = (p[1], p[2])
+        return out
+
+    _EC_MATRIX = [
+        ("no fragment", {}),
+        ("engine raised wa-worker to 3", dict(frag={"wa-worker": 3, "ps-worker": 1})),
+        ("engine at the committed levels", dict(frag={"wa-worker": 2, "ps-worker": 1})),
+        ("engine squeezed wa-worker to 1", dict(frag={"wa-worker": 1, "ps-worker": 1})),
+        ("fragment for another pool only", dict(frag={"gate-reviewer": 2})),
+        ("fragment empty", dict(frag_text="")),
+        ("fragment foreign", dict(frag_text="garbage\n")),
+        ("agent.toml 4/2, engine 2/1", dict(wa=4, ps=2, frag={"wa-worker": 2, "ps-worker": 1})),
+        ("agent.toml unreadable, engine raised", dict(drop=("wa-worker", "ps-worker"),
+                                                      frag={"wa-worker": 3, "ps-worker": 1})),
+        ("agent.toml unreadable, no fragment", dict(drop=("wa-worker", "ps-worker"))),
+    ]
+    _EC_CURS = (0, 1, 2, 3, 4)
+    _ec_diffs, _ec_cells = [], 0
+    if _ec_block is None:
+        _ec_diffs.append("the Pilot's clamp block (SELFTEST-EXTRACT pilot-clamp-engine-cap) was not found")
+    else:
+        with tempfile.TemporaryDirectory(prefix="arc-selftest-engine-") as _ec_root:
+            for _lab, _kw in _EC_MATRIX:
+                _ec_city(_ec_root, **_kw)
+                _pil = _ec_pilot_clamp(_ec_root, _EC_CURS)
+                if _pil is None:
+                    _ec_diffs.append("%s: the Pilot's real block did not run" % _lab)
+                    continue
+                with _ec_on(_ec_root):
+                    for _cur in _EC_CURS:
+                        for _ix, _pool in enumerate(("wa-worker", "ps-worker")):
+                            _got = _ec_try("_follow_engine_cap", _pool, _cur)
+                            _got = _got[0] if isinstance(_got, tuple) else "raised %s" % type(_got).__name__
+                            _want = _pil.get(str(_cur), ("?", "?"))[_ix]
+                            _ec_cells += 1
+                            if str(_got) != _want:
+                                _ec_diffs.append("%s / %s / plist %d: reconciler %s, Pilot %s" % (
+                                    _lab, _pool, _cur, _got, _want))
+    if not _ec_diffs and _ec_cells == len(_EC_MATRIX) * len(_EC_CURS) * 2:
+        _ok("(ga-m9x0lb.6-b) %d cells (%d fixtures x %d plist numbers x 2 pools): the reconciler's cap "
+            "equals what the Pilot's real clamp leaves" % (_ec_cells, len(_EC_MATRIX), len(_EC_CURS)))
+    else:
+        _bad("(ga-m9x0lb.6-b)", "%d cell(s) differ or did not run (%d compared): %s" % (
+             len(_ec_diffs), _ec_cells, "; ".join(_ec_diffs[:6])))
+
+    # (c) the read itself: found / not-found / could-not-find-out stay three different answers
+    print("\nScenario (ga-m9x0lb.6-c): _read_engine_cap() — found, found-nothing, and could-not-find-out "
+          "(lib missing, not loading, answering garbage, bash that cannot run) never read as each other")
+
+    def _ec_fake_lib(root, name, body):
+        path = os.path.join(root, name)
+        with open(path, "w") as f:
+            f.write(body)
+        return path
+
+    def _ec_resolver(cap, base, doubt, src, frag=""):
+        return ('pool_ceiling_engine_cap_resolve() { POOL_CEILING_ENGINE_CAP="%s"; '
+                'POOL_CEILING_ENGINE_CAP_BASE="%s"; POOL_CEILING_ENGINE_CAP_DOUBT="%s"; '
+                'POOL_CEILING_ENGINE_CAP_SRC="%s"; }\n'
+                'pool_ceiling_engine_fragment() { printf "%%s" "%s"; }\n' % (cap, base, doubt, src, frag))
+
+    _ec_c = []   # (label, ok, detail)
+    with tempfile.TemporaryDirectory(prefix="arc-selftest-engine-") as _ec_root:
+        _ec_city(_ec_root, wa=2, frag={"wa-worker": 3})
+        with _ec_on(_ec_root):
+            _r = _ec_try("_read_engine_cap", "wa-worker")
+        _ec_c.append(("real lib, fragment 3 over agent.toml 2 → cap 3, base 2, no doubt, the fragment's mtime",
+                      isinstance(_r, dict) and _r.get("cap") == 3 and _r.get("base") == 2
+                      and _r.get("doubt") is False and _r.get("frag_mtime") == NOW - 3600
+                      and "fragmento" in _r.get("src", ""), _r))
+        _ec_city(_ec_root, wa=2)
+        with _ec_on(_ec_root):
+            _r = _ec_try("_read_engine_cap", "wa-worker")
+        _ec_c.append(("real lib, no fragment → cap 2 = agent.toml, no doubt, no mtime (found nothing, not 'unreadable')",
+                      isinstance(_r, dict) and _r.get("cap") == 2 and _r.get("base") == 2
+                      and _r.get("doubt") is False and _r.get("frag_mtime") is None, _r))
+        _ec_city(_ec_root, wa=2, frag_text="garbage\n")
+        with _ec_on(_ec_root):
+            _r = _ec_try("_read_engine_cap", "wa-worker")
+        _ec_c.append(("real lib, foreign fragment → the engine floor 2 AND doubt=True (not agent.toml's number, not 'no override')",
+                      isinstance(_r, dict) and _r.get("cap") == 2 and _r.get("doubt") is True, _r))
+        _ec_city(_ec_root, wa=2, drop=("wa-worker",))
+        with _ec_on(_ec_root):
+            _r = _ec_try("_read_engine_cap", "wa-worker")
+        _ec_c.append(("real lib, agent.toml unreadable and no fragment → cap None (the lib says it cannot tell), never a number",
+                      isinstance(_r, dict) and _r.get("cap") is None and _r.get("base") is None
+                      and "ILEGIVEL" in _r.get("src", ""), _r))
+        _fz = os.path.join(_ec_root, "frag.toml")
+        with open(_fz, "w") as f:
+            f.write("x\n")
+        os.utime(_fz, (NOW - 100, NOW - 100))
+        _ok_lib = _ec_fake_lib(_ec_root, "ok-lib.sh", _ec_resolver("3", "2", "", "fake src", _fz))
+        _gone_lib = _ec_fake_lib(_ec_root, "gone-frag-lib.sh", _ec_resolver("3", "2", "", "fake", "/nonexistent/f.toml"))
+        with _ec_on(_ec_root, lib=_ok_lib):
+            _r = _ec_try("_read_engine_cap", "wa-worker")
+        _ec_c.append(("a lib that answers with a fragment path → its mtime is read from that path",
+                      isinstance(_r, dict) and _r.get("frag_mtime") == NOW - 100 and _r.get("cap") == 3, _r))
+        with _ec_on(_ec_root, lib=_gone_lib):
+            _r = _ec_try("_read_engine_cap", "wa-worker")
+        _ec_c.append(("a fragment path that cannot be stat'ed → the number stays, only the DATE is dropped (None)",
+                      isinstance(_r, dict) and _r.get("cap") == 3 and _r.get("frag_mtime") is None, _r))
+        _bad_libs = [
+            ("lib file missing", os.path.join(_ec_root, "no-such-lib.sh")),
+            ("lib that does not load (return 1)", _ec_fake_lib(_ec_root, "noload.sh", "return 1\n")),
+            ("lib without the resolver", _ec_fake_lib(_ec_root, "nofn.sh", ":\n")),
+            ("lib that prints noise while loading", _ec_fake_lib(_ec_root, "noisy.sh", "echo noise\n" + _ec_resolver("3", "2", "", "x"))),
+            ("resolver answering a non-number cap", _ec_fake_lib(_ec_root, "banana.sh", _ec_resolver("banana", "2", "", "x"))),
+            ("resolver answering a non-number base", _ec_fake_lib(_ec_root, "banana2.sh", _ec_resolver("3", "two", "", "x"))),
+            ("resolver answering a doubt flag that is neither empty nor 1", _ec_fake_lib(_ec_root, "maybe.sh", _ec_resolver("3", "2", "maybe", "x"))),
+            ("resolver that itself fails", _ec_fake_lib(_ec_root, "rc3.sh", "pool_ceiling_engine_cap_resolve() { return 3; }\n")),
+        ]
+        for _lab, _lib in _bad_libs:
+            with _ec_on(_ec_root, lib=_lib):
+                _r = _ec_try("_read_engine_cap", "wa-worker")
+            _ec_c.append(("%s → None (NOT MEASURED), neither a number nor 'no override'" % _lab, _r is None, _r))
+        with _ec_on(_ec_root):
+            _sh = lambda *a, **kw: None     # what _sh answers when bash cannot run or times out
+            _r = _ec_try("_read_engine_cap", "wa-worker")
+        _ec_c.append(("bash that cannot run (_sh → None) → None", _r is None, _r))
+        with _ec_on(_ec_root, lib=""):
+            _r = _ec_try("_follow_engine_cap", "wa-worker", 2)
+        _ec_c.append(("empty lib path (the switch) → the plist number, no note, no date",
+                      _r == (2, "", None), _r))
+    for _lab, _good, _det in _ec_c:
+        if _good:
+            _ok("(ga-m9x0lb.6-c) %s" % _lab)
+        else:
+            _bad("(ga-m9x0lb.6-c) %s" % _lab, "got %r" % (_det,))
+
+    # (d)+(e) _pool_cap() with the engine on: the rows of the decision, then the dating against the Pilot's log
+    print("\nScenario (ga-m9x0lb.6-d): _pool_cap() with the engine on — followed UP, limited DOWN, an operator "
+          "throttle and a pause left alone, doubt = the floor, unmeasured = the plist number said out loud")
+    _ec_notes = []
+
+    def _ec_row(label, city, want_cap, want_origin, note_has=(), note_empty=False, plist=2,
+                edited_ago=3600, log=(), tpl="wa-worker", cap_env="PILOT_WA_WORKER_MAX", lib=None,
+                via_city=False, path=None):
+        global _read_pilot_log_lines
+        with tempfile.TemporaryDirectory(prefix="arc-selftest-engine-") as root:
+            _ec_city(root, **city)
+            globals()["PILOT_PLIST"] = _pilot_plist({cap_env: str(plist)}, edited_ago)
+            _read_pilot_log_lines = lambda: list(log)
+            old_path = os.environ.get("PATH")
+            if path is not None:
+                os.environ["PATH"] = path
+            try:
+                with _ec_on(root, lib=lib, via_city=via_city):
+                    got = _ec_try(_pool_cap, tpl, cap_env, NOW)
+            finally:
+                if path is not None:
+                    os.environ["PATH"] = old_path
+                globals()["PILOT_PLIST"] = _NO_PILOT_PLIST
+                _read_pilot_log_lines = lambda: _pilot_recent()
+        if not isinstance(got, tuple):
+            _bad("(ga-m9x0lb.6-d) %s" % label, "raised %s: %s" % (type(got).__name__, got))
+            return
+        cap, origin, note = got
+        _ec_notes.append(note)
+        missing = [w for w in note_has if w not in note]
+        if cap == want_cap and origin == want_origin and not missing and (note == "" or not note_empty):
+            _ok("(ga-m9x0lb.6-d) %s → cap=%r origin=%s" % (label, cap, origin))
+        else:
+            _bad("(ga-m9x0lb.6-d) %s" % label, "got (%r, %r, %r); want cap=%r origin=%s note containing %r%s" % (
+                 cap, origin, note, want_cap, want_origin, list(note_has), " and EMPTY" if note_empty else ""))
+
+    _ec_row("engine raised wa-worker to 3, plist 2 (agent.toml 2): followed UP",
+            dict(wa=2, frag={"wa-worker": 3}), 3, "plist+engine", ("followed UP",))
+    _ec_row("engine squeezed wa-worker to 2, plist 3 (agent.toml 3): limited DOWN",
+            dict(wa=3, frag={"wa-worker": 2}), 2, "plist+engine", ("limited DOWN",), plist=3)
+    _ec_row("operator throttle: plist 1 under agent.toml 2 stays 1 even with the engine at 3",
+            dict(wa=2, frag={"wa-worker": 3}), 1, "plist", note_empty=True, plist=1)
+    _ec_row("the operator's pause (plist 0) is left alone, engine at 3 or not",
+            dict(wa=2, frag={"wa-worker": 3}), 0, "plist", note_empty=True, plist=0)
+    _ec_row("no fragment: agent.toml 2 = plist 2, nothing to follow",
+            dict(wa=2), 2, "plist", note_empty=True)
+    _ec_row("fragment FOREIGN, plist 2 = the floor: unchanged, but the doubt is said",
+            dict(wa=2, frag_text="garbage\n"), 2, "plist", ("in doubt",))
+    _ec_row("fragment FOREIGN, plist 3: comes down to the engine floor 2, not to agent.toml's 3",
+            dict(wa=3, frag_text="garbage\n"), 2, "plist+engine", ("limited DOWN", "in doubt"), plist=3)
+    _ec_row("ps-worker: plist 1, agent.toml 1, engine at 1 — untouched",
+            dict(ps=1, frag={"ps-worker": 1}), 1, "plist", note_empty=True, plist=1, tpl="ps-worker",
+            cap_env="PILOT_PS_WORKER_MAX")
+    _ec_row("production wiring (CITY alone, no seam): engine raised → followed UP",
+            dict(wa=2, frag={"wa-worker": 3}), 3, "plist+engine", ("followed UP",), via_city=True)
+    _ec_row("production wiring (CITY alone), no fragment → plist stands",
+            dict(wa=2), 2, "plist", note_empty=True, via_city=True)
+    _ec_row("the launchd PATH of the reconciler's plist minus Homebrew (/usr/bin:/bin): the lib still answers",
+            dict(wa=2, frag={"wa-worker": 3}), 3, "plist+engine", ("followed UP",), path="/usr/bin:/bin")
+    with tempfile.TemporaryDirectory(prefix="arc-selftest-engine-") as _ec_root:
+        _ec_gone = os.path.join(_ec_root, "no-such-lib.sh")
+        _ec_nofn = _ec_fake_lib(_ec_root, "cannot-tell.sh", _ec_resolver("", "", "", "teto do motor ILEGIVEL (fake)"))
+        _ec_row("lib missing: NOT MEASURED — the plist number stands and the note says so",
+                dict(wa=2, frag={"wa-worker": 3}), 2, "plist", ("NOT MEASURED",), lib=_ec_gone)
+        _ec_row("the lib itself cannot tell (agent.toml and fragment unreadable): the plist number stands, the note says so",
+                dict(wa=2, frag={"wa-worker": 3}), 2, "plist", ("unreadable",), lib=_ec_nofn)
+
+    print("\nScenario (ga-m9x0lb.6-e): a Pilot log line older than the last write of the plist OR of the "
+          "fragment describes the previous setting; a newer one is what the Pilot enforced")
+    _ec_row("log 'max=2' from BEFORE the engine raised wa-worker (fragment written 60 s ago): not evidence against it",
+            dict(wa=2, frag={"wa-worker": 3}, frag_age=60), 3, "plist+engine", ("followed UP",),
+            log=[_cap_line("wa-worker", 2, 600, "pick")])
+    _ec_row("log 'max=2' from AFTER the raise (the Pilot did not follow, e.g. an older Pilot build): DIVERGED, what the Pilot enforced wins",
+            dict(wa=2, frag={"wa-worker": 3}, frag_age=60), 2, "pilot-log", ("DIVERGED", "max=2"),
+            log=[_cap_line("wa-worker", 2, 30, "pick")])
+    _ec_row("log 'max=3' after the raise: the Pilot followed it, no divergence",
+            dict(wa=2, frag={"wa-worker": 3}, frag_age=60), 3, "plist+engine", ("followed UP",),
+            log=[_cap_line("wa-worker", 3, 30, "dispatch")])
+    _ec_row("the plist edited AFTER the fragment: the LATER of the two dates counts (log from between them is old)",
+            dict(wa=2, frag={"wa-worker": 3}, frag_age=3600), 3, "plist+engine", ("followed UP",),
+            edited_ago=60, log=[_cap_line("wa-worker", 2, 600, "pick")])
+    _ec_row("a log line newer than both and ABOVE the computed cap: what the Pilot enforced wins (the hiding side stays closed)",
+            dict(wa=2, frag={"wa-worker": 3}, frag_age=3600), 4, "pilot-log", ("DIVERGED", "max=4"),
+            log=[_cap_line("wa-worker", 4, 30, "pick")])
+
+    # (f) the end of the chain, and the guards against drift
+    print("\nScenario (ga-m9x0lb.6-f): _pool_has_capacity() names cap + origin; no note of the engine path "
+          "contains the word the caller keys 'capacity unknown' off; the Pilot's pools/variables are the reconciler's")
+    _ec_f = {}
+    with tempfile.TemporaryDirectory(prefix="arc-selftest-engine-") as _ec_root:
+        for _lvl in (3, 2):
+            _ec_city(_ec_root, wa=2, frag={"wa-worker": _lvl})
+            globals()["PILOT_PLIST"] = _pilot_plist({"PILOT_WA_WORKER_MAX": "2"})
+            with _ec_on(_ec_root):
+                _sh = _fake_session_list("wa-worker", 2, True)
+                try:
+                    _ec_f[_lvl] = _ec_try(_pool_has_capacity, "/x/whatsapp_automation", NOW)
+                finally:
+                    _sh = _stub_sh_fast
+            globals()["PILOT_PLIST"] = _NO_PILOT_PLIST
+    _f3, _f2 = _ec_f.get(3), _ec_f.get(2)
+    if (isinstance(_f3, tuple) and _f3[0] is True and "2/3" in _f3[1] and "cap 3 from plist+engine" in _f3[1]
+            and "followed UP" in _f3[1]):
+        _ok("(ga-m9x0lb.6-f) engine at 3, 2 up → has capacity (2/3), the note names 'cap 3 from plist+engine' and why")
+    else:
+        _bad("(ga-m9x0lb.6-f) engine at 3", "got %r" % (_f3,))
+    if isinstance(_f2, tuple) and _f2[0] is False and "2/2" in _f2[1] and "cap 2 from plist" in _f2[1]:
+        _ok("(ga-m9x0lb.6-f) engine at 2, 2 up → saturated (2/2), 'cap 2 from plist', as before")
+    else:
+        _bad("(ga-m9x0lb.6-f) engine at 2", "got %r" % (_f2,))
+    _ec_unk = [n for n in _ec_notes + [_f3[1] if isinstance(_f3, tuple) else ""] if "unknown" in n]
+    if _ec_notes and not _ec_unk:
+        _ok("(ga-m9x0lb.6-f) none of the %d engine-path notes contains 'unknown' (the word _process_store keys "
+            "'capacity unknown — alarming conservatively' off)" % len(_ec_notes))
+    else:
+        _bad("(ga-m9x0lb.6-f) 'unknown' in a note", "notes=%d offenders=%r" % (len(_ec_notes), _ec_unk[:3]))
+    _ec_pools = dict(POOL_BY_RIG_BASENAME.values())
+    _ec_loop = re.search(r"for _ec_pool in ([a-z -]+); do", _ec_block or "")
+    if (_ec_pools == {"wa-worker": "PILOT_WA_WORKER_MAX", "ps-worker": "PILOT_PS_WORKER_MAX"} and _ec_loop
+            and set(_ec_loop.group(1).split()) == set(_ec_pools)
+            and all(v in (_ec_block or "") for v in _ec_pools.values())):
+        _ok("(ga-m9x0lb.6-f) POOL_BY_RIG_BASENAME's pools/variables %s are exactly the ones the Pilot's clamp loops over"
+            % list(_ec_pools))
+    else:
+        _bad("(ga-m9x0lb.6-f) pool table drift", "table=%r loop=%r" % (_ec_pools, _ec_loop.group(1) if _ec_loop else None))
+    for _p in _tmp_plists:   # the zowwdz-c loop above already removed its own; this block made more
+        if os.path.exists(_p):
+            os.unlink(_p)
+    _reset()
 
     # ── (ga-zowwdz-d) one malformed state record must not take the whole cycle down ──
     # _prune_state() runs FIRST in every run_cycle(), and main() only saves state AFTER
