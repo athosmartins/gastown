@@ -1,3 +1,4 @@
+include = [".gc/pool-ceiling-engine.toml"]
 [workspace]
 provider = "claude"
 global_fragments = ["command-glossary", "operational-awareness", "town-deltas"]
