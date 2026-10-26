@@ -11,7 +11,7 @@
 #
 # WHAT. Each dispatcher sweep calls pool_ceiling_step once per pool. The ceiling
 # moves AT MOST ONE step per call, inside [min, max] — where max is NEVER above the
-# engine's own cap for the pool (agents/<pool>/agent.toml AND the engine's fragment, see pool_ceiling_engine_cap_resolve):
+# engine's own EFFECTIVE cap for the pool (the fragment's entry, else agents/<pool>/agent.toml; see pool_ceiling_engine_cap_resolve):
 #   up    1  when there is a queue, the pool is saturated at its ceiling (live >=
 #            ceiling) and EVERY slack signal is "grow";
 #   down  1  when any signal SQUEEZES (hard resource limit) — only the ceiling
@@ -55,9 +55,11 @@
 #
 # SCOPE — a BRAKE inside the engine's cap, not a raise above it. This moves the DISPATCHER-side
 # caps (pilot-dispatcher.sh: wa-worker, ps-worker; quality-gate-dispatcher.sh: gate-reviewer's
-# GATE_MAX_REVIEWERS). The CONTROLLER enforces agent.toml's max_active_sessions on its own
-# (ga-o3o09z), so a dispatcher-side value above it would be a lie and is clamped away; making
-# the engine's cap follow the dynamic ceiling is a separate mechanism (follow-up bead).
+# GATE_MAX_REVIEWERS). The CONTROLLER enforces the EFFECTIVE cap on its own (ga-o3o09z): the engine's
+# fragment entry (pool-ceiling-engine.sh, ga-m9x0lb: it lowers any pool under pressure and raises wa-worker
+# to 3) over agent.toml's max_active_sessions. A dispatcher-side value above it would be a lie and is
+# clamped away (pool_ceiling_engine_cap_resolve); the ramp below only ever works INSIDE that cap, and the
+# Pilot's static wa-worker cap follows the engine UP to it (_pilot_clamp_to_engine_cap, ga-m9x0lb.5).
 # The city-wide GC_VARIABLE_SESSION_MAX (Athos-decided, 9) stays a fixed outer bound over all
 # three. NOT covered: gastown.dog and refino-gate-reviewer — they only have an engine cap and
 # do not go through these two dispatchers; auto-refiner runs under a single-instance lock.
@@ -303,27 +305,54 @@ pool_ceiling_engine_fragment() {
   return 0
 }
 
-# pool_ceiling_engine_cap_resolve <pool> — the cap the CONTROLLER really applies to the pool, as far as a dispatcher may lean on it (ga-m9x0lb.4).
-# The controller reads agents/<pool>/agent.toml (max_active_sessions, ga-o3o09z) AND the engine's fragment, whose [[patches.agent]] entry for
-# the pool OVERRIDES it (the dynamic engine ceiling, ga-m9x0lb). A dispatcher that read agent.toml alone kept admitting the old number
-# right when the engine had lowered it (gate: 3 reviewers admitted under a ceiling of 2, measured 26/10 00:42).
+# _pc_engine_floor <pool> <base> / _pc_engine_ceil <pool> <base> — the lowest and the highest level pool-ceiling-engine.sh ever writes for a pool (ga-m9x0lb.5): a
+# MIRROR of the defaults of its pce_floor / pce_ceil — wa-worker floor 2 / ceiling 3 (the Athos rule of 03/10), ps-worker floor 1, gate-reviewer floor 2, every
+# other pool its own agent.toml value both ways. Mirrored, not sourced: the engine file is exactly what may be missing when the floor is needed (the fragment
+# could not be read), and pool-ceiling-effective-cap.selftest.sh compares both functions with the engine's own pce_floor / pce_ceil, so the two cannot drift
+# apart unnoticed. The engine job's tuning knobs (POOL_CEILING_ENGINE_<POOL>_FLOOR / _CEIL) live in ITS environment, not the dispatchers': not mirrored.
+# floor: never above <base>, and NOTHING when <base> is not an integer. ceil: never below <base>; wa-worker with no usable <base> still has its 3.
+# vazio (no <base>) -> the floor is nothing; falhou/ilegivel <base> -> the same: a floor is never guessed.
+_pc_engine_floor() {
+  local v
+  _pc_int "${2:-}" || return 0
+  case "${1:-}" in wa-worker|gate-reviewer) v=2 ;; ps-worker) v=1 ;; *) v="$2" ;; esac
+  if [ "$v" -gt "$2" ]; then v="$2"; fi
+  printf '%s' "$v"
+  return 0
+}
+_pc_engine_ceil() {
+  local v=""
+  case "${1:-}" in wa-worker) v=3 ;; *) if _pc_int "${2:-}"; then v="$2"; fi ;; esac
+  if [ -n "$v" ] && _pc_int "${2:-}" && [ "$v" -lt "$2" ]; then v="$2"; fi
+  printf '%s' "$v"
+  return 0
+}
+
+# pool_ceiling_engine_cap_resolve <pool> — the cap the CONTROLLER really applies to the pool, as far as a dispatcher may lean on it (ga-m9x0lb.4, .5).
+# ONE definition per pool. The controller reads agents/<pool>/agent.toml (max_active_sessions, ga-o3o09z) AND the engine's fragment, whose [[patches.agent]] entry
+# for the pool OVERRIDES it (the dynamic engine ceiling, ga-m9x0lb) — in BOTH directions: the engine LOWERS any pool under pressure and RAISES wa-worker above its
+# committed 2 (Athos rule, 03/10). So the effective cap is the fragment's entry when it has one, else agent.toml's value, and — like the engine's own step 6 —
+# never above the engine's ceiling for the pool (wa-worker: 3, or agent.toml's value when that is higher; every other pool: agent.toml's value, so ps-worker and
+# gate-reviewer stay min(agent.toml, fragment) and a hand-written fragment above agent.toml is not followed). A dispatcher that read agent.toml alone kept
+# admitting the old number right when the engine had lowered it (gate: 3 reviewers under a ceiling of 2, measured 26/10 00:42); one that took the smaller of the
+# two could never follow the raise (the Pilot ran at 2 while the engine said 3, .5).
 # Out-params, NEVER call via $(...) (that loses them):
-#   POOL_CEILING_ENGINE_CAP       the EFFECTIVE cap = the SMALLER of agent.toml and the fragment's entry; an integer, or EMPTY when neither is
-#                                 readable. It is never above agent.toml's own value: a fragment that RAISES (wa-worker, Athos rule) is
-#                                 not followed upward — this lib is a brake, the raise stays the controller's business (ga-5hdsr: "3 is deliberate").
-#   POOL_CEILING_ENGINE_CAP_BASE  agent.toml's value alone (integer or empty) — the old reading, for callers that need to know it was unreadable.
+#   POOL_CEILING_ENGINE_CAP       the EFFECTIVE cap (an integer), or EMPTY when it cannot be told (agent.toml unreadable and nothing else to lean on).
+#   POOL_CEILING_ENGINE_CAP_BASE  agent.toml's value alone (integer or empty): what a caller compares the cap with to see a RAISE, and to know it was unreadable.
 #   POOL_CEILING_ENGINE_CAP_SRC   one human line saying WHERE the number came from (and why the fragment did not count, when it did not).
-#   POOL_CEILING_ENGINE_CAP_DOUBT "1" iff the fragment EXISTS but could not be consulted (foreign, unreadable, reader missing) — the case a
-#                                 caller should say out loud; empty for found / absent / empty / no entry.
-# THREE STATES for the fragment, never two: it has an entry for the pool → that level counts; it is absent, empty or has no entry for the
-# pool → "nothing overrides", agent.toml stands (found / not-found); it EXISTS but cannot be read (unreadable, FOREIGN content — pce_fragment_parse
-# rc 1, the engine rewrites it on its next sweep —, or the engine's parser cannot be loaded) → could-not-find-out: agent.toml stands, the note says
-# the fragment was NOT consulted, and the number is never raised on that doubt. The parser is the engine's own (pce_fragment_parse, sourced in a
-# subshell so the dispatcher's namespace stays clean): one definition of "well-formed", so the writer and this reader cannot drift apart.
-# vazio → agent.toml stands; falhou/ilegivel → agent.toml stands (the SMALLER of what could be read), the note says so.
+#   POOL_CEILING_ENGINE_CAP_DOUBT "1" iff the fragment EXISTS but could not be consulted (foreign, unreadable, not a regular file, reader missing) — the case a
+#                                 caller should say out loud and must never raise on; empty for found / absent / empty / no entry.
+# THREE STATES for the fragment, never two: it has an entry for the pool -> that level counts; it is absent, empty or has no entry for the pool -> "nothing
+# overrides", agent.toml stands (found / not-found); it EXISTS but cannot be consulted (unreadable, FOREIGN content — pce_fragment_parse rc 1, which the engine
+# rewrites on its next sweep —, a directory / dangling link / special file at that path, a directory we may not search, or the engine's parser cannot be loaded)
+# -> could-not-find-out: the cap is the engine's FLOOR for the pool (the smaller of the floor and agent.toml: what the engine itself restarts a pool from when it
+# cannot read the levels, its step 5), NEVER agent.toml's value — a read failure must not raise the admitted count, and a valid-TOML hand edit that the strict
+# parser calls foreign ("max_active_sessions = 1 # hand") is no exception — and the note says the fragment was NOT consulted. The parser is the engine's own
+# (pce_fragment_parse, sourced in a subshell so the dispatcher's namespace stays clean): one definition of "well-formed", so writer and reader cannot drift apart.
+# vazio -> agent.toml stands; falhou/ilegivel -> the engine floor (the smaller number), the note says so; both unreadable -> EMPTY.
 # shellcheck disable=SC2034  # POOL_CEILING_ENGINE_CAP* are out-params read by the callers
 pool_ceiling_engine_cap_resolve() {
-  local pool="${1:-}" dir f v base="" frag="" fp fl eng out="" rc=0 e why=""
+  local pool="${1:-}" dir f v base="" frag="" fp fl pd eng out="" rc=0 e why="" lo="" hi="" cap=""
   POOL_CEILING_ENGINE_CAP=""; POOL_CEILING_ENGINE_CAP_BASE=""; POOL_CEILING_ENGINE_CAP_SRC=""; POOL_CEILING_ENGINE_CAP_DOUBT=""
   dir="${POOL_CEILING_AGENTS_DIR:-${GC_CITY:+$GC_CITY/agents}}"
   if [ -z "$dir" ] || [ -z "$pool" ]; then
@@ -332,15 +361,17 @@ pool_ceiling_engine_cap_resolve() {
   fi
   f="$dir/$pool/agent.toml"
   if [ -r "$f" ]; then
-    v=$(sed -n 's/^max_active_sessions[[:space:]]*=[[:space:]]*\([0-9][0-9]*\)[[:space:]]*\(#.*\)\{0,1\}$/\1/p' "$f" 2>/dev/null | head -1) || v=""
+    # vazio (no max_active_sessions line) / falhou (sed failing) -> v empty -> base stays unknown. `|| true`, not `|| v=""`: under pipefail a sed that takes SIGPIPE
+    # because head already has its line exits non-zero, and v already holds that valid first line (a long agent.toml used to read as unreadable)
+    v=$(sed -n 's/^max_active_sessions[[:space:]]*=[[:space:]]*\([0-9][0-9]*\)[[:space:]]*\(#.*\)\{0,1\}$/\1/p' "$f" 2>/dev/null | head -1) || true
     _pc_int "$v" && base="$v"
   fi
   POOL_CEILING_ENGINE_CAP_BASE="$base"
 
   fp=$(pool_ceiling_engine_fragment); fl="fragmento ${fp##*/}"   # the notes name the file, not its (long) path
+  case "$fp" in */*) pd="${fp%/*}" ;; *) pd="." ;; esac
   if [ -z "$fp" ]; then why="sem caminho do fragmento"
-  elif [ ! -e "$fp" ]; then why="$fl ausente — nada o sobrepoe"
-  else
+  elif [ -f "$fp" ]; then   # a regular file (or a link to one); a directory, a dangling link or a special file is not "empty" / "absent" below
     eng="${POOL_CEILING_ENGINE_SH:-${_PC_SELF_DIR:+$_PC_SELF_DIR/pool-ceiling-engine.sh}}"
     if [ -z "$eng" ] || [ ! -r "$eng" ]; then
       POOL_CEILING_ENGINE_CAP_DOUBT=1
@@ -360,21 +391,35 @@ pool_ceiling_engine_cap_resolve() {
         *) POOL_CEILING_ENGINE_CAP_DOUBT=1; why="$fl NAO consultado (o leitor do motor nao carregou, rc=$rc)" ;;
       esac
     fi
+  elif [ -e "$fp" ] || [ -L "$fp" ]; then
+    POOL_CEILING_ENGINE_CAP_DOUBT=1; why="$fl NAO e um arquivo comum (diretorio, link pendurado ou arquivo especial) — NAO consultado"
+  elif [ -e "$pd" ] && [ ! -x "$pd" ]; then
+    POOL_CEILING_ENGINE_CAP_DOUBT=1; why="$fl NAO consultado (sem permissao de busca em ${pd##*/}/: nao da para dizer se ele existe)"
+  else why="$fl ausente — nada o sobrepoe"
   fi
 
-  if [ -n "$base" ] && [ -n "$frag" ]; then
-    if [ "$frag" -lt "$base" ]; then POOL_CEILING_ENGINE_CAP="$frag"; POOL_CEILING_ENGINE_CAP_SRC="$fl $frag (< agents/$pool/agent.toml $base)"
-    else POOL_CEILING_ENGINE_CAP="$base"; POOL_CEILING_ENGINE_CAP_SRC="agents/$pool/agent.toml $base ($fl $frag nao e menor)"; fi
+  if [ -n "$base" ]; then lo=$(_pc_engine_floor "$pool" "$base"); fi
+  hi=$(_pc_engine_ceil "$pool" "$base")
+  if [ -n "$POOL_CEILING_ENGINE_CAP_DOUBT" ]; then
+    if [ -n "$lo" ]; then POOL_CEILING_ENGINE_CAP="$lo"; POOL_CEILING_ENGINE_CAP_SRC="piso do motor $lo ($why)"
+    else POOL_CEILING_ENGINE_CAP_SRC="teto do motor ILEGIVEL (agents/$pool/agent.toml ilegivel; $why)"; fi
+  elif [ -n "$frag" ]; then
+    cap="$frag"
+    if [ -n "$hi" ] && [ "$cap" -gt "$hi" ]; then cap="$hi"; fi   # the engine never writes past its ceiling: a level above it is a hand edit or a knob this lib does not mirror
+    POOL_CEILING_ENGINE_CAP="$cap"
+    if [ -z "$base" ]; then POOL_CEILING_ENGINE_CAP_SRC="$fl $cap (agents/$pool/agent.toml ilegivel)"
+    elif [ "$cap" -lt "$base" ]; then POOL_CEILING_ENGINE_CAP_SRC="$fl $cap (< agents/$pool/agent.toml $base)"
+    elif [ "$cap" -gt "$base" ]; then POOL_CEILING_ENGINE_CAP_SRC="$fl $frag (> agents/$pool/agent.toml $base: o motor SOBE este pool; vale ate o teto de subida do motor $hi)"
+    else POOL_CEILING_ENGINE_CAP_SRC="agents/$pool/agent.toml $base ($fl $frag nao e menor)"; fi
   elif [ -n "$base" ]; then POOL_CEILING_ENGINE_CAP="$base"; POOL_CEILING_ENGINE_CAP_SRC="agents/$pool/agent.toml $base ($why)"
-  elif [ -n "$frag" ]; then POOL_CEILING_ENGINE_CAP="$frag"; POOL_CEILING_ENGINE_CAP_SRC="$fl $frag (agents/$pool/agent.toml ilegivel)"
   else POOL_CEILING_ENGINE_CAP_SRC="teto do motor ILEGIVEL (agents/$pool/agent.toml ilegivel; $why)"; fi
   return 0
 }
 
-# pool_ceiling_engine_cap <pool> — the EFFECTIVE engine cap (see pool_ceiling_engine_cap_resolve: the smaller of agents/<pool>/agent.toml and the
-# engine fragment's entry), or NOTHING when unreadable. This is the cap the CONTROLLER itself enforces: on 2026-09-25 it spawned wa-workers up to
-# agent.toml's 4 while the Pilot's own cap said 2 (ga-o3o09z; the Mayor then made agent.toml the single source of truth). A dispatcher-side
-# ceiling above it is a lie, so the step clamps its max to this value. A value-only wrapper for $(...) callers: it cannot hand back the source note.
+# pool_ceiling_engine_cap <pool> — the EFFECTIVE engine cap (see pool_ceiling_engine_cap_resolve: the fragment's entry, else agents/<pool>/agent.toml, never above the
+# engine's ceiling for the pool), or NOTHING when unreadable. This is the cap the CONTROLLER itself enforces: on 2026-09-25 it spawned wa-workers up to agent.toml's 4
+# while the Pilot's own cap said 2 (ga-o3o09z; the Mayor then made agent.toml the single source of truth). A dispatcher-side ceiling above it is a lie, so the step
+# clamps its max to this value. A value-only wrapper for $(...) callers: it cannot hand back the source note.
 pool_ceiling_engine_cap() {
   pool_ceiling_engine_cap_resolve "${1:-}"
   [ -z "$POOL_CEILING_ENGINE_CAP" ] || printf '%s' "$POOL_CEILING_ENGINE_CAP"
@@ -440,7 +485,7 @@ pool_ceiling_step() {
   [ "$min" -le "$max" ] || min="$max"
   # Never above what the controller itself will admit. Engine cap unreadable -> never above
   # the known-good fixed value (not-found is not "no limit").
-  # The cap is the EFFECTIVE one (agent.toml and the engine's fragment, whichever is lower — ga-m9x0lb.4). agent.toml unreadable keeps the
+  # The cap is the EFFECTIVE one (the fragment's entry, else agent.toml, never above the engine's ceiling for the pool; in doubt the engine's floor — ga-m9x0lb.4/.5). agent.toml unreadable keeps the
   # known-good fixed bound even when the fragment gave a number: the fragment alone is not the whole picture.
   local ec ecb
   pool_ceiling_engine_cap_resolve "$pool"

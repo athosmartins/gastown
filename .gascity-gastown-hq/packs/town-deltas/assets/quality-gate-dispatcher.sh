@@ -775,14 +775,16 @@ fi
 # timeout kept counting — a run that times out comes back as gate:needs-fix with
 # nobody having evaluated the code. Unreadable/absent cap -> keep the env value and
 # say so (never invent a cap).
-# ga-m9x0lb.4: "what the engine will run" is agent.toml AND the engine's generated fragment
-# (.gc/pool-ceiling-engine.toml, the dynamic ceiling) — the smaller of the two, resolved by the
-# lib (pool_ceiling_engine_cap_resolve, which also says where the number came from). Reading
+# ga-m9x0lb.4/.5: "what the engine will run" is the engine's generated fragment entry
+# (.gc/pool-ceiling-engine.toml, the dynamic ceiling) over agent.toml — for gate-reviewer the smaller of
+# the two (the engine only lowers it) —, resolved by the lib (pool_ceiling_engine_cap_resolve, which
+# also says where the number came from). Reading
 # agent.toml alone left the gate admitting 3 reviewers under an engine ceiling of 2, exactly
 # when the engine had lowered it for pressure. After the lib loader because it uses the lib; if the lib
 # did not load it falls back to agent.toml alone (the old reading) and the note says the fragment was NOT
-# consulted. Fragment absent/empty/foreign/unreadable -> agent.toml stands, never a raise (vazio → agent.toml;
-# falhou/ilegivel → agent.toml, dito na nota). Runs under `set -e`: every probe is guarded.
+# consulted. Fragment absent/empty/without an entry -> agent.toml stands (vazio → agent.toml); foreign, unreadable,
+# not a regular file or its reader missing -> the engine's FLOOR for the pool (2), never agent.toml's number and
+# never a raise (falhou/ilegivel → piso do motor, dito na nota). Runs under `set -e`: every probe is guarded.
 # SELFTEST-EXTRACT gate-engine-cap-clamp: BEGIN
 _gate_clamp_to_engine_cap() {
   local cap="" src="" doubt="" f="${GC_CITY:-}/agents/gate-reviewer/agent.toml"
@@ -14947,7 +14949,7 @@ if [ "${GATE_HEADROOM_ENABLED:-1}" = "1" ]; then
     # (an unset/empty HR_QSTATE is "unknown" — never ok, and never a `set -u` abort of the gate's critical path)
     _pc_quota="${HR_QSTATE:-unknown}"
     # The ceiling never goes under the reviewers of a single run — unless the engine's own cap is
-    # lower than that (the step bounds max by agents/gate-reviewer/agent.toml): then no run could
+    # lower than that (the step bounds max by the EFFECTIVE engine cap: the fragment's entry, else agents/gate-reviewer/agent.toml): then no run could
     # be spawned in full anyway, and the "motor N" in the log line shows why. The other exception is
     # GATE_MAX_REVIEWERS=0, the operator's pause: the step hands the 0 back untouched (no floor, no state),
     # so gate_headroom_decision sees the same 0 it saw before the dynamic ceiling existed.

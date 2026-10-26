@@ -6084,6 +6084,50 @@ _ASLEEP_SESSION_IDS=$(echo "$_SESSIONS_JSON" \
            | (.session_name, .name, .alias, .id, .agent_name)]
           | map(select(. != null and . != "")) | unique | .[]' 2>/dev/null || echo "")
 
+# ── ga-m9x0lb.4/.5: the Pilot's static caps follow what the CONTROLLER will run ─────────────────
+# PILOT_WA_WORKER_MAX / PILOT_PS_WORKER_MAX are typed in the plist; the controller enforces the pool's EFFECTIVE cap: agents/<pool>/agent.toml, overridden by the
+# engine's generated fragment (.gc/pool-ceiling-engine.toml: the dynamic engine ceiling, which LOWERS any pool under pressure and RAISES wa-worker to 3 over its
+# committed 2, Athos rule 03/10). Nothing tied the two: with the engine at 2 a Pilot cap of 3 kept dispatching toward a ceiling the controller would not honour
+# (the gate had the same hole, .4); and with the engine at 3 the plist's 2 kept the Pilot at 2 for ever, so the raise only ever reached the controller (.5).
+# So the static cap is brought to the effective one (pool_ceiling_engine_cap_resolve: ONE definition, the gate uses it too): DOWN whenever it is above, and UP
+# only for a pool the engine raised above agent.toml (wa-worker), only when that cap was read without doubt and agent.toml is known, and only when the typed
+# number is agent.toml's own or higher — a leftover copy of the committed value. A number BELOW agent.toml is a deliberate operator throttle and is never raised;
+# 0 is the operator's pause and a non-integer is not ours to fix here. Fragment absent/empty/without an entry -> agent.toml's value; present but not readable ->
+# the engine's floor (never a raise, said out loud); both unreadable -> the cap is left as it is, with a warning. Lib not loaded -> nothing changes (as before).
+# It runs BEFORE the dynamic ceiling below: the static cap is that step's "fixed" starting point, and a clamp that ran after it would undo a ramp that squeezed.
+# SELFTEST-EXTRACT pilot-clamp-engine-cap: BEGIN
+_pilot_clamp_to_engine_cap() {
+  { [ "${_POOL_CEILING_OK:-0}" = "1" ] && type pool_ceiling_engine_cap_resolve >/dev/null 2>&1; } || return 0
+  local _ec_pool _ec_var _ec_cur _ec_up
+  for _ec_pool in wa-worker ps-worker; do
+    case "$_ec_pool" in wa-worker) _ec_var=PILOT_WA_WORKER_MAX ;; *) _ec_var=PILOT_PS_WORKER_MAX ;; esac
+    _ec_cur="${!_ec_var:-}"
+    case "$_ec_cur" in ''|*[!0-9]*) continue ;; esac
+    [ "$_ec_cur" -gt 0 ] || continue
+    pool_ceiling_engine_cap_resolve "$_ec_pool"
+    case "$POOL_CEILING_ENGINE_CAP" in
+      ''|*[!0-9]*) warn "$_ec_pool: teto do motor ILEGIVEL (${POOL_CEILING_ENGINE_CAP_SRC}) — $_ec_var fica $_ec_cur (ga-m9x0lb.4)"; continue ;;
+    esac
+    _ec_up=0   # vazio (agent.toml unreadable) -> 0: with no committed value there is nothing to say the engine RAISED anything, and a cap we could not read in full is no reason to raise
+    case "${POOL_CEILING_ENGINE_CAP_BASE:-}" in
+      ''|*[!0-9]*) ;;
+      *) if [ "$_ec_cur" -lt "$POOL_CEILING_ENGINE_CAP" ] && [ "$_ec_cur" -ge "$POOL_CEILING_ENGINE_CAP_BASE" ]; then _ec_up=1; fi ;;   # cur >= base and cur < cap: cap > agent.toml, which only a fragment entry that WAS read can give (in doubt the cap is the floor, never above agent.toml)
+    esac
+    if [ "$_ec_cur" -gt "$POOL_CEILING_ENGINE_CAP" ]; then
+      log "  $_ec_var $_ec_cur limitado ao teto do motor $POOL_CEILING_ENGINE_CAP (${POOL_CEILING_ENGINE_CAP_SRC}) — ga-m9x0lb.4"
+      printf -v "$_ec_var" '%s' "$POOL_CEILING_ENGINE_CAP"
+    elif [ "$_ec_up" = "1" ]; then
+      log "  $_ec_var $_ec_cur sobe ao teto do motor $POOL_CEILING_ENGINE_CAP (${POOL_CEILING_ENGINE_CAP_SRC}) — ga-m9x0lb.5"
+      printf -v "$_ec_var" '%s' "$POOL_CEILING_ENGINE_CAP"
+    elif [ -n "${POOL_CEILING_ENGINE_CAP_DOUBT:-}" ]; then
+      log "  $_ec_var $_ec_cur — teto do motor $POOL_CEILING_ENGINE_CAP (${POOL_CEILING_ENGINE_CAP_SRC}) — ga-m9x0lb.4"
+    fi
+  done
+  return 0
+}
+# SELFTEST-EXTRACT pilot-clamp-engine-cap: END
+_pilot_clamp_to_engine_cap
+
 # ── ga-uywvsc: dynamic per-pool ceiling — decided ONCE per sweep, right here ───
 # After every whole-sweep exit (quota / RAM / quiet-hours / cross-stage: a paused sweep
 # opens nothing, so there is nothing to size) and after the roster snapshot above, but
@@ -6136,41 +6180,6 @@ _pilot_apply_dynamic_pool_ceilings() {
 }
 # SELFTEST-EXTRACT pilot-apply-dynamic-pool-ceilings: END
 _pilot_apply_dynamic_pool_ceilings
-
-# ── ga-m9x0lb.4: the Pilot's static caps never exceed what the CONTROLLER will run ─────────────
-# PILOT_WA_WORKER_MAX / PILOT_PS_WORKER_MAX are typed in the plist; the controller enforces
-# agents/<pool>/agent.toml AND the engine's generated fragment (.gc/pool-ceiling-engine.toml: the dynamic
-# engine ceiling, which LOWERS the cap under pressure). Nothing tied the two: with the engine at 2 a Pilot cap of 3
-# kept dispatching toward a ceiling the controller would not honour (the gate had the same hole, ga-m9x0lb.4).
-# The dynamic step above already bounds itself by the engine cap; this is the same bound for the STATIC / SHADOW
-# path (dynamic off), and it is idempotent after the dynamic one. The pool_ceiling_engine_cap_resolve rules apply: the
-# smaller of agent.toml and the fragment; fragment absent/empty/foreign/unreadable -> agent.toml stands (never a raise on a
-# read failure, the foreign case said out loud); both unreadable -> the cap is left as it is, with a warning. A cap of 0 is
-# the operator's pause and a non-integer is not ours to fix here. Lib not loaded -> nothing changes (as before).
-# SELFTEST-EXTRACT pilot-clamp-engine-cap: BEGIN
-_pilot_clamp_to_engine_cap() {
-  { [ "${_POOL_CEILING_OK:-0}" = "1" ] && type pool_ceiling_engine_cap_resolve >/dev/null 2>&1; } || return 0
-  local _ec_pool _ec_var _ec_cur
-  for _ec_pool in wa-worker ps-worker; do
-    case "$_ec_pool" in wa-worker) _ec_var=PILOT_WA_WORKER_MAX ;; *) _ec_var=PILOT_PS_WORKER_MAX ;; esac
-    _ec_cur="${!_ec_var:-}"
-    case "$_ec_cur" in ''|*[!0-9]*) continue ;; esac
-    [ "$_ec_cur" -gt 0 ] || continue
-    pool_ceiling_engine_cap_resolve "$_ec_pool"
-    case "$POOL_CEILING_ENGINE_CAP" in
-      ''|*[!0-9]*) warn "$_ec_pool: teto do motor ILEGIVEL (${POOL_CEILING_ENGINE_CAP_SRC}) — $_ec_var fica $_ec_cur (ga-m9x0lb.4)"; continue ;;
-    esac
-    if [ "$_ec_cur" -gt "$POOL_CEILING_ENGINE_CAP" ]; then
-      log "  $_ec_var $_ec_cur limitado ao teto do motor $POOL_CEILING_ENGINE_CAP (${POOL_CEILING_ENGINE_CAP_SRC}) — ga-m9x0lb.4"
-      printf -v "$_ec_var" '%s' "$POOL_CEILING_ENGINE_CAP"
-    elif [ -n "${POOL_CEILING_ENGINE_CAP_DOUBT:-}" ]; then
-      log "  $_ec_var $_ec_cur — teto do motor $POOL_CEILING_ENGINE_CAP (${POOL_CEILING_ENGINE_CAP_SRC}) — ga-m9x0lb.4"
-    fi
-  done
-  return 0
-}
-# SELFTEST-EXTRACT pilot-clamp-engine-cap: END
-_pilot_clamp_to_engine_cap
 
 # ── ga-kqa08j: GATE FOCUS MODE (Athos 07/10) ────────────────────────────────────
 # gate-focus-mode.sh (launchd, 5 min) is the only owner of the mode; here we only read
