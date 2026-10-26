@@ -6285,9 +6285,10 @@ def _selftest():
                   'for c in $3; do PILOT_WA_WORKER_MAX=$c; PILOT_PS_WORKER_MAX=$c; '
                   '_pilot_clamp_to_engine_cap; echo "$c $PILOT_WA_WORKER_MAX $PILOT_PS_WORKER_MAX"; done')
         try:
+            # third-state-waiver: test-only; a bash that cannot run returns None and scenario (b) FAILS via _bad
             r = subprocess.run(["bash", "-c", script, "pilot-clamp", _EC_LIB, _ec_block,
                                 " ".join(str(c) for c in curs)],
-                               capture_output=True, text=True, timeout=30, env=env)   # third-state-waiver: test-only; a bash that cannot run returns None and scenario (b) FAILS via _bad
+                               capture_output=True, text=True, timeout=30, env=env)
         except Exception:
             return None
         if r.returncode != 0:
