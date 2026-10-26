@@ -6137,6 +6137,41 @@ _pilot_apply_dynamic_pool_ceilings() {
 # SELFTEST-EXTRACT pilot-apply-dynamic-pool-ceilings: END
 _pilot_apply_dynamic_pool_ceilings
 
+# ── ga-m9x0lb.4: the Pilot's static caps never exceed what the CONTROLLER will run ─────────────
+# PILOT_WA_WORKER_MAX / PILOT_PS_WORKER_MAX are typed in the plist; the controller enforces
+# agents/<pool>/agent.toml AND the engine's generated fragment (.gc/pool-ceiling-engine.toml: the dynamic
+# engine ceiling, which LOWERS the cap under pressure). Nothing tied the two: with the engine at 2 a Pilot cap of 3
+# kept dispatching toward a ceiling the controller would not honour (the gate had the same hole, ga-m9x0lb.4).
+# The dynamic step above already bounds itself by the engine cap; this is the same bound for the STATIC / SHADOW
+# path (dynamic off), and it is idempotent after the dynamic one. The pool_ceiling_engine_cap_resolve rules apply: the
+# smaller of agent.toml and the fragment; fragment absent/empty/foreign/unreadable -> agent.toml stands (never a raise on a
+# read failure, the foreign case said out loud); both unreadable -> the cap is left as it is, with a warning. A cap of 0 is
+# the operator's pause and a non-integer is not ours to fix here. Lib not loaded -> nothing changes (as before).
+# SELFTEST-EXTRACT pilot-clamp-engine-cap: BEGIN
+_pilot_clamp_to_engine_cap() {
+  { [ "${_POOL_CEILING_OK:-0}" = "1" ] && type pool_ceiling_engine_cap_resolve >/dev/null 2>&1; } || return 0
+  local _ec_pool _ec_var _ec_cur
+  for _ec_pool in wa-worker ps-worker; do
+    case "$_ec_pool" in wa-worker) _ec_var=PILOT_WA_WORKER_MAX ;; *) _ec_var=PILOT_PS_WORKER_MAX ;; esac
+    _ec_cur="${!_ec_var:-}"
+    case "$_ec_cur" in ''|*[!0-9]*) continue ;; esac
+    [ "$_ec_cur" -gt 0 ] || continue
+    pool_ceiling_engine_cap_resolve "$_ec_pool"
+    case "$POOL_CEILING_ENGINE_CAP" in
+      ''|*[!0-9]*) warn "$_ec_pool: teto do motor ILEGIVEL (${POOL_CEILING_ENGINE_CAP_SRC}) — $_ec_var fica $_ec_cur (ga-m9x0lb.4)"; continue ;;
+    esac
+    if [ "$_ec_cur" -gt "$POOL_CEILING_ENGINE_CAP" ]; then
+      log "  $_ec_var $_ec_cur limitado ao teto do motor $POOL_CEILING_ENGINE_CAP (${POOL_CEILING_ENGINE_CAP_SRC}) — ga-m9x0lb.4"
+      printf -v "$_ec_var" '%s' "$POOL_CEILING_ENGINE_CAP"
+    elif [ -n "${POOL_CEILING_ENGINE_CAP_DOUBT:-}" ]; then
+      log "  $_ec_var $_ec_cur — teto do motor $POOL_CEILING_ENGINE_CAP (${POOL_CEILING_ENGINE_CAP_SRC}) — ga-m9x0lb.4"
+    fi
+  done
+  return 0
+}
+# SELFTEST-EXTRACT pilot-clamp-engine-cap: END
+_pilot_clamp_to_engine_cap
+
 # ── ga-kqa08j: GATE FOCUS MODE (Athos 07/10) ────────────────────────────────────
 # gate-focus-mode.sh (launchd, 5 min) is the only owner of the mode; here we only read
 # it. ON: the builder pools stop taking NEW beads — _filter_candidates keeps only fixes

@@ -748,22 +748,6 @@ case "$GATE_DOLT_CPU_HOT"        in ''|*[!0-9]*) GATE_DOLT_CPU_HOT=180 ;; esac
 case "$GATE_DOLT_CPU_WARM"       in ''|*[!0-9]*) GATE_DOLT_CPU_WARM=100 ;; esac
 case "$GATE_DOLT_LATENCY_HOT_MS" in ''|*[!0-9]*) GATE_DOLT_LATENCY_HOT_MS=2500 ;; esac
 case "$GATE_MAX_REVIEWERS"       in ''|*[!0-9]*) GATE_MAX_REVIEWERS=6 ;; esac
-# ga-kqa08j: the reviewer ceiling can never exceed what the ENGINE will actually run.
-# agents/gate-reviewer/agent.toml max_active_sessions (3, deliberate — ga-5hdsr) is
-# enforced by the controller; admitting a 4th..6th run (the old default 6) only
-# created runs whose reviewer session waited in start-pending while the run's verdict
-# timeout kept counting — a run that times out comes back as gate:needs-fix with
-# nobody having evaluated the code. Unreadable/absent cap -> keep the env value and
-# say so (never invent a cap).
-GATE_ENGINE_REVIEWER_CAP="$(sed -n 's/^max_active_sessions *= *\([0-9][0-9]*\).*/\1/p' "$GC_CITY/agents/gate-reviewer/agent.toml" 2>/dev/null | head -n 1 || true)"  # set -e: a missing file must reach the UNREADABLE branch, not abort the gate
-GATE_ENGINE_CAP_NOTE=""
-case "$GATE_ENGINE_REVIEWER_CAP" in
-  ''|*[!0-9]*) GATE_ENGINE_CAP_NOTE="engine reviewer cap UNREADABLE ($GC_CITY/agents/gate-reviewer/agent.toml) — GATE_MAX_REVIEWERS stays $GATE_MAX_REVIEWERS (ga-kqa08j)" ;;
-  *) if [ "$GATE_MAX_REVIEWERS" -gt "$GATE_ENGINE_REVIEWER_CAP" ]; then
-       GATE_ENGINE_CAP_NOTE="GATE_MAX_REVIEWERS $GATE_MAX_REVIEWERS clamped to the engine cap $GATE_ENGINE_REVIEWER_CAP (agents/gate-reviewer/agent.toml) — ga-kqa08j"
-       GATE_MAX_REVIEWERS="$GATE_ENGINE_REVIEWER_CAP"
-     fi ;;
-esac
 # ── ga-uywvsc: DYNAMIC ceiling for GATE_MAX_REVIEWERS ─────────────────────────
 # GATE_MAX_REVIEWERS above is the FIXED ceiling (and what the dynamic one starts from and
 # falls back to). When switched on (pool_ceiling_enabled) the headroom step (Step 0b-1) recomputes it
@@ -784,6 +768,46 @@ if [ -r "$_POOL_CEILING_LIB" ]; then
   if . "$_POOL_CEILING_LIB" && type pool_ceiling_step >/dev/null 2>&1; then _POOL_CEILING_OK=1; _POOL_CEILING_WHY=""; fi
 fi
 # SELFTEST-EXTRACT pool-ceiling-loader: END
+# ga-kqa08j: the reviewer ceiling can never exceed what the ENGINE will actually run.
+# agents/gate-reviewer/agent.toml max_active_sessions (3, deliberate — ga-5hdsr) is
+# enforced by the controller; admitting a 4th..6th run (the old default 6) only
+# created runs whose reviewer session waited in start-pending while the run's verdict
+# timeout kept counting — a run that times out comes back as gate:needs-fix with
+# nobody having evaluated the code. Unreadable/absent cap -> keep the env value and
+# say so (never invent a cap).
+# ga-m9x0lb.4: "what the engine will run" is agent.toml AND the engine's generated fragment
+# (.gc/pool-ceiling-engine.toml, the dynamic ceiling) — the smaller of the two, resolved by the
+# lib (pool_ceiling_engine_cap_resolve, which also says where the number came from). Reading
+# agent.toml alone left the gate admitting 3 reviewers under an engine ceiling of 2, exactly
+# when the engine had lowered it for pressure. After the lib loader because it uses the lib; if the lib
+# did not load it falls back to agent.toml alone (the old reading) and the note says the fragment was NOT
+# consulted. Fragment absent/empty/foreign/unreadable -> agent.toml stands, never a raise (vazio → agent.toml;
+# falhou/ilegivel → agent.toml, dito na nota). Runs under `set -e`: every probe is guarded.
+# SELFTEST-EXTRACT gate-engine-cap-clamp: BEGIN
+_gate_clamp_to_engine_cap() {
+  local cap="" src="" doubt="" f="${GC_CITY:-}/agents/gate-reviewer/agent.toml"
+  GATE_ENGINE_CAP_NOTE=""
+  if [ "${_POOL_CEILING_OK:-0}" = "1" ] && type pool_ceiling_engine_cap_resolve >/dev/null 2>&1; then
+    pool_ceiling_engine_cap_resolve gate-reviewer
+    cap="$POOL_CEILING_ENGINE_CAP"; src="$POOL_CEILING_ENGINE_CAP_SRC"; doubt="$POOL_CEILING_ENGINE_CAP_DOUBT"
+  else
+    cap="$(sed -n 's/^max_active_sessions *= *\([0-9][0-9]*\).*/\1/p' "$f" 2>/dev/null | head -n 1 || true)"  # set -e: a missing file must reach the UNREADABLE branch, not abort the gate
+    src="$f (biblioteca do teto nao carregou — o fragmento do motor NAO foi consultado)"
+  fi
+  GATE_ENGINE_REVIEWER_CAP="$cap"
+  case "$cap" in
+    ''|*[!0-9]*) GATE_ENGINE_CAP_NOTE="engine reviewer cap UNREADABLE (${src}) — GATE_MAX_REVIEWERS stays $GATE_MAX_REVIEWERS (ga-kqa08j)" ;;
+    *) if [ "$GATE_MAX_REVIEWERS" -gt "$cap" ]; then
+         GATE_ENGINE_CAP_NOTE="GATE_MAX_REVIEWERS $GATE_MAX_REVIEWERS clamped to the engine cap $cap (${src}) — ga-kqa08j/ga-m9x0lb.4"
+         GATE_MAX_REVIEWERS="$cap"
+       fi ;;
+  esac
+  # a fragment that EXISTS but was not consulted is said out loud even when no clamp was needed (the cap in force may be above the real one)
+  if [ -z "$GATE_ENGINE_CAP_NOTE" ] && [ -n "$doubt" ]; then GATE_ENGINE_CAP_NOTE="engine cap $cap — $src (ga-m9x0lb.4)"; fi
+  return 0
+}
+# SELFTEST-EXTRACT gate-engine-cap-clamp: END
+_gate_clamp_to_engine_cap
 # SELFTEST-EXTRACT pool-ceiling-note: BEGIN
 # _pool_ceiling_lib_failed_note — prints ONE line iff the ceiling is switched ON (the lib's own
 # predicate, repeated inline because the lib is exactly what is missing: POOL_CEILING_DYNAMIC=1, or

@@ -233,8 +233,12 @@ O `status` roda no `/bin/bash` 3.2 do plist (o selftest usa o mesmo interpretado
 6. **medir drain**: `max_active_sessions` entra no fingerprint do pool (por fonte, **não provado**): contar `session.stopped`/drain do pool tocado antes e depois da 1ª escrita;
 7. subir `PILOT_WA_WORKER_MAX` do plist do Pilot só se quiser que o **Pilot** também use o 3º slot (hoje quem passa de 2 é o controller; o prod-test v2 aceita o Pilot até o teto efetivo).
 
-**Limites conhecidos.** (a) O elo "mudar max ⇒ drain das sessões vivas" é por leitura de fonte, **não** medido: por isso o passo 6 e o limite de escritas. (b) `pool_ceiling_engine_cap` (a lib do freio) ainda lê o `agent.toml`, não o
-fragmento: o freio dos dispatchers segue limitado ao valor commitado. (c) Os outros pools só baixam até haver série medida no `pool-ceiling.log`; subir qualquer um é decisão do Mayor (as variáveis `POOL_CEILING_ENGINE_<POOL>_CEIL`/`_FLOOR` existem para calibrar, não para o uso normal).
+**Limites conhecidos.** (a) O elo "mudar max ⇒ drain das sessões vivas" é por leitura de fonte, **não** medido: por isso o passo 6 e o limite de escritas. (b) ~~`pool_ceiling_engine_cap` lia só o `agent.toml`~~ — **corrigido em ga-m9x0lb.4**: a lib do freio tem `pool_ceiling_engine_cap_resolve`, que devolve o teto **efetivo**
+= o **menor** entre o `agent.toml` e a entrada do fragmento para o pool (nunca acima do `agent.toml`: um fragmento que *sobe* o wa-worker não é seguido para cima por um freio). Quem usa: o passo do teto dinâmico
+(`pool_ceiling_step`), o clamp do gate (`_gate_clamp_to_engine_cap`, que antes logava "clamped to the engine cap 3" com o motor em 2) e o clamp estático do Pilot (`_pilot_clamp_to_engine_cap`, para `PILOT_WA_WORKER_MAX`/`PILOT_PS_WORKER_MAX`
+quando o teto dinâmico está desligado ou em sombra). Fragmento ausente / vazio / sem entrada para o pool → vale o `agent.toml`; fragmento que **existe mas não se lê** (estranho, ilegível, leitor `pool-ceiling-engine.sh` ausente) → vale o
+`agent.toml` (nunca sobe na dúvida) e a nota do log diz "NAO consultado" e por quê. Lacuna aceita: um fragmento estranho não é "salvo" para um número menor — o motor o reescreve no próximo ciclo (5 min). **Não medido**: o que o controller
+faz com um spawn ACIMA do teto (recusa, fila em start-pending, ou aceita) — o conserto só alinha o que os dispatchers *admitem* com o que o controller *aplica*. (c) Os outros pools só baixam até haver série medida no `pool-ceiling.log`; subir qualquer um é decisão do Mayor (as variáveis `POOL_CEILING_ENGINE_<POOL>_CEIL`/`_FLOOR` existem para calibrar, não para o uso normal).
 (d) `story-ga-o3o09z.sh` (v2, aprovado pelo Mayor) passou a exigir: Pilot ≤ teto **efetivo** do motor (agent.toml + fragmento), fragmento presente se incluído e bem-formado, outros pools nunca acima do commitado, soma ≤ `GC_VARIABLE_SESSION_MAX`.
 
 ## Verificação
