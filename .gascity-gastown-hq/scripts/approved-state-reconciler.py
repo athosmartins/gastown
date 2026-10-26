@@ -1934,11 +1934,14 @@ def _pool_cap(template, cap_env, now):
             set_mtime = eng_mtime
         if log_cap is not None and log_cap != cap and log_epoch >= set_mtime:
             followed = "" if cap == plist_cap else " (%d once followed to the engine's effective cap)" % cap
+            # the engine's own note rides along: a cap that was not measured, or read in doubt, is a reason to
+            # read the comparison above with care, and the skip line must let the reader see it
+            engine = "" if not eng_note else " [engine: %s]" % eng_note
             return log_cap, "pilot-log", (
                 "DIVERGED: %s=%d in the Pilot plist%s, but the Pilot itself logged max=%d at %s "
                 "— after the plist and the engine's fragment were last written; plist edited without "
-                "reloading the Pilot job? using what the Pilot enforced" % (
-                    cap_env, plist_cap, followed, log_cap, _hms(log_epoch)))
+                "reloading the Pilot job? using what the Pilot enforced%s" % (
+                    cap_env, plist_cap, followed, log_cap, _hms(log_epoch), engine))
         return cap, ("plist" if cap == plist_cap else "plist+engine"), eng_note
     if log_cap is not None:
         return log_cap, "pilot-log", "%s; using the max the Pilot itself logged at %s" % (
@@ -6499,6 +6502,14 @@ def _selftest():
                 dict(wa=2, frag={"wa-worker": 3}), 2, "plist", ("NOT MEASURED",), lib=_ec_gone)
         _ec_row("the lib itself cannot tell (agent.toml and fragment unreadable): the plist number stands, the note says so",
                 dict(wa=2, frag={"wa-worker": 3}), 2, "plist", ("unreadable",), lib=_ec_nofn)
+        # the Pilot's own fresh line carries the truth the lib could not give; the note must say BOTH, or the skip
+        # line names a cap whose reliability the reader cannot see
+        _ec_row("a DIVERGED line while the lib is missing: the Pilot's max=3 wins and the note carries both facts",
+                dict(wa=2, frag={"wa-worker": 3}), 3, "pilot-log", ("DIVERGED", "NOT MEASURED"), lib=_ec_gone,
+                log=[_cap_line("wa-worker", 3, 30, "pick")])
+        _ec_row("a DIVERGED line while the fragment is foreign: the note carries the doubt too",
+                dict(wa=2, frag_text="garbage\n"), 4, "pilot-log", ("DIVERGED", "in doubt"),
+                log=[_cap_line("wa-worker", 4, 30, "pick")])
 
     print("\nScenario (ga-m9x0lb.6-e): a Pilot log line older than the last write of the plist OR of the "
           "fragment describes the previous setting; a newer one is what the Pilot enforced")
