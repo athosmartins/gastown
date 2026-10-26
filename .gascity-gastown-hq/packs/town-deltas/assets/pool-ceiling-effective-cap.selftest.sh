@@ -111,6 +111,14 @@ out="$(resolve gate-reviewer)"; eq "$(cap_of "$out")" "cap= base= doubt=" "agent
 eq "$(bash -c 'set -euo pipefail; . "$1"; pool_ceiling_engine_cap gate-reviewer; echo END' _ "$LIB" 2>&1)" "END" "pool_ceiling_engine_cap prints NOTHING when unreadable, and survives set -euo pipefail"
 mv "$C/agents/gate-reviewer/agent.toml.off" "$C/agents/gate-reviewer/agent.toml"
 
+# the READ itself fails: agent.toml is there and readable but `sed` exits non-zero (a stub that fails — the [ -r ] guard above is not what is under test)
+SEDFAIL="$TMPROOT/sed-fails"; mkdir -p "$SEDFAIL"; printf '#!/bin/sh\nexit 2\n' > "$SEDFAIL/sed"; chmod +x "$SEDFAIL/sed"
+frag "gate-reviewer=2"
+out="$(PATH="$SEDFAIL:$PATH" resolve gate-reviewer)"; eq "$(cap_of "$out")" "cap=2 base= doubt=" "sed FAILS on a readable agent.toml + fragment 2 -> the fragment's 2, agent.toml read as unknown (survives set -euo pipefail)"
+rm -f "$(FR)"
+out="$(PATH="$SEDFAIL:$PATH" resolve gate-reviewer)"; eq "$(cap_of "$out")" "cap= base= doubt=" "sed FAILS + no fragment -> EMPTY, never a number"; has "$out" "ILEGIVEL" "and the note says the cap is unreadable"
+eq "$(PATH="$SEDFAIL:$PATH" bash -c 'set -euo pipefail; . "$1"; pool_ceiling_engine_cap gate-reviewer; echo END' _ "$LIB" 2>&1)" "END" "pool_ceiling_engine_cap with a failing sed prints NOTHING and survives set -euo pipefail"
+
 # the seams
 mk_city c1b; export POOL_CEILING_AGENTS_DIR="$C/agents"
 LIVELIKE="$TMPROOT/livelike"; mkdir -p "$LIVELIKE/.gc"; printf '[[patches.agent]]\ndir = ""\nname = "gate-reviewer"\nmax_active_sessions = 1\n' > "$LIVELIKE/.gc/pool-ceiling-engine.toml"
@@ -187,6 +195,15 @@ else
   frag "gate-reviewer=2"
   out="$(POOL_CEILING_LIB="$TMPROOT/no-such-lib.sh" gate_clamp 6)"
   has "$out" "MAX=3" "lib NOT loaded -> falls back to agent.toml's 3 (cannot read the fragment)"; has "$out" "NAO foi consultado" "and the note says the fragment was NOT consulted"
+  # the fallback read fails: agent.toml missing, or sed itself exits non-zero -> UNREADABLE, GATE_MAX_REVIEWERS stays, the gate does not abort under set -e
+  mv "$C/agents/gate-reviewer/agent.toml" "$C/agents/gate-reviewer/agent.toml.off"
+  out="$(POOL_CEILING_LIB="$TMPROOT/no-such-lib.sh" gate_clamp 6)"
+  has "$out" "MAX=6" "lib NOT loaded + agent.toml MISSING -> GATE_MAX_REVIEWERS stays 6 (never invents a cap, does not abort under set -e)"; has "$out" "UNREADABLE" "and says so"
+  mv "$C/agents/gate-reviewer/agent.toml.off" "$C/agents/gate-reviewer/agent.toml"
+  out="$(PATH="$SEDFAIL:$PATH" POOL_CEILING_LIB="$TMPROOT/no-such-lib.sh" gate_clamp 6)"
+  has "$out" "MAX=6" "lib NOT loaded + sed FAILS on a readable agent.toml -> GATE_MAX_REVIEWERS stays 6 (survives set -euo pipefail)"; has "$out" "UNREADABLE" "and says so"
+  out="$(PATH="$SEDFAIL:$PATH" gate_clamp 6)"
+  has "$out" "MAX=2" "lib loaded + sed FAILS + fragment 2 -> the fragment's 2 (the lower bound it could read)"
   # order: the clamp runs AFTER the loader, or it would always take the fallback
   l_end=$(grep -n 'SELFTEST-EXTRACT pool-ceiling-loader: END' "$GATE" | head -1 | cut -d: -f1)
   l_call=$(grep -n '^_gate_clamp_to_engine_cap$' "$GATE" | head -1 | cut -d: -f1)
