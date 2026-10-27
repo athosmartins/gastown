@@ -719,13 +719,15 @@ st="$(POOL_CEILING_STATE_DIR="$TMPROOT/st.status" POOL_CEILING_SHADOW=0 pool_cei
 has "$st" "modo: APLICANDO" "shadow off -> 'modo: APLICANDO'"
 
 echo "== 10d. edges the hq-mutants sweep showed no case reached (ga-lwbl088): boundaries, knob fallbacks, live readers, return codes"
-# Each case below fails against one one-token break of pool-ceiling.sh that every other case here let through. Four such breaks are NOT covered, because no input tells them
+# Each case below fails against one one-token break of pool-ceiling.sh that every other case here let through. Six such breaks are NOT covered, because no input tells them
 # apart from the original:
 #   pool_ceiling_decide `[ "$#" -ge 5 ]` -> `-gt`: a 5th argument makes `shift "$#"` shift 5 as well, so the same arguments are left either way.
 #   pool_ceiling_decide `[ "$cur" -le "$max" ]` -> `-lt` and _pc_engine_ceil `[ "$v" -lt "$2" ]` -> `-le`: at equality the other branch assigns the same number. They differ
 #   only when a number is written with a leading zero (03 for 3, so the text printed differs), which a TOML integer cannot be.
 #   _pc_log_append `mv ... || true` -> `&& true`: a failed rotation is not the last command of the `&&` list, so set -e does not fire, and the function still ends in `return 0`
 #   (measured on bash 3.2 and 5).
+#   pool_ceiling_bounds `[ "$POOL_CEILING_MAX" -ge "$POOL_CEILING_MIN" ]` -> `-gt` and pool_ceiling_step `[ "$min" -le "$max" ]` -> `-lt` (the clamp after the engine cap): at equality
+#   the other branch assigns the same number, for the same reason as the decide clamp above.
 eq "$(pool_ceiling_class_swap 5000 4096 20000)" "grow" "swap used exactly AT the grow limit (4096 MB) is still grow: only ABOVE it holds"
 eq "$(pool_ceiling_class_swap 5000 4097 20000)" "hold" "one MB above the grow limit -> hold"
 eq "$(POOL_CEILING_DISK_GROW_MARGIN_GB=0 pool_ceiling_class_disk 9216)" "grow" "a valid disk margin knob (0) is honoured: 9 GB free is over warn 8 + 0 -> grow, not reset to the default 4"
@@ -766,6 +768,87 @@ SD10="$TMPROOT/state-10d-clock0"; mkdir -p "$SD10"
 POOL_CEILING_STEP_SECS=60 POOL_CEILING_NOW=30 stp wa-worker 2 1 4 2 63 ok ok
 eq "$POOL_CEILING_RESULT" "3" "no stored stamp (at=0) is not a last step: a clock reading of 30 s, under the 60 s rate, still steps 2 -> 3"
 case "$POOL_CEILING_LOGLINE" in *ritmo*) bad "no state yet, yet the line reads as rate-limited: $POOL_CEILING_LOGLINE" ;; *) ok "...and the line is a step, not a rate-limit hold" ;; esac
+# A clock reading of 1 is a reading (only 0 or less is "unreadable"), and a stamp of 1 is a real last step (only 0 means "never stepped").
+SD10="$TMPROOT/state-10d-now1"; mkdir -p "$SD10"
+POOL_CEILING_STEP_SECS=60 POOL_CEILING_NOW=1 stp wa-worker 2 1 4 2 63 ok ok
+eq "$POOL_CEILING_RESULT" "3" "a clock reading of 1 s is a reading: the step 2 -> 3 happens"
+case "$POOL_CEILING_LOGLINE" in *relogio*) bad "a clock of 1 s read as unreadable: $POOL_CEILING_LOGLINE" ;; *) ok "...and the line is a step, not the unreadable-clock line" ;; esac
+SD10="$TMPROOT/state-10d-at1"; mkdir -p "$SD10"; printf 'ceiling=3\nat=1\n' > "$SD10/wa-worker.state"
+POOL_CEILING_STEP_SECS=60 POOL_CEILING_NOW=30 stp wa-worker 2 1 4 3 63 ok ok
+eq "$POOL_CEILING_RESULT" "3" "a stored stamp of 1 s is a last step: 30 s later is inside the 60 s rate, the stored 3 is held"
+has "$POOL_CEILING_LOGLINE" "ritmo" "...and the line says it was the rate limit"
+# A state directory that exists but cannot be written to is said out loud (mkdir -p succeeds on it, so only the writability test can see it).
+if [ "$(id -u)" = "0" ]; then echo "  - SKIPPED: read-only state dir case (running as root, chmod 555 does not stop a write)"
+else
+  SD10="$TMPROOT/state-10d-ro"; mkdir -p "$SD10"; chmod 555 "$SD10"
+  if [ -w "$SD10" ]; then echo "  - SKIPPED: read-only state dir case (chmod 555 did not make the directory read-only here)"
+  else
+    POOL_CEILING_STEP_SECS=60 POOL_CEILING_NOW=5000 stp wa-worker 2 1 4 2 63 ok ok
+    eq "$POOL_CEILING_RESULT" "2" "a state dir that exists but is read-only: the fixed ceiling stays"
+    has "$POOL_CEILING_LOGLINE" "nao gravavel" "...and the line says the state dir is not writable (not the later 'nao persistiu')"
+  fi
+  chmod 755 "$SD10"
+fi
+# Every branch of the pure decision returns 0: the dispatchers read it through $( ) under set -e.
+for dargs in "2 1 4 2 63 load=squeeze" "1 1 4 2 63 load=squeeze" "2 1 4 2 abc" "2 1 4 2 0" "2 1 4 abc 63" "2 1 4 2 63 mem=banana" "2 1 4 2 63 dolt=hold" "2 1 4 1 63" "4 1 4 4 63" "2 1 4 2 63"; do
+  rc=0; pool_ceiling_decide $dargs >/dev/null || rc=$?
+  eq "$rc" "0" "decide returns 0 for: $dargs"
+done
+eq "$(pool_ceiling_class_swap 100 100 banana)" "unknown" "low free swap with an unreadable disk reading -> unknown (could not find out), not squeeze"
+rc=0; pool_ceiling_class_swap 100 100 banana >/dev/null || rc=$?
+eq "$rc" "0" "...and the swap classifier returns 0 on that branch too"
+# The Dolt classifier: a reading exactly AT its hot line is not hot, one above is, for the CPU and for the latency alike.
+eq "$(pool_ceiling_dolt_class 180 '' 180 2500)" "ok" "cpu exactly AT the hot line (180) -> ok: only above it is hot"
+eq "$(pool_ceiling_dolt_class 181 '' 180 2500)" "hot" "cpu one above the hot line -> hot"
+eq "$(pool_ceiling_dolt_class '' 2500 180 2500)" "ok" "latency exactly AT the hot line (2500) -> ok: only above it is hot"
+eq "$(pool_ceiling_dolt_class '' 2501 180 2500)" "hot" "latency one above the hot line -> hot"
+# A floor BELOW the min leaves the min alone: the floor only raises it.
+pool_ceiling_bounds gate-reviewer 1; eq "$POOL_CEILING_MIN..$POOL_CEILING_MAX" "2..6" "a floor below the min (1 under 2) leaves the min alone"
+pool_ceiling_bounds gate-reviewer 2; eq "$POOL_CEILING_MIN..$POOL_CEILING_MAX" "2..6" "a floor equal to the min leaves it as it is"
+pool_ceiling_bounds gate-reviewer abc; eq "$POOL_CEILING_MIN..$POOL_CEILING_MAX" "2..6" "a floor that is not a number is no floor"
+# The live readers over a sysctl that answers what the environment says, so the answer is the reader's and not the host's. A number is printed, anything else is EMPTY, and
+# every reader (the swap field helper included) returns 0.
+SYS="$TMPROOT/stub-sysctl"; mkdir -p "$SYS"
+cat > "$SYS/sysctl" <<'STUB'
+#!/bin/sh
+case "$2" in
+  hw.ncpu) printf '%s\n' "${STUB_NCPU-}" ;;
+  kern.memorystatus_vm_pressure_level) printf '%s\n' "${STUB_MEM-}" ;;
+  vm.swapusage) printf '%s\n' "${STUB_SWAP-}" ;;
+  *) exit 1 ;;
+esac
+STUB
+chmod +x "$SYS/sysctl"
+live_rd() { ( unset POOL_CEILING_T_NCPU POOL_CEILING_T_MEM POOL_CEILING_T_SWAP_FREE_MB POOL_CEILING_T_SWAP_USED_MB; PATH="$SYS:$PATH"; hash -r; "$@" ); }
+SWAPTXT='total = 2048.00M  used = 1130.75M  free = 917.25M  (encrypted)'
+eq "$(STUB_NCPU=8 live_rd pool_ceiling_read_ncpu)" "8" "the live ncpu reader prints what sysctl says when it is a number"
+eq "$(STUB_NCPU=abc live_rd pool_ceiling_read_ncpu)" "" "...and nothing when it is not a number (never the garbage)"
+eq "$(STUB_MEM=2 live_rd pool_ceiling_read_mem_pressure)" "2" "the live memory-pressure reader prints the level when it is a number"
+eq "$(STUB_MEM=abc live_rd pool_ceiling_read_mem_pressure)" "" "...and nothing when it is not a number"
+eq "$(STUB_SWAP="$SWAPTXT" live_rd pool_ceiling_read_swap_free_mb)" "917" "the live swap-free reader takes the free field of vm.swapusage, whole MB"
+eq "$(STUB_SWAP="$SWAPTXT" live_rd pool_ceiling_read_swap_used_mb)" "1130" "the live swap-used reader takes the used field, whole MB"
+eq "$(STUB_SWAP='nothing useful' live_rd pool_ceiling_read_swap_free_mb)" "" "an unparseable vm.swapusage reads as empty, never as 0"
+for rdr in "pool_ceiling_read_ncpu" "pool_ceiling_read_mem_pressure" "pool_ceiling_read_swap_free_mb" "pool_ceiling_read_swap_used_mb" "_pc_swap_field free" "_pc_swap_field used"; do
+  rc=0; STUB_NCPU=8 STUB_MEM=2 STUB_SWAP="$SWAPTXT" live_rd $rdr >/dev/null || rc=$?
+  eq "$rc" "0" "$rdr returns 0 on a reading"
+  rc=0; STUB_NCPU=abc STUB_MEM=abc STUB_SWAP='nothing useful' live_rd $rdr >/dev/null || rc=$?
+  eq "$rc" "0" "$rdr returns 0 on a reading it cannot parse"
+done
+# The queue reader returns 0 when the file is missing and when it reads one.
+rc=0; pool_ceiling_queue_from_dispatchable "$TMPROOT/q10d.nao-existe.json" whatsapp_automation 2000000000 >/dev/null || rc=$?
+eq "$rc" "0" "the queue reader returns 0 for a missing file"
+rc=0; ( PATH="$STUB:$PATH"; hash -r; pool_ceiling_queue_from_dispatchable "$TMPROOT/q10d.json" whatsapp_automation 2000000000 >/dev/null ) || rc=$?
+eq "$rc" "0" "...and for a file it reads"
+# The calibration-log append is silent when there is nowhere to write: no log configured, or a directory that cannot be made. A write that fails reports on the stderr
+# the caller did not ask for, because a redirection that fails is reported before the 2>/dev/null after it applies.
+LOGARGS="100 wa-worker 2 2 3 up queue+slack 63 2 1 1 1 1 1 1 ok ok 1"
+err="$( ( unset POOL_CEILING_LOG GC_CITY; _pc_log_append $LOGARGS ) 2>&1 )"
+eq "$err" "" "no log configured: the append says nothing"
+: > "$TMPROOT/notadir"
+err="$( ( POOL_CEILING_LOG="$TMPROOT/notadir/sub/pool-ceiling.log"; _pc_log_append $LOGARGS ) 2>&1 )"
+eq "$err" "" "a log directory that cannot be made: the append says nothing"
+rc=0; ( POOL_CEILING_LOG="$TMPROOT/notadir/sub/pool-ceiling.log"; _pc_log_append $LOGARGS ) >/dev/null 2>&1 || rc=$?
+eq "$rc" "0" "...and it returns 0"
 unset POOL_CEILING_T_LOAD5 POOL_CEILING_T_NCPU POOL_CEILING_T_MEM POOL_CEILING_T_SWAP_FREE_MB POOL_CEILING_T_SWAP_USED_MB POOL_CEILING_T_DISK_FREE_MB
 
 echo "== 11. hermetic: this run did not touch the real city's calibration log or state dir"

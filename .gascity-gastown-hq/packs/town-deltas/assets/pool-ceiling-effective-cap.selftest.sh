@@ -113,6 +113,12 @@ out="$(POOL_CEILING_ENGINE_SH="$TMPROOT/does-not-exist.sh" resolve gate-reviewer
 eq "$(cap_of "$out")" "cap=2 base=3 doubt=1" "the engine's reader MISSING while a fragment exists -> the floor 2 (the lib's own table), doubt=1"; has "$out" "indisponivel" "the note says the reader is unavailable"
 out="$(POOL_CEILING_ENGINE_SH="$SELF_DIR/pool-ceiling.sh" resolve gate-reviewer)"
 eq "$(cap_of "$out")" "cap=2 base=3 doubt=1" "a reader that does not define pce_fragment_parse -> the floor 2, doubt=1 (a broken reader is not 'no entry')"
+has "$out" "rc=4" "...and the note says the reader loaded without the parser (rc=4)"
+# a reader that DOES define the parser but whose load fails (its last command exits 1): half-loaded is not loaded, so the answer is the same doubt, with its own code
+printf 'pce_fragment_parse() { echo "gate-reviewer=2"; }\nfalse\n' > "$TMPROOT/engine-load-fails.sh"
+out="$(POOL_CEILING_ENGINE_SH="$TMPROOT/engine-load-fails.sh" resolve gate-reviewer)"
+eq "$(cap_of "$out")" "cap=2 base=3 doubt=1" "a reader that defines the parser but whose load FAILS -> the floor 2, doubt=1 (its 2 is not trusted)"
+has "$out" "rc=3" "...and the note says the reader did not load (rc=3)"
 
 # agent.toml unreadable
 frag "gate-reviewer=2"; mv "$C/agents/gate-reviewer/agent.toml" "$C/agents/gate-reviewer/agent.toml.off"
