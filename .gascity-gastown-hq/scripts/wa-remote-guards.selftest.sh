@@ -9,6 +9,9 @@
 # CASOS    Cada guard bloqueia o que tem de bloquear; "não consegui saber" (git que falha, guard que levanta exceção, forma outra, árvore ilegível) NUNCA vira passou; o código que roda é o de origin/main e NUNCA o do sha
 #          (um sha que sobrescreve os 6 arquivos de confiança com versões hostis não deixa rastro e continua bloqueado); só o que os guards leem é exportado (dado de lead não é copiado).
 # MUTANTES Cada guarda apagada do executável tem de reprovar o caso que a prova ("teste que só passa não prova nada").
+# UNIDADE  O que o CLI nunca produz — caminho com NUL ou "..", tamanhos que estouram o teto, disco no limite exato, cabeçalho do cat-file torto, registro de formas que a árvore real não tem, gitlink no ls-tree — é provado chamando a MESMA função do
+#          executável com a entrada montada (o git vira um falso que devolve o lote pedido; o disco, um número). Cada caso diz PASS/FAIL na saída e o bash só confere a linha.
+# EQUIVALENTE (ga-u6ueg0q)  `nl >= 0` no cabeçalho do cat-file: trocar por `nl >= 1` ou `nl > 0` não muda nada. nl só vale 0 quando a saída começa por quebra de linha, e raw[0:0].split() já é [] — o mesmo que o ramo else: os dois caminhos acabam em "não devolveu o blob".
 # CONTRATO Se o rig WA existe nesta máquina, os mesmos casos centrais rodam com os guards REAIS (lidos de origin/main do rig, sem tocar nele): é o que denuncia deriva de interface. Sem o rig: SKIP dito em voz alta.
 #
 # Uso: bash scripts/wa-remote-guards.selftest.sh   (FAILFAST=1 para no 1º caso que reprova; WA_REAL_RIG=<pasta> aponta o rig)
@@ -114,10 +117,164 @@ one_result() { [ "$(grep -c 'RESULT=' "$T/out")" = 1 ]; }
 no_trace() { [ ! -e "$TRACE" ]; }
 no_leftover() { [ -z "$(ls "$T/tmp" 2>/dev/null)" ]; }   # nada de wa-remote-guards-* sobrando no TMPDIR
 
+rep() { head -c "$1" /dev/zero | tr '\0' "$2"; }   # rep N c: N vezes o caractere c
+mkdir -p "$T/unit-tmp"
+cat > "$T/unit.py" <<'PYEOF'
+import importlib.util, os, sys, tempfile, types
+sys.dont_write_bytecode = True
+exe, name, rig, sub = sys.argv[1:5]
+spec = importlib.util.spec_from_file_location("wa_remote_guards_under_test", exe)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+NAME = "APPROVED_SCHEDULED_PAID_DAEMONS"
+MIB = 1048576
+
+
+class Stop(Exception):
+    """O git falso levanta isto: chegar nele prova que o teto e o disco deixaram a exportação passar."""
+
+
+def unknown(fn, *a):
+    try:
+        fn(*a)
+    except m.Unknown as e:
+        return str(e)
+    raise AssertionError("não levantou Unknown")
+
+
+def ent(i, size, path=None, mode="100644"):
+    return m.Entry(mode, "%040x" % i, size, path or "lib/f%d.py" % i)
+
+
+def stop_git(*a, **kw):
+    raise Stop()
+
+
+def export(entries, free, git):
+    base = tempfile.mkdtemp(prefix="wrg-unit.")
+    m.shutil = types.SimpleNamespace(disk_usage=lambda p: types.SimpleNamespace(free=free))
+    m.git = git
+    return m.export_tree("repo", entries, m.Path(base) / "tree"), base
+
+
+def gets_to_git(entries, free):
+    try:
+        export(entries, free, stop_git)
+    except Stop:
+        return
+    raise AssertionError("a exportação parou antes do git")
+
+
+def c_check_path():
+    for p in ("/abs.py", "a\0b.py", "a/../b.py", "a//b.py", "a/./b.py", "a/.git/c.py", ".git/config.py", "../x.py"):
+        try:
+            m.check_path(p)
+        except m.Unknown:
+            continue
+        raise AssertionError("aceitou %r" % p)
+    for p in ("a/b.py", "lib/x.py", "a.b/c.py", ".github/x.py"):
+        m.check_path(p)
+
+
+def c_total():
+    full = [ent(i, 8 * MIB) for i in range(50)]
+    gets_to_git(full, 1 << 60)
+    msg = unknown(export, full + [ent(50, 1)], 1 << 60, stop_git)
+    assert msg == "419430401 bytes a exportar (> 419430400)", msg
+
+
+def c_disk():
+    one = [ent(1, 3 * MIB + 5)]
+    gets_to_git(one, 3 * MIB + 5 + 512 * MIB)
+    msg = unknown(export, one, 3 * MIB + 5 + 512 * MIB - 1, stop_git)
+    assert msg == "disco com 515 MB livres para exportar 3 MB (margem 512 MB)", msg
+
+
+def c_batch():
+    entries = [ent(i, 3) for i in range(401)]
+    calls = []
+
+    def git(repo, *args, inp=None, timeout=0):
+        assert args == ("cat-file", "--batch"), args
+        oids = inp.decode().split()
+        calls.append(len(oids))
+        return b"".join(("%s blob 3\nabc\n" % o).encode() for o in oids)
+
+    stats, base = export(entries, 1 << 60, git)
+    assert calls == [400, 1], calls
+    assert stats == {"files": 401, "bytes": 1203}, stats
+    lib = os.path.join(base, "tree", "lib")
+    assert len(os.listdir(lib)) == 401
+    assert open(os.path.join(lib, "f400.py"), "rb").read() == b"abc"
+
+
+def c_header():
+    e = ent(7, 3, "lib/a.py")
+    stats, _ = export([e], 1 << 60, lambda *a, **kw: ("%s blob 3\nabc\n" % e.oid).encode())
+    assert stats == {"files": 1, "bytes": 3}, stats
+    for label, raw in (
+        ("dois campos", ("%s blob\n" % e.oid).encode()),
+        ("oid outro", ("%s blob 3\nabc\n" % ("f" * 40)).encode()),
+        ("tipo outro", ("%s tree 3\nabc\n" % e.oid).encode()),
+        ("sem quebra de linha", b""),
+    ):
+        msg = unknown(export, [e], 1 << 60, (lambda r: (lambda *a, **kw: r))(raw))
+        assert msg.startswith("cat-file não devolveu o blob de 'lib/a.py'"), (label, msg)
+
+
+def c_entries():
+    got = {e.path: e for e in m.tree_entries(rig, sub)}
+    assert got["lib/sub.py"].mode == "160000" and got["lib/sub.py"].size == 0, got["lib/sub.py"]
+    assert got["lib/x.py"].size == 6, got["lib/x.py"]
+
+
+def c_registry():
+    R = m.registry_labels
+    V = NAME + ' = {"a": {}, "b": {}}\n'
+    assert R('"""d"""\n' + V) == {"a", "b"}
+    assert R(V) == {"a", "b"}
+    assert R('"""d"""\nfrom __future__ import annotations\n' + NAME + ': dict = {"a": {}}\n') == {"a"}
+    assert R('"""d"""\n' + NAME + " = {}\n") == set()
+    for label, text, frag in (
+        ("duas docstrings", '"""a"""\n"""b"""\n' + V, "tem código além"),
+        ("chamada primeiro", "print(1)\n" + V, "tem código além"),
+        ("import que não é __future__", "from os import path\n" + V, "tem código além"),
+        ("outro nome", 'OTHER = {"a": {}}\n', "tem código além"),
+        ("atribuição repetida", V + V, "tem código além"),
+        ("valor que não é dict", NAME + " = []\n", "tem código além"),
+        ("sem a atribuição", '"""d"""\n', "não define"),
+    ):
+        msg = unknown(R, text)
+        assert frag in msg, (label, msg)
+
+
+try:
+    globals()["c_" + name]()
+except Exception as e:
+    print("FAIL %s: %s: %s" % (name, type(e).__name__, e))
+    sys.exit(1)
+print("PASS %s" % name)
+PYEOF
+uc() {  # uc NOME: um caso de unidade contra o executável da vez ($EXE); a linha PASS NOME é o veredito
+  ( cd "$T" && env -i HOME="$T/home" PATH="$PATH_RUN" TMPDIR="$T/unit-tmp" LANG=en_US.UTF-8 "$PY" -I -B "$T/unit.py" "$EXE" "$1" "$RIG" "${S_SUB:-}" ) > "$T/out" 2> "$T/err"; grep -qx "PASS $1" "$T/out"; }
+# a exportação do próprio main mede quantos bytes e arquivos os guards leem; um sha com o complemento até um múltiplo de 1024 deixa o "N KB" do relatório sem arredondamento (um divisor errado erra por 1 KB)
+SHA=$MAIN; runx -- --scratch "$T/sc-kb0"; KB0=$(find "$T/sc-kb0/tree" -type f -exec cat {} + | wc -c | tr -d ' '); KBF=$(find "$T/sc-kb0/tree" -type f | wc -l | tr -d ' ')
+mk "kb-redondo" 'head -c $((2048 - KB0 % 1024)) /dev/zero | tr "\0" a > lib/pad.py'; S_KB=$SHA
+KB_EXPECT=$(( (KB0 + 2048 - KB0 % 1024) / 1024 ))
+# a ref de confiança em que cada guard falha com uma mensagem de 200 letras: o relatório carrega só as 120 primeiras
+mk "erros-longos" 'printf "raise ValueError(\"%s\")\n" "$(rep 200 d)" > lib/launchd_paid_guard.py; printf "def check(git_range, skipped=None):\n    raise RuntimeError(\"%s\")\n_REPO_ROOT = None\nsubprocess = None\n" "$(rep 200 a)" > scripts/check_mds_registry_guard.py; printf "def check(git_range, skipped=None):\n    raise RuntimeError(\"%s\")\n_REPO_ROOT = None\nsubprocess = None\n" "$(rep 200 b)" > scripts/check_ntfy_bypass_guard.py; printf "def check(src):\n    raise RuntimeError(\"%s\")\n" "$(rep 200 c)" > scripts/check_notify_action_prefix_guard.py'; git -C "$RIG" update-ref refs/remotes/origin/longerr "$SHA"
+mkdir -p "$T/shim2"
+cat > "$T/shim2/git" <<EOF
+#!/bin/sh
+case " \$* " in *" cat-file -t "*) echo "$(rep 200 x)" >&2; exit 128;; esac
+exec "$GITBIN" "\$@"
+EOF
+chmod +x "$T/shim2/git"
+
 # ══ casos: cada um devolve 0 quando o comportamento BOM aparece (os mutantes reusam as mesmas funções) ═════════════════════════════════════════════════
 case_clean() { SHA=$S_CLEAN; runx; [ "$RC" = 0 ] && res PASS && gl G12 PASS && gl G6 PASS && gl G7 PASS && gl G7b PASS && one_result && no_leftover && grep -q "sha=$S_CLEAN trusted=$MAIN" "$T/out"; }
 case_order() { SHA=$S_CLEAN; runx; [ "$(grep -oE '^wa-remote-guards: G[0-9a-z]+ ' "$T/out" | tr -d '\n')" = "wa-remote-guards: G12 wa-remote-guards: G6 wa-remote-guards: G7 wa-remote-guards: G7b " ]; }
-case_g12_blocks() { SHA=$S_PAID; runx; [ "$RC" = 1 ] && res BLOCKED && gl G12 BLOCKED && has "$T/out" "BLOQUEADO Label=com.fixture.paid" && has "$T/out" "Conserto:" && ! has "$T/out" "RESULT=PASS" && one_result && no_leftover; }
+case_g12_blocks() { SHA=$S_PAID; runx; [ "$RC" = 1 ] && res BLOCKED && gl G12 BLOCKED && has "$T/out" "BLOQUEADO Label=com.fixture.paid" && has "$T/out" "marcadores_pagos=PAID_API" && has "$T/out" "Conserto:" && ! has "$T/out" "RESULT=PASS" && one_result && no_leftover; }
 case_g12_approved_in_sha() { SHA=$S_PAID_OK; runx; [ "$RC" = 0 ] && res PASS && gl G12 PASS; }
 case_g12_registry_code() { SHA=$S_REG_CODE; rm -f "$TRACE"; runx; [ "$RC" = 2 ] && res UNKNOWN && gl G12 UNKNOWN && has "$T/out" "tem código além de uma atribuição literal" && no_trace && no_leftover; }
 case_g12_unreadable_plist() { SHA=$S_BADPLIST; runx; [ "$RC" = 2 ] && res UNKNOWN && gl G12 UNKNOWN && has "$T/out" "plist alterado neste sha que o scanner não conseguiu ler (launchd/com.fixture.quebrado.plist; 1 no total)"; }
@@ -166,6 +323,24 @@ case_usage() { SHA=$S_CLEAN; ( cd "$T" && env -i PATH="$PATH_RUN" "$PY" -I -B "$
   [ "$r1" = 2 ] && [ "$r2" = 2 ] && [ "$r3" = 2 ] && res_unknown_any; }
 mk "colide" '' 'h1=$(printf a | git hash-object -w --stdin); h2=$(printf b | git hash-object -w --stdin); git update-index --add --cacheinfo 100644,$h1,lib/Dup.py; git update-index --add --cacheinfo 100644,$h2,lib/dup.py'; S_CASE=$SHA
 
+mk "gitlink" '' 'git update-index --add --cacheinfo 160000,0123456789012345678901234567890123456789,lib/sub.py'; S_SUB=$SHA
+case_u_check_path() { uc check_path; }
+case_u_total() { uc total; }
+case_u_disk() { uc disk; }
+case_u_batch() { uc batch; }
+case_u_header() { uc header; }
+case_u_entries() { uc entries; }
+case_u_registry() { uc registry; }
+case_cut_120() { SHA=$S_CLEAN; runx -- --trusted-ref refs/remotes/origin/longerr; [ "$RC" = 2 ] && grep -qE "ValueError: d{120}\)$" "$T/out" && grep -qE "G6 levantou RuntimeError: a{120}$" "$T/out" && grep -qE "G7 levantou RuntimeError: b{120}$" "$T/out" && grep -qE "G7b levantou RuntimeError: c{120}$" "$T/out"; }
+case_sha_long() { SHA=$(rep 60 a); runx; [ "$RC" = 2 ] && has "$T/out" "recebi '$(rep 50 a)'" && grep -qxF "wa-remote-guards: RESULT=UNKNOWN sha=$(rep 40 a) trusted=?" "$T/out"; }
+case_sha_blob() { SHA=$BLOB; runx; [ "$RC" = 2 ] && has "$T/out" "${BLOB:0:12} não é um commit do rig"; }
+case_git_stderr_cut() { SHA=$S_CLEAN; runx PATH="$T/shim2:$PATH_RUN"; [ "$RC" = 2 ] && grep -qE "git cat-file -t [0-9a-f]{40}: rc=128: x{160}$" "$T/out"; }
+case_export_line() { SHA=$S_KB; runx; [ "$RC" = 0 ] && has "$T/out" "sha=${S_KB:0:12} guards de confiança=refs/remotes/origin/main@${MAIN:0:12} exportados=$((KBF + 1)) arquivo(s) $KB_EXPECT KB em "; }
+case_usage_required() {
+  ( cd "$T" && env -i PATH="$PATH_RUN" "$PY" -I -B "$EXE" --sha "$S_CLEAN" ) >"$T/out" 2>"$T/err"; local r1=$? e1; e1=$(cat "$T/err")
+  ( cd "$T" && env -i PATH="$PATH_RUN" "$PY" -I -B "$EXE" --repo "$RIG" ) >"$T/out" 2>"$T/err"; local r2=$? e2; e2=$(cat "$T/err")
+  [ "$r1" = 2 ] && [ "$r2" = 2 ] && [[ "$e1" == *"required: --repo"* ]] && [[ "$e2" == *"required: --sha"* ]]
+}
 ck() { case_$1; ok $? "$2"; }
 ck clean "limpo: rc 0, os 4 guards PASS, certificado RESULT=PASS com o sha e a confiança (40 hex), uma só linha RESULT, TMPDIR limpo"
 ck order "a ordem do Mayor: G12 (dinheiro), G6, G7, G7b"
@@ -201,6 +376,19 @@ ck local_branch_decoy "um branch LOCAL chamado origin/main não vira a confianç
 ck own_tmp_removed "sem --scratch: a pasta temporária própria é removida, inclusive quando BLOQUEIA ou NÃO SEI"
 ck scratch_kept_and_not_reused "com --scratch: a pasta fica para quem a criou recolher, e uma sobra de outra execução é recusada"
 ck usage "uso errado, --sha ausente e repo que não é repo → rc 2"
+ck usage_required "--repo e --sha são obrigatórios: sem um deles o argparse recusa e diz qual (não sobra um erro interno qualquer com rc 2)"
+ck u_check_path "caminho com / inicial, NUL, '', '.', '..' ou .git é recusado; caminho comum não"
+ck u_total "o teto de 400 MiB exportados: 400 MiB exatos seguem, 1 byte a mais é recusado com os dois números na mensagem"
+ck u_disk "a margem de 512 MiB de disco: free == total + margem segue, 1 byte a menos é recusado, e a mensagem dá MB livres, MB a exportar e a margem"
+ck u_batch "401 blobs saem em dois lotes do cat-file (400 e 1), todos gravados na mesma pasta (a pasta repetida não é erro)"
+ck u_header "cabeçalho do cat-file com 2 campos, oid outro, tipo que não é blob ou sem quebra de linha → NÃO SEI do blob, nunca gravado"
+ck u_entries "ls-tree: o gitlink (tamanho '-') vira 0 e o blob comum traz o tamanho dele"
+ck u_registry "registro lido sem executar: docstring opcional, __future__ ignorado, uma só atribuição literal de dict; o resto (2ª docstring, chamada, outro import, outro nome, repetida, não-dict, ausente) → NÃO SEI"
+ck cut_120 "a mensagem de exceção do guard de confiança (G12 ao carregar, G6, G7, G7b ao rodar) entra no relatório cortada em 120 caracteres"
+ck sha_long "--sha de 60 letras: a mensagem cita só as 50 primeiras e o RESULT as 40 primeiras"
+ck sha_blob "--sha de 40 hex que não é commit (um blob): a mensagem cita os 12 primeiros"
+ck git_stderr_cut "git que falha com 200 letras no stderr: o NÃO SEI leva as 160 primeiras"
+ck export_line "a linha da exportação: sha e confiança com 12 hex, número de arquivos e KB sem arredondar (total múltiplo de 1024)"
 
 # ══ mutantes ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
 mutant() {  # mutant NOME CASO 'trecho' 'troca' ['trecho2' 'troca2']  — cada trecho existe UMA vez; o caso devolve 0 se o comportamento BOM aparece, então ≠ 0 = morto
@@ -244,6 +432,38 @@ mutant certificado-sem-confianca clean 'say(f"RESULT={result} sha={sha} trusted=
 mutant garantia-de-ordem order 'GUARDS = (("G12", guard_g12), ("G6", guard_g6), ("G7", guard_g7), ("G7b", guard_g7b))' 'GUARDS = (("G6", guard_g6), ("G12", guard_g12), ("G7", guard_g7), ("G7b", guard_g7b))'
 mutant uso-errado-vira-ok usage 'return 2 if e.code else 0' 'return 0'
 if [ "$CASEINS" = 1 ]; then mutant colisao-de-nome-sobrescreve case_collision 'os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW' 'os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW'; else echo "skip mutante da colisão de caixa: este disco distingue maiúscula"; fi
+mutant teto-total-maior u_total 'MAX_TOTAL = 400 * 1024 * 1024' 'MAX_TOTAL = 400 * 1025 * 1024'
+mutant margem-de-disco-maior u_disk 'DISK_MARGIN = 512 * 1024 * 1024' 'DISK_MARGIN = 513 * 1024 * 1024'
+mutant margem-de-disco-em-kb-errado u_disk 'DISK_MARGIN = 512 * 1024 * 1024' 'DISK_MARGIN = 512 * 1025 * 1024'
+mutant disco-no-limite-recusa u_disk 'if free < total + DISK_MARGIN:' 'if free <= total + DISK_MARGIN:'
+mutant disco-mensagem-mb-errado u_disk '{free // 1048576} MB livres para exportar {total // 1048576} MB (margem {DISK_MARGIN // 1048576} MB)' '{free // 1048577} MB livres para exportar {total // 1048577} MB (margem {DISK_MARGIN // 1048577} MB)'
+mutant lote-de-401 u_batch 'BATCH = 400' 'BATCH = 401'
+mutant pasta-repetida-erro u_batch 'dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)' 'dest.parent.mkdir(parents=True, exist_ok=False, mode=0o700)'
+mutant cabecalho-tipo-outro-passa u_header 'head[0].decode() != e.oid or head[1] != b"blob":' 'head[0].decode() != e.oid and head[1] != b"blob":'
+mutant cabecalho-curto-passa u_header 'if len(head) != 3 or head[0].decode()' 'if len(head) != 3 and head[0].decode()'
+mutant gitlink-com-tamanho u_entries '0 if size.strip() == "-" else int(size)' '1 if size.strip() == "-" else int(size)'
+mutant caminho-so-barra-e-nul-juntos u_check_path 'path.startswith("/") or "\0" in path or any(' 'path.startswith("/") and "\0" in path or any('
+mutant caminho-nul-so-com-partes u_check_path '"\0" in path or any(p in' '"\0" in path and any(p in'
+mutant registro-sem-docstring-pulado u_registry 'if i == 0 and isinstance(node, ast.Expr)' 'if i == 0 or isinstance(node, ast.Expr)'
+mutant docstring-em-qualquer-posicao u_registry 'isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)' 'isinstance(node, ast.Expr) or isinstance(node.value, ast.Constant)'
+mutant import-qualquer-pulado u_registry 'node.module == "__future__"' 'node.module != "__future__"'
+mutant outro-nome-aceito u_registry 'if target != REGISTRY_NAME or found is not None' 'if target != REGISTRY_NAME and found is not None'
+mutant valor-que-nao-e-dict-aceito u_registry 'or found is not None or not isinstance(value, ast.Dict)' 'or found is not None and not isinstance(value, ast.Dict)'
+mutant marcadores-pagos-vazios g12_blocks "i.get('paid_markers') or []" "i.get('paid_markers') and []"
+mutant carga-corta-em-121 cut_120 'não carregou ({type(e).__name__}: {safe(e)[:120]})' 'não carregou ({type(e).__name__}: {safe(e)[:121]})'
+mutant g6-corta-em-121 cut_120 'G6 levantou {type(e).__name__}: {safe(e)[:120]}' 'G6 levantou {type(e).__name__}: {safe(e)[:121]}'
+mutant g7-corta-em-121 cut_120 'G7 levantou {type(e).__name__}: {safe(e)[:120]}' 'G7 levantou {type(e).__name__}: {safe(e)[:121]}'
+mutant g7b-corta-em-121 cut_120 'G7b levantou {type(e).__name__}: {safe(e)[:120]}' 'G7b levantou {type(e).__name__}: {safe(e)[:121]}'
+mutant sha-citado-em-51 sha_long 'recebi {safe(sha)[:50]!r}' 'recebi {safe(sha)[:51]!r}'
+mutant resultado-com-41 sha_long 'RESULT=UNKNOWN sha={safe(a.sha)[:40]}' 'RESULT=UNKNOWN sha={safe(a.sha)[:41]}'
+mutant commit-citado-em-13 sha_blob '{sha[:12]} não é um commit do rig' '{sha[:13]} não é um commit do rig'
+mutant stderr-do-git-em-161 git_stderr_cut "strip())[:160]}" "strip())[:161]}"
+mutant linha-sha-em-13 export_line 'say(f"sha={sha[:12]} guards' 'say(f"sha={sha[:13]} guards'
+mutant linha-confianca-em-13 export_line '@{tsha[:12]} exportados=' '@{tsha[:13]} exportados='
+mutant linha-kb-por-1025 export_line "stats['bytes'] // 1024} KB" "stats['bytes'] // 1025} KB"
+mutant repo-opcional usage_required 'ap.add_argument("--repo", required=True)' 'ap.add_argument("--repo", required=False)'
+mutant sha-opcional usage_required 'ap.add_argument("--sha", required=True)' 'ap.add_argument("--sha", required=False)'
+
 
 # ══ contrato com os guards REAIS (lidos de origin/main do rig WA; o rig não é tocado) ═══════════════════════════════════════════════════════════════
 WA_REAL="${WA_REAL_RIG:-/Users/athos/gt/whatsapp_automation}"; WR=refs/remotes/origin/main
