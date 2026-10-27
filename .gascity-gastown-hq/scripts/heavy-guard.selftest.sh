@@ -323,7 +323,7 @@ echo "git \$*" > "$W/gitargs"
 [ -n "\$FAKE_GIT_LOCKDIR" ] && [ -d "\$FAKE_GIT_LOCKDIR" ] && echo held >> "$W/lockseen"
 [ -n "\$FAKE_GIT_DF" ] && echo "\$FAKE_GIT_DF" > "$W/dfnow"
 [ -n "\$FAKE_GIT_DFBAD" ] && : > "$W/dfbad"
-[ -n "\$FAKE_GIT_GRANDCHILD" ] && { "$PB/hook" >/dev/null 2>&1 & echo \$! > "$W/grandchild"; }
+[ -n "\$FAKE_GIT_GRANDCHILD" ] && ( "$PB/hook" >/dev/null 2>&1 & echo \$! > "$W/grandchild" )   # duplo-fork (ga-2d14tow): no grupo do push, mas reparentado, fora da cadeia de pais; só o TERM de grupo o alcança
 if [ -n "\$FAKE_GIT_TERM0" ]; then
   [ -n "\$FAKE_GIT_SLEEP" ] && { sleep "\$FAKE_GIT_SLEEP" & wait \$!; }
 elif [ -n "\$FAKE_GIT_SLEEP" ]; then
@@ -892,8 +892,9 @@ EOF
     [ -e "$W/wdone" ] || bad "watch: $1: the step was stopped at $n of 200 files (rc $rc), it must not be ($(head -c 300 "$W/werr"))"
   }
   if wwant core; then
-    wrun --what selftest-mutants --max-disk-drop-mb 4 -- sh -c 'bash "$0" "$@"; exit $?' "$W/wloop.sh" "$WF" "$W/wdone"
-    wstopped "a selftest label with --max-disk-drop-mb 4, the writer a grandchild of the step"
+    # the writer is double-forked from the step's leader (the leader sleeps): it stays in the step's process group but is no longer in its parent chain, so only the TERM to the GROUP reaches it
+    wrun --what selftest-mutants --max-disk-drop-mb 4 -- bash -c '( bash "$0" "$@" & ); sleep 30' "$W/wloop.sh" "$WF" "$W/wdone"
+    wstopped "a selftest label with --max-disk-drop-mb 4, the writer double-forked from the step (in its group, out of its parent chain)"
     grep -q 'fell' "$W/werr" && grep -q 'limit 4 MB' "$W/werr" || bad "watch: the drop refusal must say how far it fell and the limit ($(cat "$W/werr"))"
   fi
   if wwant escape; then
