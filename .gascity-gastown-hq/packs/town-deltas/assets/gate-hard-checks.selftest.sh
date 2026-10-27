@@ -109,7 +109,10 @@ branch_from "$R" main b_imp
 run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "CLAUDE.md (158 lines, its Contents fine) + the UNCHANGED docs/imp.md it imports = over 200: every .md must be extracted" fail
 has "and the violation is the 200-line rule" "200"
 branch_from "$R" main b_named; { printf '# T\n\n## Contents\n\n- A\n\n## A\n\n'; filler; } > "$R/CLAUDE.md"; TIP="$(commit_all "$R" claude-ok)"
-run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "a clean CLAUDE.md with an UNCHANGED link named .md in the tree: left out and counted, not a reason to give up" ok lint-limpo-sem-1-link-fora-do-diff
+run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "a clean CLAUDE.md with an UNCHANGED link named .md in the tree: a pass needs a whole tree (an @import may go through it)" nao-consegui-medir entrada-especial-fora-do-diff-1
+branch_from "$R" main b_tchg;  { printf '# T\n\n## Contents\n\n- A\n\n## A\n\n'; filler; } > "$R/CLAUDE.md"; rm -f "$R/docs/imp.md"; ln -s ok.md "$R/docs/imp.md"; TIP="$(commit_all "$R" type-change)"
+git -C "$R" diff --name-status "$MAIN" "$TIP" | grep -q '^T[[:space:]]docs/imp.md' && ok "(fixture: docs/imp.md really is a type change, status T)" || bad "fixture: no T status in $(git -C "$R" diff --name-status "$MAIN" "$TIP" | tr '\n' '|')"
+run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "a file that changes TYPE into a link counts as changed, even though the lint's own filter skips T: refused" nao-consegui-medir extracao-tip
 # upstream/main holds docs/upstream.md only: the lint skips a file that exists upstream, which needs the REAL refs (GIT_DIR)
 blob="$(git -C "$R" rev-parse main:docs/upstream.md)"; inner="$(printf '100644 blob %s\tupstream.md\n' "$blob" | git -C "$R" mktree)"
 up="$(printf '040000 tree %s\tdocs\n' "$inner" | git -C "$R" mktree)"; git -C "$R" update-ref refs/remotes/upstream/main "$(git -C "$R" commit-tree "$up" -m up)"
@@ -184,6 +187,9 @@ run_sut 2d "$R" "$MAIN" "$STIP" ga-x;                      expect "a hand edit i
 has "the generator's own line reaches the refusal" "STALE"
 branch_from "$R" "$STIP" f_debt; printf '\nanother plain line\n' >> "$R/$HQ/agents/mila-wa/prompt.template.md"; DTIP="$(commit_all "$R" debt)"
 run_sut 2d "$R" "$STIP" "$DTIP" ga-x;                      expect "red on the base too: main's debt, recorded, never refused" debito-previo e12-vermelho-na-base-tambem
+branch_from "$R" main f_linkbase; mkdir -p "$R/$HQ/agents/zz-link"; ln -s ../dog-remote/prompt.template.md "$R/$HQ/agents/zz-link/prompt.template.md"; LB="$(commit_all "$R" link-base)"
+branch_from "$R" "$LB" f_link; printf '\nplain line\n' >> "$R/$HQ/agents/mila-wa/prompt.template.md"; LTIP="$(commit_all "$R" prompt-over-link-base)"
+run_sut 2d "$R" "$LB" "$LTIP" ga-x;                        expect "an untouched link among the prompts: a green E12 is not vouched for" nao-consegui-medir entrada-especial-fora-do-diff-1
 branch_from "$R" main f_tool;  printf '# changed\n' | put "$R" "$HQ/packs/town-deltas/assets/e12-arms.sh"; printf 'y\n' >> "$R/$HQ/agents/dog-remote/prompt.template.md"; TTIP="$(commit_all "$R" arms)"
 run_sut 2d "$R" "$MAIN" "$TTIP" ga-x;                      expect "a diff that edits e12-arms.sh (sourced by the generator) is not judged" nao-consegui-medir ferramenta-alterada-no-diff
 : > "$CITY/.gc/e12-coverage-gate.off"
