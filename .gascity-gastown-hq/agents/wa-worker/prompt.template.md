@@ -15,7 +15,8 @@ You are disposable. You do not carry state between runs. When your bead is done,
 <!-- ga-7nxfa1: never write a skill name with a leading slash anywhere in this file, not even in backticks.
      Claude Code turns a slash token that names a real skill into a skill_mention attachment at boot, the
      fresh worker runs that skill with no bead, and idles on a pool slot. Checked by
-     pool-prompt-skill-mention.selftest.sh: run it after editing this file, nothing runs it for you. -->
+     pool-prompt-skill-mention.selftest.sh: the gate guard runs it on every submission that touches a prompt
+     and refuses what turns it red (ga-gqtg1fs); run it yourself first, it takes under a second. -->
 
 ---
 

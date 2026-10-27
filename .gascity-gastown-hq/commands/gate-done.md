@@ -12,7 +12,7 @@ allowed-tools: Bash(git status:*), Bash(git push:*), Bash(git rev-parse:*), Bash
 • Pre-flight Self-Audit: THE THIRD STATE (mandatory — before you push)
 • Pre-flight Check: NEW READS NEED A FAILURE TEST (mechanical — before you push)
 • Step 1: Push your branch (fail-closed verification) · Step 2: Gather context
-• Step 2b: Pre-gate self-review (CLOSED — nothing to run while .gc/pregate.off exists)
+• Step 2b: Pre-gate self-review (CLOSED — nothing to run)
 • Step 3: Create the ready-for-gate marker · Step 4: Report · Common Issues
 
 Signal that your work is complete and ready to pass through the quality gate.
@@ -101,6 +101,8 @@ refused, as is one over 800 lines of production code. Guide: test lines <=
 code lines. If you are over, slice the bead (never drop the test that proves
 the behavior); a feature slice is born `-t feature`. Reviewers pass 81% of
 submissions up to 200 lines and 36% of those over 800.
+
+**If your diff touches an agent prompt, a template fragment, `city.toml`, or adds or renames a skill or command (ga-gqtg1fs), run the skill-token detector first:** `bash .gascity-gastown-hq/packs/town-deltas/assets/pool-prompt-skill-mention.selftest.sh` (under a second). A slash glued to the name of a real skill or command in a boot prompt makes Claude Code attach a skill_mention at boot, and a pool worker then runs that skill with no bead and idles on a pool slot (ga-7nxfa1). The guard re-runs it about 2 minutes after you submit whenever the diff touches one of those files, and refuses the marker with `gate-status:error` only when YOUR diff turned it red (its comment names the prompt and the line). Red on main already is recorded, not refused. A diff that edits the detector itself is not judged by it (the reviewers read that diff), so run it by hand then.
 
 ## Pre-flight Self-Audit: THE THIRD STATE (mandatory — before you push)
 
