@@ -35,6 +35,15 @@
 #   3. Drift guards on the live script — placement, wiring, ordering, and
 #      that arm A genuinely never reaches the worktree machinery.
 #
+# ga-hlcfzx9 (portability repairs): a test that is red ONLY on the Linux node and green on
+# the mini before and after (ga-9s361xi) is accepted as consertou-portabilidade when the
+# source bead DECLARES it (label teste:portabilidade-os) AND the node MEASURES it (base's
+# copy red there, the branch's copy green there). Layer 1 covers the verdict word, the node
+# rc classes and the declaration read (a fake `bd`); layer 2 covers the node probe with a
+# fake mbp-run.sh and the acceptance matrix (a repair is accepted; a test green on BOTH
+# systems, an undeclared repair and every case the node cannot answer are not refused for
+# the wrong reason); layer 3 pins the wiring and that no code line picks anything by bead id.
+#
 # Exit 0 iff every assertion holds.
 
 set -uo pipefail
@@ -189,6 +198,159 @@ else
 
   eq "unparseable detected + a repaired count -> nao-consegui-medir (still not sem-teste-novo)" \
     "$(gate_base_test_verdict "" 0 0 0 1 0)" "nao-consegui-medir"
+
+  # ── ga-hlcfzx9: portability-aware verdict (arg 7 = portable) ──
+  # A test red only on ANOTHER OS passes on the mini in both forms, so no mini-side
+  # count can ever call it a repair. The 7th count is the node-measured one.
+  echo "  -- gate_base_test_verdict: portability-aware (ga-hlcfzx9) --"
+
+  eq "1 file, node-measured portability repair (portable=1) -> consertou-portabilidade" \
+    "$(gate_base_test_verdict 1 1 1 0 0 0 1)" "consertou-portabilidade"
+
+  eq "portable=0 stated explicitly -> still passou-na-base (green on both systems stays refused)" \
+    "$(gate_base_test_verdict 1 1 1 0 0 0 0)" "passou-na-base"
+
+  eq "legacy 6-arg call (no portable) -> passou-na-base, byte-for-byte the pre-ga-hlcfzx9 answer" \
+    "$(gate_base_test_verdict 1 1 1 0 0 0)" "passou-na-base"
+
+  eq "legacy 4-arg call (no repaired/unclassified/portable) -> passou-na-base" \
+    "$(gate_base_test_verdict 1 1 1 0)" "passou-na-base"
+
+  eq "precedence: a file that FAILS on base beats a portability repair -> reprovou-na-base (existing meaning untouched)" \
+    "$(gate_base_test_verdict 2 2 2 1 0 0 1)" "reprovou-na-base"
+
+  eq "precedence: a mini-side repair beats a portability repair -> consertou-teste-vermelho (the older, stronger proof keeps its word)" \
+    "$(gate_base_test_verdict 2 2 2 0 1 0 1)" "consertou-teste-vermelho"
+
+  eq "portability repair + an unclassifiable sibling -> consertou-portabilidade (positive evidence present, both non-blocking)" \
+    "$(gate_base_test_verdict 2 2 2 0 0 1 1)" "consertou-portabilidade"
+
+  eq "portability repair + a sibling that is green on both systems (portable=1, rest uncounted) -> consertou-portabilidade (one discriminating file is enough, same rule as the others)" \
+    "$(gate_base_test_verdict 2 2 2 0 0 0 1)" "consertou-portabilidade"
+
+  eq "portable count present-but-EMPTY -> nao-consegui-medir, not collapsed to 0 (erro==vazio: 0 would refuse)" \
+    "$(gate_base_test_verdict 1 1 1 0 0 0 "")" "nao-consegui-medir"
+
+  eq "portable count non-numeric -> nao-consegui-medir, not collapsed to 0" \
+    "$(gate_base_test_verdict 1 1 1 0 0 0 abc)" "nao-consegui-medir"
+
+  eq "portable count negative-looking ('-1') -> nao-consegui-medir" \
+    "$(gate_base_test_verdict 1 1 1 0 0 0 -1)" "nao-consegui-medir"
+
+  eq "portable > detected (impossible counts) -> nao-consegui-medir, inconsistent input is not evidence" \
+    "$(gate_base_test_verdict 1 1 1 0 0 0 2)" "nao-consegui-medir"
+
+  eq "repaired + unclassified + portable > detected (each fits alone, the SUM does not) -> nao-consegui-medir" \
+    "$(gate_base_test_verdict 2 2 2 0 1 1 1)" "nao-consegui-medir"
+
+  eq "partial measurement wins over a portability claim (2 detected, 1 copied) -> nao-consegui-medir" \
+    "$(gate_base_test_verdict 2 1 1 0 0 0 1)" "nao-consegui-medir"
+
+  eq "no test files + a stray portable count -> sem-teste-novo (detected=0 still short-circuits)" \
+    "$(gate_base_test_verdict 0 0 0 0 0 0 1)" "sem-teste-novo"
+
+  eq "unparseable detected + a portable count -> nao-consegui-medir (still not sem-teste-novo)" \
+    "$(gate_base_test_verdict "" 0 0 0 0 0 1)" "nao-consegui-medir"
+
+  eq "an unclassified file and NO positive evidence -> nao-consegui-medir (portable=0 does not turn doubt into a refusal)" \
+    "$(gate_base_test_verdict 1 1 1 0 0 1 0)" "nao-consegui-medir"
+fi
+
+# ── ga-hlcfzx9: the pure rc classifier, and the declaration read ─────────────
+if ! type gate_base_test_node_rc_class >/dev/null 2>&1 \
+   || ! type gate_base_test_portability_declared >/dev/null 2>&1 \
+   || ! type gate_base_test_node_state >/dev/null 2>&1; then
+  bad "FATAL: gate_base_test_node_rc_class / _portability_declared / _node_state not all defined after LIB_ONLY sourcing (ga-hlcfzx9)"
+else
+  echo "  -- gate_base_test_node_rc_class (ga-hlcfzx9) --"
+  # What one run of a selftest on the Linux node means. Only a PROVEN red may be "red":
+  # 96..99 are mbp-run.sh saying "the node did not run it", 124 a timeout, >=128 a signal.
+  for _rc in 0; do
+    eq "node rc $_rc -> green" "$(gate_base_test_node_rc_class "$_rc")" "green"
+  done
+  for _rc in 1 2 3 50 95; do
+    eq "node rc $_rc (the selftest's own failure, propagated) -> red" "$(gate_base_test_node_rc_class "$_rc")" "red"
+  done
+  for _rc in 126 127; do
+    eq "node rc $_rc (a command in it could not be executed / found there: the very ga-9s361xi failure) -> red" \
+      "$(gate_base_test_node_rc_class "$_rc")" "red"
+  done
+  for _rc in 96 97 98 99; do
+    eq "node rc $_rc (mbp-run.sh: node off / paused / unhealthy / busy / usage — the test never ran there) -> unknown, NOT red" \
+      "$(gate_base_test_node_rc_class "$_rc")" "unknown"
+  done
+  eq "node rc 124 (timeout: would it have failed or only needed longer?) -> unknown, NOT red" \
+    "$(gate_base_test_node_rc_class 124)" "unknown"
+  for _rc in 100 125 128 130 137 143 255 256 999; do
+    eq "node rc $_rc (signal / out of the convention) -> unknown" "$(gate_base_test_node_rc_class "$_rc")" "unknown"
+  done
+  eq "node rc EMPTY -> unknown (erro==vazio: not green, not red)" "$(gate_base_test_node_rc_class "")" "unknown"
+  eq "node rc non-numeric -> unknown" "$(gate_base_test_node_rc_class abc)" "unknown"
+  eq "node rc '-1' -> unknown" "$(gate_base_test_node_rc_class -1)" "unknown"
+  eq "node rc '1.5' -> unknown" "$(gate_base_test_node_rc_class 1.5)" "unknown"
+  eq "node rc with leading zeros ('007', '08' — must not be read as octal) -> red" \
+    "$(gate_base_test_node_rc_class 007)$(gate_base_test_node_rc_class 08)" "redred"
+  eq "node rc classifier always exits 0 (safe under the guard's set -e)" \
+    "$(gate_base_test_node_rc_class 137 >/dev/null; echo $?)" "0"
+
+  echo "  -- gate_base_test_portability_declared (ga-hlcfzx9) --"
+  # A fake `bd` on PATH: prints the file named by FAKE_BD_OUT_FILE, exits FAKE_BD_RC, and logs its
+  # arguments, so the test can see both what the function was told and what it asked bd.
+  _PT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/gate-hlcfzx9-decl.XXXXXX")
+  mkdir -p "$_PT_DIR/bin" "$_PT_DIR/empty"
+  cat > "$_PT_DIR/bin/bd" <<'FAKEBDEOF'
+#!/usr/bin/env bash
+echo "$*" >> "${FAKE_BD_LOG:-/dev/null}"
+[ -n "${FAKE_BD_OUT_FILE:-}" ] && cat "$FAKE_BD_OUT_FILE"
+exit "${FAKE_BD_RC:-0}"
+FAKEBDEOF
+  chmod +x "$_PT_DIR/bin/bd"
+  _decl() {  # _decl <json-or-@raw> [rc] [bead]  -> what the function answers for that bd output
+    printf '%s' "$1" > "$_PT_DIR/out.json"
+    PATH="$_PT_DIR/bin:$PATH" FAKE_BD_OUT_FILE="$_PT_DIR/out.json" FAKE_BD_RC="${2:-0}" \
+      gate_base_test_portability_declared /fake/store "${3:-ga-x}"
+  }
+  eq "declared: record carries teste:portabilidade-os (bd show --json array form) -> yes" \
+    "$(_decl '[{"id":"ga-x","labels":["gate:g","teste:portabilidade-os","p3"]}]')" "yes"
+  eq "declared: same label on a bare object -> yes" \
+    "$(_decl '{"id":"ga-x","labels":["teste:portabilidade-os"]}')" "yes"
+  eq "declared: record read, other labels only -> no" \
+    "$(_decl '[{"id":"ga-x","labels":["gate:g","p3"]}]')" "no"
+  eq "declared: record read, labels is an empty list -> no" \
+    "$(_decl '[{"id":"ga-x","labels":[]}]')" "no"
+  eq "declared: record read, NO labels key at all (bd omits it when there are none) -> no, not unknown" \
+    "$(_decl '[{"id":"ga-x","title":"t"}]')" "no"
+  eq "declared: a label that merely CONTAINS the word ('teste:portabilidade-os-x', 'teste:portabilidade') -> no (exact match only)" \
+    "$(_decl '[{"id":"ga-x","labels":["teste:portabilidade-os-x","teste:portabilidade"]}]')" "no"
+  eq "declared: not-found answer {\"error\":...} (no labels, would read as 'no') -> unknown" \
+    "$(_decl '{"error":"no issues found matching the provided IDs","schema_version":1}')" "unknown"
+  eq "declared: bd answered about a DIFFERENT bead -> unknown, never its labels" \
+    "$(_decl '[{"id":"ga-other","labels":["teste:portabilidade-os"]}]')" "unknown"
+  eq "declared: empty array [] (nothing found) -> unknown" "$(_decl '[]')" "unknown"
+  eq "declared: bd prints nothing and exits 0 -> unknown (vazio is not 'no')" "$(_decl '')" "unknown"
+  eq "declared: bd output is not JSON -> unknown" "$(_decl 'Error fetching ga-x: boom')" "unknown"
+  eq "declared: bd FAILS (rc 1) even with a valid record on stdout -> unknown (falhou is not 'no')" \
+    "$(_decl '[{"id":"ga-x","labels":["teste:portabilidade-os"]}]' 1)" "unknown"
+  eq "declared: labels is a string, not a list -> unknown" \
+    "$(_decl '[{"id":"ga-x","labels":"teste:portabilidade-os"}]')" "unknown"
+  eq "declared: labels holds a non-string -> unknown" \
+    "$(_decl '[{"id":"ga-x","labels":["teste:portabilidade-os",7]}]')" "unknown"
+  eq "declared: labels is null -> no (null is bd's own 'none', same as omitted)" \
+    "$(_decl '[{"id":"ga-x","labels":null}]')" "no"
+  eq "declared: bd binary not found at all -> unknown" \
+    "$(PATH="$_PT_DIR/empty" gate_base_test_portability_declared /fake/store ga-x)" "unknown"
+  eq "declared: empty store -> unknown" "$(gate_base_test_portability_declared "" ga-x)" "unknown"
+  eq "declared: empty bead id -> unknown" "$(gate_base_test_portability_declared /fake/store "")" "unknown"
+  eq "declared: always exits 0 (safe under the guard's set -e even on 'unknown')" \
+    "$(PATH="$_PT_DIR/empty" gate_base_test_portability_declared "" "" >/dev/null; echo $?)" "0"
+  : > "$_PT_DIR/bd.log"
+  printf '%s' '[{"id":"ga-x","labels":["teste:portabilidade-os"]}]' > "$_PT_DIR/out.json"
+  PATH="$_PT_DIR/bin:$PATH" FAKE_BD_LOG="$_PT_DIR/bd.log" FAKE_BD_OUT_FILE="$_PT_DIR/out.json" \
+    gate_base_test_portability_declared /the/store ga-x >/dev/null
+  eq "declared: asks bd exactly 'bd -C <store> show <bead> --json' (the SOURCE bead, in its own store)" \
+    "$(cat "$_PT_DIR/bd.log")" "-C /the/store show ga-x --json"
+  unset -f _decl
+  rm -rf "$_PT_DIR"
 fi
 
 if ! type gate_base_test_old_state >/dev/null 2>&1; then
@@ -769,6 +931,322 @@ eval "$_REAL_OLDSTATE_DEF"
 eq "call site: real old_state restored after the stubs (noopmod is refusable again)" \
   "$(run_live_basetest_check feat/noopmod)" "passou-na-base"
 
+# ── ga-hlcfzx9: portability repairs — declared AND measured on the Linux node ─────
+# The fixture is shaped like the production repo: the selftests live under
+# .gascity-gastown-hq/ (the only tree mbp-run.sh --repo hq can run on the node). The "node" is a
+# fake mbp-run.sh that behaves like Linux for exactly one reason: a file containing the marker
+# LINUX_BREAKS exits 126 there (the ga-9s361xi failure: a command that cannot be executed) and
+# everything else exits 0. On the mini (this shell) every file below is green, in BOTH forms.
+PORT_REPO="$TMPD/port-repo"
+mkdir -p "$PORT_REPO/.gascity-gastown-hq/lib" "$PORT_REPO/outside"
+git init -q -b main "$PORT_REPO"
+git -C "$PORT_REPO" config user.email "test@gascity.local"
+git -C "$PORT_REPO" config user.name "Test"
+_pw() { mkdir -p "$(dirname "$PORT_REPO/$1")"; printf '%s' "$2" > "$PORT_REPO/$1"; }
+_PT_BROKEN=$'#!/usr/bin/env bash\n# LINUX_BREAKS\nexit 0\n'
+_PT_FIXED=$'#!/usr/bin/env bash\nexit 0\n'
+_pw .gascity-gastown-hq/lib/port.selftest.sh     "$_PT_BROKEN"   # green on mini, red on node
+_pw .gascity-gastown-hq/lib/port2.selftest.sh    "$_PT_BROKEN"   # a second portability repair
+_pw .gascity-gastown-hq/lib/both.selftest.sh     "$_PT_FIXED"    # green on both systems
+_pw .gascity-gastown-hq/lib/stillbad.selftest.sh "$_PT_BROKEN"   # red on node, and its new form too
+_pw .gascity-gastown-hq/lib/macred.selftest.sh   $'#!/usr/bin/env bash\nexit 1\n'   # red on the mini
+_pw outside/other.selftest.sh                    "$_PT_BROKEN"   # red on node, but not under .gascity-gastown-hq/
+git -C "$PORT_REPO" add -A && git -C "$PORT_REPO" commit -q -m "base"
+PORT_BASE=$(git -C "$PORT_REPO" rev-parse HEAD)
+# One branch per scenario; each one is a single commit on the base.
+_pbranch() {  # _pbranch <name> <path> <content> [<path> <content> ...]
+  local name="$1"; shift
+  git -C "$PORT_REPO" checkout -q -b "$name" "$PORT_BASE"
+  while [ "$#" -ge 2 ]; do _pw "$1" "$2"; shift 2; done
+  git -C "$PORT_REPO" add -A && git -C "$PORT_REPO" commit -q -m "$name"
+  git -C "$PORT_REPO" checkout -q main
+}
+_pbranch port       .gascity-gastown-hq/lib/port.selftest.sh "$_PT_FIXED"
+_pbranch bothedit   .gascity-gastown-hq/lib/both.selftest.sh "$(printf '%s# cosmetic' "$_PT_FIXED")"
+_pbranch stillbad   .gascity-gastown-hq/lib/stillbad.selftest.sh "$(printf '%s# cosmetic' "$_PT_BROKEN")"
+_pbranch macred     .gascity-gastown-hq/lib/macred.selftest.sh "$_PT_FIXED"
+_pbranch outside    outside/other.selftest.sh "$_PT_FIXED"
+_pbranch added      .gascity-gastown-hq/lib/brand-new.selftest.sh "$_PT_FIXED"
+_pbranch mixed      .gascity-gastown-hq/lib/port.selftest.sh "$_PT_FIXED" .gascity-gastown-hq/lib/both.selftest.sh "$(printf '%s# cosmetic' "$_PT_FIXED")"
+_pbranch twoport    .gascity-gastown-hq/lib/port.selftest.sh "$_PT_FIXED" .gascity-gastown-hq/lib/port2.selftest.sh "$_PT_FIXED"
+_pbranch portmacred .gascity-gastown-hq/lib/port.selftest.sh "$_PT_FIXED" .gascity-gastown-hq/lib/macred.selftest.sh "$_PT_FIXED"
+unset -f _pbranch _pw
+
+PORT_BIN="$TMPD/port-bin"; mkdir -p "$PORT_BIN" "$TMPD/port-empty"
+cat > "$PORT_BIN/mbp-run.sh" <<'FAKEMBPEOF'
+#!/usr/bin/env bash
+# Fake of scripts/mbp-run.sh for the portability tests: logs every call, optionally forces an rc,
+# otherwise behaves like Linux: LINUX_BREAKS in the file => exit 126, else 0.
+dir=""; target=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --repo) shift 2 ;;
+    --dir)  dir="$2"; shift 2 ;;
+    --)     target="$2"; shift 2; break ;;
+    *)      shift ;;
+  esac
+done
+echo "budget=${MBP_RUN_TIMEOUT_S:-} dir=$dir target=$target" >> "${FAKE_MBP_LOG:-/dev/null}"
+[ -n "${FAKE_MBP_RC:-}" ] && exit "$FAKE_MBP_RC"
+grep -q LINUX_BREAKS "$dir/$target" 2>/dev/null && exit 126
+exit 0
+FAKEMBPEOF
+chmod +x "$PORT_BIN/mbp-run.sh"
+cat > "$PORT_BIN/bd" <<'FAKEBD2EOF'
+#!/usr/bin/env bash
+echo "$*" >> "${FAKE_BD_LOG:-/dev/null}"
+[ -n "${FAKE_BD_OUT_FILE:-}" ] && cat "$FAKE_BD_OUT_FILE"
+exit "${FAKE_BD_RC:-0}"
+FAKEBD2EOF
+chmod +x "$PORT_BIN/bd"
+export FAKE_MBP_LOG="$TMPD/port-mbp.log" FAKE_BD_LOG="$TMPD/port-bd.log"
+export GATE_ABT_MBP_RUN="$PORT_BIN/mbp-run.sh"
+PORT_BD_DECLARED='[{"id":"ga-port","labels":["gate:g","teste:portabilidade-os"]}]'
+PORT_BD_UNDECLARED='[{"id":"ga-port","labels":["gate:g"]}]'
+PORT_BD_NOTFOUND='{"error":"no issues found matching the provided IDs","schema_version":1}'
+_pbd() { printf '%s' "$1" > "$TMPD/port-bd.json"; export FAKE_BD_OUT_FILE="$TMPD/port-bd.json"; }
+_pcalls() { if [ -f "$1" ]; then grep -c . "$1" || true; else echo 0; fi; }   # grep -c prints 0 AND exits 1 on an empty file
+_preset() { : > "$FAKE_MBP_LOG"; : > "$FAKE_BD_LOG"; unset FAKE_MBP_RC FAKE_BD_RC GATE_ABT_NODE_TIMEOUT; }
+
+echo "  -- gate_base_test_node_state (direct, fake mbp-run.sh) --"
+_PS_WT=$(mktemp -d "${TMPDIR:-/tmp}/gate-rstae-selftest-port.XXXXXX")
+git -C "$PORT_REPO" worktree add --detach --quiet "$_PS_WT" "$PORT_BASE" 2>/dev/null
+_PS_TIP() { git -C "$PORT_REPO" rev-parse "$1"; }
+_ns() {  # _ns <branch> <file>
+  gate_base_test_node_state "$PORT_REPO" "$PORT_BASE" "$(_PS_TIP "$1")" "$_PS_WT" "$2"
+}
+_PF=.gascity-gastown-hq/lib
+
+_preset
+eq "node_state: base RED on the node + branch GREEN there (the ga-9s361xi shape) -> node-red" \
+  "$(_ns port $_PF/port.selftest.sh)" "node-red"
+_preset; _ns port $_PF/port.selftest.sh >/dev/null
+eq "node_state: that took exactly 2 node calls (old form, then the control run of the new form)" \
+  "$(_pcalls "$FAKE_MBP_LOG")" "2"
+eq "node_state: node called as '--repo hq --dir <wt>/.gascity-gastown-hq -- <path relative to it>' (the log shows the dir and the target)" \
+  "$(head -1 "$FAKE_MBP_LOG" | sed "s#$_PS_WT#WT#")" "budget=300 dir=WT/.gascity-gastown-hq target=lib/port.selftest.sh"
+_preset
+eq "node_state: base GREEN on the node too (passes on BOTH systems before the fix) -> node-green" \
+  "$(_ns bothedit $_PF/both.selftest.sh)" "node-green"
+_preset; _ns bothedit $_PF/both.selftest.sh >/dev/null
+eq "node_state: node-green costs ONE node call (no control run once the old form is green)" \
+  "$(_pcalls "$FAKE_MBP_LOG")" "1"
+_preset
+eq "node_state: base red on node but the branch's copy is red THERE TOO (nothing proves the diff fixed it) -> unknown" \
+  "$(_ns stillbad $_PF/stillbad.selftest.sh)" "unknown"
+_preset; _ns stillbad $_PF/stillbad.selftest.sh >/dev/null
+eq "node_state: ... after both runs (2 calls)" "$(_pcalls "$FAKE_MBP_LOG")" "2"
+_preset
+eq "node_state: file outside .gascity-gastown-hq/ (mbp-run.sh --repo hq cannot run it) -> unknown" \
+  "$(_ns outside outside/other.selftest.sh)" "unknown"
+_preset; _ns outside outside/other.selftest.sh >/dev/null
+eq "node_state: ... and the node was never asked" "$(_pcalls "$FAKE_MBP_LOG")" "0"
+_preset
+eq "node_state: a path that only STARTS like the hq dir ('.gascity-gastown-hq-x/…') -> unknown" \
+  "$(gate_base_test_node_state "$PORT_REPO" "$PORT_BASE" "$(_PS_TIP port)" "$_PS_WT" .gascity-gastown-hq-x/lib/a.selftest.sh)" "unknown"
+eq "node_state: bare '.gascity-gastown-hq/' with no file -> unknown" \
+  "$(gate_base_test_node_state "$PORT_REPO" "$PORT_BASE" "$(_PS_TIP port)" "$_PS_WT" .gascity-gastown-hq/)" "unknown"
+for _rc in 96 97 98 99 124 137 255; do
+  _preset; export FAKE_MBP_RC=$_rc
+  eq "node_state: node answers rc $_rc on the OLD form (did not run / timeout / signal) -> unknown, NOT node-red" \
+    "$(_ns port $_PF/port.selftest.sh)" "unknown"
+  _preset; export FAKE_MBP_RC=$_rc; _ns port $_PF/port.selftest.sh >/dev/null
+  eq "node_state: ... rc $_rc stops after the first call (no control run on an answer that is not an answer)" \
+    "$(_pcalls "$FAKE_MBP_LOG")" "1"
+done
+_preset; export FAKE_MBP_RC=1
+eq "node_state: node red on BOTH forms (rc 1 always: the node is simply broken) -> unknown, NOT node-red (the control run is what makes 'red' mean the test)" \
+  "$(_ns port $_PF/port.selftest.sh)" "unknown"
+_preset; export FAKE_MBP_RC=0
+eq "node_state: node green on both -> node-green" "$(_ns port $_PF/port.selftest.sh)" "node-green"
+_preset
+eq "node_state: base sha that does not resolve (cannot extract the old form) -> unknown" \
+  "$(gate_base_test_node_state "$PORT_REPO" 0000000000000000000000000000000000000000 "$(_PS_TIP port)" "$_PS_WT" $_PF/port.selftest.sh)" "unknown"
+eq "node_state: tip sha that does not resolve (the control run cannot happen) -> unknown, NOT node-red" \
+  "$(gate_base_test_node_state "$PORT_REPO" "$PORT_BASE" 0000000000000000000000000000000000000000 "$_PS_WT" $_PF/port.selftest.sh)" "unknown"
+for _blank in rig base tip wt file; do
+  _args=("$PORT_REPO" "$PORT_BASE" "$(_PS_TIP port)" "$_PS_WT" "$_PF/port.selftest.sh")
+  case "$_blank" in rig) _args[0]="" ;; base) _args[1]="" ;; tip) _args[2]="" ;; wt) _args[3]="" ;; file) _args[4]="" ;; esac
+  eq "node_state: empty $_blank argument -> unknown" "$(gate_base_test_node_state "${_args[@]}")" "unknown"
+done
+_preset
+eq "node_state: wrapper path does not exist -> unknown (the node is optional; absence is not a verdict)" \
+  "$(GATE_ABT_MBP_RUN="$TMPD/port-empty/nope.sh" _ns port $_PF/port.selftest.sh)" "unknown"
+printf '#!/bin/sh\nexit 126\n' > "$TMPD/port-empty/noexec.sh"
+eq "node_state: wrapper exists but is not executable -> unknown" \
+  "$(GATE_ABT_MBP_RUN="$TMPD/port-empty/noexec.sh" _ns port $_PF/port.selftest.sh)" "unknown"
+eq "node_state: no GATE_ABT_MBP_RUN and no GC_CITY (default wrapper path unresolvable) -> unknown, no crash" \
+  "$(env -u GATE_ABT_MBP_RUN GC_CITY="" bash -c 'GATE_GUARD_LIB_ONLY=1 . "$1"; gate_base_test_node_state "$2" "$3" "$4" "$5" "$6"' _ "$GUARD" "$PORT_REPO" "$PORT_BASE" "$(_PS_TIP port)" "$_PS_WT" "$_PF/port.selftest.sh")" "unknown"
+_preset; GATE_ABT_NODE_TIMEOUT=17 _ns port $_PF/port.selftest.sh >/dev/null
+eq "node_state: GATE_ABT_NODE_TIMEOUT=17 is handed to mbp-run.sh as MBP_RUN_TIMEOUT_S (the REMOTE process dies with the budget, ga-vg16lk)" \
+  "$(head -1 "$FAKE_MBP_LOG" | sed 's# dir=.*##')" "budget=17"
+for _bad in 0 abc ""; do
+  _preset; GATE_ABT_NODE_TIMEOUT="$_bad" _ns port $_PF/port.selftest.sh >/dev/null
+  eq "node_state: GATE_ABT_NODE_TIMEOUT='$_bad' (not a usable budget) -> default 300" \
+    "$(head -1 "$FAKE_MBP_LOG" | sed 's# dir=.*##')" "budget=300"
+done
+eq "node_state: always exits 0 (safe under the guard's set -e even on 'unknown')" \
+  "$(gate_base_test_node_state "" "" "" "" "" >/dev/null; echo $?)" "0"
+git -C "$PORT_REPO" worktree remove --force "$_PS_WT" 2>/dev/null || rm -rf "$_PS_WT" 2>/dev/null
+unset -f _PS_TIP _ns
+
+# The call site, end to end. Same scope and same convention as run_live_basetest_check above: a
+# mirror of the Step 5b-pre2 loop that calls the REAL guard functions (old_state, portability_declared,
+# node_state, verdict) — section 3 pins that the live call site has the same shape.
+run_port_check() {  # run_port_check <branch> [bead-id]  -> verdict
+  local branch="$1" bead="${2:-ga-port}" tip base="$PORT_BASE"
+  local detected=0 copy_ok=0 ran=0 failed=0 repaired=0 unclassified=0 portable=0 decl="" files wt f rc
+  tip=$(git -C "$PORT_REPO" rev-parse "$branch")
+  files=$(git -C "$PORT_REPO" diff --name-only --diff-filter=AM "${base}..${tip}" -- '*.selftest.sh')
+  detected=$(printf '%s\n' "$files" | grep -c .)
+  wt=$(mktemp -d "${TMPDIR:-/tmp}/gate-rstae-selftest-port.XXXXXX")
+  git -C "$PORT_REPO" worktree add --detach --quiet "$wt" "$base" 2>/dev/null
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    mkdir -p "$(dirname "$wt/$f")"
+    if git -C "$PORT_REPO" show "${tip}:$f" > "$wt/$f" 2>/dev/null; then
+      copy_ok=$((copy_ok + 1))
+      if timeout 30 bash "$wt/$f" >/dev/null 2>&1; then
+        ran=$((ran + 1))
+        case "$(gate_base_test_old_state "$PORT_REPO" "$base" "$wt" "$f")" in
+          old-fails)         repaired=$((repaired + 1)) ;;
+          added)             : ;;
+          old-passes)
+            if [ -z "$decl" ]; then
+              decl=$(gate_base_test_portability_declared /fake/store "$bead")
+            fi
+            case "$decl" in
+              no)  : ;;
+              yes)
+                case "$(gate_base_test_node_state "$PORT_REPO" "$base" "$tip" "$wt" "$f")" in
+                  node-red)    portable=$((portable + 1)) ;;
+                  node-green)  : ;;
+                  *)           unclassified=$((unclassified + 1)) ;;
+                esac ;;
+              *)   unclassified=$((unclassified + 1)) ;;
+            esac ;;
+          *)                 unclassified=$((unclassified + 1)) ;;
+        esac
+      else
+        rc=$?
+        if [ "$rc" != "124" ]; then ran=$((ran + 1)); failed=$((failed + 1)); fi
+      fi
+    fi
+  done <<PORTFILESEOF
+$files
+PORTFILESEOF
+  git -C "$PORT_REPO" worktree remove --force "$wt" 2>/dev/null || rm -rf "$wt" 2>/dev/null
+  gate_base_test_verdict "$detected" "$copy_ok" "$ran" "$failed" "$repaired" "$unclassified" "$portable"
+}
+# Every run below goes through PATH with the fake bd first, like the live guard resolves `bd`.
+run_port() { PATH="$PORT_BIN:$PATH" run_port_check "$@"; }
+
+echo "  -- acceptance matrix (ga-hlcfzx9): the declared + measured path --"
+_preset; _pbd "$PORT_BD_DECLARED"
+eq "ACCEPT 1: portability repair, DECLARED, node red on base + green on the branch -> consertou-portabilidade (ga-9s361xi passes via the new path)" \
+  "$(run_port port)" "consertou-portabilidade"
+_preset; _pbd "$PORT_BD_DECLARED"
+eq "ACCEPT 2: a test that passes on BOTH systems before the fix, DECLARED, stays refused -> passou-na-base" \
+  "$(run_port bothedit)" "passou-na-base"
+_preset; _pbd "$PORT_BD_UNDECLARED"
+eq "same repair, NOT declared -> passou-na-base (the label is what opens the node path)" \
+  "$(run_port port)" "passou-na-base"
+_preset; _pbd "$PORT_BD_UNDECLARED"; run_port port >/dev/null
+eq "same repair, NOT declared: the node is never asked (no cost without a declaration)" "$(_pcalls "$FAKE_MBP_LOG")" "0"
+_preset; _pbd "$PORT_BD_DECLARED"; export FAKE_MBP_RC=97
+eq "declared, node unavailable (rc 97) -> nao-consegui-medir, NOT a refusal (no node, no verdict)" "$(run_port port)" "nao-consegui-medir"
+_preset; _pbd "$PORT_BD_DECLARED"; export FAKE_MBP_RC=124
+eq "declared, node times out (rc 124) -> nao-consegui-medir" "$(run_port port)" "nao-consegui-medir"
+_preset; _pbd "$PORT_BD_DECLARED"; export FAKE_MBP_RC=137
+eq "declared, node process killed (rc 137) -> nao-consegui-medir" "$(run_port port)" "nao-consegui-medir"
+_preset; _pbd "$PORT_BD_DECLARED"
+eq "declared, but the new form is ALSO red on the node (the repair did not repair it) -> nao-consegui-medir, not accepted and not refused" \
+  "$(run_port stillbad)" "nao-consegui-medir"
+_preset; _pbd "$PORT_BD_DECLARED"
+eq "declared, but the file is outside .gascity-gastown-hq/ (the node cannot run it) -> nao-consegui-medir" \
+  "$(run_port outside)" "nao-consegui-medir"
+_preset; _pbd "$PORT_BD_NOTFOUND"
+eq "declaration UNREADABLE (bd answered not-found) -> nao-consegui-medir, NOT passou-na-base (could not read != nobody declared)" \
+  "$(run_port port)" "nao-consegui-medir"
+_preset; _pbd "$PORT_BD_NOTFOUND"; run_port port >/dev/null
+eq "declaration unreadable: the node is never asked" "$(_pcalls "$FAKE_MBP_LOG")" "0"
+_preset; _pbd "$PORT_BD_DECLARED"; export FAKE_BD_RC=1
+eq "declaration unreadable (bd exits 1) -> nao-consegui-medir" "$(run_port port)" "nao-consegui-medir"
+_preset; _pbd ""
+eq "declaration unreadable (bd prints nothing) -> nao-consegui-medir" "$(run_port port)" "nao-consegui-medir"
+_preset; _pbd "$PORT_BD_DECLARED"
+eq "a mini-side REPAIR (old form red on the mini) is still consertou-teste-vermelho — the older path is untouched" \
+  "$(run_port macred)" "consertou-teste-vermelho"
+_preset; _pbd "$PORT_BD_DECLARED"; run_port macred >/dev/null
+eq "a mini-side repair never reads the declaration and never asks the node (lazy: cost only where needed)" \
+  "$(_pcalls "$FAKE_BD_LOG") $(_pcalls "$FAKE_MBP_LOG")" "0 0"
+_preset; _pbd "$PORT_BD_DECLARED"
+eq "a brand-new selftest, DECLARED -> passou-na-base (no old form to repair: the node path is for MODIFIED tests only)" \
+  "$(run_port added)" "passou-na-base"
+_preset; _pbd "$PORT_BD_DECLARED"; run_port added >/dev/null
+eq "a brand-new selftest: no declaration read, no node call" "$(_pcalls "$FAKE_BD_LOG") $(_pcalls "$FAKE_MBP_LOG")" "0 0"
+_preset; _pbd "$PORT_BD_DECLARED"
+eq "portability repair + a sibling green on both systems -> consertou-portabilidade (one discriminating file is enough)" \
+  "$(run_port mixed)" "consertou-portabilidade"
+_preset; _pbd "$PORT_BD_DECLARED"
+eq "two portability repairs -> consertou-portabilidade" "$(run_port twoport)" "consertou-portabilidade"
+_preset; _pbd "$PORT_BD_DECLARED"; run_port twoport >/dev/null
+eq "two files to check: the declaration is read ONCE (bd called once), the node 4 times (2 files x old+control)" \
+  "$(_pcalls "$FAKE_BD_LOG") $(_pcalls "$FAKE_MBP_LOG")" "1 4"
+_preset; _pbd "$PORT_BD_DECLARED"
+eq "a mini-side repair + a portability repair together -> consertou-teste-vermelho (the older proof keeps its word)" \
+  "$(run_port portmacred)" "consertou-teste-vermelho"
+_preset; _pbd "$PORT_BD_DECLARED"
+eq "the declaration is read from the SOURCE bead in its store: asked 'bd -C /fake/store show <bead> --json'" \
+  "$(run_port port >/dev/null; head -1 "$FAKE_BD_LOG")" "-C /fake/store show ga-port --json"
+
+echo "  -- the path is not chosen by bead id (Mayor decision 2026-10-26) --"
+# The verdict hangs off the declaration and the measurement only. Same scenario under bead ids that
+# hash to arm A and to arm B, and under the real ga-9s361xi: the answer cannot differ.
+_PB_A=""; _PB_B=""
+for _n in $(seq 1 60); do
+  case "$(gate_ab_arm_for_bead "ga-hlc$_n")" in
+    A) [ -z "$_PB_A" ] && _PB_A="ga-hlc$_n" ;;
+    B) [ -z "$_PB_B" ] && _PB_B="ga-hlc$_n" ;;
+  esac
+  [ -n "$_PB_A" ] && [ -n "$_PB_B" ] && break
+done
+if [ -n "$_PB_A" ] && [ -n "$_PB_B" ]; then
+  _V=""
+  for _bid in "$_PB_A" "$_PB_B" ga-9s361xi ga-zxevh3a; do
+    _preset; _pbd "[{\"id\":\"$_bid\",\"labels\":[\"teste:portabilidade-os\"]}]"
+    _V="$_V$(PATH="$PORT_BIN:$PATH" run_port_check port "$_bid") "
+  done
+  eq "same repair under an arm-A bead, an arm-B bead, ga-9s361xi and its marker -> the SAME verdict four times" \
+    "$_V" "consertou-portabilidade consertou-portabilidade consertou-portabilidade consertou-portabilidade "
+else
+  bad "could not find one bead id per arm among ga-hlc1..60 — the arm-independence check has nothing to compare"
+fi
+
+echo "  -- the call site's third state for the new reads --"
+# Same doctrine as the old_state stubs above: a function documented to print one word that prints
+# NOTHING (killed substitution) or an unrecognised word must read "don't know", never refusal.
+_preset; _pbd "$PORT_BD_DECLARED"
+_REAL_NODESTATE_DEF=$(declare -f gate_base_test_node_state)
+gate_base_test_node_state() { printf ''; return 0; }
+eq "call site: node_state prints NOTHING -> nao-consegui-medir, NOT a refusal" "$(run_port bothedit)" "nao-consegui-medir"
+gate_base_test_node_state() { printf 'garbage'; return 0; }
+eq "call site: node_state prints an UNRECOGNISED word -> nao-consegui-medir, NOT a refusal" "$(run_port bothedit)" "nao-consegui-medir"
+gate_base_test_node_state() { printf 'unknown'; return 0; }
+eq "call site: node_state prints 'unknown' -> nao-consegui-medir" "$(run_port port)" "nao-consegui-medir"
+eval "$_REAL_NODESTATE_DEF"
+eq "call site: real node_state restored (bothedit is refusable again)" "$(run_port bothedit)" "passou-na-base"
+_REAL_DECL_DEF=$(declare -f gate_base_test_portability_declared)
+gate_base_test_portability_declared() { printf ''; return 0; }
+eq "call site: portability_declared prints NOTHING -> nao-consegui-medir, NOT a refusal" "$(run_port bothedit)" "nao-consegui-medir"
+gate_base_test_portability_declared() { printf 'maybe'; return 0; }
+eq "call site: portability_declared prints an UNRECOGNISED word -> nao-consegui-medir, NOT a refusal" "$(run_port bothedit)" "nao-consegui-medir"
+eval "$_REAL_DECL_DEF"
+eq "call site: real portability_declared restored" "$(run_port bothedit)" "passou-na-base"
+
+unset FAKE_MBP_LOG FAKE_BD_LOG GATE_ABT_MBP_RUN FAKE_BD_OUT_FILE FAKE_MBP_RC FAKE_BD_RC GATE_ABT_NODE_TIMEOUT
+unset -f _pbd _pcalls _preset run_port run_port_check
+
 # Worktree hygiene: after all the runs above, the RIG_PATH clone must have
 # no leftover linked worktrees and no stray temp directories — a leaked
 # throwaway worktree on every guard sweep would slowly fill disk on the one
@@ -776,6 +1254,9 @@ eq "call site: real old_state restored after the stubs (noopmod is refusable aga
 _WT_LEFTOVER=$(git -C "$RIG_PATH" worktree list 2>/dev/null | grep -c -E "gate-rstae-selftest-(wt|oldstate)" || true)
 eq "no leftover linked worktrees after 9 check runs + the old_state probes (git worktree remove ran cleanly every time)" \
   "${_WT_LEFTOVER:-0}" "0"
+_WT_LEFTOVER_PORT=$(git -C "$PORT_REPO" worktree list 2>/dev/null | grep -c "gate-rstae-selftest-port" || true)
+eq "no leftover linked worktrees after the portability runs either (node_state and the mirror both clean up)" \
+  "${_WT_LEFTOVER_PORT:-0}" "0"
 
 rm -rf "$TMPD"
 trap - EXIT
@@ -815,6 +1296,15 @@ if [ -n "$OLDSTATE_DEF_LINE" ] && [ -n "$CUTOFF_LINE" ] && [ "$OLDSTATE_DEF_LINE
 else
   bad "REGRESSION (ga-zdkn1-class): gate_base_test_old_state def=${OLDSTATE_DEF_LINE:-missing} cutoff=${CUTOFF_LINE:-missing}"
 fi
+
+for _fn in gate_base_test_node_rc_class gate_base_test_portability_declared gate_base_test_node_state; do
+  _FN_LINE=$(grep -n "^${_fn}() {" "$GUARD" | head -1 | cut -d: -f1)
+  if [ -n "$_FN_LINE" ] && [ -n "$CUTOFF_LINE" ] && [ "$_FN_LINE" -lt "$CUTOFF_LINE" ]; then
+    ok "guard.sh: $_fn (L$_FN_LINE) defined BEFORE the GATE_GUARD_LIB_ONLY cutoff (L$CUTOFF_LINE) (ga-hlcfzx9)"
+  else
+    bad "REGRESSION (ga-zdkn1-class): $_fn def=${_FN_LINE:-missing} cutoff=${CUTOFF_LINE:-missing}"
+  fi
+done
 
 # 3b. The Step 5b-pre2 block exists exactly once and is wired: calls both
 # pure functions, gates the worktree machinery on arm B, sets
@@ -874,18 +1364,83 @@ else
   bad "REGRESSION: old-state call line=${OLDSTATE_CALL_LINE:-missing} arm gate=${ARM_GATE_LINE:-missing} — arm A might run the old-form probe"
 fi
 
-echo "$ABT_BLOCK" | grep '_ABT_VERDICT=\$(gate_base_test_verdict "\$_ABT_DETECTED" "\$_ABT_COPY_OK" "\$_ABT_RAN" "\$_ABT_FAILED" "\$_ABT_REPAIRED" "\$_ABT_UNCLASSIFIED")' >/dev/null \
-  && ok "guard.sh: verdict call passes repaired AND unclassified (6 args)" \
-  || bad "guard.sh: verdict call does not pass both new counts — repairs would be re-refused"
+echo "$ABT_BLOCK" | grep '_ABT_VERDICT=\$(gate_base_test_verdict "\$_ABT_DETECTED" "\$_ABT_COPY_OK" "\$_ABT_RAN" "\$_ABT_FAILED" "\$_ABT_REPAIRED" "\$_ABT_UNCLASSIFIED" "\$_ABT_PORTABLE")' >/dev/null \
+  && ok "guard.sh: verdict call passes repaired, unclassified AND portable (7 args)" \
+  || bad "guard.sh: verdict call does not pass all three counts — repairs (ga-yl1k3w) or portability repairs (ga-hlcfzx9) would be re-refused"
 
-echo "$ABT_BLOCK" | grep -E '^[[:space:]]*added\|old-passes\)[[:space:]]+:[[:space:]]*;;' >/dev/null \
+# The old_state case: ONLY added is a proven "nothing to repair" without further asking. old-passes
+# is the one answer that may lead to a refusal, and only through the declaration + node arms below;
+# every other answer (empty, garbage, unknown) must land in unclassified.
+echo "$ABT_BLOCK" | grep -E '^[[:space:]]*added\)[[:space:]]+:[[:space:]]*;;' >/dev/null \
+  && echo "$ABT_BLOCK" | grep -E '^[[:space:]]*old-passes\)[[:space:]]*$' >/dev/null \
   && echo "$ABT_BLOCK" | grep -E '^[[:space:]]*\*\)[[:space:]]+_ABT_UNCLASSIFIED=\$\(\(_ABT_UNCLASSIFIED \+ 1\)\) ;;' >/dev/null \
-  && ok "guard.sh: the old_state case names added|old-passes as the ONLY no-count answers and sends everything else (empty/garbage/unknown) to unclassified" \
-  || bad "guard.sh: the old_state case lacks the added|old-passes / *) unclassified arms — an empty or unrecognised answer would read as a refusal"
+  && ok "guard.sh: the old_state case has added as a plain no-count arm, old-passes as its own arm (declaration + node), and sends everything else (empty/garbage/unknown) to unclassified" \
+  || bad "guard.sh: the old_state case lacks the added / old-passes / *) unclassified arms — an empty or unrecognised answer would read as a refusal"
 
 echo "$ABT_BLOCK" | grep 'AB-BASE-TEST bead=.*repaired=\$_ABT_REPAIRED unclassified=\$_ABT_UNCLASSIFIED' >/dev/null \
   && ok "guard.sh: AB-BASE-TEST log line carries repaired=/unclassified= (appended, existing fields untouched)" \
   || bad "guard.sh: AB-BASE-TEST log line lacks repaired=/unclassified="
+
+echo "$ABT_BLOCK" | grep 'AB-BASE-TEST bead=.*unclassified=\$_ABT_UNCLASSIFIED portable=\$_ABT_PORTABLE outside-subtree=' >/dev/null \
+  && ok "guard.sh: AB-BASE-TEST log line carries portable= between unclassified= and outside-subtree= (ga-hlcfzx9; existing fields untouched)" \
+  || bad "guard.sh: AB-BASE-TEST log line lacks portable=\$_ABT_PORTABLE in its slot"
+
+# ga-hlcfzx9: where the three new functions are called. All three are arm-B-only (after the gate),
+# the declaration read and the node probe are both INSIDE the old-passes arm (the lazy cost: a submission
+# that never gets there pays nothing), and the node is only asked when the declaration says "yes".
+_PO_DECL_LINE=$(echo "$ABT_BLOCK" | grep -n 'gate_base_test_portability_declared "\$BEAD_CITY" "\$BEAD_ID"' | head -1 | cut -d: -f1)
+_PO_NODE_LINE=$(echo "$ABT_BLOCK" | grep -n 'gate_base_test_node_state "\$RIG_PATH" "\$_ABT_BASE" "\$_ABT_BRANCH_SHA" "\$_ABT_WT" "\$_abt_f"' | head -1 | cut -d: -f1)
+_PO_OLDPASS_LINE=$(echo "$ABT_BLOCK" | grep -n -E '^[[:space:]]*old-passes\)[[:space:]]*$' | head -1 | cut -d: -f1)
+_PO_YES_LINE=$(echo "$ABT_BLOCK" | grep -n -E '^[[:space:]]*yes\)[[:space:]]*$' | head -1 | cut -d: -f1)
+if [ -n "$ARM_GATE_LINE" ] && [ -n "$_PO_OLDPASS_LINE" ] && [ -n "$_PO_DECL_LINE" ] && [ -n "$_PO_YES_LINE" ] && [ -n "$_PO_NODE_LINE" ] \
+   && [ "$ARM_GATE_LINE" -lt "$_PO_OLDPASS_LINE" ] && [ "$_PO_OLDPASS_LINE" -lt "$_PO_DECL_LINE" ] \
+   && [ "$_PO_DECL_LINE" -lt "$_PO_YES_LINE" ] && [ "$_PO_YES_LINE" -lt "$_PO_NODE_LINE" ]; then
+  ok "guard.sh: arm-B gate (L$ARM_GATE_LINE) < old-passes arm (L$_PO_OLDPASS_LINE) < declaration read (L$_PO_DECL_LINE) < yes) arm (L$_PO_YES_LINE) < node_state call (L$_PO_NODE_LINE) — arm A never reads the declaration, and the node is only asked for a declared, old-passes file"
+else
+  bad "guard.sh: declaration/node calls not ordered arm gate < old-passes < declaration < yes) < node_state (gate=${ARM_GATE_LINE:-missing} old-passes=${_PO_OLDPASS_LINE:-missing} decl=${_PO_DECL_LINE:-missing} yes=${_PO_YES_LINE:-missing} node=${_PO_NODE_LINE:-missing}) — the node could be asked for undeclared files, or arm A could reach it"
+fi
+
+echo "$ABT_BLOCK" | grep -E '^[[:space:]]*_ABT_PORTABLE=0; _ABT_PORT_DECL=""' >/dev/null \
+  && ok "guard.sh: _ABT_PORTABLE starts at 0 and _ABT_PORT_DECL starts EMPTY (declaration not read until first needed)" \
+  || bad "guard.sh: _ABT_PORTABLE/_ABT_PORT_DECL not initialised as 0 / empty"
+
+# The two inner cases: node answers other than node-red/node-green, and declaration answers other than
+# no/yes, go to unclassified (nao-consegui-medir) — never to "no count" (= refusal).
+_PO_INNER=$(echo "$ABT_BLOCK" | sed -n '/^[[:space:]]*old-passes)[[:space:]]*$/,/^[[:space:]]*esac$/p' | head -40)
+echo "$_PO_INNER" | grep -E '^[[:space:]]*node-red\)[[:space:]]+_ABT_PORTABLE=\$\(\(_ABT_PORTABLE \+ 1\)\) ;;' >/dev/null \
+  && echo "$_PO_INNER" | grep -E '^[[:space:]]*node-green\)[[:space:]]+:[[:space:]]*;;' >/dev/null \
+  && [ "$(echo "$_PO_INNER" | grep -cE '^[[:space:]]*\*\)[[:space:]]+_ABT_UNCLASSIFIED=\$\(\(_ABT_UNCLASSIFIED \+ 1\)\) ;;')" -ge 2 ] \
+  && echo "$_PO_INNER" | grep -E '^[[:space:]]*no\)[[:space:]]+:[[:space:]]*;;' >/dev/null \
+  && ok "guard.sh: inside old-passes: node-red counts portable, node-green and a declared 'no' count nothing, and an unreadable declaration / unrecognised node answer go to unclassified" \
+  || bad "guard.sh: the old-passes inner cases are not (node-red -> portable, node-green -> nothing, no -> nothing, *) -> unclassified) twice — doubt could become a refusal or a portable repair"
+
+# Nothing in the new code picks a path by bead id (Mayor, 2026-10-26): no code line (comments excluded)
+# names ga-9s361xi / ga-zxevh3a, and the new functions do not look at the A/B arm at all.
+_PO_ID_CODE=$(grep -nE 'ga-9s361xi|ga-zxevh3a' "$GUARD" | grep -vE '^[0-9]+:[[:space:]]*#' | grep -c . || true)
+eq "guard.sh: no CODE line names ga-9s361xi / ga-zxevh3a (comments excluded) — the portability path is not keyed on the case that motivated it" "${_PO_ID_CODE:-0}" "0"
+_PO_FUNCS=$(awk '/^gate_base_test_portability_declared\(\) \{/,/^\}/; /^gate_base_test_node_rc_class\(\) \{/,/^\}/; /^gate_base_test_node_state\(\) \{/,/^\}/' "$GUARD")
+if [ -n "$_PO_FUNCS" ] && [ "$(echo "$_PO_FUNCS" | grep -c .)" -gt 40 ]; then
+  eq "guard.sh: the three new functions never mention the arm (gate_ab_arm_for_bead / _ABT_ARM) — arm-independent by construction" \
+    "$(echo "$_PO_FUNCS" | grep -vE '^[[:space:]]*#' | grep -cE 'gate_ab_arm_for_bead|_ABT_ARM' || true)" "0"
+else
+  bad "guard.sh: could not extract the three new functions (got $(echo "$_PO_FUNCS" | grep -c .) lines) — the arm-independence check has nothing to look at"
+fi
+
+# The builder must be told how to declare. The note is built only in the refusal block, from the declaration
+# this run actually read, and ends up in the same bd comment as the ga-yl1k3w line.
+echo "$ABT_BLOCK" | grep -E 'bd label add \$BEAD_ID teste:portabilidade-os' >/dev/null \
+  && echo "$ABT_BLOCK" | grep -E '^\$_ABT_PORT_NOTE \(ga-hlcfzx9\)$' >/dev/null \
+  && ok "guard.sh: the refusal comment tells the builder to 'bd label add <bead> teste:portabilidade-os' and carries \$_ABT_PORT_NOTE" \
+  || bad "guard.sh: the refusal comment does not explain the declared portability path"
+_PO_NOTE_LINE=$(echo "$ABT_BLOCK" | grep -n '_ABT_PORT_NOTE=' | head -1 | cut -d: -f1)
+_PO_REFUSE_LINE=$(echo "$ABT_BLOCK" | grep -n '"\$_ABT_VERDICT" = "passou-na-base"' | head -1 | cut -d: -f1)
+if [ -n "$_PO_NOTE_LINE" ] && [ -n "$_PO_REFUSE_LINE" ] && [ "$_PO_NOTE_LINE" -gt "$_PO_REFUSE_LINE" ]; then
+  ok "guard.sh: _ABT_PORT_NOTE is built INSIDE the passou-na-base refusal (L$_PO_NOTE_LINE > L$_PO_REFUSE_LINE): no other verdict composes or sends it"
+else
+  bad "guard.sh: _ABT_PORT_NOTE built at L${_PO_NOTE_LINE:-missing} but the refusal starts at L${_PO_REFUSE_LINE:-missing} — it may be built outside the refusal"
+fi
+_PO_LEAK=$(echo "$ABT_BLOCK" | grep -E 'gate_base_test_verdict|"\$_ABT_VERDICT" = ' | grep -c '_ABT_PORT_DECL\|_ABT_PORT_NOTE' || true)
+eq "guard.sh: the declaration and the note appear on NO verdict-call or refusal-condition line (the verdict is computed from the counts only; the declaration decides whether the node is asked, and what the message says)" "${_PO_LEAK:-0}" "0"
 
 # ga-x4mkk2: the outside-subtree count is arm-B-only, starts as `unknown` (never measured is
 # not 0), is measured with the REAL helper against the same base/head the detection uses, is
@@ -902,7 +1457,7 @@ echo "$ABT_BLOCK" | grep -E '^[[:space:]]*_ABT_OUTSIDE="unknown"' >/dev/null \
   && ok "guard.sh: _ABT_OUTSIDE starts as \"unknown\" (a count that was never measured cannot read as 0)" \
   || bad "guard.sh: _ABT_OUTSIDE is not initialised to \"unknown\" — an unmeasured submission could log a blank or a 0"
 
-echo "$ABT_BLOCK" | grep -E 'AB-BASE-TEST bead=.*unclassified=\$_ABT_UNCLASSIFIED outside-subtree=\$_ABT_OUTSIDE"$' >/dev/null \
+echo "$ABT_BLOCK" | grep -E 'AB-BASE-TEST bead=.*unclassified=\$_ABT_UNCLASSIFIED portable=\$_ABT_PORTABLE outside-subtree=\$_ABT_OUTSIDE"$' >/dev/null \
   && ok "guard.sh: AB-BASE-TEST log line ends with outside-subtree=\$_ABT_OUTSIDE (appended last, existing fields untouched)" \
   || bad "guard.sh: AB-BASE-TEST log line does not end with outside-subtree=\$_ABT_OUTSIDE"
 
@@ -925,6 +1480,7 @@ else
     echo "[2026-09-25 09:22:37] [quality-gate-guard] AB-BASE-TEST bead=ga-b arm=B verdict=passou-na-base branch=fix/ga-b base=bbb detected=1 copy_ok=1 ran=1 failed=0"
     echo "[2026-09-25 09:23:37] [quality-gate-guard] AB-BASE-TEST bead=ga-c arm=B verdict=consertou-teste-vermelho branch=fix/ga-c base=ccc detected=1 copy_ok=1 ran=1 failed=0 repaired=1 unclassified=0 outside-subtree=0"
     echo "[2026-09-25 09:24:37] [quality-gate-guard] AB-BASE-TEST bead=ga-d arm=B verdict=reprovou-na-base branch=fix/ga-d base=ddd detected=1 copy_ok=1 ran=1 failed=1 repaired=0 unclassified=0 outside-subtree=unknown"
+    echo "[2026-10-26 23:48:37] [quality-gate-guard] AB-BASE-TEST bead=ga-e arm=B verdict=consertou-portabilidade branch=fix/ga-e base=eee detected=1 copy_ok=1 ran=1 failed=0 repaired=0 unclassified=0 portable=1 outside-subtree=0"
   } > "$_APU_LOG"
   _APU_OUT=$(GUARD_LOG="$_APU_LOG" eval "$_APU_PIPE" 2>/dev/null | sed -E 's/^ +//; s/ +/ /g')
   rm -f "$_APU_LOG"
@@ -934,6 +1490,9 @@ else
   printf '%s\n' "$_APU_OUT" | grep -qx '1 B consertou-teste-vermelho' \
     && ok "apuracao tally counts consertou-teste-vermelho as its own separate row (1 B consertou-teste-vermelho)" \
     || bad "apuracao tally lacks the separate consertou-teste-vermelho row: got '$(printf '%s' "$_APU_OUT" | tr '\n' '|')'"
+  printf '%s\n' "$_APU_OUT" | grep -qx '1 B consertou-portabilidade' \
+    && ok "apuracao tally counts consertou-portabilidade as its own separate row (1 B consertou-portabilidade) — the new verdict is measurable, not folded into another word" \
+    || bad "apuracao tally lacks the separate consertou-portabilidade row: got '$(printf '%s' "$_APU_OUT" | tr '\n' '|')'"
   grep -q 'quality-gate-guard.log' "$_APU" \
     && ok "apuracao reads quality-gate-guard.log for the verdict section (where the guard actually writes AB-BASE-TEST)" \
     || bad "apuracao does not reference quality-gate-guard.log — verdict section would read the wrong log again"

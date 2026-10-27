@@ -3075,14 +3075,14 @@ gate_ab_arm_for_bead() {
   fi
 }
 
-# gate_base_test_verdict <detected> <copy_ok> <ran> <failed> [<repaired> [<unclassified>]]
+# gate_base_test_verdict <detected> <copy_ok> <ran> <failed> [<repaired> [<unclassified> [<portable>]]]
 #   ga-rstae: collapses the base-commit test check's raw counts (computed by
 #   the impure Step 5b-pre2 block below: how many *.selftest.sh files were
 #   added/changed on the branch, how many of those were successfully
 #   materialized onto a throwaway base-commit worktree, how many actually
 #   completed execution within their timeout budget, and how many of THOSE
-#   exited non-zero) into exactly ONE of five named states (four from ga-rstae,
-#   the fifth from ga-yl1k3w). All are REQUIRED reporting buckets per the
+#   exited non-zero) into exactly ONE of six named states (four from ga-rstae,
+#   the fifth from ga-yl1k3w, the sixth from ga-hlcfzx9). All are REQUIRED reporting buckets per the
 #   bead — "sem-teste-novo" and "nao-consegui-medir" are not swallowed into a
 #   generic pass, they are counted separately so the A/B apuracao measures
 #   "who wrote a test that proves something", not "who wrote any test" or
@@ -3099,7 +3099,12 @@ gate_ab_arm_for_bead() {
 #     unclassified  — passing-new files whose old form could not be measured
 #                     (base copy unreadable, timed out, git error). Unknown is
 #                     not "the old form passed".
-#   Both default to 0 when the argument is ABSENT (a legacy 4-arg call keeps
+#   portable      — (ga-hlcfzx9) MODIFIED selftests whose old form PASSED on this
+#                     (macOS) base too, but that the builder DECLARED a portability
+#                     repair and that the Linux node proved red in the old form and
+#                     green in the new one (gate_base_test_node_state). The test was
+#                     never red HERE, so ga-yl1k3w's repair proof cannot see it.
+#   All three default to 0 when the argument is ABSENT (a legacy 4-arg call keeps
 #   today's answer exactly). A PRESENT-but-empty or non-numeric value is NOT
 #   defaulted to 0: 0 here reads "no repair" and REFUSES the builder, so a
 #   garbled count is nao-consegui-medir instead (erro != vazio).
@@ -3145,6 +3150,14 @@ gate_ab_arm_for_bead() {
 #                            A passing file whose old form is unclassifiable,
 #                            with no repair alongside it, is nao-consegui-medir
 #                            — never passou-na-base.
+#     consertou-portabilidade — (ga-hlcfzx9) detected>0, every file measured, none
+#                            failed on base here, no repair in the ga-yl1k3w sense
+#                            (repaired=0), and AT LEAST ONE file is a portability
+#                            repair (portable>0): green here before AND after, but
+#                            red on the Linux node before and green there after.
+#                            Never blocks; counted apart. consertou-teste-vermelho
+#                            wins when both kinds are present (it is the older,
+#                            stronger proof: the red was measured on this very base).
 #   "measured" above means copy_ok==detected AND ran==detected: a PARTIAL
 #   measurement (some files ok, some not) is treated the same as a total
 #   failure to measure, never as partial proof — fail-open on ANY
@@ -3154,7 +3167,7 @@ gate_ab_arm_for_bead() {
 #   passes in only these four counts.
 gate_base_test_verdict() {
   local detected="$1" copy_ok="$2" ran="$3" failed="$4"
-  local repaired="${5-0}" unclassified="${6-0}"   # absent -> 0; present-but-garbled handled below
+  local repaired="${5-0}" unclassified="${6-0}" portable="${7-0}"   # absent -> 0; present-but-garbled handled below
   case "$detected" in
     ''|*[!0-9]*) printf 'nao-consegui-medir'; return 0 ;;
   esac
@@ -3179,12 +3192,15 @@ gate_base_test_verdict() {
   # refusing answer below is allowed.
   case "$repaired" in ''|*[!0-9]*) printf 'nao-consegui-medir'; return 0 ;; esac
   case "$unclassified" in ''|*[!0-9]*) printf 'nao-consegui-medir'; return 0 ;; esac
-  if [ $(( repaired + unclassified )) -gt "$detected" ]; then
+  case "$portable" in ''|*[!0-9]*) printf 'nao-consegui-medir'; return 0 ;; esac
+  if [ $(( repaired + unclassified + portable )) -gt "$detected" ]; then
     printf 'nao-consegui-medir'   # more classified files than files: inconsistent input, not evidence
     return 0
   fi
   if [ "$repaired" -gt 0 ]; then
     printf 'consertou-teste-vermelho'
+  elif [ "$portable" -gt 0 ]; then
+    printf 'consertou-portabilidade'
   elif [ "$unclassified" -gt 0 ]; then
     printf 'nao-consegui-medir'
   else
@@ -3255,6 +3271,149 @@ gate_base_test_old_state() {
     else
       printf 'old-fails'
     fi
+  fi
+  return 0
+}
+
+# ── Portability repairs (ga-hlcfzx9) ───────────────────────────────────────────
+# The ga-yl1k3w repair proof needs the old form of the test to be RED on this
+# base, here on the mini (macOS). A test that is red ONLY on the Linux node and
+# green here before and after (ga-9s361xi: a 500000-byte `jq --arg` passes on
+# macOS and exits 126 on Linux, MAX_ARG_STRLEN) never gives that proof, so its
+# repair read as passou-na-base and was refused. Two pieces close the gap, and
+# BOTH are required: the builder DECLARES it, and the Linux node MEASURES it.
+#   * declared  — label teste:portabilidade-os on the source bead
+#                 (gate_base_test_portability_declared). A declaration alone proves
+#                 nothing; it only says the node is worth asking.
+#   * measured  — base's own copy of the test is run on the node and must go red
+#                 there while the branch's copy goes green in the same worktree
+#                 (gate_base_test_node_state). A test green on BOTH systems before
+#                 the fix is node-green and stays refusable.
+# The arm is never chosen by bead id (Mayor, 2026-10-26): the path hangs off the
+# declaration and the measurement, so it cannot bias the A/B experiment.
+
+# gate_base_test_portability_declared <store> <bead-id>  (ga-hlcfzx9)
+#   Did the builder declare, on the source bead, that this change repairs a test
+#   that is red only on another OS? Prints exactly one word, ALWAYS returns 0 (the
+#   guard runs under set -e):
+#     yes      — the bead was read and carries the label teste:portabilidade-os.
+#     no       — the bead was read and does not (a bead with no labels at all
+#                included: `bd` omits the key then, and omitted is "has none").
+#     unknown  — empty args, `bd show` failed or printed nothing, the output is not
+#                JSON, it is not THIS bead's record (a not-found probe answers
+#                {"error":...}, which has no labels and must not read as "no"), or
+#                "labels" is not a list of strings. The caller treats it as
+#                unclassified (nao-consegui-medir), never as a refusal: "could not
+#                read the declaration" is not "nobody declared".
+gate_base_test_portability_declared() {
+  local store="$1" bead="$2" raw="" verdict=""
+  if [ -z "$store" ] || [ -z "$bead" ]; then printf 'unknown'; return 0; fi
+  # vazio → unknown (nothing to read); falhou/ilegível → unknown too, never "no"
+  raw=$(bd -C "$store" show "$bead" --json 2>/dev/null) || { printf 'unknown'; return 0; }
+  if [ -z "$raw" ]; then printf 'unknown'; return 0; fi
+  verdict=$(printf '%s' "$raw" | jq -r --arg b "$bead" '
+    (if type == "array" then .[0] else . end) as $x
+    | if ($x | type) == "object" and (($x.id // "") == $b)
+      then (($x.labels // []) as $l
+            | if ($l | type) == "array" and ($l | all(type == "string"))
+              then (if ($l | index("teste:portabilidade-os")) != null then "yes" else "no" end)
+              else error("labels is not a list of strings") end)
+      else error("not this bead") end' 2>/dev/null) || { printf 'unknown'; return 0; }
+  case "$verdict" in
+    yes|no) printf '%s' "$verdict" ;;
+    *)      printf 'unknown' ;;
+  esac
+  return 0
+}
+
+# gate_base_test_node_rc_class <rc>  (ga-hlcfzx9) — pure.
+#   What a run of one selftest on the Linux node (scripts/mbp-run.sh --repo hq) means.
+#   Prints exactly one word:
+#     green    — 0.
+#     red      — 1..95 (the selftest's own failure, propagated by mbp-run.sh) or
+#                126/127 (a command inside it could not be executed / was not found
+#                there). 126 is not a stretch: it IS the failure ga-9s361xi is about.
+#                Taken as "red" ONLY because the caller also needs the branch's copy
+#                to run green in the same worktree: if the environment were merely
+#                broken the new form would fail too.
+#     unknown  — everything else: 96..99 are mbp-run.sh's own "node did not run it"
+#                (off, paused, unhealthy, slots busy, usage), 124 is a timeout (would
+#                it have failed or only needed longer?), >=128 is a signal (OOM kill,
+#                ssh gone), and anything not a plain integer. None says the test was red.
+gate_base_test_node_rc_class() {
+  local rc="${1-}"
+  case "$rc" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
+  rc=$(( 10#$rc ))
+  if [ "$rc" -eq 0 ]; then printf 'green'
+  elif [ "$rc" -le 95 ] || [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then printf 'red'
+  else printf 'unknown'
+  fi
+  return 0
+}
+
+# gate_base_test_node_state <rig> <base> <tip> <worktree> <file>  (ga-hlcfzx9)
+#   For a MODIFIED selftest whose old and new forms both passed on the mini: what do
+#   they do on the Linux node? Run by the Step 5b-pre2 loop only after the mini said
+#   old-passes AND the source bead declared portability. Prints exactly one word and
+#   ALWAYS returns 0:
+#     node-red    — base's copy ran on the node and went red (rc class "red") AND the
+#                   branch's copy ran green there, in the same worktree and with the
+#                   same sibling files: only the test's own diff explains the change.
+#                   This is the portability repair.
+#     node-green  — base's copy ran on the node and exited 0: green on BOTH systems
+#                   before the fix, so the test proves nothing. Stays refusable.
+#     unknown     — anything else: empty args, a file that is not under
+#                   .gascity-gastown-hq/ (only the hq's selftests can go to the node:
+#                   mbp-run.sh --repo hq), no executable mbp-run.sh, a copy that cannot
+#                   be extracted, an old-form rc that is not an answer (96..99, 124,
+#                   >=128, garbled), or a new form that is not green there.
+#   Side effect, deliberate: OVERWRITES <worktree>/<file> (base copy first, then the
+#   branch copy); the caller has nothing left to run from it. Each node call has its own
+#   budget (GATE_ABT_NODE_TIMEOUT seconds, default 300), also handed to mbp-run.sh as
+#   MBP_RUN_TIMEOUT_S so the REMOTE process dies with it (ga-vg16lk: a local `timeout`
+#   alone leaves the remote selftest running for hours). GATE_ABT_MBP_RUN swaps the
+#   wrapper so the selftest can prove every branch without a node; the guard never sets it.
+gate_base_test_node_state() {
+  local rig="$1" base="$2" tip="$3" wt="$4" f="$5" target="" mbp="" budget="" hq="" rc=0 cls=""
+  if [ -z "$rig" ] || [ -z "$base" ] || [ -z "$tip" ] || [ -z "$wt" ] || [ -z "$f" ]; then
+    printf 'unknown'; return 0
+  fi
+  case "$f" in
+    .gascity-gastown-hq/?*) target="${f#.gascity-gastown-hq/}" ;;
+    *) printf 'unknown'; return 0 ;;
+  esac
+  mbp="${GATE_ABT_MBP_RUN:-${GC_CITY:-}/scripts/mbp-run.sh}"
+  if [ ! -x "$mbp" ]; then printf 'unknown'; return 0; fi
+  budget="${GATE_ABT_NODE_TIMEOUT:-300}"
+  case "$budget" in ''|*[!0-9]*|0) budget=300 ;; esac
+  hq="$wt/.gascity-gastown-hq"
+  mkdir -p "$(dirname "$wt/$f")" 2>/dev/null || true
+
+  # old form first: it decides whether the new form is worth a second node round trip.
+  if ! git -C "$rig" show "${base}:${f}" > "$wt/$f" 2>/dev/null; then printf 'unknown'; return 0; fi
+  if MBP_RUN_TIMEOUT_S="$budget" timeout "$((budget + 45))" "$mbp" --repo hq --dir "$hq" -- "$target" >/dev/null 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  cls=$(gate_base_test_node_rc_class "$rc")
+  case "$cls" in
+    green) printf 'node-green'; return 0 ;;
+    red)   : ;;
+    *)     printf 'unknown'; return 0 ;;
+  esac
+
+  # control: the branch's copy, same worktree, same siblings. Not green = not proof.
+  if ! git -C "$rig" show "${tip}:${f}" > "$wt/$f" 2>/dev/null; then printf 'unknown'; return 0; fi
+  if MBP_RUN_TIMEOUT_S="$budget" timeout "$((budget + 45))" "$mbp" --repo hq --dir "$hq" -- "$target" >/dev/null 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [ "$(gate_base_test_node_rc_class "$rc")" = "green" ]; then
+    printf 'node-red'
+  else
+    printf 'unknown'
   fi
   return 0
 }
@@ -8635,6 +8794,16 @@ fi
 # old form that cannot be measured is unclassified -> nao-consegui-medir.
 # All of it lives inside the arm-B branch below; arm A never reaches it.
 #
+# Portability repairs (ga-hlcfzx9, Mayor 2026-10-26): the repair proof above needs the OLD form
+# red HERE, on the mini. A test red only on the Linux node (ga-9s361xi: jq --arg of 500000 bytes
+# is fine on macOS and exits 126 on Linux, MAX_ARG_STRLEN) is green here before and after, so it
+# read as passou-na-base. Now, for a MODIFIED selftest that passed in both forms here AND whose
+# source bead carries the label teste:portabilidade-os, gate_base_test_node_state asks the node:
+# base's copy red + the branch's copy green there -> counted as portable -> verdict
+# consertou-portabilidade (never blocks, tallied apart). Green on the node too -> still
+# passou-na-base. Label unreadable, node off or busy, file outside the hq -> unclassified ->
+# nao-consegui-medir. No label -> exactly the answer it always was. Never keyed on the bead id.
+#
 # Known blind spot, counted not closed (ga-x4mkk2, Mayor decision 2026-09-25): the
 # detection below only sees selftests inside the RIG_PATH directory, which for the
 # gascity rig is a subdirectory of the repo. A changed selftest elsewhere in the repo is
@@ -8658,6 +8827,7 @@ if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
                                          # below once a stage actually succeeds
     _ABT_DETECTED=0; _ABT_COPY_OK=0; _ABT_RAN=0; _ABT_FAILED=0
     _ABT_REPAIRED=0; _ABT_UNCLASSIFIED=0   # ga-yl1k3w: see gate_base_test_old_state
+    _ABT_PORTABLE=0; _ABT_PORT_DECL=""     # ga-hlcfzx9: see gate_base_test_node_state; DECL stays "" until first needed
     _ABT_OUTSIDE="unknown"                 # ga-x4mkk2: "never measured" must not read as 0
     _ABT_BASE=""; _ABT_TEST_FILES=""
     # ga-kisvqp: pytest/js half. py/js are "unknown" until a TOTALS line has actually been READ: a count that was never
@@ -8745,7 +8915,26 @@ if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
                 # unrecognised answer is "don't know" -> unclassified, never a refusal.
                 case "$(gate_base_test_old_state "$RIG_PATH" "$_ABT_BASE" "$_ABT_WT" "$_abt_f")" in
                   old-fails)         _ABT_REPAIRED=$((_ABT_REPAIRED + 1)) ;;
-                  added|old-passes)  : ;;
+                  added)             : ;;
+                  old-passes)
+                    # ga-hlcfzx9: green here in BOTH forms. Only a DECLARED portability repair
+                    # is worth asking the Linux node about; the declaration is read once, and
+                    # only now (a submission that never gets here pays nothing).
+                    # Declaration unreadable -> unclassified (nao-consegui-medir): "could not
+                    # read it" is not "nobody declared it", and must not refuse the builder.
+                    if [ -z "$_ABT_PORT_DECL" ]; then
+                      _ABT_PORT_DECL=$(gate_base_test_portability_declared "$BEAD_CITY" "$BEAD_ID")
+                    fi
+                    case "$_ABT_PORT_DECL" in
+                      no)  : ;;
+                      yes)
+                        case "$(gate_base_test_node_state "$RIG_PATH" "$_ABT_BASE" "$_ABT_BRANCH_SHA" "$_ABT_WT" "$_abt_f")" in
+                          node-red)    _ABT_PORTABLE=$((_ABT_PORTABLE + 1)) ;;
+                          node-green)  : ;;
+                          *)           _ABT_UNCLASSIFIED=$((_ABT_UNCLASSIFIED + 1)) ;;
+                        esac ;;
+                      *)   _ABT_UNCLASSIFIED=$((_ABT_UNCLASSIFIED + 1)) ;;
+                    esac ;;
                   *)                 _ABT_UNCLASSIFIED=$((_ABT_UNCLASSIFIED + 1)) ;;
                 esac
               else
@@ -8774,13 +8963,13 @@ ABT_TEST_FILES_EOF
         _ABT_DETECTED=$((_ABT_DETECTED + _ABT_PYJS_DET)); _ABT_COPY_OK=$((_ABT_COPY_OK + _ABT_PYJS_COPY))
         _ABT_RAN=$((_ABT_RAN + _ABT_PYJS_RAN)); _ABT_FAILED=$((_ABT_FAILED + _ABT_PYJS_FAILED))
         _ABT_REPAIRED=$((_ABT_REPAIRED + _ABT_PYJS_REP)); _ABT_UNCLASSIFIED=$((_ABT_UNCLASSIFIED + _ABT_PYJS_UNC))
-        _ABT_VERDICT=$(gate_base_test_verdict "$_ABT_DETECTED" "$_ABT_COPY_OK" "$_ABT_RAN" "$_ABT_FAILED" "$_ABT_REPAIRED" "$_ABT_UNCLASSIFIED")
+        _ABT_VERDICT=$(gate_base_test_verdict "$_ABT_DETECTED" "$_ABT_COPY_OK" "$_ABT_RAN" "$_ABT_FAILED" "$_ABT_REPAIRED" "$_ABT_UNCLASSIFIED" "$_ABT_PORTABLE")
       fi
     fi
 
     bd -C "$GC_CITY" label add "$MARKER_ID" "gate-ab:arm-b" -q 2>/dev/null || true
     bd -C "$GC_CITY" label add "$MARKER_ID" "gate-ab-basetest:$_ABT_VERDICT" -q 2>/dev/null || true
-    log "AB-BASE-TEST bead=$BEAD_ID arm=B verdict=$_ABT_VERDICT branch=$BRANCH base=$_ABT_BASE detected=$_ABT_DETECTED copy_ok=$_ABT_COPY_OK ran=$_ABT_RAN failed=$_ABT_FAILED repaired=$_ABT_REPAIRED unclassified=$_ABT_UNCLASSIFIED outside-subtree=$_ABT_OUTSIDE"
+    log "AB-BASE-TEST bead=$BEAD_ID arm=B verdict=$_ABT_VERDICT branch=$BRANCH base=$_ABT_BASE detected=$_ABT_DETECTED copy_ok=$_ABT_COPY_OK ran=$_ABT_RAN failed=$_ABT_FAILED repaired=$_ABT_REPAIRED unclassified=$_ABT_UNCLASSIFIED portable=$_ABT_PORTABLE outside-subtree=$_ABT_OUTSIDE"
     # ga-kisvqp: the pytest/js breakdown rides on its OWN lines, so the line above keeps the exact shape
     # gate-ab-apuracao.sh (and ga-x4mkk2's last-field rule) depend on.
     log "AB-BASE-TEST-PYJS bead=$BEAD_ID arm=B sh=$_ABT_SH_N py=$_ABT_NPY js=$_ABT_NJS pyjs=$_ABT_PYJS_STATE marker=$MARKER_ID"
@@ -8789,10 +8978,19 @@ ABT_TEST_FILES_EOF
     if [ "$_ABT_VERDICT" = "passou-na-base" ]; then
       err "  base-commit-test-check (ga-rstae, arm B): $_ABT_DETECTED new/changed test file(s) (selftest, pytest, js) on $BRANCH ALL pass unmodified against pre-fix base $_ABT_BASE — proves nothing about this branch's own diff. Refusing at submission."
       set_gate_status "$MARKER_ID" "error"
+      # ga-hlcfzx9: tell the builder about the portability path. Declared and still refused means the node
+      # answered node-green for every file that got that far (anything it could not answer would have made
+      # the verdict nao-consegui-medir, not this refusal).
+      if [ "$_ABT_PORT_DECL" = "yes" ]; then
+        _ABT_PORT_NOTE="Your bead already carries teste:portabilidade-os, and the Linux node ran base's own copy of the test GREEN as well: it passes on BOTH systems before the fix, so it proves nothing on either."
+      else
+        _ABT_PORT_NOTE="If this change repairs a test that is red only on ANOTHER OS (e.g. it fails on the Linux node and passes on this macOS mini both before and after), declare it on the source bead and push again:  bd label add $BEAD_ID teste:portabilidade-os   The guard then runs base's own copy of the test on the Linux node and accepts the repair if it is RED there and your copy is GREEN there. A test that passes on both systems stays refused."
+      fi
       bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: base-commit test check (ga-rstae, A/B experiment arm B).
 $_ABT_DETECTED new/changed test file(s) on $BRANCH pass UNCHANGED when run against the pre-fix base commit ($_ABT_BASE) — meaning they don't actually exercise the bug/regression this branch claims to fix (test-driven-development's own Iron Law: a test that passes before your fix exists proves nothing).
 Files: $(printf '%s\n%s\n' "$_ABT_TEST_FILES" "$_ABT_PYJS_FILE_LIST" | grep -v '^$' | paste -sd ' ' -)
 (For a test file you MODIFIED, this also means base's own copy of that file PASSED on base — a repair of a test that was red on base is accepted, not refused: ga-yl1k3w.)
+$_ABT_PORT_NOTE (ga-hlcfzx9)
 Fix (this is the point of the check, not busywork): strengthen the test so it FAILS against base — i.e. it actually depends on your fix — then push again:
   git push origin $BRANCH
 Then re-run /gate-done. Marker set to gate-status:error (fixable + re-submittable, not lost).
