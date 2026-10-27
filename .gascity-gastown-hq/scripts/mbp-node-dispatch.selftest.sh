@@ -155,6 +155,13 @@ fresh; d apply;         expect_rc "sem argumentos -> uso (2)" 2
 fresh; d apply wa-t1 --dry-run; expect_rc "apply --dry-run -> 0 sem escrita" 0 w0
 # ---- despachante real ausente
 fresh; MBP_NODE_DISPATCH="$T/nao-existe.sh" d apply wa-t1; expect_rc "despachante real ausente -> 11 sem escrita" 11 w0
+# ---- o prazo de teste (MBP_NODE_TIMEOUT) chega ao despachante como WA_NODE_TIMEOUT; sem ele o WA_NODE_TIMEOUT do ambiente fica como está (ga-u6ueg0q)
+# o despachante aqui é um stub que só imprime o WA_NODE_TIMEOUT que recebeu: sem o repasse sai "unset"; um repasse com MBP_NODE_TIMEOUT vazio apagaria o 9 herdado
+printf '#!/bin/sh\necho "WA_NODE_TIMEOUT=${WA_NODE_TIMEOUT-unset}"\n' > "$T/echo-timeout.sh"; chmod +x "$T/echo-timeout.sh"
+got=$( unset WA_NODE_TIMEOUT; export MBP_NODE_TIMEOUT=7 MBP_NODE_DISPATCH="$T/echo-timeout.sh"; "$REAL" check wa-t1 2>&1 )
+[ "$got" = "WA_NODE_TIMEOUT=7" ] && ok "MBP_NODE_TIMEOUT=7 chega ao despachante como WA_NODE_TIMEOUT=7" || bad "MBP_NODE_TIMEOUT=7: o despachante recebeu '$got'"
+got=$( unset MBP_NODE_TIMEOUT; export WA_NODE_TIMEOUT=9 MBP_NODE_DISPATCH="$T/echo-timeout.sh"; "$REAL" check wa-t1 2>&1 )
+[ "$got" = "WA_NODE_TIMEOUT=9" ] && ok "sem MBP_NODE_TIMEOUT o WA_NODE_TIMEOUT=9 do ambiente passa intacto" || bad "sem MBP_NODE_TIMEOUT: o despachante recebeu '$got' (esperado 9 herdado)"
 
 # ---- 2 slots do MBP (e só do MBP)
 fresh; busy wa-b1 wa-worker-remote-mbp-1; d apply wa-t1

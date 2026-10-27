@@ -150,6 +150,13 @@ fresh; d apply;         expect_rc "sem argumentos -> uso (2)" 2
 fresh; d apply ps-t1 --dry-run; expect_rc "apply --dry-run -> 0 sem escrita" 0 w0
 # ---- despachante real ausente
 fresh; PS_NODE_DISPATCH="$T/nao-existe.sh" d apply ps-t1; expect_rc "despachante real ausente -> 11 sem escrita" 11 w0
+# ---- o prazo de teste (PS_NODE_TIMEOUT) chega ao despachante como WA_NODE_TIMEOUT; sem ele o WA_NODE_TIMEOUT do ambiente fica como está (ga-u6ueg0q)
+# o despachante aqui é um stub que só imprime o WA_NODE_TIMEOUT que recebeu: sem o repasse sai "unset"; um repasse com PS_NODE_TIMEOUT vazio apagaria o 9 herdado
+printf '#!/bin/sh\necho "WA_NODE_TIMEOUT=${WA_NODE_TIMEOUT-unset}"\n' > "$T/echo-timeout.sh"; chmod +x "$T/echo-timeout.sh"
+got=$( unset WA_NODE_TIMEOUT; export PS_NODE_TIMEOUT=7 PS_NODE_DISPATCH="$T/echo-timeout.sh"; "$REAL" check ps-t1 2>&1 )
+[ "$got" = "WA_NODE_TIMEOUT=7" ] && ok "PS_NODE_TIMEOUT=7 chega ao despachante como WA_NODE_TIMEOUT=7" || bad "PS_NODE_TIMEOUT=7: o despachante recebeu '$got'"
+got=$( unset PS_NODE_TIMEOUT; export WA_NODE_TIMEOUT=9 PS_NODE_DISPATCH="$T/echo-timeout.sh"; "$REAL" check ps-t1 2>&1 )
+[ "$got" = "WA_NODE_TIMEOUT=9" ] && ok "sem PS_NODE_TIMEOUT o WA_NODE_TIMEOUT=9 do ambiente passa intacto" || bad "sem PS_NODE_TIMEOUT: o despachante recebeu '$got' (esperado 9 herdado)"
 # ---- o slot do PS é só do PS
 fresh; jq -c '. + {"wa-busy":{"id":"wa-busy","status":"in_progress","assignee":"wa-worker-remote-1","metadata":{}}}' "$STATE" > "$STATE.n" && mv "$STATE.n" "$STATE"
 d apply ps-t1; expect_rc "slot do WA ocupado (bead em andamento do wa-worker-remote-1) NÃO ocupa o do PS -> 0" 0
