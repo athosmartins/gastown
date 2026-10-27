@@ -9,6 +9,8 @@
 #   mail que falha, modo foco, chave de ligar, vigia cego) · baixa (aviso de CPU baixa, ga-2hd02v.6: CPU média < 85 % por 30 min, sem olhar fila, sessão nem foco; vigia cego para a CPU; o número por dia é a média de CPU) · saida (JSONL, número por dia, arquivos corrompidos, --dry-run, instância única, crash e falha de gravação, nada fora de .gc).
 # CONTROLE NEGATIVO: cada mutante (um trecho literal do script trocado, que tem de existir UMA vez) TEM de reprovar o grupo que o pega; mutante que passa = teste que não pega o bug. Só roda sem argumento e com o script de verdade.
 #   Cada mutante roda em segundo plano com o PRÓPRIO diretório temporário e para no 1º caso que reprova (o resto do grupo não diz nada de novo): sem isso eram ~80 grupos inteiros em série, mais de 10 min.
+#   EQUIVALENTE (ga-u6ueg0q): `universal_newlines=True` no Popen de run_cmd não tem caso que o separe do False: com `errors="replace"` o subprocess já abre os canais em texto e traduz a quebra de linha,
+#   então as duas formas devolvem a mesma saída.
 # COMO RODAR: hetzner-occupancy-watch.selftest.sh [grupo ...]   (sem argumento: todos os grupos e o controle negativo). HETZNER_OCC_UNDER_TEST=<script> roda a suíte contra outra cópia.
 #   HOCC_JOBS=N mutantes ao mesmo tempo (padrão 4; 1 = em série) · HOCC_NO_MUTANTS=1 pula o controle negativo (290 dos 370 casos, ~40 s no Linux) · HOCC_SLOW_START=N faz o python do vigia levar N s para subir, como o mini sob carga (com HOCC_NO_MUTANTS=1).
 #   Tudo: ~140 s no Linux; no mini, sob carga, a fatia 1 sozinha (238 verificações; hoje são 370) levou ~7 min (medido pelo gate em 19/10). RELÓGIO: nenhum caso mede o tempo de parede do vigia (no mini sob carga só subir o python já passou de 1 s, 19/10): a ordem das duas instâncias é por EVENTO (await) e o único prazo, o do run_cmd, é medido dentro do python.
@@ -162,7 +164,7 @@ items += [{"id": "wa-x%d" % i, "title": "t", "type": "bug", "rig": "whatsapp_aut
 json.dump({"generated_at": datetime.datetime.fromtimestamp(gen, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "ttl_seconds": ttl, "count": len(items), "items": items}, open(path, "w"))
 PY
 }
-focus_is() {   # focus_is on|off|stale|future|corrupt|missing : o gate-focus.state como o gate-focus-mode.sh grava (at = NOW)
+focus_is() {   # focus_is on|off|stale|future|corrupt|badflag|badat|missing : o gate-focus.state como o gate-focus-mode.sh grava (at = NOW)
   local f="$C/.gc/gate-focus.state"
   case "$1" in
     on)      printf 'active=1\nat=%s\ndepth=20\n' "$NOW" > "$f" ;;
@@ -170,6 +172,8 @@ focus_is() {   # focus_is on|off|stale|future|corrupt|missing : o gate-focus.sta
     stale)   printf 'active=1\nat=%s\n' "$((NOW - 9000))" > "$f" ;;
     future)  printf 'active=1\nat=%s\n' "$((NOW + 600))" > "$f" ;;
     corrupt) printf 'isto não é um estado\n' > "$f" ;;
+    badflag) printf 'active=2\nat=%s\n' "$NOW" > "$f" ;;
+    badat)   printf 'active=1\nat=abc\n' > "$f" ;;
     missing) rm -f "$f" ;;
   esac
 }
@@ -200,6 +204,7 @@ g_cfg() {
   eq "... por 30 min" 1800 "$(reading low_after_s)"; eq "... cooldown de 3 h" 10800 "$(reading low_cooldown_s)"
   W HETZNER_OCC_LOW_PCT=70 HETZNER_OCC_LOW_AFTER_S=3600 HETZNER_OCC_LOW_COOLDOWN_S=60 -- --print-config
   eq "env muda a régua de CPU baixa" 70.0 "$(reading low_pct)"; eq "env muda o prazo" 3600 "$(reading low_after_s)"; eq "env muda o cooldown" 60 "$(reading low_cooldown_s)"
+  W HETZNER_OCC_IDLE_COOLDOWN_S=0 -- --print-config; eq "cooldown do aviso de ocioso 0 é aceito (sem espera entre um aviso e o seguinte)" 0 "$(reading idle_cooldown_s)"
   W HETZNER_OCC_LOW_PCT=0 -- --print-config; eq "régua 0 é aceita (desliga o aviso de CPU baixa)" 0.0 "$(reading low_pct)"
   W HETZNER_OCC_LOW_PCT=100 -- --print-config; eq "régua 100 é aceita" 100.0 "$(reading low_pct)"
   local bad_pct
@@ -435,6 +440,8 @@ g_cpu() {
   fresh; tick 900 5 >/dev/null; local e1; e1=$(state_f cpu.epoch)
   tick 30 5
   eq "2ª leitura 30 s depois (janela curta): NÃO lida" false "$(reading cpu.lido)"; eq "... motivo" janela-curta "$(reading cpu.motivo)"; eq "... baseline mantido (não é trocado por uma janela curta)" "$e1" "$(state_f cpu.epoch)"
+  tick 89 5; eq "119 s desde o baseline (um a menos que o piso de 120 s): ainda NÃO lida" janela-curta "$(reading cpu.motivo)"
+  tick 1 5; eq "120 s exatos (o piso da janela): lida" true "$(reading cpu.lido)"; eq "... janela de 120 s" 120 "$(reading cpu.janela_s)"
   tick 3000 5
   eq "janela de 50 min (> 3 intervalos): NÃO lida" false "$(reading cpu.lido)"; eq "... motivo" leitura-anterior-velha "$(reading cpu.motivo)"; eq "... baseline REPOSTO (a próxima já mede)" "$NOW" "$(state_f cpu.epoch)"
   tick 900 5; eq "... e a seguinte volta a ser lida" true "$(reading cpu.lido)"
@@ -585,7 +592,7 @@ g_alarme() {
   # a regra de 3 estados do foco é a da gate-focus-lib.sh: a leitura do vigia tem de concordar com a da lib em cada estado
   if [ -f "$FOCUS_LIB" ]; then
     local mode lib want got
-    for mode in on off stale future corrupt missing; do
+    for mode in on off stale future corrupt badflag badat missing; do
       fresh; focus_is "$mode"; W -- --dry-run --print; got=$(reading foco)
       lib=$(bash -c '. "$1"; GATE_FOCUS_STATE_FILE="$2" GATE_FOCUS_NOW="$3" gate_focus_active' _ "$FOCUS_LIB" "$C/.gc/gate-focus.state" "$NOW")
       case "$lib" in 1) want=ligado ;; 0) want=desligado ;; *) want=desconhecido ;; esac
