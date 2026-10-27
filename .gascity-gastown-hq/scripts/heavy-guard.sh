@@ -66,9 +66,11 @@
 #   - START floor DISK_PUSH_MIN_MB (5000), a MINIMUM like the Go floor: --min-free-mb can raise it for one call, never lower it.
 #   - STOP floor DISK_PUSH_STOP_MB (4000): while the push runs, df is read every HEAVY_GUARD_WATCH_SECS (3); a reading UNDER it sends
 #     TERM to the push's whole process group (KILL after HEAVY_GUARD_KILL_GRACE_SECS, 5, for what is left) and the guard exits 78 with
-#     a message that says not to repeat it and to tell the Mayor: the disk is near the Dolt CRITICAL floor (3 GB). A reading the watch
-#     cannot take (df fails) never kills a push — it goes on, and the log gets one WATCH_UNREADABLE line; the decision to START was
-#     taken on a good reading. An unreadable disk BEFORE the start is the usual 76.
+#     a message that says not to repeat it and to tell the Mayor: the disk is near the Dolt CRITICAL floor (3 GB). The guard hears it
+#     from the watch's EXIT STATUS (78), never from a signal: a signal cuts its `wait` short and bash (3.2.57 and 5.2.21 alike) can then
+#     answer -1 for the push instead of its status (ga-dousipw). A reading the watch cannot take (df fails) never kills a push — it goes
+#     on, and the log gets one WATCH_UNREADABLE line; the decision to START was taken on a good reading. An unreadable disk BEFORE the
+#     start is the usual 76.
 #   - ONE push at a time: a mkdir lock ($HEAVY_GUARD_PUSH_LOCK_DIR, default $GC_CITY_PATH/.gc/heavy-guard-push.lock) holding
 #     "<pid> <epoch>". A second push waits for it (HEAVY_GUARD_PUSH_LOCK_WAIT_SECS, 900; polled every HEAVY_GUARD_PUSH_LOCK_POLL_SECS,
 #     2); still held after the wait -> rc 79. The lock is taken over when its pid is dead or its stamp is older than
