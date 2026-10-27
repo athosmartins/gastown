@@ -2,7 +2,7 @@
 # heavy-guard.sh (ga-vln2py, P0) — keep a HEAVY step from starting on the mini while the disk is near the floor.
 #
 # ## Contents
-#   Why · Usage · Exit codes · What counts as heavy · Go class · Push class · File-cap class · Where it is wired · Lib lookup · Not covered
+#   Why · Usage · Exit codes · What counts as heavy · Go class · Push class · File-cap class · Disk-watch class · Where it is wired · Lib lookup · Not covered
 #
 # WHY. 17/10 12:40-12:56 three agent steps (a git repack, a selftest copying hq.jsonl, `go build` + golangci-lint of
 # the beads repo) ran with the disk already low and filled it: Dolt took ENOSPC writing its journal and the data
@@ -10,7 +10,7 @@
 # mattered, so this is a command, not a paragraph: it checks `df` and either runs the step or says no.
 #
 # USAGE
-#   heavy-guard.sh [--min-free-mb N] [--wait-secs S] [--max-file-mb M] [--what LABEL] -- <command> [args...]
+#   heavy-guard.sh [--min-free-mb N] [--wait-secs S] [--max-file-mb M] [--max-disk-drop-mb D] [--what LABEL] -- <command> [args...]
 #       free >= N  -> runs the command (exec) and returns its exit code.
 #       free <  N  -> waits up to S seconds (default 0) for the disk to recover, then refuses WITHOUT running it.
 #   heavy-guard.sh --check [--min-free-mb N] [--wait-secs S] [--what LABEL]
@@ -22,6 +22,7 @@
 #           "$GC_CITY_PATH/scripts/heavy-guard.sh" --what pre-push --wait-secs 600 -- git push origin HEAD
 #   a selftest or a mutant battery also runs with a cap on the size of each file it writes (see "FILE-CAP CLASS"):
 #           "$GC_CITY_PATH/scripts/heavy-guard.sh" --what selftest-hq --max-file-mb 512 -- bash scripts/X.selftest.sh
+#   and it runs under a watch of the free disk (see "DISK-WATCH CLASS"): a loop that writes many small files is stopped with rc 78.
 #
 # EXIT CODES (deliberately OUTSIDE mbp-run.sh's 96..99, which mean "run it locally" — a refusal here must never be
 # read as that):
@@ -35,8 +36,10 @@
 #                guards fails by ENOSPC on the database — and the line says so. Also: the file-size cap (below) was asked for
 #                and could not be set, or could not be read back.
 #   64  usage    bad flag / no command and no --check.
-#   78  INTERRUPTED (push class only) the disk fell UNDER DISK_PUSH_STOP_MB while the push ran and the guard stopped it. This is
-#                not "try again": do NOT repeat the push or find another route (no --no-verify), tell the Mayor.
+#   78  INTERRUPTED (push class, and the selftest/mutant class) the disk fell UNDER DISK_PUSH_STOP_MB while the step ran (the selftest/mutant
+#                class: or fell by more than the drop limit since it started, see "DISK-WATCH CLASS") and the guard stopped it. This is not "try
+#                again": do NOT repeat the push or find another route (no --no-verify); a selftest/mutant step left what it wrote on disk, find
+#                it (its TMPDIR) and clean it with safe-clean. Tell the Mayor.
 #   79  PUSH LOCK BUSY (push class only) another push held the push lock for the whole lock wait. NOT a disk problem and the
 #                push did not start: retry in a minute.
 #
@@ -110,9 +113,29 @@
 #     to the ask, because `ulimit -f N` sets both. What holds either way is the contract: the cap in force is at most the ask, never more.
 #   - --check runs nothing, so it has nothing to cap: it accepts the option and only judges the disk.
 # NOT covered: on macOS (the mini, where this guard runs) the limit is not applied at all to a write opened with O_APPEND (`>>`): measured 27/10 on Darwin, an `echo >>` loop under `ulimit -f 64` reached 303 KB, while the same loop
-# through `exec 3>` stopped at 65536 B; not measured on Linux. A `>>` loop on the mini has only `timeout` and a `df` check. And the cap is per FILE. A loop that writes many small files, or appends to one file after another, is not stopped by it
-# (the aggregate of a slot is a separate watchdog). A selftest that swallows the dead child's rc can still exit 0 and let a mutant survive:
+# through `exec 3>` stopped at 65536 B; not measured on Linux. So a `>>` loop on the mini passes the cap: only the DISK-WATCH CLASS below stops it, and only once the free disk has fallen by its limit (2048 MB by default). And the cap is per FILE.
+# A loop that writes many small files, or appends to one file after another, is not stopped by it either: the DISK-WATCH CLASS below is what stops it, at the same point. A selftest that swallows the dead child's rc can still exit 0 and let a mutant survive:
 # that is the selftest's own weakness, not the cap's.
+#
+# DISK-WATCH CLASS (ga-2d14tow). The cap above is per FILE and a loop that writes MANY small files goes under it: 50 000 files of 100 KB are 5 GB
+# and no file passes 512 MB. The disk floor is read before the step and nothing looked at the disk while it ran. So a selftest/mutant step (the
+# same test as the file cap: `selftest`, `mutant` or `mutat…` in the label or in a word of the command; never a Go step, never a git command) runs
+# as a CHILD of the guard, in its own process group, under the push class's watch:
+#   - every HEAVY_GUARD_WATCH_SECS (3) df is read; a reading UNDER the stop floor, OR a free disk that has FALLEN by HEAVY_GUARD_SELFTEST_MAX_DROP_MB
+#     (2048) or more since the step started, sends TERM to the step's whole process group (KILL after HEAVY_GUARD_KILL_GRACE_SECS) and the guard exits
+#     78 with a message that says what fell and what to do. The stop floor is DISK_PUSH_STOP_MB (4000), pulled down to the start floor in force: a step
+#     the caller let start low with --min-free-mb is not killed at the first reading. 2048 MB is far above what a selftest writes on purpose (tens of
+#     MB); where the mini sits at about 6 GB it meets the 4 GB floor, and on a roomy disk, where the floor is too far away, the drop rule is the one that acts.
+#   - --max-disk-drop-mb D sets D for any step (outside the class too) and beats the default; --max-disk-drop-mb 0 lifts the drop rule only, the stop
+#     floor stays. 0, empty or garbage in the env falls to 2048 and can never lift the limit. A Go step is never in the class (a build writes GBs on
+#     purpose), but the option applies to it when the caller asks for it. A push keeps its own watch and ignores the option.
+#   - a reading the watch cannot take (df fails) never stops the step: the round is blind and the log gets ONE WATCH_UNREADABLE line. The kill
+#     switch (DISK_HEADROOM_ENABLED=0) switches the whole watch off in effect: every state is ok and the drop rule is skipped.
+#   - what the step wrote STAYS on disk (TERM does not clean up after a loop): the message says to look under its TMPDIR and clean it with safe-clean.
+#   - limits: the fall is read on the whole volume, so another process writing at the same time counts against the step; a descendant that left the
+#     process group (setsid) is not reached by the TERM of the group; the step runs in the background of the guard, so it cannot read the terminal;
+#     a guard that is KILLed (not TERMed: no trap runs) leaves its step running, and the watch stays with it and goes on reading the disk until the step ends.
+#     --check runs nothing, so it has nothing to watch: it accepts the option and only judges the disk.
 #
 # WHERE IT IS WIRED. jsonl-archive-compact.selftest.sh (--check at the top); the doctrine paragraph in
 # packs/town-deltas/template-fragments/town-deltas.template.md and the HQ SELFTESTS text of the gate
@@ -131,8 +154,8 @@
 # through to another copy would hide a stale or broken lib. Nothing readable anywhere stays rc 76 (fail CLOSED),
 # and the refusal lists every place that was looked at. HEAVY_GUARD_LIB set means exactly that file and no other.
 #
-# NOT COVERED. A session that is ALREADY inside a step when the disk falls is not interrupted (the push class is the one exception:
-# it carries its own watch). If the watch process cannot even be forked (the machine is out of processes) the push runs unwatched. dolt-disk-floor-guard.sh
+# NOT COVERED. A session that is ALREADY inside a step when the disk falls is not interrupted (the push class and the selftest/mutant
+# class are the exceptions: they carry their own watch). If the watch process cannot even be forked (the machine is out of processes) the push runs unwatched. dolt-disk-floor-guard.sh
 # frees caches at CRITICAL; telling the open pool sessions to stop their heavy steps is a separate slice (ga-vln2py.3).
 # Nothing here stops NEW work either (the Pilot sweep: ga-ydaslo; the pool probes: ga-09hfgh).
 #
@@ -142,7 +165,8 @@
 #
 # Seams (selftests): DISK_FREE_OVERRIDE_MB pins the reading; HEAVY_GUARD_POLL_SECS (default 15) is the wait step; the push class
 # reads HEAVY_GUARD_WATCH_SECS, HEAVY_GUARD_KILL_GRACE_SECS and HEAVY_GUARD_PUSH_LOCK_{DIR,WAIT_SECS,POLL_SECS,MAXAGE_SECS};
-# the file-cap class reads HEAVY_GUARD_SELFTEST_MAX_FILE_MB.
+# the file-cap class reads HEAVY_GUARD_SELFTEST_MAX_FILE_MB; the disk-watch class reads HEAVY_GUARD_SELFTEST_MAX_DROP_MB, HEAVY_GUARD_WATCH_SECS
+# and HEAVY_GUARD_KILL_GRACE_SECS.
 
 HG_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HG_LIB_REL="packs/town-deltas/assets/scripts/disk-headroom-lib.sh"
@@ -429,6 +453,8 @@ hg_watch() {
   [ "$HG_WKIND" != step ] || stop="$HG_WSTOP"
   while :; do
     sleep "$HG_WATCH"
+    # the child is gone: nothing left to watch. This is what ends a watch whose guard was KILLed (no trap ran, and the watch lives in its own process group); without it the loop would read the disk for ever and, with the pid recycled, one day TERM somebody else's group
+    kill -0 "$pid" 2>/dev/null || return 0
     # vazio/falhou/ilegível → st is not "ok" nor "low": this round is blind; the child goes on and the log says so once
     f="$(disk_free_mb 2>/dev/null)" || f=""
     st="$(disk_state_of "$f" "$stop" 2>/dev/null)" || st=""

@@ -846,7 +846,7 @@ EOF
 # The fake df reports WBASE MB minus what the writer REALLY wrote into $WF, so "the fixture's disk does not pass N MB" is measured. The writer ends by itself at 200
 # files (~25 MB) only so that a guard WITHOUT the watch does not fill the disk of this selftest. WATCH_SECTIONS="drop floor" runs only those sections (default all).
 wcases() {
-  local g="$1" lib="$2" rc secs n n2 t0 out WB="$W/wbin" WF="$W/wfix" wall=" ${WATCH_SECTIONS:-all} "
+  local g="$1" lib="$2" rc secs n n2 t0 out lbl gp WB="$W/wbin" WF="$W/wfix" wall=" ${WATCH_SECTIONS:-all} "
   wwant() { case "$wall" in *" all "*|*" $1 "*) return 0 ;; esac; return 1; }
   mkdir -p "$WB"
   cat > "$WB/df" <<EOF
@@ -854,20 +854,27 @@ wcases() {
 if [ -e "$W/wdfbad" ]; then echo "df: no usable answer"; exit 0; fi
 kb=\$(du -sk "$WF" 2>/dev/null | cut -f1)
 echo "Filesystem 1048576-blocks Used Available Capacity Mounted on"
-echo "/dev/fake 100000 90000 \$(( \$(cat "$W/wbase") - \${kb:-0} / 1024 )) 90% /"
+echo "/dev/fake 100000 90000 \$(( \$(cat "$W/wbase") - \${kb:-0} / 1024 - \$(cat "$W/wjump" 2>/dev/null || echo 0) )) 90% /"
 EOF
   chmod +x "$WB/df"
   # 128 KB a file, ~100 files a second: far under any per-file cap. WLOOP_BAD=<file> makes the fake df unreadable while it writes.
   cat > "$W/wloop.sh" <<'EOF'
 #!/bin/bash
 d="$1"; mkdir -p "$d"; [ -z "${WLOOP_BAD:-}" ] || : > "$WLOOP_BAD"
-i=0; while [ "$i" -lt 200 ]; do i=$((i+1)); printf '%0131072d' 0 > "$d/f$i"; sleep 0.005; done
+i=0; while [ "$i" -lt 200 ]; do i=$((i+1)); printf '%0131072d' 0 > "$d/f$i"; sleep 0.01; done
 echo done > "$2"
 EOF
   cp "$W/wloop.sh" "$W/wloop.selftest.sh"
+  # a step whose writes make the disk "fall" 3000 MB at once (the fake df subtracts $W/wjump): only the 2048 MB DEFAULT limit can see it
+  cat > "$W/wjump.sh" <<'EOF'
+#!/bin/bash
+d="$1"; mkdir -p "$d"; i=0
+while [ "$i" -lt 150 ]; do i=$((i+1)); printf '%01024d' 0 > "$d/f$i"; [ "$i" = 5 ] && echo 3000 > "$WJUMP"; sleep 0.02; done
+echo done > "$2"
+EOF
   wrun() { # the guard on the fake df, a fresh fixture each time; leaves rc, secs and the number of files written
-    rm -rf "$WF" "$W/wdone" "$W/wdfbad"; echo "${WBASE:-9000}" > "$W/wbase"; : > "$HEAVY_GUARD_LOG"; t0=$SECONDS
-    PATH="$WB:$PATH" DISK_HEADROOM_PATH=/ HEAVY_GUARD_LIB="$lib" HEAVY_GUARD_WATCH_SECS=1 HEAVY_GUARD_KILL_GRACE_SECS=2 "$g" "$@" >/dev/null 2>"$W/werr"; rc=$?
+    rm -rf "$WF" "$W/wdone" "$W/wdfbad" "$W/wjump"; echo "${WBASE:-9000}" > "$W/wbase"; : > "$HEAVY_GUARD_LOG"; t0=$SECONDS
+    WJUMP="$W/wjump" PATH="$WB:$PATH" DISK_HEADROOM_PATH=/ HEAVY_GUARD_LIB="$lib" HEAVY_GUARD_WATCH_SECS=1 HEAVY_GUARD_KILL_GRACE_SECS=2 "$g" "$@" >/dev/null 2>"$W/werr"; rc=$?
     secs=$((SECONDS - t0)); n="$(ls "$WF" 2>/dev/null | wc -l | tr -d ' ')"
   }
   wstopped() { # the last wrun ended by the watch: 78, long before the writer's 200 files, in seconds, nothing left running, the reason said and logged
@@ -884,26 +891,50 @@ EOF
     check "watch: $1: the step's own rc comes back" 0 "$rc"
     [ -e "$W/wdone" ] || bad "watch: $1: the step was stopped at $n of 200 files (rc $rc), it must not be ($(head -c 300 "$W/werr"))"
   }
-  if wwant drop; then
-    wrun --what selftest-mutants --max-disk-drop-mb 4 -- bash "$W/wloop.sh" "$WF" "$W/wdone"
-    wstopped "a selftest label with --max-disk-drop-mb 4"
+  if wwant core; then
+    wrun --what selftest-mutants --max-disk-drop-mb 4 -- sh -c 'bash "$0" "$@"; exit $?' "$W/wloop.sh" "$WF" "$W/wdone"
+    wstopped "a selftest label with --max-disk-drop-mb 4, the writer a grandchild of the step"
     grep -q 'fell' "$W/werr" && grep -q 'limit 4 MB' "$W/werr" || bad "watch: the drop refusal must say how far it fell and the limit ($(cat "$W/werr"))"
+  fi
+  if wwant class; then
     HEAVY_GUARD_SELFTEST_MAX_DROP_MB=4 wrun --what t -- bash "$W/wloop.selftest.sh" "$WF" "$W/wdone"
     wstopped "a *.selftest.sh word in the command, the limit from the env"
-    HEAVY_GUARD_SELFTEST_MAX_DROP_MB=2048 wrun --what selftest --max-disk-drop-mb 4 -- bash "$W/wloop.sh" "$WF" "$W/wdone"
-    wstopped "the caller's number beats the class default"
-    wrun --what other --max-disk-drop-mb 4 -- bash "$W/wloop.sh" "$WF" "$W/wdone"
-    wstopped "--max-disk-drop-mb 4 on a step that is not in the class"
     HEAVY_GUARD_SELFTEST_MAX_DROP_MB=4 wrun --what other -- bash "$W/wloop.sh" "$WF" "$W/wdone"
     wuntouched "a step outside the class is not watched by the class default"
+  fi
+  if wwant caller; then
+    HEAVY_GUARD_SELFTEST_MAX_DROP_MB=2048 wrun --what selftest --max-disk-drop-mb 4 -- bash "$W/wloop.sh" "$WF" "$W/wdone"
+    wstopped "the caller's number beats the class default"
     HEAVY_GUARD_SELFTEST_MAX_DROP_MB=4 wrun --what selftest --max-disk-drop-mb 0 -- bash "$W/wloop.sh" "$WF" "$W/wdone"
     wuntouched "--max-disk-drop-mb 0 is the explicit way to lift the drop limit"
-    for out in 0 abc 99999999999999999999; do
-      HEAVY_GUARD_SELFTEST_MAX_DROP_MB="$out" wrun --what selftest -- bash "$W/wloop.sh" "$WF" "$W/wdone"
-      wuntouched "a class limit of '$out' in the env falls back to 2048 MB, it does not uncap or stop at once"
-    done
+  fi
+  if wwant optin; then
+    wrun --what other --max-disk-drop-mb 4 -- bash "$W/wloop.sh" "$WF" "$W/wdone"
+    wstopped "--max-disk-drop-mb 4 on a step that is not in the class"
+  fi
+  if wwant goclass; then
     HEAVY_GUARD_SELFTEST_MAX_DROP_MB=4 WBASE=20000 wrun --what go-test -- bash "$W/wloop.selftest.sh" "$WF" "$W/wdone"
     wuntouched "a Go step is not in the class even with a selftest word in its command"
+  fi
+  if wwant jdef; then
+    wrun --what selftest -- bash "$W/wjump.sh" "$WF" "$W/wdone"
+    wstopped "a fall of 3000 MB stops a selftest step with the DEFAULT limit"
+  fi
+  if wwant jenv; then
+    for out in 0 abc 99999999999999999999; do
+      HEAVY_GUARD_SELFTEST_MAX_DROP_MB="$out" wrun --what selftest -- bash "$W/wjump.sh" "$WF" "$W/wdone"
+      wstopped "a class limit of '$out' in the env falls back to 2048 MB, it does not lift the limit"
+    done
+    HEAVY_GUARD_SELFTEST_MAX_DROP_MB=4000 wrun --what selftest -- bash "$W/wjump.sh" "$WF" "$W/wdone"
+    wuntouched "a class limit of 4000 MB in the env lets a fall of 3000 MB through"
+  fi
+  if wwant jflag; then
+    wrun --what selftest --max-disk-drop-mb 0 -- bash "$W/wjump.sh" "$WF" "$W/wdone"
+    wuntouched "--max-disk-drop-mb 0 lets a fall of 3000 MB through (6000 MB are left, the floor is 4000)"
+  fi
+  if wwant bypass; then
+    DISK_HEADROOM_ENABLED=0 wrun --what selftest -- bash "$W/wjump.sh" "$WF" "$W/wdone"
+    wuntouched "with the kill switch on (checks off) the watch judges nothing"
   fi
   if wwant floor; then
     WBASE=4003 wrun --min-free-mb 4003 --what selftest --max-disk-drop-mb 0 -- bash "$W/wloop.sh" "$WF" "$W/wdone"
@@ -930,6 +961,15 @@ EOF
     done
     DISK_FREE_OVERRIDE_MB=20000 HEAVY_GUARD_LIB="$lib" "$g" --what t --max-disk-drop-mb 2>/dev/null; rc=$?
     check "watch: --max-disk-drop-mb without a value is a usage error" 64 "$rc"
+  fi
+  if wwant orphan; then
+    # a guard that is KILLed (no trap runs) leaves the step and the watch behind; the watch runs in its own process group, so nothing else ends it: it must end by
+    # itself once the step is gone, not read the disk for ever (and, with the pid recycled, one day TERM somebody else's group). The label is unique to this run.
+    lbl="selftest-orphan-$$"; rm -rf "$WF" "$W/wdone" "$W/wdfbad" "$W/wjump"; echo 9000 > "$W/wbase"
+    PATH="$WB:$PATH" DISK_HEADROOM_PATH=/ HEAVY_GUARD_LIB="$lib" HEAVY_GUARD_WATCH_SECS=1 "$g" --what "$lbl" --max-disk-drop-mb 4 -- sleep 3 > /dev/null 2>&1 &
+    gp=$!; sleep 1.5; kill -KILL "$gp" 2> /dev/null; wait "$gp" 2> /dev/null; sleep 5.5   # the step ends at ~3 s, the watch notices at its next round
+    out="$(pgrep -f "$lbl" | tr '\n' ' ')"
+    if [ -z "$out" ]; then ok; else bad "watch: the watch of a KILLed guard outlived its step (pids: $out)"; for n in $out; do kill "$n" 2> /dev/null; done; fi
   fi
 }
 
@@ -1030,14 +1070,14 @@ pgm p-defheavy   "push: the default push floor is the heavy one"                
 pgm p-noverify   "push: the refusal does not say not to use --no-verify"        floor       's# and do NOT use --no-verify to get around the hook##'
 pgm p-nolower    "push: --min-free-mb can lower the push floor"                 minfree     's#\[ "\$min" -ge "\$DISK_PUSH_MIN_MB" \] 2>/dev/null || min="\$DISK_PUSH_MIN_MB"#:#'
 pgm p-nolibchk   "push: a lib without the push floors is not detected"          nopushlib   's#if \[ -n "\${DISK_PUSH_MIN_MB:-}" \] && \[ -n "\${DISK_PUSH_STOP_MB:-}" \]; then#if true; then#'
-pgm p-nowatch    "push: a push runs without the watch and the lock"             stop        's#\[ "\$push_class" = 1 \] && hg_run_watched "\$@"#:#'
-pgm p-stopmin    "push: the watch stops at the start floor, not the stop floor" stopfloor   's#disk_state_of "\$f" "\$DISK_PUSH_STOP_MB"#disk_state_of "$f" "$DISK_PUSH_MIN_MB"#'
+pgm p-nowatch    "push: a push runs without the watch and the lock"             stop        's#\[ "\$push_class" = 1 \] \&\& { HG_WKIND=push; hg_run_watched "\$@"; }#:#'
+pgm p-stopmin    "push: the watch stops at the start floor, not the stop floor" stopfloor   's#stop="\$DISK_PUSH_STOP_MB" d$#stop="$DISK_PUSH_MIN_MB" d#'
 pgm p-nousr1     "push: the watch does not tell the guard it interrupted"       stop        's#^        kill -USR1 "\$main" 2>/dev/null$#        :#'
 pgm p-leaderonly "push: the TERM goes to the push only, not its group"          stop        's#kill -TERM -- "-\$p" 2>/dev/null || kill -TERM "\$p" 2>/dev/null || return 0#kill -TERM "$p" 2>/dev/null || return 0#'
 pgm p-nokill     "push: a push that ignores TERM is never KILLed"               ignoreterm  's#^    kill -KILL .*$#    :#'
 pgm p-noloop     "push: the guard stops waiting at the first signal"            term0       's#^    \[ "\$HG_INTERRUPTED" = 1 \] && \[ "\$seen" = 0 \] || break$#    break#'
 pgm p-rc0        "push: a push that ended with 0 is turned into a 78"           term0       's#^  if \[ "\$HG_INTERRUPTED" = 1 \] && \[ "\$rc" -ne 0 \]; then$#  if [ "$HG_INTERRUPTED" = 1 ]; then#'
-pgm p-blindkills "push: a reading the watch cannot take kills the push"         blind       's#^      low)$#      low|*)#'
+pgm p-blindkills "push: a reading the watch cannot take kills the push"         blind       's#^      low|drop)$#      low|drop|*)#'
 pgm p-nolock     "push: no lock is taken"                                       serial      's#then hg_push_lock_acquire; fi#then :; fi#'
 pgm p-norelease  "push: the lock is never let go"                               serial      's#^  rmdir "\$HG_LOCK_DIR" 2>/dev/null$#  :#'
 pgm p-noexittrap "push: a refused push leaves the lock behind"                  diskrelease "s#^  trap 'hg_lock_release' EXIT\$#  :#"
@@ -1094,6 +1134,34 @@ fcm f-nolog    "fcap: the refusal leaves no log line"                           
 fcm f-nomsg    "fcap: the refusal does not say it is rc 76"                      '/could not be set or read back/s#(rc 76)" >&2$#" >\&2#'
 fcm f-nodigit  "fcap: --max-file-mb accepts anything"                           's#^  case "\$fcap" in .*exit 64 ;; esac$#  :#'
 fcm f-nolen    "fcap: --max-file-mb has no magnitude cap"                        '/^  \[ "\${#fcap}" -le 9 \]/d'
+
+# disk watch for the selftest/mutant class (ga-2d14tow): every rule of the class has a mutant that the cases of its section must notice
+wcm() { # wcm <file> <name> <sections> <sed-expr>  (a mutant of the GUARD, run through the watch cases)
+  mk_mutant "$REAL_GUARD" "$M/$1.sh" "$4" && { before=$FAIL; WATCH_SECTIONS="$3" wcases "$M/$1.sh" "$REAL_LIB" >/dev/null 2>&1; survive "$2"; }
+}
+wcm w-nodrop    "watch: the drop rule never fires"                                   core   's#^      \[ "\$d" -lt "\$HG_WDROP" \] || st=drop$#      :#'
+wcm w-noclass   "watch: no selftest/mutant step is watched"                          class   's#^  if \[ "\$go_class" = 0 \] \&\& hg_selftest_step "\$what" "\$@"; then$#  if false; then#'
+wcm w-allsteps  "watch: every step is watched with the class default"                class   's#^  if \[ "\$go_class" = 0 \] \&\& hg_selftest_step "\$what" "\$@"; then$#  if [ "$go_class" = 0 ]; then#'
+wcm w-goclass   "watch: a Go step is in the class"                                   goclass   's#^  if \[ "\$go_class" = 0 \] \&\& hg_selftest_step "\$what" "\$@"; then$#  if hg_selftest_step "$what" "$@"; then#'
+wcm w-noptin    "watch: --max-disk-drop-mb on a step outside the class is ignored"   optin   's#^  elif \[ "\$drop_mb" -gt 0 \]; then$#  elif false; then#'
+wcm w-callerlose "watch: the class default beats the caller's number"                 caller   's#^    \[ "\$drop_given" = 1 \] || drop_mb="\$HG_DROP_DEFAULT"$#    drop_mb="$HG_DROP_DEFAULT"#'
+wcm w-zerodrop  "watch: a drop limit of 0 is a limit of 0 MB (stops at once)"         caller   's#\[ "\$HG_WDROP" -gt 0 \]#[ "$HG_WDROP" -ge 0 ]#'
+wcm w-envzero   "watch: a class limit of 0 in the env lifts the drop rule"            jenv   's#"\${HEAVY_GUARD_SELFTEST_MAX_DROP_MB:-}" 2048 0#"${HEAVY_GUARD_SELFTEST_MAX_DROP_MB:-}" 2048 1#'
+wcm w-defbig    "watch: the default drop limit is 8192 MB"                            jdef   's#"\${HEAVY_GUARD_SELFTEST_MAX_DROP_MB:-}" 2048 0#"${HEAVY_GUARD_SELFTEST_MAX_DROP_MB:-}" 8192 0#'
+wcm w-envignored "watch: the class limit in the env is ignored"                       class   's#"\${HEAVY_GUARD_SELFTEST_MAX_DROP_MB:-}" 2048 0#"" 2048 0#'
+wcm w-nofloor   "watch: the stop floor never fires for a step"                        floor  's#^  \[ "\$HG_WKIND" != step \] || stop="\$HG_WSTOP"$#  [ "$HG_WKIND" != step ] || stop=0#'
+wcm w-noclamp   "watch: the stop floor is not pulled down to the start floor"         floor  's#^      \[ "\$HG_WSTOP" -le "\$min" \] 2>/dev/null || HG_WSTOP="\$min"$#      :#'
+wcm w-blindkill "watch: a round the watch cannot read kills the step"                 blind  's#^      low|drop)$#      low|drop|*)#'
+wcm w-notraps   "watch: the step has no USR1 trap, the watch's warning kills the guard" core  's#^      hg_traps$#      :#'
+wcm w-nousr1    "watch: the watch does not tell the guard it interrupted the step"    core   's#^        kill -USR1 "\$main" 2>/dev/null$#        :#'
+wcm w-leader    "watch: the TERM goes to the step only, not its process group"        core   's#kill -TERM -- "-\$p" 2>/dev/null || kill -TERM "\$p" 2>/dev/null || return 0#kill -TERM "$p" 2>/dev/null || return 0#'
+wcm w-startzero "watch: the drop is counted from 0, not from the reading at the start" core  's#HG_WSTART="\$free"; HG_WSTOP=#HG_WSTART=0; HG_WSTOP=#'
+wcm w-bypass    "watch: the kill switch does not switch the drop rule off"            bypass   's# \&\& \[ "\${DISK_HEADROOM_ENABLED:-1}" != 0 \]; then$#; then#'
+wcm w-nowatch   "watch: the step runs without the watch"                              core   's#^      hg_run_watched "\$@"$#      :#'
+wcm w-nooption  "watch: --max-disk-drop-mb is not an option"                          plain  's#^    --max-disk-drop-mb) drop=#    --max-disk-drop-mbX) drop=#'
+wcm w-nodigit   "watch: --max-disk-drop-mb accepts anything"                          plain  's#^  case "\$drop" in .*exit 64 ;; esac$#  :#'
+wcm w-nolen     "watch: --max-disk-drop-mb has no magnitude cap"                      plain  '/^  \[ "\${#drop}" -le 9 \]/d'
+wcm w-orphan    "watch: the watch outlives a step whose guard was KILLed"            orphan 's#^    kill -0 "\$pid" 2>/dev/null || return 0$#    :#'
 
 [ "$AMB_OK" = 1 ] || echo "AMBIENTE: the inherited write limit ($(bash -c 'ulimit -S -f' 2>/dev/null) soft, $(bash -c 'ulimit -H -f' 2>/dev/null) hard, in KB) is already a cap of 512 MB or less: the cases that tell 'capped at 512 MB' from 'not capped' did not run and $UNVER file-cap mutant(s) are UNVERIFIED:${UNVER_NAMES:- none} (run this selftest without the cap: heavy-guard.sh --max-file-mb 0, or bare on the node)"
 echo "heavy-guard selftest: $PASS passed, $FAIL failed$([ "$AMB_OK" = 1 ] || echo ", $UNVER mutant(s) UNVERIFIED (AMBIENTE)")"

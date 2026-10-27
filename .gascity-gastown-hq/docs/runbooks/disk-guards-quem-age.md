@@ -4,6 +4,7 @@
 - Quem apaga o quê
 - Reiniciadores do Dolt
 - O que a medição mudou na proposta do bead
+- Guarda por passo: o único que PARA um escritor vivo
 - Feito e pendente
 
 ## Estado em 2026-10-16
@@ -73,6 +74,10 @@ Não verificado: se `gc dolt start` e `gc dolt restart` disparados no mesmo minu
 4. Fora do escopo, mas mais grave que o resto: o snapshot-guard roda como root e executa um script que o usuário
    `athos` pode reescrever — `ga-xpswpd`.
 5. Worktrees mergeadas não são a alavanca: o autoprune lista 23, 0,86 GiB.
+
+## Guarda por passo: o único que PARA um escritor vivo
+
+Todos os degraus acima recuperam (apagam coisa velha) ou avisam; nenhum para um processo que está gravando agora. A exceção é o `scripts/heavy-guard.sh` (por passo, a pedido de quem o chama, não por degrau): um `git push` e um selftest/bateria de mutantes lançados por ele rodam com uma vigia que lê o `df` a cada 3 s e manda TERM ao grupo do passo quando o livre passa do piso de parada (4 GB) ou, no selftest/mutante, cai 2 GB desde o início do passo (rc 78). Para o mini, o piso lido só ANTES do passo (6 GB) não impede um laço de gravar GBs por minuto; o teto por arquivo (`ulimit -f`) não impede um laço de muitos arquivos pequenos; a queda do livre pega os dois. Uso, limites e interruptores: `disk-trabalho-pesado.md`. Passo lançado sem o guarda não tem nada disso.
 
 ## Feito e pendente
 
