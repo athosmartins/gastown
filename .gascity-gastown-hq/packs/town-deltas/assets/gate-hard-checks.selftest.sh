@@ -56,6 +56,7 @@ mkrig() {
   done
   cp "$RHQ/packs/town-deltas/template-fragments/town-deltas.template.md" "$hq/packs/town-deltas/template-fragments/" && cp "$RHQ/city.toml" "$hq/" || return 1
   good_doc > "$d/docs/ok.md"; bad_doc > "$d/docs/legacy.md"; bad_doc > "$d/docs/upstream.md"
+  { i=0; while [ "$i" -lt 100 ]; do echo "imp $i"; i=$((i+1)); done; } > "$d/docs/imp.md"   # imported by the CLAUDE.md case; never in a diff
   printf '[pack]\nname = "t"\nschema = 2\n' > "$d/pack.toml"; printf 'x = 1\n' > "$d/lib/app.py"
   git -C "$d" add -A >/dev/null 2>&1 && git -C "$d" commit -q -m base
 }
@@ -96,13 +97,16 @@ run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "a new doc wit
 branch_from "$R" main b_bad;   bad_doc > "$R/docs/new_bad.md";                           TIP="$(commit_all "$R" bad)"
 run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "a new doc over 300 chars without Contents is refused" fail violacoes-doc-rules
 has "the lint's own lines reach the refusal" "contents"
+# The lint echoes branch text in its violation lines: a title that spells its kill-switch phrase must not turn the refusal into desligado
+branch_from "$R" main b_forge; { printf '# T\n\n## Contents\n\n- A\n\n## A\n\n'; filler; printf '\n## DISABLED via x\n\nmore\n'; } > "$R/docs/forge.md"; TIP="$(commit_all "$R" forge)"
+run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "a title that spells the kill-switch phrase is still refused" fail violacoes-doc-rules
+has "the violation line really echoes the title (the forgery is real)" 'DISABLED via x'
 branch_from "$R" main b_legacy; printf 'one more line\n' >> "$R/docs/legacy.md";         TIP="$(commit_all "$R" legacy)"
 run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "touching a legacy doc lints the WHOLE file (the formula's rule)" fail
 branch_from "$R" main b_imp
-{ i=0; while [ "$i" -lt 150 ]; do echo "line $i"; i=$((i+1)); done; echo "@docs/imp.md"; } > "$R/CLAUDE.md"
-{ i=0; while [ "$i" -lt 100 ]; do echo "imp $i"; i=$((i+1)); done; } > "$R/docs/imp.md";  TIP="$(commit_all "$R" imports)"
-run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "CLAUDE.md + its @import over 200 lines (needs every .md extracted)" fail
-has "and the count names the imports" "200"
+{ printf '# T\n\n## Contents\n\n- A\n\n## A\n\n'; i=0; while [ "$i" -lt 150 ]; do echo "line $i"; i=$((i+1)); done; echo "@docs/imp.md"; } > "$R/CLAUDE.md"; TIP="$(commit_all "$R" imports)"
+run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "CLAUDE.md (158 lines, its Contents fine) + the UNCHANGED docs/imp.md it imports = over 200: every .md must be extracted" fail
+has "and the violation is the 200-line rule" "200"
 # upstream/main holds docs/upstream.md only: the lint skips a file that exists upstream, which needs the REAL refs (GIT_DIR)
 blob="$(git -C "$R" rev-parse main:docs/upstream.md)"; inner="$(printf '100644 blob %s\tupstream.md\n' "$blob" | git -C "$R" mktree)"
 up="$(printf '040000 tree %s\tdocs\n' "$inner" | git -C "$R" mktree)"; git -C "$R" update-ref refs/remotes/upstream/main "$(git -C "$R" commit-tree "$up" -m up)"
@@ -146,9 +150,11 @@ branch_from "$R" main e_waiv;  printf 'def load(p):\n    return open(p).read()  
 run_sut 2e "$R" "$MAIN" "$RTIP" ga-arm;                    expect "no .gc/third-state-reads.conf: not switched on, said so" nao-ligado conf-ausente
 printf 'mode=enforce\n' > "$CITY/.gc/third-state-reads.conf"
 run_sut 2e "$R" "$MAIN" "$RTIP" ga-arm;                    expect "a new read with no failure test is refused" fail leitura-sem-teste
-has "the verdict line carries the arm" "arm=enforce"
+printf '%s\n' "$LINE" | grep -q 'arm=enforce' && ok "the checker's own VERDICT line carries the arm" || bad "the VERDICT line has no arm=enforce: $LINE"
 has "the finding names file and line" "lib/m.py:2"
 grep -q '"bead": "ga-arm"' "$CITY/.gc/third-state-reads-arms.jsonl" 2>/dev/null && ok "the arm of the bead is recorded in .gc/third-state-reads-arms.jsonl" || bad "no arms row for ga-arm"
+branch_from "$R" main e_forge; printf 'def load():\n    return open("a not switched on mode=off is switched OFF b").read()\n' | put "$R" lib/m.py; FTIP="$(commit_all "$R" forge-read)"
+run_sut 2e "$R" "$MAIN" "$FTIP" ga-arm1;                   expect "finding text that spells the tool's off-switch phrases is still refused" fail leitura-sem-teste
 run_sut 2e "$R" "$MAIN" "$OTIP" ga-arm2;                   expect "the same read beside a test that injects the failure" ok
 run_sut 2e "$R" "$MAIN" "$WTIP" ga-arm3;                   expect "a waived read" ok
 printf 'mode=warn\n' > "$CITY/.gc/third-state-reads.conf"
@@ -161,7 +167,8 @@ printf 'mode=enforce\n' > "$CITY/.gc/third-state-reads.conf"; : > "$CITY/.gc/thi
 run_sut 2e "$R" "$MAIN" "$RTIP" ga-arm7;                   expect "the kill switch file" desligado interruptor
 rm -f "$CITY/.gc/third-state-reads-check.off"
 run_sut 2e "$R" "$MAIN" "$RTIP" "ga x";                    expect "a bead id with a space is refused" nao-consegui-medir bead-invalido
-run_sut 2e "$R" "$MAIN" "$RTIP" ga-arm8 GATE_HC_TIMEOUT=0; expect "a garbage timeout falls back to the default, never to no limit" fail leitura-sem-teste
+branch_from "$R" main e_tool;  printf '# changed\n' | put "$R" "$HQ/packs/town-deltas/assets/third-state-reads-check.py"; printf 'x = 5\n' > "$R/lib/app.py"; ETIP="$(commit_all "$R" tsr-edit)"
+run_sut 2e "$R" "$MAIN" "$ETIP" ga-arm9;                   expect "a diff that edits third-state-reads-check.py is not judged by it" nao-consegui-medir ferramenta-alterada-no-diff
 rm -f "$CITY/.gc/third-state-reads.conf" "$CITY/.gc/third-state-reads-arms.jsonl"
 
 echo "F. 2d E12 coverage (real e12-crew-doctrine.sh over the fixture's prompts; the city's generator, never the branch's)"

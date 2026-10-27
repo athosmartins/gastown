@@ -125,9 +125,11 @@ step_2c() {
   # like it lives at the root of its folder and the upstream skip silently never matches).
   out="$(cd "$SCRATCH/tip" && env "GIT_DIR=$gd" "GIT_WORK_TREE=$SCRATCH/tip" "GC_CITY_PATH=$HQ_DIR" "$TBIN" "$TMO" "$PY" -I "$tool" --check --root "$SCRATCH/tip" --diff "${base}...${tip}" 2>&1)"; RC=$?
   # vazio → saída sem linha de resumo = a ferramenta não terminou de reportar: nao-consegui-medir; falhou (rc 2/124/127) → idem
-  case "$out" in (*"DISABLED via"*) emit desligado interruptor ;; esac
+  # The tool echoes branch text (a heading, a file name) in its violation lines, so its kill-switch line is believed only on a
+  # CLEAN exit, whole line at the start: a branch that writes "DISABLED via" in a title must not turn a refusal into desligado.
   case "$RC" in
-    (0) emit ok lint-limpo ;;
+    (0) if printf '%s\n' "$out" | grep -E -q '^doc-rules-lint: DISABLED via '; then emit desligado interruptor; fi
+        emit ok lint-limpo ;;
     (1) if printf '%s\n' "$out" | grep -E -q '^doc-rules-lint: [0-9]+ file\(s\) checked, [1-9][0-9]* violation\(s\)'; then DETAIL="$(cap "$out")"; emit fail violacoes-doc-rules; fi
         emit nao-consegui-medir saida-sem-resumo ;;
     (*) emit nao-consegui-medir "lint-rc$RC" ;;
@@ -147,11 +149,10 @@ step_2e() {
   if [ -n "$line" ]; then
     v="${line#*verdict=}"; v="${v%% *}"; ARM="${line#*arm=}"; ARM="${ARM%% *}"
   elif [ "$RC" -eq 0 ]; then
-    case "$out" in
-      (*"not switched on"*) emit nao-ligado conf-ausente ;;
-      (*"mode=off"*) emit nao-ligado mode-off ;;
-      (*"switched OFF"*) emit desligado interruptor ;;
-    esac
+    # Whole lines at the start only (the finding lines echo branch text, indented): see step_2c.
+    if printf '%s\n' "$out" | grep -E -q '^NOTE: third-state-reads-check: not switched on \('; then emit nao-ligado conf-ausente; fi
+    if printf '%s\n' "$out" | grep -E -q '^NOTE: third-state-reads-check: mode=off in '; then emit nao-ligado mode-off; fi
+    if printf '%s\n' "$out" | grep -E -q '^NOTE: third-state-reads-check: is switched OFF \('; then emit desligado interruptor; fi
   fi
   case "$RC:$v" in
     (0:ok) emit ok leituras-com-teste ;;
@@ -176,7 +177,7 @@ run_e12() {
     [ "$r" -gt "$worst" ] && worst=$r
   done
   if [ "$worst" -eq 0 ]; then printf 'green %s' "$worst"
-  elif [ "$worst" -eq 1 ] && grep -E -q '(STALE|BROKEN MARKERS|GAP) — ' "$out"; then printf 'red %s' "$worst"
+  elif [ "$worst" -eq 1 ] && grep -E -q '^e12-crew-doctrine: (STALE|BROKEN MARKERS|GAP) — ' "$out"; then printf 'red %s' "$worst"
   else printf 'unknown %s' "$worst"; fi
 }
 
