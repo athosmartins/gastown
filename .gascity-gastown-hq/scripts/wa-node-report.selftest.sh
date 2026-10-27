@@ -37,7 +37,7 @@
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REAL="$HERE/wa-node-report.py"
-MIN_MUT=187
+MIN_MUT=192
 T=$(mktemp -d "${TMPDIR:-/tmp}/wa-node-report.XXXXXX")
 trap 'find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null' EXIT
 fails=0; n=0; MUTANTS=0
@@ -235,6 +235,19 @@ jl(os.path.join(city("sor"), ".gc", "hetzner-occupancy.jsonl"), [
 ])
 # ---- o Pilot gravou, mas nenhuma linha dá veredito: o relatório avisa
 jl(os.path.join(city("pv"), ".gc", "wa-node-route.jsonl"), [pr("wa-pv1", -3 * H, "shadow", 124, ""), pr("wa-pv2", -2 * H, "shadow", 2, "usage: ...")])
+# ---- linhas degeneradas (ga-u6ueg0q): `out` que não é texto, bead vazia ou que não é texto; nenhuma outra linha ilegível, para o texto dizer "apply 2, outras 0, leituras 0"
+jl(os.path.join(city("deg"), ".gc", "wa-node-route.jsonl"), [
+    {"ts": iso(-3 * H), "event": "pilot-node-route", "bead": "wa-dg1", "mode": "shadow", "rc": 0, "out": None},
+    {"ts": iso(-2 * H), "event": "pilot-node-route", "bead": "wa-dg2", "mode": "shadow", "rc": 10, "out": 7},
+    {"ts": iso(-2 * H), "event": "apply", "bead": "", "rc": 0, "detail": "dry-run: iria para wa-worker-remote-1 (code)"},
+    {"ts": iso(-2 * H), "event": "apply", "bead": 7, "rc": 0, "detail": "dry-run: iria para wa-worker-remote-1 (code)"},
+    ap("wa-dg3", -1 * H, 10, "classificador:mini test-toca-banco"),
+])
+# ---- a leitura de CPU com pct válido e SEM `nucleos`: é "sem CPU lida"; a leitura vizinha, completa, é lida
+jl(os.path.join(city("snu"), ".gc", "hetzner-occupancy.jsonl"), [
+    occ(-1 * H, {"lido": True, "pct": 50.0}, ses([])),
+    occ(-1 * H + 900, cpu(60.0), ses([])),
+])
 # ---- sessões lidas pela metade: a lista pode estar incompleta, então não entra na conta de WA
 def ses_i(nomes, ileg):
     d = ses(nomes)
@@ -380,7 +393,7 @@ fila(os.path.join("home", ".gc", "pilot-dispatchable.json"), -100)
 PYEOF
 python3 -I "$T/fx.py" "$FX" "$NOW" || { echo "o gerador de fixtures falhou"; exit 2; }
 # as cidades de fixture moram em $FX
-RT="$FX/rota"; OC="$FX/ocup"; MU="$FX/muitas"; SR="$FX/sr"; LR="$FX/lr"; DR="$FX/dr"; NA="$FX/na"; VZ="$FX/vz"; LX="$FX/lx"; DN="$FX/dn"; SP="$FX/span"; DIA="$FX/dia"; PV="$FX/pv"; OI="$FX/oi"; RL="$FX/real"; EV="$FX/ev"; SOR="$FX/sor"; SV="$FX/sv"
+RT="$FX/rota"; OC="$FX/ocup"; MU="$FX/muitas"; SR="$FX/sr"; LR="$FX/lr"; DR="$FX/dr"; NA="$FX/na"; VZ="$FX/vz"; LX="$FX/lx"; DN="$FX/dn"; SP="$FX/span"; DIA="$FX/dia"; PV="$FX/pv"; OI="$FX/oi"; RL="$FX/real"; EV="$FX/ev"; SOR="$FX/sor"; SV="$FX/sv"; DG="$FX/deg"; SNU="$FX/snu"
 FU="$FX/funil"; F2="$FX/funil2"; PD="$FX/padrao"; HM="$FX/home"
 # os arquivos soltos (logs do Pilot, filas) moram em $FX; NOPILOT/NOFILA não existem de propósito
 PLU="$FX/pilot-utc.log"; PLB="$FX/pilot-brt.log"; NOPILOT="$FX/nao-existe.log"; NOFILA="$FX/nao-existe.json"
@@ -822,13 +835,39 @@ chk_node_anterior() {
   trun UTC "$RT" --hours 24 && has "$OUT" "wa-sn2  [mini, base label do node anterior]  razões do node anterior: c" && has "$OUT" "wa-sn1  [node, só sombra (shadow/dry-run), base code]  razões: a; b"
 }
 
+chk_linhas_degeneradas() { # `out` que não é texto e bead vazia/que não é texto: não derrubam o relatório e não viram decisão com dono (ga-u6ueg0q)
+  jrun UTC "$DG" --hours 24 && eq "$RC" 0 rc && eq "$(jf .rota.analise.apply_ilegivel)" 2 "apply com bead vazia e com bead 7" && eq "$(jf .rota.analise.beads_distintas)" 3 "só dg1, dg2 e dg3 são beads" &&
+  eq "$(jf '.rota.analise.incoerentes|join(",")')" "wa-dg1,wa-dg2" "out null (rc 0) e out 7 (rc 10): incoerentes, nunca veredito" &&
+  trun UTC "$DG" --hours 24 && has "$OUT" "linhas ilegíveis: apply 2, outras (sem bead ou sem rc) 0; leituras de bead que falharam: 0"
+}
+chk_cpu_sem_nucleos() {
+  jrun UTC "$SNU" --hours 24 && eq "$RC" 0 rc && eq "$(jf .ocupacao.analise.cpu_sem_leitura)" 1 "pct 50 sem nucleos: sem CPU lida" && eq "$(jf .ocupacao.analise.cpu_lidas)" 1 "a leitura completa vizinha é lida"
+}
+chk_relatorio_nao_formado() { # se o texto do relatório não se forma, nada sai no stdout e o rc é 4 (não 0, não outro número)
+  python3 -I - "$SCRIPT" "$DG" "$NOFILA" <<'PYEOF' >/dev/null 2>&1
+import contextlib, importlib.util, io, os, sys
+sys.dont_write_bytecode = True
+os.environ["WA_NODE_REPORT_NOW"] = os.environ.get("WA_NODE_REPORT_NOW") or "0"
+spec = importlib.util.spec_from_file_location("wa_node_report", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+def quebra(_res):
+    raise RuntimeError("falha de propósito")
+m.render = quebra
+out, err = io.StringIO(), io.StringIO()
+with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+    rc = m.main(["--city", sys.argv[2], "--dispatchable", sys.argv[3]])
+assert rc == 4 and out.getvalue() == "" and "relatório não formado" in err.getvalue(), (rc, out.getvalue()[:80], err.getvalue()[:200])
+PYEOF
+}
+
 # ---- o caso real: cada função tem de passar contra o script de verdade
 check() { SCRIPT="$REAL"; VERBOSE=1; if "chk_$1"; then ok "$1"; else bad "$1"; fi; VERBOSE=0; }
 for c in veredito_final sombra_nao_e_entrega ultimo_por_hora instaveis conferir_lista base razoes razoes_so_rc0 sombra_so_shadow incoerente rc13 hook_real apply_ilegivel linhas_ilegiveis janela_rota \
          cobertura horas_com_dado aviso_pilot_sem_veredito modos soltas_leituras ordem_do_arquivo \
          prontidao_falta prontidao_beads_na_borda prontidao_so_veredito prontidao_horas_na_borda prontidao_inalcancavel prontidao_nunca_aprova \
          ocup_totais ocup_horas_utc ocup_hora09 ocup_wa_remoto ocup_hora_sem_cpu ocup_texto ocup_ilegiveis ocup_bordas sem_epoch tabela_72 ocup_nao_leitura ocup_so_reaper eventos_desconhecidos horas_so_sem_veredito node_anterior \
-         funil_utc funil_fuso funil_texto funil_gancho funil_sem_rota funil_estados wa_id_sem_ponto fila_ok fila_texto fila_hora_ruim fila_estados caminhos_padrao caminho_vazio_rc2 \
+         funil_utc funil_fuso funil_texto funil_gancho funil_sem_rota funil_estados wa_id_sem_ponto linhas_degeneradas cpu_sem_nucleos relatorio_nao_formado fila_ok fila_texto fila_hora_ruim fila_estados caminhos_padrao caminho_vazio_rc2 \
          rc3_nenhum_log rc0_basta_um rota_vazia ausente_nao_e_zero args_rc2 args_validos horas_decimal now_env somente_leitura json_uma_linha; do
   check "$c"
 done
@@ -1047,6 +1086,12 @@ mut caminho-fila-explicito-ignorado chk_fila_ok 'fila_p = a.dispatchable if a.di
 mut json-sem-funil chk_json_uma_linha '        "funil": {"arquivo": log_p, "estado": fe, "analise": fa},' '        "funil_": {"arquivo": log_p, "estado": fe, "analise": fa},'
 mut json-sem-fila chk_json_uma_linha '        "fila": {"arquivo": fila_p, "estado": qe, "analise": qa},' '        "fila_": {"arquivo": fila_p, "estado": qe, "analise": qa},'
 mut funil-escreve-no-log chk_somente_leitura "        with open(path, \"rb\") as f:${nl}            raw = f.read().decode(\"utf-8\", \"replace\")" "        with open(path, \"ab+\") as f:${nl}            f.write(b\"x\\\\n\"); f.seek(0)${nl}            raw = f.read().decode(\"utf-8\", \"replace\")"
+# -- linhas degeneradas (ga-u6ueg0q)
+mut out-nao-texto-quebra chk_linhas_degeneradas "    if isinstance(out, str) and out.strip():${nl}        try:" "    if isinstance(out, str) or out.strip():${nl}        try:"
+mut bead-vazia-e-bead chk_linhas_degeneradas 'if not isinstance(bid, str) or not bid:' 'if not isinstance(bid, str) and not bid:'
+mut nucleos-ausente-quebra chk_cpu_sem_nucleos 'if pct is None or nuc is None or not (0.0 <= pct <= 100.0) or nuc < 0:' 'if pct is None and nuc is None or not (0.0 <= pct <= 100.0) or nuc < 0:'
+mut ilegiveis-so-com-os-tres chk_linhas_degeneradas 'if a["apply_ilegivel"] or a["outras_ilegiveis"] or a["leituras_que_falharam"]:' 'if a["apply_ilegivel"] and a["outras_ilegiveis"] or a["leituras_que_falharam"]:'
+mut relatorio-nao-formado-rc5 chk_relatorio_nao_formado "não formado: %s\\n\" % e)${nl}        return 4" "não formado: %s\\n\" % e)${nl}        return 5"
 
 if [ -z "${WA_NODE_REPORT_ST_NOMUT:-}" ]; then
   [ "$MUTANTS" -ge "$MIN_MUT" ] || { echo "FAIL o piso: só $MUTANTS mutantes (mínimo $MIN_MUT) — apagar mutantes não passa por 'todos mortos'"; fails=$((fails+1)); n=$((n+1)); }
