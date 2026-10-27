@@ -5,7 +5,7 @@
 #   Casos · Controle negativo · Como rodar
 #
 # CASOS: a amostra limpa (contagens por modo, veredito, base) · linha de outro evento e linha ilegível contadas à parte · nada a medir (3) · perda contada pelo contador, só pelo aviso do log do Pilot, e o MAIOR dos dois ·
-#   o arquivo que existe e não lê (jsonl, contador, log do Pilot virados pasta) é DESCONHECIDO (4), nunca "0" · uso (2) · só leitura · e a ponta a ponta: o gancho real perde linhas num log quebrado e o relatório as vê.
+#   o arquivo que existe e não lê (jsonl, contador, log do Pilot virados pasta, ou o jq que sai 0 sem escrever o resumo) é DESCONHECIDO (4), nunca "0" · uso (2) · só leitura · e a ponta a ponta: o gancho real perde linhas num log quebrado e o relatório as vê.
 # CONTROLE NEGATIVO: cada mutante troca UMA linha do relatório numa cópia e a bateria inteira tem de reprovar; mutante que sobrevive reprova esta bateria.
 # COMO RODAR: bash scripts/ps-node-route-report.selftest.sh   (macOS /bin/bash 3.2 e Linux; precisa de jq e python3)
 #   REPORT_UNDER_TEST=<cópia do relatório> roda a bateria contra a cópia, sem mutantes, e para no 1º FAIL (é como o controle negativo chama a si mesmo).
@@ -95,6 +95,10 @@ if [ "$(id -u)" != 0 ]; then
 else
   echo "(arquivo sem permissão de leitura: pulado — root lê tudo; os cenários de pasta acima são à prova de root)"
 fi
+# o arquivo lê, mas o jq sai 0 sem escrever o resumo (jq quebrado ou trocado): resumo vazio é "não li" (4), nunca "0 linhas" (ga-u6ueg0q)
+mkdir "$T/jq-mudo"; printf '#!/bin/sh\nexit 0\n' > "$T/jq-mudo/jq"; chmod +x "$T/jq-mudo/jq"
+newcity; J ps-1 shadow 0 "$NODE_TXT" 2026-10-23T10:00:00Z > "$(LOG)"; OUT=$(PATH="$T/jq-mudo:$PATH" "$REPORT" --city "$C" 2>&1); RC=$?
+expect "jq que sai 0 sem resumo: 4, 'DESCONHECIDO' (não 0 linhas)" 4 "linhas gravadas (decisões): DESCONHECIDO" "AMOSTRA SUBCONTADA OU DUVIDOSA"
 
 # ---- uso
 newcity; OUT=$("$REPORT" --foo 2>&1); RC=$?; expect "argumento desconhecido: 2" 2 "argumento desconhecido"
@@ -149,6 +153,7 @@ mutant contador-ilegivel-vira-0 'if [ "$lost_state" = ilegivel ]; then add_doubt
 mutant jsonl-ilegivel-vira-0    '    add_doubt "$LOG existe e não foi possível lê-lo' '    : "$LOG existe e não foi possível lê-lo'
 mutant log-pilot-ilegivel-vira-0 'if [ "$plog_state" = ilegivel ]; then add_doubt' 'if false; then add_doubt'
 mutant linha-ilegivel-nao-conta 'if [ "$ileg" -gt 0 ]; then add_doubt' 'if false; then add_doubt'
+mutant resumo-vazio-vale-lido   '"$LOG" 2>/dev/null) && [ -n "$SUM" ]; then' '"$LOG" 2>/dev/null) || [ -n "$SUM" ]; then'
 mutant subcontada-sai-0         '  printf '"'"'%s\n'"'"' "$doubt" | sed '"'"'s/^/  - /'"'"'
   exit 4' '  printf '"'"'%s\n'"'"' "$doubt" | sed '"'"'s/^/  - /'"'"'
   exit 0'
