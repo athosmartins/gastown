@@ -2252,7 +2252,7 @@ grep '"event":"kept_ignored_data"' "$TMP/xp16.jsonl" | grep -qF '"top":[{"path":
 # .claude/settings.local.json, and could not look inside a folder entry — kept 15 wa-worker trees (~170 MB each) for a 4 KB .claude/settings.json. With a
 # TRACKED file in .claude/ the settings files come one by one and were not junk either. Now .claude/settings*.json(.bak.*) is junk by path, and a folder
 # entry named .claude/ is opened: only junk inside → dropped; any other file → the tree is kept and the event names THAT file; unreadable → unknown.
-# Against the pre-fix reaper (c1)(c1b)(c2)(c3)(c4)(c5)(c6)(c7)(c8)(c9b)(c11)(c14)(c16a)(c16b) fail; (c9)(c15) pin what must NOT change.
+# Against the pre-fix reaper (c1)(c1b)(c2)(c3)(c4)(c5)(c6)(c7)(c8)(c9b)(c10)(c11)(c14)(c16a)(c16b)(c16c)(c16d) fail; (c9)(c15) pin what must NOT change.
 echo "── ga-1bfcda7: an ignored .claude/ holding only the tool's settings files does not keep a tree ──"
 cl_tree() {   # <town> merged|unmerged [file…] — crew/w with an ignored .claude/ FOLDER (info/exclude) holding the given files (paths below .claude/), no pesquisa/, aged 14 h
   local t="$1" k="$2" f; shift 2
@@ -2315,6 +2315,12 @@ cl_tree cl8 merged settings.json; mkdir -p "$TMP/cl8-bin"
 printf '#!/bin/sh\ncase " $* " in *" -print0 "*) exit 0 ;; esac\nexec %s "$@"\n' "$(command -v find)" > "$TMP/cl8-bin/find"; chmod +x "$TMP/cl8-bin/find"
 xp_run cl8 PATH="$TMP/cl8-bin:$PATH"
 cl_freed cl8 "(c8): the folder reads EMPTY (find prints nothing, rc 0) → nothing inside to lose: the entry is dropped and the tree is reaped"
+# (c10) the rewritten list cannot be copied back (a full disk would do it; here cat exits 1 — it is only called there on this path): the list was truncated by then,
+# so this must read as "could not tell" (KEPT, unknown), never as "nothing is ignored" (which would REAP a tree holding data)
+cl_tree cl10 merged settings.json notes.md; mkdir -p "$TMP/cl10-bin"; printf '#!/bin/sh\nexit 1\n' > "$TMP/cl10-bin/cat"; chmod +x "$TMP/cl10-bin/cat"
+xp_run cl10 PATH="$TMP/cl10-bin:$PATH"
+cl_kept cl10 "(c10): copying the rewritten list back fails (cat rc 1) → KEPT, kept_ignored_data_unknown — a truncated list is not 'nothing is ignored'" kept_ignored_data_unknown
+[ -f "$TMP/cl10/rig/crew/w/.claude/notes.md" ] && ok "ga-1bfcda7 (c10): the notes are still on disk" || bad "ga-1bfcda7 (c10): the notes are gone"
 
 # (c9) WORKTREE_REAPER_IGNORED_JUNK_RE stays THE junk list: naming the folder itself as junk (the Mayor's by-hand relief of 27/10) skips it without opening it;
 # a list that does not name the settings files makes them data again
