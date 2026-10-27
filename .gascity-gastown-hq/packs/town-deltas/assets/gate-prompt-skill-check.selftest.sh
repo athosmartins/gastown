@@ -206,8 +206,13 @@ expect "shell syntax inside a prompt is data" ok
 echo "H. third states: a check that cannot measure never blocks and never vouches"
 run_sut "" "" ""
 expect "empty arguments" nao-consegui-medir entrada-vazia
+run_sut "$R" "--output=$WORK/pwned" "$BASE"
+expect "a sha argument that is a git option (not hex)" nao-consegui-medir entrada-invalida
+ls "$WORK"/pwned* >/dev/null 2>&1 && bad "git took the argument as --output and wrote a file" || ok "no file was written by an option-shaped argument"
 run_sut "$WORK" "$BASE" "$BASE"
 expect "rig path is not a git repository" nao-consegui-medir sem-toplevel
+run_sut "$R" "$BASE" "$BASE" TMPDIR="$WORK/does/not/exist"
+expect "no scratch directory can be made (TMPDIR unusable)" nao-consegui-medir sem-scratch
 run_sut "$R" "$BASE" "0000000000000000000000000000000000000000"
 expect "tip sha unknown to git (the diff fails)" nao-consegui-medir diff-falhou
 

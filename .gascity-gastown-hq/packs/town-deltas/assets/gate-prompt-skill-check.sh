@@ -68,8 +68,9 @@ emit() {
   exit 0
 }
 
-# is_input <root-relative path>: rc 0 if a change to that path can change what the detector says. Exactly what the
-# detector reads (its section B names, C templates, C2 city.toml + fragments) plus the detector itself.
+# is_input <root-relative path>: rc 0 if a change to that path can change what the detector says. What the detector reads
+# (its section B names, C templates, C2 city.toml + fragments) plus the detector itself. A superset only for fragments:
+# every template fragment matches, not just the ones city.toml lists (a harmless extra run, never a missed one).
 is_input() {
   case "$1" in
     ($HQ/agents/*/prompt.template.md) return 0 ;;
@@ -132,6 +133,9 @@ red_lines() {
 main() {
   local rig="${1-}" base="${2-}" tip="${3-}" f="" cls="" bcls="" cls_rc="" bcls_rc=""
   if [ -z "$rig" ] || [ -z "$base" ] || [ -z "$tip" ]; then emit nao-consegui-medir entrada-vazia; fi
+  # The shas go into `git diff <base>..<tip>`: anything that is not hex (an argument like --output=FILE would be read by
+  # git as an option) is refused before git sees it. The guard only ever passes shas it got from rev-parse/merge-base.
+  case "$base$tip" in (*[!0-9a-fA-F]*) emit nao-consegui-medir entrada-invalida ;; esac
   # vazio/falhou → rig que não é repositório git (ou git ausente): nao-consegui-medir, nunca "sem prompt alterado"
   TOP=$(git -C "$rig" rev-parse --show-toplevel 2>/dev/null) || TOP=""
   if [ -z "$TOP" ] || [ ! -d "$TOP" ]; then emit nao-consegui-medir sem-toplevel; fi
