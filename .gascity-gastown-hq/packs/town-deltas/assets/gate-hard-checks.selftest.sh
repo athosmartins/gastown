@@ -141,7 +141,7 @@ run_sut 2c "$R" "$IBASE" "$TIP" ga-x;                      expect "CLAUDE.md imp
 # (gate_run ga-h3scrqt). The base has no unchanged link (alias.md): these cases ask for a CLEAN verdict, which a link makes unmeasured.
 branch_from "$R" main b_nb; git -C "$R" rm -q docs/alias.md
 big() { local i=0; while [ "$i" -lt "$1" ]; do echo "big $i"; i=$((i+1)); done; }
-big 250 > "$R/docs/big.txt"; big 3 > "$R/docs/small.txt"; printf '@big.txt\n' > "$R/docs/chain.md"; ln -s big.txt "$R/docs/biglink.txt"
+big 250 > "$R/docs/big.txt"; big 3 > "$R/docs/small.txt"; printf '@big.txt\n' > "$R/docs/chain.md"; ln -s big.txt "$R/docs/biglink.txt"; ln -s docs "$R/linkdir"
 printf '@cyc_b.txt\n' > "$R/docs/cyc_a.txt"; printf '@cyc_a.txt\nmore\n' > "$R/docs/cyc_b.txt"
 mkdir -p "$R/sub" && big 250 > "$R/sub/notes.txt"; big 3 > "$WORK/outside.txt"; mkdir -p "$WORK/home" && big 3 > "$WORK/home/ref.txt"
 NB="$(commit_all "$R" nolink-base)"
@@ -155,6 +155,10 @@ nd n_chain "@docs/chain.md";            run_sut 2c "$R" "$NB" "$TIP" ga-x; expec
 nd n_cyc "@docs/cyc_a.txt";             run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "two .txt files that import each other end the closure, they do not loop" ok lint-limpo
 nd n_sub "@notes.txt" sub/CLAUDE.md;    run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "an import is resolved from the importing doc's folder (sub/notes.txt), not from the root" fail violacoes-doc-rules
 nd n_link "@docs/biglink.txt";          run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "an import that goes through a symlink cannot be read as data: a clean lint is unmeasured" nao-consegui-medir entrada-especial-fora-do-diff-1
+# The lint stats the path through the REAL directories of the scratch tree (only the extracted files exist there), not through the tip's listing
+nd n_dd "@lib/../docs/big.txt";         run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "a .. after a descent into a directory the scratch tree lacks (lib/ holds no doc): the lint cannot resolve it there, so a clean lint is unmeasured" nao-consegui-medir entrada-especial-fora-do-diff-1
+nd n_ld "@linkdir/big.txt";             run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "a symlinked directory on the way leads where the tip listing does not show: unmeasured" nao-consegui-medir entrada-especial-fora-do-diff-1
+nd n_nest "@../docs/big.txt" sub/CLAUDE.md; run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "a leading .. from a nested doc climbs through directories the scratch tree has: resolved and counted" fail violacoes-doc-rules
 nd n_prose "mail @someone about @types/node";  run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "an @word that names no file is not an import" ok lint-limpo
 nd n_span 'see `@docs/biglink.txt` here';      run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "an @import inside a code span is not an import (the lint's own tokenizer decides)" ok lint-limpo
 nd n_fence $'```\n@docs/biglink.txt\n```'; run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "an @import inside a fenced code block is not an import either" ok lint-limpo

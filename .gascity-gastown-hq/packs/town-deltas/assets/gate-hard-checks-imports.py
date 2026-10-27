@@ -11,8 +11,10 @@ lint's OWN tokenizer (so a code span, a prose @word or an e-mail is judged exact
 
 OUTPUT (stdout): the first line `IMPORTS-OK special=<n> files=<m>`, then the <m> tree paths to extract, one per line. Anything else, or a
 non-zero exit, means the walk did not finish: the caller reads that as unmeasured, never as an empty closure. `special` counts the reaches
-this cannot show as data: a symlink or a submodule where an import points, a path that climbs above the tree (the lint resolves it against
-the scratch dir, not the repo), and an absolute or ~ import that names a file on THIS host (the lint reads the host's file, not the branch's).
+this cannot show as data: a symlink or a submodule where an import points or that sits on its way, a `..` that follows a descent (the lint
+stats the path through the scratch tree's own directories, and the tip may have one there that the scratch tree does not), a path that climbs
+above the tree (the lint resolves it against the scratch dir, not the repo), and an absolute or ~ import that names a file on THIS host (the
+lint reads the host's file, not the branch's).
 
 Nothing of the branch is executed: the lint is the copy already merged, the branch is read as git objects. Python 3.9 compatible, like the lint.
 """
@@ -55,18 +57,38 @@ def tree(top: str, tip: str) -> Dict[str, Tuple[str, str]]:
 
 
 def reach(lint, tok: str, host: str, entries: Dict[str, Tuple[str, str]]) -> Tuple[Optional[str], int]:
-    """(the tip path the lint would read for this import, or None; 1 when the reach cannot be shown as data)."""
+    """(the tip path the lint would read for this import, or None; 1 when the answer on the whole tree may differ from the scratch tree's)."""
     if tok.startswith("~") or posixpath.isabs(tok):
         # vazio → (None, 0): no regular file by that name on this host, the lint counts the line as text; falhou (stat error) → LintError out of resolve_import, exit 2
         return (None, 1) if lint.resolve_import(tok, "/") else (None, 0)
-    cand = posixpath.normpath(posixpath.join(posixpath.dirname(host), tok))
-    if cand == ".." or cand.startswith("../") or "\n" in cand:
+    # The lint stats the path through the REAL directories of the scratch tree, which holds only the extracted files, so the walk goes one
+    # component at a time like the filesystem does (a text normpath would not): a `..` after a descent passes through a directory that exists
+    # in the tip but maybe not there, and a link on the way leads somewhere the tip listing does not show. Both are odd = 1: unmeasured.
+    stack = [c for c in posixpath.dirname(host).split("/") if c]
+    odd, descended = 0, False
+    for seg in tok.split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            if not stack:
+                return None, 1   # climbs above the tree: the lint resolves it against the scratch dir, not the repo
+            odd = odd or int(descended)
+            stack.pop()
+            continue
+        descended = True
+        stack.append(seg)
+        # vazio → not an entry: a plain directory (or nothing) on the way, no oddity; a link or a submodule on the way (or as the target) is odd
+        step = entries.get("/".join(stack))
+        if step is not None and step[0] not in REGULAR:
+            odd = 1
+    cand = "/".join(stack)
+    if "\n" in cand:
         return None, 1
-    # vazio → (None, 0): the tip has no such file, so it is not an import; a link or a submodule there cannot be extracted: (None, 1)
+    # vazio → (None, odd): the tip has no such file, so it is not an import; a link or a submodule there cannot be extracted: (None, 1)
     hit = entries.get(cand)
     if hit is None:
-        return None, 0
-    return (cand, 0) if hit[0] in REGULAR else (None, 1)
+        return None, odd
+    return (cand, odd) if hit[0] in REGULAR else (None, 1)
 
 
 def closure(lint, top: str, entries: Dict[str, Tuple[str, str]], roots: List[str]) -> Tuple[Set[str], int]:

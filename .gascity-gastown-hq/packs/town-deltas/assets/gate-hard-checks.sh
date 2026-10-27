@@ -44,8 +44,8 @@
 # when switched off (a DISABLED line, no summary), so green needs its summary line with at least one file checked. 2c's lint
 # counts a named doc's @imports by following each to a regular file of ANY suffix, so a changed CLAUDE.md / CLAUDE.local.md /
 # AGENTS.md makes gate-hard-checks-imports.py (beside this script) list what its imports reach, and the tree handed to the lint holds
-# those files too. A reach that tree cannot show as data (a link or submodule, a path above the tree, an absolute or ~ import that
-# names a file on this host) makes a clean verdict unmeasured, and a walk that did not finish is imports-nao-medidos, never an
+# those files too. A reach that tree cannot show as data (a link or submodule on the way or at the end, a `..` after a descent, a path above
+# the tree, an absolute or ~ import that names a file on this host) makes a clean verdict unmeasured, and a walk that did not finish is imports-nao-medidos, never an
 # empty closure.
 # A python without tomllib (< 3.11) cannot run 2d and would make the base tree red as well, so it is said
 # (python-sem-tomllib), never read as debito-previo for good.
@@ -140,7 +140,7 @@ pick_tools() { # PY = first python3 with tomllib (PY_TOML=1), else the PATH one;
 # imports_closure: sets IMPORTS (newline-delimited tip paths) and adds to SPECIAL, from the helper that walks the @imports of the changed
 # named docs. The lint follows an @import to a regular file of ANY suffix, so a tree of .md files alone shows it a short count; the
 # helper uses the lint's own tokenizer over the tip's git objects (gate_run ga-h3scrqt). Reaches it cannot show as data (a link, a path
-# above the tree, a file on this host) come back as `special`, which turns a clean verdict into unmeasured (ok_or_special).
+# above the tree, a `..` after a descent, a file on this host) come back as `special`, which turns a clean verdict into unmeasured (ok_or_special).
 imports_closure() {
   local helper="$HERE/gate-hard-checks-imports.py" out="" first="" n=""
   # vazio → no root although the caller just matched a named doc in this same file: a contradiction, so unmeasured; falhou/ilegível → the
