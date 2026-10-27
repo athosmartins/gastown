@@ -1224,10 +1224,14 @@ jex_run_end() {
     how="rc=$rc"
     [ -z "$JEX_SIGNAL" ] || { rc=1; how="signal $JEX_SIGNAL"; }
     jex_log "end $how after ${SECONDS}s"
-    # vazio/ilegível (no marker, or not ours) → left alone: it belongs to another run, and removing it would hide that run's death
+    # vazio (no marker) / not ours → left alone: it belongs to another run, and removing it would hide that run's death; falhou/ilegível (the read fails) → left alone too, and said in the log: this run cannot prove
+    # the marker is its own, so the next run may name it as dead although its 'end' line is above
     if [ -e "$JEX_INFLIGHT" ]; then
-        read -r marker_pid _ 2>/dev/null < "$JEX_INFLIGHT"
-        [ "$marker_pid" = "$$" ] && rm -f "$JEX_INFLIGHT"
+        if read -r marker_pid _ 2>/dev/null < "$JEX_INFLIGHT"; then
+            [ "$marker_pid" = "$$" ] && rm -f "$JEX_INFLIGHT"
+        else
+            jex_log "WARN the marker $JEX_INFLIGHT could not be read at the end of this run — left in place; the next run may name this run as dead"
+        fi
     fi
     # a run that got to its own end clears the streak; falhou/ilegível (the state cannot be read or rewritten) → the streak stays, never a guess
     if [ -z "$JEX_SIGNAL" ]; then

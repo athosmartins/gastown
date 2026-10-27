@@ -295,6 +295,8 @@ dolt_sql() {
       [ "$STUB_SOURCE_COUNT" = "ERR" ] && return 1
       printf 'row_count\n%s\n' "$STUB_SOURCE_COUNT" ;;
     "SELECT * FROM \`wa\`.issues"*)
+      # ga-iqsy9c7: STUB_CHMOD_MARKER=<path> makes that file unreadable once the export is under way (the run's own inflight marker: its read at the end of the run fails).
+      [ -n "${STUB_CHMOD_MARKER:-}" ] && chmod 000 "$STUB_CHMOD_MARKER"
       # ga-aai87v: STUB_KILL_SELF=1 is the engine's SIGKILL at the order's timeout — the exporter dies mid-export, no trap runs,
       # and its scratch file stays wherever the exporter put it.
       [ "${STUB_KILL_SELF:-0}" = "1" ] && kill -9 $$
@@ -775,6 +777,8 @@ iq_streak() { local f="$E2E_STATE/jsonl-export-state.json"; [ -e "$f" ] || { ech
 iq_marker() { [ -e "$E2E_STATE/jsonl-export-inflight" ] && echo present || echo none; }
 # vazio → no nudge in THIS run's gc calls (0); falhou (no gc log) → prints nothing, which no "= N" assertion accepts
 iq_nudges() { grep -c 'session nudge deacon/' "$E2E/gc.log" 2>/dev/null || true; }
+# same, but only the nudge about killed runs: a run that finishes also sends its own DOG_DONE to the deacon, which is no death
+iq_death_nudges() { grep -c 'JSONL_EXPORT: ' "$E2E/gc.log" 2>/dev/null || true; }
 # a pid that has exited and been reaped (a foreground child), never a made-up number
 iq_dead_pid() { bash -c 'echo $$'; }
 
@@ -906,6 +910,33 @@ run_export 203 203
 { [ "$(iq_count ' DIED .*the count in the state is unreadable')" = "1" ] && [ "$(jq -r '.sentinel_key // "gone"' "$E2E_STATE/jsonl-export-state.json")" = "kept" ]; } \
   && ok "dead pid, unreadable count in the state: the death is said, no count is invented, the rest of the state stays" \
   || bad "dead pid, unreadable count: $(tr '\n' '|' < "$IQ_LOG") state=$(jq -c . "$E2E_STATE/jsonl-export-state.json" 2>&1)"
+# The READ of the marker fails (chmod 000), not only its content: not a death either. The state holds a streak of 2, so a death counted by mistake would make 3 — the deacon nudged and '3 in a row' in the log.
+# (Not as root: root reads a chmod 000 file, and the marker would be a plain dead pid.)
+if [ "$(id -u)" -ne 0 ]; then
+  printf '%s 1\n' "$(iq_dead_pid)" > "$E2E_STATE/jsonl-export-inflight"
+  chmod 000 "$E2E_STATE/jsonl-export-inflight"
+  printf '{"consecutive_deaths":2,"sentinel_key":"kept"}\n' > "$E2E_STATE/jsonl-export-state.json"
+  iq_reset
+  run_export 204 204
+  { [ "$RC" = "0" ] && [ "$(iq_count ' WARN the marker .* is unreadable')" = "1" ] && [ "$(iq_count ' DIED ')" = "0" ] && [ "$(iq_count ' in a row')" = "0" ] && [ "$(iq_death_nudges)" = "0" ] && [ "$(head_rows)" = "204" ]; } \
+    && ok "marker that cannot be read (chmod 000): WARN, no death counted, deacon not told of a killed run, the export goes on" \
+    || bad "marker that cannot be read: rc=$RC WARN=$(iq_count ' WARN the marker') DIED=$(iq_count ' DIED ') death-nudges=$(iq_death_nudges) head=$(head_rows): $(tr '\n' '|' < "$IQ_LOG") gc: $(tr '\n' '|' < "$E2E/gc.log")"
+  [ "$(iq_marker)" = "none" ] \
+    && ok "marker that cannot be read: replaced by this run's own and removed when it ends" \
+    || bad "marker that cannot be read: a marker is still there after the run"
+  # The run's own marker becomes unreadable while it runs: at the end it cannot prove the marker is its own, so it leaves it and says so in the log (the next run may name this run as dead).
+  rm -f "$E2E_STATE/jsonl-export-inflight"
+  iq_reset
+  export STUB_CHMOD_MARKER="$E2E_STATE/jsonl-export-inflight"
+  run_export 205 205
+  unset STUB_CHMOD_MARKER
+  { [ "$RC" = "0" ] && [ "$(head_rows)" = "205" ] && [ "$(iq_count ' end rc=0 after ')" = "1" ] && [ "$(iq_count ' WARN the marker .* could not be read at the end of this run')" = "1" ] && [ "$(iq_marker)" = "present" ]; } \
+    && ok "marker unreadable at the end of the run: the run still ends rc=0, leaves the marker alone and says so in the log" \
+    || bad "marker unreadable at the end: rc=$RC head=$(head_rows) marker=$(iq_marker): $(tr '\n' '|' < "$IQ_LOG")"
+  chmod 644 "$E2E_STATE/jsonl-export-inflight" 2>/dev/null; rm -f "$E2E_STATE/jsonl-export-inflight"
+else
+  echo "  SKIP: unreadable-marker cases (running as root: chmod 000 does not block)"
+fi
 
 # Case 5 — a run that finishes clears a streak and keeps the rest of the state.
 scratch_archive iq-reset; iq_reset
