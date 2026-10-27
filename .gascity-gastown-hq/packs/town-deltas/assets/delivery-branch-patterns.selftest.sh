@@ -18,6 +18,12 @@
 #  4. The Pilot consumes the shared list: pilot-dispatcher.sh carries no second
 #     copy of it.
 #
+# Not pinned on purpose: the `[ -n "$_id" ] || return 1` guard at the top of
+# gc_delivery_branch_pick has no behaviour of its own. Without it an empty id
+# still reaches gc_delivery_branch_globs, whose own empty-id guard (section 1)
+# returns 1 before the pick reads stdin — same rc, same (empty) output, same
+# stdin left unread. Two guards in series: a test cannot tell which one fired.
+#
 # Exit 0 iff every assertion holds.
 set -uo pipefail
 
@@ -90,6 +96,11 @@ _o="$(printf '' | gc_delivery_branch_pick ga-abc)"; _rc=$?
 [ "$_rc" -eq 1 ] && [ -z "$_o" ] && ok "empty input → rc 1" || bad "empty input: rc=$_rc out='$_o'"
 _o="$(printf 'refs/heads/feat/ga-abc\n' | GC_DELIVERY_BRANCH_PREFIXES="" gc_delivery_branch_pick ga-abc)"; _rc=$?
 [ "$_rc" -eq 1 ] && [ -z "$_o" ] && ok "unusable glob list → rc 1 (no guessing)" || bad "empty prefixes in pick: rc=$_rc out='$_o'"
+# The unusable glob list is refused BEFORE stdin is read: the producer (git
+# ls-remote) is not drained for an answer that can only be rc 1. A second reader
+# on the same stdin still sees the ref line.
+_o="$( { GC_DELIVERY_BRANCH_PREFIXES="" gc_delivery_branch_pick ga-abc; echo "rc=$?"; cat; } <<< 'refs/heads/feat/ga-abc' )"
+[ "$_o" = $'rc=1\nrefs/heads/feat/ga-abc' ] && ok "unusable glob list → rc 1 before stdin is read (fail fast, nothing drained)" || bad "unusable glob list drained stdin or changed rc: '$_o'"
 
 echo "── 3. DRIFT GUARD vs quality-gate-guard.sh (the three literal copies of this list) ──"
 LIB_SET="$(printf '%s\n' $GC_DELIVERY_BRANCH_PREFIXES | sort -u)"
