@@ -384,7 +384,7 @@ _wt_lock_reason() {
 # settings*.json inside it (15 pool trees were kept for a 4 KB .claude/settings.json). Rewrites <list> (NUL-separated entries) with each entry named .claude/
 # (IGNORED_TOOL_DIR_RE) swapped for the files below it, which the caller then judges one by one: only junk → the folder drops out of the verdict, any other
 # file → it is reported by its own path. An entry the junk list already skips stays as it is, so WORKTREE_REAPER_IGNORED_JUNK_RE='…|(^|/)\.claude/$' (the
-# by-hand relief of 27/10) still means "do not look inside". rc 0 = <list> rewritten; rc 1 = could not tell (mktemp, find or writing the new list failed): <list> is not
+# by-hand relief of 27/10) still means "do not look inside". rc 0 = <list> rewritten; rc 1 = could not tell (mktemp, find, writing the new list or replacing <list> failed): <list> is not
 # to be trusted and the caller KEEPS the tree. The files come from find, not from git: git skips a folder it cannot open with a warning and rc 0, which would
 # read as "only settings.json"; find says rc != 0.
 _ignored_open_tool_dirs() {
@@ -398,8 +398,8 @@ _ignored_open_tool_dirs() {
       printf '%s\0' "$path" >>"$out" || { rc=1; break; }
     fi
   done <"$list"   # third-state-waiver: $list was written by a command whose exit code the caller checked; an empty file is git's answer "nothing is ignored"
-  # falhou (the copy back, e.g. a full disk) → rc 1, the caller KEEPS the tree; vazio ($out has no entry: nothing was listed, or the folders held no file) is a real answer
-  if [ "$rc" -eq 0 ]; then cat "$out" >"$list" 2>/dev/null || rc=1; fi
+  # falhou (the list cannot be replaced, e.g. a full disk) → rc 1, the caller KEEPS the tree; vazio ($out has no entry: nothing was listed, or the folders held no file) is a real answer
+  if [ "$rc" -eq 0 ]; then mv -f "$out" "$list" 2>/dev/null || rc=1; fi
   rm -f "$out"
   return "$rc"
 }

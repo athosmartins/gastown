@@ -2315,11 +2315,11 @@ cl_tree cl8 merged settings.json; mkdir -p "$TMP/cl8-bin"
 printf '#!/bin/sh\ncase " $* " in *" -print0 "*) exit 0 ;; esac\nexec %s "$@"\n' "$(command -v find)" > "$TMP/cl8-bin/find"; chmod +x "$TMP/cl8-bin/find"
 xp_run cl8 PATH="$TMP/cl8-bin:$PATH"
 cl_freed cl8 "(c8): the folder reads EMPTY (find prints nothing, rc 0) → nothing inside to lose: the entry is dropped and the tree is reaped"
-# (c10) the rewritten list cannot be copied back (a full disk would do it; here cat exits 1 — it is only called there on this path): the list was truncated by then,
-# so this must read as "could not tell" (KEPT, unknown), never as "nothing is ignored" (which would REAP a tree holding data)
-cl_tree cl10 merged settings.json notes.md; mkdir -p "$TMP/cl10-bin"; printf '#!/bin/sh\nexit 1\n' > "$TMP/cl10-bin/cat"; chmod +x "$TMP/cl10-bin/cat"
+# (c10) the rewritten list cannot replace the old one (a full disk would do it; here mv exits 1 — nothing else in the reaper calls mv): that is "could not tell"
+# (KEPT, kept_ignored_data_unknown), not a quiet fall back to judging the old list, where the whole .claude/ folder is one entry again and the event names it
+cl_tree cl10 merged settings.json notes.md; mkdir -p "$TMP/cl10-bin"; printf '#!/bin/sh\nexit 1\n' > "$TMP/cl10-bin/mv"; chmod +x "$TMP/cl10-bin/mv"
 xp_run cl10 PATH="$TMP/cl10-bin:$PATH"
-cl_kept cl10 "(c10): copying the rewritten list back fails (cat rc 1) → KEPT, kept_ignored_data_unknown — a truncated list is not 'nothing is ignored'" kept_ignored_data_unknown
+cl_kept cl10 "(c10): replacing the list with the rewritten one fails (mv rc 1) → KEPT, kept_ignored_data_unknown" kept_ignored_data_unknown
 [ -f "$TMP/cl10/rig/crew/w/.claude/notes.md" ] && ok "ga-1bfcda7 (c10): the notes are still on disk" || bad "ga-1bfcda7 (c10): the notes are gone"
 
 # (c9) WORKTREE_REAPER_IGNORED_JUNK_RE stays THE junk list: naming the folder itself as junk (the Mayor's by-hand relief of 27/10) skips it without opening it;
