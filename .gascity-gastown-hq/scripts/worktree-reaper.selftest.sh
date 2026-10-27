@@ -2349,6 +2349,13 @@ cl_top cl16a "(c16a): the event names .claude/settings.json.old alone" '\.claude
 cl_tree cl16b merged sub/settings.json; xp_run cl16b
 cl_kept cl16b "(c16b): .claude/sub/settings.json (not directly in .claude/) → data → KEPT, kept_ignored_data" kept_ignored_data
 cl_top cl16b "(c16b): the event names .claude/sub/settings.json" '\.claude/sub/settings\.json'
+# (c16c)(c16d) "settings*" is a FILE name: a folder called settings.d/ or settings.json.bak.d/ with files inside is not tool state
+cl_tree cl16c merged settings.d/extra.json; xp_run cl16c
+cl_kept cl16c "(c16c): .claude/settings.d/extra.json (a file inside a folder named settings*) → data → KEPT, kept_ignored_data" kept_ignored_data
+cl_top cl16c "(c16c): the event names .claude/settings.d/extra.json" '\.claude/settings\.d/extra\.json'
+cl_tree cl16d merged settings.json.bak.d/f.md; xp_run cl16d
+cl_kept cl16d "(c16d): .claude/settings.json.bak.d/f.md (a file inside a folder named settings.json.bak.*) → data → KEPT, kept_ignored_data" kept_ignored_data
+cl_top cl16d "(c16d): the event names .claude/settings.json.bak.d/f.md" '\.claude/settings\.json\.bak\.d/f\.md'
 
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"
