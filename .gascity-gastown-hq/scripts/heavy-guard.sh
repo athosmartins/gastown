@@ -206,6 +206,8 @@ hg_posint HG_LOCK_MAXAGE "${HEAVY_GUARD_PUSH_LOCK_MAXAGE_SECS:-}" 7200 0
 HG_LOCK_DIR="${HEAVY_GUARD_PUSH_LOCK_DIR:-$HG_CITY/.gc/heavy-guard-push.lock}"
 # file-cap class (ga-e6ug8gq) tunable, see "FILE-CAP CLASS": 0, empty or not a number can never UNCAP a selftest, it is the 512 MB default
 hg_posint HG_FCAP_DEFAULT "${HEAVY_GUARD_SELFTEST_MAX_FILE_MB:-}" 512 0
+# disk-watch tunable (ga-2d14tow), see "DISK-WATCH": 0, empty or not a number can never LIFT the limit of a selftest, it is the 2048 MB default
+hg_posint HG_DROP_DEFAULT "${HEAVY_GUARD_SELFTEST_MAX_DROP_MB:-}" 2048 0
 
 # hg_go_step <label> [command...] — rc 0 when the step is a Go toolchain build/test/vet/install (see "GO CLASS"), else rc 1.
 # Pure bash on purpose: no outside command (an earlier version split the command with `tr`, and when that fork failed under
@@ -290,6 +292,7 @@ hg_log() {
 
 # ── push class (ga-pwd2h6): the lock and the watch ──────────────────────────────────────────────────────────
 HG_LOCK_HELD=0; HG_CHILD=""; HG_WATCHER=""; HG_INTERRUPTED=0; HG_LOCK_VERDICT=held; HG_LOCK_HOLDER=unknown
+HG_WKIND=push; HG_WSTOP=0; HG_WDROP=0; HG_WSTART=""   # what the watch watches: push (default) or step (ga-2d14tow)
 
 hg_lock_release() {
   # best effort by design (it runs from an EXIT trap): a lock left behind is judged stale by the next push (dead pid / max age)
@@ -355,6 +358,13 @@ hg_stop_group() {
   return 0
 }
 
+# hg_traps — from here a TERM/INT/HUP stops the child and lets the lock go, and the watch's USR1 is the "interrupted" flag (without its trap USR1 would kill the guard)
+hg_traps() {
+  trap 'HG_INTERRUPTED=1' USR1
+  trap 'hg_on_signal' TERM INT HUP
+  trap 'hg_lock_release' EXIT
+}
+
 # hg_on_signal — the guard was told to stop (the session closes, a timeout): the push and the watch go down with it, the lock is let go
 hg_on_signal() {
   trap '' TERM INT HUP
@@ -368,9 +378,7 @@ hg_on_signal() {
 hg_push_lock_acquire() {
   local t0 deadline now step waited=0
   # the traps first: from here a TERM must let the lock go; the lock is only released if it was taken (HG_LOCK_HELD)
-  trap 'HG_INTERRUPTED=1' USR1
-  trap 'hg_on_signal' TERM INT HUP
-  trap 'hg_lock_release' EXIT
+  hg_traps
   # vazio/falhou (the parent cannot be made) → the mkdir below fails and the verdict is 76
   mkdir -p "${HG_LOCK_DIR%/*}" 2>/dev/null
   # vazio/falhou/ilegível (no clock) → no deadline can be made: one look at the lock, no waiting
@@ -414,24 +422,43 @@ hg_push_lock_acquire() {
   done
 }
 
-# hg_watch <push pid> <guard pid> — runs in a background subshell for as long as the push runs
+# hg_watch <child pid> <guard pid> — runs in a background subshell for as long as the child runs. Push: stops it when the disk is under DISK_PUSH_STOP_MB.
+# Step (ga-2d14tow, HG_WKIND=step): stops it under HG_WSTOP, or when the free disk has fallen HG_WDROP MB or more since HG_WSTART (HG_WDROP 0 = floor only).
 hg_watch() {
-  local pid="$1" main="$2" f st blind=0
+  local pid="$1" main="$2" f st blind=0 stop="$DISK_PUSH_STOP_MB" d
+  [ "$HG_WKIND" != step ] || stop="$HG_WSTOP"
   while :; do
     sleep "$HG_WATCH"
-    # vazio/falhou/ilegível → st is not "ok" nor "low": this round is blind; the push goes on and the log says so once
+    # vazio/falhou/ilegível → st is not "ok" nor "low": this round is blind; the child goes on and the log says so once
     f="$(disk_free_mb 2>/dev/null)" || f=""
-    st="$(disk_state_of "$f" "$DISK_PUSH_STOP_MB" 2>/dev/null)" || st=""
+    st="$(disk_state_of "$f" "$stop" 2>/dev/null)" || st=""
+    # the drop rule needs two real numbers: st=ok means f is one (the kill switch makes every state ok, so it switches this rule off too) and HG_WSTART was checked when the watch was set up; a round that cannot judge it is no verdict, never a kill
+    if [ "$st" = ok ] && [ "$HG_WKIND" = step ] && [ "$HG_WDROP" -gt 0 ] && [ "${DISK_HEADROOM_ENABLED:-1}" != 0 ]; then
+      d=$(( 10#$HG_WSTART - 10#$f ))
+      [ "$d" -lt "$HG_WDROP" ] || st=drop
+    fi
     case "$st" in
       ok) ;;
-      low)
-        echo "heavy-guard: INTERRUPTED '$what': ${f} MB free < ${DISK_PUSH_STOP_MB} MB stop floor while it ran (ga-pwd2h6) — the push is being stopped (TERM to its process group). Do NOT repeat it and do NOT work around it (no --no-verify, no other route): the disk is near the Dolt CRITICAL floor. Tell the Mayor. (rc 78)" >&2
-        hg_log "INTERRUPTED what='$what' free_mb=$f stop_mb=$DISK_PUSH_STOP_MB rc=78"
-        # told in memory (no disk needed): the guard marks the run as interrupted before the push's own exit shows up
+      low|drop)
+        if [ "$HG_WKIND" != step ]; then
+          echo "heavy-guard: INTERRUPTED '$what': ${f} MB free < ${DISK_PUSH_STOP_MB} MB stop floor while it ran (ga-pwd2h6) — the push is being stopped (TERM to its process group). Do NOT repeat it and do NOT work around it (no --no-verify, no other route): the disk is near the Dolt CRITICAL floor. Tell the Mayor. (rc 78)" >&2
+          hg_log "INTERRUPTED what='$what' free_mb=$f stop_mb=$DISK_PUSH_STOP_MB rc=78"
+        elif [ "$st" = drop ]; then
+          echo "heavy-guard: INTERRUPTED '$what': the free disk fell ${d} MB (${HG_WSTART} -> ${f} MB) while it ran, limit ${HG_WDROP} MB (ga-2d14tow) — the step is being stopped (TERM to its process group). A loop that writes many small files goes under the per-file cap and is the usual cause (27/10 ga-e6ug8gq). Do NOT re-run it unchanged and do NOT lift the limit to get around it: what it wrote is still on disk (look under its TMPDIR, clean scratch with safe-clean). If the step really writes this much, re-run THAT one with --max-disk-drop-mb and say so in the bead; if you cannot tell, tell the Mayor. (rc 78)" >&2
+          hg_log "INTERRUPTED what='$what' class=step free_mb=$f start_mb=$HG_WSTART drop_mb=$d max_drop_mb=$HG_WDROP rc=78"
+        else
+          echo "heavy-guard: INTERRUPTED '$what': ${f} MB free < ${stop} MB stop floor while it ran (ga-2d14tow) — the step is being stopped (TERM to its process group). Do NOT re-run it unchanged and do NOT work around it: the disk is near the Dolt CRITICAL floor, and what the step wrote is still on disk (look under its TMPDIR, clean scratch with safe-clean). Tell the Mayor. (rc 78)" >&2
+          hg_log "INTERRUPTED what='$what' class=step free_mb=$f stop_mb=$stop rc=78"
+        fi
+        # told in memory (no disk needed): the guard marks the run as interrupted before the child's own exit shows up
         kill -USR1 "$main" 2>/dev/null
         hg_stop_group "$pid"
         return 0 ;;
-      *) if [ "$blind" = 0 ]; then blind=1; hg_log "WATCH_UNREADABLE what='$what' stop_mb=$DISK_PUSH_STOP_MB (the push goes on)"; fi ;;
+      *) if [ "$blind" = 0 ]; then
+           blind=1
+           if [ "$HG_WKIND" = step ]; then hg_log "WATCH_UNREADABLE what='$what' class=step stop_mb=$stop (the step goes on)"
+           else hg_log "WATCH_UNREADABLE what='$what' stop_mb=$DISK_PUSH_STOP_MB (the push goes on)"; fi
+         fi ;;
     esac
   done
 }
@@ -475,13 +502,14 @@ if [ ! -r "$HG_LIB" ] || ! . "$HG_LIB" 2>/dev/null || ! type disk_headroom_state
   exit 76
 fi
 
-min=""; wait_s=0; what="heavy step"; mode=run; fcap=""; fcap_given=0
+min=""; wait_s=0; what="heavy step"; mode=run; fcap=""; fcap_given=0; drop=""; drop_given=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --min-free-mb) min="${2:-}"; shift 2 || { echo "heavy-guard: --min-free-mb needs a number" >&2; exit 64; } ;;
     --wait-secs)   wait_s="${2:-}"; shift 2 || { echo "heavy-guard: --wait-secs needs a number" >&2; exit 64; } ;;
     --what)        what="${2:-}"; shift 2 || { echo "heavy-guard: --what needs a label" >&2; exit 64; } ;;
     --max-file-mb) fcap="${2:-}"; fcap_given=1; shift 2 || { echo "heavy-guard: --max-file-mb needs a number" >&2; exit 64; } ;;
+    --max-disk-drop-mb) drop="${2:-}"; drop_given=1; shift 2 || { echo "heavy-guard: --max-disk-drop-mb needs a number" >&2; exit 64; } ;;
     --check)       mode=check; shift ;;
     --)            shift; break ;;
     -h|--help)     sed -n '2,/^HG_HERE=/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -502,6 +530,11 @@ if [ "$fcap_given" = 1 ]; then
   case "$fcap" in ''|*[!0-9]*) echo "heavy-guard: --max-file-mb must be a whole number of MB, 0 for no cap (got '$fcap')" >&2; exit 64 ;; esac
   [ "${#fcap}" -le 9 ] || { echo "heavy-guard: --max-file-mb takes at most 9 digits (got '$fcap')" >&2; exit 64; }
   fcap=$(( 10#$fcap ))
+fi
+if [ "$drop_given" = 1 ]; then
+  case "$drop" in ''|*[!0-9]*) echo "heavy-guard: --max-disk-drop-mb must be a whole number of MB, 0 for no drop limit (got '$drop')" >&2; exit 64 ;; esac
+  [ "${#drop}" -le 9 ] || { echo "heavy-guard: --max-disk-drop-mb takes at most 9 digits (got '$drop')" >&2; exit 64; }
+  drop=$(( 10#$drop ))
 fi
 if [ "$mode" = run ] && [ $# -eq 0 ]; then
   echo "heavy-guard: no command given (usage: heavy-guard.sh [opts] -- <command> [args...], or --check)" >&2
@@ -550,6 +583,21 @@ elif [ "$go_class" = 0 ] && hg_selftest_step "$what" "$@"; then
   fcap_mb="$HG_FCAP_DEFAULT"
 fi
 
+# DISK-WATCH (ga-2d14tow): a step that RUNS (not a push, which has its own watch) is watched while it runs when it is a selftest/mutant battery that is not a
+# Go step, or when the caller gives --max-disk-drop-mb N > 0. drop_mb is the fall in free MB that stops it (the caller's number wins over the class default;
+# 0 lifts the drop rule only, the floor stays). The floor is DISK_PUSH_STOP_MB, pulled down to the start floor in force so a step the caller let start low is not
+# killed at the first round. vazio (no option, not in the class) -> no watch, as before this class.
+watch_kind=""; drop_mb=0
+if [ "$mode" = run ] && [ "$push_class" = 0 ]; then
+  [ "$drop_given" = 0 ] || drop_mb="$drop"
+  if [ "$go_class" = 0 ] && hg_selftest_step "$what" "$@"; then
+    watch_kind=step
+    [ "$drop_given" = 1 ] || drop_mb="$HG_DROP_DEFAULT"
+  elif [ "$drop_mb" -gt 0 ]; then
+    watch_kind=step
+  fi
+fi
+
 # a push that RUNS under the guard goes one at a time: the lock is taken before the disk is judged (the reading is made after the wait)
 if [ "$push_class" = 1 ] && [ "$mode" = run ]; then hg_push_lock_acquire; fi
 
@@ -589,7 +637,15 @@ case "$state" in
       hg_log "REFUSED what='$what' fsize_cap_mb=$fcap_mb unsettable rc=76"
       exit 76
     fi
-    [ "$push_class" = 1 ] && hg_run_watched "$@"
+    [ "$push_class" = 1 ] && { HG_WKIND=push; hg_run_watched "$@"; }
+    if [ "$watch_kind" = step ]; then
+      HG_WKIND=step; HG_WDROP="$drop_mb"; HG_WSTART="$free"; HG_WSTOP="${DISK_PUSH_STOP_MB:-4000}"
+      # vazio/falhou/ilegível (no number to count a fall from: the bypass switches leave $free empty or "?") -> the floor alone; `[` false or "could not compare" both clamp the stop floor to the start floor
+      case "$HG_WSTART" in ''|*[!0-9]*) HG_WDROP=0 ;; esac
+      [ "$HG_WSTOP" -le "$min" ] 2>/dev/null || HG_WSTOP="$min"
+      hg_traps
+      hg_run_watched "$@"
+    fi
     exec "$@"
     ;;
   low)

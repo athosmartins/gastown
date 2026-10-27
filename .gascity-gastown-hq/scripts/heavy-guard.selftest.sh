@@ -19,6 +19,7 @@ check() { # check <desc> <expected-rc> <actual-rc>
 export GC_CITY_PATH="$W/city"; mkdir -p "$GC_CITY_PATH/.gc/logs"
 export HEAVY_GUARD_LOG="$W/city/.gc/logs/heavy-guard.log"
 unset DISK_FREE_OVERRIDE_MB DISK_HEADROOM_PATH DISK_HEADROOM_ENABLED DISK_NEW_WORK_MIN_MB DISK_HEAVY_MIN_MB HEAVY_GUARD_POLL_SECS
+unset HEAVY_GUARD_SELFTEST_MAX_DROP_MB HEAVY_GUARD_SELFTEST_MAX_FILE_MB WBASE WLOOP_BAD
 unset DISK_GO_MIN_MB DISK_PUSH_MIN_MB DISK_PUSH_STOP_MB HEAVY_GUARD_WATCH_SECS HEAVY_GUARD_KILL_GRACE_SECS HEAVY_GUARD_PUSH_LOCK_DIR HEAVY_GUARD_PUSH_LOCK_WAIT_SECS HEAVY_GUARD_PUSH_LOCK_POLL_SECS HEAVY_GUARD_PUSH_LOCK_MAXAGE_SECS
 
 # ── lib cases: lib_cases <lib> ───────────────────────────────────────────────────────────────────────────────
@@ -838,18 +839,116 @@ EOF
   check "fcap: a cap that cannot be raised but already reads TIGHTER than asked (a tighter hard limit) is fine (the step runs)" 0 "$rc"; [ -e "$W/fran" ] || bad "fcap: the step did not run under a tighter inherited cap"
 }
 
+# ── disk-watch cases (ga-2d14tow): wcases <guard> <lib> ───────────────────────────────────────────────────
+# The file cap above is per FILE: a mutant that writes MANY small files, or appends to one file after another, goes under it and empties the disk the same way
+# (27/10: 4.2 and 5.6 GB, Dolt ENOSPC). So a selftest/mutant step also runs under the push class's watch: df is read every HEAVY_GUARD_WATCH_SECS and the step is
+# stopped (TERM to its process group, KILL after the grace, rc 78) when the free disk falls under the stop floor, or by more than the drop limit since it started.
+# The fake df reports WBASE MB minus what the writer REALLY wrote into $WF, so "the fixture's disk does not pass N MB" is measured. The writer ends by itself at 200
+# files (~25 MB) only so that a guard WITHOUT the watch does not fill the disk of this selftest. WATCH_SECTIONS="drop floor" runs only those sections (default all).
+wcases() {
+  local g="$1" lib="$2" rc secs n n2 t0 out WB="$W/wbin" WF="$W/wfix" wall=" ${WATCH_SECTIONS:-all} "
+  wwant() { case "$wall" in *" all "*|*" $1 "*) return 0 ;; esac; return 1; }
+  mkdir -p "$WB"
+  cat > "$WB/df" <<EOF
+#!/bin/sh
+if [ -e "$W/wdfbad" ]; then echo "df: no usable answer"; exit 0; fi
+kb=\$(du -sk "$WF" 2>/dev/null | cut -f1)
+echo "Filesystem 1048576-blocks Used Available Capacity Mounted on"
+echo "/dev/fake 100000 90000 \$(( \$(cat "$W/wbase") - \${kb:-0} / 1024 )) 90% /"
+EOF
+  chmod +x "$WB/df"
+  # 128 KB a file, ~100 files a second: far under any per-file cap. WLOOP_BAD=<file> makes the fake df unreadable while it writes.
+  cat > "$W/wloop.sh" <<'EOF'
+#!/bin/bash
+d="$1"; mkdir -p "$d"; [ -z "${WLOOP_BAD:-}" ] || : > "$WLOOP_BAD"
+i=0; while [ "$i" -lt 200 ]; do i=$((i+1)); printf '%0131072d' 0 > "$d/f$i"; sleep 0.005; done
+echo done > "$2"
+EOF
+  cp "$W/wloop.sh" "$W/wloop.selftest.sh"
+  wrun() { # the guard on the fake df, a fresh fixture each time; leaves rc, secs and the number of files written
+    rm -rf "$WF" "$W/wdone" "$W/wdfbad"; echo "${WBASE:-9000}" > "$W/wbase"; : > "$HEAVY_GUARD_LOG"; t0=$SECONDS
+    PATH="$WB:$PATH" DISK_HEADROOM_PATH=/ HEAVY_GUARD_LIB="$lib" HEAVY_GUARD_WATCH_SECS=1 HEAVY_GUARD_KILL_GRACE_SECS=2 "$g" "$@" >/dev/null 2>"$W/werr"; rc=$?
+    secs=$((SECONDS - t0)); n="$(ls "$WF" 2>/dev/null | wc -l | tr -d ' ')"
+  }
+  wstopped() { # the last wrun ended by the watch: 78, long before the writer's 200 files, in seconds, nothing left running, the reason said and logged
+    check "watch: $1: the guard ends with 78" 78 "$rc"
+    [ ! -e "$W/wdone" ] || bad "watch: $1: the writer ran to the end, the watch did not stop it"
+    [ "$n" -lt 150 ] || bad "watch: $1: $n of 200 files were written, the watch must stop the writer long before"
+    [ "$secs" -lt 8 ] || bad "watch: $1: it took $secs s to stop a writer of ~12 MB/s"
+    grep -q 'INTERRUPTED' "$W/werr" && grep -q 'rc 78' "$W/werr" || bad "watch: $1: stderr must say INTERRUPTED and rc 78 ($(cat "$W/werr"))"
+    grep -q "INTERRUPTED what=.* class=step .*rc=78" "$HEAVY_GUARD_LOG" || bad "watch: $1: the log must have the INTERRUPTED line with class=step ($(cat "$HEAVY_GUARD_LOG"))"
+    n2="$(ls "$WF" 2>/dev/null | wc -l | tr -d ' ')"; sleep 1.5
+    [ "$(ls "$WF" 2>/dev/null | wc -l | tr -d ' ')" = "$n2" ] || bad "watch: $1: the writer kept writing after the guard returned, its process group was not stopped"
+  }
+  wuntouched() { # the last wrun ran to the end and the step's own rc came back
+    check "watch: $1: the step's own rc comes back" 0 "$rc"
+    [ -e "$W/wdone" ] || bad "watch: $1: the step was stopped at $n of 200 files (rc $rc), it must not be ($(head -c 300 "$W/werr"))"
+  }
+  if wwant drop; then
+    wrun --what selftest-mutants --max-disk-drop-mb 4 -- bash "$W/wloop.sh" "$WF" "$W/wdone"
+    wstopped "a selftest label with --max-disk-drop-mb 4"
+    grep -q 'fell' "$W/werr" && grep -q 'limit 4 MB' "$W/werr" || bad "watch: the drop refusal must say how far it fell and the limit ($(cat "$W/werr"))"
+    HEAVY_GUARD_SELFTEST_MAX_DROP_MB=4 wrun --what t -- bash "$W/wloop.selftest.sh" "$WF" "$W/wdone"
+    wstopped "a *.selftest.sh word in the command, the limit from the env"
+    HEAVY_GUARD_SELFTEST_MAX_DROP_MB=2048 wrun --what selftest --max-disk-drop-mb 4 -- bash "$W/wloop.sh" "$WF" "$W/wdone"
+    wstopped "the caller's number beats the class default"
+    wrun --what other --max-disk-drop-mb 4 -- bash "$W/wloop.sh" "$WF" "$W/wdone"
+    wstopped "--max-disk-drop-mb 4 on a step that is not in the class"
+    HEAVY_GUARD_SELFTEST_MAX_DROP_MB=4 wrun --what other -- bash "$W/wloop.sh" "$WF" "$W/wdone"
+    wuntouched "a step outside the class is not watched by the class default"
+    HEAVY_GUARD_SELFTEST_MAX_DROP_MB=4 wrun --what selftest --max-disk-drop-mb 0 -- bash "$W/wloop.sh" "$WF" "$W/wdone"
+    wuntouched "--max-disk-drop-mb 0 is the explicit way to lift the drop limit"
+    for out in 0 abc 99999999999999999999; do
+      HEAVY_GUARD_SELFTEST_MAX_DROP_MB="$out" wrun --what selftest -- bash "$W/wloop.sh" "$WF" "$W/wdone"
+      wuntouched "a class limit of '$out' in the env falls back to 2048 MB, it does not uncap or stop at once"
+    done
+    HEAVY_GUARD_SELFTEST_MAX_DROP_MB=4 WBASE=20000 wrun --what go-test -- bash "$W/wloop.selftest.sh" "$WF" "$W/wdone"
+    wuntouched "a Go step is not in the class even with a selftest word in its command"
+  fi
+  if wwant floor; then
+    WBASE=4003 wrun --min-free-mb 4003 --what selftest --max-disk-drop-mb 0 -- bash "$W/wloop.sh" "$WF" "$W/wdone"
+    wstopped "the stop floor alone (4003 MB at the start, 4000 MB floor)"
+    grep -q 'stop floor' "$W/werr" && grep -q '4000 MB' "$W/werr" || bad "watch: the floor refusal must name the stop floor ($(cat "$W/werr"))"
+    WBASE=3500 wrun --min-free-mb 3000 --what selftest --max-disk-drop-mb 0 -- bash "$W/wloop.sh" "$WF" "$W/wdone"
+    wuntouched "a step the caller let start at 3000 MB is not stopped by the 4000 MB floor, which is clamped to its start floor"
+  fi
+  if wwant blind; then
+    HEAVY_GUARD_SELFTEST_MAX_DROP_MB=4 WLOOP_BAD="$W/wdfbad" wrun --what selftest -- bash "$W/wloop.sh" "$WF" "$W/wdone"
+    wuntouched "a df the watch cannot read does not kill the step"
+    grep -q "WATCH_UNREADABLE what=" "$HEAVY_GUARD_LOG" || bad "watch: an unreadable round must leave the WATCH_UNREADABLE line ($(cat "$HEAVY_GUARD_LOG"))"
+  fi
+  if wwant plain; then
+    wrun --what selftest --max-disk-drop-mb 4 -- bash -c 'exit 7'
+    check "watch: a step that fails by itself keeps its own rc under the watch" 7 "$rc"
+    out="$(DISK_FREE_OVERRIDE_MB=20000 HEAVY_GUARD_LIB="$lib" "$g" --what selftest -- sh -c 'echo hi; exit 3' 2>/dev/null)"; rc=$?
+    check "watch: a selftest step on a pinned reading returns its rc" 3 "$rc"; [ "$out" = hi ] || bad "watch: the step's stdout must come through the watch (got '$out')"
+    DISK_FREE_OVERRIDE_MB=20000 HEAVY_GUARD_LIB="$lib" "$g" --check --max-disk-drop-mb 4 --what selftest 2>/dev/null; rc=$?
+    check "watch: --check accepts --max-disk-drop-mb (nothing runs, nothing to watch)" 0 "$rc"
+    for out in abc -1 1234567890 ''; do
+      DISK_FREE_OVERRIDE_MB=20000 HEAVY_GUARD_LIB="$lib" "$g" --max-disk-drop-mb "$out" --what t -- true 2>/dev/null; rc=$?
+      check "watch: --max-disk-drop-mb '$out' is a usage error" 64 "$rc"
+    done
+    DISK_FREE_OVERRIDE_MB=20000 HEAVY_GUARD_LIB="$lib" "$g" --what t --max-disk-drop-mb 2>/dev/null; rc=$?
+    check "watch: --max-disk-drop-mb without a value is a usage error" 64 "$rc"
+  fi
+}
+
 mk_mutant() { # mk_mutant <src> <dst> <sed-expr>  — fails the selftest if the expression changed nothing
   # sed > file leaves mode 644, and the guard mutants are EXECUTED: without +x every one of them died with rc 126 (permission
   # denied) whatever it changed, so no mutant proved anything
   sed "$3" "$1" > "$2"; chmod +x "$2"; cmp -s "$1" "$2" && { bad "mutant '$3' did not change $(basename "$1")"; return 1; }; return 0
 }
 
+if [ "${HEAVY_GUARD_ST_ONLY:-}" = watch ]; then   # development shortcut: just the disk-watch cases, no mutants
+  wcases "$REAL_GUARD" "$REAL_LIB"; echo "heavy-guard selftest (watch cases only): $PASS passed, $FAIL failed"; [ "$FAIL" -eq 0 ]; exit
+fi
 before=$FAIL; lib_cases "$REAL_LIB";                      [ "$FAIL" -eq "$before" ] || echo "(lib cases failed on the real lib)"
 before=$FAIL; guard_cases "$REAL_GUARD" "$REAL_LIB";      [ "$FAIL" -eq "$before" ] || echo "(guard cases failed on the real files)"
 before=$FAIL; go_cases "$REAL_GUARD" "$REAL_LIB";         [ "$FAIL" -eq "$before" ] || echo "(go cases failed on the real files)"
 before=$FAIL; push_cases "$REAL_GUARD" "$REAL_LIB";       [ "$FAIL" -eq "$before" ] || echo "(push cases failed on the real files)"
 before=$FAIL; lookup_cases "$REAL_GUARD";                 [ "$FAIL" -eq "$before" ] || echo "(lookup cases failed on the real guard)"
 before=$FAIL; fcap_cases "$REAL_GUARD" "$REAL_LIB";       [ "$FAIL" -eq "$before" ] || echo "(file-cap cases failed on the real files)"
+before=$FAIL; wcases "$REAL_GUARD" "$REAL_LIB";           [ "$FAIL" -eq "$before" ] || echo "(disk-watch cases failed on the real files)"
 
 # mutants: each must make at least one case fail
 survive() { # survive <name> -- the FAIL counter must have grown since $before
