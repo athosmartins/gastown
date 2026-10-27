@@ -283,6 +283,16 @@ EXP_SW0="rc=0 completo run=6 k=2 c=4 f=0 inv=0 open=4"; EXP_SYM="rc=0 sem-cobert
 peq "sujeito symlink: pulado (symlink=1), nada rodou e o arquivo de fora não mudou" "$EXP_SYM" fp_symlink
 peq "execução que falha por infra: rc 0, parcial, falhas=1, nenhum veredito; consertado o slot a varredura seguinte roda os 6" "$EXP_FALHA" fp_falha
 peq "--jail relativo funciona como o absoluto" "$EXP_SW0" fp_jailrel
+fp_fsize() {   # o selftest escreve 3 MB num arquivo do slot com o teto em 1 MB: o laço de escrita para no teto (aqui são 3 MB, nunca GB)
+  newfx; mkfoo; mkdir "$F/fora"
+  mkst foo '( head -c 3000000 /dev/zero > "$TMPDIR/big" ) 2> /dev/null
+wc -c < "$TMPDIR/big" >> "'"$F"'/fora/size"
+[ "$(bash "$H/foo.sh" 9)" = big ] || exit 1
+[ "$(bash "$H/foo.sh" 1)" = small ] || exit 1'
+  sw --fsize-mb 1; m=$(tr -d ' ' < "$F/fora/size" | sort -n | tail -1)
+  echo "$(cnt) teto=$([ "${m:-0}" -gt 0 ] && [ "${m:-0}" -le 1048576 ] && echo sim || echo "nao:${m:-vazio}")"
+}
+peq "--fsize-mb 1: o arquivo que o mutante escreve para no teto e o veredito é o mesmo" "$EXP_SW0 teto=sim" fp_fsize
 peq "sweep: mortos, sobreviventes confirmados, original intacto, HOME/TMPDIR no slot, slots limpos; os ids do gen --tree são os que ele grava" "$EXP_SWEEP" fp_sweep
 fp_semvalid() {  # bash -n que sai com rc estranho: nenhum veredito (nem "i"), nao_sei, e a varredura seguinte tenta de novo
   newfx; mkfoo; mkdir "$F/bin"; printf '#!/bin/sh\n[ "$1" = -n ] && exit 5\nexec /bin/bash "$@"\n' > "$F/bin/bash"; chmod +x "$F/bin/bash"
@@ -401,6 +411,8 @@ par kill_it heredoc-e-codigo     fp_gen     "$EXP_GEN" '                    here
 par kill_it here-string-e-heredoc fp_gen    "$EXP_GEN" ' and line[i - 1:i] != "<"' ''
 par kill_it aritmetica-e-heredoc fp_gen     "$EXP_GEN" ' and line[:i].count("((") <= line[:i].count("))")' ''
 par kill_it jail-relativo        fp_jailrel "$EXP_SW0" '    a.jail = str(Path(a.jail).resolve())' '    pass'
+par kill_it teto-nao-aplicado    fp_fsize   "$EXP_SW0 teto=sim" 'ulimit -f "$0" && exec bash "$1"' 'exec bash "$1"'
+par kill_it teto-fixo            fp_fsize   "$EXP_SW0 teto=sim" 'str(ctx.a.fsize_mb * 1024)' '"524288"'
 par kill_it symlink-gravado      fp_symlink "$EXP_SYM" '        if subj.resolve() != subj:' '        if False:'
 par kill_it falha-derruba        fp_falha   "$EXP_FALHA" '    except (OSError, RuntimeError):' '    except ZeroDivisionError:'
 par kill_it falha-calada         fp_falha   "$EXP_FALHA" '            ctx.falhas += 1' '            pass'

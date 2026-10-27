@@ -13,7 +13,7 @@
 # TRÊS ESTADOS: sem origin/main (sem-main), árvore sem scripts/ (arvore-sem-scripts), sem o motor ou a jaula na árvore (sem-motor: o main ainda não os tem), wt-add que falha, o motor que morre sem imprimir o
 #   resumo (motor-sem-resumo), o estado que o motor não lê (estado-ilegivel, do motor: nunca é zerado) → exit 3 e nada de "sem novidade" gravado. O marcador de ocioso só é escrito quando o motor DISSE
 #   sem-novidade com rc 0; ilegível/ausente/velho → roda a rodada (pior caso é repetir uma, nunca pular uma).
-# LIMITES: roda no nó como `runner`; o motor só escreve no --work ($BALLAST_RUN_DIR/work) e no estado; cada mutante roda numa cópia da árvore (~63 MB) na jaula (escrita só no slot, TCP cortado, provada pelo
+# LIMITES: roda no nó como `runner`; o motor só escreve no --work ($BALLAST_RUN_DIR/work) e no estado; cada mutante roda numa cópia da árvore (~63 MB) na jaula (escrita só no slot e no máximo 512 MB por arquivo, TCP cortado, provada pelo
 #   pai antes de qualquer mutante); selftest que cita gc/bd/dolt de verdade, sudo, tmux, launchctl, pkill… fica FORA (denylist do motor, contada em `skipped`). Nenhum dado sai do nó além deste resumo.
 set -u
 BH=${BALLAST_HOME:?BALLAST_HOME}; RD=${BALLAST_RUN_DIR:?BALLAST_RUN_DIR}; CORES=${BALLAST_CORES:-2}

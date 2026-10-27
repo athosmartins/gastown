@@ -19,7 +19,7 @@ OPERADORES: no shell só entre tokens soltos (um scanner com pilha passa por asp
 VEREDITO: morto = algum selftest da família saiu != 0 (prazo e 97 incluídos) · sobrevivente = todos 0, e roda DE NOVO numa cópia limpa: se a 2ª reprova é `flaky` (não se reporta), senão `confirmed`. Execução cortada pelo TERM não é veredito. Cada mutante roda numa CÓPIA
   da árvore dentro da jaula (--rw só o slot, HOME e TMPDIR descartáveis, `env -i` e só PATH, LANG, LC_*, USER), PROVADA antes de qualquer mutante (`--prove`): sem prova, rc 97 e nada roda.
 ESTADO (--state, json, trocado por arquivo temporário): por alvo o hash do conteúdo (e da revisão do scanner), o veredito de cada id e os sobreviventes. Hash igual e tudo coberto = `sem-novidade` (varrer o mesmo seria queima disfarçada). Ordem: arquivo mudado nos últimos 7 dias (git log),
-  depois selftests SEM mutante embutido, depois o menos recente; --cap limita os mutantes por alvo por varredura. O motor NÃO trava o --state: UM sweep por vez é de quem chama. Estado que lê mas tem forma errada = estado-ilegivel (rc 3, nunca se zera).
+  depois selftests SEM mutante embutido, depois o menos recente; --cap limita os mutantes por alvo por varredura; --fsize-mb (512) é o teto de CADA arquivo que o mutante escreve (mutante em laço de escrita é esperado: um awk assim encheu o disco do mini em 27/10; muitos arquivos pequenos o teto não cobre). O motor NÃO trava o --state: UM sweep por vez é de quem chama. Estado que lê mas tem forma errada = estado-ilegivel (rc 3, nunca se zera).
 CÓDIGOS: 0 · 2 uso · 3 estado ilegível, árvore ilegível, sem alvos ou gravação que falhou · 97 jaula não provada · 143 interrompido (o estado já gravado vale).
 """
 import argparse
@@ -322,7 +322,7 @@ def exec_family(ctx, slot_n, tgt, text, tmo):
     kv = ["%s=%s" % (k, os.environ[k]) for k in PASS_ENV if k in os.environ] + ["HOME=%s" % (slot / "home"), "TMPDIR=%s" % (slot / "tmp"), "PYTHONDONTWRITEBYTECODE=1", "GIT_AUTHOR_NAME=gt", "GIT_AUTHOR_EMAIL=gt@no", "GIT_COMMITTER_NAME=gt", "GIT_COMMITTER_EMAIL=gt@no"]
     t0, rc = time.time(), 0
     for st in tgt["family"]:
-        cmd = [sys.executable, "-I", ctx.a.jail, "--rw", str(slot), "--", "env", "-i", *kv, "timeout", "-k", "5", str(tmo), "bash", st]
+        cmd = [sys.executable, "-I", ctx.a.jail, "--rw", str(slot), "--", "env", "-i", *kv, "timeout", "-k", "5", str(tmo), "bash", "-c", 'ulimit -f "$0" && exec bash "$1"', str(ctx.a.fsize_mb * 1024), st]   # teto por arquivo (soft e hard: o mutante não o sobe); ulimit que falha = o mutante não roda (baseline vermelha, visível), nunca sem teto
         p = subprocess.Popen(cmd, cwd=cd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         with ctx.lock:
             ctx.pids.add(p.pid)
@@ -535,7 +535,7 @@ def main(argv=None):
     s = sp.choices["sweep"]
     s.add_argument("--work", required=True)
     s.add_argument("--jail", required=True)
-    for k, d in (("budget-s", 3600), ("slots", 4), ("cap", 40), ("targets", 8)):
+    for k, d in (("budget-s", 3600), ("slots", 4), ("cap", 40), ("targets", 8), ("fsize-mb", 512)):
         s.add_argument("--" + k, type=int, default=d)
     a = ap.parse_args(argv)
     if a.cmd == "gen":
