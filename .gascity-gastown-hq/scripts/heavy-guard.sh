@@ -136,9 +136,8 @@
 #     are also found by the PARENT chain (read before the TERM) and get the TERM and, after the grace, the KILL. Best effort: one whose parent died first, or that was
 #     started after the chain was read, is not found.
 #   - limits: the fall is read on the whole volume, so another process writing at the same time counts against the step; the step runs in the background of the
-#     guard, so it cannot read the terminal;
-#     a guard that is KILLed (not TERMed: no trap runs) leaves its step running, and the watch stays with it and goes on reading the disk until the step ends.
-#     --check runs nothing, so it has nothing to watch: it accepts the option and only judges the disk.
+#     guard, so it cannot read the terminal; a guard that is KILLed (not TERMed: no trap runs) leaves its step running, and the watch stays with it and goes on
+#     reading the disk until the step ends. --check runs nothing, so it has nothing to watch: it accepts the option and only judges the disk.
 #
 # WHERE IT IS WIRED. jsonl-archive-compact.selftest.sh (--check at the top); the doctrine paragraph in
 # packs/town-deltas/template-fragments/town-deltas.template.md and the HQ SELFTESTS text of the gate
@@ -499,7 +498,7 @@ hg_watch() {
           echo "heavy-guard: INTERRUPTED '$what': ${f} MB free < ${DISK_PUSH_STOP_MB} MB stop floor while it ran (ga-pwd2h6) — the push is being stopped (TERM to its process group). Do NOT repeat it and do NOT work around it (no --no-verify, no other route): the disk is near the Dolt CRITICAL floor. Tell the Mayor. (rc 78)" >&2
           hg_log "INTERRUPTED what='$what' free_mb=$f stop_mb=$DISK_PUSH_STOP_MB rc=78"
         elif [ "$st" = drop ]; then
-          echo "heavy-guard: INTERRUPTED '$what': the free disk fell ${d} MB (${HG_WSTART} -> ${f} MB) while it ran, limit ${HG_WDROP} MB (ga-2d14tow) — the step is being stopped (TERM to its process group). A loop that writes many small files goes under the per-file cap and is the usual cause (27/10 ga-e6ug8gq). Do NOT re-run it unchanged and do NOT lift the limit to get around it: what it wrote is still on disk (look under its TMPDIR, clean scratch with safe-clean). If the step really writes this much, re-run THAT one with --max-disk-drop-mb and say so in the bead; if you cannot tell, tell the Mayor. (rc 78)" >&2
+          echo "heavy-guard: INTERRUPTED '$what': the free disk fell ${d} MB (${HG_WSTART} -> ${f} MB) while it ran, limit ${HG_WDROP} MB (ga-2d14tow) — the step is being stopped (TERM to its process group). A loop that writes many small files goes under the per-file cap and is one cause (27/10 ga-e6ug8gq); the fall is read on the WHOLE volume, so another job writing at the same time (a build, a copy) can be the other. Do NOT re-run it unchanged and do NOT lift the limit to get around it: look first at what it wrote (its TMPDIR; clean scratch with safe-clean) and at df. If the step really writes this much, or another job was the cause, re-run THAT one with --max-disk-drop-mb and say so in the bead; if you cannot tell, tell the Mayor. (rc 78)" >&2
           hg_log "INTERRUPTED what='$what' class=step free_mb=$f start_mb=$HG_WSTART drop_mb=$d max_drop_mb=$HG_WDROP rc=78"
         else
           echo "heavy-guard: INTERRUPTED '$what': ${f} MB free < ${stop} MB stop floor while it ran (ga-2d14tow) — the step is being stopped (TERM to its process group). Do NOT re-run it unchanged and do NOT work around it: the disk is near the Dolt CRITICAL floor, and what the step wrote is still on disk (look under its TMPDIR, clean scratch with safe-clean). Tell the Mayor. (rc 78)" >&2
