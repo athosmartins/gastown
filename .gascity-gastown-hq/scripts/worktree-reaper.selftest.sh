@@ -2363,6 +2363,115 @@ cl_tree cl16d merged settings.json.bak.d/f.md; xp_run cl16d
 cl_kept cl16d "(c16d): .claude/settings.json.bak.d/f.md (a file inside a folder named settings.json.bak.*) → data → KEPT, kept_ignored_data" kept_ignored_data
 cl_top cl16d "(c16d): the event names .claude/settings.json.bak.d/f.md" '\.claude/settings\.json\.bak\.d/f\.md'
 
+# ── ga-k0mose6: a pool tree the gate REBASED (HEAD never an ancestor of main) is "merged" when every commit of it is in main as an
+# equivalent patch, the tree is clean and its bead(s) are closed long enough. Measured 27/10 (disk 2.4 GB): 22 of 33 worker-wa-*
+# trees met exactly that and sat in kept_pressure_unmerged until removed by hand. Each scenario below breaks one proof (or the
+# hypothesis) and must KEEP the tree; (a) and (k) are the positive controls.
+echo "── ga-k0mose6: rebased + clean + bead closed → merged for a pool tree (pressure reaps it); any proof missing → kept ──"
+KZ_ID="wa-kz1xyz"
+# kz_mk <name> [<setup run inside the tree>] [<age in hours, default 14>] — $TMP/<name>/rig with origin/main and ONE tree
+# crew/worker-kz on crew/kz/wa-kz1xyz carrying one commit; the same patch is then cherry-picked (-x: a NEW sha) onto main and pushed,
+# so the tree's HEAD is not an ancestor of origin/main yet every commit of it is there as an equivalent patch.
+kz_mk() {
+  local name="$1" extra="${2:-}" root="$TMP/$1"; mkdir -p "$root"
+  git init -q --bare "$root/remote.git"; git init -q -b main "$root/rig"
+  ( cd "$root/rig" || exit 1
+    git remote add origin "$root/remote.git"
+    echo base > base.txt; git add base.txt; git commit -qm base
+    git push -q origin main; git fetch -q origin; git remote set-head origin main 2>/dev/null || true
+    mkdir -p crew
+    git worktree add -q crew/worker-kz -b "crew/kz/$KZ_ID" main
+    ( cd crew/worker-kz && echo shipped > shipped.txt && git add shipped.txt && git commit -qm shipped )
+    git cherry-pick -x "crew/kz/$KZ_ID" && git push -q origin main && git fetch -q origin
+    if [ -n "$extra" ]; then ( cd crew/worker-kz && eval "$extra" ); fi
+  ) >/dev/null 2>&1
+  pe_age "$root/rig/crew/worker-kz" "${3:-14}"
+}
+run_kz() { # run_kz <name> <beads-json-array | @missing> [ENV=val ...] — the lookup goes through the FAKE_BEADS seam
+  local name="$1" beads="$2"; shift 2
+  if [ "$beads" = "@missing" ]; then rm -f "$TMP/$name.beads.json"; else printf '%s' "$beads" > "$TMP/$name.beads.json"; fi
+  env WORKTREE_REAPER_GT="$TMP/$name" WORKTREE_REAPER_LOG="$TMP/$name.jsonl" WORKTREE_REAPER_STALE_HOURS=24 WORKTREE_REAPER_ENABLED=1 \
+    WORKTREE_REAPER_FAKE_LSOF="$TMP/bc_nolsof.txt" WORKTREE_REAPER_FAKE_BEADS="$TMP/$name.beads.json" "$@" bash "$REAPER" >/dev/null 2>&1
+}
+kz_wt() { git -C "$TMP/$1/rig" worktree list --porcelain 2>/dev/null | grep -E "/crew/worker-kz\$" >/dev/null; }
+kz_br() { git -C "$TMP/$1/rig" rev-parse --verify -q "refs/heads/crew/kz/$KZ_ID" >/dev/null 2>&1; }
+kz_kept() { # kz_kept <name> <label> [<event that must be logged once>] — tree + branch intact, nothing reaped on the new proof
+  if kz_wt "$1" && kz_br "$1" && [ "$(events "$1" reaped_pool)" = "0" ] && { [ -z "${3:-}" ] || [ "$(events "$1" "$3")" = "1" ]; }; then
+    ok "ga-k0mose6: $2 → KEPT (tree + branch intact${3:+, $3 logged once})"
+  else bad "ga-k0mose6: $2 → NOT kept (wt=$(kz_wt "$1" && echo y || echo n) br=$(kz_br "$1" && echo y || echo n) reaped_pool=$(events "$1" reaped_pool) ${3:-event}=$([ -n "${3:-}" ] && events "$1" "$3" || echo -))"; fi
+}
+KZ_CLOSED="[$(bc_bead "$KZ_ID" closed 10)]"
+
+# (a) the measured bug, under pressure: closed 10h ago, clean, rebased → REAPED, and its orphan branch with it
+kz_mk kz_a
+[ "$(git -C "$TMP/kz_a/rig" cherry origin/main "crew/kz/$KZ_ID" 2>/dev/null)" != "" ] && [ -z "$(git -C "$TMP/kz_a/rig" cherry origin/main "crew/kz/$KZ_ID" 2>/dev/null | grep -v '^- ')" ] \
+  && ! git -C "$TMP/kz_a/rig" merge-base --is-ancestor "crew/kz/$KZ_ID" origin/main 2>/dev/null \
+  && ok "ga-k0mose6 (fixture): the tree's commit is in main as an equivalent patch ('-' only) and its HEAD is NOT an ancestor of main" \
+  || bad "ga-k0mose6 (fixture): the rebased fixture is wrong — cherry=$(git -C "$TMP/kz_a/rig" cherry origin/main "crew/kz/$KZ_ID" 2>&1 | tr '\n' ' ')"
+run_kz kz_a "$KZ_CLOSED" "$PRESS"
+kz_wt kz_a && bad "ga-k0mose6 (a): clean rebased tree of a CLOSED bead NOT reaped under pressure — the measured leak" \
+           || ok "ga-k0mose6 (a): clean rebased tree of a CLOSED bead REAPED under pressure"
+[ "$(events kz_a reaped_pool)" = "1" ] && [ "$(events kz_a kept_pressure_unmerged)" = "0" ] \
+  && ok "ga-k0mose6 (a): logged as reaped_pool, and not as kept_pressure_unmerged" \
+  || bad "ga-k0mose6 (a): expected 1 reaped_pool and 0 kept_pressure_unmerged, saw $(events kz_a reaped_pool)/$(events kz_a kept_pressure_unmerged)"
+grep '"event":"reaped_pool"' "$TMP/kz_a.jsonl" 2>/dev/null | grep -F "\"proof\":\"patch_equivalent bead_closed\",\"beads\":\"$KZ_ID\"" >/dev/null \
+  && ok "ga-k0mose6 (a): the event names the proof and the closed bead it relied on" \
+  || bad "ga-k0mose6 (a): the reap event does not carry the proof: $(grep reaped_pool "$TMP/kz_a.jsonl" 2>/dev/null | head -1)"
+kz_br kz_a && bad "ga-k0mose6 (a): the shipped orphan branch crew/kz/$KZ_ID was left behind (the Pilot's _filter_built would veto re-dispatch)" \
+           || ok "ga-k0mose6 (a): the orphan branch goes with it, on the same patch-equivalence proof"
+
+# (b) the bead is still OPEN (or in_progress: the worker may be mid-fix) → KEPT, and the pressure keep is what says so
+kz_mk kz_b; run_kz kz_b "[$(bc_bead "$KZ_ID" open)]" "$PRESS";         kz_kept kz_b "bead OPEN" kept_pressure_unmerged
+kz_mk kz_b2; run_kz kz_b2 "[$(bc_bead "$KZ_ID" in_progress)]" "$PRESS"; kz_kept kz_b2 "bead IN_PROGRESS" kept_pressure_unmerged
+# (c) closed, but not long enough (grace 6h)
+kz_mk kz_c; run_kz kz_c "[$(bc_bead "$KZ_ID" closed 1)]" "$PRESS";      kz_kept kz_c "bead closed only 1h ago (grace 6h)" kept_pressure_unmerged
+# (d) one commit of the tree is NOT in main (`git cherry` prints '+') → real work, KEPT
+kz_mk kz_d 'echo unshipped > unshipped.txt && git add unshipped.txt && git commit -qm unshipped'
+run_kz kz_d "$KZ_CLOSED" "$PRESS";                                       kz_kept kz_d "a commit main lacks (cherry '+')" kept_pressure_unmerged
+# (e)(f) the bead lookup could not answer: unknown is not closed
+kz_mk kz_e; run_kz kz_e "@missing" "$PRESS";                             kz_kept kz_e "bead lookup FAILED" kept_pressure_unmerged
+[ "$(events kz_e bead_lookup_failed)" = "1" ] && ok "ga-k0mose6 (e): the failed lookup is logged (bead_lookup_failed), not read as 'not closed' silently" \
+  || bad "ga-k0mose6 (e): no bead_lookup_failed event for a failed lookup ($(events kz_e bead_lookup_failed))"
+kz_mk kz_f; run_kz kz_f 'this is not json' "$PRESS";                     kz_kept kz_f "bead lookup printed JUNK" kept_pressure_unmerged
+kz_mk kz_f2; run_kz kz_f2 '[]' "$PRESS";                                 kz_kept kz_f2 "bead NOT FOUND (nothing says the work is over)" kept_pressure_unmerged
+# (g) not clean: an untracked file / an edit of a tracked one → this proof never takes WIP (no preserve, no --force)
+kz_mk kz_g 'echo wip > wip.txt';          run_kz kz_g "$KZ_CLOSED" "$PRESS";  kz_kept kz_g "an untracked file in the tree" kept_pressure_unmerged
+kz_mk kz_g2 'echo edit >> shipped.txt';   run_kz kz_g2 "$KZ_CLOSED" "$PRESS"; kz_kept kz_g2 "an edited tracked file in the tree" kept_pressure_unmerged
+# (h) a live process inside → kept (merged now, so the in-use keep carries its merged name)
+kz_mk kz_h; ( cd "$TMP/kz_h/rig/crew/worker-kz" && pwd -P ) > "$TMP/kz_h.lsof"
+run_kz kz_h "$KZ_CLOSED" "$PRESS" WORKTREE_REAPER_FAKE_LSOF="$TMP/kz_h.lsof"; kz_kept kz_h "a live process has its cwd in the tree" kept_merged_in_use
+# (i) a merge under way (its state is in the git dir, not in `git status`)
+kz_mk kz_i 'echo "$(git rev-parse main)" > "$(git rev-parse --git-path MERGE_HEAD)"'
+run_kz kz_i "$KZ_CLOSED" "$PRESS";                                       kz_kept kz_i "a merge is under way (MERGE_HEAD)" kept_pressure_unmerged
+# (j) the tip is a merge commit carrying content of its own: `git cherry` cannot see merges, so it blocks the proof
+kz_mk kz_j 'git checkout -q -b side main && echo own > own.txt && git add own.txt && git commit -qm own && git checkout -q "crew/kz/wa-kz1xyz" && git merge -q --no-ff side -m "merge side"'
+run_kz kz_j "$KZ_CLOSED" "$PRESS";                                       kz_kept kz_j "a merge commit with content of its own" kept_pressure_unmerged
+# (o) younger than MERGED_MIN_AGE_MIN (30 min): a tree nobody has started on is not proof of anything
+kz_mk kz_o '' 0; run_kz kz_o "$KZ_CLOSED" "$PRESS"
+kz_wt kz_o && kz_br kz_o && [ "$(events kz_o reaped_pool)" = "0" ] && ok "ga-k0mose6 (o): a tree younger than MERGED_MIN_AGE_MIN is KEPT even with the proofs" \
+  || bad "ga-k0mose6 (o): a tree minutes old was reaped (wt=$(kz_wt kz_o && echo y || echo n) reaped_pool=$(events kz_o reaped_pool))"
+
+# (k) normal mode (no pressure, age gate 24h, tree 3h old): "merged" bypasses the age gate exactly as ancestry does → reaped; an open bead → kept
+kz_mk kz_k '' 3; run_kz kz_k "$KZ_CLOSED"
+kz_wt kz_k && bad "ga-k0mose6 (k): rebased + clean + closed tree younger than the age gate NOT reaped in normal mode" \
+           || ok "ga-k0mose6 (k): rebased + clean + closed tree is reaped in normal mode too (merged bypasses the age gate)"
+kz_mk kz_k2 '' 3; run_kz kz_k2 "[$(bc_bead "$KZ_ID" open)]"
+kz_wt kz_k2 && kz_br kz_k2 && [ "$(events kz_k2 reaped_pool)" = "0" ] && ok "ga-k0mose6 (k2): the same tree with an OPEN bead stays under the age gate (3h < 24h)" \
+  || bad "ga-k0mose6 (k2): an open-bead tree younger than the age gate was reaped (wt=$(kz_wt kz_k2 && echo y || echo n))"
+
+# (l) dry-run: would_reap_pool names the proof and nothing is removed
+kz_mk kz_l; run_kz kz_l "$KZ_CLOSED" "$PRESS" WORKTREE_REAPER_ENABLED=0
+if kz_wt kz_l && kz_br kz_l && [ "$(events kz_l would_reap_pool)" = "1" ] && [ "$(events kz_l reaped_pool)" = "0" ] \
+   && grep '"event":"would_reap_pool"' "$TMP/kz_l.jsonl" | grep -F '"proof":"patch_equivalent bead_closed"' >/dev/null; then
+  ok "ga-k0mose6 (l): dry-run logs would_reap_pool with the proof and removes nothing"
+else bad "ga-k0mose6 (l): dry-run — wt=$(kz_wt kz_l && echo y || echo n) would=$(events kz_l would_reap_pool) reaped=$(events kz_l reaped_pool)"; fi
+
+# (m) a LOCKED tree is not decided by this proof (the lock contract owns it): no reaped_pool, whatever else that contract does
+kz_mk kz_m; git -C "$TMP/kz_m/rig" worktree lock --reason "$KZ_ID active build" crew/worker-kz >/dev/null 2>&1
+run_kz kz_m "$KZ_CLOSED" "$PRESS"
+[ "$(events kz_m reaped_pool)" = "0" ] && ok "ga-k0mose6 (m): a locked tree never takes the new unlocked reap (reaped_pool = 0)" \
+  || bad "ga-k0mose6 (m): a LOCKED tree was reaped by the unlocked path ($(events kz_m reaped_pool))"
+
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"
 [ "$FAIL" -eq 0 ] || exit 1

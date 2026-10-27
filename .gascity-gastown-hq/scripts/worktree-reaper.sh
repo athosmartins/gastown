@@ -27,6 +27,9 @@
 # file inside — not its root directory's mtime, and a tree a live process has its cwd or an open file in is never removed).
 # Pressure mode lowers the age gate when disk is genuinely low, but only MERGED trees go under it: an unmerged tree is kept
 # and logged with its size (kept_pressure_unmerged). Branch deletion is merged-only. Kill switch: WORKTREE_REAPER_ENABLED=0.
+# ga-k0mose6: "merged" for an UNLOCKED pool tree is also a tree the gate REBASED (its sha is never an ancestor of main): clean, every
+# commit in main as an equivalent patch (`git cherry`, no merge commit) and its bead(s) closed for BEAD_CLOSED_HOURS
+# (_pool_shipped_and_closed). Any of those unanswerable keeps the tree; the event carries "proof":"patch_equivalent bead_closed".
 # ga-xpoj67: nor is any tree removed while it holds files git IGNORES that are not junk by name (kept_ignored_data, locked trees included):
 # git does not count ignored files as dirt, so a plain `worktree remove` would take them (battery outputs under an ignored pesquisa/).
 # ga-1bfcda7: the settings files a pool session writes into its own tree (.claude/settings*.json, .bak.<epoch> copies) are tool state, junk by path;
@@ -465,7 +468,8 @@ _keep_ignored_data() {
 # reap_zombie_locked has its own check). 0 = KEEP it (the event is logged here), 1 = go on.
 #   (1) a live process has its cwd, its executable or any open file inside → kept_in_use (kept_merged_in_use when the tree is
 #       merged: the name older scenarios and dashboards know), merged or not;
-#   (2) disk pressure removes only MERGED trees (PRESSURE_REAP_UNMERGED=1 restores the old rule): an unmerged one is
+#   (2) disk pressure removes only MERGED trees (PRESSURE_REAP_UNMERGED=1 restores the old rule; "merged" is the caller's call:
+#       an ancestor of origin/<default>, or for an unlocked pool tree shipped-by-rebase and closed, ga-k0mose6): an unmerged one is
 #       kept_pressure_unmerged with its size_kb (null once PRESSURE_SIZE_BUDGET du calls were spent in the sweep, or when du
 #       fails), so what pressure no longer takes is visible, not silent. Literal reading of the
 #       bead's decision: an unmerged tree idle past STALE_HOURS is kept under pressure too, though normal mode would reap it
@@ -1290,6 +1294,38 @@ _reap_dirty_generated_only() {
   return 1
 }
 
+# ── _pool_shipped_and_closed <repo> <wt> <br> — ga-k0mose6: the ancestry test (_worktree_head_merged) is false for exactly the
+# pool trees whose work shipped: the gate REBASES a branch before it merges, so the worker's sha never becomes an ancestor of
+# origin/<default>. Measured 27/10 with the disk at 2.4 GB: 22 of 33 worker-wa-* trees were clean, their bead CLOSED and every
+# commit there in main as an equivalent patch, and every one sat in kept_pressure_unmerged ("disk pressure removes only merged
+# trees") until they were removed by hand. 0 iff ALL of these hold, and any one that cannot be answered is "not proven" (the
+# tree stays, never a guess):
+#   (1) no rebase / merge / cherry-pick / revert / bisect is under way in it;
+#   (2) HEAD is readable and every commit it has that origin/<default> lacks is there as an equivalent patch, with no merge
+#       commit among them (_ref_patch_equivalent: `git cherry` exited 0 and printed only '-' lines — a failed cherry is NOT an
+#       empty one);
+#   (3) `git status` ran and printed nothing (no uncommitted or untracked file). The remove is the plain, non --force
+#       `worktree remove`: a tree that turns dirty after this check is refused by git and takes the existing preserve-then-reap
+#       path (WIP pushed first), it is not lost;
+#   (4) every bead the tree is named for is CLOSED for BEAD_CLOSED_HOURS (_bead_closed_proof; a bd that fails, times out or
+#       prints junk is "could not tell").
+# The cheap git checks run first, so the bounded `bd list` waits are only paid by a tree that is otherwise safe to go. Main
+# shell only: on 0, $_BC_PROOF_IDS holds the closed bead ids the proof relied on (the caller logs them).
+# Not applied to LOCKED trees: a lock has its own contract (zombie holder, unparseable-lock safety net) further down.
+_pool_shipped_and_closed() {
+  local repo="$1" wt="$2" br="$3" head st
+  _BC_PROOF_IDS=""
+  _worktree_op_in_progress "$wt" && return 1
+  # vazio → no HEAD to prove, not proven; falhou (git broke) → the same line, the tree stays
+  head="$(git -C "$wt" rev-parse HEAD 2>/dev/null)"
+  [ -n "$head" ] || return 1
+  _ref_patch_equivalent "$repo" "$head" || return 1
+  # vazio → clean, the proof goes on; falhou (status could not run) → NOT clean: the tree stays
+  st="$(git -C "$wt" status --porcelain 2>/dev/null)" || return 1
+  [ -z "$st" ] || return 1
+  _bead_closed_proof "$repo" "$wt" "$br"
+}
+
 # ── reap_pool_worktrees <repo> — enumerate a repo's worktrees via `git worktree list`
 # (catches the pool worktrees at $GT/worker-* and <rig>/crew/worker-* that the path-glob
 # loop below MISSES) and reap stale + CLEAN ones, deleting their merged orphan branch.
@@ -1345,8 +1381,18 @@ reap_pool_worktrees() {
         # so a worktree that hasn't diverged from main YET — trivially "merged" because
         # nothing has happened there — isn't reaped out from under an agent that hasn't
         # started. Still must clear _worktree_in_use below either way.
-        local merged=0
-        if [ "$age_min" -ge "$MERGED_MIN_AGE_MIN" ] && _worktree_head_merged "$repo" "$wt"; then merged=1; fi
+        # ga-k0mose6: "merged" is also a tree whose branch the gate REBASED (its sha is never an ancestor of main) when
+        # _pool_shipped_and_closed proves it shipped and finished: every commit in main as an equivalent patch, tree clean,
+        # its bead(s) closed for BEAD_CLOSED_HOURS. Unlocked trees only, and only after the ancestry test said no; the
+        # reap/would-reap event then carries the proof, and the orphan branch goes on the same patch-equivalence proof.
+        local merged=0 mproof="" mproof_json=""
+        if [ "$age_min" -ge "$MERGED_MIN_AGE_MIN" ]; then
+          if _worktree_head_merged "$repo" "$wt"; then merged=1
+          elif [ -z "$lock" ] && _pool_shipped_and_closed "$repo" "$wt" "$br"; then
+            merged=1; mproof="patch_equivalent"
+            mproof_json=",\"proof\":\"patch_equivalent bead_closed\",\"beads\":\"$(_json_esc "$_BC_PROOF_IDS")\""
+          fi
+        fi
         if [ "$age" -le "$gate_hours" ] 2>/dev/null && [ "$merged" != "1" ]; then kept=$((kept+1)); wt=""; br=""; lock=""; continue; fi
         # ga-m5i7e6: in use / disk-pressure-unmerged is checked for every tree about to be removed (it used to be the merged
         # branch only). A LOCKED unmerged tree is left to the lock contract below: its own proofs (zombie holder, merged +
@@ -1393,13 +1439,13 @@ reap_pool_worktrees() {
         fi
         # ── UNLOCKED path (existing, proven): no --force protects live/dirty WIP ─────────
         if [ "$ENABLED" != "1" ]; then
-          printf '{"ts":"%s","event":"would_reap_pool","repo":"%s","wt":"%s","branch":"%s","age_h":%s}\n' "$(ts)" "$(basename "$repo")" "$(basename "$wt")" "$br" "$age" >> "$LOG" 2>/dev/null
+          printf '{"ts":"%s","event":"would_reap_pool","repo":"%s","wt":"%s","branch":"%s","age_h":%s%s}\n' "$(ts)" "$(basename "$repo")" "$(basename "$wt")" "$br" "$age" "$mproof_json" >> "$LOG" 2>/dev/null
           wt=""; br=""; lock=""; continue
         fi
         if git -C "$repo" worktree remove "$wt" 2>/dev/null; then
           pool_reaped=$((pool_reaped+1))
-          printf '{"ts":"%s","event":"reaped_pool","repo":"%s","wt":"%s","branch":"%s","age_h":%s,"mode":"%s"}\n' "$(ts)" "$(basename "$repo")" "$(basename "$wt")" "$br" "$age" "$mode" >> "$LOG" 2>/dev/null
-          delete_merged_local_branch "$repo" "$br"
+          printf '{"ts":"%s","event":"reaped_pool","repo":"%s","wt":"%s","branch":"%s","age_h":%s,"mode":"%s"%s}\n' "$(ts)" "$(basename "$repo")" "$(basename "$wt")" "$br" "$age" "$mode" "$mproof_json" >> "$LOG" 2>/dev/null
+          delete_merged_local_branch "$repo" "$br" "$mproof"
         elif preserve_and_reap_dirty "$repo" "$wt" "$br" "$age"; then
           pool_reaped=$((pool_reaped+1)); preserved_dirty=$((preserved_dirty+1))
         else
