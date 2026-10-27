@@ -356,6 +356,13 @@ EXP_SLOT="rc=0 completo run=6 k=2 c=4 f=0 inv=0 open=4 falhas=0 terminou=nao slo
 peq "mutante que grava MUITOS arquivos pequenos: o teto do slot (2 MB) corta o laço antes do fim e em segundos, o mutante é MORTO e não vira falha de infra, o slot sai limpo" "$EXP_SLOT" fp_slot
 fp_slot_uso() { newfx; mkfoo; local o="" v; for v in 0 -3 abc ""; do sw --slot-mb "$v"; o="$o $RC"; done; sw --slot-mb 1; echo "$o | $(cnt)"; }
 peq "--slot-mb que não é um inteiro >= 1 (0, negativo, texto, vazio) é uso (rc 2); 1 MB roda como qualquer outro" " 2 2 2 2 | $EXP_SW0" fp_slot_uso
+fp_slot_semdu() {  # du que FALHA (rc 1 e saída que não é número): sem medida não há veredito — o laço roda até o fim, nada é cortado, nada vira falha de infra
+  newfx; mkspray; mkdir "$F/bin"; printf '#!/bin/sh\necho abc\nexit 1\n' > "$F/bin/du"; chmod +x "$F/bin/du"; local n
+  PATH="$F/bin:$PATH" HQM_SLOT_POLL_S=0.2 sw --slot-mb 2; n=$(cat "$F/ev.n" 2> /dev/null || echo 0)
+  echo "$(cnt) falhas=$(jf 'd["falhas"]') terminou=$([ -e "$F/ev" ] && echo SIM || echo nao) n=$n left=$(ls "$F/work" | wc -l | tr -d ' ')"
+}
+EXP_SLOT_SEMDU="rc=0 completo run=6 k=2 c=4 f=0 inv=0 open=4 falhas=0 terminou=SIM n=3000 left=0"
+peq "du que falha (rc 1, saída ilegível) com o teto de slot ligado: sem medida não há veredito, o laço grava até o fim, nenhum mutante é cortado e nada vira falha de infra" "$EXP_SLOT_SEMDU" fp_slot_semdu
 peq "sweep: mortos, sobreviventes confirmados, original intacto, HOME/TMPDIR no slot, slots limpos; os ids do gen --tree são os que ele grava" "$EXP_SWEEP" fp_sweep
 fp_semvalid() {  # bash -n que sai com rc estranho: nenhum veredito (nem "i"), nao_sei, e a varredura seguinte tenta de novo
   newfx; mkfoo; mkdir "$F/bin"; printf '#!/bin/sh\n[ "$1" = -n ] && exit 5\nexec /bin/bash "$@"\n' > "$F/bin/bash"; chmod +x "$F/bin/bash"
@@ -495,6 +502,7 @@ par kill_it slot-rc-zero         fp_slot "$EXP_SLOT" '            return 153' ' 
 par kill_it slot-unidade         fp_slot "$EXP_SLOT" 'kb - base_kb >= ctx.a.slot_mb * 1024:' 'kb - base_kb >= ctx.a.slot_mb * 1048576:'
 par kill_it slot-sem-medida      fp_slot "$EXP_SLOT" 'if kb is not None and kb - base_kb >= ctx.a.slot_mb * 1024:' 'if False:'
 par kill_it slot-uso-zero        fp_slot_uso " 2 2 2 2 | $EXP_SW0" 'if a.slot_mb < 1:' 'if a.slot_mb < 0:'
+par kill_it slot-du-ilegivel     fp_slot_semdu "$EXP_SLOT_SEMDU" 'if kb is not None and kb - base_kb >= ctx.a.slot_mb * 1024:' 'if (1 << 40 if kb is None else kb) - base_kb >= ctx.a.slot_mb * 1024:'
 reap
 # controle do controle: o `mut` recusa uma âncora ambígua e uma que não casa
 FAIL0=$FAIL   # o mut recusa e conta uma falha própria: aqui a recusa é o esperado, então só a aceitação reprova
