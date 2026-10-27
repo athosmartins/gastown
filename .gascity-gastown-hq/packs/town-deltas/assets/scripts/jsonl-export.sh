@@ -1064,6 +1064,77 @@ jex_log() {
     return 0
 }
 
+# A run that dies before it finishes must show in the log, and its scratch must not wait 4 h (ga-iqsy9c7). Measured 27/10 with the disk at 4.5 GB: the order's 840 s timeout SIGKILLed three runs in a row
+# (08:27, 08:48, 09:18) while hq.comments was being read. No trap runs on a SIGKILL and nothing had been written to .gc/logs/jsonl-export.log, so a dead run looked exactly like a run that never happened;
+# each left ~830 MB of scratch ($table.jsonl.tmp.*: the rows file and the export) that only the 4 h age sweep took, and the order fires again every 15-30 min. Decided here, before any Dolt query, so
+# a Dolt that is down (or a disk so full that Dolt is) still gets its dead runs' scratch swept — and the sweep also runs on a tick that skips for a low disk (below), which is exactly when ~830 MB hurts:
+#   1. A run leaves a marker (pid + start) and removes it on any exit that runs the EXIT trap. A marker the next run finds with a DEAD pid is a run that never finished: one DIED line in the log and a count
+#      of such runs in a row (state key consecutive_deaths, cleared by a run that finishes). A table that does not fit the timeout is a third outcome — not "ok", not "failed" — so it is counted and said (the deacon is told at the 3rd death in a row) instead of repeating unseen.
+#   2. The log gets `start` and `end rc=N` around the run: a start with no end is a run still going or one that was killed, and the DIED line of the next run says which.
+#   3. Scratch names carry the pid of the run that made them ($table.jsonl.tmp.p<pid>.XXXXXX): the next run deletes the scratch of a DEAD pid at once and leaves a live run's alone. The age sweep
+#      (EXPORT_TMP_SWEEP_MIN) stays as the net for what carries no pid (older names) or a pid that something else has since reused.
+EXPORT_TMP_DIR="${GC_JSONL_EXPORT_TMP_DIR:-$(dirname "$ARCHIVE_REPO")/.jsonl-export-tmp}"
+# A scratch file older than this many minutes is swept whatever its name says. Keep it far above the order's timeout (jsonl-export.toml): no live run is that old, and the price of a long age is only the
+# disk a killed run's file holds when its pid is unreadable or reused.
+EXPORT_TMP_SWEEP_MIN=240
+JEX_INFLIGHT="$(dirname "$STATE_FILE")/jsonl-export-inflight"
+JEX_DEATH_ALERT_AT=3   # runs killed in a row before the deacon is told (once per streak)
+JEX_SIGNAL=""
+
+# jex_pid_alive <pid> — rc 0 when a process of ours has that pid. `kill -0` also fails for a pid that belongs to another user, but the exporter always runs as the same user, so a pid we cannot signal is not a run of ours.
+jex_pid_alive() {
+    kill -0 "$1" 2>/dev/null
+}
+
+# jex_epoch_iso <epoch|-> — the instant as ISO text; "?" for anything that is not an epoch (never a made-up date)
+jex_epoch_iso() {
+    case "${1:-}" in ''|*[!0-9]*) echo "?"; return 0 ;; esac
+    jq -nr --argjson e "$1" '$e | todate' 2>/dev/null || echo "?"
+}
+
+# jex_sweep_scratch — deletes what a dead run left in $EXPORT_TMP_DIR: a file whose name carries the pid of a run that is gone, and any file older than EXPORT_TMP_SWEEP_MIN. Sets JEX_SWEPT_FILES / JEX_SWEPT_BYTES.
+# vazio → no dir or no file: nothing to sweep; falhou/ilegível (a pid, an age or a size that cannot be read) → the file STAYS: a leftover costs disk, a guess deletes the file of a run that is still going
+jex_sweep_scratch() {
+    local f name pid why size
+    JEX_SWEPT_FILES=0
+    JEX_SWEPT_BYTES=0
+    [ -d "$EXPORT_TMP_DIR" ] || return 0
+    for f in "$EXPORT_TMP_DIR"/*.jsonl.tmp.*; do
+        [ -f "$f" ] || continue
+        name="${f##*/}"
+        why=""
+        if [[ "$name" =~ \.jsonl\.tmp\.p([0-9]+)\. ]]; then
+            pid="${BASH_REMATCH[1]}"
+            if [ "$pid" != "$$" ] && ! jex_pid_alive "$pid"; then
+                why="run pid $pid is gone"
+            fi
+        fi
+        if [ -z "$why" ] && [ -n "$(find "$f" -maxdepth 0 -mmin +"$EXPORT_TMP_SWEEP_MIN" 2>/dev/null)" ]; then
+            why="older than $EXPORT_TMP_SWEEP_MIN min"
+        fi
+        [ -n "$why" ] || continue
+        size=$(wc -c < "$f" 2>/dev/null | tr -d ' ') || size=0
+        case "$size" in ''|*[!0-9]*) size=0 ;; esac
+        if rm -f -- "$f"; then
+            JEX_SWEPT_FILES=$((JEX_SWEPT_FILES + 1))
+            JEX_SWEPT_BYTES=$((JEX_SWEPT_BYTES + size))
+        else
+            echo "jsonl-export: could not delete the scratch file $f ($why)" >&2
+        fi
+    done
+    return 0
+}
+
+# jex_sweep_and_report — jex_sweep_scratch, and one line on stdout and one in the log when it took something. Called by a run that is about to export and by a tick that skips for a low disk.
+jex_sweep_and_report() {
+    jex_sweep_scratch
+    if [ "$JEX_SWEPT_FILES" -gt 0 ]; then
+        echo "jsonl-export: swept $JEX_SWEPT_FILES scratch file(s), $((JEX_SWEPT_BYTES / 1048576)) MB, left in $EXPORT_TMP_DIR by run(s) that did not finish"
+        jex_log "swept $JEX_SWEPT_FILES scratch file(s), $((JEX_SWEPT_BYTES / 1048576)) MB, left by run(s) that did not finish"
+    fi
+    return 0
+}
+
 # The clock: JEX_NOW_EPOCH pins it in selftests. vazio/ilegível → "" and, on a low disk, the verdict says run (clock-unreadable).
 JEX_NOW="${JEX_NOW_EPOCH:-}"
 case "$JEX_NOW" in ''|*[!0-9]*) JEX_NOW="$(date +%s 2>/dev/null)" || JEX_NOW="" ;; esac
@@ -1088,6 +1159,9 @@ fi
 JEX_VERDICT="${JEX_DECISION%%|*}"
 JEX_WHY="${JEX_DECISION#*|}"
 if [ "$JEX_VERDICT" = "skip" ]; then
+    # A tick skipped for a low disk is where a dead run's scratch hurts most (ga-iqsy9c7): take it now, not at the next export an hour or 3 h away. vazio → nothing to sweep; falhou → the files stay (jex_sweep_scratch never fails the tick).
+    # The marker and the streak are left to the run that exports: a skipped tick is not a run.
+    jex_sweep_and_report
     echo "jsonl-export: skipped-low-disk (cadência estendida) — $JEX_WHY"
     jex_log "skipped-low-disk (cadência estendida) — $JEX_WHY"
     exit 0
@@ -1096,6 +1170,78 @@ case "$JEX_WHY" in
     disk-ok|guard-off) ;;
     *) jex_log "run ($JEX_WHY) free=${JEX_FREE:-unreadable}MB" ;;
 esac
+
+# jex_run_begin — see the block comment above. Runs once, when this tick has decided to export.
+jex_run_begin() {
+    local prev_pid="" prev_at="" prev_iso deaths new_deaths state_now started
+    # vazio (no marker) → the last run ended its own way, or this is the first: nothing to say; falhou/ilegível (a marker that is not "<pid> <epoch>", e.g. cut short by a full disk) → say so and
+    # count nothing: a garbled marker proves no death. A marker whose pid still answers is not a death either.
+    if [ -e "$JEX_INFLIGHT" ]; then
+        if read -r prev_pid prev_at 2>/dev/null < "$JEX_INFLIGHT" && [[ "$prev_pid" =~ ^[0-9]+$ ]]; then
+            prev_iso="$(jex_epoch_iso "$prev_at")"
+            if [ "$prev_pid" != "$$" ] && jex_pid_alive "$prev_pid"; then
+                jex_log "WARN the run pid=$prev_pid (start $prev_iso) is still going — a second export starts beside it"
+            else
+                # vazio/ilegível (the state or its count cannot be read) → "", the death is still said but no count is written: an unknown count never becomes 0 or 1
+                deaths="$(read_state_json | jq -r '(.consecutive_deaths // 0) | if type == "number" then floor else empty end' 2>/dev/null)" || deaths=""
+                case "$deaths" in ''|*[!0-9]*) deaths="" ;; esac
+                if [ -n "$deaths" ]; then
+                    new_deaths=$((deaths + 1))
+                    state_now="$(read_state_json | jq -c --argjson n "$new_deaths" '.consecutive_deaths = $n' 2>/dev/null)" || state_now=""
+                    if [ -z "$state_now" ] || ! write_state_json "$state_now"; then
+                        echo "jsonl-export: could not record the dead run in the state (consecutive_deaths)" >&2
+                    fi
+                    jex_log "DIED the run of $prev_iso (pid $prev_pid) never finished — killed, most likely by the order's timeout; $new_deaths in a row"
+                    if [ "$new_deaths" -eq "$JEX_DEATH_ALERT_AT" ]; then
+                        gc session nudge deacon/ "JSONL_EXPORT: $new_deaths runs in a row were killed before they finished (the order's timeout?) — see .gc/logs/jsonl-export.log" 2>/dev/null || true
+                    fi
+                else
+                    jex_log "DIED the run of $prev_iso (pid $prev_pid) never finished — killed, most likely by the order's timeout; the count in the state is unreadable"
+                fi
+            fi
+        else
+            jex_log "WARN the marker $JEX_INFLIGHT is unreadable — no death counted for the last run"
+        fi
+    fi
+
+    jex_sweep_and_report
+
+    # falhou (the marker cannot be written) → warn: this run's death would not be named by the next one (its start with no end in the log still shows it); the export goes on, the marker is never a precondition
+    started="${JEX_NOW:-}"
+    case "$started" in ''|*[!0-9]*) started="-" ;; esac
+    if ! { printf '%s %s\n' "$$" "$started" > "$JEX_INFLIGHT.tmp.$$" && mv -f "$JEX_INFLIGHT.tmp.$$" "$JEX_INFLIGHT"; } 2>/dev/null; then
+        rm -f "$JEX_INFLIGHT.tmp.$$" 2>/dev/null || true
+        echo "jsonl-export: could not write the marker $JEX_INFLIGHT; a death of this run will not be named" >&2
+    fi
+    jex_log "start pid=$$"
+}
+
+# jex_run_end — the EXIT trap: closes what jex_run_begin opened. Nothing in it may change the exit status of the run, so it never fails and never exits. A SIGTERM/SIGINT/SIGHUP is an end too, but
+# not a finished run: bash leaves $? at 0 in the trap for those, so the signal handlers below record which one it was, and the streak of deaths is neither added to nor cleared by it.
+jex_run_end() {
+    local rc=$? marker_pid="" streak how
+    set +e
+    how="rc=$rc"
+    [ -z "$JEX_SIGNAL" ] || { rc=1; how="signal $JEX_SIGNAL"; }
+    jex_log "end $how after ${SECONDS}s"
+    # vazio/ilegível (no marker, or not ours) → left alone: it belongs to another run, and removing it would hide that run's death
+    if [ -e "$JEX_INFLIGHT" ]; then
+        read -r marker_pid _ 2>/dev/null < "$JEX_INFLIGHT"
+        [ "$marker_pid" = "$$" ] && rm -f "$JEX_INFLIGHT"
+    fi
+    # a run that got to its own end clears the streak; falhou/ilegível (the state cannot be read or rewritten) → the streak stays, never a guess
+    if [ -z "$JEX_SIGNAL" ]; then
+        streak="$(read_state_json | jq -r '.consecutive_deaths // 0' 2>/dev/null)"
+        case "$streak" in ''|0|*[!0-9]*) ;; *) write_state_json "$(read_state_json | jq -c 'del(.consecutive_deaths)' 2>/dev/null)" 2>/dev/null ;; esac
+    fi
+    return 0
+}
+
+jex_run_begin
+trap 'JEX_SIGNAL=TERM; exit 143' TERM
+trap 'JEX_SIGNAL=INT; exit 130' INT
+trap 'JEX_SIGNAL=HUP; exit 129' HUP
+trap jex_run_end EXIT
 
 # jex_stamp_export_start — last_export_at = the instant this run DECIDED to export (JEX_NOW, not the moment the state is written), so the cadence is counted from tick to tick. Called once the databases are listed
 # and before the first export, never earlier: a tick that finds Dolt down or no database exports nothing and must not use up the hour. falhou → rc 1 and the caller warns: with no stamp the next tick simply
@@ -1171,18 +1317,11 @@ ensure_archive_pack_config "$ARCHIVE_REPO"
 # the order's timeout (no trap runs) left it there for the NEXT run's commit: 19 of them (16 MB) reached the archive's HEAD, a 25 MB one was next, and the S3 mirror copies the working
 # tree. Outside the archive a dead run's leftover is just a file nobody stages. A sibling of the archive (same parent, so the same filesystem unless the archive itself is a mount
 # point) keeps the final `mv` into place a rename.
-EXPORT_TMP_DIR="${GC_JSONL_EXPORT_TMP_DIR:-$(dirname "$ARCHIVE_REPO")/.jsonl-export-tmp}"
-# A dead run's scratch file is swept once it is older than this many minutes. Keep it far above the order's timeout (jsonl-export.toml), so a sweep can never take the file of a run
-# that is still going; the price of a long age is only the disk a killed run's file holds meanwhile.
-EXPORT_TMP_SWEEP_MIN=240
+# EXPORT_TMP_DIR is defined, and swept of dead runs' files, where the run begins (jex_run_begin, ga-iqsy9c7) — before any Dolt query, not here.
 # falhou → exit 1 before anything is exported: the archive keeps its last snapshot (never a fallback to a path inside the archive)
 if ! mkdir -p "$EXPORT_TMP_DIR"; then
     echo "jsonl-export: cannot create the scratch dir $EXPORT_TMP_DIR — nothing exported this run" >&2
     exit 1
-fi
-# vazio → nothing to sweep; falhou → warn and carry on (a leftover outside the archive costs disk, never a commit)
-if ! find "$EXPORT_TMP_DIR" -maxdepth 1 -type f -name '*.jsonl.tmp.*' -mmin +"$EXPORT_TMP_SWEEP_MIN" -delete; then
-    echo "jsonl-export: could not sweep old scratch files in $EXPORT_TMP_DIR" >&2
 fi
 
 # Build scrub filter for the issues table.
@@ -1598,7 +1737,7 @@ export_supplemental_table() {
     local base cols attempt=1 rc
 
     # falhou (mktemp) → the table is not exported this run and its previous version stays
-    if ! base=$(mktemp "$EXPORT_TMP_DIR/$table.jsonl.tmp.XXXXXX"); then
+    if ! base=$(mktemp "$EXPORT_TMP_DIR/$table.jsonl.tmp.p$$.XXXXXX"); then
         echo "jsonl-export: cannot create the scratch file for $db.$table in $EXPORT_TMP_DIR" >&2
         keep_previous_table "$db" "$table" || return 2
         return 1
@@ -1720,7 +1859,7 @@ while IFS= read -r DB; do
 
     # Step 1: Export issues table. The scratch file lives in $EXPORT_TMP_DIR, never under $DB_DIR (ga-aai87v).
     # falhou (mktemp) → this DB is not exported this run and its previous snapshot is restored, like every other failed step below
-    if ! ISSUE_EXPORT_TMP=$(mktemp "$EXPORT_TMP_DIR/issues.jsonl.tmp.XXXXXX"); then
+    if ! ISSUE_EXPORT_TMP=$(mktemp "$EXPORT_TMP_DIR/issues.jsonl.tmp.p$$.XXXXXX"); then
         echo "jsonl-export: cannot create the scratch file for $DB in $EXPORT_TMP_DIR" >&2
         discard_failed_db_outputs "$DB"
         FAILED_DB_COUNT=$((FAILED_DB_COUNT + 1))
@@ -1786,7 +1925,16 @@ while IFS= read -r DB; do
     # Step 2: Validate the exported JSON payload and optionally scrub it. Even
     # when SCRUB=false we still fail the DB on malformed JSON so corrupt live
     # exports cannot silently score as zero rows and become the new baseline.
-    TMPFILE=$(mktemp)
+    # The scrubbed copy is scratch too (ga-iqsy9c7): in $EXPORT_TMP_DIR, named with this run's pid, so a run killed during the ~80 s scrub of hq/issues.jsonl leaves a file the next run sweeps — not a 70 MB file in $TMPDIR that nobody does. Same filesystem as the archive: the final mv is a rename.
+    # falhou (mktemp) → this DB is not exported this run and its previous snapshot is restored, like step 1
+    if ! TMPFILE=$(mktemp "$EXPORT_TMP_DIR/issues.jsonl.tmp.p$$.XXXXXX"); then
+        echo "jsonl-export: cannot create the scratch file for the scrub of $DB in $EXPORT_TMP_DIR" >&2
+        discard_failed_db_outputs "$DB"
+        FAILED_DB_COUNT=$((FAILED_DB_COUNT + 1))
+        FAILED_DBS="${FAILED_DBS}$DB
+"
+        continue
+    fi
     if [ "$SCRUB" = "true" ]; then
         if ! scrub_exported_issues < "$DB_DIR/issues.jsonl" > "$TMPFILE"; then
             rm -f "$TMPFILE"
