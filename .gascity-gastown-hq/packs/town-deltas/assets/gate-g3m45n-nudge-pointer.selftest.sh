@@ -126,7 +126,11 @@ make_task() {
   printf '\nbd -C "%s" close "%s"\n' "$GC_CITY" "$2"
 }
 # write_comments <task> — the verdict bead's comment list with that task embedded (shape of `bd comments --json`)
-write_comments() { jq -n --arg t "$1" '[{"id":"c1","issue_id":"vb","author":"gate","text":$t,"created_at":"2026-10-10T00:00:00Z"}]' > "$COMMENTS_FILE"; }
+# The ~500 KB task goes in on STDIN, never as an argv word: Linux caps ONE exec argument at MAX_ARG_STRLEN (32 pages,
+# 128 KiB on the Hetzner node), so `jq --arg t "$1"` died with E2BIG there (rc 126) and the `set -e` the dispatcher turns
+# on when sourced took the whole selftest down with it. macOS caps only argv+env as a whole, which the task fits under.
+# vazio → text "" (what --arg t "" gave); falhou/ilegível → jq's non-zero status, and that same set -e ends the selftest here
+write_comments() { printf '%s' "$1" | jq -Rs '[{"id":"c1","issue_id":"vb","author":"gate","text":.,"created_at":"2026-10-10T00:00:00Z"}]' > "$COMMENTS_FILE"; }
 
 TASK_BIG_BYTES=500000
 TASK0="$(make_task 1 vb0 $TASK_BIG_BYTES)"; TASK1="$(make_task 2 vb1 $TASK_BIG_BYTES)"; TASK2="$(make_task 3 vb2 $TASK_BIG_BYTES)"

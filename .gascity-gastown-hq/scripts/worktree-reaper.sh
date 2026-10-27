@@ -29,6 +29,8 @@
 # and logged with its size (kept_pressure_unmerged). Branch deletion is merged-only. Kill switch: WORKTREE_REAPER_ENABLED=0.
 # ga-xpoj67: nor is any tree removed while it holds files git IGNORES that are not junk by name (kept_ignored_data, locked trees included):
 # git does not count ignored files as dirt, so a plain `worktree remove` would take them (battery outputs under an ignored pesquisa/).
+# ga-1bfcda7: the settings files a pool session writes into its own tree (.claude/settings*.json, .bak.<epoch> copies) are tool state, junk by path;
+# an ignored .claude/ FOLDER is opened to see them, so a tree is no longer kept for a 4 KB .claude/settings.json.
 # The one exception to "WITHOUT --force" is a LOCKED worktree (`remove -f -f`); it is reaped only
 # under the LOCK CONTRACT stated at ZOMBIE-LOCK DETECTION below, never because of its age alone.
 # A second, narrower exception (ga-he2c1u, town .gc-worktrees roots only): an UNLOCKED tree dirty with nothing but generated
@@ -81,8 +83,11 @@ case "$(stat -f %m / 2>/dev/null)" in ''|*[!0-9]*) _STAT_BSD=0 ;; *) _STAT_BSD=1
 IGNORED_GUARD="${WORKTREE_REAPER_IGNORED_DATA_GUARD:-1}"
 IGNORED_MIN_KB="${WORKTREE_REAPER_IGNORED_MIN_KB:-1}"       # du KiB (a non-empty file is >= 1): the "small limit" below which ignored data does not hold a tree; 0 = any entry holds it
 case "$IGNORED_MIN_KB" in ''|*[!0-9]*) IGNORED_MIN_KB=1 ;; esac   # not a number → the default: any byte of data holds the tree, never a limit that lets data go
-IGNORED_JUNK_RE='(^|/)(\.venv|venv|node_modules|__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|build|dist|\.beads)(/|$)|\.pyc$|\.sw[op]$|(^|/)(\.DS_Store|Thumbs\.db|\.claude/settings\.local\.json)$'
+# ga-1bfcda7: the last alternative is what a pool session writes into .claude/: settings.json, settings.local.json, their .bak.<epoch> copies — directly in .claude/, nothing deeper
+IGNORED_JUNK_RE='(^|/)(\.venv|venv|node_modules|__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|build|dist|\.beads)(/|$)|\.pyc$|\.sw[op]$|(^|/)(\.DS_Store|Thumbs\.db)$|(^|/)\.claude/settings[^/]*\.json(\.bak\.[^/]+)?$'
 [ -z "${WORKTREE_REAPER_IGNORED_JUNK_RE:-}" ] || IGNORED_JUNK_RE="$WORKTREE_REAPER_IGNORED_JUNK_RE"
+# ga-1bfcda7: an ignored .claude/ FOLDER is ONE entry of the listing, and the junk list cannot see inside an entry: one named .claude/ is opened (_ignored_open_tool_dirs)
+IGNORED_TOOL_DIR_RE='(^|/)\.claude/$'
 # ── zombie-lock reaping (wa-8y45): a worktree LOCKED by a stuck/ancient agent ─────
 ZOMBIE_LOCK_ENABLED="${WORKTREE_REAPER_ZOMBIE_LOCK_ENABLED:-1}"  # 0 = old behavior (skip ALL locked)
 ZOMBIE_HOURS="${WORKTREE_REAPER_ZOMBIE_HOURS:-48}"               # alive holder must EXCEED this AND be idle
@@ -375,10 +380,35 @@ _wt_lock_reason() {
   git -C "$1" worktree list --porcelain 2>/dev/null | awk -v p="$2" '$1=="worktree"{c=$2} $1=="locked"{ if(c==p){ $1=""; sub(/^ /,""); if ($0=="") $0="(no reason)"; print; exit } }'
 }
 
+# ── _ignored_open_tool_dirs <wt> <list> — ga-1bfcda7: `ls-files --directory` prints an ignored .claude/ folder as ONE entry, so the junk list never sees the
+# settings*.json inside it (15 pool trees were kept for a 4 KB .claude/settings.json). Rewrites <list> (NUL-separated entries) with each entry named .claude/
+# (IGNORED_TOOL_DIR_RE) swapped for the files below it, which the caller then judges one by one: only junk → the folder drops out of the verdict, any other
+# file → it is reported by its own path. An entry the junk list already skips stays as it is, so WORKTREE_REAPER_IGNORED_JUNK_RE='…|(^|/)\.claude/$' (the
+# by-hand relief of 27/10) still means "do not look inside". rc 0 = <list> rewritten; rc 1 = could not tell (mktemp, find, writing the new list or replacing <list> failed): <list> is not
+# to be trusted and the caller KEEPS the tree. The files come from find, not from git: git skips a folder it cannot open with a warning and rc 0, which would
+# read as "only settings.json"; find says rc != 0.
+_ignored_open_tool_dirs() {
+  local wt="$1" list="$2" out path rc=0
+  out="$(mktemp 2>/dev/null)" || return 1
+  while IFS= read -r -d '' path; do
+    if [[ "$path" =~ $IGNORED_TOOL_DIR_RE ]] && ! [[ "$path" =~ $IGNORED_JUNK_RE ]]; then
+      # vazio → no file below the folder: nothing is written for it (nothing there to lose); falhou (find rc != 0: a subfolder it cannot open) → rc 1, the caller KEEPS the tree
+      ( cd "$wt" && find "${path%/}" ! -type d -print0 ) >>"$out" 2>/dev/null || { rc=1; break; }
+    else
+      printf '%s\0' "$path" >>"$out" || { rc=1; break; }
+    fi
+  done <"$list"   # third-state-waiver: $list was written by a command whose exit code the caller checked; an empty file is git's answer "nothing is ignored"
+  # falhou (the list cannot be replaced, e.g. a full disk) → rc 1, the caller KEEPS the tree; vazio ($out has no entry: nothing was listed, or the folders held no file) is a real answer
+  if [ "$rc" -eq 0 ]; then mv -f "$out" "$list" 2>/dev/null || rc=1; fi
+  rm -f "$out"
+  return "$rc"
+}
+
 # ── _ignored_data_scan <wt> — ga-xpoj67: what the tree holds that git IGNORES and no rule calls junk. Entries are what
-# `git ls-files -o -i --directory` prints (an ignored directory is ONE entry, trailing /, sized with du); one matching IGNORED_JUNK_RE is skipped.
+# `git ls-files -o -i --directory` prints (an ignored directory is ONE entry, trailing /, sized with du) — except that an entry named .claude/ is first swapped
+# for the files below it (_ignored_open_tool_dirs, ga-1bfcda7); one matching IGNORED_JUNK_RE is skipped.
 # Sets _ID_KB (the total, KiB) and _ID_TOP (JSON: the 5 largest, largest first, {"path","kb"}). rc 0 = data worth keeping (total >= IGNORED_MIN_KB),
-# 1 = none (nothing ignored, only junk, or under the limit), 2 = could not tell (mktemp or git failed): the caller KEEPS the tree. A size du cannot
+# 1 = none (nothing ignored, only junk, or under the limit), 2 = could not tell (mktemp, git or the .claude/ opening failed): the caller KEEPS the tree. A size du cannot
 # read counts 1 KiB (an entry git listed is never "nothing"), and so does every entry past the 200th, which gets no du: the cost stays bounded
 # and the verdict can only grow.
 _ignored_data_scan() {
@@ -388,6 +418,8 @@ _ignored_data_scan() {
   # vazio → nothing is ignored (rc 1 below); falhou (rc != 0: git broke, not a work tree) → rc 2 and the caller KEEPS the tree
   git -C "$wt" ls-files -z -o -i --exclude-standard --directory --no-empty-directory >"$tmp" 2>/dev/null; rc=$?
   if [ "$rc" -ne 0 ] || [ ! -f "$tmp" ]; then rm -f "$tmp"; return 2; fi
+  # falhou (a .claude/ folder that cannot be opened, or the rewrite) → rc 2: could not tell, the caller KEEPS the tree (kept_ignored_data_unknown)
+  _ignored_open_tool_dirs "$wt" "$tmp" || { rm -f "$tmp"; return 2; }
   while IFS= read -r -d '' path; do
     [[ "$path" =~ $IGNORED_JUNK_RE ]] && continue
     kb=1

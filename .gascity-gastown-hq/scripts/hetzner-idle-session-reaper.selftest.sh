@@ -24,6 +24,7 @@ if [ "$3" = "session" ] && [ "$4" = "list" ]; then
   exit 0
 fi
 if [ "$3" = "session" ] && [ "$4" = "close" ]; then
+  [ -f "$FAKE_DIR/gc.close.err" ] && cat "$FAKE_DIR/gc.close.err" >&2
   [ -f "$FAKE_DIR/gc.close.rc" ] && exit "$(cat "$FAKE_DIR/gc.close.rc")"
   echo "$5" >> "$FAKE_DIR/closed.log"
   exit 0
@@ -36,6 +37,7 @@ echo "$*" >> "$FAKE_DIR/bd.argv"
 n=$(cat "$FAKE_DIR/bd.calls" 2>/dev/null || echo 0)
 n=$((n+1))
 echo "$n" > "$FAKE_DIR/bd.calls"
+[ -f "$FAKE_DIR/bd.err" ] && cat "$FAKE_DIR/bd.err" >&2
 [ -f "$FAKE_DIR/bd.rc" ] && exit "$(cat "$FAKE_DIR/bd.rc")"
 if [ -f "$FAKE_DIR/beads.late.json" ] && [ "$n" -ge 2 ]; then cat "$FAKE_DIR/beads.late.json"; exit 0; fi
 cat "$FAKE_DIR/beads.json"
@@ -295,6 +297,154 @@ sessions "$(row ga-c1 crew-x crew active)"
 reap $T0
 check "sem sessão nossa: sai 0" 0 "$RC"
 check "sem sessão nossa: o bd não é chamado" ausente "$(sum "$FAKE/bd.calls")"
+
+# 20-28. o que o hq-mutants achou sem teste (ga-lwbl088): um token trocado no reaper e nenhuma bateria acima reprovava. Cada caso abaixo nasceu de um mutante e reprova nele.
+# Fora daqui de propósito, por serem equivalentes (nada que um chamador consiga ler muda): o `0` de `return None, 0, <motivo>` em read_sessions. O 2º item da tupla (ilegiveis)
+# só é lido quando o 3º (motivo) vem vazio; com motivo, run() imprime e sai antes de usá-lo. Trocar esse 0 por 1 não muda saída, estado nem código de saída.
+
+# 20. o teto padrão (HETZNER_REAP_GRACE_S, 900 s) vale no segundo exato: com 900 s ainda não fecha, com 901 s fecha
+new_world teto
+sessions "$(row ga-aaa dog-remote-1 dog-remote active)"
+seed ga-aaa $T0 9
+reap $((T0+900))
+check "teto: 900 s sem bead ainda não fecha" "" "$(closed)"
+reap $((T0+901))
+check "teto: 901 s sem bead fecha" "ga-aaa" "$(closed)"
+
+# 21. os padrões e os mínimos da configuração, lidos do módulo: o teto de 60 s do gc e do bd não se mede esperando 60 s, mede-se o que run_cmd entrega ao communicate
+# vazio → o python não imprime nada e o check falha; falhou/ilegível → idem (nada aqui lê arquivo além do próprio módulo sob teste)
+cfg=$(python3 -I - "$EXE" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("reaper_sob_teste", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+tetos = []
+class Popen:  # no lugar do subprocesso: só anota o teto que run_cmd passa ao communicate
+    returncode = 0
+    def __init__(self, argv, **kw):
+        pass
+    def communicate(self, timeout=None):
+        tetos.append(timeout)
+        return "[]", ""
+m.subprocess.Popen = Popen
+c = m.load_config({"GC_CITY_PATH": "/nao/existe"})
+m.read_sessions(c)
+m.read_holders(c)
+print("tetos", *tetos)
+def aceita(chave, v):
+    try:
+        m.load_config({"GC_CITY_PATH": "/nao/existe", chave: v})
+        return "aceita"
+    except ValueError:
+        return "recusa"
+for chave, minimo in (("HETZNER_REAP_GRACE_S", 60), ("HETZNER_REAP_MIN_LIVE_RUNS", 1), ("HETZNER_REAP_GC_TIMEOUT_S", 1), ("HETZNER_REAP_BD_TIMEOUT_S", 1)):
+    print(chave, minimo - 1, aceita(chave, str(minimo - 1)), minimo, aceita(chave, str(minimo)))
+PY
+)
+want=$(printf '%s\n' "tetos 60 60" "HETZNER_REAP_GRACE_S 59 recusa 60 aceita" "HETZNER_REAP_MIN_LIVE_RUNS 0 recusa 1 aceita" "HETZNER_REAP_GC_TIMEOUT_S 0 recusa 1 aceita" "HETZNER_REAP_BD_TIMEOUT_S 0 recusa 1 aceita")
+check "config: gc e bd rodam com teto de 60 s; cada variável aceita o mínimo e recusa um a menos" "$want" "$cfg"
+
+# 22. o texto do erro que vai para o log e para a mensagem é cortado em 160 (gc close) e 80 (bd) caracteres, nem um a mais
+new_world corte
+sessions "$(row ga-aaa dog-remote-1 dog-remote active)"
+seed ga-aaa 1 9
+head -c 300 /dev/zero | tr '\0' x > "$FAKE/gc.close.err"
+echo 1 > "$FAKE/gc.close.rc"
+reap $T0
+# vazio/ausente → 0 linhas e o check falha; ilegível → grep sai 2 sem contar, o $(…) vira vazio e o check falha
+check "close que falha: o detalhe do erro tem 160 caracteres" 1 "$(grep -c -E '"detalhe":"x{160}"' "$CITY/.gc/hetzner-idle-reaper.jsonl" 2>/dev/null)"
+new_world corteBd
+sessions "$(row ga-aaa dog-remote-1 dog-remote active)"
+seed ga-aaa 1 9
+head -c 300 /dev/zero | tr '\0' x > "$FAKE/bd.err"
+echo 1 > "$FAKE/bd.rc"
+reap $T0
+check "bd que falha: o erro na mensagem tem 80 caracteres" 1 "$(grep -c -E 'bd-falhou x{80} \(' "$W/out")"
+
+# 23. entrada torta no estado (valor que não é inteiro >= 0, entrada sem campo, entrada que nem objeto é) é descartada: o relógio dela recomeça, ninguém fecha e a rodada não cai
+new_world estadoTorto
+sessions "$(row ga-t1 dog-remote-1 dog-remote active)" "$(row ga-t2 dog-remote-2 dog-remote active)" "$(row ga-t3 dog-remote-3 dog-remote active)" "$(row ga-t4 dog-remote-4 dog-remote active)" "$(row ga-t5 dog-remote-5 dog-remote active)" "$(row ga-t6 dog-remote-6 dog-remote active)" "$(row ga-t7 dog-remote-7 dog-remote active)" "$(row ga-t8 dog-remote-8 dog-remote active)" "$(row ga-t9 dog-remote-9 dog-remote active)"
+cat > "$STATE" <<'EOF'
+{"versao":1,"atualizado_em":1,"sessoes":{
+ "ga-t1":{"desde":-5,"vivas_seguidas":9},
+ "ga-t2":{"desde":true,"vivas_seguidas":9},
+ "ga-t3":{"desde":"1","vivas_seguidas":9},
+ "ga-t4":{"desde":1.0,"vivas_seguidas":9},
+ "ga-t5":{"desde":1,"vivas_seguidas":true},
+ "ga-t6":{"vivas_seguidas":9},
+ "ga-t7":{"desde":1},
+ "ga-t8":5,
+ "ga-t9":null}}
+EOF
+reap $T0
+check "estado com entradas tortas: sai 0" 0 "$RC"
+check "estado com entradas tortas: nenhuma fecha (o relógio de cada uma recomeça)" "" "$(closed)"
+
+# 24. o aviso de estado corrompido diz a verdade sobre a cópia: a rodada de verdade a guarda ("ficou em"), o --dry-run só diz que iria ("iria para") e não mexe no arquivo
+# vazio/ausente → grep conta 0 e os checks que esperam 1 falham; falhou/ilegível → o grep não conta, o $(…) vem vazio e eles falham do mesmo jeito. O que espera 0 (nenhuma cópia) só vale
+# se o diretório foi lido de fato: o check anterior prova que o `ls` listou o estado.
+new_world corrompidoReal
+sessions "$(row ga-aaa dog-remote-1 dog-remote active)"
+echo '{"versao":1,"sessoes":' > "$STATE"
+reap $T0
+check "estado corrompido: o aviso diz onde a cópia ficou" 1 "$(grep -c -F 'a cópia ficou em' "$W/err")"
+new_world corrompidoSeco
+sessions "$(row ga-aaa dog-remote-1 dog-remote active)"
+echo '{"versao":1,"sessoes":' > "$STATE"
+reap $T0 --dry-run
+check "dry-run com estado corrompido: o aviso diz que a cópia IRIA" 1 "$(grep -c -F '(--dry-run) a cópia iria para' "$W/err")"
+check "dry-run com estado corrompido: o diretório foi lido (o estado está na listagem)" 1 "$(ls "$CITY/.gc" | grep -c -x -F 'hetzner-idle-reaper.state.json')"
+check "dry-run com estado corrompido: nenhuma cópia é feita" 0 "$(ls "$CITY/.gc" | grep -c 'corrupt-')"
+check "dry-run com estado corrompido: o arquivo fica onde estava" 1 "$(grep -c -F '"sessoes":' "$STATE")"
+
+# 25. o bd que devolve elemento de forma errada (não-objeto; assignee que não é texto) é "forma desconhecida": nada fecha, o estado não anda e a rodada não cai
+new_world bdTorto
+sessions "$(row ga-aaa dog-remote-1 dog-remote active)"
+seed ga-aaa 1 9
+before=$(sum "$STATE")
+echo '[5]' > "$FAKE/beads.json"
+reap $T0
+check "bd com elemento que não é objeto: sai 0" 0 "$RC"
+check "bd com elemento que não é objeto: não fecha" "" "$(closed)"
+echo '[{"id":"ga-b1","status":"open","assignee":5}]' > "$FAKE/beads.json"
+reap $((T0+600))
+check "bd com assignee que não é texto: sai 0" 0 "$RC"
+check "bd com assignee que não é texto: não fecha" "" "$(closed)"
+check "bd torto: estado intacto" "$before" "$(sum "$STATE")"
+
+# 26. o nome mostrado da sessão: name, senão session_name, senão alias, senão "?" (lido do --dry-run, que lista "fecharia: <id> (<nome>)")
+new_world nome
+sessions '{"id":"ga-n1","name":"n-name","session_name":"n-sess","alias":"n-alias","template":"dog-remote","state":"active","closed":false}' \
+         '{"id":"ga-n2","session_name":"n-sess","alias":"n-alias","template":"dog-remote","state":"active","closed":false}' \
+         '{"id":"ga-n3","alias":"n-alias","template":"dog-remote","state":"active","closed":false}' \
+         '{"id":"ga-n4","template":"dog-remote","state":"active","closed":false}'
+printf '{"versao":1,"sessoes":{"ga-n1":{"desde":1,"vivas_seguidas":9},"ga-n2":{"desde":1,"vivas_seguidas":9},"ga-n3":{"desde":1,"vivas_seguidas":9},"ga-n4":{"desde":1,"vivas_seguidas":9}},"atualizado_em":1}\n' > "$STATE"
+reap $T0 --dry-run
+# vazio → nenhuma linha "fecharia" e o check falha; falhou/ilegível → idem
+check "nome: name, depois session_name, depois alias, depois '?'" "ga-n1 (n-name) ga-n2 (n-sess) ga-n3 (n-alias) ga-n4 (?)" "$(sed -n 's/^  fecharia: //p' "$W/out" | sed 's/ sem bead .*//' | tr '\n' ' ' | sed 's/ $//')"
+
+# 27. o resumo da rodada conta a sessão que segura bead
+new_world resumo
+sessions "$(row ga-aaa dog-remote-1 dog-remote active)" "$(row ga-bbb dog-remote-2 dog-remote active)"
+bead dog-remote-1
+reap $T0
+check "resumo: 2 sessões, 1 com bead, nada fechado" "sessoes=2 com_bead=1 fechadas=0 falhas=0 ilegiveis=0" "$(sed 's/^[^ ]* //' "$W/out")"
+
+# 28. o que a rodada grava, byte a byte (chaves em ordem, JSON compacto nos logs, o estado com recuo de 1 espaço, acento sem escape): o estado, o log por sessão e a linha de ocupação
+# (o ts é a hora local de quem roda: sai do texto antes de comparar)
+new_world bytes
+sessions "$(row ga-aaa dog-remote-é dog-remote active)" "$(row ga-bbé dog-remote-2 dog-remote active)"
+seed ga-aaa 1 9
+reap $T0
+check "bytes: a rodada fechou só a ga-aaa" "ga-aaa" "$(closed)"
+# vazio/ausente → o texto lido é vazio e não bate com o esperado: o check falha; ilegível → idem
+want=$(printf '{\n "atualizado_em": %s,\n "sessoes": {\n  "ga-bbé": {\n   "desde": %s,\n   "vivas_seguidas": 1\n  }\n },\n "versao": 1\n}' $T0 $T0)
+check "bytes: o estado gravado" "$want" "$(cat "$STATE" 2>/dev/null)"
+want=$(printf '{"epoch":%s,"evento":"fechada","id":"ga-aaa","nome":"dog-remote-é","ocioso_s":%s,"ts":"T","vivas_seguidas":10}' $T0 $((T0-1)))
+check "bytes: a linha do log por sessão" "$want" "$(sed 's/"ts":"[^"]*"/"ts":"T"/' "$CITY/.gc/hetzner-idle-reaper.jsonl" 2>/dev/null)"
+want=$(printf '{"epoch":%s,"falhas":[],"fechadas":[{"id":"ga-aaa","nome":"dog-remote-é","ocioso_s":%s}],"tipo":"reaper","ts":"T"}' $T0 $((T0-1)))
+check "bytes: a linha do hetzner-occupancy.jsonl" "$want" "$(sed 's/"ts":"[^"]*"/"ts":"T"/' "$CITY/.gc/hetzner-occupancy.jsonl" 2>/dev/null)"
+
 
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

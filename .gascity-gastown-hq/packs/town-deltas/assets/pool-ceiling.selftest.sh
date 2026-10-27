@@ -718,6 +718,56 @@ has "$st" "modo: SOMBRA" "shadow on -> 'modo: SOMBRA (decide e loga, NAO aplica)
 st="$(POOL_CEILING_STATE_DIR="$TMPROOT/st.status" POOL_CEILING_SHADOW=0 pool_ceiling_status 2>&1 | head -1)"
 has "$st" "modo: APLICANDO" "shadow off -> 'modo: APLICANDO'"
 
+echo "== 10d. edges the hq-mutants sweep showed no case reached (ga-lwbl088): boundaries, knob fallbacks, live readers, return codes"
+# Each case below fails against one one-token break of pool-ceiling.sh that every other case here let through. Four such breaks are NOT covered, because no input tells them
+# apart from the original:
+#   pool_ceiling_decide `[ "$#" -ge 5 ]` -> `-gt`: a 5th argument makes `shift "$#"` shift 5 as well, so the same arguments are left either way.
+#   pool_ceiling_decide `[ "$cur" -le "$max" ]` -> `-lt` and _pc_engine_ceil `[ "$v" -lt "$2" ]` -> `-le`: at equality the other branch assigns the same number. They differ
+#   only when a number is written with a leading zero (03 for 3, so the text printed differs), which a TOML integer cannot be.
+#   _pc_log_append `mv ... || true` -> `&& true`: a failed rotation is not the last command of the `&&` list, so set -e does not fire, and the function still ends in `return 0`
+#   (measured on bash 3.2 and 5).
+eq "$(pool_ceiling_class_swap 5000 4096 20000)" "grow" "swap used exactly AT the grow limit (4096 MB) is still grow: only ABOVE it holds"
+eq "$(pool_ceiling_class_swap 5000 4097 20000)" "hold" "one MB above the grow limit -> hold"
+eq "$(POOL_CEILING_DISK_GROW_MARGIN_GB=0 pool_ceiling_class_disk 9216)" "grow" "a valid disk margin knob (0) is honoured: 9 GB free is over warn 8 + 0 -> grow, not reset to the default 4"
+eq "$(POOL_CEILING_DISK_GROW_MARGIN_GB=banana pool_ceiling_class_disk 9216)" "hold" "a garbage disk margin knob falls back to the default 4: 9 GB free is under warn 8 + 4 -> hold"
+eq "$(pool_ceiling_dolt_class '' 1500 180 1000)" "hot" "latency over a CUSTOM hot line (1000 ms) -> hot: the caller's line is used, not the 2500 default"
+eq "$(pool_ceiling_dolt_class '' 3000 180 banana)" "hot" "a garbage latency line falls back to the default 2500 ms: 3000 ms is over it -> hot"
+eq "$(pool_ceiling_dolt_class '' 2000 180 banana)" "ok" "...and 2000 ms is under that default -> ok"
+rc=0; pool_ceiling_class_disk banana >/dev/null || rc=$?
+eq "$rc" "0" "an unreadable disk reading returns 0 (the classifiers never fail: the dispatchers run under set -e)"
+rc=0; POOL_CEILING_DYNAMIC=1 POOL_CEILING_STATE_DIR="$TMPROOT/state-pause" POOL_CEILING_LOG="$TMPROOT/pause.log" POOL_CEILING_NOW=4500 pool_ceiling_step wa-worker 0 1 4 0 63 ok ok >/dev/null || rc=$?
+eq "$rc" "0" "the step returns 0 on the operator's pause (fixed 0) too: it never fails"
+# Live readers, with the system tools stubbed so the answer does not depend on the host (macOS has the sysctl key vm.loadavg, Linux does not). POOL_CEILING_T_* is the test seam: unset in the subshell.
+STUB="$TMPROOT/stub-readers"; mkdir -p "$STUB"
+printf '#!/bin/sh\n[ "$2" = vm.loadavg ] && { echo "{ 1.10 2.50 3.90 }"; exit 0; }\nexit 1\n' > "$STUB/sysctl"
+printf '#!/bin/sh\necho "Filesystem 1024-blocks Used Available Capacity Mounted on"\necho "/dev/fake 99999999 1 3145728 1%% /fake"\n' > "$STUB/df"
+printf '#!/bin/sh\necho 7\n' > "$STUB/jq"
+chmod +x "$STUB/sysctl" "$STUB/df" "$STUB/jq"
+eq "$(unset POOL_CEILING_T_LOAD5; PATH="$STUB:$PATH"; hash -r; pool_ceiling_read_load5)" "2.50" "the live load5 reader takes the 5-minute field of 'sysctl -n vm.loadavg'"
+eq "$(unset POOL_CEILING_T_DISK_FREE_MB; PATH="$STUB:$PATH"; hash -r; POOL_CEILING_DISK_PATH="$TMPROOT" pool_ceiling_read_disk_free_mb)" "3072" "the live disk reader turns df's 3145728 KB into 3072 MB"
+# A jq that answers 7 to anything: only the missing-file guard can make the answer empty. Control first, so a silent stub is not what the empty answer proves.
+printf '{}' > "$TMPROOT/q10d.json"
+eq "$(PATH="$STUB:$PATH"; hash -r; pool_ceiling_queue_from_dispatchable "$TMPROOT/q10d.json" whatsapp_automation 2000000000)" "7" "control: a readable file reaches jq (the stub answers 7)"
+eq "$(PATH="$STUB:$PATH"; hash -r; pool_ceiling_queue_from_dispatchable "$TMPROOT/q10d.nao-existe.json" whatsapp_automation 2000000000)" "" "a missing queue file is answered by the guard, jq is never asked (empty, not 7)"
+# The rate limit: a knob that is a valid number is used, a garbage one is the 60 s default, and "no stamp yet" (at=0) is not a stamp to rate-limit against.
+setsig 31 10 1 5700 412 14336
+SD10="$TMPROOT/state-10d"; mkdir -p "$SD10"; L10="$TMPROOT/10d.log"
+stp() { POOL_CEILING_DYNAMIC=1 POOL_CEILING_STATE_DIR="$SD10" POOL_CEILING_LOG="$L10" pool_ceiling_step "$@"; }
+POOL_CEILING_STEP_SECS=300 POOL_CEILING_NOW=5000 stp wa-worker 2 1 4 2 63 ok ok
+eq "$POOL_CEILING_RESULT" "3" "(rate knob 300) first step 2 -> 3"
+POOL_CEILING_STEP_SECS=300 POOL_CEILING_NOW=5100 stp wa-worker 2 1 4 3 63 ok ok
+eq "$POOL_CEILING_RESULT" "3" "a valid rate knob is honoured: 100 s later is inside 300 s -> no step"
+has "$POOL_CEILING_LOGLINE" "ritmo" "...and the line says it was the rate limit (a 60 s default would have stepped to 4)"
+POOL_CEILING_STEP_SECS=banana POOL_CEILING_NOW=6000 stp ps-worker 1 1 2 1 4 ok ok
+eq "$POOL_CEILING_RESULT" "2" "(rate knob garbage) first step 1 -> 2"
+POOL_CEILING_STEP_SECS=banana POOL_CEILING_NOW=6030 stp ps-worker 1 1 2 2 4 ok ok
+has "$POOL_CEILING_LOGLINE" "ritmo" "a garbage rate knob is the 60 s default: 30 s later is rate-limited"
+SD10="$TMPROOT/state-10d-clock0"; mkdir -p "$SD10"
+POOL_CEILING_STEP_SECS=60 POOL_CEILING_NOW=30 stp wa-worker 2 1 4 2 63 ok ok
+eq "$POOL_CEILING_RESULT" "3" "no stored stamp (at=0) is not a last step: a clock reading of 30 s, under the 60 s rate, still steps 2 -> 3"
+case "$POOL_CEILING_LOGLINE" in *ritmo*) bad "no state yet, yet the line reads as rate-limited: $POOL_CEILING_LOGLINE" ;; *) ok "...and the line is a step, not a rate-limit hold" ;; esac
+unset POOL_CEILING_T_LOAD5 POOL_CEILING_T_NCPU POOL_CEILING_T_MEM POOL_CEILING_T_SWAP_FREE_MB POOL_CEILING_T_SWAP_USED_MB POOL_CEILING_T_DISK_FREE_MB
+
 echo "== 11. hermetic: this run did not touch the real city's calibration log or state dir"
 eq "$(prod_snapshot)" "$PROD_BEFORE" "no fake-stamped row/state written to the real pool-ceiling.log / pool-ceiling/ by this run (before: $PROD_BEFORE; real sweeps appending meanwhile do not count)"
 # the detector itself: a fake-stamped row in a log it watches IS seen, a real-epoch row is NOT
