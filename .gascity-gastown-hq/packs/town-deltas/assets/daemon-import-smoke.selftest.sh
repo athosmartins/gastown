@@ -15,6 +15,10 @@
 #           block does not run
 #   T20     a crash of the helper itself is UNKNOWN (an uncaught python error exits
 #           1, which is the FAIL code)
+#   T22-T27 (ga-u6ueg0q) the numbers a reader of the output depends on: the default
+#           timeout and its precedence, the help exit, the width of each cut-off line,
+#           the tail of a child that left no result, and the PATH search's test for an
+#           executable FILE
 # and the three-state contract: only ImportError/SyntaxError is FAIL; anything the
 # helper could not run or that is not an import problem is UNKNOWN, never PASS.
 #
@@ -249,6 +253,89 @@ R="$TMP_ROOT/t21"; mk_tree "$R"; echo 'X = 1' > "$R/daemons/routes/cls_contacts.
 mk_plist "$TMP_ROOT/t21.plist" "$R" '{}' /usr/bin/env FOO=bar "$R/venv/bin/python3" "$R/daemons/dash.py"
 run_smoke "$TMP_ROOT/t21.plist"
 [ "$(verdict)" = "PASS" ] && ok "T21 /usr/bin/env python script.py: PASS" || bad "T21 got verdict=$(verdict) out=[$OUT]"
+
+# ── T22: the timeout handed to the child: 45 s by default, DAEMON_SMOKE_TIMEOUT over it, --timeout over both ─
+# Waiting out 45 s is not a test; the module is loaded and the child process is replaced by one that records the
+# timeout run() gives to communicate() and claims it expired. No output / a python error -> the check below fails.
+tmo="$(python3 -I - "$HELPER" "$TMP_ROOT/t1.plist" <<'PYEOF'
+import contextlib, importlib.util, io, os, sys
+spec = importlib.util.spec_from_file_location("daemon_import_smoke_under_test", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+seen = []
+class Popen:
+    pid = 0
+    returncode = 0
+    def __init__(self, cmd, **kw):
+        pass
+    def communicate(self, timeout=None):
+        if timeout is None:
+            return b"", b""
+        seen.append(timeout)
+        raise m.subprocess.TimeoutExpired("x", timeout)
+m.subprocess.Popen = Popen
+m.os.killpg = lambda *a: None   # pid 0 would be OUR process group
+plist = sys.argv[2]
+def smoke(argv):
+    with contextlib.redirect_stdout(io.StringIO()):
+        m.main(argv)
+os.environ.pop("DAEMON_SMOKE_TIMEOUT", None)
+smoke([plist])
+os.environ["DAEMON_SMOKE_TIMEOUT"] = "7"
+smoke([plist])
+smoke([plist, "--timeout", "3"])
+print(*seen)
+PYEOF
+)"
+[ "$tmo" = "45.0 7.0 3.0" ] && ok "T22 timeout: 45 s default, DAEMON_SMOKE_TIMEOUT over it, --timeout over both" || bad "T22 timeouts handed to the child: [$tmo]"
+
+# ── T23: no argument / -h / --help print the usage and exit 2 (not a plist path, not a crash report) ────────
+for a in none -h --help; do
+  if [ "$a" = none ]; then H="$(python3 -I "$HELPER" 2>/dev/null)"; else H="$(python3 -I "$HELPER" "$a" 2>/dev/null)"; fi; rc=$?
+  if [ "$rc" -eq 2 ] && has "$H" "THREE STATES" && ! printf '%s\n' "$H" | grep -q '^SMOKE='; then ok "T23 [$a]: usage text, rc=2"; else bad "T23 [$a]: rc=$rc out=[$H]"; fi
+done
+
+# ── T24: the reason line is cut at 400 characters (397 + "..."), and the unreadable-plist detail at 120 ─────
+R="$TMP_ROOT/t24"; mk_tree "$R"
+LONGWD="$(python3 -I -c 'print("/" + "a" * 200 + "/" + "b" * 200, end="")')"
+mk_plist "$TMP_ROOT/t24.plist" "$LONGWD" '{}' "$R/venv/bin/python3" "$R/daemons/dash.py"
+run_smoke "$TMP_ROOT/t24.plist"
+want="$(python3 -I -c 'import sys; s = "working directory %s does not exist" % sys.argv[1]; print(s[:397] + "...", end="")' "$LONGWD")"
+[ "$(verdict)" = "UNKNOWN" ] && [ "$(reason)" = "$want" ] && ok "T24 a reason longer than 400 characters is cut to exactly 400 (397 + ...)" || bad "T24 reason is ${#OUT} chars: [$(reason)]"
+LONGPL="$TMP_ROOT/$(python3 -I -c 'print("p" * 200, end="")').plist"   # does not exist: the error message carries the whole path
+run_smoke "$LONGPL"
+r="$(reason)"
+[ "$(verdict)" = "UNKNOWN" ] && [ "${r#plist unreadable: }" != "$r" ] && [ "${#r}" -eq $((18 + 120)) ] && [ "${r: -3}" = "..." ] && ok "T24 the unreadable-plist detail is cut to exactly 120 characters" || bad "T24 unreadable plist: ${#r} chars: [$r]"
+
+# ── T25: the PATH search takes the first executable FILE: a non-executable file and a directory of that name are skipped ─
+R="$TMP_ROOT/t25"; mk_tree "$R"; echo 'X = 1' > "$R/daemons/routes/cls_contacts.py"
+mkdir -p "$R/pathA" "$R/pathB/python3" "$R/pathC"
+: > "$R/pathA/python3"; chmod 644 "$R/pathA/python3"
+ln -sfn "$PY" "$R/pathC/python3"
+mk_plist "$TMP_ROOT/t25.plist" "$R" "{\"PATH\":\"$R/pathA:$R/pathB:$R/pathC\"}" python3 "$R/daemons/dash.py"
+run_smoke "$TMP_ROOT/t25.plist"
+[ "$(verdict)" = "PASS" ] && ok "T25 bare interpreter name: skips a non-executable file and a directory on the launchd PATH, finds the real one" || bad "T25 got verdict=$(verdict) reason=$(reason)"
+
+# ── T26: a child that leaves no result: the reason carries the LAST 300 characters of its stderr, cut to 200 ──
+R="$TMP_ROOT/t26"; mk_tree "$R"
+cat > "$R/daemons/routes/cls_contacts.py" <<'EOF'
+import os, sys
+sys.stderr.write("0123456789" * 40)   # 400 characters, no newline, and no result line after them
+sys.stderr.flush()
+os._exit(0)
+EOF
+mk_plist "$TMP_ROOT/t26.plist" "$R" '{}' "$R/venv/bin/python3" "$R/daemons/dash.py"
+run_smoke "$TMP_ROOT/t26.plist"
+want="no result from the child (rc=0): $(python3 -I -c 'print(("0123456789" * 30)[:197] + "...", end="")')"
+[ "$(verdict)" = "UNKNOWN" ] && [ "$(reason)" = "$want" ] && ok "T26 no result: the reason shows stderr from its last 300 characters, cut to 200" || bad "T26 got verdict=$(verdict) reason=[$(reason)]"
+
+# ── T27: on FAIL the sys.path detail is cut to 600 characters (the incident's own evidence must stay readable) ─
+R="$TMP_ROOT/t27"; mk_tree "$R"
+PADPATH="$(python3 -I -c 'print(":".join("/nonexistent/pad/dir%02d" % i for i in range(60)), end="")')"
+mk_plist "$TMP_ROOT/t27.plist" "$R" "{\"PYTHONPATH\":\"$PADPATH\"}" "$R/venv/bin/python3" "$R/daemons/dash.py"
+run_smoke "$TMP_ROOT/t27.plist"
+line="$(printf '%s\n' "$OUT" | sed -n 's/^SMOKE_DETAIL=sys.path at failure: //p' | head -1)"
+[ "$(verdict)" = "FAIL" ] && [ "${#line}" -eq 600 ] && [ "${line: -3}" = "..." ] && ok "T27 sys.path detail on FAIL: exactly 600 characters" || bad "T27 got verdict=$(verdict) detail is ${#line} chars"
 
 echo
 echo "== result: $PASS passed, $FAIL failed =="

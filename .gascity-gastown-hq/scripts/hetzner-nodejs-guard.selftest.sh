@@ -10,6 +10,7 @@
 #   NOVOS (.4.14): arquivo que chama o node e NÃO está no retrato, fora da lista e sem Node = FALHA que o NOMEIA (prova que o conjunto é derivado) · repositório do PS ilegível ou ref inexistente = só o retrato:
 #   todos cobertos = rc 2 (não afirmo que nada novo precisa do node), fora da lista + Node ok = rc 0, + sem Node = rc 1 (sempre com a nota "conjunto = retrato") · derivação que não acha NENHUM teste = rc 2 ·
 #   globs indentados (o classificador faz strip dos dois lados) cobrem · sem subcomando, uso do guarda não muda.
+#   ga-u6ueg0q: a última linha da lista SEM quebra de linha no fim (editor que não grava o \n) ainda conta como glob.
 # MUTANTES: cada um troca UM trecho do guarda por uma versão frouxa (python3, substring exata e única); o caso apontado tem de FALHAR.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -59,7 +60,9 @@ c_retrato_fora_falha() { reset; PS_GIT_DIR="$T/nao-existe"; STUB_CHECK_RC=1; exp
 c_ref_inexistente() { reset; PS_REF=nao-existe; export PS_REF; mklist $FILES6; local rc; rc=$(run); eq "ref inexistente: cai no retrato, e com tudo coberto é rc 2" 2 "$rc"; has "…diz que não leu o PS" "$T/out" 'não consegui ler o repositório do PS'; }
 c_deriva_vazia() { reset; mkps_vazio; mklist $FILES6; local rc; rc=$(run); eq "derivação que não acha NENHUM teste: rc 2 (não 'não se aplica')" 2 "$rc"; has "…diz que contradiz o retrato" "$T/out" 'NENHUM teste.*contradiz o retrato'; eq "…sem chamar o check" nao "$(called)"; }
 c_glob_indentado() { reset; printf '# lista\n   tests/test_blow_*.py\n\t tests/test_scraper_status_blow_probe.py  \n' > "$LIST"; STUB_CHECK_RC=1; export STUB_CHECK_RC; local rc; rc=$(run); eq "globs indentados (o classificador faz strip dos dois lados) cobrem: rc 0" 0 "$rc"; eq "…e o check não é chamado" nao "$(called)"; }
-CASES="c_todos_na_lista c_fora_check_ok c_fora_check_falha c_fora_check_nao_sei c_um_so_fora c_script_ausente c_lista_ausente c_lista_sem_glob c_cobre_por_glob c_parecido_nao_cobre c_espaco_no_fim c_deriva_arquivo_novo c_retrato_cobertos c_retrato_fora_ok c_retrato_fora_falha c_ref_inexistente c_deriva_vazia c_glob_indentado"
+# a lista termina no meio de uma linha (sem \n): o `read` devolve rc 1 com o glob lido, e esse glob tem de valer — senão o último arquivo da lista volta a exigir o Node
+c_sem_quebra_final() { reset; printf '# lista\ntests/test_blow_*.py\ntests/test_scraper_status_blow_probe.py' > "$LIST"; STUB_CHECK_RC=1; export STUB_CHECK_RC; local rc; rc=$(run); eq "última linha da lista sem quebra de linha ainda cobre: rc 0" 0 "$rc"; eq "…e o check não é chamado" nao "$(called)"; }
+CASES="c_todos_na_lista c_fora_check_ok c_fora_check_falha c_fora_check_nao_sei c_um_so_fora c_script_ausente c_lista_ausente c_lista_sem_glob c_cobre_por_glob c_parecido_nao_cobre c_espaco_no_fim c_deriva_arquivo_novo c_retrato_cobertos c_retrato_fora_ok c_retrato_fora_falha c_ref_inexistente c_deriva_vazia c_glob_indentado c_sem_quebra_final"
 for c in $CASES; do echo "== $c"; $c; done
 
 mutant() {   # nome · trecho original · trecho frouxo · caso que tem de pegar
@@ -92,6 +95,7 @@ mutant igualdade-no-lugar-do-glob 'case "$1" in $g) return 0 ;; esac' '[ "$1" = 
 mutant glob-casa-tudo         'case "$1" in $g) return 0 ;; esac' 'case "$1" in *) return 0 ;; esac' c_parecido_nao_cobre
 mutant espaco-no-fim-fica     'g="${g%"${g##*[![:space:]]}"}"; ' '' c_espaco_no_fim
 mutant um-fora-nao-basta      'if [ "${#OUT[@]}" -eq 0 ]; then' 'if [ "${#OUT[@]}" -le 1 ]; then' c_um_so_fora
+mutant ultima-linha-perdida   'while IFS= read -r g || [ -n "$g" ]; do' 'while IFS= read -r g && [ -n "$g" ]; do' c_sem_quebra_final
 
 echo
 echo "$n verificações, $fails falha(s)"
