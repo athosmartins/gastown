@@ -116,6 +116,7 @@ setstub() { printf '%s' "$2" > "$STUBDIR/$1"; if [ -n "${3:-}" ]; then printf '%
 allstubs() { local s=""; for s in 2b 2c 2d 2e; do setstub "$s" "$1"; done; }
 mx() { # mx <label> <want refuse|pass> <step> <label name> <want verdict label> [VAR=value ...]
   local l="$1" want="$2" st="$3" ln="$4" wv="$5" cf="$WORK/m.$RANDOM"; shift 5
+  MXCF="$cf"   # the log of the case just run, for the checks that follow it (a glob over m.* would be several files, not this one)
   drive "$cf" RIG_PATH="$RIG" BRANCH="clean" GATE_HC_SCRIPT="$WORK/stub.sh" "$@"
   if [ "$want" = refuse ]; then
     [ "$RC" = 1 ] && ! fell "$cf" && lab "$cf" "$ln" "$wv" && has "$cf" "STATUS ga-marker-1 error" && ok "$l -> refused, label $ln:$wv" || bad "$l: wanted refusal, rc=$RC :: $(grep -E 'label|STATUS' "$cf" | tr '\n' '|')"
@@ -127,7 +128,7 @@ V() { printf 'VERDICT=%s step=2c reason=x rc=%s tip=- base=- arm=-\\n' "$1" "${2
 allstubs "$(V ok)"
 setstub 2c "$(V fail 1)\\n  contents-missing line\\n";                                         mx "2c VERDICT=fail" refuse 2c gate-docrules fail
 setstub 2c "$(V fail 1)\\n";  setstub 2e "$(V fail 1)\\n";                                       mx "2c and 2e both fail" refuse 2e gate-tsr fail
-has "$WORK/m."* "step(s) 2c 2e." 2>/dev/null && ok "ONE refusal lists both failing steps" || { f="$(ls -t "$WORK"/m.* | grep -v stdout | head -1)"; has "$f" "step(s) 2c 2e." && ok "ONE refusal lists both failing steps" || bad "two failures: $(grep 'rejected' "$f" | head -2)"; }
+has "$MXCF" "step(s) 2c 2e." && ok "ONE refusal lists both failing steps" || bad "two failures: $(grep 'rejected' "$MXCF" | head -2)"
 allstubs "$(V ok)"
 for v in debito-previo aviso nao-se-aplica nao-ligado desligado nao-consegui-medir ok; do setstub 2c "$(V "$v")\\n"; mx "2c VERDICT=$v" pass 2c gate-docrules "$v"; done
 setstub 2c "$(V banana)\\n";                    mx "unknown token (VERDICT=banana)" pass 2c gate-docrules nao-consegui-medir
@@ -139,7 +140,7 @@ setstub 2c "$(V fail 1)\\n" 9;                  mx "VERDICT=fail but the checker
 setstub 2c "noise\\n$(V fail 1)\\n";            mx "verdict line not on the FIRST line" pass 2c gate-docrules nao-consegui-medir
 setstub 2c "$(V fail 1)\\n"
 mx "observe mode: a fail is recorded and NOT refused" pass 2c gate-docrules fail GATE_HARDCHECKS=observe
-cf="$(ls -t "$WORK"/m.* | grep -v stdout | head -1)"; has "$cf" "HARDCHECK-OBSERVE would refuse marker ga-marker-1 (steps: 2c)" && ok "and the log says what it WOULD have refused" || bad "no observe line"
+has "$MXCF" "HARDCHECK-OBSERVE would refuse marker ga-marker-1 (steps: 2c)" && ok "and the log says what it WOULD have refused" || bad "no observe line"
 
 echo "D. recorded, never silent: the paths that skip the measurement"
 C7="$WORK/c7"; drive "$C7" RIG_PATH="$RIG" BRANCH="clean" GATE_HC_SCRIPT="$WORK/does-not-exist.sh"

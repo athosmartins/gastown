@@ -19,12 +19,17 @@
 # OUTPUT. One line first, then (fail / debito-previo) the tool's red lines, capped at 40:
 #   VERDICT=<token> step=<s> reason=<slug> rc=<n|-> tip=<green|red|unlinted|unknown|-> base=<..|-> arm=<enforce|holdout|->
 #   ok                  the tool ran and found nothing (2b: the parse guard printed an OK line for a pack under the tree; an
-#                       exit 0 that only SKIPPED the lint, with a WARNING line, is unlinted -> nao-consegui-medir)
-#   fail                the tool printed a finding AND exited 1 (2b/2d also need the base tree to be green).
-#                       The only verdict the guard refuses on
+#                       exit 0 that only SKIPPED the lint, with a WARNING line, is unlinted -> nao-consegui-medir; 2c: the
+#                       lint's summary line says it checked at least one file; 2e: reason sem-leituras-vistas when the tool
+#                       saw no new read at all, leituras-com-teste when every read it saw has a test or a waiver)
+#   fail                the tool printed a finding AND exited 1 (2b/2d also need the base tree to be green: for 2b, each pack
+#                       the tip broke must have linted green there). The only verdict the guard refuses on
 #   aviso               2e found reads with no failure test but its mode (warn, or the holdout arm) does not refuse
 #   debito-previo       2b/2d: red on the tip and on the base: main already carried it
-#   nao-se-aplica       the diff touches nothing this step reads (a MEASURED zero: the diff itself was read)
+#   nao-se-aplica       the diff touches nothing this step reads (a MEASURED zero: the diff itself was read; "reads" for 2c is
+#                       the lint's own set: added/copied/modified/renamed .md, any case of the suffix, so a type change such as
+#                       symlink -> regular doc is outside it, here and in the lint), or (2c) the lint ran and checked no file
+#                       (every .md in the diff was excluded or skipped by the lint)
 #   desligado           a kill switch is on (the tool's own, or E12_COVERAGE_GATE=off / .gc/e12-coverage-gate.off for 2d)
 #   nao-ligado          2e only: .gc/third-state-reads.conf is absent or mode=off, so the tool checked nothing
 #   nao-consegui-medir  anything that stopped a measurement (see the reason); the guard fails OPEN on it, loudly
@@ -33,8 +38,10 @@
 #
 # THIRD STATES. "Could not run" is never green and never red. A finding needs POSITIVE evidence in the tool's output
 # (a crash also exits 1); everything else is unmeasured. An exit 0 is not proof either: 2b's parse guard exits 0 when it
-# skips (no pack.toml above the template, gc absent, nothing matched), so green needs its OK line too. A python without tomllib (< 3.11) cannot run 2d and would
-# make the base tree red as well, so it is said (python-sem-tomllib), never read as debito-previo for good.
+# skips (no pack.toml above the template, gc absent, nothing matched), so green needs its OK line too; 2c's lint also exits 0
+# when switched off (a DISABLED line, no summary), so green needs its summary line with at least one file checked.
+# A python without tomllib (< 3.11) cannot run 2d and would make the base tree red as well, so it is said
+# (python-sem-tomllib), never read as debito-previo for good.
 #
 # ENV. GATE_HC_HQ = the directory holding the tools (default: three levels above this script); GATE_HC_TIMEOUT seconds
 # per tool run (default 90; garbage is the default, never "no limit"); GATE_HC_PYTHONS = the pythons to try for tomllib.
@@ -61,18 +68,19 @@ emit() { # emit <verdict> <reason>: the one verdict line, then the detail; ends 
   exit 0
 }
 cap() { printf '%s\n' "$1" | awk 'NR <= 40 { print substr($0, 1, 200) }'; }
-# ok_or_special <reason>: the clean verdict of a step that extracted a tree. A link the extract had to leave out makes it
-# unmeasured instead (an @import or a template may reach the tree through it); a finding is never touched by this.
+# ok_or_special <reason> [verdict]: the clean verdict (default ok) of a step that extracted a tree. A link the extract had to
+# leave out makes it unmeasured instead (an @import or a template may reach the tree through it); a finding is never touched by this.
 ok_or_special() {
   if [ "$SPECIAL" -gt 0 ]; then emit nao-consegui-medir "entrada-especial-fora-do-diff-$SPECIAL"; fi
-  emit ok "$1"
+  emit "${2:-ok}" "$1"
 }
 
-# want <path>: rc 0 when this step needs that tree entry (WANT picks the step's set).
+# want <path>: rc 0 when this step needs that tree entry (WANT picks the step's set). The doc-rules lint takes ".md" in any
+# case (path.lower().endswith), so the .md patterns here do too: a narrower set would hand the lint a tree without the file.
 want() {
   case "$WANT" in
-    (md-all) case "$1" in (*.md) return 0 ;; esac ;;
-    (md-changed) case "$1" in (*.md) case "$LIVE_MD" in (*$'\n'"$1"$'\n'*) return 0 ;; esac ;; esac ;;
+    (md-all) case "$1" in (*.[mM][dD]) return 0 ;; esac ;;
+    (md-changed) case "$1" in (*.[mM][dD]) case "$LIVE_MD" in (*$'\n'"$1"$'\n'*) return 0 ;; esac ;; esac ;;
     (e12) case "$1" in
             ($HQ/agents/*/prompt.template.md|$HQ/city.toml|$HQ/packs/town-deltas/template-fragments/town-deltas.template.md) return 0 ;;
           esac ;;
@@ -122,11 +130,12 @@ pick_tools() { # PY = first python3 with tomllib (PY_TOML=1), else the PATH one;
 }
 
 step_2c() {
-  local tool="$HQ_DIR/scripts/doc-rules-lint.py" out="" gd=""
+  local tool="$HQ_DIR/scripts/doc-rules-lint.py" out="" gd="" n=""
   [ -r "$tool" ] || emit nao-consegui-medir ferramenta-ilegivel
   tool_altered "$HQ/scripts/doc-rules-lint.py" && emit nao-consegui-medir ferramenta-alterada-no-diff
-  # A named doc (CLAUDE.md, AGENTS.md) counts its @imports: only then does the lint need every .md, not just the changed ones.
-  WANT=md-changed; LIVE_MD=$'\n'"$(grep '\.md$' "$SCRATCH/live.nl")"$'\n'
+  # A named doc (CLAUDE.md, CLAUDE.local.md, AGENTS.md) counts its @imports: only then does the lint need every .md, not just the
+  # changed ones. Its basename is matched in EXACT case, like the lint's NAMED_FILES; only the ".md" suffix is case-blind.
+  WANT=md-changed; LIVE_MD=$'\n'"$(grep -i '\.md$' "$SCRATCH/live.nl")"$'\n'
   if grep -E -q '(^|/)(CLAUDE|CLAUDE\.local|AGENTS)\.md$' "$SCRATCH/live.nl"; then WANT=md-all; fi
   extract "$tip" "$SCRATCH/tip" || emit nao-consegui-medir extracao-tip
   # vazio/falhou → sem git-dir não há diff nem ref do upstream: nao-consegui-medir, nunca "sem violação"
@@ -141,6 +150,11 @@ step_2c() {
   # CLEAN exit, whole line at the start: a branch that writes "DISABLED via" in a title must not turn a refusal into desligado.
   case "$RC" in
     (0) if printf '%s\n' "$out" | grep -E -q '^doc-rules-lint: DISABLED via '; then emit desligado interruptor; fi
+        # vazio → exit 0 sem linha de resumo (ou um resumo que se contradiz): nao-consegui-medir; 0 arquivos conferidos → nao-se-aplica;
+        # falhou/ilegível → o sed não acha a linha, o mesmo que vazio
+        n="$(printf '%s\n' "$out" | sed -n 's/^doc-rules-lint: \([0-9][0-9]*\) file(s) checked, 0 violation(s).*/\1/p' | tail -n 1)"
+        [ -n "$n" ] || emit nao-consegui-medir saida-sem-resumo
+        if [ "$n" -eq 0 ]; then ok_or_special nenhum-arquivo-conferido nao-se-aplica; fi
         ok_or_special lint-limpo ;;
     (1) if printf '%s\n' "$out" | grep -E -q '^doc-rules-lint: [0-9]+ file\(s\) checked, [1-9][0-9]* violation\(s\)'; then DETAIL="$(cap "$out")"; emit fail violacoes-doc-rules; fi
         emit nao-consegui-medir saida-sem-resumo ;;
@@ -149,7 +163,7 @@ step_2c() {
 }
 
 step_2e() {
-  local tool="$HQ_DIR/packs/town-deltas/assets/third-state-reads-check.py" out="" line="" v=""
+  local tool="$HQ_DIR/packs/town-deltas/assets/third-state-reads-check.py" out="" line="" v="" nreads=""
   [ -r "$tool" ] || emit nao-consegui-medir ferramenta-ilegivel
   tool_altered "$ASSETS_REL/third-state-reads-check.py" && emit nao-consegui-medir ferramenta-alterada-no-diff
   case "$bead" in (''|*[!A-Za-z0-9._-]*) emit nao-consegui-medir bead-invalido ;; esac
@@ -159,7 +173,10 @@ step_2e() {
   line="$(printf '%s\n' "$out" | grep -E '^third-state-reads-check: verdict=' | tail -n 1)"
   # vazio → sem linha de veredito: ligado-mas-mudo é nao-consegui-medir, nunca ok; "nothing checked" é a ferramenta dizendo que está desligada
   if [ -n "$line" ]; then
-    v="${line#*verdict=}"; v="${v%% *}"; ARM="${line#*arm=}"; ARM="${ARM%% *}"
+    v="${line#*verdict=}"; v="${v%% *}"
+    # vazio → campo ausente na linha: arm fica "-" e nreads fica vazio (nunca o resto da linha tomado por valor); falhou/ilegível → idem
+    case "$line" in (*' arm='*) ARM="${line#* arm=}"; ARM="${ARM%% *}" ;; esac
+    case "$line" in (*' reads='*) nreads="${line#* reads=}"; nreads="${nreads%% *}" ;; esac
   elif [ "$RC" -eq 0 ]; then
     # Whole lines at the start only (the finding lines echo branch text, indented): see step_2c.
     if printf '%s\n' "$out" | grep -E -q '^NOTE: third-state-reads-check: not switched on \('; then emit nao-ligado conf-ausente; fi
@@ -167,7 +184,10 @@ step_2e() {
     if printf '%s\n' "$out" | grep -E -q '^NOTE: third-state-reads-check: is switched OFF \('; then emit desligado interruptor; fi
   fi
   case "$RC:$v" in
-    (0:ok) emit ok leituras-com-teste ;;
+    # reads=0 → a ferramenta não viu leitura nova alguma: ok sem-leituras-vistas ("ok" aí não promete testes, só que nada faltava);
+    # vazio/falhou/ilegível → reads= ausente ou não numérico: nao-consegui-medir, nunca "toda leitura tem teste"
+    (0:ok) case "$nreads" in (0) emit ok sem-leituras-vistas ;; (''|*[!0-9]*) emit nao-consegui-medir saida-ilegivel ;; esac
+           emit ok leituras-com-teste ;;
     (0:reads-without-test) DETAIL="$(cap "$out")"; emit aviso leitura-sem-teste-sem-recusa ;;
     (1:reads-without-test) DETAIL="$(cap "$out")"; emit fail leitura-sem-teste ;;
     (0:nao-sei|1:nao-sei) DETAIL="$(cap "$out")"; emit nao-consegui-medir ferramenta-nao-sei ;;
@@ -236,6 +256,20 @@ run_tmpl() {
   else printf 'unknown %s' "$r"; fi
 }
 
+# base_lints_tip_reds <tip.out> <tip tree> <base.out> <base tree>: rc 0 when EVERY pack the tip's guard run called FAIL has its own
+# "OK -- <same pack>" line in the base's run. The base run is "unlinted" as a whole when it also warned about a file it could not lint
+# (a loose template); that must not hide that the pack the tip broke was linted green there, and a green pack elsewhere must not
+# vouch for a pack the base never had. vazio → nenhuma linha FAIL no tip: rc 1 (nada a cobrir, nao-consegui-medir); falhou/ilegível →
+# grep não lê o arquivo, não acha a linha OK: rc 1. The lines are matched whole and carry the scratch path, which the branch cannot know.
+base_lints_tip_reds() {
+  local p="" rel="" n=0 g="template-fragment-lint-guard:"
+  while IFS= read -r p; do
+    rel="${p#"$2"}"; n=$((n + 1))
+    grep -F -x -q -e "$g OK -- $4$rel" "$3" 2>/dev/null || grep -F -x -q -e "$g OK (only known lint-context artifacts) -- $4$rel" "$3" 2>/dev/null || return 1
+  done < <(sed -n "s/^$g FAIL -- //p" "$1" 2>/dev/null)
+  [ "$n" -gt 0 ]
+}
+
 step_2b() {
   local cr="" cls="" bcr="" ccls=""
   [ -r "$HQ_DIR/packs/town-deltas/assets/template-fragment-lint-guard.sh" ] || emit nao-consegui-medir ferramenta-ilegivel
@@ -272,7 +306,8 @@ step_2b() {
   case "$BASEC" in
     (green) emit fail parse-vermelho-no-tip-e-verde-na-base ;;
     (red) emit debito-previo parse-vermelho-na-base-tambem ;;
-    (unlinted) DETAIL="$(cap "$(cat "$SCRATCH/base.out")")"; emit nao-consegui-medir lint-nao-rodou-na-base ;;
+    (unlinted) if base_lints_tip_reds "$SCRATCH/tip.out" "$SCRATCH/tip" "$SCRATCH/base.out" "$SCRATCH/base"; then BASEC=green; emit fail parse-vermelho-no-tip-e-verde-na-base; fi
+               DETAIL="$(cap "$(cat "$SCRATCH/base.out")")"; emit nao-consegui-medir lint-nao-rodou-na-base ;;
     (*) DETAIL=""; emit nao-consegui-medir parse-inconclusivo-base ;;
   esac
 }
@@ -296,7 +331,7 @@ main() {
   CHANGED_ALL=$'\n'"$(<"$SCRATCH/all.nl")"$'\n'
   case "$STEP" in
     (2b) grep -E '(^|/)template-fragments/|(^|/)prompts/shared/|\.template\.md$|\.md\.tmpl$|(^|/)pack\.toml$' "$SCRATCH/all.nl" > "$SCRATCH/hits.nl" ;;
-    (2c) grep '\.md$' "$SCRATCH/live.nl" > "$SCRATCH/hits.nl" ;;
+    (2c) grep -i '\.md$' "$SCRATCH/live.nl" > "$SCRATCH/hits.nl" ;;
     (2d) grep -E "^[.]gascity-gastown-hq/(agents/[^/]+/prompt[.]template[.]md|city[.]toml|packs/town-deltas/(template-fragments/town-deltas[.]template[.]md|assets/(e12-arms[.]sh|e12-crew-doctrine[.]sh|claude-overlays/pool-roles[.]json)))\$" "$SCRATCH/all.nl" > "$SCRATCH/hits.nl" ;;
     (2e) cp "$SCRATCH/all.nl" "$SCRATCH/hits.nl" ;;
   esac

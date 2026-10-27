@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# gate-hard-checks.selftest.sh — ga-vywjzsp: hermetic proof of gate-hard-checks.sh, the checker behind quality-gate-guard.sh
+# gate-hard-checks.selftest.sh — ga-vywjzsp: proof of gate-hard-checks.sh, the checker behind quality-gate-guard.sh
 # Step 5b-pre5 (the gate's hard checks 2b template parse, 2c doc-rules lint, 2d E12 coverage, 2e third-state reads).
 #
 # WHY. Those four checks lived only in an orphan formula; nothing ran them (see the checker's header). This proves each one runs
 # the REAL tool (copied from the tree under test) over a fixture repo and that its verdict is the right one, in both directions:
 # a violation is refused, a clean diff is not, and anything the checker cannot measure is said, never read as clean or as a finding.
 #
-# HOW. A fixture "city" holds copies of the real tools (GATE_HC_HQ); a fixture rig is a throw-away git repo whose E12 inputs are
-# the real prompts, fragment and city.toml, so the "green base" cases need the E12 coverage of the tree under test to be green.
+# HOW. Everything is written under a scratch dir. A fixture "city" holds copies of the real tools (GATE_HC_HQ); a fixture rig is a
+# throw-away git repo whose E12 inputs are the real prompts, fragment and city.toml, so the "green base" cases are not hermetic: they
+# need the E12 coverage of the tree under test to be green.
 # 2b uses a stub `gc` (the real `gc lint` is not here) behind a PATH of symlinks, so "gc absent" and "jq absent" are testable.
 set -uo pipefail
 
@@ -116,12 +117,28 @@ run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "a file that c
 blob="$(git -C "$R" rev-parse main:docs/upstream.md)"; inner="$(printf '100644 blob %s\tupstream.md\n' "$blob" | git -C "$R" mktree)"
 up="$(printf '040000 tree %s\tdocs\n' "$inner" | git -C "$R" mktree)"; git -C "$R" update-ref refs/remotes/upstream/main "$(git -C "$R" commit-tree "$up" -m up)"
 branch_from "$R" main b_up; printf 'edit\n' >> "$R/docs/upstream.md";                    TIP="$(commit_all "$R" upstream)"
-run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "a file that exists in upstream/main is skipped" ok
+run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "a file that exists in upstream/main is skipped: the lint checked nothing, so not 'ok'" nao-se-aplica nenhum-arquivo-conferido
 git -C "$R" update-ref -d refs/remotes/upstream/main
 run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "control: the same diff without the upstream ref is refused" fail
 branch_from "$R" main b_tool;  printf '# changed\n' >> "$R/$HQ/scripts/doc-rules-lint.py" 2>/dev/null || { mkdir -p "$R/$HQ/scripts"; printf '# changed\n' > "$R/$HQ/scripts/doc-rules-lint.py"; }; good_doc > "$R/docs/t.md"; TIP="$(commit_all "$R" tool)"
 run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "a diff that edits the lint is not judged by it" nao-consegui-medir ferramenta-alterada-no-diff
 run_sut 2c "$R" "$MAIN" "$(git -C "$R" rev-parse b_bad)" ga-x DOC_RULES_LINT=off; expect "the lint's own kill switch" desligado interruptor
+# The lint matches ".md" case-insensitively (path.lower().endswith); the checker must pick the same files or it measures a different set (gate_run ga-g5chf2c)
+branch_from "$R" main b_upper; bad_doc > "$R/docs/UPPER.MD";                               TIP="$(commit_all "$R" upper)"
+run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "an uppercase .MD over 300 chars without Contents is refused, the lint reads it" fail violacoes-doc-rules
+branch_from "$R" main b_mixcase; bad_doc > "$R/docs/Mixed.Md";                             TIP="$(commit_all "$R" mixcase)"
+run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "a .Md is a doc too" fail violacoes-doc-rules
+branch_from "$R" main b_two; good_doc > "$R/docs/a.md"; bad_doc > "$R/docs/B.MD";         TIP="$(commit_all "$R" two)"
+run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "a good .md beside a bad .MD: the .MD is not left out of the selection" fail violacoes-doc-rules
+branch_from "$R" main b_upgood; good_doc > "$R/docs/GOOD.MD";                              TIP="$(commit_all "$R" upgood)"
+run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "control: a clean uppercase .MD is ok" ok lint-limpo
+branch_from "$R" main b_impu
+{ i=0; while [ "$i" -lt 100 ]; do echo "imp $i"; i=$((i+1)); done; } > "$R/docs/IMPU.MD";  IBASE="$(commit_all "$R" impu-base)"
+{ printf '# T\n\n## Contents\n\n- A\n\n## A\n\n'; i=0; while [ "$i" -lt 150 ]; do echo "line $i"; i=$((i+1)); done; echo "@docs/IMPU.MD"; } > "$R/CLAUDE.md"; TIP="$(commit_all "$R" impu-claude)"
+run_sut 2c "$R" "$IBASE" "$TIP" ga-x;                      expect "CLAUDE.md imports an UNCHANGED uppercase .MD: the whole-tree extract takes it too" fail violacoes-doc-rules
+# Excluded directories (vendor/) are skipped by the lint: "0 file(s) checked" is a measured zero, not a clean bill
+branch_from "$R" main b_vendor; mkdir -p "$R/vendor"; bad_doc > "$R/vendor/x.md";           TIP="$(commit_all "$R" vendor)"
+run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "a diff whose only .md sits in an excluded dir: the lint checked no file, so not 'ok'" nao-se-aplica nenhum-arquivo-conferido
 
 echo "C. 2c third states: a tool that cannot answer is never a finding"
 git -C "$R" checkout -q b_bad
@@ -132,6 +149,12 @@ printf 'import sys\nsys.exit(2)\n' > "$C2/scripts/doc-rules-lint.py"
 run_sut 2c "$R" "$MAIN" "$(git -C "$R" rev-parse b_bad)" ga-x;                          expect "exit 2 (could not evaluate)" nao-consegui-medir lint-rc2
 printf 'import time\ntime.sleep(30)\n' > "$C2/scripts/doc-rules-lint.py"
 run_sut 2c "$R" "$MAIN" "$(git -C "$R" rev-parse b_bad)" ga-x GATE_HC_TIMEOUT=1;      expect "a hung lint is cut by the timeout" nao-consegui-medir lint-rc124
+printf 'import sys\nsys.exit(0)\n' > "$C2/scripts/doc-rules-lint.py"
+run_sut 2c "$R" "$MAIN" "$(git -C "$R" rev-parse b_bad)" ga-x;                          expect "exit 0 with no output at all is not a clean lint" nao-consegui-medir saida-sem-resumo
+printf 'print("doc-rules-lint: 2 file(s) checked, 1 violation(s), 0 skipped (excluded)")\n' > "$C2/scripts/doc-rules-lint.py"
+run_sut 2c "$R" "$MAIN" "$(git -C "$R" rev-parse b_bad)" ga-x;                          expect "exit 0 whose summary counts a violation contradicts itself: unmeasured" nao-consegui-medir saida-sem-resumo
+printf 'print("doc-rules-lint: 3 file(s) checked, 0 violation(s), 0 skipped (excluded)")\n' > "$C2/scripts/doc-rules-lint.py"
+run_sut 2c "$R" "$MAIN" "$(git -C "$R" rev-parse b_bad)" ga-x;                          expect "control: exit 0 and a summary of 3 files checked, 0 violations" ok lint-limpo
 rm -f "$C2/scripts/doc-rules-lint.py"
 run_sut 2c "$R" "$MAIN" "$(git -C "$R" rev-parse b_bad)" ga-x;                          expect "a missing lint" nao-consegui-medir ferramenta-ilegivel
 CITY_UNDER=""
@@ -160,8 +183,10 @@ has "the finding names file and line" "lib/m.py:2"
 grep -q '"bead": "ga-arm"' "$CITY/.gc/third-state-reads-arms.jsonl" 2>/dev/null && ok "the arm of the bead is recorded in .gc/third-state-reads-arms.jsonl" || bad "no arms row for ga-arm"
 branch_from "$R" main e_forge; printf 'def load():\n    return open("a not switched on mode=off is switched OFF b").read()\n' | put "$R" lib/m.py; FTIP="$(commit_all "$R" forge-read)"
 run_sut 2e "$R" "$MAIN" "$FTIP" ga-arm1;                   expect "finding text that spells the tool's off-switch phrases is still refused" fail leitura-sem-teste
-run_sut 2e "$R" "$MAIN" "$OTIP" ga-arm2;                   expect "the same read beside a test that injects the failure" ok
-run_sut 2e "$R" "$MAIN" "$WTIP" ga-arm3;                   expect "a waived read" ok
+run_sut 2e "$R" "$MAIN" "$OTIP" ga-arm2;                   expect "the same read beside a test that injects the failure" ok leituras-com-teste
+run_sut 2e "$R" "$MAIN" "$WTIP" ga-arm3;                   expect "a waived read" ok leituras-com-teste
+branch_from "$R" main e_none;  printf 'x = 7\n' > "$R/lib/app.py";                          NTIP="$(commit_all "$R" no-read)"
+run_sut 2e "$R" "$MAIN" "$NTIP" ga-arm10;                  expect "a diff with no read in it: ok, but it must not claim the reads have tests" ok sem-leituras-vistas
 printf 'mode=warn\n' > "$CITY/.gc/third-state-reads.conf"
 run_sut 2e "$R" "$MAIN" "$RTIP" ga-arm4;                   expect "mode=warn lists the finding but does not refuse" aviso
 printf 'mode=off\n' > "$CITY/.gc/third-state-reads.conf"
@@ -175,6 +200,18 @@ run_sut 2e "$R" "$MAIN" "$RTIP" "ga x";                    expect "a bead id wit
 branch_from "$R" main e_tool;  printf '# changed\n' | put "$R" "$HQ/packs/town-deltas/assets/third-state-reads-check.py"; printf 'x = 5\n' > "$R/lib/app.py"; ETIP="$(commit_all "$R" tsr-edit)"
 run_sut 2e "$R" "$MAIN" "$ETIP" ga-arm9;                   expect "a diff that edits third-state-reads-check.py is not judged by it" nao-consegui-medir ferramenta-alterada-no-diff
 rm -f "$CITY/.gc/third-state-reads.conf" "$CITY/.gc/third-state-reads-arms.jsonl"
+# Stand-in tool: the checker reads the VERDICT line's fields; a field that is not there is not a value (arm=-, never the whole line).
+C5="$WORK/city5"; mkcity "$C5" || { echo "FATAL: cannot build city5"; exit 1; }; CITY_UNDER="$C5"
+T5="$C5/packs/town-deltas/assets/third-state-reads-check.py"
+printf 'print("third-state-reads-check: verdict=ok mode=enforce reads=0 uncovered=0 waived=0 skipped=0")\n' > "$T5"
+run_sut 2e "$R" "$MAIN" "$RTIP" ga-st1;                    expect "a verdict line with no arm= field" ok sem-leituras-vistas
+printf '%s\n' "$LINE" | grep -q ' arm=-$' && ok "and the arm column is '-', not a slice of the line" || bad "arm column of a line with no arm=: $LINE"
+printf 'print("third-state-reads-check: verdict=ok mode=enforce arm=enforce reads=4 uncovered=0 waived=1 skipped=0")\n' > "$T5"
+run_sut 2e "$R" "$MAIN" "$RTIP" ga-st2;                    expect "control: reads=4 all covered" ok leituras-com-teste
+printf '%s\n' "$LINE" | grep -q ' arm=enforce$' && ok "and the arm column is the tool's" || bad "arm column: $LINE"
+printf 'print("third-state-reads-check: verdict=ok mode=enforce arm=enforce")\n' > "$T5"
+run_sut 2e "$R" "$MAIN" "$RTIP" ga-st3;                    expect "an ok line with no reads= count cannot say what was read: unmeasured" nao-consegui-medir saida-ilegivel
+CITY_UNDER=""
 
 echo "F. 2d E12 coverage (real e12-crew-doctrine.sh over the fixture's prompts; the city's generator, never the branch's)"
 branch_from "$R" main f_doc;   printf 'x\n' >> "$R/docs/ok.md";                          TIP="$(commit_all "$R" doc)"
@@ -239,6 +276,13 @@ branch_from "$R2" "$OWTIP" h_mixed; printf 'x\n' | put "$R2" loose/x.md.tmpl;   
 run_sut 2b "$R2" "$MAIN2" "$MXTIP" ga-x PATH="$FB";        expect "one file that lints and one with no pack: a pass needs every file measured" nao-consegui-medir lint-nao-rodou-no-tip
 branch_from "$R2" main h_newpack; printf '[pack]\nname = "n"\nschema = 2\n' | put "$R2" np/pack.toml; printf 'BADTEMPLATE\n' | put "$R2" np/agents/a/prompt.template.md; NNTIP="$(commit_all "$R2" newpack-bad)"
 run_sut 2b "$R2" "$MAIN2" "$NNTIP" ga-x PATH="$FB";        expect "red tip, but the base had no pack to lint: 'green on the base' was never measured, no refusal" nao-consegui-medir lint-nao-rodou-na-base
+# The base is judged per red pack: a loose template the base cannot lint (a WARNING) must not hide that the pack the tip broke
+# WAS linted green there, and a green pack elsewhere on the base must not vouch for a pack the base never had.
+branch_from "$R2" main i_base; printf 'x\n' | put "$R2" loose/x.md.tmpl; printf '[pack]\nname = "s"\nschema = 2\n' | put "$R2" sub/pack.toml; printf 'fine\n' | put "$R2" sub/agents/a/prompt.template.md; IB2="$(commit_all "$R2" base-sub)"
+branch_from "$R2" "$IB2" i_tip; printf 'y\n' | put "$R2" loose/x.md.tmpl; printf 'BADTEMPLATE\n' | put "$R2" sub/agents/a/prompt.template.md; IT2="$(commit_all "$R2" tip-broken)"
+run_sut 2b "$R2" "$IB2" "$IT2" ga-x PATH="$FB";            expect "the broken pack linted green on the base, beside a loose template the base could not lint: refused" fail parse-vermelho-no-tip-e-verde-na-base
+branch_from "$R2" "$IB2" i_tip2; printf 'z\n' | put "$R2" sub/agents/a/prompt.template.md; printf '[pack]\nname = "n"\nschema = 2\n' | put "$R2" np/pack.toml; printf 'BADTEMPLATE\n' | put "$R2" np/agents/a/prompt.template.md; IT3="$(commit_all "$R2" tip-newpack)"
+run_sut 2b "$R2" "$IB2" "$IT3" ga-x PATH="$FB";            expect "a pack linted green on the base is no proof for a NEW pack the base never had" nao-consegui-medir lint-nao-rodou-na-base
 # Stand-in parse guard: STUB_GUARD_MODE picks the lie, anything else delegates to the real guard (REAL_GUARD).
 C4="$WORK/city4"; mkcity "$C4" template-fragment-lint-guard.sh || { echo "FATAL: cannot build city4"; exit 1; }
 cat > "$C4/packs/town-deltas/assets/template-fragment-lint-guard.sh" <<'STUBG'
