@@ -2,16 +2,12 @@
 # hq-mutate.selftest.sh (ga-2hd02v.5.6.2) — o motor de mutantes do lastro: acha os testes fracos sem tocar no que não é dele, e sem jaula provada nada roda.
 #
 # ## Contents
-#   Hermético · Casos · Mutantes do motor · Ambiente (97)
+#   Hermético · Casos · Ambiente (97)
 #
-# HERMÉTICO: tudo numa pasta descartável (árvore falsa, --work, estado) e uma JAULA FALSA que só registra cada execução e deixa passar (assim o que o motor decide é testado em qualquer sistema); git
-#   preso à pasta (GIT_CEILING_DIRECTORIES). Cada caso é uma IMPRESSÃO DIGITAL (rc, veredito, contagens, execuções na jaula): o caso vale se a impressão é a esperada e o mutante do motor vale se muda.
-# CASOS: operadores (gen) de shell e python: nada dentro de aspas, comentário ou heredoc; ids únicos e estáveis; arquivo ilegível = rc 3 (nunca zero candidatos) · alvos (plan): sujeito achado pelo nome aparado
-#   E citado pelo selftest, família, pastas, exclusões, denylist, ordem (recente, sem mutante embutido, menos recente), cobertura, retry_after, hash · varredura: mortos e sobreviventes confirmados, o
-#   original intacto, HOME/TMPDIR no slot, slots limpos, cota (--cap), sem-novidade, flaky, baseline vermelha/ambiente, estado ilegível (rc 3, intacto), jaula não provada (rc 97, nada roda), TERM.
-# MUTANTES DO MOTOR (cada âncora casa EXATAMENTE 1 vez, senão o caso é INVÁLIDO e reprova, ga-31xxl5): tirar a re-execução do sobrevivente, ignorar a prova da jaula, a baseline, o estado corrompido, a
-#   denylist, a ordem, a cota, o hash, a cobertura, o aviso do sobrevivente, escrever no original, rodar fora da jaula, HOME real, família pela metade, TERM, os três mascaramentos do scanner.
-# AMBIENTE: com a JAULA REAL (Linux com Landlock, o nó) roda também o caso de contenção (um mutante que escreve fora do --work não deixa rastro); sem ela imprime AMBIENTE e sai 97.
+# HERMÉTICO: pasta descartável e uma JAULA FALSA que só registra cada execução e deixa passar (o que o motor decide vale em qualquer sistema). Cada caso é uma IMPRESSÃO DIGITAL (rc, veredito, contagens, execuções na jaula):
+#   vale se for a esperada, e o MUTANTE do motor vale se ela mudar (âncora que não casa exatamente 1 vez = INVÁLIDO, ga-31xxl5). Nenhum caminho do host entra no texto de selftest que a denylist lê.
+# CASOS: gen (operadores, scanner de shell, arquivo perdido = rc 3) · plan · sweep (mortos, sobreviventes, original intacto, --cap, sem-novidade, sem-cobertura, flaky, baseline, estado ruim, bash -n mudo, 97, TERM).
+# AMBIENTE: com a JAULA REAL (Linux com Landlock, o nó) roda também o caso de contenção; sem ela imprime AMBIENTE e sai 97.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HM="$HERE/hq-mutate.py"
@@ -65,6 +61,8 @@ if home == rw or home.startswith(rw + "/"):
     sys.exit(64)
 kv = dict(x.split("=", 1) for x in cmd[1:] if "=" in x.split("/")[0]) if cmd[0] == "env" else {}
 log("run", a[i - 1], kv.get("HOME", ""), kv.get("TMPDIR", ""))
+if cmd[0] == "env":   # o env -i do motor limpa o ambiente: o que um caso quer que o selftest veja entra aqui (o texto dele não leva caminho do host)
+    cmd[2:2] = ["%s=%s" % (k, os.environ[k]) for k in ("FAKE_N", "FAKE_ORIG", "FAKE_B", "FAKE_M") if k in os.environ]
 if "timeout" in cmd and not shutil.which("timeout"):
     j = cmd.index("timeout")
     cmd = cmd[:j] + cmd[j + 4:]
@@ -105,6 +103,9 @@ cat <<'EOT'
 [ "$a" -eq 3 ] && exit 1
 EOT
 echo end
+echo $(( 1 << n )) && cat <<< foo && echo $'it\'s -eq 3'
+(( n = x << y )) || echo no && z="$(echo "$q" | tr -d '"') -eq 3"
+echo \" \' && echo done
 EOF
 cat > "$W/op.py" << 'EOF'
 def f(a, b):
@@ -116,7 +117,12 @@ def f(a, b):
 EOF
 printf 'true && true && true\n' > "$W/dup.sh"
 genl() { hm gen "$1" | cut -f2-5 | LC_ALL=C sort | tr ' \t' '_|'; }
-EXP_SH='3|eq-ne|-eq|-ne
+EXP_SH='13|and-or|&&|||
+13|and-or|&&|||
+14|and-or|&&|||
+14|and-or||||&&
+15|and-or|&&|||
+3|eq-ne|-eq|-ne
 3|neg-if||!_
 3|num+1|3|4
 4|and-or|&&|||
@@ -156,24 +162,29 @@ peq "gen: operadores de shell e de python, nada em aspas/comentário/heredoc, id
 eq "gen: os mesmos ids nas duas rodadas" "$(hm gen "$W/op.sh" | cut -f1 | cksum)" "$(hm gen "$W/op.sh" | cut -f1 | cksum)"
 printf 'x = """sem fim\n' > "$W/ruim.py"
 hm gen "$W/ruim.py" > /dev/null 2>&1;            eq "gen: python que não tokeniza = rc 3, não zero candidatos" 3 $?
+printf 'echo $[ 1 << y ]\n' > "$W/lo.sh"
+hm gen "$W/lo.sh" > /dev/null 2>&1;              eq "gen: shell que acaba com heredoc aberto (scanner perdido; o bash aceita) = rc 3, não a lista incompleta" 3 $?
 hm gen "$W/nao-existe.sh" > /dev/null 2>&1;      eq "gen: arquivo que não abre = rc 3" 3 $?
 hm bobagem > /dev/null 2>&1;                     eq "subcomando desconhecido = rc 2" 2 $?
 hm sweep > /dev/null 2>&1;                       eq "sweep sem argumentos = rc 2" 2 $?
 fp_valid() {
   python3 -I - "${ENG:-$HM}" << 'PY'
-import importlib.util, sys
+import importlib.util, os, sys, tempfile
 from pathlib import Path
 sp = importlib.util.spec_from_file_location("hqm", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
 a, b, c, d = m.valid(Path("a.sh"), "if x; then"), m.valid(Path("a.sh"), "echo ok"), m.valid(Path("a.py"), "x = ="), m.valid(Path("a.py"), "x = 1")
-import os; os.environ["PATH"] = "/nao/existe"
-try:
-    e = m.valid(Path("a.sh"), "echo ok")
-except Exception as x:
-    e = "estourou:" + type(x).__name__
-print(a, b, c, d, e)
+def sem(path):   # PATH sem bash (OSError) ou com um bash que sai 5 (nem 0 nem 1/2)
+    os.environ["PATH"] = path
+    try:
+        return m.valid(Path("a.sh"), "echo ok")
+    except Exception as x:
+        return "estourou:" + type(x).__name__
+f = tempfile.mkdtemp(); open(f + "/bash", "w").write("#!/bin/sh\nexit 5\n"); os.chmod(f + "/bash", 0o755)
+print(a, b, c, d, sem("/nao/existe"), sem(f))
 PY
 }
-peq "valid: mutante que não compila é recusado (bash -n, compile); sem bash não se sabe, então não roda" "False True False True False" fp_valid
+EXP_VALID="False True False True None None"
+peq "valid: mutante que não compila é recusado (bash -n, compile); sem bash, ou bash que sai com outro rc, NÃO se sabe: None, nunca False" "$EXP_VALID" fp_valid
 fp_fit() {  # a linha de resumo cabe no limite do puxador (6000): os sobreviventes que não cabem saem e a linha diz quantos
   python3 -I - "${ENG:-$HM}" << 'PY'
 import contextlib, importlib.util, io, json, sys
@@ -181,13 +192,14 @@ sp = importlib.util.spec_from_file_location("hqm", sys.argv[1]); m = importlib.u
 def run(w):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        m.summary("parcial", killed=3, survivors=[{"id": "x" * 40, "file": "f" * w, "n": i} for i in range(15)])
+        m.summary("parcial", killed=3, survivors=[{"id": "x" * 40, "file": "f" * w, "n": i} for i in range(20)])
     l = buf.getvalue().rstrip("\n"); d = json.loads(l)
     return len(l) <= 6000, len(d["survivors"]), d.get("survivors_cortados", 0)
 print(run(20), run(600))
 PY
 }
-peq "summary: a linha de resumo cabe em 6000; o que não cabe sai e é contado" "(True, 15, 0) (True, 8, 7)" fp_fit
+EXP_FIT="(True, 15, 5) (True, 8, 12)"
+peq "summary: no máximo 15 sobreviventes e a linha cabe em 6000; o que não cabe sai e é contado" "$EXP_FIT" fp_fit
 # ── varredura: impressões digitais ────────────────────────────────────────────────────────────
 fp_sweep() {
   newfx; mkfoo; local o; o=$(cks "$TREE/scripts/foo.sh"); sw
@@ -198,32 +210,28 @@ EXP_SWEEP="rc=0 completo run=6 k=2 c=4 f=0 inv=0 open=4 surv=cmp-lim,exit-rc,exi
 fp_again() { newfx; mkfoo; sw; local j; j=$(runs); sw; echo "$(jf 'd["result"]') run=$(jf 'd["mutants_run"]') novas=$(( $(runs) - j ))"; }
 fp_cap() {
   newfx; mkfoo; local o="" i
-  for i in 1 2 3 4; do sw --cap 2; o="$o $(jf 'd["result"]'):$(jf 'd["mutants_run"]')"; done
+  for i in 1 2 3 4; do sw --cap 2; o="$o $(jf 'd["result"]'):$(jf 'd["mutants_run"]'):$(jf 'd["restam"]')"; done
   echo "$o verdicts=$(python3 -I -c 'import json,sys; print(sum(len(t["verdicts"]) for t in json.load(open(sys.argv[1]))["targets"].values()))' "$F/state.json")"
 }
 fp_jail() { newfx; mkfoo; FAKE_JAIL=inerte sw; echo "rc=$RC $(jf 'd["result"]') jail=$(runs) state=$([ -e "$F/state.json" ] && echo existe || echo nao)"; }
 fp_base() {  # fp_base RC: o selftest do foo sai com RC mesmo sem mutante
   newfx; mkfoo; mkst foo ": foo.sh; exit $1"; sw
-  echo "rc=$RC run=$(jf 'd["mutants_run"]') jail=$(runs) skipped=$(jf '",".join("%s=%d" % kv for kv in sorted(d["skipped"].items()))') plan=$(hm plan --tree "$TREE" --state "$F/state.json" | cut -f1)"
+  echo "rc=$RC res=$(jf 'd["result"]') run=$(jf 'd["mutants_run"]') jail=$(runs) skipped=$(jf '",".join("%s=%d" % kv for kv in sorted(d["skipped"].items()))') plan=$(hm plan --tree "$TREE" --state "$F/state.json" | cut -f1)"
 }
 fp_state() {  # fp_state CONTEÚDO: estado que não lê = rc 3, o arquivo intacto, nada rodou
   newfx; mkfoo; printf '%s' "$1" > "$F/state.json"; local b; b=$(cks "$F/state.json"); sw
   echo "rc=$RC $(jf 'd["result"]') kept=$([ "$(cks "$F/state.json")" = "$b" ] && echo sim || echo NAO) jail=$(runs)"
 }
-fp_flaky() {  # passa na baseline e na 1ª rodada do mutante, reprova na re-execução: flaky, não sobrevivente
-  newfx; printf '#!/bin/bash\nexit 7\n' > "$TREE/scripts/fl.sh"; : > "$F/n"
-  mkst fl "echo x >> '$F/n'; [ \"\$(wc -l < '$F/n' | tr -d ' ')\" = 3 ] && exit 1
-bash \"\$H/fl.sh\""; sw
+fp_flaky() {  # passa na baseline e na 1ª rodada do mutante, reprova na re-execução: flaky, não sobrevivente (o contador vive no FAKE_N)
+  newfx; printf '#!/bin/bash\nexit 7\n' > "$TREE/scripts/fl.sh"; export FAKE_N="$F/n"; : > "$FAKE_N"
+  mkst fl 'echo x >> "$FAKE_N"; [ "$(wc -l < "$FAKE_N" | tr -d " ")" = 3 ] && exit 1
+bash "$H/fl.sh"'; sw
   echo "$(cnt) jail=$(runs)"
 }
 fp_family() {  # o 1º selftest da família (beta-ext) é fraco; o 2º (beta) mata mais um: os dois têm de rodar
   newfx; printf '%s\n' "$FOO" > "$TREE/scripts/beta.sh"
   mkst beta-ext '[ "$(bash "$H/beta.sh" 9)" = big ] || exit 1'; mkst beta 'bash "$H/beta.sh" 9 > /dev/null || exit 1'; sw
   echo "$(cnt)"
-}
-fp_deny() {
-  newfx; mkfoo; printf 'echo d\n' > "$TREE/scripts/delta.sh"; mkst delta 'bash "$H/delta.sh"; : sudo'; sw
-  echo "$(cnt) skipped=$(jf '",".join("%s=%d" % kv for kv in sorted(d["skipped"].items()))') plan=$(hm plan --tree "$TREE" --state "$F/state.json" | cut -f1,2 | tr '\t\n' '@ ')"
 }
 fp_shim() {  # fp_shim GC:BD (shim|real): o que o plan diz do alvo cujo texto cita gc e bd; shim = symlink para o remote-shim (o nó Hetzner), real = programa de verdade
   newfx; mkfoo; printf 'echo g\n' > "$TREE/scripts/gx.sh"; mkst gx 'bash "$H/gx.sh"; : gc bd'
@@ -238,6 +246,7 @@ fp_deny2() {  # fp_deny2 TEXTO: o que o plan diz do alvo cujo selftest cita TEXT
   newfx; mkfoo; printf 'echo g\n' > "$TREE/scripts/gx.sh"; mkst gx "bash \"\$H/gx.sh\"; : $1"
   hm plan --tree "$TREE" --state "$F/state.json" | awk -F'\t' '$2 == "scripts/gx.sh" {print $1}'
 }
+fp_shims() { echo "$(fp_shim shim:shim) $(fp_shim real:shim) $(fp_shim shim:real)"; }
 fp_env() {  # o ambiente do motor (HQM_SECRET: SSH_AUTH_SOCK, tokens, REMOTE_SHIM_CONF…) NÃO chega ao mutante; o PATH chega
   newfx; mkfoo; mkst foo '[ -z "${HQM_SECRET:-}" ] || exit 1
 [ -n "${PATH:-}" ] || exit 1
@@ -245,45 +254,68 @@ fp_env() {  # o ambiente do motor (HQM_SECRET: SSH_AUTH_SOCK, tokens, REMOTE_SHI
 [ "$(bash "$H/foo.sh" 1)" = small ] || exit 1'
   HQM_SECRET=vazou sw; echo "$(cnt) skipped=$(jf '",".join("%s=%d" % kv for kv in sorted(d["skipped"].items()))')"
 }
-fp_ilegivel() { newfx; printf 'x = """sem fim\n' > "$TREE/scripts/ruim.py"; mkst ruim 'python3 "$H/ruim.py" 2> /dev/null; true'; sw; echo "rc=$RC run=$(jf 'd["mutants_run"]') skipped=$(jf '",".join("%s=%d" % kv for kv in sorted(d["skipped"].items()))')"; }
+fp_ilegivel() {  # python que não tokeniza = ilegivel; shell em que o scanner se perde (`$[ 1 << y ]`, aritmética velha que o bash aceita) = scan-perdido; nenhum dos dois conta como coberto
+  newfx; printf 'x = """sem fim\n' > "$TREE/scripts/ruim.py"; mkst ruim 'python3 "$H/ruim.py" 2> /dev/null; true'
+  printf 'echo $[ 1 << y ]\n' > "$TREE/scripts/lo.sh"; mkst lo 'bash "$H/lo.sh"'; sw
+  echo "rc=$RC $(jf 'd["result"]') run=$(jf 'd["mutants_run"]') skipped=$(jf '",".join("%s=%d" % kv for kv in sorted(d["skipped"].items()))') perdidos=$(jf 'len(d["perdidos"])') plan=$(hm plan --tree "$TREE" --state "$F/state.json" | cut -f1 | sort | paste -sd' ' -)"
+}
 fp_hash() { newfx; mkfoo; sw; printf '# mudou\n' >> "$TREE/scripts/foo.sh"; hm plan --tree "$TREE" --state "$F/state.json" | cut -f1,2 | tr '\t' '@'; }
-fp_term() {
-  newfx; printf '#!/bin/bash\nexit 7\n' > "$TREE/scripts/slow.sh"; mkst slow 'sleep 30; bash "$H/slow.sh"'
-  python3 -I "${ENG:-$HM}" sweep --tree "$TREE" --state "$F/state.json" --work "$F/work" --jail "$W/fakejail.py" --slots 2 > "$F/out" 2> "$F/err" & local pid=$! i=0
-  while [ "$(runs)" -lt 1 ] && [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done
+fp_term() {  # fp_term b|m: TERM com a baseline (b) ou com 2 mutantes (m) em voo; o kill não vira veredito e a retomada acha os mesmos sobreviventes do controle
+  newfx; mkfoo; cp "$TREE/scripts/foo.sh" "$F/foo.orig"; local n=1 B=30 M=0 pid i=0 a; [ "$1" = m ] && { n=3; B=0; M=30; }
+  export FAKE_ORIG="$F/foo.orig" FAKE_B=$B FAKE_M=$M
+  mkst foo 'cmp -s "$H/foo.sh" "$FAKE_ORIG" && sleep "$FAKE_B" || sleep "$FAKE_M"
+[ "$(bash "$H/foo.sh" 9)" = big ] || exit 1
+[ "$(bash "$H/foo.sh" 1)" = small ] || exit 1'
+  python3 -I "${ENG:-$HM}" sweep --tree "$TREE" --state "$F/state.json" --work "$F/work" --jail "$W/fakejail.py" --slots 2 > "$F/out" 2> "$F/err" & pid=$!
+  while [ "$(runs)" -lt "$n" ] && [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done
   kill -TERM "$pid" 2> /dev/null; ( sleep 20; kill -9 "$pid" 2> /dev/null ) & local wd=$!
   wait "$pid"; RC=$?; kill "$wd" 2> /dev/null; wait "$wd" 2> /dev/null
-  echo "rc=$RC $(jf 'd["result"]')"
+  a="rc=$RC $(jf 'd["result"]') v=$(python3 -I -c 'import json,os,sys; print(sum(len(t["verdicts"]) for t in json.load(open(sys.argv[1]))["targets"].values()) if os.path.exists(sys.argv[1]) else 0)' "$F/state.json")"
+  export FAKE_B=0 FAKE_M=0; sw
+  echo "$a | $(cnt) surv=$(jf '",".join(sorted(s["op"] for s in d["survivors"]))')"
 }
-fp_sem_alvos() {
+fp_sem_alvos() {  # sem alvo = rc 3; só alvo pulado (denylist) = rc 0 mas sem-cobertura, nunca sem-novidade
   newfx; mkst so 'true'; sw; local a="rc=$RC $(jf 'd["result"]')"
-  mkdir -p "$F/v/hq"; hm sweep --tree "$F/v/hq" --state "$F/s2.json" --work "$F/work" --jail "$W/fakejail.py" > "$F/out" 2> /dev/null; echo "$a rc=$? $(jf 'd["result"]')"
+  mkdir -p "$F/v/hq"; hm sweep --tree "$F/v/hq" --state "$F/s2.json" --work "$F/work" --jail "$W/fakejail.py" > "$F/out" 2> /dev/null; a="$a rc=$? $(jf 'd["result"]')"
+  mkfoo; mkst foo 'bash "$H/foo.sh"; : sudo'; sw; echo "$a rc=$RC $(jf 'd["result"]') skipped=$(jf '",".join("%s=%d" % kv for kv in sorted(d["skipped"].items()))')"
 }
 peq "sweep: mortos, sobreviventes confirmados, original intacto, HOME/TMPDIR no slot, slots limpos" "$EXP_SWEEP" fp_sweep
+fp_semvalid() {  # bash -n que sai com rc estranho: nenhum veredito (nem "i"), nao_sei, e a varredura seguinte tenta de novo
+  newfx; mkfoo; mkdir "$F/bin"; printf '#!/bin/sh\n[ "$1" = -n ] && exit 5\nexec /bin/bash "$@"\n' > "$F/bin/bash"; chmod +x "$F/bin/bash"
+  PATH="$F/bin:$PATH" sw; local a="rc=$RC $(jf 'd["result"]') run=$(jf 'd["mutants_run"]') nao_sei=$(jf 'd["nao_sei"]') inv=$(jf 'd["invalid"]') restam=$(jf 'd["restam"]')"
+  sw; echo "$a | $(cnt)"
+}
+fp_gentree() {  # os ids do `gen --tree` são os que o sweep grava (os 4 sobreviventes estão entre eles); sem --tree o nome entra no lugar do caminho
+  newfx; mkfoo; sw; hm gen --tree "$TREE" "$TREE/scripts/foo.sh" | cut -f1 | sort > "$F/g"; jf '"\n".join(sorted(x["id"] for x in d["survivors"]))' | sort | comm -12 - "$F/g" | wc -l | tr -d ' '
+}
 peq "sweep de novo, mesmo conteúdo: sem-novidade e nada roda (varrer o mesmo é queima disfarçada)" "sem-novidade run=0 novas=0" fp_again
-peq "--cap 2: pega os próximos ainda não vistos até cobrir os 6, depois sem-novidade" " completo:2 completo:2 completo:2 sem-novidade:0 verdicts=6" fp_cap
+EXP_CAP=" completo:2:4 completo:2:2 completo:2:0 sem-novidade:0:0 verdicts=6"
+peq "--cap 2: pega os próximos ainda não vistos até cobrir os 6 (restam diz quantos faltam), depois sem-novidade" "$EXP_CAP" fp_cap
+EXP_SV="rc=0 sem-cobertura run=0 nao_sei=1 inv=0 restam=6 | rc=0 completo run=6 k=2 c=4 f=0 inv=0 open=4"
+peq "bash -n sem resposta (rc 5): nada roda, nenhum veredito, nao_sei; a varredura seguinte roda os 6" "$EXP_SV" fp_semvalid
+peq "gen --tree imprime os ids que o sweep grava" 4 fp_gentree
 peq "jaula não provada: rc 97, nenhuma execução, nenhum estado" "rc=97 sem-jaula jail=0 state=nao" fp_jail
-peq "baseline vermelha pula o alvo (1 execução, nenhum mutante), e o plan diz por quê" "rc=0 run=0 jail=1 skipped=base-vermelha=1 plan=base-vermelha" fp_base 1
-peq "baseline 97 pula como base-ambiente" "rc=0 run=0 jail=1 skipped=base-ambiente=1 plan=base-ambiente" fp_base 97
-for s in 'lixo{' '' '{"v":99,"targets":{}}' '[]' '{"v":1}'; do
+EXP_B1="rc=0 res=sem-cobertura run=0 jail=1 skipped=base-vermelha=1 plan=base-vermelha"
+peq "baseline vermelha pula o alvo (1 execução, nenhum mutante), o plan diz por quê e o result é sem-cobertura" "$EXP_B1" fp_base 1
+EXP_B97="rc=0 res=sem-cobertura run=0 jail=1 skipped=base-ambiente=1 plan=base-ambiente"
+peq "baseline 97 pula como base-ambiente" "$EXP_B97" fp_base 97
+for s in 'lixo{' '' '{"v":99,"targets":{}}' '[]' '{"v":1}' '{"v":1,"targets":{"scripts/foo.sh":[]}}' '{"v":1,"targets":{"scripts/foo.sh":{"verdicts":[]}}}'; do
   peq "estado ilegível ($s): rc 3, intacto, nada roda" "rc=3 estado-ilegivel kept=sim jail=0" fp_state "$s"
 done
 peq "re-execução que reprova = flaky, nunca sobrevivente" "rc=0 completo run=1 k=0 c=0 f=1 inv=0 open=0 jail=3" fp_flaky
 peq "a família inteira roda a cada mutante (o 2º selftest mata mais um)" "rc=0 completo run=6 k=3 c=3 f=0 inv=0 open=3" fp_family
-EXP_DENYPLAN="denylist:sudo@scripts/delta.sh sem-novidade@scripts/foo.sh "
-peq "denylist (sudo no texto) pula o alvo; o outro roda" "rc=0 completo run=6 k=2 c=4 f=0 inv=0 open=4 skipped=denylist=1 plan=$EXP_DENYPLAN" fp_deny
-peq "gc e bd que são symlinks para o remote-shim (o nó Hetzner) NÃO são denylist: o alvo roda" "todo" fp_shim shim:shim
-peq "gc de verdade é denylist" "denylist:gc" fp_shim real:shim
-peq "bd de verdade é denylist mesmo com o gc sendo o shim (decide por programa, não por tudo ou nada)" "denylist:bd" fp_shim shim:real
-peq "denylist: kill com sinal e -1 (qualquer ordem) mata o mundo todo" "denylist:kill -s KILL -1" fp_deny2 'kill -s KILL -1'
-peq "denylist: tmux (fala com o servidor do tmux por socket unix)" "denylist:tmux" fp_deny2 'tmux send-keys x'
-peq "denylist: --unix-socket" "denylist:--unix-socket" fp_deny2 'curl --unix-socket /x http://a'
-peq "denylist: kill de um pid só NÃO é denylist (nada de largo demais)" "todo" fp_deny2 'kill -9 "$pid"'
+fp_denys() { local t o=""; for t in 'sudo true' 'kill -s KILL -1' 'tmux send-keys x' 'curl --unix-socket /x http://a' 'kill -9 "$pid"'; do o="$o|$(fp_deny2 "$t")"; done; echo "$o"; }
+peq "denylist: sudo, kill com sinal e -1, tmux e --unix-socket pulam o alvo; kill de um pid só NÃO (nada de largo demais)" "|denylist:sudo|denylist:kill -s KILL -1|denylist:tmux|denylist:--unix-socket|todo" fp_denys
+peq "gc e bd symlinks para o remote-shim (o nó Hetzner) NÃO são denylist; gc ou bd de verdade são (decide por programa)" "todo denylist:gc denylist:bd" fp_shims
 peq "o ambiente do motor não chega ao mutante (env -i), o PATH chega" "rc=0 completo run=6 k=2 c=4 f=0 inv=0 open=4 skipped=" fp_env
-peq "sujeito que não tokeniza é ilegivel, não zero candidatos nem queda" "rc=0 run=0 skipped=ilegivel=1" fp_ilegivel
+EXP_ILEG="rc=0 sem-cobertura run=0 skipped=ilegivel=1,scan-perdido=1 perdidos=1 plan=ilegivel scan-perdido"
+peq "sujeito que não tokeniza é ilegivel e shell perdido é scan-perdido (a razão em perdidos): nem zero candidatos, nem queda, nem coberto" "$EXP_ILEG" fp_ilegivel
 peq "conteúdo mudado: o alvo volta a ser todo" "todo@scripts/foo.sh" fp_hash
-peq "TERM: interrompido, rc 143" "rc=143 interrompido" fp_term
-peq "sem alvos (selftest sem sujeito; árvore sem scripts/) = rc 3, nunca sem-novidade" "rc=3 sem-alvos rc=3 sem-alvos" fp_sem_alvos
+EXP_TERM="rc=143 interrompido v=0 | rc=0 completo run=6 k=2 c=4 f=0 inv=0 open=4 surv=cmp-lim,exit-rc,exit-rc,num+1"
+peq "TERM com a baseline em voo: rc 143, nada gravado, a retomada varre tudo" "$EXP_TERM" fp_term b
+peq "TERM com mutantes em voo: rc 143, NENHUM veredito do kill (rc -9 não é teste), a retomada acha os mesmos sobreviventes" "$EXP_TERM" fp_term m
+EXP_SA="rc=3 sem-alvos rc=3 sem-alvos rc=0 sem-cobertura skipped=denylist=1"
+peq "sem alvos (selftest sem sujeito; árvore sem scripts/) = rc 3; só alvo na denylist = sem-cobertura, nunca sem-novidade" "$EXP_SA" fp_sem_alvos
 newfx; mkfoo; mkdir "$F/root/w"; hm sweep --tree "$TREE" --state "$F/s.json" --work "$F/root/w" --jail "$W/fakejail.py" > /dev/null 2>&1; eq "--work dentro da árvore copiada = rc 2" 2 $?
 newfx; mkfoo; printf 'lixo' > "$F/s.json"; hm plan --tree "$TREE" --state "$F/s.json" > /dev/null 2>&1; eq "plan com estado ilegível = rc 3" 3 $?
 
@@ -326,63 +358,56 @@ open(dst, "w", encoding="utf-8").write(t.replace(old, new))
 PY
 }
 # kill NOME FUNÇÃO ESPERADO ANTIGO NOVO [ARG]: o motor mutante tem de dar uma impressão diferente da esperada
-kill_it() { mut "$1" "$4" "$5" && ne "mutante $1 ($2)" "$3" "$(ENG="$MP" "$2" ${6+"$6"})"; }
-par kill_it sem-reconfirma       fp_flaky   "rc=0 completo run=1 k=0 c=0 f=1 inv=0 open=0 jail=3" '    return "s" if run_slot(ctx, tgt, mutated, tgt["tmo"])[0] == 0 else "f"' '    return "s"'
+kill_it() { mut "$1" "$4" "$5" && ne "mutante $1 ($2)" "$3" "$(ENG="$MP" "$2" ${6+"$6"} 2> /dev/null)"; }
+par kill_it sem-reconfirma       fp_flaky   "rc=0 completo run=1 k=0 c=0 f=1 inv=0 open=0 jail=3" '    return None if r2 is None else "s" if r2[0] == 0 else "f"' '    return None if r2 is None else "s"'
 par kill_it prova-ignorada       fp_jail    "rc=97 sem-jaula jail=0 state=nao" '    if proof is None:' '    if False:'
-par kill_it baseline-ignorada    fp_base    "rc=0 run=0 jail=1 skipped=base-vermelha=1 plan=base-vermelha" '            if rc != 0:
-                reason = ' '            if False:
-                reason = ' 1
-par kill_it ambiente-e-vermelha  fp_base    "rc=0 run=0 jail=1 skipped=base-ambiente=1 plan=base-ambiente" '"base-ambiente" if rc == 97 else' '"base-ambiente" if False else' 97
-par kill_it denylist-off         fp_deny    "rc=0 completo run=6 k=2 c=4 f=0 inv=0 open=4 skipped=denylist=1 plan=$EXP_DENYPLAN" '        if deny:' '        if False:'
-par kill_it shim-ignorado         fp_shim    "todo" 'not in SHIMS]' 'not in ()]' shim:shim
-par kill_it shim-invertido       fp_shim    "denylist:gc" 'not in SHIMS]' 'in SHIMS]' real:shim
-par kill_it shim-sem-realpath    fp_shim    "todo" 'os.path.realpath(shutil.which(b))' 'shutil.which(b)' shim:shim
-par kill_it resumo-sem-corte     fp_fit     "(True, 15, 0) (True, 8, 7)" '    while len(line) > MAX_LINE and' '    while False and'
-par kill_it corte-sem-conta      fp_fit     "(True, 15, 0) (True, 8, 7)" 'kw.get("survivors_cortados", 0) + 1' 'kw.get("survivors_cortados", 0)'
-par kill_it valid-sem-bash       fp_valid   "False True False True False" '    except (OSError, subprocess.TimeoutExpired):
-        return False' '    except ZeroDivisionError:
-        return False'
+par kill_it baseline-ignorada    fp_base    "$EXP_B1" '            if rc != 0:' '            if False:' 1
+par kill_it ambiente-e-vermelha  fp_base    "$EXP_B97" '"base-ambiente" if rc == 97 else' '"base-ambiente" if False else' 97
+par kill_it sem-cobertura-falsa  fp_base    "$EXP_B1" '"sem-cobertura" if not n["run"] and' '"sem-cobertura" if False and' 1
+par kill_it denylist-off         fp_denys   "|denylist:sudo|denylist:kill -s KILL -1|denylist:tmux|denylist:--unix-socket|todo" '        if deny:' '        if False:'
+par kill_it kill-largo-demais    fp_denys   "|denylist:sudo|denylist:kill -s KILL -1|denylist:tmux|denylist:--unix-socket|todo" '|\bkill\b[^\n]*\s-1\b|' '|\bkill\b|'
+par kill_it tmux-fora            fp_denys   "|denylist:sudo|denylist:kill -s KILL -1|denylist:tmux|denylist:--unix-socket|todo" '|tmux|' '|'
+par kill_it shim-invertido       fp_shims   "todo denylist:gc denylist:bd" 'not in SHIMS]' 'in SHIMS]'
+par kill_it shim-sem-realpath    fp_shims   "todo denylist:gc denylist:bd" 'os.path.realpath(shutil.which(b))' 'shutil.which(b)'
+par kill_it resumo-sem-corte     fp_fit     "$EXP_FIT" '    while len(line) > MAX_LINE and' '    while False and'
+par kill_it corte-sem-conta      fp_fit     "$EXP_FIT" '        kw["survivors_cortados"] += 1' '        pass'
+par kill_it cortados-sem-15      fp_fit     "$EXP_FIT" 'max(0, len(kw["survivors"]) - 15)' '0'
+par kill_it valid-sem-bash       fp_valid   "$EXP_VALID" $'    except (OSError, subprocess.TimeoutExpired):\n        return None\n    return True' $'    except ZeroDivisionError:\n        return None\n    return True'
+par kill_it valid-rc-qualquer    fp_valid   "$EXP_VALID" 'return True if rc == 0 else False if rc in (1, 2) else None' 'return rc == 0'
+par kill_it valid-py-sempre      fp_valid   "$EXP_VALID" $'            compile(text, str(path), "exec")\n            return True' '            return True'
+par kill_it nao-sei-vira-i       fp_semvalid "$EXP_SV" '                elif ok is None:' '                elif False:'
 par kill_it env-herdado          fp_env     "rc=0 completo run=6 k=2 c=4 f=0 inv=0 open=4 skipped=" '"env", "-i", *kv, "timeout", "-k"' '"env", *kv, "timeout", "-k"'
-par kill_it kill-so-o-9          fp_deny2   "denylist:kill -s KILL -1" '|\bkill\b[^\n]*\s-1\b|' '|kill -(?:9|KILL) -1|' 'kill -s KILL -1'
-par kill_it kill-largo-demais    fp_deny2   "todo" '|\bkill\b[^\n]*\s-1\b|' '|\bkill\b|' 'kill -9 "$pid"'
-par kill_it tmux-fora            fp_deny2   "denylist:tmux" '|tmux|' '|' 'tmux send-keys x'
-par kill_it sobrevivente-calado fp_sweep   "$EXP_SWEEP" '                    new_surv.append(rec)' '                    pass'
+par kill_it sobrevivente-calado  fp_sweep   "$EXP_SWEEP" '                    new_surv.append(rec)' '                    pass'
 par kill_it jaula-nao-usada      fp_sweep   "$EXP_SWEEP" '[sys.executable, "-I", ctx.a.jail, "--rw", str(slot), "--", "env", "-i", *kv, "timeout",' '["env", "-i", *kv, "timeout",'
 par kill_it escreve-no-original  fp_sweep   "$EXP_SWEEP" '(cd / tgt["rel"]).write_text(text, encoding="utf-8")' '(ctx.tree / tgt["rel"]).write_text(text, encoding="utf-8")'
-par kill_it home-na-jaula    fp_sweep   "$EXP_SWEEP" 'p = subprocess.Popen(cmd, cwd=cd, stdin=' 'p = subprocess.Popen(cmd, cwd=cd, env=dict(os.environ, HOME=str(slot / "home")), stdin='
+par kill_it home-na-jaula        fp_sweep   "$EXP_SWEEP" 'p = subprocess.Popen(cmd, cwd=cd, stdin=' 'p = subprocess.Popen(cmd, cwd=cd, env=dict(os.environ, HOME=str(slot / "home")), stdin='
 par kill_it home-real            fp_sweep   "$EXP_SWEEP" '+ ["HOME=%s" % (slot / "home"), ' '+ ['
-par kill_it sem-cobertura        fp_again   "sem-novidade run=0 novas=0" '        elif "total" in old and len(old.get("verdicts", {})) >= old["total"]:' '        elif False:'
-par kill_it cota-ignorada        fp_cap     " completo:2 completo:2 completo:2 sem-novidade:0 verdicts=6" '                if len(pick) >= a.cap:' '                if False:'
+par kill_it sem-novidade-falso   fp_again   "sem-novidade run=0 novas=0" 'elif "total" in old and len(old.get("verdicts", {})) >= old["total"]:' 'elif False:'
+par kill_it cota-ignorada        fp_cap     "$EXP_CAP" '                if len(pick) >= a.cap:' '                if False:'
 par kill_it hash-ignorado        fp_hash    "todo@scripts/foo.sh" '        old = old if old.get("hash") == h else {}' '        old = old'
-par kill_it familia-so-1         fp_family  "rc=0 completo run=6 k=3 c=3 f=0 inv=0 open=3" '    for st in tgt["family"]:
-        cmd =' '    for st in tgt["family"][:1]:
-        cmd ='
-par kill_it term-ignorado        fp_term    "rc=143 interrompido" '        ctx.stop.set()
-        for pid in list(ctx.pids):' '        for pid in list(ctx.pids):'
-par kill_it ilegivel-derruba     fp_ilegivel "rc=0 run=0 skipped=ilegivel=1" '            except (OSError, ValueError, SyntaxError, tokenize.TokenError):
-                skipped["ilegivel"]' '            except OSError:
-                skipped["ilegivel"]'
-par kill_it estado-zera          fp_state   "rc=3 estado-ilegivel kept=sim jail=0" '    except FileNotFoundError:
-        return {"v": VERSION, "targets": {}}' '    except (FileNotFoundError, ValueError):
-        return {"v": VERSION, "targets": {}}' 'lixo{'
+par kill_it familia-so-1         fp_family  "rc=0 completo run=6 k=3 c=3 f=0 inv=0 open=3" '    for st in tgt["family"]:' '    for st in tgt["family"][:1]:'
+par kill_it term-ignorado        fp_term    "$EXP_TERM" '        ctx.stop.set()' '        pass' m
+par kill_it kill-vira-veredito   fp_term    "$EXP_TERM" '        return None if ctx.stop.is_set() else r' '        return r' m
+par kill_it ilegivel-derruba     fp_ilegivel "$EXP_ILEG" '            except (OSError, ValueError, SyntaxError, tokenize.TokenError) as e:' '            except OSError as e:'
+par kill_it perdido-e-ilegivel   fp_ilegivel "$EXP_ILEG" '"scan-perdido" if isinstance(e, Lost) else "ilegivel"' '"ilegivel"'
+par kill_it perdido-calado       fp_ilegivel "$EXP_ILEG" '        raise Lost(' '        _ = ('
+par kill_it estado-zera         fp_state   "rc=3 estado-ilegivel kept=sim jail=0" '    except FileNotFoundError:' '    except (FileNotFoundError, ValueError):' 'lixo{'
+par kill_it forma-ignorada       fp_state   "rc=3 estado-ilegivel kept=sim jail=0" ' or not all(shaped(e) for e in d["targets"].values())' '' '{"v":1,"targets":{"scripts/foo.sh":[]}}'
 par kill_it ordem-invertida      fp_plan    "$EXP_PLAN" 'plan.sort(key=lambda t: (not t["recent"],' 'plan.sort(key=lambda t: (t["recent"],'
-par kill_it embutido-ignorado    fp_plan    "$EXP_PLAN" 't["embedded"], t["swept"], t["rel"]' 't["swept"], t["rel"]'
-par kill_it swept-ignorado       fp_plan    "$EXP_PLAN" 't["embedded"], t["swept"], t["rel"]' 't["embedded"], t["rel"]'
+par kill_it ordem-sem-embutido   fp_plan    "$EXP_PLAN" 't["embedded"], t["swept"], t["rel"]' 't["rel"]'
 par kill_it retry-ignorado       fp_plan    "$EXP_PLAN" '        elif old.get("skip") and now < old.get("retry_after", 0):' '        elif old.get("skip"):'
 par kill_it ocorrencia-ignorada  fp_gen     "$EXP_GEN" '"%s:%d" % (key, seen[key])' '"%s:%d" % (key, 1)'
-par kill_it aspas-sao-codigo     fp_gen     "$EXP_GEN" "            elif c == \"'\":
-                sq = True" "            elif c == \"'\":
-                pass"
+par kill_it aspas-sao-codigo     fp_gen     "$EXP_GEN" '                st.append(["ansi" if line[i - 1:i] == "$" else "sq", 0, n])' '                pass'
+par kill_it ansi-e-sq            fp_gen     "$EXP_GEN" '"ansi" if line[i - 1:i] == "$" else "sq"' '"sq"'
 par kill_it comentario-e-codigo  fp_gen     "$EXP_GEN" '            elif c == "#" and (' '            elif False and ('
-par kill_it heredoc-e-codigo     fp_gen     "$EXP_GEN" '                    here = (m.group(3), m.group(1) == "-")' '                    here = None'
-par kill_it valid-sh-sempre      fp_valid   "False True False True" 'timeout=30).returncode == 0' 'timeout=30).returncode >= 0'
-par kill_it valid-py-sempre      fp_valid   "False True False True" '            compile(text, str(path), "exec")
-            return True' '            return True'
+par kill_it heredoc-e-codigo     fp_gen     "$EXP_GEN" '                    here = (m.group(3), m.group(1) == "-", n)' '                    here = None'
+par kill_it here-string-e-heredoc fp_gen    "$EXP_GEN" ' and line[i - 1:i] != "<"' ''
+par kill_it aritmetica-e-heredoc fp_gen     "$EXP_GEN" ' and line[:i].count("((") <= line[:i].count("))")' ''
+par kill_it gen-sem-tree         fp_gentree 4 'Path(a.file).resolve().relative_to(Path(a.tree).resolve()).as_posix() if a.tree else Path(a.file).name' 'Path(a.file).name'
 reap
 # controle do controle: o `mut` recusa uma âncora ambígua e uma que não casa
 FAIL0=$FAIL   # o mut recusa e conta uma falha própria: aqui a recusa é o esperado, então só a aceitação reprova
-if mut ancora-ambigua 'import' 'import' > /dev/null 2>&1; then bad "mut aceitou âncora que casa várias vezes"; else FAIL=$FAIL0; ok; fi
-if mut ancora-ausente 'texto-que-nao-existe-no-motor' 'y' > /dev/null 2>&1; then bad "mut aceitou âncora que não casa"; else FAIL=$FAIL0; ok; fi
+for a in import texto-que-nao-existe-no-motor; do if mut ancora-ruim "$a" y > /dev/null 2>&1; then bad "mut aceitou âncora que não casa exatamente 1 vez: $a"; else FAIL=$FAIL0; ok; fi; done
 
 # ── jaula real (o nó): o mutante que escreve fora do --work não deixa rastro ───────────────────
 SKIP=0

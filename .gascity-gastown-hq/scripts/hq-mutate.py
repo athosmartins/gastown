@@ -6,20 +6,26 @@
 
 POR QUÊ: um selftest verde com o código quebrado não prova nada. Trocar UM trecho do script (um `-gt` por `-ge`, um `&&` por `||`, um `exit 1` por `exit 0`) e rodar a família de selftests dele diz se algum
   reprova; se nenhum reprova, o mutante SOBREVIVEU e o teste é fraco naquela linha. É trabalho de CPU que o lastro do nó Hetzner pode gastar com nice 19 sem custo, e cada achado vira um bead (ga-2hd02v.5.6).
-USO: hq-mutate.py gen ARQUIVO                              imprime os candidatos (id, linha, operador, antes, depois), um por linha, TAB
+USO: hq-mutate.py gen ARQUIVO [--tree HQ]                  imprime os candidatos (id, linha, operador, antes, depois), um por linha, TAB; com --tree o id é o que o `sweep` grava (caminho relativo à árvore)
      hq-mutate.py plan  --tree HQ --state ARQ              imprime os alvos na ordem em que a varredura os pegaria (e por que pula os que pula)
      hq-mutate.py sweep --tree HQ --state ARQ --work DIR --jail hq-sandbox-run.py [--budget-s N] [--slots N] [--cap N] [--targets N]
-  A última linha do stdout do `sweep` é UM json: result (completo | parcial | sem-novidade | interrompido | sem-jaula | sem-alvos | estado-ilegivel | gravacao-falhou), contagens, skipped{motivo: n}, survivors[].
+  A última linha do stdout do `sweep` é UM json: result (completo | parcial | sem-novidade | sem-cobertura | interrompido | sem-jaula | sem-alvos | estado-ilegivel | gravacao-falhou), contagens, skipped{motivo: n}, survivors[] (até 15; `survivors_cortados` conta os que ficaram de fora).
+  `sem-novidade` = o que havia para varrer JÁ estava coberto e igual; `sem-cobertura` = nada foi examinado (tudo pulado, ou nenhum mutante rodou): quem lê só o result não pode confundir os dois. `nao_sei` conta os alvos em que o
+  `bash -n` não pôde decidir: nenhum veredito, o resto do alvo espera a próxima varredura. `restam` = candidatos já conhecidos e ainda sem veredito (um --cap que fecha como `completo` deixa `restam` > 0).
 ALVOS: o SUJEITO de cada `X.selftest.sh` de scripts/ e de packs/town-deltas/assets/ é o `X.sh` ou `X.py` da mesma pasta (com o nome aparado, `a-b-c` → `a-b`, até 3 vezes) E o selftest tem de CITAR o
   nome do arquivo (sem isso o sujeito é outro e todo mutante sobreviveria: ruído). A FAMÍLIA do sujeito são todos os selftests que caem nele; todos rodam a cada mutante. Nunca se mutam os arquivos do
   lastro (hetzner-ballast*), do próprio motor (hq-mutate*) nem da jaula (hq-sandbox-run*). Alvo cujo texto (sujeito + família) cita sudo, systemctl, pkill, docker, gc, bd, dolt (os três só se existem
   neste host e não são o symlink do remote-shim, o atalho do nó Hetzner) etc. é PULADO como `denylist:<palavra>`: o Landlock não barra sinal nem socket unix. A denylist lê o texto do sujeito e da família, não os scripts que eles chamam: o risco que sobra é o de um mutante de UM token de código que a bateria hq-selftests do lastro já roda sem jaula. Baseline (a família sem mutante) que não dá 0 pula o alvo (`base-vermelha`, `base-ambiente` se 97) por 2 dias.
-OPERADORES: no shell só entre tokens soltos (um scanner de linha passa por aspas, comentário e corpo de heredoc: nada ali é mutado); no python pelos tokens (`tokenize`). Mutante que não compila (`bash -n`,
-  `compile()`) é `invalid` e não gasta a cota. Id estável = sha1(arquivo:linha:operador:antes>depois:ocorrência).
+OPERADORES: no shell só entre tokens soltos (um scanner com pilha passa por aspas, `$( )` e `$(( ))`, comentário e corpo de heredoc: nada em string ou heredoc é mutado; o código de um `$( )` solto sim, o de um `"$( )"` entre aspas duplas não: fica sem mutar, nunca mutado errado); no python pelos
+  tokens (`tokenize`). Se o scanner de shell TERMINA com aspa, `$(` ou heredoc aberto ele se perdeu (o `bash -n` aceita esses arquivos) e a lista que ele deu é incompleta: o alvo é pulado como `scan-perdido` (a linha em
+  que a construção abriu vai em `perdidos` e no estado), nunca contado como coberto. Mutante que não compila (`bash -n`, `compile()`) é `invalid` e não gasta a cota; se o `bash -n` nem pôde rodar (sem bash, preso, morto
+  por sinal) não se sabe: `nao_sei`. Id estável = sha1(arquivo:linha:operador:antes>depois:ocorrência), com o caminho relativo à árvore.
 VEREDITO: morto = algum selftest da família saiu != 0 (prazo e 97 incluídos) · sobrevivente = todos 0; roda DE NOVO numa cópia limpa: se a 2ª reprova é `flaky` (não se reporta), senão `confirmed`.
+  Execução cortada pelo TERM NÃO é veredito (o rc dela é do sinal, não de um teste): nada se grava e o mutante roda de novo na próxima varredura.
   Cada mutante roda numa CÓPIA da árvore dentro da jaula (--rw só a pasta do slot, HOME e TMPDIR descartáveis, ambiente limpo: `env -i` e só PATH, LANG, LC_*, USER); a jaula é PROVADA antes de qualquer mutante (`--prove`): sem prova, rc 97 e nada roda.
-ESTADO (--state, json, trocado por arquivo temporário): por alvo o hash do conteúdo, o veredito de cada id, os sobreviventes e a data. Hash igual e tudo coberto = `sem-novidade` (varrer de novo o mesmo
-  conteúdo seria queima disfarçada). Ordem: alvos com arquivo mudado nos últimos 7 dias (git log), depois selftests SEM mutante embutido, depois o menos recente. --cap limita os mutantes por alvo por varredura.
+ESTADO (--state, json, trocado por arquivo temporário): por alvo o hash do conteúdo (e da revisão do scanner), o veredito de cada id, os sobreviventes e a data. Hash igual e tudo coberto = `sem-novidade` (varrer de
+  novo o mesmo conteúdo seria queima disfarçada). Ordem: alvos com arquivo mudado nos últimos 7 dias (git log), depois selftests SEM mutante embutido, depois o menos recente. --cap limita os mutantes por alvo por
+  varredura. O motor NÃO trava o --state: garantir UM sweep por vez por --state é de quem chama (dois ao mesmo tempo = o último a gravar vence). Estado que lê mas tem forma errada = estado-ilegivel (rc 3).
 CÓDIGOS: 0 · 2 uso · 3 estado ilegível/corrompido (NUNCA se zera), árvore ilegível, sem alvos ou gravação que falhou · 97 jaula não provada · 143 interrompido (o estado já gravado vale).
 """
 import argparse
@@ -41,6 +47,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 VERSION = 1
+SCAN_REV = 2   # entra no hash do alvo: muda quando o scanner ou a regra de veredito mudam, e o que uma revisão velha gravou deixa de valer
 SELFTEST_DIRS = ("scripts", "packs/town-deltas/assets")
 NOT_SUBJECT = re.compile(r"^(hetzner-ballast|hq-mutate|hq-sandbox-run)|\.selftest\.|\.mutants\.")
 EMBEDDED = re.compile(r"\bp?mut\b|[Mm]utante|MUT_")
@@ -79,44 +86,64 @@ PY_SWAP = {"==": "!=", "!=": "==", "<": ">=", ">": "<=", "<=": ">", ">=": "<", "
 PY_LIM = {"<": "<=", "<=": "<", ">": ">=", ">=": ">"}
 
 
+class Lost(ValueError):
+    """o scanner de shell acabou o arquivo com aspas, $( ) ou heredoc abertos: perdeu o fio, e o que sobrou de candidatos não vale"""
+
+
 def sh_masks(lines):
-    """uma máscara por linha: True onde há CÓDIGO (fora de aspas, de comentário e do corpo de heredoc)"""
-    sq = dq = False
-    here = None
-    for line in lines:
+    """uma máscara por linha: True onde há CÓDIGO (fora de aspas, de comentário e do corpo de heredoc). Levanta Lost se o arquivo acaba com algo aberto"""
+    st = [["cmd", 0, 0]]   # pilha [tipo, parênteses abertos, linha onde abriu]: cmd (código) · sub (dentro de $( )) · dq · sq · ansi ($'..': a barra escapa)
+    here, out = None, []
+    for n, line in enumerate(lines, 1):
         mask = [False] * len(line)
+        out.append(mask)
         if here:
             if (line.lstrip("\t") if here[1] else line).rstrip("\n") == here[0]:
                 here = None
-            yield mask
             continue
         i = 0
         while i < len(line):
-            c = line[i]
-            if sq:
-                sq = c != "'"
-            elif dq:
+            c, top = line[i], st[-1]
+            k = top[0]
+            if k == "sq":
+                if c == "'":
+                    st.pop()
+            elif k in ("dq", "ansi"):
                 if c == "\\":
                     i += 1
-                elif c == '"':
-                    dq = False
+                elif c == ('"' if k == "dq" else "'"):
+                    st.pop()
+                elif k == "dq" and line.startswith("$(", i):
+                    st.append(["sub", 0, n])
+                    i += 1
             elif c == "\\":
                 i += 1
             elif c == "'":
-                sq = True
+                st.append(["ansi" if line[i - 1:i] == "$" else "sq", 0, n])
             elif c == '"':
-                dq = True
+                st.append(["dq", 0, n])
+            elif c == "$" and line.startswith("$(", i):
+                st.append(["sub", 0, n])
+                i += 1
+            elif k == "sub" and c in "()":
+                if c == "(" or top[1]:
+                    top[1] += 1 if c == "(" else -1
+                else:
+                    st.pop()
             elif c == "#" and (i == 0 or line[i - 1] in " \t;&|()"):
                 break
             else:
-                m = HEREDOC.match(line, i) if line.startswith("<<", i) and not line.startswith("<<<", i) else None
+                # `<<` dentro de aritmética ($(( 1 << n )), (( x << 2 ))) é deslocamento, não heredoc; `<<<` é here-string (o 2º `<` dele não abre heredoc)
+                m = HEREDOC.match(line, i) if line.startswith("<<", i) and line[i - 1:i] != "<" and not (k == "sub" and top[1]) and line[:i].count("((") <= line[:i].count("))") else None
                 if m:
-                    here = (m.group(3), m.group(1) == "-")
+                    here = (m.group(3), m.group(1) == "-", n)
                     i = m.end()
                     continue
-                mask[i] = True
+                mask[i] = all(e[0] in ("cmd", "sub") for e in st)
             i += 1
-        yield mask
+    if here or len(st) > 1:
+        raise Lost("scanner perdido: %s aberto no fim do arquivo (desde a linha %d)" % (("heredoc", here[2]) if here else (st[-1][0], st[-1][2])))
+    return out
 
 
 def sh_raw(text):
@@ -171,6 +198,7 @@ def candidates(path, rel):
 
 
 def valid(path, text):
+    """True compila · False não compila · None não deu para saber (sem bash, bash preso): não roda, não grava veredito (a próxima varredura tenta) e o resumo conta em nao_sei"""
     if path.suffix == ".py":
         try:
             compile(text, str(path), "exec")
@@ -178,9 +206,10 @@ def valid(path, text):
         except (SyntaxError, ValueError):
             return False
     try:
-        return subprocess.run(["bash", "-n"], input=text, capture_output=True, text=True, timeout=30).returncode == 0
+        rc = subprocess.run(["bash", "-n"], input=text, capture_output=True, text=True, timeout=30).returncode
     except (OSError, subprocess.TimeoutExpired):
-        return False   # sem bash (ou bash preso) não se sabe se compila: não roda, e conta como invalid no resumo
+        return None
+    return True if rc == 0 else False if rc in (1, 2) else None
 
 
 def find_subject(d, stem, text):
@@ -195,6 +224,11 @@ def find_subject(d, stem, text):
             break
         cand = trimmed
     return None
+
+
+def complete(ent):
+    """o alvo tem mutantes (total > 0) e todos já têm veredito"""
+    return ent.get("total", 0) > 0 and len(ent.get("verdicts", {})) >= ent["total"]
 
 
 def make_plan(tree, state, recent):
@@ -213,7 +247,7 @@ def make_plan(tree, state, recent):
         rel = subj.relative_to(tree).as_posix()
         names = [s.relative_to(tree).as_posix() for s in sts]
         blobs = [subj.read_bytes()] + [s.read_bytes() for s in sts]
-        h = hashlib.sha1(b"\0".join(blobs) + b"v%d" % VERSION).hexdigest()
+        h = hashlib.sha1(b"\0".join(blobs) + b"v%d.s%d" % (VERSION, SCAN_REV)).hexdigest()
         text = b"\n".join(blobs).decode("utf-8", "replace")
         fam_text = b"\n".join(blobs[1:]).decode("utf-8", "replace")
         old = state["targets"].get(rel, {})
@@ -223,7 +257,7 @@ def make_plan(tree, state, recent):
             skip = "denylist:" + deny.group(0)
         elif old.get("skip") and now < old.get("retry_after", 0):
             skip = old["skip"]
-        elif "total" in old and len(old.get("verdicts", {})) >= old["total"]:
+        elif "total" in old and len(old.get("verdicts", {})) >= old["total"]:   # total 0 (nenhum candidato) também: não há o que varrer de novo
             skip = "sem-novidade"
         else:
             skip = None
@@ -243,10 +277,15 @@ def git_recent(tree):
     return {l for l in r.stdout.split("\n") if l} if r.returncode == 0 else None
 
 
+def shaped(e):
+    return (isinstance(e, dict) and isinstance(e.get("verdicts", {}), dict) and isinstance(e.get("survivors", {}), dict) and isinstance(e.get("skip", ""), str)
+            and isinstance(e.get("total", 0), int) and isinstance(e.get("retry_after", 0), (int, float)) and isinstance(e.get("swept", 0), (int, float)))
+
+
 def load_state(p):
     try:
         d = json.loads(Path(p).read_text(encoding="utf-8"))
-        if d["v"] != VERSION or not isinstance(d["targets"], dict):
+        if d["v"] != VERSION or not isinstance(d["targets"], dict) or not all(shaped(e) for e in d["targets"].values()):
             raise ValueError("versão ou forma do estado desconhecida")
         return d
     except FileNotFoundError:
@@ -313,23 +352,25 @@ def exec_family(ctx, slot_n, tgt, text, tmo):
 
 
 def run_slot(ctx, tgt, text, tmo):
+    """(rc, segundos), ou None se o TERM chegou antes ou durante a execução: o rc que sobra (-9 do killpg) é do sinal, não de um teste, e não vira veredito"""
     slot_n = ctx.slots.get()
     try:
-        return (143, 0) if ctx.stop.is_set() else exec_family(ctx, slot_n, tgt, text, tmo)
+        r = None if ctx.stop.is_set() else exec_family(ctx, slot_n, tgt, text, tmo)
+        return None if ctx.stop.is_set() else r
     finally:
         ctx.slots.put(slot_n)
 
 
 def one_mutant(ctx, tgt, text, m):
-    """k morto · s sobrevivente confirmado · f flaky · i inválido · None não rodou (prazo da varredura ou interrupção)"""
+    """k morto · s sobrevivente confirmado · f flaky · None não rodou (prazo da varredura ou TERM no meio): nenhum veredito se grava. O mutante já passou no valid() ao ser escolhido"""
     if ctx.stop.is_set() or time.time() > ctx.deadline:
         return None
     mutated = text[:m["s"]] + m["new"] + text[m["e"]:]
-    if not valid(tgt["subject"], mutated):
-        return "i"
-    if run_slot(ctx, tgt, mutated, tgt["tmo"])[0] != 0:
-        return "k"
-    return "s" if run_slot(ctx, tgt, mutated, tgt["tmo"])[0] == 0 else "f"
+    r1 = run_slot(ctx, tgt, mutated, tgt["tmo"])
+    if r1 is None or r1[0] != 0:
+        return None if r1 is None else "k"
+    r2 = run_slot(ctx, tgt, mutated, tgt["tmo"])
+    return None if r2 is None else "s" if r2[0] == 0 else "f"
 
 
 def on_term(ctx):
@@ -345,10 +386,13 @@ def on_term(ctx):
 
 def summary(result, **kw):
     # o puxador do lastro troca por null uma linha de resumo de mais de ~8000 caracteres: os sobreviventes que não cabem saem da linha (ficam no estado) e a linha diz quantos cortou
+    if "survivors" in kw:
+        kw["survivors_cortados"] = max(0, len(kw["survivors"]) - 15)
+        kw["survivors"] = kw["survivors"][:15]
     line = json.dumps(dict(result=result, **kw), sort_keys=True)
     while len(line) > MAX_LINE and kw.get("survivors"):
         kw["survivors"] = kw["survivors"][:-1]
-        kw["survivors_cortados"] = kw.get("survivors_cortados", 0) + 1
+        kw["survivors_cortados"] += 1
         line = json.dumps(dict(result=result, **kw), sort_keys=True)
     print(line, flush=True)
 
@@ -389,8 +433,8 @@ def sweep(a):
         return 3
     ctx = Ctx(a, tree)
     signal.signal(signal.SIGTERM, on_term(ctx))
-    t0, skipped, n = time.time(), {}, dict(run=0, killed=0, survived=0, confirmed=0, flaky=0, invalid=0, swept=0)
-    new_surv = []
+    t0, skipped, n = time.time(), {}, dict(run=0, killed=0, survived=0, confirmed=0, flaky=0, invalid=0, swept=0, unknown=0)
+    new_surv, lost = [], []
     for t in [t for t in plan if t["skip"]]:
         skipped[t["skip"].split(":")[0]] = skipped.get(t["skip"].split(":")[0], 0) + 1
     todo = [t for t in plan if not t["skip"]]
@@ -419,9 +463,12 @@ def sweep(a):
             t["tmo"] = min(900, max(60, 3 * secs))
             try:
                 text, cands = candidates(t["subject"], t["rel"])
-            except (OSError, ValueError, SyntaxError, tokenize.TokenError):
-                skipped["ilegivel"] = skipped.get("ilegivel", 0) + 1
-                ent.update(skip="ilegivel", retry_after=int(time.time()) + SKIP_S)
+            except (OSError, ValueError, SyntaxError, tokenize.TokenError) as e:
+                why = "scan-perdido" if isinstance(e, Lost) else "ilegivel"   # perdido: o arquivo abre, mas os candidatos que o scanner deu não valem; o resumo diz onde
+                skipped[why] = skipped.get(why, 0) + 1
+                ent.update(skip=why, retry_after=int(time.time()) + SKIP_S, perdido=str(e)[:160])
+                if why == "scan-perdido":
+                    lost.append("%s: %s" % (t["rel"], e))
                 continue
             ent["total"] = len(cands)
             ver = ent.setdefault("verdicts", {})
@@ -430,8 +477,12 @@ def sweep(a):
             for m in (c for c in cands if c["id"] not in ver):
                 if len(pick) >= a.cap:
                     break
-                if valid(t["subject"], text[:m["s"]] + m["new"] + text[m["e"]:]):
+                ok = valid(t["subject"], text[:m["s"]] + m["new"] + text[m["e"]:])
+                if ok:
                     pick.append(m)
+                elif ok is None:
+                    n["unknown"] += 1   # sem veredito e sem insistir (um bash preso custa 30 s por candidato): o alvo não fecha e a próxima varredura tenta de novo
+                    break
                 else:
                     ver[m["id"]] = "i"
                     n["invalid"] += 1
@@ -450,8 +501,6 @@ def sweep(a):
                 n["run"] += 1
                 if code == "k":
                     n["killed"] += 1
-                elif code == "i":
-                    n["invalid"] += 1
                 else:
                     n["survived"] += 1
                     n["flaky" if code == "f" else "confirmed"] += 1
@@ -465,17 +514,23 @@ def sweep(a):
             err = "%s: %s" % (type(e).__name__, e)
             break
     done = not ctx.stop.is_set() and err is None and time.time() <= ctx.deadline
-    result = "interrompido" if ctx.stop.is_set() else "gravacao-falhou" if err else "sem-novidade" if not todo else "completo" if done else "parcial"
-    summary(result, targets_swept=n["swept"], mutants_run=n["run"], killed=n["killed"], survived=n["survived"], confirmed=n["confirmed"], flaky=n["flaky"], invalid=n["invalid"],
-            skipped=skipped, open_n=sum(len(e.get("survivors", {})) for e in state["targets"].values()), survivors=new_surv[:15], recent="ok" if recent is not None else "indisponivel",
-            secs=int(time.time() - t0), jail=proof[:120], **({"erro": err[:160]} if err else {}))
+    ents = [(t, state["targets"].get(t["rel"], {})) for t in plan]
+    cur = [e for t, e in ents if e.get("hash") == t["hash"]]
+    # sem-cobertura: nada foi examinado nem antes (nenhum alvo com todos os mutantes julgados) nem agora; "completo"/"sem-novidade" sobre isso seria dizer coberto o que ninguém olhou
+    result = ("interrompido" if ctx.stop.is_set() else "gravacao-falhou" if err else "sem-cobertura" if not n["run"] and not any(complete(e) for e in cur) and (done or not todo)
+              else "sem-novidade" if not todo else "completo" if done else "parcial")
+    summary(result, targets_swept=n["swept"], mutants_run=n["run"], killed=n["killed"], survived=n["survived"], confirmed=n["confirmed"], flaky=n["flaky"], invalid=n["invalid"], nao_sei=n["unknown"],
+            restam=sum(max(0, e.get("total", 0) - len(e.get("verdicts", {}))) for e in cur), skipped=skipped, open_n=sum(len(e.get("survivors", {})) for e in state["targets"].values()), survivors=new_surv,
+            perdidos=lost[:5], recent="ok" if recent is not None else "indisponivel", secs=int(time.time() - t0), jail=proof[:120], **({"erro": err[:160]} if err else {}))
     return 143 if ctx.stop.is_set() else 3 if err else 0
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="hq-mutate.py")
     sp = ap.add_subparsers(dest="cmd", required=True)
-    sp.add_parser("gen").add_argument("file")
+    g = sp.add_parser("gen")
+    g.add_argument("file")
+    g.add_argument("--tree")
     for name in ("plan", "sweep"):
         p = sp.add_parser(name)
         p.add_argument("--tree", required=True)
@@ -488,7 +543,8 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.cmd == "gen":
         try:
-            for m in candidates(Path(a.file), Path(a.file).name)[1]:
+            rel = Path(a.file).resolve().relative_to(Path(a.tree).resolve()).as_posix() if a.tree else Path(a.file).name   # com --tree o id é o que o sweep grava
+            for m in candidates(Path(a.file), rel)[1]:
                 print("\t".join((m["id"], str(m["line"]), m["op"], m["old"], m["new"])))
         except (OSError, ValueError, SyntaxError, tokenize.TokenError) as e:
             print("hq-mutate: não leio %s (%s)" % (a.file, e), file=sys.stderr)
