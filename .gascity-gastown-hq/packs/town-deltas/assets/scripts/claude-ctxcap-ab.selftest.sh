@@ -12,7 +12,9 @@
 # --autocompact value outside auto|100k-1M (measured, claude 2.1.286), so the dangerous failure is not "the
 # arm did not apply" but "a typo in a conf file stopped every dog, wa-worker and gate-reviewer from starting".
 # Hence: bad conf -> argv untouched (T6), conf text can never add a flag (T6 injection), the flag lands before
-# any `--` (T9), and a missing next hop still launches claude (T13).
+# any `--` (T9), and a missing next hop still launches claude (T13). The same launch path also carries the guard that
+# refuses a remote-only role (dog-remote, gate-reviewer-remote, ...) on the mini unless someone overrides it on purpose
+# (ga-pshalqe, T15-T21): it refuses out loud, and it must refuse NOTHING else, so T16 sweeps every template under agents/ both ways.
 #
 # MUTATION CONTROLS (bottom): the selftest is re-run against copies of the script with one guard removed each;
 # every copy must make it FAIL. A test that stays green when the guard is gone proves nothing.
@@ -56,7 +58,7 @@ run_wrapper() {
     GC_TEMPLATE=gastown.dog GC_AGENT=gastown.dog-1 GC_SESSION_NAME=dog-aaa111 \
     ${envs[@]+"${envs[@]}"} /bin/bash "$SCRIPT" "$@"   # /bin/bash = the script's shebang = bash 3.2 on macOS, not the PATH bash
 }
-reset() { rm -f "$CONF" "$CITY/.gc/no-ctx-ab"; : > "$LOG"; }
+reset() { rm -f "$CONF" "$CITY/.gc/no-ctx-ab" "$CITY/.gc/no-remote-local-guard"; : > "$LOG"; }
 conf()  { printf '%s\n' "$@" > "$CONF"; }
 got_argv() { paste -sd'|' "$OUT"; }
 expect_argv() { # name want
@@ -203,6 +205,108 @@ run_wrapper -- "${ARGS[@]}"
 expect_argv "T14 treated without a log dir" "--autocompact|200000|$ARGS_J"
 mkdir -p "$CITY/.gc/logs"
 
+# ---- ga-pshalqe: a remote-only role is refused on the mini, out loud ----------------------------------------------
+# WHAT BROKE (27/10 13:18Z). dog-remote-1 (session ga-wisp-8u7ite) ran as a claude on the MINI. The hybrid session provider
+# sends a session to the server only when its NAME contains remote_match ("-remote-"); this session's name was the engine's
+# legacy s-<bead> default, so the mini's own tmux started it. Every local claude-headless session passes through this
+# launcher, and the server never runs it (gc-session-ssh swaps it for plain `claude` there), so a remote-only role that
+# reaches it is on the wrong machine by definition. T15-T21 run the REAL launcher with that identity.
+ERR="$WORKDIR/stderr.out"
+REMOTE_ID=(GC_TEMPLATE=dog-remote GC_AGENT=dog-remote-1 GC_ALIAS=dog-remote-1 GC_SESSION_NAME=s-ga-wisp-8u7ite GC_SESSION_ID=ga-wisp-8u7ite)
+expect_refused() { # name rc — nothing was launched: a non-zero exit and the next hop never ran
+  if [ "$2" -ne 0 ] && [ ! -s "$OUT" ]; then ok "$1"; else bad "$1 — rc=$2 argv=[$(got_argv)] (want a non-zero exit and no launch)"; fi
+}
+expect_launched() { # name rc — the next hop ran with the argv untouched and its exit status came back
+  if [ "$2" -eq 0 ] && [ "$(got_argv)" = "$ARGS_J" ]; then ok "$1"; else bad "$1 — rc=$2 argv=[$(got_argv)] (want rc 0 and the original argv)"; fi
+}
+expect_refusal_line() { # name token — the REFUSED line carries what an operator needs to find and close the session
+  if grep -- 'REMOTE-ONLY REFUSED' "$LOG" | grep -q -- "$2"; then ok "$1"; else bad "$1 — no REFUSED line with /$2/: $(tr '\n' ';' < "$LOG")"; fi
+}
+
+echo "T15 the incident: dog-remote with a legacy s-<bead> name reaches the mini's launcher"
+reset
+run_wrapper ${REMOTE_ID[@]+"${REMOTE_ID[@]}"} -- "${ARGS[@]}" 2> "$ERR"; rc=$?
+expect_refused "T15 refused, claude never started" "$rc"
+expect_refusal_line "T15 the log line names the template" "template=dog-remote"
+expect_refusal_line "T15 the log line names the session" "session=s-ga-wisp-8u7ite"
+expect_refusal_line "T15 the log line carries the id to close" "id=ga-wisp-8u7ite"
+if [ -s "$ERR" ]; then ok "T15 the refusal is visible on stderr (the session pane)"; else bad "T15 nothing on stderr: a refusal nobody can see is a silent failure"; fi
+
+echo "T16 class sweep over the city's real templates (agents/): every remote-only role is refused, every other role launches"
+AGENTS_DIR="$HERE/../../../../agents"
+if [ ! -d "$AGENTS_DIR" ]; then
+  bad "T16 agents dir not found ($AGENTS_DIR): the sweep cannot say which templates are remote-only"
+else
+  n_remote=0; n_local=0
+  for dir in "$AGENTS_DIR"/*/; do
+    t="${dir%/}"; t="${t##*/}"
+    reset
+    run_wrapper GC_TEMPLATE="$t" GC_AGENT="$t-1" GC_ALIAS="$t-1" GC_SESSION_NAME="s-ga-wisp-t16$n_remote$n_local" -- "${ARGS[@]}" 2>/dev/null; rc=$?
+    case "$t" in
+      *remote*) n_remote=$((n_remote+1)); expect_refused "T16 remote-only template $t" "$rc" ;;
+      *)        n_local=$((n_local+1));   expect_launched "T16 local template $t" "$rc" ;;
+    esac
+  done
+  if [ "$n_remote" -ge 1 ] && [ "$n_local" -ge 1 ]; then ok "T16 swept $n_remote remote-only and $n_local local templates"; else bad "T16 empty sweep (remote=$n_remote local=$n_local): the agents/ listing came back empty"; fi
+fi
+# Roles that come from packs or the engine, not from agents/ (the named crews are in agents/, so the sweep above has them):
+# all local, all must still launch.
+for t in gastown.dog gastown.mayor gastown.witness lexbh/gastown.witness control-dispatcher; do
+  reset
+  run_wrapper GC_TEMPLATE="$t" GC_AGENT="$t" GC_ALIAS= GC_SESSION_NAME=gastown__t16 -- "${ARGS[@]}" 2>/dev/null; rc=$?
+  expect_launched "T16 pack role $t" "$rc"
+done
+
+echo "T17 identity: one of GC_TEMPLATE / GC_AGENT / GC_ALIAS naming a remote-only role is enough; no identity at all is not"
+reset; run_wrapper GC_TEMPLATE= GC_AGENT= GC_ALIAS=dog-remote-2 GC_SESSION_NAME=s-ga-wisp-t17a -- "${ARGS[@]}" 2>/dev/null; rc=$?
+expect_refused "T17 the alias alone" "$rc"
+reset; run_wrapper GC_TEMPLATE= GC_AGENT=wa-worker-remote-3 GC_ALIAS= GC_SESSION_NAME=s-ga-wisp-t17b -- "${ARGS[@]}" 2>/dev/null; rc=$?
+expect_refused "T17 the agent alone" "$rc"
+reset; run_wrapper GC_TEMPLATE=gate-reviewer-remote GC_AGENT= GC_ALIAS= GC_SESSION_NAME=s-ga-wisp-t17c -- "${ARGS[@]}" 2>/dev/null; rc=$?
+expect_refused "T17 the template alone" "$rc"
+reset; run_wrapper GC_TEMPLATE= GC_AGENT= GC_ALIAS= GC_SESSION_NAME= -- "${ARGS[@]}" 2>/dev/null; rc=$?
+expect_launched "T17 no identity at all is not a remote-only role: launches (fail-open)" "$rc"
+expect_nolog "T17 and says nothing" "REMOTE-ONLY"
+
+echo "T18 kill switches: a deliberate override launches, and says so in the log"
+reset; run_wrapper ${REMOTE_ID[@]+"${REMOTE_ID[@]}"} GC_REMOTE_LOCAL_GUARD=0 -- "${ARGS[@]}" 2>/dev/null; rc=$?
+expect_launched "T18 GC_REMOTE_LOCAL_GUARD=0 launches" "$rc"
+expect_log "T18 the override leaves a line" "REMOTE-ONLY OVERRIDE"
+reset; : > "$CITY/.gc/no-remote-local-guard"
+run_wrapper ${REMOTE_ID[@]+"${REMOTE_ID[@]}"} -- "${ARGS[@]}" 2>/dev/null; rc=$?
+expect_launched "T18 .gc/no-remote-local-guard launches" "$rc"
+expect_log "T18 the file override leaves a line" "REMOTE-ONLY OVERRIDE"
+reset
+run_wrapper ${REMOTE_ID[@]+"${REMOTE_ID[@]}"} GC_REMOTE_LOCAL_GUARD=1 -- "${ARGS[@]}" 2>/dev/null; rc=$?
+expect_refused "T18 any value but 0 keeps the guard on" "$rc"
+run_wrapper ${REMOTE_ID[@]+"${REMOTE_ID[@]}"} GC_REMOTE_LOCAL_GUARD= -- "${ARGS[@]}" 2>/dev/null; rc=$?
+expect_refused "T18 an empty value keeps the guard on" "$rc"
+reset; run_wrapper GC_TEMPLATE=gastown.dog GC_REMOTE_LOCAL_GUARD=0 -- "${ARGS[@]}" 2>/dev/null
+expect_nolog "T18 a local role with the switch on says nothing" "REMOTE-ONLY"
+
+echo "T19 a log that cannot be written never turns a refusal into a launch"
+rm -rf "$CITY/.gc/logs"
+run_wrapper ${REMOTE_ID[@]+"${REMOTE_ID[@]}"} -- "${ARGS[@]}" 2> "$ERR"; rc=$?
+expect_refused "T19 no log directory" "$rc"
+if [ -s "$ERR" ]; then ok "T19 stderr still carries the refusal"; else bad "T19 no log directory and nothing on stderr: the refusal is invisible"; fi
+run_wrapper ${REMOTE_ID[@]+"${REMOTE_ID[@]}"} GC_CITY_PATH= -- "${ARGS[@]}" 2>/dev/null; rc=$?
+expect_refused "T19 no city path" "$rc"
+mkdir -p "$CITY/.gc/logs"
+
+echo "T20 the refusal comes before the context A/B and before the fail-open next-hop fallback"
+reset; conf salt=t1 "enroll=dog-remote" treat_window=200000 treat_pct=100
+run_wrapper ${REMOTE_ID[@]+"${REMOTE_ID[@]}"} -- "${ARGS[@]}" 2>/dev/null; rc=$?
+expect_refused "T20 an enrolled remote-only role is refused, not armed" "$rc"
+expect_nolog "T20 no arm line" "CTX-AB arm="
+reset
+run_wrapper ${REMOTE_ID[@]+"${REMOTE_ID[@]}"} GC_CTXCAP_NEXT_BIN="$WORKDIR/does-not-exist" GC_LOWPRIO_CLAUDE_BIN="$STUB" -- "${ARGS[@]}" 2>/dev/null; rc=$?
+expect_refused "T20 a missing next hop does not fall through to launching claude directly" "$rc"
+
+echo "T21 a readable remote name on the mini is just as wrong (hybrid off or misrouted): refused too"
+reset
+run_wrapper ${REMOTE_ID[@]+"${REMOTE_ID[@]}"} GC_SESSION_NAME=dog-remote-gawisp302f1x -- "${ARGS[@]}" 2>/dev/null; rc=$?
+expect_refused "T21 dog-remote-<tail> on the mini" "$rc"
+
 echo
 echo "RESULT: PASS=$PASS FAIL=$FAIL"
 
@@ -239,6 +343,20 @@ if [ "$FAIL" -eq 0 ] && [ -z "${CTXCAP_NO_MUTATE:-}" ]; then
   mutate kill-env         's/"\${GC_CTX_AB:-}" != "0"/"${GC_CTX_AB:-}" != "never"/'
   mutate kill-file        's/! -e "\$city\/.gc\/no-ctx-ab"/! -e "$city\/.gc\/never"/'
   mutate fail-open-next   's/\[ -x "\$next" \]/[ -n "$next" ]/'
+  # ga-pshalqe: the remote-only guard (T15-T21)
+  mutate remote-pattern-none      's/\*-remote|\*-remote-\*) rl_hit=1/*-never-matches) rl_hit=1/'
+  mutate remote-pattern-no-infix  's/\*-remote|\*-remote-\*) rl_hit=1/*-remote) rl_hit=1/'
+  mutate remote-pattern-no-suffix 's/\*-remote|\*-remote-\*) rl_hit=1/*-remote-*) rl_hit=1/'
+  mutate remote-template-only     's/for rl_v in "\${GC_TEMPLATE:-}" "\${GC_AGENT:-}" "\${GC_ALIAS:-}"; do/for rl_v in "${GC_TEMPLATE:-}"; do/'
+  mutate remote-session-name-only 's/for rl_v in "\${GC_TEMPLATE:-}" "\${GC_AGENT:-}" "\${GC_ALIAS:-}"; do/for rl_v in "${GC_SESSION_NAME:-}"; do/'
+  mutate remote-empty-is-hit      's/\*-remote|\*-remote-\*) rl_hit=1/*-remote|*-remote-*|"") rl_hit=1/'
+  mutate remote-exit-zero         's/exit 78/exit 0/'
+  mutate remote-falls-through     's/exit 78/:/'
+  mutate remote-no-log            's/note "REMOTE-ONLY REFUSED \$rl_id"/:/'
+  mutate remote-silent            's/"\${GC_SESSION_ID:-\${GC_ALIAS:-?}}" >&2/"${GC_SESSION_ID:-${GC_ALIAS:-?}}" >\/dev\/null/'
+  mutate remote-kill-env-any      's/"\${GC_REMOTE_LOCAL_GUARD:-}" = "0"/"${GC_REMOTE_LOCAL_GUARD:-}" != ""/'
+  mutate remote-kill-file         's/-e "\$city\/.gc\/no-remote-local-guard"/-e "$city\/.gc\/never"/'
+  mutate remote-override-unlogged 's/note "REMOTE-ONLY OVERRIDE \$rl_id - starting on the mini on purpose"/:/'
   if [ "$MFAIL" -ne 0 ]; then FAIL=$((FAIL+MFAIL)); fi
 fi
 
