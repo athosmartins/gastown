@@ -7,8 +7,7 @@
 # a violation is refused, a clean diff is not, and anything the checker cannot measure is said, never read as clean or as a finding.
 #
 # HOW. A fixture "city" holds copies of the real tools (GATE_HC_HQ); a fixture rig is a throw-away git repo whose E12 inputs are
-# the real prompts, fragment and city.toml. kimi-worker-remote is left out of the rig: its prompt mentions gate-done and the
-# E12 generator does not list it (red on main since 26/10, ga-do1ixn.2), and this selftest proves the checker, not main's debt.
+# the real prompts, fragment and city.toml, so the "green base" cases need the E12 coverage of the tree under test to be green.
 # 2b uses a stub `gc` (the real `gc lint` is not here) behind a PATH of symlinks, so "gc absent" and "jq absent" are testable.
 set -uo pipefail
 
@@ -52,7 +51,7 @@ mkrig() {
   mkdir -p "$hq/agents" "$hq/packs/town-deltas/template-fragments" "$d/docs" "$d/lib" "$d/tests"
   for a in "$RHQ"/agents/*/; do
     n="$(basename "$a")"
-    if [ "$n" != kimi-worker-remote ] && [ -f "$a/prompt.template.md" ]; then mkdir -p "$hq/agents/$n" && cp "$a/prompt.template.md" "$hq/agents/$n/" || return 1; fi
+    if [ -f "$a/prompt.template.md" ]; then mkdir -p "$hq/agents/$n" && cp "$a/prompt.template.md" "$hq/agents/$n/" || return 1; fi
   done
   cp "$RHQ/packs/town-deltas/template-fragments/town-deltas.template.md" "$hq/packs/town-deltas/template-fragments/" && cp "$RHQ/city.toml" "$hq/" || return 1
   good_doc > "$d/docs/ok.md"; bad_doc > "$d/docs/legacy.md"; bad_doc > "$d/docs/upstream.md"
