@@ -36,6 +36,15 @@
 #           bad number never makes the script fall through to the branch restore (backup tag, CLEARED, root moved)
 #   S17     the net behind S16: with an arithmetic fault INJECTED into a copy of the guard, the handler's abort ends the run
 #           inert (a WARN line, rc 0, the root untouched), not in the restore
+#   S18-S25 (ga-u6ueg0q) the paths the first seventeen leave at their defaults: S18 the kill switch reports a crew branch and leaves it; S19 a
+#           `git switch main` that fails forces nothing, says so and ends 0; S20 a fetch that fails does not stop the restore and is a WARN,
+#           while S12 pins that a fetch that worked is not; S21 the guard drops the stash entry IT made, never an unrelated one; S22 a state
+#           file without its last newline still counts; S23 the age in the alert and in CLEARED (2 h, 0 min, a start in the future); S24 an
+#           alert made at this very second is neither in the future nor spent; S25 no notify on PATH: log only, rc=1, window not spent
+#   EQUIVALENT  read_state and clear_episode return 0 on "no episode", and swapping that for 1 changes nothing: every caller runs them as a
+#           statement and the guard has no `set -e`. The two early exits `[ -f "$STATE" ] || return 0` and `[ -e "$STATE" ] || return 0` and the
+#           `|| return 0` after the read can be dropped without a visible difference: with no file the read fails with k empty, and an empty k
+#           reaches the case's `*) return 0` (or, in clear_episode, finds nothing to remove and no episode to close).
 # HOW. Real git: a bare "origin" plus a clone as the live root, in a throwaway dir. The guard runs as a subprocess
 # with WA_ROOT_GUARD_{ROOT,CITY,HOOKS,NOW} pointing there and a fake `notify` first on PATH; nothing under /Users/athos
 # is read, no network, no daemons. WRMG_GUARD=<path> runs the harness against another copy of the guard — that is how it
@@ -322,6 +331,8 @@ eq "S12 root is back on main" "$(fx rev-parse --abbrev-ref HEAD)" main
 has "S12 RESTORED is logged" "$LOG" "RESTORED"
 eq "S12 the divergent HEAD is on a backup tag" "$(fx tag -l "wa-root-guard-backup-$CREW" | wc -l | tr -d ' ')" 1
 eq "S12 notified" "$(nl "$NOTES")" 1
+eq "S12 exit code" "$RC" 0
+hasnt "S12 a fetch that worked leaves no 'returned nonzero' WARN" "$LOG" "returned nonzero"
 
 echo "S13: the production defaults of the seams are the real paths"
 has "S13 default ROOT" "$GUARD" 'WA_ROOT_GUARD_ROOT:-/Users/athos/gt/whatsapp_automation'
@@ -422,6 +433,80 @@ else
   eq "S17 exit code" "$RC" 0
   has "S17 the abort is logged, not silent" "$LOG" "did not finish"
   untouched "S17"
+fi
+
+echo "S18: the kill switch (WA_ROOT_GUARD_ENABLED=0) — a crew branch is reported and left alone"
+mk_world s18; fx checkout -q -b crew/k; echo k > "$ROOT/k.txt"; fx add k.txt; fx commit -q -m crewk
+cycle 1 WA_ROOT_GUARD_ENABLED=0
+eq "S18 exit code" "$RC" 0
+has "S18 the line says check-only" "$LOG" "check-only, NOT restoring"
+eq "S18 the root stays on the crew branch" "$(fx rev-parse --abbrev-ref HEAD)" crew/k
+eq "S18 no backup tag" "$(fx tag -l 'wa-root-guard-backup-*' | wc -l | tr -d ' ')" 0
+hasnt "S18 no RESTORED line" "$LOG" "RESTORED"
+has "S18 notified that the guard is disabled" "$NOTES" "guard DISABLED"
+
+echo "S19: 'git switch main' fails (the crew's uncommitted edit would be overwritten) — nothing is forced, the guard says so and ends 0"
+mk_world s19; fx checkout -q -b crew/c; echo crew > "$ROOT/f.txt"; fx add f.txt; fx commit -q -m crewf; echo dirty > "$ROOT/f.txt"
+cycle 1
+eq "S19 exit code" "$RC" 0
+has "S19 the failure is logged" "$LOG" "'git switch main' FAILED"
+eq "S19 the root stays on the crew branch (never forced)" "$(fx rev-parse --abbrev-ref HEAD)" crew/c
+eq "S19 the uncommitted edit is still there" "$(cat "$ROOT/f.txt")" dirty
+eq "S19 the divergent HEAD is on a backup tag" "$(fx tag -l 'wa-root-guard-backup-*' | wc -l | tr -d ' ')" 1
+has "S19 notified (needs a human)" "$NOTES" "switch to main FAILED"
+
+echo "S20: 'git fetch origin main' fails (offline) — the restore goes on with the local main and says so"
+mk_world s20; fx checkout -q -b crew/f; echo f > "$ROOT/ff.txt"; fx add ff.txt; fx commit -q -m crewff
+fx remote set-url origin "$W/no-such-origin.git"
+cycle 1
+eq "S20 exit code" "$RC" 0
+has "S20 the fetch failure is a WARN line" "$LOG" "'git fetch origin main' returned nonzero"
+has "S20 the restore still lands" "$LOG" "RESTORED"
+eq "S20 the root is back on main" "$(fx rev-parse --abbrev-ref HEAD)" main
+
+echo "S21: the guard drops only the stash entry IT made (ga-sdkrl)"
+mk_world s21a; fx checkout -q -b crew/d; mkdir -p "$ROOT/daemons"; echo d1 > "$ROOT/daemons/d.txt"; fx add daemons/d.txt; fx commit -q -m crewd
+echo d2 > "$ROOT/daemons/d.txt"
+cycle 1
+has "S21a RESTORED" "$LOG" "RESTORED"
+eq "S21a the entry the guard made for daemons/ is dropped: nothing is left on the stash" "$(fx stash list | wc -l | tr -d ' ')" 0
+mk_world s21b; echo mine >> "$ROOT/f.txt"; fx stash push -q -m unrelated
+fx checkout -q -b crew/e; echo e > "$ROOT/e.txt"; fx add e.txt; fx commit -q -m crewe
+SB="$(fx rev-parse refs/stash)"
+cycle 1
+has "S21b RESTORED" "$LOG" "RESTORED"
+eq "S21b daemons/ was clean, so the guard made no entry: the unrelated stash is untouched" "$(fx rev-parse -q --verify refs/stash)" "$SB"
+
+echo "S22: the episode state without its final newline still counts (read returns non-zero on it but fills the fields)"
+mk_world s22; fx checkout -q --detach "$U"; printf 'off-main 1 %s 0' $((T0 + 114)) > "$STATE"
+cycle 2
+eq "S22 the 2nd cycle of that episode alerts" "$(nl "$LOG")" 1
+has "S22 ... as cycle 2 of an episode that began a cycle earlier" "$LOG" "cycles=2, ~1min)"
+
+echo "S23: the age in the alert and in CLEARED is the minutes since the episode began"
+mk_world s23a; fx checkout -q --detach "$U"; printf 'off-main 1 %s 0\n' $((T0 + 228 - 7200)) > "$STATE"; cycle 2
+has "S23a began 2 h before: ~120min" "$LOG" "cycles=2, ~120min)"
+mk_world s23b; fx checkout -q --detach "$U"; printf 'off-main 1 %s 0\n' $((T0 + 228)) > "$STATE"; cycle 2
+has "S23b began this very second: ~0min, not unknown" "$LOG" "cycles=2, ~0min)"
+mk_world s23c; fx checkout -q --detach "$U"; printf 'off-main 1 %s 0\n' $((T0 + 228 + 600)) > "$STATE"; cycle 2
+has "S23c began in the future (the clock stepped back): unknown" "$LOG" "cycles=2, ~?)"
+mk_world s23d; printf 'off-main 2 %s %s\n' $((T0 + 228 - 7200)) $((T0 + 100)) > "$STATE"; cycle 2
+has "S23d CLEARED carries the length of the episode" "$LOG" "lasted ~120min, 2 cycles"
+
+echo "S24: the alert window is half-open — a last alert made at this very second is neither in the future nor spent"
+mk_world s24; fx checkout -q --detach "$U"; printf 'off-main 5 %s %s\n' "$T0" $((T0 + 228)) > "$STATE"; cycle 2
+eq "S24 no alert (alarm == now is not a clock that stepped back)" "$(nl "$LOG")" 0
+eq "S24 ... and no notification" "$(nl "$NOTES")" 0
+
+echo "S25: no notify on PATH — the alert is in the log only, the failure line says rc=1, and the window is not spent"
+mk_world s25; fx checkout -q --detach "$U"; rm -f "$BIN/notify"
+NONOTE="$BIN:$(dirname "$REAL_GIT"):/usr/bin:/bin"
+if env PATH="$NONOTE" sh -c 'command -v notify' >/dev/null 2>&1; then bad "S25 fixture: a notify is still on PATH ($NONOTE)"; else
+  cycle 1 PATH="$NONOTE"; cycle 2 PATH="$NONOTE"
+  has "S25 the alert line is written" "$LOG" "OFF-MAIN-DETACHED"
+  has "S25 the failure line says rc=1 (not the 127 of running a command that is not there)" "$LOG" "(rc=1), so this log is its only copy"
+  cycle 3 PATH="$NONOTE"
+  eq "S25 the window was not spent: the next cycle writes the alert again" "$(grep -c 'OFF-MAIN-DETACHED' "$LOG")" 2
 fi
 
 echo ""
