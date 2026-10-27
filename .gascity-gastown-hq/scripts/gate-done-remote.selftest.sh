@@ -537,11 +537,13 @@ git init -q --bare -b main "$WAORIGIN"; git clone -q "$WAORIGIN" "$WAW" 2>/dev/n
 mkdir -p "$WAW/lib" "$WAW/scripts/hooks" "$WAW/launchd"; printf 'x = 1\n' > "$WAW/lib/x.py"
 cp -R "$HERE/wa-remote-guards.fixture/." "$WAW/"; printf '#!/bin/sh\n# ACTION_PREFIX_OK\n' > "$WAW/scripts/notify"   # ga-2hd02v.3.11: G12/G6/G7/G7b de confiança (a mesma interface dos reais) que o wa-remote-guards.py lê de origin/main
 # o hook de verdade (scripts/hooks/pre-push do WA) acha $REPO_ROOT pelo `git rev-parse --show-toplevel` e roda os guards DE LÁ (G6 check_mds_registry_guard.py, G7, G12…): aqui, o menor que mostra a mesma forma
+#    PYTHONDONTWRITEBYTECODE=1 no python do hook (ga-k02m9rp): o guard do fixture importa módulos de lib/ e o controle roda este hook DENTRO do checkout principal do rig; sem isto o Python grava lib/__pycache__ nele, o git status o
+#    lista como arquivo novo e o "WA feliz: o checkout principal do rig não mudou" culpa o atalho por um resíduo do controle (medido no nó Hetzner, que não tem __pycache__ no gitignore global nem a variável no ambiente)
 cat > "$WAW/scripts/hooks/pre-push" <<WAHOOK
 #!/bin/sh
 REPO_ROOT="\$(git rev-parse --show-toplevel)"
 echo "pre-push em \$REPO_ROOT" >> "$WAHOOKLOG"
-FIXTURE_TRACE="$WASENT" python3 "\$REPO_ROOT/scripts/check_mds_registry_guard.py" || { echo "Guard 6 FAILED: scripts/check_mds_registry_guard.py" >&2; exit 1; }
+FIXTURE_TRACE="$WASENT" PYTHONDONTWRITEBYTECODE=1 python3 "\$REPO_ROOT/scripts/check_mds_registry_guard.py" || { echo "Guard 6 FAILED: scripts/check_mds_registry_guard.py" >&2; exit 1; }
 exit 0
 WAHOOK
 chmod +x "$WAW/scripts/hooks/pre-push"
@@ -587,6 +589,8 @@ has "$WAHOOKLOG" "pre-push em $WARIG"; ok $? "WA controle: o hook do fixture rod
 reset_wa; git -C "$WARIG" worktree add -q --no-checkout -b probe-nc "$T/probe-wt" "$WASHA" 2>/dev/null; git -C "$T/probe-wt" push --dry-run origin HEAD:refs/heads/probe >/dev/null 2>"$T/err"; r=$?
 ok $((r == 0)) "WA controle (o bug): push de worktree sem checkout é RECUSADO pelo hook do rig (o guard não existe lá)"; has "$T/err" "Guard 6 FAILED"; ok $? "WA controle (o bug): a recusa é a do Guard 6, a de produção"
 git -C "$WARIG" worktree remove --force "$T/probe-wt" 2>/dev/null; git -C "$WARIG" branch -q -D probe-nc 2>/dev/null; git -C "$WARIG" update-ref -d refs/probe/wa 2>/dev/null
+# partida (ga-k02m9rp): depois dos controles e ANTES de qualquer execução do atalho, o checkout principal do rig está limpo e em origin/main; os "WA feliz" mais abaixo só valem como "o atalho não mexeu" se isto vale
+[ "$(git -C "$WARIG" rev-parse HEAD)" = "$(git --git-dir="$WAORIGIN" rev-parse main)" ] && [ -z "$(git -C "$WARIG" status --porcelain)" ]; ok $? "WA partida: o checkout principal do rig está limpo e em origin/main depois dos controles e antes de qualquer execução do atalho (se reprova aqui, foi um controle que sujou o rig)"
 # ensaio: resolve tudo, não escreve nada
 reset_wa; run_wa GATE_DONE_REMOTE_DRY_RUN=1
 ok $((RC != 0)) "WA ensaio: sai 0"; has "$T/out" "bead=wa-t1 worker/$WASESS@${WASHA:0:12} → $WABR"; ok $? "WA ensaio: diz alias, bead (da loja do rig), sha e branch"
@@ -662,7 +666,8 @@ case_wg_paid() { wa_ref "$WASHA_PAID"; reset_wa; run_wa; GR=$RC; wa_ref "$WASHA"
 case_wg_paid_approved() { wa_ref "$WASHA_PAID_OK"; reset_wa; run_wa; GR=$RC; wa_ref "$WASHA"; [ "$GR" = 0 ] && has "$T/out" "Marker created: ga-mk1" && wa_clean && ! guards_left; }
 case_wg_note() { wa_ref "$WASHA"; reset_wa; run_wa; dbq '.beads["ga-mk1"].description' | grep -qF -- "so G12, G6, G7 e G7b foram verificados (pelos OBJETOS de ${WASHA:0:12}, com os guards de origin/main @" \
   && dbq '.beads["ga-mk1"].description' | grep -qF -- "os demais guards do pre-push e as suites pytest nao foram verificados" && has "$T/err" "G12 PASS" && has "$T/err" "G7b PASS"; }
-case_wg_unknown_trusted() { reset_wa; E=$(git -C "$WARIG" commit-tree "$(git -C "$WARIG" hash-object -w -t tree /dev/null)" -m vazio 2>/dev/null); git -C "$WARIG" update-ref refs/remotes/origin/main "$E"
+case_wg_unknown_trusted() { reset_wa; E=$(G -C "$WARIG" commit-tree "$(git -C "$WARIG" hash-object -w -t tree /dev/null)" -m vazio 2>/dev/null)   # G: o commit-tree precisa de identidade; o git cru morre num host sem user.name global (ga-k02m9rp)
+  [ -n "$E" ] && git -C "$WARIG" update-ref refs/remotes/origin/main "$E" || return 1   # se o commit vazio ou o update-ref falha, o origin/main do rig segue são e o atalho passa (rc 0): reprova aqui, sem testar um estado que não montou
   run_wa; GR=$RC; git -C "$WARIG" update-ref refs/remotes/origin/main "$(git --git-dir="$WAORIGIN" rev-parse main)"; refused2; }
 case_wg_sibling_missing() { rm -f "$CITY/scripts/wa-remote-guards.py"; reset_wa; run_wa; GR=$RC; real_guards; refused2; }
 case_wg_pass() { fake_case pass; [ "$GR" = 0 ] && has "$T/out" "Marker created: ga-mk1" && [ "$(wc -l < "$T/guards.calls" | tr -d ' ')" = 1 ] && grep -qE "^--repo $WARIG --sha $WASHA --scratch $CITY/.gc/gate-done-remote/guards-" "$T/guards.calls" \
@@ -880,8 +885,9 @@ seed12 ga-t4 "Cena 2"; r12 GATE_DONE_REMOTE_DRY_RUN=1; refused12 "S8 ensaio com 
 seed12 ga-t4 "Cena 2"; r12a -- ga-t4 "worker/$SESS12" "$PP"; refused12 "S2c forma com argumentos com o ref preso" "já está no main" ga-t4 "$B2"
 # S3 — worker/<sessão> está num commit de OUTRA bead que ainda não entrou no main e a correção está em worker/<sessão>-<bead> (wa-a2lb9b)
 wipe12 "$B3"
-mk_commit s3e.txt "feat(ga-other1): trabalho de outra bead, ainda fora do main" main "worker/$SESS12"; E3=$NEWSHA
-mk_commit s3.txt "fix(ga-t5): a bead de agora" main "worker/$SESS12-ga-t5"; F3=$NEWSHA
+#    horas FIXAS e o ref da OUTRA bead é o mais NOVO (ga-k02m9rp): só a prova da bead o deixa de fora; sem ela os dois ficam (um não contém o outro) e a hora desempata para o ref errado
+GIT_COMMITTER_DATE="2026-10-23T12:00:00Z" mk_commit s3e.txt "feat(ga-other1): trabalho de outra bead, ainda fora do main" main "worker/$SESS12"; E3=$NEWSHA
+GIT_COMMITTER_DATE="2026-10-23T10:00:00Z" mk_commit s3.txt "fix(ga-t5): a bead de agora" main "worker/$SESS12-ga-t5"; F3=$NEWSHA
 seed12 ga-t5 "Cena 3"; r12
 sub12 "S3 worker/<sessão> em commit de outra bead; correção em worker/<sessão>-ga-t5" ga-t5 "$B3" "$F3"
 has "$T/err" "nenhum cita ga-t5"; ok $? "S3: a saída diz por que ignorou o ref do commit de outra bead"
@@ -1055,7 +1061,9 @@ wa_ref "$WASHA"
 # ── 8b. mutantes da ga-2hd02v.3.13 (qual ref sai, prova da bead, lease): cada caso monta o SEU estado (c12_start limpa o espelho, o origin e o main) ──────────────────────────
 c12_start() { wipe12 "$B1" "$B2" "$B3" "$B5"; git --git-dir="$ORIGIN" update-ref -d refs/heads/intruso12 2>/dev/null; return 0; }
 case_s1_pick() { c12_start; mk_s1; seed12 ga-t3 "Cena 1"; r12 GATE_DONE_REMOTE_DRY_RUN=1; has "$T/out" "bead=ga-t3 worker/$SESS12-v2@${F1:0:12} → $B1"; }
-case_s3_pick() { c12_start; mk_commit s3e.txt "feat(ga-other1): trabalho de outra bead, ainda fora do main" main "worker/$SESS12"; mk_commit s3.txt "fix(ga-t5): a bead de agora" main "worker/$SESS12-ga-t5"; F3=$NEWSHA
+# s3 (ga-k02m9rp): horas FIXAS e o ref da OUTRA bead como o mais novo. Com a hora do relógio o mutante só morria quando os dois commits caíam no MESMO segundo (empate de hora → recusa); em segundos diferentes o mais novo era o certo
+# e ele sobrevivia (com 1,1 s entre os dois commits sobrevive sempre). Agora, sem a prova da bead, o ref errado (o mais novo) vence o desempate sempre e o origin recebe o sha da OUTRA bead: o caso reprova.
+case_s3_pick() { c12_start; GIT_COMMITTER_DATE="2026-10-23T12:00:00Z" mk_commit s3e.txt "feat(ga-other1): trabalho de outra bead, ainda fora do main" main "worker/$SESS12"; GIT_COMMITTER_DATE="2026-10-23T10:00:00Z" mk_commit s3.txt "fix(ga-t5): a bead de agora" main "worker/$SESS12-ga-t5"; F3=$NEWSHA
   seed12 ga-t5 "Cena 3"; r12; [ "$RC" = 0 ] && [ "$(origin_has "$B3")" = "$F3" ]; }
 case_s4_args_cite() { c12_start; mk_commit s3e.txt "feat(ga-other1): trabalho de outra bead" main "worker/$SESS12"; E3=$NEWSHA
   seed12 ga-t5 "Cena 3"; r12a -- ga-t5 "worker/$SESS12" "$E3"; [ "$RC" = 1 ] && ! origin_has "$B3" >/dev/null; }
