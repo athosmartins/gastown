@@ -224,6 +224,38 @@ has "the guard's FAIL line reaches the refusal" "template-fragment-lint-guard: F
 branch_from "$R" "$GBAD" g_debt; printf 'more\n' >> "$R/$HQ/agents/thies-wa/prompt.template.md"; GDEBT="$(commit_all "$R" tmpl-debt)"
 run_sut 2b "$R" "$GBAD" "$GDEBT" ga-x PATH="$FB";          expect "red on the base too: main's debt" debito-previo
 run_sut 2b "$R" "$MAIN" "$GBAD" ga-x PATH="$FB" STUB_GC_FAIL=1; expect "a gc that cannot lint anything fails the CONTROL: said, not 'debt for good'" nao-consegui-medir gc-lint-controle-vermelho
+
+echo "G2. 2b: an exit 0 is not proof that a lint ran (the parse guard exits 0 when it SKIPS; gate_run ga-rrje9vk)"
+# rig2 has no pack.toml anywhere, like whatsapp_automation, which tracks a .md.tmpl outside every pack: the guard skips with a warning.
+R2="$WORK/rig2"; mkdir -p "$R2" && git -C "$R2" init -q && git -C "$R2" symbolic-ref HEAD refs/heads/main && git -C "$R2" config user.email t@example.invalid \
+  && git -C "$R2" config user.name t && git -C "$R2" config commit.gpgsign false || { echo "FATAL: cannot build rig2"; exit 1; }
+printf 'x = 1\n' | put "$R2" lib/app.py; MAIN2="$(commit_all "$R2" base2)"
+branch_from "$R2" main h_nopack; printf 'hello {{ .Unclosed\n' | put "$R2" templates/CLAUDE.local.md.tmpl;      NPTIP="$(commit_all "$R2" nopack)"
+run_sut 2b "$R2" "$MAIN2" "$NPTIP" ga-x PATH="$FB";        expect "a template with no pack.toml above it was never linted: not ok" nao-consegui-medir lint-nao-rodou-no-tip
+has "and the guard's own warning reaches the output" "no pack.toml found above changed file"
+branch_from "$R2" main h_owned; printf '[pack]\nname = "s"\nschema = 2\n' | put "$R2" sub/pack.toml; printf 'fine\n' | put "$R2" sub/agents/a/prompt.template.md; OWTIP="$(commit_all "$R2" owned)"
+run_sut 2b "$R2" "$MAIN2" "$OWTIP" ga-x PATH="$FB";        expect "control: the same rig, a template that HAS an owning pack, is ok" ok parse-verde-no-tip
+branch_from "$R2" "$OWTIP" h_mixed; printf 'x\n' | put "$R2" loose/x.md.tmpl;                                         MXTIP="$(commit_all "$R2" mixed)"
+run_sut 2b "$R2" "$MAIN2" "$MXTIP" ga-x PATH="$FB";        expect "one file that lints and one with no pack: a pass needs every file measured" nao-consegui-medir lint-nao-rodou-no-tip
+branch_from "$R2" main h_newpack; printf '[pack]\nname = "n"\nschema = 2\n' | put "$R2" np/pack.toml; printf 'BADTEMPLATE\n' | put "$R2" np/agents/a/prompt.template.md; NNTIP="$(commit_all "$R2" newpack-bad)"
+run_sut 2b "$R2" "$MAIN2" "$NNTIP" ga-x PATH="$FB";        expect "red tip, but the base had no pack to lint: 'green on the base' was never measured, no refusal" nao-consegui-medir lint-nao-rodou-na-base
+# Stand-in parse guard: STUB_GUARD_MODE picks the lie, anything else delegates to the real guard (REAL_GUARD).
+C4="$WORK/city4"; mkcity "$C4" template-fragment-lint-guard.sh || { echo "FATAL: cannot build city4"; exit 1; }
+cat > "$C4/packs/town-deltas/assets/template-fragment-lint-guard.sh" <<'STUBG'
+#!/usr/bin/env bash
+case "${STUB_GUARD_MODE:-}:$1" in
+  (forged-ok:*) echo "template-fragment-lint-guard: OK -- /not/the/tree/under/test"; exit 0 ;;
+  (no-match:*)  echo "template-fragment-lint-guard: no changed file matches a template/fragment/pack.toml pattern -- skipping gc lint."; exit 0 ;;
+  (ctl-skip:*/ctl) echo "template-fragment-lint-guard: WARNING: no pack.toml found above changed file x -- skipping (nothing to gc lint against)." >&2; exit 0 ;;
+esac
+exec bash "$REAL_GUARD" "$@"
+STUBG
+CITY_UNDER="$C4"; REALG="$RHQ/packs/town-deltas/assets/template-fragment-lint-guard.sh"
+run_sut 2b "$R" "$MAIN" "$GBAD" ga-x PATH="$FB" REAL_GUARD="$REALG" STUB_GUARD_MODE=ctl-skip; expect "the CONTROL gets the same check: a control the guard skipped proves no lint ran" nao-consegui-medir gc-lint-controle-nao-rodou
+run_sut 2b "$R" "$MAIN" "$GOK" ga-x PATH="$FB" REAL_GUARD="$REALG" STUB_GUARD_MODE=forged-ok;  expect "an OK line that does not name the tree under test is not proof (it echoes branch data)" nao-consegui-medir lint-nao-rodou-no-tip
+run_sut 2b "$R" "$MAIN" "$GOK" ga-x PATH="$FB" REAL_GUARD="$REALG" STUB_GUARD_MODE=no-match;   expect "exit 0 and no OK line at all (the guard matched nothing)" nao-consegui-medir lint-nao-rodou-no-tip
+run_sut 2b "$R" "$MAIN" "$GOK" ga-x PATH="$FB" REAL_GUARD="$REALG";                            expect "control: the stand-in delegating to the real guard still reads ok" ok parse-verde-no-tip
+CITY_UNDER=""
 rm -f "$FB/gc"
 run_sut 2b "$R" "$MAIN" "$GBAD" ga-x PATH="$FB";           expect "no gc on PATH (the guard would exit 0 with only a warning)" nao-consegui-medir sem-gc
 printf '#!/bin/sh\nexit 0\n' > "$FB/gc"; chmod +x "$FB/gc"; rm -f "$FB/jq"

@@ -17,8 +17,9 @@
 # a wanted file should be is refused before anything is written.
 #
 # OUTPUT. One line first, then (fail / debito-previo) the tool's red lines, capped at 40:
-#   VERDICT=<token> step=<s> reason=<slug> rc=<n|-> tip=<green|red|unknown|-> base=<..|-> arm=<enforce|holdout|->
-#   ok                  the tool ran and found nothing
+#   VERDICT=<token> step=<s> reason=<slug> rc=<n|-> tip=<green|red|unlinted|unknown|-> base=<..|-> arm=<enforce|holdout|->
+#   ok                  the tool ran and found nothing (2b: the parse guard printed an OK line for a pack under the tree; an
+#                       exit 0 that only SKIPPED the lint, with a WARNING line, is unlinted -> nao-consegui-medir)
 #   fail                the tool printed a finding AND exited 1 (2b/2d also need the base tree to be green).
 #                       The only verdict the guard refuses on
 #   aviso               2e found reads with no failure test but its mode (warn, or the holdout arm) does not refuse
@@ -31,7 +32,8 @@
 # Always exits 0 after printing; a crash prints no VERDICT= line, which the guard reads as unmeasured.
 #
 # THIRD STATES. "Could not run" is never green and never red. A finding needs POSITIVE evidence in the tool's output
-# (a crash also exits 1); everything else is unmeasured. A python without tomllib (< 3.11) cannot run 2d and would
+# (a crash also exits 1); everything else is unmeasured. An exit 0 is not proof either: 2b's parse guard exits 0 when it
+# skips (no pack.toml above the template, gc absent, nothing matched), so green needs its OK line too. A python without tomllib (< 3.11) cannot run 2d and would
 # make the base tree red as well, so it is said (python-sem-tomllib), never read as debito-previo for good.
 #
 # ENV. GATE_HC_HQ = the directory holding the tools (default: three levels above this script); GATE_HC_TIMEOUT seconds
@@ -215,19 +217,27 @@ step_2d() {
 }
 
 # run_tmpl <tree> <outfile> <list>: the template-fragment parse guard (the city's copy) over <tree> for the template
-# files named in <list>; prints "<class> <rc>". Red needs the guard's own "FAIL --" line AND rc 1.
+# files named in <list>; prints "<class> <rc>". Red needs the guard's own "FAIL --" line AND rc 1. Green needs rc 0 AND proof
+# that a lint ran: the guard also exits 0 when it SKIPS (a template with no pack.toml above it, no gc, nothing matched), saying so
+# only in a WARNING line, so rc 0 with no "OK -- <tree>" line, or with any WARNING line, is "unlinted" (never green, never red).
 run_tmpl() {
   local t="$1" out="$2" list="$3" r=0 f=""
   set --
   while IFS= read -r f; do set -- "$@" "$f"; done < "$list"
   env "PATH=$(dirname "$PY"):$PATH" "$TBIN" "$TMO" bash "$HQ_DIR/packs/town-deltas/assets/template-fragment-lint-guard.sh" "$t" "$@" > "$out" 2>&1 || r=$?
-  if [ "$r" -eq 0 ]; then printf 'green %s' "$r"
+  if [ "$r" -eq 0 ]; then
+    # vazio → saída sem linha OK desta árvore (the guard matched nothing): unlinted; falhou/ilegível → grep não lê $out, não acha
+    # linha OK: unlinted. Any WARNING line (a skipped file) is unlinted too. Green is an OK line ending in " -- <tree>[/…]": the
+    # guard echoes branch-controlled file names, and a line naming the scratch path (unknown to the branch author) cannot be forged.
+    if grep -q '^template-fragment-lint-guard: WARNING:' "$out"; then printf 'unlinted %s' "$r"
+    elif grep '^template-fragment-lint-guard: OK' "$out" | grep -F -q -- " -- $t"; then printf 'green %s' "$r"
+    else printf 'unlinted %s' "$r"; fi
   elif [ "$r" -eq 1 ] && grep -q '^template-fragment-lint-guard: FAIL' "$out"; then printf 'red %s' "$r"
   else printf 'unknown %s' "$r"; fi
 }
 
 step_2b() {
-  local cr="" cls="" bcr=""
+  local cr="" cls="" bcr="" ccls=""
   [ -r "$HQ_DIR/packs/town-deltas/assets/template-fragment-lint-guard.sh" ] || emit nao-consegui-medir ferramenta-ilegivel
   tool_altered "$ASSETS_REL/template-fragment-lint-guard.sh" && emit nao-consegui-medir ferramenta-alterada-no-diff
   # The guard exits 0 with only a WARNING when gc is absent, and fails on every report when jq is: neither may read as a verdict.
@@ -236,21 +246,33 @@ step_2b() {
   WANT=tmpl
   extract "$tip" "$SCRATCH/tip" || emit nao-consegui-medir extracao-tip
   cr="$(run_tmpl "$SCRATCH/tip" "$SCRATCH/tip.out" "$SCRATCH/hits.nl")"; cls="${cr%% *}"; TIPC="$cls"; RC="${cr##* }"
-  case "$cls" in (green) ok_or_special parse-verde-no-tip ;; (red) ;; (*) emit nao-consegui-medir parse-inconclusivo-tip ;; esac
+  # vazio → detalhe vazio; falhou/ilegível → detalhe vazio (the verdict line alone still says what was measured)
   DETAIL="$(cap "$(cat "$SCRATCH/tip.out")")"
+  case "$cls" in
+    (green) DETAIL=""; ok_or_special parse-verde-no-tip ;;
+    (red) ;;
+    (unlinted) emit nao-consegui-medir lint-nao-rodou-no-tip ;;
+    (*) DETAIL=""; emit nao-consegui-medir parse-inconclusivo-tip ;;
+  esac
   # Positive control: a plain pack must lint green here. If it does not (gc cannot lint at all, jq breaks the report) every
   # tree reads red, and "red on the base too" would be debito-previo for good: said out loud instead.
   mkdir -p "$SCRATCH/ctl/agents/ctl" || { DETAIL=""; emit nao-consegui-medir sem-controle; }
   printf '[pack]\nname = "ctl"\nschema = 2\n' > "$SCRATCH/ctl/pack.toml"
   printf 'plain text.\n' > "$SCRATCH/ctl/agents/ctl/prompt.template.md"
   printf 'agents/ctl/prompt.template.md\n' > "$SCRATCH/ctl.nl"
-  cr="$(run_tmpl "$SCRATCH/ctl" "$SCRATCH/ctl.out" "$SCRATCH/ctl.nl")"
-  case "${cr%% *}" in (green) ;; (*) DETAIL="$(cap "$(cat "$SCRATCH/ctl.out")")"; emit nao-consegui-medir gc-lint-controle-vermelho ;; esac
+  cr="$(run_tmpl "$SCRATCH/ctl" "$SCRATCH/ctl.out" "$SCRATCH/ctl.nl")"; ccls="${cr%% *}"
+  # vazio → detalhe vazio, e a classe do controle já não era green; falhou/ilegível → detalhe vazio, o mesmo nao-consegui-medir
+  case "$ccls" in
+    (green) ;;
+    (unlinted) DETAIL="$(cap "$(cat "$SCRATCH/ctl.out")")"; emit nao-consegui-medir gc-lint-controle-nao-rodou ;;
+    (*) DETAIL="$(cap "$(cat "$SCRATCH/ctl.out")")"; emit nao-consegui-medir gc-lint-controle-vermelho ;;
+  esac
   extract "$base" "$SCRATCH/base" || { DETAIL=""; emit nao-consegui-medir extracao-base; }
   bcr="$(run_tmpl "$SCRATCH/base" "$SCRATCH/base.out" "$SCRATCH/hits.nl")"; BASEC="${bcr%% *}"
   case "$BASEC" in
     (green) emit fail parse-vermelho-no-tip-e-verde-na-base ;;
     (red) emit debito-previo parse-vermelho-na-base-tambem ;;
+    (unlinted) DETAIL="$(cap "$(cat "$SCRATCH/base.out")")"; emit nao-consegui-medir lint-nao-rodou-na-base ;;
     (*) DETAIL=""; emit nao-consegui-medir parse-inconclusivo-base ;;
   esac
 }
