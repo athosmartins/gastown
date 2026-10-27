@@ -37,7 +37,7 @@ cat > "$W/bd" <<'EOF'
 #!/bin/sh
 # bd de brinquedo: bd -C RIG show ID --json | list -l LABEL --json --limit 0 | create TITULO … --stdin --json | comment ID --stdin. Anota a linha (bd.calls) e o stdin (bd.stdin.N, N = chamadas que NÃO são list).
 # bd.beads = as beads do rig, uma por linha: "ID STATUS [outro|sem]" (outro = outra label, sem = sem a chave labels); o create REGISTRA a bead em bd.beads, e é o que o list devolve.
-# Se bd.status existe, o show E o list dão esse status a TODAS as beads (o dono "fechou": no bd de verdade as duas leituras vêm do mesmo registro).
+# bd.label = a label que o list dá às beads (padrão origem:lastro-wa-suite). Se bd.status existe, o show E o list dão esse status a TODAS as beads (o dono "fechou": no bd de verdade as duas leituras vêm do mesmo registro).
 # Falhas por arquivo: bd.show.fail · bd.list.fail (sai 1) · bd.list.garbage (não é JSON) · bd.list.shape (JSON que não é lista) · bd.create.fail (sai 1 SEM criar) ·
 #   bd.create.lands-fail (CRIA e depois sai 1) · bd.create.lands-timeout (CRIA e depois fica parado: o prazo do script tem que matá-lo) · bd.create.noid (CRIA e responde sem id) · bd.comment.fail
 W="$(cd "$(dirname "$0")" && pwd)"
@@ -50,7 +50,7 @@ if [ "$3" = list ]; then
   while read -r id st lb; do
     [ -n "$id" ] || continue
     [ -f "$W/bd.status" ] && st=$(cat "$W/bd.status")
-    case "$lb" in outro) lab=',"labels":["outra:coisa"]';; sem) lab='';; *) lab=',"labels":["origem:lastro-wa-suite","area:testes"]';; esac
+    case "$lb" in outro) lab=',"labels":["outra:coisa"]';; sem) lab='';; *) lab=',"labels":["'"$(cat "$W/bd.label" 2> /dev/null || echo origem:lastro-wa-suite)"'","area:testes"]';; esac
     printf '%s{"id":"%s","status":"%s"%s}' "$sep" "$id" "$st" "$lab"; sep=','
   done < "$W/bd.beads"
   echo ']'; exit 0
@@ -80,15 +80,26 @@ n, off = int(sys.argv[1]), int(sys.argv[2])
 print(json.dumps({"v": 1, "main": "c" * 40, "items": {"tests/t%03d.py::t" % i: {"from": "a" * 40, "to": "b" * 40, "seen": "c" * 40} for i in range(off, off + n)}}))' "$1" "${2:-0}" > "$W/node.confirmed"
 }
 nf() { OUT=$(env GC_CITY_PATH="$CITY" HB_SSH="$W/ssh" HB_BD="$W/bd" HB_WA_RIG=/rig HETZNER_NODE_HOST=node HB_BD_TIMEOUT="${BDT:-}" "$PY" -I "$NF" 2>&1); RC=$?; }   # BDT=N nf → prazo do bd em N s (vazio = o padrão do script)
+nx() { OUT=$(env GC_CITY_PATH="$CITY" HB_SSH="$W/ssh" HB_BD="$W/bd" HB_WA_RIG=/rig HB_HQ_RIG="${HQRIG-/hq}" HETZNER_NODE_HOST=node "$PY" -I "$NF" "$@" 2>&1); RC=$?; }   # nx ARGS… (HQRIG="" → rig do HQ vazio, cai na cidade)
+nh() { nx --fonte hq-mutants; }
+hqcity() { newcity; echo origem:lastro-hq-mutants > "$W/bd.label"; }
+mkhq() {  # mkhq QUANTOS [DESLOCAMENTO=0] — o hq-mutants.state.json do nó com QUANTOS sobreviventes s0NN em 2 alvos (par → a.sh, ímpar → b.sh), mais um alvo SEM a chave survivors
+  "$PY" -I -c 'import sys, json
+n, off = int(sys.argv[1]), int(sys.argv[2])
+t = {"scripts/a.sh": {"hash": "h", "survivors": {}}, "scripts/b.sh": {"hash": "h", "survivors": {}}, "scripts/c.sh": {"hash": "h", "total": 3}}
+for i in range(off, off + n):
+    t["scripts/%s.sh" % "ab"[i % 2]]["survivors"]["s%03d" % i] = {"id": "s%03d" % i, "file": "scripts/%s.sh" % "ab"[i % 2], "line": 10 + i, "op": "cmp", "old": "-eq", "new": "-ne", "selftest": ["scripts/%s.selftest.sh" % "ab"[i % 2]]}
+print(json.dumps({"v": 1, "targets": t}))' "$1" "${2:-0}" > "$W/node.confirmed"
+}
 calls() { grep -c -- "$1" "$W/$2" 2> /dev/null || true; }   # calls PADRAO ARQUIVO — quantas linhas anotadas casam
 state() { "$PY" -I -c 'import sys, json
 try:
-    v = json.load(open(sys.argv[1] + "/.gc/hetzner-ballast/newfail.json"))
+    v = json.load(open(sys.argv[1] + "/.gc/hetzner-ballast/" + sys.argv[3]))
 except FileNotFoundError:
     print("ausente"); sys.exit(0)
 except (OSError, ValueError):
     print("ilegivel"); sys.exit(0)
-print(v.get(sys.argv[2]) if isinstance(v, dict) else "forma")' "$CITY" "$1"; }
+print(v.get(sys.argv[2]) if isinstance(v, dict) else "forma")' "$CITY" "$1" "${2:-newfail.json}"; }   # state CHAVE [ARQUIVO]
 
 g_all() {
   newcity semflag; mkconf 3; nf
@@ -183,7 +194,67 @@ g_all() {
   check "newfail: 237 confirmadas → o corpo traz os 237 ids (a lista COMPLETA, sem o corte de 15 do resumo)" "237" "$(grep -c '^  tests/t[0-9]*.py::t$' "$W/bd.stdin.1")"
 }
 
+g_hq() {  # a fonte hq-mutants (ga-2hd02v.5.6.4): lê o estado do motor, abre a bead no rig do HQ, com label, estado e rig PRÓPRIOS
+  local a
+  newcity; mkhq 3
+  for a in "--fonte" "--fonte nada" "--fonte hq-mutants x" "hq-mutants" "--fonte wa-suite hq-mutants" "--fonte=hq-mutants"; do
+    nx $a
+    check "newfail[hq]: argumento '$a' que não é UMA fonte conhecida → rc 2 'uso' e nada lido nem aberto (nunca cai na fonte padrão)" "2 1 0 0" "$RC $(printf '%s' "$OUT" | grep -c 'newfail: uso:') $(wc -l < "$W/ssh.calls" | tr -d ' ') $(wc -l < "$W/bd.calls" | tr -d ' ')"
+  done
+  newcity semflag; mkhq 3; nh
+  check "newfail[hq]: sem a bandeira do nó não faz nada (rc 0, PULADO, nenhuma chamada)" "0 1 0 0" "$RC $(printf '%s' "$OUT" | grep -c PULADO) $(wc -l < "$W/ssh.calls" | tr -d ' ') $(wc -l < "$W/bd.calls" | tr -d ' ')"
+  hqcity; mkhq 3; echo 255 > "$W/ssh.rc"; nh
+  check "newfail[hq]: ssh que não conectou (255) → rc 98 e nada aberto" "98 0" "$RC $(wc -l < "$W/bd.calls" | tr -d ' ')"
+  hqcity; echo 10 > "$W/ssh.rc"; nh
+  check "newfail[hq]: o motor ainda não gravou o estado (arquivo ausente no nó) → rc 0, nada aberto, e foi hq-mutants.state.json que se pediu ao nó" "0 0 1 ausente" "$RC $(wc -l < "$W/bd.calls" | tr -d ' ') $(calls 'hq-mutants.state.json' ssh.calls) $(state fp newfail-hq-mutants.json)"
+  hqcity; echo 11 > "$W/ssh.rc"; nh
+  check "newfail[hq]: o nó NÃO conseguiu ler o estado (rc 11) → rc 3, nunca '0 sobreviventes'" "3 0" "$RC $(wc -l < "$W/bd.calls" | tr -d ' ')"
+  bad() { hqcity; printf '%s\n' "$2" > "$W/node.confirmed"; nh; check "newfail[hq]: $1 → rc 3 e NADA aberto (erro nunca vira '0 sobreviventes')" "3 0" "$RC $(wc -l < "$W/bd.calls" | tr -d ' ')"; }
+  bad "estado do motor que não é JSON" 'isto nao e json'
+  bad "versão 2" '{"v": 2, "targets": {}}'
+  bad "targets que é uma lista" '{"v": 1, "targets": []}'
+  bad "alvo que não é objeto" '{"v": 1, "targets": {"a.sh": []}}'
+  bad "survivors que é uma lista" '{"v": 1, "targets": {"a.sh": {"survivors": []}}}'
+  bad "sobrevivente que não é objeto" '{"v": 1, "targets": {"a.sh": {"survivors": {"x": 5}}}}'
+  bad "sobrevivente com a linha em texto" '{"v": 1, "targets": {"a.sh": {"survivors": {"x": {"file": "a.sh", "line": "7"}}}}}'
+  hqcity; echo '{"v": 1, "targets": {"scripts/c.sh": {"hash": "h"}}}' > "$W/node.confirmed"; nh
+  check "newfail[hq]: alvo SEM a chave survivors (o motor também aceita) = nenhum sobrevivente → rc 0, nada aberto" "0 0" "$RC $(wc -l < "$W/bd.calls" | tr -d ' ')"
+
+  hqcity; mkhq 3; nh
+  check "newfail[hq]: lista nova → UMA bead (create no rig /hq, task, P3, stdin, json, as duas labels do hq) e o estado do hq guarda o id e n" "0 1 1 wa-new1 3" "$RC $(calls '^-C /hq create hq-mutants do lastro: 3 mutante.* -t task -p 3 --stdin --json -l origem:lastro-hq-mutants -l area:testes$' bd.calls) $(calls 'create' bd.calls) $(state bead newfail-hq-mutants.json) $(state n newfail-hq-mutants.json)"
+  check "newfail[hq]: o corpo agrupa por arquivo, com linha, troca, id e o selftest de cada sobrevivente; o alvo sem sobrevivente não aparece" "1 1 1 1 0" "$(grep -c '^ARQUIVO scripts/a.sh (2)$' "$W/bd.stdin.1") $(grep -c '^ARQUIVO scripts/b.sh (1)$' "$W/bd.stdin.1") $(grep -c '^  L10 \[cmp\] -eq -> -ne  id=s000  (testes: scripts/a.selftest.sh)$' "$W/bd.stdin.1") $(grep -c '^  L12 .* id=s002' "$W/bd.stdin.1") $(grep -c 'c.sh' "$W/bd.stdin.1")"
+  check "newfail[hq]: as fontes não dividem estado: o newfail.json do wa-suite não nasceu" "ausente" "$(state fp newfail.json)"
+  nh
+  check "newfail[hq]: a MESMA lista de novo → nada a fazer (continuam as 2 chamadas: list e create)" "0 1 2" "$RC $(printf '%s' "$OUT" | grep -c 'nada a fazer') $(wc -l < "$W/bd.calls" | tr -d ' ')"
+  mkhq 4; nh
+  check "newfail[hq]: lista que MUDA com a bead aberta → comentário na MESMA bead (nenhum create novo), com o id novo no corpo" "0 1 1 1" "$RC $(calls 'comment wa-new1 --stdin' bd.calls) $(calls 'create' bd.calls) $(grep -c 'id=s003' "$W/bd.stdin.3")"
+  echo closed > "$W/bd.status"; mkhq 5; nh
+  check "newfail[hq]: bead FECHADA pelo dono + lista diferente → abre outra (2 creates no total)" "0 2" "$RC $(calls 'create' bd.calls)"
+  hqcity; mkhq 2; nh; echo '{"v": 1, "targets": {"scripts/a.sh": {"hash": "h", "survivors": {}}}}' > "$W/node.confirmed"; : > "$W/bd.calls"; nh
+  check "newfail[hq]: lista que ZERA → um comentário 'pegos' (não fecha) e n vai a 0" "0 1 0 0 1" "$RC $(calls 'comment' bd.calls) $(calls 'close' bd.calls) $(state n newfail-hq-mutants.json) $(grep -c 'foram pegos' "$W/bd.stdin.2")"
+  hqcity; mkhq 40; nh
+  check "newfail[hq]: 40 sobreviventes → o corpo traz os 40 (a lista COMPLETA, sem o corte de 15 do resumo)" "40" "$(grep -c 'id=s[0-9][0-9][0-9]' "$W/bd.stdin.1")"
+
+  hqcity; mkhq 2; HQRIG= nh
+  check "newfail[hq]: HB_HQ_RIG vazio → o rig do HQ é a cidade (nunca um '-C' vazio)" "0 1" "$RC $(calls "^-C $CITY create " bd.calls)"
+  hqcity; mkhq 2; nh; : > "$W/bd.beads"; rm -f "$W/bd.label"; mkconf 3; nf
+  check "newfail[hq]: as duas fontes na MESMA cidade: uma bead em cada rig (/hq e /rig), cada uma no seu estado" "0 1 1 wa-new1 wa-new2 2 3" "$RC $(calls '^-C /hq create' bd.calls) $(calls '^-C /rig create' bd.calls) $(state bead newfail-hq-mutants.json) $(state bead newfail.json) $(state n newfail-hq-mutants.json) $(state n newfail.json)"
+  newcity; mkhq 3; printf 'x1 open\nx2 in_progress\n' > "$W/bd.beads"; nh
+  check "newfail[hq]: beads com a label do wa-suite no rig NÃO são nossas (a label é a do hq): lista com ela e abre a bead (1 list, 1 create, 0 comment)" "0 1 1 0" "$RC $(calls '^-C /hq list -l origem:lastro-hq-mutants --json --limit 0$' bd.calls) $(calls 'create' bd.calls) $(calls 'comment' bd.calls)"
+  hqcity; mkhq 3; printf 'x9 closed\nx7 open\nx2 in_progress\n' > "$W/bd.beads"; nh
+  check "newfail[hq]: o rig já tem 2 nossas (label do hq) não fechadas → comenta na de MENOR id (x2), 0 create, estado com x2" "0 0 1 x2" "$RC $(calls 'create' bd.calls) $(calls 'comment x2 --stdin' bd.calls) $(state bead newfail-hq-mutants.json)"
+  hqcity; mkhq 3; touch "$W/bd.create.lands-fail"; nh
+  check "newfail[hq]: bd create que CRIA a bead e sai com rc≠0 → rc 3 e estado do hq NÃO gravado" "3 ausente" "$RC $(state fp newfail-hq-mutants.json)"
+  rm -f "$W/bd.create.lands-fail"; : > "$W/bd.calls"; nh
+  check "newfail[hq]: volta seguinte lista o rig do hq, acha a bead que nasceu e comenta nela (0 create, estado com o id)" "0 0 1 1 wa-new1" "$RC $(calls 'create' bd.calls) $(calls 'comment wa-new1 --stdin' bd.calls) $(calls 'list -l origem:lastro-hq-mutants' bd.calls) $(state bead newfail-hq-mutants.json)"
+  hqcity; mkhq 3; mkdir -p "$CITY/.gc/hetzner-ballast"; echo lixo > "$CITY/.gc/hetzner-ballast/newfail-hq-mutants.json"; nh
+  check "newfail[hq]: estado local do hq ilegível → rc 3, não abre nem comenta" "3 0" "$RC $(wc -l < "$W/bd.calls" | tr -d ' ')"
+  hqcity; mkhq 3; mkdir -p "$CITY/.gc/hetzner-ballast"; echo lixo > "$CITY/.gc/hetzner-ballast/newfail.json"; nh
+  check "newfail[hq]: o estado do WA ilegível não trava o do hq: abre a bead (rc 0, 1 create)" "0 1" "$RC $(calls 'create' bd.calls)"
+}
+
 g_all
+g_hq
 echo "── $((n - fails))/$n ok"
 if [ -n "${HNF_MUTANT:-}" ]; then echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
 
@@ -194,28 +265,45 @@ if [ -n "${HNF_MUTANT:-}" ]; then echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exi
   cat > "$T/mutants.txt" <<'MUT'
 a bandeira do nó é ignorada@@    if not os.path.exists(os.path.join(CITY, ".gc", "hetzner-node.on")):@@    if False:
 o corpo da bead corta a lista em 15@@        out.extend("  " + i for i in sorted(ids))@@        out.extend("  " + i for i in sorted(ids)[:15])
-leitura do nó que falha vira 'ausente' (zero confirmadas)@@        return "ilegivel", "o nó não leu wa-suite.confirmed (rc=%d)" % r.returncode@@        return "ausente", None
-JSON ruim do nó vira lista vazia@@        return "ilegivel", "wa-suite.confirmed não é JSON"@@        return "ok", {}
+leitura do nó que falha vira 'ausente' (zero confirmadas)@@        return "ilegivel", "o nó não leu %s (rc=%d)" % (F["arquivo"], r.returncode)@@        return "ausente", None
+JSON ruim do nó vira lista vazia@@        return "ilegivel", "%s não é JSON" % F["arquivo"]@@        return "ok", {}
 bead fechada recebe comentário em vez de abrir outra@@        action = "comentar" if status == "open" else "criar"@@        action = "comentar"
 bead ilegível não impede abrir outra@@        if status is None:@@        if False:
 lista que muda não é percebida (a impressão digital não compara)@@    if bead and fp == last_fp:@@    if bead:
-estado local ilegível vira estado vazio@@        return None, "newfail.json ilegível (%s)" % type(e).__name__@@        return {}, ""
+estado local ilegível vira estado vazio@@        return None, "%s ilegível (%s)" % (os.path.basename(F["estado"]), type(e).__name__)@@        return {}, ""
 abre a bead sem listar o rig antes (a que a volta anterior criou sem saber é duplicada)@@        ours, why = find_ours()@@        ours, why = [], ""
 achou uma bead nossa aberta e abre outra mesmo assim@@        if ours:@@        if False:
 adota a bead de MAIOR id em vez da menor@@            bead, action = ours[0], "comentar"@@            bead, action = ours[-1], "comentar"
-bd list que falha vira "nenhuma nossa" (abre outra)@@        return None, "não consegui listar o rig do WA (o bd não respondeu, estourou o prazo de %g s ou saiu com erro)" % BD_TIMEOUT@@        return [], ""
-bd list com lixo (não é JSON) vira "nenhuma nossa"@@        return None, "o bd list do rig do WA não devolveu JSON"@@        return [], ""
+bd list que falha vira "nenhuma nossa" (abre outra)@@        return None, "não consegui listar o rig do %s (o bd não respondeu, estourou o prazo de %g s ou saiu com erro)" % (F["rig_nome"], BD_TIMEOUT)@@        return [], ""
+bd list com lixo (não é JSON) vira "nenhuma nossa"@@        return None, "o bd list do rig do %s não devolveu JSON" % F["rig_nome"]@@        return [], ""
 bd list com JSON que não é lista dá traceback@@    if not isinstance(v, list):@@    if False:
-bead nossa FECHADA conta como aberta@@        if LABELS[0] in (labels or []) and x["status"] != "closed":@@        if LABELS[0] in (labels or []):
-bead de OUTRA label (ou sem labels) conta como nossa@@        if LABELS[0] in (labels or []) and x["status"] != "closed":@@        if x["status"] != "closed":
-a listagem esquece o --limit 0 (trunca em 50 sem avisar)@@    r = run([BD, "-C", WA_RIG, "list", "-l", LABELS[0], "--json", "--limit", "0"], timeout=BD_TIMEOUT)@@    r = run([BD, "-C", WA_RIG, "list", "-l", LABELS[0], "--json"], timeout=BD_TIMEOUT)
+bead nossa FECHADA conta como aberta@@        if F["labels"][0] in (labels or []) and x["status"] != "closed":@@        if F["labels"][0] in (labels or []):
+bead de OUTRA label (ou sem labels) conta como nossa@@        if F["labels"][0] in (labels or []) and x["status"] != "closed":@@        if x["status"] != "closed":
+a listagem esquece o --limit 0 (trunca em 50 sem avisar)@@    r = run([BD, "-C", F["rig"], "list", "-l", F["labels"][0], "--json", "--limit", "0"], timeout=BD_TIMEOUT)@@    r = run([BD, "-C", F["rig"], "list", "-l", F["labels"][0], "--json"], timeout=BD_TIMEOUT)
 o prazo do bd ignora HB_BD_TIMEOUT@@        v = float(os.environ.get("HB_BD_TIMEOUT") or 90)@@        v = 90.0
-o texto da falha do create volta a afirmar que nada foi registrado@@Não sei se a bead nasceu no rig do WA;@@Nada foi registrado no rig do WA;
+o texto da falha do create volta a afirmar que nada foi registrado@@Não sei se a bead nasceu no rig do %s;@@Nada foi registrado no rig do %s;
 escrita do estado local que falha vira silêncio (rc 0)@@        die(3, "%s, mas NÃO gravei o estado local (%s): %s" % (done, e, next_round))@@        pass
 a criação não grava o estado (a próxima volta não sabe da bead)@@    save_state_or_die(fp, new, len(items), "abri %s" % new, "a próxima volta lista o rig e comenta nela em vez de abrir outra")@@    pass
 o comentário da lista nova não grava o estado (repete a cada volta)@@        save_state_or_die(fp, bead, len(items), "comentei a lista nova em %s" % bead, "a próxima volta repete o comentário")@@        pass
 o comentário 'corrigidas' não grava o estado (repete a cada volta)@@            save_state_or_die(fp, bead, 0, "comentei em %s que foram corrigidas" % bead, "a próxima volta repete o comentário")@@            pass
 lista que zera não comenta@@        if bead and last_n:@@        if False:
+a fonte hq-mutants usa a label do wa-suite@@labels=("origem:lastro-hq-mutants", "area:testes")@@labels=("origem:lastro-wa-suite", "area:testes")
+a fonte hq-mutants divide o estado com o wa-suite@@estado="newfail-hq-mutants.json"@@estado="newfail.json"
+a fonte hq-mutants pede ao nó o arquivo do wa-suite@@arquivo="hq-mutants.state.json"@@arquivo="wa-suite.confirmed"
+a fonte hq-mutants abre a bead no rig do WA@@rig=os.environ.get("HB_HQ_RIG") or CITY@@rig=os.environ.get("HB_WA_RIG") or CITY
+HB_HQ_RIG vazio vira o rig vazio (-C '')@@rig=os.environ.get("HB_HQ_RIG") or CITY@@rig=os.environ.get("HB_HQ_RIG", CITY)
+a bead do hq nasce bug P2 (como a do wa-suite)@@tipo="task", prio="3"@@tipo="bug", prio="2"
+a lista que zera fala 'corrigidas' e não 'pegos'@@foram pegos: a lista atual está vazia@@foram corrigidas: a lista atual está vazia
+só o 1º alvo do estado do motor entra na lista@@    for ent in targets.values():@@    for ent in list(targets.values())[:1]:
+survivors que não é objeto passa@@        if not isinstance(surv, dict):@@        if False:
+alvo que não é objeto vira "sem sobrevivente"@@        surv = ent.get("survivors", {}) if isinstance(ent, dict) else None@@        surv = ent.get("survivors", {}) if isinstance(ent, dict) else {}
+alvo sem a chave survivors dá traceback@@        surv = ent.get("survivors", {}) if isinstance(ent, dict) else None@@        surv = ent["survivors"] if isinstance(ent, dict) else None
+sobrevivente com a linha em texto passa@@isinstance(r.get("line"), int) and @@
+o corpo corta os sobreviventes em 15@@        for line, sid, r in sorted(rows, key=lambda x: (x[0], x[1])):@@        for line, sid, r in sorted(rows, key=lambda x: (x[0], x[1]))[:15]:
+o corpo esquece o id do sobrevivente@@r.get("new", "").replace("\n", "\\n"), sid, @@r.get("new", "").replace("\n", "\\n"), "", 
+fonte que não conheço cai na padrão (wa-suite)@@    die(2, "uso: hetzner-ballast-newfail.py [--fonte %s]" % "|".join(sorted(FONTES)))@@    return "wa-suite"
+nome de fonte desconhecido dá traceback em vez de rc 2@@    if len(argv) == 2 and argv[0] == "--fonte" and argv[1] in FONTES:@@    if len(argv) == 2 and argv[0] == "--fonte":
+sem argumento a fonte padrão passa a ser hq-mutants@@        return "wa-suite"@@        return "hq-mutants"
 MUT
   "$PY" -I - "$NF" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import re, sys
