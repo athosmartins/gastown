@@ -896,6 +896,12 @@ EOF
     wstopped "a selftest label with --max-disk-drop-mb 4, the writer a grandchild of the step"
     grep -q 'fell' "$W/werr" && grep -q 'limit 4 MB' "$W/werr" || bad "watch: the drop refusal must say how far it fell and the limit ($(cat "$W/werr"))"
   fi
+  if wwant escape; then
+    # a battery runs each mutant under `timeout` (or with `set -m`, or setsid), which gives it a process group of its own: the group of the step does not hold it, and the runaway
+    # went on writing. The step here is that battery: the writer runs in a group of its own; the watch has to find it by the parent chain and stop it with the rest.
+    wrun --what selftest-mutants --max-disk-drop-mb 4 -- bash -c 'set -m; bash "$0" "$@" & wait $!; exit $?' "$W/wloop.sh" "$WF" "$W/wdone"
+    wstopped "a writer that left the step's process group (set -m, like a mutant run under timeout)"
+  fi
   if wwant class; then
     HEAVY_GUARD_SELFTEST_MAX_DROP_MB=4 wrun --what t -- bash "$W/wloop.selftest.sh" "$WF" "$W/wdone"
     wstopped "a *.selftest.sh word in the command, the limit from the env"
@@ -1162,6 +1168,7 @@ wcm w-nooption  "watch: --max-disk-drop-mb is not an option"                    
 wcm w-nodigit   "watch: --max-disk-drop-mb accepts anything"                          plain  's#^  case "\$drop" in .*exit 64 ;; esac$#  :#'
 wcm w-nolen     "watch: --max-disk-drop-mb has no magnitude cap"                      plain  '/^  \[ "\${#drop}" -le 9 \]/d'
 wcm w-orphan    "watch: the watch outlives a step whose guard was KILLed"            orphan 's#^    kill -0 "\$pid" 2>/dev/null || return 0$#    :#'
+wcm w-notree    "watch: a descendant outside the step's process group is left running" escape 's#^  tree="\$(hg_descendants "\$p" 2>/dev/null)" || tree=""$#  tree=""#'
 
 [ "$AMB_OK" = 1 ] || echo "AMBIENTE: the inherited write limit ($(bash -c 'ulimit -S -f' 2>/dev/null) soft, $(bash -c 'ulimit -H -f' 2>/dev/null) hard, in KB) is already a cap of 512 MB or less: the cases that tell 'capped at 512 MB' from 'not capped' did not run and $UNVER file-cap mutant(s) are UNVERIFIED:${UNVER_NAMES:- none} (run this selftest without the cap: heavy-guard.sh --max-file-mb 0, or bare on the node)"
 echo "heavy-guard selftest: $PASS passed, $FAIL failed$([ "$AMB_OK" = 1 ] || echo ", $UNVER mutant(s) UNVERIFIED (AMBIENTE)")"

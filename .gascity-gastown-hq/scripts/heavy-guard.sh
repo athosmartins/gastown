@@ -132,8 +132,11 @@
 #   - a reading the watch cannot take (df fails) never stops the step: the round is blind and the log gets ONE WATCH_UNREADABLE line. The kill
 #     switch (DISK_HEADROOM_ENABLED=0) switches the whole watch off in effect: every state is ok and the drop rule is skipped.
 #   - what the step wrote STAYS on disk (TERM does not clean up after a loop): the message says to look under its TMPDIR and clean it with safe-clean.
-#   - limits: the fall is read on the whole volume, so another process writing at the same time counts against the step; a descendant that left the
-#     process group (setsid) is not reached by the TERM of the group; the step runs in the background of the guard, so it cannot read the terminal;
+#   - a mutant battery runs each mutant under `timeout`, which gives it a process group of its own, so the group of the step does not hold the runaway: the descendants
+#     are also found by the PARENT chain (read before the TERM) and get the TERM and, after the grace, the KILL. Best effort: one whose parent died first, or that was
+#     started after the chain was read, is not found.
+#   - limits: the fall is read on the whole volume, so another process writing at the same time counts against the step; the step runs in the background of the
+#     guard, so it cannot read the terminal;
 #     a guard that is KILLed (not TERMed: no trap runs) leaves its step running, and the watch stays with it and goes on reading the disk until the step ends.
 #     --check runs nothing, so it has nothing to watch: it accepts the option and only judges the disk.
 #
@@ -370,14 +373,40 @@ hg_lock_takeover() {
   return 0
 }
 
-# hg_stop_group <pid> — TERM to the process group <pid> leads (just <pid> when it leads none); what is left after the grace gets KILL
+# hg_descendants <pid> — one pid per line: every process under <pid> (children, their children, ...), found by the PARENT chain and not by the process group. A battery runs
+# each mutant under `timeout` (or with `set -m`, or setsid), which gives the mutant a group of its own, so the group of the step does not hold it.
+# vazio (nothing under <pid>, or no pgrep) → prints nothing: the group is all there is; falhou (pgrep fails) → the same, never a guess
+hg_descendants() {
+  local c
+  for c in $(pgrep -P "$1" 2>/dev/null); do
+    printf '%s\n' "$c"
+    hg_descendants "$c"
+  done
+}
+
+# hg_alive <pid> [descendant pid...] — rc 0 while the group <pid> leads, <pid> itself or any of the descendants is still there
+hg_alive() {
+  local d
+  kill -0 -- "-$1" 2>/dev/null && return 0
+  kill -0 "$1" 2>/dev/null && return 0
+  shift
+  for d in "$@"; do kill -0 "$d" 2>/dev/null && return 0; done
+  return 1
+}
+
+# hg_stop_group <pid> — TERM to the process group <pid> leads (just <pid> when it leads none) and to every descendant the parent chain finds (read BEFORE the TERM: once the
+# leader is gone its children are re-parented and the chain is lost; one started after the read is not found); what is still there after the grace gets KILL
 hg_stop_group() {
-  local p="$1" k=0 n=$(( HG_KILL_GRACE * 5 ))
+  local p="$1" k=0 n=$(( HG_KILL_GRACE * 5 )) tree d
+  tree="$(hg_descendants "$p" 2>/dev/null)" || tree=""
   kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null || return 0
-  while [ "$k" -lt "$n" ] && { kill -0 -- "-$p" 2>/dev/null || kill -0 "$p" 2>/dev/null; }; do sleep 0.2; k=$((k+1)); done
-  if kill -0 -- "-$p" 2>/dev/null || kill -0 "$p" 2>/dev/null; then
+  # the ones the group does not hold get the TERM too, so they can clean up like the rest (a pid that is already gone is no error)
+  for d in $tree; do kill -TERM "$d" 2>/dev/null; done
+  while [ "$k" -lt "$n" ] && hg_alive "$p" $tree; do sleep 0.2; k=$((k+1)); done
+  if hg_alive "$p" $tree; then
     kill -KILL -- "-$p" 2>/dev/null
     kill -KILL "$p" 2>/dev/null
+    for d in $tree; do kill -KILL "$d" 2>/dev/null; done
   fi
   return 0
 }
