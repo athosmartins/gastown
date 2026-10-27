@@ -58,6 +58,7 @@ mkrig() {
   good_doc > "$d/docs/ok.md"; bad_doc > "$d/docs/legacy.md"; bad_doc > "$d/docs/upstream.md"
   { i=0; while [ "$i" -lt 100 ]; do echo "imp $i"; i=$((i+1)); done; } > "$d/docs/imp.md"   # imported by the CLAUDE.md case; never in a diff
   ln -s ok.md "$d/docs/alias.md"   # an unchanged link named .md (AGENTS.md -> CLAUDE.md is common): never in a diff either
+  mkdir -p "$d/.claude/commands" && ln -s ../../docs/ok.md "$d/.claude/commands/gate-done.md"   # the HQ repo tracks this one: no import reaches it
   printf '[pack]\nname = "t"\nschema = 2\n' > "$d/pack.toml"; printf 'x = 1\n' > "$d/lib/app.py"
   git -C "$d" add -A >/dev/null 2>&1 && git -C "$d" commit -q -m base
 }
@@ -75,6 +76,7 @@ expect() { # expect <label> <verdict> [reason]
   else bad "$1: wanted $2${3:+ ($3)}, got verdict='$VERDICT' reason='$REASON' rc=$RC :: $(printf '%s' "$OUT" | head -n 4 | tr '\n' '|' | cut -c1-300)"; fi
 }
 has() { printf '%s\n' "$OUT" | grep -q -- "$2" && ok "$1" || bad "$1 (no '$2' in: $(printf '%s' "$OUT" | head -n 3 | tr '\n' '|' | cut -c1-200))"; }
+hasnt() { if printf '%s\n' "$OUT" | grep -q -- "$2"; then bad "$1 ('$2' is in: $(printf '%s' "$OUT" | head -n 6 | tr '\n' '|' | cut -c1-300))"; else ok "$1"; fi; }
 
 CITY="$WORK/city"; mkcity "$CITY" || { echo "FATAL: cannot build the fixture city"; exit 1; }
 R="$WORK/rig"; mkrig "$R" || { echo "FATAL: cannot build the fixture rig"; exit 1; }
@@ -108,11 +110,26 @@ branch_from "$R" main b_imp
 { printf '# T\n\n## Contents\n\n- A\n\n## A\n\n'; i=0; while [ "$i" -lt 150 ]; do echo "line $i"; i=$((i+1)); done; echo "@docs/imp.md"; } > "$R/CLAUDE.md"; TIP="$(commit_all "$R" imports)"
 run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "CLAUDE.md (158 lines, its Contents fine) + the UNCHANGED docs/imp.md it imports = over 200: every .md must be extracted" fail
 has "and the violation is the 200-line rule" "200"
+# AGENTS.md and CLAUDE.local.md are named docs too (the lint's NAMED_FILES): each counts the UNCHANGED docs/imp.md it imports, and a doc whose
+# name merely ENDS like one (MYCLAUDE.md) is not named, so its import is not counted and the lint stays clean.
+branch_from "$R" main b_agents
+{ printf '# T\n\n## Contents\n\n- A\n\n## A\n\n'; i=0; while [ "$i" -lt 150 ]; do echo "line $i"; i=$((i+1)); done; echo "@docs/imp.md"; } > "$R/AGENTS.md"; TIP="$(commit_all "$R" agents-imports)"
+run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "AGENTS.md (158 lines) + the UNCHANGED docs/imp.md it imports = over 200: a named doc, its import is counted" fail
+branch_from "$R" main b_local
+{ printf '# T\n\n## Contents\n\n- A\n\n## A\n\n'; i=0; while [ "$i" -lt 150 ]; do echo "line $i"; i=$((i+1)); done; echo "@docs/imp.md"; } > "$R/CLAUDE.local.md"; TIP="$(commit_all "$R" local-imports)"
+run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "CLAUDE.local.md (158 lines) + the UNCHANGED docs/imp.md it imports = over 200: a named doc, its import is counted" fail
+branch_from "$R" main b_near
+{ printf '# T\n\n## Contents\n\n- A\n\n## A\n\n'; i=0; while [ "$i" -lt 150 ]; do echo "line $i"; i=$((i+1)); done; echo "@docs/imp.md"; } > "$R/docs/MYCLAUDE.md"; TIP="$(commit_all "$R" near-name)"
+run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "docs/MYCLAUDE.md is no named doc: its @import is not counted, so a clean lint is a clean verdict (no imports walk)" ok lint-limpo
 branch_from "$R" main b_named; { printf '# T\n\n## Contents\n\n- A\n\n## A\n\n'; filler; } > "$R/CLAUDE.md"; TIP="$(commit_all "$R" claude-ok)"
-run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "a clean CLAUDE.md with an UNCHANGED link named .md in the tree: a pass needs a whole tree (an @import may go through it)" nao-consegui-medir entrada-especial-fora-do-diff-1
+run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "a clean CLAUDE.md beside two UNCHANGED links named .md that no import reaches (docs/alias.md, .claude/commands/gate-done.md): ok, the production path" ok lint-limpo
+branch_from "$R" main b_namedlink; { printf '# T\n\n## Contents\n\n- A\n\n## A\n\n'; filler; echo "@docs/alias.md"; } > "$R/CLAUDE.md"; TIP="$(commit_all "$R" claude-imports-link)"
+run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "the same CLAUDE.md importing the UNCHANGED link docs/alias.md: the lint reads through a link the scratch tree cannot show, so a clean lint is unmeasured" nao-consegui-medir entrada-especial-fora-do-diff-1
 branch_from "$R" main b_tchg;  { printf '# T\n\n## Contents\n\n- A\n\n## A\n\n'; filler; } > "$R/CLAUDE.md"; rm -f "$R/docs/imp.md"; ln -s ok.md "$R/docs/imp.md"; TIP="$(commit_all "$R" type-change)"
 git -C "$R" diff --name-status "$MAIN" "$TIP" | grep -q '^T[[:space:]]docs/imp.md' && ok "(fixture: docs/imp.md really is a type change, status T)" || bad "fixture: no T status in $(git -C "$R" diff --name-status "$MAIN" "$TIP" | tr '\n' '|')"
-run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "a file that changes TYPE into a link counts as changed, even though the lint's own filter skips T: refused" nao-consegui-medir extracao-tip
+run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "a file that changes TYPE into a link is skipped by the lint's own filter (T) and no import reaches it: the lint never reads it, so ok" ok lint-limpo
+branch_from "$R" main b_tchg2; { printf '# T\n\n## Contents\n\n- A\n\n## A\n\n'; filler; echo "@docs/imp.md"; } > "$R/CLAUDE.md"; rm -f "$R/docs/imp.md"; ln -s ok.md "$R/docs/imp.md"; TIP="$(commit_all "$R" type-change-imported)"
+run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "the same type change, now IMPORTED by CLAUDE.md: the lint reads through the new link, which the scratch tree cannot show, so a clean lint is unmeasured" nao-consegui-medir entrada-especial-fora-do-diff-1
 # upstream/main holds docs/upstream.md only: the lint skips a file that exists upstream, which needs the REAL refs (GIT_DIR)
 blob="$(git -C "$R" rev-parse main:docs/upstream.md)"; inner="$(printf '100644 blob %s\tupstream.md\n' "$blob" | git -C "$R" mktree)"
 up="$(printf '040000 tree %s\tdocs\n' "$inner" | git -C "$R" mktree)"; git -C "$R" update-ref refs/remotes/upstream/main "$(git -C "$R" commit-tree "$up" -m up)"
@@ -138,8 +155,9 @@ branch_from "$R" main b_impu
 run_sut 2c "$R" "$IBASE" "$TIP" ga-x;                      expect "CLAUDE.md imports an UNCHANGED uppercase .MD: the whole-tree extract takes it too" fail violacoes-doc-rules
 # The lint follows an @import to ANY regular file (resolve_import only tests S_ISREG), so the tree handed to it must hold every file a
 # named doc reaches, whatever its suffix: else the 200-line count is short and the verdict is a clean one on a tree it could not see
-# (gate_run ga-h3scrqt). The base has no unchanged link (alias.md): these cases ask for a CLEAN verdict, which a link makes unmeasured.
-branch_from "$R" main b_nb; git -C "$R" rm -q docs/alias.md
+# (gate_run ga-h3scrqt). The base KEEPS its unchanged links (docs/alias.md, .claude/commands/gate-done.md): no import below reaches them, so
+# they must not make a clean verdict unmeasured, which is how the tree looks in production (gate_run ga-osam9b5).
+branch_from "$R" main b_nb
 big() { local i=0; while [ "$i" -lt "$1" ]; do echo "big $i"; i=$((i+1)); done; }
 big 250 > "$R/docs/big.txt"; big 3 > "$R/docs/small.txt"; printf '@big.txt\n' > "$R/docs/chain.md"; ln -s big.txt "$R/docs/biglink.txt"; ln -s docs "$R/linkdir"
 printf '@cyc_b.txt\n' > "$R/docs/cyc_a.txt"; printf '@cyc_a.txt\nmore\n' > "$R/docs/cyc_b.txt"
@@ -226,7 +244,9 @@ grep -q '"bead": "ga-arm"' "$CITY/.gc/third-state-reads-arms.jsonl" 2>/dev/null 
 branch_from "$R" main e_forge; printf 'def load():\n    return open("a not switched on mode=off is switched OFF b").read()\n' | put "$R" lib/m.py; FTIP="$(commit_all "$R" forge-read)"
 run_sut 2e "$R" "$MAIN" "$FTIP" ga-arm1;                   expect "finding text that spells the tool's off-switch phrases is still refused" fail leitura-sem-teste
 run_sut 2e "$R" "$MAIN" "$OTIP" ga-arm2;                   expect "the same read beside a test that injects the failure" ok leituras-com-teste
-run_sut 2e "$R" "$MAIN" "$WTIP" ga-arm3;                   expect "a waived read" ok leituras-com-teste
+run_sut 2e "$R" "$MAIN" "$WTIP" ga-arm3;                   expect "a read that is only waived (no test at all): ok, but it must not claim the read has a test" ok ok-leituras-dispensadas
+branch_from "$R" main e_mix;   printf 'def load(p):\n    return open(p).read()\ndef load2(p):\n    return open(p).read()  # third-state-waiver: a packaged constant cannot fail\n' | put "$R" lib/m.py; printf '%b\n' "$TEST" | put "$R" tests/test_m.py; MXTIP="$(commit_all "$R" read-tested-and-waived)"
+run_sut 2e "$R" "$MAIN" "$MXTIP" ga-arm3b;                 expect "one read with a failure test and one waived: some read has a test, so leituras-com-teste" ok leituras-com-teste
 branch_from "$R" main e_none;  printf 'x = 7\n' > "$R/lib/app.py";                          NTIP="$(commit_all "$R" no-read)"
 run_sut 2e "$R" "$MAIN" "$NTIP" ga-arm10;                  expect "a diff with no read in it: ok, but it must not claim the reads have tests" ok sem-leituras-vistas
 printf 'mode=warn\n' > "$CITY/.gc/third-state-reads.conf"
@@ -262,6 +282,25 @@ printf 'print("third-state-reads-check: verdict=ok mode=enforce arm=enforce read
 run_sut 2e "$R" "$MAIN" "$RTIP" ga-st6;                    expect "an ok line with reads= but no skipped= cannot say what was left out: unmeasured" nao-consegui-medir saida-ilegivel
 printf 'print("third-state-reads-check: verdict=ok mode=enforce arm=enforce reads=4 uncovered=0 waived=1 skipped=x")\n' > "$T5"
 run_sut 2e "$R" "$MAIN" "$RTIP" ga-st7;                    expect "a skipped= that is not a number is not zero" nao-consegui-medir saida-ilegivel
+# A read that is only WAIVED carries no test: the reason says so, whatever else the line declares
+printf 'print("third-state-reads-check: verdict=ok mode=enforce arm=enforce reads=2 uncovered=0 waived=2 skipped=0")\n' > "$T5"
+run_sut 2e "$R" "$MAIN" "$RTIP" ga-st8;                    expect "reads=2 and both waived: ok, with its own reason" ok ok-leituras-dispensadas
+printf 'print("third-state-reads-check: verdict=ok mode=enforce arm=enforce reads=2 uncovered=0 waived=2 skipped=1")\n' > "$T5"
+run_sut 2e "$R" "$MAIN" "$RTIP" ga-st9;                    expect "reads=2 both waived and 1 file not analysed: the reason carries the 1 too" ok ok-leituras-dispensadas-e-1-nao-analisados
+printf 'print("third-state-reads-check: verdict=ok mode=enforce arm=enforce reads=3 uncovered=0 waived=2 skipped=0")\n' > "$T5"
+run_sut 2e "$R" "$MAIN" "$RTIP" ga-st10;                   expect "reads=3 with 2 waived: one read has its test, so leituras-com-teste" ok leituras-com-teste
+printf 'print("third-state-reads-check: verdict=ok mode=enforce arm=enforce reads=2 uncovered=0 skipped=0")\n' > "$T5"
+run_sut 2e "$R" "$MAIN" "$RTIP" ga-st11;                   expect "an ok line with reads= but no waived= cannot say how many reads have a test: unmeasured" nao-consegui-medir saida-ilegivel
+printf 'print("third-state-reads-check: verdict=ok mode=enforce arm=enforce reads=2 uncovered=0 waived=x skipped=0")\n' > "$T5"
+run_sut 2e "$R" "$MAIN" "$RTIP" ga-st12;                   expect "a waived= that is not a number is not zero" nao-consegui-medir saida-ilegivel
+printf 'print("third-state-reads-check: verdict=ok mode=enforce arm=enforce reads=1 uncovered=0 waived=2 skipped=0")\n' > "$T5"
+run_sut 2e "$R" "$MAIN" "$RTIP" ga-st13;                   expect "more waived reads than reads contradicts itself: unmeasured" nao-consegui-medir saida-ilegivel
+printf 'print("third-state-reads-check: verdict=ok mode=enforce arm=enforce reads=0 uncovered=0 waived=1 skipped=0")\n' > "$T5"
+run_sut 2e "$R" "$MAIN" "$RTIP" ga-st14;                   expect "waived reads with no read at all contradicts itself too" nao-consegui-medir saida-ilegivel
+printf 'print("third-state-reads-check: verdict=ok mode=enforce arm=enforce uncovered=0 waived=0 skipped=0")\n' > "$T5"
+run_sut 2e "$R" "$MAIN" "$RTIP" ga-st15;                   expect "an ok line with no reads= cannot say what was read: unmeasured, never 'every read has a test'" nao-consegui-medir saida-ilegivel
+printf 'print("third-state-reads-check: verdict=ok mode=enforce arm=enforce reads=x uncovered=0 waived=0 skipped=0")\n' > "$T5"
+run_sut 2e "$R" "$MAIN" "$RTIP" ga-st16;                   expect "a reads= that is not a number is not zero" nao-consegui-medir saida-ilegivel
 CITY_UNDER=""
 
 echo "F. 2d E12 coverage (real e12-crew-doctrine.sh over the fixture's prompts; the city's generator, never the branch's)"
@@ -303,13 +342,22 @@ CITY_UNDER=""
 
 echo "G. 2b template parse (stub gc behind a PATH of symlinks: the real gc lint is not on this node)"
 FB="$WORK/fb"; mkdir -p "$FB"
-for t in bash sh env git grep awk sed tr cat mkdir rm dirname basename mktemp cp cut head tail sort uniq python3 timeout jq ls wc; do p="$(command -v "$t" 2>/dev/null)" && ln -sf "$p" "$FB/$t"; done
+for t in bash sh env git grep awk sed tr cat mkdir rm dirname basename mktemp cp cut head tail sort uniq comm python3 timeout jq ls wc; do p="$(command -v "$t" 2>/dev/null)" && ln -sf "$p" "$FB/$t"; done
 cat > "$FB/gc" <<'STUB'
 #!/bin/sh
-# gc lint <pack> --json: red when any file under <pack> holds BADTEMPLATE (or when STUB_GC_FAIL is set)
+# gc lint <pack> --json: red when any file under <pack> holds BADTEMPLATE (or when STUB_GC_FAIL is set). One error diagnostic per such
+# file, at that file's path; its message counts the BADTEMPLATE lines in it, so a second break in a file that was already broken reads
+# as a different error (the real gc names the broken action in the message).
 [ "$1" = lint ] || exit 2
-if [ -n "${STUB_GC_FAIL:-}" ] || grep -r -q BADTEMPLATE "$2" 2>/dev/null; then
-  printf '{"error_count":1,"packs":[{"name":"p","path":"%s","ok":false,"diagnostics":[{"severity":"error","path":"%s/agents/x/prompt.template.md","message":"template: prompt:1:2: bad"}]}]}\n' "$2" "$2"; exit 1
+files="$(grep -r -l BADTEMPLATE "$2" 2>/dev/null)"
+if [ -z "$files" ] && [ -n "${STUB_GC_FAIL:-}" ]; then files="$2/agents/x/prompt.template.md"; fi
+if [ -n "$files" ]; then
+  d=""; n=0
+  for f in $files; do
+    n=$((n + 1)); c="$(grep -c BADTEMPLATE "$f" 2>/dev/null)"
+    d="$d${d:+,}{\"severity\":\"error\",\"path\":\"$f\",\"message\":\"template: prompt:1:2: bad x${c:-0}\"}"
+  done
+  printf '{"error_count":%s,"packs":[{"name":"p","path":"%s","ok":false,"diagnostics":[%s]}]}\n' "$n" "$2" "$d"; exit 1
 fi
 printf '{"error_count":0,"packs":[{"name":"p","path":"%s","ok":true,"diagnostics":[]}]}\n' "$2"
 STUB
@@ -324,6 +372,18 @@ has "the guard's FAIL line reaches the refusal" "template-fragment-lint-guard: F
 branch_from "$R" "$GBAD" g_debt; printf 'more\n' >> "$R/$HQ/agents/thies-wa/prompt.template.md"; GDEBT="$(commit_all "$R" tmpl-debt)"
 run_sut 2b "$R" "$GBAD" "$GDEBT" ga-x PATH="$FB";          expect "red on the base too: main's debt" debito-previo
 run_sut 2b "$R" "$MAIN" "$GBAD" ga-x PATH="$FB" STUB_GC_FAIL=1; expect "a gc that cannot lint anything fails the CONTROL: said, not 'debt for good'" nao-consegui-medir gc-lint-controle-vermelho
+# "Red on the base too" is a SET question, as in 2d: main's one break must not carry a second one (gate_run ga-osam9b5, blocking finding).
+# The guard prints one FAIL line per red pack and one NEW line per error: those are the lines compared, not the pack's class.
+branch_from "$R" main k_frag;  printf 'BADTEMPLATE\n' >> "$R/$HQ/packs/town-deltas/template-fragments/town-deltas.template.md"; KFRAG="$(commit_all "$R" fragment-debt)"
+branch_from "$R" "$KFRAG" k_same; printf 'plain\n' >> "$R/$HQ/agents/mila-wa/prompt.template.md"; KSAME="$(commit_all "$R" fragment-debt-other-edit)"
+run_sut 2b "$R" "$KFRAG" "$KSAME" ga-x PATH="$FB";         expect "control: main's fragment is broken, this diff edits another prompt and adds no break: still main's debt" debito-previo parse-vermelho-na-base-tambem
+run_sut 2b "$R" "$KFRAG" "$KSAME" ga-x PATH="$FB" "TMPDIR=$WORK/tmplink/"; expect "same debt, scratch under a TMPDIR that ends in a slash and goes through a link: still main's debt (the pack line carries the path)" debito-previo parse-vermelho-na-base-tambem
+branch_from "$R" "$KFRAG" k_new; printf 'BADTEMPLATE\n' | put "$R" "$HQ/agents/gemini-test/prompt.template.md"; KNEW="$(commit_all "$R" fragment-debt-new-break)"
+run_sut 2b "$R" "$KFRAG" "$KNEW" ga-x PATH="$FB";          expect "caseF: main's fragment is broken, and this diff adds a NEW break in agents/gemini-test (same pack): refused" fail parse-vermelho-novo-no-tip
+has "and the refusal names the new break" "gemini-test"
+hasnt "and lists only the new one, not main's fragment" "town-deltas.template.md"
+branch_from "$R" "$KFRAG" k_twice; printf 'BADTEMPLATE\n' >> "$R/$HQ/packs/town-deltas/template-fragments/town-deltas.template.md"; KTWICE="$(commit_all "$R" fragment-second-break)"
+run_sut 2b "$R" "$KFRAG" "$KTWICE" ga-x PATH="$FB";        expect "a SECOND break in the file main already breaks (a different error line): refused" fail parse-vermelho-novo-no-tip
 
 echo "G2. 2b: an exit 0 is not proof that a lint ran (the parse guard exits 0 when it SKIPS; gate_run ga-rrje9vk)"
 # rig2 has no pack.toml anywhere, like whatsapp_automation, which tracks a .md.tmpl outside every pack: the guard skips with a warning.
@@ -346,11 +406,39 @@ branch_from "$R2" "$IB2" i_tip; printf 'y\n' | put "$R2" loose/x.md.tmpl; printf
 run_sut 2b "$R2" "$IB2" "$IT2" ga-x PATH="$FB";            expect "the broken pack linted green on the base, beside a loose template the base could not lint: refused" fail parse-vermelho-no-tip-e-verde-na-base
 branch_from "$R2" "$IB2" i_tip2; printf 'z\n' | put "$R2" sub/agents/a/prompt.template.md; printf '[pack]\nname = "n"\nschema = 2\n' | put "$R2" np/pack.toml; printf 'BADTEMPLATE\n' | put "$R2" np/agents/a/prompt.template.md; IT3="$(commit_all "$R2" tip-newpack)"
 run_sut 2b "$R2" "$IB2" "$IT3" ga-x PATH="$FB";            expect "a pack linted green on the base is no proof for a NEW pack the base never had" nao-consegui-medir lint-nao-rodou-na-base
+echo "G3. 2b: a base that is red in one pack is not red in the others (gate_run ga-osam9b5)"
+# Both packs hold agents/x/prompt.template.md: the NEW line (pack name, path inside the pack, message) is the same for both, so only the
+# "FAIL -- <pack>" line tells them apart. The single-pack caseF above is the opposite: the FAIL line is the same, only the NEW line differs.
+branch_from "$R2" main j_base
+printf '[pack]\nname = "a"\nschema = 2\n' | put "$R2" pa/pack.toml; printf 'BADTEMPLATE\n' | put "$R2" pa/agents/x/prompt.template.md
+printf '[pack]\nname = "b"\nschema = 2\n' | put "$R2" pb/pack.toml; printf 'fine\n' | put "$R2" pb/agents/x/prompt.template.md; JB="$(commit_all "$R2" a-red-b-green)"
+branch_from "$R2" "$JB" j_g; printf 'BADTEMPLATE\nedited\n' | put "$R2" pa/agents/x/prompt.template.md; printf 'BADTEMPLATE\n' | put "$R2" pb/agents/x/prompt.template.md; JG="$(commit_all "$R2" breaks-b)"
+run_sut 2b "$R2" "$JB" "$JG" ga-x PATH="$FB";              expect "caseG: pack A is red on the base, and this diff breaks pack B, green there: refused" fail parse-vermelho-novo-no-tip
+has "and the refusal names pack B" 'FAIL -- pb$'
+hasnt "and not main's pack A" 'FAIL -- pa$'
+branch_from "$R2" "$JB" j_s; printf 'BADTEMPLATE\nedited again\n' | put "$R2" pa/agents/x/prompt.template.md; printf 'fine, edited\n' | put "$R2" pb/agents/x/prompt.template.md; JS="$(commit_all "$R2" same-break)"
+run_sut 2b "$R2" "$JB" "$JS" ga-x PATH="$FB";              expect "control: the same break on both sides (pack A), the diff touches pack B without breaking it: main's debt" debito-previo parse-vermelho-na-base-tambem
+branch_from "$R2" "$JB" j_b2; printf 'BADTEMPLATE\n' | put "$R2" pb/agents/x/prompt.template.md; JB2="$(commit_all "$R2" both-red)"
+branch_from "$R2" "$JB2" j_fix; printf 'BADTEMPLATE\nedited\n' | put "$R2" pa/agents/x/prompt.template.md; printf 'fixed\n' | put "$R2" pb/agents/x/prompt.template.md; JF="$(commit_all "$R2" fixes-b)"
+run_sut 2b "$R2" "$JB2" "$JF" ga-x PATH="$FB";             expect "control: both packs red on the base, the diff repairs B and leaves A: the tip's lines are a subset of main's, debt" debito-previo parse-vermelho-na-base-tambem
+rm -f "$FB/comm"
+run_sut 2b "$R2" "$JB" "$JS" ga-x PATH="$FB";              expect "no comm to compare the finding lines: unmeasured, never 'no new break'" nao-consegui-medir parse-linhas-ilegiveis
+ln -sf "$(command -v comm)" "$FB/comm"
+
 # Stand-in parse guard: STUB_GUARD_MODE picks the lie, anything else delegates to the real guard (REAL_GUARD).
 C4="$WORK/city4"; mkcity "$C4" template-fragment-lint-guard.sh || { echo "FATAL: cannot build city4"; exit 1; }
 cat > "$C4/packs/town-deltas/assets/template-fragment-lint-guard.sh" <<'STUBG'
 #!/usr/bin/env bash
 case "${STUB_GUARD_MODE:-}:$1" in
+  (fail-bare:*/ctl) exec bash "$REAL_GUARD" "$@" ;;
+  (fail-bare:*)  echo "template-fragment-lint-guard: FAIL"; exit 1 ;;
+  # order/dup: the same findings on the tip and the base, listed in another order (order) or one of them twice on the tip (dup): the
+  # comparison is of SETS, so neither is a new break
+  (order:*/ctl|dup:*/ctl) exec bash "$REAL_GUARD" "$@" ;;
+  (order:*/tip)  printf '%s\n' "template-fragment-lint-guard: FAIL -- $1/pa" "  NEW (not on the known list): [pa] agents/x/prompt.template.md -- z" "  NEW (not on the known list): [pa] agents/x/prompt.template.md -- a"; exit 1 ;;
+  (order:*/base) printf '%s\n' "template-fragment-lint-guard: FAIL -- $1/pa" "  NEW (not on the known list): [pa] agents/x/prompt.template.md -- a" "  NEW (not on the known list): [pa] agents/x/prompt.template.md -- z"; exit 1 ;;
+  (dup:*/tip)    printf '%s\n' "template-fragment-lint-guard: FAIL -- $1/pa" "  NEW (not on the known list): [pa] agents/x/prompt.template.md -- z" "  NEW (not on the known list): [pa] agents/x/prompt.template.md -- z"; exit 1 ;;
+  (dup:*/base)   printf '%s\n' "template-fragment-lint-guard: FAIL -- $1/pa" "  NEW (not on the known list): [pa] agents/x/prompt.template.md -- z"; exit 1 ;;
   (forged-ok:*) echo "template-fragment-lint-guard: OK -- /not/the/tree/under/test"; exit 0 ;;
   (no-match:*)  echo "template-fragment-lint-guard: no changed file matches a template/fragment/pack.toml pattern -- skipping gc lint."; exit 0 ;;
   (ctl-skip:*/ctl) echo "template-fragment-lint-guard: WARNING: no pack.toml found above changed file x -- skipping (nothing to gc lint against)." >&2; exit 0 ;;
@@ -359,6 +447,9 @@ exec bash "$REAL_GUARD" "$@"
 STUBG
 CITY_UNDER="$C4"; REALG="$RHQ/packs/town-deltas/assets/template-fragment-lint-guard.sh"
 run_sut 2b "$R" "$MAIN" "$GBAD" ga-x PATH="$FB" REAL_GUARD="$REALG" STUB_GUARD_MODE=ctl-skip; expect "the CONTROL gets the same check: a control the guard skipped proves no lint ran" nao-consegui-medir gc-lint-controle-nao-rodou
+run_sut 2b "$R" "$MAIN" "$GOK" ga-x PATH="$FB" REAL_GUARD="$REALG" STUB_GUARD_MODE=fail-bare;   expect "a FAIL that names no pack, red on both sides: no line to compare, unmeasured and not debt" nao-consegui-medir parse-linhas-ilegiveis
+run_sut 2b "$R" "$MAIN" "$GOK" ga-x PATH="$FB" REAL_GUARD="$REALG" STUB_GUARD_MODE=order;       expect "the same two findings on both sides, listed in another order: a set, so main's debt (not a new break)" debito-previo parse-vermelho-na-base-tambem
+run_sut 2b "$R" "$MAIN" "$GOK" ga-x PATH="$FB" REAL_GUARD="$REALG" STUB_GUARD_MODE=dup;         expect "a finding the tip lists twice and the base once: the same finding, main's debt (not a new break)" debito-previo parse-vermelho-na-base-tambem
 run_sut 2b "$R" "$MAIN" "$GOK" ga-x PATH="$FB" REAL_GUARD="$REALG" STUB_GUARD_MODE=forged-ok;  expect "an OK line that does not name the tree under test is not proof (it echoes branch data)" nao-consegui-medir lint-nao-rodou-no-tip
 run_sut 2b "$R" "$MAIN" "$GOK" ga-x PATH="$FB" REAL_GUARD="$REALG" STUB_GUARD_MODE=no-match;   expect "exit 0 and no OK line at all (the guard matched nothing)" nao-consegui-medir lint-nao-rodou-no-tip
 run_sut 2b "$R" "$MAIN" "$GOK" ga-x PATH="$FB" REAL_GUARD="$REALG";                            expect "control: the stand-in delegating to the real guard still reads ok" ok parse-verde-no-tip
