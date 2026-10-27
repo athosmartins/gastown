@@ -161,6 +161,16 @@ TIP="$(commit_all "$R" "add the skill that makes the latent token real")"
 run_sut "$R" "$BASE2" "$TIP"
 expect "a NEW skill name turns an old prompt line into a skill mention" fail
 git_in "$R" checkout -q main; git_in "$R" reset -q --hard "$BASE"
+# Same flip through commands/*.md (the detector also derives names from the city's own commands/): a diff that adds ONLY a command file is an input.
+branch_from_main "$R" latent_cmd
+printf 'see /newcmd for details.\n' >> "$R/$HQ/agents/gate-reviewer/prompt.template.md"
+LCBASE="$(commit_all "$R" "latent token: no command called newcmd exists yet")"
+git_in "$R" checkout -q -b newcmd "$LCBASE"
+printf '# newcmd\n' > "$R/$HQ/commands/newcmd.md"
+TIP="$(commit_all "$R" "add the command that makes the latent token real")"
+run_sut "$R" "$LCBASE" "$TIP"
+expect "a NEW command file (commands/*.md only in the diff) turns an old prompt line into a skill mention" fail
+git_in "$R" checkout -q main
 
 echo "F. only what the diff made fail blocks (base-aware)"
 branch_from_main "$R" red_base
@@ -206,11 +216,22 @@ expect "shell syntax inside a prompt is data" ok
 echo "H. third states: a check that cannot measure never blocks and never vouches"
 run_sut "" "" ""
 expect "empty arguments" nao-consegui-medir entrada-vazia
+run_sut "" "$BASE" "$BASE"
+expect "only the rig empty" nao-consegui-medir entrada-vazia
+run_sut "$R" "" "$BASE"
+expect "only the base empty" nao-consegui-medir entrada-vazia
+run_sut "$R" "$BASE" ""
+expect "only the tip empty" nao-consegui-medir entrada-vazia
 run_sut "$R" "--output=$WORK/pwned" "$BASE"
 expect "a sha argument that is a git option (not hex)" nao-consegui-medir entrada-invalida
 ls "$WORK"/pwned* >/dev/null 2>&1 && bad "git took the argument as --output and wrote a file" || ok "no file was written by an option-shaped argument"
 run_sut "$WORK" "$BASE" "$BASE"
 expect "rig path is not a git repository" nao-consegui-medir sem-toplevel
+# git that answers --show-toplevel with a path that is not a directory (a stale or removed worktree): non-empty, so only the -d test can refuse it.
+FAKEGIT="$WORK/fakegit"; mkdir -p "$FAKEGIT"
+printf '#!/bin/sh\nfor a in "$@"; do [ "$a" = --show-toplevel ] && { echo "%s/no-such-toplevel"; exit 0; }; done\nexec "%s" "$@"\n' "$WORK" "$(command -v git)" > "$FAKEGIT/git"; chmod +x "$FAKEGIT/git"
+run_sut "$R" "$BASE" "$BASE" PATH="$FAKEGIT:$PATH"
+expect "git names a top level that is not a directory" nao-consegui-medir sem-toplevel
 run_sut "$R" "$BASE" "$BASE" TMPDIR="$WORK/does/not/exist"
 expect "no scratch directory can be made (TMPDIR unusable)" nao-consegui-medir sem-scratch
 run_sut "$R" "$BASE" "0000000000000000000000000000000000000000"
@@ -285,6 +306,26 @@ if [ -n "$TIP" ]; then
   [ ! -e "$WORK/planted" ] && ok "nothing was written outside the scratch directory" || bad "the climbing path WROTE $WORK/planted"
 else
   bad "could not build the climbing-path commit (plumbing failed): the traversal case did not run"
+fi
+
+# A name no file system takes (300 bytes in one component): git stores it, mkdir cannot make its directory. The extraction must stop with "could not",
+# not return "all written" half way (the entries after it would be missing from a tree the detector then judges as if it were whole).
+mk_long_commit() { # mk_long_commit <repo> <parent> -> prints the commit: parent's tree + $HQ/skills/<300 x a>/SKILL.md
+  local r="$1" par="$2" b="" leaf="" long="" newsk="" newhq="" newroot=""
+  long="$(head -c 300 /dev/zero | tr '\0' a)"
+  b="$(printf 'long\n' | git -C "$r" hash-object -w --stdin)"
+  leaf="$(printf '100644 blob %s\tSKILL.md\n' "$b" | git -C "$r" mktree)"
+  newsk="$( { git -C "$r" ls-tree "$par:$HQ/skills"; printf '040000 tree %s\t%s\n' "$leaf" "$long"; } | git -C "$r" mktree)"
+  newhq="$( { git -C "$r" ls-tree "$par:$HQ" | awk -F'\t' '$2 != "skills"'; printf '040000 tree %s\tskills\n' "$newsk"; } | git -C "$r" mktree)"
+  newroot="$( { git -C "$r" ls-tree "$par" | awk -F'\t' -v n="$HQ" '$2 != n'; printf '040000 tree %s\t%s\n' "$newhq" "$HQ"; } | git -C "$r" mktree)"
+  git -C "$r" commit-tree "$newroot" -p "$par" -m "name too long for the file system"
+}
+TIP="$(mk_long_commit "$R" main)"
+if [ -n "$TIP" ]; then
+  run_sut "$R" "$BASE" "$TIP"
+  expect "an input whose directory the file system refuses (mkdir fails)" nao-consegui-medir extracao-tip
+else
+  bad "could not build the long-name commit (plumbing failed): the mkdir case did not run"
 fi
 
 echo "J. contract: one VERDICT line first, red lines only for fail/debito-previo, nothing left behind"

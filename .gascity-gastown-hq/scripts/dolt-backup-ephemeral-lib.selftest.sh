@@ -189,6 +189,18 @@ if [ "$(id -u)" != "0" ]; then
 else ok "(running as root — skipped)"; fi
 chmod 644 "$T/eph.env"; rm -f "$T/eph.env"; unset DOLT_BACKUP_EPHEMERAL_DRYRUN_DBS
 
+# The doubt branches above need a conf the process cannot read (chmod 000), and a run as root skips them (root reads the file anyway), so a break of either one passes
+# there (ga-lwbl088). Here the conf READER is the stub (rc 1 = no such line, rc 2 = cannot read it), so they run whoever runs the test.
+(
+  _eph_conf_line() { case "$1" in DOLT_BACKUP_EPHEMERAL_DRYRUN) return 1 ;; *) return 2 ;; esac; }
+  unset DOLT_BACKUP_EPHEMERAL_DRYRUN DOLT_BACKUP_EPHEMERAL_DRYRUN_DBS
+  _eph_dryrun hq
+) && ok "no global dry-run line, per-db line UNREADABLE → dry run for any db (doubt keeps the staging; no chmod needed)" || bad "an unreadable per-db line let hq release"
+(
+  _eph_db_list() { echo hq; return 2; }
+  _eph_is_ephemeral hq
+) && bad "hq ephemeral although the list read failed (rc 2) and printed hq anyway" || ok "a failed list read is 'no' even when the stream names the db (the rc decides, not the text)"
+
 # ═══ _eph_release_target — path safety ══════════════════════════════════════════════════════
 echo "── _eph_release_target (path-safety) ──"
 fresh_root; mkdir_backup "$BACKUP_ROOT/hq" 4
@@ -374,6 +386,23 @@ putfp '{"run_utc":"2026-10-01T07:05:12Z","databases":{"hq":{"issues":1}}}'
 [ "$(AWS="" _eph_s3_fingerprint_state hq)" = "unknown" ] && ok "AWS unset → unknown" || bad "AWS unset: $(AWS="" _eph_s3_fingerprint_state hq)"
 [ "$(_eph_s3_fingerprint_state 'h q')" = "unknown" ] && ok "invalid db name → unknown" || bad "invalid db: $(_eph_s3_fingerprint_state 'h q')"
 _eph_s3_fingerprint_state hq >/dev/null; [ $? -eq 0 ] && ok "always rc 0 — the answer is the word" || bad "non-zero rc"
+# Each guard that answers "could not find out" BEFORE any aws call (ga-lwbl088). The fake aws ignores the bucket name and the file is in the bucket, so a guard that
+# lets the call through shows up as an answer other than "unknown" and as a line in $CALLS. $CALLS is emptied by the `: >` just before each read: empty → aws never
+# ran (what is asserted); missing/unreadable → cannot happen, the `: >` makes the file (and `[ ! -s ]` would read a missing one as "no call", never as a call).
+: > "$CALLS"
+out="$(BUCKET="" _eph_s3_fingerprint_state hq)"
+{ [ "$out" = "unknown" ] && [ ! -s "$CALLS" ]; } && ok "BUCKET unset (AWS set) → unknown, and aws was never called" || bad "BUCKET unset: '$out', aws calls: $(wc -l < "$CALLS" | tr -d ' ')"
+: > "$CALLS"
+out="$(AWS="" _eph_s3_fingerprint_state hq)"
+{ [ "$out" = "unknown" ] && [ ! -s "$CALLS" ]; } && ok "AWS unset (BUCKET set) → unknown, and aws was never called" || bad "AWS unset: '$out', aws calls: $(wc -l < "$CALLS" | tr -d ' ')"
+# mktemp that fails: unknown, still rc 0 (the contract above), and nothing was asked of S3
+printf '#!/bin/sh\nexit 1\n' > "$BIN/mktemp-fail"; mkdir -p "$T/nomktemp"; cp "$BIN/mktemp-fail" "$T/nomktemp/mktemp"; chmod +x "$T/nomktemp/mktemp"
+: > "$CALLS"
+out="$(PATH="$T/nomktemp:$PATH"; hash -r; _eph_s3_fingerprint_state hq)"; rc_mk=$?
+[ "$out" = "unknown" ] && [ "$rc_mk" -eq 0 ] && [ ! -s "$CALLS" ] && ok "mktemp fails → unknown, rc 0, no aws call" || bad "mktemp fails: '$out' rc=$rc_mk aws calls: $(wc -l < "$CALLS" | tr -d ' ')"
+(PATH="$T/nomktemp:$PATH"; hash -r; _eph_s3_fingerprint_state hq >/dev/null); rc_mk=$?
+[ "$rc_mk" -eq 0 ] && ok "…and the function itself returns 0 when mktemp fails (callers test the word, not the rc)" || bad "mktemp failure gave rc $rc_mk"
+hash -r
 
 # ═══ _eph_drop_empty_staging (ga-94vxdw) ════════════════════════════════════════════════════
 # The old nightly's `DOLT_BACKUP('add', …, 'file://<dest>')` re-made an EMPTY .dolt-backup/hq every night. An empty
