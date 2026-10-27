@@ -1,6 +1,13 @@
 description = """
 Autonomous quality gate for crew changes before they land on main.
 
+NOT THE LIVE GATE (ga-vywjzsp, 27/10/2026). Nothing in this repo slings or pours this formula: the live gate is
+quality-gate-guard.sh, then quality-gate-dispatcher.sh, then gate-reviewer sessions started with gc session new.
+The hard checks of the run-tests step (2b template parse, 2c doc-rules lint, 2d E12 coverage, 2e third-state
+reads) run from the guard, Step 5b-pre5, through packs/town-deltas/assets/gate-hard-checks.sh, one tool per step,
+over the branch as data. Editing a step below changes nothing in the live gate: edit that script. The steps stay
+as the written spec of each check and as the text the selftests of those tools extract and run.
+
 A fresh, independent polecat runs this formula. It receives a branch to
 review and the identity of the original author. The reviewer is NEVER the
 author.
