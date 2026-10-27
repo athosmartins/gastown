@@ -72,9 +72,11 @@
 #   - START floor DISK_PUSH_MIN_MB (5000), a MINIMUM like the Go floor: --min-free-mb can raise it for one call, never lower it.
 #   - STOP floor DISK_PUSH_STOP_MB (4000): while the push runs, df is read every HEAVY_GUARD_WATCH_SECS (3); a reading UNDER it sends
 #     TERM to the push's whole process group (KILL after HEAVY_GUARD_KILL_GRACE_SECS, 5, for what is left) and the guard exits 78 with
-#     a message that says not to repeat it and to tell the Mayor: the disk is near the Dolt CRITICAL floor (3 GB). A reading the watch
-#     cannot take (df fails) never kills a push — it goes on, and the log gets one WATCH_UNREADABLE line; the decision to START was
-#     taken on a good reading. An unreadable disk BEFORE the start is the usual 76.
+#     a message that says not to repeat it and to tell the Mayor: the disk is near the Dolt CRITICAL floor (3 GB). The guard hears it
+#     from the watch's EXIT STATUS (78), never from a signal: a signal cuts its `wait` short and bash (3.2.57 and 5.2.21 alike) can then
+#     answer -1 for the push instead of its status (ga-dousipw). A reading the watch cannot take (df fails) never kills a push — it goes
+#     on, and the log gets one WATCH_UNREADABLE line; the decision to START was taken on a good reading. An unreadable disk BEFORE the
+#     start is the usual 76.
 #   - ONE push at a time: a mkdir lock ($HEAVY_GUARD_PUSH_LOCK_DIR, default $GC_CITY_PATH/.gc/heavy-guard-push.lock) holding
 #     "<pid> <epoch>". A second push waits for it (HEAVY_GUARD_PUSH_LOCK_WAIT_SECS, 900; polled every HEAVY_GUARD_PUSH_LOCK_POLL_SECS,
 #     2); still held after the wait -> rc 79. The lock is taken over when its pid is dead or its stamp is older than
@@ -317,7 +319,7 @@ hg_log() {
 }
 
 # ── push class (ga-pwd2h6): the lock and the watch ──────────────────────────────────────────────────────────
-HG_LOCK_HELD=0; HG_CHILD=""; HG_WATCHER=""; HG_INTERRUPTED=0; HG_LOCK_VERDICT=held; HG_LOCK_HOLDER=unknown
+HG_LOCK_HELD=0; HG_CHILD=""; HG_WATCHER=""; HG_LOCK_VERDICT=held; HG_LOCK_HOLDER=unknown
 HG_WKIND=push; HG_WSTOP=0; HG_WDROP=0; HG_WSTART=""   # what the watch watches: push (default) or step (ga-2d14tow)
 
 hg_lock_release() {
@@ -410,9 +412,9 @@ hg_stop_group() {
   return 0
 }
 
-# hg_traps — from here a TERM/INT/HUP stops the child and lets the lock go, and the watch's USR1 is the "interrupted" flag (without its trap USR1 would kill the guard)
+# hg_traps — from here a TERM/INT/HUP stops the child and lets the lock go. No USR1 on purpose (ga-dousipw): nothing signals the guard while it waits,
+# the watch tells it what it did through its exit status (see hg_run_watched)
 hg_traps() {
-  trap 'HG_INTERRUPTED=1' USR1
   trap 'hg_on_signal' TERM INT HUP
   trap 'hg_lock_release' EXIT
 }
@@ -474,10 +476,12 @@ hg_push_lock_acquire() {
   done
 }
 
-# hg_watch <child pid> <guard pid> — runs in a background subshell for as long as the child runs. Push: stops it when the disk is under DISK_PUSH_STOP_MB.
+# hg_watch <child pid> — runs in a background subshell for as long as the child runs. Push: stops it when the disk is under DISK_PUSH_STOP_MB.
 # Step (ga-2d14tow, HG_WKIND=step): stops it under HG_WSTOP, or when the free disk has fallen HG_WDROP MB or more since HG_WSTART (HG_WDROP 0 = floor only).
+# Its EXIT STATUS is the guard's only word of what it did (ga-dousipw): 78 = it began to stop the child; anything else (the 143 of a TERM while it
+# slept, the 0 of a child that was already gone) is read as "it never touched the child"
 hg_watch() {
-  local pid="$1" main="$2" f st blind=0 stop="$DISK_PUSH_STOP_MB" d
+  local pid="$1" f st blind=0 stop="$DISK_PUSH_STOP_MB" d
   [ "$HG_WKIND" != step ] || stop="$HG_WSTOP"
   while :; do
     sleep "$HG_WATCH"
@@ -494,6 +498,9 @@ hg_watch() {
     case "$st" in
       ok) ;;
       low|drop)
+        # decided, and the order matters: from here the guard's TERM (it sends one when the child ends) must not cut the stop short, and
+        # it must be ignored BEFORE anything is done to the child, so that "78" is true whenever the child was touched
+        trap '' TERM
         if [ "$HG_WKIND" != step ]; then
           echo "heavy-guard: INTERRUPTED '$what': ${f} MB free < ${DISK_PUSH_STOP_MB} MB stop floor while it ran (ga-pwd2h6) — the push is being stopped (TERM to its process group). Do NOT repeat it and do NOT work around it (no --no-verify, no other route): the disk is near the Dolt CRITICAL floor. Tell the Mayor. (rc 78)" >&2
           hg_log "INTERRUPTED what='$what' free_mb=$f stop_mb=$DISK_PUSH_STOP_MB rc=78"
@@ -504,10 +511,9 @@ hg_watch() {
           echo "heavy-guard: INTERRUPTED '$what': ${f} MB free < ${stop} MB stop floor while it ran (ga-2d14tow) — the step is being stopped (TERM to its process group). Do NOT re-run it unchanged and do NOT work around it: the disk is near the Dolt CRITICAL floor, and what the step wrote is still on disk (look under its TMPDIR, clean scratch with safe-clean). Tell the Mayor. (rc 78)" >&2
           hg_log "INTERRUPTED what='$what' class=step free_mb=$f stop_mb=$stop rc=78"
         fi
-        # told in memory (no disk needed): the guard marks the run as interrupted before the child's own exit shows up
-        kill -USR1 "$main" 2>/dev/null
+        # told through the exit status (no disk needed): the guard reads the 78 after its own undisturbed wait
         hg_stop_group "$pid"
-        return 0 ;;
+        exit 78 ;;
       *) if [ "$blind" = 0 ]; then
            blind=1
            if [ "$HG_WKIND" = step ]; then hg_log "WATCH_UNREADABLE what='$what' class=step stop_mb=$stop (the step goes on)"
@@ -517,34 +523,29 @@ hg_watch() {
   done
 }
 
-# hg_run_watched <command...> — run the push with the watch beside it; never returns (exits with the push's rc, or 78)
+# hg_run_watched <command...> — run the push (or, ga-2d14tow, the watched step) with the watch beside it; never returns (exits with its rc, or 78)
 hg_run_watched() {
-  local rc seen
-  # job control only to give the push its OWN process group, so the TERM of the watch reaches its hook and children too
+  local rc wrc
+  # job control only to give the child its OWN process group, so the TERM of the watch reaches its hook and children too
   set -m
   "$@" &
   HG_CHILD=$!
-  hg_watch "$HG_CHILD" "$$" &
+  hg_watch "$HG_CHILD" &
   HG_WATCHER=$!
   set +m
-  # `wait` returns early (rc > 128) when the watch's USR1 arrives: that return is the signal, not the push. Detected by the trap having
-  # flipped HG_INTERRUPTED during THIS wait (not by probing the pid: the push may already be gone, and its real status is still
-  # there for the next `wait` to collect). Wait again until the status is the push's own.
-  while :; do
-    seen="$HG_INTERRUPTED"
-    { wait "$HG_CHILD"; } 2>/dev/null; rc=$?
-    [ "$HG_INTERRUPTED" = 1 ] && [ "$seen" = 0 ] || break
-  done
-  # a push that ended with 0 ended fine, whatever the watch did at that very moment; any other rc after an interruption is the 78
-  if [ "$HG_INTERRUPTED" = 1 ] && [ "$rc" -ne 0 ]; then
-    # the watch is still giving the rest of the push's group its grace (TERM sent, KILL to come): let it finish, so a hook
-    # that cleans up on TERM can; hg_watch returns by itself once the group is gone or has been killed
-    { wait "$HG_WATCHER"; } 2>/dev/null
-    rc=78
-  else
-    kill -TERM -- "-$HG_WATCHER" 2>/dev/null || kill -TERM "$HG_WATCHER" 2>/dev/null
-    { wait "$HG_WATCHER"; } 2>/dev/null
-  fi
+  # Nothing signals the guard while it waits (ga-dousipw): a trapped signal cuts `wait` short (rc > 128) and the `wait` after it can answer
+  # -1 instead of the child's status, so a child that ended with 0 came back as 78 (measured on bash 3.2.57 and on 5.2.21: from 1 run in 40
+  # to 1 in 3, the more load the more). So the watch says what it did through its exit status, read below after this undisturbed wait.
+  # vazio/falhou/ilegível → not expected: only the guard's own TERM/INT/HUP can cut this wait and that trap exits 143 first; a status that is
+  # not a number would still end as a failure (exit 255 or 2), never as a 0
+  { wait "$HG_CHILD"; } 2>/dev/null; rc=$?
+  # the child is over: tell the watch. Asleep between two readings it dies of the TERM (143); once it began to stop the child it ignores the
+  # TERM, gives the rest of the child's group its grace (so a hook that cleans up on TERM can) and exits 78 by itself
+  kill -TERM -- "-$HG_WATCHER" 2>/dev/null || kill -TERM "$HG_WATCHER" 2>/dev/null
+  # vazio/falhou/ilegível (no status to read, or one that is not 78) → read as "the watch did not stop it": the child answers with its own rc, never a made-up 0
+  { wait "$HG_WATCHER"; } 2>/dev/null; wrc=$?
+  # a child that ended with 0 ended fine, whatever the watch did at that very moment; any other rc after the watch stopped it is the 78
+  if [ "$wrc" = 78 ] && [ "$rc" -ne 0 ]; then rc=78; fi
   hg_lock_release
   exit "$rc"
 }
