@@ -48,7 +48,7 @@ TMO="${GATE_HC_TIMEOUT:-90}"
 case "$TMO" in (''|*[!0-9]*) TMO=90 ;; esac
 [ "$TMO" -ge 1 ] 2>/dev/null || TMO=90
 
-STEP="${1-}"; SCRATCH=""; TOP=""; WANT=""; LIVE_MD=""; LIVE_ALL=""; SPECIAL=0; RC="-"; TIPC="-"; BASEC="-"; ARM="-"; DETAIL=""
+STEP="${1-}"; SCRATCH=""; TOP=""; WANT=""; LIVE_MD=""; CHANGED_ALL=""; SPECIAL=0; RC="-"; TIPC="-"; BASEC="-"; ARM="-"; DETAIL=""
 PY=""; PY_TOML=0; TBIN=""
 cleanup() { if [ -n "$SCRATCH" ]; then rm -rf "$SCRATCH" 2>/dev/null; fi; return 0; }
 trap cleanup EXIT
@@ -59,6 +59,12 @@ emit() { # emit <verdict> <reason>: the one verdict line, then the detail; ends 
   exit 0
 }
 cap() { printf '%s\n' "$1" | awk 'NR <= 40 { print substr($0, 1, 200) }'; }
+# ok_or_special <reason>: the clean verdict of a step that extracted a tree. A link the extract had to leave out makes it
+# unmeasured instead (an @import or a template may reach the tree through it); a finding is never touched by this.
+ok_or_special() {
+  if [ "$SPECIAL" -gt 0 ]; then emit nao-consegui-medir "entrada-especial-fora-do-diff-$SPECIAL"; fi
+  emit ok "$1"
+}
 
 # want <path>: rc 0 when this step needs that tree entry (WANT picks the step's set).
 want() {
@@ -89,9 +95,10 @@ extract() {
     # A path is data from the branch (git mktree builds "." / ".." / ".git" entries): refuse, never skip and go on.
     case "/$path/" in (*/./*|*/../*|*/.git/*|*//*) return 1 ;; esac
     mode=${meta%% *}; obj=${meta##* }
-    # A link or a gitlink cannot be read as data. One the diff CHANGES is refused (the step would judge what it never saw);
-    # an unchanged one (AGENTS.md -> CLAUDE.md is common) is left out and counted, and a clean 2c verdict says so in its reason.
-    case "$mode" in (100644|100755) ;; (*) case "$LIVE_ALL" in (*$'\n'"$path"$'\n'*) return 1 ;; esac; SPECIAL=$((SPECIAL + 1)); continue ;; esac
+    # A link or a gitlink cannot be read as data. One the diff touches in ANY way (a type change counts) is refused: the step
+    # would judge what it never saw. An untouched one is left out and counted, and a CLEAN verdict then becomes unmeasured
+    # (ok_or_special): a finding stays a finding, but a pass needs a whole tree (an @import may point through that link).
+    case "$mode" in (100644|100755) ;; (*) case "$CHANGED_ALL" in (*$'\n'"$path"$'\n'*) return 1 ;; esac; SPECIAL=$((SPECIAL + 1)); continue ;; esac
     mkdir -p "$dest/$(dirname "$path")" 2>/dev/null || return 1
     git -C "$TOP" cat-file blob "$obj" > "$dest/$path" 2>/dev/null || return 1
   done < "$listf"
@@ -132,8 +139,7 @@ step_2c() {
   # CLEAN exit, whole line at the start: a branch that writes "DISABLED via" in a title must not turn a refusal into desligado.
   case "$RC" in
     (0) if printf '%s\n' "$out" | grep -E -q '^doc-rules-lint: DISABLED via '; then emit desligado interruptor; fi
-        if [ "$SPECIAL" -gt 0 ]; then emit ok "lint-limpo-sem-$SPECIAL-link-fora-do-diff"; fi
-        emit ok lint-limpo ;;
+        ok_or_special lint-limpo ;;
     (1) if printf '%s\n' "$out" | grep -E -q '^doc-rules-lint: [0-9]+ file\(s\) checked, [1-9][0-9]* violation\(s\)'; then DETAIL="$(cap "$out")"; emit fail violacoes-doc-rules; fi
         emit nao-consegui-medir saida-sem-resumo ;;
     (*) emit nao-consegui-medir "lint-rc$RC" ;;
@@ -195,7 +201,7 @@ step_2d() {
   WANT=e12
   extract "$tip" "$SCRATCH/tip" || emit nao-consegui-medir extracao-tip
   cr="$(run_e12 "$SCRATCH/tip" "$SCRATCH/tip.out")"; cls="${cr%% *}"; TIPC="$cls"; RC="${cr##* }"
-  case "$cls" in (green) emit ok e12-verde-no-tip ;; (red) ;; (*) emit nao-consegui-medir e12-inconclusivo-tip ;; esac
+  case "$cls" in (green) ok_or_special e12-verde-no-tip ;; (red) ;; (*) emit nao-consegui-medir e12-inconclusivo-tip ;; esac
   # vazio/falhou → só falta a saída da ferramenta no comentário da recusa; o veredito já saiu do exit code e da linha ancorada
   DETAIL="$(cap "$(cat "$SCRATCH/tip.out")")"
   # Red on the tip: was it this diff? The base answers (a repair or a debt main already carried shows up here).
@@ -230,7 +236,7 @@ step_2b() {
   WANT=tmpl
   extract "$tip" "$SCRATCH/tip" || emit nao-consegui-medir extracao-tip
   cr="$(run_tmpl "$SCRATCH/tip" "$SCRATCH/tip.out" "$SCRATCH/hits.nl")"; cls="${cr%% *}"; TIPC="$cls"; RC="${cr##* }"
-  case "$cls" in (green) emit ok parse-verde-no-tip ;; (red) ;; (*) emit nao-consegui-medir parse-inconclusivo-tip ;; esac
+  case "$cls" in (green) ok_or_special parse-verde-no-tip ;; (red) ;; (*) emit nao-consegui-medir parse-inconclusivo-tip ;; esac
   DETAIL="$(cap "$(cat "$SCRATCH/tip.out")")"
   # Positive control: a plain pack must lint green here. If it does not (gc cannot lint at all, jq breaks the report) every
   # tree reads red, and "red on the base too" would be debito-previo for good: said out loud instead.
@@ -264,8 +270,8 @@ main() {
   git -C "$TOP" diff -z --name-only --no-renames "${base}..${tip}" > "$SCRATCH/all" 2>/dev/null || emit nao-consegui-medir diff-falhou
   git -C "$TOP" diff -z --name-only --no-renames --diff-filter=ACMR "${base}..${tip}" > "$SCRATCH/live" 2>/dev/null || emit nao-consegui-medir diff-falhou
   tr '\0' '\n' < "$SCRATCH/all" > "$SCRATCH/all.nl"; tr '\0' '\n' < "$SCRATCH/live" > "$SCRATCH/live.nl"
-  # vazio/falhou → lista vazia: nenhum link conta como "alterado" e o extract só os pula e conta (a entrada alterada seria recusada)
-  LIVE_ALL=$'\n'"$(<"$SCRATCH/live.nl")"$'\n'
+  # vazio/falhou → lista vazia: nenhum link conta como "alterado", o extract os pula e conta, e um veredito limpo vira nao-consegui-medir
+  CHANGED_ALL=$'\n'"$(<"$SCRATCH/all.nl")"$'\n'
   case "$STEP" in
     (2b) grep -E '(^|/)template-fragments/|(^|/)prompts/shared/|\.template\.md$|\.md\.tmpl$|(^|/)pack\.toml$' "$SCRATCH/all.nl" > "$SCRATCH/hits.nl" ;;
     (2c) grep '\.md$' "$SCRATCH/live.nl" > "$SCRATCH/hits.nl" ;;
