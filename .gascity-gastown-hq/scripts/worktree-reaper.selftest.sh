@@ -2247,6 +2247,109 @@ xp_kept xp15 "(x15): mktemp fails → KEPT, kept_ignored_data_unknown logged" ke
 xp_mk xp16; m5_tree xp16 w merged; ( cd "$TMP/xp16/rig/crew/w" && rm -rf pesquisa && printf r > 'a"b\c d.dat' ) >/dev/null 2>&1; m5_age "$TMP/xp16/rig/crew/w" 14; xp_run xp16
 grep '"event":"kept_ignored_data"' "$TMP/xp16.jsonl" | grep -qF '"top":[{"path":"a\"b\\c d.dat","kb":' && ok "ga-xpoj67 (x16): quote, backslash and space in a file name are escaped in the event" || bad "ga-xpoj67 (x16): event: $(grep kept_ignored_data "$TMP/xp16.jsonl" 2>/dev/null | head -1)"
 
+# ══ ga-1bfcda7: the pool session's own .claude/ settings files are tool state, not data ══
+# Measured 27/10 (git 2.43): an ignored .claude/ FOLDER is ONE entry of `ls-files -o -i --directory` (".claude/"), so IGNORED_JUNK_RE — which named only
+# .claude/settings.local.json, and could not look inside a folder entry — kept 15 wa-worker trees (~170 MB each) for a 4 KB .claude/settings.json. With a
+# TRACKED file in .claude/ the settings files come one by one and were not junk either. Now .claude/settings*.json(.bak.*) is junk by path, and a folder
+# entry named .claude/ is opened: only junk inside → dropped; any other file → the tree is kept and the event names THAT file; unreadable → unknown.
+# Against the pre-fix reaper (c1)(c1b)(c2)(c3)(c4)(c5)(c6)(c7)(c8)(c9b)(c11)(c14)(c16a)(c16b) fail; (c9)(c15) pin what must NOT change.
+echo "── ga-1bfcda7: an ignored .claude/ holding only the tool's settings files does not keep a tree ──"
+cl_tree() {   # <town> merged|unmerged [file…] — crew/w with an ignored .claude/ FOLDER (info/exclude) holding the given files (paths below .claude/), no pesquisa/, aged 14 h
+  local t="$1" k="$2" f; shift 2
+  xp_mk "$t"; echo '.claude/' >> "$TMP/$t/rig/.git/info/exclude"; m5_tree "$t" w "$k"
+  ( cd "$TMP/$t/rig/crew/w" && rm -rf pesquisa && mkdir -p .claude && for f in "$@"; do mkdir -p ".claude/$(dirname "$f")" && echo '{}' > ".claude/$f"; done ) >/dev/null 2>&1
+  m5_age "$TMP/$t/rig/crew/w" 14
+}
+cl_b() {   # <town> [extra ignored file] — crew/w with a TRACKED .claude/keep.md; settings.json, settings.json.bak.<epoch> and settings.local.json ignored ONE BY ONE (no folder entry)
+  local t="$1" x="${2:-}"
+  xp_mk "$t"; printf '%s\n' .claude/settings.json '.claude/settings.json.bak.*' >> "$TMP/$t/rig/.git/info/exclude"; [ -z "$x" ] || echo ".claude/$x" >> "$TMP/$t/rig/.git/info/exclude"
+  m5_tree "$t" w unmerged
+  ( cd "$TMP/$t/rig/crew/w" && rm -rf pesquisa && mkdir -p .claude && echo k > .claude/keep.md && echo '{}' > .claude/settings.json && echo '{}' > .claude/settings.local.json \
+    && echo '{}' > .claude/settings.json.bak.1793102038 && { [ -z "$x" ] || echo n > ".claude/$x"; } && git add .claude/keep.md \
+    && GIT_AUTHOR_DATE=$M5_OLD GIT_COMMITTER_DATE=$M5_OLD git commit -qm claude ) >/dev/null 2>&1
+  m5_age "$TMP/$t/rig/crew/w" 14
+}
+cl_kept() {   # <town> <label> <event> — the tree is still there and the keep was logged exactly once under that event
+  if m5_has "$1" && [ "$(events "$1" "$3")" = "1" ]; then ok "ga-1bfcda7 $2"; else bad "ga-1bfcda7 $2 — present=$(m5_has "$1" && echo y || echo n) $3=$(events "$1" "$3")"; fi
+}
+cl_freed() {  # <town> <label> — the tree is gone and nothing was kept for its ignored files, known or unknown
+  if ! m5_has "$1" && [ "$(events "$1" kept_ignored_data)" = "0" ] && [ "$(events "$1" kept_ignored_data_unknown)" = "0" ]; then ok "ga-1bfcda7 $2"
+  else bad "ga-1bfcda7 $2 — present=$(m5_has "$1" && echo y || echo n) kept_ignored_data=$(events "$1" kept_ignored_data) unknown=$(events "$1" kept_ignored_data_unknown)"; fi
+}
+cl_top() {    # <town> <label> <path ERE> — the kept_ignored_data event names exactly ONE path and it is that one (the file inside .claude/, not the folder)
+  local re='"top":\[\{"path":"'"$3"'","kb":[1-9][0-9]*\}\]'
+  if grep '"event":"kept_ignored_data"' "$TMP/$1.jsonl" 2>/dev/null | grep -Eq "$re"; then ok "ga-1bfcda7 $2"; else bad "ga-1bfcda7 $2 — event: $(grep kept_ignored_data "$TMP/$1.jsonl" 2>/dev/null | head -1)"; fi
+}
+
+# (c1)(c1b)(c2) the bead's case: the ignored folder holds only the tool's own files → junk → the tree is reaped (normal mode, PRESSURE mode, with the .bak and the local file)
+cl_tree cl1 merged settings.json; xp_run cl1
+cl_freed cl1 "(c1): MERGED tree idle 14 h whose ignored .claude/ holds only settings.json → reaped (the 15 wa-worker trees of 27/10 were kept for 4 KB)"
+cl_tree cl1b merged settings.json; xp_run cl1b "$PRESS"
+cl_freed cl1b "(c1b): the same tree in PRESSURE mode → reaped"
+cl_tree cl2 merged settings.json settings.local.json settings.json.bak.1793102038; xp_run cl2
+cl_freed cl2 "(c2): settings.json + settings.local.json + settings.json.bak.<epoch> in the ignored .claude/ → all tool state → reaped"
+
+# (c3)(c4) any other file in the folder is data: the tree is KEPT and the event names the FILE (not the folder, not the settings file beside it)
+cl_tree cl3 merged settings.json notes.md; xp_run cl3
+cl_kept cl3 "(c3): settings.json + a notes.md in the ignored .claude/ → the notes are data → KEPT, kept_ignored_data" kept_ignored_data
+cl_top cl3 "(c3): the event names .claude/notes.md alone — not the folder, not settings.json" '\.claude/notes\.md'
+[ -f "$TMP/cl3/rig/crew/w/.claude/notes.md" ] && ok "ga-1bfcda7 (c3): the notes are still on disk" || bad "ga-1bfcda7 (c3): the notes are gone"
+cl_tree cl4 unmerged settings.json skills/x/SKILL.md; xp_run cl4
+cl_kept cl4 "(c4): UNMERGED tree, a file in a subfolder of the ignored .claude/ → KEPT, kept_ignored_data" kept_ignored_data
+cl_top cl4 "(c4): the event names .claude/skills/x/SKILL.md" '\.claude/skills/x/SKILL\.md'
+
+# (c5)(c6) the same files ignored ONE BY ONE beside a TRACKED .claude/ file (git lists each, the folder is no entry): junk by path; with another ignored file → kept
+cl_b cl5; xp_run cl5
+cl_freed cl5 "(c5): settings.json, settings.json.bak.<epoch> and settings.local.json ignored one by one beside a tracked .claude/keep.md → junk by path → reaped"
+cl_b cl6 notes.md; xp_run cl6
+cl_kept cl6 "(c6): the same plus an ignored .claude/notes.md → KEPT, kept_ignored_data" kept_ignored_data
+cl_top cl6 "(c6): the event names .claude/notes.md alone" '\.claude/notes\.md'
+
+# (c7)(c8) opening the folder fails → unknown is not "only settings" (KEPT, kept_ignored_data_unknown); it reads EMPTY → nothing inside to lose (the entry is dropped, reaped)
+cl_tree cl7 merged settings.json; mkdir -p "$TMP/cl7-bin"
+printf '#!/bin/sh\ncase " $* " in *" -print0 "*) exit 1 ;; esac\nexec %s "$@"\n' "$(command -v find)" > "$TMP/cl7-bin/find"; chmod +x "$TMP/cl7-bin/find"
+xp_run cl7 PATH="$TMP/cl7-bin:$PATH"
+cl_kept cl7 "(c7): find cannot open the ignored .claude/ (rc 1) → unknown is not 'only settings': KEPT, kept_ignored_data_unknown logged" kept_ignored_data_unknown
+grep '"event":"kept_ignored_data_unknown"' "$TMP/cl7.jsonl" 2>/dev/null | grep -q '"size_kb":null,"top":\[\]' && ok "ga-1bfcda7 (c7): the unknown event says size null, not 0" || bad "ga-1bfcda7 (c7): unknown event: $(grep unknown "$TMP/cl7.jsonl" 2>/dev/null | head -1)"
+cl_tree cl8 merged settings.json; mkdir -p "$TMP/cl8-bin"
+printf '#!/bin/sh\ncase " $* " in *" -print0 "*) exit 0 ;; esac\nexec %s "$@"\n' "$(command -v find)" > "$TMP/cl8-bin/find"; chmod +x "$TMP/cl8-bin/find"
+xp_run cl8 PATH="$TMP/cl8-bin:$PATH"
+cl_freed cl8 "(c8): the folder reads EMPTY (find prints nothing, rc 0) → nothing inside to lose: the entry is dropped and the tree is reaped"
+
+# (c9) WORKTREE_REAPER_IGNORED_JUNK_RE stays THE junk list: naming the folder itself as junk (the Mayor's by-hand relief of 27/10) skips it without opening it;
+# a list that does not name the settings files makes them data again
+cl_tree cl9 merged notes.md; xp_run cl9 WORKTREE_REAPER_IGNORED_JUNK_RE='(^|/)\.claude/$'
+cl_freed cl9 "(c9): WORKTREE_REAPER_IGNORED_JUNK_RE naming .claude/ as junk → reaped without opening the folder, notes and all (the relief of 27/10 still works)"
+cl_tree cl9b merged settings.json; xp_run cl9b WORKTREE_REAPER_IGNORED_JUNK_RE='(^|/)nothing$'
+cl_kept cl9b "(c9b): a junk list that does not name the settings files → the file inside is data again → KEPT, kept_ignored_data" kept_ignored_data
+cl_top cl9b "(c9b): the event names .claude/settings.json" '\.claude/settings\.json'
+
+# (c11) tool state beside real data: only the data is reported
+xp_mk cl11; echo '.claude/' >> "$TMP/cl11/rig/.git/info/exclude"; m5_tree cl11 w merged
+( cd "$TMP/cl11/rig/crew/w" && mkdir -p .claude && echo '{}' > .claude/settings.json ) >/dev/null 2>&1; m5_age "$TMP/cl11/rig/crew/w" 14; xp_run cl11
+cl_kept cl11 "(c11): pesquisa/ (data) beside an ignored .claude/ with only settings.json → KEPT, kept_ignored_data" kept_ignored_data
+cl_top cl11 "(c11): the event names pesquisa/ alone — the settings file is not reported" 'pesquisa/'
+
+# (c14) a .claude/ below a folder that has TRACKED files is an entry of its own (sub/.claude/) → opened the same way
+xp_mk cl14; echo '.claude/' >> "$TMP/cl14/rig/.git/info/exclude"; m5_tree cl14 w unmerged
+( cd "$TMP/cl14/rig/crew/w" && rm -rf pesquisa && mkdir -p sub/.claude && echo k > sub/keep.md && echo '{}' > sub/.claude/settings.json && git add sub/keep.md \
+  && GIT_AUTHOR_DATE=$M5_OLD GIT_COMMITTER_DATE=$M5_OLD git commit -qm sub ) >/dev/null 2>&1; m5_age "$TMP/cl14/rig/crew/w" 14; xp_run cl14
+cl_freed cl14 "(c14): sub/.claude/ (ignored, beside a tracked sub/keep.md) holding only settings.json → reaped"
+
+# (c15) only a folder NAMED .claude is opened: an ignored x.claude/ is an ordinary folder → data
+xp_mk cl15; echo 'x.claude/' >> "$TMP/cl15/rig/.git/info/exclude"; m5_tree cl15 w merged
+( cd "$TMP/cl15/rig/crew/w" && rm -rf pesquisa && mkdir -p x.claude && echo '{}' > x.claude/settings.json ) >/dev/null 2>&1; m5_age "$TMP/cl15/rig/crew/w" 14; xp_run cl15
+cl_kept cl15 "(c15): an ignored x.claude/ (not a folder named .claude) is data → KEPT, kept_ignored_data" kept_ignored_data
+cl_top cl15 "(c15): the event names x.claude/ itself" 'x\.claude/'
+
+# (c16a)(c16b) tool state is exactly settings*.json and settings*.json.bak.* directly in .claude/: a ".old" copy, and a settings.json one level down, are data
+cl_tree cl16a merged settings.json settings.json.old; xp_run cl16a
+cl_kept cl16a "(c16a): settings.json.old beside settings.json → data → KEPT, kept_ignored_data" kept_ignored_data
+cl_top cl16a "(c16a): the event names .claude/settings.json.old alone" '\.claude/settings\.json\.old'
+cl_tree cl16b merged sub/settings.json; xp_run cl16b
+cl_kept cl16b "(c16b): .claude/sub/settings.json (not directly in .claude/) → data → KEPT, kept_ignored_data" kept_ignored_data
+cl_top cl16b "(c16b): the event names .claude/sub/settings.json" '\.claude/sub/settings\.json'
+
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"
 [ "$FAIL" -eq 0 ] || exit 1
