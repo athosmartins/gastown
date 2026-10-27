@@ -332,6 +332,30 @@ EXP_FSIZE_ENORME="rc=0 res=sem-cobertura run=0 skipped=base-vermelha=1"
 # o motor roda sob um limite DURO menor que o pedido (um sistema que já limita): vale o menor, o teto não vira recusa e a varredura roda igual
 fp_fsize_duro() { ( ulimit -f 2048 || exit 1; fp_fsize 4 ); }   # sem -H: soft e hard juntos (um hard abaixo do soft atual dá EINVAL)
 peq "limite duro do sistema (2 MB) menor que o --fsize-mb pedido (4): vale o menor, a varredura roda igual e o laço morre" "$EXP_FSIZE" fp_fsize_duro
+# teto de CRESCIMENTO do slot (ga-2d14tow). O teto por arquivo não pega o laço que grava MUITOS arquivos pequenos: 50 mil de 100 KB são 5 GB e nenhum passa de 512 MB. O fixture é o mesmo mutante do caso acima (o `-gt` virado manda o caminho do 9 para o laço),
+# agora um awk que grava 3000 arquivos de 8 KB (~24 MB, parado aí só para um motor SEM o teto do slot não encher o disco deste selftest) com uma pausa a cada 10; o teto do slot de 2 MB tem de cortá-lo bem antes. O laço registra FORA do slot (a jaula falsa deixa)
+# quantos arquivos já gravou (a cada 50, em ev.n) e, se chegar ao fim, ev. Morto pelo teto do slot = mutante MORTO, nunca falha de infra.
+mkspray() {
+  cat > "$TREE/scripts/spray.sh" << 'EOF'
+#!/bin/bash
+# spray.sh: fixture
+n=${1:-0}; ev=${2:-/dev/null}
+if [ "$n" -gt 5 ]; then echo big; exit 0; fi
+awk -v d="$TMPDIR" -v ev="$ev" 'BEGIN { for (i = 1; i <= 3000; i++) { f = d "/f" i; printf "%08192d", 0 > f; close(f); if (i % 50 == 0) { print i > (ev ".n"); close(ev ".n") } if (i % 10 == 0) system("sleep 0.02") } print "wrote" > ev; close(ev) }'
+echo small
+exit 0
+EOF
+  mkst spray 'out=$(bash "$H/spray.sh" 9 "'"$F"'/ev"); [ "$out" = big ] || exit 1'
+}
+fp_slot() {  # fp_slot [MB]: a varredura do fixture com teto de slot de MB (2), medindo a cada 0,2 s
+  newfx; mkspray; local t0=$SECONDS cap=${1:-2} n
+  HQM_SLOT_POLL_S=0.2 sw --slot-mb "$cap"; n=$(cat "$F/ev.n" 2> /dev/null || echo 0)
+  echo "$(cnt) falhas=$(jf 'd["falhas"]') terminou=$([ -e "$F/ev" ] && echo SIM || echo nao) slot=$([ "$n" -gt 0 ] && [ "$n" -lt 1500 ] && echo cortado || echo "NAO($n)") rapido=$([ $((SECONDS - t0)) -lt 8 ] && echo sim || echo NAO) left=$(ls "$F/work" | wc -l | tr -d ' ')"
+}
+EXP_SLOT="rc=0 completo run=6 k=2 c=4 f=0 inv=0 open=4 falhas=0 terminou=nao slot=cortado rapido=sim left=0"
+peq "mutante que grava MUITOS arquivos pequenos: o teto do slot (2 MB) corta o laço antes do fim e em segundos, o mutante é MORTO e não vira falha de infra, o slot sai limpo" "$EXP_SLOT" fp_slot
+fp_slot_uso() { newfx; mkfoo; local o="" v; for v in 0 -3 abc ""; do sw --slot-mb "$v"; o="$o $RC"; done; sw --slot-mb 1; echo "$o | $(cnt)"; }
+peq "--slot-mb que não é um inteiro >= 1 (0, negativo, texto, vazio) é uso (rc 2); 1 MB roda como qualquer outro" " 2 2 2 2 | $EXP_SW0" fp_slot_uso
 peq "sweep: mortos, sobreviventes confirmados, original intacto, HOME/TMPDIR no slot, slots limpos; os ids do gen --tree são os que ele grava" "$EXP_SWEEP" fp_sweep
 fp_semvalid() {  # bash -n que sai com rc estranho: nenhum veredito (nem "i"), nao_sei, e a varredura seguinte tenta de novo
   newfx; mkfoo; mkdir "$F/bin"; printf '#!/bin/sh\n[ "$1" = -n ] && exit 5\nexec /bin/bash "$@"\n' > "$F/bin/bash"; chmod +x "$F/bin/bash"
@@ -466,6 +490,11 @@ par kill_it teto-so-no-soft      fp_fsize   "$EXP_FSIZE" 'resource.setrlimit(res
 [ "$SKIP_FS" = 1 ] || par kill_it teto-falha-e-roda fp_fsize_enorme "$EXP_FSIZE_ENORME" '    os._exit(70)\n' '    pass\n'
 par kill_it teto-sem-minimo      fp_fsize_duro "$EXP_FSIZE" '    n = n if hard == resource.RLIM_INFINITY else min(n, hard)\n' '    n = n\n'
 par kill_it teto-uso-aceita-zero fp_fsize_uso   " 2 2 2 2 | $EXP_SW0" 'if a.cmd == "sweep" and a.fsize_mb < 1:' 'if a.cmd == "sweep" and a.fsize_mb < 0:'
+par kill_it slot-ausente         fp_slot "$EXP_SLOT" '            rc = wait_capped(ctx, p, slot, base_kb, tmo + 30)' '            rc = p.wait(timeout=tmo + 30)'
+par kill_it slot-rc-zero         fp_slot "$EXP_SLOT" '            return 153' '            return 0'
+par kill_it slot-unidade         fp_slot "$EXP_SLOT" 'kb - base_kb >= ctx.a.slot_mb * 1024:' 'kb - base_kb >= ctx.a.slot_mb * 1048576:'
+par kill_it slot-sem-medida      fp_slot "$EXP_SLOT" 'if kb is not None and kb - base_kb >= ctx.a.slot_mb * 1024:' 'if False:'
+par kill_it slot-uso-zero        fp_slot_uso " 2 2 2 2 | $EXP_SW0" 'if a.slot_mb < 1:' 'if a.slot_mb < 0:'
 reap
 # controle do controle: o `mut` recusa uma âncora ambígua e uma que não casa
 FAIL0=$FAIL   # o mut recusa e conta uma falha própria: aqui a recusa é o esperado, então só a aceitação reprova

@@ -25,6 +25,9 @@ TETO DE ESCRITA (ga-e6ug8gq): código alterado pode virar laço de escrita (27/1
   ARQUIVO, um laço que grava MUITOS arquivos abaixo dele passa (a soma do slot é o follow-up); e um selftest que engole o rc do filho morto pelo teto e sai 0 deixa o mutante sobreviver (o disco, ao menos, está salvo).
 ESTADO (--state, json, trocado por arquivo temporário): por alvo o hash do conteúdo (e da revisão do scanner), o veredito de cada id e os sobreviventes. Hash igual e tudo coberto = `sem-novidade` (varrer o mesmo seria queima disfarçada). Ordem: arquivo mudado nos últimos 7 dias (git log),
   depois selftests SEM mutante embutido, depois o menos recente; --cap limita os mutantes por alvo por varredura. O motor NÃO trava o --state: UM sweep por vez é de quem chama. Estado que lê mas tem forma errada = estado-ilegivel (rc 3, nunca se zera).
+TETO DO SLOT (ga-2d14tow): o teto por arquivo não pega o laço que grava MUITOS arquivos pequenos (cada um passa por baixo dele; 50 mil arquivos de 100 KB são 5 GB). Enquanto cada selftest da família roda, o motor mede o slot (`du -sk`) a cada 2 s e, se ele cresceu
+  mais de --slot-mb MB (1024) desde a cópia da árvore, mata o grupo do filho: rc 153 (o mesmo do teto por arquivo) = mutante MORTO como qualquer rc != 0, nunca falha de infra; na baseline é baseline vermelha. Medida que não sai (du ausente, prazo, saída que não é número) não mata ninguém.
+  NÃO coberto: escrita FORA do slot (a jaula real só deixa o slot; a falsa dos testes deixa) e o disco todo do nó.
 CÓDIGOS: 0 · 2 uso · 3 estado ilegível, árvore ilegível, sem alvos ou gravação que falhou · 97 jaula não provada · 143 interrompido (o estado já gravado vale).
 """
 import argparse
@@ -329,6 +332,44 @@ def wipe(ctx, p):
         shutil.rmtree(p, ignore_errors=True)
 
 
+SLOT_MB = 1024   # crescimento máximo de um slot (MB) desde a cópia da árvore, ver TETO DO SLOT
+try:   # HQM_SLOT_POLL_S: os selftests medem a cada 0.2 s. vazio → 2 s; falhou/ilegível (não é número, fora de 0.05..60) → 2 s, nunca um intervalo que não mede
+    SLOT_POLL_S = float(os.environ.get("HQM_SLOT_POLL_S", "2"))
+    if not 0.05 <= SLOT_POLL_S <= 60:
+        raise ValueError(SLOT_POLL_S)
+except ValueError:
+    SLOT_POLL_S = 2.0
+
+
+def slot_kb(slot):
+    """KB que o slot ocupa (du -sk), ou None quando a medida não saiu. vazio/falhou/ilegível (du ausente, prazo, saída que não é número) → None: sem medida não há veredito e o filho segue. Um du que sai com rc 1 por um subdiretório ilegível ainda imprime o que somou: vale, é um mínimo (nunca mata sem motivo)"""
+    try:
+        r = subprocess.run(["du", "-sk", str(slot)], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    head = r.stdout.split("\t", 1)[0].strip()
+    return int(head) if head.isdigit() else None
+
+
+def wait_capped(ctx, p, slot, base_kb, limit_s):
+    """rc do filho p; 153 (128 + SIGXFSZ, o do teto por arquivo) quando o slot cresceu --slot-mb ou mais desde base_kb: o grupo do filho morre (KILL) e o veredito é de morte, nunca de infra. Passar de limit_s levanta TimeoutExpired, como o p.wait faria"""
+    end = time.time() + limit_s
+    while True:
+        try:
+            return p.wait(timeout=max(0.05, min(SLOT_POLL_S, end - time.time())))
+        except subprocess.TimeoutExpired:
+            if time.time() >= end:
+                raise
+        kb = slot_kb(slot)
+        if kb is not None and kb - base_kb >= ctx.a.slot_mb * 1024:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass   # já saiu
+            p.wait()
+            return 153
+
+
 def exec_family(ctx, slot_n, tgt, text, tmo):
     """copia a árvore para o slot, grava o mutante (text=None: a baseline) e roda a família na jaula; (rc do 1º selftest que não deu 0, ou 0; segundos)"""
     slot = ctx.work / ("slot-%d" % slot_n)
@@ -340,6 +381,7 @@ def exec_family(ctx, slot_n, tgt, text, tmo):
     cd = clone / ctx.tree.relative_to(ctx.root)
     if text is not None:
         (cd / tgt["rel"]).write_text(text, encoding="utf-8")
+    base_kb = slot_kb(slot) or 0   # vazio/falhou (du não mediu) → 0: o limite passa a valer sobre o slot inteiro, nunca sem limite
     # o HOME de mentira vai por `env` DENTRO da jaula: a jaula confere o --rw contra o HOME de VERDADE, e um slot que contém o HOME de mentira seria pai dele e recusado (rc 64 = baseline vermelha em tudo). `env -i`: do ambiente do motor só passa PASS_ENV. SSH_AUTH_SOCK, TMUX, DBUS_*, XDG_RUNTIME_DIR, REMOTE_SHIM_CONF e tokens ficam de fora: o Landlock não barra socket unix nem sinal, então o mutante não pode herdar o endereço de nenhum
     kv = ["%s=%s" % (k, os.environ[k]) for k in PASS_ENV if k in os.environ] + ["HOME=%s" % (slot / "home"), "TMPDIR=%s" % (slot / "tmp"), "PYTHONDONTWRITEBYTECODE=1", "GIT_AUTHOR_NAME=gt", "GIT_AUTHOR_EMAIL=gt@no", "GIT_COMMITTER_NAME=gt", "GIT_COMMITTER_EMAIL=gt@no"]
     t0, rc = time.time(), 0
@@ -349,7 +391,7 @@ def exec_family(ctx, slot_n, tgt, text, tmo):
         with ctx.lock:
             ctx.pids.add(p.pid)
         try:
-            rc = p.wait(timeout=tmo + 30)
+            rc = wait_capped(ctx, p, slot, base_kb, tmo + 30)
         except subprocess.TimeoutExpired:
             os.killpg(p.pid, signal.SIGKILL)
             rc = p.wait()
@@ -424,6 +466,9 @@ def prove(a):
 
 
 def sweep(a):
+    if a.slot_mb < 1:   # sem teto de slot não há varredura (o -h já diz o padrão)
+        print("hq-mutate: --slot-mb tem de ser um inteiro >= 1 (MB de crescimento por slot)", file=sys.stderr)
+        return 2
     tree = Path(a.tree).resolve()
     a.jail = str(Path(a.jail).resolve())   # a jaula roda com o cwd na cópia: um --jail relativo (a forma do USO) passaria na prova e deixaria toda baseline vermelha
     if tree.parent == Path(a.work).resolve() or tree.parent in Path(a.work).resolve().parents:
@@ -556,6 +601,7 @@ def main(argv=None):
         p.add_argument("--state", required=True)
     s = sp.choices["sweep"]
     s.add_argument("--work", required=True)
+    s.add_argument("--slot-mb", type=int, default=SLOT_MB)
     s.add_argument("--jail", required=True)
     for k, d in (("budget-s", 3600), ("slots", 4), ("cap", 40), ("targets", 8), ("fsize-mb", FSIZE_MB)):
         s.add_argument("--" + k, type=int, default=d)
