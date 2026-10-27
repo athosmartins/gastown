@@ -1043,6 +1043,18 @@ class ExtRunOnceTests(unittest.TestCase):
             self.assertEqual(G.run_once(cfg), 0)
         self.assertEqual(picked, [902])
 
+    def test_a_failure_in_the_extension_path_does_not_cost_the_page_guard_its_state(self):
+        """Catches: a bug in the extension path aborting run_once before the state write, which would wipe the
+        page guard's idle history on every run (it would never see a tab as idle again) and signal nothing useful."""
+        child = self.spawn("--type=renderer", "--extension-process")
+        cfg = self.cfg()
+        with mock.patch.object(G, "step_ext", side_effect=RuntimeError("boom")):
+            self.assertEqual(self.run_guard(cfg, "--extension-process", child), 0)
+        self.assertIsNone(child.poll())
+        self.assertIn("ERROR extension-renderer path: RuntimeError: boom", self.log_text(cfg))
+        st = json.loads(pathlib.Path(cfg.state_path).read_text())
+        self.assertIn(str(child.pid), st["pids"], "the page guard's own history must still be written")
+
     def test_unreadable_state_recycles_nothing(self):
         """Catches: a corrupt state file reading as 'over the ceiling for a long time'."""
         child = self.spawn("--type=renderer", "--extension-process")

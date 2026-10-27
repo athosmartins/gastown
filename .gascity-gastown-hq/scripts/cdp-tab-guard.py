@@ -1055,6 +1055,49 @@ def recycle_extension_renderer(cfg, state, cand, main_pid, udd, now, live, log):
     return True
 
 
+def run_extension_recycle(cfg, state, ps_text, main_pid, samples, now, live, killswitch, log):
+    """The extension-renderer path of one run (ga-1wvxej0). Returns (new_ext history, n over the ceiling,
+    n recycled). A separate path because these renderers host no `page` and a leaking one is never idle.
+    A reading that failed (sample None) leaves that pid out of the history: no history, no signal."""
+    new_ext, ext_cands, ext_recycled, ext_over_n = {}, [], 0, 0
+    ext_recent = [t for t in state.get("ext_recycles", []) if now - t < 3600]
+    state["ext_recycles"] = ext_recent        # same list: every attempt is recorded as it happens
+    for pid in parse_extension_renderers(ps_text, main_pid):
+        s = samples.get(pid)
+        if s is None:
+            continue
+        entry, over_for = step_ext(state.get("ext", {}).get(str(pid)), s, now, cfg)
+        new_ext[str(pid)] = entry
+        if s["footprint_mb"] >= cfg.ext_ceiling_mb:
+            ext_over_n += 1
+            verdict = ext_decide(over_for, len(ext_recent), cfg)
+            log("EXT_HEAVY pid=%d fp=%.0fMB over_ceiling=%ds need=%ds recycled_last_hour=%d/%d -> %s" % (
+                pid, s["footprint_mb"], over_for, cfg.ext_grace_sec, len(ext_recent), cfg.ext_max_recycle_hour,
+                verdict))
+            if verdict == "CAPPED":
+                log("EXT_RECYCLE_CAPPED pid=%d fp=%.0fMB — this hour's recycles are used up; the whole-Chrome "
+                    "watchdog is the only net left" % (pid, s["footprint_mb"]))
+            elif verdict == "RECYCLE":
+                ext_cands.append({"pid": pid, "fp_mb": s["footprint_mb"], "over_for_s": over_for,
+                                  "start": s["start"]})
+    if ext_cands:
+        ext_live = live and cfg.ext_recycle == 1
+        if not ext_live:
+            log("EXT_RECYCLE is a dry run (%s)" % ("kill switch present" if killswitch else
+                                                   "ACTION/EXT_RECYCLE not 1" if cfg.ext_recycle != 1 or cfg.action != 1
+                                                   else "not armed"))
+        # one per run, heaviest first: a respawned renderer gets its own grace before the next one
+        cand = max(ext_cands, key=lambda c: c["fp_mb"])
+        try:
+            if recycle_extension_renderer(cfg, state, cand, main_pid, main_user_data_dir(ps_text, main_pid),
+                                          now, ext_live, log):
+                ext_recycled = 1
+        except Exception as ex:
+            log("ERROR recycling extension renderer %d: %s: %s — a signal may already have been sent: check the "
+                "RECYCLING_EXT/RECYCLED_EXT lines above" % (cand["pid"], type(ex).__name__, ex))
+    return new_ext, ext_over_n, ext_recycled
+
+
 def run_once(cfg, verbose=False):
     log = make_logger(cfg, verbose)
     os.makedirs(cfg.state_dir, exist_ok=True)
@@ -1119,51 +1162,22 @@ def run_once(cfg, verbose=False):
             log("ERROR acting on %d heavy idle renderer(s): %s: %s — a close may already have been issued "
                 "before the failure: check the CLOSING/CLOSED lines above" % (len(candidates), type(ex).__name__, ex))
 
-    # Extension renderers (ga-1wvxej0): a separate path, because they host no `page` and a leaking one is
-    # never idle. A reading that failed (s is None) leaves that pid out of the history: no history, no signal.
-    new_ext, ext_cands, ext_recycled, ext_over_n = {}, [], 0, 0
-    ext_recent = [t for t in state.get("ext_recycles", []) if now - t < 3600]
-    state["ext_recycles"] = ext_recent        # same list: every attempt is recorded as it happens
-    for pid in parse_extension_renderers(ps_run.stdout, main_pid):
-        s = samples.get(pid)
-        if s is None:
-            continue
-        entry, over_for = step_ext(state.get("ext", {}).get(str(pid)), s, now, cfg)
-        new_ext[str(pid)] = entry
-        if s["footprint_mb"] >= cfg.ext_ceiling_mb:
-            ext_over_n += 1
-            verdict = ext_decide(over_for, len(ext_recent), cfg)
-            log("EXT_HEAVY pid=%d fp=%.0fMB over_ceiling=%ds need=%ds recycled_last_hour=%d/%d -> %s" % (
-                pid, s["footprint_mb"], over_for, cfg.ext_grace_sec, len(ext_recent), cfg.ext_max_recycle_hour,
-                verdict))
-            if verdict == "CAPPED":
-                log("EXT_RECYCLE_CAPPED pid=%d fp=%.0fMB — this hour's recycles are used up; the whole-Chrome "
-                    "watchdog is the only net left" % (pid, s["footprint_mb"]))
-            elif verdict == "RECYCLE":
-                ext_cands.append({"pid": pid, "fp_mb": s["footprint_mb"], "over_for_s": over_for,
-                                  "start": s["start"]})
-    if ext_cands:
-        ext_live = live and cfg.ext_recycle == 1
-        if not ext_live:
-            log("EXT_RECYCLE is a dry run (%s)" % ("kill switch present" if killswitch else
-                                                   "ACTION/EXT_RECYCLE not 1" if cfg.ext_recycle != 1 or cfg.action != 1
-                                                   else "not armed"))
-        # one per run, heaviest first: a respawned renderer gets its own grace before the next one
-        cand = max(ext_cands, key=lambda c: c["fp_mb"])
-        try:
-            if recycle_extension_renderer(cfg, state, cand, main_pid, main_user_data_dir(ps_run.stdout, main_pid),
-                                          now, ext_live, log):
-                ext_recycled = 1
-        except Exception as ex:
-            log("ERROR recycling extension renderer %d: %s: %s — a signal may already have been sent: check the "
-                "RECYCLING_EXT/RECYCLED_EXT lines above" % (cand["pid"], type(ex).__name__, ex))
+    # Extension renderers (ga-1wvxej0). Whatever goes wrong in this path must not cost the page guard its idle
+    # history (the state write below): on any failure the extension history is kept as it was and nothing is signalled.
+    try:
+        new_ext, ext_over_n, ext_recycled = run_extension_recycle(
+            cfg, state, ps_run.stdout, main_pid, samples, now, live, killswitch, log)
+    except Exception as ex:
+        new_ext, ext_over_n, ext_recycled = dict(state.get("ext") or {}), 0, 0
+        log("ERROR extension-renderer path: %s: %s — extension history kept, nothing signalled this run"
+            % (type(ex).__name__, ex))
 
     credit_own_cpu(new_pids, state.pop("own_cpu_ms", None) or {})
     state["v"] = 1
     state["pids"] = new_pids
     state["ext"] = new_ext
     state["closes"] = [t for t in state.get("closes", []) if now - t < 3600]
-    state["ext_recycles"] = [t for t in state["ext_recycles"] if now - t < 3600]
+    state["ext_recycles"] = [t for t in state.get("ext_recycles", []) if now - t < 3600]
     if not heavy and now - state.get("last_heartbeat", 0) >= HEARTBEAT_EVERY_S:
         log("ok renderers=%d total=%.0fMB max=%.0fMB heavy=0 swap=%s pressure=%s live=%s" % (
             len(evals), total_mb, max_mb, "?" if swap_mb is None else "%.0fMB" % swap_mb, pressure, live))
