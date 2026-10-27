@@ -21,6 +21,11 @@
 # failure, a marker that is not an ancestor, an unknown rig. Unknown never
 # counts as inert.
 #
+# Since ga-xx7qt7a a delta that holds CODE has a second way to move the marker (the rig-wide
+# scheduled-job proof, dri_sched_proof; see story-delivery-daemon-refresh-scheduled-advance.test.sh).
+# The stub below answers only `runtime_dir`, so for that proof `extra_runtime_roots` is unreadable
+# and it holds — which is why the code cases here (T2, T4, T12) still read as holds.
+#
 # T1: docs-only delta → marker moves to HEAD, log says "advanced: delta sem
 #     daemon afetado", an unflagged pin on the marker moves, a 'stuck' pin, a
 #     pin whose own window has code, and a pin with no sha stay byte-for-byte.
