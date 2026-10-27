@@ -13,8 +13,10 @@ OUTPUT (stdout): the first line `IMPORTS-OK special=<n> files=<m>`, then the <m>
 non-zero exit, means the walk did not finish: the caller reads that as unmeasured, never as an empty closure. `special` counts the reaches
 this cannot show as data: a symlink or a submodule where an import points or that sits on its way, a `..` that follows a descent (the lint
 stats the path through the scratch tree's own directories, and the tip may have one there that the scratch tree does not), a path that climbs
-above the tree (the lint resolves it against the scratch dir, not the repo), and an absolute or ~ import that names a file on THIS host (the
-lint reads the host's file, not the branch's).
+above the tree (the lint resolves it against the scratch dir, not the repo), and every absolute or ~ import (the lint would read the host's
+file, not the branch's). That last one counts whether or not this host has such a file: the disk is never asked, because an answer that
+changes the output would tell a builder who cannot read this disk what is on it (ga-ymc1052; gate-hard-checks-lint.py keeps the lint from
+asking either).
 
 Nothing of the branch is executed: the lint is the copy already merged, the branch is read as git objects. Python 3.9 compatible, like the lint.
 """
@@ -56,11 +58,13 @@ def tree(top: str, tip: str) -> Dict[str, Tuple[str, str]]:
     return out
 
 
-def reach(lint, tok: str, host: str, entries: Dict[str, Tuple[str, str]]) -> Tuple[Optional[str], int]:
+def reach(tok: str, host: str, entries: Dict[str, Tuple[str, str]]) -> Tuple[Optional[str], int]:
     """(the tip path the lint would read for this import, or None; 1 when the answer on the whole tree may differ from the scratch tree's)."""
     if tok.startswith("~") or posixpath.isabs(tok):
-        # vazio → (None, 0): no regular file by that name on this host, the lint counts the line as text; falhou (stat error) → LintError out of resolve_import, exit 2
-        return (None, 1) if lint.resolve_import(tok, "/") else (None, 0)
+        # The disk is not asked (ga-ymc1052). A special that depended on whether the host HAS the file would give a builder who cannot read
+        # this disk an oracle for it: the verdict label, the reason and a stat error's text would all change with the answer. Every such
+        # token is the same special, found or not, and a clean verdict that carries one is unmeasured either way.
+        return None, 1
     # The lint stats the path through the REAL directories of the scratch tree, which holds only the extracted files, so the walk goes one
     # component at a time like the filesystem does (a text normpath would not): a `..` after a descent passes through a directory that exists
     # in the tip but maybe not there, and a link on the way leads somewhere the tip listing does not show. Both are odd = 1: unmeasured.
@@ -111,7 +115,7 @@ def closure(lint, top: str, entries: Dict[str, Tuple[str, str]], roots: List[str
             if doc.kinds[i] not in ("text", "heading"):
                 continue
             for tok in lint.import_tokens(line)[0]:
-                target, odd = reach(lint, tok, cur, entries)
+                target, odd = reach(tok, cur, entries)
                 special += odd
                 if target is not None:
                     need.add(target)

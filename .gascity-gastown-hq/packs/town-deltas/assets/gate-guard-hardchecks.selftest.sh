@@ -59,6 +59,8 @@ lab() { has "$1" "label add ga-marker-1 $2:$3"; }     # lab <calls> <label> <ver
 GCCITY="$WORK/city"; AS="$GCCITY/packs/town-deltas/assets"
 mkdir -p "$GCCITY/scripts" "$AS" "$GCCITY/.gc" && cp "$RHQ/scripts/doc-rules-lint.py" "$GCCITY/scripts/" && cp "$CHECKER" "$AS/" || { echo "FATAL: cannot build the fixture city"; exit 1; }
 for f in third-state-reads-check.py e12-crew-doctrine.sh e12-arms.sh template-fragment-lint-guard.sh; do cp "$RHQ/packs/town-deltas/assets/$f" "$AS/" || exit 1; done
+# the checker's own helpers sit beside it in the city: 2c runs the lint through gate-hard-checks-lint.py and without it the step is unmeasured (ga-ymc1052)
+for f in gate-hard-checks-imports.py gate-hard-checks-lint.py; do cp "$(dirname "$CHECKER")/$f" "$AS/" || { echo "FATAL: cannot build the fixture city ($f beside the checker)"; exit 1; }; done
 
 echo "B. end to end: real checker and tools, real git, rig = a subdirectory of the clone"
 ORIGIN="$WORK/origin.git"; BUILD="$WORK/build"; RIGCLONE="$WORK/rigclone"

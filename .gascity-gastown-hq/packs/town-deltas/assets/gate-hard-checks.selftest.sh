@@ -26,7 +26,7 @@ for f in scripts/doc-rules-lint.py packs/town-deltas/assets/third-state-reads-ch
   [ -f "$RHQ/$f" ] || { echo "FATAL: $RHQ/$f not found (the tools the checker runs)"; exit 1; }
 done
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ghc-selftest.XXXXXX")" || { echo "FATAL: no scratch dir"; exit 1; }
-trap 'rm -rf "$WORK"' EXIT
+trap 'chmod -R u+rwX "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT   # the host-side fixtures below include a file and a directory nobody may read
 export TMPDIR="$WORK/tmp"; mkdir -p "$TMPDIR"
 
 put() { mkdir -p "$(dirname "$1/$2")" && cat > "$1/$2"; }
@@ -162,6 +162,12 @@ big() { local i=0; while [ "$i" -lt "$1" ]; do echo "big $i"; i=$((i+1)); done; 
 big 250 > "$R/docs/big.txt"; big 3 > "$R/docs/small.txt"; printf '@big.txt\n' > "$R/docs/chain.md"; ln -s big.txt "$R/docs/biglink.txt"; ln -s docs "$R/linkdir"
 printf '@cyc_b.txt\n' > "$R/docs/cyc_a.txt"; printf '@cyc_a.txt\nmore\n' > "$R/docs/cyc_b.txt"
 mkdir -p "$R/sub" && big 250 > "$R/sub/notes.txt"; big 3 > "$WORK/outside.txt"; mkdir -p "$WORK/home" && big 3 > "$WORK/home/ref.txt"
+# Files on the HOST (outside the repo) for the ga-ymc1052 twins below: a long one, an unreadable one, one inside a directory nobody may
+# enter, a chain whose members import each other, and one above the scratch tree (reached by climbing out of it with `..`).
+big 250 > "$WORK/hostbig.txt"; big 250 > "$WORK/home/big.txt"; big 250 > "$WORK/hostabove.txt"
+big 3 > "$WORK/hostunread.txt"; chmod 000 "$WORK/hostunread.txt"
+mkdir -p "$WORK/hostnoexec" && big 3 > "$WORK/hostnoexec/x.txt" && chmod 000 "$WORK/hostnoexec"
+mkdir -p "$WORK/hostchain" && printf 'one\n@%s/hostchain/n2.txt\n' "$WORK" > "$WORK/hostchain/n1.txt" && printf 'two\n@%s/hostchain/secret-n3.txt\n' "$WORK" > "$WORK/hostchain/n2.txt" && big 250 > "$WORK/hostchain/secret-n3.txt"
 NB="$(commit_all "$R" nolink-base)"
 # nd <branch> <import line> [doc path]: a small named doc (9 lines, Contents fine) on a branch of NB; TIP = its commit
 nd() { branch_from "$R" "$NB" "$1"; mkdir -p "$(dirname "$R/${3:-CLAUDE.md}")"; { printf '# T\n\n## Contents\n\n- A\n\n## A\n\n'; filler; printf '%s\n' "$2"; } > "$R/${3:-CLAUDE.md}"; TIP="$(commit_all "$R" "$1")"; }
@@ -182,10 +188,57 @@ nd n_span 'see `@docs/biglink.txt` here';      run_sut 2c "$R" "$NB" "$TIP" ga-x
 nd n_fence $'```\n@docs/biglink.txt\n```'; run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "an @import inside a fenced code block is not an import either" ok lint-limpo
 nd n_abs "@$WORK/outside.txt";          run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "an absolute import reads the HOST's file, not the branch's: a clean lint is unmeasured" nao-consegui-medir entrada-especial-fora-do-diff-1
 nd n_home "@~/ref.txt";                 run_sut 2c "$R" "$NB" "$TIP" ga-x "HOME=$WORK/home"; expect "a ~ import is the host's file too" nao-consegui-medir entrada-especial-fora-do-diff-1
-nd n_nofile "@/nonexistent-dir/x.txt";  run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "an absolute @word that is no file is not an import" ok lint-limpo
+nd n_nofile "@/nonexistent-dir/x.txt";  run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "an absolute @word that no file answers reads exactly like one a file answers (ga-ymc1052): the disk is never asked" nao-consegui-medir entrada-especial-fora-do-diff-1
 nd n_up "@../outside.txt";              run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "an import that climbs above the tree is resolved against the scratch dir, not the repo: unmeasured" nao-consegui-medir entrada-especial-fora-do-diff-1
+# ga-ymc1052 — what this host's disk holds must not reach the output. A builder that cannot read this disk (the Hetzner dog) reads the
+# verdict label, the reason and, on a refusal, the lint's own lines; if any of them differs between "the host has that file" and "it has not",
+# the submitted CLAUDE.md is an oracle for the host's files: their existence, their length (the 200-line count says it), the names they
+# import, whether the guard may read them. So an @import that names a host file (absolute, ~, or a climb above the tree) is the same
+# special whatever the disk answers, and the lint is not allowed to ask. twin runs the same small named doc twice, once with an import
+# the host can answer and once with one it cannot; the checker's WHOLE output and exit code must be equal, and be the wanted verdict.
+TWN=0
+twin() { # twin <label> <verdict> <reason> <import the host has> <import the host lacks> [VAR=value ...]
+  local label="$1" wv="$2" wr="$3" a="$4" b="$5" oa="" ob="" ra="" rb=""; shift 5
+  TWN=$((TWN+1))
+  # The run the host CAN answer goes last: OUT, VERDICT and REASON are left holding it, so the hasnt lines after a twin look at the
+  # output where a leak would show (the run for a path the host lacks has nothing to leak).
+  nd "twin_${TWN}_lacks" "$b"; run_sut 2c "$R" "$NB" "$TIP" ga-x "$@"; ob="$OUT"; rb="$RC"
+  nd "twin_${TWN}_has" "$a";   run_sut 2c "$R" "$NB" "$TIP" ga-x "$@"; oa="$OUT"; ra="$RC"
+  if [ "$oa" = "$ob" ] && [ "$ra" = "$rb" ] && [ "$VERDICT" = "$wv" ] && [ "$REASON" = "$wr" ]; then ok "$label: the same output either way -> $VERDICT ($REASON)"
+  else bad "$label: wanted one output, $wv ($wr), got has=[$(printf '%s' "$oa" | head -n 3 | tr '\n' '|' | cut -c1-230)] lacks=[$(printf '%s' "$ob" | head -n 3 | tr '\n' '|' | cut -c1-230)]"; fi
+}
+SP1="nao-consegui-medir entrada-especial-fora-do-diff-1"
+twin "an absolute import, a 3-line host file vs a path no host has (the bead's two cases)" $SP1 "@$WORK/outside.txt" "@$WORK/no-such-dir/x.txt"
+twin "an absolute import, a 250-line host file: its length is not counted" $SP1 "@$WORK/hostbig.txt" "@$WORK/no-such-dir/x.txt"
+hasnt "and no 200-line count of the host's file reaches the output" "effective"
+twin "an absolute import of a host file the guard may not read" $SP1 "@$WORK/hostunread.txt" "@$WORK/no-such-dir/x.txt"
+twin "an absolute import into a host directory nobody may enter" $SP1 "@$WORK/hostnoexec/x.txt" "@$WORK/no-such-dir/x.txt"
+hasnt "and the resolved path is not echoed" "cannot stat"
+twin "an absolute import of a host file that imports other host files" $SP1 "@$WORK/hostchain/n1.txt" "@$WORK/no-such-dir/x.txt"
+hasnt "and the names the host file imports are not listed" "secret-n3"
+twin "a ~ import, a 3-line file in the guard's home vs one it lacks" $SP1 "@~/ref.txt" "@~/no-such-ref.txt" "HOME=$WORK/home"
+twin "a ~ import, a 250-line file in the guard's home" $SP1 "@~/big.txt" "@~/no-such-ref.txt" "HOME=$WORK/home"
+twin "a climb out of the scratch tree to a 250-line host file vs to a path that is not there" $SP1 "@../../../hostabove.txt" "@../../../hostabove-none.txt"
+nd n_three "@/a/b @~/c @~someone/d";   run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "every host token counts once, existing or not: three of them are special 3" nao-consegui-medir entrada-especial-fora-do-diff-3
+nd n_mixed "@$WORK/outside.txt @$WORK/no-such-dir/x.txt"; run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "one the host has and one it lacks are two specials, not one" nao-consegui-medir entrada-especial-fora-do-diff-2
+# The host token may sit in a doc the CLAUDE.md reaches, not in the CLAUDE.md itself
+nested() { # nested <branch> <line of docs/nested.md>: a clean CLAUDE.md that imports docs/nested.md
+  branch_from "$R" "$NB" "$1"; printf '# nested\n%s\n' "$2" > "$R/docs/nested.md"
+  { printf '# T\n\n## Contents\n\n- A\n\n## A\n\n'; filler; printf '@docs/nested.md\n'; } > "$R/CLAUDE.md"; TIP="$(commit_all "$R" "$1")"
+}
+nested nest_lacks "@$WORK/no-such-dir/x.txt"; run_sut 2c "$R" "$NB" "$TIP" ga-x; NL="$OUT"; NRL="$RC"
+nested nest_has "@$WORK/hostbig.txt";  run_sut 2c "$R" "$NB" "$TIP" ga-x
+[ "$NL" = "$OUT" ] && [ "$NRL" = "$RC" ] && [ "$VERDICT $REASON" = "$SP1" ] && ok "a host import inside a doc the CLAUDE.md imports: the same output either way -> $VERDICT ($REASON)" || bad "nested host import: lacks=[$(printf '%s' "$NL" | head -n 3 | tr '\n' '|' | cut -c1-200)] has=[$(printf '%s' "$OUT" | head -n 3 | tr '\n' '|' | cut -c1-200)]"
+# A real finding stays a finding, and its lines do not depend on the host either
+ownfail() { # ownfail <branch> <import line>: a CLAUDE.md that is over the cap by its OWN lines, plus one import line
+  branch_from "$R" "$NB" "$1"; { printf '# T\n\n## Contents\n\n- A\n\n## A\n\n'; big 205; printf '%s\n' "$2"; } > "$R/CLAUDE.md"; TIP="$(commit_all "$R" "$1")"
+}
+ownfail own_lacks "@$WORK/no-such-dir/x.txt"; run_sut 2c "$R" "$NB" "$TIP" ga-x; FL="$OUT"; FRL="$RC"
+ownfail own_has "@$WORK/hostbig.txt";  run_sut 2c "$R" "$NB" "$TIP" ga-x
+[ "$FL" = "$OUT" ] && [ "$FRL" = "$RC" ] && [ "$VERDICT $REASON" = "fail violacoes-doc-rules" ] && ok "a doc over the cap by its own lines is still refused, with the same lines whatever the host holds -> $VERDICT ($REASON)" || bad "own-lines finding: lacks=[$(printf '%s' "$FL" | head -n 3 | tr '\n' '|' | cut -c1-230)] has=[$(printf '%s' "$OUT" | head -n 3 | tr '\n' '|' | cut -c1-230)]"
+hasnt "and the refusal names no imported host file" "imported"
 # A closure helper that crashes or prints something else is a measurement that did not happen, never an empty closure
-HB="$WORK/hbroken"; mkdir -p "$HB"; cp "$SUT" "$HB/gate-hard-checks.sh"; SUT_REAL="$SUT"; SUT="$HB/gate-hard-checks.sh"
+HB="$WORK/hbroken"; mkdir -p "$HB"; cp "$SUT" "$HB/gate-hard-checks.sh"; cp "$(dirname "$SUT")/gate-hard-checks-lint.py" "$HB/"; SUT_REAL="$SUT"; SUT="$HB/gate-hard-checks.sh"
 nd n_hlp "@docs/big.txt"
 printf 'import sys\nsys.exit(3)\n' > "$HB/gate-hard-checks-imports.py"
 run_sut 2c "$R" "$NB" "$TIP" ga-x;                         expect "a closure helper that exits non-zero" nao-consegui-medir imports-nao-medidos
@@ -195,6 +248,12 @@ printf 'print("IMPORTS-OK special=0 files=0 extra")\n' > "$HB/gate-hard-checks-i
 run_sut 2c "$R" "$NB" "$TIP" ga-x;                         expect "a closure helper whose first line is not the exact protocol line" nao-consegui-medir imports-nao-medidos
 rm -f "$HB/gate-hard-checks-imports.py"
 run_sut 2c "$R" "$NB" "$TIP" ga-x;                         expect "a missing closure helper" nao-consegui-medir imports-nao-medidos
+# The lint runs through gate-hard-checks-lint.py so it cannot read this host's disk for an @import (ga-ymc1052): without that wrapper the
+# step is unmeasured, and the lint is never run bare in its place
+cp "$(dirname "$SUT_REAL")/gate-hard-checks-imports.py" "$HB/"
+run_sut 2c "$R" "$NB" "$TIP" ga-x;                         expect "control: the closure helper and the lint wrapper both present read as before" fail violacoes-doc-rules
+rm -f "$HB/gate-hard-checks-lint.py"
+run_sut 2c "$R" "$NB" "$TIP" ga-x;                         expect "a missing lint wrapper: the lint is not run bare instead" nao-consegui-medir ferramenta-ilegivel
 SUT="$SUT_REAL"
 # Excluded directories (vendor/) are skipped by the lint: "0 file(s) checked" is a measured zero, not a clean bill
 branch_from "$R" main b_vendor; mkdir -p "$R/vendor"; bad_doc > "$R/vendor/x.md";           TIP="$(commit_all "$R" vendor)"
@@ -211,13 +270,63 @@ printf 'import time\ntime.sleep(30)\n' > "$C2/scripts/doc-rules-lint.py"
 run_sut 2c "$R" "$MAIN" "$(git -C "$R" rev-parse b_bad)" ga-x GATE_HC_TIMEOUT=1;      expect "a hung lint is cut by the timeout" nao-consegui-medir lint-rc124
 printf 'import sys\nsys.exit(0)\n' > "$C2/scripts/doc-rules-lint.py"
 run_sut 2c "$R" "$MAIN" "$(git -C "$R" rev-parse b_bad)" ga-x;                          expect "exit 0 with no output at all is not a clean lint" nao-consegui-medir saida-sem-resumo
-printf 'print("doc-rules-lint: 2 file(s) checked, 1 violation(s), 0 skipped (excluded)")\n' > "$C2/scripts/doc-rules-lint.py"
+# A stand-in lint is a module with the two functions the lint wrapper relies on (resolve_import, which it keeps off the disk, and main)
+stub_lint() { printf 'def resolve_import(tok, host_dir):\n    return None\n\ndef main(argv=None):\n    print("%s")\n    return %s\n' "$1" "$2"; }
+stub_lint 'doc-rules-lint: 2 file(s) checked, 1 violation(s), 0 skipped (excluded)' 0 > "$C2/scripts/doc-rules-lint.py"
 run_sut 2c "$R" "$MAIN" "$(git -C "$R" rev-parse b_bad)" ga-x;                          expect "exit 0 whose summary counts a violation contradicts itself: unmeasured" nao-consegui-medir saida-sem-resumo
-printf 'print("doc-rules-lint: 3 file(s) checked, 0 violation(s), 0 skipped (excluded)")\n' > "$C2/scripts/doc-rules-lint.py"
+stub_lint 'doc-rules-lint: 3 file(s) checked, 0 violation(s), 0 skipped (excluded)' 0 > "$C2/scripts/doc-rules-lint.py"
 run_sut 2c "$R" "$MAIN" "$(git -C "$R" rev-parse b_bad)" ga-x;                          expect "control: exit 0 and a summary of 3 files checked, 0 violations" ok lint-limpo
+# The wrapper patches the lint's resolve_import; a lint that does not have it (renamed, or never there) would run unpatched, reading the host's disk
+printf 'def main(argv=None):\n    print("doc-rules-lint: 3 file(s) checked, 0 violation(s), 0 skipped (excluded)")\n    return 0\n' > "$C2/scripts/doc-rules-lint.py"
+run_sut 2c "$R" "$MAIN" "$(git -C "$R" rev-parse b_bad)" ga-x;                          expect "a lint with no resolve_import is never run unpatched" nao-consegui-medir lint-rc2
+printf 'def resolve_import(tok, host_dir):\n    return None\n' > "$C2/scripts/doc-rules-lint.py"
+run_sut 2c "$R" "$MAIN" "$(git -C "$R" rev-parse b_bad)" ga-x;                          expect "a lint with no main is not a clean lint" nao-consegui-medir lint-rc2
+printf 'def resolve_import(tok, host_dir:\n' > "$C2/scripts/doc-rules-lint.py"
+run_sut 2c "$R" "$MAIN" "$(git -C "$R" rev-parse b_bad)" ga-x;                          expect "a lint that does not even parse is unmeasured" nao-consegui-medir lint-rc2
 rm -f "$C2/scripts/doc-rules-lint.py"
 run_sut 2c "$R" "$MAIN" "$(git -C "$R" rev-parse b_bad)" ga-x;                          expect "a missing lint" nao-consegui-medir ferramenta-ilegivel
 CITY_UNDER=""
+
+echo "C2. the lint wrapper keeps the lint off this host's disk (ga-ymc1052), proved on its own"
+WRAP="$(dirname "$SUT")/gate-hard-checks-lint.py"
+# The resolver it installs, with the lint's own resolve_import replaced by a marker so "delegated" and "answered without the disk" differ
+mkdir -p "$WORK/wtree/sub" "$WORK/wtree2"
+cat > "$WORK/wrap-unit.py" <<'PY'
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("ghc_lint", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+root = sys.argv[2]
+sub = os.path.join(root, "sub")
+res = mod.host_blind(lambda tok, host: "REAL:%s@%s" % (tok, host), root)
+cases = [
+    ("absolute", "/etc/hosts", root, None),
+    ("tilde", "~/x", root, None),
+    ("tilde user", "~someone/x", root, None),
+    ("climb out of the root", "../x", root, None),
+    ("climb out of a subfolder (two levels)", "../../x", sub, None),
+    ("a sibling whose name starts with the root's name", "../" + os.path.basename(root) + "2/x", root, None),
+    ("an absolute path that points INSIDE the root is still a host path", os.path.join(root, "x"), root, None),
+    ("inside the root: the lint's own resolver answers", "docs/x.txt", root, "REAL:docs/x.txt@" + root),
+    ("a .. that stays inside the root", "../docs/x.txt", sub, "REAL:../docs/x.txt@" + sub),
+]
+bad = 0
+for name, tok, host, want in cases:
+    got = res(tok, host)
+    if got != want:
+        bad += 1
+        print("WRONG %s: %r -> %r (wanted %r)" % (name, tok, got, want))
+print("wrapper resolver: %d case(s), %d wrong" % (len(cases), bad))
+sys.exit(1 if bad else 0)
+PY
+UOUT="$(python3 -I "$WORK/wrap-unit.py" "$WRAP" "$WORK/wtree" 2>&1)"; URC=$?
+[ "$URC" -eq 0 ] && ok "the resolver answers 'no such file' to every import that leaves the tree and delegates the rest ($(printf '%s' "$UOUT" | tail -n 1))" || bad "the resolver: $(printf '%s' "$UOUT" | head -n 4 | tr '\n' '|' | cut -c1-300)"
+# Through a symlinked tree root (macOS: /var is a link to /private/var) an import inside the tree is still inside it, and counted
+mkdir -p "$WORK/wreal" && { printf '# T\n\n## Contents\n\n- A\n\n## A\n\n'; filler; echo "@big.txt"; } > "$WORK/wreal/CLAUDE.md"; big 250 > "$WORK/wreal/big.txt"; ln -s wreal "$WORK/wlink"
+UOUT="$(cd "$WORK/wlink" && env "GC_CITY_PATH=$CITY" python3 -I "$WRAP" "$RHQ/scripts/doc-rules-lint.py" "$WORK/wlink" --check --root "$WORK/wlink" --upstream-ref none CLAUDE.md 2>&1)"; URC=$?
+{ [ "$URC" -eq 1 ] && printf '%s\n' "$UOUT" | grep -q 'imported 250 from big.txt'; } && ok "a tree reached through a symlink still counts the import inside it (rc 1, 250 lines)" || bad "symlinked tree root: rc=$URC $(printf '%s' "$UOUT" | head -n 3 | tr '\n' '|' | cut -c1-250)"
+UOUT="$(env "GC_CITY_PATH=$CITY" python3 -I "$WRAP" 2>&1)"; URC=$?
+{ [ "$URC" -eq 2 ] && printf '%s\n' "$UOUT" | grep -q '^usage:'; } && ok "called with no arguments: usage, exit 2" || bad "no arguments: rc=$URC $UOUT"
 
 echo "D. tree safety: a path the branch controls can neither climb out of the scratch dir nor be a link"
 blob="$(printf 'x\n' | git -C "$R" hash-object -w --stdin)"

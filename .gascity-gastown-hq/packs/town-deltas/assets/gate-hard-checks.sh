@@ -14,7 +14,12 @@
 # branch supplies is EXECUTED: each tool is the copy already merged beside this script (HQ_DIR), run over the branch's
 # files as DATA. A diff that edits the tool itself is not judged (ferramenta-alterada-no-diff): its own copy cannot
 # vouch for it. Tree paths are data too: an entry with a "." / ".." / ".git" component, a symlink or a gitlink where
-# a wanted file should be is refused before anything is written.
+# a wanted file should be is refused before anything is written. 2c also keeps this host's disk from showing through: a path
+# the branch WRITES in a doc (a CLAUDE.md that imports /some/file, ~/x or ../../x) is never looked up on it, so the output
+# reads the same whether the guard's host has that file or not. The submitter reads the verdict label and the refusal lines
+# back and can be a session that cannot read this disk (the Hetzner dog); an output that changed with the file would tell it
+# whether the file exists, how long it is and what it imports (ga-ymc1052). That is done in gate-hard-checks-imports.py and
+# gate-hard-checks-lint.py; 2d and 2e were read for it and open no path the branch names, 2b (gc lint) was not audited.
 #
 # OUTPUT. One line first, then (fail / debito-previo) the tool's red lines, capped at 40:
 #   VERDICT=<token> step=<s> reason=<slug> rc=<n|-> tip=<green|red|unlinted|unknown|-> base=<..|-> arm=<enforce|holdout|->
@@ -51,8 +56,10 @@
 # those files and the changed .md files, nothing else: the lint opens no other file, so an unchanged link that no import reaches
 # (the tracked .claude/commands/gate-done.md) neither goes in the tree nor makes a clean verdict unmeasured.
 # A reach that tree cannot show as data (a link or submodule on the way or at the end, a `..` after a descent, a path above
-# the tree, an absolute or ~ import that names a file on this host) makes a clean verdict unmeasured, and a walk that did not finish is imports-nao-medidos, never an
-# empty closure.
+# the tree, ANY absolute or ~ import: it counts found or not, the disk is not asked) makes a clean verdict unmeasured, and a walk that did not
+# finish is imports-nao-medidos, never an empty closure. The lint itself runs through gate-hard-checks-lint.py, which answers "no such file"
+# to every import that points outside the extracted tree before any stat: such a line counts as plain text, and a finding in the doc's own
+# lines stays a finding.
 # 2b and 2d compare the tip's finding lines with the base's when both are red; if that comparison could not run (no comm, no finding line
 # to read in a run called red) it is unmeasured (parse-linhas-ilegiveis / e12-linhas-ilegiveis), never "no new break".
 # A python without tomllib (< 3.11) cannot run 2d and would make the base tree red as well, so it is said
@@ -152,7 +159,8 @@ pick_tools() { # PY = first python3 with tomllib (PY_TOML=1), else the PATH one;
 # imports_closure: sets IMPORTS (newline-delimited tip paths) and adds to SPECIAL, from the helper that walks the @imports of the changed
 # named docs. The lint follows an @import to a regular file of ANY suffix, so a tree of .md files alone shows it a short count; the
 # helper uses the lint's own tokenizer over the tip's git objects (gate_run ga-h3scrqt). Reaches it cannot show as data (a link, a path
-# above the tree, a `..` after a descent, a file on this host) come back as `special`, which turns a clean verdict into unmeasured (ok_or_special).
+# above the tree, a `..` after a descent, an absolute or ~ import whether or not the host has the file) come back as `special`, which turns a
+# clean verdict into unmeasured (ok_or_special).
 imports_closure() {
   local helper="$HERE/gate-hard-checks-imports.py" out="" first="" n=""
   # vazio → no root although the caller just matched a named doc in this same file: a contradiction, so unmeasured; falhou/ilegível → the
@@ -171,8 +179,11 @@ imports_closure() {
 }
 
 step_2c() {
-  local tool="$HQ_DIR/scripts/doc-rules-lint.py" out="" gd="" n=""
+  local tool="$HQ_DIR/scripts/doc-rules-lint.py" runner="$HERE/gate-hard-checks-lint.py" out="" gd="" n=""
   [ -r "$tool" ] || emit nao-consegui-medir ferramenta-ilegivel
+  # vazio/falhou → the wrapper is gone or unreadable: unmeasured. The lint is never run bare instead, because bare it reads this host's disk
+  # for an @import and what it prints would tell the submitter what is on it (ga-ymc1052).
+  [ -r "$runner" ] || emit nao-consegui-medir ferramenta-ilegivel
   tool_altered "$HQ/scripts/doc-rules-lint.py" && emit nao-consegui-medir ferramenta-alterada-no-diff
   # The lint reads the changed .md files and nothing else, except that a named doc (CLAUDE.md, CLAUDE.local.md, AGENTS.md) counts its
   # @imports, and follows each one to a regular file of any suffix: only then does the tree need more than the changed .md files,
@@ -188,7 +199,10 @@ step_2c() {
   # GIT_DIR gives the lint the real objects (the diff) and refs (upstream/main); the CONTENT it reads is the extracted tip.
   # GIT_WORK_TREE makes `rev-parse --show-toplevel` answer the tip root from any subdirectory (else a file under docs/ looks
   # like it lives at the root of its folder and the upstream skip silently never matches).
-  out="$(cd "$SCRATCH/tip" && env "GIT_DIR=$gd" "GIT_WORK_TREE=$SCRATCH/tip" "GC_CITY_PATH=$HQ_DIR" "$TBIN" "$TMO" "$PY" -I "$tool" --check --root "$SCRATCH/tip" --diff "${base}...${tip}" 2>&1)"; RC=$?
+  # The lint runs through gate-hard-checks-lint.py: the same lint, the same lines and exit codes, but an @import that points outside the
+  # extracted tree (absolute, ~, a climb out of it) is answered "no such file" before any stat. Bare, the lint reads this host's file and
+  # prints its length, the names it imports and the stat error, which the submitter reads back from the marker (ga-ymc1052).
+  out="$(cd "$SCRATCH/tip" && env "GIT_DIR=$gd" "GIT_WORK_TREE=$SCRATCH/tip" "GC_CITY_PATH=$HQ_DIR" "$TBIN" "$TMO" "$PY" -I "$runner" "$tool" "$SCRATCH/tip" --check --root "$SCRATCH/tip" --diff "${base}...${tip}" 2>&1)"; RC=$?
   # vazio → saída sem linha de resumo = a ferramenta não terminou de reportar: nao-consegui-medir; falhou (rc 2/124/127) → idem
   # The tool echoes branch text (a heading, a file name) in its violation lines, so its kill-switch line is believed only on a
   # CLEAN exit, whole line at the start: a branch that writes "DISABLED via" in a title must not turn a refusal into desligado.
