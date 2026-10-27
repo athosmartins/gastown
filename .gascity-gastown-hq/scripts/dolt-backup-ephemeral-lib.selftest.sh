@@ -5,6 +5,12 @@
 # dumb-but-honest fake dolt-backup-s3-proof.selftest.sh uses), a FAKE `ps`, and throwaway
 # .dolt-backup trees. The real aws, the real bucket, the real process list and the real
 # .dolt-backup are NEVER touched.
+#
+# ga-u6ueg0q: the return codes the lib documents as "always 0" (_eph_mode_summary, _eph_s3_fingerprint_state, _eph_epoch_utc) are pinned on every branch they have, and a writer
+# that shows up while the S3 proof is running is refused with rc 1, never reported as a release.
+# EQUIVALENT: in _eph_release_target and _eph_drop_empty_staging the check "pwd -P of the root equals pwd -P of dirname(<root>/<db>)" cannot fail for a db the case above it already
+# accepted (the dirname of <root>/<db> is <root>); in _eph_drop_empty_staging the case on the db name repeats what _eph_is_ephemeral has just refused; and the "real directory, not a
+# symlink" test there only picks WHICH rc 1 path a symlink or a file takes, because rmdir refuses both (rc 1, nothing removed, nothing logged, with or without the test).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -139,6 +145,8 @@ if [ "$(id -u)" != "0" ]; then
   [ "$rc" -eq 2 ] && ok "unreadable conf → rc 2 (cannot tell)" || bad "unreadable conf gave rc $rc"
   _eph_is_ephemeral hq && bad "hq ephemeral with an UNREADABLE conf (doubt must keep the old behaviour)" || ok "unreadable conf → not ephemeral (the staging stays)"
   case "$(_eph_mode_summary)" in off\(conf-unreadable*) ok "summary says conf-unreadable" ;; *) bad "summary: $(_eph_mode_summary)" ;; esac
+  _eph_mode_summary >/dev/null; rc=$?
+  [ "$rc" -eq 0 ] && ok "…and the summary returns 0 even then (a log helper never fails its caller)" || bad "summary of an unreadable conf gave rc $rc"
 else
   ok "(running as root — unreadable-conf cases skipped)"; ok "(skipped)"; ok "(skipped)"
 fi
@@ -321,6 +329,15 @@ _eph_release_staging hq "$BACKUP_ROOT/hq"; rc=$?
 [ "$rc" -eq 1 ] && [ -d "$BACKUP_ROOT/hq" ] && ok "manifest changed during the proof → stale proof → NOT released" || bad "stale proof released the staging (rc=$rc)"
 grep -q 'manifest changed while proving' "$LOGF" && ok "…and the log names the reason" || bad "stale-proof reason not logged"
 [ "$_EPH_RELEASE_WHY" = "manifest-changed" ] && ok "…reason word: manifest-changed (a stale proof)" || bad "reason word is '$_EPH_RELEASE_WHY', expected manifest-changed"
+# 8b. a writer that starts while the (slow) proof runs: the second look, right before the rm, refuses it
+reset_bucket; fresh_root; mkdir_backup "$BACKUP_ROOT/hq" 4; mkdir_backup "$FB/hq" 4
+_s3proof_repair_then_prove() { FAKE_PS_OUT='bash /x/packs/town-deltas/assets/scripts/mol-dog-backup.sh'; export FAKE_PS_OUT; return 0; }
+_eph_release_staging hq "$BACKUP_ROOT/hq"; rc=$?
+unset FAKE_PS_OUT
+[ "$rc" -eq 1 ] && [ -d "$BACKUP_ROOT/hq" ] && ok "a writer that starts while the proof runs → NOT released, rc 1" || bad "late writer: rc=$rc exists=$([ -d "$BACKUP_ROOT/hq" ] && echo yes || echo no)"
+grep -q 'a backup writer started while proving S3' "$LOGF" && ok "…and the log names the reason" || bad "late-writer reason not logged"
+grep -q 'RELEASING' "$LOGF" && bad "the release line was logged although a writer had started" || ok "…and nothing says it is releasing"
+[ "$_EPH_RELEASE_WHY" = "writer-active" ] && ok "…reason word: writer-active" || bad "reason word is '$_EPH_RELEASE_WHY', expected writer-active"
 eval "$_real_proof"
 
 # 9. dry run
@@ -385,6 +402,10 @@ reset_bucket
 putfp '{"run_utc":"2026-10-01T07:05:12Z","databases":{"hq":{"issues":1}}}'
 [ "$(AWS="" _eph_s3_fingerprint_state hq)" = "unknown" ] && ok "AWS unset → unknown" || bad "AWS unset: $(AWS="" _eph_s3_fingerprint_state hq)"
 [ "$(_eph_s3_fingerprint_state 'h q')" = "unknown" ] && ok "invalid db name → unknown" || bad "invalid db: $(_eph_s3_fingerprint_state 'h q')"
+_eph_s3_fingerprint_state 'h q' >/dev/null; rc=$?
+[ "$rc" -eq 0 ] && ok "…an invalid db name still returns 0 (the answer is the word)" || bad "invalid db name gave rc $rc"
+AWS="" _eph_s3_fingerprint_state hq >/dev/null; rc=$?
+[ "$rc" -eq 0 ] && ok "…and so does an unset AWS" || bad "unset AWS gave rc $rc"
 _eph_s3_fingerprint_state hq >/dev/null; [ $? -eq 0 ] && ok "always rc 0 — the answer is the word" || bad "non-zero rc"
 # Each guard that answers "could not find out" BEFORE any aws call (ga-lwbl088). The fake aws ignores the bucket name and the file is in the bucket, so a guard that
 # lets the call through shows up as an answer other than "unknown" and as a line in $CALLS. $CALLS is emptied by the `: >` just before each read: empty → aws never
@@ -462,6 +483,8 @@ grep -qE '(^|[^a-z])rm -rf|rm -r ' <(sed -n '/^_eph_drop_empty_staging()/,/^}/p'
 echo "── _eph_epoch_utc / _eph_s3_last_backup_text (ga-94vxdw) ──"
 [ "$(_eph_epoch_utc "$(epoch_of 2026-10-01T23:38:00Z)")" = "2026-10-01T23:38:00Z" ] && ok "_eph_epoch_utc round-trips an epoch to its UTC timestamp" || bad "epoch→utc: $(_eph_epoch_utc "$(epoch_of 2026-10-01T23:38:00Z)")"
 [ "$(_eph_epoch_utc abc)" = "?" ] && [ "$(_eph_epoch_utc '')" = "?" ] && ok "_eph_epoch_utc: a non-number → '?' (never a made-up time)" || bad "epoch junk: '$(_eph_epoch_utc abc)' '$(_eph_epoch_utc '')'"
+_eph_epoch_utc abc >/dev/null; rc=$?
+[ "$rc" -eq 0 ] && ok "…and it returns 0 for a non-number, as it does for a number" || bad "epoch of a non-number gave rc $rc"
 reset_bucket
 putfp '{"run_utc":"2026-10-01T23:50:00Z","databases":{"hq":{"status":"ok","run_utc":"2026-10-01T23:38:00Z"},"lexbh":{"status":"failed","last_ok_run_utc":"2026-09-29T09:09:49Z"},"beads":{"status":"failed","last_ok_run_utc":null}}}'
 out="$(_eph_s3_last_backup_text hq)"
