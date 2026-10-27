@@ -307,7 +307,7 @@ go test ./...'; do
 # PATH marks whether the command RAN, so "refused" is proved by the command not running, not only by the rc; a fake `df`
 # whose answer the fake git can change makes the disk fall DURING the push. The real git is never called.
 push_cases() {
-  local g="$1" lib="$2" rc out i lbl cmdline hp dp r1 r2 gp seq
+  local g="$1" lib="$2" rc out i lbl cmdline hp dp r1 r2 gp seq RW rr rn rp rq rbad
   local PB="$W/pbin" PD="$W/pdf" LK="$W/plock"
   export HEAVY_GUARD_PUSH_LOCK_DIR="$LK"
   mkdir -p "$PB" "$PD"
@@ -504,6 +504,41 @@ EOF
   p_reset
   pbounded 25 env "${wenv[@]}" FAKE_GIT_DF=3900 FAKE_GIT_SLEEP=8 FAKE_GIT_TERM0=1 "$g" --what pre-push -- git push origin HEAD 2>/dev/null >/dev/null; rc=$?
   check "push watch: a push that ended with 0 keeps its 0 even after the watch told it to stop" 0 "$rc"
+  fi
+  if want race; then
+  # ga-dousipw: the guard's own `wait` must never be cut short. When the watch signalled the guard, bash answered -1 instead of the push's status
+  # (bash 3.2.57 and 5.2.21 alike: 1 run in 40 alone, 1 in 3 with 24 guards at once) and a push that ended with 0 came back as 78. One run cannot
+  # show a race, so: the term0 push above, 24 guards at once, each in a world of its own (fake git and df, lock, log), 4 rounds; every one answers 0
+  RW="$W/race"; mkdir -p "$RW/bin"
+  cat > "$RW/bin/git" <<'EOF'
+#!/bin/sh
+echo 3900 > "$RACE_W/dfnow"
+trap 'exit 0' TERM
+sleep 8 & wait $!
+exit 0
+EOF
+  cat > "$RW/bin/df" <<'EOF'
+#!/bin/sh
+echo "Filesystem 1048576-blocks Used Available Capacity Mounted on"
+echo "/dev/fake 100000 90000 $(cat "$RACE_W/dfnow") 90% /"
+EOF
+  chmod +x "$RW/bin/git" "$RW/bin/df"
+  rp=""
+  for rr in 1 2 3 4; do
+    rn=1
+    while [ "$rn" -le 24 ]; do
+      mkdir -p "$RW/$rr.$rn"; echo 9000 > "$RW/$rr.$rn/dfnow"
+      ( pbounded 40 env RACE_W="$RW/$rr.$rn" PATH="$RW/bin:$PATH" DISK_HEADROOM_PATH=/ HEAVY_GUARD_LIB="$lib" HEAVY_GUARD_WATCH_SECS=1 HEAVY_GUARD_KILL_GRACE_SECS=3 \
+          HEAVY_GUARD_PUSH_LOCK_DIR="$RW/$rr.$rn/lock" HEAVY_GUARD_LOG="$RW/$rr.$rn/log" "$g" --what pre-push -- git push origin HEAD >/dev/null 2>&1
+        echo $? > "$RW/$rr.$rn/rc" ) &
+      rp="$rp $!"; rn=$((rn+1))
+    done
+    for rq in $rp; do wait "$rq"; done; rp=""
+  done
+  # vazio/falhou/ilegível (a world with no rc file: the run never finished) → counted as a bad run, never as a 0
+  rbad=0
+  for rr in 1 2 3 4; do rn=1; while [ "$rn" -le 24 ]; do [ "$(cat "$RW/$rr.$rn/rc" 2>/dev/null)" = 0 ] || rbad=$((rbad+1)); rn=$((rn+1)); done; done
+  if [ "$rbad" -eq 0 ]; then ok; else bad "push watch: $rbad of 96 pushes that ended with 0 (24 guards at once) did not come back 0"; fi
   fi
   if want stopfloor; then
   # exactly the stop floor is NOT under it; a dip that stays above it does not interrupt
@@ -825,11 +860,13 @@ pgm p-nolower    "push: --min-free-mb can lower the push floor"                 
 pgm p-nolibchk   "push: a lib without the push floors is not detected"          nopushlib   's#if \[ -n "\${DISK_PUSH_MIN_MB:-}" \] && \[ -n "\${DISK_PUSH_STOP_MB:-}" \]; then#if true; then#'
 pgm p-nowatch    "push: a push runs without the watch and the lock"             stop        's#\[ "\$push_class" = 1 \] && hg_run_watched "\$@"#:#'
 pgm p-stopmin    "push: the watch stops at the start floor, not the stop floor" stopfloor   's#disk_state_of "\$f" "\$DISK_PUSH_STOP_MB"#disk_state_of "$f" "$DISK_PUSH_MIN_MB"#'
-pgm p-nousr1     "push: the watch does not tell the guard it interrupted"       stop        's#^        kill -USR1 "\$main" 2>/dev/null$#        :#'
+pgm p-nostatus   "push: the watch that stopped the push exits 0, the guard never hears it" stop   's#^        exit 78 ;;$#        exit 0 ;;#'
+pgm p-lateignore "push: the watch ignores the guard's TERM only after it stopped the push"  stop   "/^        trap '' TERM\$/d; s#^        hg_stop_group \"\\\$pid\"\$#        hg_stop_group \"\$pid\"; trap '' TERM#"
+pgm p-nowaitw    "push: the guard does not read the watch's status"             stop        's#^  { wait "\$HG_WATCHER"; } 2>/dev/null; wrc=\$?$#  wrc=0#'
 pgm p-leaderonly "push: the TERM goes to the push only, not its group"          stop        's#kill -TERM -- "-\$p" 2>/dev/null || kill -TERM "\$p" 2>/dev/null || return 0#kill -TERM "$p" 2>/dev/null || return 0#'
 pgm p-nokill     "push: a push that ignores TERM is never KILLed"               ignoreterm  's#^    kill -KILL .*$#    :#'
-pgm p-noloop     "push: the guard stops waiting at the first signal"            term0       's#^    \[ "\$HG_INTERRUPTED" = 1 \] && \[ "\$seen" = 0 \] || break$#    break#'
-pgm p-rc0        "push: a push that ended with 0 is turned into a 78"           term0       's#^  if \[ "\$HG_INTERRUPTED" = 1 \] && \[ "\$rc" -ne 0 \]; then$#  if [ "$HG_INTERRUPTED" = 1 ]; then#'
+pgm p-rc0        "push: a push that ended with 0 is turned into a 78"           term0       's#^  if \[ "\$wrc" = 78 \] && \[ "\$rc" -ne 0 \]; then rc=78; fi$#  if [ "$wrc" = 78 ]; then rc=78; fi#'
+pgm p-anywrc     "push: any watch status but 0 turns the push's rc into a 78"   rc          's#^  if \[ "\$wrc" = 78 \] && \[ "\$rc" -ne 0 \]; then rc=78; fi$#  if [ "$wrc" != 0 ] \&\& [ "$rc" -ne 0 ]; then rc=78; fi#'
 pgm p-blindkills "push: a reading the watch cannot take kills the push"         blind       's#^      low)$#      low|*)#'
 pgm p-nolock     "push: no lock is taken"                                       serial      's#then hg_push_lock_acquire; fi#then :; fi#'
 pgm p-norelease  "push: the lock is never let go"                               serial      's#^  rmdir "\$HG_LOCK_DIR" 2>/dev/null$#  :#'
