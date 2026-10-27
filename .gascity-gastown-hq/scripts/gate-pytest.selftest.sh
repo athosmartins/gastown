@@ -16,6 +16,10 @@
 #   fora de -qq sem a linha-resumo (lista SKIPPED parcial incluída) e as grafias de -qq · grep que lê a saída e falha (a contagem de SKIPPED e a linha-resumo).
 #   Controles negativos A-I: cada mutante (sem a confirmação local, sem o desvio 96..99, regra antiga do skip, sem a contenção dos ids, leitura antiga da assinatura, -p no:cacheprovider de volta,
 #   sem o status do tee, sem a exigência do resumo, leitura antiga que ignora o rc do grep) tem de ser pego.
+#   ga-u6ueg0q: o motivo EXATO no log (alvo que não abre, que existe e não é .py, que vem depois de uma flag local: o 1º motivo fica) · o grep que lê o alvo e dá erro · --dir e --repo com valor e nenhum
+#   argumento do pytest (a mensagem é a dos argumentos que faltam) · o grep -c que imprime a contagem e sai com 2 · a linha SKIPPED de formato que não leio, sob -qq.
+#   EQUIVALENTE: `-gt` por `-ge` no laço das opções (com $# = 0 o case vê $1 vazio e sai pelo `*) break`); `-lt` por `-le` na leitura de um grupo de flags curtas (a posição logo depois do fim
+#   lê vazio e não casa com letra nenhuma); `-gt 0` por `-ge 0` em `nids -gt 0 && ids_fora -eq 1` (ids_fora só vira 1 com um id não vazio, e um id não vazio já conta em nids).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 GP="$HERE/gate-pytest.sh"
@@ -281,10 +285,10 @@ done
 echo "tee: $f: No space left on device" >&2
 exit 1
 EOF
-# grep que falha (rc 2, sem imprimir nada) quando os argumentos citam STUB_GREP_FAIL; senão é o grep de verdade
+# grep que falha (rc 2, sem imprimir nada, ou imprimindo STUB_GREP_PRINT antes) quando os argumentos citam STUB_GREP_FAIL; senão é o grep de verdade
 cat > "$T/shadow-grep/grep" <<'EOF'
 #!/usr/bin/env bash
-if [ -n "${STUB_GREP_FAIL:-}" ]; then case "$*" in *"$STUB_GREP_FAIL"*) exit 2 ;; esac; fi
+if [ -n "${STUB_GREP_FAIL:-}" ]; then case "$*" in *"$STUB_GREP_FAIL"*) [ -z "${STUB_GREP_PRINT:-}" ] || echo "$STUB_GREP_PRINT"; exit 2 ;; esac; fi
 exec "$REAL_GREP" "$@"
 EOF
 chmod +x "$T/shadow-tee/tee" "$T/shadow-grep/grep"; REAL_GREP=$(command -v grep); export REAL_GREP
@@ -320,6 +324,10 @@ has_local "grep -c falhou: o test_a roda aqui" "$STUB_LOG" 'arg:tests/test_a.py$
 reset; mbp_out ".s" "SKIPPED [1] tests/test_b.py:9: no data on the MBP"
 rc=$(PATH="$T/shadow-grep:$PATH" STUB_GREP_FAIL=' in [0-9.]+s' STUB_LOCAL_RCS=1 run -- tests/test_a.py tests/test_b.py -qq); expect "grep da linha-resumo falhou: o rc daqui vale (1)" 1 "$rc"
 has_local "grep do resumo falhou: o test_a roda aqui" "$STUB_LOG" 'arg:tests/test_a.py$'; has "grep do resumo falhou: mbp-saida-ilegivel no log" "$LOG" 'mbp-saida-ilegivel'
+# o grep -c lê parte do arquivo, IMPRIME a contagem e sai com 2 (erro de leitura no meio): o número é válido como texto e mesmo assim não vale, o rc diz que a leitura falhou
+reset; mbp_out ".s" "SKIPPED [1] tests/test_b.py:9: no data on the MBP"
+rc=$(PATH="$T/shadow-grep:$PATH" STUB_GREP_FAIL='^SKIPPED' STUB_GREP_PRINT=1 STUB_LOCAL_RCS=1 run -- tests/test_a.py tests/test_b.py -qq); expect "grep -c imprimiu 1 e saiu com 2: o rc daqui vale (1)" 1 "$rc"
+has_local "grep -c com rc 2: o test_a roda aqui" "$STUB_LOG" 'arg:tests/test_a.py$'; has "grep -c com rc 2: mbp-saida-ilegivel no log" "$LOG" 'mbp-saida-ilegivel'
 # verde do MBP aceito: o MBP não tem shared/data nem .env — um teste que lê dado por um caminho que o wrapper não enxerga pode passar VAZIO lá.
 # O wrapper não consegue saber, então DIZ (fail-open visível), só quando um verde do MBP foi aceito.
 reset; mbp_out "1 passed in 0.1s"; rc=$(run -- tests/test_a.py -q); expect "verde do MBP" 0 "$rc"; has "verde do MBP: a nota de verde vazio sai" "$T/out" 'nota: verde do MBP.*VAZIO'
@@ -384,6 +392,14 @@ reset; rc=$(run -- tests/test_a.py --lfnf all -q); expect "--lfnf all (valor sep
 reset; rc=$(run -- tests/test_a.py --last-failed-no-failures none -q); expect "--last-failed-no-failures none (valor separado)" 0 "$rc"; has "--last-failed-no-failures: o motivo é a flag" "$LOG" 'flag-local:--last-failed-no-failures'
 reset; rc=$(run -- "$T/other/test_out.py" -q); expect "caminho absoluto fora do worktree" 0 "$rc"; hasnt "fora: sem MBP" "$STUB_LOG" 'MBP_CALL'; has "fora: motivo" "$LOG" 'alvo-fora-do-worktree'
 reset; rc=$(run -- tests/nao_existe.py -q); expect "alvo inexistente" 0 "$rc"; has "inexistente: motivo" "$LOG" 'alvo-ilegivel'
+# o motivo do log é o do alvo que não pude nem classificar, não o `todos-ficam-aqui(alvo-ilegivel:<arquivo>)` de um alvo que a leitura do arquivo rejeitou depois: com o padrão solto os dois passam
+has "inexistente: o motivo é exatamente alvo-ilegivel" "$LOG" '"detail":"alvo-ilegivel"'
+printf 'x\n' > "$T/wt/tests/dados.txt"
+reset; mbp_out "1 passed in 0.1s"; rc=$(run -- tests/dados.txt -q); expect "alvo que existe e não é .py" 0 "$rc"
+hasnt "não-.py: sem MBP" "$STUB_LOG" 'MBP_CALL'; has "não-.py: o motivo é exatamente alvo-ilegivel" "$LOG" '"detail":"alvo-ilegivel"'
+# o 1º motivo vence: o alvo ilegível que vem DEPOIS de uma flag que só roda aqui não troca o motivo
+reset; rc=$(run -- --lf tests/nao_existe.py -q); expect "flag local + alvo inexistente" 0 "$rc"
+has "flag local + alvo inexistente: o motivo da flag fica" "$LOG" '"detail":"flag-local:--lf"'; hasnt "flag local + alvo inexistente: não vira alvo-ilegivel" "$LOG" '"detail":"alvo-ilegivel"'
 reset; rc=$("$GP" --dir "$T/wt" -- tests/test_a.py -q >"$T/out" 2>"$T/err"; echo $?); expect "repo sem espelho (nem wa nem ps)" 0 "$rc"
 has "sem espelho: motivo" "$LOG" 'repo-sem-espelho'; hasnt "sem espelho: sem MBP" "$STUB_LOG" 'MBP_CALL'
 # 7a0 o repo vem do repo do GIT (git-common-dir), nunca do NOME do diretório do worktree: um worktree do gascity cujo caminho cita "whatsapp_automation" NÃO é o WA
@@ -423,6 +439,9 @@ if [ "$(id -u)" != 0 ]; then
   hasnt "ilegível: sem MBP" "$STUB_LOG" 'MBP_CALL'; has "ilegível: motivo" "$LOG" 'alvo-ilegivel:tests/test_noread.py'
   chmod 644 "$T/wt/tests/test_noread.py"
 fi
+# o arquivo abre, mas o grep que o lê dá erro (rc 2): "não consegui saber" fica AQUI com o motivo do arquivo, nunca vira "não cita shared/data" (que mandaria o alvo ao MBP no escuro)
+reset; mbp_out "1 passed in 0.1s"; rc=$(PATH="$T/shadow-grep:$PATH" STUB_GREP_FAIL='-a -v -E' run -- tests/test_a.py -q); expect "grep que lê o alvo falhou" 0 "$rc"
+hasnt "grep do alvo falhou: sem MBP" "$STUB_LOG" 'MBP_CALL'; has_local "grep do alvo falhou: roda aqui" "$STUB_LOG" 'arg:tests/test_a.py$'; has "grep do alvo falhou: o motivo diz qual arquivo" "$LOG" 'alvo-ilegivel:tests/test_a.py'
 
 # 7b divisão por alvo: o que fica aqui NÃO arrasta os outros para cá
 reset; mbp_out "2 passed in 1.0s"; rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_db.py -x -q); expect "divisão: a no MBP, db aqui" 0 "$rc"
@@ -461,6 +480,9 @@ reset; mbp_out "1 passed in 0.1s"; rc=$(run -- tests/test_a.py::TestX::test_y -q
 
 # 9 uso errado
 reset; rc=$("$GP" --dir "$T/wt" >"$T/out" 2>"$T/err"; echo $?); expect "sem argumentos do pytest" 4 "$rc"
+has "sem argumentos do pytest: a mensagem é a dos argumentos que faltam" "$T/out" 'faltam os argumentos'; hasnt "sem argumentos do pytest: --dir tem valor, a mensagem não é a de opção sem valor" "$T/out" 'precisa de um valor'
+rc=$("$GP" --repo wa >"$T/out" 2>"$T/err"; echo $?); expect "--repo com valor e nenhum argumento do pytest" 4 "$rc"
+has "--repo com valor: a mensagem é a dos argumentos que faltam" "$T/out" 'faltam os argumentos'; hasnt "--repo com valor: a mensagem não é a de opção sem valor" "$T/out" 'precisa de um valor'
 rc=$("$GP" --dir "$T/nao-existe" -- tests/test_a.py >"$T/out" 2>"$T/err"; echo $?); expect "--dir inexistente" 4 "$rc"
 has "--dir inexistente: a mensagem diz QUAL diretório" "$T/out" 'nao-existe'
 # --dir / --repo como ÚLTIMO argumento (sem valor): uso errado (4), não um laço sem fim que prende a chamada do revisor até o teto de 600 s
@@ -560,6 +582,9 @@ sys.exit(0 if eval(sys.argv[2]) else 1)' "$2" "$3" 2>/dev/null; then echo "ok   
   # 15k sob -qq não há linha-resumo: skip_n vem da soma das linhas SKIPPED
   reset; mbp_out ".s" "SKIPPED [1] tests/test_b.py:9: x"; rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_b.py -qq); expect "15k: -qq com um pulado" 0 "$rc"
   jpy "15k: skip_n vem da soma das linhas" "$LOG" 'r["skip_n"]==1 and r["skip"]==["[1] tests/test_b.py:9: x"]'
+  # 15n a linha SKIPPED cujo formato o casamento completo não lê (sem ':' depois do caminho), mas de que a contagem [n] ainda se lê: sob -qq, sem resumo, é essa contagem que vira o total
+  reset; mbp_out ".s" "SKIPPED [2] tests/test_b.py sem-dois-pontos"; rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_b.py -qq); expect "15n: linha SKIPPED de formato que não leio" 0 "$rc"
+  jpy "15n: skip_n é a contagem [n] da linha" "$LOG" 'r["skip_n"]==2'; has "15n: o detail diz skips-fora-dos-alvos:2" "$LOG" 'skips-fora-dos-alvos:2'
   # 15l o resumo diz que pulou e NÃO há linha para listar (--no-summary): o total é dito, a lista não é inventada
   reset; mbp_out "= 1 passed, 2 skipped in 0.1s ="; rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py --no-summary); expect "15l: resumo sem linhas SKIPPED" 0 "$rc"
   jpy "15l: skip_n 2 e nenhuma lista" "$LOG" 'r["skip_n"]==2 and "skip" not in r'
