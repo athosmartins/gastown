@@ -539,6 +539,8 @@ EOF
   rbad=0
   for rr in 1 2 3 4; do rn=1; while [ "$rn" -le 24 ]; do [ "$(cat "$RW/$rr.$rn/rc" 2>/dev/null)" = 0 ] || rbad=$((rbad+1)); rn=$((rn+1)); done; done
   if [ "$rbad" -eq 0 ]; then ok; else bad "push watch: $rbad of 96 pushes that ended with 0 (24 guards at once) did not come back 0"; fi
+  # the cause, not only the symptom (the run above is a race: a quiet machine can pass it): nothing may trap or send USR1 to the guard again
+  if grep -Eq 'trap .* USR1|kill -USR1' "$g"; then bad "push watch: the guard traps or sends USR1 again: a trapped signal cuts its wait short (ga-dousipw)"; else ok; fi
   fi
   if want stopfloor; then
   # exactly the stop floor is NOT under it; a dip that stays above it does not interrupt
@@ -863,6 +865,7 @@ pgm p-stopmin    "push: the watch stops at the start floor, not the stop floor" 
 pgm p-nostatus   "push: the watch that stopped the push exits 0, the guard never hears it" stop   's#^        exit 78 ;;$#        exit 0 ;;#'
 pgm p-lateignore "push: the watch ignores the guard's TERM only after it stopped the push"  stop   "/^        trap '' TERM\$/d; s#^        hg_stop_group \"\\\$pid\"\$#        hg_stop_group \"\$pid\"; trap '' TERM#"
 pgm p-nowaitw    "push: the guard does not read the watch's status"             stop        's#^  { wait "\$HG_WATCHER"; } 2>/dev/null; wrc=\$?$#  wrc=0#'
+pgm p-usr1back   "push: the guard traps USR1 again (a signal that cuts its wait)"   race        "s#^  trap 'hg_on_signal' TERM INT HUP\$#  trap 'hg_on_signal' TERM INT HUP; trap : USR1#"
 pgm p-leaderonly "push: the TERM goes to the push only, not its group"          stop        's#kill -TERM -- "-\$p" 2>/dev/null || kill -TERM "\$p" 2>/dev/null || return 0#kill -TERM "$p" 2>/dev/null || return 0#'
 pgm p-nokill     "push: a push that ignores TERM is never KILLed"               ignoreterm  's#^    kill -KILL .*$#    :#'
 pgm p-rc0        "push: a push that ended with 0 is turned into a 78"           term0       's#^  if \[ "\$wrc" = 78 \] && \[ "\$rc" -ne 0 \]; then rc=78; fi$#  if [ "$wrc" = 78 ]; then rc=78; fi#'
