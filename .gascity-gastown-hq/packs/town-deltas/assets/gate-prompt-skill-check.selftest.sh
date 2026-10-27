@@ -16,6 +16,9 @@
 # detector missing, detector crashing, detector with no summary line, a summary that disagrees with the exit code,
 # a timeout, a tree entry git cannot extract). None of them may read as "ok" and none may read as "fail": a check that
 # cannot measure must never block (fail-open) and never vouch.
+#
+# EQUIVALENT (ga-u6ueg0q): the exit code of cleanup (an EXIT trap, whose status the shell drops) and of run_detector (read through $( ) in an assignment nobody tests; its verdict is the printed
+# "<class> <rc>" pair) cannot be observed, so turning their `return 0` into `return 1` changes nothing.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -147,6 +150,19 @@ STIP="$(commit_all "$S" "prompt edit")"
 run_sut "$S" "$SBASE" "$STIP"
 expect "stub: prompt edit" ok
 N="$(wc -l < "$CNT" | tr -d ' ')"; [ "$N" = "1" ] && ok "the detector ran exactly once for a green prompt edit" || bad "the detector ran $N time(s) (wanted 1)"
+# the detector also derives skill names from the repo-level .claude tree: a diff that adds ONLY a file there is an input, not "nothing the detector reads"
+git_in "$S" checkout -q main; branch_from_main "$S" claude_cmd
+mkdir -p "$S/.claude/commands"; printf '# x\n' > "$S/.claude/commands/x.md"
+STIP="$(commit_all "$S" "a .claude command and nothing else")"
+: > "$CNT"; run_sut "$S" "$SBASE" "$STIP"
+expect "stub: a diff that only adds .claude/commands/x.md is an input" ok
+N="$(wc -l < "$CNT" | tr -d ' ')"; [ "$N" = "1" ] && ok "the detector ran once for a .claude/commands file" || bad "the detector ran $N time(s) for a .claude/commands file (wanted 1)"
+git_in "$S" checkout -q main; branch_from_main "$S" claude_skill
+mkdir -p "$S/.claude/skills/x"; printf '# x\n' > "$S/.claude/skills/x/SKILL.md"
+STIP="$(commit_all "$S" "a .claude skill and nothing else")"
+: > "$CNT"; run_sut "$S" "$SBASE" "$STIP"
+expect "stub: a diff that only adds .claude/skills/x/SKILL.md is an input" ok
+N="$(wc -l < "$CNT" | tr -d ' ')"; [ "$N" = "1" ] && ok "the detector ran once for a .claude/skills file" || bad "the detector ran $N time(s) for a .claude/skills file (wanted 1)"
 
 echo "E. inputs other than prompts also trigger it (the verdict can flip without a prompt in the diff)"
 git_in "$R" checkout -q main; branch_from_main "$R" latent
@@ -327,6 +343,24 @@ if [ -n "$TIP" ]; then
 else
   bad "could not build the long-name commit (plumbing failed): the mkdir case did not run"
 fi
+
+echo "I2. a listing or a directory that cannot be made stops the extraction (never a tree with entries missing)"
+git_in "$R" checkout -q main; branch_from_main "$R" extract_fail
+printf 'plain.\n' >> "$R/$HQ/agents/gate-reviewer/prompt.template.md"; TIP="$(commit_all "$R" "prompt edit for the extraction failures")"
+git_in "$R" checkout -q main
+FAKELS="$WORK/fakels"; mkdir -p "$FAKELS"
+printf '#!/bin/sh\nfor a in "$@"; do [ "$a" = ls-tree ] && { echo "fatal: simulated ls-tree failure" >&2; exit 128; }; done\nexec "%s" "$@"\n' "$(command -v git)" > "$FAKELS/git"; chmod +x "$FAKELS/git"
+run_sut "$R" "$BASE" "$TIP" PATH="$FAKELS:$PATH"
+expect "the listing of the tip tree fails (ls-tree)" nao-consegui-medir extracao-tip
+# a mkdir that refuses the paths MKDIR_FAIL globs; with MKDIR_MADE it makes the directory first and still reports the failure
+FAKEMK="$WORK/fakemk"; mkdir -p "$FAKEMK"; REAL_MKDIR="$(command -v mkdir)"
+printf '#!/bin/sh\nfor a in "$@"; do case "$a" in $MKDIR_FAIL) [ -z "${MKDIR_MADE:-}" ] || "$REAL_MKDIR" "$@"; echo "mkdir: simulated failure: $a" >&2; exit 1 ;; esac; done\nexec "$REAL_MKDIR" "$@"\n' > "$FAKEMK/mkdir"; chmod +x "$FAKEMK/mkdir"
+run_sut "$R" "$BASE" "$TIP" PATH="$FAKEMK:$PATH" REAL_MKDIR="$REAL_MKDIR" MKDIR_FAIL='*/tip'
+expect "the directory of the tip tree cannot be made" nao-consegui-medir extracao-tip
+run_sut "$R" "$BASE" "$TIP" PATH="$FAKEMK:$PATH" REAL_MKDIR="$REAL_MKDIR" MKDIR_FAIL='*/agents/*' MKDIR_MADE=1
+expect "a mkdir that reports failure is a failure even when the directory is there" nao-consegui-medir extracao-tip
+run_sut "$R" "$BASE" "$TIP" PATH="$FAKEMK:$PATH" REAL_MKDIR="$REAL_MKDIR" MKDIR_FAIL='*/nothing-matches-this'
+expect "control: the same mkdir that refuses nothing lets the same diff through" ok
 
 echo "J. contract: one VERDICT line first, red lines only for fail/debito-previo, nothing left behind"
 run_sut "$R" "$BASE" "$BASE"
