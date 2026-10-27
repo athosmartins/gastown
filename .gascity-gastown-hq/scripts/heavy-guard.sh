@@ -2,7 +2,7 @@
 # heavy-guard.sh (ga-vln2py, P0) — keep a HEAVY step from starting on the mini while the disk is near the floor.
 #
 # ## Contents
-#   Why · Usage · Exit codes · What counts as heavy · Go class · Push class · Where it is wired · Lib lookup · Not covered
+#   Why · Usage · Exit codes · What counts as heavy · Go class · Push class · File-cap class · Where it is wired · Lib lookup · Not covered
 #
 # WHY. 17/10 12:40-12:56 three agent steps (a git repack, a selftest copying hq.jsonl, `go build` + golangci-lint of
 # the beads repo) ran with the disk already low and filled it: Dolt took ENOSPC writing its journal and the data
@@ -10,7 +10,7 @@
 # mattered, so this is a command, not a paragraph: it checks `df` and either runs the step or says no.
 #
 # USAGE
-#   heavy-guard.sh [--min-free-mb N] [--wait-secs S] [--what LABEL] -- <command> [args...]
+#   heavy-guard.sh [--min-free-mb N] [--wait-secs S] [--max-file-mb M] [--what LABEL] -- <command> [args...]
 #       free >= N  -> runs the command (exec) and returns its exit code.
 #       free <  N  -> waits up to S seconds (default 0) for the disk to recover, then refuses WITHOUT running it.
 #   heavy-guard.sh --check [--min-free-mb N] [--wait-secs S] [--what LABEL]
@@ -20,6 +20,8 @@
 #   for a Go build/test step (see "GO CLASS") the floor is DISK_GO_MIN_MB (13312 = 13 GB) instead;
 #   for a `git push` (see "PUSH CLASS") it is DISK_PUSH_MIN_MB (5000), and the push runs under a watch and a lock:
 #           "$GC_CITY_PATH/scripts/heavy-guard.sh" --what pre-push --wait-secs 600 -- git push origin HEAD
+#   a selftest or a mutant battery also runs with a cap on the size of each file it writes (see "FILE-CAP CLASS"):
+#           "$GC_CITY_PATH/scripts/heavy-guard.sh" --what selftest-hq --max-file-mb 512 -- bash scripts/X.selftest.sh
 #
 # EXIT CODES (deliberately OUTSIDE mbp-run.sh's 96..99, which mean "run it locally" — a refusal here must never be
 # read as that):
@@ -30,7 +32,8 @@
 #                MacBook (scripts/mbp-run.sh --exec --go ..., see "GO CLASS"; golangci-lint has no remote today), or
 #                wait for the disk and try again; tell the Mayor if it stays low.
 #   76  UNKNOWN  no usable reading of the disk. The step is refused too — fail CLOSED, because the command this
-#                guards fails by ENOSPC on the database — and the line says so.
+#                guards fails by ENOSPC on the database — and the line says so. Also: the file-size cap (below) was asked for
+#                and could not be set, or could not be read back.
 #   64  usage    bad flag / no command and no --check.
 #   78  INTERRUPTED (push class only) the disk fell UNDER DISK_PUSH_STOP_MB while the push ran and the guard stopped it. This is
 #                not "try again": do NOT repeat the push or find another route (no --no-verify), tell the Mayor.
@@ -85,6 +88,31 @@
 # heavy floor and a plain exec, as before. --check in the class is the floor alone: no lock and no watch, since nothing runs under
 # the guard — a script that pushes after --check is not covered by 78/79.
 #
+# FILE-CAP CLASS (ga-e6ug8gq). 27/10 05:09-05:24 an ad-hoc mutant battery on a selftest ran an awk mutant that looped for ever and wrote
+# 4.2 GB and then 5.6 GB into $TMPDIR, one file each time: the disk hit 0 twice and Dolt took a sticky ENOSPC until `gc dolt restart --force`.
+# The disk floor above is read BEFORE a step starts, and nothing watched the step: a loop that only writes is not stopped by it. The cure is a
+# limit the KERNEL enforces, on the size of each file the step writes: `ulimit -f`, set here right before the exec, in the shell that becomes the
+# command, so the command and everything it starts inherit it and cannot raise it (soft and hard are set together).
+#   - a step is in the class when `selftest`, `mutant` or `mutat…` (mutate, mutation) shows up in its --what label or in any word of its
+#     command, capitals ignored (`--what selftest-hq`, `bash x.selftest.sh`, `python3 hq-mutate.py`, `run-mutants.sh`). It is a substring
+#     read, so a false match only caps a step that did not need it; the way out is `--max-file-mb 0`. A command that starts with `git`, a Go
+#     step and a push are never in the class (a repack or a Go build writes big files on purpose; they have their own rules above).
+#   - the default cap is HEAVY_GUARD_SELFTEST_MAX_FILE_MB, 512 (MB per file; 1-9 digits, else 512). 512 MB is far above what a selftest
+#     writes on purpose (tens of MB) and far below what empties the disk. --max-file-mb M sets M for any step, class or not, and beats the
+#     default; --max-file-mb 0 is the explicit way to run a class step uncapped.
+#   - what the cap does to a runaway loop: the write that would pass the limit makes the kernel send SIGXFSZ, which ends the writer (rc 153
+#     in a shell), or fails with EFBIG when the program ignores that signal (Python does, and so does anything started from a Python
+#     launcher). Either way a file written in sequence stops at the limit, to the byte. With SIGXFSZ at its default the loop is gone in seconds (the selftest requires < 5 s); with EFBIG the file is still capped, but a shell loop that ignores write errors keeps spinning until its own timeout (measured 27/10 on Darwin: rc 124 after 5 s, file held at 65536 B). For a mutant that is the right verdict: a mutant
+#     whose selftest dies from the cap is KILLED (caught); it is never an infra failure.
+#   - fail CLOSED: a cap that was asked for and cannot be set (ulimit fails and the reading is not already at or under the cap), or cannot
+#     be read back, or reads looser than asked, refuses the step with rc 76 and runs nothing. A tighter limit inherited from the caller is
+#     kept as it is: it is the stricter one.
+#   - --check runs nothing, so it has nothing to cap: it accepts the option and only judges the disk.
+# NOT covered: on macOS (the mini, where this guard runs) the limit is not applied at all to a write opened with O_APPEND (`>>`): measured 27/10 on Darwin, an `echo >>` loop under `ulimit -f 64` reached 303 KB, while the same loop
+# through `exec 3>` stopped at 65536 B; not measured on Linux. A `>>` loop on the mini has only `timeout` and a `df` check. And the cap is per FILE. A loop that writes many small files, or appends to one file after another, is not stopped by it
+# (the aggregate of a slot is a separate watchdog). A selftest that swallows the dead child's rc can still exit 0 and let a mutant survive:
+# that is the selftest's own weakness, not the cap's.
+#
 # WHERE IT IS WIRED. jsonl-archive-compact.selftest.sh (--check at the top); the doctrine paragraph in
 # packs/town-deltas/template-fragments/town-deltas.template.md and the HQ SELFTESTS text of the gate
 # (gate-review-task.lib.sh) tell agents to use it; docs/runbooks/disk-trabalho-pesado.md has the pre-commit snippet
@@ -112,7 +140,8 @@
 # $GC_CITY_PATH/.gc/logs/heavy-guard.log), best effort: a log that cannot be written never changes the verdict.
 #
 # Seams (selftests): DISK_FREE_OVERRIDE_MB pins the reading; HEAVY_GUARD_POLL_SECS (default 15) is the wait step; the push class
-# reads HEAVY_GUARD_WATCH_SECS, HEAVY_GUARD_KILL_GRACE_SECS and HEAVY_GUARD_PUSH_LOCK_{DIR,WAIT_SECS,POLL_SECS,MAXAGE_SECS}.
+# reads HEAVY_GUARD_WATCH_SECS, HEAVY_GUARD_KILL_GRACE_SECS and HEAVY_GUARD_PUSH_LOCK_{DIR,WAIT_SECS,POLL_SECS,MAXAGE_SECS};
+# the file-cap class reads HEAVY_GUARD_SELFTEST_MAX_FILE_MB.
 
 HG_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HG_LIB_REL="packs/town-deltas/assets/scripts/disk-headroom-lib.sh"
@@ -174,6 +203,8 @@ hg_posint HG_LOCK_WAIT "${HEAVY_GUARD_PUSH_LOCK_WAIT_SECS:-}" 900 1
 hg_posint HG_LOCK_POLL "${HEAVY_GUARD_PUSH_LOCK_POLL_SECS:-}" 2 0
 hg_posint HG_LOCK_MAXAGE "${HEAVY_GUARD_PUSH_LOCK_MAXAGE_SECS:-}" 7200 0
 HG_LOCK_DIR="${HEAVY_GUARD_PUSH_LOCK_DIR:-$HG_CITY/.gc/heavy-guard-push.lock}"
+# file-cap class (ga-e6ug8gq) tunable, see "FILE-CAP CLASS": 0, empty or not a number can never UNCAP a selftest, it is the 512 MB default
+hg_posint HG_FCAP_DEFAULT "${HEAVY_GUARD_SELFTEST_MAX_FILE_MB:-}" 512 0
 
 # hg_go_step <label> [command...] — rc 0 when the step is a Go toolchain build/test/vet/install (see "GO CLASS"), else rc 1.
 # Pure bash on purpose: no outside command (an earlier version split the command with `tr`, and when that fork failed under
@@ -221,6 +252,33 @@ hg_push_step() {
     esac
   done
   return 1
+}
+
+# hg_selftest_step <label> [command...] — rc 0 when the step is a selftest or a mutant battery (see "FILE-CAP CLASS"), else rc 1. Pure
+# bash and substring-based, like the other matchers: no outside command that could fail. A false match only puts a cap on a step that did
+# not need one (and --max-file-mb 0 lifts it); a miss is the direction that matters, so the words are read from the label AND every word of
+# the command. A git command (a repack/gc writes a big pack on purpose) is never in the class.
+# vazio (no label, no command words) → rc 1, not in the class; falhou cannot happen (nothing is read from a file or the disk)
+hg_selftest_step() {
+  local label="${1:-}" cre
+  shift
+  case "${1:-}" in git|*/git) return 1 ;; esac
+  # capitals are ignored by bracket classes (bash 3.2 on the mini has no ${var,,})
+  cre='[Ss][Ee][Ll][Ff][Tt][Ee][Ss][Tt]|[Mm][Uu][Tt]([Aa][Nn][Tt]|[Aa][Tt])'
+  [[ " $label $* " =~ $cre ]] && return 0
+  return 1
+}
+
+# hg_apply_fcap <MB> — ulimit -f for this shell, which becomes the command. Returns 0 when the cap in force is at most <MB> (set now, or an
+# already tighter one), else rc 1. The caller refuses with 76 on rc 1: a cap that was asked for is never silently absent.
+# bash counts ulimit -f in 1024-byte blocks (512 in POSIX mode: then both the set and the read-back are in 512s, and the cap is tighter, never looser)
+hg_apply_fcap() {
+  local kb=$(( $1 * 1024 )) cur
+  # vazio/falhou (ulimit refuses: the hard limit is lower than asked) → no stderr noise, the reading below decides
+  ulimit -f "$kb" 2>/dev/null
+  # vazio/falhou/ilegível (nothing printed, "unlimited", not a number) → `[` cannot compare (rc 2) → rc 1: no proof a cap is in force; a reading above the ask → rc 1
+  cur="$(ulimit -f 2>/dev/null)" || return 1
+  [ "$cur" -le "$kb" ] 2>/dev/null
 }
 
 hg_log() {
@@ -416,12 +474,13 @@ if [ ! -r "$HG_LIB" ] || ! . "$HG_LIB" 2>/dev/null || ! type disk_headroom_state
   exit 76
 fi
 
-min=""; wait_s=0; what="heavy step"; mode=run
+min=""; wait_s=0; what="heavy step"; mode=run; fcap=""; fcap_given=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --min-free-mb) min="${2:-}"; shift 2 || { echo "heavy-guard: --min-free-mb needs a number" >&2; exit 64; } ;;
     --wait-secs)   wait_s="${2:-}"; shift 2 || { echo "heavy-guard: --wait-secs needs a number" >&2; exit 64; } ;;
     --what)        what="${2:-}"; shift 2 || { echo "heavy-guard: --what needs a label" >&2; exit 64; } ;;
+    --max-file-mb) fcap="${2:-}"; fcap_given=1; shift 2 || { echo "heavy-guard: --max-file-mb needs a number" >&2; exit 64; } ;;
     --check)       mode=check; shift ;;
     --)            shift; break ;;
     -h|--help)     sed -n '2,/^HG_HERE=/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -438,6 +497,11 @@ case "$wait_s" in ''|*[!0-9]*) echo "heavy-guard: --wait-secs must be a whole nu
 # base 10 on purpose: "08" and "09" pass the digits check above but are invalid OCTAL to $(( )), which used to leave the
 # deadline empty and the low-disk loop below spinning for ever
 wait_s=$(( 10#$wait_s ))
+if [ "$fcap_given" = 1 ]; then
+  case "$fcap" in ''|*[!0-9]*) echo "heavy-guard: --max-file-mb must be a whole number of MB, 0 for no cap (got '$fcap')" >&2; exit 64 ;; esac
+  [ "${#fcap}" -le 9 ] || { echo "heavy-guard: --max-file-mb takes at most 9 digits (got '$fcap')" >&2; exit 64; }
+  fcap=$(( 10#$fcap ))
+fi
 if [ "$mode" = run ] && [ $# -eq 0 ]; then
   echo "heavy-guard: no command given (usage: heavy-guard.sh [opts] -- <command> [args...], or --check)" >&2
   exit 64
@@ -476,6 +540,15 @@ if [ "$go_class" = 0 ] && hg_push_step "$what" "$@"; then
   fi
 fi
 
+# FILE-CAP CLASS (ga-e6ug8gq): the cap each file of the step may reach, in MB; 0 = none. The caller's number wins; else a selftest/mutant step
+# that is not a Go step gets the class default (a push starts with git, which hg_selftest_step leaves out). vazio (no option, not in the class) → 0, as before this class.
+fcap_mb=0
+if [ "$fcap_given" = 1 ]; then
+  fcap_mb="$fcap"
+elif [ "$go_class" = 0 ] && hg_selftest_step "$what" "$@"; then
+  fcap_mb="$HG_FCAP_DEFAULT"
+fi
+
 # a push that RUNS under the guard goes one at a time: the lock is taken before the disk is judged (the reading is made after the wait)
 if [ "$push_class" = 1 ] && [ "$mode" = run ]; then hg_push_lock_acquire; fi
 
@@ -508,6 +581,13 @@ case "$state" in
       hg_log "BYPASS what='$what' DISK_HEADROOM_ENABLED=${DISK_HEADROOM_ENABLED:-} DISK_FREE_OVERRIDE_MB=${DISK_FREE_OVERRIDE_MB:-}"
     fi
     [ "$mode" = check ] && exit 0
+    # last thing before the step: the cap is set in THIS shell, which the exec turns into the command. fail CLOSED (rc 76): a step that was
+    # to run capped never runs without it
+    if [ "$fcap_mb" -gt 0 ] && ! hg_apply_fcap "$fcap_mb"; then
+      echo "heavy-guard: REFUSED '$what': the cap of ${fcap_mb} MB per file (ulimit -f) could not be set or read back, so the step is not started — without it a runaway write loop has no limit (27/10 ga-e6ug8gq: two loops filled the disk and Dolt took ENOSPC). Retry; if it persists, tell the Mayor. (rc 76)" >&2
+      hg_log "REFUSED what='$what' fsize_cap_mb=$fcap_mb unsettable rc=76"
+      exit 76
+    fi
     [ "$push_class" = 1 ] && hg_run_watched "$@"
     exec "$@"
     ;;

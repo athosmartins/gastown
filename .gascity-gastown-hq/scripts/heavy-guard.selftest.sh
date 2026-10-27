@@ -739,6 +739,85 @@ lookup_cases() { # lookup_cases <guard>
   fi
 }
 
+# ── file-cap cases (ga-e6ug8gq): fcap_cases <guard> <lib> ─────────────────────────────────────────────────
+# 27/10 05:09-05:24: an ad-hoc mutant battery on a selftest ran an awk mutant that looped for ever and wrote 4.2 and 5.6 GB into $TMPDIR; the disk hit 0 twice and Dolt took ENOSPC. The writer below IS that loop, stopped at 8M lines
+# (~260 MB) only so that a guard WITHOUT the cap does not fill the disk of this selftest. `bash -c 'ulimit -f'` everywhere: sh is POSIX mode on macOS (512-byte units) and dash on Linux.
+fcap_cases() {
+  local g="$1" lib="$2" rc out base t0 sz ev FB="$W/fbin"
+  mkdir -p "$FB"
+  run() { DISK_FREE_OVERRIDE_MB=20000 HEAVY_GUARD_LIB="$lib" "$g" "$@"; }
+  base="$(bash -c 'ulimit -f')"
+  cat > "$W/fcap-loop.sh" << 'EOF'
+#!/bin/bash
+awk -v f="$1" 'BEGIN { while (1) { print "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" > f; if (++i > 8000000) exit } }'
+echo "awk_rc=$?" > "$2"
+EOF
+  cp "$W/fcap-loop.sh" "$W/fcap-loop.selftest.sh"
+  printf '#!/bin/bash\nbash -c "ulimit -f" > "%s/git-ulimit"\n' "$W" > "$FB/git"; chmod +x "$FB/git"
+  floop() { # floop <desc> <script> <guard invocation up to and including -->: the loop under the guard must die from the cap, at the cap, fast
+    local desc="$1" script="$2"; shift 2
+    rm -f "$W/big" "$W/ev"; t0=$SECONDS
+    "$@" bash "$W/$script" "$W/big" "$W/ev" 2>/dev/null; rc=$?
+    check "fcap: $desc: the guard returns the command's own rc (the script outlives the writer it lost)" 0 "$rc"
+    sz="$(wc -c < "$W/big" 2>/dev/null | tr -d ' ')"
+    [ "$sz" = 4194304 ] || bad "fcap: $desc: the write loop must stop at exactly the 4 MB cap, 4194304 bytes (got '${sz:-no file}')"
+    [ "$((SECONDS - t0))" -lt 5 ] || bad "fcap: $desc: the write loop must die in under 5 s (took $((SECONDS - t0)))"
+    ev="$(cat "$W/ev" 2>/dev/null)"
+    case "$ev" in awk_rc=[1-9]*) ;; *) bad "fcap: $desc: the writer must be KILLED by the cap (153 = SIGXFSZ, or an EFBIG exit), not end by itself (got '$ev')" ;; esac
+  }
+  floop "--max-file-mb 4 on a plain step" fcap-loop.sh run --max-file-mb 4 --what t --
+  floop "a selftest step takes the class cap (HEAVY_GUARD_SELFTEST_MAX_FILE_MB=4)" fcap-loop.selftest.sh env HEAVY_GUARD_SELFTEST_MAX_FILE_MB=4 DISK_FREE_OVERRIDE_MB=20000 HEAVY_GUARD_LIB="$lib" "$g" --what t --
+  # the cap as the child sees it, in KB (bash's unit): 512 MB for the selftest/mutant class, the caller's number when given, nothing for the rest
+  out="$(run --what selftest-hq -- bash -c 'ulimit -f')";                         [ "$out" = 524288 ] || bad "fcap: a selftest LABEL gets the default 512 MB cap, 524288 KB (got '$out')"
+  out="$(run --what 'Mutant battery' -- bash -c 'ulimit -f')";                    [ "$out" = 524288 ] || bad "fcap: a mutant label (capitals ignored) gets the default cap (got '$out')"
+  out="$(run --what t -- bash -c 'ulimit -f' x foo.selftest.sh)";                [ "$out" = 524288 ] || bad "fcap: a *.selftest.sh word in the command gets the default cap (got '$out')"
+  out="$(run --what t -- bash -c 'ulimit -f' x run-mutants.sh)";                 [ "$out" = 524288 ] || bad "fcap: a *mutant* word in the command gets the default cap (got '$out')"
+  out="$(run --what t -- bash -c 'ulimit -f' x hq-mutate.py)";                   [ "$out" = 524288 ] || bad "fcap: hq-mutate.py gets the default cap (got '$out')"
+  out="$(run --what repack -- bash -c 'ulimit -f')";                              [ "$out" = "$base" ] || bad "fcap: an ordinary heavy step is NOT capped by default, a repack can write a big pack (got '$out', was '$base')"
+  out="$(run --max-file-mb 8 --what repack -- bash -c 'ulimit -f')";             [ "$out" = 8192 ] || bad "fcap: --max-file-mb 8 caps any step at 8192 KB (got '$out')"
+  out="$(run --max-file-mb 3 --what selftest -- bash -c 'ulimit -f')";           [ "$out" = 3072 ] || bad "fcap: the caller's number beats the class default (got '$out')"
+  out="$(run --max-file-mb 0 --what selftest -- bash -c 'ulimit -f')";           [ "$out" = "$base" ] || bad "fcap: --max-file-mb 0 is the explicit way to run a selftest uncapped (got '$out')"
+  out="$(HEAVY_GUARD_SELFTEST_MAX_FILE_MB=7 run --what selftest -- bash -c 'ulimit -f')"; [ "$out" = 7168 ] || bad "fcap: HEAVY_GUARD_SELFTEST_MAX_FILE_MB sets the class cap (got '$out')"
+  out="$(HEAVY_GUARD_SELFTEST_MAX_FILE_MB=0 run --what selftest -- bash -c 'ulimit -f')"; [ "$out" = 524288 ] || bad "fcap: a class cap of 0 in the env falls back to 512 MB, it does not uncap (got '$out')"
+  out="$(HEAVY_GUARD_SELFTEST_MAX_FILE_MB=abc run --what selftest -- bash -c 'ulimit -f')"; [ "$out" = 524288 ] || bad "fcap: a class cap that is not a number falls back to 512 MB (got '$out')"
+  # a Go step and a push keep their own rules (a Go build and a git pack write big files): a word `selftest` in their command does not cap them
+  out="$(run --what go-test -- bash -c 'ulimit -f' x selftest)";                  [ "$out" = "$base" ] || bad "fcap: a Go step is not capped by the selftest class (got '$out')"
+  rm -f "$W/git-ulimit"
+  PATH="$FB:$PATH" HEAVY_GUARD_PUSH_LOCK_DIR="$W/fplock" run --what t -- git push origin fix/x-selftest >/dev/null 2>&1; rc=$?
+  check "fcap: the push runs" 0 "$rc"
+  [ "$(cat "$W/git-ulimit" 2>/dev/null)" = "$base" ] || bad "fcap: a push is not capped by the selftest class (got '$(cat "$W/git-ulimit" 2>/dev/null)')"
+  rm -f "$W/git-ulimit"
+  PATH="$FB:$PATH" run --what t -- git repack -a selftest-pack >/dev/null 2>&1; rc=$?
+  check "fcap: the repack runs" 0 "$rc"
+  [ "$(cat "$W/git-ulimit" 2>/dev/null)" = "$base" ] || bad "fcap: a git command is never in the selftest class, a repack writes a big pack on purpose (got '$(cat "$W/git-ulimit" 2>/dev/null)')"
+  # --check runs nothing, so there is nothing to cap, and a cap given with it is not an error
+  run --check --max-file-mb 4 --what selftest 2>/dev/null; rc=$?;               check "fcap: --check accepts --max-file-mb" 0 "$rc"
+  # usage: whole number of MB, at most 9 digits, a value is needed
+  run --max-file-mb abc --what t -- true 2>/dev/null; rc=$?;                    check "fcap: --max-file-mb abc is a usage error" 64 "$rc"
+  run --max-file-mb -1 --what t -- true 2>/dev/null; rc=$?;                     check "fcap: --max-file-mb -1 is a usage error" 64 "$rc"
+  run --max-file-mb 1234567890 --what t -- true 2>/dev/null; rc=$?;            check "fcap: --max-file-mb of 10 digits is a usage error" 64 "$rc"
+  run --what t --max-file-mb 2>/dev/null; rc=$?;                                check "fcap: --max-file-mb without a value is a usage error" 64 "$rc"
+  # fail CLOSED: a cap that cannot be set (and is not already tighter) means the step does not run. The ulimit builtin is replaced through BASH_ENV (read by the guard's own bash)
+  fk() { # fk <name> <ulimit function body> — the guard with that fake ulimit, the step is `touch ran`
+    printf 'ulimit() { %s; }\n' "$2" > "$W/ulimit-$1.env"; rm -f "$W/fran"
+    BASH_ENV="$W/ulimit-$1.env" run --max-file-mb 512 --what t -- touch "$W/fran" 2>"$W/ferr"; rc=$?
+  }
+  : > "$HEAVY_GUARD_LOG"   # the log is shared by every run of this selftest: the refusal below has to be a line written by THIS run
+  fk none 'return 1'
+  check "fcap: a ulimit that fails and reads nothing refuses with 76" 76 "$rc"; [ ! -e "$W/fran" ] || bad "fcap: the step RAN with no cap set (ulimit failing, nothing readable)"
+  grep -q 'REFUSED' "$W/ferr" && grep -q 'rc 76' "$W/ferr" || bad "fcap: the refusal must say REFUSED and rc 76 ($(cat "$W/ferr"))"
+  grep -q "REFUSED what='t' fsize_cap" "$HEAVY_GUARD_LOG" || bad "fcap: the refusal must be in the log ($(tail -n 2 "$HEAVY_GUARD_LOG"))"
+  # the reading itself succeeds in the next three: only its VALUE can make the guard refuse
+  fk unl '[ $# -eq 1 ] && { echo unlimited; return 0; }; return 1'
+  check "fcap: a ulimit that cannot set and reads unlimited refuses with 76" 76 "$rc"; [ ! -e "$W/fran" ] || bad "fcap: the step RAN with the cap unlimited"
+  fk empty '[ $# -eq 1 ] && return 0; return 1'
+  check "fcap: a ulimit that cannot set and reads nothing (rc 0) refuses with 76" 76 "$rc"; [ ! -e "$W/fran" ] || bad "fcap: the step RAN with an empty reading of the cap"
+  fk big '[ $# -eq 1 ] && echo 999999999; return 0'
+  check "fcap: a ulimit that says it set the cap but reads a looser one refuses with 76" 76 "$rc"; [ ! -e "$W/fran" ] || bad "fcap: the step RAN with a cap looser than asked"
+  fk tight '[ $# -eq 1 ] && echo 1000; [ $# -eq 2 ] && return 1; return 0'
+  check "fcap: a cap that cannot be raised but is already TIGHTER than asked is fine (the step runs)" 0 "$rc"; [ -e "$W/fran" ] || bad "fcap: the step did not run under a tighter inherited cap"
+}
+
 mk_mutant() { # mk_mutant <src> <dst> <sed-expr>  — fails the selftest if the expression changed nothing
   # sed > file leaves mode 644, and the guard mutants are EXECUTED: without +x every one of them died with rc 126 (permission
   # denied) whatever it changed, so no mutant proved anything
@@ -750,6 +829,7 @@ before=$FAIL; guard_cases "$REAL_GUARD" "$REAL_LIB";      [ "$FAIL" -eq "$before
 before=$FAIL; go_cases "$REAL_GUARD" "$REAL_LIB";         [ "$FAIL" -eq "$before" ] || echo "(go cases failed on the real files)"
 before=$FAIL; push_cases "$REAL_GUARD" "$REAL_LIB";       [ "$FAIL" -eq "$before" ] || echo "(push cases failed on the real files)"
 before=$FAIL; lookup_cases "$REAL_GUARD";                 [ "$FAIL" -eq "$before" ] || echo "(lookup cases failed on the real guard)"
+before=$FAIL; fcap_cases "$REAL_GUARD" "$REAL_LIB";       [ "$FAIL" -eq "$before" ] || echo "(file-cap cases failed on the real files)"
 
 # mutants: each must make at least one case fail
 survive() { # survive <name> -- the FAIL counter must have grown since $before
@@ -859,6 +939,34 @@ lkm l-nofile  "lookup: a directory is taken for the lib"              's#\[ -f "
 lkm l-nomsg   "lookup: the refusal does not list the places looked"   's#\${HG_LOOKED:+ (search order: \$HG_LOOKED)}##'
 lkm l-nolog   "lookup: the refusal log does not list the places"      's#\${HG_LOOKED:+ search_order=\$HG_LOOKED}##'
 [ "$LK_CAN_HIDE" = 1 ] && lkm l-noread "lookup: an unreadable lib is taken for the lib" 's# && \[ -r "\$hg_c" \]##'
+
+fcm() { # fcm <file> <name> <sed-expr>  (a mutant of the GUARD, run through the file-cap cases)
+  mk_mutant "$REAL_GUARD" "$M/$1.sh" "$3" && { before=$FAIL; fcap_cases "$M/$1.sh" "$REAL_LIB" >/dev/null 2>&1; survive "$2"; }
+}
+# file cap (ga-e6ug8gq): every line of the class has a mutant that the cases above must notice
+fcm f-nocap    "fcap: the cap is never applied"                                 's#^    if \[ "\$fcap_mb" -gt 0 \] && ! hg_apply_fcap "\$fcap_mb"; then$#    if false; then#'
+fcm f-unit     "fcap: the MB are not turned into 1024-byte blocks"              's#local kb=\$(( \$1 \* 1024 )) cur#local kb=$(( $1 )) cur#'
+fcm f-defsize  "fcap: the default class cap is not 512 MB"                      's#"\${HEAVY_GUARD_SELFTEST_MAX_FILE_MB:-}" 512 0#"${HEAVY_GUARD_SELFTEST_MAX_FILE_MB:-}" 1024 0#'
+fcm f-defenv   "fcap: the class cap seam in the env is ignored"                 's#"\${HEAVY_GUARD_SELFTEST_MAX_FILE_MB:-}" 512 0#"" 512 0#'
+fcm f-defzero  "fcap: a class cap of 0 in the env uncaps the selftests"         's#"\${HEAVY_GUARD_SELFTEST_MAX_FILE_MB:-}" 512 0#"${HEAVY_GUARD_SELFTEST_MAX_FILE_MB:-}" 512 1#'
+fcm f-nomatch  "fcap: no step is recognised as a selftest or a mutant battery"  's#^  \[\[ " \$label \$\* " =~ \$cre \]\] && return 0$#  :#'
+fcm f-nolabel  "fcap: the label is not read for the class"                      's#\[\[ " \$label \$\* " =~ \$cre \]\]#[[ " $* " =~ $cre ]]#'
+fcm f-nocmd    "fcap: the command words are not read for the class"             's#\[\[ " \$label \$\* " =~ \$cre \]\]#[[ " $label " =~ $cre ]]#'
+fcm f-case     "fcap: the class words are matched case-sensitively"             's#\[Mm\]\[Uu\]\[Tt\]#mut#'
+fcm f-nomutat  "fcap: mutate / mutation do not count as mutant batteries"        's#(\[Aa\]\[Nn\]\[Tt\]|\[Aa\]\[Tt\])#([Aa][Nn][Tt])#'
+fcm f-nogit    "fcap: a git command (repack, push) is in the class"             's#^  case "\${1:-}" in git|\*/git) return 1 ;; esac$#  :#'
+fcm f-gocap    "fcap: a Go step is capped by the class"                         's#^elif \[ "\$go_class" = 0 \] && hg_selftest_step#elif hg_selftest_step#'
+fcm f-giveup   "fcap: the caller's number does not beat the class default"      '/^fcap_mb=0$/{n;s#^if \[ "\$fcap_given" = 1 \]; then$#if false; then#;}'
+fcm f-zero     "fcap: --max-file-mb 0 sets a cap of zero instead of none"        's#\[ "\$fcap_mb" -gt 0 \]#[ "$fcap_mb" -ge 0 ]#'
+fcm f-set      "fcap: a cap that cannot be raised is refused even when tighter" 's#^  ulimit -f "\$kb" 2>/dev/null$#  ulimit -f "$kb" 2>/dev/null || return 1#'
+fcm f-noread   "fcap: the cap is not read back"                                 's#^  cur="\$(ulimit -f 2>/dev/null)" || return 1$#  return 0#'
+fcm f-loose    "fcap: a looser cap than asked is taken for the one asked"        's#^  \[ "\$cur" -le "\$kb" \] 2>/dev/null$#  true#'
+fcm f-unlim    "fcap: a reading that cannot be compared is taken as capped"      's#^  \[ "\$cur" -le "\$kb" \] 2>/dev/null$#  [ "$cur" -gt "$kb" ] 2>/dev/null \&\& return 1; return 0#'
+fcm f-open     "fcap: the refusal lets the step run (fail open)"                 '/fsize_cap_mb=\$fcap_mb unsettable/{n;s/exit 76/:/;}'
+fcm f-nolog    "fcap: the refusal leaves no log line"                            '/hg_log "REFUSED what=.\$what. fsize_cap_mb/d'
+fcm f-nomsg    "fcap: the refusal does not say it is rc 76"                      '/could not be set or read back/s#(rc 76)" >&2$#" >\&2#'
+fcm f-nodigit  "fcap: --max-file-mb accepts anything"                           's#^  case "\$fcap" in .*exit 64 ;; esac$#  :#'
+fcm f-nolen    "fcap: --max-file-mb has no magnitude cap"                        '/^  \[ "\${#fcap}" -le 9 \]/d'
 
 echo "heavy-guard selftest: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

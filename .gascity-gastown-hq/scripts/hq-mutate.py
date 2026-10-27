@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """hq-mutate.py — varredura de MUTANTES do código que os *.selftest.sh do hq cobrem (ga-2hd02v.5.6.2): o resultado que alguém lê é a lista de testes que NÃO pegam um bug.
 ## Contents
-  Por quê · Uso · Alvos · Operadores · Veredito · Estado · Códigos de saída
+  Por quê · Uso · Alvos · Operadores · Veredito · Teto de escrita · Estado · Códigos de saída
 POR QUÊ: um selftest verde com o código quebrado não prova nada. Trocar UM trecho do script (`-gt` por `-ge`, `&&` por `||`, `exit 1` por `exit 0`) e rodar a família de selftests dele diz se algum reprova; se nenhum
   reprova, o mutante SOBREVIVEU e o teste é fraco naquela linha. É CPU que o lastro do nó Hetzner gasta com nice 19 sem custo, e cada achado vira um bead (ga-2hd02v.5.6).
 USO: hq-mutate.py gen ARQUIVO [--tree HQ]                  imprime os candidatos (id, linha, operador, antes, depois), TAB; com --tree o id é o que o `sweep` grava (caminho relativo à árvore)
      hq-mutate.py plan  --tree HQ --state ARQ              imprime os alvos na ordem em que a varredura os pegaria (e por que pula os que pula)
-     hq-mutate.py sweep --tree HQ --state ARQ --work DIR --jail hq-sandbox-run.py [--budget-s N] [--slots N] [--cap N] [--targets N]
+     hq-mutate.py sweep --tree HQ --state ARQ --work DIR --jail hq-sandbox-run.py [--budget-s N] [--slots N] [--cap N] [--targets N] [--fsize-mb N]
   A última linha do stdout do `sweep` é UM json: result (completo | parcial | sem-novidade | sem-cobertura | interrompido | sem-jaula | sem-alvos | estado-ilegivel | gravacao-falhou), contagens, skipped{motivo: n},
   survivors[] (até 15; `survivors_cortados` conta o resto). `sem-novidade` = tudo o que havia já estava coberto e igual; `sem-cobertura` = nada foi examinado. `nao_sei` = alvos em que o `bash -n` não decidiu; `falhas` = execuções
   que falharam por infra (disco cheio, slot que não limpa): nenhum veredito, o resultado nunca é `completo`; `restam` = candidatos conhecidos ainda sem veredito (nao_sei e falhas: a próxima varredura tenta de novo).
@@ -18,8 +18,13 @@ OPERADORES: no shell só entre tokens soltos (um scanner com pilha passa por asp
   pelos tokens (`tokenize`). Scanner que TERMINA com aspa, `$(` ou heredoc aberto se perdeu (o `bash -n` aceita o arquivo): alvo pulado como `scan-perdido`, nunca coberto. Mutante que não compila é `invalid` e não gasta a cota; id estável = sha1(arquivo:linha:operador:antes>depois:ocorrência).
 VEREDITO: morto = algum selftest da família saiu != 0 (prazo e 97 incluídos) · sobrevivente = todos 0, e roda DE NOVO numa cópia limpa: se a 2ª reprova é `flaky` (não se reporta), senão `confirmed`. Execução cortada pelo TERM não é veredito. Cada mutante roda numa CÓPIA
   da árvore dentro da jaula (--rw só o slot, HOME e TMPDIR descartáveis, `env -i` e só PATH, LANG, LC_*, USER), PROVADA antes de qualquer mutante (`--prove`): sem prova, rc 97 e nada roda.
+TETO DE ESCRITA (ga-e6ug8gq): código alterado pode virar laço de escrita (27/10: um awk em laço gravou 4,2 e 5,6 GB em $TMPDIR, duas vezes, o disco do mini zerou e o Dolt ficou com ENOSPC). Todo filho (a baseline e cada
+  mutante) roda com RLIMIT_FSIZE de --fsize-mb MB (512) POR ARQUIVO, posto DENTRO da jaula, no último elo antes do bash (a jaula e o timeout, que são python/coreutils, não o mudam nem o desfazem) e herdado por tudo o que o selftest roda. O lançador devolve o SIGXFSZ ao padrão
+  (o python o ignora e o filho herdaria o ignorar: o write falharia com EFBIG e um laço de shell giraria até o prazo do mutante; por isso `bash -c 'ulimit -f …'` não basta) e RECUSA (rc 70, nunca roda sem teto) se não consegue fixar e reler o limite: a baseline fica vermelha e o alvo é pulado. Arquivo que estoura o teto mata o laço
+  (rc 153) e o mutante é MORTO como qualquer rc != 0, nunca falha de infra; stdout e stderr dos filhos vão para /dev/null (nada a cortar). --fsize-mb < 1 é uso (rc 2): não existe varredura sem teto. NÃO coberto: o teto é por
+  ARQUIVO, um laço que grava MUITOS arquivos abaixo dele passa (a soma do slot é o follow-up); e um selftest que engole o rc do filho morto pelo teto e sai 0 deixa o mutante sobreviver (o disco, ao menos, está salvo).
 ESTADO (--state, json, trocado por arquivo temporário): por alvo o hash do conteúdo (e da revisão do scanner), o veredito de cada id e os sobreviventes. Hash igual e tudo coberto = `sem-novidade` (varrer o mesmo seria queima disfarçada). Ordem: arquivo mudado nos últimos 7 dias (git log),
-  depois selftests SEM mutante embutido, depois o menos recente; --cap limita os mutantes por alvo por varredura; --fsize-mb (512) é o teto de CADA arquivo que o mutante escreve (mutante em laço de escrita é esperado: um awk assim encheu o disco do mini em 27/10; muitos arquivos pequenos o teto não cobre). O motor NÃO trava o --state: UM sweep por vez é de quem chama. Estado que lê mas tem forma errada = estado-ilegivel (rc 3, nunca se zera).
+  depois selftests SEM mutante embutido, depois o menos recente; --cap limita os mutantes por alvo por varredura. O motor NÃO trava o --state: UM sweep por vez é de quem chama. Estado que lê mas tem forma errada = estado-ilegivel (rc 3, nunca se zera).
 CÓDIGOS: 0 · 2 uso · 3 estado ilegível, árvore ilegível, sem alvos ou gravação que falhou · 97 jaula não provada · 143 interrompido (o estado já gravado vale).
 """
 import argparse
@@ -49,6 +54,23 @@ SKIP_S = 2 * 86400
 DENY = r"\b(?:sudo|doas|systemctl|launchctl|pkill|killall|osascript|docker|podman|tmux|ssh-add|busctl|dbus-send|socat|gt-netns-run|gt-iso-run)\b|git push|\bkill\b[^\n]*\s-1\b|--unix-socket|\bnc\s+-U"
 PASS_ENV = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME")
 MAX_LINE = 6000
+FSIZE_MB = 512   # teto de escrita por arquivo de cada filho, ver TETO DE ESCRITA
+# lançador do teto: fixa e RELÊ o RLIMIT_FSIZE, devolve o SIGXFSZ ao padrão (o python o ignora e o exec herda o ignorar) e só então roda o resto; vazio/não-inteiro → ValueError, falhou/ilegível (setrlimit recusa, getrlimit relê outra coisa) → rc 70 e nada roda (nunca sem teto). -I -c CAPPER BYTES CMD…
+CAPPER = (
+    "import os, resource, signal, sys\n"
+    "try:\n"
+    "    n = int(sys.argv[1])\n"
+    "    hard = resource.getrlimit(resource.RLIMIT_FSIZE)[1]\n"
+    "    n = n if hard == resource.RLIM_INFINITY else min(n, hard)\n"
+    "    resource.setrlimit(resource.RLIMIT_FSIZE, (n, n))\n"
+    "    if resource.getrlimit(resource.RLIMIT_FSIZE) != (n, n):\n"
+    "        raise OSError('o limite fixado nao foi o relido')\n"
+    "    signal.signal(signal.SIGXFSZ, signal.SIG_DFL)\n"
+    "except (OSError, ValueError, OverflowError) as e:\n"
+    "    sys.stderr.write('hq-mutate: teto de escrita nao aplicado: %s\\n' % e)\n"
+    "    os._exit(70)\n"
+    "os.execvp(sys.argv[2], sys.argv[2:])\n"
+)
 SHIMS = ("remote-shim", "remote-shim.py")
 
 
@@ -322,7 +344,7 @@ def exec_family(ctx, slot_n, tgt, text, tmo):
     kv = ["%s=%s" % (k, os.environ[k]) for k in PASS_ENV if k in os.environ] + ["HOME=%s" % (slot / "home"), "TMPDIR=%s" % (slot / "tmp"), "PYTHONDONTWRITEBYTECODE=1", "GIT_AUTHOR_NAME=gt", "GIT_AUTHOR_EMAIL=gt@no", "GIT_COMMITTER_NAME=gt", "GIT_COMMITTER_EMAIL=gt@no"]
     t0, rc = time.time(), 0
     for st in tgt["family"]:
-        cmd = [sys.executable, "-I", ctx.a.jail, "--rw", str(slot), "--", "env", "-i", *kv, "timeout", "-k", "5", str(tmo), "bash", "-c", 'ulimit -f "$0" && exec bash "$1"', str(ctx.a.fsize_mb * 1024), st]   # teto por arquivo (soft e hard: o mutante não o sobe); ulimit que falha = o mutante não roda (baseline vermelha, visível), nunca sem teto
+        cmd = [sys.executable, "-I", ctx.a.jail, "--rw", str(slot), "--", "env", "-i", *kv, "timeout", "-k", "5", str(tmo), sys.executable, "-I", "-c", CAPPER, str(ctx.a.fsize_mb << 20), "bash", st]
         p = subprocess.Popen(cmd, cwd=cd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         with ctx.lock:
             ctx.pids.add(p.pid)
@@ -535,9 +557,11 @@ def main(argv=None):
     s = sp.choices["sweep"]
     s.add_argument("--work", required=True)
     s.add_argument("--jail", required=True)
-    for k, d in (("budget-s", 3600), ("slots", 4), ("cap", 40), ("targets", 8), ("fsize-mb", 512)):
+    for k, d in (("budget-s", 3600), ("slots", 4), ("cap", 40), ("targets", 8), ("fsize-mb", FSIZE_MB)):
         s.add_argument("--" + k, type=int, default=d)
     a = ap.parse_args(argv)
+    if a.cmd == "sweep" and a.fsize_mb < 1:   # sem teto não há varredura
+        ap.error("--fsize-mb tem de ser um inteiro >= 1 (MB por arquivo)")
     if a.cmd == "gen":
         try:
             rel = Path(a.file).resolve().relative_to(Path(a.tree).resolve()).as_posix() if a.tree else Path(a.file).name   # com --tree o id é o que o sweep grava
