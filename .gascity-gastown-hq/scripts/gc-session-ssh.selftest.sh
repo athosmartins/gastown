@@ -894,11 +894,11 @@ g_wt() {
   # --- identidade do atalho: o identity_pattern do runbook casa com o que o engine gera para o dog-remote, e só com isso ---
   local doc="$HERE/../docs/runbooks/gc-session-ssh.md" rx; rx=$(sed -n 's/^IDENTITY_PATTERN=//p' "$doc" 2>/dev/null)
   [ "$(printf '%s\n' "$rx" | grep -c .)" = 1 ]; ok $? "wt: o runbook traz UM identity_pattern canônico (linha IDENTITY_PATTERN=…)"
-  python3 -I - "$rx" <<'PY'; ok $? "wt: o identity_pattern casa com alias/template/sessão que o engine gera (dog-remote-1, dog-remote, dog-remote-gapxi4ls, dog-remote-adhoc-…) e recusa os locais, os de outro papel e as misturas"
+  python3 -I - "$rx" <<'PY'; ok $? "wt: o identity_pattern casa com alias/template/sessão que o engine gera (dog-remote-1, dog-remote, dog-remote-gapxi4ls, dog-remote-adhoc-…, e o kimi-worker-remote da ga-do1ixn.5) e recusa os locais, os de outro papel e as misturas"
 import re, sys
 rx = re.compile(sys.argv[1])  # vazio ou inválido → o programa cai (rc ≠ 0) e o teste reprova
-yes = ["remote-e2e-1", "dog-remote", "dog-remote-1", "dog-remote-gapxi4ls", "dog-remote-adhoc-0fc28155dd", "gate-reviewer-remote-2", "gate-reviewer-remote-adhoc-48ac5cece9", "wa-worker-remote-adhoc-1254849098", "wa-worker-remote-gawisp79e1", "ps-worker-remote", "ps-worker-remote-1", "ps-worker-remote-gaabc1234", "ps-worker-remote-adhoc-1254849098"]
-no = ["gastown.dog-4", "dog-gapxi4ls", "gastown.mayor", "dog", "mayor-remote-1", "dog-remote-", "dog-remote-a", "dog-remote-adhoc-", "dog-remote-adhoc-12345678901", "dog-remote-gapxi4ls-x", "dog-remote/../x", "x-dog-remote-1", "remote-e2e-2", "ps-worker-1", "ps-worker", "ps-remote-1", "ps-worker-remote-", "ps-worker-remote-adhoc-"]
+yes = ["remote-e2e-1", "kimi-worker-remote", "kimi-worker-remote-1", "kimi-worker-remote-gawispabc12", "kimi-worker-remote-adhoc-0fc28155dd", "dog-remote", "dog-remote-1", "dog-remote-gapxi4ls", "dog-remote-adhoc-0fc28155dd", "gate-reviewer-remote-2", "gate-reviewer-remote-adhoc-48ac5cece9", "wa-worker-remote-adhoc-1254849098", "wa-worker-remote-gawisp79e1", "ps-worker-remote", "ps-worker-remote-1", "ps-worker-remote-gaabc1234", "ps-worker-remote-adhoc-1254849098"]
+no = ["kimi-worker-1", "kimi-remote-1", "kimi-worker-remote-", "kimi-worker-remote-adhoc-", "gastown.dog-4", "dog-gapxi4ls", "gastown.mayor", "dog", "mayor-remote-1", "dog-remote-", "dog-remote-a", "dog-remote-adhoc-", "dog-remote-adhoc-12345678901", "dog-remote-gapxi4ls-x", "dog-remote/../x", "x-dog-remote-1", "remote-e2e-2", "ps-worker-1", "ps-worker", "ps-remote-1", "ps-worker-remote-", "ps-worker-remote-adhoc-"]
 bad = [x for x in yes if not rx.fullmatch(x)] + [x for x in no if rx.fullmatch(x)]
 print("fora do esperado:", bad, file=sys.stderr) if bad else None
 sys.exit(1 if bad else 0)

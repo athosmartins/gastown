@@ -84,7 +84,7 @@ SHA_RE = re.compile(r"[0-9a-f]{40}")  # o sha que o dog diz: inteiro, para a con
 USAGE = "gate-done <bead> <ref> <sha>   (ou `gate-done` sem argumento: a ÚNICA bead in_progress do alias, de worker/<sessão>)"
 FIX_LABEL = "gate:needs-fix"  # o que o dispatcher põe na bead-fonte quando o gate reprova: a "volta do gate"
 ROUTES = ("gastown.dog", "dog-remote")  # (rig gascity; os outros: RIGS) gc.routed_to de uma volta do gate: gastown.dog é o que o dispatcher RESTAURA ao reprovar (gate_fail_restore_route → default_pool_route_for_rig; medido em ga-9636op, ga-2hd02v.1.12 e .1.18); dog-remote é a rota posta à mão. Quem prova que a bead é DESTE alias é a última entrega, não a rota
-BARE_ROLE_RE = re.compile(r"(?:dog|gate-reviewer|wa-worker|ps-worker)-remote(?:-adhoc)?")  # nome de sessão SEM cauda: pelo IDENTITY_PATTERN (gc-session-ssh.md) `<papel>-remote-<1-3 dígitos | 3-12 alnum>` TAMBÉM é nome válido de sessão, e `<papel>-remote-adhoc-<10 alnum>` idem (ga-2hd02v.3.13)
+BARE_ROLE_RE = re.compile(r"(?:dog|gate-reviewer|wa-worker|ps-worker|kimi-worker)-remote(?:-adhoc)?")  # nome de sessão SEM cauda: pelo IDENTITY_PATTERN (gc-session-ssh.md) `<papel>-remote-<1-3 dígitos | 3-12 alnum>` TAMBÉM é nome válido de sessão, e `<papel>-remote-adhoc-<10 alnum>` idem (ga-2hd02v.3.13)
 SUFFIX_RE = r"-[A-Za-z0-9][A-Za-z0-9._-]{0,40}"  # a cauda de worker/<sessão>-<cauda>: o `-v2`, o `-<bead>`, o `-a2lb9b` que os dogs usam quando worker/<sessão> está preso em outra entrega (ga-2hd02v.3.13)
 MIRROR_MAIN = "refs/remotes/origin/main"  # no espelho de produção o main mora SÓ aqui (o hetzner-mirror.sh o sincroniza); não há refs/heads/main
 MAX_CANDS = 40  # worker/<sessão>-… acima disso não se confere um a um: recusa e manda usar a forma com argumentos
@@ -98,12 +98,13 @@ class Rig(NamedTuple):
     role: str      # o papel das sessões remotas que submetem DESTE rig (a parte do nome da sessão antes do sufixo)
     routes: tuple  # gc.routed_to de uma volta do gate neste rig: o pool do mini (o que o dispatcher RESTAURA ao reprovar) e o do nó
     prepush: bool = True  # False = o pre-push do rig NÃO roda no mini (ga-2hd02v.3.10): ele executa scripts da ÁRVORE empurrada, e o worktree é sem checkout de propósito (código do nó não roda no mini antes da revisão)
+    also: tuple = ()  # outros papéis remotos que submetem DESTE rig (ga-do1ixn.5: kimi-worker-remote no gascity); mesma loja, repositório e espelho do `role`
     guards: bool = False  # True = G12/G6/G7/G7b do pre-push rodam no lugar do hook, pelos OBJETOS do sha e com o código de origin/main (wa-remote-guards.py, ga-2hd02v.3.11); só faz sentido com prepush=False
 
 
 # ga-2hd02v.4: a tabela do que o atalho atende. Rig fora dela = recusa (nunca "tenta e vê").
 RIGS = {
-    "ga": Rig("ga", "gascity", "dog-remote", ROUTES),
+    "ga": Rig("ga", "gascity", "dog-remote", ROUTES, also=("kimi-worker-remote",)),  # kimi-worker-remote: o worker do teste Kimi (ga-do1ixn), 2º papel do HQ
     "ps": Rig("ps", "property_scrapers", "ps-worker-remote", ("ps-worker", "ps-worker-remote")),
     "wa": Rig("wa", "whatsapp_automation", "wa-worker-remote", ("wa-worker", "wa-worker-remote"), prepush=False, guards=True),  # medido 22/10: ~12 dos ~15 guards do pre-push do WA rodam arquivos de $REPO_ROOT (a árvore empurrada); HQ e PS seguem com o hook (PS: só um shim do bd)
 }
@@ -112,7 +113,7 @@ GUARDS_TIMEOUT = 180  # medido 23/10 com o mini a load 55: 17 s (WA main, 304 pl
 GUARDS_PASS_RE = re.compile(r"^wa-remote-guards: RESULT=PASS sha=([0-9a-f]{40}) trusted=([0-9a-f]{40})\s*$", re.M)  # o "certificado": sem esta linha um rc 0 não vale
 GUARDS_BLOCK_RE = re.compile(r"^wa-remote-guards: RESULT=BLOCKED sha=([0-9a-f]{40}) trusted=([0-9a-f]{40})\s*$", re.M)  # idem para o rc 1: um Python que estoura também sai 1, e isso NÃO é "reprovou"
 GUARDS_WARN_RE = re.compile(r"^wa-remote-guards:\s+AVISO:\s*(.*?)\s*$", re.M)  # uma linha AVISO do exe (G12: plist ilegível / agendado sem entrypoint; G6: fragmento MDS inválido); o grupo é o texto depois de "AVISO:"
-ROLE_RE = re.compile(r"(dog-remote|ps-worker-remote|wa-worker-remote)(?:-|$)")  # o papel de um nome de sessão; gate-reviewer-remote e nomes de teste não casam → vale o rig do HQ, como antes
+ROLE_RE = re.compile(r"(dog-remote|kimi-worker-remote|ps-worker-remote|wa-worker-remote)(?:-|$)")  # o papel de um nome de sessão; gate-reviewer-remote e nomes de teste não casam → vale o rig do HQ, como antes
 
 
 class Ctx(NamedTuple):
@@ -591,7 +592,13 @@ def submit(city: str, ctx: Ctx, alias: str, sess: str, bid: str, sha: str, src: 
 def rig_of_session(sess: str) -> str:
     """O prefixo do rig de uma sessão pelo PAPEL no nome (dog-remote-…, ps-worker-remote-…, wa-worker-remote-…). Papel que não casa (gate-reviewer-remote, nome de teste) → "ga": o HQ, como antes da tabela."""
     m = ROLE_RE.match(sess)
-    return next((p for p, r in RIGS.items() if m and r.role == m.group(1)), "ga")
+    return next((p for p, r in RIGS.items() if m and m.group(1) in (r.role,) + r.also), "ga")
+
+
+def role_of(name: str) -> str:
+    """O papel remoto no nome (alias ou sessão), ou "" quando não há (gate-reviewer-remote, nome de teste). Dois papéis do MESMO rig (dog-remote e kimi-worker-remote no gascity) são papéis diferentes."""
+    m = ROLE_RE.match(name)
+    return m.group(1) if m else ""
 
 
 def rig_ctx(city: str, prefix: str, mirror_override: str = "") -> Ctx:
@@ -631,9 +638,13 @@ def main() -> int:
     os.environ.update({"GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "gc.auto", "GIT_CONFIG_VALUE_0": "0", "GIT_CONFIG_KEY_1": "maintenance.auto", "GIT_CONFIG_VALUE_1": "false"})
     mirror = os.environ.get("GATE_DONE_REMOTE_MIRROR") or ""  # só vale para o rig do HQ (teste); os outros rigs usam sempre o espelho do próprio nome
     role_prefix = rig_of_session(sess)
-    # o identity_pattern do atalho é GLOBAL (casa os quatro papéis), então alias de um papel com sessão de outro passa por ele: aqui o alias e a sessão têm de ser do MESMO papel (nome sem papel vale como o HQ nos dois)
-    if rig_of_session(alias) != role_prefix:
-        raise Stop(f"identidade mista: o alias {alias!r} é do rig {RIGS[rig_of_session(alias)].name} e a sessão {sess!r} é do rig {RIGS[role_prefix].name}: não submeto", 2)
+    # o identity_pattern do atalho é GLOBAL (casa todos os papéis), então alias de um papel com sessão de outro passa por ele: aqui o alias e a sessão têm de ser do MESMO papel, e não só do mesmo
+    # rig quando os DOIS nomes têm papel (ga-do1ixn.5: dog-remote e kimi-worker-remote são os dois do gascity; o mesmo rig não basta). Nome sem papel (remote-e2e-1, gate-reviewer-remote) vale como
+    # o HQ e só conta pelo rig, como antes
+    ra, rs = role_of(alias), role_of(sess)
+    if rig_of_session(alias) != role_prefix or (ra and rs and ra != rs):
+        raise Stop(f"identidade mista: o alias {alias!r} é do papel {role_of(alias) or '(nenhum)'} (rig {RIGS[rig_of_session(alias)].name}) e a sessão {sess!r} é do papel {role_of(sess) or '(nenhum)'} "
+                   f"(rig {RIGS[role_prefix].name}): não submeto", 2)
     args = sys.argv[1:]
     want = None
     if args:  # forma com argumentos: o dog diz a bead, o ref do espelho e o sha (ga-2hd02v.1.18); nada é lido antes de a forma e o ref passarem

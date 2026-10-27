@@ -8,9 +8,10 @@ PALIATIVO até o patch do engine da ga-2hd02v.1.22 entrar na janela (docs/pendin
 a sessão manual que o idle_timeout acabou de dormir, e 3 sessões dog-remote vivas sem bead seguram os 3 slots do nó (20/10 06:39 e 13:0x: "sem alias dog-remote-<n> livre").
 Quando o patch entrar: descarregar o job (docs/runbooks/hetzner-idle-session-reaper.md) e apagar estes arquivos.
 REGRA  o launchd do mini roda isto a cada 600 s (com.gascity.hetzner-idle-session-reaper). Duas leituras, cada uma com três estados (leu / não consegui ler / vale X):
-         `gc session list --json`   as sessões dos templates HETZNER_REAP_TEMPLATES (dog-remote, gate-reviewer-remote), com state e closed
+         `gc session list --json`   as sessões dos templates HETZNER_REAP_TEMPLATES (dog-remote, gate-reviewer-remote, kimi-worker-remote), com state e closed
          `bd list --include-infra --status open,in_progress --json --limit 0`   quem SEGURA bead: assignee = o id, o session_name, o name ou o alias da sessão
        "não consegui ler" (qualquer das duas) = ninguém é fechado e o estado nem anda. Bead ABERTA também segura a sessão (a in_progress sozinha não basta).
+       kimi-worker-remote (ga-do1ixn.5) entra: a bead dele é do rig gascity, na loja da HQ, como a do dog-remote.
        wa-worker-remote fica de fora de propósito: a bead dele mora na loja da WA, que o bd da HQ não lê; sem provar "sem bead" não se fecha.
 ESTADO por sessão (id), em <cidade>/.gc/hetzner-idle-reaper.state.json: `desde` (1ª leitura sem bead, vale também enquanto ela dorme: o laço do engine a faz dormir e acordar)
        e `vivas_seguidas` (rodadas seguidas em que a vi VIVA e sem bead). Uma leitura em que ela segura bead, ou em que sumiu da lista, apaga o relógio.
@@ -56,7 +57,7 @@ def _num(env, key, default, cast, lo):
 def load_config(env):
     city = env.get("GC_CITY_PATH") or DEFAULT_CITY
     raw = env.get("HETZNER_REAP_NOW", "").strip()
-    templates = [s.strip() for s in env.get("HETZNER_REAP_TEMPLATES", "dog-remote,gate-reviewer-remote").split(",") if s.strip()]
+    templates = [s.strip() for s in env.get("HETZNER_REAP_TEMPLATES", "dog-remote,gate-reviewer-remote,kimi-worker-remote").split(",") if s.strip()]
     if not templates:
         raise ValueError("HETZNER_REAP_TEMPLATES vazio")
     return SimpleNamespace(

@@ -378,12 +378,12 @@ seed_back "$ALIAS" "$ALIAS" closed; run_exe_a -- ga-t2 "$BRB" "$SHAV"; back_refu
 COLL=$(python3 -I - "$HQ/docs/runbooks/gc-session-ssh.md" <<'EOF'
 import re, sys
 rx = re.compile(re.search(r"^IDENTITY_PATTERN=(.*)$", open(sys.argv[1], encoding="utf-8").read(), re.M).group(1))
-roles = ["dog-remote", "gate-reviewer-remote", "wa-worker-remote", "ps-worker-remote"]
+roles = ["dog-remote", "gate-reviewer-remote", "wa-worker-remote", "ps-worker-remote", "kimi-worker-remote"]
 names = ["remote-e2e-1"] + roles + [f"{r}-{t}" for r in roles for t in ("1", "12", "123", "abc", "gawisp1ryjj", "adhoc", "adhoc-0fc28155dd")]
 print(" ".join(x for x in names if rx.fullmatch(x) and any(rx.fullmatch(f"{x}-{n}") for n in ("1", "12", "123", "v2", "abc", "ga-t2", "a2lb9b", "0fc28155dd"))))
 EOF
 )
-eqs "$COLL" "dog-remote gate-reviewer-remote wa-worker-remote ps-worker-remote dog-remote-adhoc gate-reviewer-remote-adhoc wa-worker-remote-adhoc ps-worker-remote-adhoc"; ok $? "ambiguidade do sufixo: só os nomes sem cauda e os <papel>-adhoc colidem pelo IDENTITY_PATTERN do runbook (achei: '$COLL')"
+eqs "$COLL" "dog-remote gate-reviewer-remote wa-worker-remote ps-worker-remote kimi-worker-remote dog-remote-adhoc gate-reviewer-remote-adhoc wa-worker-remote-adhoc ps-worker-remote-adhoc kimi-worker-remote-adhoc"; ok $? "ambiguidade do sufixo: só os nomes sem cauda e os <papel>-adhoc colidem pelo IDENTITY_PATTERN do runbook (achei: '$COLL')"
 for x in $COLL; do
   reset_db2; run_exe_a GC_SESSION_NAME="$x" GC_ALIAS="$x-1" BEADS_ACTOR="$x-1" -- ga-t2 "worker/$x-2" "$SHA"   # alias do MESMO papel da sessão (senão a identidade mista recusa antes)
   ok $((RC != 1)) "sessão sem cauda '$x' com worker/$x-2: recusa 1"; has "$T/err" "branch principal de OUTRA sessão"; ok $? "'$x': diz que worker/$x-2 pode ser de OUTRA sessão"
@@ -481,6 +481,19 @@ ok $((RC != 0)) "papel desconhecido (remote-e2e-1): sai 0 e trata como o rig do 
 # identidade mista (o identity_pattern do atalho é global): alias de um papel com sessão de outro = recusa 2 antes de ler qualquer bead
 reset_ps; run_ps GC_ALIAS="$ALIAS" BEADS_ACTOR="$ALIAS"; ok $((RC != 2)) "PS identidade mista (alias dog-remote-1, sessão ps-worker-remote-…): recusa 2"; has "$T/err" "identidade mista"; ok $? "identidade mista: diz o motivo"; ps_nothing; ok $? "identidade mista: nada escrito"
 reset_ps; run_exe GC_ALIAS="$PSALIAS" BEADS_ACTOR="$PSALIAS"; ok $((RC != 2)) "HQ identidade mista (alias ps-worker-remote-1, sessão dog-remote-…): recusa 2"; has "$T/err" "identidade mista"; ok $? "HQ identidade mista: diz o motivo"; ps_nothing; ok $? "HQ identidade mista: nada escrito"
+# kimi-worker-remote (ga-do1ixn.5): 2º papel remoto do rig gascity. Submete bead ga-… da loja da cidade como o dog-remote; alias e sessão de papéis DIFERENTES do mesmo rig continuam mistura
+KSESS="kimi-worker-remote-abc123"; KALIAS="kimi-worker-remote-1"
+MKBEAD=ga-t1 mk_work kimi.txt "worker/$KSESS"; SHAK=$NEWSHA
+kimi_db() { reset_ps; python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); d["beads"]["ga-t1"]["assignee"]=sys.argv[2]; json.dump(d,open(sys.argv[1],"w"))' "$DB" "$KALIAS"; }
+run_kimi() { run_exe GC_SESSION_NAME="$KSESS" GC_ALIAS="$KALIAS" BEADS_ACTOR="$KALIAS" GC_TEMPLATE=kimi-worker-remote "$@"; }
+kimi_db; run_kimi GATE_DONE_REMOTE_DRY_RUN=1
+ok $((RC != 0)) "kimi: ensaio da sessão kimi-worker-remote sai 0"; has "$T/out" "bead=ga-t1 worker/$KSESS@${SHAK:0:12}"; ok $? "kimi: a bead é a ga-t1 da loja da cidade (rig gascity), do worker/<sessão> kimi"; [ "$(mut_count)" = 0 ]; ok $? "kimi: ensaio não escreve"
+git --git-dir="$ORIGIN" update-ref -d "refs/heads/$BR" 2>/dev/null; kimi_db; run_kimi
+ok $((RC != 0)) "kimi: o gate-done de verdade sai 0"; [ "$(origin_has "$BR")" = "$SHAK" ]; ok $? "kimi: o origin tem $BR no sha do espelho"
+has "$T/out" "Marker created: ga-mk1"; ok $? "kimi: o marcador foi criado"; [ "$(dbq '.beads["ga-mk1"].metadata["gate.submitted_by"] // ""')" = "$KALIAS" ]; ok $? "kimi: gate.submitted_by = o alias kimi"
+git --git-dir="$ORIGIN" update-ref -d "refs/heads/$BR"
+kimi_db; run_exe GC_ALIAS="$KALIAS" BEADS_ACTOR="$KALIAS"; ok $((RC != 2)) "kimi identidade mista (alias kimi-worker-remote-1, sessão dog-remote-…): recusa 2, mesmo sendo o MESMO rig"; has "$T/err" "identidade mista"; ok $? "kimi × dog: diz o motivo"; ps_nothing; ok $? "kimi × dog: nada escrito"
+reset_ps; run_exe GC_SESSION_NAME="$KSESS" GC_TEMPLATE=kimi-worker-remote; ok $((RC != 2)) "dog identidade mista (alias dog-remote-1, sessão kimi-worker-remote-…): recusa 2"; has "$T/err" "identidade mista"; ok $? "dog × kimi: diz o motivo"; ps_nothing; ok $? "dog × kimi: nada escrito"
 # o papel da sessão limita o rig: ps-worker-remote com bead ga-…, dog-remote com bead ps-…
 reset_ps; run_ps -- ga-t1 "worker/$PSSESS" "$PSSHA"; ok $((RC != 1)) "PS sessão com bead ga-…: recusa 1"; has "$T/err" "é de outro prefixo (ga)"; ok $? "PS sessão com bead ga-…: diz que é de outro prefixo"; ps_nothing; ok $? "PS sessão com bead ga-…: nada escrito"
 reset_ps; run_exe_a -- ps-t1 "worker/$SESS" "$SHA"; ok $((RC != 1)) "dog-remote com bead ps-…: recusa 1"; has "$T/err" "é de outro prefixo (ps)"; ok $? "dog-remote com bead ps-…: diz que é de outro prefixo"; ps_nothing; ok $? "dog-remote com bead ps-…: nada escrito"
@@ -985,7 +998,12 @@ mutant ps-releitura-vazia-volta-a-or-vazio 'if not isinstance(now, dict) or now.
 case_node_mark_left() { reset_ps; run_ps FAKE_BD_KEEP_MARK=1; has "$T/out" "NÃO ficou solta (resta pilot.wa_node_alias"; }
 mutant ps-solta-nao-le-a-marca '("pilot.wa_node_alias", (now.get("metadata") or {}).get("pilot.wa_node_alias"))' '("x", None)' case_node_mark_left
 case_mixed_identity() { reset_ps; run_ps GC_ALIAS="$ALIAS" BEADS_ACTOR="$ALIAS"; [ "$RC" = 2 ] && has "$T/err" "identidade mista" && ps_nothing; }
-mutant ps-identidade-mista-vale 'if rig_of_session(alias) != role_prefix:' 'if False:' case_mixed_identity
+mutant ps-identidade-mista-vale 'if rig_of_session(alias) != role_prefix or (ra and rs and ra != rs):' 'if False:' case_mixed_identity
+case_kimi_dog_mixed() { kimi_db; run_exe GC_ALIAS="$KALIAS" BEADS_ACTOR="$KALIAS"; [ "$RC" = 2 ] && has "$T/err" "identidade mista" && ps_nothing; }
+case_kimi_happy() { kimi_db; run_kimi GATE_DONE_REMOTE_DRY_RUN=1; [ "$RC" = 0 ] && has "$T/out" "bead=ga-t1 worker/$KSESS@"; }
+mutant kimi-mesmo-rig-basta 'if rig_of_session(alias) != role_prefix or (ra and rs and ra != rs):' 'if rig_of_session(alias) != role_prefix:' case_kimi_dog_mixed
+mutant kimi-fora-do-role-re 'dog-remote|kimi-worker-remote|ps-worker-remote' 'dog-remote|ps-worker-remote' case_kimi_dog_mixed
+mutant kimi-rig-errado 'also=("kimi-worker-remote",)' 'also=()' case_kimi_happy 'return next((p for p, r in RIGS.items() if m and m.group(1) in (r.role,) + r.also), "ga")' 'return next((p for p, r in RIGS.items() if m and m.group(1) in (r.role,) + r.also), "ps")'
 mutant ps-loja-da-cidade        'bead = one_bead(ctx.store, alias)' 'bead = one_bead(city, alias)' case_ps_happy
 mutant ps-guarda-de-prefixo     'if bpfx != role_prefix:' 'if False:' case_ps_prefix_guard
 mutant ps-rotas-do-hq           'bead = named_bead(city, alias, args[0], ctx.store, ctx.rig.routes)' 'bead = named_bead(city, alias, args[0], ctx.store)' case_ps_back_hq_route
@@ -996,7 +1014,7 @@ mutant ps-solta-na-loja-errada  'release(city, bid, alias, found[0], ctx.store)'
 mutant ps-nao-solta-a-marca-do-no '"--unset-metadata", "gc.routed_to", "--unset-metadata", "pilot.wa_node_alias", "-q"' '"--unset-metadata", "gc.routed_to", "-q"' case_ps_node_mark
 mutant ps-pasta-do-rig-nao-conferida 'if os.path.basename(path) != rig.name or not os.path.isdir(path):' 'if False:' case_ps_wrong_dir
 mutant ps-rota-ausente-vira-cidade 'raise Stop(f"não achei a rota do prefixo {prefix!r} em {city}/.beads/routes.jsonl ({type(e).__name__}): sem ela não sei em que loja a bead mora")' 'return Ctx(rig, city, city, f"{city}/.gc/hetzner-mirror/repos/{rig.name}.git", str(Path(city) / ".gc" / "gate-done-remote"))' case_ps_no_routes
-mutant ps-papel-desconhecido-vira-ps 'return next((p for p, r in RIGS.items() if m and r.role == m.group(1)), "ga")' 'return next((p for p, r in RIGS.items() if m and r.role == m.group(1)), "ps")' case_unknown_role
+mutant ps-papel-desconhecido-vira-ps 'return next((p for p, r in RIGS.items() if m and m.group(1) in (r.role,) + r.also), "ga")' 'return next((p for p, r in RIGS.items() if m and m.group(1) in (r.role,) + r.also), "ps")' case_unknown_role
 
 # ga-2hd02v.3.10: os mutantes do desligamento do pre-push do WA (cada caso devolve 0 quando o comportamento BOM aparece)
 case_wa_happy() { reset_wa; run_wa; [ "$RC" = 0 ] && [ "$(wa_origin_has "$WABR")" = "$WASHA" ]; }

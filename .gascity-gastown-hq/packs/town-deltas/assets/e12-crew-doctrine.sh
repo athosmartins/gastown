@@ -43,7 +43,7 @@
 #   - the town-deltas fragment, as the guarded section td:e12-write-time-doctrine (TD_ROLE dog / ps-worker / wa-worker, show_unset=false: a
 #     crew has no TD_ROLE and already carries its own region, so it must not get the block twice);
 #   - three more crew prompts that build and finish through the gate (batista-ps, thies-ps, batista-lx), as the same marked region;
-#   - the three Hetzner remote builders (dog-remote, wa-worker-remote, ps-worker-remote; ga-wmylcp, ga-2hd02v.4) and the MBP builder (wa-worker-remote-mbp; ga-w7qwl1.2.1): they run gate-done and have no TD_ROLE, so the fragment never
+#   - the three Hetzner remote builders (dog-remote, wa-worker-remote, ps-worker-remote; ga-wmylcp, ga-2hd02v.4) and the MBP builder (wa-worker-remote-mbp; ga-w7qwl1.2.1), and the Kimi test worker on Hetzner (kimi-worker-remote; ga-do1ixn.5): they run gate-done and have no TD_ROLE, so the fragment never
 #     reaches them. gate-reviewer-remote is NOT a target: a reviewer does not deliver through the gate, its prompt does not name gate-done,
 #     and the coverage rule below (3) is what keeps it that way.
 # The fragment section is plain text between its guard line and `{{ end -}}` (no markers inside: pool-preamble-build.py compares the rendered
@@ -58,7 +58,7 @@
 #
 # Env (tests only): E12_ARMS = the e12-arms.sh to render from; E12_CREW_AGENTS_DIR = the agents/ directory holding <crew>-wa/prompt.template.md;
 # E12_CREW_NAMES = the crews (default: thies oracle digo mila peter batista); E12_EXTRA_AGENTS = more agents whose own prompt gets the region
-# (default: batista-ps thies-ps batista-lx dog-remote wa-worker-remote ps-worker-remote wa-worker-remote-mbp; set but empty = none); E12_FRAGMENT = the fragment file (default: ../template-fragments/town-deltas.template.md;
+# (default: batista-ps thies-ps batista-lx dog-remote wa-worker-remote ps-worker-remote wa-worker-remote-mbp kimi-worker-remote; set but empty = none); E12_FRAGMENT = the fragment file (default: ../template-fragments/town-deltas.template.md;
 # set but empty = no fragment target); E12_CITY_TOML = the city.toml that coverage reads (default: three levels above this file).
 set -uo pipefail
 
@@ -67,7 +67,7 @@ ARMS="${E12_ARMS:-$SD/e12-arms.sh}"
 AGENTS="${E12_CREW_AGENTS_DIR:-$SD/../../../agents}"
 AGENTS="$(cd "$AGENTS" 2>/dev/null && pwd || printf '%s' "$AGENTS")"   # a normalised path in messages; an unreachable one stays as given
 CREWS="${E12_CREW_NAMES:-thies oracle digo mila peter batista}"
-EXTRA="${E12_EXTRA_AGENTS-batista-ps thies-ps batista-lx dog-remote wa-worker-remote ps-worker-remote wa-worker-remote-mbp}"   # no colon: set-but-empty means "none", unset means the default
+EXTRA="${E12_EXTRA_AGENTS-batista-ps thies-ps batista-lx dog-remote wa-worker-remote ps-worker-remote wa-worker-remote-mbp kimi-worker-remote}"   # no colon: set-but-empty means "none", unset means the default
 FRAGMENT="${E12_FRAGMENT-$SD/../template-fragments/town-deltas.template.md}"
 CITY_TOML="${E12_CITY_TOML-$SD/../../../city.toml}"
 HEADER="## Write-time doctrine"

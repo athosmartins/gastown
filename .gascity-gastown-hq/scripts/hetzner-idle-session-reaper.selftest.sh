@@ -93,6 +93,12 @@ check "zumbi: log por sessão" 1 "$(grep -c -F '"evento":"fechada"' "$CITY/.gc/h
 reap $((T0+1800))
 check "zumbi: depois de fechada não fecha de novo" "ga-aaa" "$(closed)"
 
+# 1b. kimi-worker-remote (ga-do1ixn.5) está nos templates padrão: o zumbi dele fecha como o do dog; o wa-worker-remote continua de fora
+new_world kimi
+sessions "$(row ga-kkk kimi-worker-remote-1 kimi-worker-remote active)" "$(row ga-www wa-worker-remote-1 wa-worker-remote active)"
+reap $T0; reap $((T0+600)); reap $((T0+1200))
+check "kimi: o zumbi kimi-worker-remote fecha com o padrão de templates (o wa-worker-remote não)" "ga-kkk" "$(closed)"
+
 # 2. bead in_progress no alias: nunca fecha, nem depois de 40 min
 new_world comBead
 sessions "$(row ga-aaa dog-remote-1 dog-remote active)"
