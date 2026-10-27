@@ -59,6 +59,11 @@
 # ga-iqsy9c7: this timeout is a SIGKILL — the script's trap never runs — so a run that does not fit in it leaves no end of its own. The script writes `start pid=N` and `end rc=N` to .gc/logs/jsonl-export.log
 # (a start with no end is a run that died); the NEXT run logs `DIED ... N in a row`, deletes the scratch of the dead pid (names carry it: $table.jsonl.tmp.p<pid>.*) before it asks Dolt anything, and tells the deacon
 # at the 3rd death in a row. The 4 h age sweep stays only as the net for a scratch name that carries no pid.
+#
+# ga-80oz1l9: the "6-8 minutes" above is from before the supplemental tables (ga-l6v576), which read hq.comments (437 MB) and the other tables page by page. At load 55-65 on 10 cores a run took 1711 s (a hand-run
+# without a timeout): every scheduled run from 07:42Z to ~15:48Z died at 840 s, nothing was committed and the offsite lagged 6 h. The pager now parses a page once, copies it by bytes instead of taking it apart and
+# putting it back (19 MB page: 2.6 s of CPU -> 0.15 s) and asks for bigger pages where the rows are small (hq.labels, row read: 169 s -> 43 s at load 64). A whole run was NOT timed after that — the timeout stays 840 s,
+# under the interval — so whether three runs in a row end inside it is for `gc order history jsonl-export` to say once this is deployed.
 [order]
 description = "Export Dolt databases to JSONL git archive (ga-7sxdmb — replaces mol-dog-jsonl)"
 exec = "$PACK_DIR/assets/scripts/jsonl-export.sh"

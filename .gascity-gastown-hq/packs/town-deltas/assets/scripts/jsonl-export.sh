@@ -266,7 +266,16 @@ SHORT_EXPORT_MIN_SLACK="${GC_JSONL_SHORT_EXPORT_MIN_SLACK:-5}"
 SUPP_TABLES="comments config dependencies labels metadata"
 # These feed arithmetic and `sleep`: a plain whole number in decimal (08 is eight), the default for anything else; only a delay may be 0.
 SUPP_CHUNK_ROWS=$(env_whole_number "${GC_JSONL_SUPP_CHUNK_ROWS:-2000}" 2000 1)
-SUPP_KEY_CHUNK_ROWS=$(env_whole_number "${GC_JSONL_SUPP_KEY_CHUNK_ROWS:-$((SUPP_CHUNK_ROWS * 5))}" $((SUPP_CHUNK_ROWS * 5)) 1)
+# ga-80oz1l9: under load 60 every query is 2-4 s however little it returns (the two key sweeps of the 122k keys of hq.labels were 24 queries), so the pages that cost nothing to make bigger are made bigger.
+# A key is a fraction of a row: the sweeps read 50000 a page — unless the chunk is set by hand (an operator, a test), when they stay at 5 chunks as they always were.
+SUPP_KEY_CHUNK_DEFAULT=50000
+[ -z "${GC_JSONL_SUPP_CHUNK_ROWS:-}" ] || SUPP_KEY_CHUNK_DEFAULT=$((SUPP_CHUNK_ROWS * 5))
+SUPP_KEY_CHUNK_ROWS=$(env_whole_number "${GC_JSONL_SUPP_KEY_CHUNK_ROWS:-$SUPP_KEY_CHUNK_DEFAULT}" "$SUPP_KEY_CHUNK_DEFAULT" 1)
+# The pages of ROWS grow the same way, from what the page just read weighed: SUPP_CHUNK_ROWS is the floor (hq.comments, ~10 KB a row, stays at 2000 rows = a 19 MB page), and a table of small rows (hq.labels, ~70 B) is read
+# in pages of up to SUPP_CHUNK_ROWS_MAX rows, as many as make SUPP_PAGE_TARGET_BYTES. 0 = fixed pages. A chunk set by hand keeps fixed pages unless the target is set by hand too.
+SUPP_PAGE_TARGET_BYTES=$(env_whole_number "${GC_JSONL_SUPP_PAGE_TARGET_BYTES:-16777216}" 16777216 0)
+[ -z "${GC_JSONL_SUPP_CHUNK_ROWS:-}" ] || [ -n "${GC_JSONL_SUPP_PAGE_TARGET_BYTES:-}" ] || SUPP_PAGE_TARGET_BYTES=0
+SUPP_CHUNK_ROWS_MAX=$(env_whole_number "${GC_JSONL_SUPP_CHUNK_ROWS_MAX:-50000}" 50000 1)
 SUPP_EXPORT_ATTEMPTS=$(env_whole_number "${GC_JSONL_SUPP_EXPORT_ATTEMPTS:-2}" 2 1)
 SUPP_EXPORT_RETRY_DELAY=$(env_whole_number "${GC_JSONL_SUPP_EXPORT_RETRY_DELAY:-3}" 3 0)
 SUPP_MAX_PAGES=5000
@@ -1511,19 +1520,82 @@ sql_column_list() {
 
 SUPP_RAW_ROWS=""
 
+# The size of <file> in bytes, as a plain number. Return 1 with nothing printed when it cannot be read: a size nobody could measure is never 0.
+file_bytes() {
+    local n
+
+    n=$(wc -c < "$1" 2>/dev/null | tr -d '[:space:]') || return 1
+    case "$n" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$n"
+}
+
+# Appends the rows of <page> (one Dolt `-r json` document that read_keyed_pages has already parsed) to <dest> as bare `row,row,…` text, with a "," in front when <first> is 0 (the stitch
+# already holds rows). Return 1 when <dest> cannot be written or ends up with other than the bytes it was given.
+# Dolt writes a page as `{"rows": [` + the rows + `]}` + a newline, all on ONE line, and the rows of the next page can follow the rows of this one with a comma. So a page in that envelope is
+# copied by bytes — cut the 10-byte head and the 3-byte tail, parse nothing, write nothing again (ga-80oz1l9: a 19 MB page of hq.comments taken apart with `jq -c '.rows[]?'` and put back with
+# `paste | tr` cost 2.6 s of CPU and 16 s of wall under load 65, and the table is 22 such pages; copied by bytes it is 0.15 s of CPU and 2-3 s of wall). A page in any other envelope —
+# pretty-printed, another key — goes through jq, as every page used to, and the log says so once.
+# The cut is `dd` over the 10-byte head, then `head -c` of the rest, both on the one open file: no pipe between them, so nothing for pipefail to count as a SIGPIPE, and no `tail -c +11` —
+# macOS's tail copies a pipe byte by byte (0.7 s of CPU for a 19 MB page, where dd and head use none that shows).
+STITCH_SLOW_SAID=0
+stitch_page_rows() {
+    local page="$1" dest="$2" first="$3" size before after want
+
+    size=$(file_bytes "$page") || return 1
+    before=$(file_bytes "$dest") || return 1
+    # vazio → the head, the tail or the line count is not what a page in Dolt's envelope has; falhou/ilegível → the same, and the page takes the jq path below
+    if [ "$(head -c 10 "$page" 2>/dev/null)" = '{"rows": [' ] \
+        && [ "$(tail -c 3 "$page" 2>/dev/null | od -An -tx1 | tr -d '[:space:]')" = 5d7d0a ] \
+        && [ "$(wc -l < "$page" 2>/dev/null | tr -d '[:space:]')" = 1 ]; then
+        [ "$first" = 1 ] || printf ',' >> "$dest" || return 1
+        { dd bs=10 count=1 of=/dev/null 2>/dev/null && head -c $((size - 13)) >> "$dest"; } < "$page" || return 1
+        want=$((before + size - 13))
+        [ "$first" = 1 ] || want=$((want + 1))
+        # falhou (size of the stitch cannot be read) → the same as a short copy: the read fails and the table keeps its previous version
+        after=$(file_bytes "$dest") || return 1
+        if [ "$after" -ne "$want" ]; then
+            echo "jsonl-export: stitching a page into $dest wrote $((after - before)) bytes, want $((want - before))" >&2
+            return 1
+        fi
+        return 0
+    fi
+    if [ "$STITCH_SLOW_SAID" != 1 ]; then
+        STITCH_SLOW_SAID=1
+        echo "jsonl-export: a page of rows is not in Dolt's usual envelope ({\"rows\": [...]} on one line): joining the pages through jq, which is slow on a big table" >&2
+    fi
+    [ "$first" = 1 ] || printf ',' >> "$dest" || return 1
+    jq -j '(.rows // []) | map(tojson) | join(",")' "$page" >> "$dest" || return 1
+}
+
+# The chunk for the page after the one just read (ga-80oz1l9): <rows> rows weighed <bytes>, so SUPP_PAGE_TARGET_BYTES holds that many more; never below the chunk it was, never above SUPP_CHUNK_ROWS_MAX.
+# Fixed pages (target 0), an empty page or a size that cannot be read → the chunk as it was. The growth is only ever in how many rows a query asks for: what is read, in which order and how it is judged do not change.
+next_chunk_rows() {
+    local chunk="$1" rows="$2" bytes="$3" want
+
+    if [ "$SUPP_PAGE_TARGET_BYTES" -gt 0 ] && [ "$rows" -gt 0 ] && [ "$bytes" -gt 0 ] 2>/dev/null; then
+        want=$((SUPP_PAGE_TARGET_BYTES * rows / bytes))
+        [ "$want" -le "$SUPP_CHUNK_ROWS_MAX" ] || want="$SUPP_CHUNK_ROWS_MAX"
+        [ "$want" -le "$chunk" ] || chunk="$want"
+    fi
+    printf '%s\n' "$chunk"
+}
+
 # Reads <db>.<table> by KEY (ga-l6v576): pages of <chunk> rows, `SELECT <cols|*> FROM t [WHERE (<key>) > (<last key of the page before>)] ORDER BY <key> LIMIT <chunk>`. <kind> is
 # "rows" (whole rows into the document <out>, SUPP_RAW_ROWS = their count) or "keys" (the key columns only, into <out> itself as one JSON array per line). For rows the keys of what was
-# read are in <out>.keys. Scratch files are <out>.p<N> (pages), <out>.pe (one page's stderr), <out>.err (all of Dolt's stderr) and <out>.rows; the caller removes <out>.*.
+# read are in <out>.keys. Scratch files are <out>.p<N> (the page being read), <out>.pk (its keys), <out>.pe (its stderr), <out>.err (all of Dolt's stderr) and <out>.stitch (the pages so far);
+# the caller removes <out>.*.
 # Paging by key is not a snapshot either, but it fails in ways that can be told: a row inserted or deleted behind the cursor moves nothing, so no row is served twice or stepped over.
 # One read that runs past ~40 s is cut by Dolt — a well-formed document, exit 0, SUPP_CUT_SIGNATURE on stderr — so a page that comes back with rows and that line is kept and the next page
 # resumes from its last key. The paging stops on an EMPTY page only: a short page is not the end, it may be a cut. An empty page that carries the cut's line is the cut that left nothing:
-# a failed read. A single page is kept exactly as Dolt wrote it; several are joined in the same shape. Checked on the way: every page is a JSON document, the cursor moves on, and no key
-# comes twice (a server that repeats rows has not given a snapshot, whatever the counts say).
+# a failed read. Each page is stitched into <out>.stitch as soon as it has passed (stitch_page_rows) and deleted, so the scratch holds the table once and one page, not three copies of it
+# (ga-80oz1l9); a single page comes out exactly as Dolt wrote it, several in the same shape. Checked on the way: every page is ONE JSON document with nothing but `rows` in it, the cursor
+# moves on, and no key comes twice (a server that repeats rows has not given a snapshot, whatever the counts say). A page costs ONE jq run for all of that (its keys, its row count and the
+# cursor come out of the same parse): under load 60 every process the pager starts is seconds, and a table of 120k label rows was 60 pages of four of them.
 # Return 0 → read; return 1 → the read failed (Dolt's exit code, an unreadable document, a cursor that cannot be written or does not move, a repeated key, an empty page after a cut), the
 # reason and Dolt's stderr are in the log, <out> is junk.
 read_keyed_pages() {
     local db="$1" table="$2" cols="$3" kind="$4" chunk="$5" out="$6"
-    local what keys_file collist sel where query rows literal="" prev_literal="" n=0 kept=0 total=0 i dups
+    local what keys_file collist sel where query rows literal="" prev_literal="" n=0 kept=0 total=0 dups
 
     collist=$(sql_column_list "$cols")
     if [ "$kind" = rows ]; then
@@ -1552,9 +1624,15 @@ read_keyed_pages() {
         fi
         # third-state-waiver: o .err só junta o stderr do dolt para o texto do log; o veredito da página sai do jq e da linha de corte lida do .pe, não daqui
         cat "$out.pe" >> "$out.err" 2>/dev/null || true
-        # vazio (a 0-byte page) → an error, not a table with no rows: Dolt prints {} for that
-        if ! rows=$(jq -s -r 'if length == 0 then error("empty page") else ((.[0].rows // []) | length) end' "$out.p$n" 2>/dev/null); then
-            # third-state-waiver: a falha já foi decidida pelo status do jq acima; este tail só monta o texto do log (vazio se o .err sumiu)
+        # vazio (a 0-byte page, or two documents) → an error, not a table with no rows: Dolt prints {} for that. The same run takes the page's keys, one JSON array per line, into .pk.
+        if ! jq -c -s --arg cols "$cols" '
+                ($cols | split(" ")) as $cs
+                | if length != 1 then error("not exactly one document") else .[0] end
+                | if type != "object" or ((keys - ["rows"]) | length) > 0 then error("not a page of rows") else (.rows // []) end
+                | if type != "array" then error("rows is not a list") else .[] end
+                | . as $r | [$cs[] as $c | $r[$c]]' "$out.p$n" > "$out.pk" 2>/dev/null \
+            || ! rows=$(wc -l < "$out.pk" 2>/dev/null | tr -d '[:space:]') || [ -z "$rows" ] || [ -n "${rows//[0-9]/}" ]; then
+            # third-state-waiver: a falha já foi decidida pelo status do jq e do wc acima; este tail só monta o texto do log (vazio se o .err sumiu)
             echo "jsonl-export: reading $what returned an unreadable document (page $n): $(tail -c 300 "$out.err" | tr '\n' ' ')" >&2
             return 1
         fi
@@ -1565,17 +1643,19 @@ read_keyed_pages() {
                 echo "jsonl-export: page $n of $what came back empty after the store cut the read: $(tail -c 300 "$out.err" | tr '\n' ' ')" >&2
                 return 1
             fi
-            [ "$n" -eq 1 ] || rm -f "$out.p$n"
+            # only the empty first page of a table of ROWS is kept (it becomes the document, see below); every other empty page, and the keys', is no use to anyone
+            { [ "$kind" = rows ] && [ "$n" -eq 1 ]; } || rm -f "$out.p$n"
             break
         fi
         kept=$((kept + 1))
         total=$((total + rows))
         # falhou → the page's keys, or the last row's cursor, cannot be made: the read stops (a key that cannot be quoted is never put into SQL)
-        if ! jq -c --arg cols "$cols" '($cols | split(" ")) as $cs | .rows[]? | . as $r | [$cs[] as $c | $r[$c]]' "$out.p$n" >> "$keys_file" 2>/dev/null; then
+        if ! cat "$out.pk" >> "$keys_file" 2>/dev/null; then
             echo "jsonl-export: reading $what: the keys of page $n cannot be read" >&2
             return 1
         fi
-        if ! literal=$(jq -c '.rows[-1]' "$out.p$n" 2>/dev/null | key_tuple_literal "$cols") || [ -z "$literal" ]; then
+        # the cursor is the last row's key: the last line of .pk, put back into an object for key_tuple_literal
+        if ! literal=$(tail -n 1 "$out.pk" | jq -c --arg cols "$cols" '($cols | split(" ")) as $cs | . as $k | reduce range(0; $cs | length) as $i ({}; .[$cs[$i]] = $k[$i])' 2>/dev/null | key_tuple_literal "$cols") || [ -z "$literal" ]; then
             echo "jsonl-export: reading $what: the key of the last row of page $n cannot be written into the next query" >&2
             return 1
         fi
@@ -1584,7 +1664,19 @@ read_keyed_pages() {
             return 1
         fi
         prev_literal="$literal"
-        [ "$kind" = rows ] || rm -f "$out.p$n"
+        if [ "$kind" = rows ]; then
+            # the stitch starts with Dolt's own head; falhou (cannot write, or the page cannot be stitched) → the read fails, the table keeps its previous version
+            if [ "$kept" -eq 1 ]; then
+                printf '{"rows": [' > "$out.stitch" || return 1
+            fi
+            if ! stitch_page_rows "$out.p$n" "$out.stitch" "$((kept == 1))"; then
+                echo "jsonl-export: reading $what: page $n cannot be stitched into the document" >&2
+                return 1
+            fi
+        fi
+        # vazio/falhou (the page cannot be weighed) → the chunk stays as it was: a page that cannot be weighed is no reason to ask for more
+        [ "$kind" != rows ] || chunk=$(next_chunk_rows "$chunk" "$rows" "$(file_bytes "$out.p$n" 2>/dev/null || echo 0)")
+        rm -f "$out.p$n"   # stitched (or only keys): the page is no longer needed, and the table's pages are a copy of the table
         if [ "$n" -ge "$SUPP_MAX_PAGES" ]; then
             echo "jsonl-export: reading $what needs more than $SUPP_MAX_PAGES pages of $chunk rows" >&2
             return 1
@@ -1609,18 +1701,13 @@ read_keyed_pages() {
     esac
     [ "$kind" = rows ] || return 0
 
-    if [ "$kept" -le 1 ]; then
+    if [ "$kept" -eq 0 ]; then
+        # vazio → the table has no rows: the one page is Dolt's own empty document, kept as it wrote it
         mv -f "$out.p1" "$out" || return 1
     else
-        : > "$out.rows"
-        i=1
-        while [ "$i" -le "$kept" ]; do
-            jq -c '.rows[]?' "$out.p$i" >> "$out.rows" || return 1
-            rm -f "$out.p$i"   # joined: the page is no longer needed, and the table's pages are a copy of the table
-            i=$((i + 1))
-        done
-        # Dolt's own shape: {"rows": [row,row]}. The rows are one JSON line each, so the only newline paste leaves is its last.
-        { printf '{"rows": ['; paste -sd, - < "$out.rows" | tr -d '\n'; printf ']}\n'; } > "$out" || return 1
+        # Dolt's own shape: {"rows": [row,row]}, and its newline
+        printf ']}\n' >> "$out.stitch" || return 1
+        mv -f "$out.stitch" "$out" || return 1
     fi
     SUPP_RAW_ROWS="$total"
     return 0

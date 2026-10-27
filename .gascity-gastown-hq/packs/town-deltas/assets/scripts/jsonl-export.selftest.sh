@@ -185,7 +185,7 @@ stub_churn() {  # stub_churn <table file> <ins_behind> <del_behind> <ins_ahead> 
     | sort_by([.id, (.seq // 0)]) | .[]' "$1" > "$1.new" && mv -f "$1.new" "$1"
 }
 stub_supp() {  # stub_supp <query> <table>
-  local q="$1" tbl="$2" tf var cnt sel kind after="null" wlits="" lim=0 off=0 cap lose flaky seen pg apg att stuck dup skip cut_page out cut doc pk="${STUB_PK:-id}" cur ib db ia da _
+  local q="$1" tbl="$2" tf var cnt sel kind after="null" wlits="" lim=0 off=0 cap lose flaky seen pg apg att stuck dup skip cut_page out cut doc mal pre pk="${STUB_PK:-id}" cur ib db ia da _
   tf=$(stub_table_file "$tbl")
   case "$q" in
     "SELECT COUNT(*)"*)
@@ -214,6 +214,8 @@ stub_supp() {  # stub_supp <query> <table>
     # which page of the attempt, and which attempt, this is — an attempt starts at the first page (no cursor, no offset)
     mkdir -p "$E2E_TABLE_DIR"
     pg=$(( $(cat "$E2E_TABLE_DIR/$tbl.pages" 2>/dev/null || echo 0) + 1 )); printf '%s' "$pg" > "$E2E_TABLE_DIR/$tbl.pages"
+    # ga-80oz1l9: E2E_PAGES_LOG gets one line per page of rows fetched — how many page files (<out>.p<N>) the scratch holds right now, the one being written included
+    [ -z "${E2E_PAGES_LOG:-}" ] || printf '%s\n' "$(find "${E2E_PAGES_DIR:-/nonexistent}" -type f 2>/dev/null | grep -Ec '\.p[0-9]+$')" >> "$E2E_PAGES_LOG"
     if [ "$after" = "null" ] && [ "$off" = "0" ]; then
       apg=1
       flaky=$(stub_var "STUB_FLAKY_$tbl" 0)
@@ -260,6 +262,21 @@ stub_supp() {  # stub_supp <query> <table>
     | (if $kind == "keys" then ($sel | gsub("`"; "") | split(", ")) as $cols | ($served | map(. as $r | reduce $cols[] as $c ({}; .[$c] = $r[$c]))) else $served end) as $final
     | $cut, (if ($final | length) == 0 then {} else {rows: $final} end)' "$tf") || return 1
   cut="${out%%$'\n'*}"; doc="${out#*$'\n'}"
+  # ga-80oz1l9: Dolt's `-r json` envelope is `{"rows": [` + the rows + `]}` on ONE line (a space after the colon); jq -c writes `{"rows":[`, which no Dolt does. STUB_ENVELOPE_<t> picks the shape:
+  # unset = Dolt's, compact = jq's, pretty = indented over many lines. STUB_MALFORMED_<t>=<page>:extra|two — the <page>th page of an attempt carries a second key (extra) or is two documents (two).
+  pre='{"rows":['
+  case "$(stub_var "STUB_ENVELOPE_$tbl")" in
+    compact) ;;
+    pretty) doc=$(printf '%s' "$doc" | jq .) ;;
+    *) case "$doc" in "$pre"*) doc='{"rows": ['"${doc#"$pre"}" ;; esac ;;
+  esac
+  mal=$(stub_var "STUB_MALFORMED_$tbl")
+  if [ "$kind" = "rows" ] && [ -n "$mal" ] && [ "${mal%%:*}" = "${apg:-0}" ]; then
+    case "${mal#*:}" in
+      extra) doc="${doc%\}}"', "next": 1}' ;;
+      two) doc="$doc"$'\n'"$doc" ;;
+    esac
+  fi
   printf '%s\n' "$doc"
   [ "$cut" = "false" ] || echo "[mysql] 2026/10/19 01:21:48 packets.go:58 unexpected EOF" >&2
   if [ "$kind" = "rows" ]; then   # other writers act on the live table once, after the N-th page of rows of the run
@@ -338,7 +355,7 @@ run_export() {  # run_export <export-rows> <source-count|ERR> [scrubbed-away-row
   OUT=$(
     E2E_GC_LOG="$E2E/gc.log" STUB_EXPORT_ROWS="$1" STUB_SOURCE_COUNT="$2" STUB_TEST_ROWS="${3:-0}" \
     DISK_FREE_OVERRIDE_MB="${E2E_DISK_MB:-102400}" JEX_NOW_EPOCH="${E2E_NOW:-}" E2E_DOLT_CALLS="$E2E/dolt-calls.log" \
-    PATH="$SANDBOX_PATH" GC_CITY="$E2E/city" GC_PACK_STATE_DIR="${E2E_STATE:-$E2E/state}" \
+    PATH="${E2E_EXTRA_PATH:+$E2E_EXTRA_PATH:}$SANDBOX_PATH" GC_CITY="$E2E/city" GC_PACK_STATE_DIR="${E2E_STATE:-$E2E/state}" \
     GC_JSONL_ARCHIVE_REPO="$ARCH" \
     bash "$E2E/scripts/jsonl-export.sh" 2>&1
   )
@@ -982,11 +999,11 @@ reset_reads() { : > "$E2E_READ_LOG"; rm -f "$E2E_FLAKY_DIR"/*; }   # the read lo
 attempts_of() { grep -Ec "^READ $1 rows [a-z0-9]+ (-|off=0)$" "$E2E_READ_LOG" 2>/dev/null || true; }   # reads of rows of <table> that started from the top, no cursor = attempts at the whole table
 supp_env_reset() {
   local x
-  unset STUB_READ_CAP STUB_PK GC_JSONL_SUPP_CHUNK_ROWS GC_JSONL_SUPP_KEY_CHUNK_ROWS
+  unset STUB_READ_CAP STUB_PK GC_JSONL_SUPP_CHUNK_ROWS GC_JSONL_SUPP_KEY_CHUNK_ROWS GC_JSONL_SUPP_PAGE_TARGET_BYTES GC_JSONL_SUPP_CHUNK_ROWS_MAX
   for x in $SUPP_TABLES_ALL; do
-    unset "STUB_ROWS_$x" "STUB_COUNT_$x" "STUB_LOSE_$x" "STUB_FLAKY_$x" "STUB_FAIL_$x" "STUB_GARBAGE_$x" "STUB_ODD_$x" "STUB_KEYS_FAIL_$x" "STUB_CHURN_$x" "STUB_SKIP_$x" "STUB_DUP_$x" "STUB_STUCK_$x" "STUB_EMPTYCUT_$x"
+    unset "STUB_ROWS_$x" "STUB_COUNT_$x" "STUB_LOSE_$x" "STUB_FLAKY_$x" "STUB_FAIL_$x" "STUB_GARBAGE_$x" "STUB_ODD_$x" "STUB_KEYS_FAIL_$x" "STUB_CHURN_$x" "STUB_SKIP_$x" "STUB_DUP_$x" "STUB_STUCK_$x" "STUB_EMPTYCUT_$x" "STUB_ENVELOPE_$x" "STUB_MALFORMED_$x"
   done
-  unset STUB_GIT_BLIND
+  unset STUB_GIT_BLIND E2E_PAGES_LOG E2E_PAGES_DIR E2E_EXTRA_PATH JQ_SPY_LOG
 }
 supp_env_reset
 
@@ -1513,6 +1530,156 @@ for spec in "2000|2000|1|2000" "08|2000|1|8" "007|2000|1|7" "100|2000|1|100" "|2
   got=$(nw "$v" "$d" "$m")
   [ "$got" = "$want" ] && ok "env_whole_number '$v' default $d min $m -> $want" || bad "env_whole_number '$v' default $d min $m -> '$got', want $want"
 done
+
+# ga-80oz1l9 — the comments table (~437 MB at the live store) has to be read, joined and archived inside the order's 840 s under a load of 60, where every process the pager starts costs seconds.
+# What took the time was not Dolt (3 s a page) but the pager taking each page apart with `jq -c '.rows[]?'`, putting the rows back with `paste | tr`, and three or four jq runs per page for the
+# count, the keys and the cursor, with every page kept until the end (a scratch of 2-3 copies of the table). Dolt's page is one line, `{"rows": [` + rows + `]}`, so it is stitched by bytes,
+# parsed ONCE, and deleted as soon as it is in the stitch. The file that comes out is the same one Dolt would have written for the whole table in a single query.
+echo "=== ga-80oz1l9: a page is parsed once, stitched by bytes, and gone; the file is Dolt's own document ==="
+# vazio → the table file is empty and so is the expected document (it will not equal a 600-row one); falhou (paste/tr cannot run) → a document that matches no archive file
+expected_doc() {  # expected_doc <t> — the document Dolt writes for the whole of <t> in ONE query: {"rows": [row,row,…]} and a newline
+  { printf '{"rows": ['; paste -sd, "$E2E_TABLE_DIR/$1.rows" | tr -d '\n'; printf ']}\n'; }
+}
+doc_is_dolts() {  # doc_is_dolts <label> <t> — the archive's file for <t> equals expected_doc byte by byte
+  if cmp -s <(expected_doc "$2") "$ARCH/wa/$2.jsonl"; then ok "$1: wa/$2.jsonl is byte for byte the document Dolt writes for the whole table"
+  else bad "$1: wa/$2.jsonl differs from the document Dolt writes for the whole table (starts: $(head -c 60 "$ARCH/wa/$2.jsonl" 2>/dev/null), ends: $(tail -c 20 "$ARCH/wa/$2.jsonl" 2>/dev/null | od -An -c | tr -s ' ' | tr -d '\n'))"; fi
+}
+# A jq that writes down every call that is handed a page file (<out>.p<N>) and then runs the real one; and a `head` that loses a byte of what the stitch copies (the stitch's `head -c <rest of the page>` on its stdin; any other call is the real one) — it is on the PATH only where a case asks for it.
+SPY_DIR="$E2E/spy"; HEAD_DIR="$E2E/headshim"; mkdir -p "$SPY_DIR" "$HEAD_DIR"
+printf '#!/bin/bash\nfor a in "$@"; do case "$a" in */*.p[0-9]*) printf "%%s\\n" "$a" >> "$JQ_SPY_LOG"; break ;; esac; done\nexec %s "$@"\n' "$E2E/tools/jq" > "$SPY_DIR/jq"
+printf '#!/bin/bash\nif [ "$#" = 2 ] && [ "$1" = -c ] && [ "$2" -gt 100 ] 2>/dev/null; then exec /usr/bin/head -c $(( $2 - 1 )); fi\nexec /usr/bin/head "$@"\n' > "$HEAD_DIR/head"
+chmod +x "$SPY_DIR/jq" "$HEAD_DIR/head"
+export JQ_SPY_LOG="$E2E/jq-spy.log" E2E_PAGES_LOG="$E2E/pages.log" E2E_PAGES_DIR="$E2E/.jsonl-export-tmp"
+
+# Case 1 — a table of 6 pages of 100 in Dolt's own envelope. One jq run per page file (all the tables and both key sweeps together), never more than the page being read in the scratch,
+# no notice about a strange envelope, and the file is the one-query document.
+fresh_archive supp-stitch
+export STUB_ROWS_comments=600 GC_JSONL_SUPP_CHUNK_ROWS=100 E2E_EXTRA_PATH="$SPY_DIR"
+: > "$JQ_SPY_LOG"; : > "$E2E_PAGES_LOG"; reset_reads
+run_export 200 200
+pages_read=$(grep -c '^READ ' "$E2E_READ_LOG" 2>/dev/null || true)
+jq_on_pages=$(grep -c . "$JQ_SPY_LOG" 2>/dev/null || true)
+most_page_files=$(sort -n "$E2E_PAGES_LOG" 2>/dev/null | tail -n 1)
+[ "$(supp_file_rows comments)" = "600" ] && [ "$(supp_dup_keys comments)" = "0" ] \
+  && ok "stitched read: wa/comments.jsonl holds the 600 rows, each once" \
+  || bad "stitched read: comments holds $(supp_file_rows comments) rows, $(supp_dup_keys comments) ids twice, want 600/0: $OUT"
+doc_is_dolts "stitched read" comments
+[ "$(wc -l < "$ARCH/wa/comments.jsonl" | tr -d ' ')" = "1" ] \
+  && ok "stitched read: the document is ONE line, as Dolt writes it" \
+  || bad "stitched read: the document is $(wc -l < "$ARCH/wa/comments.jsonl" | tr -d ' ') lines long, want 1"
+[ "${pages_read:-0}" -ge 11 ] && [ "${jq_on_pages:-x}" -le "${pages_read:-0}" ] \
+  && ok "stitched read: $jq_on_pages jq runs on $pages_read pages — one parse a page, at most" \
+  || bad "stitched read: $jq_on_pages jq runs were handed a page file for $pages_read pages read — a page is parsed more than once (or no page was read)"
+[ -n "$most_page_files" ] && [ "$most_page_files" -le 1 ] \
+  && ok "stitched read: the scratch never held more than the page being read ($most_page_files page file)" \
+  || bad "stitched read: the scratch held up to '${most_page_files:-?}' page files at once, want 1 — the pages are kept until the end"
+case "$OUT" in
+  *"not in Dolt's usual envelope"*) bad "stitched read: the log says the envelope is unusual for a page that is Dolt's own: $OUT" ;;
+  *) ok "stitched read: no notice about the envelope" ;;
+esac
+no_failed_table "stitched read"
+supp_env_reset
+
+# Case 2 — a table of ONE page, and one with no row at all: the page is what Dolt wrote, and an empty table is still `{}`.
+fresh_archive supp-stitch-small
+export STUB_ROWS_comments=40 STUB_ROWS_config=0 GC_JSONL_SUPP_CHUNK_ROWS=100
+run_export 200 200
+doc_is_dolts "one page" comments
+[ "$(tr -d '[:space:]' < "$ARCH/wa/config.jsonl" 2>/dev/null)" = "{}" ] \
+  && ok "no rows: wa/config.jsonl is Dolt's own {}" \
+  || bad "no rows: wa/config.jsonl is '$(head -c 80 "$ARCH/wa/config.jsonl" 2>/dev/null)', want {}"
+supp_env_reset
+
+# Case 3 — a page in another envelope (jq's compact one, or an indented one over many lines) is joined through jq: the SAME file comes out, and the log says once that it is the slow way.
+for env in compact pretty; do
+  fresh_archive "supp-stitch-$env"
+  export STUB_ROWS_comments=600 GC_JSONL_SUPP_CHUNK_ROWS=100 "STUB_ENVELOPE_comments=$env"
+  run_export 200 200
+  doc_is_dolts "$env envelope" comments
+  said=$(printf '%s\n' "$OUT" | grep -c "not in Dolt's usual envelope" || true)
+  [ "$said" = "1" ] \
+    && ok "$env envelope: the log says once that the pages are joined the slow way" \
+    || bad "$env envelope: the 'not in Dolt's usual envelope' notice is in the log $said times, want 1: $OUT"
+  no_failed_table "$env envelope"
+  supp_env_reset
+done
+
+# Case 4 — a page that is not one document with `rows` and nothing else (a second key; two documents) is not Dolt's answer: the read fails and the previous 600-row version stays.
+for mal in extra two; do
+  fresh_archive "supp-stitch-bad-$mal"
+  export STUB_ROWS_comments=600 GC_JSONL_SUPP_CHUNK_ROWS=100
+  run_export 200 200
+  export STUB_ROWS_comments=700 "STUB_MALFORMED_comments=3:$mal"
+  run_export 201 201
+  [ "$(supp_file_rows comments)" = "600" ] && [ "$(supp_head_rows comments)" = "600" ] \
+    && ok "page with $mal: the previous 600-row version stays (file and HEAD)" \
+    || bad "page with $mal: comments holds $(supp_file_rows comments) rows (HEAD $(supp_head_rows comments)), want 600 — a page that is not Dolt's answer was archived"
+  case "$OUT" in
+    *"failed: wa(comments)"*) ok "page with $mal: the run summary lists 'failed: wa(comments)'" ;;
+    *) bad "page with $mal: the run summary does not name wa(comments). Output: $OUT" ;;
+  esac
+  supp_env_reset
+done
+
+# Case 5 — the stitch copies fewer bytes than it was given (a `head` that loses one): the size check sees it, the read fails and the previous version stays. Without the check a corrupt
+# document would be archived with the right row count in the log.
+fresh_archive supp-stitch-short
+export STUB_ROWS_comments=600 GC_JSONL_SUPP_CHUNK_ROWS=100
+run_export 200 200
+export STUB_ROWS_comments=700 E2E_EXTRA_PATH="$HEAD_DIR"
+run_export 201 201
+[ "$(supp_file_rows comments)" = "600" ] && [ "$(supp_head_rows comments)" = "600" ] \
+  && ok "a stitch that loses a byte: the previous 600-row version stays (file and HEAD)" \
+  || bad "a stitch that loses a byte: comments holds $(supp_file_rows comments) rows (HEAD $(supp_head_rows comments)), want 600 — a short copy became the snapshot"
+case "$OUT" in
+  *"wrote "*" bytes, want "*) ok "a stitch that loses a byte: the log says how many bytes were written and how many were due" ;;
+  *) bad "a stitch that loses a byte: no 'wrote N bytes, want M' line in the output: $OUT" ;;
+esac
+supp_env_reset
+
+# Case 6 — the pages grow where it costs nothing (ga-80oz1l9). With no chunk set by hand, a table of small rows is read in bigger pages than the 2000 a row of hq.comments (~10 KB) needs: 12000 rows of ~40 bytes are
+# 2000 rows, then ONE page of the other 10000, then the empty page; and the key sweeps read 50000 keys a page, not 10000. The floor holds (the first page is 2000 rows) and the file is still the one-query document.
+fresh_archive supp-growth
+export STUB_ROWS_comments=12000
+reset_reads
+run_export 200 200
+limits_of() { grep "^READ comments $1 " "$E2E_READ_LOG" 2>/dev/null | awk '{printf "%s ", $4}'; }   # the LIMIT of every read of <rows|keys>, in order
+row_limits=$(limits_of rows); key_limits=$(limits_of keys)
+[ "$(supp_file_rows comments)" = "12000" ] && [ "$(supp_dup_keys comments)" = "0" ] \
+  && ok "grown pages: wa/comments.jsonl holds the 12000 rows, each once" \
+  || bad "grown pages: comments holds $(supp_file_rows comments) rows, $(supp_dup_keys comments) ids twice, want 12000/0: $OUT"
+doc_is_dolts "grown pages" comments
+[ "$row_limits" = "2000 50000 50000 " ] \
+  && ok "grown pages: the rows were read 2000, then 50000 at a time ($row_limits)" \
+  || bad "grown pages: the LIMITs of the rows were '$row_limits', want '2000 50000 50000 ' (the floor, the grown page, the empty one)"
+[ "$key_limits" = "50000 50000 50000 50000 " ] \
+  && ok "grown pages: both key sweeps read 50000 keys a page ($key_limits)" \
+  || bad "grown pages: the LIMITs of the key sweeps were '$key_limits', want four reads of 50000"
+no_failed_table "grown pages"
+supp_env_reset
+
+# Case 7 — the knobs. Chunk 100 and a target set by hand (100000 bytes, ~40-byte rows, at most 400 rows): 100, then 400 at a time; the same document. A target the first page already meets
+# (3000 bytes = ~70 rows, under the 100 the chunk is) changes nothing: pages never shrink below the chunk.
+fresh_archive supp-growth-cap
+export STUB_ROWS_comments=1000 GC_JSONL_SUPP_CHUNK_ROWS=100 GC_JSONL_SUPP_PAGE_TARGET_BYTES=100000 GC_JSONL_SUPP_CHUNK_ROWS_MAX=400
+reset_reads
+run_export 200 200
+row_limits=$(limits_of rows)
+doc_is_dolts "grown to the cap" comments
+[ "$row_limits" = "100 400 400 400 400 " ] \
+  && ok "grown to the cap: the rows were read 100, then 400 at a time ($row_limits)" \
+  || bad "grown to the cap: the LIMITs of the rows were '$row_limits', want '100 400 400 400 400 '"
+supp_env_reset
+fresh_archive supp-growth-none
+export STUB_ROWS_comments=1000 GC_JSONL_SUPP_CHUNK_ROWS=100 GC_JSONL_SUPP_PAGE_TARGET_BYTES=3000
+reset_reads
+run_export 200 200
+row_limits=$(limits_of rows)
+doc_is_dolts "target already met" comments
+[ "$row_limits" = "100 100 100 100 100 100 100 100 100 100 100 " ] \
+  && ok "target already met: eleven reads of 100 rows, no growth and no shrinking" \
+  || bad "target already met: the LIMITs of the rows were '$row_limits', want eleven of 100"
+supp_env_reset
 
 # ga-8z0hy7 — a commit that lands while jsonl-archive-compact.sh runs must not start git's background maintenance.
 # `git commit` runs `git maintenance run --auto --quiet --detach`; on git 2.54 that is a geometric repack which merges and deletes the loose-*.pack batch
