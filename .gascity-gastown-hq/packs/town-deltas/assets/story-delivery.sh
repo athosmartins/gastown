@@ -1109,26 +1109,36 @@ PYEOF
 #       Logs "advanced: delta sem daemon afetado". The patterns are the helper's
 #       DEFAULT_NO_RESTART_PATTERNS ("no daemon on any rig imports a test or doc
 #       file", ga-dk7fw); a test fails if the two lists drift apart.
+#   marker is an ancestor of HEAD and marker..HEAD holds CODE → the rig-wide
+#       scheduled-job proof below (dri_sched_proof, ga-xx7qt7a): the marker moves to
+#       HEAD only when nothing launched from the runtime can be running code older
+#       than HEAD. The pins are left as they were on that path. Logs "advanced:
+#       nenhum job do runtime pode estar rodando código anterior ao HEAD".
 #   anything else → nothing moves, and the reason is logged once per
-#       (marker, HEAD) pair — the 2 days of silence were the problem.
+#       (marker, HEAD[, reason class]) — the 2 days of silence were the problem.
 # It only ever moves a marker forward over files the helper itself would call
-# structurally inert. It never judges code: a code file, a scheduled-job file
-# (scripts/*, a plist template — what JOB_NOT_INSTALLED is about), a rename out
-# of code (--no-renames lists the old path), a git failure, a marker that is not
-# a commit or not an ancestor, an unknown rig, or DRY_RUN=1 all leave every file
-# as it was. A stuck-flagged pin is never touched (ga-n2jnsa re-examines it each
-# cycle). Code in the window is NOT handled here: that still needs the helper's
-# verdict from Step 5b, and this step does not pretend otherwise.
+# structurally inert, or over code that dri_sched_proof proves nothing can be
+# running. It never judges which daemon a code file reaches: a scheduled-job file
+# (a *.plist in the delta — what JOB_NOT_INSTALLED is about), a git failure, a marker
+# that is not a commit or not an ancestor, an unknown rig, or DRY_RUN=1 all leave every
+# file as it was. A rename out of code counts as code (--no-renames lists the old path,
+# and the old path is what is judged), so it is held unless dri_sched_proof clears it.
+# A stuck-flagged pin is never touched (ga-n2jnsa re-examines it each cycle).
+# Attribution of a code file to a daemon (which label does runner.py reach) is NOT
+# attempted here: that still needs the helper's verdict from Step 5b. The proof
+# below does not need it, because it asks the stronger question about the whole rig.
 DRI_NO_DAEMON_PATTERNS="tests/** docs/** *.md"
 # dri_delta_inert <runtime_dir> <from> <to> — 0 every changed file is covered,
 # 1 some file is not, 2 git could not list them. Sets DRI_N (files changed),
-# DRI_N_OTHER (not covered) and DRI_FIRST_OTHER.
+# DRI_N_OTHER (not covered), DRI_FIRST_OTHER and DRI_LIST (the file list it read,
+# so a caller that needs the same list does not run the same diff twice).
 dri_delta_inert() {
-  DRI_N=0; DRI_N_OTHER=0; DRI_FIRST_OTHER=""
+  DRI_N=0; DRI_N_OTHER=0; DRI_FIRST_OTHER=""; DRI_LIST=""
   local list f pat cov
   if ! list="$(git -c core.quotepath=off -C "$1" diff --name-only --no-renames "$2" "$3" 2>/dev/null)"; then
     return 2
   fi
+  DRI_LIST="$list"
   set -f
   while IFS= read -r f; do
     [ -n "$f" ] || continue
@@ -1145,6 +1155,224 @@ dri_delta_inert() {
   done <<< "$list"
   set +f
   [ "$DRI_N_OTHER" -eq 0 ]
+}
+# dri_sched_proof <rig> <runtime_dir> <from> <to> <delta files> — ga-xx7qt7a. The second chance for a
+# delta dri_delta_inert refused because it holds code. Asks one rig-wide question that
+# needs no attribution of files to daemons: can anything launched from this runtime be
+# running code older than <to>? Measured 27/10 on property_scrapers: the helper cannot be
+# asked instead — a DRY_RUN=1 probe of that delta hit `timeout 180` at load 70 before it
+# finished discovering, and it registers every com.scrapers.* "with no known entrypoint",
+# so its AFFECTED=<empty> would have meant "could not attribute", not "checked clean".
+# Returns 0 only when every item below is a positive "yes"; 1 for "no" AND for "could not
+# tell" alike (the caller never moves on either, and the log says which it was):
+#   1. the delta (the list dri_delta_inert just read, passed in so the diff is not run
+#      twice) holds no *.plist — a plist in it is a scheduled job that may not be
+#      installed, and JOB_NOT_INSTALLED is Step 5b's call;
+#   2. the rig has no extra_runtime_roots (a second clone is synced by someone else);
+#   3. at least one LaunchAgents plist names the checkout (an empty roster proves nothing
+#      — it also cannot be told apart from a roster that was not read); no plist that names
+#      it is unreadable or without a Label; none has KeepAlive (true, or a dict);
+#   4. the checkout has no tracked local modification (the files on disk ARE <to>);
+#   5. every such job with a live process started after <to> arrived in the checkout:
+#      runtime_head_at_epoch of its start time is <to>, or a commit whose distance to <to>
+#      changes no code (dri_delta_inert) — the primitive Step 5b uses for process proof.
+# The cheap, decisive checks come first on purpose: this runs every sweep for a rig whose
+# marker is held, and a rig like whatsapp_automation (extra_runtime_roots, KeepAlive daemons)
+# must stop at the runbook read or the plist scan, not after a git status of a large checkout.
+# Not modelled (the same documented class as daemon-refresh.sh header point 24): a job
+# that reaches the checkout only through a wrapper script outside it (its plist never
+# names the checkout), a process not owned by a LaunchAgents plist, and a job in
+# /Library/Launch*. Sets DRI_SCHED_CLASS (a stable token: it is part of the
+# once-per-reason log key), DRI_SCHED_WHY and, on 0, DRI_SCHED_SUMMARY.
+dri_sched_proof() {
+  DRI_SCHED_CLASS=""; DRI_SCHED_WHY=""; DRI_SCHED_SUMMARY=""
+  local rig="$1" rt="$2" from="$3" to="$4" list="${5:-}" rc=0 f dirty xr agents scan last tbl hdr
+  local jobs="" n_jobs=0 n_run=0 kind a b ka_label="" label pid ls ep h
+  # vazio → class git: a delta that was refused for holding code has at least one file, so an
+  # empty list is a caller bug, never "nothing to check"; falhou/ilegível → the caller got rc 2
+  # from the diff and never calls this
+  if [ -z "${list//[[:space:]]/}" ]; then
+    DRI_SCHED_CLASS="git"; DRI_SCHED_WHY="no file list for ${from:0:9}..${to:0:9} was passed in (unknown is not inert)"
+    return 1
+  fi
+  while IFS= read -r f; do
+    case "$f" in
+      *.plist)
+        DRI_SCHED_CLASS="plist-in-delta"
+        DRI_SCHED_WHY="the delta carries a scheduled-job plist ($f) that may not be installed — only the helper's JOB_NOT_INSTALLED check from Step 5b can clear that"
+        return 1 ;;
+    esac
+  done <<< "$list"
+  # vazio → no extra roots, go on; falhou/ilegível → class roots, nothing moves
+  rc=0; xr="$(get_runbook_field "$rig" "extra_runtime_roots" 2>/dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    DRI_SCHED_CLASS="roots"; DRI_SCHED_WHY="could not read extra_runtime_roots for rig $rig from the runbook"
+    return 1
+  fi
+  if [ -n "${xr//[[:space:]]/}" ]; then
+    DRI_SCHED_CLASS="roots"; DRI_SCHED_WHY="rig $rig has extra_runtime_roots (a second clone synced by someone else), whose jobs this proof does not cover"
+    return 1
+  fi
+  agents="${LAUNCH_AGENTS_DIR:-}"
+  if [ -z "$agents" ] && [ -n "${HOME:-}" ]; then agents="$HOME/Library/LaunchAgents"; fi
+  if [ -z "$agents" ] || [ ! -d "$agents" ]; then
+    DRI_SCHED_CLASS="scan"; DRI_SCHED_WHY="the LaunchAgents directory (${agents:-unset}) cannot be read, so which jobs launch from the runtime is unknown"
+    return 1
+  fi
+  # vazio → an empty roster still prints its END line and is judged below (class nojob);
+  # no END line at all → class scan; falhou/ilegível → class scan, nothing moves
+  rc=0
+  scan="$(python3 -I - "$rt" "$agents" <<'PY' 2>/dev/null
+import os, sys, plistlib
+rt = sys.argv[1].rstrip("/")
+agents = sys.argv[2]
+names = {rt}
+try:
+    names.add(os.path.realpath(rt).rstrip("/"))
+except OSError:
+    pass
+names.discard("")
+if not names:
+    sys.exit(2)
+raw_names = [n.encode() for n in names]
+
+def strings(o):
+    if isinstance(o, str):
+        yield o
+    elif isinstance(o, dict):
+        for v in o.values():
+            for s in strings(v):
+                yield s
+    elif isinstance(o, (list, tuple)):
+        for v in o:
+            for s in strings(v):
+                yield s
+
+def safe(s):
+    return "".join(" " if c in "\t\r\n" else c for c in s)
+
+try:
+    files = sorted(x for x in os.listdir(agents) if x.endswith(".plist"))
+except OSError:
+    sys.exit(3)
+for f in files:
+    try:
+        with open(os.path.join(agents, f), "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        print("UNKNOWN\t" + safe(f))
+        continue
+    try:
+        d = plistlib.loads(raw)
+        if not isinstance(d, dict):
+            raise ValueError("not a dict")
+    except Exception:
+        if any(n in raw for n in raw_names):
+            print("UNREADABLE\t" + safe(f))
+        continue
+    if not any(n in s for s in strings(d) for n in names):
+        continue
+    label = d.get("Label")
+    # a label outside [A-Za-z0-9._@+:-] cannot be told apart from a glob or a field
+    # separator by the shell that reads this output: held as unknown, never guessed at
+    if not isinstance(label, str) or not label or not all(c.isalnum() and c.isascii() or c in "._@+:-" for c in label):
+        print("NOLABEL\t" + safe(f))
+        continue
+    ka = d.get("KeepAlive")
+    print("JOB\t%s\t%s" % (label, "none" if ka is None or ka is False else "keepalive"))
+print("END\t%d" % len(files))
+PY
+)" || rc=$?
+  last="${scan##*$'\n'}"
+  case "$last" in
+    END$'\t'*) ;;
+    *) DRI_SCHED_CLASS="scan"; DRI_SCHED_WHY="reading the plists in $agents failed (rc=$rc), so which jobs launch from the runtime is unknown"
+       return 1 ;;
+  esac
+  while IFS=$'\t' read -r kind a b; do
+    case "$kind" in
+      JOB)
+        jobs="$jobs $a"; n_jobs=$((n_jobs + 1))
+        if [ "$b" != "none" ] && [ -z "$ka_label" ]; then ka_label="$a"; fi ;;
+      UNREADABLE|UNKNOWN|NOLABEL)
+        DRI_SCHED_CLASS="plist"
+        DRI_SCHED_WHY="$a in $agents ($kind) cannot be read as a job and may launch from the runtime — an unreadable plist that names the checkout is not an absent one"
+        return 1 ;;
+    esac
+  done <<< "$scan"
+  if [ -n "$ka_label" ]; then
+    DRI_SCHED_CLASS="keepalive"
+    DRI_SCHED_WHY="$ka_label is launched from the runtime with KeepAlive, so it can be running code from before ${to:0:9}"
+    return 1
+  fi
+  if [ "$n_jobs" -eq 0 ]; then
+    DRI_SCHED_CLASS="nojob"
+    DRI_SCHED_WHY="no launchd job in $agents names the runtime checkout, and an empty roster is not proof that nothing runs from it"
+    return 1
+  fi
+  # vazio → the checkout is clean, go on; falhou/ilegível → class git, nothing moves
+  rc=0; dirty="$(git --no-optional-locks -C "$rt" status --porcelain --untracked-files=no 2>/dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    DRI_SCHED_CLASS="git"; DRI_SCHED_WHY="git could not tell whether the runtime checkout is clean"
+    return 1
+  fi
+  if [ -n "$dirty" ]; then
+    DRI_SCHED_CLASS="dirty"; DRI_SCHED_WHY="the runtime checkout has local modifications to tracked files (first: ${dirty%%$'\n'*}), so the files on disk are not ${to:0:9}"
+    return 1
+  fi
+  # vazio → class launchctl (not even the header came back); falhou/ilegível → class launchctl
+  rc=0; tbl="$("${LAUNCHCTL_BIN:-launchctl}" list 2>/dev/null)" || rc=$?
+  hdr="${tbl%%$'\n'*}"
+  case "$hdr" in
+    PID*Label) ;;
+    *) DRI_SCHED_CLASS="launchctl"; DRI_SCHED_WHY="launchctl list gave no readable table (rc=$rc), so which jobs have a live process is unknown"
+       return 1 ;;
+  esac
+  for label in $jobs; do
+    # vazio → "ABSENT" (the label is not loaded: no process); falhou/ilegível → empty pid, class launchctl
+    pid="$(awk -v l="$label" '$3 == l && !f { print $1; f = 1 } END { if (!f) print "ABSENT" }' <<< "$tbl")" || pid=""
+    case "$pid" in
+      ABSENT|-) continue ;;
+      ""|*[!0-9]*)
+        DRI_SCHED_CLASS="launchctl"; DRI_SCHED_WHY="launchctl list shows '$pid' in the pid column of $label, which is neither a pid nor '-'"
+        return 1 ;;
+    esac
+    # vazio → class live-unknown (the process is gone or ps cannot see it: no start time);
+    # falhou/ilegível → class live-unknown
+    ls="$("${PS_BIN:-ps}" -o lstart= -p "$pid" 2>/dev/null)" || ls=""
+    ls="${ls%"${ls##*[![:space:]]}"}"
+    ep=""
+    if [ -n "$ls" ]; then ep="$(date -j -f "%a %b %e %T %Y" "$ls" +%s 2>/dev/null)" || ep=""; fi
+    if ! [[ "$ep" =~ ^[0-9]+$ ]]; then
+      DRI_SCHED_CLASS="live-unknown"; DRI_SCHED_WHY="$label (pid $pid) is running but its start time could not be read ('${ls:-nothing}')"
+      return 1
+    fi
+    # vazio → class live-unknown (the start predates the reflog, or the log is out of order);
+    # falhou/ilegível → class live-unknown
+    h="$(runtime_head_at_epoch "$rt" "$ep")"
+    if [ -z "$h" ]; then
+      DRI_SCHED_CLASS="live-unknown"; DRI_SCHED_WHY="$label (pid $pid) started at epoch $ep, which the checkout's reflog cannot place (before it began, or out of order)"
+      return 1
+    fi
+    rc=0; git -C "$rt" merge-base --is-ancestor "$h" "$to" >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      DRI_SCHED_CLASS="live-unknown"; DRI_SCHED_WHY="$label (pid $pid) started while the checkout was on ${h:0:9}, which is not a proven ancestor of ${to:0:9} (rc=$rc)"
+      return 1
+    fi
+    rc=0; dri_delta_inert "$rt" "$h" "$to" || rc=$?
+    if [ "$rc" -eq 1 ]; then
+      DRI_SCHED_CLASS="live-old"
+      DRI_SCHED_WHY="$label (pid $pid) started while the checkout was on ${h:0:9}; ${h:0:9}..${to:0:9} changes code ($DRI_FIRST_OTHER) the process may not have loaded"
+      return 1
+    elif [ "$rc" -ne 0 ]; then
+      DRI_SCHED_CLASS="live-unknown"; DRI_SCHED_WHY="git could not list the files changed in ${h:0:9}..${to:0:9} for $label (pid $pid)"
+      return 1
+    fi
+    n_run=$((n_run + 1))
+  done
+  DRI_SCHED_CLASS="ok"
+  DRI_SCHED_SUMMARY="$n_jobs job(s) launched from the runtime, none with KeepAlive, $n_run with a live process (each started after ${to:0:9} arrived, or at a distance from it that changes no code)"
+  return 0
 }
 DRI_DIR="$GC_CITY/.gc/runtime/daemon-refresh-baseline"
 if [ -d "$DRI_DIR" ]; then
@@ -1166,34 +1394,50 @@ if [ -d "$DRI_DIR" ]; then
     fi
     _dri_why=""
     _dri_nfiles=0
+    _dri_via_sched=0; _dri_cls=""; _dri_nother=0; _dri_sched_sum=""
     if ! git -C "$_dri_rt" merge-base --is-ancestor "$_dri_old" "$_dri_head" >/dev/null 2>&1; then
       _dri_why="the marker ${_dri_old:0:9} is not an ancestor of the checkout's HEAD ${_dri_head:0:9} (reset/rebase) — only a Step 5b verdict can re-anchor it"
     else
       _dri_rc=0; dri_delta_inert "$_dri_rt" "$_dri_old" "$_dri_head" || _dri_rc=$?
-      _dri_nfiles="$DRI_N"
+      _dri_nfiles="$DRI_N"; _dri_nother="$DRI_N_OTHER"; _dri_list="$DRI_LIST"
       if [ "$_dri_rc" -eq 2 ]; then
         _dri_why="git could not list the files changed in ${_dri_old:0:9}..${_dri_head:0:9} (unknown is not inert)"
       elif [ "$_dri_rc" -ne 0 ]; then
         _dri_why="$DRI_N_OTHER of $DRI_N file(s) changed in ${_dri_old:0:9}..${_dri_head:0:9} are outside tests/**, docs/**, *.md (first: $DRI_FIRST_OTHER) — only the helper's verdict from Step 5b can move it"
+        # ga-xx7qt7a: code in the window is not yet a reason to hold — ask the rig-wide
+        # question (can anything launched from this runtime be running older code?).
+        # Only a positive "yes" clears _dri_why; "no" and "could not tell" keep it and
+        # add why, and the reason class joins the once-per-reason log key.
+        if dri_sched_proof "$_dri_rig" "$_dri_rt" "$_dri_old" "$_dri_head" "$_dri_list"; then
+          _dri_via_sched=1; _dri_why=""; _dri_sched_sum="$DRI_SCHED_SUMMARY"
+        else
+          _dri_cls="$DRI_SCHED_CLASS"
+          _dri_why="$_dri_why; the scheduled-job check (ga-xx7qt7a) did not clear it either: $DRI_SCHED_WHY"
+        fi
       fi
     fi
     _dri_why_file="$DRI_DIR/$_dri_rig.idle-advance-why"
     if [ -n "$_dri_why" ]; then
-      if [ "$DRY_RUN" != "1" ] && [ "$(cat "$_dri_why_file" 2>/dev/null || echo "")" != "$_dri_old $_dri_head" ]; then
+      if [ "$DRY_RUN" != "1" ] && [ "$(cat "$_dri_why_file" 2>/dev/null || echo "")" != "$_dri_old $_dri_head${_dri_cls:+ $_dri_cls}" ]; then
         log "Daemon refresh: baseline for rig $_dri_rig NOT advanced by the idle check (ga-thoo16): $_dri_why."
-        printf '%s' "$_dri_old $_dri_head" > "$_dri_why_file" 2>/dev/null || true
+        printf '%s' "$_dri_old $_dri_head${_dri_cls:+ $_dri_cls}" > "$_dri_why_file" 2>/dev/null || true
       fi
       continue
     fi
     if [ "$DRY_RUN" = "1" ]; then
-      log "Daemon refresh: DRY_RUN — WOULD advance baseline for rig $_dri_rig ${_dri_old:0:9} -> ${_dri_head:0:9}: delta sem daemon afetado ($_dri_nfiles file(s), all tests/**, docs/** or *.md)."
+      if [ "$_dri_via_sched" -eq 1 ]; then
+        log "Daemon refresh: DRY_RUN — WOULD advance baseline for rig $_dri_rig ${_dri_old:0:9} -> ${_dri_head:0:9}: nenhum job do runtime pode estar rodando código anterior ao HEAD ($_dri_nother of $_dri_nfiles file(s) in the delta are code; $_dri_sched_sum; per-daemon pins untouched) (ga-xx7qt7a)."
+      else
+        log "Daemon refresh: DRY_RUN — WOULD advance baseline for rig $_dri_rig ${_dri_old:0:9} -> ${_dri_head:0:9}: delta sem daemon afetado ($_dri_nfiles file(s), all tests/**, docs/** or *.md)."
+      fi
       continue
     fi
     # per-daemon pins first (same order as Step 5b: the rig-wide marker is only
-    # written once the pins it implies are on disk).
+    # written once the pins it implies are on disk). Not on the scheduled-job path
+    # (ga-xx7qt7a): that proof is rig-wide and says nothing about a pin's own window.
     _dri_pd_file="$DRI_DIR/$_dri_rig.perdaemon"
     _dri_pd_moved=0; _dri_pd_kept=0; _dri_pd_out=""; _dri_cache=" "
-    if [ -s "$_dri_pd_file" ]; then
+    if [ "$_dri_via_sched" -eq 0 ] && [ -s "$_dri_pd_file" ]; then
       while IFS= read -r _dri_line || [ -n "$_dri_line" ]; do
         _dri_l1=""; _dri_l2=""; _dri_l3=""
         read -r _dri_l1 _dri_l2 _dri_l3 <<< "$_dri_line" || true
@@ -1239,7 +1483,11 @@ if [ -d "$DRI_DIR" ]; then
     fi
     if printf '%s\n' "$_dri_head" > "$_dri_sha_file.tmp.$$" 2>/dev/null && mv -f "$_dri_sha_file.tmp.$$" "$_dri_sha_file" 2>/dev/null; then
       rm -f "$_dri_why_file" 2>/dev/null || true
-      log "Daemon refresh: baseline for rig $_dri_rig advanced: delta sem daemon afetado (${_dri_old:0:9} -> ${_dri_head:0:9}; $_dri_nfiles file(s), all under tests/**, docs/** or *.md — no daemon or scheduled job can load them; per-daemon pins moved: $_dri_pd_moved, left as they were: $_dri_pd_kept) (ga-thoo16)."
+      if [ "$_dri_via_sched" -eq 1 ]; then
+        log "Daemon refresh: baseline for rig $_dri_rig advanced: nenhum job do runtime pode estar rodando código anterior ao HEAD (${_dri_old:0:9} -> ${_dri_head:0:9}; $_dri_nother of $_dri_nfiles file(s) in the delta are code; $_dri_sched_sum; per-daemon pins untouched) (ga-xx7qt7a)."
+      else
+        log "Daemon refresh: baseline for rig $_dri_rig advanced: delta sem daemon afetado (${_dri_old:0:9} -> ${_dri_head:0:9}; $_dri_nfiles file(s), all under tests/**, docs/** or *.md — no daemon or scheduled job can load them; per-daemon pins moved: $_dri_pd_moved, left as they were: $_dri_pd_kept) (ga-thoo16)."
+      fi
     else
       rm -f "$_dri_sha_file.tmp.$$" 2>/dev/null || true
       warn "could not persist daemon-refresh baseline for rig $_dri_rig at $_dri_sha_file (idle advance skipped this sweep; ga-thoo16)"

@@ -1,7 +1,7 @@
 # hetzner-ballast.items.txt — a fila do lastro do nó Hetzner (ga-2hd02v.5). TSV, 8 colunas separadas por TAB; o hetzner-ballast.sh install a leva para ~/gt-remote/ballast/items.tsv.
 #
 # Contents
-#   Colunas · Itens de hoje · O que falta (donos)
+#   Colunas · Itens de hoje · Núcleos e cooldown · O que falta (donos)
 #
 # COLUNAS: nome · papel (work | filler) · núcleos (inteiro ou auto = o resto do orçamento) · rss_mb (teto da soma de RSS do item; passou, o governo o termina) · prazo_s (o `timeout` do item; o governo
 #   o termina 60 s depois) · cooldown_s (espera entre rodadas; falha espera no mínimo 600 s) · requires (`-` ou lista de path:/exec:/cmd:/flag:/noflag:, todos verdadeiros; predicado desconhecido = item inerte) ·
@@ -12,11 +12,16 @@
 #   wa-suite.leak se o canário medir vazamento de rede. 5 núcleos e rss_mb 13312 são MEDIDOS (ga-weaih6, 24/10, nó de 31 GB): cada worker do xdist termina em ~2 GB de memória PRÓPRIA (PSS ≈ 94% do RSS: não é
 #   página de fork contada em dobro); 8 workers já somavam 15,2 GB com a suíte em 35% (extrapolado: ~19 GB no fim), acima do que o governo admite (MemAvailable − rss_mb ≥ 14336); 5 workers deram pico de
 #   11795 MB na suíte inteira (43 min). Conta e números: docs/runbooks/hetzner-ballast.md ("Medido"); o teste hetzner-ballast-wa-suite.selftest.sh (grupo reg) falha se núcleos × MB por worker + base
-#   deixar de caber no rss_mb. queima é o último recurso — CPU pura quando não há trabalho útil — e nasce DESLIGADO (flag burn.on; hetzner-ballast.sh burn on).
+#   deixar de caber no rss_mb. hq-mutants (ga-2hd02v.5.6) varre MUTANTES dos *.selftest.sh do hq (hq-mutate.py, na jaula hq-sandbox-run.py, as duas do main): quebra um pouco do código que o selftest cobre e vê se o selftest
+#   reprova; o que sobrevive é teste que não protege aquela linha. Rodízio com estado em ~/gt-remote/ballast (a rodada acaba no prazo e a seguinte continua), só arquivo mudado volta a ser varrido; vem DEPOIS do wa-suite no
+#   arquivo (o governo começa os work na ordem daqui) e tem 4 núcleos FIXOS (cabe ao lado do wa-suite, 4 + 5 = 9, mas NÃO ao lado dos dois: ver CUSTO DE BLOQUEIO); roda 2 mutantes por núcleo (selftest de shell vive de fork e espera). queima é o último recurso — CPU pura quando não há trabalho útil — e nasce DESLIGADO (flag burn.on; hetzner-ballast.sh burn on).
 # NÚCLEOS E COOLDOWN (ga-r4lw72, 24/10, medido no nó): o hq-selftests tem 4 núcleos FIXOS porque o `auto` é decidido UMA vez, na partida: uma rodada que começou ao lado do wa-suite de 8 núcleos ficou com 1 núcleo por
 #   3 h e estourou o prazo (o trabalho dele soma ~12.555 s de selftest: 1 núcleo não cabe nos 10.800 s do prazo, 4 cabem com folga), e sozinho o `auto` levava o orçamento inteiro, então o wa-suite (cooldown vencido) não
 #   começava até ele acabar (18:47Z-20:06Z). 4 + 5 do wa-suite = 9 = o orçamento com 6 núcleos de sessões; com mais carga de sessões o segundo espera. Cooldown 180 s nos dois: depois de uma rodada COMPLETA o main já
 #   mudou (a rodada leva 44 a 80 min) e 600 s eram espera pura; o espelho do mini só atualiza a cada ~5 min, então perguntar com mais frequência não ganha nada. Falha espera no mínimo 600 s (BALLAST_FAIL_COOLDOWN_S).
+#   hq-mutants (ga-2hd02v.5.6.3): 4 núcleos FIXOS (o `auto` o faria disputar o orçamento com os outros dois; 4 cabem ao lado de um deles), cooldown 300 s (uma rodada sem novidade custa um pull e sai; só
+#   com código novo no main ele volta a varrer, e o main do espelho muda a cada ~5 min), prazo 3000 s com o motor limitado a 1800 s (HQ_MUTANTS_BUDGET_S): sobram 1200 s para o mutante que estava em voo (até 900 s + 30). CUSTO DE BLOQUEIO (lido do governo, não medido): work não é preemptado e 4 + 5 + 4 = 13 > 9,
+#   então com o hq-mutants rodando o hq-selftests ou o wa-suite que vencer o cooldown espera a rodada acabar (no máximo o prazo, 3000 s); rss_mb 3072 = ~76 MB medidos por slot (8 slots: queda de 610 MB em MemAvailable) + folga.
 # O QUE FALTA (cada um entra aqui quando o dono entregar um comando que roda sozinho no nó, só com código e dado público que já está lá): calibração do Traço BIM (wa-eqp0dy), backfill do estudo de
 #   viabilidade (wa-ekvjuo).
 #
@@ -24,3 +29,4 @@
 hq-selftests	work	4	4096	10800	180	exec:~/gt-remote/bin/hetzner-remote-git.sh	hq-selftests.sh
 queima	filler	auto	512	3600	0	flag:burn.on	queima.sh
 wa-suite	work	5	13312	21600	180	exec:~/gt-remote/bin/hetzner-remote-git.sh,exec:~/gt-remote/bin/gt-iso-run,exec:/usr/local/sbin/gt-netns-run,exec:~/gt-remote/venv-wa/bin/python,path:~/gt-remote/bin/gtn_stable_ids.py,noflag:wa-suite.leak	wa-suite.sh
+hq-mutants	work	4	3072	3000	300	exec:~/gt-remote/bin/hetzner-remote-git.sh	hq-mutants.sh

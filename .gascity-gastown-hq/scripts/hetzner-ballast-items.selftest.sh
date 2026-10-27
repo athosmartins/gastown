@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # hetzner-ballast-items.selftest.sh — hermético (ga-2hd02v.5): os itens do lastro (scripts/hetzner-ballast-items/*.sh) contra um espelho git de brinquedo (um repo bare com a árvore do hq
-# de mentira, o `hetzner-remote-git.sh` é um stub que usa `git worktree` de verdade) e selftests de brinquedo (passa, reprova, ambiente, estoura o prazo, só-macOS). Nada fala com o nó.
+# de mentira, o `hetzner-remote-git.sh` é um stub que usa `git worktree` de verdade) e selftests de brinquedo (passa, reprova, ambiente, estoura o prazo, só-macOS); o motor de mutantes e a jaula do
+# hq-mutants são de mentira (um hq-mutate.py de brinquedo que imprime o que o caso manda). Nada fala com o nó.
 #
 # Contents
-#   Casos · Variáveis
+#   Casos · Controle negativo · Variáveis
 #
 # CASOS
 #   hq-selftests (g_hq): uma rodada completa conta passou/reprovou/ambiente/prazo e deixa de fora a lista só-macOS · 1ª rodada = "primeira" (sem comparação) · mesma ponta do main = "sem-novidade"
@@ -15,11 +16,16 @@
 #   queima (g_burn): sobe BALLAST_CORES laços, avisa o resumo na partida e sai no TERM sem deixar filho · passado BALLAST_BURN_SECS termina SOZINHA com rc 0 (o `timeout` do prazo a mataria com 124 e o
 #     governo cobraria >= 600 s de cooldown de falha) · BALLAST_BURN_SECS inválido = exit 2 · o relógio (sleep) que falha dá rc 1, não 0 · o tempo padrão fica >= 60 s abaixo do prazo da linha `queima` do registro. Toda corrida de entrada inválida
 #     leva prazo (o queima agora dorme BALLAST_BURN_SECS: um que aceitasse a entrada ruim penduraria o teste).
+#   hq-mutants (g_mut): a rodada passa ao motor a árvore NOVA, o estado em $BALLAST_HOME (sobrevive entre rodadas), --slots (2 × núcleos; HQ_MUTANTS_SLOTS inválido volta ao padrão, acima de 16 corta em 16) e --budget-s ·
+#     o resumo é a ÚLTIMA linha JSON do motor COM `result` (não uma velha, nem lixo depois) mais main/pull/slots/budget_s/engine_rc, uma linha só · motor sem-novidade com rc 0 grava o marcador de ocioso e a mesma
+#     ponta (de menos de 6 h) não cria árvore nem chama o motor · marcador velho, ponta nova, motor que diz sem-novidade com rc 3, completo, sem-jaula (rc 97 passa adiante), rc estranho (vira 3), motor que morre sem
+#     resumo (motor-sem-resumo, rc 3, sem marcador) · sem motor/jaula na árvore, sem scripts/, sem origin/main, wt-add que falha = exit 3 · pull que falha segue · o passo do resumo que morre = resumo-falhou, exit 3 · TERM no
+#     meio espera o motor acabar ANTES de a árvore sair, e a árvore e a branch saem · o registro REAL: a linha hq-mutants (work, núcleos fixos que cabem ao lado do wa-suite, depois dele, prazo >= budget + 1000 s, RAM).
 # CONTROLE NEGATIVO: sem a rodada de reprovadas · ambiente/prazo contados como reprovados · lista só-macOS ignorada ou aceita vazia · comparação sem a rodada anterior · ponta não gravada · árvore
 #   não removida (nem no TERM) · pull/wt-add que falham ignorados · queima que não leva os laços no TERM · queima que espera o prazo (rc 124), sai com rc 1 no fim normal ou toma o relógio que falhou por fim normal · tempo padrão acima do prazo do registro ·
 #   BALLAST_BURN_SECS inválido aceito · falha do passo final vista como rc 0 · alvo de estado que é pasta sem a checagem prévia · passo do resumo que morre sem resumo · padrão só-macOS não aparado —
 #   cada um é aplicado numa cópia e a bateria TEM que falhar.
-# VARIÁVEIS: HBI_PY (python do teste; padrão /usr/bin/python3) · HBI_ONLY=<grupo> (hq burn) · HBI_NO_MUTANTS=1 · HBI_JOBS (mutantes em paralelo; padrão 4)
+# VARIÁVEIS: HBI_PY (python do teste; padrão /usr/bin/python3) · HBI_ONLY=<grupo> (hq mut burn) · HBI_NO_MUTANTS=1 · HBI_JOBS (mutantes em paralelo; padrão 4)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ITEMS="${HBI_ITEMS_DIR:-$HERE/hetzner-ballast-items}"
@@ -62,10 +68,10 @@ EOF
 chmod +x "$W/bin/timeout"
 cat > "$W/bin/python3" <<'EOF'
 #!/bin/sh
-# python3 de brinquedo: o real, salvo que COM o arquivo $HBI_PY_CRASH o passo do RESUMO final (o único cujo texto tem "res1, res2, prev_p") quebra — rc 1 e nada na saída, como um OOM ou um erro do interpretador
+# python3 de brinquedo: o real, salvo que COM o arquivo $HBI_PY_CRASH o passo do RESUMO final (o único cujo texto tem "res1, res2, prev_p", ou "erc, short, pull" no hq-mutants) quebra — rc 1 e nada na saída, como um OOM ou um erro do interpretador
 case "$1:$2" in
   -I:-) src=$(cat)
-        if [ -f "$HBI_PY_CRASH" ] && printf '%s' "$src" | grep -q 'res1, res2, prev_p'; then echo "python3 (brinquedo): quebrou" >&2; exit 1; fi
+        if [ -f "$HBI_PY_CRASH" ] && printf '%s' "$src" | grep -q -e 'res1, res2, prev_p' -e 'erc, short, pull'; then echo "python3 (brinquedo): quebrou" >&2; exit 1; fi
         printf '%s\n' "$src" | "$HBI_REAL_PY" "$@"; exit $? ;;
 esac
 exec "$HBI_REAL_PY" "$@"
@@ -239,9 +245,122 @@ g_burn() {
   check "burn: o tempo padrão ($dflt s) fica pelo menos 60 s abaixo do prazo da linha queima do registro ($prazo s)" "1" "$folga"
 }
 
-if [ -n "${HBI_MUTANT:-}" ]; then g_hq; g_burn; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
+# ── g_mut ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+addengine() {  # motor e jaula de MENTIRA no main de brinquedo (o que o motor imprime e com que rc vem de FAKE_MODE; cada chamada fica em $W/engine.log)
+  local s="$SRC/.gascity-gastown-hq/scripts"; mkdir -p "$s"; : > "$s/hq-sandbox-run.py"
+  cat > "$s/hq-mutate.py" <<'PYE'
+import json, os, signal, sys, time
+open(os.environ["FAKE_LOG"], "a").write(" ".join(sys.argv[1:]) + "\n")
+mode = os.environ.get("FAKE_MODE", "completo")
+def out(d, rc):
+    print(json.dumps(d), flush=True); sys.exit(rc)
+a = sys.argv[1:]
+if "--work" not in a or not os.path.isdir(a[a.index("--work") + 1]): out({"result": "work-ausente"}, 2)
+if mode == "completo":   # uma linha velha antes, o resumo, lixo JSON depois: vale o ÚLTIMO com `result`
+    print(json.dumps({"result": "stale"})); print(json.dumps({"result": "completo", "mutants_run": 3, "survivors": [{"id": "m1", "file": "scripts/a.sh", "line": 7}]})); out({"x": 1}, 0)
+if mode == "novidade": out({"result": "sem-novidade"}, 0)
+if mode == "sn3": out({"result": "sem-novidade"}, 3)
+if mode == "cob": out({"result": "sem-cobertura", "nao_sei": 1, "restam": 5, "perdidos": ["x"]}, 0)
+if mode == "jaula": out({"result": "sem-jaula"}, 97)
+if mode == "rc5": out({"result": "completo"}, 5)
+if mode == "lixo":
+    print("lixo"); print("boom", file=sys.stderr); sys.exit(1)
+if mode == "term":   # o TERM só chega aqui pelo trap do item; a árvore NÃO pode sair antes de este ENGINE-DONE
+    def h(*_):
+        time.sleep(1); open(os.environ["RG_CALLS"], "a").write("ENGINE-DONE\n"); out({"result": "interrompido"}, 143)
+    signal.signal(signal.SIGTERM, h); open(os.environ["FAKE_LOG"] + ".up", "w").close(); time.sleep(12); out({"result": "completo"}, 0)
+PYE
+  git -C "$SRC" add -A && git -C "$SRC" commit -q -m motor && git -C "$GR/gascity/repo.git" fetch -q "$SRC" "+HEAD:refs/remotes/origin/main"
+}
+newmut() { newrig; : > "$W/engine.log"; rm -f "$W/engine.log.up" "$W/py.crash"; addengine; }
+runmut() {  # runmut [VAR=valor…] → $OUT, $RC (BALLAST_CORES=2: o padrão é 4 slots)
+  RDN=$((${RDN:-0}+1)); RD="$T/rd$N.$RDN"; mkdir -p "$RD"
+  OUT=$(env PATH="$W/bin:$PATH" HOME="$T/home" BALLAST_HOME="$BH" BALLAST_RUN_DIR="$RD" BALLAST_CORES=2 BALLAST_REMOTE_GIT="$W/rg" GT_REMOTE_GIT="$GR" FAKE_LOG="$W/engine.log" RG_CALLS="$W/rg.calls" "$@" bash "$ITEMS/hq-mutants.sh" 2>"$W/err"); RC=$?
+}
+eng() { grep -c -F -- "$1" "$W/engine.log"; }   # quantas chamadas do motor levaram o trecho
+g_mut() {
+  local tip tr idle
+  newmut; runmut FAKE_MODE=completo; tip=$(git -C "$GR/gascity/repo.git" rev-parse refs/remotes/origin/main); tr="$GR/gascity/wt/ballast-hqm/.gascity-gastown-hq"; idle="$BH/hq-mutants.idle"
+  check "mut: rodada → rc 0, result completo (a ÚLTIMA linha JSON com result: nem a velha antes, nem o lixo depois)" "0 completo" "$RC $(sj result)"
+  check "mut: o resumo traz o sobrevivente do motor, o pull, slots (2 × núcleos), budget_s e engine_rc" "m1 ok 4 1800 0" "$(sj survivors.0.id) $(sj pull) $(sj slots) $(sj budget_s) $(sj engine_rc)"
+  check "mut: o resumo traz a ponta (9 letras) e é UMA linha BALLAST-SUMMARY só" "${tip:0:9} 1" "$(sj main) $(printf '%s\n' "$OUT" | grep -c '^BALLAST-SUMMARY: ')"
+  check "mut: o motor recebe a árvore NOVA (a do ballast-hqm) e a jaula DELA" "1 1" "$(eng "sweep --tree $tr ") $(eng "--jail $tr/scripts/hq-sandbox-run.py ")"
+  check "mut: o estado fica em \$BALLAST_HOME (o rodízio sobrevive entre rodadas; no run-dir recomeçaria do zero) e o --work no run-dir" "1 1" "$(eng "--state $BH/hq-mutants.state.json ") $(eng "--work $RD/work ")"
+  check "mut: --slots 4 (2 × os 2 núcleos) e --budget-s 1800 (o padrão)" "1 1" "$(eng "--slots 4 ") $(eng "--budget-s 1800")"
+  check "mut: ao fim a árvore sai (wt-rm), nenhuma branch worker/* sobra, e completo NÃO grava marcador de ocioso" "1 0 0" "$(grep -c '^wt-rm gascity ballast-hqm' "$W/rg.calls") $(git -C "$GR/gascity/repo.git" branch --list 'worker/*' | wc -l | tr -d ' ') $([ -e "$idle" ] && echo 1 || echo 0)"
+  : > "$W/engine.log"; runmut FAKE_MODE=completo HQ_MUTANTS_SLOTS=abc HQ_MUTANTS_BUDGET_S=xyz
+  check "mut: HQ_MUTANTS_SLOTS e HQ_MUTANTS_BUDGET_S que não são inteiros voltam ao padrão (4 slots, 1800 s)" "1 1" "$(eng "--slots 4 ") $(eng "--budget-s 1800")"
+  : > "$W/engine.log"; runmut FAKE_MODE=completo HQ_MUTANTS_SLOTS=99 HQ_MUTANTS_BUDGET_S=5
+  check "mut: slots acima de 16 cortam em 16; prazo abaixo de 60 s sobe a 60" "1 1" "$(eng "--slots 16 ") $(eng "--budget-s 60")"
+  : > "$W/engine.log"; runmut FAKE_MODE=completo HQ_MUTANTS_SLOTS=3 HQ_MUTANTS_BUDGET_S=90
+  check "mut: HQ_MUTANTS_SLOTS=3 e HQ_MUTANTS_BUDGET_S=90 valem" "1 1" "$(eng "--slots 3 ") $(eng "--budget-s 90")"
+
+  newmut; runmut FAKE_MODE=novidade; tip=$(git -C "$GR/gascity/repo.git" rev-parse refs/remotes/origin/main)
+  check "mut: motor sem-novidade (rc 0) → rc 0 e o marcador de ocioso guarda a ponta" "0 sem-novidade $tip" "$RC $(sj result) $(cat "$BH/hq-mutants.idle" 2>/dev/null)"
+  : > "$W/engine.log"; runmut FAKE_MODE=completo
+  check "mut: mesma ponta com o marcador de menos de 6 h → sem-novidade sem criar árvore e sem chamar o motor" "0 sem-novidade 1 0" "$RC $(sj result) $(grep -c '^wt-add' "$W/rg.calls") $(wc -l < "$W/engine.log" | tr -d ' ')"
+  touch -t 202001010000 "$BH/hq-mutants.idle"; runmut FAKE_MODE=completo
+  check "mut: marcador de ocioso de mais de 6 h (um alvo pulado por base-vermelha volta em 2 dias) → roda de novo" "completo 1" "$(sj result) $(wc -l < "$W/engine.log" | tr -d ' ')"
+  runmut FAKE_MODE=novidade; newcommit z.selftest.sh 0; : > "$W/engine.log"; runmut FAKE_MODE=completo
+  check "mut: ponta nova (commit no main) → roda de novo apesar do marcador" "completo 1" "$(sj result) $(wc -l < "$W/engine.log" | tr -d ' ')"
+  newmut; runmut FAKE_MODE=sn3
+  check "mut: motor que diz sem-novidade mas sai com rc 3 → exit 3 e SEM marcador (não houve rodada)" "3 sem-novidade 0" "$RC $(sj result) $([ -e "$BH/hq-mutants.idle" ] && echo 1 || echo 0)"
+  newmut; runmut FAKE_MODE=cob
+  check "mut: motor sem-cobertura (rc 0: nada examinado) → rc 0, nao_sei/restam/perdidos do motor passam e SEM marcador de ocioso (a seguinte tenta de novo)" "0 sem-cobertura 1 5 x 0" "$RC $(sj result) $(sj nao_sei) $(sj restam) $(sj perdidos.0) $([ -e "$BH/hq-mutants.idle" ] && echo 1 || echo 0)"
+  newmut; runmut FAKE_MODE=jaula
+  check "mut: motor sem-jaula (rc 97) → o 97 passa adiante, resumo sem-jaula, sem marcador" "97 sem-jaula 0" "$RC $(sj result) $([ -e "$BH/hq-mutants.idle" ] && echo 1 || echo 0)"
+  newmut; runmut FAKE_MODE=rc5
+  check "mut: rc que o motor não tem (5) → exit 3 e engine_rc 5 no resumo" "3 5" "$RC $(sj engine_rc)"
+  newmut; runmut FAKE_MODE=lixo
+  check "mut: motor que morre sem JSON → exit 3, motor-sem-resumo com a última linha do stderr, engine_rc 1, UMA linha de resumo" "3 motor-sem-resumo boom 1 1" "$RC $(sj result) $(sj stderr) $(sj engine_rc) $(printf '%s\n' "$OUT" | grep -c '^BALLAST-SUMMARY: ')"
+  newmut; : > "$W/py.crash"; runmut FAKE_MODE=completo; rm -f "$W/py.crash"
+  check "mut: o passo do resumo que quebra (python rc 1, sem saída) → exit 3 com resumo-falhou (uma linha), nunca rc 1 mudo" "3 resumo-falhou 0 1" "$RC $(sj result) $(sj engine_rc) $(printf '%s\n' "$OUT" | grep -c '^BALLAST-SUMMARY: ')"
+
+  newrig; : > "$W/engine.log"; runmut FAKE_MODE=completo
+  check "mut: o main sem o motor (ainda é o 5.6.2) → exit 3 sem-motor, motor não chamado, árvore removida" "3 sem-motor 0 1" "$RC $(sj result) $(wc -l < "$W/engine.log" | tr -d ' ') $(grep -c '^wt-rm gascity ballast-hqm' "$W/rg.calls")"
+  newmut; git -C "$SRC" rm -q .gascity-gastown-hq/scripts/hq-sandbox-run.py; git -C "$SRC" commit -q -m sem-jaula; git -C "$GR/gascity/repo.git" fetch -q "$SRC" "+HEAD:refs/remotes/origin/main"; runmut FAKE_MODE=completo
+  check "mut: o motor sem a jaula na árvore → exit 3 sem-motor (nunca roda mutante sem jaula)" "3 sem-motor 0" "$RC $(sj result) $(wc -l < "$W/engine.log" | tr -d ' ')"
+  newmut; git -C "$SRC" rm -rq .gascity-gastown-hq/scripts; git -C "$SRC" commit -q -m sem-scripts; git -C "$GR/gascity/repo.git" fetch -q "$SRC" "+HEAD:refs/remotes/origin/main"; runmut FAKE_MODE=completo
+  check "mut: árvore sem scripts/ → exit 3 arvore-sem-scripts" "3 arvore-sem-scripts" "$RC $(sj result)"
+  newmut; : > "$W/rg.pull.fail"; runmut FAKE_MODE=completo
+  check "mut: pull que falha segue com o clone que há e diz pull=falhou (rc 0)" "0 falhou completo" "$RC $(sj pull) $(sj result)"
+  newmut; git -C "$GR/gascity/repo.git" update-ref -d refs/remotes/origin/main; runmut FAKE_MODE=completo
+  check "mut: clone sem origin/main → exit 3 (sem-main), motor não chamado" "3 sem-main 0" "$RC $(sj result) $(wc -l < "$W/engine.log" | tr -d ' ')"
+  newmut; : > "$W/rg.wtadd.fail"; runmut FAKE_MODE=completo
+  check "mut: wt-add que falha → exit 3 wt-add-falhou, motor não chamado" "3 wt-add-falhou 0" "$RC $(sj result) $(wc -l < "$W/engine.log" | tr -d ' ')"
+  # sobra de rodada morta com SIGKILL (árvore + branch na ponta velha): a seguinte testa a ponta NOVA
+  newmut; old=$(git -C "$GR/gascity/repo.git" rev-parse refs/remotes/origin/main); git -C "$GR/gascity/repo.git" worktree add -q -b worker/ballast-hqm "$GR/gascity/wt/ballast-hqm" "$old"
+  newcommit y.selftest.sh 0; runmut FAKE_MODE=completo; tip=$(git -C "$GR/gascity/repo.git" rev-parse refs/remotes/origin/main)
+  check "mut: sobra de rodada morta (árvore + branch na ponta velha) → a rodada seguinte testa a ponta NOVA e nenhuma branch sobra" "0 ${tip:0:9} 0" "$RC $(sj main) $(git -C "$GR/gascity/repo.git" branch --list 'worker/*' | wc -l | tr -d ' ')"
+
+  newmut; RDN=$((RDN+1)); RD="$T/rd$N.k"; mkdir -p "$RD"
+  PATH="$W/bin:$PATH" HOME="$T/home" BALLAST_HOME="$BH" BALLAST_RUN_DIR="$RD" BALLAST_CORES=2 BALLAST_REMOTE_GIT="$W/rg" GT_REMOTE_GIT="$GR" FAKE_LOG="$W/engine.log" RG_CALLS="$W/rg.calls" FAKE_MODE=term bash "$ITEMS/hq-mutants.sh" > "$W/killm.out" 2>&1 & kp=$!   # sem subshell: $kp é o próprio item
+  i=0; while [ "$i" -lt 100 ] && [ ! -e "$W/engine.log.up" ]; do sleep 0.2; i=$((i+1)); done
+  kill -TERM "$kp" 2>/dev/null; wait "$kp" 2>/dev/null; krc=$?
+  i=0; while [ "$i" -lt 100 ] && ! grep -q '^wt-rm gascity ballast-hqm' "$W/rg.calls"; do sleep 0.2; i=$((i+1)); done
+  check "mut: TERM no meio → exit 143 e o marcador de ocioso não é gravado" "143 0" "$krc $([ -e "$BH/hq-mutants.idle" ] && echo 1 || echo 0)"
+  check "mut: TERM no meio → a árvore e a branch saem DEPOIS de o motor acabar de parar (ENGINE-DONE antes do wt-rm: com a árvore fora, mutante em voo perderia a cópia)" "1 1 0" "$([ "$(grep -n '^ENGINE-DONE' "$W/rg.calls" | cut -d: -f1 | head -n 1)" -lt "$(grep -n '^wt-rm gascity ballast-hqm' "$W/rg.calls" | cut -d: -f1 | head -n 1)" ] 2>/dev/null && echo 1 || echo 0) $(grep -c '^wt-rm gascity ballast-hqm' "$W/rg.calls") $(git -C "$GR/gascity/repo.git" branch --list 'worker/*' | wc -l | tr -d ' ')"
+
+  # o registro REAL (hetzner-ballast.items.txt do repo): a linha hq-mutants
+  local R="$HERE/hetzner-ballast.items.txt" cmd rss cores prazo cdn dflt folga ln_w ln_m
+  rf() { awk -F'\t' -v n="$1" -v c="$2" '$1 == n && NF == 8 { print $c }' "$R" 2>/dev/null; }   # campo c da linha n (8 colunas); vazio se a linha falta
+  cores=$(rf hq-mutants 3); rss=$(rf hq-mutants 4); prazo=$(rf hq-mutants 5); cdn=$(rf hq-mutants 6); cmd=$(rf hq-mutants 8)
+  case "$cores$rss$prazo$cdn" in ''|*[!0-9]*) cores=0 ;; esac
+  check "mut: a linha hq-mutants do registro é papel work, de 8 colunas, com núcleos FIXOS (inteiro >= 2: o auto levaria o orçamento inteiro) e o comando $cmd executável na pasta de itens" "work 1 1" "$(rf hq-mutants 2) $([ "$cores" -ge 2 ] && echo 1 || echo 0) $([ -n "$cmd" ] && [ -x "$ITEMS/$cmd" ] && echo 1 || echo 0)"
+  check "mut: exige o hetzner-remote-git.sh (sem ele o item nem pull faz)" "1" "$(rf hq-mutants 7 | tr ',' '\n' | grep -c -x -F 'exec:~/gt-remote/bin/hetzner-remote-git.sh')"
+  dflt=$(grep -o 'HQ_MUTANTS_BUDGET_S:-[0-9]*' "$ITEMS/hq-mutants.sh" 2>/dev/null | head -n 1 | grep -o '[0-9]*$')
+  case "$dflt$prazo" in ''|*[!0-9]*) folga=0 ;; *) [ -n "$dflt" ] && [ "$((dflt + 1000))" -le "$prazo" ] && folga=1 || folga=0 ;; esac
+  check "mut: o prazo do registro ($prazo s) passa o tempo do motor ($dflt s) em >= 1000 s (um mutante em voo leva até 930 s, e o prazo mata com rc 124)" "1" "$folga"
+  check "mut: espera de 120 a 600 s depois de uma rodada (cada pergunta é um pull ao espelho, que só atualiza a cada ~5 min)" "1" "$([ "$cdn" -ge 120 ] 2>/dev/null && [ "$cdn" -le 600 ] && echo 1 || echo 0)"
+  check "mut: $(rf wa-suite 3) núcleos do wa-suite + $cores do hq-mutants cabem no orçamento de 9 (16 - 6 de sessões - 1 de reserva): ao lado do wa-suite, que é o que roda quase sempre" "1" "$([ "$cores" -ge 1 ] && [ $(( $(rf wa-suite 3) + cores )) -le 9 ] 2>/dev/null && echo 1 || echo 0)"
+  check "mut: rss_mb ($rss) cobre 2 slots por núcleo × 150 MB (o dobro dos ~76 MB medidos por slot) + 512 de base" "1" "$([ "$rss" -ge $((cores * 2 * 150 + 512)) ] 2>/dev/null && echo 1 || echo 0)"
+  ln_w=$(grep -n '^wa-suite	' "$R" | cut -d: -f1); ln_m=$(grep -n '^hq-mutants	' "$R" | cut -d: -f1)
+  check "mut: a linha hq-mutants vem DEPOIS do wa-suite (o governo começa os work na ordem do arquivo: com os dois prontos o wa-suite não pode ficar de fora)" "1" "$([ -n "$ln_w" ] && [ -n "$ln_m" ] && [ "$ln_m" -gt "$ln_w" ] && echo 1 || echo 0)"
+}
+
+if [ -n "${HBI_MUTANT:-}" ]; then for g in ${HBI_MUTANT_G:-hq burn mut}; do "g_$g"; done; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
 if [ -n "${HBI_ONLY:-}" ]; then "g_$HBI_ONLY"; echo "── $((n - fails))/$n ok (só g_$HBI_ONLY)"; [ "$fails" = 0 ]; exit $?; fi
-g_hq; g_burn
+g_hq; g_burn; g_mut
 
 [ -n "${HBI_NO_MUTANTS:-}" ] || {
   echo "── controle negativo: cada mutante tem que reprovar a bateria ──"
@@ -275,6 +394,44 @@ hq-selftests.sh@@falha do passo final (resumo e gravação do estado) vira rc 0@
 hq-selftests.sh@@alvo de estado que é pasta só falha na troca, DEPOIS do resumo (sem a checagem antes)@@    if os.path.isdir(path):@@    if False:
 hq-selftests.sh@@o passo do resumo que morre sem imprimir não deixa resumo nenhum@@summary resumo-falhou main="${tested:0:9}" pull="$pull" python_rc="$prc"@@:
 hq-selftests.sh@@a lista só-macOS não é aparada nas pontas@@pat=${pat#"${pat%%[![:space:]]*}"}; pat=${pat%"${pat##*[![:space:]]}"}@@:
+hq-mutants.sh@@o marcador de ocioso nunca é reconhecido@@if [ "$main" = "$(cat "$IDLE" 2> /dev/null)" ] &&@@if false &&
+hq-mutants.sh@@o marcador de ocioso vale para sempre (sem o prazo de 6 h)@@ && [ -n "$(find "$IDLE" -mmin -360 2> /dev/null)" ]; then@@; then
+hq-mutants.sh@@o marcador é gravado em qualquer resultado@@if rec["result"] == "sem-novidade" and erc == 0:@@if True:
+hq-mutants.sh@@o marcador é gravado com o motor em rc != 0@@if rec["result"] == "sem-novidade" and erc == 0:@@if rec["result"] == "sem-novidade":
+hq-mutants.sh@@o marcador guarda outra coisa que a ponta@@f.write(full + "\n")@@f.write("x\n")
+hq-mutants.sh@@o rc do motor vira 0@@rc = erc if erc in (0, 97, 143) else 3@@rc = 0
+hq-mutants.sh@@rc que o motor não tem passa adiante@@rc = erc if erc in (0, 97, 143) else 3@@rc = erc
+hq-mutants.sh@@o 97 do motor vira 3@@(0, 97, 143)@@(0, 143)
+hq-mutants.sh@@motor sem resumo sai com rc 0@@"stderr": tail}
+    rc = 3@@"stderr": tail}
+    rc = 0
+hq-mutants.sh@@vale a PRIMEIRA linha JSON do motor, não a última@@for line in reversed(@@for line in (
+hq-mutants.sh@@linha JSON sem result é aceita como resumo@@if isinstance(v, dict) and "result" in v:@@if True:
+hq-mutants.sh@@a árvore de trabalho nunca é removida@@cleanup() { [ -z "$bead" ] || { "$RG" wt-rm "$RIG" "$bead" > /dev/null 2>&1; branch_rm; }; }@@cleanup() { :; }
+hq-mutants.sh@@a branch worker/* não sai no fim da rodada@@"$RG" wt-rm "$RIG" "$bead" > /dev/null 2>&1; branch_rm; }; }@@"$RG" wt-rm "$RIG" "$bead" > /dev/null 2>&1; }; }
+hq-mutants.sh@@a branch velha não sai antes do wt-add (a rodada testaria a ponta de outro dia)@@branch_rm
+if ! timeout 900 "$RG" wt-add@@if ! timeout 900 "$RG" wt-add
+hq-mutants.sh@@wt-add que falha segue em frente@@if ! timeout 900 "$RG" wt-add "$RIG" "$bead" main > "$RD/wt-add.out" 2>&1; then@@if false; then
+hq-mutants.sh@@clone sem origin/main segue em frente@@[ -n "$main" ] || { say "o clone não tem origin/main"; summary sem-main pull=$pull; exit 3; }@@main=${main:-0000000000}
+hq-mutants.sh@@pull que falha é dado como ok@@2>&1 || pull=falhou@@2>&1 || pull=ok
+hq-mutants.sh@@árvore sem o motor ou a jaula segue em frente@@[ -f "$ENG" ] && [ -f "$JAIL" ] || {@@true || {
+hq-mutants.sh@@árvore sem scripts/ segue em frente@@[ -d "$TREE/scripts" ] || {@@true || {
+hq-mutants.sh@@o TERM não espera o motor acabar (a árvore sai de baixo dos mutantes em voo)@@kill -TERM "$ep" 2>/dev/null; wait "$ep" 2>/dev/null; }; exit 143'@@kill -TERM "$ep" 2>/dev/null; }; exit 143'
+hq-mutants.sh@@o TERM não chega ao motor@@{ kill -TERM "$ep" 2>/dev/null; wait "$ep"@@{ wait "$ep"
+hq-mutants.sh@@o item não espera o motor@@wait "$ep"; erc=$?; ep=""@@erc=0; ep=""
+hq-mutants.sh@@--slots fixo em 1@@--slots "$SLOTS"@@--slots 1
+hq-mutants.sh@@--budget-s fixo@@--budget-s "$BUDGET"@@--budget-s 99
+hq-mutants.sh@@1 slot por núcleo em vez de 2@@SLOTS=${HQ_MUTANTS_SLOTS:-$((CORES * 2))}@@SLOTS=${HQ_MUTANTS_SLOTS:-$((CORES))}
+hq-mutants.sh@@HQ_MUTANTS_SLOTS inválido é aceito@@case "$SLOTS" in ''|*[!0-9]*|0) SLOTS=$((CORES * 2)) ;; esac@@case "$SLOTS" in 'zz') SLOTS=$((CORES * 2)) ;; esac
+hq-mutants.sh@@o teto de 16 slots some@@[ "$SLOTS" -le 16 ] || SLOTS=16@@:
+hq-mutants.sh@@HQ_MUTANTS_BUDGET_S inválido é aceito@@case "$BUDGET" in ''|*[!0-9]*) BUDGET=1800 ;; esac@@case "$BUDGET" in 'zz') BUDGET=1800 ;; esac
+hq-mutants.sh@@o piso de 60 s do prazo some@@[ "$BUDGET" -ge 60 ] || BUDGET=60@@:
+hq-mutants.sh@@o estado vai para o run-dir (o rodízio recomeçaria do zero a cada rodada)@@STATE="$BH/hq-mutants.state.json"@@STATE="$RD/hq-mutants.state.json"
+hq-mutants.sh@@o tempo do motor passa do prazo do registro (volta o rc 124)@@HQ_MUTANTS_BUDGET_S:-1800@@HQ_MUTANTS_BUDGET_S:-3000
+hq-mutants.sh@@o passo do resumo que morre não deixa resumo nenhum@@if [ "$prc" -eq 1 ]; then summary resumo-falhou@@if false; then summary resumo-falhou
+hq-mutants.sh@@o rc do passo do resumo é perdido (sai sempre 0)@@exit "$prc"@@exit 0
+hq-mutants.sh@@a pasta de trabalho do motor não é criada@@mkdir -p "$RD/work" || {@@: || {
+hq-mutants.sh@@o resumo traz a ponta inteira em vez das 9 letras@@rec.update(main=short,@@rec.update(main=full,
 MUT
   "$PY" -I - "$ITEMS" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import os, re, shutil, sys
@@ -300,16 +457,17 @@ for i, e in enumerate(entries, 1):
     d = "%s/mi%d" % (tmp, i)
     shutil.copytree(items, d)
     open(os.path.join(d, fn), "w", encoding="utf-8").write(src.replace(a, b))
-    print("%d\tOK\t%s" % (i, desc))
+    print("%d\tOK\t%s\t%s" % (i, desc, fn))
 PYEOF
   JOBS=${HBI_JOBS:-4}
-  while IFS="$(printf '\t')" read -r idx st desc; do
+  while IFS="$(printf '\t')" read -r idx st desc fn; do
     if [ "$st" != OK ]; then ok 1 "mutante '$desc': a âncora não casa exatamente 1 vez (o script mudou?)"; continue; fi
     while [ "$(jobs -r | wc -l | tr -d ' ')" -ge "$JOBS" ]; do sleep 0.3; done
-    ( HBI_MUTANT=1 HBI_ITEMS_DIR="$T/mi$idx" bash "$0" 2>&1 | tail -1 > "$T/mres.$idx" ) &
+    case "$fn" in hq-mutants.sh) g=mut ;; queima.sh) g=burn ;; *) g=hq ;; esac   # só o grupo do arquivo mudado
+    ( HBI_MUTANT=1 HBI_MUTANT_G=$g HBI_ITEMS_DIR="$T/mi$idx" bash "$0" 2>&1 | tail -1 > "$T/mres.$idx" ) &
   done < "$T/mutants.idx"
   wait
-  while IFS="$(printf '\t')" read -r idx st desc; do
+  while IFS="$(printf '\t')" read -r idx st desc fn; do
     [ "$st" = OK ] || continue
     r=$(cat "$T/mres.$idx" 2>/dev/null)
     case "$r" in "RESULT 0/"*) ok 1 "mutante '$desc' NÃO foi pego ($r)";; "RESULT "*) ok 0 "mutante '$desc' pego ($r)";; *) ok 1 "mutante '$desc': sem resultado ($r)";; esac
