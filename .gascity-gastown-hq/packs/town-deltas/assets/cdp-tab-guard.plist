@@ -24,6 +24,16 @@
        ("SKIP locked"). Every knob is an env var (CDP_TAB_GUARD_*, listed in the script header);
        none is set here, so the defaults apply: armed, 1536 MB ceiling, 10 min idle.
 
+       EXTENSION RENDERERS (ga-1wvxej0): a renderer launched with --extension-process whose
+       FOOTPRINT stays >= 1536 MB for >= 120 s is recycled on its own (SIGTERM to that one pid,
+       SIGKILL 5 s later if it is still there; at most 2 per hour), instead of waiting for
+       chrome_cdp_watchdog.sh to recycle the WHOLE Chrome at 4096 MB after 900 s. Chrome respawns
+       an extension process on demand and the renderer holds no web tab (an extension page open as a
+       tab, or a side panel, would show as crashed until reloaded). Before the signal the guard logs
+       EXT_ATTRIB (V8 heap per extension, by manifest name) so the leaking extension gets named.
+       Dry run for just this part: CDP_TAB_GUARD_EXT_RECYCLE=0 (anything but 1). The DISABLED file
+       below covers it too.
+
        KILL SWITCH (stops closing without unloading the job; it keeps logging WOULD_CLOSE):
            touch /Users/athos/gt/.gascity-gastown-hq/.gc/cdp-tab-guard/DISABLED
        Log:    .gc/logs/cdp-tab-guard.log     Heartbeat for watchers: .gc/cdp-tab-guard/status.json

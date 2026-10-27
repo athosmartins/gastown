@@ -311,13 +311,13 @@ class LoadStateTests(unittest.TestCase):
         return G.load_state(self.cfg, self.logged.append)
 
     def test_missing_file_is_an_empty_normalized_state(self):
-        self.assertEqual(self._load(), {"pids": {}, "closes": [], "last_heartbeat": 0})
+        self.assertEqual(self._load(), {"pids": {}, "closes": [], "last_heartbeat": 0, "ext": {}, "ext_recycles": []})
 
     def test_wrong_shapes_are_replaced_not_propagated(self):
         """Catches: valid JSON of the wrong shape raising in every run. The crash comes before the
         state is rewritten, so it would never heal."""
         st = self._load('{"pids": [], "closes": "x", "last_heartbeat": "y"}')
-        self.assertEqual(st, {"pids": {}, "closes": [], "last_heartbeat": 0})
+        self.assertEqual(st, {"pids": {}, "closes": [], "last_heartbeat": 0, "ext": {}, "ext_recycles": []})
         self.assertTrue(any("STATE" in line for line in self.logged), "repair must be visible: %r" % self.logged)
 
     def test_well_typed_parts_survive_and_junk_parts_are_dropped(self):
@@ -325,7 +325,25 @@ class LoadStateTests(unittest.TestCase):
         how long every tab has been idle)."""
         st = self._load('{"pids": {"5": {"start": 1}, "6": "junk"}, "closes": [1.5, "x", true, 2],'
                         ' "last_heartbeat": 7}')
-        self.assertEqual(st, {"pids": {"5": {"start": 1}}, "closes": [1.5, 2], "last_heartbeat": 7})
+        self.assertEqual(st, {"pids": {"5": {"start": 1}}, "closes": [1.5, 2], "last_heartbeat": 7,
+                              "ext": {}, "ext_recycles": []})
+
+    def test_extension_history_survives_a_round_trip_and_junk_in_it_is_dropped(self):
+        """Catches: load_state forgetting the extension-renderer history on every run (the guard would see
+        every heavy extension renderer as 'first sight' forever and never reach the grace), or trusting
+        a hand-edited entry of the wrong type."""
+        st = self._load('{"pids": {}, "closes": [], "last_heartbeat": 0, "ext": {"7": {"start": 3, "over_since": 9},'
+                        ' "8": "junk"}, "ext_recycles": [5, "x", true, 6.5]}')
+        self.assertEqual(st["ext"], {"7": {"start": 3, "over_since": 9}})
+        self.assertEqual(st["ext_recycles"], [5, 6.5])
+
+    def test_a_state_written_before_the_extension_keys_existed_is_not_reported_as_damage(self):
+        """Catches: a STATE-had-an-unexpected-shape warning on every first run after the deploy, which
+        would teach the reader to ignore that line."""
+        st = self._load('{"pids": {"5": {"start": 1}}, "closes": [1.5], "last_heartbeat": 7}')
+        self.assertEqual(st["ext"], {})
+        self.assertEqual(st["ext_recycles"], [])
+        self.assertEqual(self.logged, [])
 
 
 class BusyRenderersTests(unittest.TestCase):
@@ -536,6 +554,502 @@ class DecideTests(unittest.TestCase):
                            closes_last_hour=7)
         got = [(d["target"], d["action"], d.get("reason")) for d in out]
         self.assertEqual(got, [("P1", "CLOSE", "HEAVY_IDLE"), ("P3", "SKIP", "CAP_HOUR")])
+
+
+# ─────────────── extension-renderer recycle (ga-1wvxej0) ───────────────
+
+PS_EXT_FIXTURE = "\n".join([
+    _ps_line(100, 1, _MAIN + " --remote-debugging-port=9222 --user-data-dir=/Users/x/.chrome-cdp --no-first-run about:blank"),
+    _ps_line(101, 100, _RENDERER + " --type=renderer --extension-process --renderer-client-id=5"),
+    _ps_line(102, 100, _RENDERER + " --type=renderer --renderer-client-id=6"),                       # a tab's renderer
+    _ps_line(103, 100, _GPU + " --type=gpu-process"),
+    _ps_line(104, 100, _RENDERER + " --type=renderer --extension-process-foo"),                      # near-miss token
+    _ps_line(105, 100, _GPU + " --type=utility --extension-process"),                                # not a renderer
+    _ps_line(106, 101, _RENDERER + " --type=renderer --extension-process"),                          # grandchild
+    _ps_line(200, 1, _MAIN + " --remote-debugging-port=9333 --user-data-dir=/tmp/other about:blank"),
+    _ps_line(201, 200, _RENDERER + " --type=renderer --extension-process"),                          # other family
+    _ps_line(107, 100, _RENDERER + " --type=renderer --lang=en --extension-process --foo=bar"),      # flag not first
+])
+
+
+class ParseExtensionRenderersTests(unittest.TestCase):
+    def test_only_direct_renderer_children_with_the_exact_flag(self):
+        """Catches: signalling a tab's renderer (loses a logged-in session), a GPU/utility helper, another
+        Chrome's renderer, a grandchild, or a flag that merely starts with --extension-process."""
+        self.assertEqual(sorted(G.parse_extension_renderers(PS_EXT_FIXTURE, 100)), [101, 107])
+        self.assertEqual(G.parse_extension_renderers(PS_EXT_FIXTURE, 200), [201])
+        self.assertEqual(G.parse_extension_renderers(PS_EXT_FIXTURE, 999), [])
+        self.assertEqual(G.parse_extension_renderers("", 100), [])
+
+    def test_user_data_dir_of_the_main_process(self):
+        self.assertEqual(G.main_user_data_dir(PS_EXT_FIXTURE, 100), "/Users/x/.chrome-cdp")
+        self.assertIsNone(G.main_user_data_dir(PS_EXT_FIXTURE, 101))      # a renderer has none
+        self.assertIsNone(G.main_user_data_dir(PS_EXT_FIXTURE, 999))
+
+
+class StepExtTests(unittest.TestCase):
+    def setUp(self):
+        self.cfg = env_cfg(ext_ceiling_mb=1000, ext_grace_sec=120, max_gap_sec=300)
+
+    @staticmethod
+    def _s(fp, start=11):
+        return {"footprint_mb": fp, "cpu_ms": 0.0, "start": start}
+
+    def test_under_the_ceiling_is_never_over(self):
+        e, over = G.step_ext(None, self._s(999.0), 1000.0, self.cfg)
+        self.assertEqual(over, 0)
+        self.assertIsNone(e["over_since"])
+
+    def test_first_sight_over_the_ceiling_is_not_recyclable(self):
+        """Catches: recycling on the first reading (a transient spike would cost the extension a restart)."""
+        e, over = G.step_ext(None, self._s(1200.0), 1000.0, self.cfg)
+        self.assertEqual(over, 0)
+        self.assertEqual(e["over_since"], 1000.0)
+
+    def test_time_over_accumulates_across_runs(self):
+        e, _ = G.step_ext(None, self._s(1200.0), 1000.0, self.cfg)
+        e, over = G.step_ext(e, self._s(1300.0), 1060.0, self.cfg)
+        self.assertEqual(over, 60)
+        e, over = G.step_ext(e, self._s(1400.0), 1125.0, self.cfg)
+        self.assertEqual(over, 125)
+
+    def test_dropping_under_the_ceiling_restarts_the_clock(self):
+        """Catches: a renderer that came back down still carrying its old 'over since'."""
+        e, _ = G.step_ext(None, self._s(1200.0), 1000.0, self.cfg)
+        e, over = G.step_ext(e, self._s(300.0), 1060.0, self.cfg)
+        self.assertEqual(over, 0)
+        e, over = G.step_ext(e, self._s(1200.0), 1120.0, self.cfg)
+        self.assertEqual(over, 0)                   # restarted, not 120
+        self.assertEqual(e["over_since"], 1120.0)
+
+    def test_history_that_cannot_be_trusted_counts_as_first_sight(self):
+        """Catches: a recycled pid number, a long unobserved gap, a clock that went backwards, or a
+        malformed entry being read as time spent over the ceiling."""
+        good = {"start": 11, "over_since": 1000.0, "last_ts": 1060.0}
+        cases = {
+            "other process behind the pid": (dict(good, start=12), 1120.0),
+            "gap longer than max_gap_sec": (good, 1060.0 + 301.0),
+            "clock went backwards": (good, 1050.0),
+            "over_since in the future": (dict(good, over_since=5000.0), 1120.0),
+            "over_since not a number": (dict(good, over_since="x"), 1120.0),
+            "last_ts missing": ({"start": 11, "over_since": 1000.0}, 1120.0),
+            "bool timestamps": (dict(good, over_since=True, last_ts=True), 1120.0),
+            "not a dict": ("junk", 1120.0),
+            "none": (None, 1120.0),
+        }
+        for name, (entry, now) in cases.items():
+            with self.subTest(name):
+                e, over = G.step_ext(entry, self._s(1200.0), now, self.cfg)
+                self.assertEqual(over, 0)
+                self.assertEqual(e["over_since"], now)
+        e, over = G.step_ext(good, self._s(1200.0), 1120.0, self.cfg)         # positive control
+        self.assertEqual(over, 120)
+
+
+class ExtDecideTests(unittest.TestCase):
+    def test_table(self):
+        """Catches: recycling before the grace, no cap on a renderer that re-bloats after every recycle,
+        and the cap hiding a renderer that has not yet earned a recycle."""
+        cfg = env_cfg(ext_grace_sec=120, ext_max_recycle_hour=2)
+        table = [(0, 0, "WAIT"), (-5, 0, "WAIT"), (119, 0, "WAIT"), (120, 0, "RECYCLE"), (500, 1, "RECYCLE"),
+                 (500, 2, "CAPPED"), (120, 3, "CAPPED"), (119, 5, "WAIT")]
+        for over, recent, want in table:
+            with self.subTest(over=over, recent=recent):
+                self.assertEqual(G.ext_decide(over, recent, cfg), want)
+
+
+class ExtConfigTests(unittest.TestCase):
+    def test_defaults(self):
+        c = env_cfg()
+        self.assertEqual((c.ext_ceiling_mb, c.ext_grace_sec, c.ext_max_recycle_hour, c.ext_recycle),
+                         (1536.0, 120, 2, 1))
+
+    def test_garbage_falls_back_to_the_default_and_never_to_zero(self):
+        """Catches: a typo lowering the ceiling or the grace to 0 (recycle everything at once)."""
+        for k, bad in (("ext_ceiling_mb", "abc"), ("ext_ceiling_mb", "0"), ("ext_ceiling_mb", "-5"),
+                       ("ext_ceiling_mb", "nan"), ("ext_grace_sec", "0"), ("ext_grace_sec", "x"),
+                       ("ext_grace_sec", "-1"), ("ext_max_recycle_hour", "-1"), ("ext_max_recycle_hour", "x")):
+            with self.subTest(k=k, bad=bad):
+                c = env_cfg(**{k: bad})
+                self.assertEqual((c.ext_ceiling_mb, c.ext_grace_sec, c.ext_max_recycle_hour), (1536.0, 120, 2))
+
+    def test_only_an_explicit_1_arms_the_recycle(self):
+        """Catches: 'off'/'yes'/'' leaving a disarm attempt live (same rule as ACTION)."""
+        self.assertEqual(env_cfg(ext_recycle=1).ext_recycle, 1)
+        self.assertEqual(env_cfg(ext_recycle=" 1 ").ext_recycle, 1)
+        for v in ("0", "off", "yes", "", "true", "2"):
+            with self.subTest(v=v):
+                self.assertEqual(env_cfg(ext_recycle=v).ext_recycle, 0)
+
+
+class RecycleExtensionRendererTests(unittest.TestCase):
+    """recycle_extension_renderer with the process table, the clock and the signals faked."""
+
+    PID, START = 501, 77
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="cdp-tab-guard-extrecycle-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.cfg = env_cfg(state_dir=self.dir, ext_ceiling_mb=1000)
+        self.cand = {"pid": self.PID, "fp_mb": 1800.0, "over_for_s": 130, "start": self.START}
+        self.state = {"ext_recycles": []}
+        self.lines, self.signals = [], []
+        self.alive = True
+        self.identity = [True]          # popped per call; the last value repeats
+        self.start_now = self.START
+
+    def _log(self, msg):
+        self.lines.append(msg)
+        return True
+
+    def _ident(self, pid, main_pid):
+        return self.identity.pop(0) if len(self.identity) > 1 else self.identity[0]
+
+    def _sig(self, pid, sig):
+        self.signals.append((pid, sig))
+        if sig == signal.SIGTERM and self.dies_on_term:
+            self.alive = False
+        if sig == signal.SIGKILL:
+            self.alive = False
+
+    dies_on_term = True
+
+    def run_recycle(self, live=True, heap=None, log=None, now=5000.0, term_wait=0.5, kill_wait=0.5):
+        heap = heap if heap is not None else [("a" * 32, "Claude", 900.0, 2)]
+        proc = (lambda pid: {"footprint_mb": 1800.0, "cpu_ms": 0.0, "start": self.start_now}) \
+            if self.start_now is not None else (lambda pid: None)
+        heap_fn = heap if callable(heap) else (lambda port, udd: heap)
+        with mock.patch.object(G, "_ext_identity", side_effect=self._ident), \
+                mock.patch.object(G, "read_proc", side_effect=proc), \
+                mock.patch.object(G, "_send_signal", side_effect=self._sig), \
+                mock.patch.object(G, "_pid_alive", side_effect=lambda pid: self.alive), \
+                mock.patch.object(G, "ext_heap_by_extension", side_effect=heap_fn), \
+                mock.patch.object(G, "EXT_TERM_WAIT_S", term_wait), \
+                mock.patch.object(G, "EXT_KILL_WAIT_S", kill_wait):
+            return G.recycle_extension_renderer(self.cfg, self.state, self.cand, 100, "/Users/x/.chrome-cdp",
+                                                now, live, log or self._log)
+
+    def text(self):
+        return "\n".join(self.lines)
+
+    def test_positive_control_one_sigterm_logged_before_and_counted(self):
+        """Catches: no signal at all, SIGKILL as the first move, a signal without the durable RECYCLING_EXT
+        line before it, and an attempt that is not counted (the hourly cap would never see it)."""
+        self.assertTrue(self.run_recycle())
+        self.assertEqual(self.signals, [(self.PID, signal.SIGTERM)])
+        t = self.text()
+        self.assertLess(t.index("EXT_ATTRIB"), t.index("RECYCLING_EXT"))
+        self.assertLess(t.index("RECYCLING_EXT"), t.index("RECYCLED_EXT"))
+        self.assertIn("sigkill=False", t)
+        self.assertEqual(self.state["ext_recycles"], [5000.0])
+        on_disk = json.loads(pathlib.Path(self.cfg.state_path).read_text())
+        self.assertEqual(on_disk["ext_recycles"], [5000.0], "the attempt must be on disk before the wait")
+
+    def test_attribution_names_the_extension_and_its_heap(self):
+        self.run_recycle(heap=[("b" * 32, "Loom", None, 1), ("a" * 32, "Claude", 900.0, 2)])
+        self.assertIn("%s (Claude) heap=900MB targets=2" % ("a" * 32), self.text())
+        self.assertIn("%s (Loom) heap=? targets=1" % ("b" * 32), self.text())
+
+    def test_dry_run_signals_nothing_but_still_leaves_the_evidence(self):
+        """Catches: WOULD_RECYCLE_EXT that signals anyway, and a dry run that throws the attribution away."""
+        self.assertFalse(self.run_recycle(live=False))
+        self.assertEqual(self.signals, [])
+        self.assertIn("WOULD_RECYCLE_EXT", self.text())
+        self.assertIn("EXT_ATTRIB", self.text())
+        self.assertNotIn("RECYCLING_EXT", self.text())
+        self.assertEqual(self.state["ext_recycles"], [])
+
+    def test_something_else_behind_the_pid_is_never_signalled(self):
+        """Catches: pid reuse (a tab's renderer or any process now owns the number), a ps that failed
+        (None), and a process that cannot be read: unknown is never a reason to signal."""
+        for name, ident, start in (("other start time", [True], 78), ("not an extension renderer", [False], 77),
+                                   ("ps could not tell", [None], 77), ("unreadable", [True], None)):
+            with self.subTest(name):
+                self.lines.clear(), self.signals.clear()
+                self.identity, self.start_now = list(ident), start
+                self.assertFalse(self.run_recycle())
+                self.assertEqual(self.signals, [])
+                self.assertIn("SKIP EXT_CHANGED", self.text())
+
+    def test_a_change_during_the_evidence_pass_is_caught_by_the_second_check(self):
+        """Catches: checking identity once, then spending up to EXT_ATTRIB_BUDGET_S reading CDP before
+        the signal (the pid can be reused in that window)."""
+        self.identity = [True, False]
+        self.assertFalse(self.run_recycle())
+        self.assertEqual(self.signals, [])
+        self.assertIn("RECYCLING_EXT", self.text())          # it got as far as the durable line
+        self.assertIn("SKIP EXT_CHANGED", self.text())
+        self.assertEqual(self.state["ext_recycles"], [])
+
+    def test_a_log_that_cannot_be_written_means_no_signal(self):
+        """Catches: signalling with no durable record of why."""
+        def log(msg):
+            self.lines.append(msg)
+            return not msg.startswith("RECYCLING_EXT")
+        self.assertFalse(self.run_recycle(log=log))
+        self.assertEqual(self.signals, [])
+
+    def test_attribution_that_fails_does_not_block_the_recycle(self):
+        """Catches: evidence gathering (CDP down, a wedged extension target) becoming a precondition."""
+        def boom(port, udd):
+            raise OSError("cdp down")
+        self.assertTrue(self.run_recycle(heap=boom))
+        self.assertEqual(self.signals, [(self.PID, signal.SIGTERM)])
+        self.assertIn("EXT_ATTRIB unavailable", self.text())
+
+    def test_sigkill_only_when_sigterm_did_not_work(self):
+        """Catches: SIGKILL sent regardless, and SIGTERM-ignoring renderers staying up."""
+        self.dies_on_term = False
+        self.assertTrue(self.run_recycle())
+        self.assertEqual(self.signals, [(self.PID, signal.SIGTERM), (self.PID, signal.SIGKILL)])
+        self.assertIn("RECYCLED_EXT", self.text())
+        self.assertIn("sigkill=True", self.text())
+
+    def test_a_renderer_that_survives_both_signals_is_reported_as_ineffective(self):
+        """Catches: reporting success for a process that is still there."""
+        def stubborn(pid, sig):
+            self.signals.append((pid, sig))
+        with mock.patch.object(G, "_ext_identity", return_value=True), \
+                mock.patch.object(G, "read_proc", return_value={"footprint_mb": 1800.0, "cpu_ms": 0.0, "start": self.START}), \
+                mock.patch.object(G, "_send_signal", side_effect=stubborn), \
+                mock.patch.object(G, "_pid_alive", return_value=True), \
+                mock.patch.object(G, "ext_heap_by_extension", return_value=[]), \
+                mock.patch.object(G, "EXT_TERM_WAIT_S", 0.5), mock.patch.object(G, "EXT_KILL_WAIT_S", 0.5):
+            self.assertTrue(G.recycle_extension_renderer(self.cfg, self.state, self.cand, 100, None, 5000.0,
+                                                         True, self._log))
+        self.assertEqual([s for _, s in self.signals], [signal.SIGTERM, signal.SIGKILL])
+        self.assertIn("RECYCLE_EXT_INEFFECTIVE", self.text())
+        self.assertNotIn("RECYCLED_EXT ", self.text())
+
+    def test_a_renderer_that_vanished_before_the_signal_is_not_counted(self):
+        """Catches: a recycle that never happened eating the hourly budget."""
+        def gone(pid, sig):
+            raise ProcessLookupError()
+        with mock.patch.object(G, "_ext_identity", return_value=True), \
+                mock.patch.object(G, "read_proc", return_value={"footprint_mb": 1800.0, "cpu_ms": 0.0, "start": self.START}), \
+                mock.patch.object(G, "_send_signal", side_effect=gone), \
+                mock.patch.object(G, "ext_heap_by_extension", return_value=[]):
+            self.assertFalse(G.recycle_extension_renderer(self.cfg, self.state, self.cand, 100, None, 5000.0,
+                                                          True, self._log))
+        self.assertIn("EXT_ALREADY_GONE", self.text())
+        self.assertEqual(self.state["ext_recycles"], [])
+
+
+class ExtDisplayNameTests(unittest.TestCase):
+    def setUp(self):
+        self.udd = tempfile.mkdtemp(prefix="cdp-tab-guard-udd-")
+        self.addCleanup(shutil.rmtree, self.udd, ignore_errors=True)
+
+    def _ext(self, ext_id, manifest, messages=None, ver="1.0_0"):
+        d = pathlib.Path(self.udd, "Default", "Extensions", ext_id, ver)
+        d.mkdir(parents=True)
+        (d / "manifest.json").write_text(json.dumps(manifest))
+        if messages is not None:
+            (d / "_locales" / manifest.get("default_locale", "en")).mkdir(parents=True)
+            (d / "_locales" / manifest.get("default_locale", "en") / "messages.json").write_text(json.dumps(messages))
+
+    def test_plain_localised_and_unreadable_names(self):
+        """Catches: a name lookup that can fail the recycle, or that prints garbage for __MSG_x__."""
+        a, b, c = "a" * 32, "b" * 32, "c" * 32
+        self._ext(a, {"name": "Claude"})
+        self._ext(b, {"name": "__MSG_extName__", "default_locale": "en"}, {"extname": {"message": "Bitwarden"}})
+        self._ext(c, {"name": "__MSG_gone__", "default_locale": "en"}, {})
+        self.assertEqual(G.ext_display_name(self.udd, a), "Claude")
+        self.assertEqual(G.ext_display_name(self.udd, b), "Bitwarden")
+        self.assertEqual(G.ext_display_name(self.udd, c), c)                  # unresolvable -> the id
+        self.assertEqual(G.ext_display_name(self.udd, "d" * 32), "d" * 32)   # not installed -> the id
+        self.assertEqual(G.ext_display_name(None, a), a)                      # profile unknown -> the id
+
+
+class ExtRunOnceTests(unittest.TestCase):
+    """run_once end to end against a REAL throwaway process that looks like an extension renderer. Only the
+    `ps -axo` table is faked (a Chrome main with this test as the parent); the footprint read, the identity
+    re-check, the signal and the process exit are all real. No Chrome is started and :9222 is never touched."""
+
+    GRACE = 1
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="cdp-tab-guard-extrun-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.children = []
+        self.addCleanup(self._reap)
+        self.real_run = subprocess.run
+
+    def _reap(self):
+        for c in self.children:
+            if c.poll() is None:
+                c.kill()
+            c.wait()
+
+    def spawn(self, *flags):
+        c = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)", *flags],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.children.append(c)
+        # Wait until `ps` can see its argv AND the footprint is a real number: a process that has just exec'd
+        # reads ~0 MB for a moment, which the guard would (correctly) treat as under any ceiling.
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            out = self.real_run(["ps", "-o", "command=", "-p", str(c.pid)], capture_output=True, text=True).stdout
+            got = G.read_proc(c.pid)
+            if "time.sleep" in out and got is not None and got["footprint_mb"] >= 2.0:
+                return c
+            time.sleep(0.05)
+        self.fail("throwaway renderer never reached a readable footprint")
+
+    def cfg(self, **kv):
+        base = {"state_dir": self.dir, "log": os.path.join(self.dir, "g.log"), "lock": os.path.join(self.dir, "g.lock"),
+                "port": 9, "ceiling_mb": 10 ** 9, "ext_ceiling_mb": 1, "ext_grace_sec": self.GRACE,
+                "pressure_total_mb": 10 ** 9, "pressure_swap_mb": 10 ** 9, "max_gap_sec": 120}
+        base.update(kv)
+        return env_cfg(**base)
+
+    def run_guard(self, cfg, child_line_flags, child, main_pid=None):
+        main_pid = os.getpid() if main_pid is None else main_pid
+        table = "\n".join([
+            _ps_line(main_pid, 1, _MAIN + " --remote-debugging-port=%d --user-data-dir=%s" % (cfg.port, self.dir)),
+            _ps_line(child.pid, os.getpid(), _RENDERER + " --type=renderer " + child_line_flags),
+        ])
+
+        def fake_run(args, *a, **kw):
+            if list(args)[:2] == ["ps", "-axo"]:
+                return subprocess.CompletedProcess(args, 0, stdout=table, stderr="")
+            return self.real_run(args, *a, **kw)
+        with mock.patch.object(G.subprocess, "run", side_effect=fake_run):
+            return G.run_once(cfg)
+
+    def log_text(self, cfg):
+        try:
+            return pathlib.Path(cfg.log_path).read_text()
+        except FileNotFoundError:
+            return ""
+
+    def two_runs(self, cfg, child, flags="--extension-process", **kw):
+        self.assertEqual(self.run_guard(cfg, flags, child, **kw), 0)
+        time.sleep(self.GRACE + 0.3)
+        self.assertEqual(self.run_guard(cfg, flags, child, **kw), 0)
+
+    def test_a_heavy_extension_renderer_is_recycled_after_the_grace_and_only_then(self):
+        """Catches: no recycle at all; a recycle on the first reading; the wrong process dying; the cap not
+        being recorded; and a status.json that does not say it happened."""
+        child = self.spawn("--type=renderer", "--extension-process")
+        cfg = self.cfg()
+        self.assertEqual(self.run_guard(cfg, "--extension-process", child), 0)
+        self.assertIsNone(child.poll(), "first sight must not recycle")
+        self.assertIn("EXT_HEAVY pid=%d" % child.pid, self.log_text(cfg))
+        time.sleep(self.GRACE + 0.3)
+        self.assertEqual(self.run_guard(cfg, "--extension-process", child), 0)
+        self.assertEqual(child.wait(timeout=15), -signal.SIGTERM)
+        t = self.log_text(cfg)
+        self.assertIn("RECYCLING_EXT pid=%d" % child.pid, t)
+        self.assertIn("RECYCLED_EXT pid=%d" % child.pid, t)
+        self.assertIn("EXT_ATTRIB", t)                       # CDP is unreachable here: the line says so, the recycle went on
+        st = json.loads(pathlib.Path(cfg.status_path).read_text())
+        self.assertEqual((st["ext_heavy"], st["ext_recycled_this_run"], st["ext_recycles_last_hour"]), (1, 1, 1))
+        self.assertEqual(len(json.loads(pathlib.Path(cfg.state_path).read_text())["ext_recycles"]), 1)
+
+    def test_a_tab_renderer_with_the_same_footprint_is_never_touched(self):
+        """Catches: the extension path catching ordinary tab renderers (their pages are other agents' work)."""
+        child = self.spawn("--type=renderer")
+        cfg = self.cfg()
+        self.two_runs(cfg, child, flags="--renderer-client-id=3")
+        self.assertIsNone(child.poll())
+        self.assertNotIn("EXT_HEAVY", self.log_text(cfg))
+
+    def test_disarmed_by_env_is_a_dry_run(self):
+        child = self.spawn("--type=renderer", "--extension-process")
+        cfg = self.cfg(ext_recycle=0)
+        self.two_runs(cfg, child)
+        self.assertIsNone(child.poll())
+        self.assertIn("WOULD_RECYCLE_EXT", self.log_text(cfg))
+
+    def test_action_not_1_is_a_dry_run(self):
+        child = self.spawn("--type=renderer", "--extension-process")
+        cfg = self.cfg(action=0)
+        self.two_runs(cfg, child)
+        self.assertIsNone(child.poll())
+        self.assertIn("WOULD_RECYCLE_EXT", self.log_text(cfg))
+
+    def test_kill_switch_file_is_a_dry_run(self):
+        """Catches: the DISABLED file stopping tab closes but not this."""
+        child = self.spawn("--type=renderer", "--extension-process")
+        cfg = self.cfg()
+        pathlib.Path(cfg.disabled_path).write_text("")
+        self.two_runs(cfg, child)
+        self.assertIsNone(child.poll())
+        t = self.log_text(cfg)
+        self.assertIn("WOULD_RECYCLE_EXT", t)
+        self.assertIn("kill switch present", t)
+
+    def test_hourly_cap_leaves_the_renderer_alone_and_says_so(self):
+        """Catches: a renderer that re-bloats after every recycle being recycled forever."""
+        child = self.spawn("--type=renderer", "--extension-process")
+        cfg = self.cfg(ext_max_recycle_hour=2)
+        now = time.time()
+        pathlib.Path(cfg.state_path).write_text(json.dumps(
+            {"pids": {}, "closes": [], "last_heartbeat": 0, "ext": {}, "ext_recycles": [now - 30, now - 90]}))
+        self.two_runs(cfg, child)
+        self.assertIsNone(child.poll())
+        self.assertIn("EXT_RECYCLE_CAPPED pid=%d" % child.pid, self.log_text(cfg))
+
+    def test_a_recycle_older_than_an_hour_no_longer_counts(self):
+        child = self.spawn("--type=renderer", "--extension-process")
+        cfg = self.cfg(ext_max_recycle_hour=1)
+        now = time.time()
+        pathlib.Path(cfg.state_path).write_text(json.dumps(
+            {"pids": {}, "closes": [], "last_heartbeat": 0, "ext": {}, "ext_recycles": [now - 3700]}))
+        self.two_runs(cfg, child)
+        self.assertEqual(child.wait(timeout=15), -signal.SIGTERM)
+
+    def test_a_renderer_under_the_ceiling_is_left_alone(self):
+        child = self.spawn("--type=renderer", "--extension-process")
+        cfg = self.cfg(ext_ceiling_mb=10 ** 6)
+        self.two_runs(cfg, child)
+        self.assertIsNone(child.poll())
+        self.assertNotIn("EXT_HEAVY", self.log_text(cfg))
+
+    def test_a_pid_that_changed_hands_between_runs_starts_its_clock_again(self):
+        """Catches: carrying 'over since' from one process to the next one that gets the same pid."""
+        child = self.spawn("--type=renderer", "--extension-process")
+        cfg = self.cfg()
+        self.assertEqual(self.run_guard(cfg, "--extension-process", child), 0)
+        state = json.loads(pathlib.Path(cfg.state_path).read_text())
+        state["ext"][str(child.pid)]["start"] += 1            # as if another process now answered to this pid
+        pathlib.Path(cfg.state_path).write_text(json.dumps(state))
+        time.sleep(self.GRACE + 0.3)
+        self.assertEqual(self.run_guard(cfg, "--extension-process", child), 0)
+        self.assertIsNone(child.poll(), "history of another process must not count")
+
+    def test_only_the_heaviest_candidate_is_recycled_per_run(self):
+        """Catches: several extension renderers signalled in one run (their respawns would share one grace and
+        the hourly cap would be spent in a single tick), and the lighter one being picked."""
+        cfg = self.cfg()
+        table = "\n".join([_ps_line(os.getpid(), 1, _MAIN + " --remote-debugging-port=%d --user-data-dir=%s" % (cfg.port, self.dir)),
+                           _ps_line(901, os.getpid(), _RENDERER + " --type=renderer --extension-process"),
+                           _ps_line(902, os.getpid(), _RENDERER + " --type=renderer --extension-process")])
+        fp = {901: 2000.0, 902: 3000.0}
+
+        def fake_run(args, *a, **kw):
+            if list(args)[:2] == ["ps", "-axo"]:
+                return subprocess.CompletedProcess(args, 0, stdout=table, stderr="")
+            return self.real_run(args, *a, **kw)
+        picked = []
+        with mock.patch.object(G.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(G, "read_proc", side_effect=lambda pid: {"footprint_mb": fp[pid], "cpu_ms": 0.0, "start": pid}
+                                  if pid in fp else None), \
+                mock.patch.object(G, "recycle_extension_renderer", side_effect=lambda c, st, cand, *a: picked.append(cand["pid"]) or True):
+            self.assertEqual(G.run_once(cfg), 0)
+            self.assertEqual(picked, [])                     # first sight
+            time.sleep(self.GRACE + 0.3)
+            self.assertEqual(G.run_once(cfg), 0)
+        self.assertEqual(picked, [902])
+
+    def test_unreadable_state_recycles_nothing(self):
+        """Catches: a corrupt state file reading as 'over the ceiling for a long time'."""
+        child = self.spawn("--type=renderer", "--extension-process")
+        cfg = self.cfg()
+        pathlib.Path(cfg.state_path).write_text("{not json")
+        self.assertEqual(self.run_guard(cfg, "--extension-process", child), 0)
+        self.assertIsNone(child.poll())
 
 
 class ReadProcTests(unittest.TestCase):

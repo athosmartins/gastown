@@ -26,6 +26,22 @@ WHAT (per run; launchd StartInterval 60 s; single instance):
      ~PROBE_MS of CPU; work-based because a wall-clock loop starves on a loaded box) and see
      whose CPU counter jumps. Close the one tab that owns the heavy renderer with
      Target.closeTarget, after re-confirming the placement. Never the Chrome process.
+  5. EXTENSION RENDERERS (ga-1wvxej0) are a separate path, because step 4 cannot reach them: they
+     host no `page` target and the one that leaked was never idle. Measured 10/27: `ps` showed
+     --extension-process on the 04:1x and 11:5x episodes; in this log every heavy-renderer reading of
+     the 14 long episodes of 10/10-10/27 has idle=0s (so step 4 never became a candidate), and the three
+     of 10/27 grew 60-123 MB/min. A renderer launched with the exact
+     token --extension-process whose footprint stays >= EXT_CEILING_MB for >= EXT_GRACE_S is
+     recycled by itself: SIGTERM to that one pid (SIGKILL if it is still there 5 s later), after
+     re-checking right before the signal that the pid is still a renderer child of the CDP Chrome
+     with that flag and the same start time. Chrome respawns an extension process on demand and the
+     renderer holds no web tab (see KNOWN LIMITS 6); the alternative, until now, was
+     chrome_cdp_watchdog.sh recycling the WHOLE Chrome at 4096 MB after 900 s (5 times between 10/21
+     and 10/27, at 5.0-6.2 GB, each time dropping every agent's tabs).
+     Just before the signal it logs EXT_ATTRIB: the V8 heap of every extension target (background
+     page / service worker), by extension id and manifest name, because the pid -> extension map
+     cannot be drawn on a renderer that never goes quiet. That line names the CANDIDATE by
+     measure; it is a heap reading, not a pid mapping.
 
 HOW WE KNOW A TAB IS "IN USE NOW" (the tradeoff, stated plainly): a tab is in use if its
 renderer's CPU shows activity inside the idle window. A CDP client driving a tab (snapshot,
@@ -58,20 +74,28 @@ KNOWN LIMITS: (1) a renderer that burns >= 15 ms of CPU in EVERY one of three 1.
 apart) defers ALL closes (DEFER_NOISY repeating in the log is the tell); noise that is quiet on any
 single look does not defer, and the placement + the re-confirmation still guard the close;
 (2) only `page` targets are closable — a heavy
-renderer hosting only iframes/extension pages stays UNMAPPED; (3) the silent-tab case above;
+renderer hosting only iframes/extension pages stays UNMAPPED by step 4 (an --extension-process one
+is handled by step 5, which recycles the renderer instead of closing a tab; an iframe-only
+web renderer is still out of reach); (3) the silent-tab case above;
 (4) a renderer so starved or so compressed that it misses the liveness ping is read as dead, so
 its tab is never mapped and the run ends in SKIP UNMAPPED (inert, never a wrong close). Measured
 2026-09-19 with a suite reniced to the floor on a box at load 55+: PROBE dead=1 then SKIP UNMAPPED,
 three pages taking 21 s to map. `PROBE dead=N` + `SKIP UNMAPPED` repeating in the log while a heavy
 tab exists is the tell: raise CDP_TAB_GUARD_PING_S; (5) every page must be placed within the 45 s
-mapping budget, so on a starved box with very many tabs the run can end in PARTIAL_PROBE (inert).
+mapping budget, so on a starved box with very many tabs the run can end in PARTIAL_PROBE (inert);
+(6) an extension page opened as a tab (chrome-extension://.../options.html) or a side panel lives in
+the same extension process: if that process is recycled it shows as crashed until reloaded. Nothing
+here maps pages to extension processes, so step 5 accepts that cost, which only a renderer that stayed
+over EXT_CEILING_MB for EXT_GRACE_S can incur.
 
 OUT OF SCOPE: (a) chrome_cdp_watchdog.sh keeps the whole-Chrome recycle. Since ga-4kn6j8 it caps
 this same FOOTPRINT number (4096 MB), no longer `ps rss` (the blind spot above), and recycles
 only after the footprint stays over the cap for 900 s (CHROME_CAP_GRACE_S = this guard's 10 min
 idle window + ~5 min to close the tab), so this guard gets the first chance; >= 8192 MB for 180 s
 recycles without waiting the full grace. It reads none of this guard's files, by design: if
-IDLE_SEC changes, revisit that grace by hand. (b) the MBP Chrome (:9223).
+IDLE_SEC changes, revisit that grace by hand. It stays the backstop for step 5: EXT_GRACE_S (120 s)
+at EXT_CEILING_MB (1536) acts long before its 4096 MB / 900 s, which then no longer fires for this
+leak should no longer reach its cap. (b) the MBP Chrome (:9223).
 
 CONFIG (env, CDP_TAB_GUARD_*; garbage or non-positive numeric values fall back to the default so
 a typo can never lower the ceiling to 0; ACTION is armed only by an absent variable or exactly 1,
@@ -80,7 +104,10 @@ anything else is a dry run): PORT 9222 · ACTION 1 · CEILING_MB 1536 · IDLE_SE
 150 · MAX_GAP_SEC 300 · MAX_CLOSE_RUN 2 · MAX_CLOSE_HOUR 8 · MIN_PAGES_KEEP 1 · PROBE_MS 50 (CPU-ms
 of work per probe) · PING_S 5 · PING_S_PRESSURE 20 (seconds a page gets to answer a trivial evaluate
 before it is read as dead; the pressure value is never shorter than PING_S) · STATE_DIR / LOG / LOCK
-(default under $GC_CITY_PATH/.gc).
+(default under $GC_CITY_PATH/.gc) · EXT_CEILING_MB 1536 · EXT_GRACE_S 120 · EXT_MAX_RECYCLE_HOUR 2
+(after that many recycles in an hour it logs EXT_RECYCLE_CAPPED and leaves the rest to the
+watchdog) · EXT_RECYCLE (armed only by an absent variable or exactly 1; anything else logs
+WOULD_RECYCLE_EXT and signals nothing, like ACTION; the DISABLED file and ACTION != 1 also disarm it).
 
 Files: <state_dir>/state.json (idle tracking), status.json (heartbeat for watchers),
 guard.lock, DISABLED (kill switch); log: <city>/.gc/logs/cdp-tab-guard.log.
@@ -113,6 +140,10 @@ PROTECTED_SCHEMES = ("chrome:", "chrome-extension:", "chrome-untrusted:", "chrom
 HARD_TIMEOUT_S = 120
 LOG_ROTATE_BYTES = 2 * 1024 * 1024
 HEARTBEAT_EVERY_S = 600
+EXT_FLAG = "--extension-process"
+EXT_TERM_WAIT_S = 5.0        # SIGTERM -> SIGKILL (ga-1wvxej0)
+EXT_KILL_WAIT_S = 3.0
+EXT_ATTRIB_BUDGET_S = 12.0   # whole EXT_ATTRIB pass; the recycle never waits longer than this for evidence
 
 
 # ─────────────────────────────── configuration ───────────────────────────────
@@ -158,6 +189,12 @@ class Config:
         # under memory pressure, when a compressed or starved renderer is slow but alive; never shorter.
         c.ping_s = _num(env, "ping_s", 5.0, float, 0.0, strict=True)
         c.ping_s_pressure = max(c.ping_s, _num(env, "ping_s_pressure", 20.0, float, 0.0, strict=True))
+        # Extension-renderer recycle (ga-1wvxej0). Armed like ACTION: only an absent variable or exactly 1.
+        raw_ext = env.get("CDP_TAB_GUARD_EXT_RECYCLE")
+        c.ext_recycle = 1 if raw_ext is None or str(raw_ext).strip() == "1" else 0
+        c.ext_ceiling_mb = _num(env, "ext_ceiling_mb", 1536.0, float, 0.0, strict=True)
+        c.ext_grace_sec = _num(env, "ext_grace_sec", 120, int, 0, strict=True)
+        c.ext_max_recycle_hour = _num(env, "ext_max_recycle_hour", 2, int, 0)
         city = env.get("GC_CITY_PATH") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         c.state_dir = env.get("CDP_TAB_GUARD_STATE_DIR") or os.path.join(city, ".gc", "cdp-tab-guard")
         c.log_path = env.get("CDP_TAB_GUARD_LOG") or os.path.join(city, ".gc", "logs", "cdp-tab-guard.log")
@@ -191,6 +228,31 @@ def parse_family(ps_text, port):
     if main is None:
         return (None, [])
     return (main, [pid for pid, ppid, cmd in rows if ppid == main and "--type=renderer" in cmd.split()])
+
+
+def parse_extension_renderers(ps_text, main_pid):
+    """Pids of the renderers that are direct children of `main_pid` and carry the exact tokens
+    --type=renderer and --extension-process (ga-1wvxej0). Token match, so --extension-process-foo,
+    a GPU/utility helper, or a renderer of another Chrome never qualifies."""
+    out = []
+    for line in ps_text.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit() and int(parts[1]) == main_pid:
+            toks = parts[2].split()
+            if "--type=renderer" in toks and EXT_FLAG in toks:
+                out.append(int(parts[0]))
+    return out
+
+
+def main_user_data_dir(ps_text, main_pid):
+    """--user-data-dir of the main process, or None (only used to put a name on an extension id)."""
+    for line in ps_text.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and int(parts[0]) == main_pid:
+            for tok in parts[2].split():
+                if tok.startswith("--user-data-dir="):
+                    return tok[len("--user-data-dir="):] or None
+    return None
 
 
 class _RUsageV0(ctypes.Structure):
@@ -288,6 +350,32 @@ def classify(fp_mb, idle_for_s, pressure, cfg):
         return "OK"
     need = cfg.idle_sec_pressure if pressure else cfg.idle_sec
     return "HEAVY_IDLE" if (idle_for_s > 0 and idle_for_s >= need) else "HEAVY_NOT_IDLE"
+
+
+def step_ext(entry, sample, now, cfg):
+    """Track how long an extension renderer's footprint has stayed >= ext_ceiling_mb. Returns
+    (new_entry, over_for_s). over_for_s == 0 is 'not recyclable': under the ceiling, first sight over it,
+    or history we cannot trust (another process behind the same pid, a gap longer than max_gap_sec, a
+    clock that went backwards, a malformed entry). Unknown time over the ceiling is never time over it."""
+    fresh = {"start": sample["start"], "over_since": None, "last_ts": now}
+    if sample["footprint_mb"] < cfg.ext_ceiling_mb:
+        return fresh, 0
+    prev = entry if isinstance(entry, dict) else {}
+    since, last = prev.get("over_since"), prev.get("last_ts")
+    trusted = (prev.get("start") == sample["start"] and _is_num(since) and _is_num(last)
+               and 0 <= now - last <= cfg.max_gap_sec and since <= now)
+    fresh["over_since"] = since if trusted else now
+    return fresh, int(now - fresh["over_since"])
+
+
+def ext_decide(over_for_s, recycles_last_hour, cfg):
+    """WAIT | RECYCLE | CAPPED. CAPPED = it has been over the ceiling long enough but this hour's
+    recycles are used up: the whole-Chrome watchdog stays the backstop, and the log says so loudly."""
+    if over_for_s <= 0 or over_for_s < cfg.ext_grace_sec:
+        return "WAIT"
+    if recycles_last_hour >= cfg.ext_max_recycle_hour:
+        return "CAPPED"
+    return "RECYCLE"
 
 
 def is_pressure(total_mb, swap_mb, cfg):
@@ -649,11 +737,13 @@ def _is_num(v):
 
 
 def load_state(cfg, log):
-    """The state, always in the same shape: {'pids': {str: dict}, 'closes': [num], 'last_heartbeat': num}.
+    """The state, always in the same shape: {'pids': {str: dict}, 'closes': [num], 'last_heartbeat': num,
+    'ext': {str: dict}, 'ext_recycles': [num]} ('ext*' = the extension-renderer recycle, ga-1wvxej0).
     A missing file is a fresh start; an unparsable file or a part of the wrong type is logged and
     replaced (valid JSON of the wrong shape must not crash every run — the crash would come before
-    the rewrite, so it would never heal). Fresh history means no tab can look idle yet: inert."""
-    empty = {"pids": {}, "closes": [], "last_heartbeat": 0}
+    the rewrite, so it would never heal). Fresh history means no tab can look idle and no extension
+    renderer can look over the ceiling for long enough: inert."""
+    empty = {"pids": {}, "closes": [], "last_heartbeat": 0, "ext": {}, "ext_recycles": []}
     try:
         with open(cfg.state_path) as f:
             st = json.load(f)
@@ -666,12 +756,17 @@ def load_state(cfg, log):
             % type(ex).__name__)
         return empty
     pids, closes, hb = st.get("pids"), st.get("closes"), st.get("last_heartbeat")
+    ext, ext_rec = st.get("ext"), st.get("ext_recycles")
     clean = {
         "pids": {str(k): v for k, v in pids.items() if isinstance(v, dict)} if isinstance(pids, dict) else {},
         "closes": [t for t in closes if _is_num(t)] if isinstance(closes, list) else [],
         "last_heartbeat": hb if _is_num(hb) else 0,
+        "ext": {str(k): v for k, v in ext.items() if isinstance(v, dict)} if isinstance(ext, dict) else {},
+        "ext_recycles": [t for t in ext_rec if _is_num(t)] if isinstance(ext_rec, list) else [],
     }
-    if (clean["pids"] != (pids or {}) or clean["closes"] != (closes or []) or clean["last_heartbeat"] != (hb or 0)):
+    # A state written before the extension keys existed has neither: that is the old shape, not damage.
+    if (clean["pids"] != (pids or {}) or clean["closes"] != (closes or []) or clean["last_heartbeat"] != (hb or 0)
+            or clean["ext"] != (ext or {}) or clean["ext_recycles"] != (ext_rec or [])):
         log("STATE had an unexpected shape — kept the well-typed parts, dropped the rest")
     return clean
 
@@ -812,6 +907,154 @@ def act(cfg, state, candidates, renderer_pids, now, live, log, pressure=False):
     return made
 
 
+def ext_display_name(udd, ext_id):
+    """Manifest name of an extension in the CDP profile, else the id itself. A name is a courtesy to the
+    person reading the log, never a gate: any failure to read it (no profile dir known, no manifest,
+    a localised name we cannot resolve) lands on the id."""
+    if not udd:
+        return ext_id
+    # vazio / falhou / ilegível → the id itself (a name is a courtesy, never a gate)
+    try:
+        mdir = os.path.join(udd, "Default", "Extensions", ext_id)
+        mdir = os.path.join(mdir, sorted(os.listdir(mdir))[-1])
+        with open(os.path.join(mdir, "manifest.json")) as f:
+            manifest = json.load(f)
+        name = str(manifest.get("name") or "")
+        m = re.fullmatch(r"__MSG_(.+)__", name)
+        if m:
+            with open(os.path.join(mdir, "_locales", str(manifest.get("default_locale") or "en"),
+                                   "messages.json")) as f:
+                msgs = {str(k).lower(): v for k, v in json.load(f).items()}
+            name = str(msgs[m.group(1).lower()]["message"])
+        return _clean_title(name).strip() or ext_id
+    except Exception:
+        return ext_id
+
+
+def ext_heap_by_extension(port, udd, budget_s=EXT_ATTRIB_BUDGET_S):
+    """[(extension id, name, used_mb | None, n_targets)] heaviest first, from the V8 heap of every
+    extension target (background page / service worker) over CDP. used_mb is the LARGEST heap among the
+    extension's targets that answered; None = none of them answered (unread is not zero). Raises on a CDP failure
+    to connect or list; a single target that does not answer only makes its extension 'unread'."""
+    deadline = time.time() + budget_s
+    # vazio → [] rows (logged as "no extension target listed"); falhou → raises, the caller logs EXT_ATTRIB
+    # unavailable and recycles anyway (evidence is not a gate); one target silent → its extension "heap=?"
+    client = CDPClient.connect(port, timeout=5)
+    try:
+        infos = client.call("Target.getTargets", timeout=5)["targetInfos"]
+        per = {}
+        for t in infos:
+            m = re.match(r"chrome-extension://([a-p]{32})/", t.get("url") or "")
+            if t.get("type") == "page" or not m:
+                continue
+            slot = per.setdefault(m.group(1), {"used": None, "n": 0})
+            slot["n"] += 1
+            if time.time() >= deadline:
+                continue                       # out of budget: this target stays unread
+            try:
+                sid = client.call("Target.attachToTarget", {"targetId": t["targetId"], "flatten": True},
+                                  timeout=3)["sessionId"]
+                try:
+                    usage = client.call("Runtime.getHeapUsage", session_id=sid, timeout=3)
+                    # V8 heap plus the ArrayBuffer backing store: a GIF/audio buffer leak lives in the latter
+                    used = (usage["usedSize"] + usage.get("backingStorageSize", 0)) / 1048576.0
+                finally:
+                    try:
+                        client.call("Target.detachFromTarget", {"sessionId": sid}, timeout=3)
+                    except Exception:
+                        pass
+                slot["used"] = used if slot["used"] is None else max(slot["used"], used)
+            except Exception:
+                continue
+    finally:
+        client.close()
+    rows = [(i, ext_display_name(udd, i), s["used"], s["n"]) for i, s in per.items()]
+    return sorted(rows, key=lambda r: (r[2] is None, -(r[2] or 0.0)))
+
+
+def _ext_identity(pid, main_pid):
+    """True | False | None: is `pid` still a --type=renderer --extension-process child of `main_pid`?
+    None = could not tell (ps failed); False = it is something else or gone."""
+    # vazio → False (pid gone); falhou/ilegível → None (cannot tell: the caller skips, never signals)
+    try:
+        out = subprocess.run(["ps", "-o", "ppid=,command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception:
+        return None
+    if not out:
+        return False
+    parts = out.split(None, 1)
+    if len(parts) != 2 or not parts[0].isdigit():
+        return None
+    toks = parts[1].split()
+    return int(parts[0]) == main_pid and "--type=renderer" in toks and EXT_FLAG in toks
+
+
+def _send_signal(pid, sig):
+    os.kill(pid, sig)
+
+
+def recycle_extension_renderer(cfg, state, cand, main_pid, udd, now, live, log):
+    """Signal ONE heavy extension renderer. `cand` = {'pid','fp_mb','over_for_s','start'}. Returns True
+    when a signal was sent. Order matters: identity re-check (pid reuse, or a renderer that already
+    exited) -> EXT_ATTRIB (the evidence dies with the process) -> dry-run stop -> durable RECYCLING_EXT
+    line (no durable record, no signal) -> identity re-check again -> SIGTERM -> SIGKILL if it is still
+    the same process 5 s later. Every 'could not tell' about WHICH process this is (ps failed, unreadable,
+    other start time) is a skip, never a signal; failing to read the EXT_ATTRIB evidence is not a gate."""
+    pid = cand["pid"]
+    what = "pid=%d fp=%.0fMB over_ceiling=%ds ceiling=%.0fMB" % (pid, cand["fp_mb"], cand["over_for_s"],
+                                                                   cfg.ext_ceiling_mb)
+
+    def same_process():
+        # vazio → pid gone = not the same process; falhou/ilegível (None) → not the same process (skip, no signal)
+        cur = read_proc(pid)
+        return _ext_identity(pid, main_pid) is True and cur is not None and cur["start"] == cand["start"]
+
+    if not same_process():
+        log("SKIP EXT_CHANGED %s (no longer the same --extension-process renderer, or could not be read)" % what)
+        return False
+    try:
+        rows = ext_heap_by_extension(cfg.port, udd)
+        log("EXT_ATTRIB %s heap-by-extension (heaviest first; candidates by V8 heap, not a pid mapping): %s" % (
+            what, "; ".join("%s (%s) %s targets=%d" % (i, n, "heap=?" if u is None else "heap=%.0fMB" % u, c)
+                            for i, n, u, c in rows[:6]) or "no extension target listed"))
+    except Exception as ex:
+        log("EXT_ATTRIB unavailable for %s (%s: %s) — recycling does not wait on it" % (what, type(ex).__name__, ex))
+    if not live:
+        log("WOULD_RECYCLE_EXT %s" % what)
+        return False
+    if not log("RECYCLING_EXT %s" % what):
+        return False            # no durable record, no signal (LOG UNWRITABLE is on stderr)
+    if not same_process():
+        log("SKIP EXT_CHANGED %s (changed while the evidence was being read)" % what)
+        return False
+    sent_kill = False
+    try:
+        _send_signal(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        log("EXT_ALREADY_GONE %s" % what)
+        return False
+    state.setdefault("ext_recycles", []).append(now)
+    _write_json_atomic(cfg.state_path, state)      # count the attempt before waiting: a crash cannot hide it
+    for _ in range(int(EXT_TERM_WAIT_S / 0.25)):
+        if not _pid_alive(pid) or not same_process():
+            break
+        time.sleep(0.25)
+    else:
+        sent_kill = True
+        try:
+            _send_signal(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        for _ in range(int(EXT_KILL_WAIT_S / 0.25)):
+            if not _pid_alive(pid):
+                break
+            time.sleep(0.25)
+    gone = not _pid_alive(pid) or _ext_identity(pid, main_pid) is False
+    log("%s %s sigkill=%s" % ("RECYCLED_EXT" if gone else "RECYCLE_EXT_INEFFECTIVE", what, sent_kill))
+    return True
+
+
 def run_once(cfg, verbose=False):
     log = make_logger(cfg, verbose)
     os.makedirs(cfg.state_dir, exist_ok=True)
@@ -876,10 +1119,51 @@ def run_once(cfg, verbose=False):
             log("ERROR acting on %d heavy idle renderer(s): %s: %s — a close may already have been issued "
                 "before the failure: check the CLOSING/CLOSED lines above" % (len(candidates), type(ex).__name__, ex))
 
+    # Extension renderers (ga-1wvxej0): a separate path, because they host no `page` and a leaking one is
+    # never idle. A reading that failed (s is None) leaves that pid out of the history: no history, no signal.
+    new_ext, ext_cands, ext_recycled, ext_over_n = {}, [], 0, 0
+    ext_recent = [t for t in state.get("ext_recycles", []) if now - t < 3600]
+    state["ext_recycles"] = ext_recent        # same list: every attempt is recorded as it happens
+    for pid in parse_extension_renderers(ps_run.stdout, main_pid):
+        s = samples.get(pid)
+        if s is None:
+            continue
+        entry, over_for = step_ext(state.get("ext", {}).get(str(pid)), s, now, cfg)
+        new_ext[str(pid)] = entry
+        if s["footprint_mb"] >= cfg.ext_ceiling_mb:
+            ext_over_n += 1
+            verdict = ext_decide(over_for, len(ext_recent), cfg)
+            log("EXT_HEAVY pid=%d fp=%.0fMB over_ceiling=%ds need=%ds recycled_last_hour=%d/%d -> %s" % (
+                pid, s["footprint_mb"], over_for, cfg.ext_grace_sec, len(ext_recent), cfg.ext_max_recycle_hour,
+                verdict))
+            if verdict == "CAPPED":
+                log("EXT_RECYCLE_CAPPED pid=%d fp=%.0fMB — this hour's recycles are used up; the whole-Chrome "
+                    "watchdog is the only net left" % (pid, s["footprint_mb"]))
+            elif verdict == "RECYCLE":
+                ext_cands.append({"pid": pid, "fp_mb": s["footprint_mb"], "over_for_s": over_for,
+                                  "start": s["start"]})
+    if ext_cands:
+        ext_live = live and cfg.ext_recycle == 1
+        if not ext_live:
+            log("EXT_RECYCLE is a dry run (%s)" % ("kill switch present" if killswitch else
+                                                   "ACTION/EXT_RECYCLE not 1" if cfg.ext_recycle != 1 or cfg.action != 1
+                                                   else "not armed"))
+        # one per run, heaviest first: a respawned renderer gets its own grace before the next one
+        cand = max(ext_cands, key=lambda c: c["fp_mb"])
+        try:
+            if recycle_extension_renderer(cfg, state, cand, main_pid, main_user_data_dir(ps_run.stdout, main_pid),
+                                          now, ext_live, log):
+                ext_recycled = 1
+        except Exception as ex:
+            log("ERROR recycling extension renderer %d: %s: %s — a signal may already have been sent: check the "
+                "RECYCLING_EXT/RECYCLED_EXT lines above" % (cand["pid"], type(ex).__name__, ex))
+
     credit_own_cpu(new_pids, state.pop("own_cpu_ms", None) or {})
     state["v"] = 1
     state["pids"] = new_pids
+    state["ext"] = new_ext
     state["closes"] = [t for t in state.get("closes", []) if now - t < 3600]
+    state["ext_recycles"] = [t for t in state["ext_recycles"] if now - t < 3600]
     if not heavy and now - state.get("last_heartbeat", 0) >= HEARTBEAT_EVERY_S:
         log("ok renderers=%d total=%.0fMB max=%.0fMB heavy=0 swap=%s pressure=%s live=%s" % (
             len(evals), total_mb, max_mb, "?" if swap_mb is None else "%.0fMB" % swap_mb, pressure, live))
@@ -889,7 +1173,9 @@ def run_once(cfg, verbose=False):
         "ts": now, "measured": True, "renderers": len(evals), "unreadable": len(unreadable),
         "total_mb": round(total_mb, 1),
         "max_mb": round(max_mb, 1), "heavy": len(heavy), "pressure": pressure, "live": live,
-        "closed_this_run": closed, "closes_last_hour": len(state["closes"])})
+        "closed_this_run": closed, "closes_last_hour": len(state["closes"]),
+        "ext_heavy": ext_over_n, "ext_recycled_this_run": ext_recycled,
+        "ext_recycles_last_hour": len(state["ext_recycles"])})
     return 0
 
 
