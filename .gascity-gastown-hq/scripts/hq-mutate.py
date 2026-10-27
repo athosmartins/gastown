@@ -1,32 +1,26 @@
 #!/usr/bin/env python3
 """hq-mutate.py — varredura de MUTANTES do código que os *.selftest.sh do hq cobrem (ga-2hd02v.5.6.2): o resultado que alguém lê é a lista de testes que NÃO pegam um bug.
-
 ## Contents
   Por quê · Uso · Alvos · Operadores · Veredito · Estado · Códigos de saída
-
-POR QUÊ: um selftest verde com o código quebrado não prova nada. Trocar UM trecho do script (um `-gt` por `-ge`, um `&&` por `||`, um `exit 1` por `exit 0`) e rodar a família de selftests dele diz se algum
-  reprova; se nenhum reprova, o mutante SOBREVIVEU e o teste é fraco naquela linha. É trabalho de CPU que o lastro do nó Hetzner pode gastar com nice 19 sem custo, e cada achado vira um bead (ga-2hd02v.5.6).
-USO: hq-mutate.py gen ARQUIVO [--tree HQ]                  imprime os candidatos (id, linha, operador, antes, depois), um por linha, TAB; com --tree o id é o que o `sweep` grava (caminho relativo à árvore)
+POR QUÊ: um selftest verde com o código quebrado não prova nada. Trocar UM trecho do script (`-gt` por `-ge`, `&&` por `||`, `exit 1` por `exit 0`) e rodar a família de selftests dele diz se algum reprova; se nenhum
+  reprova, o mutante SOBREVIVEU e o teste é fraco naquela linha. É CPU que o lastro do nó Hetzner gasta com nice 19 sem custo, e cada achado vira um bead (ga-2hd02v.5.6).
+USO: hq-mutate.py gen ARQUIVO [--tree HQ]                  imprime os candidatos (id, linha, operador, antes, depois), TAB; com --tree o id é o que o `sweep` grava (caminho relativo à árvore)
      hq-mutate.py plan  --tree HQ --state ARQ              imprime os alvos na ordem em que a varredura os pegaria (e por que pula os que pula)
      hq-mutate.py sweep --tree HQ --state ARQ --work DIR --jail hq-sandbox-run.py [--budget-s N] [--slots N] [--cap N] [--targets N]
-  A última linha do stdout do `sweep` é UM json: result (completo | parcial | sem-novidade | sem-cobertura | interrompido | sem-jaula | sem-alvos | estado-ilegivel | gravacao-falhou), contagens, skipped{motivo: n}, survivors[] (até 15; `survivors_cortados` conta os que ficaram de fora).
-  `sem-novidade` = o que havia para varrer JÁ estava coberto e igual; `sem-cobertura` = nada foi examinado (tudo pulado, ou nenhum mutante rodou): quem lê só o result não pode confundir os dois. `nao_sei` conta os alvos em que o
-  `bash -n` não pôde decidir: nenhum veredito, o resto do alvo espera a próxima varredura. `restam` = candidatos já conhecidos e ainda sem veredito (um --cap que fecha como `completo` deixa `restam` > 0).
-ALVOS: o SUJEITO de cada `X.selftest.sh` de scripts/ e de packs/town-deltas/assets/ é o `X.sh` ou `X.py` da mesma pasta (com o nome aparado, `a-b-c` → `a-b`, até 3 vezes) E o selftest tem de CITAR o
-  nome do arquivo (sem isso o sujeito é outro e todo mutante sobreviveria: ruído). A FAMÍLIA do sujeito são todos os selftests que caem nele; todos rodam a cada mutante. Nunca se mutam os arquivos do
-  lastro (hetzner-ballast*), do próprio motor (hq-mutate*) nem da jaula (hq-sandbox-run*). Alvo cujo texto (sujeito + família) cita sudo, systemctl, pkill, docker, gc, bd, dolt (os três só se existem
-  neste host e não são o symlink do remote-shim, o atalho do nó Hetzner) etc. é PULADO como `denylist:<palavra>`: o Landlock não barra sinal nem socket unix. A denylist lê o texto do sujeito e da família, não os scripts que eles chamam: o risco que sobra é o de um mutante de UM token de código que a bateria hq-selftests do lastro já roda sem jaula. Baseline (a família sem mutante) que não dá 0 pula o alvo (`base-vermelha`, `base-ambiente` se 97) por 2 dias.
-OPERADORES: no shell só entre tokens soltos (um scanner com pilha passa por aspas, `$( )` e `$(( ))`, comentário e corpo de heredoc: nada em string ou heredoc é mutado; o código de um `$( )` solto sim, o de um `"$( )"` entre aspas duplas não: fica sem mutar, nunca mutado errado); no python pelos
-  tokens (`tokenize`). Se o scanner de shell TERMINA com aspa, `$(` ou heredoc aberto ele se perdeu (o `bash -n` aceita esses arquivos) e a lista que ele deu é incompleta: o alvo é pulado como `scan-perdido` (a linha em
-  que a construção abriu vai em `perdidos` e no estado), nunca contado como coberto. Mutante que não compila (`bash -n`, `compile()`) é `invalid` e não gasta a cota; se o `bash -n` nem pôde rodar (sem bash, preso, morto
-  por sinal) não se sabe: `nao_sei`. Id estável = sha1(arquivo:linha:operador:antes>depois:ocorrência), com o caminho relativo à árvore.
-VEREDITO: morto = algum selftest da família saiu != 0 (prazo e 97 incluídos) · sobrevivente = todos 0; roda DE NOVO numa cópia limpa: se a 2ª reprova é `flaky` (não se reporta), senão `confirmed`.
-  Execução cortada pelo TERM NÃO é veredito (o rc dela é do sinal, não de um teste): nada se grava e o mutante roda de novo na próxima varredura.
-  Cada mutante roda numa CÓPIA da árvore dentro da jaula (--rw só a pasta do slot, HOME e TMPDIR descartáveis, ambiente limpo: `env -i` e só PATH, LANG, LC_*, USER); a jaula é PROVADA antes de qualquer mutante (`--prove`): sem prova, rc 97 e nada roda.
-ESTADO (--state, json, trocado por arquivo temporário): por alvo o hash do conteúdo (e da revisão do scanner), o veredito de cada id, os sobreviventes e a data. Hash igual e tudo coberto = `sem-novidade` (varrer de
-  novo o mesmo conteúdo seria queima disfarçada). Ordem: alvos com arquivo mudado nos últimos 7 dias (git log), depois selftests SEM mutante embutido, depois o menos recente. --cap limita os mutantes por alvo por
-  varredura. O motor NÃO trava o --state: garantir UM sweep por vez por --state é de quem chama (dois ao mesmo tempo = o último a gravar vence). Estado que lê mas tem forma errada = estado-ilegivel (rc 3).
-CÓDIGOS: 0 · 2 uso · 3 estado ilegível/corrompido (NUNCA se zera), árvore ilegível, sem alvos ou gravação que falhou · 97 jaula não provada · 143 interrompido (o estado já gravado vale).
+  A última linha do stdout do `sweep` é UM json: result (completo | parcial | sem-novidade | sem-cobertura | interrompido | sem-jaula | sem-alvos | estado-ilegivel | gravacao-falhou), contagens, skipped{motivo: n},
+  survivors[] (até 15; `survivors_cortados` conta o resto). `sem-novidade` = tudo o que havia já estava coberto e igual; `sem-cobertura` = nada foi examinado. `nao_sei` = alvos em que o `bash -n` não decidiu; `falhas` = execuções
+  que falharam por infra (disco cheio, slot que não limpa): nenhum veredito, o resultado nunca é `completo`; `restam` = candidatos conhecidos ainda sem veredito (nao_sei e falhas: a próxima varredura tenta de novo).
+ALVOS: o SUJEITO de cada `X.selftest.sh` de scripts/ e packs/town-deltas/assets/ é o `X.sh` ou `X.py` da mesma pasta (nome aparado, `a-b-c` → `a-b`, até 3 vezes) E o selftest tem de CITAR o nome do arquivo (senão todo
+  mutante sobreviveria: ruído). FAMÍLIA = todos os selftests que caem no sujeito; todos rodam a cada mutante. Nunca se mutam os arquivos do lastro (hetzner-ballast*), do motor (hq-mutate*) nem da jaula (hq-sandbox-run*), nem sujeito
+  que seja symlink (`symlink`: o motor grava o mutante fora da jaula). Alvo cujo texto cita sudo, systemctl, pkill, docker, gc, bd, dolt (os três só se são o programa de verdade, não o symlink do remote-shim do nó) etc. é PULADO
+  como `denylist:<palavra>` (o Landlock não barra sinal nem socket unix); a denylist lê o texto do sujeito e da família, não os scripts que eles chamam. Baseline (a família sem mutante) que não dá 0 pula o alvo por 2 dias (`base-vermelha`; `base-ambiente` se 97).
+OPERADORES: no shell só entre tokens soltos (um scanner com pilha passa por aspas, `$( )` e `$(( ))`, comentário e corpo de heredoc: nada em string ou heredoc é mutado, e o `"$( )"` entre aspas duplas fica sem mutar, nunca mutado errado); no python
+  pelos tokens (`tokenize`). Scanner que TERMINA com aspa, `$(` ou heredoc aberto se perdeu (o `bash -n` aceita o arquivo): alvo pulado como `scan-perdido`, nunca coberto. Mutante que não compila é `invalid` e não gasta a cota; id estável = sha1(arquivo:linha:operador:antes>depois:ocorrência).
+VEREDITO: morto = algum selftest da família saiu != 0 (prazo e 97 incluídos) · sobrevivente = todos 0, e roda DE NOVO numa cópia limpa: se a 2ª reprova é `flaky` (não se reporta), senão `confirmed`. Execução cortada pelo TERM não é veredito. Cada mutante roda numa CÓPIA
+  da árvore dentro da jaula (--rw só o slot, HOME e TMPDIR descartáveis, `env -i` e só PATH, LANG, LC_*, USER), PROVADA antes de qualquer mutante (`--prove`): sem prova, rc 97 e nada roda.
+ESTADO (--state, json, trocado por arquivo temporário): por alvo o hash do conteúdo (e da revisão do scanner), o veredito de cada id e os sobreviventes. Hash igual e tudo coberto = `sem-novidade` (varrer o mesmo seria queima disfarçada). Ordem: arquivo mudado nos últimos 7 dias (git log),
+  depois selftests SEM mutante embutido, depois o menos recente; --cap limita os mutantes por alvo por varredura. O motor NÃO trava o --state: UM sweep por vez é de quem chama. Estado que lê mas tem forma errada = estado-ilegivel (rc 3, nunca se zera).
+CÓDIGOS: 0 · 2 uso · 3 estado ilegível, árvore ilegível, sem alvos ou gravação que falhou · 97 jaula não provada · 143 interrompido (o estado já gravado vale).
 """
 import argparse
 import hashlib
@@ -163,9 +157,7 @@ def sh_raw(text):
 
 
 def py_raw(text):
-    offs = [0]
-    for line in io.StringIO(text).readlines():
-        offs.append(offs[-1] + len(line))
+    offs = [0, *itertools.accumulate(len(l) for l in io.StringIO(text).readlines())]
     out = []
     for t in tokenize.generate_tokens(io.StringIO(text).readline):
         (r, c), (r2, c2) = t.start, t.end
@@ -226,11 +218,6 @@ def find_subject(d, stem, text):
     return None
 
 
-def complete(ent):
-    """o alvo tem mutantes (total > 0) e todos já têm veredito"""
-    return ent.get("total", 0) > 0 and len(ent.get("verdicts", {})) >= ent["total"]
-
-
 def make_plan(tree, state, recent):
     """alvos (sujeito + família) na ordem da varredura; cada um com `skip` (motivo) ou None. Levanta OSError se a árvore não abre"""
     if not (tree / "scripts").is_dir():
@@ -253,7 +240,9 @@ def make_plan(tree, state, recent):
         old = state["targets"].get(rel, {})
         old = old if old.get("hash") == h else {}
         deny = DENY_RX.search(text)
-        if deny:
+        if subj.resolve() != subj:   # symlink no arquivo ou na pasta: o motor grava o mutante FORA da jaula e a cópia guarda o link, o mutante iria ao arquivo de verdade
+            skip = "symlink"
+        elif deny:
             skip = "denylist:" + deny.group(0)
         elif old.get("skip") and now < old.get("retry_after", 0):
             skip = old["skip"]
@@ -307,6 +296,7 @@ class Ctx:
             self.slots.put(i)
         self.stop, self.pids, self.lock = threading.Event(), set(), threading.Lock()
         self.deadline = time.time() + a.budget_s
+        self.falhas = 0
 
 
 def wipe(ctx, p):
@@ -328,8 +318,7 @@ def exec_family(ctx, slot_n, tgt, text, tmo):
     cd = clone / ctx.tree.relative_to(ctx.root)
     if text is not None:
         (cd / tgt["rel"]).write_text(text, encoding="utf-8")
-    # o HOME de mentira vai por `env` DENTRO da jaula: a jaula confere o --rw contra o HOME de VERDADE, e um slot que contém o HOME de mentira seria pai dele e recusado (rc 64 = baseline vermelha em tudo)
-    # `env -i`: do ambiente do motor só passa PASS_ENV. SSH_AUTH_SOCK, TMUX, DBUS_*, XDG_RUNTIME_DIR, REMOTE_SHIM_CONF e tokens ficam de fora: o Landlock não barra socket unix nem sinal, então o mutante não pode herdar o endereço de nenhum
+    # o HOME de mentira vai por `env` DENTRO da jaula: a jaula confere o --rw contra o HOME de VERDADE, e um slot que contém o HOME de mentira seria pai dele e recusado (rc 64 = baseline vermelha em tudo). `env -i`: do ambiente do motor só passa PASS_ENV. SSH_AUTH_SOCK, TMUX, DBUS_*, XDG_RUNTIME_DIR, REMOTE_SHIM_CONF e tokens ficam de fora: o Landlock não barra socket unix nem sinal, então o mutante não pode herdar o endereço de nenhum
     kv = ["%s=%s" % (k, os.environ[k]) for k in PASS_ENV if k in os.environ] + ["HOME=%s" % (slot / "home"), "TMPDIR=%s" % (slot / "tmp"), "PYTHONDONTWRITEBYTECODE=1", "GIT_AUTHOR_NAME=gt", "GIT_AUTHOR_EMAIL=gt@no", "GIT_COMMITTER_NAME=gt", "GIT_COMMITTER_EMAIL=gt@no"]
     t0, rc = time.time(), 0
     for st in tgt["family"]:
@@ -352,11 +341,15 @@ def exec_family(ctx, slot_n, tgt, text, tmo):
 
 
 def run_slot(ctx, tgt, text, tmo):
-    """(rc, segundos), ou None se o TERM chegou antes ou durante a execução: o rc que sobra (-9 do killpg) é do sinal, não de um teste, e não vira veredito"""
+    """(rc, segundos), ou None se o TERM chegou antes ou durante a execução (o rc que sobra, -9 do killpg, é do sinal, não de um teste) ou se a execução falhou por infra: nenhum veredito"""
     slot_n = ctx.slots.get()
     try:
         r = None if ctx.stop.is_set() else exec_family(ctx, slot_n, tgt, text, tmo)
         return None if ctx.stop.is_set() else r
+    except (OSError, RuntimeError):   # infra (disco cheio, slot que não limpa) não é veredito de teste: conta em `falhas` e o resultado deixa de ser `completo`
+        with ctx.lock:
+            ctx.falhas += 1
+        return None
     finally:
         ctx.slots.put(slot_n)
 
@@ -410,6 +403,7 @@ def prove(a):
 
 def sweep(a):
     tree = Path(a.tree).resolve()
+    a.jail = str(Path(a.jail).resolve())   # a jaula roda com o cwd na cópia: um --jail relativo (a forma do USO) passaria na prova e deixaria toda baseline vermelha
     if tree.parent == Path(a.work).resolve() or tree.parent in Path(a.work).resolve().parents:
         print("hq-mutate: o --work não pode ficar dentro da árvore que se copia", file=sys.stderr)
         return 2
@@ -420,7 +414,7 @@ def sweep(a):
     try:
         state = load_state(a.state)
     except (OSError, ValueError, KeyError, TypeError) as e:
-        summary("estado-ilegivel", erro="%s: %s" % (type(e).__name__, e)[:160])
+        summary("estado-ilegivel", erro=("%s: %s" % (type(e).__name__, e))[:160])
         return 3
     recent = git_recent(tree)
     try:
@@ -448,7 +442,10 @@ def sweep(a):
         if ctx.stop.is_set():
             break
         jobs = []
-        for t, (rc, secs) in zip(batch, base):
+        for t, r in zip(batch, base):
+            if r is None:
+                continue   # não rodou (falha de infra, já contada): o alvo fica como estava e a próxima varredura tenta de novo
+            rc, secs = r
             ent = state["targets"].setdefault(t["rel"], {})
             if ent.get("hash") != t["hash"]:
                 ent.clear()
@@ -513,14 +510,14 @@ def sweep(a):
         except OSError as e:
             err = "%s: %s" % (type(e).__name__, e)
             break
-    done = not ctx.stop.is_set() and err is None and time.time() <= ctx.deadline
+    done = not ctx.stop.is_set() and err is None and time.time() <= ctx.deadline and not ctx.falhas
     ents = [(t, state["targets"].get(t["rel"], {})) for t in plan]
     cur = [e for t, e in ents if e.get("hash") == t["hash"]]
     # sem-cobertura: nada foi examinado nem antes (nenhum alvo com todos os mutantes julgados) nem agora; "completo"/"sem-novidade" sobre isso seria dizer coberto o que ninguém olhou
-    result = ("interrompido" if ctx.stop.is_set() else "gravacao-falhou" if err else "sem-cobertura" if not n["run"] and not any(complete(e) for e in cur) and (done or not todo)
+    result = ("interrompido" if ctx.stop.is_set() else "gravacao-falhou" if err else "sem-cobertura" if not n["run"] and not any(e.get("total", 0) > 0 and len(e.get("verdicts", {})) >= e["total"] for e in cur) and (done or not todo)
               else "sem-novidade" if not todo else "completo" if done else "parcial")
-    summary(result, targets_swept=n["swept"], mutants_run=n["run"], killed=n["killed"], survived=n["survived"], confirmed=n["confirmed"], flaky=n["flaky"], invalid=n["invalid"], nao_sei=n["unknown"],
-            restam=sum(max(0, e.get("total", 0) - len(e.get("verdicts", {}))) for e in cur), skipped=skipped, open_n=sum(len(e.get("survivors", {})) for e in state["targets"].values()), survivors=new_surv,
+    summary(result, targets_swept=n["swept"], mutants_run=n["run"], killed=n["killed"], survived=n["survived"], confirmed=n["confirmed"], flaky=n["flaky"], invalid=n["invalid"], nao_sei=n["unknown"], falhas=ctx.falhas,
+            restam=sum(max(0, e.get("total", 0) - len(e.get("verdicts", {}))) for e in cur), skipped=skipped, open_n=sum(len(e.get("survivors", {})) for e in cur), survivors=new_surv,
             perdidos=lost[:5], recent="ok" if recent is not None else "indisponivel", secs=int(time.time() - t0), jail=proof[:120], **({"erro": err[:160]} if err else {}))
     return 143 if ctx.stop.is_set() else 3 if err else 0
 

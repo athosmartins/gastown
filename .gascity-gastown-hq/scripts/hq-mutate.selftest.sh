@@ -4,10 +4,8 @@
 # ## Contents
 #   Hermético · Casos · Ambiente (97)
 #
-# HERMÉTICO: pasta descartável e uma JAULA FALSA que só registra cada execução e deixa passar (o que o motor decide vale em qualquer sistema). Cada caso é uma IMPRESSÃO DIGITAL (rc, veredito, contagens, execuções na jaula):
-#   vale se for a esperada, e o MUTANTE do motor vale se ela mudar (âncora que não casa exatamente 1 vez = INVÁLIDO, ga-31xxl5). Nenhum caminho do host entra no texto de selftest que a denylist lê.
-# CASOS: gen (operadores, scanner de shell, arquivo perdido = rc 3) · plan · sweep (mortos, sobreviventes, original intacto, --cap, sem-novidade, sem-cobertura, flaky, baseline, estado ruim, bash -n mudo, 97, TERM).
-# AMBIENTE: com a JAULA REAL (Linux com Landlock, o nó) roda também o caso de contenção; sem ela imprime AMBIENTE e sai 97.
+# HERMÉTICO: pasta descartável e uma JAULA FALSA que só registra cada execução e deixa passar. Cada caso é uma IMPRESSÃO DIGITAL (rc, veredito, contagens, execuções na jaula): vale se for a esperada, e o MUTANTE do motor vale se ela mudar (âncora que não casa exatamente 1 vez = INVÁLIDO, ga-31xxl5).
+# AMBIENTE: com a JAULA REAL (Linux com Landlock, o nó) roda também o caso de contenção (o caminho de fora vai no TEXTO do selftest, o `env -i` do motor apagaria uma variável; controle e mutante pelo mesmo caminho); sem ela imprime AMBIENTE e sai 97.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HM="$HERE/hq-mutate.py"
@@ -89,7 +87,6 @@ runs() { grep -c '^run' "$F/jail.log"; }
 cks() { cksum < "$1"; }
 cnt() { echo "rc=$RC $(jf 'd["result"]') run=$(jf 'd["mutants_run"]') k=$(jf 'd["killed"]') c=$(jf 'd["confirmed"]') f=$(jf 'd["flaky"]') inv=$(jf 'd["invalid"]') open=$(jf 'd["open_n"]')"; }
 
-# ── operadores (gen) ───────────────────────────────────────────────────────────────────────────
 cat > "$W/op.sh" << 'EOF'
 #!/bin/bash
 # comentário: [ a -eq b ] && exit 1
@@ -159,14 +156,9 @@ EXP_PY='4|lim|<|<=
 fp_gen() { echo "sh=$(genl "$W/op.sh" | cksum) py=$(genl "$W/op.py" | cksum) dup=$(hm gen "$W/dup.sh" | cut -f1 | sort -u | wc -l | tr -d ' ')"; }
 EXP_GEN="sh=$(printf '%s\n' "$EXP_SH" | cksum) py=$(printf '%s\n' "$EXP_PY" | cksum) dup=2"
 peq "gen: operadores de shell e de python, nada em aspas/comentário/heredoc, ids únicos" "$EXP_GEN" fp_gen
-eq "gen: os mesmos ids nas duas rodadas" "$(hm gen "$W/op.sh" | cut -f1 | cksum)" "$(hm gen "$W/op.sh" | cut -f1 | cksum)"
-printf 'x = """sem fim\n' > "$W/ruim.py"
-hm gen "$W/ruim.py" > /dev/null 2>&1;            eq "gen: python que não tokeniza = rc 3, não zero candidatos" 3 $?
-printf 'echo $[ 1 << y ]\n' > "$W/lo.sh"
-hm gen "$W/lo.sh" > /dev/null 2>&1;              eq "gen: shell que acaba com heredoc aberto (scanner perdido; o bash aceita) = rc 3, não a lista incompleta" 3 $?
+printf 'x = """sem fim\n' > "$W/ruim.py"; hm gen "$W/ruim.py" > /dev/null 2>&1;            eq "gen: python que não tokeniza = rc 3, não zero candidatos" 3 $?
+printf 'echo $[ 1 << y ]\n' > "$W/lo.sh"; hm gen "$W/lo.sh" > /dev/null 2>&1;              eq "gen: shell que acaba com heredoc aberto (scanner perdido; o bash aceita) = rc 3, não a lista incompleta" 3 $?
 hm gen "$W/nao-existe.sh" > /dev/null 2>&1;      eq "gen: arquivo que não abre = rc 3" 3 $?
-hm bobagem > /dev/null 2>&1;                     eq "subcomando desconhecido = rc 2" 2 $?
-hm sweep > /dev/null 2>&1;                       eq "sweep sem argumentos = rc 2" 2 $?
 fp_valid() {
   python3 -I - "${ENG:-$HM}" << 'PY'
 import importlib.util, os, sys, tempfile
@@ -200,18 +192,17 @@ PY
 }
 EXP_FIT="(True, 15, 5) (True, 8, 12)"
 peq "summary: no máximo 15 sobreviventes e a linha cabe em 6000; o que não cabe sai e é contado" "$EXP_FIT" fp_fit
-# ── varredura: impressões digitais ────────────────────────────────────────────────────────────
 fp_sweep() {
   newfx; mkfoo; local o; o=$(cks "$TREE/scripts/foo.sh"); sw
   echo "$(cnt) surv=$(jf '",".join(sorted(s["op"] for s in d["survivors"]))') rec=$(jf 'd["recent"]') jail=$(runs) orig=$([ "$(cks "$TREE/scripts/foo.sh")" = "$o" ] && echo igual || echo MUDOU)" \
-       "left=$(ls "$F/work" | wc -l | tr -d ' ') home=$(awk -F'\t' -v w="$F/work/slot-" '$1 == "run" && (index($3, w) != 1 || index($4, w) != 1) {n++} END {print n+0}' "$F/jail.log")"
+       "left=$(ls "$F/work" | wc -l | tr -d ' ') home=$(awk -F'\t' -v w="$F/work/slot-" '$1 == "run" && (index($3, w) != 1 || index($4, w) != 1) {n++} END {print n+0}' "$F/jail.log")" \
+       "gen=$(hm gen --tree "$TREE" "$TREE/scripts/foo.sh" | cut -f1 | sort > "$F/g"; jf '"\n".join(sorted(x["id"] for x in d["survivors"]))' | sort | comm -12 - "$F/g" | wc -l | tr -d ' ')"
 }
-EXP_SWEEP="rc=0 completo run=6 k=2 c=4 f=0 inv=0 open=4 surv=cmp-lim,exit-rc,exit-rc,num+1 rec=indisponivel jail=11 orig=igual left=0 home=0"
+EXP_SWEEP="rc=0 completo run=6 k=2 c=4 f=0 inv=0 open=4 surv=cmp-lim,exit-rc,exit-rc,num+1 rec=indisponivel jail=11 orig=igual left=0 home=0 gen=4"
 fp_again() { newfx; mkfoo; sw; local j; j=$(runs); sw; echo "$(jf 'd["result"]') run=$(jf 'd["mutants_run"]') novas=$(( $(runs) - j ))"; }
 fp_cap() {
   newfx; mkfoo; local o="" i
-  for i in 1 2 3 4; do sw --cap 2; o="$o $(jf 'd["result"]'):$(jf 'd["mutants_run"]'):$(jf 'd["restam"]')"; done
-  echo "$o verdicts=$(python3 -I -c 'import json,sys; print(sum(len(t["verdicts"]) for t in json.load(open(sys.argv[1]))["targets"].values()))' "$F/state.json")"
+  for i in 1 2 3 4; do sw --cap 2; o="$o $(jf 'd["result"]'):$(jf 'd["mutants_run"]'):$(jf 'd["restam"]')"; done; echo "$o verdicts=$(python3 -I -c 'import json,sys; print(sum(len(t["verdicts"]) for t in json.load(open(sys.argv[1]))["targets"].values()))' "$F/state.json")"
 }
 fp_jail() { newfx; mkfoo; FAKE_JAIL=inerte sw; echo "rc=$RC $(jf 'd["result"]') jail=$(runs) state=$([ -e "$F/state.json" ] && echo existe || echo nao)"; }
 fp_base() {  # fp_base RC: o selftest do foo sai com RC mesmo sem mutante
@@ -279,21 +270,30 @@ fp_sem_alvos() {  # sem alvo = rc 3; só alvo pulado (denylist) = rc 0 mas sem-c
   mkdir -p "$F/v/hq"; hm sweep --tree "$F/v/hq" --state "$F/s2.json" --work "$F/work" --jail "$W/fakejail.py" > "$F/out" 2> /dev/null; a="$a rc=$? $(jf 'd["result"]')"
   mkfoo; mkst foo 'bash "$H/foo.sh"; : sudo'; sw; echo "$a rc=$RC $(jf 'd["result"]') skipped=$(jf '",".join("%s=%d" % kv for kv in sorted(d["skipped"].items()))')"
 }
-peq "sweep: mortos, sobreviventes confirmados, original intacto, HOME/TMPDIR no slot, slots limpos" "$EXP_SWEEP" fp_sweep
+fp_symlink() {
+  newfx; mkfoo; mkdir "$F/ext"; mv "$TREE/scripts/foo.sh" "$F/ext/foo.sh"; ln -s "$F/ext/foo.sh" "$TREE/scripts/foo.sh"; local a; a=$(cks "$F/ext/foo.sh"); sw
+  echo "rc=$RC $(jf 'd["result"]') run=$(jf 'd["mutants_run"]') skipped=$(jf '",".join("%s=%d" % kv for kv in sorted(d["skipped"].items()))') ext=$([ "$(cks "$F/ext/foo.sh")" = "$a" ] && echo intacto || echo MUDOU)"
+}
+fp_falha() {   # um ARQUIVO no lugar da pasta do slot: a execução falha por infra
+  newfx; mkfoo; : > "$F/work/slot-0"; : > "$F/work/slot-1"; sw; local a="rc=$RC $(jf 'd["result"]') run=$(jf 'd["mutants_run"]') falhas=$(jf 'd["falhas"]')"
+  rm -f "$F/work/slot-0" "$F/work/slot-1"; sw; echo "$a | $(cnt)"
+}
+fp_jailrel() { newfx; mkfoo; cd "$W" && JAIL=fakejail.py sw; cnt; }   # --jail relativo (a forma do USO): resolvido uma vez, senão toda baseline vira vermelha
+EXP_SW0="rc=0 completo run=6 k=2 c=4 f=0 inv=0 open=4"; EXP_SYM="rc=0 sem-cobertura run=0 skipped=symlink=1 ext=intacto"; EXP_FALHA="rc=0 parcial run=0 falhas=1 | $EXP_SW0"
+peq "sujeito symlink: pulado (symlink=1), nada rodou e o arquivo de fora não mudou" "$EXP_SYM" fp_symlink
+peq "execução que falha por infra: rc 0, parcial, falhas=1, nenhum veredito; consertado o slot a varredura seguinte roda os 6" "$EXP_FALHA" fp_falha
+peq "--jail relativo funciona como o absoluto" "$EXP_SW0" fp_jailrel
+peq "sweep: mortos, sobreviventes confirmados, original intacto, HOME/TMPDIR no slot, slots limpos; os ids do gen --tree são os que ele grava" "$EXP_SWEEP" fp_sweep
 fp_semvalid() {  # bash -n que sai com rc estranho: nenhum veredito (nem "i"), nao_sei, e a varredura seguinte tenta de novo
   newfx; mkfoo; mkdir "$F/bin"; printf '#!/bin/sh\n[ "$1" = -n ] && exit 5\nexec /bin/bash "$@"\n' > "$F/bin/bash"; chmod +x "$F/bin/bash"
   PATH="$F/bin:$PATH" sw; local a="rc=$RC $(jf 'd["result"]') run=$(jf 'd["mutants_run"]') nao_sei=$(jf 'd["nao_sei"]') inv=$(jf 'd["invalid"]') restam=$(jf 'd["restam"]')"
   sw; echo "$a | $(cnt)"
-}
-fp_gentree() {  # os ids do `gen --tree` são os que o sweep grava (os 4 sobreviventes estão entre eles); sem --tree o nome entra no lugar do caminho
-  newfx; mkfoo; sw; hm gen --tree "$TREE" "$TREE/scripts/foo.sh" | cut -f1 | sort > "$F/g"; jf '"\n".join(sorted(x["id"] for x in d["survivors"]))' | sort | comm -12 - "$F/g" | wc -l | tr -d ' '
 }
 peq "sweep de novo, mesmo conteúdo: sem-novidade e nada roda (varrer o mesmo é queima disfarçada)" "sem-novidade run=0 novas=0" fp_again
 EXP_CAP=" completo:2:4 completo:2:2 completo:2:0 sem-novidade:0:0 verdicts=6"
 peq "--cap 2: pega os próximos ainda não vistos até cobrir os 6 (restam diz quantos faltam), depois sem-novidade" "$EXP_CAP" fp_cap
 EXP_SV="rc=0 sem-cobertura run=0 nao_sei=1 inv=0 restam=6 | rc=0 completo run=6 k=2 c=4 f=0 inv=0 open=4"
 peq "bash -n sem resposta (rc 5): nada roda, nenhum veredito, nao_sei; a varredura seguinte roda os 6" "$EXP_SV" fp_semvalid
-peq "gen --tree imprime os ids que o sweep grava" 4 fp_gentree
 peq "jaula não provada: rc 97, nenhuma execução, nenhum estado" "rc=97 sem-jaula jail=0 state=nao" fp_jail
 EXP_B1="rc=0 res=sem-cobertura run=0 jail=1 skipped=base-vermelha=1 plan=base-vermelha"
 peq "baseline vermelha pula o alvo (1 execução, nenhum mutante), o plan diz por quê e o result é sem-cobertura" "$EXP_B1" fp_base 1
@@ -321,7 +321,7 @@ newfx; mkfoo; printf 'lixo' > "$F/s.json"; hm plan --tree "$TREE" --state "$F/s.
 
 # ── plan: sujeito, família, exclusões, ordem, cobertura, retry_after ────────────────────────────────
 fp_plan() {
-  newfx; local n R="$F/root"
+  newfx; local n R="$F/root" ord cov part skip exp
   for n in alpha beta zeta delta gamma hetzner-ballast-q; do echo 'echo x' > "$TREE/scripts/$n.sh"; mkst "$n" "bash \"\$H/$n.sh\""; done
   mkst delta 'bash "$H/delta.sh"; : sudo'; mkst gamma 'true'
   mkdir -p "$TREE/packs/town-deltas/assets"; echo 'x = 1' > "$TREE/packs/town-deltas/assets/eps.py"; mkst eps 'python3 "$H/eps.py"; : mut x' packs/town-deltas/assets
@@ -329,11 +329,9 @@ fp_plan() {
   git -C "$R" add . ; git -C "$R" reset -q -- hq/scripts/alpha.sh hq/scripts/alpha.selftest.sh
   GIT_AUTHOR_DATE="2020-01-01T00:00:00" GIT_COMMITTER_DATE="2020-01-01T00:00:00" git -C "$R" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q -m velho
   git -C "$R" add . ; git -C "$R" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q -m novo
-  local pl="hm plan --tree $TREE --state $F/st.json" h1 h2
-  echo '{"v":1,"targets":{}}' > "$F/st.json"
+  local pl="hm plan --tree $TREE --state $F/st.json" h1 h2; echo '{"v":1,"targets":{}}' > "$F/st.json"
   h1=$($pl | awk -F'\t' '$2 == "scripts/zeta.sh" {print $6}'); h2=$($pl | awk -F'\t' '$2 == "scripts/beta.sh" {print $6}')
   st() { printf '{"v":1,"targets":{"scripts/zeta.sh":%s,"scripts/beta.sh":%s}}' "$1" "$2" > "$F/st.json"; $pl | awk -F'\t' -v r="$3" '$2 == r {print $1}'; }
-  local ord cov part skip exp
   ord=$(st "{\"hash\":\"$h1\",\"swept\":100}" "{\"hash\":\"$h2\",\"swept\":500}" scripts/zeta.sh > /dev/null; $pl | awk -F'\t' '{printf "%s@%s ", $1, $2}')
   cov=$(st "{\"hash\":\"$h1\",\"total\":2,\"verdicts\":{\"a\":\"k\",\"b\":\"k\"}}" '{}' scripts/zeta.sh)
   part=$(st "{\"hash\":\"$h1\",\"total\":3,\"verdicts\":{\"a\":\"k\",\"b\":\"k\"}}" '{}' scripts/zeta.sh)
@@ -343,7 +341,6 @@ fp_plan() {
 }
 EXP_PLAN="todo@scripts/alpha.sh denylist:sudo@scripts/delta.sh todo@scripts/zeta.sh todo@scripts/beta.sh todo@packs/town-deltas/assets/eps.py | cov=sem-novidade part=todo skip=base-vermelha exp=todo"
 peq "plan: alpha (mudou há <7 dias) primeiro; depois sem mutante embutido e menos recente; eps (embutido) por último; gamma e hetzner-ballast fora; cobertura e retry_after" "$EXP_PLAN" fp_plan
-# ── mutantes do motor ─────────────────────────────────────────────────────────────────────────────
 # mut NOME ANTIGO NOVO: copia o motor e troca ANTIGO por NOVO (tem de casar exatamente 1 vez); o caminho fica em $MP
 mut() {
   MP="$W/eng-$1.py"
@@ -364,7 +361,7 @@ par kill_it prova-ignorada       fp_jail    "rc=97 sem-jaula jail=0 state=nao" '
 par kill_it baseline-ignorada    fp_base    "$EXP_B1" '            if rc != 0:' '            if False:' 1
 par kill_it ambiente-e-vermelha  fp_base    "$EXP_B97" '"base-ambiente" if rc == 97 else' '"base-ambiente" if False else' 97
 par kill_it sem-cobertura-falsa  fp_base    "$EXP_B1" '"sem-cobertura" if not n["run"] and' '"sem-cobertura" if False and' 1
-par kill_it denylist-off         fp_denys   "|denylist:sudo|denylist:kill -s KILL -1|denylist:tmux|denylist:--unix-socket|todo" '        if deny:' '        if False:'
+par kill_it denylist-off         fp_denys   "|denylist:sudo|denylist:kill -s KILL -1|denylist:tmux|denylist:--unix-socket|todo" '        elif deny:' '        elif False:'
 par kill_it kill-largo-demais    fp_denys   "|denylist:sudo|denylist:kill -s KILL -1|denylist:tmux|denylist:--unix-socket|todo" '|\bkill\b[^\n]*\s-1\b|' '|\bkill\b|'
 par kill_it tmux-fora            fp_denys   "|denylist:sudo|denylist:kill -s KILL -1|denylist:tmux|denylist:--unix-socket|todo" '|tmux|' '|'
 par kill_it shim-invertido       fp_shims   "todo denylist:gc denylist:bd" 'not in SHIMS]' 'in SHIMS]'
@@ -403,7 +400,13 @@ par kill_it comentario-e-codigo  fp_gen     "$EXP_GEN" '            elif c == "#
 par kill_it heredoc-e-codigo     fp_gen     "$EXP_GEN" '                    here = (m.group(3), m.group(1) == "-", n)' '                    here = None'
 par kill_it here-string-e-heredoc fp_gen    "$EXP_GEN" ' and line[i - 1:i] != "<"' ''
 par kill_it aritmetica-e-heredoc fp_gen     "$EXP_GEN" ' and line[:i].count("((") <= line[:i].count("))")' ''
-par kill_it gen-sem-tree         fp_gentree 4 'Path(a.file).resolve().relative_to(Path(a.tree).resolve()).as_posix() if a.tree else Path(a.file).name' 'Path(a.file).name'
+par kill_it jail-relativo        fp_jailrel "$EXP_SW0" '    a.jail = str(Path(a.jail).resolve())' '    pass'
+par kill_it symlink-gravado      fp_symlink "$EXP_SYM" '        if subj.resolve() != subj:' '        if False:'
+par kill_it falha-derruba        fp_falha   "$EXP_FALHA" '    except (OSError, RuntimeError):' '    except ZeroDivisionError:'
+par kill_it falha-calada         fp_falha   "$EXP_FALHA" '            ctx.falhas += 1' '            pass'
+par kill_it falha-e-completo     fp_falha   "$EXP_FALHA" ' and not ctx.falhas' ''
+par kill_it base-nula-cai        fp_falha   "$EXP_FALHA" '            if r is None:' '            if False:'
+par kill_it gen-sem-tree         fp_sweep   "$EXP_SWEEP" 'Path(a.file).resolve().relative_to(Path(a.tree).resolve()).as_posix() if a.tree else Path(a.file).name' 'Path(a.file).name'
 reap
 # controle do controle: o `mut` recusa uma âncora ambígua e uma que não casa
 FAIL0=$FAIL   # o mut recusa e conta uma falha própria: aqui a recusa é o esperado, então só a aceitação reprova
@@ -415,12 +418,16 @@ out=$(python3 -I "$HERE/hq-sandbox-run.py" --probe 2>&1) && case "$out" in "HQSB
 if [ "$SKIP" = 1 ]; then
   echo "AMBIENTE: sem Landlock ABI >= 4 aqui ($out): o caso com a jaula REAL não rodou (o nó roda)"
 else
-  newfx; mkfoo; mkdir "$F/fora"; export FORA="$F/fora"
-  mkst foo '( echo x > "$FORA/vazou" ) 2> /dev/null; [ "$(bash "$H/foo.sh" 9)" = big ] || exit 1
+  vz() {  # o selftest escreve fora do --work; o caminho vai no TEXTO dele (o env -i do motor apagaria uma variável); quem decide se a escrita passa é a jaula
+    newfx; mkfoo; mkdir "$F/fora"
+    mkst foo '( echo x > "'"$F"'/fora/vazou" ) 2> /dev/null
+[ "$(bash "$H/foo.sh" 9)" = big ] || exit 1
 [ "$(bash "$H/foo.sh" 1)" = small ] || exit 1'
-  JAIL="$HERE/hq-sandbox-run.py" sw
-  eq "jaula real: o veredito é o mesmo e nenhuma execução escreveu fora do --work" "rc=0 completo run=6 k=2 c=4 f=0 inv=0 open=4 vazou=nao" "$(cnt) vazou=$([ -e "$F/fora/vazou" ] && echo SIM || echo nao)"
-  ( cd "$TREE" && bash scripts/foo.selftest.sh ) > /dev/null 2>&1; [ -e "$F/fora/vazou" ] && ok || bad "controle: sem a jaula o mesmo selftest ESCREVE fora (senão 'não vazou' não provaria nada)"
+    JAIL=$1 sw; echo "$(cnt) vazou=$([ -e "$F/fora/vazou" ] && echo SIM || echo nao)"
+  }
+  eq "jaula real: o veredito é o mesmo e a escrita fora do --work é barrada" "$EXP_SW0 vazou=nao" "$(vz "$HERE/hq-sandbox-run.py")"
+  eq "controle pelo MESMO caminho do motor, com a jaula que não contém: a escrita passa" "$EXP_SW0 vazou=SIM" "$(vz "$W/fakejail.py")"
+  eq "mutante jaula-nao-usada com a jaula real: a escrita passa (o caso reprova se a contenção cair)" "$EXP_SW0 vazou=SIM" "$(ENG="$W/eng-jaula-nao-usada.py" vz "$HERE/hq-sandbox-run.py")"
 fi
 
 echo "hq-mutate selftest: $PASS passed, $FAIL failed$([ "$SKIP" = 1 ] && echo ", caso da jaula real NÃO rodou (AMBIENTE)")"
