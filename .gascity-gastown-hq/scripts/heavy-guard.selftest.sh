@@ -313,15 +313,17 @@ push_cases() {
   mkdir -p "$PB" "$PD"
   cat > "$PB/git" <<EOF
 #!/bin/sh
+# the TERM dispositions come FIRST: writing dfnow below is what lets the watch see the disk fall and send the TERM, so a trap installed after that line loses the race on a loaded
+# node (the fake dies of the default TERM, rc 143, and the guard answers 78 to a push that was meant to ignore TERM or to exit 0 on it)
+[ -n "\$FAKE_GIT_IGNORE_TERM" ] && trap '' TERM
+[ -n "\$FAKE_GIT_TERM0" ] && trap 'echo "end \$\$" >> "$W/gitlog"; exit 0' TERM
 echo "start \$\$" >> "$W/gitlog"
 echo "git \$*" > "$W/gitargs"
 [ -n "\$FAKE_GIT_LOCKDIR" ] && [ -d "\$FAKE_GIT_LOCKDIR" ] && echo held >> "$W/lockseen"
 [ -n "\$FAKE_GIT_DF" ] && echo "\$FAKE_GIT_DF" > "$W/dfnow"
 [ -n "\$FAKE_GIT_DFBAD" ] && : > "$W/dfbad"
-[ -n "\$FAKE_GIT_IGNORE_TERM" ] && trap '' TERM
 [ -n "\$FAKE_GIT_GRANDCHILD" ] && { "$PB/hook" >/dev/null 2>&1 & echo \$! > "$W/grandchild"; }
 if [ -n "\$FAKE_GIT_TERM0" ]; then
-  trap 'echo "end \$\$" >> "$W/gitlog"; exit 0' TERM
   [ -n "\$FAKE_GIT_SLEEP" ] && { sleep "\$FAKE_GIT_SLEEP" & wait \$!; }
 elif [ -n "\$FAKE_GIT_SLEEP" ]; then
   sleep "\$FAKE_GIT_SLEEP"
@@ -501,8 +503,15 @@ EOF
   fi
   if want term0; then
   # a push that exits 0 even when told to stop did finish: its 0 comes through, it is not turned into a 78
+  # One rerun is allowed on a 78. bash 5.2.21 (the node) answers "-1", not a status, to the `wait` that follows one cut short by the watch's USR1 when the push ends at that very moment (measured 27/10 on the node, with a traced copy of the guard: 10 of 200
+  # runs one after the other, about 1 in 3 with 24 at once), and the guard reads a "-1" as "not 0": the conservative 78, never a false success. That is a window of the shell, not the rule under test (the guard is left as it was; ga-dousipw has the evidence and what did not work). The rule is red
+  # if it fails twice (about 1 in 400 by chance); a guard that turns every 0 into a 78 (the mutant p-rc0) fails both tries.
   p_reset
   pbounded 25 env "${wenv[@]}" FAKE_GIT_DF=3900 FAKE_GIT_SLEEP=8 FAKE_GIT_TERM0=1 "$g" --what pre-push -- git push origin HEAD 2>/dev/null >/dev/null; rc=$?
+  if [ "$rc" = 78 ]; then
+    p_reset
+    pbounded 25 env "${wenv[@]}" FAKE_GIT_DF=3900 FAKE_GIT_SLEEP=8 FAKE_GIT_TERM0=1 "$g" --what pre-push -- git push origin HEAD 2>/dev/null >/dev/null; rc=$?
+  fi
   check "push watch: a push that ended with 0 keeps its 0 even after the watch told it to stop" 0 "$rc"
   fi
   if want stopfloor; then
@@ -739,6 +748,14 @@ lookup_cases() { # lookup_cases <guard>
   fi
 }
 
+# ── ambient write limit (ga-e6ug8gq) ───────────────────────────────────────────────────────────────────────
+# Run through the guard itself (`heavy-guard.sh --what X -- bash scripts/heavy-guard.selftest.sh`, the sanctioned route) this selftest starts under a 512 MB `ulimit -f`, soft and hard. Then "the guard capped the step at
+# 512 MB" and "the guard did not cap it" print the SAME number in the child (524288), so the cases that tell them apart go green by accident and the guard mutants that drop the default cap survive. Those assertions are
+# SKIPPED, visibly (AMBIENTE note and exit 97 at the end), instead of passing or failing by luck. They need a baseline that a 512 MB cap would change: the soft AND the hard limit each unlimited or above 524288 KB.
+# vazio/falhou/ilegível (the reading prints nothing, or something that is neither "unlimited" nor a number) → cannot tell the cap from the baseline: AMB_OK=0, the skipping side; unlimited → ok; a number: ok above 524288 only
+amb_ok() { case "$1" in unlimited) return 0 ;; ''|*[!0-9]*) return 1 ;; *) [ "$1" -gt 524288 ] ;; esac; }
+AMB_OK=0; amb_ok "$(bash -c 'ulimit -S -f' 2>/dev/null)" && amb_ok "$(bash -c 'ulimit -H -f' 2>/dev/null)" && AMB_OK=1
+
 # ── file-cap cases (ga-e6ug8gq): fcap_cases <guard> <lib> ─────────────────────────────────────────────────
 # 27/10 05:09-05:24: an ad-hoc mutant battery on a selftest ran an awk mutant that looped for ever and wrote 4.2 and 5.6 GB into $TMPDIR; the disk hit 0 twice and Dolt took ENOSPC. The writer below IS that loop, stopped at 8M lines
 # (~260 MB) only so that a guard WITHOUT the cap does not fill the disk of this selftest. `bash -c 'ulimit -f'` everywhere: sh is POSIX mode on macOS (512-byte units) and dash on Linux.
@@ -767,29 +784,32 @@ EOF
   }
   floop "--max-file-mb 4 on a plain step" fcap-loop.sh run --max-file-mb 4 --what t --
   floop "a selftest step takes the class cap (HEAVY_GUARD_SELFTEST_MAX_FILE_MB=4)" fcap-loop.selftest.sh env HEAVY_GUARD_SELFTEST_MAX_FILE_MB=4 DISK_FREE_OVERRIDE_MB=20000 HEAVY_GUARD_LIB="$lib" "$g" --what t --
-  # the cap as the child sees it, in KB (bash's unit): 512 MB for the selftest/mutant class, the caller's number when given, nothing for the rest
-  out="$(run --what selftest-hq -- bash -c 'ulimit -f')";                         [ "$out" = 524288 ] || bad "fcap: a selftest LABEL gets the default 512 MB cap, 524288 KB (got '$out')"
-  out="$(run --what 'Mutant battery' -- bash -c 'ulimit -f')";                    [ "$out" = 524288 ] || bad "fcap: a mutant label (capitals ignored) gets the default cap (got '$out')"
-  out="$(run --what t -- bash -c 'ulimit -f' x foo.selftest.sh)";                [ "$out" = 524288 ] || bad "fcap: a *.selftest.sh word in the command gets the default cap (got '$out')"
-  out="$(run --what t -- bash -c 'ulimit -f' x run-mutants.sh)";                 [ "$out" = 524288 ] || bad "fcap: a *mutant* word in the command gets the default cap (got '$out')"
-  out="$(run --what t -- bash -c 'ulimit -f' x hq-mutate.py)";                   [ "$out" = 524288 ] || bad "fcap: hq-mutate.py gets the default cap (got '$out')"
-  out="$(run --what repack -- bash -c 'ulimit -f')";                              [ "$out" = "$base" ] || bad "fcap: an ordinary heavy step is NOT capped by default, a repack can write a big pack (got '$out', was '$base')"
+  # the cap as the child sees it, in KB (bash's unit): the caller's number beats the class default and the env seam sets it. These three read the same under the 512 MB ambient limit (8, 3 and 7 MB are under it), so they run either way
   out="$(run --max-file-mb 8 --what repack -- bash -c 'ulimit -f')";             [ "$out" = 8192 ] || bad "fcap: --max-file-mb 8 caps any step at 8192 KB (got '$out')"
   out="$(run --max-file-mb 3 --what selftest -- bash -c 'ulimit -f')";           [ "$out" = 3072 ] || bad "fcap: the caller's number beats the class default (got '$out')"
-  out="$(run --max-file-mb 0 --what selftest -- bash -c 'ulimit -f')";           [ "$out" = "$base" ] || bad "fcap: --max-file-mb 0 is the explicit way to run a selftest uncapped (got '$out')"
   out="$(HEAVY_GUARD_SELFTEST_MAX_FILE_MB=7 run --what selftest -- bash -c 'ulimit -f')"; [ "$out" = 7168 ] || bad "fcap: HEAVY_GUARD_SELFTEST_MAX_FILE_MB sets the class cap (got '$out')"
-  out="$(HEAVY_GUARD_SELFTEST_MAX_FILE_MB=0 run --what selftest -- bash -c 'ulimit -f')"; [ "$out" = 524288 ] || bad "fcap: a class cap of 0 in the env falls back to 512 MB, it does not uncap (got '$out')"
-  out="$(HEAVY_GUARD_SELFTEST_MAX_FILE_MB=abc run --what selftest -- bash -c 'ulimit -f')"; [ "$out" = 524288 ] || bad "fcap: a class cap that is not a number falls back to 512 MB (got '$out')"
+  # 512 MB for the selftest/mutant class and nothing for the rest: the child reads 524288 when capped and its baseline when not, which differ only if the ambient limit is not itself 512 MB or less (AMB_OK)
+  if [ "$AMB_OK" = 1 ]; then
+    out="$(run --what selftest-hq -- bash -c 'ulimit -f')";                         [ "$out" = 524288 ] || bad "fcap: a selftest LABEL gets the default 512 MB cap, 524288 KB (got '$out')"
+    out="$(run --what 'Mutant battery' -- bash -c 'ulimit -f')";                    [ "$out" = 524288 ] || bad "fcap: a mutant label (capitals ignored) gets the default cap (got '$out')"
+    out="$(run --what t -- bash -c 'ulimit -f' x foo.selftest.sh)";                [ "$out" = 524288 ] || bad "fcap: a *.selftest.sh word in the command gets the default cap (got '$out')"
+    out="$(run --what t -- bash -c 'ulimit -f' x run-mutants.sh)";                 [ "$out" = 524288 ] || bad "fcap: a *mutant* word in the command gets the default cap (got '$out')"
+    out="$(run --what t -- bash -c 'ulimit -f' x hq-mutate.py)";                   [ "$out" = 524288 ] || bad "fcap: hq-mutate.py gets the default cap (got '$out')"
+    out="$(run --what repack -- bash -c 'ulimit -f')";                              [ "$out" = "$base" ] || bad "fcap: an ordinary heavy step is NOT capped by default, a repack can write a big pack (got '$out', was '$base')"
+    out="$(run --max-file-mb 0 --what selftest -- bash -c 'ulimit -f')";           [ "$out" = "$base" ] || bad "fcap: --max-file-mb 0 is the explicit way to run a selftest uncapped (got '$out')"
+    out="$(HEAVY_GUARD_SELFTEST_MAX_FILE_MB=0 run --what selftest -- bash -c 'ulimit -f')"; [ "$out" = 524288 ] || bad "fcap: a class cap of 0 in the env falls back to 512 MB, it does not uncap (got '$out')"
+    out="$(HEAVY_GUARD_SELFTEST_MAX_FILE_MB=abc run --what selftest -- bash -c 'ulimit -f')"; [ "$out" = 524288 ] || bad "fcap: a class cap that is not a number falls back to 512 MB (got '$out')"
+  fi
   # a Go step and a push keep their own rules (a Go build and a git pack write big files): a word `selftest` in their command does not cap them
-  out="$(run --what go-test -- bash -c 'ulimit -f' x selftest)";                  [ "$out" = "$base" ] || bad "fcap: a Go step is not capped by the selftest class (got '$out')"
+  out="$(run --what go-test -- bash -c 'ulimit -f' x selftest)";                  [ "$AMB_OK" != 1 ] || [ "$out" = "$base" ] || bad "fcap: a Go step is not capped by the selftest class (got '$out')"
   rm -f "$W/git-ulimit"
   PATH="$FB:$PATH" HEAVY_GUARD_PUSH_LOCK_DIR="$W/fplock" run --what t -- git push origin fix/x-selftest >/dev/null 2>&1; rc=$?
   check "fcap: the push runs" 0 "$rc"
-  [ "$(cat "$W/git-ulimit" 2>/dev/null)" = "$base" ] || bad "fcap: a push is not capped by the selftest class (got '$(cat "$W/git-ulimit" 2>/dev/null)')"
+  [ "$AMB_OK" != 1 ] || [ "$(cat "$W/git-ulimit" 2>/dev/null)" = "$base" ] || bad "fcap: a push is not capped by the selftest class (got '$(cat "$W/git-ulimit" 2>/dev/null)')"
   rm -f "$W/git-ulimit"
   PATH="$FB:$PATH" run --what t -- git repack -a selftest-pack >/dev/null 2>&1; rc=$?
   check "fcap: the repack runs" 0 "$rc"
-  [ "$(cat "$W/git-ulimit" 2>/dev/null)" = "$base" ] || bad "fcap: a git command is never in the selftest class, a repack writes a big pack on purpose (got '$(cat "$W/git-ulimit" 2>/dev/null)')"
+  [ "$AMB_OK" != 1 ] || [ "$(cat "$W/git-ulimit" 2>/dev/null)" = "$base" ] || bad "fcap: a git command is never in the selftest class, a repack writes a big pack on purpose (got '$(cat "$W/git-ulimit" 2>/dev/null)')"
   # --check runs nothing, so there is nothing to cap, and a cap given with it is not an error
   run --check --max-file-mb 4 --what selftest 2>/dev/null; rc=$?;               check "fcap: --check accepts --max-file-mb" 0 "$rc"
   # usage: whole number of MB, at most 9 digits, a value is needed
@@ -797,7 +817,7 @@ EOF
   run --max-file-mb -1 --what t -- true 2>/dev/null; rc=$?;                     check "fcap: --max-file-mb -1 is a usage error" 64 "$rc"
   run --max-file-mb 1234567890 --what t -- true 2>/dev/null; rc=$?;            check "fcap: --max-file-mb of 10 digits is a usage error" 64 "$rc"
   run --what t --max-file-mb 2>/dev/null; rc=$?;                                check "fcap: --max-file-mb without a value is a usage error" 64 "$rc"
-  # fail CLOSED: a cap that cannot be set (and is not already tighter) means the step does not run. The ulimit builtin is replaced through BASH_ENV (read by the guard's own bash)
+  # fail CLOSED: a cap that cannot be set (and whose reading is not already at or under the ask: a tighter HARD limit that ulimit will not let go) means the step does not run. The ulimit builtin is replaced through BASH_ENV (read by the guard's own bash)
   fk() { # fk <name> <ulimit function body> — the guard with that fake ulimit, the step is `touch ran`
     printf 'ulimit() { %s; }\n' "$2" > "$W/ulimit-$1.env"; rm -f "$W/fran"
     BASH_ENV="$W/ulimit-$1.env" run --max-file-mb 512 --what t -- touch "$W/fran" 2>"$W/ferr"; rc=$?
@@ -815,7 +835,7 @@ EOF
   fk big '[ $# -eq 1 ] && echo 999999999; return 0'
   check "fcap: a ulimit that says it set the cap but reads a looser one refuses with 76" 76 "$rc"; [ ! -e "$W/fran" ] || bad "fcap: the step RAN with a cap looser than asked"
   fk tight '[ $# -eq 1 ] && echo 1000; [ $# -eq 2 ] && return 1; return 0'
-  check "fcap: a cap that cannot be raised but is already TIGHTER than asked is fine (the step runs)" 0 "$rc"; [ -e "$W/fran" ] || bad "fcap: the step did not run under a tighter inherited cap"
+  check "fcap: a cap that cannot be raised but already reads TIGHTER than asked (a tighter hard limit) is fine (the step runs)" 0 "$rc"; [ -e "$W/fran" ] || bad "fcap: the step did not run under a tighter inherited cap"
 }
 
 mk_mutant() { # mk_mutant <src> <dst> <sed-expr>  — fails the selftest if the expression changed nothing
@@ -834,6 +854,14 @@ before=$FAIL; fcap_cases "$REAL_GUARD" "$REAL_LIB";       [ "$FAIL" -eq "$before
 # mutants: each must make at least one case fail
 survive() { # survive <name> -- the FAIL counter must have grown since $before
   if [ "$FAIL" -gt "$before" ]; then FAIL=$before; PASS=$((PASS+1)); else bad "mutant '$1' survived: no case noticed it"; fi
+}
+# the file-cap mutants under an ambient limit that is itself the cap (AMB_OK=0): the cases that would catch a dropped default cap were skipped, so a mutant nobody noticed is UNVERIFIED, not a survivor. One that a case
+# DID notice is killed as always. With AMB_OK=1 it is exactly survive.
+UNVER=0; UNVER_NAMES=""
+survive_amb() { # survive_amb <name> -- the FAIL counter must have grown since $before, or (AMB_OK=0) the mutant is counted as unverified
+  if [ "$FAIL" -gt "$before" ]; then FAIL=$before; PASS=$((PASS+1))
+  elif [ "$AMB_OK" != 1 ]; then UNVER=$((UNVER+1)); UNVER_NAMES="$UNVER_NAMES [$1]"
+  else bad "mutant '$1' survived: no case noticed it"; fi
 }
 M="$W/mut"; mkdir -p "$M"
 mk_mutant "$REAL_LIB" "$M/lib-le.sh" 's/-lt "\$_dh_min"/-le "$_dh_min"/' && { before=$FAIL; lib_cases "$M/lib-le.sh" >/dev/null; survive "lib: -lt became -le"; }
@@ -941,7 +969,7 @@ lkm l-nolog   "lookup: the refusal log does not list the places"      's#\${HG_L
 [ "$LK_CAN_HIDE" = 1 ] && lkm l-noread "lookup: an unreadable lib is taken for the lib" 's# && \[ -r "\$hg_c" \]##'
 
 fcm() { # fcm <file> <name> <sed-expr>  (a mutant of the GUARD, run through the file-cap cases)
-  mk_mutant "$REAL_GUARD" "$M/$1.sh" "$3" && { before=$FAIL; fcap_cases "$M/$1.sh" "$REAL_LIB" >/dev/null 2>&1; survive "$2"; }
+  mk_mutant "$REAL_GUARD" "$M/$1.sh" "$3" && { before=$FAIL; fcap_cases "$M/$1.sh" "$REAL_LIB" >/dev/null 2>&1; survive_amb "$2"; }
 }
 # file cap (ga-e6ug8gq): every line of the class has a mutant that the cases above must notice
 fcm f-nocap    "fcap: the cap is never applied"                                 's#^    if \[ "\$fcap_mb" -gt 0 \] && ! hg_apply_fcap "\$fcap_mb"; then$#    if false; then#'
@@ -968,5 +996,8 @@ fcm f-nomsg    "fcap: the refusal does not say it is rc 76"                     
 fcm f-nodigit  "fcap: --max-file-mb accepts anything"                           's#^  case "\$fcap" in .*exit 64 ;; esac$#  :#'
 fcm f-nolen    "fcap: --max-file-mb has no magnitude cap"                        '/^  \[ "\${#fcap}" -le 9 \]/d'
 
-echo "heavy-guard selftest: $PASS passed, $FAIL failed"
-[ "$FAIL" -eq 0 ]
+[ "$AMB_OK" = 1 ] || echo "AMBIENTE: the inherited write limit ($(bash -c 'ulimit -S -f' 2>/dev/null) soft, $(bash -c 'ulimit -H -f' 2>/dev/null) hard, in KB) is already a cap of 512 MB or less: the cases that tell 'capped at 512 MB' from 'not capped' did not run and $UNVER file-cap mutant(s) are UNVERIFIED:${UNVER_NAMES:- none} (run this selftest without the cap: heavy-guard.sh --max-file-mb 0, or bare on the node)"
+echo "heavy-guard selftest: $PASS passed, $FAIL failed$([ "$AMB_OK" = 1 ] || echo ", $UNVER mutant(s) UNVERIFIED (AMBIENTE)")"
+[ "$FAIL" -eq 0 ] || exit 1
+[ "$AMB_OK" = 1 ] || exit 97
+exit 0

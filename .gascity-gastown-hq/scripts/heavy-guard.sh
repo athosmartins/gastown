@@ -105,8 +105,9 @@
 #     launcher). Either way a file written in sequence stops at the limit, to the byte. With SIGXFSZ at its default the loop is gone in seconds (the selftest requires < 5 s); with EFBIG the file is still capped, but a shell loop that ignores write errors keeps spinning until its own timeout (measured 27/10 on Darwin: rc 124 after 5 s, file held at 65536 B). For a mutant that is the right verdict: a mutant
 #     whose selftest dies from the cap is KILLED (caught); it is never an infra failure.
 #   - fail CLOSED: a cap that was asked for and cannot be set (ulimit fails and the reading is not already at or under the cap), or cannot
-#     be read back, or reads looser than asked, refuses the step with rc 76 and runs nothing. A tighter limit inherited from the caller is
-#     kept as it is: it is the stricter one.
+#     be read back, or reads looser than asked, refuses the step with rc 76 and runs nothing. A tighter HARD limit inherited from the caller is
+#     kept (ulimit cannot raise it, and the read-back is at or under the ask); a tighter SOFT limit alone is raised together with the hard one
+#     to the ask, because `ulimit -f N` sets both. What holds either way is the contract: the cap in force is at most the ask, never more.
 #   - --check runs nothing, so it has nothing to cap: it accepts the option and only judges the disk.
 # NOT covered: on macOS (the mini, where this guard runs) the limit is not applied at all to a write opened with O_APPEND (`>>`): measured 27/10 on Darwin, an `echo >>` loop under `ulimit -f 64` reached 303 KB, while the same loop
 # through `exec 3>` stopped at 65536 B; not measured on Linux. A `>>` loop on the mini has only `timeout` and a `df` check. And the cap is per FILE. A loop that writes many small files, or appends to one file after another, is not stopped by it
@@ -269,8 +270,8 @@ hg_selftest_step() {
   return 1
 }
 
-# hg_apply_fcap <MB> — ulimit -f for this shell, which becomes the command. Returns 0 when the cap in force is at most <MB> (set now, or an
-# already tighter one), else rc 1. The caller refuses with 76 on rc 1: a cap that was asked for is never silently absent.
+# hg_apply_fcap <MB> — ulimit -f for this shell, which becomes the command. Returns 0 when the cap in force is at most <MB> (set now, or a
+# tighter HARD limit that ulimit would not let go; a tighter soft-only limit is raised to <MB> with the hard one), else rc 1. The caller refuses with 76 on rc 1: a cap that was asked for is never silently absent.
 # bash counts ulimit -f in 1024-byte blocks (512 in POSIX mode: then both the set and the read-back are in 512s, and the cap is tighter, never looser)
 hg_apply_fcap() {
   local kb=$(( $1 * 1024 )) cur

@@ -7,6 +7,7 @@
 # HERMÉTICO: pasta descartável e uma JAULA FALSA que só registra cada execução e deixa passar. Cada caso é uma IMPRESSÃO DIGITAL (rc, veredito, contagens, execuções na jaula): vale se for a esperada, e o MUTANTE do motor vale se ela mudar (âncora que não casa exatamente 1 vez = INVÁLIDO, ga-31xxl5).
 # TETO DE ESCRITA (ga-e6ug8gq): um mutante cujo selftest entra em laço de escrita morre pelo teto por arquivo (`--fsize-mb`) e conta como MORTO. O caso grava com um awk em laço (fixture `loopy.sh`, parado em ~264 MB só para um motor SEM teto não encher o disco deste selftest) com o teto em 4 MB e confere: o arquivo não passou de 4 MB, o awk morreu (rc 153), em menos de 5 s, o mutante contou como morto e a pasta de trabalho ficou vazia. Cada elo do teto tem seu mutante do motor (teto ausente, em bytes, não fixado, SIGXFSZ ignorado, só no soft, falha que roda mesmo assim, sem mínimo contra um limite herdado, uso sem validação).
 # AMBIENTE: com a JAULA REAL (Linux com Landlock, o nó) roda também o caso de contenção (o caminho de fora vai no TEXTO do selftest, o `env -i` do motor apagaria uma variável; controle e mutante pelo mesmo caminho); sem ela imprime AMBIENTE e sai 97.
+# O mesmo vale para o caso do teto que o lançador não consegue fixar: ele só é alcançável com o limite duro de escrita ilimitado. Sob um duro finito (p.ex. dentro do `heavy-guard.sh`, 512 MB) o caso e o seu mutante são pulados com AMBIENTE e o exit é 97 (FAIL=0): esta bateria mede o próprio teto, então rode-a com `--max-file-mb 0` ou direto no nó. Seus fixtures são limitados (~260 MB).
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HM="$HERE/hq-mutate.py"
@@ -319,10 +320,15 @@ EXP_FSIZE="rc=0 completo run=6 k=2 c=4 f=0 inv=0 open=4 falhas=0 awk_rc=153 teto
 peq "mutante em laço de escrita infinito: o teto por arquivo (4 MB) corta o awk em menos de 5 s (rc 153), o arquivo não passa do teto, o mutante é MORTO e não vira falha de infra" "$EXP_FSIZE" fp_fsize
 fp_fsize_uso() { newfx; mkfoo; local o="" v; for v in 0 -3 abc ""; do sw --fsize-mb "$v"; o="$o $RC"; done; sw --fsize-mb 1; echo "$o | $(cnt)"; }
 peq "--fsize-mb que não é um inteiro >= 1 (0, negativo, texto, vazio) é uso (rc 2): sem teto não há varredura; 1 MB roda como qualquer outro" " 2 2 2 2 | $EXP_SW0" fp_fsize_uso
+# O caso "teto que o lançador não consegue fixar" só existe com o limite DURO ilimitado: com um duro finito o CAPPER usa min(pedido, duro) e FIXA (é o que o caso fp_fsize_duro prova), então o teto enorme
+# não falha, a baseline roda e a impressão muda. Rodar sob `heavy-guard.sh` (teto de 512 MB por arquivo para quem tem "selftest" no nome) deixa o duro finito: o caso ficaria vermelho sem culpa do motor, e o mutante
+# teto-falha-e-roda passaria por "morto" só porque a impressão já difere. Por isso lê-se o duro aqui e, se não for ilimitado, o caso e o seu mutante são PULADOS COM AVISO (AMBIENTE, exit 97), nunca verde nem vermelho por acidente.
+# vazio/falhou/ilegível (o ulimit não imprime, ou imprime algo que não é "unlimited") → não se sabe se o caso é alcançável: pula, que é o lado inerte; ilimitado → roda; número → pula
+SKIP_FS=0; [ "$(ulimit -H -f 2> /dev/null)" = unlimited ] || SKIP_FS=1
 # teto que o lançador não consegue fixar (aqui: maior que o rlimit aceita) = nada roda, nunca roda SEM teto: a baseline fica vermelha e o alvo é pulado
 fp_fsize_enorme() { newfx; mkfoo; sw --fsize-mb 99999999999999999999; echo "rc=$RC res=$(jf 'd["result"]') run=$(jf 'd["mutants_run"]') skipped=$(jf '",".join("%s=%d" % kv for kv in sorted(d["skipped"].items()))')"; }
 EXP_FSIZE_ENORME="rc=0 res=sem-cobertura run=0 skipped=base-vermelha=1"
-peq "teto que o lançador não consegue fixar: rc 70 do lançador, baseline vermelha, nenhum mutante roda (nunca roda sem teto)" "$EXP_FSIZE_ENORME" fp_fsize_enorme
+[ "$SKIP_FS" = 1 ] || peq "teto que o lançador não consegue fixar: rc 70 do lançador, baseline vermelha, nenhum mutante roda (nunca roda sem teto)" "$EXP_FSIZE_ENORME" fp_fsize_enorme
 # o motor roda sob um limite DURO menor que o pedido (um sistema que já limita): vale o menor, o teto não vira recusa e a varredura roda igual
 fp_fsize_duro() { ( ulimit -f 2048 || exit 1; fp_fsize 4 ); }   # sem -H: soft e hard juntos (um hard abaixo do soft atual dá EINVAL)
 peq "limite duro do sistema (2 MB) menor que o --fsize-mb pedido (4): vale o menor, a varredura roda igual e o laço morre" "$EXP_FSIZE" fp_fsize_duro
@@ -457,7 +463,7 @@ par kill_it teto-em-bytes        fp_fsize   "$EXP_FSIZE" 'str(ctx.a.fsize_mb << 
 par kill_it teto-nao-fixa        fp_fsize   "$EXP_FSIZE" '    resource.setrlimit(resource.RLIMIT_FSIZE, (n, n))\n' '    pass\n'
 par kill_it sigxfsz-ignorado     fp_fsize   "$EXP_FSIZE" '    signal.signal(signal.SIGXFSZ, signal.SIG_DFL)\n' '    pass\n'
 par kill_it teto-so-no-soft      fp_fsize   "$EXP_FSIZE" 'resource.setrlimit(resource.RLIMIT_FSIZE, (n, n))' 'resource.setrlimit(resource.RLIMIT_FSIZE, (n, resource.RLIM_INFINITY))'
-par kill_it teto-falha-e-roda    fp_fsize_enorme "$EXP_FSIZE_ENORME" '    os._exit(70)\n' '    pass\n'
+[ "$SKIP_FS" = 1 ] || par kill_it teto-falha-e-roda fp_fsize_enorme "$EXP_FSIZE_ENORME" '    os._exit(70)\n' '    pass\n'
 par kill_it teto-sem-minimo      fp_fsize_duro "$EXP_FSIZE" '    n = n if hard == resource.RLIM_INFINITY else min(n, hard)\n' '    n = n\n'
 par kill_it teto-uso-aceita-zero fp_fsize_uso   " 2 2 2 2 | $EXP_SW0" 'if a.cmd == "sweep" and a.fsize_mb < 1:' 'if a.cmd == "sweep" and a.fsize_mb < 0:'
 reap
@@ -483,7 +489,8 @@ else
   eq "mutante jaula-nao-usada com a jaula real: a escrita passa (o caso reprova se a contenção cair)" "$EXP_SW0 vazou=SIM" "$(ENG="$W/eng-jaula-nao-usada.py" vz "$HERE/hq-sandbox-run.py")"
 fi
 
-echo "hq-mutate selftest: $PASS passed, $FAIL failed$([ "$SKIP" = 1 ] && echo ", caso da jaula real NÃO rodou (AMBIENTE)")"
+[ "$SKIP_FS" = 0 ] || echo "AMBIENTE: limite duro de escrita finito aqui ($(ulimit -H -f 2> /dev/null)): o caso do teto que o lançador não fixa e o seu mutante não rodaram (rode sem teto: heavy-guard.sh --max-file-mb 0, ou direto no nó)"
+echo "hq-mutate selftest: $PASS passed, $FAIL failed$([ "$SKIP" = 1 ] && echo ", caso da jaula real NÃO rodou (AMBIENTE)")$([ "$SKIP_FS" = 1 ] && echo ", caso do teto não fixável NÃO rodou (AMBIENTE)")"
 [ "$FAIL" -eq 0 ] || exit 1
-[ "$SKIP" -eq 0 ] || exit 97
+[ "$SKIP" -eq 0 ] && [ "$SKIP_FS" -eq 0 ] || exit 97
 exit 0
