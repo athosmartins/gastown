@@ -9076,6 +9076,94 @@ Then re-run /gate-done. Marker set to gate-status:error (fixable + re-submittabl
 esac
 # SELFTEST-EXTRACT bash32-check: END
 
+# ── Step 5b-pre4 (ga-gqtg1fs): submission-time skill-token check for agent prompts ──
+# 24/10: 3eea2c223 (ga-eei1o4) put a skill token in the gate-reviewer prompt and main stayed red against
+# pool-prompt-skill-mention.selftest.sh until the Mayor ran it by hand on 26/10. Nothing in the gate ran it: the
+# reviewers run "the test files the diff changed" and a prompt is not a test file, and the ga-rstae check above runs
+# only the selftests the diff ALTERED. A pool worker booted from a prompt with a skill token runs that skill with no
+# bead and idles on a pool slot (ga-7nxfa1), so it is refused here, ~2 min after the submission, not at the next
+# hand run.
+#
+# The measurement is gate-prompt-skill-check.sh: one VERDICT= line, always exit 0, run as its own process so nothing
+# in it can trip this file's `set -euo pipefail`. It runs the detector only when base..tip touches something the
+# detector reads, and blocks only what the diff itself made fail:
+#   fail                tip red AND base green -> refused below. The ONLY verdict that refuses.
+#   debito-previo       tip red AND base red   -> recorded, never refused (main already carried it)
+#   ok                  tip green (a repair of a red main too)
+#   sem-prompt-alterado the diff touches nothing the detector reads: nothing ran
+#   nao-consegui-medir  git, the fetch, the checker or the detector did not answer, or the diff edits the detector
+#                       itself (its own copy is never run and cannot vouch for it): fail-OPEN, recorded with its reason
+#   desligado           the kill switch is on
+# Kill switch: GATE_SKILLMENTION_CHECK=off in the guard's environment, or the flag file
+# $GC_CITY/.gc/gate-skillmention.off; either records verdict desligado and skips the measurement.
+#
+# Same record discipline as the bash-3.2 check above: a pessimistic default verdict, replaced only by a verdict the
+# checker really printed, and ONE record written AFTER the measurement `if` (label gate-skillmention:<verdict> and the
+# SKILLMENTION-CHECK log line), so a path that skips the measurement records itself exactly like one that ran.
+# The block between the SELFTEST-EXTRACT sentinels is run VERBATIM by gate-guard-skillmention-check.selftest.sh,
+# which stubs only log/err/set_gate_status/bd: keep the sentinels, and keep the block self-contained.
+# SELFTEST-EXTRACT skillmention-check: BEGIN
+_PSC_VERDICT="nao-consegui-medir"   # pessimistic default: only a verdict the checker printed replaces it
+_PSC_REASON="entrada-nao-resolvida"
+_PSC_DETAIL=""
+_PSC_INPUTS_OK=0
+_PSC_SCRIPT="${GATE_PSC_SCRIPT:-$GC_CITY/packs/town-deltas/assets/gate-prompt-skill-check.sh}"
+if [ "${GATE_SKILLMENTION_CHECK:-}" = "off" ] || [ -f "$GC_CITY/.gc/gate-skillmention.off" ]; then
+  _PSC_VERDICT="desligado"; _PSC_REASON="interruptor"
+elif [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
+  _PSC_INPUTS_OK=1
+  _PSC_REASON="fetch-falhou"
+  # A failed fetch leaves origin/main and origin/$BRANCH at whatever an earlier sweep saw, and measuring THAT would
+  # report on a commit that is not the one being submitted: it is "could not measure", never a clean bill.
+  if git -C "$RIG_PATH" fetch origin main "$BRANCH" --quiet 2>/dev/null; then
+    # vazio → sha não resolvido: cai em base-nao-resolvida (nao-consegui-medir), nunca em "sem prompt alterado"; falhou → idem
+    _PSC_MAIN_SHA=$(git -C "$RIG_PATH" rev-parse "origin/main" 2>/dev/null || echo "")
+    _PSC_BRANCH_SHA=$(git -C "$RIG_PATH" rev-parse "origin/$BRANCH" 2>/dev/null || echo "")
+    _PSC_BASE=""
+    if [ -n "$_PSC_MAIN_SHA" ] && [ -n "$_PSC_BRANCH_SHA" ]; then
+      _PSC_BASE=$(git -C "$RIG_PATH" merge-base "$_PSC_BRANCH_SHA" "$_PSC_MAIN_SHA" 2>/dev/null || echo "")
+    fi
+    if [ -z "$_PSC_BASE" ]; then
+      _PSC_REASON="base-nao-resolvida"
+    elif [ ! -r "$_PSC_SCRIPT" ]; then
+      _PSC_REASON="verificador-ilegivel"
+    else
+      # vazio/falhou → sem linha VERDICT= (o verificador morreu antes de responder): fica o default nao-consegui-medir
+      _PSC_OUT=$(bash "$_PSC_SCRIPT" "$RIG_PATH" "$_PSC_BASE" "$_PSC_BRANCH_SHA" 2>/dev/null || echo "")
+      _PSC_LINE=$(printf '%s\n' "$_PSC_OUT" | sed -n '1p')
+      _PSC_TOK=$(printf '%s\n' "$_PSC_LINE" | sed -n 's/^VERDICT=\([a-z-]*\)\( .*\)\{0,1\}$/\1/p')
+      case "$_PSC_TOK" in
+        (ok|fail|debito-previo|sem-prompt-alterado|nao-consegui-medir)
+          _PSC_VERDICT="$_PSC_TOK"
+          _PSC_REASON=$(printf '%s\n' "$_PSC_LINE" | sed -n 's/^VERDICT=[a-z-]* reason=\([^ ]*\).*/\1/p')
+          # The checker caps its own detail; this cap is for a checker that misbehaves (an oversized argument would lose
+          # the comment). One awk stage that reads everything: `| head` would SIGPIPE the stage before it, and under
+          # pipefail that is a non-zero status that set -e turns into the death of the whole sweep.
+          _PSC_DETAIL=$(printf '%s\n' "$_PSC_OUT" | awk 'NR > 1 && NR <= 41 { print substr($0, 1, 200) }')
+          ;;
+        (*) _PSC_REASON="resposta-ilegivel" ;;
+      esac
+    fi
+  fi
+fi
+bd -C "$GC_CITY" label add "$MARKER_ID" "gate-skillmention:$_PSC_VERDICT" -q 2>/dev/null || true
+log "SKILLMENTION-CHECK bead=${BEAD_ID:-<EMPTY>} verdict=$_PSC_VERDICT reason=${_PSC_REASON:-<EMPTY>} branch=${BRANCH:-<EMPTY>} rig_path=${RIG_PATH:-<EMPTY>} inputs_ok=$_PSC_INPUTS_OK marker=$MARKER_ID"
+if [ "$_PSC_VERDICT" = "fail" ]; then
+  err "  skillmention-check (ga-gqtg1fs): this branch turns pool-prompt-skill-mention.selftest.sh red (it is green on the merge base). Refusing at submission."
+  set_gate_status "$MARKER_ID" "error"
+  bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: agent-prompt skill-token check (ga-gqtg1fs).
+This branch turns pool-prompt-skill-mention.selftest.sh RED; it is green on the merge base with main. A skill token in an agent boot prompt or template fragment (a slash glued to the name of a real skill or command) makes Claude Code attach a skill_mention at boot, and a pool worker then runs that skill with no bead and idles on a pool slot (ga-7nxfa1). What the detector reported for this branch:
+$_PSC_DETAIL
+Fix: reword the line so no skill name follows a slash (write 'the gate-done skill', or a path such as .claude/commands/x.md). If the cause is a NEW skill or command name that collides with an old line, reword the old line. Check it locally, it takes under a second:
+  bash .gascity-gastown-hq/packs/town-deltas/assets/pool-prompt-skill-mention.selftest.sh
+then push again:
+  git push origin $BRANCH
+Then re-run the gate-done step. Marker set to gate-status:error (fixable + re-submittable, not lost)." 2>/dev/null || true
+  log "SUPPRESSED PUSH (wa-uthi non-terminal): skillmention-check failed for $MARKER_ID (gate-status:error)."
+  exit 1
+fi
+# SELFTEST-EXTRACT skillmention-check: END
+
 # ── Step 5b (ga-e7zk7): detach source bead from the dog pool — gate owns it now ──
 # Why HERE (after Step 5), not before it: Step 5 derives the self-review-exclusion
 # author from the source bead's record, and its FIRST-CHOICE signal is the bead's
