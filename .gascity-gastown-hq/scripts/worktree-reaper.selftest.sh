@@ -1272,7 +1272,12 @@ cat > "$PE_BIN/git" <<'PEGIT'
 # Real git, except `git cherry` which PE_CHERRY can break: fail = rc 128 and no output;
 # garbage = rc 0 and output that is not cherry's format; partial = a '-' line, THEN rc 1.
 # And `git rev-list --merges` (the merge-commit check), which PE_REVLIST=fail breaks: rc 128, no output.
+# ga-k0mose6: `git rev-parse HEAD` (PE_REVPARSE=fail) and `git status` (PE_STATUS=fail) break the same way: rc 128, no output.
+rp=0
 for a in "$@"; do
+  [ "$a" = "rev-parse" ] && rp=1
+  if [ "$a" = "HEAD" ] && [ "$rp" = "1" ] && [ "${PE_REVPARSE:-}" = "fail" ]; then exit 128; fi
+  if [ "$a" = "status" ] && [ "${PE_STATUS:-}" = "fail" ]; then exit 128; fi
   if [ "$a" = "cherry" ]; then
     case "${PE_CHERRY:-}" in
       fail)    exit 128 ;;
@@ -2390,7 +2395,7 @@ kz_mk() {
 run_kz() { # run_kz <name> <beads-json-array | @missing> [ENV=val ...] — the lookup goes through the FAKE_BEADS seam
   local name="$1" beads="$2"; shift 2
   if [ "$beads" = "@missing" ]; then rm -f "$TMP/$name.beads.json"; else printf '%s' "$beads" > "$TMP/$name.beads.json"; fi
-  env WORKTREE_REAPER_GT="$TMP/$name" WORKTREE_REAPER_LOG="$TMP/$name.jsonl" WORKTREE_REAPER_STALE_HOURS=24 WORKTREE_REAPER_ENABLED=1 \
+  env PATH="$PE_BIN:$PATH" WORKTREE_REAPER_GT="$TMP/$name" WORKTREE_REAPER_LOG="$TMP/$name.jsonl" WORKTREE_REAPER_STALE_HOURS=24 WORKTREE_REAPER_ENABLED=1 \
     WORKTREE_REAPER_FAKE_LSOF="$TMP/bc_nolsof.txt" WORKTREE_REAPER_FAKE_BEADS="$TMP/$name.beads.json" "$@" bash "$REAPER" >/dev/null 2>&1
 }
 kz_wt() { git -C "$TMP/$1/rig" worktree list --porcelain 2>/dev/null | grep -E "/crew/worker-kz\$" >/dev/null; }
@@ -2434,6 +2439,19 @@ kz_mk kz_e; run_kz kz_e "@missing" "$PRESS";                             kz_kept
   || bad "ga-k0mose6 (e): no bead_lookup_failed event for a failed lookup ($(events kz_e bead_lookup_failed))"
 kz_mk kz_f; run_kz kz_f 'this is not json' "$PRESS";                     kz_kept kz_f "bead lookup printed JUNK" kept_pressure_unmerged
 kz_mk kz_f2; run_kz kz_f2 '[]' "$PRESS";                                 kz_kept kz_f2 "bead NOT FOUND (nothing says the work is over)" kept_pressure_unmerged
+# (p) a git read the proof leans on FAILS (the PE_BIN stub: rc 128, no output). A failed cherry is not an empty one, and a failed
+# rev-parse / status / rev-list is not "no HEAD to worry about" / "clean" / "no merge commits": every one keeps the tree, branch included.
+kz_mk kz_p1; run_kz kz_p1 "$KZ_CLOSED" "$PRESS" PE_CHERRY=fail;     kz_kept kz_p1 "git cherry FAILS (rc 128, no output)" kept_pressure_unmerged
+kz_mk kz_p2; run_kz kz_p2 "$KZ_CLOSED" "$PRESS" PE_CHERRY=garbage;  kz_kept kz_p2 "git cherry prints something that is not its format" kept_pressure_unmerged
+kz_mk kz_p3; run_kz kz_p3 "$KZ_CLOSED" "$PRESS" PE_CHERRY=partial;  kz_kept kz_p3 "git cherry prints a '-' line and THEN fails" kept_pressure_unmerged
+kz_mk kz_p4; run_kz kz_p4 "$KZ_CLOSED" "$PRESS" PE_REVLIST=fail;    kz_kept kz_p4 "the merge-commit check (rev-list --merges) FAILS" kept_pressure_unmerged
+kz_mk kz_p5; run_kz kz_p5 "$KZ_CLOSED" "$PRESS" PE_REVPARSE=fail;   kz_kept kz_p5 "git rev-parse HEAD FAILS (no HEAD to prove)" kept_pressure_unmerged
+kz_mk kz_p6; run_kz kz_p6 "$KZ_CLOSED" "$PRESS" PE_STATUS=fail;     kz_kept kz_p6 "git status FAILS (an empty listing from a failed status is not 'clean')" kept_pressure_unmerged
+# (p0) the same stub with every knob OFF forwards to the real git: the failures above come from the knob, not from the stub
+kz_mk kz_p0; run_kz kz_p0 "$KZ_CLOSED" "$PRESS"
+kz_wt kz_p0 && bad "ga-k0mose6 (p0): through the stub with no knob set the clean rebased tree was NOT reaped (the stub itself breaks git)" \
+            || ok "ga-k0mose6 (p0): through the stub with no knob set the same tree is REAPED (so the p1..p6 keeps are the injected failures)"
+
 # (g) not clean: an untracked file / an edit of a tracked one → this proof never takes WIP (no preserve, no --force)
 kz_mk kz_g 'echo wip > wip.txt';          run_kz kz_g "$KZ_CLOSED" "$PRESS";  kz_kept kz_g "an untracked file in the tree" kept_pressure_unmerged
 kz_mk kz_g2 'echo edit >> shipped.txt';   run_kz kz_g2 "$KZ_CLOSED" "$PRESS"; kz_kept kz_g2 "an edited tracked file in the tree" kept_pressure_unmerged
