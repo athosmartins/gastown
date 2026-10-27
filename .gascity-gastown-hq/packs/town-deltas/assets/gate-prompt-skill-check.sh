@@ -23,13 +23,15 @@
 # of its scratch directory.
 #
 # OUTPUT. Exactly one verdict line first, then (fail / debito-previo only) the detector's red lines, capped:
-#   VERDICT=<token> reason=<slug> hits=<n> tip=<green|red|unknown|-> base=<green|red|unknown|->
+#   VERDICT=<token> reason=<slug> hits=<n> tip=<green|red|unknown|-> base=<green|red|unknown|-> rc_tip=<n|-> rc_base=<n|->
 #   sem-prompt-alterado  no input in the diff: nothing was run (a MEASURED zero: the diff itself was read)
 #   ok                   tip green (a repair of a red main lands here too)
 #   fail                 tip red AND base green: this diff broke it. The only verdict the guard refuses on
 #   debito-previo        tip red AND base red: main already carried it; recorded, never refused
 #   nao-consegui-medir   anything that stopped a measurement (see the reason); the guard fails OPEN on it, loudly
-# Always exits 0: the verdict is the answer, and the guard reads it from stdout.
+# rc_tip / rc_base are the detector's exit codes (124 = timeout, 126/127 = could not exec), so an environment problem on
+# the host that runs this (no timeout, no python) is readable in the log at a glance.
+# Exits 0 after printing its verdict. A crash prints no VERDICT= line at all, which the guard reads as unmeasured.
 #
 # THIRD STATES. "Could not run" is never "green" and never "red": a detector that crashed, hung, printed no summary line
 # or whose summary contradicts its exit code is `unknown`. The class is taken from what the detector REPORTED (its last
@@ -53,13 +55,15 @@ case "$TMO" in (''|*[!0-9]*) TMO=60 ;; esac
 SCRATCH=""
 TOP=""
 HITS="-"
+RC_TIP="-"
+RC_BASE="-"
 DETAIL=""
 cleanup() { if [ -n "$SCRATCH" ]; then rm -rf "$SCRATCH" 2>/dev/null; fi; return 0; }
 trap cleanup EXIT
 
 # emit <verdict> <reason> [tip-class] [base-class]: the one verdict line, then any detail; ends the run.
 emit() {
-  printf 'VERDICT=%s reason=%s hits=%s tip=%s base=%s\n' "$1" "$2" "$HITS" "${3:--}" "${4:--}"
+  printf 'VERDICT=%s reason=%s hits=%s tip=%s base=%s rc_tip=%s rc_base=%s\n' "$1" "$2" "$HITS" "${3:--}" "${4:--}" "$RC_TIP" "$RC_BASE"
   if [ -n "$DETAIL" ]; then printf '%s\n' "$DETAIL"; fi
   exit 0
 }
@@ -102,20 +106,21 @@ extract_tree() {
   return 0
 }
 
-# run_detector <tree> <outfile>: prints green | red | unknown | ausente (the detector is not in that tree).
+# run_detector <tree> <outfile>: prints "<class> <rc>", class = green | red | unknown | ausente (the detector is not in
+# that tree); rc = the detector's exit code, "-" when it was not run.
 run_detector() {
   local tree="$1" out="$2" rc=0 line="" nfail=""
-  if [ ! -f "$tree/$SELFTEST_REL" ]; then printf 'ausente'; return 0; fi
-  mkdir -p "$tree/.tmp" 2>/dev/null || { printf 'unknown'; return 0; }
+  if [ ! -f "$tree/$SELFTEST_REL" ]; then printf 'ausente -'; return 0; fi
+  mkdir -p "$tree/.tmp" 2>/dev/null || { printf 'unknown -'; return 0; }
   ( cd "$tree" && timeout "$TMO" env -i PATH="$PATH" HOME="${HOME:-/}" TMPDIR="$tree/.tmp" ${LANG:+"LANG=$LANG"} ${LC_ALL:+"LC_ALL=$LC_ALL"} ${LC_CTYPE:+"LC_CTYPE=$LC_CTYPE"} bash "$SELFTEST_REL" ) > "$out" 2>&1 || rc=$?
   # vazio → sem linha de resumo = o detector não terminou de reportar (caiu, travou, timeout 124, 126/127): unknown; falhou/ilegível → idem
   line=$(grep -E '^pool-prompt-skill-mention selftest: [0-9]+ passed, [0-9]+ failed$' "$out" 2>/dev/null | tail -n 1)
-  if [ -z "$line" ]; then printf 'unknown'; return 0; fi
+  if [ -z "$line" ]; then printf 'unknown %s' "$rc"; return 0; fi
   nfail=${line##*passed, }; nfail=${nfail%% failed*}
-  case "$nfail" in (''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
-  if [ "$nfail" -eq 0 ] && [ "$rc" -eq 0 ]; then printf 'green'
-  elif [ "$nfail" -gt 0 ] && [ "$rc" -eq 1 ]; then printf 'red'
-  else printf 'unknown'; fi
+  case "$nfail" in (''|*[!0-9]*) printf 'unknown %s' "$rc"; return 0 ;; esac
+  if [ "$nfail" -eq 0 ] && [ "$rc" -eq 0 ]; then printf 'green %s' "$rc"
+  elif [ "$nfail" -gt 0 ] && [ "$rc" -eq 1 ]; then printf 'red %s' "$rc"
+  else printf 'unknown %s' "$rc"; fi
   return 0
 }
 
@@ -125,7 +130,7 @@ red_lines() {
 }
 
 main() {
-  local rig="${1-}" base="${2-}" tip="${3-}" f="" cls="" bcls=""
+  local rig="${1-}" base="${2-}" tip="${3-}" f="" cls="" bcls="" cls_rc="" bcls_rc=""
   if [ -z "$rig" ] || [ -z "$base" ] || [ -z "$tip" ]; then emit nao-consegui-medir entrada-vazia; fi
   # vazio/falhou → rig que não é repositório git (ou git ausente): nao-consegui-medir, nunca "sem prompt alterado"
   TOP=$(git -C "$rig" rev-parse --show-toplevel 2>/dev/null) || TOP=""
@@ -146,8 +151,14 @@ main() {
   # may not be run and cannot vouch for itself. Nothing is run and nothing is vouched for: unmeasured, said out loud.
   if [ "$DET_TOUCHED" -eq 1 ]; then emit nao-consegui-medir detector-alterado-no-diff; fi
 
+  # A python without tomllib (< 3.11) makes the detector's section C2 report "cannot read global_fragments" on EVERY tree:
+  # red on the tip and on the base alike, which would read as debito-previo for good while the check refuses nothing.
+  # vazio/falhou → este python não lê TOML: nao-consegui-medir dito em voz alta, nunca o debito-previo que ele fabricaria
+  python3 -c 'import tomllib' >/dev/null 2>&1 || emit nao-consegui-medir python-sem-tomllib
+
   extract_tree "$tip" "$SCRATCH/tip" || emit nao-consegui-medir extracao-tip
-  cls=$(run_detector "$SCRATCH/tip" "$SCRATCH/tip.out")
+  cls_rc=$(run_detector "$SCRATCH/tip" "$SCRATCH/tip.out")
+  cls=${cls_rc%% *}; RC_TIP=${cls_rc##* }
   case "$cls" in
     (green) emit ok detector-verde-no-tip green ;;
     (ausente) emit nao-consegui-medir selftest-ausente-no-tip ;;
@@ -157,7 +168,8 @@ main() {
 
   # tip is red: was it this diff? The base answers (a repair or a latent break shows up here as green/red).
   extract_tree "$base" "$SCRATCH/base" || emit nao-consegui-medir extracao-base red
-  bcls=$(run_detector "$SCRATCH/base" "$SCRATCH/base.out")
+  bcls_rc=$(run_detector "$SCRATCH/base" "$SCRATCH/base.out")
+  bcls=${bcls_rc%% *}; RC_BASE=${bcls_rc##* }
   DETAIL=$(red_lines "$SCRATCH/tip.out")
   case "$bcls" in
     (green) emit fail detector-vermelho-no-tip-e-verde-na-base red green ;;

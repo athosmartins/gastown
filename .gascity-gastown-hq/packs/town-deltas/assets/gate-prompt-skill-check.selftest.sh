@@ -222,9 +222,19 @@ broken_detector_case() { # broken_detector_case <label> <detector text> [VAR=val
   expect "$lab" nao-consegui-medir selftest-inconclusivo-tip
 }
 broken_detector_case "detector crashes without a summary line" $'#!/usr/bin/env bash\necho boom >&2\nexit 3\n'
+printf '%s\n' "$OUT" | sed -n 1p | grep -q ' rc_tip=3 ' && ok "the detector's exit code (3) is on the verdict line" || bad "rc_tip=3 missing from the verdict line :: $(printf '%s' "$OUT" | head -n 1)"
 broken_detector_case "exit 0 with no summary line is not a pass" $'#!/usr/bin/env bash\nexit 0\n'
 broken_detector_case "a summary that disagrees with the exit code" $'#!/usr/bin/env bash\necho "pool-prompt-skill-mention selftest: 5 passed, 0 failed"\nexit 1\n'
 broken_detector_case "detector hits the timeout" $'#!/usr/bin/env bash\nsleep 5\necho "pool-prompt-skill-mention selftest: 1 passed, 0 failed"\n' GATE_PSC_TIMEOUT=1
+printf '%s\n' "$OUT" | sed -n 1p | grep -q ' rc_tip=124 ' && ok "a timeout shows as rc_tip=124" || bad "rc_tip=124 missing :: $(printf '%s' "$OUT" | head -n 1)"
+
+# A python without tomllib (< 3.11) turns the detector red on EVERY tree (its section C2): left alone that reads as
+# debito-previo forever while nothing is ever refused. It must be said out loud instead.
+FAKEPY="$WORK/fakepy"; mkdir -p "$FAKEPY"; printf '#!/bin/sh\nexit 1\n' > "$FAKEPY/python3"; chmod +x "$FAKEPY/python3"
+git_in "$R" checkout -q main; git_in "$R" checkout -q -b nopy
+printf 'plain.\n' >> "$R/$HQ/agents/gate-reviewer/prompt.template.md"; TIP="$(commit_all "$R" "prompt edit, python without tomllib")"
+run_sut "$R" "$BASE" "$TIP" PATH="$FAKEPY:$PATH"
+expect "a python without tomllib is said out loud, not read as debito-previo" nao-consegui-medir python-sem-tomllib
 
 git_in "$R" checkout -q main; git_in "$R" checkout -q -b nodet_base
 git_in "$R" rm -q "$DET_REL"; NB="$(commit_all "$R" "base lineage without any detector")"

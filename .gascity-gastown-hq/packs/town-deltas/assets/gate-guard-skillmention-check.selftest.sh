@@ -98,6 +98,7 @@ has "$C1" "Gate guard rejected marker: agent-prompt skill-token check (ga-gqtg1f
 has "$C1" "gate-reviewer" && has "$C1" "/gate-done" && ok "the comment carries the red lines (which prompt, which text)" || bad "red lines missing from the comment"
 has "$C1" "git push origin tok" && ok "the comment says how to push the fix" || bad "the comment does not name the branch to push"
 has "$C1" "SKILLMENTION-CHECK bead=ga-bead-1 verdict=fail" && ok "log line SKILLMENTION-CHECK recorded" || bad "log line missing"
+has "$C1" "checker=[VERDICT=fail reason=" && has "$C1" "tip=red base=green" && ok "the log carries the checker's own line (tip/base classes, exit codes)" || bad "the checker's line is not in the log :: $(grep SKILLMENTION "$C1" | head -1 | cut -c1-240)"
 
 push_branch clean "$HQ/agents/gate-reviewer/prompt.template.md" 'one more plain sentence.'
 C2="$WORK/c2"; drive "$C2" RIG_PATH="$RIG" BRANCH="clean" GATE_PSC_SCRIPT="$CHECKER"
@@ -145,7 +146,7 @@ echo "D. recorded, never silent: the paths that skip the measurement"
 C5="$WORK/c5"; drive "$C5" RIG_PATH="$RIG" BRANCH="clean" GATE_PSC_SCRIPT="$WORK/does-not-exist.sh"
 fell "$C5" && labeled "$C5" nao-consegui-medir && has "$C5" "reason=verificador-ilegivel" && ok "checker script missing: fail-open, recorded with its reason" || bad "missing checker: $(head -4 "$C5" | tr '\n' '|')"
 C6="$WORK/c6"; drive "$C6" RIG_PATH="" BRANCH="clean" GATE_PSC_SCRIPT="$CHECKER"
-fell "$C6" && labeled "$C6" nao-consegui-medir && has "$C6" "inputs_ok=0" && has "$C6" "rig_path=<EMPTY>" && ok "RIG_PATH unset: recorded as nao-consegui-medir inputs_ok=0, rig_path=<EMPTY>" || bad "unset RIG_PATH: $(head -4 "$C6" | tr '\n' '|')"
+fell "$C6" && labeled "$C6" nao-consegui-medir && has "$C6" "inputs_ok=0" && has "$C6" "rig_path=<EMPTY>" && has "$C6" "checker=[<EMPTY>]" && ok "RIG_PATH unset: recorded as nao-consegui-medir inputs_ok=0, rig_path=<EMPTY>, no checker line (and no unbound variable under set -u)" || bad "unset RIG_PATH: $(head -4 "$C6" | tr '\n' '|')"
 : > "$STUBCOUNT"
 mkstub "$WORK/stub.counting.sh" 0 'VERDICT=fail reason=x\n'
 C7="$WORK/c7"; drive "$C7" RIG_PATH="$RIG" BRANCH="clean" GATE_PSC_SCRIPT="$WORK/stub.counting.sh" GATE_SKILLMENTION_CHECK=off

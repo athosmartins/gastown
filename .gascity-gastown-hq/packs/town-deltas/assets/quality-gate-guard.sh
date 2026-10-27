@@ -9106,6 +9106,7 @@ esac
 _PSC_VERDICT="nao-consegui-medir"   # pessimistic default: only a verdict the checker printed replaces it
 _PSC_REASON="entrada-nao-resolvida"
 _PSC_DETAIL=""
+_PSC_LINE=""
 _PSC_INPUTS_OK=0
 _PSC_SCRIPT="${GATE_PSC_SCRIPT:-$GC_CITY/packs/town-deltas/assets/gate-prompt-skill-check.sh}"
 if [ "${GATE_SKILLMENTION_CHECK:-}" = "off" ] || [ -f "$GC_CITY/.gc/gate-skillmention.off" ]; then
@@ -9147,7 +9148,7 @@ elif [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
   fi
 fi
 bd -C "$GC_CITY" label add "$MARKER_ID" "gate-skillmention:$_PSC_VERDICT" -q 2>/dev/null || true
-log "SKILLMENTION-CHECK bead=${BEAD_ID:-<EMPTY>} verdict=$_PSC_VERDICT reason=${_PSC_REASON:-<EMPTY>} branch=${BRANCH:-<EMPTY>} rig_path=${RIG_PATH:-<EMPTY>} inputs_ok=$_PSC_INPUTS_OK marker=$MARKER_ID"
+log "SKILLMENTION-CHECK bead=${BEAD_ID:-<EMPTY>} verdict=$_PSC_VERDICT reason=${_PSC_REASON:-<EMPTY>} branch=${BRANCH:-<EMPTY>} rig_path=${RIG_PATH:-<EMPTY>} inputs_ok=$_PSC_INPUTS_OK marker=$MARKER_ID checker=[${_PSC_LINE:-<EMPTY>}]"
 if [ "$_PSC_VERDICT" = "fail" ]; then
   err "  skillmention-check (ga-gqtg1fs): this branch turns pool-prompt-skill-mention.selftest.sh red (it is green on the merge base). Refusing at submission."
   set_gate_status "$MARKER_ID" "error"
