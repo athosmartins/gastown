@@ -57,6 +57,7 @@ mkrig() {
   cp "$RHQ/packs/town-deltas/template-fragments/town-deltas.template.md" "$hq/packs/town-deltas/template-fragments/" && cp "$RHQ/city.toml" "$hq/" || return 1
   good_doc > "$d/docs/ok.md"; bad_doc > "$d/docs/legacy.md"; bad_doc > "$d/docs/upstream.md"
   { i=0; while [ "$i" -lt 100 ]; do echo "imp $i"; i=$((i+1)); done; } > "$d/docs/imp.md"   # imported by the CLAUDE.md case; never in a diff
+  ln -s ok.md "$d/docs/alias.md"   # an unchanged link named .md (AGENTS.md -> CLAUDE.md is common): never in a diff either
   printf '[pack]\nname = "t"\nschema = 2\n' > "$d/pack.toml"; printf 'x = 1\n' > "$d/lib/app.py"
   git -C "$d" add -A >/dev/null 2>&1 && git -C "$d" commit -q -m base
 }
@@ -107,6 +108,8 @@ branch_from "$R" main b_imp
 { printf '# T\n\n## Contents\n\n- A\n\n## A\n\n'; i=0; while [ "$i" -lt 150 ]; do echo "line $i"; i=$((i+1)); done; echo "@docs/imp.md"; } > "$R/CLAUDE.md"; TIP="$(commit_all "$R" imports)"
 run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "CLAUDE.md (158 lines, its Contents fine) + the UNCHANGED docs/imp.md it imports = over 200: every .md must be extracted" fail
 has "and the violation is the 200-line rule" "200"
+branch_from "$R" main b_named; { printf '# T\n\n## Contents\n\n- A\n\n## A\n\n'; filler; } > "$R/CLAUDE.md"; TIP="$(commit_all "$R" claude-ok)"
+run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "a clean CLAUDE.md with an UNCHANGED link named .md in the tree: left out and counted, not a reason to give up" ok lint-limpo-sem-1-link-fora-do-diff
 # upstream/main holds docs/upstream.md only: the lint skips a file that exists upstream, which needs the REAL refs (GIT_DIR)
 blob="$(git -C "$R" rev-parse main:docs/upstream.md)"; inner="$(printf '100644 blob %s\tupstream.md\n' "$blob" | git -C "$R" mktree)"
 up="$(printf '040000 tree %s\tdocs\n' "$inner" | git -C "$R" mktree)"; git -C "$R" update-ref refs/remotes/upstream/main "$(git -C "$R" commit-tree "$up" -m up)"
