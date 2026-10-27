@@ -136,6 +136,44 @@ branch_from "$R" main b_impu
 { i=0; while [ "$i" -lt 100 ]; do echo "imp $i"; i=$((i+1)); done; } > "$R/docs/IMPU.MD";  IBASE="$(commit_all "$R" impu-base)"
 { printf '# T\n\n## Contents\n\n- A\n\n## A\n\n'; i=0; while [ "$i" -lt 150 ]; do echo "line $i"; i=$((i+1)); done; echo "@docs/IMPU.MD"; } > "$R/CLAUDE.md"; TIP="$(commit_all "$R" impu-claude)"
 run_sut 2c "$R" "$IBASE" "$TIP" ga-x;                      expect "CLAUDE.md imports an UNCHANGED uppercase .MD: the whole-tree extract takes it too" fail violacoes-doc-rules
+# The lint follows an @import to ANY regular file (resolve_import only tests S_ISREG), so the tree handed to it must hold every file a
+# named doc reaches, whatever its suffix: else the 200-line count is short and the verdict is a clean one on a tree it could not see
+# (gate_run ga-h3scrqt). The base has no unchanged link (alias.md): these cases ask for a CLEAN verdict, which a link makes unmeasured.
+branch_from "$R" main b_nb; git -C "$R" rm -q docs/alias.md
+big() { local i=0; while [ "$i" -lt "$1" ]; do echo "big $i"; i=$((i+1)); done; }
+big 250 > "$R/docs/big.txt"; big 3 > "$R/docs/small.txt"; printf '@big.txt\n' > "$R/docs/chain.md"; ln -s big.txt "$R/docs/biglink.txt"
+printf '@cyc_b.txt\n' > "$R/docs/cyc_a.txt"; printf '@cyc_a.txt\nmore\n' > "$R/docs/cyc_b.txt"
+mkdir -p "$R/sub" && big 250 > "$R/sub/notes.txt"; big 3 > "$WORK/outside.txt"; mkdir -p "$WORK/home" && big 3 > "$WORK/home/ref.txt"
+NB="$(commit_all "$R" nolink-base)"
+# nd <branch> <import line> [doc path]: a small named doc (9 lines, Contents fine) on a branch of NB; TIP = its commit
+nd() { branch_from "$R" "$NB" "$1"; mkdir -p "$(dirname "$R/${3:-CLAUDE.md}")"; { printf '# T\n\n## Contents\n\n- A\n\n## A\n\n'; filler; printf '%s\n' "$2"; } > "$R/${3:-CLAUDE.md}"; TIP="$(commit_all "$R" "$1")"; }
+nd n_plain "no import here";            run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "control: a clean CLAUDE.md with no link in the tree is ok" ok lint-limpo
+nd n_big "@docs/big.txt";               run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "CLAUDE.md (9 lines) imports an UNCHANGED 250-line .txt: the lint sees 259 lines, not 9" fail violacoes-doc-rules
+has "and the violation is the 200-line rule, counted through the .txt" "imported 250 from big.txt"
+nd n_small "@docs/small.txt";           run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "control: a 3-line .txt import stays under the cap" ok lint-limpo
+nd n_chain "@docs/chain.md";            run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "a .md the doc imports itself imports a 250-line .txt: the closure is followed" fail violacoes-doc-rules
+nd n_cyc "@docs/cyc_a.txt";             run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "two .txt files that import each other end the closure, they do not loop" ok lint-limpo
+nd n_sub "@notes.txt" sub/CLAUDE.md;    run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "an import is resolved from the importing doc's folder (sub/notes.txt), not from the root" fail violacoes-doc-rules
+nd n_link "@docs/biglink.txt";          run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "an import that goes through a symlink cannot be read as data: a clean lint is unmeasured" nao-consegui-medir entrada-especial-fora-do-diff-1
+nd n_prose "mail @someone about @types/node";  run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "an @word that names no file is not an import" ok lint-limpo
+nd n_span 'see `@docs/biglink.txt` here';      run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "an @import inside a code span is not an import (the lint's own tokenizer decides)" ok lint-limpo
+nd n_fence $'```\n@docs/biglink.txt\n```'; run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "an @import inside a fenced code block is not an import either" ok lint-limpo
+nd n_abs "@$WORK/outside.txt";          run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "an absolute import reads the HOST's file, not the branch's: a clean lint is unmeasured" nao-consegui-medir entrada-especial-fora-do-diff-1
+nd n_home "@~/ref.txt";                 run_sut 2c "$R" "$NB" "$TIP" ga-x "HOME=$WORK/home"; expect "a ~ import is the host's file too" nao-consegui-medir entrada-especial-fora-do-diff-1
+nd n_nofile "@/nonexistent-dir/x.txt";  run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "an absolute @word that is no file is not an import" ok lint-limpo
+nd n_up "@../outside.txt";              run_sut 2c "$R" "$NB" "$TIP" ga-x; expect "an import that climbs above the tree is resolved against the scratch dir, not the repo: unmeasured" nao-consegui-medir entrada-especial-fora-do-diff-1
+# A closure helper that crashes or prints something else is a measurement that did not happen, never an empty closure
+HB="$WORK/hbroken"; mkdir -p "$HB"; cp "$SUT" "$HB/gate-hard-checks.sh"; SUT_REAL="$SUT"; SUT="$HB/gate-hard-checks.sh"
+nd n_hlp "@docs/big.txt"
+printf 'import sys\nsys.exit(3)\n' > "$HB/gate-hard-checks-imports.py"
+run_sut 2c "$R" "$NB" "$TIP" ga-x;                         expect "a closure helper that exits non-zero" nao-consegui-medir imports-nao-medidos
+printf 'print("IMPORTS-OK special=0 files=0")\nimport sys\nsys.exit(3)\n' > "$HB/gate-hard-checks-imports.py"
+run_sut 2c "$R" "$NB" "$TIP" ga-x;                         expect "a closure helper that prints a good first line and then dies is still a walk that did not finish" nao-consegui-medir imports-nao-medidos
+printf 'print("IMPORTS-OK special=0 files=0 extra")\n' > "$HB/gate-hard-checks-imports.py"
+run_sut 2c "$R" "$NB" "$TIP" ga-x;                         expect "a closure helper whose first line is not the exact protocol line" nao-consegui-medir imports-nao-medidos
+rm -f "$HB/gate-hard-checks-imports.py"
+run_sut 2c "$R" "$NB" "$TIP" ga-x;                         expect "a missing closure helper" nao-consegui-medir imports-nao-medidos
+SUT="$SUT_REAL"
 # Excluded directories (vendor/) are skipped by the lint: "0 file(s) checked" is a measured zero, not a clean bill
 branch_from "$R" main b_vendor; mkdir -p "$R/vendor"; bad_doc > "$R/vendor/x.md";           TIP="$(commit_all "$R" vendor)"
 run_sut 2c "$R" "$MAIN" "$TIP" ga-x;                       expect "a diff whose only .md sits in an excluded dir: the lint checked no file, so not 'ok'" nao-se-aplica nenhum-arquivo-conferido
@@ -211,6 +249,15 @@ run_sut 2e "$R" "$MAIN" "$RTIP" ga-st2;                    expect "control: read
 printf '%s\n' "$LINE" | grep -q ' arm=enforce$' && ok "and the arm column is the tool's" || bad "arm column: $LINE"
 printf 'print("third-state-reads-check: verdict=ok mode=enforce arm=enforce")\n' > "$T5"
 run_sut 2e "$R" "$MAIN" "$RTIP" ga-st3;                    expect "an ok line with no reads= count cannot say what was read: unmeasured" nao-consegui-medir saida-ilegivel
+# The tool's "NOT analysed" files are a scope it declared; a pass that says nothing about them reads like "every file was looked at"
+printf 'print("third-state-reads-check: verdict=ok mode=enforce arm=enforce reads=0 uncovered=0 waived=0 skipped=3")\n' > "$T5"
+run_sut 2e "$R" "$MAIN" "$RTIP" ga-st4;                    expect "reads=0 and 3 files not analysed: still ok, but the reason says how many were not looked at" ok sem-leituras-vistas-e-3-nao-analisados
+printf 'print("third-state-reads-check: verdict=ok mode=enforce arm=enforce reads=4 uncovered=0 waived=1 skipped=2")\n' > "$T5"
+run_sut 2e "$R" "$MAIN" "$RTIP" ga-st5;                    expect "reads=4 covered and 2 files not analysed: the reason carries the 2" ok leituras-com-teste-e-2-nao-analisados
+printf 'print("third-state-reads-check: verdict=ok mode=enforce arm=enforce reads=4 uncovered=0 waived=1")\n' > "$T5"
+run_sut 2e "$R" "$MAIN" "$RTIP" ga-st6;                    expect "an ok line with reads= but no skipped= cannot say what was left out: unmeasured" nao-consegui-medir saida-ilegivel
+printf 'print("third-state-reads-check: verdict=ok mode=enforce arm=enforce reads=4 uncovered=0 waived=1 skipped=x")\n' > "$T5"
+run_sut 2e "$R" "$MAIN" "$RTIP" ga-st7;                    expect "a skipped= that is not a number is not zero" nao-consegui-medir saida-ilegivel
 CITY_UNDER=""
 
 echo "F. 2d E12 coverage (real e12-crew-doctrine.sh over the fixture's prompts; the city's generator, never the branch's)"
@@ -223,6 +270,16 @@ run_sut 2d "$R" "$MAIN" "$STIP" ga-x;                      expect "a hand edit i
 has "the generator's own line reaches the refusal" "STALE"
 branch_from "$R" "$STIP" f_debt; printf '\nanother plain line\n' >> "$R/$HQ/agents/mila-wa/prompt.template.md"; DTIP="$(commit_all "$R" debt)"
 run_sut 2d "$R" "$STIP" "$DTIP" ga-x;                      expect "red on the base too: main's debt, recorded, never refused" debito-previo e12-vermelho-na-base-tambem
+# The red lines carry the tree's path and the tip and the base sit in different dirs: the cut must survive how macOS names a TMPDIR
+# (a trailing slash, and /var is a link to /private/var), or every debt-carrying branch would read as "new" in production
+ln -s "$WORK/tmp" "$WORK/tmplink"
+run_sut 2d "$R" "$STIP" "$DTIP" ga-x "TMPDIR=$WORK/tmplink/"; expect "same debt, scratch under a TMPDIR that ends in a slash and goes through a link: still main's debt" debito-previo e12-vermelho-na-base-tambem
+# "Red on the base too" is a SET question: main's one gap must not let a second one ride (gate_run ga-h3scrqt, medium finding)
+branch_from "$R" "$STIP" f_second; awk '{print} /e12-doctrine:begin/ {print "A SECOND STALE LINE INSIDE THE REGION"}' "$R/$HQ/agents/mila-wa/prompt.template.md" > "$WORK/p2.md" && cp "$WORK/p2.md" "$R/$HQ/agents/mila-wa/prompt.template.md"; S2TIP="$(commit_all "$R" second-stale)"
+run_sut 2d "$R" "$STIP" "$S2TIP" ga-x;                     expect "main's gap is red on the base, and this diff adds a SECOND one in another prompt: refused" fail e12-vermelho-novo-no-tip
+has "and the refusal names the new prompt" "mila-wa"
+branch_from "$R" "$STIP" f_same; printf '\nplain\n' >> "$R/$HQ/agents/dog-remote/prompt.template.md"; SATIP="$(commit_all "$R" same-prompt-edit)"
+run_sut 2d "$R" "$STIP" "$SATIP" ga-x;                     expect "control: editing the already-stale prompt outside its region adds no red line: still main's debt" debito-previo e12-vermelho-na-base-tambem
 branch_from "$R" main f_linkbase; mkdir -p "$R/$HQ/agents/zz-link"; ln -s ../dog-remote/prompt.template.md "$R/$HQ/agents/zz-link/prompt.template.md"; LB="$(commit_all "$R" link-base)"
 branch_from "$R" "$LB" f_link; printf '\nplain line\n' >> "$R/$HQ/agents/mila-wa/prompt.template.md"; LTIP="$(commit_all "$R" prompt-over-link-base)"
 run_sut 2d "$R" "$LB" "$LTIP" ga-x;                        expect "an untouched link among the prompts: a green E12 is not vouched for" nao-consegui-medir entrada-especial-fora-do-diff-1
@@ -234,6 +291,8 @@ rm -f "$CITY/.gc/e12-coverage-gate.off"
 run_sut 2d "$R" "$MAIN" "$STIP" ga-x E12_COVERAGE_GATE=off; expect "the env switch" desligado interruptor
 mkdir -p "$WORK/fakepy"; printf '#!/bin/sh\ncase "$*" in *tomllib*) exit 1;; esac\nexec %s "$@"\n' "$(command -v python3)" > "$WORK/fakepy/python3"; chmod +x "$WORK/fakepy/python3"
 run_sut 2d "$R" "$MAIN" "$STIP" ga-x GATE_HC_PYTHONS="$WORK/fakepy/python3"; expect "a python without tomllib says so (it would make every base red too)" nao-consegui-medir python-sem-tomllib
+FB2="$WORK/fb2"; mkdir -p "$FB2"; for t in bash sh env git grep awk sed tr cat mkdir rm dirname basename mktemp cp cut head tail sort uniq python3 timeout jq ls wc; do p="$(command -v "$t" 2>/dev/null)" && ln -sf "$p" "$FB2/$t"; done
+run_sut 2d "$R" "$STIP" "$DTIP" ga-x PATH="$FB2";            expect "no comm to compare the red lines: unmeasured, never 'no new red line'" nao-consegui-medir e12-linhas-ilegiveis
 C3="$WORK/city3"; mkcity "$C3" e12-crew-doctrine.sh; CITY_UNDER="$C3"
 run_sut 2d "$R" "$MAIN" "$STIP" ga-x;                      expect "a missing generator" nao-consegui-medir ferramenta-ilegivel
 CITY_UNDER=""

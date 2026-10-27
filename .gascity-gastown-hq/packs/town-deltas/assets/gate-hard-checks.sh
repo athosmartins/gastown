@@ -21,11 +21,13 @@
 #   ok                  the tool ran and found nothing (2b: the parse guard printed an OK line for a pack under the tree; an
 #                       exit 0 that only SKIPPED the lint, with a WARNING line, is unlinted -> nao-consegui-medir; 2c: the
 #                       lint's summary line says it checked at least one file; 2e: reason sem-leituras-vistas when the tool
-#                       saw no new read at all, leituras-com-teste when every read it saw has a test or a waiver)
+#                       saw no new read at all, leituras-com-teste when every read it saw has a test or a waiver; either reason
+#                       ends -e-<N>-nao-analisados when the tool declares N changed files it did not analyse)
 #   fail                the tool printed a finding AND exited 1 (2b/2d also need the base tree to be green: for 2b, each pack
-#                       the tip broke must have linted green there). The only verdict the guard refuses on
+#                       the tip broke must have linted green there; for 2d, a base that is red too still refuses when the tip
+#                       has a red line the base's run lacks, and its detail lists just those new lines). The only verdict the guard refuses on
 #   aviso               2e found reads with no failure test but its mode (warn, or the holdout arm) does not refuse
-#   debito-previo       2b/2d: red on the tip and on the base: main already carried it
+#   debito-previo       2b/2d: red on the tip and on the base: main already carried it (2d: every red line of the tip is on the base)
 #   nao-se-aplica       the diff touches nothing this step reads (a MEASURED zero: the diff itself was read; "reads" for 2c is
 #                       the lint's own set: added/copied/modified/renamed .md, any case of the suffix, so a type change such as
 #                       symlink -> regular doc is outside it, here and in the lint), or (2c) the lint ran and checked no file
@@ -39,7 +41,12 @@
 # THIRD STATES. "Could not run" is never green and never red. A finding needs POSITIVE evidence in the tool's output
 # (a crash also exits 1); everything else is unmeasured. An exit 0 is not proof either: 2b's parse guard exits 0 when it
 # skips (no pack.toml above the template, gc absent, nothing matched), so green needs its OK line too; 2c's lint also exits 0
-# when switched off (a DISABLED line, no summary), so green needs its summary line with at least one file checked.
+# when switched off (a DISABLED line, no summary), so green needs its summary line with at least one file checked. 2c's lint
+# counts a named doc's @imports by following each to a regular file of ANY suffix, so a changed CLAUDE.md / CLAUDE.local.md /
+# AGENTS.md makes gate-hard-checks-imports.py (beside this script) list what its imports reach, and the tree handed to the lint holds
+# those files too. A reach that tree cannot show as data (a link or submodule, a path above the tree, an absolute or ~ import that
+# names a file on this host) makes a clean verdict unmeasured, and a walk that did not finish is imports-nao-medidos, never an
+# empty closure.
 # A python without tomllib (< 3.11) cannot run 2d and would make the base tree red as well, so it is said
 # (python-sem-tomllib), never read as debito-previo for good.
 #
@@ -57,7 +64,7 @@ TMO="${GATE_HC_TIMEOUT:-90}"
 case "$TMO" in (''|*[!0-9]*) TMO=90 ;; esac
 [ "$TMO" -ge 1 ] 2>/dev/null || TMO=90
 
-STEP="${1-}"; SCRATCH=""; TOP=""; WANT=""; LIVE_MD=""; CHANGED_ALL=""; SPECIAL=0; RC="-"; TIPC="-"; BASEC="-"; ARM="-"; DETAIL=""
+STEP="${1-}"; SCRATCH=""; TOP=""; WANT=""; LIVE_MD=""; IMPORTS=""; CHANGED_ALL=""; SPECIAL=0; RC="-"; TIPC="-"; BASEC="-"; ARM="-"; DETAIL=""
 PY=""; PY_TOML=0; TBIN=""
 cleanup() { if [ -n "$SCRATCH" ]; then rm -rf "$SCRATCH" 2>/dev/null; fi; return 0; }
 trap cleanup EXIT
@@ -77,9 +84,10 @@ ok_or_special() {
 
 # want <path>: rc 0 when this step needs that tree entry (WANT picks the step's set). The doc-rules lint takes ".md" in any
 # case (path.lower().endswith), so the .md patterns here do too: a narrower set would hand the lint a tree without the file.
+# md-all adds IMPORTS (imports_closure): the lint follows an @import to a file of ANY suffix, so every .md is not enough.
 want() {
   case "$WANT" in
-    (md-all) case "$1" in (*.[mM][dD]) return 0 ;; esac ;;
+    (md-all) case "$1" in (*.[mM][dD]) return 0 ;; esac; case "$IMPORTS" in (*$'\n'"$1"$'\n'*) return 0 ;; esac ;;
     (md-changed) case "$1" in (*.[mM][dD]) case "$LIVE_MD" in (*$'\n'"$1"$'\n'*) return 0 ;; esac ;; esac ;;
     (e12) case "$1" in
             ($HQ/agents/*/prompt.template.md|$HQ/city.toml|$HQ/packs/town-deltas/template-fragments/town-deltas.template.md) return 0 ;;
@@ -129,14 +137,36 @@ pick_tools() { # PY = first python3 with tomllib (PY_TOML=1), else the PATH one;
   return 0
 }
 
+# imports_closure: sets IMPORTS (newline-delimited tip paths) and adds to SPECIAL, from the helper that walks the @imports of the changed
+# named docs. The lint follows an @import to a regular file of ANY suffix, so a tree of .md files alone shows it a short count; the
+# helper uses the lint's own tokenizer over the tip's git objects (gate_run ga-h3scrqt). Reaches it cannot show as data (a link, a path
+# above the tree, a file on this host) come back as `special`, which turns a clean verdict into unmeasured (ok_or_special).
+imports_closure() {
+  local helper="$HERE/gate-hard-checks-imports.py" out="" first="" n=""
+  # vazio → no root although the caller just matched a named doc in this same file: a contradiction, so unmeasured; falhou/ilegível → the
+  # same, never an empty closure
+  grep -E '(^|/)(CLAUDE|CLAUDE\.local|AGENTS)\.md$' "$SCRATCH/live.nl" > "$SCRATCH/roots.nl" || emit nao-consegui-medir imports-nao-medidos
+  [ -r "$helper" ] || emit nao-consegui-medir imports-nao-medidos
+  # vazio → "IMPORTS-OK special=0 files=0" is the legitimate empty closure; falhou/ilegível → rc != 0, no first line, or a first line off the
+  # protocol is a walk that did not finish: unmeasured, never an empty closure
+  out="$("$TBIN" "$TMO" "$PY" -I "$helper" "$HQ_DIR/scripts/doc-rules-lint.py" "$TOP" "$tip" "$SCRATCH/roots.nl" 2> "$SCRATCH/imports.err")" \
+    || { DETAIL="$(cap "$(cat "$SCRATCH/imports.err" 2>/dev/null)")"; emit nao-consegui-medir imports-nao-medidos; }
+  first="$(printf '%s\n' "$out" | sed -n '1p')"
+  printf '%s\n' "$first" | grep -E -q '^IMPORTS-OK special=[0-9]+ files=[0-9]+$' || { DETAIL=""; emit nao-consegui-medir imports-nao-medidos; }
+  n="${first#IMPORTS-OK special=}"; n="${n%% *}"
+  SPECIAL=$((SPECIAL + n))
+  IMPORTS=$'\n'"$(printf '%s\n' "$out" | sed '1d')"$'\n'
+}
+
 step_2c() {
   local tool="$HQ_DIR/scripts/doc-rules-lint.py" out="" gd="" n=""
   [ -r "$tool" ] || emit nao-consegui-medir ferramenta-ilegivel
   tool_altered "$HQ/scripts/doc-rules-lint.py" && emit nao-consegui-medir ferramenta-alterada-no-diff
-  # A named doc (CLAUDE.md, CLAUDE.local.md, AGENTS.md) counts its @imports: only then does the lint need every .md, not just the
-  # changed ones. Its basename is matched in EXACT case, like the lint's NAMED_FILES; only the ".md" suffix is case-blind.
+  # A named doc (CLAUDE.md, CLAUDE.local.md, AGENTS.md) counts its @imports, and the lint follows each one to a regular file of any
+  # suffix: only then does it need more than the changed .md files, namely every .md (a link may be one) plus the files the imports
+  # reach (imports_closure). Its basename is matched in EXACT case, like the lint's NAMED_FILES; only the ".md" suffix is case-blind.
   WANT=md-changed; LIVE_MD=$'\n'"$(grep -i '\.md$' "$SCRATCH/live.nl")"$'\n'
-  if grep -E -q '(^|/)(CLAUDE|CLAUDE\.local|AGENTS)\.md$' "$SCRATCH/live.nl"; then WANT=md-all; fi
+  if grep -E -q '(^|/)(CLAUDE|CLAUDE\.local|AGENTS)\.md$' "$SCRATCH/live.nl"; then WANT=md-all; imports_closure; fi
   extract "$tip" "$SCRATCH/tip" || emit nao-consegui-medir extracao-tip
   # vazio/falhou → sem git-dir não há diff nem ref do upstream: nao-consegui-medir, nunca "sem violação"
   gd="$(git -C "$TOP" rev-parse --absolute-git-dir 2>/dev/null)" || gd=""
@@ -163,7 +193,7 @@ step_2c() {
 }
 
 step_2e() {
-  local tool="$HQ_DIR/packs/town-deltas/assets/third-state-reads-check.py" out="" line="" v="" nreads=""
+  local tool="$HQ_DIR/packs/town-deltas/assets/third-state-reads-check.py" out="" line="" v="" nreads="" nskip="" note=""
   [ -r "$tool" ] || emit nao-consegui-medir ferramenta-ilegivel
   tool_altered "$ASSETS_REL/third-state-reads-check.py" && emit nao-consegui-medir ferramenta-alterada-no-diff
   case "$bead" in (''|*[!A-Za-z0-9._-]*) emit nao-consegui-medir bead-invalido ;; esac
@@ -177,6 +207,7 @@ step_2e() {
     # vazio → campo ausente na linha: arm fica "-" e nreads fica vazio (nunca o resto da linha tomado por valor); falhou/ilegível → idem
     case "$line" in (*' arm='*) ARM="${line#* arm=}"; ARM="${ARM%% *}" ;; esac
     case "$line" in (*' reads='*) nreads="${line#* reads=}"; nreads="${nreads%% *}" ;; esac
+    case "$line" in (*' skipped='*) nskip="${line#* skipped=}"; nskip="${nskip%% *}" ;; esac
   elif [ "$RC" -eq 0 ]; then
     # Whole lines at the start only (the finding lines echo branch text, indented): see step_2c.
     if printf '%s\n' "$out" | grep -E -q '^NOTE: third-state-reads-check: not switched on \('; then emit nao-ligado conf-ausente; fi
@@ -186,8 +217,12 @@ step_2e() {
   case "$RC:$v" in
     # reads=0 → a ferramenta não viu leitura nova alguma: ok sem-leituras-vistas ("ok" aí não promete testes, só que nada faltava);
     # vazio/falhou/ilegível → reads= ausente ou não numérico: nao-consegui-medir, nunca "toda leitura tem teste"
-    (0:ok) case "$nreads" in (0) emit ok sem-leituras-vistas ;; (''|*[!0-9]*) emit nao-consegui-medir saida-ilegivel ;; esac
-           emit ok leituras-com-teste ;;
+    # skipped= is the files the tool declares it did NOT analyse: a pass that drops that count reads like "every file was looked at", so the
+    # reason keeps it; vazio/falhou/ilegível → skipped= absent or not a number is as unreadable as reads= (nao-consegui-medir), never 0
+    (0:ok) case "$nskip" in (''|*[!0-9]*) emit nao-consegui-medir saida-ilegivel ;; esac
+           if [ "$nskip" -gt 0 ]; then note="-e-$nskip-nao-analisados"; fi
+           case "$nreads" in (0) emit ok "sem-leituras-vistas$note" ;; (''|*[!0-9]*) emit nao-consegui-medir saida-ilegivel ;; esac
+           emit ok "leituras-com-teste$note" ;;
     (0:reads-without-test) DETAIL="$(cap "$out")"; emit aviso leitura-sem-teste-sem-recusa ;;
     (1:reads-without-test) DETAIL="$(cap "$out")"; emit fail leitura-sem-teste ;;
     (0:nao-sei|1:nao-sei) DETAIL="$(cap "$out")"; emit nao-consegui-medir ferramenta-nao-sei ;;
@@ -213,6 +248,15 @@ run_e12() {
   else printf 'unknown %s' "$worst"; fi
 }
 
+# e12_red_lines <out> <tree>: the red lines of one E12 run with the tree's own prefix cut off (the tip and the base sit in different
+# scratch dirs, and the lines carry the path), sorted, into <out>.norm. rc != 0 = they could not be read.
+e12_red_lines() {
+  # vazio → rc 1: run_e12 calls a tree red only when it printed such a line, so none here is a contradiction, not "no gap"; falhou/ilegível → rc != 0 as well
+  grep -E '^e12-crew-doctrine: (STALE|BROKEN MARKERS|GAP) — ' "$1" > "$1.red" || return 1
+  awk -v t="$2/" '{ while ((i = index($0, t)) > 0) $0 = substr($0, 1, i - 1) substr($0, i + length(t)); print }' "$1.red" > "$1.cut" || return 1
+  LC_ALL=C sort -u "$1.cut" > "$1.norm"
+}
+
 step_2d() {
   local cr="" cls="" bcr=""
   if [ "${E12_COVERAGE_GATE:-}" = "off" ] || [ -f "$HQ_DIR/.gc/e12-coverage-gate.off" ]; then emit desligado interruptor; fi
@@ -231,7 +275,12 @@ step_2d() {
   bcr="$(run_e12 "$SCRATCH/base" "$SCRATCH/base.out")"; BASEC="${bcr%% *}"
   case "$BASEC" in
     (green) emit fail e12-vermelho-no-tip-e-verde-na-base ;;
-    (red) emit debito-previo e12-vermelho-na-base-tambem ;;
+    # Red on the base too is not yet "main's debt": only a tip red line the base's run lacks is this diff's, so main's one gap cannot
+    # carry a second. A comparison that did not run is unmeasured, never "no new red line".
+    (red) e12_red_lines "$SCRATCH/tip.out" "$SCRATCH/tip" && e12_red_lines "$SCRATCH/base.out" "$SCRATCH/base" \
+            && LC_ALL=C comm -23 "$SCRATCH/tip.out.norm" "$SCRATCH/base.out.norm" > "$SCRATCH/e12.new" || { DETAIL=""; emit nao-consegui-medir e12-linhas-ilegiveis; }
+          if [ -s "$SCRATCH/e12.new" ]; then DETAIL="$(cap "$(cat "$SCRATCH/e12.new")")"; emit fail e12-vermelho-novo-no-tip; fi
+          emit debito-previo e12-vermelho-na-base-tambem ;;
     (*) DETAIL=""; emit nao-consegui-medir e12-inconclusivo-base ;;
   esac
 }
@@ -323,6 +372,12 @@ main() {
   if [ -z "$TOP" ] || [ ! -d "$TOP" ]; then emit nao-consegui-medir sem-toplevel; fi
   SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/ghc.XXXXXX" 2>/dev/null)" || SCRATCH=""
   if [ -z "$SCRATCH" ]; then emit nao-consegui-medir sem-scratch; fi
+  # The tools print the tree's path back (2d's red lines), and macOS names a TMPDIR with a trailing slash under /var, a link to
+  # /private/var: the physical path is the one form they cannot rewrite. vazio/falhou → cd or pwd failed: unmeasured, and the EXIT
+  # trap still removes the dir, because SCRATCH still holds the name mktemp gave
+  REAL="$(cd "$SCRATCH" 2>/dev/null && pwd -P)" || REAL=""
+  if [ -z "$REAL" ]; then emit nao-consegui-medir sem-scratch; fi
+  SCRATCH="$REAL"
   # vazio → o diff foi lido e está vazio = zero MEDIDO (nao-se-aplica); falhou (sha desconhecido, objeto ausente) → diff-falhou, nunca zero
   git -C "$TOP" diff -z --name-only --no-renames "${base}..${tip}" > "$SCRATCH/all" 2>/dev/null || emit nao-consegui-medir diff-falhou
   git -C "$TOP" diff -z --name-only --no-renames --diff-filter=ACMR "${base}..${tip}" > "$SCRATCH/live" 2>/dev/null || emit nao-consegui-medir diff-falhou
