@@ -10,13 +10,14 @@ PARA QUE SERVE
 FONTES (`--fonte NOME`; sem o argumento é wa-suite; as duas não dividem estado, label nem bead)
   wa-suite    lê wa-suite.confirmed, bead no rig do WA (label origem:lastro-wa-suite), bug P2, estado newfail.json.
   hq-mutants  lê hq-mutants.state.json (o estado do motor hq-mutate.py: de cada alvo, `survivors` = os mutantes que NENHUM selftest da família pegou, confirmados por uma 2ª rodada numa cópia limpa), bead no rig do HQ
-              (a cidade; label origem:lastro-hq-mutants), task P3, estado newfail-hq-mutants.json. A lista é a do ÚLTIMO rodízio: o id sai quando o alvo é varrido de novo e o mutante morre (o teste foi reforçado).
+              (a cidade; label origem:lastro-hq-mutants), task P3, estado newfail-hq-mutants.json. A lista é a do ÚLTIMO rodízio: o id sai quando o motor varre o alvo de novo e o mutante morre (ou deixa de existir); alvo apagado ou ainda não varrido de novo mantém a linha (pode estar velha).
+              Lista que ZERA não é 'pegos': alvo sem sobrevivente também é alvo que o motor NÃO reavaliou (base vermelha, scanner perdido, prazo, estado novo). O comentário diz quantos alvos não foram julgados por inteiro e quais.
 O QUE LÊ (wa-suite)
   `ssh <nó> cat ~/gt-remote/ballast/wa-suite.confirmed`: {"v": 1, "main": <ponta da rodada>, "items": {<id do teste>: {"from": <ponta antes>, "to": <ponta onde apareceu>, "seen": <ponta que confirmou>}}}.
   É o estado ATUAL (o id fica até o teste passar), então olhar menos vezes que a rodada não perde nada.
 O QUE FAZ
   Lista vazia e nenhuma bead nossa aberta → nada. Lista com impressão digital nova → abre a bead (bug, P2, labels origem:lastro-wa-suite e area:testes, SEM rota: quem triagem decide) ou, se a que abrimos
-  segue aberta, a atualiza por comentário com a lista inteira. Bead que o dono fechou e uma lista DIFERENTE depois → abre outra (a MESMA lista com a bead fechada não reabre nada). Lista que zera → um comentário "corrigidas" (não fecha: quem corrigiu fecha). Mesma lista = nada.
+  segue aberta, a atualiza por comentário com a lista inteira. Bead que o dono fechou e uma lista DIFERENTE depois → abre outra (a MESMA lista com a bead fechada não reabre nada). Lista que zera → um comentário (não fecha: quem corrigiu fecha): wa-suite diz "corrigidas"; hq-mutants só diz o que o estado prova (alvos todos julgados por inteiro) ou, havendo alvo não reavaliado, que vazia NÃO prova que foram pegos. Mesma lista = nada.
   ANTES de abrir, sempre lista o rig (`bd list -l origem:lastro-wa-suite`): se já existe uma nossa não fechada (a criação anterior pode ter nascido sem eu saber), comenta nela em vez de abrir outra.
   Sem a bandeira do nó (.gc/hetzner-node.on) não faz nada, como as outras orders do nó.
 TRÊS ESTADOS
@@ -77,22 +78,22 @@ def run(args, inp=None, timeout=90):
 
 
 def read_node():
-    """('ok', itens) | ('ausente', None) | ('ssh', None) | ('ilegivel', texto do motivo)."""
+    """('ok', itens, avaliação) | ('ausente', None, None) | ('ssh', None, None) | ('ilegivel', texto do motivo, None). avaliação = (quantos alvos o estado tem, [(alvo, por que não foi reavaliado)])."""
     r = run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", NODE, REMOTE % F["arquivo"]], timeout=60)
     if r is None or r.returncode == 255:
-        return "ssh", None
+        return "ssh", None, None
     if r.returncode == 10:
-        return "ausente", None
+        return "ausente", None, None
     if r.returncode != 0:
-        return "ilegivel", "o nó não leu %s (rc=%d)" % (F["arquivo"], r.returncode)
+        return "ilegivel", "o nó não leu %s (rc=%d)" % (F["arquivo"], r.returncode), None
     try:
         v = json.loads(r.stdout)
     except (ValueError, RecursionError):
-        return "ilegivel", "%s não é JSON" % F["arquivo"]
+        return "ilegivel", "%s não é JSON" % F["arquivo"], None
     items = F["items"](v)
     if items is None:
-        return "ilegivel", "%s não tem a forma esperada (%s)" % (F["arquivo"], F["forma"])
-    return "ok", items
+        return "ilegivel", "%s não tem a forma esperada (%s)" % (F["arquivo"], F["forma"]), None
+    return "ok", items, F["avalia"](v)
 
 
 def load_state():
@@ -154,11 +155,38 @@ def items_hq(v):
         if not isinstance(surv, dict):
             return None
         for sid, r in surv.items():
-            if not (isinstance(sid, str) and isinstance(r, dict) and isinstance(r.get("file"), str) and isinstance(r.get("line"), int) and all(isinstance(r.get(f, ""), str) for f in ("op", "old", "new"))
+            if not (isinstance(sid, str) and isinstance(r, dict) and isinstance(r.get("file"), str) and type(r.get("line")) is int and all(isinstance(r.get(f, ""), str) for f in ("op", "old", "new"))
                     and isinstance(r.get("selftest", []), list) and all(isinstance(t, str) for t in r.get("selftest", []))):
                 return None
             items[sid] = r
     return items
+
+
+def avalia_wa(v):
+    """O wa-suite.confirmed é a lista ATUAL de ids (não há alvo que fique sem ser reavaliado): nada a declarar."""
+    return 0, []
+
+
+def avalia_hq(v):
+    """(quantos alvos o estado do motor tem, [(alvo, por que NÃO foi julgado por inteiro agora)]). `items_hq` já provou a forma de `targets`. Alvo sem sobrevivente na lista NÃO é alvo pego: o motor, quando o arquivo muda,
+    zera a entrada e só volta a preenchê-la ao julgar (base vermelha, scanner perdido ou prazo deixam a entrada sem `survivors`); só o alvo com hash, sem `skip` e com todos os mutantes julgados está de fato reavaliado.
+    Nenhum alvo no estado = o motor ainda não varreu nada (estado novo): também não vale como 'pegos'."""
+    targets = v["targets"]
+    out = [] if targets else [("estado", "sem nenhum alvo: o motor ainda não varreu nada")]
+    for rel, ent in sorted(targets.items()):
+        total, ver = ent.get("total"), ent.get("verdicts", {})
+        if "skip" in ent:
+            why = "pulado: %s" % str(ent["skip"])[:40]
+        elif not ent.get("hash"):
+            why = "sem hash"
+        elif type(total) is not int or not isinstance(ver, dict):
+            why = "sem total de mutantes"
+        elif len(ver) < total:
+            why = "restam %d de %d mutantes" % (total - len(ver), total)
+        else:
+            continue
+        out.append((rel, why))
+    return len(targets), out
 
 
 def render_hq(items):
@@ -169,7 +197,8 @@ def render_hq(items):
     out = ["Mutantes SOBREVIVENTES confirmados pelo lastro do nó (item hq-mutants): %d troca(s) de UM trecho do código do hq que NENHUM selftest da família reprovou." % len(items), "",
            "Cada linha é uma quebra deliberada (antes → depois) que deixou os selftests do arquivo VERDES, e que repetida numa cópia limpa também passou: o teste não protege aquela linha. Para fechar, "
            "ponha no selftest um caso que reprove com a troca (o id é estável: sha1 de arquivo:linha:operador:antes>depois:ocorrência) ou, se a troca não muda o comportamento, diga qual é a equivalência. "
-           "A lista é a do ÚLTIMO rodízio e a bead é atualizada quando ela muda; um id sai quando o arquivo é varrido de novo e o mutante morre.", ""]
+           "A lista é a do ÚLTIMO rodízio e a bead é atualizada quando ela muda. Um id sai quando o motor varre o arquivo de novo e o mutante morre (ou deixa de existir); arquivo apagado, renomeado ou ainda não varrido de novo "
+           "MANTÉM a linha aqui, e ela pode estar velha: confira no arquivo atual antes de agir.", ""]
     for rel, rows in sorted(files.items()):
         out.append("ARQUIVO %s (%d)" % (rel, len(rows)))
         for line, sid, r in sorted(rows, key=lambda x: (x[0], x[1])):
@@ -261,14 +290,24 @@ def create(items):
     return bead
 
 
+def zerou_hq(n, nao):
+    """Comentário de lista que zerou. Vazia NÃO é 'pegos': só digo o que o estado prova, e o que ele não prova vai escrito (alvo não reavaliado, estado sem alvo, arquivo que saiu do estado)."""
+    if nao:
+        quais = "; ".join("%s (%s)" % x for x in nao[:10]) + ("; +%d" % (len(nao) - 10) if len(nao) > 10 else "")
+        return ("A lista de mutantes sobreviventes (item hq-mutants) está vazia, mas isso NÃO prova que os testes foram reforçados. Estado do motor: %d alvo(s); NÃO julgados por inteiro agora: %d [%s]. "
+                "Alvo que o motor ainda não reavaliou não tem sobrevivente na lista, nem por isso foi pego. Confira ~/gt-remote/ballast/hq-mutants.state.json no nó antes de fechar esta bead." % (n, len(nao), quais))
+    return ("A lista de mutantes sobreviventes (item hq-mutants) está vazia: os %d alvo(s) do estado do motor estão com todos os mutantes julgados e nenhum sobrevive. Quem reforçou o teste fecha esta bead. "
+            "(Arquivo que saiu do estado do motor também não aparece: confira ~/gt-remote/ballast/hq-mutants.state.json no nó.)" % n)
+
+
 FONTES = {
     "wa-suite": dict(arquivo="wa-suite.confirmed", estado="newfail.json", rig=os.environ.get("HB_WA_RIG", "/Users/athos/gt/whatsapp_automation"), rig_nome="WA", labels=("origem:lastro-wa-suite", "area:testes"),
                      tipo="bug", prio="2", titulo="wa-suite do lastro: %d regressão(ões) confirmada(s) no main", items=items_wa, forma="v 1, items {id: {from, to, seen}}", render=render_wa, coisas="regressões", gen="as",
-                     zerou="As regressões confirmadas pelo lastro do nó (item wa-suite) foram corrigidas: a lista atual está vazia. Quem corrigiu fecha esta bead."),
+                     avalia=avalia_wa, zerou=lambda n, nao: "As regressões confirmadas pelo lastro do nó (item wa-suite) foram corrigidas: a lista atual está vazia. Quem corrigiu fecha esta bead."),
     "hq-mutants": dict(arquivo="hq-mutants.state.json", estado="newfail-hq-mutants.json", rig=os.environ.get("HB_HQ_RIG") or CITY, rig_nome="HQ", labels=("origem:lastro-hq-mutants", "area:testes"),
                        tipo="task", prio="3", titulo="hq-mutants do lastro: %d mutante(s) sobrevivente(s) confirmado(s) no main", items=items_hq, forma="v 1, targets {arquivo: {survivors: {id: {file, line, op, old, new}}}}", render=render_hq,
                        coisas="mutantes sobreviventes", gen="os",
-                       zerou="Os mutantes sobreviventes confirmados pelo lastro do nó (item hq-mutants) foram pegos: a lista atual está vazia (os testes foram reforçados). Quem reforçou fecha esta bead."),
+                       avalia=avalia_hq, zerou=zerou_hq),
 }
 
 
@@ -289,7 +328,7 @@ def main():
     if not os.path.exists(os.path.join(CITY, ".gc", "hetzner-node.on")):
         say("PULADO: o nó está desligado (falta %s/.gc/hetzner-node.on)" % CITY)
         return 0
-    st, items_or_why = read_node()
+    st, items_or_why, aval = read_node()
     if st == "ssh":
         die(98, "ssh não conectou (%s): nada foi feito" % NODE)
     if st == "ilegivel":
@@ -305,11 +344,11 @@ def main():
     fp = fingerprint(items)
     if not items:
         if bead and last_n:
-            r = run([BD, "-C", F["rig"], "comment", bead, "--stdin"], inp=F["zerou"], timeout=60)
+            r = run([BD, "-C", F["rig"], "comment", bead, "--stdin"], inp=F["zerou"](*aval), timeout=60)
             if r is None or r.returncode != 0:
                 die(3, "bd comment falhou em %s: o estado local não mudou; a próxima volta repete" % bead)
-            save_state_or_die(fp, bead, 0, "comentei em %s que foram corrigidas" % bead, "a próxima volta repete o comentário")
-            say("lista vazia: comentei em %s que foram corrigidas" % bead)
+            save_state_or_die(fp, bead, 0, "comentei em %s que a lista zerou" % bead, "a próxima volta repete o comentário")
+            say("lista vazia: comentei em %s que a lista zerou (%d alvo(s) não reavaliado(s))" % (bead, len(aval[1])))
         else:
             say("0 %s confirmad%s" % (F["coisas"], F["gen"]))
         return 0

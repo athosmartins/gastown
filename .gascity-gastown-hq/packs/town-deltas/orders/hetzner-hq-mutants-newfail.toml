@@ -3,8 +3,8 @@
 # item seria queima disfarçada: gasta CPU e não produz nada que alguém leia.
 #
 # O QUE FAZ: hetzner-ballast-newfail.py --fonte hq-mutants lê o estado do motor no nó (ssh) e mantém UMA bead no rig do HQ (a cidade; task, P3, labels origem:lastro-hq-mutants e area:testes) com a lista COMPLETA
-# de sobreviventes (arquivo, linha, troca, id, selftest da família): abre quando a lista é nova, comenta quando ela muda ou zera ("pegos": o selftest foi reforçado e o arquivo, varrido de novo, não tem mais o
-# sobrevivente), abre outra se o dono fechou a anterior E a lista mudou depois. ANTES de abrir lista o rig (label origem:lastro-hq-mutants): se já existe uma nossa não fechada, comenta nela em vez de abrir outra.
+# de sobreviventes (arquivo, linha, troca, id, selftest da família): abre quando a lista é nova, comenta quando ela muda ou zera (lista vazia NÃO é "pegos": o comentário diz quantos alvos o motor não
+# reavaliou, e só com todos julgados por inteiro diz que nenhum sobrevive), abre outra se o dono fechou a anterior E a lista mudou depois. ANTES de abrir lista o rig (label origem:lastro-hq-mutants): se já existe uma nossa não fechada, comenta nela em vez de abrir outra.
 # Ler o nó ou o estado local que falha = exit 3 e NADA é aberto; o nó desligado (falta .gc/hetzner-node.on) = não faz nada. Estado local: .gc/hetzner-ballast/newfail-hq-mutants.json (o do wa-suite é outro arquivo).
 #
 # 30 min como a do wa-suite: a lista é o estado ATUAL (não um evento) e o motor só a muda quando varre um arquivo; cada volta custa um ssh e, se a lista mudou, um bd na cidade.

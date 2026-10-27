@@ -6,7 +6,7 @@
 #
 # CASOS: bandeira do nó ausente = não faz nada · ssh fora = rc 98 · arquivo do nó ausente = nada confirmado (rc 0) · leitura do nó que falha, JSON ruim, forma errada = rc 3 e NADA é aberto (erro nunca vira "0 confirmadas") ·
 #   lista nova = UMA bead (bug, P2, labels, corpo com a lista COMPLETA, também com 237 ids) e o estado guarda o id · mesma lista = nada · lista que muda = comentário na mesma bead · bead fechada pelo dono = abre outra ·
-#   bead que não consigo ler = não abre outra · lista que zera = um comentário "corrigidas" · estado local ilegível = rc 3 · `bd create` sem resposta certa (rc≠0, prazo estourado, sem id — com a bead NASCIDA ou não) = rc 3, estado
+#   bead que não consigo ler = não abre outra · lista que zera = um comentário (wa-suite "corrigidas"; hq-mutants nunca afirma "pegos" sem alvo julgado por inteiro) · estado local ilegível = rc 3 · `bd create` sem resposta certa (rc≠0, prazo estourado, sem id — com a bead NASCIDA ou não) = rc 3, estado
 #   intacto, e a volta seguinte LISTA o rig antes de abrir (acha a nossa → comenta, não duplica; não acha → abre; não consegue listar → rc 3 e nada feito) · só conta como nossa a bead com a label e não fechada.
 # CONTROLE NEGATIVO: cada mutante (um trecho do script trocado) TEM que reprovar a bateria.
 # VARIÁVEIS: HNF_UNDER_TEST (script a testar) · HNF_PY (python; padrão /usr/bin/python3) · HNF_NO_MUTANTS=1 · HNF_JOBS (mutantes em paralelo; padrão 4)
@@ -217,8 +217,9 @@ g_hq() {  # a fonte hq-mutants (ga-2hd02v.5.6.4): lê o estado do motor, abre a 
   bad "survivors que é uma lista" '{"v": 1, "targets": {"a.sh": {"survivors": []}}}'
   bad "sobrevivente que não é objeto" '{"v": 1, "targets": {"a.sh": {"survivors": {"x": 5}}}}'
   bad "sobrevivente com a linha em texto" '{"v": 1, "targets": {"a.sh": {"survivors": {"x": {"file": "a.sh", "line": "7"}}}}}'
+  bad "sobrevivente com a linha booleana (True é int em Python)" '{"v": 1, "targets": {"a.sh": {"survivors": {"x": {"file": "a.sh", "line": true}}}}}'
   hqcity; echo '{"v": 1, "targets": {"scripts/c.sh": {"hash": "h"}}}' > "$W/node.confirmed"; nh
-  check "newfail[hq]: alvo SEM a chave survivors (o motor também aceita) = nenhum sobrevivente → rc 0, nada aberto" "0 0" "$RC $(wc -l < "$W/bd.calls" | tr -d ' ')"
+  check "newfail[hq]: alvo SEM a chave survivors (o motor também aceita) = nenhum sobrevivente na lista → rc 0, nada aberto (sem bead anterior, não há o que dizer)" "0 0" "$RC $(wc -l < "$W/bd.calls" | tr -d ' ')"
 
   hqcity; mkhq 3; nh
   check "newfail[hq]: lista nova → UMA bead (create no rig /hq, task, P3, stdin, json, as duas labels do hq) e o estado do hq guarda o id e n" "0 1 1 wa-new1 3" "$RC $(calls '^-C /hq create hq-mutants do lastro: 3 mutante.* -t task -p 3 --stdin --json -l origem:lastro-hq-mutants -l area:testes$' bd.calls) $(calls 'create' bd.calls) $(state bead newfail-hq-mutants.json) $(state n newfail-hq-mutants.json)"
@@ -230,8 +231,25 @@ g_hq() {  # a fonte hq-mutants (ga-2hd02v.5.6.4): lê o estado do motor, abre a 
   check "newfail[hq]: lista que MUDA com a bead aberta → comentário na MESMA bead (nenhum create novo), com o id novo no corpo" "0 1 1 1" "$RC $(calls 'comment wa-new1 --stdin' bd.calls) $(calls 'create' bd.calls) $(grep -c 'id=s003' "$W/bd.stdin.3")"
   echo closed > "$W/bd.status"; mkhq 5; nh
   check "newfail[hq]: bead FECHADA pelo dono + lista diferente → abre outra (2 creates no total)" "0 2" "$RC $(calls 'create' bd.calls)"
-  hqcity; mkhq 2; nh; echo '{"v": 1, "targets": {"scripts/a.sh": {"hash": "h", "survivors": {}}}}' > "$W/node.confirmed"; : > "$W/bd.calls"; nh
-  check "newfail[hq]: lista que ZERA → um comentário 'pegos' (não fecha) e n vai a 0" "0 1 0 0 1" "$RC $(calls 'comment' bd.calls) $(calls 'close' bd.calls) $(state n newfail-hq-mutants.json) $(grep -c 'foram pegos' "$W/bd.stdin.2")"
+  # zera(JSON): a lista tinha 2 sobreviventes, o nó passa a mandar JSON; o comentário da 2ª volta está em bd.stdin.2
+  zera() { hqcity; mkhq 2; nh; printf '%s\n' "$1" > "$W/node.confirmed"; : > "$W/bd.calls"; nh; }
+  zc() { grep -c -- "$1" "$W/bd.stdin.2" 2> /dev/null || true; }   # zc TEXTO — linhas do comentário que zera com o texto
+  zera '{"v": 1, "targets": {"scripts/a.sh": {"hash": "h", "total": 2, "verdicts": {"m1": "k", "m2": "i"}, "survivors": {}}}}'
+  check "newfail[hq]: lista que ZERA com TODOS os alvos julgados por inteiro → um comentário (não fecha), n a 0, diz 'nenhum sobrevive' e não afirma causa" "0 1 0 0 1 0 0" "$RC $(calls 'comment' bd.calls) $(calls 'close' bd.calls) $(state n newfail-hq-mutants.json) $(zc 'nenhum sobrevive') $(zc 'NÃO prova') $(zc 'foram pegos')"
+  zera '{"v": 1, "targets": {"scripts/a.sh": {"hash": "h2", "swept": 5, "skip": "base-vermelha", "retry_after": 9999999999}}}'
+  check "newfail[hq]: lista que zera porque o alvo foi PULADO (base vermelha) → o comentário diz 'NÃO prova', conta 1 alvo não julgado e o nomeia com o motivo; não diz 'nenhum sobrevive'" "0 1 0 1 1 1 0" "$RC $(calls 'comment' bd.calls) $(state n newfail-hq-mutants.json) $(zc 'NÃO prova') $(zc 'NÃO julgados por inteiro agora: 1 \[scripts/a.sh (pulado: base-vermelha)\]') $(zc 'pulado: base-vermelha') $(zc 'nenhum sobrevive')"
+  zera '{"v": 1, "targets": {"scripts/a.sh": {"hash": "h", "total": 3, "verdicts": {"m1": "k"}, "survivors": {}}}}'
+  check "newfail[hq]: lista que zera com mutantes POR JULGAR (total 3, 1 veredito) → 'NÃO prova' e 'restam 2 de 3 mutantes'" "1 1 0" "$(zc 'NÃO prova') $(zc 'restam 2 de 3 mutantes') $(zc 'nenhum sobrevive')"
+  zera '{"v": 1, "targets": {"scripts/a.sh": {"total": 0, "verdicts": {}}}}'
+  check "newfail[hq]: lista que zera com alvo SEM hash (o motor nunca o gravou como varrido) → 'NÃO prova' e 'sem hash'" "1 1 0" "$(zc 'NÃO prova') $(zc 'sem hash') $(zc 'nenhum sobrevive')"
+  zera '{"v": 1, "targets": {"scripts/a.sh": {"hash": "h"}}}'
+  check "newfail[hq]: lista que zera com alvo sem total nem veredito → 'NÃO prova' e 'sem total de mutantes' (ausente não é 'julgado')" "1 1 0" "$(zc 'NÃO prova') $(zc 'sem total de mutantes') $(zc 'nenhum sobrevive')"
+  zera '{"v": 1, "targets": {}}'
+  check "newfail[hq]: estado NOVO do motor (targets {}) depois de uma lista → comentário 'NÃO prova' com 0 alvos e 'sem nenhum alvo'; n vai a 0 e nada é fechado" "0 1 0 0 1 1 1 0" "$RC $(calls 'comment' bd.calls) $(calls 'close' bd.calls) $(state n newfail-hq-mutants.json) $(zc 'NÃO prova') $(zc 'Estado do motor: 0 alvo') $(zc 'sem nenhum alvo') $(zc 'nenhum sobrevive')"
+  zera '{"v": 1, "targets": {"scripts/a.sh": {"hash": "h", "total": 1, "verdicts": {"m1": "k"}, "survivors": {}}, "scripts/b.sh": {"hash": "h3", "skip": "scan-perdido", "perdido": "heredoc aberto"}}}'
+  check "newfail[hq]: um alvo julgado e outro pulado → 'NÃO prova', 2 alvos no estado, 1 não julgado (o julgado não é listado)" "1 1 1 0" "$(zc 'NÃO prova') $(zc 'Estado do motor: 2 alvo.*julgados por inteiro agora: 1 \[scripts/b.sh (pulado: scan-perdido)\]') $(zc 'scan-perdido') $(zc 'scripts/a.sh (')"
+  hqcity; mkhq 3; nh
+  check "newfail[hq]: o corpo da bead avisa que a linha pode estar velha (alvo apagado ou ainda não varrido de novo mantém a dele)" "1" "$(grep -c 'pode estar velha' "$W/bd.stdin.1")"
   hqcity; mkhq 40; nh
   check "newfail[hq]: 40 sobreviventes → o corpo traz os 40 (a lista COMPLETA, sem o corte de 15 do resumo)" "40" "$(grep -c 'id=s[0-9][0-9][0-9]' "$W/bd.stdin.1")"
 
@@ -285,7 +303,7 @@ o texto da falha do create volta a afirmar que nada foi registrado@@Não sei se 
 escrita do estado local que falha vira silêncio (rc 0)@@        die(3, "%s, mas NÃO gravei o estado local (%s): %s" % (done, e, next_round))@@        pass
 a criação não grava o estado (a próxima volta não sabe da bead)@@    save_state_or_die(fp, new, len(items), "abri %s" % new, "a próxima volta lista o rig e comenta nela em vez de abrir outra")@@    pass
 o comentário da lista nova não grava o estado (repete a cada volta)@@        save_state_or_die(fp, bead, len(items), "comentei a lista nova em %s" % bead, "a próxima volta repete o comentário")@@        pass
-o comentário 'corrigidas' não grava o estado (repete a cada volta)@@            save_state_or_die(fp, bead, 0, "comentei em %s que foram corrigidas" % bead, "a próxima volta repete o comentário")@@            pass
+o comentário 'corrigidas' não grava o estado (repete a cada volta)@@            save_state_or_die(fp, bead, 0, "comentei em %s que a lista zerou" % bead, "a próxima volta repete o comentário")@@            pass
 lista que zera não comenta@@        if bead and last_n:@@        if False:
 a fonte hq-mutants usa a label do wa-suite@@labels=("origem:lastro-hq-mutants", "area:testes")@@labels=("origem:lastro-wa-suite", "area:testes")
 a fonte hq-mutants divide o estado com o wa-suite@@estado="newfail-hq-mutants.json"@@estado="newfail.json"
@@ -293,12 +311,21 @@ a fonte hq-mutants pede ao nó o arquivo do wa-suite@@arquivo="hq-mutants.state.
 a fonte hq-mutants abre a bead no rig do WA@@rig=os.environ.get("HB_HQ_RIG") or CITY@@rig=os.environ.get("HB_WA_RIG") or CITY
 HB_HQ_RIG vazio vira o rig vazio (-C '')@@rig=os.environ.get("HB_HQ_RIG") or CITY@@rig=os.environ.get("HB_HQ_RIG", CITY)
 a bead do hq nasce bug P2 (como a do wa-suite)@@tipo="task", prio="3"@@tipo="bug", prio="2"
-a lista que zera fala 'corrigidas' e não 'pegos'@@foram pegos: a lista atual está vazia@@foram corrigidas: a lista atual está vazia
+alvo PULADO (skip) conta como julgado, e a lista que zera vira 'nenhum sobrevive'@@        if "skip" in ent:@@        if False:
+alvo SEM hash conta como julgado@@        elif not ent.get("hash"):@@        elif False:
+alvo sem total (ou verdicts de outro tipo) conta como julgado@@        elif type(total) is not int or not isinstance(ver, dict):@@        elif False:
+mutantes por julgar (total > vereditos) contam como julgados@@        elif len(ver) < total:@@        elif False:
+estado novo (targets {}) vira lista vazia limpa ('nenhum sobrevive')@@    out = [] if targets else [("estado", "sem nenhum alvo: o motor ainda não varreu nada")]@@    out = []
+o comentário que zera esquece a avaliação dos alvos@@inp=F["zerou"](*aval), timeout=60)@@inp=F["zerou"](0, []), timeout=60)
+o comentário que zera do hq-mutants ignora os alvos não reavaliados@@    if nao:@@    if False:
+a fonte hq-mutants usa a avaliação do wa-suite (nada a declarar)@@avalia=avalia_hq, zerou=zerou_hq@@avalia=avalia_wa, zerou=zerou_hq
+sobrevivente com a linha booleana passa@@type(r.get("line")) is int and @@isinstance(r.get("line"), int) and 
+o corpo esquece o aviso de linha velha@@"MANTÉM a linha aqui, e ela pode estar velha: confira no arquivo atual antes de agir."@@""
 só o 1º alvo do estado do motor entra na lista@@    for ent in targets.values():@@    for ent in list(targets.values())[:1]:
 survivors que não é objeto passa@@        if not isinstance(surv, dict):@@        if False:
 alvo que não é objeto vira "sem sobrevivente"@@        surv = ent.get("survivors", {}) if isinstance(ent, dict) else None@@        surv = ent.get("survivors", {}) if isinstance(ent, dict) else {}
 alvo sem a chave survivors dá traceback@@        surv = ent.get("survivors", {}) if isinstance(ent, dict) else None@@        surv = ent["survivors"] if isinstance(ent, dict) else None
-sobrevivente com a linha em texto passa@@isinstance(r.get("line"), int) and @@
+sobrevivente com a linha em texto passa@@type(r.get("line")) is int and @@
 o corpo corta os sobreviventes em 15@@        for line, sid, r in sorted(rows, key=lambda x: (x[0], x[1])):@@        for line, sid, r in sorted(rows, key=lambda x: (x[0], x[1]))[:15]:
 o corpo esquece o id do sobrevivente@@r.get("new", "").replace("\n", "\\n"), sid, @@r.get("new", "").replace("\n", "\\n"), "", 
 fonte que não conheço cai na padrão (wa-suite)@@    die(2, "uso: hetzner-ballast-newfail.py [--fonte %s]" % "|".join(sorted(FONTES)))@@    return "wa-suite"
