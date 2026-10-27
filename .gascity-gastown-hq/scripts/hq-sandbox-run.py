@@ -96,14 +96,15 @@ def check_rw(dirs):
 
 
 PROVA_FILHO = r'''
-import os, socket, sys
+import errno, os, socket, sys
 fora, porta, dentro = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 def tenta(nome, f):
     try:
         f()
         print("%s:ESCAPOU" % nome)
-    except OSError:
-        print("%s:barrado" % nome)
+    except OSError as e:
+        # só EACCES/EPERM é a jaula: um connect recusado (ECONNREFUSED) ou um caminho que sumiu (ENOENT) não provam nada, então saem como `erro-<errno>` e a prova fica inerte
+        print("%s:%s" % (nome, "barrado" if e.errno in (errno.EACCES, errno.EPERM) else "erro-" + errno.errorcode.get(e.errno, str(e.errno))))
 def criar():
     open(os.path.join(fora, "novo"), "w").close()
 def apagar():

@@ -8,7 +8,8 @@
 # CASOS: uso e recusas (rodam em qualquer sistema) · sem jaula (HQSB_FORCE_UNAVAILABLE) o comando NÃO roda · com jaula (só Linux com Landlock ABI >= 4, o nó): escrever, apagar, truncar e abrir TCP
 #   fora do --rw falham e o estado fora fica intacto, escrever dentro e em /dev/null funciona, o rc do comando passa, `--prove` dá `provado`.
 # MUTANTES do próprio lançador (cada âncora casa EXATAMENTE 1 vez, senão o caso é INVÁLIDO e reprova: âncora ambígua não prova nada, ga-31xxl5): tirar um direito da jaula, não chamar o restrict_self, deixar
-#   o /dev de fora, deixar o --rw=HOME passar e seguir sem jaula quando ela falha têm de ser pegos por `--prove` ou pelos casos acima.
+#   o /dev de fora, deixar o --rw=HOME passar e seguir sem jaula quando ela falha têm de ser pegos por `--prove` ou pelos casos acima; o mesmo para a prova enganada (o filho mente, o connect falha
+#   por outro motivo, o filho não roda): ela diz inerte, nunca provado.
 # AMBIENTE: sem Landlock (macOS, kernel velho) os casos de jaula e os mutantes NÃO rodam: imprime AMBIENTE e sai 97 (nunca verde sem ter provado a jaula); o gate roda este arquivo no nó (mbp-run.sh --repo hq).
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -123,6 +124,11 @@ PY
   pmut sem-dev        "/dev some das regras (jaula que barra tudo)"    'for d in list(rw) + ["/dev"]:' 'for d in list(rw):'
   # fachada: a jaula não fecha E o filho mente que barrou — só o que o PAI confere (sentinela, pasta de fora, conexão aceita) pode pegar
   mut sem-restrict-f 'if libc.syscall(SYS_RESTRICT, fd, 0) != 0:' 'if False:' && pmut fachada "o filho mente: só os fatos vistos pelo pai pegam" 'print("%s:ESCAPOU" % nome)' 'print("%s:barrado" % nome)' "$W/mut-sem-restrict-f.py"
+  # terceiro estado: "o connect falhou" não é "a jaula barrou". Sem os direitos de rede E apontando para uma porta fechada, o connect volta ECONNREFUSED e o pai não vê conexão aceita: só o filho
+  # separar EACCES de qualquer outro erro impede o `provado` falso. E o filho que nem chega a rodar (interpretador que não existe) tem de dar inerte, não provado.
+  mut sem-tcp-recusado 'NET_BIND_TCP | NET_CONNECT_TCP))' '0))' \
+    && pmut connect-recusado "o connect falha por outro motivo (ECONNREFUSED) e a prova diz provado" 'socket.create_connection(("127.0.0.1", porta), 3)' 'socket.create_connection(("127.0.0.1", 1), 3)' "$W/mut-sem-tcp-recusado.py"
+  pmut filho-nao-roda "o filho da prova não executa e a prova diz provado" 'sys.executable, "-I", "-c", PROVA_FILHO, fora' '"/nao/existe/python", "-I", "-c", PROVA_FILHO, fora'
   # mutantes de recusa. home-livre: a recusa de --rw = HOME some. sem-jaula-segue: com a jaula falhando o comando roda assim mesmo. Quem mata é o caso de recusa/fail-open acima
   mut home-livre 'if r == "/" or r == home or home.startswith(r.rstrip("/") + "/"):' 'if r == "/":' \
     && { HOME="$W/home" python3 -I "$W/mut-home-livre.py" --rw "$W/home" -- true > /dev/null 2>&1; rc=$?
