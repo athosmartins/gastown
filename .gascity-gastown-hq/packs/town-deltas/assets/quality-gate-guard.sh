@@ -9165,6 +9165,107 @@ Then re-run the gate-done step. Marker set to gate-status:error (fixable + re-su
 fi
 # SELFTEST-EXTRACT skillmention-check: END
 
+# ── Step 5b-pre5 (ga-vywjzsp): submission-time hard checks 2b-2e of the gate ──
+# formulas/mol-quality-gate-runner.toml (run-tests) holds four deterministic hard checks: 2b template parse, 2c doc-rules
+# lint, 2d E12 coverage, 2e third-state reads. Nothing pours that formula (the live gate is this guard, the dispatcher and
+# the reviewer sessions, and none of them named a step in 633 versions), so for weeks they ran only when a reviewer found
+# the formula and typed a command by hand. They run here instead, ~2 min after the submission: one gate-hard-checks.sh call
+# per step, each over the branch's files as DATA with the tool already merged (its header says why nothing of the branch runs).
+# Per step the checker answers one VERDICT= line:
+#   fail                the tool printed a finding AND exited 1 (2b/2d: red on the tip and green on the base). Refused below
+#   ok / aviso          clean / 2e findings under mode warn or the holdout arm: recorded, not refused
+#   debito-previo       2b/2d red on the base too: main already carried it
+#   nao-se-aplica       the diff touches nothing the step reads (a measured zero)
+#   nao-ligado          2e: .gc/third-state-reads.conf is absent or mode=off, the tool checked nothing
+#   desligado           a kill switch is on
+#   nao-consegui-medir  anything that stopped a measurement: fail-OPEN, recorded with its reason
+# All four steps run before the verdict, so the builder gets every finding in one comment. One label per step
+# (gate-tmplparse, gate-docrules, gate-e12cov, gate-tsr: <verdict>) and one HARDCHECK log line per step that carries the
+# checker's own line (rc= is the tool's exit code): each execution of each step, with its rc, reads in the log and on the marker.
+# Switches: GATE_HARDCHECKS=off or $GC_CITY/.gc/gate-hardchecks.off skips all four (each recorded desligado);
+# GATE_HARDCHECKS=observe or .gc/gate-hardchecks.observe runs and records them but never refuses (the log says what it WOULD
+# refuse); each tool keeps its own switch (DOC_RULES_LINT=off, E12_COVERAGE_GATE=off, THIRD_STATE_READS_CHECK=off).
+# Same record discipline as Step 5b-pre4: a pessimistic default verdict, replaced only by a verdict the checker really printed,
+# and ONE record per step written AFTER the measurement. The block between the SELFTEST-EXTRACT sentinels is run VERBATIM by
+# gate-guard-hardchecks.selftest.sh, which stubs only log/err/set_gate_status/bd: keep the sentinels, keep the block self-contained.
+# SELFTEST-EXTRACT hardchecks: BEGIN
+_HC_SCRIPT="${GATE_HC_SCRIPT:-$GC_CITY/packs/town-deltas/assets/gate-hard-checks.sh}"
+_HC_MODE="enforce"
+if [ "${GATE_HARDCHECKS:-}" = "off" ] || [ -f "$GC_CITY/.gc/gate-hardchecks.off" ]; then
+  _HC_MODE="off"
+elif [ "${GATE_HARDCHECKS:-}" = "observe" ] || [ -f "$GC_CITY/.gc/gate-hardchecks.observe" ]; then
+  _HC_MODE="observe"
+fi
+_HC_BASE=""; _HC_TIP=""; _HC_WHY="entrada-nao-resolvida"
+if [ "$_HC_MODE" != "off" ] && [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
+  _HC_WHY="fetch-falhou"
+  # A failed fetch leaves origin/main and origin/$BRANCH at whatever an earlier sweep saw, and measuring THAT would report on
+  # a commit that is not the one being submitted: it is "could not measure", never a clean bill.
+  if git -C "$RIG_PATH" fetch origin main "$BRANCH" --quiet 2>/dev/null; then
+    # vazio → sha não resolvido: cai em base-nao-resolvida (nao-consegui-medir), nunca em "nada a medir"; falhou → idem
+    _HC_MAIN=$(git -C "$RIG_PATH" rev-parse "origin/main" 2>/dev/null || echo "")
+    _HC_TIP=$(git -C "$RIG_PATH" rev-parse "origin/$BRANCH" 2>/dev/null || echo "")
+    if [ -n "$_HC_MAIN" ] && [ -n "$_HC_TIP" ]; then
+      _HC_BASE=$(git -C "$RIG_PATH" merge-base "$_HC_TIP" "$_HC_MAIN" 2>/dev/null || echo "")
+    fi
+    if [ -z "$_HC_BASE" ]; then _HC_WHY="base-nao-resolvida"; _HC_TIP=""; fi
+  fi
+fi
+_HC_FAILS=""; _HC_DETAIL=""; _HC_HINTS=""
+for _HC_STEP in 2b 2c 2d 2e; do
+  case "$_HC_STEP" in
+    (2b) _HC_LAB="gate-tmplparse"; _HC_HINT='2b template parse: bash .gascity-gastown-hq/packs/town-deltas/assets/template-fragment-lint-guard.sh <repo root> <changed template files>   (needs gc and jq)' ;;
+    (2c) _HC_LAB="gate-docrules"; _HC_HINT='2c doc rules: python3 .gascity-gastown-hq/scripts/doc-rules-lint.py --check --diff "$(git merge-base HEAD origin/main)...HEAD"   (--fix-contents <file> writes the Contents section)' ;;
+    (2d) _HC_LAB="gate-e12cov"; _HC_HINT='2d E12 coverage: bash .gascity-gastown-hq/packs/town-deltas/assets/e12-crew-doctrine.sh check ; ... coverage   (stale text: ... write)' ;;
+    (*)  _HC_LAB="gate-tsr"; _HC_HINT='2e third-state reads: python3 .gascity-gastown-hq/packs/town-deltas/assets/third-state-reads-check.py --repo . --base origin/main --head HEAD --bead <bead> --no-record' ;;
+  esac
+  _HC_V="nao-consegui-medir"; _HC_R="$_HC_WHY"; _HC_LINE=""
+  if [ "$_HC_MODE" = "off" ]; then
+    _HC_V="desligado"; _HC_R="interruptor-geral"
+  elif [ -n "$_HC_TIP" ]; then
+    if [ ! -r "$_HC_SCRIPT" ]; then
+      _HC_R="verificador-ilegivel"
+    else
+      # vazio/falhou → sem linha VERDICT= (o verificador morreu antes de responder): fica o default nao-consegui-medir
+      _HC_OUT=$(bash "$_HC_SCRIPT" "$_HC_STEP" "$RIG_PATH" "$_HC_BASE" "$_HC_TIP" "$BEAD_ID" 2>/dev/null || echo "")
+      _HC_LINE=$(printf '%s\n' "$_HC_OUT" | sed -n '1p')
+      _HC_TOK=$(printf '%s\n' "$_HC_LINE" | sed -n 's/^VERDICT=\([a-z-]*\) step=.*$/\1/p')
+      case "$_HC_TOK" in
+        (ok|fail|aviso|debito-previo|nao-se-aplica|nao-ligado|desligado|nao-consegui-medir)
+          _HC_V="$_HC_TOK"
+          _HC_R=$(printf '%s\n' "$_HC_LINE" | sed -n 's/^VERDICT=[a-z-]* step=[^ ]* reason=\([^ ]*\).*/\1/p')
+          if [ "$_HC_V" = "fail" ]; then
+            _HC_FAILS="$_HC_FAILS $_HC_STEP"
+            _HC_HINTS="$_HC_HINTS"$'\n'"  $_HC_HINT"
+            # One awk stage that reads everything: `| head` would SIGPIPE the stage before it, and under pipefail that is a
+            # non-zero status that set -e turns into the death of the whole sweep. The checker caps itself; this is for a misbehaving one.
+            _HC_DETAIL="$_HC_DETAIL"$'\n'"--- step $_HC_STEP ($_HC_LAB) ---"$'\n'"$(printf '%s\n' "$_HC_OUT" | awk 'NR > 1 && NR <= 21 { print substr($0, 1, 200) }')"
+          fi
+          ;;
+        (*) _HC_R="resposta-ilegivel" ;;
+      esac
+    fi
+  fi
+  bd -C "$GC_CITY" label add "$MARKER_ID" "$_HC_LAB:$_HC_V" -q 2>/dev/null || true
+  log "HARDCHECK step=$_HC_STEP verdict=$_HC_V reason=${_HC_R:-<EMPTY>} bead=${BEAD_ID:-<EMPTY>} branch=${BRANCH:-<EMPTY>} mode=$_HC_MODE marker=$MARKER_ID checker=[${_HC_LINE:-<EMPTY>}]"
+done
+if [ -n "$_HC_FAILS" ] && [ "$_HC_MODE" = "observe" ]; then
+  log "HARDCHECK-OBSERVE would refuse marker $MARKER_ID (steps:$_HC_FAILS); observe mode, not refusing."
+elif [ -n "$_HC_FAILS" ]; then
+  err "  hard checks (ga-vywjzsp): step(s)$_HC_FAILS failed. Refusing at submission."
+  set_gate_status "$MARKER_ID" "error"
+  bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: gate hard checks (ga-vywjzsp), step(s)$_HC_FAILS.
+These are the gate's deterministic hard checks (formulas/mol-quality-gate-runner.toml run-tests 2b-2e), run here about 2 minutes after the submission over your branch tip. Each failing step shows the tool's own lines:
+$_HC_DETAIL
+Run the failing step yourself before you push again (from the repo root):$_HC_HINTS
+Then push again:
+  git push origin $BRANCH
+and re-run the gate-done step. Marker set to gate-status:error (fixable + re-submittable, not lost)." 2>/dev/null || true
+  log "SUPPRESSED PUSH (wa-uthi non-terminal): hardchecks failed for $MARKER_ID (gate-status:error)."
+  exit 1
+fi
+# SELFTEST-EXTRACT hardchecks: END
+
 # ── Step 5b (ga-e7zk7): detach source bead from the dog pool — gate owns it now ──
 # Why HERE (after Step 5), not before it: Step 5 derives the self-review-exclusion
 # author from the source bead's record, and its FIRST-CHOICE signal is the bead's
