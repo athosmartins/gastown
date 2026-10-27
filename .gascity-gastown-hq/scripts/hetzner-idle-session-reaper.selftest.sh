@@ -19,6 +19,7 @@ cat > "$T/bin/gc" <<'EOF'
 #!/bin/sh
 echo "$*" >> "$FAKE_DIR/gc.argv"
 if [ "$3" = "session" ] && [ "$4" = "list" ]; then
+  [ -f "$FAKE_DIR/gc.list.hang" ] && { echo $$ > "$FAKE_DIR/gc.pid"; exec sleep 20; }
   [ -f "$FAKE_DIR/gc.list.rc" ] && exit "$(cat "$FAKE_DIR/gc.list.rc")"
   cat "$FAKE_DIR/sessions.json"
   exit 0
@@ -69,12 +70,13 @@ seed() { # seed <id> <desde> <vivas_seguidas>: estado de uma rodada anterior
 reap() { # reap <epoch> [args...]  -> RC; saída em $W/out e $W/err
   local now="$1"
   shift
-  env -i PATH="/usr/bin:/bin" HOME="$W" GC_CITY_PATH="$CITY" GC_BIN="$T/bin/gc" BD_BIN="$T/bin/bd" FAKE_DIR="$FAKE" HETZNER_REAP_NOW="$now" python3 -I "$EXE" "$@" > "$W/out" 2> "$W/err"
+  env -i PATH="/usr/bin:/bin" HOME="$W" GC_CITY_PATH="$CITY" GC_BIN="$T/bin/gc" BD_BIN="$T/bin/bd" FAKE_DIR="$FAKE" HETZNER_REAP_NOW="$now" $REAP_X python3 -I "$EXE" "$@" > "$W/out" 2> "$W/err"
   RC=$?
 }
 closed() { tr '\n' ' ' < "$FAKE/closed.log" | sed 's/ $//'; }
 sum() { if [ -f "$1" ]; then cksum < "$1"; else echo ausente; fi; }
 T0=1000000
+REAP_X=""  # VAR=valor (sem espaço no valor) a mais no ambiente da próxima rodada; quem usa zera depois
 
 # 1. o zumbi: sem bead, vivo. Fecha só quando o relógio passa de 15 min E o viu vivo em 2 rodadas (3ª leitura, 20 min depois)
 new_world zumbi
@@ -301,6 +303,10 @@ check "sem sessão nossa: o bd não é chamado" ausente "$(sum "$FAKE/bd.calls")
 # 20-28. o que o hq-mutants achou sem teste (ga-lwbl088): um token trocado no reaper e nenhuma bateria acima reprovava. Cada caso abaixo nasceu de um mutante e reprova nele.
 # Fora daqui de propósito, por serem equivalentes (nada que um chamador consiga ler muda): o `0` de `return None, 0, <motivo>` em read_sessions. O 2º item da tupla (ilegiveis)
 # só é lido quando o 3º (motivo) vem vazio; com motivo, run() imprime e sai antes de usá-lo. Trocar esse 0 por 1 não muda saída, estado nem código de saída.
+# Também equivalentes (ga-u6ueg0q): o universal_newlines=True do Popen em run_cmd (com errors= dado, o Popen já abre em modo texto e traduz a quebra de linha do mesmo jeito); os 5 s do
+# communicate que espera o cano fechar depois do SIGKILL (só um neto que sai do grupo e segura o cano faria 5 e 6 diferirem, e isso é segundo de relógio, não resultado); o `is not None`
+# do elif de run() que arma held (rows só é None junto com um motivo, e aí a rodada já saiu; com rows vazio o laço não roda e held não é lido); e o `<=` do relógio que recuou
+# (com desde == agora os dois lados dão agora).
 
 # 20. o teto padrão (HETZNER_REAP_GRACE_S, 900 s) vale no segundo exato: com 900 s ainda não fecha, com 901 s fecha
 new_world teto
@@ -445,6 +451,93 @@ check "bytes: a linha do log por sessão" "$want" "$(sed 's/"ts":"[^"]*"/"ts":"T
 want=$(printf '{"epoch":%s,"falhas":[],"fechadas":[{"id":"ga-aaa","nome":"dog-remote-é","ocioso_s":%s}],"tipo":"reaper","ts":"T"}' $T0 $((T0-1)))
 check "bytes: a linha do hetzner-occupancy.jsonl" "$want" "$(sed 's/"ts":"[^"]*"/"ts":"T"/' "$CITY/.gc/hetzner-occupancy.jsonl" 2>/dev/null)"
 
+
+# 29-34. o que o lastro ainda achou sem teste (ga-u6ueg0q): código de saída de cada falha, o gc que trava, a trava de instância, a cópia do estado corrompido, o prefixo do template e a contagem de ilegíveis
+
+# 29. quem não consegue gravar ou ler a pasta de estado sai 3 (rodada de verdade e --dry-run); configuração inválida, e qualquer exceção solta, sai 1 com o traceback à vista
+new_world semGravar
+sessions "$(row ga-aaa dog-remote-1 dog-remote active)"
+rm -rf "$CITY/.gc"; : > "$CITY/.gc"
+reap $T0
+check "pasta .gc que é um arquivo: a rodada de verdade sai 3" 3 "$RC"
+check "pasta .gc que é um arquivo: diz que não conseguiu gravar" 1 "$(grep -c -F 'não consegui gravar em' "$W/err")"
+reap $T0 --dry-run
+check "pasta .gc que é um arquivo: o --dry-run sai 3 (não consegue ler o estado)" 3 "$RC"
+check "pasta .gc que é um arquivo: o --dry-run diz que não conseguiu ler" 1 "$(grep -c -F 'não consegui ler' "$W/err")"
+new_world configRuim
+sessions "$(row ga-aaa dog-remote-1 dog-remote active)"
+seed ga-aaa 1 9
+REAP_X="HETZNER_REAP_GRACE_S=59"; reap $T0; REAP_X=""
+check "configuração abaixo do mínimo: sai 1" 1 "$RC"
+check "configuração abaixo do mínimo: o traceback fica à vista, com a variável e o mínimo" 1 "$(grep -c -E '^ValueError: HETZNER_REAP_GRACE_S=59 abaixo do mínimo 60' "$W/err")"
+check "configuração abaixo do mínimo: não fecha" "" "$(closed)"
+
+# 30. outra instância com a trava: a rodada de verdade sai 0 sem ler nem fechar nada; o --dry-run não precisa da trava e lê mesmo assim; solta a trava, a rodada volta a fechar
+new_world trava
+sessions "$(row ga-aaa dog-remote-1 dog-remote active)"
+seed ga-aaa 1 9
+before=$(sum "$STATE")
+python3 -I -c 'import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+open(sys.argv[2], "w").write("travada")
+time.sleep(60)' "$CITY/.gc/hetzner-idle-reaper.lock" "$W/travada" &
+HOLDER=$!
+i=0; while [ ! -s "$W/travada" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i+1)); done
+# vazio → a trava não foi tomada a tempo e a rodada abaixo fecharia a ga-aaa: os checks de "não fecha" falham
+reap $T0
+check "trava ocupada: sai 0" 0 "$RC"
+check "trava ocupada: não fecha" "" "$(closed)"
+check "trava ocupada: o estado não anda" "$before" "$(sum "$STATE")"
+check "trava ocupada: diz que outra instância está rodando" 1 "$(grep -c -F 'outra instância ainda está rodando' "$W/err")"
+check "trava ocupada: não lê nada" ausente "$(sum "$FAKE/gc.argv")"
+reap $T0 --dry-run
+check "dry-run com a trava ocupada: sai 0" 0 "$RC"
+check "dry-run com a trava ocupada: não precisa dela e diz o que fecharia" 1 "$(grep -c -F 'fecharia: ga-aaa' "$W/out")"
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+reap $T0
+check "trava solta: a rodada fecha" "ga-aaa" "$(closed)"
+
+# 31. dois estados corrompidos no mesmo segundo não pisam na cópia um do outro: a 1ª colisão vai para -2, a 2ª para -3
+new_world corrompidoDuas
+sessions "$(row ga-aaa dog-remote-1 dog-remote active)"
+: > "$STATE.corrupt-$T0"
+echo '{"versao":1,"sessoes":' > "$STATE"
+reap $T0
+check "cópia que já existe: a nova vai para -2" 1 "$(ls "$CITY/.gc" | grep -c -x -F "hetzner-idle-reaper.state.json.corrupt-$T0-2")"
+check "cópia que já existe: a antiga fica como estava" 0 "$(wc -c < "$STATE.corrupt-$T0" | tr -d ' ')"
+echo '{"versao":1,"sessoes":' > "$STATE"
+reap $T0
+check "duas cópias que já existem: a nova vai para -3" 1 "$(ls "$CITY/.gc" | grep -c -x -F "hetzner-idle-reaper.state.json.corrupt-$T0-3")"
+check "duas cópias que já existem: a -2 não foi pisada" 1 "$(grep -c -F '"sessoes":' "$STATE.corrupt-$T0-2")"
+
+# 32. o template aparece com prefixo de rig ou de pacote (<rig>/<template>, <pack>.<template>): é nosso; quem só TERMINA igual, sem o separador, ou só começa igual, não é
+new_world templates
+sessions "$(row ga-p1 dog-remote-1 gastown/dog-remote active)" "$(row ga-p2 dog-remote-2 core.dog-remote active)" "$(row ga-p3 dog-remote-3 xdog-remote active)" "$(row ga-p4 dog-remote-4 gastown/xdog-remote active)" "$(row ga-p5 dog-remote-5 dog-remote-x active)"
+printf '{"versao":1,"sessoes":{"ga-p1":{"desde":1,"vivas_seguidas":9},"ga-p2":{"desde":1,"vivas_seguidas":9},"ga-p3":{"desde":1,"vivas_seguidas":9},"ga-p4":{"desde":1,"vivas_seguidas":9},"ga-p5":{"desde":1,"vivas_seguidas":9}},"atualizado_em":1}\n' > "$STATE"
+reap $T0
+check "templates: fecha <rig>/<template> e <pack>.<template>, e só eles" "ga-p1 ga-p2" "$(closed)"
+
+# 33. entrada da lista de sessões que não é objeto é contada em ilegiveis e mais nada acontece com ela
+new_world ilegiveis
+printf '{"sessions":[5,"texto",null,%s]}\n' "$(row ga-aaa dog-remote-1 dog-remote active)" > "$FAKE/sessions.json"
+reap $T0
+check "lista com 3 entradas que não são objeto: sai 0" 0 "$RC"
+check "lista com 3 entradas que não são objeto: o resumo conta 3 ilegíveis" "sessoes=1 com_bead=0 fechadas=0 falhas=0 ilegiveis=3" "$(sed 's/^[^ ]* //' "$W/out")"
+
+# 34. o gc que trava: estoura o teto, a rodada diz gc-timeout e o PROCESSO morre (não fica pendurado por trás), com o estado intacto
+new_world gcTrava
+sessions "$(row ga-aaa dog-remote-1 dog-remote active)"
+seed ga-aaa 1 9
+before=$(sum "$STATE")
+: > "$FAKE/gc.list.hang"
+REAP_X="HETZNER_REAP_GC_TIMEOUT_S=1"; reap $T0; REAP_X=""
+pid=$(cat "$FAKE/gc.pid" 2>/dev/null)
+# vazio → o gc de mentira não chegou a rodar: vira "sem-pid" e o check falha
+if [ -z "$pid" ]; then vivo=sem-pid; elif kill -0 "$pid" 2>/dev/null; then vivo=vivo; kill -9 "$pid" 2>/dev/null; else vivo=morto; fi
+check "gc que trava: o processo foi morto ao estourar o teto" morto "$vivo"
+check "gc que trava: a rodada diz gc-timeout e não fecha" 1 "$(grep -c -F 'gc-timeout' "$W/out")"
+check "gc que trava: o estado não anda" "$before" "$(sum "$STATE")"
 
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
