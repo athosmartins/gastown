@@ -446,8 +446,12 @@ echo "  -- git, mkdir and the file system failing in the middle of quality-gate-
 use_list widget.sh "$SEL_W" "$ID_LIM"; hgreset; : > "$REASONS"
 eq "a base that does not resolve (rev-parse of it fails) -> unknown, nothing ran" \
   "$(gate_base_test_mutants_state "$REPO" 0000000000000000000000000000000000000000 "$(tip kills)" "$WT" "$F_W" "$STORE" "$BEAD" 2>>"$REASONS") $(nlines "$FAKE_HG_LOG")" "unknown 0"
+# the tip is read BEFORE the stub: tip() itself is a rev-parse in the rig, and a stub that fails it would hand the function an empty tip
+# (reason empty-argument) instead of reaching the function's own read of the base
+TIP_K=$(tip kills)
 eq "git rev-parse of the base failing in the rig (git exits 1) -> unknown worktree-not-at-base, never a comparison of two empty strings" \
-  "$( ( git() { if [ "$1" = -C ] && [ "$2" = "$REPO" ] && [ "$3" = rev-parse ]; then return 1; fi; command git "$@"; }; st kills ) 2>>"$REASONS")" "unknown"
+  "$( ( git() { if [ "$1" = -C ] && [ "$2" = "$REPO" ] && [ "$3" = rev-parse ]; then return 1; fi; command git "$@"; }
+        gate_base_test_mutants_state "$REPO" "$BASE" "$TIP_K" "$WT" "$F_W" "$STORE" "$BEAD" ) 2>>"$REASONS")" "unknown"
 eq "git rev-parse HEAD failing in the worktree (git exits 1) -> unknown too" \
   "$( ( git() { if [ "$1" = -C ] && [ "$2" = "$WT" ] && [ "$3" = rev-parse ]; then return 1; fi; command git "$@"; }; st kills ) 2>>"$REASONS")" "unknown"
 eq "... both of them left the reason, and neither ran anything" "$(grep -c 'answer=unknown why=worktree-not-at-base$' "$REASONS") $(nlines "$FAKE_HG_LOG")" "3 0"
@@ -798,7 +802,7 @@ areset; bdset $BEAD "$LIST_OK" "$LBL_P"
 eq "portability label only: the mutant path is not taken -> passou-na-base (node green), unchanged ga-hlcfzx9" "$(run_mut_check kills)" "passou-na-base"
 eq "... no mutant was run" "$(nlines "$FAKE_HG_LOG")" "0"
 areset; bdset $BEAD "$LIST_OK" "$LBL_M"
-eq "bd is asked 3 times for one slice: each label once (not once per mutant) and the list once" "$(run_mut_check kills >/dev/null; nlines "$FAKE_BD_LOG")" "3"
+eq "bd is asked 4 times for one slice: each label once, the list twice (the ids, then the count of lines that did not parse), never once per mutant" "$(run_mut_check kills >/dev/null; nlines "$FAKE_BD_LOG")" "4"
 
 echo "  -- the path never depends on the bead id --"
 ARM_A=ga-rstae; ARM_B=ga-pj5va
