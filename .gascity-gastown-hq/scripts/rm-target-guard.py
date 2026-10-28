@@ -75,7 +75,10 @@ LIT = re.compile(r"""'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)\"""", re.S)
 ARGV = re.compile(r"""\[\s*['"](?:[^'"\n]*/)?(rm|unlink|rmdir|shred|rimraf)['"]\s*,([^\]]*)\]|['"](?:[^'"\n]*/)?(rm|unlink|rmdir|shred|rimraf)['"]\s*,\s*\[([^\]]*)\]""")
 ELEM = re.compile(r"""\s*(?:'(?P<s>(?:[^'\\]|\\.)*)'|"(?P<d>(?:[^"\\]|\\.)*)"|(?P<e>[^,\s][^,]*))\s*(?:,|$)""")  # um elemento de lista de argv: literal ou expressão
 # nomes de API de remoção (sem as palavras genéricas remove/delete: scripts de edição as citam o tempo todo): em qualquer parte do código ligam a leitura dos literais de caminho
-DELAPI = re.compile(r"rmtree|remove_tree|rimraf|rm_rf?\b|rmSync|rmdirSync|unlinkSync|removedirs|os\.(?:remove|unlink|rmdir)\b|\.unlink\(|\.rmdir\(|FileUtils\.rm|File\.delete|Dir\.rmdir|(?<![\w.])(?:unlink|rmdir)\s*\(")
+NAMES = r"rmtree|remove_tree|rimraf(?:Sync)?|rm_rf?\b|rmSync|rmdirSync|unlinkSync|removedirs|os\.(?:remove|unlink|rmdir)\b|\.(?:rm|rmdir|unlink)(?=\s*\()|FileUtils\.rm_rf?|File\.delete|Dir\.rmdir|(?<![\w.])(?:unlink|rmdir)(?=\s*\()"
+DELAPI = re.compile(NAMES)
+DELREC = re.compile(r"rmtree|remove_tree|rimraf|rm_rf|removedirs|rmSync|FileUtils\.rm_rf|recursive")  # a API que apaga pasta inteira; `os.remove`/`unlink` apagam um arquivo
+DELCALL = re.compile("(?:" + NAMES + r")\s*\(\s*['\"]([^'\"\n]+)['\"]")  # o literal passado DIRETO à API: `rmtree('gt-remote')`
 GITNAMES = re.compile(r"\.git|objects|refs|head|pack|index|config|hooks|logs|info|description|lock|sample|idx|[0-9a-f]{6,}", re.I)  # nomes de dentro de um .git: um filtro que os casa apaga história
 
 
@@ -224,7 +227,7 @@ def judge(f: str, rec: bool, selective: bool, pat) -> str | None:
             rp = [x for x in root.split("/") if x]
             if low[:len(rp)] == rp:
                 rest = low[len(rp):]
-                dir_ = rec or os.path.isdir(f)  # arquivo solto nessas pastas não derruba a sessão de ninguém; pasta ou recursão sim
+                dir_ = os.path.isdir(f) or (rec and not os.path.lexists(f))  # arquivo existente nessas pastas não derruba a sessão de ninguém; pasta, ou nome que não existe numa remoção recursiva, sim
                 return "rm.shared-tmp" if (not rest or rest[0].startswith("tmux-") or (dir_ and ((rest[0].startswith("claude-") and len(rest) < 3) or (rp[-1] == "folders" and len(rest) < 4)))) else None
         if low[0] in SYSTEM:
             return "rm.system"
@@ -244,15 +247,17 @@ def classify(p: str, rec: bool, selective: bool = False, pat=None):
     return None
 
 
-def check(ops: list, rec: bool, selective: bool, cwds: list, env: dict):
+def check(ops: list, rec: bool, selective, cwds: list, env: dict, lenient: bool = False):
     """(regra, alvo) do 1º operando proibido; operando que não resolvo só barra numa remoção recursiva."""
     for raw in ops:
         for p, pat in candidates(raw, cwds, env):
             if time.monotonic() > DEADLINE:
                 return "rm.too-big", "tempo esgotado"
             if p is None:
-                if rec:
+                if rec and not lenient:
                     return "rm.target-unknown", raw.replace(UNK, "?")
+                continue
+            if lenient and not os.path.lexists(p):  # literal pelado que não existe quase nunca é caminho: só vale o que existe
                 continue
             r = classify(p, rec, selective, pat)
             if r:
@@ -462,7 +467,10 @@ def inline(code: str, cwds: list, depth: int, env: dict):
     for lit in lits:
         hit = scan_bash(lit, cwds, depth + 1, env) if RM_TEXT.search(lit) and re.search(r"\s", lit.strip()) else None
         if hit: return hit
-    return check([x for x in lits if deletes and x and not re.search(r"\s", x) and re.search(r"\w", x) and re.match(r"[~/.]|\w+/", x)], True, False, cwds, env)
+    strict = DELCALL.findall(code) + [x for x in lits if deletes and x and not re.search(r"\s", x) and re.search(r"\w", x) and re.match(r"[~/.]|\w+/", x)]
+    bare = [x for x in lits if deletes and x and len(x) < 256 and "\n" not in x]  # qualquer outro literal pode ser um nome relativo (`d='gt-remote'; rmtree(d)`): julgado, mas um `$x` solto nele não bloqueia
+    rec = bool(DELREC.search(code))
+    return check(strict, rec, False, cwds, env) or check(bare, rec, False, cwds, env, True)
 
 
 def code_of(stage: list) -> list:
@@ -489,11 +497,7 @@ def scan_bash(cmd: str, cwds: list, depth: int = 0, env=None):
     if depth > 6:
         return "rm.too-deep", cmd[:60]
     toks, docs = lex(cmd)
-    for body, recv in docs:  # corpo lido por shell ou interpretador é código; por cat, tee, git commit -F - é texto
-        hit = scan_bash(body, cwds, depth + 1, env) if any(w in SHELLS for w in recv) else None
-        hit = hit or (inline(body, cwds, depth + 1, env) if any(INTERP.fullmatch(w) for w in recv) else None)
-        if hit: return hit
-    cur, here, saved, feed = [], list(cwds), [], []  # feed = comandos anteriores da MESMA pipeline
+    cur, here, saved, feed, ever = [], list(cwds), [], [], list(cwds)  # feed = comandos anteriores da MESMA pipeline; ever = todo cwd que vi (o heredoc roda em algum deles)
     for t in toks + [Op(";")]:
         if isinstance(t, Op) and t in SEP_OPS:
             hit = one(cur, here, depth, env, feed)
@@ -503,6 +507,7 @@ def scan_bash(cmd: str, cwds: list, depth: int = 0, env=None):
             if new is not None:  # o cd só vale com certeza depois de `&&`; com `;` `||` `&` `|` ele pode ter falhado e o shell ficou onde estava: valem os dois (o pior vence)
                 merged = here + [p for p in new if p not in here]
                 here = new if t == "&&" else merged if len(merged) <= 8 else merged[:7] + [None]  # nunca descarta o cwd mais novo: acima do teto entra um "não sei"
+                ever = (ever + [p for p in here if p not in ever])[:8]
             if t == "(":
                 saved.append(here)
             elif t == ")" and saved:
@@ -510,6 +515,10 @@ def scan_bash(cmd: str, cwds: list, depth: int = 0, env=None):
             cur = []
         else:
             cur.append(t)
+    for body, recv in docs:  # corpo lido por shell ou interpretador é código, no cwd do comando que o lê (qual foi? valem todos os que vi); por cat, tee, git commit -F - é texto
+        hit = scan_bash(body, ever, depth + 1, env) if any(w in SHELLS for w in recv) else None
+        hit = hit or (inline(body, ever, depth + 1, env) if any(INTERP.fullmatch(w) for w in recv) else None)
+        if hit: return hit
     return None
 
 
