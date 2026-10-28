@@ -790,6 +790,19 @@ EOF
   grep -q "REFUSED what='pre-push' free_mb=4000 min_mb=5000 class=push rc=75" "$HEAVY_GUARD_LOG" || bad "push lock: refusal not in the log ($(cat "$HEAVY_GUARD_LOG"))"
   grep -q "PUSH_LOCK_YIELD what='pre-push' free_mb=4000 min_mb=5000" "$HEAVY_GUARD_LOG" || bad "push lock: the push was refused without ever having taken and let go of the lock ($(cat "$HEAVY_GUARD_LOG"))"
   kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
+  # (f) the disk cannot be read inside the lock (it could before): the lock is let go and the push is refused with 76 at once; a reading that cannot be taken is not waited for (60 s wait asked, 20 s allowed)
+  p_reset; sleep 60 & hp=$!
+  mkdir "$LK"; echo "$hp $(date +%s)" > "$LK/owner"; echo 9000 > "$W/dfnow"
+  pbounded 20 env "${wenv[@]}" HEAVY_GUARD_POLL_SECS=1 HEAVY_GUARD_PUSH_LOCK_WAIT_SECS=30 HEAVY_GUARD_PUSH_LOCK_POLL_SECS=1 "$g" --what pre-push --wait-secs 60 -- git push e 2>"$W/err" >/dev/null &
+  r1=$!
+  wait_df_call || bad "push lock: the push that waits for the lock never read the disk"
+  : > "$W/dfbad"; rm -f "$LK/owner"; rmdir "$LK"
+  wait "$r1"; rc=$?
+  check "push lock: a disk that cannot be read inside the lock is refused with 76 at once, not after the wait" 76 "$rc"
+  [ ! -e "$LK" ] || bad "push lock: the lock was left behind by a push refused for a disk it could not read inside the lock"
+  [ ! -e "$W/gitlog" ] || bad "push lock: git push RAN on a disk that could not be read inside the lock"
+  grep -q "PUSH_LOCK_YIELD what='pre-push' free_mb=? min_mb=5000 state=unknown" "$HEAVY_GUARD_LOG" || bad "push lock: the lock was not let go on a reading that failed inside it ($(cat "$HEAVY_GUARD_LOG"))"
+  kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
   fi
   if want sigterm; then
   # the guard itself told to stop (the session is killed): it takes the push group down with it and lets the lock go
@@ -1236,6 +1249,7 @@ pgm p-lowlocks   "push: a reading under the floor takes the lock too"          l
 pgm p-noyield    "push: a lock taken before a reading under the floor is kept while the push waits" lockafterdisk 's#^  if \[ "\$HG_LOCK_HELD" = 1 \]; then$#  if false; then#'
 pgm p-norejudge  "push: the disk is not read again inside the lock"            lockafterdisk '/^    hg_push_lock_acquire$/{n;s#continue#break#;}'
 pgm p-noyieldlog "push: giving the lock back leaves no log line"                lockafterdisk '/hg_log "PUSH_LOCK_YIELD/d'
+pgm p-unkwait    "push: a reading that cannot be taken is waited for like a low one" lockafterdisk 's#^  if \[ "\$state" != low \] || \[ "\$now" -ge "\$deadline" \]; then break; fi$#  if [ "$now" -ge "$deadline" ]; then break; fi#'
 pgm p-zerowait   "push: a wait of 0 is not allowed"                             posint        's#\[ "\$4" = 1 \] ||#false ||#'
 pgm p-octal      "push: a zero-padded number is read as octal"                  posint        's@^  v=\$(( 10#\$v ))$@  v=$(( v ))@'
 pgm p-maxage     "push: a lock older than the max age is never stale"           age         's@\*) \[ \$(( now - 10#\$at )) -le "\$HG_LOCK_MAXAGE" \] || { HG_LOCK_VERDICT=stale; return 0; } ;;@*) : ;;@'
