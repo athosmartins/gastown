@@ -2,10 +2,12 @@
 # hq-mutate.selftest.sh (ga-2hd02v.5.6.2) — o motor de mutantes do lastro: acha os testes fracos sem tocar no que não é dele, e sem jaula provada nada roda.
 #
 # ## Contents
-#   Hermético · Casos · Ambiente (97)
+#   Hermético · Casos · Teto de escrita (ga-e6ug8gq) · Ambiente (97)
 #
 # HERMÉTICO: pasta descartável e uma JAULA FALSA que só registra cada execução e deixa passar. Cada caso é uma IMPRESSÃO DIGITAL (rc, veredito, contagens, execuções na jaula): vale se for a esperada, e o MUTANTE do motor vale se ela mudar (âncora que não casa exatamente 1 vez = INVÁLIDO, ga-31xxl5).
+# TETO DE ESCRITA (ga-e6ug8gq): um mutante cujo selftest entra em laço de escrita morre pelo teto por arquivo (`--fsize-mb`) e conta como MORTO. O caso grava com um awk em laço (fixture `loopy.sh`, parado em ~264 MB só para um motor SEM teto não encher o disco deste selftest) com o teto em 4 MB e confere: o arquivo não passou de 4 MB, o awk morreu (rc 153), em menos de 5 s, o mutante contou como morto e a pasta de trabalho ficou vazia. Cada elo do teto tem seu mutante do motor (teto ausente, em bytes, não fixado, SIGXFSZ ignorado, só no soft, falha que roda mesmo assim, sem mínimo contra um limite herdado, uso sem validação).
 # AMBIENTE: com a JAULA REAL (Linux com Landlock, o nó) roda também o caso de contenção (o caminho de fora vai no TEXTO do selftest, o `env -i` do motor apagaria uma variável; controle e mutante pelo mesmo caminho); sem ela imprime AMBIENTE e sai 97.
+# O mesmo vale para o caso do teto que o lançador não consegue fixar: ele só é alcançável com o limite duro de escrita ilimitado. Sob um duro finito (p.ex. dentro do `heavy-guard.sh`, 512 MB) o caso e o seu mutante são pulados com AMBIENTE e o exit é 97 (FAIL=0): esta bateria mede o próprio teto, então rode-a com `--max-file-mb 0` ou direto no nó. Seus fixtures são limitados (~260 MB).
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HM="$HERE/hq-mutate.py"
@@ -283,7 +285,7 @@ EXP_SW0="rc=0 completo run=6 k=2 c=4 f=0 inv=0 open=4"; EXP_SYM="rc=0 sem-cobert
 peq "sujeito symlink: pulado (symlink=1), nada rodou e o arquivo de fora não mudou" "$EXP_SYM" fp_symlink
 peq "execução que falha por infra: rc 0, parcial, falhas=1, nenhum veredito; consertado o slot a varredura seguinte roda os 6" "$EXP_FALHA" fp_falha
 peq "--jail relativo funciona como o absoluto" "$EXP_SW0" fp_jailrel
-fp_fsize() {   # o selftest escreve 3 MB num arquivo do slot com o teto em 1 MB: o laço de escrita para no teto (aqui são 3 MB, nunca GB)
+fp_fsize_head() {   # (ga-2hd02v.5.6.3) o selftest escreve 3 MB num arquivo do slot com o teto em 1 MB: o laço de escrita para no teto (aqui são 3 MB, nunca GB)
   newfx; mkfoo; mkdir "$F/fora"
   mkst foo '( head -c 3000000 /dev/zero > "$TMPDIR/big" ) 2> /dev/null
 wc -c < "$TMPDIR/big" >> "'"$F"'/fora/size"
@@ -292,7 +294,75 @@ wc -c < "$TMPDIR/big" >> "'"$F"'/fora/size"
   sw --fsize-mb 1; m=$(tr -d ' ' < "$F/fora/size" | sort -n | tail -1)
   echo "$(cnt) teto=$([ "${m:-0}" -gt 0 ] && [ "${m:-0}" -le 1048576 ] && echo sim || echo "nao:${m:-vazio}")"
 }
-peq "--fsize-mb 1: o arquivo que o mutante escreve para no teto e o veredito é o mesmo" "$EXP_SW0 teto=sim" fp_fsize
+peq "--fsize-mb 1: o arquivo que o mutante escreve para no teto e o veredito é o mesmo" "$EXP_SW0 teto=sim" fp_fsize_head
+# teto de ESCRITA por arquivo (ga-e6ug8gq). 27/10 05:09-05:24: um mutante virou um laço de awk que gravou 4,2 e 5,6 GB em $TMPDIR, duas vezes, o disco do mini zerou e o Dolt ficou com ENOSPC. O fixture é esse mutante: com
+# o `-gt` virado, o caminho do 9 cai num laço de awk que não para (travado em 8 milhões de linhas, ~260 MB, só para que um motor SEM teto não encha o disco deste selftest); o teto de 4 MB tem de cortá-lo muito antes.
+# O laço deixa FORA do slot (a jaula falsa deixa) o que viu: o rc do awk (153 = 128 + SIGXFSZ, morto pelo teto) e o tamanho do arquivo. Morto pelo teto = mutante MORTO, nunca falha de infra.
+mkloopy() {
+  cat > "$TREE/scripts/loopy.sh" << 'EOF'
+#!/bin/bash
+# loopy.sh: fixture
+n=${1:-0}; ev=${2:-/dev/null}
+if [ "$n" -gt 5 ]; then echo big; exit 0; fi
+awk -v f="$TMPDIR/big" 'BEGIN { while (1) { print "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" > f; if (++i > 8000000) exit } }'
+echo "awk_rc=$? size=$(wc -c < "$TMPDIR/big" | tr -d ' ')" > "$ev"
+echo small
+exit 0
+EOF
+  mkst loopy 'out=$(bash "$H/loopy.sh" 9 "'"$F"'/ev"); [ "$out" = big ] || exit 1'
+}
+fp_fsize() {  # fp_fsize [MB]: a varredura do fixture com teto de MB (4)
+  newfx; mkloopy; local t0=$SECONDS ev ar sz cap=${1:-4}
+  sw --fsize-mb "$cap"; ev=$(cat "$F/ev" 2> /dev/null); ar=${ev#awk_rc=}; ar=${ar%% *}; sz=${ev##*size=}
+  echo "$(cnt) falhas=$(jf 'd["falhas"]') awk_rc=$ar teto=$([ -n "$sz" ] && [ "$sz" -le $((cap * 1048576)) ] 2> /dev/null && echo respeitado || echo "ESTOUROU($sz)") rapido=$([ $((SECONDS - t0)) -lt 5 ] && echo sim || echo NAO) left=$(ls "$F/work" | wc -l | tr -d ' ')"
+}
+EXP_FSIZE="rc=0 completo run=6 k=2 c=4 f=0 inv=0 open=4 falhas=0 awk_rc=153 teto=respeitado rapido=sim left=0"
+peq "mutante em laço de escrita infinito: o teto por arquivo (4 MB) corta o awk em menos de 5 s (rc 153), o arquivo não passa do teto, o mutante é MORTO e não vira falha de infra" "$EXP_FSIZE" fp_fsize
+fp_fsize_uso() { newfx; mkfoo; local o="" v; for v in 0 -3 abc ""; do sw --fsize-mb "$v"; o="$o $RC"; done; sw --fsize-mb 1; echo "$o | $(cnt)"; }
+peq "--fsize-mb que não é um inteiro >= 1 (0, negativo, texto, vazio) é uso (rc 2): sem teto não há varredura; 1 MB roda como qualquer outro" " 2 2 2 2 | $EXP_SW0" fp_fsize_uso
+# O caso "teto que o lançador não consegue fixar" só existe com o limite DURO ilimitado: com um duro finito o CAPPER usa min(pedido, duro) e FIXA (é o que o caso fp_fsize_duro prova), então o teto enorme
+# não falha, a baseline roda e a impressão muda. Rodar sob `heavy-guard.sh` (teto de 512 MB por arquivo para quem tem "selftest" no nome) deixa o duro finito: o caso ficaria vermelho sem culpa do motor, e o mutante
+# teto-falha-e-roda passaria por "morto" só porque a impressão já difere. Por isso lê-se o duro aqui e, se não for ilimitado, o caso e o seu mutante são PULADOS COM AVISO (AMBIENTE, exit 97), nunca verde nem vermelho por acidente.
+# vazio/falhou/ilegível (o ulimit não imprime, ou imprime algo que não é "unlimited") → não se sabe se o caso é alcançável: pula, que é o lado inerte; ilimitado → roda; número → pula
+SKIP_FS=0; [ "$(ulimit -H -f 2> /dev/null)" = unlimited ] || SKIP_FS=1
+# teto que o lançador não consegue fixar (aqui: maior que o rlimit aceita) = nada roda, nunca roda SEM teto: a baseline fica vermelha e o alvo é pulado
+fp_fsize_enorme() { newfx; mkfoo; sw --fsize-mb 99999999999999999999; echo "rc=$RC res=$(jf 'd["result"]') run=$(jf 'd["mutants_run"]') skipped=$(jf '",".join("%s=%d" % kv for kv in sorted(d["skipped"].items()))')"; }
+EXP_FSIZE_ENORME="rc=0 res=sem-cobertura run=0 skipped=base-vermelha=1"
+[ "$SKIP_FS" = 1 ] || peq "teto que o lançador não consegue fixar: rc 70 do lançador, baseline vermelha, nenhum mutante roda (nunca roda sem teto)" "$EXP_FSIZE_ENORME" fp_fsize_enorme
+# o motor roda sob um limite DURO menor que o pedido (um sistema que já limita): vale o menor, o teto não vira recusa e a varredura roda igual
+fp_fsize_duro() { ( ulimit -f 2048 || exit 1; fp_fsize 4 ); }   # sem -H: soft e hard juntos (um hard abaixo do soft atual dá EINVAL)
+peq "limite duro do sistema (2 MB) menor que o --fsize-mb pedido (4): vale o menor, a varredura roda igual e o laço morre" "$EXP_FSIZE" fp_fsize_duro
+# teto de CRESCIMENTO do slot (ga-2d14tow). O teto por arquivo não pega o laço que grava MUITOS arquivos pequenos: 50 mil de 100 KB são 5 GB e nenhum passa de 512 MB. O fixture é o mesmo mutante do caso acima (o `-gt` virado manda o caminho do 9 para o laço),
+# agora um awk que grava 3000 arquivos de 8 KB (~24 MB, parado aí só para um motor SEM o teto do slot não encher o disco deste selftest) com uma pausa a cada 10; o teto do slot de 2 MB tem de cortá-lo bem antes. O laço registra FORA do slot (a jaula falsa deixa)
+# quantos arquivos já gravou (a cada 50, em ev.n) e, se chegar ao fim, ev. Morto pelo teto do slot = mutante MORTO, nunca falha de infra.
+mkspray() {
+  cat > "$TREE/scripts/spray.sh" << 'EOF'
+#!/bin/bash
+# spray.sh: fixture
+n=${1:-0}; ev=${2:-/dev/null}
+if [ "$n" -gt 5 ]; then echo big; exit 0; fi
+awk -v d="$TMPDIR" -v ev="$ev" 'BEGIN { for (i = 1; i <= 3000; i++) { f = d "/f" i; printf "%08192d", 0 > f; close(f); if (i % 50 == 0) { print i > (ev ".n"); close(ev ".n") } if (i % 10 == 0) system("sleep 0.02") } print "wrote" > ev; close(ev) }'
+echo small
+exit 0
+EOF
+  mkst spray 'out=$(bash "$H/spray.sh" 9 "'"$F"'/ev"); [ "$out" = big ] || exit 1'
+}
+fp_slot() {  # fp_slot [MB]: a varredura do fixture com teto de slot de MB (2), medindo a cada 0,2 s
+  newfx; mkspray; local t0=$SECONDS cap=${1:-2} n
+  HQM_SLOT_POLL_S=0.2 sw --slot-mb "$cap"; n=$(cat "$F/ev.n" 2> /dev/null || echo 0)
+  echo "$(cnt) falhas=$(jf 'd["falhas"]') terminou=$([ -e "$F/ev" ] && echo SIM || echo nao) slot=$([ "$n" -gt 0 ] && [ "$n" -lt 1500 ] && echo cortado || echo "NAO($n)") rapido=$([ $((SECONDS - t0)) -lt 8 ] && echo sim || echo NAO) left=$(ls "$F/work" | wc -l | tr -d ' ')"
+}
+EXP_SLOT="rc=0 completo run=6 k=2 c=4 f=0 inv=0 open=4 falhas=0 terminou=nao slot=cortado rapido=sim left=0"
+peq "mutante que grava MUITOS arquivos pequenos: o teto do slot (2 MB) corta o laço antes do fim e em segundos, o mutante é MORTO e não vira falha de infra, o slot sai limpo" "$EXP_SLOT" fp_slot
+fp_slot_uso() { newfx; mkfoo; local o="" v; for v in 0 -3 abc ""; do sw --slot-mb "$v"; o="$o $RC"; done; sw --slot-mb 1; echo "$o | $(cnt)"; }
+peq "--slot-mb que não é um inteiro >= 1 (0, negativo, texto, vazio) é uso (rc 2); 1 MB roda como qualquer outro" " 2 2 2 2 | $EXP_SW0" fp_slot_uso
+fp_slot_semdu() {  # du que FALHA (rc 1 e saída que não é número): sem medida não há veredito — o laço roda até o fim, nada é cortado, nada vira falha de infra
+  newfx; mkspray; mkdir "$F/bin"; printf '#!/bin/sh\necho abc\nexit 1\n' > "$F/bin/du"; chmod +x "$F/bin/du"; local n
+  PATH="$F/bin:$PATH" HQM_SLOT_POLL_S=0.2 sw --slot-mb 2; n=$(cat "$F/ev.n" 2> /dev/null || echo 0)
+  echo "$(cnt) falhas=$(jf 'd["falhas"]') terminou=$([ -e "$F/ev" ] && echo SIM || echo nao) n=$n left=$(ls "$F/work" | wc -l | tr -d ' ')"
+}
+EXP_SLOT_SEMDU="rc=0 completo run=6 k=2 c=4 f=0 inv=0 open=4 falhas=0 terminou=SIM n=3000 left=0"
+peq "du que falha (rc 1, saída ilegível) com o teto de slot ligado: sem medida não há veredito, o laço grava até o fim, nenhum mutante é cortado e nada vira falha de infra" "$EXP_SLOT_SEMDU" fp_slot_semdu
 peq "sweep: mortos, sobreviventes confirmados, original intacto, HOME/TMPDIR no slot, slots limpos; os ids do gen --tree são os que ele grava" "$EXP_SWEEP" fp_sweep
 fp_semvalid() {  # bash -n que sai com rc estranho: nenhum veredito (nem "i"), nao_sei, e a varredura seguinte tenta de novo
   newfx; mkfoo; mkdir "$F/bin"; printf '#!/bin/sh\n[ "$1" = -n ] && exit 5\nexec /bin/bash "$@"\n' > "$F/bin/bash"; chmod +x "$F/bin/bash"
@@ -411,14 +481,28 @@ par kill_it heredoc-e-codigo     fp_gen     "$EXP_GEN" '                    here
 par kill_it here-string-e-heredoc fp_gen    "$EXP_GEN" ' and line[i - 1:i] != "<"' ''
 par kill_it aritmetica-e-heredoc fp_gen     "$EXP_GEN" ' and line[:i].count("((") <= line[:i].count("))")' ''
 par kill_it jail-relativo        fp_jailrel "$EXP_SW0" '    a.jail = str(Path(a.jail).resolve())' '    pass'
-par kill_it teto-nao-aplicado    fp_fsize   "$EXP_SW0 teto=sim" 'ulimit -f "$0" && exec bash "$1"' 'exec bash "$1"'
-par kill_it teto-fixo            fp_fsize   "$EXP_SW0 teto=sim" 'str(ctx.a.fsize_mb * 1024)' '"524288"'
+par kill_it head-teto-ausente    fp_fsize_head "$EXP_SW0 teto=sim" 'sys.executable, "-I", "-c", CAPPER, str(ctx.a.fsize_mb << 20), "bash", st]' '"bash", st]'
+par kill_it head-teto-fixo       fp_fsize_head "$EXP_SW0 teto=sim" 'str(ctx.a.fsize_mb << 20)' '"536870912"'
 par kill_it symlink-gravado      fp_symlink "$EXP_SYM" '        if subj.resolve() != subj:' '        if False:'
 par kill_it falha-derruba        fp_falha   "$EXP_FALHA" '    except (OSError, RuntimeError):' '    except ZeroDivisionError:'
 par kill_it falha-calada         fp_falha   "$EXP_FALHA" '            ctx.falhas += 1' '            pass'
 par kill_it falha-e-completo     fp_falha   "$EXP_FALHA" ' and not ctx.falhas' ''
 par kill_it base-nula-cai        fp_falha   "$EXP_FALHA" '            if r is None:' '            if False:'
 par kill_it gen-sem-tree         fp_sweep   "$EXP_SWEEP" 'Path(a.file).resolve().relative_to(Path(a.tree).resolve()).as_posix() if a.tree else Path(a.file).name' 'Path(a.file).name'
+par kill_it teto-ausente         fp_fsize   "$EXP_FSIZE" 'sys.executable, "-I", "-c", CAPPER, str(ctx.a.fsize_mb << 20), "bash", st]' '"bash", st]'
+par kill_it teto-em-bytes        fp_fsize   "$EXP_FSIZE" 'str(ctx.a.fsize_mb << 20)' 'str(ctx.a.fsize_mb)'
+par kill_it teto-nao-fixa        fp_fsize   "$EXP_FSIZE" '    resource.setrlimit(resource.RLIMIT_FSIZE, (n, n))\n' '    pass\n'
+par kill_it sigxfsz-ignorado     fp_fsize   "$EXP_FSIZE" '    signal.signal(signal.SIGXFSZ, signal.SIG_DFL)\n' '    pass\n'
+par kill_it teto-so-no-soft      fp_fsize   "$EXP_FSIZE" 'resource.setrlimit(resource.RLIMIT_FSIZE, (n, n))' 'resource.setrlimit(resource.RLIMIT_FSIZE, (n, resource.RLIM_INFINITY))'
+[ "$SKIP_FS" = 1 ] || par kill_it teto-falha-e-roda fp_fsize_enorme "$EXP_FSIZE_ENORME" '    os._exit(70)\n' '    pass\n'
+par kill_it teto-sem-minimo      fp_fsize_duro "$EXP_FSIZE" '    n = n if hard == resource.RLIM_INFINITY else min(n, hard)\n' '    n = n\n'
+par kill_it teto-uso-aceita-zero fp_fsize_uso   " 2 2 2 2 | $EXP_SW0" 'if a.cmd == "sweep" and a.fsize_mb < 1:' 'if a.cmd == "sweep" and a.fsize_mb < 0:'
+par kill_it slot-ausente         fp_slot "$EXP_SLOT" '            rc = wait_capped(ctx, p, slot, base_kb, tmo + 30)' '            rc = p.wait(timeout=tmo + 30)'
+par kill_it slot-rc-zero         fp_slot "$EXP_SLOT" '            return 153' '            return 0'
+par kill_it slot-unidade         fp_slot "$EXP_SLOT" 'kb - base_kb >= ctx.a.slot_mb * 1024:' 'kb - base_kb >= ctx.a.slot_mb * 1048576:'
+par kill_it slot-sem-medida      fp_slot "$EXP_SLOT" 'if kb is not None and kb - base_kb >= ctx.a.slot_mb * 1024:' 'if False:'
+par kill_it slot-uso-zero        fp_slot_uso " 2 2 2 2 | $EXP_SW0" 'if a.slot_mb < 1:' 'if a.slot_mb < 0:'
+par kill_it slot-du-ilegivel     fp_slot_semdu "$EXP_SLOT_SEMDU" 'if kb is not None and kb - base_kb >= ctx.a.slot_mb * 1024:' 'if (1 << 40 if kb is None else kb) - base_kb >= ctx.a.slot_mb * 1024:'
 reap
 # controle do controle: o `mut` recusa uma âncora ambígua e uma que não casa
 FAIL0=$FAIL   # o mut recusa e conta uma falha própria: aqui a recusa é o esperado, então só a aceitação reprova
@@ -442,7 +526,8 @@ else
   eq "mutante jaula-nao-usada com a jaula real: a escrita passa (o caso reprova se a contenção cair)" "$EXP_SW0 vazou=SIM" "$(ENG="$W/eng-jaula-nao-usada.py" vz "$HERE/hq-sandbox-run.py")"
 fi
 
-echo "hq-mutate selftest: $PASS passed, $FAIL failed$([ "$SKIP" = 1 ] && echo ", caso da jaula real NÃO rodou (AMBIENTE)")"
+[ "$SKIP_FS" = 0 ] || echo "AMBIENTE: limite duro de escrita finito aqui ($(ulimit -H -f 2> /dev/null)): o caso do teto que o lançador não fixa e o seu mutante não rodaram (rode sem teto: heavy-guard.sh --max-file-mb 0, ou direto no nó)"
+echo "hq-mutate selftest: $PASS passed, $FAIL failed$([ "$SKIP" = 1 ] && echo ", caso da jaula real NÃO rodou (AMBIENTE)")$([ "$SKIP_FS" = 1 ] && echo ", caso do teto não fixável NÃO rodou (AMBIENTE)")"
 [ "$FAIL" -eq 0 ] || exit 1
-[ "$SKIP" -eq 0 ] || exit 97
+[ "$SKIP" -eq 0 ] && [ "$SKIP_FS" -eq 0 ] || exit 97
 exit 0

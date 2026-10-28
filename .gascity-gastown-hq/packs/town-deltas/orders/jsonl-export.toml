@@ -55,6 +55,10 @@
 # writes `skipped-low-disk (cadência estendida)` to .gc/logs/jsonl-export.log — so a `gc order history jsonl-export` full of runs does not mean a full of exports. 3 h + this interval + this timeout stays
 # under the 6 h "fonte parada" alarm of jsonl-hourly-offsite.sh (jsonl-export.selftest.sh compares them).
 # jsonl-export.selftest.sh (ga-48e0du) fails if `timeout` is missing, under 600 s, or not under `interval`.
+#
+# ga-iqsy9c7: this timeout is a SIGKILL — the script's trap never runs — so a run that does not fit in it leaves no end of its own. The script writes `start pid=N` and `end rc=N` to .gc/logs/jsonl-export.log
+# (a start with no end is a run that died); the NEXT run logs `DIED ... N in a row`, deletes the scratch of the dead pid (names carry it: $table.jsonl.tmp.p<pid>.*) before it asks Dolt anything, and tells the deacon
+# at the 3rd death in a row. The 4 h age sweep stays only as the net for a scratch name that carries no pid.
 [order]
 description = "Export Dolt databases to JSONL git archive (ga-7sxdmb — replaces mol-dog-jsonl)"
 exec = "$PACK_DIR/assets/scripts/jsonl-export.sh"

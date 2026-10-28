@@ -295,6 +295,8 @@ dolt_sql() {
       [ "$STUB_SOURCE_COUNT" = "ERR" ] && return 1
       printf 'row_count\n%s\n' "$STUB_SOURCE_COUNT" ;;
     "SELECT * FROM \`wa\`.issues"*)
+      # ga-iqsy9c7: STUB_CHMOD_MARKER=<path> makes that file unreadable once the export is under way (the run's own inflight marker: its read at the end of the run fails).
+      [ -n "${STUB_CHMOD_MARKER:-}" ] && chmod 000 "$STUB_CHMOD_MARKER"
       # ga-aai87v: STUB_KILL_SELF=1 is the engine's SIGKILL at the order's timeout — the exporter dies mid-export, no trap runs,
       # and its scratch file stays wherever the exporter put it.
       [ "${STUB_KILL_SELF:-0}" = "1" ] && kill -9 $$
@@ -759,6 +761,206 @@ GC_JSONL_EXPORT_TMP_DIR="$E2E/scratch-is-a-file/sub" run_export 201 201
 [ "$(head_rows)" = "200" ] && [ "$(commits)" = "$BASE_COMMITS" ] && [ -z "$(stray_in "$ARCH")" ] \
   && ok "scratch dir not creatable: archive untouched (HEAD still 200 rows, no new commit, nothing written inside)" \
   || bad "scratch dir not creatable: head=$(head_rows) commits $BASE_COMMITS -> $(commits) stray=$(stray_in "$ARCH" | tr '\n' ' ')"
+
+# ── ga-iqsy9c7: a run killed at the order's timeout leaves a line in the log, and its scratch is gone before the NEXT run starts ──
+# 27/10: the 840 s timeout SIGKILLed three exports in a row while hq.comments was being read; no trap runs on a SIGKILL, nothing was in the log, and each run left ~830 MB of scratch that only the 4 h age sweep took.
+# The kill is the same simulated one as above (STUB_KILL_SELF = a real SIGKILL of the exporter). Dead and live pids are real ones: a pid that has exited, and a background `sleep` that is still running.
+echo "=== ga-iqsy9c7: a killed run is named in the log and its scratch is swept by the next run ==="
+IQ_LOG="$E2E/city/.gc/logs/jsonl-export.log"
+iq_reset() { mkdir -p "$(dirname "$IQ_LOG")"; : > "$IQ_LOG"; }
+# vazio → the count is 0 (grep -c prints 0); falhou (log unreadable) → prints nothing, which no "= N" assertion accepts
+iq_count() { grep -c -e "$1" "$IQ_LOG" 2>/dev/null || true; }
+# line number of the LAST line matching $1; vazio/falhou → "none"
+iq_last_line() { local n; n=$(grep -n -e "$1" "$IQ_LOG" 2>/dev/null | tail -n 1 | cut -d: -f1); echo "${n:-none}"; }
+# vazio → no streak in the state ("none"); falhou/ilegível (no state file, or jq cannot read it) → "?"
+iq_streak() { local f="$E2E_STATE/jsonl-export-state.json"; [ -e "$f" ] || { echo "?"; return 0; }; jq -r '.consecutive_deaths // "none"' "$f" 2>/dev/null || echo "?"; }
+iq_marker() { [ -e "$E2E_STATE/jsonl-export-inflight" ] && echo present || echo none; }
+# vazio → no nudge in THIS run's gc calls (0); falhou (no gc log) → prints nothing, which no "= N" assertion accepts
+iq_nudges() { grep -c 'session nudge deacon/' "$E2E/gc.log" 2>/dev/null || true; }
+# same, but only the nudge about killed runs: a run that finishes also sends its own DOG_DONE to the deacon, which is no death
+iq_death_nudges() { grep -c 'JSONL_EXPORT: ' "$E2E/gc.log" 2>/dev/null || true; }
+# a pid that has exited and been reaped (a foreground child), never a made-up number
+iq_dead_pid() { bash -c 'echo $$'; }
+
+# Case 1 — the real sequence: SIGKILL mid-export → start with no end in the log; the next run names the death, deletes the dead run's scratch BEFORE it starts, and exports.
+scratch_archive iq-dead; iq_reset
+run_export 200 200
+BASE_COMMITS=$(commits)
+export STUB_KILL_SELF=1
+run_export 201 201
+unset STUB_KILL_SELF
+KILLED_RC=$RC
+KILLED_FILE="$(stray_in "$E2E_TMPD" | head -n 1)"
+KILLED_PID="$(printf '%s\n' "$KILLED_FILE" | sed -n 's/.*\.jsonl\.tmp\.p\([0-9][0-9]*\)\..*/\1/p')"
+{ [ "$KILLED_RC" != "0" ] && [ -n "$KILLED_PID" ] && ! kill -0 "$KILLED_PID" 2>/dev/null; } \
+  && ok "dead run: SIGKILLed mid-export (rc=$KILLED_RC), left a scratch file named with its own pid ($KILLED_PID), which no longer answers" \
+  || bad "test setup invalid: rc=$KILLED_RC scratch='$KILLED_FILE' pid='$KILLED_PID' (want a death, a pid-named scratch file and a pid that no longer answers): $OUT"
+{ [ "$(tail -n 1 "$IQ_LOG" | sed -n 's/.* start pid=\([0-9]*\)$/\1/p')" = "$KILLED_PID" ] && [ "$(iq_count ' start pid=')" = "2" ] && [ "$(iq_count ' end ')" = "1" ]; } \
+  && ok "dead run: the log shows its start with no end (2 starts, 1 end, the last line is the start of pid $KILLED_PID)" \
+  || bad "dead run: the log should end with 'start pid=$KILLED_PID' and hold 2 starts / 1 end, holds: $(tr '\n' '|' < "$IQ_LOG")"
+[ "$(iq_marker)" = "present" ] \
+  && ok "dead run: its inflight marker stayed (no trap runs on a SIGKILL) — that is how the next run knows" \
+  || bad "dead run: no inflight marker after the kill"
+[ -e "$KILLED_FILE" ] || bad "test setup invalid: the killed run's scratch file '$KILLED_FILE' is not there before the next run"
+run_export 201 201
+[ ! -e "$KILLED_FILE" ] && [ -z "$(ls -A "$E2E_TMPD" 2>/dev/null)" ] \
+  && ok "dead run: the next run deleted its scratch (seconds old, not 4 h) — the scratch dir is empty" \
+  || bad "dead run: the next run left in the scratch dir: $(ls -A "$E2E_TMPD" | tr '\n' ' ')"
+case "$OUT" in
+  *"swept 1 scratch file(s)"*) ok "dead run: the next run says on stdout what it swept" ;;
+  *) bad "dead run: no 'swept 1 scratch file(s)' in the next run's output: $OUT" ;;
+esac
+{ [ "$(iq_count "DIED .*(pid $KILLED_PID) never finished.*; 1 in a row")" = "1" ] && [ "$(iq_count ' swept 1 scratch')" = "1" ]; } \
+  && ok "dead run: the log has ONE 'DIED ... (pid $KILLED_PID) ... 1 in a row' line and the sweep line" \
+  || bad "dead run: the log lacks the DIED / swept lines: $(tr '\n' '|' < "$IQ_LOG")"
+# the sweep is decided before the run starts: its line sits above the new run's start line
+{ [ "$(iq_last_line ' swept 1 scratch')" != "none" ] && [ "$(iq_last_line ' swept 1 scratch')" -lt "$(iq_last_line ' start pid=')" ]; } \
+  && ok "dead run: the sweep is logged BEFORE the new run's start (it does not wait for the export)" \
+  || bad "dead run: swept at line $(iq_last_line ' swept 1 scratch'), the new start at line $(iq_last_line ' start pid='): $(tr '\n' '|' < "$IQ_LOG")"
+{ [ "$(head_rows)" = "201" ] && [ "$(commits)" = "$((BASE_COMMITS + 1))" ]; } \
+  && ok "dead run: the next run still exports (201 rows, one new commit)" \
+  || bad "dead run: head=$(head_rows) commits $BASE_COMMITS -> $(commits) (rc=$RC): $OUT"
+{ [ "$(iq_marker)" = "none" ] && [ "$(iq_streak)" = "none" ] && [ "$(tail -n 1 "$IQ_LOG" | grep -c ' end rc=0 after ')" = "1" ]; } \
+  && ok "dead run: a run that finishes removes its marker, clears the streak and logs 'end rc=0'" \
+  || bad "dead run: marker=$(iq_marker) streak=$(iq_streak) last log line='$(tail -n 1 "$IQ_LOG")'"
+
+# Case 2 — the streak: each run killed after a killed run adds one; at the 3rd the deacon is told ONCE; a run that finishes clears it.
+scratch_archive iq-streak; iq_reset
+run_export 200 200
+export STUB_KILL_SELF=1
+run_export 201 201   # killed, nothing before it to name
+{ [ "$(iq_streak)" = "none" ] && [ "$(iq_count ' DIED ')" = "0" ]; } \
+  && ok "streak: the first kill is not yet known to anyone (no DIED, no count)" \
+  || bad "streak: after the first kill streak=$(iq_streak) DIED=$(iq_count ' DIED '): $(tr '\n' '|' < "$IQ_LOG")"
+run_export 201 201   # killed; names the first death
+{ [ "$(iq_streak)" = "1" ] && [ "$(iq_count '; 1 in a row')" = "1" ] && [ "$(iq_nudges)" = "0" ]; } \
+  && ok "streak: the 2nd run finds the 1st dead — 1 in a row, nobody nudged" \
+  || bad "streak: after 2 kills streak=$(iq_streak) '1 in a row'=$(iq_count '; 1 in a row') nudges=$(iq_nudges)"
+run_export 201 201
+{ [ "$(iq_streak)" = "2" ] && [ "$(iq_nudges)" = "0" ]; } \
+  && ok "streak: 2 in a row, nobody nudged" \
+  || bad "streak: after 3 kills streak=$(iq_streak) nudges=$(iq_nudges), want 2 and 0"
+run_export 201 201
+{ [ "$(iq_streak)" = "3" ] && [ "$(iq_nudges)" = "1" ]; } \
+  && ok "streak: 3 in a row — the deacon is nudged once" \
+  || bad "streak: after 4 kills streak=$(iq_streak) nudges=$(iq_nudges) (this run's gc calls), want 3 and 1: $(tr '\n' '|' < "$E2E/gc.log")"
+run_export 201 201
+{ [ "$(iq_streak)" = "4" ] && [ "$(iq_nudges)" = "0" ]; } \
+  && ok "streak: the 4th in a row is counted but the deacon is not nudged again" \
+  || bad "streak: after 5 kills streak=$(iq_streak) nudges=$(iq_nudges), want 4 and 0"
+unset STUB_KILL_SELF
+run_export 201 201
+{ [ "$RC" = "0" ] && [ "$(iq_streak)" = "none" ] && [ "$(iq_count '; 5 in a row')" = "1" ] && [ "$(head_rows)" = "201" ]; } \
+  && ok "streak: the run that finishes names the 5th death, exports, and clears the streak" \
+  || bad "streak: rc=$RC streak=$(iq_streak) head=$(head_rows): $(tail -n 5 "$IQ_LOG" | tr '\n' '|')"
+
+# Case 3 — a live run's scratch stays, a dead run's goes, the age net still takes what is old whatever its name says, and what is not scratch is not touched.
+scratch_archive iq-live; iq_reset
+mkdir -p "$E2E_TMPD"
+sleep 120 & LIVE_PID=$!
+DEAD_PID="$(iq_dead_pid)"
+printf 'live' > "$E2E_TMPD/comments.jsonl.tmp.p$LIVE_PID.LIVE01"; printf 'live' > "$E2E_TMPD/comments.jsonl.tmp.p$LIVE_PID.LIVE01.rows"
+printf 'dead' > "$E2E_TMPD/comments.jsonl.tmp.p$DEAD_PID.DEAD01"; printf 'dead' > "$E2E_TMPD/comments.jsonl.tmp.p$DEAD_PID.DEAD01.rows"
+printf 'old'  > "$E2E_TMPD/labels.jsonl.tmp.p$LIVE_PID.OLD001"; touch -t 200001010000 "$E2E_TMPD/labels.jsonl.tmp.p$LIVE_PID.OLD001"
+printf 'new, no pid in the name' > "$E2E_TMPD/config.jsonl.tmp.NOPID1"
+printf 'not scratch' > "$E2E_TMPD/notes.txt"
+run_export 200 200
+[ -e "$E2E_TMPD/comments.jsonl.tmp.p$LIVE_PID.LIVE01" ] && [ -e "$E2E_TMPD/comments.jsonl.tmp.p$LIVE_PID.LIVE01.rows" ] \
+  && ok "live pid: the scratch of a process that is still running stays (file and sidecar)" \
+  || bad "live pid: a live run's scratch was deleted: $(ls -A "$E2E_TMPD" | tr '\n' ' ')"
+[ ! -e "$E2E_TMPD/comments.jsonl.tmp.p$DEAD_PID.DEAD01" ] && [ ! -e "$E2E_TMPD/comments.jsonl.tmp.p$DEAD_PID.DEAD01.rows" ] \
+  && ok "dead pid: the scratch of a pid that has exited is deleted at once (file and sidecar), fresh as it is" \
+  || bad "dead pid: still there: $(ls -A "$E2E_TMPD" | tr '\n' ' ')"
+[ ! -e "$E2E_TMPD/labels.jsonl.tmp.p$LIVE_PID.OLD001" ] \
+  && ok "age net: a file older than the sweep age goes even when its pid answers (the pid may have been reused)" \
+  || bad "age net: the 2000-dated file with a live pid is still there"
+[ -e "$E2E_TMPD/config.jsonl.tmp.NOPID1" ] && [ -e "$E2E_TMPD/notes.txt" ] \
+  && ok "no pid in the name / not a scratch name: fresh files stay (the age rule alone decides, and it is not old)" \
+  || bad "a fresh no-pid file or a non-scratch file was deleted: $(ls -A "$E2E_TMPD" | tr '\n' ' ')"
+case "$OUT" in
+  *"swept 3 scratch file(s)"*) ok "sweep: the run says it swept 3 files (the dead pid's file and sidecar, and the old one)" ;;
+  *) bad "sweep: no 'swept 3 scratch file(s)' line in the output: $OUT" ;;
+esac
+kill "$LIVE_PID" 2>/dev/null || true; wait "$LIVE_PID" 2>/dev/null || true
+
+# Case 4 — a marker that proves nothing counts nothing: garbage (a write cut short by a full disk) → WARN; a pid that still answers → WARN (a second export beside it), not a death.
+scratch_archive iq-marker; iq_reset
+run_export 200 200
+printf 'garbage' > "$E2E_STATE/jsonl-export-inflight"
+iq_reset
+run_export 201 201
+{ [ "$(iq_count ' WARN the marker .* is unreadable')" = "1" ] && [ "$(iq_count ' DIED ')" = "0" ] && [ "$(iq_streak)" = "none" ]; } \
+  && ok "garbled marker: logs a WARN and counts no death" \
+  || bad "garbled marker: WARN=$(iq_count ' WARN the marker') DIED=$(iq_count ' DIED ') streak=$(iq_streak): $(tr '\n' '|' < "$IQ_LOG")"
+[ "$(iq_marker)" = "none" ] \
+  && ok "garbled marker: replaced by this run's own and removed when it ends" \
+  || bad "garbled marker: a marker is still there after the run"
+sleep 120 & LIVE_PID=$!
+printf '%s 1\n' "$LIVE_PID" > "$E2E_STATE/jsonl-export-inflight"
+iq_reset
+run_export 202 202
+{ [ "$(iq_count " WARN the run pid=$LIVE_PID .* still going")" = "1" ] && [ "$(iq_count ' DIED ')" = "0" ] && [ "$(iq_streak)" = "none" ] && [ "$(head_rows)" = "202" ]; } \
+  && ok "marker of a live pid: WARN 'still going', no death counted, the export goes on" \
+  || bad "marker of a live pid: WARN=$(iq_count ' WARN the run pid=') DIED=$(iq_count ' DIED ') streak=$(iq_streak) head=$(head_rows): $(tr '\n' '|' < "$IQ_LOG")"
+kill "$LIVE_PID" 2>/dev/null || true; wait "$LIVE_PID" 2>/dev/null || true
+printf '%s 1\n' "$(iq_dead_pid)" > "$E2E_STATE/jsonl-export-inflight"
+printf '{"consecutive_deaths":"many","sentinel_key":"kept"}\n' > "$E2E_STATE/jsonl-export-state.json"
+iq_reset
+run_export 203 203
+{ [ "$(iq_count ' DIED .*the count in the state is unreadable')" = "1" ] && [ "$(jq -r '.sentinel_key // "gone"' "$E2E_STATE/jsonl-export-state.json")" = "kept" ]; } \
+  && ok "dead pid, unreadable count in the state: the death is said, no count is invented, the rest of the state stays" \
+  || bad "dead pid, unreadable count: $(tr '\n' '|' < "$IQ_LOG") state=$(jq -c . "$E2E_STATE/jsonl-export-state.json" 2>&1)"
+# The READ of the marker fails (chmod 000), not only its content: not a death either. The state holds a streak of 2, so a death counted by mistake would make 3 — the deacon nudged and '3 in a row' in the log.
+# (Not as root: root reads a chmod 000 file, and the marker would be a plain dead pid.)
+if [ "$(id -u)" -ne 0 ]; then
+  printf '%s 1\n' "$(iq_dead_pid)" > "$E2E_STATE/jsonl-export-inflight"
+  chmod 000 "$E2E_STATE/jsonl-export-inflight"
+  printf '{"consecutive_deaths":2,"sentinel_key":"kept"}\n' > "$E2E_STATE/jsonl-export-state.json"
+  iq_reset
+  run_export 204 204
+  { [ "$RC" = "0" ] && [ "$(iq_count ' WARN the marker .* is unreadable')" = "1" ] && [ "$(iq_count ' DIED ')" = "0" ] && [ "$(iq_count ' in a row')" = "0" ] && [ "$(iq_death_nudges)" = "0" ] && [ "$(head_rows)" = "204" ]; } \
+    && ok "marker that cannot be read (chmod 000): WARN, no death counted, deacon not told of a killed run, the export goes on" \
+    || bad "marker that cannot be read: rc=$RC WARN=$(iq_count ' WARN the marker') DIED=$(iq_count ' DIED ') death-nudges=$(iq_death_nudges) head=$(head_rows): $(tr '\n' '|' < "$IQ_LOG") gc: $(tr '\n' '|' < "$E2E/gc.log")"
+  [ "$(iq_marker)" = "none" ] \
+    && ok "marker that cannot be read: replaced by this run's own and removed when it ends" \
+    || bad "marker that cannot be read: a marker is still there after the run"
+  # The run's own marker becomes unreadable while it runs: at the end it cannot prove the marker is its own, so it leaves it and says so in the log (the next run may name this run as dead).
+  rm -f "$E2E_STATE/jsonl-export-inflight"
+  iq_reset
+  export STUB_CHMOD_MARKER="$E2E_STATE/jsonl-export-inflight"
+  run_export 205 205
+  unset STUB_CHMOD_MARKER
+  { [ "$RC" = "0" ] && [ "$(head_rows)" = "205" ] && [ "$(iq_count ' end rc=0 after ')" = "1" ] && [ "$(iq_count ' WARN the marker .* could not be read at the end of this run')" = "1" ] && [ "$(iq_marker)" = "present" ]; } \
+    && ok "marker unreadable at the end of the run: the run still ends rc=0, leaves the marker alone and says so in the log" \
+    || bad "marker unreadable at the end: rc=$RC head=$(head_rows) marker=$(iq_marker): $(tr '\n' '|' < "$IQ_LOG")"
+  chmod 644 "$E2E_STATE/jsonl-export-inflight" 2>/dev/null; rm -f "$E2E_STATE/jsonl-export-inflight"
+else
+  echo "  SKIP: unreadable-marker cases (running as root: chmod 000 does not block)"
+fi
+
+# Case 5 — a run that finishes clears a streak and keeps the rest of the state.
+scratch_archive iq-reset; iq_reset
+run_export 200 200
+jq -c '.consecutive_deaths = 2 | .sentinel_key = "kept"' "$E2E_STATE/jsonl-export-state.json" > "$E2E_STATE/s.tmp" && mv "$E2E_STATE/s.tmp" "$E2E_STATE/jsonl-export-state.json"
+run_export 200 200
+{ [ "$(iq_streak)" = "none" ] && [ "$(jq -r '.sentinel_key // "gone"' "$E2E_STATE/jsonl-export-state.json")" = "kept" ]; } \
+  && ok "reset: a finished run clears consecutive_deaths and keeps the other keys of the state" \
+  || bad "reset: streak=$(iq_streak) state=$(jq -c . "$E2E_STATE/jsonl-export-state.json" 2>&1)"
+
+# Case 6 — nothing the run makes is left in the scratch dir, and the scrubbed copy of the issues (70 MB at hq) no longer sits in $TMPDIR: with a TMPDIR nobody can write to the run still exports.
+# (GNU mktemp on the node honors TMPDIR and fails in an unwritable one; BSD mktemp on the mini ignores TMPDIR when it is given no template. So the case tells the old code from the new on the node, and on the mini — or as root, where
+# the chmod blocks nothing — it only repeats the clean run.)
+scratch_archive iq-clean; iq_reset
+mkdir -p "$E2E/ro-tmpdir"; chmod 555 "$E2E/ro-tmpdir"
+TMPDIR="$E2E/ro-tmpdir" run_export 200 200 5
+chmod 755 "$E2E/ro-tmpdir"
+{ [ "$RC" = "0" ] && [ "$(head_rows)" = "200" ] && [ -z "$(ls -A "$E2E_TMPD" 2>/dev/null)" ] && [ -z "$(ls -A "$E2E/ro-tmpdir" 2>/dev/null)" ]; } \
+  && ok "clean run, 5 scrubbed rows, TMPDIR unwritable: exports (200 rows), both dirs end empty — the scrub's temp file is in the scratch dir, not in TMPDIR" \
+  || bad "clean run with an unwritable TMPDIR: rc=$RC head=$(head_rows) scratch=$(ls -A "$E2E_TMPD" 2>/dev/null | tr '\n' ' '): $OUT"
+{ [ "$(iq_count ' start pid=')" = "1" ] && [ "$(iq_count ' end rc=0 after ')" = "1" ] && [ "$(iq_marker)" = "none" ]; } \
+  && ok "clean run: one start and one 'end rc=0' in the log, no marker left" \
+  || bad "clean run: start=$(iq_count ' start pid=') end=$(iq_count ' end rc=0') marker=$(iq_marker): $(tr '\n' '|' < "$IQ_LOG")"
+unset GC_JSONL_EXPORT_TMP_DIR
 
 # ── ga-l6v576: comments, config, dependencies, labels and metadata are read whole and checked against the source, like issues ──
 # They were exported with `dolt_sql ... > file 2>/dev/null || true`: no row count, no exit code, no stderr. Dolt cuts a read that runs past ~40 s — a well-formed document, exit 0, "unexpected EOF" on
@@ -1675,7 +1877,10 @@ cad 10240 0 200; cad 10240 1 210; cad 10240 2 220
 { ! is_skip && [ "$(head_rows)" = "220" ] && [ "$(commits)" = "3" ]; } \
   && ok "control, 10 GB: three runs in three seconds all export (220 rows, 3 commits)" \
   || bad "control, 10 GB: skip=$(yn is_skip) head=$(head_rows) commits=$(commits) (rc=$RC): $OUT"
-[ ! -s "$JEX_TLOG" ] && ok "control, 10 GB: a healthy disk leaves the cadence log empty" || bad "control, 10 GB: the log has lines: $(tr '\n' '|' < "$JEX_TLOG")"
+# the run's own `start pid=N` / `end rc=N` lines (ga-iqsy9c7) are not cadence lines: they are there on every run, so what must stay empty is the log WITHOUT them.
+# vazio → no cadence line; falhou (the log cannot be read) → the text is "?", which is not empty
+cadence_lines() { grep -v -e ' start pid=[0-9]' -e ' end rc=[0-9]' -e ' end signal ' "$JEX_TLOG" 2>/dev/null || { [ $? -eq 1 ] || echo '?'; }; }
+[ -z "$(cadence_lines)" ] && ok "control, 10 GB: a healthy disk writes no cadence line to the log (only the run's start/end)" || bad "control, 10 GB: the log has cadence lines: $(cadence_lines | tr '\n' '|')"
 
 # a stamp nobody can trust never blocks the export: garbage, and a stamp from the future
 fresh_archive badstamp; reset_tlog
@@ -1711,14 +1916,26 @@ unset STUB_KILL_SELF
 { [ "$RC" != "0" ] && [ "$(stamp)" = "$(iso_of $T0)" ]; } \
   && ok "killed mid-export at 2 GB: the run died (rc=$RC) and had already stamped last_export_at" \
   || bad "killed mid-export: rc=$RC stamp=$(stamp), want a death and $(iso_of $T0): $OUT"
+# ga-iqsy9c7: the kill leaves its scratch, and the skipped tick that follows — the low disk is why it skips, and the disk is what the scratch eats — deletes it, instead of leaving it to the next export an hour or 3 h away
+KC_DIR="$(dirname "$ARCH")/.jsonl-export-tmp"
+KC_LEFT="$(stray_in "$KC_DIR")"
+{ [ -n "$KC_LEFT" ] && [ "${KC_LEFT#find failed}" = "$KC_LEFT" ]; } \
+  && ok "killed mid-export at 2 GB: the dead run left its scratch (the case under test exists)" \
+  || bad "test setup invalid: the killed run left '$KC_LEFT' in $KC_DIR"
 cad 2048 900 200
 { is_skip && [ "$(dolt_calls)" = "0" ]; } \
   && ok "…the next tick (15 min later) is a skip: a killed export is not retried every tick" \
   || bad "after a killed export: skip=$(yn is_skip) dolt_calls=$(dolt_calls): $OUT"
+{ [ -z "$(stray_in "$KC_DIR")" ] && [ "$(grep -c ' swept 1 scratch' "$JEX_TLOG" 2>/dev/null || true)" = "1" ] && tail -n 1 "$JEX_TLOG" | grep -q 'skipped-low-disk'; } \
+  && ok "…and that skipped tick already swept the dead run's scratch (logged, before the skip line) without asking Dolt anything" \
+  || bad "skipped tick after a kill: scratch='$(stray_in "$KC_DIR" | tr '\n' ' ')' swept lines=$(grep -c ' swept 1 scratch' "$JEX_TLOG" 2>/dev/null || true): $(tr '\n' '|' < "$JEX_TLOG")"
 cad 2048 10800 200
 { ! is_skip && [ "$(head_rows)" = "200" ]; } \
   && ok "…and 3 h after it the export runs and archives (200 rows)" \
   || bad "3 h after a killed export: skip=$(yn is_skip) head=$(head_rows) (rc=$RC): $OUT"
+[ "$(grep -c ' DIED .*; 1 in a row' "$JEX_TLOG" 2>/dev/null || true)" = "1" ] \
+  && ok "…and that run names the kill in the log ('DIED ... 1 in a row'), which the skipped tick between left to it" \
+  || bad "3 h after a kill: no 'DIED ... 1 in a row' in the log: $(tr '\n' '|' < "$JEX_TLOG")"
 
 # a skipped tick still delivers the pending spike alert (it is retried BEFORE the cadence is decided)
 fresh_archive alertskip; reset_tlog

@@ -58,6 +58,43 @@ note() {
   printf '%s pid=%s agent=%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "${GC_AGENT:-?}" "$*" >> "$log" 2>/dev/null || true
 }
 
+# A REMOTE-ONLY ROLE IS REFUSED HERE (ga-pshalqe). dog-remote, gate-reviewer-remote, wa-worker-remote(-mbp), ps-worker-remote and
+# kimi-worker-remote exist to run on the server, and the hybrid session provider sends a session there only when its NAME contains
+# remote_match ("-remote-"). 27/10 13:18Z: dog-remote-1 (session ga-wisp-8u7ite) was started by the mini's own tmux; its name was the
+# engine's legacy s-<bead> default, with no -remote- in it. A claude ran here with the mini's RAM and disk behind it and no bd/gc
+# allowlist. This wrapper is the one point every LOCAL claude-headless launch passes, and the server never runs it (gc-session-ssh
+# swaps it for plain `claude` there), so a remote-only role that arrives here is on the wrong machine whatever the cause. Refuse
+# out loud instead of starting quietly: a line in the log, the reason on stderr, exit 78. A hit is an identity that ends in -remote
+# (a template, before the engine appends its tail) or contains -remote- (an alias or agent): any one of GC_TEMPLATE / GC_AGENT /
+# GC_ALIAS is enough.
+# KNOBS: GC_REMOTE_LOCAL_GUARD=0 (this launch) / touch $GC_CITY_PATH/.gc/no-remote-local-guard (every new launch, no config reload).
+# An override leaves a REMOTE-ONLY OVERRIDE line in the log, like every decision here: best-effort, never a reason to stop a launch.
+rl_hit=""
+# vazio → none of the three names a remote-only role, so the launch goes on untouched (fail-open, like the A/B below: this wrapper is on
+#   every pool launch and must not stop a session it cannot name);
+# falhou/ilegível → an unset variable reads as empty (the same no-hit); a kill-switch file that cannot be tested reads as absent, so the
+#   guard stays ON — for a guard the inert state is "refuse".
+for rl_v in "${GC_TEMPLATE:-}" "${GC_AGENT:-}" "${GC_ALIAS:-}"; do
+  case "$rl_v" in
+    *-remote|*-remote-*) rl_hit=1; break ;;
+  esac
+done
+if [ -n "$rl_hit" ]; then
+  rl_id="template=${GC_TEMPLATE:-?} alias=${GC_ALIAS:-?} session=${GC_SESSION_NAME:-?} id=${GC_SESSION_ID:-?}"
+  if [ "${GC_REMOTE_LOCAL_GUARD:-}" = "0" ] || { [ -n "$city" ] && [ -e "$city/.gc/no-remote-local-guard" ]; }; then
+    note "REMOTE-ONLY OVERRIDE $rl_id - starting on the mini on purpose"
+  else
+    case "${GC_SESSION_NAME:-}" in
+      *-remote-*) rl_why="its name has -remote-, so the hybrid session provider should have sent it to the server (is [session] provider = hybrid on?)" ;;
+      *)          rl_why="its name has no -remote-, so the hybrid session provider kept it on the mini's tmux" ;;
+    esac
+    note "REMOTE-ONLY REFUSED $rl_id"
+    printf 'claude-ctxcap-ab: REFUSED - a remote-only role must not start on the mini (%s); %s.\n  To run it here on purpose: touch %s/.gc/no-remote-local-guard     To close it: gc session close %s     [ga-pshalqe]\n' \
+      "$rl_id" "$rl_why" "${city:-<city>}" "${GC_SESSION_ID:-${GC_ALIAS:-?}}" >&2
+    exit 78
+  fi
+fi
+
 argv=("$@")
 ab_conf=""
 [ -n "$city" ] && ab_conf="$city/.gc/context-ab.conf"

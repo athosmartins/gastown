@@ -1272,7 +1272,12 @@ cat > "$PE_BIN/git" <<'PEGIT'
 # Real git, except `git cherry` which PE_CHERRY can break: fail = rc 128 and no output;
 # garbage = rc 0 and output that is not cherry's format; partial = a '-' line, THEN rc 1.
 # And `git rev-list --merges` (the merge-commit check), which PE_REVLIST=fail breaks: rc 128, no output.
+# ga-k0mose6: `git rev-parse HEAD` (PE_REVPARSE=fail) and `git status` (PE_STATUS=fail) break the same way: rc 128, no output.
+rp=0
 for a in "$@"; do
+  [ "$a" = "rev-parse" ] && rp=1
+  if [ "$a" = "HEAD" ] && [ "$rp" = "1" ] && [ "${PE_REVPARSE:-}" = "fail" ]; then exit 128; fi
+  if [ "$a" = "status" ] && [ "${PE_STATUS:-}" = "fail" ]; then exit 128; fi
   if [ "$a" = "cherry" ]; then
     case "${PE_CHERRY:-}" in
       fail)    exit 128 ;;
@@ -2246,6 +2251,244 @@ xp_kept xp15 "(x15): mktemp fails → KEPT, kept_ignored_data_unknown logged" ke
 # (x16) a file name with a quote, a backslash and a space is escaped in the event, so the line stays one JSON object
 xp_mk xp16; m5_tree xp16 w merged; ( cd "$TMP/xp16/rig/crew/w" && rm -rf pesquisa && printf r > 'a"b\c d.dat' ) >/dev/null 2>&1; m5_age "$TMP/xp16/rig/crew/w" 14; xp_run xp16
 grep '"event":"kept_ignored_data"' "$TMP/xp16.jsonl" | grep -qF '"top":[{"path":"a\"b\\c d.dat","kb":' && ok "ga-xpoj67 (x16): quote, backslash and space in a file name are escaped in the event" || bad "ga-xpoj67 (x16): event: $(grep kept_ignored_data "$TMP/xp16.jsonl" 2>/dev/null | head -1)"
+
+# ══ ga-1bfcda7: the pool session's own .claude/ settings files are tool state, not data ══
+# Measured 27/10 (git 2.43): an ignored .claude/ FOLDER is ONE entry of `ls-files -o -i --directory` (".claude/"), so IGNORED_JUNK_RE — which named only
+# .claude/settings.local.json, and could not look inside a folder entry — kept 15 wa-worker trees (~170 MB each) for a 4 KB .claude/settings.json. With a
+# TRACKED file in .claude/ the settings files come one by one and were not junk either. Now .claude/settings*.json(.bak.*) is junk by path, and a folder
+# entry named .claude/ is opened: only junk inside → dropped; any other file → the tree is kept and the event names THAT file; unreadable → unknown.
+# Against the pre-fix reaper (c1)(c1b)(c2)(c3)(c4)(c5)(c6)(c7)(c8)(c9b)(c10)(c11)(c14)(c16a)(c16b)(c16c)(c16d) fail; (c9)(c15) pin what must NOT change.
+echo "── ga-1bfcda7: an ignored .claude/ holding only the tool's settings files does not keep a tree ──"
+cl_tree() {   # <town> merged|unmerged [file…] — crew/w with an ignored .claude/ FOLDER (info/exclude) holding the given files (paths below .claude/), no pesquisa/, aged 14 h
+  local t="$1" k="$2" f; shift 2
+  xp_mk "$t"; echo '.claude/' >> "$TMP/$t/rig/.git/info/exclude"; m5_tree "$t" w "$k"
+  ( cd "$TMP/$t/rig/crew/w" && rm -rf pesquisa && mkdir -p .claude && for f in "$@"; do mkdir -p ".claude/$(dirname "$f")" && echo '{}' > ".claude/$f"; done ) >/dev/null 2>&1
+  m5_age "$TMP/$t/rig/crew/w" 14
+}
+cl_b() {   # <town> [extra ignored file] — crew/w with a TRACKED .claude/keep.md; settings.json, settings.json.bak.<epoch> and settings.local.json ignored ONE BY ONE (no folder entry)
+  local t="$1" x="${2:-}"
+  xp_mk "$t"; printf '%s\n' .claude/settings.json '.claude/settings.json.bak.*' >> "$TMP/$t/rig/.git/info/exclude"; [ -z "$x" ] || echo ".claude/$x" >> "$TMP/$t/rig/.git/info/exclude"
+  m5_tree "$t" w unmerged
+  ( cd "$TMP/$t/rig/crew/w" && rm -rf pesquisa && mkdir -p .claude && echo k > .claude/keep.md && echo '{}' > .claude/settings.json && echo '{}' > .claude/settings.local.json \
+    && echo '{}' > .claude/settings.json.bak.1793102038 && { [ -z "$x" ] || echo n > ".claude/$x"; } && git add .claude/keep.md \
+    && GIT_AUTHOR_DATE=$M5_OLD GIT_COMMITTER_DATE=$M5_OLD git commit -qm claude ) >/dev/null 2>&1
+  m5_age "$TMP/$t/rig/crew/w" 14
+}
+cl_kept() {   # <town> <label> <event> — the tree is still there and the keep was logged exactly once under that event
+  if m5_has "$1" && [ "$(events "$1" "$3")" = "1" ]; then ok "ga-1bfcda7 $2"; else bad "ga-1bfcda7 $2 — present=$(m5_has "$1" && echo y || echo n) $3=$(events "$1" "$3")"; fi
+}
+cl_freed() {  # <town> <label> — the tree is gone and nothing was kept for its ignored files, known or unknown
+  if ! m5_has "$1" && [ "$(events "$1" kept_ignored_data)" = "0" ] && [ "$(events "$1" kept_ignored_data_unknown)" = "0" ]; then ok "ga-1bfcda7 $2"
+  else bad "ga-1bfcda7 $2 — present=$(m5_has "$1" && echo y || echo n) kept_ignored_data=$(events "$1" kept_ignored_data) unknown=$(events "$1" kept_ignored_data_unknown)"; fi
+}
+cl_top() {    # <town> <label> <path ERE> — the kept_ignored_data event names exactly ONE path and it is that one (the file inside .claude/, not the folder)
+  local re='"top":\[\{"path":"'"$3"'","kb":[1-9][0-9]*\}\]'
+  if grep '"event":"kept_ignored_data"' "$TMP/$1.jsonl" 2>/dev/null | grep -Eq "$re"; then ok "ga-1bfcda7 $2"; else bad "ga-1bfcda7 $2 — event: $(grep kept_ignored_data "$TMP/$1.jsonl" 2>/dev/null | head -1)"; fi
+}
+
+# (c1)(c1b)(c2) the bead's case: the ignored folder holds only the tool's own files → junk → the tree is reaped (normal mode, PRESSURE mode, with the .bak and the local file)
+cl_tree cl1 merged settings.json; xp_run cl1
+cl_freed cl1 "(c1): MERGED tree idle 14 h whose ignored .claude/ holds only settings.json → reaped (the 15 wa-worker trees of 27/10 were kept for 4 KB)"
+cl_tree cl1b merged settings.json; xp_run cl1b "$PRESS"
+cl_freed cl1b "(c1b): the same tree in PRESSURE mode → reaped"
+cl_tree cl2 merged settings.json settings.local.json settings.json.bak.1793102038; xp_run cl2
+cl_freed cl2 "(c2): settings.json + settings.local.json + settings.json.bak.<epoch> in the ignored .claude/ → all tool state → reaped"
+
+# (c3)(c4) any other file in the folder is data: the tree is KEPT and the event names the FILE (not the folder, not the settings file beside it)
+cl_tree cl3 merged settings.json notes.md; xp_run cl3
+cl_kept cl3 "(c3): settings.json + a notes.md in the ignored .claude/ → the notes are data → KEPT, kept_ignored_data" kept_ignored_data
+cl_top cl3 "(c3): the event names .claude/notes.md alone — not the folder, not settings.json" '\.claude/notes\.md'
+[ -f "$TMP/cl3/rig/crew/w/.claude/notes.md" ] && ok "ga-1bfcda7 (c3): the notes are still on disk" || bad "ga-1bfcda7 (c3): the notes are gone"
+cl_tree cl4 unmerged settings.json skills/x/SKILL.md; xp_run cl4
+cl_kept cl4 "(c4): UNMERGED tree, a file in a subfolder of the ignored .claude/ → KEPT, kept_ignored_data" kept_ignored_data
+cl_top cl4 "(c4): the event names .claude/skills/x/SKILL.md" '\.claude/skills/x/SKILL\.md'
+
+# (c5)(c6) the same files ignored ONE BY ONE beside a TRACKED .claude/ file (git lists each, the folder is no entry): junk by path; with another ignored file → kept
+cl_b cl5; xp_run cl5
+cl_freed cl5 "(c5): settings.json, settings.json.bak.<epoch> and settings.local.json ignored one by one beside a tracked .claude/keep.md → junk by path → reaped"
+cl_b cl6 notes.md; xp_run cl6
+cl_kept cl6 "(c6): the same plus an ignored .claude/notes.md → KEPT, kept_ignored_data" kept_ignored_data
+cl_top cl6 "(c6): the event names .claude/notes.md alone" '\.claude/notes\.md'
+
+# (c7)(c8) opening the folder fails → unknown is not "only settings" (KEPT, kept_ignored_data_unknown); it reads EMPTY → nothing inside to lose (the entry is dropped, reaped)
+cl_tree cl7 merged settings.json; mkdir -p "$TMP/cl7-bin"
+printf '#!/bin/sh\ncase " $* " in *" -print0 "*) exit 1 ;; esac\nexec %s "$@"\n' "$(command -v find)" > "$TMP/cl7-bin/find"; chmod +x "$TMP/cl7-bin/find"
+xp_run cl7 PATH="$TMP/cl7-bin:$PATH"
+cl_kept cl7 "(c7): find cannot open the ignored .claude/ (rc 1) → unknown is not 'only settings': KEPT, kept_ignored_data_unknown logged" kept_ignored_data_unknown
+grep '"event":"kept_ignored_data_unknown"' "$TMP/cl7.jsonl" 2>/dev/null | grep -q '"size_kb":null,"top":\[\]' && ok "ga-1bfcda7 (c7): the unknown event says size null, not 0" || bad "ga-1bfcda7 (c7): unknown event: $(grep unknown "$TMP/cl7.jsonl" 2>/dev/null | head -1)"
+cl_tree cl8 merged settings.json; mkdir -p "$TMP/cl8-bin"
+printf '#!/bin/sh\ncase " $* " in *" -print0 "*) exit 0 ;; esac\nexec %s "$@"\n' "$(command -v find)" > "$TMP/cl8-bin/find"; chmod +x "$TMP/cl8-bin/find"
+xp_run cl8 PATH="$TMP/cl8-bin:$PATH"
+cl_freed cl8 "(c8): the folder reads EMPTY (find prints nothing, rc 0) → nothing inside to lose: the entry is dropped and the tree is reaped"
+# (c10) the rewritten list cannot replace the old one (a full disk would do it; here mv exits 1 — nothing else in the reaper calls mv): that is "could not tell"
+# (KEPT, kept_ignored_data_unknown), not a quiet fall back to judging the old list, where the whole .claude/ folder is one entry again and the event names it
+cl_tree cl10 merged settings.json notes.md; mkdir -p "$TMP/cl10-bin"; printf '#!/bin/sh\nexit 1\n' > "$TMP/cl10-bin/mv"; chmod +x "$TMP/cl10-bin/mv"
+xp_run cl10 PATH="$TMP/cl10-bin:$PATH"
+cl_kept cl10 "(c10): replacing the list with the rewritten one fails (mv rc 1) → KEPT, kept_ignored_data_unknown" kept_ignored_data_unknown
+[ -f "$TMP/cl10/rig/crew/w/.claude/notes.md" ] && ok "ga-1bfcda7 (c10): the notes are still on disk" || bad "ga-1bfcda7 (c10): the notes are gone"
+
+# (c9) WORKTREE_REAPER_IGNORED_JUNK_RE stays THE junk list: naming the folder itself as junk (the Mayor's by-hand relief of 27/10) skips it without opening it;
+# a list that does not name the settings files makes them data again
+cl_tree cl9 merged notes.md; xp_run cl9 WORKTREE_REAPER_IGNORED_JUNK_RE='(^|/)\.claude/$'
+cl_freed cl9 "(c9): WORKTREE_REAPER_IGNORED_JUNK_RE naming .claude/ as junk → reaped without opening the folder, notes and all (the relief of 27/10 still works)"
+cl_tree cl9b merged settings.json; xp_run cl9b WORKTREE_REAPER_IGNORED_JUNK_RE='(^|/)nothing$'
+cl_kept cl9b "(c9b): a junk list that does not name the settings files → the file inside is data again → KEPT, kept_ignored_data" kept_ignored_data
+cl_top cl9b "(c9b): the event names .claude/settings.json" '\.claude/settings\.json'
+
+# (c11) tool state beside real data: only the data is reported
+xp_mk cl11; echo '.claude/' >> "$TMP/cl11/rig/.git/info/exclude"; m5_tree cl11 w merged
+( cd "$TMP/cl11/rig/crew/w" && mkdir -p .claude && echo '{}' > .claude/settings.json ) >/dev/null 2>&1; m5_age "$TMP/cl11/rig/crew/w" 14; xp_run cl11
+cl_kept cl11 "(c11): pesquisa/ (data) beside an ignored .claude/ with only settings.json → KEPT, kept_ignored_data" kept_ignored_data
+cl_top cl11 "(c11): the event names pesquisa/ alone — the settings file is not reported" 'pesquisa/'
+
+# (c14) a .claude/ below a folder that has TRACKED files is an entry of its own (sub/.claude/) → opened the same way
+xp_mk cl14; echo '.claude/' >> "$TMP/cl14/rig/.git/info/exclude"; m5_tree cl14 w unmerged
+( cd "$TMP/cl14/rig/crew/w" && rm -rf pesquisa && mkdir -p sub/.claude && echo k > sub/keep.md && echo '{}' > sub/.claude/settings.json && git add sub/keep.md \
+  && GIT_AUTHOR_DATE=$M5_OLD GIT_COMMITTER_DATE=$M5_OLD git commit -qm sub ) >/dev/null 2>&1; m5_age "$TMP/cl14/rig/crew/w" 14; xp_run cl14
+cl_freed cl14 "(c14): sub/.claude/ (ignored, beside a tracked sub/keep.md) holding only settings.json → reaped"
+
+# (c15) only a folder NAMED .claude is opened: an ignored x.claude/ is an ordinary folder → data
+xp_mk cl15; echo 'x.claude/' >> "$TMP/cl15/rig/.git/info/exclude"; m5_tree cl15 w merged
+( cd "$TMP/cl15/rig/crew/w" && rm -rf pesquisa && mkdir -p x.claude && echo '{}' > x.claude/settings.json ) >/dev/null 2>&1; m5_age "$TMP/cl15/rig/crew/w" 14; xp_run cl15
+cl_kept cl15 "(c15): an ignored x.claude/ (not a folder named .claude) is data → KEPT, kept_ignored_data" kept_ignored_data
+cl_top cl15 "(c15): the event names x.claude/ itself" 'x\.claude/'
+
+# (c16a)(c16b) tool state is exactly settings*.json and settings*.json.bak.* directly in .claude/: a ".old" copy, and a settings.json one level down, are data
+cl_tree cl16a merged settings.json settings.json.old; xp_run cl16a
+cl_kept cl16a "(c16a): settings.json.old beside settings.json → data → KEPT, kept_ignored_data" kept_ignored_data
+cl_top cl16a "(c16a): the event names .claude/settings.json.old alone" '\.claude/settings\.json\.old'
+cl_tree cl16b merged sub/settings.json; xp_run cl16b
+cl_kept cl16b "(c16b): .claude/sub/settings.json (not directly in .claude/) → data → KEPT, kept_ignored_data" kept_ignored_data
+cl_top cl16b "(c16b): the event names .claude/sub/settings.json" '\.claude/sub/settings\.json'
+# (c16c)(c16d) "settings*" is a FILE name: a folder called settings.d/ or settings.json.bak.d/ with files inside is not tool state
+cl_tree cl16c merged settings.d/extra.json; xp_run cl16c
+cl_kept cl16c "(c16c): .claude/settings.d/extra.json (a file inside a folder named settings*) → data → KEPT, kept_ignored_data" kept_ignored_data
+cl_top cl16c "(c16c): the event names .claude/settings.d/extra.json" '\.claude/settings\.d/extra\.json'
+cl_tree cl16d merged settings.json.bak.d/f.md; xp_run cl16d
+cl_kept cl16d "(c16d): .claude/settings.json.bak.d/f.md (a file inside a folder named settings.json.bak.*) → data → KEPT, kept_ignored_data" kept_ignored_data
+cl_top cl16d "(c16d): the event names .claude/settings.json.bak.d/f.md" '\.claude/settings\.json\.bak\.d/f\.md'
+
+# ── ga-k0mose6: a pool tree the gate REBASED (HEAD never an ancestor of main) is "merged" when every commit of it is in main as an
+# equivalent patch, the tree is clean and its bead(s) are closed long enough. Measured 27/10 (disk 2.4 GB): 22 of 33 worker-wa-*
+# trees met exactly that and sat in kept_pressure_unmerged until removed by hand. Each scenario below breaks one proof (or the
+# hypothesis) and must KEEP the tree; (a) and (k) are the positive controls.
+echo "── ga-k0mose6: rebased + clean + bead closed → merged for a pool tree (pressure reaps it); any proof missing → kept ──"
+KZ_ID="wa-kz1xyz"
+# kz_mk <name> [<setup run inside the tree>] [<age in hours, default 14>] — $TMP/<name>/rig with origin/main and ONE tree
+# crew/worker-kz on crew/kz/wa-kz1xyz carrying one commit; the same patch is then cherry-picked (-x: a NEW sha) onto main and pushed,
+# so the tree's HEAD is not an ancestor of origin/main yet every commit of it is there as an equivalent patch.
+kz_mk() {
+  local name="$1" extra="${2:-}" root="$TMP/$1"; mkdir -p "$root"
+  git init -q --bare "$root/remote.git"; git init -q -b main "$root/rig"
+  ( cd "$root/rig" || exit 1
+    git remote add origin "$root/remote.git"
+    echo base > base.txt; git add base.txt; git commit -qm base
+    git push -q origin main; git fetch -q origin; git remote set-head origin main 2>/dev/null || true
+    mkdir -p crew
+    git worktree add -q crew/worker-kz -b "crew/kz/$KZ_ID" main
+    ( cd crew/worker-kz && echo shipped > shipped.txt && git add shipped.txt && git commit -qm shipped )
+    git cherry-pick -x "crew/kz/$KZ_ID" && git push -q origin main && git fetch -q origin
+    if [ -n "$extra" ]; then ( cd crew/worker-kz && eval "$extra" ); fi
+  ) >/dev/null 2>&1
+  pe_age "$root/rig/crew/worker-kz" "${3:-14}"
+}
+run_kz() { # run_kz <name> <beads-json-array | @missing> [ENV=val ...] — the lookup goes through the FAKE_BEADS seam
+  local name="$1" beads="$2"; shift 2
+  if [ "$beads" = "@missing" ]; then rm -f "$TMP/$name.beads.json"; else printf '%s' "$beads" > "$TMP/$name.beads.json"; fi
+  env PATH="$PE_BIN:$PATH" WORKTREE_REAPER_GT="$TMP/$name" WORKTREE_REAPER_LOG="$TMP/$name.jsonl" WORKTREE_REAPER_STALE_HOURS=24 WORKTREE_REAPER_ENABLED=1 \
+    WORKTREE_REAPER_FAKE_LSOF="$TMP/bc_nolsof.txt" WORKTREE_REAPER_FAKE_BEADS="$TMP/$name.beads.json" "$@" bash "$REAPER" >/dev/null 2>&1
+}
+kz_wt() { git -C "$TMP/$1/rig" worktree list --porcelain 2>/dev/null | grep -E "/crew/worker-kz\$" >/dev/null; }
+kz_br() { git -C "$TMP/$1/rig" rev-parse --verify -q "refs/heads/crew/kz/$KZ_ID" >/dev/null 2>&1; }
+kz_kept() { # kz_kept <name> <label> [<event that must be logged once>] — tree + branch intact, nothing reaped on the new proof
+  if kz_wt "$1" && kz_br "$1" && [ "$(events "$1" reaped_pool)" = "0" ] && { [ -z "${3:-}" ] || [ "$(events "$1" "$3")" = "1" ]; }; then
+    ok "ga-k0mose6: $2 → KEPT (tree + branch intact${3:+, $3 logged once})"
+  else bad "ga-k0mose6: $2 → NOT kept (wt=$(kz_wt "$1" && echo y || echo n) br=$(kz_br "$1" && echo y || echo n) reaped_pool=$(events "$1" reaped_pool) ${3:-event}=$([ -n "${3:-}" ] && events "$1" "$3" || echo -))"; fi
+}
+KZ_CLOSED="[$(bc_bead "$KZ_ID" closed 10)]"
+
+# (a) the measured bug, under pressure: closed 10h ago, clean, rebased → REAPED, and its orphan branch with it
+kz_mk kz_a
+[ "$(git -C "$TMP/kz_a/rig" cherry origin/main "crew/kz/$KZ_ID" 2>/dev/null)" != "" ] && [ -z "$(git -C "$TMP/kz_a/rig" cherry origin/main "crew/kz/$KZ_ID" 2>/dev/null | grep -v '^- ')" ] \
+  && ! git -C "$TMP/kz_a/rig" merge-base --is-ancestor "crew/kz/$KZ_ID" origin/main 2>/dev/null \
+  && ok "ga-k0mose6 (fixture): the tree's commit is in main as an equivalent patch ('-' only) and its HEAD is NOT an ancestor of main" \
+  || bad "ga-k0mose6 (fixture): the rebased fixture is wrong — cherry=$(git -C "$TMP/kz_a/rig" cherry origin/main "crew/kz/$KZ_ID" 2>&1 | tr '\n' ' ')"
+run_kz kz_a "$KZ_CLOSED" "$PRESS"
+kz_wt kz_a && bad "ga-k0mose6 (a): clean rebased tree of a CLOSED bead NOT reaped under pressure — the measured leak" \
+           || ok "ga-k0mose6 (a): clean rebased tree of a CLOSED bead REAPED under pressure"
+[ "$(events kz_a reaped_pool)" = "1" ] && [ "$(events kz_a kept_pressure_unmerged)" = "0" ] \
+  && ok "ga-k0mose6 (a): logged as reaped_pool, and not as kept_pressure_unmerged" \
+  || bad "ga-k0mose6 (a): expected 1 reaped_pool and 0 kept_pressure_unmerged, saw $(events kz_a reaped_pool)/$(events kz_a kept_pressure_unmerged)"
+grep '"event":"reaped_pool"' "$TMP/kz_a.jsonl" 2>/dev/null | grep -F "\"proof\":\"patch_equivalent bead_closed\",\"beads\":\"$KZ_ID\"" >/dev/null \
+  && ok "ga-k0mose6 (a): the event names the proof and the closed bead it relied on" \
+  || bad "ga-k0mose6 (a): the reap event does not carry the proof: $(grep reaped_pool "$TMP/kz_a.jsonl" 2>/dev/null | head -1)"
+kz_br kz_a && bad "ga-k0mose6 (a): the shipped orphan branch crew/kz/$KZ_ID was left behind (the Pilot's _filter_built would veto re-dispatch)" \
+           || ok "ga-k0mose6 (a): the orphan branch goes with it, on the same patch-equivalence proof"
+
+# (b) the bead is still OPEN (or in_progress: the worker may be mid-fix) → KEPT, and the pressure keep is what says so
+kz_mk kz_b; run_kz kz_b "[$(bc_bead "$KZ_ID" open)]" "$PRESS";         kz_kept kz_b "bead OPEN" kept_pressure_unmerged
+kz_mk kz_b2; run_kz kz_b2 "[$(bc_bead "$KZ_ID" in_progress)]" "$PRESS"; kz_kept kz_b2 "bead IN_PROGRESS" kept_pressure_unmerged
+# (c) closed, but not long enough (grace 6h)
+kz_mk kz_c; run_kz kz_c "[$(bc_bead "$KZ_ID" closed 1)]" "$PRESS";      kz_kept kz_c "bead closed only 1h ago (grace 6h)" kept_pressure_unmerged
+# (d) one commit of the tree is NOT in main (`git cherry` prints '+') → real work, KEPT
+kz_mk kz_d 'echo unshipped > unshipped.txt && git add unshipped.txt && git commit -qm unshipped'
+run_kz kz_d "$KZ_CLOSED" "$PRESS";                                       kz_kept kz_d "a commit main lacks (cherry '+')" kept_pressure_unmerged
+# (e)(f) the bead lookup could not answer: unknown is not closed
+kz_mk kz_e; run_kz kz_e "@missing" "$PRESS";                             kz_kept kz_e "bead lookup FAILED" kept_pressure_unmerged
+[ "$(events kz_e bead_lookup_failed)" = "1" ] && ok "ga-k0mose6 (e): the failed lookup is logged (bead_lookup_failed), not read as 'not closed' silently" \
+  || bad "ga-k0mose6 (e): no bead_lookup_failed event for a failed lookup ($(events kz_e bead_lookup_failed))"
+kz_mk kz_f; run_kz kz_f 'this is not json' "$PRESS";                     kz_kept kz_f "bead lookup printed JUNK" kept_pressure_unmerged
+kz_mk kz_f2; run_kz kz_f2 '[]' "$PRESS";                                 kz_kept kz_f2 "bead NOT FOUND (nothing says the work is over)" kept_pressure_unmerged
+# (p) a git read the proof leans on FAILS (the PE_BIN stub: rc 128, no output). A failed cherry is not an empty one, and a failed
+# rev-parse / status / rev-list is not "no HEAD to worry about" / "clean" / "no merge commits": every one keeps the tree, branch included.
+kz_mk kz_p1; run_kz kz_p1 "$KZ_CLOSED" "$PRESS" PE_CHERRY=fail;     kz_kept kz_p1 "git cherry FAILS (rc 128, no output)" kept_pressure_unmerged
+kz_mk kz_p2; run_kz kz_p2 "$KZ_CLOSED" "$PRESS" PE_CHERRY=garbage;  kz_kept kz_p2 "git cherry prints something that is not its format" kept_pressure_unmerged
+kz_mk kz_p3; run_kz kz_p3 "$KZ_CLOSED" "$PRESS" PE_CHERRY=partial;  kz_kept kz_p3 "git cherry prints a '-' line and THEN fails" kept_pressure_unmerged
+kz_mk kz_p4; run_kz kz_p4 "$KZ_CLOSED" "$PRESS" PE_REVLIST=fail;    kz_kept kz_p4 "the merge-commit check (rev-list --merges) FAILS" kept_pressure_unmerged
+kz_mk kz_p5; run_kz kz_p5 "$KZ_CLOSED" "$PRESS" PE_REVPARSE=fail;   kz_kept kz_p5 "git rev-parse HEAD FAILS (no HEAD to prove)" kept_pressure_unmerged
+kz_mk kz_p6; run_kz kz_p6 "$KZ_CLOSED" "$PRESS" PE_STATUS=fail;     kz_kept kz_p6 "git status FAILS (an empty listing from a failed status is not 'clean')" kept_pressure_unmerged
+# (p0) the same stub with every knob OFF forwards to the real git: the failures above come from the knob, not from the stub
+kz_mk kz_p0; run_kz kz_p0 "$KZ_CLOSED" "$PRESS"
+kz_wt kz_p0 && bad "ga-k0mose6 (p0): through the stub with no knob set the clean rebased tree was NOT reaped (the stub itself breaks git)" \
+            || ok "ga-k0mose6 (p0): through the stub with no knob set the same tree is REAPED (so the p1..p6 keeps are the injected failures)"
+
+# (g) not clean: an untracked file / an edit of a tracked one → this proof never takes WIP (no preserve, no --force)
+kz_mk kz_g 'echo wip > wip.txt';          run_kz kz_g "$KZ_CLOSED" "$PRESS";  kz_kept kz_g "an untracked file in the tree" kept_pressure_unmerged
+kz_mk kz_g2 'echo edit >> shipped.txt';   run_kz kz_g2 "$KZ_CLOSED" "$PRESS"; kz_kept kz_g2 "an edited tracked file in the tree" kept_pressure_unmerged
+# (h) a live process inside → kept (merged now, so the in-use keep carries its merged name)
+kz_mk kz_h; ( cd "$TMP/kz_h/rig/crew/worker-kz" && pwd -P ) > "$TMP/kz_h.lsof"
+run_kz kz_h "$KZ_CLOSED" "$PRESS" WORKTREE_REAPER_FAKE_LSOF="$TMP/kz_h.lsof"; kz_kept kz_h "a live process has its cwd in the tree" kept_merged_in_use
+# (i) a merge under way (its state is in the git dir, not in `git status`)
+kz_mk kz_i 'echo "$(git rev-parse main)" > "$(git rev-parse --git-path MERGE_HEAD)"'
+run_kz kz_i "$KZ_CLOSED" "$PRESS";                                       kz_kept kz_i "a merge is under way (MERGE_HEAD)" kept_pressure_unmerged
+# (j) the tip is a merge commit carrying content of its own: `git cherry` cannot see merges, so it blocks the proof
+kz_mk kz_j 'git checkout -q -b side main && echo own > own.txt && git add own.txt && git commit -qm own && git checkout -q "crew/kz/wa-kz1xyz" && git merge -q --no-ff side -m "merge side"'
+run_kz kz_j "$KZ_CLOSED" "$PRESS";                                       kz_kept kz_j "a merge commit with content of its own" kept_pressure_unmerged
+# (o) younger than MERGED_MIN_AGE_MIN (30 min): a tree nobody has started on is not proof of anything
+kz_mk kz_o '' 0; run_kz kz_o "$KZ_CLOSED" "$PRESS"
+kz_wt kz_o && kz_br kz_o && [ "$(events kz_o reaped_pool)" = "0" ] && ok "ga-k0mose6 (o): a tree younger than MERGED_MIN_AGE_MIN is KEPT even with the proofs" \
+  || bad "ga-k0mose6 (o): a tree minutes old was reaped (wt=$(kz_wt kz_o && echo y || echo n) reaped_pool=$(events kz_o reaped_pool))"
+
+# (k) normal mode (no pressure, age gate 24h, tree 3h old): "merged" bypasses the age gate exactly as ancestry does → reaped; an open bead → kept
+kz_mk kz_k '' 3; run_kz kz_k "$KZ_CLOSED"
+kz_wt kz_k && bad "ga-k0mose6 (k): rebased + clean + closed tree younger than the age gate NOT reaped in normal mode" \
+           || ok "ga-k0mose6 (k): rebased + clean + closed tree is reaped in normal mode too (merged bypasses the age gate)"
+kz_mk kz_k2 '' 3; run_kz kz_k2 "[$(bc_bead "$KZ_ID" open)]"
+kz_wt kz_k2 && kz_br kz_k2 && [ "$(events kz_k2 reaped_pool)" = "0" ] && ok "ga-k0mose6 (k2): the same tree with an OPEN bead stays under the age gate (3h < 24h)" \
+  || bad "ga-k0mose6 (k2): an open-bead tree younger than the age gate was reaped (wt=$(kz_wt kz_k2 && echo y || echo n))"
+
+# (l) dry-run: would_reap_pool names the proof and nothing is removed
+kz_mk kz_l; run_kz kz_l "$KZ_CLOSED" "$PRESS" WORKTREE_REAPER_ENABLED=0
+if kz_wt kz_l && kz_br kz_l && [ "$(events kz_l would_reap_pool)" = "1" ] && [ "$(events kz_l reaped_pool)" = "0" ] \
+   && grep '"event":"would_reap_pool"' "$TMP/kz_l.jsonl" | grep -F '"proof":"patch_equivalent bead_closed"' >/dev/null; then
+  ok "ga-k0mose6 (l): dry-run logs would_reap_pool with the proof and removes nothing"
+else bad "ga-k0mose6 (l): dry-run — wt=$(kz_wt kz_l && echo y || echo n) would=$(events kz_l would_reap_pool) reaped=$(events kz_l reaped_pool)"; fi
+
+# (m) a LOCKED tree is not decided by this proof (the lock contract owns it): no reaped_pool, whatever else that contract does
+kz_mk kz_m; git -C "$TMP/kz_m/rig" worktree lock --reason "$KZ_ID active build" crew/worker-kz >/dev/null 2>&1
+run_kz kz_m "$KZ_CLOSED" "$PRESS"
+[ "$(events kz_m reaped_pool)" = "0" ] && ok "ga-k0mose6 (m): a locked tree never takes the new unlocked reap (reaped_pool = 0)" \
+  || bad "ga-k0mose6 (m): a LOCKED tree was reaped by the unlocked path ($(events kz_m reaped_pool))"
 
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"
