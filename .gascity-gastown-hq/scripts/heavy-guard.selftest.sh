@@ -340,9 +340,11 @@ while :; do sleep 1; done
 EOF
   cat > "$PD/df" <<EOF
 #!/bin/sh
+v=\$(cat "$W/dfnow")
+echo x >> "$W/dfcalls"
 if [ -e "$W/dfbad" ]; then echo "df: no usable answer"; exit 0; fi
 echo "Filesystem 1048576-blocks Used Available Capacity Mounted on"
-echo "/dev/fake 100000 90000 \$(cat "$W/dfnow") 90% /"
+echo "/dev/fake 100000 90000 \$v 90% /"
 EOF
   chmod +x "$PB/git" "$PB/hook" "$PD/df"
   # prun: the reading is pinned by the caller (DISK_FREE_OVERRIDE_MB); wenv: the live fake df, polled every second by the watch
@@ -355,8 +357,18 @@ EOF
     if kill -0 "$p" 2>/dev/null; then kill "$p" 2>/dev/null; wait "$p" 2>/dev/null; return 124; fi
     wait "$p"
   }
+  # the fake df notes each call in $W/dfcalls AFTER taking its reading from $W/dfnow: a case that waits for the file may change dfnow at once, the reading it saw is already the guard's
+  wait_df_call() { # until the fake df was asked once (the guard's first disk reading), at most ~20 s; empty/absent → not read yet, keep waiting; never → rc 1 and the case says so
+    local k=0
+    while [ ! -s "$W/dfcalls" ] && [ "$k" -lt 200 ]; do sleep 0.1; k=$((k+1)); done
+    [ -s "$W/dfcalls" ]
+  }
+  sample_lock() { # sample_lock <pid> <max>: every 0.1 s until <pid> exits or <max> samples were taken, a line goes to $W/held when the push lock exists (absent → not held)
+    local k=0
+    while kill -0 "$1" 2>/dev/null && [ "$k" -lt "$2" ]; do [ -e "$LK" ] && echo held >> "$W/held"; sleep 0.1; k=$((k+1)); done
+  }
   p_reset() {
-    rm -f "$W/gitlog" "$W/gitargs" "$W/dfbad" "$W/grandchild" "$W/hooktermed" "$W/lockseen" "$W/err" "$LK/owner"; rmdir "$LK" 2>/dev/null
+    rm -f "$W/gitlog" "$W/gitargs" "$W/dfbad" "$W/dfcalls" "$W/held" "$W/grandchild" "$W/hooktermed" "$W/lockseen" "$W/err" "$LK/owner"; rmdir "$LK" 2>/dev/null
     echo 9000 > "$W/dfnow"; : > "$HEAVY_GUARD_LOG"
   }
 
@@ -695,6 +707,89 @@ EOF
   p_reset
   DISK_FREE_OVERRIDE_MB=4000 prun --what pre-push -- git push >/dev/null 2>&1; rc=$?
   check "push lock: a push refused for the disk is 75" 75 "$rc"; [ ! -e "$LK" ] || bad "push lock: the lock was left behind by a refused push"
+  # a push refused AFTER it took the lock (the disk is good, the file cap it asked for cannot be set: the ulimit builtin is replaced through BASH_ENV, as the file-cap cases do) lets the lock go too: the EXIT trap
+  p_reset; printf 'ulimit() { return 1; }\n' > "$W/ulimit-push.env"
+  pbounded 20 env "${wenv[@]}" BASH_ENV="$W/ulimit-push.env" "$g" --max-file-mb 512 --what pre-push -- git push >/dev/null 2>&1; rc=$?
+  check "push lock: a push whose file cap cannot be set is refused with 76" 76 "$rc"; [ ! -e "$W/gitlog" ] || bad "push lock: the push RAN with no file cap set"
+  [ ! -e "$LK" ] || bad "push lock: the lock was left behind by a push refused after it took the lock"
+  fi
+  if want lockafterdisk; then
+  # ga-r2u6sv0: the disk is judged BEFORE the lock, so a push that waits for the disk never holds it (27/10 one held it ~57 min and every other push got 79).
+  # the live fake df ($W/dfnow) is what the waiting push reads; the second push pins a good reading of its own (DISK_FREE_OVERRIDE_MB), as a push on a disk that came back would
+  # (a) disk under the floor, a push waiting for it: the lock is never there while it waits, a second push with a good disk runs at once, and the first goes ahead when the disk is back
+  # the cases below do not sleep and hope: they wait for the guard's first disk reading (wait_df_call), so on a loaded machine they still look at a push that is already waiting
+  p_reset; echo 4000 > "$W/dfnow"
+  pbounded 40 env "${wenv[@]}" HEAVY_GUARD_POLL_SECS=1 HEAVY_GUARD_PUSH_LOCK_WAIT_SECS=2 HEAVY_GUARD_PUSH_LOCK_POLL_SECS=1 "$g" --what pre-push --wait-secs 25 -- git push a >/dev/null 2>&1 &
+  r1=$!
+  wait_df_call || bad "push lock: the push that waits for the disk never read it"
+  sample_lock "$r1" 25
+  [ ! -e "$W/held" ] || bad "push lock: a push that waits for the disk held the lock while it waited"
+  pbounded 20 env DISK_FREE_OVERRIDE_MB=9000 PATH="$PB:$PATH" HEAVY_GUARD_LIB="$lib" HEAVY_GUARD_PUSH_LOCK_WAIT_SECS=2 HEAVY_GUARD_PUSH_LOCK_POLL_SECS=1 "$g" --what pre-push -- git push b >/dev/null 2>&1; rc=$?
+  check "push lock: a second push with a good disk runs while the first one waits for the disk (not 79)" 0 "$rc"
+  [ "$(cat "$W/gitargs" 2>/dev/null)" = "git push b" ] || bad "push lock: the second push did not run (git got '$(cat "$W/gitargs" 2>/dev/null)')"
+  kill -0 "$r1" 2>/dev/null || bad "push lock: the push that waits for the disk gave up before the disk came back"
+  echo 9000 > "$W/dfnow"
+  wait "$r1"; rc=$?; check "push lock: the push that waited goes ahead when the disk is back" 0 "$rc"
+  [ "$(cat "$W/gitargs" 2>/dev/null)" = "git push a" ] || bad "push lock: the waiting push did not run after the disk came back (git got '$(cat "$W/gitargs" 2>/dev/null)')"
+  seq="$(awk '{printf "%s ", $1}' "$W/gitlog" 2>/dev/null)"; [ "$seq" = "start end start end " ] || bad "push lock: the two pushes must run one after the other (events: $seq)"
+  [ ! -e "$LK" ] || bad "push lock: the lock was left behind after the waiting push ran"
+  # (b) the disk never comes back: 75 after the wait, as before, and the lock was never there
+  p_reset; echo 4000 > "$W/dfnow"
+  pbounded 20 env "${wenv[@]}" HEAVY_GUARD_POLL_SECS=1 "$g" --what pre-push --wait-secs 2 -- git push 2>"$W/err" >/dev/null &
+  r1=$!
+  wait_df_call || bad "push lock: the push that waits for the disk never read it"
+  sample_lock "$r1" 300
+  wait "$r1"; rc=$?
+  check "push lock: a push whose disk never came back is refused with 75 after the wait" 75 "$rc"
+  [ ! -e "$W/held" ] || bad "push lock: a push refused for the disk held the lock while it waited"
+  [ ! -e "$W/gitlog" ] || bad "push lock: git push RAN with the disk under the floor"
+  grep -q 'rc 75' "$W/err" || bad "push lock: the refusal must say rc 75 ($(cat "$W/err"))"
+  # (c) another push holds the lock and the disk is under the floor (or unreadable): the answer is the disk's (75 / 76), not the lock's (79); the push never asks for the lock and never touches it
+  # (a push that queued for the lock would end in 79 after the 2 s lock wait: the rc tells the orders apart, no clock reading is needed)
+  p_reset; sleep 60 & hp=$!
+  mkdir "$LK"; echo "$hp $(date +%s)" > "$LK/owner"; echo 4000 > "$W/dfnow"
+  pbounded 20 env "${wenv[@]}" HEAVY_GUARD_PUSH_LOCK_WAIT_SECS=2 HEAVY_GUARD_PUSH_LOCK_POLL_SECS=1 "$g" --what pre-push -- git push >/dev/null 2>&1; rc=$?
+  check "push lock: a push under the disk floor is refused with 75 (not 79) while another push holds the lock" 75 "$rc"
+  [ "$(cut -d' ' -f1 "$LK/owner" 2>/dev/null)" = "$hp" ] || bad "push lock: a push under the disk floor touched the lock of the push that holds it"
+  : > "$W/dfbad"
+  pbounded 20 env "${wenv[@]}" HEAVY_GUARD_PUSH_LOCK_WAIT_SECS=2 HEAVY_GUARD_PUSH_LOCK_POLL_SECS=1 "$g" --what pre-push -- git push >/dev/null 2>&1; rc=$?
+  check "push lock: a push whose disk cannot be read is refused with 76 (not 79) while another push holds the lock" 76 "$rc"
+  [ ! -e "$W/gitlog" ] || bad "push lock: git push RAN while the disk was under the floor or unreadable"
+  [ "$(cut -d' ' -f1 "$LK/owner" 2>/dev/null)" = "$hp" ] || bad "push lock: a push with an unreadable disk touched the lock of the push that holds it"
+  kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
+  # (d) the disk falls while the push waits for the lock: inside the lock it is read again, the lock is let go and the wait goes on outside it; when the disk is back the push runs
+  p_reset; sleep 60 & hp=$!
+  mkdir "$LK"; echo "$hp $(date +%s)" > "$LK/owner"; echo 9000 > "$W/dfnow"
+  pbounded 40 env "${wenv[@]}" HEAVY_GUARD_POLL_SECS=1 HEAVY_GUARD_PUSH_LOCK_WAIT_SECS=30 HEAVY_GUARD_PUSH_LOCK_POLL_SECS=1 "$g" --what pre-push --wait-secs 25 -- git push c >/dev/null 2>&1 &
+  r1=$!
+  # the push has read 9000 (the reading is taken before the call is noted) and is queued for the lock, or about to be: the disk falls first, then the lock is let go, so the reading inside the lock is 4000
+  wait_df_call || bad "push lock: the push that waits for the lock never read the disk"
+  echo 4000 > "$W/dfnow"; rm -f "$LK/owner"; rmdir "$LK"
+  for i in $(seq 1 80); do grep -q "PUSH_LOCK_YIELD what='pre-push'" "$HEAVY_GUARD_LOG" && break; sleep 0.25; done
+  grep -q "PUSH_LOCK_YIELD what='pre-push' free_mb=4000 min_mb=5000" "$HEAVY_GUARD_LOG" || bad "push lock: a disk that fell inside the lock must be logged as PUSH_LOCK_YIELD ($(cat "$HEAVY_GUARD_LOG"))"
+  sleep 0.5
+  [ ! -e "$LK" ] || bad "push lock: a push that found the disk under the floor inside the lock kept the lock while it waits"
+  [ ! -e "$W/gitlog" ] || bad "push lock: git push RAN on a reading under the floor taken inside the lock"
+  kill -0 "$r1" 2>/dev/null || bad "push lock: a push that found the disk under the floor inside the lock did not go back to waiting"
+  echo 9000 > "$W/dfnow"
+  wait "$r1"; rc=$?; check "push lock: the push that gave the lock back goes ahead when the disk is back" 0 "$rc"
+  [ "$(cat "$W/gitargs" 2>/dev/null)" = "git push c" ] || bad "push lock: the push did not run after the disk came back (git got '$(cat "$W/gitargs" 2>/dev/null)')"
+  [ ! -e "$LK" ] || bad "push lock: the lock was left behind after the push ran"
+  kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
+  # (e) the same fall, and the wait runs out: 75 as before, the lock let go
+  p_reset; sleep 60 & hp=$!
+  mkdir "$LK"; echo "$hp $(date +%s)" > "$LK/owner"; echo 9000 > "$W/dfnow"
+  pbounded 40 env "${wenv[@]}" HEAVY_GUARD_POLL_SECS=1 HEAVY_GUARD_PUSH_LOCK_WAIT_SECS=30 HEAVY_GUARD_PUSH_LOCK_POLL_SECS=1 "$g" --what pre-push --wait-secs 4 -- git push d 2>"$W/err" >/dev/null &
+  r1=$!
+  wait_df_call || bad "push lock: the push that waits for the lock never read the disk"
+  echo 4000 > "$W/dfnow"; rm -f "$LK/owner"; rmdir "$LK"
+  wait "$r1"; rc=$?
+  check "push lock: a disk that fell inside the lock and stayed under the floor is refused with 75 when the wait runs out" 75 "$rc"
+  [ ! -e "$LK" ] || bad "push lock: the lock was left behind by a push refused for a disk that fell inside it"
+  [ ! -e "$W/gitlog" ] || bad "push lock: git push RAN on a disk that fell under the floor inside the lock"
+  grep -q "REFUSED what='pre-push' free_mb=4000 min_mb=5000 class=push rc=75" "$HEAVY_GUARD_LOG" || bad "push lock: refusal not in the log ($(cat "$HEAVY_GUARD_LOG"))"
+  grep -q "PUSH_LOCK_YIELD what='pre-push' free_mb=4000 min_mb=5000" "$HEAVY_GUARD_LOG" || bad "push lock: the push was refused without ever having taken and let go of the lock ($(cat "$HEAVY_GUARD_LOG"))"
+  kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
   fi
   if want sigterm; then
   # the guard itself told to stop (the session is killed): it takes the push group down with it and lets the lock go
@@ -1132,9 +1227,15 @@ pgm p-nokill     "push: a push that ignores TERM is never KILLed"               
 pgm p-rc0        "push: a push that ended with 0 is turned into a 78"           term0       's#^  if \[ "\$wrc" = 78 \] && \[ "\$rc" -ne 0 \]; then rc=78; fi$#  if [ "$wrc" = 78 ]; then rc=78; fi#'
 pgm p-anywrc     "push: any watch status but 0 turns the push's rc into a 78"   rc          's#^  if \[ "\$wrc" = 78 \] && \[ "\$rc" -ne 0 \]; then rc=78; fi$#  if [ "$wrc" != 0 ] \&\& [ "$rc" -ne 0 ]; then rc=78; fi#'
 pgm p-blindkills "push: a reading the watch cannot take kills the push"         blind       's#^      low|drop)$#      low|drop|*)#'
-pgm p-nolock     "push: no lock is taken"                                       serial      's#then hg_push_lock_acquire; fi#then :; fi#'
-pgm p-norelease  "push: the lock is never let go"                               serial      's#^  rmdir "\$HG_LOCK_DIR" 2>/dev/null$#  :#'
-pgm p-noexittrap "push: a refused push leaves the lock behind"                  diskrelease "s#^  trap 'hg_lock_release' EXIT\$#  :#"
+pgm p-nolock     "push: no lock is taken"                                       "serial lockafterdisk" 's#^    hg_push_lock_acquire$#    HG_LOCK_HELD=1#'
+pgm p-norelease  "push: the lock is never let go"                               "serial lockafterdisk" 's#^  rmdir "\$HG_LOCK_DIR" 2>/dev/null$#  :#'
+pgm p-noexittrap "push: a push refused after it took the lock leaves the lock behind" diskrelease "s#^  trap 'hg_lock_release' EXIT\$#  :#"
+# lock after the disk (ga-r2u6sv0): each rule of the order has a mutant that the cases of its section must notice
+pgm p-lockfirst  "push: the lock is taken before the disk is judged (the old order, a waiter holds it)" lockafterdisk 's#^if \[ "\$push_class" = 1 \] \&\& \[ "\$mode" = run \]; then lock_push=1; fi$#if [ "$push_class" = 1 ] \&\& [ "$mode" = run ]; then lock_push=1; hg_push_lock_acquire; fi#;s#^  if \[ "\$HG_LOCK_HELD" = 1 \]; then$#  if false; then#'
+pgm p-lowlocks   "push: a reading under the floor takes the lock too"          lockafterdisk 's#^  if \[ "\$state" = ok \]; then$#  if [ "$state" = ok ] || [ "$lock_push" = 1 ]; then#'
+pgm p-noyield    "push: a lock taken before a reading under the floor is kept while the push waits" lockafterdisk 's#^  if \[ "\$HG_LOCK_HELD" = 1 \]; then$#  if false; then#'
+pgm p-norejudge  "push: the disk is not read again inside the lock"            lockafterdisk '/^    hg_push_lock_acquire$/{n;s#continue#break#;}'
+pgm p-noyieldlog "push: giving the lock back leaves no log line"                lockafterdisk '/hg_log "PUSH_LOCK_YIELD/d'
 pgm p-zerowait   "push: a wait of 0 is not allowed"                             posint        's#\[ "\$4" = 1 \] ||#false ||#'
 pgm p-octal      "push: a zero-padded number is read as octal"                  posint        's@^  v=\$(( 10#\$v ))$@  v=$(( v ))@'
 pgm p-maxage     "push: a lock older than the max age is never stale"           age         's@\*) \[ \$(( now - 10#\$at )) -le "\$HG_LOCK_MAXAGE" \] || { HG_LOCK_VERDICT=stale; return 0; } ;;@*) : ;;@'

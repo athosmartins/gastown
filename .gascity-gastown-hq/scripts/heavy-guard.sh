@@ -40,8 +40,8 @@
 #                class: or fell by more than the drop limit since it started, see "DISK-WATCH CLASS") and the guard stopped it. This is not "try
 #                again": do NOT repeat the push or find another route (no --no-verify); a selftest/mutant step left what it wrote on disk, find
 #                it (its TMPDIR) and clean it with safe-clean. Tell the Mayor.
-#   79  PUSH LOCK BUSY (push class only) another push held the push lock for the whole lock wait. NOT a disk problem and the
-#                push did not start: retry in a minute.
+#   79  PUSH LOCK BUSY (push class only) another push held the push lock for the whole lock wait (the lock is only taken once the disk
+#                is above the floor, so the holder is a push that is RUNNING or about to). NOT a disk problem and the push did not start: retry in a minute.
 #
 # WHAT COUNTS AS HEAVY (anything that writes or holds hundreds of MB on this machine): go build / go test / go vet,
 # golangci-lint, a git repack / gc / maintenance, a selftest that builds fixtures of tens of MB or runs mutants,
@@ -84,6 +84,11 @@
 #     about a minute (the holder died between mkdir and writing it). A lock the guard cannot read or judge is respected, never taken.
 #     A lock that cannot be created at all is rc 76: no push runs unlocked. It is mutual exclusion on a best-effort basis (two
 #     waiters can judge the same stale lock and race on the takeover); the stop floor is what protects the disk.
+#   - the lock is held only while the push RUNS (ga-r2u6sv0). The disk is judged first, with the --wait-secs wait, outside the lock: a
+#     push that waits for the disk (or is refused for it, 75 / 76) does not hold it for that wait, so it cannot make the other pushes wait or get 79. Only
+#     on a reading above the floor is the lock taken, and the disk is read once more inside it: if it fell under the floor meanwhile
+#     the lock is let go (log line PUSH_LOCK_YIELD) and the wait goes on outside it, up to the same --wait-secs deadline (counted from the
+#     first reading, so the time spent waiting for the lock counts), then 75; a reading that cannot be taken inside the lock lets it go and is 76 at once.
 # A step is in the class when its command is git (bare or by path), then git's own options (-C <dir>, -c <k=v>, --git-dir, ...),
 # then `push`: `git push`, `git -C dir push origin HEAD`. With no command to look at (--check) a --what label that is `push`, `git push`
 # or `pre-push` (- or _ or a space between, capitals ignored, anything after a non-alphanumeric) counts. A label cannot make another
@@ -653,8 +658,12 @@ if [ "$mode" = run ] && [ "$push_class" = 0 ]; then
   fi
 fi
 
-# a push that RUNS under the guard goes one at a time: the lock is taken before the disk is judged (the reading is made after the wait)
-if [ "$push_class" = 1 ] && [ "$mode" = run ]; then hg_push_lock_acquire; fi
+# a push that RUNS under the guard goes one at a time, but the lock is held only while the push runs (ga-r2u6sv0): the disk is judged FIRST, with its
+# wait, OUTSIDE the lock; the lock is taken on an "ok" reading and the disk is judged once more INSIDE it (taking it can take a while, and the disk moves);
+# a reading under the floor inside the lock lets it go and goes back to waiting outside it. 27/10 the other order held the lock for the whole
+# --wait-secs (~57 min, nothing pushed) and every other push got rc 79 for more than 1h30. --check takes no lock: nothing runs under the guard.
+lock_push=0
+if [ "$push_class" = 1 ] && [ "$mode" = run ]; then lock_push=1; fi
 
 # vazio/falhou/ilegível → no clock, so no deadline can be made: do not wait at all (one reading, then the verdict)
 t0=$(date +%s 2>/dev/null)
@@ -665,7 +674,19 @@ while :; do
   # vazio/falhou/ilegível → free="" → state "unknown" (rc 76 below)
   free="$(disk_free_mb 2>/dev/null)" || free=""
   state="$(disk_state_of "$free" "$min")"
-  [ "$state" = ok ] && break
+  if [ "$state" = ok ]; then
+    # no lock for this call (not a push that runs), or the reading just made was taken INSIDE the lock: go
+    if [ "$lock_push" = 0 ] || [ "$HG_LOCK_HELD" = 1 ]; then break; fi
+    # ok OUTSIDE the lock: take it (it waits for another push, or exits 79 / 76) and read the disk again before trusting that reading
+    hg_push_lock_acquire
+    continue
+  fi
+  # under the floor (low) or unreadable (unknown) with the lock in hand: let it go BEFORE waiting or refusing, so a push that waits for the disk
+  # never holds the lock (the log line is best effort; vazio → "?" in it only)
+  if [ "$HG_LOCK_HELD" = 1 ]; then
+    hg_lock_release
+    hg_log "PUSH_LOCK_YIELD what='$what' free_mb=${free:-?} min_mb=$min state=$state"
+  fi
   now=$(date +%s 2>/dev/null)
   # vazio/falhou/ilegível → the wait cannot be bounded: stop waiting, the verdict is taken on the reading just made
   case "$now" in ''|*[!0-9]*) break ;; esac
