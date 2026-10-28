@@ -1092,10 +1092,13 @@ unset -f _PS_TIP _ns
 
 # The call site, end to end. Same scope and same convention as run_live_basetest_check above: a
 # mirror of the Step 5b-pre2 loop that calls the REAL guard functions (old_state, portability_declared,
-# node_state, verdict) — section 3 pins that the live call site has the same shape.
+# mutants_declared, declared_state [-> mutants_state, node_state], verdict) — section 3 pins that the live
+# call site has the same shape. ga-4kykayr: this fixture's bead never carries teste:endurece-mutantes, so the
+# mutant path answers "no" here and the portability matrix below is the unchanged ga-hlcfzx9 one; the mutant
+# path has its own fixture and matrix in gate-guard-ab-base-test-mutants.selftest.sh.
 run_port_check() {  # run_port_check <branch> [bead-id]  -> verdict
   local branch="$1" bead="${2:-ga-port}" tip base="$PORT_BASE"
-  local detected=0 copy_ok=0 ran=0 failed=0 repaired=0 unclassified=0 portable=0 decl="" files wt f rc
+  local detected=0 copy_ok=0 ran=0 failed=0 repaired=0 unclassified=0 portable=0 killed=0 decl="" mdecl="" files wt f rc
   tip=$(git -C "$PORT_REPO" rev-parse "$branch")
   files=$(git -C "$PORT_REPO" diff --name-only --diff-filter=AM "${base}..${tip}" -- '*.selftest.sh')
   detected=$(printf '%s\n' "$files" | grep -c .)
@@ -1115,15 +1118,14 @@ run_port_check() {  # run_port_check <branch> [bead-id]  -> verdict
             if [ -z "$decl" ]; then
               decl=$(gate_base_test_portability_declared /fake/store "$bead")
             fi
-            case "$decl" in
-              no)  : ;;
-              yes)
-                case "$(gate_base_test_node_state "$PORT_REPO" "$base" "$tip" "$wt" "$f")" in
-                  node-red)    portable=$((portable + 1)) ;;
-                  node-green)  : ;;
-                  *)           unclassified=$((unclassified + 1)) ;;
-                esac ;;
-              *)   unclassified=$((unclassified + 1)) ;;
+            if [ -z "$mdecl" ]; then
+              mdecl=$(gate_base_test_mutants_declared /fake/store "$bead")
+            fi
+            case "$(gate_base_test_declared_state "$PORT_REPO" "$base" "$tip" "$wt" "$f" /fake/store "$bead" "$mdecl" "$decl")" in
+              killed)     killed=$((killed + 1)) ;;
+              portable)   portable=$((portable + 1)) ;;
+              refusable)  : ;;
+              *)          unclassified=$((unclassified + 1)) ;;
             esac ;;
           *)                 unclassified=$((unclassified + 1)) ;;
         esac
@@ -1136,7 +1138,7 @@ run_port_check() {  # run_port_check <branch> [bead-id]  -> verdict
 $files
 PORTFILESEOF
   git -C "$PORT_REPO" worktree remove --force "$wt" 2>/dev/null || rm -rf "$wt" 2>/dev/null
-  gate_base_test_verdict "$detected" "$copy_ok" "$ran" "$failed" "$repaired" "$unclassified" "$portable"
+  gate_base_test_verdict "$detected" "$copy_ok" "$ran" "$failed" "$repaired" "$unclassified" "$portable" "$killed"
 }
 # Every run below goes through PATH with the fake bd first, like the live guard resolves `bd`.
 run_port() { PATH="$PORT_BIN:$PATH" run_port_check "$@"; }
@@ -1191,8 +1193,8 @@ eq "portability repair + a sibling green on both systems -> consertou-portabilid
 _preset; _pbd "$PORT_BD_DECLARED"
 eq "two portability repairs -> consertou-portabilidade" "$(run_port twoport)" "consertou-portabilidade"
 _preset; _pbd "$PORT_BD_DECLARED"; run_port twoport >/dev/null
-eq "two files to check: the declaration is read ONCE (bd called once), the node 4 times (2 files x old+control)" \
-  "$(_pcalls "$FAKE_BD_LOG") $(_pcalls "$FAKE_MBP_LOG")" "1 4"
+eq "two files to check: each declaration is read ONCE (bd called twice: teste:portabilidade-os, teste:endurece-mutantes), the node 4 times (2 files x old+control)" \
+  "$(_pcalls "$FAKE_BD_LOG") $(_pcalls "$FAKE_MBP_LOG")" "2 4"
 _preset; _pbd "$PORT_BD_DECLARED"
 eq "a mini-side repair + a portability repair together -> consertou-teste-vermelho (the older proof keeps its word)" \
   "$(run_port portmacred)" "consertou-teste-vermelho"
@@ -1364,9 +1366,9 @@ else
   bad "REGRESSION: old-state call line=${OLDSTATE_CALL_LINE:-missing} arm gate=${ARM_GATE_LINE:-missing} — arm A might run the old-form probe"
 fi
 
-echo "$ABT_BLOCK" | grep '_ABT_VERDICT=\$(gate_base_test_verdict "\$_ABT_DETECTED" "\$_ABT_COPY_OK" "\$_ABT_RAN" "\$_ABT_FAILED" "\$_ABT_REPAIRED" "\$_ABT_UNCLASSIFIED" "\$_ABT_PORTABLE")' >/dev/null \
-  && ok "guard.sh: verdict call passes repaired, unclassified AND portable (7 args)" \
-  || bad "guard.sh: verdict call does not pass all three counts — repairs (ga-yl1k3w) or portability repairs (ga-hlcfzx9) would be re-refused"
+echo "$ABT_BLOCK" | grep '_ABT_VERDICT=\$(gate_base_test_verdict "\$_ABT_DETECTED" "\$_ABT_COPY_OK" "\$_ABT_RAN" "\$_ABT_FAILED" "\$_ABT_REPAIRED" "\$_ABT_UNCLASSIFIED" "\$_ABT_PORTABLE" "\$_ABT_KILLED")' >/dev/null \
+  && ok "guard.sh: verdict call passes repaired, unclassified, portable AND killed (8 args)" \
+  || bad "guard.sh: verdict call does not pass all four counts — repairs (ga-yl1k3w), portability repairs (ga-hlcfzx9) or mutant kills (ga-4kykayr) would be re-refused"
 
 # The old_state case: ONLY added is a proven "nothing to repair" without further asking. old-passes
 # is the one answer that may lead to a refusal, and only through the declaration + node arms below;
@@ -1381,38 +1383,65 @@ echo "$ABT_BLOCK" | grep 'AB-BASE-TEST bead=.*repaired=\$_ABT_REPAIRED unclassif
   && ok "guard.sh: AB-BASE-TEST log line carries repaired=/unclassified= (appended, existing fields untouched)" \
   || bad "guard.sh: AB-BASE-TEST log line lacks repaired=/unclassified="
 
-echo "$ABT_BLOCK" | grep 'AB-BASE-TEST bead=.*unclassified=\$_ABT_UNCLASSIFIED portable=\$_ABT_PORTABLE outside-subtree=' >/dev/null \
-  && ok "guard.sh: AB-BASE-TEST log line carries portable= between unclassified= and outside-subtree= (ga-hlcfzx9; existing fields untouched)" \
-  || bad "guard.sh: AB-BASE-TEST log line lacks portable=\$_ABT_PORTABLE in its slot"
+echo "$ABT_BLOCK" | grep 'AB-BASE-TEST bead=.*unclassified=\$_ABT_UNCLASSIFIED portable=\$_ABT_PORTABLE killed=\$_ABT_KILLED outside-subtree=' >/dev/null \
+  && ok "guard.sh: AB-BASE-TEST log line carries portable= (ga-hlcfzx9) and killed= (ga-4kykayr) between unclassified= and outside-subtree= (existing fields untouched)" \
+  || bad "guard.sh: AB-BASE-TEST log line lacks portable=\$_ABT_PORTABLE killed=\$_ABT_KILLED in its slot"
 
-# ga-hlcfzx9: where the three new functions are called. All three are arm-B-only (after the gate),
-# the declaration read and the node probe are both INSIDE the old-passes arm (the lazy cost: a submission
-# that never gets there pays nothing), and the node is only asked when the declaration says "yes".
+# ga-hlcfzx9 / ga-4kykayr: where the declared paths are called. All of it is arm-B-only (after the gate), the
+# declaration reads and the dispatch are INSIDE the old-passes arm (the lazy cost: a submission that never gets
+# there pays nothing), and the dispatch itself (gate_base_test_declared_state) asks the node only for a declared
+# portability file and runs mutants only for a declared mutant-hardening one (pinned on its body further down).
 _PO_DECL_LINE=$(echo "$ABT_BLOCK" | grep -n 'gate_base_test_portability_declared "\$BEAD_CITY" "\$BEAD_ID"' | head -1 | cut -d: -f1)
-_PO_NODE_LINE=$(echo "$ABT_BLOCK" | grep -n 'gate_base_test_node_state "\$RIG_PATH" "\$_ABT_BASE" "\$_ABT_BRANCH_SHA" "\$_ABT_WT" "\$_abt_f"' | head -1 | cut -d: -f1)
+_PO_MDECL_LINE=$(echo "$ABT_BLOCK" | grep -n 'gate_base_test_mutants_declared "\$BEAD_CITY" "\$BEAD_ID"' | head -1 | cut -d: -f1)
+_PO_CALL_LINE=$(echo "$ABT_BLOCK" | grep -n 'gate_base_test_declared_state "\$RIG_PATH" "\$_ABT_BASE" "\$_ABT_BRANCH_SHA" "\$_ABT_WT" "\$_abt_f" "\$BEAD_CITY" "\$BEAD_ID" "\$_ABT_MUT_DECL" "\$_ABT_PORT_DECL"' | head -1 | cut -d: -f1)
 _PO_OLDPASS_LINE=$(echo "$ABT_BLOCK" | grep -n -E '^[[:space:]]*old-passes\)[[:space:]]*$' | head -1 | cut -d: -f1)
-_PO_YES_LINE=$(echo "$ABT_BLOCK" | grep -n -E '^[[:space:]]*yes\)[[:space:]]*$' | head -1 | cut -d: -f1)
-if [ -n "$ARM_GATE_LINE" ] && [ -n "$_PO_OLDPASS_LINE" ] && [ -n "$_PO_DECL_LINE" ] && [ -n "$_PO_YES_LINE" ] && [ -n "$_PO_NODE_LINE" ] \
+if [ -n "$ARM_GATE_LINE" ] && [ -n "$_PO_OLDPASS_LINE" ] && [ -n "$_PO_DECL_LINE" ] && [ -n "$_PO_MDECL_LINE" ] && [ -n "$_PO_CALL_LINE" ] \
    && [ "$ARM_GATE_LINE" -lt "$_PO_OLDPASS_LINE" ] && [ "$_PO_OLDPASS_LINE" -lt "$_PO_DECL_LINE" ] \
-   && [ "$_PO_DECL_LINE" -lt "$_PO_YES_LINE" ] && [ "$_PO_YES_LINE" -lt "$_PO_NODE_LINE" ]; then
-  ok "guard.sh: arm-B gate (L$ARM_GATE_LINE) < old-passes arm (L$_PO_OLDPASS_LINE) < declaration read (L$_PO_DECL_LINE) < yes) arm (L$_PO_YES_LINE) < node_state call (L$_PO_NODE_LINE) — arm A never reads the declaration, and the node is only asked for a declared, old-passes file"
+   && [ "$_PO_OLDPASS_LINE" -lt "$_PO_MDECL_LINE" ] \
+   && [ "$_PO_DECL_LINE" -lt "$_PO_CALL_LINE" ] && [ "$_PO_MDECL_LINE" -lt "$_PO_CALL_LINE" ]; then
+  ok "guard.sh: arm-B gate (L$ARM_GATE_LINE) < old-passes arm (L$_PO_OLDPASS_LINE) < both declaration reads (L$_PO_DECL_LINE, L$_PO_MDECL_LINE) < declared_state call (L$_PO_CALL_LINE) — arm A never reads a declaration or measures anything"
 else
-  bad "guard.sh: declaration/node calls not ordered arm gate < old-passes < declaration < yes) < node_state (gate=${ARM_GATE_LINE:-missing} old-passes=${_PO_OLDPASS_LINE:-missing} decl=${_PO_DECL_LINE:-missing} yes=${_PO_YES_LINE:-missing} node=${_PO_NODE_LINE:-missing}) — the node could be asked for undeclared files, or arm A could reach it"
+  bad "guard.sh: declaration reads / declared_state call not ordered arm gate < old-passes < reads < call (gate=${ARM_GATE_LINE:-missing} old-passes=${_PO_OLDPASS_LINE:-missing} decl=${_PO_DECL_LINE:-missing} mdecl=${_PO_MDECL_LINE:-missing} call=${_PO_CALL_LINE:-missing}) — a declared path could run for undeclared files, or arm A could reach it"
+fi
+# the node is reached ONLY through gate_base_test_declared_state: no direct call left at the call site
+eq "guard.sh: the Step 5b-pre2 block has no direct gate_base_test_node_state / _mutants_state call (the dispatch is the one function)" \
+  "$(echo "$ABT_BLOCK" | sed -E 's/(^|[[:space:]])#.*$//' | grep -cE 'gate_base_test_node_state|gate_base_test_mutants_state' || true)" "0"
+
+_PO_DS=$(awk '/^gate_base_test_declared_state\(\) \{/,/^\}/' "$GUARD")
+_PO_DS_PCASE=$(echo "$_PO_DS" | grep -n 'case "\$pdecl" in' | head -1 | cut -d: -f1)
+_PO_DS_NODE=$(echo "$_PO_DS" | grep -n 'gate_base_test_node_state "\$rig" "\$base" "\$tip" "\$wt" "\$f"' | head -1 | cut -d: -f1)
+_PO_DS_YES=$(echo "$_PO_DS" | awk -v s="${_PO_DS_PCASE:-0}" 'NR > s && /^[[:space:]]*yes\)[[:space:]]*$/ { print NR; exit }')
+if [ -n "$_PO_DS_PCASE" ] && [ -n "$_PO_DS_YES" ] && [ -n "$_PO_DS_NODE" ] && [ "$_PO_DS_PCASE" -lt "$_PO_DS_YES" ] && [ "$_PO_DS_YES" -lt "$_PO_DS_NODE" ]; then
+  ok "guard.sh: in gate_base_test_declared_state the node is asked only inside the portability declaration's yes) arm (case L$_PO_DS_PCASE < yes) L$_PO_DS_YES < node_state L$_PO_DS_NODE)"
+else
+  bad "guard.sh: gate_base_test_declared_state does not ask the node only under a declared portability yes) (case=${_PO_DS_PCASE:-missing} yes=${_PO_DS_YES:-missing} node=${_PO_DS_NODE:-missing})"
 fi
 
 echo "$ABT_BLOCK" | grep -E '^[[:space:]]*_ABT_PORTABLE=0; _ABT_PORT_DECL=""' >/dev/null \
   && ok "guard.sh: _ABT_PORTABLE starts at 0 and _ABT_PORT_DECL starts EMPTY (declaration not read until first needed)" \
   || bad "guard.sh: _ABT_PORTABLE/_ABT_PORT_DECL not initialised as 0 / empty"
 
-# The two inner cases: node answers other than node-red/node-green, and declaration answers other than
-# no/yes, go to unclassified (nao-consegui-medir) — never to "no count" (= refusal).
-_PO_INNER=$(echo "$ABT_BLOCK" | sed -n '/^[[:space:]]*old-passes)[[:space:]]*$/,/^[[:space:]]*esac$/p' | head -40)
-echo "$_PO_INNER" | grep -E '^[[:space:]]*node-red\)[[:space:]]+_ABT_PORTABLE=\$\(\(_ABT_PORTABLE \+ 1\)\) ;;' >/dev/null \
-  && echo "$_PO_INNER" | grep -E '^[[:space:]]*node-green\)[[:space:]]+:[[:space:]]*;;' >/dev/null \
-  && [ "$(echo "$_PO_INNER" | grep -cE '^[[:space:]]*\*\)[[:space:]]+_ABT_UNCLASSIFIED=\$\(\(_ABT_UNCLASSIFIED \+ 1\)\) ;;')" -ge 2 ] \
-  && echo "$_PO_INNER" | grep -E '^[[:space:]]*no\)[[:space:]]+:[[:space:]]*;;' >/dev/null \
-  && ok "guard.sh: inside old-passes: node-red counts portable, node-green and a declared 'no' count nothing, and an unreadable declaration / unrecognised node answer go to unclassified" \
-  || bad "guard.sh: the old-passes inner cases are not (node-red -> portable, node-green -> nothing, no -> nothing, *) -> unclassified) twice — doubt could become a refusal or a portable repair"
+# The inner cases: a node answer other than node-red/node-green, a mutant answer other than killed/survived and a
+# declaration answer other than no/yes all end in "unknown" -> the call site's unclassified (nao-consegui-medir) —
+# never in "no count" (= refusal) and never in a repair that was not measured.
+echo "$_PO_DS" | grep -E "^[[:space:]]*node-red\)[[:space:]]+printf 'portable'; return 0 ;;" >/dev/null \
+  && echo "$_PO_DS" | grep -E '^[[:space:]]*node-green\)[[:space:]]+:[[:space:]]*;;' >/dev/null \
+  && echo "$_PO_DS" | grep -E "^[[:space:]]*killed\)[[:space:]]+printf 'killed'; return 0 ;;" >/dev/null \
+  && echo "$_PO_DS" | grep -E '^[[:space:]]*survived\)[[:space:]]+:[[:space:]]*;;' >/dev/null \
+  && [ "$(echo "$_PO_DS" | grep -cE '^[[:space:]]*no\)[[:space:]]+:[[:space:]]*;;')" -ge 2 ] \
+  && [ "$(echo "$_PO_DS" | grep -cE '^[[:space:]]*\*\)[[:space:]]+unk=1 ;;')" -ge 4 ] \
+  && ok "guard.sh: in declared_state, node-red -> portable and killed -> killed (early return), node-green / survived / a declared 'no' count nothing, and an unreadable declaration / unrecognised mutant or node answer set unknown" \
+  || bad "guard.sh: gate_base_test_declared_state's cases are not (node-red -> portable, node-green -> nothing, killed -> killed, survived -> nothing, no -> nothing, *) -> unknown) — doubt could become a refusal or an unmeasured repair"
+_PO_CS=$(echo "$ABT_BLOCK" | sed -n '/^[[:space:]]*old-passes)[[:space:]]*$/,/^[[:space:]]*esac ;;$/p')
+echo "$_PO_CS" | grep -E '^[[:space:]]*killed\)[[:space:]]+_ABT_KILLED=\$\(\(_ABT_KILLED \+ 1\)\) ;;' >/dev/null \
+  && echo "$_PO_CS" | grep -E '^[[:space:]]*portable\)[[:space:]]+_ABT_PORTABLE=\$\(\(_ABT_PORTABLE \+ 1\)\) ;;' >/dev/null \
+  && echo "$_PO_CS" | grep -E '^[[:space:]]*refusable\)[[:space:]]+:[[:space:]]*;;' >/dev/null \
+  && echo "$_PO_CS" | grep -E '^[[:space:]]*\*\)[[:space:]]+_ABT_UNCLASSIFIED=\$\(\(_ABT_UNCLASSIFIED \+ 1\)\) ;;' >/dev/null \
+  && ok "guard.sh: inside old-passes: killed counts _ABT_KILLED, portable counts _ABT_PORTABLE, refusable counts nothing and anything else (empty/garbage/unknown) is unclassified" \
+  || bad "guard.sh: the old-passes arm does not map declared_state's words (killed -> _ABT_KILLED, portable -> _ABT_PORTABLE, refusable -> nothing, *) -> unclassified)"
+echo "$ABT_BLOCK" | grep -E '^[[:space:]]*_ABT_KILLED=0; _ABT_MUT_DECL=""' >/dev/null \
+  && ok "guard.sh: _ABT_KILLED starts at 0 and _ABT_MUT_DECL starts EMPTY (mutant declaration not read until first needed)" \
+  || bad "guard.sh: _ABT_KILLED/_ABT_MUT_DECL not initialised as 0 / empty"
 
 # Nothing in the new code picks a path by bead id (Mayor, 2026-10-26): no code line (comments excluded)
 # names ga-9s361xi / ga-zxevh3a, and the new functions do not look at the A/B arm at all.
@@ -1457,7 +1486,7 @@ echo "$ABT_BLOCK" | grep -E '^[[:space:]]*_ABT_OUTSIDE="unknown"' >/dev/null \
   && ok "guard.sh: _ABT_OUTSIDE starts as \"unknown\" (a count that was never measured cannot read as 0)" \
   || bad "guard.sh: _ABT_OUTSIDE is not initialised to \"unknown\" — an unmeasured submission could log a blank or a 0"
 
-echo "$ABT_BLOCK" | grep -E 'AB-BASE-TEST bead=.*unclassified=\$_ABT_UNCLASSIFIED portable=\$_ABT_PORTABLE outside-subtree=\$_ABT_OUTSIDE"$' >/dev/null \
+echo "$ABT_BLOCK" | grep -E 'AB-BASE-TEST bead=.*unclassified=\$_ABT_UNCLASSIFIED portable=\$_ABT_PORTABLE killed=\$_ABT_KILLED outside-subtree=\$_ABT_OUTSIDE"$' >/dev/null \
   && ok "guard.sh: AB-BASE-TEST log line ends with outside-subtree=\$_ABT_OUTSIDE (appended last, existing fields untouched)" \
   || bad "guard.sh: AB-BASE-TEST log line does not end with outside-subtree=\$_ABT_OUTSIDE"
 
@@ -1481,6 +1510,7 @@ else
     echo "[2026-09-25 09:23:37] [quality-gate-guard] AB-BASE-TEST bead=ga-c arm=B verdict=consertou-teste-vermelho branch=fix/ga-c base=ccc detected=1 copy_ok=1 ran=1 failed=0 repaired=1 unclassified=0 outside-subtree=0"
     echo "[2026-09-25 09:24:37] [quality-gate-guard] AB-BASE-TEST bead=ga-d arm=B verdict=reprovou-na-base branch=fix/ga-d base=ddd detected=1 copy_ok=1 ran=1 failed=1 repaired=0 unclassified=0 outside-subtree=unknown"
     echo "[2026-10-26 23:48:37] [quality-gate-guard] AB-BASE-TEST bead=ga-e arm=B verdict=consertou-portabilidade branch=fix/ga-e base=eee detected=1 copy_ok=1 ran=1 failed=0 repaired=0 unclassified=0 portable=1 outside-subtree=0"
+    echo "[2026-10-28 04:07:50] [quality-gate-guard] AB-BASE-TEST bead=ga-f arm=B verdict=matou-mutantes branch=fix/ga-f base=fff detected=1 copy_ok=1 ran=1 failed=0 repaired=0 unclassified=0 portable=0 killed=1 outside-subtree=0"
   } > "$_APU_LOG"
   _APU_OUT=$(GUARD_LOG="$_APU_LOG" eval "$_APU_PIPE" 2>/dev/null | sed -E 's/^ +//; s/ +/ /g')
   rm -f "$_APU_LOG"
@@ -1493,6 +1523,9 @@ else
   printf '%s\n' "$_APU_OUT" | grep -qx '1 B consertou-portabilidade' \
     && ok "apuracao tally counts consertou-portabilidade as its own separate row (1 B consertou-portabilidade) — the new verdict is measurable, not folded into another word" \
     || bad "apuracao tally lacks the separate consertou-portabilidade row: got '$(printf '%s' "$_APU_OUT" | tr '\n' '|')'"
+  printf '%s\n' "$_APU_OUT" | grep -qx '1 B matou-mutantes' \
+    && ok "apuracao tally counts matou-mutantes as its own separate row (1 B matou-mutantes, ga-4kykayr) — counted apart, with no change to the script" \
+    || bad "apuracao tally lacks the separate matou-mutantes row: got '$(printf '%s' "$_APU_OUT" | tr '\n' '|')'"
   grep -q 'quality-gate-guard.log' "$_APU" \
     && ok "apuracao reads quality-gate-guard.log for the verdict section (where the guard actually writes AB-BASE-TEST)" \
     || bad "apuracao does not reference quality-gate-guard.log — verdict section would read the wrong log again"
