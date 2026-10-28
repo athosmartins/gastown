@@ -3306,17 +3306,25 @@ gate_base_test_old_state() {
 #                unclassified (nao-consegui-medir), never as a refusal: "could not
 #                read the declaration" is not "nobody declared".
 gate_base_test_portability_declared() {
-  local store="$1" bead="$2" raw="" verdict=""
-  if [ -z "$store" ] || [ -z "$bead" ]; then printf 'unknown'; return 0; fi
+  gate_base_test_label_declared "${1-}" "${2-}" "teste:portabilidade-os"
+}
+
+# gate_base_test_label_declared <store> <bead-id> <label>  (ga-hlcfzx9; label as an argument: ga-4kykayr)
+#   The reader behind gate_base_test_portability_declared (teste:portabilidade-os) and
+#   gate_base_test_mutants_declared (teste:endurece-mutantes): the answers and the reasons
+#   for them are the ones documented on the first.
+gate_base_test_label_declared() {
+  local store="$1" bead="$2" label="$3" raw="" verdict=""
+  if [ -z "$store" ] || [ -z "$bead" ] || [ -z "$label" ]; then printf 'unknown'; return 0; fi
   # vazio → unknown (nothing to read); falhou/ilegível → unknown too, never "no"
   raw=$(bd -C "$store" show "$bead" --json 2>/dev/null) || { printf 'unknown'; return 0; }
   if [ -z "$raw" ]; then printf 'unknown'; return 0; fi
-  verdict=$(printf '%s' "$raw" | jq -r --arg b "$bead" '
+  verdict=$(printf '%s' "$raw" | jq -r --arg b "$bead" --arg l "$label" '
     (if type == "array" then .[0] else . end) as $x
     | if ($x | type) == "object" and (($x.id // "") == $b)
-      then (($x.labels // []) as $l
-            | if ($l | type) == "array" and ($l | all(type == "string"))
-              then (if ($l | index("teste:portabilidade-os")) != null then "yes" else "no" end)
+      then (($x.labels // []) as $ls
+            | if ($ls | type) == "array" and ($ls | all(type == "string"))
+              then (if ($ls | index($l)) != null then "yes" else "no" end)
               else error("labels is not a list of strings") end)
       else error("not this bead") end' 2>/dev/null) || { printf 'unknown'; return 0; }
   case "$verdict" in
@@ -3412,6 +3420,246 @@ gate_base_test_node_state() {
   fi
   if [ "$(gate_base_test_node_rc_class "$rc")" = "green" ]; then
     printf 'node-red'
+  else
+    printf 'unknown'
+  fi
+  return 0
+}
+
+# ── Mutant-hardening slices (ga-4kykayr) ───────────────────────────────────────
+# A slice of the hq-mutants lastro (origem:lastro-hq-mutants) only hardens a SELFTEST:
+# production code does not change, so the new selftest passes UNCHANGED against base —
+# which arm B reads as passou-na-base and refuses (ga-iu0fvlo, marker ga-1iur59y). The
+# honest question for such a slice is not "does it fail on base" but "does it catch a
+# BROKEN base": the lastro's own mutants are exactly that. Same design as the portability
+# repair above (Mayor, 2026-10-28), and for the same reason (the arm is never chosen by
+# bead id): the builder DECLARES, the gate MEASURES.
+#   * declared  — label teste:endurece-mutantes on the source bead
+#                 (gate_base_test_mutants_declared). It only says the measurement is worth
+#                 making; it approves nothing.
+#   * measured  — the mutants the source bead lists for that selftest (the lastro's own
+#                 list) are applied, one at a time, to a copy of base, and the BRANCH's
+#                 selftest is run against each, in the same sandbox as the pytest/js runs.
+#                 It must be GREEN with no mutant and RED with at least one
+#                 (gate_base_test_mutants_state).
+# Nothing here can approve by accident: every doubt (label unreadable, list absent or
+# unparsable, an id that no longer applies, no sandbox, the disk floor, a timeout, a
+# control run that is not green, a mutant that goes red once and green on the repeat)
+# lands in `unknown`, which the call site counts as unclassified (nao-consegui-medir —
+# never a refusal, never an approval). Only a COMPLETE measurement in which every
+# mutant applied, ran and stayed green is `survived` (-> passou-na-base, as always).
+#
+# Slice 1 of 2 (ga-4kykayr.1): this section only MEASURES. Nothing in the guard calls it
+# yet, so no verdict changes; the `matou-mutantes` verdict and the Step 5b-pre2 call site
+# that reads these answers arrive in slice 2 (ga-4kykayr.2). Until then `killed|survived|
+# unknown` below are the answers that call site will map, as written above.
+
+# gate_base_test_mutants_declared <store> <bead-id>  (ga-4kykayr)
+#   Did the builder declare, on the source bead, that this change hardens a selftest
+#   against the lastro's mutants? yes | no | unknown, exactly as
+#   gate_base_test_portability_declared answers for teste:portabilidade-os (a bead with
+#   no labels is "no"; a bead that cannot be read, or is not THIS bead, is "unknown").
+#   ALWAYS returns 0.
+gate_base_test_mutants_declared() {
+  gate_base_test_label_declared "${1-}" "${2-}" "teste:endurece-mutantes"
+}
+
+# gate_base_test_mutant_list <store> <bead-id> <selftest>  (ga-4kykayr)
+#   The lastro's mutants for ONE selftest, read from the SOURCE bead's description, which
+#   hetzner-ballast-newfail.py writes as
+#       ARQUIVO <production file> (N)
+#         L58 [num] 45 -> 46  id=0f90dfe6a4  (testes: <selftest>[,<selftest>...])
+#   <selftest> is HQ-relative (packs/town-deltas/assets/x.selftest.sh), the form `testes:`
+#   uses. Prints one line per mutant whose `testes:` names it, `<production file><TAB><id>`,
+#   in list order. ALWAYS returns 0.
+#   vazio → nothing printed (this selftest has no mutant in the list); falhou/ilegível →
+#   nothing printed too (bd failed, not JSON, not THIS bead, no description). The two are
+#   the same to the caller on purpose: both are "no list to measure against", which is
+#   `unknown`, never "no mutant survives". A line that does not have the shape above is
+#   skipped, never guessed at.
+gate_base_test_mutant_list() {
+  local store="${1-}" bead="${2-}" sel="${3-}" raw="" desc=""
+  if [ -z "$store" ] || [ -z "$bead" ] || [ -z "$sel" ]; then return 0; fi
+  raw=$(bd -C "$store" show "$bead" --json 2>/dev/null) || return 0
+  if [ -z "$raw" ]; then return 0; fi
+  desc=$(printf '%s' "$raw" | jq -r --arg b "$bead" '
+    (if type == "array" then .[0] else . end) as $x
+    | if ($x | type) == "object" and (($x.id // "") == $b) and (($x.description // "") | type) == "string"
+      then ($x.description // "") else empty end' 2>/dev/null) || return 0
+  if [ -z "$desc" ]; then return 0; fi
+  printf '%s\n' "$desc" | awk -v st="$sel" '
+    /^ARQUIVO / { subj = $2; next }
+    subj != "" && /^  L[0-9]+ / {
+      i = index($0, "  id="); j = index($0, "  (testes: ")
+      if (i == 0 || j == 0 || j < i) next
+      id = substr($0, i + 5, j - i - 5)
+      if (length(id) != 10 || id !~ /^[0-9a-f]+$/) next
+      lst = substr($0, j + 11); sub(/\)[ \t]*$/, "", lst)
+      n = split(lst, parts, ",")
+      for (k = 1; k <= n; k++) if (parts[k] == st) { print subj "\t" id; break }
+    }' 2>/dev/null || true
+  return 0
+}
+
+# gate_base_test_mutant_rc_class <rc>  (ga-4kykayr) — pure.
+#   What the status of ONE sandboxed selftest run (heavy-guard -> timeout -> sandbox-exec ->
+#   bash) means. Prints exactly one word:
+#     green    — 0.
+#     red      — 1..95 except heavy-guard's own 64 (usage), 75 (disk low), 76 (no reading of the
+#                disk / cap not settable), 78 (disk watch stopped it) and 79 (push lock): the
+#                selftest's own failure.
+#     unknown  — everything else: 96..99 (97 = gate_base_test_sandbox_exec could not run it
+#                safely), 124 (timeout: would it have failed or only needed longer?), 126/127
+#                (could not execute / not found — nothing says the test went red) and >=128
+#                (a signal), and anything that is not a plain integer.
+#   Stricter than gate_base_test_node_rc_class on 126/127 on purpose: that one has the node's
+#   green control to lean on for a command that exists on one OS only; a mutant run does not.
+gate_base_test_mutant_rc_class() {
+  local rc="${1-}"
+  case "$rc" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
+  rc=$(( 10#$rc ))
+  case "$rc" in
+    0) printf 'green' ;;
+    64|75|76|78|79) printf 'unknown' ;;
+    *) if [ "$rc" -le 95 ]; then printf 'red'; else printf 'unknown'; fi ;;
+  esac
+  return 0
+}
+
+# _gate_base_test_mutant_run <scratch> <cwd> <selftest>  (ga-4kykayr)
+#   One sandboxed run of <selftest> from <cwd>, through heavy-guard (the disk floor, the per-file
+#   write cap and the disk-drop watch that every selftest/mutant step runs under) and
+#   gate_base_test_sandbox_exec (no network, writes only under <scratch>, scrubbed env, budget
+#   GATE_ABT_MUT_TIMEOUT seconds, default 30 = the new-form budget). Prints gate_base_test_mutant_rc_class
+#   of its status. GATE_ABT_HEAVY_GUARD swaps the wrapper so the selftest can run without a disk
+#   reading; the guard itself never sets it. ALWAYS returns 0.
+_gate_base_test_mutant_run() {
+  local scratch="${1-}" cwd="${2-}" sel="${3-}" rc=0
+  local GATE_ABT_RUN_GUARD="${GATE_ABT_HEAVY_GUARD:-${GC_CITY:-}/scripts/heavy-guard.sh}"
+  local secs="${GATE_ABT_MUT_TIMEOUT:-30}"
+  case "$secs" in ''|*[!0-9]*|0) secs=30 ;; esac
+  # </dev/null: the caller reads its list from a here-document, and a selftest that reads stdin would eat it
+  gate_base_test_sandbox_exec "$scratch" "$secs" "$cwd" bash "$sel" </dev/null && rc=0 || rc=$?
+  gate_base_test_mutant_rc_class "$rc"
+  return 0
+}
+
+# gate_base_test_mutants_state <rig> <base> <tip> <worktree> <file> <store> <bead-id>  (ga-4kykayr)
+#   For a MODIFIED selftest whose old and new forms both passed on the mini and whose source bead
+#   declared teste:endurece-mutantes: does the BRANCH's copy catch a broken base? To be run by the
+#   Step 5b-pre2 loop (slice 2) only after those two conditions. Prints exactly one word and ALWAYS returns 0:
+#     killed    — with a mutant of production code applied to <worktree> (a checkout of base), the
+#                 branch's selftest went RED, TWICE, and the same selftest was GREEN with no mutant
+#                 in the same sandbox, same worktree, same siblings.
+#     survived  — a COMPLETE measurement: the list was read, none of it was cut by the cap or the
+#                 budget, every mutant applied and ran, and the selftest stayed green with ALL of
+#                 them. The selftest does not catch what the lastro says it should; stays refusable.
+#     unknown   — anything else (see the section header). Partial evidence only counts for
+#                 `killed`: one red mutant is a proof however many others were not run, but "none of
+#                 the ones I ran died" says nothing about the ones I did not.
+#   Order: mutants whose id the diff cites (commit messages base..tip, added lines of the selftest)
+#   first, then the rest in list order; GATE_ABT_MUT_MAX (default 40, the sweep's own --cap) of them;
+#   the whole measurement has GATE_ABT_MUT_BUDGET seconds (default 300). The first confirmed kill stops it.
+#   Containment: the mutated file only exists inside <worktree>, which the sandbox cannot write to
+#   (writes go to a scratch directory only); the pristine file is kept outside it and put back after
+#   every mutant. Mutants are produced by `hq-mutate.py apply` (GATE_ABT_MUTATE swaps the engine for
+#   the selftest), which refuses symlinks, the engine's own files and any text that cites sudo, pkill,
+#   docker... (see its APLICAR UM MUTANTE); a refusal is unknown. Side effect, deliberate: OVERWRITES
+#   <worktree>/<file> with the branch's copy and leaves the worktree otherwise as it found it.
+gate_base_test_mutants_state() {
+  local rig="${1-}" base="${2-}" tip="${3-}" wt="${4-}" f="${5-}" store="${6-}" bead="${7-}"
+  local sel="" hq="" mut="" py="" list="" cited="" ordered="" rest="" line="" subj="" id="" subjpath=""
+  local root="" scratch="" keep="" budget="" max="" t0="" total=0 tried=0 green=0 unk=0 killed=0 cls="" cls2="" arc=0 real_wt="" real_dir=""
+  case "$f" in
+    .gascity-gastown-hq/?*.selftest.sh) sel="${f#.gascity-gastown-hq/}" ;;
+    *) printf 'unknown'; return 0 ;;
+  esac
+  if [ -z "$rig" ] || [ -z "$base" ] || [ -z "$tip" ] || [ -z "$wt" ] || [ -z "$store" ] || [ -z "$bead" ]; then
+    printf 'unknown'; return 0
+  fi
+  hq="$wt/.gascity-gastown-hq"
+  mut="${GATE_ABT_MUTATE:-${GC_CITY:-}/scripts/hq-mutate.py}"
+  py=$(command -v python3 2>/dev/null) || py=""
+  if [ ! -f "$mut" ] || [ -z "$py" ] || [ ! -d "$hq" ]; then printf 'unknown'; return 0; fi
+  budget="${GATE_ABT_MUT_BUDGET:-300}"; case "$budget" in ''|*[!0-9]*|0) budget=300 ;; esac
+  max="${GATE_ABT_MUT_MAX:-40}";        case "$max" in ''|*[!0-9]*|0) max=40 ;; esac
+
+  # vazio → unknown (no list for this selftest); falhou/ilegível → unknown too
+  list=$(gate_base_test_mutant_list "$store" "$bead" "$sel")
+  if [ -z "$list" ]; then printf 'unknown'; return 0; fi
+  total=$(printf '%s\n' "$list" | grep -c .) || total=0
+
+  # what the diff cites, to try those first. vazio/falhou → nothing cited: list order, no harm.
+  cited=$( { git -C "$rig" log --format=%B "${base}..${tip}" 2>/dev/null || true
+             git -C "$rig" diff "${base}..${tip}" -- ":(top)$f" 2>/dev/null | grep '^+' || true ; } ) || cited=""
+  ordered=""; rest=""
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    id="${line#*$'\t'}"
+    case "$cited" in
+      *"$id"*) ordered="${ordered}${line}"$'\n' ;;
+      *)       rest="${rest}${line}"$'\n' ;;
+    esac
+  done <<GATE_ABT_MUT_LIST_EOF
+$list
+GATE_ABT_MUT_LIST_EOF
+  ordered="${ordered}${rest}"
+
+  root=$(mktemp -d "${TMPDIR:-/tmp}/gate-abt-mutants.XXXXXX" 2>/dev/null) || root=""
+  if [ -z "$root" ]; then printf 'unknown'; return 0; fi
+  root=$(cd "$root" 2>/dev/null && pwd -P) || root=""
+  if [ -z "$root" ]; then printf 'unknown'; return 0; fi
+  scratch="$root/scratch"; keep="$root/keep"
+  mkdir -p "$scratch" "$keep" 2>/dev/null || { rm -rf "$root" 2>/dev/null; printf 'unknown'; return 0; }
+  real_wt=$(cd "$wt" 2>/dev/null && pwd -P) || real_wt=""
+
+  # No sandbox, no run (the same rule as the pytest/js half). Then the branch's selftest, and the control.
+  if ! gate_base_test_sandbox_ok "$scratch" || [ -z "$real_wt" ] \
+     || ! git -C "$rig" show "${tip}:${f}" > "$wt/$f" 2>/dev/null; then
+    rm -rf "$root" 2>/dev/null; printf 'unknown'; return 0
+  fi
+  t0=$(date +%s)
+  cls=$(_gate_base_test_mutant_run "$scratch" "$hq" "$wt/$f")
+  if [ "$cls" != "green" ]; then rm -rf "$root" 2>/dev/null; printf 'unknown'; return 0; fi
+
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    if [ "$tried" -ge "$max" ] || [ $(( $(date +%s) - t0 )) -ge "$budget" ]; then break; fi
+    tried=$((tried + 1))
+    subj="${line%%$'\t'*}"; id="${line#*$'\t'}"
+    subjpath="$hq/$subj"
+    # a subject that is not a plain file INSIDE the worktree is never written to: the rewrite below follows symlinks
+    real_dir=$(cd "$(dirname "$subjpath")" 2>/dev/null && pwd -P) || real_dir=""
+    case "$real_dir/" in
+      "$real_wt"/*) ;;
+      *) unk=$((unk + 1)); continue ;;
+    esac
+    if [ ! -f "$subjpath" ] || [ -L "$subjpath" ]; then unk=$((unk + 1)); continue; fi
+    arc=0
+    "$py" -I "$mut" apply "$subjpath" --tree "$hq" --id "$id" --out "$keep/mutant" --also "$wt/$f" </dev/null >/dev/null 2>&1 || arc=$?
+    if [ "$arc" -ne 0 ] || [ ! -s "$keep/mutant" ]; then rm -f "$keep/mutant"; unk=$((unk + 1)); continue; fi
+    if ! cat "$subjpath" > "$keep/orig" 2>/dev/null; then rm -f "$keep/mutant"; unk=$((unk + 1)); continue; fi
+    cls=""; cls2=""
+    if cat "$keep/mutant" > "$subjpath" 2>/dev/null; then
+      cls=$(_gate_base_test_mutant_run "$scratch" "$hq" "$wt/$f")
+      if [ "$cls" = "red" ]; then cls2=$(_gate_base_test_mutant_run "$scratch" "$hq" "$wt/$f"); fi
+    fi
+    cat "$keep/orig" > "$subjpath" 2>/dev/null || { rm -rf "$root" 2>/dev/null; printf 'unknown'; return 0; }   # the worktree is not back as it was: nothing more is run from it
+    rm -f "$keep/mutant" "$keep/orig"
+    case "$cls:$cls2" in
+      red:red)     killed=1; break ;;
+      green:)      green=$((green + 1)) ;;
+      *)           unk=$((unk + 1)) ;;   # a first red that did not repeat is a flaky test, not a kill
+    esac
+  done <<GATE_ABT_MUT_ORDER_EOF
+$ordered
+GATE_ABT_MUT_ORDER_EOF
+  rm -rf "$root" 2>/dev/null
+
+  if [ "$killed" -eq 1 ]; then
+    printf 'killed'
+  elif [ "$unk" -eq 0 ] && [ "$tried" -eq "$total" ] && [ "$green" -eq "$total" ]; then
+    printf 'survived'
   else
     printf 'unknown'
   fi
@@ -3991,7 +4239,7 @@ gate_base_test_py_interp() {
 #   timeout return, so a caller cannot mistake "not run" for a result.
 #   <scratch>/plugin is put on PYTHONPATH (the pytest outcome plugin is copied there).
 gate_base_test_sandbox_exec() {
-  local scratch="${1-}" secs="${2-}" cwd="${3-}" real="" prof="" tbin="" rc=0
+  local scratch="${1-}" secs="${2-}" cwd="${3-}" real="" prof="" tbin="" rc=0 pre=()
   local sbx="${GATE_ABT_SANDBOX_EXEC:-/usr/bin/sandbox-exec}"
   shift 3 2>/dev/null || return 97
   if [ -z "$scratch" ] || [ ! -d "$scratch" ] || [ -z "$cwd" ] || [ ! -d "$cwd" ] || [ ! -x "$sbx" ] || [ "$#" -lt 1 ]; then
@@ -4003,12 +4251,19 @@ gate_base_test_sandbox_exec() {
   real=$(cd "$scratch" 2>/dev/null && pwd -P) || return 97
   prof=$(gate_base_test_sandbox_profile "$real" "${HOME:-}") || return 97
   tbin=$(_gate_base_test_timeout_bin) || return 97
+  # ga-4kykayr: a caller that runs MUTATED code sets GATE_ABT_RUN_GUARD (as a local of its own, so it never leaks to
+  # the pytest/js runs) to heavy-guard.sh: the run then goes through its disk floor, its per-file write cap and its
+  # disk-drop watch. A guard that was asked for and is not executable is "not run" (97), never a run without it.
+  if [ -n "${GATE_ABT_RUN_GUARD:-}" ]; then
+    [ -x "$GATE_ABT_RUN_GUARD" ] || return 97
+    pre=("$GATE_ABT_RUN_GUARD" --what selftest-gate-abt --max-file-mb 512 --)
+  fi
   mkdir -p "$real/home" "$real/tmp" "$real/plugin" 2>/dev/null || return 97
   # run.log is opened by THIS process (the redirect below), in a directory the previous sandboxed run could
   # write to: a test that left a symlink under that name would make the redirect truncate whatever it points
   # at. Removing the name first removes the link itself, never its target.
   rm -f "$real/run.log" 2>/dev/null || true
-  ( cd "$cwd" 2>/dev/null && exec "$tbin" -k 5 "$secs" env -i \
+  ( cd "$cwd" 2>/dev/null && exec ${pre[@]+"${pre[@]}"} "$tbin" -k 5 "$secs" env -i \
       PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin \
       HOME="$real/home" TMPDIR="$real/tmp" LANG=en_US.UTF-8 \
       PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$real/plugin" GATE_BT_OUTCOMES="$real/outcomes.jsonl" \

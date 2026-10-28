@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """hq-mutate.py — varredura de MUTANTES do código que os *.selftest.sh do hq cobrem (ga-2hd02v.5.6.2): o resultado que alguém lê é a lista de testes que NÃO pegam um bug.
 ## Contents
-  Por quê · Uso · Alvos · Operadores · Veredito · Teto de escrita · Estado · Códigos de saída
+  Por quê · Uso · Alvos · Operadores · Veredito · Teto de escrita · Estado · Aplicar um mutante (gate) · Códigos de saída
 POR QUÊ: um selftest verde com o código quebrado não prova nada. Trocar UM trecho do script (`-gt` por `-ge`, `&&` por `||`, `exit 1` por `exit 0`) e rodar a família de selftests dele diz se algum reprova; se nenhum
   reprova, o mutante SOBREVIVEU e o teste é fraco naquela linha. É CPU que o lastro do nó Hetzner gasta com nice 19 sem custo, e cada achado vira um bead (ga-2hd02v.5.6).
 USO: hq-mutate.py gen ARQUIVO [--tree HQ]                  imprime os candidatos (id, linha, operador, antes, depois), TAB; com --tree o id é o que o `sweep` grava (caminho relativo à árvore)
      hq-mutate.py plan  --tree HQ --state ARQ              imprime os alvos na ordem em que a varredura os pegaria (e por que pula os que pula)
+     hq-mutate.py apply ARQUIVO --tree HQ --id ID --out SAIDA [--also SELFTEST]...   grava em SAIDA o texto do ARQUIVO com UM mutante (ver APLICAR UM MUTANTE)
      hq-mutate.py sweep --tree HQ --state ARQ --work DIR --jail hq-sandbox-run.py [--budget-s N] [--slots N] [--cap N] [--targets N] [--fsize-mb N]
   A última linha do stdout do `sweep` é UM json: result (completo | parcial | sem-novidade | sem-cobertura | interrompido | sem-jaula | sem-alvos | estado-ilegivel | gravacao-falhou), contagens, skipped{motivo: n},
   survivors[] (até 15; `survivors_cortados` conta o resto). `sem-novidade` = tudo o que havia já estava coberto e igual; `sem-cobertura` = nada foi examinado. `nao_sei` = alvos em que o `bash -n` não decidiu; `falhas` = execuções
@@ -28,7 +29,11 @@ ESTADO (--state, json, trocado por arquivo temporário): por alvo o hash do cont
 TETO DO SLOT (ga-2d14tow): o teto por arquivo não pega o laço que grava MUITOS arquivos pequenos (cada um passa por baixo dele; 50 mil arquivos de 100 KB são 5 GB). Enquanto cada selftest da família roda, o motor mede o slot (`du -sk`) a cada 2 s e, se ele cresceu
   mais de --slot-mb MB (1024) desde a cópia da árvore, mata o grupo do filho: rc 153 (o mesmo do teto por arquivo) = mutante MORTO como qualquer rc != 0, nunca falha de infra; na baseline é baseline vermelha. Medida que não sai (du ausente, prazo, saída que não é número) não mata ninguém.
   NÃO coberto: escrita FORA do slot (a jaula real só deixa o slot; a falsa dos testes deixa) e o disco todo do nó.
-CÓDIGOS: 0 · 2 uso · 3 estado ilegível, árvore ilegível, sem alvos ou gravação que falhou · 97 jaula não provada · 143 interrompido (o estado já gravado vale).
+APLICAR UM MUTANTE (ga-4kykayr): o gate de submissão (quality-gate-guard.sh, braço B do A/B) precisa de UM mutante do lastro numa cópia da base para ver se o selftest do branch reprova com ele. `apply` não roda nada: lê o ARQUIVO, acha o candidato de id ID (o mesmo
+  id do sweep: o caminho entra relativo à --tree), confere que o texto mutado compila e grava só ele em SAIDA; quem chama o coloca onde quiser e o roda. Recusa (rc 6) o que o sweep também não muta: sujeito que passa por symlink dentro da árvore, arquivo do lastro, do
+  motor ou da jaula, selftest, e texto (do sujeito ou de um --also) que cita a DENYLIST de programas que agem sem rede e sem escrita (sudo, pkill, kill -1, docker, tmux, git push...). Fica de FORA daqui bd, gc e dolt de verdade (o sweep os recusa): quem chama roda o selftest
+  numa caixa sem rede, com HOME e escrita só no scratch, onde eles não alcançam nada. Id que não existe mais (o arquivo andou desde a última varredura: o id carrega a linha) é rc 4, nunca "outro mutante parecido".
+CÓDIGOS: 0 · 2 uso · 3 estado ilegível, árvore ilegível, sem alvos ou gravação que falhou · 97 jaula não provada · 143 interrompido (o estado já gravado vale). `apply`: 0 gravou · 3 não leu/não gravou · 4 id inexistente · 5 o mutante não compila (ou o bash não decidiu) · 6 recusado.
 """
 import argparse
 import hashlib
@@ -589,12 +594,60 @@ def sweep(a):
     return 143 if ctx.stop.is_set() else 3 if err else 0
 
 
+def apply(a):
+    """grava em --out o texto do arquivo com o mutante --id. 0 gravou · 3 não leio/não gravo · 4 id inexistente · 5 não compila · 6 recusado (symlink, arquivo do motor/lastro/selftest, denylist)"""
+    tree = os.path.abspath(a.tree)
+    parts = Path(os.path.relpath(os.path.abspath(a.file), tree)).parts
+    if not parts or parts[0] == "..":   # fora da árvore: o id não teria o que ser
+        print("hq-mutate: %s não está dentro de %s" % (a.file, a.tree), file=sys.stderr)
+        return 6
+    path = Path(tree)
+    for part in parts:   # só os elos de DENTRO da árvore: um /var -> /private/var antes dela não conta
+        path = path / part
+        if path.is_symlink():
+            print("hq-mutate: %s passa por symlink (%s): o sweep também não muta" % (a.file, part), file=sys.stderr)
+            return 6
+    if NOT_SUBJECT.search(path.name):
+        print("hq-mutate: %s não é sujeito (lastro, motor, jaula, selftest ou mutantes)" % path.name, file=sys.stderr)
+        return 6
+    try:
+        text, cands = candidates(path, "/".join(parts))
+        also = [Path(p).read_text(encoding="utf-8", errors="replace") for p in a.also]
+    except (OSError, ValueError, SyntaxError, tokenize.TokenError) as e:
+        print("hq-mutate: não leio %s (%s)" % (a.file, e), file=sys.stderr)
+        return 3
+    deny = re.compile(DENY).search("\n".join([text] + also))   # sem bd/gc/dolt de verdade: ver APLICAR UM MUTANTE
+    if deny:
+        print("hq-mutate: recusado, denylist:%s" % deny.group(0), file=sys.stderr)
+        return 6
+    m = next((c for c in cands if c["id"] == a.id), None)
+    if m is None:
+        print("hq-mutate: o id %s não existe em %s (o arquivo mudou desde a varredura?)" % (a.id, "/".join(parts)), file=sys.stderr)
+        return 4
+    mutated = text[:m["s"]] + m["new"] + text[m["e"]:]
+    if valid(path, mutated) is not True:   # False = não compila · None = não deu para saber: nos dois o mutante não vai a lugar nenhum
+        print("hq-mutate: o mutante %s não compila (ou o bash não decidiu)" % a.id, file=sys.stderr)
+        return 5
+    try:
+        Path(a.out).write_text(mutated, encoding="utf-8")
+    except OSError as e:
+        print("hq-mutate: não gravei %s (%s)" % (a.out, e), file=sys.stderr)
+        return 3
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="hq-mutate.py")
     sp = ap.add_subparsers(dest="cmd", required=True)
     g = sp.add_parser("gen")
     g.add_argument("file")
     g.add_argument("--tree")
+    ap_ = sp.add_parser("apply")
+    ap_.add_argument("file")
+    ap_.add_argument("--tree", required=True)
+    ap_.add_argument("--id", required=True)
+    ap_.add_argument("--out", required=True)
+    ap_.add_argument("--also", action="append", default=[])
     for name in ("plan", "sweep"):
         p = sp.add_parser(name)
         p.add_argument("--tree", required=True)
@@ -617,6 +670,8 @@ def main(argv=None):
             print("hq-mutate: não leio %s (%s)" % (a.file, e), file=sys.stderr)
             return 3
         return 0
+    if a.cmd == "apply":
+        return apply(a)
     if a.cmd == "plan":
         try:
             for t in make_plan(Path(a.tree).resolve(), load_state(a.state), git_recent(Path(a.tree).resolve())):

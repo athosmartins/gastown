@@ -41,6 +41,7 @@ packs/town-deltas/assets/gate-e11-diff-cap.selftest.sh
 packs/town-deltas/assets/gate-e5-second-reviewer.selftest.sh
 packs/town-deltas/assets/gate-fastlane.selftest.sh
 packs/town-deltas/assets/gate-guard-ab-base-test-check.selftest.sh
+packs/town-deltas/assets/gate-guard-ab-base-test-mutants.selftest.sh
 packs/town-deltas/assets/gate-guard-ab-base-test-pyjs.selftest.sh
 packs/town-deltas/assets/gate-guard-bash32-syntax-check.selftest.sh
 packs/town-deltas/assets/gate-lane-tally.selftest.sh
