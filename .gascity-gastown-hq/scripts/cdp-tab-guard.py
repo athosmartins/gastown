@@ -94,8 +94,8 @@ only after the footprint stays over the cap for 900 s (CHROME_CAP_GRACE_S = this
 idle window + ~5 min to close the tab), so this guard gets the first chance; >= 8192 MB for 180 s
 recycles without waiting the full grace. It reads none of this guard's files, by design: if
 IDLE_SEC changes, revisit that grace by hand. It stays the backstop for step 5: EXT_GRACE_S (120 s)
-at EXT_CEILING_MB (1536) acts long before its 4096 MB / 900 s, which then no longer fires for this
-leak should no longer reach its cap. (b) the MBP Chrome (:9223).
+at EXT_CEILING_MB (1536) acts long before its 4096 MB / 900 s, so the watchdog only fires for this
+leak when step 5 did not act (disarmed, capped for the hour, or a renderer that would not die). (b) the MBP Chrome (:9223).
 
 CONFIG (env, CDP_TAB_GUARD_*; garbage or non-positive numeric values fall back to the default so
 a typo can never lower the ceiling to 0; ACTION is armed only by an absent variable or exactly 1,
