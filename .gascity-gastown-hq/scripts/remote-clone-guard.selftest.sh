@@ -16,8 +16,9 @@
 #   verdade (`python3 -I <guarda> || exit 2`) sai 2 se o guarda trava, some ou tem erro de sintaxe (falha fechada), e 0 se libera · lex — o que o shell lê como TEXTO não vira operador nem
 #   some (subgrupos: lexq aspas e `\` · lexs redirecionamento sem alvo · lexe palavra vazia · lexd `$'…'`/`$"…"` · lexu aspa ou `\` que não fecha, também num comentário `#` · lexr `$( )` do alvo
 #   de redirecionamento · lexh heredoc/`<<<`/find · lexp os controles que NÃO bloqueiam) · dest — o lugar onde o git escreve vem como ARGUMENTO, sem -C (worktree remove ../outro,
-#   clone/init <outro>/x, checkout-index --prefix=…; subgrupos destb e destp).
-# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (125 mutantes); e
+#   clone/init <outro>/x, checkout-index --prefix=…; subgrupos destb e destp) · interp — o texto que um INTERPRETADOR (python -c, node -e, perl -e, ruby -e, awk) ou um pipe entrega a um
+#   shell roda: as 12 formas que só o cc-safety-net pegava (ga-tphd15o; subgrupos interpc código de interpretador, interpp pipe que um shell lê, interpe base64/rev/eval/printf -v).
+# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (180 mutantes); e
 #   contra um stub que só sai 0 (o servidor ANTES desta fatia: o hook do mini era `drop` e nada o substituía), quase tudo falha.
 # VARIÁVEIS: RCG_UNDER_TEST (guarda a testar) · RCG_ONLY (grupos, vírgula) · RCG_NO_MUTANTS=1
 set -u
@@ -607,6 +608,49 @@ git commit -m 'msg'"
   b 0 "ctx: controle — export GIT_DIR=<próprio>; git commit (atribuição certa)" "export GIT_DIR=$OWN/.git; git commit -m x"
 }
 
+g_interp() {  # ga-tphd15o (achado do ga-nkfwixz, cc-safety-net como oráculo): o texto que um INTERPRETADOR (python/node/perl/awk) ou um pipe entrega a um shell roda — as 12 formas que só o safety-net pegava
+  # As strings com os.system / shell=True abaixo são PAYLOADS DE TESTE de propósito: viram só o texto de um pedido que o guarda confere, nada aqui as executa.
+  local c g="git -C $OTH reset --hard" B R
+  B=$(python3 -c 'import base64,sys; print(base64.b64encode(sys.argv[1].encode()).decode())' "$g"); R=$(python3 -c 'import sys; print(sys.argv[1][::-1])' "$g")
+  if grp interpc interp; then
+  for c in "python3 -c \"import os; os.system('$g')\"" "python3 -c \"import subprocess; subprocess.run('$g', shell=True)\"" "node -e \"require('child_process').execSync('$g')\"" \
+           "perl -e 'system(\"$g\")'" "perl -e '\`$g\`'" "awk 'BEGIN{system(\"$g\")}'" "python3 -c \"import os; os.popen('$g')\"" "python3 -c \"import subprocess; subprocess.check_output('$g', shell=True)\"" \
+           "python3 -I -c \"import os; os.system('git -C ../other reset --hard')\"" "python3.12 -c \"import os; os.system('$g')\"" "node -e \"require('child_process').exec('$g')\"" "perl -e 'system \"$g\"'" \
+           "perl -e 'exec(\"$g\")'" "ruby -e 'system(\"$g\")'" "gawk 'BEGIN{\"$g\" | getline}'" "sudo -n python3 -c \"import os; os.system('$g')\"" "bash -c \"python3 -c \\\"import os; os.system('$g')\\\"\"" \
+           "python3 -c \"import os; os.chdir('$OTH'); os.system('git commit -m x')\"" "node -e \"require('child_process').execSync('git commit -m x', {cwd: '$OTH'})\"" "perl -e 'qx{$g}'" "perl -e 'system(qq{$g})'" "ruby -e '%x($g)'" "ruby -e '%x{$g}'"; do
+    b 2 "interp: o texto entre aspas do código roda num shell: $c" "$c"
+  done
+  for c in "python3 -c \"import os; os.system('git -C $OWN commit -m x')\"" "python3 -c \"import os; os.system('git commit -m x')\"" "python3 -c \"import os; os.system('git -C $OTH log')\"" \
+           "python3 -c \"print('use git -C $OTH commit to write')\"" "python3 -c \"import json,sys; print(json.load(sys.stdin))\"" "awk '{print \$1}'" "perl -pe 's/a b/c d/'" "node -e \"console.log(1+1)\"" \
+           "perl -e 'system(\"git -C $OWN commit -m x\")'" "awk 'BEGIN{system(\"git status\")}'" "python3 -c \"import os; os.chdir('$OWN'); os.system('git -C $OWN commit -m x')\"" "python3 $T/tool.py --msg ok" "perl -e 'qx{git -C $OWN commit -m x}'" \
+           "python3 -c \"import json; print(json.dumps({'cwd': '$OWN', 'command': 'git checkout --detach abc'}))\""; do
+    b 0 "pass: interp: código de interpretador que não escreve no alheio: $c" "$c"
+  done
+  fi
+  if grp interpp interp; then
+  for c in "echo '$g' | sh" "printf '%s\\n' '$g' | bash -s" "echo $g | sh" "echo \"$g\" | bash" "printf 'cd %s && git reset --hard\\n' $OTH | sh" "printf '%s\\n' 'cd $OTH' 'git reset --hard' | bash" \
+           "echo -e 'cd $OTH\\ngit reset --hard' | sh" "printf -- '%s\\n' '$g' | sh" "LC_ALL=C command echo '$g' | sh" "echo '$g' | sudo -n bash -s" "echo '$g' |& sh" "true && echo '$g' | sh -x" "echo '$g' | zsh" "echo 'git -C ../other reset --hard' | sh" "echo '$g' | cat | sh" "echo '$g' | tee $T/o | sh" "echo '$g' | cat -u | bash -s" "cat <<< '$g' | sh" "cat <<< \"$g\" | bash -s" "rev <<< '$R' | sh" "c='$g'; cat <<< \"\$c\" | sh" \
+           "f() { echo '$g' | sh; }; f" "case x in x) echo '$g' | sh;; esac" "( echo '$g' | sh )" "x=\$(echo '$g' | sh)" "if true; then echo '$g' | sh; fi"; do
+    b 2 "interp: o texto que um pipe entrega a um shell roda: $c" "$c"
+  done
+  for c in "echo '$g' | cat" "echo '$g' | wc -l" "echo '$g' > $T/out" "printf '%s\\n' '$g' | tee $T/out" "echo 'git -C $OWN commit -m x' | sh" "echo '$g' | sh -c 'cat'" "echo 'git -C $OTH log' | sh" \
+           "echo hello | sh" "echo '$g' | bash -c 'git -C $OWN log'" "echo 'git commit -m x' | sh" "echo '$g' | cat $T/f | sh" "f() { echo 'git -C $OWN commit -m x' | sh; }; f" "cat <<< '$g' | cat" "cat <<< 'git -C $OWN commit -m x' | sh"; do
+    b 0 "pass: interp: pipe que não entrega o texto a um shell, ou texto que não escreve no alheio: $c" "$c"
+  done
+  fi
+  if grp interpe interp; then
+  for c in "eval \"\$(echo $B | base64 -d)\"" "echo $B | base64 -d | sh" "eval \"\$(echo '$R' | rev)\"" "printf -v c '%s' '$g'; eval \"\$c\"" "eval \$(echo $B | base64 --decode)" "echo $B | base64 -D | bash" \
+           "echo '$R' | rev | sh" "base64 -d <<< $B | sh" "eval \$(echo '$R' | rev)" "printf -v c '%s' '$g'; eval \$c" "printf -v c '%s' '$g'; eval \"\${c}\"" "false || printf -v c '%s' '$g'; eval \"\$c\"" \
+           "printf -v c 'git -C %s reset --hard' $OTH; eval \"\$c\"" "c='$g'; eval \"\$c\"" "export c='$g'; eval \$c" \
+           "c='$g'; echo \"\$c\" | sh" "c='$g'; printf '%s\\n' \"\$c\" | bash -s" "b=$B; echo \$b | base64 -d | sh" "echo \"\$(echo $B | base64 -d)\" | sh" "c='$g'; eval \"\$(echo \"\$c\")\""; do
+    b 2 "interp: texto codificado ou guardado em variável que o eval ou o shell roda: $c" "$c"
+  done
+  for c in "echo $B | base64 -d" "echo $B | base64 -d > $T/out" "eval \"\$(echo $B | base64 -d | wc -c)\"" "eval \"\$(echo $B | base64 -d > $T/out)\"" "echo '$R' | rev" "printf -v c '%s' '$g'; echo \"\$c\"" "printf -v c '%s' 'git -C $OWN commit -m x'; eval \"\$c\"" \
+           "eval \"\$(echo hello)\"" "eval \"\$(ssh-agent -s)\"" "eval \"\$(echo '$g' | wc -c)\"" "printf -v c '%s' hello; eval \"\$c\"" "eval \"\$d\"" "c='git -C $OWN log'; eval \"\$c\"" "printf -v c '%s' '$g'; c=ok; eval \"\$c\"" "c='git -C $OWN commit -m x'; echo \"\$c\" | sh" "echo \"\$d\" | sh" "c='$g'; echo \"\$c\" | cat"; do
+    b 0 "pass: interp: codificado ou em variável, mas que não vira escrita no alheio: $c" "$c"
+  done
+  fi
+}
 g_fuzz() {  # fuzzer diferencial (gate ga-36d3ic, sugestão do revisor): o bash REAL com um git falso que registra onde escreveria é a verdade; o guarda
   # tem de bloquear toda escrita no alheio. Semente fixa (reproduzível). RCG_FUZZ_N muda o tamanho (padrão 200).
   cat > "$T/fuzz.py" <<'FUZZEOF'
@@ -825,7 +869,7 @@ g_hook() {  # o comando que vai no settings do servidor
   c="python3-que-nao-existe -I $P || exit 2"; sh -c "$c" <<<"$js" >/dev/null 2>&1; [ $? = 2 ]; ok $? "hook: python ausente (127) vira 2"
 }
 
-all() { group block && g_block; group pass && g_pass; group evade && g_evade; group closed && g_closed; group shell && g_shell; group wrap && g_wrap; g_lex; g_dest; group cfg && g_cfg; group tools && g_tools; group msg && g_msg; group cond && g_cond; group ctx && g_ctx; group fuzz && g_fuzz
+all() { group block && g_block; group pass && g_pass; group evade && g_evade; group closed && g_closed; group shell && g_shell; group wrap && g_wrap; g_lex; g_dest; group cfg && g_cfg; group tools && g_tools; group msg && g_msg; group cond && g_cond; group ctx && g_ctx; g_interp; group fuzz && g_fuzz
         group check && g_check; group hook && g_hook; return 0; }
 
 if [ -n "${RCG_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
@@ -857,7 +901,7 @@ echo "== $((n-fails))/$n ok =="
   mutant cond "cd em padrão de case ou com ;; segue mudando o diretório" 's/            if kw or wrapped or ext or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;")/            if kw or wrapped or ext or prev in ("||", "|", "|\&") or term in ("|", "|\&", "\&")/'
   mutant cond "{ cd a; } & mantém o diretório do grupo em background" 's/^\( *\)if term == "&":$/\1if False:/'
   mutant evade "bash -c não é aberto" 's/return sub(script\[0\], cwd, env)/pass/'
-  mutant evade "eval não é aberto" 's/return sub(" ".join(seg\[1:\]), cwd, env)/pass/'
+  mutant evade "eval não é aberto" 's/return sub(" ".join(reveal(seg\[1:\], {\*\*st\["env"\], \*\*env})), cwd, env)/pass/'
   mutant evade "\$( ) não é aberto" 's/r = sub(bytes.fromhex(m.group(1)).decode(), st\["cwd"\], {})/r = None/'
   mutant evade "crase não vira \$( )" 's/(cmd.startswith("\$(", k) or cmd\[k\] == "`")/cmd.startswith("$(", k)/'
   mutant evade "parêntese dentro do \$( ) não é contado" 's/            d += 1 if c == "(" else -1/            d -= 1/'
@@ -980,9 +1024,49 @@ echo "== $((n-fails))/$n ok =="
   mutant check "selfcheck ignora campo extra do hook (if, async…)" 's/ and set(h) <= {"type", "command", "timeout"}//'
   mutant check "selfcheck ignora campo extra do grupo" 's/ and set(g) <= {"matcher", "hooks"}//'
   mutant check "selfcheck não exige type=command" 's/ and h.get("type") == "command"//'
+  mutant interpc "python -c deixa de ser interpretador" 's/^INTERP = re.compile(r"(?:python|pypy|perl|ruby)/INTERP = re.compile(r"(?:pypy|perl|ruby)/'
+  mutant interpc "node -e deixa de ser interpretador" 's/|node(?:js)?|/|/'
+  mutant interpc "perl -e deixa de ser interpretador" 's/|perl|ruby)/|ruby)/'
+  mutant interpc "ruby -e deixa de ser interpretador" 's/|perl|ruby)/|perl)/'
+  mutant interpc "awk deixa de ser interpretador" 's/|\[gmn\]?awk"/"/'
+  mutant interpc "o código de nenhum interpretador é aberto" 's/        elif INTERP.fullmatch(c):/        elif False:/'
+  mutant interpc "o literal entre aspas do código não é conferido sozinho (perl system \"…\" sem parêntese, getline do awk)" 's/for text in \[t\] + \[next(filter(None, g), "") for g in LIT.findall(t)\]:/for text in [t]:/'
+  mutant interpc "o código inteiro não é conferido como shell (a crase do perl)" 's/for text in \[t\] + \[next(filter(None, g), "") for g in LIT.findall(t)\]:/for text in [next(filter(None, g), "") for g in LIT.findall(t)]:/'
+  mutant interpc "chdir/cwd no código não deixa o diretório \"não sei\"" 's/^CODECD = re.compile(r"chdir|\\bcwd\\s\*\[=:\]")/CODECD = re.compile(r"(?!)")/'
+  mutant interpc "a chave 'cwd' de um JSON vale como a opção cwd= (falso positivo no próprio clone)" 's/^CODECD = re.compile(r"chdir|\\bcwd\\s\*\[=:\]")/CODECD = re.compile(r"chdir|\\bcwd\\b")/'
+  mutant interpc "o shell aberto pelo código nunca sabe o diretório (falso positivo no próprio clone)" 's/cw = None if CODECD.search(" ".join(seg)) else cwd/cw = None/'
+  mutant interpp "shell sem -c não lê o texto do pipe (nem o que está em corpo de função)" 's/ else seg + \["-c", flow\]/ else seg/'
+  mutant interpp "o texto de um trecho não segue para o próximo do pipe" 's/flow, hs = printed(seg, flow if hs is None else hs, st\["env"\]) if pc in PIPES else None, None/flow, hs = None, None/'
+  mutant interpp "o trecho não recebe o que o anterior imprime" 's/r = one(pipefed(seg, flow), False, prev, pc)/r = one(seg, False, prev, pc)/'
+  mutant interpp "|& não liga trechos" 's/^PIPES, VAR = ("|", "|&"),/PIPES, VAR = ("|",),/'
+  mutant interpp,interpe "o texto de um here-string não é guardado" 's/            hs = reveal(\[tok\], st\["env"\])\[0\] if herestr else hs/            pass/'
+  mutant interpp,interpe "o here-string não vira o stdin do produtor do pipe" 's/printed(seg, flow if hs is None else hs, st\["env"\])/printed(seg, flow, st["env"])/'
+  mutant interpp "echo não é lido" 's/^    if c == "echo":/    if False:/'
+  mutant interpp "echo -e não decodifica os escapes" 's/if "e" in fl else/if False else/'
+  mutant interpp,interpe "printf não é lido" 's/^    if c == "printf" and a:/    if False:/'
+  mutant interpp "printf reaproveita o formato só uma vez" 's/range(0, max(len(a) - 1, 1) if n else 1, n or 1)/range(0, 1)/'
+  mutant interpp "printf -- não é pulado" 's/^    a = a\[1:\] if c == "printf" and a\[:1\] == \["--"\] else a/    a = a/'
+  mutant interpp "VAR=x e command antes do echo escondem o produtor do pipe" 's/^    _, s, _, opq = peel(seg)$/    s, opq = seg, False/'
+  mutant interpc "qx{…} e q{…}/qq{…} do perl deixam de ser literais" 's/(?:\\bq\[qx\]?|%x)/(?:%x)/'
+  mutant interpc "%x(…) do ruby deixa de ser literal" 's/(?:\\bq\[qx\]?|%x)/(?:\\bq[qx]?)/'
+  mutant interpp "tee não repassa o stdin" 's/(c == "tee" or c == "cat"/(c == "tee1" or c == "cat"/'
+  mutant interpp "cat sem arquivo não repassa o stdin" 's/ or c == "cat" and all(/ or c == "cat1" and all(/'
+  mutant interpp "cat com arquivo repassa o stdin (lê o arquivo, não o pipe)" 's/all(x\[:1\] == "-" for x in a)/True/'
+  mutant interpe "echo e printf não revelam variável nem \$( ) nos argumentos" 's/a = reveal(a, env) if c in ("echo", "printf") else a/a = a/'
+  mutant interpe "base64 -d só vale com -d (não --decode nem -D)" 's/{"-d", "--decode", "-D"}/{"-d"}/'
+  mutant interpe "base64 -d não decodifica" 's/c == "base64"/c == "base65"/'
+  mutant interpe "rev não inverte" 's/ and c == "rev" else None/ and False else None/'
+  mutant interpe "pipeline dentro do \$( ) não é lido" 's/        elif tok in PIPES:/        elif False:/'
+  mutant interpe "outro operador dentro do \$( ) (>, ;…) vale como pipeline simples" '/elif tok in PIPES:/,/return flow/ s/            return None/            pass/'
+  mutant interpe "o eval não revela o \$( ) que só imprime texto" 's/t = pipe_out(bytes.fromhex(m.group(1)).decode(), env) if m else/t = None if m else/'
+  mutant interpe "o eval não revela a variável que guardo" 's/ else env.get(v.group(1) or v.group(2)) if v else None/ else None/'
+  mutant interpe "o eval volta a ver só o texto da palavra" 's/return sub(" ".join(reveal(seg\[1:\], {\*\*st\["env"\], \*\*env})), cwd, env)/return sub(" ".join(seg[1:]), cwd, env)/'
+  mutant interpe "o eval revela só as variáveis do próprio comando, não as do shell" 's/reveal(seg\[1:\], {\*\*st\["env"\], \*\*env})/reveal(seg[1:], env)/'
+  mutant interpe "printf -v NOME não guarda o texto" 's/        elif c == "printf" and seg\[1:2\] == \["-v"\] and len(seg) > 3:/        elif False:/'
+  mutant interpe "printf -v guarda sempre \"não sei\"" 's/st\["env"\]\[seg\[2\]\] = "\$?" if t is None else t/st["env"][seg[2]] = "$?"/'
   echo "-- contra um stub que só sai 0 (o servidor ANTES desta fatia)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"; printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$T/stub.py"
-  r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,shell,wrap,lex,dest,cfg,tools,msg,check,cond" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"
+  r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,shell,wrap,lex,dest,cfg,tools,msg,check,cond,interp" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"
   case "$r" in "RESULT 0/"*|"") ok 1 "stub deveria falhar quase tudo ($r)";; *) ok 0 "stub falha os casos ($r)";; esac
   echo "== final: $((n-fails))/$n ok =="
 }
