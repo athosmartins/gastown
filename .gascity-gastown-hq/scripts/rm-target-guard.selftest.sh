@@ -15,7 +15,7 @@ H = os.path.realpath(tempfile.mkdtemp(prefix="rmtgst."))  # HOME de teste: fica 
 S = os.path.realpath(tempfile.mkdtemp(prefix="rmtgsc."))  # scratch de verdade, fora do HOME
 for d in (".dolt-data/ga/.dolt/noms", ".beads", "proj/.git/objects", "proj/.git/refs", "proj/src", "proj/build", "proj/node_modules/p", "proj/__pycache__", "proj2/.git/objects", "proj2/.git/refs", "gt-remote/keys", "gt-remote/git/gascity/repo.git/objects",
           "gt-remote/git/gascity/repo.git/refs", "gt-remote/git/gascity/wt/s1/src", ".cache/pip", "Library/CloudStorage/d", "gt/rig/shared/data", "gt/rig/crew/bob", "gt/rig/.gc-worktrees/w", "bin",
-          "gt-remote/big/zrepo/.git"):
+          "gt-remote/big/zrepo/.git", "work2/open", "work2/locked", "work2/xonly", "work2/rdonly"):
     os.makedirs(f"{H}/{d}")
 for f in ("notes.txt", "proj/src/a.py", "proj/src/m.pyc", "proj/build/x.o", "proj/.git/HEAD", "proj/.git/index.lock", "proj/.git/config", "proj2/.git/HEAD", "gt-remote/keys/gt_mirror", "gt-remote/git/gascity/repo.git/HEAD",
           "gt-remote/git/gascity/wt/s1/.git", "gt-remote/git/gascity/wt/s1/src/a", ".dolt-data/ga/.dolt/noms/manifest", ".beads/b", ".cache/pip/w", "gt/rig/crew/bob/x.py", "proj/__pycache__/m.pyc"):
@@ -27,6 +27,8 @@ for d in ("work/a", "work/b", "work/.git", "srepo/.git", "srepo/src", "many"):
 for i in range(5):
     open(f"{S}/many/f{i}", "w").write("x")
 os.symlink(f"{H}/proj/.git", f"{S}/lnkgit"); os.symlink(f"{S}/work", f"{S}/lnkok")
+os.chmod(f"{H}/work2/locked", 0); os.chmod(f"{H}/work2/xonly", 0o100); os.chmod(f"{H}/work2/rdonly", 0o400)
+DENIES = not os.access(f"{H}/work2/locked", os.R_OK | os.X_OK) and not os.access(f"{H}/work2/xonly", os.R_OK) and not os.access(f"{H}/work2/rdonly", os.X_OK)  # root (ou FS sem modo) lê tudo: sem negação não há o que provar
 os.environ["HOME"] = H
 CWD = f"{H}/proj"
 CWDS = {"s": f"{S}/work", "b": f"{H}/proj/build", "p": f"{S}/work/a", "h": H, "z": "/zzh/a/b"}  # z = HOME sintético fundo e vazio (/zzh/a/b): sem repo por perto para esconder as regras de HOME
@@ -91,8 +93,18 @@ B find @H/proj -name '*.lock' -delete ‖ B find @H/proj -path '*/objects/*' -de
 B node -e "require('fs').unlinkSync('@H/.dolt-data/ga/x')" ‖ B python3 -c "import shutil; d='@H/gt-remote'; shutil.rmtree(d)" ‖ P python3 -c "import shutil; d='@S/work'; shutil.rmtree(d)" ‖ B unlink @H/*/*/*/.dolt/x ‖ P rm -f @S/*/*/*/x ‖ P python3 -c "l=[1]; l.remove(1); open('@H/gt-remote/x')"
 B rm -rf /zzroot ‖ B:z rm -rf /zzh/a ‖ B:z rm -rf /zzh/a/b ‖ B:z rm -rf /zzh/a/b/c ‖ P:z rm -rf /zzh/a/b/c/d ‖ B:z rm -rf ~ ‖ B:z rm -rf ~/x ‖ P for d in @S/work/a; do rm -rf "$d"; done ‖ P R=ls; $R -la ~ ‖ B rm -f @H/proj/.gi*/HEAD ‖ B rimraf ~/gt ‖ B popd; rm -rf node_modules
 B find @H/proj -regex '.*\w.*' -delete ‖ B rm -f @H/proj/.gi{t,x}/HEAD
+B fish -c 'rm -rf ~/gt-remote' ‖ B tcsh -c 'rm -rf ~/gt-remote' ‖ B pypy3 -c "import shutil; shutil.rmtree('@H/gt-remote')" ‖ B Rscript -e 'unlink("@H/gt-remote", recursive=TRUE)' ‖ B julia -e 'rm("@H/gt-remote", recursive=true)' ‖ B osascript -e 'do shell script "rm -rf ~/gt-remote"' ‖ B xonsh -c 'rm -rf ~/gt-remote' ‖ B echo 'rm -rf ~/gt-remote' | fish ‖ P git -c core.editor=true commit -m 'rm -rf ~' ‖ P cut -c1-5 notes.txt ‖ P xonsh -c 'ls ~' ‖ P echo "rm -rf ~/gt-remote" ‖ P grep -e 'rm -rf ~' notes.txt
+B rm -rf ~/gt/rig/shared ‖ B rm -r ~/gt/rig/shared/ ‖ B find ~/gt/rig/shared -delete ‖ B rm -rf ~/gt/rig/sha* ‖ B rm -rf ~/gt/rig/s* ‖ B rm -rf ~/gt/rig/shared/data/../../shared ‖ B rm -rf ~/gt/rig ‖ B find ~/gt/rig -delete ‖ B find ~/gt/rig/shared -name '*.db' -delete ‖ B find ~/gt/rig -name '*.pyc' -delete ‖ P rm -f ~/gt/rig/shared ‖ P rm ~/gt/rig/shared/note.txt ‖ P rm -rf ~/gt/rig/shared/note.txt ‖ P rm -rf ~/gt/rig/zz
+B HOME=/tmp/x rm -rf $HOME/gt-remote ‖ B D=~/gt-remote; D=/tmp/ok rm -rf $D ‖ B D=~/gt-remote; D=/tmp/ok true; rm -rf $D ‖ B D=~/gt-remote; (D=/tmp/ok); rm -rf "$D" ‖ B D=~/gt-remote; D=/tmp/ok | cat; rm -rf "$D" ‖ B D=~/gt-remote; true && (D=/tmp/ok; true); rm -rf "$D" ‖ B D=~/gt-remote; f() { D=/tmp/ok; }; rm -rf "$D" ‖ B D=~/gt-remote; env D=/tmp/ok rm -rf $D
+B D=/tmp/ok; read D <<< ~/gt-remote; rm -rf $D ‖ B D=/tmp/ok; eval "D=$HOME/gt-remote"; rm -rf $D ‖ B D=/tmp/ok; printf -v D %s ~/gt-remote; rm -rf $D ‖ B D=~/gt-remote; false && D=/tmp/ok; rm -rf $D ‖ B D=~/gt-remote; if false; then D=/tmp/ok; fi; rm -rf $D ‖ B D=~/gt-remote; if false; then D=/tmp/ok; else rm -rf $D; fi ‖ B D=~/gt-remote; case x in y) D=/tmp/ok;; esac; rm -rf $D
+B D=/tmp/ok; for i in 1 2; do rm -rf $D; D=~/gt-remote; done ‖ B D=/tmp/ok; f() { rm -rf $D; }; D=~/gt-remote; f ‖ B D=/tmp/ok; echo ~/gt-remote | while read D; do rm -rf $D; done ‖ B D=@H/proj/.gi; D+=t; rm -rf $D ‖ B D=@H; D+=/gt-remote; rm -rf $D ‖ B D=@S/work; source ./e.sh; rm -rf $D ‖ B D=@S/work; mapfile -t D < l; rm -rf $D ‖ B function f { D=~/gt-remote; }; D=/tmp/ok; f; rm -rf $D ‖ B f() { D=~/gt-remote; }; D=/tmp/ok; f; rm -rf $D ‖ B D=~/gt-remote; function f { D=/tmp/ok; }; rm -rf $D
+P D=~/gt-remote; D=@S/work; rm -rf $D ‖ P D=@S/work; D=@H/gt-remote rm -rf $D ‖ P (D=@S/work; rm -rf $D) ‖ P D=@S/work; D=@S/work/a rm -rf $D ‖ P D=@S/work; true && D=@S/work/a; rm -rf $D ‖ P for f in a b; do T=@S/work/$f; rm -rf "$T"; done ‖ P D=@S/work; if true; then D=@S/work/a; fi; rm -rf $D ‖ P f() { D=@S/work; rm -rf $D; }; f ‖ P D=@S/work; for f in a b; do rm -rf $D/$f; done ‖ P rm -rf @H/work2/open
+B D="/tmp/ok $HOME/gt-remote"; rm -rf $D ‖ B D="@S/work $HOME/gt-remote"; rm -rf $D ‖ B T="@S/work $HOME/gt-remote"; for t in $T; do rm -rf "$t"; done ‖ B C='rm -rf @H/gt-remote'; $C ‖ B C='rm -rf @H/gt-remote'; eval "$C" ‖ B C='rm -rf @H/gt-remote'; bash -c "$C" ‖ B C='rm -rf @H/gt-remote'; sh -c "$C" ‖ B for C in 'ls' 'rm -rf @H/gt-remote'; do $C; done ‖ P D="@S/work @S/work/a"; rm -rf $D ‖ P C='ls -la'; $C
+B rm -rf ~/.dolt-dat{a..a}/ga ‖ B rm -rf ~/proj/.g{i..i}t ‖ B echo ~/gt-remote | xargs -J % rm -rf % ‖ B echo ~/gt-remote | xargs -S 100 rm -rf ‖ B echo ~/gt-remote | xargs -R 1 rm -rf ‖ B sudo -s 'rm -rf ~/gt-remote' ‖ B sudo -u bob -i rm -rf ~/gt-remote ‖ B doas -s 'rm -rf ~/gt-remote' ‖ P sudo -s 'ls ~'
+B true && C='rm -rf @H/proj2'; $C ‖ B C='rm -r -f @H/gt-remote/git/gas*'; $C ‖ B C='unlink @H/.dolt-data/ga/.dolt/noms/man*'; bash -c "$C" ‖ B true && C='rm @H/proj2'; eval "$C" ‖ B true && R=rm; $R @H/proj2 ‖ P D=@S/work; true && C='rm -rf @S/work/a'; $C ‖ P C='/bin/r? -rf @S/work/a'; $C ‖ B time D=@H/proj/.git/HEAD; f() { D=/tmp/ok; }; unlink "$D" ‖ B time C='shred @H/proj2'; $C ‖ P D=@S/work; env D=@H/proj2; rm -rf "$D" ‖ P D=@S/work; command D=@H/proj2; rm -rf "$D" ‖ B D=@H/proj2; env A=1; rm -f "$D" ‖ B echo ~/proj2 | while read D; do rm -f "$D"; done ‖ B true && echo @H/gt-remote/git | while read D; do rmdir "$D"; done ‖ B echo ../proj2 | while read D; do shred "$D"; done ‖ P echo @S/work | while read D; do rm "$D"; done ‖ B echo @H/.beads/{b,zz} | while read D; do rmdir "$D"; done ‖ B rm @H/pro{j..j} ‖ B shred @H/gt-remote/git/gascity/wt/s{1..1} ‖ B rm @H/gt-remote/git/gascity/wt/s{0..1} ‖ B rm @H/proj/.gi{t..t}/HEAD ‖ P rm @H/proj/build/x.{o..o} ‖ B T='@S/work @H/proj/.git/x.p{y..y}'; for t in $T; do rm "$t"; done ‖ B printf -v D %s @H/proj2; unlink "$D" ‖ P printf -v D %s @S/work; D=@H/proj2 true; unlink "$D" ‖ B D=@H/proj2; false && read D <<< @S/work; unlink "$D" ‖ B D='@H/proj/.git/x{1..100}'; rm "$D" ‖ B D='@H/proj/.git/x{1..100}'; rm $D ‖ P D='@S/work/x{1..100}'; rm "$D" ‖ B true && C='shred @H/proj/.git/index.loc{k..k}'; $C ‖ B C='rm @H/proj/.git/index.loc{k..k}'; $C ‖ B select d in @H/proj2 x; do unlink "$d"; done ‖ P select d in @S/work x; do unlink "$d"; done ‖ B D=@H/proj2 bash -c 'rm "$D"' ‖ P D=@S/work bash -c 'rm "$D"' ‖ B D=@H/proj2; { D=@S/work; } | cat; unlink "$D" ‖ P D=@S/work; { D=@S/work/a; }; rm -rf "$D" ‖ B D=@H/proj2; echo ${D:=@S/work} | cat; unlink "$D" ‖ B D=@S/work; while true; do unlink "$D"; D=@H/proj2; done ‖ P D=@S/work; while true; do unlink "$D"; D=@S/work/a; done ‖ B n=D; D=@S/work; read "$n" <<< @H/proj2; rm -rf "$D" ‖ B D=@H/proj/; rm "${D%/}/.git/HEAD" ‖ B D=@H/proj/.git/HEAD.bak; unlink "${D%.bak}" ‖ B unlink "${U:-@H/proj/.git/HEAD}" ‖ B D=@H/proj/.git/HEAD; unlink "${D:-@S/work}" ‖ B D=xx@H/proj/.git/HEAD; unlink "${D#xx}" ‖ B D=@H/proj/.git/zz; unlink "${D/zz/HEAD}" ‖ B D=@H/proj/.git/HEAD; rm ${D%%/zz} ‖ P D=@S/work/a; rm "${D%/a}/b" ‖ P unlink "${U:-@S/work}" ‖ B D=@S/work; unlink "${D:+@H/proj/.git/HEAD}"
+B time f() { D=@H/proj/.git/HEAD; }; D=/tmp/ok; f; unlink "$D" ‖ B ! f() { D=@H/proj/.git/HEAD; }; D=/tmp/ok; f; unlink "$D" ‖ B time -p f() { D=@H/proj/.git/HEAD; }; D=/tmp/ok; f; unlink "$D" ‖ P time f() { echo hi; }; f; unlink @S/work/a ‖ B D+=/gascity; shred "$D" ‖ B unset D; D+=/gascity; shred "$D" ‖ B nohup D=@S/work; D+=/gascity; shred "$D" ‖ P D=@S/work; D+=/a; unlink "$D" ‖ P D+=@S/work/a; unlink "$D" ‖ B D=@H/proj/.git.bak; rm -rf "${D%.bak}" ‖ P D=@H/proj/.git.bak; rm -rf "$D" ‖ B D=@H/proj/.git.bak.bak; rm -rf "${D%%.bak*}" ‖ P D=@H/proj/.git.bak.bak; rm -rf "${D%.bak}" ‖ B D=xx@H/proj2; rm -rf "${D#xx}" ‖ P D=xx@H/proj2; rm -rf "$D" ‖ B D=ab@H/proj2; rm -rf "${D##a?}" ‖ B D=@H/proj/gitx; rm "${D/gitx/.git}" ‖ P D=@H/proj/gitx; rm "$D" ‖ B unlink ${U:-@H/proj/.git/HEA{D..D}} ‖ B D=x; shred "${D:+"${HOME}/gt-remote/big"}" ‖ P D=x; shred "${D:+"${HOME}/notes.txt"}" ‖ B unlink "${U:-${HOME}/proj/.git/HEAD}" ‖ P unlink "${U:-${HOME}/notes.txt}" ‖ B D=@H/proj/.git.bak; E=.bak; rm -rf "${D%$E}" ‖ P D=@H/proj/.git.bak; E=.zz; rm -rf "${D%$E}" ‖ B D=@H/proj2; "D=@S/work"; rm -rf "$D" ‖ B D=@H/proj2; 'D=@S/work'; rm -rf "$D" ‖ P D=@S/work; "D=@H/proj2"; rm -rf "$D" ‖ P D=@H/proj2; D="@S/work"; rm -rf "$D" ‖ B D=@S/work; env "D=@H/proj2" bash -c 'rm -rf "$D"' ‖ P D=@S/work; env "D=@S/work/a" bash -c 'rm -rf "$D"' ‖ B D=x; shred ${D:+"${HOME}/gt-remote/big"} ‖ B rm -r ${U:-@H/gt/rig/.gc-worktrees/{w,zz}} ‖ B bash -c 'rm -f ${U:-"${HOME}/gt/rig/shared/data"}' ‖ B eval 'D="${HOME}/gt/rig"; rm "${D:+"${HOME}/gt/rig"}" -r' ‖ B D=@H/proj/.git; unlink "${U:-${D}/HEAD}" ‖ P unlink ${U:-"${HOME}/notes.txt"} ‖ P D=x; unlink "${D:+"@S/work/a"}" ‖ B unlink "${U:-}"@H/proj/.git/HEAD ‖ B:z unlink ${U:-}${U:-"@H"}/proj/.git/HEAD ‖ B:s D=@H/proj/.git; unlink ${U:-${D}/HEAD;x} ‖ B:s unlink ${U:-"} ;"@H/proj/.git/HEAD} ‖ B:s unlink ${U:-'} ;'@H/proj/.git/HEAD} ‖ P:z unlink ${U:-"} ;"@S/work/a} ‖ P:z unlink ${U:-'}'@S/work/a}
 """
-X = [("B", "bash <<'EOF'\nrm -rf ~/gt-remote\nEOF"), ("B", "cat <<'EOF' | sh\nrm -rf ~/gt-remote\nEOF"), ("B", "python3 - <<'EOF'\nimport shutil\nshutil.rmtree('@H/gt-remote')\nEOF"), ("B", "echo \"import shutil; shutil.rmtree('@H/gt-remote')\" | python3 -"),
+X = [("B", "tcsh <<'EOF'\nrm -rf ~/gt-remote\nEOF"), ("B", "bash <<'EOF'\nrm -rf ~/gt-remote\nEOF"), ("B", "cat <<'EOF' | sh\nrm -rf ~/gt-remote\nEOF"), ("B", "python3 - <<'EOF'\nimport shutil\nshutil.rmtree('@H/gt-remote')\nEOF"), ("B", "echo \"import shutil; shutil.rmtree('@H/gt-remote')\" | python3 -"),
      ("P", "git commit -m \"$(cat <<'EOF'\nfix: stop using rm -rf ~/gt-remote\nEOF\n)\""), ("P", "cat <<'EOF'\nrm -rf ~\nEOF"), ("P", ""), ("P", "   "), ("B", "# c\nrm -rf ~/gt-remote"), ("B", "x=1\nrm -rf ~/gt-remote"),
      ("B", "X=~/gt-remote; bash <<'EOF'\nrm -rf \"$X\"\nEOF\nX=/tmp/safe"), ("B", "cd ~ && python3 - <<'EOF'\nimport shutil\nshutil.rmtree('gt-remote')\nEOF"), ("B", "cd ~ && bash <<'EOF'\nrm -rf gt-remote\nEOF"), ("P", "python3 - <<'EOF'\np = 'tests/foo.py'  # remove the old text, delete nothing\ns = open(p).read().replace('old', 'new')\nEOF"), ("B", nest(8)), ("P", nest(3)), ("B", "echo " + "x" * 300000), ("P", "echo " + "x" * 60000), ("B", "FOO=1 BAR=2 rm -rf ~/gt-remote")]
 TABLE = []
@@ -101,6 +113,10 @@ for line in DSL.strip().split("\n"):
         v, cmd = part.split(" ", 1)
         TABLE.append((v[0], cmd, CWDS.get(v[2:], CWD)))
 TABLE += [(w, c, CWD) for w, c in X]
+if DENIES:  # vazio → pasta sem nada passa (work2/open); falhou/ilegível (sem permissão de ler / de entrar) → vale como se guardasse um repo
+    TABLE += [("B", "rm -rf @H/work2/locked", CWD), ("B", "rm -rf @H/work2/xonly", CWD), ("B", "rm -rf @H/work2/rdonly", CWD)]  # rdonly: lista mas não entra, então só o lstat do .git diz "não sei"
+else:
+    print("SKIP pasta ilegível: chmod 000/100/400 não nega aqui (root?): as 3 linhas work2/locked, xonly e rdonly não rodam")
 
 
 def run_table(m):
@@ -154,8 +170,8 @@ def e2e(raw=None, tool="Bash", cmd="ls", guard=GUARD):
 rc, err = e2e(cmd="rm -fr ~/gt-remote")
 check("ponta a ponta: bloqueio sai 2 com a mensagem (alvo, regra, não é cancelamento, saída segura)", rc == 2 and all(s in err for s in ("[HOOK BLOCK: rm-target-guard]", "NÃO É CANCELAMENTO", "rm.home-child", "gt-remote", "safe-clean", "find <pasta>")), err[:200])
 check("ponta a ponta: liberado sai 0 sem ruído; scratch também", e2e() == (0, "") and e2e(cmd=f"rm -rf {S}/work") == (0, ""))
-check("ponta a ponta: JSON ilegível que cita command bloqueia; lixo sem command libera; stdin vazio libera; outra ferramenta libera",
-      e2e(raw='{"command": ')[0] == 2 and e2e(raw="lixo")[0] == 0 and e2e(raw="")[0] == 0 and e2e(tool="Write", cmd="rm -rf ~")[0] == 0)
+check("ponta a ponta: stdin que não é um pedido legível (JSON quebrado, lixo, lista) bloqueia; stdin vazio libera; outra ferramenta libera",
+      all(e2e(raw=r)[0] == 2 for r in ('{"command": ', "lixo", "[]")) and e2e(raw="")[0] == 0 and e2e(tool="Write", cmd="rm -rf ~")[0] == 0)
 SRC = open(GUARD).read()
 crash = f"{H}/crash.py"
 open(crash, "w").write(SRC.replace("def decide(inp: dict):", "def decide(inp: dict):\n    raise RuntimeError('boom')", 1))
@@ -185,6 +201,9 @@ def verdict(p, rec, sel):
         return True
     if not p.startswith(H + "/") or any(c in ("node_modules", "__pycache__") for c in parts) or p.startswith(H + "/.cache"):
         return False
+    rel = p[len(H) + 1:].split("/")
+    if rel[0] == "gt" and ((len(rel) >= 4 and rel[2:4] == ["shared", "data"]) or (rec and (len(rel) == 2 or (len(rel) == 3 and rel[2] == "shared")))):
+        return True  # dado de produção do rig e os dois ancestrais que o levam junto
     if sel:
         return holds(p, DATA)
     return (len(p[len(H) + 1:].split("/")) == 1 and rec and not (os.path.exists(p) and not os.path.isdir(p))) or holds(p, REPOS)
@@ -225,7 +244,7 @@ def touched(cmd):
 
 rnd = random.Random(int(os.environ.get("RMTG_SEED", "7")))
 BAD = ["proj/.git/config", "proj/.git/HEAD", "proj", "proj2", ".dolt-data/ga", ".dolt-data/ga/.dolt/noms/manifest", ".beads/b", "gt-remote", "gt-remote/keys/gt_mirror", "gt-remote/git", "gt-remote/git/gascity",
-       "gt-remote/git/gascity/wt/s1", "gt-remote/big", "gt/rig/crew/bob/x.py", "gt/rig/.gc-worktrees/w", "@S/lnkgit"]
+       "gt-remote/git/gascity/wt/s1", "gt-remote/big", "gt/rig", "gt/rig/shared", "gt/rig/shared/data", "gt/rig/crew/bob/x.py", "gt/rig/.gc-worktrees/w", "@S/lnkgit"]
 OK = ["proj/src/a.py", "proj/build", "proj/build/x.o", "proj/node_modules", "notes.txt", ".cache/pip/w", "proj/.git/index.lock", "gt-remote/git/gascity/wt/s1/src", "@S/work", "@S/work/a", "@S/srepo", "@S/many/f1", "proj/src/m.pyc"]
 FLAGS = ["-rf", "-fr", "-r -f", "-f -r", "-Rf", "-rfv", "--recursive --force", "--recur --forc", "-r", "-f", "", "-rf --", "--recursive", "-vr"]
 WRAPS = ["env A=1", "command", "nohup", "nice -n 5", "time"] + [w for w in ("timeout 5", "stdbuf -oL") if shutil.which(w.split()[0])]
@@ -236,6 +255,8 @@ def spell(rel):
     P = S + rel[2:] if rel.startswith("@S") else f"{H}/{rel}"
     d, b = os.path.split(P)
     opts = [P, "'" + P + "'", d + "//" + b, d + "/./" + b, P[:5] + "''" + P[5:], d + "/" + b[:3] + "*", d + "/{" + b + ",zz}", os.path.relpath(P, CWD), P + "/"]
+    if b[-1:].isalnum():
+        opts.append(d + "/" + b[:-1] + "{" + b[-1] + ".." + b[-1] + "}")
     if P.startswith(H + "/"):
         r = P[len(H) + 1:]
         opts += ["~/" + r, "$HOME/" + r, '"${HOME}/' + r + '"']
@@ -248,12 +269,25 @@ def core(arg):
     return " ".join(rnd.choice([f"{v} {f} {arg}", f"{v} {arg} {f}"]).split())
 
 
+def late(s, P):
+    """Variável com escopo (o bash decide quem vê o quê): prefixo, subshell, pipeline, `&&`, if, laço, função, read/printf -v/eval, `+=`, valor com espaço, linha de comando numa variável."""
+    d, b = os.path.split(P)
+    q = shlex.quote(core(s))
+    return [f"D={s}; D=/tmp/ok " + core('"$D"'), f"D={s}; (D=/tmp/ok); " + core('"$D"'), f"D={s}; D=/tmp/ok | cat; " + core('"$D"'), f"D=/tmp/ok; true && D={s}; " + core('"$D"'), f"D={s}; false && D=/tmp/ok; " + core('"$D"'),
+            f"D={s}; f() {{ D=/tmp/ok; }}; " + core('"$D"'), f"f() {{ D={s}; }}; f; " + core('"$D"'), f"f() {{ D={s}; }}; D=/tmp/ok; f; " + core('"$D"'), f"read D <<< {s}; " + core('"$D"'), f"printf -v D %s {s}; " + core('"$D"'), f"eval D={s}; " + core('"$D"'),
+            f"D=/tmp/ok; if true; then D={s}; fi; " + core('"$D"'), f"D={s}; if false; then D=/tmp/ok; fi; " + core('"$D"'), f"D=/tmp/ok; for i in 1 2; do " + core('"$D"') + f"; D={s}; done",
+            f"D=/tmp/ok; f() {{ " + core('"$D"') + f"; }}; D={s}; f", f"D={shlex.quote(d)}; D+={shlex.quote('/' + b)}; " + core('"$D"'), f"D='/tmp/ok {s}'; " + core("$D"), f"T='/tmp/ok {s}'; for t in $T; do " + core('"$t"') + "; done",
+            f"C={q}; $C", f"C={q}; eval \"$C\"", f"C={q}; bash -c \"$C\"", f"echo {s} | while read D; do " + core('"$D"') + "; done", f"case x in x) D={s};; esac; " + core('"$D"'), f"D={s}; case x in y) D=/tmp/ok;; esac; " + core('"$D"'),
+            f"D={s}/; " + core('"${D%/}"'), f"D=x{s}; " + core('"${D#x}"'), f"D={s}; " + core('"${D:-/tmp/ok}"'), core('${U:-' + s + '}'), f"D={s}.bak; " + core('"${D%.bak}"'), f"D={s}; " + core('"${D/zz/}"'), f"D={s}; " + core('"${D:+' + s + '}"'),
+            f"nohup D={s}; D+=/x; " + core('"$D"')]
+
+
 def shape(s, P):
     d, b = os.path.split(P)
     ds = "~" + d[len(H):] if d.startswith(H) else d
     return rnd.choice([core(s), core(s), f"D={s}; " + core('"$D"'), f"export D={s}; " + core("$D"), f"cd {ds} && " + core(shlex.quote(b)), f"(cd {ds}; " + core(shlex.quote(b)) + ")", f"echo {s} | xargs " + core(""),
                        f"for f in {s}; do " + core('"$f"') + "; done", f"find {s} " + rnd.choice(["-mindepth 1 -delete", "-name '*.o' -delete", "-exec rm -rf {} +", "-type f -delete", "-name x -exec rm {} \\;"]),
-                       f"R=rm; $R {rnd.choice(FLAGS)} {s}", "f() { " + core(s) + "; }; f", "python3 -c " + shlex.quote("import subprocess; subprocess.run(['rm','-rf','%s'])" % P)])
+                       f"R=rm; $R {rnd.choice(FLAGS)} {s}", "f() { " + core(s) + "; }; f", "python3 -c " + shlex.quote("import subprocess; subprocess.run(['rm','-rf','%s'])" % P)] + late(s, P))
 
 
 def wrap(c):
@@ -294,9 +328,8 @@ MUT = [('componente negado', 'if c in DENY_COMP and not (', 'if False and not ('
        ('inline: rm dentro de literal liga os caminhos', 'or any(RM_TEXT.search(x) for x in lits)', 'or False'), ('inline: sem API, nenhum caminho estrito', '[x for x in lits if deletes and x and not', '[x for x in lits if True and x and not'),
        ('inline: sem API, nenhum literal pelado', 'bare = [x for x in lits if deletes and x and len(x)', 'bare = [x for x in lits if True and x and len(x)'), ('curinga fundo: o texto do padrão é julgado', 'out += [(p, p), (None, None)]', 'out += [(None, None)]'),
        ('$( )', 'for body in substitutions(w):', 'for body in []:'), ('cd só com &&', 'here = new if t == "&&" else merged if len(merged) <= 8 else merged[:7] + [None]', 'here = new'), ('teto do glob', '([(None, None)] if len(hits) > GLOB_MAX else [])', '[]'),
-       ('for depois do peel', 'if len(ws) > 3 and ws[0] == "for" and ws[2] == "in":', 'if False:'), ('xargs', 'if verb == "xargs":', 'if False:'), ('find', 'if verb == "find":', 'if False:'), ('env -S', '(b == "env" and key in ("-S", "--split-string"))', 'False'),
-       ('npx -c', '(b == "npx" and key in ("-c", "--call"))', 'False'), ('flock -c', 'if b == "flock" and ws[:1] in', 'if False and ws[:1] in'), ('verbo por variável', 'if len(v) == 1 and UNK not in v[0] and not re.search(r"[*?\\[]", v[0]):', 'if False:'),
-       ('verbo desconhecido + flag recursiva', 'return check(ops, rec, () if rec else ("",), cwds, env)', 'pass'), ('verbo desconhecido sem flag: regras absolutas', 'return check(ops, rec, () if rec else ("",), cwds, env)', 'return check(ops, rec, False, cwds, env)'),
+       ('xargs', 'if verb == "xargs":', 'if False:'), ('find', 'if verb == "find":', 'if False:'), ('env -S', '(b == "env" and key in ("-S", "--split-string"))', 'False'),
+       ('npx -c', '(b == "npx" and key in ("-c", "--call"))', 'False'), ('flock -c', 'if b == "flock" and ws[:1] in', 'if False and ws[:1] in'), ('verbo desconhecido + flag recursiva', 'return check(ops, rec, () if rec else ("",), cwds, env)', 'pass'), ('verbo desconhecido sem flag: regras absolutas', 'return check(ops, rec, () if rec else ("",), cwds, env)', 'return check(ops, rec, False, cwds, env)'),
        ('export', 'if verb in ("export", "declare", "typeset", "local", "readonly"):', 'if False:'), ('cd nunca descarta o mais novo', 'merged if len(merged) <= 8 else merged[:7] + [None]', 'merged[:4]'), ('curinga fundo', 'for c in p.split("/")) > 2:', 'for c in p.split("/")) > 200:'),
        ('prazo', 'if time.monotonic() > DEADLINE:', 'if False:'), ('pasta compartilhada: arquivo solto', 'dir_ = os.path.isdir(f) or (rec and not os.path.lexists(f))', 'dir_ = True'),
        ('heredoc de shell: cwd de todos os cd', 'hit = scan_bash(body, ever, depth + 1, denv) if', 'hit = scan_bash(body, cwds, depth + 1, denv) if'), ('heredoc de interpretador: cwd de todos os cd', 'inline(body, ever, depth + 1, denv)', 'inline(body, cwds, depth + 1, denv)'),
@@ -305,7 +338,42 @@ MUT = [('componente negado', 'if c in DENY_COMP and not (', 'if False and not ('
        ('tilde', 'return home() + s[1:] if s == "~" or s.startswith("~/")', 'return s if s == "~" or s.startswith("~/")'), ('glob', 'hits = sorted(itertools.islice(glob.iglob(p), GLOB_MAX + 1))', 'hits = []'), ('chave {a,b}', 'bs = [t] if UNK in t else braces(t)', 'bs = [t]'),
        ('teto da chave', 'len(alts) <= 16', 'len(alts) <= 1600'), ('caixa', 'low = [unicodedata.normalize("NFC", x).casefold() for x in parts]', 'low = list(parts)'), ('HOME vence scratch', 'rel, relp = (low[k:], parts[k:]) if k is not None else (None, None)', 'rel, relp = None, None'),
        ('node_modules', 'any(c in ALLOW_COMP for c in parts)', 'False'), ('.cache', 'any(relp[:len(a)] == list(a) for a in ALLOW_HOME)', 'False'), ('pyc', '(f.endswith(".pyc") and not os.path.isdir(f))', 'False'), ('rimraf', 'or verb == "rimraf"', 'or False'),
-       ('popd', 'if os.path.basename(ws[0]) == "popd":', 'if False:'), ('lançador opaco', 'if verb in OPAQUE:', 'if False:'), ('source e .', 'verb in ("eval", "source", ".")', 'verb == "eval"')]
+       ('popd', 'if os.path.basename(ws[0]) == "popd":', 'if False:'), ('lançador opaco', 'if verb in OPAQUE:', 'if False:'), ('source e .', 'verb in ("eval", "source", ".")', 'verb == "eval"'), ('shells ampliados', '"ash", "csh", "tcsh", "fish", "mksh"', '"ash", "mksh"'), ('interpretadores: pypy', 'pypy[\\d.]*|', ''), ('interpretadores: R, julia, osascript', '|tclsh|wish|Rscript|julia|osascript|jshell|groovy', ''), ('rm( como API de remoção', '(?:unlink|rmdir|rm)(?=', '(?:unlink|rmdir)(?='), ('-c genérico para corredor desconhecido', 'if a in ("-c", "--command") and x + 1 < len(args)', 'if False and x + 1 < len(args)'),
+       ('for depois do peel', 'if len(ws) > 3 and ws[0] in ("for", "select") and ws[2] == "in":', 'if False:'), ('select como for', 'ws[0] in ("for", "select") and ws[2] == "in"', 'ws[0] == "for" and ws[2] == "in"'),
+       ('verbo por variável: valor que sei', 'known = [x for x in v if UNK not in x and x != ws[0]]', 'known = []'), ('verbo por variável: outro valor é "não sei"', 'known = [x for x in v if UNK not in x and x != ws[0]]', 'known = [x for x in v if len(v) == 1 and UNK not in x and x != ws[0]]'),
+       ('rig: ancestrais só recursivos no ~/gt/<rig>', 'or (rec and (len(rel) == 2 or (len(rel) == 3 and rel[2] == "shared")))', 'or False'), ('rig: ~/gt/<rig>', '(len(rel) == 2 or (len(rel) == 3 and rel[2] == "shared"))', '(len(rel) == 3 and rel[2] == "shared")'),
+       ('rig: ~/gt/<rig>/shared', '(len(rel) == 2 or (len(rel) == 3 and rel[2] == "shared"))', '(len(rel) == 2)'), ('rig: ancestral exige recursivo', '(rec and (len(rel) == 2 or', '((len(rel) == 2 or'),
+       ('prefixo NOME=v vale para o comando de dentro', 'for a in pre: assign(a, cenv, cwds[0], False)', 'for a in pre: pass'), ('env/command sem comando não atribui', 'for a in pre if not wrapped else ():', 'for a in pre:'),
+       ('embrulho marca a lista', 'if pre is not None and b != "time":', 'if False:'), ('time é palavra reservada', 'if pre is not None and b != "time":', 'if pre is not None:'),
+       ('depois de && a atribuição é talvez', 'or prev in ("&&", "||")', ''), ('dentro de case a atribuição é talvez', 'weak = iso or bool(blk["cases"]) or', 'weak = iso or'),
+       ('dentro de { } a atribuição é talvez', ' or bool(blk["grp"] and blk["grp"][-1] is None)', ''), ('pipe e & rodam em subshell', 'iso = t in ("|", "|&", "&") or prev in ("|", "|&")', 'iso = False'),
+       ('o que o pipe muda entra como talvez', 'if before is not None: merge(env, before)', 'if before is not None: pass'), ('else volta ao ambiente do if', 'top[1].append(dict(env)); env.clear(); env.update(top[0]); top[2] = k == "elif"', 'top[1].append(dict(env)); top[2] = k == "elif"'),
+       ('fi e done juntam os ramos', 'fr.pop(); merge(env, top[0], *top[1])', 'fr.pop()'), ('then abre quadro', 'elif k in ("while", "until") or (k == "then" and not (top and top[2])):', 'elif k in ("while", "until"):'),
+       ('while alarga o ambiente', 'widen(env); ST["late"] = True\n        elif k == "then":', 'ST["late"] = True\n        elif k == "then":'), ('for alarga o ambiente', 'fr.append([dict(env), [], False]); widen(env); ST["late"] = True', 'fr.append([dict(env), [], False]); ST["late"] = True'),
+       ('subshell devolve o ambiente', 'here, snap = saved.pop()\n            env.clear(); env.update(snap)', 'here, snap = saved.pop()'), ('chamada de função', 'if ws[0] in ST["funcs"]:', 'if False:'),
+       ('cabeçalho f() {', 'if t == "(" and len(hd) == 1 and', 'if False and len(hd) == 1 and'), ('function f {', 'if k == "function":  #', 'if False:  #'),
+       ('corpo de função alarga o ambiente', 'if b["fnew"]: ST["fn"] += 1; widen(env)', 'if b["fnew"]: ST["fn"] += 1'), ('2º passo', 'if not hit and ST["late"]:', 'if False:'),
+       ('2º passo: valores já vistos', 'if ST["again"] else ():', 'if False else ():'), ('nome calculado vira "não sei"', 'if verb == "printf" else args)): wild(env)', 'if verb == "printf" else args)): pass'),
+       ('escritor: valor que sei', 'setvar(env, n, vals if vals is not None and n == tgt else [UNK], strong)', 'setvar(env, n, [UNK], strong)'), ('printf -v', 'if verb == "printf" and len(args) == 4 and args[0] == "-v" and args[2] == "%s":', 'if False:'),
+       ('read de here-string', 'src, tgt = tilde(here[0]) if len(here) == 1 else said(feed), names[-1]', 'src, tgt = None, names[-1]'), ('read do echo do pipe', 'src, tgt = tilde(here[0]) if len(here) == 1 else said(feed), names[-1]', 'src, tgt = (tilde(here[0]) if len(here) == 1 else None), names[-1]'),
+       ('eval devolve o que atribuiu', 'if cenv.get(k) != v: setvar(env, k, v, strong)', 'if cenv.get(k) != v: pass'), ('source', 'if verb in ("source", "."):  # o arquivo que ele roda pode atribuir qualquer coisa\n        wild(env)', 'if verb in ("source", "."):  # o arquivo que ele roda pode atribuir qualquer coisa\n        pass'),
+       ('+=', '("${%s}" % m.group(1) if m.group(2) else "")', '""'), ('pedaços do IFS', 'return ts + [q for t in ts if UNK not in t for q in sep.split(t) if q and q != t]', 'return ts'),
+       ('sequência de chave', 'm = next((q for q in SEQ.finditer(s) if', 'm = next((q for q in [] if'), ('o texto com chave sem expandir também vale', 'if UNK not in t and t not in bs:', 'if False:'),
+       ('param: padrão e alternativo', 'if k in "-=+":', 'if False:'), ('param: alternativo +', 'else [(w if c and v == "" else v) if k != "+" else (w if v or not c else "")]', 'else [v]'),
+       ('param: N que não sei tem as duas', '([v, w] if k != "+" else [w, ""]) if UNK in v', '([v] if k != "+" else [""]) if UNK in v'), ('param: corte pelo fim', 'if k == "%": return', 'if False: return'),
+       ('param: corte pelo começo', 'return [next((v[i:] for i in (r if op == "#" else reversed(r)) if re.fullmatch(g(w), v[:i])), v)]', 'return [v]'), ('param: troca', 'if k == "/": return [re.sub(', 'if False: return [re.sub('),
+       ('param: o operador chega ao valor', 'for x in (param(v, m.group(3), w) if m.group(3) else [v])]', 'for x in [v]]'), ('xargs -J -S -R', 'XARGS_VAL = {"-I", "-J", "-S", "-R", ', 'XARGS_VAL = {"-I", '),
+       ('sudo -s', 'shell = shell or (b in ("sudo", "doas") and key in ("-s", "-i", "--shell", "--login"))', 'shell = shell'), ('lstat que falha = existe', 'except (OSError, ValueError): return True', 'except (OSError, ValueError): return False'),
+       ('pasta ilegível = guarda', 'except (OSError, ValueError): raise OverflowError(d)', 'except (OSError, ValueError): return []'), ('atribuição com aspas é comando', 'toks.append(Q(w) if q is not None and "=" in w and q <= w.index("=") else w)', 'toks.append(w)'),
+       ('atribuição com aspas depois de embrulho', 'and (wrapped or not isinstance(ws[0], Q))', 'and True'), ('time e ! antes do cabeçalho de função', 'hd = [w for w in ws if w not in ("time", "!", "-p")]', 'hd = ws'),
+       ('+= num nome que não sei pode estar vazio', 'if m.group(2) and UNK in "".join(env.get(m.group(1), [UNK])):', 'if False:'), ('aspas antes do = depois de embrulho ainda é atribuição', 'and (wrapped or not isinstance(ws[0], Q))', 'and not isinstance(ws[0], Q)'),
+       ('${ }: chave aninhada $( ) e ${ } pulada', 'elif c == "$" and q != "\'" and t[j + 1:j + 2] in ("{", "("): j = skip_subst(t, j) - 1', 'elif False: j = skip_subst(t, j) - 1'),
+       ('${ }: a ponta da } sem aspas fecha', 'while j < n and not (t[j] == "}" and q is None):', 'while j < n and t[j] != "}":'),
+       ('${ }: a palavra do operador perde as aspas', 're.sub("[\\"\']", "", m.group(4))', 'm.group(4)'),
+       ('${ }: a palavra do operador se expande', '(expand(re.sub("[\\"\']", "", m.group(4)), cwd, env) if m.group(3) else [""])', '([re.sub("[\\"\']", "", m.group(4))] if m.group(3) else [""])'),
+       ('${ }: aspas protegem a }', 'elif c in "\'\\"": q = None if q == c else (q or c)', 'elif False: q = None'),
+       ('${ }: só " protege a }', 'elif c in "\'\\"": q =', 'elif c in \'"\': q ='),
+       ('${ }: a palavra aceita 1 nível de chave', '((?:[^{}]|\\{[^{}]*\\})*)', '((?:[^{}])*)')]
 alive = []
 for name, old, new in MUT:
     if SRC.count(old) != 1:
@@ -318,6 +386,7 @@ for name, old, new in MUT:
     except Exception:  # noqa: BLE001 — mutante que quebra o import também foi pego
         pass
 check(f"mutantes: {len(MUT)} guardas apagadas, todas reprovam a tabela", not alive, "; ".join(alive))
+os.chmod(f"{H}/work2/locked", 0o755); os.chmod(f"{H}/work2/xonly", 0o755); os.chmod(f"{H}/work2/rdonly", 0o755)
 shutil.rmtree(H, ignore_errors=True); shutil.rmtree(S, ignore_errors=True)
 print(f"{sum(results)}/{len(results)} blocos ok")
 sys.exit(0 if all(results) else 1)
