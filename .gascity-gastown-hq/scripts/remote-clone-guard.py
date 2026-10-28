@@ -533,15 +533,15 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
             elif not st["fdepth"] and term == "&":
                 st["cwd"] = None
             return None
-        if st.get("calling") and seg[:1] == ["function"] and seg[2:3] == ["{"]:  # definição aninhada num corpo reexecutado: o corpo dela não roda agora, mas onde ele acaba eu não sei (o `}` que o fecha não fica guardado)
-            st["lost"] = True  # o resto desta reexecução é conferido sem diretório e o diretório fica "não sei" depois dela: um `cd` dentro do corpo que não roda não pode valer para o que vem depois
+        if st.get("calling") and (seg[:1] == ["function"] or seg[:1] == ["{"] and prev == ")"):  # definição aninhada num corpo reexecutado (`function g {`, `g() {`): o corpo dela não roda agora e onde ele acaba eu não sei (o `}` que o fecha não fica guardado)
+            st["lost"] = True  # até o fim desta reexecução, `cd` e atribuição de variável valem "não sei" (ver unsure e o ramo do cd): o que o corpo que não roda faz não pode valer para o que vem depois
         if not st.get("calling") and (seg[:1] == ["{"] and st.pop("func", False) or seg[:1] == ["function"] and seg[2:3] == ["{"]):  # nunca ao REEXECUTAR um corpo guardado (calling): o `{` guardado ali reabria a definição com o nome velho, desviava o resto do corpo para a lista errada e o laço de chamada percorria essa lista sem fim (ga-tih62nv)
             if seg[0] == "function":
                 st["fname"], seg = seg[1], seg[2:]
             st["fdepth"], st["funcs"] = 1, st.get("funcs", {})
             st["funcs"].setdefault(st["fname"], [])
             if seg[1:]:
-                st["funcs"][st["fname"]].append((seg[1:], prev, term))
+                st["funcs"][st["fname"]].append((seg[1:], ";", term))  # prev ";": o `)` do `f()` não é o operador de quem vem depois do `{` (senão um corpo que começa por um grupo `{ … }` pareceria uma definição aninhada ao ser reexecutado)
             return None
         if seg == ["}"]:
             if term == "&":
@@ -550,7 +550,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
         w0 = [os.path.basename(x) for x in seg]
         env, seg, b, opq = peel(seg)
         blind, wrapped = blind or b, any(x in WRAP for x in w0[:len(w0) - len(seg)])  # wrapped: `env cd x` roda o cd como PROGRAMA — o shell fica onde estava
-        unsure = kw or blk or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&")  # o trecho pode não ter rodado
+        unsure = bool(st.get("lost")) or kw or blk or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&")  # o trecho pode não ter rodado
         if not seg:
             st["env"].update({k: "$?" if unsure else v for k, v in env.items()})  # `GIT_DIR=x; git …` vale p/ os seguintes; `true || GIT_DIR=x` = "não sei" ($ → não resolve)
             return None
@@ -563,7 +563,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
             st["env"].update({m.group(1): "$?" if unsure else m.group(2) for m in map(ASSIGN.fullmatch, seg[1:]) if m})
         elif c in ("cd", "pushd", "popd"):
             new = None if c == "popd" else chdir(seg[1:], st["cwd"], c == "pushd")
-            if kw or wrapped or ext or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&"):
+            if st.get("lost") or kw or wrapped or ext or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&"):
                 new = None
             if blk and new is not None:
                 st["cdblk"] = True  # cd dentro de um ramo: vale até o fi/done/esac/else/elif
@@ -601,13 +601,12 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
             st["calling"].add(c)
             try:
                 for s, p, t in st["funcs"][c]:
-                    r = one(list(s), blind or bool(st.get("lost")), p, t)
+                    r = one(list(s), blind, p, t)
                     if r:
                         return r
             finally:
                 st["calling"].discard(c)
-                if st.pop("lost", False):
-                    st["cwd"] = None
+                st.pop("lost", None)
         elif c == "git":
             return git_hit(seg, {**st["env"], **env}, cwd, terr, own)
         return None
