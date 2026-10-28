@@ -233,7 +233,6 @@ bdset $BEAD "ARQUIVO packs/a.sh (4)
   L7 [n] 1 -> 2  id=3d3d3d3d3d  (testes: $SELW)"
 eq "malformed lines (short id, upper-case id, no id, no testes, one-space indent, testes before id) are skipped, the good one is kept" \
   "$(gate_base_test_mutant_list $STORE $BEAD $SELW | cut -f2 | tr '\n' ' ')" "3d3d3d3d3d "
-bdset $BEAD "  L7 [n] 1 -> 2  id=3d3d3d3d3d  (testes: $SELW)"
 eq "... and 'skipped' counts the five of them that name this selftest (the one with no testes: cannot be attributed to any selftest, so it is not counted)" \
   "$(gate_base_test_mutant_list $STORE $BEAD $SELW skipped)" "5"
 eq "... a selftest those lines do not name has no holes: 0" "$(gate_base_test_mutant_list $STORE $BEAD "$SELO" skipped)" "0"
