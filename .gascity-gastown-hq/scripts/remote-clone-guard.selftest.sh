@@ -898,10 +898,16 @@ PYEOF
   tb 2 "budget: 8 funções que chamam todas as outras (~96 mil passos) passam do teto e são BLOQUEADAS, não liberadas" "$(calls 8)"
   has "NÃO É CANCELAMENTO DO USUÁRIO" && has "não consegui analisar este pedido a tempo" && has "passos de conferência" && has "um comando por chamada"; ok $? "budget: ...a recusa diz que é política automática, que faltou tempo/passos e como reescrever"
   tb 0 "budget: controle — 5 funções que chamam todas as outras (~300 passos) passam" "$(calls 5)"
-  # parecer de segurança do commit anterior: a definição ANINHADA num corpo reexecutado não roda, então o `cd` dela não pode valer para o que vem depois
+  # parecer de segurança dos commits anteriores: a definição ANINHADA num corpo reexecutado (function g {, g() {) NÃO roda; o que o corpo dela faz (cd, variável) não pode valer para o que vem depois
   b 2 "budget: f() { function g { cd <próprio>; }; }; cd <alheio>; f; git commit — o cd de g NÃO rodou, o commit escreve no alheio" "f() { function g { cd $OWN; }; }; cd $OTH; f; git commit -m x"
-  b 2 "budget: ...e o git DENTRO de f, depois da definição aninhada, também (o resto da reexecução é conferido sem diretório)" "f() { :; function g { cd $OWN; }; git commit -m x; }; cd $OTH; f"
-  b 0 "budget: controle — um grupo { cd <próprio>; } dentro de f RODA: o git seguinte escreve no próprio" "f() { { cd $OWN; }; git commit -m x; }; cd $OTH; f"
+  b 2 "budget: ...a mesma aninhada na forma g() { cd <próprio>; }" "f() { g() { cd $OWN; }; }; cd $OTH; f; git commit -m x"
+  b 2 "budget: ...e o git DENTRO de f, depois da definição aninhada, também" "f() { :; function g { cd $OWN; }; git commit -m x; }; cd $OTH; f"
+  b 2 "budget: ...e um \$( ) depois da aninhada (o diretório que ele vê é o \"não sei\", não o do cd de g)" "f() { :; function g { cd $OWN; }; echo \$(git commit -m x); }; cd $OTH; f"
+  b 2 "budget: ...e a variável: export GIT_DIR=<próprio> dentro da aninhada não vale (GIT_DIR=<alheio> de fora)" "f() { function g { export GIT_DIR=$OWN/.git; }; }; export GIT_DIR=$OTH/.git; f; git commit -m x"
+  b 0 "budget: controle — um grupo { cd <próprio>; } no começo do corpo de f RODA: o git seguinte escreve no próprio" "f() { { cd $OWN; }; git commit -m x; }; cd $OTH; f"
+  b 0 "budget: controle — f() { { cd <próprio>; }; :; }; cd <alheio>; f; git commit — o grupo do começo do corpo RODA, o cd vale" "f() { { cd $OWN; }; :; }; cd $OTH; f; git commit -m x"
+  b 0 "budget: controle — com uma bandeira de definição velha (foo(); no meio), o grupo { } do corpo de f NÃO reabre a definição: o cd e o git do próprio seguem certos" "f() { :; { :; }; }; foo(); f; cd $OWN && git commit -m x"
+  b 2 "budget: f cuja chave não fecha (aspa tardia) com function g { } e um git no alheio: o corpo reexecutado no fim é CONFERIDO, não engolido por g" "f() { :; echo '{'; function g { :; }; git -C $OTH commit -m x; }; f"
   b 2 "budget: controle — a função aninhada CHAMADA que escreve no alheio é bloqueada" "f() { function g { git -C $OTH commit -m x; }; g; }; f"
   r=$(python3 -I "$capy" 10 "$hn" "$P" busy 2>&1); echo "$r" | grep -qF "rc=2 " && echo "$r" | grep -qF "timer=0 " && echo "$r" | grep -qF "analisar=1"; ok $? "budget: o julgamento que gira sem fim é cortado pelo relógio (0.3 s no teste): sai 2, diz que não deu tempo e o relógio fica desarmado [$r]"
   r=$(python3 -I "$capy" 10 "$hn" "$P" stdin 2>&1); echo "$r" | grep -qF "rc=2 " && echo "$r" | grep -qF "analisar=1"; ok $? "budget: o relógio já está armado quando o guarda lê o stdin: pedido que nunca termina de chegar é BLOQUEADO [$r]"
@@ -1075,9 +1081,11 @@ echo "== $((n-fails))/$n ok =="
   mutant budget "o relógio continua armado depois do veredito" 's/^        signal.setitimer(signal.ITIMER_REAL, 0)$/        pass/'
   mutant budget "o estouro dentro do julgamento cai no 'o guarda falhou' (sem a recusa de tempo)" 's/^    except Budget:$/    except KeyError:/'
   mutant budget "main() não pega o estouro" 's/^    except Budget as e:/    except KeyError as e:/'
-  mutant budget "a definição aninhada num corpo reexecutado não marca o diretório como perdido" 's/^            st\["lost"\] = True .*/            pass/'
-  mutant budget "depois da reexecução com definição aninhada o diretório continua o do cd de dentro dela" 's/^                if st.pop("lost", False):$/                if False:/'
-  mutant budget "o resto da reexecução, depois da definição aninhada, continua com diretório" 's/blind or bool(st.get("lost"))/blind/'
+  mutant budget "function NOME { aninhada num corpo reexecutado não marca a região como perdida" 's/(seg\[:1\] == \["function"\] or seg\[:1\] == \["{"\] and prev == ")")/(seg[:1] == ["{"] and prev == ")")/'
+  mutant budget "NOME() { aninhada num corpo reexecutado não marca a região como perdida" 's/(seg\[:1\] == \["function"\] or seg\[:1\] == \["{"\] and prev == ")")/(seg[:1] == ["function"])/'
+  mutant budget "na região perdida o cd volta a valer" 's/if st.get("lost") or kw or wrapped or ext or/if kw or wrapped or ext or/'
+  mutant budget "na região perdida a atribuição de variável volta a valer" 's/unsure = bool(st.get("lost")) or kw/unsure = kw/'
+  mutant budget "o corpo que começa por um grupo { } parece uma definição aninhada" 's/append((seg\[1:\], ";", term))/append((seg[1:], prev, term))/'
   echo "-- contra um stub que só sai 0 (o servidor ANTES desta fatia)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"; printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$T/stub.py"
   r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,shell,wrap,lex,dest,cfg,tools,msg,check,cond" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"
