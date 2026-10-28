@@ -64,6 +64,20 @@
 # without a timeout): every scheduled run from 07:42Z to ~15:48Z died at 840 s, nothing was committed and the offsite lagged 6 h. The pager now parses a page once, copies it by bytes instead of taking it apart and
 # putting it back (19 MB page: 2.6 s of CPU -> 0.15 s) and asks for bigger pages where the rows are small (hq.labels, row read: 169 s -> 43 s at load 64). A whole run was NOT timed after that — the timeout stays 840 s,
 # under the interval — so whether three runs in a row end inside it is for `gc order history jsonl-export` to say once this is deployed.
+#
+# ga-fegzc8h: it was NOT enough, and the number that mattered was never the speed of one database. Three scheduled runs on 28/10 (03:09Z, 03:39Z, 04:02Z) each died at 840 s and committed nothing; the offsite stood
+# still from 20:04Z of 27/10. A whole run measured by hand at load 70-122: beads 21 s, dc 21 s, gastown 33 s, hq 528 s (its comments 233 s; the scrub, validate, count and copy after the tables ~190 s), lexbh 112 s,
+# marketing 17 s, property_scrapers 48 s, whatsapp_automation ~180 s — ~960 s, longer than this timeout, and the script still committed ONCE, after the last database. Making a database faster moves that sum by a
+# fraction; no timeout under the interval can hold it when the load goes up again. So the script now fits ITS WORK in a budget (GC_JSONL_BUDGET_SECONDS, 690 s) and commits what is complete:
+#   - it starts the database that was started LONGEST AGO first (state: db_runs.<db>.tried), so a database that was killed or deferred goes to the front of the next run, and one that was killed mid-export goes to the back;
+#   - a database starts only if its last measured cost x 125 % fits in what is left of the budget (a database never measured counts 240 s); the first database of a run always starts, so a run always makes progress;
+#   - past budget - 200 s it reads no further supplemental table: the previous version stays, as for a table Dolt cut short (`partial=db(table)` in the commit subject);
+#   - what it did not start is NAMED, as `deferred=a,b` in the commit subject, `deferred: a b` in the summary and the DOG_DONE nudge, and `DEFER db — why` in the log. It is not `partial=` (that one makes
+#     jsonl_hourly.py count a stale table and alert) and not `failed:` (it did not fail; it waited). The archive's HEAD moves every run, and the age of each database's issues.jsonl — what the offsite checks (6 h) — is
+#     bounded by the number of runs it takes to come round: 2-3 at the costs above, i.e. 30-45 min — an ESTIMATE from those costs, not a measurement of a deployed run.
+# 690 s + 120 s for the commit and the git housekeeping that follows it = 810 s, under this 840 s. jsonl-export-budget.selftest.sh fails if the default budget + 120 s is over `timeout`, if `timeout` is not under
+# `interval`, or if the exporter does not rotate, defer, cut the tables off and commit. The timeout is NOT raised: the script still has no single-flight lock. That three runs in a row end with a commit, and that
+# `jsonl-hourly-offsite-age` returns to 0 (latest.json younger than 4500 s), can only be said by `gc order history jsonl-export` and the log after this is deployed.
 [order]
 description = "Export Dolt databases to JSONL git archive (ga-7sxdmb — replaces mol-dog-jsonl)"
 exec = "$PACK_DIR/assets/scripts/jsonl-export.sh"

@@ -284,6 +284,19 @@ MAX_PUSH_FAILURES="${GC_JSONL_MAX_PUSH_FAILURES:-3}"
 PUSH_RETRY_DELAY_MIN="${GC_JSONL_PUSH_RETRY_DELAY_MIN:-1}"
 PUSH_RETRY_DELAY_SPAN="${GC_JSONL_PUSH_RETRY_DELAY_SPAN:-4}"
 SCRUB="${GC_JSONL_SCRUB:-true}"
+# ga-fegzc8h: the run's time budget. The order's timeout (840 s, under the 15 m interval: there is no single-flight lock) kills the run, and the one commit sits after the LAST database, so a run that
+# is killed commits nothing: three runs in a row (03:09, 03:39, 04:02Z on 28/10, load 70-120) wrote every file and committed none, the archive's HEAD stood still for 8 h and the offsite stopped. A whole pass
+# is ~960 s there (hq alone 530 s, the 7 others 430 s), so no timeout under the interval ever fits it; the run now fits ITS WORK in the budget instead:
+#   - the databases are taken in the order they were last started (jex_order_databases), the longest-waiting first, so a database cut by the budget one run goes first the next;
+#   - a database is started only if its last observed cost (x JEX_COST_MARGIN_PCT %) fits in what is left of the budget; one never observed counts as JEX_UNKNOWN_COST_SECONDS; the FIRST database of a run always
+#     starts (a run that starts nothing makes no progress). What does not fit is "deferred": its files are not touched, it is named in the log, the summary and the commit subject (` deferred=a,b`);
+#   - past BUDGET - JEX_POST_RESERVE_SECONDS no further supplemental TABLE is read (the previous version stays, ` partial=` says so): what is left is the database's own scrub/validate and the commit;
+#   - the loop ends, what is complete is staged and committed, the run exits 0.
+# BUDGET + the commit's own time has to stay under the order's timeout (jsonl-export-budget.selftest.sh holds BUDGET + 120 s <= timeout). All of them are plain whole numbers.
+JEX_BUDGET_SECONDS=$(env_whole_number "${GC_JSONL_BUDGET_SECONDS:-690}" 690 1)
+JEX_COST_MARGIN_PCT=$(env_whole_number "${GC_JSONL_COST_MARGIN_PCT:-125}" 125 100)
+JEX_UNKNOWN_COST_SECONDS=$(env_whole_number "${GC_JSONL_UNKNOWN_COST_SECONDS:-240}" 240 0)
+JEX_POST_RESERVE_SECONDS=$(env_whole_number "${GC_JSONL_POST_RESERVE_SECONDS:-200}" 200 0)
 # The archive lives under packs/maintenance whichever pack's copy of this script
 # runs (ga-7sxdmb). gc sets GC_PACK_STATE_DIR to the state dir of the pack that
 # OWNS the order, so for this vendored copy PACK_STATE_DIR is packs/town-deltas;
@@ -358,6 +371,21 @@ validate_exported_issues() {
     jq -e -c '
         if (type == "object") and ((.rows? // [] | type) == "array") then
             .
+        else
+            error("issues export must be a JSON object with a rows array")
+        end
+    '
+}
+
+# ga-fegzc8h: validate_exported_issues + count_jsonl_rows in ONE pass over the payload. Prints the row count of the first
+# document on stdout; exits non-zero (and prints nothing) when the payload is empty or any document is not an object with a rows array
+# (empty → fail, as `jq -e` on no output was; unreadable → fail, never a count of 0).
+validate_and_count_issues() {
+    jq -s -e -r '
+        if length == 0 then
+            error("issues export was empty")
+        elif all(.[]; (type == "object") and ((.rows? // [] | type) == "array")) then
+            ((.[0].rows // []) | length)
         else
             error("issues export must be a JSON object with a rows array")
         end
@@ -1269,6 +1297,123 @@ jex_stamp_export_start() {
     write_state_json "$updated"
 }
 
+# ── ga-fegzc8h: the run's time budget (the rule and the numbers are at JEX_BUDGET_SECONDS) ──
+# The state keeps, per database, when this scheme last STARTED it and what a full export of it last cost:
+#   .jex_seq              this run's number, +1 per run that reaches the loop
+#   .db_runs.<db>.tried   jex_seq * 1000 + the database's place in that run (a started-then-killed database counts: it goes to the back, it does not livelock the front)
+#   .db_runs.<db>.cost_s  seconds the last export of the database that reached the commit took
+JEX_SEQ=0
+JEX_DB_STARTED=0   # databases this run has started
+JEX_DB_OPEN=""     # the database being exported ("" = none) ...
+JEX_DB_T0=0        # ... when it started (jex_elapsed) ...
+JEX_DB_STAGED0=0   # ... and how many paths were staged by then, to tell whether it got staged
+DEFERRED_DBS=""    # the databases the budget left for the next run, one per line, like FAILED_DBS
+DEFERRED_DB_COUNT=0
+JEX_TABLES_CUT=0   # supplemental tables the cutoff kept at their previous version
+
+# jex_elapsed — seconds this run has been going. $SECONDS is bash's own clock, the one the "end ... after Ns" line of jex_run_end reads. JEX_CLOCK_FILE is the selftest's seam: a file holding the elapsed
+# seconds, advanced by the stub Dolt, so a test sleeps no second and does not depend on the load. vazio/ilegível (not a plain number) → $SECONDS.
+jex_elapsed() {
+    local v=""
+    if [ -n "${JEX_CLOCK_FILE:-}" ]; then
+        v="$(cat "$JEX_CLOCK_FILE" 2>/dev/null)" || v=""
+        case "$v" in ''|*[!0-9]*) v="" ;; esac
+    fi
+    printf '%s\n' "${v:-$SECONDS}"
+}
+
+# jex_state_set <jq filter over the state, with $db $seq $tried $cost bound> — rewrites the state with the filter applied. falhou (jq cannot build it, the file cannot be written) → rc 1 and nothing is written:
+# an empty answer must never replace the state file, which also holds pending_spike_alerts and the push counters.
+jex_state_set() {
+    local filter="$1" db="${2:-}" updated
+    # `runs` is .db_runs when it is an object, {} for anything else (a state edited by hand or reset): the filter never fails on a shape this scheme did not write
+    updated="$(read_state_json | jq -c --arg db "$db" --argjson seq "${JEX_SEQ:-0}" --argjson tried "${3:-0}" --argjson cost "${4:-0}" "def runs: (.db_runs // {}) | if type == \"object\" then . else {} end; $filter" 2>/dev/null)" || updated=""
+    [ -n "$updated" ] || return 1
+    write_state_json "$updated"
+}
+
+# jex_budget_init — this run's number. vazio/ilegível (no whole number in the state: the first run of this scheme, or a state that was reset) → 0, so the run is number 1 and the order falls back to Dolt's.
+jex_budget_init() {
+    local seq
+    seq="$(read_state_json | jq -r '(.jex_seq // 0) | if type == "number" then floor else 0 end' 2>/dev/null)" || seq=""
+    case "$seq" in ''|*[!0-9]*) seq=0 ;; esac
+    [ "${#seq}" -le 9 ] || seq=0
+    JEX_SEQ=$((seq + 1))
+}
+
+# jex_order_databases <list> — the list, one database per line, the one STARTED longest ago first (never started = first; ties keep Dolt's order). The same databases, only in another order: the stalest goes first,
+# so the one the budget cut last run is the one that starts this run, and a database that is always last in Dolt's order is not the one that is never reached. vazio/falhou (the state or jq cannot answer) → the list as
+# it came: the budget still holds, only the fairness between runs is lost.
+jex_order_databases() {
+    local dbs="$1" state ordered
+    state="$(read_state_json)" || state='{}'
+    ordered="$(printf '%s\n' "$dbs" | jq -R -s -r --argjson st "$state" '
+        split("\n") | map(select(length > 0)) | to_entries
+        | sort_by([((($st.db_runs | if type == "object" then . else {} end)[.value] | if type == "object" then .tried else null end) | if type == "number" then . else -1 end), .key])
+        | map(.value)[]' 2>/dev/null)" || ordered=""
+    if [ -n "$ordered" ]; then
+        printf '%s\n' "$ordered"
+    else
+        printf '%s\n' "$dbs"
+    fi
+}
+
+# jex_db_fits <db> — rc 0 when the database may start, rc 1 (and JEX_FIT_NOTE says why) when what is left of the budget cannot hold its last observed cost x JEX_COST_MARGIN_PCT %. The first database of the
+# run always may. vazio/ilegível (no cost recorded for it) → JEX_UNKNOWN_COST_SECONDS, the same margin: never "free".
+JEX_FIT_NOTE=""
+jex_db_fits() {
+    local db="$1" cost src=observed need left
+    JEX_FIT_NOTE=""
+    [ "$JEX_DB_STARTED" -gt 0 ] || return 0
+    cost="$(read_state_json | jq -r --arg db "$db" '((.db_runs | if type == "object" then .[$db] else null end) | if type == "object" then .cost_s else null end) // empty | if type == "number" then floor else empty end' 2>/dev/null)" || cost=""
+    case "$cost" in ''|*[!0-9]*) cost="$JEX_UNKNOWN_COST_SECONDS"; src="never observed, assumed" ;; esac
+    [ "${#cost}" -le 9 ] || cost="$JEX_UNKNOWN_COST_SECONDS"
+    need=$(( cost * JEX_COST_MARGIN_PCT / 100 ))
+    left=$(( JEX_BUDGET_SECONDS - $(jex_elapsed) ))
+    [ "$need" -gt "$left" ] || return 0
+    JEX_FIT_NOTE="needs ~${need}s (last cost ${cost}s, $src), ${left}s left of the ${JEX_BUDGET_SECONDS}s budget"
+    return 1
+}
+
+# jex_db_defer <db> <why> — the budget leaves the database for the next run (where it goes first). Not a failure: no FAILED_DBS entry, no alarm; its files in the archive are not touched — HEAD has the last
+# snapshot and the offsite builds from HEAD. It is said in the log, the run's summary and the commit subject.
+jex_db_defer() {
+    DEFERRED_DBS="${DEFERRED_DBS}$1
+"
+    DEFERRED_DB_COUNT=$((DEFERRED_DB_COUNT + 1))
+    echo "jsonl-export: $1 deferred to the next run — $2" >&2
+    jex_log "DEFER $1 — $2"
+}
+
+# jex_db_begin <db> — a database starts: stamped in the state at once (a run killed inside it must still send it to the back of the next order). falhou → warn, the export goes on.
+jex_db_begin() {
+    JEX_DB_STARTED=$((JEX_DB_STARTED + 1))
+    JEX_DB_OPEN="$1"
+    JEX_DB_T0="$(jex_elapsed)"
+    JEX_DB_STAGED0="${#STAGE_PATHS[@]}"
+    jex_state_set '.jex_seq = $seq | .db_runs = (runs | .[$db] = ((.[$db] | if type == "object" then . else {} end) + {tried: $tried}))' "$1" "$((JEX_SEQ * 1000 + JEX_DB_STARTED))" \
+        || echo "jsonl-export: could not record the start of $1 in the state; the next run's order may repeat this one's" >&2
+}
+
+# jex_db_end — closes the database jex_db_begin opened (called at the top of the next turn of the loop and after it, since the loop leaves a database by `continue` in a dozen places). Its cost is recorded only
+# if it got staged: a database that failed at its first query would teach the next run that it is free. falhou → warn: the old cost stays.
+jex_db_end() {
+    local cost
+    [ -n "$JEX_DB_OPEN" ] || return 0
+    if [ "${#STAGE_PATHS[@]}" -gt "$JEX_DB_STAGED0" ]; then
+        cost=$(( $(jex_elapsed) - JEX_DB_T0 ))
+        [ "$cost" -ge 0 ] || cost=0
+        jex_state_set '.db_runs = (runs | .[$db] = ((.[$db] | if type == "object" then . else {} end) + {cost_s: $cost}))' "$JEX_DB_OPEN" 0 "$cost" \
+            || echo "jsonl-export: could not record the cost of $JEX_DB_OPEN in the state; the old one stays" >&2
+    fi
+    JEX_DB_OPEN=""
+}
+
+# jex_table_cutoff_passed — rc 0 once the run is past BUDGET - JEX_POST_RESERVE_SECONDS: no further supplemental table is started, what is left is the database's own scrub/validate and the commit.
+jex_table_cutoff_passed() {
+    [ "$(jex_elapsed)" -ge $(( JEX_BUDGET_SECONDS - JEX_POST_RESERVE_SECONDS )) ]
+}
+
 is_user_database() {
     case "$1" in
         information_schema|mysql|dolt_cluster|performance_schema|sys|__gc_probe|benchdb|testdb_*|beads_pt*|beads_vr*|beads_test_bench_*|doctest_*|doctortest_*)
@@ -1470,6 +1615,27 @@ partial_commit_note() {
     if [ -n "$PARTIAL_DBS" ]; then
         printf ' partial=%s' "$(printf '%s' "$PARTIAL_DBS" | paste -sd, -)"
     fi
+}
+
+# ", deferred: lexbh marketing " for a run summary / DOG_DONE nudge (ga-fegzc8h): the databases the time budget left for the next run. Empty when the run reached every database.
+# Deferred is not failed: nothing went wrong, the database's archive files were not touched and it goes first next run.
+deferred_note() {
+    if [ -n "$DEFERRED_DBS" ]; then
+        printf ', deferred: %s' "$(printf '%s' "$DEFERRED_DBS" | tr '\n' ' ')"
+    fi
+}
+
+# " deferred=lexbh,marketing" for an archive commit message. It is its own word and NOT "partial=": jsonl_hourly.py reads partial=db(table) as "this snapshot kept a stale table"
+# and alerts after JHO_ALERT_AFTER of them in a row, and a deferral is the normal state of a run that is under its budget.
+deferred_commit_note() {
+    if [ -n "$DEFERRED_DBS" ]; then
+        printf ' deferred=%s' "$(printf '%s' "$DEFERRED_DBS" | paste -sd, -)"
+    fi
+}
+
+# The "N" of "exported=N/M": the databases this run exported whole. Deferred ones are in M and not in N, and named by deferred_commit_note.
+exported_db_count() {
+    printf '%s' "$((TOTAL_DBS - FAILED_DB_COUNT - DEFERRED_DB_COUNT))"
 }
 
 # <db>.<table>'s own row count, unfiltered (ga-l6v576). vazio → never printed: an unreadable count is `return 1`, never a 0 that would read as "the table is empty".
@@ -1920,7 +2086,12 @@ if [ "$JEX_DISK_LIB_OK" = "1" ] && ! jex_stamp_export_start; then
     echo "jsonl-export: could not stamp last_export_at; the next tick will not be spaced out" >&2
 fi
 
+# ga-fegzc8h: the databases in the order of who waited longest, and this run's number (see JEX_BUDGET_SECONDS).
+jex_budget_init
+DATABASES="$(jex_order_databases "$DATABASES")"
+
 while IFS= read -r DB; do
+    jex_db_end   # the database the last turn left open: its cost goes to the state
     [ -z "$DB" ] && continue
     TOTAL_DBS=$((TOTAL_DBS + 1))
     DB_UNVERIFIED=0
@@ -1939,6 +2110,13 @@ while IFS= read -r DB; do
         TOTAL_DBS=$((TOTAL_DBS - 1))
         continue
     fi
+
+    # ga-fegzc8h: out of budget → the database waits for the next run, where it goes first. After the has_wisps_table check: a store that is not exported is not "deferred".
+    if ! jex_db_fits "$DB"; then
+        jex_db_defer "$DB" "$JEX_FIT_NOTE"
+        continue
+    fi
+    jex_db_begin "$DB"
 
     DB_DIR="$ARCHIVE_REPO/$DB"
     mkdir -p "$DB_DIR"
@@ -1988,6 +2166,18 @@ while IFS= read -r DB; do
     #   unrestorable-> the DB is discarded like any other failed step.
     SUPP_UNRESTORABLE=0
     for TABLE in $SUPP_TABLES; do
+        # ga-fegzc8h: past the table cutoff of the budget the table is not read — the previous version stays, like a table Dolt cut short (rc 1 below: named in partial=, issues still commit). The scrub/validate
+        # of this database and the commit still have to fit under the order's timeout. falhou (the previous version cannot be put back) → the database is discarded, like rc 2 of export_supplemental_table.
+        if jex_table_cutoff_passed; then
+            echo "jsonl-export: $DB.$TABLE not read: $(jex_elapsed)s into the ${JEX_BUDGET_SECONDS}s budget — the previous version stays" >&2
+            JEX_TABLES_CUT=$((JEX_TABLES_CUT + 1))
+            if ! keep_previous_table "$DB" "$TABLE"; then
+                SUPP_UNRESTORABLE=1
+                break
+            fi
+            DB_SHORT_TABLES="${DB_SHORT_TABLES:+$DB_SHORT_TABLES,}$TABLE"
+            continue
+        fi
         SUPP_RC=0
         export_supplemental_table "$DB" "$TABLE" || SUPP_RC=$?
         case "$SUPP_RC" in
@@ -2052,7 +2242,9 @@ while IFS= read -r DB; do
 "
         continue
     fi
-    if ! validate_exported_issues < "$TMPFILE" >/dev/null; then
+    # ga-fegzc8h: the validation and the row count of the payload that is about to become the snapshot are ONE pass (validate_and_count_issues). They were two jq passes over it, and a third and fourth
+    # for the same count below: on hq (96 MB, a single JSON document) each pass took 50-100 s at load 95, out of the ~530 s the database costs and the 690 s a run has.
+    if ! CURRENT_COUNT=$(validate_and_count_issues < "$TMPFILE"); then
         rm -f "$TMPFILE"
         discard_failed_db_outputs "$DB"
         FAILED_DB_COUNT=$((FAILED_DB_COUNT + 1))
@@ -2113,10 +2305,8 @@ while IFS= read -r DB; do
             ;;
     esac
 
-    # Count records from the final persisted payload (post-scrub / post-
-    # validation) so commit messages and DOG_DONE summaries reflect what was
-    # actually archived, not the pre-scrub raw export.
-    CURRENT_COUNT=$(count_jsonl_rows < "$DB_DIR/issues.jsonl")
+    # CURRENT_COUNT was counted from the final persisted payload (post-scrub / post-validation) by validate_and_count_issues above, so commit
+    # messages and DOG_DONE summaries reflect what was actually archived, not the pre-scrub raw export.
 
     # Step 3: Spike detection — compare record counts against previous commit.
     PREV_COUNT=0
@@ -2130,7 +2320,7 @@ while IFS= read -r DB; do
     # division-by-zero on line `DELTA=...` when the floor is set to 0 to
     # disable the small-N skip.
     if [ "$PREV_COUNT" -gt 0 ] && [ "$PREV_COUNT" -ge "$MIN_PREV_FOR_SPIKE_CHECK" ]; then
-        FILTERED_COUNT=$(count_jsonl_rows < "$DB_DIR/issues.jsonl")
+        FILTERED_COUNT=$CURRENT_COUNT
         DELTA=$(( (FILTERED_COUNT - PREV_COUNT) * 100 / PREV_COUNT ))
         if [ "$DELTA" -lt 0 ]; then
             DELTA=$(( -DELTA ))
@@ -2170,6 +2360,11 @@ while IFS= read -r DB; do
 done <<EOF
 $DATABASES
 EOF
+jex_db_end   # the last database of the run, when the loop ended on it
+# A run the budget did not touch writes nothing here (its `end rc=N after Ns` line says how long it took; the cost of each database is in the state): the log stays the record of what the budget CHANGED.
+if [ "$DEFERRED_DB_COUNT" -gt 0 ] || [ "$JEX_TABLES_CUT" -gt 0 ]; then
+    jex_log "budget: $(jex_elapsed)s of ${JEX_BUDGET_SECONDS}s used, ${DEFERRED_DB_COUNT} of ${TOTAL_DBS} database(s) deferred${DEFERRED_DBS:+ ($(printf '%s' "$DEFERRED_DBS" | tr '\n' ' '))}, ${JEX_TABLES_CUT} table(s) kept at their previous version, ${#STAGE_PATHS[@]} path(s) staged"
+fi
 
 cd "$ARCHIVE_REPO"
 if [ "${#STAGE_PATHS[@]}" -gt 0 ]; then
@@ -2188,9 +2383,9 @@ fi
 # until a later successful non-HALT run pushes the archive forward.
 if [ "$HALTED" -eq 1 ]; then
     if ! git diff --cached --quiet 2>/dev/null; then
-        EXPORTED_DBS=$((TOTAL_DBS - FAILED_DB_COUNT))
+        EXPORTED_DBS=$(exported_db_count)
         commit_archive_snapshot \
-            "[HALT] backup $(date -u +%Y-%m-%dT%H:%M:%SZ): exported=$EXPORTED_DBS/$TOTAL_DBS records=$TOTAL_EXPORTED$(unverified_commit_note)$(partial_commit_note) (spike detected; push skipped)" \
+            "[HALT] backup $(date -u +%Y-%m-%dT%H:%M:%SZ): exported=$EXPORTED_DBS/$TOTAL_DBS records=$TOTAL_EXPORTED$(unverified_commit_note)$(partial_commit_note)$(deferred_commit_note) (spike detected; push skipped)" \
             "HALT baseline" || {
             discard_staged_archive_outputs
             exit 1
@@ -2203,7 +2398,7 @@ if [ "$HALTED" -eq 1 ]; then
     else
         echo "jsonl-export: spike alert delivery failed; will retry from state" >&2
     fi
-    gc session nudge deacon/ "DOG_DONE: jsonl — HALTED on spike detection$(unverified_note)" 2>/dev/null || true
+    gc session nudge deacon/ "DOG_DONE: jsonl — HALTED on spike detection$(unverified_note)$(deferred_note)" 2>/dev/null || true
     exit 0
 fi
 
@@ -2218,36 +2413,36 @@ if git diff --cached --quiet 2>/dev/null; then
             PUSH_STATUS="skipped (local-only)"
         fi
         if [ -n "$FAILED_DBS" ]; then
-            EXPORTED_DBS=$((TOTAL_DBS - FAILED_DB_COUNT))
+            EXPORTED_DBS=$(exported_db_count)
             SUMMARY="jsonl — exported $EXPORTED_DBS/$TOTAL_DBS, records: $TOTAL_EXPORTED, push: $PUSH_STATUS, failed: $(printf '%s' "$FAILED_DBS" | tr '\n' ' ')"
         else
             SUMMARY="jsonl — no changes, push: $PUSH_STATUS"
         fi
-        SUMMARY="$SUMMARY$(unverified_note)"
+        SUMMARY="$SUMMARY$(unverified_note)$(deferred_note)"
         gc session nudge deacon/ "DOG_DONE: $SUMMARY" 2>/dev/null || true
         echo "jsonl-export: $SUMMARY"
         exit 0
     fi
     if [ -n "$FAILED_DBS" ]; then
-        EXPORTED_DBS=$((TOTAL_DBS - FAILED_DB_COUNT))
-        SUMMARY="jsonl — exported $EXPORTED_DBS/$TOTAL_DBS, records: $TOTAL_EXPORTED, push: skipped, failed: $(printf '%s' "$FAILED_DBS" | tr '\n' ' ')$(unverified_note)"
+        EXPORTED_DBS=$(exported_db_count)
+        SUMMARY="jsonl — exported $EXPORTED_DBS/$TOTAL_DBS, records: $TOTAL_EXPORTED, push: skipped, failed: $(printf '%s' "$FAILED_DBS" | tr '\n' ' ')$(unverified_note)$(deferred_note)"
         gc session nudge deacon/ "DOG_DONE: $SUMMARY" 2>/dev/null || true
         echo "jsonl-export: $SUMMARY"
         exit 0
     fi
-    # No changes. This exit prints nothing on a clean run; an unverified one still
+    # No changes. This exit prints nothing on a clean run; an unverified one, or one that deferred databases, still
     # says so on stdout, next to the nudge.
-    SUMMARY="jsonl — no changes$(unverified_note)"
+    SUMMARY="jsonl — no changes$(unverified_note)$(deferred_note)"
     gc session nudge deacon/ "DOG_DONE: $SUMMARY" 2>/dev/null || true
-    if [ -n "$UNVERIFIED_DBS" ]; then
+    if [ -n "$UNVERIFIED_DBS" ] || [ -n "$DEFERRED_DBS" ]; then
         echo "jsonl-export: $SUMMARY"
     fi
     exit 0
 fi
 
-EXPORTED_DBS=$((TOTAL_DBS - FAILED_DB_COUNT))
+EXPORTED_DBS=$(exported_db_count)
 commit_archive_snapshot \
-    "backup $(date -u +%Y-%m-%dT%H:%M:%SZ): exported=$EXPORTED_DBS/$TOTAL_DBS records=$TOTAL_EXPORTED$(unverified_commit_note)$(partial_commit_note)" \
+    "backup $(date -u +%Y-%m-%dT%H:%M:%SZ): exported=$EXPORTED_DBS/$TOTAL_DBS records=$TOTAL_EXPORTED$(unverified_commit_note)$(partial_commit_note)$(deferred_commit_note)" \
     "archive snapshot" || {
     discard_staged_archive_outputs
     exit 1
@@ -2267,7 +2462,7 @@ SUMMARY="jsonl — exported $EXPORTED_DBS/$TOTAL_DBS, records: $TOTAL_EXPORTED, 
 if [ -n "$FAILED_DBS" ]; then
     SUMMARY="$SUMMARY, failed: $(printf '%s' "$FAILED_DBS" | tr '\n' ' ')"
 fi
-SUMMARY="$SUMMARY$(unverified_note)"
+SUMMARY="$SUMMARY$(unverified_note)$(deferred_note)"
 
 gc session nudge deacon/ "DOG_DONE: $SUMMARY" 2>/dev/null || true
 echo "jsonl-export: $SUMMARY"
