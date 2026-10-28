@@ -11,6 +11,7 @@
 #   todos cobertos = rc 2 (não afirmo que nada novo precisa do node), fora da lista + Node ok = rc 0, + sem Node = rc 1 (sempre com a nota "conjunto = retrato") · derivação que não acha NENHUM teste = rc 2 ·
 #   globs indentados (o classificador faz strip dos dois lados) cobrem · sem subcomando, uso do guarda não muda.
 #   ga-u6ueg0q: a última linha da lista SEM quebra de linha no fim (editor que não grava o \n) ainda conta como glob.
+#   ga-iu0fvlo: SEM argumentos, a lista mac-only e o script do check vêm de AO LADO do guarda (HERE, derivado do $0 e não do cwd): copia o guarda para uma pasta com os dois e roda de OUTRO diretório.
 # MUTANTES: cada um troca UM trecho do guarda por uma versão frouxa (python3, substring exata e única); o caso apontado tem de FALHAR.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -62,7 +63,17 @@ c_deriva_vazia() { reset; mkps_vazio; mklist $FILES6; local rc; rc=$(run); eq "d
 c_glob_indentado() { reset; printf '# lista\n   tests/test_blow_*.py\n\t tests/test_scraper_status_blow_probe.py  \n' > "$LIST"; STUB_CHECK_RC=1; export STUB_CHECK_RC; local rc; rc=$(run); eq "globs indentados (o classificador faz strip dos dois lados) cobrem: rc 0" 0 "$rc"; eq "…e o check não é chamado" nao "$(called)"; }
 # a lista termina no meio de uma linha (sem \n): o `read` devolve rc 1 com o glob lido, e esse glob tem de valer — senão o último arquivo da lista volta a exigir o Node
 c_sem_quebra_final() { reset; printf '# lista\ntests/test_blow_*.py\ntests/test_scraper_status_blow_probe.py' > "$LIST"; STUB_CHECK_RC=1; export STUB_CHECK_RC; local rc; rc=$(run); eq "última linha da lista sem quebra de linha ainda cobre: rc 0" 0 "$rc"; eq "…e o check não é chamado" nao "$(called)"; }
-CASES="c_todos_na_lista c_fora_check_ok c_fora_check_falha c_fora_check_nao_sei c_um_so_fora c_script_ausente c_lista_ausente c_lista_sem_glob c_cobre_por_glob c_parecido_nao_cobre c_espaco_no_fim c_deriva_arquivo_novo c_retrato_cobertos c_retrato_fora_ok c_retrato_fora_falha c_ref_inexistente c_deriva_vazia c_glob_indentado c_sem_quebra_final"
+# sem argumentos o guarda lê a lista e chama o check de AO LADO de si mesmo: HERE sai do $0 (não do cwd). Se HERE ficasse vazio, a lista viraria /hetzner-mac-only.ps.txt (ausente) e o check /hetzner-nodejs.sh (ausente)
+c_defaults_ao_lado() {
+  reset; local L="$T/lado" rc; rm -rf "$L"; mkdir -p "$L"; cp "${SCRIPT:-$G}" "$L/hetzner-nodejs-guard.sh"; cp "$CHK" "$L/hetzner-nodejs.sh"
+  mklist $FILES6; cp "$LIST" "$L/hetzner-mac-only.ps.txt"
+  rc=$( ( cd "$T" && PS_GIT_DIR="$PSFIX/.git" PS_REF=main bash "$L/hetzner-nodejs-guard.sh" > "$T/out" 2>&1 ); echo $? )
+  eq "sem argumentos, a lista ao lado cobre os 6: rc 0 (lido de HERE, rodando de outro cwd)" 0 "$rc"; has "…e é a lista ao lado que decide" "$T/out" 'derivados do repositório.*não é exigido'; eq "…sem chamar o check" nao "$(called)"
+  mklist; cp "$LIST" "$L/hetzner-mac-only.ps.txt"; : > "$CALLS"
+  rc=$( ( cd "$T" && STUB_CHECK_RC=1 PS_GIT_DIR="$PSFIX/.git" PS_REF=main bash "$L/hetzner-nodejs-guard.sh" > "$T/out" 2>&1 ); echo $? )
+  eq "sem argumentos, lista ao lado sem os 6 e o check ao lado em rc 1: rc 1" 1 "$rc"; eq "…o check AO LADO foi chamado" sim "$(called)"
+}
+CASES="c_todos_na_lista c_fora_check_ok c_fora_check_falha c_fora_check_nao_sei c_um_so_fora c_script_ausente c_lista_ausente c_lista_sem_glob c_cobre_por_glob c_parecido_nao_cobre c_espaco_no_fim c_deriva_arquivo_novo c_retrato_cobertos c_retrato_fora_ok c_retrato_fora_falha c_ref_inexistente c_deriva_vazia c_glob_indentado c_sem_quebra_final c_defaults_ao_lado"
 for c in $CASES; do echo "== $c"; $c; done
 
 mutant() {   # nome · trecho original · trecho frouxo · caso que tem de pegar
@@ -96,6 +107,8 @@ mutant glob-casa-tudo         'case "$1" in $g) return 0 ;; esac' 'case "$1" in 
 mutant espaco-no-fim-fica     'g="${g%"${g##*[![:space:]]}"}"; ' '' c_espaco_no_fim
 mutant um-fora-nao-basta      'if [ "${#OUT[@]}" -eq 0 ]; then' 'if [ "${#OUT[@]}" -le 1 ]; then' c_um_so_fora
 mutant ultima-linha-perdida   'while IFS= read -r g || [ -n "$g" ]; do' 'while IFS= read -r g && [ -n "$g" ]; do' c_sem_quebra_final
+mutant here-vazio-sem-pwd    'HERE=$(cd "$(dirname "$0")" && pwd)' 'HERE=$(cd "$(dirname "$0")" || pwd)' c_defaults_ao_lado
+mutant default-do-check-no-cwd 'CHECK=${2:-$HERE/hetzner-nodejs.sh}' 'CHECK=${2:-./hetzner-nodejs.sh}' c_defaults_ao_lado
 
 echo
 echo "$n verificações, $fails falha(s)"
