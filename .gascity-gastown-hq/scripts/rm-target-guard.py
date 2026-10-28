@@ -179,8 +179,9 @@ def holds(d: str, git: bool = True) -> bool:
     if marked(d, git):
         return True
     bud = [LS_BUDGET]
+    kids = lambda x: [n for n in ls(x, bud) if git or n != ".git"]  # noqa: E731 — só dado: o `.git` de um clone (HEAD+objects+refs) parece um repo bare, mas é o clone, não dado
     try:
-        return any(real(pa) and (marked(pa, git) or any(real(pb) and marked(pb, git) for pb in (os.path.join(pa, b) for b in ls(pa, bud)))) for pa in (os.path.join(d, a) for a in ls(d, bud)))
+        return any(real(pa) and (marked(pa, git) or any(real(pb) and marked(pb, git) for pb in (os.path.join(pa, b) for b in kids(pa)))) for pa in (os.path.join(d, a) for a in kids(d)))
     except OverflowError:
         return True
 
@@ -407,12 +408,14 @@ def peel(ws: list, env: dict) -> list:
                 key, eq, val = o.partition("=") if o[:2] == "--" else (o[:2], "", o[2:])
                 if key in takes and not (eq or val):
                     val, ws = (ws[0] if ws else ""), ws[1:]
-                if b == "env" and key in ("-S", "--split-string"):
+                if (b == "env" and key in ("-S", "--split-string")) or (b == "npx" and key in ("-c", "--call")):  # o valor da opção é um comando inteiro numa palavra só
                     ws = [str(t) for t in lex(val)[0]] + ws
                 looked = looked or (b == "command" and key in ("-v", "-V"))
             if looked:
                 return []
             ws = ws[npos:]
+            if b == "flock" and ws[:1] in (["-c"], ["--command"]) and len(ws) > 1:  # `flock arquivo -c 'rm -rf x'`
+                ws = [str(t) for t in lex(ws[1])[0]] + ws[2:]
         else:
             break
     return ws
@@ -435,7 +438,7 @@ def cd_target(ws: list, cwds: list, env: dict):
 
 def inline(code: str, cwds: list, depth: int, env: dict):
     """Código inline de python/node/perl/ruby/awk. Confere `['rm','-rf',x]`, texto de shell com rm (`os.system`) e, se o código usa uma API de remoção (DEL), cada literal de caminho."""
-    deletes = bool(DEL.search(code))
+    deletes = bool(DEL.search(code) or RM_TEXT.search(code))  # verbo de remoção em qualquer parte (`'rm -rf ' + '/caminho'`) liga a leitura dos literais de caminho
     for m in ARGV.finditer(code):
         rest = m.group(2) if m.group(1) else m.group(4)  # literal vira o texto; expressão (variável, concatenação) vira UNK
         els = [g.group("s") if g.group("s") is not None else g.group("d") if g.group("d") is not None else UNK for g in ELEM.finditer(rest)]
@@ -460,6 +463,13 @@ def code_of(stage: list) -> list:
     """Textos que um estágio de pipe (ou o corpo de `<( )`) entrega como programa a quem o lê: cada palavra e, no echo/printf, os argumentos JUNTOS (`echo rm -rf x | bash`)."""
     ws = [str(t) for t in stage if not isinstance(t, Op)]
     return ws + ([" ".join(ws[1:])] if ws and os.path.basename(ws[0]) in ("echo", "printf") else [])
+
+
+def narrow(test: str, pat: str) -> bool:
+    """O padrão de um -name/-regex… filtra de verdade? Sem caractere literal (fora de [colchetes] e, no regex, de `.*` `.+` `\\`) casa tudo: `*`, `.*`, `.*[a-z].*`."""
+    s = re.sub(r"\[[^\]]*\]", "", pat)
+    s = re.sub(r"\\[wWdDsSbB]|\.[*+?]|\\", "", s) if test in ("-regex", "-iregex") else s
+    return bool(re.search(r"[A-Za-z0-9]", s))
 
 
 def fed(feed: list) -> list:
@@ -487,7 +497,8 @@ def scan_bash(cmd: str, cwds: list, depth: int = 0, env=None):
             feed = feed + [cur] if t in ("|", "|&") else []
             new = cd_target(cur, here, env)
             if new is not None:  # o cd só vale com certeza depois de `&&`; com `;` `||` `&` `|` ele pode ter falhado e o shell ficou onde estava: valem os dois (o pior vence)
-                here = new if t == "&&" else (here + [p for p in new if p not in here])[:4]
+                merged = here + [p for p in new if p not in here]
+                here = new if t == "&&" else merged if len(merged) <= 8 else merged[:7] + [None]  # nunca descarta o cwd mais novo: acima do teto entra um "não sei"
             if t == "(":
                 saved.append(here)
             elif t == ")" and saved:
@@ -525,9 +536,19 @@ def one(ws: list, cwds: list, depth: int, env: dict, feed: list, app=None):
         v = expand(ws[0], cwds[0], env)
         if len(v) == 1 and UNK not in v[0] and not re.search(r"[*?\[]", v[0]):
             ws = [v[0]] + ws[1:]
-        elif any(re.fullmatch(r"-[a-zA-Z]*[rR][a-zA-Z]*|--recur\w*", a) for a in ws[1:]):  # não sei que programa é, mas pede recursão: vale como rm
-            ws = ["rm"] + ws[1:]
+        else:  # não sei que programa é: com flag recursiva vale como rm; sem ela valem as regras absolutas nos operandos, e texto de shell com rm nos argumentos é lido
+            ops, rec = rm_args("rm", ws[1:])
+            for a in ws[1:]:
+                hit = scan_bash(a, cwds, depth + 1, env) if RM_TEXT.search(a) and re.search(r"\s", a.strip()) else None
+                if hit:
+                    return hit
+            return check(ops, rec, not rec, cwds, env)
     verb, args = os.path.basename(ws[0]), ws[1:]
+    if verb in ("export", "declare", "typeset", "local", "readonly"):  # `export D=x`: vale para os comandos seguintes
+        for a in args:
+            if ASSIGN.match(a):
+                env[a.split("=", 1)[0]] = [tilde(x) for x in expand(a.split("=", 1)[1], cwds[0], env)]
+        return None
     procs = [w[2:-1] for w in words if w[:2] in ("<(", ">(") and w.endswith(")")]  # `bash <(echo 'rm -rf x')`: a SAÍDA do corpo é o programa de quem o lê
     if verb in RM_VERBS:
         ops, rec = rm_args(verb, args)
@@ -556,8 +577,8 @@ def one(ws: list, cwds: list, depth: int, env: dict, feed: list, app=None):
                 hit = one(cmd[:end], cwds, depth, env, [])
                 if hit:
                     return hit
-        # filtro de nome só vale se tem ao menos 1 caractere literal fora de [colchetes]: `-name '*'`, `-name '.*'`, `-regex '.*'` casam tudo (`*.o` filtra)
-        sel = any(t in SELECT and x + 1 < len(expr) and re.search(r"[A-Za-z0-9]", re.sub(r"\[[^\]]*\]", "", expr[x + 1])) for x, t in enumerate(expr))
+        # filtro de nome só vale se filtra de verdade (narrow) e nada o anula: `-o`, `!`, `-not` fazem o -delete valer para o que o filtro NÃO casa
+        sel = not ({"!", "-not", "-o", "-or"} & set(expr)) and any(t in SELECT and x + 1 < len(expr) and narrow(t, expr[x + 1]) for x, t in enumerate(expr))
         return check(roots, True, sel, cwds, env) if rmish else None
     shellish = verb in SHELLS or verb in ("eval", "source", ".")
     if shellish or INTERP.fullmatch(verb):
