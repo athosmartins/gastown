@@ -20,6 +20,8 @@
 # CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (125 mutantes); e
 #   contra um stub que só sai 0 (o servidor ANTES desta fatia: o hook do mini era `drop` e nada o substituía), quase tudo falha.
 # VARIÁVEIS: RCG_UNDER_TEST (guarda a testar) · RCG_ONLY (grupos, vírgula) · RCG_NO_MUTANTS=1
+# BUDGET (grupo à parte, ga-tih62nv): o pedido que fazia o guarda girar SEM FIM (e que o hook deixava seguir sem conferência ao estourar o prazo de 600 s do Claude Code) termina;
+#   passou do teto de passos ou de tempo = BLOQUEADO, nunca liberado. Cada caso roda com prazo próprio (o guarda de antes não termina nesse pedido: o caso tem que reprovar, não pendurar).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 P="${RCG_UNDER_TEST:-$HERE/remote-clone-guard.py}"
@@ -825,8 +827,85 @@ g_hook() {  # o comando que vai no settings do servidor
   c="python3-que-nao-existe -I $P || exit 2"; sh -c "$c" <<<"$js" >/dev/null 2>&1; [ $? = 2 ]; ok $? "hook: python ausente (127) vira 2"
 }
 
+g_budget() {  # ga-tih62nv: o pedido que fazia o guarda girar SEM FIM (e que o hook deixava seguir sem conferência quando o prazo de 600 s do Claude Code estourava) termina; o que passa do teto de passos ou de tempo é BLOQUEADO, nunca liberado
+  local rp="$T/repro.txt" hn="$T/budget.py" capy="$T/cap.py" r
+  has() { grep -qF -- "$1" "$T/err"; }
+  calls() {  # calls K: K funções f1..fK, cada uma chama todas as outras, e a chamada de f1 (os passos crescem como K!: K=5 são ~300, K=8 são ~96 mil)
+    local k=$1 i j body out=""
+    for ((i = 1; i <= k; i++)); do
+      body=""
+      for ((j = 1; j <= k; j++)); do [ "$j" = "$i" ] || body="$body f$j;"; done
+      out="$out f$i() {$body }; "
+    done
+    echo "${out}f1"
+  }
+  # o pedido de 4 linhas / 438 caracteres do runbook (seção "Custo de tempo" da ga-tphd15o): definição de função + $((…)) + ${V#*/} + case numa linha, dentro do texto de um python
+  cat > "$rp" <<'EOF'
+     """    mn=$((mn+1)); [ $((mn % ${GCSSH_SHARD#*/})) = "${GCSSH_SHARD%/*}" ] || return  # GCSSH_SHARD=K/N: só o mutante de ordem ≡ K (mod N); a ordem conta TODOS, de qualquer grupo
+    [ -z "${GCSSH_MUTANTS_ONLY:-}" ] || case ",$1," in *",$GCSSH_MUTANTS_ONLY,"*) ;; *) return;; esac""")
+sub1("""  mutant() {  # mutant GRUPOS DESCRIÇÃO SED-EXPR""", """  mn=0; : "${GCSSH_SHARD:=0/1}"
+  mutant() {  # mutant GRUPOS DESCRIÇÃO SED-EXPR""")
+EOF
+  cat > "$capy" <<'PYEOF'
+import subprocess, sys
+# cap.py SEGUNDOS SCRIPT [ARGS…]: roda `python3 -I SCRIPT ARGS…` com prazo; estourou → mata e sai 124 (o `timeout` do coreutils não está no PATH do mini)
+try:
+    sys.exit(subprocess.run([sys.executable, "-I"] + sys.argv[2:], timeout=float(sys.argv[1])).returncode)
+except subprocess.TimeoutExpired:
+    sys.exit(124)
+PYEOF
+  cat > "$hn" <<'PYEOF'
+import importlib.util, io, signal, sys, time
+# budget.py GUARDA MODO: roda o main() do GUARDA com o relógio em 0.3 s e imprime `rc= dt= timer= analisar=` (timer = o relógio que sobrou armado; analisar = a recusa de tempo saiu no stderr)
+spec = importlib.util.spec_from_file_location("rcg", sys.argv[1])
+g = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(g)
+g.TIME_LIMIT = 0.3
+sys.stdin = io.StringIO('{"tool_name": "Bash", "cwd": "/", "tool_input": {"command": "echo oi"}}')
+if sys.argv[2] == "busy":  # o julgamento que nunca volta
+    def busy(*a):
+        while True:
+            pass
+    g.decide = busy
+elif sys.argv[2] == "stdin":  # o pedido nunca termina de chegar
+    class Hang(io.StringIO):
+        def read(self, *a):
+            time.sleep(30)
+            return ""
+    sys.stdin = Hang()
+elif sys.argv[2] == "twice":  # decide() zera o contador a cada pedido: dois pedidos de ~300 passos com teto de 500 não estouram
+    g.STEP_LIMIT = 500
+    cmd = "; ".join("echo a%d" % i for i in range(300))
+    for _ in range(2):
+        g.decide({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": "/"}, "/x", None)
+    print("rc=0 reset=ok")
+    sys.exit(0)
+err = io.StringIO()
+sys.stderr = err
+t = time.perf_counter()
+rc = g.main(["x"])
+sys.stderr = sys.__stderr__
+print("rc=%d dt=%.1f timer=%g analisar=%d" % (rc, time.perf_counter() - t, signal.getitimer(signal.ITIMER_REAL)[0], "não consegui analisar este pedido a tempo" in err.getvalue()))
+PYEOF
+  tb() {  # tb QUERO DESCRIÇÃO COMANDO — como b, mas com prazo de 20 s: o guarda de antes NÃO termina neste pedido, e o caso tem que REPROVAR (rc 124), não pendurar o selftest
+    (cd "$OWN" && CLAUDE_PROJECT_DIR="$OWN" python3 -I "$capy" 20 "$P" >"$T/o" 2>"$T/err" < <(mk Bash "$OWN" command "$3")); RC=$?
+    [ "$RC" = "$1" ]; ok $? "$2 (rc=$RC, queria $1)"
+  }
+  tb 0 "budget: o pedido de 438 caracteres do runbook (função + conta + case numa linha) termina e libera" "$(cat "$rp")"
+  tb 2 "budget: o mesmo pedido com um git -C <alheio> commit no fim é BLOQUEADO (terminar não custa o veredito)" "$(cat "$rp")"$'\n'"git -C $OTH commit -m x"
+  has "$OTH" && ! has "a tempo"; ok $? "budget: ...e a recusa é a de sempre (diz o alvo alheio), não a de tempo"
+  tb 0 "budget: o mesmo pedido seguido de cd <próprio> && git commit libera (o diretório volta a ser conhecido depois da chamada)" "$(cat "$rp")"$'\n'"cd $OWN && git commit -m x"
+  tb 2 "budget: 8 funções que chamam todas as outras (~96 mil passos) passam do teto e são BLOQUEADAS, não liberadas" "$(calls 8)"
+  has "NÃO É CANCELAMENTO DO USUÁRIO" && has "não consegui analisar este pedido a tempo" && has "passos de conferência" && has "um comando por chamada"; ok $? "budget: ...a recusa diz que é política automática, que faltou tempo/passos e como reescrever"
+  tb 0 "budget: controle — 5 funções que chamam todas as outras (~300 passos) passam" "$(calls 5)"
+  r=$(python3 -I "$capy" 10 "$hn" "$P" busy 2>&1); echo "$r" | grep -qF "rc=2 " && echo "$r" | grep -qF "timer=0 " && echo "$r" | grep -qF "analisar=1"; ok $? "budget: o julgamento que gira sem fim é cortado pelo relógio (0.3 s no teste): sai 2, diz que não deu tempo e o relógio fica desarmado [$r]"
+  r=$(python3 -I "$capy" 10 "$hn" "$P" stdin 2>&1); echo "$r" | grep -qF "rc=2 " && echo "$r" | grep -qF "analisar=1"; ok $? "budget: o relógio já está armado quando o guarda lê o stdin: pedido que nunca termina de chegar é BLOQUEADO [$r]"
+  r=$(python3 -I "$capy" 10 "$hn" "$P" ok 2>&1); echo "$r" | grep -qF "rc=0 " && echo "$r" | grep -qF "timer=0 "; ok $? "budget: pedido comum libera e deixa o relógio desarmado [$r]"
+  r=$(python3 -I "$capy" 10 "$hn" "$P" twice 2>&1); echo "$r" | grep -qF "reset=ok"; ok $? "budget: decide() zera o contador de passos a cada pedido [$r]"
+}
+
 all() { group block && g_block; group pass && g_pass; group evade && g_evade; group closed && g_closed; group shell && g_shell; group wrap && g_wrap; g_lex; g_dest; group cfg && g_cfg; group tools && g_tools; group msg && g_msg; group cond && g_cond; group ctx && g_ctx; group fuzz && g_fuzz
-        group check && g_check; group hook && g_hook; return 0; }
+        group check && g_check; group hook && g_hook; group budget && g_budget; return 0; }
 
 if [ -n "${RCG_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
 all
@@ -980,6 +1059,17 @@ echo "== $((n-fails))/$n ok =="
   mutant check "selfcheck ignora campo extra do hook (if, async…)" 's/ and set(h) <= {"type", "command", "timeout"}//'
   mutant check "selfcheck ignora campo extra do grupo" 's/ and set(g) <= {"matcher", "hooks"}//'
   mutant check "selfcheck não exige type=command" 's/ and h.get("type") == "command"//'
+  mutant budget "um { guardado, ao reexecutar um corpo, reabre a definição (o laço sem fim do pedido do runbook)" 's/if not st.get("calling") and (seg\[:1\] == \["{"\]/if (seg[:1] == ["{"]/'
+  mutant budget "o corpo que não fecha, reexecutado no fim, volta a poder reabrir a definição" 's/^        st.setdefault("calling", set()).add(st\["fname"\]).*/        pass/'
+  mutant budget "sem contar os trechos de one() o teto de passos nunca vale" 's/^        tick()$/        pass/'
+  mutant budget "teto de passos gigante" 's/^STEP_LIMIT, TIME_LIMIT, WORK = 50000,/STEP_LIMIT, TIME_LIMIT, WORK = 10**9,/'
+  mutant budget "o contador de passos não zera a cada pedido" 's/^    WORK\[0\] = 0$/    pass/'
+  mutant budget "o relógio não é armado" 's/^    signal.setitimer(signal.ITIMER_REAL, TIME_LIMIT).*/    pass/'
+  mutant budget "o relógio só é armado depois de ler o stdin" 's/^    signal.setitimer(signal.ITIMER_REAL, TIME_LIMIT).*/    pass/;s/^    raw = sys.stdin.read()$/    raw = sys.stdin.read(); signal.setitimer(signal.ITIMER_REAL, TIME_LIMIT)/'
+  mutant budget "sem tratador de SIGALRM o alarme MATA o guarda, sem a recusa" 's/^    signal.signal(signal.SIGALRM, expired)$/    pass/'
+  mutant budget "o relógio continua armado depois do veredito" 's/^        signal.setitimer(signal.ITIMER_REAL, 0)$/        pass/'
+  mutant budget "o estouro dentro do julgamento cai no 'o guarda falhou' (sem a recusa de tempo)" 's/^    except Budget:$/    except KeyError:/'
+  mutant budget "main() não pega o estouro" 's/^    except Budget as e:/    except KeyError as e:/'
   echo "-- contra um stub que só sai 0 (o servidor ANTES desta fatia)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"; printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$T/stub.py"
   r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,shell,wrap,lex,dest,cfg,tools,msg,check,cond" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"
