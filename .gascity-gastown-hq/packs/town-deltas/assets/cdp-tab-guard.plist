@@ -24,7 +24,7 @@
        ("SKIP locked"). Every knob is an env var (CDP_TAB_GUARD_*, listed in the script header);
        none is set here, so the defaults apply: armed, 1536 MB ceiling, 10 min idle.
 
-       EXTENSION RENDERERS (ga-1wvxej0): a renderer launched with --extension-process whose
+       EXTENSION RENDERERS (ga-1wvxej0): a renderer launched with the extension-process flag whose
        FOOTPRINT stays >= 1536 MB for >= 120 s is recycled on its own (SIGTERM to that one pid,
        SIGKILL 5 s later if it is still there; at most 2 per hour), instead of waiting for
        chrome_cdp_watchdog.sh to recycle the WHOLE Chrome at 4096 MB after 900 s. Chrome respawns
