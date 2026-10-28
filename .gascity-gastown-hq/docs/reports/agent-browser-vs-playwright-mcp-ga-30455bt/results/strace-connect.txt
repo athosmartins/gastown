@@ -1,0 +1,4 @@
+connect() calls by target (agent-browser CLI + daemon, commands: batch(open,snapshot -i), snapshot, wait --url, get title, snapshot -i --delta, close):
+    3  AF_INET 127.0.0.1:47222
+   16  AF_UNIX /tmp/abe/<session>.sock
+non-loopback connects: 0

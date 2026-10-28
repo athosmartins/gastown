@@ -1,0 +1,15 @@
+## AB WITH --pin-tab, fresh sessions pavcow pbvcow ; start tabs = ["12CFE7:about:blank"]
+pavcow open A1 -> ✓ TAB-A1 http://127.0.0.1:47811/tab/A1
+pbvcow open B1 -> ✓ TAB-B1 http://127.0.0.1:47811/tab/B1
+tabs now ["E16754:/tab/B1","79157C:/tab/A1","12CFE7:about:blank"]
+pavcow title: TAB-A1 | pbvcow title: TAB-B1
+pbvcow re-open B2 -> ✓ TAB-B2 http://127.0.0.1:47811/tab/B2
+after pbvcow re-open:  pavcow title: TAB-A1 | pbvcow title: TAB-B2 | tabs ["E16754:/tab/B2","79157C:/tab/A1","12CFE7:about:blank"]
+pbvcow tab list -> ["12CFE7:about:blank","79157C:/tab/A1","E16754:/tab/B2*"]
+pbvcow tries to take pavcow tab -> [exit 1] ✗ tab_locked: tab 79157C0B646FA4CDB6321CE308724E0B is pinned by session 'pavcow' (--pin-tab); close that session or use another tab
+human opens a tab -> tabs ["C5672B:/tab/HUMAN","E16754:/tab/B2","79157C:/tab/A1","12CFE7:about:blank"] | pavcow title: TAB-A1 | pbvcow title: TAB-B2
+pavcow tab closed externally; get title -> [exit 1] ✗ tab_gone: bound tab is gone (target 79157C0B646FA4CDB6321CE308724E0B, last url http://127.0.0.1:47811/tab/A1). Run `agent-browser tab new <url>` to bind a new tab, or `agent-browser tab list` to pick an existing one
+pavcow click-like action on a gone tab (eval) -> [exit 1] ✗ tab_gone: bound tab is gone (target 79157C0B646FA4CDB6321CE308724E0B, last url http://127.0.0.1:47811/tab/A1). Run `agent-browser tab new <url>` to bind a new tab, or `agent-browser tab list` to pick an existing one
+pbvcow unaffected -> TAB-B2
+pavcow recover with tab new -> http://127.0.0.1:47811/tab/A2 | pavcow title: TAB-A2
+after both close -> tabs ["16BA4A:/tab/A2","C5672B:/tab/HUMAN","E16754:/tab/B2","12CFE7:about:blank"] | chrome alive: true

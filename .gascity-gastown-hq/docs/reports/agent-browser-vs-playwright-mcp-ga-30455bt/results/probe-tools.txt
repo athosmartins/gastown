@@ -1,0 +1,3 @@
+{"label": "pw-mcp-default", "server": {"name": "Playwright", "version": "1.64.0-alpha-1790635538000"}, "protocol": "2025-06-18", "tools": 25, "bytes": 17616, "o200k": 3764, "cl100k": 3688}
+{"label": "ab-mcp-core", "server": {"name": "agent-browser", "title": "agent-browser", "version": "0.40.0"}, "protocol": "2025-06-18", "tools": 29, "bytes": 79991, "o200k": 16851, "cl100k": 16187}
+{"label": "ab-mcp-all", "server": {"name": "agent-browser", "title": "agent-browser", "version": "0.40.0"}, "protocol": "2025-06-18", "tools": 156, "bytes": 417365, "o200k": 87943, "cl100k": 84412}

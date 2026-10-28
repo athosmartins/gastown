@@ -1,0 +1,26 @@
+## PW-MCP: two MCP server processes, same Chrome; start tabs = ["3ACA53:about:blank"]
+PW1 navigate /tab/A1 -> tabs ["3ACA53:/tab/A1"]
+PW2 navigate /tab/B1 -> tabs ["3ACA53:/tab/B1"]
+PW1 snapshot sees: TAB-B1 | PW2 sees: TAB-B1
+after PW2 navigates again: PW1 sees: TAB-B2 | tabs ["3ACA53:/tab/B2"]
+PW1 browser_tabs list -> ### Result - 0: (current) [TAB-B2](http://127.0.0.1:47811/tab/B2) 
+after PW1 browser_close -> tabs ["3ACA53:/tab/B2"] | PW2 still sees: TAB-B2
+after both MCP processes exit -> tabs ["3ACA53:/tab/B2"] | chrome alive: true
+
+## AB without --pin-tab (2 sessions, --cdp); start tabs = ["BC9319:about:blank"]
+s1 open /tab/A1 -> tabs ["BC9319:/tab/A1"]
+s2 open /tab/B1 -> tabs ["BC9319:/tab/B1"]
+s1 get title: TAB-B1 | s2 get title: TAB-B1
+after both close -> tabs ["BC9319:/tab/B1"] | chrome alive: true
+
+## AB WITH --pin-tab; start tabs = ["BE7B95:about:blank"]
+s1 open: [exit 1] ✗ tab_gone: bound tab is gone (target BC93199D09455026FB0D838E97DF3F0A, last url http://127.0.0.1:47811/tab/B1). Run `agent-browser tab new <url>` to bind a new tab, or `agent-browser tab list` to pick an existing one
+s2 open: [exit 1] ✗ tab_gone: bound tab is gone (target BC93199D09455026FB0D838E97DF3F0A, last url http://127.0.0.1:47811/tab/B1). Run `agent-browser tab new <url>` to bind a new tab, or `agent-browser tab list` to pick an existing one
+tabs now ["BE7B95:about:blank"]
+s1 get title: [exit 1] ✗ tab_gone: bound tab is gone (target BC93199D09455026FB0D838E97DF3F0A, last url http://127.0.0.1:47811/tab/B1). Run `agent-browser tab new <url>` to bind a new tab, or `agent-browser tab list` to pick an existing one | s2 get title: [exit 1] ✗ tab_gone: bound tab is gone (target BC93199D09455026FB0D838E97DF3F0A, last url http://127.0.0.1:47811/tab/B1). Run `agent-browser tab new <url>` to bind a new tab, or `agent-browser tab list` to pick an existing one
+after s2 re-open B2: s1 get title: [exit 1] ✗ tab_gone: bound tab is gone (target BC93199D09455026FB0D838E97DF3F0A, last url http://127.0.0.1:47811/tab/B1). Run `agent-browser tab new <url>` to bind a new tab, or `agent-browser tab list` to pick an existing one | s2: [exit 1] ✗ tab_gone: bound tab is gone (target BC93199D09455026FB0D838E97DF3F0A, last url http://127.0.0.1:47811/tab/B1). Run `agent-browser tab new <url>` to bind a new tab, or `agent-browser tab list` to pick an existing one
+s2 tab list --json -> {"success":true,"data":{"lifecycle":{"effectiveLaunch":{"browserLaunched":true,"engine":"chrome","launchHash":18130743080645134114},"launched":false,"relaunchedBrowser":false,"restartedBackground":false,"restoreStatus":"not_configured","reused":true,"saveStatus":"not_attempted"},"tabs":[{"active":false,"label":null,"tabId":"t1","targetId":"BE7B95148C5E8E1D0A1A7CD86E447BD7","title":"about:blank","type":"page","url":"a
+s1 tab targetId parsed from s2 list: (not parsed)
+s1 tab closed externally; s1 get title -> [exit 1] ✗ tab_gone: bound tab is gone (target BC93199D09455026FB0D838E97DF3F0A, last url http://127.0.0.1:47811/tab/B1). Run `agent-browser tab new <url>` to bind a new tab, or `agent-browser tab list` to pick an existing one
+s2 still fine -> [exit 1] ✗ tab_gone: bound tab is gone (target BC93199D09455026FB0D838E97DF3F0A, last url http://127.0.0.1:47811/tab/B1). Run `agent-browser tab new <url>` to bind a new tab, or `agent-browser tab list` to pick an existing one | tabs ["BE7B95:about:blank"]
+after both close -> tabs ["BE7B95:about:blank"] | chrome alive: true

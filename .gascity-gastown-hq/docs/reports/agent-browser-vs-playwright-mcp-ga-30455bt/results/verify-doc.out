@@ -1,0 +1,73 @@
+OK   report.txt has 8 cost rows
+OK   doc section 3 has 8 rows
+OK   sec3 pw-A <- 'pw-A (snapshot em 4 pontos)'
+OK   sec3 pw-B <- 'pw-B (snapshot em 2 pontos)'
+OK   sec3 pw-B2 <- 'pw-B2 (melhor do Playwright)'
+OK   sec3 ab-full-A <- 'ab `snapshot` (A)'
+OK   sec3 ab-c-A <- 'ab `-c` (A)'
+OK   sec3 ab-i-A <- 'ab `-i` (A)'
+OK   sec3 ab-i-B <- 'ab `-i` (B, comando-a-comando)'
+OK   sec3 ab-batch <- 'ab `batch` + `-i`'
+OK   batch = 28% / 38% of pw-A
+OK   batch vs pw-B2: -37% / -43% (63% / 57%)
+OK   ab-i-B @200k = 104% of pw-A and 142% of pw-B
+OK   batch is 4 calls, pw-B2 is 8, ab one-command-per-call is 13
+OK   without static, batch is 46% below pw-B2 at B=30k
+OK   doc section 2 has 5 rows
+OK   sec2 login
+OK   sec2 form
+OK   sec2 todo
+OK   sec2 dashboard
+OK   sec2 heavy
+OK   -i reductions are -68/-64/-72/-66/-73
+OK   ab full snapshot reductions span ~0..49%
+OK   PW direct RSS init 117-119
+OK   PW direct RSS 1st snapshot 128-130
+OK   PW direct RSS end 139-140
+OK   PW direct PSS 92-94 -> 113-115 (contains all values, < 1 MB slack)
+OK   PW npx RSS 192 -> 204 with 3 procs
+OK   PW npx PSS 132 -> 143
+OK   npx tree: npm exec 76 / sh 2 / node 126
+OK   AB daemon 1st snapshot ~11 MB
+OK   AB daemon end (B/batch) ~12 MB
+OK   AB daemon end (A) 21-23 MB
+OK   ratios: direct/AB ~11x, npx/AB ~16x, worst-case ~6x
+OK   static number 17616 present in saved evidence
+OK   static number 3764 present in saved evidence
+OK   static number 79991 present in saved evidence
+OK   static number 16851 present in saved evidence
+OK   static number 417365 present in saved evidence
+OK   static number 87943 present in saved evidence
+OK   static number 39038 present in saved evidence
+OK   static number 8571 present in saved evidence
+OK   static number 28109 present in saved evidence
+OK   static number 6065 present in saved evidence
+OK   static number 35705 present in saved evidence
+OK   static number 7926 present in saved evidence
+OK   static number 7557 present in saved evidence
+OK   static number 2046 present in saved evidence
+OK   tool counts 25 / 29 / 156
+OK   todo: -i full again ~500 (490-520)
+OK   todo: -i --delta = 80 on every click
+OK   todo: pw snapshot ~1.700 (1677-1709)
+OK   todo: pw find 138-161
+OK   heavy: -i --delta = unchanged, 7 tokens
+OK   heavy: pw snapshot after the click = 70.808
+OK   heavy --delta: baseline 39508, deltas 94/2236/94, all see the note
+OK   heavy -c --delta: deltas 7/58/7, never see the note
+OK   navigating flow: -i --delta == -i == 5135
+OK   compact-hides-text: DOM truth = 1 note
+OK   compact-hides-text: full snapshot sees it (1)
+OK   compact-hides-text: -c, -i and -i -c do not (0)
+OK   strace: only loopback CDP + unix socket, 0 non-loopback connects
+OK   PW x2: PW1 sees TAB-B1 (PW2's page), same single tab
+OK   PW x2: after PW2 re-navigates PW1 sees TAB-B2
+OK   AB without --pin-tab: both sessions see TAB-B1
+OK   pin: three tabs (blank kept + A1 + B1)
+OK   pin: a stays on A1 while b goes to B2
+OK   pin: tab_locked when b takes a's tab
+OK   pin: a human tab steals nothing
+OK   pin: tab_gone on get title and on eval; b unaffected; recover via tab new
+OK   pin: tabs REMAIN after close, Chrome alive
+
+ALL OK

@@ -1,0 +1,9 @@
+✓ Web browser - Wikipedia
+add-note ref=e2
+DOM truth: #notes li count = 1
+lines containing 'Note 1 saved' (0 = the mode cannot see the change):
+  snapshot (full)   : 1
+  snapshot -c       : 0
+  snapshot -i       : 0
+  snapshot -i -c    : 0
+✓ Browser closed

@@ -1,0 +1,163 @@
+{
+ "config": "ab-i-B",
+ "calls": 13,
+ "respTok": 477,
+ "respTokCl": 484,
+ "respBytes": 1433,
+ "callTok": 297,
+ "steps": [
+  {
+   "n": 1,
+   "step": "nav-login",
+   "tool": "Bash",
+   "callTok": 33,
+   "respBytes": 63,
+   "respTok": 25,
+   "respTokCl": 24
+  },
+  {
+   "n": 2,
+   "step": "snap-login",
+   "tool": "Bash",
+   "callTok": 16,
+   "respBytes": 490,
+   "respTok": 160,
+   "respTokCl": 158
+  },
+  {
+   "n": 3,
+   "step": "fill-user",
+   "tool": "Bash",
+   "callTok": 19,
+   "respBytes": 9,
+   "respTok": 3,
+   "respTokCl": 4
+  },
+  {
+   "n": 4,
+   "step": "fill-pass",
+   "tool": "Bash",
+   "callTok": 19,
+   "respBytes": 9,
+   "respTok": 3,
+   "respTokCl": 4
+  },
+  {
+   "n": 5,
+   "step": "click-signin",
+   "tool": "Bash",
+   "callTok": 17,
+   "respBytes": 9,
+   "respTok": 3,
+   "respTokCl": 4
+  },
+  {
+   "n": 6,
+   "step": "wait-dash",
+   "tool": "Bash",
+   "callTok": 19,
+   "respBytes": 33,
+   "respTok": 14,
+   "respTokCl": 14
+  },
+  {
+   "n": 7,
+   "step": "check-dash",
+   "tool": "Bash",
+   "callTok": 15,
+   "respBytes": 12,
+   "respTok": 4,
+   "respTokCl": 4
+  },
+  {
+   "n": 8,
+   "step": "nav-form",
+   "tool": "Bash",
+   "callTok": 27,
+   "respBytes": 35,
+   "respTok": 17,
+   "respTokCl": 18
+  },
+  {
+   "n": 9,
+   "step": "snap-form",
+   "tool": "Bash",
+   "callTok": 16,
+   "respBytes": 670,
+   "respTok": 212,
+   "respTokCl": 212
+  },
+  {
+   "n": 10,
+   "step": "fill-form",
+   "tool": "Bash",
+   "callTok": 65,
+   "respBytes": 49,
+   "respTok": 15,
+   "respTokCl": 20
+  },
+  {
+   "n": 11,
+   "step": "click-submit",
+   "tool": "Bash",
+   "callTok": 17,
+   "respBytes": 9,
+   "respTok": 3,
+   "respTokCl": 4
+  },
+  {
+   "n": 12,
+   "step": "wait-done",
+   "tool": "Bash",
+   "callTok": 19,
+   "respBytes": 30,
+   "respTok": 15,
+   "respTokCl": 15
+  },
+  {
+   "n": 13,
+   "step": "check-done",
+   "tool": "Bash",
+   "callTok": 15,
+   "respBytes": 15,
+   "respTok": 3,
+   "respTokCl": 3
+  }
+ ],
+ "mem": {
+  "afterFirstSnapshot": {
+   "procs": 1,
+   "rssKB": 11452,
+   "pssKB": 9909,
+   "privKB": 9892,
+   "hwmKB": 11452,
+   "rows": [
+    {
+     "pid": "3227674",
+     "cmd": "/tmp/claude-1000/-home-runner-gt-remote-git-gascity-wt-dog-remote-gawispa2pmaz/ee0ff7a6-6a",
+     "rss": 11452,
+     "hwm": 11452,
+     "pss": 9909,
+     "priv": 9892
+    }
+   ]
+  },
+  "afterTask": {
+   "procs": 1,
+   "rssKB": 12476,
+   "pssKB": 10933,
+   "privKB": 10916,
+   "hwmKB": 12476,
+   "rows": [
+    {
+     "pid": "3227674",
+     "cmd": "/tmp/claude-1000/-home-runner-gt-remote-git-gascity-wt-dog-remote-gawispa2pmaz/ee0ff7a6-6a",
+     "rss": 12476,
+     "hwm": 12476,
+     "pss": 10933,
+     "priv": 10916
+    }
+   ]
+  }
+ }
+}

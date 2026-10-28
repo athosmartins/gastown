@@ -1,0 +1,135 @@
+{
+ "config": "pw-B2",
+ "calls": 8,
+ "respTok": 1656,
+ "respTokCl": 1641,
+ "respBytes": 5200,
+ "callTok": 279,
+ "steps": [
+  {
+   "n": 1,
+   "step": "nav-login",
+   "tool": "browser_navigate",
+   "callTok": 25,
+   "respBytes": 252,
+   "respTok": 94,
+   "respTokCl": 92
+  },
+  {
+   "n": 2,
+   "step": "snap-login",
+   "tool": "browser_snapshot",
+   "callTok": 10,
+   "respBytes": 1747,
+   "respTok": 507,
+   "respTokCl": 503
+  },
+  {
+   "n": 3,
+   "step": "fill-login",
+   "tool": "browser_fill_form",
+   "callTok": 50,
+   "respBytes": 197,
+   "respTok": 54,
+   "respTokCl": 52
+  },
+  {
+   "n": 4,
+   "step": "click-signin",
+   "tool": "browser_click",
+   "callTok": 19,
+   "respBytes": 377,
+   "respTok": 137,
+   "respTokCl": 135
+  },
+  {
+   "n": 5,
+   "step": "nav-form",
+   "tool": "browser_navigate",
+   "callTok": 25,
+   "respBytes": 208,
+   "respTok": 81,
+   "respTokCl": 81
+  },
+  {
+   "n": 6,
+   "step": "snap-form",
+   "tool": "browser_snapshot",
+   "callTok": 10,
+   "respBytes": 1758,
+   "respTok": 582,
+   "respTokCl": 583
+  },
+  {
+   "n": 7,
+   "step": "fill-form",
+   "tool": "browser_fill_form",
+   "callTok": 119,
+   "respBytes": 404,
+   "respTok": 112,
+   "respTokCl": 107
+  },
+  {
+   "n": 8,
+   "step": "click-submit",
+   "tool": "browser_click",
+   "callTok": 21,
+   "respBytes": 257,
+   "respTok": 89,
+   "respTokCl": 88
+  }
+ ],
+ "mem": {
+  "afterInit": {
+   "procs": 1,
+   "rssKB": 121892,
+   "pssKB": 95736,
+   "privKB": 83696,
+   "hwmKB": 121892,
+   "rows": [
+    {
+     "pid": "3335654",
+     "cmd": "/home/runner/.local/node-v22.22.3-linux-arm64/bin/node /tmp/claude-1000/-home-runner-gt-re",
+     "rss": 121892,
+     "hwm": 121892,
+     "pss": 95736,
+     "priv": 83696
+    }
+   ]
+  },
+  "afterFirstSnapshot": {
+   "procs": 1,
+   "rssKB": 133380,
+   "pssKB": 107061,
+   "privKB": 94900,
+   "hwmKB": 133380,
+   "rows": [
+    {
+     "pid": "3335654",
+     "cmd": "/home/runner/.local/node-v22.22.3-linux-arm64/bin/node /tmp/claude-1000/-home-runner-gt-re",
+     "rss": 133380,
+     "hwm": 133380,
+     "pss": 107061,
+     "priv": 94900
+    }
+   ]
+  },
+  "afterTask": {
+   "procs": 1,
+   "rssKB": 142660,
+   "pssKB": 116341,
+   "privKB": 104180,
+   "hwmKB": 142660,
+   "rows": [
+    {
+     "pid": "3335654",
+     "cmd": "/home/runner/.local/node-v22.22.3-linux-arm64/bin/node /tmp/claude-1000/-home-runner-gt-re",
+     "rss": 142660,
+     "hwm": 142660,
+     "pss": 116341,
+     "priv": 104180
+    }
+   ]
+  }
+ }
+}

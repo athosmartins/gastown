@@ -1,0 +1,31 @@
+calibration: real/o200k per sample = 1.414 / 1.47 / 1.44  -> K=1.441
+
+| config | calls | tool results (o200k) | calls (o200k) | context added (real) | ITE B=30k | ITE B=30k +static | vs pw-A | ITE B=200k +static | vs pw-A |
+|---|---|---|---|---|---|---|---|---|---|
+| pw-A | 11 | 15357 | 285 | 22538 | 79731 | 86240 | 100% | 290240 | 100% |
+| pw-B | 9 | 1667 | 265 | 2782 | 36734 | 42158 | 49% | 212158 | 73% |
+| pw-B2 | 8 | 1656 | 279 | 2786 | 33742 | 38624 | 45% | 191624 | 66% |
+| ab-full-A | 13 | 7882 | 291 | 11774 | 67105 | 84396 | 98% | 322396 | 111% |
+| ab-c-A | 13 | 6429 | 299 | 9693 | 63097 | 80388 | 93% | 318388 | 110% |
+| ab-i-A | 13 | 5135 | 299 | 7828 | 59450 | 76741 | 89% | 314741 | 108% |
+| ab-i-B | 13 | 477 | 297 | 1113 | 46357 | 63648 | 74% | 301648 | 104% |
+| ab-batch | 4 | 477 | 221 | 1006 | 18109 | 24284 | 28% | 109284 | 38% |
+
+snapshot size per page (o200k)  [real Claude ~ x1.441]
+| page | pw snapshot | pw snapshot depth=3 | pw find controls | ab snapshot | ab -i | ab -c | ab -d 3 |
+|---|---|---|---|---|---|---|---|
+| login | 507 | 212 | 490 | 336 | 160 | 253 | 319 |
+| form | 582 | 443 | 582 | 432 | 212 | 408 | 339 |
+| todo | 1725 | 1725 | 1717 | 1733 | 484 | 1453 | 1733 |
+| dashboard | 13564 | 253 | 16211 | 6951 | 4650 | 5655 | 321 |
+| heavy | 70784 | 332 | 72758 | 39900 | 18998 | 37699 | 1369 |
+| reduction ab -i vs pw snapshot | login 68%, form 64%, todo 72%, dashboard 66%, heavy 73% |
+
+RAM (Linux, KB) -- the shared Chromium is excluded (same for both)
+pw-A: init rss=117MB pss=92MB procs=1 | after 1st snapshot rss=128MB pss=102MB procs=1 | after task rss=140MB pss=114MB procs=1
+pw-B: init rss=118MB pss=92MB procs=1 | after 1st snapshot rss=129MB pss=103MB procs=1 | after task rss=139MB pss=113MB procs=1
+pw via npx: init rss=192MB pss=132MB procs=3 | after 1st snapshot rss=204MB pss=143MB procs=3
+   rows: 3241182:76MB npm exec playwright-mcp --cdp-endpoint http://127. ; 3241260:2MB sh -c playwright-mcp --cdp-endpoint http://127.0.0 ; 3241261:126MB node /tmp/claude-1000/-home-runner-gt-remote-git-g
+ab-i-B (daemon): after 1st snapshot rss=11MB pss=10MB procs=1 | after task rss=12MB pss=11MB procs=1
+ab-i-A (daemon): after 1st snapshot rss=11MB pss=10MB procs=1 | after task rss=23MB pss=21MB procs=1
+ab-full-A (daemon): after 1st snapshot rss=11MB pss=10MB procs=1 | after task rss=22MB pss=21MB procs=1

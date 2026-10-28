@@ -1,0 +1,4 @@
+baseline deltas (tool_use + tiny result + framing): [1546,370,315,361]
+{"sample":"PW YAML snapshot (HN, first 24000 B)","bytes":24000,"delta":9728,"baselineFloor":348.6666666666667,"realClaudeTok":9379.333333333334,"o200k":6635,"cl100k":6643,"real_over_o200k":1.414,"real_over_cl100k":1.412,"bytesPerRealTok":2.56}
+{"sample":"AB snapshot -i (HN, whole file)","bytes":13601,"delta":7185,"baselineFloor":348.6666666666667,"realClaudeTok":6836.333333333333,"o200k":4650,"cl100k":4681,"real_over_o200k":1.47,"real_over_cl100k":1.46,"bytesPerRealTok":1.99}
+{"sample":"AB full snapshot (HN, first 24000 B)","bytes":24000,"delta":9544,"baselineFloor":348.6666666666667,"realClaudeTok":9195.333333333334,"o200k":6386,"cl100k":6371,"real_over_o200k":1.44,"real_over_cl100k":1.443,"bytesPerRealTok":2.61}

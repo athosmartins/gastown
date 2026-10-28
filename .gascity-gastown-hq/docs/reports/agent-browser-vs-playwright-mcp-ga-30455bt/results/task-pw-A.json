@@ -1,0 +1,162 @@
+{
+ "config": "pw-A",
+ "calls": 11,
+ "respTok": 15357,
+ "respTokCl": 15365,
+ "respBytes": 54786,
+ "callTok": 285,
+ "steps": [
+  {
+   "n": 1,
+   "step": "nav-login",
+   "tool": "browser_navigate",
+   "callTok": 25,
+   "respBytes": 252,
+   "respTok": 94,
+   "respTokCl": 92
+  },
+  {
+   "n": 2,
+   "step": "snap-login",
+   "tool": "browser_snapshot",
+   "callTok": 10,
+   "respBytes": 1747,
+   "respTok": 507,
+   "respTokCl": 503
+  },
+  {
+   "n": 3,
+   "step": "fill-user",
+   "tool": "browser_type",
+   "callTok": 18,
+   "respBytes": 124,
+   "respTok": 34,
+   "respTokCl": 33
+  },
+  {
+   "n": 4,
+   "step": "fill-pass",
+   "tool": "browser_type",
+   "callTok": 18,
+   "respBytes": 107,
+   "respTok": 31,
+   "respTokCl": 30
+  },
+  {
+   "n": 5,
+   "step": "click-signin",
+   "tool": "browser_click",
+   "callTok": 19,
+   "respBytes": 377,
+   "respTok": 137,
+   "respTokCl": 135
+  },
+  {
+   "n": 6,
+   "step": "snap-dash",
+   "tool": "browser_snapshot",
+   "callTok": 10,
+   "respBytes": 49196,
+   "respTok": 13564,
+   "respTokCl": 13587
+  },
+  {
+   "n": 7,
+   "step": "nav-form",
+   "tool": "browser_navigate",
+   "callTok": 25,
+   "respBytes": 208,
+   "respTok": 81,
+   "respTokCl": 81
+  },
+  {
+   "n": 8,
+   "step": "snap-form",
+   "tool": "browser_snapshot",
+   "callTok": 10,
+   "respBytes": 1758,
+   "respTok": 582,
+   "respTokCl": 583
+  },
+  {
+   "n": 9,
+   "step": "fill-form",
+   "tool": "browser_fill_form",
+   "callTok": 119,
+   "respBytes": 404,
+   "respTok": 112,
+   "respTokCl": 107
+  },
+  {
+   "n": 10,
+   "step": "click-submit",
+   "tool": "browser_click",
+   "callTok": 21,
+   "respBytes": 257,
+   "respTok": 89,
+   "respTokCl": 88
+  },
+  {
+   "n": 11,
+   "step": "snap-done",
+   "tool": "browser_snapshot",
+   "callTok": 10,
+   "respBytes": 356,
+   "respTok": 126,
+   "respTokCl": 126
+  }
+ ],
+ "mem": {
+  "afterInit": {
+   "procs": 1,
+   "rssKB": 119848,
+   "pssKB": 94551,
+   "privKB": 81652,
+   "hwmKB": 119848,
+   "rows": [
+    {
+     "pid": "3224869",
+     "cmd": "/home/runner/.local/node-v22.22.3-linux-arm64/bin/node /tmp/claude-1000/-home-runner-gt-re",
+     "rss": 119848,
+     "hwm": 119848,
+     "pss": 94551,
+     "priv": 81652
+    }
+   ]
+  },
+  "afterFirstSnapshot": {
+   "procs": 1,
+   "rssKB": 130776,
+   "pssKB": 104531,
+   "privKB": 92296,
+   "hwmKB": 130776,
+   "rows": [
+    {
+     "pid": "3224869",
+     "cmd": "/home/runner/.local/node-v22.22.3-linux-arm64/bin/node /tmp/claude-1000/-home-runner-gt-re",
+     "rss": 130776,
+     "hwm": 130776,
+     "pss": 104531,
+     "priv": 92296
+    }
+   ]
+  },
+  "afterTask": {
+   "procs": 1,
+   "rssKB": 143452,
+   "pssKB": 117207,
+   "privKB": 104972,
+   "hwmKB": 143452,
+   "rows": [
+    {
+     "pid": "3224869",
+     "cmd": "/home/runner/.local/node-v22.22.3-linux-arm64/bin/node /tmp/claude-1000/-home-runner-gt-re",
+     "rss": 143452,
+     "hwm": 143452,
+     "pss": 117207,
+     "priv": 104972
+    }
+   ]
+  }
+ }
+}

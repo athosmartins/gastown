@@ -1,0 +1,96 @@
+{
+ "config": "pw-npx",
+ "calls": 2,
+ "respTok": 601,
+ "respTokCl": 595,
+ "respBytes": 1999,
+ "callTok": 35,
+ "steps": [
+  {
+   "n": 1,
+   "step": "nav-login",
+   "tool": "browser_navigate",
+   "callTok": 25,
+   "respBytes": 252,
+   "respTok": 94,
+   "respTokCl": 92
+  },
+  {
+   "n": 2,
+   "step": "snap-login",
+   "tool": "browser_snapshot",
+   "callTok": 10,
+   "respBytes": 1747,
+   "respTok": 507,
+   "respTokCl": 503
+  }
+ ],
+ "mem": {
+  "afterInit": {
+   "procs": 3,
+   "rssKB": 197104,
+   "pssKB": 135422,
+   "privKB": 115412,
+   "hwmKB": 197104,
+   "rows": [
+    {
+     "pid": "3241182",
+     "cmd": "npm exec playwright-mcp --cdp-endpoint http://127.0.0.1:47222                             ",
+     "rss": 77516,
+     "hwm": 77516,
+     "pss": 47335,
+     "priv": 37268
+    },
+    {
+     "pid": "3241260",
+     "cmd": "sh -c playwright-mcp --cdp-endpoint http://127.0.0.1:47222 ",
+     "rss": 1576,
+     "hwm": 1576,
+     "pss": 104,
+     "priv": 96
+    },
+    {
+     "pid": "3241261",
+     "cmd": "node /tmp/claude-1000/-home-runner-gt-remote-git-gascity-wt-dog-remote-gawispa2pmaz/ee0ff7",
+     "rss": 118012,
+     "hwm": 118012,
+     "pss": 87983,
+     "priv": 78048
+    }
+   ]
+  },
+  "afterFirstSnapshot": {
+   "procs": 3,
+   "rssKB": 208584,
+   "pssKB": 146548,
+   "privKB": 126352,
+   "hwmKB": 208584,
+   "rows": [
+    {
+     "pid": "3241182",
+     "cmd": "npm exec playwright-mcp --cdp-endpoint http://127.0.0.1:47222                             ",
+     "rss": 77516,
+     "hwm": 77516,
+     "pss": 47239,
+     "priv": 37140
+    },
+    {
+     "pid": "3241260",
+     "cmd": "sh -c playwright-mcp --cdp-endpoint http://127.0.0.1:47222 ",
+     "rss": 1576,
+     "hwm": 1576,
+     "pss": 104,
+     "priv": 96
+    },
+    {
+     "pid": "3241261",
+     "cmd": "node /tmp/claude-1000/-home-runner-gt-remote-git-gascity-wt-dog-remote-gawispa2pmaz/ee0ff7",
+     "rss": 129492,
+     "hwm": 129492,
+     "pss": 99205,
+     "priv": 89116
+    }
+   ]
+  }
+ }
+}

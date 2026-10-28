@@ -1,0 +1,42 @@
+{
+ "heavy snapshot --delta": {
+  "baselineTok": 39508,
+  "deltas": [
+   {
+    "tok": 94,
+    "sawNewText": true,
+    "head": "{ \"baseRevision\": 1, \"changes\": [], \"kind\": \"delta\", \"revision\": 2, \"treeChange\": { \"deleteCount\": 0, \"lines\": [ \" - listitem [level=1]\", \" - ListMarker \\\"• \\\"\", "
+   },
+   {
+    "tok": 2236,
+    "sawNewText": true,
+    "head": "{ \"baseRevision\": 2, \"changes\": [], \"kind\": \"delta\", \"revision\": 3, \"treeChange\": { \"deleteCount\": 193, \"lines\": [ \" - listitem [level=1]\", \" - ListMarker \\\"• \\\"\""
+   },
+   {
+    "tok": 94,
+    "sawNewText": true,
+    "head": "{ \"baseRevision\": 3, \"changes\": [], \"kind\": \"delta\", \"revision\": 4, \"treeChange\": { \"deleteCount\": 0, \"lines\": [ \" - listitem [level=1]\", \" - ListMarker \\\"• \\\"\", "
+   }
+  ]
+ },
+ "heavy snapshot -c --delta": {
+  "baselineTok": 38306,
+  "deltas": [
+   {
+    "tok": 7,
+    "sawNewText": false,
+    "head": "unchanged (revision 6) "
+   },
+   {
+    "tok": 58,
+    "sawNewText": false,
+    "head": "{ \"baseRevision\": 6, \"changes\": [], \"kind\": \"delta\", \"revision\": 7, \"treeChange\": { \"deleteCount\": 2, \"lines\": [], \"startLine\": 183 } } "
+   },
+   {
+    "tok": 7,
+    "sawNewText": false,
+    "head": "unchanged (revision 8) "
+   }
+  ]
+ }
+}
