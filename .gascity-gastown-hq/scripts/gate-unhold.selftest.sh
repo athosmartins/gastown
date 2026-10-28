@@ -31,6 +31,13 @@
 # removal was hard-wired to it. Now:
 #   gc --city C bd ...  routes by bead-id prefix -> reaches HQ (ga-*) AND rig (wa-*)
 #   bd -C C ...         HQ store ONLY            -> a wa-* id is "no issue found"
+#
+# ga-iu0fvlo: the exit CODES and the "which branch said it" of the failure paths now have a case each (section 10), with embedded mutants (one loose edit of
+# the tool, the case must FAIL): no prefix at all = usage error rc 2 · a bead that cannot be read = rc 1 "could not read" (NEVER "nothing to do", rc 0) ·
+# a failed removal is summarised by "FAILED — could not remove from <bead>: <labels>" (not by the verify step's "still present") · a re-fetch that fails after
+# the removals = rc 1 "UNVERIFIED" (never "verified clear"). Sections 2-9 only looked at "non-zero" or at the message text, so an `exit 1` -> `exit 0` went unseen.
+# EQUIVALENT (dd375a676b, L113 `… | sed 's/ *$//' || true` with `||` -> `&&`): _one_line is only ever called inside a `$( )` (errexit is off there) and when the pipeline
+#   fails it is because grep -v printed nothing, so `out` is empty either way and "no output" is printed either way; the only thing that changes is an rc nobody reads.
 
 set -euo pipefail
 
@@ -73,6 +80,8 @@ BD_LABELS_FILE="$(mktemp)"
 BD_REMOVE_LOG="$(mktemp)"   # one line per `label remove` attempt: "<route> <id> <label>"
 BD_REMOVE_IS_NOOP=0   # when 1, `label remove` reports success but does NOT mutate state
 REMOVE_FAIL_LABEL=""  # when set, `label remove` of exactly this label exits 1 ("boom")
+SHOW_FAIL_FROM=""     # when set to N, the Nth `show` and every later one print nothing and exit 1 (counter in SHOW_COUNT_FILE)
+SHOW_COUNT_FILE="$(mktemp)"
 
 seed_labels() {
   : > "$BD_LABELS_FILE"
@@ -98,6 +107,10 @@ fake_store() {
   done
   case "$verb" in
     show)
+      if [ -n "${SHOW_FAIL_FROM:-}" ]; then   # the counter is a file: fetch_labels runs inside $( )
+        local k; k=$(( $(cat "$SHOW_COUNT_FILE" 2>/dev/null || echo 0) + 1 )); echo "$k" > "$SHOW_COUNT_FILE"
+        if [ "$k" -ge "$SHOW_FAIL_FROM" ]; then echo "Error: show failed" >&2; return 1; fi
+      fi
       printf '{"labels": %s}\n' "$(current_labels_json)"
       ;;
     label)
@@ -299,7 +312,74 @@ grep -q "could not remove gate:needs-human from wa-test" "$OUT_FILE" \
   || bad "entrypoint gave no clear message; output was: $(cat "$OUT_FILE")"
 rm -f "$OUT_FILE"
 
-rm -f "$BD_LABELS_FILE" "$BD_LABELS_FILE.tmp" "$BD_REMOVE_LOG"
+# ── 10. ga-iu0fvlo: exit codes and failure branches, each with its own case ──────
+#      A case that cannot be measured (no output at all) is a FAIL here, never a silent pass:
+#      every assertion compares a captured rc/text, and an empty capture does not equal the expected one.
+case_sem_prefixo() {   # no prefix at all -> usage error, rc 2, nothing read or removed
+  local RC=0 OUT
+  seed_labels "gate:needs-human"; : > "$BD_REMOVE_LOG"
+  OUT=$(gate_unhold_main "wa-test" 2>&1) || RC=$?
+  eq "no prefix: usage error rc 2" "$RC" "2"
+  case "$OUT" in *"usage: gate-unhold.sh"*) ok "no prefix: prints the usage" ;; *) bad "no prefix: no usage line; output was: $OUT" ;; esac
+  eq "no prefix: nothing was removed" "$(grep -c . "$BD_REMOVE_LOG" || true)" "0"
+}
+case_bead_ilegivel() {   # gc down and bd -C cannot reach the bead: the labels are UNKNOWN -> rc 1 "could not read", never "nothing to do" (rc 0)
+  local RC=0 OUT
+  seed_labels "gate:needs-human"; : > "$BD_REMOVE_LOG"; GC_UP=0
+  OUT=$(gate_unhold_main "wa-test" "gate:needs-human" 2>&1) || RC=$?
+  GC_UP=1
+  eq "unreadable bead: rc 1" "$RC" "1"
+  case "$OUT" in *"could not read bead wa-test"*) ok "unreadable bead: says it could not read it" ;; *) bad "unreadable bead: no 'could not read bead' line; output was: $OUT" ;; esac
+  case "$OUT" in *"nothing to do"*) bad "unreadable bead reported 'nothing to do' (unknown read as 'no veto')" ;; *) ok "unreadable bead: never reported as 'nothing to do'" ;; esac
+  eq "unreadable bead: nothing was removed" "$(grep -c . "$BD_REMOVE_LOG" || true)" "0"
+}
+case_falha_remocao_resumo() {   # a failed removal ends in the removal summary, not in the verify step's "still present"
+  local RC=0 OUT
+  seed_labels "gate:needs-human" "lane:small"; : > "$BD_REMOVE_LOG"; REMOVE_FAIL_LABEL="gate:needs-human"
+  OUT=$(gate_unhold_main "wa-test" "gate:needs-human" 2>&1) || RC=$?
+  REMOVE_FAIL_LABEL=""
+  eq "failed removal: rc 1" "$RC" "1"
+  case "$OUT" in *"FAILED — could not remove from wa-test: gate:needs-human"*) ok "failed removal: the summary names bead and label" ;; *) bad "failed removal: no removal summary; output was: $OUT" ;; esac
+  case "$OUT" in *"still present"*) bad "failed removal went on to the verify step ('still present')" ;; *) ok "failed removal: stops before the verify step" ;; esac
+}
+case_refetch_falha() {   # the removals worked but the verify re-fetch fails -> rc 1 UNVERIFIED, never "verified clear"
+  local RC=0 OUT
+  seed_labels "gate:needs-human" "lane:small"; : > "$BD_REMOVE_LOG"; echo 0 > "$SHOW_COUNT_FILE"; SHOW_FAIL_FROM=2
+  OUT=$(gate_unhold_main "wa-test" "gate:needs-human" 2>&1) || RC=$?
+  SHOW_FAIL_FROM=""
+  eq "re-fetch fails: rc 1" "$RC" "1"
+  case "$OUT" in *"could not re-fetch wa-test to verify"*) ok "re-fetch fails: says UNVERIFIED" ;; *) bad "re-fetch fails: no 'could not re-fetch' line; output was: $OUT" ;; esac
+  case "$OUT" in *"verified clear"*) bad "re-fetch fails but the run said 'verified clear'" ;; *) ok "re-fetch fails: never 'verified clear'" ;; esac
+  eq "re-fetch fails: the removal itself did happen" "$(labels_now)" "lane:small"
+}
+echo "── 10. exit codes and failure branches (ga-iu0fvlo) ──"
+case_sem_prefixo; case_bead_ilegivel; case_falha_remocao_resumo; case_refetch_falha
+
+echo "── 10b. mutants: one loose edit of the tool, the case must FAIL ──"
+mutant() {   # name · original piece (\n = newline) · loose piece · case that must catch it
+  local name="$1" old="$2" new="$3" case_fn="$4" res mut
+  mut="$(mktemp)"
+  if ! python3 - "$TOOL" "$old" "$new" > "$mut" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+old, new = sys.argv[2].replace("\\n", "\n"), sys.argv[3].replace("\\n", "\n")
+if src.count(old) != 1:
+    sys.exit(3)
+sys.stdout.write(src.replace(old, new))
+PY
+  then bad "mutant $name: the original piece does not appear exactly once in the tool (did the tool change?)"; rm -f "$mut"; return; fi
+  res=$( ( GATE_UNHOLD_LIB_ONLY=1 source "$mut"; $case_fn ) 2>&1 ) || true
+  rm -f "$mut"
+  if printf '%s\n' "$res" | grep -q '^  FAIL'; then ok "mutant $name killed by $case_fn"; else bad "mutant $name SURVIVED $case_fn"; fi
+}
+mutant uso-vira-ok            'return 2' 'return 0' case_sem_prefixo
+mutant leitura-ilegivel-ok    '[ -n "$raw" ] || return 1' '[ -n "$raw" ] || return 0' case_bead_ilegivel
+mutant leitura-sem-return     '[ -n "$raw" ] || return 1' '[ -n "$raw" ]' case_bead_ilegivel
+mutant main-ilegivel-rc-0     'both failed/empty)" >&2\n    return 1' 'both failed/empty)" >&2\n    return 0' case_bead_ilegivel
+mutant remocao-falha-rc-0     'bd -C fallback: $(_one_line "$bd_err")" >&2\n  return 1' 'bd -C fallback: $(_one_line "$bd_err")" >&2\n  return 0' case_falha_remocao_resumo
+mutant refetch-falha-rc-0     'treat as UNVERIFIED, check manually" >&2\n    return 1' 'treat as UNVERIFIED, check manually" >&2\n    return 0' case_refetch_falha
+
+rm -f "$BD_LABELS_FILE" "$BD_LABELS_FILE.tmp" "$BD_REMOVE_LOG" "$SHOW_COUNT_FILE"
 
 echo ""
 echo "──────────────────────────────────────────"
