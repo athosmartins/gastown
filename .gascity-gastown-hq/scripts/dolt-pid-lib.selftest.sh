@@ -16,6 +16,12 @@
 # real, so kill -0 liveness checks are genuine; their identity (comm) and
 # listen-socket state are faked via the stubbed ps/lsof, keyed by PID, so the
 # test needs no actual dolt binary or open port.
+#
+# ga-iu0fvlo: three more scenarios, each with its OWN stub dir (sc_rc_sucesso, sc_pidfile_vazio, sc_pidfile_morto), and embedded mutants (one loose edit of the lib, the scenario must FAIL):
+#   - the PID comes WITH rc 0 (pidfile and pgrep paths): callers read `if pid=$(dolt_server_pid)`, and the old scenarios only compared the text;
+#   - an EMPTY dolt.pid is "not the server", the lookup goes on to pgrep (a `return 0` there made the lib answer "success, empty PID" and skip the fallback);
+#   - a dolt.pid of a DEAD process is never returned even when ps/lsof (stubbed to swear "dolt, listening" for any PID) would accept it: kill -0 is the liveness arbiter, not ps/lsof.
+# EQUIVALENT (d04a2a88f3, L41 `[ -n "$_p" ] || return 1` without the `|| return 1`): with an empty $_p the next line, `kill -0 "" || return 1`, fails by itself (rc 1), so the answer is the same.
 set -uo pipefail
 
 FAILURES=0
@@ -139,6 +145,76 @@ if [ "$rc" -eq 0 ]; then
 else
   echo "PASS: dolt_server_pid returns non-zero when no valid candidate exists"
 fi
+
+# ── ga-iu0fvlo: scenarios with their own stubs (do not depend on the PATH/stub state left by the ones above) ──
+# stubs in dir $1: $2 = the PID that IS the server (ps says dolt, lsof says LISTEN), or ALL (every PID is, to test that kill -0 decides liveness on its own);
+# the rest = what pgrep prints, one PID each (none = pgrep exits 1 with nothing)
+mkstubs() {
+  local d="$1" who="$2" p; shift 2; mkdir -p "$d"
+  { echo '#!/usr/bin/env bash'; for p in "$@"; do echo "echo $p"; done; if [ "$#" -gt 0 ]; then echo 'exit 0'; else echo 'exit 1'; fi; } > "$d/pgrep"
+  cat > "$d/ps" <<EOF
+#!/usr/bin/env bash
+pid=""
+for a in "\$@"; do case "\$a" in [0-9]*) pid="\$a" ;; esac; done
+if [ "$who" = ALL ] || [ "\$pid" = "$who" ]; then echo dolt; else echo sleep; fi
+EOF
+  cat > "$d/lsof" <<EOF
+#!/usr/bin/env bash
+pid="" prev=""
+for a in "\$@"; do [ "\$prev" = "-p" ] && pid="\$a"; prev="\$a"; done
+[ "$who" = ALL ] || [ "\$pid" = "$who" ]
+EOF
+  chmod +x "$d/pgrep" "$d/ps" "$d/lsof"
+}
+# dolt_server_pid with the stubs of $1 and the city $2 -> GOT (stdout) and GOT_RC (rc); a missing/unreadable answer is "" with rc != 0, never a PID
+run_pid() { GOT="$( ( PATH="$1:$PATH"; GC_CITY="$2"; dolt_server_pid ) )"; GOT_RC=$?; }
+mkcity() { mkdir -p "$1/.gc/runtime/packs/dolt"; rm -f "$1/.gc/runtime/packs/dolt/dolt.pid"; }   # no dolt.pid yet (the mutant runs reuse the dirs of the main run)
+
+sc_rc_sucesso() {
+  local b="$SCRATCH/sc1/bin" c="$SCRATCH/sc1/city"
+  mkcity "$c"; mkstubs "$b" "$REAL_PID" "$DECOY_PID" "$REAL_PID"
+  run_pid "$b" "$c"
+  assert_eq "pgrep fallback: the server PID" "$REAL_PID" "$GOT"; assert_eq "pgrep fallback: rc 0 comes with the PID" 0 "$GOT_RC"
+  printf '%s' "$REAL_PID" > "$c/.gc/runtime/packs/dolt/dolt.pid"; mkstubs "$b" "$REAL_PID" "$DECOY_PID"   # pgrep now has only the decoy: the PID can only come from dolt.pid
+  run_pid "$b" "$c"
+  assert_eq "dolt.pid: the server PID" "$REAL_PID" "$GOT"; assert_eq "dolt.pid: rc 0 comes with the PID" 0 "$GOT_RC"
+}
+sc_pidfile_vazio() {   # empty dolt.pid (interrupted write): not the server, the lookup goes on to pgrep
+  local b="$SCRATCH/sc2/bin" c="$SCRATCH/sc2/city"
+  mkcity "$c"; : > "$c/.gc/runtime/packs/dolt/dolt.pid"; mkstubs "$b" "$REAL_PID" "$DECOY_PID" "$REAL_PID"
+  run_pid "$b" "$c"
+  assert_eq "empty dolt.pid: falls through to pgrep and finds the server" "$REAL_PID" "$GOT"; assert_eq "empty dolt.pid: rc 0" 0 "$GOT_RC"
+}
+sc_pidfile_morto() {   # dolt.pid of a process that already exited; ps/lsof stubbed to accept ANY pid, so only kill -0 can refuse it
+  local b="$SCRATCH/sc3/bin" c="$SCRATCH/sc3/city" dead="" i
+  for i in 1 2 3; do sleep 0 & dead=$!; wait "$dead" 2>/dev/null; kill -0 "$dead" 2>/dev/null || break; dead=""; done   # a PID that is really gone (retry if it was reused at once)
+  if [ -z "$dead" ]; then echo "FAIL: could not get a dead PID for the stale dolt.pid scenario (not measured)"; FAILURES=$((FAILURES + 1)); return; fi
+  mkcity "$c"; printf '%s' "$dead" > "$c/.gc/runtime/packs/dolt/dolt.pid"; mkstubs "$b" ALL
+  run_pid "$b" "$c"
+  assert_eq "dolt.pid of a dead process: empty, ps/lsof alone do not decide" "" "$GOT"; assert_eq "dolt.pid of a dead process: rc 1" 1 "$GOT_RC"
+}
+sc_rc_sucesso; sc_pidfile_vazio; sc_pidfile_morto
+
+echo "── mutants: one loose edit of the lib, the scenario must FAIL ──"
+mutant() {   # name · original piece (\n = newline) · loose piece · scenario that must catch it
+  local name="$1" old="$2" new="$3" case_fn="$4" res
+  if ! python3 - "$LIB" "$old" "$new" > "$SCRATCH/mut-lib.sh" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+old, new = sys.argv[2].replace("\\n", "\n"), sys.argv[3].replace("\\n", "\n")
+if src.count(old) != 1:
+    sys.exit(3)
+sys.stdout.write(src.replace(old, new))
+PY
+  then echo "FAIL: mutant $name: the original piece does not appear exactly once in the lib (did the lib change?)"; FAILURES=$((FAILURES + 1)); return; fi
+  res="$( ( source "$SCRATCH/mut-lib.sh"; $case_fn ) 2>&1 )"
+  if printf '%s\n' "$res" | grep -q '^FAIL'; then echo "PASS: mutant $name killed by $case_fn"; else echo "FAIL: mutant $name SURVIVED $case_fn"; FAILURES=$((FAILURES + 1)); fi
+}
+mutant vazio-vira-servidor   '[ -n "$_p" ] || return 1' '[ -n "$_p" ] || return 0' sc_pidfile_vazio
+mutant morto-vira-servidor   'kill -0 "$_p" 2>/dev/null || return 1' 'kill -0 "$_p" 2>/dev/null || return 0' sc_pidfile_morto
+mutant vivo-fica-com-ps-lsof 'kill -0 "$_p" 2>/dev/null || return 1' 'kill -0 "$_p" 2>/dev/null' sc_pidfile_morto
+mutant pidfile-sucesso-rc-1  "printf '%s' \"\$_cand\"\\n      return 0" "printf '%s' \"\$_cand\"\\n      return 1" sc_rc_sucesso
+mutant pgrep-sucesso-rc-1    "printf '%s' \"\$_p\"\\n      return 0" "printf '%s' \"\$_p\"\\n      return 1" sc_rc_sucesso
 
 if [ "$FAILURES" -eq 0 ]; then
   echo "ALL PASS"
