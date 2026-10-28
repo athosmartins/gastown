@@ -15,22 +15,27 @@ COMO DECIDE
   `${X:-padrão}`, glob que EXISTE) e o código inline de python/node/perl/ruby/php/awk é varrido por literais de caminho. $( ) e crase rodam em QUALQUER palavra (atribuição, redirecionamento,
   here-string, heredoc sem aspas). Caminho com pedaço que não sei resolver: valem a pasta literal antes dele, o nome do fim e o caminho com o pedaço tirado (ele pode ser vazio). Verbo que só olha metadado (echo, ls, stat, test, cd, `git status|ls-files|check-ignore`, o padrão do
   grep, o valor de `find -name`) não conta como leitura, salvo quando a saída vira operando de outro comando (`xargs`, `read`, `$( )`); redirecionamento conta sempre.
-CÓDIGOS: 0 liberado · 2 bloqueado. Falha do próprio guarda num pedido que ele cobre = bloqueado (nunca "liberado"); aninhamento acima de 6 níveis também ("não consigo ler" = bloqueado).
+CÓDIGOS: 0 liberado · 2 bloqueado. Falha do próprio guarda num pedido que ele cobre = bloqueado (nunca "liberado"); aninhamento acima de 6 níveis e glob que não termina de ser conferido em 4 s também ("não consigo ler" = bloqueado).
 LIMITES (trava contra engano, não sandbox; o fecho de verdade é permissão de arquivo por usuário Unix): não vejo caminho montado em pedaços (`chr()`, concatenação,
   `base64 -d`), variável que não é HOME nem atribuída na mesma chamada (raiz desconhecida + pasta de segredo + nome comum, `$X/.gnupg/pubring.kbx`, passa), variável de laço, `~usuario`,
   script que o comando executa (`bash x.sh`), segredo no ambiente, nem o que um programa lê sozinho (`ssh` usa a chave). Lista completa: docs/runbooks/guard-oracle-diff.md, "Limites".
 """
 from __future__ import annotations
 
+import functools
 import glob
 import json
 import os
 import re
 import sys
+import time
 
 FILE_TOOLS = {"Read": "file_path", "Edit": "file_path", "Write": "file_path", "MultiEdit": "file_path", "NotebookEdit": "notebook_path", "NotebookRead": "notebook_path"}
 WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 COVERED = {"Bash", "Grep", "Glob", *FILE_TOOLS}
+BUDGET_S = 4.0  # segundos que um pedido tem para conferir os casos de glob (nó: ~20 mil caminhos/s; mini: bem menos): sem tempo BLOQUEIA (secret.glob-too-wide), nunca olha uma parte e libera o resto
+LATE = [0.0]  # o prazo do pedido em curso, em time.monotonic() (decide() recarrega)
+real_home = functools.lru_cache(maxsize=None)(os.path.realpath)  # um glob larga milhares de caminhos e cada um confere o HOME real: só o 1º resolve
 
 # --- catálogo (portado do cc-safety-net 2.7.0, src/core/rules/secret.ts, cortado ao que existe nas nossas máquinas) ---
 HOME_DIRS = {".ssh": "secret.home.ssh", ".aws": "secret.home.aws", ".gcp": "secret.home.gcp", ".gnupg": "secret.home.gnupg"}
@@ -84,7 +89,7 @@ def home() -> str:
 def rels(parts: list) -> list:
     """Possíveis 'partes sob o HOME' (minúsculas) de um caminho absoluto em partes: o HOME daqui, /root, /home/<u>, /Users/<u>."""
     low, out = [p.casefold() for p in parts], []
-    for h in {home(), os.path.realpath(home()), "/root"}:
+    for h in {home(), real_home(home()), "/root"}:
         hp = [p.casefold() for p in h.split("/") if p]
         if hp and low[:len(hp)] == hp:
             out.append(low[len(hp):])
@@ -183,6 +188,17 @@ def braces(s: str, depth: int = 3) -> list:
     return out
 
 
+def cases(cand: str):
+    """Os caminhos que o glob de `cand` devolve, um a um. Passou do prazo do pedido (LATE) no meio deles: OverflowError, porque olhar uma parte e liberar o resto é o mesmo 0 de "não é segredo"."""
+    n = 0
+    for n, p in enumerate(glob.iglob(cand), 1):  # vazio → o literal vale; falhou/ilegível (permissão, loop de link) → glob devolve [] e o literal vale
+        if time.monotonic() > LATE[0]:
+            raise OverflowError(cand)
+        yield p
+    if not n:
+        yield cand
+
+
 def classify(raw: str, cwd, write: bool = False, env=None):
     """(regra, caminho) se `raw` é caminho de segredo; None se não é, ou se não sei resolver o caminho TODO (variável que não conheço: limite documentado, não bloqueio; mas a pasta
     literal antes do pedaço desconhecido e o nome do fim ainda valem, ver partial())."""
@@ -203,14 +219,16 @@ def classify(raw: str, cwd, write: bool = False, env=None):
             if bare == cand or UNKNOWN.search(bare):  # nada a tirar, ou sobrou pedaço que não sei tirar: não consigo saber, o limite documentado
                 continue
             cand = bare
-        # vazio → o literal vale; falhou/ilegível (permissão, loop de link) → glob devolve [] e o literal vale
-        for p in (sorted(glob.glob(cand))[:50] or [cand]) if re.search(r"[*?\[]", cand) else [cand]:
-            for form in (os.path.normpath(p), os.path.realpath(p)):
-                r = match(form, write)
-                if r and r.startswith(("secret.home.", "secret.cli.")) and "/" not in raw and not write and not os.path.lexists(form):
-                    r = match(form, write, False)  # palavra solta que só cai na pasta do segredo por causa de um `cd` e não existe lá (`cd ~/.ssh; head -n 2 config`): vale só o NOME
-                if r:
-                    return r, form
+        try:
+            for p in cases(cand) if re.search(r"[*?\[]", cand) else [cand]:
+                for form in dict.fromkeys((os.path.normpath(p), os.path.realpath(p))):  # a mesma forma duas vezes é um custo só
+                    r = match(form, write)
+                    if r and r.startswith(("secret.home.", "secret.cli.")) and "/" not in raw and not write and not os.path.lexists(form):
+                        r = match(form, write, False)  # palavra solta que só cai na pasta do segredo por causa de um `cd` e não existe lá (`cd ~/.ssh; head -n 2 config`): vale só o NOME
+                    if r:
+                        return r, form
+        except OverflowError:  # sem tempo no meio dos casos do glob
+            return "secret.glob-too-wide", cand
     return None
 
 
@@ -510,6 +528,7 @@ def one(ws: list, cwd, depth: int, env: dict, strict: bool = False, feed=()):
 # --- decisão ---
 def decide(inp: dict):
     """None = liberado; (regra, alvo, operação) = bloqueado."""
+    LATE[0] = time.monotonic() + BUDGET_S
     tool, ti, cwd = inp.get("tool_name"), inp.get("tool_input") or {}, inp.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or None
     if tool == "Bash":
         hit = scan_bash(str(ti.get("command") or ""), cwd)

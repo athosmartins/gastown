@@ -11,12 +11,14 @@ import importlib.util, json, os, random, shlex, shutil, subprocess, sys, tempfil
 
 GUARD, N, SEED = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 H = os.path.realpath(tempfile.mkdtemp(prefix="srgst."))
-for d in (".ssh", ".aws", ".gnupg", ".claude", "proj/node_modules/pkg", "gt-remote/keys", "tmp", "bin"):
+for d in (".ssh", ".aws", ".gnupg", ".claude", "proj/node_modules/pkg", "proj/certs", "gt-remote/keys", "tmp", "bin"):
     os.makedirs(f"{H}/{d}")
 FILES = [".ssh/id_rsa", ".ssh/id_ed25519", ".ssh/id_rsa.pub", ".ssh/config", ".ssh/known_hosts", ".aws/credentials", ".gnupg/pubring.kbx", ".claude/.credentials.json", "proj/.env", "proj/.env.example",
-         "proj/README.md", "gt-remote/keys/gt_mirror", "proj/node_modules/pkg/cacert.pem"]
+         "proj/README.md", "gt-remote/keys/gt_mirror", "proj/node_modules/pkg/cacert.pem", "proj/certs/zz.key"]
 for f in FILES:
     open(f"{H}/{f}", "w").write("x\n")
+for i in range(50):  # 55 entradas em ~/.ssh e 51 em proj/certs: o segredo (id_rsa, zz.key) vem depois da 50ª, onde o guarda cortava
+    open(f"{H}/.ssh/a{i:02d}.pub", "w").close(); open(f"{H}/proj/certs/a{i:02d}.crt", "w").close()
 os.symlink(f"{H}/.ssh/id_rsa", f"{H}/proj/linkado")
 os.environ["HOME"] = H
 CWD = f"{H}/proj"
@@ -127,18 +129,24 @@ TABLE += [("B", "Grep", {"pattern": "t", "@cwd": "@H"}, "-"), ("B", "Grep", {"pa
           ("B", "Grep", {"pattern": "t", "path": "~/.claude"}, "-"), ("B", "Grep", {"pattern": "t", "@cwd": "@H/.config/gcloud"}, "-"), ("P", "Grep", {"pattern": "t", "path": "~/.claude/projects"}, "-"),
           ("P", "Glob", {"pattern": "~/.claude/settings*"}, "-")]
 
+# tentativa 3 do gate: glob que passa de 50 casos tem de olhar TODOS (id_rsa é a 53ª de ~/.ssh, zz.key a 51ª de certs); sem tempo ("@secs": -1) bloqueia, e só glob gasta tempo
+TABLE += [("B", B, {"command": "cat ~/.ssh/*"}, "-"), ("B", B, {"command": "cat certs/*"}, "-"), ("P", B, {"command": "cat certs/a*"}, "-"), ("B", B, {"command": "cat certs/a*", "@secs": "-1"}, "-"),
+          ("B", B, {"command": "cat certs/{a0,a1}* README.md", "@secs": "-1"}, "-"), ("P", B, {"command": "cat README.md nada*", "@secs": "-1"}, "-"), ("P", B, {"command": "cat ./README.md", "@secs": "-1"}, "-")]
+
 
 def run_table(m):
-    bad = []
+    bad, secs = [], m.BUDGET_S
     for want, tool, ti, sn in TABLE:
         ti = {k: v.replace("@H", H) for k, v in ti.items()}
         cwd = ti.pop("@cwd", CWD)
+        m.BUDGET_S = float(ti.pop("@secs", secs))  # "@secs": o prazo de glob só nesta linha (-1 = já estourado)
         try:
             got = "B" if m.decide({"tool_name": tool, "tool_input": ti, "cwd": cwd}) else "P"
         except Exception as e:  # noqa: BLE001
             got = "ERRO " + repr(e)[:40]
         if got != want:
             bad.append(f"{tool} {ti} esperado={want} veio={got}")
+    m.BUDGET_S = secs
     return bad
 
 
@@ -204,7 +212,7 @@ def q(s):
 def spell(rel):
     P = f"{H}/{rel}"
     d, b = os.path.split(P)
-    return rnd.choice([P, "~/" + rel, "$HOME/" + rel, '"${HOME}/' + rel + '"', os.path.relpath(P, CWD), d + "/" + b[:3] + "*", d + "/{" + b + ",zz}", P[:5] + "''" + P[5:], "'" + P + "'", d + "//" + b,
+    return rnd.choice([P, "~/" + rel, "$HOME/" + rel, '"${HOME}/' + rel + '"', os.path.relpath(P, CWD), d + "/" + b[:3] + "*", d + "/*", d + "/{" + b + ",zz}", P[:5] + "''" + P[5:], "'" + P + "'", d + "//" + b,
                        "{~/" + rel + ",zz}", "${UNSET:-~/" + rel + "}", "${UNSET:-" + P + "}"])
 
 
@@ -269,7 +277,7 @@ MUT = [("pasta ~/.ssh", "if rel and rel[0] in HOME_DIRS:", "if False and rel and
        ("rastreio de cd", "here = cd_target(cur, here, env) or here", "here = here"), ("heredoc para shell", "any(w in SHELLS for w in recv)", "False"), ("código por stdin", "\"-s\" in nargs or not [a for a in nargs", "\"-s\" in nargs and False and [a for a in nargs"),
        ("raiz larga", "or home().startswith(p.rstrip(\"/\") + \"/\")", "or False"), ("teto da chave", "len(alts) <= 16", "len(alts) <= 1600"), ("find -exec", "not any(a in (\"-exec\", \"-execdir\", \"-ok\", \"-okdir\") for a in eargs)", "True"),
        ("valor colado", "cand = m.group(1) if (m := re.fullmatch(r\"-[A-Za-z](.+)\", cand)) else cand", "pass"), ("verbo que escreve", "reads = verb in READERS and not", "reads = True or not"),
-       ("padrão do grep", "skip.add(ev + j); pat_done = True", "pat_done = True"), ("link simbólico", "os.path.realpath(p)):", "os.path.normpath(p)):"),
+       ("padrão do grep", "skip.add(ev + j); pat_done = True", "pat_done = True"), ("link simbólico", "os.path.realpath(p))):", "os.path.normpath(p))):"),
        ("crase aninhada", 'j += 2 if t[j] == "\\\\" else 1  # a crase', "j += 1  # a crase"), ("escapes de $'…'", 'cur.append(ansi(text[i:j]) if c == "$" else text[i:j])', "cur.append(text[i:j])"),
        # tentativa 2 do gate: um mutante por mecanismo novo
        ("aninhamento fundo bloqueia", 'return "secret.nesting-too-deep", cmd[:80]', "return None"), ("nome inteiro da variável", 'NAME = r"[A-Za-z_][A-Za-z0-9_]*"', 'NAME = r"[A-Za-z_]"'),
@@ -284,7 +292,9 @@ MUT = [("pasta ~/.ssh", "if rel and rel[0] in HOME_DIRS:", "if False and rel and
        ("índice do git", 'if not hit and (m := re.fullmatch(r":(?:[0-3]:)?([^\\s:][^\\s]*)", cand)):', "if False:"), ("Grep/Glob sem path é o cwd", 'where = str(ti.get("path") or "") or cwd or os.getcwd()', 'where = str(ti.get("path") or "")'),
        ("embrulho esconde o verbo", "ev = real_verb(ws)", "ev = 0"), ("pedaço desconhecido pode ser vazio", 'bare = os.path.normpath(PIECE.sub("", cand))', "bare = cand"),
        ("ancestral de segredo (conteúdo)", "if p and deep and any(tuple(r) in CRED_PARENTS for r in rels(", "if False and any(tuple(r) in CRED_PARENTS for r in rels("),
-       ("Glob só lista nomes", "broad(d, cwd, deep=False)", "broad(d, cwd, deep=True)")]
+       ("Glob só lista nomes", "broad(d, cwd, deep=False)", "broad(d, cwd, deep=True)"),
+       ("corte silencioso em 50", "enumerate(glob.iglob(cand), 1)", "enumerate(sorted(glob.glob(cand))[:50], 1)"), ("sem tempo não bloqueia", "raise OverflowError(cand)", "break"),
+       ("prazo recarregado por pedido", "LATE[0] = time.monotonic() + BUDGET_S", "pass")]
 alive = []
 for name, old, new in MUT:
     if SRC.count(old) != 1:
