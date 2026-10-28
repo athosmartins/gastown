@@ -9,14 +9,16 @@ PARA QUE SERVE
   Um agente (ou um texto injetado que ele leu) não lê `~/.ssh`, `~/.aws`, `~/.claude/.credentials.json`, `.env`, chave privada, `.netrc`… com Read, Grep, Glob, Edit,
   Write, MultiEdit, NotebookEdit nem com `cat` & cia. Segredo entra no comando pelo `secret <item>` (Bitwarden), nunca lendo o arquivo. Hook que sai 2 bloqueia em qualquer modo, `--dangerously-skip-permissions` incluso (medido no remote-clone-guard).
 COMO DECIDE
-  Ferramenta de arquivo: o caminho do pedido (file_path, notebook_path, path, o diretório fixo do pattern de Glob) é resolvido (`~`, `$HOME`, cwd, link simbólico) e
-  comparado com o catálogo; Grep/Glob também recusam um glob que NOMEIA a família (`.env*`, `*.pem`). Bash: o texto é lido como o bash lê (aspas, comentário, heredoc,
-  `bash -c`/`eval`/`$( )`, `cd`), cada palavra vira candidato a caminho (`~`, `$HOME`, atribuição anterior, chave `{a,b}`, glob que EXISTE) e o código inline de
-  python/node/perl/ruby/php/awk é varrido por literais de caminho. Verbo que só olha metadado (echo, ls, stat, test, cd, `git status|ls-files|check-ignore`, o padrão do
+  Ferramenta de arquivo: o caminho do pedido (file_path, notebook_path, path, o diretório fixo do pattern de Glob; Grep/Glob sem path = o cwd) é resolvido (`~`, `$HOME`, cwd, link
+  simbólico) e comparado com o catálogo; Grep/Glob também recusam um glob que NOMEIA a família (`.env*`, `*.pem`). Bash: o texto é lido como o bash lê (aspas, comentário, heredoc,
+  `bash -c`/`eval`/`$( )`, `cd`, embrulho `timeout`/`nohup`/`env`/`sudo`), cada palavra vira candidato a caminho (chave `{a,b}` primeiro, depois `~`, `$HOME`, atribuição anterior,
+  `${X:-padrão}`, glob que EXISTE) e o código inline de python/node/perl/ruby/php/awk é varrido por literais de caminho. $( ) e crase rodam em QUALQUER palavra (atribuição, redirecionamento,
+  here-string, heredoc sem aspas). Caminho com pedaço que não sei resolver: valem a pasta literal antes dele, o nome do fim e o caminho com o pedaço tirado (ele pode ser vazio). Verbo que só olha metadado (echo, ls, stat, test, cd, `git status|ls-files|check-ignore`, o padrão do
   grep, o valor de `find -name`) não conta como leitura, salvo quando a saída vira operando de outro comando (`xargs`, `read`, `$( )`); redirecionamento conta sempre.
-CÓDIGOS: 0 liberado · 2 bloqueado. Falha do próprio guarda num pedido que ele cobre = bloqueado (nunca "liberado").
+CÓDIGOS: 0 liberado · 2 bloqueado. Falha do próprio guarda num pedido que ele cobre = bloqueado (nunca "liberado"); aninhamento acima de 6 níveis também ("não consigo ler" = bloqueado).
 LIMITES (trava contra engano, não sandbox; o fecho de verdade é permissão de arquivo por usuário Unix): não vejo caminho montado em pedaços (`chr()`, concatenação,
-  `base64 -d`), variável que não é HOME nem atribuída na mesma chamada, script que o comando executa (`bash x.sh`), nem o que um programa lê sozinho (`ssh` usa a chave).
+  `base64 -d`), variável que não é HOME nem atribuída na mesma chamada (raiz desconhecida + pasta de segredo + nome comum, `$X/.gnupg/pubring.kbx`, passa), variável de laço, `~usuario`,
+  script que o comando executa (`bash x.sh`), segredo no ambiente, nem o que um programa lê sozinho (`ssh` usa a chave). Lista completa: docs/runbooks/guard-oracle-diff.md, "Limites".
 """
 from __future__ import annotations
 
@@ -56,6 +58,8 @@ GREP_VAL = {"-e", "--regexp", "-A", "-B", "-C", "-m", "-g", "--glob", "-t", "--t
 FIND_VAL = {"-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename", "-regex", "-iregex", "-lname", "-ilname"}
 FEEDERS = {"xargs", "parallel", "read", "mapfile", "readarray"}  # a saída de um echo/ls vira operando deles: nesses casos nenhum verbo é isento
 ASSIGN = re.compile(r"[A-Za-z_]\w*=")
+WRAP_VAL = {"sudo": {"-u", "-g", "-C", "-h", "-p", "-r", "-t", "-U"}, "doas": {"-u", "-C"}, "timeout": {"-k", "-s"}, "nice": {"-n"}, "ionice": {"-c", "-n", "-p"}, "env": {"-u", "-C", "-S"}, "nohup": set(),
+            "command": set(), "time": set(), "exec": set(), "builtin": set(), "stdbuf": set(), "setsid": set(), "unbuffer": set(), "caffeinate": set()}  # embrulho -> opções que levam valor
 ANSI = re.compile(r"\\(x[0-9a-fA-F]{1,2}|[0-7]{1,3}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|c.|.)", re.S)
 
 
@@ -124,17 +128,52 @@ def match(path: str, write: bool, homerules: bool = True):
     return "secret.ext." + ext if ext in SECRET_EXT else None
 
 
+NAME = r"[A-Za-z_][A-Za-z0-9_]*"
+VAR = re.compile(r"\$\{(" + NAME + r")(?:(:?)[-=]([^{}]*))?\}|\$(" + NAME + r")")  # $NOME · ${NOME} · ${NOME:-padrão} (grupos: nome, ":", padrão, nome)
+UNKNOWN = re.compile(r"[$`]")  # sobrou `$` ou crase num caminho: há um pedaço que não sei resolver
+PIECE = re.compile(r"\$\{[^{}]*\}|\$\([^()]*\)|`[^`]*`|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@#?*!$-]")  # um pedaço desconhecido inteiro: ${…}, $(…), `…`, $NOME, $1
+
+
+def tilde(s: str) -> str:
+    return home() + s[1:] if s == "~" or s.startswith("~/") else s
+
+
+def subst(s: str, env: dict) -> str:
+    """O texto como o shell o entrega depois de `$NOME`, `${NOME}`, `${NOME:-padrão}` e `~`. UMA passada (o shell não reexpande o valor) e pelo NOME INTEIRO (`H=1` não come o
+    `$HOME`); valor vazio vale (`X=` troca por nada); não corta pelo cwd (uma variável relativa é resolvida onde é USADA, não onde foi atribuída). HOME é conhecido; outro nome que
+    não foi atribuído nesta chamada fica como está, com o `$`: quem chama sabe que ali há um pedaço desconhecido."""
+    def one_var(m):
+        name, colon, dflt = m.group(1) or m.group(4), m.group(2), m.group(3)
+        # vazio → nome atribuído a "" vale "" (não é "desconhecido"); falhou/ilegível → nome que não conheço: sem padrão o `$` fica, com padrão vale o padrão (pode ser o que o shell abre)
+        known = env[name] if name in env else (home() if name == "HOME" else None)
+        if dflt is None:
+            return m.group(0) if known is None else known
+        return tilde(VAR.sub(one_var, dflt)) if known is None or (colon and not known) else known
+    return tilde(VAR.sub(one_var, s.strip().strip("`")))
+
+
 def expand(s: str, cwd, env: dict) -> str:
-    s = s.strip().strip("`")
-    for name, val in env.items():
-        s = s.replace("${" + name + "}", val).replace("$" + name, val) if val else s
-    s = home() + s[1:] if s == "~" or s.startswith("~/") else re.sub(r"^\$\{?HOME\}?(?=/|$)", lambda _: home(), s)
+    s = subst(s, env)
     return s if os.path.isabs(s) else os.path.join(cwd or os.getcwd(), s)
+
+
+def partial(cand: str, write: bool):
+    """Regra de segredo de um caminho com pedaço desconhecido (`$VAR` de fora, `$( )`, crase), ou None. O que eu sei ainda vale: (A) a pasta literal ANTES do 1º pedaço
+    desconhecido com um filho qualquer (`~/.ssh/$f` abre algo em ~/.ssh) e (B) o NOME do fim, se ele é literal (`$(echo ~)/.ssh/id_rsa`). O caso "o pedaço é vazio" (C) é do classify()."""
+    comps = cand.split("/")
+    # vazio → sem componente desconhecido não chega aqui (o chamador só entra com `$` ou crase); falhou/ilegível → None, que é "não consegui saber" e o chamador segue o limite documentado
+    first = next((i for i, c in enumerate(comps) if UNKNOWN.search(c)), None)
+    if first is None:
+        return None
+    hit = match("/".join(comps[:first]) + "/<desconhecido>" + (".pub" if comps[first].endswith(".pub") else ""), write) if first else None  # `$k.pub` segue chave pública
+    if hit is None and not UNKNOWN.search(comps[-1]):
+        hit = match("/" + "/".join(c for c in comps if c and not UNKNOWN.search(c)), write, False)
+    return hit
 
 
 def braces(s: str, depth: int = 3) -> list:
     """Expansão de chave. Passou do teto (16 alternativas, 3 níveis, 64 resultados) levanta OverflowError: quem chama BLOQUEIA, nunca corta em silêncio."""
-    m = re.search(r"\{([^{}]*,[^{}]*)\}", s)
+    m = re.search(r"(?<!\$)\{([^{}]*,[^{}]*)\}", s)  # `${X:-a,b}` é expansão de parâmetro, não chave
     if not m:
         return [s]
     alts = m.group(1).split(",")
@@ -145,17 +184,25 @@ def braces(s: str, depth: int = 3) -> list:
 
 
 def classify(raw: str, cwd, write: bool = False, env=None):
-    """(regra, caminho) se `raw` é caminho de segredo; None se não é, ou se não sei resolver (variável que não conheço: limite documentado, não bloqueio)."""
+    """(regra, caminho) se `raw` é caminho de segredo; None se não é, ou se não sei resolver o caminho TODO (variável que não conheço: limite documentado, não bloqueio; mas a pasta
+    literal antes do pedaço desconhecido e o nome do fim ainda valem, ver partial())."""
     raw = (raw or "").strip()
     if not raw or raw.startswith("-") or re.match(r"[A-Za-z][\w+.-]*://", raw):
         return None
     try:
-        cands = braces(expand(raw, cwd, env or {}))
+        cands = [expand(b, cwd, env or {}) for b in braces(raw)]  # o bash faz a chave PRIMEIRO e depois o `~` e o `$` de cada palavra: `{~/.gnupg/x,y}` abre ~/.gnupg/x
     except OverflowError:
         return "secret.brace-expansion", raw
     for cand in cands:
-        if "$" in cand or "`" in cand:
-            continue
+        if UNKNOWN.search(cand):
+            hit = partial(cand, write)
+            if hit:
+                return hit, cand
+            # (C) o pedaço desconhecido pode ser VAZIO (variável não atribuída, `$( )` sem saída): sem ele o caminho segue o fluxo normal, glob incluso (`.cr*$X` é `.credentials.json`)
+            bare = os.path.normpath(PIECE.sub("", cand))
+            if bare == cand or UNKNOWN.search(bare):  # nada a tirar, ou sobrou pedaço que não sei tirar: não consigo saber, o limite documentado
+                continue
+            cand = bare
         # vazio → o literal vale; falhou/ilegível (permissão, loop de link) → glob devolve [] e o literal vale
         for p in (sorted(glob.glob(cand))[:50] or [cand]) if re.search(r"[*?\[]", cand) else [cand]:
             for form in (os.path.normpath(p), os.path.realpath(p)):
@@ -167,10 +214,18 @@ def classify(raw: str, cwd, write: bool = False, env=None):
     return None
 
 
-def broad(raw: str, cwd, env=None):
-    """('secret.scan.home', caminho) se `raw` é o HOME, um ancestral dele ou `~/gt-remote` (ancestral de ~/gt-remote/keys): varrer isso recursivamente lê segredo."""
+CRED_PARENTS = {sub[:k] for sub, _, _ in HOME_SUB for k in range(1, len(sub))}  # ancestrais de segredo do catálogo que não são segredo em si: ~/.claude (guarda .credentials.json), ~/.config, ~/.dolt, ~/gt-remote…
+
+
+def broad(raw: str, cwd, env=None, deep: bool = True):
+    """('secret.scan.home', caminho) se `raw` é o HOME, um ancestral dele ou `~/gt-remote` (ancestral de ~/gt-remote/keys): varrer isso recursivamente lê segredo. deep=True (quem LÊ
+    conteúdo: grep -r, find, tar, cp -r, Grep) vale também para os outros ancestrais de segredo do catálogo (`~/.claude`, `~/.config`…); deep=False (Glob só lista nomes) fica no HOME e acima."""
     p = os.path.normpath(expand(raw or "", cwd, env or {})) if raw else ""
-    return ("secret.scan.home", p) if p and (p in ("/", "/home", "/Users", "/root", home(), home() + "/gt-remote") or home().startswith(p.rstrip("/") + "/")) else None
+    if p and (p in ("/", "/home", "/Users", "/root", home(), home() + "/gt-remote") or home().startswith(p.rstrip("/") + "/")):
+        return "secret.scan.home", p
+    if p and deep and any(tuple(r) in CRED_PARENTS for r in rels([x for x in p.split("/") if x])):
+        return "secret.scan.cred-parent", p
+    return None
 
 
 def names_family(comp: str):
@@ -235,7 +290,7 @@ def lex(text: str):
             flush(); i += 1
         elif c == "\n":
             flush(); toks.append(Op(";")); i += 1
-            for delim, tabs, recv in pend:
+            for delim, tabs, recv, quoted in pend:
                 body = []
                 while i < n:
                     j = text.find("\n", i)
@@ -243,7 +298,7 @@ def lex(text: str):
                     if (line.lstrip("\t") if tabs else line) == delim:
                         break
                     body.append(line)
-                docs.append(("\n".join(body), recv))
+                docs.append(("\n".join(body), recv, quoted))
             pend = []
         elif c == "#" and not word:
             while i < n and text[i] != "\n":
@@ -276,21 +331,22 @@ def lex(text: str):
                 flush()
             op = re.match(r"<<<|<<-?|&&|\|\||\|&|;;|&>>|&>|>>|>&|<&|>\||<>|[;&|()<>]", text[i:]).group(0)
             i += len(op)
-            m = re.match(r"[ \t]*(?:'([^']*)'|\"([^\"]*)\"|\\?([\w.-]+))", text[i:]) if op in ("<<", "<<-") else None
+            m = re.match(r"[ \t]*(?:'([^']*)'|\"([^\"]*)\"|(\\?)([\w.-]+))", text[i:]) if op in ("<<", "<<-") else None
             if m:  # o delimitador não é palavra; quem lê o heredoc está antes ou depois dele, na mesma linha
                 k = len(toks)
                 while k and not (isinstance(toks[k - 1], Op) and toks[k - 1] in SEP_OPS):
                     k -= 1
                 eol = text.find("\n", i)
                 words = [str(t) for t in toks[k:] if not isinstance(t, Op)] + re.split(r"[\s;&|()<>]+", text[i + m.end(): n if eol < 0 else eol])
-                pend.append((m.group(1) or m.group(2) or m.group(3) or "", op == "<<-", [os.path.basename(w) for w in words if w]))
+                quoted = m.group(1) is not None or m.group(2) is not None or bool(m.group(3))  # <<'E' <<"E" <<\E: o corpo é texto; sem aspas o bash EXPANDE $( ) e crase dele
+                pend.append((m.group(1) or m.group(2) or m.group(4) or "", op == "<<-", [os.path.basename(w) for w in words if w], quoted))
                 i += m.end()
             else:
                 toks.append(Op(pre + op))
         else:
             cur.append(c); word = True; i += 1
     flush()
-    return toks, docs + [("", r) for _, _, r in pend]  # `cat <<EOF` sem newline depois: não há corpo
+    return toks, docs + [("", r, True) for _, _, r, _ in pend]  # `cat <<EOF` sem newline depois: não há corpo
 
 
 def substitutions(w: str):
@@ -309,6 +365,16 @@ def literals(code: str, cwd, env):
     return next((h for h in (classify(run.strip("{}"), cwd, False, env) for run in RUN.findall(code)) if h), None)
 
 
+def real_verb(ws: list) -> int:
+    """Índice do verbo de verdade atrás de embrulhos (`timeout 5 find …`, `nohup grep -r …`, `env A=1 tar …`, `sudo -u x cp -r …`, `command export D=…`); 0 se não há embrulho ou só há embrulho."""
+    k = 0
+    while k < len(ws) and os.path.basename(ws[k]) in WRAP_VAL:
+        w, k = os.path.basename(ws[k]), k + 1
+        while k < len(ws) and (ws[k].startswith("-") or ASSIGN.match(ws[k]) or re.fullmatch(r"\d+(?:\.\d+)?[smhd]?", ws[k])):
+            k += 1 + (ws[k] in WRAP_VAL[w])
+    return k if k < len(ws) else 0
+
+
 def cd_target(words: list, cwd, env: dict):
     """O diretório depois de um `cd`/`pushd` (assumo que rodou); None se a linha não é cd ou não sei o destino."""
     ws = [w for w in words if not ASSIGN.match(w)]
@@ -323,12 +389,14 @@ def cd_target(words: list, cwd, env: dict):
 
 def scan_bash(cmd: str, cwd, depth: int = 0, env=None, strict: bool = False):
     env = dict(env or {})
-    if depth > 6:
-        return None
+    if depth > 6:  # vazio → n/a; falhou/ilegível (aninhamento mais fundo do que eu varro) → BLOQUEIA: o que eu não leio pode ser o segredo (igual ao teto da chave {a,b})
+        return "secret.nesting-too-deep", cmd[:80]
     toks, docs = lex(cmd)
-    for body, recv in docs:  # corpo lido como DADO (cat, git commit -F -, tee…): o texto citar `.env` não é ler `.env`; lido por shell ou interpretador, é código
+    for body, recv, quoted in docs:  # corpo lido como DADO (cat, git commit -F -, tee…): o texto citar `.env` não é ler `.env`; lido por shell ou interpretador, é código
         hit = scan_bash(body, cwd, depth + 1, env) if any(w in SHELLS for w in recv) else None
         hit = hit or (literals(body, cwd, env) if any(INTERP.fullmatch(w) for w in recv) else None)
+        for sub in () if quoted or hit else substitutions(body):  # delimitador SEM aspas: o $( ) e a crase do corpo RODAM, e a saída vira o texto que o leitor recebe
+            hit = hit or scan_bash(sub, cwd, depth + 1, env, True)
         if hit:
             return hit
     strict = strict or any(not isinstance(t, Op) and os.path.basename(t) in FEEDERS for t in toks)
@@ -370,17 +438,25 @@ def one(ws: list, cwd, depth: int, env: dict, strict: bool = False, feed=()):
         hit = classify(val, cwd, False, env)
         if hit:
             return hit
-        env[name] = expand(val, cwd, env) if val else ""
+        env[name] = subst(val, env)  # o valor como o shell o guarda: SEM juntar ao cwd (`D=.gnupg; cd ~; cat $D/x` abre ~/.gnupg/x)
         i += 1
-    ws = words[i:]
-    if not ws:
-        return None
-    verb, args, skip = os.path.basename(ws[0]), ws[1:], set()  # skip = índices (em args) de palavras que são CÓDIGO ou padrão, não caminho
-    for w in ws:  # $( ) e crase dentro de uma palavra (`echo "$(cat ~/.ssh/id_rsa)"`) rodam MESMO que o verbo seja isento, e a saída é operando de outro comando
+    # $( ) e crase em QUALQUER palavra da linha rodam MESMO que o verbo seja isento ou que não haja verbo (`echo "$(cat ~/.ssh/id_rsa)"`, `X=$(cat ~/.ssh/id_rsa)`, `cat < $(…)`,
+    # `cat <<< $(…)`), e a saída é operando de outro comando
+    for w in words + [t for t, _ in redirs] + [t for t, _ in herestr]:
         for body in substitutions(w):
             hit = scan_bash(body, cwd, depth + 1, env, True)
             if hit:
                 return hit
+    ws = words[i:]
+    if not ws:
+        return None
+    # o verbo é o de verdade, não o embrulho (`timeout 5 grep -r x ~/.claude` varre; `nohup find … | xargs cat` lista e lê); args segue com TODAS as palavras depois do 1º (candidatos a caminho)
+    ev = real_verb(ws)
+    verb, args, eargs, skip = os.path.basename(ws[ev]), ws[1:], ws[ev + 1:], set()  # skip = índices (em args) de palavras que são CÓDIGO ou padrão, não caminho
+    if verb in ("export", "declare", "typeset", "local", "readonly"):  # `export D=.gnupg` também vira variável para as palavras seguintes
+        for a in args:
+            if ASSIGN.match(a):
+                env[a.split("=", 1)[0]] = subst(a.split("=", 1)[1], env)
     nest = next((k for k, w in enumerate(ws) if os.path.basename(w) in SHELLS | {"eval"} or INTERP.fullmatch(os.path.basename(w))), None)
     if nest is not None:  # o 1º shell/interpretador da linha, mesmo atrás de embrulho (`timeout 5 bash -c …`, `nohup sh -c …`, `env A=1 python3 -c …`)
         nv, nargs, code = os.path.basename(ws[nest]), ws[nest + 1:], None
@@ -402,19 +478,19 @@ def one(ws: list, cwd, depth: int, env: dict, strict: bool = False, feed=()):
             hit = scan_bash(code, cwd, depth + 1, env) if nv in SHELLS | {"eval"} else literals(code, cwd, env)
             if hit:
                 return hit
-    if not strict and (verb in EXEMPT or (verb == "git" and next((a for a in args if not a.startswith("-")), "") in GIT_EXEMPT)):
+    if not strict and (verb in EXEMPT or (verb == "git" and next((a for a in eargs if not a.startswith("-")), "") in GIT_EXEMPT)):
         return None
     if verb in GREPS:  # o 1º operando é o padrão (a menos que haja -e/--regexp): citar `.env` num padrão não é ler `.env`
-        pat_done = any(a in ("-e", "--regexp") or a.startswith("--regexp=") for a in args)
-        for k, a in enumerate(args):
+        pat_done = any(a in ("-e", "--regexp") or a.startswith("--regexp=") for a in eargs)
+        for j, a in enumerate(eargs):  # j conta a partir do verbo de verdade; o índice em args é ev + j
             if a in GREP_VAL:
-                skip.add(k + 1)
+                skip.add(ev + j + 1)
             elif a.startswith("--regexp="):
-                skip.add(k)
-            elif not a.startswith("-") and not pat_done and (k - 1) not in skip and (k == 0 or args[k - 1] not in ("-f", "--file")):
-                skip.add(k); pat_done = True
-    reads = verb in READERS and not (verb == "sed" and any(re.match(r"-[a-zA-Z]*i|--in-place", a) for a in args))  # quem não é leitor conhecido pode ESCREVER: sem a exceção de leitura de ~/.ssh
-    names = verb == "find" and not any(a in ("-exec", "-execdir", "-ok", "-okdir") for a in args)  # `find -name .env` só lista; com -exec lê o que achou
+                skip.add(ev + j)
+            elif not a.startswith("-") and not pat_done and (ev + j - 1) not in skip and (j == 0 or eargs[j - 1] not in ("-f", "--file")):
+                skip.add(ev + j); pat_done = True
+    reads = verb in READERS and not (verb == "sed" and any(re.match(r"-[a-zA-Z]*i|--in-place", a) for a in eargs))  # quem não é leitor conhecido pode ESCREVER: sem a exceção de leitura de ~/.ssh
+    names = verb == "find" and not strict and not any(a in ("-exec", "-execdir", "-ok", "-okdir") for a in eargs)  # `find -name .env` só lista; com -exec lê o que achou, e em modo estrito (a saída vira operando de xargs/read/$( )) o nome buscado é o que será lido
     scans = verb in GREPS or verb in ("tar", "zip", "rsync", "cp", "scp") or (verb == "find" and not names)
     for k, a in enumerate(args):
         if k in skip or (names and k and args[k - 1] in FIND_VAL):
@@ -424,6 +500,8 @@ def one(ws: list, cwd, depth: int, env: dict, strict: bool = False, feed=()):
         hit = classify(cand, cwd, not reads, env) or (broad(cand, cwd, env) if scans else None)
         if not hit and re.fullmatch(r"[^\s:/][^\s:]*:[^\s]+", cand):  # `scp host:~/.ssh/id_rsa`: o que vem depois do `:` também é caminho (e `doc: id_rsa` não é)
             hit = classify(cand.split(":", 1)[1], cwd, not reads, env)
+        if not hit and (m := re.fullmatch(r":(?:[0-3]:)?([^\s:][^\s]*)", cand)):  # `git show :.env` / `:0:.env`: o índice do git, o caminho vem depois do `:` (sem rev antes dele)
+            hit = classify(m.group(1), cwd, not reads, env)
         if hit:
             return hit
     return None
@@ -440,13 +518,15 @@ def decide(inp: dict):
         hit = classify(str(ti.get(FILE_TOOLS[tool]) or ""), cwd, tool in WRITE_TOOLS)
         return (hit[0], hit[1], ("escrita" if tool in WRITE_TOOLS else "leitura") + " (" + tool + ")") if hit else None
     if tool in ("Grep", "Glob"):
-        hit, pat = classify(str(ti.get("path") or ""), cwd) or broad(str(ti.get("path") or ""), cwd), str(ti.get("glob" if tool == "Grep" else "pattern") or "")
+        # vazio → `path` omitido é o cwd da ferramenta (Grep e Glob varrem o cwd): vale como se estivesse escrito; falhou/ilegível → pedido sem cwd usa o cwd do próprio hook (o da sessão)
+        where = str(ti.get("path") or "") or cwd or os.getcwd()
+        hit, pat = classify(where, cwd) or broad(where, cwd, deep=tool == "Grep"), str(ti.get("glob" if tool == "Grep" else "pattern") or "")
         if not hit and pat:
             p = os.path.expanduser(pat) if pat.startswith("~") else pat
             fixed = re.split(r"[*?\[{]", p)[0]  # Glob: o diretório fixo do pattern (antes do 1º curinga) também conta
             d = fixed if fixed.endswith("/") else os.path.dirname(fixed)
             fam = names_family(pat.rsplit("/", 1)[-1])
-            hit = ((classify(d, cwd) or broad(d, cwd)) if d and tool == "Glob" else None) or ((fam, pat) if fam else None)
+            hit = ((classify(d, cwd) or broad(d, cwd, deep=False)) if d and tool == "Glob" else None) or ((fam, pat) if fam else None)
         return (hit[0], hit[1], tool) if hit else None
     return None
 
