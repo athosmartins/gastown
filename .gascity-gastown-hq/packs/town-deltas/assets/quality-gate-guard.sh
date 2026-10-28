@@ -3075,14 +3075,14 @@ gate_ab_arm_for_bead() {
   fi
 }
 
-# gate_base_test_verdict <detected> <copy_ok> <ran> <failed> [<repaired> [<unclassified> [<portable>]]]
+# gate_base_test_verdict <detected> <copy_ok> <ran> <failed> [<repaired> [<unclassified> [<portable> [<killed>]]]]
 #   ga-rstae: collapses the base-commit test check's raw counts (computed by
 #   the impure Step 5b-pre2 block below: how many *.selftest.sh files were
 #   added/changed on the branch, how many of those were successfully
 #   materialized onto a throwaway base-commit worktree, how many actually
 #   completed execution within their timeout budget, and how many of THOSE
-#   exited non-zero) into exactly ONE of six named states (four from ga-rstae,
-#   the fifth from ga-yl1k3w, the sixth from ga-hlcfzx9). All are REQUIRED reporting buckets per the
+#   exited non-zero) into exactly ONE of seven named states (four from ga-rstae,
+#   the fifth from ga-yl1k3w, the sixth from ga-hlcfzx9, the seventh from ga-4kykayr). All are REQUIRED reporting buckets per the
 #   bead — "sem-teste-novo" and "nao-consegui-medir" are not swallowed into a
 #   generic pass, they are counted separately so the A/B apuracao measures
 #   "who wrote a test that proves something", not "who wrote any test" or
@@ -3104,7 +3104,14 @@ gate_ab_arm_for_bead() {
 #                     repair and that the Linux node proved red in the old form and
 #                     green in the new one (gate_base_test_node_state). The test was
 #                     never red HERE, so ga-yl1k3w's repair proof cannot see it.
-#   All three default to 0 when the argument is ABSENT (a legacy 4-arg call keeps
+#   killed        — (ga-4kykayr) MODIFIED selftests whose old form PASSED here too, that the
+#                     builder DECLARED a mutant-hardening slice (label teste:endurece-mutantes)
+#                     and that the guard MEASURED: with a mutant of the production code
+#                     applied to a copy of base, the branch's selftest went RED, and GREEN
+#                     without it (gate_base_test_mutants_state). A slice that only hardens
+#                     a selftest changes no production code, so the new test passes on base
+#                     BY CONSTRUCTION; what it can prove is that it catches a broken base.
+#   All four default to 0 when the argument is ABSENT (a legacy 4-arg call keeps
 #   today's answer exactly). A PRESENT-but-empty or non-numeric value is NOT
 #   defaulted to 0: 0 here reads "no repair" and REFUSES the builder, so a
 #   garbled count is nao-consegui-medir instead (erro != vazio).
@@ -3158,6 +3165,14 @@ gate_ab_arm_for_bead() {
 #                            Never blocks; counted apart. consertou-teste-vermelho
 #                            wins when both kinds are present (it is the older,
 #                            stronger proof: the red was measured on this very base).
+#     matou-mutantes       — (ga-4kykayr) detected>0, every file measured, none
+#                            failed on base here, repaired=0 and portable=0, and AT
+#                            LEAST ONE file killed a mutant (killed>0). Never blocks;
+#                            counted apart. Lower precedence than the two repairs
+#                            above (older answers keep their word) and higher than
+#                            nao-consegui-medir: a proven kill is not undone by
+#                            another file the guard could not classify, the same way
+#                            a repair is not.
 #   "measured" above means copy_ok==detected AND ran==detected: a PARTIAL
 #   measurement (some files ok, some not) is treated the same as a total
 #   failure to measure, never as partial proof — fail-open on ANY
@@ -3167,7 +3182,7 @@ gate_ab_arm_for_bead() {
 #   passes in only these four counts.
 gate_base_test_verdict() {
   local detected="$1" copy_ok="$2" ran="$3" failed="$4"
-  local repaired="${5-0}" unclassified="${6-0}" portable="${7-0}"   # absent -> 0; present-but-garbled handled below
+  local repaired="${5-0}" unclassified="${6-0}" portable="${7-0}" killed="${8-0}"   # absent -> 0; present-but-garbled handled below
   case "$detected" in
     ''|*[!0-9]*) printf 'nao-consegui-medir'; return 0 ;;
   esac
@@ -3193,7 +3208,8 @@ gate_base_test_verdict() {
   case "$repaired" in ''|*[!0-9]*) printf 'nao-consegui-medir'; return 0 ;; esac
   case "$unclassified" in ''|*[!0-9]*) printf 'nao-consegui-medir'; return 0 ;; esac
   case "$portable" in ''|*[!0-9]*) printf 'nao-consegui-medir'; return 0 ;; esac
-  if [ $(( repaired + unclassified + portable )) -gt "$detected" ]; then
+  case "$killed" in ''|*[!0-9]*) printf 'nao-consegui-medir'; return 0 ;; esac
+  if [ $(( repaired + unclassified + portable + killed )) -gt "$detected" ]; then
     printf 'nao-consegui-medir'   # more classified files than files: inconsistent input, not evidence
     return 0
   fi
@@ -3201,6 +3217,8 @@ gate_base_test_verdict() {
     printf 'consertou-teste-vermelho'
   elif [ "$portable" -gt 0 ]; then
     printf 'consertou-portabilidade'
+  elif [ "$killed" -gt 0 ]; then
+    printf 'matou-mutantes'
   elif [ "$unclassified" -gt 0 ]; then
     printf 'nao-consegui-medir'
   else
@@ -3448,11 +3466,6 @@ gate_base_test_node_state() {
 # selftest that is still red once the mutant is gone) lands in `unknown`, which the call site counts as unclassified (nao-consegui-medir —
 # never a refusal, never an approval). Only a COMPLETE measurement in which every
 # mutant applied, ran and stayed green is `survived` (-> passou-na-base, as always).
-#
-# Slice 1 of 2 (ga-4kykayr.1): this section only MEASURES. Nothing in the guard calls it
-# yet, so no verdict changes; the `matou-mutantes` verdict and the Step 5b-pre2 call site
-# that reads these answers arrive in slice 2 (ga-4kykayr.2). Until then `killed|survived|
-# unknown` below are the answers that call site will map, as written above.
 
 # gate_base_test_mutants_declared <store> <bead-id>  (ga-4kykayr)
 #   Did the builder declare, on the source bead, that this change hardens a selftest
@@ -3546,8 +3559,8 @@ _gate_base_test_mutant_run() {
 
 # gate_base_test_mutants_state <rig> <base> <tip> <worktree> <file> <store> <bead-id>  (ga-4kykayr)
 #   For a MODIFIED selftest whose old and new forms both passed on the mini and whose source bead
-#   declared teste:endurece-mutantes: does the BRANCH's copy catch a broken base? To be run by the
-#   Step 5b-pre2 loop (slice 2) only after those two conditions. Prints exactly one word and ALWAYS returns 0:
+#   declared teste:endurece-mutantes: does the BRANCH's copy catch a broken base? Run by the Step
+#   5b-pre2 loop only after those two conditions. Prints exactly one word and ALWAYS returns 0:
 #     killed    — with a mutant of production code applied to <worktree> (a checkout of base), the
 #                 branch's selftest went RED, TWICE, and the same selftest was GREEN with no mutant
 #                 in the same sandbox, same worktree, same siblings, BEFORE the mutant (the control)
@@ -3671,6 +3684,45 @@ GATE_ABT_MUT_ORDER_EOF
   else
     printf 'unknown'
   fi
+  return 0
+}
+
+# gate_base_test_declared_state <rig> <base> <tip> <worktree> <file> <store> <bead-id> <mutants-decl> <portability-decl>  (ga-4kykayr)
+#   What the DECLARED paths say about ONE modified selftest whose old and new forms both passed
+#   here (gate_base_test_old_state said old-passes). Both declarations were read by the caller
+#   (gate_base_test_mutants_declared / _portability_declared: yes | no | unknown). Prints one word,
+#   ALWAYS returns 0:
+#     killed     — mutants declared and a mutant was killed (gate_base_test_mutants_state).
+#     portable   — portability declared and the Linux node proved it (gate_base_test_node_state).
+#                  Mutants are tried first: they run on the mini, in the sandbox, with no round trip.
+#     refusable  — nothing declared could be asked and nothing proves anything: no declaration at
+#                  all, or every declared path ANSWERED and said no (mutants all survived, node green).
+#     unknown    — a declaration could not be read, or a declared path could not answer. Never refusable:
+#                  "could not tell" is not "proves nothing".
+gate_base_test_declared_state() {
+  local rig="${1-}" base="${2-}" tip="${3-}" wt="${4-}" f="${5-}" store="${6-}" bead="${7-}" mdecl="${8-}" pdecl="${9-}"
+  local unk=0
+  case "$mdecl" in
+    no)  : ;;
+    yes)
+      case "$(gate_base_test_mutants_state "$rig" "$base" "$tip" "$wt" "$f" "$store" "$bead")" in
+        killed)   printf 'killed'; return 0 ;;
+        survived) : ;;
+        *)        unk=1 ;;
+      esac ;;
+    *)   unk=1 ;;
+  esac
+  case "$pdecl" in
+    no)  : ;;
+    yes)
+      case "$(gate_base_test_node_state "$rig" "$base" "$tip" "$wt" "$f")" in
+        node-red)   printf 'portable'; return 0 ;;
+        node-green) : ;;
+        *)          unk=1 ;;
+      esac ;;
+    *)   unk=1 ;;
+  esac
+  if [ "$unk" -eq 1 ]; then printf 'unknown'; else printf 'refusable'; fi
   return 0
 }
 
@@ -9067,6 +9119,18 @@ fi
 # passou-na-base. Label unreadable, node off or busy, file outside the hq -> unclassified ->
 # nao-consegui-medir. No label -> exactly the answer it always was. Never keyed on the bead id.
 #
+# Mutant-hardening slices (ga-4kykayr, Mayor 2026-10-28): a slice of the hq-mutants lastro only
+# hardens a selftest, so production code does not change and the new selftest passes on base
+# BY CONSTRUCTION (ga-iu0fvlo, marker ga-1iur59y). Same design as the portability repair, and
+# also never keyed on the bead id: the builder DECLARES (label teste:endurece-mutantes on the
+# source bead) and the gate MEASURES (gate_base_test_mutants_state: the mutants the source bead
+# lists for that selftest are applied one at a time to a copy of base, and the branch's selftest
+# must be GREEN with none and RED with at least one, in the sandbox of the pytest/js half).
+# Red on a mutant -> counted as killed -> verdict matou-mutantes (never blocks, tallied apart).
+# All mutants survive -> still passou-na-base. Label unreadable, list absent, a mutant that does
+# not apply, no sandbox, a cap or budget hit -> unclassified -> nao-consegui-medir: never a
+# silent passou-na-base and never an approval. No label -> exactly the answer it always was.
+#
 # Known blind spot, counted not closed (ga-x4mkk2, Mayor decision 2026-09-25): the
 # detection below only sees selftests inside the RIG_PATH directory, which for the
 # gascity rig is a subdirectory of the repo. A changed selftest elsewhere in the repo is
@@ -9091,6 +9155,7 @@ if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
     _ABT_DETECTED=0; _ABT_COPY_OK=0; _ABT_RAN=0; _ABT_FAILED=0
     _ABT_REPAIRED=0; _ABT_UNCLASSIFIED=0   # ga-yl1k3w: see gate_base_test_old_state
     _ABT_PORTABLE=0; _ABT_PORT_DECL=""     # ga-hlcfzx9: see gate_base_test_node_state; DECL stays "" until first needed
+    _ABT_KILLED=0; _ABT_MUT_DECL=""        # ga-4kykayr: see gate_base_test_mutants_state; DECL stays "" until first needed
     _ABT_OUTSIDE="unknown"                 # ga-x4mkk2: "never measured" must not read as 0
     _ABT_BASE=""; _ABT_TEST_FILES=""
     # ga-kisvqp: pytest/js half. py/js are "unknown" until a TOTALS line has actually been READ: a count that was never
@@ -9180,23 +9245,23 @@ if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
                   old-fails)         _ABT_REPAIRED=$((_ABT_REPAIRED + 1)) ;;
                   added)             : ;;
                   old-passes)
-                    # ga-hlcfzx9: green here in BOTH forms. Only a DECLARED portability repair
-                    # is worth asking the Linux node about; the declaration is read once, and
-                    # only now (a submission that never gets here pays nothing).
-                    # Declaration unreadable -> unclassified (nao-consegui-medir): "could not
-                    # read it" is not "nobody declared it", and must not refuse the builder.
+                    # ga-hlcfzx9 / ga-4kykayr: green here in BOTH forms. Only a DECLARED path is worth
+                    # measuring: teste:portabilidade-os (the Linux node) or teste:endurece-mutantes (mutants
+                    # of the code under test). Each declaration is read once, and only now (a submission
+                    # that never gets here pays nothing). One that cannot be read is unclassified
+                    # (nao-consegui-medir): "could not read it" is not "nobody declared it", and must not
+                    # refuse the builder. gate_base_test_declared_state decides; no declaration is refusable.
                     if [ -z "$_ABT_PORT_DECL" ]; then
                       _ABT_PORT_DECL=$(gate_base_test_portability_declared "$BEAD_CITY" "$BEAD_ID")
                     fi
-                    case "$_ABT_PORT_DECL" in
-                      no)  : ;;
-                      yes)
-                        case "$(gate_base_test_node_state "$RIG_PATH" "$_ABT_BASE" "$_ABT_BRANCH_SHA" "$_ABT_WT" "$_abt_f")" in
-                          node-red)    _ABT_PORTABLE=$((_ABT_PORTABLE + 1)) ;;
-                          node-green)  : ;;
-                          *)           _ABT_UNCLASSIFIED=$((_ABT_UNCLASSIFIED + 1)) ;;
-                        esac ;;
-                      *)   _ABT_UNCLASSIFIED=$((_ABT_UNCLASSIFIED + 1)) ;;
+                    if [ -z "$_ABT_MUT_DECL" ]; then
+                      _ABT_MUT_DECL=$(gate_base_test_mutants_declared "$BEAD_CITY" "$BEAD_ID")
+                    fi
+                    case "$(gate_base_test_declared_state "$RIG_PATH" "$_ABT_BASE" "$_ABT_BRANCH_SHA" "$_ABT_WT" "$_abt_f" "$BEAD_CITY" "$BEAD_ID" "$_ABT_MUT_DECL" "$_ABT_PORT_DECL")" in
+                      killed)     _ABT_KILLED=$((_ABT_KILLED + 1)) ;;
+                      portable)   _ABT_PORTABLE=$((_ABT_PORTABLE + 1)) ;;
+                      refusable)  : ;;
+                      *)          _ABT_UNCLASSIFIED=$((_ABT_UNCLASSIFIED + 1)) ;;
                     esac ;;
                   *)                 _ABT_UNCLASSIFIED=$((_ABT_UNCLASSIFIED + 1)) ;;
                 esac
@@ -9226,13 +9291,13 @@ ABT_TEST_FILES_EOF
         _ABT_DETECTED=$((_ABT_DETECTED + _ABT_PYJS_DET)); _ABT_COPY_OK=$((_ABT_COPY_OK + _ABT_PYJS_COPY))
         _ABT_RAN=$((_ABT_RAN + _ABT_PYJS_RAN)); _ABT_FAILED=$((_ABT_FAILED + _ABT_PYJS_FAILED))
         _ABT_REPAIRED=$((_ABT_REPAIRED + _ABT_PYJS_REP)); _ABT_UNCLASSIFIED=$((_ABT_UNCLASSIFIED + _ABT_PYJS_UNC))
-        _ABT_VERDICT=$(gate_base_test_verdict "$_ABT_DETECTED" "$_ABT_COPY_OK" "$_ABT_RAN" "$_ABT_FAILED" "$_ABT_REPAIRED" "$_ABT_UNCLASSIFIED" "$_ABT_PORTABLE")
+        _ABT_VERDICT=$(gate_base_test_verdict "$_ABT_DETECTED" "$_ABT_COPY_OK" "$_ABT_RAN" "$_ABT_FAILED" "$_ABT_REPAIRED" "$_ABT_UNCLASSIFIED" "$_ABT_PORTABLE" "$_ABT_KILLED")
       fi
     fi
 
     bd -C "$GC_CITY" label add "$MARKER_ID" "gate-ab:arm-b" -q 2>/dev/null || true
     bd -C "$GC_CITY" label add "$MARKER_ID" "gate-ab-basetest:$_ABT_VERDICT" -q 2>/dev/null || true
-    log "AB-BASE-TEST bead=$BEAD_ID arm=B verdict=$_ABT_VERDICT branch=$BRANCH base=$_ABT_BASE detected=$_ABT_DETECTED copy_ok=$_ABT_COPY_OK ran=$_ABT_RAN failed=$_ABT_FAILED repaired=$_ABT_REPAIRED unclassified=$_ABT_UNCLASSIFIED portable=$_ABT_PORTABLE outside-subtree=$_ABT_OUTSIDE"
+    log "AB-BASE-TEST bead=$BEAD_ID arm=B verdict=$_ABT_VERDICT branch=$BRANCH base=$_ABT_BASE detected=$_ABT_DETECTED copy_ok=$_ABT_COPY_OK ran=$_ABT_RAN failed=$_ABT_FAILED repaired=$_ABT_REPAIRED unclassified=$_ABT_UNCLASSIFIED portable=$_ABT_PORTABLE killed=$_ABT_KILLED outside-subtree=$_ABT_OUTSIDE"
     # ga-kisvqp: the pytest/js breakdown rides on its OWN lines, so the line above keeps the exact shape
     # gate-ab-apuracao.sh (and ga-x4mkk2's last-field rule) depend on.
     log "AB-BASE-TEST-PYJS bead=$BEAD_ID arm=B sh=$_ABT_SH_N py=$_ABT_NPY js=$_ABT_NJS pyjs=$_ABT_PYJS_STATE marker=$MARKER_ID"
@@ -9248,6 +9313,16 @@ ABT_TEST_FILES_EOF
         _ABT_PORT_NOTE="Your bead already carries teste:portabilidade-os, and the Linux node ran base's own copy of the test GREEN as well: it passes on BOTH systems before the fix, so it proves nothing on either."
       else
         _ABT_PORT_NOTE="If this change repairs a test that is red only on ANOTHER OS (e.g. it fails on the Linux node and passes on this macOS mini both before and after), declare it on the source bead and push again:  bd label add $BEAD_ID teste:portabilidade-os   The guard then runs base's own copy of the test on the Linux node and accepts the repair if it is RED there and your copy is GREEN there. A test that passes on both systems stays refused."
+      fi
+      # ga-4kykayr: the same for a slice that only hardens a selftest against the lastro's mutants. Declared and still
+      # refused means, for each MODIFIED selftest, that every mutant the source bead lists for it was applied to base
+      # and the test stayed GREEN. A brand-new selftest has no base form to compare and is refused without any mutant.
+      if [ "$_ABT_MUT_DECL" = "yes" ]; then
+        _ABT_PORT_NOTE="$_ABT_PORT_NOTE
+Your bead also carries teste:endurece-mutantes. That path measures MODIFIED selftests only (a brand-new file has no base form to compare): for each modified test the guard applied EVERY mutant the bead lists for it to base, one at a time, and a test that stayed GREEN with all of them kills none of what it was meant to harden. Add a case that goes RED with at least one of those mutants (ids are in the bead body)."
+      else
+        _ABT_PORT_NOTE="$_ABT_PORT_NOTE
+If this change only HARDENS a selftest against the hq-mutants lastro (production code unchanged, so the test passes on base by construction), declare it on the source bead and push again:  bd label add $BEAD_ID teste:endurece-mutantes   The guard then applies the mutants the bead lists for that test to a copy of base and accepts the change if your test is GREEN without them and RED with at least one. A test that kills none stays refused."
       fi
       bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: base-commit test check (ga-rstae, A/B experiment arm B).
 $_ABT_DETECTED new/changed test file(s) on $BRANCH pass UNCHANGED when run against the pre-fix base commit ($_ABT_BASE) — meaning they don't actually exercise the bug/regression this branch claims to fix (test-driven-development's own Iron Law: a test that passes before your fix exists proves nothing).

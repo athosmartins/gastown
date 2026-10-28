@@ -9,16 +9,14 @@
 # time, to a copy of base and runs the branch's selftest against each: GREEN with none, RED with at least
 # one), and the path never depends on the bead id. The new verdict word is matou-mutantes (does not block).
 #
-# Slice 1 of 2 (ga-4kykayr.1) covers what MEASURES: the label reader, the lastro list parser, the engine's
-# apply, the sandboxed mutant run and the opt-in heavy-guard wrapper. The verdict word and the Step 5b-pre2
-# call site (their dispatch and acceptance cases) are slice 2 (ga-4kykayr.2).
-#
 ## Contents
-##   1. pure         label reader · lastro list parser · rc classes
+##   1. pure         verdict word and precedence · label reader · lastro list parser · rc classes
 ##   2. real runs    gate_base_test_mutants_state against a real git repo, the real hq-mutate.py `apply`
 ##                   and the real macOS sandbox: killed / survived / every way it cannot tell
-##   3. engine       hq-mutate.py apply, called directly
-##   4. drift        placement, containment and "nothing here picks anything by bead id"
+##   3. dispatch     gate_base_test_declared_state (mutants first, then the Linux node, "unknown" is never "no")
+##   4. engine       hq-mutate.py apply, called directly
+##   5. acceptance   a mirror of the Step 5b-pre2 loop: the ga-iu0fvlo shape end to end, in both arms
+##   6. drift        placement, containment and "nothing here picks anything by bead id"
 ##
 # The sandbox sections need /usr/bin/sandbox-exec (macOS); without it they are skipped, loudly, and the pure
 # and drift sections still run. This file is listed in hetzner-mac-only.hq.txt next to the other A/B check
@@ -45,16 +43,17 @@ bash -n "${BASH_SOURCE[0]}" && ok "this selftest passes bash -n" || bad "this se
 
 # A caller's own overrides must not steer this run.
 unset GATE_ABT_HEAVY_GUARD GATE_ABT_MUTATE GATE_ABT_MUT_TIMEOUT GATE_ABT_MUT_BUDGET GATE_ABT_MUT_MAX \
-      GATE_ABT_SANDBOX_EXEC GATE_ABT_RUN_GUARD \
-      FAKE_BD_OUT_FILE FAKE_BD_RC FAKE_BD_LOG FAKE_HG_RC FAKE_HG_LOG FAKE_ENGINE_MODE
+      GATE_ABT_SANDBOX_EXEC GATE_ABT_MBP_RUN GATE_ABT_RUN_GUARD GATE_ABT_OLD_TIMEOUT GATE_ABT_NODE_TIMEOUT \
+      FAKE_BD_OUT_FILE FAKE_BD_RC FAKE_BD_LOG FAKE_HG_RC FAKE_HG_LOG FAKE_ENGINE_MODE FAKE_MBP_LOG FAKE_MBP_RC
 
 # shellcheck disable=SC1090
 GATE_GUARD_LIB_ONLY=1 . "$GUARD"
 set +e  # the guard sources with set -euo pipefail, which leaks into this shell (sourced, not subprocessed) and
         # would silently kill the rest of this harness on the first non-zero command.
 
-for _fn in gate_base_test_label_declared gate_base_test_mutants_declared gate_base_test_mutant_list \
-           gate_base_test_mutant_rc_class gate_base_test_mutants_state gate_base_test_sandbox_exec; do
+for _fn in gate_base_test_verdict gate_base_test_label_declared gate_base_test_mutants_declared \
+           gate_base_test_mutant_list gate_base_test_mutant_rc_class gate_base_test_mutants_state \
+           gate_base_test_declared_state gate_base_test_sandbox_exec gate_base_test_old_state; do
   type "$_fn" >/dev/null 2>&1 && ok "$_fn is defined after LIB_ONLY sourcing" || bad "FATAL: $_fn is not defined"
 done
 type gate_base_test_mutants_state >/dev/null 2>&1 || { echo "  PASS=$PASS  FAIL=$FAIL"; exit 1; }
@@ -91,6 +90,24 @@ shift
 exec "$@"
 FAKEHGEOF
 chmod +x "$TMPD/bin/hg-stub.sh"
+# mbp-run.sh: logs the target; 126 for a target that says LINUX_BREAKS, else 0 (the portability matrix's idiom).
+cat > "$TMPD/bin/mbp-run.sh" <<'FAKEMBPEOF'
+#!/usr/bin/env bash
+dir=""; target=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dir)  dir="$2"; shift 2 ;;
+    --repo) shift 2 ;;
+    --)     target="$2"; shift 2; break ;;
+    *)      shift ;;
+  esac
+done
+echo "dir=$dir target=$target" >> "${FAKE_MBP_LOG:-/dev/null}"
+[ -n "${FAKE_MBP_RC:-}" ] && exit "$FAKE_MBP_RC"
+grep -q LINUX_BREAKS "$dir/$target" 2>/dev/null && exit 126
+exit 0
+FAKEMBPEOF
+chmod +x "$TMPD/bin/mbp-run.sh"
 # a stand-in for hq-mutate.py: `apply` writes whatever FAKE_ENGINE_MODE says, whatever file it is asked about.
 cat > "$TMPD/fake-engine.py" <<'FAKEENGEOF'
 import os, sys
@@ -106,8 +123,8 @@ with open(out, 'w') as fh:
 sys.exit(0)
 FAKEENGEOF
 export PATH="$TMPD/bin:$PATH"
-export FAKE_BD_LOG="$TMPD/bd.log" FAKE_HG_LOG="$TMPD/hg.log"
-: > "$FAKE_BD_LOG"; : > "$FAKE_HG_LOG"
+export FAKE_BD_LOG="$TMPD/bd.log" FAKE_HG_LOG="$TMPD/hg.log" FAKE_MBP_LOG="$TMPD/mbp.log"
+: > "$FAKE_BD_LOG"; : > "$FAKE_HG_LOG"; : > "$FAKE_MBP_LOG"
 
 STORE=/fake/store
 BEAD=ga-mut
@@ -122,7 +139,26 @@ bdraw() { printf '%s' "$1" > "$TMPD/bd.json"; export FAKE_BD_OUT_FILE="$TMPD/bd.
 nlines() { if [ -s "$1" ]; then grep -c . "$1" || true; else echo 0; fi; }   # grep -c prints 0 AND exits 1 on an empty file
 
 # ── 1. pure ──────────────────────────────────────────────────────────────────────────────────────────
-echo "── 1. pure: label reader, lastro list parser, rc classes ──"
+echo "── 1. pure: verdict word, label reader, lastro list parser, rc classes ──"
+echo "  -- gate_base_test_verdict (8th arg: killed) --"
+V() { gate_base_test_verdict "$@"; }
+eq "one selftest, killed=1 -> matou-mutantes (today: passou-na-base)" "$(V 1 1 1 0 0 0 0 1)" "matou-mutantes"
+eq "killed absent (7 args, the ga-hlcfzx9 call shape) -> unchanged passou-na-base" "$(V 1 1 1 0 0 0 0)" "passou-na-base"
+eq "killed=0 -> passou-na-base" "$(V 1 1 1 0 0 0 0 0)" "passou-na-base"
+eq "a file that FAILED on base wins over a kill (reprovou-na-base)" "$(V 1 1 1 1 0 0 0 1)" "reprovou-na-base"
+eq "repaired wins over killed (consertou-teste-vermelho)" "$(V 2 2 2 0 1 0 0 1)" "consertou-teste-vermelho"
+eq "portable wins over killed (consertou-portabilidade)" "$(V 2 2 2 0 0 0 1 1)" "consertou-portabilidade"
+eq "killed wins over an unclassified sibling (the same precedence portable has)" "$(V 2 2 2 0 0 1 0 1)" "matou-mutantes"
+eq "unclassified with no kill -> nao-consegui-medir" "$(V 2 2 2 0 0 1 0 0)" "nao-consegui-medir"
+eq "no new selftest -> sem-teste-novo whatever killed says" "$(V 0 0 0 0 0 0 0 1)" "sem-teste-novo"
+eq "a file that did not run (ran != detected) -> nao-consegui-medir even with killed=1" "$(V 2 2 1 0 0 0 0 1)" "nao-consegui-medir"
+eq "copy failed (copy_ok != detected) -> nao-consegui-medir even with killed=1" "$(V 1 0 1 0 0 0 0 1)" "nao-consegui-medir"
+eq "killed='abc' (garbled) -> nao-consegui-medir, never an approval" "$(V 1 1 1 0 0 0 0 abc)" "nao-consegui-medir"
+eq "killed='' (explicitly empty) -> nao-consegui-medir" "$(V 1 1 1 0 0 0 0 "")" "nao-consegui-medir"
+eq "killed='-1' -> nao-consegui-medir" "$(V 1 1 1 0 0 0 0 -1)" "nao-consegui-medir"
+eq "classified files > files (repaired+unclassified+portable+killed > detected) -> nao-consegui-medir" "$(V 1 1 1 0 0 1 0 1)" "nao-consegui-medir"
+eq "killed alone > detected -> nao-consegui-medir" "$(V 1 1 1 0 0 0 0 2)" "nao-consegui-medir"
+
 echo "  -- gate_base_test_mutants_declared / label_declared --"
 bdraw "[{\"id\":\"$BEAD\",\"labels\":[\"gate:g\",\"$LBL_M\"]}]"
 eq "label teste:endurece-mutantes present -> yes" "$(gate_base_test_mutants_declared $STORE $BEAD)" "yes"
@@ -227,7 +263,7 @@ for _t in /usr/bin/sandbox-exec python3 jq git; do command -v "$_t" >/dev/null 2
 command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1 || CAN_RUN=0
 
 if [ "$CAN_RUN" -ne 1 ]; then
-  echo "── 2-3. SKIPPED: sandbox-exec / python3 / jq / git / timeout missing on this host (the sandbox is macOS-only) ──"
+  echo "── 2-5. SKIPPED: sandbox-exec / python3 / jq / git / timeout missing on this host (the sandbox is macOS-only) ──"
 else
 A=.gascity-gastown-hq/packs/town-deltas/assets      # repo-root-relative, the form `git diff --name-only` prints
 HQ="$REPO/.gascity-gastown-hq"
@@ -306,6 +342,7 @@ printf '%s\n' '#!/usr/bin/env bash' 'sleep 2' 'exit 0' | mkbranch slowctl "slow 
 printf '%s\n' '#!/usr/bin/env bash' 'SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"' \
   '[ "$(bash "$SELF_DIR/widget.sh" 10)" = small ] || sleep 30' 'exit 0' | mkbranch hang "hangs when the mutant is in" "$F_W"
 printf '%s\n' '#!/usr/bin/env bash' '# touched' 'exit 0' | mkbranch trivial "touches a selftest that is not about widget.sh" "$F_T"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' | mkbranch brandnew "a brand-new selftest" "$A/brandnew.selftest.sh"
 git -C "$REPO" checkout -q main
 
 WT="$TMPD/wt"
@@ -491,8 +528,47 @@ GATE_ABT_RUN_GUARD="$TMPD/bin/hg-stub.sh" FAKE_HG_RC=75 gate_base_test_sandbox_e
 eq "the wrapper's own refusal (rc 75) is what sandbox_exec returns" "$_rc" "75"
 hgreset
 
-# ── 3. the engine's apply, called directly ───────────────────────────────────────────────────────────
-echo "── 3. hq-mutate.py apply ──"
+# ── 3. declared_state ────────────────────────────────────────────────────────────────────────────────
+echo "── 3. gate_base_test_declared_state: the dispatch over the two declared paths ──"
+# The two measurements are replaced here (their own sections are above and in the check selftest); this
+# section is only about what the dispatch does with their answers.
+_real_mutants_state=$(declare -f gate_base_test_mutants_state)
+_real_node_state=$(declare -f gate_base_test_node_state)
+CALLLOG="$TMPD/calls.log"
+gate_base_test_mutants_state() { printf m >> "$CALLLOG"; printf '%s' "${FAKE_M:-unknown}"; }
+gate_base_test_node_state()    { printf n >> "$CALLLOG"; printf '%s' "${FAKE_N:-unknown}"; }
+ds() {  # ds <mutants-decl> <portability-decl>   -> "<answer> <which measurements were asked, in order>"
+  : > "$CALLLOG"
+  local out; out=$(gate_base_test_declared_state r b t w f s id "$1" "$2")
+  printf '%s %s' "$out" "$(cat "$CALLLOG")"
+}
+dsx() { FAKE_M="$1" FAKE_N="$2" ds "$3" "$4"; }
+eq "no declaration at all (no, no) -> refusable, nothing asked" "$(dsx killed node-red no no)" "refusable "
+eq "mutants declared, killed -> killed (the node is never asked)" "$(dsx killed node-red yes yes)" "killed m"
+eq "mutants declared, killed, portability not declared -> killed" "$(dsx killed node-red yes no)" "killed m"
+eq "mutants declared, survived, nothing else declared -> refusable (a complete 'no')" "$(dsx survived node-red yes no)" "refusable m"
+eq "mutants declared, unknown, nothing else declared -> unknown" "$(dsx unknown node-red yes no)" "unknown m"
+eq "mutants unknown-garbage answer ('maybe') is unknown" "$(dsx maybe node-red yes no)" "unknown m"
+eq "mutants survived + portability declared + node-red -> portable (the old path still works after a no)" "$(dsx survived node-red yes yes)" "portable mn"
+eq "mutants survived + portability declared + node-green -> refusable (both ANSWERED no)" "$(dsx survived node-green yes yes)" "refusable mn"
+eq "mutants unknown + portability declared + node-red -> portable (a proof is a proof)" "$(dsx unknown node-red yes yes)" "portable mn"
+eq "mutants unknown + portability declared + node-green -> unknown (one path could not answer)" "$(dsx unknown node-green yes yes)" "unknown mn"
+eq "portability only, node-red -> portable (unchanged ga-hlcfzx9)" "$(dsx killed node-red no yes)" "portable n"
+eq "portability only, node-green -> refusable" "$(dsx killed node-green no yes)" "refusable n"
+eq "portability only, node cannot tell -> unknown" "$(dsx killed unknown no yes)" "unknown n"
+eq "mutants declaration unreadable (unknown) -> unknown, mutants not even run" "$(dsx killed node-green unknown no)" "unknown "
+eq "... but a node proof still counts when the mutants declaration was unreadable" "$(dsx killed node-red unknown yes)" "portable n"
+eq "portability declaration unreadable (unknown), nothing proves anything -> unknown" "$(dsx survived node-red yes unknown)" "unknown m"
+eq "both declarations empty strings (never read) -> unknown, never refusable" "$(dsx survived node-green "" "")" "unknown "
+eq "a garbled declaration ('maybe') is not 'yes' and not 'no' -> unknown" "$(dsx survived node-green maybe no)" "unknown "
+eval "$_real_mutants_state"
+eval "$_real_node_state"
+unset -f ds dsx; unset FAKE_M FAKE_N
+eq "the real functions are back after the stubs" "$(type gate_base_test_mutants_state | grep -c 'GATE_ABT_MUT_MAX' | awk '{ print ($1 >= 1) ? "yes" : "no" }')" "yes"
+eq "always exits 0" "$(gate_base_test_declared_state "" "" "" "" "" "" "" "" "" >/dev/null; echo $?)" "0"
+
+# ── 4. the engine's apply, called directly ───────────────────────────────────────────────────────────
+echo "── 4. hq-mutate.py apply ──"
 AP() { python3 -I "$ENGINE" apply "$@" >/dev/null 2>&1; echo $?; }
 W_ORIG=$(cksum < "$REPO/$A/widget.sh")
 eq "apply the boundary mutant: rc 0" "$(AP "$REPO/$A/widget.sh" --tree "$HQ" --id "$ID_LIM" --out "$TMPD/mut.out")" "0"
@@ -514,14 +590,129 @@ printf 'ordinary text\n' > "$TMPD/also.txt"
 eq "an --also file without any of that: rc 0" "$(AP "$REPO/$A/widget.sh" --tree "$HQ" --id "$ID_LIM" --out "$TMPD/mut9.out" --also "$TMPD/also.txt")" "0"
 eq "apply without --id: argparse refuses (rc 2), the guard reads that as unknown" "$(AP "$REPO/$A/widget.sh" --tree "$HQ" --out "$TMPD/mut10.out")" "2"
 
+# ── 5. acceptance: the Step 5b-pre2 loop, end to end ─────────────────────────────────────────────────
+echo "── 5. acceptance: ga-iu0fvlo's shape through a mirror of the live call site ──"
+# Same scope and the same convention as run_port_check in gate-guard-ab-base-test-check.selftest.sh: the loop
+# is copied, every decision in it is a call to a REAL guard function, and the check selftest's section 3 pins
+# that the live call site has this shape.
+run_mut_check() {  # run_mut_check <branch> [bead-id]  -> verdict
+  local branch="$1" bead="${2:-$BEAD}" tip base="$BASE"
+  local detected=0 copy_ok=0 ran=0 failed=0 repaired=0 unclassified=0 portable=0 killed=0 decl="" mdecl="" files wt f rc
+  tip=$(git -C "$REPO" rev-parse "$branch")
+  files=$(git -C "$REPO" diff --name-only --diff-filter=AM "${base}..${tip}" -- '*.selftest.sh')
+  detected=$(printf '%s\n' "$files" | grep -c .)
+  wt=$(mktemp -d "${TMPDIR:-/tmp}/gate-4kykayr-mirror.XXXXXX")
+  git -C "$REPO" worktree add --detach --quiet "$wt" "$base" 2>/dev/null
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    mkdir -p "$(dirname "$wt/$f")"
+    if git -C "$REPO" show "${tip}:$f" > "$wt/$f" 2>/dev/null; then
+      copy_ok=$((copy_ok + 1))
+      if timeout 30 bash "$wt/$f" >/dev/null 2>&1; then
+        ran=$((ran + 1))
+        case "$(gate_base_test_old_state "$REPO" "$base" "$wt" "$f")" in
+          old-fails)         repaired=$((repaired + 1)) ;;
+          added)             : ;;
+          old-passes)
+            if [ -z "$decl" ]; then decl=$(gate_base_test_portability_declared "$STORE" "$bead"); fi
+            if [ -z "$mdecl" ]; then mdecl=$(gate_base_test_mutants_declared "$STORE" "$bead"); fi
+            case "$(gate_base_test_declared_state "$REPO" "$base" "$tip" "$wt" "$f" "$STORE" "$bead" "$mdecl" "$decl")" in
+              killed)     killed=$((killed + 1)) ;;
+              portable)   portable=$((portable + 1)) ;;
+              refusable)  : ;;
+              *)          unclassified=$((unclassified + 1)) ;;
+            esac ;;
+          *)                 unclassified=$((unclassified + 1)) ;;
+        esac
+      else
+        rc=$?
+        if [ "$rc" != "124" ]; then ran=$((ran + 1)); failed=$((failed + 1)); fi
+      fi
+    fi
+  done <<MUTFILESEOF
+$files
+MUTFILESEOF
+  git -C "$REPO" worktree remove --force "$wt" 2>/dev/null || rm -rf "$wt" 2>/dev/null
+  gate_base_test_verdict "$detected" "$copy_ok" "$ran" "$failed" "$repaired" "$unclassified" "$portable" "$killed"
+}
+export GATE_ABT_MBP_RUN="$TMPD/bin/mbp-run.sh"
+areset() { hgreset; : > "$FAKE_MBP_LOG"; : > "$FAKE_BD_LOG"; unset FAKE_BD_RC FAKE_MBP_RC; }
+LIST_OK="$(mutdesc widget.sh "$SEL_W" "$ID_NUM" "$ID_LIM")"
+bdset $BEAD "$LIST_OK" origem:lastro-hq-mutants "$LBL_M"; areset
+eq "TODAY (no measurement): the same branch with the label removed is refused as before -> passou-na-base" \
+  "$(bdset $BEAD "$LIST_OK" origem:lastro-hq-mutants; run_mut_check kills)" "passou-na-base"
+eq "... and with no label nothing was run" "$(nlines "$FAKE_HG_LOG")" "0"
+areset; bdset $BEAD "$LIST_OK" origem:lastro-hq-mutants "$LBL_M"
+eq "ACCEPT 1: label + the list + a selftest that kills a listed mutant (the selftest only; production unchanged) -> matou-mutantes" \
+  "$(run_mut_check kills)" "matou-mutantes"
+areset; bdset $BEAD "$LIST_OK" origem:lastro-hq-mutants "$LBL_M"
+eq "ACCEPT 2: the other order of the list -> matou-mutantes" \
+  "$(bdset $BEAD "$(mutdesc widget.sh "$SEL_W" "$ID_LIM" "$ID_NUM")" "$LBL_M"; run_mut_check kills)" "matou-mutantes"
+areset; bdset $BEAD "$LIST_OK" "$LBL_M"
+eq "REFUSE 1: label + the list, but the selftest kills nothing listed -> passou-na-base (surviving mutant: stays refused)" \
+  "$(run_mut_check weak)" "passou-na-base"
+areset; bdset $BEAD "$LIST_OK" "$LBL_M"
+eq "UNREADABLE 1: label + list, but the cap leaves the killer untried -> nao-consegui-medir" \
+  "$(GATE_ABT_MUT_MAX=1 run_mut_check kills)" "nao-consegui-medir"
+areset; bdset $BEAD "$LIST_OK" "$LBL_M"; export FAKE_BD_RC=1
+eq "UNREADABLE 2: bd fails -> nao-consegui-medir (never a silent passou-na-base, never an approval)" "$(run_mut_check kills)" "nao-consegui-medir"
+areset; bdraw '{"error":"no issues found matching the provided IDs","schema_version":1}'
+eq "UNREADABLE 3: bd answers 'not found' -> nao-consegui-medir" "$(run_mut_check kills)" "nao-consegui-medir"
+areset; bdset $BEAD "sem lista" "$LBL_M"
+eq "UNREADABLE 4: label but no mutant list in the description -> nao-consegui-medir" "$(run_mut_check kills)" "nao-consegui-medir"
+areset; bdset $BEAD "$(mutdesc widget.sh "$SEL_W" deadbeef00)" "$LBL_M"
+eq "UNREADABLE 5: label + a list whose only id no longer applies -> nao-consegui-medir" "$(run_mut_check kills)" "nao-consegui-medir"
+areset; bdset $BEAD "$(mutdesc widget.sh "$SEL_W" "$ID_NUM" deadbeef00)" "$LBL_M"
+eq "UNREADABLE 6: a surviving mutant plus a stale one -> nao-consegui-medir, NOT passou-na-base" "$(run_mut_check weak)" "nao-consegui-medir"
+areset; bdset $BEAD "$(mutdesc widget.sh "$SEL_W" deadbeef00 "$ID_LIM")" "$LBL_M"
+eq "ACCEPT 3: a stale id plus a killer -> matou-mutantes" "$(run_mut_check kills)" "matou-mutantes"
+areset; bdset $BEAD "$LIST_OK" "$LBL_M"
+eq "UNREADABLE 7: no sandbox -> nao-consegui-medir" "$(GATE_ABT_SANDBOX_EXEC=/nonexistent run_mut_check kills)" "nao-consegui-medir"
+areset; bdset $BEAD "$LIST_OK" "$LBL_M"; export FAKE_HG_RC=75
+eq "UNREADABLE 8: the disk floor (heavy-guard rc 75) -> nao-consegui-medir" "$(run_mut_check kills)" "nao-consegui-medir"
+areset; bdset $BEAD "$LIST_OK" "$LBL_M"
+eq "a selftest that is red on base with the mutant list present: the mirror's own run catches it first -> reprovou-na-base (unchanged)" \
+  "$(run_mut_check redctl)" "reprovou-na-base"
+areset; bdset $BEAD "$LIST_OK" "$LBL_M"
+eq "BRAND-NEW selftest with the label -> passou-na-base (nothing on base to compare, the mutant path is for MODIFIED selftests)" \
+  "$(run_mut_check brandnew)" "passou-na-base"
+eq "... and no mutant was run for it" "$(nlines "$FAKE_HG_LOG")" "0"
+areset; bdset $BEAD "$LIST_OK" "$LBL_M" "$LBL_P"
+eq "both labels declared and a mutant is killed -> matou-mutantes" "$(run_mut_check kills)" "matou-mutantes"
+eq "... the Linux node was never asked (mutants run first, on the mini)" "$(nlines "$FAKE_MBP_LOG")" "0"
+areset; bdset $BEAD "$LIST_OK" "$LBL_M" "$LBL_P"
+eq "both labels, the mutants all survive, the node is green on the old form too -> passou-na-base (both answered no)" "$(run_mut_check weak)" "passou-na-base"
+eq "... the node was asked (once: the old form was green)" "$(nlines "$FAKE_MBP_LOG")" "1"
+areset; bdset $BEAD "$LIST_OK" "$LBL_P"
+eq "portability label only: the mutant path is not taken -> passou-na-base (node green), unchanged ga-hlcfzx9" "$(run_mut_check kills)" "passou-na-base"
+eq "... no mutant was run" "$(nlines "$FAKE_HG_LOG")" "0"
+areset; bdset $BEAD "$LIST_OK" "$LBL_M"
+eq "bd is asked 3 times for one slice: each label once (not once per mutant) and the list once" "$(run_mut_check kills >/dev/null; nlines "$FAKE_BD_LOG")" "3"
+
+echo "  -- the path never depends on the bead id --"
+ARM_A=ga-rstae; ARM_B=ga-pj5va
+eq "fixture: ga-rstae is arm A and ga-pj5va is arm B (so the two runs below cover both arms)" \
+  "$(gate_ab_arm_for_bead $ARM_A)$(gate_ab_arm_for_bead $ARM_B)" "AB"
+_V=""
+for _b in $ARM_A $ARM_B ga-iu0fvlo; do
+  areset; bdset "$_b" "$LIST_OK" origem:lastro-hq-mutants "$LBL_M"
+  _V="$_V$(run_mut_check kills "$_b") "
+done
+eq "the same slice under an arm-A id, an arm-B id and ga-iu0fvlo's own id: the same verdict" "$_V" "matou-mutantes matou-mutantes matou-mutantes "
+_V=""
+for _b in $ARM_A $ARM_B ga-iu0fvlo; do
+  areset; bdset "$_b" "$LIST_OK" origem:lastro-hq-mutants
+  _V="$_V$(run_mut_check kills "$_b") "
+done
+eq "... and without the label, the same refusal under all three" "$_V" "passou-na-base passou-na-base passou-na-base "
 fi
 
-# ── 4. drift guards ──────────────────────────────────────────────────────────────────────────────────
-echo "── 4. drift guards ──"
+# ── 6. drift guards ──────────────────────────────────────────────────────────────────────────────────
+echo "── 6. drift guards ──"
 code_of() { sed -e 's/[[:space:]]#.*$//' -e '/^[[:space:]]*#/d'; }   # no comments: only what runs
 SEC=$(awk '/^# ── Mutant-hardening slices \(ga-4kykayr\)/{p=1} /^gate_base_test_outside_subtree\(\)/{p=0} p' "$GUARD")
 [ -n "$SEC" ] && ok "the mutant-hardening section is in the guard" || bad "the mutant-hardening section was not found in the guard"
-eq "the section defines its five functions" "$(printf '%s\n' "$SEC" | grep -cE '^(gate_base_test_mutants_declared|gate_base_test_mutant_list|gate_base_test_mutant_rc_class|_gate_base_test_mutant_run|gate_base_test_mutants_state)\(\)')" "5"
+eq "the section defines its six functions" "$(printf '%s\n' "$SEC" | grep -cE '^(gate_base_test_mutants_declared|gate_base_test_mutant_list|gate_base_test_mutant_rc_class|_gate_base_test_mutant_run|gate_base_test_mutants_state|gate_base_test_declared_state)\(\)')" "6"
 eq "no code line of the guard names ga-iu0fvlo or its marker ga-1iur59y (the path hangs off the declaration and the measurement)" \
   "$(code_of < "$GUARD" | grep -cE 'ga-iu0fvlo|ga-1iur59y')" "0"
 eq "the section never reads the arm (no gate_ab_arm_for_bead, no ARM variable)" "$(printf '%s\n' "$SEC" | code_of | grep -cE 'gate_ab_arm_for_bead|_ARM|ARM=')" "0"
@@ -539,6 +730,10 @@ eq "the sandbox profile is the same one the pytest/js runs use (the section call
   "$(printf '%s\n' "$SEC" | code_of | grep -cE 'gate_base_test_sandbox_ok|gate_base_test_sandbox_exec|sandbox-exec')" "2"
 eq "sandbox_exec adds the wrapper only when GATE_ABT_RUN_GUARD is set, as 97 when it is not executable" \
   "$(awk '/^gate_base_test_sandbox_exec\(\)/,/^}/' "$GUARD" | code_of | grep -cE 'GATE_ABT_RUN_GUARD:-|\[ -x "\$GATE_ABT_RUN_GUARD" \] \|\| return 97|--what selftest-gate-abt --max-file-mb 512 --')" "3"
+ABT_BLOCK=$(awk '/Step 5b-pre2 \(ga-rstae\)/,/^fi$/' "$GUARD")
+eq "the refusal note tells the builder about the label (bd label add <bead> teste:endurece-mutantes)" "$(printf '%s\n' "$ABT_BLOCK" | grep -c 'bd label add .*teste:endurece-mutantes')" "1"
+eq "the call site counts kills under the log field killed= and keeps outside-subtree= last" \
+  "$(printf '%s\n' "$ABT_BLOCK" | grep -c 'killed=\$_ABT_KILLED outside-subtree=\$_ABT_OUTSIDE')" "1"
 eq "scripts/hetzner-mac-only.hq.txt lists this selftest (it needs sandbox-exec)" \
   "$(grep -c '^packs/town-deltas/assets/gate-guard-ab-base-test-mutants.selftest.sh$' "$SELF_DIR/../../../scripts/hetzner-mac-only.hq.txt")" "1"
 /bin/bash -n "$GUARD" 2>/dev/null && ok "guard passes /bin/bash -n (the macOS system bash 3.2 reads it)" || bad "guard does not parse under /bin/bash"
