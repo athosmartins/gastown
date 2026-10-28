@@ -16,9 +16,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUT="${GHC_SUT:-$HERE/gate-hard-checks.sh}"
 RHQ="${GHC_HQ:-$(cd "$HERE/../../.." && pwd)}"
 HQ=".gascity-gastown-hq"
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIP=0
 ok()  { echo "  ✓ $*"; PASS=$((PASS+1)); }
 bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
+skip() { echo "  - SKIPPED $*"; SKIP=$((SKIP+1)); }   # a case that could not be exercised here: said and counted, never passed
 
 for t in git python3 jq timeout; do command -v "$t" >/dev/null 2>&1 || { echo "FATAL: $t not found"; exit 1; }; done
 for f in scripts/doc-rules-lint.py packs/town-deltas/assets/third-state-reads-check.py packs/town-deltas/assets/e12-crew-doctrine.sh \
@@ -167,6 +168,11 @@ mkdir -p "$R/sub" && big 250 > "$R/sub/notes.txt"; big 3 > "$WORK/outside.txt"; 
 big 250 > "$WORK/hostbig.txt"; big 250 > "$WORK/home/big.txt"; big 250 > "$WORK/hostabove.txt"
 big 3 > "$WORK/hostunread.txt"; chmod 000 "$WORK/hostunread.txt"
 mkdir -p "$WORK/hostnoexec" && big 3 > "$WORK/hostnoexec/x.txt" && chmod 000 "$WORK/hostnoexec"
+# chmod 000 keeps nobody out when this runs as root (the Hetzner dog may): the two twins below that lean on it would then pass without ever
+# reaching the denied-read path. Ask the disk instead of guessing from the uid.
+# vazio → n/a, the probe only opens a file; falhou → a probe that cannot tell reads as "denied": the twins run and a leak still shows
+DENY_FILE=1; ( : < "$WORK/hostunread.txt" ) 2>/dev/null && DENY_FILE=0
+DENY_DIR=1;  ( : < "$WORK/hostnoexec/x.txt" ) 2>/dev/null && DENY_DIR=0
 mkdir -p "$WORK/hostchain" && printf 'one\n@%s/hostchain/n2.txt\n' "$WORK" > "$WORK/hostchain/n1.txt" && printf 'two\n@%s/hostchain/secret-n3.txt\n' "$WORK" > "$WORK/hostchain/n2.txt" && big 250 > "$WORK/hostchain/secret-n3.txt"
 NB="$(commit_all "$R" nolink-base)"
 # nd <branch> <import line> [doc path]: a small named doc (9 lines, Contents fine) on a branch of NB; TIP = its commit
@@ -211,9 +217,12 @@ SP1="nao-consegui-medir entrada-especial-fora-do-diff-1"
 twin "an absolute import, a 3-line host file vs a path no host has (the bead's two cases)" $SP1 "@$WORK/outside.txt" "@$WORK/no-such-dir/x.txt"
 twin "an absolute import, a 250-line host file: its length is not counted" $SP1 "@$WORK/hostbig.txt" "@$WORK/no-such-dir/x.txt"
 hasnt "and no 200-line count of the host's file reaches the output" "effective"
-twin "an absolute import of a host file the guard may not read" $SP1 "@$WORK/hostunread.txt" "@$WORK/no-such-dir/x.txt"
-twin "an absolute import into a host directory nobody may enter" $SP1 "@$WORK/hostnoexec/x.txt" "@$WORK/no-such-dir/x.txt"
-hasnt "and the resolved path is not echoed" "cannot stat"
+if [ "$DENY_FILE" = 1 ]; then twin "an absolute import of a host file the guard may not read" $SP1 "@$WORK/hostunread.txt" "@$WORK/no-such-dir/x.txt"
+else skip "an absolute import of a host file the guard may not read: chmod 000 does not keep this user out (running as root?), so the case would pass without reaching the denied read"; fi
+if [ "$DENY_DIR" = 1 ]; then
+  twin "an absolute import into a host directory nobody may enter" $SP1 "@$WORK/hostnoexec/x.txt" "@$WORK/no-such-dir/x.txt"
+  hasnt "and the resolved path is not echoed" "cannot stat"
+else skip "an absolute import into a host directory nobody may enter, and the check that the resolved path is not echoed: chmod 000 does not keep this user out (running as root?)"; fi
 twin "an absolute import of a host file that imports other host files" $SP1 "@$WORK/hostchain/n1.txt" "@$WORK/no-such-dir/x.txt"
 hasnt "and the names the host file imports are not listed" "secret-n3"
 twin "a ~ import, a 3-line file in the guard's home vs one it lacks" $SP1 "@~/ref.txt" "@~/no-such-ref.txt" "HOME=$WORK/home"
@@ -289,38 +298,51 @@ CITY_UNDER=""
 
 echo "C2. the lint wrapper keeps the lint off this host's disk (ga-ymc1052), proved on its own"
 WRAP="$(dirname "$SUT")/gate-hard-checks-lint.py"
-# The resolver it installs, with the lint's own resolve_import replaced by a marker so "delegated" and "answered without the disk" differ
-mkdir -p "$WORK/wtree/sub" "$WORK/wtree2"
+# The resolver it installs, with the lint's own resolve_import replaced by a marker so "delegated" and "answered without the disk" differ.
+# The same tree is handed over spelled three ways, and each is crossed with the two spellings of the importing doc's folder the lint can
+# pass (the root as given, and its real form): the answer must not depend on how the caller wrote the path. $WORK/wtree is what the host's
+# TMPDIR makes it ("T//x/wtree" on macOS, a plain path on Linux), so the other two are built here to hold on every host.
+mkdir -p "$WORK/wtree/sub" "$WORK/wtree2"; ln -s wtree "$WORK/wtree-link"
 cat > "$WORK/wrap-unit.py" <<'PY'
 import importlib.util, os, sys
 spec = importlib.util.spec_from_file_location("ghc_lint", sys.argv[1])
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
-root = sys.argv[2]
-sub = os.path.join(root, "sub")
-res = mod.host_blind(lambda tok, host: "REAL:%s@%s" % (tok, host), root)
-cases = [
-    ("absolute", "/etc/hosts", root, None),
-    ("tilde", "~/x", root, None),
-    ("tilde user", "~someone/x", root, None),
-    ("climb out of the root", "../x", root, None),
-    ("climb out of a subfolder (two levels)", "../../x", sub, None),
-    ("a sibling whose name starts with the root's name", "../" + os.path.basename(root) + "2/x", root, None),
-    ("an absolute path that points INSIDE the root is still a host path", os.path.join(root, "x"), root, None),
-    ("inside the root: the lint's own resolver answers", "docs/x.txt", root, "REAL:docs/x.txt@" + root),
-    ("a .. that stays inside the root", "../docs/x.txt", sub, "REAL:../docs/x.txt@" + sub),
+base = sys.argv[2]
+roots = [
+    ("as the host's TMPDIR spells it", base),
+    ("with a doubled slash, a ./ and a trailing slash", os.path.dirname(base) + "//./" + os.path.basename(base) + "/"),
+    ("through a symlink", base + "-link"),
 ]
 bad = 0
-for name, tok, host, want in cases:
-    got = res(tok, host)
-    if got != want:
-        bad += 1
-        print("WRONG %s: %r -> %r (wanted %r)" % (name, tok, got, want))
-print("wrapper resolver: %d case(s), %d wrong" % (len(cases), bad))
+total = 0
+for how, root in roots:
+    for hostform, hostbase in (("folder as given", root), ("folder in real form", os.path.realpath(root))):
+        sub = os.path.join(hostbase, "sub")
+        real_name = os.path.basename(os.path.realpath(root))
+        res = mod.host_blind(lambda tok, host: "REAL:%s@%s" % (tok, host), root)
+        cases = [
+            ("absolute", "/etc/hosts", hostbase, None),
+            ("tilde", "~/x", hostbase, None),
+            ("tilde user", "~someone/x", hostbase, None),
+            ("climb out of the root", "../x", hostbase, None),
+            ("climb out of a subfolder (two levels)", "../../x", sub, None),
+            ("a sibling whose name starts with the root's name", "../" + real_name + "2/x", hostbase, None),
+            ("an absolute path that points INSIDE the root is still a host path", os.path.join(hostbase, "x"), hostbase, None),
+            ("inside the root: the lint's own resolver answers", "docs/x.txt", hostbase, "REAL:docs/x.txt@" + hostbase),
+            ("a .. that stays inside the root", "../docs/x.txt", sub, "REAL:../docs/x.txt@" + sub),
+        ]
+        for name, tok, host, want in cases:
+            total += 1
+            got = res(tok, host)
+            if got != want:
+                bad += 1
+                print("WRONG [root %s, %s] %s: %r -> %r (wanted %r)" % (how, hostform, name, tok, got, want))
+print("wrapper resolver: %d case(s), %d wrong" % (total, bad))
 sys.exit(1 if bad else 0)
 PY
 UOUT="$(python3 -I "$WORK/wrap-unit.py" "$WRAP" "$WORK/wtree" 2>&1)"; URC=$?
-[ "$URC" -eq 0 ] && ok "the resolver answers 'no such file' to every import that leaves the tree and delegates the rest ($(printf '%s' "$UOUT" | tail -n 1))" || bad "the resolver: $(printf '%s' "$UOUT" | head -n 4 | tr '\n' '|' | cut -c1-300)"
+[ "$URC" -eq 0 ] && ok "the resolver answers 'no such file' to every import that leaves the tree and delegates the rest, however the tree is spelled ($(printf '%s' "$UOUT" | tail -n 1))" || bad "the resolver: $(printf '%s' "$UOUT" | head -n 4 | tr '\n' '|' | cut -c1-300)"
 # Through a symlinked tree root (macOS: /var is a link to /private/var) an import inside the tree is still inside it, and counted
 mkdir -p "$WORK/wreal" && { printf '# T\n\n## Contents\n\n- A\n\n## A\n\n'; filler; echo "@big.txt"; } > "$WORK/wreal/CLAUDE.md"; big 250 > "$WORK/wreal/big.txt"; ln -s wreal "$WORK/wlink"
 UOUT="$(cd "$WORK/wlink" && env "GC_CITY_PATH=$CITY" python3 -I "$WRAP" "$RHQ/scripts/doc-rules-lint.py" "$WORK/wlink" --check --root "$WORK/wlink" --upstream-ref none CLAUDE.md 2>&1)"; URC=$?
@@ -570,5 +592,5 @@ run_sut 2b "$R" "$MAIN" "$GBAD" ga-x PATH="$FB";           expect "no jq on PATH
 branch_from "$R" main g_tool;  printf '# x\n' | put "$R" "$HQ/packs/town-deltas/assets/template-fragment-lint-guard.sh"; printf 'q\n' >> "$R/$HQ/agents/mila-wa/prompt.template.md"; GT="$(commit_all "$R" guard-edit)"
 run_sut 2b "$R" "$MAIN" "$GT" ga-x PATH="$FB";             expect "a diff that edits the parse guard is not judged by it" nao-consegui-medir ferramenta-alterada-no-diff
 
-echo "gate-hard-checks selftest: $PASS passed, $FAIL failed"
+echo "gate-hard-checks selftest: $PASS passed, $FAIL failed$([ "$SKIP" -gt 0 ] && echo ", $SKIP SKIPPED (not exercised on this host: see the - SKIPPED lines)")"
 [ "$FAIL" -eq 0 ]

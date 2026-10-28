@@ -30,15 +30,25 @@ from typing import Callable, List, Optional
 
 
 def host_blind(real: Callable[[str, str], Optional[str]], root: str) -> Callable[[str, str], Optional[str]]:
-    """resolve_import that answers None (not a file, the lint counts the line as text) for any import that points outside <root>."""
+    """resolve_import that answers None (not a file, the lint counts the line as text) for any import that points outside <root>.
+
+    <root> and the folder the lint passes are both put in their real form here, so that "inside" does not depend on how the caller spelled the
+    tree (a TMPDIR that ends in a slash gives "T//x", and /var is a link to /private/var on macOS): the same tree spelled two ways would
+    otherwise answer None for every import inside it, and the lint would read an in-tree 250-line file as plain text and call the doc clean."""
+    # vazio → a root that does not exist comes back normalized (non-strict), and nothing is inside it; falhou → an error other than "not
+    # found" escapes to main()'s try, which ends the run as exit 2 (unmeasured), never as "inside" and never as "outside"
+    root = os.path.realpath(root)
 
     def resolve_import(tok: str, host_dir: str) -> Optional[str]:
         # An absolute or ~ import is a path on this host, never in the branch.
         if tok.startswith("~") or os.path.isabs(tok):
             return None
-        # A relative one is placed on the path first, without touching the disk: one that climbs out of the tree would be stat'ed against the
-        # scratch dir's parents, which is this host again. Inside the tree the lint resolves it itself, through the tree's own directories.
-        cand = os.path.normpath(os.path.join(host_dir, tok))
+        # A relative one is placed on the path first, without touching the disk but for the folder of the importing doc (it is in the tree):
+        # one that climbs out of the tree would be stat'ed against the scratch dir's parents, which is this host again. Inside the tree the
+        # lint resolves it itself, through the tree's own directories.
+        # vazio → a folder that is not there comes back normalized; falhou → an error other than "not found" escapes into the lint's run: a
+        # traceback and exit 1 with no summary line, which the checker reads as unmeasured (saida-sem-resumo), never as "inside" or "outside"
+        cand = os.path.normpath(os.path.join(os.path.realpath(host_dir), tok))
         if cand != root and not cand.startswith(root + os.sep):
             return None
         return real(tok, host_dir)
@@ -57,7 +67,7 @@ def main(argv: List[str]) -> int:
         lint = importlib.util.module_from_spec(spec)   # type: ignore[arg-type]
         spec.loader.exec_module(lint)                  # type: ignore[union-attr]
         # vazio/falhou → a lint without resolve_import or main is not the one this was written for: AttributeError, exit 2, never run unpatched
-        lint.resolve_import = host_blind(lint.resolve_import, os.path.realpath(argv[2]))
+        lint.resolve_import = host_blind(lint.resolve_import, argv[2])
         run = lint.main
     except Exception as exc:   # unknown is not clean: any failure ends the run and the checker reads exit 2 as unmeasured
         print("gate-hard-checks-lint: %s: %s" % (type(exc).__name__, exc), file=sys.stderr)
