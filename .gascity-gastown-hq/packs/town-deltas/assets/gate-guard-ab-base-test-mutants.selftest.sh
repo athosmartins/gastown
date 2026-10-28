@@ -300,6 +300,8 @@ mk_widget_selftest 100:big    | mkbranch weak        "a case that kills nothing"
 mk_widget_selftest 50:small   | mkbranch redctl      "red with no mutant at all"                  "$F_W"
 printf '%s\n' '#!/usr/bin/env bash' 'f="$TMPDIR/runs"; n=$(cat "$f" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$f"' \
   '[ "$n" -eq 2 ] && exit 1' 'exit 0' | mkbranch flaky "red once, green on the repeat" "$F_W"
+{ printf '%s\n' '#!/usr/bin/env bash' '[ -e "$TMPDIR/marker" ] && exit 1' ': > "$TMPDIR/marker"'; mk_widget_selftest | sed 1d; } \
+  | mkbranch stateful "the base's own checks, red on every re-run in the same TMPDIR" "$F_W"
 printf '%s\n' '#!/usr/bin/env bash' 'sleep 2' 'exit 0' | mkbranch slowctl "slow even with no mutant" "$F_W"
 printf '%s\n' '#!/usr/bin/env bash' 'SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"' \
   '[ "$(bash "$SELF_DIR/widget.sh" 10)" = small ] || sleep 30' 'exit 0' | mkbranch hang "hangs when the mutant is in" "$F_W"
@@ -335,14 +337,14 @@ use_list widget.sh "$SEL_W" "$ID_NUM" "$ID_LIM"; hgreset
 eq "KILLED: the branch adds 'chk 10 small', the list holds a survivor then the boundary mutant" "$(st kills)" "killed"
 eq "... the production file is back byte for byte" "$(W_SUM)" "$W0"
 eq "... and git sees the worktree's production file as untouched" "$(git -C "$WT" status --porcelain -- "$A/widget.sh")" ""
-eq "... 4 sandboxed runs: control, the survivor once, the killer twice (red must repeat)" "$(nlines "$FAKE_HG_LOG")" "4"
+eq "... 5 sandboxed runs: control, the survivor once, the killer twice (red must repeat), the unmutated re-run (green again)" "$(nlines "$FAKE_HG_LOG")" "5"
 eq "... every one went through the heavy-guard wrapper with the per-file write cap (--max-file-mb 512)" \
-  "$(grep -c '^--what selftest-gate-abt --max-file-mb 512 -- | ' "$FAKE_HG_LOG")" "4"
+  "$(grep -c '^--what selftest-gate-abt --max-file-mb 512 -- | ' "$FAKE_HG_LOG")" "5"
 eq "... and the run is of the BRANCH's selftest, inside the worktree" "$(sed 's#.*| ##' "$FAKE_HG_LOG" | sort -u)" "$WT/$F_W"
 
 use_list widget.sh "$SEL_W" "$ID_LIM" "$ID_NUM"; hgreset
 eq "KILLED with the killer first in the list (one mutant, red:red, stops there)" "$(st kills)" "killed"
-eq "... 3 runs (control + the killer twice)" "$(nlines "$FAKE_HG_LOG")" "3"
+eq "... 4 runs (control + the killer twice + the unmutated re-run)" "$(nlines "$FAKE_HG_LOG")" "4"
 use_list widget.sh "$SEL_W" "$ID_NUM"; hgreset
 eq "KILLED the other way: 'chk 11 big' kills 10 -> 11" "$(st kills11)" "killed"
 use_list widget.sh "$SEL_W" "$ID_NUM" "$ID_LIM"; hgreset
@@ -378,6 +380,10 @@ eq "control not green (the selftest is red with NO mutant) -> unknown" "$(st red
 eq "... only the control ran" "$(nlines "$FAKE_HG_LOG")" "1"
 hgreset
 eq "flaky: red on the mutant once, green on the repeat -> unknown (a flaky test is not a kill)" "$(st flaky)" "unknown"
+use_list widget.sh "$SEL_W" "$ID_LIM"; hgreset
+eq "left-over state: the base's own checks (they kill nothing) that are green as the control and red on every re-run in the same TMPDIR -> unknown, NOT killed" "$(st stateful)" "unknown"
+eq "... 4 runs: control, the mutant twice, then the unmutated re-run that was still red" "$(nlines "$FAKE_HG_LOG")" "4"
+eq "... the production file is back byte for byte" "$(W_SUM)" "$W0"
 use_list widget.sh "$SEL_W" "$ID_NUM" "$ID_LIM"; hgreset
 eq "cap: GATE_ABT_MUT_MAX=1 and the survivor is first -> unknown (the killer was not reached)" "$(GATE_ABT_MUT_MAX=1 st kills)" "unknown"
 eq "... cap=2 reaches it -> killed" "$(GATE_ABT_MUT_MAX=2 st kills)" "killed"
@@ -459,7 +465,7 @@ cp "$ENGINE" "$TMPD/city/scripts/hq-mutate.py"
 use_list widget.sh "$SEL_W" "$ID_LIM"; hgreset
 eq "no overrides, GC_CITY set: both come from \$GC_CITY/scripts -> killed" \
   "$(env -u GATE_ABT_HEAVY_GUARD -u GATE_ABT_MUTATE bash -c 'GATE_GUARD_LIB_ONLY=1 . "$1"; set +e; GC_CITY="$9"; gate_base_test_mutants_state "$2" "$3" "$4" "$5" "$6" "$7" "$8"' _ "$GUARD" "$REPO" "$BASE" "$(tip kills)" "$WT" "$F_W" "$STORE" "$BEAD" "$TMPD/city")" "killed"
-eq "... through that heavy-guard (3 runs logged)" "$(nlines "$FAKE_HG_LOG")" "3"
+eq "... through that heavy-guard (4 runs logged)" "$(nlines "$FAKE_HG_LOG")" "4"
 hgreset
 eq "no overrides and GC_CITY empty: nothing to run -> unknown" \
   "$(env -u GATE_ABT_HEAVY_GUARD -u GATE_ABT_MUTATE bash -c 'GATE_GUARD_LIB_ONLY=1 . "$1"; set +e; GC_CITY="$9"; gate_base_test_mutants_state "$2" "$3" "$4" "$5" "$6" "$7" "$8"' _ "$GUARD" "$REPO" "$BASE" "$(tip kills)" "$WT" "$F_W" "$STORE" "$BEAD" "")" "unknown"

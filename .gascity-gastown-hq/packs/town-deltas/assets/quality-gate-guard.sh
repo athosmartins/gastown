@@ -3444,8 +3444,8 @@ gate_base_test_node_state() {
 #                 (gate_base_test_mutants_state).
 # Nothing here can approve by accident: every doubt (label unreadable, list absent or
 # unparsable, an id that no longer applies, no sandbox, the disk floor, a timeout, a
-# control run that is not green, a mutant that goes red once and green on the repeat)
-# lands in `unknown`, which the call site counts as unclassified (nao-consegui-medir —
+# control run that is not green, a mutant that goes red once and green on the repeat, a
+# selftest that is still red once the mutant is gone) lands in `unknown`, which the call site counts as unclassified (nao-consegui-medir —
 # never a refusal, never an approval). Only a COMPLETE measurement in which every
 # mutant applied, ran and stayed green is `survived` (-> passou-na-base, as always).
 #
@@ -3550,7 +3550,11 @@ _gate_base_test_mutant_run() {
 #   Step 5b-pre2 loop (slice 2) only after those two conditions. Prints exactly one word and ALWAYS returns 0:
 #     killed    — with a mutant of production code applied to <worktree> (a checkout of base), the
 #                 branch's selftest went RED, TWICE, and the same selftest was GREEN with no mutant
-#                 in the same sandbox, same worktree, same siblings.
+#                 in the same sandbox, same worktree, same siblings, BEFORE the mutant (the control)
+#                 and AGAIN right after the subject was put back. Every run of one measurement shares
+#                 one scratch (TMPDIR/HOME), so a selftest that cannot run twice in the same scratch is
+#                 green as the control and red afterwards whatever the mutant does; only the third green
+#                 tells "the mutant was caught" from "what the earlier runs left behind".
 #     survived  — a COMPLETE measurement: the list was read, none of it was cut by the cap or the
 #                 budget, every mutant applied and ran, and the selftest stayed green with ALL of
 #                 them. The selftest does not catch what the lastro says it should; stays refusable.
@@ -3569,7 +3573,7 @@ _gate_base_test_mutant_run() {
 gate_base_test_mutants_state() {
   local rig="${1-}" base="${2-}" tip="${3-}" wt="${4-}" f="${5-}" store="${6-}" bead="${7-}"
   local sel="" hq="" mut="" py="" list="" cited="" ordered="" rest="" line="" subj="" id="" subjpath=""
-  local root="" scratch="" keep="" budget="" max="" t0="" total=0 tried=0 green=0 unk=0 killed=0 cls="" cls2="" arc=0 real_wt="" real_dir=""
+  local root="" scratch="" keep="" budget="" max="" t0="" total=0 tried=0 green=0 unk=0 killed=0 cls="" cls2="" cls3="" arc=0 real_wt="" real_dir=""
   case "$f" in
     .gascity-gastown-hq/?*.selftest.sh) sel="${f#.gascity-gastown-hq/}" ;;
     *) printf 'unknown'; return 0 ;;
@@ -3639,17 +3643,21 @@ GATE_ABT_MUT_LIST_EOF
     "$py" -I "$mut" apply "$subjpath" --tree "$hq" --id "$id" --out "$keep/mutant" --also "$wt/$f" </dev/null >/dev/null 2>&1 || arc=$?
     if [ "$arc" -ne 0 ] || [ ! -s "$keep/mutant" ]; then rm -f "$keep/mutant"; unk=$((unk + 1)); continue; fi
     if ! cat "$subjpath" > "$keep/orig" 2>/dev/null; then rm -f "$keep/mutant"; unk=$((unk + 1)); continue; fi
-    cls=""; cls2=""
+    cls=""; cls2=""; cls3=""
     if cat "$keep/mutant" > "$subjpath" 2>/dev/null; then
       cls=$(_gate_base_test_mutant_run "$scratch" "$hq" "$wt/$f")
       if [ "$cls" = "red" ]; then cls2=$(_gate_base_test_mutant_run "$scratch" "$hq" "$wt/$f"); fi
     fi
     cat "$keep/orig" > "$subjpath" 2>/dev/null || { rm -rf "$root" 2>/dev/null; printf 'unknown'; return 0; }   # the worktree is not back as it was: nothing more is run from it
     rm -f "$keep/mutant" "$keep/orig"
-    case "$cls:$cls2" in
-      red:red)     killed=1; break ;;
-      green:)      green=$((green + 1)) ;;
-      *)           unk=$((unk + 1)) ;;   # a first red that did not repeat is a flaky test, not a kill
+    # red:red is a kill only if the selftest is GREEN again, in the same scratch, now that the subject is back.
+    # Control, mutant runs and this one share $scratch/tmp and $scratch/home: a selftest that is not re-runnable
+    # there is red on every run after the first whatever the mutant does, and would read as killed.
+    if [ "$cls:$cls2" = "red:red" ]; then cls3=$(_gate_base_test_mutant_run "$scratch" "$hq" "$wt/$f"); fi
+    case "$cls:$cls2:$cls3" in
+      red:red:green) killed=1; break ;;
+      green::)       green=$((green + 1)) ;;
+      *)             unk=$((unk + 1)) ;;   # a first red that did not repeat is flaky; red twice that is still red with no mutant is left-over state, not a kill
     esac
   done <<GATE_ABT_MUT_ORDER_EOF
 $ordered
