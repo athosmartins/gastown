@@ -47,8 +47,8 @@ LIMIT = 8  # segundos para julgar um pedido; passou disto vale bloqueado (hook q
 DEADLINE = float("inf")
 RM_TEXT = re.compile(r"(?<![\w.-])(?:rm|unlink|rmdir|shred|rimraf)(?![\w-])|-delete|rmtree")
 RM_VERBS = {"rm", "unlink", "rmdir", "shred", "rimraf"}
-SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "ash"}
-INTERP = re.compile(r"(?:python[\d.]*|node(?:js)?|perl|ruby|php|lua|deno|bun|awk|gawk|mawk)")
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "ash", "csh", "tcsh", "fish", "mksh", "yash", "posh", "rbash", "pdksh", "oksh"}
+INTERP = re.compile(r"(?:python[\d.]*|pypy[\d.]*|node(?:js)?|perl|ruby|php|lua|luajit|deno|bun|awk|gawk|mawk|nawk|tclsh|wish|Rscript|julia|osascript|jshell|groovy)")
 KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "{", "}", "!", "coproc", "function"}
 OPAQUE = {"chrt", "taskset", "parallel", "su", "runuser", "script", "trap", "watch", "unshare", "nsenter", "chroot", "setpriv", "numactl", "caffeinate", "unbuffer", "ssh"}
 WRAP = {"env": ("-u -C -S --unset --chdir --split-string", 0), "command": ("", 0), "builtin": ("", 0), "exec": ("-a", 0), "nohup": ("", 0), "time": ("-f -o --format --output", 0),
@@ -80,7 +80,7 @@ LIT = re.compile(r"""'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)\"""", re.S)
 ARGV = re.compile(r"""\[\s*['"](?:[^'"\n]*/)?(rm|unlink|rmdir|shred|rimraf)['"]\s*,([^\]]*)\]|['"](?:[^'"\n]*/)?(rm|unlink|rmdir|shred|rimraf)['"]\s*,\s*\[([^\]]*)\]""")
 ELEM = re.compile(r"""\s*(?:'(?P<s>(?:[^'\\]|\\.)*)'|"(?P<d>(?:[^"\\]|\\.)*)"|(?P<e>[^,\s][^,]*))\s*(?:,|$)""")  # um elemento de lista de argv: literal ou expressão
 # nomes de API de remoção (sem as palavras genéricas remove/delete: scripts de edição as citam o tempo todo): em qualquer parte do código ligam a leitura dos literais de caminho
-NAMES = r"rmtree|remove_tree|rimraf(?:Sync)?|rm_rf?\b|rmSync|rmdirSync|unlinkSync|removedirs|os\.(?:remove|unlink|rmdir)\b|\.(?:rm|rmdir|unlink)(?=\s*\()|FileUtils\.(?:rm|remove)\w*|File\.delete|Dir\.rmdir|(?<![\w.])(?:unlink|rmdir)(?=\s*\()"
+NAMES = r"rmtree|remove_tree|rimraf(?:Sync)?|rm_rf?\b|rmSync|rmdirSync|unlinkSync|removedirs|os\.(?:remove|unlink|rmdir)\b|\.(?:rm|rmdir|unlink)(?=\s*\()|FileUtils\.(?:rm|remove)\w*|File\.delete|Dir\.rmdir|(?<![\w.])(?:unlink|rmdir|rm)(?=\s*\()"
 DELAPI = re.compile(NAMES)
 DELREC = re.compile(r"rmtree|remove_tree|remove_dir|remove_entry|rimraf|rm_rf?\b|removedirs|rmSync|recursive")  # a API que apaga pasta inteira; `os.remove`/`unlink` apagam um arquivo
 DELCALL = re.compile("(?:" + NAMES + r")\s*\(?\s*['\"]([^'\"\n]+)['\"]")  # o literal passado DIRETO à API: `rmtree('gt-remote')`
@@ -598,6 +598,10 @@ def one(ws: list, cwds: list, depth: int, env: dict, feed: list, app=None):
                 if hit: return hit
             elif os.path.basename(w) in RM_VERBS | {"find", "xargs"} | SHELLS:
                 return one(args[j:], cwds, depth + 1, env, [])
+    for x, a in enumerate(args):  # corredor de código que não conheço (xonsh, elvish, nu…): a convenção `-c 'texto'` entrega o programa; só texto que cita rm e tem espaço (não pega `git -c k=v`, `cut -c1-5`, `grep -e`)
+        if a in ("-c", "--command") and x + 1 < len(args) and RM_TEXT.search(args[x + 1]) and re.search(r"\s", args[x + 1].strip()):
+            hit = scan_bash(args[x + 1], cwds, depth + 1, env)
+            if hit: return hit
     return None
 
 def decide(inp: dict):
