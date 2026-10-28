@@ -533,6 +533,8 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
             elif not st["fdepth"] and term == "&":
                 st["cwd"] = None
             return None
+        if st.get("calling") and seg[:1] == ["function"] and seg[2:3] == ["{"]:  # definição aninhada num corpo reexecutado: o corpo dela não roda agora, mas onde ele acaba eu não sei (o `}` que o fecha não fica guardado)
+            st["lost"] = True  # o resto desta reexecução é conferido sem diretório e o diretório fica "não sei" depois dela: um `cd` dentro do corpo que não roda não pode valer para o que vem depois
         if not st.get("calling") and (seg[:1] == ["{"] and st.pop("func", False) or seg[:1] == ["function"] and seg[2:3] == ["{"]):  # nunca ao REEXECUTAR um corpo guardado (calling): o `{` guardado ali reabria a definição com o nome velho, desviava o resto do corpo para a lista errada e o laço de chamada percorria essa lista sem fim (ga-tih62nv)
             if seg[0] == "function":
                 st["fname"], seg = seg[1], seg[2:]
@@ -599,11 +601,13 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
             st["calling"].add(c)
             try:
                 for s, p, t in st["funcs"][c]:
-                    r = one(list(s), blind, p, t)
+                    r = one(list(s), blind or bool(st.get("lost")), p, t)
                     if r:
                         return r
             finally:
                 st["calling"].discard(c)
+                if st.pop("lost", False):
+                    st["cwd"] = None
         elif c == "git":
             return git_hit(seg, {**st["env"], **env}, cwd, terr, own)
         return None
