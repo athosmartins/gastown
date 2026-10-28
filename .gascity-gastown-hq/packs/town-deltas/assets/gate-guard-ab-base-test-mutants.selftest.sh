@@ -44,7 +44,7 @@ bash -n "${BASH_SOURCE[0]}" && ok "this selftest passes bash -n" || bad "this se
 # A caller's own overrides must not steer this run.
 unset GATE_ABT_HEAVY_GUARD GATE_ABT_MUTATE GATE_ABT_MUT_TIMEOUT GATE_ABT_MUT_BUDGET GATE_ABT_MUT_MAX \
       GATE_ABT_SANDBOX_EXEC GATE_ABT_MBP_RUN GATE_ABT_RUN_GUARD GATE_ABT_OLD_TIMEOUT GATE_ABT_NODE_TIMEOUT \
-      FAKE_BD_OUT_FILE FAKE_BD_RC FAKE_BD_LOG FAKE_HG_RC FAKE_HG_LOG FAKE_ENGINE_MODE FAKE_MBP_LOG FAKE_MBP_RC
+      FAKE_BD_OUT_FILE FAKE_BD_RC FAKE_BD_LOG FAKE_HG_RC FAKE_HG_RC_AT FAKE_HG_LOG FAKE_ENGINE_MODE FAKE_MBP_LOG FAKE_MBP_RC
 
 # shellcheck disable=SC1090
 GATE_GUARD_LIB_ONLY=1 . "$GUARD"
@@ -79,12 +79,15 @@ exit "${FAKE_BD_RC:-0}"
 FAKEBDEOF
 chmod +x "$TMPD/bin/bd"
 # heavy-guard stand-in: logs "<--what NAME --max-file-mb N --> <last arg>" (one line per run), answers
-# FAKE_HG_RC if set, else runs what follows the `--`. The real heavy-guard needs a disk reading; the real
-# one is what runs in production (the drift section pins that the guard asks for it by that path).
+# FAKE_HG_RC if set (every run, or only the FAKE_HG_RC_AT-th run when that is set too), else runs what
+# follows the `--`. The real heavy-guard needs a disk reading; the real one is what runs in production
+# (the drift section pins that the guard asks for it by that path).
 cat > "$TMPD/bin/hg-stub.sh" <<'FAKEHGEOF'
 #!/usr/bin/env bash
 echo "$1 $2 $3 $4 $5 | ${@: -1}" >> "${FAKE_HG_LOG:-/dev/null}"
-[ -n "${FAKE_HG_RC:-}" ] && exit "$FAKE_HG_RC"
+if [ -n "${FAKE_HG_RC:-}" ]; then
+  if [ -z "${FAKE_HG_RC_AT:-}" ] || [ "$(wc -l < "${FAKE_HG_LOG:-/dev/null}" | tr -d ' ')" = "$FAKE_HG_RC_AT" ]; then exit "$FAKE_HG_RC"; fi
+fi
 while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done
 shift
 exec "$@"
@@ -231,6 +234,15 @@ bdset $BEAD "ARQUIVO packs/a.sh (4)
 eq "malformed lines (short id, upper-case id, no id, no testes, one-space indent, testes before id) are skipped, the good one is kept" \
   "$(gate_base_test_mutant_list $STORE $BEAD $SELW | cut -f2 | tr '\n' ' ')" "3d3d3d3d3d "
 bdset $BEAD "  L7 [n] 1 -> 2  id=3d3d3d3d3d  (testes: $SELW)"
+eq "... and 'skipped' counts the five of them that name this selftest (the one with no testes: cannot be attributed to any selftest, so it is not counted)" \
+  "$(gate_base_test_mutant_list $STORE $BEAD $SELW skipped)" "5"
+eq "... a selftest those lines do not name has no holes: 0" "$(gate_base_test_mutant_list $STORE $BEAD "$SELO" skipped)" "0"
+bdset $BEAD "$LASTRO" origem:lastro-hq-mutants "$LBL_M"
+eq "a clean description: 'skipped' is 0, and the list itself is unchanged by the new argument" \
+  "$(gate_base_test_mutant_list $STORE $BEAD $SELW skipped)$(gate_base_test_mutant_list $STORE $BEAD $SELW | wc -l | tr -d ' ')" "04"
+bdset $BEAD "  L7 [n] 1 -> 2  id=3d3d3d3d3d  (testes: $SELW)"
+eq "a mutant line with no ARQUIVO above it has no file to apply to -> skipped, and counted as a hole" \
+  "$(gate_base_test_mutant_list $STORE $BEAD $SELW skipped)" "1"
 eq "a mutant line with no ARQUIVO above it has no file to apply to -> skipped" "$(gate_base_test_mutant_list $STORE $BEAD $SELW)" ""
 bdset $BEAD "só texto, nenhuma lista"
 eq "a description with no list at all -> nothing" "$(gate_base_test_mutant_list $STORE $BEAD $SELW)" ""
@@ -242,8 +254,10 @@ bdraw "[{\"id\":\"$BEAD\",\"description\":7}]"
 eq "a description that is not a string -> nothing" "$(gate_base_test_mutant_list $STORE $BEAD $SELW)" ""
 bdraw 'not json'
 eq "bd output that is not JSON -> nothing" "$(gate_base_test_mutant_list $STORE $BEAD $SELW)" ""
+eq "... and nothing for 'skipped' either: an unreadable description is not '0 holes'" "$(gate_base_test_mutant_list $STORE $BEAD $SELW skipped)" ""
 bdset $BEAD "$LASTRO"; export FAKE_BD_RC=1
 eq "bd failed -> nothing (the same as 'no list': both are 'nothing to measure against')" "$(gate_base_test_mutant_list $STORE $BEAD $SELW)" ""
+eq "... and nothing for 'skipped'" "$(gate_base_test_mutant_list $STORE $BEAD $SELW skipped)" ""
 unset FAKE_BD_RC
 eq "empty store/bead -> nothing" "$(gate_base_test_mutant_list "" $BEAD $SELW)$(gate_base_test_mutant_list $STORE "" $SELW)" ""
 eq "always exits 0" "$(gate_base_test_mutant_list "" "" "" >/dev/null; echo $?)" "0"
@@ -343,13 +357,16 @@ printf '%s\n' '#!/usr/bin/env bash' 'SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]
   '[ "$(bash "$SELF_DIR/widget.sh" 10)" = small ] || sleep 30' 'exit 0' | mkbranch hang "hangs when the mutant is in" "$F_W"
 printf '%s\n' '#!/usr/bin/env bash' '# touched' 'exit 0' | mkbranch trivial "touches a selftest that is not about widget.sh" "$F_T"
 printf '%s\n' '#!/usr/bin/env bash' 'exit 0' | mkbranch brandnew "a brand-new selftest" "$A/brandnew.selftest.sh"
+{ mk_widget_selftest; echo '# touched, nothing new'; } | mkbranch stale "a comment and nothing else" "$F_W"
+mk_widget_selftest 10:small   | mkbranch fresh      "a new selftest that kills"                   "$A/fresh.selftest.sh"
 git -C "$REPO" checkout -q main
 
 WT="$TMPD/wt"
 git -C "$REPO" worktree add --detach --quiet "$WT" "$BASE" 2>/dev/null || bad "FATAL fixture: worktree add failed"
 tip() { git -C "$REPO" rev-parse "$1"; }
+REASONS="$TMPD/reasons.log"   # the function's stderr: one AB-BASE-TEST-MUTANTS line per answer (the guard's log in production)
 st() {  # st <branch> [repo-relative selftest]   -> gate_base_test_mutants_state
-  gate_base_test_mutants_state "$REPO" "$BASE" "$(tip "$1")" "$WT" "${2:-$F_W}" "$STORE" "$BEAD"
+  gate_base_test_mutants_state "$REPO" "$BASE" "$(tip "$1")" "$WT" "${2:-$F_W}" "$STORE" "$BEAD" 2>>"$REASONS"
 }
 mutdesc() {  # mutdesc <subject-under-assets> <selftest-under-hq> <id>...   -> a lastro description listing those ids
   local subj="$1" sel="$2"; shift 2
@@ -362,7 +379,7 @@ use_list() {  # use_list <subject> <selftest> <id>...
   local subj="$1" sel="$2"; shift 2
   bdset $BEAD "$(mutdesc "$subj" "$sel" "$@")" origem:lastro-hq-mutants "$LBL_M"
 }
-hgreset() { : > "$FAKE_HG_LOG"; unset FAKE_HG_RC; }
+hgreset() { : > "$FAKE_HG_LOG"; unset FAKE_HG_RC FAKE_HG_RC_AT; }
 W_SUM() { cksum < "$WT/$A/widget.sh"; }
 export GATE_ABT_HEAVY_GUARD="$TMPD/bin/hg-stub.sh" GATE_ABT_MUTATE="$ENGINE"
 
@@ -370,18 +387,20 @@ export GATE_ABT_HEAVY_GUARD="$TMPD/bin/hg-stub.sh" GATE_ABT_MUTATE="$ENGINE"
 echo "── 2. gate_base_test_mutants_state: a real repo, the real engine, the real macOS sandbox ──"
 W0=$(W_SUM)
 
-use_list widget.sh "$SEL_W" "$ID_NUM" "$ID_LIM"; hgreset
+use_list widget.sh "$SEL_W" "$ID_NUM" "$ID_LIM"; hgreset; : > "$REASONS"
 eq "KILLED: the branch adds 'chk 10 small', the list holds a survivor then the boundary mutant" "$(st kills)" "killed"
+eq "... and the reason line carries the counters (one survivor passed, the killer was the 2nd of 2)" "$(grep -c 'answer=killed total=2 tried=2 green=1 basecaught=0 unknown=0 skipped=0 why=-$' "$REASONS")" "1"
 eq "... the production file is back byte for byte" "$(W_SUM)" "$W0"
 eq "... and git sees the worktree's production file as untouched" "$(git -C "$WT" status --porcelain -- "$A/widget.sh")" ""
-eq "... 5 sandboxed runs: control, the survivor once, the killer twice (red must repeat), the unmutated re-run (green again)" "$(nlines "$FAKE_HG_LOG")" "5"
+eq "... 7 sandboxed runs: control, the survivor once, the killer twice (red must repeat), the unmutated re-run (green again), the base copy's control, the base copy against the killer (green)" "$(nlines "$FAKE_HG_LOG")" "7"
 eq "... every one went through the heavy-guard wrapper with the per-file write cap (--max-file-mb 512)" \
-  "$(grep -c '^--what selftest-gate-abt --max-file-mb 512 -- | ' "$FAKE_HG_LOG")" "5"
-eq "... and the run is of the BRANCH's selftest, inside the worktree" "$(sed 's#.*| ##' "$FAKE_HG_LOG" | sort -u)" "$WT/$F_W"
+  "$(grep -c '^--what selftest-gate-abt --max-file-mb 512 -- | ' "$FAKE_HG_LOG")" "7"
+eq "... and every run is of the selftest inside the worktree (the branch's copy, or the base's put in its place)" "$(sed 's#.*| ##' "$FAKE_HG_LOG" | sort -u)" "$WT/$F_W"
+eq "... the branch's copy is back in place afterwards (the base copy's text did not stay)" "$(cksum < "$WT/$F_W")" "$(git -C "$REPO" show "$(tip kills):$F_W" | cksum)"
 
 use_list widget.sh "$SEL_W" "$ID_LIM" "$ID_NUM"; hgreset
 eq "KILLED with the killer first in the list (one mutant, red:red, stops there)" "$(st kills)" "killed"
-eq "... 4 runs (control + the killer twice + the unmutated re-run)" "$(nlines "$FAKE_HG_LOG")" "4"
+eq "... 6 runs (control + the killer twice + the unmutated re-run + the base copy's control and run)" "$(nlines "$FAKE_HG_LOG")" "6"
 use_list widget.sh "$SEL_W" "$ID_NUM"; hgreset
 eq "KILLED the other way: 'chk 11 big' kills 10 -> 11" "$(st kills11)" "killed"
 use_list widget.sh "$SEL_W" "$ID_NUM" "$ID_LIM"; hgreset
@@ -395,6 +414,34 @@ use_list widget.sh "$SEL_W" "$ID_LIM"
 eq "a selftest that kills a mutant NOT in this list does not count: 'chk 11 big' against {boundary} -> survived" "$(st kills11)" "survived"
 use_list widget.sh "$SEL_W" "$ID_NUM"
 eq "... and 'chk 10 small' against {+1} -> survived" "$(st kills)" "survived"
+
+echo "  -- killed means THIS change caught it, not that the base's own checks already did --"
+use_list widget.sh "$SEL_W" "$ID_NEG"; hgreset; : > "$REASONS"
+eq "STALE entry: the branch only adds a comment, the base's own checks already kill the listed mutant -> survived (stays passou-na-base), NOT killed" "$(st stale)" "survived"
+eq "... 6 runs: control, the mutant twice, the unmutated re-run, then the base copy's control and its run against the mutant (red: it dies there too)" "$(nlines "$FAKE_HG_LOG")" "6"
+eq "... production file back byte for byte, branch copy back in place" "$(W_SUM) $(cksum < "$WT/$F_W")" "$W0 $(git -C "$REPO" show "$(tip stale):$F_W" | cksum)"
+eq "... and the reason line counts it as base-caught, not as unknown" "$(grep -c 'answer=survived total=1 tried=1 green=0 basecaught=1 unknown=0 skipped=0 why=-$' "$REASONS")" "1"
+hgreset
+eq "a check the base already has, added again ('chk 100 big' does not matter) against a mutant the base kills -> survived, NOT killed" "$(st weak)" "survived"
+use_list widget.sh "$SEL_W" "$ID_NEG" "$ID_LIM"; hgreset
+eq "a mutant the base already kills, then one only this change kills -> killed (the first is not news, the second is)" "$(st kills)" "killed"
+eq "... 10 runs: the base copy's control ran once, then one run of it per kill candidate" "$(nlines "$FAKE_HG_LOG")" "10"
+use_list widget.sh "packs/town-deltas/assets/fresh.selftest.sh" "$ID_LIM"; hgreset; : > "$REASONS"
+eq "no base copy to compare with (the selftest is new on this branch) -> unknown, never killed" "$(st fresh "$A/fresh.selftest.sh")" "unknown"
+eq "... 4 runs: control, the mutant twice, the unmutated re-run; nothing for the base" "$(nlines "$FAKE_HG_LOG")" "4"
+eq "... the reason names the measurement that is missing (base: -)" "$(grep -c 'answer=unknown .*why=[0-9a-f]*:run-red/red/green/-$' "$REASONS")" "1"
+eq "... production file back byte for byte" "$(W_SUM)" "$W0"
+
+echo "  -- the disk guard answering on ONE run only (a mutant run, the repeat, the re-run, the base copy) --"
+use_list widget.sh "$SEL_W" "$ID_LIM"
+for _at in 2:75 2:76 2:78 2:79 3:78 4:78 5:1 5:78 6:78; do
+  hgreset; export FAKE_HG_RC_AT="${_at%%:*}" FAKE_HG_RC="${_at#*:}"
+  eq "run ${_at%%:*} of the kill path answers rc ${_at#*:} -> unknown, never killed" "$(st kills)" "unknown"
+  eq "... production file and the branch's selftest are back as they were" "$(W_SUM) $(cksum < "$WT/$F_W")" "$W0 $(git -C "$REPO" show "$(tip kills):$F_W" | cksum)"
+done
+hgreset; export FAKE_HG_RC_AT=6 FAKE_HG_RC=1
+eq "the base copy red under the mutant (run 6 answers rc 1) -> survived: it dies there too, nothing this change added" "$(st kills)" "survived"
+hgreset
 
 echo "  -- every way the measurement cannot tell: unknown, never survived, never killed --"
 bdset $BEAD "ARQUIVO packs/town-deltas/assets/widget.sh (1)
@@ -412,6 +459,34 @@ use_list widget.sh "$SEL_W" deadbeef00 "$ID_LIM"
 eq "... a stale id in front of the killer -> still killed (one proven kill is proof)" "$(st kills)" "killed"
 use_list widget.sh "$SEL_W" "$ID_NUM" deadbeef00
 eq "... a surviving mutant and a stale one -> unknown (the stale one was not measured), NOT survived" "$(st weak)" "unknown"
+bdset $BEAD "ARQUIVO packs/town-deltas/assets/widget.sh (2)
+  L4 [x] a -> b  id=$ID_NUM  (testes: $SEL_W)
+  L9 [x] a -> b  (testes: $SEL_W)" "$LBL_M"; hgreset; : > "$REASONS"
+eq "a line that names this selftest but has no id (the lastro's format drifted): the parsed mutants survive -> unknown, NOT survived (the list has a hole)" "$(st weak)" "unknown"
+eq "... the reason says how many lines were left out" "$(grep -c 'answer=unknown total=1 tried=1 green=1 .*skipped=1 why=list-has-1-unparsed-line(s)$' "$REASONS")" "1"
+bdset $BEAD "ARQUIVO packs/town-deltas/assets/widget.sh (2)
+  L4 [x] a -> b  id=$ID_LIM  (testes: $SEL_W)
+  L9 [x] a -> b  (testes: $SEL_W)" "$LBL_M"; hgreset
+eq "... the same hole next to a mutant the selftest kills -> still killed (one proven kill is proof, the hole only blocks 'survived')" "$(st kills)" "killed"
+bdset $BEAD "ARQUIVO packs/town-deltas/assets/widget.sh (2)
+  L4 [x] a -> b  id=$ID_NUM  (testes: $SEL_W)
+  L9 [x] a -> b  (testes: packs/town-deltas/assets/another.selftest.sh)" "$LBL_M"; hgreset
+eq "a malformed line that names ANOTHER selftest is not this one's hole -> survived" "$(st weak)" "survived"
+
+echo "  -- the worktree has to be the base, and the subject base's own bytes --"
+use_list widget.sh "$SEL_W" "$ID_LIM"; hgreset; : > "$REASONS"
+git -C "$REPO" worktree add --detach --quiet "$TMPD/wt-tip" "$(tip kills)" 2>/dev/null || bad "FATAL fixture: second worktree add failed"
+eq "a worktree that is at the branch's tip, not at base (the mutants would be made of the wrong code) -> unknown" \
+  "$(gate_base_test_mutants_state "$REPO" "$BASE" "$(tip kills)" "$TMPD/wt-tip" "$F_W" "$STORE" "$BEAD" 2>>"$REASONS")" "unknown"
+eq "... nothing ran" "$(nlines "$FAKE_HG_LOG")" "0"
+eq "... and the reason says so" "$(grep -c 'answer=unknown why=worktree-not-at-base$' "$REASONS")" "1"
+git -C "$REPO" worktree remove --force "$TMPD/wt-tip" 2>/dev/null
+echo '# a stray edit' >> "$WT/$A/widget.sh"; hgreset; : > "$REASONS"
+eq "a production file in the worktree that is not base's own bytes (an earlier run died with a mutant in place) -> unknown, never mutated again" "$(st kills)" "unknown"
+eq "... only the control ran" "$(nlines "$FAKE_HG_LOG")" "1"
+eq "... the reason names the mutant and the cause" "$(grep -c 'answer=unknown .*why=[0-9a-f]*:subject-not-base$' "$REASONS")" "1"
+git -C "$WT" checkout -q -- "$A/widget.sh"
+eq "... (fixture) the stray edit is gone again" "$(W_SUM)" "$W0"
 use_list widget.sh "$SEL_W" "$ID_LIM"; hgreset
 eq "control not green (the selftest is red with NO mutant) -> unknown" "$(st redctl)" "unknown"
 eq "... only the control ran" "$(nlines "$FAKE_HG_LOG")" "1"
@@ -453,17 +528,18 @@ eq "... bare '.gascity-gastown-hq/.selftest.sh' (no name) -> unknown" "$(st kill
 for _blank in rig base tip wt file store bead; do
   _args=("$REPO" "$BASE" "$(tip kills)" "$WT" "$F_W" "$STORE" "$BEAD")
   case "$_blank" in rig) _args[0]="" ;; base) _args[1]="" ;; tip) _args[2]="" ;; wt) _args[3]="" ;; file) _args[4]="" ;; store) _args[5]="" ;; bead) _args[6]="" ;; esac
-  eq "empty $_blank argument -> unknown" "$(gate_base_test_mutants_state "${_args[@]}")" "unknown"
+  eq "empty $_blank argument -> unknown" "$(gate_base_test_mutants_state "${_args[@]}" 2>>"$REASONS")" "unknown"
 done
-eq "a tip that does not resolve -> unknown" "$(gate_base_test_mutants_state "$REPO" "$BASE" 0000000000000000000000000000000000000000 "$WT" "$F_W" "$STORE" "$BEAD")" "unknown"
-eq "a worktree that is not there -> unknown" "$(gate_base_test_mutants_state "$REPO" "$BASE" "$(tip kills)" "$TMPD/no-such-wt" "$F_W" "$STORE" "$BEAD")" "unknown"
-eq "always exits 0" "$(gate_base_test_mutants_state "" "" "" "" "" "" "" >/dev/null; echo $?)" "0"
+eq "a tip that does not resolve -> unknown" "$(gate_base_test_mutants_state "$REPO" "$BASE" 0000000000000000000000000000000000000000 "$WT" "$F_W" "$STORE" "$BEAD" 2>>"$REASONS")" "unknown"
+eq "a worktree that is not there -> unknown" "$(gate_base_test_mutants_state "$REPO" "$BASE" "$(tip kills)" "$TMPD/no-such-wt" "$F_W" "$STORE" "$BEAD" 2>>"$REASONS")" "unknown"
+eq "always exits 0" "$(gate_base_test_mutants_state "" "" "" "" "" "" "" >/dev/null 2>>"$REASONS"; echo $?)" "0"
 eq "the wrapper's local GATE_ABT_RUN_GUARD never leaks into this shell" "${GATE_ABT_RUN_GUARD+set}" ""
 
 echo "  -- containment: a hostile or odd engine, a symlinked or sensitive subject --"
 export GATE_ABT_MUTATE="$TMPD/fake-engine.py"
 use_list widget.sh "$SEL_W" "$ID_LIM"; hgreset
-eq "a mutant that wrecks widget.sh (fake engine, 'garbage' mode): the selftest goes red twice -> killed" "$(FAKE_ENGINE_MODE=garbage st weak)" "killed"
+eq "a mutant that wrecks widget.sh (fake engine, 'garbage' mode): the selftest goes red twice, and the base's copy goes red too (its own 'chk 50 big') -> survived, not killed" "$(FAKE_ENGINE_MODE=garbage st weak)" "survived"
+eq "... 6 runs: control, the wreck twice, the unmutated re-run, the base copy's control and its run against the wreck" "$(nlines "$FAKE_HG_LOG")" "6"
 eq "... and the worktree's widget.sh was put back byte for byte" "$(W_SUM)" "$W0"
 eq "... git agrees" "$(git -C "$WT" status --porcelain -- "$A/widget.sh")" ""
 hgreset
@@ -501,14 +577,14 @@ cp "$TMPD/bin/hg-stub.sh" "$TMPD/city/scripts/heavy-guard.sh"
 cp "$ENGINE" "$TMPD/city/scripts/hq-mutate.py"
 use_list widget.sh "$SEL_W" "$ID_LIM"; hgreset
 eq "no overrides, GC_CITY set: both come from \$GC_CITY/scripts -> killed" \
-  "$(env -u GATE_ABT_HEAVY_GUARD -u GATE_ABT_MUTATE bash -c 'GATE_GUARD_LIB_ONLY=1 . "$1"; set +e; GC_CITY="$9"; gate_base_test_mutants_state "$2" "$3" "$4" "$5" "$6" "$7" "$8"' _ "$GUARD" "$REPO" "$BASE" "$(tip kills)" "$WT" "$F_W" "$STORE" "$BEAD" "$TMPD/city")" "killed"
-eq "... through that heavy-guard (4 runs logged)" "$(nlines "$FAKE_HG_LOG")" "4"
+  "$(env -u GATE_ABT_HEAVY_GUARD -u GATE_ABT_MUTATE bash -c 'GATE_GUARD_LIB_ONLY=1 . "$1"; set +e; GC_CITY="$9"; gate_base_test_mutants_state "$2" "$3" "$4" "$5" "$6" "$7" "$8"' _ "$GUARD" "$REPO" "$BASE" "$(tip kills)" "$WT" "$F_W" "$STORE" "$BEAD" "$TMPD/city" 2>>"$REASONS")" "killed"
+eq "... through that heavy-guard (6 runs logged)" "$(nlines "$FAKE_HG_LOG")" "6"
 hgreset
 eq "no overrides and GC_CITY empty: nothing to run -> unknown" \
-  "$(env -u GATE_ABT_HEAVY_GUARD -u GATE_ABT_MUTATE bash -c 'GATE_GUARD_LIB_ONLY=1 . "$1"; set +e; GC_CITY="$9"; gate_base_test_mutants_state "$2" "$3" "$4" "$5" "$6" "$7" "$8"' _ "$GUARD" "$REPO" "$BASE" "$(tip kills)" "$WT" "$F_W" "$STORE" "$BEAD" "")" "unknown"
+  "$(env -u GATE_ABT_HEAVY_GUARD -u GATE_ABT_MUTATE bash -c 'GATE_GUARD_LIB_ONLY=1 . "$1"; set +e; GC_CITY="$9"; gate_base_test_mutants_state "$2" "$3" "$4" "$5" "$6" "$7" "$8"' _ "$GUARD" "$REPO" "$BASE" "$(tip kills)" "$WT" "$F_W" "$STORE" "$BEAD" "" 2>>"$REASONS")" "unknown"
 rm -f "$TMPD/city/scripts/heavy-guard.sh"
 eq "engine present but heavy-guard.sh missing from \$GC_CITY/scripts -> unknown (the run is never made without it)" \
-  "$(env -u GATE_ABT_HEAVY_GUARD -u GATE_ABT_MUTATE bash -c 'GATE_GUARD_LIB_ONLY=1 . "$1"; set +e; GC_CITY="$9"; gate_base_test_mutants_state "$2" "$3" "$4" "$5" "$6" "$7" "$8"' _ "$GUARD" "$REPO" "$BASE" "$(tip kills)" "$WT" "$F_W" "$STORE" "$BEAD" "$TMPD/city")" "unknown"
+  "$(env -u GATE_ABT_HEAVY_GUARD -u GATE_ABT_MUTATE bash -c 'GATE_GUARD_LIB_ONLY=1 . "$1"; set +e; GC_CITY="$9"; gate_base_test_mutants_state "$2" "$3" "$4" "$5" "$6" "$7" "$8"' _ "$GUARD" "$REPO" "$BASE" "$(tip kills)" "$WT" "$F_W" "$STORE" "$BEAD" "$TMPD/city" 2>>"$REASONS")" "unknown"
 
 echo "  -- gate_base_test_sandbox_exec: the wrapper is opt-in, and the pytest/js runs never get it --"
 SBX_SCR="$TMPD/sbx"; mkdir -p "$SBX_SCR"
@@ -712,7 +788,7 @@ echo "── 6. drift guards ──"
 code_of() { sed -e 's/[[:space:]]#.*$//' -e '/^[[:space:]]*#/d'; }   # no comments: only what runs
 SEC=$(awk '/^# ── Mutant-hardening slices \(ga-4kykayr\)/{p=1} /^gate_base_test_outside_subtree\(\)/{p=0} p' "$GUARD")
 [ -n "$SEC" ] && ok "the mutant-hardening section is in the guard" || bad "the mutant-hardening section was not found in the guard"
-eq "the section defines its six functions" "$(printf '%s\n' "$SEC" | grep -cE '^(gate_base_test_mutants_declared|gate_base_test_mutant_list|gate_base_test_mutant_rc_class|_gate_base_test_mutant_run|gate_base_test_mutants_state|gate_base_test_declared_state)\(\)')" "6"
+eq "the section defines its seven functions" "$(printf '%s\n' "$SEC" | grep -cE '^(gate_base_test_mutants_declared|gate_base_test_mutant_list|gate_base_test_mutant_rc_class|_gate_base_test_mutant_run|gate_base_test_mutants_state|_gate_base_test_mutants_unknown|gate_base_test_declared_state)\(\)')" "7"
 eq "no code line of the guard names ga-iu0fvlo or its marker ga-1iur59y (the path hangs off the declaration and the measurement)" \
   "$(code_of < "$GUARD" | grep -cE 'ga-iu0fvlo|ga-1iur59y')" "0"
 eq "the section never reads the arm (no gate_ab_arm_for_bead, no ARM variable)" "$(printf '%s\n' "$SEC" | code_of | grep -cE 'gate_ab_arm_for_bead|_ARM|ARM=')" "0"

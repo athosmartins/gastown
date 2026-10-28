@@ -3460,12 +3460,17 @@ gate_base_test_node_state() {
 #                 selftest is run against each, in the same sandbox as the pytest/js runs.
 #                 It must be GREEN with no mutant and RED with at least one
 #                 (gate_base_test_mutants_state).
-# Nothing here can approve by accident: every doubt (label unreadable, list absent or
+# Nothing here counts a doubt as hardening: every doubt (label unreadable, list absent or
 # unparsable, an id that no longer applies, no sandbox, the disk floor, a timeout, a
 # control run that is not green, a mutant that goes red once and green on the repeat, a
-# selftest that is still red once the mutant is gone) lands in `unknown`, which the call site counts as unclassified (nao-consegui-medir —
-# never a refusal, never an approval). Only a COMPLETE measurement in which every
-# mutant applied, ran and stayed green is `survived` (-> passou-na-base, as always).
+# selftest that is still red once the mutant is gone, a base copy that cannot be measured
+# against the same mutant, a list with unparsed lines, a worktree that is not at base) lands in
+# `unknown`, which the call site counts as unclassified (nao-consegui-medir): never a refusal,
+# never matou-mutantes. `killed` needs the branch's copy red twice and green again, AND the
+# base's own copy green against the same mutant (a selftest that merely pins the subject's
+# checksum would still kill everything: the measure says "caught", not "tests behaviour").
+# Only a COMPLETE measurement in which every mutant applied and ran and either stayed green or
+# was caught by the base's own copy as well is `survived` (-> passou-na-base, as always).
 
 # gate_base_test_mutants_declared <store> <bead-id>  (ga-4kykayr)
 #   Did the builder declare, on the source bead, that this change hardens a selftest
@@ -3477,7 +3482,7 @@ gate_base_test_mutants_declared() {
   gate_base_test_label_declared "${1-}" "${2-}" "teste:endurece-mutantes"
 }
 
-# gate_base_test_mutant_list <store> <bead-id> <selftest>  (ga-4kykayr)
+# gate_base_test_mutant_list <store> <bead-id> <selftest> [skipped]  (ga-4kykayr)
 #   The lastro's mutants for ONE selftest, read from the SOURCE bead's description, which
 #   hetzner-ballast-newfail.py writes as
 #       ARQUIVO <production file> (N)
@@ -3489,7 +3494,10 @@ gate_base_test_mutants_declared() {
 #   nothing printed too (bd failed, not JSON, not THIS bead, no description). The two are
 #   the same to the caller on purpose: both are "no list to measure against", which is
 #   `unknown`, never "no mutant survives". A line that does not have the shape above is
-#   skipped, never guessed at.
+#   skipped, never guessed at. With a 4th argument `skipped` it prints instead ONE number: how
+#   many such lines still name <selftest> (a line that names no selftest cannot be attributed
+#   to any, and is not counted), so the caller can tell a list with holes from a complete one.
+#   Nothing printed = the description could not be read: not "0".
 gate_base_test_mutant_list() {
   local store="${1-}" bead="${2-}" sel="${3-}" raw="" desc=""
   if [ -z "$store" ] || [ -z "$bead" ] || [ -z "$sel" ]; then return 0; fi
@@ -3500,17 +3508,23 @@ gate_base_test_mutant_list() {
     | if ($x | type) == "object" and (($x.id // "") == $b) and (($x.description // "") | type) == "string"
       then ($x.description // "") else empty end' 2>/dev/null) || return 0
   if [ -z "$desc" ]; then return 0; fi
-  printf '%s\n' "$desc" | awk -v st="$sel" '
+  printf '%s\n' "$desc" | awk -v st="$sel" -v mode="${4-}" '
     /^ARQUIVO / { subj = $2; next }
-    subj != "" && /^  L[0-9]+ / {
-      i = index($0, "  id="); j = index($0, "  (testes: ")
-      if (i == 0 || j == 0 || j < i) next
-      id = substr($0, i + 5, j - i - 5)
-      if (length(id) != 10 || id !~ /^[0-9a-f]+$/) next
+    /^ *L[0-9]+ / {
+      good = 0
+      if (subj != "" && $0 ~ /^  L[0-9]+ /) {
+        i = index($0, "  id="); j = index($0, "  (testes: ")
+        if (i != 0 && j != 0 && j >= i) {
+          id = substr($0, i + 5, j - i - 5)
+          if (length(id) == 10 && id ~ /^[0-9a-f]+$/) good = 1
+        }
+      }
+      if (!good) { if (index($0, st) > 0) skipped++; next }
       lst = substr($0, j + 11); sub(/\)[ \t]*$/, "", lst)
       n = split(lst, parts, ",")
-      for (k = 1; k <= n; k++) if (parts[k] == st) { print subj "\t" id; break }
-    }' 2>/dev/null || true
+      for (k = 1; k <= n; k++) if (parts[k] == st) { if (mode != "skipped") print subj "\t" id; break }
+    }
+    END { if (mode == "skipped") print skipped + 0 }' 2>/dev/null || true
   return 0
 }
 
@@ -3557,53 +3571,84 @@ _gate_base_test_mutant_run() {
   return 0
 }
 
+# _gate_base_test_mutants_unknown <file> <why>  (ga-4kykayr)
+#   The one word `unknown` for gate_base_test_mutants_state, with its REASON on stderr (the guard's log;
+#   callers capture stdout only). `unknown` alone never said whether the list was missing, an id stale, the
+#   disk low or the sandbox absent. ALWAYS returns 0.
+_gate_base_test_mutants_unknown() {
+  echo "AB-BASE-TEST-MUTANTS file=${1-} answer=unknown why=${2-}" >&2
+  printf 'unknown'
+  return 0
+}
+
 # gate_base_test_mutants_state <rig> <base> <tip> <worktree> <file> <store> <bead-id>  (ga-4kykayr)
 #   For a MODIFIED selftest whose old and new forms both passed on the mini and whose source bead
-#   declared teste:endurece-mutantes: does the BRANCH's copy catch a broken base? Run by the Step
-#   5b-pre2 loop only after those two conditions. Prints exactly one word and ALWAYS returns 0:
+#   declared teste:endurece-mutantes: does the BRANCH's copy catch a broken base that the BASE's own
+#   copy did not? Run by the Step 5b-pre2 loop only after those two conditions. Prints exactly one
+#   word and ALWAYS returns 0 (the reason, counters included, goes to stderr as AB-BASE-TEST-MUTANTS):
 #     killed    — with a mutant of production code applied to <worktree> (a checkout of base), the
 #                 branch's selftest went RED, TWICE, and the same selftest was GREEN with no mutant
 #                 in the same sandbox, same worktree, same siblings, BEFORE the mutant (the control)
 #                 and AGAIN right after the subject was put back. Every run of one measurement shares
 #                 one scratch (TMPDIR/HOME), so a selftest that cannot run twice in the same scratch is
 #                 green as the control and red afterwards whatever the mutant does; only the third green
-#                 tells "the mutant was caught" from "what the earlier runs left behind".
-#     survived  — a COMPLETE measurement: the list was read, none of it was cut by the cap or the
-#                 budget, every mutant applied and ran, and the selftest stayed green with ALL of
-#                 them. The selftest does not catch what the lastro says it should; stays refusable.
+#                 tells "the mutant was caught" from "what the earlier runs left behind". AND the BASE's
+#                 own copy of the selftest stayed GREEN with that same mutant (after a control of its own,
+#                 green with no mutant; each of its runs is the first in a scratch of its own): THIS change
+#                 caught what the base did not. Without that proof a stale lastro entry plus a comment-only
+#                 change would read as hardening, because the branch's copy catches what the base's already did.
+#     survived  — a COMPLETE measurement: the worktree is at base, the list was read in full (none of it
+#                 cut by the cap or the budget, none of it skipped as unparsable) and every mutant applied
+#                 and ran, and each one either stayed green with the branch's selftest or was caught by the
+#                 base's selftest as well (nothing this change added). Stays refusable.
 #     unknown   — anything else (see the section header). Partial evidence only counts for
-#                 `killed`: one red mutant is a proof however many others were not run, but "none of
+#                 `killed`: one proven kill is a proof however many others were not run, but "none of
 #                 the ones I ran died" says nothing about the ones I did not.
 #   Order: mutants whose id the diff cites (commit messages base..tip, added lines of the selftest)
 #   first, then the rest in list order; GATE_ABT_MUT_MAX (default 40, the sweep's own --cap) of them;
 #   the whole measurement has GATE_ABT_MUT_BUDGET seconds (default 300). The first confirmed kill stops it.
 #   Containment: the mutated file only exists inside <worktree>, which the sandbox cannot write to
 #   (writes go to a scratch directory only); the pristine file is kept outside it and put back after
-#   every mutant. Mutants are produced by `hq-mutate.py apply` (GATE_ABT_MUTATE swaps the engine for
-#   the selftest), which refuses symlinks, the engine's own files and any text that cites sudo, pkill,
-#   docker... (see its APLICAR UM MUTANTE); a refusal is unknown. Side effect, deliberate: OVERWRITES
-#   <worktree>/<file> with the branch's copy and leaves the worktree otherwise as it found it.
+#   every mutant, and a subject that is not byte for byte base's is never mutated (no trap puts back a
+#   file an earlier, killed run left mutated). Mutants are produced by `hq-mutate.py apply`
+#   (GATE_ABT_MUTATE swaps the engine for the selftest), which refuses symlinks, the engine's own files
+#   and any text that cites sudo, pkill, docker... (see its APLICAR UM MUTANTE); a refusal is unknown.
+#   Side effect, deliberate: OVERWRITES <worktree>/<file> with the branch's copy and leaves the worktree
+#   otherwise as it found it.
 gate_base_test_mutants_state() {
   local rig="${1-}" base="${2-}" tip="${3-}" wt="${4-}" f="${5-}" store="${6-}" bead="${7-}"
   local sel="" hq="" mut="" py="" list="" cited="" ordered="" rest="" line="" subj="" id="" subjpath=""
-  local root="" scratch="" keep="" budget="" max="" t0="" total=0 tried=0 green=0 unk=0 killed=0 cls="" cls2="" cls3="" arc=0 real_wt="" real_dir=""
+  local root="" scratch="" keep="" budget="" max="" t0="" total=0 skipped="" tried=0 green=0 basecaught=0 unk=0 killed=0
+  local cls="" cls2="" cls3="" clsb="" bctl="" arc=0 real_wt="" real_dir="" real_base="" head_now="" why="" ans=""
   case "$f" in
     .gascity-gastown-hq/?*.selftest.sh) sel="${f#.gascity-gastown-hq/}" ;;
-    *) printf 'unknown'; return 0 ;;
+    *) _gate_base_test_mutants_unknown "$f" "not-a-selftest-path"; return 0 ;;
   esac
   if [ -z "$rig" ] || [ -z "$base" ] || [ -z "$tip" ] || [ -z "$wt" ] || [ -z "$store" ] || [ -z "$bead" ]; then
-    printf 'unknown'; return 0
+    _gate_base_test_mutants_unknown "$f" "empty-argument"; return 0
   fi
   hq="$wt/.gascity-gastown-hq"
   mut="${GATE_ABT_MUTATE:-${GC_CITY:-}/scripts/hq-mutate.py}"
   py=$(command -v python3 2>/dev/null) || py=""
-  if [ ! -f "$mut" ] || [ -z "$py" ] || [ ! -d "$hq" ]; then printf 'unknown'; return 0; fi
+  if [ ! -f "$mut" ] || [ -z "$py" ] || [ ! -d "$hq" ]; then
+    _gate_base_test_mutants_unknown "$f" "no-engine-python-or-worktree"; return 0
+  fi
+  # The mutants are made of base's code, so the variable that was decided (base) must be the one acting
+  # (the worktree's HEAD), not merely the one the caller says it checked out.
+  real_base=$(git -C "$rig" rev-parse --verify -q "${base}^{commit}" 2>/dev/null) || real_base=""
+  head_now=$(git -C "$wt" rev-parse --verify -q HEAD 2>/dev/null) || head_now=""
+  if [ -z "$real_base" ] || [ "$real_base" != "$head_now" ]; then
+    _gate_base_test_mutants_unknown "$f" "worktree-not-at-base"; return 0
+  fi
   budget="${GATE_ABT_MUT_BUDGET:-300}"; case "$budget" in ''|*[!0-9]*|0) budget=300 ;; esac
   max="${GATE_ABT_MUT_MAX:-40}";        case "$max" in ''|*[!0-9]*|0) max=40 ;; esac
 
   # vazio → unknown (no list for this selftest); falhou/ilegível → unknown too
   list=$(gate_base_test_mutant_list "$store" "$bead" "$sel")
-  if [ -z "$list" ]; then printf 'unknown'; return 0; fi
+  if [ -z "$list" ]; then _gate_base_test_mutants_unknown "$f" "no-list"; return 0; fi
+  # Lines that name this selftest but did not parse were left out of $list: a list with holes is not COMPLETE.
+  # Anything but a plain number (bd failed between the two reads) is "cannot tell" too.
+  skipped=$(gate_base_test_mutant_list "$store" "$bead" "$sel" skipped)
   total=$(printf '%s\n' "$list" | grep -c .) || total=0
 
   # what the diff cites, to try those first. vazio/falhou → nothing cited: list order, no harm.
@@ -3623,25 +3668,27 @@ GATE_ABT_MUT_LIST_EOF
   ordered="${ordered}${rest}"
 
   root=$(mktemp -d "${TMPDIR:-/tmp}/gate-abt-mutants.XXXXXX" 2>/dev/null) || root=""
-  if [ -z "$root" ]; then printf 'unknown'; return 0; fi
+  if [ -z "$root" ]; then _gate_base_test_mutants_unknown "$f" "no-temp-dir"; return 0; fi
   root=$(cd "$root" 2>/dev/null && pwd -P) || root=""
-  if [ -z "$root" ]; then printf 'unknown'; return 0; fi
+  if [ -z "$root" ]; then _gate_base_test_mutants_unknown "$f" "no-temp-dir"; return 0; fi
   scratch="$root/scratch"; keep="$root/keep"
-  mkdir -p "$scratch" "$keep" 2>/dev/null || { rm -rf "$root" 2>/dev/null; printf 'unknown'; return 0; }
+  mkdir -p "$scratch" "$keep" 2>/dev/null || { rm -rf "$root" 2>/dev/null; _gate_base_test_mutants_unknown "$f" "no-scratch"; return 0; }
   real_wt=$(cd "$wt" 2>/dev/null && pwd -P) || real_wt=""
 
   # No sandbox, no run (the same rule as the pytest/js half). Then the branch's selftest, and the control.
   if ! gate_base_test_sandbox_ok "$scratch" || [ -z "$real_wt" ] \
      || ! git -C "$rig" show "${tip}:${f}" > "$wt/$f" 2>/dev/null; then
-    rm -rf "$root" 2>/dev/null; printf 'unknown'; return 0
+    rm -rf "$root" 2>/dev/null; _gate_base_test_mutants_unknown "$f" "no-sandbox-or-no-branch-copy"; return 0
   fi
   t0=$(date +%s)
   cls=$(_gate_base_test_mutant_run "$scratch" "$hq" "$wt/$f")
-  if [ "$cls" != "green" ]; then rm -rf "$root" 2>/dev/null; printf 'unknown'; return 0; fi
+  if [ "$cls" != "green" ]; then rm -rf "$root" 2>/dev/null; _gate_base_test_mutants_unknown "$f" "control-$cls"; return 0; fi
 
   while IFS= read -r line; do
     [ -z "$line" ] && continue
-    if [ "$tried" -ge "$max" ] || [ $(( $(date +%s) - t0 )) -ge "$budget" ]; then break; fi
+    if [ "$tried" -ge "$max" ] || [ $(( $(date +%s) - t0 )) -ge "$budget" ]; then
+      [ -n "$why" ] || why="cut-short(cap=$max,budget=${budget}s)"; break
+    fi
     tried=$((tried + 1))
     subj="${line%%$'\t'*}"; id="${line#*$'\t'}"
     subjpath="$hq/$subj"
@@ -3649,28 +3696,56 @@ GATE_ABT_MUT_LIST_EOF
     real_dir=$(cd "$(dirname "$subjpath")" 2>/dev/null && pwd -P) || real_dir=""
     case "$real_dir/" in
       "$real_wt"/*) ;;
-      *) unk=$((unk + 1)); continue ;;
+      *) unk=$((unk + 1)); [ -n "$why" ] || why="$id:subject-outside-worktree"; continue ;;
     esac
-    if [ ! -f "$subjpath" ] || [ -L "$subjpath" ]; then unk=$((unk + 1)); continue; fi
+    if [ ! -f "$subjpath" ] || [ -L "$subjpath" ]; then unk=$((unk + 1)); [ -n "$why" ] || why="$id:subject-missing-or-link"; continue; fi
+    # only base's own file is mutated: a run killed while a mutant was in place leaves it there, and a mutant of a mutant means nothing
+    if ! git -C "$hq" diff --quiet HEAD -- "$subj" 2>/dev/null; then
+      unk=$((unk + 1)); [ -n "$why" ] || why="$id:subject-not-base"; continue
+    fi
     arc=0
     "$py" -I "$mut" apply "$subjpath" --tree "$hq" --id "$id" --out "$keep/mutant" --also "$wt/$f" </dev/null >/dev/null 2>&1 || arc=$?
-    if [ "$arc" -ne 0 ] || [ ! -s "$keep/mutant" ]; then rm -f "$keep/mutant"; unk=$((unk + 1)); continue; fi
-    if ! cat "$subjpath" > "$keep/orig" 2>/dev/null; then rm -f "$keep/mutant"; unk=$((unk + 1)); continue; fi
-    cls=""; cls2=""; cls3=""
+    if [ "$arc" -ne 0 ] || [ ! -s "$keep/mutant" ]; then
+      rm -f "$keep/mutant"; unk=$((unk + 1)); [ -n "$why" ] || why="$id:apply-rc$arc"; continue
+    fi
+    if ! cat "$subjpath" > "$keep/orig" 2>/dev/null; then rm -f "$keep/mutant"; unk=$((unk + 1)); [ -n "$why" ] || why="$id:subject-unreadable"; continue; fi
+    cls=""; cls2=""; cls3=""; clsb=""
     if cat "$keep/mutant" > "$subjpath" 2>/dev/null; then
       cls=$(_gate_base_test_mutant_run "$scratch" "$hq" "$wt/$f")
       if [ "$cls" = "red" ]; then cls2=$(_gate_base_test_mutant_run "$scratch" "$hq" "$wt/$f"); fi
     fi
-    cat "$keep/orig" > "$subjpath" 2>/dev/null || { rm -rf "$root" 2>/dev/null; printf 'unknown'; return 0; }   # the worktree is not back as it was: nothing more is run from it
-    rm -f "$keep/mutant" "$keep/orig"
+    cat "$keep/orig" > "$subjpath" 2>/dev/null || { rm -rf "$root" 2>/dev/null; _gate_base_test_mutants_unknown "$f" "$id:subject-not-restored"; return 0; }   # the worktree is not back as it was: nothing more is run from it
     # red:red is a kill only if the selftest is GREEN again, in the same scratch, now that the subject is back.
     # Control, mutant runs and this one share $scratch/tmp and $scratch/home: a selftest that is not re-runnable
     # there is red on every run after the first whatever the mutant does, and would read as killed.
     if [ "$cls:$cls2" = "red:red" ]; then cls3=$(_gate_base_test_mutant_run "$scratch" "$hq" "$wt/$f"); fi
-    case "$cls:$cls2:$cls3" in
-      red:red:green) killed=1; break ;;
-      green::)       green=$((green + 1)) ;;
-      *)             unk=$((unk + 1)) ;;   # a first red that did not repeat is flaky; red twice that is still red with no mutant is left-over state, not a kill
+    # The branch's selftest catching the mutant is not yet THIS change catching it: ask the base's copy of the
+    # same selftest, the same mutant. Each run gets a scratch of its own, so neither can be a left-over state.
+    # The base copy needs its own control (green with no mutant, here, in this sandbox): red under the mutant
+    # only means "the base catches it" when it is not red with nothing wrong at all.
+    if [ "$cls:$cls2:$cls3" = "red:red:green" ]; then
+      if git -C "$rig" show "${base}:${f}" > "$wt/$f" 2>/dev/null; then
+        if [ -z "$bctl" ]; then
+          bctl="unknown"
+          if mkdir -p "$root/scratch-base-control" 2>/dev/null; then bctl=$(_gate_base_test_mutant_run "$root/scratch-base-control" "$hq" "$wt/$f"); fi
+        fi
+        if [ "$bctl" = "green" ] && mkdir -p "$root/scratch-base-$tried" 2>/dev/null && cat "$keep/mutant" > "$subjpath" 2>/dev/null; then
+          clsb=$(_gate_base_test_mutant_run "$root/scratch-base-$tried" "$hq" "$wt/$f")
+        fi
+      fi
+      # back as found, whatever happened above: the subject, then the branch's copy (the base's text replaced it)
+      if ! cat "$keep/orig" > "$subjpath" 2>/dev/null || ! git -C "$rig" show "${tip}:${f}" > "$wt/$f" 2>/dev/null; then
+        rm -rf "$root" 2>/dev/null; _gate_base_test_mutants_unknown "$f" "$id:worktree-not-restored"; return 0
+      fi
+    fi
+    rm -f "$keep/mutant" "$keep/orig"
+    case "$cls:$cls2:$cls3:$clsb" in
+      red:red:green:green) killed=1; break ;;
+      red:red:green:red)   basecaught=$((basecaught + 1)) ;;   # the base's own copy dies to it too: not news
+      green:::)            green=$((green + 1)) ;;
+      *)  # a first red that did not repeat is flaky; red twice that is still red with no mutant is left-over state,
+          # not a kill; a base copy that could not be measured cannot say what the change added
+          unk=$((unk + 1)); [ -n "$why" ] || why="$id:run-$cls/$cls2/$cls3/${clsb:--}" ;;
     esac
   done <<GATE_ABT_MUT_ORDER_EOF
 $ordered
@@ -3678,12 +3753,22 @@ GATE_ABT_MUT_ORDER_EOF
   rm -rf "$root" 2>/dev/null
 
   if [ "$killed" -eq 1 ]; then
-    printf 'killed'
-  elif [ "$unk" -eq 0 ] && [ "$tried" -eq "$total" ] && [ "$green" -eq "$total" ]; then
-    printf 'survived'
+    ans="killed"
+  elif [ "$unk" -eq 0 ] && [ "$skipped" = 0 ] && [ "$total" -gt 0 ] && [ "$tried" -eq "$total" ] \
+       && [ $((green + basecaught)) -eq "$total" ]; then
+    ans="survived"
   else
-    printf 'unknown'
+    ans="unknown"
+    if [ -z "$why" ]; then
+      case "$skipped" in
+        0) why="unmeasured" ;;
+        ''|*[!0-9]*) why="list-completeness-unreadable" ;;
+        *) why="list-has-$skipped-unparsed-line(s)" ;;
+      esac
+    fi
   fi
+  echo "AB-BASE-TEST-MUTANTS file=$f answer=$ans total=$total tried=$tried green=$green basecaught=$basecaught unknown=$unk skipped=${skipped:-?} why=${why:--}" >&2
+  printf '%s' "$ans"
   return 0
 }
 
@@ -9125,11 +9210,15 @@ fi
 # also never keyed on the bead id: the builder DECLARES (label teste:endurece-mutantes on the
 # source bead) and the gate MEASURES (gate_base_test_mutants_state: the mutants the source bead
 # lists for that selftest are applied one at a time to a copy of base, and the branch's selftest
-# must be GREEN with none and RED with at least one, in the sandbox of the pytest/js half).
-# Red on a mutant -> counted as killed -> verdict matou-mutantes (never blocks, tallied apart).
-# All mutants survive -> still passou-na-base. Label unreadable, list absent, a mutant that does
-# not apply, no sandbox, a cap or budget hit -> unclassified -> nao-consegui-medir: never a
-# silent passou-na-base and never an approval. No label -> exactly the answer it always was.
+# must be GREEN with none and RED with at least one, in the sandbox of the pytest/js half) AND
+# the BASE's own copy of that selftest must stay green against that same mutant: a change that
+# only re-states what base already catches did not harden anything.
+# Red on a mutant, base's copy green -> counted as killed -> verdict matou-mutantes (never
+# blocks, tallied apart). All mutants survive, or die only to base's copy too -> still
+# passou-na-base. Label unreadable, list absent or with unparsed lines, a mutant that does not
+# apply, no sandbox, a cap or budget hit, a worktree that is not at base -> unclassified ->
+# nao-consegui-medir (the reason is on the AB-BASE-TEST-MUTANTS line): never a silent
+# passou-na-base and never matou-mutantes. No label -> exactly the answer it always was.
 #
 # Known blind spot, counted not closed (ga-x4mkk2, Mayor decision 2026-09-25): the
 # detection below only sees selftests inside the RIG_PATH directory, which for the
