@@ -70,6 +70,11 @@ FD = re.compile(r"(^|[\s;&|(])\d+(?=[<>])")  # `2>/dev/null`, `1>&2`: o número 
 SHELLY = re.compile(r"[$`*?\[{]")
 PIECE = re.compile(r"&&|\|\||\|&|;;|[;&|()]|[<>]+&?")
 SUBST = re.compile(r"\$S([0-9a-f]*)\$")
+INTERP = re.compile(r"(?:python|pypy|perl|ruby)[\d.]*|node(?:js)?|[gmn]?awk")  # interpretador cujo código (python -c, node -e, perl -e, programa do awk) pode rodar um shell: o texto entre aspas dele é conferido como comando
+LIT = re.compile(r"'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\"|(?:\bq[qx]?|%x)\s*(?:\{([^}]*)\}|\(([^)]*)\)|\[([^\]]*)\]|/([^/]*)/)", re.S)  # literal do código de um interpretador: entre aspas simples ou duplas, ou q{…}/qq{…}/qx{…}/%x(…) do perl e do ruby (um grupo por forma)
+CODECD = re.compile(r"chdir|\bcwd\s*[=:]")  # o código muda o diretório do shell que abre (os.chdir, cwd=, {cwd: …}): o git de dentro roda em lugar "não sei"; a chave entre aspas de um JSON ('cwd': …) não é opção
+PIPES, VAR = ("|", "|&"), re.compile(r"\$(\w+)|\$\{(\w+)\}")
+PFMT = re.compile(r"%(?:%|[-+ #0]*\d*(?:\.\d+)?[a-zA-Z])")  # uma conversão do printf (%s, %b, %5d) ou o %% literal
 HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)([^\s'\"<>|&;()]+)\2")  # o delimitador é a palavra INTEIRA (END-OF-FILE, EOF.txt), não só \w+
 PROT = {c: chr(0xF0000 + ord(c)) for c in "();<>|&'"}  # `;<>…` entre aspas ou depois de `\` é TEXTO: antes do shlex (que tira as aspas) vira um caractere de uso privado, e só depois volta (ver protect)
 UNPROT = str.maketrans({v: k for k, v in PROT.items()})
@@ -363,6 +368,67 @@ def words(cmd: str) -> list:
     return [(t.translate(UNPROT), bool(t) and set(t) <= PUNCT) for t in lx]
 
 
+def printed(seg: list, flow, env: dict):
+    """Texto que o comando imprime, ou None = não sei. Só o que dá para ler sem rodar nada: echo/printf com texto literal; cat/tee (repassam), base64 -d e rev sobre o que
+    chegou pelo pipe (flow, None = não sei). O shell que lê o pipe sem -c e o `eval "$(…)"` conferem esse texto como comando."""
+    _, s, _, opq = peel(seg)
+    c, a = (os.path.basename(s[0]), s[1:]) if s and not opq else ("", [])
+    a = reveal(a, env) if c in ("echo", "printf") else a  # `c='…'; echo "$c" | sh`, `echo "$(echo … | base64 -d)" | sh`: variável e $( ) lidos como no eval
+    if c == "echo":
+        fl = ""
+        while a and re.fullmatch(r"-[neE]+", a[0]):
+            fl, a = fl + a[0], a[1:]
+        return (ANSI.sub(ansi, " ".join(a)) if "e" in fl else " ".join(a)) + "\n"
+    a = a[1:] if c == "printf" and a[:1] == ["--"] else a
+    if c == "printf" and a:  # o formato reaproveitado até acabar os argumentos, como o printf do shell; sem conversão, uma vez só
+        f = ANSI.sub(ansi, a[0])
+        n = sum(m.group() != "%%" for m in PFMT.finditer(f))
+        return "".join(PFMT.sub(lambda m, it=iter(a[1 + i:1 + i + n]): "%" if m.group() == "%%" else next(it, ""), f) for i in range(0, max(len(a) - 1, 1) if n else 1, n or 1))
+    if flow is not None and (c == "tee" or c == "cat" and all(x[:1] == "-" for x in a)):  # só repassam o stdin (cat com arquivo lê o arquivo)
+        return flow
+    if flow is not None and c == "base64" and {"-d", "--decode", "-D"} & set(a):
+        import base64  # aqui e não no topo: o hook roda em todo comando Bash, e o import custa (~20 ms medidos sob carga)
+        try:  # vazio → texto vazio; base64 inválido (ValueError) → None = não sei, nunca "vazio"; byte que não é texto vira U+FFFD (o resto continua conferido)
+            return base64.b64decode(flow).decode(errors="replace")
+        except ValueError:
+            return None
+    return "\n".join(x[::-1] for x in flow.split("\n")) if flow is not None and c == "rev" else None
+
+
+def pipefed(seg: list, flow):
+    """Shell ligado por um pipe a um texto que conheço (flow): sem -c ele lê o programa do stdin, que é `sh -c '<texto>'`. O -c e o texto vão para o fim do trecho, e então
+    quem confere o trecho — agora, ou na CHAMADA da função em que ele está — já sabe abri-lo (com -c próprio vale o primeiro -c: o shell ignora o stdin). flow None = não sei."""
+    if flow is None:
+        return seg
+    _, s, _, opq = peel(seg)
+    return seg if opq or not s or os.path.basename(s[0]) not in SHELLS else seg + ["-c", flow]
+
+
+def pipe_out(body: str, env: dict):
+    """O que o miolo de um `$( )` imprime quando é só um pipeline que sei ler (printed); None = não sei (outro operador, ou um comando que não leio)."""
+    flow, seg = None, []
+    for tok, op in words(body) + [("|", True)]:
+        if not op:
+            seg.append(tok)
+        elif tok in PIPES:
+            flow, seg = printed(seg, flow, env), []
+        else:
+            return None
+    return flow
+
+
+def reveal(ws: list, env: dict) -> list:
+    """As palavras de um `eval` com o texto que dá para ler sem rodar nada: um `$( )` que só imprime texto (pipe_out) e `$NOME`/`${NOME}` de variável que guardo (`NOME=…`,
+    `printf -v NOME …`). Sem valor ou $( ) que não leio (None) → a palavra fica como está; só a palavra INTEIRA é trocada, nunca um pedaço dela."""
+    out = []
+    for w in ws:
+        m, v = SUBST.fullmatch(w), VAR.fullmatch(w)
+        # vazio (variável sem valor, $( ) que não leio) → t None e a palavra fica; falhou/ilegível (hex do marcador inválido) → a exceção sobe e main() bloqueia
+        t = pipe_out(bytes.fromhex(m.group(1)).decode(), env) if m else env.get(v.group(1) or v.group(2)) if v else None
+        out.append(w if t is None else t.rstrip("\n") if m else t)
+    return out
+
+
 def wopt(w: str, seg: list):
     """Lê as opções do embrulho `w` no começo de `seg` (o que vem DEPOIS do nome dele): devolve (o resto, cego), ou None = há opção que não está na tabela WOPT
     do embrulho, e então não sei onde o comando começa (a palavra seguinte pode ser o valor da opção ou o próprio comando). cego = alguma opção muda o diretório."""
@@ -628,7 +694,17 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
                             break
                     return sub(script[0], cwd, env)
         elif c == "eval":
-            return sub(" ".join(seg[1:]), cwd, env)
+            return sub(" ".join(reveal(seg[1:], {**st["env"], **env})), cwd, env)  # `eval "$(echo … | base64 -d)"`, `eval "$NOME"`: o texto que dá para ler vira o que se confere
+        elif c == "printf" and seg[1:2] == ["-v"] and len(seg) > 3:  # printf -v NOME FORMATO ARGS…: NOME passa a guardar o texto, mesmo se o trecho pode não ter rodado (lado fechado)
+            t = printed(["printf"] + seg[3:], None, {**st["env"], **env})  # vazio → NOME vazio; formato que não leio (None) → "$?" = não sei
+            st["env"][seg[2]] = "$?" if t is None else t
+        elif INTERP.fullmatch(c):  # python -c / node -e / perl -e / awk: o texto entre aspas do código (os.system, shell=True, execSync, system, crase) roda num shell e é conferido como comando; lista de argumentos e texto montado em pedaços: não vejo
+            cw = None if CODECD.search(" ".join(seg)) else cwd  # os.chdir / cwd=: o shell de dentro roda noutro diretório
+            for t in seg[1:]:
+                for text in [t] + [next(filter(None, g), "") for g in LIT.findall(t)]:
+                    r = sub(text, cw, env)
+                    if r:
+                        return r
         elif c == "find":  # o `\;` e o `\(` do find são palavras (words() não os toma por operador do shell): todos os `-exec` do find estão neste trecho
             for j, t in enumerate(seg):
                 if t in ("-exec", "-execdir", "-ok", "-okdir"):  # -exec/-ok rodam no diretório do find; -execdir/-okdir no de CADA achado, que não sei qual é: cego
@@ -646,7 +722,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
             return git_hit(seg, {**st["env"], **env}, cwd, terr, own)
         return None
 
-    skip, herestr, prev = False, False, ""
+    skip, herestr, prev, flow, hs = False, False, "", None, None  # flow = o que o trecho anterior imprime, se um pipe o liga ao próximo; hs = o texto do here-string do trecho (o stdin dele, no lugar do pipe)
     for tok, op in words(cmd) + [(";", True)]:  # o `;` do fim fecha o último trecho
         if skip and not op:  # alvo de redirecionamento: só uma PALAVRA é alvo. Operador logo depois (`git … >` sem alvo, que o shell recusa) segue como operador: engolir o `;` do fim ou o `&&` deixava o trecho sem conferir
             skip = False
@@ -657,14 +733,16 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
                 r = sub(tok, st["cwd"], {})
                 if r:
                     return r
+            hs = reveal([tok], st["env"])[0] if herestr else hs  # `cat <<< '…' | sh`, `base64 -d <<< B64 | sh`: o texto é o stdin do produtor do pipe
             herestr = False
         elif op:  # o shlex junta pontuação colada (`);`, `&&(`, `2>&1`): separa de novo
             skip = herestr = False  # um operador que chega com um redirecionamento esperando alvo não é o alvo
             for pc in PIECE.findall(tok):
                 if pc in SEPS or pc in ("(", ")"):
-                    r = one(seg, False, prev, pc)
+                    r = one(pipefed(seg, flow), False, prev, pc)
                     if r:
                         return r
+                    flow, hs = printed(seg, flow if hs is None else hs, st["env"]) if pc in PIPES else None, None
                     if pc == "(":
                         if not skip and (len(seg) == 1 and seg[0] not in KEYWORDS or len(seg) == 2 and seg[0] == "function" and seg[1] not in KEYWORDS):
                             st["func"], st["fname"] = True, seg[-1]  # `f (` e `function f (`: definição de função — o `{ … }` que vem a seguir é corpo que não roda agora
