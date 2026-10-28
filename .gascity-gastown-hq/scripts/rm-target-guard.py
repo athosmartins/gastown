@@ -74,8 +74,8 @@ ANSI = re.compile(r"\\(x[0-9a-fA-F]{1,2}|[0-7]{1,3}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-
 LIT = re.compile(r"""'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)\"""", re.S)
 ARGV = re.compile(r"""\[\s*['"](?:[^'"\n]*/)?(rm|unlink|rmdir|shred|rimraf)['"]\s*,([^\]]*)\]|['"](?:[^'"\n]*/)?(rm|unlink|rmdir|shred|rimraf)['"]\s*,\s*\[([^\]]*)\]""")
 ELEM = re.compile(r"""\s*(?:'(?P<s>(?:[^'\\]|\\.)*)'|"(?P<d>(?:[^"\\]|\\.)*)"|(?P<e>[^,\s][^,]*))\s*(?:,|$)""")  # um elemento de lista de argv: literal ou expressão
-# literal passado DIRETO a uma API de remoção (`rmtree('/x')`, `fs.rmSync('/x')`, `Path('/x').unlink()`): grupo 1 ou 2
-DELCALL = re.compile(r"""(?:rmtree|remove_tree|rimraf(?:Sync)?|rm_rf?|rmSync|rmdirSync|unlinkSync|os\.(?:remove|unlink|rmdir|removedirs)|fs\.(?:promises\.)?(?:rm|rmdir|unlink)|FileUtils\.rm_rf?|File\.delete|Dir\.rmdir|(?<![\w.])(?:unlink|rmdir))\s*\(\s*['\"]([^'\"\n]+)['\"]|Path\(\s*['\"]([^'\"\n]+)['\"]\s*\)\s*\.(?:unlink|rmdir)""")
+# nomes de API de remoção (sem as palavras genéricas remove/delete: scripts de edição as citam o tempo todo): em qualquer parte do código ligam a leitura dos literais de caminho
+DELAPI = re.compile(r"rmtree|remove_tree|rimraf|rm_rf?\b|rmSync|rmdirSync|unlinkSync|removedirs|os\.(?:remove|unlink|rmdir)\b|\.unlink\(|\.rmdir\(|FileUtils\.rm|File\.delete|Dir\.rmdir|(?<![\w.])(?:unlink|rmdir)\s*\(")
 GITNAMES = re.compile(r"\.git|objects|refs|head|pack|index|config|hooks|logs|info|description|lock|sample|idx|[0-9a-f]{6,}", re.I)  # nomes de dentro de um .git: um filtro que os casa apaga história
 
 
@@ -151,8 +151,8 @@ def candidates(raw: str, cwds: list, env: dict) -> list:
                 p = os.path.normpath(b if os.path.isabs(b) else os.path.join(cwd, b))
                 if re.search(r"[*?\[]", p):
                     # vazio → glob sem resultado: o rm recebe o texto como veio e o padrão vale; falhou/ilegível (permissão, laço de link) → glob devolve [] e o padrão vale
-                    if sum(bool(re.search(r"[*?\[]", c)) for c in p.split("/")) > 2:  # curinga fundo (/*/*/*/x) percorre o disco inteiro: não expando, vale como alvo que não conheço
-                        out.append((None, None))
+                    if sum(bool(re.search(r"[*?\[]", c)) for c in p.split("/")) > 2:  # curinga fundo (/*/*/*/x) percorre o disco inteiro: não expando; o TEXTO do padrão ainda é julgado e, numa remoção recursiva, vale alvo que não conheço
+                        out += [(p, p), (None, None)]
                         continue
                     hits = sorted(itertools.islice(glob.iglob(p), GLOB_MAX + 1))
                     out += [(h, p) for h in hits[:GLOB_MAX] or [p]] + ([(None, None)] if len(hits) > GLOB_MAX else [])  # achados além do teto: não os vi, valem como alvo que não conheço
@@ -449,23 +449,20 @@ def cd_target(ws: list, cwds: list, env: dict):
 
 
 def inline(code: str, cwds: list, depth: int, env: dict):
-    """Código inline de python/node/perl/ruby/awk. Confere `['rm','-rf',x]`, texto de shell com rm (`os.system`), o literal passado DIRETO a uma API de remoção (`rmtree('/x')`) e, se algum
-    literal cita rm/unlink/rmdir/shred, cada literal de caminho (`'rm -rf ' + '/x'`). A palavra solta "remove"/"delete" não liga nada: scripts de edição a citam o tempo todo."""
+    """Código inline de python/node/perl/ruby/awk. Confere `['rm','-rf',x]`, texto de shell com rm (`os.system`) e, se o código usa uma API de remoção (DELAPI) ou algum literal cita
+    rm/unlink/rmdir/shred, cada literal de caminho (`d='/x'; shutil.rmtree(d)`, `'rm -rf ' + '/x'`). A palavra solta "remove"/"delete" não liga nada."""
     for m in ARGV.finditer(code):
         rest = m.group(2) if m.group(1) else m.group(4)  # literal vira o texto; expressão (variável, concatenação) vira UNK
         els = [g.group("s") if g.group("s") is not None else g.group("d") if g.group("d") is not None else UNK for g in ELEM.finditer(rest)]
         ops, rec = rm_args(m.group(1) or m.group(3), els)
         hit = check(ops, rec, False, cwds, env)
-        if hit:
-            return hit
+        if hit: return hit
     lits = [m.group(1) if m.group(1) is not None else m.group(2) for m in LIT.finditer(code)]
-    cites = any(RM_TEXT.search(x) for x in lits)
+    deletes = bool(DELAPI.search(code)) or any(RM_TEXT.search(x) for x in lits)
     for lit in lits:
         hit = scan_bash(lit, cwds, depth + 1, env) if RM_TEXT.search(lit) and re.search(r"\s", lit.strip()) else None
-        if hit:
-            return hit
-    paths = [a or b for a, b in DELCALL.findall(code)] + [x for x in lits if cites and x and not re.search(r"\s", x) and re.search(r"\w", x) and re.match(r"[~/.]|\w+/", x)]
-    return check(paths, True, False, cwds, env)
+        if hit: return hit
+    return check([x for x in lits if deletes and x and not re.search(r"\s", x) and re.search(r"\w", x) and re.match(r"[~/.]|\w+/", x)], True, False, cwds, env)
 
 
 def code_of(stage: list) -> list:
@@ -495,14 +492,12 @@ def scan_bash(cmd: str, cwds: list, depth: int = 0, env=None):
     for body, recv in docs:  # corpo lido por shell ou interpretador é código; por cat, tee, git commit -F - é texto
         hit = scan_bash(body, cwds, depth + 1, env) if any(w in SHELLS for w in recv) else None
         hit = hit or (inline(body, cwds, depth + 1, env) if any(INTERP.fullmatch(w) for w in recv) else None)
-        if hit:
-            return hit
+        if hit: return hit
     cur, here, saved, feed = [], list(cwds), [], []  # feed = comandos anteriores da MESMA pipeline
     for t in toks + [Op(";")]:
         if isinstance(t, Op) and t in SEP_OPS:
             hit = one(cur, here, depth, env, feed)
-            if hit:
-                return hit
+            if hit: return hit
             feed = feed + [cur] if t in ("|", "|&") else []
             new = cd_target(cur, here, env)
             if new is not None:  # o cd só vale com certeza depois de `&&`; com `;` `||` `&` `|` ele pode ter falhado e o shell ficou onde estava: valem os dois (o pior vence)
@@ -533,8 +528,7 @@ def one(ws: list, cwds: list, depth: int, env: dict, feed: list, app=None):
     for w in words:  # $( ) e crase dentro de QUALQUER palavra rodam, mesmo atrás de um echo
         for body in substitutions(w):
             hit = scan_bash(body, cwds, depth + 1, env)
-            if hit:
-                return hit
+            if hit: return hit
     ws = peel(words, env)
     if not ws:
         return None
@@ -549,8 +543,7 @@ def one(ws: list, cwds: list, depth: int, env: dict, feed: list, app=None):
             ops, rec = rm_args("rm", ws[1:])
             for a in ws[1:]:
                 hit = scan_bash(a, cwds, depth + 1, env) if RM_TEXT.search(a) and re.search(r"\s", a.strip()) else None
-                if hit:
-                    return hit
+                if hit: return hit
             return check(ops, rec, () if rec else ("",), cwds, env)
     verb, args = os.path.basename(ws[0]), ws[1:]
     if verb in ("export", "declare", "typeset", "local", "readonly"):  # `export D=x`: vale para os comandos seguintes
@@ -584,8 +577,7 @@ def one(ws: list, cwds: list, depth: int, env: dict, feed: list, app=None):
                 sub = peel(cmd[:end], {})
                 rmish = rmish or bool(sub) and os.path.basename(sub[0]) in RM_VERBS
                 hit = one(cmd[:end], cwds, depth, env, [])
-                if hit:
-                    return hit
+                if hit: return hit
         # filtro de nome só vale se filtra de verdade (narrow) e nada o anula: `-o`, `!`, `-not` fazem o -delete valer para o que o filtro NÃO casa
         sel = () if {"!", "-not", "-o", "-or"} & set(expr) else tuple(expr[x + 1] for x, t in enumerate(expr) if t in SELECT and x + 1 < len(expr) and narrow(t, expr[x + 1]))
         return check(roots, True, sel, cwds, env) if rmish else None
@@ -595,8 +587,7 @@ def one(ws: list, cwds: list, depth: int, env: dict, feed: list, app=None):
         for body in procs:
             for w in code_of(lex(body)[0]):
                 hit = run(w)
-                if hit:
-                    return hit
+                if hit: return hit
         code = " ".join(args) if verb == "eval" else None
         for x, a in enumerate(args if code is None else []):
             if re.fullmatch(r"-[a-zA-Z]*[ceEpr]|--(?:eval|print|command)", a):
@@ -608,15 +599,13 @@ def one(ws: list, cwds: list, depth: int, env: dict, feed: list, app=None):
         if not code and verb != "eval" and ("-" in args or "-s" in args or not [a for a in args if not a.startswith("-")]):  # lê o programa do stdin: o que vem pelo pipe é código
             for w in [c for st in feed for c in code_of(st)]:
                 hit = run(w)
-                if hit:
-                    return hit
+                if hit: return hit
         return run(code) if code else None
     if verb in OPAQUE:  # não modelo o que o lançador faz: o comando de dentro (palavra solta ou texto entre aspas) vale
         for j, w in enumerate(args):
             if re.search(r"\s", w):
                 hit = scan_bash(w, cwds, depth + 1, env)
-                if hit:
-                    return hit
+                if hit: return hit
             elif os.path.basename(w) in RM_VERBS | {"find", "xargs"} | SHELLS:
                 return one(args[j:], cwds, depth + 1, env, [])
     return None
