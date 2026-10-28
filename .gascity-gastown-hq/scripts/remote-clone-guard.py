@@ -70,7 +70,7 @@ PIECE = re.compile(r"&&|\|\||\|&|;;|[;&|()]|[<>]+&?")
 SUBST = re.compile(r"\$S([0-9a-f]*)\$")
 INTERP = re.compile(r"(?:python|pypy|perl|ruby)[\d.]*|node(?:js)?|[gmn]?awk")  # interpretador cujo código (python -c, node -e, perl -e, programa do awk) pode rodar um shell: o texto entre aspas dele é conferido como comando
 LIT = re.compile(r"'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\"|(?:\bq[qx]?|%x)\s*(?:\{([^}]*)\}|\(([^)]*)\)|\[([^\]]*)\]|/([^/]*)/)", re.S)  # literal do código de um interpretador: entre aspas simples ou duplas, ou q{…}/qq{…}/qx{…}/%x(…) do perl e do ruby (um grupo por forma)
-CODECD = re.compile(r"chdir|\bcwd\s*[=:]")  # o código muda o diretório do shell que abre (os.chdir, cwd=, {cwd: …}): o git de dentro roda em lugar "não sei"; a chave entre aspas de um JSON ('cwd': …) não é opção
+CODECD = re.compile(r"chdir|\bcwd\b|\bGIT_[A-Z_]+")  # o código muda o diretório ou o repositório do shell que abre (os.chdir, cwd=, {'cwd': …}, GIT_DIR/GIT_WORK_TREE no env): o git de dentro roda em lugar "não sei". Qualquer `cwd` vale, até a chave de um JSON (falso positivo assumido); nome de variável montado em pedaços não vejo
 PIPES, VAR = ("|", "|&"), re.compile(r"\$(\w+)|\$\{(\w+)\}")
 PFMT = re.compile(r"%(?:%|[-+ #0]*\d*(?:\.\d+)?[a-zA-Z])")  # uma conversão do printf (%s, %b, %5d) ou o %% literal
 HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)([^\s'\"<>|&;()]+)\2")  # o delimitador é a palavra INTEIRA (END-OF-FILE, EOF.txt), não só \w+
@@ -646,7 +646,8 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
         elif INTERP.fullmatch(c):  # python -c / node -e / perl -e / awk: o texto entre aspas do código (os.system, shell=True, execSync, system, crase) roda num shell e é conferido como comando; lista de argumentos e texto montado em pedaços: não vejo
             cw = None if CODECD.search(" ".join(seg)) else cwd  # os.chdir / cwd=: o shell de dentro roda noutro diretório
             for t in seg[1:]:
-                for text in [t] + [next(filter(None, g), "") for g in LIT.findall(t)]:
+                m = ASSIGN.fullmatch(t)  # `awk -v cmd="git …"`: o valor de NOME=valor também pode ser o comando (o peel o engoliria como atribuição); o literal vale com os escapes decodificados (`'\x67it …'` é git)
+                for text in [t] + ([m.group(2)] if m else []) + [ANSI.sub(ansi, next(filter(None, g), "")) for g in LIT.findall(t)]:
                     r = sub(text, cw, env)
                     if r:
                         return r
