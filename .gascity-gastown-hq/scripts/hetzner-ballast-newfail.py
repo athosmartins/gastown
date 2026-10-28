@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""hetzner-ballast-newfail.py — dá DONO ao que um item do lastro confirma: as regressões do wa-suite (ga-r4lw72, a fonte padrão) e os mutantes que sobrevivem ao hq-mutants (ga-2hd02v.5.6.4, `--fonte hq-mutants`). Roda no MINI (gc order, a cada 30 min). Python 3.9+, só biblioteca padrão.
+"""hetzner-ballast-newfail.py — dá DONO ao que um item do lastro confirma: as regressões do wa-suite (ga-r4lw72, a fonte padrão) e os mutantes que sobrevivem ao hq-mutants (ga-2hd02v.5.6.4, `--fonte hq-mutants`) e ao wa-mutants (ga-tmfmvxi, `--fonte wa-mutants`). Roda no MINI (gc order, a cada 30 min). Python 3.9+, só biblioteca padrão.
 
 Contents
   Para que serve · Fontes · O que lê · O que faz · Três estados · Estado local · Ambiente
@@ -7,11 +7,12 @@ Contents
 PARA QUE SERVE
   O item wa-suite do lastro (no nó) compara cada rodada completa da suíte inteira do WA com a anterior, e o `new_fail` do resumo ninguém lia (24/10: 237 numa rodada, ruído até separar o tropeço da regressão).
   O item agora CONFIRMA: falha NOVA numa rodada completa que AINDA reprova na rodada completa seguinte. Esta ponta, no mini, transforma a lista dele em UMA bead no rig do WA, com a lista COMPLETA (o resumo corta em 15).
-FONTES (`--fonte NOME`; sem o argumento é wa-suite; as duas não dividem estado, label nem bead)
+FONTES (`--fonte NOME`; sem o argumento é wa-suite; as fontes não dividem estado, label nem bead)
   wa-suite    lê wa-suite.confirmed, bead no rig do WA (label origem:lastro-wa-suite), bug P2, estado newfail.json.
   hq-mutants  lê hq-mutants.state.json (o estado do motor hq-mutate.py: de cada alvo, `survivors` = os mutantes que NENHUM selftest da família pegou, confirmados por uma 2ª rodada numa cópia limpa), bead no rig do HQ
               (a cidade; label origem:lastro-hq-mutants), task P3, estado newfail-hq-mutants.json. A lista é a do ÚLTIMO rodízio: o id sai quando o motor varre o alvo de novo e o mutante morre (ou deixa de existir); alvo apagado ou ainda não varrido de novo mantém a linha (pode estar velha).
               Lista que ZERA não é 'pegos': alvo sem sobrevivente também é alvo que o motor NÃO reavaliou (base vermelha, scanner perdido, prazo, estado novo). O comentário diz quantos alvos não foram julgados por inteiro e quais.
+  wa-mutants  lê wa-mutants.state.json (o MESMO formato do hq-mutants, escrito pelo hq-mutate-wa.py sobre lib/ e daemons/ do WA), bead no rig do WA (label origem:lastro-wa-mutants), task P3, estado newfail-wa-mutants.json. SEM ctx:ready, SEM exec:auto e sem rota: o pilot-missing-route-watchdog manda para o pool de dogs a bead que tem as duas (foi o que aconteceu com a ga-iu0fvlo), e quem triagem decide. É UMA bead rolante: a lista muda, a bead é atualizada por comentário no máximo a cada 6 h, e cada texto (bead ou comentário) tem teto de 40000 bytes: os arquivos com mais sobreviventes vêm primeiro e o que não cabe vira uma linha com a conta (o hq-mutants chegou a 136.952 bytes na ga-iu0fvlo). Lista que ZERA diz, por motivo, quantos alvos o motor NÃO julgou (o WA tem centenas fora da varredura por desenho: sem teste da família, família grande, denylist).
 O QUE LÊ (wa-suite)
   `ssh <nó> cat ~/gt-remote/ballast/wa-suite.confirmed`: {"v": 1, "main": <ponta da rodada>, "items": {<id do teste>: {"from": <ponta antes>, "to": <ponta onde apareceu>, "seen": <ponta que confirmou>}}}.
   É o estado ATUAL (o id fica até o teste passar), então olhar menos vezes que a rodada não perde nada.
@@ -25,14 +26,17 @@ TRÊS ESTADOS
   ler = rc 3 e NADA é aberto nem comentado: avisar de novo sobre uma bead que já existe duplicaria. Escrita do estado local que falha depois do `bd` ter respondido = rc 3 e a frase "NÃO gravei", nunca traceback: num comentário a próxima volta o repete (repetido é melhor que perdido); depois de um create ela lista o rig e comenta na bead que nasceu.
   `bd create` sem resposta certa (não executou, estourou o prazo, rc ≠ 0 ou respondeu sem o id) = a bead PODE ter nascido: rc 3, estado intacto, e a volta seguinte olha o rig antes de abrir. Rig que não consigo listar = rc 3 e nada feito ("não achei nenhuma nossa" e "não consegui listar" nunca são a mesma resposta).
 ESTADO LOCAL
-  <cidade>/.gc/hetzner-ballast/newfail.json (hq-mutants: newfail-hq-mutants.json): {"v": 1, "fp": <impressão digital da última lista avisada>, "bead": <id>, "n": <quantas>}.
+  <cidade>/.gc/hetzner-ballast/newfail.json (hq-mutants: newfail-hq-mutants.json; wa-mutants: newfail-wa-mutants.json): {"v": 1, "fp": <impressão digital da última lista avisada>, "bead": <id>, "n": <quantas>, "at": <quando, UTC>}.
+  O "at" é o relógio do adiamento do wa-mutants (comentário no máximo a cada 6 h); sem "at" ou ilegível, o comentário sai na hora.
 AMBIENTE
   GC_CITY_PATH · HETZNER_NODE_HOST (padrão hetzner-teste) · HB_SSH (padrão ssh) · HB_BD (padrão bd) · HB_WA_RIG (padrão /Users/athos/gt/whatsapp_automation) · HB_HQ_RIG (padrão a cidade) · HB_BD_TIMEOUT (segundos do `bd create` e do `bd list`; padrão 90, valor que não é número > 0 = 90). Saída: 0 ok · 3 recusado ou não consegui · 98 ssh fora.
 """
+import calendar
 import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -300,6 +304,69 @@ def zerou_hq(n, nao):
             "(Arquivo que saiu do estado do motor também não aparece: confira ~/gt-remote/ballast/hq-mutants.state.json no nó.)" % n)
 
 
+WAM_CAP = 40000   # bytes do texto de UMA bead ou comentário do wa-mutants: o código do WA tem ~1000 alvos e o hq-mutants já levou a bead a 136.952 bytes (ga-iu0fvlo)
+WAM_GAP_S = 21600   # a lista muda a cada rodada que julga um alvo novo; com a bead aberta, comentar no máximo a cada 6 h (30 min × até 40 KB empilhava)
+
+
+def render_wam(items):
+    """Texto da bead do wa-mutants: sobreviventes por arquivo e linha, do arquivo com MAIS deles para o com menos, até WAM_CAP bytes. O que não cabe vira UMA linha com a conta (a lista inteira fica no estado do nó)."""
+    files = {}
+    for sid, r in items.items():
+        files.setdefault(r["file"], []).append((r["line"], sid, r))
+    head = ["Mutantes SOBREVIVENTES confirmados pelo lastro do nó (item wa-mutants): %d troca(s) de UMA linha do código do WA (lib/, daemons/) que NENHUM teste da família reprovou." % len(items), "",
+            "Cada linha é uma quebra deliberada (antes → depois) que deixou o pytest da família do arquivo (os testes que levam o nome dele ou o importam) VERDE, e que repetida numa cópia limpa também passou: o teste não protege aquela linha. "
+            "Para fechar, ponha num teste um caso que reprove com a troca (o id é estável: sha1 de arquivo:linha:operador:antes>depois:ocorrência) ou, se a troca não muda o comportamento, diga qual é a equivalência. "
+            "A lista é a do ÚLTIMO rodízio e a bead é atualizada quando ela muda (no máximo a cada %d h). Um id sai quando o motor varre o arquivo de novo e o mutante morre (ou deixa de existir); arquivo apagado, renomeado ou ainda não varrido de novo "
+            "MANTÉM a linha aqui, e ela pode estar velha: confira no arquivo atual antes de agir." % (WAM_GAP_S // 3600), ""]
+    flat = []   # (texto, arquivo se for linha de mutante, senão None)
+    for rel, rows in sorted(files.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        flat.append(("ARQUIVO %s (%d)" % (rel, len(rows)), None))
+        for line, sid, r in sorted(rows, key=lambda x: (x[0], x[1])):
+            fam = ",".join(r.get("selftest", []))
+            flat.append(("  L%d [%s] %s -> %s  id=%s%s" % (line, r.get("op", ""), r.get("old", "").replace("\n", "\\n"), r.get("new", "").replace("\n", "\\n"), sid, "  (testes: %s)" % fam if fam else ""), rel))
+        flat.append(("", None))
+    fonte = ("Fonte: ~/gt-remote/ballast/wa-mutants.state.json no nó (hetzner-ballast-newfail.py --fonte wa-mutants, ga-tmfmvxi). Não é lead nem dado de cliente: só trechos do código do próprio WA, tirados do espelho que o wa-suite já usa.")
+    teto = WAM_CAP - 700   # a reserva cobre a linha da conta (~230 bytes), a da fonte (~230) e o `lead` que o comentário põe na frente (até ~150); sobra pouco de propósito: o teste prova que sem o cabeçalho na conta o texto passa de 40000
+    used = sum(len(x.encode("utf-8")) + 1 for x in head)
+    out, k = list(head), 0
+    for k, (txt, rel) in enumerate(flat):
+        used += len(txt.encode("utf-8")) + 1
+        if used > teto:
+            break
+        out.append(txt)
+    else:
+        k = len(flat)
+    rest = [rel for _, rel in flat[k:] if rel is not None]
+    if rest:
+        out.append("+%d mutante(s) em %d arquivo(s) NÃO listados aqui (limite de %d bytes por texto de bead): a lista inteira está em ~/gt-remote/ballast/wa-mutants.state.json no nó, e os ids que não aparecem aqui continuam valendo." % (len(rest), len(set(rest)), WAM_CAP))
+    out.append(fonte)
+    return "\n".join(out)
+
+
+def zerou_wam(n, nao):
+    """Comentário de lista que zerou (wa-mutants). Vazia NÃO é 'pegos', e no WA menos ainda: parte do código fica FORA da varredura por desenho (sem teste da família, família grande, denylist), então a conta por motivo vai escrita."""
+    if not nao:
+        return ("A lista de mutantes sobreviventes (item wa-mutants) está vazia: os %d alvo(s) do estado do motor estão com todos os mutantes julgados e nenhum sobrevive. Quem reforçou o teste fecha esta bead. "
+                "(Arquivo que saiu do estado do motor também não aparece: confira ~/gt-remote/ballast/wa-mutants.state.json no nó.)" % n)
+    por = {}
+    for _, why in nao:
+        k = re.sub(r"\d+", "N", ":".join(why.split(":")[:2]))
+        por[k] = por.get(k, 0) + 1
+    top = sorted(por.items(), key=lambda kv: (-kv[1], kv[0]))
+    quais = "; ".join("%d× %s" % (c, k) for k, c in top[:8]) + ("; +%d motivo(s)" % (len(top) - 8) if len(top) > 8 else "")
+    return ("A lista de mutantes sobreviventes (item wa-mutants) está vazia, mas isso NÃO prova que os testes foram reforçados. Estado do motor: %d alvo(s); NÃO julgados por inteiro agora: %d [%s]. "
+            "Alvo que o motor pulou ou ainda não reavaliou não tem sobrevivente na lista, nem por isso foi pego. Confira ~/gt-remote/ballast/wa-mutants.state.json no nó antes de fechar esta bead." % (n, len(nao), quais))
+
+
+def too_soon(state, gap):
+    """True se o último aviso (state["at"]) tem menos de `gap` s. vazio (sem `at`) / ilegível (não é a data que o save_state grava, ou está no futuro) → False: comento. Repetido é melhor que perdido, a mesma regra do resto do script."""
+    try:
+        t = calendar.timegm(time.strptime(state.get("at"), "%Y-%m-%dT%H:%M:%SZ"))
+    except (TypeError, ValueError):
+        return False
+    return 0 <= time.time() - t < gap
+
+
 FONTES = {
     "wa-suite": dict(arquivo="wa-suite.confirmed", estado="newfail.json", rig=os.environ.get("HB_WA_RIG", "/Users/athos/gt/whatsapp_automation"), rig_nome="WA", labels=("origem:lastro-wa-suite", "area:testes"),
                      tipo="bug", prio="2", titulo="wa-suite do lastro: %d regressão(ões) confirmada(s) no main", items=items_wa, forma="v 1, items {id: {from, to, seen}}", render=render_wa, coisas="regressões", gen="as",
@@ -308,6 +375,10 @@ FONTES = {
                        tipo="task", prio="3", titulo="hq-mutants do lastro: %d mutante(s) sobrevivente(s) confirmado(s) no main", items=items_hq, forma="v 1, targets {arquivo: {survivors: {id: {file, line, op, old, new}}}}", render=render_hq,
                        coisas="mutantes sobreviventes", gen="os",
                        avalia=avalia_hq, zerou=zerou_hq),
+    # sem ctx:ready, exec:auto nem rota: o pilot-missing-route-watchdog reencaminha para o pool de dogs a bead que tem as duas (foi o que aconteceu com a ga-iu0fvlo); quem triagem decide
+    "wa-mutants": dict(arquivo="wa-mutants.state.json", estado="newfail-wa-mutants.json", rig=os.environ.get("HB_WA_RIG", "/Users/athos/gt/whatsapp_automation"), rig_nome="WA", labels=("origem:lastro-wa-mutants", "area:testes"),
+                       tipo="task", prio="3", titulo="wa-mutants do lastro: %d mutante(s) sobrevivente(s) confirmado(s) no main", items=items_hq, forma="v 1, targets {arquivo: {survivors: {id: {file, line, op, old, new}}}}", render=render_wam,
+                       coisas="mutantes sobreviventes", gen="os", avalia=avalia_hq, zerou=zerou_wam, gap_s=WAM_GAP_S),
 }
 
 
@@ -361,6 +432,10 @@ def main():
         if status is None:
             die(3, "não consegui ler a bead %s no rig do %s: não abro outra nem comento (a próxima volta repete)" % (bead, F["rig_nome"]))
         action = "comentar" if status == "open" else "criar"
+        # só o comentário na bead que JÁ é nossa e aberta espera (aviso ainda sem relógio = comenta); abrir bead nova, achar a nossa no rig e o comentário de lista que zerou saem na hora
+        if action == "comentar" and F.get("gap_s") and too_soon(state, F["gap_s"]):
+            say("a lista de %s mudou (agora %d), mas o último aviso em %s tem menos de %g h: adio o comentário (a próxima volta com a lista ainda diferente comenta)" % (F["coisas"], len(items), bead, F["gap_s"] / 3600))
+            return 0
     lead = "A lista de %s confirmad%s MUDOU (agora %d)." % (F["coisas"], F["gen"], len(items))
     if action == "criar":
         # nunca abro sem olhar o rig: uma criação anterior pode ter nascido sem eu saber (prazo, rc ≠ 0, resposta sem id, estado local que não gravou)

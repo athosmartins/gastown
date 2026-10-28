@@ -1,0 +1,23 @@
+# ga-tmfmvxi: dá DONO aos mutantes que o item wa-mutants do lastro do nó Hetzner confirma como SOBREVIVENTES. O wa-mutants quebra uma linha por vez do código do WA (lib/ e daemons/, o espelho que o wa-suite já usa; NUNCA
+# dado de lead) com o hq-mutate-wa.py, na jaula, e vê se o pytest da família do arquivo reprova; o que sobrevive a duas rodadas (a 2ª numa cópia limpa) é teste que não protege aquela linha, e o motor o guarda em
+# ~/gt-remote/ballast/wa-mutants.state.json. Sem esta order ninguém lê esse arquivo e o item seria queima disfarçada: gasta CPU e não produz nada que alguém leia.
+#
+# O QUE FAZ: hetzner-ballast-newfail.py --fonte wa-mutants lê o estado do motor no nó (ssh) e mantém UMA bead rolante no rig do WA (task, P3, labels origem:lastro-wa-mutants e area:testes, SEM ctx:ready, SEM exec:auto e
+# SEM rota: o pilot-missing-route-watchdog manda ao pool de dogs a bead que tem as duas, e quem triagem decide) com a lista de sobreviventes (arquivo, linha, troca, id, testes da família), do arquivo com mais deles para o com menos
+# e com teto de 40000 bytes por texto (o que não cabe vira uma linha com a conta; a lista inteira fica no nó). Abre quando a lista é nova; comenta quando ela muda, no máximo a cada 6 h; comenta quando zera (lista vazia NÃO é "pegos": o
+# comentário diz, por motivo, quantos alvos o motor não julgou, e só com todos julgados por inteiro diz que nenhum sobrevive); abre outra se o dono fechou a anterior E a lista mudou depois. ANTES de abrir lista o rig
+# (label origem:lastro-wa-mutants): se já existe uma nossa não fechada, comenta nela em vez de abrir outra.
+# Ler o nó ou o estado local que falha = exit 3 e NADA é aberto; o nó desligado (falta .gc/hetzner-node.on) = não faz nada. Estado local: .gc/hetzner-ballast/newfail-wa-mutants.json (o do wa-suite e o do hq-mutants são outros arquivos).
+#
+# 30 min como as outras: a lista é o estado ATUAL (não um evento) e o motor só a muda quando varre um arquivo; cada volta custa um ssh e, se a lista mudou, um bd no rig do WA. O espaçamento de 6 h vale só para o COMENTÁRIO
+# na bead aberta: o motor varre centenas de arquivos e a lista muda a cada rodada, e um comentário de até 40 KB a cada 30 min empilharia (a ga-iu0fvlo do hq-mutants chegou a 136.952 bytes de descrição).
+# timeout 420s: a volta que ABRE bead empilha ssh (até 60 s) + show (até 60 s) + list (até 90 s) + create (até 90 s) = 300 s só nos tetos, e 420 s dá folga.
+#
+# Conferir depois de um reload:  gc order show hetzner-wa-mutants-newfail   -> Source: .../packs/town-deltas/...
+#                                cat $GC_CITY_PATH/.gc/hetzner-ballast/newfail-wa-mutants.json   (a lista que já foi avisada, a bead e o "at" do último aviso)
+[order]
+description = "Cada 30 min: os mutantes que o wa-mutants do lastro (nó Hetzner) confirmou como sobreviventes no código do WA viram UMA bead rolante no rig do WA, sem rota (abre / comenta quando muda, no máximo a cada 6 h / comenta quando zera); no-op com o nó desligado (ga-tmfmvxi)"
+trigger = "cooldown"
+interval = "30m"
+timeout = "420s"
+exec = "python3 -I $PACK_DIR/../../scripts/hetzner-ballast-newfail.py --fonte wa-mutants"
