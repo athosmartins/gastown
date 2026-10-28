@@ -443,6 +443,42 @@ hgreset; export FAKE_HG_RC_AT=6 FAKE_HG_RC=1
 eq "the base copy red under the mutant (run 6 answers rc 1) -> survived: it dies there too, nothing this change added" "$(st kills)" "survived"
 hgreset
 
+echo "  -- git, mkdir and the file system failing in the middle of quality-gate-guard.sh's function --"
+use_list widget.sh "$SEL_W" "$ID_LIM"; hgreset; : > "$REASONS"
+eq "a base that does not resolve (rev-parse of it fails) -> unknown, nothing ran" \
+  "$(gate_base_test_mutants_state "$REPO" 0000000000000000000000000000000000000000 "$(tip kills)" "$WT" "$F_W" "$STORE" "$BEAD" 2>>"$REASONS") $(nlines "$FAKE_HG_LOG")" "unknown 0"
+eq "git rev-parse of the base failing in the rig (git exits 1) -> unknown worktree-not-at-base, never a comparison of two empty strings" \
+  "$( ( git() { if [ "$1" = -C ] && [ "$2" = "$REPO" ] && [ "$3" = rev-parse ]; then return 1; fi; command git "$@"; }; st kills ) 2>>"$REASONS")" "unknown"
+eq "git rev-parse HEAD failing in the worktree (git exits 1) -> unknown too" \
+  "$( ( git() { if [ "$1" = -C ] && [ "$2" = "$WT" ] && [ "$3" = rev-parse ]; then return 1; fi; command git "$@"; }; st kills ) 2>>"$REASONS")" "unknown"
+eq "... both of them left the reason, and neither ran anything" "$(grep -c 'answer=unknown why=worktree-not-at-base$' "$REASONS") $(nlines "$FAKE_HG_LOG")" "3 0"
+mkdir -p "$TMPD/not-a-checkout/.gascity-gastown-hq"
+eq "a worktree directory that is not a git checkout at all (nothing to read a HEAD from) -> unknown" \
+  "$(GIT_CEILING_DIRECTORIES="$TMPD" gate_base_test_mutants_state "$REPO" "$BASE" "$(tip kills)" "$TMPD/not-a-checkout" "$F_W" "$STORE" "$BEAD" 2>>"$REASONS")" "unknown"
+hgreset; : > "$REASONS"
+eq "the scratch directory of the base copy's run cannot be made (mkdir exits 1) -> unknown, not killed: the base was never asked" \
+  "$( ( mkdir() { case "$*" in *scratch-base-[0-9]*) return 1 ;; esac; command mkdir "$@"; }; st kills ) 2>>"$REASONS")" "unknown"
+eq "... 5 runs: control, the mutant twice, the unmutated re-run, the base copy's control; no run of the base copy under the mutant" "$(nlines "$FAKE_HG_LOG")" "5"
+eq "... the reason shows the base copy's slot empty (-)" "$(grep -c 'answer=unknown .*why=[0-9a-f]*:run-red/red/green/-$' "$REASONS")" "1"
+eq "... production file and the branch's selftest are back as they were" "$(W_SUM) $(cksum < "$WT/$F_W")" "$W0 $(git -C "$REPO" show "$(tip kills):$F_W" | cksum)"
+hgreset
+eq "the base copy's control cannot get its scratch directory (mkdir exits 1) -> unknown, nothing of the base ran" \
+  "$( ( mkdir() { case "$*" in *scratch-base-control*) return 1 ;; esac; command mkdir "$@"; }; st kills ) 2>>"$REASONS")" "unknown"
+eq "... 4 runs: only the branch's own" "$(nlines "$FAKE_HG_LOG")" "4"
+hgreset; : > "$REASONS"
+if [ "$(id -u)" = "0" ]; then echo "  - SKIPPED: subject-cannot-be-put-back case (running as root, chmod a-w does not stop a write)"
+else
+  chmod a-w "$WT/$A/widget.sh"
+  if [ -w "$WT/$A/widget.sh" ]; then echo "  - SKIPPED: subject-cannot-be-put-back case (chmod a-w did not make the file read-only here)"
+  else
+    eq "a subject the function cannot write (chmod a-w): the mutant does not go in and the original cannot be put back -> unknown, never survived" "$(st kills)" "unknown"
+    eq "... only the control ran, the reason says the subject was not restored" "$(nlines "$FAKE_HG_LOG") $(grep -c 'answer=unknown why=[0-9a-f]*:subject-not-restored$' "$REASONS")" "1 1"
+  fi
+  chmod u+w "$WT/$A/widget.sh"
+fi
+eq "... (fixture) the production file is as it was and git sees it clean" "$(W_SUM) $(git -C "$WT" status --porcelain -- "$A/widget.sh")" "$W0 "
+hgreset
+
 echo "  -- every way the measurement cannot tell: unknown, never survived, never killed --"
 bdset $BEAD "ARQUIVO packs/town-deltas/assets/widget.sh (1)
   L4 [x] a -> b  id=$ID_LIM  (testes: packs/town-deltas/assets/another.selftest.sh)" "$LBL_M"; hgreset
