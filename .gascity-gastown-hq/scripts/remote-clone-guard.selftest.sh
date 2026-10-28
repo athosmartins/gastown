@@ -18,7 +18,7 @@
 #   de redirecionamento · lexh heredoc/`<<<`/find · lexp os controles que NÃO bloqueiam) · dest — o lugar onde o git escreve vem como ARGUMENTO, sem -C (worktree remove ../outro,
 #   clone/init <outro>/x, checkout-index --prefix=…; subgrupos destb e destp) · interp — o texto que um INTERPRETADOR (python -c, node -e, perl -e, ruby -e, awk) ou um pipe entrega a um
 #   shell roda: as 12 formas que só o cc-safety-net pegava (ga-tphd15o; subgrupos interpc código de interpretador, interpp pipe que um shell lê, interpe base64/rev/eval/printf -v).
-# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (180 mutantes); e
+# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (184 mutantes); e
 #   contra um stub que só sai 0 (o servidor ANTES desta fatia: o hook do mini era `drop` e nada o substituía), quase tudo falha.
 # VARIÁVEIS: RCG_UNDER_TEST (guarda a testar) · RCG_ONLY (grupos, vírgula) · RCG_NO_MUTANTS=1
 # BUDGET (grupo à parte, ga-tih62nv): o pedido que fazia o guarda girar SEM FIM (e que o hook deixava seguir sem conferência ao estourar o prazo de 600 s do Claude Code) termina;
@@ -624,13 +624,18 @@ g_interp() {  # ga-tphd15o (achado do ga-nkfwixz, cc-safety-net como oráculo): 
            "perl -e 'system(\"$g\")'" "perl -e '\`$g\`'" "awk 'BEGIN{system(\"$g\")}'" "python3 -c \"import os; os.popen('$g')\"" "python3 -c \"import subprocess; subprocess.check_output('$g', shell=True)\"" \
            "python3 -I -c \"import os; os.system('git -C ../other reset --hard')\"" "python3.12 -c \"import os; os.system('$g')\"" "node -e \"require('child_process').exec('$g')\"" "perl -e 'system \"$g\"'" \
            "perl -e 'exec(\"$g\")'" "ruby -e 'system(\"$g\")'" "gawk 'BEGIN{\"$g\" | getline}'" "sudo -n python3 -c \"import os; os.system('$g')\"" "bash -c \"python3 -c \\\"import os; os.system('$g')\\\"\"" \
-           "python3 -c \"import os; os.chdir('$OTH'); os.system('git commit -m x')\"" "node -e \"require('child_process').execSync('git commit -m x', {cwd: '$OTH'})\"" "perl -e 'qx{$g}'" "perl -e 'system(qq{$g})'" "ruby -e '%x($g)'" "ruby -e '%x{$g}'"; do
+           "python3 -c \"import os; os.chdir('$OTH'); os.system('git commit -m x')\"" "node -e \"require('child_process').execSync('git commit -m x', {cwd: '$OTH'})\"" "perl -e 'qx{$g}'" "perl -e 'system(qq{$g})'" "ruby -e '%x($g)'" "ruby -e '%x{$g}'" \
+           "node -e \"require('child_process').execSync('git commit -m x', {'cwd': '$OTH'})\"" "python3 -c \"import subprocess; subprocess.run('git commit -m x', shell=True, **{'cwd': '$OTH'})\"" \
+           "python3 -c \"import os; os.environ['GIT_DIR'] = '$OTH/.git'; os.system('git commit -m x')\"" "node -e \"require('child_process').execSync('git commit -m x', {env: {GIT_DIR: '$OTH/.git'}})\"" \
+           "python3 -c \"import subprocess; subprocess.run('git add .', shell=True, env={'GIT_WORK_TREE': '$OTH'})\"" \
+           "python3 -c \"import json; print(json.dumps({'cwd': '$OWN', 'command': 'git checkout --detach abc'}))\"" \
+           "python3 -c \"import os; os.system('\\x67it -C $OTH reset --hard')\"" "node -e \"require('child_process').execSync('\\x67it -C $OTH reset --hard')\"" \
+           "awk -v cmd='$g' 'BEGIN{system(cmd)}'" "python3 -c \"import os,sys; os.system(sys.argv[1])\" '$g'"; do
     b 2 "interp: o texto entre aspas do código roda num shell: $c" "$c"
   done
   for c in "python3 -c \"import os; os.system('git -C $OWN commit -m x')\"" "python3 -c \"import os; os.system('git commit -m x')\"" "python3 -c \"import os; os.system('git -C $OTH log')\"" \
            "python3 -c \"print('use git -C $OTH commit to write')\"" "python3 -c \"import json,sys; print(json.load(sys.stdin))\"" "awk '{print \$1}'" "perl -pe 's/a b/c d/'" "node -e \"console.log(1+1)\"" \
-           "perl -e 'system(\"git -C $OWN commit -m x\")'" "awk 'BEGIN{system(\"git status\")}'" "python3 -c \"import os; os.chdir('$OWN'); os.system('git -C $OWN commit -m x')\"" "python3 $T/tool.py --msg ok" "perl -e 'qx{git -C $OWN commit -m x}'" \
-           "python3 -c \"import json; print(json.dumps({'cwd': '$OWN', 'command': 'git checkout --detach abc'}))\""; do
+           "perl -e 'system(\"git -C $OWN commit -m x\")'" "awk 'BEGIN{system(\"git status\")}'" "python3 -c \"import os; os.chdir('$OWN'); os.system('git -C $OWN commit -m x')\"" "python3 $T/tool.py --msg ok" "perl -e 'qx{git -C $OWN commit -m x}'" "python3 -c \"DIGIT_N = 1; import os; os.system('git commit -m x')\""; do
     b 0 "pass: interp: código de interpretador que não escreve no alheio: $c" "$c"
   done
   fi
@@ -1221,10 +1226,14 @@ echo "== $((n-fails))/$n ok =="
   mutant interpc "ruby -e deixa de ser interpretador" 's/|perl|ruby)/|perl)/'
   mutant interpc "awk deixa de ser interpretador" 's/|\[gmn\]?awk"/"/'
   mutant interpc "o código de nenhum interpretador é aberto" 's/        elif INTERP.fullmatch(c):/        elif False:/'
-  mutant interpc "o literal entre aspas do código não é conferido sozinho (perl system \"…\" sem parêntese, getline do awk)" 's/for text in \[t\] + \[next(filter(None, g), "") for g in LIT.findall(t)\]:/for text in [t]:/'
-  mutant interpc "o código inteiro não é conferido como shell (a crase do perl)" 's/for text in \[t\] + \[next(filter(None, g), "") for g in LIT.findall(t)\]:/for text in [next(filter(None, g), "") for g in LIT.findall(t)]:/'
-  mutant interpc "chdir/cwd no código não deixa o diretório \"não sei\"" 's/^CODECD = re.compile(r"chdir|\\bcwd\\s\*\[=:\]")/CODECD = re.compile(r"(?!)")/'
-  mutant interpc "a chave 'cwd' de um JSON vale como a opção cwd= (falso positivo no próprio clone)" 's/^CODECD = re.compile(r"chdir|\\bcwd\\s\*\[=:\]")/CODECD = re.compile(r"chdir|\\bcwd\\b")/'
+  mutant interpc "o literal entre aspas do código não é conferido sozinho (perl system \"…\" sem parêntese, getline do awk)" 's/ + \[ANSI.sub(ansi, next(filter(None, g), "")) for g in LIT.findall(t)\]:/:/'
+  mutant interpc "o código inteiro não é conferido como shell (a crase do perl)" 's/for text in \[t\] + (\[m.group(2)\] if m else \[\]) + /for text in ([m.group(2)] if m else []) + /'
+  mutant interpc "chdir/cwd no código não deixa o diretório \"não sei\"" 's/^CODECD = re.compile(r"chdir|\\bcwd\\b|\\bGIT_\[A-Z_\]+")/CODECD = re.compile(r"(?!)")/'
+  mutant interpc "a chave 'cwd' ENTRE ASPAS deixa de valer como a opção (bypass)" 's/^CODECD = re.compile(r"chdir|\\bcwd\\b|\\bGIT_\[A-Z_\]+")/CODECD = re.compile(r"chdir|\\bcwd\\s\*\[=:\]|\\bGIT_\[A-Z_\]+")/'
+  mutant interpc "GIT_DIR / GIT_WORK_TREE no código não deixam o diretório \"não sei\"" 's/^CODECD = re.compile(r"chdir|\\bcwd\\b|\\bGIT_\[A-Z_\]+")/CODECD = re.compile(r"chdir|\\bcwd\\b")/'
+  mutant interpc "GIT_ sem fronteira de palavra casa DIGIT_N (falso positivo no próprio clone)" 's/^CODECD = re.compile(r"chdir|\\bcwd\\b|\\bGIT_\[A-Z_\]+")/CODECD = re.compile(r"chdir|\\bcwd\\b|GIT_\[A-Z_\]+")/'
+  mutant interpc "os escapes do literal (\\x67it) não são decodificados" 's/ANSI.sub(ansi, next(filter(None, g), ""))/next(filter(None, g), "")/'
+  mutant interpc "o valor de NOME=valor (awk -v cmd=…) não é conferido" 's/\[m.group(2)\] if m else \[\]/[]/'
   mutant interpc "o shell aberto pelo código nunca sabe o diretório (falso positivo no próprio clone)" 's/cw = None if CODECD.search(" ".join(seg)) else cwd/cw = None/'
   mutant interpp "shell sem -c não lê o texto do pipe (nem o que está em corpo de função)" 's/ else seg + \["-c", flow\]/ else seg/'
   mutant interpp "o texto de um trecho não segue para o próximo do pipe" 's/flow, hs = printed(seg, flow if hs is None else hs, st\["env"\]) if pc in PIPES else None, None/flow, hs = None, None/'
