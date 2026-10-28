@@ -5,6 +5,11 @@
 # Hermetic: stubs `bd` with a fake executable (prepended to PATH) that serves
 # canned `bd show` fixtures and logs `bd create`'s full argv (as JSON) instead
 # of executing it. No real bd/Dolt is ever contacted, nothing is ever created.
+#
+# ga-iu0fvlo: os argumentos do `bd create` chegam VERBATIM e em ordem, inclusive o ÚLTIMO e o ÚNICO (case_args_verbatim). Os casos antigos só olhavam se o título e `--type` estavam em algum lugar
+#   do argv; um laço `while [ $# -gt 1 ]` ou um `[ ${#ARGS[@]} -gt 1 ]` largava o último argumento sem que nenhum caso notasse. Mutantes embutidos: o trecho troca UMA vez, o caso tem de FALHAR.
+# EQUIVALENTE (0f5cf9a63b, L57 `-gt 0`→`-ge 0`): em bash ≥ 4.4 o `"${ARGS[@]}"` vazio expande para nada, então `exec bd create "${ARGS[@]}" --metadata M` é o mesmo comando do ramo else;
+#   só o bash 3.2 do mac aborta ("unbound variable") e aí o caso "zero extra args" já o pega. No nó (bash 5) nenhum caso vê a diferença.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -152,6 +157,43 @@ RC=$(run_script --mail-id test-mail-good --metadata '{"foo":"bar"}' "Title")
 META=$(metadata_of)
 [ "$(echo "$META" | jq -r '.foo')" = "bar" ] && ok "user's own metadata key survives the merge" || bad "user's own metadata key lost: $META"
 [ "$(echo "$META" | jq -r '."mail.author"')" = "oracle-wa" ] && ok "mail.* keys still added alongside user metadata" || bad "mail.* keys lost when user metadata was present: $META"
+
+# ── os argumentos do bd create chegam verbatim, em ordem, sem largar o último nem o único (ga-iu0fvlo) ──
+# ── argv que falta (create-call.json ausente) ou ilegível reprova: jq -e sem entrada sai ≠ 0 ────────────
+case_args_verbatim() {
+  local RC ARGV
+  RC=$(run_script --mail-id test-mail-good "My Title" --description "desc" --type bug); ARGV=$(cat "$WORKDIR/create-call.json" 2>/dev/null)
+  [ "$RC" -eq 0 ] && echo "$ARGV" | jq -e '.[0:5] == ["My Title","--description","desc","--type","bug"]' >/dev/null 2>&1 \
+    && ok "args verbatim e em ordem, o ÚLTIMO (bug) incluso" || bad "args do bd create perdidos/fora de ordem (rc $RC): $ARGV"
+  RC=$(run_script --mail-id test-mail-good "Só o título"); ARGV=$(cat "$WORKDIR/create-call.json" 2>/dev/null)
+  [ "$RC" -eq 0 ] && echo "$ARGV" | jq -e 'length == 3 and .[0] == "Só o título" and .[1] == "--metadata"' >/dev/null 2>&1 \
+    && ok "com --mail-id, o argumento ÚNICO chega ao bd create" || bad "argumento único perdido com --mail-id (rc $RC): $ARGV"
+  RC=$(run_script "Único"); ARGV=$(cat "$WORKDIR/create-call.json" 2>/dev/null)
+  [ "$RC" -eq 0 ] && echo "$ARGV" | jq -e 'length == 3 and .[0] == "Único" and .[1] == "--metadata" and .[2] == "{}"' >/dev/null 2>&1 \
+    && ok "sem --mail-id, o argumento ÚNICO chega ao bd create e o metadata é {}" || bad "argumento único perdido sem --mail-id (rc $RC): $ARGV"
+  RC=$(run_script --mail-id test-mail-good --metadata '{"foo":"bar"}' "Title"); ARGV=$(cat "$WORKDIR/create-call.json" 2>/dev/null)
+  [ "$RC" -eq 0 ] && echo "$ARGV" | jq -e '.[0] == "Title"' >/dev/null 2>&1 \
+    && ok "o título depois de --metadata chega ao bd create" || bad "título depois de --metadata perdido (rc $RC): $ARGV"
+}
+echo "── args verbatim (ga-iu0fvlo) ──"
+case_args_verbatim
+
+echo "── mutants: one loose edit of the script, the case must FAIL ──"
+mutant() {   # nome · trecho original · trecho frouxo · caso que tem de pegar
+  local name=$1 old=$2 new=$3 case_fn=$4 res
+  if ! python3 - "$HERE/file-bead-from-mail.sh" "$old" "$new" > "$WORKDIR/mut.sh" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+if src.count(sys.argv[2]) != 1:
+    sys.exit(3)
+sys.stdout.write(src.replace(sys.argv[2], sys.argv[3]))
+PY
+  then bad "mutante $name: o trecho original não aparece exatamente uma vez no script (o script mudou?)"; return; fi
+  res=$( ( SCRIPT="$WORKDIR/mut.sh"; $case_fn ) 2>&1 )
+  if printf '%s\n' "$res" | grep -q '^  FAIL'; then ok "mutante $name morto por $case_fn"; else bad "mutante $name SOBREVIVEU a $case_fn"; fi
+}
+mutant laco-larga-o-ultimo   'while [ $# -gt 0 ]; do' 'while [ $# -gt 1 ]; do' case_args_verbatim
+mutant unico-arg-vai-pro-else 'if [ "${#ARGS[@]}" -gt 0 ]; then' 'if [ "${#ARGS[@]}" -gt 1 ]; then' case_args_verbatim
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]
