@@ -26,16 +26,20 @@ LIMITES (trava contra engano, não sandbox): não vejo script que o comando exec
 from __future__ import annotations
 
 import glob
+import itertools
 import json
 import os
 import re
 import sys
+import time
 import unicodedata
 
 UNK = "\x00"  # "não sei": pedaço de caminho que o guarda não resolve (variável solta, substituição, ~usuário)
 MAX_CMD = 262144  # acima disto o leitor não roda e o pedido é bloqueado: texto que não dá para conferir não vira "liberado"
 GLOB_MAX = 20000  # curinga com mais achados que isto: o resto vale como alvo que não conheço
 LS_BUDGET = 20000  # entradas de pasta lidas por julgamento (2 níveis); estourou = a pasta vale como se guardasse um repo
+LIMIT = 8  # segundos para julgar um pedido; passou disto vale bloqueado (hook que estoura o tempo do harness falha ABERTO)
+DEADLINE = float("inf")
 RM_TEXT = re.compile(r"(?<![\w.-])(?:rm|unlink|rmdir|shred|rimraf)(?![\w-])|-delete|rmtree")
 RM_VERBS = {"rm", "unlink", "rmdir", "shred", "rimraf"}
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "ash"}
@@ -70,7 +74,9 @@ ANSI = re.compile(r"\\(x[0-9a-fA-F]{1,2}|[0-7]{1,3}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-
 LIT = re.compile(r"""'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)\"""", re.S)
 ARGV = re.compile(r"""\[\s*['"](?:[^'"\n]*/)?(rm|unlink|rmdir|shred|rimraf)['"]\s*,([^\]]*)\]|['"](?:[^'"\n]*/)?(rm|unlink|rmdir|shred|rimraf)['"]\s*,\s*\[([^\]]*)\]""")
 ELEM = re.compile(r"""\s*(?:'(?P<s>(?:[^'\\]|\\.)*)'|"(?P<d>(?:[^"\\]|\\.)*)"|(?P<e>[^,\s][^,]*))\s*(?:,|$)""")  # um elemento de lista de argv: literal ou expressão
-DEL = re.compile(r"rmtree|remove|unlink|rmdir|rimraf|rmSync|rm_rf|rm_r\b|delete|trash")  # API de remoção: só com ela um literal de caminho solto no código inline conta
+# literal passado DIRETO a uma API de remoção (`rmtree('/x')`, `fs.rmSync('/x')`, `Path('/x').unlink()`): grupo 1 ou 2
+DELCALL = re.compile(r"""(?:rmtree|remove_tree|rimraf(?:Sync)?|rm_rf?|rmSync|rmdirSync|unlinkSync|os\.(?:remove|unlink|rmdir|removedirs)|fs\.(?:promises\.)?(?:rm|rmdir|unlink)|FileUtils\.rm_rf?|File\.delete|Dir\.rmdir|(?<![\w.])(?:unlink|rmdir))\s*\(\s*['\"]([^'\"\n]+)['\"]|Path\(\s*['\"]([^'\"\n]+)['\"]\s*\)\s*\.(?:unlink|rmdir)""")
+GITNAMES = re.compile(r"\.git|objects|refs|head|pack|index|config|hooks|logs|info|description|lock|sample|idx|[0-9a-f]{6,}", re.I)  # nomes de dentro de um .git: um filtro que os casa apaga história
 
 
 def ansi(body: str) -> str:
@@ -145,7 +151,10 @@ def candidates(raw: str, cwds: list, env: dict) -> list:
                 p = os.path.normpath(b if os.path.isabs(b) else os.path.join(cwd, b))
                 if re.search(r"[*?\[]", p):
                     # vazio → glob sem resultado: o rm recebe o texto como veio e o padrão vale; falhou/ilegível (permissão, laço de link) → glob devolve [] e o padrão vale
-                    hits = sorted(glob.glob(p))
+                    if sum(bool(re.search(r"[*?\[]", c)) for c in p.split("/")) > 2:  # curinga fundo (/*/*/*/x) percorre o disco inteiro: não expando, vale como alvo que não conheço
+                        out.append((None, None))
+                        continue
+                    hits = sorted(itertools.islice(glob.iglob(p), GLOB_MAX + 1))
                     out += [(h, p) for h in hits[:GLOB_MAX] or [p]] + ([(None, None)] if len(hits) > GLOB_MAX else [])  # achados além do teto: não os vi, valem como alvo que não conheço
                 else:
                     out.append((p, None))
@@ -215,11 +224,12 @@ def judge(f: str, rec: bool, selective: bool, pat) -> str | None:
             rp = [x for x in root.split("/") if x]
             if low[:len(rp)] == rp:
                 rest = low[len(rp):]
-                return "rm.shared-tmp" if (not rest or (rest[0].startswith("claude-") and len(rest) < 3) or rest[0].startswith("tmux-") or (rp[-1] == "folders" and len(rest) < 4)) else None
+                dir_ = rec or os.path.isdir(f)  # arquivo solto nessas pastas não derruba a sessão de ninguém; pasta ou recursão sim
+                return "rm.shared-tmp" if (not rest or rest[0].startswith("tmux-") or (dir_ and ((rest[0].startswith("claude-") and len(rest) < 3) or (rp[-1] == "folders" and len(rest) < 4)))) else None
         if low[0] in SYSTEM:
             return "rm.system"
     if selective:  # filtro de nome: o que vale é só a regra absoluta e dado (Dolt, beads, repo bare) embaixo da raiz; árvore de trabalho com `.git` pode (`find . -name '*.pyc' -delete`)
-        return "rm.repo-root" if holds(f, False) else None
+        return "rm.repo-root" if holds(f, False) or (holds(f) and any(GITNAMES.search(p) for p in selective)) else None
     if pat and MASS.fullmatch(pat.rsplit("/", 1)[-1]) and holds(os.path.dirname(pat)):
         return "rm.mass"
     return "rm.repo-root" if holds(f) else None
@@ -238,6 +248,8 @@ def check(ops: list, rec: bool, selective: bool, cwds: list, env: dict):
     """(regra, alvo) do 1º operando proibido; operando que não resolvo só barra numa remoção recursiva."""
     for raw in ops:
         for p, pat in candidates(raw, cwds, env):
+            if time.monotonic() > DEADLINE:
+                return "rm.too-big", "tempo esgotado"
             if p is None:
                 if rec:
                     return "rm.target-unknown", raw.replace(UNK, "?")
@@ -437,8 +449,8 @@ def cd_target(ws: list, cwds: list, env: dict):
 
 
 def inline(code: str, cwds: list, depth: int, env: dict):
-    """Código inline de python/node/perl/ruby/awk. Confere `['rm','-rf',x]`, texto de shell com rm (`os.system`) e, se o código usa uma API de remoção (DEL), cada literal de caminho."""
-    deletes = bool(DEL.search(code) or RM_TEXT.search(code))  # verbo de remoção em qualquer parte (`'rm -rf ' + '/caminho'`) liga a leitura dos literais de caminho
+    """Código inline de python/node/perl/ruby/awk. Confere `['rm','-rf',x]`, texto de shell com rm (`os.system`), o literal passado DIRETO a uma API de remoção (`rmtree('/x')`) e, se algum
+    literal cita rm/unlink/rmdir/shred, cada literal de caminho (`'rm -rf ' + '/x'`). A palavra solta "remove"/"delete" não liga nada: scripts de edição a citam o tempo todo."""
     for m in ARGV.finditer(code):
         rest = m.group(2) if m.group(1) else m.group(4)  # literal vira o texto; expressão (variável, concatenação) vira UNK
         els = [g.group("s") if g.group("s") is not None else g.group("d") if g.group("d") is not None else UNK for g in ELEM.finditer(rest)]
@@ -446,17 +458,14 @@ def inline(code: str, cwds: list, depth: int, env: dict):
         hit = check(ops, rec, False, cwds, env)
         if hit:
             return hit
-    for m in LIT.finditer(code):
-        lit = m.group(1) if m.group(1) is not None else m.group(2)
-        if RM_TEXT.search(lit) and re.search(r"\s", lit.strip()):
-            hit = scan_bash(lit, cwds, depth + 1, env)
-        elif deletes and lit and not re.search(r"\s", lit) and re.match(r"[~/.]|\w+/", lit):
-            hit = check([lit], True, False, cwds, env)
-        else:
-            hit = None
+    lits = [m.group(1) if m.group(1) is not None else m.group(2) for m in LIT.finditer(code)]
+    cites = any(RM_TEXT.search(x) for x in lits)
+    for lit in lits:
+        hit = scan_bash(lit, cwds, depth + 1, env) if RM_TEXT.search(lit) and re.search(r"\s", lit.strip()) else None
         if hit:
             return hit
-    return None
+    paths = [a or b for a, b in DELCALL.findall(code)] + [x for x in lits if cites and x and not re.search(r"\s", x) and re.search(r"\w", x) and re.match(r"[~/.]|\w+/", x)]
+    return check(paths, True, False, cwds, env)
 
 
 def code_of(stage: list) -> list:
@@ -526,11 +535,11 @@ def one(ws: list, cwds: list, depth: int, env: dict, feed: list, app=None):
             hit = scan_bash(body, cwds, depth + 1, env)
             if hit:
                 return hit
-    if len(words) > 3 and words[0] == "for" and words[2] == "in":  # `for d in a b; do rm -rf "$d"; done`: $d passa a valer cada item
-        env[words[1]] = [tilde(x) for w in words[3:] for x in expand(w, cwds[0], env)]
-        return None
     ws = peel(words, env)
     if not ws:
+        return None
+    if len(ws) > 3 and ws[0] == "for" and ws[2] == "in":  # `for d in a b; do rm -rf "$d"; done` (e `time for …`): $d passa a valer cada item
+        env[ws[1]] = [tilde(x) for w in ws[3:] for x in expand(w, cwds[0], env)]
         return None
     if re.search(r"[$`*?\[]", ws[0]) and ws[0] not in ("[", "[["):  # verbo que sai de variável, substituição ou curinga (`$R -rf x`, `$(echo rm) -rf x`, `/bin/r? -rf x`)
         v = expand(ws[0], cwds[0], env)
@@ -542,7 +551,7 @@ def one(ws: list, cwds: list, depth: int, env: dict, feed: list, app=None):
                 hit = scan_bash(a, cwds, depth + 1, env) if RM_TEXT.search(a) and re.search(r"\s", a.strip()) else None
                 if hit:
                     return hit
-            return check(ops, rec, not rec, cwds, env)
+            return check(ops, rec, () if rec else ("",), cwds, env)
     verb, args = os.path.basename(ws[0]), ws[1:]
     if verb in ("export", "declare", "typeset", "local", "readonly"):  # `export D=x`: vale para os comandos seguintes
         for a in args:
@@ -578,7 +587,7 @@ def one(ws: list, cwds: list, depth: int, env: dict, feed: list, app=None):
                 if hit:
                     return hit
         # filtro de nome só vale se filtra de verdade (narrow) e nada o anula: `-o`, `!`, `-not` fazem o -delete valer para o que o filtro NÃO casa
-        sel = not ({"!", "-not", "-o", "-or"} & set(expr)) and any(t in SELECT and x + 1 < len(expr) and narrow(t, expr[x + 1]) for x, t in enumerate(expr))
+        sel = () if {"!", "-not", "-o", "-or"} & set(expr) else tuple(expr[x + 1] for x, t in enumerate(expr) if t in SELECT and x + 1 < len(expr) and narrow(t, expr[x + 1]))
         return check(roots, True, sel, cwds, env) if rmish else None
     shellish = verb in SHELLS or verb in ("eval", "source", ".")
     if shellish or INTERP.fullmatch(verb):
@@ -615,8 +624,10 @@ def one(ws: list, cwds: list, depth: int, env: dict, feed: list, app=None):
 
 def decide(inp: dict):
     """None = liberado; (regra, alvo, operação) = bloqueado."""
+    global DEADLINE
     if inp.get("tool_name") != "Bash":
         return None
+    DEADLINE = time.monotonic() + LIMIT
     cmd, cwd = str((inp.get("tool_input") or {}).get("command") or ""), inp.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR")
     if len(cmd) > MAX_CMD:  # não dá para conferir e a busca de texto não prova nada (`r''m`, `$'\x72m'`): bloqueado
         return "rm.too-big", cmd[:60], "comando Bash"

@@ -89,12 +89,14 @@ P python3 -c "import subprocess; subprocess.run(['ls','@H/gt-remote'])" ‖ P py
 B cd @S/work; cd @S/work/a; cd @S/work/b; cd @S/srepo; cd @S/srepo/src; cd @S/many; cd @H/proj/src; cd @H/proj/build; cd @H; rm -rf gt-remote ‖ B python3 -c "import os; os.system('rm -rf ' + '@H/gt-remote')" ‖ B npx -c 'rm -rf ~/gt-remote'
 B flock /tmp/l -c 'rm -rf ~/gt-remote' ‖ B $(echo rm) --r ~/gt-remote ‖ B $(echo rm) --rec ~/gt-remote ‖ B $X ~/.dolt-data/ga ‖ P $X ~/proj ‖ B $SHELL -c 'rm -rf ~/gt-remote' ‖ B find @H/proj -name '*.pyc' -o -type f -delete
 B find @H/proj ! -name '*.pyc' -delete ‖ B find @H/proj -not -name '*.o' -delete ‖ B find @H/proj -regex '.*[a-z].*' -delete ‖ P find @H/proj -regex '.*\.pyc' -delete ‖ P find @H/proj -name x -delete ‖ B export D=~/.dolt-data/ga; unlink $D
-B declare D=~/.dolt-data/ga; shred $D ‖ P export D=@S/work; rm -rf $D ‖ B rm -rf /zzroot ‖ B:z rm -rf /zzh/a ‖ B:z rm -rf /zzh/a/b ‖ B:z rm -rf /zzh/a/b/c ‖ P:z rm -rf /zzh/a/b/c/d ‖ B:z rm -rf ~ ‖ B:z rm -rf ~/x
+B declare D=~/.dolt-data/ga; shred $D ‖ P export D=@S/work; rm -rf $D ‖ B time for f in @H/gt/rig/.gc-worktrees/./w; do shred "$f"; done ‖ P rm -f /tmp/claude-1000/mt.out ‖ B rm -rf /tmp/claude-1000/mt.out ‖ B rm -rf @S/*/*/*/x
+B find @H/proj -name HEAD -delete ‖ B find @H/gt-remote/git -name zzz -delete ‖ B find @H/proj -name '*.lock' -delete ‖ B find @H/proj -path '*/objects/*' -delete ‖ B find @H/proj -name 'pack*' -delete ‖ P find @H/proj/build -name HEAD -delete ‖ P find @H/proj -name '*.pyc' -delete
+B python3 -c "import pathlib; pathlib.Path('@H/gt-remote').rmdir()" ‖ B node -e "require('fs').unlinkSync('@H/.dolt-data/ga/x')" ‖ P python3 -c "import shutil; print(shutil.rmtree.__doc__); x='@H/gt-remote'" ‖ P python3 -c "l=[1]; l.remove(1); open('@H/gt-remote/x')" ‖ B rm -rf /zzroot ‖ B:z rm -rf /zzh/a ‖ B:z rm -rf /zzh/a/b ‖ B:z rm -rf /zzh/a/b/c ‖ P:z rm -rf /zzh/a/b/c/d ‖ B:z rm -rf ~ ‖ B:z rm -rf ~/x
 P for d in @S/work/a; do rm -rf "$d"; done ‖ P R=ls; $R -la ~ ‖ B rm -f @H/proj/.gi*/HEAD ‖ B rimraf ~/gt ‖ B popd; rm -rf node_modules ‖ B find @H/proj -regex '.*\w.*' -delete ‖ B rm -f @H/proj/.gi{t,x}/HEAD
 """
 X = [("B", "bash <<'EOF'\nrm -rf ~/gt-remote\nEOF"), ("B", "cat <<'EOF' | sh\nrm -rf ~/gt-remote\nEOF"), ("B", "python3 - <<'EOF'\nimport shutil\nshutil.rmtree('@H/gt-remote')\nEOF"), ("B", "echo \"import shutil; shutil.rmtree('@H/gt-remote')\" | python3 -"),
      ("P", "git commit -m \"$(cat <<'EOF'\nfix: stop using rm -rf ~/gt-remote\nEOF\n)\""), ("P", "cat <<'EOF'\nrm -rf ~\nEOF"), ("P", ""), ("P", "   "), ("B", "# c\nrm -rf ~/gt-remote"), ("B", "x=1\nrm -rf ~/gt-remote"),
-     ("B", nest(8)), ("P", nest(3)), ("B", "echo " + "x" * 300000), ("P", "echo " + "x" * 60000), ("B", "FOO=1 BAR=2 rm -rf ~/gt-remote")]
+     ("P", "python3 - <<'EOF'\np = 'tests/foo.py'  # remove the old text, delete nothing\ns = open(p).read().replace('old', 'new')\nEOF"), ("B", nest(8)), ("P", nest(3)), ("B", "echo " + "x" * 300000), ("P", "echo " + "x" * 60000), ("B", "FOO=1 BAR=2 rm -rf ~/gt-remote")]
 TABLE = []
 for line in DSL.strip().split("\n"):
     for part in line.split(" ‖ "):
@@ -119,7 +121,7 @@ def run_table(m):
 
 
 def ceilings(m):
-    """Os dois tetos (GLOB_MAX, LS_BUDGET) só aparecem baixando-os: o módulo `m` é recarregado para não deixar o valor baixo para trás."""
+    """Os três tetos (GLOB_MAX, LS_BUDGET, LIMIT) só aparecem baixando-os: o módulo `m` é recarregado para não deixar o valor baixo para trás."""
     c, out = load(m.__file__), []
     c.GLOB_MAX = 3
     if not c.decide({"tool_name": "Bash", "tool_input": {"command": f"rm -rf {S}/many/*"}, "cwd": CWD}):
@@ -127,6 +129,9 @@ def ceilings(m):
     c.GLOB_MAX, c.LS_BUDGET = 20000, 0
     if not c.decide({"tool_name": "Bash", "tool_input": {"command": f"rm -rf {H}/proj/build"}, "cwd": CWD}):
         out.append("orçamento LS_BUDGET")
+    c.LS_BUDGET, c.LIMIT = 20000, -1
+    if not c.decide({"tool_name": "Bash", "tool_input": {"command": f"rm -rf {S}/work"}, "cwd": CWD}):
+        out.append("prazo LIMIT")
     return out
 
 
@@ -158,7 +163,7 @@ crash = f"{H}/crash.py"
 open(crash, "w").write(SRC.replace("def decide(inp: dict):", "def decide(inp: dict):\n    raise RuntimeError('boom')", 1))
 rc, err = e2e(cmd="ls", guard=crash)
 check("ponta a ponta: o guarda falhando num pedido Bash = bloqueado (nunca liberado)", rc == 2 and "o guarda falhou" in err, err[:120])
-check("tetos: curinga além de GLOB_MAX vale como alvo desconhecido e pasta além de LS_BUDGET como se guardasse repo (com os tetos de verdade os mesmos comandos passam: linhas da tabela)", not ceilings(m), str(ceilings(m)))
+check("tetos: curinga além de GLOB_MAX = alvo desconhecido, pasta além de LS_BUDGET = guarda repo, prazo LIMIT estourado = bloqueado (com os tetos de verdade os mesmos comandos passam: linhas da tabela)", not ceilings(m), str(ceilings(m)))
 
 # --- fuzzer contra o bash REAL: rm/unlink/rmdir/shred/find são FALSOS (primeiros no PATH), gravam verbo, cwd e argv exatamente como o shell os entregou ---
 LOG = f"{H}/log.bin"
@@ -212,12 +217,14 @@ def touched(cmd):
             ops, sel = [a for a in args if not a.startswith("-")], False
             rec_ = verb == "rm" and any((a[:1] == "-" and a[:2] != "--" and set(a[1:]) & set("rR")) or a.startswith("--rec") for a in args)
         for a in ops:
+            if not a or (re.search(r"[*?\[]", a) and not os.path.lexists(os.path.join(cwd, a))):  # `rm ""` (wrapper que engole `D=x;`) e texto com curinga que não existe: o rm não apaga nada
+                continue
             full = os.path.join(cwd, a)
             hit = hit or verdict(os.path.normpath(full), rec_, sel) or verdict(os.path.realpath(full), rec_, sel)
     return hit, rc
 
 
-rnd = random.Random(7)
+rnd = random.Random(int(os.environ.get("RMTG_SEED", "7")))
 BAD = ["proj/.git/config", "proj/.git/HEAD", "proj", "proj2", ".dolt-data/ga", ".dolt-data/ga/.dolt/noms/manifest", ".beads/b", "gt-remote", "gt-remote/keys/gt_mirror", "gt-remote/git", "gt-remote/git/gascity",
        "gt-remote/git/gascity/wt/s1", "gt-remote/big", "gt/rig/crew/bob/x.py", "gt/rig/.gc-worktrees/w", "@S/lnkgit"]
 OK = ["proj/src/a.py", "proj/build", "proj/build/x.o", "proj/node_modules", "notes.txt", ".cache/pip/w", "proj/.git/index.lock", "gt-remote/git/gascity/wt/s1/src", "@S/work", "@S/work/a", "@S/srepo", "@S/many/f1", "proj/src/m.pyc"]
@@ -280,18 +287,18 @@ MUT = [("componente negado", "if c in DENY_COMP and not (", "if False and not ("
        ("tmux", 'rest[0].startswith("tmux-")', "False"), ("pasta de sistema", "if low[0] in SYSTEM:", "if False:"), ("raiz de repo", 'return "rm.repo-root" if holds(f) else None', "return None"),
        ("repo a 2 níveis", "any(real(pb) and marked(pb, git) for pb in (os.path.join(pa, b) for b in kids(pa)))", "False"), ("repo bare", 'os.path.isfile(j("HEAD"))', "False"),
        ("estouro do orçamento", "except OverflowError:\n        return True", "except OverflowError:\n        return False"), ("curinga que esvazia", "if pat and MASS.fullmatch(", "if False and MASS.fullmatch("),
-       ("find: filtro de nome", "return check(roots, True, sel, cwds, env) if rmish else None", "return check(roots, True, True, cwds, env) if rmish else None"), ("find: filtro trivial", 'return bool(re.search(r"[A-Za-z0-9]", s))', "return True"), ("find: -o anula o filtro", '{"!", "-not", "-o", "-or"} & set(expr)', "set()"), ("find: regex", 'if test in ("-regex", "-iregex") else s', "if False else s"), ("find: só dado ignora .git", 'if git or n != ".git"', "if True"),
-       ("find: dado sob raiz seletiva", 'return "rm.repo-root" if holds(f, False) else None', "return None"), ("alvo desconhecido", 'return "rm.target-unknown", raw.replace(UNK, "?")', "continue"),
+       ("find: filtro de nome", "return check(roots, True, sel, cwds, env) if rmish else None", "return check(roots, True, (\"\",), cwds, env) if rmish else None"), ("find: filtro trivial", 'return bool(re.search(r"[A-Za-z0-9]", s))', "return True"), ("find: -o anula o filtro", '{"!", "-not", "-o", "-or"} & set(expr)', "set()"), ("find: regex", 'if test in ("-regex", "-iregex") else s', "if False else s"), ("find: só dado ignora .git", 'if git or n != ".git"', "if True"),
+       ("find: dado sob raiz seletiva", 'return "rm.repo-root" if holds(f, False) or', 'return "rm.repo-root" if False or'), ("alvo desconhecido", 'return "rm.target-unknown", raw.replace(UNK, "?")', "continue"),
        ("link simbólico", "for f in dict.fromkeys((os.path.normpath(p), os.path.realpath(p))):", "for f in (os.path.normpath(p),):"), ("flags agrupadas", 'rec = rec or bool(set(a[1:]) & {"r", "R"})', 'rec = rec or a[1:] == "r"'),
        ("opção longa por prefixo", 'rec = rec or (bool(n) and "recursive".startswith(n))', 'rec = rec or n == "recursive"'), ("timeout DURATION", "ws = ws[npos:]", "ws = ws"),
        ("sudo -u valor", '"sudo": ("-u -g', '"sudo": ("-g'), ("bash -c", 'r"-[a-zA-Z]*[ceEpr]|', 'r"-[a-zA-Z]*[eEpr]|'), ("heredoc para shell", "if any(w in SHELLS for w in recv) else None", "if False else None"),
-       ("argv de subprocess", "for m in ARGV.finditer(code):", "for m in []:"), ("literal de caminho inline", "elif deletes and lit", "elif False and lit"), ("$( )", "for body in substitutions(w):", "for body in []:"),
-       ("cd só com &&", 'here = new if t == "&&" else merged if len(merged) <= 8 else merged[:7] + [None]', "here = new"), ("teto do glob", '([(None, None)] if len(hits) > GLOB_MAX else [])', "[]"), ("for", 'if len(words) > 3 and words[0] == "for"', "if False and words[0] == 'for'"),
+       ("argv de subprocess", "for m in ARGV.finditer(code):", "for m in []:"), ("inline: literal direto numa API de remoção", "[a or b for a, b in DELCALL.findall(code)]", "[]"), ("inline: citou rm, caminhos valem", "if cites and x", "if False and x"), ("$( )", "for body in substitutions(w):", "for body in []:"),
+       ("cd só com &&", 'here = new if t == "&&" else merged if len(merged) <= 8 else merged[:7] + [None]', "here = new"), ("teto do glob", '([(None, None)] if len(hits) > GLOB_MAX else [])', "[]"), ("for depois do peel", 'if len(ws) > 3 and ws[0] == "for" and ws[2] == "in":', "if False:"),
        ("xargs", 'if verb == "xargs":', "if False:"), ("find", 'if verb == "find":', "if False:"), ("env -S", '(b == "env" and key in ("-S", "--split-string"))', "False"), ("npx -c", '(b == "npx" and key in ("-c", "--call"))', "False"), ("flock -c", 'if b == "flock" and ws[:1] in', 'if False and ws[:1] in'),
-       ("verbo por variável", 'if len(v) == 1 and UNK not in v[0] and not re.search(r"[*?\\[]", v[0]):', "if False:"), ("verbo desconhecido + flag recursiva", "return check(ops, rec, not rec, cwds, env)", "pass"), ("verbo desconhecido sem flag: regras absolutas", "return check(ops, rec, not rec, cwds, env)", "return check(ops, rec, False, cwds, env)"), ("export", 'if verb in ("export", "declare", "typeset", "local", "readonly"):', "if False:"), ("cd nunca descarta o mais novo", "merged if len(merged) <= 8 else merged[:7] + [None]", "merged[:4]"), ("inline: verbo de remoção em qualquer parte", "deletes = bool(DEL.search(code) or RM_TEXT.search(code))", "deletes = bool(DEL.search(code))"),
+       ("verbo por variável", 'if len(v) == 1 and UNK not in v[0] and not re.search(r"[*?\\[]", v[0]):', "if False:"), ("verbo desconhecido + flag recursiva", 'return check(ops, rec, () if rec else ("",), cwds, env)', "pass"), ("verbo desconhecido sem flag: regras absolutas", 'return check(ops, rec, () if rec else ("",), cwds, env)', "return check(ops, rec, False, cwds, env)"), ("export", 'if verb in ("export", "declare", "typeset", "local", "readonly"):', "if False:"), ("cd nunca descarta o mais novo", "merged if len(merged) <= 8 else merged[:7] + [None]", "merged[:4]"), ("curinga fundo", 'for c in p.split("/")) > 2:', 'for c in p.split("/")) > 200:'), ("prazo", "if time.monotonic() > DEADLINE:", "if False:"), ("pasta compartilhada: arquivo solto", "dir_ = rec or os.path.isdir(f)", "dir_ = True"), ("find: nomes internos do git", "(holds(f) and any(GITNAMES.search(p) for p in selective))", "False"),
        ("<( ) no lexer", 'elif c in "<>" and nx == "(":', "elif False:"), ("saída de <( ) é programa", "for w in code_of(lex(body)[0]):", "for w in []:"), ("echo|bash junta args", '[" ".join(ws[1:])] if ws and', '[] if ws and'),
        ("tamanho", "if len(cmd) > MAX_CMD:", "if False:"), ("profundidade", "if depth > 6:", "if depth > 600:"), ("tilde", 'return home() + s[1:] if s == "~" or s.startswith("~/")', 'return s if s == "~" or s.startswith("~/")'),
-       ("glob", "hits = sorted(glob.glob(p))", "hits = []"), ("chave {a,b}", "bs = [t] if UNK in t else braces(t)", "bs = [t]"), ("teto da chave", "len(alts) <= 16", "len(alts) <= 1600"),
+       ("glob", "hits = sorted(itertools.islice(glob.iglob(p), GLOB_MAX + 1))", "hits = []"), ("chave {a,b}", "bs = [t] if UNK in t else braces(t)", "bs = [t]"), ("teto da chave", "len(alts) <= 16", "len(alts) <= 1600"),
        ("caixa", 'low = [unicodedata.normalize("NFC", x).casefold() for x in parts]', "low = list(parts)"), ("HOME vence scratch", "rel, relp = (low[k:], parts[k:]) if k is not None else (None, None)", "rel, relp = None, None"),
        ("node_modules", "any(c in ALLOW_COMP for c in parts)", "False"), (".cache", "any(relp[:len(a)] == list(a) for a in ALLOW_HOME)", "False"), ("pyc", '(f.endswith(".pyc") and not os.path.isdir(f))', "False"),
        ("rimraf", 'or verb == "rimraf"', "or False"), ("popd", 'if os.path.basename(ws[0]) == "popd":', "if False:"), ("lançador opaco", "if verb in OPAQUE:", "if False:"), ("source e .", 'verb in ("eval", "source", ".")', 'verb == "eval"')]
