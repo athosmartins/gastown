@@ -11,7 +11,8 @@ PARA QUE SERVE
   `--dangerously-skip-permissions`: um hook que sai com 2 bloqueia a chamada em qualquer modo (medido no servidor, ver o runbook).
 COMO DECIDE (sei que pode / sei que não pode / não sei, e o último NÃO vira "pode"): território = $RCG_ROOT, senão ~/gt-remote/git; clone próprio = o ancestral com `.git`
   de $CLAUDE_PROJECT_DIR. A regra inteira (onde o git pode estar, alvo, "não sei", heredoc, contexto do aninhado): docs/runbooks/hetzner-hardening.md, "Como o guarda decide".
-CÓDIGOS: 0 liberado · 2 bloqueado. `--selfcheck [settings.json [pasta-do-projeto…]]`: 0 se o guarda decide como deveria numa pasta de teste E (com o settings) todo
+CÓDIGOS: 0 liberado · 2 bloqueado — também o pedido que o guarda não consegue analisar em STEP_LIMIT passos ou TIME_LIMIT segundos (hook estourado no Claude Code, 600 s, NÃO bloqueia: a
+  chamada seguiria sem conferência; o guarda se corta antes e fecha, ver Budget). `--selfcheck [settings.json [pasta-do-projeto…]]`: 0 se o guarda decide como deveria numa pasta de teste E (com o settings) todo
   PreToolUse de Bash/Edit/Write/MultiEdit/NotebookEdit é EXATAMENTE `python3 -I <este arquivo> || exit 2`, sem campo que mude QUANDO dispara (só type/command/timeout) e
   sem `disableAllHooks` nele nem em <pasta>/.claude/settings[.local].json; 1 caso contrário (o provider confere antes de abrir sessão real). Edit/Write em ~/.claude/hooks/** e ~/.claude/settings*.json bloqueiam.
 LIMITES (é trava contra engano, não sandbox): a lista do que NÃO vejo e dos falsos positivos está no runbook, seção "Como o guarda decide".
@@ -22,6 +23,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import sys
 import tempfile
 
@@ -78,6 +80,7 @@ DEST = {"worktree", "init", "clone", "checkout-index", "submodule", "archive", "
 PATHOPT = {"--output", "--prefix", "--separate-git-dir", "--lost-found", "--file", "--template"}  # em QUALQUER subcomando: a opção cujo valor é um caminho onde o git escreve
 URL = re.compile(r"\w+://")
 CONT = re.compile(r"(?<!\\)((?:\\\\)*)\\\n")  # barra + newline com número ÍMPAR de barras: continuação de linha (com número par a última barra é a barra escapada)
+STEP_LIMIT, TIME_LIMIT, WORK = 50000, 5.0, [0]  # teto por pedido: passos de conferência (ver tick) e segundos de relógio (ver main); WORK = passos gastos até agora
 
 
 def inside(p: str, root: str) -> bool:
@@ -484,6 +487,17 @@ def git_hit(seg: list, env: dict, cwd, terr: str, own):
     return None
 
 
+class Budget(Exception):
+    """Estourou o teto de passos ou de segundos: o pedido NÃO foi conferido, então não passa — main() bloqueia. O guarda se corta ANTES do prazo do hook no Claude Code (600 s), porque hook estourado não bloqueia: a chamada seguiria sem conferência."""
+
+
+def tick() -> None:
+    """Uma unidade de trabalho: cada trecho que one() confere (o comando aninhado também passa por ele). Passou de STEP_LIMIT → Budget."""
+    WORK[0] += 1
+    if WORK[0] > STEP_LIMIT:
+        raise Budget(f"mais de {STEP_LIMIT} passos de conferência")
+
+
 def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
     """O 1º (alvo, operação) de escrita contra clone alheio, ou None (alvo None = não resolvi). env/funcs = contexto de quem chamou: o aninhado nunca começa do zero."""
     if depth > 3:
@@ -502,6 +516,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
         return None
 
     def one(seg: list, blind: bool = False, prev: str = "", term: str = ";", ext: bool = False):  # ext = trecho que um programa roda (find -exec): cd ali não muda o shell; prev/term = o operador antes e depois do trecho: dizem se um cd rodou com certeza
+        tick()
         r = inner(seg)
         if r:
             return r
@@ -518,7 +533,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
             elif not st["fdepth"] and term == "&":
                 st["cwd"] = None
             return None
-        if seg[:1] == ["{"] and st.pop("func", False) or seg[:1] == ["function"] and seg[2:3] == ["{"]:
+        if not st.get("calling") and (seg[:1] == ["{"] and st.pop("func", False) or seg[:1] == ["function"] and seg[2:3] == ["{"]):  # nunca ao REEXECUTAR um corpo guardado (calling): o `{` guardado ali reabria a definição com o nome velho, desviava o resto do corpo para a lista errada e o laço de chamada percorria essa lista sem fim (ga-tih62nv)
             if seg[0] == "function":
                 st["fname"], seg = seg[1], seg[2:]
             st["fdepth"], st["funcs"] = 1, st.get("funcs", {})
@@ -629,6 +644,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
             seg.append(tok)
     if st.get("fdepth"):  # o fim da função não fecha (uma `{` entre aspas desconta a conta): a chamada pode ter caído no corpo — confiro o corpo como se rodasse, em diretório "não sei"
         st["fdepth"] = 0
+        st.setdefault("calling", set()).add(st["fname"])  # este corpo também é reexecutado: conferido, não relido como definição (ver o `{` em one)
         for s, p, t in st["funcs"].get(st["fname"], []):
             r = one(list(s), True, p, t)
             if r:
@@ -637,7 +653,8 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
 
 
 def decide(inp: dict, terr: str, proj):
-    """None = liberado; (alvo, operação) = bloqueado."""
+    """None = liberado; (alvo, operação) = bloqueado. Budget (passos demais) sobe para main(): sem veredito não há "liberado"."""
+    WORK[0] = 0
     tool, ti, cwd = inp.get("tool_name"), inp.get("tool_input") or {}, inp.get("cwd") or None
     own = own_clone(proj, terr)
     if tool == "Bash":
@@ -705,9 +722,32 @@ def selfcheck(args: list) -> int:
     return 0 if ok else 1
 
 
+def expired(signum, frame):
+    raise Budget(f"mais de {TIME_LIMIT:g} s")
+
+
+def late(why: str) -> str:
+    return ("[HOOK BLOCK: remote-clone-guard] NÃO É CANCELAMENTO DO USUÁRIO — política automática de isolamento entre sessões.\n"
+            f"BLOQUEADO: não consegui analisar este pedido a tempo ({why}), e o que o guarda não consegue conferir não passa.\n"
+            "Reescreva em pedaços menores: um comando por chamada, sem definir função nem aninhar $( ), case ou eval no mesmo pedido. "
+            "Para um script longo, grave o arquivo com a ferramenta Write e rode-o pelo caminho.\n")
+
+
 def main(argv: list) -> int:
     if argv[1:2] == ["--selfcheck"]:
         return selfcheck(argv[2:])
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, TIME_LIMIT)  # armado antes de ler o stdin: o prazo do hook no Claude Code é 600 s e, estourado, a chamada SEGUE sem conferência
+    try:
+        return judge()
+    except Budget as e:  # falhou/estourou ≠ liberado: sem veredito o pedido é bloqueado, com a mensagem de como reescrever
+        print(late(str(e)), file=sys.stderr)
+        return 2
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+
+
+def judge() -> int:
     raw = sys.stdin.read()
     terr = os.path.realpath(os.environ.get("RCG_ROOT") or os.path.expanduser("~/gt-remote/git"))
     proj = os.environ.get("CLAUDE_PROJECT_DIR")
@@ -715,6 +755,8 @@ def main(argv: list) -> int:
     try:
         inp = json.loads(raw)
         hit = decide(inp, terr, proj)
+    except Budget:
+        raise  # a mensagem própria é a de main()
     except Exception as e:  # noqa: BLE001 — falha do guarda não pode virar "liberado" quando o pedido pode tocar git ou arquivo
         if not (isinstance(inp, dict) and inp.get("tool_name") in {"Bash", *TOOLS_FILE}) and not re.search(r"git|file_path|notebook_path", raw):
             return 0  # JSON lido e é Bash/Edit/Write: bloqueia mesmo sem a palavra "git" no texto (`g''it` não a tem); sem ser JSON e sem citar, libera
