@@ -992,13 +992,36 @@ class ExtRunOnceTests(unittest.TestCase):
         self.assertIn("EXT_RECYCLE_CAPPED pid=%d" % child.pid, self.log_text(cfg))
 
     def test_a_recycle_older_than_an_hour_no_longer_counts(self):
+        """Catches: the extension path counting recycles that are more than an hour old, so the hourly cap
+        never lets go. The old entry is written AFTER the first run: run_once prunes the list when it saves,
+        so an entry seeded before run 1 is already gone by the run that decides, and the test would pass
+        even if the extension path itself never expired anything."""
         child = self.spawn("--type=renderer", "--extension-process")
         cfg = self.cfg(ext_max_recycle_hour=1)
-        now = time.time()
-        pathlib.Path(cfg.state_path).write_text(json.dumps(
-            {"pids": {}, "closes": [], "last_heartbeat": 0, "ext": {}, "ext_recycles": [now - 3700]}))
-        self.two_runs(cfg, child)
+        self.assertEqual(self.run_guard(cfg, "--extension-process", child), 0)
+        state = json.loads(pathlib.Path(cfg.state_path).read_text())
+        state["ext_recycles"] = [time.time() - 3700]
+        pathlib.Path(cfg.state_path).write_text(json.dumps(state))
+        time.sleep(self.GRACE + 0.3)
+        self.assertEqual(self.run_guard(cfg, "--extension-process", child), 0)
         self.assertEqual(child.wait(timeout=15), -signal.SIGTERM)
+
+    def test_a_reading_that_failed_is_not_a_zero_and_leaves_no_history(self):
+        """Catches: a footprint that could not be read being turned into 0 MB. The ceiling is set to 0 on the
+        object (the env path refuses 0) so that a made-up '0 MB' would count as over it: the process would be
+        signalled on a number nobody measured. With any real ceiling the same collapse still leaves an invented
+        entry in the saved history, which is the second assertion."""
+        child = self.spawn("--type=renderer", "--extension-process")
+        cfg = self.cfg()
+        cfg.ext_ceiling_mb = 0.0
+        with mock.patch.object(G, "read_proc", return_value=None):
+            self.two_runs(cfg, child)
+        self.assertIsNone(child.poll(), "a pid whose footprint could not be read must never be signalled")
+        t = self.log_text(cfg)
+        self.assertNotIn("EXT_HEAVY", t)
+        self.assertNotIn("RECYCLING_EXT", t)
+        self.assertNotIn(str(child.pid), json.loads(pathlib.Path(cfg.state_path).read_text())["ext"])
+        self.assertEqual(json.loads(pathlib.Path(cfg.status_path).read_text())["ext_heavy"], 0)
 
     def test_a_renderer_under_the_ceiling_is_left_alone(self):
         child = self.spawn("--type=renderer", "--extension-process")
