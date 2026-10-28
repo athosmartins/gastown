@@ -47,6 +47,17 @@
 # Against the actual pre-fix ga-zkaoe script (no reclaim-count handling at
 # all), scenarios 7 and 8 both fail — confirmed the same way.
 #
+#   9. STALE-RECLAIM1 (ga-iu0fvlo): the FIRST reclaim after a bead already carries
+#      pilot:reclaim-count:1 — the old label is removed and :2 is added. Scenario 7
+#      (count 2) cannot tell `-gt 0` from `-gt 1` (2 passes both); count 1 is the
+#      edge. An embedded mutant (`-gt 0` -> `-gt 1`) must FAIL scenario 9.
+#
+# EQUIVALENT (ga-iu0fvlo; 825d7d2791 08ba2503b4 09f520a343 d4f03dc13b f51fd9aafb 288e1a3742 — the six
+# `... -q 2>/dev/null || true` lines flipped to `&& true`): the script has no `set -e` and nobody reads the
+# rc of those removal/add calls (the post-state is VERIFIED from a fresh `bd show` further down, which is
+# the whole point of the `|| true`), so `|| true` and `&& true` leave the same state and the same exit code;
+# there is no scenario that sees the difference.
+#
 # Run:  bash packs/town-deltas/assets/pilot-manual-reclaim.selftest.sh
 set -u
 
@@ -99,6 +110,14 @@ case "$sub" in
         else
           echo '[{"id":"'"$1"'","status":"open","labels":["pilot:reclaim-count:3"],"metadata":{}}]'
         fi ;;
+      stale-reclaim1)
+        # ga-iu0fvlo: the edge of `[ count -gt 0 ]` — a bead carrying exactly
+        # pilot:reclaim-count:1 must still have that old label removed.
+        if [ "$_N" -eq 1 ]; then
+          echo '[{"id":"'"$1"'","status":"open","labels":["pilot:dispatched","pilot:dispatching","story:in-flight","pilot:reclaim-count:1"],"metadata":{"pilot.dispatched_at":"123"}}]'
+        else
+          echo '[{"id":"'"$1"'","status":"open","labels":["pilot:reclaim-count:2"],"metadata":{}}]'
+        fi ;;
       reclaim-count-not-confirmed)
         # ga-zkaoe: the OTHER 3 markers confirm cleared on the 2nd read, but
         # pilot:reclaim-count:1 is silently absent from that same read —
@@ -148,9 +167,9 @@ EOF
 chmod +x "$BINS"/*
 sandbox_path_init "$WORK" jq || exit 2   # jq: the script's marker check; bd is the stub above
 
-run_script() {
+run_script() {   # $1 = cenário · $2 = script sob teste (padrão: o real; os mutantes passam uma cópia frouxa)
   rm -f "${MUT}.showcount"
-  PMR_SCENARIO="$1" PATH="$SANDBOX_PATH" bash "$SCRIPT" "gt-testbead" >"$WORK/out.log" 2>"$WORK/err.log"
+  PMR_SCENARIO="$1" PATH="$SANDBOX_PATH" bash "${2:-$SCRIPT}" "gt-testbead" >"$WORK/out.log" 2>"$WORK/err.log"
   echo $?
 }
 
@@ -238,6 +257,36 @@ rc=$(run_script reclaim-count-not-confirmed)
 ck "RECLAIM-COUNT-NOT-CONFIRMED: exit code 1 (does not silently succeed)" 1 "$rc"
 ck "RECLAIM-COUNT-NOT-CONFIRMED: does NOT claim markers cleared" 0 "$(grep -qc 'markers cleared' "$WORK/out.log" >/dev/null 2>&1 && echo 1 || echo 0)"
 ck "RECLAIM-COUNT-NOT-CONFIRMED: reports the unconfirmed label" 1 "$(grep -qc 'pilot:reclaim-count:1' "$WORK/err.log" >/dev/null 2>&1 && echo 1 || echo 0)"
+
+# STALE-RECLAIM1 (ga-iu0fvlo): exactly pilot:reclaim-count:1 on the bead -> that old label is removed and :2 is
+# added. Count 2 (above) passes `-gt 0` and `-gt 1` alike; count 1 is the edge only the real guard crosses.
+sc_reclaim1() {   # $1 = script sob teste; deixa RC1 · R1_REMOVE · R1_ADD (0/1) para quem chamou
+  : >"$MUT"; RC1=$(run_script stale-reclaim1 "$1")
+  R1_REMOVE=0; grep -q 'MUT label remove gt-testbead pilot:reclaim-count:1' "$MUT" && R1_REMOVE=1   # log ausente/vazio -> 0 (reprova), nunca passa
+  R1_ADD=0;    grep -q 'MUT label add gt-testbead pilot:reclaim-count:2' "$MUT" && R1_ADD=1
+}
+sc_reclaim1 "$SCRIPT"
+ck "STALE-RECLAIM1: exit code 0" 0 "$RC1"
+ck "STALE-RECLAIM1: removes old pilot:reclaim-count:1" 1 "$R1_REMOVE"
+ck "STALE-RECLAIM1: adds pilot:reclaim-count:2" 1 "$R1_ADD"
+
+# Mutants: one loose edit of the script, STALE-RECLAIM1 must FAIL (the replace must hit exactly once, or the mutant is void)
+pmr_mutant() {   # nome · trecho original · trecho frouxo
+  local name=$1 old=$2 new=$3 got
+  mkdir -p "$WORK/mut"
+  if ! python3 - "$SCRIPT" "$old" "$new" >"$WORK/mut/pilot-manual-reclaim.sh" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+if src.count(sys.argv[2]) != 1:
+    sys.exit(3)
+sys.stdout.write(src.replace(sys.argv[2], sys.argv[3]))
+PY
+  then ck "MUTANTE $name: o trecho original aparece exatamente uma vez no script (o script mudou?)" 1 0; return; fi
+  sc_reclaim1 "$WORK/mut/pilot-manual-reclaim.sh"
+  got=0; [ "$RC1" = 0 ] && [ "$R1_REMOVE" = 1 ] && [ "$R1_ADD" = 1 ] && got=1   # 1 = o mutante passou por tudo = sobreviveu
+  ck "MUTANTE $name: STALE-RECLAIM1 reprova (o mutante não sobrevive)" 0 "$got"
+}
+pmr_mutant limiar-do-rotulo-velho '[ "$CUR_RECLAIM_COUNT" -gt 0 ]' '[ "$CUR_RECLAIM_COUNT" -gt 1 ]'
 
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
