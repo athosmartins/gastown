@@ -183,6 +183,22 @@ expect '.results.some_future_result' '1' "A2: an unknown result still shows up B
 expect '.results.rig_native_pool_session_cap_queued' '2' "A2: results is the per-name ground truth (same vocabulary as pilot_dispatch.result)"
 expect '.results | has("")' 'false' "A2: the nameless exit has no results key (it is only in unclassified)"
 
+# A2d — ga-do1ixn.3: a lane:kimi bead the Kimi pass handed to dispatch_one() and that came back WITHOUT a dispatch. kimi_lane_released (the lane only takes an HQ bead with a dog target) and
+# kimi_lane_wait (slot busy, session did not open, notice failed — the bead waits, never the mini) are deliberate waits, like wa_node_pass_released: refused_by_guard, BY NAME, never failed_other
+# (a Pilot-fault tile that lights for every bead waiting its turn). node_rollback_unconfirmed from the same pass is a real fault (the undo could not be read back): it stays in failed_other.
+run_sweep 'k1 1 kimi_lane_released
+k2 1 kimi_lane_wait
+k3 1 node_rollback_unconfirmed
+k4 1
+k5 0 node_ok' >/dev/null 2>&1
+expect '.refused_by_guard' '{"kimi_lane_released":1,"kimi_lane_wait":1}' "A2d: the Kimi pass's two deliberate waits are counted UNDER THEIR NAMES in refused_by_guard (a wait, not a Pilot fault)"
+expect '.failed_other' '1'         "A2d: …and the Kimi pass's node_rollback_unconfirmed (a fault) is the ONLY failed_other"
+expect '.unclassified' '1'         "A2d: a Kimi-pass exit with no name is unclassified (never dropped, never a success)"
+expect '.dispatched' '1'           "A2d: the Kimi pass's dispatch (rc 0) is dispatched"
+expect '.results.kimi_lane_wait' '1' "A2d: kimi_lane_wait shows up BY NAME in results"
+expect '.candidates == (.dispatched + .queued_pool_cap + .queued_global_cap + .spawn_failed + .yielded_priority + ([.refused_by_guard[]] | add // 0) + .failed_other + .unclassified)' 'true' \
+       "A2d: accounting closes with the Kimi pass's outcomes"
+
 # A3 — the buckets add up to candidates: nothing is dropped and nothing is counted twice.
 expect '.candidates == (.dispatched + .queued_pool_cap + .queued_global_cap + .spawn_failed + .yielded_priority + ([.refused_by_guard[]] | add // 0) + .failed_other + .unclassified)' 'true' \
        "A3: candidates == sum of every bucket (accounting closes)"
@@ -304,6 +320,17 @@ grep -q 'NONQUEUE_FAILS=\$((NONQUEUE_FAILS + 1))' <<< "$LANE_FN" \
   && ok "B2: NONQUEUE_FAILS accounting (Step 5 stall gate) is intact" \
   || bad "B2: NONQUEUE_FAILS accounting was lost from dispatch_lane"
 
+# The Kimi pass (ga-do1ixn.3) calls dispatch_one() itself, outside dispatch_lane(): it must note BOTH ends. Only a note on rc 0 (the WA pass's convention) leaves every wait invisible to the sweep event
+# — the bead is a candidate that vanished from `candidates`, and a Kimi slot that is always busy looks like a lane with nothing to do.
+KIMI_FN="$(extract_fn '_pilot_kimi_lane_pass')"
+[ -n "$KIMI_FN" ] || { echo "FATAL: _pilot_kimi_lane_pass() not found" >&2; exit 2; }
+grep -qE '_pilot_sweep_note "\$_kl_id" 0 ' <<< "$KIMI_FN" \
+  && ok "B2: the Kimi pass notes a dispatch_one() success (rc 0)" \
+  || bad "B2: the Kimi pass does not note a successful dispatch_one()"
+grep -qE '_pilot_sweep_note "\$_kl_id" "\$_kl_rc" "\$\{DISPATCH_RESULT:-\}"' <<< "$KIMI_FN" \
+  && ok "B2: the Kimi pass notes a dispatch_one() non-zero exit WITH its DISPATCH_RESULT (kimi_lane_released / kimi_lane_wait / node_rollback_unconfirmed)" \
+  || bad "B2: the Kimi pass does not carry rc and DISPATCH_RESULT into the note for a non-zero dispatch_one() — its waits never reach the pilot_sweep event"
+
 # B3 — emitted once per sweep: after the saturation predicate exists (the event carries it), before the
 # closing 'sweep complete' line, and NOT from inside a lane loop (that would be per-candidate again).
 # EVERY call site counts, indented ones included: an emit inside a lane loop would be per-candidate again.
@@ -324,7 +351,7 @@ fi
 # B4 — drift guard. A new DISPATCH_RESULT literal that is not classified would silently land in
 # failed_other: a BENIGN new state (e.g. another kind of queue) would then read as a Pilot failure on
 # the painel. Adding a result now means classifying it in _pilot_sweep_emit AND listing it here.
-KNOWN_RESULTS=" sling_ok rig_native_ok dry_run rig_native_pool_session_cap_queued rig_native_global_session_cap_queued rig_native_spawn_failed pool_ownership_refuse rig_native_dog_store_blind rig_native_dog_store_migrated rig_native_pool_store_blind rig_native_pool_store_migrated rig_native_pool_target_only rig_dedup_skip rig_assign_failed sling_no_bead_id sling_phantom_bead inflight_unconfirmed rig_native_pool_count_unreadable rig_native_spawn_deferred_slow remerge_branch_lookup_unknown wa_node_unknown ps_node_unknown hq_pool_store_blind pool_store_unknown priority_yield node_ok node_rollback_unconfirmed disk_floor_node_only wa_node_pass_released "
+KNOWN_RESULTS=" sling_ok rig_native_ok dry_run rig_native_pool_session_cap_queued rig_native_global_session_cap_queued rig_native_spawn_failed pool_ownership_refuse rig_native_dog_store_blind rig_native_dog_store_migrated rig_native_pool_store_blind rig_native_pool_store_migrated rig_native_pool_target_only rig_dedup_skip rig_assign_failed sling_no_bead_id sling_phantom_bead inflight_unconfirmed rig_native_pool_count_unreadable rig_native_spawn_deferred_slow remerge_branch_lookup_unknown wa_node_unknown ps_node_unknown hq_pool_store_blind pool_store_unknown priority_yield node_ok node_rollback_unconfirmed disk_floor_node_only wa_node_pass_released kimi_lane_released kimi_lane_wait "
 # (rig_native_pool_count_unreadable, ga-oa004t: the session count could not be READ, so the spawn was not
 #  attempted — a FAULT, deliberately left in failed_other and NOT in a *_queued bucket: a dead `session list`
 #  is not a busy pool, and filing it as saturation would hide it from the Step 5 stall gate.)
@@ -336,6 +363,9 @@ KNOWN_RESULTS=" sling_ok rig_native_ok dry_run rig_native_pool_session_cap_queue
 # (node_ok / node_rollback_unconfirmed, ga-2hd02v.1.14: PILOT_NODE_FIRST=on. node_ok is rc 0 -> "dispatched" (the bead went to a dog-remote alias and the session was nudged). node_rollback_unconfirmed
 #  is rc 1: the node dispatch failed AND the undo could not be read back, so the Pilot dispatched NOTHING and left the claim for the TTL. Deliberately left in failed_other - a FAULT, not a policy:
 #  a guard bucket would hide a bead that may still be assigned to the node while the Pilot cannot tell.)
+# (kimi_lane_released / kimi_lane_wait, ga-do1ixn.3: the Kimi lane pass gave a lane:kimi bead back on purpose — released because the lane only takes an HQ bead with a dog target, or kept waiting
+#  because the Kimi slot was busy / the session did not open / the notice failed. Nothing failed and nothing is a Pilot fault: refused_by_guard, like wa_node_pass_released. node_rollback_unconfirmed from the
+#  same pass is the one real fault there and stays in failed_other, above.)
 # (priority_yield, ga-5fn5p3: a P2..P4 bead CEDED to a P0/P1 waiting behind a full pool. Nothing failed and nothing was
 #  refused by a guard — it is deferred BY POLICY and re-evaluated next sweep — so it has its OWN bucket, yielded_priority:
 #  in failed_other it would read as a Pilot fault, in refused_by_guard as a guard that fired.)
@@ -349,7 +379,7 @@ done
 # would otherwise leave the emitter matching nothing and everything falling into failed_other).
 for _nm in rig_native_pool_session_cap_queued rig_native_global_session_cap_queued rig_native_spawn_failed \
            pool_ownership_refuse rig_native_dog_store_blind rig_native_dog_store_migrated rig_native_pool_target_only rig_dedup_skip \
-           rig_native_spawn_deferred_slow disk_floor_node_only wa_node_pass_released; do
+           rig_native_spawn_deferred_slow disk_floor_node_only wa_node_pass_released kimi_lane_released kimi_lane_wait; do
   if grep -q "DISPATCH_RESULT=\"$_nm\"" "$DISPATCHER" && grep -q "$_nm" <<< "$EMIT_FN"; then
     :
   else

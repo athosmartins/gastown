@@ -3857,13 +3857,32 @@ default_pool_route_for_rig() {
 # rótulo lane:kimi volta de um FAIL para a faixa Kimi — gc.routed_to=kimi-lane, que de propósito não é nome de
 # pool (nenhuma sondagem nem a demanda do engine a pegam; só a passada da faixa Kimi do pilot-dispatcher.sh a
 # despacha, ao kimi-worker-remote). Restaurar gastown.dog a mandaria ao pool de dog do MINI, um pool Claude.
-# Sem o rótulo → a rota que veio, inalterada. Rótulos ilegíveis (vazio) → a rota que veio: o terceiro estado
-# fica com o comportamento de antes, e a passada da faixa Kimi recarimba kimi-lane na varredura seguinte.
+# Sem o rótulo → a rota que veio, inalterada. Rótulos que não se leem (vazio) NÃO chegam aqui como "sem o rótulo":
+# o FAIL os trata antes, com gate_fail_lane_labels (relê sem cache) e, se ainda assim não leu, com aviso e nota no comentário.
 gate_kimi_lane_route() {
   case " ${1:-} " in
     *" lane:kimi "*) printf 'kimi-lane' ;;
     *) printf '%s' "${2:-}" ;;
   esac
+}
+
+# gate_lane_labels_from_show <saída de `bd show --json`> — pure; selftest-sourceable. ga-do1ixn.3: imprime os rótulos
+# (separados por espaço) da bead que o JSON descreve; vazio se o JSON não é uma bead que eu leia (vazio, lixo, lista sem
+# objeto, rótulo que não é texto) ou se a bead não tem rótulo algum.
+gate_lane_labels_from_show() {
+  printf '%s' "${1:-}" | jq -r 'if type=="array" then .[0] else . end | select(type=="object") | (.labels // []) | if all(.[]; type=="string") then join(" ") else empty end' 2>/dev/null || true
+}
+
+# gate_fail_lane_labels <bead_city> <bead_id> <rótulos lidos antes> — ga-do1ixn.3 (gate rodada 1, bloqueante 2): os rótulos
+# com que o FAIL decide se a bead volta à faixa Kimi. Imprime-os e devolve 0; devolve 1 (sem imprimir) se não os leu.
+# Uma bead no gate SEMPRE tem rótulo (gate:reviewing e story:in-flight, que este mesmo caminho limpa), então "nenhum rótulo"
+# é leitura que não rendeu, não "sem lane:kimi": relê UMA vez, sem cache, direto do bd.
+# vazio → sem rótulo nenhum = não li; falhou/ilegível na releitura → não li (rc 1): o chamador avisa e a rota segue como antes, nunca sem rota.
+gate_fail_lane_labels() {
+  local _gl="${3:-}"
+  [ -n "$_gl" ] || _gl=$(gate_lane_labels_from_show "$(bd -C "${1:-}" show "${2:-}" --json 2>/dev/null || true)")
+  [ -n "$_gl" ] || return 1
+  printf '%s' "$_gl"
 }
 
 # gate_fail_restore_route <bead_city> <rig_list_json> — pure; selftest-sourceable.
@@ -12057,8 +12076,21 @@ $(gate_render_reasons "$FAIL_REASONS")" 2>/dev/null || true
           _GFAIL_ROUTE="gastown.dog"
           log "  ga-u679x2: could not reverse-resolve bead_city='$BEAD_CITY' to any registered rig — falling back to gastown.dog (safe default), NOT guessing from code rig '$RIG'."
         fi
-        # ga-do1ixn.3: bead da faixa Kimi volta para a faixa (kimi-lane), não para o pool de dog do mini
-        _GFAIL_ROUTE=$(gate_kimi_lane_route "${SRC_LABELS:-}" "$_GFAIL_ROUTE")
+        # ga-do1ixn.3: bead da faixa Kimi volta para a faixa (kimi-lane), não para o pool de dog do mini.
+        # Os rótulos vêm da leitura do começo do FAIL (SRC_LABELS, com cache); vazio → relê sem cache (gate_fail_lane_labels); falhou/ilegível nas duas → NÃO sei se é lane:kimi:
+        # a rota segue a restaurada (nunca sem rota, ga-f54ui), mas com WARN e uma nota no comentário do FAIL — antes isto caía em gastown.dog calado. Se a bead é lane:kimi, a passada
+        # da faixa Kimi do Pilot a recarimba kimi-lane na varredura seguinte (ela é candidata); até lá a sondagem dos dogs a vê.
+        # SELFTEST-EXTRACT gate-fail-kimi-lane: BEGIN
+        _GFAIL_LANE_NOTE=""
+        if _GFAIL_LANE_LABELS=$(gate_fail_lane_labels "$BEAD_CITY" "$BEAD_ID" "${SRC_LABELS:-}"); then
+          :
+        else
+          _GFAIL_LANE_LABELS=""
+          warn "  ga-do1ixn.3: não consegui ler os rótulos de $BEAD_ID (leitura em cache vazia e releitura sem cache também) — não sei se é lane:kimi; a rota fica $_GFAIL_ROUTE; se a bead é da faixa Kimi, a passada do Pilot a recarimba kimi-lane na varredura seguinte."
+          _GFAIL_LANE_NOTE=" NOTE: os rótulos da bead não foram lidos (cache e releitura) — não sei se é lane:kimi (ga-do1ixn.3); a rota ficou $_GFAIL_ROUTE e a passada da faixa Kimi do Pilot a recarimba kimi-lane se for."
+        fi
+        _GFAIL_ROUTE=$(gate_kimi_lane_route "$_GFAIL_LANE_LABELS" "$_GFAIL_ROUTE")
+        # SELFTEST-EXTRACT gate-fail-kimi-lane: END
         bd -C "$BEAD_CITY" update "$BEAD_ID" --set-metadata "gc.routed_to=$_GFAIL_ROUTE" -q 2>/dev/null || true
         # Verify the write actually stuck (ga-p5q3 error-vs-empty discipline) — a
         # post-write READ failure must never be reported as "restore failed"; it is
@@ -12153,7 +12185,7 @@ $(gate_render_reasons "$FAIL_REASONS")" 2>/dev/null || true
         fi
         GATE_FAIL_REDISPATCH_VERIFIED=$(gate_fail_redispatch_verified "$_GFAIL_FINAL_JSON" "$_GFAIL_ROUTE" "$_GFAIL_ROUTE_UNKNOWN" "${GATE_FAIL_NO_EVAL_RUN:-1}")
         # SELFTEST-EXTRACT gate-fail-final-reread: END
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) cleared. gc.routed_to restored to $_GFAIL_ROUTE (from the bead's own home store, ga-u679x2) so pool workers can self-serve this bead (ga-f54ui) — verified post-write, not assumed: $_GFAIL_ROUTE_OBS; $_GFAIL_ASSIGNEE_OBS; $_GFAIL_STATUS_OBS; $_GFAIL_QUEUED_OBS (ga-39l9z2).$_GFAIL_ROUTE_UNKNOWN_NOTE The Pilot will also re-dispatch a builder with the GATE-FEEDBACK above.$_GFAIL_VETO_NOTE" 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) cleared. gc.routed_to restored to $_GFAIL_ROUTE (from the bead's own home store, ga-u679x2) so pool workers can self-serve this bead (ga-f54ui) — verified post-write, not assumed: $_GFAIL_ROUTE_OBS; $_GFAIL_ASSIGNEE_OBS; $_GFAIL_STATUS_OBS; $_GFAIL_QUEUED_OBS (ga-39l9z2).$_GFAIL_ROUTE_UNKNOWN_NOTE$_GFAIL_LANE_NOTE The Pilot will also re-dispatch a builder with the GATE-FEEDBACK above.$_GFAIL_VETO_NOTE" 2>/dev/null || true
       fi
     fi
   fi

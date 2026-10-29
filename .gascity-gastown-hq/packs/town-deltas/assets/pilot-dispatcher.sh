@@ -12485,7 +12485,8 @@ _pilot_kimi_dispatch() {
 #   veto:<rótulo>  a bead traz um rótulo de PILOT_NODE_FIRST_VETO_LABELS (node:never é o que o prompt do kimi-worker põe ao devolver a bead ao mini) → sai da faixa
 #   pii:<termo>    o texto casou com a lista do Mayor (cpf, telefone, conversa, lead, proprietário, chip/frota, Pipedrive, e-mail, shared/data e *.db, dado pessoal) ou com número longo sem máscara
 #                  (CPF, CNPJ e telefone/WhatsApp: 10+ dígitos seguidos; CPF e CNPJ com espaço, ponto, barra ou hífen entre os grupos, mascarados por inteiro ou pela metade; DDD + número com espaço, ponto ou hífen;
-#                  9NNNN e NNNN com espaço, ponto ou hífen; [2-5]NNN-NNNN) → sai da faixa. Data e hora (2026-10-28 19:15) e versão (1.2.3) não casam: o separador só vale entre grupos de tamanho de documento ou telefone
+#                  [9 ]NNNN NNNN e [2-5]NNN NNNN com espaço, ponto ou hífen — dois grupos de 4 dígitos (3333 4444, 2026 2027) casam, falso positivo aceito; telefone com (DDD) e o 9 solto ou colado, e +55 com ou sem parênteses, casam pelo termo telefone;
+#                  hífen, travessão e menos Unicode (U+2010 a U+2015, U+2212, U+FF0D) valem como hífen antes de casar) → sai da faixa. Data e hora (2026-10-28 19:15) e versão (1.2.3) não casam: o separador só vale entre grupos de tamanho de documento ou telefone
 #   sem-texto      título ou descrição vazios: não há o que triar → espera
 #   ilegivel       rótulo ou campo que não é do tipo esperado, ou JSON que o jq não lê → espera
 # Fail-closed: só `ok` deixa a bead ir ao Kimi. Os termos casam por palavra inteira, sem caixa e sem acento ("leader" e "chipset" não casam). Falso positivo custa a bead voltar ao dog Claude; falso
@@ -12501,7 +12502,7 @@ _pilot_kimi_screen() {
   _ks_out=$(printf '%s' "$_ks_bead" | jq -r '
     def pats: [
       ["cpf", "\\bcpfs?\\b|\\b\\d{3}\\.\\d{3}\\.\\d{3}-\\d{2}\\b"],
-      ["telefone", "telefon|celular|\\bfones?\\b|\\bphones?\\b|whats ?app|whapi|\\(\\d{2}\\)\\s?9?\\d{4}-?\\d{4}|\\+55\\s?\\d{2}"],
+      ["telefone", "telefon|celular|\\bfones?\\b|\\bphones?\\b|whats ?app|whapi|\\(\\d{2}\\)\\s*9?[\\s.-]?\\d{4}[\\s.-]?\\d{4}|\\+\\s?55\\s?\\(?\\d{2}\\)?"],
       ["conversa", "\\bconvers(a|as|a[cç][aã]o|a[cç][oõ]es|ation|ations)\\b"],
       ["lead", "\\bleads?\\b"],
       ["proprietario", "propriet[aá]ri[oa]s?"],
@@ -12510,12 +12511,12 @@ _pilot_kimi_screen() {
       ["email", "e-?mails?\\b|[a-z0-9._%+-]+@[a-z0-9-]+\\.[a-z]{2,}"],
       ["dado-pessoal", "dados? pessoa(l|is)|\\bpii\\b|\\blgpd\\b"],
       ["shared/data", "shared/data|\\.db\\b"],
-      ["numero-longo", "\\b\\d{10,}\\b|\\b\\d{2}[\\s.]?\\d{3}[\\s.]?\\d{3}[\\s./-]?\\d{4}[\\s-]?\\d{2}\\b|\\b\\d{3}[\\s.-]?\\d{3}[\\s.-]?\\d{3}[\\s.-]?\\d{2}\\b|\\b0?\\d{2}[\\s.-]?9?[\\s.-]?\\d{4}[\\s.-]?\\d{4}\\b|\\b9\\d{4}[\\s.-]\\d{4}\\b|\\b[2-5]\\d{3}-\\d{4}\\b"]
+      ["numero-longo", "\\b\\d{10,}\\b|\\b\\d{2}[\\s.]?\\d{3}[\\s.]?\\d{3}[\\s./-]?\\d{4}[\\s-]?\\d{2}\\b|\\b\\d{3}[\\s.-]?\\d{3}[\\s.-]?\\d{3}[\\s.-]?\\d{2}\\b|\\b0?\\d{2}[\\s.-]?9?[\\s.-]?\\d{4}[\\s.-]?\\d{4}\\b|\\b9[\\s.-]?\\d{4}[\\s.-]\\d{4}\\b|\\b[2-5]\\d{3}[\\s.-]\\d{4}\\b"]
     ];
     def txt: if . == null then "" elif type == "string" then . else error("nao-texto") end;
     ([ .title, .description, .design, .acceptance_criteria, .notes ] | map(txt)) as $f
     | if ($f[0] | test("\\S") | not) or ($f[1] | test("\\S") | not) then "sem-texto"
-      else ($f | join("\n") | gsub("\\p{M}"; "")) as $text
+      else ($f | join("\n") | gsub("\\p{M}"; "") | gsub("[\u2010-\u2015\u2212\uFF0D]"; "-")) as $text
         | ([ pats[] | . as $p | select($text | test($p[1]; "i")) | $p[0] ] | .[0] // "") as $hit
         | if $hit == "" then "ok" else "pii:" + $hit end
       end' 2>/dev/null) || _ks_out=""
@@ -12565,14 +12566,14 @@ _pilot_kimi_demote() {
 }
 
 # _pilot_kimi_lane_pass — uma vez por varredura, ANTES da passada de WA e das pistas. Sempre devolve 0. (1) Tira das duas pistas TODA bead com o rótulo lane:kimi: o laço normal nunca a vê, então
-# nenhuma vai a um pool Claude, com a faixa aberta ou fechada; pista que o jq não lê fica VAZIA nesta varredura (não dá para separar as do Kimi, e o estado inerte é não despachar). (1b) Tria cada bead
+# o Pilot não a despacha a um pool Claude, com a faixa aberta ou fechada (fora do Pilot, a sondagem dos dogs lê gc.routed_to: a bead que ainda tem rota gastown.dog fica visível a ela do momento em que ganha lane:kimi até o carimbo desta passada, e uma falha do carimbo a deixa visível — por isso o resumo conta carimbos e falhas, e o certo é o Mayor pôr gc.routed_to=kimi-lane junto com o rótulo); pista que o jq não lê fica VAZIA nesta varredura (não dá para separar as do Kimi, e o estado inerte é não despachar). (1b) Tria cada bead
 # do HQ da faixa (_pilot_kimi_screen no JSON da bead e, se ela passou, _pilot_kimi_screen_comments nos comentários): veto ou dado pessoal → REBAIXA (_pilot_kimi_demote: sai da faixa e volta ao dog); sem texto ou ilegível → espera na faixa. O rebaixamento vale com a faixa aberta ou
 # fechada (a bead devolvida pelo kimi-worker não pode ficar presa em kimi-lane só porque a bandeira foi desligada) e não escreve nada no DRY_RUN. (2) Carimba gc.routed_to=kimi-lane nas do HQ que ainda
 # não o têm (uma rota de pool posta por outro caminho — a volta do gate, o pilot-missing-route-watchdog — chamaria o pool do mini). (3) Com a faixa aberta, leva UMA bead do HQ (ga-) que passou na
 # triagem ao kimi-worker-remote por dispatch_one com _PILOT_KIMI_PASS=1; a de outro rig espera (semana 1: só HQ, o traco-bim não tem espelho no nó).
 _pilot_kimi_lane_pass() {
-  local _kl_lane _kl_pool _kl_k _kl_rest _kl_ids _kl_id _kl_pick _kl_rc _kl_tier _kl_closed="" _kl_n=0 _kl_sent=0 _kl_stamped=0 _kl_stampfail=0 _kl_tries=0 _kl_other=0 _kl_stop=""
-  local _kl_small="[]" _kl_big="[]" _kl_held="[]" _kl_keep _kl_bead _kl_verdict _kl_why _kl_next _kl_demoted=0 _kl_demfail=0 _kl_held_n=0
+  local _kl_lane _kl_pool _kl_k _kl_rest _kl_ids _kl_id _kl_pick _kl_rc _kl_tier _kl_closed="" _kl_n=0 _kl_sent=0 _kl_stamped=0 _kl_stampfail=0 _kl_idsfail=0 _kl_tries=0 _kl_rel=0 _kl_rel_max=10 _kl_other=0 _kl_stop=""
+  local _kl_small="[]" _kl_big="[]" _kl_held="[]" _kl_keep _kl_bead _kl_verdict _kl_why _kl_next _kl_demoted=0 _kl_demfail=0 _kl_held_n=0 _kl_stamp_txt
   for _kl_lane in small big; do
     case "$_kl_lane" in small) _kl_pool="${SMALL_CANDIDATES:-[]}" ;; big) _kl_pool="${BIG_CANDIDATES:-[]}" ;; esac
     # vazio → []; falhou/ilegível → as duas metades vazias (a pista inteira sai desta varredura, com aviso)
@@ -12633,8 +12634,11 @@ _pilot_kimi_lane_pass() {
   done
   # (2) a rota de espera: só nas que ainda não a têm; o DRY_RUN não escreve
   if [ "${DRY_RUN:-0}" != "1" ]; then
-    # só as do HQ (ga-, loja da cidade): a de outro rig espera sem carimbo (semana 1 é só HQ) — vazio/falhou → nada a carimbar
-    _kl_ids=$(printf '%s\n%s\n%s' "$_kl_small" "$_kl_big" "$_kl_held" | jq -r --arg r "$PILOT_KIMI_ROUTE" '.[] | select(((.id // "") | startswith("ga-")) and ((.metadata["gc.routed_to"] // "") != $r)) | .id' 2>/dev/null) || _kl_ids=""
+    # só as do HQ (ga-, loja da cidade): a de outro rig espera sem carimbo (semana 1 é só HQ) — vazio → nada a carimbar (todas já têm a rota); falhou/ilegível → nada carimbado, e o aviso e o resumo dizem "não li" (nunca "carimbada=0")
+    _kl_ids=$(printf '%s\n%s\n%s' "$_kl_small" "$_kl_big" "$_kl_held" | jq -r --arg r "$PILOT_KIMI_ROUTE" '.[] | select(((.id // "") | startswith("ga-")) and ((.metadata["gc.routed_to"] // "") != $r)) | .id' 2>/dev/null) || {
+      _kl_ids=""; _kl_idsfail=1
+      warn "ga-do1ixn.3: faixa Kimi: não consegui ler quais beads precisam do carimbo gc.routed_to=$PILOT_KIMI_ROUTE — nada foi carimbado nesta varredura; as que ainda têm rota de pool seguem visíveis à sondagem dos dogs até a próxima"
+    }
     for _kl_id in $_kl_ids; do
       if timeout 15 bd -C "$GC_CITY" update "$_kl_id" --set-metadata "gc.routed_to=$PILOT_KIMI_ROUTE" -q >/dev/null 2>&1; then _kl_stamped=$((_kl_stamped + 1))
       else _kl_stampfail=$((_kl_stampfail + 1)); warn "ga-do1ixn.3: não consegui carimbar gc.routed_to=$PILOT_KIMI_ROUTE em $_kl_id — a pista normal não a pega (saiu da lista), mas uma rota de pool posta por fora seguiria valendo"; fi
@@ -12651,6 +12655,8 @@ _pilot_kimi_lane_pass() {
       case "$_kl_lane" in small) _kl_pool="$_kl_small" ;; big) _kl_pool="$_kl_big" ;; esac
       while :; do
         [ "$_kl_tries" -lt 3 ] || { _kl_stop="tentativas"; break; }
+        # as soltas (kimi_lane_released: alvo que não é dog) não gastam tentativa, mas têm teto próprio: cada uma custa uma claim e uma solta no HQ
+        [ "$_kl_rel" -lt "$_kl_rel_max" ] || { _kl_stop="soltas"; break; }
         _kl_pick=$(_top_candidate "$_kl_pool")
         { [ -n "$_kl_pick" ] && [ "$_kl_pick" != null ]; } || break
         _kl_id=$(printf '%s' "$_kl_pick" | jq -r '.id // ""' 2>/dev/null) || _kl_id=""
@@ -12665,13 +12671,22 @@ _pilot_kimi_lane_pass() {
         if [ "$_kl_rc" = 0 ]; then
           _kl_sent=1; DISPATCHED=$((DISPATCHED + 1)); _pilot_sweep_note "$_kl_id" 0 "${DISPATCH_RESULT:-}"; break
         fi
-        # sem vaga (ou o nó não ficou com ela): as outras também não ficariam nesta varredura
-        case "${DISPATCH_RESULT:-}" in kimi_lane_wait|node_rollback_unconfirmed) _kl_stop="${DISPATCH_RESULT}"; break ;; esac
+        # o que dispatch_one devolveu sem despachar entra no pilot_sweep pelo NOME (kimi_lane_released/kimi_lane_wait = espera de propósito; node_rollback_unconfirmed = falha; sem nome = unclassified): sem esta nota a bead sumia da contagem da varredura
+        _pilot_sweep_note "$_kl_id" "$_kl_rc" "${DISPATCH_RESULT:-}"
+        case "${DISPATCH_RESULT:-}" in
+          # sem vaga (ou o nó não ficou com ela): as outras também não ficariam nesta varredura
+          kimi_lane_wait|node_rollback_unconfirmed) _kl_stop="${DISPATCH_RESULT}"; break ;;
+          # solta antes de gastar a vaga do Kimi: a de trás ainda tem a vez, até o teto de soltas
+          kimi_lane_released) _kl_tries=$((_kl_tries - 1)); _kl_rel=$((_kl_rel + 1)) ;;
+        esac
       done
     done
   fi
   _PILOT_KIMI_PASS=0
-  log "ga-do1ixn.3: faixa Kimi: lane:kimi=$_kl_n · ${_kl_stop:-aberta} · despachada=$_kl_sent · fora do HQ=$_kl_other · rota carimbada=$_kl_stamped (falhas $_kl_stampfail) · rebaixadas=$_kl_demoted (falhas $_kl_demfail) · esperando a triagem=$_kl_held_n — nenhuma vai a pool Claude"
+  # vazio → 0 carimbadas; falhou/ilegível → o resumo diz que a lista não foi lida
+  _kl_stamp_txt="rota carimbada=$_kl_stamped (falhas $_kl_stampfail)"
+  [ "$_kl_idsfail" = 0 ] || _kl_stamp_txt="rota carimbada=NÃO LI a lista (nada carimbado)"
+  log "ga-do1ixn.3: faixa Kimi: lane:kimi=$_kl_n · ${_kl_stop:-aberta} · despachada=$_kl_sent · fora do HQ=$_kl_other · $_kl_stamp_txt · rebaixadas=$_kl_demoted (falhas $_kl_demfail) · soltas=$_kl_rel · esperando a triagem=$_kl_held_n — o Pilot não despacha nenhuma a pool Claude; uma rota de pool posta por fora (gastown.dog) vale até o carimbo desta passada"
   return 0
 }
 
@@ -16629,6 +16644,12 @@ DISPATCH_RESULT=""   # ga-ov3gow: global on purpose — set by dispatch_one(), r
 #                       Also rig_native_spawn_deferred_slow (ga-6hr8p7): the spawn was DEFERRED because an
 #                       earlier spawn this sweep was slow — a deliberate deferral, not a fault; it is still
 #                       counted in NONQUEUE_FAILS so the Step 5 stall streak sees a sweep that spawned nothing.
+#                       And kimi_lane_released / kimi_lane_wait (ga-do1ixn.3): a lane:kimi bead the Kimi pass handed to
+#                       dispatch_one() and that dispatch_one() gave back on purpose — released (the lane only takes an HQ
+#                       bead with a dog target) or kept waiting (the Kimi slot was busy, the session did not open, the
+#                       notice failed; never the mini). The claim is released, nothing is stamped as a pool route: a
+#                       wait, not a fault. (node_rollback_unconfirmed from the Kimi pass — the undo of the dispatch could
+#                       not be confirmed — is NOT here: it stays failed_other, where a real fault is visible.)
 #   failed_other        any other NAMED failure (assign / sling / in-flight / rig_native_pool_count_unreadable —
 #                       the session count could not be read, so the spawn was NOT attempted, ga-oa004t — and
 #                       remerge_branch_lookup_unknown, ga-x7m5rg: the gate:needs-remerge branch lookup could
@@ -16696,7 +16717,7 @@ _pilot_sweep_emit() {
       elif $o.r == "rig_native_global_session_cap_queued" then "queued_global_cap"
       elif $o.r == "rig_native_spawn_failed" then "spawn_failed"
       elif $o.r == "priority_yield" then "yielded_priority"
-      elif ["pool_ownership_refuse", "rig_native_dog_store_blind", "rig_native_dog_store_migrated", "rig_native_pool_store_blind", "rig_native_pool_store_migrated", "hq_pool_store_blind", "rig_native_pool_target_only", "rig_dedup_skip", "rig_native_spawn_deferred_slow", "disk_floor_node_only", "wa_node_pass_released"]
+      elif ["pool_ownership_refuse", "rig_native_dog_store_blind", "rig_native_dog_store_migrated", "rig_native_pool_store_blind", "rig_native_pool_store_migrated", "hq_pool_store_blind", "rig_native_pool_target_only", "rig_dedup_skip", "rig_native_spawn_deferred_slow", "disk_floor_node_only", "wa_node_pass_released", "kimi_lane_released", "kimi_lane_wait"]
            | any(.[]; . == $o.r) then "refused_by_guard"
       elif $o.r == "" then "unclassified"
       else "failed_other" end;
