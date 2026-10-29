@@ -12484,7 +12484,8 @@ _pilot_kimi_dispatch() {
 #   ok             rótulos sem veto e título+descrição (+design, critérios, notas) sem termo de dado pessoal → pode ir ao Kimi
 #   veto:<rótulo>  a bead traz um rótulo de PILOT_NODE_FIRST_VETO_LABELS (node:never é o que o prompt do kimi-worker põe ao devolver a bead ao mini) → sai da faixa
 #   pii:<termo>    o texto casou com a lista do Mayor (cpf, telefone, conversa, lead, proprietário, chip/frota, Pipedrive, e-mail, shared/data e *.db, dado pessoal) ou com número longo sem máscara
-#                  (CPF de 11 dígitos, CNPJ, telefone/WhatsApp: 10+ dígitos seguidos; CNPJ com máscara; 9NNNN-NNNN e [2-5]NNN-NNNN) → sai da faixa
+#                  (CPF, CNPJ e telefone/WhatsApp: 10+ dígitos seguidos; CPF e CNPJ com espaço, ponto, barra ou hífen entre os grupos, mascarados por inteiro ou pela metade; DDD + número com espaço, ponto ou hífen;
+#                  9NNNN e NNNN com espaço, ponto ou hífen; [2-5]NNN-NNNN) → sai da faixa. Data e hora (2026-10-28 19:15) e versão (1.2.3) não casam: o separador só vale entre grupos de tamanho de documento ou telefone
 #   sem-texto      título ou descrição vazios: não há o que triar → espera
 #   ilegivel       rótulo ou campo que não é do tipo esperado, ou JSON que o jq não lê → espera
 # Fail-closed: só `ok` deixa a bead ir ao Kimi. Os termos casam por palavra inteira, sem caixa e sem acento ("leader" e "chipset" não casam). Falso positivo custa a bead voltar ao dog Claude; falso
@@ -12509,7 +12510,7 @@ _pilot_kimi_screen() {
       ["email", "e-?mails?\\b|[a-z0-9._%+-]+@[a-z0-9-]+\\.[a-z]{2,}"],
       ["dado-pessoal", "dados? pessoa(l|is)|\\bpii\\b|\\blgpd\\b"],
       ["shared/data", "shared/data|\\.db\\b"],
-      ["numero-longo", "\\b\\d{10,}\\b|\\b\\d{2}\\.\\d{3}\\.\\d{3}/\\d{4}-\\d{2}\\b|\\b9\\d{4}-\\d{4}\\b|\\b[2-5]\\d{3}-\\d{4}\\b"]
+      ["numero-longo", "\\b\\d{10,}\\b|\\b\\d{2}[\\s.]?\\d{3}[\\s.]?\\d{3}[\\s./-]?\\d{4}[\\s-]?\\d{2}\\b|\\b\\d{3}[\\s.-]?\\d{3}[\\s.-]?\\d{3}[\\s.-]?\\d{2}\\b|\\b0?\\d{2}[\\s.-]?9?[\\s.-]?\\d{4}[\\s.-]?\\d{4}\\b|\\b9\\d{4}[\\s.-]\\d{4}\\b|\\b[2-5]\\d{3}-\\d{4}\\b"]
     ];
     def txt: if . == null then "" elif type == "string" then . else error("nao-texto") end;
     ([ .title, .description, .design, .acceptance_criteria, .notes ] | map(txt)) as $f
@@ -12525,6 +12526,7 @@ _pilot_kimi_screen() {
 # _pilot_kimi_screen_comments <id> — a triagem dos COMENTÁRIOS de UMA bead do HQ (o worker os lê ao abrir a bead). UMA leitura ao bd (`bd comments <id> --json`) e a mesma lista de termos de
 # _pilot_kimi_screen, aplicada a um texto só com os comentários. Imprime UMA palavra e devolve 0: ok | piic:<termo> (o termo casou num comentário) | ilegivel (a leitura falhou ou não é uma lista de comentários).
 # Fail-closed: só `ok` deixa a bead ir ao Kimi; sem comentário (`[]`) é ok, comentário que não se lê NÃO é. O texto do PAI não é triado (o worker só o vê se abrir o pai de propósito; o prompt manda não abrir).
+# É uma fotografia: comentário posto depois desta leitura (até o worker abrir a bead, ou durante a sessão) não é triado por aqui; o runbook manda só o Pilot e o worker escreverem numa bead lane:kimi e o prompt manda o worker parar.
 _pilot_kimi_screen_comments() {
   local _kc_id="$1" _kc_json="" _kc_text="" _kc_synth="" _kc_v=""
   # vazio (bd que sai 0 sem imprimir: não é "sem comentários", isso é `[]`) / falhou (bd que não leu, bead sumida, timeout) → ilegivel

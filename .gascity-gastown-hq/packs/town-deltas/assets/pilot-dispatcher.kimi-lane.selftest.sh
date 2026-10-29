@@ -15,7 +15,8 @@
 #   comentário com o NOME do termo, nunca o trecho) e não é despachada, com a faixa aberta ou fechada, e nada se escreve no DRY_RUN; a que não tem texto ou não se lê espera (carimbada, sem despachar);
 #   rebaixamento que não grava deixa a bead esperando; a de outro rig não é triada. (triagem, comentários) _pilot_kimi_screen_comments: `[]` é ok, termo em qualquer comentário é piic:<termo>
 #   (a bead é rebaixada), leitura que falha, saída vazia com rc 0, lista que não é lista ou text que não é texto é ilegivel (a bead espera); os comentários só são lidos da que passou no JSON.
-#   (número longo) CPF de 11 dígitos, CNPJ (com ou sem máscara) e telefone sem máscara casam; sha, id de bead, data e número curto não.
+#   (número longo) CPF de 11 dígitos, CNPJ (com ou sem máscara) e telefone sem máscara casam, e também CPF/CNPJ/telefone com espaço, ponto, barra ou hífen entre os grupos (mascarado por inteiro ou pela metade,
+#   espaço sem quebra e dígito de largura total incluídos); sha, id de bead, data, data com hora, versão, contagem e número curto não.
 # COMO RODA: as funções são extraídas VERBATIM dos dispatchers (awk) e rodam num shell filho sob `set -euo pipefail`, com `gc` e `bd` FALSOS num PATH sem os reais; dispatch_one é um falso que
 #   registra o que recebeu. Contra um dispatcher sem as funções o arquivo se recusa a começar.
 # CONTROLE NEGATIVO: cada mutante (pista que não separa as do Kimi, bandeira ignorada, bead de outro rig aceita, vaga que conta todo template, bloco do Kimi que cai no mini, gate que restaura dog,
@@ -245,8 +246,30 @@ numero-longo|manda pro 5531999998888
 numero-longo|ligar 98765-4321
 numero-longo|CNPJ 12.345.678/0001-90
 numero-longo|fixo 3456-7890
+numero-longo|zap 11-9876-5432
+numero-longo|zap 11 98765 4321
+numero-longo|zap 11.98765.4321
+numero-longo|zap 011 9 8765 4321
+numero-longo|zap 55 11 98765 4321
+numero-longo|ligar 98765 4321
+numero-longo|ligar 98765.4321
+numero-longo|documento 123 456 789 09
+numero-longo|documento 123.456.789 09
+numero-longo|documento 123456789-09
+numero-longo|documento 123.456.78909
+numero-longo|documento 123-456-789-09
+numero-longo|empresa 12345678/0001-90
+numero-longo|empresa 12345678/000190
+numero-longo|empresa 12.345.678/000190
+numero-longo|empresa 12 345 678 0001 90
+numero-longo|empresa 12.345.678 0001 90
 EOF
 r=$(S lane:kimi "T" "commits d12b6923f e 6474abc8d na bead ga-do1ixn.3, 123456789 linhas, porta 1234567, dia 2026-10-28, v1.2.3"); [ "$r" = ok ] && ok "número curto, sha, id de bead e data NÃO casam como número longo" || bad "falso positivo de número: '$r'"
+for t in '2026-10-28 19:15:00' '28/10/2026 19:15' '28.10.2026' '2026-10-28 2026-10-29' 'versão 1.2.3 e 4.5.6' 'linhas 120 130 140 150' 'ip 10.0.0.1 e 172.16.0.254' '5000 MB livres, 4803 MB' 'teto 1000 linhas, 800 de produção' 'ga-do1ixn.3 e ga-do1ixn.5'; do
+  r=$(S lane:kimi "T" "$t"); [ "$r" = ok ] && ok "data, hora, versão e contagem NÃO casam como número longo: '$t'" || bad "falso positivo de número em '$t': '$r'"
+done
+r=$(S lane:kimi "T" "zap $(printf '11\xc2\xa098765\xc2\xa04321')"); [ "$r" = pii:numero-longo ] && ok "o espaço sem quebra (U+00A0) entre os grupos também casa" || bad "NBSP: '$r'"
+r=$(S lane:kimi "T" "zap $(printf '\xef\xbc\x91\xef\xbc\x91\xef\xbc\x99\xef\xbc\x98\xef\xbc\x97\xef\xbc\x96\xef\xbc\x95\xef\xbc\x94\xef\xbc\x93\xef\xbc\x92\xef\xbc\x91')"); [ "$r" = pii:numero-longo ] && ok "dígitos de largura total também casam" || bad "dígito largo: '$r'"
 r=$(S lane:kimi "T" "$(printf 'o proprieta\xcc\x81rio do lote')"); [ "$r" = "pii:proprietario" ] && ok "acento decomposto (NFD) também casa" || bad "NFD: '$r'"
 r=$(S lane:kimi "Importar leads" "texto limpo"); [ "$r" = "pii:lead" ] && ok "o termo no TÍTULO basta" || bad "título: '$r'"
 r=$(run_screen '{"id":"ga-s","title":"t","description":"limpo","notes":"fala do WhatsApp"}'); [ "$r" = "pii:telefone" ] && ok "o termo nas notas também barra" || bad "notas: '$r'"
@@ -369,7 +392,7 @@ PY
     row=$(grep -F "[\"$t\", \"" "$DISPATCHER" | head -1 | sed 's/^ *//; s/,$//')
     mutant "termo '$t' ignorado" pilot "$row" "[\"$t\", \"(?!x)x\"]"
   done
-  for alt in '\\b\\d{10,}\\b|' '\\b\\d{2}\\.\\d{3}\\.\\d{3}/\\d{4}-\\d{2}\\b|' '\\b9\\d{4}-\\d{4}\\b|' '|\\b[2-5]\\d{3}-\\d{4}\\b'; do
+  for alt in '\\b\\d{10,}\\b|' '\\b\\d{2}[\\s.]?\\d{3}[\\s.]?\\d{3}[\\s./-]?\\d{4}[\\s-]?\\d{2}\\b|' '\\b\\d{3}[\\s.-]?\\d{3}[\\s.-]?\\d{3}[\\s.-]?\\d{2}\\b|' '\\b0?\\d{2}[\\s.-]?9?[\\s.-]?\\d{4}[\\s.-]?\\d{4}\\b|' '\\b9\\d{4}[\\s.-]\\d{4}\\b|' '|\\b[2-5]\\d{3}-\\d{4}\\b'; do
     mutant "número longo sem a forma '$alt'" pilot "$alt" ""
   done
   for t in lead 'chip/frota'; do
