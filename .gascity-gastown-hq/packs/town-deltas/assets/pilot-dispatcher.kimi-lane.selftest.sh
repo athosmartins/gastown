@@ -204,6 +204,23 @@ run_step5() {
   nt=0; [ ! -f "$WORK/notify.log" ] || nt=$(grep -c 'Pilot estagnado' "$WORK/notify.log" || true)
   echo "sat=$sat estado=$st notify=$nt"
 }
+# run_kd_seq — DUAS chamadas de _pilot_kimi_dispatch no mesmo shell, como as tentativas de uma varredura: a 1ª com a lista de sessões que falha, a 2ª com a lista lida e a vaga ocupada. Imprime "first=<_PKL_FAULT> second=<_PKL_FAULT>".
+# A marca da 1ª não pode vazar para a 2ª: vaga ocupada é espera de propósito, e um resto de "não li" a leria como falha.
+run_kd_seq() {
+  (
+    set -euo pipefail
+    PATH="$SANDBOX_PATH"; SELFTEST_WORK="$WORK"; export SELFTEST_WORK
+    log()  { echo "LOG $*" >> "$LINES"; }
+    warn() { echo "WARN $*" >> "$LINES"; }
+    GC_CITY="$WORK/city"; PILOT_SPAWN_TIMEOUT_SECS=20; PILOT_KIMI_TEMPLATE="kimi-worker-remote"; _PILOT_SLOW_SPAWN_SEEN=0
+    eval "$FUNCS"
+    echo 1 > "$WORK/gc.list.rc"
+    _pilot_kimi_dispatch "ga-k1" "$WORK/city" "Título"; first="${_PKL_FAULT-?}"
+    rm -f "$WORK/gc.list.rc"; sess kimi-worker-remote-1:active
+    _pilot_kimi_dispatch "ga-k1" "$WORK/city" "Título"
+    echo "first=$first second=${_PKL_FAULT-?}"
+  ) 2>&1 | tail -1
+}
 cset() { printf '%s\n' "$2" > "$WORK/comments.$1"; }   # cset <id> <json>: o que `bd comments <id> --json` imprime para esse id
 cj() { jq -cn --arg t "$1" '[{author:"mayor", created_at:"2026-10-28T12:00:00Z", id:"c1", issue_id:"ga-x", text:$t}]'; }   # UM comentário, no formato do bd
 K1=$(b ga-k1 "lane:kimi,story:approved"); K2=$(b ga-k2 "lane:kimi" kimi-lane); KW=$(b wa-k3 "lane:kimi" wa-worker); N1=$(b ga-n1 "story:approved"); N2=$(b ga-n2 "lane:kimi-not")
@@ -587,6 +604,8 @@ reset; echo 1 > "$WORK/gc.list.rc"; r=$(run_kd); f=$(cat "$WORK/kd.fault" 2>/dev
 [ "$r" = "res=mini alias=" ] && [ "$f" = "fault=1" ] && ok "lista de sessões que não se leu (gc session list falhou): sem vaga e nada escrito, mas é FALHA — 'não consegui ler' não é 'a vaga está ocupada'" || bad "lista ilegível: '$r' '$f'"
 reset; printf '%s\n' '{"sessions":"nao-e-lista"}' > "$WORK/sessions.json"; r=$(run_kd); f=$(cat "$WORK/kd.fault" 2>/dev/null)
 [ "$r" = "res=mini alias=" ] && [ "$f" = "fault=1" ] && ok "lista de sessões que não é uma lista: sem vaga e FALHA (mesma família)" || bad "lista que não é lista: '$r' '$f'"
+reset; r=$(run_kd_seq)
+[ "$r" = "first=1 second=0" ] && ok "duas chamadas seguidas: a lista que falhou na 1ª (fault=1) NÃO vaza para a 2ª, que é vaga ocupada (fault=0) — a marca de leitura zera na entrada de cada escolha de vaga" || bad "marca que vaza entre chamadas: '$r'"
 reset; sess; r=$(KD_JQFAIL=1 run_kd); f=$(cat "$WORK/kd.fault" 2>/dev/null)
 [ "$r" = "res=mini alias=" ] && [ "$f" = "fault=1" ] && ok "a escolha da vaga que não rende (jq morreu): sem vaga e FALHA (mesma família)" || bad "jq da vaga que falha: '$r' '$f'"
 reset; sess kimi-worker-remote-1:active; r=$(run_kd); f=$(cat "$WORK/kd.fault" 2>/dev/null)
