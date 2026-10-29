@@ -62,6 +62,9 @@ WOPT = {
 WRAP, SPLIT = set(WOPT), {"-S", "--split-string"}  # env -S 'git -C x commit': o valor da opção é um comando inteiro
 KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "{", "!", "coproc"}  # palavras reservadas que vêm ANTES de um comando: o git depois delas é o comando do trecho
 LEAD = {"then", "do", "else", "elif", "!", "{", "time"}  # palavras que só LIGAM um bloco ao comando seguinte (o comando de verdade é a próxima)
+OPENS = {"if": "fi", "for": "done", "while": "done", "until": "done", "select": "done", "case": "esac"}  # palavra que abre um bloco → a que o fecha
+BLOCK = LEAD | set(OPENS) | set(OPENS.values())  # as palavras que o shell só lê como reservadas no começo de um comando: com aspa, barra ou depois de redirecionamento são comando comum
+QM = chr(0xF0100)  # fim de palavra que levou aspa ou `\` (protect o põe, words tira): `\fi` e `"fi"` são o COMANDO fi, não o fecho do if
 OPAQUE = {"flock", "ionice", "chrt", "taskset", "parallel", "su", "runuser", "ssh", "script", "trap", "watch", "unshare", "nsenter", "chroot", "setpriv", "numactl",
           "strace", "fakeroot", "systemd-run", "busybox", "dbus-run-session", "xvfb-run", "unbuffer", "caffeinate", "tmux", "screen", "expect"}  # lançadores que não modelo: lista FECHADA (ver LIMITES)
 GIT_FLAG = re.compile(r"-[Phv]|--(?:no-pager|bare|no-replace-objects|no-lazy-fetch|no-optional-locks|no-advice|literal-pathspecs|glob-pathspecs|noglob-pathspecs|"
@@ -314,7 +317,7 @@ def protect(cmd: str) -> str:
     """O shlex tira as aspas e a barra: `'>'` e `\\>` saem como `>`, igual a um `>` de verdade, e `''` sai como palavra vazia. Aqui cada `;&|()<>` que o SHELL lê como
     texto (entre aspas, ou depois de `\\`) vira um caractere reservado (PROT), que words() devolve ao texto DEPOIS de decidir quem é operador. `$'…'` leva os escapes
     decodificados (`$'\\x67it'` é git; `$'\\''` é uma aspa, não o fim) e `$"…"` perde o `$`. Unclosed = aspas que não fecham ou `\\` no fim (a posição vai junto)."""
-    out, i, q, qpos = [], 0, "", 0
+    out, i, q, qpos, hq = [], 0, "", 0, False  # hq = a palavra de agora tem aspa ou barra
     while i < len(cmd):
         c = cmd[i]
         if q == "'":
@@ -324,6 +327,7 @@ def protect(cmd: str) -> str:
             q = "" if c == '"' else q
             out.append(c if c == '"' else PROT.get(c, c))
         elif c == "\\" and i + 1 < len(cmd):  # dentro de aspas duplas ou fora: barra + o caractere seguinte é um par só
+            hq = True
             out += [cmd[i + 1]] if q == '"' and cmd[i + 1] in "$`" else [c, PROT.get(cmd[i + 1], cmd[i + 1])]  # em "…", `\$`/`\`` perdem a barra (o shlex a manteria; o bash não)
             i += 1
         elif q:
@@ -336,6 +340,7 @@ def protect(cmd: str) -> str:
         elif c == "$" and cmd[i + 1:i + 2] == '"':  # `$"…"` (tradução de locale) é só `"…"`: o `$` vai embora
             pass
         elif c == "$" and cmd[i + 1:i + 2] == "'":
+            hq = True
             j = i + 2
             while j < len(cmd) and cmd[j] != "'":
                 j += 2 if cmd[j] == "\\" else 1
@@ -345,12 +350,25 @@ def protect(cmd: str) -> str:
             i = j
         else:
             if c in "'\"":
-                q, qpos = c, i
+                q, qpos, hq = c, i, True
+            elif hq and (c.isspace() or c in PUNCT):  # fim da palavra que levou aspa ou barra
+                out.append(QM)
+                hq = False
             out.append(c)
         i += 1
     if q:
         raise Unclosed(qpos)
-    return "".join(out)
+    return "".join(out) + (QM if hq else "")
+
+
+class Q(str):
+    """Palavra reservada (`fi`, `then`, `!`…) que o shell NÃO lê como reservada porque levou aspa ou barra (`\\fi`, `"fi"`) ou veio depois de um redirecionamento (`>x fi`): igual à palavra
+    na comparação, mas one() não a toma por abertura nem por fecho de bloco."""
+
+
+def word(t: str):
+    s = t.translate(UNPROT).replace(QM, "")
+    return Q(s) if QM in t and s in BLOCK else s
 
 
 def words(cmd: str) -> list:
@@ -366,7 +384,7 @@ def words(cmd: str) -> list:
             cmd = cmd[:e.pos] + cmd[e.pos + 1:]
     lx = shlex.shlex(text, posix=True, punctuation_chars=True)
     lx.whitespace_split, lx.commenters = True, ""
-    return [(t.translate(UNPROT), bool(t) and set(t) <= PUNCT) for t in lx]
+    return [(word(t), bool(t) and set(t) <= PUNCT) for t in lx]
 
 
 class Many(Exception):
@@ -679,13 +697,16 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None, ma
             if term == "&":
                 st["cwd"] = None  # `{ …; } &`: o grupo roda em background; o cd de dentro não vale aqui fora
             return None
-        lead = next((x for x in seg if x not in LEAD), "")  # a 1ª palavra que não é palavra reservada de ligação (`then if x; …` abre um bloco)
-        if lead in ("fi", "done", "esac"):  # bloco em VÁRIAS linhas (`if …; then⏎ c=ok⏎ fi`): quem está dentro de if/for/while/until/case/select PODE não ter rodado, igual à forma de uma linha (que o `then`/`do` do trecho já marca)
-            st["bdepth"] = max(st.get("bdepth", 0) - 1, 0)
-        elif lead in ("if", "for", "while", "until", "case", "select"):
-            st["bdepth"] = st.get("bdepth", 0) + 1
+        lead = next((x for x in seg if isinstance(x, Q) or x not in LEAD), "")  # a 1ª palavra que não é palavra reservada de ligação (`then if x; …` abre um bloco); a que levou aspa, barra ou redirecionamento NÃO é reservada
+        bs = st.setdefault("bstack", [])  # blocos abertos em linhas anteriores (if/for/while/until/case/select): quem está dentro PODE não ter rodado, igual à forma de uma linha (que o `then`/`do` do trecho já marca)
+        if ext or isinstance(lead, Q):
+            pass  # `find -exec fi` roda um PROGRAMA chamado fi; `\fi`, `"fi"` e `>x fi` são comando comum: nenhum abre nem fecha bloco
+        elif lead in OPENS:
+            bs.append(OPENS[lead])
+        elif bs and lead == bs[-1]:
+            bs.pop()  # só o fecho do bloco de cima desce (fi do if, done do for/while/until/select, esac do case): o `fi)` de um padrão de case não fecha o if de fora; na dúvida o bloco fica aberto (lado fechado)
         fw, done = next((x for x in seg if x not in KEYWORDS and not ASSIGN.fullmatch(x)), ""), ""  # a palavra que o shell chama: a 1ª que não é VAR=x nem palavra reservada
-        norun = bool(st.get("lost")) or kw or blk or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&") or bool(st.get("maybe")) or st.get("bdepth", 0) > 0  # o trecho pode não ter rodado (maybe = o corpo de uma função chamada por um trecho assim; bdepth = dentro de um bloco aberto em linha anterior)
+        norun = bool(st.get("lost")) or kw or blk or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&") or bool(st.get("maybe")) or bool(bs)  # o trecho pode não ter rodado (maybe = o corpo de uma função chamada por um trecho assim; bs = dentro de um bloco aberto em linha anterior)
         if fw in st.get("funcs", {}) and fw not in st.setdefault("calling", set()):  # uma função com nome de comando que trato adiante (bash, env, cd, find, eval, export, sudo, git…) é chamada como FUNÇÃO: o corpo roda, e o resto do trecho segue conferido como se o nome fosse o programa (command X e env X ignoram a função: lado fechado)
             r = call(fw, blind, norun)
             if r:
@@ -713,7 +734,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None, ma
                 new = None
             if done:
                 new = None  # a função chamada cd/pushd/popd foi reexecutada acima: o que ela fez de verdade com o diretório eu não sei, e o cd modelado aqui pode nem ter rodado
-            if (blk or st.get("bdepth", 0) > 0) and new is not None:
+            if (blk or bs) and new is not None:
                 st["cdblk"] = True  # cd dentro de um ramo: vale até o fi/done/esac/else/elif
             if prev == "&&" and new is not None:
                 st["chain"] = True  # cd que não é o 1º da cadeia (`x && cd a && …`): vale só enquanto a cadeia && continua (ver o topo de one())
@@ -768,9 +789,10 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None, ma
         return None
 
     skip, herestr, prev, flow, hs = False, False, "", None, None  # flow = o que o trecho anterior imprime, se um pipe o liga ao próximo; hs = o texto do here-string do trecho (o stdin dele, no lugar do pipe)
+    rd = False  # o trecho já teve redirecionamento antes do comando (`>x fi`), ou vem depois do `)` de `<(…)`/`( … )`: as palavras reservadas dele são palavras comuns
     for tok, op in words(cmd) + [(";", True)]:  # o `;` do fim fecha o último trecho
         if skip and not op:  # alvo de redirecionamento: só uma PALAVRA é alvo. Operador logo depois (`git … >` sem alvo, que o shell recusa) segue como operador: engolir o `;` do fim ou o `&&` deixava o trecho sem conferir
-            skip = False
+            skip, rd = False, rd or all(w in LEAD for w in seg)  # redirecionamento antes de qualquer comando: o que vem depois (`>x fi`, `then >x fi`) não é palavra reservada
             r = inner([tok])  # `> $(git -C x commit)`: o $( ) do alvo roda
             if r:
                 return r
@@ -803,11 +825,11 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None, ma
                             st["cwd"], st["env"], st["may"] = stack.pop()
                         else:
                             pc = "case)"  # `)` sem `(` de subshell aberto (pilha vazia, ou o `case` mais de dentro é o que está aberto): fim de um padrão de `case` — o ramo pode nem rodar
-                    seg, prev = [], pc
+                    seg, prev, rd = [], pc, pc == ")" and not st.get("func")  # depois do `)` de um subshell ou de `<(…)` o que vem é argumento, não começo de comando (o `)` de padrão de case é "case)" e deixa o corpo começar um comando; o de `f()` também: o corpo `{ if … }` começa comando)
                 else:
                     skip, herestr = True, pc == "<<<"  # redirecionamento: a palavra seguinte é o arquivo (ou, no here-string, o texto)
         else:
-            seg.append(tok)
+            seg.append(Q(tok) if rd and tok in BLOCK else tok)
     if st.get("fdepth"):  # o fim da função não fecha (uma `{` entre aspas desconta a conta): a chamada pode ter caído no corpo — confiro o corpo como se rodasse, em diretório "não sei"
         st["fdepth"] = 0
         st.setdefault("calling", set()).add(st["fname"])  # este corpo também é reexecutado: conferido, não relido como definição (ver o `{` em one)

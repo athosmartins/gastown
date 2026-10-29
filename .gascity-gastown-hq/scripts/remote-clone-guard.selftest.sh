@@ -17,8 +17,8 @@
 #   some (subgrupos: lexq aspas e `\` · lexs redirecionamento sem alvo · lexe palavra vazia · lexd `$'…'`/`$"…"` · lexu aspa ou `\` que não fecha, também num comentário `#` · lexr `$( )` do alvo
 #   de redirecionamento · lexh heredoc/`<<<`/find · lexp os controles que NÃO bloqueiam) · dest — o lugar onde o git escreve vem como ARGUMENTO, sem -C (worktree remove ../outro,
 #   clone/init <outro>/x, checkout-index --prefix=…; subgrupos destb e destp) · interp — o texto que um INTERPRETADOR (python -c, node -e, perl -e, ruby -e, awk) ou um pipe entrega a um
-#   shell roda: as 12 formas que só o cc-safety-net pegava (ga-tphd15o; subgrupos interpc código de interpretador e os delimitadores de literal que o guarda lê — q<…>, %Q{…}, [[…]] —, interpp pipe que um shell lê, interpe base64/rev/eval/printf -v e a atribuição/cd dentro de bloco em VÁRIAS linhas).
-# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (214 mutantes); e
+#   shell roda: as 12 formas que só o cc-safety-net pegava (ga-tphd15o; subgrupos interpc código de interpretador e os delimitadores de literal que o guarda lê — q<…>, %Q{…}, [[…]] —, interpp pipe que um shell lê, interpe base64/rev/eval/printf -v e a atribuição/cd dentro de bloco em VÁRIAS linhas, com o fi/done/esac que o shell não lê como fecho — \fi, "fi", >x fi, fi) de case, find -exec fi).
+# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (224 mutantes); e
 #   contra um stub que só sai 0 (o servidor ANTES desta fatia: o hook do mini era `drop` e nada o substituía), quase tudo falha.
 # VARIÁVEIS: RCG_UNDER_TEST (guarda a testar) · RCG_ONLY (grupos, vírgula) · RCG_NO_MUTANTS=1
 # BUDGET (grupo à parte, ga-tih62nv): o pedido que fazia o guarda girar SEM FIM (e que o hook deixava seguir sem conferência ao estourar o prazo de 600 s do Claude Code) termina;
@@ -706,7 +706,7 @@ g_interp() {  # ga-tphd15o (achado do ga-nkfwixz, cc-safety-net como oráculo): 
            "c='$g'${nl}if [ -d / ]; then${nl}case x in${nl}y) true ;;${nl}esac${nl}c=ok${nl}fi${nl}eval \"\$c\""; do
     b 2 "interp: bloco em várias linhas — a atribuição ou o cd dentro dele pode não ter rodado: $c" "$c"
   done
-  # Controles: depois do fi/done/esac a atribuição que SEI que rodou volta a apagar o texto de antes (a profundidade do bloco desce); dentro do bloco o cd vale até o fi.
+  # Controles: depois do fi/done/esac a atribuição que SEI que rodou volta a apagar o texto de antes (o bloco sai da pilha); dentro do bloco o cd vale até o fi.
   for c in "c='$h'${nl}if [ -f /nonexistent ]; then${nl}c=ok${nl}fi${nl}eval \"\$c\"" "if [ -d / ]; then${nl}c=ok${nl}fi${nl}eval \"\$c\"" \
            "c='$g'${nl}if [ -d / ]; then${nl}true${nl}fi${nl}c=ok${nl}eval \"\$c\"" "c='$g'${nl}for i in 1; do${nl}true${nl}done${nl}c=ok${nl}eval \"\$c\"" \
            "c='$g'${nl}case x in${nl}y) true ;;${nl}esac${nl}c=ok${nl}eval \"\$c\"" "c='$g'${nl}if [ -d / ]; then if [ -f /nonexistent ]; then${nl}true${nl}fi${nl}fi${nl}c=ok${nl}eval \"\$c\"" \
@@ -714,8 +714,33 @@ g_interp() {  # ga-tphd15o (achado do ga-nkfwixz, cc-safety-net como oráculo): 
            "export GIT_DIR=$OTH/.git${nl}if [ -d / ]; then${nl}true${nl}fi${nl}export GIT_DIR=$OWN/.git${nl}git commit -m x"; do
     b 0 "pass: interp: bloco em várias linhas que não escreve no alheio, e o texto atribuído DEPOIS do bloco vence: $c" "$c"
   done
-  # Uma abertura atrás de then/do/else (`then if x; then`) também abre bloco: sem contá-la, o 1º fi zera a profundidade com o bloco de fora ainda aberto.
+  # Uma abertura atrás de then/do/else (`then if x; then`) também abre bloco: sem contá-la, o 1º fi tiraria o bloco de fora da pilha com ele ainda aberto.
   b 2 "interp: if aninhado atrás do then, na mesma linha — o fi de dentro não fecha o de fora" "c='$g'${nl}if [ -d / ]; then if [ -f /nonexistent ]; then${nl}true${nl}fi${nl}c=ok${nl}fi${nl}eval \"\$c\""
+  # Palavra que o shell NÃO lê como reservada não abre nem fecha bloco (gate ga-tphd15o, tentativa 3, revisão de segurança): `\fi`, `"fi"`, `f"i"`, `>x fi`, `<(…) fi`, o `fi)` de um padrão de case e
+  # o `find -exec fi \;` são comando ou argumento comum. Se contassem como fi, o c=ok de DEPOIS (ainda dentro do if que não rodou) pareceria certo e apagaria o texto nocivo de antes. Na dúvida o bloco fica aberto.
+  local pre="c='$g'${nl}if false; then${nl}" post="${nl}c=ok${nl}fi${nl}eval \"\$c\""
+  for c in "${pre}\\fi$post" "${pre}\"fi\"$post" "${pre}'fi'$post" "${pre}f\"i\"$post" "${pre}\$'fi'$post" "${pre}>/dev/null fi$post" "${pre}diff <(true) fi$post" \
+           "${pre}find . -maxdepth 0 -exec fi \;$post" "${pre}case x in${nl}fi) true ;;${nl}esac$post" "${pre}case x in${nl}a) true ;;${nl}fi|b) true ;;${nl}esac$post" \
+           "${pre}\\esac$post" "${pre}\\done$post" "${pre}\\then fi$post" "c='$g'${nl}if false; then >/dev/null fi${nl}c=ok${nl}fi${nl}eval \"\$c\"" \
+           "c='$g'${nl}for i in; do${nl}\\done${nl}c=ok${nl}done${nl}eval \"\$c\"" "c='$g'${nl}for i in; do${nl}\\do done${nl}c=ok${nl}done${nl}eval \"\$c\"" \
+           "c='$g'${nl}for i in; do${nl}case x in${nl}done) true ;;${nl}esac${nl}c=ok${nl}done${nl}eval \"\$c\"" "c='$g'${nl}case x in${nl}y) true${nl}c=ok${nl};;${nl}esac${nl}eval \"\$c\"" \
+           "c='$g'${nl}f() { if false; then${nl}c=ok${nl}fi; }${nl}f${nl}eval \"\$c\"" "c='$g'${nl}f() { if false; then >/dev/null fi${nl}c=ok${nl}fi; }${nl}f${nl}eval \"\$c\""; do
+    b 2 "interp: palavra que o shell não lê como reservada não fecha o bloco, e o fecho de um bloco de dentro não fecha o de fora: $c" "$c"
+  done
+  # Controles: o fecho de verdade (com redirecionamento DEPOIS dele, dentro de if/for/case/função) desce o bloco certo, e o c=ok que vem depois volta a valer.
+  for c in "c='$g'${nl}if [ -d / ]; then${nl}true${nl}fi >/dev/null${nl}c=ok${nl}eval \"\$c\"" "c='$g'${nl}while read l; do${nl}true${nl}done < /dev/null${nl}c=ok${nl}eval \"\$c\"" \
+           "c='$g'${nl}if [ -d / ]; then${nl}case x in${nl}y) true ;;${nl}esac${nl}fi${nl}c=ok${nl}eval \"\$c\"" "c='$g'${nl}for i in 1; do${nl}if [ -d / ]; then${nl}true${nl}fi${nl}done${nl}c=ok${nl}eval \"\$c\"" \
+           "c='$g'${nl}case x in${nl}y) if [ -d / ]; then${nl}true${nl}fi ;;${nl}esac${nl}c=ok${nl}eval \"\$c\"" "c='$g'${nl}f() { if [ -d / ]; then${nl}true${nl}fi; }${nl}f${nl}c=ok${nl}eval \"\$c\"" \
+           "c='$g'${nl}diff <(true) fi${nl}c=ok${nl}eval \"\$c\"" "c='$g'${nl}find . -maxdepth 0 -exec fi \;${nl}c=ok${nl}eval \"\$c\""; do
+    b 0 "pass: interp: o fecho de verdade desce o bloco certo (fi >x, done <x, esac dentro de if, if dentro de for/case/função); fi como argumento não mexe em nada: $c" "$c"
+  done
+  # A marca de `f (` (definição de função) acaba no 1º trecho que não abre com `{`: o corpo de `f() ( … )` e de `f() if … fi` não é `{ … }`, e o grupo `{ … }` que vem depois RODA. Com a marca viva ele era tomado por corpo
+  # e nunca conferido, e o `)` de `<(…)` que vinha depois também perdia a marca de "o que segue é argumento" (que `f()` desliga).
+  for c in "f() ( true )${nl}{ git -C $OTH commit -m x; }" "f() ( true ); { git -C $OTH commit -m x; }" "f() if true; then true; fi${nl}{ git -C $OTH commit -m x; }" \
+           "c='$g'${nl}f() ( true )${nl}if false; then${nl}diff <(true) fi${nl}c=ok${nl}fi${nl}eval \"\$c\""; do
+    b 2 "interp: o corpo de função que não é { … } não faz o grupo { … } seguinte virar corpo: $c" "$c"
+  done
+  b 0 "pass: interp: depois de f() ( … ) o grupo { … } roda no clone próprio" "f() ( true )${nl}{ git -C $OWN status; }"
   # O texto passa de variável para variável, vem de $( ) guardado, de %b, do prefixo do comando, ou de dentro de um shell aninhado.
   for c in "c=\$(echo '$g'); eval \"\$c\"" "c=\$(echo '$g'); echo \"\$c\" | sh" "c='$g'; d=\$c; eval \"\$d\"" "c='$g'; d=\"\$c\"; eval \"\$d\"" \
            "printf '%b' 'cd $OTH\\ngit reset --hard' | sh" "printf '%b\\n' 'cd $OTH\\ngit reset --hard' | sh" "c='$g'; c=ok eval \"\$c\"" "c=ok; c='$g' eval '\$c'" \
@@ -1244,14 +1269,18 @@ echo "== $((n-fails))/$n ok =="
   mutant wrap "o descritor de 2>/dev/null conta como argumento" 's/^FD = re.compile(.*)  #/FD = re.compile(r"(?!)")  #/'
   mutant wrap "número com espaço antes do > (argumento!) é tratado como descritor" 's/\\d+(?=\[<>\])/\\d+\\s*(?=[<>])/'
   mutant wrap "palavra do shell na posição do subcomando do git não esconde um -C" 's/    if SHELLY.search(sub):/    if False:/'
-  mutant lexq "aspas simples: o ;<>… dentro delas volta a ser operador" "s/out.append(c if c == \"'\" else PROT.get(c, c))/out.append(c)/"
-  mutant lexq "aspas duplas: o ;<>… dentro delas volta a ser operador" "s/out.append(c if c == '\"' else PROT.get(c, c))/out.append(c)/"
-  mutant lexq "barra + caractere (\\>): o caractere escapado volta a ser operador" 's/else \[c, PROT.get(cmd\[i + 1\], cmd\[i + 1\])\]/else [c, cmd[i + 1]]/'
-  mutant lexq "quem é operador é decidido DEPOIS de devolver os caracteres protegidos" 's/bool(t) and set(t) <= PUNCT) for t in lx\]/bool(t) and set(t.translate(UNPROT)) <= PUNCT) for t in lx]/'
+  # Duas defesas dizem que o `;` de `';'` e de `\;` é texto: o PROT (o shlex nunca o vê como pontuação) e a marca QM de fim de palavra (um token com QM nunca é só pontuação). Tirar UMA não muda o
+  # resultado (mutante equivalente), por isso os mutantes deste bloco tiram as duas ($noqm = a que põe a QM): sem as duas, o operador entre aspas volta a separar comandos.
+  noqm='s/^                out.append(QM)$/                pass/'
+  mutant lexq "aspas simples: o ;<>… dentro delas volta a ser operador (e sem a QM)" "s/out.append(c if c == \"'\" else PROT.get(c, c))/out.append(c)/;$noqm"
+  mutant lexq "aspas duplas: o ;<>… dentro delas volta a ser operador (e sem a QM)" "s/out.append(c if c == '\"' else PROT.get(c, c))/out.append(c)/;$noqm"
+  mutant lexq "barra + caractere (\\>): o caractere escapado volta a ser operador (e sem a QM)" 's/else \[c, PROT.get(cmd\[i + 1\], cmd\[i + 1\])\]/else [c, cmd[i + 1]]/;'"$noqm"
+  mutant lexq "quem é operador é decidido DEPOIS de devolver os caracteres protegidos (e sem a QM)" 's/bool(t) and set(t) <= PUNCT) for t in lx\]/bool(t) and set(t.translate(UNPROT)) <= PUNCT) for t in lx]/;'"$noqm"
   mutant lexs "redirecionamento sem alvo (> no fim) engole o terminador" 's/if skip and not op:/if skip:/'
   mutant lexs "operador que chega com redirecionamento esperando alvo não zera o alvo" 's/^\( *\)skip = herestr = False  # um operador.*/\1pass/'
-  mutant lexe "a palavra vazia ('' ou \"\") some da lista de palavras" 's/ for t in lx\]/ for t in lx if t]/'
-  mutant lexe "a palavra vazia vale como operador" 's/(t.translate(UNPROT), bool(t) and set(t)/(t.translate(UNPROT), set(t)/'
+  # Idem: a palavra vazia ('' ou "") sai do shlex como "" e o protect lhe põe a QM (o token deixa de ser vazio), então estes dois mutantes também tiram a QM.
+  mutant lexe "a palavra vazia ('' ou \"\") some da lista de palavras (e sem a QM)" 's/ for t in lx\]/ for t in lx if t]/;'"$noqm"
+  mutant lexe "a palavra vazia vale como operador (e sem a QM)" 's/(word(t), bool(t) and set(t)/(word(t), set(t)/;'"$noqm"
   mutant lexd "\$'…' não é aberto (o \$ fica e o git vira \$git)" "s/elif c == \"\\\$\" and cmd\[i + 1:i + 2\] == \"'\":/elif False:/"
   mutant lexd "\$\"…\" não perde o \$" "s/elif c == \"\\\$\" and cmd\[i + 1:i + 2\] == '\"':/elif False:/"
   mutant lexd "escape hexadecimal de \$'…' não é decodificado" 's/return chr(min(int(e\[1:\], 16), 0x10FFFF))/return m.group(0)/'
@@ -1378,12 +1407,22 @@ echo "== $((n-fails))/$n ok =="
   mutant interpe "função chamada por um trecho que pode não ter rodado atribui como se tivesse" 's/^        st\["maybe"\] = was or maybe$/        st["maybe"] = was/'
   mutant interpe "a palavra de comando que é função, chamada por um trecho que pode não ter rodado, atribui como se tivesse" 's/            r = call(fw, blind, norun)/            r = call(fw, blind)/'
   mutant interpe "função escondida atrás de um embrulho (command f), chamada por um trecho que pode não ter rodado, atribui como se tivesse" 's/                r = call(c, blind, unsure)  #.*/                r = call(c, blind)/'
-  mutant interpe "if/for/while/until em várias linhas não abrem bloco (a atribuição de dentro vale como certa)" 's/st\["bdepth"\] = st.get("bdepth", 0) + 1/pass/'
-  mutant interpe "fi/done/esac não fecham o bloco (a atribuição de DEPOIS dele vira \"talvez\")" 's/st\["bdepth"\] = max(st.get("bdepth", 0) - 1, 0)/pass/'
-  mutant interpe "dentro do bloco de várias linhas o trecho não é \"pode não ter rodado\"" 's/ or st.get("bdepth", 0) > 0  # o trecho/  # o trecho/'
-  mutant interpe "o cd dentro do bloco de várias linhas vale depois do fi" 's/if (blk or st.get("bdepth", 0) > 0) and new is not None:/if blk and new is not None:/'
-  mutant interpe "o case não conta como bloco (o esac fecha o if de fora)" 's/("if", "for", "while", "until", "case", "select")/("if", "for", "while", "until", "select")/'
+  mutant interpe "if/for/while/until/select/case em várias linhas não abrem bloco (a atribuição de dentro vale como certa)" 's/            bs.append(OPENS\[lead\])/            pass/'
+  mutant interpe "fi/done/esac não fecham o bloco (a atribuição de DEPOIS dele vira \"talvez\")" 's/^            bs.pop()  # só o fecho/            pass  # só o fecho/'
+  mutant interpe "qualquer fecho tira o bloco de cima da pilha, não só o que combina (o fi de um padrão de case, \"fi)\", fecha o if de fora)" 's/        elif bs and lead == bs\[-1\]:/        elif bs and lead in OPENS.values():/'
+  mutant interpe "dentro do bloco de várias linhas o trecho não é \"pode não ter rodado\"" 's/ or bool(bs)  # o trecho/  # o trecho/'
+  mutant interpe "o cd dentro do bloco de várias linhas vale depois do fi" 's/if (blk or bs) and new is not None:/if blk and new is not None:/'
+  mutant interpe "o case não abre bloco (a atribuição na 2ª linha de um ramo vale como certa)" 's/, "case": "esac"}/}/'
   mutant interpe "then/do na frente de um if (then if x; then) escondem a abertura" 's/^LEAD = {"then", "do", /LEAD = {/'
+  mutant interpe "a palavra que levou aspa ou barra (\\fi, \"fi\") não é marcada no protect: fecha o bloco como a reservada" 's/^                out.append(QM)$/                pass/'
+  mutant interpe "word() devolve a palavra de aspa ou barra como texto comum (\\fi fecha o if)" 's/    return Q(s) if QM in t and s in BLOCK else s/    return s/'
+  mutant interpe "o trecho cuja 1ª palavra levou aspa ou barra ainda abre ou fecha bloco" 's/        if ext or isinstance(lead, Q):/        if ext:/'
+  mutant interpe "a palavra reservada com barra (\\then fi) é pulada como ligação: o fi dela fecha o bloco" 's/isinstance(x, Q) or x not in LEAD/x not in LEAD/'
+  mutant interpe "o find -exec fi \; roda o programa fi e é tomado por fecho de bloco" 's/        if ext or isinstance(lead, Q):/        if isinstance(lead, Q):/'
+  mutant interpe "a palavra depois de um redirecionamento (>x fi) é tomada por reservada" 's/            skip, rd = False, rd or all(w in LEAD for w in seg)/            skip = False/'
+  mutant interpe "a palavra depois do ) de <(…) (diff <(true) fi) é tomada por reservada" 's/seg, prev, rd = \[\], pc, pc == ")" and not st.get("func")/seg, prev, rd = [], pc, False/'
+  mutant interpe "o ) de f() tira a reservada do corpo da função ({ if … fi } não abre bloco)" 's/seg, prev, rd = \[\], pc, pc == ")" and not st.get("func")/seg, prev, rd = [], pc, pc == ")"/'
+  mutant interpe "a marca de f ( não acaba num corpo que não é { … } (o grupo { … } seguinte vira corpo e nunca é conferido)" 's/^        if seg and seg\[0\] != "{":/        if False:/'
   mutant interpe "variantes demais passam sem conferir (o teto some)" 's/        if len(out) > MANY:/        if False:/'
   mutant interpe "variantes demais bloqueiam como falha do guarda, sem dizer o motivo" 's/        except Many:/        except ZeroDivisionError:/'
   echo "-- contra um stub que só sai 0 (o servidor ANTES desta fatia)"
