@@ -533,8 +533,14 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
             elif not st["fdepth"] and term == "&":
                 st["cwd"] = None
             return None
-        if st.get("calling") and (seg[:1] == ["function"] or seg[:1] == ["{"] and prev == ")"):  # definição aninhada num corpo reexecutado (`function g {`, `g() {`): o corpo dela não roda agora e onde ele acaba eu não sei (o `}` que o fecha não fica guardado)
-            st["lost"] = True  # até o fim desta reexecução, `cd` e atribuição de variável valem "não sei" (ver unsure e o ramo do cd): o que o corpo que não roda faz não pode valer para o que vem depois
+        if st.get("calling"):
+            if len(seg) == 1 and term == "(" and seg[0] not in KEYWORDS:
+                st["nhead"] = seg[0]  # a cabeça `g (` de uma definição aninhada: o `{` que vem a seguir é o corpo dela
+            if seg[:1] == ["function"] or seg[:1] == ["{"] and prev == ")":  # definição aninhada num corpo reexecutado (`function g {`, `g() {`): o corpo dela não roda agora e onde ele acaba eu não sei (o `}` que o fecha não fica guardado)
+                st["lost"] = True  # até o fim desta reexecução, `cd` e atribuição de variável valem "não sei" (ver unsure e o ramo do cd): o que o corpo que não roda faz não pode valer para o que vem depois
+                nm = seg[1] if seg[0] == "function" and seg[1:2] else st.pop("nhead", None)
+                if nm:  # a aninhada passa a existir: uma chamada dela depois, de fora, confere o resto desta lista (mais do que o corpo dela, que não sei onde acaba: lado fechado)
+                    st["funcs"].setdefault(nm, []).extend(st.get("rest", ()))
         if not st.get("calling") and (seg[:1] == ["{"] and st.pop("func", False) or seg[:1] == ["function"] and seg[2:3] == ["{"]):  # nunca ao REEXECUTAR um corpo guardado (calling): o `{` guardado ali reabria a definição com o nome velho, desviava o resto do corpo para a lista errada e o laço de chamada percorria essa lista sem fim (ga-tih62nv)
             if seg[0] == "function":
                 st["fname"], seg = seg[1], seg[2:]
@@ -601,7 +607,9 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
             st["calling"].add(c)
             saved = st.get("lost")  # a região perdida de quem chamou continua depois que esta chamada acaba: o que vem depois pode ser o resto do corpo que não roda
             try:
-                for s, p, t in st["funcs"][c]:
+                body = list(st["funcs"][c])  # cópia: definir uma aninhada ali dentro acrescenta à lista de quem a define, e o que se acrescenta não é revisto nesta passada
+                for i, (s, p, t) in enumerate(body):
+                    st["rest"] = body[i:]
                     r = one(list(s), blind, p, t)
                     if r:
                         return r
@@ -649,7 +657,9 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
     if st.get("fdepth"):  # o fim da função não fecha (uma `{` entre aspas desconta a conta): a chamada pode ter caído no corpo — confiro o corpo como se rodasse, em diretório "não sei"
         st["fdepth"] = 0
         st.setdefault("calling", set()).add(st["fname"])  # este corpo também é reexecutado: conferido, não relido como definição (ver o `{` em one)
-        for s, p, t in st["funcs"].get(st["fname"], []):
+        body = list(st["funcs"].get(st["fname"], []))  # cópia, pelo mesmo motivo do laço de chamada de função acima
+        for i, (s, p, t) in enumerate(body):
+            st["rest"] = body[i:]
             r = one(list(s), True, p, t)
             if r:
                 return r

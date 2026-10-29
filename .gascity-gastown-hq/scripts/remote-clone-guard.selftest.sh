@@ -908,6 +908,9 @@ PYEOF
   b 2 "budget: ...a definição que pode não ter rodado (true || function f { cd <próprio>; }): o cd de f não vale" "cd $OTH; true || function f { cd $OWN; }; f; git commit -m x"
   b 2 "budget: ...a região perdida sobrevive a uma chamada feita dentro dela (depois do h, o cd ainda é o do corpo que não roda)" "f() { :; function g { :; h; cd $OWN; }; git commit -m x; }; h() { :; }; cd $OTH; f"
   b 2 "budget: a cabeça g() de um f aberto não deixa bandeira velha: o grupo { } de fora não é engolido como corpo de g" "g() { k() { cd $OTH; }; k; g() { :; }; }; g; { git commit -m x; }"
+  b 2 "budget: f() { g() { git commit; }; }; f; cd <alheio>; g — a aninhada passa a existir quando f roda, e a chamada dela de fora é conferida" "f() { g() { git commit -m x; }; }; f; cd $OTH; g"
+  b 2 "budget: ...o mesmo com function g {" "f() { function g { git commit -m x; }; }; f; cd $OTH; g"
+  b 0 "budget: uma função que se redefine (function f { dentro de f) não gira nem estoura o teto" "f() { :; function f { :; }; :; }; f"
   b 0 "budget: controle — f() { { cd <próprio>; }; :; }; cd <alheio>; f; git commit — o grupo do começo do corpo RODA, o cd vale" "f() { { cd $OWN; }; :; }; cd $OTH; f; git commit -m x"
   b 0 "budget: controle — com uma bandeira de definição velha (foo(); no meio), o grupo { } do corpo de f NÃO reabre a definição: o cd e o git do próprio seguem certos" "f() { :; { :; }; }; foo(); f; cd $OWN && git commit -m x"
   b 2 "budget: f cuja chave não fecha (aspa tardia) com function g { } e um git no alheio: o corpo reexecutado no fim é CONFERIDO, não engolido por g" "f() { :; echo '{'; function g { :; }; git -C $OTH commit -m x; }; f"
@@ -1084,13 +1087,17 @@ echo "== $((n-fails))/$n ok =="
   mutant budget "o relógio continua armado depois do veredito" 's/^        signal.setitimer(signal.ITIMER_REAL, 0)$/        pass/'
   mutant budget "o estouro dentro do julgamento cai no 'o guarda falhou' (sem a recusa de tempo)" 's/^    except Budget:$/    except KeyError:/'
   mutant budget "main() não pega o estouro" 's/^    except Budget as e:/    except KeyError as e:/'
-  mutant budget "function NOME { aninhada num corpo reexecutado não marca a região como perdida" 's/(seg\[:1\] == \["function"\] or seg\[:1\] == \["{"\] and prev == ")")/(seg[:1] == ["{"] and prev == ")")/'
-  mutant budget "NOME() { aninhada num corpo reexecutado não marca a região como perdida" 's/(seg\[:1\] == \["function"\] or seg\[:1\] == \["{"\] and prev == ")")/(seg[:1] == ["function"])/'
+  mutant budget "function NOME { aninhada num corpo reexecutado não marca a região como perdida" 's/if seg\[:1\] == \["function"\] or seg\[:1\] == \["{"\] and prev == ")":/if seg[:1] == ["{"] and prev == ")":/'
+  mutant budget "NOME() { aninhada num corpo reexecutado não marca a região como perdida" 's/if seg\[:1\] == \["function"\] or seg\[:1\] == \["{"\] and prev == ")":/if seg[:1] == ["function"]:/'
   mutant budget "na região perdida o cd volta a valer" 's/if st.get("lost") or kw or wrapped or ext or/if kw or wrapped or ext or/'
   mutant budget "na região perdida a atribuição de variável volta a valer" 's/unsure = bool(st.get("lost")) or kw/unsure = kw/'
   mutant budget "uma chamada feita dentro da região perdida a encerra para o resto do corpo de fora" 's/^                st\["lost"\] = saved$/                st.pop("lost", None)/'
   mutant budget "function f { depois de || ou && vale como definição que sempre rodou" 's/";" if prev == ")" else prev/";"/'
   mutant budget "a cabeça g() dentro de uma definição aberta deixa a bandeira velha (engole o próximo grupo { })" 's/ and not st.get("fdepth"):  # not fdepth/:  # not fdepth/'
+  mutant budget "a aninhada não passa a existir quando f roda (a chamada dela de fora não é conferida)" 's/^                    st\["funcs"\]\.setdefault(nm, \[\])\.extend(st\.get("rest", ()))$/                    pass/'
+  mutant budget "a cabeça g() aninhada não dá o nome à função (só a forma function g { dá)" 's/^                st\["nhead"\] = seg\[0\] .*/                pass/'
+  mutant budget "function g { aninhada não dá o nome à função (só a forma g() { dá)" 's/nm = seg\[1\] if seg\[0\] == "function" and seg\[1:2\] else st.pop("nhead", None)/nm = st.pop("nhead", None)/'
+  mutant budget "a reexecução percorre a lista viva (uma função que se redefine acrescenta a si mesma sem fim)" 's/body = list(st\["funcs"\]\[c\])  # cópia/body = st["funcs"][c]  # cópia/'
   mutant budget "o corpo que começa por um grupo { } parece uma definição aninhada" 's/";" if prev == ")" else prev/prev/'
   echo "-- contra um stub que só sai 0 (o servidor ANTES desta fatia)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"; printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$T/stub.py"
