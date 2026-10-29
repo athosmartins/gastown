@@ -2,8 +2,7 @@
 # secret-read-guard.selftest.sh (ga-nkfwixz) — hermético: HOME de teste num tmp, sem rede. Quatro blocos: tabela de casos (a coluna SN é o veredito do cc-safety-net
 # 2.7.0 medido em 28/10; "dev" marca a divergência que escolhi), ponta a ponta (exit code e mensagem), fuzzer diferencial contra o bash REAL (leitores falsos
 # registram o caminho FINAL que o shell entregou; todo comando que tocou segredo tem de bloquear) e mutantes (cada guarda apagada tem de reprovar a tabela).
-# Uso: secret-read-guard.selftest.sh [N-do-fuzzer, padrão 150] [semente, padrão $SRG_SEED ou 7]. SRG_UNDER_TEST=<arquivo> roda a suíte contra outra cópia do guarda.
-# Exit 0 = tudo passou.
+# Uso: secret-read-guard.selftest.sh [N-do-fuzzer, padrão 150] [semente, padrão $SRG_SEED ou 7]. SRG_UNDER_TEST=<arquivo> roda a suíte contra outra cópia do guarda. Exit 0 = tudo passou.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec python3 -I - "${SRG_UNDER_TEST:-$HERE/secret-read-guard.py}" "${1:-150}" "${2:-${SRG_SEED:-7}}" <<'PYEOF'
@@ -11,16 +10,16 @@ import importlib.util, json, os, random, shlex, shutil, subprocess, sys, tempfil
 
 GUARD, N, SEED = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 H = os.path.realpath(tempfile.mkdtemp(prefix="srgst."))
-for d in (".ssh", ".aws", ".gnupg", ".claude", "proj/node_modules/pkg", "proj/certs", "gt-remote/keys", "tmp", "bin"):
+for d in (".ssh", ".aws", ".gnupg", ".claude", ".kube", "proj/node_modules/pkg", "proj/certs", "gt-remote/keys", "tmp", "bin"):
     os.makedirs(f"{H}/{d}")
-FILES = [".ssh/id_rsa", ".ssh/id_ed25519", ".ssh/id_rsa.pub", ".ssh/config", ".ssh/known_hosts", ".aws/credentials", ".gnupg/pubring.kbx", ".claude/.credentials.json", "proj/.env", "proj/.env.example",
+FILES = [".ssh/id_rsa", ".ssh/id_ed25519", ".ssh/id_rsa.pub", ".ssh/config", ".ssh/known_hosts", ".aws/credentials", ".gnupg/pubring.kbx", ".claude/.credentials.json", ".kube/config", "proj/.env", "proj/.env.example",
          "proj/README.md", "gt-remote/keys/gt_mirror", "proj/node_modules/pkg/cacert.pem", "proj/certs/zz.key"]
 for f in FILES:
     open(f"{H}/{f}", "w").write("x\n")
 for i in range(50):  # 55 entradas em ~/.ssh e 51 em proj/certs: o segredo (id_rsa, zz.key) vem depois da 50ª, onde o guarda cortava
     open(f"{H}/.ssh/a{i:02d}.pub", "w").close(); open(f"{H}/proj/certs/a{i:02d}.crt", "w").close()
 os.symlink(f"{H}/.ssh/id_rsa", f"{H}/proj/linkado")
-os.environ["HOME"] = H
+os.environ["HOME"] = H; os.environ.pop("CLAUDE_PROJECT_DIR", None)  # o pedido sem cwd usa o do hook: o teste dele não herda o do ambiente
 CWD = f"{H}/proj"
 
 
@@ -73,10 +72,7 @@ for want, sn, cmd in [
     TABLE.append((want, B, {"command": cmd}, sn))
 
 
-def deep(n, inner):
-    for _ in range(n):
-        inner = f"echo $({inner})"
-    return inner
+def deep(n, inner): return "echo $(" * n + inner + ")" * n
 
 
 # Gate, tentativa 1 (ga-nkfwixz) e os irmãos da MESMA família: o guarda TINHA a informação (ou sabia que não sabia) e devolveu o mesmo "liberado" de "não é segredo". Cada linha abaixo é
@@ -122,16 +118,30 @@ for want, sn, cmd in [
     ("B", "-", "git show :.env"), ("B", "-", "git show :0:.env"), ("B", "-", "git show HEAD:.env"), ("P", "-", "git show :README.md"), ("P", "-", "git show HEAD:README.md"),
 ]:
     TABLE.append((want, B, {"command": cmd}, sn))
-# Grep e Glob sem `path` varrem o cwd da sessão: tem de valer como se o cwd estivesse escrito (o "@cwd" troca o cwd da linha)
+# Grep e Glob sem `path` varrem o cwd da sessão: tem de valer como se o cwd estivesse escrito (o "@cwd" troca o cwd da linha; "" = pedido sem cwd, de onde o `cd` relativo parte do cwd do hook)
 TABLE += [("B", "Grep", {"pattern": "t", "@cwd": "@H"}, "-"), ("B", "Grep", {"pattern": "t", "path": "", "@cwd": "@H/.ssh"}, "-"), ("B", "Glob", {"pattern": "*", "@cwd": "@H/.ssh"}, "-"),
           ("P", "Grep", {"pattern": "t", "@cwd": "@H/proj"}, "-"), ("P", "Glob", {"pattern": "**/*.py", "@cwd": "@H/proj"}, "-"),
           # Grep lê conteúdo (ancestral de segredo vale); Glob só lista nomes (fica no HOME e acima)
           ("B", "Grep", {"pattern": "t", "path": "~/.claude"}, "-"), ("B", "Grep", {"pattern": "t", "@cwd": "@H/.config/gcloud"}, "-"), ("P", "Grep", {"pattern": "t", "path": "~/.claude/projects"}, "-"),
-          ("P", "Glob", {"pattern": "~/.claude/settings*"}, "-")]
+          ("P", "Glob", {"pattern": "~/.claude/settings*"}, "-"), ("P", B, {"command": "cd sub; cat README.md", "@cwd": ""}, "-")]
 
 # tentativa 3 do gate: glob que passa de 50 casos tem de olhar TODOS (id_rsa é a 53ª de ~/.ssh, zz.key a 51ª de certs); sem tempo ("@secs": -1) bloqueia, e só glob gasta tempo
 TABLE += [("B", B, {"command": "cat ~/.ssh/*"}, "-"), ("B", B, {"command": "cat certs/*"}, "-"), ("P", B, {"command": "cat certs/a*"}, "-"), ("B", B, {"command": "cat certs/a*", "@secs": "-1"}, "-"),
           ("B", B, {"command": "cat certs/{a0,a1}* README.md", "@secs": "-1"}, "-"), ("P", B, {"command": "cat README.md nada*", "@secs": "-1"}, "-"), ("P", B, {"command": "cat ./README.md", "@secs": "-1"}, "-")]
+
+# tentativa 4: o cwd depois de um `cd` é o do shell ou "não sei" (nunca "o mesmo de antes"), palavra reservada na frente do cd, o corpo do heredoc roda onde o cd levou, array e `+=`, dialeto do glob
+TABLE += [(w, B, {"command": c}, "-") for w, c in [
+    ("B", "{ cd ~/.claude; cat .credentials.json; }"), ("B", "if cd ~/.claude; then cat .credentials.json; fi"), ("B", "if true; then cd ~/.claude; cat .credentials.json; fi"), ("B", "for i in 1; do cd ~/.claude; cat .credentials.json; done"),
+    ("B", "f() { cd ~/.claude; cat .credentials.json; }; f"), ("B", "function f { cd ~/.claude; cat .credentials.json; }; f"), ("B", "{ cd ~/.kube; cat config; }"), ("B", "cd ~; cd proj; cd -; cat .claude/.credentials.json"),
+    ("B", "cd ~/.claude; pushd /tmp >/dev/null; popd >/dev/null; cat .credentials.json"), ("B", "cd ~/.claude; pushd /tmp >/dev/null; pushd >/dev/null; cat .credentials.json"), ("B", "cd $UNSET; cat .claude/.credentials.json"),
+    ("B", "cd $UNSET; cat .credentials.json"), ("B", "cd $UNSET; cd sub; cat .credentials.json"), ("B", 'cd "$(echo ~/.claude)"; cat .credentials.json'), ("B", "cd ~root; cat .claude/.credentials.json"), ("B", 'eval "cd ~/.claude"; cat .credentials.json'),
+    ("B", "cd ~/.claude; bash <<'EOF'\ncat .credentials.json\nEOF\ncd /tmp"), ("P", "{ cd proj; cat README.md; }"), ("P", "cd $UNSET; cat README.md"), ("P", "cd $UNSET; cat settings.json"), ("P", "cd $UNSET; cd /tmp; cat .credentials.json"),
+    ("P", "if [ -f .env ]; then echo ok; fi"), ("P", "if true; then cat ~/.ssh/config; fi"), ("P", 'cd "$(git rev-parse --show-toplevel)" && sleep 1 && date +%T'), ("P", "cd $UNSET; cat src/main.py"),
+    ("P", "cd $UNSET; grep -rn x .; cp -r . /tmp/x"), ("B", "cd $UNSET; cat config"), ("B", "cd $UNSET; cat ~/.aws/nope"), ("P", 'cd $UNSET; cat $f src/$f "$(basename "$f")" $S/x'), ("B", "cd $UNSET; cat $f/id_rsa"), ("B", "cd $UNSET; cat ~/.aws/$f"),
+    ("B", "D=(.claude); cat ~/$D/.credentials.json"), ("B", 'files=(~/.claude/.credentials.json); for f in "${files[@]}"; do cat "$f"; done'), ("B", 'files=(~/.claude/.credentials.json); cat "${files[@]}"'),
+    ("B", "declare -a D=(.claude); cat ~/$D/.credentials.json"), ("B", "declare -a f=(~/.claude/.credentials.json); echo done"), ("B", 'files=(); files+=(~/.claude/.credentials.json); cat "${files[@]}"'),
+    ("B", "F+=~/.ssh/id_rsa; cat $F"), ("B", "files=(\n~/.claude/.credentials.json\n)"), ("P", 'files=(README.md x); cat "${files[@]}"'), ("P", "D=(.claude); cat ~/$D/settings.json"),
+    ("B", "cat ~/.ssh/[^c]*"), ("B", "cat ~/.claude/.cred[[:alpha:]]*"), ("P", "cat ~/.ssh/[^i]*"), ("B", "find . -name .env -delete"), ("B", 'cat $"$HOME/.gnupg/pubring.kbx"'), ("P", 'cat $"README.md"')]]
 
 
 def run_table(m):
@@ -222,18 +232,13 @@ def shape(S, P):
     return rnd.choice([f"{r} {S}", f"F={S}; {v} $F", f"export F={S}; {v} \"$F\"", f"cat < {S}", f"echo hi > {S}", f"{v} $(echo {S})", f"echo {S} | xargs {v}", f"find {S} -maxdepth 0 -exec {v} {{}} \\;",
                        f"for f in {S}; do {v} \"$f\"; done", f"cd {os.path.dirname(P).replace(H, '~')}; {r} {os.path.basename(P)}", f"echo {q(f'{r} {S}')} | bash", f"tee {S}",
                        f"X=; {r} {S}$X", f"cd ~; D={rd}; {r} $D/{b}", f"D={rd}; {r} ~/$D/{b}", f"export D={rd}; cd ~; {r} $D/{b}", f"A=$HOME; B=$A/{rd}; {r} $B/{b}",
+                       f"cd \"$(echo ~)/{rd}\"; {r} {b}", f"A=({S}); {v} \"${{A[@]}}\"", f"A=({S}); for f in \"${{A[@]}}\"; do {v} \"$f\"; done", f"D=({rd}); {r} ~/$D/{b}",
                        f"find {d} -name {b} | xargs {v}", f"find {d} -name {b} -print0 | xargs -0 {v}", f"{v} $(find {d} -name {b})"])
-
-
-def deepen(c):
-    for _ in range(rnd.randint(7, 9)):
-        c = f"echo $({c})"
-    return c
 
 
 def wrap(c):
     for _ in range(rnd.choice([0, 1, 1, 2])):
-        c = rnd.choice([lambda: f"bash -c {q(c)}", lambda: f"eval {q(c)}", lambda: f"env {c}", lambda: f"command {c}", lambda: f"nohup {c}", lambda: f"timeout 5 {c}", lambda: f"( {c} )",
+        c = rnd.choice([lambda: f"bash -c {q(c)}", lambda: f"eval {q(c)}", lambda: f"env {c}", lambda: f"command {c}", lambda: f"nohup {c}", lambda: f"timeout 5 {c}", lambda: f"( {c} )", lambda: f"{{ {c}; }}", lambda: f"if true; then {c}; fi", lambda: f"for i in 1; do {c}; done", lambda: f"f() {{ {c}; }}; f",
                         lambda: f"true && {c}", lambda: f"{c} 2>/dev/null", lambda: f"bash <<'EOF'\n{c}\nEOF"])()
     return c
 
@@ -258,7 +263,7 @@ miss = []
 for i in range(N):
     rel = rnd.choice(SECRET if rnd.random() < 0.7 else BENIGN)
     cmd = rnd.choice(PRE) + wrap(shape(spell(rel), f"{H}/{rel}"))
-    cmd = deepen(cmd) if rnd.random() < 0.06 else cmd
+    cmd = deep(rnd.randint(7, 9), cmd) if rnd.random() < 0.06 else cmd
     t, rc = touched(cmd)
     if rc in (2, 126, 127):
         continue
@@ -274,8 +279,8 @@ SRC = open(GUARD).read()
 MUT = [("pasta ~/.ssh", "if rel and rel[0] in HOME_DIRS:", "if False and rel and rel[0] in HOME_DIRS:"), ("modelo de .env", "base.endswith(ENV_TEMPLATE)", "False"),
        ("exceção de leitura em ~/.ssh", "(rel[1] in SSH_OK or rel[1].endswith(\".pub\"))", "False"), ("escrita nas ferramentas", "tool in WRITE_TOOLS)", "False)"),
        ("pacote não é segredo", "any(s in low[:-1] for s in BROAD_SKIP)", "False"), ("verbo isento", "EXEMPT = {\"echo\",", "EXEMPT = {\"zzz\","), ("xargs/read tornam estrito", "FEEDERS = {\"xargs\",", "FEEDERS = {\"zzz\","),
-       ("rastreio de cd", "here = cd_target(cur, here, env) or here", "here = here"), ("heredoc para shell", "any(w in SHELLS for w in recv)", "False"), ("código por stdin", "\"-s\" in nargs or not [a for a in nargs", "\"-s\" in nargs and False and [a for a in nargs"),
-       ("raiz larga", "or home().startswith(p.rstrip(\"/\") + \"/\")", "or False"), ("teto da chave", "len(alts) <= 16", "len(alts) <= 1600"), ("find -exec", "not any(a in (\"-exec\", \"-execdir\", \"-ok\", \"-okdir\") for a in eargs)", "True"),
+       ("rastreio de cd", "here = cd_target(cur, here, env)", "here = here"), ("heredoc para shell", "any(w in SHELLS for w in recv)", "False"), ("código por stdin", "\"-s\" in nargs or not [a for a in nargs", "\"-s\" in nargs and False and [a for a in nargs"),
+       ("raiz larga", "or home().startswith(p.rstrip(\"/\") + \"/\")", "or False"), ("teto da chave", "len(alts) <= 16", "len(alts) <= 1600"), ("find -exec", "not any(a in (\"-exec\", \"-execdir\", \"-ok\", \"-okdir\", \"-delete\") for a in eargs)", "True"),
        ("valor colado", "cand = m.group(1) if (m := re.fullmatch(r\"-[A-Za-z](.+)\", cand)) else cand", "pass"), ("verbo que escreve", "reads = verb in READERS and not", "reads = True or not"),
        ("padrão do grep", "skip.add(ev + j); pat_done = True", "pat_done = True"), ("link simbólico", "os.path.realpath(p))):", "os.path.normpath(p))):"),
        ("crase aninhada", 'j += 2 if t[j] == "\\\\" else 1  # a crase', "j += 1  # a crase"), ("escapes de $'…'", 'cur.append(ansi(text[i:j]) if c == "$" else text[i:j])', "cur.append(text[i:j])"),
@@ -283,18 +288,29 @@ MUT = [("pasta ~/.ssh", "if rel and rel[0] in HOME_DIRS:", "if False and rel and
        ("aninhamento fundo bloqueia", 'return "secret.nesting-too-deep", cmd[:80]', "return None"), ("nome inteiro da variável", 'NAME = r"[A-Za-z_][A-Za-z0-9_]*"', 'NAME = r"[A-Za-z_]"'),
        ("valor vazio vale", "known = env[name] if name in env else", "known = env[name] if env.get(name) else"),
        ("padrão ${X:-…}", "return tilde(VAR.sub(one_var, dflt)) if known is None or (colon and not known) else known", "return known if known is not None else m.group(0)"),
-       ("variável relativa onde é usada", "env[name] = subst(val, env)", "env[name] = expand(val, cwd, env)"), ("export/declare registram a variável", 'env[a.split("=", 1)[0]] = subst(a.split("=", 1)[1], env)', "pass"),
+       ("variável relativa onde é usada", "env[name] = subst(els[0] if els else \"\", env)", "env[name] = expand(els[0] if els else \"\", cwd, env)"), ("export/declare registram a variável", "assign(a, cwd, env)  # só a variável", "pass  # só a variável"),
        ("$( ) em atribuição e redirecionamento", "for w in words + [t for t, _ in redirs] + [t for t, _ in herestr]:", "for w in words[i:]:"),
        ("$( ) em heredoc sem aspas", "for sub in () if quoted or hit else substitutions(body):", "for sub in ():"), ("heredoc com aspas é texto", "quoted = m.group(1) is not None or m.group(2) is not None or bool(m.group(3))", "quoted = False"),
        ("find -name em modo estrito", 'names = verb == "find" and not strict and not any(', 'names = verb == "find" and not any('),
        ("pasta literal antes do desconhecido", 'hit = match("/".join(comps[:first])', 'hit = None and match("/".join(comps[:first])'), ("nome do fim com pedaço desconhecido", "if hit is None and not UNKNOWN.search(comps[-1]):", "if False:"),
-       ("$k.pub segue chave pública", '(".pub" if comps[first].endswith(".pub") else "")', '""'), ("chave antes do til", "cands = [expand(b, cwd, env or {}) for b in braces(raw)]", "cands = braces(expand(raw, cwd, env or {}))"),
-       ("índice do git", 'if not hit and (m := re.fullmatch(r":(?:[0-3]:)?([^\\s:][^\\s]*)", cand)):', "if False:"), ("Grep/Glob sem path é o cwd", 'where = str(ti.get("path") or "") or cwd or os.getcwd()', 'where = str(ti.get("path") or "")'),
+       ("$k.pub segue chave pública", '(".pub" if comps[first].endswith(".pub") else "")', '""'), ("chave antes do til", "cands = [expand(b, cwd, env or {}) for b in alts]", "cands = braces(expand(raw, cwd, env or {}))"),
+       ("índice do git", 'if not hit and (m := re.fullmatch(r":(?:[0-3]:)?([^\\s:][^\\s]*)", cand)):', "if False:"), ("Grep/Glob sem path é o cwd", 'where = str(ti.get("path") or "") or cwd', 'where = str(ti.get("path") or "")'),
        ("embrulho esconde o verbo", "ev = real_verb(ws)", "ev = 0"), ("pedaço desconhecido pode ser vazio", 'bare = os.path.normpath(PIECE.sub("", cand))', "bare = cand"),
        ("ancestral de segredo (conteúdo)", "if p and deep and any(tuple(r) in CRED_PARENTS for r in rels(", "if False and any(tuple(r) in CRED_PARENTS for r in rels("),
        ("Glob só lista nomes", "broad(d, cwd, deep=False)", "broad(d, cwd, deep=True)"),
-       ("corte silencioso em 50", "enumerate(glob.iglob(cand), 1)", "enumerate(sorted(glob.glob(cand))[:50], 1)"), ("sem tempo não bloqueia", "raise OverflowError(cand)", "break"),
-       ("prazo recarregado por pedido", "LATE[0] = time.monotonic() + BUDGET_S", "pass")]
+       ("corte silencioso em 50", "enumerate(glob.iglob(pat), 1)", "enumerate(sorted(glob.glob(pat))[:50], 1)"), ("sem tempo não bloqueia", "raise OverflowError(cand)", "break"),
+       ("prazo recarregado por pedido", "LATE[0] = time.monotonic() + BUDGET_S", "pass"),
+       # tentativa 4
+       ("palavra reservada abre a linha", "cur, snap = bare(cur), dict(env)", "cur, snap = cur, dict(env)"), ("function f", 'or ws[0] == "function")', "or False)"), ("destino com $ ou crase vale cwd desconhecido", "or DYN.search(d) or", "or False or"),
+       ("cd - e +N", 'DYN = re.compile(r"[$`]|^~|^[+-]\\d*$")', 'DYN = re.compile(r"[$`]|^~")'), ("~usuario", 'DYN = re.compile(r"[$`]|^~|', 'DYN = re.compile(r"[$`]|'), ("popd", 'verb == "popd" or', "False or"),
+       ("pushd sem destino", '(verb == "pushd" and not args) or', "False or"), ("relativo a cwd desconhecido", "or (cwd is UNSURE and not os.path.isabs(d))", "or False"), ("eval com cd", 'if verb == "eval" and re.search(', 'if False and re.search('),
+       ("cwd desconhecido vale cada pasta de segredo", "for p in BASES] if cwd is UNSURE", "for p in [()]] if cwd is UNSURE"), ("heredoc roda onde o cd levou", "[x for c in seen for x in where(c)]", "where(here)"),
+       ("array é uma palavra", 'elif c == "(" and word and re.fullmatch(', 'elif False and c == "(" and word and re.fullmatch('), ("elementos do array", 'if val[:1] == "(" and val[-1:] == ")" else [val]', "if False else [val]"),
+       ("array em declare", "for c in elems(cand))", "for c in [cand])"), ("+= é atribuição", 'ASSIGN = re.compile(r"[A-Za-z_]\\w*\\+?=")', 'ASSIGN = re.compile(r"[A-Za-z_]\\w*=")'), ("[^ do glob", 'cand.replace("[^", "[!")', "cand"),
+       ("classe POSIX do glob", '"?" if "[:" in m.group(0) else m.group(0)', "m.group(0)"), ('$"…"', "elif c == '\"' or (c == \"$\" and nx == '\"'):", "elif c == '\"':"), ("find -delete", '"-okdir", "-delete")', '"-okdir")'),
+       ("pasta suposta: palavra que não existe vale só o nome", '(guess or ("/" not in raw and not write))', '("/" not in raw and not write)'), ("pasta suposta: ela mesma (.) vale só o nome", "or (guess and os.path.normpath(p) == cwd))", "or False)"),
+       ("pasta suposta: caminho absoluto vale inteiro", "guess = isinstance(cwd, Guess) and not os.path.isabs(subst(alt, env or {}))", "guess = isinstance(cwd, Guess)"),
+       ("varrer . numa pasta suposta", 'if isinstance(cwd, Guess) and not os.path.isabs(subst(raw or "", env or {})):', "if False:"), ("pasta suposta: pedaço desconhecido não é pasta de segredo", 'hit = None if guess and hit and hit.startswith(("secret.home.", "secret.cli.")) else hit', "hit = hit"), ("pedido sem cwd usa o do hook", 'os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()', 'os.environ.get("CLAUDE_PROJECT_DIR") or None')]
 alive = []
 for name, old, new in MUT:
     if SRC.count(old) != 1:
