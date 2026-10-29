@@ -541,7 +541,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
             st["fdepth"], st["funcs"] = 1, st.get("funcs", {})
             st["funcs"].setdefault(st["fname"], [])
             if seg[1:]:
-                st["funcs"][st["fname"]].append((seg[1:], ";", term))  # prev ";": o `)` do `f()` não é o operador de quem vem depois do `{` (senão um corpo que começa por um grupo `{ … }` pareceria uma definição aninhada ao ser reexecutado)
+                st["funcs"][st["fname"]].append((seg[1:], ";" if prev == ")" else prev, term))  # só o `)` do `f()` vira ";" (senão um corpo que começa por um grupo `{ … }` pareceria uma definição aninhada ao ser reexecutado); `||`, `&&`, `|`, `&` antes de `function f {` ficam: a definição pode não ter rodado
             return None
         if seg == ["}"]:
             if term == "&":
@@ -599,6 +599,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
                         return r
         elif c in st.get("funcs", {}) and c not in st.setdefault("calling", set()):  # chamada de função definida nesta chamada: o corpo roda AGORA, neste cwd
             st["calling"].add(c)
+            saved = st.get("lost")  # a região perdida de quem chamou continua depois que esta chamada acaba: o que vem depois pode ser o resto do corpo que não roda
             try:
                 for s, p, t in st["funcs"][c]:
                     r = one(list(s), blind, p, t)
@@ -606,7 +607,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
                         return r
             finally:
                 st["calling"].discard(c)
-                st.pop("lost", None)
+                st["lost"] = saved
         elif c == "git":
             return git_hit(seg, {**st["env"], **env}, cwd, terr, own)
         return None
@@ -631,7 +632,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
                     if r:
                         return r
                     if pc == "(":
-                        if len(seg) == 1 and not skip and seg[0] not in KEYWORDS:
+                        if len(seg) == 1 and not skip and seg[0] not in KEYWORDS and not st.get("fdepth"):  # not fdepth: a cabeça `g (` DENTRO de uma definição aberta deixaria a bandeira velha, e o próximo grupo `{ }` do fluxo de fora seria engolido como corpo de `g`, sem conferir
                             st["func"], st["fname"] = True, seg[0]  # `f (`: definição de função — o `{ … }` que vem a seguir é corpo que não roda agora
                         stack.append(st["cwd"])
                         skip = False  # `<(cmd)` / `>(cmd)`: o `<` que vem colado no `(` não é redirecionamento de arquivo, a palavra seguinte é um comando
