@@ -2988,6 +2988,61 @@ else
   # here could otherwise mislabel a DIFFERENT story's inert reason as this
   # one's.
   THIS_PULL_INERT_PREDICATE=""
+  # ga-hm8i53s: what the per-story probe below actually did, reset per story for
+  # the same leakage reason as the variables above. "not-run" = no probe this
+  # story (unresolvable MERGE_PRE_MAIN, or a Path A story that never needed
+  # one); otherwise ok | timeout | failed | silent (refresh_probe_classify).
+  # Only the three non-ok states mean "the probe did not answer" — the hold
+  # text further down keys on them, so a stale value here would word a
+  # different story's hold as an unavailable-attribution one.
+  MERGE_OWN_PROBE_STATE="not-run"
+  MERGE_OWN_PROBE_WHY=""
+  MERGE_OWN_PROBE_RC=""
+  MERGE_OWN_PROBE_SECS=""
+  # ga-hm8i53s: budget for the two DRY_RUN=1 helper probes below (per-story
+  # attribution and the bead-scoped freshness re-probe). It was a hard-coded
+  # `timeout 180`. Measured over the whole story-delivery.log (29/10): all 35
+  # unreadable per-story probes and all 6 unreadable re-probes took 180-187s —
+  # the cap expiring, never a faster failure — while readable probes ran a
+  # median of 131s (p90 163s, 24% of them above 150s). The wide call to the same
+  # helper (heavier: real run, widest window, NO timeout, so its numbers are
+  # uncensored) ran a median of 224s, p90 411s, p95 487s. 300s clears the
+  # readable tail with room; two probes at 300s plus that p95 wide call is
+  # ~1090s, inside the 1800s delivery:running ceiling (ga-015qqe) — but the
+  # tail beyond 180s of the probe itself is unmeasured (every sample was cut at
+  # the cap), which is why the log line now carries elapsed=: the next
+  # measurement is uncensored and this default can be set from data, not from
+  # this paragraph. A value that is not a positive integer falls back to
+  # 300: `timeout 0` means NO limit and a non-number makes `timeout` itself fail
+  # (rc 125, the probe never runs) — both worse than the default.
+  PROBE_TIMEOUT_S="${DELIVERY_PROBE_TIMEOUT_S:-300}"
+  case "$PROBE_TIMEOUT_S" in
+    ''|*[!0-9]*) PROBE_TIMEOUT_S=300 ;;
+    *) PROBE_TIMEOUT_S=$((10#$PROBE_TIMEOUT_S)); [ "$PROBE_TIMEOUT_S" -gt 0 ] || PROBE_TIMEOUT_S=300 ;;
+  esac
+  # refresh_probe_classify <verdict-line> <rc> <secs> — sets PROBE_STATE and
+  # PROBE_WHY for one DRY_RUN=1 helper call. Four states, never two:
+  #   timeout — rc 124. Decided FIRST, before looking at the output: a helper
+  #             killed mid-print can leave VERDICT= without the AFFECTED= that
+  #             follows it (emit() prints them eight lines apart), and a cut-off
+  #             list must never read as "reaches nothing". The helper has no
+  #             literal `exit 124` (grep), so 124 here is `timeout` firing.
+  #   ok      — a VERDICT= line (the helper's exit code is NOT health: it exits
+  #             1 on every non-OK verdict).
+  #   failed  — no VERDICT=, rc != 0 (crash, killed, missing helper).
+  #   silent  — no VERDICT=, rc 0 (the helper finished and said nothing).
+  refresh_probe_classify() {
+    local _v="$1" _rc="$2" _secs="$3"
+    if [ "$_rc" = "124" ]; then
+      PROBE_STATE="timeout"; PROBE_WHY="timed out after ${_secs}s (budget ${PROBE_TIMEOUT_S}s, rc=124)"
+    elif [ -n "$_v" ]; then
+      PROBE_STATE="ok"; PROBE_WHY=""
+    elif [ "$_rc" != "0" ]; then
+      PROBE_STATE="failed"; PROBE_WHY="exited rc=$_rc after ${_secs}s without a VERDICT= line"
+    else
+      PROBE_STATE="silent"; PROBE_WHY="finished (rc=0) after ${_secs}s without printing a VERDICT= line"
+    fi
+  }
   if [ -n "$PRE_DEPLOY_SHA" ] && [ "$PRE_DEPLOY_SHA" != "$POST_DEPLOY_SHA" ]; then
     THIS_PULL_CHANGED="$(git -C "$RUNTIME_DIR" diff --name-only "$PRE_DEPLOY_SHA" "$POST_DEPLOY_SHA" 2>/dev/null || true)"
     if [ -n "${THIS_PULL_CHANGED// /}" ]; then
@@ -3142,15 +3197,32 @@ else
     # story that ALSO reaches a real live daemon (the common, mixed case)
     # still correctly stays "not inert" below: subtracting a self-healing
     # scheduled job never empties a set that also contains a live daemon.
+    # ga-hm8i53s: the exit code and the elapsed time are KEPT (they used to be
+    # thrown away by `|| true`), because they are the only thing that tells a
+    # probe that ran out of budget from one that crashed or one that answered
+    # with nothing — three different failures that all left the output empty and
+    # were all logged as "<unparseable output> affected=[]". Same inert default
+    # as before: no answer is never "reaches nothing".
+    MERGE_OWN_PROBE_RC=0
+    MERGE_OWN_PROBE_T0=$(date +%s)
     MERGE_OWN_OUT=$(RUNTIME_DIR="$RUNTIME_DIR" \
       PRE_DEPLOY_SHA="$MERGE_OWN_BASE_SHA" POST_DEPLOY_SHA="$MERGE_SHA" \
       DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
       EXTRA_RUNTIME_ROOTS="$EXTRA_RUNTIME_ROOTS" \
       DRY_RUN=1 \
-      timeout 180 bash "$REFRESH_HELPER" 2>/dev/null || true)
+      timeout "$PROBE_TIMEOUT_S" bash "$REFRESH_HELPER" 2>/dev/null) || MERGE_OWN_PROBE_RC=$?
+    MERGE_OWN_PROBE_SECS=$(( $(date +%s) - MERGE_OWN_PROBE_T0 ))
     MERGE_OWN_VERDICT_LINE=$(echo "$MERGE_OWN_OUT" | grep '^VERDICT=' | head -1 || true)
     MERGE_OWN_AFFECTED=$(echo "$MERGE_OWN_OUT" | grep '^AFFECTED=' | head -1 | sed 's/^AFFECTED=//' || true)
     MERGE_OWN_AFFECTED_NOT_RUNNING=$(echo "$MERGE_OWN_OUT" | grep '^AFFECTED_NOT_RUNNING=' | head -1 | sed 's/^AFFECTED_NOT_RUNNING=//' || true)
+    refresh_probe_classify "$MERGE_OWN_VERDICT_LINE" "$MERGE_OWN_PROBE_RC" "$MERGE_OWN_PROBE_SECS"
+    MERGE_OWN_PROBE_STATE="$PROBE_STATE"; MERGE_OWN_PROBE_WHY="$PROBE_WHY"
+    if [ "$MERGE_OWN_PROBE_STATE" != "ok" ]; then
+      # Whatever a probe that did not finish managed to print is not an answer:
+      # drop it so the branches below see exactly "no answer", and a list cut
+      # off mid-print can never become an empty (= inert) reach.
+      MERGE_OWN_VERDICT_LINE=""; MERGE_OWN_AFFECTED=""; MERGE_OWN_AFFECTED_NOT_RUNNING=""
+    fi
     MERGE_OWN_AFFECTED_LIVE=""
     for _moa in $MERGE_OWN_AFFECTED; do
       case " $MERGE_OWN_AFFECTED_NOT_RUNNING " in
@@ -3158,9 +3230,14 @@ else
         *) MERGE_OWN_AFFECTED_LIVE="$MERGE_OWN_AFFECTED_LIVE $_moa" ;;
       esac
     done
-    log "Per-story attribution probe (this-iteration-pull pre=$PRE_DEPLOY_SHA post=$POST_DEPLOY_SHA) — asked daemon-refresh.sh (DRY_RUN=1, no real kickstart/drain) whether $STORY_ID's own merge $MERGE_SHA alone (vs pre-merge-main base $MERGE_OWN_BASE_SHA) reaches any live daemon: ${MERGE_OWN_VERDICT_LINE:-<unparseable output>} affected=[$MERGE_OWN_AFFECTED] affected_not_running=[$MERGE_OWN_AFFECTED_NOT_RUNNING] affected_live=[$MERGE_OWN_AFFECTED_LIVE]."
+    # ga-hm8i53s: three states in the log, not two. "affected=[]" means the probe
+    # ANSWERED and this merge reaches nothing; a probe that did not answer prints
+    # "?" there, so a reader (or a grep) can never take "could not tell" for it.
+    _mo_show_aff="$MERGE_OWN_AFFECTED"; _mo_show_nr="$MERGE_OWN_AFFECTED_NOT_RUNNING"; _mo_show_live="$MERGE_OWN_AFFECTED_LIVE"
+    if [ "$MERGE_OWN_PROBE_STATE" != "ok" ]; then _mo_show_aff="?"; _mo_show_nr="?"; _mo_show_live="?"; fi
+    log "Per-story attribution probe (this-iteration-pull pre=$PRE_DEPLOY_SHA post=$POST_DEPLOY_SHA) — asked daemon-refresh.sh (DRY_RUN=1, no real kickstart/drain) whether $STORY_ID's own merge $MERGE_SHA alone (vs pre-merge-main base $MERGE_OWN_BASE_SHA) reaches any live daemon: ${MERGE_OWN_VERDICT_LINE:-<no answer: ${MERGE_OWN_PROBE_WHY:-probe state $MERGE_OWN_PROBE_STATE}>} affected=[$_mo_show_aff] affected_not_running=[$_mo_show_nr] affected_live=[$_mo_show_live] probe=$MERGE_OWN_PROBE_STATE rc=$MERGE_OWN_PROBE_RC elapsed=${MERGE_OWN_PROBE_SECS}s budget=${PROBE_TIMEOUT_S}s."
     if [ -z "$MERGE_OWN_VERDICT_LINE" ]; then
-      : # unparseable helper output (crash/timeout) — leave THIS_PULL_STRUCTURALLY_INERT/MERGE_OWN_AFFECTED exactly as the Path-A pattern check (if it ran) already set them; existing blame fallback applies either way
+      : # the probe did not answer (timeout/crash/silent — see MERGE_OWN_PROBE_STATE) — leave THIS_PULL_STRUCTURALLY_INERT/MERGE_OWN_AFFECTED exactly as the Path-A pattern check (if it ran) already set them; existing blame fallback applies either way (fail closed: no answer is never "reaches nothing")
     elif [ "$MERGE_OWN_VERDICT_LINE" = "VERDICT=JOB_NOT_INSTALLED" ]; then
       # ga-nuou9v (wa-s5fux): a job this bead's own merge added/touched that
       # is missing from launchd or present-but-not-loaded can NEVER self-heal
@@ -3853,14 +3930,31 @@ else
             fi
             ;;
         esac
+        # ga-hm8i53s: same budget and same kept exit code as the per-story probe
+        # above — 6 of the 41 unreadable probes measured on 29/10 were THIS call
+        # expiring at 180s, and `|| true` made them look like a garbled answer.
+        MERGE_OWN_FRESH_RC=0
+        MERGE_OWN_FRESH_T0=$(date +%s)
         MERGE_OWN_FRESH_OUT=$(RUNTIME_DIR="$RUNTIME_DIR" \
           PRE_DEPLOY_SHA="$MERGE_OWN_BASE_SHA" POST_DEPLOY_SHA="$MERGE_SHA" \
           DEPLOY_EPOCH="$MERGE_OWN_REPROBE_EPOCH" \
           SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS $MERGE_OWN_AFFECTED" \
           EXTRA_RUNTIME_ROOTS="$EXTRA_RUNTIME_ROOTS" \
           DRY_RUN=1 \
-          timeout 180 bash "$REFRESH_HELPER" 2>/dev/null || true)
+          timeout "$PROBE_TIMEOUT_S" bash "$REFRESH_HELPER" 2>/dev/null) || MERGE_OWN_FRESH_RC=$?
+        MERGE_OWN_FRESH_SECS=$(( $(date +%s) - MERGE_OWN_FRESH_T0 ))
         MERGE_OWN_FRESH_VERDICT_LINE=$(echo "$MERGE_OWN_FRESH_OUT" | grep '^VERDICT=' | head -1 || true)
+        refresh_probe_classify "$MERGE_OWN_FRESH_VERDICT_LINE" "$MERGE_OWN_FRESH_RC" "$MERGE_OWN_FRESH_SECS"
+        MERGE_OWN_FRESH_STATE="$PROBE_STATE"; MERGE_OWN_FRESH_WHY="$PROBE_WHY"
+        if [ "$MERGE_OWN_FRESH_STATE" = "timeout" ]; then
+          # rc 124 means the re-probe did not finish, so nothing it printed is
+          # trusted — same rule as the per-story probe above. The "clean" test
+          # below already needs a GUARDED= line next to VERDICT=OK, which covers
+          # a kill between the two; this makes the rule the same for every field
+          # (PROOF=, the GUARDED_* splits) instead of relying on which line the
+          # kill happened to land before.
+          MERGE_OWN_FRESH_OUT=""; MERGE_OWN_FRESH_VERDICT_LINE=""
+        fi
         # ga-8i2nds (third-state audit): keep the GUARDED= LINE itself, not only
         # its value. A verdict with NO GUARDED= line at all is "the re-probe did
         # not say", and must not read as "GUARDED is empty, nothing is stale".
@@ -3901,7 +3995,12 @@ else
         MERGE_OWN_FRESH_NOEVID=$(echo "$MERGE_OWN_FRESH_NOEVID_LINE" | sed 's/^GUARDED_SYMBOL_NO_EVIDENCE=//')
         MERGE_OWN_FRESH_NOTCOMP_LINE=$(echo "$MERGE_OWN_FRESH_OUT" | grep '^GUARDED_SYMBOL_NOT_COMPUTED=' | head -1 || true)
         MERGE_OWN_FRESH_NOTCOMP=$(echo "$MERGE_OWN_FRESH_NOTCOMP_LINE" | sed 's/^GUARDED_SYMBOL_NOT_COMPUTED=//')
-        log "Freshness re-probe for $STORY_ID's own affected daemon(s) [$MERGE_OWN_AFFECTED] (forced through the SENSITIVE already_fresh() check): ${MERGE_OWN_FRESH_VERDICT_LINE:-<unparseable output>} still-stale=[$MERGE_OWN_LIVE_STALE] proof=${MERGE_OWN_FRESH_PROOF:-none} (freshness floor $MERGE_OWN_REPROBE_EPOCH: merge arrived in the runtime at ${MERGE_OWN_ARRIVAL_EPOCH:-unknown}, this deploy started $DEPLOY_EPOCH)."
+        # ga-hm8i53s: "still-stale=[]" means the re-probe ANSWERED and nothing is
+        # stale; a re-probe that did not answer prints "?" (same rule as the
+        # per-story probe line).
+        _mo_show_stale="$MERGE_OWN_LIVE_STALE"
+        [ "$MERGE_OWN_FRESH_STATE" = "ok" ] || _mo_show_stale="?"
+        log "Freshness re-probe for $STORY_ID's own affected daemon(s) [$MERGE_OWN_AFFECTED] (forced through the SENSITIVE already_fresh() check): ${MERGE_OWN_FRESH_VERDICT_LINE:-<no answer: ${MERGE_OWN_FRESH_WHY:-probe state $MERGE_OWN_FRESH_STATE}>} still-stale=[$_mo_show_stale] proof=${MERGE_OWN_FRESH_PROOF:-none} probe=$MERGE_OWN_FRESH_STATE rc=$MERGE_OWN_FRESH_RC elapsed=${MERGE_OWN_FRESH_SECS}s budget=${PROBE_TIMEOUT_S}s (freshness floor $MERGE_OWN_REPROBE_EPOCH: merge arrived in the runtime at ${MERGE_OWN_ARRIVAL_EPOCH:-unknown}, this deploy started $DEPLOY_EPOCH)."
         # Three states, and only the first one releases:
         #   clean       — the re-probe printed BOTH a VERDICT= and a GUARDED= line,
         #                 the verdict is exactly VERDICT=OK, and GUARDED is empty:
@@ -4325,6 +4424,14 @@ This delivery is recorded as proof=symbol_unreachable_human_confirmed (label del
         HALT_REASON="$REFRESH_REASON"
         HALT_DETAIL="$REFRESH_OUT"
         HALT_FP_LIST="$REFRESH_GUARDED"
+        # ga-hm8i53s: the two sentences of the announce that ASSERT a measured
+        # fact about this story's daemon — "is running code OLDER", "is dormant/
+        # unverified". True when the bead-scoped re-probe or the wide list says
+        # so; not true when the per-story probe never answered (overridden in the
+        # NEEDS_GUARDED_RESTART branch below, only for that case). Defaults are
+        # the exact text this announce always carried.
+        HALT_CLAIM="A long-lived daemon serving rig '$RIG' is running code OLDER than this deploy and could not be safely refreshed/verified, so the merged feature would be DORMANT in production. story:done is WITHHELD (a dormant deploy must never be marked done)."
+        HALT_AUTHOR_NUDGE="a daemon serving the merge is dormant/unverified. See bead; do NOT mark done."
         if [ "$REFRESH_VERDICT" = "NEEDS_GUARDED_RESTART" ]; then
           # ga-puq8z ACEITE 2: this verdict is single-hop import/template-closure
           # detection (daemon-refresh.sh Step 3), not proof the daemon's live
@@ -4445,6 +4552,28 @@ Context only — NOT attributed to this merge: $HALT_CONTEXT_COUNT other sensiti
 CAVEAT (ga-puq8z): the list above is an import/template-closure match against this merge's own delta, not proof of reachability to the changed symbols — if in doubt, compare \`ps -o lstart= -p <pid>\` against this merge's commit $MERGE_SHA before restarting."
           else
             REFRESH_ACTION="ACTION: perform a guarded/graceful restart of the flagged hot-path daemon(s) ($REFRESH_GUARDED) — drain in-flight messages/webhooks first — then re-run delivery. (Configure a DRAIN_CMD_<label> for daemon-refresh.sh to automate this.) No per-bead attribution available this run (this story's own pull was not a true no-op, or the attribution probe above did not return a parseable result) — this is the wide sweep's list only. CAVEAT (ga-puq8z): flagged by import/template-closure matching, not proven reachable to the changed symbols — if in doubt, compare \`ps -o lstart= -p <pid>\` against commit $POST_DEPLOY_SHA before restarting."
+            # ga-hm8i53s: when the per-story probe RAN and did not answer, the
+            # text above is wrong in three ways — it orders a restart of the
+            # whole rig-wide list as if that were this story's job, it asserts
+            # the story's daemon is OLDER/dormant (nobody measured that: the
+            # question the probe exists to answer is unanswered), and its
+            # "did not return a parseable result" hides WHY. wa-1d97lb.17
+            # (29/10): the probe timed out, its own daemon (terreno-publico)
+            # was already fresh, and the author was told to restart the
+            # 16-daemon rig-wide list (two of them the cosmetic dashboards the
+            # Mayor measured as not its). The hold itself stays —
+            # an unreadable attribution is never "reaches nothing" — and so does
+            # every retry mechanic; only the words change, to the three-state
+            # truth: it is NOT known whether any of the rig-wide list is this
+            # story's job.
+            case "$MERGE_OWN_PROBE_STATE" in
+              timeout|failed|silent)
+                HALT_REASON="this story's own merge could not be attributed — the per-story probe of $MERGE_OWN_BASE_SHA..$MERGE_SHA $MERGE_OWN_PROBE_WHY, so it is unknown which daemons this merge reaches; the rig-wide staleness listed below is not attributed to it"
+                HALT_CLAIM="NOT a finding that this merge left a daemon dormant: the probe that decides which daemons this merge reaches did not answer, so there is nothing measured against this story. story:done is WITHHELD fail-closed (an unreadable attribution is never read as 'reaches nothing'), and the delivery is retried automatically every sweep."
+                HALT_AUTHOR_NUDGE="attribution unavailable (the per-story daemon probe $MERGE_OWN_PROBE_STATE) — not a finding against your change; retried automatically every sweep. See bead; do NOT mark done."
+                REFRESH_ACTION="ACTION: none needed from the author yet. The per-story probe (state=$MERGE_OWN_PROBE_STATE: $MERGE_OWN_PROBE_WHY) is what says which daemons THIS merge reaches; until one answers it is unknown whether any of the rig-wide list is this story's job, so do NOT restart that list on this story's account. The delivery stays held and is re-probed every sweep; it releases on its own once a probe answers and shows this merge reaches no stale daemon. If it keeps failing, the helper is starving for CPU — check the load average — or compare \`ps -o lstart= -p <pid>\` of the daemon that serves this diff's files against commit $MERGE_SHA by hand. Rig-wide context only (judged against the window tip $POST_DEPLOY_SHA, not this merge): $REFRESH_GUARDED"
+                ;;
+            esac
           fi
         elif [ "$REFRESH_VERDICT" = "JOB_NOT_INSTALLED" ]; then
           # ga-nuou9v: same fix shape as quality-gate-dispatcher.sh's
@@ -4543,14 +4672,14 @@ $REFRESH_ACTION" 2>/dev/null || true
                 2>/dev/null || true
             else
               bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HALTED (ga-iwv0 daemon refresh): $REFRESH_VERDICT — $HALT_REASON
-A long-lived daemon serving rig '$RIG' is running code OLDER than this deploy and could not be safely refreshed/verified, so the merged feature would be DORMANT in production. story:done is WITHHELD (a dormant deploy must never be marked done).
+$HALT_CLAIM
 $REFRESH_ACTION
 Refresh detail:
 $HALT_DETAIL" 2>/dev/null || true
               AUTHOR=$(echo "$STORY" | jq -r '.assignee // .created_by // ""' 2>/dev/null || echo "")
               if [ -n "$AUTHOR" ] && [ "$AUTHOR" != "null" ]; then
                 gc --city "$GC_CITY" session nudge "$AUTHOR" \
-                  "DELIVERY HALTED for $STORY_ID (ga-iwv0): $REFRESH_VERDICT — a daemon serving the merge is dormant/unverified. See bead; do NOT mark done." \
+                  "DELIVERY HALTED for $STORY_ID (ga-iwv0): $REFRESH_VERDICT — $HALT_AUTHOR_NUDGE" \
                   --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR"
               fi
               gc --city "$GC_CITY" session nudge mayor \
