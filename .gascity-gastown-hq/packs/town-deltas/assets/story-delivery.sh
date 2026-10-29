@@ -2990,8 +2990,10 @@ else
   THIS_PULL_INERT_PREDICATE=""
   # ga-hm8i53s: what the per-story probe below actually did, reset per story for
   # the same leakage reason as the variables above. "not-run" = no probe this
-  # story (unresolvable MERGE_PRE_MAIN, or a Path A story that never needed
-  # one); otherwise ok | timeout | failed | silent (refresh_probe_classify).
+  # story: MERGE_SHA or MERGE_PRE_MAIN did not resolve to a real ancestor pair
+  # (the probe runs on Path A and Path B alike since ga-ndu4ic, so a story that
+  # reaches the probe's `if` always gets one); otherwise ok | timeout | failed
+  # | silent (refresh_probe_classify).
   # Only the three non-ok states mean "the probe did not answer" — the hold
   # text further down keys on them, so a stale value here would word a
   # different story's hold as an unavailable-attribution one.
@@ -3015,11 +3017,20 @@ else
   # this paragraph. A value that is not a positive integer falls back to
   # 300: `timeout 0` means NO limit and a non-number makes `timeout` itself fail
   # (rc 125, the probe never runs) — both worse than the default.
-  PROBE_TIMEOUT_S="${DELIVERY_PROBE_TIMEOUT_S:-300}"
-  case "$PROBE_TIMEOUT_S" in
-    ''|*[!0-9]*) PROBE_TIMEOUT_S=300 ;;
-    *) PROBE_TIMEOUT_S=$((10#$PROBE_TIMEOUT_S)); [ "$PROBE_TIMEOUT_S" -gt 0 ] || PROBE_TIMEOUT_S=300 ;;
+  # Unset or empty = not configured → 300, quietly. Set to anything else that is
+  # not a positive integer → 300 AND a WARN naming the rejected value, so a typo
+  # in the launchd plist does not quietly leave the operator believing a
+  # different budget is in force.
+  PROBE_TIMEOUT_S=300
+  PROBE_BUDGET_REJECTED=0
+  case "${DELIVERY_PROBE_TIMEOUT_S:-}" in
+    '') ;;
+    *[!0-9]*) PROBE_BUDGET_REJECTED=1 ;;
+    *) _probe_budget=$((10#$DELIVERY_PROBE_TIMEOUT_S))
+       if [ "$_probe_budget" -gt 0 ]; then PROBE_TIMEOUT_S="$_probe_budget"; else PROBE_BUDGET_REJECTED=1; fi ;;
   esac
+  [ "$PROBE_BUDGET_REJECTED" = "0" ] \
+    || warn "DELIVERY_PROBE_TIMEOUT_S='$DELIVERY_PROBE_TIMEOUT_S' is not a positive integer — using the default 300s per probe (0 would reach timeout(1) as 'no limit', a non-number as a usage error)"
   # refresh_probe_classify <verdict-line> <rc> <secs> — sets PROBE_STATE and
   # PROBE_WHY for one DRY_RUN=1 helper call. Four states, never two:
   #   timeout — rc 124. Decided FIRST, before looking at the output: a helper
@@ -3027,14 +3038,29 @@ else
   #             follows it (emit() prints them eight lines apart), and a cut-off
   #             list must never read as "reaches nothing". The helper has no
   #             literal `exit 124` (grep), so 124 here is `timeout` firing.
-  #   ok      — a VERDICT= line (the helper's exit code is NOT health: it exits
-  #             1 on every non-OK verdict).
-  #   failed  — no VERDICT=, rc != 0 (crash, killed, missing helper).
+  #   failed  — rc >= 128: the helper (or timeout itself) died to a signal that
+  #             was NOT the budget — SIGKILL 137 (OOM, an operator), SIGTERM 143
+  #             (launchd stopping the job). Decided BEFORE the output for the same
+  #             reason as 124: a VERDICT= that got out before the kill is a
+  #             partial answer, and the AFFECTED= behind it never arrived.
+  #   ok      — a VERDICT= line. The exit code is NOT health: the real run exits
+  #             1 on every non-OK verdict, the DRY_RUN=1 probes used here exit 0
+  #             (daemon-refresh.sh `if [ "$DRY_RUN" = "1" ]; then exit 0`), so
+  #             neither says anything about whether the answer is complete. Not
+  #             covered: the helper dying by itself, with a small rc, between
+  #             VERDICT= and the lines this file reads. No such path is known:
+  #             emit() has no errexit and prints VERDICT=, AFFECTED=,
+  #             AFFECTED_NOT_RUNNING= and GUARDED= with ${VAR:-} defaults, so only
+  #             a signal (>= 128, above) can cut it there.
+  #   failed  — also when there is no VERDICT= and rc != 0 (crash, missing
+  #             helper).
   #   silent  — no VERDICT=, rc 0 (the helper finished and said nothing).
   refresh_probe_classify() {
     local _v="$1" _rc="$2" _secs="$3"
     if [ "$_rc" = "124" ]; then
       PROBE_STATE="timeout"; PROBE_WHY="timed out after ${_secs}s (budget ${PROBE_TIMEOUT_S}s, rc=124)"
+    elif [ "${_rc:-0}" -ge 128 ] 2>/dev/null; then
+      PROBE_STATE="failed"; PROBE_WHY="was killed by signal $(( _rc - 128 )) (rc=$_rc) after ${_secs}s, so anything it printed first is a partial answer"
     elif [ -n "$_v" ]; then
       PROBE_STATE="ok"; PROBE_WHY=""
     elif [ "$_rc" != "0" ]; then
@@ -3156,14 +3182,16 @@ else
     # can't safely cover arbitrary .py files, since whether one is reachable
     # from any daemon depends on the rig's actual import graph, not its path.
     #
-    # Bounded with `timeout 180`: measured live against this rig's real
-    # daemon roster (ga-6zkhci), a call that can't short-circuit on a
-    # tests/docs/md-only delta (i.e. one that reaches Step 2/3's live
-    # launchctl/ps discovery across every declared daemon) took ~98s
-    # wall-clock. A single slow-or-hung probe here must not stall every OTHER
-    # story queued behind this one in the same sweep; a timeout is treated
-    # the same as any other unparseable result below — fails closed to the
-    # existing blame behavior, never guesses an exemption.
+    # Bounded with `timeout "$PROBE_TIMEOUT_S"` (default 300s; it was a fixed
+    # 180 until ga-hm8i53s — see the budget paragraph above the case): measured
+    # live against this rig's real daemon roster (ga-6zkhci), a call that can't
+    # short-circuit on a tests/docs/md-only delta (i.e. one that reaches Step
+    # 2/3's live launchctl/ps discovery across every declared daemon) took ~98s
+    # wall-clock then, a median of 131s by 29/10. A single slow-or-hung probe
+    # here must not stall every OTHER story queued behind this one in the same
+    # sweep; a timeout is treated the same as any other unparseable result
+    # below — fails closed to the existing blame behavior, never guesses an
+    # exemption.
     #
     # Read AFFECTED, never VERDICT, to decide inert-ness. Under DRY_RUN=1,
     # daemon-refresh.sh reports VERDICT=OK for a daemon it WOULD have
@@ -3220,7 +3248,9 @@ else
     if [ "$MERGE_OWN_PROBE_STATE" != "ok" ]; then
       # Whatever a probe that did not finish managed to print is not an answer:
       # drop it so the branches below see exactly "no answer", and a list cut
-      # off mid-print can never become an empty (= inert) reach.
+      # off mid-print can never become an empty (= inert) reach. "Did not
+      # finish" = rc 124 (budget) or rc >= 128 (killed), both decided in
+      # refresh_probe_classify before the output is looked at.
       MERGE_OWN_VERDICT_LINE=""; MERGE_OWN_AFFECTED=""; MERGE_OWN_AFFECTED_NOT_RUNNING=""
     fi
     MERGE_OWN_AFFECTED_LIVE=""
@@ -4432,6 +4462,12 @@ This delivery is recorded as proof=symbol_unreachable_human_confirmed (label del
         # the exact text this announce always carried.
         HALT_CLAIM="A long-lived daemon serving rig '$RIG' is running code OLDER than this deploy and could not be safely refreshed/verified, so the merged feature would be DORMANT in production. story:done is WITHHELD (a dormant deploy must never be marked done)."
         HALT_AUTHOR_NUDGE="a daemon serving the merge is dormant/unverified. See bead; do NOT mark done."
+        # ga-hm8i53s: the dedup key (HALT_FP_NEW, below) must carry every input
+        # that flips what the author is TOLD. The attribution state is one: it
+        # decides "restart THESE" vs "none needed, do NOT restart". Empty = the
+        # key stays byte-identical to the one fingerprints on disk already hold
+        # (an answered probe, every other verdict) — no re-announce on deploy.
+        HALT_FP_ATTR=""
         if [ "$REFRESH_VERDICT" = "NEEDS_GUARDED_RESTART" ]; then
           # ga-puq8z ACEITE 2: this verdict is single-hop import/template-closure
           # detection (daemon-refresh.sh Step 3), not proof the daemon's live
@@ -4571,6 +4607,10 @@ CAVEAT (ga-puq8z): the list above is an import/template-closure match against th
                 HALT_REASON="this story's own merge could not be attributed — the per-story probe of $MERGE_OWN_BASE_SHA..$MERGE_SHA $MERGE_OWN_PROBE_WHY, so it is unknown which daemons this merge reaches; the rig-wide staleness listed below is not attributed to it"
                 HALT_CLAIM="NOT a finding that this merge left a daemon dormant: the probe that decides which daemons this merge reaches did not answer, so there is nothing measured against this story. story:done is WITHHELD fail-closed (an unreadable attribution is never read as 'reaches nothing'), and the delivery is retried automatically every sweep."
                 HALT_AUTHOR_NUDGE="attribution unavailable (the per-story daemon probe $MERGE_OWN_PROBE_STATE) — not a finding against your change; retried automatically every sweep. See bead; do NOT mark done."
+                # Key on the state NAME (timeout|failed|silent): the nudge and the
+                # action embed it. Never on WHY — it carries rc and elapsed seconds,
+                # which differ on every sweep and would re-announce each one.
+                HALT_FP_ATTR="|attr=$MERGE_OWN_PROBE_STATE"
                 REFRESH_ACTION="ACTION: none needed from the author yet. The per-story probe (state=$MERGE_OWN_PROBE_STATE: $MERGE_OWN_PROBE_WHY) is what says which daemons THIS merge reaches; until one answers it is unknown whether any of the rig-wide list is this story's job, so do NOT restart that list on this story's account. The delivery stays held and is re-probed every sweep; it releases on its own once a probe answers and shows this merge reaches no stale daemon. If it keeps failing, the helper is starving for CPU — check the load average — or compare \`ps -o lstart= -p <pid>\` of the daemon that serves this diff's files against commit $MERGE_SHA by hand. Rig-wide context only (judged against the window tip $POST_DEPLOY_SHA, not this merge): $REFRESH_GUARDED"
                 ;;
             esac
@@ -4629,7 +4669,15 @@ CAVEAT (ga-puq8z): the list above is an import/template-closure match against th
           # the WIDE list while the comment shows the bead-scoped one would
           # re-announce on every unrelated change to the wide window and stay
           # silent when the bead's own list actually changed.
-          HALT_FP_NEW="$REFRESH_VERDICT|$HALT_FP_LIST|$REFRESH_FRESHFAIL"
+          # ga-hm8i53s: ...and the attribution state when the text depends on it
+          # (HALT_FP_ATTR, set where the text is overridden). Without it a sweep
+          # whose per-story probe timed out ("none needed, do NOT restart") and
+          # the next sweep whose probe answered with the very same list ("restart
+          # THESE") share one key: the real instruction is never posted and the
+          # author keeps the wrong one until the 24h reminder. The re-probe's
+          # state is deliberately NOT keyed: it changes how sure the text is
+          # (confirmed stale vs not confirmed), not what the author is told to do.
+          HALT_FP_NEW="$REFRESH_VERDICT|$HALT_FP_LIST|$REFRESH_FRESHFAIL$HALT_FP_ATTR"
           HALT_FP_NOW="$(date +%s)"
           HALT_FP_OLD="$(sed -n '1p' "$HALT_FP_FILE" 2>/dev/null || echo "")"
           HALT_FP_OLD_TS="$(sed -n '2p' "$HALT_FP_FILE" 2>/dev/null || echo "")"
