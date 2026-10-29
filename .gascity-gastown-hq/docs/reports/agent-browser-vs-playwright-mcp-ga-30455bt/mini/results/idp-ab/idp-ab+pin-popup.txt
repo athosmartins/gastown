@@ -1,0 +1,52 @@
+--- abrir RP + snapshot -i: ab batch open http://127.0.0.1:47901/ snapshot -i (3111 ms)
+✓ RP-Teste
+  http://127.0.0.1:47901/
+
+- heading "RP-Teste" [level=1, ref=e1]
+- link "Entrar com IdP-Teste" [ref=e4]
+- button "Entrar com IdP-Teste (popup)" [ref=e5]
+- heading "Login embutido" [level=2, ref=e2]
+- Iframe "Login embutido" [ref=e3]
+  - heading "IdP-Teste" [level=1, ref=e6]
+  - textbox "Usuário" [ref=e8]
+  - textbox "Senha" [ref=e9]
+  - button "Entrar" [ref=e7]
+
+--- clicar (abre popup): ab click @e5 (3193 ms)
+✓ Done
+
+--- listar abas: ab tab list (341 ms)
+  [t1] about:blank - about:blank
+→ [t2] 127.0.0.1:47901 - http://127.0.0.1:47901/
+  [t3] 127.0.0.1:47902/authorize?mode=popup&state=P - http://127.0.0.1:47902/authorize?mode=popup&state=P
+
+--- trocar para o popup: ab tab t3 (1538 ms)
+✓ IdP-Teste: Entrar
+  http://127.0.0.1:47902/authorize?mode=popup&state=P
+
+--- snapshot -i do popup: ab snapshot -i (1537 ms)
+- heading "IdP-Teste" [level=1, ref=e10]
+- textbox "Usuário" [ref=e12]
+- textbox "Senha" [ref=e13]
+- button "Entrar" [ref=e11]
+
+--- preencher + entrar (o popup se fecha): ab batch --bail fill @e12 "demo-user" fill @e13 "demo-pass" click @e11 (2390 ms)
+✓ Done
+
+✓ Done
+
+✓ Done
+
+--- listar abas: ab tab list (2021 ms)
+  [t1] about:blank - about:blank
+  [t2] 127.0.0.1:47901 - http://127.0.0.1:47901/
+
+--- voltar para a aba do RP: ab tab t2 (565 ms)
+✓ RP-Teste
+  http://127.0.0.1:47901/
+
+--- confirmar: ab get text #status (527 ms)
+Logado via popup: demo-user
+
+
+NOTES: apos o click o chrome tem: ["http://:2/authorize?mode=popup&state=P","http://:1/","about:blank"] | popup na lista: id t3 | depois do popup fechar o chrome tem: ["http://:2/authorize?mode=popup&state=P","http://:1/","about:blank"]

@@ -1,0 +1,15 @@
+## AB WITH --pin-tab, fresh sessions pailne pbilne ; start tabs = ["E18F41:about:blank"]
+pailne open A1 -> ✓ TAB-A1 http://127.0.0.1:47811/tab/A1
+pbilne open B1 -> ✓ TAB-B1 http://127.0.0.1:47811/tab/B1
+tabs now ["BDEFB2:/tab/B1","578120:/tab/A1","E18F41:about:blank"]
+pailne title: TAB-A1 | pbilne title: TAB-B1
+pbilne re-open B2 -> ✓ TAB-B2 http://127.0.0.1:47811/tab/B2
+after pbilne re-open:  pailne title: TAB-A1 | pbilne title: TAB-B2 | tabs ["BDEFB2:/tab/B2","578120:/tab/A1","E18F41:about:blank"]
+pbilne tab list -> ["E18F41:about:blank","578120:/tab/A1","BDEFB2:/tab/B2*"]
+pbilne tries to take pailne tab -> [exit 1] ✗ tab_locked: tab 57812061829CEFE99B49EE9B2E38CBA5 is pinned by session 'pailne' (--pin-tab); close that session or use another tab
+human opens a tab -> tabs ["8BF133:/tab/HUMAN","BDEFB2:/tab/B2","578120:/tab/A1","E18F41:about:blank"] | pailne title: TAB-A1 | pbilne title: TAB-B2
+pailne tab closed externally; get title -> [exit 1] ✗ tab_gone: bound tab is gone (target 57812061829CEFE99B49EE9B2E38CBA5, last url http://127.0.0.1:47811/tab/A1). Run `agent-browser tab new <url>` to bind a new tab, or `agent-browser tab list` to pick an existing one
+pailne click-like action on a gone tab (eval) -> [exit 1] ✗ tab_gone: bound tab is gone (target 57812061829CEFE99B49EE9B2E38CBA5, last url http://127.0.0.1:47811/tab/A1). Run `agent-browser tab new <url>` to bind a new tab, or `agent-browser tab list` to pick an existing one
+pbilne unaffected -> TAB-B2
+pailne recover with tab new -> http://127.0.0.1:47811/tab/A2 | pailne title: TAB-A2
+after both close -> tabs ["E85F46:/tab/A2","8BF133:/tab/HUMAN","BDEFB2:/tab/B2","E18F41:about:blank"] | chrome alive: true

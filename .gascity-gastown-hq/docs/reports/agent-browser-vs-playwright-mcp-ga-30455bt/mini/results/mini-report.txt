@@ -1,0 +1,34 @@
+rodadas: r1,r2,r3 | K=1.44 (calibracao do no)
+
+| fluxo | n | chamadas | resultado (o200k, mediana [min-max]) | ITE B=30k (+estatico) | vs pw-A | ITE B=200k (+estatico) | vs pw-A | latencia do fluxo (s, mediana [min-max]) |
+|---|---|---|---|---|---|---|---|---|
+| pw-A | 3 | 11 | 15330 [15330-15330] | 86178 | 100% | 290178 | 100% | 17.4 [13.6-35.5] |
+| pw-B | 3 | 9 | 1724 [1724-1724] | 42327 | 49% | 212327 | 73% | 7.5 [3.4-23.6] |
+| pw-B2 | 3 | 8 | 1713 [1713-1713] | 38786 | 45% | 191786 | 66% | 14.1 [7.6-59.6] |
+| ab-full-A | 3 | 13 | 7820 [7820-7820] | 84204 | 98% | 322203 | 111% | 10.2 [4.1-20.2] |
+| ab-c-A | 3 | 13 | 6374 [6374-6374] | 80213 | 93% | 318213 | 110% | 12.0 [2.6-21.7] |
+| ab-i-A | 3 | 13 | 5084 [5084-5084] | 76578 | 89% | 314578 | 108% | 15.2 [3.3-21.5] |
+| ab-i-B | 3 | 13 | 461 [461-461] | 63593 | 74% | 301593 | 104% | 3.4 [1.3-11.8] |
+| ab-batch | 3 | 4 | 461 [461-461] | 24245 | 28% | 109245 | 38% | 6.8 [5.9-15.1] |
+
+Latencia por chamada (ms, mediana entre rodadas), passo a passo:
+  pw-A       nav-login=2768  snap-login=182  fill-user=1104  fill-pass=521  click-signin=5525  snap-dash=1315  nav-form=1940  snap-form=351  fill-form=3119  click-submit=2319  snap-done=71
+  pw-B       nav-login=2178  snap-login=209  fill-user=267  fill-pass=100  click-signin=1458  nav-form=535  snap-form=94  fill-form=738  click-submit=805
+  pw-B2      nav-login=3981  snap-login=156  fill-login=874  click-signin=4302  nav-form=875  snap-form=266  fill-form=2341  click-submit=1504
+  pw-npx     nav-login=6035  snap-login=619
+  ab-full-A  nav-login=1925  snap-login=282  fill-user=433  fill-pass=404  click-signin=766  wait-dash=1917  snap-dash=684  nav-form=880  snap-form=325  fill-form=1080  click-submit=110  wait-done=871  snap-done=225
+  ab-c-A     nav-login=1297  snap-login=87  fill-user=761  fill-pass=354  click-signin=558  wait-dash=1797  snap-dash=1544  nav-form=1415  snap-form=321  fill-form=1824  click-submit=432  wait-done=825  snap-done=489
+  ab-i-A     nav-login=5093  snap-login=1535  fill-user=670  fill-pass=429  click-signin=219  wait-dash=659  snap-dash=523  nav-form=647  snap-form=737  fill-form=1696  click-submit=423  wait-done=746  snap-done=118
+  ab-i-B     nav-login=1418  snap-login=326  fill-user=59  fill-pass=145  click-signin=131  wait-dash=252  check-dash=54  nav-form=156  snap-form=43  fill-form=498  click-submit=153  wait-done=186  check-done=37
+  ab-batch   nav-snap-login=2516  login-wait-verify=1996  nav-snap-form=931  form-submit-verify=2431
+
+Memoria no macOS: footprint (phys_footprint) x RSS do ps, MB, mediana entre rodadas
+  pw-A       afterInit: footprint 91.0 MB (rss 65.3 MB, 1 proc) | afterFirstSnapshot: footprint 100.0 MB (rss 56.1 MB, 1 proc) | afterTask: footprint 103.0 MB (rss 49.8 MB, 1 proc)
+  pw-B       afterInit: footprint 99.0 MB (rss 118.1 MB, 1 proc) | afterFirstSnapshot: footprint 99.0 MB (rss 64.0 MB, 1 proc) | afterTask: footprint 106.0 MB (rss 81.3 MB, 1 proc)
+  pw-B2      afterInit: footprint 85.0 MB (rss 100.5 MB, 1 proc) | afterFirstSnapshot: footprint 98.0 MB (rss 86.7 MB, 1 proc) | afterTask: footprint 106.0 MB (rss 52.4 MB, 1 proc)
+  pw-npx     afterInit: footprint 134.0 MB (rss 110.2 MB, 2 proc) | afterFirstSnapshot: footprint 136.0 MB (rss 64.0 MB, 2 proc)
+  ab-full-A  afterFirstSnapshot: footprint 4.4 MB (rss 9.8 MB, 1 proc) | afterTask: footprint 6.7 MB (rss 10.7 MB, 1 proc)
+  ab-c-A     afterFirstSnapshot: footprint 4.3 MB (rss 10.3 MB, 1 proc) | afterTask: footprint 6.7 MB (rss 11.0 MB, 1 proc)
+  ab-i-A     afterFirstSnapshot: footprint 4.5 MB (rss 9.4 MB, 1 proc) | afterTask: footprint 14.0 MB (rss 10.1 MB, 1 proc)
+  ab-i-B     afterFirstSnapshot: footprint 4.7 MB (rss 10.6 MB, 1 proc) | afterTask: footprint 4.9 MB (rss 11.9 MB, 1 proc)
+  ab-batch   afterTask: footprint 4.8 MB (rss 10.5 MB, 1 proc)

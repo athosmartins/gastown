@@ -1,0 +1,158 @@
+{
+ "config": "pw-A",
+ "calls": 11,
+ "respTok": 15330,
+ "respTokCl": 15340,
+ "respBytes": 54545,
+ "callTok": 285,
+ "steps": [
+  {
+   "n": 1,
+   "step": "nav-login",
+   "ms": 2768,
+   "tool": "browser_navigate",
+   "callTok": 25,
+   "respBytes": 377,
+   "respTok": 143,
+   "respTokCl": 140
+  },
+  {
+   "n": 2,
+   "step": "snap-login",
+   "ms": 526,
+   "tool": "browser_snapshot",
+   "callTok": 10,
+   "respBytes": 1770,
+   "respTok": 515,
+   "respTokCl": 511
+  },
+  {
+   "n": 3,
+   "step": "fill-user",
+   "ms": 1104,
+   "tool": "browser_type",
+   "callTok": 18,
+   "respBytes": 124,
+   "respTok": 34,
+   "respTokCl": 33
+  },
+  {
+   "n": 4,
+   "step": "fill-pass",
+   "ms": 521,
+   "tool": "browser_type",
+   "callTok": 18,
+   "respBytes": 107,
+   "respTok": 31,
+   "respTokCl": 30
+  },
+  {
+   "n": 5,
+   "step": "click-signin",
+   "ms": 5525,
+   "tool": "browser_click",
+   "callTok": 19,
+   "respBytes": 377,
+   "respTok": 137,
+   "respTokCl": 135
+  },
+  {
+   "n": 6,
+   "step": "snap-dash",
+   "ms": 1315,
+   "tool": "browser_snapshot",
+   "callTok": 10,
+   "respBytes": 48816,
+   "respTok": 13483,
+   "respTokCl": 13509
+  },
+  {
+   "n": 7,
+   "step": "nav-form",
+   "ms": 1266,
+   "tool": "browser_navigate",
+   "callTok": 25,
+   "respBytes": 208,
+   "respTok": 81,
+   "respTokCl": 81
+  },
+  {
+   "n": 8,
+   "step": "snap-form",
+   "ms": 276,
+   "tool": "browser_snapshot",
+   "callTok": 10,
+   "respBytes": 1758,
+   "respTok": 582,
+   "respTokCl": 583
+  },
+  {
+   "n": 9,
+   "step": "fill-form",
+   "ms": 2451,
+   "tool": "browser_fill_form",
+   "callTok": 119,
+   "respBytes": 404,
+   "respTok": 112,
+   "respTokCl": 107
+  },
+  {
+   "n": 10,
+   "step": "click-submit",
+   "ms": 1617,
+   "tool": "browser_click",
+   "callTok": 21,
+   "respBytes": 257,
+   "respTok": 89,
+   "respTokCl": 88
+  },
+  {
+   "n": 11,
+   "step": "snap-done",
+   "ms": 71,
+   "tool": "browser_snapshot",
+   "callTok": 10,
+   "respBytes": 347,
+   "respTok": 123,
+   "respTokCl": 123
+  }
+ ],
+ "mem": {
+  "afterInit": {
+   "procs": 1,
+   "fpMB": 87,
+   "rssKB": 66848,
+   "rows": [
+    {
+     "pid": "86904",
+     "rssKB": 66848,
+     "cmd": "/opt/homebrew/Cellar/node@22/22.22.3/bin/node /private/tmp/claude-501/-Users-athos-gt--gas"
+    }
+   ]
+  },
+  "afterFirstSnapshot": {
+   "procs": 1,
+   "fpMB": 97,
+   "rssKB": 57456,
+   "rows": [
+    {
+     "pid": "86904",
+     "rssKB": 57456,
+     "cmd": "/opt/homebrew/Cellar/node@22/22.22.3/bin/node /private/tmp/claude-501/-Users-athos-gt--gas"
+    }
+   ]
+  },
+  "afterTask": {
+   "procs": 1,
+   "fpMB": 108,
+   "rssKB": 62144,
+   "rows": [
+    {
+     "pid": "86904",
+     "rssKB": 62144,
+     "cmd": "/opt/homebrew/Cellar/node@22/22.22.3/bin/node /private/tmp/claude-501/-Users-athos-gt--gas"
+    }
+   ]
+  }
+ }
+}

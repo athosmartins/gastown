@@ -1,0 +1,64 @@
+{
+ "config": "ab-batch",
+ "calls": 4,
+ "respTok": 461,
+ "respTokCl": 468,
+ "respBytes": 1406,
+ "callTok": 221,
+ "steps": [
+  {
+   "n": 1,
+   "step": "nav-snap-login",
+   "ms": 5207,
+   "tool": "Bash",
+   "callTok": 41,
+   "respBytes": 552,
+   "respTok": 185,
+   "respTokCl": 182
+  },
+  {
+   "n": 2,
+   "step": "login-wait-verify",
+   "ms": 1996,
+   "tool": "Bash",
+   "callTok": 59,
+   "respBytes": 76,
+   "respTok": 27,
+   "respTokCl": 30
+  },
+  {
+   "n": 3,
+   "step": "nav-snap-form",
+   "ms": 2649,
+   "tool": "Bash",
+   "callTok": 35,
+   "respBytes": 672,
+   "respTok": 213,
+   "respTokCl": 214
+  },
+  {
+   "n": 4,
+   "step": "form-submit-verify",
+   "ms": 5207,
+   "tool": "Bash",
+   "callTok": 86,
+   "respBytes": 106,
+   "respTok": 36,
+   "respTokCl": 42
+  }
+ ],
+ "mem": {
+  "afterTask": {
+   "procs": 1,
+   "fpMB": 4.8,
+   "rssKB": 9056,
+   "rows": [
+    {
+     "pid": "24182",
+     "rssKB": 9056,
+     "cmd": "/private/tmp/claude-501/-Users-athos-gt--gascity-gastown-hq--gc-agents-dogs-gastown-dog-6/"
+    }
+   ]
+  }
+ }
+}

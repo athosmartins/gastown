@@ -1,0 +1,50 @@
+[
+ {
+  "stack": "ab",
+  "flow": "redirect",
+  "ok": true,
+  "calls": 3,
+  "respTok": 290,
+  "ms": 10868,
+  "notes": []
+ },
+ {
+  "stack": "ab",
+  "flow": "popup",
+  "ok": true,
+  "calls": 9,
+  "respTok": 381,
+  "ms": 4685,
+  "notes": [
+   "apos o click o chrome tem: [\"http://:2/authorize?mode=popup&state=P\",\"http://:1/\"]",
+   "popup na lista: id t2 (ja e a aba ATIVA, sem trocar)",
+   "depois do popup fechar o chrome tem: [\"http://:1/\"]"
+  ]
+ },
+ {
+  "stack": "ab+pin",
+  "flow": "popup",
+  "ok": true,
+  "calls": 9,
+  "respTok": 407,
+  "ms": 15223,
+  "notes": [
+   "apos o click o chrome tem: [\"http://:2/authorize?mode=popup&state=P\",\"http://:1/\",\"about:blank\"]",
+   "popup na lista: id t3",
+   "depois do popup fechar o chrome tem: [\"http://:2/authorize?mode=popup&state=P\",\"http://:1/\",\"about:blank\"]"
+  ]
+ },
+ {
+  "stack": "ab",
+  "flow": "iframe",
+  "ok": true,
+  "calls": 6,
+  "respTok": 230,
+  "ms": 14312,
+  "notes": [
+   "refs no snapshot -i da pagina (iframe incluso?): u=e8 p=e9 b=e7",
+   "click direto no iframe RECUSADO: ✗ Element '@e7' is outside the viewport, so the click would not reach it",
+   "scrollintoview NAO resolveu; tentando teclado"
+  ]
+ }
+]

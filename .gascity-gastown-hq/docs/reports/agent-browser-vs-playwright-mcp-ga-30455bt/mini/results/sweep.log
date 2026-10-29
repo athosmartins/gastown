@@ -1,0 +1,58 @@
+### round r1  19:56:34  load: 73.80 70.32 69.72
+{"config":"pw-A","calls":11,"respTok":15330,"respTokCl":15340,"respBytes":54546,"callTok":285,"ms":[3972,107,1769,943,7268,741,4204,577,10593,4906,419],"msTotal":35499,"mem":{"afterInit":"1p footprint=93MB rss=31.2MB","afterFirstSnapshot":"1p footprint=106MB rss=50.3MB","afterTask":"1p footprint=101MB rss=30.8MB"}}
+rc=0 cfg=pw-A
+{"config":"pw-B","calls":9,"respTok":1724,"respTokCl":1708,"respBytes":5382,"callTok":265,"ms":[3385,209,267,100,1458,535,94,624,778],"msTotal":7450,"mem":{"afterInit":"1p footprint=99MB rss=119.4MB","afterFirstSnapshot":"1p footprint=99MB rss=64.0MB","afterTask":"1p footprint=106MB rss=84.4MB"}}
+rc=0 cfg=pw-B
+{"config":"pw-B2","calls":8,"respTok":1713,"respTokCl":1697,"respBytes":5349,"callTok":279,"ms":[3981,156,710,4302,875,266,2341,1504],"msTotal":14135,"mem":{"afterInit":"1p footprint=85MB rss=100.5MB","afterFirstSnapshot":"1p footprint=98MB rss=86.7MB","afterTask":"1p footprint=106MB rss=59.9MB"}}
+rc=0 cfg=pw-B2
+{"config":"pw-npx","calls":2,"respTok":658,"respTokCl":651,"respBytes":2147,"callTok":35,"ms":[6035,834],"msTotal":6869,"mem":{"afterInit":"2p footprint=134MB rss=97.0MB","afterFirstSnapshot":"2p footprint=142MB rss=49.4MB"}}
+rc=0 cfg=pw-npx
+{"config":"ab-full-A","calls":13,"respTok":7820,"respTokCl":7821,"respBytes":28851,"callTok":291,"ms":[1925,262,433,404,766,1917,684,880,325,1080,104,871,558],"msTotal":10209,"mem":{"afterFirstSnapshot":"1p footprint=4.4MB rss=9.8MB","afterTask":"1p footprint=6.5MB rss=10.7MB"}}
+rc=0 cfg=ab-full-A
+{"config":"ab-c-A","calls":13,"respTok":6374,"respTokCl":6407,"respBytes":22307,"callTok":299,"ms":[1297,87,761,354,558,1797,1544,1415,321,1824,747,825,489],"msTotal":12019,"mem":{"afterFirstSnapshot":"1p footprint=4.2MB rss=10.3MB","afterTask":"1p footprint=6.7MB rss=11.0MB"}}
+rc=0 cfg=ab-c-A
+{"config":"ab-i-A","calls":13,"respTok":5084,"respTokCl":5124,"respBytes":14719,"callTok":299,"ms":[5093,1582,670,429,219,659,523,647,1022,1972,727,1066,588],"msTotal":15197,"mem":{"afterFirstSnapshot":"1p footprint=4.5MB rss=9.4MB","afterTask":"1p footprint=6.2MB rss=9.7MB"}}
+rc=0 cfg=ab-i-A
+{"config":"ab-i-B","calls":13,"respTok":461,"respTokCl":468,"respBytes":1397,"callTok":297,"ms":[3636,700,76,552,533,517,25,824,527,2984,354,986,37],"msTotal":11751,"mem":{"afterFirstSnapshot":"1p footprint=4.8MB rss=10.4MB","afterTask":"1p footprint=5.3MB rss=10.9MB"}}
+rc=0 cfg=ab-i-B
+{"config":"ab-batch","calls":4,"respTok":461,"respTokCl":468,"respBytes":1406,"callTok":221,"ms":[2516,1247,630,2431],"msTotal":6824,"mem":{"afterTask":"1p footprint=4.7MB rss=10.5MB"}}
+rc=0 cfg=ab-batch
+### round r2  20:01:36  load: 59.66 64.27 67.05
+{"config":"pw-A","calls":11,"respTok":15330,"respTokCl":15340,"respBytes":54545,"callTok":285,"ms":[2768,526,1104,521,5525,1315,1266,276,2451,1617,71],"msTotal":17440,"mem":{"afterInit":"1p footprint=87MB rss=65.3MB","afterFirstSnapshot":"1p footprint=97MB rss=56.1MB","afterTask":"1p footprint=108MB rss=60.7MB"}}
+rc=0 cfg=pw-A
+{"config":"pw-B","calls":9,"respTok":1724,"respTokCl":1708,"respBytes":5382,"callTok":265,"ms":[543,8,41,18,1004,214,16,738,805],"msTotal":3387,"mem":{"afterInit":"1p footprint=99MB rss=118.1MB","afterFirstSnapshot":"1p footprint=112MB rss=130.7MB","afterTask":"1p footprint=118MB rss=81.3MB"}}
+rc=0 cfg=pw-B
+{"config":"pw-B2","calls":8,"respTok":1713,"respTokCl":1697,"respBytes":5348,"callTok":279,"ms":[1642,34,874,1808,248,11,1487,1466],"msTotal":7570,"mem":{"afterInit":"1p footprint=98MB rss=120.9MB","afterFirstSnapshot":"1p footprint=106MB rss=117.1MB","afterTask":"1p footprint=116MB rss=52.4MB"}}
+rc=0 cfg=pw-B2
+{"config":"pw-npx","calls":2,"respTok":658,"respTokCl":651,"respBytes":2147,"callTok":35,"ms":[2594,338],"msTotal":2932,"mem":{"afterInit":"2p footprint=124MB rss=110.2MB","afterFirstSnapshot":"2p footprint=134MB rss=81.6MB"}}
+rc=0 cfg=pw-npx
+{"config":"ab-full-A","calls":13,"respTok":7820,"respTokCl":7821,"respBytes":28851,"callTok":291,"ms":[905,282,131,117,229,191,636,428,258,517,110,182,68],"msTotal":4054,"mem":{"afterFirstSnapshot":"1p footprint=4.6MB rss=10.7MB","afterTask":"1p footprint=16MB rss=11.9MB"}}
+rc=0 cfg=ab-full-A
+{"config":"ab-c-A","calls":13,"respTok":6374,"respTokCl":6407,"respBytes":22307,"callTok":299,"ms":[1021,66,103,52,126,139,237,182,25,333,136,116,90],"msTotal":2626,"mem":{"afterFirstSnapshot":"1p footprint=4.6MB rss=11.3MB","afterTask":"1p footprint=15MB rss=17.2MB"}}
+rc=0 cfg=ab-c-A
+{"config":"ab-i-A","calls":13,"respTok":5084,"respTokCl":5124,"respBytes":14719,"callTok":299,"ms":[884,109,22,19,105,349,290,362,28,468,122,418,90],"msTotal":3266,"mem":{"afterFirstSnapshot":"1p footprint=4.6MB rss=10.6MB","afterTask":"1p footprint=14MB rss=11.0MB"}}
+rc=0 cfg=ab-i-A
+{"config":"ab-i-B","calls":13,"respTok":461,"respTokCl":468,"respBytes":1397,"callTok":297,"ms":[331,20,21,26,131,194,54,56,38,169,153,87,27],"msTotal":1307,"mem":{"afterFirstSnapshot":"1p footprint=4.7MB rss=13.1MB","afterTask":"1p footprint=4.9MB rss=11.9MB"}}
+rc=0 cfg=ab-i-B
+{"config":"ab-batch","calls":4,"respTok":461,"respTokCl":468,"respBytes":1406,"callTok":221,"ms":[1102,2055,931,1822],"msTotal":5910,"mem":{"afterTask":"1p footprint=5.2MB rss=10.5MB"}}
+rc=0 cfg=ab-batch
+### round r3  20:03:40  load: 43.33 57.23 63.94
+{"config":"pw-A","calls":11,"respTok":15330,"respTokCl":15340,"respBytes":54545,"callTok":285,"ms":[900,182,309,25,3011,1433,1940,351,3119,2319,50],"msTotal":13639,"mem":{"afterInit":"1p footprint=91MB rss=69.2MB","afterFirstSnapshot":"1p footprint=100MB rss=60.8MB","afterTask":"1p footprint=103MB rss=49.8MB"}}
+rc=0 cfg=pw-A
+{"config":"pw-B","calls":9,"respTok":1724,"respTokCl":1708,"respBytes":5382,"callTok":265,"ms":[2178,280,737,251,4419,2630,568,7131,5442],"msTotal":23636,"mem":{"afterInit":"1p footprint=89MB rss=70.7MB","afterFirstSnapshot":"1p footprint=97MB rss=37.0MB","afterTask":"1p footprint=105MB rss=19.0MB"}}
+rc=0 cfg=pw-B
+{"config":"pw-B2","calls":8,"respTok":1713,"respTokCl":1697,"respBytes":5349,"callTok":279,"ms":[12615,1021,7064,13047,4979,843,13388,6675],"msTotal":59632,"mem":{"afterInit":"1p footprint=82MB rss=30.1MB","afterFirstSnapshot":"1p footprint=91MB rss=37.2MB","afterTask":"1p footprint=102MB rss=18.5MB"}}
+rc=0 cfg=pw-B2
+{"config":"pw-npx","calls":2,"respTok":658,"respTokCl":651,"respBytes":2147,"callTok":35,"ms":[6383,619],"msTotal":7002,"mem":{"afterInit":"2p footprint=135MB rss=146.3MB","afterFirstSnapshot":"2p footprint=136MB rss=64.0MB"}}
+rc=0 cfg=pw-npx
+{"config":"ab-full-A","calls":13,"respTok":7820,"respTokCl":7821,"respBytes":28851,"callTok":291,"ms":[5525,1917,540,943,1325,2542,1352,1576,431,2175,640,1022,225],"msTotal":20213,"mem":{"afterFirstSnapshot":"1p footprint=4.3MB rss=9.4MB","afterTask":"1p footprint=6.7MB rss=8.8MB"}}
+rc=0 cfg=ab-full-A
+{"config":"ab-c-A","calls":13,"respTok":6374,"respTokCl":6407,"respBytes":22307,"callTok":299,"ms":[2967,1059,1395,395,791,2188,1868,3790,516,4315,432,1325,626],"msTotal":21667,"mem":{"afterFirstSnapshot":"1p footprint=4.3MB rss=9.4MB","afterTask":"1p footprint=6.6MB rss=8.8MB"}}
+rc=0 cfg=ab-c-A
+{"config":"ab-i-A","calls":13,"respTok":5084,"respTokCl":5124,"respBytes":14719,"callTok":299,"ms":[6726,1535,1402,722,1940,2783,1892,822,737,1696,423,746,118],"msTotal":21542,"mem":{"afterFirstSnapshot":"1p footprint=4.3MB rss=9.4MB","afterTask":"1p footprint=15MB rss=10.1MB"}}
+rc=0 cfg=ab-i-A
+{"config":"ab-i-B","calls":13,"respTok":461,"respTokCl":468,"respBytes":1397,"callTok":297,"ms":[1418,326,59,145,43,252,72,156,43,498,105,186,118],"msTotal":3421,"mem":{"afterFirstSnapshot":"1p footprint=4.5MB rss=10.6MB","afterTask":"1p footprint=4.8MB rss=11.9MB"}}
+rc=0 cfg=ab-i-B
+{"config":"ab-batch","calls":4,"respTok":461,"respTokCl":468,"respBytes":1406,"callTok":221,"ms":[5207,1996,2649,5207],"msTotal":15059,"mem":{"afterTask":"1p footprint=4.8MB rss=8.8MB"}}
+rc=0 cfg=ab-batch
+### DONE 20:11:12

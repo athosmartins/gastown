@@ -1,0 +1,41 @@
+--- abrir RP + snapshot -i: ab batch open http://127.0.0.1:47901/ snapshot -i (7662 ms)
+✓ RP-Teste
+  http://127.0.0.1:47901/
+
+- heading "RP-Teste" [level=1, ref=e1]
+- link "Entrar com IdP-Teste" [ref=e4]
+- button "Entrar com IdP-Teste (popup)" [ref=e5]
+- heading "Login embutido" [level=2, ref=e2]
+- Iframe "Login embutido" [ref=e3]
+  - heading "IdP-Teste" [level=1, ref=e6]
+  - textbox "Usuário" [ref=e8]
+  - textbox "Senha" [ref=e9]
+  - button "Entrar" [ref=e7]
+
+--- preencher + entrar no iframe: ab batch --bail fill @e8 "demo-user" fill @e9 "demo-pass" click @e7 (1880 ms)
+✓ Done
+
+✓ Done
+
+✗ Element '@e7' is outside the viewport, so the click would not reach it
+
+[exit 1]
+--- scrollintoview + click: ab batch --bail scrollintoview @e7 click @e7 (1680 ms)
+✓ Done
+
+✗ Element '@e7' is outside the viewport, so the click would not reach it
+
+[exit 1]
+--- checar: ab get text #status (645 ms)
+Não logado
+
+--- refill senha + press Enter: ab batch --bail fill @e9 "demo-pass" press Enter (1597 ms)
+✓ Done
+
+✓ Done
+
+--- confirmar: ab get text #status (848 ms)
+Logado via iframe: demo-user
+
+
+NOTES: refs no snapshot -i da pagina (iframe incluso?): u=e8 p=e9 b=e7 | click direto no iframe RECUSADO: ✗ Element '@e7' is outside the viewport, so the click would not reach it | scrollintoview NAO resolveu; tentando teclado

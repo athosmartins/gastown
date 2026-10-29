@@ -1,0 +1,109 @@
+{
+ "pages": {
+  "login": {
+   "pw snapshot": 515,
+   "pw snapshot depth=3": 223,
+   "pw find controls": 487,
+   "ab snapshot": 349,
+   "ab -i": 173,
+   "ab -c": 266,
+   "ab -i -c": 173,
+   "ab -d 3": 332,
+   "ab -i -d 3": 173
+  },
+  "form": {
+   "pw snapshot": 582,
+   "pw snapshot depth=3": 443,
+   "pw find controls": 582,
+   "ab snapshot": 423,
+   "ab -i": 211,
+   "ab -c": 405,
+   "ab -i -c": 211,
+   "ab -d 3": 350,
+   "ab -i -d 3": 211
+  },
+  "todo": {
+   "pw snapshot": 1722,
+   "pw snapshot depth=3": 1722,
+   "pw find controls": 1714,
+   "ab snapshot": 1777,
+   "ab -i": 528,
+   "ab -c": 1497,
+   "ab -i -c": 528,
+   "ab -d 3": 1777,
+   "ab -i -d 3": 528
+  },
+  "dashboard": {
+   "pw snapshot": 13483,
+   "pw snapshot depth=3": 253,
+   "pw find controls": 15854,
+   "ab snapshot": 7232,
+   "ab -i": 4934,
+   "ab -c": 5937,
+   "ab -i -c": 4934,
+   "ab -d 3": 328,
+   "ab -i -d 3": 4934
+  },
+  "heavy": {
+   "pw snapshot": 70794,
+   "pw snapshot depth=3": 329,
+   "pw find controls": 72683,
+   "ab snapshot": 40522,
+   "ab -i": 19618,
+   "ab -c": 38310,
+   "ab -i -c": 19618,
+   "ab -d 3": 1426,
+   "ab -i -d 3": 19618
+  }
+ },
+ "delta": {
+  "todo": {
+   "ab_i_full_each": [
+    516,
+    504,
+    492
+   ],
+   "ab_i_delta": [
+    80,
+    80,
+    80
+   ],
+   "pw_snapshot_each": [
+    1709,
+    1693,
+    1677
+   ],
+   "pw_find_verify": [
+    138,
+    161,
+    146
+   ],
+   "ab_delta_text": [
+    "{   \"baseRevision\": 1,   \"changes\": [     {       \"op\": \"remove\",       \"ref\": \"@e4575\"     }   ],   \"kind\": \"delta\",   \"revision\": 2,   \"treeChange\": {     \"de",
+    "{   \"baseRevision\": 2,   \"changes\": [     {       \"op\": \"remove\",       \"ref\": \"@e4576\"     }   ],   \"kind\": \"delta\",   \"revision\": 3,   \"treeChange\": {     \"de",
+    "{   \"baseRevision\": 3,   \"changes\": [     {       \"op\": \"remove\",       \"ref\": \"@e4577\"     }   ],   \"kind\": \"delta\",   \"revision\": 4,   \"treeChange\": {     \"de"
+   ],
+   "ab_baseline_full": 528,
+   "pw_baseline_full": 1722
+  },
+  "heavy": {
+   "ab_i_full_each": [
+    19618
+   ],
+   "ab_i_delta": [
+    7
+   ],
+   "pw_snapshot_each": [
+    70821
+   ],
+   "pw_find_verify": [
+    117
+   ],
+   "ab_delta_text": [
+    "unchanged (revision 6) "
+   ],
+   "ab_baseline_full": 19618,
+   "pw_baseline_full": 70794
+  }
+ }
+}

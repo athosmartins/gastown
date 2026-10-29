@@ -1,0 +1,35 @@
+[
+  {
+    "stack": "pw",
+    "flow": "redirect",
+    "ok": true,
+    "calls": 7,
+    "respTok": 900,
+    "ms": 34073,
+    "notes": []
+  },
+  {
+    "stack": "pw",
+    "flow": "popup",
+    "ok": true,
+    "calls": 12,
+    "respTok": 1138,
+    "ms": 32926,
+    "notes": [
+      "apos o click o chrome tem: [\"\",\"http://:1/\"]",
+      "popup na lista: indice 1 | o click ja avisou da aba nova",
+      "depois do popup fechar o chrome tem: [\"http://:1/\"]"
+    ]
+  },
+  {
+    "stack": "pw",
+    "flow": "iframe",
+    "ok": true,
+    "calls": 5,
+    "respTok": 647,
+    "ms": 21384,
+    "notes": [
+      "refs no snapshot da pagina (iframe incluso?): u=f1e5 p=f1e7 b=f1e8"
+    ]
+  }
+]

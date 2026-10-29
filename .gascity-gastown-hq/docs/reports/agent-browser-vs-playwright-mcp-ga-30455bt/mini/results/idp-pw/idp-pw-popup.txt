@@ -1,0 +1,127 @@
+--- abrir RP: browser_navigate {"url":"http://127.0.0.1:47901/"} (6896 ms)
+### Ran Playwright code
+```js
+await page.goto('http://127.0.0.1:47901/');
+```
+### Page
+- Page URL: http://127.0.0.1:47901/
+- Page Title: RP-Teste
+### Snapshot
+- [Snapshot](.playwright-mcp/page-2026-10-28T23-26-42-304Z.yml)
+
+--- snapshot: browser_snapshot {} (515 ms)
+### Page
+- Page URL: http://127.0.0.1:47901/
+- Page Title: RP-Teste
+### Snapshot
+```yaml
+- generic [ref=e1]:
+  - heading "RP-Teste" [level=1] [ref=e2]
+  - status [ref=e3]: Não logado
+  - paragraph [ref=e4]:
+    - link "Entrar com IdP-Teste" [ref=e5] [cursor=pointer]:
+      - /url: /login
+  - paragraph [ref=e6]:
+    - button "Entrar com IdP-Teste (popup)" [ref=e7]
+  - heading "Login embutido" [level=2] [ref=e8]
+  - iframe [ref=e9]:
+    - generic [ref=f1e1]:
+      - heading "IdP-Teste" [level=1] [ref=f1e2]
+      - generic [ref=f1e3]:
+        - generic [ref=f1e4]:
+          - text: Usuário
+          - textbox "Usuário" [ref=f1e5]
+        - generic [ref=f1e6]:
+          - text: Senha
+          - textbox "Senha" [ref=f1e7]
+        - button "Entrar" [ref=f1e8]
+```
+
+--- clicar (abre popup): browser_click {"target":"e7","element":"botao popup"} (7217 ms)
+[tool error] ### Error
+TimeoutError: browserBackend.callTool: Timeout 5000ms exceeded.
+Call log:
+  - waiting for locator('aria-ref=e7')
+    - locator resolved to <button id="pop" type="button">Entrar com IdP-Teste (popup)</button>
+  - attempting click action
+    - waiting for element to be visible, enabled and stable
+    - element is visible, enabled and stable
+    - scrolling into view if needed
+    - done scrolling
+    - performing click action
+
+
+--- listar abas: browser_tabs {"action":"list"} (2274 ms)
+### Result
+- 0: (current) [RP-Teste](http://127.0.0.1:47901/)
+
+--- listar abas: browser_tabs {"action":"list"} (1012 ms)
+### Result
+- 0: (current) [RP-Teste](http://127.0.0.1:47901/)
+- 1: [IdP-Teste: Entrar](http://127.0.0.1:47902/authorize?mode=popup&state=P)
+
+--- selecionar popup: browser_tabs {"action":"select","index":1} (1999 ms)
+### Result
+- 0: [RP-Teste](http://127.0.0.1:47901/)
+- 1: (current) [IdP-Teste: Entrar](http://127.0.0.1:47902/authorize?mode=popup&state=P)
+
+--- snapshot do popup: browser_snapshot {} (898 ms)
+### Open tabs
+- 0: [RP-Teste](http://127.0.0.1:47901/)
+- 1: (current) [IdP-Teste: Entrar](http://127.0.0.1:47902/authorize?mode=popup&state=P)
+### Page
+- Page URL: http://127.0.0.1:47902/authorize?mode=popup&state=P
+- Page Title: IdP-Teste: Entrar
+### Snapshot
+```yaml
+- generic [active] [ref=e1]:
+  - heading "IdP-Teste" [level=1] [ref=e2]
+  - generic [ref=e3]:
+    - generic [ref=e4]:
+      - text: Usuário
+      - textbox "Usuário" [ref=e5]
+    - generic [ref=e6]:
+      - text: Senha
+      - textbox "Senha" [ref=e7]
+    - button "Entrar" [ref=e8]
+```
+
+--- preencher: browser_fill_form {"fields":[{"target":"e5","name":"Usuario","type":"textbox","value":"demo-user"},{"target":"e7","name":"Senha","type":"t (3523 ms)
+### Ran Playwright code
+```js
+await page.getByRole('textbox', { name: 'Usuário' }).fill('demo-user');
+await page.getByRole('textbox', { name: 'Senha' }).fill('demo-pass');
+```
+
+--- entrar (o popup se fecha): browser_click {"target":"e8","element":"botao Entrar"} (4420 ms)
+### Ran Playwright code
+```js
+await page.getByRole('button', { name: 'Entrar' }).click();
+```
+### Page
+- Page URL: http://127.0.0.1:47901/
+- Page Title: RP-Teste
+### Snapshot
+- [Snapshot](.playwright-mcp/page-2026-10-28T23-27-07-030Z.yml)
+
+--- listar abas: browser_tabs {"action":"list"} (1288 ms)
+### Result
+- 0: (current) [RP-Teste](http://127.0.0.1:47901/)
+
+--- voltar a aba 0: browser_tabs {"action":"select","index":0} (1877 ms)
+### Result
+- 0: (current) [RP-Teste](http://127.0.0.1:47901/)
+
+--- confirmar: browser_find {"text":"Logado via popup"} (1007 ms)
+### Result
+Found 1 match for "Logado via popup":
+
+- generic [ref=e1]:
+  - heading "RP-Teste" [level=1] [ref=e2]
+  - status [ref=e3]: "Logado via popup: demo-user"
+  - paragraph [ref=e4]:
+    - link "Entrar com IdP-Teste" [ref=e5] [cursor=pointer]:
+      - /url: /login
+
+
+NOTES: apos o click o chrome tem: ["","http://:1/"] | popup na lista: indice 1 | o click ja avisou da aba nova | depois do popup fechar o chrome tem: ["http://:1/"]

@@ -1,0 +1,14 @@
+[real9222] antes:
+   <aba de agente: titulo e URL omitidos>
+   <aba de agente: titulo e URL omitidos>
+   <aba de agente: titulo e URL omitidos>
+[real9222] open (pin):
+   ✓ pin-probe-ga-g7zyxc3
+     data:text/html,<title>pin-probe-ga-g7zyxc3</title><p>probe
+[real9222] get title -> pin-probe-ga-g7zyxc3
+[real9222] durante:
+   > 74ABC32A pin-probe-ga-g7zyxc3 | data:text/html,<title>pin-probe-ga-g7zyxc3</title><p>probe
+[real9222] paginas: antes=3 durante=4
+[real9222] tab close -> ✓ Tab [t4] closed
+[real9222] depois: IDENTICO ao antes (3 paginas, mesmas URLs e titulos)
+[real9222] chrome vivo: Chrome/156.0.8078.49

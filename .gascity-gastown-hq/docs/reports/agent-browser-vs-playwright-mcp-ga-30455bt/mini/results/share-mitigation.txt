@@ -1,0 +1,25 @@
+## M1: PW1 e PW2 comecam com browser_tabs{new}; abas iniciais = ["1E07F:about:blank"]
+PW1 tabs new /tab/A1 -> abas ["BB923:/tab/A1","1E07F:about:blank"]
+PW2 tabs new /tab/B1 -> abas ["FBE6B:/tab/B1","BB923:/tab/A1","1E07F:about:blank"]
+PW1 ve: TAB-A1 | PW2 ve: TAB-B1
+PW2 navega B2 -> PW1 ve: TAB-A1 | PW2 ve: TAB-B2
+PW1 navega A2 -> PW1 ve: TAB-A2 | PW2 ve: TAB-B2
+PW1 browser_tabs list -> ### Result - 0: [](about:blank) - 1: (current) [TAB-A2](http://127.0.0.1:47811/tab/A2) - 2: [TAB-B2](http://127.0.0.1:47811/tab/B2) 
+PW2 browser_tabs list -> ### Result - 0: [](about:blank) - 1: [TAB-A2](http://127.0.0.1:47811/tab/A2) - 2: (current) [TAB-B2](http://127.0.0.1:47811/tab/B2) 
+PW1 browser_tabs close (sem index) -> ### Result - 0: [](about:blank) - 1: (current) [TAB-B2](http://127.0.0.1:47811/tab/B2) 
+  abas agora ["FBE6B:/tab/B2","1E07F:about:blank"] | PW2 ainda ve: TAB-B2
+PW2 browser_close -> ### Result No open tabs. Navigate to a URL to create one. ### Ran Playwright code ```js await page.close() ``` 
+  abas agora ["FBE6B:/tab/B2","1E07F:about:blank"]
+
+## M2: PW1 ja navegando na aba inicial; PW2 chega e usa tabs{new}
+PW1 navega A1 (aba inicial) -> abas ["258CC:/tab/A1"]
+PW2 tabs new B1 -> abas ["722D9:/tab/B1","258CC:/tab/A1"]
+PW1 ve (depois da aba nova de PW2): TAB-A1 | PW2 ve: TAB-B1
+PW1 navega A2 -> abas ["722D9:/tab/B1","258CC:/tab/A2"] | PW2 ve: TAB-B1
+PW2 browser_tabs list -> ### Result - 0: [TAB-A2](http://127.0.0.1:47811/tab/A2) - 1: (current) [TAB-B1](http://127.0.0.1:47811/tab/B1) 
+
+## M3: PW1 em A1; PW2 faz tabs{list} e tabs{select,index 0} (agente que "volta para a primeira aba")
+PW2 tabs list -> ### Result - 0: (current) [TAB-A1](http://127.0.0.1:47811/tab/A1) 
+PW2 select 0 + navega B1 -> PW1 ve: TAB-B1 | abas ["B495E:/tab/B1"]
+
+chrome vivo: true | abas finais ["B495E:/tab/B1"]

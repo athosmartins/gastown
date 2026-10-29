@@ -1,0 +1,13 @@
+# spawn -> resposta do `initialize` (ms), npx/node REAIS do mini, load average 75-82 (10 nucleos), 28/10 ~20:25-20:35
+# lote 1 (load 82): npx @playwright/mcp@latest, 3 execucoes
+{"spec":"@playwright/mcp@latest","ms":[34809,33471,31350]}
+# lote 2: npx @playwright/mcp@0.0.83, PRIMEIRA vez (instala no cache do npx; timeout do cliente de teste = 90 s)
+{"spec":"@playwright/mcp@0.0.83","ms":["ERR:timeout initialize"]}
+# lote 3: npx @playwright/mcp@0.0.83 ja no cache, 3 execucoes
+{"spec":"@playwright/mcp@0.0.83","ms":[23369,69214,45463]}
+# lote 4 (load 75 -> 54): node direto, 5 execucoes
+{"direct":"$EVAL_S/pw-mcp/node_modules/@playwright/mcp/cli.js","ms":[8913,6117,2802,4164,5330]}
+# lote 5 (mesmo periodo do lote 4): npx @playwright/mcp@latest, 2 execucoes
+{"spec":"@playwright/mcp@latest","ms":[11113,17944]}
+# janela de conexao do Claude: `claude mcp get playwright-cdp` com o npx @latest marcou "Failed to connect - timed out after 30000ms";
+# depois do pin direto (node + cli.js): "Connected".

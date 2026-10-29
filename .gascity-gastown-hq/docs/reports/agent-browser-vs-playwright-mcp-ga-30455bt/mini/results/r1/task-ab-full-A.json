@@ -1,0 +1,166 @@
+{
+ "config": "ab-full-A",
+ "calls": 13,
+ "respTok": 7820,
+ "respTokCl": 7821,
+ "respBytes": 28851,
+ "callTok": 291,
+ "steps": [
+  {
+   "n": 1,
+   "step": "nav-login",
+   "ms": 1925,
+   "tool": "Bash",
+   "callTok": 33,
+   "respBytes": 63,
+   "respTok": 25,
+   "respTokCl": 24
+  },
+  {
+   "n": 2,
+   "step": "snap-login",
+   "ms": 262,
+   "tool": "Bash",
+   "callTok": 14,
+   "respBytes": 1102,
+   "respTok": 336,
+   "respTokCl": 333
+  },
+  {
+   "n": 3,
+   "step": "fill-user",
+   "ms": 433,
+   "tool": "Bash",
+   "callTok": 19,
+   "respBytes": 9,
+   "respTok": 3,
+   "respTokCl": 4
+  },
+  {
+   "n": 4,
+   "step": "fill-pass",
+   "ms": 404,
+   "tool": "Bash",
+   "callTok": 19,
+   "respBytes": 9,
+   "respTok": 3,
+   "respTokCl": 4
+  },
+  {
+   "n": 5,
+   "step": "click-signin",
+   "ms": 766,
+   "tool": "Bash",
+   "callTok": 17,
+   "respBytes": 9,
+   "respTok": 3,
+   "respTokCl": 4
+  },
+  {
+   "n": 6,
+   "step": "wait-dash",
+   "ms": 1917,
+   "tool": "Bash",
+   "callTok": 19,
+   "respBytes": 33,
+   "respTok": 14,
+   "respTokCl": 14
+  },
+  {
+   "n": 7,
+   "step": "snap-dash",
+   "ms": 684,
+   "tool": "Bash",
+   "callTok": 14,
+   "respBytes": 25766,
+   "respTok": 6913,
+   "respTokCl": 6906
+  },
+  {
+   "n": 8,
+   "step": "nav-form",
+   "ms": 880,
+   "tool": "Bash",
+   "callTok": 27,
+   "respBytes": 35,
+   "respTok": 17,
+   "respTokCl": 18
+  },
+  {
+   "n": 9,
+   "step": "snap-form",
+   "ms": 325,
+   "tool": "Bash",
+   "callTok": 14,
+   "respBytes": 1526,
+   "respTok": 408,
+   "respTokCl": 410
+  },
+  {
+   "n": 10,
+   "step": "fill-form",
+   "ms": 1080,
+   "tool": "Bash",
+   "callTok": 65,
+   "respBytes": 49,
+   "respTok": 15,
+   "respTokCl": 20
+  },
+  {
+   "n": 11,
+   "step": "click-submit",
+   "ms": 104,
+   "tool": "Bash",
+   "callTok": 17,
+   "respBytes": 9,
+   "respTok": 3,
+   "respTokCl": 4
+  },
+  {
+   "n": 12,
+   "step": "wait-done",
+   "ms": 871,
+   "tool": "Bash",
+   "callTok": 19,
+   "respBytes": 30,
+   "respTok": 15,
+   "respTokCl": 15
+  },
+  {
+   "n": 13,
+   "step": "snap-done",
+   "ms": 558,
+   "tool": "Bash",
+   "callTok": 14,
+   "respBytes": 211,
+   "respTok": 65,
+   "respTokCl": 65
+  }
+ ],
+ "mem": {
+  "afterFirstSnapshot": {
+   "procs": 1,
+   "fpMB": 4.4,
+   "rssKB": 10032,
+   "rows": [
+    {
+     "pid": "7694",
+     "rssKB": 10032,
+     "cmd": "/private/tmp/claude-501/-Users-athos-gt--gascity-gastown-hq--gc-agents-dogs-gastown-dog-6/"
+    }
+   ]
+  },
+  "afterTask": {
+   "procs": 1,
+   "fpMB": 6.5,
+   "rssKB": 10928,
+   "rows": [
+    {
+     "pid": "7694",
+     "rssKB": 10928,
+     "cmd": "/private/tmp/claude-501/-Users-athos-gt--gascity-gastown-hq--gc-agents-dogs-gastown-dog-6/"
+    }
+   ]
+  }
+ }
+}

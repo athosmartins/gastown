@@ -1,0 +1,66 @@
+{
+ "config": "pw-npx",
+ "calls": 2,
+ "respTok": 658,
+ "respTokCl": 651,
+ "respBytes": 2147,
+ "callTok": 35,
+ "steps": [
+  {
+   "n": 1,
+   "step": "nav-login",
+   "ms": 2594,
+   "tool": "browser_navigate",
+   "callTok": 25,
+   "respBytes": 377,
+   "respTok": 143,
+   "respTokCl": 140
+  },
+  {
+   "n": 2,
+   "step": "snap-login",
+   "ms": 338,
+   "tool": "browser_snapshot",
+   "callTok": 10,
+   "respBytes": 1770,
+   "respTok": 515,
+   "respTokCl": 511
+  }
+ ],
+ "mem": {
+  "afterInit": {
+   "procs": 2,
+   "fpMB": 124,
+   "rssKB": 112880,
+   "rows": [
+    {
+     "pid": "5706",
+     "rssKB": 37104,
+     "cmd": "npm exec playwright-mcp --cdp-endpoint http://127.0.0.1:47222     "
+    },
+    {
+     "pid": "7017",
+     "rssKB": 75776,
+     "cmd": "node /private/tmp/claude-501/-Users-athos-gt--gascity-gastown-hq--gc-agents-dogs-gastown-d"
+    }
+   ]
+  },
+  "afterFirstSnapshot": {
+   "procs": 2,
+   "fpMB": 134,
+   "rssKB": 83552,
+   "rows": [
+    {
+     "pid": "5706",
+     "rssKB": 35504,
+     "cmd": "npm exec playwright-mcp --cdp-endpoint http://127.0.0.1:47222     "
+    },
+    {
+     "pid": "7017",
+     "rssKB": 48048,
+     "cmd": "node /private/tmp/claude-501/-Users-athos-gt--gascity-gastown-hq--gc-agents-dogs-gastown-d"
+    }
+   ]
+  }
+ }
+}

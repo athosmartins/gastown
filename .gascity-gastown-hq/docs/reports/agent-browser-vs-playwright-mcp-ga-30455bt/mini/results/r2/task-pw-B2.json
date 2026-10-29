@@ -1,0 +1,128 @@
+{
+ "config": "pw-B2",
+ "calls": 8,
+ "respTok": 1713,
+ "respTokCl": 1697,
+ "respBytes": 5348,
+ "callTok": 279,
+ "steps": [
+  {
+   "n": 1,
+   "step": "nav-login",
+   "ms": 1642,
+   "tool": "browser_navigate",
+   "callTok": 25,
+   "respBytes": 377,
+   "respTok": 143,
+   "respTokCl": 140
+  },
+  {
+   "n": 2,
+   "step": "snap-login",
+   "ms": 34,
+   "tool": "browser_snapshot",
+   "callTok": 10,
+   "respBytes": 1770,
+   "respTok": 515,
+   "respTokCl": 511
+  },
+  {
+   "n": 3,
+   "step": "fill-login",
+   "ms": 874,
+   "tool": "browser_fill_form",
+   "callTok": 50,
+   "respBytes": 197,
+   "respTok": 54,
+   "respTokCl": 52
+  },
+  {
+   "n": 4,
+   "step": "click-signin",
+   "ms": 1808,
+   "tool": "browser_click",
+   "callTok": 19,
+   "respBytes": 377,
+   "respTok": 137,
+   "respTokCl": 135
+  },
+  {
+   "n": 5,
+   "step": "nav-form",
+   "ms": 248,
+   "tool": "browser_navigate",
+   "callTok": 25,
+   "respBytes": 208,
+   "respTok": 81,
+   "respTokCl": 81
+  },
+  {
+   "n": 6,
+   "step": "snap-form",
+   "ms": 11,
+   "tool": "browser_snapshot",
+   "callTok": 10,
+   "respBytes": 1758,
+   "respTok": 582,
+   "respTokCl": 583
+  },
+  {
+   "n": 7,
+   "step": "fill-form",
+   "ms": 1487,
+   "tool": "browser_fill_form",
+   "callTok": 119,
+   "respBytes": 404,
+   "respTok": 112,
+   "respTokCl": 107
+  },
+  {
+   "n": 8,
+   "step": "click-submit",
+   "ms": 1466,
+   "tool": "browser_click",
+   "callTok": 21,
+   "respBytes": 257,
+   "respTok": 89,
+   "respTokCl": 88
+  }
+ ],
+ "mem": {
+  "afterInit": {
+   "procs": 1,
+   "fpMB": 98,
+   "rssKB": 123792,
+   "rows": [
+    {
+     "pid": "99262",
+     "rssKB": 123792,
+     "cmd": "/opt/homebrew/Cellar/node@22/22.22.3/bin/node /private/tmp/claude-501/-Users-athos-gt--gas"
+    }
+   ]
+  },
+  "afterFirstSnapshot": {
+   "procs": 1,
+   "fpMB": 106,
+   "rssKB": 119936,
+   "rows": [
+    {
+     "pid": "99262",
+     "rssKB": 119936,
+     "cmd": "/opt/homebrew/Cellar/node@22/22.22.3/bin/node /private/tmp/claude-501/-Users-athos-gt--gas"
+    }
+   ]
+  },
+  "afterTask": {
+   "procs": 1,
+   "fpMB": 116,
+   "rssKB": 53696,
+   "rows": [
+    {
+     "pid": "99262",
+     "rssKB": 53696,
+     "cmd": "/opt/homebrew/Cellar/node@22/22.22.3/bin/node /private/tmp/claude-501/-Users-athos-gt--gas"
+    }
+   ]
+  }
+ }
+}
