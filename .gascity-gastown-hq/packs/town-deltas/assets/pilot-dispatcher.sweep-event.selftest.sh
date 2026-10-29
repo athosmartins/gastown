@@ -184,8 +184,8 @@ expect '.results.rig_native_pool_session_cap_queued' '2' "A2: results is the per
 expect '.results | has("")' 'false' "A2: the nameless exit has no results key (it is only in unclassified)"
 
 # A2d — ga-do1ixn.3: a lane:kimi bead the Kimi pass handed to dispatch_one() and that came back WITHOUT a dispatch. kimi_lane_released (the lane only takes an HQ bead with a dog target) and
-# kimi_lane_wait (slot busy, session list unreadable, spawn budget spent — the bead waits, never the mini) are deliberate waits, like wa_node_pass_released: refused_by_guard, BY NAME, never failed_other
-# (a Pilot-fault tile that lights for every bead waiting its turn). node_rollback_unconfirmed and kimi_lane_failed (the assignment, the session or the notice failed) from the same pass are real faults: they stay in failed_other.
+# kimi_lane_wait (slot busy, spawn budget spent — the bead waits, never the mini) are deliberate waits, like wa_node_pass_released: refused_by_guard, BY NAME, never failed_other
+# (a Pilot-fault tile that lights for every bead waiting its turn). node_rollback_unconfirmed and kimi_lane_failed (the session list could not be read, or the assignment, the session or the notice failed) from the same pass are real faults: they stay in failed_other.
 run_sweep 'k1 1 kimi_lane_released
 k2 1 kimi_lane_wait
 k3 1 node_rollback_unconfirmed
@@ -367,8 +367,8 @@ KNOWN_RESULTS=" sling_ok rig_native_ok dry_run rig_native_pool_session_cap_queue
 #  is rc 1: the node dispatch failed AND the undo could not be read back, so the Pilot dispatched NOTHING and left the claim for the TTL. Deliberately left in failed_other - a FAULT, not a policy:
 #  a guard bucket would hide a bead that may still be assigned to the node while the Pilot cannot tell.)
 # (kimi_lane_released / kimi_lane_wait, ga-do1ixn.3: the Kimi lane pass gave a lane:kimi bead back on purpose — released because the lane only takes an HQ bead with a dog target, or kept waiting
-#  because the Kimi slot was busy or the session list could not be read. Nothing failed and nothing is a Pilot fault: refused_by_guard, like wa_node_pass_released. The same pass's two real faults stay in
-#  failed_other, above: node_rollback_unconfirmed, and kimi_lane_failed (gate round 2: the assignment, the session or the notice failed — the node did not take the bead; the undo ran).)
+#  because the Kimi slot was busy or the spawn budget was spent. Nothing failed and nothing is a Pilot fault: refused_by_guard, like wa_node_pass_released. The same pass's two real faults stay in
+#  failed_other, above: node_rollback_unconfirmed, and kimi_lane_failed (gate round 2: the session list could not be read, or the assignment, the session or the notice failed — the node did not take the bead; the undo ran).)
 # (priority_yield, ga-5fn5p3: a P2..P4 bead CEDED to a P0/P1 waiting behind a full pool. Nothing failed and nothing was
 #  refused by a guard — it is deferred BY POLICY and re-evaluated next sweep — so it has its OWN bucket, yielded_priority:
 #  in failed_other it would read as a Pilot fault, in refused_by_guard as a guard that fired.)

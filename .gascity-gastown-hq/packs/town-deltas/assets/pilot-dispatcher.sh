@@ -12409,13 +12409,13 @@ _pilot_kimi_lane_closed() {
 
 # _pilot_kimi_pick_alias — a vaga do kimi-worker-remote: devolve 0 com _PKL_ALIAS=<template>-1 e _PKL_ALIAS_STATE (new | asleep) ou 1 sem vaga. A leitura do _pilot_node_pick_alias com o template do Kimi
 # e teto 1: vaga conta por TEMPLATE (fora closed e asleep: sessão sem alias também ocupa), estado que não conheço = ocupado, alias preso por OUTRO template nunca é escolhido.
-_PKL_ALIAS=""; _PKL_ALIAS_STATE=""
+_PKL_ALIAS=""; _PKL_ALIAS_STATE=""; _PKL_PICK_UNREAD=0
 _pilot_kimi_pick_alias() {
   local _kp_json="" _kp_pick=""
-  _PKL_ALIAS=""; _PKL_ALIAS_STATE=""
-  # vazio/falhou (rc≠0, sem saída, não JSON, ok:false) → sem vaga: lista que não se leu NÃO é "sem sessões"
-  _kp_json=$(gc_json_or_unknown timeout 20 gc --city "$GC_CITY" session list --json) || { return 1; }
-  printf '%s' "$_kp_json" | jq -e '.sessions | type == "array"' >/dev/null 2>&1 || return 1
+  _PKL_ALIAS=""; _PKL_ALIAS_STATE=""; _PKL_PICK_UNREAD=0
+  # vazio/falhou (rc≠0, sem saída, não JSON, ok:false) → sem vaga: lista que não se leu NÃO é "sem sessões"; devolve 1 como a vaga ocupada (nada é escrito), mas _PKL_PICK_UNREAD=1 diz que foi leitura que não rendeu, para o chamador não a contar como espera calma
+  _kp_json=$(gc_json_or_unknown timeout 20 gc --city "$GC_CITY" session list --json) || { _PKL_PICK_UNREAD=1; return 1; }
+  printf '%s' "$_kp_json" | jq -e '.sessions | type == "array"' >/dev/null 2>&1 || { _PKL_PICK_UNREAD=1; return 1; }
   # vazio = vaga ocupada (→ 1); jq que falha → 1
   _kp_pick=$(printf '%s' "$_kp_json" | jq -r --arg kt "$PILOT_KIMI_TEMPLATE" '
     [.sessions[] | select(type == "object" and .closed != true)] as $live
@@ -12424,7 +12424,7 @@ _pilot_kimi_pick_alias() {
     | if $occ >= 1 then empty
       elif ($h | length) == 0 then "\($a) new"
       elif ($h | all(.template == $kt and .state == "asleep")) then "\($a) asleep"
-      else empty end' 2>/dev/null) || return 1
+      else empty end' 2>/dev/null) || { _PKL_PICK_UNREAD=1; return 1; }
   [ -n "$_kp_pick" ] || return 1
   _PKL_ALIAS="${_kp_pick%% *}"; _PKL_ALIAS_STATE="${_kp_pick#* }"
   return 0
@@ -12432,7 +12432,7 @@ _pilot_kimi_pick_alias() {
 
 # _pilot_kimi_dispatch <bead_id> <bead_city> <title> — leva a bead ao kimi-worker-remote. Sempre devolve 0 e deixa _PNF_RESULT (node = atribuída e avisada · mini = nada ficou escrito: o chamador solta a
 # claim e a bead ESPERA · stuck = o desfazer não se confirmou) e _PNF_ALIAS, que é o que o dispatch_one já lê para o ramo do nó. _PKL_FAULT separa as duas esperas de _PNF_RESULT=mini: 0 = espera de propósito
-# (orçamento de spawn gasto, vaga ocupada ou lista de sessões que não se leu: nada foi tentado), 1 = o nó FALHOU (a atribuição, a sessão ou o aviso; o desfazer, confirmado ou não, já rodou) — o dispatch_one nomeia
+# (orçamento de spawn gasto ou vaga ocupada: nada foi tentado), 1 = FALHA: a lista de sessões não se leu (nada foi tentado) ou o nó falhou (a atribuição, a sessão ou o aviso; o desfazer, confirmado ou não, já rodou) — o dispatch_one nomeia
 # a primeira kimi_lane_wait e a segunda kimi_lane_failed, e só a primeira fica de fora da conta de "Pilot estagnado".
 _pilot_kimi_dispatch() {
   local _kd_id="$1" _kd_city="$2" _kd_title="$3" _kd_alias="" _kd_state="" _kd_rc=0 _kd_t0=0 _kd_msg="" _kd_step="" _kd_sess=0
@@ -12442,7 +12442,13 @@ _pilot_kimi_dispatch() {
     return 0
   fi
   if ! _pilot_kimi_pick_alias; then
-    log "  faixa Kimi: $_kd_id espera — a vaga do $PILOT_KIMI_TEMPLATE está ocupada ou a lista de sessões não se leu"
+    # vaga ocupada = espera de propósito (_PKL_FAULT=0); lista de sessões que não se leu = falha (_PKL_FAULT=1): sem vaga nos dois, nada escrito, mas só o primeiro fica de fora do "Pilot estagnado"
+    if [ "${_PKL_PICK_UNREAD:-0}" = "1" ]; then
+      _PKL_FAULT=1
+      warn "ga-do1ixn.3: faixa Kimi: $_kd_id espera — NÃO consegui ler a lista de sessões (vaga do $PILOT_KIMI_TEMPLATE desconhecida; nada escrito)"
+    else
+      log "  faixa Kimi: $_kd_id espera — a vaga do $PILOT_KIMI_TEMPLATE está ocupada"
+    fi
     return 0
   fi
   _kd_alias="$_PKL_ALIAS"; _kd_state="$_PKL_ALIAS_STATE"
@@ -16663,12 +16669,13 @@ DISPATCH_RESULT=""   # ga-ov3gow: global on purpose — set by dispatch_one(), r
 #                       counted in NONQUEUE_FAILS so the Step 5 stall streak sees a sweep that spawned nothing.
 #                       And kimi_lane_released / kimi_lane_wait (ga-do1ixn.3): a lane:kimi bead the Kimi pass handed to
 #                       dispatch_one() and that dispatch_one() gave back on purpose — released (the lane only takes an HQ
-#                       bead with a dog target) or kept waiting (the Kimi slot was busy, the session list could not be read
-#                       or the spawn budget was spent; never the mini). The claim is released, nothing is stamped as a pool
+#                       bead with a dog target) or kept waiting (the Kimi slot was busy or the spawn budget was spent;
+#                       never the mini). The claim is released, nothing is stamped as a pool
 #                       route: a wait, not a fault. (Two results from the Kimi pass are NOT here and stay failed_other, where
 #                       a real fault is visible: node_rollback_unconfirmed — the undo of the dispatch could not be confirmed
-#                       — and kimi_lane_failed — the assignment, the session or the notice failed, the node did not take the
-#                       bead and the undo ran. Gate round 2: kimi_lane_wait used to cover that outage too.)
+#                       — and kimi_lane_failed — the session list could not be read, or the assignment, the session or the
+#                       notice failed (the node did not take the bead; the undo ran). Gate round 2: kimi_lane_wait used
+#                       to cover those too.)
 #   failed_other        any other NAMED failure (assign / sling / in-flight / rig_native_pool_count_unreadable —
 #                       the session count could not be read, so the spawn was NOT attempted, ga-oa004t — and
 #                       remerge_branch_lookup_unknown, ga-x7m5rg: the gate:needs-remerge branch lookup could

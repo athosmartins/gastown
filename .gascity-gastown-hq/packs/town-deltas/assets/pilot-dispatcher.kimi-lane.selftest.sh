@@ -24,7 +24,7 @@
 #   (rodada 2, bloqueante) ESPERA DE PROPÓSITO NÃO É PARADA: o predicado de saturação e o Step 5 (a sequência do "Pilot estagnado") rodam VERBATIM (marcadores SELFTEST-EXTRACT): uma lane:kimi esperando e mais nada =
 #   saturado, streak zerado, nenhum toque; o controle (candidato comum que não despachou) segue contando e tocando; espera + falha no mesmo sweep NÃO isenta; contador ilegível/ausente/com zero à esquerda; o marcador
 #   POOL-SATURATED nomeia a espera e sai byte a byte igual sem ela. A passada deixa KIMI_LANE_WAITING (esperas) e soma as FALHAS (rebaixamento, carimbo, lista do carimbo, triagem ilegível, nó que falhou, retorno sem nome)
-#   em NONQUEUE_FAILS. kimi_lane_failed (atribuição, sessão ou aviso falhou, _PKL_FAULT) é um nome à parte de kimi_lane_wait. (não bloqueante) a triagem lê também metadata story.criterios/estrela_guia/equilibrios; o
+#   em NONQUEUE_FAILS. kimi_lane_failed (lista de sessões que não se leu, ou atribuição, sessão ou aviso que falhou: _PKL_FAULT) é um nome à parte de kimi_lane_wait (vaga ocupada, orçamento de spawn). (não bloqueante) a triagem lê também metadata story.criterios/estrela_guia/equilibrios; o
 #   FAIL do gate de uma bead lane:kimi acrescenta a nota de que kimi-lane não é um pool.
 # COMO RODA: as funções são extraídas VERBATIM dos dispatchers (awk) e rodam num shell filho sob `set -euo pipefail`, com `gc` e `bd` FALSOS num PATH sem os reais; dispatch_one é um falso que
 #   registra o que recebeu. Contra um dispatcher sem as funções o arquivo se recusa a começar.
@@ -175,6 +175,8 @@ run_kd() {
     log()  { echo "LOG $*" >> "$LINES"; }
     warn() { echo "WARN $*" >> "$LINES"; }
     GC_CITY="$WORK/city"; PILOT_SPAWN_TIMEOUT_SECS=20; PILOT_KIMI_TEMPLATE="kimi-worker-remote"; _PILOT_SLOW_SPAWN_SEEN=0
+    # KD_JQFAIL=1: o jq que escolhe a vaga (o que declara $occ) morre; os outros jq seguem
+    if [ "${KD_JQFAIL:-0}" = 1 ]; then jq() { case "$*" in *'$occ'*) return 5 ;; esac; command jq "$@"; }; fi
     eval "$FUNCS"
     _pilot_kimi_dispatch "ga-k1" "$WORK/city" "Título"
     echo "fault=${_PKL_FAULT-?}" > "$WORK/kd.fault"
@@ -582,7 +584,13 @@ reset; sess; printf '%s' 'update ga-k1 --assignee' > "$WORK/bd.fail.on"; r=$(run
 reset; sess kimi-worker-remote-1:active; r=$(run_kd); f=$(cat "$WORK/kd.fault" 2>/dev/null)
 [ "$r" = "res=mini alias=" ] && [ "$f" = "fault=0" ] && ok "vaga ocupada: espera de propósito, SEM falha" || bad "vaga ocupada: '$r' '$f'"
 reset; echo 1 > "$WORK/gc.list.rc"; r=$(run_kd); f=$(cat "$WORK/kd.fault" 2>/dev/null)
-[ "$r" = "res=mini alias=" ] && [ "$f" = "fault=0" ] && ok "lista de sessões que não se leu: sem vaga, SEM falha (inerte; o aviso do log diz)" || bad "lista ilegível: '$r' '$f'"
+[ "$r" = "res=mini alias=" ] && [ "$f" = "fault=1" ] && ok "lista de sessões que não se leu (gc session list falhou): sem vaga e nada escrito, mas é FALHA — 'não consegui ler' não é 'a vaga está ocupada'" || bad "lista ilegível: '$r' '$f'"
+reset; printf '%s\n' '{"sessions":"nao-e-lista"}' > "$WORK/sessions.json"; r=$(run_kd); f=$(cat "$WORK/kd.fault" 2>/dev/null)
+[ "$r" = "res=mini alias=" ] && [ "$f" = "fault=1" ] && ok "lista de sessões que não é uma lista: sem vaga e FALHA (mesma família)" || bad "lista que não é lista: '$r' '$f'"
+reset; sess; r=$(KD_JQFAIL=1 run_kd); f=$(cat "$WORK/kd.fault" 2>/dev/null)
+[ "$r" = "res=mini alias=" ] && [ "$f" = "fault=1" ] && ok "a escolha da vaga que não rende (jq morreu): sem vaga e FALHA (mesma família)" || bad "jq da vaga que falha: '$r' '$f'"
+reset; sess kimi-worker-remote-1:active; r=$(run_kd); f=$(cat "$WORK/kd.fault" 2>/dev/null)
+[ "$r" = "res=mini alias=" ] && [ "$f" = "fault=0" ] && ok "CONTROLE: lista lida e vaga ocupada continua espera de propósito (fault=0)" || bad "controle vaga ocupada: '$r' '$f'"
 reset; sess; r=$(run_kd); f=$(cat "$WORK/kd.fault" 2>/dev/null)
 [ "$r" = "res=node alias=kimi-worker-remote-1" ] && [ "$f" = "fault=0" ] && ok "despacho que deu certo: sem falha" || bad "despacho certo: '$r' '$f'"
 KB="$(awk '/^  if \[ "\$\{_PILOT_KIMI_PASS:-0\}" = "1" \]; then/{f=1} f{print} f&&/^  fi$/{exit}' "$DISPATCHER")"
@@ -691,6 +699,15 @@ PY
   mutant "retorno sem nome conta como espera" pilot 'kimi_lane_wait|kimi_lane_released) ;; *) _kl_dfault=$((_kl_dfault + 1)) ;; esac' '*) ;; esac'
   mutant "kimi_lane_failed não para a passada" pilot 'kimi_lane_wait|kimi_lane_failed|node_rollback_unconfirmed) _kl_stop=' 'kimi_lane_wait|node_rollback_unconfirmed) _kl_stop='
   mutant "falha do nó sai com o nome da espera" pilot 'if [ "${_PKL_FAULT:-0}" = "1" ]; then DISPATCH_RESULT="kimi_lane_failed"; else' 'if false; then DISPATCH_RESULT="kimi_lane_failed"; else'
+  mutant "lista de sessões ilegível conta como vaga ocupada" pilot 'if [ "${_PKL_PICK_UNREAD:-0}" = "1" ]; then
+      _PKL_FAULT=1' 'if false; then
+      _PKL_FAULT=1'
+  mutant "gc session list que falha não marca a leitura" pilot 'session list --json) || { _PKL_PICK_UNREAD=1; return 1; }' 'session list --json) || { return 1; }'
+  mutant "lista que não é lista não marca a leitura" pilot '>/dev/null 2>&1 || { _PKL_PICK_UNREAD=1; return 1; }' '>/dev/null 2>&1 || return 1'
+  mutant "jq da vaga que falha não marca a leitura" pilot "2>/dev/null) || { _PKL_PICK_UNREAD=1; return 1; }" "2>/dev/null) || return 1"
+  mutant "a marca de leitura não zera na entrada" pilot '_PKL_ALIAS=""; _PKL_ALIAS_STATE=""; _PKL_PICK_UNREAD=0
+  # vazio/falhou' '_PKL_ALIAS=""; _PKL_ALIAS_STATE=""
+  # vazio/falhou'
   mutant "falha do nó não é marcada" pilot '    _PKL_FAULT=1
     warn' '    warn'
   mutant "a marca de falha não zera na entrada" pilot '_PNF_RESULT="mini"; _PKL_FAULT=0' '_PNF_RESULT="mini"'
