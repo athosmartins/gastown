@@ -8,6 +8,9 @@
 #   · palavras informativas NÃO bloqueiam · duras vencem node:ok · unknown (sem prova, JSON ilegível, campo de tipo estranho, texto/entrada grande, filtro (ausente ou furado)/mac-only (ausente
 #   ou sem glob) ausente, rsync que falha/sai com rc 23/não responde/lista tudo, canário errado, exceção inesperada) · caminho fora do formato (.., absoluto, ~/, $VAR/) não toca o disco ·
 #   teto de 40 caminhos · códigos de saída 0/10/11/2 · as regexes de telefone/CPF são as do hetzner-pii-scan.py.
+#   · TESTE DERIVADO (ga-2hd02v.3.15, regra 6): um repo git de mentira faz o papel do repo do WA (origin/main; o working tree e o HEAD à frente não valem); node/derivado só com código rastreado + teste de nome do módulo
+#   que CITA o módulo (palavra inteira) + teste que o nó tem (rsync, mac-only, espelho); módulo mais longo, nome curto/genérico, prefixo sem `_`, extensão fora de py/js/cjs/mjs e código que não existe em origin/main NÃO ganham teste;
+#   lead/envio no texto mandam ao mini (freio-derivado); repo/ref/git/grep/espelho que falham dão unknown COM a nota e vazio dá unknown SEM nota (três estados).
 # CONTROLE NEGATIVO: cada mutante abaixo troca UMA linha do classificador numa cópia e o caso designado tem de reprovar; mutante que sobrevive reprova esta bateria. Um mutante só vale se o
 #   ORIGINAL passa o mesmo caso no mesmo ambiente e se ele não morre por causa do ambiente (ver as 3 regras acima de mk_mutant); caso e mutante de rsync usam stubs que só o mutante separa do original.
 # COMO RODAR: bash scripts/wa-node-classify.selftest.sh   (macOS /bin/bash 3.2 e Linux). Pesado o bastante para ir ao nó: scripts/mbp-run.sh --repo hq scripts/wa-node-classify.selftest.sh
@@ -23,6 +26,7 @@ ok()  { n=$((n+1)); echo "ok   $1"; }
 bad() { n=$((n+1)); echo "FAIL $1"; fails=$((fails+1)); }
 PY=${WA_NODE_SELFTEST_PY:-python3}
 export WA_NODE_MIRROR="$T/espelho-ausente"   # os casos antigos valem SEM espelho (cai no filtro do rsync); o espelho entra só nos casos da seção "espelho git", com um stub
+export WA_NODE_REPO="$T/wa-repo-ausente"     # idem o repo do WA (regra 6): os casos antigos nunca olham o repo de verdade desta máquina; a seção "teste derivado" monta um de mentira
 
 CLS="$CLS_REAL"; OUT=""; RC=0
 run() { OUT=$(printf '%s' "$1" | "$PY" -I "$CLS" 2>/dev/null); RC=$?; }
@@ -130,6 +134,7 @@ export WA_NODE_RSYNC_TIMEOUT=abc; expect "prazo do rsync ilegível volta ao padr
 # ---- espelho git (ga-2hd02v.3): .md que o rsync não lista mas o espelho entrega (docs/, DESIGN.md...) deixa de ser "fora do filtro"; só com o espelho legível E a varredura de conteúdo, senão volta ao filtro do rsync
 # spec = Seção 1 do filtro real + pastas de dado (o `sparse` sem rig) + um caminho que a varredura de CONTEÚDO sinalizou (docs/sinalizado.md); o espelho de verdade serve o mesmo formato em `spec-out <rig>`
 HETZNER_MIRROR_FILTER="$REAL_FILTER" bash "$HERE/hetzner-mirror.sh" sparse > "$T/spec.txt" 2>/dev/null; echo '!/docs/sinalizado.md' >> "$T/spec.txt"
+echo '!/tests/test_flag_mod.py' >> "$T/spec.txt"   # um TESTE que a varredura de conteúdo sinalizou (a regra 6 não pode contá-lo como "teste que o nó tem")
 [ "$(wc -l < "$T/spec.txt")" -gt 25 ] && ok "spec de teste gerado pelo hetzner-mirror.sh real (>25 linhas)" || bad "spec de teste não gerado: o hetzner-mirror.sh sparse falhou"
 stub mirror-ok '[ "$1" = spec-out ] && [ "$2" = whatsapp_automation ] || exit 2; cat "'"$T"'/spec.txt"'
 printf '#!/bin/sh\ncat "%s/spec.txt"\nexit 75\n' "$T" > "$T/mirror-75"; chmod +x "$T/mirror-75"   # o espelho que sai com rc 75 mesmo imprimindo um spec bom
@@ -193,6 +198,89 @@ export WA_NODE_RSYNC="$T/rs-so-neg-falha"; expect "visão 'só negações' do rs
 export WA_NODE_MIRROR_TIMEOUT=abc; expect "prazo do espelho ilegível volta ao padrão (20) e não derruba" "$(DESC "${DOCS}docs/runbooks/guia.md")" 0 'via-espelho'; unset WA_NODE_MIRROR_TIMEOUT
 export WA_NODE_MIRROR="$T/espelho-ausente"
 
+# ---- teste derivado (ga-2hd02v.3.15, regra 6): código citado e NENHUM teste citado -> o teste que o repo do WA já tem. O repo é de mentira: origin/main = o 1º commit; o 2º só existe no HEAD (o nó não o tem).
+RP="$T/wa-repo"; mkdir -p "$RP"
+gw() { env -i HOME="$T" PATH="$PATH" GIT_CONFIG_NOSYSTEM=1 git -C "$RP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false "$@"; }
+wf() { mkdir -p "$RP/$(dirname "$1")"; printf '%s\n' "$2" > "$RP/$1"; }   # wf <caminho> <conteúdo>
+gw init -q
+for m in foo_parser bar_service bar_service_extra utils abcd silent_mod subs_mod orfa_unica flag_mod mac_mod tok_mod ext_mod inner_mod boundary many_mod huge_mod cap_a cap_b cap_c cap_d cap_e late_mod; do wf "lib/$m.py" "# $m"; done
+wf lib/js_mod.js "// js_mod"; wf scripts/run_job.sh "# run_job"; wf lib/dash-mod.py "# dash-mod"; wf tests/test_dash-mod_wa.py "dash-mod"; wf lib/css_mod.css "/* css_mod */"; wf tests/test_css_mod_wa.py "css_mod"   # nome com hífen: fora do formato de módulo
+wf tests/test_foo_parser.py "from lib.foo_parser import parse"; wf tests/test_foo_parser_extra_wa_x1.py "import foo_parser"; wf tests/auto_response/test_foo_parser_sub.py "foo_parser"
+wf tests/test_bar_service.py "bar_service"; wf tests/test_bar_service_extra_casos.py "bar_service bar_service_extra"   # o 2º é do módulo bar_service_extra, que também existe E cita bar_service como palavra inteira (como os testes irmãos reais): só a regra do módulo mais longo o tira de bar_service
+wf tests/test_utils_algo.py "utils"; wf tests/test_abcd_x.py "abcd"
+wf tests/test_silent_mod_wa_q.py "nada aqui"; wf tests/test_subs_mod_wa_q.py "subs_module_other"   # nome certo, conteúdo que não cita / que só tem o módulo dentro de outra palavra
+wf tests/test_flag_mod.py "flag_mod"; wf tests/test_mac_mod.py "mac_mod"; wf tests/test_tok_mod_token.js "tok_mod"
+wf tests/test_js_mod_wa_1.cjs "js_mod"; wf tests/test_run_job.py "run_job"; wf tests/test_novo_modulo_wa_n.py "novo_modulo"   # novo_modulo: teste existe, código NÃO
+wf tests/test_old_inner_mod_wa.py "inner_mod"; wf tests/test_boundaryx_wa.py "boundary"; wf tests/test_ext_mod.json "ext_mod"
+for i in 1 2 3 4 5 6 7; do wf "tests/test_many_mod_$i.py" "many_mod"; done
+for i in $(seq -w 1 30); do wf "tests/test_huge_mod_$i.py" "huge_mod"; done
+for m in cap_a cap_b cap_c cap_d cap_e; do for i in $(seq -w 1 21); do wf "tests/test_${m}_$i.py" "$m"; done; done
+gw add -A && gw commit -q -m 1 && gw update-ref refs/remotes/origin/main HEAD || bad "repo de mentira do WA não montado"
+wf tests/test_late_mod.py "late_mod"; gw add -A && gw commit -q -m 2   # o teste de late_mod só existe no HEAD, não em origin/main
+git_ok=$(gw rev-parse --verify -q refs/remotes/origin/main >/dev/null && gw ls-tree -r --name-only origin/main | grep -c 'test_foo_parser'); [ "$git_ok" = 3 ] && ok "repo de mentira do WA montado (origin/main tem 3 testes de foo_parser; o HEAD tem um a mais em late_mod)" || bad "repo de mentira do WA errado ($git_ok)"
+mkdir -p "$T/wa-repo-vazio"; env -i HOME="$T" PATH="$PATH" git -C "$T/wa-repo-vazio" init -q
+env -i HOME="$T" PATH="$PATH" git -C "$T/wa-repo-vazio" update-ref refs/remotes/origin/main "$(env -i HOME="$T" PATH="$PATH" git -C "$T/wa-repo-vazio" -c user.email=t@t -c user.name=t commit-tree "$(env -i HOME="$T" PATH="$PATH" git -C "$T/wa-repo-vazio" hash-object -t tree /dev/null)" -m vazio)"   # origin/main existe e a árvore é VAZIA
+stub git-grep-quebra 'for a in "$@"; do [ "$a" = grep ] && exit 2; done; exec git "$@"'          # só o `git grep` falha (rc 2)
+stub git-grep-mudo 'for a in "$@"; do [ "$a" = grep ] && exit 0; done; exec git "$@"'            # `git grep` sai 0 sem imprimir nada (o que o git nunca faz)
+stub git-lento 'for a in "$@"; do [ "$a" = ls-tree ] && sleep 6; done; exec git "$@"'
+printf '# so comentario\ntests/test_mac_mod*.py\n' > "$T/macs-derivado.txt"
+grep -v -F '[Kk][Ee][Nn]' "$T/spec.txt" > "$T/spec-sem-token.txt"; stub mirror-sem-token 'cat "'"$T"'/spec-sem-token.txt"'   # o espelho SEM as regras de token: só o filtro do rsync nega test_tok_mod_token.js
+export WA_NODE_REPO="$RP" WA_NODE_MIRROR="$T/mirror-ok"
+SEMNOTA='"info": \[\]\}$'   # unknown SEM nota: o repo respondeu e não há teste (vazio é um estado legítimo)
+expect "derivado: node com basis derivado, 3 testes (um em subpasta) e os pares em info" "$(DESC 'Corrigir lib/foo_parser.py quando a entrada vem vazia.')" 0 '"verdict": "node", "basis": "derivado", "reasons": \["prova-teste-derivado:3-teste\(s\)\+1-codigo\(s\)"\].*"info": \["teste-derivado:lib/foo_parser\.py=tests/auto_response/test_foo_parser_sub\.py", "teste-derivado:lib/foo_parser\.py=tests/test_foo_parser\.py", "teste-derivado:lib/foo_parser\.py=tests/test_foo_parser_extra_wa_x1\.py"\]\}$'
+expect "derivado: o teste citado continua dando basis text (a regra 5 vem antes)" "$(DESC 'Corrigir lib/foo_parser.py com tests/test_foo_parser.py')" 0 '"basis": "text".*prova-no-texto'
+expect "derivado: node:ok continua dando basis label" "$(labels "$(DESC 'Corrigir lib/foo_parser.py')" '["node:ok"]')" 0 '"basis": "label"'
+expect "derivado: teste citado SEM código citado não deriva nada" "$(DESC 'rodar tests/test_foo_parser.py')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "derivado: código citado sem teste no repo -> unknown sem nota" "$(DESC 'ajustar lib/orfa_unica.py')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "derivado: código que NÃO existe em origin/main não ganha o teste de nome igual (test_novo_modulo existe)" "$(DESC 'criar lib/novo_modulo.py')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "derivado: só o código que tem teste conta; o sem teste não atrapalha nem entra na contagem" "$(DESC 'ajustar lib/foo_parser.py e lib/orfa_unica.py')" 0 'prova-teste-derivado:3-teste\(s\)\+1-codigo\(s\)'
+expect "derivado: dois códigos com teste somam" "$(DESC 'ajustar lib/foo_parser.py e lib/bar_service.py')" 0 'prova-teste-derivado:4-teste\(s\)\+2-codigo\(s\)'
+expect "derivado: test_bar_service_extra_* é de bar_service_extra (módulo mais longo que existe), não de bar_service" "$(DESC 'ajustar lib/bar_service.py')" 0 'prova-teste-derivado:1-teste\(s\)\+1-codigo\(s\).*"teste-derivado:lib/bar_service\.py=tests/test_bar_service\.py"\]\}$'
+expect "derivado: e o módulo mais longo fica com o dele" "$(DESC 'ajustar lib/bar_service_extra.py')" 0 'prova-teste-derivado:1-teste\(s\)\+1-codigo\(s\).*=tests/test_bar_service_extra_casos\.py"\]\}$'
+expect "derivado: nome genérico (utils) não prova nada" "$(DESC 'ajustar lib/utils.py')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "derivado: nome curto (4 letras) não prova nada" "$(DESC 'ajustar lib/abcd.py')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "derivado: nome do teste certo, conteúdo que NÃO cita o módulo" "$(DESC 'ajustar lib/silent_mod.py')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "derivado: conteúdo que só tem o módulo dentro de outra palavra (subs_module_other) não cita" "$(DESC 'ajustar lib/subs_mod.py')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "derivado: módulo no MEIO do nome do teste (test_old_inner_mod) não é do módulo" "$(DESC 'ajustar lib/inner_mod.py')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "derivado: prefixo sem o _ (test_boundaryx) não é do módulo boundary" "$(DESC 'ajustar lib/boundary.py')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "derivado: .css citado não ganha teste por nome (só py/sh/js/mjs/cjs/ts)" "$(DESC 'ajustar lib/css_mod.css')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "derivado: nome de módulo com hífen (fora do formato) não prova nada" "$(DESC 'ajustar lib/dash-mod.py')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "derivado: extensão que não é de teste (test_ext_mod.json) não conta" "$(DESC 'ajustar lib/ext_mod.py')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "derivado: teste que a varredura de conteúdo do espelho sinalizou NÃO é teste que o nó tem" "$(DESC 'ajustar lib/flag_mod.py')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "derivado: teste só no HEAD (não em origin/main) não conta: o espelho entrega origin/main" "$(DESC 'ajustar lib/late_mod.py')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "derivado: teste que o filtro do rsync nega (test_tok_mod_token.js; o espelho também) não conta" "$(DESC 'ajustar lib/tok_mod.py')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+export WA_NODE_MIRROR="$T/mirror-sem-token"; expect "derivado: teste que SÓ o filtro do rsync nega (o espelho não tem a regra de token) também não conta" "$(DESC 'ajustar lib/tok_mod.py')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"; export WA_NODE_MIRROR="$T/mirror-ok"
+export WA_NODE_MAC_ONLY="$T/macs-derivado.txt"
+expect "derivado: teste na lista mac-only não conta" "$(DESC 'ajustar lib/mac_mod.py')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+unset WA_NODE_MAC_ONLY
+expect "derivado: .js com teste .cjs" "$(DESC 'ajustar lib/js_mod.js')" 0 '"basis": "derivado".*test_js_mod_wa_1\.cjs'
+expect "derivado: script .sh com teste .py" "$(DESC 'ajustar scripts/run_job.sh')" 0 '"basis": "derivado".*test_run_job\.py'
+expect "derivado: mais de 6 pares: 6 em info e o resto contado (teste-derivado-mais)" "$(DESC 'ajustar lib/many_mod.py')" 0 'prova-teste-derivado:7-teste\(s\)\+1-codigo\(s\).*test_many_mod_6\.py", "teste-derivado-mais:1"\]\}$'
+expect "derivado: teto de 25 testes por módulo" "$(DESC 'ajustar lib/huge_mod.py')" 0 'prova-teste-derivado:25-teste\(s\)\+1-codigo\(s\).*"teste-derivado-mais:19"\]\}$'
+expect "derivado: teto de 100 candidatos no total (5 módulos x 21 testes)" "$(DESC 'ajustar lib/cap_a.py lib/cap_b.py lib/cap_c.py lib/cap_d.py lib/cap_e.py')" 0 'prova-teste-derivado:100-teste\(s\)\+5-codigo\(s\)'
+expect "freio: lead no texto manda ao mini (prova fraca), com os pares em info" "$(DESC 'Corrigir lib/foo_parser.py; o lead some da lista')" 10 '"verdict": "mini", "basis": "", "reasons": \["freio-derivado:dado-de-lead"\].*teste-derivado:lib/foo_parser\.py='
+expect "freio: envio no texto manda ao mini" "$(DESC 'Corrigir lib/foo_parser.py antes de enviar a mensagem')" 10 '"reasons": \["freio-derivado:envio-whatsapp"\]'
+expect "freio: lead e envio juntos, na ordem da lista" "$(DESC 'Corrigir lib/foo_parser.py: o lead recebe o envio duplicado')" 10 '"reasons": \["freio-derivado:dado-de-lead,envio-whatsapp"\]'
+expect "freio: palavras informativas que NÃO são da lista (deploy, tela) não bloqueiam a prova derivada" "$(DESC 'Corrigir lib/foo_parser.py no deploy da tela')" 0 '"basis": "derivado"'
+expect "freio: sem prova derivada o lead no texto não muda o unknown (continua não sei, não vira mini)" "$(DESC 'ajustar lib/orfa_unica.py; o lead some')" 11 'sem-prova-de-codigo-e-teste'
+expect "derivado: palavra mole (banco) ainda vence" "$(DESC 'Corrigir lib/foo_parser.py que abre um sqlite')" 10 'moles:banco-de-dados'
+expect "derivado: caminho duro (.db) ainda vence" "$(DESC 'Corrigir lib/foo_parser.py e queue.db')" 10 'caminho-fora-do-filtro:queue\.db'
+expect "derivado: telefone no texto ainda vence" "$(DESC 'Corrigir lib/foo_parser.py (31) 98876-5432')" 10 '"reasons": \["dado-no-texto"\]'
+# falhou/ilegível: unknown COM a nota (nunca node, nunca o mesmo resultado do vazio)
+NOTA() { printf 'sem-prova-de-codigo-e-teste.*"info": \\["teste-derivado-ilegivel:%s"\\]\\}$' "$1"; }
+FP=$(DESC 'Corrigir lib/foo_parser.py quando a entrada vem vazia.')
+export WA_NODE_REPO="$T/wa-repo-ausente";  expect "derivado: repo inexistente -> unknown com a nota (não 'sem teste')" "$FP" 11 "$(NOTA repo-git-rc-128)"; export WA_NODE_REPO="$RP"
+export WA_NODE_REPO_REF=origin/zz;        expect "derivado: ref inexistente -> unknown com a nota" "$FP" 11 "$(NOTA repo-git-rc-128)"; unset WA_NODE_REPO_REF
+export WA_NODE_REPO_REF=--oops;           expect "derivado: ref com cara de opção do git é recusada antes de chamar o git" "$FP" 11 "$(NOTA repo-ref-invalida)"; unset WA_NODE_REPO_REF
+export WA_NODE_REPO="$T/wa-repo-vazio";    expect "derivado: árvore VAZIA em origin/main é ilegível (a real nunca é vazia), não 'sem teste'" "$FP" 11 "$(NOTA repo-vazio)"; export WA_NODE_REPO="$RP"
+export WA_NODE_GIT="$T/nao-existe-git";    expect "derivado: git inexistente -> unknown com a nota" "$FP" 11 "$(NOTA repo-git-sem-resposta)"; unset WA_NODE_GIT
+export WA_NODE_GIT="$T/git-lento" WA_NODE_REPO_TIMEOUT=1; expect "derivado: git que não responde no prazo -> unknown com a nota" "$FP" 11 "$(NOTA repo-git-sem-resposta)"; unset WA_NODE_GIT WA_NODE_REPO_TIMEOUT
+export WA_NODE_GIT="$T/git-grep-quebra";   expect "derivado: git grep que falha (rc 2) -> unknown com a nota, não 'nenhum teste cita'" "$FP" 11 "$(NOTA repo-grep-rc-2)"; unset WA_NODE_GIT
+export WA_NODE_GIT="$T/git-grep-mudo";     expect "derivado: git grep que sai 0 sem nome algum -> unknown com a nota" "$FP" 11 "$(NOTA repo-grep-ilegivel)"; unset WA_NODE_GIT
+export WA_NODE_MIRROR="$T/mirror-75";      expect "derivado: espelho em atualização (rc 75) -> unknown com a nota, nunca 'o nó tem o teste'" "$FP" 11 "$(NOTA espelho-rc-75)"; export WA_NODE_MIRROR="$T/mirror-ok"
+export WA_NODE_REPO_TIMEOUT=abc;           expect "derivado: prazo do repo ilegível volta ao padrão (20) e não derruba" "$FP" 0 '"basis": "derivado"'; unset WA_NODE_REPO_TIMEOUT
+export WA_NODE_REPO="$T/wa-repo-ausente" WA_NODE_MIRROR="$T/espelho-ausente"
+
 # ---- o classificador não deixa resíduo e só aceita stdin
 tmp_residue() { # tmp_residue <classificador> -> nº de itens que sobraram num TMPDIR só dele (a bead cita caminhos, então o classificador cria a árvore temporária)
   local d; d=$(mktemp -d "$T/tmpd.XXXXXX")
@@ -243,6 +331,7 @@ mutant() { # mutant <nome> <trecho original> <trecho novo> <json> <rc> <regex> [
   fi
   unset WA_NODE_FILTER WA_NODE_MAC_ONLY; for e in $envspec; do unset "${e%%=*}"; done
   export WA_NODE_MIRROR="$T/espelho-ausente"   # o padrão da bateria (um envspec pode ter trocado e desarmado)
+  export WA_NODE_REPO="$T/wa-repo-ausente"     # idem o repo do WA (a regra 6 só vê o repo de mentira nos casos que o pedem por envspec)
 }
 mutant sem-node-mini     '"node:mini" in labels'                       'False'                                  "$(labels "$GOOD" '["node:mini"]')" 10 'etiqueta-node:mini'
 mutant sem-epic          'b.get("issue_type") == "epic"'               'False'                                  "$(field "$GOOD" issue_type '"epic"')" 10 '"epic"'
@@ -288,6 +377,38 @@ mutant espelho-sem-canario-dado 'any(c not in denied for c in CANARY_MIRROR_NO) 
 mutant espelho-sem-canario-doc ' or CANARY_OK in denied or CANARY_DOC in denied' '' "$(DESC "${DOCS}docs/runbooks/guia.md")" 10 'espelho-ilegivel:espelho-canario-errado' "WA_NODE_MIRROR=$T/mirror-nega-md"
 mutant espelho-git-rc-ignorado 'if r.returncode not in (0, 1):' 'if False:' "$(DESC "${DOCS}docs/runbooks/guia.md")" 10 'espelho-ilegivel:espelho-git-rc-128' "WA_NODE_MIRROR=$T/mirror-ok WA_NODE_GIT=$T/git-quebrado"
 mutant so-neg-sem-canario-pasta 'no_canary += list(CANARY_OPEN_NO)' 'pass' "$(DESC "${DOCS}docs/runbooks/guia.md")" 10 'espelho-ilegivel:canario-errado' "WA_NODE_MIRROR=$T/mirror-ok WA_NODE_RSYNC=$T/rs-so-neg-vaza"
+# teste derivado (regra 6): um mutante por linha da regra; o repo de mentira e o espelho de mentira vêm por envspec (o padrão da bateria é repo e espelho AUSENTES)
+DV="WA_NODE_REPO=$RP WA_NODE_MIRROR=$T/mirror-ok"
+D_FOO=$(DESC 'Corrigir lib/foo_parser.py quando a entrada vem vazia.')
+mutant derivado-sem-freio       'if blocked:'                          'if False:'                                  "$(DESC 'Corrigir lib/foo_parser.py; o lead some da lista')" 10 'freio-derivado:dado-de-lead' "$DV"
+mutant derivado-freio-sem-lead  'DERIVED_BLOCK_INFO = ("dado-de-lead", "envio-whatsapp")' 'DERIVED_BLOCK_INFO = ("envio-whatsapp",)' "$(DESC 'Corrigir lib/foo_parser.py; o lead some da lista')" 10 'freio-derivado:dado-de-lead' "$DV"
+mutant derivado-freio-sem-envio 'DERIVED_BLOCK_INFO = ("dado-de-lead", "envio-whatsapp")' 'DERIVED_BLOCK_INFO = ("dado-de-lead",)' "$(DESC 'Corrigir lib/foo_parser.py antes de enviar a mensagem')" 10 'freio-derivado:envio-whatsapp' "$DV"
+mutant derivado-basis-text      'basis = "derivado" if any(w.startswith("prova-teste-derivado:") for w in why) else "text"' 'basis = "text"' "$D_FOO" 0 '"basis": "derivado"' "$DV"
+mutant derivado-sem-maior       ' and not any(rest == m or rest.startswith(m + "_") for m in longer))' ')' "$(DESC 'ajustar lib/bar_service.py')" 0 'prova-teste-derivado:1-teste\(s\)' "$DV"
+mutant derivado-sem-generico    ' and s not in GENERIC_STEMS'          ''                                           "$(DESC 'ajustar lib/utils.py')" 11 'sem-prova-de-codigo-e-teste' "$DV"
+mutant derivado-sem-minimo      ' and len(s) >= MIN_STEM'              ''                                           "$(DESC 'ajustar lib/abcd.py')" 11 'sem-prova-de-codigo-e-teste' "$DV"
+mutant derivado-sem-formato     'return s if STEM_RE.match(s) and'     'return s if True and'                       "$(DESC 'ajustar lib/dash-mod.py')" 11 'sem-prova-de-codigo-e-teste' "$DV"
+mutant derivado-css-ganha-teste ' and p.rsplit(".", 1)[-1] in DERIVE_EXT else ""' ' else ""'               "$(DESC 'ajustar lib/css_mod.css')" 11 'sem-prova-de-codigo-e-teste' "$DV"
+mutant derivado-sem-rastreado   's = module_stem(p) if p in present and' 's = module_stem(p) if True and'  "$(DESC 'criar lib/novo_modulo.py')" 11 'sem-prova-de-codigo-e-teste' "$DV"
+mutant derivado-nome-solto      '(rest == s or rest.startswith(s + "_"))' '(s in rest)'                             "$(DESC 'ajustar lib/inner_mod.py')" 11 'sem-prova-de-codigo-e-teste' "$DV"
+mutant derivado-sem-sublinhado  'or rest.startswith(s + "_"))'         'or rest.startswith(s))'                     "$(DESC 'ajustar lib/boundary.py')" 11 'sem-prova-de-codigo-e-teste' "$DV"
+mutant derivado-ext-solta       '(?:py|js|cjs|mjs)$")'                 '(?:py|js|cjs|mjs|json)$")'                  "$(DESC 'ajustar lib/ext_mod.py')" 11 'sem-prova-de-codigo-e-teste' "$DV"
+mutant derivado-sem-espelho     'keep = [t for t in keep if t not in denied]' 'keep = keep'                           "$(DESC 'ajustar lib/flag_mod.py')" 11 'sem-prova-de-codigo-e-teste' "$DV"
+mutant derivado-sem-mac-only    ' and not any(fnmatch.fnmatchcase(t, g) for g in globs)]' ']'                       "$(DESC 'ajustar lib/mac_mod.py')" 11 'sem-prova-de-codigo-e-teste' "$DV WA_NODE_MAC_ONLY=$T/macs-derivado.txt"
+mutant derivado-sem-rsync       'keep = [t for t in allc if t in sent and' 'keep = [t for t in allc if True and'     "$(DESC 'ajustar lib/tok_mod.py')" 11 'sem-prova-de-codigo-e-teste' "WA_NODE_REPO=$RP WA_NODE_MIRROR=$T/mirror-sem-token"
+mutant derivado-sem-conteudo    'ok = [t for t in ts if t in hits]'    'ok = list(ts)'                              "$(DESC 'ajustar lib/silent_mod.py')" 11 'sem-prova-de-codigo-e-teste' "$DV"
+mutant derivado-sem-palavra     '"grep", "-l", "-w", "-F"'             '"grep", "-l", "-F"'                         "$(DESC 'ajustar lib/subs_mod.py')" 11 'sem-prova-de-codigo-e-teste' "$DV"
+mutant derivado-ref-head        'os.environ.get("WA_NODE_REPO_REF", "origin/main")' 'os.environ.get("WA_NODE_REPO_REF", "HEAD")' "$(DESC 'ajustar lib/late_mod.py')" 11 'sem-prova-de-codigo-e-teste' "$DV"
+mutant derivado-vazio-vale      'raise Unreadable("repo-vazio")'       'pass'                                       "$D_FOO" 11 'teste-derivado-ilegivel:repo-vazio' "WA_NODE_REPO=$T/wa-repo-vazio WA_NODE_MIRROR=$T/mirror-ok"
+mutant derivado-rc-ignorado     'raise Unreadable("repo-git-rc-%d" % r.returncode)' 'pass'                          "$D_FOO" 11 'teste-derivado-ilegivel:repo-git-rc-128' "$DV WA_NODE_REPO_REF=origin/zz"
+mutant derivado-ref-livre       'if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_./\-]*", REPO_REF):' 'if False:'       "$D_FOO" 11 'teste-derivado-ilegivel:repo-ref-invalida' "$DV WA_NODE_REPO_REF=--oops"
+mutant derivado-grep-rc         'raise Unreadable("repo-grep-rc-%d" % r.returncode)' 'pass'                         "$D_FOO" 11 'teste-derivado-ilegivel:repo-grep-rc-2' "$DV WA_NODE_GIT=$T/git-grep-quebra"
+mutant derivado-grep-mudo       'if r.returncode == 0 and not hits:'   'if False:'                                  "$D_FOO" 11 'teste-derivado-ilegivel:repo-grep-ilegivel' "$DV WA_NODE_GIT=$T/git-grep-mudo"
+mutant derivado-falha-vira-vazio 'note = ["teste-derivado-ilegivel:" + str(e)]' 'note = []'                         "$D_FOO" 11 'teste-derivado-ilegivel:espelho-rc-75' "WA_NODE_REPO=$RP WA_NODE_MIRROR=$T/mirror-75"
+mutant derivado-sem-pares       'dinfo = pairs[:6] + ('                'dinfo = [] and ('                           "$D_FOO" 0 'teste-derivado:lib/foo_parser\.py=tests/test_foo_parser\.py' "$DV"
+mutant derivado-sem-teto-pares  'dinfo = pairs[:6] + ('                'dinfo = pairs + ('                          "$(DESC 'ajustar lib/many_mod.py')" 0 'test_many_mod_6\.py", "teste-derivado-mais:1"\]\}$' "$DV"
+mutant derivado-sem-teto-modulo 'mine[:MAX_DERIVED_PER_STEM]'          'mine'                                       "$(DESC 'ajustar lib/huge_mod.py')" 0 'prova-teste-derivado:25-teste' "$DV"
+mutant derivado-sem-teto-total  ')[:MAX_DERIVED_TESTS]'                ')'                                          "$(DESC 'ajustar lib/cap_a.py lib/cap_b.py lib/cap_c.py lib/cap_d.py lib/cap_e.py')" 0 'prova-teste-derivado:100-teste' "$DV"
 # o resíduo no TMPDIR: o mutante que não apaga a árvore tem de deixar item para trás (senão o teste de "sem resíduo" passaria mesmo sem a limpeza)
 if mk_mutant sem-limpeza 'shutil.rmtree(root, ignore_errors=True)' 'pass'; then
   left=$(tmp_residue "$T/mut-sem-limpeza.py")

@@ -117,6 +117,7 @@ export WA_NODE_CAPACITY="$T/cap.py"; unset WA_NODE_SPAWN WA_NODE_SLOTS WA_NODE_A
 
 NODE_TEXT='{"verdict":"node","basis":"text","reasons":["prova-no-texto:1-teste(s)+1-codigo"],"paths":[],"tests":[],"info":[]}'
 NODE_LABEL='{"verdict":"node","basis":"label","reasons":["etiqueta-node:ok"],"paths":[],"tests":[],"info":[]}'
+NODE_DERIV='{"verdict":"node","basis":"derivado","reasons":["prova-teste-derivado:1-teste(s)+1-codigo(s)"],"paths":[],"tests":[],"info":[]}'   # ga-2hd02v.3.15: prova mais fraca que a do texto
 MINI='{"verdict":"mini","basis":"","reasons":["caminho-fora-do-filtro:queue.db"],"paths":[],"tests":[],"info":[]}'
 UNK='{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste"],"paths":[],"tests":[],"info":[]}'
 cls() { printf '%s' "$1" > "$CLSOUT"; printf '%s' "$2" > "$CLSRC"; }
@@ -165,6 +166,8 @@ fresh; cls "$UNK" 11;  d apply wa-t1; expect_rc "apply: unknown -> 11 sem escrit
 fresh; cls "$NODE_TEXT" 0; d apply wa-t1 --basis label; expect_rc "apply --basis label com veredito por texto -> 10 sem escrita" 10 w0
 fresh; cls "$NODE_LABEL" 0; d apply wa-t1 --basis label; expect_rc "apply --basis label com a etiqueta -> 0" 0
 fresh; cls "$NODE_TEXT" 0; d apply wa-t1 --basis any; expect_rc "apply --basis any com texto -> 0" 0
+fresh; cls "$NODE_DERIV" 0; d apply wa-t1 --basis label; expect_rc "apply --basis label com a prova derivada (teste do repo) -> 10 sem escrita: derivado nunca passa no modo label" 10 w0
+fresh; cls "$NODE_DERIV" 0; d apply wa-t1 --basis any; expect_rc "apply --basis any com a prova derivada -> 0" 0
 # ---- apply/check: o exit code e o JSON do classificador têm que CONCORDAR (terceiro estado, ga-9636op). Classificador que caiu, foi morto, não imprimiu, imprimiu o que não se lê ou cujo exit
 #      code e veredito discordam NUNCA manda a bead ao nó: vira 11 ("não consegui decidir"), sem escrita. Um código cru do classificador (2, 12, 13, 124, 137) também não vaza: o chamador lê 2 como
 #      "uso", 12 como "não elegível" e 13/124/137 como "a escrita pode ter acontecido".

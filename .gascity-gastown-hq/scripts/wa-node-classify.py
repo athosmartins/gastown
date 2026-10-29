@@ -27,13 +27,23 @@ COMO DECIDE (a 1ª regra que casa vale; tudo é lido da bead, nada é gravado ne
      para medir o acerto antes de ligar. MEDIDO (19/10, 400 beads WA fechadas): bloqueando por elas, 0 de 400 passavam; sem bloquear, ~4% citam teste + código sem caminho duro.
      Quem segura o resíduo é o que não depende de palavra: caminho pelo filtro real, telefone/CPF no texto, e o gate depois.
   5. prova positiva: >=1 teste citado (caminho tests/ ou test_*.py que o filtro deixa passar) E >=1 arquivo de código citado que o filtro deixa passar -> node, basis `text`;
-     `node:ok` dispensa a prova (as duras já passaram) -> node, basis `label`; sem prova -> unknown
+     `node:ok` dispensa a prova (as duras já passaram) -> node, basis `label`; sem prova -> 6
+  6. TESTE DERIVADO (ga-2hd02v.3.15; só com código citado e NENHUM teste citado; uma prova mais fraca que a 5, por isso basis próprio e freios próprios): o código citado tem de existir em
+     origin/main do repo do WA (o que o espelho entrega ao nó) e ter um teste que o repo JÁ tem: arquivo tests/**/test_<módulo>.(py|js|cjs|mjs) ou test_<módulo>_*.(...), em que <módulo> é o nome
+     do arquivo de código sem a extensão (>=5 letras, nada genérico como utils/config), E cujo CONTEÚDO cita o módulo como palavra inteira (nome parecido sozinho não prova). Teste que pertence a um
+     módulo de nome mais longo que também existe (test_bar_service_extra_* é de bar_service_extra, não de bar_service) não conta. O teste ainda tem de passar pelo filtro do rsync, fora da lista
+     mac-only e fora do que a varredura de conteúdo do espelho segura, porque "teste que o nó tem" é o que vale. Nada é inferido para código que o texto não cita. Achou -> node, basis `derivado`
+     (`info`: teste-derivado:<código>=<teste>); mas se o texto tem palavra informativa de dado de lead ou de envio de WhatsApp (os freios de DERIVED_BLOCK_INFO) -> mini, `freio-derivado:<palavras>`.
+     Não achou -> unknown. Repo/git/espelho ilegível -> unknown com `info` `teste-derivado-ilegivel:<motivo>`; nunca vira node.
 
-CÓDIGOS DE SAÍDA: 0 node · 10 mini · 11 unknown · 2 uso. A linha de stdout é um JSON: {"verdict","basis","reasons":[...],"paths":[...],"tests":[...],"info":[...]}.
-O QUE NÃO FAZ: não lê dado, não abre o nó, não toca o Dolt, não escreve na bead. Lê só stdin (o JSON do `bd show --json`), o filtro, a lista mac-only e (só com `.md` fora do rsync) o filtro que o espelho serve.
+CÓDIGOS DE SAÍDA: 0 node · 10 mini · 11 unknown · 2 uso. A linha de stdout é um JSON: {"verdict","basis","reasons":[...],"paths":[...],"tests":[...],"info":[...]}; basis = label | text | derivado | "" (só o node tem).
+O QUE NÃO FAZ: não lê dado, não abre o nó, não toca o Dolt, não escreve na bead. Lê só stdin (o JSON do `bd show --json`), o filtro, a lista mac-only, (só com `.md` fora do rsync) o filtro que o espelho serve e (só com código citado sem teste citado) a árvore e o conteúdo dos TESTES do repo do WA em origin/main, por `git ls-tree`/`git grep`: nunca a árvore de trabalho.
 LIMITES: a exceção do espelho confia na varredura de conteúdo (>=20 telefones ou >=3 CPFs distintos por arquivo): lista pequena, nome, e-mail e CNPJ num `.md` passam; vale o mesmo resíduo do bloco 3b do filtro. É heurística de TEXTO sobre a bead; o texto pode omitir que o teste abre um banco. NÃO são extraídos: pasta sem arquivo (`data/`), arquivo sem nome (`.env`), extensão fora da lista, nome com
   sufixo (`x.py.bak` não vira `x.py`). Para esses a regra 3a não age; quem segura o dado é o filtro do rsync (o nó nunca o recebe) e, no caso de `.env`/`.db`, a palavra mole da regra 4. O resíduo cai no nó como teste vermelho e a bead volta ao mini pelo gate (custo, não vazamento:
   o dado não chega ao nó de qualquer jeito). A lista de palavras moles é deliberadamente larga (o vocabulário do WA é todo de lead/terreno): na dúvida a bead fica no mini, como hoje.
+  A regra 6 prova que existe um teste do módulo que o cita; NÃO prova que ele cobre a mudança da bead, nem que roda sem recurso vivo (pode abrir banco, rede ou Chrome, ou dar skip e ficar verde sem provar nada): isso cai no nó como teste
+  vermelho/skip e a bead volta ao mini pelo gate. Por isso o basis é `derivado` e não `text`: quem for ligar o modo auto pode tratar os dois de um jeito diferente. Plano, comentário e ctx-check NÃO entram: o plano (design/notes/acceptance_criteria)
+  já é lido, o ctx-check só grava etiqueta e comentário de lacuna, e o worker do nó não recebe comentário (ga-2hd02v.10).
 """
 import fnmatch
 import json
@@ -79,6 +89,21 @@ CANARY_DOC = "docs/zz_wa_node_canary.md"                             # a visão 
 CANARY_OPEN_NO = ("shared/zz_wa_node_canary.md", "logs/zz_wa_node_canary.md")   # pasta que nunca sai (Seção 3): a visão "só negações" TEM de segurar mesmo sendo .md
 CANARY_MIRROR_NO = ("data/zz_wa_node_canary.json", "zz_wa_node_canary.db", ".env")   # o espelho TEM de segurar (as mesmas famílias que a Seção 1 / pastas de dado)
 MIRROR_MIN_RULES = 20                                                # a Seção 1 traduzida tem mais que isto; menos = filtro cortado
+# regra 6 (teste derivado, ga-2hd02v.3.15): o teste que o repo do WA já tem para o código citado
+REPO_DIR = os.environ.get("WA_NODE_REPO", REPO_ABS.rstrip("/"))      # o repo do WA no mini: dele saem a árvore e o conteúdo dos testes
+REPO_REF = os.environ.get("WA_NODE_REPO_REF", "origin/main")         # o que o espelho entrega ao nó; nunca a árvore de trabalho (o que não está commitado o nó não tem)
+try:
+    REPO_TIMEOUT = max(1, int(os.environ.get("WA_NODE_REPO_TIMEOUT", "20")))
+except ValueError:
+    REPO_TIMEOUT = 20
+DERIVE_EXT = ("py", "sh", "js", "mjs", "cjs", "ts")                  # só código com essas extensões ganha teste por nome (um .css citado não ganha), e só os módulos delas contam como "módulo de nome mais longo"
+TEST_FILE_RE = re.compile(r"^test_(.+)\.(?:py|js|cjs|mjs)$")         # tests/**/test_<módulo>[_<sufixo>].<ext>; os 5 test_*.sh do WA ficam de fora (teste de shell: esta regra só conhece py/js)
+STEM_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
+MIN_STEM = 5                                                         # nome curto (db, auth, app) casa teste de mil coisas
+GENERIC_STEMS = frozenset(("utils", "helpers", "helper", "common", "config", "settings", "server", "client", "models", "routes", "index", "shared", "setup", "types", "tools", "utility", "utilities", "runner", "worker", "daemon"))
+MAX_DERIVED_PER_STEM = 25                                            # testes candidatos por módulo (ordem alfabética); acima disso o excesso nem é lido
+MAX_DERIVED_TESTS = 100                                              # candidatos no total, para o rsync -n e o git grep ficarem curtos
+DERIVED_BLOCK_INFO = ("dado-de-lead", "envio-whatsapp")              # palavras informativas que, só para a prova derivada (mais fraca), mandam ao mini (lista do Mayor em ga-2hd02v.3.15); banco e credencial da mesma lista já são moles e bloqueiam antes
 
 # palavras do texto (sem acento, minúsculas). slug -> regex. Larga de propósito (ver LIMITES).
 SOFT = (
@@ -321,6 +346,105 @@ def has_pii(blob):
     return CPF.search(blob) is not None
 
 
+def repo_git_env():
+    # dentro de um hook o git exporta GIT_DIR etc.: sem limpar, os comandos agiriam em outro repositório; pathspec literal: nome de teste com [ ou * não vira glob
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["GIT_LITERAL_PATHSPECS"] = "1"
+    return env
+
+
+def repo_tree():
+    """caminhos dos arquivos de REPO_REF no repo do WA (o que o espelho entrega ao nó). Ref de formato estranho, git ausente ou sem resposta no prazo, rc != 0 (repo ou ref inexistente) e árvore VAZIA
+    (a real nunca é vazia) -> Unreadable: nunca "o repo não tem testes"."""
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_./\-]*", REPO_REF):
+        raise Unreadable("repo-ref-invalida")
+    try:
+        r = subprocess.run([GIT, "-C", REPO_DIR, "ls-tree", "-r", "-z", "--name-only", REPO_REF], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=repo_git_env(), timeout=REPO_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        raise Unreadable("repo-git-sem-resposta")
+    if r.returncode != 0:
+        raise Unreadable("repo-git-rc-%d" % r.returncode)
+    files = [x for x in r.stdout.decode("utf-8", "replace").split("\0") if x]
+    if not files:
+        raise Unreadable("repo-vazio")
+    return files
+
+
+def file_stem(path):
+    """nome do arquivo sem a última extensão (`lib/foo_bar.py` -> `foo_bar`; `x.test.js` -> `x.test`)."""
+    base = path.rsplit("/", 1)[-1]
+    return base.rsplit(".", 1)[0] if "." in base else base
+
+
+def module_stem(path):
+    """o nome de módulo de um arquivo de código citado, ou "" se não serve para achar teste por nome (fora do formato, curto demais, genérico demais)."""
+    s = file_stem(path)
+    return s if STEM_RE.match(s) and len(s) >= MIN_STEM and s not in GENERIC_STEMS else ""
+
+
+def grep_cites(stem, tests):
+    """subconjunto de `tests` (arquivos de REPO_REF) cujo CONTEÚDO tem `stem` como palavra inteira. git grep sai 1 quando nenhum casa -> vazio (legítimo); rc 0 sem nome algum que eu leia, git ausente,
+    prazo ou rc > 1 -> Unreadable: nunca "nenhum cita"."""
+    try:
+        r = subprocess.run([GIT, "-C", REPO_DIR, "grep", "-l", "-w", "-F", "-z", "-e", stem, REPO_REF, "--"] + list(tests), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=repo_git_env(), timeout=REPO_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        raise Unreadable("repo-grep-sem-resposta")
+    if r.returncode not in (0, 1):
+        raise Unreadable("repo-grep-rc-%d" % r.returncode)
+    pre = REPO_REF + ":"   # com um tree-ish o git imprime `<ref>:<caminho>`
+    hits = set(x[len(pre):] for x in r.stdout.decode("utf-8", "replace").split("\0") if x.startswith(pre))
+    if r.returncode == 0 and not hits:
+        raise Unreadable("repo-grep-ilegivel")
+    return hits
+
+
+def derived_tests(code, globs):
+    """{arquivo de código citado: [testes que o repo do WA já tem para ele]} (regra 6). Entram só testes que (1) são de um código que existe em REPO_REF, (2) têm no NOME o módulo (test_<módulo>.ext ou
+    test_<módulo>_*.ext) sem serem de um módulo de nome mais longo que também existe, (3) têm no CONTEÚDO o módulo como palavra inteira, e (4) o nó TEM: filtro do rsync, lista mac-only e espelho com a
+    varredura de conteúdo. Nada achado -> {} (vazio é um estado legítimo); qualquer leitura que falhe -> Unreadable (quem chama devolve unknown com a nota; nunca node)."""
+    tree = repo_tree()
+    present = set(tree)
+    stems_all, test_rest = set(), []   # nomes de módulo (fora de tests/) e, de cada teste, o que vem depois de `test_`
+    for f in tree:
+        base = f.rsplit("/", 1)[-1]
+        if f.startswith("tests/"):
+            m = TEST_FILE_RE.match(base)
+            if m:
+                test_rest.append((f, m.group(1)))
+        elif base.rsplit(".", 1)[-1] in DERIVE_EXT:
+            stems_all.add(file_stem(f))
+    cand = {}
+    for p in code:
+        s = module_stem(p) if p in present and p.rsplit(".", 1)[-1] in DERIVE_EXT else ""   # código que não existe em REPO_REF (arquivo novo, caminho solto) ou que não é de DERIVE_EXT (.css) não ganha teste por nome
+        if not s:
+            continue
+        # `test_bar_service_extra_x` é de `bar_service_extra`, não de `bar_service`: se existe módulo mais longo que começa com o nome e o teste começa com o nome dele, o teste é dele
+        longer = [m for m in stems_all if m.startswith(s + "_")]
+        mine = sorted(f for f, rest in test_rest
+                      if (rest == s or rest.startswith(s + "_")) and not any(rest == m or rest.startswith(m + "_") for m in longer))
+        if mine:
+            cand[p] = (s, mine[:MAX_DERIVED_PER_STEM])
+    if not cand:
+        return {}
+    allc = sorted(set(t for _, ts in cand.values() for t in ts))[:MAX_DERIVED_TESTS]
+    sent = sent_by_filter(allc)
+    keep = [t for t in allc if t in sent and not any(fnmatch.fnmatchcase(t, g) for g in globs)]
+    if keep:
+        denied = mirror_denied(mirror_rules(), keep)
+        keep = [t for t in keep if t not in denied]
+    keep = set(keep)
+    found = {}
+    for p, (s, ts) in cand.items():
+        ts = [t for t in ts if t in keep]
+        if not ts:
+            continue
+        hits = grep_cites(s, ts)
+        ok = [t for t in ts if t in hits]
+        if ok:
+            found[p] = ok
+    return found
+
+
 def classify(b):
     """(veredito, motivos, caminhos, testes, info)."""
     labels = labels_of(b)
@@ -365,7 +489,23 @@ def classify(b):
         return "node", why + ["etiqueta-node:ok"], paths, tests, info
     if tests and code:
         return "node", ["prova-no-texto:%d-teste(s)+%d-codigo" % (len(tests), len(code))], paths, tests, info
-    return "unknown", ["sem-prova-de-codigo-e-teste"], paths, tests, info
+    # regra 6: código citado e nenhum teste citado -> o teste que o repo já tem para esse código.
+    # vazio (nenhum teste do módulo) -> segue unknown como antes, sem nota; falhou/ilegível (repo, git, rsync, espelho) -> unknown + nota `teste-derivado-ilegivel`, nunca node e nunca "vazio"
+    found, note = {}, []
+    if code and not tests:
+        try:
+            found = derived_tests(code, globs)
+        except Unreadable as e:
+            note = ["teste-derivado-ilegivel:" + str(e)]
+    if found:
+        pairs = ["teste-derivado:%s=%s" % (c, t) for c in code for t in found.get(c, [])]
+        dinfo = pairs[:6] + (["teste-derivado-mais:%d" % (len(pairs) - 6)] if len(pairs) > 6 else [])
+        blocked = [s for s in DERIVED_BLOCK_INFO if s in info]
+        if blocked:   # prova mais fraca que o teste citado: lead/envio no texto mandam ao mini
+            return "mini", ["freio-derivado:" + ",".join(blocked)], paths, tests, info + dinfo
+        ntests = len(set(t for ts in found.values() for t in ts))
+        return "node", ["prova-teste-derivado:%d-teste(s)+%d-codigo(s)" % (ntests, len(found))], paths, tests, info + dinfo
+    return "unknown", ["sem-prova-de-codigo-e-teste"], paths, tests, info + note
 
 
 def main(argv):
@@ -382,8 +522,14 @@ def main(argv):
         v, why, paths, tests, info = "unknown", ["nao-consegui:" + str(e)], [], [], []
     except Exception as e:   # o que eu não previ (JSON aninhado demais, disco cheio no mkdtemp...) também é "não consegui": nunca um crash que o chamador leia como outra coisa
         v, why, paths, tests, info = "unknown", ["erro-inesperado:" + type(e).__name__], [], [], []
-    # basis: de onde veio o `node` — a etiqueta de um humano ou só a prova no texto (o Pilot liga uma e a outra em degraus: modo label, depois auto)
-    basis = "label" if "etiqueta-node:ok" in why else ("text" if v == "node" else "")
+    # basis: de onde veio o `node` — a etiqueta de um humano, a prova no texto ou o teste que o repo já tem (o Pilot liga uma e a outra em degraus: modo label, depois auto);
+    # só o node tem basis, e o `derivado` é separado do `text` porque é uma prova mais fraca (ver LIMITES)
+    if "etiqueta-node:ok" in why:
+        basis = "label"
+    elif v == "node":
+        basis = "derivado" if any(w.startswith("prova-teste-derivado:") for w in why) else "text"
+    else:
+        basis = ""
     print(json.dumps({"verdict": v, "basis": basis, "reasons": why, "paths": paths, "tests": tests, "info": info}, ensure_ascii=False))
     return {"node": EX_NODE, "mini": EX_MINI}.get(v, EX_UNKNOWN)
 
