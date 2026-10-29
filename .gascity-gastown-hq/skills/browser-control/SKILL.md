@@ -10,6 +10,7 @@ description: Use when an agent/crew needs to drive a real Chrome over CDP from t
 • Os dois endpoints CDP · Resolução dos módulos no mini (pré-requisito)
 • Conectar — puppeteer-core (universal, recomendado) · Conectar — playwright-core
 • Saúde / quando algo não conecta · Blast radius / segurança (LER)
+• MCP `playwright-cdp`: higiene de snapshot, aba própria e versão fixa
 • Relação com outras peças / fora de escopo · Refs
 
 A infra de dois browsers reais já existe e é durável. Esta skill é o **padrão
@@ -112,6 +113,23 @@ curl -s --max-time 5 http://127.0.0.1:9223/json/version   # MBP via túnel
   (log em `~/Library/Logs/chrome-cdp-tunnel-mbp.log`). Se persistir, o Chrome
   CDP do **MBP** pode estar down — precisa de ação na máquina MBP.
 
+### Abas somem sozinhas em esperas longas (2026-07-14)
+
+Como o perfil é **compartilhado entre agentes concorrentes**, uma aba sua pode
+fechar sozinha no meio de uma operação de vários minutos (proteção de memória
+do Chrome sob a carga de múltiplos agentes navegando ao mesmo tempo — visto
+com `hex cell run`/publish em notebook pesado). Sintoma: `browser_navigate`/
+`browser_snapshot` retorna `"Target page, context or browser has been
+closed"`. Não é falha sua nem motivo pra abortar a tarefa:
+
+1. `cdp status` — se DOWN, `cdp restart` (a sessão logada **sobrevive** ao
+   restart, fica no perfil persistente `~/.chrome-cdp` — não precisa relogar).
+2. Navegue de novo pra a mesma URL e retome de onde parou.
+3. **Pra esperas de vários minutos** (aguardando um job/preview rodar),
+   prefira `sleep` via Bash (não toca o browser) a ficar chamando
+   `browser_wait_for` repetidamente — polling ativo parece correlacionar com
+   mais fechamentos de aba do que só esperar e checar uma vez no fim.
+
 ## Blast radius / segurança (LER)
 
 - O perfil `~/.chrome-cdp` carrega as **sessões reais logadas do Athos** e
@@ -129,12 +147,75 @@ curl -s --max-time 5 http://127.0.0.1:9223/json/version   # MBP via túnel
   endereço de entrega e pagamento: skill **`federated-site-login`**.
 - Sessão expirada → peça re-login interativo ao Athos; não tente burlar.
 
+## MCP `playwright-cdp`: higiene de snapshot, aba própria e versão fixa
+
+Medido em 28/10 no mini (Chrome 156, `@playwright/mcp` 0.0.83; bead ga-g7zyxc3,
+relatório `docs/reports/agent-browser-vs-playwright-mcp-ga-30455bt.md`). Tokens
+são o200k; o custo real no Claude é ≈ ×1,44.
+
+**Snapshot: o que custa e como gastar menos**
+
+- As ações (`browser_click`, `browser_navigate`, `browser_type`…) **não**
+  devolvem a página: devolvem um link para `.playwright-mcp/page-*.yml` (~30
+  tokens). O snapshot inline só vem de `browser_snapshot` — não o chame a cada
+  passo.
+- **Orientar-se:** `browser_snapshot` com `depth: 3`. HN: 13.483 → 253 tokens;
+  Wikipédia: 70.794 → 329. Em página pequena não ajuda (login 515 → 223; lista
+  de 40 linhas 1.722 → 1.722).
+- **Confirmar que algo mudou:** `browser_find` com `text` (138–161 tokens), não
+  um snapshot novo. `browser_find` com `regex` largo **não** serve de filtro de
+  controles: custa o snapshot inteiro.
+- **Vários campos de uma vez:** `browser_fill_form` (o login também: usuário e
+  senha na mesma chamada).
+- **Ref só onde vai agir.** Login + formulário (11 passos): 15.330 tokens de
+  resultado com snapshot em todo ponto de observação, 1.713 com snapshot só onde
+  precisa de ref + `fill_form` (8 chamadas).
+
+**Aba própria — dois `playwright-cdp` no MESMO Chrome navegam a MESMA aba**
+
+Sem isolamento (medido no mini): o segundo `browser_navigate` troca a página do
+primeiro, e o primeiro passa a ver o conteúdo do outro. O `:9222` é compartilhado
+por vários crews, então vale mesmo sem nenhuma troca de ferramenta.
+
+- **Primeira ação da sessão:** `browser_tabs` com `{action:"new", url:"…"}` e
+  navegue só nessa aba. Medido: dois agentes ficaram isolados, inclusive quando
+  um deles já estava trabalhando na aba inicial.
+- **`browser_tabs list` lista TODAS as abas do Chrome, as de outros agentes
+  também.** Nunca use `select` ou `close` com índice de aba que você não abriu:
+  um `select 0` seguido de navegação sequestrou a aba do outro agente.
+- **Depois de `browser_tabs close`, a aba "atual" passa para uma vizinha — que
+  pode ser de outro agente.** Abra uma aba nova (`new`) antes de navegar de novo.
+- No fim, feche a sua: `browser_tabs` com `{action:"close"}` e **sem** `index`
+  fecha só a atual.
+
+**Versão fixa**
+
+- O `playwright-cdp` roda `@playwright/mcp` **0.0.83** direto com node, a partir
+  de `~/.local/share/playwright-mcp` (instalado pelo `install.sh`): sem `npx`,
+  sem consulta ao registry, sem o processo `npm exec` na frente. Antes era
+  `npx @playwright/mcp@latest`, sem pin (cada sessão resolvia a versão do
+  momento).
+- Por que direto e não `npx @playwright/mcp@0.0.83`: com o mini a load 75–82,
+  o `npx @playwright/mcp@latest` levou 31–35 s para responder o `initialize`
+  (3 de 3 medições) e o `claude mcp get` marcou "Failed to connect — timed out
+  after 30000ms"; o node direto levou 2,8–8,9 s (5 de 5). O `npx` com versão
+  fixa também ficou lento (23, 45 e 69 s): o custo é o `npm exec` subindo numa
+  máquina saturada, não só a consulta ao registry. Footprint por sessão: ~135 MB
+  com `npm exec` + node, ~100 MB direto.
+- Registrar (ou refazer) no Claude, uma vez por máquina:
+  `claude mcp remove playwright-cdp -s user && claude mcp add playwright-cdp -s user -- /opt/homebrew/bin/node ~/.local/share/playwright-mcp/node_modules/@playwright/mcp/cli.js --cdp-endpoint http://127.0.0.1:9222`
+  e confira com `claude mcp get playwright-cdp` (`✔ Connected`). Sessão viva só
+  troca no restart.
+- Trocar a versão: edite `PW_MCP_VERSION` no `install.sh`, rode-o e repita o
+  `claude mcp get`. O plugin `playwright@claude-plugins-official` (sessões fora
+  dos overlays do `city.toml`) ainda lança `npx @playwright/mcp@latest` sem pin.
+
 ## Relação com outras peças / fora de escopo
 
 - **MCP `playwright-cdp`** (`mcp__playwright-cdp__browser_*`) aponta pro mini
   (9222) e carrega no start de sessões Claude novas — é o caminho preferido
-  quando disponível. Fazer o MCP **selecionar 9222 vs 9223** é **Opcional/fora
-  de escopo** desta entrega.
+  quando disponível (higiene, aba própria e versão: seção acima). Fazer o MCP
+  **selecionar 9222 vs 9223** é **Opcional/fora de escopo** desta entrega.
 - **Não** altere/crie a infra de browser (já existe e funciona) nem use o
   Chrome pessoal do Athos (o padrão é o perfil dedicado `~/.chrome-cdp`).
 
