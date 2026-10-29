@@ -6,8 +6,12 @@
 # o dispatcher (gate-remote-reviewers.lib.sh). INERTE: sem a flag $GC_CITY/.gc/gate-remote-reviewers.on ninguém abre este template.
 # Ligar, provar e as decisões do Mayor: docs/runbooks/gate-reviewer-remote.md.
 #
-# max_active_sessions = 2, não 1: o nó tem teto 4 no total e o dog-remote ocupa 1; o run de código usa 1 revisor (ga-5hdsr), então 2 =
-# dois runs ao mesmo tempo, com 1 vaga de folga. E 1 seria lido pelo guarda crew-session-dedup como sessão única e mataria o 2º start.
+# max_active_sessions = 3 (era 2; ga-yjrg7n6): o nó tem teto 6 no total (`cap` em .gc/session-ssh.json, dividido entre todas as sessões `*-remote-*`:
+# dog-remote usa até 1 na prática, wa-worker-remote 0-1) e o run de código usa 1 revisor (ga-5hdsr), então 3 = três runs ao mesmo tempo no nó
+# e ainda 3 vagas de folga para os outros templates remotos. Medido em 29/10 00:4x-01:3x: o que barrou o nó foi ESTE teto ("Reviewer 1: full (node
+# has 2 of 2 gate-reviewer-remote sessions) - local reviewer") e às 01:2x o nó estava em load 7/16 núcleos com 18 GB livres (ga-n4ql4ur, ga-yjrg7n6). O fallback não muda: nó
+# cheio/unready/unknown = revisor local; conta do Claude do nó esgotada (`hetzner-claude.py gate` ≠ ok) = local. E 1 seria lido pelo guarda
+# crew-session-dedup como sessão única e mataria o 2º start (por isso o piso é 2; nunca volte a 1).
 # min_active_sessions = 0 e nada de `gc hook` aqui: a sessão só existe porque o dispatcher a abriu para uma verdict bead; idle_timeout
 # curto devolve a vaga do nó. work_dir, overlay_dir e env NÃO viajam (o provider os ignora): o revisor do nó não tem o overlay
 # `pool-reviewer`, e a prova de equivalência de veredito (runbook) mede se isso muda o resultado.
@@ -15,7 +19,7 @@
 # O atalho `bd` do nó não passa `bd label add|remove` nem `gc runtime drain-ack` (rc 77): o veredito volta por `bd comment` + `bd close`,
 # caminho que o dispatcher já aceita (ga-86l90a8 PASS, ga-w7pm55 FAIL). Alargar o atalho é decisão de segurança do Mayor, não feita.
 idle_timeout = "10m"
-max_active_sessions = 2
+max_active_sessions = 3
 min_active_sessions = 0
 model = "sonnet"
 provider = "claude-headless"
