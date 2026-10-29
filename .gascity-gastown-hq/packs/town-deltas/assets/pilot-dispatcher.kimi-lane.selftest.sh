@@ -19,7 +19,7 @@
 #   espaço sem quebra e dígito de largura total incluídos); sha, id de bead, data, data com hora, versão, contagem e número curto não. (telefone, rodada 1 do gate) (31) 9 9999-8888, (31) 9 9999 8888,
 #   +55 (31) 9 9999-8888, 9 9999-8888 e 3333 4444 casam, e travessão, hífen não separável e menos Unicode valem como hífen.
 #   (gate, rodada 1) o bloco do FAIL que decide a rota roda VERBATIM (marcadores SELFTEST-EXTRACT): rótulos em cache, cache vazio com releitura sem cache, e leitura que não rende (bd que falha, saída vazia, lixo, sem rótulo,
-#   rótulo que não é texto) = a rota fica, com aviso e nota no comentário — nunca "sem lane:kimi" calado. (pilot_sweep) o que dispatch_one devolve sem despachar entra na contagem pelo nome. (soltas) kimi_lane_released não gasta
+#   rótulo que não é texto) = a rota fica, com aviso e nota no comentário — nunca "sem lane:kimi" calado. (pilot_sweep) o que dispatch_one devolve sem despachar entra na contagem pelo nome. (pilot_sweep, ga-k5gl8hd) TODA lane:kimi que a passada tira das pistas é candidata da varredura, chegue ou não a dispatch_one: 1 esperando = candidates=1 e refused_by_guard.kimi_lane_wait=1 (o _pilot_sweep_emit REAL roda sobre as notas); faixa fechada, sem-texto, outro rig, tentativas gastas, DRY_RUN e a que ficou atrás da despachada = espera; rebaixada = kimi_lane_demoted; rebaixamento, carimbo ou triagem que falharam = failed_other, nunca espera. (soltas) kimi_lane_released não gasta
 #   as 3 tentativas, mas tem teto de 10. (carimbo) a lista dos que precisam do carimbo que não se lê é dita (NÃO LI), nunca "carimbada=0". (texto) nada afirma "nenhuma vai a pool Claude".
 #   (rodada 2, bloqueante) ESPERA DE PROPÓSITO NÃO É PARADA: o predicado de saturação e o Step 5 (a sequência do "Pilot estagnado") rodam VERBATIM (marcadores SELFTEST-EXTRACT): uma lane:kimi esperando e mais nada =
 #   saturado, streak zerado, nenhum toque; o controle (candidato comum que não despachou) segue contando e tocando; espera + falha no mesmo sweep NÃO isenta; contador ilegível/ausente/com zero à esquerda; o marcador
@@ -30,7 +30,7 @@
 #   registra o que recebeu. Contra um dispatcher sem as funções o arquivo se recusa a começar.
 # CONTROLE NEGATIVO: cada mutante (pista que não separa as do Kimi, bandeira ignorada, bead de outro rig aceita, vaga que conta todo template, bloco do Kimi que cai no mini, gate que restaura dog,
 #   veto ignorado, cada termo da lista ignorado, termo sem fronteira de palavra, cada forma do número longo e do telefone, travessão que não vale como hífen, sem-texto/ilegível que passa, comentários que não são triados
-#   ou cuja leitura falha/vem vazia/malformada conta como ok, rebaixamento que não tira o rótulo/a rota/escreve no DRY_RUN, gate que não relê/não avisa/não anota, passada que não nota o resultado, solta que gasta
+#   ou cuja leitura falha/vem vazia/malformada conta como ok, rebaixamento que não tira o rótulo/a rota/escreve no DRY_RUN, gate que não relê/não avisa/não anota, passada que não nota o resultado, passada que não nota a espera, a rebaixada ou cada uma das falhas (ga-k5gl8hd), evento que não classifica kimi_lane_demoted, solta que gasta
 #   tentativa ou sem teto, lista do carimbo que falha sem dizer; rodada 2: predicado que ignora a espera, que isenta com falha ou com despacho, contador ilegível que isenta, passada que não conta a espera ou não soma
 #   cada uma das falhas, kimi_lane_failed que vira espera ou não para a passada, metadata story.* fora da triagem, nota do gate fora do lugar) é aplicado numa cópia e a bateria tem de reprovar.
 # Variáveis: PILOT_DISPATCHER_PATH · GATE_DISPATCHER_PATH · KL_NO_MUTANTS=1
@@ -46,7 +46,7 @@ bad() { FAIL=$((FAIL+1)); echo "  ✗ $*"; }
 
 fn_src() { awk -v n="$1" '$0 ~ "^"n"\\(\\) *\\{"{f=1} f{print} f&&/^}$/{exit}' "$2"; }
 FUNCS=""
-for f in gc_json_or_unknown _pilot_slow_spawn_budget_spent _pilot_note_spawn_timing _pilot_node_first_rollback _pilot_node_first_veto _pilot_kimi_lane_closed _pilot_kimi_pick_alias _pilot_kimi_dispatch _pilot_kimi_screen _pilot_kimi_screen_comments _pilot_kimi_demote _pilot_kimi_lane_pass; do
+for f in gc_json_or_unknown _pilot_slow_spawn_budget_spent _pilot_note_spawn_timing _pilot_node_first_rollback _pilot_node_first_veto _pilot_kimi_lane_closed _pilot_kimi_pick_alias _pilot_kimi_dispatch _pilot_kimi_screen _pilot_kimi_screen_comments _pilot_kimi_demote _pilot_kimi_lane_pass _pilot_sweep_note _pilot_sweep_emit; do
   src="$(fn_src "$f" "$DISPATCHER")"
   [ -n "$src" ] || { echo "FATAL: $f() not found in $DISPATCHER (ga-do1ixn.3 not applied)" >&2; exit 2; }
   FUNCS="$FUNCS
@@ -120,8 +120,8 @@ EOF
 chmod +x "$WORK/bin/gc" "$WORK/bin/bd"
 sandbox_path_init "$WORK" jq date timeout mkdir dirname cat sleep head || exit 2
 
-CALLS="$WORK/calls.log"; LINES="$WORK/lines.txt"; DCALLS="$WORK/dispatch.log"; NOTES="$WORK/notes.log"
-reset() { rm -f "$WORK"/gc.*.rc "$WORK"/sessions.json "$WORK"/bead.assignee "$WORK"/bead.status "$WORK"/bead.labels "$WORK"/bd.show.raw "$WORK"/bd.fail.on "$WORK"/comments.* "$CALLS" "$LINES" "$DCALLS" "$NOTES" "$WORK/pass.counters" "$WORK/kd.fault" "$WORK/gate.kimi.note" "$WORK"/city/.gc/*.on; echo open > "$WORK/bead.status"; }
+CALLS="$WORK/calls.log"; LINES="$WORK/lines.txt"; DCALLS="$WORK/dispatch.log"; NOTES="$WORK/notes.log"; EV="$WORK/pilot.jsonl"
+reset() { rm -f "$WORK"/gc.*.rc "$WORK"/sessions.json "$WORK"/bead.assignee "$WORK"/bead.status "$WORK"/bead.labels "$WORK"/bd.show.raw "$WORK"/bd.fail.on "$WORK"/comments.* "$CALLS" "$LINES" "$DCALLS" "$NOTES" "$EV" "$WORK/pass.counters" "$WORK/kd.fault" "$WORK/gate.kimi.note" "$WORK"/city/.gc/*.on; echo open > "$WORK/bead.status"; }
 sess() { # sess alias:state[:template] ... → sessions.json
   local a j='[]' al st tp
   for a in "$@"; do
@@ -137,7 +137,8 @@ b() { # b id labels_csv [route] [descrição] → um objeto de candidata (descri
 }
 
 # run_pass SMALL_JSON BIG_JSON — a passada num filho; imprime "small=<ids> big=<ids> dispatched=<n>". KL_DRC = rc do dispatch_one falso; KL_DRES = o DISPATCH_RESULT dele (definida e vazia = dispatch_one sem nome);
-# KL_REL = ids ("ga-r1 ga-r2") para os quais ele devolve rc 1 com kimi_lane_released (solta antes de gastar a vaga). _pilot_sweep_note grava "<id> <rc> <nome>" em $NOTES.
+# KL_REL = ids ("ga-r1 ga-r2") para os quais ele devolve rc 1 com kimi_lane_released (solta antes de gastar a vaga). _pilot_sweep_note e _pilot_sweep_emit são os REAIS (extraídos como o resto): depois da passada
+# $NOTES recebe cada nota na ordem ("<id> <rc> <nome>", uma por linha: o evento guarda só a ÚLTIMA de cada bead) e a linha do pilot_sweep vai para $EV.
 # KL_JQFAIL=1 troca o jq do filho por um que falha só na leitura de "quais beads precisam do carimbo" (a que usa startswith("ga-")).
 run_pass() {
   (
@@ -148,7 +149,6 @@ run_pass() {
     _top_candidate() { printf '%s' "$1" | jq -c '.[0] // empty'; }
     _bead_tier() { echo story; }
     _dolt_saturated() { return 1; }
-    _pilot_sweep_note() { echo "$1 $2 ${3-}" >> "$NOTES"; }
     dispatch_one() {
       local _di_id; _di_id=$(printf '%s' "$1" | jq -r .id)
       echo "$_di_id lane=$2 kimi=${_PILOT_KIMI_PASS:-0}" >> "$DCALLS"
@@ -161,8 +161,11 @@ run_pass() {
     PILOT_NODE_FIRST_VETO_LABELS="node:never needs:engine-window exec:manual"
     SMALL_CANDIDATES="$1"; BIG_CANDIDATES="$2"; SMALL_COUNT=0; BIG_COUNT=0
     NONQUEUE_FAILS=0; KIMI_LANE_WAITING=0   # o dispatcher os declara no topo, junto de POOL_CAP_QUEUED
+    SWEEP_OUTCOMES=""; PILOT_LOG="$EV"; SMALL_SLOTS=3; BIG_SLOTS=3
     eval "$FUNCS"
     _pilot_kimi_lane_pass
+    _pilot_sweep_emit
+    [ -z "$SWEEP_OUTCOMES" ] || printf '%s' "${SWEEP_OUTCOMES//$'\t'/ }" > "$NOTES"
     echo "waiting=${KIMI_LANE_WAITING-?} nqf=${NONQUEUE_FAILS-?}" > "$WORK/pass.counters"
     echo "small=$(printf '%s' "$SMALL_CANDIDATES" | jq -r '[.[].id] | join(",")' 2>/dev/null) big=$(printf '%s' "$BIG_CANDIDATES" | jq -r '[.[].id] | join(",")' 2>/dev/null) n=$SMALL_COUNT/$BIG_COUNT dispatched=$DISPATCHED"
   ) 2>&1 | tail -1
@@ -221,6 +224,8 @@ run_kd_seq() {
     echo "first=$first second=${_PKL_FAULT-?}"
   ) 2>&1 | tail -1
 }
+# evs — a linha do pilot_sweep que a passada acabou de emitir (a do _pilot_sweep_emit REAL), resumida: c=candidates d=dispatched g=refused_by_guard f=failed_other u=unclassified
+evs() { [ -s "$EV" ] || { echo "sem-evento"; return 0; }; tail -1 "$EV" | jq -c '{c:.candidates, d:.dispatched, g:.refused_by_guard, f:.failed_other, u:.unclassified}' 2>/dev/null || echo "evento-ilegivel"; }
 cset() { printf '%s\n' "$2" > "$WORK/comments.$1"; }   # cset <id> <json>: o que `bd comments <id> --json` imprime para esse id
 cj() { jq -cn --arg t "$1" '[{author:"mayor", created_at:"2026-10-28T12:00:00Z", id:"c1", issue_id:"ga-x", text:$t}]'; }   # UM comentário, no formato do bd
 K1=$(b ga-k1 "lane:kimi,story:approved"); K2=$(b ga-k2 "lane:kimi" kimi-lane); KW=$(b wa-k3 "lane:kimi" wa-worker); N1=$(b ga-n1 "story:approved"); N2=$(b ga-n2 "lane:kimi-not")
@@ -247,13 +252,13 @@ reset; on; r=$(run_pass "[$N1]" "[]")
 
 echo "── passada: o que dispatch_one devolve entra na contagem da varredura (pilot_sweep) pelo NOME (rodada 1, bloqueante 1)"
 reset; on; r=$(run_pass "[$K1]" "[]")
-[ "$(cat "$NOTES" 2>/dev/null)" = "ga-k1 0 node_ok" ] && ok "despachada: _pilot_sweep_note ga-k1 0 node_ok" || bad "nota da despachada: '$(cat "$NOTES" 2>/dev/null)'"
+[ "$(tail -1 "$NOTES" 2>/dev/null)" = "ga-k1 0 node_ok" ] && [ "$(evs)" = '{"c":1,"d":1,"g":{},"f":0,"u":0}' ] && ok "despachada: a última nota é ga-k1 0 node_ok e o evento conta 1 candidata, 1 despachada (a espera da triagem foi sobrescrita)" || bad "nota da despachada: '$(cat "$NOTES" 2>/dev/null)' evento=$(evs)"
 reset; on; r=$(KL_DRC=1 KL_DRES=kimi_lane_wait run_pass "[$K1,$K2]" "[]")
-[ "$(cat "$NOTES" 2>/dev/null)" = "ga-k1 1 kimi_lane_wait" ] && ok "sem vaga: a nota leva o NOME kimi_lane_wait (uma só: a passada para)" || bad "nota do kimi_lane_wait: '$(cat "$NOTES" 2>/dev/null)'"
+[ "$(tail -1 "$NOTES" 2>/dev/null)" = "ga-k1 1 kimi_lane_wait" ] && [ "$(grep -c . "$DCALLS")" = 1 ] && [ "$(evs)" = '{"c":2,"d":0,"g":{"kimi_lane_wait":2},"f":0,"u":0}' ] && ok "sem vaga: a nota leva o NOME kimi_lane_wait (uma tentativa só: a passada para) e as 2 contam como espera" || bad "nota do kimi_lane_wait: '$(cat "$NOTES" 2>/dev/null)' evento=$(evs)"
 reset; on; r=$(KL_DRC=1 KL_DRES=node_rollback_unconfirmed run_pass "[$K1,$K2]" "[]")
-[ "$(cat "$NOTES" 2>/dev/null)" = "ga-k1 1 node_rollback_unconfirmed" ] && [ "$(grep -c . "$DCALLS")" = 1 ] && ok "desfazer sem confirmar: a nota leva o nome (failed_other no resumo) e a passada para" || bad "nota do node_rollback_unconfirmed: '$(cat "$NOTES" 2>/dev/null)' tentativas=$(grep -c . "$DCALLS")"
+[ "$(tail -1 "$NOTES" 2>/dev/null)" = "ga-k1 1 node_rollback_unconfirmed" ] && [ "$(grep -c . "$DCALLS")" = 1 ] && [ "$(evs)" = '{"c":2,"d":0,"g":{"kimi_lane_wait":1},"f":1,"u":0}' ] && ok "desfazer sem confirmar: a nota leva o nome (failed_other no evento, a que nem tentou segue espera) e a passada para" || bad "nota do node_rollback_unconfirmed: '$(cat "$NOTES" 2>/dev/null)' tentativas=$(grep -c . "$DCALLS") evento=$(evs)"
 reset; on; r=$(KL_DRC=1 KL_DRES= run_pass "[$K1,$K2]" "[]")
-[ "$(head -1 "$NOTES" 2>/dev/null)" = "ga-k1 1 " ] && [ "$(grep -c . "$DCALLS")" = 2 ] && ok "dispatch_one que falha sem nome: a nota vai sem nome (unclassified, nunca sumida) e a passada tenta a próxima" || bad "nota sem nome: '$(cat "$NOTES" 2>/dev/null)' tentativas=$(grep -c . "$DCALLS")"
+[ "$(grep -c '^ga-k1 1 $' "$NOTES" 2>/dev/null)" = 1 ] && [ "$(grep -c . "$DCALLS")" = 2 ] && [ "$(evs)" = '{"c":2,"d":0,"g":{},"f":0,"u":2}' ] && ok "dispatch_one que falha sem nome: a nota vai sem nome (unclassified, nunca sumida, nunca espera) e a passada tenta a próxima" || bad "nota sem nome: '$(cat "$NOTES" 2>/dev/null)' tentativas=$(grep -c . "$DCALLS") evento=$(evs)"
 
 echo "── passada: soltas (kimi_lane_released) não gastam as 3 tentativas, mas têm teto próprio (rodada 1, não bloqueante)"
 R1=$(b ga-r1 lane:kimi); R2=$(b ga-r2 lane:kimi); R3=$(b ga-r3 lane:kimi); R4=$(b ga-r4 lane:kimi)
@@ -591,6 +596,42 @@ reset; printf '%s' 'gc.routed_to=kimi-lane' > "$WORK/bd.fail.on"; r=$(run_pass "
 reset; r=$(KL_JQFAIL=1 run_pass "[$K1]" "[]"); c=$(cnt)
 [ "$c" = "waiting=1 nqf=1" ] && ok "lista do carimbo que não se leu: 1 falha" || bad "lista do carimbo: '$c'"
 
+echo "── pilot_sweep: TODA lane:kimi que a passada tira das pistas é candidata da varredura, tenha ou não chegado a dispatch_one (ga-k5gl8hd)"
+# Antes: só a bead que a passada entregava a dispatch_one entrava em candidates/results. Faixa fechada, triagem sem-texto, outro rig, rebaixada, tentativas gastas ou a que ficou atrás da despachada
+# sumiam da contagem: o evento dizia 0 candidatas com N esperando. Aqui roda o _pilot_sweep_emit REAL sobre as notas da passada (a última nota de cada bead vence).
+reset; r=$(run_pass "[$K1]" "[]")
+[ "$(evs)" = '{"c":1,"d":0,"g":{"kimi_lane_wait":1},"f":0,"u":0}' ] && [ "$(tail -1 "$EV" | jq -c .results)" = '{"kimi_lane_wait":1}' ] && ok "ACEITE: UMA lane:kimi esperando (faixa fechada) → candidates=1 e refused_by_guard.kimi_lane_wait=1 (results.kimi_lane_wait=1)" || bad "uma esperando: $(evs) $(tail -1 "$EV" 2>/dev/null | jq -c .results 2>/dev/null)"
+reset; r=$(run_pass "[$K1,$KW]" "[$E1]")
+[ "$(evs)" = '{"c":3,"d":0,"g":{"kimi_lane_wait":3},"f":0,"u":0}' ] && ok "faixa fechada, 3 beads (HQ, outro rig, sem texto): as 3 contam como espera, 0 falhas" || bad "3 esperando: $(evs)"
+reset; on; r=$(run_pass "[$K1,$K2]" "[]")
+[ "$(cat "$DCALLS")" = "ga-k1 lane=small kimi=1" ] && [ "$(evs)" = '{"c":2,"d":1,"g":{"kimi_lane_wait":1},"f":0,"u":0}' ] && ok "aberta, a 1ª despachada e a de trás nem tentada: 2 candidatas, 1 despachada, a que ficou atrás conta como espera" || bad "despachada + a de trás: $(evs) / $(cat "$DCALLS")"
+reset; on; r=$(run_pass "[$KW]" "[]")
+[ ! -s "$DCALLS" ] && [ "$(evs)" = '{"c":1,"d":0,"g":{"kimi_lane_wait":1},"f":0,"u":0}' ] && ok "aberta, só uma bead de outro rig: não vai a dispatch_one, e conta como espera" || bad "outro rig: $(evs) / $(cat "$DCALLS" 2>/dev/null)"
+reset; on; r=$(run_pass "[$E1]" "[]")
+[ ! -s "$DCALLS" ] && [ "$(evs)" = '{"c":1,"d":0,"g":{"kimi_lane_wait":1},"f":0,"u":0}' ] && ok "triagem sem-texto (descrição vazia): espera DE PROPÓSITO — kimi_lane_wait, 0 falhas" || bad "sem-texto: $(evs)"
+R5=$(b ga-r5 lane:kimi)
+reset; on; r=$(KL_DRC=1 KL_DRES=assign_failed run_pass "[$R1,$R2,$R3,$R4,$R5]" "[]")
+[ "$(grep -c . "$DCALLS")" = 3 ] && grep -q ' · tentativas · ' "$LINES" && [ "$(evs)" = '{"c":5,"d":0,"g":{"kimi_lane_wait":2},"f":3,"u":0}' ] && ok "tentativas gastas (3 falhas, a passada para): as 3 tentadas são falha (failed_other), as 2 que nem tentou seguem espera" || bad "tentativas gastas: $(evs) tentativas=$(grep -c . "$DCALLS") / $(grep -h 'faixa Kimi:' "$LINES" | tail -1)"
+reset; on; r=$(KL_DRY=1 run_pass "[$K1,$V1]" "[]")
+[ ! -s "$DCALLS" ] && [ "$(writes)" = 0 ] && [ "$(evs)" = '{"c":2,"d":0,"g":{"kimi_lane_wait":2},"f":0,"u":0}' ] && ok "DRY_RUN (nada escrito, nada despachado): a limpa e a que SERIA rebaixada contam como espera" || bad "dry-run: $(evs) writes=$(writes)"
+echo "   …a rebaixada saiu da faixa: não é espera, e o nome diz isso; a que não rebaixou ou não li é FALHA (failed_other), nunca espera"
+reset; r=$(run_pass "[$V1]" "[]")
+[ "$(evs)" = '{"c":1,"d":0,"g":{"kimi_lane_demoted":1},"f":0,"u":0}' ] && [ "$(tail -1 "$EV" | jq -c .results)" = '{"kimi_lane_demoted":1}' ] && ok "rebaixada (veto, faixa fechada): candidates=1 com o nome kimi_lane_demoted em refused_by_guard — não kimi_lane_wait" || bad "rebaixada: $(evs)"
+reset; on; r=$(run_pass "[$V1,$K1]" "[]")
+[ "$(cat "$DCALLS")" = "ga-k1 lane=small kimi=1" ] && [ "$(evs)" = '{"c":2,"d":1,"g":{"kimi_lane_demoted":1},"f":0,"u":0}' ] && ok "aberta: a rebaixada conta como kimi_lane_demoted e a limpa é despachada" || bad "rebaixada + despachada: $(evs)"
+reset; printf '%s' '--remove-label' > "$WORK/bd.fail.on"; r=$(run_pass "[$V1]" "[]")
+[ "$(evs)" = '{"c":1,"d":0,"g":{},"f":1,"u":0}' ] && [ "$(tail -1 "$EV" | jq -c .results)" = '{"kimi_lane_failed":1}' ] && ok "rebaixamento que não gravou: failed_other (kimi_lane_failed), nunca espera — igual ao NONQUEUE_FAILS da passada" || bad "rebaixamento que falha: $(evs)"
+reset; cset ga-c3 "$(cj 'ok')"; printf '%s' 'comments ga-c3' > "$WORK/bd.fail.on"; r=$(run_pass "[$C3]" "[]")
+[ "$(evs)" = '{"c":1,"d":0,"g":{},"f":1,"u":0}' ] && ok "triagem que não consegui ler (comentários): failed_other, nunca espera" || bad "triagem ilegível: $(evs)"
+reset; printf '%s' 'gc.routed_to=kimi-lane' > "$WORK/bd.fail.on"; r=$(run_pass "[$K1]" "[]")
+[ "$(evs)" = '{"c":1,"d":0,"g":{},"f":1,"u":0}' ] && ok "carimbo da rota de espera que não gravou: failed_other, nunca espera (a mesma bead, com o carimbo gravado, é a 1ª linha desta seção: espera)" || bad "carimbo que falha: $(evs)"
+reset; on; printf '%s' 'gc.routed_to=kimi-lane' > "$WORK/bd.fail.on"; r=$(run_pass "[$K1]" "[]")
+[ "$(evs)" = '{"c":1,"d":1,"g":{},"f":0,"u":0}' ] && ok "…mas a bead que o carimbo falhou e que FOI despachada conta como despachada (a última nota da bead vence; a falha do carimbo segue em NONQUEUE_FAILS)" || bad "carimbo que falha e despacho: $(evs)"
+reset; r=$(run_pass "[$N1,$N2]" "[]")
+[ ! -s "$NOTES" ] && [ "$(evs)" = '{"c":0,"d":0,"g":{},"f":0,"u":0}' ] && ok "CONTROLE: sem lane:kimi a passada não nota nada (0 candidatas vindas dela)" || bad "sem lane:kimi: $(evs) / $(cat "$NOTES" 2>/dev/null)"
+reset; on; r=$(run_pass "[$K1]" "[]")
+[ "$(grep -c '^ga-k1 ' "$NOTES")" = 2 ] && [ "$(sed -n 1p "$NOTES")" = "ga-k1 1 kimi_lane_wait" ] && [ "$(sed -n 2p "$NOTES")" = "ga-k1 0 node_ok" ] && ok "a espera é a PRIMEIRA nota (antes da tentativa): a do despacho vem depois e vence — a ordem que o evento usa" || bad "ordem das notas: $(cat "$NOTES")"
+
 echo "── kimi_lane_failed: falha do nó ≠ espera de propósito (rodada 2, não bloqueante: o mesmo nome cobria os dois)"
 reset; sess; echo 1 > "$WORK/gc.new.rc"; r=$(run_kd); f=$(cat "$WORK/kd.fault" 2>/dev/null)
 [ "$r" = "res=mini alias=" ] && [ "$f" = "fault=1" ] && ok "a sessão não abriu: nada ficou escrito (mini) e a falha é marcada (fault=1)" || bad "sessão que não abre: '$r' '$f'"
@@ -715,6 +756,15 @@ PY
   mutant "triagem ilegível não soma" pilot '+ _kl_unread + _kl_dfault ))' '+ _kl_dfault ))'
   mutant "falha do despacho não soma" pilot '+ _kl_unread + _kl_dfault ))' '+ _kl_unread ))'
   mutant "triagem ilegível conta como sem-texto" pilot '[ "$_kl_verdict" = sem-texto ] || _kl_unread=$((_kl_unread + 1))' ':'
+  mutant "a lane:kimi que espera não entra no evento" pilot '      [ -z "$_kl_id" ] || _pilot_sweep_note "$_kl_id" 1 kimi_lane_wait' '      :'
+  mutant "a espera é notada como sucesso" pilot '[ -z "$_kl_id" ] || _pilot_sweep_note "$_kl_id" 1 kimi_lane_wait' '[ -z "$_kl_id" ] || _pilot_sweep_note "$_kl_id" 0 kimi_lane_wait'
+  mutant "a rebaixada não é notada" pilot '; _pilot_sweep_note "$_kl_id" 1 kimi_lane_demoted' ''
+  mutant "a rebaixada é notada como espera" pilot '_pilot_sweep_note "$_kl_id" 1 kimi_lane_demoted' '_pilot_sweep_note "$_kl_id" 1 kimi_lane_wait'
+  mutant "o evento não classifica kimi_lane_demoted" pilot '"kimi_lane_wait", "kimi_lane_demoted"]' '"kimi_lane_wait"]'
+  mutant "rebaixamento que falha fica como espera" pilot '_kl_held_n=$((_kl_held_n + 1)); _pilot_sweep_note "$_kl_id" 1 kimi_lane_failed' '_kl_held_n=$((_kl_held_n + 1))'
+  mutant "triagem ilegível fica como espera no evento" pilot '          [ "$_kl_verdict" = sem-texto ] || _pilot_sweep_note "$_kl_id" 1 kimi_lane_failed' '          :'
+  mutant "sem-texto vira falha no evento" pilot '[ "$_kl_verdict" = sem-texto ] || _pilot_sweep_note "$_kl_id" 1 kimi_lane_failed' '_pilot_sweep_note "$_kl_id" 1 kimi_lane_failed'
+  mutant "carimbo que falha fica como espera no evento" pilot '_kl_stampfail=$((_kl_stampfail + 1)); _pilot_sweep_note "$_kl_id" 1 kimi_lane_failed; warn' '_kl_stampfail=$((_kl_stampfail + 1)); warn'
   mutant "retorno sem nome conta como espera" pilot 'kimi_lane_wait|kimi_lane_released) ;; *) _kl_dfault=$((_kl_dfault + 1)) ;; esac' '*) ;; esac'
   mutant "kimi_lane_failed não para a passada" pilot 'kimi_lane_wait|kimi_lane_failed|node_rollback_unconfirmed) _kl_stop=' 'kimi_lane_wait|node_rollback_unconfirmed) _kl_stop='
   mutant "falha do nó sai com o nome da espera" pilot 'if [ "${_PKL_FAULT:-0}" = "1" ]; then DISPATCH_RESULT="kimi_lane_failed"; else' 'if false; then DISPATCH_RESULT="kimi_lane_failed"; else'

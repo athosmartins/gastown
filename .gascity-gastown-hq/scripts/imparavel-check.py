@@ -93,6 +93,15 @@ POOL_SATURATED_MARK = "ga-in9ebr: POOL-SATURATED sweep"
 # the bead's STATUS header, not a real bead label) and stays local.
 PARKING_LABELS = tuple(park_labels.PARK_LABELS) + ("status",)
 
+# ga-k5gl8hd: a bead with this label belongs to the Kimi lane (ga-do1ixn.3), NOT to the Pilot's normal
+# loop: _pilot_kimi_lane_pass takes every one of them out of both lanes before dispatch and sends at most
+# ONE per sweep to the kimi-worker-remote, with the lane open; with the lane closed (no .gc/kimi-lane.on),
+# the slot busy, a triage hold, another rig or the attempts spent, it WAITS on purpose. pilot-dispatchable.json
+# is written BEFORE that pass, so such a bead is in the snapshot and, without this, read as "buildable and
+# silently stuck" — a false ❌ on a lane that is working as designed. Exact match, like the dispatcher's own
+# index("lane:kimi"): lane:kimi-not and the like are NOT the Kimi lane (and not in PARKING_LABELS' prefix rule).
+KIMI_LANE_LABEL = "lane:kimi"
+
 NOW = time.time()
 
 
@@ -300,7 +309,15 @@ def classify_bead(bead_id, labels, gate_source_beads, held_loop_max=HELD_LOOP_MA
       'stuck'   — genuinely buildable, not flowing/held → a silent stall (reason set
                   to 'held-loop:Nx' when a held bead exceeded the re-hold budget).
     Precedence: parking-label > active-gate-marker > in-gate-label(non-needs-fix) >
-    in-flight > held > stuck."""
+    in-flight > lane:kimi > held > stuck.
+
+    lane:kimi (ga-k5gl8hd) → ('parked', 'kimi-lane'), whether the lane is open or closed: the Kimi pass
+    owns the bead and its waiting is on purpose (a Kimi pass FAULT is the Pilot's own pilot_sweep /
+    NONQUEUE_FAILS to report, not a silent stall of this queue). It sits AFTER in-flight on purpose: a
+    lane:kimi bead the Kimi worker is building now is 'flowing' and keeps the delivery-stall age check
+    (classify_in_flight) — only the one that WAITS is parked. It sits BEFORE the held rule so a
+    lane:kimi bead can never fall into 'stuck' through it (held-loop), as the normal loop that
+    evaluates the hold never sees a lane:kimi bead."""
     if any(_label_is_parking(l) for l in labels):
         return ("parked", "label")
     # An ACTIVE gate marker names it → the gate owns it (gate-stall = check_gate's job),
@@ -314,6 +331,8 @@ def classify_bead(bead_id, labels, gate_source_beads, held_loop_max=HELD_LOOP_MA
         return ("parked", "in-gate")
     if "story:in-flight" in labels:
         return ("flowing", "")
+    if KIMI_LANE_LABEL in labels:
+        return ("parked", "kimi-lane")
     held = [l for l in labels if l.startswith("pilot:held-until:")]
     if held:
         if len(held) > held_loop_max:
@@ -379,7 +398,7 @@ def check_approved():
     # already-built bead awaiting the gate must NEVER count as a silent Pilot stall.
     gate_source_beads = _gate_source_beads()
     parked, buildable, stuck = [], [], []
-    flowing_count, held_count, in_gate_count = 0, 0, 0
+    flowing_count, held_count, in_gate_count, kimi_lane_count = 0, 0, 0, 0
     read_err = []
     no_route = []
 
@@ -405,6 +424,8 @@ def check_approved():
             parked.append({"id": bead_id, "title": title, "rig": rig, "reason": reason})
             if reason == "in-gate":
                 in_gate_count += 1
+            elif reason == "kimi-lane":
+                kimi_lane_count += 1
             continue
 
         # GENUINELY BUILDABLE (everything not parked: flowing / held / stuck)
@@ -427,6 +448,7 @@ def check_approved():
         "total": len(items),
         "parked_count": len(parked),
         "in_gate_count": in_gate_count,
+        "kimi_lane_count": kimi_lane_count,
         "buildable_count": len(buildable),
         "flowing_count": flowing_count,
         "held_count": held_count,
@@ -442,7 +464,7 @@ def check_approved():
 def _check_approved_fallback(inherited_warns):
     """Fallback: story:approved-only logic when pilot-dispatchable.json is unavailable."""
     stuck, total = [], 0
-    ok_in_flight, ok_held, ok_mayor, ok_fresh, ok_in_gate = 0, 0, 0, 0, 0
+    ok_in_flight, ok_held, ok_mayor, ok_fresh, ok_in_gate, ok_kimi = 0, 0, 0, 0, 0, 0
     warns = list(inherited_warns)
     gate_source_beads = _gate_source_beads()
 
@@ -458,6 +480,10 @@ def _check_approved_fallback(inherited_warns):
             asg = (b.get("assignee") or "")
             if "story:in-flight" in labs:
                 ok_in_flight += 1; continue
+            # ga-k5gl8hd: same rule as classify_bead — the Kimi pass owns a waiting lane:kimi bead,
+            # so the Pilot's normal loop never touches it; it must not age into a false "stuck" here.
+            if KIMI_LANE_LABEL in labs:
+                ok_kimi += 1; continue
             if any(l.startswith("pilot:held-until") for l in labs):
                 ok_held += 1; continue
             if asg == "mayor":
@@ -496,8 +522,9 @@ def _check_approved_fallback(inherited_warns):
 
     return {
         "total": total,
-        "parked_count": ok_held + ok_mayor + ok_in_gate,
+        "parked_count": ok_held + ok_mayor + ok_in_gate + ok_kimi,
         "in_gate_count": ok_in_gate,
+        "kimi_lane_count": ok_kimi,
         "buildable_count": total - len(stuck) - ok_in_flight,
         "flowing_count": ok_in_flight,
         "held_count": ok_held,
@@ -507,7 +534,8 @@ def _check_approved_fallback(inherited_warns):
         "from_dispatchable": False,
         "snap_age_min": None,
         "_ok_reasons": {"in-flight": ok_in_flight, "held": ok_held,
-                        "mayor": ok_mayor, "fresh": ok_fresh, "in-gate": ok_in_gate},
+                        "mayor": ok_mayor, "fresh": ok_fresh, "in-gate": ok_in_gate,
+                        "kimi-lane": ok_kimi},
         "_total_approved": total,
     }
 
@@ -1169,9 +1197,10 @@ def main():
                         if candidates else "")
             print("  • slots do Pilot: small=%d livre(s)   big=%d livre(s)%s"
                   % (slots["small"], slots["big"], cand_note))
-        print("  • parked (needs-human/on-device/blocked/já-no-gate): %d (já-construídas-no-gate: %d)"
+        print("  • parked (needs-human/on-device/blocked/já-no-gate/faixa-Kimi): %d"
+              " (já-construídas-no-gate: %d, esperando na faixa Kimi: %d)"
               "   • genuinamente construíveis: %d   • em build agora (in-flight): %d   • held: %d"
-              % (a["parked_count"], a.get("in_gate_count", 0),
+              % (a["parked_count"], a.get("in_gate_count", 0), a.get("kimi_lane_count", 0),
                  a["buildable_count"], a["flowing_count"], a["held_count"]))
         if a["stuck"]:
             # ga-zkxdw item 3: show each stuck bead's own lane inline — previously
@@ -1188,8 +1217,9 @@ def main():
         print("APROVADAS (fallback story:approved — snapshot indisponível): %d total"
               % a.get("_total_approved", a["total"]))
         print("  • em build agora (in-flight): %d   • held: %d   • mayor-reservada: %d   • recém-despachada: %d"
+              "   • esperando na faixa Kimi: %d"
               % (ok_r.get("in-flight", 0), ok_r.get("held", 0),
-                 ok_r.get("mayor", 0), ok_r.get("fresh", 0)))
+                 ok_r.get("mayor", 0), ok_r.get("fresh", 0), ok_r.get("kimi-lane", 0)))
 
     if g.get("read_err"):
         print("GATE: ilegível")
@@ -1235,7 +1265,7 @@ def main():
             print("  🔨 Construindo %d agora (%s) — a máquina ESTÁ produzindo, não ociosa."
                   % (building_now, ", ".join(building_ids[:6])))
         if a.get("from_dispatchable") and a["buildable_count"] == 0 and a["parked_count"] > 0:
-            print("  Fila inflada com needs-human/on-device/blocked, mas 0 genuinamente construível"
+            print("  Fila inflada com needs-human/on-device/blocked/faixa-Kimi, mas 0 genuinamente construível"
                   " → %s (%d parked)."
                   % ("ocioso correto" if not building_now else "fila dispatchable parqueada (mas há build ativo acima)",
                      a["parked_count"]))

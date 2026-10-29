@@ -12609,6 +12609,10 @@ _pilot_kimi_lane_pass() {
       [ -n "$_kl_bead" ] || continue
       # vazio/falhou → sem id: segue como "fora do HQ" e o laço de despacho (que também exige id) a deixa esperando
       _kl_id=$(printf '%s' "$_kl_bead" | jq -r '.id // ""' 2>/dev/null) || _kl_id=""
+      # TODA bead lane:kimi com id entra no pilot_sweep já aqui, como ESPERA (kimi_lane_wait), antes de qualquer tentativa: o evento guarda a ÚLTIMA nota de cada bead, então o despacho, o rebaixamento e as falhas abaixo
+      # a sobrescrevem e o que fica como espera é o que esperou de fato (faixa fechada, triagem sem-texto, outro rig, tentativas gastas, dry-run, vaga ocupada). Sem esta nota o evento mostrava 0 candidatas com N esperando.
+      # vazio (bead sem id) → sem nota: sem id não há o que contar; falhou/ilegível (id que o jq não leu) → o mesmo, sem nota, e a bead segue como "fora do HQ" (o laço de despacho, que também exige id, a deixa esperando como antes)
+      [ -z "$_kl_id" ] || _pilot_sweep_note "$_kl_id" 1 kimi_lane_wait
       case "$_kl_id" in
         ga-*)
           _kl_verdict=$(_pilot_kimi_screen "$_kl_bead")
@@ -12629,14 +12633,18 @@ _pilot_kimi_lane_pass() {
           if [ "${DRY_RUN:-0}" = "1" ]; then
             log "  faixa Kimi: $_kl_id seria rebaixada (dry-run, nada escrito) — $_kl_why"
           elif _pilot_kimi_demote "$_kl_bead" "$_kl_why"; then
-            _kl_demoted=$((_kl_demoted + 1)); log "  faixa Kimi: $_kl_id rebaixada — $_kl_why"
+            # saiu da faixa e voltou ao dog: não espera mais no Kimi, então não fica como kimi_lane_wait (refused_by_guard, nome próprio)
+            _kl_demoted=$((_kl_demoted + 1)); log "  faixa Kimi: $_kl_id rebaixada — $_kl_why"; _pilot_sweep_note "$_kl_id" 1 kimi_lane_demoted
           else
-            _kl_demfail=$((_kl_demfail + 1)); _kl_held_n=$((_kl_held_n + 1))
+            # rebaixamento que não gravou é FALHA (soma em NONQUEUE_FAILS): a nota diz failed_other, nunca espera
+            _kl_demfail=$((_kl_demfail + 1)); _kl_held_n=$((_kl_held_n + 1)); _pilot_sweep_note "$_kl_id" 1 kimi_lane_failed
             _kl_next=$(printf '%s' "$_kl_held" | jq -c --argjson b "$_kl_bead" '. + [$b]' 2>/dev/null) && _kl_held="$_kl_next" || warn "ga-do1ixn.3: faixa Kimi: não consegui listar $_kl_id para o carimbo — ela segue fora das pistas, sem despachar"
           fi ;;
         *)
           # sem-texto = a bead não tem o que triar (espera de propósito); ilegivel (ou palavra que a triagem não devolve) = NÃO CONSEGUI LER: é falha, soma em NONQUEUE_FAILS e o Step 5 segue vendo
           [ "$_kl_verdict" = sem-texto ] || _kl_unread=$((_kl_unread + 1))
+          # a nota segue a conta acima: sem-texto fica kimi_lane_wait (a de cima); o que não li vira kimi_lane_failed (failed_other)
+          [ "$_kl_verdict" = sem-texto ] || _pilot_sweep_note "$_kl_id" 1 kimi_lane_failed
           _kl_held_n=$((_kl_held_n + 1)); log "  faixa Kimi: $_kl_id espera — triagem '$_kl_verdict' (título ou descrição vazios, ou um campo ou comentário que não leio): não vai ao Kimi sem eu ler o texto"
           _kl_next=$(printf '%s' "$_kl_held" | jq -c --argjson b "$_kl_bead" '. + [$b]' 2>/dev/null) && _kl_held="$_kl_next" || warn "ga-do1ixn.3: faixa Kimi: não consegui listar $_kl_id para o carimbo — ela segue fora das pistas, sem despachar" ;;
       esac
@@ -12652,7 +12660,7 @@ _pilot_kimi_lane_pass() {
     }
     for _kl_id in $_kl_ids; do
       if timeout 15 bd -C "$GC_CITY" update "$_kl_id" --set-metadata "gc.routed_to=$PILOT_KIMI_ROUTE" -q >/dev/null 2>&1; then _kl_stamped=$((_kl_stamped + 1))
-      else _kl_stampfail=$((_kl_stampfail + 1)); warn "ga-do1ixn.3: não consegui carimbar gc.routed_to=$PILOT_KIMI_ROUTE em $_kl_id — a pista normal não a pega (saiu da lista), mas uma rota de pool posta por fora seguiria valendo"; fi
+      else _kl_stampfail=$((_kl_stampfail + 1)); _pilot_sweep_note "$_kl_id" 1 kimi_lane_failed; warn "ga-do1ixn.3: não consegui carimbar gc.routed_to=$PILOT_KIMI_ROUTE em $_kl_id — a pista normal não a pega (saiu da lista), mas uma rota de pool posta por fora seguiria valendo"; fi
     done
   fi
   _kl_closed=$(_pilot_kimi_lane_closed)
@@ -16676,6 +16684,17 @@ DISPATCH_RESULT=""   # ga-ov3gow: global on purpose — set by dispatch_one(), r
 #                       — and kimi_lane_failed — the session list could not be read, or the assignment, the session or the
 #                       notice failed (the node did not take the bead; the undo ran). Gate round 2: kimi_lane_wait used
 #                       to cover those too.)
+#                       ga-k5gl8hd: EVERY lane:kimi bead the Kimi pass pulls out of the lanes is a candidate of the sweep, also the
+#                       ones that never reach dispatch_one() — the pass notes each one as kimi_lane_wait as soon as it reads its id
+#                       (lane closed, triage hold on a bead without text, another rig, attempts spent, DRY_RUN, a bead left behind
+#                       the one that was sent), and the notes of dispatch_one() and of the cases below overwrite it (the last note
+#                       wins). Without it a sweep with N beads waiting in the lane showed candidates=0. Two names that are
+#                       NOT dispatch_one() results, only notes of the pass: kimi_lane_demoted (the triage vetoed the bead and the
+#                       pass took lane:kimi off it — it went back to the dogs and no longer waits in the Kimi lane: refused_by_guard,
+#                       in its own key) and kimi_lane_failed again, for what the pass itself could not do to a bead (the demotion
+#                       did not write, the triage could not read the bead, the stamp of the wait route did not write): failed_other,
+#                       in step with NONQUEUE_FAILS. A pass-wide fault that has no bead (the list of beads to stamp unreadable) is
+#                       only in NONQUEUE_FAILS and in the log.
 #   failed_other        any other NAMED failure (assign / sling / in-flight / rig_native_pool_count_unreadable —
 #                       the session count could not be read, so the spawn was NOT attempted, ga-oa004t — and
 #                       remerge_branch_lookup_unknown, ga-x7m5rg: the gate:needs-remerge branch lookup could
@@ -16745,7 +16764,7 @@ _pilot_sweep_emit() {
       elif $o.r == "rig_native_global_session_cap_queued" then "queued_global_cap"
       elif $o.r == "rig_native_spawn_failed" then "spawn_failed"
       elif $o.r == "priority_yield" then "yielded_priority"
-      elif ["pool_ownership_refuse", "rig_native_dog_store_blind", "rig_native_dog_store_migrated", "rig_native_pool_store_blind", "rig_native_pool_store_migrated", "hq_pool_store_blind", "rig_native_pool_target_only", "rig_dedup_skip", "rig_native_spawn_deferred_slow", "disk_floor_node_only", "wa_node_pass_released", "kimi_lane_released", "kimi_lane_wait"]
+      elif ["pool_ownership_refuse", "rig_native_dog_store_blind", "rig_native_dog_store_migrated", "rig_native_pool_store_blind", "rig_native_pool_store_migrated", "hq_pool_store_blind", "rig_native_pool_target_only", "rig_dedup_skip", "rig_native_spawn_deferred_slow", "disk_floor_node_only", "wa_node_pass_released", "kimi_lane_released", "kimi_lane_wait", "kimi_lane_demoted"]
            | any(.[]; . == $o.r) then "refused_by_guard"
       elif $o.r == "" then "unclassified"
       else "failed_other" end;

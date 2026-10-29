@@ -392,6 +392,25 @@ for _nm in rig_native_pool_session_cap_queued rig_native_global_session_cap_queu
 done
 [ -z "${_b4_bad:-}" ] && ok "B4: every explicitly classified result name still exists in dispatch_one (and vice-versa)"
 
+# B4b — ga-k5gl8hd: the Kimi pass also notes names ITSELF (_pilot_sweep_note "$_kl_id" <rc> <name>) for the lane:kimi beads that never reach dispatch_one() — they are not DISPATCH_RESULT assignments,
+# so the loops above never see them. A benign one (waiting in the lane, demoted back to the dogs) must be classified in the emitter's refused_by_guard list, or it reads as a Pilot fault; the fault
+# one (kimi_lane_failed: the demotion, the triage read or the stamp did not happen) must NOT be there, because failed_other is the only place a real fault stays visible. A new kimi_lane_* name
+# the pass notes fails here until it is placed on one side or the other.
+_kl_noted="$(grep -oE '_pilot_sweep_note "\$_kl_id" [0-9]+ kimi_lane_[a-z_0-9]+' "$DISPATCHER" | sed 's/.* //' | sort -u | tr '\n' ' ')"
+_b4b_bad=""
+for _nm in kimi_lane_wait kimi_lane_demoted kimi_lane_failed; do
+  case " $_kl_noted " in *" $_nm "*) : ;; *) _b4b_bad="$_b4b_bad $_nm(not noted by the Kimi pass any more)" ;; esac
+done
+for _nm in $_kl_noted; do
+  case "$_nm" in
+    kimi_lane_wait|kimi_lane_demoted) grep -q "\"$_nm\"" <<< "$EMIT_FN" || _b4b_bad="$_b4b_bad $_nm(benign, but not in refused_by_guard)" ;;
+    kimi_lane_failed) ! grep -q "$_nm" <<< "$EMIT_FN" || _b4b_bad="$_b4b_bad $_nm(a fault, but classified as a guard)" ;;
+    *) _b4b_bad="$_b4b_bad $_nm(new name: place it in refused_by_guard if benign, leave it out if it is a fault, then list it here)" ;;
+  esac
+done
+[ -z "$_b4b_bad" ] && ok "B4b: every name the Kimi pass notes itself is placed right (wait/demoted → refused_by_guard, failed → failed_other)" \
+                   || bad "B4b: Kimi pass note name(s) misplaced:$_b4b_bad"
+
 echo ""
 echo "pilot-dispatcher.sweep-event.selftest: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] && { echo "SELFTEST PASS"; exit 0; }

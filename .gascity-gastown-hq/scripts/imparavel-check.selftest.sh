@@ -116,6 +116,38 @@ eq("un-parked bead NOT in the gate set → stuck", C("other", ["ctx:ready"], IN_
 print("── flowing ──")
 eq("story:in-flight → flowing", C("b", ["ctx:ready", "story:in-flight"], NONE)[0], "flowing")
 
+print("── ga-k5gl8hd: lane:kimi — a bead the Kimi pass owns is PARKED (reason kimi-lane), never "
+      "'stuck'; pilot-dispatchable.json is written BEFORE that pass, so it is in the snapshot ──")
+# The lane being open or closed is invisible to the classifier on purpose (it only sees labels), so
+# one label set stands for both: a waiting lane:kimi bead is parked either way.
+eq("lane:kimi waiting → ('parked', 'kimi-lane')",
+   C("b", ["ctx:ready", "exec:auto", "lane:kimi"], NONE), ("parked", "kimi-lane"))
+eq("lane:kimi + story:approved → parked kimi-lane",
+   C("b", ["ctx:ready", "story:approved", "lane:kimi"], NONE), ("parked", "kimi-lane"))
+eq("lane:kimi + gate:needs-fix (bounced) → parked kimi-lane (the normal loop never sees it either)",
+   C("b", ["ctx:ready", "gate:needs-fix", "lane:kimi"], NONE), ("parked", "kimi-lane"))
+# pilot:held-until:* is itself a parking label (prefix rule), so it wins with reason 'label' — what
+# matters here is that a lane:kimi bead with holds, even past HELD_LOOP_MAX, is never 'stuck'.
+eq("lane:kimi + pilot:held-until:<epoch> → parked (not stuck)",
+   C("b", ["ctx:ready", "lane:kimi", "pilot:held-until:99999999999"], NONE)[0], "parked")
+eq("lane:kimi + 6 held-until marks → parked, NOT a held-loop stuck",
+   C("b", ["lane:kimi"] + ["pilot:held-until:%d" % (1000 + i) for i in range(6)], NONE)[0], "parked")
+eq("lane:kimi + story:in-flight → flowing (the Kimi worker is building it: keeps the delivery-stall age check)",
+   C("b", ["ctx:ready", "lane:kimi", "story:in-flight"], NONE)[0], "flowing")
+eq("lane:kimi + an OPEN gate marker → parked in-gate (the gate marker still outranks, same bucket count as before)",
+   C("wa-8y45", ["ctx:ready", "lane:kimi"], IN_GATE), ("parked", "in-gate"))
+eq("lane:kimi + needs-human → parked label (a parking label still wins and keeps its own reason)",
+   C("b", ["ctx:ready", "lane:kimi", "story:needs-human"], NONE)[0:1], ("parked",))
+eq("CONTROL: the same bead WITHOUT lane:kimi stays stuck",
+   C("b", ["ctx:ready", "exec:auto"], NONE)[0], "stuck")
+eq("CONTROL: lane:small / lane:big stay stuck (only the Kimi lane is owned by another pass)",
+   (C("b", ["ctx:ready", "lane:small"], NONE)[0], C("b", ["ctx:ready", "lane:big"], NONE)[0]),
+   ("stuck", "stuck"))
+eq("CONTROL: lane:kimi-not is NOT the Kimi lane (exact match, like the dispatcher's index(\"lane:kimi\")) → stuck",
+   C("b", ["ctx:ready", "lane:kimi-not"], NONE)[0], "stuck")
+eq("CONTROL: a label that merely CONTAINS lane:kimi (x-lane:kimi) is not the Kimi lane → stuck",
+   C("b", ["ctx:ready", "x-lane:kimi"], NONE)[0], "stuck")
+
 print("── ga-26us5: classify_in_flight() — a story:in-flight LABEL alone is not proof of "
       "progress; only real recent updated_at is (AC1/AC3) ──")
 CIF = m.classify_in_flight
@@ -328,6 +360,71 @@ eq("in_gate_count == 1", _a["in_gate_count"], 1)
 eq("stuck list == [wa-STUCK] (in-gate NOT flagged, genuine IS)",
    [s["id"] for s in _a["stuck"]], ["wa-STUCK"])
 eq("from_dispatchable path used (not fallback)", _a["from_dispatchable"], True)
+
+print("── ga-k5gl8hd end-to-end: ONE lane:kimi bead waiting in the snapshot is parked, not stuck ──")
+# The Mayor's pre-flight before the first .gc/kimi-lane.on: this is the exact shape (one lane:kimi
+# bead + one plain buildable bead in the queue). The Kimi bead must land in kimi_lane_count and
+# parked_count; ONLY the plain bead may reach `stuck`.
+snap_k = {"generated_at": "2999-01-01T00:00:00Z", "ttl_seconds": 600, "count": 2,
+          "items": [
+              {"id": "wa-KIMI",  "store": "whatsapp_automation", "title": "waits for the Kimi lane"},
+              {"id": "wa-PLAIN", "store": "whatsapp_automation", "title": "buildable, never built"}]}
+_fd_k, _p_k = tempfile.mkstemp(suffix=".json"); os.write(_fd_k, json.dumps(snap_k).encode()); os.close(_fd_k)
+_k_orig = (m.DISPATCHABLE_JSON, m._age_min, m._gate_source_beads, m._bd_show_labels_text)
+m.DISPATCHABLE_JSON = _p_k
+m._age_min = lambda iso: 1.0
+m._gate_source_beads = lambda: set()
+_K_LIVE = {"wa-KIMI":  ["ctx:ready", "exec:auto", "lane:kimi"],
+           "wa-PLAIN": ["ctx:ready", "exec:auto"]}
+m._bd_show_labels_text = lambda root, bid: _K_LIVE.get(bid)
+_ak = m.check_approved()
+os.unlink(_p_k)
+eq("stuck == [wa-PLAIN] only (the lane:kimi bead is NOT flagged)", [s["id"] for s in _ak["stuck"]], ["wa-PLAIN"])
+eq("kimi_lane_count == 1", _ak["kimi_lane_count"], 1)
+eq("parked_count == 1 (the Kimi bead is parked)", _ak["parked_count"], 1)
+eq("buildable_count == 1 (the Kimi bead is not 'genuinely buildable')", _ak["buildable_count"], 1)
+eq("in_gate_count == 0 (a Kimi bead is not mistaken for an in-gate one)", _ak["in_gate_count"], 0)
+
+# Only a Kimi bead in the queue: nothing stuck at all, so the verdict can be ✅ (the false ❌ is gone).
+snap_k1 = {"generated_at": "2999-01-01T00:00:00Z", "ttl_seconds": 600, "count": 1,
+           "items": [{"id": "wa-KIMI", "store": "whatsapp_automation", "title": "waits for the Kimi lane"}]}
+_fd_k1, _p_k1 = tempfile.mkstemp(suffix=".json"); os.write(_fd_k1, json.dumps(snap_k1).encode()); os.close(_fd_k1)
+m.DISPATCHABLE_JSON = _p_k1
+_ak1 = m.check_approved()
+os.unlink(_p_k1)
+eq("ONE lane:kimi bead alone → stuck == []", _ak1["stuck"], [])
+eq("ONE lane:kimi bead alone → parked_count == 1 and buildable_count == 0",
+   (_ak1["parked_count"], _ak1["buildable_count"]), (1, 0))
+
+# The same bead WITHOUT the label is the control: it IS a stuck bead.
+_K_LIVE["wa-KIMI"] = ["ctx:ready", "exec:auto"]
+_fd_k2, _p_k2 = tempfile.mkstemp(suffix=".json"); os.write(_fd_k2, json.dumps(snap_k1).encode()); os.close(_fd_k2)
+m.DISPATCHABLE_JSON = _p_k2
+_ak2 = m.check_approved()
+os.unlink(_p_k2)
+eq("CONTROL: the same single bead without lane:kimi → stuck == [wa-KIMI]",
+   [s["id"] for s in _ak2["stuck"]], ["wa-KIMI"])
+eq("CONTROL: ...and kimi_lane_count == 0", _ak2["kimi_lane_count"], 0)
+m.DISPATCHABLE_JSON, m._age_min, m._gate_source_beads, m._bd_show_labels_text = _k_orig
+
+print("── ga-k5gl8hd fallback (snapshot unavailable → story:approved): a waiting lane:kimi bead "
+      "does not age into stuck either ──")
+_fb_orig = (m._bd_json, m._age_min, m._gate_source_beads, m.RIGS)
+m.RIGS = [("wa", "/x")]
+m._gate_source_beads = lambda: set()
+m._age_min = lambda iso: 9999.0                       # old enough that a plain bead IS stuck
+m._bd_json = lambda root, label, status="open", include_infra=False: ([
+    {"id": "wa-KIMI",  "title": "k", "labels": ["story:approved", "lane:kimi"], "updated_at": "2020-01-01T00:00:00Z"},
+    {"id": "wa-PLAIN", "title": "p", "labels": ["story:approved"],              "updated_at": "2020-01-01T00:00:00Z"},
+    {"id": "wa-NOT",   "title": "n", "labels": ["story:approved", "lane:kimi-not"], "updated_at": "2020-01-01T00:00:00Z"},
+], True)
+_af = m._check_approved_fallback([])
+eq("fallback: stuck == [wa-PLAIN, wa-NOT] (the lane:kimi bead is NOT; lane:kimi-not IS)",
+   [s["id"] for s in _af["stuck"]], ["wa-PLAIN", "wa-NOT"])
+eq("fallback: kimi_lane_count == 1 and _ok_reasons['kimi-lane'] == 1",
+   (_af["kimi_lane_count"], _af["_ok_reasons"]["kimi-lane"]), (1, 1))
+eq("fallback: the Kimi bead is counted in parked_count", _af["parked_count"], 1)
+m._bd_json, m._age_min, m._gate_source_beads, m.RIGS = _fb_orig
 
 print("── ga-lwi4b regression: check_gate()'s stalled_by_age must respect reviewer_alive ──")
 # batista's measured incident (04:17): a queued marker sat 475min (> GATE_STALL_MIN=165)
@@ -1475,6 +1572,38 @@ eq("report does NOT claim 'bd show falhou' for these (that would misattribute th
 
 m.check_approved, m.check_gate, m.check_pilot, m.check_dolt, m.RIGS = _nr_ca, _nr_cg, _nr_cp, _nr_cd, _nr_rigs
 m._read_pilot_log_tail = _nr_read_tail
+
+print("── ga-k5gl8hd: main() end-to-end — a queue holding only a waiting lane:kimi bead is ✅, "
+      "and the report says why ──")
+_km_ca, _km_cg, _km_cp, _km_cd, _km_rigs = m.check_approved, m.check_gate, m.check_pilot, m.check_dolt, m.RIGS
+_km_read_tail = m._read_pilot_log_tail
+m.check_approved = lambda: {
+    "total": 1, "parked_count": 1, "in_gate_count": 0, "kimi_lane_count": 1, "buildable_count": 0,
+    "flowing_count": 0, "held_count": 0, "stuck": [],
+    "read_err": [], "no_route": [], "warns": [],
+    "from_dispatchable": True, "snap_age_min": 1.0,
+}
+m.check_gate = lambda: {"active": [], "parked": [], "last_pass_min": 1.0,
+                         "reviewer_alive": True, "oldest_active_min": None,
+                         "stalled": False, "stall_reason": ""}
+m.check_pilot = lambda: {"alive": True, "last_sweep_min": 0.5}
+m.check_dolt = lambda: {"responsive": True, "latency_ms": 10}
+m.RIGS = []
+m._read_pilot_log_tail = lambda: None
+_bufKM = io.StringIO()
+_exitKM = None
+try:
+    with contextlib.redirect_stdout(_bufKM):
+        m.main()
+except SystemExit as e:
+    _exitKM = e.code
+_outKM = _bufKM.getvalue()
+eq("only a waiting lane:kimi bead in the queue → exit 0 (✅), not ❌", _exitKM, 0)
+eq("report prints the Kimi-lane count (esperando na faixa Kimi: 1)",
+   "esperando na faixa Kimi: 1" in _outKM, True)
+eq("report does not list it among CONSTRUÍVEIS MAS PARADAS", "CONSTRUÍVEIS MAS PARADAS" in _outKM, False)
+m.check_approved, m.check_gate, m.check_pilot, m.check_dolt, m.RIGS = _km_ca, _km_cg, _km_cp, _km_cd, _km_rigs
+m._read_pilot_log_tail = _km_read_tail
 
 print()
 print("RESULT: %d passed, %d failed" % (PASS, FAIL))
