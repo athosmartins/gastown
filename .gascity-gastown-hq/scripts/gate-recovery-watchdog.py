@@ -617,6 +617,20 @@ STUCK_RUN_ID_RE = re.compile(r"gate-run (\S+) \(branch=")
 STUCK_BRANCH_RE = re.compile(r"gate-run \S+ \(branch=([^)\s]+)\)")
 
 
+# ga-yg3e22c: the templates whose ACTIVE session proves a reviewer is working. Since 29/10 the gate
+# serves some runs from the remote node (template gate-reviewer-remote, flag gate-remote-reviewers.on);
+# counting only "gate-reviewer" made every remote-served run past DISPATCH_STUCK_SEC look abandoned
+# (measured 29/10 02:27: false "marcador dispatching travado" with the remote reviewer alive at 787s/2160s).
+# NOT used by reap_frozen_reviewers(): that one measures the silence of a LOCAL tmux pane, which a remote
+# reviewer does not have, so leaving the remote out there is the inert side.
+ACTIVE_REVIEWER_TEMPLATES = ("gate-reviewer", "gate-reviewer-remote")
+
+
+def _active_reviewer_sessions(sessions):
+    """Sessions that show a reviewer alive for the in-flight run: state=active on a local OR remote reviewer template."""
+    return [s for s in sessions if s.get("template") in ACTIVE_REVIEWER_TEMPLATES and s.get("state") == "active"]
+
+
 def stuck_dispatching():
     """Bool view of stuck_dispatching_detail() — kept for every caller/selftest that only needs the verdict."""
     return stuck_dispatching_detail()[0]
@@ -628,7 +642,7 @@ def stuck_dispatching_detail():
     True only if the dispatcher is ACTIVELY polling a run that is stuck: the most
     recent dispatcher-log line is a Phase C 'still in flight (0/N verdicts, Ys/Ts)' with
     Y past DISPATCH_STUCK_SEC, the log is fresh (dispatcher still polling, not moved on /
-    between runs), no gate-reviewer session is active, AND the run has no DELIVERED
+    between runs), no gate-reviewer session (local or remote, ga-yg3e22c) is active, AND the run has no DELIVERED
     verdict recorded yet either. Keying on the LIVE poll (not a marker label) means a
     stranded 'gate-status:dispatching' marker — e.g. left by a killed dispatcher during
     maintenance — does NOT false-fire. A slow-but-working run (reviewers still active) is
@@ -687,7 +701,7 @@ def stuck_dispatching_detail():
         sessions = json.loads(rs.stdout).get("sessions", []) if rs else []
     except Exception:
         return (False, None, None)
-    active = [s for s in sessions if s.get("template") == "gate-reviewer" and s.get("state") == "active"]
+    active = _active_reviewer_sessions(sessions)    # ga-yg3e22c: local AND remote reviewer templates
     if active:
         return (False, None, None)
     # corroborate #2 (ga-rzd08j): a reviewer already DELIVERED (closed verdict bead) for
