@@ -905,6 +905,9 @@ PYEOF
   b 2 "budget: ...e um \$( ) depois da aninhada (o diretório que ele vê é o \"não sei\", não o do cd de g)" "f() { :; function g { cd $OWN; }; echo \$(git commit -m x); }; cd $OTH; f"
   b 2 "budget: ...e a variável: export GIT_DIR=<próprio> dentro da aninhada não vale (GIT_DIR=<alheio> de fora)" "f() { function g { export GIT_DIR=$OWN/.git; }; }; export GIT_DIR=$OTH/.git; f; git commit -m x"
   b 0 "budget: controle — um grupo { cd <próprio>; } no começo do corpo de f RODA: o git seguinte escreve no próprio" "f() { { cd $OWN; }; git commit -m x; }; cd $OTH; f"
+  b 2 "budget: ...a definição que pode não ter rodado (true || function f { cd <próprio>; }): o cd de f não vale" "cd $OTH; true || function f { cd $OWN; }; f; git commit -m x"
+  b 2 "budget: ...a região perdida sobrevive a uma chamada feita dentro dela (depois do h, o cd ainda é o do corpo que não roda)" "f() { :; function g { :; h; cd $OWN; }; git commit -m x; }; h() { :; }; cd $OTH; f"
+  b 2 "budget: a cabeça g() de um f aberto não deixa bandeira velha: o grupo { } de fora não é engolido como corpo de g" "g() { k() { cd $OTH; }; k; g() { :; }; }; g; { git commit -m x; }"
   b 0 "budget: controle — f() { { cd <próprio>; }; :; }; cd <alheio>; f; git commit — o grupo do começo do corpo RODA, o cd vale" "f() { { cd $OWN; }; :; }; cd $OTH; f; git commit -m x"
   b 0 "budget: controle — com uma bandeira de definição velha (foo(); no meio), o grupo { } do corpo de f NÃO reabre a definição: o cd e o git do próprio seguem certos" "f() { :; { :; }; }; foo(); f; cd $OWN && git commit -m x"
   b 2 "budget: f cuja chave não fecha (aspa tardia) com function g { } e um git no alheio: o corpo reexecutado no fim é CONFERIDO, não engolido por g" "f() { :; echo '{'; function g { :; }; git -C $OTH commit -m x; }; f"
@@ -1085,7 +1088,10 @@ echo "== $((n-fails))/$n ok =="
   mutant budget "NOME() { aninhada num corpo reexecutado não marca a região como perdida" 's/(seg\[:1\] == \["function"\] or seg\[:1\] == \["{"\] and prev == ")")/(seg[:1] == ["function"])/'
   mutant budget "na região perdida o cd volta a valer" 's/if st.get("lost") or kw or wrapped or ext or/if kw or wrapped or ext or/'
   mutant budget "na região perdida a atribuição de variável volta a valer" 's/unsure = bool(st.get("lost")) or kw/unsure = kw/'
-  mutant budget "o corpo que começa por um grupo { } parece uma definição aninhada" 's/append((seg\[1:\], ";", term))/append((seg[1:], prev, term))/'
+  mutant budget "uma chamada feita dentro da região perdida a encerra para o resto do corpo de fora" 's/^                st\["lost"\] = saved$/                st.pop("lost", None)/'
+  mutant budget "function f { depois de || ou && vale como definição que sempre rodou" 's/";" if prev == ")" else prev/";"/'
+  mutant budget "a cabeça g() dentro de uma definição aberta deixa a bandeira velha (engole o próximo grupo { })" 's/ and not st.get("fdepth"):  # not fdepth/:  # not fdepth/'
+  mutant budget "o corpo que começa por um grupo { } parece uma definição aninhada" 's/";" if prev == ")" else prev/prev/'
   echo "-- contra um stub que só sai 0 (o servidor ANTES desta fatia)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"; printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$T/stub.py"
   r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,shell,wrap,lex,dest,cfg,tools,msg,check,cond" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"
