@@ -1321,7 +1321,7 @@ echo "== $((n-fails))/$n ok =="
   mutant budget "NOME() { aninhada num corpo reexecutado não marca a região como perdida" 's/if seg\[:1\] == \["function"\] or seg\[:1\] == \["{"\] and (prev == ")" or st.get("nhead")):/if seg[:1] == ["function"]:/'
   mutant budget "na região perdida o cd volta a valer" 's/if st.get("lost") or kw or wrapped or ext or/if kw or wrapped or ext or/'
   mutant budget "na região perdida a atribuição de variável volta a valer" 's/norun = bool(st.get("lost")) or kw/norun = kw/'
-  mutant budget "uma chamada feita dentro da região perdida a encerra para o resto do corpo de fora" 's/^            st\["lost"\] = saved$/            st.pop("lost", None)/'
+  mutant budget "uma chamada feita dentro da região perdida a encerra para o resto do corpo de fora" 's/^            st\["lost"\], st\["maybe"\] = saved, was$/            st.pop("lost", None); st["maybe"] = was/'
   mutant budget "function f { depois de || ou && vale como definição que sempre rodou" 's/";" if prev == ")" else prev/";"/'
   mutant budget "a aninhada não passa a existir quando f roda (a chamada dela de fora não é conferida)" 's/^                        st\["funcs"\]\.setdefault(nm, \[\])\.extend(rest)$/                        pass/'
   mutant budget "a cabeça g() aninhada não dá o nome à função (só a forma function g { dá)" 's/^                st\["nhead"\] = seg\[0\] .*/                pass/'
