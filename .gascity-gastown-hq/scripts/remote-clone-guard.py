@@ -526,6 +526,8 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
         if seg and seg[0] in ("fi", "done", "esac", "else", "elif") and st.pop("cdblk", False):
             st["cwd"] = None
         blk = bool(seg) and seg[0] in ("if", "then", "else", "elif", "do", "while", "until")
+        if seg and seg[0] != "{":
+            st.pop("func", None)  # a cabeça `f (` que não foi seguida de `{` não era uma definição: a bandeira não pode ficar velha para o próximo `{` do texto
         if st.get("fdepth"):  # dentro de `f() { … }`: o corpo NÃO roda agora — guardo os trechos e confiro na CHAMADA, no cwd de lá (um git ali roda onde `f` for chamada)
             st["fdepth"] += seg.count("{") - seg.count("}")
             if seg != ["}"]:
