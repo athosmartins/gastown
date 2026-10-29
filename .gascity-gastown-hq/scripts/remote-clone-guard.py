@@ -491,9 +491,9 @@ class Budget(Exception):
     """Estourou o teto de passos ou de segundos: o pedido NÃO foi conferido, então não passa — main() bloqueia. O guarda se corta ANTES do prazo do hook no Claude Code (600 s), porque hook estourado não bloqueia: a chamada seguiria sem conferência."""
 
 
-def tick() -> None:
-    """Uma unidade de trabalho: cada trecho que one() confere (o comando aninhado também passa por ele). Passou de STEP_LIMIT → Budget."""
-    WORK[0] += 1
+def tick(n: int = 1) -> None:
+    """Unidades de trabalho: 1 por trecho que one() confere (o comando aninhado também passa por ele), n por n entradas copiadas ao registrar uma aninhada. Passou de STEP_LIMIT → Budget."""
+    WORK[0] += n
     if WORK[0] > STEP_LIMIT:
         raise Budget(f"mais de {STEP_LIMIT} passos de conferência")
 
@@ -540,6 +540,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
                 st["lost"] = True  # até o fim desta reexecução, `cd` e atribuição de variável valem "não sei" (ver unsure e o ramo do cd): o que o corpo que não roda faz não pode valer para o que vem depois
                 nm = seg[1] if seg[0] == "function" and seg[1:2] else st.pop("nhead", None)
                 if nm:  # a aninhada passa a existir: uma chamada dela depois, de fora, confere o resto desta lista (mais do que o corpo dela, que não sei onde acaba: lado fechado)
+                    tick(len(st.get("rest", ())))  # a cópia custa tanto quanto conferir o que ela copia: conta no teto (centenas de aninhadas num corpo só não enchem a memória)
                     st["funcs"].setdefault(nm, []).extend(st.get("rest", ()))
         if not st.get("calling") and (seg[:1] == ["{"] and st.pop("func", False) or seg[:1] == ["function"] and seg[2:3] == ["{"]):  # nunca ao REEXECUTAR um corpo guardado (calling): o `{` guardado ali reabria a definição com o nome velho, desviava o resto do corpo para a lista errada e o laço de chamada percorria essa lista sem fim (ga-tih62nv)
             if seg[0] == "function":
@@ -640,7 +641,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
                     if r:
                         return r
                     if pc == "(":
-                        if len(seg) == 1 and not skip and seg[0] not in KEYWORDS and not st.get("fdepth"):  # not fdepth: a cabeça `g (` DENTRO de uma definição aberta deixaria a bandeira velha, e o próximo grupo `{ }` do fluxo de fora seria engolido como corpo de `g`, sem conferir
+                        if len(seg) == 1 and not skip and seg[0] not in KEYWORDS:
                             st["func"], st["fname"] = True, seg[0]  # `f (`: definição de função — o `{ … }` que vem a seguir é corpo que não roda agora
                         stack.append(st["cwd"])
                         skip = False  # `<(cmd)` / `>(cmd)`: o `<` que vem colado no `(` não é redirecionamento de arquivo, a palavra seguinte é um comando

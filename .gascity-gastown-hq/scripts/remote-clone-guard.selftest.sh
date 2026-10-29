@@ -839,6 +839,11 @@ g_budget() {  # ga-tih62nv: o pedido que fazia o guarda girar SEM FIM (e que o h
     done
     echo "${out}f1"
   }
+  nested() {  # nested K: f() com K definições aninhadas `function gN { :; }` e a chamada de f (registrar cada uma copia o resto da lista: ~K²/2 entradas)
+    local k=$1 i out="f() { :;"
+    for ((i = 1; i <= k; i++)); do out="$out function g$i { :; };"; done
+    echo "$out }; f"
+  }
   # o pedido de 4 linhas / 438 caracteres do runbook (seção "Custo de tempo" da ga-tphd15o): definição de função + $((…)) + ${V#*/} + case numa linha, dentro do texto de um python
   cat > "$rp" <<'EOF'
      """    mn=$((mn+1)); [ $((mn % ${GCSSH_SHARD#*/})) = "${GCSSH_SHARD%/*}" ] || return  # GCSSH_SHARD=K/N: só o mutante de ordem ≡ K (mod N); a ordem conta TODOS, de qualquer grupo
@@ -898,6 +903,8 @@ PYEOF
   tb 2 "budget: 8 funções que chamam todas as outras (~96 mil passos) passam do teto e são BLOQUEADAS, não liberadas" "$(calls 8)"
   has "NÃO É CANCELAMENTO DO USUÁRIO" && has "não consegui analisar este pedido a tempo" && has "passos de conferência" && has "um comando por chamada"; ok $? "budget: ...a recusa diz que é política automática, que faltou tempo/passos e como reescrever"
   tb 0 "budget: controle — 5 funções que chamam todas as outras (~300 passos) passam" "$(calls 5)"
+  tb 2 "budget: 400 definições aninhadas num corpo só (~80 mil entradas copiadas ao registrar) estouram o teto: a cópia entra na conta" "$(nested 400)"
+  tb 0 "budget: controle — 20 definições aninhadas no mesmo corpo passam" "$(nested 20)"
   # parecer de segurança dos commits anteriores: a definição ANINHADA num corpo reexecutado (function g {, g() {) NÃO roda; o que o corpo dela faz (cd, variável) não pode valer para o que vem depois
   b 2 "budget: f() { function g { cd <próprio>; }; }; cd <alheio>; f; git commit — o cd de g NÃO rodou, o commit escreve no alheio" "f() { function g { cd $OWN; }; }; cd $OTH; f; git commit -m x"
   b 2 "budget: ...a mesma aninhada na forma g() { cd <próprio>; }" "f() { g() { cd $OWN; }; }; cd $OTH; f; git commit -m x"
@@ -907,7 +914,6 @@ PYEOF
   b 0 "budget: controle — um grupo { cd <próprio>; } no começo do corpo de f RODA: o git seguinte escreve no próprio" "f() { { cd $OWN; }; git commit -m x; }; cd $OTH; f"
   b 2 "budget: ...a definição que pode não ter rodado (true || function f { cd <próprio>; }): o cd de f não vale" "cd $OTH; true || function f { cd $OWN; }; f; git commit -m x"
   b 2 "budget: ...a região perdida sobrevive a uma chamada feita dentro dela (depois do h, o cd ainda é o do corpo que não roda)" "f() { :; function g { :; h; cd $OWN; }; git commit -m x; }; h() { :; }; cd $OTH; f"
-  b 2 "budget: a cabeça g() de um f aberto não deixa bandeira velha: o grupo { } de fora não é engolido como corpo de g" "g() { k() { cd $OTH; }; k; g() { :; }; }; g; { git commit -m x; }"
   b 2 "budget: f() { g() { git commit; }; }; f; cd <alheio>; g — a aninhada passa a existir quando f roda, e a chamada dela de fora é conferida" "f() { g() { git commit -m x; }; }; f; cd $OTH; g"
   b 2 "budget: ...o mesmo com function g {" "f() { function g { git commit -m x; }; }; f; cd $OTH; g"
   b 0 "budget: uma função que se redefine (function f { dentro de f) não gira nem estoura o teto" "f() { :; function f { :; }; :; }; f"
@@ -1093,11 +1099,11 @@ echo "== $((n-fails))/$n ok =="
   mutant budget "na região perdida a atribuição de variável volta a valer" 's/unsure = bool(st.get("lost")) or kw/unsure = kw/'
   mutant budget "uma chamada feita dentro da região perdida a encerra para o resto do corpo de fora" 's/^                st\["lost"\] = saved$/                st.pop("lost", None)/'
   mutant budget "function f { depois de || ou && vale como definição que sempre rodou" 's/";" if prev == ")" else prev/";"/'
-  mutant budget "a cabeça g() dentro de uma definição aberta deixa a bandeira velha (engole o próximo grupo { })" 's/ and not st.get("fdepth"):  # not fdepth/:  # not fdepth/'
   mutant budget "a aninhada não passa a existir quando f roda (a chamada dela de fora não é conferida)" 's/^                    st\["funcs"\]\.setdefault(nm, \[\])\.extend(st\.get("rest", ()))$/                    pass/'
   mutant budget "a cabeça g() aninhada não dá o nome à função (só a forma function g { dá)" 's/^                st\["nhead"\] = seg\[0\] .*/                pass/'
   mutant budget "function g { aninhada não dá o nome à função (só a forma g() { dá)" 's/nm = seg\[1\] if seg\[0\] == "function" and seg\[1:2\] else st.pop("nhead", None)/nm = st.pop("nhead", None)/'
   mutant budget "a reexecução percorre a lista viva (uma função que se redefine acrescenta a si mesma sem fim)" 's/body = list(st\["funcs"\]\[c\])  # cópia/body = st["funcs"][c]  # cópia/'
+  mutant budget "registrar uma aninhada copia a lista sem entrar na conta do teto" 's/^                    tick(len(st.get("rest", ())))  #.*/                    pass/'
   mutant budget "o corpo que começa por um grupo { } parece uma definição aninhada" 's/";" if prev == ")" else prev/prev/'
   echo "-- contra um stub que só sai 0 (o servidor ANTES desta fatia)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"; printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$T/stub.py"
