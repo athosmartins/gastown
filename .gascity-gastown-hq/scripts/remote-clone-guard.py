@@ -70,10 +70,10 @@ FD = re.compile(r"(^|[\s;&|(])\d+(?=[<>])")  # `2>/dev/null`, `1>&2`: o número 
 SHELLY = re.compile(r"[$`*?\[{]")
 PIECE = re.compile(r"&&|\|\||\|&|;;|[;&|()]|[<>]+&?")
 SUBST = re.compile(r"\$S([0-9a-f]*)\$")
-INTERP = re.compile(r"(?:python|pypy|perl|ruby)[\d.]*|node(?:js)?|[gmn]?awk")  # interpretador cujo código (python -c, node -e, perl -e, programa do awk) pode rodar um shell: o texto entre aspas dele é conferido como comando
-LIT = re.compile(r"'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\"|(?:\bq[qx]?|%x)\s*(?:\{([^}]*)\}|\(([^)]*)\)|\[([^\]]*)\]|/([^/]*)/)", re.S)  # literal do código de um interpretador: entre aspas simples ou duplas, ou q{…}/qq{…}/qx{…}/%x(…) do perl e do ruby (um grupo por forma)
+INTERP = re.compile(r"(?:python|pypy|perl|ruby|php|lua)[\d.]*|node(?:js)?|deno|bun|[gmn]?awk")  # interpretador cujo código (python -c, node -e, perl -e, php -r, lua -e, deno eval, bun -e, programa do awk) pode rodar um shell: o texto entre aspas dele é conferido como comando
+LIT = re.compile(r"'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\"|(?:\bq[qx]?|%x)\s*(?:\{([^}]*)\}|\(([^)]*)\)|\[([^\]]*)\]|([^\w\s{(\[<'\"])((?:(?!\6).)*)\6)", re.S)  # literal do código de um interpretador: entre aspas simples ou duplas, ou q{…}/qq{…}/qx{…}/%x(…) do perl e do ruby, com qualquer delimitador que o perl aceita (q!…!, q#…#, q/…/: um grupo por forma, e o delimitador sozinho é um grupo)
 CODECD = re.compile(r"chdir|\bcwd\b|\bGIT_[A-Z_]+")  # o código muda o diretório ou o repositório do shell que abre (os.chdir, cwd=, {'cwd': …}, GIT_DIR/GIT_WORK_TREE no env): o git de dentro roda em lugar "não sei". Qualquer `cwd` vale, até a chave de um JSON (falso positivo assumido); nome de variável montado em pedaços não vejo
-PIPES, VAR = ("|", "|&"), re.compile(r"\$(\w+)|\$\{(\w+)\}")
+PIPES, VAR, MANY = ("|", "|&"), re.compile(r"\$(\w+)|\$\{(\w+)\}"), 64
 PFMT = re.compile(r"%(?:%|[-+ #0]*\d*(?:\.\d+)?[a-zA-Z])")  # uma conversão do printf (%s, %b, %5d) ou o %% literal
 HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)([^\s'\"<>|&;()]+)\2")  # o delimitador é a palavra INTEIRA (END-OF-FILE, EOF.txt), não só \w+
 PROT = {c: chr(0xF0000 + ord(c)) for c in "();<>|&'"}  # `;<>…` entre aspas ou depois de `\` é TEXTO: antes do shlex (que tira as aspas) vira um caractere de uso privado, e só depois volta (ver protect)
@@ -368,22 +368,23 @@ def words(cmd: str) -> list:
     return [(t.translate(UNPROT), bool(t) and set(t) <= PUNCT) for t in lx]
 
 
-def printed(seg: list, flow, env: dict):
-    """Texto que o comando imprime, ou None = não sei. Só o que dá para ler sem rodar nada: echo/printf com texto literal; cat/tee (repassam), base64 -d e rev sobre o que
-    chegou pelo pipe (flow, None = não sei). O shell que lê o pipe sem -c e o `eval "$(…)"` conferem esse texto como comando."""
-    _, s, _, opq = peel(seg)
-    c, a = (os.path.basename(s[0]), s[1:]) if s and not opq else ("", [])
-    a = reveal(a, env) if c in ("echo", "printf") else a  # `c='…'; echo "$c" | sh`, `echo "$(echo … | base64 -d)" | sh`: variável e $( ) lidos como no eval
+class Many(Exception):
+    """Mais variantes de um eval/pipe (o produto dos textos que cada variável pode ter) do que o guarda confere: decide() BLOQUEIA o pedido, nunca o libera por não ter conferido."""
+
+
+def say(c: str, a: list, flow):
+    """O texto de UMA variante: o que `c a…` imprime (stdin = flow, None = não sei), ou None = não sei."""
     if c == "echo":
         fl = ""
         while a and re.fullmatch(r"-[neE]+", a[0]):
             fl, a = fl + a[0], a[1:]
         return (ANSI.sub(ansi, " ".join(a)) if "e" in fl else " ".join(a)) + "\n"
     a = a[1:] if c == "printf" and a[:1] == ["--"] else a
-    if c == "printf" and a:  # o formato reaproveitado até acabar os argumentos, como o printf do shell; sem conversão, uma vez só
+    if c == "printf" and a:  # o formato reaproveitado até acabar os argumentos, como o printf do shell; sem conversão, uma vez só; o argumento do %b leva os escapes decodificados
         f = ANSI.sub(ansi, a[0])
         n = sum(m.group() != "%%" for m in PFMT.finditer(f))
-        return "".join(PFMT.sub(lambda m, it=iter(a[1 + i:1 + i + n]): "%" if m.group() == "%%" else next(it, ""), f) for i in range(0, max(len(a) - 1, 1) if n else 1, n or 1))
+        conv = lambda m, it: "%" if m.group() == "%%" else ANSI.sub(ansi, next(it, "")) if m.group()[-1] == "b" else next(it, "")  # noqa: E731
+        return "".join(PFMT.sub(lambda m, it=iter(a[1 + i:1 + i + n]): conv(m, it), f) for i in range(0, max(len(a) - 1, 1) if n else 1, n or 1))
     if flow is not None and (c == "tee" or c == "cat" and all(x[:1] == "-" for x in a)):  # só repassam o stdin (cat com arquivo lê o arquivo)
         return flow
     if flow is not None and c == "base64" and {"-d", "--decode", "-D"} & set(a):
@@ -395,37 +396,58 @@ def printed(seg: list, flow, env: dict):
     return "\n".join(x[::-1] for x in flow.split("\n")) if flow is not None and c == "rev" else None
 
 
+def printed(seg: list, flow, may: dict):
+    """Os textos que o comando pode imprimir (uma lista: cada variável do argumento pode guardar mais de um texto), ou None = não sei. Só o que dá para ler sem rodar nada:
+    echo/printf com texto literal; cat/tee (repassam), base64 -d e rev sobre o que chegou pelo pipe (flow, None = não sei). O shell que lê o pipe sem -c e o
+    `eval "$(…)"` conferem esses textos como comando. A variante que não leio (None) fica de fora; sem nenhuma que eu leia → None."""
+    _, s, _, opq = peel(seg)
+    c, a = (os.path.basename(s[0]), s[1:]) if s and not opq else ("", [])
+    # `c='…'; echo "$c" | sh`, `echo "$(echo … | base64 -d)" | sh`: variável e $( ) lidos como no eval
+    outs = [say(c, v, None) for v in reveal(a, may)] if c in ("echo", "printf") else [say(c, a, f) for f in (flow if flow is not None else [None])]
+    return [o for o in outs if o is not None] or None
+
+
 def pipefed(seg: list, flow):
-    """Shell ligado por um pipe a um texto que conheço (flow): sem -c ele lê o programa do stdin, que é `sh -c '<texto>'`. O -c e o texto vão para o fim do trecho, e então
-    quem confere o trecho — agora, ou na CHAMADA da função em que ele está — já sabe abri-lo (com -c próprio vale o primeiro -c: o shell ignora o stdin). flow None = não sei."""
+    """Shell ligado por um pipe a textos que conheço (flow): sem -c ele lê o programa do stdin, que é `sh -c '<texto>'`. O -c e o texto vão para o fim do trecho, e então
+    quem confere o trecho — agora, ou na CHAMADA da função em que ele está — já sabe abri-lo (com -c próprio vale o primeiro -c: o shell ignora o stdin). Mais de um texto
+    possível: um script só, um depois do outro (só aumenta o que bloqueia). flow None = não sei."""
     if flow is None:
         return seg
     _, s, _, opq = peel(seg)
-    return seg if opq or not s or os.path.basename(s[0]) not in SHELLS else seg + ["-c", flow]
+    return seg if opq or not s or os.path.basename(s[0]) not in SHELLS else seg + ["-c", "\n".join(flow)]
 
 
-def pipe_out(body: str, env: dict):
+def pipe_out(body: str, may: dict):
     """O que o miolo de um `$( )` imprime quando é só um pipeline que sei ler (printed); None = não sei (outro operador, ou um comando que não leio)."""
     flow, seg = None, []
     for tok, op in words(body) + [("|", True)]:
         if not op:
             seg.append(tok)
         elif tok in PIPES:
-            flow, seg = printed(seg, flow, env), []
+            flow, seg = printed(seg, flow, may), []
         else:
             return None
     return flow
 
 
-def reveal(ws: list, env: dict) -> list:
-    """As palavras de um `eval` com o texto que dá para ler sem rodar nada: um `$( )` que só imprime texto (pipe_out) e `$NOME`/`${NOME}` de variável que guardo (`NOME=…`,
-    `printf -v NOME …`). Sem valor ou $( ) que não leio (None) → a palavra fica como está; só a palavra INTEIRA é trocada, nunca um pedaço dela."""
-    out = []
+def texts(w: str, may: dict):
+    """Os textos que a palavra `w` pode ter depois de expandida, só do que dá para ler sem rodar nada: um `$( )` que só imprime texto (pipe_out), `$NOME`/`${NOME}` de
+    variável que guardo (may: TODOS os textos que ela pode ter, ver setvar) e a própria palavra. None = não sei (`$( )` que não leio, variável sem texto): quem chama decide se isso
+    é "fica como está" (reveal) ou "NOME passa a não ter texto" (setvar). Só a palavra INTEIRA é trocada, nunca um pedaço dela."""
+    m, v = SUBST.fullmatch(w), VAR.fullmatch(w)
+    # vazio (variável sem texto, $( ) que não leio) → None, a palavra fica; falhou/ilegível (hex do marcador inválido) → a exceção sobe e main() bloqueia
+    t = pipe_out(bytes.fromhex(m.group(1)).decode(), may) if m else may.get(v.group(1) or v.group(2)) if v else [w]
+    return list(dict.fromkeys(x.rstrip("\n") if m else x for x in t)) if t else None
+
+
+def reveal(ws: list, may: dict) -> list:
+    """As VARIANTES das palavras de um `eval`/`echo`: cada palavra com seus textos possíveis (texts), uma variante por combinação. Palavra sem texto fica como está.
+    Mais de MANY variantes → Many (o pedido bloqueia): truncar deixaria passar a combinação que ficou de fora."""
+    out = [[]]
     for w in ws:
-        m, v = SUBST.fullmatch(w), VAR.fullmatch(w)
-        # vazio (variável sem valor, $( ) que não leio) → t None e a palavra fica; falhou/ilegível (hex do marcador inválido) → a exceção sobe e main() bloqueia
-        t = pipe_out(bytes.fromhex(m.group(1)).decode(), env) if m else env.get(v.group(1) or v.group(2)) if v else None
-        out.append(w if t is None else t.rstrip("\n") if m else t)
+        out = [o + [t] for o in out for t in texts(w, may) or [w]]
+        if len(out) > MANY:
+            raise Many
     return out
 
 
@@ -564,14 +586,26 @@ def tick(n: int = 1) -> None:
         raise Budget(f"mais de {STEP_LIMIT} passos de conferência")
 
 
-def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
-    """O 1º (alvo, operação) de escrita contra clone alheio, ou None (alvo None = não resolvi). env/funcs = contexto de quem chamou: o aninhado nunca começa do zero."""
+def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None, may=None):
+    """O 1º (alvo, operação) de escrita contra clone alheio, ou None (alvo None = não resolvi). env/funcs/may = contexto de quem chamou: o aninhado nunca começa do zero."""
     if depth > 3:
         return None, "comando aninhado fundo demais para conferir"
-    st, stack, seg = {"cwd": cwd, "env": dict(env or {}), "funcs": {} if funcs is None else funcs}, [], []
+    st, stack, seg = {"cwd": cwd, "env": dict(env or {}), "funcs": {} if funcs is None else funcs, "may": {k: list(v) for k, v in (may or {}).items()}}, [], []
+
+    def seen(env: dict, keep: bool = False) -> dict:  # os textos que cada variável pode ter para um comando com o prefixo `env` (NOME=x cmd): o prefixo vale no lugar; keep = o prefixo vale JUNTO (o eval expande `"$NOME"` antes e `'$NOME'` depois)
+        return {**st["may"], **{k: list(dict.fromkeys((st["may"].get(k, []) if keep else []) + (texts(v, st["may"]) or []))) for k, v in env.items()}}
 
     def sub(text: str, cwd, env: dict):  # trecho aninhado: mesmo contexto (variáveis do trecho de fora + as desta palavra, funções)
-        return scan(text, cwd, terr, own, depth + 1, {**st["env"], **env}, st["funcs"])
+        return scan(text, cwd, terr, own, depth + 1, {**st["env"], **env}, st["funcs"], seen(env))
+
+    def setvar(name: str, ts, unsure: bool, val: str = "$?"):
+        """NOME passa a guardar `val` em env (o que o git lê: GIT_DIR…; "$?" = não sei) e os textos `ts` em may (o que eval/pipe leem; None = não sei o texto). Trecho que PODE não ter rodado:
+        env vira "não sei" e may GUARDA os textos de antes E os novos — um valor inofensivo que talvez não tenha sido gravado não apaga o nocivo que talvez continue lá."""
+        st["env"][name] = "$?" if unsure else val
+        if not unsure:
+            st["may"][name] = ts or []  # sei que rodou: o texto de antes acabou; sem texto legível (None) → vazio, nada a conferir
+        elif ts:
+            st["may"][name] = list(dict.fromkeys(st["may"].get(name, []) + ts))  # sem texto legível (None) → fica o que havia
 
     def inner(ws: list):
         for w in ws:  # $(…) e crases dentro de qualquer palavra rodam (até no valor de VAR=…, ou no alvo de um redirecionamento): confere o miolo
@@ -581,9 +615,10 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
                     return r
         return None
 
-    def call(c: str, blind: bool):  # reexecuta AGORA, neste cwd, o corpo guardado da função c: o 1º (alvo, operação) de escrita, ou None
+    def call(c: str, blind: bool, maybe: bool = False):  # reexecuta AGORA, neste cwd, o corpo guardado da função c: o 1º (alvo, operação) de escrita, ou None. maybe = a chamada pode não ter rodado (`[ -f x ] && f`): o corpo também
         st.setdefault("calling", set()).add(c)
-        saved = st.get("lost")  # a região perdida de quem chamou continua depois que esta chamada acaba: o que vem depois pode ser o resto do corpo que não roda
+        saved, was = st.get("lost"), st.get("maybe")  # a região perdida de quem chamou continua depois que esta chamada acaba: o que vem depois pode ser o resto do corpo que não roda; o mesmo vale para o "talvez"
+        st["maybe"] = was or maybe
         try:
             body = list(st["funcs"][c])  # cópia: definir uma aninhada ali dentro acrescenta à lista de quem a define, e o que se acrescenta não é revisto nesta passada
             for i, (s, p, t) in enumerate(body):
@@ -593,7 +628,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
                     return r
         finally:
             st["calling"].discard(c)
-            st["lost"] = saved
+            st["lost"], st["maybe"] = saved, was
         return None
 
     def one(seg: list, blind: bool = False, prev: str = "", term: str = ";", ext: bool = False):  # ext = trecho que um programa roda (find -exec): cd ali não muda o shell; prev/term = o operador antes e depois do trecho: dizem se um cd rodou com certeza
@@ -644,17 +679,19 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
                 st["cwd"] = None  # `{ …; } &`: o grupo roda em background; o cd de dentro não vale aqui fora
             return None
         fw, done = next((x for x in seg if x not in KEYWORDS and not ASSIGN.fullmatch(x)), ""), ""  # a palavra que o shell chama: a 1ª que não é VAR=x nem palavra reservada
+        norun = bool(st.get("lost")) or kw or blk or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&") or bool(st.get("maybe"))  # o trecho pode não ter rodado (maybe = o corpo de uma função chamada por um trecho assim)
         if fw in st.get("funcs", {}) and fw not in st.setdefault("calling", set()):  # uma função com nome de comando que trato adiante (bash, env, cd, find, eval, export, sudo, git…) é chamada como FUNÇÃO: o corpo roda, e o resto do trecho segue conferido como se o nome fosse o programa (command X e env X ignoram a função: lado fechado)
-            r = call(fw, blind)
+            r = call(fw, blind, norun)
             if r:
                 return r
             done = fw
         w0 = [os.path.basename(x) for x in seg]
         env, seg, b, opq = peel(seg)
         blind, wrapped = blind or b, any(x in WRAP for x in w0[:len(w0) - len(seg)])  # wrapped: `env cd x` roda o cd como PROGRAMA — o shell fica onde estava
-        unsure = bool(st.get("lost")) or kw or bool(done) or blk or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&")  # o trecho pode não ter rodado
+        unsure = norun or bool(done)  # o trecho pode não ter rodado; done = a palavra de comando era uma função com nome de programa: o que o programa de verdade faz eu não sei
         if not seg:
-            st["env"].update({k: "$?" if unsure else v for k, v in env.items()})  # `GIT_DIR=x; git …` vale p/ os seguintes; `true || GIT_DIR=x` = "não sei" ($ → não resolve)
+            for k, v in env.items():  # `GIT_DIR=x; git …` vale p/ os seguintes; `true || GIT_DIR=x` = "não sei" ($ → não resolve)
+                setvar(k, texts(v, st["may"]), unsure, v)
             return None
         cwd, c = None if blind else st["cwd"], os.path.basename(seg[0])
         if st.pop("or", False) and prev == "||" and c not in ("exit", "return"):
@@ -662,7 +699,8 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
         if " " in seg[0]:  # env -S 'git -C x commit': um comando inteiro numa palavra só
             return sub(" ".join(seg), cwd, env)
         if c in ("export", "declare", "typeset"):
-            st["env"].update({m.group(1): "$?" if unsure else m.group(2) for m in map(ASSIGN.fullmatch, seg[1:]) if m})
+            for m in filter(None, map(ASSIGN.fullmatch, seg[1:])):
+                setvar(m.group(1), texts(m.group(2), st["may"]), unsure, m.group(2))
         elif c in ("cd", "pushd", "popd"):
             new = None if c == "popd" else chdir(seg[1:], st["cwd"], c == "pushd")
             if st.get("lost") or kw or wrapped or ext or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&"):
@@ -693,16 +731,16 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
                         if stop:
                             break
                     return sub(script[0], cwd, env)
-        elif c == "eval":
-            return sub(" ".join(reveal(seg[1:], {**st["env"], **env})), cwd, env)  # `eval "$(echo … | base64 -d)"`, `eval "$NOME"`: o texto que dá para ler vira o que se confere
-        elif c == "printf" and seg[1:2] == ["-v"] and len(seg) > 3:  # printf -v NOME FORMATO ARGS…: NOME passa a guardar o texto, mesmo se o trecho pode não ter rodado (lado fechado)
-            t = printed(["printf"] + seg[3:], None, {**st["env"], **env})  # vazio → NOME vazio; formato que não leio (None) → "$?" = não sei
-            st["env"][seg[2]] = "$?" if t is None else t
+        elif c == "eval":  # `eval "$(echo … | base64 -d)"`, `eval "$NOME"`: cada texto que dá para ler vira uma variante do que se confere (um script só: só aumenta o que bloqueia)
+            return sub("\n".join(" ".join(v) for v in reveal(seg[1:], seen(env, True))), cwd, env)
+        elif c == "printf" and seg[1:2] == ["-v"] and len(seg) > 3:  # printf -v NOME FORMATO ARGS…: NOME passa a guardar o texto; trecho que pode não ter rodado soma o texto novo ao de antes (setvar)
+            t = printed(["printf"] + seg[3:], None, st["may"])  # vazio → NOME vazio; formato que não leio (None) → sem texto
+            setvar(seg[2], t, unsure, t[0] if t and len(t) == 1 else "$?")
         elif INTERP.fullmatch(c):  # python -c / node -e / perl -e / awk: o texto entre aspas do código (os.system, shell=True, execSync, system, crase) roda num shell e é conferido como comando; lista de argumentos e texto montado em pedaços: não vejo
             cw = None if CODECD.search(" ".join(seg)) else cwd  # os.chdir / cwd=: o shell de dentro roda noutro diretório
             for t in seg[1:]:
                 m = ASSIGN.fullmatch(t)  # `awk -v cmd="git …"`: o valor de NOME=valor também pode ser o comando (o peel o engoliria como atribuição); o literal vale com os escapes decodificados (`'\x67it …'` é git)
-                for text in [t] + ([m.group(2)] if m else []) + [ANSI.sub(ansi, next(filter(None, g), "")) for g in LIT.findall(t)]:
+                for text in [t] + ([m.group(2)] if m else []) + [ANSI.sub(ansi, ([x for x in g if x] or [""])[-1]) for g in LIT.findall(t)]:
                     r = sub(text, cw, env)
                     if r:
                         return r
@@ -714,7 +752,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
                         return r
         elif c in st.get("funcs", {}) and c not in st.setdefault("calling", set()):  # chamada de função definida nesta chamada: o corpo roda AGORA, neste cwd
             if c != done:  # (já reexecutada acima quando era a palavra de comando; aqui chega o que um embrulho escondia: time f, command f)
-                r = call(c, blind)
+                r = call(c, blind, unsure)  # chamada que pode não ter rodado: o corpo também (`[ -f x ] && f`)
                 if r:
                     return r
             if c == "git":  # uma função chamada git NÃO isenta a chamada: a definição pode não ter rodado (`false && function git`, subshell, chamada condicional) e `command git`, `env git` e `\git` ignoram a função; o corpo já foi conferido acima, e o git de verdade também
@@ -734,7 +772,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
                 r = sub(tok, st["cwd"], {})
                 if r:
                     return r
-            hs = reveal([tok], st["env"])[0] if herestr else hs  # `cat <<< '…' | sh`, `base64 -d <<< B64 | sh`: o texto é o stdin do produtor do pipe
+            hs = [v[0] for v in reveal([tok], st["may"])] if herestr else hs  # `cat <<< '…' | sh`, `base64 -d <<< B64 | sh`: o texto é o stdin do produtor do pipe
             herestr = False
         elif op:  # o shlex junta pontuação colada (`);`, `&&(`, `2>&1`): separa de novo
             skip = herestr = False  # um operador que chega com um redirecionamento esperando alvo não é o alvo
@@ -743,17 +781,22 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
                     r = one(pipefed(seg, flow), False, prev, pc)
                     if r:
                         return r
-                    flow, hs = printed(seg, flow if hs is None else hs, st["env"]) if pc in PIPES else None, None
+                    flow, hs = printed(seg, flow if hs is None else hs, st["may"]) if pc in PIPES else None, None
+                    c0 = next((i for i, w in enumerate(seg) if w not in KEYWORDS), len(seg))  # onde começa o comando do trecho
+                    if seg[c0:c0 + 1] == ["case"] and "in" in seg[c0 + 2:]:
+                        stack.append(None)  # `case … in`: o `)` que vem a seguir fecha um PADRÃO, não um subshell (a marca sai da pilha no `esac`)
+                    elif seg[c0:c0 + 1] == ["esac"] and None in stack:
+                        del stack[len(stack) - 1 - stack[::-1].index(None):]  # o `esac` fecha o `case` mais de dentro; subshell aberto dentro dele (script malformado) sai sem voltar nada
                     if pc == "(":
                         if not skip and (len(seg) == 1 and seg[0] not in KEYWORDS or len(seg) == 2 and seg[0] == "function" and seg[1] not in KEYWORDS):
                             st["func"], st["fname"] = True, seg[-1]  # `f (` e `function f (`: definição de função — o `{ … }` que vem a seguir é corpo que não roda agora
-                        stack.append(st["cwd"])
+                        stack.append((st["cwd"], dict(st["env"]), {k: list(v) for k, v in st["may"].items()}))  # o `( )` roda num subshell: diretório e variáveis voltam a ser estes no `)`
                         skip = False  # `<(cmd)` / `>(cmd)`: o `<` que vem colado no `(` não é redirecionamento de arquivo, a palavra seguinte é um comando
                     elif pc == ")":
-                        if stack:
-                            st["cwd"] = stack.pop()
+                        if stack and stack[-1] is not None:
+                            st["cwd"], st["env"], st["may"] = stack.pop()
                         else:
-                            pc = "case)"  # `)` sem `(` aberto: fim de um padrão de `case` — o ramo pode nem rodar
+                            pc = "case)"  # `)` sem `(` de subshell aberto (pilha vazia, ou o `case` mais de dentro é o que está aberto): fim de um padrão de `case` — o ramo pode nem rodar
                     seg, prev = [], pc
                 else:
                     skip, herestr = True, pc == "<<<"  # redirecionamento: a palavra seguinte é o arquivo (ou, no here-string, o texto)
@@ -777,7 +820,10 @@ def decide(inp: dict, terr: str, proj):
     tool, ti, cwd = inp.get("tool_name"), inp.get("tool_input") or {}, inp.get("cwd") or None
     own = own_clone(proj, terr)
     if tool == "Bash":
-        return scan(str(ti.get("command") or ""), os.path.realpath(cwd) if cwd else None, terr, own)
+        try:
+            return scan(str(ti.get("command") or ""), os.path.realpath(cwd) if cwd else None, terr, own)
+        except Many:
+            return None, "eval/pipe com variáveis demais para conferir"
     if tool in TOOLS_FILE:
         p = res(str(ti.get(TOOLS_FILE[tool]) or ""), os.path.realpath(cwd) if cwd else None, shell=False)
         if p is None or claude_conf(p) or (inside(p, terr) and not (own and inside(p, own))):

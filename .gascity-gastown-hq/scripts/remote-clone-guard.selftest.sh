@@ -18,7 +18,7 @@
 #   de redirecionamento · lexh heredoc/`<<<`/find · lexp os controles que NÃO bloqueiam) · dest — o lugar onde o git escreve vem como ARGUMENTO, sem -C (worktree remove ../outro,
 #   clone/init <outro>/x, checkout-index --prefix=…; subgrupos destb e destp) · interp — o texto que um INTERPRETADOR (python -c, node -e, perl -e, ruby -e, awk) ou um pipe entrega a um
 #   shell roda: as 12 formas que só o cc-safety-net pegava (ga-tphd15o; subgrupos interpc código de interpretador, interpp pipe que um shell lê, interpe base64/rev/eval/printf -v).
-# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (184 mutantes); e
+# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (205 mutantes); e
 #   contra um stub que só sai 0 (o servidor ANTES desta fatia: o hook do mini era `drop` e nada o substituía), quase tudo falha.
 # VARIÁVEIS: RCG_UNDER_TEST (guarda a testar) · RCG_ONLY (grupos, vírgula) · RCG_NO_MUTANTS=1
 # BUDGET (grupo à parte, ga-tih62nv): o pedido que fazia o guarda girar SEM FIM (e que o hook deixava seguir sem conferência ao estourar o prazo de 600 s do Claude Code) termina;
@@ -617,7 +617,7 @@ git commit -m 'msg'"
 
 g_interp() {  # ga-tphd15o (achado do ga-nkfwixz, cc-safety-net como oráculo): o texto que um INTERPRETADOR (python/node/perl/awk) ou um pipe entrega a um shell roda — as 12 formas que só o safety-net pegava
   # As strings com os.system / shell=True abaixo são PAYLOADS DE TESTE de propósito: viram só o texto de um pedido que o guarda confere, nada aqui as executa.
-  local c g="git -C $OTH reset --hard" B R
+  local c g="git -C $OTH reset --hard" h="git -C $OWN commit -m x" B R v6 v7
   B=$(python3 -c 'import base64,sys; print(base64.b64encode(sys.argv[1].encode()).decode())' "$g"); R=$(python3 -c 'import sys; print(sys.argv[1][::-1])' "$g")
   if grp interpc interp; then
   for c in "python3 -c \"import os; os.system('$g')\"" "python3 -c \"import subprocess; subprocess.run('$g', shell=True)\"" "node -e \"require('child_process').execSync('$g')\"" \
@@ -637,6 +637,14 @@ g_interp() {  # ga-tphd15o (achado do ga-nkfwixz, cc-safety-net como oráculo): 
            "python3 -c \"print('use git -C $OTH commit to write')\"" "python3 -c \"import json,sys; print(json.load(sys.stdin))\"" "awk '{print \$1}'" "perl -pe 's/a b/c d/'" "node -e \"console.log(1+1)\"" \
            "perl -e 'system(\"git -C $OWN commit -m x\")'" "awk 'BEGIN{system(\"git status\")}'" "python3 -c \"import os; os.chdir('$OWN'); os.system('git -C $OWN commit -m x')\"" "python3 $T/tool.py --msg ok" "perl -e 'qx{git -C $OWN commit -m x}'" "python3 -c \"DIGIT_N = 1; import os; os.system('git commit -m x')\""; do
     b 0 "pass: interp: código de interpretador que não escreve no alheio: $c" "$c"
+  done
+  # interpretadores que o parecer do gate (ga-tphd15o, tentativa 1) apontou fora da lista, e os delimitadores do perl além de q{} q() q[] q//
+  for c in "php -r 'system(\"$g\");'" "php8.2 -r 'shell_exec(\"$g\");'" "lua -e 'os.execute(\"$g\")'" "lua5.4 -e 'io.popen(\"$g\")'" "deno eval \"new Deno.Command('sh', {args: ['-c', '$g']}).outputSync()\"" "bun -e \"require('child_process').execSync('$g')\"" \
+           "perl -e 'system(q!$g!)'" "perl -e 'system(q#$g#)'" "perl -e 'system(qq|$g|)'" "perl -e 'qx,$g,'"; do
+    b 2 "interp: php/lua/deno/bun e q!…! do perl rodam o texto num shell: $c" "$c"
+  done
+  for c in "php -r 'echo 1;'" "lua -e 'print(1)'" "bun -e \"console.log(1)\"" "deno eval \"console.log(1)\"" "php -r 'system(\"git -C $OWN commit -m x\");'" "perl -e 'system(q!git -C $OWN commit -m x!)'"; do
+    b 0 "pass: interp: php/lua/deno/bun/perl que não escrevem no alheio: $c" "$c"
   done
   fi
   if grp interpp interp; then
@@ -660,6 +668,50 @@ g_interp() {  # ga-tphd15o (achado do ga-nkfwixz, cc-safety-net como oráculo): 
   for c in "echo $B | base64 -d" "echo $B | base64 -d > $T/out" "eval \"\$(echo $B | base64 -d | wc -c)\"" "eval \"\$(echo $B | base64 -d > $T/out)\"" "echo '$R' | rev" "printf -v c '%s' '$g'; echo \"\$c\"" "printf -v c '%s' 'git -C $OWN commit -m x'; eval \"\$c\"" \
            "eval \"\$(echo hello)\"" "eval \"\$(ssh-agent -s)\"" "eval \"\$(echo '$g' | wc -c)\"" "printf -v c '%s' hello; eval \"\$c\"" "eval \"\$d\"" "c='git -C $OWN log'; eval \"\$c\"" "printf -v c '%s' '$g'; c=ok; eval \"\$c\"" "c='git -C $OWN commit -m x'; echo \"\$c\" | sh" "echo \"\$d\" | sh" "c='$g'; echo \"\$c\" | cat"; do
     b 0 "pass: interp: codificado ou em variável, mas que não vira escrita no alheio: $c" "$c"
+  done
+  # Trecho que PODE não ter rodado (gate ga-tphd15o, tentativa 1): o texto de antes continua possível E o novo também — o eval e o pipe conferem todos. Erro e vazio não dão o mesmo valor:
+  # um valor inofensivo que talvez não tenha sido gravado não apaga o nocivo que talvez continue lá, e um nocivo que talvez tenha sido gravado conta.
+  for c in "printf -v c '%s' '$g'; [ -f /nonexistent ] && printf -v c '%s' ok; eval \"\$c\"" "c='$g'; [ -f /nonexistent ] && printf -v c '%s' ok; eval \"\$c\"" "c='$g'; [ -f /nonexistent ] && c=ok; eval \"\$c\"" \
+           "c=ok; [ -d / ] && c='$g'; eval \"\$c\"" "if [ -d / ]; then c='$g'; fi; eval \"\$c\"" "[ -d / ] && c='$g'; eval \"\$c\"" "false || c='$g'; eval \"\$c\"" "false || export c='$g'; eval \"\$c\"" \
+           "for i in 1; do c='$g'; done; eval \"\$c\"" "while false; do c='$g'; done; eval \"\$c\"" "case x in y) c='$g';; esac; eval \"\$c\"" "[ -d / ] && c='$g'; echo \"\$c\" | sh" \
+           "c='$g'; f() { c=ok; }; [ -f /nonexistent ] && f; eval \"\$c\"" "c='$g'; f() { c=ok; }; [ -f /nonexistent ] && command f; eval \"\$c\"" "a='git -C'; [ -d / ] && a=ok; eval \"\$a\" '$OTH' reset --hard" \
+           "printf -v GIT_DIR '%s' $OTH/.git; [ -f /nonexistent ] && printf -v GIT_DIR '%s' $OWN/.git; git commit -m x"; do
+    b 2 "interp: o texto de antes ou o novo — o trecho pode não ter rodado: $c" "$c"
+  done
+  # O texto passa de variável para variável, vem de $( ) guardado, de %b, do prefixo do comando, ou de dentro de um shell aninhado.
+  for c in "c=\$(echo '$g'); eval \"\$c\"" "c=\$(echo '$g'); echo \"\$c\" | sh" "c='$g'; d=\$c; eval \"\$d\"" "c='$g'; d=\"\$c\"; eval \"\$d\"" \
+           "printf '%b' 'cd $OTH\\ngit reset --hard' | sh" "printf '%b\\n' 'cd $OTH\\ngit reset --hard' | sh" "c='$g'; c=ok eval \"\$c\"" "c=ok; c='$g' eval '\$c'" \
+           "export c='$g'; bash -c 'eval \"\$c\"'" "c='$g' bash -c 'eval \"\$c\"'" "export d='$g'; export c=\$d; eval \"\$c\"" "export c=\$(echo '$g'); eval \"\$c\""; do
+    b 2 "interp: o texto vem de outra variável, de \$( ) guardado, de %b, do prefixo do comando ou de um shell aninhado: $c" "$c"
+  done
+  # O ( ) roda num subshell: o que ele atribui não vale fora (o texto de antes continua; GIT_DIR de antes continua).
+  for c in "c='$g'; ( c=ok ); eval \"\$c\"" "GIT_DIR=$OTH/.git; ( GIT_DIR=$OWN/.git ); git commit -m x"; do
+    b 2 "interp: o subshell não desfaz o que veio antes: $c" "$c"
+  done
+  # O `)` que fecha um PADRÃO de case, dentro de um ( ), não fecha o subshell: o diretório, o GIT_DIR e o texto de antes do case continuam valendo até o `)` de verdade.
+  for c in "( cd $OTH; case x in y) git commit -m x ;; x) git commit -m y ;; esac )" "( cd $OTH; case x in y) true ;; esac; git commit -m x )" \
+           "( GIT_DIR=$OTH/.git; case x in y) true ;; esac; git commit -m x )" "( c='$g'; case x in y) true ;; esac; eval \"\$c\" )" \
+           "( c='$g'; case x in y) c=ok ;; esac; eval \"\$c\" )" "( cd $OTH; case x in y) case z in w) true ;; esac ;; esac; git commit -m x )" \
+           "( cd $OTH; case x in (y) true ;; esac; git commit -m x )" "( cd $OTH; case x in y) ( true ) ;; esac; git commit -m x )" \
+           "( cd $OTH; if case x in y) true ;; esac; then git commit -m x; fi )" "( cd $OTH; while case x in y) false ;; esac; do git commit -m x; done )" \
+           "( cd $OTH; case x in y) true ;; esac ); cd $OTH; git commit -m x" "( cd $OTH; case x in"$'\n'" y) true ;; esac; git commit -m x )"; do
+    b 2 "interp: o ) de um padrão de case não fecha o subshell: $c" "$c"
+  done
+  for c in "( cd $OTH; case x in y) true ;; esac ); git commit -m x" "( c='$g'; case x in y) true ;; esac ); eval \"\$c\"" "( cd $OWN; case x in y) true ;; esac; git commit -m x )"; do
+    b 0 "pass: interp: o ) que fecha o subshell depois do case volta o diretório e as variáveis: $c" "$c"
+  done
+  # Variantes demais para conferir uma a uma (7 variáveis de 2 textos = 128): bloqueia, nunca libera por não ter conferido.
+  v6="a=1; [ -d / ] && a=2; b=1; [ -d / ] && b=2; c=1; [ -d / ] && c=2; d=1; [ -d / ] && d=2; e=1; [ -d / ] && e=2; f=1; [ -d / ] && f=2;"
+  v7="$v6 g=1; [ -d / ] && g=2;"
+  b 2 "interp: 128 variantes de um eval passam do teto: bloqueia" "$v7 eval \"\$a\" \"\$b\" \"\$c\" \"\$d\" \"\$e\" \"\$f\" \"\$g\""
+  grep -qF "variáveis demais" "$T/err"; ok $? "interp: o bloqueio por variantes demais diz o motivo (não 'o guarda falhou')"
+  b 0 "pass: interp: 64 variantes de um eval (6 variáveis de 2 textos) ainda são conferidas e nenhuma escreve no alheio" "$v6 eval \"\$a\" \"\$b\" \"\$c\" \"\$d\" \"\$e\" \"\$f\""
+  for c in "c='$h'; [ -f /nonexistent ] && c=ok; eval \"\$c\"" "c='$h'; if [ -d / ]; then c=ok; fi; eval \"\$c\"" "if [ -d / ]; then c=ok; fi; eval \"\$c\"" \
+           "c=ok; [ -f /nonexistent ] && c='$g'; c=ok; eval \"\$c\"" "( c='$g' ); eval \"\$c\"" "( c='$h'; eval \"\$c\" )" "( export GIT_DIR=$OWN/.git; git commit -m x )" \
+           "printf '%b' 'cd $OWN\\ngit commit -m x' | sh" "c='$g'; c=ok; [ -f /nonexistent ] && c=ok2; eval \"\$c\"" "printf -v GIT_DIR '%s' $OTH/.git; printf -v GIT_DIR '%s' $OWN/.git; git commit -m x" \
+           "c=\$(echo '$h'); eval \"\$c\"" "c='$h'; d=\$c; eval \"\$d\"" "c='$g'; f() { c=ok; }; f; eval \"\$c\"" "c=ok eval \"\$c\"" "c='$g'; c=ok; c2=\$c; eval \"\$c2\"" \
+           "export c='$h'; bash -c 'eval \"\$c\"'" "printf -v c '%s' '$g'; [ -f /nonexistent ] && printf -v c '%s' ok; echo \"\$c\" | cat"; do
+    b 0 "pass: interp: trecho que pode não ter rodado, subshell, variável de variável, mas nada escreve no alheio: $c" "$c"
   done
   fi
 }
@@ -1064,7 +1116,7 @@ echo "== $((n-fails))/$n ok =="
   mutant cond "cd em padrão de case ou com ;; segue mudando o diretório" 's/            if st.get("lost") or kw or wrapped or ext or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;")/            if st.get("lost") or kw or wrapped or ext or prev in ("||", "|", "|\&") or term in ("|", "|\&", "\&")/'
   mutant cond "{ cd a; } & mantém o diretório do grupo em background" 's/^\( *\)if term == "&":$/\1if False:/'
   mutant evade "bash -c não é aberto" 's/return sub(script\[0\], cwd, env)/pass/'
-  mutant evade "eval não é aberto" 's/return sub(" ".join(reveal(seg\[1:\], {\*\*st\["env"\], \*\*env})), cwd, env)/pass/'
+  mutant evade "eval não é aberto" 's/            return sub("\\n".join(" ".join(v) for v in reveal(seg\[1:\], seen(env, True))), cwd, env)/            pass/'
   mutant evade "\$( ) não é aberto" 's/r = sub(bytes.fromhex(m.group(1)).decode(), st\["cwd"\], {})/r = None/'
   mutant evade "crase não vira \$( )" 's/(cmd.startswith("\$(", k) or cmd\[k\] == "`")/cmd.startswith("$(", k)/'
   mutant evade "parêntese dentro do \$( ) não é contado" 's/            d += 1 if c == "(" else -1/            d -= 1/'
@@ -1087,7 +1139,7 @@ echo "== $((n-fails))/$n ok =="
   mutant check "selfcheck ignora a camada do projeto" 's/for d in args\[1:\]:/for d in []:/'
   mutant evade "opção de env/sudo que muda o diretório não deixa o guarda cego" 's/^\( *\)blind = blind or name in chd$/\1pass/'
   mutant evade "export/declare não são lidos" 's/if c in ("export", "declare", "typeset"):/if False:/'
-  mutant evade "VAR=x solta não vale para o git seguinte" 's/st\["env"\].update({k: "\$?" if unsure else v for k, v in env.items()})  # /pass  # /'
+  mutant evade "VAR=x solta não vale para o git seguinte" 's/                setvar(k, texts(v, st\["may"\]), unsure, v)/                pass/'
   mutant evade "VAR=x (solta ou depois de env/sudo) é descartada" 's/env\[m.group(1)\], seg = m.group(2), seg\[1:\]/seg = seg[1:]/'
   mutant evade "env -S (comando inteiro numa palavra) não é reaberto" 's/if " " in seg\[0\]:/if False:/'
   mutant evade "remote -v add vira leitura" 's/rest in (\[\], \["-v"\]) or/rest[:1] in ([], ["-v"]) or/'
@@ -1111,8 +1163,8 @@ echo "== $((n-fails))/$n ok =="
   mutant shell "here-string para bash é ignorado" 's/            if herestr and runs_text(seg):/            if False:/'
   mutant shell "continuação de linha não é juntada" 's/hide(CONT.sub(r"\\1", decomment(heredocs(cmd))))/hide(decomment(heredocs(cmd)))/'
   mutant shell "barra escapada + newline vira continuação" 's/^CONT = re.compile(.*)  #/CONT = re.compile(r"()\\\\\\n")  #/'
-  mutant ctx "trecho aninhado começa sem as variáveis de fora" 's/return scan(text, cwd, terr, own, depth + 1, {\*\*st\["env"\], \*\*env}, st\["funcs"\])/return scan(text, cwd, terr, own, depth + 1, {}, st["funcs"])/'
-  mutant ctx "trecho aninhado começa sem as funções de fora" 's/"funcs": {} if funcs is None else funcs}/"funcs": {}}/'
+  mutant ctx "trecho aninhado começa sem as variáveis de fora" 's/return scan(text, cwd, terr, own, depth + 1, {\*\*st\["env"\], \*\*env}, st\["funcs"\], seen(env))/return scan(text, cwd, terr, own, depth + 1, {}, st["funcs"], seen(env))/'
+  mutant ctx "trecho aninhado começa sem as funções de fora" 's/"funcs": {} if funcs is None else funcs, /"funcs": {}, /'
   mutant ctx "função cujo fim não fecha nunca roda" 's/    if st.get("fdepth"):  # o fim da função/    if False:  # o fim da função/'
   mutant ctx "heredoc volta a sumir para qualquer leitor que não é shell" 's/    return not opq and (not seg or os.path.basename(seg\[0\]) in DATA)/    return not opq and (not seg or os.path.basename(seg[0]) not in SHELLS)/'
   mutant ctx "redirecionamento colado esconde o shell do heredoc" 's/REDIR.sub(" ", cmd\[/(cmd[/'
@@ -1123,8 +1175,8 @@ echo "== $((n-fails))/$n ok =="
   mutant ctx "\$( ) entre aspas simples/escapado volta a ser extraído no nível de fora" 's/        if q not in (.*) and (cmd.startswith("\$(", k) or cmd\[k\] == "`"):/        if (cmd.startswith("$(", k) or cmd[k] == "`"):/'
   mutant ctx "o ) do case fecha o \$( )" 's/            cs = max(0, cs + (1 if w.group(1) == "case" else -1))/            pass/'
   mutant ctx "em aspas duplas \\\$ e \\\` mantêm a barra" 's/out += \[cmd\[i + 1\]\] if q == .* else \[c, PROT.get/out += [c, PROT.get/'
-  mutant ctx "VAR= depois de || vale como certa" 's/{k: "\$?" if unsure else v for/{k: v for/'
-  mutant ctx "export depois de || vale como certo" 's/{m.group(1): "\$?" if unsure else m.group(2) for/{m.group(1): m.group(2) for/'
+  mutant ctx "VAR= depois de || vale como certa" 's/setvar(k, texts(v, st\["may"\]), unsure, v)/setvar(k, texts(v, st["may"]), False, v)/'
+  mutant ctx "export depois de || vale como certo" 's/setvar(m.group(1), texts(m.group(2), st\["may"\]), unsure, m.group(2))/setvar(m.group(1), texts(m.group(2), st["may"]), False, m.group(2))/'
   mutant ctx "env cd muda o diretório do shell" 's/if st.get("lost") or kw or wrapped or ext or/if st.get("lost") or kw or ext or/'
   mutant ctx "find -exec cd (sem terminador) muda o diretório do shell" 's/if st.get("lost") or kw or wrapped or ext or/if st.get("lost") or kw or wrapped or/'
   mutant closed "branch/tag com palavra solta e sem opção de lista vira leitura" 's/        elif t.startswith("-") or not listing:/        elif t.startswith("-"):/'
@@ -1201,7 +1253,7 @@ echo "== $((n-fails))/$n ok =="
   mutant budget "function NOME { aninhada num corpo reexecutado não marca a região como perdida" 's/if seg\[:1\] == \["function"\] or seg\[:1\] == \["{"\] and (prev == ")" or st.get("nhead")):/if seg[:1] == ["{"] and (prev == ")" or st.get("nhead")):/'
   mutant budget "NOME() { aninhada num corpo reexecutado não marca a região como perdida" 's/if seg\[:1\] == \["function"\] or seg\[:1\] == \["{"\] and (prev == ")" or st.get("nhead")):/if seg[:1] == ["function"]:/'
   mutant budget "na região perdida o cd volta a valer" 's/if st.get("lost") or kw or wrapped or ext or/if kw or wrapped or ext or/'
-  mutant budget "na região perdida a atribuição de variável volta a valer" 's/unsure = bool(st.get("lost")) or kw/unsure = kw/'
+  mutant budget "na região perdida a atribuição de variável volta a valer" 's/norun = bool(st.get("lost")) or kw/norun = kw/'
   mutant budget "uma chamada feita dentro da região perdida a encerra para o resto do corpo de fora" 's/^            st\["lost"\] = saved$/            st.pop("lost", None)/'
   mutant budget "function f { depois de || ou && vale como definição que sempre rodou" 's/";" if prev == ")" else prev/";"/'
   mutant budget "a aninhada não passa a existir quando f roda (a chamada dela de fora não é conferida)" 's/^                        st\["funcs"\]\.setdefault(nm, \[\])\.extend(rest)$/                        pass/'
@@ -1219,28 +1271,32 @@ echo "== $((n-fails))/$n ok =="
   mutant budget "function NOME() no topo não é lido como definição (o cd de dentro vale como se tivesse rodado)" 's/ or len(seg) == 2 and seg\[0\] == "function" and seg\[1\] not in KEYWORDS)/)/'
   mutant budget "a palavra de comando que é uma função não é reexecutada antes dos ramos especiais (bash(), env(), cd(), find(), eval()…)" 's/^        if fw in st.get("funcs", {}) and fw not in st.setdefault("calling", set()):/        if False:/'
   mutant budget "um cd coberto por uma função segue modelado como cd" 's/^            if done:$/            if False:/'
-  mutant budget "uma atribuição coberta por uma função (export() { :; }) segue valendo" 's/ or kw or bool(done) or blk or/ or kw or blk or/'
-  mutant interpc "python -c deixa de ser interpretador" 's/^INTERP = re.compile(r"(?:python|pypy|perl|ruby)/INTERP = re.compile(r"(?:pypy|perl|ruby)/'
+  mutant budget "uma atribuição coberta por uma função (export() { :; }) segue valendo" 's/unsure = norun or bool(done)/unsure = norun/'
+  mutant interpc "python -c deixa de ser interpretador" 's/^INTERP = re.compile(r"(?:python|pypy|perl|ruby|php|lua)/INTERP = re.compile(r"(?:pypy|perl|ruby|php|lua)/'
   mutant interpc "node -e deixa de ser interpretador" 's/|node(?:js)?|/|/'
-  mutant interpc "perl -e deixa de ser interpretador" 's/|perl|ruby)/|ruby)/'
-  mutant interpc "ruby -e deixa de ser interpretador" 's/|perl|ruby)/|perl)/'
+  mutant interpc "perl -e deixa de ser interpretador" 's/|perl|ruby|php|lua)/|ruby|php|lua)/'
+  mutant interpc "ruby -e deixa de ser interpretador" 's/|perl|ruby|php|lua)/|perl|php|lua)/'
+  mutant interpc "php -r deixa de ser interpretador" 's/|ruby|php|lua)/|ruby|lua)/'
+  mutant interpc "lua -e deixa de ser interpretador" 's/|ruby|php|lua)/|ruby|php)/'
+  mutant interpc "deno eval e bun -e deixam de ser interpretadores" 's/|node(?:js)?|deno|bun|/|node(?:js)?|/'
+  mutant interpc "o perl só aceita q{} q() q[] como delimitador (q!…! e q#…# passam)" 's/\\6)", re.S)/\\6(?!))", re.S)/'
   mutant interpc "awk deixa de ser interpretador" 's/|\[gmn\]?awk"/"/'
   mutant interpc "o código de nenhum interpretador é aberto" 's/        elif INTERP.fullmatch(c):/        elif False:/'
-  mutant interpc "o literal entre aspas do código não é conferido sozinho (perl system \"…\" sem parêntese, getline do awk)" 's/ + \[ANSI.sub(ansi, next(filter(None, g), "")) for g in LIT.findall(t)\]:/:/'
+  mutant interpc "o literal entre aspas do código não é conferido sozinho (perl system \"…\" sem parêntese, getline do awk)" 's/ + \[ANSI.sub(ansi, (\[x for x in g if x\] or \[""\])\[-1\]) for g in LIT.findall(t)\]:/:/'
   mutant interpc "o código inteiro não é conferido como shell (a crase do perl)" 's/for text in \[t\] + (\[m.group(2)\] if m else \[\]) + /for text in ([m.group(2)] if m else []) + /'
   mutant interpc "chdir/cwd no código não deixa o diretório \"não sei\"" 's/^CODECD = re.compile(r"chdir|\\bcwd\\b|\\bGIT_\[A-Z_\]+")/CODECD = re.compile(r"(?!)")/'
   mutant interpc "a chave 'cwd' ENTRE ASPAS deixa de valer como a opção (bypass)" 's/^CODECD = re.compile(r"chdir|\\bcwd\\b|\\bGIT_\[A-Z_\]+")/CODECD = re.compile(r"chdir|\\bcwd\\s\*\[=:\]|\\bGIT_\[A-Z_\]+")/'
   mutant interpc "GIT_DIR / GIT_WORK_TREE no código não deixam o diretório \"não sei\"" 's/^CODECD = re.compile(r"chdir|\\bcwd\\b|\\bGIT_\[A-Z_\]+")/CODECD = re.compile(r"chdir|\\bcwd\\b")/'
   mutant interpc "GIT_ sem fronteira de palavra casa DIGIT_N (falso positivo no próprio clone)" 's/^CODECD = re.compile(r"chdir|\\bcwd\\b|\\bGIT_\[A-Z_\]+")/CODECD = re.compile(r"chdir|\\bcwd\\b|GIT_\[A-Z_\]+")/'
-  mutant interpc "os escapes do literal (\\x67it) não são decodificados" 's/ANSI.sub(ansi, next(filter(None, g), ""))/next(filter(None, g), "")/'
+  mutant interpc "os escapes do literal (\\x67it) não são decodificados" 's/ANSI.sub(ansi, (\[x for x in g if x\] or \[""\])\[-1\])/(\[x for x in g if x\] or [""])[-1]/'
   mutant interpc "o valor de NOME=valor (awk -v cmd=…) não é conferido" 's/\[m.group(2)\] if m else \[\]/[]/'
   mutant interpc "o shell aberto pelo código nunca sabe o diretório (falso positivo no próprio clone)" 's/cw = None if CODECD.search(" ".join(seg)) else cwd/cw = None/'
-  mutant interpp "shell sem -c não lê o texto do pipe (nem o que está em corpo de função)" 's/ else seg + \["-c", flow\]/ else seg/'
-  mutant interpp "o texto de um trecho não segue para o próximo do pipe" 's/flow, hs = printed(seg, flow if hs is None else hs, st\["env"\]) if pc in PIPES else None, None/flow, hs = None, None/'
+  mutant interpp "shell sem -c não lê o texto do pipe (nem o que está em corpo de função)" 's/ else seg + \["-c", "\\n".join(flow)\]/ else seg/'
+  mutant interpp "o texto de um trecho não segue para o próximo do pipe" 's/flow, hs = printed(seg, flow if hs is None else hs, st\["may"\]) if pc in PIPES else None, None/flow, hs = None, None/'
   mutant interpp "o trecho não recebe o que o anterior imprime" 's/r = one(pipefed(seg, flow), False, prev, pc)/r = one(seg, False, prev, pc)/'
-  mutant interpp "|& não liga trechos" 's/^PIPES, VAR = ("|", "|&"),/PIPES, VAR = ("|",),/'
-  mutant interpp,interpe "o texto de um here-string não é guardado" 's/            hs = reveal(\[tok\], st\["env"\])\[0\] if herestr else hs/            pass/'
-  mutant interpp,interpe "o here-string não vira o stdin do produtor do pipe" 's/printed(seg, flow if hs is None else hs, st\["env"\])/printed(seg, flow, st["env"])/'
+  mutant interpp "|& não liga trechos" 's/^PIPES, VAR, MANY = ("|", "|&"),/PIPES, VAR, MANY = ("|",),/'
+  mutant interpp,interpe "o texto de um here-string não é guardado" 's/            hs = \[v\[0\] for v in reveal(\[tok\], st\["may"\])\] if herestr else hs/            pass/'
+  mutant interpp,interpe "o here-string não vira o stdin do produtor do pipe" 's/printed(seg, flow if hs is None else hs, st\["may"\])/printed(seg, flow, st["may"])/'
   mutant interpp "echo não é lido" 's/^    if c == "echo":/    if False:/'
   mutant interpp "echo -e não decodifica os escapes" 's/if "e" in fl else/if False else/'
   mutant interpp,interpe "printf não é lido" 's/^    if c == "printf" and a:/    if False:/'
@@ -1252,18 +1308,37 @@ echo "== $((n-fails))/$n ok =="
   mutant interpp "tee não repassa o stdin" 's/(c == "tee" or c == "cat"/(c == "tee1" or c == "cat"/'
   mutant interpp "cat sem arquivo não repassa o stdin" 's/ or c == "cat" and all(/ or c == "cat1" and all(/'
   mutant interpp "cat com arquivo repassa o stdin (lê o arquivo, não o pipe)" 's/all(x\[:1\] == "-" for x in a)/True/'
-  mutant interpe "echo e printf não revelam variável nem \$( ) nos argumentos" 's/a = reveal(a, env) if c in ("echo", "printf") else a/a = a/'
+  mutant interpe "echo e printf não revelam variável nem \$( ) nos argumentos" 's/for v in reveal(a, may)\] if c in ("echo", "printf")/for v in [a]] if c in ("echo", "printf")/'
   mutant interpe "base64 -d só vale com -d (não --decode nem -D)" 's/{"-d", "--decode", "-D"}/{"-d"}/'
   mutant interpe "base64 -d não decodifica" 's/c == "base64"/c == "base65"/'
   mutant interpe "rev não inverte" 's/ and c == "rev" else None/ and False else None/'
   mutant interpe "pipeline dentro do \$( ) não é lido" 's/        elif tok in PIPES:/        elif False:/'
   mutant interpe "outro operador dentro do \$( ) (>, ;…) vale como pipeline simples" '/elif tok in PIPES:/,/return flow/ s/            return None/            pass/'
-  mutant interpe "o eval não revela o \$( ) que só imprime texto" 's/t = pipe_out(bytes.fromhex(m.group(1)).decode(), env) if m else/t = None if m else/'
-  mutant interpe "o eval não revela a variável que guardo" 's/ else env.get(v.group(1) or v.group(2)) if v else None/ else None/'
-  mutant interpe "o eval volta a ver só o texto da palavra" 's/return sub(" ".join(reveal(seg\[1:\], {\*\*st\["env"\], \*\*env})), cwd, env)/return sub(" ".join(seg[1:]), cwd, env)/'
-  mutant interpe "o eval revela só as variáveis do próprio comando, não as do shell" 's/reveal(seg\[1:\], {\*\*st\["env"\], \*\*env})/reveal(seg[1:], env)/'
+  mutant interpe "o eval não revela o \$( ) que só imprime texto" 's/t = pipe_out(bytes.fromhex(m.group(1)).decode(), may) if m else/t = None if m else/'
+  mutant interpe "o eval não revela a variável que guardo" 's/ else may.get(v.group(1) or v.group(2)) if v else \[w\]/ else None if v else [w]/'
+  mutant interpe "o eval volta a ver só o texto da palavra" 's/for v in reveal(seg\[1:\], seen(env, True))/for v in [seg[1:]]/'
+  mutant interpe "o eval revela só as variáveis do próprio comando, não as do shell" 's/reveal(seg\[1:\], seen(env, True))/reveal(seg[1:], {k: texts(v, {}) or [] for k, v in env.items()})/'
+  mutant interpe "o eval só vê as variáveis do shell, não o prefixo NOME=x do comando" 's/ + (texts(v, st\["may"\]) or \[\]))) for k, v in env.items()}}/)) for k, v in env.items()}}/'
+  mutant interpe "o eval só vê o prefixo NOME=x, não o texto que a variável tinha antes" 's/(st\["may"\].get(k, \[\]) if keep else \[\])/[]/'
+  mutant interpe "o shell aninhado (bash -c, NOME=x bash -c) começa sem os textos das variáveis" 's/st\["funcs"\], seen(env))/st["funcs"], {})/'
   mutant interpe "printf -v NOME não guarda o texto" 's/        elif c == "printf" and seg\[1:2\] == \["-v"\] and len(seg) > 3:/        elif False:/'
-  mutant interpe "printf -v guarda sempre \"não sei\"" 's/st\["env"\]\[seg\[2\]\] = "\$?" if t is None else t/st["env"][seg[2]] = "$?"/'
+  mutant interpe "printf -v guarda sempre \"não sei\" para o git" 's/setvar(seg\[2\], t, unsure, t\[0\] if t and len(t) == 1 else "\$?")/setvar(seg[2], t, unsure, "$?")/'
+  mutant interpe "trecho que pode não ter rodado APAGA o texto de antes (o inofensivo vence o nocivo)" 's/            st\["may"\]\[name\] = list(dict.fromkeys(st\["may"\].get(name, \[\]) + ts))  # /            st["may"][name] = ts  # /'
+  mutant interpe "trecho que pode não ter rodado não conta o texto novo (o nocivo que talvez foi gravado)" 's/        elif ts:$/        elif False:/'
+  mutant interpe "trecho que SEI que rodou não apaga o texto de antes" 's/            st\["may"\]\[name\] = ts or \[\]  # /            st["may"][name] = st["may"].get(name, []) + (ts or [])  # /'
+  mutant interpe "NOME=\$OUTRA e NOME=\$( ) não leem o texto da atribuição" 's/setvar(k, texts(v, st\["may"\]), unsure, v)/setvar(k, [v], unsure, v)/'
+  mutant interpe "export NOME=\$OUTRA e NOME=\$( ) não leem o texto da atribuição" 's/setvar(m.group(1), texts(m.group(2), st\["may"\]), unsure, m.group(2))/setvar(m.group(1), [m.group(2)], unsure, m.group(2))/'
+  mutant interpe "o argumento do %b do printf não decodifica os escapes" 's/ANSI.sub(ansi, next(it, "")) if m.group()\[-1\] == "b" else next(it, "")/next(it, "")/'
+  mutant interpe "o ( ) não desfaz o que o subshell atribuiu" 's/st\["cwd"\], st\["env"\], st\["may"\] = stack.pop()/st["cwd"] = stack.pop()[0]/'
+  mutant interpe "o case não marca a pilha: o ) do padrão fecha o subshell" 's/if seg\[c0:c0 + 1\] == \["case"\] and "in" in seg\[c0 + 2:\]:/if False:/'
+  mutant interpe "o esac não tira a marca do case: o ) que fecha o subshell vira fim de padrão" 's/elif seg\[c0:c0 + 1\] == \["esac"\] and None in stack:/elif False:/'
+  mutant interpe "o ) sempre fecha o subshell, mesmo com o case aberto" 's/if stack and stack\[-1\] is not None:/if stack:/'
+  mutant interpe "o case depois de if/while não é reconhecido (a palavra reservada conta como comando)" 's/c0 = next((i for i, w in enumerate(seg) if w not in KEYWORDS), len(seg))/c0 = 0/'
+  mutant interpe "função chamada por um trecho que pode não ter rodado atribui como se tivesse" 's/^        st\["maybe"\] = was or maybe$/        st["maybe"] = was/'
+  mutant interpe "a palavra de comando que é função, chamada por um trecho que pode não ter rodado, atribui como se tivesse" 's/            r = call(fw, blind, norun)/            r = call(fw, blind)/'
+  mutant interpe "função escondida atrás de um embrulho (command f), chamada por um trecho que pode não ter rodado, atribui como se tivesse" 's/                r = call(c, blind, unsure)  #.*/                r = call(c, blind)/'
+  mutant interpe "variantes demais passam sem conferir (o teto some)" 's/        if len(out) > MANY:/        if False:/'
+  mutant interpe "variantes demais bloqueiam como falha do guarda, sem dizer o motivo" 's/        except Many:/        except ZeroDivisionError:/'
   echo "-- contra um stub que só sai 0 (o servidor ANTES desta fatia)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"; printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$T/stub.py"
   r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,shell,wrap,lex,dest,cfg,tools,msg,check,cond,interp" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"
