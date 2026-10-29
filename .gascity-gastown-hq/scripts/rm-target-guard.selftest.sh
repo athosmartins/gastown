@@ -108,6 +108,13 @@ B env -C "$X" rm -rf build ‖ P env -C "$X" rm -f build ‖ B env -C .. rm -rf 
 B if true; then cd @H/gt-remote; rm -rf git; fi ‖ B { cd @H/gt-remote; rm -rf git; } ‖ B while true; do cd @H/gt-remote; rm -rf git; done ‖ B f() { cd @H/gt-remote; rm -rf git; }; f ‖ P if true; then cd @S/work; rm -rf a; fi
 B x="$(echo "a\"b")"; rm -rf @H/proj ‖ P x="$(echo "a\"b")"; rm -f @S/work/a ‖ B echo "$(echo hi; rm -rf @H/proj ‖ B echo "oi; rm -rf @H/proj ‖ P echo "oi; ls ‖ B echo ${x:-oi; rm -rf @H/proj
 B echo 'oi; rm -rf @H/proj ‖ P echo 'oi; ls ‖ B echo `echo '`; rm -rf @H/proj; echo '`' ‖ B echo "oi; r""m -rf @H/proj ‖ B echo "oi; $'\x72m' -rf @H/proj ‖ B rm --{a,b,c}{a,b,c}{a,b,c}{a,b,c} @H/gt/rig/shared
+B F=-rf; rm $F ~/gt ‖ B F=-fr; rm $F ~/gt ‖ B F='-r -f'; rm $F ~/gt ‖ B F=-rf; rm "$F" ~/gt ‖ B F=-rf; rm ~/gt $F ‖ B F=--recursive; rm $F ~/gt ‖ B F=-rf; rm $F ~/gt/rig/shared ‖ B F=-rf; rm $F ~/.ssh ‖ B F=-rf; sudo rm $F ~/gt
+B F=-rf; env rm $F ~/gt ‖ B F=-rf; command rm $F ~/gt ‖ B F=-rf; echo ~/gt | xargs rm $F ‖ B export F=-rf; bash -c 'rm $F ~/gt' ‖ B F=-rf; eval 'rm $F ~/gt' ‖ B for f in -rf; do rm $f ~/gt; done ‖ B for f in -v -rf; do rm $f ~/gt; done
+B rm ${RMFLAGS:--rf} ~/gt/rig/shared ‖ B rm ${RMFLAGS:--rf} ~/gt ‖ B rm $RMFLAGS ~/gt/rig/shared ‖ B rm $RMFLAGS ~/.claude ‖ B rm $(echo -rf) ~/gt ‖ B rm `echo -rf` ~/gt ‖ B rm {-rf,~/gt} ‖ B rm ~/gt {-rf,x} ‖ B rm {-r,-f} ~/gt
+B rm $UNSET ~/gt ‖ B rm -f $UNSET ~/gt ‖ P rm $UNSET ~/notes.txt ‖ P unlink $UNSET ~/gt ‖ P rm -f $UNSET ‖ P rm $UNSET/x ‖ P F=-f; rm $F ~/gt ‖ P F='-f -v'; rm $F ~/gt ‖ P F=-v; rm "$F" ~/gt ‖ P F=-rf; rm -- $F ~/gt ‖ P rm -- $F ~/gt
+B C='rm -rf ~/gt $(date)'; eval "$C" ‖ B C='rm -rf ~/gt $(date)'; $C ‖ B C='rm $(echo -rf) ~/gt'; bash -c "$C" ‖ B true && C='rm ~/.beads/{b..b} $(echo -f)'; $C ‖ P C='ls -la $(pwd)'; $C ‖ P C='echo $(date)'; eval "$C"
+B rm -rf {~/gt,x} ‖ B rm -rf x {y,~/gt} ‖ B rm --{a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q} $UNSET ‖ P rm -rf {x,@S/work/a}
+B F=-rf; rm $F -- ~/gt ‖ P rm ${U:-a,b} ‖ P U=; rm -rf ${U:-/tmp/ok,@H/gt} ‖ P D=aaaa; rm -rf ${D%%a} ‖ P F=-rf; unlink $F ~/gt
 """
 X = [("B", "C=\"rm -rf 'a @H/proj b'\"; $C"), ("B", "C='rm -rf \"a @H/proj b\"'; $C"), ("B", "C='rm -rf a # @H/proj'; $C"), ("B", "C='rm -rf a\\ @H/proj'; $C"), ("B", "C='rm -rf \"@H/proj\"'; eval \"$C\""), ("B", "C=\"rm -rf '@H/proj'\"; bash -c \"$C\""), ("B", "C='rm -Rf \"${HOME}/proj2\"'; eval \"$C\""), ("B", "echo `echo '`; rm -f @S/work/a; echo `echo '`"), ("P", "x=$((1 << 3 \n + 1))\nrm -f @S/work/a"), ("P", "x=$(( (1<<3)\n + 1 )); echo $x"), ("B", "x=$((rm -rf @H/proj) | wc)"), ("P", "for ((i=0;i<1<<3;i++)); do :; done\nrm -f @S/work/a"), ("B", "cat <<E\"O\"F\nx\nEOF\nrm -rf @H/proj"), ("B", "echo \"$(cat <<'EOF'\nit's\nEOF\n)\"; rm -rf @H/proj"), ("B", "git commit -m \"$(cat <<'EOF'\nfix: don't break\nEOF\n)\" && rm -rf @H/proj"), ("P", "git commit -m \"$(cat <<'EOF'\nfix: don't use rm -rf ~/gt-remote\nEOF\n)\""),
      ("B", "((x = 1 << 3))\nrm -rf @H/proj"), ("P", "((x = 1 << 3))\nrm -f @S/work/a"), ("B", "for ((i=0;i<1<<3;i++)); do :; done\nrm -rf @H/proj"), ("P", "echo $((1 << 3))\nrm -f @S/work/a"), ("P", "x=\"$(echo \"a\\\"b\")\"\nrm -f @S/work/a"),
@@ -115,6 +122,7 @@ X = [("B", "C=\"rm -rf 'a @H/proj b'\"; $C"), ("B", "C='rm -rf \"a @H/proj b\"';
      ("B", "tcsh <<'EOF'\nrm -rf ~/gt-remote\nEOF"),("B", "bash <<'EOF'\nrm -rf ~/gt-remote\nEOF"), ("B", "cat <<'EOF' | sh\nrm -rf ~/gt-remote\nEOF"), ("B", "python3 - <<'EOF'\nimport shutil\nshutil.rmtree('@H/gt-remote')\nEOF"), ("B", "echo \"import shutil; shutil.rmtree('@H/gt-remote')\" | python3 -"),
      ("P", "git commit -m \"$(cat <<'EOF'\nfix: stop using rm -rf ~/gt-remote\nEOF\n)\""), ("P", "cat <<'EOF'\nrm -rf ~\nEOF"), ("P", ""), ("P", "   "), ("B", "# c\nrm -rf ~/gt-remote"), ("B", "x=1\nrm -rf ~/gt-remote"),
      ("B", "X=~/gt-remote; bash <<'EOF'\nrm -rf \"$X\"\nEOF\nX=/tmp/safe"), ("B", "cd ~ && python3 - <<'EOF'\nimport shutil\nshutil.rmtree('gt-remote')\nEOF"), ("B", "cd ~ && bash <<'EOF'\nrm -rf gt-remote\nEOF"), ("P", "python3 - <<'EOF'\np = 'tests/foo.py'  # remove the old text, delete nothing\ns = open(p).read().replace('old', 'new')\nEOF"), ("B", nest(8)), ("P", nest(3)), ("B", "echo " + "x" * 300000), ("P", "echo " + "x" * 60000), ("B", "FOO=1 BAR=2 rm -rf ~/gt-remote")]
+X += [("B", "D=" + "a" * 60 + "; rm -rf ${D%%*a*a*a*b}"), ("B", "D=" + "a" * 300 + "; rm -rf ${D%%a}")]  # ${ } com padrão de muitos `*` ou valor longo: o regex recuaria por minutos; vale "não sei" e a remoção recursiva é barrada
 TABLE = []
 for line in DSL.strip().split("\n"):
     for part in line.split(" ‖ "):
@@ -157,6 +165,22 @@ def ceilings(m):
     return out
 
 
+def optglob(m):
+    """`rm *` numa pasta que faz de HOME e guarda um arquivo `-rf`: o bash entrega `rm -rf d` (injeção por curinga). Sem o arquivo, o mesmo comando não apaga pasta nenhuma."""
+    out, g = [], [os.path.realpath(tempfile.mkdtemp(prefix="rmtgop.")) for _ in (0, 1)]
+    for p in g:
+        os.makedirs(f"{p}/d")
+    open(f"{g[0]}/-rf", "w").close()
+    for p, cmd, want in ((g[0], "rm *", True), (g[1], "rm *", False), (g[0], "rm ./*", False)):  # `./*` entrega `./-rf` (operando, não opção): passa
+        os.environ["HOME"] = p
+        if bool(m.decide({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": p})) != want:
+            out.append(f"opção que vem de glob: `{cmd}` com {'`-rf`' if p == g[0] else 'a pasta sem `-rf`'} tem de {'bloquear' if want else 'passar'}")
+    os.environ["HOME"] = H
+    for p in g:
+        shutil.rmtree(p, ignore_errors=True)
+    return out
+
+
 results = []
 
 
@@ -187,6 +211,7 @@ check("ponta a ponta: bytes inválidos no stdin (locale UTF-8 estrita: sem o dec
 rc, err = e2e(cmd="ls", guard=crash)
 check("ponta a ponta: o guarda falhando num pedido Bash = bloqueado (nunca liberado)", rc == 2 and "o guarda falhou" in err, err[:120])
 check("tetos: curinga além de GLOB_MAX = alvo desconhecido, pasta além de LS_BUDGET = guarda repo, prazo LIMIT estourado = bloqueado (com os tetos de verdade os mesmos comandos passam: linhas da tabela)", not ceilings(m), str(ceilings(m)))
+check("opção do rm que vem de curinga: arquivo `-rf` na pasta faz `rm *` recursivo (e sem o arquivo passa)", not optglob(m), str(optglob(m)))
 
 # --- fuzzer contra o bash REAL: rm/unlink/rmdir/shred/find são FALSOS (primeiros no PATH), gravam verbo, cwd e argv exatamente como o shell os entregou ---
 LOG = f"{H}/log.bin"
@@ -243,7 +268,7 @@ def touched(cmd):
             ops, sel = [a for a in args if not a.startswith("-")], False
             rec_ = verb == "rm" and any((a[:1] == "-" and a[:2] != "--" and set(a[1:]) & set("rR")) or a.startswith("--rec") for a in args)
         for a in ops:
-            if not a or (re.search(r"[*?\[]", a) and not os.path.lexists(os.path.join(cwd, a))):  # `rm ""` (wrapper que engole `D=x;`) e texto com curinga que não existe: o rm não apaga nada
+            if not a or a[0] in "'\"" or (re.search(r"[*?\[]", a) and not os.path.lexists(os.path.join(cwd, a))):  # `rm ""` (wrapper que engole `D=x;`), texto com curinga que não existe e operando que começa com aspa LITERAL (bash 3.2 e 5 entregam `'/x/.git/y'` com as aspas dentro de `"${D:+'…'}"`: é um caminho relativo que ninguém citou): o rm não apaga nada
                 continue
             full = os.path.join(cwd, a)
             hit = hit or verdict(os.path.normpath(full), rec_, sel) or verdict(os.path.realpath(full), rec_, sel)
@@ -274,11 +299,12 @@ def spell(rel):
 def core(arg):
     v = rnd.choice(["rm"] * 5 + ["unlink", "shred", "rmdir"])
     f = rnd.choice(FLAGS) if v == "rm" else ""
+    f = rnd.choice([f] * 4 + ["${U:-" + f + "}", "$(echo " + f + ")"]) if f else f  # a opção também pode não estar escrita: padrão de variável ou substituição
     return " ".join(rnd.choice([f"{v} {f} {arg}", f"{v} {arg} {f}"]).split())
 
 
 def late(s, P):
-    """Variável com escopo (o bash decide quem vê o quê): prefixo, subshell, pipeline, `&&`, if, laço, função, read/printf -v/eval, `+=`, valor com espaço, linha de comando numa variável."""
+    """Variável com escopo (o bash decide quem vê o quê): prefixo, subshell, pipeline, `&&`, if, laço, função, read/printf -v/eval, `+=`, valor com espaço, linha de comando numa variável, opção do rm numa variável."""
     d, b = os.path.split(P)
     q = shlex.quote(core(s))
     return [f"D={s}; D=/tmp/ok " + core('"$D"'), f"D={s}; (D=/tmp/ok); " + core('"$D"'), f"D={s}; D=/tmp/ok | cat; " + core('"$D"'), f"D=/tmp/ok; true && D={s}; " + core('"$D"'), f"D={s}; false && D=/tmp/ok; " + core('"$D"'),
@@ -287,7 +313,8 @@ def late(s, P):
             f"D=/tmp/ok; f() {{ " + core('"$D"') + f"; }}; D={s}; f", f"D={shlex.quote(d)}; D+={shlex.quote('/' + b)}; " + core('"$D"'), f"D='/tmp/ok {s}'; " + core("$D"), f"T='/tmp/ok {s}'; for t in $T; do " + core('"$t"') + "; done",
             f"C={q}; $C", f"C={q}; eval \"$C\"", f"C={q}; bash -c \"$C\"", f"echo {s} | while read D; do " + core('"$D"') + "; done", f"case x in x) D={s};; esac; " + core('"$D"'), f"D={s}; case x in y) D=/tmp/ok;; esac; " + core('"$D"'),
             f"D={s}/; " + core('"${D%/}"'), f"D=x{s}; " + core('"${D#x}"'), f"D={s}; " + core('"${D:-/tmp/ok}"'), core('${U:-' + s + '}'), f"D={s}.bak; " + core('"${D%.bak}"'), f"D={s}; " + core('"${D/zz/}"'), f"D={s}; " + core('"${D:+' + s + '}"'),
-            f"nohup D={s}; D+=/x; " + core('"$D"')]
+            f"nohup D={s}; D+=/x; " + core('"$D"'),
+            f"F={shlex.quote(rnd.choice(FLAGS))}; rm $F {s}", f"F={shlex.quote(rnd.choice(FLAGS))}; rm {s} \"$F\"", f"for f in {shlex.quote(rnd.choice(FLAGS))}; do rm $f {s}; done", f"export F={shlex.quote(rnd.choice(FLAGS))}; bash -c 'rm $F {s}'"]
 
 
 def shape(s, P):
@@ -343,7 +370,7 @@ MUT = [('componente negado', 'if c in DENY_COMP and not (', 'if False and not ('
        ('heredoc de shell: cwd de todos os cd', 'hit = scan_bash(body, ever, depth + 1, denv) if', 'hit = scan_bash(body, cwds, depth + 1, denv) if'), ('heredoc de interpretador: cwd de todos os cd', 'inline(body, ever, depth + 1, denv)', 'inline(body, cwds, depth + 1, denv)'),
        ('find: nomes internos do git', '(holds(f) and any(GITNAMES.search(p) for p in selective))', 'False'), ('<( ) no lexer', 'c == "`" or (c in "<>" and nx == "(")', 'c == "`"'), ('saída de <( ) é programa', '(w[i] in "$<>" and w[i + 1:i + 2] == "(")', '(w[i] == "$" and w[i + 1:i + 2] == "(")'),
        ('echo|bash junta args', '[" ".join(ws[1:])] if ws and', '[] if ws and'), ('tamanho', 'if len(cmd) > MAX_CMD:', 'if False:'), ('profundidade', 'if depth > 6:', 'if depth > 600:'),
-       ('tilde', 'return home() + s[1:] if s == "~" or s.startswith("~/")', 'return s if s == "~" or s.startswith("~/")'), ('glob', 'hits = sorted(itertools.islice(glob.iglob(p), GLOB_MAX + 1))', 'hits = []'), ('chave {a,b}', 'bs = [t] if UNK in t else braces(t)', 'bs = [t]'),
+       ('tilde', 'return home() + s[1:] if s == "~" or s.startswith("~/")', 'return s if s == "~" or s.startswith("~/")'), ('glob', 'hits = sorted(itertools.islice(glob.iglob(p), GLOB_MAX + 1))', 'hits = []'), ('chave {a,b}', 'bs = [t] if UNK in t else [tilde(x) for x in braces(t)]', 'bs = [t]'),
        ('teto da chave', 'len(alts) <= 16', 'len(alts) <= 1600'), ('caixa', 'low = [unicodedata.normalize("NFC", x).casefold() for x in parts]', 'low = list(parts)'), ('HOME vence scratch', 'rel, relp = (low[k:], parts[k:]) if k is not None else (None, None)', 'rel, relp = None, None'),
        ('node_modules', 'any(c in ALLOW_COMP for c in parts)', 'False'), ('.cache', 'any(relp[:len(a)] == list(a) for a in ALLOW_HOME)', 'False'), ('pyc', '(f.endswith(".pyc") and not os.path.isdir(f))', 'False'), ('rimraf', 'or verb == "rimraf"', 'or False'),
        ('popd', 'if os.path.basename(ws[0]) == "popd":', 'if False:'), ('lançador opaco', 'if verb in OPAQUE:', 'if False:'), ('source e .', 'verb in ("eval", "source", ".")', 'verb == "eval"'), ('shells ampliados', '"ash", "csh", "tcsh", "fish", "mksh"', '"ash", "mksh"'), ('interpretadores: pypy', 'pypy[\\d.]*|', ''), ('interpretadores: R, julia, osascript', '|tclsh|wish|Rscript|julia|osascript|jshell|groovy', ''), ('rm( como API de remoção', '(?:unlink|rmdir|rm)(?=', '(?:unlink|rmdir)(?='), ('-c genérico para corredor desconhecido', 'if a in ("-c", "--command") and x + 1 < len(args)', 'if False and x + 1 < len(args)'),
@@ -396,7 +423,18 @@ MUT = [('componente negado', 'if c in DENY_COMP and not (', 'if False and not ('
        ('heredoc com delimitador entre aspas não executa $( )', 'm.group(3) is None or "\\\\" in m.group(0)', 'True'), ('heredoc: delimitador entre aspas ou com barra', 'm.group(3) is None or "\\\\" in m.group(0)', 'False'),
        ('bash -c "$( )": a saída é programa', 'for body in [b for a in args for b in substitutions(a)]:', 'for body in []:'), ('saída de $( ): heredoc é programa', 'code_of(tk) + [d for d, _, _ in dcs]', 'code_of(tk)'),
        ('crase: aspas não escondem o fecho', 'elif e == "}" and c in "\'\\"": q = None if q == c else (q or c)  #', 'elif c in "\'\\"": q = None if q == c else (q or c)  #'), ('$((: o corpo é lido como (( ))', 'w.startswith("$((", i)', 'False'), ('valor de variável: o bash só parte em branco (aspas e # dele são letras)', 'for rd in (x.split(), [str(t) for t in lex(x)[0]]):', 'for rd in ([str(t) for t in lex(x)[0]],):'),
-       ('valor de variável: eval e bash -c leem o valor como texto de shell', 'for rd in (x.split(), [str(t) for t in lex(x)[0]]):', 'for rd in (x.split(),):')]
+       ('valor de variável: eval e bash -c leem o valor como texto de shell', 'for rd in (x.split(), [str(t) for t in lex(x)[0]]):', 'for rd in (x.split(),):'),
+       ('opção que não está escrita vale como escrita', 'ops, rec = rm_args(verb, xo + args)', 'ops, rec = rm_args(verb, args)'), ('opção que não está escrita entra antes do --', 'ops, rec = rm_args(verb, xo + args)', 'ops, rec = rm_args(verb, args + xo)'),
+       ('pedaço que não sei: os operandos que sei valem como recursivos', 'r = classify(p, rec or maybe, selective, pat)', 'r = classify(p, rec, selective, pat)'), ('pedaço que não sei: só o rm', 'maybe=maybe and verb == "rm")', 'maybe=maybe)'),
+       ('há pedaço que não sei', 'any(UNK in t for t in ts)', 'False'), ('opção só antes do --', 'ws = args[:args.index("--") if "--" in args else len(args)]', 'ws = args'),
+       ('opção: palavra com $ ou crase', 'for a in ws if re.search(r"[$`]", a) for t in pieces(a, cwd, env)]', 'for a in [] for t in pieces(a, cwd, env)]'),
+       ('opção: arquivo `-rf` do curinga', '[os.path.basename(p) for a in ws if "/" not in a and re.search(r"[*?\\[]", a) for p, _ in candidates(a, [cwd], env) if p]', '[]'),
+       ('opção: curinga só em palavra sem barra', 'if "/" not in a and re.search(r"[*?\\[]", a) for p, _ in candidates', 'if re.search(r"[*?\\[]", a) for p, _ in candidates'),
+       ('til dentro da chave: o bash expande a chave antes do til', 'bs = [t] if UNK in t else [tilde(x) for x in braces(t)]', 'bs = [t] if UNK in t else braces(t)'),
+       ('variável vira comando: o texto recebido resolve, então a regra não dispara', 'if any(RM_TEXT.search(t) and UNK in "".join(expand(t, cwds[0], env)) for t in', 'if any(RM_TEXT.search(t) for t in'),
+       ('opção: chave que gera opção (palavra que não começa com -)', '+ [b for a in ws if "{" in a for b in braces(a)] +', '+'),
+       ('variável vira comando: valor com $( ) e texto que cita remoção', 'if any(RM_TEXT.search(t) and UNK in', 'if False and any(RM_TEXT.search(t) and UNK in'), ('o texto recebido pela variável é guardado', 'ST["raw"].setdefault(m.group(1), set()).add(w[m.end():])', 'pass'),
+       ('param: valor longo', 'or len(v) > 256 or w.count("*") > 2: return [UNK]', 'or w.count("*") > 2: return [UNK]'), ('param: muitos *', 'or len(v) > 256 or w.count("*") > 2: return [UNK]', 'or len(v) > 256: return [UNK]')]
 alive = []
 for name, old, new in MUT:
     if SRC.count(old) != 1:
@@ -404,7 +442,7 @@ for name, old, new in MUT:
     open(f"{H}/mut.py", "w").write(SRC.replace(old, new))
     try:
         mut = load(f"{H}/mut.py")
-        if not set(run_table(mut) + ceilings(mut)) - set(bad):  # morto = produz linha de falha NOVA (com a tabela-base já falhando, qualquer mutante "reprovaria")
+        if not set(run_table(mut) + ceilings(mut) + optglob(mut)) - set(bad):  # morto = produz linha de falha NOVA (com a tabela-base já falhando, qualquer mutante "reprovaria")
             alive.append(name + ": SOBREVIVEU")
     except Exception:  # noqa: BLE001 — mutante que quebra o import também foi pego
         pass
