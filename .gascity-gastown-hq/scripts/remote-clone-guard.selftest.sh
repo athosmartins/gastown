@@ -912,6 +912,11 @@ PYEOF
   b 2 "budget: ...e um \$( ) depois da aninhada (o diretório que ele vê é o \"não sei\", não o do cd de g)" "f() { :; function g { cd $OWN; }; echo \$(git commit -m x); }; cd $OTH; f"
   b 2 "budget: ...e a variável: export GIT_DIR=<próprio> dentro da aninhada não vale (GIT_DIR=<alheio> de fora)" "f() { function g { export GIT_DIR=$OWN/.git; }; }; export GIT_DIR=$OTH/.git; f; git commit -m x"
   b 0 "budget: controle — um grupo { cd <próprio>; } no começo do corpo de f RODA: o git seguinte escreve no próprio" "f() { { cd $OWN; }; git commit -m x; }; cd $OTH; f"
+  b 2 "budget: texto de python (foo(a, b)) num heredoc deixava a bandeira de definição velha: o grupo { } seguinte, com um git no alheio, era engolido sem conferir" "python3 - <<'EOF'
+foo(a, b)
+EOF
+{ git -C $OTH commit -m x; }"
+  b 2 "budget: ...e a cabeça g() aninhada, g() { k() { cd <alheio>; }; k; g() { :; }; }; g; { git commit; } (o guarda de antes nem termina nele)" "g() { k() { cd $OTH; }; k; g() { :; }; }; g; { git commit -m x; }"
   b 2 "budget: ...a definição que pode não ter rodado (true || function f { cd <próprio>; }): o cd de f não vale" "cd $OTH; true || function f { cd $OWN; }; f; git commit -m x"
   b 2 "budget: ...a região perdida sobrevive a uma chamada feita dentro dela (depois do h, o cd ainda é o do corpo que não roda)" "f() { :; function g { :; h; cd $OWN; }; git commit -m x; }; h() { :; }; cd $OTH; f"
   b 2 "budget: f() { g() { git commit; }; }; f; cd <alheio>; g — a aninhada passa a existir quando f roda, e a chamada dela de fora é conferida" "f() { g() { git commit -m x; }; }; f; cd $OTH; g"
@@ -1104,6 +1109,7 @@ echo "== $((n-fails))/$n ok =="
   mutant budget "function g { aninhada não dá o nome à função (só a forma g() { dá)" 's/nm = seg\[1\] if seg\[0\] == "function" and seg\[1:2\] else st.pop("nhead", None)/nm = st.pop("nhead", None)/'
   mutant budget "a reexecução percorre a lista viva (uma função que se redefine acrescenta a si mesma sem fim)" 's/body = list(st\["funcs"\]\[c\])  # cópia/body = st["funcs"][c]  # cópia/'
   mutant budget "registrar uma aninhada copia a lista sem entrar na conta do teto" 's/^                    tick(len(st.get("rest", ())))  #.*/                    pass/'
+  mutant budget "a cabeça NOME( que não foi seguida de { deixa a bandeira de definição velha (o próximo grupo { } vira corpo, sem conferir)" 's/^        if seg and seg\[0\] != "{":$/        if False:/'
   mutant budget "o corpo que começa por um grupo { } parece uma definição aninhada" 's/";" if prev == ")" else prev/prev/'
   echo "-- contra um stub que só sai 0 (o servidor ANTES desta fatia)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"; printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$T/stub.py"
