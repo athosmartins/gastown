@@ -17,8 +17,8 @@
 #   some (subgrupos: lexq aspas e `\` · lexs redirecionamento sem alvo · lexe palavra vazia · lexd `$'…'`/`$"…"` · lexu aspa ou `\` que não fecha, também num comentário `#` · lexr `$( )` do alvo
 #   de redirecionamento · lexh heredoc/`<<<`/find · lexp os controles que NÃO bloqueiam) · dest — o lugar onde o git escreve vem como ARGUMENTO, sem -C (worktree remove ../outro,
 #   clone/init <outro>/x, checkout-index --prefix=…; subgrupos destb e destp) · interp — o texto que um INTERPRETADOR (python -c, node -e, perl -e, ruby -e, awk) ou um pipe entrega a um
-#   shell roda: as 12 formas que só o cc-safety-net pegava (ga-tphd15o; subgrupos interpc código de interpretador, interpp pipe que um shell lê, interpe base64/rev/eval/printf -v).
-# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (205 mutantes); e
+#   shell roda: as 12 formas que só o cc-safety-net pegava (ga-tphd15o; subgrupos interpc código de interpretador e os delimitadores de literal que o guarda lê — q<…>, %Q{…}, [[…]] —, interpp pipe que um shell lê, interpe base64/rev/eval/printf -v e a atribuição/cd dentro de bloco em VÁRIAS linhas).
+# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (214 mutantes); e
 #   contra um stub que só sai 0 (o servidor ANTES desta fatia: o hook do mini era `drop` e nada o substituía), quase tudo falha.
 # VARIÁVEIS: RCG_UNDER_TEST (guarda a testar) · RCG_ONLY (grupos, vírgula) · RCG_NO_MUTANTS=1
 # BUDGET (grupo à parte, ga-tih62nv): o pedido que fazia o guarda girar SEM FIM (e que o hook deixava seguir sem conferência ao estourar o prazo de 600 s do Claude Code) termina;
@@ -464,6 +464,9 @@ g_cond() {  # gate da fatia 6a (tentativa 3): a variável em que o guarda DECIDE
   b 2 "cond: cd <alheio>; false && cd <próprio> && true; git commit (repro do revisor: a cadeia acabou no ;)" "cd $OTH; false && cd $OWN && true; git commit --allow-empty -m INTRUDER"
   b 2 "cond: [ -d x ] && cd <próprio> && git status; git commit, com cwd no alheio" "[ -d /tmp ] && cd $OWN && git status >/dev/null; git commit -m x" "$OTH"
   b 2 "cond: case x in x) cd <próprio>;; esac; git commit, com cwd no alheio" "case x in x) cd $OWN;; esac; git commit -m x" "$OTH"
+  # O cd de UM ramo do case não vale no ramo seguinte (a contagem de blocos só zera o diretório no esac, então o ramo b ainda veria o cd do ramo a): sem o `case)`/`;;` do cd, estes passam.
+  b 2 "cond: case x in a) cd <próprio> ;; b) git commit ;; esac, com cwd no alheio (o cd do ramo a não vale no b)" "case x in a) cd $OWN ;; b) git commit -m x ;; esac" "$OTH"
+  b 2 "cond: o mesmo case em várias linhas, com cwd no alheio" "case x in"$'\n'"a) cd $OWN ;;"$'\n'"b) git commit -m x ;;"$'\n'"esac" "$OTH"
   b 2 "cond: false && { cd <próprio> && true; }; git commit, com cwd no alheio" "false && { cd $OWN && true; }; git commit -m x" "$OTH"
   b 2 "cond: { cd <próprio>; } & git commit, com cwd no alheio (grupo em background)" "{ cd $OWN; } & git commit -m x" "$OTH"
   b 2 "cond: f() { cd <próprio>; }; git commit, com cwd no alheio (função nunca chamada)" "f() { cd $OWN; }; git commit -m x" "$OTH"
@@ -646,6 +649,17 @@ g_interp() {  # ga-tphd15o (achado do ga-nkfwixz, cc-safety-net como oráculo): 
   for c in "php -r 'echo 1;'" "lua -e 'print(1)'" "bun -e \"console.log(1)\"" "deno eval \"console.log(1)\"" "php -r 'system(\"git -C $OWN commit -m x\");'" "perl -e 'system(q!git -C $OWN commit -m x!)'"; do
     b 0 "pass: interp: php/lua/deno/bun/perl que não escrevem no alheio: $c" "$c"
   done
+  # Gate ga-tphd15o, tentativa 2: q<…>/qq<…>/qx<…> do perl, %x<…>/%Q{…}/%q<…> do ruby e [[…]]/[=[…]=] do lua passavam como "nada a conferir" (o guarda dizia ler "qualquer delimitador").
+  # Cada forma que o guarda lê tem um caso que bloqueia; as que ele NÃO lê estão no runbook ("Continua sem ver"), nunca num comentário que prometa mais.
+  for c in "perl -e 'system(q<$g>)'" "perl -e 'system(qq<$g>)'" "perl -e 'qx<$g>'" "ruby -e '%x<$g>'" "ruby -e 'system(%Q{$g})'" "ruby -e 'system(%Q<$g>)'" "ruby -e 'system(%q<$g>)'" \
+           "ruby -e 'system(%Q[$g])'" "ruby -e 'system(%q($g))'" "perl -e 'system(q <$g>)'" "lua -e 'os.execute([[$g]])'" "lua -e 'os.execute([=[$g]=])'" "lua -e 'os.execute([==[$g]==])'" \
+           "lua -e 'io.popen([[echo hi]]); os.execute([[$g]])'" "perl -e 'print q<hi>; system(q<$g>)'"; do
+    b 2 "interp: <…> do perl/ruby, %Q/%q do ruby e [[…]] do lua são literais lidos: $c" "$c"
+  done
+  for c in "perl -e 'system(q<git -C $OWN commit -m x>)'" "perl -e 'qx<git status>'" "ruby -e 'system(%Q{git -C $OWN commit -m x})'" "ruby -e 'system(%q<git -C $OTH log>)'" "lua -e 'os.execute([[git -C $OWN commit -m x]])'" \
+           "lua -e 'print([[git -C $OTH log]])'" "lua -e 'os.execute([=[git -C $OWN commit -m x]=])'" "perl -e 'print q<hi>'" "ruby -e 'puts %Q{hi}'" "lua -e 'print([[hi]])'"; do
+    b 0 "pass: interp: <…>, %Q/%q e [[…]] que não escrevem no alheio: $c" "$c"
+  done
   fi
   if grp interpp interp; then
   for c in "echo '$g' | sh" "printf '%s\\n' '$g' | bash -s" "echo $g | sh" "echo \"$g\" | bash" "printf 'cd %s && git reset --hard\\n' $OTH | sh" "printf '%s\\n' 'cd $OTH' 'git reset --hard' | bash" \
@@ -678,6 +692,30 @@ g_interp() {  # ga-tphd15o (achado do ga-nkfwixz, cc-safety-net como oráculo): 
            "printf -v GIT_DIR '%s' $OTH/.git; [ -f /nonexistent ] && printf -v GIT_DIR '%s' $OWN/.git; git commit -m x"; do
     b 2 "interp: o texto de antes ou o novo — o trecho pode não ter rodado: $c" "$c"
   done
+  # Os MESMOS blocos em VÁRIAS linhas (gate ga-tphd15o, tentativa 2): a atribuição sozinha numa linha dentro de if/for/while/until/case/else também pode não ter rodado; só a forma de
+  # uma linha estava coberta (o `then`/`do` do trecho a marcava), e a de várias linhas apagava o texto nocivo de antes. O mesmo vale para o cd e o GIT_DIR dentro do bloco.
+  local nl=$'\n'
+  for c in "c='$g'${nl}if [ -f /nonexistent ]; then${nl}c=ok${nl}fi${nl}eval \"\$c\"" "c='$g'${nl}for i in 1; do${nl}c=ok${nl}done${nl}eval \"\$c\"" \
+           "c='$g'${nl}while false; do${nl}c=ok${nl}done${nl}eval \"\$c\"" "c='$g'${nl}until true; do${nl}c=ok${nl}done${nl}eval \"\$c\"" \
+           "c='$g'${nl}if [ -f /nonexistent ]; then${nl}c=a${nl}else${nl}c=b${nl}fi${nl}eval \"\$c\"" "c='$g'${nl}if [ -d / ]; then${nl}if [ -f /nonexistent ]; then${nl}c=ok${nl}fi${nl}fi${nl}eval \"\$c\"" \
+           "c='$g'${nl}case x in${nl}y) c=ok ;;${nl}esac${nl}eval \"\$c\"" "c='$g'${nl}if [ -f /nonexistent ]; then${nl}printf -v c '%s' ok${nl}fi${nl}eval \"\$c\"" \
+           "c='$g'${nl}if [ -f /nonexistent ]; then${nl}export c=ok${nl}fi${nl}echo \"\$c\" | sh" "c='$g'${nl}if [ -d / ]; then if [ -f /nonexistent ]; then${nl}true${nl}fi${nl}c=ok${nl}fi${nl}eval \"\$c\"" \
+           "c='$g'${nl}if [ -f /nonexistent ]; then${nl}  c=ok${nl}fi${nl}echo \"\$c\" | sh" "export GIT_DIR=$OTH/.git${nl}if [ -f /nonexistent ]; then${nl}export GIT_DIR=$OWN/.git${nl}fi${nl}git commit -m x" \
+           "GIT_DIR=$OTH/.git${nl}for i in 1; do${nl}GIT_DIR=$OWN/.git${nl}done${nl}git commit -m x" "cd $OTH${nl}if [ -f /nonexistent ]; then${nl}cd $OWN${nl}fi${nl}git commit -m x" \
+           "cd $OTH${nl}for i in 1; do${nl}cd $OWN${nl}done${nl}git commit -m x" "cd $OTH${nl}while false; do${nl}cd $OWN${nl}done${nl}git commit -m x" \
+           "c='$g'${nl}if [ -d / ]; then${nl}case x in${nl}y) true ;;${nl}esac${nl}c=ok${nl}fi${nl}eval \"\$c\""; do
+    b 2 "interp: bloco em várias linhas — a atribuição ou o cd dentro dele pode não ter rodado: $c" "$c"
+  done
+  # Controles: depois do fi/done/esac a atribuição que SEI que rodou volta a apagar o texto de antes (a profundidade do bloco desce); dentro do bloco o cd vale até o fi.
+  for c in "c='$h'${nl}if [ -f /nonexistent ]; then${nl}c=ok${nl}fi${nl}eval \"\$c\"" "if [ -d / ]; then${nl}c=ok${nl}fi${nl}eval \"\$c\"" \
+           "c='$g'${nl}if [ -d / ]; then${nl}true${nl}fi${nl}c=ok${nl}eval \"\$c\"" "c='$g'${nl}for i in 1; do${nl}true${nl}done${nl}c=ok${nl}eval \"\$c\"" \
+           "c='$g'${nl}case x in${nl}y) true ;;${nl}esac${nl}c=ok${nl}eval \"\$c\"" "c='$g'${nl}if [ -d / ]; then if [ -f /nonexistent ]; then${nl}true${nl}fi${nl}fi${nl}c=ok${nl}eval \"\$c\"" \
+           "cd $OWN${nl}if [ -f /nonexistent ]; then${nl}git commit -m x${nl}fi" "cd $OTH${nl}if [ -d / ]; then${nl}cd $OWN${nl}git commit -m x${nl}fi" \
+           "export GIT_DIR=$OTH/.git${nl}if [ -d / ]; then${nl}true${nl}fi${nl}export GIT_DIR=$OWN/.git${nl}git commit -m x"; do
+    b 0 "pass: interp: bloco em várias linhas que não escreve no alheio, e o texto atribuído DEPOIS do bloco vence: $c" "$c"
+  done
+  # Uma abertura atrás de then/do/else (`then if x; then`) também abre bloco: sem contá-la, o 1º fi zera a profundidade com o bloco de fora ainda aberto.
+  b 2 "interp: if aninhado atrás do then, na mesma linha — o fi de dentro não fecha o de fora" "c='$g'${nl}if [ -d / ]; then if [ -f /nonexistent ]; then${nl}true${nl}fi${nl}c=ok${nl}fi${nl}eval \"\$c\""
   # O texto passa de variável para variável, vem de $( ) guardado, de %b, do prefixo do comando, ou de dentro de um shell aninhado.
   for c in "c=\$(echo '$g'); eval \"\$c\"" "c=\$(echo '$g'); echo \"\$c\" | sh" "c='$g'; d=\$c; eval \"\$d\"" "c='$g'; d=\"\$c\"; eval \"\$d\"" \
            "printf '%b' 'cd $OTH\\ngit reset --hard' | sh" "printf '%b\\n' 'cd $OTH\\ngit reset --hard' | sh" "c='$g'; c=ok eval \"\$c\"" "c=ok; c='$g' eval '\$c'" \
@@ -1279,7 +1317,10 @@ echo "== $((n-fails))/$n ok =="
   mutant interpc "php -r deixa de ser interpretador" 's/|ruby|php|lua)/|ruby|lua)/'
   mutant interpc "lua -e deixa de ser interpretador" 's/|ruby|php|lua)/|ruby|php)/'
   mutant interpc "deno eval e bun -e deixam de ser interpretadores" 's/|node(?:js)?|deno|bun|/|node(?:js)?|/'
-  mutant interpc "o perl só aceita q{} q() q[] como delimitador (q!…! e q#…# passam)" 's/\\6)", re.S)/\\6(?!))", re.S)/'
+  mutant interpc "o perl só aceita q{} q() q[] como delimitador (q!…! e q#…# passam)" 's/\\6|<(/\\6(?!)|<(/'
+  mutant interpc "<…> do perl e do ruby (q<>, qq<>, qx<>, %x<>, %Q<>) deixa de ser literal" 's/|<(\[^>\]\*)>)/|<(?!)(\[^>\]\*)>)/'
+  mutant interpc "[[…]] e [=[…]=] do lua deixam de ser literais" 's/\\9\\]", re.S)/\\9\\](?!)", re.S)/'
+  mutant interpc "%Q e %q do ruby deixam de ser literais (só %x)" 's/%\[xQq\]/%x/'
   mutant interpc "awk deixa de ser interpretador" 's/|\[gmn\]?awk"/"/'
   mutant interpc "o código de nenhum interpretador é aberto" 's/        elif INTERP.fullmatch(c):/        elif False:/'
   mutant interpc "o literal entre aspas do código não é conferido sozinho (perl system \"…\" sem parêntese, getline do awk)" 's/ + \[ANSI.sub(ansi, (\[x for x in g if x\] or \[""\])\[-1\]) for g in LIT.findall(t)\]:/:/'
@@ -1303,8 +1344,8 @@ echo "== $((n-fails))/$n ok =="
   mutant interpp "printf reaproveita o formato só uma vez" 's/range(0, max(len(a) - 1, 1) if n else 1, n or 1)/range(0, 1)/'
   mutant interpp "printf -- não é pulado" 's/^    a = a\[1:\] if c == "printf" and a\[:1\] == \["--"\] else a/    a = a/'
   mutant interpp "VAR=x e command antes do echo escondem o produtor do pipe" 's/^    _, s, _, opq = peel(seg)$/    s, opq = seg, False/'
-  mutant interpc "qx{…} e q{…}/qq{…} do perl deixam de ser literais" 's/(?:\\bq\[qx\]?|%x)/(?:%x)/'
-  mutant interpc "%x(…) do ruby deixa de ser literal" 's/(?:\\bq\[qx\]?|%x)/(?:\\bq[qx]?)/'
+  mutant interpc "qx{…} e q{…}/qq{…} do perl deixam de ser literais" 's/(?:\\bq\[qx\]?|%\[xQq\])/(?:%[xQq])/'
+  mutant interpc "%x(…) do ruby deixa de ser literal" 's/(?:\\bq\[qx\]?|%\[xQq\])/(?:\\bq[qx]?)/'
   mutant interpp "tee não repassa o stdin" 's/(c == "tee" or c == "cat"/(c == "tee1" or c == "cat"/'
   mutant interpp "cat sem arquivo não repassa o stdin" 's/ or c == "cat" and all(/ or c == "cat1" and all(/'
   mutant interpp "cat com arquivo repassa o stdin (lê o arquivo, não o pipe)" 's/all(x\[:1\] == "-" for x in a)/True/'
@@ -1337,6 +1378,12 @@ echo "== $((n-fails))/$n ok =="
   mutant interpe "função chamada por um trecho que pode não ter rodado atribui como se tivesse" 's/^        st\["maybe"\] = was or maybe$/        st["maybe"] = was/'
   mutant interpe "a palavra de comando que é função, chamada por um trecho que pode não ter rodado, atribui como se tivesse" 's/            r = call(fw, blind, norun)/            r = call(fw, blind)/'
   mutant interpe "função escondida atrás de um embrulho (command f), chamada por um trecho que pode não ter rodado, atribui como se tivesse" 's/                r = call(c, blind, unsure)  #.*/                r = call(c, blind)/'
+  mutant interpe "if/for/while/until em várias linhas não abrem bloco (a atribuição de dentro vale como certa)" 's/st\["bdepth"\] = st.get("bdepth", 0) + 1/pass/'
+  mutant interpe "fi/done/esac não fecham o bloco (a atribuição de DEPOIS dele vira \"talvez\")" 's/st\["bdepth"\] = max(st.get("bdepth", 0) - 1, 0)/pass/'
+  mutant interpe "dentro do bloco de várias linhas o trecho não é \"pode não ter rodado\"" 's/ or st.get("bdepth", 0) > 0  # o trecho/  # o trecho/'
+  mutant interpe "o cd dentro do bloco de várias linhas vale depois do fi" 's/if (blk or st.get("bdepth", 0) > 0) and new is not None:/if blk and new is not None:/'
+  mutant interpe "o case não conta como bloco (o esac fecha o if de fora)" 's/("if", "for", "while", "until", "case", "select")/("if", "for", "while", "until", "select")/'
+  mutant interpe "then/do na frente de um if (then if x; then) escondem a abertura" 's/^LEAD = {"then", "do", /LEAD = {/'
   mutant interpe "variantes demais passam sem conferir (o teto some)" 's/        if len(out) > MANY:/        if False:/'
   mutant interpe "variantes demais bloqueiam como falha do guarda, sem dizer o motivo" 's/        except Many:/        except ZeroDivisionError:/'
   echo "-- contra um stub que só sai 0 (o servidor ANTES desta fatia)"

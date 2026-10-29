@@ -61,6 +61,7 @@ WOPT = {
 }
 WRAP, SPLIT = set(WOPT), {"-S", "--split-string"}  # env -S 'git -C x commit': o valor da opção é um comando inteiro
 KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "{", "!", "coproc"}  # palavras reservadas que vêm ANTES de um comando: o git depois delas é o comando do trecho
+LEAD = {"then", "do", "else", "elif", "!", "{", "time"}  # palavras que só LIGAM um bloco ao comando seguinte (o comando de verdade é a próxima)
 OPAQUE = {"flock", "ionice", "chrt", "taskset", "parallel", "su", "runuser", "ssh", "script", "trap", "watch", "unshare", "nsenter", "chroot", "setpriv", "numactl",
           "strace", "fakeroot", "systemd-run", "busybox", "dbus-run-session", "xvfb-run", "unbuffer", "caffeinate", "tmux", "screen", "expect"}  # lançadores que não modelo: lista FECHADA (ver LIMITES)
 GIT_FLAG = re.compile(r"-[Phv]|--(?:no-pager|bare|no-replace-objects|no-lazy-fetch|no-optional-locks|no-advice|literal-pathspecs|glob-pathspecs|noglob-pathspecs|"
@@ -71,7 +72,7 @@ SHELLY = re.compile(r"[$`*?\[{]")
 PIECE = re.compile(r"&&|\|\||\|&|;;|[;&|()]|[<>]+&?")
 SUBST = re.compile(r"\$S([0-9a-f]*)\$")
 INTERP = re.compile(r"(?:python|pypy|perl|ruby|php|lua)[\d.]*|node(?:js)?|deno|bun|[gmn]?awk")  # interpretador cujo código (python -c, node -e, perl -e, php -r, lua -e, deno eval, bun -e, programa do awk) pode rodar um shell: o texto entre aspas dele é conferido como comando
-LIT = re.compile(r"'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\"|(?:\bq[qx]?|%x)\s*(?:\{([^}]*)\}|\(([^)]*)\)|\[([^\]]*)\]|([^\w\s{(\[<'\"])((?:(?!\6).)*)\6)", re.S)  # literal do código de um interpretador: entre aspas simples ou duplas, ou q{…}/qq{…}/qx{…}/%x(…) do perl e do ruby, com qualquer delimitador que o perl aceita (q!…!, q#…#, q/…/: um grupo por forma, e o delimitador sozinho é um grupo)
+LIT = re.compile(r"'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\"|(?:\bq[qx]?|%[xQq])\s*(?:\{([^}]*)\}|\(([^)]*)\)|\[([^\]]*)\]|([^\w\s{(\[<'\"])((?:(?!\6).)*)\6|<([^>]*)>)|\[(=*)\[(.*?)\]\9\]", re.S)  # literal do código de um interpretador: entre aspas simples ou duplas; q{…}/qq{…}/qx{…} do perl e %x/%Q/%q do ruby com {} () [] <> ou outro delimitador de UM caractere que não seja letra, dígito, _, espaço nem aspa (q!…!, q#…#, q/…/); [[…]] e [=[…]=] do lua. Um grupo por forma (o extrator pega o último não vazio); {} () [] <> não aninham: leio até o PRIMEIRO fechamento (ver LIMITES)
 CODECD = re.compile(r"chdir|\bcwd\b|\bGIT_[A-Z_]+")  # o código muda o diretório ou o repositório do shell que abre (os.chdir, cwd=, {'cwd': …}, GIT_DIR/GIT_WORK_TREE no env): o git de dentro roda em lugar "não sei". Qualquer `cwd` vale, até a chave de um JSON (falso positivo assumido); nome de variável montado em pedaços não vejo
 PIPES, VAR, MANY = ("|", "|&"), re.compile(r"\$(\w+)|\$\{(\w+)\}"), 64
 PFMT = re.compile(r"%(?:%|[-+ #0]*\d*(?:\.\d+)?[a-zA-Z])")  # uma conversão do printf (%s, %b, %5d) ou o %% literal
@@ -678,8 +679,13 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None, ma
             if term == "&":
                 st["cwd"] = None  # `{ …; } &`: o grupo roda em background; o cd de dentro não vale aqui fora
             return None
+        lead = next((x for x in seg if x not in LEAD), "")  # a 1ª palavra que não é palavra reservada de ligação (`then if x; …` abre um bloco)
+        if lead in ("fi", "done", "esac"):  # bloco em VÁRIAS linhas (`if …; then⏎ c=ok⏎ fi`): quem está dentro de if/for/while/until/case/select PODE não ter rodado, igual à forma de uma linha (que o `then`/`do` do trecho já marca)
+            st["bdepth"] = max(st.get("bdepth", 0) - 1, 0)
+        elif lead in ("if", "for", "while", "until", "case", "select"):
+            st["bdepth"] = st.get("bdepth", 0) + 1
         fw, done = next((x for x in seg if x not in KEYWORDS and not ASSIGN.fullmatch(x)), ""), ""  # a palavra que o shell chama: a 1ª que não é VAR=x nem palavra reservada
-        norun = bool(st.get("lost")) or kw or blk or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&") or bool(st.get("maybe"))  # o trecho pode não ter rodado (maybe = o corpo de uma função chamada por um trecho assim)
+        norun = bool(st.get("lost")) or kw or blk or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&") or bool(st.get("maybe")) or st.get("bdepth", 0) > 0  # o trecho pode não ter rodado (maybe = o corpo de uma função chamada por um trecho assim; bdepth = dentro de um bloco aberto em linha anterior)
         if fw in st.get("funcs", {}) and fw not in st.setdefault("calling", set()):  # uma função com nome de comando que trato adiante (bash, env, cd, find, eval, export, sudo, git…) é chamada como FUNÇÃO: o corpo roda, e o resto do trecho segue conferido como se o nome fosse o programa (command X e env X ignoram a função: lado fechado)
             r = call(fw, blind, norun)
             if r:
@@ -707,7 +713,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None, ma
                 new = None
             if done:
                 new = None  # a função chamada cd/pushd/popd foi reexecutada acima: o que ela fez de verdade com o diretório eu não sei, e o cd modelado aqui pode nem ter rodado
-            if blk and new is not None:
+            if (blk or st.get("bdepth", 0) > 0) and new is not None:
                 st["cdblk"] = True  # cd dentro de um ramo: vale até o fi/done/esac/else/elif
             if prev == "&&" and new is not None:
                 st["chain"] = True  # cd que não é o 1º da cadeia (`x && cd a && …`): vale só enquanto a cadeia && continua (ver o topo de one())
