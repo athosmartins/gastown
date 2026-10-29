@@ -13,12 +13,14 @@
 #   (triagem, unidade) _pilot_kimi_screen: ok · veto:<rótulo> (node:never, needs:engine-window, exec:manual; token inteiro) · pii:<termo> para cada termo da lista do Mayor, sem caixa, sem acento (NFC e NFD)
 #   e por palavra inteira ("leader", "chipset" não casam) · sem-texto · ilegivel. (triagem, passada) a bead do HQ com veto ou dado pessoal é REBAIXADA (tira lane:kimi; gc.routed_to kimi-lane → gastown.dog;
 #   comentário com o NOME do termo, nunca o trecho) e não é despachada, com a faixa aberta ou fechada, e nada se escreve no DRY_RUN; a que não tem texto ou não se lê espera (carimbada, sem despachar);
-#   rebaixamento que não grava deixa a bead esperando; a de outro rig não é triada.
+#   rebaixamento que não grava deixa a bead esperando; a de outro rig não é triada. (triagem, comentários) _pilot_kimi_screen_comments: `[]` é ok, termo em qualquer comentário é piic:<termo>
+#   (a bead é rebaixada), leitura que falha, saída vazia com rc 0, lista que não é lista ou text que não é texto é ilegivel (a bead espera); os comentários só são lidos da que passou no JSON.
+#   (número longo) CPF de 11 dígitos, CNPJ (com ou sem máscara) e telefone sem máscara casam; sha, id de bead, data e número curto não.
 # COMO RODA: as funções são extraídas VERBATIM dos dispatchers (awk) e rodam num shell filho sob `set -euo pipefail`, com `gc` e `bd` FALSOS num PATH sem os reais; dispatch_one é um falso que
 #   registra o que recebeu. Contra um dispatcher sem as funções o arquivo se recusa a começar.
 # CONTROLE NEGATIVO: cada mutante (pista que não separa as do Kimi, bandeira ignorada, bead de outro rig aceita, vaga que conta todo template, bloco do Kimi que cai no mini, gate que restaura dog,
-#   veto ignorado, cada termo da lista ignorado, termo sem fronteira de palavra, sem-texto/ilegível que passa, rebaixamento que não tira o rótulo/a rota/escreve no DRY_RUN) é aplicado numa cópia e a
-#   bateria tem de reprovar.
+#   veto ignorado, cada termo da lista ignorado, termo sem fronteira de palavra, cada forma do número longo, sem-texto/ilegível que passa, comentários que não são triados ou cuja leitura falha/vem
+#   vazia/malformada conta como ok, rebaixamento que não tira o rótulo/a rota/escreve no DRY_RUN) é aplicado numa cópia e a bateria tem de reprovar.
 # Variáveis: PILOT_DISPATCHER_PATH · GATE_DISPATCHER_PATH · KL_NO_MUTANTS=1
 set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,7 +34,7 @@ bad() { FAIL=$((FAIL+1)); echo "  ✗ $*"; }
 
 fn_src() { awk -v n="$1" '$0 ~ "^"n"\\(\\) *\\{"{f=1} f{print} f&&/^}$/{exit}' "$2"; }
 FUNCS=""
-for f in gc_json_or_unknown _pilot_slow_spawn_budget_spent _pilot_note_spawn_timing _pilot_node_first_rollback _pilot_node_first_veto _pilot_kimi_lane_closed _pilot_kimi_pick_alias _pilot_kimi_dispatch _pilot_kimi_screen _pilot_kimi_demote _pilot_kimi_lane_pass; do
+for f in gc_json_or_unknown _pilot_slow_spawn_budget_spent _pilot_note_spawn_timing _pilot_node_first_rollback _pilot_node_first_veto _pilot_kimi_lane_closed _pilot_kimi_pick_alias _pilot_kimi_dispatch _pilot_kimi_screen _pilot_kimi_screen_comments _pilot_kimi_demote _pilot_kimi_lane_pass; do
   src="$(fn_src "$f" "$DISPATCHER")"
   [ -n "$src" ] || { echo "FATAL: $f() not found in $DISPATCHER (ga-do1ixn.3 not applied)" >&2; exit 2; }
   FUNCS="$FUNCS
@@ -57,7 +59,7 @@ case "$4" in
 esac
 exit 98
 EOF
-# bd FALSO: uma bead (assignee/status em arquivo; honra --if-assignee). Registra toda chamada.
+# bd FALSO: uma bead (assignee/status em arquivo; honra --if-assignee) e os comentários de cada id. Registra toda chamada.
 cat > "$WORK/bin/bd" <<'EOF'
 #!/bin/sh
 W="${SELFTEST_WORK:?}"
@@ -83,6 +85,8 @@ case "$3" in
     exit 0 ;;
   show) s=open; [ ! -f "$W/bead.status" ] || s=$(cat "$W/bead.status")
         printf '[{"id":"%s","assignee":"%s","status":"%s"}]\n' "$4" "$(cur)" "$s"; exit 0 ;;
+  comments) # `bd -C C comments <id> --json`: imprime $W/comments.<id> (arquivo vazio = rc 0 sem saída); sem arquivo = bead sem comentários
+        if [ -f "$W/comments.$4" ]; then cat "$W/comments.$4"; else echo '[]'; fi; exit 0 ;;
 esac
 exit 0
 EOF
@@ -90,7 +94,7 @@ chmod +x "$WORK/bin/gc" "$WORK/bin/bd"
 sandbox_path_init "$WORK" jq date timeout mkdir dirname cat sleep head || exit 2
 
 CALLS="$WORK/calls.log"; LINES="$WORK/lines.txt"; DCALLS="$WORK/dispatch.log"
-reset() { rm -f "$WORK"/gc.*.rc "$WORK"/sessions.json "$WORK"/bead.assignee "$WORK"/bead.status "$WORK"/bd.fail.on "$CALLS" "$LINES" "$DCALLS" "$WORK"/city/.gc/*.on; echo open > "$WORK/bead.status"; }
+reset() { rm -f "$WORK"/gc.*.rc "$WORK"/sessions.json "$WORK"/bead.assignee "$WORK"/bead.status "$WORK"/bd.fail.on "$WORK"/comments.* "$CALLS" "$LINES" "$DCALLS" "$WORK"/city/.gc/*.on; echo open > "$WORK/bead.status"; }
 sess() { # sess alias:state[:template] ... → sessions.json
   local a j='[]' al st tp
   for a in "$@"; do
@@ -100,7 +104,7 @@ sess() { # sess alias:state[:template] ... → sessions.json
   printf '{"sessions":%s}\n' "$j" > "$WORK/sessions.json"
 }
 on()  { : > "$WORK/city/.gc/kimi-lane.on"; : > "$WORK/city/.gc/hetzner-node.on"; }
-writes() { grep -v 'session list' "$CALLS" 2>/dev/null | grep -vc '^bd .* show ' || true; }
+writes() { grep -v 'session list' "$CALLS" 2>/dev/null | grep -v '^bd .* comments ' | grep -vc '^bd .* show ' || true; }
 b() { # b id labels_csv [route] [descrição] → um objeto de candidata (descrição limpa por padrão; "" = vazia)
   jq -cn --arg id "$1" --arg l "$2" --arg r "${3:-}" --arg d "${4-Mexe só no script do gate e no selftest.}" '{id:$id, title:("t " + $id), description:$d, priority:2, labels:($l | split(",") | map(select(length > 0))), metadata:(if $r == "" then {} else {"gc.routed_to":$r} end)}'
 }
@@ -140,6 +144,8 @@ run_kd() {
   ) 2>&1 | tail -1
 }
 
+cset() { printf '%s\n' "$2" > "$WORK/comments.$1"; }   # cset <id> <json>: o que `bd comments <id> --json` imprime para esse id
+cj() { jq -cn --arg t "$1" '[{author:"mayor", created_at:"2026-10-28T12:00:00Z", id:"c1", issue_id:"ga-x", text:$t}]'; }   # UM comentário, no formato do bd
 K1=$(b ga-k1 "lane:kimi,story:approved"); K2=$(b ga-k2 "lane:kimi" kimi-lane); KW=$(b wa-k3 "lane:kimi" wa-worker); N1=$(b ga-n1 "story:approved"); N2=$(b ga-n2 "lane:kimi-not")
 echo "── passada: as beads lane:kimi saem das pistas, abertas ou fechadas"
 reset; r=$(run_pass "[$K1,$N1,$KW]" "[$N2,$K2]")
@@ -233,7 +239,14 @@ email|fulano@exemplo.com.br
 dado-pessoal|tem dados pessoais
 shared/data|lê shared/data/x
 shared/data|abre pessoas.db
+numero-longo|cliente 12345678901
+numero-longo|a empresa 12345678000190
+numero-longo|manda pro 5531999998888
+numero-longo|ligar 98765-4321
+numero-longo|CNPJ 12.345.678/0001-90
+numero-longo|fixo 3456-7890
 EOF
+r=$(S lane:kimi "T" "commits d12b6923f e 6474abc8d na bead ga-do1ixn.3, 123456789 linhas, porta 1234567, dia 2026-10-28, v1.2.3"); [ "$r" = ok ] && ok "número curto, sha, id de bead e data NÃO casam como número longo" || bad "falso positivo de número: '$r'"
 r=$(S lane:kimi "T" "$(printf 'o proprieta\xcc\x81rio do lote')"); [ "$r" = "pii:proprietario" ] && ok "acento decomposto (NFD) também casa" || bad "NFD: '$r'"
 r=$(S lane:kimi "Importar leads" "texto limpo"); [ "$r" = "pii:lead" ] && ok "o termo no TÍTULO basta" || bad "título: '$r'"
 r=$(run_screen '{"id":"ga-s","title":"t","description":"limpo","notes":"fala do WhatsApp"}'); [ "$r" = "pii:telefone" ] && ok "o termo nas notas também barra" || bad "notas: '$r'"
@@ -243,6 +256,25 @@ r=$(S lane:kimi "T" "   "); [ "$r" = "sem-texto" ] && ok "descrição só de esp
 r=$(S lane:kimi "" "texto"); [ "$r" = "sem-texto" ] && ok "título vazio: sem-texto" || bad "título vazio: '$r'"
 for bj in '{"id":"ga-s","title":"t","description":{"a":1}}' '{"id":"ga-s","title":5,"description":"x"}' '{"id":"ga-s","title":"t","description":"x","labels":"lane:kimi"}' '{"id":"ga-s","title":"t","description":"x","labels":[1]}' 'isto-nao-e-json' '[1]'; do
   r=$(run_screen "$bj"); [ "$r" = "ilegivel" ] && ok "ilegivel ← $bj" || bad "$bj: esperava ilegivel, veio '$r'"
+done
+
+echo "── triagem dos comentários (unidade): sem comentário é ok, termo barra, o que não se lê espera"
+run_cscreen() { ( set -euo pipefail; PATH="$SANDBOX_PATH"; SELFTEST_WORK="$WORK"; export SELFTEST_WORK; GC_CITY="$WORK/city"; PILOT_NODE_FIRST_VETO_LABELS="node:never needs:engine-window exec:manual"; eval "$FUNCS"; _pilot_kimi_screen_comments "$1" ) 2>&1 | tail -1; }
+reset; r=$(run_cscreen ga-c0); [ "$r" = ok ] && grep -q 'bd -C .* comments ga-c0 --json' "$CALLS" && ok "sem comentários ([]): ok, lendo com bd comments <id> --json" || bad "sem comentários: '$r' / $(cat "$CALLS" 2>/dev/null)"
+reset; cset ga-c0 "$(cj 'rodei o selftest, passou em 82 casos')"; r=$(run_cscreen ga-c0); [ "$r" = ok ] && ok "comentário limpo: ok" || bad "comentário limpo: '$r'"
+for pair in 'cpf|o CPF do Zezinho' 'telefone|liga no WhatsApp dele' 'email|manda para fulano@exemplo.com.br' 'numero-longo|conta 12345678901'; do
+  reset; cset ga-c0 "$(cj "${pair#*|}")"; r=$(run_cscreen ga-c0); [ "$r" = "piic:${pair%%|*}" ] && ok "piic:${pair%%|*} ← comentário '${pair#*|}'" || bad "comentário '${pair#*|}': esperava piic:${pair%%|*}, veio '$r'"
+done
+reset; cset ga-c0 '[{"text":"tudo certo"},{"text":"ok"},{"text":"a lista de leads vai junto"}]'; r=$(run_cscreen ga-c0); [ "$r" = "piic:lead" ] && ok "o termo no ÚLTIMO de vários comentários também barra" || bad "vários comentários: '$r'"
+reset; cset ga-c0 "$(cj "$(printf 'o proprieta\xcc\x81rio do lote')")"; r=$(run_cscreen ga-c0); [ "$r" = "piic:proprietario" ] && ok "acento decomposto (NFD) no comentário também casa" || bad "NFD no comentário: '$r'"
+reset; printf '%s' 'comments ga-c0' > "$WORK/bd.fail.on"; r=$(run_cscreen ga-c0); [ "$r" = ilegivel ] && ok "bd comments que falha: ilegivel (nunca ok)" || bad "leitura que falha: '$r'"
+reset; : > "$WORK/comments.ga-c0"; r=$(run_cscreen ga-c0); [ "$r" = ilegivel ] && ok "bd comments que sai 0 sem imprimir nada: ilegivel (vazio não é '[]')" || bad "saída vazia: '$r'"
+run_cscreen_stub() { ( set -euo pipefail; PATH="$SANDBOX_PATH"; SELFTEST_WORK="$WORK"; export SELFTEST_WORK; GC_CITY="$WORK/city"; eval "$FUNCS"; _pilot_kimi_screen() { printf '%s' "$KL_STUB"; }; _pilot_kimi_screen_comments "$1" ) 2>&1 | tail -1; }
+for w in ilegivel sem-texto veto:node:never ''; do
+  reset; r=$(KL_STUB="$w" run_cscreen_stub ga-c0); [ "$r" = ilegivel ] && ok "a triagem do texto respondeu '${w:-<vazio>}': nos comentários vira ilegivel (só ok e pii: têm significado)" || bad "resposta '$w' da triagem: esperava ilegivel, veio '$r'"
+done
+for cj_bad in '{"a":1}' '[1]' '[{"text":5}]' '[{"id":"1"}]' '[{"text":null}]' 'isto-nao-e-json'; do
+  reset; cset ga-c0 "$cj_bad"; r=$(run_cscreen ga-c0); [ "$r" = ilegivel ] && ok "ilegivel ← $cj_bad" || bad "$cj_bad: esperava ilegivel, veio '$r'"
 done
 
 echo "── triagem (passada): veto/dado pessoal rebaixam; sem texto espera; nada vai ao Kimi sem passar"
@@ -273,10 +305,27 @@ reset; on; r=$(run_pass "[$V3]" "[]")
 [ "$(cat "$DCALLS" 2>/dev/null)" = "ga-v3 lane=small kimi=1" ] && ! grep -q 'remove-label' "$CALLS" && ok "node:never-ever não é veto: a bead segue para o Kimi" || bad "node:never-ever: $(cat "$DCALLS" "$CALLS" 2>/dev/null)"
 reset; on; r=$(run_pass "[$WP]" "[]")
 [ ! -s "$DCALLS" ] && ! grep -q 'wa-p9' "$CALLS" && grep -q 'wa-p9 espera' "$LINES" && ok "bead de outro rig: não é triada nem escrita (semana 1: só HQ), apenas espera" || bad "outro rig: $(cat "$CALLS" "$LINES" 2>/dev/null)"
+echo "── triagem dos comentários (passada): um comentário com termo rebaixa; o que não se lê espera"
+C1=$(b ga-c1 "lane:kimi" kimi-lane); C2=$(b ga-c2 "lane:kimi"); C3=$(b ga-c3 "lane:kimi"); C4=$(b ga-c4 "lane:kimi"); C5=$(b ga-c5 "lane:kimi"); WC=$(b wa-c9 "lane:kimi" wa-worker)
+reset; on; cset ga-c1 "$(cj 'a CPF do Zezinho está na planilha')"; r=$(run_pass "[$C1,$C2]" "[]")
+[ "$(cat "$DCALLS" 2>/dev/null)" = "ga-c2 lane=small kimi=1" ] && grep -q 'update ga-c1 --remove-label lane:kimi --set-metadata gc.routed_to=gastown.dog -q' "$CALLS" && ok "termo num COMENTÁRIO: a bead é rebaixada (rótulo e rota) e só a limpa (ga-c2) vai a dispatch_one" || bad "comentário com termo: '$r' / $(cat "$DCALLS" "$CALLS" 2>/dev/null)"
+grep -q 'comment ga-c1 .*termo .cpf. nos comentários' "$CALLS" && ! grep -q 'comment ga-c1 .*Zezinho' "$CALLS" && grep -q 'rebaixadas=1 (falhas 0)' "$LINES" && ok "o comentário na bead diz o NOME do termo e que foi nos comentários; não copia o trecho" || bad "comentário de rebaixo: $(grep ' comment ' "$CALLS")"
+grep -q 'bd -C .* comments ga-c2 --json' "$CALLS" && ok "a bead que passou no JSON tem os comentários lidos (uma leitura por bead)" || bad "sem leitura dos comentários de ga-c2: $(cat "$CALLS")"
+reset; on; r=$(run_pass "[$V1,$P1,$E1,$X1,$WC]" "[]")
+! grep -q ' comments ' "$CALLS" && ok "veto, termo, sem texto, campo ilegível e bead de outro rig: nenhuma leitura de comentário (já decididas ou fora do HQ)" || bad "leu comentários à toa: $(grep ' comments ' "$CALLS")"
+reset; cset ga-c1 "$(cj 'a CPF do Zezinho')"; r=$(run_pass "[$C1]" "[]")
+grep -q 'update ga-c1 --remove-label lane:kimi' "$CALLS" && grep -q 'fechada:off' "$LINES" && ok "faixa FECHADA: o comentário com termo rebaixa do mesmo jeito" || bad "faixa fechada, comentário: $(cat "$CALLS" "$LINES" 2>/dev/null)"
+reset; on; cset ga-c1 "$(cj 'a CPF do Zezinho')"; r=$(KL_DRY=1 run_pass "[$C1,$C2]" "[]")
+[ ! -s "$DCALLS" ] && [ "$(writes)" = 0 ] && grep -q 'ga-c1 seria rebaixada (dry-run, nada escrito) — a triagem de dado pessoal casou com o termo .cpf. nos comentários' "$LINES" && ok "DRY_RUN: lê os comentários, diz o que rebaixaria e não escreve nem despacha" || bad "DRY_RUN com comentário: writes=$(writes) $(cat "$LINES" "$CALLS" 2>/dev/null)"
+reset; on; printf '%s' 'comments ga-c3' > "$WORK/bd.fail.on"; r=$(run_pass "[$C3,$C2]" "[]")
+[ "$(cat "$DCALLS" 2>/dev/null)" = "ga-c2 lane=small kimi=1" ] && ! grep -q 'remove-label' "$CALLS" && grep -q "ga-c3 espera — triagem 'ilegivel'" "$LINES" && grep -q 'esperando a triagem=1' "$LINES" && ok "leitura dos comentários que falha: a bead ESPERA (não vai ao Kimi, não é rebaixada); só ga-c2 vai" || bad "leitura que falha: '$r' / $(cat "$DCALLS" "$LINES" "$CALLS" 2>/dev/null)"
+grep -q 'update ga-c3 --set-metadata gc.routed_to=kimi-lane' "$CALLS" && ok "…e a que espera é carimbada (não cai numa pista Claude por falta de rota)" || bad "ga-c3 sem carimbo: $(grep ga-c3 "$CALLS")"
+reset; on; : > "$WORK/comments.ga-c4"; cset ga-c5 '{"a":1}'; r=$(run_pass "[$C4,$C5,$C2]" "[]")
+[ "$(cat "$DCALLS" 2>/dev/null)" = "ga-c2 lane=small kimi=1" ] && ! grep -q 'remove-label' "$CALLS" && grep -q 'esperando a triagem=2' "$LINES" && ok "saída vazia (rc 0) ou lista que não é lista: as duas esperam, só ga-c2 vai" || bad "vazio/não-lista: '$r' / $(cat "$DCALLS" "$LINES" 2>/dev/null)"
 PASSFN="$(fn_src _pilot_kimi_lane_pass "$DISPATCHER")"
 pl() { printf '%s\n' "$PASSFN" | grep -nF -- "$1" | head -1 | cut -d: -f1; }
-l_sc=$(pl '_kl_verdict=$(_pilot_kimi_screen "$_kl_bead")'); l_st=$(pl '--set-metadata "gc.routed_to=$PILOT_KIMI_ROUTE"'); l_dr=$(pl 'if [ "${DRY_RUN:-0}" = "1" ]; then'); l_dm=$(pl 'elif _pilot_kimi_demote "$_kl_bead" "$_kl_why"; then'); l_dp=$(pl 'dispatch_one "$_kl_pick"')
-{ [ -n "$l_sc" ] && [ -n "$l_st" ] && [ -n "$l_dp" ] && [ "$l_sc" -lt "$l_st" ] && [ "$l_st" -lt "$l_dp" ]; } && ok "a triagem roda antes do carimbo e do despacho" || bad "ordem da passada (triagem=$l_sc carimbo=$l_st despacho=$l_dp)"
+l_sc=$(pl '_kl_verdict=$(_pilot_kimi_screen "$_kl_bead")'); l_cm=$(pl '_kl_verdict=$(_pilot_kimi_screen_comments "$_kl_id")'); l_st=$(pl '--set-metadata "gc.routed_to=$PILOT_KIMI_ROUTE"'); l_dr=$(pl 'if [ "${DRY_RUN:-0}" = "1" ]; then'); l_dm=$(pl 'elif _pilot_kimi_demote "$_kl_bead" "$_kl_why"; then'); l_dp=$(pl 'dispatch_one "$_kl_pick"')
+{ [ -n "$l_sc" ] && [ -n "$l_cm" ] && [ -n "$l_st" ] && [ -n "$l_dp" ] && [ "$l_sc" -lt "$l_cm" ] && [ "$l_cm" -lt "$l_st" ] && [ "$l_st" -lt "$l_dp" ]; } && ok "a triagem (JSON, depois os comentários) roda antes do carimbo e do despacho" || bad "ordem da passada (triagem=$l_sc comentários=$l_cm carimbo=$l_st despacho=$l_dp)"
 { [ -n "$l_dr" ] && [ -n "$l_dm" ] && [ "$l_dr" -lt "$l_dm" ]; } && ok "o teste do DRY_RUN vem antes do rebaixamento" || bad "DRY_RUN depois do rebaixamento (dry=$l_dr rebaixa=$l_dm)"
 
 if [ -z "${KL_MUTANT:-}" ] && [ "${KL_NO_MUTANTS:-0}" != "1" ]; then
@@ -313,17 +362,28 @@ PY
   mutant "veto ignorado" pilot '_ks_veto=$(_pilot_node_first_veto "$_ks_labels")' '_ks_veto=""'
   mutant "triagem sempre ok" pilot 'if $hit == "" then "ok" else "pii:" + $hit end' '"ok"'
   mutant "sem-texto passa" pilot 'then "sem-texto"' 'then "ok"'
-  mutant "ilegível passa (campo)" pilot "*) printf 'ilegivel' ;; esac" "*) printf 'ok' ;; esac"
-  mutant "ilegível passa (rótulos)" pilot "|| { printf 'ilegivel'; return 0; }" "|| { printf 'ok'; return 0; }"
-  for t in cpf telefone conversa lead proprietario 'chip/frota' pipedrive email dado-pessoal 'shared/data'; do
+  mutant "ilegível passa (campo)" pilot "pii:*) printf '%s' \"\$_ks_out\" ;; *) printf 'ilegivel' ;; esac" "pii:*) printf '%s' \"\$_ks_out\" ;; *) printf 'ok' ;; esac"
+  mutant "ilegível passa (rótulos)" pilot "else error(\"labels\") end' 2>/dev/null) || { printf 'ilegivel'; return 0; }" "else error(\"labels\") end' 2>/dev/null) || { printf 'ok'; return 0; }"
+  mutant "palavra desconhecida da triagem passa nos comentários" pilot "\"\${_kc_v#pii:}\" ;; *) printf 'ilegivel' ;; esac" "\"\${_kc_v#pii:}\" ;; *) printf 'ok' ;; esac"
+  for t in cpf telefone conversa lead proprietario 'chip/frota' pipedrive email dado-pessoal 'shared/data' numero-longo; do
     row=$(grep -F "[\"$t\", \"" "$DISPATCHER" | head -1 | sed 's/^ *//; s/,$//')
     mutant "termo '$t' ignorado" pilot "$row" "[\"$t\", \"(?!x)x\"]"
+  done
+  for alt in '\\b\\d{10,}\\b|' '\\b\\d{2}\\.\\d{3}\\.\\d{3}/\\d{4}-\\d{2}\\b|' '\\b9\\d{4}-\\d{4}\\b|' '|\\b[2-5]\\d{3}-\\d{4}\\b'; do
+    mutant "número longo sem a forma '$alt'" pilot "$alt" ""
   done
   for t in lead 'chip/frota'; do
     row=$(grep -F "[\"$t\", \"" "$DISPATCHER" | head -1 | sed 's/^ *//; s/,$//')
     mutant "termo '$t' sem fronteira de palavra" pilot "$row" "${row//'\\b'/}"
   done
-  mutant "a triagem não roda" pilot 'ga-*) _kl_verdict=$(_pilot_kimi_screen "$_kl_bead") ;;' 'ga-*) _kl_verdict=ok ;;'
+  mutant "a triagem não roda" pilot '_kl_verdict=$(_pilot_kimi_screen "$_kl_bead")' '_kl_verdict=ok'
+  mutant "os comentários não são triados" pilot '[ "$_kl_verdict" != ok ] || _kl_verdict=$(_pilot_kimi_screen_comments "$_kl_id")' ':'
+  mutant "piic não rebaixa" pilot 'veto:*|pii:*|piic:*)' 'veto:*|pii:*)'
+  mutant "leitura de comentários que falha conta como ok" pilot "comments \"\$_kc_id\" --json 2>/dev/null) || { printf 'ilegivel'; return 0; }" "comments \"\$_kc_id\" --json 2>/dev/null) || { printf 'ok'; return 0; }"
+  mutant "saída vazia dos comentários conta como ok" pilot "[ -n \"\$_kc_json\" ] || { printf 'ilegivel'; return 0; }" "[ -n \"\$_kc_json\" ] || _kc_json='[]'"
+  mutant "comentários que não são lista passam" pilot 'else error("comments") end' 'else "" end'
+  mutant "comentário com text que não é texto passa" pilot 'all(.[]; (.text | type) == "string")' 'all(.[]; true)'
+  mutant "termo do comentário não vira piic" pilot "pii:*) printf 'piic:%s' \"\${_kc_v#pii:}\"" "pii:*) printf 'ok'"
   mutant "sem texto é despachada" pilot '        ok|fora-do-hq)' '        ok|fora-do-hq|sem-texto|ilegivel)'
   mutant "rebaixamento sem tirar o rótulo" pilot '_dm_args=(--remove-label lane:kimi)' '_dm_args=(-q)'
   mutant "rebaixamento sem devolver a rota" pilot 'if [ "$_dm_route" = "$PILOT_KIMI_ROUTE" ]; then _dm_args+=' 'if false; then _dm_args+='

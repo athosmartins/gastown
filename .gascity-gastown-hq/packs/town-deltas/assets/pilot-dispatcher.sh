@@ -12483,7 +12483,8 @@ _pilot_kimi_dispatch() {
 # _pilot_kimi_screen <bead_json> — a triagem de UMA bead lane:kimi, só pelo que o JSON da candidata já traz (nenhuma chamada ao bd). Imprime UMA palavra e devolve 0:
 #   ok             rótulos sem veto e título+descrição (+design, critérios, notas) sem termo de dado pessoal → pode ir ao Kimi
 #   veto:<rótulo>  a bead traz um rótulo de PILOT_NODE_FIRST_VETO_LABELS (node:never é o que o prompt do kimi-worker põe ao devolver a bead ao mini) → sai da faixa
-#   pii:<termo>    o texto casou com a lista do Mayor (cpf, telefone, conversa, lead, proprietário, chip/frota, Pipedrive, e-mail, shared/data e *.db, dado pessoal) → sai da faixa
+#   pii:<termo>    o texto casou com a lista do Mayor (cpf, telefone, conversa, lead, proprietário, chip/frota, Pipedrive, e-mail, shared/data e *.db, dado pessoal) ou com número longo sem máscara
+#                  (CPF de 11 dígitos, CNPJ, telefone/WhatsApp: 10+ dígitos seguidos; CNPJ com máscara; 9NNNN-NNNN e [2-5]NNN-NNNN) → sai da faixa
 #   sem-texto      título ou descrição vazios: não há o que triar → espera
 #   ilegivel       rótulo ou campo que não é do tipo esperado, ou JSON que o jq não lê → espera
 # Fail-closed: só `ok` deixa a bead ir ao Kimi. Os termos casam por palavra inteira, sem caixa e sem acento ("leader" e "chipset" não casam). Falso positivo custa a bead voltar ao dog Claude; falso
@@ -12507,7 +12508,8 @@ _pilot_kimi_screen() {
       ["pipedrive", "pipedrive"],
       ["email", "e-?mails?\\b|[a-z0-9._%+-]+@[a-z0-9-]+\\.[a-z]{2,}"],
       ["dado-pessoal", "dados? pessoa(l|is)|\\bpii\\b|\\blgpd\\b"],
-      ["shared/data", "shared/data|\\.db\\b"]
+      ["shared/data", "shared/data|\\.db\\b"],
+      ["numero-longo", "\\b\\d{10,}\\b|\\b\\d{2}\\.\\d{3}\\.\\d{3}/\\d{4}-\\d{2}\\b|\\b9\\d{4}-\\d{4}\\b|\\b[2-5]\\d{3}-\\d{4}\\b"]
     ];
     def txt: if . == null then "" elif type == "string" then . else error("nao-texto") end;
     ([ .title, .description, .design, .acceptance_criteria, .notes ] | map(txt)) as $f
@@ -12517,6 +12519,24 @@ _pilot_kimi_screen() {
         | if $hit == "" then "ok" else "pii:" + $hit end
       end' 2>/dev/null) || _ks_out=""
   case "$_ks_out" in ok|sem-texto|pii:*) printf '%s' "$_ks_out" ;; *) printf 'ilegivel' ;; esac
+  return 0
+}
+
+# _pilot_kimi_screen_comments <id> — a triagem dos COMENTÁRIOS de UMA bead do HQ (o worker os lê ao abrir a bead). UMA leitura ao bd (`bd comments <id> --json`) e a mesma lista de termos de
+# _pilot_kimi_screen, aplicada a um texto só com os comentários. Imprime UMA palavra e devolve 0: ok | piic:<termo> (o termo casou num comentário) | ilegivel (a leitura falhou ou não é uma lista de comentários).
+# Fail-closed: só `ok` deixa a bead ir ao Kimi; sem comentário (`[]`) é ok, comentário que não se lê NÃO é. O texto do PAI não é triado (o worker só o vê se abrir o pai de propósito; o prompt manda não abrir).
+_pilot_kimi_screen_comments() {
+  local _kc_id="$1" _kc_json="" _kc_text="" _kc_synth="" _kc_v=""
+  # vazio (bd que sai 0 sem imprimir: não é "sem comentários", isso é `[]`) / falhou (bd que não leu, bead sumida, timeout) → ilegivel
+  _kc_json=$(timeout 15 bd -C "$GC_CITY" comments "$_kc_id" --json 2>/dev/null) || { printf 'ilegivel'; return 0; }
+  [ -n "$_kc_json" ] || { printf 'ilegivel'; return 0; }
+  # vazio → "" (lista sem comentários: nada a casar); falhou/ilegível (não é lista, item que não é objeto, text que não é texto) → ilegivel
+  _kc_text=$(printf '%s' "$_kc_json" | jq -r 'if type == "array" and all(.[]; (.text | type) == "string") then map(.text) | join("\n") else error("comments") end' 2>/dev/null) || { printf 'ilegivel'; return 0; }
+  # título/descrição de enchimento ("-") só para a triagem não responder sem-texto: o que vale aqui são as notas, que levam os comentários
+  _kc_synth=$(jq -cn --arg c "$_kc_text" '{labels: [], title: "-", description: "-", notes: $c}' 2>/dev/null) || { printf 'ilegivel'; return 0; }
+  # vazio/falhou → a própria _pilot_kimi_screen imprime ilegivel (nunca vazio); qualquer palavra que não seja ok/pii: vira ilegivel aqui
+  _kc_v=$(_pilot_kimi_screen "$_kc_synth")
+  case "$_kc_v" in ok) printf 'ok' ;; pii:*) printf 'piic:%s' "${_kc_v#pii:}" ;; *) printf 'ilegivel' ;; esac
   return 0
 }
 
@@ -12537,14 +12557,14 @@ _pilot_kimi_demote() {
     warn "ga-do1ixn.3: faixa Kimi: não consegui rebaixar $_dm_id ($_dm_why) — ela segue na faixa, sem despachar, e a próxima varredura tenta de novo"
     return 1
   fi
-  timeout 15 bd -C "$GC_CITY" comment "$_dm_id" "ga-do1ixn.3: o Pilot tirou esta bead da faixa Kimi — rótulo lane:kimi removido${_dm_note}. Motivo: $_dm_why. Ela segue como bead normal para os dogs Claude. Para recolocá-la na faixa: corrija o que causou isso e ponha lane:kimi de novo." >/dev/null 2>&1 \
+  timeout 15 bd -C "$GC_CITY" comment "$_dm_id" "ga-do1ixn.3: o Pilot tirou esta bead da faixa Kimi — rótulo lane:kimi removido${_dm_note}. Motivo: $_dm_why. Ela segue como bead normal para os dogs Claude. Se o motivo é um termo, este comentário (que o cita) também passa pela triagem: pôr lane:kimi de volta nesta bead não a traz de volta à faixa, e para isso se abre uma bead nova sem esses termos. Se o motivo é um rótulo de veto, tirar o rótulo e pôr lane:kimi de novo basta." >/dev/null 2>&1 \
     || warn "ga-do1ixn.3: faixa Kimi: $_dm_id rebaixada, mas o comentário com o motivo não gravou — o motivo está só neste log: $_dm_why"
   return 0
 }
 
 # _pilot_kimi_lane_pass — uma vez por varredura, ANTES da passada de WA e das pistas. Sempre devolve 0. (1) Tira das duas pistas TODA bead com o rótulo lane:kimi: o laço normal nunca a vê, então
 # nenhuma vai a um pool Claude, com a faixa aberta ou fechada; pista que o jq não lê fica VAZIA nesta varredura (não dá para separar as do Kimi, e o estado inerte é não despachar). (1b) Tria cada bead
-# do HQ da faixa (_pilot_kimi_screen): veto ou dado pessoal → REBAIXA (_pilot_kimi_demote: sai da faixa e volta ao dog); sem texto ou ilegível → espera na faixa. O rebaixamento vale com a faixa aberta ou
+# do HQ da faixa (_pilot_kimi_screen no JSON da bead e, se ela passou, _pilot_kimi_screen_comments nos comentários): veto ou dado pessoal → REBAIXA (_pilot_kimi_demote: sai da faixa e volta ao dog); sem texto ou ilegível → espera na faixa. O rebaixamento vale com a faixa aberta ou
 # fechada (a bead devolvida pelo kimi-worker não pode ficar presa em kimi-lane só porque a bandeira foi desligada) e não escreve nada no DRY_RUN. (2) Carimba gc.routed_to=kimi-lane nas do HQ que ainda
 # não o têm (uma rota de pool posta por outro caminho — a volta do gate, o pilot-missing-route-watchdog — chamaria o pool do mini). (3) Com a faixa aberta, leva UMA bead do HQ (ga-) que passou na
 # triagem ao kimi-worker-remote por dispatch_one com _PILOT_KIMI_PASS=1; a de outro rig espera (semana 1: só HQ, o traco-bim não tem espelho no nó).
@@ -12567,7 +12587,7 @@ _pilot_kimi_lane_pass() {
     _kl_n=$((_kl_n + $(printf '%s' "$_kl_k" | jq 'length' 2>/dev/null || echo 0)))
   done
   [ "$_kl_n" -gt 0 ] || return 0
-  # (1b) a triagem das beads do HQ da faixa — só o JSON da candidata, nenhuma chamada de leitura ao bd. ok e as de outro rig seguem para a lista de despacho; veto/dado pessoal rebaixa (e sai das listas);
+  # (1b) a triagem das beads do HQ da faixa — o JSON da candidata e, para a que passou nele, UMA leitura dos comentários. ok e as de outro rig seguem para a lista de despacho; veto/dado pessoal rebaixa (e sai das listas);
   # sem texto/ilegível, ou rebaixamento que não gravou, fica em _kl_held (espera: recebe o carimbo, não é despachada). Nada aqui escreve no DRY_RUN.
   for _kl_lane in small big; do
     case "$_kl_lane" in small) _kl_pool="$_kl_small" ;; big) _kl_pool="$_kl_big" ;; esac
@@ -12577,14 +12597,21 @@ _pilot_kimi_lane_pass() {
       [ -n "$_kl_bead" ] || continue
       # vazio/falhou → sem id: segue como "fora do HQ" e o laço de despacho (que também exige id) a deixa esperando
       _kl_id=$(printf '%s' "$_kl_bead" | jq -r '.id // ""' 2>/dev/null) || _kl_id=""
-      case "$_kl_id" in ga-*) _kl_verdict=$(_pilot_kimi_screen "$_kl_bead") ;; *) _kl_verdict="fora-do-hq" ;; esac
+      case "$_kl_id" in
+        ga-*)
+          _kl_verdict=$(_pilot_kimi_screen "$_kl_bead")
+          # os comentários só são lidos (uma chamada ao bd por bead) se o JSON da bead já passou: veto, termo, sem texto e ilegível já decidem sem essa leitura
+          [ "$_kl_verdict" != ok ] || _kl_verdict=$(_pilot_kimi_screen_comments "$_kl_id") ;;
+        *) _kl_verdict="fora-do-hq" ;;
+      esac
       case "$_kl_verdict" in
         ok|fora-do-hq)
           _kl_next=$(printf '%s' "$_kl_keep" | jq -c --argjson b "$_kl_bead" '. + [$b]' 2>/dev/null) && _kl_keep="$_kl_next" \
             || warn "ga-do1ixn.3: faixa Kimi: não consegui listar $_kl_id para o despacho — ela espera nesta varredura" ;;
-        veto:*|pii:*)
+        veto:*|pii:*|piic:*)
           case "$_kl_verdict" in
             veto:*) _kl_why="rótulo de veto '${_kl_verdict#veto:}' (node:never é o que o kimi-worker põe ao devolver a bead ao mini; os outros dizem que um worker automático não faz esta bead)" ;;
+            piic:*) _kl_why="a triagem de dado pessoal casou com o termo '${_kl_verdict#piic:}' nos comentários da bead (a faixa Kimi é só para bead sem dado pessoal, e o worker lê os comentários)" ;;
             *) _kl_why="a triagem de dado pessoal casou com o termo '${_kl_verdict#pii:}' no título ou na descrição (a faixa Kimi é só para bead sem dado pessoal)" ;;
           esac
           if [ "${DRY_RUN:-0}" = "1" ]; then
@@ -12596,7 +12623,7 @@ _pilot_kimi_lane_pass() {
             _kl_next=$(printf '%s' "$_kl_held" | jq -c --argjson b "$_kl_bead" '. + [$b]' 2>/dev/null) && _kl_held="$_kl_next" || warn "ga-do1ixn.3: faixa Kimi: não consegui listar $_kl_id para o carimbo — ela segue fora das pistas, sem despachar"
           fi ;;
         *)
-          _kl_held_n=$((_kl_held_n + 1)); log "  faixa Kimi: $_kl_id espera — triagem '$_kl_verdict' (título ou descrição vazios, ou um campo que não leio): não vai ao Kimi sem eu ler o texto"
+          _kl_held_n=$((_kl_held_n + 1)); log "  faixa Kimi: $_kl_id espera — triagem '$_kl_verdict' (título ou descrição vazios, ou um campo ou comentário que não leio): não vai ao Kimi sem eu ler o texto"
           _kl_next=$(printf '%s' "$_kl_held" | jq -c --argjson b "$_kl_bead" '. + [$b]' 2>/dev/null) && _kl_held="$_kl_next" || warn "ga-do1ixn.3: faixa Kimi: não consegui listar $_kl_id para o carimbo — ela segue fora das pistas, sem despachar" ;;
       esac
     done < <(printf '%s' "$_kl_pool" | jq -c '.[]' 2>/dev/null)
