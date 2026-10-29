@@ -45,6 +45,10 @@
 #                                  stays silent (gate feedback on 4686821a7)
 # P8 probe killed by a signal    -> a VERDICT= with no AFFECTED= behind it is a
 #                                  cut-off answer, not "reaches nothing": failed
+# P9 re-probe killed by a signal -> its "VERDICT=OK + empty GUARDED=" is not an
+#                                  answer either: the delivery must NOT release
+#                                  on it (control: the same two lines, exit 0,
+#                                  do release)
 
 # No `pipefail` at file level (ga-uel7sb): assertions below are `X | grep ...`
 # -style pipes; the block under test still runs WITH `set -euo pipefail`, as in
@@ -75,7 +79,10 @@ MARKER_REL=".gc/runtime/daemon-refresh-baseline/whatsapp_automation.sha"
 #              ok           probe answers (NEEDS_GUARDED_RESTART + AFFECTED)
 #              reprobe_slow per-story probe answers, the freshness re-probe
 #                           (the 2nd DRY_RUN=1 call) never does
-#   budget:    value for DELIVERY_PROBE_TIMEOUT_S; "unset" leaves it unset.
+#              reprobe_clean  per-story probe answers, the re-probe answers
+#                           "VERDICT=OK" + an empty "GUARDED=" and exits 0
+#              reprobe_killed same two lines, then SIGKILL (rc 137)
+#   budget:   value for DELIVERY_PROBE_TIMEOUT_S; "unset" leaves it unset.
 #
 # Fixture: C0 base -> C1 adds lib/sensitive_daemon_dep.py (the earlier cause of
 # a rig-wide staleness) -> C2 is this story's own commit (also "sensitive").
@@ -125,6 +132,8 @@ if [ "$DRY_RUN" = "1" ]; then
     termed)       echo "VERDICT=OK"; kill -TERM $$ ;;
     crash)        echo "boom: launchctl list failed" >&2; exit 3 ;;
     reprobe_slow) [ "$n" -ge 2 ] && exec sleep 30 ;;
+    reprobe_clean)  [ "$n" -ge 2 ] && { echo "VERDICT=OK"; echo "GUARDED="; exit 0; } ;;
+    reprobe_killed) [ "$n" -ge 2 ] && { echo "VERDICT=OK"; echo "GUARDED="; kill -KILL $$; } ;;
   esac
 fi
 echo "VERDICT=NEEDS_GUARDED_RESTART"
@@ -382,6 +391,33 @@ for mode_rc in "killed 137" "termed 143"; do
     || nok "P8 $mode affected" "$PL"
   [ "$REACHED" -eq 0 ] && ok "P8 $mode: delivery stays HELD" || nok "P8 $mode held" "REACHED=$REACHED"
 done
+
+# ── P9: the freshness re-probe killed by a signal after a "clean" answer ────
+# The release test is "VERDICT=OK over an empty GUARDED=". A re-probe that
+# prints exactly that and is then SIGKILLed has not finished: whatever else it
+# would have printed (PROOF=, the GUARDED_* splits) never arrived, so the two
+# lines are a partial answer, not a verdict. Same rule as the per-story probe
+# (P8) and as rc 124 (P6): nothing from a probe that did not answer is trusted.
+# The control runs first: the SAME two lines with a normal exit must release,
+# or "held" below would be a pass for some other reason.
+run_block reprobe_clean
+RL="$(reprobe_line)"
+printf '%s' "$RL" | grep -F 'probe=ok' >/dev/null \
+  && ok "P9 control: a re-probe that answers VERDICT=OK + empty GUARDED= is probe=ok" \
+  || nok "P9 control classification" "$RL"
+[ "$REACHED" -eq 1 ] && ok "P9 control: ...and the delivery releases on it (so 'held' below is the kill's doing)" \
+  || nok "P9 control release" "REACHED=$REACHED log: $LOG_OUT"
+
+run_block reprobe_killed
+RL="$(reprobe_line)"
+printf '%s' "$RL" | grep -F 'probe=failed' >/dev/null && printf '%s' "$RL" | grep -F 'rc=137' >/dev/null \
+  && ok "P9 a signalled re-probe is probe=failed rc=137" || nok "P9 re-probe state" "$RL"
+printf '%s' "$RL" | grep -F 'still-stale=[?]' >/dev/null \
+  && ok "P9 still-stale is unknown ([?]), not the empty 'nothing is stale'" || nok "P9 still-stale" "$RL"
+printf '%s' "$RL" | grep -F 'no answer' >/dev/null \
+  && ok "P9 the line says 'no answer' instead of echoing the cut-off VERDICT=OK" || nok "P9 no answer" "$RL"
+[ "$REACHED" -eq 0 ] && ok "P9 delivery stays HELD (a cut-off 'clean' never releases)" \
+  || nok "P9 held" "REACHED=$REACHED"
 
 echo ""
 echo "story-delivery probe-timeout tests: $PASS passed, $FAIL failed"

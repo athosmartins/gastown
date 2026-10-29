@@ -3976,13 +3976,17 @@ else
         MERGE_OWN_FRESH_VERDICT_LINE=$(echo "$MERGE_OWN_FRESH_OUT" | grep '^VERDICT=' | head -1 || true)
         refresh_probe_classify "$MERGE_OWN_FRESH_VERDICT_LINE" "$MERGE_OWN_FRESH_RC" "$MERGE_OWN_FRESH_SECS"
         MERGE_OWN_FRESH_STATE="$PROBE_STATE"; MERGE_OWN_FRESH_WHY="$PROBE_WHY"
-        if [ "$MERGE_OWN_FRESH_STATE" = "timeout" ]; then
-          # rc 124 means the re-probe did not finish, so nothing it printed is
-          # trusted — same rule as the per-story probe above. The "clean" test
-          # below already needs a GUARDED= line next to VERDICT=OK, which covers
-          # a kill between the two; this makes the rule the same for every field
-          # (PROOF=, the GUARDED_* splits) instead of relying on which line the
-          # kill happened to land before.
+        if [ "$MERGE_OWN_FRESH_STATE" != "ok" ]; then
+          # A re-probe that did not answer (timeout rc 124, killed rc >= 128,
+          # crashed, silent) has said nothing we trust — same rule as the
+          # per-story probe above. The "clean" test below already needs a
+          # GUARDED= line next to VERDICT=OK, which covers a kill between the
+          # two; it does NOT cover a kill AFTER both (the two lines are all it
+          # reads), where a cut-off "VERDICT=OK + empty GUARDED=" would release
+          # the delivery with the rest of the answer (PROOF=, the GUARDED_*
+          # splits) never delivered. Dropping the output makes the rule the
+          # same for every field instead of relying on which line the kill
+          # happened to land before.
           MERGE_OWN_FRESH_OUT=""; MERGE_OWN_FRESH_VERDICT_LINE=""
         fi
         # ga-8i2nds (third-state audit): keep the GUARDED= LINE itself, not only
