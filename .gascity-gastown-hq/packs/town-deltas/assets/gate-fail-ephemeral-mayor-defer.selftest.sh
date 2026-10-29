@@ -193,10 +193,10 @@ case "$(trim "$MAIL_LOG")" in *mayor*) ok "named-crew total failure still mails 
 case "$BD_COMMENTS" in *"wa-x3:"*"escalated to mayor by mail"*) ok "and its 'escalated to mayor' trace lands in the bead's OWN store (pre-existing twin of blocking 1)" ;; *) bad "escalation trace for wa-x3 lost (lost: [$BD_LOST]; landed: [$BD_COMMENTS])" ;; esac
 
 echo "== 6. gate_fail_author_is_ephemeral reuses the canonical pool deny-list"
-for a in mayor gastown.mayor gastown__mayor dog-gaabc gastown.dog gastown.dog-2 wa-worker wa-worker-adhoc-1 ps-worker ps-worker-3; do
+for a in mayor gastown.mayor gastown__mayor dog-gaabc gastown.dog gastown.dog-2 wa-worker wa-worker-adhoc-1 ps-worker ps-worker-3 kimi-worker-remote kimi-worker-remote-1; do
   gate_fail_author_is_ephemeral "$a" && ok "$a is ephemeral" || bad "$a should be ephemeral"
 done
-for a in thies-wa batista-wa oracle-wa peter-wa mila-wa digo-wa ""; do
+for a in thies-wa batista-wa oracle-wa peter-wa mila-wa digo-wa kimi-wa kimi-worker ""; do
   gate_fail_author_is_ephemeral "$a" && bad "[$a] must NOT be ephemeral" || ok "[$a] is not ephemeral"
 done
 

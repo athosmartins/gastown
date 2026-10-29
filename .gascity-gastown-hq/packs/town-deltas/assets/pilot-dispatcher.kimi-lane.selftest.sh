@@ -21,12 +21,18 @@
 #   (gate, rodada 1) o bloco do FAIL que decide a rota roda VERBATIM (marcadores SELFTEST-EXTRACT): rótulos em cache, cache vazio com releitura sem cache, e leitura que não rende (bd que falha, saída vazia, lixo, sem rótulo,
 #   rótulo que não é texto) = a rota fica, com aviso e nota no comentário — nunca "sem lane:kimi" calado. (pilot_sweep) o que dispatch_one devolve sem despachar entra na contagem pelo nome. (soltas) kimi_lane_released não gasta
 #   as 3 tentativas, mas tem teto de 10. (carimbo) a lista dos que precisam do carimbo que não se lê é dita (NÃO LI), nunca "carimbada=0". (texto) nada afirma "nenhuma vai a pool Claude".
+#   (rodada 2, bloqueante) ESPERA DE PROPÓSITO NÃO É PARADA: o predicado de saturação e o Step 5 (a sequência do "Pilot estagnado") rodam VERBATIM (marcadores SELFTEST-EXTRACT): uma lane:kimi esperando e mais nada =
+#   saturado, streak zerado, nenhum toque; o controle (candidato comum que não despachou) segue contando e tocando; espera + falha no mesmo sweep NÃO isenta; contador ilegível/ausente/com zero à esquerda; o marcador
+#   POOL-SATURATED nomeia a espera e sai byte a byte igual sem ela. A passada deixa KIMI_LANE_WAITING (esperas) e soma as FALHAS (rebaixamento, carimbo, lista do carimbo, triagem ilegível, nó que falhou, retorno sem nome)
+#   em NONQUEUE_FAILS. kimi_lane_failed (atribuição, sessão ou aviso falhou, _PKL_FAULT) é um nome à parte de kimi_lane_wait. (não bloqueante) a triagem lê também metadata story.criterios/estrela_guia/equilibrios; o
+#   FAIL do gate de uma bead lane:kimi acrescenta a nota de que kimi-lane não é um pool.
 # COMO RODA: as funções são extraídas VERBATIM dos dispatchers (awk) e rodam num shell filho sob `set -euo pipefail`, com `gc` e `bd` FALSOS num PATH sem os reais; dispatch_one é um falso que
 #   registra o que recebeu. Contra um dispatcher sem as funções o arquivo se recusa a começar.
 # CONTROLE NEGATIVO: cada mutante (pista que não separa as do Kimi, bandeira ignorada, bead de outro rig aceita, vaga que conta todo template, bloco do Kimi que cai no mini, gate que restaura dog,
 #   veto ignorado, cada termo da lista ignorado, termo sem fronteira de palavra, cada forma do número longo e do telefone, travessão que não vale como hífen, sem-texto/ilegível que passa, comentários que não são triados
 #   ou cuja leitura falha/vem vazia/malformada conta como ok, rebaixamento que não tira o rótulo/a rota/escreve no DRY_RUN, gate que não relê/não avisa/não anota, passada que não nota o resultado, solta que gasta
-#   tentativa ou sem teto, lista do carimbo que falha sem dizer) é aplicado numa cópia e a bateria tem de reprovar.
+#   tentativa ou sem teto, lista do carimbo que falha sem dizer; rodada 2: predicado que ignora a espera, que isenta com falha ou com despacho, contador ilegível que isenta, passada que não conta a espera ou não soma
+#   cada uma das falhas, kimi_lane_failed que vira espera ou não para a passada, metadata story.* fora da triagem, nota do gate fora do lugar) é aplicado numa cópia e a bateria tem de reprovar.
 # Variáveis: PILOT_DISPATCHER_PATH · GATE_DISPATCHER_PATH · KL_NO_MUTANTS=1
 set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,6 +62,10 @@ done
 # o bloco do FAIL que decide a rota da bead lane:kimi, entre os marcadores SELFTEST-EXTRACT (roda VERBATIM nos testes do gate)
 GBLOCK="$(awk '/# SELFTEST-EXTRACT gate-fail-kimi-lane: BEGIN/{f=1;next} /# SELFTEST-EXTRACT gate-fail-kimi-lane: END/{f=0} f' "$GATE")"
 [ -n "$GBLOCK" ] || { echo "FATAL: bloco SELFTEST-EXTRACT gate-fail-kimi-lane vazio ou ausente em $GATE" >&2; exit 2; }
+# o predicado de saturação e o Step 5 (a sequência "Pilot estagnado"), entre os marcadores SELFTEST-EXTRACT: rodam VERBATIM nos testes da espera de propósito (rodada 2)
+PRED_BLOCK="$(awk '/# SELFTEST-EXTRACT pilot-saturation-predicate: BEGIN/{f=1;next} /# SELFTEST-EXTRACT pilot-saturation-predicate: END/{f=0} f' "$DISPATCHER")"
+STEP5_BLOCK="$(awk '/# SELFTEST-EXTRACT pilot-stall-step5: BEGIN/{f=1;next} /# SELFTEST-EXTRACT pilot-stall-step5: END/{f=0} f' "$DISPATCHER")"
+[ -n "$PRED_BLOCK" ] && [ -n "$STEP5_BLOCK" ] || { echo "FATAL: bloco SELFTEST-EXTRACT pilot-saturation-predicate/pilot-stall-step5 vazio ou ausente em $DISPATCHER" >&2; exit 2; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pilot-kimilane-selftest.XXXXXX")"
 trap 'chmod -R u+rwX "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
@@ -111,7 +121,7 @@ chmod +x "$WORK/bin/gc" "$WORK/bin/bd"
 sandbox_path_init "$WORK" jq date timeout mkdir dirname cat sleep head || exit 2
 
 CALLS="$WORK/calls.log"; LINES="$WORK/lines.txt"; DCALLS="$WORK/dispatch.log"; NOTES="$WORK/notes.log"
-reset() { rm -f "$WORK"/gc.*.rc "$WORK"/sessions.json "$WORK"/bead.assignee "$WORK"/bead.status "$WORK"/bead.labels "$WORK"/bd.show.raw "$WORK"/bd.fail.on "$WORK"/comments.* "$CALLS" "$LINES" "$DCALLS" "$NOTES" "$WORK"/city/.gc/*.on; echo open > "$WORK/bead.status"; }
+reset() { rm -f "$WORK"/gc.*.rc "$WORK"/sessions.json "$WORK"/bead.assignee "$WORK"/bead.status "$WORK"/bead.labels "$WORK"/bd.show.raw "$WORK"/bd.fail.on "$WORK"/comments.* "$CALLS" "$LINES" "$DCALLS" "$NOTES" "$WORK/pass.counters" "$WORK/kd.fault" "$WORK/gate.kimi.note" "$WORK"/city/.gc/*.on; echo open > "$WORK/bead.status"; }
 sess() { # sess alias:state[:template] ... → sessions.json
   local a j='[]' al st tp
   for a in "$@"; do
@@ -150,8 +160,10 @@ run_pass() {
     PILOT_KIMI_TEMPLATE="kimi-worker-remote"; PILOT_KIMI_ROUTE="kimi-lane"; DRY_RUN="${KL_DRY:-0}"; DISPATCHED=0
     PILOT_NODE_FIRST_VETO_LABELS="node:never needs:engine-window exec:manual"
     SMALL_CANDIDATES="$1"; BIG_CANDIDATES="$2"; SMALL_COUNT=0; BIG_COUNT=0
+    NONQUEUE_FAILS=0; KIMI_LANE_WAITING=0   # o dispatcher os declara no topo, junto de POOL_CAP_QUEUED
     eval "$FUNCS"
     _pilot_kimi_lane_pass
+    echo "waiting=${KIMI_LANE_WAITING-?} nqf=${NONQUEUE_FAILS-?}" > "$WORK/pass.counters"
     echo "small=$(printf '%s' "$SMALL_CANDIDATES" | jq -r '[.[].id] | join(",")' 2>/dev/null) big=$(printf '%s' "$BIG_CANDIDATES" | jq -r '[.[].id] | join(",")' 2>/dev/null) n=$SMALL_COUNT/$BIG_COUNT dispatched=$DISPATCHED"
   ) 2>&1 | tail -1
 }
@@ -165,10 +177,31 @@ run_kd() {
     GC_CITY="$WORK/city"; PILOT_SPAWN_TIMEOUT_SECS=20; PILOT_KIMI_TEMPLATE="kimi-worker-remote"; _PILOT_SLOW_SPAWN_SEEN=0
     eval "$FUNCS"
     _pilot_kimi_dispatch "ga-k1" "$WORK/city" "Título"
+    echo "fault=${_PKL_FAULT-?}" > "$WORK/kd.fault"
     echo "res=${_PNF_RESULT-?} alias=${_PNF_ALIAS-?}"
   ) 2>&1 | tail -1
 }
 
+# run_step5 INICIAL [VAR=valor ...] — o predicado de saturação e o Step 5 VERBATIM num filho (notify/log/warn falsos; sem bd nem gc). INICIAL = o valor que o arquivo do streak já tem (none = sem arquivo).
+# Imprime "sat=<0|1> estado=<n|none> notify=<n>": o predicado, o streak depois do sweep e quantas vezes o "Pilot estagnado" tocou.
+run_step5() {
+  local init="$1" sat st nt; shift
+  rm -f "$WORK/city/.gc/pilot-dispatcher-stall.count" "$WORK/notify.log" "$WORK/step5.log"
+  [ "$init" = none ] || printf '%s\n' "$init" > "$WORK/city/.gc/pilot-dispatcher-stall.count"
+  sat=$(
+    set -euo pipefail
+    log() { echo "$*" >> "$WORK/step5.log"; }; warn() { :; }
+    notify() { echo "$*" >> "$WORK/notify.log"; }
+    GC_CITY="$WORK/city"; DRY_RUN=0; DISPATCHED=0; SMALL_SLOTS=3; BIG_SLOTS=3; POOL_CAP_QUEUED=0; PRIORITY_YIELDED=0; NONQUEUE_FAILS=0; KIMI_LANE_WAITING=0
+    for kv in "$@"; do eval "$kv"; done
+    eval "$PRED_BLOCK"
+    eval "$STEP5_BLOCK"
+    echo "$_pool_saturated_sweep"
+  ) || sat="rc$?"
+  st=none; [ ! -f "$WORK/city/.gc/pilot-dispatcher-stall.count" ] || st=$(cat "$WORK/city/.gc/pilot-dispatcher-stall.count")
+  nt=0; [ ! -f "$WORK/notify.log" ] || nt=$(grep -c 'Pilot estagnado' "$WORK/notify.log" || true)
+  echo "sat=$sat estado=$st notify=$nt"
+}
 cset() { printf '%s\n' "$2" > "$WORK/comments.$1"; }   # cset <id> <json>: o que `bd comments <id> --json` imprime para esse id
 cj() { jq -cn --arg t "$1" '[{author:"mayor", created_at:"2026-10-28T12:00:00Z", id:"c1", issue_id:"ga-x", text:$t}]'; }   # UM comentário, no formato do bd
 K1=$(b ga-k1 "lane:kimi,story:approved"); K2=$(b ga-k2 "lane:kimi" kimi-lane); KW=$(b wa-k3 "lane:kimi" wa-worker); N1=$(b ga-n1 "story:approved"); N2=$(b ga-n2 "lane:kimi-not")
@@ -273,6 +306,7 @@ run_gblock() {
     BEAD_CITY="$WORK/city"; BEAD_ID=ga-g1; SRC_LABELS="$1"; _GFAIL_ROUTE="$2"
     eval "$GFUNC"
     eval "$GBLOCK"
+    printf '%s' "${_GFAIL_KIMI_NOTE-?}" > "$WORK/gate.kimi.note"
     echo "route=$_GFAIL_ROUTE note=$([ -n "$_GFAIL_LANE_NOTE" ] && echo 1 || echo 0)"
   ) 2>&1 | tail -1
 }
@@ -294,6 +328,14 @@ for rawcase in 'vazia (rc 0 sem saída)|' 'lixo|isto-nao-e-json' 'lista vazia|[]
   reset; printf '%s' "${rawcase#*|}" > "$WORK/bd.show.raw"; r=$(run_gblock "" gastown.dog)
   [ "$r" = "route=gastown.dog note=1" ] && [ "$(nwarn)" = 1 ] && ok "releitura ${rawcase%%|*}: não li — a rota fica, com aviso e nota (bead no gate sempre tem rótulo; nenhum rótulo é leitura que não rendeu)" || bad "releitura ${rawcase%%|*}: '$r' warns=$(nwarn)"
 done
+# a rota kimi-lane não é um pool: a frase do comentário ("so pool workers can self-serve this bead") não vale para ela, e a nota diz o que vale (rodada 2, não bloqueante)
+reset; r=$(run_gblock "story:approved lane:kimi gate:needs-fix" gastown.dog); kn=$(cat "$WORK/gate.kimi.note" 2>/dev/null)
+case "$kn" in *lane:kimi*"não é um pool"*"passada da faixa Kimi"*) ok "FAIL de bead lane:kimi: o comentário ganha a nota 'a rota kimi-lane não é um pool; quem a leva de volta é a passada da faixa Kimi'" ;; *) bad "nota da rota kimi-lane: '$kn'" ;; esac
+reset; r=$(run_gblock "story:approved gate:needs-fix" gastown.dog); kn=$(cat "$WORK/gate.kimi.note" 2>/dev/null)
+[ -z "$kn" ] && [ -f "$WORK/gate.kimi.note" ] && ok "FAIL de bead comum: SEM nota da faixa (a frase do pool vale) — o arquivo existe e está vazio, não ausente" || bad "bead comum com nota da faixa ou sem o bloco: '$kn'"
+reset; printf '%s' 'show ga-g1' > "$WORK/bd.fail.on"; r=$(run_gblock "" gastown.dog); kn=$(cat "$WORK/gate.kimi.note" 2>/dev/null)
+[ -z "$kn" ] && [ -f "$WORK/gate.kimi.note" ] && ok "rótulos que não li: a rota ficou gastown.dog, então a nota da faixa NÃO sai (só a nota dos rótulos não lidos, que já existe)" || bad "nota da faixa com rótulos não lidos: '$kn'"
+n=$(grep -c '\$_GFAIL_LANE_NOTE\$_GFAIL_KIMI_NOTE The Pilot will also re-dispatch' "$GATE" || true); [ "$n" = 1 ] && ok "o comentário do FAIL leva a nota da faixa Kimi UMA vez, logo depois da nota dos rótulos" || bad "nota \$_GFAIL_KIMI_NOTE no comentário do FAIL: $n ocorrência(s)"
 n=$(grep -c '\$_GFAIL_ROUTE_UNKNOWN_NOTE\$_GFAIL_LANE_NOTE' "$GATE" || true); [ "$n" = 1 ] && ok "o comentário do FAIL leva a nota dos rótulos não lidos (UMA vez, ao lado da nota da rota)" || bad "nota \$_GFAIL_LANE_NOTE no comentário do FAIL: $n ocorrência(s)"
 { ! printf '%s\n' "$GFUNC" | grep -Eq '(^|[^_a-z-])(warn|log) '; } && ok "as funções do gate rodam dentro de \$(...): nenhuma chama warn/log (a saída viraria rótulo)" || bad "warn/log dentro de função do gate que roda em \$(...)"
 
@@ -381,6 +423,14 @@ r=$(S lane:kimi "T" "zap $(printf '\xef\xbc\x91\xef\xbc\x91\xef\xbc\x99\xef\xbc\
 r=$(S lane:kimi "T" "$(printf 'o proprieta\xcc\x81rio do lote')"); [ "$r" = "pii:proprietario" ] && ok "acento decomposto (NFD) também casa" || bad "NFD: '$r'"
 r=$(S lane:kimi "Importar leads" "texto limpo"); [ "$r" = "pii:lead" ] && ok "o termo no TÍTULO basta" || bad "título: '$r'"
 r=$(run_screen '{"id":"ga-s","title":"t","description":"limpo","notes":"fala do WhatsApp"}'); [ "$r" = "pii:telefone" ] && ok "o termo nas notas também barra" || bad "notas: '$r'"
+# rodada 2 (não bloqueante): os campos de texto que o dispatch_one trata como conteúdo da bead (metadata story.criterios, story.estrela_guia, story.equilibrios) também passam pela triagem
+for mk in story.criterios story.estrela_guia story.equilibrios; do
+  r=$(run_screen "$(jq -cn --arg k "$mk" '{id:"ga-s",title:"t",description:"limpo",labels:[],metadata:{($k):"importar o CPF do cliente"}}')"); [ "$r" = "pii:cpf" ] && ok "termo em metadata $mk: barra (pii:cpf)" || bad "metadata $mk: '$r'"
+done
+r=$(run_screen '{"id":"ga-s","title":"t","description":"limpo","labels":[],"metadata":{"story.criterios":"abre o painel e confere o log","story.estrela_guia":"rápido","story.equilibrios":"sem risco"}}'); [ "$r" = ok ] && ok "CONTROLE: metadata story.* limpos não barram" || bad "metadata limpo: '$r'"
+r=$(run_screen '{"id":"ga-s","title":"t","description":"limpo","labels":[],"metadata":{"gc.routed_to":"kimi-lane","pilot.dispatching_at":"1793280866"}}'); [ "$r" = ok ] && ok "CONTROLE: metadata operacional (rota, carimbo de tempo) não é triado como texto" || bad "metadata operacional: '$r'"
+r=$(run_screen '{"id":"ga-s","title":"t","description":"limpo","labels":[],"metadata":{"story.criterios":{"a":1}}}'); [ "$r" = ilegivel ] && ok "story.criterios que não é texto: ilegivel (espera; nunca ok)" || bad "story.criterios objeto: '$r'"
+r=$(run_screen '{"id":"ga-s","title":"t","description":"limpo","labels":[],"metadata":"isto-nao-e-objeto"}'); [ "$r" = ilegivel ] && ok "metadata que não é objeto: ilegivel" || bad "metadata string: '$r'"
 r=$(S lane:kimi "T" "um leader, um chipset, leadership, conversão de cores, o log do gate"); [ "$r" = ok ] && ok "palavra inteira: leader/chipset/leadership/conversão não casam" || bad "palavra inteira: '$r'"
 r=$(run_screen '{"id":"ga-s","title":"t","labels":[]}'); [ "$r" = "sem-texto" ] && ok "sem descrição: sem-texto" || bad "sem descrição: '$r'"
 r=$(S lane:kimi "T" "   "); [ "$r" = "sem-texto" ] && ok "descrição só de espaço: sem-texto" || bad "descrição em branco: '$r'"
@@ -458,6 +508,85 @@ pl() { printf '%s\n' "$PASSFN" | grep -nF -- "$1" | head -1 | cut -d: -f1; }
 l_sc=$(pl '_kl_verdict=$(_pilot_kimi_screen "$_kl_bead")'); l_cm=$(pl '_kl_verdict=$(_pilot_kimi_screen_comments "$_kl_id")'); l_st=$(pl '--set-metadata "gc.routed_to=$PILOT_KIMI_ROUTE"'); l_dr=$(pl 'if [ "${DRY_RUN:-0}" = "1" ]; then'); l_dm=$(pl 'elif _pilot_kimi_demote "$_kl_bead" "$_kl_why"; then'); l_dp=$(pl 'dispatch_one "$_kl_pick"')
 { [ -n "$l_sc" ] && [ -n "$l_cm" ] && [ -n "$l_st" ] && [ -n "$l_dp" ] && [ "$l_sc" -lt "$l_cm" ] && [ "$l_cm" -lt "$l_st" ] && [ "$l_st" -lt "$l_dp" ]; } && ok "a triagem (JSON, depois os comentários) roda antes do carimbo e do despacho" || bad "ordem da passada (triagem=$l_sc comentários=$l_cm carimbo=$l_st despacho=$l_dp)"
 { [ -n "$l_dr" ] && [ -n "$l_dm" ] && [ "$l_dr" -lt "$l_dm" ]; } && ok "o teste do DRY_RUN vem antes do rebaixamento" || bad "DRY_RUN depois do rebaixamento (dry=$l_dr rebaixa=$l_dm)"
+
+echo "── espera de propósito não é parada (rodada 2, bloqueante 1): o predicado de saturação e o Step 5 REAIS"
+# O que o gate achou: a bead lane:kimi que espera de propósito (faixa fechada, vaga ocupada, triagem, outro rig) tirava a pool do "sem candidatos" mas nada a contava como espera; com dispatched=0 e vaga livre o
+# Step 5 somava um sweep parado e, a cada 3º, mandava o p4 "Pilot estagnado" (15 min) — e o imparavel-check, que só se cala com o marcador POOL-SATURATED, a leria como fila parada.
+# Aqui roda o predicado e o Step 5 VERBATIM, com o estado do streak já em 2 (o próximo sweep seria o 3º, o que toca).
+r=$(run_step5 2 KIMI_LANE_WAITING=1)
+[ "$r" = "sat=1 estado=none notify=0" ] && ok "UMA lane:kimi esperando e mais nada: saturado (espera, não parada) — o streak zera e o 'Pilot estagnado' NÃO toca" || bad "lane:kimi esperando, streak 2: '$r' (esperado 'sat=1 estado=none notify=0')"
+r=$(run_step5 5 KIMI_LANE_WAITING=4)
+[ "$r" = "sat=1 estado=none notify=0" ] && ok "…também no 6º sweep seguido, com 4 esperando (o toque de 15 em 15 min não volta)" || bad "4 esperando, streak 5: '$r'"
+r=$(run_step5 2 NONQUEUE_FAILS=1)
+[ "$r" = "sat=0 estado=3 notify=1" ] && ok "CONTROLE: um candidato comum que não despachou (NONQUEUE_FAILS) continua somando o streak e tocando no 3º — o gate do Step 5 foi mesmo alcançado" || bad "controle sem espera: '$r' (esperado 'sat=0 estado=3 notify=1')"
+r=$(run_step5 2 KIMI_LANE_WAITING=1 NONQUEUE_FAILS=1)
+[ "$r" = "sat=0 estado=3 notify=1" ] && ok "espera + uma falha de verdade no mesmo sweep: NÃO é saturado — a falha segue contada e o alarme toca (a espera não a esconde)" || bad "espera + falha: '$r'"
+r=$(run_step5 2 KIMI_LANE_WAITING=1 DISPATCHED=1)
+[ "$r" = "sat=0 estado=none notify=0" ] && ok "espera + um despacho: não é saturado e o streak zera pelo caminho de sempre (despachou)" || bad "espera + despacho: '$r'"
+r=$(run_step5 2 KIMI_LANE_WAITING=x)
+[ "$r" = "sat=0 estado=3 notify=1" ] && ok "contador que não é número: NÃO isenta o sweep (uma conta que não li nunca vira 'espera de propósito')" || bad "contador ilegível: '$r'"
+r=$(run_step5 2 KIMI_LANE_WAITING=08)
+[ "$r" = "sat=1 estado=none notify=0" ] && ok "contador com zero à esquerda (08) é lido como decimal, não como octal inválido" || bad "contador 08: '$r'"
+r=$(run_step5 2 'unset KIMI_LANE_WAITING')
+[ "$r" = "sat=0 estado=3 notify=1" ] && ok "contador ausente: vale 0 (sem erro com set -u) e o sweep parado conta como antes" || bad "contador ausente: '$r'"
+r=$(run_step5 2 POOL_CAP_QUEUED=2)
+[ "$r" = "sat=1 estado=none notify=0" ] && ok "CONTROLE: fila de teto de pool (ga-in9ebr) segue saturada como antes" || bad "controle teto de pool: '$r'"
+r=$(run_step5 2 PRIORITY_YIELDED=1)
+[ "$r" = "sat=1 estado=none notify=0" ] && ok "CONTROLE: cessão a P0/P1 (ga-5fn5p3) segue saturada como antes" || bad "controle cessão: '$r'"
+# o marcador que o imparavel-check lê ("ga-in9ebr: POOL-SATURATED sweep") sai igual quando a causa é a fila de teto, e nomeia a espera da faixa Kimi quando ela é parte da causa
+run_step5 2 KIMI_LANE_WAITING=3 >/dev/null; m=$(grep 'ga-in9ebr: POOL-SATURATED sweep' "$WORK/step5.log" 2>/dev/null)
+case "$m" in "ga-in9ebr: POOL-SATURATED sweep — dispatched=0 only because 0 candidate(s) are queued behind full worker capacity and 3 lane:kimi bead(s) wait on purpose in the Kimi lane"*"(backpressure, not a stall).") ok "o marcador POOL-SATURATED (o que o imparavel-check lê) sai com o mesmo prefixo e nomeia as 3 lane:kimi que esperam" ;; *) bad "marcador com espera da faixa: '$m'" ;; esac
+run_step5 2 POOL_CAP_QUEUED=2 >/dev/null; m=$(grep 'ga-in9ebr: POOL-SATURATED sweep' "$WORK/step5.log" 2>/dev/null)
+[ "$m" = "ga-in9ebr: POOL-SATURATED sweep — dispatched=0 only because 2 candidate(s) are queued behind full worker capacity (backpressure, not a stall)." ] && ok "CONTROLE: sem lane:kimi esperando o marcador sai BYTE A BYTE como antes (o que o imparavel-check e os outros selftests leem não muda)" || bad "marcador sem a faixa Kimi mudou: '$m'"
+run_step5 2 NONQUEUE_FAILS=1 >/dev/null; ! grep -q 'POOL-SATURATED' "$WORK/step5.log" 2>/dev/null && ok "CONTROLE: sweep que não é saturado não escreve o marcador" || bad "marcador escrito num sweep não saturado: $(cat "$WORK/step5.log")"
+
+echo "── passada: o que a passada deixa para o predicado — espera (KIMI_LANE_WAITING) e falha (NONQUEUE_FAILS) separadas"
+cnt() { cat "$WORK/pass.counters" 2>/dev/null || echo "sem-arquivo"; }
+reset; r=$(run_pass "[$K1]" "[]"); c=$(cnt)
+[ "$c" = "waiting=1 nqf=0" ] && ok "faixa FECHADA com uma bead limpa: 1 espera, 0 falhas" || bad "fechada: '$c'"
+reset; on; r=$(run_pass "[$K1]" "[]"); c=$(cnt)
+[ "$c" = "waiting=0 nqf=0" ] && ok "aberta e despachada: nada esperando, nenhuma falha" || bad "despachada: '$c'"
+reset; on; r=$(KL_DRC=1 KL_DRES=kimi_lane_wait run_pass "[$K1,$K2]" "[]"); c=$(cnt)
+[ "$c" = "waiting=2 nqf=0" ] && ok "vaga ocupada (kimi_lane_wait): as 2 esperam (a que tentou e a que nem tentou), 0 falhas" || bad "vaga ocupada: '$c'"
+reset; on; r=$(KL_DRC=1 KL_DRES=kimi_lane_released run_pass "[$K1]" "[]"); c=$(cnt)
+[ "$c" = "waiting=1 nqf=0" ] && ok "solta (kimi_lane_released): espera, 0 falhas" || bad "solta: '$c'"
+reset; on; r=$(run_pass "[$KW]" "[]"); c=$(cnt)
+[ "$c" = "waiting=1 nqf=0" ] && ok "bead de outro rig (semana 1: só HQ): espera, 0 falhas" || bad "outro rig: '$c'"
+reset; on; r=$(run_pass "[$E1]" "[]"); c=$(cnt)
+[ "$c" = "waiting=1 nqf=0" ] && ok "sem texto (descrição vazia): espera na triagem, 0 falhas" || bad "sem-texto: '$c'"
+reset; on; r=$(run_pass "[$N1]" "[]"); c=$(cnt)
+[ "$c" = "waiting=0 nqf=0" ] && ok "sem lane:kimi: nada esperando, nenhuma falha" || bad "sem lane:kimi: '$c'"
+echo "   …e o que é FALHA do nó ou da passada não vira espera: soma em NONQUEUE_FAILS, que desliga a isenção"
+reset; on; r=$(KL_DRC=1 KL_DRES=kimi_lane_failed run_pass "[$K1,$K2]" "[]"); c=$(cnt)
+[ "$c" = "waiting=2 nqf=1" ] && [ "$(grep -c . "$DCALLS")" = 1 ] && ok "kimi_lane_failed (atribuição, sessão ou aviso falhou): 1 falha e a passada para" || bad "kimi_lane_failed: '$c' tentativas=$(grep -c . "$DCALLS" 2>/dev/null)"
+reset; on; r=$(KL_DRC=1 KL_DRES=node_rollback_unconfirmed run_pass "[$K1]" "[]"); c=$(cnt)
+[ "$c" = "waiting=1 nqf=1" ] && ok "desfazer sem confirmar (node_rollback_unconfirmed): 1 falha" || bad "node_rollback_unconfirmed: '$c'"
+reset; on; r=$(KL_DRC=1 KL_DRES= run_pass "[$K1]" "[]"); c=$(cnt)
+[ "$c" = "waiting=1 nqf=1" ] && ok "dispatch_one que falha SEM nome: é falha, não espera (o que não sei dizer não é isento)" || bad "falha sem nome: '$c'"
+reset; on; cset ga-c3 "$(cj 'ok')"; printf '%s' 'comments ga-c3' > "$WORK/bd.fail.on"; r=$(run_pass "[$C3]" "[]"); c=$(cnt)
+[ "$c" = "waiting=1 nqf=1" ] && ok "triagem ilegível (leitura dos comentários falhou): 1 falha — não parece espera calma" || bad "ilegível: '$c'"
+reset; on; printf '%s' '--remove-label' > "$WORK/bd.fail.on"; r=$(run_pass "[$V1]" "[]"); c=$(cnt)
+[ "$c" = "waiting=1 nqf=1" ] && ok "rebaixamento que não gravou: 1 falha" || bad "rebaixamento que falha: '$c'"
+reset; printf '%s' 'gc.routed_to=kimi-lane' > "$WORK/bd.fail.on"; r=$(run_pass "[$K1]" "[]"); c=$(cnt)
+[ "$c" = "waiting=1 nqf=1" ] && ok "carimbo que não gravou: 1 falha" || bad "carimbo que falha: '$c'"
+reset; r=$(KL_JQFAIL=1 run_pass "[$K1]" "[]"); c=$(cnt)
+[ "$c" = "waiting=1 nqf=1" ] && ok "lista do carimbo que não se leu: 1 falha" || bad "lista do carimbo: '$c'"
+
+echo "── kimi_lane_failed: falha do nó ≠ espera de propósito (rodada 2, não bloqueante: o mesmo nome cobria os dois)"
+reset; sess; echo 1 > "$WORK/gc.new.rc"; r=$(run_kd); f=$(cat "$WORK/kd.fault" 2>/dev/null)
+[ "$r" = "res=mini alias=" ] && [ "$f" = "fault=1" ] && ok "a sessão não abriu: nada ficou escrito (mini) e a falha é marcada (fault=1)" || bad "sessão que não abre: '$r' '$f'"
+reset; sess; echo 1 > "$WORK/gc.nudge.rc"; r=$(run_kd); f=$(cat "$WORK/kd.fault" 2>/dev/null)
+[ "$r" = "res=mini alias=" ] && [ "$f" = "fault=1" ] && ok "o aviso falhou: falha marcada" || bad "aviso que falha: '$r' '$f'"
+reset; sess; printf '%s' 'update ga-k1 --assignee' > "$WORK/bd.fail.on"; r=$(run_kd); f=$(cat "$WORK/kd.fault" 2>/dev/null)
+[ "$r" = "res=mini alias=" ] && [ "$f" = "fault=1" ] && ok "a atribuição falhou: falha marcada" || bad "atribuição que falha: '$r' '$f'"
+reset; sess kimi-worker-remote-1:active; r=$(run_kd); f=$(cat "$WORK/kd.fault" 2>/dev/null)
+[ "$r" = "res=mini alias=" ] && [ "$f" = "fault=0" ] && ok "vaga ocupada: espera de propósito, SEM falha" || bad "vaga ocupada: '$r' '$f'"
+reset; echo 1 > "$WORK/gc.list.rc"; r=$(run_kd); f=$(cat "$WORK/kd.fault" 2>/dev/null)
+[ "$r" = "res=mini alias=" ] && [ "$f" = "fault=0" ] && ok "lista de sessões que não se leu: sem vaga, SEM falha (inerte; o aviso do log diz)" || bad "lista ilegível: '$r' '$f'"
+reset; sess; r=$(run_kd); f=$(cat "$WORK/kd.fault" 2>/dev/null)
+[ "$r" = "res=node alias=kimi-worker-remote-1" ] && [ "$f" = "fault=0" ] && ok "despacho que deu certo: sem falha" || bad "despacho certo: '$r' '$f'"
+KB="$(awk '/^  if \[ "\$\{_PILOT_KIMI_PASS:-0\}" = "1" \]; then/{f=1} f{print} f&&/^  fi$/{exit}' "$DISPATCHER")"
+printf '%s\n' "$KB" | grep -qF 'if [ "${_PKL_FAULT:-0}" = "1" ]; then DISPATCH_RESULT="kimi_lane_failed"; else DISPATCH_RESULT="kimi_lane_wait"; fi' && ok "dispatch_one: o bloco da faixa devolve kimi_lane_failed quando _PKL_FAULT=1 e kimi_lane_wait quando não" || bad "bloco da faixa em dispatch_one sem os dois nomes: $(printf '%s\n' "$KB" | cut -c1-160)"
 
 if [ -z "${KL_MUTANT:-}" ] && [ "${KL_NO_MUTANTS:-0}" != "1" ]; then
   echo "── controle negativo: cada mutante tem que reprovar a bateria"
@@ -544,6 +673,35 @@ PY
   mutant "telefone sem a forma (DD) com 9 solto" pilot '|\\(\\d{2}\\)\\s*9?[\\s.-]?\\d{4}[\\s.-]?\\d{4}' ''
   mutant "telefone sem a forma +55 com parêntese" pilot '|\\+\\s?55\\s?\\(?\\d{2}\\)?' ''
   mutant "travessão e hífen Unicode não valem como hífen" pilot ' | gsub("[\u2010-\u2015\u2212\uFF0D]"; "-")' ''
+  echo "   …rodada 2 (espera de propósito não é parada)"
+  mutant "predicado ignora a espera da faixa" pilot '${PRIORITY_YIELDED:-0} + _kimi_wait_n )) -gt 0 ]' '${PRIORITY_YIELDED:-0} )) -gt 0 ]'
+  mutant "contador ilegível isenta o sweep" pilot "case \"\$_kimi_wait_n\" in ''|*[!0-9]*) _kimi_wait_n=0 ;;" "case \"\$_kimi_wait_n\" in ''|*[!0-9]*) _kimi_wait_n=1 ;;"
+  mutant "zero à esquerda lido como octal" pilot '*) _kimi_wait_n=$((10#$_kimi_wait_n)) ;; esac' '*) : ;; esac'
+  mutant "a isenção vale com falha no sweep" pilot '_kimi_wait_n )) -gt 0 ] && [ "${NONQUEUE_FAILS:-0}" -eq 0 ]; then' '_kimi_wait_n )) -gt 0 ]; then'
+  mutant "a isenção vale com despacho" pilot 'if [ "$DISPATCHED" -eq "0" ] && [ $(( ${POOL_CAP_QUEUED:-0} + ${PRIORITY_YIELDED:-0} + _kimi_wait_n ))' 'if [ $(( ${POOL_CAP_QUEUED:-0} + ${PRIORITY_YIELDED:-0} + _kimi_wait_n ))'
+  mutant "marcador POOL-SATURATED sem a espera da faixa" pilot '${_py_sat_note}${_kl_sat_note} (backpressure' '${_py_sat_note} (backpressure'
+  mutant "a passada não conta a espera" pilot 'KIMI_LANE_WAITING=$((_kl_n - _kl_sent))' 'KIMI_LANE_WAITING=0'
+  mutant "a passada não soma nenhuma falha" pilot 'NONQUEUE_FAILS=$(( ${NONQUEUE_FAILS:-0} + _kl_demfail + _kl_stampfail + _kl_idsfail + _kl_unread + _kl_dfault ))' 'NONQUEUE_FAILS=${NONQUEUE_FAILS:-0}'
+  mutant "rebaixamento que falha não soma" pilot '+ _kl_demfail + _kl_stampfail' '+ _kl_stampfail'
+  mutant "carimbo que falha não soma" pilot '+ _kl_stampfail + _kl_idsfail' '+ _kl_idsfail'
+  mutant "lista do carimbo ilegível não soma" pilot '+ _kl_idsfail + _kl_unread' '+ _kl_unread'
+  mutant "triagem ilegível não soma" pilot '+ _kl_unread + _kl_dfault ))' '+ _kl_dfault ))'
+  mutant "falha do despacho não soma" pilot '+ _kl_unread + _kl_dfault ))' '+ _kl_unread ))'
+  mutant "triagem ilegível conta como sem-texto" pilot '[ "$_kl_verdict" = sem-texto ] || _kl_unread=$((_kl_unread + 1))' ':'
+  mutant "retorno sem nome conta como espera" pilot 'kimi_lane_wait|kimi_lane_released) ;; *) _kl_dfault=$((_kl_dfault + 1)) ;; esac' '*) ;; esac'
+  mutant "kimi_lane_failed não para a passada" pilot 'kimi_lane_wait|kimi_lane_failed|node_rollback_unconfirmed) _kl_stop=' 'kimi_lane_wait|node_rollback_unconfirmed) _kl_stop='
+  mutant "falha do nó sai com o nome da espera" pilot 'if [ "${_PKL_FAULT:-0}" = "1" ]; then DISPATCH_RESULT="kimi_lane_failed"; else' 'if false; then DISPATCH_RESULT="kimi_lane_failed"; else'
+  mutant "falha do nó não é marcada" pilot '    _PKL_FAULT=1
+    warn' '    warn'
+  mutant "a marca de falha não zera na entrada" pilot '_PNF_RESULT="mini"; _PKL_FAULT=0' '_PNF_RESULT="mini"'
+  mutant "metadata story.* fora da triagem" pilot ', .metadata["story.criterios"], .metadata["story.estrela_guia"], .metadata["story.equilibrios"] ] | map(txt)) as $f' '] | map(txt)) as $f'
+  mutant "story.criterios fora da triagem" pilot ', .metadata["story.criterios"],' ','
+  mutant "story.estrela_guia fora da triagem" pilot ', .metadata["story.estrela_guia"],' ','
+  mutant "story.equilibrios fora da triagem" pilot ', .metadata["story.equilibrios"] ]' ' ]'
+  mutant "gate: nota da faixa em todo FAIL" gate 'if [ "$_GFAIL_ROUTE" = "kimi-lane" ]; then
+          _GFAIL_KIMI_NOTE=' 'if true; then
+          _GFAIL_KIMI_NOTE='
+  mutant "gate: comentário do FAIL sem a nota da faixa" gate '$_GFAIL_LANE_NOTE$_GFAIL_KIMI_NOTE The Pilot' '$_GFAIL_LANE_NOTE The Pilot'
 fi
 echo "pilot-dispatcher.kimi-lane selftest: $PASS passed, $FAIL failed"
 echo "RESULT $FAIL/$((PASS+FAIL))"

@@ -399,7 +399,7 @@ PILOT_NODE_FIRST_VETO_LABELS="${PILOT_NODE_FIRST_VETO_LABELS:-node:never needs:e
 PILOT_NODE_CAPACITY_BIN="${PILOT_NODE_CAPACITY_BIN:-$GC_CITY/scripts/hetzner-capacity.py}"
 PILOT_NODE_FIRST_LOG="${PILOT_NODE_FIRST_LOG:-$GC_CITY/.gc/logs/node-first-shadow.jsonl}"
 # ga-do1ixn.3: a faixa Kimi (teste do Athos 26/10: Claude Code com o Kimi por baixo, só bead sem dado pessoal). Bead com o rótulo lane:kimi vai SÓ ao kimi-worker-remote (Hetzner, perfil Kimi
-# do scripts/gc-session-ssh) e o kimi-worker-remote só recebe lane:kimi. Sem a bandeira (ou com o nó desligado, a vaga ocupada, bead fora do HQ) a bead ESPERA: nunca cai num pool Claude.
+# do scripts/gc-session-ssh) e o kimi-worker-remote só recebe lane:kimi. Sem a bandeira (ou com o nó desligado, a vaga ocupada, bead fora do HQ) a bead ESPERA: o Pilot não a manda a pool Claude (a sondagem dos dogs, que é do engine, lê gc.routed_to: a bead que ainda tem rota de pool fica visível a ela até o carimbo da passada — ver o runbook gc-session-ssh).
 # A espera carimba gc.routed_to=kimi-lane, que de propósito NÃO é nome de pool: nem a sondagem dos pools nem a demanda do engine a pegam, e o pilot-missing-route-watchdog não a vê "sem rota".
 PILOT_KIMI_LANE_FLAG="${PILOT_KIMI_LANE_FLAG:-$GC_CITY/.gc/kimi-lane.on}"
 PILOT_KIMI_NODE_FLAG="${PILOT_KIMI_NODE_FLAG:-$GC_CITY/.gc/hetzner-node.on}"
@@ -12431,10 +12431,12 @@ _pilot_kimi_pick_alias() {
 }
 
 # _pilot_kimi_dispatch <bead_id> <bead_city> <title> — leva a bead ao kimi-worker-remote. Sempre devolve 0 e deixa _PNF_RESULT (node = atribuída e avisada · mini = nada ficou escrito: o chamador solta a
-# claim e a bead ESPERA · stuck = o desfazer não se confirmou) e _PNF_ALIAS, que é o que o dispatch_one já lê para o ramo do nó.
+# claim e a bead ESPERA · stuck = o desfazer não se confirmou) e _PNF_ALIAS, que é o que o dispatch_one já lê para o ramo do nó. _PKL_FAULT separa as duas esperas de _PNF_RESULT=mini: 0 = espera de propósito
+# (orçamento de spawn gasto, vaga ocupada ou lista de sessões que não se leu: nada foi tentado), 1 = o nó FALHOU (a atribuição, a sessão ou o aviso; o desfazer, confirmado ou não, já rodou) — o dispatch_one nomeia
+# a primeira kimi_lane_wait e a segunda kimi_lane_failed, e só a primeira fica de fora da conta de "Pilot estagnado".
 _pilot_kimi_dispatch() {
   local _kd_id="$1" _kd_city="$2" _kd_title="$3" _kd_alias="" _kd_state="" _kd_rc=0 _kd_t0=0 _kd_msg="" _kd_step="" _kd_sess=0
-  _PNF_ALIAS=""; _PNF_RESULT="mini"
+  _PNF_ALIAS=""; _PNF_RESULT="mini"; _PKL_FAULT=0
   if _pilot_slow_spawn_budget_spent; then
     log "  faixa Kimi: $_kd_id espera — uma sessão lenta já gastou o orçamento de spawn deste sweep"
     return 0
@@ -12467,7 +12469,8 @@ _pilot_kimi_dispatch() {
     [ "$_kd_rc" -eq 0 ] || _kd_step="o aviso falhou (rc=$_kd_rc)"
   fi
   if [ -n "$_kd_step" ]; then
-    warn "ga-do1ixn.3: faixa Kimi: $_kd_id → $_kd_alias: $_kd_step — desfaço o despacho; a bead espera a próxima varredura (nunca vai a um pool Claude)"
+    _PKL_FAULT=1
+    warn "ga-do1ixn.3: faixa Kimi: $_kd_id → $_kd_alias: $_kd_step — desfaço o despacho; a bead espera a próxima varredura (o Pilot não a manda a pool Claude)"
     if _pilot_node_first_rollback "$_kd_id" "$_kd_city" "$_kd_alias" "$_kd_sess"; then
       _PNF_ALIAS=""; _PNF_RESULT="mini"
     else
@@ -12481,14 +12484,14 @@ _pilot_kimi_dispatch() {
 }
 
 # _pilot_kimi_screen <bead_json> — a triagem de UMA bead lane:kimi, só pelo que o JSON da candidata já traz (nenhuma chamada ao bd). Imprime UMA palavra e devolve 0:
-#   ok             rótulos sem veto e título+descrição (+design, critérios, notas) sem termo de dado pessoal → pode ir ao Kimi
+#   ok             rótulos sem veto e título+descrição (+design, critérios, notas e os textos de metadata story.criterios, story.estrela_guia e story.equilibrios, que o dispatch_one trata como conteúdo da bead) sem termo de dado pessoal → pode ir ao Kimi
 #   veto:<rótulo>  a bead traz um rótulo de PILOT_NODE_FIRST_VETO_LABELS (node:never é o que o prompt do kimi-worker põe ao devolver a bead ao mini) → sai da faixa
 #   pii:<termo>    o texto casou com a lista do Mayor (cpf, telefone, conversa, lead, proprietário, chip/frota, Pipedrive, e-mail, shared/data e *.db, dado pessoal) ou com número longo sem máscara
 #                  (CPF, CNPJ e telefone/WhatsApp: 10+ dígitos seguidos; CPF e CNPJ com espaço, ponto, barra ou hífen entre os grupos, mascarados por inteiro ou pela metade; DDD + número com espaço, ponto ou hífen;
 #                  [9 ]NNNN NNNN e [2-5]NNN NNNN com espaço, ponto ou hífen — dois grupos de 4 dígitos (3333 4444, 2026 2027) casam, falso positivo aceito; telefone com (DDD) e o 9 solto ou colado, e +55 com ou sem parênteses, casam pelo termo telefone;
 #                  hífen, travessão e menos Unicode (U+2010 a U+2015, U+2212, U+FF0D) valem como hífen antes de casar) → sai da faixa. Data e hora (2026-10-28 19:15) e versão (1.2.3) não casam: o separador só vale entre grupos de tamanho de documento ou telefone
 #   sem-texto      título ou descrição vazios: não há o que triar → espera
-#   ilegivel       rótulo ou campo que não é do tipo esperado, ou JSON que o jq não lê → espera
+#   ilegivel       rótulo ou campo (inclusive os três de metadata story.*) que não é do tipo esperado, metadata que não é objeto, ou JSON que o jq não lê → espera
 # Fail-closed: só `ok` deixa a bead ir ao Kimi. Os termos casam por palavra inteira, sem caixa e sem acento ("leader" e "chipset" não casam). Falso positivo custa a bead voltar ao dog Claude; falso
 # negativo custa dado pessoal num provedor de fora — por isso a lista é larga. O que a triagem imprime é o NOME do termo, nunca o trecho do texto (o comentário na bead não copia dado pessoal).
 _pilot_kimi_screen() {
@@ -12514,7 +12517,7 @@ _pilot_kimi_screen() {
       ["numero-longo", "\\b\\d{10,}\\b|\\b\\d{2}[\\s.]?\\d{3}[\\s.]?\\d{3}[\\s./-]?\\d{4}[\\s-]?\\d{2}\\b|\\b\\d{3}[\\s.-]?\\d{3}[\\s.-]?\\d{3}[\\s.-]?\\d{2}\\b|\\b0?\\d{2}[\\s.-]?9?[\\s.-]?\\d{4}[\\s.-]?\\d{4}\\b|\\b9[\\s.-]?\\d{4}[\\s.-]\\d{4}\\b|\\b[2-5]\\d{3}[\\s.-]\\d{4}\\b"]
     ];
     def txt: if . == null then "" elif type == "string" then . else error("nao-texto") end;
-    ([ .title, .description, .design, .acceptance_criteria, .notes ] | map(txt)) as $f
+    ([ .title, .description, .design, .acceptance_criteria, .notes, .metadata["story.criterios"], .metadata["story.estrela_guia"], .metadata["story.equilibrios"] ] | map(txt)) as $f
     | if ($f[0] | test("\\S") | not) or ($f[1] | test("\\S") | not) then "sem-texto"
       else ($f | join("\n") | gsub("\\p{M}"; "") | gsub("[\u2010-\u2015\u2212\uFF0D]"; "-")) as $text
         | ([ pats[] | . as $p | select($text | test($p[1]; "i")) | $p[0] ] | .[0] // "") as $hit
@@ -12572,7 +12575,7 @@ _pilot_kimi_demote() {
 # não o têm (uma rota de pool posta por outro caminho — a volta do gate, o pilot-missing-route-watchdog — chamaria o pool do mini). (3) Com a faixa aberta, leva UMA bead do HQ (ga-) que passou na
 # triagem ao kimi-worker-remote por dispatch_one com _PILOT_KIMI_PASS=1; a de outro rig espera (semana 1: só HQ, o traco-bim não tem espelho no nó).
 _pilot_kimi_lane_pass() {
-  local _kl_lane _kl_pool _kl_k _kl_rest _kl_ids _kl_id _kl_pick _kl_rc _kl_tier _kl_closed="" _kl_n=0 _kl_sent=0 _kl_stamped=0 _kl_stampfail=0 _kl_idsfail=0 _kl_tries=0 _kl_rel=0 _kl_rel_max=10 _kl_other=0 _kl_stop=""
+  local _kl_lane _kl_pool _kl_k _kl_rest _kl_ids _kl_id _kl_pick _kl_rc _kl_tier _kl_closed="" _kl_n=0 _kl_sent=0 _kl_stamped=0 _kl_stampfail=0 _kl_idsfail=0 _kl_tries=0 _kl_rel=0 _kl_rel_max=10 _kl_other=0 _kl_stop="" _kl_unread=0 _kl_dfault=0
   local _kl_small="[]" _kl_big="[]" _kl_held="[]" _kl_keep _kl_bead _kl_verdict _kl_why _kl_next _kl_demoted=0 _kl_demfail=0 _kl_held_n=0 _kl_stamp_txt
   for _kl_lane in small big; do
     case "$_kl_lane" in small) _kl_pool="${SMALL_CANDIDATES:-[]}" ;; big) _kl_pool="${BIG_CANDIDATES:-[]}" ;; esac
@@ -12626,6 +12629,8 @@ _pilot_kimi_lane_pass() {
             _kl_next=$(printf '%s' "$_kl_held" | jq -c --argjson b "$_kl_bead" '. + [$b]' 2>/dev/null) && _kl_held="$_kl_next" || warn "ga-do1ixn.3: faixa Kimi: não consegui listar $_kl_id para o carimbo — ela segue fora das pistas, sem despachar"
           fi ;;
         *)
+          # sem-texto = a bead não tem o que triar (espera de propósito); ilegivel (ou palavra que a triagem não devolve) = NÃO CONSEGUI LER: é falha, soma em NONQUEUE_FAILS e o Step 5 segue vendo
+          [ "$_kl_verdict" = sem-texto ] || _kl_unread=$((_kl_unread + 1))
           _kl_held_n=$((_kl_held_n + 1)); log "  faixa Kimi: $_kl_id espera — triagem '$_kl_verdict' (título ou descrição vazios, ou um campo ou comentário que não leio): não vai ao Kimi sem eu ler o texto"
           _kl_next=$(printf '%s' "$_kl_held" | jq -c --argjson b "$_kl_bead" '. + [$b]' 2>/dev/null) && _kl_held="$_kl_next" || warn "ga-do1ixn.3: faixa Kimi: não consegui listar $_kl_id para o carimbo — ela segue fora das pistas, sem despachar" ;;
       esac
@@ -12671,11 +12676,13 @@ _pilot_kimi_lane_pass() {
         if [ "$_kl_rc" = 0 ]; then
           _kl_sent=1; DISPATCHED=$((DISPATCHED + 1)); _pilot_sweep_note "$_kl_id" 0 "${DISPATCH_RESULT:-}"; break
         fi
-        # o que dispatch_one devolveu sem despachar entra no pilot_sweep pelo NOME (kimi_lane_released/kimi_lane_wait = espera de propósito; node_rollback_unconfirmed = falha; sem nome = unclassified): sem esta nota a bead sumia da contagem da varredura
+        # o que dispatch_one devolveu sem despachar entra no pilot_sweep pelo NOME (kimi_lane_released/kimi_lane_wait = espera de propósito; node_rollback_unconfirmed/kimi_lane_failed = falha; sem nome = unclassified): sem esta nota a bead sumia da contagem da varredura
         _pilot_sweep_note "$_kl_id" "$_kl_rc" "${DISPATCH_RESULT:-}"
+        # espera de propósito = kimi_lane_wait e kimi_lane_released (nada falhou); qualquer outro retorno sem despachar (kimi_lane_failed, node_rollback_unconfirmed, outro nome, sem nome) é FALHA e soma em NONQUEUE_FAILS
+        case "${DISPATCH_RESULT:-}" in kimi_lane_wait|kimi_lane_released) ;; *) _kl_dfault=$((_kl_dfault + 1)) ;; esac
         case "${DISPATCH_RESULT:-}" in
           # sem vaga (ou o nó não ficou com ela): as outras também não ficariam nesta varredura
-          kimi_lane_wait|node_rollback_unconfirmed) _kl_stop="${DISPATCH_RESULT}"; break ;;
+          kimi_lane_wait|kimi_lane_failed|node_rollback_unconfirmed) _kl_stop="${DISPATCH_RESULT}"; break ;;
           # solta antes de gastar a vaga do Kimi: a de trás ainda tem a vez, até o teto de soltas
           kimi_lane_released) _kl_tries=$((_kl_tries - 1)); _kl_rel=$((_kl_rel + 1)) ;;
         esac
@@ -12683,6 +12690,12 @@ _pilot_kimi_lane_pass() {
     done
   fi
   _PILOT_KIMI_PASS=0
+  # Para o predicado de saturação e o Step 5 (rodada 2 do gate): a bead lane:kimi que ficou na faixa sem despachar é ESPERA DE PROPÓSITO (faixa fechada, vaga ocupada, triagem, outro rig, tentativas gastas) e a
+  # pool não a viu como candidata no resto do sweep — sem esta conta o sweep seria lido como parado e o p4 "Pilot estagnado" tocaria a cada 15 min. FALHA (rebaixamento, carimbo, lista do carimbo, triagem que não li,
+  # nó que falhou ou retorno sem nome) soma em NONQUEUE_FAILS, e com NONQUEUE_FAILS>0 o predicado NÃO isenta o sweep: a espera nunca esconde uma falha.
+  # vazio → 0 esperas (a conta fecha em 0); falhou/ilegível → as contas vêm de contadores locais desta função, que não leem nada de fora
+  KIMI_LANE_WAITING=$((_kl_n - _kl_sent))
+  NONQUEUE_FAILS=$(( ${NONQUEUE_FAILS:-0} + _kl_demfail + _kl_stampfail + _kl_idsfail + _kl_unread + _kl_dfault ))
   # vazio → 0 carimbadas; falhou/ilegível → o resumo diz que a lista não foi lida
   _kl_stamp_txt="rota carimbada=$_kl_stamped (falhas $_kl_stampfail)"
   [ "$_kl_idsfail" = 0 ] || _kl_stamp_txt="rota carimbada=NÃO LI a lista (nada carimbado)"
@@ -15003,7 +15016,7 @@ LIVESEC
     fi
   elif [ "${_PILOT_KIMI_PASS:-0}" = "1" ]; then
     # ga-do1ixn.3: faixa Kimi — a vaga do kimi-worker-remote (no Hetzner) não é a que a P0/P1 espera, então o yield NÃO se aplica; mas só segue a bead do HQ com alvo de dog (a receita do nó é a de dog).
-    # Qualquer outra solta a claim aqui, SEM carimbo de pool (o 4º argumento não é wa-worker/ps-worker de propósito): ela espera na faixa, nunca vai a um pool Claude.
+    # Qualquer outra solta a claim aqui, SEM carimbo de pool (o 4º argumento não é wa-worker/ps-worker de propósito): ela espera na faixa; o Pilot não a manda a pool Claude.
     if [ "$_PYS_NATIVE" = "0" ] && [ "$_PYS_TARGET" = "gastown.dog" ]; then
       log "  ga-do1ixn.3: $STORY_ID segue na faixa Kimi — o yield não se aplica (a vaga é a do kimi-worker-remote, no nó)."
     else
@@ -15534,7 +15547,8 @@ TASK
     fi
     if [ "$_PNF_RESULT" != "node" ]; then
       _pilot_priority_yield_release "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET" "kimi-lane"
-      DISPATCH_RESULT="kimi_lane_wait"
+      # _PKL_FAULT é posto pela _pilot_kimi_dispatch na entrada (0 = espera de propósito, 1 = a atribuição, a sessão ou o aviso falhou): 1 vira kimi_lane_failed (failed_other no pilot_sweep; a passada o soma em NONQUEUE_FAILS)
+      if [ "${_PKL_FAULT:-0}" = "1" ]; then DISPATCH_RESULT="kimi_lane_failed"; else DISPATCH_RESULT="kimi_lane_wait"; fi
       return 1
     fi
   fi
@@ -16604,6 +16618,9 @@ OWNERSHIP_GUARD_VETO_COUNT=0   # ga-8jxe1 AC4 — see the two increment sites in
 POOL_CAP_QUEUED=0
 POOL_CAP_QUEUED_IDS=""
 NONQUEUE_FAILS=0
+# ga-do1ixn.3: beads lane:kimi que a passada da faixa Kimi deixou ESPERANDO de propósito neste sweep (tirou das pistas e não despachou). Conta do lado da saturação no predicado, como PRIORITY_YIELDED; as
+# FALHAS dessa passada não entram aqui: somam em NONQUEUE_FAILS, que desliga a isenção.
+KIMI_LANE_WAITING=0
 DISPATCH_RESULT=""   # ga-ov3gow: global on purpose — set by dispatch_one(), read by dispatch_lane() (see there)
 
 # ── ga-ov3gow: the per-sweep aggregate event (`pilot_sweep`) ──────────────────────────────────────────
@@ -16646,10 +16663,12 @@ DISPATCH_RESULT=""   # ga-ov3gow: global on purpose — set by dispatch_one(), r
 #                       counted in NONQUEUE_FAILS so the Step 5 stall streak sees a sweep that spawned nothing.
 #                       And kimi_lane_released / kimi_lane_wait (ga-do1ixn.3): a lane:kimi bead the Kimi pass handed to
 #                       dispatch_one() and that dispatch_one() gave back on purpose — released (the lane only takes an HQ
-#                       bead with a dog target) or kept waiting (the Kimi slot was busy, the session did not open, the
-#                       notice failed; never the mini). The claim is released, nothing is stamped as a pool route: a
-#                       wait, not a fault. (node_rollback_unconfirmed from the Kimi pass — the undo of the dispatch could
-#                       not be confirmed — is NOT here: it stays failed_other, where a real fault is visible.)
+#                       bead with a dog target) or kept waiting (the Kimi slot was busy, the session list could not be read
+#                       or the spawn budget was spent; never the mini). The claim is released, nothing is stamped as a pool
+#                       route: a wait, not a fault. (Two results from the Kimi pass are NOT here and stay failed_other, where
+#                       a real fault is visible: node_rollback_unconfirmed — the undo of the dispatch could not be confirmed
+#                       — and kimi_lane_failed — the assignment, the session or the notice failed, the node did not take the
+#                       bead and the undo ran. Gate round 2: kimi_lane_wait used to cover that outage too.)
 #   failed_other        any other NAMED failure (assign / sling / in-flight / rig_native_pool_count_unreadable —
 #                       the session count could not be read, so the spawn was NOT attempted, ga-oa004t — and
 #                       remerge_branch_lookup_unknown, ga-x7m5rg: the gate:needs-remerge branch lookup could
@@ -16665,7 +16684,9 @@ DISPATCH_RESULT=""   # ga-ov3gow: global on purpose — set by dispatch_one(), r
 #                       for such a bead is not a candidate outcome — it appears in the log line "cedida a P0/P1" only.)
 #   unclassified        dispatch_one() returned non-zero WITHOUT naming a result (its early guards, a lost
 #                       claim, a hold): counted so the accounting closes — never read as a success
-#   pool_saturated      the ga-in9ebr predicate (_pool_saturated_sweep); consumers must not re-derive it
+#   pool_saturated      the ga-in9ebr predicate (_pool_saturated_sweep); consumers must not re-derive it. True also when the only
+#                       reason nothing dispatched is lane:kimi beads waiting on purpose in the Kimi lane (ga-do1ixn.3, KIMI_LANE_WAITING:
+#                       lane closed, slot busy, triage hold, another rig) — still never with a failure in the same sweep (NONQUEUE_FAILS)
 #   priority_yield_blind  ga-5fn5p3: 1 iff this sweep could not tell which P0/P1 beads wait for capacity (the emit's
 #                       population or a pool's live session count was unreadable) — nothing was ceded on that doubt and
 #                       dispatch ran as before; 0 when it could tell; null when the scan never ran or the rule is OFF. "Could not tell"
@@ -16989,8 +17010,14 @@ fi
 # dispatched nothing because the capacity there is, is spoken for by a higher priority — not because the Pilot stalled. It
 # counts on the same side of the predicate as a queue (and, like a queue, never in NONQUEUE_FAILS); without it a sweep that
 # only ceded would trip the Step 5 "Pilot estagnado" streak and imparavel-check's silent-stall alarm.
+# ga-do1ixn.3 (gate, rodada 2): a bead lane:kimi que a passada da faixa Kimi deixou esperando de propósito (KIMI_LANE_WAITING: faixa fechada, vaga ocupada, triagem, outro rig) é a mesma coisa: o sweep não despachou
+# porque a única demanda estava numa faixa que espera, não porque o Pilot parou. Mesma regra das outras duas parcelas: nunca com NONQUEUE_FAILS>0 (a passada soma ali as próprias falhas), nunca com despacho.
+# SELFTEST-EXTRACT pilot-saturation-predicate: BEGIN
 _pool_saturated_sweep=0
-if [ "$DISPATCHED" -eq "0" ] && [ $(( ${POOL_CAP_QUEUED:-0} + ${PRIORITY_YIELDED:-0} )) -gt 0 ] && [ "${NONQUEUE_FAILS:-0}" -eq 0 ]; then
+# vazio → 0 esperas; falhou/ilegível (o contador não é número) → 0 também: um sweep nunca é isento por uma conta que não li
+_kimi_wait_n="${KIMI_LANE_WAITING:-0}"
+case "$_kimi_wait_n" in ''|*[!0-9]*) _kimi_wait_n=0 ;; *) _kimi_wait_n=$((10#$_kimi_wait_n)) ;; esac
+if [ "$DISPATCHED" -eq "0" ] && [ $(( ${POOL_CAP_QUEUED:-0} + ${PRIORITY_YIELDED:-0} + _kimi_wait_n )) -gt 0 ] && [ "${NONQUEUE_FAILS:-0}" -eq 0 ]; then
   _pool_saturated_sweep=1
 fi
 if [ "${POOL_CAP_QUEUED:-0}" -gt 0 ] 2>/dev/null; then
@@ -17002,8 +17029,11 @@ fi
 if [ "$_pool_saturated_sweep" = "1" ]; then
   _py_sat_note=""
   if [ "${PRIORITY_YIELDED:-0}" -gt 0 ]; then _py_sat_note=" and ${PRIORITY_YIELDED} ceded to a P0/P1 that waits for it (ga-5fn5p3)"; fi
-  log "ga-in9ebr: POOL-SATURATED sweep — dispatched=0 only because ${POOL_CAP_QUEUED:-0} candidate(s) are queued behind full worker capacity${_py_sat_note} (backpressure, not a stall)."
+  _kl_sat_note=""
+  if [ "${_kimi_wait_n:-0}" -gt 0 ]; then _kl_sat_note=" and ${_kimi_wait_n} lane:kimi bead(s) wait on purpose in the Kimi lane (ga-do1ixn.3: lane closed, slot busy, triage hold or another rig — not in any pool)"; fi
+  log "ga-in9ebr: POOL-SATURATED sweep — dispatched=0 only because ${POOL_CAP_QUEUED:-0} candidate(s) are queued behind full worker capacity${_py_sat_note}${_kl_sat_note} (backpressure, not a stall)."
 fi
+# SELFTEST-EXTRACT pilot-saturation-predicate: END
 
 if [ "$DISPATCHED" -eq "0" ]; then
   log "No dispatches this sweep (lane slots may have been won by a concurrent process, or all picks skipped)."
@@ -17033,6 +17063,7 @@ _pilot_sweep_emit
 # selftest fixture exactly like LOG/PILOT_LOG already do (hermetic, no new
 # test seam needed). Gated on DRY_RUN (mirrors every other mutation in this
 # file — "makes zero state changes").
+# SELFTEST-EXTRACT pilot-stall-step5: BEGIN
 PILOT_STALL_STATE="$GC_CITY/.gc/pilot-dispatcher-stall.count"
 PILOT_STALL_ALERT_CAP="${PILOT_STALL_ALERT_CAP:-3}"
 # ga-in9ebr: a sweep that dispatched nothing ONLY because every candidate it tried was
@@ -17060,6 +17091,7 @@ if [ "$DRY_RUN" != "1" ] && [ "${_PILOT_NODE_ONLY:-0}" != "1" ] && [ "$DISPATCHE
 elif [ "$DRY_RUN" != "1" ] && [ "${_PILOT_NODE_ONLY:-0}" != "1" ] && [ -f "$PILOT_STALL_STATE" ]; then
   rm -f "$PILOT_STALL_STATE" 2>/dev/null || true
 fi
+# SELFTEST-EXTRACT pilot-stall-step5: END
 
 # ga-2lca0l (3): the cede-only streak Step 5 above deliberately ignores (a sweep that only ceded is "saturated") is its own alarm:
 # N sweeps with dispatched=0, free slots and cessions → the Mayor is mailed once, naming the P0/P1 and the pool's sessions.

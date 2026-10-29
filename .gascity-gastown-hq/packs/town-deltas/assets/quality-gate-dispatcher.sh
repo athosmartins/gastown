@@ -3658,8 +3658,13 @@ gate_fail_assignee_action() {
   #     alias/name form, kept for parity in case a future call site ever feeds
   #     that form in instead. Same "gate/dispatch mis-handles the Mayor
   #     identity" class as GAP-1 (ga-625z4).
+  #   - kimi-worker-remote / kimi-worker-remote-* : ga-do1ixn.3 (gate round 2, info). The Hetzner Kimi pool slot
+  #     (alias kimi-worker-remote-1, the bead's raw assignee). Same kind as dog-remote-1 (dog-*) and wa-worker-remote-1
+  #     (wa-worker-*): its prompt says the bead "volta do gate sem assignee" and the idle session closes by itself in
+  #     15 min, so a still-live Kimi author at FAIL time must take "clear" (route back to kimi-lane, Pilot re-dispatches),
+  #     not "keep" (assignee kept, route unset, a nudge to a disposable slot).
   case "$author" in
-    ''|mayor|gastown.mayor|gastown__mayor|gastown.dog|gastown.dog-*|dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*)
+    ''|mayor|gastown.mayor|gastown__mayor|gastown.dog|gastown.dog-*|dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*|kimi-worker-remote|kimi-worker-remote-*)
       printf 'clear'; return 0 ;;
   esac
   if [ "$author_alive" = "1" ]; then
@@ -3671,7 +3676,7 @@ gate_fail_assignee_action() {
 
 # gate_fail_author_is_ephemeral <author> — pure; selftest-sourceable.
 # ga-aijm2v.5 (rule 3): true (rc 0) when <author> is a disposable pool slot — wa-worker,
-# ps-worker, gastown.dog, dog-* — or the "mayor" routing sentinel the author normalizer
+# ps-worker, gastown.dog, dog-*, kimi-worker-remote* — or the "mayor" routing sentinel the author normalizer
 # substitutes for an unreachable one. Deliberately NOT a second pattern list: it asks
 # gate_fail_assignee_action with alive=1, whose deny-list (ga-nkkku / ga-mgrma) already IS
 # this codebase's definition of "never a named crew, regardless of liveness", so the two
@@ -12090,6 +12095,12 @@ $(gate_render_reasons "$FAIL_REASONS")" 2>/dev/null || true
           _GFAIL_LANE_NOTE=" NOTE: os rótulos da bead não foram lidos (cache e releitura) — não sei se é lane:kimi (ga-do1ixn.3); a rota ficou $_GFAIL_ROUTE e a passada da faixa Kimi do Pilot a recarimba kimi-lane se for."
         fi
         _GFAIL_ROUTE=$(gate_kimi_lane_route "$_GFAIL_LANE_LABELS" "$_GFAIL_ROUTE")
+        # a frase fixa do comentário do FAIL ("so pool workers can self-serve this bead") vale para uma rota de pool; kimi-lane NÃO é pool (de propósito: nem a sondagem dos pools a pega), e a nota diz quem a leva de volta.
+        # vazio → sem nota (a rota é a de sempre); a nota só nasce quando a rota que vai ser gravada é kimi-lane, e não depende de nenhuma leitura além da que decidiu a rota acima
+        _GFAIL_KIMI_NOTE=""
+        if [ "$_GFAIL_ROUTE" = "kimi-lane" ]; then
+          _GFAIL_KIMI_NOTE=" NOTE: esta bead é da faixa Kimi (lane:kimi) — a rota kimi-lane não é um pool, então nenhum pool worker a pega sozinho; quem a leva de volta é a passada da faixa Kimi do Pilot (bandeira .gc/kimi-lane.on, nó ligado e a vaga do kimi-worker-remote), e até lá ela espera."
+        fi
         # SELFTEST-EXTRACT gate-fail-kimi-lane: END
         bd -C "$BEAD_CITY" update "$BEAD_ID" --set-metadata "gc.routed_to=$_GFAIL_ROUTE" -q 2>/dev/null || true
         # Verify the write actually stuck (ga-p5q3 error-vs-empty discipline) — a
@@ -12185,7 +12196,7 @@ $(gate_render_reasons "$FAIL_REASONS")" 2>/dev/null || true
         fi
         GATE_FAIL_REDISPATCH_VERIFIED=$(gate_fail_redispatch_verified "$_GFAIL_FINAL_JSON" "$_GFAIL_ROUTE" "$_GFAIL_ROUTE_UNKNOWN" "${GATE_FAIL_NO_EVAL_RUN:-1}")
         # SELFTEST-EXTRACT gate-fail-final-reread: END
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) cleared. gc.routed_to restored to $_GFAIL_ROUTE (from the bead's own home store, ga-u679x2) so pool workers can self-serve this bead (ga-f54ui) — verified post-write, not assumed: $_GFAIL_ROUTE_OBS; $_GFAIL_ASSIGNEE_OBS; $_GFAIL_STATUS_OBS; $_GFAIL_QUEUED_OBS (ga-39l9z2).$_GFAIL_ROUTE_UNKNOWN_NOTE$_GFAIL_LANE_NOTE The Pilot will also re-dispatch a builder with the GATE-FEEDBACK above.$_GFAIL_VETO_NOTE" 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) cleared. gc.routed_to restored to $_GFAIL_ROUTE (from the bead's own home store, ga-u679x2) so pool workers can self-serve this bead (ga-f54ui) — verified post-write, not assumed: $_GFAIL_ROUTE_OBS; $_GFAIL_ASSIGNEE_OBS; $_GFAIL_STATUS_OBS; $_GFAIL_QUEUED_OBS (ga-39l9z2).$_GFAIL_ROUTE_UNKNOWN_NOTE$_GFAIL_LANE_NOTE$_GFAIL_KIMI_NOTE The Pilot will also re-dispatch a builder with the GATE-FEEDBACK above.$_GFAIL_VETO_NOTE" 2>/dev/null || true
       fi
     fi
   fi
