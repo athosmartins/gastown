@@ -314,6 +314,17 @@ MOCK_NODE=empty
 R="$(run_spawn "$SC")";           eq "node spawn returns nothing: falls back to local" "$R" "ga-LOCAL||calls=gate-reviewer-remote,gate-reviewer,|rc=0"
 MOCK_NODE=timeout
 R="$(run_spawn "$SC")";           eq "node spawn TIMES OUT (outcome unknown): falls back to local (a stray node session idles out; never two reviewers for the slot)" "$R" "ga-LOCAL||calls=gate-reviewer-remote,gate-reviewer,|rc=0"
+# ga-n4ql4ur: Step 0b-1 admitted this run on the node's room while the LOCAL ceiling was full (GATE_NODE_ADMITTED=1). If the node then gives no
+# session the reviewer opens local above that ceiling: never a run without a reviewer, but the log must say it (a verdict timeout on a reviewer
+# held in start-pending would otherwise read as a bad review). An ordinary run, or one whose node spawn works, gets no such line.
+MOCK_NODE=fail
+R="$(GATE_NODE_ADMITTED=1 run_spawn "$SC")"; eq "admitted on the node's room + node spawn FAILS: still falls back to local (never a run without a reviewer)" "$R" "ga-LOCAL||calls=gate-reviewer-remote,gate-reviewer,|rc=0"
+has "…and the WARN says the run opens local above the local ceiling (ga-n4ql4ur)" "$(grep '^WARN' "$LOGF")" "above the local ceiling"
+R="$(run_spawn "$SC")"
+case "$(grep '^WARN' "$LOGF")" in *ga-n4ql4ur*) bad "an ordinary run (not admitted on the node's room) got the ga-n4ql4ur warning" ;; *) ok "…an ordinary run (GATE_NODE_ADMITTED unset) gets no such warning" ;; esac
+MOCK_NODE=ok
+R="$(GATE_NODE_ADMITTED=1 run_spawn "$SC")"; eq "admitted on the node's room + node spawn WORKS: the node's session, as intended" "$R" "ga-NODE|gate-reviewer-remote|calls=gate-reviewer-remote,|rc=0"
+case "$(grep '^WARN' "$LOGF")" in *ga-n4ql4ur*) bad "the warning fired although the node took the reviewer" ;; *) ok "…and no warning (the node took it)" ;; esac
 MOCK_NODE=ok; MOCK_LOCAL=fail
 R="$(run_spawn "$SC")";           eq "node spawn works, local would not: the slot is the node's" "$R" "ga-NODE|gate-reviewer-remote|calls=gate-reviewer-remote,|rc=0"
 MOCK_NODE=fail

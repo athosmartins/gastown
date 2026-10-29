@@ -2486,6 +2486,34 @@ gate_headroom_decision() {
   return 0
 }
 
+# gate_headroom_node_admit <verdict> <ceiling> <reason> <perrun> <node_kind>
+# → echoes "admit" or "keep" ("keep" = leave gate_headroom_decision's answer as it is). PURE; no I/O; set -e safe; bash 3.2.
+# ga-n4ql4ur. The ceiling gate_headroom_decision admits against is the MINI's: it is clamped to the engine cap of the LOCAL template
+# `gate-reviewer`, and `inflight` counts only that template (Step 0a-2 reads `.template=="gate-reviewer"`), so a reviewer served by
+# `gate-reviewer-remote` never spends it. What was still wrong: with the local ceiling FULL and a free slot on the node, the decision
+# said `defer ... dolt-calm-cap-reached` although the next run would open on the node. This turns exactly that one deferral into an
+# admit, and only when the node pick (gate_remote_pick_template) answered KIND=node. Everything else keeps the defer:
+#   · any other reason: Dolt warm/hot, quota, memory, swap, no signal. Those brakes protect the mini and its Dolt, and a run served by the
+#     node still loads both: the run's prep (rebase, verdict bead, task embed) and the dispatcher's polling happen on the mini, and the node
+#     reviewer's `bd`/`gc` are shortcuts that ask the mini (agents/gate-reviewer-remote/prompt.template.md). Only `dolt-calm-cap-reached` is a
+#     limit specific to LOCAL reviewers; keeping the rest deferred is the conservative reading, not a measured need.
+#   · ceiling 0 (GATE_MAX_REVIEWERS=0 is the operator's pause, and an engine cap of 0 reads the same): "0 + 1 > 0" prints cap-reached too,
+#     and the node must never undo a pause. Ceiling not a number: nobody knows what was reached.
+#   · perrun != 1: one node pick answers for ONE reviewer; a 3-reviewer run would send the other two local, above the cap.
+#   · kind anything but the exact word `node` (empty = the pick never answered, inert = flag off, fallback = node full/unready/unknown).
+gate_headroom_node_admit() {
+  local verdict="${1:-}" ceiling="${2:-}" reason="${3:-}" perrun="${4:-}" kind="${5:-}"
+  [ "$verdict" = "defer" ] || { echo "keep"; return 0; }
+  [ "$reason" = "dolt-calm-cap-reached" ] || { echo "keep"; return 0; }
+  case "$ceiling" in ''|*[!0-9]*) echo "keep"; return 0 ;; esac
+  [ "$ceiling" -ge 1 ] 2>/dev/null || { echo "keep"; return 0; }
+  case "$perrun" in ''|*[!0-9]*) echo "keep"; return 0 ;; esac
+  [ "$perrun" -eq 1 ] 2>/dev/null || { echo "keep"; return 0; }
+  [ "$kind" = "node" ] || { echo "keep"; return 0; }
+  echo "admit"
+  return 0
+}
+
 # ── Single-instance lock (ported VERBATIM from pilot-dispatcher.sh, ga-7s0or) ──
 # launchd fires this dispatcher every ~2 min, but a gate sweep can run up to the
 # verdict timeout (~22 min). With no guard, 2-3 sweeps overlap and EACH runs the
@@ -14976,6 +15004,26 @@ if [ "${GATE_HEADROOM_ENABLED:-1}" = "1" ]; then
   HR_VERDICT=$(printf '%s' "$HR_DECISION" | awk '{print $1}')
   HR_CEILING=$(printf '%s' "$HR_DECISION" | awk '{print $2}')
   HR_REASON=$(printf '%s' "$HR_DECISION" | cut -d' ' -f3-)
+  # ga-n4ql4ur: the LOCAL ceiling is full but the next reviewer may go to the node, which that ceiling does not count. Only the
+  # `dolt-calm-cap-reached` deferral qualifies (gate_headroom_node_admit says why); the node probe (ssh + the node's Claude login) is
+  # paid only when its answer can change the outcome. Remote lib not loaded = no probe, the defer stands. The admitted run is only
+  # OFFERED to the node first: the spawn step asks the node again, and GATE_NODE_ADMITTED lets it say so if the node refused then.
+  # SELFTEST-EXTRACT gate-node-headroom-admit: BEGIN
+  GATE_NODE_ADMITTED=0
+  if [ "$HR_VERDICT" = "defer" ] && [ "${GATE_REMOTE_LIB_OK:-0}" = "1" ] \
+     && [ "$(gate_headroom_node_admit "$HR_VERDICT" "$HR_CEILING" "$HR_REASON" "$GATE_REVIEWERS_PER_RUN" node)" = "admit" ]; then
+    # vazio → KIND stays "" and the defer stands (reset first: an earlier pick in this process, Phase C's re-convene, may have left "node" behind);
+    # falhou/ilegível → the pick returns non-zero or sets nothing: same, the defer stands. Only an ANSWERED KIND=node admits.
+    GATE_REMOTE_PICK_KIND=""; GATE_REMOTE_PICK_WHY=""
+    gate_remote_pick_template || true
+    if [ "$(gate_headroom_node_admit "$HR_VERDICT" "$HR_CEILING" "$HR_REASON" "$GATE_REVIEWERS_PER_RUN" "${GATE_REMOTE_PICK_KIND:-}")" = "admit" ]; then
+      log "Headroom NODE: local ceiling ${HR_CEILING} reached (${HR_REASON}) but the node can take the next reviewer (${GATE_REMOTE_PICK_WHY:-?}) — admitting; the reviewer is offered to the node first (ga-n4ql4ur)."
+      HR_VERDICT="admit"; HR_REASON="${HR_REASON}+node-room"; GATE_NODE_ADMITTED=1
+    else
+      log "Headroom NODE: local ceiling ${HR_CEILING} reached (${HR_REASON}) and the node does not take it either (${GATE_REMOTE_PICK_KIND:-no answer}: ${GATE_REMOTE_PICK_WHY:-no reason given}) — the defer stands (ga-n4ql4ur)."
+    fi
+  fi
+  # SELFTEST-EXTRACT gate-node-headroom-admit: END
   # N in-flight runs for the log line = ceil(LIVE_REVIEWERS / reviewers-per-run).
   HR_RUNS=$(( ( LIVE_REVIEWERS + GATE_REVIEWERS_PER_RUN - 1 ) / GATE_REVIEWERS_PER_RUN ))
   case "$HR_QSTATE" in ok) HR_COTA="ok" ;; limited) HR_COTA="LIMITED" ;; *) HR_COTA="ilegivel(fail-open)" ;; esac
@@ -19260,6 +19308,12 @@ This bead ID will be delivered to the reviewer session via nudge with exact comm
     elif [ "${GATE_REMOTE_PICK_KIND:-}" = "fallback" ]; then
       log "  Reviewer $i: ${GATE_REMOTE_PICK_WHY}"
     fi
+  fi
+  # ga-n4ql4ur: the one residual risk of admitting on the node's room. Step 0b-1 admitted this run because the LOCAL ceiling was full and
+  # the node had a slot; if the node refused now (full, unready, spawn gave no session) the reviewer opens LOCAL above that ceiling and the
+  # controller may hold it in start-pending while the run's verdict timeout counts. Say so, so a timed-out run is not read as a bad review.
+  if [ -z "$SESSION_ID" ] && [ "${GATE_NODE_ADMITTED:-0}" = "1" ]; then
+    warn "  Reviewer $i: run admitted on the NODE's room (local ceiling full) but no node session came back (pick=${GATE_REMOTE_PICK_KIND:-none}; the lines above say why) - opening LOCAL above the local ceiling; it may wait in start-pending (ga-n4ql4ur)."
   fi
   if [ -z "$SESSION_ID" ]; then
     _spawn_err_file="/tmp/gate-reviewer-spawn-err-$$.${i}"
