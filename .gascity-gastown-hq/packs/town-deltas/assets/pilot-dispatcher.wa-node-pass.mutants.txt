@@ -61,7 +61,7 @@ braco: a vaga virtual do mini nao volta	if [ "${_PILOT_WA_NODE_PASS:-0}" = "1" ]
 braco: adotar que falha segue ao gancho	          DISPATCH_RESULT="wa_node_pass_released"\n          return 1\n        fi\n        _pilot_wa_node_decide	          DISPATCH_RESULT="wa_node_pass_released"\n        fi\n        _pilot_wa_node_decide
 gancho nao exporta o rc do apply	if [ "$_mode" != shadow ] && [ "${DRY_RUN:-0}" != "1" ]; then _PWN_APPLY_RC="$_rc"; fi	:
 gancho nao zera o rc na entrada	  _PWN_APPLY_RC=""\n  case "$_mode" in shadow|label|auto) ;; *) return 1 ;; esac	  case "$_mode" in shadow|label|auto) ;; *) return 1 ;; esac
-resultado novo fora do pilot_sweep	"disk_floor_node_only", "wa_node_pass_released"]	"disk_floor_node_only"]
+resultado novo fora do pilot_sweep	"wa_node_pass_released", "kimi_lane_released"	"kimi_lane_released"
 Dolt saturado agora nao para a passada	if [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ] || _dolt_saturated; then _pw_stop="dolt-saturated"; break; fi	if [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ]; then _pw_stop="dolt-saturated"; break; fi
 Dolt saturado no inicio nao para a passada	if [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ] || _dolt_saturated; then _pw_stop="dolt-saturated"; break; fi	if _dolt_saturated; then _pw_stop="dolt-saturated"; break; fi
 a chave DISPATCH_TO_CAPACITY nao vale na passada	if [ "${DISPATCH_TO_CAPACITY:-1}" != "1" ] && [ "$_pw_keepmax" -gt 1 ]; then _pw_keepmax=1; fi	:
