@@ -3853,6 +3853,19 @@ default_pool_route_for_rig() {
   esac
 }
 
+# gate_kimi_lane_route <labels (space-joined)> <route> — pure; selftest-sourceable. ga-do1ixn.3: a bead com o
+# rótulo lane:kimi volta de um FAIL para a faixa Kimi — gc.routed_to=kimi-lane, que de propósito não é nome de
+# pool (nenhuma sondagem nem a demanda do engine a pegam; só a passada da faixa Kimi do pilot-dispatcher.sh a
+# despacha, ao kimi-worker-remote). Restaurar gastown.dog a mandaria ao pool de dog do MINI, um pool Claude.
+# Sem o rótulo → a rota que veio, inalterada. Rótulos ilegíveis (vazio) → a rota que veio: o terceiro estado
+# fica com o comportamento de antes, e a passada da faixa Kimi recarimba kimi-lane na varredura seguinte.
+gate_kimi_lane_route() {
+  case " ${1:-} " in
+    *" lane:kimi "*) printf 'kimi-lane' ;;
+    *) printf '%s' "${2:-}" ;;
+  esac
+}
+
 # gate_fail_restore_route <bead_city> <rig_list_json> — pure; selftest-sourceable.
 # ga-u679x2: what gc.routed_to should be RESTORED to when a bead returns to the
 # generic pool after a gate FAIL, derived from the BEAD's OWN home store
@@ -12044,6 +12057,8 @@ $(gate_render_reasons "$FAIL_REASONS")" 2>/dev/null || true
           _GFAIL_ROUTE="gastown.dog"
           log "  ga-u679x2: could not reverse-resolve bead_city='$BEAD_CITY' to any registered rig — falling back to gastown.dog (safe default), NOT guessing from code rig '$RIG'."
         fi
+        # ga-do1ixn.3: bead da faixa Kimi volta para a faixa (kimi-lane), não para o pool de dog do mini
+        _GFAIL_ROUTE=$(gate_kimi_lane_route "${SRC_LABELS:-}" "$_GFAIL_ROUTE")
         bd -C "$BEAD_CITY" update "$BEAD_ID" --set-metadata "gc.routed_to=$_GFAIL_ROUTE" -q 2>/dev/null || true
         # Verify the write actually stuck (ga-p5q3 error-vs-empty discipline) — a
         # post-write READ failure must never be reported as "restore failed"; it is

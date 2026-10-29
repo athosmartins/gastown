@@ -373,6 +373,19 @@ ok $((RC != 0)) "volta do gate com a rota dog-remote: sai 0"; [ "$(origin_has "$
 git --git-dir="$ORIGIN" update-ref -d "refs/heads/$BRB"
 seed_back "$ALIAS" "$ALIAS" open "outro-dog"; run_exe_a -- ga-t2 "$BRB" "$SHAV"; back_refused "bead de outro alias, mesmo com gate:needs-fix" "nem uma volta do gate"
 seed_back "$ALIAS" "$ALIAS" closed; run_exe_a -- ga-t2 "$BRB" "$SHAV"; back_refused "bead fechada" "nem uma volta do gate"
+# ga-do1ixn.3: a volta do gate da bead lane:kimi — o gate a devolve com gc.routed_to=kimi-lane (não gastown.dog). O alias do kimi-worker-remote aceita SÓ essa rota; o dog-remote nunca a aceita.
+KBSESS="kimi-worker-remote-abc123"; KBALIAS="kimi-worker-remote-1"
+run_kimi_back() { run_exe_a GC_SESSION_NAME="$KBSESS" GC_ALIAS="$KBALIAS" BEADS_ACTOR="$KBALIAS" GC_TEMPLATE=kimi-worker-remote -- ga-t2 "$BRB" "$SHAV"; }
+seed_back "$KBALIAS" "$KBALIAS" open "" "gate:needs-fix,gate:fix-attempt:1" kimi-lane; run_kimi_back
+ok $((RC != 0)) "kimi: volta do gate com a rota kimi-lane: sai 0"; [ "$(origin_has "$BRB")" = "$SHAV" ]; ok $? "kimi: volta do gate com kimi-lane: o origin tem $BRB no sha dito"
+has "$T/out" "bead solta: ga-t2"; ok $? "kimi: volta do gate com kimi-lane: a bead foi solta"
+git --git-dir="$ORIGIN" update-ref -d "refs/heads/$BRB"
+seed_back "$KBALIAS" "$KBALIAS" open "" "gate:needs-fix,gate:fix-attempt:1" gastown.dog; run_kimi_back; back_refused "kimi: volta do gate com a rota gastown.dog (bead que o Pilot rebaixou ao dog Claude)" "nem uma volta do gate"
+has "$T/err" "achei 'gastown.dog'"; ok $? "kimi × gastown.dog: a recusa diz a rota que achou"
+seed_back "$KBALIAS" "$KBALIAS" open "" "gate:needs-fix,gate:fix-attempt:1" dog-remote; run_kimi_back; back_refused "kimi: volta do gate com a rota dog-remote (do dog do nó)" "nem uma volta do gate"
+seed_back "$ALIAS" "$ALIAS" open "" "gate:needs-fix,gate:fix-attempt:1" kimi-lane; run_exe_a -- ga-t2 "$BRB" "$SHAV"; back_refused "dog-remote: volta do gate com a rota kimi-lane (bead da faixa Kimi), mesmo com a última entrega dele" "nem uma volta do gate"
+has "$T/err" "achei 'kimi-lane'"; ok $? "dog × kimi-lane: a recusa diz a rota que achou"
+seed_back outro-kimi outro-kimi open "" "gate:needs-fix,gate:fix-attempt:1" kimi-lane; run_kimi_back; back_refused "kimi: volta do gate cuja última entrega é de outro alias" "não foi de $KBALIAS"
 # `worker/<sessão>-SUFIXO` só é inequívoco se `<sessão>-SUFIXO` NÃO for ele mesmo um nome de sessão. Premissa lida do IDENTITY_PATTERN do runbook (a linha que o wrapper de produção usa):
 # hoje só colidem os nomes SEM cauda e os `<papel>-adhoc` (que viram `<papel>-adhoc-<10 alfanuméricos>`); se alguém alargar o padrão, este caso quebra e manda rever BARE_ROLE_RE
 COLL=$(python3 -I - "$HQ/docs/runbooks/gc-session-ssh.md" <<'EOF'
@@ -981,6 +994,14 @@ case_back_other_route() { seed_back "$ALIAS" "$ALIAS" open "" "gate:needs-fix" "
 mutant volta-so-aceita-dog-remote 'ROUTES = ("gastown.dog", "dog-remote")' 'ROUTES = ("dog-remote",)' case_back_real_shape
 mutant volta-sem-all-nos-marcadores '["list", "--all", "--label"' '["list", "--label"' case_back_real_shape
 mutant volta-aceita-rota-de-outro-pool 'meta.get("gc.routed_to") in routes)' 'meta.get("gc.routed_to") is not None)' case_back_other_route
+# ga-do1ixn.3: a rota da faixa Kimi
+case_kimi_back_lane() { seed_back "$KBALIAS" "$KBALIAS" open "" "gate:needs-fix,gate:fix-attempt:1" kimi-lane; run_kimi_back; [ "$RC" = 0 ] && [ "$(origin_has "$BRB")" = "$SHAV" ]; }
+case_kimi_back_dog_route() { seed_back "$KBALIAS" "$KBALIAS" open "" "gate:needs-fix,gate:fix-attempt:1" gastown.dog; run_kimi_back; refused_back; }
+case_dog_back_kimi_lane() { seed_back "$ALIAS" "$ALIAS" open "" "gate:needs-fix,gate:fix-attempt:1" kimi-lane; run_exe_a -- ga-t2 "$BRB" "$SHAV"; refused_back; }
+mutant kimi-volta-sem-a-rota-kimi-lane 'return (KIMI_ROUTE,) if role_of(alias) == KIMI_ROLE else rig.routes' 'return rig.routes' case_kimi_back_lane
+mutant kimi-volta-aceita-a-rota-do-dog 'return (KIMI_ROUTE,) if role_of(alias) == KIMI_ROLE else rig.routes' 'return (KIMI_ROUTE,) + rig.routes if role_of(alias) == KIMI_ROLE else rig.routes' case_kimi_back_dog_route
+mutant dog-volta-aceita-kimi-lane 'return (KIMI_ROUTE,) if role_of(alias) == KIMI_ROLE else rig.routes' 'return rig.routes + (KIMI_ROUTE,)' case_dog_back_kimi_lane
+mutant volta-nao-usa-as-rotas-do-alias 'bead = named_bead(city, alias, args[0], ctx.store, routes_of(ctx.rig, alias))' 'bead = named_bead(city, alias, args[0], ctx.store, ctx.rig.routes)' case_kimi_back_lane
 mutant volta-sem-marcador-vira-pode 'raise Stop(f"{bid} nunca foi entregue ao gate (nenhum marcador source-bead:{bid}): não há volta do gate para submeter")' 'return {"description": "author: " + os.environ["BEADS_ACTOR"]}' case_back_no_marker
 mutant sufixo-N-ambiguo-sem-guarda 'and BARE_ROLE_RE.fullmatch(sess):' 'and False:' case_bare_role
 
@@ -1012,8 +1033,8 @@ mutant kimi-fora-do-role-re 'dog-remote|kimi-worker-remote|ps-worker-remote' 'do
 mutant kimi-rig-errado 'also=("kimi-worker-remote",)' 'also=()' case_kimi_happy 'return next((p for p, r in RIGS.items() if m and m.group(1) in (r.role,) + r.also), "ga")' 'return next((p for p, r in RIGS.items() if m and m.group(1) in (r.role,) + r.also), "ps")'
 mutant ps-loja-da-cidade        'bead = one_bead(ctx.store, alias)' 'bead = one_bead(city, alias)' case_ps_happy
 mutant ps-guarda-de-prefixo     'if bpfx != role_prefix:' 'if False:' case_ps_prefix_guard
-mutant ps-rotas-do-hq           'bead = named_bead(city, alias, args[0], ctx.store, ctx.rig.routes)' 'bead = named_bead(city, alias, args[0], ctx.store)' case_ps_back_hq_route
-mutant ps-rotas-do-ps           'bead = named_bead(city, alias, args[0], ctx.store, ctx.rig.routes)' 'bead = named_bead(city, alias, args[0], ctx.store, ROUTES)' case_ps_back
+mutant ps-rotas-do-hq           'bead = named_bead(city, alias, args[0], ctx.store, routes_of(ctx.rig, alias))' 'bead = named_bead(city, alias, args[0], ctx.store)' case_ps_back_hq_route
+mutant ps-rotas-do-ps           'bead = named_bead(city, alias, args[0], ctx.store, routes_of(ctx.rig, alias))' 'bead = named_bead(city, alias, args[0], ctx.store, ROUTES)' case_ps_back
 mutant ps-worktree-fora-do-rig  'str(Path(path) / ".gc-worktrees" / "gate-done-remote"))' 'str(Path(city) / ".gc" / "gate-done-remote"))' case_ps_rig_line
 mutant ps-espelho-do-hq         'f"{city}/.gc/hetzner-mirror/repos/{rig.name}.git", str(Path(path)' 'f"{city}/.gc/hetzner-mirror/repos/gascity.git", str(Path(path)' case_ps_mirror_name
 mutant ps-solta-na-loja-errada  'release(city, bid, alias, found[0], ctx.store)' 'release(city, bid, alias, found[0])' case_ps_released_in_store

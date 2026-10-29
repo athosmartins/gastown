@@ -398,6 +398,13 @@ PILOT_NODE_FIRST="${PILOT_NODE_FIRST:-off}"
 PILOT_NODE_FIRST_VETO_LABELS="${PILOT_NODE_FIRST_VETO_LABELS:-node:never needs:engine-window exec:manual}"
 PILOT_NODE_CAPACITY_BIN="${PILOT_NODE_CAPACITY_BIN:-$GC_CITY/scripts/hetzner-capacity.py}"
 PILOT_NODE_FIRST_LOG="${PILOT_NODE_FIRST_LOG:-$GC_CITY/.gc/logs/node-first-shadow.jsonl}"
+# ga-do1ixn.3: a faixa Kimi (teste do Athos 26/10: Claude Code com o Kimi por baixo, só bead sem dado pessoal). Bead com o rótulo lane:kimi vai SÓ ao kimi-worker-remote (Hetzner, perfil Kimi
+# do scripts/gc-session-ssh) e o kimi-worker-remote só recebe lane:kimi. Sem a bandeira (ou com o nó desligado, a vaga ocupada, bead fora do HQ) a bead ESPERA: nunca cai num pool Claude.
+# A espera carimba gc.routed_to=kimi-lane, que de propósito NÃO é nome de pool: nem a sondagem dos pools nem a demanda do engine a pegam, e o pilot-missing-route-watchdog não a vê "sem rota".
+PILOT_KIMI_LANE_FLAG="${PILOT_KIMI_LANE_FLAG:-$GC_CITY/.gc/kimi-lane.on}"
+PILOT_KIMI_NODE_FLAG="${PILOT_KIMI_NODE_FLAG:-$GC_CITY/.gc/hetzner-node.on}"
+PILOT_KIMI_TEMPLATE="kimi-worker-remote"
+PILOT_KIMI_ROUTE="kimi-lane"
 # ga-2hd02v.9: a passada de WA no nó (_pilot_wa_node_pass). off (padrão) | shadow | on. shadow classifica (`check`, só leitura) a fila de WA e REGISTRA o que iria ao nó; on FAZ: adota a rota carimbada pelo mini, entrega
 # a dispatch_one e, se o nó não ficar, devolve a rota e solta a claim. Só vale com PILOT_WA_NODE_ROUTE (on: label|auto · shadow: shadow|label|auto). Quem liga é uma pessoa; valor desconhecido = off. Os demais botões
 # (PILOT_WA_NODE_PASS_PROBES / _SECS / _CHECK_TIMEOUT / _MAX_FAILS / _MINI_TTL / _UNKNOWN_TTL / _RELEASED_TTL / _MEMO / _LOG) são lidos onde se usam, com padrão e valor ilegível = padrão.
@@ -12207,6 +12214,8 @@ _PNF_EFFECTIVE=""    # saída, só em `on` com _PNF_VERDICT=node: quantas sessõ
 _pilot_node_first_shadow() {
   local _nf_id="$1" _nf_target="$2" _nf_native="$3" _nf_labels="$4" _nf_out="" _nf_rc=0 _nf_v="" _nf_why="" _nf_l="" _nf_rec="" _nf_eff="" _nf_sh=true _nf_tag="sombra"
   _PNF_VERDICT=""; _PNF_EFFECTIVE=""
+  # ga-do1ixn.3: na faixa Kimi o nó primeiro NÃO é consultado (a bead vai ao kimi-worker-remote, nunca ao dog-remote); o veredito já está zerado acima.
+  [ "${_PILOT_KIMI_PASS:-0}" != "1" ] || return 0
   case "$PILOT_NODE_FIRST" in
     off) return 0 ;;
     shadow) : ;;
@@ -12384,6 +12393,256 @@ _pilot_node_first_dispatch() {
   fi
   _PNF_RESULT="node"; _PNF_ALIAS="$_nd_alias"
   log "  node-first (on): $_nd_id foi ao nó — alias $_nd_alias (${_nd_state}, effective=$_nd_eff)"
+  return 0
+}
+
+# ── ga-do1ixn.3: a faixa Kimi (lane:kimi → kimi-worker-remote, e só) ─────────────────────────────────────────────
+# A mesma receita do nó primeiro (_pilot_node_first_dispatch: escolher o alias → atribuir → abrir/acordar a sessão → avisar, e qualquer falha desfaz pelo _pilot_node_first_rollback), com o template
+# do Kimi e teto 1 (agents/kimi-worker-remote/agent.toml). A diferença está no que acontece quando o nó não fica com a bead: aqui ela ESPERA (a varredura seguinte tenta de novo), nunca vai ao mini.
+
+# _pilot_kimi_lane_closed — imprime por que a faixa está fechada nesta varredura (off = sem a bandeira PILOT_KIMI_LANE_FLAG; node-off = sem a do nó) ou nada (aberta). Sempre devolve 0.
+_pilot_kimi_lane_closed() {
+  [ -e "$PILOT_KIMI_LANE_FLAG" ] || { printf 'off'; return 0; }
+  [ -e "$PILOT_KIMI_NODE_FLAG" ] || { printf 'node-off'; return 0; }
+  return 0
+}
+
+# _pilot_kimi_pick_alias — a vaga do kimi-worker-remote: devolve 0 com _PKL_ALIAS=<template>-1 e _PKL_ALIAS_STATE (new | asleep) ou 1 sem vaga. A leitura do _pilot_node_pick_alias com o template do Kimi
+# e teto 1: vaga conta por TEMPLATE (fora closed e asleep: sessão sem alias também ocupa), estado que não conheço = ocupado, alias preso por OUTRO template nunca é escolhido.
+_PKL_ALIAS=""; _PKL_ALIAS_STATE=""
+_pilot_kimi_pick_alias() {
+  local _kp_json="" _kp_pick=""
+  _PKL_ALIAS=""; _PKL_ALIAS_STATE=""
+  # vazio/falhou (rc≠0, sem saída, não JSON, ok:false) → sem vaga: lista que não se leu NÃO é "sem sessões"
+  _kp_json=$(gc_json_or_unknown timeout 20 gc --city "$GC_CITY" session list --json) || { return 1; }
+  printf '%s' "$_kp_json" | jq -e '.sessions | type == "array"' >/dev/null 2>&1 || return 1
+  # vazio = vaga ocupada (→ 1); jq que falha → 1
+  _kp_pick=$(printf '%s' "$_kp_json" | jq -r --arg kt "$PILOT_KIMI_TEMPLATE" '
+    [.sessions[] | select(type == "object" and .closed != true)] as $live
+    | ([$live[] | select(.template == $kt and .state != "asleep")] | length) as $occ
+    | ($kt + "-1") as $a | [$live[] | select(.alias == $a)] as $h
+    | if $occ >= 1 then empty
+      elif ($h | length) == 0 then "\($a) new"
+      elif ($h | all(.template == $kt and .state == "asleep")) then "\($a) asleep"
+      else empty end' 2>/dev/null) || return 1
+  [ -n "$_kp_pick" ] || return 1
+  _PKL_ALIAS="${_kp_pick%% *}"; _PKL_ALIAS_STATE="${_kp_pick#* }"
+  return 0
+}
+
+# _pilot_kimi_dispatch <bead_id> <bead_city> <title> — leva a bead ao kimi-worker-remote. Sempre devolve 0 e deixa _PNF_RESULT (node = atribuída e avisada · mini = nada ficou escrito: o chamador solta a
+# claim e a bead ESPERA · stuck = o desfazer não se confirmou) e _PNF_ALIAS, que é o que o dispatch_one já lê para o ramo do nó.
+_pilot_kimi_dispatch() {
+  local _kd_id="$1" _kd_city="$2" _kd_title="$3" _kd_alias="" _kd_state="" _kd_rc=0 _kd_t0=0 _kd_msg="" _kd_step="" _kd_sess=0
+  _PNF_ALIAS=""; _PNF_RESULT="mini"
+  if _pilot_slow_spawn_budget_spent; then
+    log "  faixa Kimi: $_kd_id espera — uma sessão lenta já gastou o orçamento de spawn deste sweep"
+    return 0
+  fi
+  if ! _pilot_kimi_pick_alias; then
+    log "  faixa Kimi: $_kd_id espera — a vaga do $PILOT_KIMI_TEMPLATE está ocupada ou a lista de sessões não se leu"
+    return 0
+  fi
+  _kd_alias="$_PKL_ALIAS"; _kd_state="$_PKL_ALIAS_STATE"
+  timeout 15 bd -C "$_kd_city" update "$_kd_id" --assignee "$_kd_alias" --status in_progress -q >/dev/null 2>&1 || _kd_rc=$?
+  [ "$_kd_rc" -eq 0 ] || _kd_step="a atribuição falhou (rc=$_kd_rc)"
+  if [ -z "$_kd_step" ]; then
+    _kd_sess=1; _kd_rc=0; _kd_t0=$SECONDS
+    if [ "$_kd_state" = "asleep" ]; then
+      timeout "${PILOT_SPAWN_TIMEOUT_SECS:-150}" gc --city "$GC_CITY" session wake "$_kd_alias" >/dev/null 2>&1 || _kd_rc=$?
+    else
+      timeout "${PILOT_SPAWN_TIMEOUT_SECS:-150}" gc --city "$GC_CITY" session new "$PILOT_KIMI_TEMPLATE" --alias "$_kd_alias" --no-attach \
+        --title-hint "build $_kd_id: $_kd_title" >/dev/null 2>&1 || _kd_rc=$?
+    fi
+    _pilot_note_spawn_timing "$_kd_rc" "$_kd_t0"
+    if [ "$_kd_rc" -ne 0 ]; then
+      _kd_step="a sessão ($_kd_state) não abriu (rc=$_kd_rc)"
+      if [ "$_kd_rc" = "124" ]; then _kd_step="$_kd_step — estourou o prazo: ela pode ter nascido"; fi
+    fi
+  fi
+  if [ -z "$_kd_step" ]; then
+    _kd_msg="Bead nova para você (faixa Kimi): $_kd_id — $_kd_title. Ela já está atribuída ao seu alias (GC_ALIAS=$_kd_alias): ache com 'bd list --status in_progress --assignee \"\$GC_ALIAS\" --json --limit 5' e siga o seu protocolo."
+    _kd_rc=0
+    timeout 15 gc --city "$GC_CITY" session nudge "$_kd_alias" "$_kd_msg" >/dev/null 2>&1 || _kd_rc=$?
+    [ "$_kd_rc" -eq 0 ] || _kd_step="o aviso falhou (rc=$_kd_rc)"
+  fi
+  if [ -n "$_kd_step" ]; then
+    warn "ga-do1ixn.3: faixa Kimi: $_kd_id → $_kd_alias: $_kd_step — desfaço o despacho; a bead espera a próxima varredura (nunca vai a um pool Claude)"
+    if _pilot_node_first_rollback "$_kd_id" "$_kd_city" "$_kd_alias" "$_kd_sess"; then
+      _PNF_ALIAS=""; _PNF_RESULT="mini"
+    else
+      _PNF_RESULT="stuck"; _PNF_ALIAS="$_kd_alias"
+    fi
+    return 0
+  fi
+  _PNF_RESULT="node"; _PNF_ALIAS="$_kd_alias"
+  log "  faixa Kimi: $_kd_id foi ao $PILOT_KIMI_TEMPLATE — alias $_kd_alias ($_kd_state)"
+  return 0
+}
+
+# _pilot_kimi_screen <bead_json> — a triagem de UMA bead lane:kimi, só pelo que o JSON da candidata já traz (nenhuma chamada ao bd). Imprime UMA palavra e devolve 0:
+#   ok             rótulos sem veto e título+descrição (+design, critérios, notas) sem termo de dado pessoal → pode ir ao Kimi
+#   veto:<rótulo>  a bead traz um rótulo de PILOT_NODE_FIRST_VETO_LABELS (node:never é o que o prompt do kimi-worker põe ao devolver a bead ao mini) → sai da faixa
+#   pii:<termo>    o texto casou com a lista do Mayor (cpf, telefone, conversa, lead, proprietário, chip/frota, Pipedrive, e-mail, shared/data e *.db, dado pessoal) → sai da faixa
+#   sem-texto      título ou descrição vazios: não há o que triar → espera
+#   ilegivel       rótulo ou campo que não é do tipo esperado, ou JSON que o jq não lê → espera
+# Fail-closed: só `ok` deixa a bead ir ao Kimi. Os termos casam por palavra inteira, sem caixa e sem acento ("leader" e "chipset" não casam). Falso positivo custa a bead voltar ao dog Claude; falso
+# negativo custa dado pessoal num provedor de fora — por isso a lista é larga. O que a triagem imprime é o NOME do termo, nunca o trecho do texto (o comentário na bead não copia dado pessoal).
+_pilot_kimi_screen() {
+  local _ks_bead="$1" _ks_labels="" _ks_veto="" _ks_out=""
+  # vazio → "" (bead sem rótulos: nenhum veto a ler); falhou/ilegível (rótulos que não são lista de texto, ou JSON que o jq não lê) → ilegivel
+  _ks_labels=$(printf '%s' "$_ks_bead" | jq -r '(.labels // []) | if type == "array" and all(.[]; type == "string") then join(",") else error("labels") end' 2>/dev/null) || { printf 'ilegivel'; return 0; }
+  # vazio → nenhum rótulo de veto na bead (a função só lê a lista e não falha)
+  _ks_veto=$(_pilot_node_first_veto "$_ks_labels")
+  if [ -n "$_ks_veto" ]; then printf 'veto:%s' "$_ks_veto"; return 0; fi
+  # vazio/falhou (campo que não é texto, bead que não é objeto, jq que morreu) → ilegivel; o jq imprime sempre um estado, então saída vazia é jq que não rodou
+  _ks_out=$(printf '%s' "$_ks_bead" | jq -r '
+    def pats: [
+      ["cpf", "\\bcpfs?\\b|\\b\\d{3}\\.\\d{3}\\.\\d{3}-\\d{2}\\b"],
+      ["telefone", "telefon|celular|\\bfones?\\b|\\bphones?\\b|whats ?app|whapi|\\(\\d{2}\\)\\s?9?\\d{4}-?\\d{4}|\\+55\\s?\\d{2}"],
+      ["conversa", "\\bconvers(a|as|a[cç][aã]o|a[cç][oõ]es|ation|ations)\\b"],
+      ["lead", "\\bleads?\\b"],
+      ["proprietario", "propriet[aá]ri[oa]s?"],
+      ["chip/frota", "\\bchips?\\b|\\bfrotas?\\b"],
+      ["pipedrive", "pipedrive"],
+      ["email", "e-?mails?\\b|[a-z0-9._%+-]+@[a-z0-9-]+\\.[a-z]{2,}"],
+      ["dado-pessoal", "dados? pessoa(l|is)|\\bpii\\b|\\blgpd\\b"],
+      ["shared/data", "shared/data|\\.db\\b"]
+    ];
+    def txt: if . == null then "" elif type == "string" then . else error("nao-texto") end;
+    ([ .title, .description, .design, .acceptance_criteria, .notes ] | map(txt)) as $f
+    | if ($f[0] | test("\\S") | not) or ($f[1] | test("\\S") | not) then "sem-texto"
+      else ($f | join("\n") | gsub("\\p{M}"; "")) as $text
+        | ([ pats[] | . as $p | select($text | test($p[1]; "i")) | $p[0] ] | .[0] // "") as $hit
+        | if $hit == "" then "ok" else "pii:" + $hit end
+      end' 2>/dev/null) || _ks_out=""
+  case "$_ks_out" in ok|sem-texto|pii:*) printf '%s' "$_ks_out" ;; *) printf 'ilegivel' ;; esac
+  return 0
+}
+
+# _pilot_kimi_demote <bead_json> <motivo> — tira UMA bead do HQ da faixa Kimi, como se o lane:kimi nunca tivesse sido posto: remove o rótulo e, se a rota é a de espera (kimi-lane), devolve gc.routed_to
+# a gastown.dog (a rota de toda bead do HQ). Sem isto a bead que o kimi-worker devolve ao mini (node:never) ou que a triagem barra voltaria ao Kimi a cada varredura — uma sessão paga por volta.
+# DUAS escritas: a atualização (rótulo + rota numa chamada só: pega inteira ou não pega) e o comentário (só diz o porquê; se falhar, o log da passada tem o motivo). Devolve 0 se a atualização pegou, 1 se
+# não pegou (a bead segue na faixa, inerte: a passada a trata como em espera). Só se chama com bead do HQ (ga-) e fora do DRY_RUN.
+_pilot_kimi_demote() {
+  local _dm_bead="$1" _dm_why="$2" _dm_id="" _dm_route="" _dm_note="" _dm_args=()
+  # vazio/falhou → sem id: nada a rebaixar (devolve 1)
+  _dm_id=$(printf '%s' "$_dm_bead" | jq -r '.id // ""' 2>/dev/null) || _dm_id=""
+  [ -n "$_dm_id" ] || return 1
+  # vazio → bead sem rota gravada (só o rótulo sai); falhou/ilegível (metadata que não é objeto) → trato como carimbada: a rota volta a gastown.dog, que é a do HQ de qualquer jeito
+  _dm_route=$(printf '%s' "$_dm_bead" | jq -r '.metadata["gc.routed_to"] // ""' 2>/dev/null) || _dm_route="$PILOT_KIMI_ROUTE"
+  _dm_args=(--remove-label lane:kimi)
+  if [ "$_dm_route" = "$PILOT_KIMI_ROUTE" ]; then _dm_args+=(--set-metadata "gc.routed_to=gastown.dog"); _dm_note=" e gc.routed_to de volta a gastown.dog"; fi
+  if ! timeout 15 bd -C "$GC_CITY" update "$_dm_id" "${_dm_args[@]}" -q >/dev/null 2>&1; then
+    warn "ga-do1ixn.3: faixa Kimi: não consegui rebaixar $_dm_id ($_dm_why) — ela segue na faixa, sem despachar, e a próxima varredura tenta de novo"
+    return 1
+  fi
+  timeout 15 bd -C "$GC_CITY" comment "$_dm_id" "ga-do1ixn.3: o Pilot tirou esta bead da faixa Kimi — rótulo lane:kimi removido${_dm_note}. Motivo: $_dm_why. Ela segue como bead normal para os dogs Claude. Para recolocá-la na faixa: corrija o que causou isso e ponha lane:kimi de novo." >/dev/null 2>&1 \
+    || warn "ga-do1ixn.3: faixa Kimi: $_dm_id rebaixada, mas o comentário com o motivo não gravou — o motivo está só neste log: $_dm_why"
+  return 0
+}
+
+# _pilot_kimi_lane_pass — uma vez por varredura, ANTES da passada de WA e das pistas. Sempre devolve 0. (1) Tira das duas pistas TODA bead com o rótulo lane:kimi: o laço normal nunca a vê, então
+# nenhuma vai a um pool Claude, com a faixa aberta ou fechada; pista que o jq não lê fica VAZIA nesta varredura (não dá para separar as do Kimi, e o estado inerte é não despachar). (1b) Tria cada bead
+# do HQ da faixa (_pilot_kimi_screen): veto ou dado pessoal → REBAIXA (_pilot_kimi_demote: sai da faixa e volta ao dog); sem texto ou ilegível → espera na faixa. O rebaixamento vale com a faixa aberta ou
+# fechada (a bead devolvida pelo kimi-worker não pode ficar presa em kimi-lane só porque a bandeira foi desligada) e não escreve nada no DRY_RUN. (2) Carimba gc.routed_to=kimi-lane nas do HQ que ainda
+# não o têm (uma rota de pool posta por outro caminho — a volta do gate, o pilot-missing-route-watchdog — chamaria o pool do mini). (3) Com a faixa aberta, leva UMA bead do HQ (ga-) que passou na
+# triagem ao kimi-worker-remote por dispatch_one com _PILOT_KIMI_PASS=1; a de outro rig espera (semana 1: só HQ, o traco-bim não tem espelho no nó).
+_pilot_kimi_lane_pass() {
+  local _kl_lane _kl_pool _kl_k _kl_rest _kl_ids _kl_id _kl_pick _kl_rc _kl_tier _kl_closed="" _kl_n=0 _kl_sent=0 _kl_stamped=0 _kl_stampfail=0 _kl_tries=0 _kl_other=0 _kl_stop=""
+  local _kl_small="[]" _kl_big="[]" _kl_held="[]" _kl_keep _kl_bead _kl_verdict _kl_why _kl_next _kl_demoted=0 _kl_demfail=0 _kl_held_n=0
+  for _kl_lane in small big; do
+    case "$_kl_lane" in small) _kl_pool="${SMALL_CANDIDATES:-[]}" ;; big) _kl_pool="${BIG_CANDIDATES:-[]}" ;; esac
+    # vazio → []; falhou/ilegível → as duas metades vazias (a pista inteira sai desta varredura, com aviso)
+    _kl_k=$(printf '%s' "$_kl_pool" | jq -c '[ .[] | select(((.labels // []) | index("lane:kimi")) != null) ]' 2>/dev/null) || _kl_k=""
+    _kl_rest=$(printf '%s' "$_kl_pool" | jq -c '[ .[] | select(((.labels // []) | index("lane:kimi")) == null) ]' 2>/dev/null) || _kl_rest=""
+    if [ -z "$_kl_k" ] || [ -z "$_kl_rest" ]; then
+      warn "ga-do1ixn.3: a pista $_kl_lane não é uma lista que eu leia — sem separar as beads lane:kimi, ela fica vazia nesta varredura"
+      _kl_k="[]"; _kl_rest="[]"
+    fi
+    case "$_kl_lane" in
+      small) SMALL_CANDIDATES="$_kl_rest"; SMALL_COUNT=$(printf '%s' "$_kl_rest" | jq 'length' 2>/dev/null || echo 0); _kl_small="$_kl_k" ;;
+      big)   BIG_CANDIDATES="$_kl_rest";   BIG_COUNT=$(printf '%s' "$_kl_rest" | jq 'length' 2>/dev/null || echo 0); _kl_big="$_kl_k" ;;
+    esac
+    _kl_n=$((_kl_n + $(printf '%s' "$_kl_k" | jq 'length' 2>/dev/null || echo 0)))
+  done
+  [ "$_kl_n" -gt 0 ] || return 0
+  # (1b) a triagem das beads do HQ da faixa — só o JSON da candidata, nenhuma chamada de leitura ao bd. ok e as de outro rig seguem para a lista de despacho; veto/dado pessoal rebaixa (e sai das listas);
+  # sem texto/ilegível, ou rebaixamento que não gravou, fica em _kl_held (espera: recebe o carimbo, não é despachada). Nada aqui escreve no DRY_RUN.
+  for _kl_lane in small big; do
+    case "$_kl_lane" in small) _kl_pool="$_kl_small" ;; big) _kl_pool="$_kl_big" ;; esac
+    _kl_keep="[]"
+    # vazio → a pista não tinha beads lane:kimi (nada a triar); falhou/ilegível → nenhuma bead da pista fica na lista de despacho (o estado inerte é não despachar)
+    while IFS= read -r _kl_bead; do
+      [ -n "$_kl_bead" ] || continue
+      # vazio/falhou → sem id: segue como "fora do HQ" e o laço de despacho (que também exige id) a deixa esperando
+      _kl_id=$(printf '%s' "$_kl_bead" | jq -r '.id // ""' 2>/dev/null) || _kl_id=""
+      case "$_kl_id" in ga-*) _kl_verdict=$(_pilot_kimi_screen "$_kl_bead") ;; *) _kl_verdict="fora-do-hq" ;; esac
+      case "$_kl_verdict" in
+        ok|fora-do-hq)
+          _kl_next=$(printf '%s' "$_kl_keep" | jq -c --argjson b "$_kl_bead" '. + [$b]' 2>/dev/null) && _kl_keep="$_kl_next" \
+            || warn "ga-do1ixn.3: faixa Kimi: não consegui listar $_kl_id para o despacho — ela espera nesta varredura" ;;
+        veto:*|pii:*)
+          case "$_kl_verdict" in
+            veto:*) _kl_why="rótulo de veto '${_kl_verdict#veto:}' (node:never é o que o kimi-worker põe ao devolver a bead ao mini; os outros dizem que um worker automático não faz esta bead)" ;;
+            *) _kl_why="a triagem de dado pessoal casou com o termo '${_kl_verdict#pii:}' no título ou na descrição (a faixa Kimi é só para bead sem dado pessoal)" ;;
+          esac
+          if [ "${DRY_RUN:-0}" = "1" ]; then
+            log "  faixa Kimi: $_kl_id seria rebaixada (dry-run, nada escrito) — $_kl_why"
+          elif _pilot_kimi_demote "$_kl_bead" "$_kl_why"; then
+            _kl_demoted=$((_kl_demoted + 1)); log "  faixa Kimi: $_kl_id rebaixada — $_kl_why"
+          else
+            _kl_demfail=$((_kl_demfail + 1)); _kl_held_n=$((_kl_held_n + 1))
+            _kl_next=$(printf '%s' "$_kl_held" | jq -c --argjson b "$_kl_bead" '. + [$b]' 2>/dev/null) && _kl_held="$_kl_next" || warn "ga-do1ixn.3: faixa Kimi: não consegui listar $_kl_id para o carimbo — ela segue fora das pistas, sem despachar"
+          fi ;;
+        *)
+          _kl_held_n=$((_kl_held_n + 1)); log "  faixa Kimi: $_kl_id espera — triagem '$_kl_verdict' (título ou descrição vazios, ou um campo que não leio): não vai ao Kimi sem eu ler o texto"
+          _kl_next=$(printf '%s' "$_kl_held" | jq -c --argjson b "$_kl_bead" '. + [$b]' 2>/dev/null) && _kl_held="$_kl_next" || warn "ga-do1ixn.3: faixa Kimi: não consegui listar $_kl_id para o carimbo — ela segue fora das pistas, sem despachar" ;;
+      esac
+    done < <(printf '%s' "$_kl_pool" | jq -c '.[]' 2>/dev/null)
+    case "$_kl_lane" in small) _kl_small="$_kl_keep" ;; big) _kl_big="$_kl_keep" ;; esac
+  done
+  # (2) a rota de espera: só nas que ainda não a têm; o DRY_RUN não escreve
+  if [ "${DRY_RUN:-0}" != "1" ]; then
+    # só as do HQ (ga-, loja da cidade): a de outro rig espera sem carimbo (semana 1 é só HQ) — vazio/falhou → nada a carimbar
+    _kl_ids=$(printf '%s\n%s\n%s' "$_kl_small" "$_kl_big" "$_kl_held" | jq -r --arg r "$PILOT_KIMI_ROUTE" '.[] | select(((.id // "") | startswith("ga-")) and ((.metadata["gc.routed_to"] // "") != $r)) | .id' 2>/dev/null) || _kl_ids=""
+    for _kl_id in $_kl_ids; do
+      if timeout 15 bd -C "$GC_CITY" update "$_kl_id" --set-metadata "gc.routed_to=$PILOT_KIMI_ROUTE" -q >/dev/null 2>&1; then _kl_stamped=$((_kl_stamped + 1))
+      else _kl_stampfail=$((_kl_stampfail + 1)); warn "ga-do1ixn.3: não consegui carimbar gc.routed_to=$PILOT_KIMI_ROUTE em $_kl_id — a pista normal não a pega (saiu da lista), mas uma rota de pool posta por fora seguiria valendo"; fi
+    done
+  fi
+  _kl_closed=$(_pilot_kimi_lane_closed)
+  if [ -n "$_kl_closed" ]; then _kl_stop="fechada:$_kl_closed"
+  elif [ "${DRY_RUN:-0}" = "1" ]; then _kl_stop="dry-run"
+  elif [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ] || _dolt_saturated; then _kl_stop="dolt-saturated"
+  fi
+  if [ -z "$_kl_stop" ]; then
+    for _kl_lane in small big; do
+      [ "$_kl_sent" = 0 ] && [ -z "$_kl_stop" ] || break
+      case "$_kl_lane" in small) _kl_pool="$_kl_small" ;; big) _kl_pool="$_kl_big" ;; esac
+      while :; do
+        [ "$_kl_tries" -lt 3 ] || { _kl_stop="tentativas"; break; }
+        _kl_pick=$(_top_candidate "$_kl_pool")
+        { [ -n "$_kl_pick" ] && [ "$_kl_pick" != null ]; } || break
+        _kl_id=$(printf '%s' "$_kl_pick" | jq -r '.id // ""' 2>/dev/null) || _kl_id=""
+        [ -n "$_kl_id" ] || break
+        _kl_pool=$(printf '%s' "$_kl_pool" | jq -c --arg id "$_kl_id" '[ .[] | select(.id != $id) ]' 2>/dev/null) || _kl_pool="[]"
+        case "$_kl_id" in ga-*) ;; *) _kl_other=$((_kl_other + 1)); log "  faixa Kimi: $_kl_id espera — lane:kimi só vale para bead do HQ (ga-) na semana 1"; continue ;; esac
+        _kl_tries=$((_kl_tries + 1))
+        _PILOT_KIMI_PASS=1; DISPATCH_RESULT=""; _kl_rc=0
+        _kl_tier=$(_bead_tier "$_kl_pick")
+        dispatch_one "$_kl_pick" "$_kl_lane" "$_kl_tier" || _kl_rc=$?
+        _PILOT_KIMI_PASS=0
+        if [ "$_kl_rc" = 0 ]; then
+          _kl_sent=1; DISPATCHED=$((DISPATCHED + 1)); _pilot_sweep_note "$_kl_id" 0 "${DISPATCH_RESULT:-}"; break
+        fi
+        # sem vaga (ou o nó não ficou com ela): as outras também não ficariam nesta varredura
+        case "${DISPATCH_RESULT:-}" in kimi_lane_wait|node_rollback_unconfirmed) _kl_stop="${DISPATCH_RESULT}"; break ;; esac
+      done
+    done
+  fi
+  _PILOT_KIMI_PASS=0
+  log "ga-do1ixn.3: faixa Kimi: lane:kimi=$_kl_n · ${_kl_stop:-aberta} · despachada=$_kl_sent · fora do HQ=$_kl_other · rota carimbada=$_kl_stamped (falhas $_kl_stampfail) · rebaixadas=$_kl_demoted (falhas $_kl_demfail) · esperando a triagem=$_kl_held_n — nenhuma vai a pool Claude"
   return 0
 }
 
@@ -14698,6 +14957,17 @@ LIVESEC
       DISPATCH_RESULT="wa_node_pass_released"
       return 1
     fi
+  elif [ "${_PILOT_KIMI_PASS:-0}" = "1" ]; then
+    # ga-do1ixn.3: faixa Kimi — a vaga do kimi-worker-remote (no Hetzner) não é a que a P0/P1 espera, então o yield NÃO se aplica; mas só segue a bead do HQ com alvo de dog (a receita do nó é a de dog).
+    # Qualquer outra solta a claim aqui, SEM carimbo de pool (o 4º argumento não é wa-worker/ps-worker de propósito): ela espera na faixa, nunca vai a um pool Claude.
+    if [ "$_PYS_NATIVE" = "0" ] && [ "$_PYS_TARGET" = "gastown.dog" ]; then
+      log "  ga-do1ixn.3: $STORY_ID segue na faixa Kimi — o yield não se aplica (a vaga é a do kimi-worker-remote, no nó)."
+    else
+      log "  ga-do1ixn.3: $STORY_ID espera — a faixa Kimi só leva bead do HQ com alvo de dog (alvo $_PYS_TARGET, rig-native=$_PYS_NATIVE); claim solta, sem carimbo."
+      _pilot_priority_yield_release "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET" "kimi-lane"
+      DISPATCH_RESULT="kimi_lane_released"
+      return 1
+    fi
   elif [ "${_PILOT_WA_MBP_PASS:-0}" = "1" ]; then
     # ga-w7qwl1.2.6: a carimbada que dispatch_lane entregou ao MBP — a vaga do MBP não é a que a P0/P1 espera, então o yield NÃO se aplica; mas só segue bead de store de rig (não o do HQ) com alvo wa-worker (o único braço que chama o gancho do MBP; _pilot_mbp_stamped_pre já só oferece id wa-*).
     # vazio/falhou (alvo ou store que não são os esperados) → solta a claim COMO FILA DE CAPACIDADE (a rota carimbada fica como estava): é onde o pulo pré-claim do teto do pool a teria deixado. Nunca cai no mini daqui.
@@ -15205,6 +15475,22 @@ TASK
     if [ "$_PNF_RESULT" = "stuck" ]; then
       warn "ga-2hd02v.1.14: $STORY_ID ficou entre o nó e o mini — o desfazer do despacho a ${_PNF_ALIAS:-?} não se confirmou. Deixo o claim para o TTL em vez de despachar ao mini por cima."
       DISPATCH_RESULT="node_rollback_unconfirmed"
+      return 1
+    fi
+  fi
+  # ── ga-do1ixn.3: faixa Kimi — a bead vai ao kimi-worker-remote ou ESPERA ─────────
+  # O nó primeiro (acima) não rodou para ela (_PNF_VERDICT vazio). node = o ramo `elif _PNF_RESULT = node` da cadeia abaixo faz o resto, como no dog-remote. mini (vaga ocupada, sessão que não abriu,
+  # aviso que falhou: nada ficou escrito) = solta a claim e a bead espera a próxima varredura — NUNCA segue para o despacho do mini. stuck = o desfazer não se confirmou: o claim fica para o TTL.
+  if [ "${_PILOT_KIMI_PASS:-0}" = "1" ]; then
+    _pilot_kimi_dispatch "$STORY_ID" "$STORY_BEAD_CITY" "$STORY_TITLE"
+    if [ "stuck" = "$_PNF_RESULT" ]; then
+      warn "ga-do1ixn.3: $STORY_ID ficou entre o kimi-worker-remote e a espera — o desfazer do despacho a ${_PNF_ALIAS:-?} não se confirmou. Deixo o claim para o TTL."
+      DISPATCH_RESULT="node_rollback_unconfirmed"
+      return 1
+    fi
+    if [ "$_PNF_RESULT" != "node" ]; then
+      _pilot_priority_yield_release "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET" "kimi-lane"
+      DISPATCH_RESULT="kimi_lane_wait"
       return 1
     fi
   fi
@@ -16611,6 +16897,8 @@ dispatch_lane() {
 }
 
 # ga-2hd02v.9: a passada de WA no nó roda UMA vez, antes das pistas, e (modo on) tira da pista o que ficou com o nó. Padrão off. Nunca derruba a varredura (devolve sempre 0; o `|| true` é a rede de segurança do set -e).
+# ga-do1ixn.3: a faixa Kimi roda ANTES: tira das pistas toda bead lane:kimi (nenhuma chega ao laço normal nem à passada de WA) e leva no máximo uma ao kimi-worker-remote. Sempre devolve 0.
+_pilot_kimi_lane_pass || true
 _pilot_wa_node_pass || true
 
 # Small + big lanes are independent. Dispatch the full pool for each (the loop is

@@ -84,6 +84,8 @@ SHA_RE = re.compile(r"[0-9a-f]{40}")  # o sha que o dog diz: inteiro, para a con
 USAGE = "gate-done <bead> <ref> <sha>   (ou `gate-done` sem argumento: a ÚNICA bead in_progress do alias, de worker/<sessão>)"
 FIX_LABEL = "gate:needs-fix"  # o que o dispatcher põe na bead-fonte quando o gate reprova: a "volta do gate"
 ROUTES = ("gastown.dog", "dog-remote")  # (rig gascity; os outros: RIGS) gc.routed_to de uma volta do gate: gastown.dog é o que o dispatcher RESTAURA ao reprovar (gate_fail_restore_route → default_pool_route_for_rig; medido em ga-9636op, ga-2hd02v.1.12 e .1.18); dog-remote é a rota posta à mão. Quem prova que a bead é DESTE alias é a última entrega, não a rota
+KIMI_ROLE = "kimi-worker-remote"  # o papel do teste Kimi (ga-do1ixn): 2º papel do rig gascity
+KIMI_ROUTE = "kimi-lane"  # gc.routed_to da bead lane:kimi, na espera e na volta do gate (ga-do1ixn.3: o gate devolve a bead lane:kimi para cá, não para gastown.dog). NÃO é pool: nenhuma sonda de pool a pega, só o Pilot a leva ao kimi-worker-remote
 BARE_ROLE_RE = re.compile(r"(?:dog|gate-reviewer|wa-worker|ps-worker|kimi-worker)-remote(?:-adhoc)?")  # nome de sessão SEM cauda: pelo IDENTITY_PATTERN (gc-session-ssh.md) `<papel>-remote-<1-3 dígitos | 3-12 alnum>` TAMBÉM é nome válido de sessão, e `<papel>-remote-adhoc-<10 alnum>` idem (ga-2hd02v.3.13)
 SUFFIX_RE = r"-[A-Za-z0-9][A-Za-z0-9._-]{0,40}"  # a cauda de worker/<sessão>-<cauda>: o `-v2`, o `-<bead>`, o `-a2lb9b` que os dogs usam quando worker/<sessão> está preso em outra entrega (ga-2hd02v.3.13)
 MIRROR_MAIN = "refs/remotes/origin/main"  # no espelho de produção o main mora SÓ aqui (o hetzner-mirror.sh o sincroniza); não há refs/heads/main
@@ -601,6 +603,12 @@ def role_of(name: str) -> str:
     return m.group(1) if m else ""
 
 
+def routes_of(rig: Rig, alias: str) -> tuple:
+    """As rotas de volta do gate que ESTE alias aceita (ga-do1ixn.3). O worker do Kimi aceita SÓ a faixa dele (kimi-lane: ele só trabalha bead lane:kimi, e a que o Pilot rebaixou volta ao dog Claude com
+    gastown.dog — o worker do Kimi não a conserta mais); todo outro alias aceita as do rig e NUNCA kimi-lane (um dog Claude não submete bead da faixa Kimi)."""
+    return (KIMI_ROUTE,) if role_of(alias) == KIMI_ROLE else rig.routes
+
+
 def rig_ctx(city: str, prefix: str, mirror_override: str = "") -> Ctx:
     """A loja, o repositório, o espelho e a pasta de worktree do rig. Prefixo fora da tabela, rota ausente ou ilegível, pasta que não existe, repositório que o git não lê → Stop (nada foi escrito)."""
     rig = RIGS.get(prefix)
@@ -656,7 +664,7 @@ def main() -> int:
         if bpfx != role_prefix:  # a sessão de um papel só submete bead do rig do papel (bead alheia nem é lida)
             raise Stop(f"a sessão {sess} é do rig {RIGS[role_prefix].name} e {args[0]} é de outro prefixo ({bpfx}): não submeto")
         ctx = rig_ctx(city, role_prefix, mirror)
-        bead = named_bead(city, alias, args[0], ctx.store, ctx.rig.routes)
+        bead = named_bead(city, alias, args[0], ctx.store, routes_of(ctx.rig, alias))
     else:
         ctx = rig_ctx(city, role_prefix, mirror)
         bead = one_bead(ctx.store, alias)
