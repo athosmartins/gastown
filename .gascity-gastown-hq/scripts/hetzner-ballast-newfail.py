@@ -12,7 +12,7 @@ FONTES (`--fonte NOME`; sem o argumento é wa-suite; as fontes não dividem esta
   hq-mutants  lê hq-mutants.state.json (o estado do motor hq-mutate.py: de cada alvo, `survivors` = os mutantes que NENHUM selftest da família pegou, confirmados por uma 2ª rodada numa cópia limpa), bead no rig do HQ
               (a cidade; label origem:lastro-hq-mutants), task P3, estado newfail-hq-mutants.json. A lista é a do ÚLTIMO rodízio: o id sai quando o motor varre o alvo de novo e o mutante morre (ou deixa de existir); alvo apagado ou ainda não varrido de novo mantém a linha (pode estar velha).
               Lista que ZERA não é 'pegos': alvo sem sobrevivente também é alvo que o motor NÃO reavaliou (base vermelha, scanner perdido, prazo, estado novo). O comentário diz quantos alvos não foram julgados por inteiro e quais.
-  wa-mutants  lê wa-mutants.state.json (o MESMO formato do hq-mutants, escrito pelo hq-mutate-wa.py sobre lib/ e daemons/ do WA), bead no rig do WA (label origem:lastro-wa-mutants), task P3, estado newfail-wa-mutants.json. SEM ctx:ready, SEM exec:auto e sem rota: o pilot-missing-route-watchdog manda para o pool de dogs a bead que tem as duas (foi o que aconteceu com a ga-iu0fvlo), e quem triagem decide. É UMA bead rolante: a lista muda, a bead é atualizada por comentário no máximo a cada 6 h, e cada texto (bead ou comentário) tem teto de 40000 bytes: os arquivos com mais sobreviventes vêm primeiro e o que não cabe vira uma linha com a conta (o hq-mutants chegou a 136.952 bytes na ga-iu0fvlo). Lista que ZERA diz, por motivo, quantos alvos o motor NÃO julgou (o WA tem centenas fora da varredura por desenho: sem teste da família, família grande, denylist).
+  wa-mutants  lê wa-mutants.state.json (o MESMO formato do hq-mutants, escrito pelo hq-mutate-wa.py sobre lib/ e daemons/ do WA), bead no rig do WA (label origem:lastro-wa-mutants), task P3, estado newfail-wa-mutants.json. SEM ctx:ready, SEM exec:auto e sem rota: o pilot-missing-route-watchdog manda para o pool de dogs a bead que tem as duas (foi o que aconteceu com a ga-iu0fvlo), e quem triagem decide. É UMA bead rolante: a lista muda, a bead é atualizada por comentário no máximo a cada 6 h, e cada texto (bead ou comentário) tem teto de 40000 bytes: os arquivos com mais sobreviventes vêm primeiro e o que não cabe vira uma linha com a conta (o hq-mutants chegou a 136.952 bytes na ga-iu0fvlo). Lista que ZERA NÃO é 'pegos' e o comentário diz os dois buracos: (1) por motivo, quantos alvos que o motor TEM no estado não foram julgados por inteiro (base vermelha, scanner perdido, 'restam N de M'); (2) que arquivo sem teste da família, com família grande, na denylist ou symlink NUNCA entra no estado do motor (o plano o pula e só o conta no `skipped` do resumo, que esta ponta não lê), então a lista vazia não diz nada sobre ele. O aviso (2) sai também com todos os alvos do estado julgados.
 O QUE LÊ (wa-suite)
   `ssh <nó> cat ~/gt-remote/ballast/wa-suite.confirmed`: {"v": 1, "main": <ponta da rodada>, "items": {<id do teste>: {"from": <ponta antes>, "to": <ponta onde apareceu>, "seen": <ponta que confirmou>}}}.
   É o estado ATUAL (o id fica até o teste passar), então olhar menos vezes que a rodada não perde nada.
@@ -327,10 +327,10 @@ def render_wam(items):
         flat.append(("", None))
     fonte = ("Fonte: ~/gt-remote/ballast/wa-mutants.state.json no nó (hetzner-ballast-newfail.py --fonte wa-mutants, ga-tmfmvxi). Não é lead nem dado de cliente: só trechos do código do próprio WA, tirados do espelho que o wa-suite já usa.")
     teto = WAM_CAP - 700   # a reserva cobre a linha da conta (~230 bytes), a da fonte (~230) e o `lead` que o comentário põe na frente (até ~150); sobra pouco de propósito: o teste prova que sem o cabeçalho na conta o texto passa de 40000
-    used = sum(len(x.encode("utf-8")) + 1 for x in head)
+    used = sum(len(x.encode("utf-8", "replace")) + 1 for x in head)   # "replace": o motor grava um nome de arquivo fora do UTF-8 como o escape \udcXX do JSON, e o encode estrito dava traceback aqui; com "replace" conta o '?' (1 byte) que run() (errors="replace") põe no lugar ao mandar o texto ao bd, então o teto de bytes vale para o que o bd recebe
     out, k = list(head), 0
     for k, (txt, rel) in enumerate(flat):
-        used += len(txt.encode("utf-8")) + 1
+        used += len(txt.encode("utf-8", "replace")) + 1
         if used > teto:
             break
         out.append(txt)
@@ -343,19 +343,25 @@ def render_wam(items):
     return "\n".join(out)
 
 
+WAM_FORA = ("Arquivo sem teste da família, com família grande, na denylist do motor ou que é symlink fica FORA desta conta: ele NUNCA entra no estado do motor (o plano o pula e só o conta no `skipped` do resumo da varredura, que esta ponta não lê), "
+            "então não aparece nem como 'não julgado', e a lista vazia não diz nada sobre ele. No clone do WA são centenas de arquivos (os números estão no runbook hetzner-ballast.md).")
+
+
 def zerou_wam(n, nao):
-    """Comentário de lista que zerou (wa-mutants). Vazia NÃO é 'pegos', e no WA menos ainda: parte do código fica FORA da varredura por desenho (sem teste da família, família grande, denylist), então a conta por motivo vai escrita."""
+    """Comentário de lista que zerou (wa-mutants). Vazia NÃO é 'pegos', por dois buracos, e os dois vão escritos. (1) Alvo que o motor TEM no estado mas não julgou por inteiro (base vermelha, scanner perdido, 'restam N de M mutantes', sem hash): `nao`, contado por motivo.
+    (2) O que NUNCA entra no estado (WAM_FORA): este script só lê wa-mutants.state.json, e o motor grava ali só o alvo que entrou na varredura (hq-mutate.py: `state["targets"].setdefault`) mais os pulos de tempo de execução (base-ambiente, base-vermelha, scan-perdido, ilegivel);
+    os pulos do PLANO (sem-teste, familia-grande, denylist, symlink) ficam só no `skipped` do resumo, que não passa por aqui. Por isso o aviso (2) sai nas DUAS ramas, inclusive com todos os alvos do estado julgados."""
     if not nao:
-        return ("A lista de mutantes sobreviventes (item wa-mutants) está vazia: os %d alvo(s) do estado do motor estão com todos os mutantes julgados e nenhum sobrevive. Quem reforçou o teste fecha esta bead. "
-                "(Arquivo que saiu do estado do motor também não aparece: confira ~/gt-remote/ballast/wa-mutants.state.json no nó.)" % n)
+        return ("A lista de mutantes sobreviventes (item wa-mutants) está vazia: os %d alvo(s) do estado do motor estão com todos os mutantes julgados e nenhum sobrevive. Isso vale SÓ para esses alvos. %s "
+                "Quem reforçou o teste desses alvos fecha esta bead. (Arquivo que saiu do estado do motor também não aparece: confira ~/gt-remote/ballast/wa-mutants.state.json no nó.)" % (n, WAM_FORA))
     por = {}
     for _, why in nao:
-        k = re.sub(r"\d+", "N", ":".join(why.split(":")[:2]))
+        k = re.sub(r"\d+", "N", why)   # 'restam 2 de 3 mutantes' e 'restam 5 de 9 mutantes' são o mesmo motivo; os de `pulado: <motivo>` não têm número
         por[k] = por.get(k, 0) + 1
     top = sorted(por.items(), key=lambda kv: (-kv[1], kv[0]))
     quais = "; ".join("%d× %s" % (c, k) for k, c in top[:8]) + ("; +%d motivo(s)" % (len(top) - 8) if len(top) > 8 else "")
     return ("A lista de mutantes sobreviventes (item wa-mutants) está vazia, mas isso NÃO prova que os testes foram reforçados. Estado do motor: %d alvo(s); NÃO julgados por inteiro agora: %d [%s]. "
-            "Alvo que o motor pulou ou ainda não reavaliou não tem sobrevivente na lista, nem por isso foi pego. Confira ~/gt-remote/ballast/wa-mutants.state.json no nó antes de fechar esta bead." % (n, len(nao), quais))
+            "Alvo que o motor pulou ou ainda não reavaliou não tem sobrevivente na lista, nem por isso foi pego. %s Confira ~/gt-remote/ballast/wa-mutants.state.json no nó antes de fechar esta bead." % (n, len(nao), quais, WAM_FORA))
 
 
 def too_soon(state, gap):

@@ -5,7 +5,8 @@
 # O QUE FAZ: hetzner-ballast-newfail.py --fonte wa-mutants lê o estado do motor no nó (ssh) e mantém UMA bead rolante no rig do WA (task, P3, labels origem:lastro-wa-mutants e area:testes, SEM ctx:ready, SEM exec:auto e
 # SEM rota: o pilot-missing-route-watchdog manda ao pool de dogs a bead que tem as duas, e quem triagem decide) com a lista de sobreviventes (arquivo, linha, troca, id, testes da família), do arquivo com mais deles para o com menos
 # e com teto de 40000 bytes por texto (o que não cabe vira uma linha com a conta; a lista inteira fica no nó). Abre quando a lista é nova; comenta quando ela muda, no máximo a cada 6 h; comenta quando zera (lista vazia NÃO é "pegos": o
-# comentário diz, por motivo, quantos alvos o motor não julgou, e só com todos julgados por inteiro diz que nenhum sobrevive); abre outra se o dono fechou a anterior E a lista mudou depois. ANTES de abrir lista o rig
+# comentário diz, por motivo, quantos alvos do estado do motor não foram julgados por inteiro, e em TODO comentário avisa que arquivo sem teste da família, com família grande, na denylist ou symlink nunca entra nesse estado e fica fora da conta;
+# "nenhum sobrevive" só aparece com todos os alvos do estado julgados, e vale só para eles); abre outra se o dono fechou a anterior E a lista mudou depois. ANTES de abrir lista o rig
 # (label origem:lastro-wa-mutants): se já existe uma nossa não fechada, comenta nela em vez de abrir outra.
 # Ler o nó ou o estado local que falha = exit 3 e NADA é aberto; o nó desligado (falta .gc/hetzner-node.on) = não faz nada. Estado local: .gc/hetzner-ballast/newfail-wa-mutants.json (o do wa-suite e o do hq-mutants são outros arquivos).
 #

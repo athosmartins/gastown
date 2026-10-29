@@ -385,19 +385,31 @@ g_wam() {  # a fonte wa-mutants (ga-tmfmvxi): o MESMO formato do hq-mutants, bea
   sz=$(wc -c < "$W/bd.stdin.3" | tr -d ' ')
   check "newfail[wam]: o COMENTÁRIO com 800 sobreviventes (aviso + lista) também fica em 40000 bytes" "1 1" "$([ "$sz" -le 40000 ] && echo 1 || echo 0) $(grep -c 'MUDOU (agora 800)' "$W/bd.stdin.3")"
 
+  wamcity; mkwam 800 0 1; printf 'x2 open\n' > "$W/bd.beads"; nw
+  sz=$(wc -c < "$W/bd.stdin.1" | tr -d ' ')
+  check "newfail[wam]: o comentário com o lead MAIS LONGO ('reencontrada', ~146 bytes) e 800 sobreviventes também fica em 40000 bytes, e passa de 30000" "1 1 1" "$(calls 'comment x2 --stdin' bd.calls) $([ "$sz" -le 40000 ] && echo 1 || echo 0) $([ "$sz" -gt 30000 ] && grep -c 'reencontrada no rig do WA' "$W/bd.stdin.1" || echo 0)"
+
+  # nome de arquivo que não é UTF-8 (o motor grava o escape \udcXX no JSON): o texto sai com '?' no lugar, sem traceback, e a bead abre
+  wamcity; "$PY" -I -c 'import json
+r = {"id": "u1", "file": "lib/\udcff.py", "line": 4, "op": "cmp", "old": "==", "new": "!=", "selftest": ["tests/t.py"]}
+print(json.dumps({"v": 1, "targets": {"lib/\udcff.py": {"hash": "h", "survivors": {"u1": r}}}}))' > "$W/node.confirmed"; nw
+  check "newfail[wam]: nome de arquivo fora do UTF-8 (\\udcff no JSON do motor) → rc 0, sem traceback, UMA bead aberta e o nome aparece com '?'" "0 0 1 1" "$RC $(printf '%s' "$OUT" | grep -c Traceback) $(calls 'create' bd.calls) $(grep -c '^ARQUIVO lib/?.py (1)$' "$W/bd.stdin.1")"
+
   # a lista que ZERA: a bead nasce com 2, o nó passa a mandar o JSON de $1; o comentário está em bd.stdin.2 (o zero NÃO espera as 6 h: a bead acabou de nascer)
   zeraw() { wamcity; mkwam 2; nw; printf '%s\n' "$1" > "$W/node.confirmed"; : > "$W/bd.calls"; nw; }
   zw() { grep -c -- "$1" "$W/bd.stdin.2" 2> /dev/null || true; }   # zw TEXTO — linhas do comentário que zera com o texto
   zeraw '{"v": 1, "targets": {"lib/a.py": {"hash": "h", "total": 2, "verdicts": {"m1": "k", "m2": "k"}, "survivors": {}}}}'
-  check "newfail[wam]: lista que ZERA com TODOS os alvos julgados por inteiro → um comentário na hora (não fecha), n a 0, diz 'nenhum sobrevive' e não afirma 'NÃO prova' nem 'pegos'" "0 1 0 0 1 0 0" "$RC $(calls 'comment' bd.calls) $(calls 'close' bd.calls) $(state n newfail-wa-mutants.json) $(zw 'nenhum sobrevive') $(zw 'NÃO prova') $(zw 'foram peg')"
+  check "newfail[wam]: lista que ZERA com TODOS os alvos julgados por inteiro → um comentário na hora (não fecha), n a 0, diz 'nenhum sobrevive' SÓ dos alvos do estado e AVISA que arquivo sem teste/família grande/denylist/symlink nunca entra nesse estado (a lista vazia não fala dele); não afirma 'NÃO prova' nem 'pegos'" "0 1 0 0 1 0 0 1 1" "$RC $(calls 'comment' bd.calls) $(calls 'close' bd.calls) $(state n newfail-wa-mutants.json) $(zw 'nenhum sobrevive') $(zw 'NÃO prova') $(zw 'foram peg') $(zw 'vale SÓ para esses alvos') $(zw 'NUNCA entra no estado do motor')"
   nw
   check "newfail[wam]: a mesma lista vazia de novo → nada (o comentário que zera não se repete)" "0 1" "$RC $(calls 'comment' bd.calls)"
-  zeraw '{"v": 1, "targets": {"lib/ok.py": {"hash": "h", "total": 1, "verdicts": {"m": "k"}, "survivors": {}}, "lib/f1.py": {"hash": "h", "skip": "familia-grande:13"}, "lib/f2.py": {"hash": "h", "skip": "familia-grande:15"}, "lib/f3.py": {"hash": "h", "skip": "familia-grande:40"}, "lib/d1.py": {"hash": "h", "skip": "denylist:os.kill"}, "lib/d2.py": {"hash": "h", "skip": "denylist:os.killpg"}, "lib/s1.py": {"hash": "h", "skip": "sem-teste"}}}'
-  check "newfail[wam]: lista que zera com 6 de 7 alvos FORA da varredura por desenho → 'NÃO prova', o estado do motor tem 7 alvos, 6 não julgados, e a conta vem por motivo (3× familia-grande; 2× denylist; 1× sem-teste, nessa ordem: o número do motivo não separa os grupos)" "1 1 1 0" "$(zw 'NÃO prova') $(zw 'Estado do motor: 7 alvo(s); NÃO julgados por inteiro agora: 6 \[') $(zw '\[3× pulado: familia-grande; 2× pulado: denylist; 1× pulado: sem-teste\]') $(zw 'nenhum sobrevive')"
+  # as formas abaixo são as que o motor GRAVA no estado (hq-mutate.py: `skip` = base-ambiente / base-vermelha com `retry_after`; scan-perdido / ilegivel com `retry_after` e `perdido`). Os pulos do PLANO (sem-teste, familia-grande, denylist, symlink) o motor NÃO grava
+  # no estado (só no `skipped` do resumo): um caso que os pusesse aqui provaria uma coisa que o motor nunca entrega (o gate reprovou a 1ª versão por isso)
+  zeraw '{"v": 1, "targets": {"lib/ok.py": {"hash": "h", "total": 1, "verdicts": {"m": "k"}, "survivors": {}}, "lib/r1.py": {"hash": "h", "swept": 5, "skip": "base-vermelha", "retry_after": 9999999999}, "lib/r2.py": {"hash": "h", "swept": 5, "skip": "base-vermelha", "retry_after": 9999999999}, "lib/r3.py": {"hash": "h", "swept": 5, "skip": "base-vermelha", "retry_after": 9999999999}, "lib/e1.py": {"hash": "h", "swept": 5, "skip": "base-ambiente", "retry_after": 9999999999}, "lib/e2.py": {"hash": "h", "swept": 5, "skip": "base-ambiente", "retry_after": 9999999999}, "lib/p1.py": {"hash": "h", "swept": 5, "skip": "scan-perdido", "retry_after": 9999999999, "perdido": "heredoc aberto"}, "lib/i1.py": {"hash": "h", "swept": 5, "skip": "ilegivel", "retry_after": 9999999999, "perdido": "SyntaxError"}}}'
+  check "newfail[wam]: lista que zera com 7 de 8 alvos PULADOS em tempo de execução (as formas que o motor grava) → 'NÃO prova', o estado do motor tem 8 alvos, 7 não julgados, a conta vem por motivo (3× base-vermelha; 2× base-ambiente; 1× ilegivel; 1× scan-perdido, nessa ordem), e o aviso de que o plano pula arquivos que nunca entram no estado" "1 1 1 1 0" "$(zw 'NÃO prova') $(zw 'Estado do motor: 8 alvo(s); NÃO julgados por inteiro agora: 7 \[') $(zw '\[3× pulado: base-vermelha; 2× pulado: base-ambiente; 1× pulado: ilegivel; 1× pulado: scan-perdido\]') $(zw 'NUNCA entra no estado do motor') $(zw 'nenhum sobrevive')"
   zeraw '{"v": 1, "targets": {"lib/a.py": {"hash": "h", "total": 3, "verdicts": {"m1": "k"}, "survivors": {}}, "lib/b.py": {"hash": "h", "total": 9, "verdicts": {"m1": "k", "m2": "k", "m3": "k", "m4": "k"}, "survivors": {}}}}'
-  check "newfail[wam]: mutantes POR JULGAR em dois alvos (restam 2 de 3 e 5 de 9) → um só motivo '2× restam N de N mutantes'" "1 1" "$(zw 'NÃO prova') $(zw '\[2× restam N de N mutantes\]')"
+  check "newfail[wam]: mutantes POR JULGAR em dois alvos (restam 2 de 3 e 5 de 9) → um só motivo '2× restam N de N mutantes', e o aviso do que nunca entra no estado" "1 1 1" "$(zw 'NÃO prova') $(zw '\[2× restam N de N mutantes\]') $(zw 'NUNCA entra no estado do motor')"
   zeraw '{"v": 1, "targets": {"a.py": {"hash": "h", "skip": "a"}, "b.py": {"hash": "h", "skip": "b"}, "c.py": {"hash": "h", "skip": "c"}, "d.py": {"hash": "h", "skip": "d"}, "e.py": {"hash": "h", "skip": "e"}, "f.py": {"hash": "h", "skip": "f"}, "g.py": {"hash": "h", "skip": "g"}, "h.py": {"hash": "h", "skip": "h"}, "i.py": {"hash": "h", "skip": "i"}, "j.py": {"hash": "h", "skip": "j"}}}'
-  check "newfail[wam]: 10 motivos diferentes → a lista traz os 8 primeiros e '+2 motivo(s)' (o comentário não vira um despejo)" "1 1 0 1" "$(zw '1× pulado: h; +2 motivo(s)') $(zw '1× pulado: a; 1× pulado: b;') $(zw 'pulado: i') $(zw 'NÃO julgados por inteiro agora: 10 \[')"
+  check "newfail[wam]: 10 motivos SINTÉTICOS (o motor de hoje grava no máximo 8 diferentes: este é o teto de defesa para um motor futuro) → a lista traz os 8 primeiros e '+2 motivo(s)' (o comentário não vira um despejo)" "1 1 0 1" "$(zw '1× pulado: h; +2 motivo(s)') $(zw '1× pulado: a; 1× pulado: b;') $(zw 'pulado: i') $(zw 'NÃO julgados por inteiro agora: 10 \[')"
   zeraw '{"v": 1, "targets": {}}'
   check "newfail[wam]: estado NOVO do motor (targets {}) depois de uma lista → 'NÃO prova', 0 alvos e 'sem nenhum alvo'; n vai a 0 e nada é fechado" "0 1 0 0 1 1 1" "$RC $(calls 'comment' bd.calls) $(calls 'close' bd.calls) $(state n newfail-wa-mutants.json) $(zw 'NÃO prova') $(zw 'Estado do motor: 0 alvo') $(zw 'sem nenhum alvo')"
   wamcity; echo '{"v": 1, "targets": {"lib/c.py": {"hash": "h"}}}' > "$W/node.confirmed"; nw
@@ -497,8 +509,8 @@ as linhas do arquivo ficam na ordem do JSON@@        flat.append(("ARQUIVO %s (%
         for line, sid, r in rows:
 o cabeçalho do arquivo conta um a mais@@        flat.append(("ARQUIVO %s (%d)" % (rel, len(rows)), None))@@        flat.append(("ARQUIVO %s (%d)" % (rel, len(rows) + 1), None))
 o wa-mutants não tem teto de tamanho@@    teto = WAM_CAP - 700@@    teto = WAM_CAP * 100
-o teto ignora o cabeçalho do texto@@    used = sum(len(x.encode("utf-8")) + 1 for x in head)@@    used = 0
-o teto conta caracteres, não bytes@@        used += len(txt.encode("utf-8")) + 1@@        used += len(txt) + 1
+o teto ignora o cabeçalho do texto@@    used = sum(len(x.encode("utf-8", "replace")) + 1 for x in head)@@    used = 0
+o teto conta caracteres, não bytes@@        used += len(txt.encode("utf-8", "replace")) + 1@@        used += len(txt) + 1
 o teto deixa passar 5000 bytes a mais@@        if used > teto:@@        if used > teto + 5000:
 o que não coube some sem a linha da conta@@    if rest:@@    if False:
 a linha da conta erra por um@@% (len(rest), len(set(rest)), WAM_CAP))@@% (len(rest) - 1, len(set(rest)), WAM_CAP))
@@ -508,17 +520,19 @@ o corpo do wa-mutants diz o intervalo errado@@% (WAM_GAP_S // 3600), ""]@@% 1, "
 o corpo do wa-mutants esquece o aviso de linha velha@@"MANTÉM a linha aqui, e ela pode estar velha: confira no arquivo atual antes de agir." % (WAM_GAP_S@@"" % (WAM_GAP_S
 o corpo do wa-mutants esquece o id do sobrevivente@@, sid, "  (testes: %s)" % fam if fam else ""), rel))@@, "", "  (testes: %s)" % fam if fam else ""), rel))
 a lista que zera do wa-mutants nunca diz que todos foram julgados@@    if not nao:@@    if False:
-os motivos do wa-mutants não são agrupados@@        k = re.sub(r"\d+", "N", ":".join(why.split(":")[:2]))@@        k = why
-os motivos do wa-mutants separam os números (restam 2 de 3 ≠ restam 5 de 9)@@        k = re.sub(r"\d+", "N", ":".join(why.split(":")[:2]))@@        k = ":".join(why.split(":")[:2])
-os motivos do wa-mutants só olham a 1ª parte (pulado)@@        k = re.sub(r"\d+", "N", ":".join(why.split(":")[:2]))@@        k = re.sub(r"\d+", "N", ":".join(why.split(":")[:1]))
-os motivos do wa-mutants olham 3 partes (familia-grande:13 ≠ :15)@@        k = re.sub(r"\d+", "N", ":".join(why.split(":")[:2]))@@        k = re.sub(r"\d+", "N", ":".join(why.split(":")[:3]))
+os motivos do wa-mutants não são agrupados (restam 2 de 3 ≠ restam 5 de 9)@@        k = re.sub(r"\d+", "N", why)@@        k = why
+os motivos do wa-mutants só olham a 1ª parte (pulado)@@        k = re.sub(r"\d+", "N", why)@@        k = re.sub(r"\d+", "N", why.split(":")[0])
 cada alvo conta uma vez só por motivo@@        por[k] = por.get(k, 0) + 1@@        por[k] = 1
 os motivos saem em ordem alfabética (não pelo que tem mais alvos)@@    top = sorted(por.items(), key=lambda kv: (-kv[1], kv[0]))@@    top = sorted(por.items(), key=lambda kv: kv[0])
 os motivos saem do menor para o maior@@    top = sorted(por.items(), key=lambda kv: (-kv[1], kv[0]))@@    top = sorted(por.items(), key=lambda kv: (kv[1], kv[0]))
 a lista dos motivos não é cortada em 8@@for k, c in top[:8])@@for k, c in top)
 a lista dos motivos erra o '+K motivo(s)'@@(len(top) - 8) if len(top) > 8 else ""@@(len(top)) if len(top) > 8 else ""
-o comentário que zera do wa-mutants diz 0 alvos não julgados@@nem por isso foi pego. Confira ~/gt-remote/ballast/wa-mutants.state.json no nó antes de fechar esta bead." % (n, len(nao), quais))@@nem por isso foi pego. Confira ~/gt-remote/ballast/wa-mutants.state.json no nó antes de fechar esta bead." % (n, 0, quais))
-o comentário que zera do wa-mutants erra o total de alvos do estado do motor@@nem por isso foi pego. Confira ~/gt-remote/ballast/wa-mutants.state.json no nó antes de fechar esta bead." % (n, len(nao), quais))@@nem por isso foi pego. Confira ~/gt-remote/ballast/wa-mutants.state.json no nó antes de fechar esta bead." % (0, len(nao), quais))
+o comentário que zera do wa-mutants diz 0 alvos não julgados@@% (n, len(nao), quais, WAM_FORA))@@% (n, 0, quais, WAM_FORA))
+o comentário que zera do wa-mutants erra o total de alvos do estado do motor@@% (n, len(nao), quais, WAM_FORA))@@% (0, len(nao), quais, WAM_FORA))
+a lista que zera com todos julgados esquece o aviso do que nunca entra no estado@@Isso vale SÓ para esses alvos. %s "@@Isso vale SÓ para esses alvos. %.0s "
+a lista que zera com alvo não julgado esquece o aviso do que nunca entra no estado@@nem por isso foi pego. %s Confira@@nem por isso foi pego. %.0s Confira
+o aviso do que nunca entra no estado deixa de dizer que o arquivo NUNCA entra@@ele NUNCA entra no estado do motor@@ele entra no estado do motor
+a conta de bytes do corpo do wa-mutants volta ao encode estrito (traceback com nome fora do UTF-8)@@        used += len(txt.encode("utf-8", "replace")) + 1@@        used += len(txt.encode("utf-8")) + 1
 MUT
   "$PY" -I - "$NF" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import re, sys
