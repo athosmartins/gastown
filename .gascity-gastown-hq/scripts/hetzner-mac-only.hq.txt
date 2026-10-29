@@ -55,7 +55,6 @@ packs/town-deltas/assets/gate-rebase-content-verdict.selftest.sh
 packs/town-deltas/assets/gate-reviewer-orphan-clear.selftest.sh
 packs/town-deltas/assets/gate-spawn-err-capture.selftest.sh
 packs/town-deltas/assets/gate-spawn-transient-retry.selftest.sh
-packs/town-deltas/assets/gate-yjrg7n6-preadmit-budget.selftest.sh
 packs/town-deltas/assets/heavy-selftest-guard.selftest.sh
 packs/town-deltas/assets/inflight-reclaim-guard.selftest.sh
 packs/town-deltas/assets/lexbh-deploy-cmd.selftest.sh
