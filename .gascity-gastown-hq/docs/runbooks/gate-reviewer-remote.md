@@ -2,7 +2,7 @@
 
 ## Contents
 
-O que é · Desenho · Escritas do revisor × allowlist do atalho (ga-6auslu, pré-condição iii do degrau b da 1.6) · Ligar · Provar · Diferenças conhecidas (revisor do nó × local) · Medido, inferido, não testado
+O que é · Desenho · Escritas do revisor × allowlist do atalho (ga-6auslu, pré-condição iii do degrau b da 1.6) · Ligar · Provar · Diferenças conhecidas (revisor do nó × local) · A admissão não espera o Phase C (ga-yjrg7n6) · Medido, inferido, não testado
 
 Bead ga-2hd02v.1.9 (filha da ga-2hd02v.1). Mayor, 19/10: construir e provar no nó com sessão de teste ou dry-run **já**; a ATIVAÇÃO viva (flag, config do host) só depois do flip da 1.6 provado. **A 1.6 estava aberta quando esta fatia terminou: tudo aqui está pronto e INERTE.**
 
@@ -16,7 +16,7 @@ Peças: `agents/gate-reviewer-remote/` · `packs/town-deltas/assets/gate-remote-
 
 * **Flag em 3 estados:** ligada, desligada, **ilegível** (pasta/link/arquivo que não se lê, `GC_CITY` vazio). Ilegível = local, e o log diz `flag UNREADABLE`.
 * **Nó em 4 respostas:** `room`, `full`, `unready`, `unknown`. Só `room` vai ao nó; `unknown` (ssh caiu, `list-running` passou de 30 s, linha estranha, config ilegível, `timeout` ausente) **não é `room`**.
-  `room` = vivas no nó < `cap` do host (`.gc/session-ssh.json`) **e** revisores remotos vivos < `max_active_sessions` do template (2). `unready` = o host não tem `real_sessions_released_by` (start sairia 12) ou `worktree_rigs["gate-reviewer"]` (sairia 13).
+  `room` = vivas no nó < `cap` do host (`.gc/session-ssh.json`) **e** revisores remotos vivos < `max_active_sessions` do template (3; era 2 até ga-yjrg7n6). `unready` = o host não tem `real_sessions_released_by` (start sairia 12) ou `worktree_rigs["gate-reviewer"]` (sairia 13).
 * **Uma tentativa no nó**; falhou, voltou vazio ou estourou → a MESMA etapa abre o local. Um estouro tem desfecho desconhecido: no pior caso sobra uma sessão ociosa no nó até o `idle_timeout` (10 min). Nunca dois revisores para o mesmo slot.
 * **Slot que morreu no nó é substituído no LOCAL.** Slot que era local é oferecido ao nó como spawn novo.
 * **Tarefa idêntica, palavra por palavra** (um texto por slot, renderizado antes de escolher o template). O revisor do nó recebe sempre a tarefa INTEIRA no nudge, nunca o ponteiro: o atalho do nó não devolve corpo de comentário (`bd comments` e `--include-comments` voltam rc 77).
@@ -86,6 +86,21 @@ Log do dispatcher: `Reviewer N: node has room - remote reviewer first` (nó) · 
 4. **Sem `drain-ack`:** a sessão ociosa fecha pelo `idle_timeout` de 10 min (local: 1 h) e segura uma vaga do nó até lá.
 5. **`start` mais lento:** o `wt-add` puxa o espelho (piso de 150 s) e segura o `flock` do host. **Não medido para este papel.**
 6. **1º turno de procura:** `bd list --assignee` pode voltar vazio com a bead certa (ga-mo7q); o prompt manda confirmar por `bd show <id> --json`.
+
+## A admissão não espera o Phase C (ga-yjrg7n6)
+
+Medido em 29/10 (00:48–02:02, log do dispatcher): a rodada 2 abriu às 00:49:47 e só chegou a "Found 9 queued marker(s)" às 01:03:04, **13 min sem admitir nada**. O tempo era o Phase C (cada run ainda em voo custa ~35–48 s de `bd list`/`bd show`/`gc rig list`; cada run que fechou custa 2,5–4 min de finalize) mais as passadas filhas do mid-sweep (3m46s e 2m47s), tudo ANTES do "Found". Nas rodadas seguintes o Phase C levou 1,5–2,5 min e do "Found" ao "Run admitted" passaram 3,9–8,7 min.
+
+**Orçamento pré-admissão:** `GATE_PREADMIT_BUDGET_SECS` (padrão **150** s por rodada, contados do banner `=== Dispatcher sweep start`; **`0` desliga** e volta ao comportamento antigo; não numérico = 150). Dois efeitos:
+
+* **Phase C não COMEÇA run novo depois do orçamento.** Sempre começa pelo menos um (a rodada nunca fica sem progresso) e nunca corta um finalize em andamento. Os que sobraram vão para `$GC_CITY/.gc/gate-phase-c-deferred` (um id por blank, gravado por tmp+mv) e a rodada seguinte os confere **primeiro**, na ordem do arquivo: as rodadas viram um rodízio, nenhum run fica atrás da cabeça da lista. Arquivo ausente ou ilegível = ordem natural (o log avisa do ilegível).
+* **A passada filha do mid-sweep espera.** Com um marker aguardando admissão, ou com o orçamento gasto, os candidatos ficam pendentes e quem os coleta é o Phase C da rodada seguinte. A filha do Phase C-only (a que recebe os ids) **não** aplica o orçamento.
+
+**Detecção de revisor morto não muda:** ela é guiada por timeout do run (`VERDICT_TIMEOUT_MINUTES`, 22 min, até 50) ou por sessão primária confirmada fechada, e um run adiado é conferido na rodada seguinte, então o atraso é de uma rodada.
+
+Log: `Phase C: pre-admission budget of Ns spent after Ms — K of N in-flight run(s) left for the next round, which checks them first: IDS` · `Mid-sweep (…): … NOT collecting now; the next round's Phase C does` · `Pre-admission: reached admission Ns after the sweep start (budget Ns; Phase C left IDS|none for the next round)` (o intervalo antes/depois da admissão). Prova: `gate-yjrg7n6-preadmit-budget.selftest.sh` (processo de verdade numa cidade de rascunho, com 2 mutantes).
+
+**Custo conhecido:** um revisor REMOTO que já terminou, num run adiado, segura a vaga do nó por mais uma rodada (o Step 0a-2 só tira do headroom os revisores LOCAIS terminados; o remoto sai no finalize ou no `idle_timeout` de 10 min). Com o teto do template em 3, isso consome uma das 3 vagas, no pior caso, por uma rodada.
 
 ## Medido, inferido, não testado
 

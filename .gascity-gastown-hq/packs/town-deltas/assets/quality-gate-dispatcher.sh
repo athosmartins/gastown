@@ -2898,6 +2898,107 @@ GATE_EVENTS_FILE="${GATE_EVENTS_FILE:-${GC_CITY:-}/.gc/events.jsonl}"
 # ("collected, or nothing to collect") so the parent can warn instead of logging a refusal as a success.
 GATE_PHASE_C_ONLY_NOTRUN_RC=75
 
+# ── ga-yjrg7n6: a queued marker is admitted before the finalize side has used up its turn ──
+# Measured 29/10 00:49-01:03 (ga-n4ql4ur): one round held the lock ~13 min with 9 markers queued and admitted none. Phase C walked
+# every in-flight run in series (~35-48 s each just to say "still in flight": the verdict-bead list, one `bd show` per verdict bead),
+# one completed run took ~2.5 min to finalize, and then TWO mid-sweep Phase-C-only passes (above) took 3m46s and 2m47s more — all
+# before "Found N queued marker(s)". Headroom does not need any of it: finished LOCAL reviewers are already excluded from
+# LIVE_REVIEWERS by Step 0a-2 (ga-rze6ge) whether or not their run was finalized.
+#
+# GATE_PREADMIT_BUDGET_SECS is the time a round may spend on finalize-side work before admission gets its turn (0 = off: the old
+# behaviour, everything finalized first). Two things look at it:
+#   · Phase C stops STARTING a new in-flight run once the budget is spent (a run being finalized is never cut). The runs it did not
+#     reach are written to GATE_PHASE_C_DEFERRED_FILE and are the FIRST thing the next round's Phase C checks, so a long list is
+#     covered over successive rounds and the tail is not starved. Dead-reviewer detection is not weakened: it fires at a run's
+#     verdict timeout (22-50 min) or on a confirmed-closed session, and a deferred run is checked within one round.
+#   · gate_midsweep_collect keeps its candidates (it does not start a child) while the budget is spent or a marker is already
+#     waiting for admission. The next round's Phase C collects them, as it always did for a verdict that landed late.
+GATE_PREADMIT_BUDGET_SECS="${GATE_PREADMIT_BUDGET_SECS:-150}"
+case "$GATE_PREADMIT_BUDGET_SECS" in ''|*[!0-9]*) GATE_PREADMIT_BUDGET_SECS=150 ;; esac    # a typo is the default, not "off" and not "no limit"
+GATE_PREADMIT_BUDGET_SECS=$(printf '%s' "$GATE_PREADMIT_BUDGET_SECS" | sed 's/^0*\([0-9]\)/\1/')
+GATE_PHASE_C_DEFERRED_FILE="${GATE_PHASE_C_DEFERRED_FILE:-${GC_CITY:-}/.gc/gate-phase-c-deferred}"
+GATE_ADMISSION_WAITING=0     # 1 once "Found N queued marker(s)" saw N > 0 in THIS round
+GATE_ROUND_T0=""             # epoch at the sweep banner of THIS process; empty in a Phase-C-only child and in lib-only mode
+
+# Pure. $1 = round start epoch, $2 = now, $3 = budget in seconds. rc 0 iff the budget is SPENT.
+# vazio → not spent; falhou/ilegível → not spent: a start time, a clock or a budget that cannot be read as a number leaves the
+# old behaviour (finalize everything) in place, never a Phase C cut short on a guess. Budget 0 = off.
+# SELFTEST-EXTRACT gate-preadmit-budget-spent-fn: BEGIN
+gate_preadmit_budget_spent() {
+  local _t0="${1:-}" _now="${2:-}" _b="${3:-}"
+  case "$_t0" in ''|*[!0-9]*) return 1 ;; esac
+  case "$_now" in ''|*[!0-9]*) return 1 ;; esac
+  case "$_b" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$((10#$_b))" -gt 0 ] || return 1
+  [ "$((10#$_now - 10#$_t0))" -ge "$((10#$_b))" ]
+}
+# SELFTEST-EXTRACT gate-preadmit-budget-spent-fn: END
+
+# Pure. $1 = JSON array of running gate-runs, $2 = ids the previous round left unchecked (blank-separated). Prints the array with
+# those runs FIRST, in the order of $2 (the previous round's own order — that is what makes the rounds a rotation: a run it
+# deferred was never reached, one it wrapped to the tail goes after the unreached ones); the others follow in the order they came
+# in. A listed id that is not running any more is ignored. vazio → the array unchanged (nothing was deferred);
+# falhou/ilegível ($1 not an array, jq failing) → $1 unchanged, never an empty list: the old order is the inert state.
+# SELFTEST-EXTRACT gate-phase-c-order-fn: BEGIN
+gate_phase_c_order_deferred_first() {
+  local _out
+  case "${2:-}" in *[![:space:]]*) ;; *) printf '%s' "${1-}"; return 0 ;; esac
+  if _out=$(printf '%s' "${1-}" | jq -c --arg ids "$2" '
+      ( reduce ($ids | scan("[^ \n\t]+")) as $x ([]; if index($x) then . else . + [$x] end) ) as $d
+      | if type == "array" then . as $all | ([ $d[] as $x | $all[] | select(.id == $x) ] + [ $all[] | select(.id as $i | $d | index($i) | not) ]) else error("not an array") end
+    ' 2>/dev/null) && [ -n "$_out" ]; then
+    printf '%s' "$_out"
+  else
+    printf '%s' "${1-}"
+  fi
+}
+# SELFTEST-EXTRACT gate-phase-c-order-fn: END
+
+# The runs the previous round's Phase C left unchecked, one line of blank-separated ids; "" when there are none.
+# vazio / file absent → "" (nothing was deferred). falhou/ilegível (a directory, no permission) → "" too, and said once: the
+# order is then the natural one, which only costs the fairness, never a run.
+gate_phase_c_deferred_read() {
+  local _f="${GATE_PHASE_C_DEFERRED_FILE:-}" _txt
+  [ -n "$_f" ] && [ -e "$_f" ] || return 0
+  if ! _txt=$(cat "$_f" 2>/dev/null); then
+    warn "Phase C: $_f exists but cannot be read — in-flight runs are checked in their natural order this round (ga-yjrg7n6)."
+    return 0
+  fi
+  printf '%s' "$_txt" | tr '\n\t' '  '
+}
+
+# $1 = the ids this round's Phase C left unchecked ("" = none). Atomic (tmp + mv). With nothing to record and no file there is
+# nothing to do (no state churn on a healthy gate). A write that fails is said and costs only the fairness of the next round.
+gate_phase_c_deferred_write() {
+  local _f="${GATE_PHASE_C_DEFERRED_FILE:-}" _tmp
+  [ -n "$_f" ] || return 0
+  if [ -z "${1:-}" ] && [ ! -e "$_f" ]; then return 0; fi
+  _tmp="$_f.tmp.$$"
+  # a directory in the way is a failed write (`mv file dir` would "succeed" by moving the file INTO it)
+  if [ ! -d "$_f" ] && { printf '%s\n' "${1:-}" > "$_tmp"; } 2>/dev/null && mv -f "$_tmp" "$_f" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$_tmp" 2>/dev/null || true
+  warn "Phase C: could not record the deferred run(s) in $_f — the next round checks in-flight runs in their natural order (ga-yjrg7n6)."
+  return 0
+}
+
+# rc 0 iff gate_midsweep_collect should NOT start a child pass now: finalize-side work is ahead of a marker that is waiting, or the
+# round already spent its budget. Off with GATE_PREADMIT_BUDGET_SECS=0. Sets GATE_PREADMIT_DEFER_WHY for the log line.
+gate_preadmit_defer_midsweep() {
+  GATE_PREADMIT_DEFER_WHY=""
+  [ "${GATE_PREADMIT_BUDGET_SECS:-0}" != "0" ] || return 1
+  if [ "${GATE_ADMISSION_WAITING:-0}" = "1" ]; then
+    GATE_PREADMIT_DEFER_WHY="a queued marker is waiting for admission"
+    return 0
+  fi
+  if gate_preadmit_budget_spent "${GATE_ROUND_T0:-}" "$(date +%s)" "$GATE_PREADMIT_BUDGET_SECS"; then
+    GATE_PREADMIT_DEFER_WHY="this round already spent its ${GATE_PREADMIT_BUDGET_SECS}s pre-admission budget"
+    return 0
+  fi
+  return 1
+}
+
 # rc 0 iff THIS process is a Phase-C-only child entitled to borrow the lock.
 # Arg: the expected parent pid (the caller passes $PPID; a selftest passes a stand-in).
 # SELFTEST-EXTRACT gate-lock-borrow-ok-fn: BEGIN
@@ -2965,6 +3066,7 @@ gate_midsweep_arm() {
   GATE_MIDSWEEP_PENDING=""
   GATE_ADMITTING_RUN=""
   GATE_MIDSWEEP_BLIND_LOGGED=0
+  GATE_PREADMIT_DEFER_LOGGED=0
   GATE_MIDSWEEP_OFF=$({ wc -c < "$GATE_EVENTS_FILE"; } 2>/dev/null | tr -d ' ' || true)   # { } so a failed "<" is silenced too
   case "${GATE_MIDSWEEP_OFF:-}" in
     ''|*[!0-9]*) GATE_MIDSWEEP_OFF=""; _gate_midsweep_blind "the size of $GATE_EVENTS_FILE could not be read" ;;
@@ -3060,6 +3162,17 @@ gate_midsweep_collect() {
 $_cand"
   GATE_MIDSWEEP_PENDING=""
   case "$_cand" in *[![:space:]]*) ;; *) return 0 ;; esac
+  # ga-yjrg7n6: a child pass is a finalize (2.5-4 min measured). While a marker waits for admission, or once the round spent its
+  # pre-admission budget, the candidates stay pending instead: the next round's Phase C collects them, which is what happened to
+  # every verdict that landed late before ga-bk5j8u.1. Said once per sweep, with the ids.
+  if gate_preadmit_defer_midsweep; then
+    GATE_MIDSWEEP_PENDING="$_cand"
+    if [ "${GATE_PREADMIT_DEFER_LOGGED:-0}" != "1" ]; then
+      GATE_PREADMIT_DEFER_LOGGED=1
+      log "Mid-sweep ($_where): verdict(s) closed for run(s) $(printf '%s' "$_cand" | tr '\n' ' ' | sed 's/^ *//; s/ *$//') but ${GATE_PREADMIT_DEFER_WHY} — NOT collecting now; the next round's Phase C does (ga-yjrg7n6)."
+    fi
+    return 0
+  fi
   _skip="${GATE_ADMITTING_RUN:-} ${GATE_MIDSWEEP_DONE:-}"
   # The two confirming reads: live, and each must come back as a JSON array (see _gate_midsweep_read). A read that
   # could not be made keeps the candidates for the next safe point; it is never taken for "nothing is open".
@@ -13513,6 +13626,9 @@ if [ "${GATE_PHASE_C_ONLY:-0}" = "1" ]; then
   log "--- Phase-C-only pass (mid-sweep, borrowed lock) for run(s): ${GATE_PHASE_C_ONLY_RUNS:-none} (ga-bk5j8u.1) ---"
 else
   log "=== Dispatcher sweep start (DRY_RUN=${DRY_RUN}) ==="
+  # ga-yjrg7n6: the clock of the pre-admission budget (gate_preadmit_budget_spent). A multi-admit round is a fresh process (exec),
+  # so every round gets its own budget.
+  GATE_ROUND_T0=$(date +%s)
 fi
 
 # ga-qmymjm: post-merge tails forked by an EARLIER sweep that never reported back (killed hard, machine restarted): said out loud, once each
@@ -13541,6 +13657,16 @@ fi
 # onward), so freed reviewer-session slots are visible to THIS sweep's own
 # headroom check (Step 0b-1) and the merge stays serial — this whole block
 # runs under the SAME single-instance lock as the rest of the sweep.
+#
+# ga-yjrg7n6: "first" is bounded. Finished LOCAL reviewers are excluded from the
+# headroom count by Step 0a-2 (ga-rze6ge) whether or not their run has been
+# finalized, so admission does not need all of Phase C: after
+# GATE_PREADMIT_BUDGET_SECS (default 150 s from the sweep banner) no NEW run is
+# started and the rest go first in the next round (GATE_PHASE_C_DEFERRED_FILE).
+# What deferral does cost: a finished REMOTE reviewer keeps its slot on the node
+# until its run is finalized (cleanup_reviewer_sessions closes it; the node's
+# idle_timeout is the backstop), so a deferred run holds it for one more round —
+# which is why deferred runs are checked first, not last.
 #
 # Context for each running gate-run is re-derived from its bead state (never
 # from process-local variables — a DIFFERENT process may have claimed it):
@@ -13583,6 +13709,14 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
     # onward) rather than releasing it after the first — see
     # cleanup_reviewer_sessions' GATE_SWEEP_HAS_MORE_WORK handling above.
     GATE_SWEEP_HAS_MORE_WORK=1
+    # ga-yjrg7n6: the pre-admission budget. The runs the previous round did not reach go first (gate_phase_c_order_deferred_first);
+    # once the budget is spent no NEW run is started below (one whose finalize is running is never cut) and the rest are written
+    # down for the next round. A Phase-C-only child is handed exactly the runs to collect, so it neither reorders nor stops.
+    PC_BUDGET_ON=0; PC_STARTED_N=0; PC_DEFERRED_IDS=""
+    if [ "${GATE_PHASE_C_ONLY:-0}" != "1" ] && [ "${GATE_PREADMIT_BUDGET_SECS:-0}" != "0" ]; then
+      PC_BUDGET_ON=1
+      PHASE_C_RUNNING_JSON=$(gate_phase_c_order_deferred_first "$PHASE_C_RUNNING_JSON" "$(gate_phase_c_deferred_read)")
+    fi
     for PC_I in $(seq 0 $((PHASE_C_COUNT - 1))); do
       # ga-bk5j8u.1: a Phase-C-only child re-proves its borrow before EACH run. If its parent died
       # (SIGKILL: the child would otherwise outlive it, finalizing under a dead holder's token while a
@@ -13607,6 +13741,19 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
       # freshness half and gets reclaimed anyway). No-op when the lock is
       # disabled or its dir is absent (token-guarded write, 2>/dev/null).
       if [ "$GATE_LOCK_ENABLED" = "1" ]; then _gate_lock_write_hb; fi
+      # ga-yjrg7n6: budget spent → leave the runs from here on to the next round. At least one run is always started (the budget
+      # can be spent before Phase C even begins), so a round never makes zero progress. vazio → nothing is deferred and the loop
+      # goes on; falhou (jq cannot list the rest) → the loop goes on too: reading the rest wrong must not cut a run, only cost time.
+      if [ "$PC_BUDGET_ON" = "1" ] && [ "$PC_STARTED_N" -gt 0 ] \
+         && gate_preadmit_budget_spent "${GATE_ROUND_T0:-}" "$(date +%s)" "$GATE_PREADMIT_BUDGET_SECS"; then
+        if PC_DEFERRED_IDS=$(printf '%s' "$PHASE_C_RUNNING_JSON" | jq -r --argjson i "$PC_I" '[ .[$i:][] | .id // empty ] | join(" ")' 2>/dev/null) \
+           && [ -n "$PC_DEFERRED_IDS" ]; then
+          log "Phase C: pre-admission budget of ${GATE_PREADMIT_BUDGET_SECS}s spent after $(( $(date +%s) - GATE_ROUND_T0 ))s — $((PHASE_C_COUNT - PC_I)) of ${PHASE_C_COUNT} in-flight run(s) left for the next round, which checks them first: ${PC_DEFERRED_IDS} (ga-yjrg7n6)."
+          break
+        fi
+        PC_DEFERRED_IDS=""
+      fi
+      PC_STARTED_N=$((PC_STARTED_N + 1))
       PC_RUN=$(printf '%s' "$PHASE_C_RUNNING_JSON" | jq ".[$PC_I]")
       GATE_RUN_ID=$(printf '%s' "$PC_RUN" | jq -r '.id // empty')
       [ -z "$GATE_RUN_ID" ] && continue
@@ -14098,6 +14245,8 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
       # SELFTEST-EXTRACT phase-c-verdict-decision: END
     done
     GATE_SWEEP_HAS_MORE_WORK=0
+    # ga-yjrg7n6: the next round's head of line (empty when this round reached every run).
+    if [ "$PC_BUDGET_ON" = "1" ]; then gate_phase_c_deferred_write "$PC_DEFERRED_IDS"; fi
   fi
 fi
 
@@ -14743,6 +14892,10 @@ if [ "$COUNT" = "0" ]; then
   log "No queued markers. Exiting."
   exit 0
 fi
+# ga-yjrg7n6: from here a marker waits for admission — gate_midsweep_collect starts no child pass ahead of it. The line is the
+# measurement: seconds from this round's banner to the admission path (the 29/10 00:49 round took ~13 min), and what was deferred.
+GATE_ADMISSION_WAITING=1
+log "Pre-admission: reached admission ${GATE_ROUND_T0:+$(( $(date +%s) - GATE_ROUND_T0 ))s }after the sweep start (budget ${GATE_PREADMIT_BUDGET_SECS}s; Phase C left ${PC_DEFERRED_IDS:-none} for the next round) (ga-yjrg7n6)."
 
 # ── Step 0b-0 (ga-faw5o defeito 3): rebase-fail exile escalation watchdog ────
 # gate:exiled-tier5 markers only accumulate retry attempts when actually
