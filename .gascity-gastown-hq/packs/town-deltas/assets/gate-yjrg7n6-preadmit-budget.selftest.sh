@@ -12,16 +12,25 @@
 #      "not spent" (never a Phase C cut short on a guess); leading zeros are decimal.
 #   2. gate_phase_c_order_deferred_first: the runs the last round did not reach go first, the order inside each group is kept,
 #      unknown ids are ignored, nothing is lost or duplicated; an unreadable array comes back untouched, never as an empty list.
-#   3. the deferred-run file: absent / empty / unreadable read as "none" (the last one says so); an atomic write; a write that
-#      fails says so and does not stop the sweep; nothing is written when there is nothing to record.
-#   4. gate_midsweep_collect: with a marker waiting, or the budget spent, a closed verdict is NOT collected by a child pass (no bd
-#      read either), the candidate is kept and collected as soon as the pass is allowed again, and the line is said once per
-#      sweep; budget 0 is the old behaviour (the child starts regardless); a start time that cannot be read does not defer.
+#   3. the deferred-run file: absent / empty / unreadable read as "none" (the last one SAYS so, on stderr: the dispatcher calls the
+#      reader inside $( ), so a word on stdout would be taken for the ids and never reach the log); an atomic write; a write that
+#      fails says so, does not stop the sweep and does not leave the PREVIOUS list behind; nothing is written when there is nothing
+#      to record. The warnings of all three helpers (reader, writer, reorder) travel on stderr; the harness' warn() is the
+#      dispatcher's own (an echo to stdout), so a warning on the wrong channel is seen here as it is seen in production.
+#   4. gate_midsweep_collect: with a marker waiting, or (before the marker is admitted) the budget spent, a closed verdict is NOT
+#      collected by a child pass (no bd read either), the candidate is kept and collected as soon as the pass is allowed again,
+#      and the line is said once per sweep; budget 0 is the old behaviour (the child starts regardless); a start time that cannot
+#      be read does not defer. Once this round's marker is admitted and no other one is queued the ACK-wait pass is allowed again
+#      (the budget is a PRE-admission budget); with others queued, or a count that cannot be read, it stays deferred.
 #   5. the REAL dispatcher as a real process, with four in-flight runs that cost 3 s each to check and a 5 s budget: the round
 #      stops starting runs once the budget is spent, writes the ones it did not reach, the NEXT round checks those first (so the
 #      two rounds cover all four), budget 0 checks all four in the first round (old behaviour), and a Phase-C-only child ignores
-#      the budget (it was handed exactly the runs to collect).
-#   6. the wiring has teeth: removing the `break` from Phase C, or the deferral from gate_midsweep_collect, turns a check red.
+#      the budget (it was handed exactly the runs to collect). A queued marker sits in the scratch city, so each round reaches
+#      "Found 1" and the "Pre-admission: reached admission" line, which names what the round left for the next one; a DIRECTORY
+#      where the deferred-run file belongs (the repro of the first gate verdict) puts the reader's AND the writer's warning in the
+#      real log; a jq that cannot list the runs left is said once and the round checks the rest as it did before the budget.
+#   6. the checks have teeth: removing the `break` from Phase C, the deferral from gate_midsweep_collect, the reader's stderr
+#      redirect, the removal of the previous list, the lowering of the waiting flag at admission or the jq warning turns a check red.
 #
 # Exit 0 iff every assertion holds.
 # Test seam: QG_YJRG7N6_DISPATCHER points the checks at another dispatcher file. Run on the previous HEAD's dispatcher this FAILS
@@ -50,13 +59,15 @@ set +e   # the dispatcher turns errexit on; the harness counts failures instead
 
 # None of these existed before ga-yjrg7n6: an unpatched dispatcher stops here instead of silently skipping every check below.
 for _fn in gate_preadmit_budget_spent gate_phase_c_order_deferred_first gate_phase_c_deferred_read gate_phase_c_deferred_write \
-           gate_preadmit_defer_midsweep gate_midsweep_collect; do
+           gate_preadmit_defer_midsweep gate_preadmit_mark_admitted gate_midsweep_collect; do
   type "$_fn" >/dev/null 2>&1 || { echo "FATAL: $_fn not defined by the dispatcher (ga-yjrg7n6 missing?)"; exit 1; }
 done
 
 LOGF="$ROOT/log.txt"; : > "$LOGF"
 log()  { printf '%s\n' "$*" >> "$LOGF"; }
-warn() { printf 'WARN %s\n' "$*" >> "$LOGF"; }
+# warn is the dispatcher's own: an echo to STDOUT. Gate attempt 1 of this bead was failed by a stub that wrote to a FILE instead: in production the
+# reader's warning was swallowed by the $( ) of its caller and the check passed regardless.
+warn() { printf 'WARN %s\n' "$*"; }
 err()  { printf 'ERR %s\n' "$*" >> "$LOGF"; }
 
 # ── 1. gate_preadmit_budget_spent (pure) ───────────────────────────────────────
@@ -99,15 +110,19 @@ eq "…a repeated id counts once (r5 r5 r2 → r5 r2 r1 r3 r4)"        "$(gate_p
 eq "an empty array stays an empty array"                           "$(gate_phase_c_order_deferred_first "[]" "r1")" "[]"
 # unreadable input is returned as it came — never as an empty list (an empty Phase C would read as "nothing in flight")
 for _bad in "garbage" "" "null" '{"id":"r1"}' "[1,2"; do
-  eq "unreadable first argument [$_bad] → returned unchanged" "$(gate_phase_c_order_deferred_first "$_bad" "r1")" "$_bad"
+  eq "unreadable first argument [$_bad] → returned unchanged" "$(gate_phase_c_order_deferred_first "$_bad" "r1" 2>/dev/null)" "$_bad"
+  eq "…and said on stderr (stdout is the array its caller captures), not silent" "$(gate_phase_c_order_deferred_first "$_bad" "r1" 2>&1 >/dev/null | grep -c 'could not be reordered')" "1"
 done
+eq "a readable array with nothing deferred says nothing"  "$(gate_phase_c_order_deferred_first "$_RUNS" "" 2>&1 >/dev/null | wc -l | tr -d ' ')" "0"
+eq "…nor does an ordinary reorder"                        "$(gate_phase_c_order_deferred_first "$_RUNS" "r4 r5" 2>&1 >/dev/null | wc -l | tr -d ' ')" "0"
 
 # ── 3. the deferred-run file ───────────────────────────────────────────────────
 echo "── 3. the deferred-run file: read, write, failure ──"
 GATE_PHASE_C_DEFERRED_FILE="$ROOT/state/deferred"
-: > "$LOGF"
-eq "no file → none"                      "$(gate_phase_c_deferred_read)" ""
-eq "…and no warning for a missing file"  "$(grep -c 'cannot be read' "$LOGF")" "0"
+ERRF="$ROOT/err.txt"
+said() { "$@" 2>&1 >/dev/null; }   # what a command printed on STDERR — the channel that reaches the log when the caller captures stdout
+eq "no file → none"                      "$(gate_phase_c_deferred_read 2>&1)" ""
+eq "…and no warning for a missing file"  "$(said gate_phase_c_deferred_read | wc -l | tr -d ' ')" "0"
 eq "nothing to record and no file → no file is created" "$(gate_phase_c_deferred_write ""; [ -e "$GATE_PHASE_C_DEFERRED_FILE" ] && echo created || echo none)" "none"
 mkdir -p "$ROOT/state"
 gate_phase_c_deferred_write "r3 r4"
@@ -119,21 +134,54 @@ gate_phase_c_deferred_write ""
 eq "recording 'none' clears it"          "$(gate_phase_c_deferred_read)" ""
 printf 'r1\nr2\t r3\n' > "$GATE_PHASE_C_DEFERRED_FILE"
 eq "newlines and tabs read as blanks"    "$(gate_phase_c_deferred_read)" "r1 r2  r3"
-# unreadable: a directory where the file should be
+# unreadable: a directory where the file should be. The dispatcher calls the reader as
+#     gate_phase_c_order_deferred_first "$JSON" "$(gate_phase_c_deferred_read)"
+# so STDOUT is captured and taken for the ids: the ids must be the only thing on it, and the warning must travel on STDERR (the log).
+# (Gate attempt 1 of ga-yjrg7n6: the warning was an echo to stdout, jq took it for an id and nothing reached the log.)
 rm -f "$GATE_PHASE_C_DEFERRED_FILE"; mkdir "$GATE_PHASE_C_DEFERRED_FILE"
-: > "$LOGF"
-eq "a directory in its place → none (natural order)" "$(gate_phase_c_deferred_read 2>/dev/null)" ""
-eq "…and it is said, not silent"         "$(grep -c 'exists but cannot be read' "$LOGF")" "1"
-: > "$LOGF"
-gate_phase_c_deferred_write "r1"; _rc=$?
+_IDS="$(gate_phase_c_deferred_read 2>"$ERRF")"
+eq "a directory in its place → no ids on stdout (natural order)" "$_IDS" ""
+eq "…and it is said on stderr, the channel that reaches the log" "$(grep -c 'exists but cannot be read' "$ERRF")" "1"
+: > "$ERRF"
+gate_phase_c_deferred_write "r1" 2>"$ERRF" >/dev/null; _rc=$?
 eq "a write that cannot land → rc 0 (the sweep goes on)" "$_rc" "0"
-eq "…and says so"                        "$(grep -c 'could not record the deferred run' "$LOGF")" "1"
+eq "…and says so (stderr)"               "$(grep -c 'could not record the deferred run' "$ERRF")" "1"
 eq "…and leaves no temp file"            "$(ls "$ROOT/state" | tr '\n' ' ')" "deferred "
 rm -rf "$GATE_PHASE_C_DEFERRED_FILE"
+# a write that fails must not leave the PREVIOUS list in place: its warning promises the natural order, and the old ids would put runs that were
+# reached since AHEAD of the ones just deferred. A temp path that is a directory makes the write fail while the old file stays removable.
+probe_stale() {   # probe_stale <dispatcher> → what the reader returns after a failed write on top of the list "r1 r2" ("" = the old list is gone)
+  (
+    export TMPDIR="$ROOT/tmp-probe"; mkdir -p "$TMPDIR"
+    GATE_DISPATCHER_LIB_ONLY=1 source "$1" >/dev/null 2>&1 || { echo "SOURCE_FAIL"; exit 0; }
+    set +e
+    warn() { :; }
+    D="$ROOT/stale-probe"; mkdir -p "$D"; GATE_PHASE_C_DEFERRED_FILE="$D/deferred"
+    printf 'r1 r2\n' > "$GATE_PHASE_C_DEFERRED_FILE"; mkdir -p "$GATE_PHASE_C_DEFERRED_FILE.tmp.$$"
+    gate_phase_c_deferred_write "r9" 2>/dev/null >/dev/null
+    gate_phase_c_deferred_read 2>/dev/null
+  )
+}
+eq "a failed write takes the previous list away too (the next round reads 'none', as the warning says)" "$(probe_stale "$DISPATCHER")" ""
+printf 'r1 r2\n' > "$GATE_PHASE_C_DEFERRED_FILE"; mkdir "$GATE_PHASE_C_DEFERRED_FILE.tmp.$$"
+: > "$ERRF"; gate_phase_c_deferred_write "r9" 2>"$ERRF" >/dev/null
+eq "…and the warning says it is the natural order" "$(grep -c 'could not record the deferred run.*natural order' "$ERRF")" "1"
+rmdir "$GATE_PHASE_C_DEFERRED_FILE.tmp.$$"; rm -f "$GATE_PHASE_C_DEFERRED_FILE"
+# …and when even the removal fails, the warning says THAT instead (a read-only state directory; root ignores the mode, so the case is skipped there)
+if [ "$(id -u)" != "0" ]; then
+  printf 'r1 r2\n' > "$GATE_PHASE_C_DEFERRED_FILE"; chmod a-w "$ROOT/state"
+  : > "$ERRF"; gate_phase_c_deferred_write "r9" 2>"$ERRF" >/dev/null
+  chmod u+w "$ROOT/state"
+  eq "a failed write whose previous list cannot be removed either → the warning says the next round starts from it" "$(grep -c 'previous list could not be removed' "$ERRF")" "1"
+  eq "…and that list is still there, unchanged" "$(gate_phase_c_deferred_read 2>/dev/null)" "r1 r2"
+  rm -f "$GATE_PHASE_C_DEFERRED_FILE"
+else
+  ok "(running as root: the read-only state directory case is skipped)"
+fi
 GATE_PHASE_C_DEFERRED_FILE="$ROOT/no-such-dir/deferred"
-: > "$LOGF"
-gate_phase_c_deferred_write "r1"; _rc=$?
-eq "a missing state dir → rc 0 and a warning" "$_rc|$(grep -c 'could not record the deferred run' "$LOGF")" "0|1"
+: > "$ERRF"
+gate_phase_c_deferred_write "r1" 2>"$ERRF" >/dev/null; _rc=$?
+eq "a missing state dir → rc 0 and a warning" "$_rc|$(grep -c 'could not record the deferred run' "$ERRF")" "0|1"
 GATE_PHASE_C_DEFERRED_FILE=""
 eq "no path configured → read is empty"  "$(gate_phase_c_deferred_read)" ""
 eq "no path configured → write is a no-op, rc 0" "$(gate_phase_c_deferred_write "r1"; echo $?)" "0"
@@ -145,7 +193,7 @@ ev_verdict_closed() {   # $1 = run id
 }
 # probe_midsweep <dispatcher> → one line per scenario, "name|children|bd-reads|defer-lines|pending-after-the-last-call". Runs in its own
 # shell: the dispatcher is sourced lib-only ONCE, bd and the child launcher are fakes, and the only thing that varies is the round's state.
-SCENARIOS="young waiting waiting-then-free spent off unmeasured garbage-start"
+SCENARIOS="young waiting waiting-then-free spent off unmeasured garbage-start admitted-last admitted-others-wait admitted-count-unreadable"
 probe_midsweep() {
   (
     export TMPDIR="$ROOT/tmp-probe"; mkdir -p "$TMPDIR"
@@ -161,10 +209,13 @@ probe_midsweep() {
       _gate_run_phase_c_child() { CHILD_N=$((CHILD_N+1)); return 0; }
       GATE_EVENTS_FILE="$F/events.jsonl"; : > "$GATE_EVENTS_FILE"
       GATE_LOCK_ENABLED=1; GATE_MIDSWEEP_ENABLED=1; GATE_PHASE_C_ONLY=0; GATE_PHASE_C_ENABLED=1
-      GATE_PREADMIT_BUDGET_SECS=150; GATE_ADMISSION_WAITING=0; GATE_ROUND_T0=$(date +%s)
+      GATE_PREADMIT_BUDGET_SECS=150; GATE_ADMISSION_WAITING=0; GATE_PREADMIT_ADMITTED=0; GATE_ROUND_T0=$(date +%s)
       case "$SC" in
         young) ;;
         waiting|waiting-then-free) GATE_ADMISSION_WAITING=1 ;;
+        admitted-*)   # "Found N" was seen, the budget is long spent, and the admission step ran with N queued markers — through the real function
+          GATE_ADMISSION_WAITING=1; GATE_ROUND_T0=$(( $(date +%s) - 400 ))
+          case "$SC" in admitted-last) gate_preadmit_mark_admitted 1 ;; admitted-others-wait) gate_preadmit_mark_admitted 3 ;; *) gate_preadmit_mark_admitted many ;; esac ;;
         spent) GATE_ROUND_T0=$(( $(date +%s) - 400 )) ;;
         off) GATE_PREADMIT_BUDGET_SECS=0; GATE_ADMISSION_WAITING=1; GATE_ROUND_T0=$(( $(date +%s) - 400 )) ;;
         unmeasured) GATE_ROUND_T0="" ;;
@@ -183,13 +234,16 @@ PM_REAL="$(probe_midsweep "$DISPATCHER")"
 pm() { printf '%s\n' "$1" | grep "^$2|" | head -1 | cut -d'|' -f2-; }   # pm <probe-output> <scenario>
 eq "control: a young round, nothing waiting → the child starts once (2 confirming reads)" "$(pm "$PM_REAL" young)" "1|2|0|"
 eq "a marker is waiting → NO child, NO bd read, the candidate is kept, said once for two safe points" "$(pm "$PM_REAL" waiting)" "0|0|1|pending"
-eq "…and when the marker has been admitted (not waiting any more) the kept candidate is collected, not lost" "$(pm "$PM_REAL" waiting-then-free)" "1|2|1|"
+eq "…the deferral reads the flag live: once it is lowered the kept candidate is collected, not lost (unit level; production lowers it only at admission, below)" "$(pm "$PM_REAL" waiting-then-free)" "1|2|1|"
 eq "the round spent its budget → NO child, the candidate is kept" "$(pm "$PM_REAL" spent)" "0|0|1|pending"
 eq "budget 0 (the kill switch) → the old behaviour: the child starts although a marker waits and the budget is long spent" "$(pm "$PM_REAL" off)" "1|2|0|"
 eq "round start unknown (lib-only / a clock that could not be read) → no deferral" "$(pm "$PM_REAL" unmeasured)" "1|2|0|"
 eq "round start not a number → no deferral" "$(pm "$PM_REAL" garbage-start)" "1|2|0|"
+eq "the LAST queued marker is admitted (1 queued): the ACK-wait pass is allowed again although the budget is long spent — it is a PRE-admission budget" "$(pm "$PM_REAL" admitted-last)" "1|2|0|"
+eq "…with other markers still queued (3) the pass stays deferred" "$(pm "$PM_REAL" admitted-others-wait)" "0|0|1|pending"
+eq "…and a count that cannot be read keeps it deferred (nothing is collected ahead of a marker on a guess)" "$(pm "$PM_REAL" admitted-count-unreadable)" "0|0|1|pending"
 case "$(cat "$ROOT/probe-spent/log")" in
-  *"this round already spent its 150s pre-admission budget"*"next round's Phase C does (ga-yjrg7n6)"*) ok "the log line says why and who collects instead" ;;
+  *"this round already spent its 150s pre-admission budget"*"next round's Phase C (ga-yjrg7n6)"*) ok "the log line says why and who collects instead" ;;
   *) bad "the deferral line does not say why / who collects: $(cat "$ROOT/probe-spent/log")" ;;
 esac
 case "$(cat "$ROOT/probe-waiting/log")" in *"a queued marker is waiting for admission"*) ok "…and for a waiting marker, that reason" ;; *) bad "no 'queued marker is waiting' reason" ;; esac
@@ -226,13 +280,15 @@ case "$*" in
       s="${s:+$s,}{\"id\":\"r$i\",\"title\":\"gate-run: br$i (b$i)\",\"description\":\"$d\"}"
     done
     echo "[$s]" ;;
+  *gate-status:queued*)   # one queued marker: the round reaches "Found 1 queued marker(s)" and the admission measurement, then the headroom probe fails CLOSED
+    echo '[{"id":"m9","title":"gate-marker: br9 (b9)","labels":["type:quality-gate-marker","gate-status:queued"],"description":"source_bead: b9\nbranch: br9\nauthor: x\nrig: norig","created_at":"2026-10-29T00:00:00Z","priority":2,"issue_type":"bug"}]' ;;
   *"--json"*) echo "[]" ;;
 esac
 exit 0
 FAKEBD
 cat > "$ROOT/fakebin/gc" <<'FAKEGC'
 #!/bin/bash
-case "$*" in *"rig list"*) sleep 3; echo '{"rigs":[]}' ;; esac
+case "$*" in *"rig list"*) sleep "${FAKE_RIG_SLEEP:-3}"; echo '{"rigs":[]}' ;; esac
 exit 0
 FAKEGC
 chmod +x "$ROOT/fakebin/bd" "$ROOT/fakebin/gc"
@@ -272,7 +328,10 @@ D1="$(cat "$DEFERRED2" 2>/dev/null | tr -d '\n')"
 eq "the runs it started plus the runs it wrote down are the four, each once" "$(printf '%s %s' "$R1" "$D1" | tr ' ' '\n' | grep '^r' | sort -u | wc -l | tr -d ' ')|$(n_words "$R1")+$(n_words "$D1")" "4|$(n_words "$R1")+$(n_words "$D1")"
 eq "…and they add up (nothing started AND deferred, nothing in neither)" "$(( $(n_words "$R1") + $(n_words "$D1") ))" "4"
 case "$(cat "$LOG2")" in *"pre-admission budget of 5s spent after"*"left for the next round, which checks them first: $D1 (ga-yjrg7n6)"*) ok "the log says the budget was spent and which runs wait" ;; *) bad "no 'budget spent … left for the next round: $D1' line" ;; esac
-case "$(cat "$LOG2")" in *"Pre-admission: reached admission"*"Phase C left $D1 for the next round"*|*"No queued markers. Exiting."*) ok "the round ends or reaches admission (nothing is queued in the scratch city)" ;; *) bad "round 1 did not reach the end of Step 0b" ;; esac
+case "$(cat "$LOG2")" in
+  *"Found 1 queued marker(s)"*"Pre-admission: reached admission "*"s after the sweep start (budget 5s; Phase C left $D1 for the next round) (ga-yjrg7n6)."*) ok "the round reaches admission and the measurement line names what it left for the next one: [$D1]" ;;
+  *) bad "no 'Pre-admission: reached admission … (budget 5s; Phase C left $D1 for the next round)' after 'Found 1 queued marker(s)': $(grep -E 'Found|Pre-admission' "$LOG2" | cut -c1-200 | tr '\n' '|')" ;;
+esac
 
 # FURTHER ROUNDS: the deferred runs go first, so the rounds walk the whole list instead of re-checking the head of it
 PREV_D="$D1"; COVER="$R1"; ROUNDS=1; FIRST_OK=1
@@ -291,10 +350,41 @@ eq "…and the rounds covered all four runs within four rounds (none is starved 
 
 # CONTROL: budget 0 is the old behaviour
 rm -f "$CITY2/.gc/gate-phase-c-deferred"
-sweep "$STAGED" 0; _rc=$?
+FAKE_RIG_SLEEP=1 sweep "$STAGED" 0; _rc=$?
 eq "budget 0: one round checks all four in-flight runs (the old behaviour)" "$(reached)" "r1 r2 r3 r4"
 eq "…and writes no deferred file" "$([ -e "$DEFERRED2" ] && echo exists || echo none)" "none"
 case "$(cat "$LOG2")" in *"pre-admission budget of"*) bad "budget 0 still logged a budget line" ;; *) ok "…and logs no budget line" ;; esac
+case "$(cat "$LOG2")" in *"Pre-admission: reached admission "*"(budget 0s; Phase C left none for the next round)"*) ok "…and the measurement line says budget 0s, left none" ;; *) bad "budget 0: no 'Pre-admission … (budget 0s; Phase C left none …)' line: $(grep 'Pre-admission' "$LOG2" | cut -c1-200)" ;; esac
+
+# THE REPRO OF THE FIRST GATE VERDICT: a DIRECTORY where the deferred-run file belongs. The reader and the writer both fail and both must be in
+# the log of the real process. The reader's word used to be an echo to stdout inside the $( ) that hands the ids to jq, and never got there.
+rm -rf "$DEFERRED2"; mkdir "$DEFERRED2"
+FAKE_RIG_SLEEP=0 sweep "$STAGED" 5; _rc=$?
+eq "a directory in place of the deferred file: the round still ends normally" "$_rc" "0"
+eq "…the real log says the file exists but cannot be read" "$(grep -c 'exists but cannot be read' "$LOG2")" "1"
+eq "…and, at the end of Phase C, that the deferred run(s) could not be recorded" "$(grep -c 'could not record the deferred run' "$LOG2")" "1"
+eq "…the runs were checked in their natural order (there was nothing readable to rotate by)" "$(reached)" "r1 r2 r3 r4"
+rm -rf "$DEFERRED2"
+
+# THE LISTING OF THE RUNS LEFT FAILS (a jq that cannot read the array it parsed a moment ago: practically unreachable, so a shim makes it happen).
+# The loop must go on and check the rest as it did before the budget existed, and the log must say so, once.
+jq_shim_on() {   # a jq that fails ONLY the program that lists the runs left (when FAKE_JQ_FAIL_REST is set) and passes everything else through
+  cat > "$ROOT/fakebin/jq" <<'FAKEJQ'
+#!/bin/bash
+case "$*" in *'.[$i:]'*) [ -n "${FAKE_JQ_FAIL_REST:-}" ] && exit 5 ;; esac
+exec "${REAL_JQ:?}" "$@"
+FAKEJQ
+  chmod +x "$ROOT/fakebin/jq"
+  export REAL_JQ="$(command -v jq)"
+}
+jq_shim_off() { rm -f "$ROOT/fakebin/jq"; }
+jq_shim_on
+FAKE_RIG_SLEEP=1 FAKE_JQ_FAIL_REST=1 sweep "$STAGED" 1; _rc=$?
+eq "a jq that cannot list the runs left: the round ends normally" "$_rc" "0"
+eq "…it checks all four runs, as it did before the budget" "$(reached)" "r1 r2 r3 r4"
+eq "…and says so, once" "$(grep -c 'runs still to check could not be listed' "$LOG2")" "1"
+eq "…and records nothing as deferred" "$([ -s "$DEFERRED2" ] && echo recorded || echo none)" "none"
+jq_shim_off
 
 # THE CHILD: handed exactly the runs to collect, it does not stop for the budget and does not reorder
 mkdir -p "$LOCK2"
@@ -325,6 +415,66 @@ if [ -n "$M" ]; then
   eq "mutant: a Phase C whose budget never fires checks all four runs again (the check goes red)" "$(reached)" "r1 r2 r3 r4"
 else bad "mutant nobreak: the anchor line is not there exactly once"; fi
 rm -f "$DEFERRED2"
+# the reader's warning back on stdout (the defect of gate attempt 1): the real process with a directory in place of the file goes red
+M="$(mutant_sub stdoutwarn 'natural order this round (ga-yjrg7n6)." >&2' 'natural order this round (ga-yjrg7n6)."')"
+if [ -n "$M" ]; then
+  MS="$(stage_dispatcher "$M" mutant-stdoutwarn.sh)"
+  rm -rf "$DEFERRED2"; mkdir "$DEFERRED2"
+  FAKE_RIG_SLEEP=0 sweep "$MS" 5
+  eq "mutant: the reader's warning on stdout again → no 'cannot be read' line in the real log (the check goes red)" "$(grep -c 'exists but cannot be read' "$LOG2")" "0"
+  rm -rf "$DEFERRED2"
+else bad "mutant stdoutwarn: the anchor line is not there exactly once"; fi
+# a failed write that leaves the previous list in place
+M="$(mutant_sub keepstale 'if [ -f "$_f" ] && ! rm -f "$_f" 2>/dev/null; then' 'if false && [ -f "$_f" ] && ! rm -f "$_f" 2>/dev/null; then')"
+if [ -n "$M" ]; then
+  eq "mutant: the previous list is not taken away → the next round would start from it (the check goes red)" "$(probe_stale "$M")" "r1 r2"
+else bad "mutant keepstale: the anchor line is not there exactly once"; fi
+# the reorder that cannot reorder says nothing
+probe_reorder_said() {   # probe_reorder_said <dispatcher> → lines on stderr when it is handed something that is not an array
+  (
+    export TMPDIR="$ROOT/tmp-probe"; mkdir -p "$TMPDIR"
+    GATE_DISPATCHER_LIB_ONLY=1 source "$1" >/dev/null 2>&1 || { echo "SOURCE_FAIL"; exit 0; }
+    set +e
+    warn() { printf 'WARN %s\n' "$*"; }
+    gate_phase_c_order_deferred_first "garbage" "r1" 2>&1 >/dev/null | wc -l | tr -d ' '
+  )
+}
+eq "the reorder that cannot reorder says so once" "$(probe_reorder_said "$DISPATCHER")" "1"
+M="$(mutant_sub silentreorder 'warn "Phase C: the list of in-flight runs could not be reordered' ': "Phase C: the list of in-flight runs could not be reordered')"
+if [ -n "$M" ]; then
+  eq "mutant: the reorder keeps quiet again (the check goes red)" "$(probe_reorder_said "$M")" "0"
+else bad "mutant silentreorder: the anchor line is not there exactly once"; fi
+# the waiting flag never comes down at admission
+M="$(mutant_sub noreset '[ "$((10#$1))" -gt 1 ] || GATE_ADMISSION_WAITING=0' '[ "$((10#$1))" -gt 1 ] || :')"
+if [ -n "$M" ]; then
+  PM_MUT="$(probe_midsweep "$M")"
+  eq "mutant: the flag is never lowered at admission → the ACK-wait pass stays deferred after the last marker (the check goes red)" "$(pm "$PM_MUT" admitted-last)" "0|0|1|pending"
+else bad "mutant noreset: the anchor line is not there exactly once"; fi
+# a jq that cannot list the runs left, and the loop keeps asking (said three times) / says nothing
+M="$(mutant_sub nocutoff 'PC_DEFERRED_IDS=""; PC_CUT_OFF=1' 'PC_DEFERRED_IDS=""')"
+if [ -n "$M" ]; then
+  MS="$(stage_dispatcher "$M" mutant-nocutoff.sh)"
+  jq_shim_on
+  FAKE_RIG_SLEEP=1 FAKE_JQ_FAIL_REST=1 sweep "$MS" 1
+  jq_shim_off
+  eq "mutant: the loop asks again on every run → the warning is repeated (the check goes red)" "$(grep -c 'runs still to check could not be listed' "$LOG2")" "3"
+else bad "mutant nocutoff: the anchor line is not there exactly once"; fi
+rm -f "$DEFERRED2"
+
+# the admission step lowers the flag between the gate-run bead and the ACK-wait safe point (the scratch city never gets that far)
+admit_wiring_ok() {   # admit_wiring_ok <dispatcher file> → rc 0 iff gate_preadmit_mark_admitted is called after GATE_ADMITTING_RUN is set and before step-7b-ack
+  local f="$1" a m k
+  a="$(grep -n -F -- 'GATE_ADMITTING_RUN="$GATE_RUN_ID"' "$f" | head -1 | cut -d: -f1)"
+  m="$(grep -n -F -- 'gate_preadmit_mark_admitted "${COUNT:-}"' "$f" | head -1 | cut -d: -f1)"
+  k="$(grep -n -F -- 'gate_midsweep_collect "step-7b-ack"' "$f" | head -1 | cut -d: -f1)"
+  [ -n "$a" ] && [ -n "$m" ] && [ -n "$k" ] && [ "$m" -gt "$a" ] && [ "$m" -lt "$k" ]
+}
+if admit_wiring_ok "$DISPATCHER"; then ok "the admission step calls gate_preadmit_mark_admitted after the gate-run bead and before the ACK-wait safe point"
+else bad "gate_preadmit_mark_admitted is not called between GATE_ADMITTING_RUN and step-7b-ack"; fi
+M="$(mutant_sub nocall 'gate_preadmit_mark_admitted "${COUNT:-}"' ':')"
+if [ -n "$M" ]; then
+  if admit_wiring_ok "$M"; then bad "mutant: the call removed → the wiring check still passes"; else ok "mutant: the call removed → the wiring check goes red"; fi
+else bad "mutant nocall: the anchor line is not there exactly once"; fi
 
 # wiring that no run of the scratch city reaches (nothing is queued there): the round start is stamped at the banner, the waiting flag
 # is raised after "Found N" and before the first safe point that can start a child with a marker waiting.

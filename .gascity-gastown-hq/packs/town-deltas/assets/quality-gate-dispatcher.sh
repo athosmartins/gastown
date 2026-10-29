@@ -2910,14 +2910,23 @@ GATE_PHASE_C_ONLY_NOTRUN_RC=75
 #   · Phase C stops STARTING a new in-flight run once the budget is spent (a run being finalized is never cut). The runs it did not
 #     reach are written to GATE_PHASE_C_DEFERRED_FILE and are the FIRST thing the next round's Phase C checks, so a long list is
 #     covered over successive rounds and the tail is not starved. Dead-reviewer detection is not weakened: it fires at a run's
-#     verdict timeout (22-50 min) or on a confirmed-closed session, and a deferred run is checked within one round.
-#   · gate_midsweep_collect keeps its candidates (it does not start a child) while the budget is spent or a marker is already
-#     waiting for admission. The next round's Phase C collects them, as it always did for a verdict that landed late.
+#     verdict timeout (22-50 min) or on a confirmed-closed session, and a deferred run is checked the next round when it heads the
+#     deferred list, one round later for each deferred run ahead of it (a run is only judged when it is checked).
+#   · gate_midsweep_collect keeps its candidates (it does not start a child) while a marker waits for admission, and — BEFORE the
+#     marker is admitted — while the budget is spent. The next round's Phase C collects them, as it always did for a verdict that
+#     landed late; so does a later safe point of this round once the last queued marker has been admitted (gate_preadmit_mark_admitted).
+#     Cost of both: a finished run waits for its finalize until the next round (and one behind it in the deferred list, longer:
+#     the runbook, "A admissão não espera o Phase C", has the bound).
+# When GATE_PHASE_C_DEFERRED_FILE cannot be used the log says so, every round (the three helpers print their warning on STDERR: their
+# callers capture stdout). Unreadable → the natural order that round. Unwritable → the same next round, so the tail of a long list is
+# not reached while the head runs stay in flight, and its finalize — and its timeout — wait until they end. That is what the budget
+# costs in a broken state directory: visible in the log, a delay, not a lost run.
 GATE_PREADMIT_BUDGET_SECS="${GATE_PREADMIT_BUDGET_SECS:-150}"
 case "$GATE_PREADMIT_BUDGET_SECS" in ''|*[!0-9]*) GATE_PREADMIT_BUDGET_SECS=150 ;; esac    # a typo is the default, not "off" and not "no limit"
 GATE_PREADMIT_BUDGET_SECS=$(printf '%s' "$GATE_PREADMIT_BUDGET_SECS" | sed 's/^0*\([0-9]\)/\1/')
 GATE_PHASE_C_DEFERRED_FILE="${GATE_PHASE_C_DEFERRED_FILE:-${GC_CITY:-}/.gc/gate-phase-c-deferred}"
-GATE_ADMISSION_WAITING=0     # 1 once "Found N queued marker(s)" saw N > 0 in THIS round
+GATE_ADMISSION_WAITING=0     # 1 from "Found N queued marker(s)" (N > 0) until this round's marker is admitted and no other one is queued
+GATE_PREADMIT_ADMITTED=0     # 1 once this round's marker has its gate-run bead: the budget is a PRE-admission budget and stops applying
 GATE_ROUND_T0=""             # epoch at the sweep banner of THIS process; empty in a Phase-C-only child and in lib-only mode
 
 # Pure. $1 = round start epoch, $2 = now, $3 = budget in seconds. rc 0 iff the budget is SPENT.
@@ -2938,7 +2947,8 @@ gate_preadmit_budget_spent() {
 # those runs FIRST, in the order of $2 (the previous round's own order — that is what makes the rounds a rotation: a run it
 # deferred was never reached, one it wrapped to the tail goes after the unreached ones); the others follow in the order they came
 # in. A listed id that is not running any more is ignored. vazio → the array unchanged (nothing was deferred);
-# falhou/ilegível ($1 not an array, jq failing) → $1 unchanged, never an empty list: the old order is the inert state.
+# falhou/ilegível ($1 not an array, jq failing) → $1 unchanged, never an empty list: the old order is the inert state — and said, on
+# STDERR (stdout is the array its caller captures).
 # SELFTEST-EXTRACT gate-phase-c-order-fn: BEGIN
 gate_phase_c_order_deferred_first() {
   local _out
@@ -2949,26 +2959,30 @@ gate_phase_c_order_deferred_first() {
     ' 2>/dev/null) && [ -n "$_out" ]; then
     printf '%s' "$_out"
   else
+    warn "Phase C: the list of in-flight runs could not be reordered (not a JSON array, or jq failed) — checking them in the order they came (ga-yjrg7n6)." >&2
     printf '%s' "${1-}"
   fi
 }
 # SELFTEST-EXTRACT gate-phase-c-order-fn: END
 
 # The runs the previous round's Phase C left unchecked, one line of blank-separated ids; "" when there are none.
-# vazio / file absent → "" (nothing was deferred). falhou/ilegível (a directory, no permission) → "" too, and said once: the
-# order is then the natural one, which only costs the fairness, never a run.
+# vazio / file absent → "" (nothing was deferred). falhou/ilegível (a directory, no permission) → "" too (the natural order this
+# round), and said — on STDERR: the caller is  gate_phase_c_order_deferred_first "$JSON" "$(gate_phase_c_deferred_read)", so what
+# this prints on stdout IS the ids, and a warning there would be handed to jq as one and never reach the log (gate attempt 1).
 gate_phase_c_deferred_read() {
   local _f="${GATE_PHASE_C_DEFERRED_FILE:-}" _txt
   [ -n "$_f" ] && [ -e "$_f" ] || return 0
   if ! _txt=$(cat "$_f" 2>/dev/null); then
-    warn "Phase C: $_f exists but cannot be read — in-flight runs are checked in their natural order this round (ga-yjrg7n6)."
+    warn "Phase C: $_f exists but cannot be read — in-flight runs are checked in their natural order this round (ga-yjrg7n6)." >&2
     return 0
   fi
   printf '%s' "$_txt" | tr '\n\t' '  '
 }
 
 # $1 = the ids this round's Phase C left unchecked ("" = none). Atomic (tmp + mv). With nothing to record and no file there is
-# nothing to do (no state churn on a healthy gate). A write that fails is said and costs only the fairness of the next round.
+# nothing to do (no state churn on a healthy gate). A write that fails is said (stderr, like the reader) and the PREVIOUS list is
+# taken away: left in place it would put runs that were reached since ahead of the ones just deferred, and the warning says
+# "natural order". If even that removal fails the warning says that instead.
 gate_phase_c_deferred_write() {
   local _f="${GATE_PHASE_C_DEFERRED_FILE:-}" _tmp
   [ -n "$_f" ] || return 0
@@ -2979,12 +2993,18 @@ gate_phase_c_deferred_write() {
     return 0
   fi
   rm -f "$_tmp" 2>/dev/null || true
-  warn "Phase C: could not record the deferred run(s) in $_f — the next round checks in-flight runs in their natural order (ga-yjrg7n6)."
+  if [ -f "$_f" ] && ! rm -f "$_f" 2>/dev/null; then
+    warn "Phase C: could not record the deferred run(s) in $_f, and the previous list could not be removed either — the next round starts from that list (ga-yjrg7n6)." >&2
+    return 0
+  fi
+  warn "Phase C: could not record the deferred run(s) in $_f — the next round checks in-flight runs in their natural order (ga-yjrg7n6)." >&2
   return 0
 }
 
-# rc 0 iff gate_midsweep_collect should NOT start a child pass now: finalize-side work is ahead of a marker that is waiting, or the
-# round already spent its budget. Off with GATE_PREADMIT_BUDGET_SECS=0. Sets GATE_PREADMIT_DEFER_WHY for the log line.
+# rc 0 iff gate_midsweep_collect should NOT start a child pass now: finalize-side work is ahead of a marker that is waiting, or —
+# before this round's marker is admitted — the round already spent its budget. Off with GATE_PREADMIT_BUDGET_SECS=0. Sets
+# GATE_PREADMIT_DEFER_WHY for the log line. After the admission (GATE_PREADMIT_ADMITTED=1) only a marker still waiting defers: the
+# budget is for the time BEFORE admission, and a pass in the ACK wait of the last queued marker delays nobody.
 gate_preadmit_defer_midsweep() {
   GATE_PREADMIT_DEFER_WHY=""
   [ "${GATE_PREADMIT_BUDGET_SECS:-0}" != "0" ] || return 1
@@ -2992,11 +3012,23 @@ gate_preadmit_defer_midsweep() {
     GATE_PREADMIT_DEFER_WHY="a queued marker is waiting for admission"
     return 0
   fi
+  [ "${GATE_PREADMIT_ADMITTED:-0}" != "1" ] || return 1
   if gate_preadmit_budget_spent "${GATE_ROUND_T0:-}" "$(date +%s)" "$GATE_PREADMIT_BUDGET_SECS"; then
     GATE_PREADMIT_DEFER_WHY="this round already spent its ${GATE_PREADMIT_BUDGET_SECS}s pre-admission budget"
     return 0
   fi
   return 1
+}
+
+# Called (directly, it sets globals) once this round's marker has its gate-run bead. $1 = the queued markers this round found. A round
+# admits ONE marker and then re-execs for the next, so once it is admitted a marker is still waiting iff more than one was queued:
+# only then does the waiting flag stay up. vazio / ilegível count → the flag stays up (the state the round was already in: nothing is
+# collected ahead of a marker on a guess).
+gate_preadmit_mark_admitted() {
+  GATE_PREADMIT_ADMITTED=1
+  case "${1:-}" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$((10#$1))" -gt 1 ] || GATE_ADMISSION_WAITING=0
+  return 0
 }
 
 # rc 0 iff THIS process is a Phase-C-only child entitled to borrow the lock.
@@ -3162,14 +3194,15 @@ gate_midsweep_collect() {
 $_cand"
   GATE_MIDSWEEP_PENDING=""
   case "$_cand" in *[![:space:]]*) ;; *) return 0 ;; esac
-  # ga-yjrg7n6: a child pass is a finalize (2.5-4 min measured). While a marker waits for admission, or once the round spent its
-  # pre-admission budget, the candidates stay pending instead: the next round's Phase C collects them, which is what happened to
-  # every verdict that landed late before ga-bk5j8u.1. Said once per sweep, with the ids.
+  # ga-yjrg7n6: a child pass is a finalize (2.5-4 min measured). While a marker waits for admission, or (before this round's marker is
+  # admitted) once the round spent its pre-admission budget, the candidates stay pending instead. They are collected by a later safe
+  # point of this round if the deferral ends (the last queued marker admitted: its ACK wait), else by the next round's Phase C — which
+  # is what happened to every verdict that landed late before ga-bk5j8u.1. Said once per sweep, with the ids.
   if gate_preadmit_defer_midsweep; then
     GATE_MIDSWEEP_PENDING="$_cand"
     if [ "${GATE_PREADMIT_DEFER_LOGGED:-0}" != "1" ]; then
       GATE_PREADMIT_DEFER_LOGGED=1
-      log "Mid-sweep ($_where): verdict(s) closed for run(s) $(printf '%s' "$_cand" | tr '\n' ' ' | sed 's/^ *//; s/ *$//') but ${GATE_PREADMIT_DEFER_WHY} — NOT collecting now; the next round's Phase C does (ga-yjrg7n6)."
+      log "Mid-sweep ($_where): verdict(s) closed for run(s) $(printf '%s' "$_cand" | tr '\n' ' ' | sed 's/^ *//; s/ *$//') but ${GATE_PREADMIT_DEFER_WHY} — NOT collecting now; kept for a later safe point of this round or the next round's Phase C (ga-yjrg7n6)."
     fi
     return 0
   fi
@@ -13663,10 +13696,15 @@ fi
 # finalized, so admission does not need all of Phase C: after
 # GATE_PREADMIT_BUDGET_SECS (default 150 s from the sweep banner) no NEW run is
 # started and the rest go first in the next round (GATE_PHASE_C_DEFERRED_FILE).
-# What deferral does cost: a finished REMOTE reviewer keeps its slot on the node
-# until its run is finalized (cleanup_reviewer_sessions closes it; the node's
-# idle_timeout is the backstop), so a deferred run holds it for one more round —
-# which is why deferred runs are checked first, not last.
+# What deferral does cost: (1) a finished REMOTE reviewer keeps its slot on the
+# node until its run is finalized (cleanup_reviewer_sessions closes it; the
+# node's idle_timeout is the backstop), so a deferred run holds it for one more
+# round — which is why deferred runs are checked first, not last. (2) A run that
+# is READY to finalize waits for its turn: the head of the deferred list is
+# checked first next round, the ones behind it one round later each, so with k
+# runs reached per round (several when each is only "still in flight", ONE when
+# a 2.5-4 min finalize comes first) the last of N waits up to ceil(N/k) rounds.
+# By reading the code, not measured.
 #
 # Context for each running gate-run is re-derived from its bead state (never
 # from process-local variables — a DIFFERENT process may have claimed it):
@@ -13712,7 +13750,7 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
     # ga-yjrg7n6: the pre-admission budget. The runs the previous round did not reach go first (gate_phase_c_order_deferred_first);
     # once the budget is spent no NEW run is started below (one whose finalize is running is never cut) and the rest are written
     # down for the next round. A Phase-C-only child is handed exactly the runs to collect, so it neither reorders nor stops.
-    PC_BUDGET_ON=0; PC_STARTED_N=0; PC_DEFERRED_IDS=""
+    PC_BUDGET_ON=0; PC_STARTED_N=0; PC_DEFERRED_IDS=""; PC_CUT_OFF=0
     if [ "${GATE_PHASE_C_ONLY:-0}" != "1" ] && [ "${GATE_PREADMIT_BUDGET_SECS:-0}" != "0" ]; then
       PC_BUDGET_ON=1
       PHASE_C_RUNNING_JSON=$(gate_phase_c_order_deferred_first "$PHASE_C_RUNNING_JSON" "$(gate_phase_c_deferred_read)")
@@ -13742,16 +13780,18 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
       # disabled or its dir is absent (token-guarded write, 2>/dev/null).
       if [ "$GATE_LOCK_ENABLED" = "1" ]; then _gate_lock_write_hb; fi
       # ga-yjrg7n6: budget spent → leave the runs from here on to the next round. At least one run is always started (the budget
-      # can be spent before Phase C even begins), so a round never makes zero progress. vazio → nothing is deferred and the loop
-      # goes on; falhou (jq cannot list the rest) → the loop goes on too: reading the rest wrong must not cut a run, only cost time.
-      if [ "$PC_BUDGET_ON" = "1" ] && [ "$PC_STARTED_N" -gt 0 ] \
+      # can be spent before Phase C even begins), so a round never makes zero progress. vazio (no id in the rest) → nothing is
+      # deferred and the loop goes on; falhou (jq cannot list the rest) → said, once, and the loop goes on for the rest of the round
+      # as it did before the budget: a list that could not be read must not cut a run, only cost time.
+      if [ "$PC_BUDGET_ON" = "1" ] && [ "$PC_CUT_OFF" != "1" ] && [ "$PC_STARTED_N" -gt 0 ] \
          && gate_preadmit_budget_spent "${GATE_ROUND_T0:-}" "$(date +%s)" "$GATE_PREADMIT_BUDGET_SECS"; then
-        if PC_DEFERRED_IDS=$(printf '%s' "$PHASE_C_RUNNING_JSON" | jq -r --argjson i "$PC_I" '[ .[$i:][] | .id // empty ] | join(" ")' 2>/dev/null) \
-           && [ -n "$PC_DEFERRED_IDS" ]; then
+        if ! PC_DEFERRED_IDS=$(printf '%s' "$PHASE_C_RUNNING_JSON" | jq -r --argjson i "$PC_I" '[ .[$i:][] | .id // empty ] | join(" ")' 2>/dev/null); then
+          PC_DEFERRED_IDS=""; PC_CUT_OFF=1
+          warn "Phase C: the pre-admission budget is spent, but the list of runs still to check could not be listed — checking them now, as before the budget (ga-yjrg7n6)."
+        elif [ -n "$PC_DEFERRED_IDS" ]; then
           log "Phase C: pre-admission budget of ${GATE_PREADMIT_BUDGET_SECS}s spent after $(( $(date +%s) - GATE_ROUND_T0 ))s — $((PHASE_C_COUNT - PC_I)) of ${PHASE_C_COUNT} in-flight run(s) left for the next round, which checks them first: ${PC_DEFERRED_IDS} (ga-yjrg7n6)."
           break
         fi
-        PC_DEFERRED_IDS=""
       fi
       PC_STARTED_N=$((PC_STARTED_N + 1))
       PC_RUN=$(printf '%s' "$PHASE_C_RUNNING_JSON" | jq ".[$PC_I]")
@@ -14892,7 +14932,8 @@ if [ "$COUNT" = "0" ]; then
   log "No queued markers. Exiting."
   exit 0
 fi
-# ga-yjrg7n6: from here a marker waits for admission — gate_midsweep_collect starts no child pass ahead of it. The line is the
+# ga-yjrg7n6: from here a marker waits for admission — gate_midsweep_collect starts no child pass ahead of it (until the admission
+# step lowers the flag for the LAST queued marker: gate_preadmit_mark_admitted, after the gate-run bead). The line is the
 # measurement: seconds from this round's banner to the admission path (the 29/10 00:49 round took ~13 min), and what was deferred.
 GATE_ADMISSION_WAITING=1
 log "Pre-admission: reached admission ${GATE_ROUND_T0:+$(( $(date +%s) - GATE_ROUND_T0 ))s }after the sweep start (budget ${GATE_PREADMIT_BUDGET_SECS}s; Phase C left ${PC_DEFERRED_IDS:-none} for the next round) (ga-yjrg7n6)."
@@ -19222,6 +19263,10 @@ log "Gate-run bead: $GATE_RUN_ID"
 # bookkeeping below; a mid-sweep pass never collects it (a child finalizing it underneath would race that). A verdict
 # that lands this early waits for the next sweep's Phase C, exactly as before.
 GATE_ADMITTING_RUN="$GATE_RUN_ID"
+# ga-yjrg7n6: the marker of this round is admitted. The pre-admission budget stops applying, and the waiting flag comes down unless
+# other markers are still queued (this round admits one and re-execs for the next): the ACK wait below (step-7b-ack) is idle time, and
+# a verdict that landed is collected there as before the budget existed when nobody waits behind this run.
+gate_preadmit_mark_admitted "${COUNT:-}"
 # ga-ub8yq: one self-contained record joining run+bead+size, keyed by GATE_RUN_ID
 # (unique per attempt) so gate-review-size-report.py can pair each attempt with
 # its own "Gate run complete: gate_run=..." verdict line without guessing from

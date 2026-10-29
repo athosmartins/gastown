@@ -7,8 +7,10 @@
 # Ligar, provar e as decisões do Mayor: docs/runbooks/gate-reviewer-remote.md.
 #
 # max_active_sessions = 3 (era 2; ga-yjrg7n6): o nó tem teto 6 no total (`cap` em .gc/session-ssh.json, dividido entre todas as sessões `*-remote-*`:
-# dog-remote usa até 1 na prática, wa-worker-remote 0-1) e o run de código usa 1 revisor (ga-5hdsr), então 3 = três runs ao mesmo tempo no nó
-# e ainda 3 vagas de folga para os outros templates remotos. Medido em 29/10 00:4x-01:3x: o que barrou o nó foi ESTE teto ("Reviewer 1: full (node
+# dog-remote usa até 1 na prática, wa-worker-remote 0-1) e o run de código usa 1 revisor (ga-5hdsr), então 3 = três runs ao mesmo tempo no nó.
+# Folga para os outros templates remotos: NÃO garantida. Os tetos deles (dog-remote 3, wa-worker-remote 3, mais ps/kimi 1 cada) somam com este
+# mais que o cap 6 do host; quem limita é o cap do host (a lib confere o total do nó antes do teto do template e o provider recusa no flock:
+# o revisor cai para o local, sem sessão fantasma). Medido em 29/10 00:4x-01:3x: o que barrou o nó foi ESTE teto ("Reviewer 1: full (node
 # has 2 of 2 gate-reviewer-remote sessions) - local reviewer") e às 01:2x o nó estava em load 7/16 núcleos com 18 GB livres (ga-n4ql4ur, ga-yjrg7n6). O fallback não muda: nó
 # cheio/unready/unknown = revisor local; conta do Claude do nó esgotada (`hetzner-claude.py gate` ≠ ok) = local. E 1 seria lido pelo guarda
 # crew-session-dedup como sessão única e mataria o 2º start (por isso o piso é 2; nunca volte a 1).
