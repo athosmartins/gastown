@@ -1,34 +1,22 @@
 #!/usr/bin/env python3
 r"""rm-target-guard.py — hook PreToolUse (Bash) que recusa REMOVER o que não é descartável, julgando o ALVO e não a grafia do comando (ga-id0im4e).
-Nasceu da medição de ga-nkfwixz (guard-oracle-diff.md §3, no branch fix/ga-nkfwixz-secret-read-guard): a regra `Bash(rm -rf:*)` casa TEXTO e só barrou 2 de 7 grafias (`bash -c`, `env`); `rm -fr`,
-`rm -r -f`, `rm --recursive --force`, `/bin/rm -rf` e `subprocess.run(['rm','-rf',X])` rodaram. DORMENTE: nenhum settings.json chama este arquivo; ligar é decisão do Mayor (ATIVAÇÃO).
-
-Contents
-  Para que serve · Como decide · Códigos · Ativação · Medido · Limites
-PARA QUE SERVE
-  Um agente (ou texto injetado que ele leu) não apaga dado do Dolt, `.git`, o HOME, a raiz de um repo nem a pasta de /tmp que outras sessões usam, seja qual for a ordem das flags ou o embrulho (`env`,
-  `sudo`, `timeout`, `bash -c`, `eval`, `find -delete`, `xargs`, `python -c`). Limpar scratch continua livre: `rm -rf /tmp/x` passa. Sai 2 em qualquer modo, `--dangerously-skip-permissions` incluso.
-COMO DECIDE
-  O texto é lido como o bash lê (aspas, `$'…'`, heredoc, `$( )`, `<( )`, crase, `cd`, chave `{a,b}` `{1..9}` e variável com o escopo do bash: `V=x cmd`, subshell, pipe, `&&`, função, laço, `read`, `printf -v`,
-  `+=`, `${V:-x}` `${V%x}` `${V/x/y}`, linha de comando guardada numa variável `C='rm -rf x'; $C`), os embrulhos saem, e cada `rm`/`unlink`/`rmdir`/`shred`/`rimraf` tem as opções normalizadas (`-fr`,
-  `-r -f`, `--recur`, `--`, opção depois do operando): sobram os OPERANDOS, resolvidos (`~`, `$HOME`, cwd, chave, glob que EXISTE) e julgados em duas formas, o texto e o `realpath`: vale a pior. Proibido:
-  componente `.dolt` `.dolt-data` `.beads` `.git` `.gc-worktrees` `crew` (a trava velha `.git/*.lock` sai), `/` e pasta de 1º nível, HOME e ancestrais, pasta DIRETA do HOME apagada por inteiro,
-  `~/Library/CloudStorage`, `~/gt/*/shared/data` (e, numa remoção recursiva, os dois ancestrais que a levam junto: `~/gt/<rig>`, `~/gt/<rig>/shared`), a raiz de /tmp e as pastas compartilhadas (`claude-<uid>`, `claude-<uid>/<projeto>`, `tmux-*`), pasta de sistema, raiz de repo git (worktree ou bare) ou
-  pasta que guarda um até 2 níveis abaixo, curinga que esvazia uma delas. Livre: /tmp, /var/tmp, o scratchpad, `~/.cache`, `node_modules`, `__pycache__`, `*.pyc` e o resto do trabalho (`rm -rf build`).
-  `find -delete|-exec rm` julga as raízes (filtro de nome que filtra de verdade: só regras absolutas, dado e nomes de dentro do .git); `xargs rm`, alvo que não resolvo (`$VAR`, `$( )`), verbo que não
-  resolvo com flag recursiva e curinga fundo, numa remoção RECURSIVA = bloqueado (estado inerte). Só `&&` fixa o cwd depois de um `cd`; com `;` `||` `&` valem o velho E o novo. Código inline: `['rm','-rf',x]`,
-  texto de shell com rm e, se há API de remoção, os literais de caminho.
-CÓDIGOS: 0 liberado · 2 bloqueado. Falha do guarda num pedido Bash, texto acima de MAX_CMD (256 KB) ou prazo LIMIT (8 s) estourado = bloqueado, nunca "liberado".
-ATIVAÇÃO (do Mayor; agente não edita o settings do usuário): PreToolUse, matcher "Bash", UM hook `python3 -I <caminho>/rm-target-guard.py || exit 2` (o `|| exit 2` faz travar ou sumir o python também sair 2). Para
-  SUBSTITUIR a regra de prefixo, tire `Bash(rm -rf:*)` do `deny` (nó e overlays `pool-*`: nega até o scratch, e lá não há `safe-clean`) ou do `ask` (mini: travou pool 54-97 min, ga-gkap9p) na MESMA camada.
-  Sugestão: nó primeiro, depois os overlays. Desligar: tirar o grupo. A mensagem do bloqueio ensina a saída (caminho literal em /tmp, `safe-clean <abs>`, `find <pasta> -mindepth 1 -delete`).
-MEDIDO (28/10): selftest no nó Hetzner em 55 s: tabela de 589 linhas, fuzzer contra o bash REAL (577 comandos válidos, 281 entregaram alvo proibido a um rm falso, 0 bypass), 145 mutantes mortos; mais 16 sementes × 400 sob o bash 3.2.57 do mini: 0 bypass em 6.133 comandos válidos (2.840 entregaram alvo proibido a um rm falso).
-  "0 bypass" vale para as sementes rodadas: o fuzzer não é prova. 6 rodadas da revisão de segurança automática do commit (21 achados) e o gate ga-x35kswn (ancestral do rig, escopo de variável, expansão sem word-split) viraram linhas de tabela e mutantes. Replay dos 31.820 pedidos Bash REAIS de 1.002 transcrições do nó, feito numa versão ANTERIOR (não refeito depois dos escopos de variável): 396 citam remoção e 20 foram bloqueados, conferidos um a um:
-  6 sondas em /dev/null (`rm -rf` e `rm -f`, da regra deny), 2 `.git` de cópia em scratch, 6 `$VAR`/`$(date)` que o guarda não sabe (escreva o caminho), 6 scripts Python com API de remoção e caminho (parte só porque a transcrição não guarda o cwd), 0 erro do guarda. Custo ~50 ms por chamada (25 ms são o python); comando de 250 KB em ≤ 0,4 s (medidas da versão anterior).
-LIMITES (trava contra engano, não sandbox): não vejo script que o comando executa (`bash x.sh`; um `source` de arquivo faz todo nome valer "não sei"), alias/função de fora, caminho montado em pedaços, `rsync --delete`,
-  `git clean`, `mv x /dev/null`, nem o que um programa apaga sozinho; remoção NÃO recursiva de alvo desconhecido (`rm -f "$f"`) passa. Variável: o que laço, função, pipe ou `{ }` muda entra como "talvez" (união, 2º passo,
-  sem fluxo); `D=(…)`, `${V^^}`, `${V:1:2}`, `${!V}`, `$((…))` e `${IFS…}` exótico valem "não sei"; `read` só de `<<<` ou `echo` com um nome; chave até 16 alternativas, 3 níveis e 64 saídas (acima = bloqueado). Falsos positivos conhecidos (lado fechado): `rm -rf "$VAR"` com variável solta, `.git` de cópia em scratch, `find -name
-  '*.lock'` num work tree, pasta com repo dentro, script Python com API de remoção e caminho protegido. Selftest: rm-target-guard.selftest.sh [N] (RMTG_SEED, RMTG_UNDER_TEST).
+A regra `Bash(rm -rf:*)` casa TEXTO e só barrou 2 de 7 grafias (ga-nkfwixz, guard-oracle-diff.md §3): `rm -fr`, `rm -r -f`, `rm --recursive --force`, `/bin/rm -rf`, `subprocess.run(['rm','-rf',X])` rodaram.
+DORMENTE: nenhum settings.json chama este arquivo; ligar é decisão do Mayor (ATIVAÇÃO). Um agente (ou texto injetado que ele leu) não apaga dado do Dolt, `.git`, o HOME, a raiz de um repo nem a pasta de
+/tmp que outras sessões usam, seja qual for a ordem das flags ou o embrulho (`env`, `sudo`, `timeout`, `bash -c`, `eval`, `find -delete`, `xargs`, `python -c`); `rm -rf /tmp/x` e `rm -rf build` passam. Sai 2 em qualquer modo.
+COMO DECIDE: o texto é lido como o bash lê (aspas, `$'…'`, heredoc, `$( )`, `<( )`, crase, `cd`, `env -C`, `sudo -D`, chave `{a,b}` `{1..9}` na palavra do verbo e nas flags, e variável com o escopo do bash: `V=x cmd`, subshell, pipe,
+  `&&`, função, laço, `read`, `printf -v`, `+=`, `${V:-x}`, `C='rm -rf x'; $C`), os embrulhos saem, as opções do `rm`/`unlink`/`rmdir`/`shred`/`rimraf` são normalizadas e os OPERANDOS (`~`, `$HOME`, cwd, chave, glob que EXISTE)
+  são julgados em duas formas, o texto e o `realpath`: vale a pior. Proibido: componente `.dolt` `.dolt-data` `.beads` `.git` `.gc-worktrees` `crew`, `/` e pasta de 1º nível, HOME e ancestrais, pasta DIRETA do HOME, `~/Library/CloudStorage`,
+  `~/gt/*/shared/data` (e, numa remoção recursiva, `~/gt/<rig>` e `~/gt/<rig>/shared`), a raiz de /tmp e as pastas compartilhadas (`claude-<uid>`, `claude-<uid>/<projeto>`, `tmux-*`), pasta de sistema, raiz de repo git ou pasta que guarda um
+  até 2 níveis abaixo, curinga que esvazia uma delas. `find -delete|-exec rm` julga as raízes; `xargs rm`, alvo que não resolvo (`$VAR`, `$( )`) ou verbo que não resolvo com flag recursiva = bloqueado. Só `&&` fixa o cwd depois de um `cd`.
+  Texto que o leitor não consegue fechar (aspas, `$( )`, crase, `${ }` ou heredoc sem fecho) e que cita remoção = bloqueado (`rm.unparsed`): perdeu o compasso do bash, e o que não dá para conferir não vira "liberado".
+CÓDIGOS: 0 liberado · 2 bloqueado. Erro do guarda num pedido Bash, texto acima de MAX_CMD (256 KB) ou prazo LIMIT (8 s) estourado = bloqueado. Travar o python NÃO sai 2 (o executor mata e o pedido segue): o prazo é cooperativo.
+ATIVAÇÃO (do Mayor; agente não edita o settings do usuário): PreToolUse, matcher "Bash", UM hook `python3 -I <caminho>/rm-target-guard.py || exit 2` (o `|| exit 2` cobre python que cai ou some). Para SUBSTITUIR a regra de prefixo,
+  tire `Bash(rm -rf:*)` do `deny` (nó e overlays `pool-*`) ou do `ask` (mini: travou pool 54-97 min, ga-gkap9p) na MESMA camada. Primeiro o nó Hetzner com 48 h de observação; no mini só depois de refazer o replay das transcrições com 0 falso positivo.
+MEDIDO (29/10): selftest com 655 linhas de tabela e 175 mutantes mortos; fuzzer contra o bash REAL do nó (5.2.21) com 11 sementes, ~9.900 comandos válidos, 0 bypass; seis listas de casos contra o bash 3.2.57 do mini e o 5.3 do brew, 0 divergência. "0 bypass" vale para as sementes rodadas: o fuzzer não é prova. Replay de 31.820 pedidos reais (396 citam
+  remoção, 20 bloqueados, conferidos um a um) feito numa versão ANTERIOR. Custo ~50 ms por chamada.
+LIMITES (trava contra engano, não sandbox): não vejo script que o comando executa (`bash x.sh`, `source`), alias/função de fora, caminho montado em pedaços, `rsync --delete`, `git clean`, `mv x /dev/null`, `git -c alias.x='!rm …'`, nem executor que
+  recebe o rm como texto (`uv run python -c`, `tmux send-keys`, `at`); remoção NÃO recursiva de alvo desconhecido (`rm -f "$f"`) passa. `D=(…)`, `${V^^}`, `${V:1:2}`, `${!V}`, `$((…))` valem "não sei"; chave até 16 alternativas, 3 níveis e 64 saídas.
+  Falsos positivos (lado fechado): `rm -rf "$VAR"`, `.git` de cópia em scratch, `find -name '*.lock'` num work tree, script Python com API de remoção e caminho protegido, apóstrofo solto em comentário dentro de `$( )` junto de texto com rm. Selftest: rm-target-guard.selftest.sh [N] (RMTG_SEED).
 """
 from __future__ import annotations
 
@@ -47,7 +35,7 @@ GLOB_MAX = 20000  # curinga com mais achados que isto: o resto vale como alvo qu
 LS_BUDGET = 20000  # entradas de pasta lidas por julgamento (2 níveis); estourou = a pasta vale como se guardasse um repo
 LIMIT = 8  # segundos para julgar um pedido; passou disto vale bloqueado (hook que estoura o tempo do harness falha ABERTO)
 DEADLINE = float("inf")
-ST: dict = {"seen": {}, "late": False, "again": False, "funcs": set(), "fnvals": {}, "fn": 0, "nref": False}  # estado de UM pedido (decide o zera): valores já atribuídos, se há laço/função (2º passo), funções definidas, o que o corpo delas atribui, corpo de função aberto, nameref declarado
+ST: dict = {"seen": {}, "late": False, "again": False, "funcs": set(), "fnvals": {}, "fn": 0, "nref": False, "open": False}  # estado de UM pedido (decide o zera): valores já atribuídos, se há laço/função (2º passo), funções definidas, o que o corpo delas atribui, corpo de função aberto, nameref declarado, fecho que o leitor não achou
 RM_TEXT = re.compile(r"(?<![\w.-])(?:rm|unlink|rmdir|shred|rimraf)(?![\w-])|-delete|rmtree")
 RM_VERBS = {"rm", "unlink", "rmdir", "shred", "rimraf"}
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "ash", "csh", "tcsh", "fish", "mksh", "yash", "posh", "rbash", "pdksh", "oksh"}
@@ -56,7 +44,7 @@ KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "{", "}", "!",
 OPAQUE = {"chrt", "taskset", "parallel", "su", "runuser", "script", "trap", "watch", "unshare", "nsenter", "chroot", "setpriv", "numactl", "caffeinate", "unbuffer", "ssh"}
 WRAP = {"env": ("-u -C -S --unset --chdir --split-string", 0), "command": ("", 0), "builtin": ("", 0), "exec": ("-a", 0), "nohup": ("", 0), "time": ("-f -o --format --output", 0),
         "timeout": ("-s -k --signal --kill-after", 1), "nice": ("-n --adjustment", 0), "ionice": ("-c -n -p --class --classdata", 0), "setsid": ("", 0), "stdbuf": ("-i -o -e", 0),
-        "sudo": ("-u -g -C -D -h -p -r -t -T -U --user --group", 0), "doas": ("-u -C", 0), "flock": ("-w -E --timeout", 1), "busybox": ("", 0), "toybox": ("", 0), "npx": ("-p -c --package", 0),
+        "sudo": ("-u -g -C -D -h -p -r -t -T -U --user --group --chdir", 0), "doas": ("-u -C", 0), "flock": ("-w -E --timeout", 1), "busybox": ("", 0), "toybox": ("", 0), "npx": ("-p -c --package", 0),
         "strace": ("-o -e -p -s -u -E -a -b -I -O -P -X", 0), "ltrace": ("-o -e -p -s -u -a -b -I -n", 0)}
 XARGS_VAL = {"-I", "-J", "-S", "-R", "-n", "-P", "-L", "-d", "-E", "-s", "-a", "--max-args", "--max-procs", "--max-lines", "--delimiter", "--eof", "--max-chars", "--arg-file", "--replace"}
 SELECT = {"-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename", "-regex", "-iregex", "-lname", "-ilname"}  # testes de NOME: só eles filtram de verdade (-mtime, -size… casam quase tudo)
@@ -77,7 +65,8 @@ RULES = {
     "rm.cloud": "~/Library/CloudStorage: documentos pessoais do Athos", "rm.rig-data": "~/gt/<rig>/shared/data (dados de produção) e as duas pastas que o levam junto, ~/gt/<rig> e ~/gt/<rig>/shared, removidas por inteiro", "rm.system": "pasta de sistema",
     "rm.shared-tmp": "pasta de /tmp compartilhada com outras sessões (a raiz, claude-<uid>, claude-<uid>/<projeto>, tmux-*)", "rm.repo-root": "raiz de repo git (ou pasta que guarda um): trabalho sem entregar",
     "rm.mass": "curinga que esvazia uma pasta protegida (rm -rf *)", "rm.target-unknown": "alvo que o guarda não consegue resolver (variável solta, substituição) numa remoção recursiva",
-    "rm.too-deep": "comando aninhado fundo demais para conferir", "rm.too-big": "comando grande demais para conferir"}
+    "rm.too-deep": "comando aninhado fundo demais para conferir", "rm.too-big": "comando grande demais para conferir",
+    "rm.unparsed": "aspas, $( ), crase, ${ } ou heredoc sem fecho e o texto cita remoção: o leitor perdeu o compasso do bash e não dá para conferir"}
 ANSI = re.compile(r"\\(x[0-9a-fA-F]{1,2}|[0-7]{1,3}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|c.|.)", re.S)
 LIT = re.compile(r"""'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)\"""", re.S)
 ARGV = re.compile(r"""\[\s*['"](?:[^'"\n]*/)?(rm|unlink|rmdir|shred|rimraf)['"]\s*,([^\]]*)\]|['"](?:[^'"\n]*/)?(rm|unlink|rmdir|shred|rimraf)['"]\s*,\s*\[([^\]]*)\]""")
@@ -127,9 +116,7 @@ def expand(s: str, cwd, env: dict) -> list:
         nxt, more = [], False
         for t in outs:
             m = VAR.search(t)
-            if m is None:
-                nxt.append(t)
-                continue
+            if m is None: nxt.append(t); continue
             more, name = True, m.group(1) or m.group(2)
             vals = env[name] if name in env else [home()] if name == "HOME" else [cwd] if name == "PWD" and cwd else [" "] if name == "IFS" else [UNK]
             nxt += [t[:m.start()] + x + t[m.end():] for v in vals for w in (expand(re.sub("[\"']", "", m.group(4)), cwd, env) if m.group(3) else [""]) for x in (param(v, m.group(3), w) if m.group(3) else [v])]  # a palavra do operador também se expande, sem as aspas que o bash tira (`${D%$E}`, `${D:+"$HOME/x"}`)
@@ -140,16 +127,16 @@ def expand(s: str, cwd, env: dict) -> list:
 SEQ = re.compile(r"\{(-?\d+|[A-Za-z])\.\.(-?\d+|[A-Za-z])(?:\.\.(-?\d+))?\}")
 
 def span(a: str, b: str, step) -> list:
-    """Valores de `{a..b}` / `{a..b..passo}` (número, com zeros à esquerda se um extremo os tem, ou letra); mais de 16 levanta OverflowError."""
+    """Valores de `{a..b}` / `{a..b..passo}` (número, com zeros à esquerda se um extremo os tem, ou letra); mais de 16 = [UNK] (não sei)."""
     num, k = a.lstrip("-").isdigit(), abs(int(step or 1)) or 1
     x, y = (int(a), int(b)) if num else (ord(a), ord(b))
     rng = range(x, y + 1, k) if x <= y else range(x, y - 1, -k)
-    if len(rng) > 16: raise OverflowError(a + b)
+    if len(rng) > 16: return [UNK]
     w = max(len(a), len(b)) if num and any(len(t.lstrip("-")) > 1 and t.lstrip("-")[0] == "0" for t in (a, b)) else 0
     return [str(v).zfill(w) if num else chr(v) for v in rng]
 
 def braces(s: str, depth: int = 3) -> list:
-    """Expansão de chave: `{a,b}` e sequência (`{1..3}`, `{a..e}`). Passou do teto (16 alternativas, 3 níveis, 64 resultados) levanta OverflowError: quem chama trata como "não sei", nunca corta em silêncio."""
+    """Expansão de chave: `{a,b}` e sequência (`{1..3}`, `{a..e}`). Passou do teto (16 alternativas, 3 níveis, 64 resultados) = [UNK + s] (não sei), nunca corta em silêncio."""
     m = next((q for q in SEQ.finditer(s) if q.group(1).lstrip("-").isdigit() == q.group(2).lstrip("-").isdigit()), None)  # `{1..a}` o bash não expande
     alts = span(*m.groups()) if m else None
     if m is None:
@@ -157,7 +144,7 @@ def braces(s: str, depth: int = 3) -> list:
         alts = m.group(1).split(",") if m else None
     if m is None: return [s]
     out = [r for alt in alts for r in braces(s[:m.start()] + alt + s[m.end():], depth - 1)] if depth and len(alts) <= 16 else None
-    if out is None or len(out) > 64: raise OverflowError(s)
+    if out is None or len(out) > 64: return [UNK + s]
     return out
 
 def setvar(env: dict, name: str, vals: list, strong: bool):
@@ -206,10 +193,7 @@ def candidates(raw: str, cwds: list, env: dict) -> list:
     out = []
     for t in pieces(raw, cwds[0], env):  # as aspas já se perderam: vale o valor inteiro E cada pedaço dele
         t = tilde(t)
-        try:
-            bs = [t] if UNK in t else braces(t)
-        except OverflowError:
-            bs = [UNK]
+        bs = [t] if UNK in t else braces(t)
         if UNK not in t and t not in bs:  # o que veio de variável não passa por chave (`T='x{a,b}'; rm $T`, `C='rm x{k..k}'; $C`): o rm recebe o texto como está; o digitado passa. Sem saber qual, valem os dois
             bs = bs + [t]
         for b in bs:
@@ -339,40 +323,54 @@ class Op(str):
 SEP_OPS = {";", "&&", "||", "|", "|&", "&", ";;", "(", ")"}
 REDIR = re.compile(r"\d*(?:&?>>?|<|>&|<&|>\||<>)")
 OPRE = re.compile(r"<<<|<<-?|&&|\|\||\|&|;;|&>>|&>|>>|>&|<&|>\||<>|[;&|()<>]")
+HDOC = re.compile(r"[ \t]*(?:'([^']*)'|\"([^\"]*)\"|\\?([\w.-]+))")  # delimitador de heredoc: 'EOF', "EOF" ou EOF
 
 def skip_subst(t: str, i: int) -> int:
-    """t[i:] começa em `$(`, `${` ou crase: o índice depois do fecho (sem fecho = fim do texto). Aspas dentro pulam até a de fecho; parênteses aninhados contam.
-    `${` fecha na 1ª `}` fora de aspas (também dentro de "…": a ' protege a `}`) e de `${`/`$(` aninhados; chave solta não conta (`${U:-a{b}c}` fecha depois do b)."""
-    n, j, depth = len(t), i + 1, 0
-    if t[i] == "`":
-        while j < n and t[j] != "`": j += 2 if t[j] == "\\" else 1
-        return min(j + 1, n)
-    if t.startswith("${", i):
-        q, j = None, i + 2
-        while j < n and not (t[j] == "}" and q is None):
+    """t[i:] começa em `$(`, `<(`, `>(`, `${` ou crase: o índice depois do fecho. Sem fecho = fim do texto (quem relê o corpo acusa o que ficou aberto; o `${ }`, que ninguém relê, acusa aqui). Dentro de `$( )`: aspas (com `\\"`, `$'…'`), `$( )`/`${ }`/crase
+    aninhados e corpo de heredoc (o apóstrofo solto de um texto de commit) pulam inteiros; `${` fecha na 1ª `}` fora de aspas (a ' protege a `}`) e a crase na 1ª crase, aspas não a escondem (o bash casa a crase sem olhar aspas); chave solta não conta."""
+    n, j, depth, hd = len(t), i + 1, 0, []
+    if t[i] == "`" or t.startswith("${", i):  # crase fecha na 1ª crase (aspas não a escondem), `${` na 1ª `}` fora de aspas (a ' protege a `}`)
+        e, q, j = t[i] if t[i] == "`" else "}", None, i + 1 + (t[i] == "$")
+        while j < n and not (t[j] == e and q is None):
             c = t[j]
             if c == "\\" and q != "'": j += 1
-            elif c in "'\"": q = None if q == c else (q or c)
-            elif c == "$" and q != "'" and t[j + 1:j + 2] in ("{", "("): j = skip_subst(t, j) - 1
+            elif e == "}" and c in "'\"": q = None if q == c else (q or c)  # na crase as aspas NÃO escondem o fecho (o bash casa a crase sem olhar aspas)
+            elif e == "}" and q != "'" and (c == "`" or (c == "$" and t[j + 1:j + 2] in ("{", "("))): j = skip_subst(t, j) - 1
             j += 1
+        ST["open"] |= j >= n
         return min(j + 1, n)
+    dq = False
     while j < n:
-        c = t[j]
-        if c == "\\":
-            j += 1
-        elif c in "'\"":
-            j = t.find(c, j + 1)
-            j = n if j < 0 else j
-        elif c == "(" or c == ")":
+        c, nx = t[j], t[j + 1:j + 2]
+        if c == "\\": j += 1
+        elif c == '"': dq = not dq
+        elif c == "`" or (c == "$" and nx in ("(", "{")) or (c in "<>" and nx == "(" and not dq): j = skip_subst(t, j) - 1
+        elif dq: pass
+        elif c == "'" or (c == "$" and nx == "'"):
+            q = c == "$"; j += 1 + q
+            while j < n and t[j] != "'": j += 2 if q and t[j] == "\\" else 1
+        elif c in "()":
             depth += 1 if c == "(" else -1
             if depth == 0: return j + 1
+        elif c == "<" and nx == "<":
+            m = None if t[j + 2:j + 3] == "<" else HDOC.match(t, j + 2 + (t[j + 2:j + 3] == "-"))
+            if m: hd.append((m.group(1) or m.group(2) or m.group(3) or "", t[j + 2:j + 3] == "-")); j = m.end() - 1
+            else: j += 1
+        elif c == "\n" and hd:  # o corpo do heredoc vai até a linha do delimitador
+            for delim, tabs in hd:
+                while True:
+                    e = t.find("\n", j + 1); e = n if e < 0 else e
+                    ok, j = (t[j + 1:e].lstrip("\t") if tabs else t[j + 1:e]) == delim, e
+                    if ok or e >= n: break
+                if not ok: return n
+            hd = []
         j += 1
     return n
 
 def lex(text: str):
     """Texto -> (palavras e Op, heredocs). Um leitor só, com as regras de aspas do bash: comentário, `\\`, '…', "…" (só `\\$ \\` \\" \\\\` escapam), $'…', $( ) e
     crase ficam DENTRO da palavra, newline vira `;` e o corpo de heredoc sai do fluxo: (corpo, palavras de quem o lê)."""
-    toks, docs, pend, cur, word, i, n, q = [], [], [], [], False, 0, len(text), None
+    toks, docs, pend, cur, word, i, n, q, ar = [], [], [], [], False, 0, len(text), None, 0  # ar = fundo de `(( ))` aritmético: ali `<<` é deslocamento, não heredoc
 
     def mark():
         nonlocal q
@@ -391,14 +389,15 @@ def lex(text: str):
             flush(); i += 1
         elif c == "\n":
             flush(); toks.append(Op(";")); i += 1
-            for delim, tabs, recv in pend:
+            for delim, tabs, recv, qd in pend:
                 body = []
                 while i < n:
                     j = text.find("\n", i)
                     line, i = (text[i:], n) if j < 0 else (text[i:j], j + 1)
                     if (line.lstrip("\t") if tabs else line) == delim: break
                     body.append(line)
-                docs.append(("\n".join(body), recv))
+                else: ST["open"] = True  # heredoc sem a linha do delimitador
+                docs.append(("\n".join(body), recv, qd))
             pend = []
         elif c == "#" and not word:
             while i < n and text[i] != "\n":
@@ -408,7 +407,7 @@ def lex(text: str):
         elif c == "'" or (c == "$" and nx == "'"):  # '…' literal; $'…' decodificado
             mark(); i += 1 + (c == "$"); word = True; j = i
             while j < n and text[j] != "'": j += 2 if c == "$" and text[j] == "\\" else 1
-            cur.append(ansi(text[i:j]) if c == "$" else text[i:j]); i = j + 1
+            cur.append(ansi(text[i:j]) if c == "$" else text[i:j]); i = j + 1; ST["open"] |= j >= n
         elif c == '"':
             mark(); i += 1; word = True
             while i < n and text[i] != '"':
@@ -419,10 +418,8 @@ def lex(text: str):
                     j = skip_subst(text, i); cur.append(text[i:j]); i = j
                 else:
                     cur.append(d); i += 1
-            i += 1
-        elif (c == "$" and nx in ("(", "{")) or c == "`":
-            j = skip_subst(text, i); cur.append(text[i:j]); word = True; i = j
-        elif c in "<>" and nx == "(":  # `<(cmd)` e `>(cmd)`: substituição de processo, fica DENTRO da palavra como o $( )
+            ST["open"] |= i >= n; i += 1
+        elif (c == "$" and nx in ("(", "{")) or c == "`" or (c in "<>" and nx == "("):  # `<(cmd)` e `>(cmd)` (substituição de processo) ficam DENTRO da palavra como o $( )
             j = skip_subst(text, i); cur.append(text[i:j]); word = True; i = j
         elif c in ";&|()<>":
             pre = ""
@@ -430,28 +427,29 @@ def lex(text: str):
                 pre, cur, word, q = "".join(cur), [], False, None
             else: flush()
             op = OPRE.match(text, i).group(0)
+            if op in "()" and (ar or (op == "(" and nx == "(" and (not toks or toks[-1] in KEYWORDS | {"for"} or (isinstance(toks[-1], Op) and toks[-1] in SEP_OPS)))): ar += 1 if op == "(" else -1  # `((` no começo de comando
             i += len(op)
-            m = re.match(r"[ \t]*(?:'([^']*)'|\"([^\"]*)\"|\\?([\w.-]+))", text[i:]) if op in ("<<", "<<-") else None
+            m = HDOC.match(text, i) if op in ("<<", "<<-") and not ar else None
             if m:  # o delimitador não é palavra; quem lê o heredoc está antes ou depois dele, na mesma linha
                 k = len(toks)
                 while k and not (isinstance(toks[k - 1], Op) and toks[k - 1] in SEP_OPS): k -= 1
                 eol = text.find("\n", i)
-                words = [str(t) for t in toks[k:] if not isinstance(t, Op)] + re.split(r"[\s;&|()<>]+", text[i + m.end(): n if eol < 0 else eol])
-                pend.append((m.group(1) or m.group(2) or m.group(3) or "", op == "<<-", [os.path.basename(w) for w in words if w]))
-                i += m.end()
+                words = [str(t) for t in toks[k:] if not isinstance(t, Op)] + re.split(r"[\s;&|()<>]+", text[m.end(): n if eol < 0 else eol])
+                pend.append((m.group(1) or m.group(2) or m.group(3) or "", op == "<<-", [os.path.basename(w) for w in words if w], m.group(3) is None or "\\" in m.group(0)))  # o 4º: delimitador entre aspas (o corpo não expande $( ))
+                i = m.end()
             else: toks.append(Op(pre + op))
         else:
             cur.append(c); word = True; i += 1
     flush()
-    return toks, docs + [("", r) for _, _, r in pend]  # `cat <<EOF` sem newline depois: não há corpo
+    return toks, docs + [("", r, True) for _, _, r, _ in pend]  # `cat <<EOF` sem newline depois: não há corpo
 
 def substitutions(w: str):
-    """Corpos de $( ) e crase dentro de UMA palavra."""
+    """Corpos de $( ), <( ), >( ) e crase dentro de UMA palavra."""
     i, out = 0, []
     while i < len(w):
         if (w[i] in "$<>" and w[i + 1:i + 2] == "(") or w[i] == "`":  # $( ), <( ), >( ) e crase
             j = skip_subst(w, i)
-            out.append(w[i + 2:j - 1] if w[i] != "`" else w[i + 1:j - (w[j - 1:j] == "`")]); i = j
+            out.append(w[i + 1:j] if w.startswith("$((", i) else w[i + 2:j - 1] if w[i] != "`" else w[i + 1:j - (w[j - 1:j] == "`")]); i = j  # `$((`: o corpo vai com o 2º `(`, lido como `(( ))` (o `<<` ali é deslocamento)
         else: i += 1
     return out
 
@@ -477,6 +475,7 @@ def peel(ws: list, pre=None) -> list:
                 key, eq, val = o.partition("=") if o[:2] == "--" else (o[:2], "", o[2:])
                 if key in takes and not (eq or val):
                     val, ws = (ws[0] if ws else ""), ws[1:]
+                if pre is not None and key in {"env": ("-C", "--chdir"), "sudo": ("-D", "--chdir")}.get(b, ()): pre.append((val,))  # a pasta em que o comando de dentro roda: quem chama a aplica ao cwd
                 if (b == "env" and key in ("-S", "--split-string")) or (b == "npx" and key in ("-c", "--call")):  # o valor da opção é um comando inteiro numa palavra só
                     ws = [str(t) for t in lex(val)[0]] + ws
                 looked = looked or (b == "command" and key in ("-v", "-V"))
@@ -492,10 +491,9 @@ def peel(ws: list, pre=None) -> list:
 def cd_target(ws: list, cwds: list, env: dict):
     """As pastas depois de um `cd`/`pushd` (assumo que rodou); None se a linha não é cd; [None] se não sei o destino."""
     ws = [w for w in ws if not ASSIGN.match(w)]
-    while ws and ws[0] in ("time", "command", "builtin", "!"): ws = ws[1:]
+    while ws and ws[0] in KEYWORDS | CTL | {"time", "command", "builtin"}: ws = ws[1:]  # `then cd x`, `do cd x`, `{ cd x`: o cd depois de palavra de bloco também vale
     if not ws or os.path.basename(ws[0]) not in ("cd", "pushd", "popd"): return None
-    if os.path.basename(ws[0]) == "popd":  # volta a uma pasta que não rastreio
-        return [None]
+    if os.path.basename(ws[0]) == "popd": return [None]  # volta a uma pasta que não rastreio
     args = [a for a in ws[1:] if a not in ("-L", "-P", "-e", "-@", "--")]
     if args[:1] == ["-"]: return [None]
     return [p for p, _ in candidates(args[0], cwds, env)] if args else [home()]
@@ -507,13 +505,11 @@ def inline(code: str, cwds: list, depth: int, env: dict):
         rest = m.group(2) if m.group(1) else m.group(4)  # literal vira o texto; expressão (variável, concatenação) vira UNK
         els = [g.group("s") if g.group("s") is not None else g.group("d") if g.group("d") is not None else UNK for g in ELEM.finditer(rest)]
         ops, rec = rm_args(m.group(1) or m.group(3), els)
-        hit = check(ops, rec, False, cwds, env)
-        if hit: return hit
+        if hit := check(ops, rec, False, cwds, env): return hit
     lits = [m.group(1) if m.group(1) is not None else m.group(2) for m in LIT.finditer(code)]
     deletes = bool(DELAPI.search(code)) or any(RM_TEXT.search(x) for x in lits)
     for lit in lits:
-        hit = scan_bash(lit, cwds, depth + 1, env) if RM_TEXT.search(lit) and re.search(r"\s", lit.strip()) else None
-        if hit: return hit
+        if hit := scan_bash(lit, cwds, depth + 1, env) if RM_TEXT.search(lit) and re.search(r"\s", lit.strip()) else None: return hit
     strict = DELCALL.findall(code) + [x for x in lits if deletes and x and not re.search(r"\s", x) and re.search(r"\w", x) and re.match(r"[~/.]|\w+/", x)]
     bare = [x for x in lits if deletes and x and len(x) < 256 and "\n" not in x and re.search(r"\w", x)]  # qualquer outro literal pode ser um nome relativo (`d='gt-remote'; rmtree(d)`): julgado, mas um `$x` solto nele não bloqueia
     rec = bool(DELREC.search(code)) or any(re.search(r"\s-[a-zA-Z]*[rR]|--recurs", x) for x in lits if RM_TEXT.search(x))
@@ -601,8 +597,7 @@ def scan_bash(cmd: str, cwds: list, depth: int = 0, env=None, share: bool = Fals
             iso = t in ("|", "|&", "&") or prev in ("|", "|&")
             weak = iso or bool(blk["cases"]) or bool(blk["grp"] and blk["grp"][-1] is None) or prev in ("&&", "||")
             before = dict(env) if iso else None
-            hit = one(ws, here, depth, env, feed, None, not weak)
-            if hit: return hit
+            if hit := one(ws, here, depth, env, feed, None, not weak): return hit
             if before is not None: merge(env, before)
             if t == "(" and ASSIGN.fullmatch(str(ws[-1])):  # `D=(a b)`: matriz, o valor não leio
                 setvar(env, ASSIGN.match(ws[-1]).group(1), [UNK], True)
@@ -620,9 +615,10 @@ def scan_bash(cmd: str, cwds: list, depth: int = 0, env=None, share: bool = Fals
             env.clear(); env.update(snap)
         cur, prev = [], str(t)
     denv = {k: [UNK] for k in env}  # o corpo roda no meio da linha e eu só tenho o ambiente do FIM: variável atribuída por fora vale "não sei", nunca o valor final
-    for body, recv in docs:  # corpo lido por shell ou interpretador é código, no cwd do comando que o lê (qual foi? valem todos os que vi); por cat, tee, git commit -F - é texto
+    for body, recv, qd in docs:  # corpo lido por shell ou interpretador é código, no cwd do comando que o lê (qual foi? valem todos os que vi); por cat, tee, git commit -F - é texto, salvo o $( ) de um delimitador sem aspas
         hit = scan_bash(body, ever, depth + 1, denv) if any(w in SHELLS for w in recv) else None
         hit = hit or (inline(body, ever, depth + 1, denv) if any(INTERP.fullmatch(w) for w in recv) else None)
+        for sb in () if qd else substitutions(body): hit = hit or scan_bash(sb, ever, depth + 1, denv)
         if hit: return hit
     return None
 
@@ -638,36 +634,38 @@ def one(ws: list, cwds: list, depth: int, env: dict, feed: list, app=None, stron
             if not isinstance(t, Op): words.append(t)
     for w in words:  # $( ) e crase dentro de QUALQUER palavra rodam, mesmo atrás de um echo
         for body in substitutions(w):
-            hit = scan_bash(body, cwds, depth + 1, env)
-            if hit: return hit
+            if hit := scan_bash(body, cwds, depth + 1, env): return hit
         for m in re.finditer(r"\$\{(\w+):?=", w):  # `${D:=x}` atribui D no shell que lê a palavra
             setvar(env, m.group(1), [UNK], True)
     pre = []
     ws = peel(words, pre)
-    wrapped, pre = None in pre, [a for a in pre if a]
+    wrapped, cd, pre = None in pre, [a[0] for a in pre if isinstance(a, tuple)], [a for a in pre if isinstance(a, str)]
     cenv = dict(env)  # o que um comando de dentro (bash -c, eval, find -exec, xargs…) enxerga: o ambiente de fora com o prefixo `NOME=v` somado como "talvez". Os operandos do próprio verbo usam `env`: o shell os expande ANTES do prefixo valer
     for a in pre: assign(a, cenv, cwds[0], False)
     if not ws:  # só atribuição: vale no shell (atrás de `env`/`command` não: aí é argumento do embrulho)
         for a in pre if not wrapped else (): assign(a, env, cwds[0], strong)
         return None
+    for d in cd:  # `env -C DIR cmd`, `sudo -D DIR cmd`: o comando de dentro roda em DIR (não resolvo = cwd "não sei", que barra a remoção recursiva)
+        new = [p for p, _ in candidates(d, cwds, env)]; cwds = new if len(new) <= 8 else new[:7] + [None]
     if ws[0] in ST["funcs"]:  # chamada de função: o que o corpo atribui entra como "talvez"
         for k, v in list(ST["fnvals"].items()): setvar(env, k, sorted(v), False)
     if len(ws) > 3 and ws[0] in ("for", "select") and ws[2] == "in":  # `for d in a b; do rm -rf "$d"; done` (e `time for …`): $d passa a valer cada item
         setvar(env, ws[1], [tilde(x) for w in ws[3:] for x in pieces(w, cwds[0], env)], strong)
         return None
-    if re.search(r"[$`*?\[]", ws[0]) and ws[0] not in ("[", "[["):  # verbo que sai de variável, substituição ou curinga (`$R -rf x`, `$(echo rm) -rf x`, `/bin/r? -rf x`)
-        v = expand(ws[0], cwds[0], env)
+    if re.search(r"[$`*?\[]|\{[^{}]*(?:,|\.\.)", ws[0]) and ws[0] not in ("[", "[["):  # verbo que sai de variável, substituição, curinga ou chave (`$R -rf x`, `$(echo rm) -rf x`, `/bin/r? -rf x`, `{rm,-rf,x}`)
+        bs = braces(ws[0])  # cada alternativa da chave é uma PALAVRA (`{rm,-rf,x}` = rm -rf x; `r{m,} -rf x` = rm r -rf x); passou do teto = não sei
+        if UNK not in bs[0] and bs != [ws[0]]: return one(bs + ws[1:], cwds, depth + 1, cenv, feed, app, False)
+        v = expand(bs[0], cwds[0], env)
         if re.match(r"[^=]*\$[^=]*\+?=", ws[0]):  # `$n=x` (só vira atribuição dentro de eval): o nome vem de variável
             wild(env)
-        known = [x for x in v if UNK not in x and x != ws[0]]  # cada valor que sei é uma linha de comando: relê como palavras (`C='rm -rf x*'; $C`, `rm${IFS}-rf${IFS}x`), também quando outro valor é "não sei" (`true && C=…`); valor vazio some e o resto vira o comando
+        known = [x for x in v if UNK not in x and x != ws[0]]  # cada valor que sei é uma linha de comando: vira palavras (`C='rm -rf x*'; $C`, `rm${IFS}-rf${IFS}x`), também quando outro valor é "não sei" (`true && C=…`); valor vazio some e o resto vira o comando
         for x in known:
-            hit = one([str(t) for t in lex(x)[0]] + ws[1:], cwds, depth + 1, cenv, feed, app, False)
-            if hit: return hit
+            for rd in (x.split(), [str(t) for t in lex(x)[0]]):  # `$C` solto: o bash só parte o valor em branco e expande curinga, aspas, `;`, `#` e `\` dele são LETRAS (`C="rm -rf 'a ~/p b'"; $C` apaga ~/p); `eval "$C"` e `bash -c "$C"` leem o valor como texto de shell (aspas valem). Aqui os dois chegam como `$C`: leio dos dois jeitos (bloqueia a mais, nunca a menos)
+                if hit := one(rd + ws[1:], cwds, depth + 1, cenv, feed, app, False): return hit
         if len(known) == len(v): return None
         ops, rec = rm_args("rm", ws[1:])  # um valor que não sei que programa é: com flag recursiva vale como rm; sem ela valem as regras absolutas nos operandos, e texto de shell com rm nos argumentos é lido
         for a in ws[1:]:
-            hit = scan_bash(a, cwds, depth + 1, cenv) if RM_TEXT.search(a) and re.search(r"\s", a.strip()) else None
-            if hit: return hit
+            if hit := scan_bash(a, cwds, depth + 1, cenv) if RM_TEXT.search(a) and re.search(r"\s", a.strip()) else None: return hit
         return check(ops, rec, () if rec else ("",), cwds, env)
     verb, args = os.path.basename(ws[0]), ws[1:]
     if verb in ("export", "declare", "typeset", "local", "readonly"):  # `export D=x`: vale para os comandos seguintes
@@ -693,10 +691,10 @@ def one(ws: list, cwds: list, depth: int, env: dict, feed: list, app=None, stron
         return None
     if verb in ("source", "."):  # o arquivo que ele roda pode atribuir qualquer coisa
         wild(env)
-    procs = [w[2:-1] for w in words if w[:2] in ("<(", ">(") and w.endswith(")")]  # `bash <(echo 'rm -rf x')`: a SAÍDA do corpo é o programa de quem o lê
     if verb in RM_VERBS:
+        args = [y for a in args for y in (braces(a) if a[:1] == "-" and "{" in a else [a])]  # `--{recursive,force}`: o bash entrega duas opções
         ops, rec = rm_args(verb, args)
-        return check(ops + list(app or []), rec, False, cwds, env)
+        return check(ops + list(app or []), rec or (verb == "rm" and any(UNK in a for a in args)), False, cwds, env)  # chave de opção além do teto = opção que não sei, vale recursiva
     if verb == "xargs":
         i = 0
         while i < len(args) and args[i][:1] == "-" and len(args[i]) > 1:
@@ -715,8 +713,7 @@ def one(ws: list, cwds: list, depth: int, env: dict, feed: list, app=None, stron
                 end = next((y for y, w in enumerate(cmd) if w == ";" or (w == "+" and y and cmd[y - 1] == "{}")), len(cmd))
                 sub = peel(cmd[:end])
                 rmish = rmish or bool(sub) and os.path.basename(sub[0]) in RM_VERBS
-                hit = one(cmd[:end], cwds, depth, cenv, [], None, False)
-                if hit: return hit
+                if hit := one(cmd[:end], cwds, depth, cenv, [], None, False): return hit
         # filtro de nome só vale se filtra de verdade (narrow) e nada o anula: `-o`, `!`, `-not` fazem o -delete valer para o que o filtro NÃO casa
         sel = () if {"!", "-not", "-o", "-or"} & set(expr) else tuple(expr[x + 1] for x, t in enumerate(expr) if t in SELECT and x + 1 < len(expr) and narrow(t, expr[x + 1]))
         return check(roots, True, sel, cwds, env) if rmish else None
@@ -724,10 +721,10 @@ def one(ws: list, cwds: list, depth: int, env: dict, feed: list, app=None, stron
     if shellish or INTERP.fullmatch(verb):
         sub = dict(cenv)  # `eval` roda no shell de quem chama: o que ele atribui volta; `bash -c`, `sh x` e os interpretadores rodam numa cópia
         run = (lambda s: scan_bash(s, cwds, depth + 1, sub, verb == "eval")) if shellish else (lambda s: inline(s, cwds, depth + 1, sub))
-        for body in procs:
-            for w in code_of(lex(body)[0]):
-                hit = run(w)
-                if hit: return hit
+        for body in [b for a in args for b in substitutions(a)]:  # o que `<( )` e `$( )` imprimem é o programa (`bash <(echo 'rm -rf x')`, `bash -c "$(cat <<'EOF'…EOF)"`, `eval "$(echo rm -rf x)"`)
+            tk, dcs = lex(body)
+            for w in code_of(tk) + [d for d, _, _ in dcs]:
+                if hit := run(w): return hit
         code = " ".join(args) if verb == "eval" else None
         for x, a in enumerate(args if code is None else []):
             if re.fullmatch(r"-[a-zA-Z]*[ceEpr]|--(?:eval|print|command)", a):
@@ -737,8 +734,7 @@ def one(ws: list, cwds: list, depth: int, env: dict, feed: list, app=None, stron
         code = code or (here[0] if here else None)
         if not code and verb != "eval" and ("-" in args or "-s" in args or not [a for a in args if not a.startswith("-")]):  # lê o programa do stdin: o que vem pelo pipe é código
             for w in [c for st in feed for c in code_of(st)]:
-                hit = run(w)
-                if hit: return hit
+                if hit := run(w): return hit
         hit = run(code) if code else None
         if verb == "eval" and not hit:
             for k, v in sub.items():
@@ -747,13 +743,11 @@ def one(ws: list, cwds: list, depth: int, env: dict, feed: list, app=None, stron
     if verb in OPAQUE:  # não modelo o que o lançador faz: o comando de dentro (palavra solta ou texto entre aspas) vale
         for j, w in enumerate(args):
             if re.search(r"\s", w):
-                hit = scan_bash(w, cwds, depth + 1, cenv)
-                if hit: return hit
+                if hit := scan_bash(w, cwds, depth + 1, cenv): return hit
             elif os.path.basename(w) in RM_VERBS | {"find", "xargs"} | SHELLS: return one(args[j:], cwds, depth + 1, cenv, [], None, False)
     for x, a in enumerate(args):  # corredor de código que não conheço (xonsh, elvish, nu…): a convenção `-c 'texto'` entrega o programa; só texto que cita rm e tem espaço (não pega `git -c k=v`, `cut -c1-5`, `grep -e`)
         if a in ("-c", "--command") and x + 1 < len(args) and RM_TEXT.search(args[x + 1]) and re.search(r"\s", args[x + 1].strip()):
-            hit = scan_bash(args[x + 1], cwds, depth + 1, cenv)
-            if hit: return hit
+            if hit := scan_bash(args[x + 1], cwds, depth + 1, cenv): return hit
     return None
 
 def decide(inp: dict):
@@ -762,14 +756,15 @@ def decide(inp: dict):
     if inp.get("tool_name") != "Bash": return None
     DEADLINE = time.monotonic() + LIMIT
     cmd, cwd = str((inp.get("tool_input") or {}).get("command") or ""), inp.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR")
-    if len(cmd) > MAX_CMD:  # não dá para conferir e a busca de texto não prova nada (`r''m`, `$'\x72m'`): bloqueado
-        return "rm.too-big", cmd[:60], "comando Bash"
-    ST.update(seen={}, late=False, again=False, funcs=set(), fnvals={}, fn=0, nref=False)
+    if len(cmd) > MAX_CMD: return "rm.too-big", cmd[:60], "comando Bash"  # não dá para conferir e a busca de texto não prova nada (`r''m`, `$'\x72m'`): bloqueado
+    ST.update(seen={}, late=False, again=False, funcs=set(), fnvals={}, fn=0, nref=False, open=False)
     ctx = [os.path.realpath(cwd)] if isinstance(cwd, str) and os.path.isabs(cwd) else [None]
     hit = scan_bash(cmd, ctx)
     if not hit and ST["late"]:  # laço ou função: o corpo pode rodar depois de atribuições que vêm DEPOIS dele no texto; o 2º passo o lê com todos os valores já vistos
         ST.update(again=True, fn=0)
         hit = scan_bash(cmd, ctx)
+    if not hit and ST["open"] and any(RM_TEXT.search(x) for x in (re.sub(r"['\"\\]", "", cmd), ansi(cmd))):  # vazio → todo fecho achado, nada a dizer; falhou/ilegível (fecho perdido) e o texto cita remoção → bloqueado
+        hit = "rm.unparsed", cmd[:60]
     return (hit[0], hit[1], "comando Bash") if hit else None
 
 def message(hit) -> str:
@@ -788,9 +783,7 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001 — falha do guarda não pode virar "liberado"
         print(f"[HOOK BLOCK: rm-target-guard] o guarda falhou ({type(e).__name__}) e não consigo conferir este pedido: bloqueado.", file=sys.stderr)
         return 2
-    if hit:
-        print(message(hit), file=sys.stderr)
-        return 2
-    return 0
+    if hit: print(message(hit), file=sys.stderr)
+    return 2 if hit else 0
 
 if __name__ == "__main__": sys.exit(main())
