@@ -618,13 +618,13 @@ PY
   mutant "bead de outro rig aceita" pilot 'case "$_kl_id" in ga-*) ;; *) _kl_other' 'case "$_kl_id" in *) ;; ga-*) _kl_other'
   mutant "a vaga conta todo template" pilot '([$live[] | select(.template == $kt and .state != "asleep")] | length) as $occ' '([$live[] | select(.state != "asleep")] | length) as $occ'
   mutant "sessão sem alias não ocupa" pilot '([$live[] | select(.template == $kt and .state != "asleep")] | length) as $occ' '([$live[] | select(.alias == ($kt + "-1") and .state != "asleep")] | length) as $occ'
-  mutant "sem vaga e segue tentando" pilot 'kimi_lane_wait|node_rollback_unconfirmed) _kl_stop=' 'nunca) _kl_stop='
+  mutant "sem vaga e segue tentando" pilot 'kimi_lane_wait|kimi_lane_failed|node_rollback_unconfirmed) _kl_stop=' 'nunca) _kl_stop='
   mutant "carimbo no DRY_RUN" pilot '  # (2) a rota de espera: só nas que ainda não a têm; o DRY_RUN não escreve
   if [ "${DRY_RUN:-0}" != "1" ]; then' '  # (2)
   if true; then'
   mutant "sessão que falha não desfaz" pilot '    if _pilot_node_first_rollback "$_kd_id" "$_kd_city" "$_kd_alias" "$_kd_sess"; then' '    if true; then'
-  mutant "bloco do Kimi cai no mini" pilot '      DISPATCH_RESULT="kimi_lane_wait"
-      return 1' '      DISPATCH_RESULT="kimi_lane_wait"'
+  mutant "bloco do Kimi cai no mini" pilot 'else DISPATCH_RESULT="kimi_lane_wait"; fi
+      return 1' 'else DISPATCH_RESULT="kimi_lane_wait"; fi'
   mutant "nó primeiro consultado na faixa" pilot '  [ "${_PILOT_KIMI_PASS:-0}" != "1" ] || return 0' '  :'
   mutant "gate restaura dog para lane:kimi" gate "    *\" lane:kimi \"*) printf 'kimi-lane' ;;" "    *\" lane:kimi \"*) printf '%s' \"\${2:-}\" ;;"
   mutant "veto ignorado" pilot '_ks_veto=$(_pilot_node_first_veto "$_ks_labels")' '_ks_veto=""'
