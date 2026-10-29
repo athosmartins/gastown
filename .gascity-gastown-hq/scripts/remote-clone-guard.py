@@ -515,6 +515,21 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
                     return r
         return None
 
+    def call(c: str, blind: bool):  # reexecuta AGORA, neste cwd, o corpo guardado da função c: o 1º (alvo, operação) de escrita, ou None
+        st.setdefault("calling", set()).add(c)
+        saved = st.get("lost")  # a região perdida de quem chamou continua depois que esta chamada acaba: o que vem depois pode ser o resto do corpo que não roda
+        try:
+            body = list(st["funcs"][c])  # cópia: definir uma aninhada ali dentro acrescenta à lista de quem a define, e o que se acrescenta não é revisto nesta passada
+            for i, (s, p, t) in enumerate(body):
+                st["rest"] = body[i:]
+                r = one(list(s), blind, p, t)
+                if r:
+                    return r
+        finally:
+            st["calling"].discard(c)
+            st["lost"] = saved
+        return None
+
     def one(seg: list, blind: bool = False, prev: str = "", term: str = ";", ext: bool = False):  # ext = trecho que um programa roda (find -exec): cd ali não muda o shell; prev/term = o operador antes e depois do trecho: dizem se um cd rodou com certeza
         tick()
         r = inner(seg)
@@ -538,12 +553,18 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
         if st.get("calling"):
             if len(seg) == 1 and term == "(" and seg[0] not in KEYWORDS:
                 st["nhead"] = seg[0]  # a cabeça `g (` de uma definição aninhada: o `{` que vem a seguir é o corpo dela
-            if seg[:1] == ["function"] or seg[:1] == ["{"] and prev == ")":  # definição aninhada num corpo reexecutado (`function g {`, `g() {`): o corpo dela não roda agora e onde ele acaba eu não sei (o `}` que o fecha não fica guardado)
+            elif seg and seg[0] != "{":
+                st.pop("nhead", None)  # a cabeça que não foi seguida de `{` não era uma definição: a bandeira não pode ficar velha para o próximo `{`. Enquanto vale, o `{` é o corpo mesmo com um newline entre `g()` e ele (o separador é então o `;` do newline, não o `)`)
+            if seg[:1] == ["function"] or seg[:1] == ["{"] and (prev == ")" or st.get("nhead")):  # definição aninhada num corpo reexecutado (`function g {`, `g() {`): o corpo dela não roda agora e onde ele acaba eu não sei (o `}` que o fecha não fica guardado)
                 st["lost"] = True  # até o fim desta reexecução, `cd` e atribuição de variável valem "não sei" (ver unsure e o ramo do cd): o que o corpo que não roda faz não pode valer para o que vem depois
                 nm = seg[1] if seg[0] == "function" and seg[1:2] else st.pop("nhead", None)
                 if nm:  # a aninhada passa a existir: uma chamada dela depois, de fora, confere o resto desta lista (mais do que o corpo dela, que não sei onde acaba: lado fechado)
-                    tick(len(st.get("rest", ())))  # a cópia custa tanto quanto conferir o que ela copia: conta no teto (centenas de aninhadas num corpo só não enchem a memória)
-                    st["funcs"].setdefault(nm, []).extend(st.get("rest", ()))
+                    rest = st.get("rest") or ()
+                    key = (nm, id(rest[0]) if rest else 0)
+                    if key not in st.setdefault("regd", set()):  # a MESMA definição reexecutada (chamar g de novo: o corpo registrado traz o próprio cabeçalho) não se registra outra vez: a lista dobrava a cada chamada e 7 chamadas de g estouravam o teto
+                        st["regd"].add(key)
+                        tick(len(rest))  # a cópia custa tanto quanto conferir o que ela copia: conta no teto (centenas de aninhadas num corpo só não enchem a memória)
+                        st["funcs"].setdefault(nm, []).extend(rest)
         if not st.get("calling") and (seg[:1] == ["{"] and st.pop("func", False) or seg[:1] == ["function"] and seg[2:3] == ["{"]):  # nunca ao REEXECUTAR um corpo guardado (calling): o `{` guardado ali reabria a definição com o nome velho, desviava o resto do corpo para a lista errada e o laço de chamada percorria essa lista sem fim (ga-tih62nv)
             if seg[0] == "function":
                 st["fname"], seg = seg[1], seg[2:]
@@ -556,10 +577,16 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
             if term == "&":
                 st["cwd"] = None  # `{ …; } &`: o grupo roda em background; o cd de dentro não vale aqui fora
             return None
+        fw, done = next((x for x in seg if x not in KEYWORDS and not ASSIGN.fullmatch(x)), ""), ""  # a palavra que o shell chama: a 1ª que não é VAR=x nem palavra reservada
+        if fw in st.get("funcs", {}) and fw not in st.setdefault("calling", set()):  # uma função com nome de comando que trato adiante (bash, env, cd, find, eval, export, sudo, git…) é chamada como FUNÇÃO: o corpo roda, e o resto do trecho segue conferido como se o nome fosse o programa (command X e env X ignoram a função: lado fechado)
+            r = call(fw, blind)
+            if r:
+                return r
+            done = fw
         w0 = [os.path.basename(x) for x in seg]
         env, seg, b, opq = peel(seg)
         blind, wrapped = blind or b, any(x in WRAP for x in w0[:len(w0) - len(seg)])  # wrapped: `env cd x` roda o cd como PROGRAMA — o shell fica onde estava
-        unsure = bool(st.get("lost")) or kw or blk or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&")  # o trecho pode não ter rodado
+        unsure = bool(st.get("lost")) or kw or bool(done) or blk or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&")  # o trecho pode não ter rodado
         if not seg:
             st["env"].update({k: "$?" if unsure else v for k, v in env.items()})  # `GIT_DIR=x; git …` vale p/ os seguintes; `true || GIT_DIR=x` = "não sei" ($ → não resolve)
             return None
@@ -574,6 +601,8 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
             new = None if c == "popd" else chdir(seg[1:], st["cwd"], c == "pushd")
             if st.get("lost") or kw or wrapped or ext or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&"):
                 new = None
+            if done:
+                new = None  # a função chamada cd/pushd/popd foi reexecutada acima: o que ela fez de verdade com o diretório eu não sei, e o cd modelado aqui pode nem ter rodado
             if blk and new is not None:
                 st["cdblk"] = True  # cd dentro de um ramo: vale até o fi/done/esac/else/elif
             if prev == "&&" and new is not None:
@@ -607,18 +636,12 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
                     if r:
                         return r
         elif c in st.get("funcs", {}) and c not in st.setdefault("calling", set()):  # chamada de função definida nesta chamada: o corpo roda AGORA, neste cwd
-            st["calling"].add(c)
-            saved = st.get("lost")  # a região perdida de quem chamou continua depois que esta chamada acaba: o que vem depois pode ser o resto do corpo que não roda
-            try:
-                body = list(st["funcs"][c])  # cópia: definir uma aninhada ali dentro acrescenta à lista de quem a define, e o que se acrescenta não é revisto nesta passada
-                for i, (s, p, t) in enumerate(body):
-                    st["rest"] = body[i:]
-                    r = one(list(s), blind, p, t)
-                    if r:
-                        return r
-            finally:
-                st["calling"].discard(c)
-                st["lost"] = saved
+            if c != done:  # (já reexecutada acima quando era a palavra de comando; aqui chega o que um embrulho escondia: time f, command f)
+                r = call(c, blind)
+                if r:
+                    return r
+            if c == "git":  # uma função chamada git NÃO isenta a chamada: a definição pode não ter rodado (`false && function git`, subshell, chamada condicional) e `command git`, `env git` e `\git` ignoram a função; o corpo já foi conferido acima, e o git de verdade também
+                return git_hit(seg, {**st["env"], **env}, cwd, terr, own)
         elif c == "git":
             return git_hit(seg, {**st["env"], **env}, cwd, terr, own)
         return None
@@ -643,8 +666,8 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
                     if r:
                         return r
                     if pc == "(":
-                        if len(seg) == 1 and not skip and seg[0] not in KEYWORDS:
-                            st["func"], st["fname"] = True, seg[0]  # `f (`: definição de função — o `{ … }` que vem a seguir é corpo que não roda agora
+                        if not skip and (len(seg) == 1 and seg[0] not in KEYWORDS or len(seg) == 2 and seg[0] == "function" and seg[1] not in KEYWORDS):
+                            st["func"], st["fname"] = True, seg[-1]  # `f (` e `function f (`: definição de função — o `{ … }` que vem a seguir é corpo que não roda agora
                         stack.append(st["cwd"])
                         skip = False  # `<(cmd)` / `>(cmd)`: o `<` que vem colado no `(` não é redirecionamento de arquivo, a palavra seguinte é um comando
                     elif pc == ")":

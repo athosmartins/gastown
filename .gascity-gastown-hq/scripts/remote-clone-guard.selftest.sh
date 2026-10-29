@@ -22,6 +22,10 @@
 # VARIÁVEIS: RCG_UNDER_TEST (guarda a testar) · RCG_ONLY (grupos, vírgula) · RCG_NO_MUTANTS=1
 # BUDGET (grupo à parte, ga-tih62nv): o pedido que fazia o guarda girar SEM FIM (e que o hook deixava seguir sem conferência ao estourar o prazo de 600 s do Claude Code) termina;
 #   passou do teto de passos ou de tempo = BLOQUEADO, nunca liberado. Cada caso roda com prazo próprio (o guarda de antes não termina nesse pedido: o caso tem que reprovar, não pendurar).
+#   Tentativa 2 no gate (parecer: a definição aninhada registrava o NOME sem condição e uma função chamada git pulava o git_hit): uma função chamada git NUNCA isenta a chamada (definição
+#   condicional, em subshell, f que não rodou, command git / env git / \git), `g()` + newline + `{` e `function g()` no topo são definições, e a mesma aninhada reexecutada não se registra de novo.
+#   A CLASSE disso: uma função com nome de comando que o guarda trata ANTES do ramo de função (bash, env, cd, find, eval, export, sudo, ssh…) é chamada como função pelo shell; o corpo
+#   é reexecutado antes dos ramos especiais, e um cd ou export coberto por função vale "não sei".
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 P="${RCG_UNDER_TEST:-$HERE/remote-clone-guard.py}"
@@ -496,6 +500,7 @@ END-OF-FILE"
 git -C $OTH commit -m x
 	EOF"
   b 2 "cond: f() { git commit; }; cd <alheio>; f (o corpo roda no cwd da chamada)" "f() { git commit -m x; }; cd $OTH; f"
+  b 2 "cond: f() { git commit; }; cd <alheio>; time f (a função atrás de um embrulho: o ramo depois do descasque)" "f() { git commit -m x; }; cd $OTH; time f"
   b 2 "cond: function f { git commit; }; (cd <alheio>; f)" "function f { git commit -m x; }; (cd $OTH; f)"
   b 2 "cond: cd <próprio>/nao-existe; git commit, com cwd no alheio (o cd falha, o shell fica no alheio)" "cd $OWN/nao-existe; git commit -m x" "$OTH"
   b 2 "cond: cd <próprio>/arquivo (não é diretório); git commit, com cwd no alheio" "cd $OWN/.git; git commit -m x" "$OTH"
@@ -926,6 +931,52 @@ EOF
   b 0 "budget: controle — com uma bandeira de definição velha (foo(); no meio), o grupo { } do corpo de f NÃO reabre a definição: o cd e o git do próprio seguem certos" "f() { :; { :; }; }; foo(); f; cd $OWN && git commit -m x"
   b 2 "budget: f cuja chave não fecha (aspa tardia) com function g { } e um git no alheio: o corpo reexecutado no fim é CONFERIDO, não engolido por g" "f() { :; echo '{'; function g { :; }; git -C $OTH commit -m x; }; f"
   b 2 "budget: controle — a função aninhada CHAMADA que escreve no alheio é bloqueada" "f() { function g { git -C $OTH commit -m x; }; g; }; f"
+  # parecer do gate na tentativa 1: registrar a aninhada SEM CONDIÇÃO, com o ramo "chamada de função" antes do ramo git, deixava uma função chamada git pular o git_hit.
+  # Uma função chamada git NUNCA isenta a chamada: pode não existir (a definição não rodou) e command git / env git / \git a ignoram.
+  b 2 "budget: f() { false && function git { :; }; }; f; git -C <alheio> commit — a definição NUNCA rodou, o git de verdade escreve no alheio" "f() { false && function git { :; }; }; f; git -C $OTH commit -m x"
+  b 2 "budget: ...a definição dentro de um subshell ( function git { :; } ) não vale fora dele" "f() { ( function git { :; } ); }; f; git -C $OTH commit -m x"
+  b 2 "budget: ...a chamada de f que pode não rodar (false && f)" "f() { function git { :; }; }; false && f; git -C $OTH commit -m x"
+  b 2 "budget: ...a git DEFINIDA de verdade também não isenta a chamada (lado fechado, falso positivo assumido: command git e env git a ignoram)" "f() { :; function git { :; }; }; f; git -C $OTH commit -m x"
+  b 2 "budget: ...sem a camada f (false && function git { :; })" "false && function git { :; }; git -C $OTH commit -m x"
+  b 2 "budget: ...f chamada dentro de \$( )" "f() { function git { :; }; }; echo \$(f); git -C $OTH commit -m x"
+  b 2 "budget: ...a forma g() { de uma aninhada chamada git" "f() { git() { :; }; }; f; git -C $OTH commit -m x"
+  b 2 "budget: git() { :; }; git -C <alheio> commit — a função git do topo não isenta a chamada" "git() { :; }; git -C $OTH commit -m x"
+  b 2 "budget: ...git() { :; }; command git -C <alheio> commit (command ignora a função)" "git() { :; }; command git -C $OTH commit -m x"
+  b 2 "budget: ...env git" "git() { :; }; env git -C $OTH commit -m x"
+  b 2 "budget: ...\\git" "git() { :; }; \\git -C $OTH commit -m x"
+  b 2 "budget: ...e o cwd alheio" "git() { :; }; cd $OTH; git commit -m x"
+  b 0 "budget: controle — git() que só faz echo e uma LEITURA no alheio: libera (o git de verdade só lê)" "git() { echo hi; }; git -C $OTH log"
+  b 0 "budget: controle — ...e a escrita no PRÓPRIO clone" "git() { echo hi; }; git -C $OWN commit -m x"
+  # `g()` + quebra de linha + `{`: o separador é o `;` do newline, não o `)`; num corpo reexecutado o `{` é o corpo da aninhada (não roda agora)
+  b 2 "budget: f() { :; g()⏎{ cd <próprio>; }; }; cd <alheio>; f; git commit — g só foi DEFINIDA, o commit escreve no alheio" "f() { :; g()"$'\n'"{ cd $OWN; }; }; cd $OTH; f; git commit -m x"
+  b 2 "budget: ...com espaço (g ()⏎{)" "f() { :; g ()"$'\n'"{ cd $OWN; }; }; cd $OTH; f; git commit -m x"
+  b 2 "budget: ...e na forma function g ()⏎{" "f() { :; function g ()"$'\n'"{ cd $OWN; }; }; cd $OTH; f; git commit -m x"
+  b 0 "budget: controle — texto de python (foo(a, b)) num heredoc no corpo de f e um grupo { cd <próprio>; } depois: o grupo RODA (a cabeça não deixa bandeira velha)" "f() { python3 - <<'EOF'"$'\n'"foo(a, b)"$'\n'"EOF"$'\n'"{ cd $OWN; }; git commit -m x; }; cd $OTH; f"
+  b 0 "budget: controle — uma cabeça foo (a) solta e depois um grupo { cd <próprio>; } que RODA" "f() { echo \$(foo (a)); { cd $OWN; }; }; cd $OTH; f; git commit -m x"
+  # function g() no topo: g só foi definida, o cd de dentro não rodou
+  b 2 "budget: cd <alheio>; function g() { cd <próprio>; }; git commit — a definição não roda o corpo" "cd $OTH; function g() { cd $OWN; }; git commit -m x"
+  b 2 "budget: ...com espaço (function g ())" "cd $OTH; function g () { cd $OWN; }; git commit -m x"
+  b 2 "budget: ...function g()⏎{" "cd $OTH; function g()"$'\n'"{ cd $OWN; }; git commit -m x"
+  b 0 "budget: controle — function g() chamada: o cd RODA e o commit é no próprio" "cd $OTH; function g() { cd $OWN; }; g; git commit -m x"
+  # custo: a MESMA aninhada reexecutada não se registra de novo (o corpo registrado traz o próprio cabeçalho: a lista dobrava a cada chamada)
+  tb 0 "budget: f() { function g { :; }; g; }; f; g; g; g; g; g; g; g — 7 chamadas de uma aninhada não estouram o teto (falso positivo da tentativa 1)" "f() { function g { :; }; g; }; f; g; g; g; g; g; g; g"
+  tb 0 "budget: ...f chamada duas vezes" "f() { function g { :; }; g; }; f; f; g; g"
+  tb 2 "budget: controle — 7 chamadas da aninhada que escreve no alheio ainda bloqueiam" "f() { function g { git -C $OTH commit -m x; }; }; f; g; g; g; g; g; g; g"
+  b 2 "budget: controle — duas aninhadas de nomes diferentes: cada uma registrada, a segunda escreve no alheio" "f() { function g { :; }; function k { git -C $OTH commit -m x; }; }; f; k"
+  b 2 "budget: controle — a MESMA aninhada g definida por duas funções, a segunda escreve: o registro da segunda não pode ser pulado só porque o nome já foi registrado" "f() { function g { :; }; }; h() { function g { git commit -m x; }; }; f; h; cd $OTH; g"
+  # a CLASSE do parecer: uma função com nome de comando que o guarda trata ANTES do ramo de função (bash, env, cd, find, eval, export, sudo, ssh…) é chamada como FUNÇÃO pelo shell, e o
+  # corpo nunca era reexecutado (o guarda de antes também liberava). `git` era só o caso que o gate citou.
+  local nm
+  for nm in bash sh eval find env sudo xargs command time ssh flock exec nohup; do
+    b 2 "budget: $nm() { <escreve no alheio>; }; $nm — a função tem o nome de um comando que o guarda trata antes: o corpo RODA" "$nm() { git -C $OTH commit -m x; }; $nm"
+  done
+  b 2 "budget: cd() { <escreve no alheio>; }; cd /tmp" "cd() { git -C $OTH commit -m x; }; cd /tmp"
+  b 2 "budget: export() { <escreve no alheio>; }; export X=1" "export() { git -C $OTH commit -m x; }; export X=1"
+  b 0 "budget: controle — bash() que só faz echo: libera" "bash() { echo hi; }; bash"
+  b 0 "budget: controle — env() que só faz echo: libera" "env() { echo hi; }; env"
+  b 2 "budget: cd <alheio>; cd() { :; }; cd <próprio>; git commit — o cd é a FUNÇÃO e o diretório não mudou: o commit escreve no alheio" "cd $OTH; cd() { :; }; cd $OWN; git commit -m x"
+  b 2 "budget: export GIT_DIR=<alheio>; export() { :; }; export GIT_DIR=<próprio>; git commit — o export é a FUNÇÃO e a variável não mudou" "export GIT_DIR=$OTH/.git; export() { :; }; export GIT_DIR=$OWN/.git; git commit -m x"
+  b 2 "budget: f() { git -C <alheio> commit; }; time f — a função atrás de um embrulho (time) ainda é conferida" "f() { git -C $OTH commit -m x; }; time f"
   r=$(python3 -I "$capy" 10 "$hn" "$P" busy 2>&1); echo "$r" | grep -qF "rc=2 " && echo "$r" | grep -qF "timer=0 " && echo "$r" | grep -qF "analisar=1"; ok $? "budget: o julgamento que gira sem fim é cortado pelo relógio (0.3 s no teste): sai 2, diz que não deu tempo e o relógio fica desarmado [$r]"
   r=$(python3 -I "$capy" 10 "$hn" "$P" stdin 2>&1); echo "$r" | grep -qF "rc=2 " && echo "$r" | grep -qF "analisar=1"; ok $? "budget: o relógio já está armado quando o guarda lê o stdin: pedido que nunca termina de chegar é BLOQUEADO [$r]"
   r=$(python3 -I "$capy" 10 "$hn" "$P" ok 2>&1); echo "$r" | grep -qF "rc=0 " && echo "$r" | grep -qF "timer=0 "; ok $? "budget: pedido comum libera e deixa o relógio desarmado [$r]"
@@ -1098,19 +1149,28 @@ echo "== $((n-fails))/$n ok =="
   mutant budget "o relógio continua armado depois do veredito" 's/^        signal.setitimer(signal.ITIMER_REAL, 0)$/        pass/'
   mutant budget "o estouro dentro do julgamento cai no 'o guarda falhou' (sem a recusa de tempo)" 's/^    except Budget:$/    except KeyError:/'
   mutant budget "main() não pega o estouro" 's/^    except Budget as e:/    except KeyError as e:/'
-  mutant budget "function NOME { aninhada num corpo reexecutado não marca a região como perdida" 's/if seg\[:1\] == \["function"\] or seg\[:1\] == \["{"\] and prev == ")":/if seg[:1] == ["{"] and prev == ")":/'
-  mutant budget "NOME() { aninhada num corpo reexecutado não marca a região como perdida" 's/if seg\[:1\] == \["function"\] or seg\[:1\] == \["{"\] and prev == ")":/if seg[:1] == ["function"]:/'
+  mutant budget "function NOME { aninhada num corpo reexecutado não marca a região como perdida" 's/if seg\[:1\] == \["function"\] or seg\[:1\] == \["{"\] and (prev == ")" or st.get("nhead")):/if seg[:1] == ["{"] and (prev == ")" or st.get("nhead")):/'
+  mutant budget "NOME() { aninhada num corpo reexecutado não marca a região como perdida" 's/if seg\[:1\] == \["function"\] or seg\[:1\] == \["{"\] and (prev == ")" or st.get("nhead")):/if seg[:1] == ["function"]:/'
   mutant budget "na região perdida o cd volta a valer" 's/if st.get("lost") or kw or wrapped or ext or/if kw or wrapped or ext or/'
   mutant budget "na região perdida a atribuição de variável volta a valer" 's/unsure = bool(st.get("lost")) or kw/unsure = kw/'
-  mutant budget "uma chamada feita dentro da região perdida a encerra para o resto do corpo de fora" 's/^                st\["lost"\] = saved$/                st.pop("lost", None)/'
+  mutant budget "uma chamada feita dentro da região perdida a encerra para o resto do corpo de fora" 's/^            st\["lost"\] = saved$/            st.pop("lost", None)/'
   mutant budget "function f { depois de || ou && vale como definição que sempre rodou" 's/";" if prev == ")" else prev/";"/'
-  mutant budget "a aninhada não passa a existir quando f roda (a chamada dela de fora não é conferida)" 's/^                    st\["funcs"\]\.setdefault(nm, \[\])\.extend(st\.get("rest", ()))$/                    pass/'
+  mutant budget "a aninhada não passa a existir quando f roda (a chamada dela de fora não é conferida)" 's/^                        st\["funcs"\]\.setdefault(nm, \[\])\.extend(rest)$/                        pass/'
   mutant budget "a cabeça g() aninhada não dá o nome à função (só a forma function g { dá)" 's/^                st\["nhead"\] = seg\[0\] .*/                pass/'
   mutant budget "function g { aninhada não dá o nome à função (só a forma g() { dá)" 's/nm = seg\[1\] if seg\[0\] == "function" and seg\[1:2\] else st.pop("nhead", None)/nm = st.pop("nhead", None)/'
-  mutant budget "a reexecução percorre a lista viva (uma função que se redefine acrescenta a si mesma sem fim)" 's/body = list(st\["funcs"\]\[c\])  # cópia/body = st["funcs"][c]  # cópia/'
-  mutant budget "registrar uma aninhada copia a lista sem entrar na conta do teto" 's/^                    tick(len(st.get("rest", ())))  #.*/                    pass/'
+  mutant budget "a reexecução percorre a lista viva E o registro repetido não é pulado (juntos: uma função que se redefine acrescenta a si mesma sem fim; sozinha, a cópia virou defesa em profundidade, o registro único já impede)" 's/body = list(st\["funcs"\]\[c\])  # cópia/body = st["funcs"][c]  # cópia/;s/if key not in st.setdefault("regd", set()):/if st.setdefault("regd", set()) is not None:/'
+  mutant budget "registrar uma aninhada copia a lista sem entrar na conta do teto" 's/^                        tick(len(rest))  #.*/                        pass/'
   mutant budget "a cabeça NOME( que não foi seguida de { deixa a bandeira de definição velha (o próximo grupo { } vira corpo, sem conferir)" 's/^        if seg and seg\[0\] != "{":$/        if False:/'
   mutant budget "o corpo que começa por um grupo { } parece uma definição aninhada" 's/";" if prev == ")" else prev/prev/'
+  mutant budget "uma função chamada git isenta a chamada do git_hit (a definição pode nem ter rodado; command git a ignora)" 's/^            if c == "git":  #.*/            if False:/'
+  mutant budget "g() NEWLINE { num corpo reexecutado não é lido como definição aninhada" 's/(prev == ")" or st.get("nhead"))/prev == ")"/'
+  mutant budget "a cabeça g ( que não foi seguida de { deixa a bandeira velha (o próximo grupo { } vira corpo de função e o cd dele deixa de valer)" 's/^            elif seg and seg\[0\] != "{":$/            elif False:/'
+  mutant budget "a MESMA aninhada é registrada de novo a cada chamada (a lista dobra e o pedido de 7 chamadas estoura o teto)" 's/if key not in st.setdefault("regd", set()):/if st.setdefault("regd", set()) is not None:/'
+  mutant budget "o registro da aninhada é pulado pelo NOME (a segunda definição de g, que escreve, nunca é conferida na chamada)" 's/key = (nm, id(rest\[0\]) if rest else 0)/key = nm/'
+  mutant budget "function NOME() no topo não é lido como definição (o cd de dentro vale como se tivesse rodado)" 's/ or len(seg) == 2 and seg\[0\] == "function" and seg\[1\] not in KEYWORDS)/)/'
+  mutant budget "a palavra de comando que é uma função não é reexecutada antes dos ramos especiais (bash(), env(), cd(), find(), eval()…)" 's/^        if fw in st.get("funcs", {}) and fw not in st.setdefault("calling", set()):/        if False:/'
+  mutant budget "um cd coberto por uma função segue modelado como cd" 's/^            if done:$/            if False:/'
+  mutant budget "uma atribuição coberta por uma função (export() { :; }) segue valendo" 's/ or kw or bool(done) or blk or/ or kw or blk or/'
   echo "-- contra um stub que só sai 0 (o servidor ANTES desta fatia)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"; printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$T/stub.py"
   r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,shell,wrap,lex,dest,cfg,tools,msg,check,cond" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"
