@@ -9,15 +9,19 @@ PARA QUE SERVE
 COMO DECIDE
   Ferramenta de arquivo: o caminho do pedido (file_path, notebook_path, path, o diretório fixo do pattern de Glob; Grep/Glob sem path = o cwd) é resolvido (`~`, `$HOME`, cwd, link simbólico)
   e comparado com o catálogo; Grep/Glob também recusam um glob que NOMEIA a família (`.env*`, `*.pem`). Bash: o texto é lido como o bash lê (aspas, comentário, heredoc, `bash -c`/`eval`/`$( )`, `cd`,
-  embrulho `timeout`/`nohup`/`env`/`sudo`), cada palavra vira candidato a caminho (chave `{a,b}` primeiro, depois `~`, `$HOME`, atribuição anterior, `${X:-padrão}`, glob que EXISTE) e o código inline
+  embrulho `timeout`/`nohup`/`env`/`sudo`), cada palavra vira candidato a caminho (chave `{a,b}` e `{x..y[..n]}` primeiro, depois `~`, `$HOME`, atribuição anterior, `${X:-padrão}`, glob que EXISTE) e o código inline
   de python/node/perl/ruby/php/awk é varrido por literais de caminho. $( ) e crase rodam em QUALQUER palavra. Caminho com pedaço que não sei resolver: valem a pasta literal antes dele, o nome do fim e o
   caminho com o pedaço tirado. Verbo que só olha metadado (echo, ls, stat, test, cd, `git status|ls-files|check-ignore`, o padrão do grep, o valor de `find -name`) não conta como leitura, salvo quando a
   saída vira operando de outro comando (`xargs`, `read`, `$( )`); redirecionamento conta sempre.
-CÓDIGOS: 0 liberado · 2 bloqueado. Falha do próprio guarda num pedido que ele cobre = bloqueado (nunca "liberado"); aninhamento acima de 6 níveis e glob que não termina de ser conferido em 4 s também ("não consigo ler" = bloqueado).
+  CWD E VARIÁVEL = CONJUNTO, não um valor: um `cd` pode falhar, ser condicional ou cair noutra pasta (CDPATH, cdable_vars), e uma atribuição pode não ter rodado. Cada linha vale para TODOS os cwds que ela pode ter
+  (o de antes continua possível; destino que não existe não entra) e cada variável vale com TODOS os valores que recebeu na chamada (até 512 combinações; mais, ou mais de 64 cwds, bloqueia).
+CÓDIGOS: 0 liberado · 2 bloqueado. Falha do próprio guarda num pedido que ele cobre = bloqueado (nunca "liberado"); aninhamento acima de 6 níveis, byte NUL num caminho e glob cujos CASOS não terminam de ser conferidos em 4 s também ("não consigo ler" = bloqueado).
+  O prazo de 4 s só é conferido quando o glob devolve um caso: um glob que percorre muito e casa pouco (`cat d/*/*/*/*/x`) NÃO é limitado por ele, e um hook que passa do timeout do harness não sai 2 (não bloqueia).
 LIMITES (trava contra engano, não sandbox; o fecho de verdade é permissão de arquivo por usuário Unix): não vejo caminho montado em pedaços (`chr()`, concatenação,
   `base64 -d`), variável que não é HOME nem atribuída na mesma chamada (raiz desconhecida + pasta de segredo + nome comum, `$X/.gnupg/pubring.kbx`, passa), variável de laço, script que o
-  comando executa (`bash x.sh`), segredo no ambiente, nem o que um programa lê sozinho (`ssh` usa a chave). Depois de um `cd` que não sigo (`cd $X`, `cd -`, `popd`) o cwd é desconhecido: nome de segredo e
-  arquivo que existe numa pasta de segredo bloqueiam; `grep -r x .` e criar arquivo novo de nome comum, não. Lista completa: docs/runbooks/guard-oracle-diff.md, "Limites".
+  comando executa (`bash x.sh`), segredo no ambiente, nem o que um programa lê sozinho (`ssh` usa a chave). Depois de um `cd` que não sigo (`cd $X`, `cd` relativo com CDPATH/cdable_vars em jogo, `eval "cd …"`) o cwd
+  é desconhecido: nome de segredo e arquivo que existe numa pasta de segredo bloqueiam; `grep -r x .` e criar arquivo novo de nome comum, não. CDPATH atribuído por nome montado (`declare "$n=…"`), `eval "$cmd"`, alias,
+  `~+`, `~-`, `~usuário`, `${HOME%/}` e `shopt -s globstar dotglob` não são modelados. Lista completa: docs/runbooks/guard-oracle-diff.md, "Limites".
 """
 from __future__ import annotations
 
@@ -27,14 +31,18 @@ import itertools
 import json
 import os
 import re
+import stat
 import sys
 import time
 
 FILE_TOOLS = {"Read": "file_path", "Edit": "file_path", "Write": "file_path", "MultiEdit": "file_path", "NotebookEdit": "notebook_path", "NotebookRead": "notebook_path"}
 WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 COVERED = {"Bash", "Grep", "Glob", *FILE_TOOLS}
-BUDGET_S = 4.0  # segundos que um pedido tem para conferir os casos de glob (nó: ~20 mil caminhos/s; mini: bem menos): sem tempo BLOQUEIA (secret.glob-too-wide), nunca olha uma parte e libera o resto
+BUDGET_S = 4.0  # segundos que um pedido tem para conferir os CASOS de glob (nó: ~20 mil caminhos/s; mini: bem menos): estourou no meio dos casos BLOQUEIA (secret.glob-too-wide), nunca olha uma parte e libera o resto. Só é conferido quando o glob devolve um caso: o que percorre muito e casa pouco não é limitado (Limites)
 LATE = [0.0]  # o prazo do pedido em curso, em time.monotonic() (decide() recarrega)
+CDP = [False]  # CDPATH ou cdable_vars em jogo neste pedido (decide() recarrega, scan_bash liga): um `cd` relativo sem ./ ou ../ pode cair noutra pasta que não a do cwd
+CDP_MENTION = re.compile(r"cdpath|cdable_?vars", re.I)  # bash: CDPATH e `shopt -s cdable_vars`; zsh: o array `cdpath` e `setopt cdable_vars` (opção sem diferença de caixa nem de `_`)
+ALTS = "\0alts"  # chave do env: nome -> TODOS os valores que a variável recebeu na chamada (atribuição repetida ou condicional: o shell pode ter ficado com qualquer um)
 real_home = functools.lru_cache(maxsize=None)(os.path.realpath)  # um glob larga milhares de caminhos e cada um confere o HOME real: só o 1º resolve
 
 # --- catálogo (portado do cc-safety-net 2.7.0, src/core/rules/secret.ts, cortado ao que existe nas nossas máquinas) ---
@@ -162,6 +170,17 @@ def expand(s: str, cwd, env: dict) -> str:
     return s if os.path.isabs(s) else os.path.join(cwd or os.getcwd(), s)
 
 
+def valuations(text: str, env: dict) -> list:
+    """Cada valoração de `env` para as variáveis que `text` cita e que receberam valores diferentes na chamada (`D=a; [ -f x ] && D=b`: o shell pode ter ficado com qualquer um): [env] se não há
+    nenhuma. Passou de 512 combinações (um laço `for` de 30 ids vale 30; só o PRODUTO entre variáveis explode): OverflowError, quem chama decide (classify BLOQUEIA)."""
+    alts = env.get(ALTS) or {}  # vazio → nenhuma variável com valores alternativos, vale o env como está; falhou/ilegível → n/a (dict em memória)
+    names = [n for n in dict.fromkeys(re.findall(r"\$\{?(" + NAME + ")", text)) if n in alts]
+    combos = list(itertools.product(*(alts[n] for n in names)))
+    if len(combos) > 512:
+        raise OverflowError(text)
+    return [dict(env, **dict(zip(names, c))) for c in combos] if names else [env]
+
+
 def partial(cand: str, write: bool):
     """Regra de segredo de um caminho com pedaço desconhecido (`$VAR` de fora, `$( )`, crase), ou None. O que eu sei ainda vale: (A) a pasta literal ANTES do 1º pedaço
     desconhecido com um filho qualquer (`~/.ssh/$f` abre algo em ~/.ssh) e (B) o NOME do fim, se ele é literal (`$(echo ~)/.ssh/id_rsa`). O caso "o pedaço é vazio" (C) é do classify()."""
@@ -176,9 +195,35 @@ def partial(cand: str, write: bool):
     return hit
 
 
+SEQ = re.compile(r"(?<!\$)\{([+-]?\d+|[^{},.])\.\.([+-]?\d+|[^{},.])(?:\.\.([+-]?\d+))?\}")  # `{x..y}` e `{x..y..n}`: x e y inteiros ou um caractere só
+
+
+def sequence(m):
+    """Os valores de uma sequência `{x..y[..n]}`, ou None se não é sequência (o shell a deixa como texto). Inteiros (sem o zero à esquerda que o shell preenche: nenhuma regra do catálogo
+    depende de dígito); caracteres por código (o zsh anda por qualquer caractere, o bash só por letras: aqui vale o maior); passo 0 vale 1 e o sinal do passo não conta. Mais de 64 valores: OverflowError."""
+    a, b, n = m.group(1), m.group(2), m.group(3)
+    step = abs(int(n)) if n else 1
+    if re.fullmatch(r"[+-]?\d+", a) and re.fullmatch(r"[+-]?\d+", b):
+        lo, hi, fmt = int(a), int(b), str
+    elif len(a) == 1 and len(b) == 1:
+        lo, hi, fmt = ord(a), ord(b), chr
+    else:
+        return None
+    step = step or 1
+    if abs(hi - lo) // step + 1 > 64:
+        raise OverflowError(m.group(0))
+    return [fmt(lo + i * step * (1 if hi >= lo else -1)) for i in range(abs(hi - lo) // step + 1)]
+
+
 def braces(s: str, depth: int = 3) -> list:
-    """Expansão de chave. Passou do teto (16 alternativas, 3 níveis, 64 resultados) levanta OverflowError: quem chama BLOQUEIA, nunca corta em silêncio."""
+    """Expansão de chave, as duas formas: lista `{a,b}` e sequência `{x..y[..n]}`. Passou do teto (16 alternativas, 3 níveis, 64 resultados) levanta OverflowError: quem chama BLOQUEIA, nunca corta em silêncio."""
     m = re.search(r"(?<!\$)\{([^{}]*,[^{}]*)\}", s)  # `${X:-a,b}` é expansão de parâmetro, não chave
+    q = next(((x, v) for x in SEQ.finditer(s) if (v := sequence(x)) is not None), None)  # vazio → não há sequência: segue só a lista; falhou/ilegível (mais de 64 valores) → OverflowError, que bloqueia
+    if q and (not m or q[0].start() < m.start()):
+        out = [r for v in q[1] for r in braces(s[:q[0].start()] + v + s[q[0].end():], depth - 1)] if depth else None
+        if out is None or len(out) > 64:
+            raise OverflowError(s)
+        return out
     if not m:
         return [s]
     alts = m.group(1).split(",")
@@ -189,11 +234,12 @@ def braces(s: str, depth: int = 3) -> list:
 
 
 BRACKET = re.compile(r"\[(?:[^\]\[]|\[:[a-z]+:\])+\]")
+EXTGLOB = re.compile(r"[@+!*?]\((?:[^()]|\([^()]*\))*\)")  # extglob (`shopt -s extglob`): @(a|b) +(a) !(a) *(a) ?(a)
 
 
 def cases(cand: str):
     """Os caminhos que o glob de `cand` devolve, um a um. Passou do prazo do pedido (LATE) no meio deles: OverflowError, porque olhar uma parte e liberar o resto é o mesmo 0 de "não é segredo"."""
-    n, pat = 0, BRACKET.sub(lambda m: "?" if "[:" in m.group(0) else m.group(0), cand.replace("[^", "[!"))  # o bash lê `[^c]` como `[!c]`; classe POSIX que o fnmatch não conhece vira `?` (casa a mais: nunca a menos)
+    n, pat = 0, EXTGLOB.sub("*", BRACKET.sub(lambda m: "?" if "[:" in m.group(0) else m.group(0), cand.replace("[^", "[!")))  # o bash lê `[^c]` como `[!c]`; classe POSIX que o fnmatch não conhece vira `?`; grupo extglob vira `*` (casa a mais: nunca a menos)
     for n, p in enumerate(glob.iglob(pat), 1):  # vazio → o literal vale; falhou/ilegível (permissão, loop de link) → glob devolve [] e o literal vale
         if time.monotonic() > LATE[0]:
             raise OverflowError(cand)
@@ -204,8 +250,18 @@ def cases(cand: str):
 
 def classify(raw: str, cwd, write: bool = False, env=None):
     """(regra, caminho) se `raw` é caminho de segredo; None se não é, ou se não sei resolver o caminho TODO (variável que não conheço: limite documentado, não bloqueio; mas a pasta
-    literal antes do pedaço desconhecido e o nome do fim ainda valem, ver partial())."""
+    literal antes do pedaço desconhecido e o nome do fim ainda valem, ver partial()). Variável que recebeu valores diferentes na chamada: confere cada um (valuations())."""
+    try:
+        envs = valuations(raw or "", env or {})
+    except OverflowError:  # variáveis demais com valor alternativo: não consigo conferir todas as combinações
+        return "secret.too-many-values", (raw or "").strip()
+    return next(filter(None, (classify_env(raw, cwd, write, e) for e in envs)), None)
+
+
+def classify_env(raw: str, cwd, write: bool, env: dict):
     raw = (raw or "").strip()
+    if "\x00" in raw:  # vazio → n/a; falhou/ilegível → byte NUL: nenhuma ferramenta abre esse caminho e cada versão do Python o trata de um jeito (3.9 engole o ValueError, 3.11+ levanta): bloqueia explícito
+        return "secret.nul-byte", raw.replace("\x00", "\\x00")
     if not raw or raw.startswith("-") or re.match(r"[A-Za-z][\w+.-]*://", raw):
         return None
     try:
@@ -214,6 +270,8 @@ def classify(raw: str, cwd, write: bool = False, env=None):
     except OverflowError:
         return "secret.brace-expansion", raw
     for alt, cand in zip(alts, cands):
+        if "\x00" in cand:  # o NUL veio do valor de uma variável ou do cwd do pedido
+            return "secret.nul-byte", cand.replace("\x00", "\\x00")
         guess = isinstance(cwd, Guess) and not os.path.isabs(subst(alt, env or {}))  # nome relativo numa pasta que só suponho ser o cwd
         if UNKNOWN.search(cand):
             hit = partial(cand, write)
@@ -226,7 +284,7 @@ def classify(raw: str, cwd, write: bool = False, env=None):
                 continue
             cand = bare
         try:
-            for p in cases(cand) if re.search(r"[*?\[]", cand) else [cand]:
+            for p in cases(cand) if re.search(r"[*?\[]|[@+!]\(", cand) else [cand]:
                 for form in dict.fromkeys((os.path.normpath(p), os.path.realpath(p))):  # a mesma forma duas vezes é um custo só
                     r = match(form, write)
                     if r and r.startswith(("secret.home.", "secret.cli.")) and (guess or ("/" not in raw and not write)) and (not os.path.lexists(form) or (guess and os.path.normpath(p) == cwd)):
@@ -244,7 +302,16 @@ BASES = sorted(CRED_PARENTS | {sub for sub, _, is_file in HOME_SUB if not is_fil
 
 def broad(raw: str, cwd, env=None, deep: bool = True):
     """('secret.scan.home', caminho) se `raw` é o HOME, um ancestral dele ou `~/gt-remote` (ancestral de ~/gt-remote/keys): varrer isso recursivamente lê segredo. deep=True (quem LÊ
-    conteúdo: grep -r, find, tar, cp -r, Grep) vale também para os outros ancestrais de segredo do catálogo (`~/.claude`, `~/.config`…); deep=False (Glob só lista nomes) fica no HOME e acima."""
+    conteúdo: grep -r, find, tar, cp -r, Grep) vale também para os outros ancestrais de segredo do catálogo (`~/.claude`, `~/.config`…); deep=False (Glob só lista nomes) fica no HOME e acima.
+    Variável com valores alternativos: confere cada um (valuations())."""
+    try:
+        envs = valuations(raw or "", env or {})
+    except OverflowError:
+        return "secret.too-many-values", (raw or "").strip()
+    return next(filter(None, (broad_env(raw, cwd, e, deep) for e in envs)), None)
+
+
+def broad_env(raw: str, cwd, env: dict, deep: bool):
     if isinstance(cwd, Guess) and not os.path.isabs(subst(raw or "", env or {})): return None  # `.` numa pasta que só suponho ser o cwd: varrer o cwd de um `cd` que não sigo é o `grep -r x .` de todo dia, limite documentado
     p = os.path.normpath(expand(raw or "", cwd, env or {})) if raw else ""
     if p and (p in ("/", "/home", "/Users", "/root", home(), home() + "/gt-remote") or home().startswith(p.rstrip("/") + "/")):
@@ -355,6 +422,8 @@ def lex(text: str):
             j = skip_subst(text, i); cur.append(text[i:j]); word = True; i = j
         elif c == "(" and word and re.fullmatch(r"[A-Za-z_]\w*\+?=", "".join(cur)):  # NOME=(a b): array, UMA palavra só (os elementos são caminhos e `$NOME` é o 1º)
             j = skip_subst(text, i - 1); cur.append(text[i:j]); i = j
+        elif c == "(" and word and cur and cur[-1][-1:] in ("@", "+", "!", "*", "?"):  # extglob `@(a|b)` e qualificador de glob do zsh `*(.)`: o grupo é parte da palavra (o cases() o lê)
+            j = skip_subst(text, i - 1); cur.append(text[i:j]); i = j
         elif c in ";&|()<>":
             pre = ""
             if c in "<>" and word and "".join(cur).isdigit():  # `2>`: o descritor faz parte do operador
@@ -419,21 +488,81 @@ def where(cwd) -> list:
     return [Guess(os.path.join(home(), *p)) for p in BASES] if cwd is UNSURE else [cwd]
 
 
-def cd_target(words: list, cwd, env: dict):
-    """O cwd depois da linha (assumo que o `cd` rodou): o mesmo se ela não é cd; o destino do `cd`/`pushd`; UNSURE se não sei qual é (DYN, `popd`, `pushd` sem destino, relativo a um UNSURE, `eval` com `cd` dentro)."""
+def uniq(items: list) -> list:
+    """Os cwds sem repetir (UNSURE vale um só)."""
+    out, keys = [], set()
+    for c in items:
+        k = "\0unsure" if c is UNSURE else str(c)
+        if k not in keys:
+            keys.add(k)
+            out.append(c)
+    return out
+
+
+def pool(here: list) -> list:
+    """Onde conferir uma linha: where() de CADA cwd possível, sem repetir (a mesma pasta conhecida e suposta vale a conhecida, a mais estrita)."""
+    out = {}
+    for c in here:
+        for b in where(c):
+            if str(b) not in out or (isinstance(out[str(b)], Guess) and not isinstance(b, Guess)):
+                out[str(b)] = b
+    return list(out.values())
+
+
+def may_exist(p: str) -> bool:
+    """O `cd` para `p` pode ter dado certo (então `p` é um cwd possível)? Existe como pasta: sim. Não existe: não (o `cd` falha e o cwd fica onde estava, que já está no conjunto)."""
+    try:  # vazio → não existe: o cd falha; falhou/ilegível (permissão, loop de link, byte NUL) → não sei se existe: vale como possível
+        return stat.S_ISDIR(os.stat(p).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except (OSError, ValueError):
+        return True
+
+
+def cd_targets(words: list, cwd, env: dict) -> list:
+    """Os cwds possíveis depois da linha SE ela é um `cd` que rodou: [cwd] se ela não é cd; o destino do `cd`/`pushd` (um por valor possível da variável do destino e por pasta que o glob ou a chave do destino casa); UNSURE se não sei qual é (DYN,
+    `popd`, `pushd` sem destino, relativo a um UNSURE, `eval` com `cd` dentro, e `cd` relativo sem ./ ou ../ quando CDPATH ou cdable_vars está em jogo: o shell o procura em
+    outras pastas). `-P` (em qualquer posição) acrescenta a pasta com os links resolvidos: o `..` seguinte parte da pasta real. Quem chama junta isto ao conjunto de antes: o `cd` pode falhar ou ser condicional."""
     ws = [w for k, w in enumerate(words) if not ASSIGN.match(w) and not isinstance(w, Op) and not (k and isinstance(words[k - 1], Op))]  # sem atribuição, sem redirecionamento (operador e alvo)
     while ws and ws[0] in ("time", "command", "builtin", "!"):  # seguem sendo o cd do próprio shell (`timeout`, `env`, `nohup` rodariam um programa externo)
         ws = ws[1:]
     verb = os.path.basename(ws[0]) if ws else ""
     if verb == "eval" and re.search(r"\b(?:cd|pushd|popd)\b", " ".join(ws[1:])):  # roda no shell de quem chamou, e o que o texto faz eu não sigo
-        return UNSURE
+        return [UNSURE]
     if verb not in ("cd", "pushd", "popd"):
-        return cwd
-    args = [a for a in ws[1:] if a not in ("-L", "-P", "-e", "-@", "--")]
-    d = subst(args[0], env) if args else home()
-    if verb == "popd" or (verb == "pushd" and not args) or DYN.search(d) or (cwd is UNSURE and not os.path.isabs(d)):
-        return UNSURE
-    return os.path.normpath(d if os.path.isabs(d) else os.path.join(cwd, d))
+        return [cwd]
+    args, physical = ws[1:], False
+    while args and (args[0] == "--" or re.fullmatch(r"-[LPe@]+", args[0])):  # opções (combinadas: `-Pe`); `--` encerra. Opção que o cd não tem (`-x`, `pushd -n`) não troca de pasta: o cwd de antes já está no conjunto
+        if args[0] == "--":
+            args = args[1:]
+            break
+        physical = physical or "P" in args[0]  # o bash fica com a última entre -L e -P, o zsh com -P em qualquer posição: vale o maior (os dois cwds)
+        args = args[1:]
+    if verb == "popd" or (verb == "pushd" and not args):
+        return [UNSURE]
+    out = []
+    try:
+        evs = valuations(args[0], env) if args else [env]
+    except OverflowError:  # variáveis demais com valor alternativo: não sei para onde foi
+        return [UNSURE]
+    for ev in evs:
+        try:  # o shell faz chave e glob na palavra do destino (`cd ~/.cl*`, `cd ~/.{claude,x}`): cada pasta que casa é um destino possível
+            ds = braces(subst(args[0], ev) if args else home())
+        except OverflowError:  # chave além do teto: não sei para onde foi
+            out.append(UNSURE)
+            continue
+        for d in ds:
+            explicit = d in (".", "..") or d.startswith(("./", "../"))  # só / ./ ../ pulam o CDPATH
+            if DYN.search(d) or (cwd is UNSURE and not os.path.isabs(d)) or (CDP[0] and not os.path.isabs(d) and not explicit):
+                out.append(UNSURE)
+                continue
+            t = d if os.path.isabs(d) else os.path.join(cwd, d)
+            try:  # vazio → glob que não casa nada vale o texto (o cd falha, o cwd fica); falhou/ilegível (sem tempo no meio dos casos) → não sei para onde foi
+                for g in cases(t) if re.search(r"[*?\[]|[@+!]\(", t) else [t]:
+                    out += [os.path.normpath(g)] + ([os.path.realpath(g)] if physical else [])
+            except OverflowError:
+                out.append(UNSURE)
+    return out
 
 
 def scan_bash(cmd: str, cwd, depth: int = 0, env=None, strict: bool = False):
@@ -441,26 +570,31 @@ def scan_bash(cmd: str, cwd, depth: int = 0, env=None, strict: bool = False):
     if depth > 6:  # vazio → n/a; falhou/ilegível (aninhamento mais fundo do que eu varro) → BLOQUEIA: o que eu não leio pode ser o segredo (igual ao teto da chave {a,b})
         return "secret.nesting-too-deep", cmd[:80]
     toks, docs = lex(cmd)
+    if any(CDP_MENTION.search(t) for t in toks if not isinstance(t, Op)):  # o pedido mexe em CDPATH/cdable_vars (ou o ambiente do hook já tem): vale desde a 1ª linha, em todos os níveis
+        CDP[0] = True
     strict = strict or any(not isinstance(t, Op) and os.path.basename(t) in FEEDERS for t in toks)
-    cur, here, saved, feed, seen = [], cwd, [], [], [cwd]  # feed = palavras dos comandos anteriores da MESMA pipeline; seen = cada cwd por onde o `cd` passou
+    # here = TODOS os cwds possíveis agora (um `cd` pode falhar, ser condicional ou cair via CDPATH: o cwd de antes continua possível); feed = palavras dos comandos anteriores da MESMA pipeline; seen = todo cwd por onde passou
+    cur, here, saved, feed, seen = [], [cwd], [], [], [cwd]
     for t in toks + [Op(";")]:
         if isinstance(t, Op) and t in SEP_OPS:
-            cur, snap = bare(cur), dict(env)  # snap: cada pasta de where() avalia a atribuição da linha a partir do mesmo env (`A=$A$A` não dobra a cada pasta)
-            hit = next(filter(None, (one(cur, b, depth, env if k == 0 else dict(snap), strict, feed) for k, b in enumerate(where(here)))), None)
+            cur, snap = bare(cur), dict(env)  # snap: cada pasta de pool() avalia a atribuição da linha a partir do mesmo env (`A=$A$A` não dobra a cada pasta)
+            hit = next(filter(None, (one(cur, b, depth, env if k == 0 else dict(snap), strict, feed) for k, b in enumerate(pool(here)))), None)
             if hit:
                 return hit
             feed = feed + cur if t in ("|", "|&") else []
-            here = cd_target(cur, here, env)
+            here = uniq(here + [n for c in here for n in cd_targets(cur, c, env) if n is UNSURE or n == c or may_exist(n)])  # destino que não existe: o cd falha e o cwd de antes já está no conjunto
+            if len(here) > 64:  # vazio → n/a; falhou/ilegível (pastas demais por onde o cd passou) → BLOQUEIA: não confiro o que não caberia no prazo
+                return "secret.cwd-too-many", cmd[:80]
             if t == "(":
                 saved.append(here)
             elif t == ")" and saved:
                 here = saved.pop()
-            seen += [] if here in seen else [here]
+            seen = uniq(seen + here)
             cur = []
         else:
             cur.append(t)
     # o corpo de heredoc roda onde o comando rodou, e o `cd` antes dele conta (`cd ~/.claude; bash <<EOF … cat .credentials.json`): vale cada cwd por onde passou
-    for (body, recv, quoted), b in itertools.product(docs, [x for c in seen for x in where(c)]):  # corpo lido como DADO (cat, git commit -F -, tee…): o texto citar `.env` não é ler `.env`; lido por shell ou interpretador, é código
+    for (body, recv, quoted), b in itertools.product(docs, pool(seen)):  # corpo lido como DADO (cat, git commit -F -, tee…): o texto citar `.env` não é ler `.env`; lido por shell ou interpretador, é código
         hit = scan_bash(body, b, depth + 1, env) if any(w in SHELLS for w in recv) else None
         hit = hit or (literals(body, b, env) if any(INTERP.fullmatch(w) for w in recv) else None)
         for sub in () if quoted or hit else substitutions(body):  # delimitador SEM aspas: o $( ) e a crase do corpo RODAM, e a saída vira o texto que o leitor recebe
@@ -476,15 +610,27 @@ def elems(val: str) -> list:
 
 
 def assign(word: str, cwd, env: dict):
-    """`NOME=valor`, `NOME=(a b)`, `NOME+=…`: cada valor (ou elemento) é candidato a caminho (devolve a regra) e NOME vira variável para as palavras seguintes: `$NOME` é o 1º elemento de um array,
+    """`NOME=valor`, `NOME=(a b)`, `NOME+=…`: cada valor (ou elemento) é candidato a caminho (devolve a regra) e NOME vira variável para as palavras seguintes, com TODOS os valores que já recebeu na chamada (ALTS: a atribuição pode ser condicional): `$NOME` é o 1º elemento de um array,
     valor vazio vale vazio, e `+=` deixa o valor desconhecido (não sei o que havia antes)."""
     name, val = word.split("=", 1)
     els = elems(val)
     hit = next(filter(None, (classify(e, cwd, False, env) for e in els)), None)  # confere ANTES de gravar: `X=$X/a` lê o $X de antes da linha
+    alts = dict(env.get(ALTS) or {})  # vazio → nenhuma variável com valor alternativo; falhou/ilegível → n/a (dict em memória)
     if name.endswith("+"):
         env.pop(name[:-1], None)
+        alts.pop(name[:-1], None)
     else:
-        env[name] = subst(els[0] if els else "", env)  # o valor como o shell o guarda: SEM juntar ao cwd (`D=.gnupg; cd ~; cat $D/x` abre ~/.gnupg/x)
+        first = els[0] if els else ""
+        try:
+            news = tuple(dict.fromkeys(subst(first, e) for e in valuations(first, env)))
+        except OverflowError:  # o valor depende de variáveis demais com valor alternativo: não confiro as combinações
+            return hit or ("secret.too-many-values", word[:80])
+        before = alts.get(name) or ((env[name],) if name in env else ())  # o shell pode ter ficado com o valor de antes (atribuição condicional ou que falhou) ou com o novo: vale TODOS
+        env[name] = subst(first, env)  # o valor como o shell o guarda: SEM juntar ao cwd (`D=.gnupg; cd ~; cat $D/x` abre ~/.gnupg/x)
+        both = tuple(dict.fromkeys(before + news))
+        if len(both) > 1:
+            alts[name] = both
+    env[ALTS] = alts
     return hit
 
 
@@ -518,6 +664,16 @@ def one(ws: list, cwd, depth: int, env: dict, strict: bool = False, feed=()):
     ws = words[i:]
     if not ws:
         return None
+    for w in words:  # `: ${D:=.claude}` e `${D=…}` atribuem D (se estava vazio ou sem valor): o valor entra como mais um valor possível
+        for m in re.finditer(r"\$\{(" + NAME + r")(?::?=)([^{}]*)\}", w):
+            hit = assign(m.group(1) + "=" + m.group(2), cwd, env)
+            if hit:
+                return hit
+    if ws[0] in ("for", "select") and len(ws) > 3 and ws[2] == "in" and re.fullmatch(NAME, ws[1]):  # `for d in .claude .gnupg`: d vale cada palavra (a união dos valores; lista com glob ou $( ) fica como escrita)
+        for w in ws[3:]:
+            hit = assign(ws[1] + "=" + w, cwd, env)
+            if hit:
+                return hit
     # o verbo é o de verdade, não o embrulho (`timeout 5 grep -r x ~/.claude` varre; `nohup find … | xargs cat` lista e lê); args segue com TODAS as palavras depois do 1º (candidatos a caminho)
     ev = real_verb(ws)
     verb, args, eargs, skip = os.path.basename(ws[ev]), ws[1:], ws[ev + 1:], set()  # skip = índices (em args) de palavras que são CÓDIGO ou padrão, não caminho
@@ -579,6 +735,7 @@ def one(ws: list, cwd, depth: int, env: dict, strict: bool = False, feed=()):
 def decide(inp: dict):
     """None = liberado; (regra, alvo, operação) = bloqueado."""
     LATE[0] = time.monotonic() + BUDGET_S
+    CDP[0] = bool(os.environ.get("CDPATH") or CDP_MENTION.search(os.environ.get("BASHOPTS", "")))  # vazio → CDPATH ausente ou vazio, sem cdable_vars: o shell não procura o destino do cd em outras pastas; o ambiente do hook é o da sessão
     tool, ti, cwd = inp.get("tool_name"), inp.get("tool_input") or {}, inp.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()  # vazio → pedido sem cwd parte do cwd do hook (o da sessão)
     if tool == "Bash":
         hit = scan_bash(str(ti.get("command") or ""), cwd)

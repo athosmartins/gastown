@@ -10,8 +10,10 @@ import importlib.util, json, os, random, shlex, shutil, subprocess, sys, tempfil
 
 GUARD, N, SEED = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 H = os.path.realpath(tempfile.mkdtemp(prefix="srgst."))
-for d in (".ssh", ".aws", ".gnupg", ".claude", ".kube", "proj/node_modules/pkg", "proj/certs", "gt-remote/keys", "tmp", "bin"):
+for d in (".ssh", ".aws", ".gnupg", ".claude", ".claude/sub", ".kube", "proj/node_modules/pkg", "proj/certs", "gt-remote/keys", "tmp", "bin", "many"):
     os.makedirs(f"{H}/{d}")
+for i in range(70):  # 70 pastas distintas e reais: o teto de cwds possíveis de uma chamada (64) só se alcança com cd para pasta que existe
+    os.makedirs(f"{H}/many/d{i:02d}")
 FILES = [".ssh/id_rsa", ".ssh/id_ed25519", ".ssh/id_rsa.pub", ".ssh/config", ".ssh/known_hosts", ".aws/credentials", ".gnupg/pubring.kbx", ".claude/.credentials.json", ".kube/config", "proj/.env", "proj/.env.example",
          "proj/README.md", "gt-remote/keys/gt_mirror", "proj/node_modules/pkg/cacert.pem", "proj/certs/zz.key"]
 for f in FILES:
@@ -19,7 +21,10 @@ for f in FILES:
 for i in range(50):  # 55 entradas em ~/.ssh e 51 em proj/certs: o segredo (id_rsa, zz.key) vem depois da 50ª, onde o guarda cortava
     open(f"{H}/.ssh/a{i:02d}.pub", "w").close(); open(f"{H}/proj/certs/a{i:02d}.crt", "w").close()
 os.symlink(f"{H}/.ssh/id_rsa", f"{H}/proj/linkado")
-os.environ["HOME"] = H; os.environ.pop("CLAUDE_PROJECT_DIR", None)  # o pedido sem cwd usa o do hook: o teste dele não herda o do ambiente
+os.symlink(f"{H}/.claude/sub", f"{H}/proj/certs/lnk")  # link para PASTA: `cd -P lnk; cd ..` cai em ~/.claude, `cd lnk; cd ..` volta para proj/certs
+os.environ["HOME"] = H
+for k in ("CLAUDE_PROJECT_DIR", "CDPATH", "BASHOPTS"):
+    os.environ.pop(k, None)  # o pedido sem cwd usa o do hook, e CDPATH/BASHOPTS do ambiente de quem roda mudariam o que um `cd` relativo significa: o teste não herda nada disso (uma linha liga o seu com "@env")
 CWD = f"{H}/proj"
 
 
@@ -135,7 +140,7 @@ TABLE += [(w, B, {"command": c}, "-") for w, c in [
     ("B", "f() { cd ~/.claude; cat .credentials.json; }; f"), ("B", "function f { cd ~/.claude; cat .credentials.json; }; f"), ("B", "{ cd ~/.kube; cat config; }"), ("B", "cd ~; cd proj; cd -; cat .claude/.credentials.json"),
     ("B", "cd ~/.claude; pushd /tmp >/dev/null; popd >/dev/null; cat .credentials.json"), ("B", "cd ~/.claude; pushd /tmp >/dev/null; pushd >/dev/null; cat .credentials.json"), ("B", "cd $UNSET; cat .claude/.credentials.json"),
     ("B", "cd $UNSET; cat .credentials.json"), ("B", "cd $UNSET; cd sub; cat .credentials.json"), ("B", 'cd "$(echo ~/.claude)"; cat .credentials.json'), ("B", "cd ~root; cat .claude/.credentials.json"), ("B", 'eval "cd ~/.claude"; cat .credentials.json'),
-    ("B", "cd ~/.claude; bash <<'EOF'\ncat .credentials.json\nEOF\ncd /tmp"), ("P", "{ cd proj; cat README.md; }"), ("P", "cd $UNSET; cat README.md"), ("P", "cd $UNSET; cat settings.json"), ("P", "cd $UNSET; cd /tmp; cat .credentials.json"),
+    ("B", "cd ~/.claude; bash <<'EOF'\ncat .credentials.json\nEOF\ncd /tmp"), ("P", "{ cd proj; cat README.md; }"), ("P", "cd $UNSET; cat README.md"), ("P", "cd $UNSET; cat settings.json"), ("B", "cd $UNSET; cd /tmp; cat .credentials.json"),  # era P na tentativa 4; tentativa 5: o cd /tmp pode falhar ou ser condicional, então o cwd desconhecido de antes continua possível
     ("P", "if [ -f .env ]; then echo ok; fi"), ("P", "if true; then cat ~/.ssh/config; fi"), ("P", 'cd "$(git rev-parse --show-toplevel)" && sleep 1 && date +%T'), ("P", "cd $UNSET; cat src/main.py"),
     ("P", "cd $UNSET; grep -rn x .; cp -r . /tmp/x"), ("B", "cd $UNSET; cat config"), ("B", "cd $UNSET; cat ~/.aws/nope"), ("P", 'cd $UNSET; cat $f src/$f "$(basename "$f")" $S/x'), ("B", "cd $UNSET; cat $f/id_rsa"), ("B", "cd $UNSET; cat ~/.aws/$f"),
     ("B", "D=(.claude); cat ~/$D/.credentials.json"), ("B", 'files=(~/.claude/.credentials.json); for f in "${files[@]}"; do cat "$f"; done'), ("B", 'files=(~/.claude/.credentials.json); cat "${files[@]}"'),
@@ -144,16 +149,67 @@ TABLE += [(w, B, {"command": c}, "-") for w, c in [
     ("B", "cat ~/.ssh/[^c]*"), ("B", "cat ~/.claude/.cred[[:alpha:]]*"), ("P", "cat ~/.ssh/[^i]*"), ("B", "find . -name .env -delete"), ("B", 'cat $"$HOME/.gnupg/pubring.kbx"'), ("P", 'cat $"README.md"')]]
 
 
+# tentativa 5 do gate (a 4ª reprovou com 4 bloqueios): o guarda sabia, ou devia saber que não sabia, e devolveu o mesmo "liberado". A CLASSE de cada um, com os irmãos.
+# (1) o `cd` relativo não é só join(cwd, d): CDPATH e cdable_vars (bash; no zsh o array `cdpath` e `setopt cdable_vars`) o procuram em outras pastas, de qualquer jeito que apareçam na chamada ou no ambiente
+# (2) um `cd` pode falhar ou ser condicional: cada linha vale para a UNIÃO dos cwds possíveis; o mesmo vale para uma variável que recebeu outro valor depois (atribuição condicional)
+# (3) chave tem duas formas, lista e sequência `{x..y[..n]}`; (4) byte NUL num caminho bloqueia explícito, igual em todo Python; irmãos: extglob, `cd -P`, opções coladas (`-Pe`)
+T5 = [
+    # CDPATH / cdable_vars: o destino relativo sem ./ ou ../ é desconhecido (UNSURE); ./x, ../x, /x e . não passam pelo CDPATH
+    ("B", "CDPATH=$HOME; cd .claude >/dev/null; cat .credentials.json", {}), ("B", "export CDPATH=$HOME; cd .claude; cat .credentials.json", {}), ("B", 'CD""PATH=$HOME; cd .claude; cat .credentials.json', {}),
+    ("B", "bash -c 'CDPATH=$HOME; cd .claude; cat .credentials.json'", {}), ("B", "env CDPATH=$HOME bash -c 'cd .claude; cat .credentials.json'", {}), ("B", "cdpath=($HOME); cd .claude; cat .credentials.json", {}),
+    ("B", "d=~/.claude; shopt -s cdable_vars; cd d; cat .credentials.json", {}), ("B", "setopt CDABLE_VARS; d=~/.claude; cd d; cat .credentials.json", {}), ("B", "bash -O cdable_vars -c 'd=~/.claude; cd d; cat .credentials.json'", {}),
+    ("B", "cd .claude; cat .credentials.json", {"CDPATH": "@H"}), ("B", "d=~/.claude; cd d; cat .credentials.json", {"BASHOPTS": "cdable_vars:checkwinsize"}),
+    ("P", "cd .claude; cat settings.json", {}), ("P", "CDPATH=$HOME; cd ./certs; cat config", {}), ("P", "CDPATH=$HOME; cd ../proj; cat config", {}), ("P", "CDPATH=$HOME; cd /tmp; cat README.md", {}),
+    ("P", "cd .claude; cat .credentials.json", {"CDPATH": ""}),
+    # irmãos do cd: opções coladas (`-Pe`), `--`, e `-P` (o `..` seguinte parte da pasta REAL do link)
+    ("B", "cd -Pe ~/.claude; cat .credentials.json", {}), ("B", "cd -- ~/.claude; cat .credentials.json", {}), ("P", "cd -Pe certs; cat config", {}), ("P", "cd -- certs; cat config", {}),
+    ("B", "cd -P lnk; cd ..; cat .credentials.json", {"@cwd": "@H/proj/certs"}), ("P", "cd lnk; cd ..; cat .credentials.json", {"@cwd": "@H/proj/certs"}), ("B", "cd -LP lnk; cd ..; cat .credentials.json", {"@cwd": "@H/proj/certs"}),
+    ("B", "cd -PL lnk; cd ..; cat .credentials.json", {"@cwd": "@H/proj/certs"}), ("P", "cd -L lnk; cd ..; cat .credentials.json", {"@cwd": "@H/proj/certs"}),
+    # cd que falha ou é condicional: o cwd de antes continua possível (e o que não existe não vira cwd)
+    ("B", "cd /nonexistent_zz 2>/dev/null; cat .credentials.json", {"@cwd": "@H/.claude"}), ("B", "[ -d /nonexistent_zz ] && cd /nonexistent_zz; cat .credentials.json", {"@cwd": "@H/.claude"}),
+    ("B", "false && cd /tmp; cat .credentials.json", {"@cwd": "@H/.claude"}), ("B", "cd /tmp 2>/dev/null || true; cat .credentials.json", {"@cwd": "@H/.claude"}), ("B", "if false; then cd /tmp; fi; cat .credentials.json", {"@cwd": "@H/.claude"}),
+    ("B", "cd nonexist1; cd .claude; cat .credentials.json", {"@cwd": "@H"}), ("B", "cd ~/.claude; cd /tmp; cat .credentials.json", {}), ("B", "(cd ~/.claude; cat .credentials.json)", {}),
+    ("P", "cd /nonexistent_zz; cat README.md", {}), ("P", "cd ~/.ssh/nonexistent_zz; cat src/a.py", {}), ("P", "(cd ~/.ssh && ls); cat src/a.py", {}), ("P", "cd /tmp; cat README.md", {}), ("B", "cd $UNSET; cd ~/.ssh; cat src/a.py", {}),
+    ("B", "; ".join(f"cd @H/many/d{i:02d}" for i in range(70)) + "; cat README.md", {}), ("P", "; ".join(f"cd @H/many/d{i:02d}" for i in range(20)) + "; cat README.md", {}),
+    # variável com outro valor depois (condicional ou repetida): vale cada um, inclusive o que passa por outra variável; combinações demais bloqueiam
+    ("B", "D=.claude; [ -f /nope ] && D=zz; cd ~; cat $D/.credentials.json", {}), ("B", "D=.claude; false && D=zz; E=$D; cd ~; cat $E/.credentials.json", {}), ("B", "D=zz; [ -f /nope ] && D=.claude; cd ~; cat $D/.credentials.json", {}), ("B", "D=.claude; [ -f /nope ] && D=zz; cd ~; cat ~/$D/.credentials.json", {}),
+    ("B", "X=.claude; case $1 in a) X=zz;; esac; cd ~; cat $X/.credentials.json", {}), ("B", "D=.claude; D=zz; cd ~; cat $D/.credentials.json", {}), ("B", "; ".join(f"{n}={v}" for n in "ABCDEFGHIJ" for v in (1, 2)) + "; cat $A$B$C$D$E$F$G$H$I$J", {}),
+    ("B", "D=~/.claude; [ -f /nope ] && D=@H/proj; grep -r token $D", {}), ("B", "D=@H/proj; [ -f /nope ] && D=~/.claude; grep -r token $D", {}), ("P", "D=~/.claude/projects; [ -f /nope ] && D=@H/proj; grep -r token $D", {}),
+    ("P", "A=1; A=2; B=1; B=2; C=1; C=2; D=1; D=2; cat $A$B$C$D", {}), ("P", "for b in " + " ".join(f"wa-{i}" for i in range(40)) + "; do git show $b; done", {}), ("P", "for a in " + " ".join(f"x{i}" for i in range(20)) + "; do for c in " + " ".join(f"y{i}" for i in range(20)) + "; do echo $a $c; cat $a$c; done; done", {}), ("P", "D=.claude; [ -f /nope ] && D=zz; cd ~; cat $D/settings.json", {}), ("P", "F=README.md; F=notes.md; cat $F", {}),
+    # chave, a 2ª forma: sequência de inteiros ou de caracteres, com passo (0 vale 1, o sinal não conta); o teto é o mesmo da lista
+    ("B", "cat ~/.claude/.cred{e..e}ntials.json", {}), ("B", "echo x >> ~/.s{s..s}h/authorized_keys", {}), ("B", "cat ~/.g{n..n}upg/pubring.kbx", {}), ("B", "cat ~/.{c..c}laude/.credentials.json", {}),
+    ("B", "cat ~/.claude/.credentials.jso{a..z}", {}), ("B", "cat ~/.claude/.credentials.jso{z..a..12}", {}), ("B", "cat ~/.claude/.credentials.jso{a..n..-13}", {}), ("B", "cat ~/.claude/.credentials.jso{a..z..0}", {}), ("B", "cat ~/.claude/.credentials.jso{o..9}", {}), ("P", "cat ~/.claude/.credentials.jso{a..z..2}", {}),
+    ("B", "cat ~/.aws/{a..z}{a..z}", {}), ("B", "cat {1..100}", {}), ("B", "cat ~/.ssh/id_rsa{1..3,x}", {}), ("P", "cat README.md{1..3}", {}), ("P", "echo {1..3}", {}), ("P", "cat {a..c}.md", {}), ("P", "cat README.md{01..03}", {}),
+    # byte NUL: nenhuma ferramenta abre o caminho, e cada Python o trata de um jeito (3.9 engole o ValueError, 3.11+ levanta): bloqueia explícito em todos
+    ("B", "READ:a\x00b", {}), ("B", "READ:~/.claude/.credentials.json\x00x", {}), ("B", "cat a\x00b", {}), ("B", "cat -\x00x", {}), ("B", "cat README.md", {"@cwd": "@H/proj\x00x"}), ("B", "curl http://a\x00b", {}), ("B", "X=$'a\\x00'; cat README.md$X", {}), ("B", "GREP:a\x00b", {}), ("B", "GLOB:a\x00b/*", {}), ("P", "cat README.md", {}),
+    # extglob (`shopt -s extglob`) e o qualificador `*(.)` do zsh: o grupo fica na palavra e vale `*` (a mais, nunca a menos)
+    ("B", "cat ~/.claude/.cred@(entials).json", {}), ("B", "cat ~/.claude/.credentials.@(json)", {}), ("B", "cat ~/.claude/.cred+(entials).json", {}), ("B", "cat ~/.ssh/id_*(rsa)", {}), ("B", "cat ~/.aws/!(nope)", {}),
+    # o destino do cd passa por glob e chave; `: ${D:=v}` e `for d in a b` dão à variável todos os valores
+    ("B", "cd ~/.cl*; cat .credentials.json", {}), ("B", "cd ~/.claud[e]; cat .credentials.json", {}), ("B", "cd ~/.cl@(aude); cat .credentials.json", {}), ("B", "cd ~/.{c..c}laude; cat .credentials.json", {}), ("P", "cd ~/.zz*; cat README.md", {}),
+    ("B", ": ${D:=.claude}; cd ~; cat $D/.credentials.json", {}), ("B", "echo ${D=.claude}; cd ~; cat $D/.credentials.json", {}), ("P", ": ${D:=.claude}; cd ~; cat $D/settings.json", {}),
+    ("B", "for d in .claude .gnupg; do cd ~; cat $d/.credentials.json; done", {}), ("B", "for d in zz .claude; do cd ~; cat $d/.credentials.json; done", {}), ("P", "for f in a.txt b.txt; do cat $f; done", {}), ("P", "for d in .claude; do cd ~; cat $d/settings.json; done", {}),
+    ("P", "ls *(.)", {}), ("P", "ls -la **/*(.)", {}), ("P", "[[ $x == @(a|b) ]] && echo ok", {}),
+]
+for want, cmd, extra in T5:
+    tool, ti = ("Read", {"file_path": cmd[5:]}) if cmd.startswith("READ:") else ("Grep", {"pattern": "t", "path": cmd[5:]}) if cmd.startswith("GREP:") else ("Glob", {"pattern": cmd[5:]}) if cmd.startswith("GLOB:") else (B, {"command": cmd})
+    TABLE.append((want, tool, {**ti, **{k: v for k, v in extra.items()}}, "-"))
+
+
 def run_table(m):
     bad, secs = [], m.BUDGET_S
     for want, tool, ti, sn in TABLE:
-        ti = {k: v.replace("@H", H) for k, v in ti.items()}
+        ti = {k: (v.replace("@H", H) if isinstance(v, str) else v) for k, v in ti.items()}
         cwd = ti.pop("@cwd", CWD)
         m.BUDGET_S = float(ti.pop("@secs", secs))  # "@secs": o prazo de glob só nesta linha (-1 = já estourado)
+        env = {k: ti.pop(k) for k in ("CDPATH", "BASHOPTS") if k in ti}  # variáveis do ambiente do hook só nesta linha ("" = definida e vazia)
+        for k, v in env.items():
+            os.environ[k] = v
         try:
             got = "B" if m.decide({"tool_name": tool, "tool_input": ti, "cwd": cwd}) else "P"
         except Exception as e:  # noqa: BLE001
             got = "ERRO " + repr(e)[:40]
+        for k in env:
+            os.environ.pop(k, None)
         if got != want:
             bad.append(f"{tool} {ti} esperado={want} veio={got}")
     m.BUDGET_S = secs
@@ -186,6 +242,8 @@ check("ponta a ponta: bloqueio sai 2 com a mensagem (alvo, regra, não é cancel
 check("ponta a ponta: liberado sai 0 sem ruído", e2e({"command": "ls"}) == (0, ""))
 check("ponta a ponta: JSON ilegível que cita file_path bloqueia; lixo sem campo libera; stdin vazio libera", e2e(None, raw='{"file_path": ') [0] == 2 and e2e(None, raw="lixo")[0] == 0 and e2e(None, raw="")[0] == 0)
 rc, err = e2e({"file_path": "a\x00b"}, tool="Read")
+check("ponta a ponta: byte NUL num caminho = bloqueado pela regra, igual em todo Python (o 3.9 do mini engole o ValueError, o 3.11+ levanta)", rc == 2 and "secret.nul-byte" in err, err[:160])
+rc, err = e2e(None, raw=json.dumps({"tool_name": "Read", "tool_input": ["x"]}))  # tool_input que não é objeto: o guarda levanta AttributeError em qualquer versão
 check("ponta a ponta: o guarda falhando num pedido que cobre = bloqueado (nunca liberado)", rc == 2 and "o guarda falhou" in err, err[:120])
 check("ponta a ponta: ferramenta que o guarda não cobre libera", e2e({"url": "x"}, tool="WebFetch")[0] == 0)
 
@@ -210,7 +268,7 @@ for name in ("cat", "head", "tail", "less", "cp", "base64", "xxd", "grep", "sed"
     open(f"{H}/bin/{name}", "w").write(FAKE); os.chmod(f"{H}/bin/{name}", 0o755)
 rnd = random.Random(SEED)
 SECRET = [".ssh/id_rsa", ".ssh/id_ed25519", ".aws/credentials", ".gnupg/pubring.kbx", ".claude/.credentials.json", "proj/.env", "gt-remote/keys/gt_mirror"]
-PRE = ["", "", "", "H=1; ", "HO=/zz; H=1; ", "X=; ", "export H=2; ", "HOM=/q; "]  # atribuições antes do comando: nome que é prefixo de HOME, valor vazio
+PRE = ["", "", "", "H=1; ", "HO=/zz; H=1; ", "X=; ", "export H=2; ", "HOM=/q; ", f"CDPATH={H}:/zz; ", "shopt -s cdable_vars; "]  # atribuições antes do comando: nome que é prefixo de HOME, valor vazio, CDPATH e cdable_vars (mudam o que um `cd` relativo significa)
 BENIGN = ["proj/README.md", ".ssh/config", "proj/.env.example", ".ssh/id_rsa.pub", ".ssh/known_hosts"]
 READERS = ["cat", "head -n 2", "tail", "less", "base64", "xxd", "od", "sed -n 1p", "awk 1", "grep -n x"]
 
@@ -219,11 +277,18 @@ def q(s):
     return [shlex.quote(s), '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`") + '"'][rnd.randrange(2)]
 
 
+def seq(rel):
+    """A letra minúscula de `rel` escrita como sequência de chave: {e..e} ou {d..f} (o bash anda por letras; a faixa traz o nome certo no meio)."""
+    k = rnd.choice([i for i, ch in enumerate(rel) if ch.islower()])
+    c = rel[k]
+    return "~/" + rel[:k] + rnd.choice(["{" + c + ".." + c + "}", "{" + chr(max(97, ord(c) - 1)) + ".." + chr(min(122, ord(c) + 1)) + "}"]) + rel[k + 1:]
+
+
 def spell(rel):
     P = f"{H}/{rel}"
     d, b = os.path.split(P)
     return rnd.choice([P, "~/" + rel, "$HOME/" + rel, '"${HOME}/' + rel + '"', os.path.relpath(P, CWD), d + "/" + b[:3] + "*", d + "/*", d + "/{" + b + ",zz}", P[:5] + "''" + P[5:], "'" + P + "'", d + "//" + b,
-                       "{~/" + rel + ",zz}", "${UNSET:-~/" + rel + "}", "${UNSET:-" + P + "}"])
+                       "{~/" + rel + ",zz}", "${UNSET:-~/" + rel + "}", "${UNSET:-" + P + "}", seq(rel)])
 
 
 def shape(S, P):
@@ -233,7 +298,10 @@ def shape(S, P):
                        f"for f in {S}; do {v} \"$f\"; done", f"cd {os.path.dirname(P).replace(H, '~')}; {r} {os.path.basename(P)}", f"echo {q(f'{r} {S}')} | bash", f"tee {S}",
                        f"X=; {r} {S}$X", f"cd ~; D={rd}; {r} $D/{b}", f"D={rd}; {r} ~/$D/{b}", f"export D={rd}; cd ~; {r} $D/{b}", f"A=$HOME; B=$A/{rd}; {r} $B/{b}",
                        f"cd \"$(echo ~)/{rd}\"; {r} {b}", f"A=({S}); {v} \"${{A[@]}}\"", f"A=({S}); for f in \"${{A[@]}}\"; do {v} \"$f\"; done", f"D=({rd}); {r} ~/$D/{b}",
-                       f"find {d} -name {b} | xargs {v}", f"find {d} -name {b} -print0 | xargs -0 {v}", f"{v} $(find {d} -name {b})"])
+                       f"find {d} -name {b} | xargs {v}", f"find {d} -name {b} -print0 | xargs -0 {v}", f"{v} $(find {d} -name {b})",
+                       f"cd {rd}; {r} {b}", f"D={d}; cd D; {r} {b}", f"cd {d}; cd /nonexistent_zz 2>/dev/null; {r} {b}", f"cd {d}; [ -d /nonexistent_zz ] && cd /nonexistent_zz; {r} {b}", f"cd {d}; false && cd /tmp; {r} {b}",
+                       f"D={rd}; [ -d /nonexistent_zz ] && D=zz; cd ~; {r} $D/{b}",
+                       f"cd ~/{rd[:-1]}*; {r} {b}", f": ${{D:={rd}}}; cd ~; {r} $D/{b}", f"for d in zz {rd}; do cd ~; {r} $d/{b}; done"])
 
 
 def wrap(c):
@@ -276,10 +344,11 @@ check(f"fuzzer vs bash real: {valid} comandos válidos, {nt} tocaram segredo, by
 
 # --- mutantes: cada guarda apagada tem de reprovar a tabela ---
 SRC = open(GUARD).read()
+HERE_UPD = "here = uniq(here + [n for c in here for n in cd_targets(cur, c, env) if n is UNSURE or n == c or may_exist(n)])"
 MUT = [("pasta ~/.ssh", "if rel and rel[0] in HOME_DIRS:", "if False and rel and rel[0] in HOME_DIRS:"), ("modelo de .env", "base.endswith(ENV_TEMPLATE)", "False"),
        ("exceção de leitura em ~/.ssh", "(rel[1] in SSH_OK or rel[1].endswith(\".pub\"))", "False"), ("escrita nas ferramentas", "tool in WRITE_TOOLS)", "False)"),
        ("pacote não é segredo", "any(s in low[:-1] for s in BROAD_SKIP)", "False"), ("verbo isento", "EXEMPT = {\"echo\",", "EXEMPT = {\"zzz\","), ("xargs/read tornam estrito", "FEEDERS = {\"xargs\",", "FEEDERS = {\"zzz\","),
-       ("rastreio de cd", "here = cd_target(cur, here, env)", "here = here"), ("heredoc para shell", "any(w in SHELLS for w in recv)", "False"), ("código por stdin", "\"-s\" in nargs or not [a for a in nargs", "\"-s\" in nargs and False and [a for a in nargs"),
+       ("rastreio de cd", HERE_UPD, "here = here"), ("heredoc para shell", "any(w in SHELLS for w in recv)", "False"), ("código por stdin", "\"-s\" in nargs or not [a for a in nargs", "\"-s\" in nargs and False and [a for a in nargs"),
        ("raiz larga", "or home().startswith(p.rstrip(\"/\") + \"/\")", "or False"), ("teto da chave", "len(alts) <= 16", "len(alts) <= 1600"), ("find -exec", "not any(a in (\"-exec\", \"-execdir\", \"-ok\", \"-okdir\", \"-delete\") for a in eargs)", "True"),
        ("valor colado", "cand = m.group(1) if (m := re.fullmatch(r\"-[A-Za-z](.+)\", cand)) else cand", "pass"), ("verbo que escreve", "reads = verb in READERS and not", "reads = True or not"),
        ("padrão do grep", "skip.add(ev + j); pat_done = True", "pat_done = True"), ("link simbólico", "os.path.realpath(p))):", "os.path.normpath(p))):"),
@@ -288,7 +357,7 @@ MUT = [("pasta ~/.ssh", "if rel and rel[0] in HOME_DIRS:", "if False and rel and
        ("aninhamento fundo bloqueia", 'return "secret.nesting-too-deep", cmd[:80]', "return None"), ("nome inteiro da variável", 'NAME = r"[A-Za-z_][A-Za-z0-9_]*"', 'NAME = r"[A-Za-z_]"'),
        ("valor vazio vale", "known = env[name] if name in env else", "known = env[name] if env.get(name) else"),
        ("padrão ${X:-…}", "return tilde(VAR.sub(one_var, dflt)) if known is None or (colon and not known) else known", "return known if known is not None else m.group(0)"),
-       ("variável relativa onde é usada", "env[name] = subst(els[0] if els else \"\", env)", "env[name] = expand(els[0] if els else \"\", cwd, env)"), ("export/declare registram a variável", "assign(a, cwd, env)  # só a variável", "pass  # só a variável"),
+       ("variável relativa onde é usada", "env[name] = subst(first, env)", "env[name] = expand(first, cwd, env)"), ("export/declare registram a variável", "assign(a, cwd, env)  # só a variável", "pass  # só a variável"),
        ("$( ) em atribuição e redirecionamento", "for w in words + [t for t, _ in redirs] + [t for t, _ in herestr]:", "for w in words[i:]:"),
        ("$( ) em heredoc sem aspas", "for sub in () if quoted or hit else substitutions(body):", "for sub in ():"), ("heredoc com aspas é texto", "quoted = m.group(1) is not None or m.group(2) is not None or bool(m.group(3))", "quoted = False"),
        ("find -name em modo estrito", 'names = verb == "find" and not strict and not any(', 'names = verb == "find" and not any('),
@@ -301,16 +370,35 @@ MUT = [("pasta ~/.ssh", "if rel and rel[0] in HOME_DIRS:", "if False and rel and
        ("corte silencioso em 50", "enumerate(glob.iglob(pat), 1)", "enumerate(sorted(glob.glob(pat))[:50], 1)"), ("sem tempo não bloqueia", "raise OverflowError(cand)", "break"),
        ("prazo recarregado por pedido", "LATE[0] = time.monotonic() + BUDGET_S", "pass"),
        # tentativa 4
-       ("palavra reservada abre a linha", "cur, snap = bare(cur), dict(env)", "cur, snap = cur, dict(env)"), ("function f", 'or ws[0] == "function")', "or False)"), ("destino com $ ou crase vale cwd desconhecido", "or DYN.search(d) or", "or False or"),
-       ("cd - e +N", 'DYN = re.compile(r"[$`]|^~|^[+-]\\d*$")', 'DYN = re.compile(r"[$`]|^~")'), ("~usuario", 'DYN = re.compile(r"[$`]|^~|', 'DYN = re.compile(r"[$`]|'), ("popd", 'verb == "popd" or', "False or"),
-       ("pushd sem destino", '(verb == "pushd" and not args) or', "False or"), ("relativo a cwd desconhecido", "or (cwd is UNSURE and not os.path.isabs(d))", "or False"), ("eval com cd", 'if verb == "eval" and re.search(', 'if False and re.search('),
-       ("cwd desconhecido vale cada pasta de segredo", "for p in BASES] if cwd is UNSURE", "for p in [()]] if cwd is UNSURE"), ("heredoc roda onde o cd levou", "[x for c in seen for x in where(c)]", "where(here)"),
+       ("palavra reservada abre a linha", "cur, snap = bare(cur), dict(env)", "cur, snap = cur, dict(env)"), ("function f", 'or ws[0] == "function")', "or False)"), ("destino com $ ou crase vale cwd desconhecido", "if DYN.search(d) or (cwd is UNSURE", "if False or (cwd is UNSURE"),
+       ("~usuario", 'DYN = re.compile(r"[$`]|^~|', 'DYN = re.compile(r"[$`]|'), ("relativo a cwd desconhecido", "or (cwd is UNSURE and not os.path.isabs(d))", "or False"), ("eval com cd", 'if verb == "eval" and re.search(', 'if False and re.search('),
+       ("cwd desconhecido vale cada pasta de segredo", "for p in BASES] if cwd is UNSURE", "for p in [()]] if cwd is UNSURE"), ("heredoc roda onde o cd levou", "itertools.product(docs, pool(seen))", "itertools.product(docs, where(cwd))"),
        ("array é uma palavra", 'elif c == "(" and word and re.fullmatch(', 'elif False and c == "(" and word and re.fullmatch('), ("elementos do array", 'if val[:1] == "(" and val[-1:] == ")" else [val]', "if False else [val]"),
        ("array em declare", "for c in elems(cand))", "for c in [cand])"), ("+= é atribuição", 'ASSIGN = re.compile(r"[A-Za-z_]\\w*\\+?=")', 'ASSIGN = re.compile(r"[A-Za-z_]\\w*=")'), ("[^ do glob", 'cand.replace("[^", "[!")', "cand"),
        ("classe POSIX do glob", '"?" if "[:" in m.group(0) else m.group(0)', "m.group(0)"), ('$"…"', "elif c == '\"' or (c == \"$\" and nx == '\"'):", "elif c == '\"':"), ("find -delete", '"-okdir", "-delete")', '"-okdir")'),
        ("pasta suposta: palavra que não existe vale só o nome", '(guess or ("/" not in raw and not write))', '("/" not in raw and not write)'), ("pasta suposta: ela mesma (.) vale só o nome", "or (guess and os.path.normpath(p) == cwd))", "or False)"),
-       ("pasta suposta: caminho absoluto vale inteiro", "guess = isinstance(cwd, Guess) and not os.path.isabs(subst(alt, env or {}))", "guess = isinstance(cwd, Guess)"),
-       ("varrer . numa pasta suposta", 'if isinstance(cwd, Guess) and not os.path.isabs(subst(raw or "", env or {})):', "if False:"), ("pasta suposta: pedaço desconhecido não é pasta de segredo", 'hit = None if guess and hit and hit.startswith(("secret.home.", "secret.cli.")) else hit', "hit = hit"), ("pedido sem cwd usa o do hook", 'os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()', 'os.environ.get("CLAUDE_PROJECT_DIR") or None')]
+       ("varrer . numa pasta suposta", 'if isinstance(cwd, Guess) and not os.path.isabs(subst(raw or "", env or {})):', "if False:"), ("pasta suposta: pedaço desconhecido não é pasta de segredo", 'hit = None if guess and hit and hit.startswith(("secret.home.", "secret.cli.")) else hit', "hit = hit"), ("pedido sem cwd usa o do hook", 'os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()', 'os.environ.get("CLAUDE_PROJECT_DIR") or None'),
+       # tentativa 5: cd (CDPATH, cdable_vars, opções, -P), união dos cwds possíveis, variável com outro valor depois, chave de sequência, NUL, extglob. (Sem mutante, porque seriam equivalentes: `cd -`, `popd` e `pushd` sem destino, cujo destino é uma pasta por onde a chamada já passou e que o conjunto guarda; "caminho absoluto vale inteiro numa pasta suposta", porque o cwd conhecido de antes está sempre no conjunto e julga o caminho absoluto; o teto de 64 dentro de sequence(), porque o de 64 resultados do braces() repete o veredito: ele só evita montar a lista gigante de `{1..99999999999}`.)
+       ("CDPATH: cd relativo sem ./ ../ é desconhecido", "(CDP[0] and not os.path.isabs(d) and not explicit)", "False"), ("CDPATH: ./ ../ . .. não passam por ele", 'explicit = d in (".", "..") or d.startswith(("./", "../"))', "explicit = False"),
+       ("CDPATH/cdable_vars citado na chamada", "if any(CDP_MENTION.search(t) for t in toks if not isinstance(t, Op)):", "if False:"), ("cdable_vars", 'CDP_MENTION = re.compile(r"cdpath|cdable_?vars", re.I)', 'CDP_MENTION = re.compile(r"cdpath", re.I)'),
+       ("zsh: cdpath minúsculo, CDABLE_VARS", 'CDP_MENTION = re.compile(r"cdpath|cdable_?vars", re.I)', 'CDP_MENTION = re.compile(r"CDPATH|cdable_vars")'), ("CDPATH do ambiente do hook", 'CDP[0] = bool(os.environ.get("CDPATH") or', "CDP[0] = bool(False or"),
+       ("BASHOPTS do ambiente do hook", 'CDP_MENTION.search(os.environ.get("BASHOPTS", ""))', "False"), ("opções coladas do cd (-Pe)", 're.fullmatch(r"-[LPe@]+", args[0])', 're.fullmatch(r"-[LPe@]", args[0])'),
+       ("cd -P acrescenta a pasta real", "out += [os.path.normpath(g)] + ([os.path.realpath(g)] if physical else [])", "out += [os.path.normpath(g)]"), ("cd -P em qualquer posição (zsh)", 'physical = physical or "P" in args[0]', 'physical = physical or args[0].endswith("P")'),
+       ("cd que falha ou é condicional: união dos cwds", HERE_UPD, "here = uniq([n for c in here for n in cd_targets(cur, c, env) if n is UNSURE or n == c or may_exist(n)])"),
+       ("destino que não existe não vira cwd", "n is UNSURE or n == c or may_exist(n)", "True"), ("teto de cwds possíveis", "if len(here) > 64:", "if len(here) > 6400:"), ("subshell devolve o cwd", "here = saved.pop()", "pass"),
+       ("pasta conhecida vence a suposta", "(isinstance(out[str(b)], Guess) and not isinstance(b, Guess))", "False"),
+       ("variável com outro valor depois", "if len(both) > 1:", "if False:"), ("o valor de antes entra na união", "before = alts.get(name) or ((env[name],) if name in env else ())", "before = alts.get(name) or ()"),
+       ("o valor alternativo vem de outra variável", "news = tuple(dict.fromkeys(subst(first, e) for e in valuations(first, env)))", "news = (subst(first, env),)"),
+       ("classify confere cada valoração", "return next(filter(None, (classify_env(raw, cwd, write, e) for e in envs)), None)", "return classify_env(raw, cwd, write, envs[0])"),
+       ("broad confere cada valoração", "return next(filter(None, (broad_env(raw, cwd, e, deep) for e in envs)), None)", "return broad_env(raw, cwd, envs[0], deep)"), ("teto de combinações de valores", "if len(combos) > 512:", "if len(combos) > 51200:"),
+       ("chave: sequência", "q = next(((x, v) for x in SEQ.finditer(s) if (v := sequence(x)) is not None), None)", "q = None"), ("sequência: passo", "step = abs(int(n)) if n else 1", "step = 1"),
+       ("sequência: descendo", "lo + i * step * (1 if hi >= lo else -1)", "lo + i * step"), ("sequência: passo 0 vale 1", "step = step or 1", "pass"),
+       ("sequência: caractere de qualquer tipo (zsh)", "elif len(a) == 1 and len(b) == 1:", "elif a.isalpha() and b.isalpha():"),
+       ("NUL explícito", 'if "\\x00" in raw:', "if False:"), ("NUL que vem de variável ou do cwd", 'if "\\x00" in cand:', "if False:"),
+       ("extglob: o glob o lê", r'EXTGLOB = re.compile(r"[@+!*?]\(', r'EXTGLOB = re.compile(r"[Z]\('), ("extglob: o grupo fica na palavra", 'cur[-1][-1:] in ("@", "+", "!", "*", "?")', 'cur[-1][-1:] in ("ZZ",)'),
+       ("cd: glob no destino", 'for g in cases(t) if re.search(r"[*?\\[]|[@+!]\\(", t) else [t]:', "for g in [t]:"), ("cd: chave no destino", "ds = braces(subst(args[0], ev) if args else home())", "ds = [subst(args[0], ev) if args else home()]"),
+       ("${D:=v} atribui", 'hit = assign(m.group(1) + "=" + m.group(2), cwd, env)', "hit = None"), ("for d in a b: d vale cada palavra", 'hit = assign(ws[1] + "=" + w, cwd, env)', "hit = None"),
+       ("extglob: dispara o glob", 're.search(r"[*?\\[]|[@+!]\\(", cand)', 're.search(r"[*?\\[]", cand)')]
 alive = []
 for name, old, new in MUT:
     if SRC.count(old) != 1:
