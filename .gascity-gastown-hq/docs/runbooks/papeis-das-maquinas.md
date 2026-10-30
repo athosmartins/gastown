@@ -47,15 +47,15 @@ O gargalo do mini é disco e swap, não CPU. A limpeza do hq (15 → 5,5 GB, 21/
 
 ## Fases e beads
 
-| Fase | O quê | Bead | Estado (23/10) |
+| Fase | O quê | Bead | Estado (30/10) |
 |---|---|---|---|
 | 1 | Laboratório de restore | ga-ap2dd6, ga-3kmvyr | 1ª fatia fechada; restore real do hq com hold até 24/10 |
-| 2 | Workers, revisores e testes no nó | ga-2hd02v (filhas .3 WA, .4 PS) | WA no nó com 3 vagas; PS em sombra |
-| 2b | MBP como nó de capacidade | ga-sokx7u | aberta |
-| 3 | Motor (Pilot/gate) no nó, Dolt fica no mini | ga-puml3i | medir latência mini↔nó primeiro; se não couber, o motor fica no mini |
+| 2 | Workers, revisores e testes no nó | ga-2hd02v (filhas .3 WA, .4 PS) | ga-2hd02v.1.6 fechada 30/10 (dog, revisor e wa-worker remotos provados com bead real); rota WA ao nó em `auto` desde 30/10 (33bc8fb4f); cessão por prioridade que corta o WA antes do nó = ga-2hd02v.3.16; PS em sombra |
+| 2b | MBP como nó de capacidade | ga-sokx7u, ga-w7qwl1.2 | prova ao vivo com sessão de teste (ga-w7qwl1.2.4); guarda só dentro da sessão remota, `~/.claude` do Athos intocado (ga-w7qwl1.2.7); canário (ga-w7qwl1.2.5) espera as duas |
+| 3 | Motor (Pilot/gate) no nó, Dolt fica no mini | ga-puml3i | **medido 30/10: o motor FICA no mini.** O atalho ssh recusa por desenho as leituras do Pilot (`--limit 0`, flags de exclusão, ready/query, escritas); overhead do atalho +0,61 s/chamada p50 (RTT 236 ms); varredura do mini já tem p50 6,2 min e o gargalo é a saturação do mini, não a distância. Números na ga-puml3i |
 
 ## Quando revisar
 
 - Disco do mini abaixo do piso de forma recorrente com o hq acima de ~10 GB: reabrir o GC no nó, não o flatten.
-- ga-puml3i aprovar a latência: abrir as fatias de migração do motor e atualizar a tabela acima.
+- Reabrir a fase 3 só se as duas coisas mudarem: o mini sair da saturação (load < ~20) **e** houver decisão de alargar o atalho (paginação/`-n 0`, ready, escritas). Aí repetir a medida da ga-puml3i com um trace de chamadas de um sweep vivo.
 - Nó travar por RAM: subir de plano (regra 2).
