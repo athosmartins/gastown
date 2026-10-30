@@ -64,7 +64,7 @@ Para liberar: pôr `"real_sessions_released_by": "<quem decidiu, quando>"` na en
 * é independente do `push-bundle` de propósito: o guarda não pode esperar pela classificação de um hook alheio. A mensagem de recusa do provider agora cita este comando;
 * o job é `scripts/com.gascity.hetzner-guard-sync.plist` (180 s). Instalar (`launchctl bootstrap`) e registrar na política do wait-for-dolt e no DPW é do Mayor, como foi com o capacity-step e o occupancy-watch; enquanto não estiver instalado, rodar o comando à mão (ou em laço) tem o mesmo efeito.
 
-**LIDO DO CÓDIGO e provado com o servidor em loopback** (`hetzner-claude.selftest.sh`: o shell, o sha, o `mv` e o `--selfcheck` do guarda de verdade rodam; 68 verificações novas, 12 delas mutantes pegos). **Não medido contra o Hetzner de verdade**: o primeiro uso real é do Mayor (`--check` primeiro).
+**LIDO DO CÓDIGO e provado com o servidor em loopback** (`hetzner-claude.selftest.sh`: o shell, o sha, o `mv` e o `--selfcheck` do guarda de verdade rodam; 81 verificações novas, 15 delas mutantes pegos). **Não medido contra o Hetzner de verdade**: o primeiro uso real é do Mayor (`--check` primeiro).
 
 ## `rm -rf` sem humano no teclado
 

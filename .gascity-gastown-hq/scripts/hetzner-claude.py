@@ -933,8 +933,10 @@ def cmd_sync_guard(a) -> int:
                       f"não reinstalo em laço: espero {SYNC_RETRY}s ou o guarda do repositório mudar")
                 return 1
             how, text = guard_apply(data, want)
-            if how == "ok":
-                return sync_done("ok", f"atualizado ({have[:12] if kind == 'sha' else 'ausente'} -> {want[:12]}); o anterior ficou em {GUARD_DEST}.sync-bak", 0, want, event=True)
+            if how == "ok":  # só há .sync-bak quando havia um guarda antes (o script só o cria nesse caso)
+                was = f"{have[:12]} -> " if kind == "sha" else "ausente -> "
+                kept = f"; o anterior ficou em {GUARD_DEST}.sync-bak" if kind == "sha" else ""
+                return sync_done("ok", f"atualizado ({was}{want[:12]}){kept}", 0, want, event=True)
             if how == "reverted":
                 return sync_done("failed", f"o --selfcheck do servidor reprovou o guarda novo e ele foi revertido ({text})", 1, want)
             if how == "failed":
