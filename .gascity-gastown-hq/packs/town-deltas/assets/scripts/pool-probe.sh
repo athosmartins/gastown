@@ -92,9 +92,10 @@ pp_log() {
 # ga-6fkx9je: GATE FOCUS MODE (Athos 07/10, ga-kqa08j). While the gate is the bottleneck (gate-focus-mode.sh says active=1) the
 # builder pools take no NEW story, only fixes: gate:needs-fix / gate:fix-attempt:N, origem:auto-healer-notify, impacto:dano-ao-vivo
 # (GATE_FOCUS_FIX_JQ, gate-focus-lib.sh). The wa/ps worker probes keep ONLY fixes; this probe cannot. The dog pool also carries the
-# city's own formula work (the stale-db cleanup molecule and its steps, gc.kind work - see the disk floor above): the Pilot never
-# dispatches it, so the mode never held it back, and starving it for the hours the mode stays ON would stop the reaper and the
-# orders. So the hold is the disk floor's minus the fix class: tier 1 loses the positively recognised NEW STORIES (the ONE
+# city's own formula work (the stale-db cleanup molecule and its steps, gc.kind work - see the disk floor above): the Pilot keeps
+# formula beads off its dispatch queue (_filter_candidates: gc.root_bead_id, gc.formula_contract, gc.kind), so the mode never held that
+# work back, and starving it for the hours the mode stays ON would stop the reaper and the orders.
+# So the hold is the disk floor's minus the fix class: tier 1 loses the positively recognised NEW STORIES (the ONE
 # definition, DISK_HOLD_NEW_STORIES_JQ in the disk lib) that are not fixes; formula work, fixes and tiers 2 and 3 flow.
 # Three states of the mode, never two: ON -> hold; OFF -> as before; unknown (lib missing or corrupt, no state file, a state
 # older than GATE_FOCUS_STALE_S, anything but 0/1) -> as before, FAIL OPEN as the lib's contract says and as every other pause
@@ -262,11 +263,11 @@ if [ "$focus_state" = 1 ] && [ "$disk_state" != low ]; then
         && t1_all_held=$(printf "%s" "$t1_all_kept" | jq -c "$focus_hold_jq" 2>/dev/null) && [ -n "$t1_all_held" ]; then
         # vazio/falhou/ilegível -> LOG TEXT ONLY (the list itself was read above and is what gets used): a count jq cannot give prints "?", never "0 left"
         n_all=$(pp_len "$t1_all_kept"); n_all_held=$(pp_len "$t1_all_held")
-        pp_log "gate focus mode ON, the --limit=$t1_window window held nothing but new stories - tier 1 refetched without a limit: $(pp_minus "$n_all" "$n_all_held") new story/stories held back, ${n_all_held:-?} left (ga-6fkx9je)"
+        pp_log "gate focus mode ON, the first $t1_window beads held nothing but new stories - tier 1 refetched without a limit:$(pp_minus "$n_all" "$n_all_held") new story/stories held back, ${n_all_held:-?} left (ga-6fkx9je)"
         t1_kept="$t1_all_held"
       else
         mark 1; t1_kept="[]"
-        pp_log "gate focus mode ON, the --limit=$t1_window window held nothing but new stories and the unlimited refetch could not be read - tier 1 answers nothing (ga-6fkx9je)"
+        pp_log "gate focus mode ON, the first $t1_window beads held nothing but new stories and the unlimited refetch could not be read - tier 1 answers nothing (ga-6fkx9je)"
       fi
     fi
   else
