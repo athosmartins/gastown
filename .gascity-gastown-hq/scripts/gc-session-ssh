@@ -79,8 +79,12 @@ O QUE NÃO FAZ (cada item é de outra fatia ou é recusa de propósito)
   SESSÃO REAL NÃO ABRE sem a liberação e sem o guarda de clone (ga-2hd02v.1.5, decisão Q4 do Mayor): só abre o que se chama
   remote-e2e-<x> ou remote-test-<x> (a sessão mínima de teste). Qualquer outro nome exige (1) `real_sessions_released_by` na config do host
   — decisão EXPLÍCITA do Mayor; ausente, vazio ou não-texto = recusa, sem ssh — e (2) conferir NO host, dentro do mesmo script do start,
-  que {remote_home}/.claude/hooks/remote-clone-guard.py é byte a byte o do repositório e que o `--selfcheck` dele aprova as settings
-  do host e a pasta da sessão (hook em Bash/Edit/Write/MultiEdit/NotebookEdit, com `|| exit 2`, sem disableAllHooks em nenhuma camada); senão exit 12 do script e nada abre.
+  que o remote-clone-guard.py é byte a byte o do repositório e que o `--selfcheck` dele aprova as settings e a pasta da sessão (hook em Bash/Edit/Write/MultiEdit/NotebookEdit,
+  com `|| exit 2`, sem disableAllHooks em nenhuma camada); senão exit 12 do script e nada abre. ONDE ficam o guarda e as settings depende de `guard_layer` do host:
+    home    (servidor; padrão) {remote_home}/.claude/hooks/remote-clone-guard.py e {remote_home}/.claude/settings.json;
+    session (notebook; padrão em host que dorme, e o ÚNICO aceito nele — ga-w7qwl1.2.7) {remote_root}/guard/remote-clone-guard.py e o arquivo do ÚLTIMO `--settings` do comando, que tem de ser
+            {remote_root}/city/settings.json (o claude usa só o último); nada sob {remote_home}/.claude é lido nem escrito pelo provider, e o hook só vale na sessão que carrega o arquivo do bundle
+            (remote-bundle-build.py build --guard-layer session). O python3 da conferência roda com o PATH da sessão (session_env.path), o mesmo do hook.
 
 CONFIGURAÇÃO  $GC_SSH_CONFIG ou <cidade>/.gc/session-ssh.json (cidade = pasta acima de scripts/)
   {"default_host": "hetzner", "hosts": {"hetzner": {"ssh": "hetzner-teste", "cap": 4,
@@ -94,6 +98,7 @@ CONFIGURAÇÃO  $GC_SSH_CONFIG ou <cidade>/.gc/session-ssh.json (cidade = pasta 
   host que dorme, ga-w7qwl1.1.5: o claude da sessão roda com ZDOTDIR=<remote_root>/zdot e CLAUDE_ENV_FILE=<remote_root>/zdot/env.sh do bundle
   (remote-bundle-build.py --session-path, a MESMA lista) e com PATH = só essas pastas — o shell da ferramenta Bash NÃO acha o bd/dolt do usuário;
   zdot ausente ou com PATH diferente do da config → a sessão não abre (exit 126, motivo no .exit); `claude` do comando vira o caminho absoluto).
+  guard_layer ("home" | "session"; padrão "session" em host que dorme, "home" nos demais; outro valor recusa a config, e "home" num host que dorme também): onde mora o guarda de clone da sessão real, acima.
   claude_account ({"current_file": "/abs/claude_pool_current_account.json", "secret": "/abs/secret"}; secret é opcional, padrão <mini_home>/.local/bin/secret; ga-2hd02v.7.1): a sessão cujo
   comando é o claude nasce na conta 'current' do pool do mini, com a chave dela (`secret claude-oauth-token-<e-mail>`, lida no mini, prazo de 15 s) em CLAUDE_CODE_OAUTH_TOKEN como PREFIXO do
   comando final do lançador (que vai pela entrada padrão do ssh e se apaga ao rodar; nunca no argv, log, evento nem dry-run). Conta sem item no cofre, cofre ilegível ou arquivo do pool
@@ -427,6 +432,14 @@ class Cfg:
         self.gate, self.sleeps = h.get("presence_gate", False), h.get("sleeps", False)
         if self.sleeps and not self.gate:  # notebook sem a regra de presença abriria sessão com o Athos no teclado
             raise Fail(f"host {self.host}: 'sleeps' (notebook) exige presence_gate true")
+        # onde mora o guarda de clone NO host (ga-w7qwl1.2.7): `home` = {remote_home}/.claude/hooks (servidor: o ~/.claude é do runner); `session` = {remote_root}/guard + o arquivo de --settings do bundle
+        # (notebook: o ~/.claude é do dono e o provider não o lê nem o escreve). ausente → `session` em host que dorme, `home` no resto; outro valor → recusa a config; `home` num host que dorme → recusa
+        # (guarda em ~/.claude pessoal: um python3 quebrado bloquearia as sessões PESSOAIS do Athos, e a pasta é dele — regra de 12/10, ga-sokx7u)
+        self.guard_layer = h.get("guard_layer", "session" if self.sleeps else "home")
+        if not isinstance(self.guard_layer, str) or self.guard_layer not in ("home", "session"):
+            raise Fail(f"host {self.host}: 'guard_layer' tem que ser \"home\" ou \"session\" ({self.guard_layer!r})")
+        if self.sleeps and self.guard_layer != "session":
+            raise Fail(f"host {self.host}: 'guard_layer' \"home\" num host que dorme (notebook) poria o guarda no ~/.claude pessoal do dono: só \"session\"")
         self.spath, self.claude_bin, self.zdot = self.session_env(h)
         # gui_agent (ga-w7qwl1.1.8): o tmux da sessão nasce num LaunchAgent do domínio gráfico (o claude só alcança o login lá). Host que dorme (o MBP) EXIGE: sem ele a sessão abriria deslogada, em silêncio.
         if "gui_agent" in h and not isinstance(h["gui_agent"], bool):
@@ -837,8 +850,24 @@ def op_gate(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     return 0 if v["ok"] else 1
 
 
-def real_gate(cfg: Cfg, name: str, work_dir: str) -> str:
-    """'' = sessão de teste (passa); senão o trecho de sh que confere o guarda de clone NO host. Sem liberação, ou sem como conferir → Fail."""
+def last_settings(command: str) -> str:
+    """O valor do ÚLTIMO `--settings` do comando; "" = nenhum, sem valor ou comando que não leio. O claude usa só o último (MEDIDO no 2.1.314: com dois, o primeiro é ignorado). O sh do lançador ainda expande $var e crase, que isto não segue: é conferência contra engano."""
+    try:
+        argv = shlex.split(command)
+    except ValueError:  # aspas que não fecham: não sei qual --settings vale, e "não sei" não é o do bundle
+        return ""
+    last = ""
+    for i, a in enumerate(argv):
+        if a == "--settings":
+            last = argv[i + 1] if i + 1 < len(argv) else ""
+        elif a.startswith("--settings="):
+            last = a[len("--settings="):]
+    return last
+
+
+def real_gate(cfg: Cfg, name: str, work_dir: str, command: str = "") -> str:
+    """'' = sessão de teste (passa); senão o trecho de sh que confere o guarda de clone NO host. Sem liberação, ou sem como conferir → Fail.
+    Camada `session` (notebook): o guarda é {remote_root}/guard/ e o settings conferido é o do `--settings` do COMANDO (que tem de ser o do bundle, o último dele); nada sob {remote_home}/.claude é lido."""
     if TEST_RE.fullmatch(name):
         return ""
     if not cfg.released:
@@ -849,10 +878,20 @@ def real_gate(cfg: Cfg, name: str, work_dir: str) -> str:
             sha = hashlib.sha256(f.read()).hexdigest()
     except OSError as e:
         raise Fail(f"sessão real {name!r} recusada: não consegui ler o {GUARD} do repositório para conferir o do host: {e}")
-    g, st = q(f"{cfg.home}/.claude/hooks/{GUARD}"), q(f"{cfg.home}/.claude/settings.json")
+    if cfg.guard_layer == "session":
+        bundle_settings = f"{cfg.root}/city/settings.json"
+        used = last_settings(command)
+        if used != bundle_settings:  # o hook do bundle só vale se o claude LER o arquivo do bundle: outro último --settings (ou nenhum) desliga o guarda sem ninguém ver
+            raise Fail(f"sessão real {name!r} recusada em {cfg.host}: o último --settings do comando é {used or '(nenhum)'!r}, não {bundle_settings!r}: o guarda de clone só vale na sessão que carrega o arquivo do bundle")
+        g, st = q(f"{cfg.root}/guard/{GUARD}"), q(bundle_settings)
+        fix = "reinstale o bundle com remote-bundle-build.py build --guard-layer session (mbp-proof install)"
+        py = f"env PATH={q(cfg.spath)} python3" if cfg.spath else "python3"  # o hook roda com o PATH da sessão: a conferência, com o mesmo
+    else:
+        g, st = q(f"{cfg.home}/.claude/hooks/{GUARD}"), q(f"{cfg.home}/.claude/settings.json")
+        fix, py = "corrija com: hetzner-claude.py sync-guard", "python3"
     return (f'h=$( {{ sha256sum {g} || shasum -a 256 {g}; }} 2>/dev/null | cut -d" " -f1)\n'
-            f'[ "$h" = {sha} ] || {{ echo "sessão real {name} recusada: {GUARD} ausente ou diferente do repositório no host (corrija com: hetzner-claude.py sync-guard)" >&2; exit {EX_POLICY}; }}\n'
-            f'o=$(python3 -I {g} --selfcheck {st} {q(work_dir)} 2>&1) || {{ echo "sessão real {name} recusada: o --selfcheck do guarda reprovou as settings do host: $o" >&2; exit {EX_POLICY}; }}\n')
+            f'[ "$h" = {sha} ] || {{ echo "sessão real {name} recusada: {GUARD} ausente ou diferente do repositório no host ({fix})" >&2; exit {EX_POLICY}; }}\n'
+            f'o=$({py} -I {g} --selfcheck {st} {q(work_dir)} 2>&1) || {{ echo "sessão real {name} recusada: o --selfcheck do guarda reprovou as settings do host: $o" >&2; exit {EX_POLICY}; }}\n')
 
 
 def shim_pump(cfg: Cfg) -> None:
@@ -923,11 +962,11 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     gate, would_refuse = "", None  # `gate` = o trecho de sh do guarda de clone (sessão real); `cfg.gate` = a regra de presença do MBP — duas regras, as DUAS valem
     if dry:  # vazio → a recusa local não dispararia (None; o sha e o --selfcheck do guarda só rodam no host, no start de verdade); falhou → o motivo, em vez de um dry-run que finge que abriria
         try:
-            real_gate(cfg, name, p["work_dir"])
+            real_gate(cfg, name, p["work_dir"], p["command"])
         except Fail as e:
             would_refuse = str(e)
     else:
-        gate = real_gate(cfg, name, p["work_dir"])  # política local primeiro: sessão real sem liberação nem chega a consultar a presença
+        gate = real_gate(cfg, name, p["work_dir"], p["command"])  # política local primeiro: sessão real sem liberação nem chega a consultar a presença
     if cfg.gate and not dry:  # regra de presença: a cada start, na hora (é o que faz "o Athos voltou → nada novo" valer já na próxima tentativa)
         g = gate_check(cfg)
         if not g["ok"]:
@@ -968,6 +1007,7 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
         print(json.dumps(dict(p, **wtd, host=cfg.host, session=name, session_kind="teste" if TEST_RE.fullmatch(name) else "real", would_refuse=would_refuse, claude_account=acct_view, model_profile=prof_view, launcher=launcher(cfg, name, p, secrets).split("\n"),
                               prepare=({"git_user": name, "git_email": f"{name}@gastown.invalid", "trust_file": f"{cfg.home}/.claude.json", "work_dir": p["work_dir"]} if cfg.prepare else None),
                               gate=cfg.gate_cmd if cfg.gate else None, path_extra=cfg.path_extra,
+                              **({"guard": {"layer": "session", "file": f"{cfg.root}/guard/{GUARD}", "settings": f"{cfg.root}/city/settings.json"}} if cfg.guard_layer == "session" else {}),
                               session_env={"path": cfg.spath, "claude": cfg.claude_bin, "zdot": cfg.zdot} if cfg.spath else None,
                               gui_agent=(dict(gui_files(cfg, name), bootstrap=["launchctl", "bootstrap", "gui/<uid>", gui_files(cfg, name)["plist"]], wait_s=cfg.gui_wait,
                                               script=gui_agent_sh(cfg, name, p, lpath).split("\n"), plist_xml=gui_plist(cfg, name).split("\n")) if cfg.gui else None),

@@ -10,6 +10,7 @@ USO
   remote-bundle-build.py build --city C --claude-home ~/.claude --role dog --role-dir C/.gc/agents/dogs/gastown.dog-1 \
       --remote-root /home/runner/gt-remote/bundle --remote-home /home/runner --out OUT [--skills [--exclude-skill NOME]...] [--session-path DIR:DIR...]
       (--session-path leva o ambiente de shell LIMPO da sessão em OUT/zdot/ — ver abaixo; sem a opção o bundle não tem zdot e nada muda)
+      (--guard-layer session, ga-w7qwl1.2.7: o bundle de um host cujo ~/.claude é de outra pessoa (o MBP); sem a opção, `home`, o do servidor — ver "CAMADA DA SESSÃO")
       (--skills deixa de fora, POR NOME, as de SKILLS_NOT_ON_SERVER (3, CPF/CNPJ) e SKILLS_MINI_ONLY (3, caminho do mini); --exclude-skill acrescenta nomes; o manifest lista `excluded_skills` e,
        para nome que não existe em skills/, `excluded_skills_missing` + aviso no stderr — a guarda de CPF/CNPJ continua valendo para as demais)
   remote-bundle-build.py verify OUT         # re-hasheia os arquivos e confere com o manifest (inclui o bit de execução, lido do modo, e o
@@ -41,6 +42,11 @@ O QUE ENTRA (cada hook tem UM veredito, na tabela POLICY):
           EXPLÍCITO da sessão (atalho primeiro, depois só pastas fixas do sistema — nunca ~/.local/bin nem ~/go/bin do usuário) e `env.sh` repete o PATH e dá
           `unalias`/`unset -f` em bd gc gate-done dolt: o claude carrega funções e aliases do ~/.zshrc real no snapshot do shell, e o env.sh roda DEPOIS dele a cada comando.
           Cada pasta do PATH tem que ser uma das fixas do sistema (SYS_DIRS) ou ficar sob a pasta-mãe de --remote-root (gt-remote/); outra coisa → exit 3.
+  CAMADA DA SESSÃO (--guard-layer session, ga-w7qwl1.2.7; Athos 12/10: o framework não toca o ~/.claude pessoal do MBP): NADA vai para {remote_home}/.claude. O guarda sai em guard/ (sempre, não só
+          com swap) e o city/settings.json — o arquivo do `--settings` da sessão, o único que só o `claude` aberto pelo provider carrega — ganha o PreToolUse do guarda para Bash e para
+          Edit|Write|MultiEdit|NotebookEdit e `"disableAllHooks": false` ESCRITO (MEDIDO no claude 2.1.314: um `disableAllHooks: true` no ~/.claude pessoal ou na pasta do projeto desliga,
+          calado, o hook que vem do `--settings`; o `false` no próprio `--settings` vence os dois). A camada de USUÁRIO do mini não é lida nem entregue (o MBP tem a dele); hook `keep` em city/role
+          recusa (o script iria para {remote_home}/.claude/hooks). Sem a opção (`home`, o Hetzner) a saída é a de sempre, byte a byte.
   Chaves de settings fora da lista de portáveis (modelo, statusLine, plugins...) são descartadas e registradas.
   Regra `ask` de permissão vira `deny` (ga-2hd02v.1.5): no servidor não há quem aperte a tecla, e `ask` explícita vale MESMO com
   --dangerously-skip-permissions — MEDIDO lá: `rm -rf` com só o `ask` fica parado num "Do you want to proceed?" sem fim; com `deny` é negado na hora.
@@ -54,7 +60,7 @@ POR QUE FALHA EM VEZ DE COPIAR (três estados: sei que serve / sei que não serv
   symlink de skill que sai da cidade, pasta ilegível dentro de uma skill, `--skills` com a pasta vazia, ou qualquer `/Users/` sobrando no que seria enviado
   → exit 3 e NADA é escrito.
 
-SAÍDA (OUT/): home/.claude/{settings.json,hooks/*} → {remote_home}/.claude/ · city/settings.json → arquivo de --settings · zdot/* (com --session-path) → ZDOTDIR ·
+SAÍDA (OUT/): home/.claude/{settings.json,hooks/*} → {remote_home}/.claude/ (não existe com --guard-layer session; no lugar, guard/remote-clone-guard.py → {remote_root}/guard/) · city/settings.json → arquivo de --settings · zdot/* (com --session-path) → ZDOTDIR ·
   role/<papel>/.claude/{settings.json,skills/*} → .claude/ do diretório de trabalho da sessão · manifest.json (veredito
   por hook com `command` (a parte reconhecida) e `command_sha256` (do comando inteiro, drop inclusive), shim_needs, chaves descartadas, contagem de regras de permissão descartadas, sha256 de cada arquivo, bundle_hash — sem data/hora: mesma entrada, mesmo hash).
 
@@ -178,6 +184,7 @@ def listing_hash(items: dict[str, tuple[str, bool]]) -> str:  # items: caminho �
 class Bundle:
     def __init__(self, a: argparse.Namespace):
         self.a = a
+        self.session_layer = a.guard_layer == "session"
         self.city = Path(a.city).resolve()
         self.home = str(Path(a.mini_home).resolve())
         self.rules = [(str(self.city), a.remote_root + "/city"), (str(self.city.parent), a.remote_root + "/work"),
@@ -279,9 +286,22 @@ class Bundle:
         return verdict
 
     def guard_hook(self) -> dict:
-        return {"type": "command", "command": f"python3 -I {self.a.remote_home}/.claude/hooks/{GUARD} || exit 2"}
+        where = f"{self.a.remote_root}/guard" if self.session_layer else f"{self.a.remote_home}/.claude/hooks"
+        return {"type": "command", "command": f"python3 -I {where}/{GUARD} || exit 2"}
+
+    def session_guard(self, out: dict) -> None:
+        """Camada da sessão: o guarda e o `disableAllHooks: false` ficam ESCRITOS no arquivo de --settings (o do usuário não é entregue e o do projeto/pessoal pode desligar hooks)."""
+        pre = out.setdefault("hooks", {}).setdefault("PreToolUse", [])
+        gh = self.guard_hook()
+        # o swap do city (se houver) já pôs o guarda no grupo do Bash (junto de outros hooks) e/ou no de FILE_TOOLS: um grupo de mesmo matcher que já traz o guarda não ganha outro
+        # (o guarda rodaria duas vezes); o veredito não depende da ordem (qualquer saída 2 bloqueia)
+        want = [{"matcher": m, "hooks": [gh]} for m in ("Bash", FILE_TOOLS) if not any(g.get("matcher") == m and gh in g.get("hooks", []) for g in pre)]
+        pre[:0] = want
+        out["disableAllHooks"] = False
 
     def keep_script(self, name: str) -> None:
+        if self.session_layer:  # o script iria para {remote_home}/.claude/hooks, e a camada da sessão não escreve ali: ausente ≠ descartado
+            raise Refused(f"hook keep {name}: --guard-layer session não instala nada em {self.a.remote_home}/.claude (o script iria para hooks/)")
         p = Path(self.a.claude_home) / "hooks" / name
         if not p.is_file():
             raise Refused(f"hook keep {name}: {p} não existe (ausente ≠ descartado)")
@@ -435,17 +455,25 @@ class Bundle:
                                       ("city", "city", self.city / ".gc" / "settings.json", "city/settings.json"),
                                       (f"role:{a.role}", "role", Path(a.role_dir) / ".claude" / "settings.json",
                                        f"role/{a.role}/.claude/settings.json")):
+            if self.session_layer and kind == "user":  # o ~/.claude do host é do dono; esta camada não o lê nem o entrega
+                continue
             out = self.settings(src, kind, path)
+            if self.session_layer and kind == "city":
+                self.session_guard(out)
             self.add(dest, (json.dumps(out, indent=2, sort_keys=True) + "\n").encode())
-        if self.swaps:
+        if self.session_layer:  # sempre: o city/settings.json acima aponta para este arquivo, haja swap ou não
+            self.add(f"guard/{GUARD}", Path(a.clone_guard).read_bytes(), ex=True)
+        elif self.swaps:
             self.add(f"home/.claude/hooks/{GUARD}", Path(a.clone_guard).read_bytes(), ex=True)
         if a.skills:
             self.skills(a.role, Path(a.role_dir))
         return {"version": 1, "remote_root": a.remote_root, "remote_home": a.remote_home, "role": a.role,
-                "install": {"home/.claude": a.remote_home + "/.claude", "city/settings.json": a.remote_root + "/city/settings.json",
+                "install": {**({"guard": a.remote_root + "/guard"} if self.session_layer else {"home/.claude": a.remote_home + "/.claude"}),
+                            "city/settings.json": a.remote_root + "/city/settings.json",
                             f"role/{a.role}/.claude": "<diretório de trabalho da sessão>/.claude", **({"zdot": a.remote_root + "/zdot"} if self.session_dirs else {})},
+                **({"guard_layer": "session"} if self.session_layer else {}),
                 "session_path": self.session_dirs,
-                "hooks": self.hooks, "shim_needs": sorted(self.shim_needs), "clone_guard": self.swaps > 0,
+                "hooks": self.hooks, "shim_needs": sorted(self.shim_needs), "clone_guard": self.swaps > 0 or self.session_layer,
                 "dropped_keys": {k: sorted(set(v)) for k, v in sorted(self.dropped_keys.items())},
                 "dropped_rules": dict(sorted(self.dropped_rules.items())),
                 "excluded_skills": self.excluded, "excluded_skills_missing": self.excluded_missing,
@@ -577,6 +605,7 @@ def main(argv: list[str]) -> int:
     b.add_argument("--skills", action="store_true")
     b.add_argument("--exclude-skill", action="append", default=[], metavar="NOME")
     b.add_argument("--session-path", default=None, metavar="DIR:DIR")  # o PATH explícito da sessão (zdot/); vazio = sem zdot
+    b.add_argument("--guard-layer", choices=("home", "session"), default="home")  # home = o do servidor ({remote_home}/.claude/hooks); session = guard/ + city/settings.json (ga-w7qwl1.2.7)
     b.add_argument("--clone-guard", default=str(Path(__file__).resolve().parent / GUARD))  # o guarda que o swap leva; ilegível → recusa
     v = sub.add_parser("verify")
     v.add_argument("dir")

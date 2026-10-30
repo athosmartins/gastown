@@ -26,6 +26,10 @@
 #   mbp (ga-w7qwl1) — host de presença (notebook que dorme): `presence_gate`/`sleeps`/`path_extra` validados na config; start só abre com a regra de
 #   presença livre (pausa, bandeira, slot_cap e vigia de prioridade), a política local do guarda de clone vale ANTES dela; list-running tolera host
 #   que dorme e mantém o registro de sessões; recusa clara do host limpa o registro; /Users/ de outro home recusa.
+#   lay (ga-w7qwl1.2.7) — a camada de guarda da SESSÃO: num host que dorme (o MBP) `guard_layer` é "session" por padrão (outro valor, e "home" ali, recusa a config sem ssh;
+#   o servidor segue "home"); o `start` real confere o guarda e o --selfcheck do BUNDLE (<raiz>/guard, <raiz>/city/settings.json, com o python3 do PATH da sessão) e NÃO lê nem escreve nada em
+#   $HOME/.claude (nem com ele ilegível, envenenado ou chmod 000); o último --settings do comando tem que ser o do bundle (nenhum, outro, ou o do bundle antes de outro recusa); python3
+#   ausente ou quebrado = a sessão não abre (exit 12) e nada muda fora dela; o worktree (worktree_rigs/wt-add) e o session_env (ZDOTDIR/PATH/claude absoluto) convivem NO MESMO host; Hetzner igual.
 #   gui (ga-w7qwl1.1.8) — o tmux do MBP nasce num LaunchAgent POR SESSÃO do domínio gráfico (launchd/claude falsos em $T/extra): o plist fica em <raiz>/run (nunca em ~/Library/LaunchAgents), o label tem o prefixo
 #   fixo, o tmux server nasce no domínio gráfico e o claude da sessão enxerga o login, o claude só roda `auth status` e o Keychain não é tocado; o stop faz bootout, apaga e PROVA a ausência (print rc 113; 112 = sem
 #   o domínio; rc 1 ou label ainda carregado = o stop FALHA e a sessão fica no registro); o start recusa (exit 1, com a causa, nada aberto/carregado/em run/, evento 'refused') sem sessão gráfica, com o claude
@@ -53,7 +57,7 @@
 #   erro de ssh, flock, "tmux sem acesso" tolerado como "sem servidor", o `has` que engole o erro do tmux, melhor esforço da sessão
 #   ausente, o stop que não confere que a sessão sumiu, e o portão (sem a liberação, liberação de qualquer tipo, nome de teste frouxo ou sem
 #   âncora, sem conferir o sha do guarda, sem rodar o --selfcheck, script do host que sai 0, guarda irmão ilegível), e a regra de presença do MBP (grupo mbp: guarda de /Users/, validação da config, recusa/pausa/slot_cap, vigia, PATH extra,
-#   registro de sessões do list-running); 170 mutantes no total (33 do grupo gui: bootout/arquivos/prova de ausência do stop e da recusa, a varredura de órfãs e a ordem dela, o veredito do `auth status` (ilegível, rc, contraditório), plist fora de run/, label sem prefixo, KeepAlive, Aqua, validação da config, e os do start em duas chamadas: o piso da 2ª chamada, o rc 14 do abandonado contra o 15 do gui_agent, as funções do agente na 2ª; 5 do grupo abort: a marca <nome>.stop do stop, ga-0k82lw — o stop não a grava, o preparo do start não a apaga, a 2ª chamada não olha para ela, o stop não poda as marcas antigas (> 24 h), a poda sem limite de idade leva a marca recém-gravada; 20 do grupo lr: o cache nunca lido, start sem invalidar antes / depois, stop sem invalidar, gravação sem conferir a geração, prazo e relógio, geração e forma do arquivo, dry-run, list_cache_s em cinco formas, geração ilegível ou ausente, registro acertado com lista do cache, falha ao invalidar derrubando o start; 26 do grupo wt: wt-add/wt-rm do provider, o guarda DEPOIS do wt-add, o recolhimento só do que não perde trabalho e os nomes do engine; 9 do ambiente limpo da sessão, grupo mbp: session_env, ZDOTDIR, PATH explícito e claude absoluto, ga-w7qwl1.1.5).
+#   registro de sessões do list-running); a camada da sessão (grupo lay: o último --settings, o guarda e o settings do bundle no lugar do ~/.claude, o PATH da sessão na conferência, o padrão por host que dorme, a recusa do home num host que dorme, a validação do valor, a chave guard do dry-run); um mutante por trava, a conta sai no resumo da rodada; no grupo gui são 33 (gui: bootout/arquivos/prova de ausência do stop e da recusa, a varredura de órfãs e a ordem dela, o veredito do `auth status` (ilegível, rc, contraditório), plist fora de run/, label sem prefixo, KeepAlive, Aqua, validação da config, e os do start em duas chamadas: o piso da 2ª chamada, o rc 14 do abandonado contra o 15 do gui_agent, as funções do agente na 2ª; 5 do grupo abort: a marca <nome>.stop do stop, ga-0k82lw — o stop não a grava, o preparo do start não a apaga, a 2ª chamada não olha para ela, o stop não poda as marcas antigas (> 24 h), a poda sem limite de idade leva a marca recém-gravada; 20 do grupo lr: o cache nunca lido, start sem invalidar antes / depois, stop sem invalidar, gravação sem conferir a geração, prazo e relógio, geração e forma do arquivo, dry-run, list_cache_s em cinco formas, geração ilegível ou ausente, registro acertado com lista do cache, falha ao invalidar derrubando o start; 26 do grupo wt: wt-add/wt-rm do provider, o guarda DEPOIS do wt-add, o recolhimento só do que não perde trabalho e os nomes do engine; 9 do ambiente limpo da sessão, grupo mbp: session_env, ZDOTDIR, PATH explícito e claude absoluto, ga-w7qwl1.1.5).
 #   Mais: contra um stub que só sai 0, quase tudo falha.
 # VARIÁVEIS: GCSSH_UNDER_TEST (script a testar) · GCSSH_ONLY (grupos separados por vírgula) · GCSSH_NO_MUTANTS=1 · GCSSH_MUTANTS_ONLY=<grupo> (pula os casos e roda só os mutantes desse grupo) · GCSSH_SHARD=K/N (pula os casos e roda só os mutantes de ordem ≡ K mod N; K e N decimais sem sinal nem zero à esquerda, N de 1 a 9999, K de 0 a N-1, senão exit 2; o stub só no K=0: a campanha de mutantes em N processos). Rodar ZERO casos e ZERO mutantes (grupo que não existe em GCSSH_ONLY/GCSSH_MUTANTS_ONLY, fatia K/N sem mutante nenhum) FALHA com 'NADA RODOU' (exit 1), nunca sai como '0/0 ok'; o grupo `shard` prova isso
 set -u
@@ -117,6 +121,12 @@ install_host() {  # o guarda e as settings do "servidor" ($RH/.claude), como o b
   local src; src="$(dirname "$P")/$GUARDF"; [ -f "$src" ] || src="$HERE/$GUARDF"
   mkdir -p "$RH/.claude/hooks"; cp "$src" "$RH/.claude/hooks/$GUARDF"
   jq -n --arg c "python3 -I $RH/.claude/hooks/$GUARDF || exit 2" '{hooks:{PreToolUse:[{matcher:"Bash",hooks:[{type:"command",command:$c}]},{matcher:"Edit|Write|MultiEdit|NotebookEdit",hooks:[{type:"command",command:$c}]}]}}' > "$RH/.claude/settings.json"
+}
+MSET="--settings $RR/city/settings.json"; HOLD="sh -c cat sh $MSET"  # o comando de um host de camada `session` TEM de carregar o settings do bundle (o último --settings); HOLD é o `cat` que mantém a sessão de pé, com ele
+install_session() {  # a camada da SESSÃO do bundle ($RR/guard + $RR/city/settings.json), como `remote-bundle-build.py build --guard-layer session` a instala; o guarda é o IRMÃO do script em teste. NADA sob $RH/.claude
+  local src; src="$(dirname "$P")/$GUARDF"; [ -f "$src" ] || src="$HERE/$GUARDF"
+  mkdir -p "$RR/guard" "$RR/city"; cp "$src" "$RR/guard/$GUARDF"
+  jq -n --arg c "python3 -I $RR/guard/$GUARDF || exit 2" '{disableAllHooks:false,hooks:{PreToolUse:[{matcher:"Bash",hooks:[{type:"command",command:$c}]},{matcher:"Edit|Write|MultiEdit|NotebookEdit",hooks:[{type:"command",command:$c}]}]}}' > "$RR/city/settings.json"
 }
 count() { tmux -L "${2:-$SOCK}" list-sessions 2>/dev/null | grep -c . ; }
 group() { [ -z "${GCSSH_ONLY:-}" ] || case ",$GCSSH_ONLY," in *",$1,"*) return 0;; *) return 1;; esac; }
@@ -359,7 +369,7 @@ EOF
   # biblioteca de presença falsa (o modo vem de $T/pres.mode, a pausa de $T/pres.pause): as mesmas variáveis da mbp-presence.sh de verdade
   printf 'presence_eval() { PR_MODE=$(cat "%s/pres.mode" 2>/dev/null || echo uso); PR_PAUSED=0; [ -e "%s/pres.pause" ] && PR_PAUSED=1; return 0; }\n' "$T" "$T" > "$T/lib/presence.sh"
   echo livre > "$T/pres.mode"; rm -f "$T/pres.pause"
-  zdot_put "$T/shim-bin:/usr/bin:/bin"
+  zdot_put "$T/shim-bin:/usr/bin:/bin"; install_session
   setup_gui
 }
 # ---- o domínio gráfico falso (ga-w7qwl1.1.8): tudo em $T/extra, que é o path_extra do host m (vem ANTES do PATH do sistema) ----
@@ -461,22 +471,22 @@ g_mbp() {
   [ $RC = 0 ] && [ "$(jq -r .env.GC_HOME "$T/out")" = /Users/athos/.gc ] && jq -r .command "$T/out" | grep -q -- '--d /Users/athos/trab'; ok $? "mbp: com home /Users/athos no host, o caminho do mini vira o do MBP e passa (rc=$RC $(head -c 150 "$T/err"))"
   GC_SSH_HOST=h pv --dry-run start x-2 < <(req "claude --d /Users/outro/trab"); [ $RC = 1 ] && has "$T/err" 'caminho do mini'; ok $? "mbp: /Users/ de OUTRO usuário continua recusado mesmo num host cujo home é /Users/..."
   # --- gate: só evidência positiva de "Athos fora e MBP saudável" abre sessão ---
-  fresh; mode livre; pv start w-remote-m-1 < <(req cat); ok $RC "mbp: Athos fora e MBP saudável → o start abre (rc=$RC $(head -c 200 "$T/err"))"
+  fresh; mode livre; pv start w-remote-m-1 < <(req "$HOLD"); ok $RC "mbp: Athos fora e MBP saudável → o start abre (rc=$RC $(head -c 200 "$T/err"))"
   [ "$(count x "${SOCK}m")" = 1 ] && [ "$(count)" = 0 ]; ok $? "mbp: a sessão está no socket do host m, não no do padrão"
   jq -e 'select(.event=="started" and .host=="m" and .session=="w-remote-m-1")' "$T/state/m/events.jsonl" >/dev/null 2>&1; ok $? "mbp: o start deixa uma linha 'started' em <estado>/m/events.jsonl (insumo do placar)"
   [ -e "$T/state/m/running/w-remote-m-1" ]; ok $? "mbp: ...e registra a sessão como aberta por nós"
   for m in uso pausado semsaude pausalocal flagoff semcap cap0 sempresenca lixo vazio; do
-    mode $m; fresh; pv start w-remote-m-9 < <(req cat); [ $RC = 1 ] && has "$T/err" 'não abro sessão nova' && nossh && [ "$(count x "${SOCK}m")" = 1 ]
+    mode $m; fresh; pv start w-remote-m-9 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'não abro sessão nova' && nossh && [ "$(count x "${SOCK}m")" = 1 ]
     ok $? "mbp: checagem '$m' → start recusado, sem ssh e sem sessão nova (rc=$RC $(head -c 120 "$T/err"))"
   done
-  mode uso; pv start w-remote-m-9 < <(req cat); has "$T/err" 'Athos está no MBP' && has "$T/err" 'input_recente'; ok $? "mbp: a recusa por uso diz que o Athos está no MBP e por quê"
-  mode pausado; pv start w-remote-m-9 < <(req cat); has "$T/err" 'pausado'; ok $? "mbp: a recusa por pausa/bandeira (rc 99) diz isso"
-  mode semsaude; pv start w-remote-m-9 < <(req cat); has "$T/err" 'sem saúde'; ok $? "mbp: a recusa por MBP sem saúde (rc 98) diz isso"
+  mode uso; pv start w-remote-m-9 < <(req "$HOLD"); has "$T/err" 'Athos está no MBP' && has "$T/err" 'input_recente'; ok $? "mbp: a recusa por uso diz que o Athos está no MBP e por quê"
+  mode pausado; pv start w-remote-m-9 < <(req "$HOLD"); has "$T/err" 'pausado'; ok $? "mbp: a recusa por pausa/bandeira (rc 99) diz isso"
+  mode semsaude; pv start w-remote-m-9 < <(req "$HOLD"); has "$T/err" 'sem saúde'; ok $? "mbp: a recusa por MBP sem saúde (rc 98) diz isso"
   jq -e 'select(.event=="refused" and .host=="m" and (.reason|test("Athos está no MBP")))' "$T/state/m/events.jsonl" >/dev/null 2>&1; ok $? "mbp: cada recusa vira linha 'refused' com o motivo no events.jsonl"
-  mkdir -p "$T/noexec"; cfgm '{"gate_cmd":["'"$T"'/noexec/nao-existe"]}'; mode livre; fresh; pv start w-remote-m-9 < <(req cat); [ $RC = 1 ] && has "$T/err" 'não consegui rodar a checagem' && nossh; ok $? "mbp: checagem que não roda → recusa (não abre 'por falta de resposta')"
-  cfgm; mode livre; pv start w-remote-m-2 < <(req cat); ok $RC "mbp: com tudo de volta ao normal, o próximo start abre sozinho"
+  mkdir -p "$T/noexec"; cfgm '{"gate_cmd":["'"$T"'/noexec/nao-existe"]}'; mode livre; fresh; pv start w-remote-m-9 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'não consegui rodar a checagem' && nossh; ok $? "mbp: checagem que não roda → recusa (não abre 'por falta de resposta')"
+  cfgm; mode livre; pv start w-remote-m-2 < <(req "$HOLD"); ok $RC "mbp: com tudo de volta ao normal, o próximo start abre sozinho"
   # --- o teto é o menor entre o do host e o slot_cap da checagem ---
-  pv stop w-remote-m-2 </dev/null; pv stop w-remote-m-1 </dev/null; mode slot1; pv start w-remote-m-1 < <(req cat); pv start w-remote-m-2 < <(req cat)
+  pv stop w-remote-m-2 </dev/null; pv stop w-remote-m-1 </dev/null; mode slot1; pv start w-remote-m-1 < <(req "$HOLD"); pv start w-remote-m-2 < <(req "$HOLD")
   [ $RC = 1 ] && has "$T/err" 'teto' && [ "$(count x "${SOCK}m")" = 1 ]; ok $? "mbp: cap 2 no host, slot_cap 1 na checagem → a 2ª sessão não abre (vale o menor)"
   [ ! -e "$T/state/m/running/w-remote-m-2" ]; ok $? "mbp: start que o host recusou com clareza (teto) não fica no registro de sessões nossas"
   # --- gate <host>: o veredito de um start agora, sem abrir nada ---
@@ -489,22 +499,22 @@ g_mbp() {
   mode livre; GC_SSH_DRYRUN=1 pv gate m </dev/null; [ $RC = 2 ]; ok $? "mbp: GC_SSH_DRYRUN=1 vazado → gate exit 2, não 'sempre libera'"
   [ "$(count x "${SOCK}m")" = 1 ]; ok $? "mbp: gate não abre nem fecha nenhuma sessão"
   # --- list-running: todos os hosts; o notebook dormindo não derruba a lista ---
-  pv stop w-remote-m-1 </dev/null; pv start w-a-1 < <(req cat); mode livre; pv start w-remote-m-3 < <(req cat)
+  pv stop w-remote-m-1 </dev/null; pv start w-a-1 < <(req "$HOLD"); mode livre; pv start w-remote-m-3 < <(req "$HOLD")
   pv list-running w- </dev/null; [ $RC = 0 ] && has "$T/out" w-a-1 && has "$T/out" w-remote-m-3; ok $? "mbp: list-running junta as sessões de todos os hosts"
   GC_SSH_HOST=m pv list-running w- </dev/null; [ "$(cat "$T/out")" = w-remote-m-3 ]; ok $? "mbp: \$GC_SSH_HOST fixa o list-running num host só"
   FAKE_SSH_FAIL_HOST=fakembp pv list-running w- </dev/null; [ $RC = 1 ] && has "$T/err" fakembp; ok $? "mbp: notebook fora do ar COM sessão nossa registrada → list-running é erro (não sei o que há lá)"
   pv stop w-remote-m-3 </dev/null; FAKE_SSH_FAIL_HOST=fakembp pv list-running w- </dev/null; [ $RC = 0 ] && has "$T/out" w-a-1 && has "$T/state/m/session-ssh.log" 'não conta'; ok $? "mbp: notebook fora do ar SEM sessão nossa → só ele sai da lista (a do servidor continua), e o log diz"
   pv stop w-a-1 </dev/null
   FAKE_SSH_FAIL_HOST=fakehost pv list-running w- </dev/null; [ $RC = 1 ] && has "$T/err" fakehost; ok $? "mbp: o host que NÃO dorme, fora do ar e sem sessão registrada, continua sendo erro (nunca lista vazia)"
-  mode livre; pv start w-remote-m-4 < <(req cat); tmux -L "${SOCK}m" kill-session -t =w-remote-m-4 2>/dev/null; pv list-running w- </dev/null; [ ! -e "$T/state/m/running/w-remote-m-4" ]; ok $? "mbp: sessão que o host já não tem sai do registro quando o host responde (o registro se corrige sozinho)"
+  mode livre; pv start w-remote-m-4 < <(req "$HOLD"); tmux -L "${SOCK}m" kill-session -t =w-remote-m-4 2>/dev/null; pv list-running w- </dev/null; [ ! -e "$T/state/m/running/w-remote-m-4" ]; ok $? "mbp: sessão que o host já não tem sai do registro quando o host responde (o registro se corrige sozinho)"
   touch -t 203001010000 "$T/state/m/running/w-remote-m-7"; pv list-running w- </dev/null; [ -e "$T/state/m/running/w-remote-m-7" ]; ok $? "mbp: registro mais novo que a pergunta (start em curso) não é apagado pelo list-running"
   rm -f "$T/state/m/running/w-remote-m-7"
   FAKE_SSH_CUT_HOST=fakembp pv list-running w- </dev/null; [ $RC = 1 ] && has "$T/err" 'sem marcadores'; ok $? "mbp: notebook que RESPONDEU cortado, mesmo sem sessão registrada, é erro (só 'não respondeu' sai da lista) (rc=$RC)"
-  mode livre; FAKE_SSH_RAN_255=1 pv start w-remote-m-6 < <(req cat); [ $RC = 1 ] && [ -e "$T/state/m/running/w-remote-m-6" ]; ok $? "mbp: start ambíguo (o script rodou, o ssh caiu depois) fica no registro (rc=$RC)"
+  mode livre; FAKE_SSH_RAN_255=1 pv start w-remote-m-6 < <(req "$HOLD"); [ $RC = 1 ] && [ -e "$T/state/m/running/w-remote-m-6" ]; ok $? "mbp: start ambíguo (o script rodou, o ssh caiu depois) fica no registro (rc=$RC)"
   FAKE_SSH_FAIL_HOST=fakembp pv list-running w- </dev/null; [ $RC = 1 ]; ok $? "mbp: ...e com o notebook fora do ar o list-running diz 'não sei' (erro), não 'nada nosso lá'"
   pv stop w-remote-m-6 </dev/null
   # --- PATH extra do host ---
-  pv start w-remote-m-5 < <(req "sh -c 'echo \$PATH > $T/path.out; echo \$ZDOTDIR \$CLAUDE_ENV_FILE > $T/zd.out; exec cat'"); sleep 0.5
+  pv start w-remote-m-5 < <(req "sh -c 'echo \$PATH > $T/path.out; echo \$ZDOTDIR \$CLAUDE_ENV_FILE > $T/zd.out; exec cat' sh $MSET"); sleep 0.5
   [ "$(cat "$T/path.out" 2>/dev/null)" = "$T/shim-bin:/usr/bin:/bin" ]; ok $? "mbp: o PATH da sessão é EXATAMENTE o da session_env (atalho + pastas do sistema), sem o PATH do ssh nem ~/.local/bin"
   [ "$(cat "$T/zd.out" 2>/dev/null)" = "$RR/zdot $RR/zdot/env.sh" ]; ok $? "mbp: a sessão leva ZDOTDIR=<raiz>/zdot e CLAUDE_ENV_FILE=<raiz>/zdot/env.sh"
   case "$(tmux -L "${SOCK}m" show-environment -g PATH 2>&1)" in "PATH=$T/extra:"*) true;; *) false;; esac; ok $? "mbp: o PATH do HOST (tmux, ps, renice) segue começando pelo path_extra (Homebrew do MBP)"
@@ -515,7 +525,7 @@ g_mbp() {
   mkdir -p "$T/home/.local/bin"; : > "$T/demote.log"
   for t in renice taskpolicy; do printf '#!/bin/sh\necho "%s $*" >> "%s/demote.log"\n' "$t" "$T" > "$T/home/.local/bin/$t"; chmod +x "$T/home/.local/bin/$t"; done
   echo livre > "$T/pres.mode"; rm -f "$T/pres.pause" "$T/wpid.out"
-  pv start w-remote-m-6 < <(req "sh -c 'echo \$\$ > $T/wpid.out; exec sleep 300'"); ok $RC "mbp: (preparo) sessão de longa duração (rc=$RC $(head -c 150 "$T/err"))"; sleep 3; pid=$(cat "$T/wpid.out" 2>/dev/null)
+  pv start w-remote-m-6 < <(req "sh -c 'echo \$\$ > $T/wpid.out; exec sleep 300' sh $MSET"); ok $RC "mbp: (preparo) sessão de longa duração (rc=$RC $(head -c 150 "$T/err"))"; sleep 3; pid=$(cat "$T/wpid.out" 2>/dev/null)
   [ -n "$pid" ] && [ ! -s "$T/demote.log" ]; ok $? "mbp: com o Athos fora, ninguém é rebaixado (pid=$pid, $(wc -l < "$T/demote.log") chamadas)"
   echo uso > "$T/pres.mode"; for i in $(seq 1 40); do grep -q "^taskpolicy -b -p $pid\$" "$T/demote.log" && break; sleep 0.25; done
   grep -q "^renice -n 19 -p $pid\$" "$T/demote.log" && grep -q "^taskpolicy -b -p $pid\$" "$T/demote.log"; ok $? "mbp: o Athos voltou → o processo da sessão (pid $pid) leva renice 19 + taskpolicy -b em poucos segundos"
@@ -525,20 +535,20 @@ g_mbp() {
   # vazio (pgrep rc 1) → passa; falhou/ilegível (rc 2/3) → FAIL, nunca "nenhum sobrou". Casa o caminho da biblioteca falsa, que é argumento do vigia e único por bateria ($T vem do mktemp): o 'PRESENCE_LIB_ONLY=1' de antes casava também o vigia de OUTRA bateria rodando em paralelo (revisor/dog no mini) e reprovava à toa (ga-3gaf8g)
   pv stop w-remote-m-6 </dev/null; sleep 2; pgrep -f "$T/lib/presence.sh" >/dev/null; [ $? = 1 ]; ok $? "mbp: o vigia termina junto com a sessão (nenhum sobrou DESTA bateria; o de outra rodando em paralelo não conta)"
   : > "$T/demote.log"; rm -f "$T/wpid.out"; : > "$T/pres.pause"; echo livre > "$T/pres.mode"
-  pv start w-remote-m-7 < <(req "sh -c 'echo \$\$ > $T/wpid.out; exec sleep 300'"); sleep 1; pid=$(cat "$T/wpid.out" 2>/dev/null)
+  pv start w-remote-m-7 < <(req "sh -c 'echo \$\$ > $T/wpid.out; exec sleep 300' sh $MSET"); sleep 1; pid=$(cat "$T/wpid.out" 2>/dev/null)
   for i in $(seq 1 40); do grep -q "^taskpolicy -b -p $pid\$" "$T/demote.log" && break; sleep 0.25; done
   grep -q "^taskpolicy -b -p $pid\$" "$T/demote.log"; ok $? "mbp: a pausa do Athos (arquivo de pausa) também rebaixa a sessão em curso"
   pv stop w-remote-m-7 </dev/null; rm -f "$T/pres.pause" "$T/home/.local/bin/renice" "$T/home/.local/bin/taskpolicy"
   # --- o ambiente da sessão é do bundle: sem ele (ou de outro PATH) a sessão NÃO abre; e o comando tem que existir no PATH da SESSÃO ---
-  mode livre; mv "$RR/zdot" "$RR/zdot.off"; fresh; pv start w-remote-m-9 < <(req cat); [ $RC = 1 ] && has "$T/err" 'zdot ausente ou com PATH diferente' && [ "$(count x "${SOCK}m")" = 0 ]
+  mode livre; mv "$RR/zdot" "$RR/zdot.off"; fresh; pv start w-remote-m-9 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'zdot ausente ou com PATH diferente' && [ "$(count x "${SOCK}m")" = 0 ]
   ok $? "mbp: sem o zdot do bundle no host o start recusa dizendo por quê e nada fica aberto (rc=$RC)"
-  mv "$RR/zdot.off" "$RR/zdot"; zdot_put "/usr/local/bin:/usr/bin:/bin"; pv start w-remote-m-9 < <(req cat); [ $RC = 1 ] && has "$T/err" 'zdot ausente ou com PATH diferente' && [ "$(count x "${SOCK}m")" = 0 ]
+  mv "$RR/zdot.off" "$RR/zdot"; zdot_put "/usr/local/bin:/usr/bin:/bin"; pv start w-remote-m-9 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'zdot ausente ou com PATH diferente' && [ "$(count x "${SOCK}m")" = 0 ]
   ok $? "mbp: zdot com PATH diferente do da session_env (bundle de outra lista) → recusa, nada aberto (rc=$RC)"
   zdot_put "$T/shim-bin:/usr/bin:/bin"; printf '#!/bin/sh\nexit 0\n' > "$T/extra/so-no-host"; chmod +x "$T/extra/so-no-host"
-  pv start w-remote-m-9 < <(req so-no-host); [ $RC = 1 ] && has "$T/err" 'comando não encontrado' && [ "$(count x "${SOCK}m")" = 0 ]
+  pv start w-remote-m-9 < <(req "so-no-host $MSET"); [ $RC = 1 ] && has "$T/err" 'comando não encontrado' && [ "$(count x "${SOCK}m")" = 0 ]
   ok $? "mbp: comando que só existe no PATH do host (path_extra) não existe para a sessão: 127, nada aberto (rc=$RC)"
   # --- sem a biblioteca de presença no host não há vigia, então não há sessão ---
-  mv "$T/lib/presence.sh" "$T/lib/presence.sh.off"; fresh; pv start w-remote-m-8 < <(req cat); [ $RC = 1 ] && has "$T/err" 'biblioteca de presença' && [ "$(count x "${SOCK}m")" = 0 ]; ok $? "mbp: sem a biblioteca de presença no host o start recusa (uma sessão sem vigia não abre) (rc=$RC)"
+  mv "$T/lib/presence.sh" "$T/lib/presence.sh.off"; fresh; pv start w-remote-m-8 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'biblioteca de presença' && [ "$(count x "${SOCK}m")" = 0 ]; ok $? "mbp: sem a biblioteca de presença no host o start recusa (uma sessão sem vigia não abre) (rc=$RC)"
   mv "$T/lib/presence.sh.off" "$T/lib/presence.sh"
   # --- nada de segredo novo no MBP: o env é o mesmo filtro do servidor ---
   pv --dry-run start w-remote-m-0 < <(req claude '' '{"env":{"GC_CITY":"'"$CITY"'","GC_INSTANCE_TOKEN":"x","ANTHROPIC_API_KEY":"k","GITHUB_TOKEN":"g","LANG":"C"}}' | jq '.work_dir="'"$CITY"'/.gc/agents/dog"')
@@ -546,24 +556,24 @@ g_mbp() {
   jq -r .work_dir "$T/out" | grep -q "^$RR/"; ok $? "mbp: o diretório de trabalho fica dentro da raiz do bundle (gt-remote), nunca no resto do home do Athos"
   # --- config: a regra de presença não pode ser desligada por engano, e sem default_host o host vem do nome ---
   for v in '"true"' 1 null '"sim"'; do
-    cfgm '{"presence_gate":'"$v"'}'; fresh; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "'presence_gate'" && nossh; ok $? "mbp: presence_gate=$v (não é true/false) recusa a config, sem ssh (rc=$RC)"
+    cfgm '{"presence_gate":'"$v"'}'; fresh; pv --dry-run start w-remote-m-0 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" "'presence_gate'" && nossh; ok $? "mbp: presence_gate=$v (não é true/false) recusa a config, sem ssh (rc=$RC)"
   done
-  cfgm '{"sleeps":"talvez"}'; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "'sleeps'"; ok $? "mbp: sleeps que não é booleano recusa a config"
-  cfgm '{"presence_gate":false}'; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" 'exige presence_gate'; ok $? "mbp: notebook (sleeps) sem a regra de presença recusa a config"
-  cfgm '{"session_env":null}'; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "'session_env' é obrigatório" && nossh; ok $? "mbp: notebook (sleeps) sem session_env recusa a config, sem ssh (rc=$RC)"
+  cfgm '{"sleeps":"talvez"}'; pv --dry-run start w-remote-m-0 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" "'sleeps'"; ok $? "mbp: sleeps que não é booleano recusa a config"
+  cfgm '{"presence_gate":false}'; pv --dry-run start w-remote-m-0 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'exige presence_gate'; ok $? "mbp: notebook (sleeps) sem a regra de presença recusa a config"
+  cfgm '{"session_env":null}'; pv --dry-run start w-remote-m-0 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" "'session_env' é obrigatório" && nossh; ok $? "mbp: notebook (sleeps) sem session_env recusa a config, sem ssh (rc=$RC)"
   for v in '"/usr/bin"' '{}' '{"path":[],"claude":"/c"}' '{"path":["/usr/bin"]}' '{"path":["/usr/bin"],"claude":"c"}' '{"path":["/usr/bin","/usr/bin"],"claude":"/c"}' \
            '{"path":["/home/x/.local/bin"],"claude":"/c"}' '{"path":["/a/../b"],"claude":"/c"}' '{"path":["bin"],"claude":"/c"}' '{"path":["/usr/bin"],"claude":"/c","extra":1}' '{"path":"/usr/bin","claude":"/c"}'; do
-    cfgm '{"session_env":'"$v"'}'; fresh; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "session_env" && nossh; ok $? "mbp: session_env $v recusa a config (nunca vira 'sem ambiente'), sem ssh (rc=$RC)"
+    cfgm '{"session_env":'"$v"'}'; fresh; pv --dry-run start w-remote-m-0 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" "session_env" && nossh; ok $? "mbp: session_env $v recusa a config (nunca vira 'sem ambiente'), sem ssh (rc=$RC)"
   done
-  cfgm; pv --dry-run start w-1 < <(req cat); [ $RC = 0 ] && [ "$(jq -r .session_env "$T/out")" = null ]; ok $? "mbp: host que NÃO dorme segue sem session_env (nada muda para o servidor) (rc=$RC)"
-  cfgm '{"gate_cmd":"mbp-run.sh --check"}'; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "'gate_cmd'"; ok $? "mbp: gate_cmd em texto (não lista) recusa a config"
+  cfgm; pv --dry-run start w-1 < <(req "$HOLD"); [ $RC = 0 ] && [ "$(jq -r .session_env "$T/out")" = null ]; ok $? "mbp: host que NÃO dorme segue sem session_env (nada muda para o servidor) (rc=$RC)"
+  cfgm '{"gate_cmd":"mbp-run.sh --check"}'; pv --dry-run start w-remote-m-0 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" "'gate_cmd'"; ok $? "mbp: gate_cmd em texto (não lista) recusa a config"
   cfgm; jq 'del(.default_host)' "$T/cfg.json" > "$T/cfg.nd" && mv "$T/cfg.nd" "$T/cfg.json"; setup_mbp; mode livre
-  pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 0 ] && [ "$(jq -r .host "$T/out")" = m ]; ok $? "mbp: sem default_host o nome da sessão ainda escolhe o host (rc=$RC $(head -c 120 "$T/err"))"
-  cfgm; pv --dry-run start dog-remote-1 < <(req cat); [ $RC = 0 ] && [ "$(jq -r .host "$T/out")" = a ]; ok $? "mbp: <papel>-remote-<n> (número do pool, a forma do patch do engine) vai ao default_host, não pede o host '1' (rc=$RC $(head -c 120 "$T/err"))"
+  pv --dry-run start w-remote-m-0 < <(req "$HOLD"); [ $RC = 0 ] && [ "$(jq -r .host "$T/out")" = m ]; ok $? "mbp: sem default_host o nome da sessão ainda escolhe o host (rc=$RC $(head -c 120 "$T/err"))"
+  cfgm; pv --dry-run start dog-remote-1 < <(req "$HOLD"); [ $RC = 0 ] && [ "$(jq -r .host "$T/out")" = a ]; ok $? "mbp: <papel>-remote-<n> (número do pool, a forma do patch do engine) vai ao default_host, não pede o host '1' (rc=$RC $(head -c 120 "$T/err"))"
   # sozinho o caso acima não separa o `isdigit`: a regra de cauda (o número no FIM do nome não pede host) devolve o mesmo default_host. Com sufixo só o `isdigit` salva.
-  pv --dry-run start dog-remote-1-2 < <(req cat); [ $RC = 0 ] && [ "$(jq -r .host "$T/out")" = a ]; ok $? "mbp: um número nunca é host, nem com sufixo (<papel>-remote-<n>-<m> vai ao default_host, não recusa 'host 1') (rc=$RC $(head -c 120 "$T/err"))"
+  pv --dry-run start dog-remote-1-2 < <(req "$HOLD"); [ $RC = 0 ] && [ "$(jq -r .host "$T/out")" = a ]; ok $? "mbp: um número nunca é host, nem com sufixo (<papel>-remote-<n>-<m> vai ao default_host, não recusa 'host 1') (rc=$RC $(head -c 120 "$T/err"))"
   jq 'del(.default_host)' "$T/cfg.json" > "$T/cfg.nd" && mv "$T/cfg.nd" "$T/cfg.json"
-  pv start w-remote-m-1 < <(req cat); pv list-running w- </dev/null; [ $RC = 0 ] && has "$T/out" w-remote-m-1; ok $? "mbp: sem default_host o list-running ainda junta os hosts (rc=$RC $(head -c 120 "$T/err"))"
+  pv start w-remote-m-1 < <(req "$HOLD"); pv list-running w- </dev/null; [ $RC = 0 ] && has "$T/out" w-remote-m-1; ok $? "mbp: sem default_host o list-running ainda junta os hosts (rc=$RC $(head -c 120 "$T/err"))"
   pv stop w-remote-m-1 </dev/null
   cfg 3
 }
@@ -576,7 +586,7 @@ lcline() { grep -n "$1" "$T/lc.log" | tail -1 | cut -d: -f1; }  # número da ÚL
 gui_refuse() {  # gui_refuse DESCRIÇÃO FRAGMENTO-DO-ERRO [auth.mode [lc.mode [arquivo-de-falha]]] — start recusado: exit 1 com a causa, nada aberto, nada carregado, nada em run/, evento 'refused', Keychain intocado, claude só 'auth status' no gui
   lcreset; [ -z "${3:-}" ] || echo "$3" > "$T/auth.mode"; [ -z "${4:-}" ] || echo "$4" > "$T/lc.mode"; [ -z "${5:-}" ] || : > "$T/$5"
   mkdir -p "$T/state/m"; : > "$T/state/m/events.jsonl"; fresh
-  pv start w-remote-m-9 < <(req cat)
+  pv start w-remote-m-9 < <(req "$HOLD")
   [ $RC = 1 ] && has "$T/err" "$2" && [ "$(count x "${SOCK}m")" = 0 ] && [ "$(nload)" = 0 ] && [ "$(nrun)" = 0 ] && [ ! -e "$T/state/m/running/w-remote-m-9" ] && [ ! -s "$T/security.log" ] \
     && ! grep -qv '^auth status FAKE_LAUNCHD=1$' "$T/claude.log" && jq -e 'select(.event=="refused" and .session=="w-remote-m-9" and (.reason|startswith("gui_agent:")))' "$T/state/m/events.jsonl" >/dev/null 2>&1
   ok $? "gui: $1 → start recusado (exit 1) com a causa, nada aberto/carregado/em run/, evento 'refused' (rc=$RC $(head -c 140 "$T/err"))"
@@ -599,7 +609,7 @@ g_gui() {
   pv --dry-run start w-1 < <(req "claude --x"); [ $RC = 0 ] && [ "$(jq -r .gui_agent "$T/out")" = null ]; ok $? "gui: host sem gui_agent (o servidor Linux) não ganha agente"
   # --- start: o tmux nasce no domínio gráfico, o claude da sessão enxerga o login, nada fora de run/, Keychain intocado ---
   lcreset; fresh; rm -f "$T/inside.out"
-  pv start w-remote-m-1 < <(req "sh -c '$T/claude auth status > $T/inside.out 2>&1; exec cat'"); ok $RC "gui: sessão gráfica + claude logado → o start abre (rc=$RC $(head -c 200 "$T/err"))"
+  pv start w-remote-m-1 < <(req "sh -c '$T/claude auth status > $T/inside.out 2>&1; exec cat' sh $MSET"); ok $RC "gui: sessão gráfica + claude logado → o start abre (rc=$RC $(head -c 200 "$T/err"))"
   for i in $(seq 1 20); do [ -s "$T/inside.out" ] && break; sleep 0.5; done
   [ "$(count x "${SOCK}m")" = 1 ] && [ "$(tmux -L "${SOCK}m" show-environment -g FAKE_LAUNCHD 2>&1)" = FAKE_LAUNCHD=1 ]; ok $? "gui: o tmux server nasceu DENTRO do domínio gráfico (o ambiente dele é o do launchd, não o do ssh)"
   grep -q '"loggedIn": true' "$T/inside.out" 2>/dev/null; ok $? "gui: o claude de dentro da sessão enxerga o login (o que pelo ssh sozinho dá false)"
@@ -615,15 +625,15 @@ g_gui() {
   [ $rc = 0 ] && [ -n "$b" ] && [ -n "$p" ] && [ "$p" -gt "$b" ]; ok $? "gui: o stop faz bootout e DEPOIS confere pelo launchctl print que o label sumiu (3) (rc=$rc bootout@${b:-nunca} print@${p:-nunca})"
   [ "$(nload)" = 0 ] && [ "$(nrun)" = 0 ] && [ "$(count x "${SOCK}m")" = 0 ]; ok $? "gui: depois do stop não sobra agente carregado, plist, script nem veredito em run/ (3)"
   evt stopped w-remote-m-1 && [ ! -e "$T/state/m/running/w-remote-m-1" ]; ok $? "gui: stop completo → linha 'stopped' e a sessão sai do registro"
-  pv start w-remote-m-1 < <(req cat); ok $RC "gui: depois do stop o mesmo nome abre de novo (o label foi liberado de verdade) (rc=$RC $(head -c 160 "$T/err"))"; pv stop w-remote-m-1 </dev/null
+  pv start w-remote-m-1 < <(req "$HOLD"); ok $RC "gui: depois do stop o mesmo nome abre de novo (o label foi liberado de verdade) (rc=$RC $(head -c 160 "$T/err"))"; pv stop w-remote-m-1 </dev/null
   # --- 3: sem prova, o stop FALHA (e o registro da sessão fica): bootout que não removeu · launchctl print que não deu para ler ---
-  pv start w-remote-m-2 < <(req cat); echo stuck > "$T/lc.mode"; : > "$T/state/m/events.jsonl"; pv stop w-remote-m-2 </dev/null
+  pv start w-remote-m-2 < <(req "$HOLD"); echo stuck > "$T/lc.mode"; : > "$T/state/m/events.jsonl"; pv stop w-remote-m-2 </dev/null
   [ $RC = 1 ] && has "$T/err" 'a ausência NÃO foi provada' && [ -e "$T/lc/loaded/${L}w-remote-m-2" ] && [ -e "$T/state/m/running/w-remote-m-2" ] && ! evt stopped w-remote-m-2; ok $? "gui: bootout que não removeu o label → o stop FALHA ('ausência NÃO foi provada'), mantém o registro e não anuncia 'stopped' (3) (rc=$RC $(head -c 140 "$T/err"))"
   rm -f "$T/lc.mode"; pv stop w-remote-m-2 </dev/null; [ $RC = 0 ] && [ "$(nload)" = 0 ] && evt stopped w-remote-m-2 && [ ! -e "$T/state/m/running/w-remote-m-2" ]; ok $? "gui: com o launchd de volta ao normal o mesmo stop termina e limpa (rc=$RC)"
-  pv start w-remote-m-2 < <(req cat); echo printfail > "$T/lc.mode"; : > "$T/state/m/events.jsonl"; pv stop w-remote-m-2 </dev/null  # eventos zerados: o 'stopped' do mesmo nome, do caso acima, não pode valer aqui
+  pv start w-remote-m-2 < <(req "$HOLD"); echo printfail > "$T/lc.mode"; : > "$T/state/m/events.jsonl"; pv stop w-remote-m-2 </dev/null  # eventos zerados: o 'stopped' do mesmo nome, do caso acima, não pode valer aqui
   [ $RC = 1 ] && has "$T/err" 'launchctl print rc=1' && [ -e "$T/state/m/running/w-remote-m-2" ] && ! evt stopped w-remote-m-2 && [ "$(nload)" = 0 ]; ok $? "gui: launchctl print que não deu para ler (rc 1) NÃO vale como ausência, mesmo com o label de fato removido: o stop falha (3) (rc=$RC $(head -c 140 "$T/err"))"
   rm -f "$T/lc.mode"; pv stop w-remote-m-2 </dev/null; [ $RC = 0 ] && evt stopped w-remote-m-2; ok $? "gui: ...e lido de novo (113) o stop termina (rc=$RC)"
-  pv start w-remote-m-2 < <(req cat); echo nogui > "$T/lc.mode"; : > "$T/state/m/events.jsonl"; pv stop w-remote-m-2 </dev/null
+  pv start w-remote-m-2 < <(req "$HOLD"); echo nogui > "$T/lc.mode"; : > "$T/state/m/events.jsonl"; pv stop w-remote-m-2 </dev/null
   [ $RC = 0 ] && evt stopped w-remote-m-2; ok $? "gui: sem o domínio gui (print rc 112) nada vive nele: conta como ausência provada — decisão de projeto, o Mayor escreveu 113 (rc=$RC $(head -c 140 "$T/err"))"
   # --- 6: sem sessão gráfica, ou com o claude deslogado/ilegível no domínio gráfico, o start RECUSA (exit != 0, com o motivo) ---
   gui_refuse "sem sessão gráfica (o claude não alcançaria o Keychain)" 'não há sessão gráfica' "" nogui; ! grep -q ' bootstrap ' "$T/lc.log"; ok $? "gui: ...e sem sessão gráfica nada chegou a ser carregado"
@@ -637,17 +647,17 @@ g_gui() {
   gui_refuse "plutil reprova o plist" 'plutil -lint' "" "" plutil.fail
   gui_refuse "launchctl bootstrap que falha" 'launchctl bootstrap do agente' "" bootfail
   gui_refuse "tmux do agente que não abre a sessão" 'o tmux do agente não abriu a sessão' "" "" tmux.fail; has "$T/err" boom; ok $? "gui: ...e a causa do tmux vem na mensagem"
-  lcreset; echo out > "$T/auth.mode"; echo stuck > "$T/lc.mode"; : > "$T/state/m/events.jsonl"; pv start w-remote-m-9 < <(req cat)
+  lcreset; echo out > "$T/auth.mode"; echo stuck > "$T/lc.mode"; : > "$T/state/m/events.jsonl"; pv start w-remote-m-9 < <(req "$HOLD")
   [ $RC = 1 ] && has "$T/err" 'DESLOGADO' && has "$T/err" 'a ausência NÃO foi provada' && [ -e "$T/lc/loaded/${L}w-remote-m-9" ]; ok $? "gui: recusa cujo agente não se conseguiu remover diz as DUAS coisas (a causa e que o agente ficou) — nunca 'limpo' calado (rc=$RC)"
   # --- 4: o start varre os agentes órfãos do prefixo ANTES de criar o novo (o w-remote-m-9 acima já é uma: só no domínio, sem arquivos) ---
   rm -f "$T/lc.mode"; echo in > "$T/auth.mode"
-  pv start w-remote-m-2 < <(req cat); pv start w-remote-m-1 < <(req cat)
+  pv start w-remote-m-2 < <(req "$HOLD"); pv start w-remote-m-1 < <(req "$HOLD")
   tmux -L "${SOCK}m" kill-session -t =w-remote-m-1  # a sessão some por fora: o agente fica carregado e os arquivos em run/ (o stop nunca rodou)
   printf x > "$RR/run/${L}w-remote-m-5.plist"; printf x > "$RR/run/${L}w-remote-m-5.agent.sh"  # só arquivos (start que morreu no meio)
   echo "$RR/run/${L}w-remote-m-6.plist" > "$T/lc/loaded/${L}w-remote-m-6"  # só no domínio (stop que apagou os arquivos mas não derrubou)
   echo x > "$T/lc/loaded/com.apple.fake"; printf x > "$RR/run/outro.plist"; printf x > "$RR/run/${L}w-remote-m-7.plist.bak"  # NÃO são nossos: outro prefixo, outro nome, outro sufixo
   [ -e "$T/lc/loaded/${L}w-remote-m-1" ] && [ -f "$RR/run/${L}w-remote-m-1.plist" ] && [ -f "$RR/run/${L}w-remote-m-1.agent.sh" ] && [ -f "$RR/run/${L}w-remote-m-5.plist" ] && [ -e "$T/lc/loaded/${L}w-remote-m-6" ] && [ -e "$T/lc/loaded/com.apple.fake" ]; ok $? "gui: precondição da varredura — as órfãs (1 carregada+arquivos, 5 só arquivos, 6 só no domínio) e o que não é nosso estão montados ANTES do start; sem isso os casos abaixo passariam no vazio"
-  : > "$T/lc.log"; pv start w-remote-m-3 < <(req cat); ok $RC "gui: start com órfãs pendentes abre (rc=$RC $(head -c 200 "$T/err"))"
+  : > "$T/lc.log"; pv start w-remote-m-3 < <(req "$HOLD"); ok $RC "gui: start com órfãs pendentes abre (rc=$RC $(head -c 200 "$T/err"))"
   [ ! -e "$T/lc/loaded/${L}w-remote-m-9" ]; ok $? "gui: a sobra da recusa acima (carregada, sem arquivos) também foi varrida, já pelo start seguinte (4)"
   [ ! -e "$T/lc/loaded/${L}w-remote-m-1" ] && [ ! -e "$RR/run/${L}w-remote-m-1.plist" ] && [ ! -e "$RR/run/${L}w-remote-m-1.agent.sh" ] && [ ! -e "$RR/run/${L}w-remote-m-1.agent.res" ]; ok $? "gui: órfã de sessão que sumiu por fora (carregada + arquivos) é varrida (4)"
   [ ! -e "$RR/run/${L}w-remote-m-5.plist" ] && [ ! -e "$RR/run/${L}w-remote-m-5.agent.sh" ]; ok $? "gui: órfã que só tem arquivos em run/ é varrida (4)"
@@ -659,37 +669,37 @@ g_gui() {
   has "$T/state/m/session-ssh.log" "start w-remote-m-3: gui_agent: varreu o agente órfão ${L}w-remote-m-1" && has "$T/state/m/session-ssh.log" "gui_agent: varreu o agente órfão ${L}w-remote-m-5" && has "$T/state/m/session-ssh.log" "gui_agent: varreu o agente órfão ${L}w-remote-m-6"; ok $? "gui: cada órfã varrida fica no log do provider"
   pv stop w-remote-m-2 </dev/null; pv stop w-remote-m-3 </dev/null; rm -f "$RR/run/outro.plist" "$RR/run/${L}w-remote-m-7.plist.bak"
   lcreset; echo "$RR/run/${L}w-remote-m-6.plist" > "$T/lc/loaded/${L}w-remote-m-6"; echo stuck > "$T/lc.mode"; : > "$T/state/m/events.jsonl"; : > "$T/lc.log"
-  pv start w-remote-m-4 < <(req cat)
+  pv start w-remote-m-4 < <(req "$HOLD")
   [ $RC = 1 ] && has "$T/err" 'a ausência NÃO foi provada' && ! grep -q "^launchctl bootstrap .*${L}w-remote-m-4" "$T/lc.log" && [ "$(count x "${SOCK}m")" = 0 ] && [ ! -e "$T/state/m/running/w-remote-m-4" ] && [ "$(nrun)" = 0 ] \
     && jq -e 'select(.event=="refused" and .session=="w-remote-m-4" and (.reason|startswith("gui_agent:")))' "$T/state/m/events.jsonl" >/dev/null 2>&1; ok $? "gui: órfã que a varredura não consegue provar ausente → o start recusa e NÃO cria o agente novo (4) (rc=$RC $(head -c 140 "$T/err"))"
-  rm -f "$T/lc.mode"; pv start w-remote-m-4 < <(req cat); [ $RC = 0 ] && [ ! -e "$T/lc/loaded/${L}w-remote-m-6" ] && [ -e "$T/lc/loaded/${L}w-remote-m-4" ]; ok $? "gui: ...e com o launchd de volta ao normal o mesmo start varre a órfã e abre (rc=$RC)"
+  rm -f "$T/lc.mode"; pv start w-remote-m-4 < <(req "$HOLD"); [ $RC = 0 ] && [ ! -e "$T/lc/loaded/${L}w-remote-m-6" ] && [ -e "$T/lc/loaded/${L}w-remote-m-4" ]; ok $? "gui: ...e com o launchd de volta ao normal o mesmo start varre a órfã e abre (rc=$RC)"
   pv stop w-remote-m-4 </dev/null
   # --- o resto do start: teto, nome repetido, sessão que morre logo, regra de presença antes de tudo (7) ---
-  lcreset; pv start w-remote-m-1 < <(req cat); pv start w-remote-m-2 < <(req cat); : > "$T/lc.log"
-  pv start w-remote-m-3 < <(req cat); [ $RC = 1 ] && has "$T/err" 'teto' && [ ! -s "$T/lc.log" ] && [ ! -e "$RR/run/${L}w-remote-m-3.plist" ]; ok $? "gui: host no teto → recusa antes de tocar no launchd (nenhum launchctl, nenhum arquivo) (rc=$RC)"
-  pv start w-remote-m-1 < <(req cat); [ $RC != 0 ] && ! grep -q '^launchctl bootstrap' "$T/lc.log" && [ "$(count x "${SOCK}m")" = 2 ]; ok $? "gui: nome que já existe → não cria um segundo agente para ele (rc=$RC)"
+  lcreset; pv start w-remote-m-1 < <(req "$HOLD"); pv start w-remote-m-2 < <(req "$HOLD"); : > "$T/lc.log"
+  pv start w-remote-m-3 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'teto' && [ ! -s "$T/lc.log" ] && [ ! -e "$RR/run/${L}w-remote-m-3.plist" ]; ok $? "gui: host no teto → recusa antes de tocar no launchd (nenhum launchctl, nenhum arquivo) (rc=$RC)"
+  pv start w-remote-m-1 < <(req "$HOLD"); [ $RC != 0 ] && ! grep -q '^launchctl bootstrap' "$T/lc.log" && [ "$(count x "${SOCK}m")" = 2 ]; ok $? "gui: nome que já existe → não cria um segundo agente para ele (rc=$RC)"
   pv stop w-remote-m-1 </dev/null; pv stop w-remote-m-2 </dev/null
-  lcreset; pv start w-remote-m-9 < <(req "sh -c 'exit 3'"); [ $RC = 1 ] && has "$T/err" 'terminou logo após abrir' && [ "$(nload)" = 0 ] && [ "$(nrun)" = 0 ]; ok $? "gui: sessão que morre logo depois de abrir leva o agente junto, provado — não deixa órfão (rc=$RC $(head -c 140 "$T/err"))"
-  lcreset; mode uso; fresh; pv start w-remote-m-9 < <(req cat); [ $RC = 1 ] && has "$T/err" 'Athos está no MBP' && [ ! -s "$T/lc.log" ] && [ "$(nrun)" = 0 ] && nossh; ok $? "gui: Athos usando o MBP → o start recusa ANTES de tocar no launchd: a regra de presença vem primeiro e o agente não a contorna (7) (rc=$RC)"
+  lcreset; pv start w-remote-m-9 < <(req "sh -c 'exit 3' sh $MSET"); [ $RC = 1 ] && has "$T/err" 'terminou logo após abrir' && [ "$(nload)" = 0 ] && [ "$(nrun)" = 0 ]; ok $? "gui: sessão que morre logo depois de abrir leva o agente junto, provado — não deixa órfão (rc=$RC $(head -c 140 "$T/err"))"
+  lcreset; mode uso; fresh; pv start w-remote-m-9 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'Athos está no MBP' && [ ! -s "$T/lc.log" ] && [ "$(nrun)" = 0 ] && nossh; ok $? "gui: Athos usando o MBP → o start recusa ANTES de tocar no launchd: a regra de presença vem primeiro e o agente não a contorna (7) (rc=$RC)"
   mode livre
   # --- o start são DUAS chamadas ssh (ga-0k82lw): o que a 1.8 põe dentro delas tem que caber nas regras desse desenho ---
   # a 2ª chamada carrega o agente e espera o veredito do login (até gui_wait_s): com o prazo do start já gasto, o piso dela tem que cobrir essa espera, senão o ssh é cortado com o agente ainda subindo
   lcreset; echo slow > "$T/auth.mode"; cfgm '{"gui_proof_s":2,"start_timeout":3}'; fresh
-  pv start w-remote-m-8 < <(req cat); [ $RC = 0 ] && [ "$(count x "${SOCK}m")" = 1 ] && [ -e "$T/lc/loaded/${L}w-remote-m-8" ]; ok $? "gui: 'auth status' de 7 s com start_timeout 3 → a 2ª chamada tem o piso do veredito (OPEN_MIN + gui_wait_s) e o start abre (rc=$RC $(head -c 140 "$T/err"))"
+  pv start w-remote-m-8 < <(req "$HOLD"); [ $RC = 0 ] && [ "$(count x "${SOCK}m")" = 1 ] && [ -e "$T/lc/loaded/${L}w-remote-m-8" ]; ok $? "gui: 'auth status' de 7 s com start_timeout 3 → a 2ª chamada tem o piso do veredito (OPEN_MIN + gui_wait_s) e o start abre (rc=$RC $(head -c 140 "$T/err"))"
   pv stop w-remote-m-8 </dev/null; echo in > "$T/auth.mode"; cfgm '{"gui_proof_s":2}'
   # o stop chega na parte lenta do start: a 2ª chamada desiste ANTES de carregar o agente (a 1ª só LEU o launchd, na varredura) — e é o rc 14 ('abandonado'), não o 15 da recusa do domínio gráfico (um evento 'refused' de gui_agent para um start que o mini abandonou seria mentira)
   lcreset; : > "$T/state/m/events.jsonl"; fresh; rm -f "$T/slow.mark"
   printf '#!/bin/sh\n: > "%s"\nsleep 4\nexec "%s" "$@"\n' "$T/slow.mark" "$(command -v sha256sum)" > "$T/extra/sha256sum"; chmod +x "$T/extra/sha256sum"  # a sessão w-remote-* é REAL: o portão roda sha256sum no host, na 1ª chamada
-  env HOME="$T/home" GC_SSH_CONFIG="$T/cfg.json" GC_SSH_BIN="$T/bin/ssh" GC_EXEC_STATE_DIR="$T/state" "$P" start w-remote-m-9 < <(req cat) >"$T/out.bg" 2>"$T/err.bg" & i=$!
+  env HOME="$T/home" GC_SSH_CONFIG="$T/cfg.json" GC_SSH_BIN="$T/bin/ssh" GC_EXEC_STATE_DIR="$T/state" "$P" start w-remote-m-9 < <(req "$HOLD") >"$T/out.bg" 2>"$T/err.bg" & i=$!
   waitfor "$T/slow.mark"; pv stop w-remote-m-9 </dev/null; rc=$RC; wait $i; k=$?; rm -f "$T/extra/sha256sum"
   [ -e "$T/slow.mark" ] && [ $rc = 0 ] && [ $k = 1 ] && has "$T/err.bg" 'abandonado' && ! grep -q ' bootstrap ' "$T/lc.log" && [ "$(nload)" = 0 ] && [ "$(nrun)" = 0 ] && [ "$(count x "${SOCK}m")" = 0 ] \
     && ! jq -e 'select(.event=="refused" and .session=="w-remote-m-9")' "$T/state/m/events.jsonl" >/dev/null 2>&1; ok $? "gui: stop no meio da parte lenta do start → o start desiste ('abandonado') sem carregar agente e sem evento 'refused' de gui_agent (stop rc=$rc, start rc=$k: $(head -c 120 "$T/err.bg"))"
   rm -f "$T/state/m/running/w-remote-m-9"
   # --- config: gui_agent é decisão explícita; no notebook é obrigatória; o agente precisa do claude que confere o login ---
-  for v in '"true"' 1 null; do cfgm '{"gui_agent":'"$v"'}'; fresh; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "'gui_agent'" && nossh; ok $? "gui: gui_agent=$v (não é true/false) recusa a config, sem ssh (rc=$RC)"; done
-  cfgm '{"gui_agent":false}'; fresh; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "'gui_agent' é obrigatório" && nossh; ok $? "gui: notebook (sleeps) sem gui_agent recusa a config — senão o tmux nasceria no ssh e a sessão, deslogada (rc=$RC)"
-  cfgm; jq '.hosts.a.gui_agent=true' "$T/cfg.json" > "$T/cfg.nd" && mv "$T/cfg.nd" "$T/cfg.json"; fresh; pv --dry-run start w-1 < <(req cat); [ $RC = 1 ] && has "$T/err" "session_env.claude" && nossh; ok $? "gui: gui_agent num host sem session_env.claude recusa a config (o agente não teria como conferir o login) (rc=$RC)"
-  for k in gui_wait_s gui_proof_s; do for v in 0 601 '"x"'; do cfgm '{"'$k'":'"$v"'}'; fresh; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "$k" && nossh; ok $? "gui: $k=$v recusa a config, sem ssh (rc=$RC)"; done; done
+  for v in '"true"' 1 null; do cfgm '{"gui_agent":'"$v"'}'; fresh; pv --dry-run start w-remote-m-0 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" "'gui_agent'" && nossh; ok $? "gui: gui_agent=$v (não é true/false) recusa a config, sem ssh (rc=$RC)"; done
+  cfgm '{"gui_agent":false}'; fresh; pv --dry-run start w-remote-m-0 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" "'gui_agent' é obrigatório" && nossh; ok $? "gui: notebook (sleeps) sem gui_agent recusa a config — senão o tmux nasceria no ssh e a sessão, deslogada (rc=$RC)"
+  cfgm; jq '.hosts.a.gui_agent=true' "$T/cfg.json" > "$T/cfg.nd" && mv "$T/cfg.nd" "$T/cfg.json"; fresh; pv --dry-run start w-1 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" "session_env.claude" && nossh; ok $? "gui: gui_agent num host sem session_env.claude recusa a config (o agente não teria como conferir o login) (rc=$RC)"
+  for k in gui_wait_s gui_proof_s; do for v in 0 601 '"x"'; do cfgm '{"'$k'":'"$v"'}'; fresh; pv --dry-run start w-remote-m-0 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" "$k" && nossh; ok $? "gui: $k=$v recusa a config, sem ssh (rc=$RC)"; done; done
   lcreset; cfg 3
 }
 
@@ -698,32 +708,32 @@ g_gate() {  # a sessão REAL só abre com a liberação E o guarda conferido no 
   cfg 3; good=$(cat "$T/cfg.json"); fresh
   # sem liberação e sem guarda no host: só a sessão de teste abre
   echo "$good" | jq 'del(.hosts.a.real_sessions_released_by)' > "$T/cfg.json"; find "$RH/.claude" -mindepth 1 -delete 2>/dev/null
-  for nm in remote-e2e-1 remote-test-x_Y-2; do pv start $nm < <(req cat); ok $RC "gate: $nm (sessão mínima de teste) abre sem liberação e sem guarda no host (rc=$RC $(head -c 150 "$T/err"))"; pv stop $nm </dev/null; done
+  for nm in remote-e2e-1 remote-test-x_Y-2; do pv start $nm < <(req "$HOLD"); ok $RC "gate: $nm (sessão mínima de teste) abre sem liberação e sem guarda no host (rc=$RC $(head -c 150 "$T/err"))"; pv stop $nm </dev/null; done
   # com o guarda bom no host, mas sem liberação: a real não abre
   install_host; fresh
-  pv start g-real < <(req cat); [ $RC = 1 ] && has "$T/err" 'real_sessions_released_by' && has "$T/err" 'g-real' && nossh && [ "$(count)" = 0 ]; ok $? "gate: sessão real SEM a chave de liberação recusa dizendo a chave, sem ssh e sem abrir (rc=$RC)"
+  pv start g-real < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'real_sessions_released_by' && has "$T/err" 'g-real' && nossh && [ "$(count)" = 0 ]; ok $? "gate: sessão real SEM a chave de liberação recusa dizendo a chave, sem ssh e sem abrir (rc=$RC)"
   for rb in '""' '"   "' 'true' '1' 'null' '[]' '{"a":1}'; do
     echo "$good" | jq ".hosts.a.real_sessions_released_by=$rb" > "$T/cfg.json"; fresh
-    pv start g-real < <(req cat); [ $RC = 1 ] && has "$T/err" 'real_sessions_released_by' && nossh && [ "$(count)" = 0 ]; ok $? "gate: liberação $rb não é liberação (só texto não vazio), recusa sem ssh"
+    pv start g-real < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'real_sessions_released_by' && nossh && [ "$(count)" = 0 ]; ok $? "gate: liberação $rb não é liberação (só texto não vazio), recusa sem ssh"
   done
   # nomes que PARECEM de teste mas não são
   echo "$good" | jq 'del(.hosts.a.real_sessions_released_by)' > "$T/cfg.json"
   # (`my_remote-e2e-1` e não `my-remote-e2e-1`: o `-remote-<x>` com hífen o host_of lê como host `<x>` e recusa ANTES do guarda — ver o caso abaixo)
   for nm in remote-e2e- remote-e2e1 my_remote-e2e-1 remote-e2e remote-testing-1 Remote-E2E-1 remote-test remote_e2e-1 dog_remote-test-1; do
-    fresh; pv start $nm < <(req cat); [ $RC = 1 ] && has "$T/err" 'real_sessions_released_by' && nossh; ok $? "gate: '$nm' NÃO é sessão de teste (nome exato remote-e2e-<x> / remote-test-<x>) e recusa (rc=$RC)"
+    fresh; pv start $nm < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'real_sessions_released_by' && nossh; ok $? "gate: '$nm' NÃO é sessão de teste (nome exato remote-e2e-<x> / remote-test-<x>) e recusa (rc=$RC)"
   done
   # com hífen antes do `remote-`, duas regras recusam (o host_of do ga-w7qwl1 e o guarda de clone): basta que ALGUMA recuse, sem ssh e sem abrir nada
   for nm in my-remote-e2e-1 dog-remote-test-1; do
-    fresh; pv start $nm < <(req cat); [ $RC = 1 ] && { has "$T/err" 'real_sessions_released_by' || has "$T/err" 'o nome pede o host'; } && nossh && [ "$(count)" = 0 ]; ok $? "gate: '$nm' (prefixo com hífen) recusa, por qualquer das duas regras, sem ssh e sem abrir (rc=$RC)"
+    fresh; pv start $nm < <(req "$HOLD"); [ $RC = 1 ] && { has "$T/err" 'real_sessions_released_by' || has "$T/err" 'o nome pede o host'; } && nossh && [ "$(count)" = 0 ]; ok $? "gate: '$nm' (prefixo com hífen) recusa, por qualquer das duas regras, sem ssh e sem abrir (rc=$RC)"
   done
   # com a liberação, o host decide
   echo "$good" > "$T/cfg.json"
-  fresh; pv start g-ok < <(req cat); ok $RC "gate: liberada + guarda idêntico + settings aprovadas → a sessão real abre (rc=$RC $(head -c 200 "$T/err"))"
+  fresh; pv start g-ok < <(req "$HOLD"); ok $RC "gate: liberada + guarda idêntico + settings aprovadas → a sessão real abre (rc=$RC $(head -c 200 "$T/err"))"
   pv is-running g-ok </dev/null; [ "$(cat "$T/out")" = true ]; ok $? "gate: ...e está de pé"; pv stop g-ok </dev/null
   find "$RH/.claude/hooks" -name "$GUARDF" -delete
-  fresh; pv start g-nog < <(req cat); [ $RC = 1 ] && has "$T/err" 'ausente ou diferente' && has "$T/err" 'hetzner-claude.py sync-guard' && [ "$(count)" = 0 ] && [ ! -e "$RR/run/g-nog.sh" ]; ok $? "gate: guarda AUSENTE no host → recusa dizendo o guarda e o comando que o conserta (ga-2w0hiow), nada aberto, nenhum lançador (rc=$RC)"
+  fresh; pv start g-nog < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'ausente ou diferente' && has "$T/err" 'hetzner-claude.py sync-guard' && [ "$(count)" = 0 ] && [ ! -e "$RR/run/g-nog.sh" ]; ok $? "gate: guarda AUSENTE no host → recusa dizendo o guarda e o comando que o conserta (ga-2w0hiow), nada aberto, nenhum lançador (rc=$RC)"
   install_host; printf '\n# adulterado\n' >> "$RH/.claude/hooks/$GUARDF"
-  fresh; pv start g-dif < <(req cat); [ $RC = 1 ] && has "$T/err" 'ausente ou diferente' && has "$T/err" 'hetzner-claude.py sync-guard' && [ "$(count)" = 0 ]; ok $? "gate: guarda do host DIFERENTE do repositório (1 linha a mais) → recusa e diz o comando que o conserta (rc=$RC)"
+  fresh; pv start g-dif < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'ausente ou diferente' && has "$T/err" 'hetzner-claude.py sync-guard' && [ "$(count)" = 0 ]; ok $? "gate: guarda do host DIFERENTE do repositório (1 linha a mais) → recusa e diz o comando que o conserta (rc=$RC)"
   install_host; st="$RH/.claude/settings.json"; h=$(cat "$st")
   local mut='sem o || exit 2 (falha aberta)@@.hooks.PreToolUse|=map(.hooks|=map(.command|=sub(" \\|\\| exit 2$";"")))
 sem o grupo de Edit/Write@@.hooks.PreToolUse|=map(select(.matcher=="Bash"))
@@ -735,16 +745,116 @@ sem hooks nenhum@@del(.hooks)'
   while IFS= read -r ln; do
     [ -n "$ln" ] || continue; d=${ln%%@@*}; expr=${ln#*@@}
     printf '%s' "$h" | jq "$expr" > "$st"; fresh
-    pv start g-set < <(req cat); [ $RC = 1 ] && has "$T/err" 'selfcheck' && [ "$(count)" = 0 ]; ok $? "gate: settings do host $d → o --selfcheck reprova e nada abre (rc=$RC $(head -c 120 "$T/err"))"
+    pv start g-set < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'selfcheck' && [ "$(count)" = 0 ]; ok $? "gate: settings do host $d → o --selfcheck reprova e nada abre (rc=$RC $(head -c 120 "$T/err"))"
   done <<< "$mut"
-  printf '{ isto não é json' > "$st"; fresh; pv start g-set < <(req cat); [ $RC = 1 ] && has "$T/err" 'selfcheck' && [ "$(count)" = 0 ]; ok $? "gate: settings do host ilegíveis (JSON quebrado) → recusa"
-  rm -f "$st"; fresh; pv start g-set < <(req cat); [ $RC = 1 ] && has "$T/err" 'selfcheck' && [ "$(count)" = 0 ]; ok $? "gate: settings do host AUSENTES → recusa"
+  printf '{ isto não é json' > "$st"; fresh; pv start g-set < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'selfcheck' && [ "$(count)" = 0 ]; ok $? "gate: settings do host ilegíveis (JSON quebrado) → recusa"
+  rm -f "$st"; fresh; pv start g-set < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'selfcheck' && [ "$(count)" = 0 ]; ok $? "gate: settings do host AUSENTES → recusa"
   install_host
   # o provider precisa do guarda do repositório para conferir o do host; sem ele não há como conferir → recusa antes de qualquer ssh
   mkdir -p "$T/noguard"; cp "$P" "$T/noguard/gc-session-ssh"; chmod +x "$T/noguard/gc-session-ssh"; fresh
-  ( P="$T/noguard/gc-session-ssh"; pv start g-nogi < <(req cat); [ $RC = 1 ] && has "$T/err" 'não consegui ler' && nossh && [ "$(count)" = 0 ] ); ok $? "gate: sem o guarda do repositório ao lado do provider, a real recusa antes de qualquer ssh"
-  ( P="$T/noguard/gc-session-ssh"; pv start remote-e2e-9 < <(req cat); RCX=$RC; pv stop remote-e2e-9 </dev/null; exit $RCX ); ok $? "gate: ...mas a de teste abre (não depende do guarda)"
+  ( P="$T/noguard/gc-session-ssh"; pv start g-nogi < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'não consegui ler' && nossh && [ "$(count)" = 0 ] ); ok $? "gate: sem o guarda do repositório ao lado do provider, a real recusa antes de qualquer ssh"
+  ( P="$T/noguard/gc-session-ssh"; pv start remote-e2e-9 < <(req "$HOLD"); RCX=$RC; pv stop remote-e2e-9 </dev/null; exit $RCX ); ok $? "gate: ...mas a de teste abre (não depende do guarda)"
   find "$T/noguard" -mindepth 1 -delete; rmdir "$T/noguard"
+  cfg 3; install_host
+}
+
+# --- lay (ga-w7qwl1.2.7): a camada de guarda da SESSÃO — host que dorme (o MBP) guarda o guarda e as settings no BUNDLE (<raiz>/guard, <raiz>/city/settings.json) e o ~/.claude pessoal do dono não é lido nem escrito ---
+tree_sig() {  # tree_sig PASTA → assinatura (caminhos + conteúdo) da árvore; ABSENT se a pasta não existe: o que o teste compara antes e depois do start
+  [ -e "$1" ] || { echo ABSENT; return; }
+  ( cd "$1" && find . | LC_ALL=C sort | while IFS= read -r f; do if [ -f "$f" ]; then printf '%s %s\n' "$f" "$(cksum < "$f")"; else printf '%s dir\n' "$f"; fi; done )
+}
+mzero() { [ "$(count x "${SOCK}m")" = 0 ] && [ ! -e "$RR/run/$1.sh" ]; }  # mzero SESSÃO: nada aberto no host m e nenhum lançador deixado
+g_lay() {
+  local st="$RR/city/settings.json" gf="$RR/guard/$GUARDF" h ln d expr sig w c nm v n1=dog-remote-m-gajoin01 pool
+  setup_mbp; cfgm; mode livre
+  find "$RH/.claude" -mindepth 1 -delete 2>/dev/null; rmdir "$RH/.claude" 2>/dev/null  # o notebook NÃO tem a camada de guarda no ~/.claude: o padrão é o host não ter nada ali
+  # --- o que o dry-run diz ---
+  fresh; pv --dry-run start w-remote-m-0 < <(req "$HOLD"); [ $RC = 0 ] && jq -e --arg g "$gf" --arg s "$st" '.guard == {"layer":"session","file":$g,"settings":$s} and .would_refuse == null' "$T/out" >/dev/null; ok $? "lay: host que dorme (m) tem a camada 'session' por padrão e o dry-run diz onde ficam o guarda e as settings (no bundle) (rc=$RC $(head -c 160 "$T/err"))"
+  ! grep -qF "$RH/.claude/" "$T/out"; ok $? "lay: ...e nada no dry-run aponta para dentro do ~/.claude do host"
+  fresh; pv --dry-run start w-1 < <(req "$HOLD"); [ $RC = 0 ] && jq -e 'has("guard") | not' "$T/out" >/dev/null; ok $? "lay: o host padrão (o servidor Linux, sem 'sleeps') segue na camada 'home': o dry-run não traz 'guard' (rc=$RC)"
+  # --- a abertura real não lê nem escreve no ~/.claude do host ---
+  fresh; pv start w-remote-m-1 < <(req "$HOLD"); ok $RC "lay: start real SEM nenhum ~/.claude no host abre (a camada vem do bundle) (rc=$RC $(head -c 220 "$T/err"))"
+  [ ! -e "$RH/.claude" ]; ok $? "lay: ...e o start NÃO criou o ~/.claude do host"
+  pv stop w-remote-m-1 </dev/null; [ ! -e "$RH/.claude" ]; ok $? "lay: ...nem o stop"
+  mkdir -p "$RH/.claude/hooks" "$RH/.claude/projects/x"; printf '{"disableAllHooks":true,"hooks":{}}' > "$RH/.claude/settings.json"; printf 'isto nao e python(' > "$RH/.claude/hooks/$GUARDF"; echo historico > "$RH/.claude/projects/x/s.jsonl"
+  sig=$(tree_sig "$RH/.claude"); fresh; pv start w-remote-m-2 < <(req "$HOLD"); ok $RC "lay: ~/.claude do host ENVENENADO (disableAllHooks, guarda quebrado) não atrapalha o start: a sessão usa o do bundle (rc=$RC $(head -c 220 "$T/err"))"
+  [ "$(tree_sig "$RH/.claude")" = "$sig" ]; ok $? "lay: ...e a árvore do ~/.claude do host ficou byte a byte como estava (nada escrito, nada apagado)"
+  pv stop w-remote-m-2 </dev/null; [ "$(tree_sig "$RH/.claude")" = "$sig" ]; ok $? "lay: ...nem o stop mexe nela"
+  chmod 000 "$RH/.claude"; fresh; pv start w-remote-m-3 < <(req "$HOLD"); w=$RC; chmod 755 "$RH/.claude"; ok $w "lay: ~/.claude do host SEM permissão nenhuma (000) → o start abre: nada ali é LIDO (rc=$w $(head -c 220 "$T/err"))"
+  pv stop w-remote-m-3 </dev/null; [ "$(tree_sig "$RH/.claude")" = "$sig" ]; ok $? "lay: ...e a árvore segue intacta depois"
+  # --- guarda do bundle: ausente, diferente do repositório ---
+  mv "$gf" "$gf.off"; fresh; pv start w-remote-m-4 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'ausente ou diferente' && has "$T/err" 'guard-layer session' && ! has "$T/err" 'sync-guard' && mzero w-remote-m-4; ok $? "lay: guarda AUSENTE em <raiz>/guard → recusa dizendo como reinstalar o bundle (e não o sync-guard do servidor), nada aberto, nenhum lançador (rc=$RC $(head -c 200 "$T/err"))"
+  mv "$gf.off" "$gf"; printf '\n# adulterado\n' >> "$gf"; fresh; pv start w-remote-m-4 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'ausente ou diferente' && mzero w-remote-m-4; ok $? "lay: guarda do bundle DIFERENTE do repositório (1 linha a mais) → recusa, nada aberto (rc=$RC)"
+  install_session
+  # --- settings do bundle: o --selfcheck reprova o que desliga ou enfraquece o guarda ---
+  h=$(cat "$st")
+  local mut='sem o || exit 2 (falha aberta)@@.hooks.PreToolUse|=map(.hooks|=map(.command|=sub(" \\|\\| exit 2$";"")))
+sem o grupo de Edit/Write@@.hooks.PreToolUse|=map(select(.matcher=="Bash"))
+sem o grupo de Bash@@.hooks.PreToolUse|=map(select(.matcher!="Bash"))
+sem MultiEdit na lista@@.hooks.PreToolUse[1].matcher="Edit|Write|NotebookEdit"
+com disableAllHooks=true@@.disableAllHooks=true
+SEM o disableAllHooks:false explícito (um disableAllHooks:true pessoal ou do projeto o desligaria sem ninguém ver)@@del(.disableAllHooks)
+chamando outro guarda@@.hooks.PreToolUse|=map(.hooks|=map(.command|=sub("remote-clone-guard";"outro-guard")))
+sem hooks nenhum@@del(.hooks)'
+  while IFS= read -r ln; do
+    [ -n "$ln" ] || continue; d=${ln%%@@*}; expr=${ln#*@@}
+    printf '%s' "$h" | jq "$expr" > "$st"; fresh
+    pv start w-remote-m-5 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'selfcheck' && mzero w-remote-m-5; ok $? "lay: settings do bundle $d → o --selfcheck reprova e nada abre (rc=$RC $(head -c 120 "$T/err"))"
+  done <<< "$mut"
+  printf '%s' "$h" | jq --arg rh "$RH" --arg g "$GUARDF" '.hooks.PreToolUse|=map(.hooks|=map(.command|="python3 -I \($rh)/.claude/hooks/\($g) || exit 2"))' > "$st"; fresh
+  pv start w-remote-m-5 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'selfcheck' && mzero w-remote-m-5; ok $? "lay: settings do bundle com o hook apontando para o guarda do ~/.claude do host (a camada de casa) → reprova: na sessão o guarda é o do bundle (rc=$RC)"
+  printf '{ isto não é json' > "$st"; fresh; pv start w-remote-m-5 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'selfcheck' && mzero w-remote-m-5; ok $? "lay: settings do bundle ilegíveis (JSON quebrado) → recusa"
+  rm -f "$st"; fresh; pv start w-remote-m-5 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'selfcheck' && mzero w-remote-m-5; ok $? "lay: settings do bundle AUSENTES → recusa"
+  install_session; fresh; pv start w-remote-m-5 < <(req "$HOLD"); ok $RC "lay: (controle) com o bundle reinstalado o mesmo start abre (rc=$RC $(head -c 160 "$T/err"))"; pv stop w-remote-m-5 </dev/null
+  # --- o COMANDO tem de carregar o settings do bundle como o ÚLTIMO --settings (é o único que o claude lê) ---
+  for ln in "sem nenhum --settings@@sh -c cat" "só outro --settings@@sh -c cat sh --settings /outro/settings.json" "o do bundle e depois outro@@sh -c cat sh --settings $st --settings /outro/settings.json" "forma --settings=outro por último@@sh -c cat sh --settings $st --settings=/outro/settings.json" "--settings sem valor@@sh -c cat sh --settings" "aspas que não fecham@@sh -c 'cat sh --settings $st"; do
+    d=${ln%%@@*}; c=${ln#*@@}; fresh; pv start w-remote-m-6 < <(req "$c"); [ $RC = 1 ] && has "$T/err" 'último --settings' && has "$T/err" 'guarda de clone só vale' && nossh && mzero w-remote-m-6; ok $? "lay: comando $d → a sessão real recusa dizendo o --settings que faltou, sem ssh e sem abrir (rc=$RC $(head -c 160 "$T/err"))"
+  done
+  for ln in "outro e depois o do bundle@@sh -c cat sh --settings /outro/settings.json --settings $st" "forma --settings=<bundle>@@sh -c cat sh --settings=$st" "inline do pool e depois o do bundle@@sh -c cat sh --settings {\"remoteControlAtStartup\":false} --settings $st"; do
+    d=${ln%%@@*}; c=${ln#*@@}; fresh; pv start w-remote-m-6 < <(req "$c"); ok $RC "lay: comando $d → abre: vale o ÚLTIMO (rc=$RC $(head -c 160 "$T/err"))"; pv stop w-remote-m-6 </dev/null
+  done
+  pool="$CITY/packs/town-deltas/assets/scripts/claude-ctxcap-ab.sh --settings '{\"remoteControlAtStartup\":false}' --model sonnet --strict-mcp-config --dangerously-skip-permissions --effort xhigh --settings $CITY/.gc/settings.json --session-id 1a9a7c40-03ef-4caa-9a56-1b1b6e0e3a11"
+  fresh; pv --dry-run start w-remote-m-0 < <(req "$pool"); c="$T/claude --settings {\"remoteControlAtStartup\":false} --model sonnet --strict-mcp-config --dangerously-skip-permissions --effort xhigh --settings $st --session-id 1a9a7c40-03ef-4caa-9a56-1b1b6e0e3a11"
+  [ $RC = 0 ] && [ "$(jq -r .command "$T/out" | tr -d "'")" = "$c" ] && jq -e '.would_refuse == null' "$T/out" >/dev/null; ok $? "lay: o comando de pool do mini (lançador + --settings inline + --settings da cidade) vira claude absoluto com o settings do BUNDLE por último, e o dry-run não vê recusa (rc=$RC $(jq -r '.would_refuse // empty' "$T/out" 2>/dev/null | head -c 160))"
+  fresh; pv --dry-run start w-remote-m-0 < <(req "claude --model sonnet"); [ $RC = 0 ] && jq -e '.would_refuse | strings | contains("--settings")' "$T/out" >/dev/null; ok $? "lay: ...e um claude sem --settings o dry-run já mostra como recusa (would_refuse), sem ssh (rc=$RC)"
+  # --- python3 faltando ou quebrado NA PATH DA SESSÃO: a sessão não abre (falha fechada) e nada muda fora dela ---
+  mkdir -p "$T/nopy" "$T/badpy"; for bn in sh cat env; do ln -sf "$(command -v $bn)" "$T/nopy/$bn"; ln -sf "$(command -v $bn)" "$T/badpy/$bn"; done
+  printf '#!/bin/sh\nexit 1\n' > "$T/badpy/python3"; chmod +x "$T/badpy/python3"
+  command -v python3 >/dev/null; ok $? "lay: (premissa) o python3 EXISTE no PATH do ssh deste teste: a falta abaixo é só na PATH da sessão"
+  sig=$(tree_sig "$RH/.claude"); w=$(tree_sig "$RR/city")
+  for ln in "python3 AUSENTE da PATH da sessão (existe na do ssh)@@nopy" "python3 QUEBRADO na PATH da sessão (sai 1)@@badpy"; do
+    d=${ln%%@@*}; v=${ln#*@@}; cfgm '{"session_env":{"path":["'"$T/$v"'"],"claude":"'"$T"'/claude"}}'; zdot_put "$T/$v"; fresh; : > "$T/lc.log"
+    pv start w-remote-m-7 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'selfcheck' && mzero w-remote-m-7; ok $? "lay: $d → a sessão real NÃO abre, nenhum lançador (rc=$RC $(head -c 160 "$T/err"))"
+    [ "$(tree_sig "$RH/.claude")" = "$sig" ] && [ "$(tree_sig "$RR/city")" = "$w" ] && ! grep -q bootstrap "$T/lc.log"; ok $? "lay: ...e nada mudou fora dela (~/.claude do host, o city do bundle, nenhum agente gráfico carregado)"
+  done
+  cfgm; zdot_put "$T/shim-bin:/usr/bin:/bin"; fresh; pv start w-remote-m-7 < <(req "$HOLD"); ok $RC "lay: (controle) com o python3 de volta na PATH da sessão o mesmo start abre (rc=$RC $(head -c 160 "$T/err"))"; pv stop w-remote-m-7 </dev/null
+  # --- config: guard_layer ---
+  for v in '"x"' '""' 'true' 'null' '1' '[]' '"Session"'; do
+    cfgm '{"guard_layer":'"$v"'}'; fresh; pv --dry-run start w-remote-m-0 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" "'guard_layer'" && nossh; ok $? "lay: guard_layer=$v não é \"home\"/\"session\" → config recusada dizendo a chave, sem ssh (rc=$RC)"
+  done
+  # num host que NÃO dorme o único freio de valor ruim é a validação de tipo/valor (no que dorme, qualquer coisa que não seja "session" já recusa por outro motivo)
+  for v in '"x"' '""' 'true' 'null' '1' '[]' '"Session"'; do
+    cfg 3; jq --argjson v "$v" '.hosts.a.guard_layer=$v' "$T/cfg.json" > "$T/cfg2.json" && mv "$T/cfg2.json" "$T/cfg.json"; fresh; pv --dry-run start w-1 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" "'guard_layer'" && nossh; ok $? "lay: guard_layer=$v num host que NÃO dorme também recusa a config dizendo a chave, sem ssh (rc=$RC)"
+  done
+  cfgm '{"guard_layer":"home"}'; fresh; pv --dry-run start w-remote-m-0 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" "'guard_layer'" && has "$T/err" 'dorme' && nossh; ok $? "lay: guard_layer \"home\" num host que DORME (o notebook do dono) recusa a config: o guarda iria para o ~/.claude pessoal (rc=$RC)"
+  cfgm '{"guard_layer":"session"}'; fresh; pv --dry-run start w-remote-m-0 < <(req "$HOLD"); [ $RC = 0 ] && jq -e '.guard.layer == "session"' "$T/out" >/dev/null; ok $? "lay: guard_layer \"session\" explícito no host que dorme vale (rc=$RC)"
+  cfg 3; jq '.hosts.a.guard_layer="session"' "$T/cfg.json" > "$T/cfg2.json" && mv "$T/cfg2.json" "$T/cfg.json"; fresh; pv --dry-run start w-1 < <(req "$HOLD"); [ $RC = 0 ] && jq -e '.guard.layer == "session"' "$T/out" >/dev/null; ok $? "lay: ...e um host que NÃO dorme também pode optar por 'session' (rc=$RC)"
+  # --- o servidor (camada home) não muda ---
+  cfg 3; install_host; find "$RR/guard" -mindepth 1 -delete 2>/dev/null; rmdir "$RR/guard" 2>/dev/null; rm -f "$st"; fresh
+  pv start w-9 < <(req cat); ok $RC "lay: SERVIDOR (camada home): a sessão real abre só com o guarda e as settings do ~/.claude, SEM <raiz>/guard nem <raiz>/city/settings.json e com um comando sem --settings (rc=$RC $(head -c 200 "$T/err"))"; pv stop w-9 </dev/null
+  find "$RH/.claude/hooks" -name "$GUARDF" -delete; fresh; pv start w-9 < <(req cat); [ $RC = 1 ] && has "$T/err" 'sync-guard' && ! has "$T/err" 'guard-layer'; ok $? "lay: ...e sem o guarda do ~/.claude o servidor recusa com o conserto de sempre (sync-guard) (rc=$RC)"
+  install_host
+  # --- o caso JUNTO: worktree do provider + ambiente da sessão (ZDOTDIR/PATH/claude absoluto) + camada de guarda, no MESMO host (o runbook: "Nenhum teste junta os dois") ---
+  setup_mbp; cfgm '{"worktree_rigs":{"dog":"gascity"}}'; mode livre; wtmirror; mkdir -p "$RH/.claude"; printf '{"pessoal":true}' > "$RH/.claude/settings.json"; sig=$(tree_sig "$RH/.claude"); v=$(cksum < "$RH/.claude.json"); w=$(WTD $n1)
+  fresh; pv --dry-run start $n1 < <(req "claude --model sonnet $MSET" "$CITY/.gc/agents/dogs/dog-remote-1"); [ $RC = 0 ] && jq -e --arg w "$w" --arg c "$T/claude --model sonnet $MSET" --arg p "$T/shim-bin:/usr/bin:/bin" '.host == "m" and .work_dir == $w and .command == $c and .session_env.path == $p and .guard.layer == "session" and .would_refuse == null and (.worktree.add | endswith("wt-add gascity '$n1'"))' "$T/out" >/dev/null; ok $? "lay: JUNTO — dry-run: host m, pasta = a do wt-add, claude absoluto, PATH da session_env, camada de guarda 'session', sem recusa (rc=$RC $(head -c 160 "$T/err"))"
+  fresh; pv start $n1 < <(req "sh -c 'pwd -P > $T/j.pwd; echo \$PATH > $T/j.path; echo \$ZDOTDIR \$CLAUDE_ENV_FILE > $T/j.zd; exec cat' sh $MSET" "$CITY/.gc/agents/dogs/dog-remote-1"); ok $RC "lay: JUNTO — start real abre (worktree do provider + ambiente da sessão + guarda do bundle) (rc=$RC $(head -c 250 "$T/err"))"; sleep 0.7
+  [ "$(git -C "$w" rev-parse --is-inside-work-tree 2>/dev/null)" = true ] && has "$T/rg.log" "wt-add gascity $n1 GR=$RH/gt-remote/git" && [ "$(cat "$T/j.pwd" 2>/dev/null)" = "$(cd "$w" 2>/dev/null && pwd -P)" ]; ok $? "lay: ...a sessão roda DENTRO do worktree que o wt-add criou (cwd = $(cat "$T/j.pwd" 2>/dev/null))"
+  [ "$(cat "$T/j.path" 2>/dev/null)" = "$T/shim-bin:/usr/bin:/bin" ] && [ "$(cat "$T/j.zd" 2>/dev/null)" = "$RR/zdot $RR/zdot/env.sh" ]; ok $? "lay: ...com o PATH da session_env e o ZDOTDIR / CLAUDE_ENV_FILE do bundle (PATH='$(cat "$T/j.path" 2>/dev/null)' zdot='$(cat "$T/j.zd" 2>/dev/null)')"
+  [ "$(tree_sig "$RH/.claude")" = "$sig" ] && [ "$(cksum < "$RH/.claude.json")" = "$v" ]; ok $? "lay: ...e nem o ~/.claude do host nem o ~/.claude.json (a confiança da pasta: worktree_prepare é falso no notebook) mudaram"
+  : > "$T/rg.log"; pv stop $n1 </dev/null; [ $RC = 0 ] && mzero $n1 && has "$T/rg.log" "wt-rm gascity $n1" && [ ! -e "$w" ] && [ "$(tree_sig "$RH/.claude")" = "$sig" ]; ok $? "lay: ...e o stop derruba a sessão e recolhe o worktree limpo, sem tocar no ~/.claude do host (rc=$RC)"
+  wtmirror '{"disableAllHooks":true}'; fresh; pv start $n1 < <(req "$HOLD" "$CITY/.gc/agents/dogs/dog-remote-1"); [ $RC = 1 ] && has "$T/err" 'disableAllHooks' && mzero $n1 && [ ! -e "$w" ] && has "$T/rg.log" "wt-rm gascity $n1"; ok $? "lay: JUNTO — o guarda do bundle olha o worktree JÁ criado: disableAllHooks que vem no checkout recusa a sessão e o worktree é desfeito (rc=$RC $(head -c 200 "$T/err"))"
+  wtmirror; mv "$gf" "$gf.off"; fresh; pv start $n1 < <(req "$HOLD" "$CITY/.gc/agents/dogs/dog-remote-1"); [ $RC = 1 ] && has "$T/err" 'ausente ou diferente' && mzero $n1 && [ ! -e "$w" ] && has "$T/rg.log" "wt-rm gascity $n1"; ok $? "lay: JUNTO — guarda do bundle ausente: a sessão não abre e o worktree que o start tinha criado é desfeito (rc=$RC)"
+  mv "$gf.off" "$gf"; [ "$(tree_sig "$RH/.claude")" = "$sig" ]; ok $? "lay: ...e o ~/.claude do host continua como estava"
   cfg 3; install_host
 }
 
@@ -1273,7 +1383,7 @@ g_shard() {  # o filtro do PRÓPRIO selftest (GCSSH_SHARD, GCSSH_ONLY, GCSSH_MUT
   [ $rr = 0 ] && [ "$(printf '%s\n' "$oo" | grep -c '^ok   mutante .* pego')" = 1 ] && printf '%s\n' "$oo" | grep -q '^== final: 1/1 ok ==$' && ! printf '%s\n' "$oo" | grep -q 'NADA RODOU'; ok $? "shard: (controle) GCSSH_SHARD=1/9999 roda exatamente 1 mutante, pego, e sai 0 (rc=$rr: $(printf '%s' "$oo" | tail -c 110))"
 }
 
-all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group gui && g_gui; group acct && g_acct; group prof && g_prof; group lr && g_lr; group lrd && g_lrd; group abort && g_abort; group shard && g_shard; return 0; }
+all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group lay && g_lay; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group gui && g_gui; group acct && g_acct; group prof && g_prof; group lr && g_lr; group lrd && g_lrd; group abort && g_abort; group shard && g_shard; return 0; }
 
 if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
 # GCSSH_SHARD=K/N: dois decimais canônicos (sem sinal, sem espaço, sem zero à esquerda: `[ 3 = 03 ]` é falso e $((mn % 010)) é octal, então a fatia ficaria vazia ou trocada sem aviso), N de 1 a 9999 e K de 0 a N-1
@@ -1353,9 +1463,19 @@ case "$shn" in [1-9]*) ;; *) shard_bad;; esac
   mutant gate "nome de teste sem o hífen (remote-e2e1 vira teste)" 's/remote-(?:e2e|test)-\[A-Za-z0-9_-\]+/remote-(?:e2e|test)[A-Za-z0-9_-]*/'
   mutant gate "nome de teste sem âncora (my-remote-e2e-1 vira teste)" 's/if TEST_RE.fullmatch(name):/if TEST_RE.search(name):/'
   mutant gate "sem conferir o sha do guarda" 's/\[ "\$h" = {sha} \] ||/true ||/'
-  mutant gate "sem rodar o --selfcheck" 's/o=\$(python3 -I {g} --selfcheck {st} {q(work_dir)} 2>&1)/o=$(true)/'
+  mutant gate "sem rodar o --selfcheck" 's/o=\$({py} -I {g} --selfcheck {st} {q(work_dir)} 2>&1)/o=$(true)/'
   mutant gate "script do host que sai 0 (a recusa vira 'abriu')" 's/exit {EX_POLICY}/exit 0/g'
   mutant gate "guarda do repositório ilegível passa" 's/^        raise Fail(f"sessão real {name!r} recusada: não consegui ler.*$/        sha = ""/'
+  # camada da SESSÃO (ga-w7qwl1.2.7): cada peça que tira o guarda do ~/.claude pessoal do host, uma de cada vez
+  mutant lay "o último --settings do comando não precisa ser o do bundle" 's/if used != bundle_settings:/if False:/'
+  mutant lay "vale o PRIMEIRO --settings, não o último" 's/last = argv\[i + 1\] if i + 1 < len(argv) else ""/last = last or (argv[i + 1] if i + 1 < len(argv) else "")/'
+  mutant lay "a sessão confere o guarda do ~/.claude do host" 's/g, st = q(f"{cfg.root}\/guard\/{GUARD}"), q(bundle_settings)/g, st = q(f"{cfg.home}\/.claude\/hooks\/{GUARD}"), q(bundle_settings)/'
+  mutant lay "o --selfcheck lê o settings.json PESSOAL do host" 's/g, st = q(f"{cfg.root}\/guard\/{GUARD}"), q(bundle_settings)/g, st = q(f"{cfg.root}\/guard\/{GUARD}"), q(f"{cfg.home}\/.claude\/settings.json")/'
+  mutant lay "o python3 da conferência ignora o PATH da sessão" 's/py = f"env PATH={q(cfg.spath)} python3" if cfg.spath else "python3"/py = "python3"/'
+  mutant lay "host que dorme usa a camada home por padrão" 's/h.get("guard_layer", "session" if self.sleeps else "home")/h.get("guard_layer", "home")/'
+  mutant lay "camada home aceita em host que dorme" 's/if self.sleeps and self.guard_layer != "session":/if False:/'
+  mutant lay "guard_layer de qualquer valor é aceito" 's/if not isinstance(self.guard_layer, str) or self.guard_layer not in ("home", "session"):/if False:/'
+  mutant lay "o dry-run não diz onde fica o guarda" 's/} if cfg.guard_layer == "session" else {}),/} if False else {}),/'
   mutant prep "sem o preparo no start" 's/\.replace("@PREP@", prepare_script(cfg))/.replace("@PREP@", "")/'
   mutant prep "sem gravar a identidade git" 's/^git -C "\$W" config --worktree user.name "\$N" \&\& git -C "\$W" config --worktree user.email "\$N@gastown.invalid" || pfail/true || pfail/'
   mutant prep "sem conferir que a identidade gravada é a que vale" 's/^\[ "\$(git -C "\$W" config --get user.name)" = "\$N" \] \&\& \[ "\$(git -C "\$W" config --get user.email)" = "\$N@gastown.invalid" \] || pfail/true || pfail/'
@@ -1499,7 +1619,7 @@ case "$shn" in [1-9]*) ;; *) shard_bad;; esac
   [ -n "${GCSSH_MUTANTS_ONLY:-}" ] || [ "${GCSSH_SHARD%/*}" != 0 ] || {
   echo "-- contra um stub que só sai 0 (a versão 'anterior' não tinha provider nenhum)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"
-  r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate,prep,wt,gui,acct,prof" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
+  r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate,lay,prep,wt,gui,acct,prof" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
   case "$r" in "RESULT 0/"*|"") ok 1 "stub deveria falhar quase tudo ($r)";; *) ok 0 "stub falha os casos novos ($r)";; esac
   }
   echo "== final: $((n-fails))/$n ok =="

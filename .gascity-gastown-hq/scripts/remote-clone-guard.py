@@ -11,6 +11,10 @@ PARA QUE SERVE
   `--dangerously-skip-permissions`: um hook que sai com 2 bloqueia a chamada em qualquer modo (medido no servidor, ver o runbook).
 COMO DECIDE (sei que pode / sei que não pode / não sei, e o último NÃO vira "pode"): território = $RCG_ROOT, senão ~/gt-remote/git; clone próprio = o ancestral com `.git`
   de $CLAUDE_PROJECT_DIR. A regra inteira (onde o git pode estar, alvo, "não sei", heredoc, contexto do aninhado): docs/runbooks/hetzner-hardening.md, "Como o guarda decide".
+CAMADA DA SESSÃO (ga-w7qwl1.2.7, host `mbp`): num notebook o ~/.claude é PESSOAL, e o guarda não vai para lá. O bundle o instala em <raiz>/guard/remote-clone-guard.py e o liga no arquivo de
+  `--settings` da sessão (<raiz>/city/settings.json): só o `claude` aberto pelo provider o carrega. Quando este arquivo roda de uma pasta chamada `guard`, <raiz>/guard, <raiz>/zdot e <raiz>/city/settings.json
+  (NÃO a <raiz> inteira: o diretório de trabalho de uma sessão pode ficar sob <raiz>/city ou <raiz>/work) passam a ser protegidos de Edit/Write, e o `--selfcheck` exige `disableAllHooks: false` ESCRITO no settings (MEDIDO no claude 2.1.314: `disableAllHooks: true` no ~/.claude/settings.json
+  pessoal OU em <pasta>/.claude/settings.json desliga, calado, o hook que vem do `--settings`; `false` no próprio `--settings` vence as duas camadas). O servidor (~/.claude/hooks/) não muda.
 CÓDIGOS: 0 liberado · 2 bloqueado — também o pedido que o guarda não consegue analisar em STEP_LIMIT passos ou TIME_LIMIT segundos (hook estourado no Claude Code, 600 s, NÃO bloqueia: a
   chamada seguiria sem conferência; o guarda se corta antes e fecha, ver Budget). `--selfcheck [settings.json [pasta-do-projeto…]]`: 0 se o guarda decide como deveria numa pasta de teste E (com o settings) todo
   PreToolUse de Bash/Edit/Write/MultiEdit/NotebookEdit é EXATAMENTE `python3 -I <este arquivo> || exit 2`, sem campo que mude QUANDO dispara (só type/command/timeout) e
@@ -109,10 +113,21 @@ def own_clone(proj, terr: str):
     return None
 
 
+LAYER_PATHS = ("guard", "zdot", "city/settings.json")  # o que o bundle instala sob a <raiz> e liga a sessão: o guarda, o ZDOTDIR/PATH e o arquivo de `--settings`. O resto de city/ e work/ pode ser diretório de trabalho: NÃO entra
+
+
+def layer_root() -> str:
+    """A raiz do bundle quando este arquivo roda de <raiz>/guard/ (camada da SESSÃO, ga-w7qwl1.2.7); "" = não (o servidor roda de ~/.claude/hooks/). Raiz que não dá para ler (/) → "": nunca "tudo é protegido"."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    root = os.path.dirname(here)
+    return root if os.path.basename(here) == "guard" and root not in ("", "/") else ""
+
+
 def claude_conf(p: str) -> bool:
-    """Hook ou settings do claude no HOME: quem os escreve desliga este guarda (o provider só os confere na ABERTURA da sessão)."""
+    """Hook ou settings do claude no HOME, ou arquivo da camada da sessão (LAYER_PATHS sob a raiz do bundle): quem os escreve desliga este guarda (o provider só os confere na ABERTURA da sessão)."""
     h = os.path.realpath(os.path.expanduser("~")) + "/.claude/"
-    return p.startswith(h) and bool(re.fullmatch(r"hooks/.*|settings[^/]*\.json", p[len(h):]))
+    root = layer_root()  # vazio → não há camada de sessão e vale só o home (o servidor, como sempre foi)
+    return (p.startswith(h) and bool(re.fullmatch(r"hooks/.*|settings[^/]*\.json", p[len(h):]))) or (bool(root) and any(inside(p, f"{root}/{d}") for d in LAYER_PATHS))
 
 
 def lists_only(sub: str, rest: list) -> bool:
@@ -745,6 +760,9 @@ def selfcheck(args: list) -> int:
             groups = (s.get("hooks") or {}).get("PreToolUse") or []
             if s.get("disableAllHooks"):
                 raise ValueError("disableAllHooks ligado")
+            # camada da sessão: o ~/.claude pessoal e a pasta do projeto podem ter `disableAllHooks: true`, e só um `false` ESCRITO neste arquivo vence as duas (medido). ausente/outro valor → falha
+            if layer_root() and s.get("disableAllHooks") is not False:
+                raise ValueError("camada da sessão: falta `disableAllHooks: false` explícito (sem ele um disableAllHooks do ~/.claude pessoal ou do projeto desliga o hook)")
             for d in args[1:]:  # a camada do PROJETO (a pasta da sessão) também pode ligar disableAllHooks: ausente = nada a conferir; ilegível = falha
                 for f in (os.path.join(d, ".claude", n) for n in ("settings.json", "settings.local.json")):
                     if os.path.exists(f) and json.load(open(f)).get("disableAllHooks"):

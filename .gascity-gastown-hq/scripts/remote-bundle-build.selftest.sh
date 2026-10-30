@@ -2,7 +2,7 @@
 # remote-bundle-build.selftest.sh — hermético: cidade, ~/.claude e papel são fixtures em mktemp; nada lê o mini de verdade.
 #
 # Contents
-#   Casos · Controle negativo
+#   Casos · Camada da sessão · Controle negativo
 #
 # CASOS: caminhos reescritos e nenhum /Users/ no bundle · hook keep presente e executável, drop ausente, shim VERBATIM ·
 #   shim_needs lista os 4 subcomandos do gc · chave fora da lista e regra de permissão de macOS saem (e ficam no manifest) ·
@@ -48,6 +48,10 @@
 #   LIVE-CLONE-GIT-GUARD (ga-2w0hiow): a trava do clone vivo do mini (`python3 -I <cidade>/scripts/live-clone-git-guard.py`, PreToolUse) é DROP: build sai 0, o hook não vai a nenhuma settings
 #   (nem leva os vizinhos do grupo), o manifest registra drop + command_sha256 do comando inteiro, na camada user e na city, com espaço/TAB no fim; recusam (exit 3, "não é só …"): argumento atrás
 #   (--selfcheck), `&&`, `;`, newline, sem -I, outra cidade, cidade de nome parecido, ~ no lugar do caminho, nome que só contém/começa com o do guarda, junto de outro drop, e em outro evento (Stop).
+#   CAMADA DA SESSÃO (ga-w7qwl1.2.7): com --guard-layer session o bundle NÃO leva home/ (nada para o ~/.claude do host): o guarda vai em guard/ e o city/settings.json o traz em Bash e em
+#   Edit|Write|MultiEdit|NotebookEdit (UMA vez cada, antes dos demais hooks) com `disableAllHooks: false` escrito; o manifest diz guard_layer=session e install.guard; o selfcheck do guarda DA CAMADA aprova esse settings
+#   e reprova o mesmo sem o false; combinado com --session-path e --skills continua certo; o swap do cross-clone-block do city cai no mesmo guarda sem duplicar; hook keep recusa (exit 3: não há ~/.claude
+#   onde instalá-lo; em `home` o mesmo city passa); valor desconhecido é erro de uso (2); o padrão (`home`, o Hetzner) tem o MESMO hash com e sem --guard-layer home e nada da camada.
 # CONTROLE NEGATIVO: a tabela POLICY perde a linha de um hook (sed) e o mesmo build TEM que passar a recusar — keep (filter-bash-output.sh)
 #   e drop (gt tap guard cross-clone-block, home-scan-guard, ntfy-on-stop.sh). Skills: sem a exclusão por nome as 3 com CPF/CNPJ recusam; exclusão por substring deixaria a renomeada
 #   passar; sem as linhas de CPF/CNPJ de SECRETS a 4ª skill passaria. MBP: sem a guarda que reconhece a raiz do destino o build recusa tudo; reescrita em sequência
@@ -56,6 +60,8 @@
 #   Edit|Write, o arquivo do guarda, a troca em si) gera settings que o --selfcheck do guarda reprova.
 #   Live-clone-git-guard: sem a linha da POLICY, sem o ramo da forma, com prefixo no lugar do comando inteiro, com qualquer pasta no lugar da cidade, sem a tolerância ao espaço no fim e sem a
 #   exigência de PreToolUse — cada mutante inverte o rc do mesmo build.
+#   Camada da sessão: a opção lida e ignorada, sem o disableAllHooks:false, sem o PreToolUse do guarda, só o grupo do Bash, sem o arquivo em guard/, a camada de usuário do mini ainda indo para home/,
+#   o manifest sem guard_layer, o hook apontando para o ~/.claude, sem a recusa do hook keep e sem a deduplicação — cada um reprova o bundle (ou o build).
 # VARIÁVEIS: BUNDLE_BUILD_UNDER_TEST (builder a testar) · BUNDLE_NO_MUTANTS=1 (só os casos, sem o controle negativo; o resumo diz "sem mutantes").
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -389,7 +395,7 @@ swapmut() {  # swapmut DESCRIÇÃO SED — o builder sem uma peça do swap gera 
 }
 swapmut "sem '|| exit 2' (falha aberta)" 's/ || exit 2"}/"}/'
 swapmut "sem o grupo Edit|Write" 's/if self.swaps > swaps:/if False:/'
-swapmut "sem o arquivo do guarda no bundle" 's/^        if self.swaps:$/        if False:/'
+swapmut "sem o arquivo do guarda no bundle" 's/^        elif self.swaps:$/        elif False:/'
 swapmut "sem a troca (o gt do mini segue nas settings)" 's/if v == "swap":/if False:/'
 
 fresh; python3 - "$B" "$T/mutant.py" <<'PYEOF'
@@ -848,6 +854,66 @@ if command -v zsh >/dev/null 2>&1; then
 else
   echo "SKIP zsh ausente neste nó: a emulação da sequência de comandos do claude NÃO rodou (o zdot foi só verificado por conteúdo, não por comportamento)"
 fi
+
+# ---- CAMADA DA SESSÃO (--guard-layer session, ga-w7qwl1.2.7): no MBP o ~/.claude é do Athos. O bundle não leva NADA para {remote_home}/.claude: o guarda vai em <raiz>/guard/ e o
+# PreToolUse + `disableAllHooks: false` ficam no city/settings.json (o arquivo do `--settings` da sessão). O comportamento do claude que isso usa está medido em
+# scripts/remote-guard-layer.selftest.sh (claude real, API local de mentira); aqui só se prova o que o BUILDER entrega.
+sess_good() {  # sess_good OUT [PREFIXO_EXTRA] — 0 só se o bundle da camada da sessão (destino $MB) está certo; senão o número do que falhou. PREFIXO_EXTRA: pasta fora da raiz que a opção do caso cita de propósito (--session-path)
+  local o=$1 ex=${2:-$MB} c="python3 -I $MB/guard/remote-clone-guard.py || exit 2"
+  [ ! -e "$o/home" ] || return 1  # nada para o ~/.claude do host
+  { cmp -s "$GUARD" "$o/guard/remote-clone-guard.py" && [ -x "$o/guard/remote-clone-guard.py" ]; } || return 2
+  jq -e --arg c "$c" '.disableAllHooks == false and ([.hooks.PreToolUse[] | select(.matcher == "Bash") | .hooks[].command] | index($c) != null) and ([.hooks.PreToolUse[] | select(.matcher == "Edit|Write|MultiEdit|NotebookEdit") | .hooks[].command] | index($c) != null)' "$o/city/settings.json" >/dev/null || return 3
+  jq -e --arg r "$MB" '.guard_layer == "session" and .clone_guard == true and .install.guard == ($r + "/guard") and (.install | has("home/.claude") | not)' "$o/manifest.json" >/dev/null || return 4
+  python3 -I "$B" verify "$o" >/dev/null 2>&1 || return 5
+  grep -rhoE '/Users/[^" ;:]*' "$o" | grep -vE "^($MB|$ex)(/|\$)" >/dev/null; [ $? = 1 ] || return 6  # todo /Users/ sob a raiz do bundle (ou sob o prefixo que o caso pediu)
+  sed "s#$MB/guard#$o/guard#g" "$o/city/settings.json" > "$T/s.json"; python3 -I "$o/guard/remote-clone-guard.py" --selfcheck "$T/s.json" >/dev/null 2>&1 || return 7  # o guarda DA CAMADA aprova o settings gerado
+  return 0
+}
+fresh; wipe "$T/f/out"; MBR=$MB mbp_build "$B" "$T/f" "$T/f/out" --guard-layer session; rc=$?; ok $rc "sessão: build com --guard-layer session sai 0 (rc=$rc)"; [ $rc = 0 ] || cat "$T/err" >&2
+sess_good "$T/f/out"; rc=$?; ok $rc "sessão: o bundle está certo (rc=$rc: 1=home/ existe, 2=guarda, 3=city/settings.json, 4=manifest, 5=verify, 6=/Users/ fora da raiz, 7=selfcheck)"
+SO=$T/f/out
+[ ! -e "$SO/home" ] && ! grep -rqF "/.claude/hooks" "$SO/city" "$SO/manifest.json"; ok $? "sessão: nada aponta para {remote_home}/.claude (nem o settings nem o manifest citam .claude/hooks)"
+jq -e '[.hooks.PreToolUse[].hooks[].command | select(contains("remote-clone-guard"))] | length == 2' "$SO/city/settings.json" >/dev/null; ok $? "sessão: o guarda aparece UMA vez em Bash e UMA vez em Edit|Write|MultiEdit|NotebookEdit (sem duplicata)"
+jq -e '.hooks.PreToolUse | map(.matcher) | (index("Bash") != null) and (index("Edit|Write|MultiEdit|NotebookEdit") != null)' "$SO/city/settings.json" >/dev/null; ok $? "sessão: os dois grupos de matcher estão no city/settings.json"
+jq -e '(.hooks.PreToolUse[0:2] | map(.matcher) | sort) == ["Bash", "Edit|Write|MultiEdit|NotebookEdit"]' "$SO/city/settings.json" >/dev/null; ok $? "sessão: os grupos do guarda vêm PRIMEIRO (nenhum hook anterior pode segurar o dele)"
+sed "s#$MB/guard#$SO/guard#g" "$SO/city/settings.json" | jq 'del(.disableAllHooks)' > "$T/s.json"; python3 -I "$SO/guard/remote-clone-guard.py" --selfcheck "$T/s.json" >/dev/null 2>"$T/err"; [ $? = 1 ]; ok $? "sessão: o mesmo settings SEM o disableAllHooks:false escrito → o selfcheck do guarda da camada reprova"
+# a forma REAL do MBP: guarda + zdot (PATH explícito da sessão) + skills no mesmo bundle
+fresh; wipe "$T/f/out"; MBR=$MB mbp_build "$B" "$T/f" "$T/f/out" --guard-layer session --session-path /Users/athos/gt-remote/shim-bin:/opt/homebrew/bin:/usr/bin:/bin --skills; rc=$?
+{ [ $rc = 0 ] && sess_good "$T/f/out" /Users/athos/gt-remote/shim-bin && [ -f "$T/f/out/zdot/env.sh" ] && [ -f "$T/f/out/role/dog/.claude/skills/ok-skill/SKILL.md" ]; }; ok $? "sessão: com --session-path e --skills o bundle tem guard/ + zdot/ + a skill do papel e continua certo (rc=$rc)"
+# o servidor (padrão `home`) NÃO muda: mesmo bundle com e sem a opção, e nada de camada de sessão nele
+fresh; wipe "$T/f/out"; build "$T/f" "$T/f/out"; h0=$(hash_of "$T/f/out"); wipe "$T/f/out"; build "$T/f" "$T/f/out" --guard-layer home; h1=$(hash_of "$T/f/out")
+[ -n "$h0" ] && [ "$h0" = "$h1" ] && [ -x "$T/f/out/home/.claude/hooks/remote-clone-guard.py" ] && [ ! -e "$T/f/out/guard" ] && ! jq -e 'has("guard_layer")' "$T/f/out/manifest.json" >/dev/null && ! jq -e 'has("disableAllHooks")' "$T/f/out/city/settings.json" >/dev/null
+ok $? "sessão: o padrão (home, o Hetzner) é o mesmo bundle com ou sem --guard-layer home: guarda em home/.claude/hooks, sem guard/, sem guard_layer no manifest, sem disableAllHooks no city"
+fresh; wipe "$T/f/out"; build "$T/f" "$T/f/out" --guard-layer nenhuma; rc=$?; [ $rc = 2 ] && [ ! -e "$T/f/out" ]; ok $? "sessão: --guard-layer com valor desconhecido é erro de uso (2) e nada é escrito (rc=$rc)"
+# swap no city (o cross-clone-block do mini também mora lá): o guarda não duplica e o selfcheck segue aprovando
+citybash() { jq --arg c "$2" '.hooks.PreToolUse = [{"matcher": "Bash", "hooks": [{"type": "command", "command": $c}]}]' "$1" > "$T/m.json" && cp "$T/m.json" "$1"; }  # citybash ARQUIVO COMANDO: o PreToolUse do city com UM grupo de matcher Bash (o addhook faria um grupo sem matcher, que não é a forma do cross-clone-block)
+fresh; citybash "$T/f/$CS" "$T/f/home/.local/bin/gt tap guard cross-clone-block"; wipe "$T/f/out"; MBR=$MB mbp_build "$B" "$T/f" "$T/f/out" --guard-layer session; rc=$?
+{ [ $rc = 0 ] && sess_good "$T/f/out" && jq -e '[.hooks.PreToolUse[].hooks[].command | select(contains("remote-clone-guard"))] | length == 2' "$T/f/out/city/settings.json" >/dev/null; }; ok $? "sessão: com o cross-clone-block no city o swap cai no MESMO guarda (2 comandos do guarda, nenhum a mais) (rc=$rc)"
+# hook keep em city/papel iria para {remote_home}/.claude/hooks: a camada não escreve ali → recusa (e o mesmo build em `home` passa: a recusa é da camada)
+sess_keep() {  # sess_keep BUILDER [extra...] — o city ganha um hook keep (filter-bash-output.sh); roda o build do MBP
+  local b=$1; shift; fresh; addhook "$T/f/$CS" PreToolUse '~/.claude/hooks/filter-bash-output.sh'; wipe "$T/f/out"; MBR=$MB mbp_build "$b" "$T/f" "$T/f/out" "$@"
+}
+sess_keep "$B"; rc=$?; ok $rc "sessão: (controle) o mesmo city com hook keep em home passa (rc=$rc)"
+sess_keep "$B" --guard-layer session; rc=$?; [ $rc = 3 ] && has "$T/err" "--guard-layer session não instala nada" && [ ! -e "$T/f/out" ]; ok $? "sessão: hook keep no city recusa dizendo que a camada não escreve no .claude do host, e nada é escrito (rc=$rc)"
+# controle negativo: cada peça da camada tirada do builder, uma de cada vez
+sessmut() {  # sessmut DESCRIÇÃO OLD NEW — o bundle do builder estragado TEM que reprovar em sess_good (ou o build recusar)
+  pymut "$B" "$T/mutant.py" "$2" "$3"; ok $? "  o builder tem o trecho que o mutante '$1' estraga (não é um no-op)"
+  fresh; wipe "$T/f/mut"; MBR=$MB mbp_build "$T/mutant.py" "$T/f" "$T/f/mut" --guard-layer session; local rc=$?
+  { [ $rc != 0 ] || ! sess_good "$T/f/mut"; }; ok $? "controle negativo: $1 → o bundle reprova"
+}
+sessmut "a opção é lida mas nada muda (session_layer sempre falso)" 'self.session_layer = a.guard_layer == "session"' 'self.session_layer = False'
+sessmut "sem o disableAllHooks:false escrito" 'out["disableAllHooks"] = False' 'pass'
+sessmut "o PreToolUse do guarda não entra no city/settings.json" 'pre[:0] = want' 'pass'
+sessmut "o guarda só em Bash (o grupo Edit|Write sai)" 'for m in ("Bash", FILE_TOOLS) if not any' 'for m in ("Bash",) if not any'
+sessmut "o arquivo do guarda não vai em guard/" 'if self.session_layer:  # sempre: o city/settings.json' 'if False:  # sempre: o city/settings.json'
+sessmut "a camada de USUÁRIO do mini continua indo para home/.claude" 'if self.session_layer and kind == "user":' 'if False and kind == "user":'
+sessmut "o manifest não diz guard_layer" '**({"guard_layer": "session"} if self.session_layer else {})' '**({})'
+sessmut "o hook aponta para o guarda do ~/.claude (home) e não para guard/" 'where = f"{self.a.remote_root}/guard" if self.session_layer else f"{self.a.remote_home}/.claude/hooks"' 'where = f"{self.a.remote_home}/.claude/hooks"'
+pymut "$B" "$T/mutant.py" 'if self.session_layer:  # o script iria para' 'if False:  # o script iria para'; ok $? "  o builder tem a recusa do hook keep na camada (o mutante abaixo não é um no-op)"
+sess_keep "$T/mutant.py" --guard-layer session; [ $? = 0 ]; ok $? "controle negativo: sem a recusa o hook keep passaria a escrever em {remote_home}/.claude/hooks"
+pymut "$B" "$T/mutant.py" ' if not any(g.get("matcher") == m and gh in g.get("hooks", []) for g in pre)]' ']'; ok $? "  o builder tem a deduplicação do guarda (o mutante abaixo não é um no-op)"
+fresh; citybash "$T/f/$CS" "$T/f/home/.local/bin/gt tap guard cross-clone-block"; wipe "$T/f/mut"; MBR=$MB mbp_build "$T/mutant.py" "$T/f" "$T/f/mut" --guard-layer session
+jq -e '[.hooks.PreToolUse[].hooks[].command | select(contains("remote-clone-guard"))] | length == 2' "$T/f/mut/city/settings.json" >/dev/null 2>&1; [ $? != 0 ]; ok $? "controle negativo: sem a deduplicação o guarda do swap do city aparece em dobro"
 
 # controle negativo do live-clone-git-guard.py (ga-2w0hiow): cada peça do ramo novo estragada, uma de cada vez, e o MESMO build tem que dar o rc OPOSTO ao do builder de verdade
 lcg_mut() {  # lcg_mut DESCRIÇÃO OLD NEW EVENTO COMANDO RC — o mutante troca UM trecho (confirmado) e o build com EVENTO/COMANDO passa a sair RC

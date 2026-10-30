@@ -2,7 +2,7 @@
 
 ## Contents
 
-• O guarda de clone · Como o guarda decide · A trava no provider e como liberar
+• O guarda de clone · Como o guarda decide · **O guarda na camada da sessão (host com `~/.claude` pessoal)** · A trava no provider e como liberar
 • `rm -rf` sem humano no teclado · Prova real no servidor (MEDIDO) · Instalação e como repetir
 • Fatia 6b: skills que ficam fora do servidor, por nome · Auditoria do servidor (repetível)
 • Fatia 6c: hooks no Linux, latência dos hooks gc e a sessão mínima de ponta a ponta (MEDIDO 17/10)
@@ -47,13 +47,24 @@ Texto que antes ficava no topo do `remote-clone-guard.py` (saiu de lá para cabe
 
 **Limites** (é trava contra engano, não sandbox). NÃO vejo: script que o comando executa (`bash x.sh`, `source`), `python -c`, variável que guarda o git ou o diretório, comando montado em pipe (`echo … | sh`), função/alias de OUTRA chamada, CDPATH, `> arquivo`, `sed -i`/`rm`/`cp` no alheio, configuração já gravada no `.git/config` do alheio, QUAL ref o git escreve (do clone próprio, `push --delete worker/<outra>`, `branch -D`, `update-ref`, `worktree prune` mexem no espelho compartilhado), e destino em opção/subcomando fora de DEST/PATHOPT (`config -f`, `fast-import --export-marks`). Falsos positivos (lado fechado): git atrás de lançador OPACO, de embrulho com opção desconhecida, de -execdir, de `git --opção-nova VALOR`, `git clone <alheio> <próprio>/sub` (toda palavra de DEST é caminho), heredoc lido por quem não está em DATA cujo texto cita o clone alheio, e função com `{` entre aspas (conferida em diretório "não sei") bloqueiam — escreva `git -C <caminho absoluto do seu clone>`. `$'…'` só decodifica os escapes conhecidos. O fecho de verdade (usuário Unix por sessão, permissão por branch) é outro trabalho. A lista `gc-session-ssh` de nomes de teste (`remote-e2e-*`/`remote-test-*`) pula o selftest do guarda pelo NOME: a trava só é tão forte quanto quem escolhe nomes de sessão.
 
+## O guarda na camada da sessão (host com `~/.claude` pessoal)
+
+Ga-w7qwl1.2.7 (parte B da ga-w7qwl1.2.4). No MBP o `~/.claude` é do Athos, e o guarda NÃO pode morar nele nem ser conferido contra o `settings.json` dele. O mesmo `remote-clone-guard.py` roda de `<raiz-do-bundle>/guard/` (`remote-bundle-build.py build --guard-layer session`), ligado pelo `city/settings.json` do bundle (o último `--settings` do comando) com `disableAllHooks: false` escrito. Diferenças para o servidor, todas dentro do guarda:
+
+* **Reconhecimento.** Rodando de uma pasta chamada `guard`, a pasta-mãe é a raiz do bundle (uma raiz vazia ou `/` não vale). Rodando de `~/.claude/hooks/` (servidor), nada muda.
+* **Protege a camada:** Edit/Write/MultiEdit/NotebookEdit em `<raiz>/guard/**`, `<raiz>/zdot/**` e `<raiz>/city/settings.json` bloqueiam (symlink incluído); o resto do city, `work/` e nomes parecidos (`guardx/`, `settings.json.bak`) passam. Bash que escreve ali não é analisado.
+* **`--selfcheck`:** na camada, `disableAllHooks` tem de ser o booleano `false` ESCRITO no settings (ausente, `true`, `null`, `0`, `"false"` ou lista reprovam), porque um `disableAllHooks: true` no config pessoal ou na pasta do projeto desliga em silêncio os hooks do `--settings` (MEDIDO no `claude` 2.1.314, `scripts/remote-guard-layer.selftest.sh`). O `true` da camada do projeto reprova em qualquer cópia, como antes.
+* **Falha fechada:** o hook é `python3 -I <guarda> || exit 2`; guarda ausente, com erro de sintaxe, ou `python3` ausente/quebrado na PATH da sessão = a ferramenta é BLOQUEADA (até a escrita inocente), e o `start` do provider nem abre a sessão (exit 12).
+* **Limite (a revisão de segurança automática do commit apontou):** `python3` é achado pelo PATH da sessão, e a pasta do atalho (`shim-bin`, sob `gt-remote/`) vem primeiro nele e NÃO está na lista protegida (só `guard/`, `zdot/` e `city/settings.json`). Um `python3` falso que o agente grave ali (Edit/Write não bloqueia; Bash que escreve nunca é analisado) faria o hook sair 0 e desligaria o guarda; "falha fechada" acima vale para `python3` ausente ou quebrado, não para um que MENTE. A camada `home` do servidor tem a mesma dependência (o hook dela também é `python3 -I …`, achado pelo PATH); o que muda é só quais pastas o PATH tem. O conserto de verdade é o hook com o caminho ABSOLUTO do interpretador, que depende de medir onde fica o `python3` do MBP (não medido); fica para a prova ao vivo (ga-w7qwl1.2.4, parte A).
+* **Selftests:** grupo `layer` do `remote-clone-guard.selftest.sh` (79 casos, 11 mutantes; contra o guarda anterior 36 reprovam), grupo `lay` do `gc-session-ssh.selftest.sh` e o bloco “CAMADA DA SESSÃO” do `remote-bundle-build.selftest.sh`.
+
 ## A trava no provider e como liberar
 
 
 `gc-session-ssh start` só abre sem liberação o que se chama `remote-e2e-<x>` ou `remote-test-<x>` (a sessão mínima de teste). Qualquer outro nome:
 
 1. precisa de `real_sessions_released_by` (texto não vazio) na entrada do host em `.gc/session-ssh.json` — **decisão explícita do Mayor**; ausente, vazio ou não-texto = recusa sem abrir ssh;
-2. e, **no host, dentro do mesmo script do start**, o `sha256` de `<remote_home>/.claude/hooks/remote-clone-guard.py` tem que ser igual ao do guarda irmão do provider **e** `python3 -I <guarda> --selfcheck <remote_home>/.claude/settings.json <pasta da sessão>` tem que aprovar; senão o script sai 12 e nada abre (o provider devolve erro, exit 1, com o motivo).
+2. e, **no host, dentro do mesmo script do start**, o `sha256` de `<remote_home>/.claude/hooks/remote-clone-guard.py` tem que ser igual ao do guarda irmão do provider **e** `python3 -I <guarda> --selfcheck <remote_home>/.claude/settings.json <pasta da sessão>` tem que aprovar; senão o script sai 12 e nada abre (o provider devolve erro, exit 1, com o motivo). Isto vale para `guard_layer: "home"` (o servidor). Num host que dorme (`guard_layer: "session"`, o padrão dele) o guarda e o `settings.json` conferidos são os do bundle (`<raiz>/guard/…`, `<raiz>/city/settings.json`, e este tem de ser o ÚLTIMO `--settings` do comando), com o `python3` do PATH da sessão; nada sob `<remote_home>/.claude` é lido (ver a seção acima).
 
 Para liberar: pôr `"real_sessions_released_by": "<quem decidiu, quando>"` na entrada do host. Para travar de novo: tirar a chave. O `--dry-run` mostra `session_kind` "teste" ou "real". Selftest do provider **277 de 277** (229 casos + 47 mutantes pegos + o controle contra um stub).
 

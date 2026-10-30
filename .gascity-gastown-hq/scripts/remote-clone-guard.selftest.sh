@@ -16,8 +16,11 @@
 #   verdade (`python3 -I <guarda> || exit 2`) sai 2 se o guarda trava, some ou tem erro de sintaxe (falha fechada), e 0 se libera · lex — o que o shell lê como TEXTO não vira operador nem
 #   some (subgrupos: lexq aspas e `\` · lexs redirecionamento sem alvo · lexe palavra vazia · lexd `$'…'`/`$"…"` · lexu aspa ou `\` que não fecha, também num comentário `#` · lexr `$( )` do alvo
 #   de redirecionamento · lexh heredoc/`<<<`/find · lexp os controles que NÃO bloqueiam) · dest — o lugar onde o git escreve vem como ARGUMENTO, sem -C (worktree remove ../outro,
-#   clone/init <outro>/x, checkout-index --prefix=…; subgrupos destb e destp).
-# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (125 mutantes); e
+#   clone/init <outro>/x, checkout-index --prefix=…; subgrupos destb e destp) · layer — a camada da SESSÃO (ga-w7qwl1.2.7): o guarda instalado em <raiz>/guard/ (pasta `guard` sob a raiz do bundle)
+#   protege a própria camada (guard/, zdot/, city/settings.json — Edit/Write/MultiEdit/NotebookEdit, também por symlink) sem travar o trabalho, o resto do city nem nomes parecidos; a cópia do servidor
+#   (~/.claude/hooks) e uma pasta que não se chama `guard` NÃO protegem nada disso; o --selfcheck exige `disableAllHooks: false` ESCRITO no settings da camada (ausente/true/null/0/"false"/lista reprovam;
+#   o `true` da camada do projeto reprova em qualquer cópia); o hook via `sh -c` bloqueia (2) e libera (0), e guarda ausente ou com erro de sintaxe sai 2.
+# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (um mutante por trava; o resumo da rodada traz a conta); e
 #   contra um stub que só sai 0 (o servidor ANTES desta fatia: o hook do mini era `drop` e nada o substituía), quase tudo falha.
 # VARIÁVEIS: RCG_UNDER_TEST (guarda a testar) · RCG_ONLY (grupos, vírgula) · RCG_NO_MUTANTS=1
 # BUDGET (grupo à parte, ga-tih62nv): o pedido que fazia o guarda girar SEM FIM (e que o hook deixava seguir sem conferência ao estourar o prazo de 600 s do Claude Code) termina;
@@ -442,6 +445,58 @@ g_tools() {
   g 0 "tools: Write em ~/.claude/projects passa" Write file_path "$HOME/.claude/projects/x.jsonl"
   g 0 "tools: Read de arquivo do outro clone passa" Read file_path "$OTH/f.txt"
   g 0 "tools: ferramenta desconhecida passa" WebFetch url "http://x"
+}
+g_layer() {  # camada da SESSÃO (ga-w7qwl1.2.7): no MBP o guarda mora em <raiz>/guard/ e o settings em <raiz>/city/settings.json, NÃO no ~/.claude pessoal. O guarda que roda de lá protege esses
+  # arquivos (e o zdot/) como protege o ~/.claude/hooks do servidor; a raiz sai do lugar do PRÓPRIO arquivo (pasta chamada guard), e o servidor, que roda de ~/.claude/hooks, não ganha nada novo.
+  local src="$P" LR="$HOME/gt-remote/bundle" t f s
+  mkdir -p "$LR/guard" "$LR/zdot" "$LR/city/.gc/agents/dog" "$LR/work" "$LR/guardx"; cp "$src" "$LR/guard/remote-clone-guard.py"
+  ln -sfn "$LR/guard" "$LR/work/glink"; ln -sfn "$LR/city/settings.json" "$LR/work/slink"
+  local P="$LR/guard/remote-clone-guard.py"  # a partir daqui o guarda testado roda DA camada da sessão
+  for t in "Edit file_path" "Write file_path" "MultiEdit file_path" "NotebookEdit notebook_path"; do
+    set -- $t
+    for f in guard/remote-clone-guard.py guard/novo.py zdot/.zshenv zdot/env.sh city/settings.json work/glink/remote-clone-guard.py work/slink; do
+      g 2 "layer: $1 em <raiz>/$f (desligaria o guarda da sessão) é BLOQUEADO" "$1" "$2" "$LR/$f"
+    done
+    for f in work/x.txt city/outro.txt city/.gc/agents/dog/f guardx/f city/settings.json.bak; do
+      g 0 "layer: $1 em <raiz>/$f (trabalho da sessão, não é a camada) passa" "$1" "$2" "$LR/$f"
+    done
+    g 2 "layer: $1 em ~/.claude/hooks continua bloqueado (o home segue valendo)" "$1" "$2" "$HOME/.claude/hooks/remote-clone-guard.py"
+    g 2 "layer: $1 no clone alheio continua bloqueado" "$1" "$2" "$OTH/f.txt"
+  done
+  g 2 "layer: o motivo da recusa diz que é hook/settings do claude" Write file_path "$LR/guard/remote-clone-guard.py"; grep -q "hook/settings do claude" "$T/err"; ok $? "layer: ...e a mensagem fala em hook/settings do claude"
+  local P="$src"  # o MESMO arquivo rodando de fora de uma pasta `guard` (o servidor, ~/.claude/hooks): a raiz do bundle NÃO ganha proteção
+  g 0 "layer: o guarda do servidor não protege <raiz>/guard (não há camada de sessão: só o home)" Write file_path "$LR/guard/novo.py"
+  g 0 "layer: ...nem <raiz>/city/settings.json" Write file_path "$LR/city/settings.json"
+  g 2 "layer: ...mas segue protegendo ~/.claude/hooks" Write file_path "$HOME/.claude/hooks/x.py"
+  mkdir -p "$T/naoguard"; cp "$src" "$T/naoguard/remote-clone-guard.py"; local P="$T/naoguard/remote-clone-guard.py"
+  g 0 "layer: a pasta do arquivo não se chama guard → nenhuma raiz é deduzida (irmãos dela não ficam protegidos)" Write file_path "$T/zdot/.zshenv"
+  local P="$LR/guard/remote-clone-guard.py"
+  # --- o selfcheck da camada exige `disableAllHooks: false` ESCRITO: sem ele o ~/.claude pessoal ou a pasta do projeto desligam o hook (medido com o claude real) ---
+  s="$LR/city/settings.json"; rm -f "$s"
+  layerset() {  # layerset VALOR  (VALOR: um JSON, ou `ausente`) → $s = settings bom + disableAllHooks=VALOR
+    settings "$s" "Bash" "Edit|Write|MultiEdit|NotebookEdit"
+    [ "$1" = ausente ] || python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));d["disableAllHooks"]=json.loads(sys.argv[2]);json.dump(d,open(sys.argv[1],"w"))' "$s" "$1"
+  }
+  layerset false; python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; ok $? "layer: selfcheck da camada com \`disableAllHooks: false\` escrito → ok"
+  for t in ausente true null 0 '"false"' '[]'; do
+    layerset "$t"; python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; [ $? = 1 ]; ok $? "layer: selfcheck da camada com disableAllHooks=$t → falha (só o \`false\` escrito vence o ~/.claude e o projeto)"
+  done
+  layerset ausente; python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; grep -q 'disableAllHooks: false' "$T/err"; ok $? "layer: ...e a falha diz que falta o \`disableAllHooks: false\` explícito"
+  local pd="$T/projl"; mkdir -p "$pd/.claude"; layerset false
+  echo '{"disableAllHooks": true}' > "$pd/.claude/settings.json"; python3 -I "$P" --selfcheck "$s" "$pd" >"$T/o" 2>"$T/err"; [ $? = 1 ]; ok $? "layer: o \`false\` do bundle não apaga a checagem da camada do projeto (disableAllHooks ligado lá → falha)"
+  rm -f "$pd/.claude/settings.json"; python3 -I "$P" --selfcheck "$s" "$pd" >"$T/o" 2>"$T/err"; ok $? "layer: projeto sem settings + camada boa → ok"
+  layerset false; python3 -I "$src" --selfcheck "$s" >"$T/o" 2>"$T/err"; [ $? = 1 ]; ok $? "layer: o settings da camada serve só a QUEM roda de lá (o hook cita outro arquivo → falha)"
+  layerset ausente; python3 -I "$src" --selfcheck >"$T/o" 2>"$T/err"; ok $? "layer: o guarda do servidor (fora de pasta guard) continua dispensando o \`false\` escrito — sem settings, só os casos internos"
+  cp "$src" "$T/naoguard/remote-clone-guard.py"; settings "$s" "Bash" "Edit|Write|MultiEdit|NotebookEdit"; sed -i.bak "s#$LR/guard#$T/naoguard#g" "$s"; python3 -I "$T/naoguard/remote-clone-guard.py" --selfcheck "$s" >"$T/o" 2>"$T/err"
+  ok $? "layer: o guarda do servidor com o hook certo e SEM \`disableAllHooks\` → ok (nada mudou para o Hetzner)"
+  # --- o hook de verdade (o comando do settings), rodando da camada ---
+  local c="python3 -I $LR/guard/remote-clone-guard.py || exit 2"
+  CLAUDE_PROJECT_DIR="$OWN" sh -c "$c" <<<"$(mk Write "$OWN" file_path "$LR/zdot/.zshenv")" >/dev/null 2>&1; [ $? = 2 ]; ok $? "layer: o hook da sessão bloqueia (2) a escrita no zdot/ do bundle"
+  CLAUDE_PROJECT_DIR="$OWN" sh -c "$c" <<<"$(mk Write "$OWN" file_path "$LR/work/x.txt")" >/dev/null 2>&1; [ $? = 0 ]; ok $? "layer: o hook da sessão libera (0) a escrita no trabalho"
+  printf 'def (:\n' > "$LR/guard/remote-clone-guard.py"
+  CLAUDE_PROJECT_DIR="$OWN" sh -c "$c" <<<"$(mk Write "$OWN" file_path "$LR/work/x.txt")" >/dev/null 2>&1; [ $? = 2 ]; ok $? "layer: guarda da camada com erro de sintaxe → o hook sai 2 (falha fechada)"
+  rm -f "$LR/guard/remote-clone-guard.py"
+  CLAUDE_PROJECT_DIR="$OWN" sh -c "$c" <<<"$(mk Write "$OWN" file_path "$LR/work/x.txt")" >/dev/null 2>&1; [ $? = 2 ]; ok $? "layer: guarda da camada AUSENTE → o hook sai 2 (falha fechada)"
 }
 g_cond() {  # gate da fatia 6a (tentativa 3): a variável em que o guarda DECIDE (cwd modelado) tem de ser a mesma em que o shell AGE. cd que pode não ter rodado
   # (depois de ||, atrás de then/else/do, em pipeline/background, ou depois de && sem a cadeia seguir) deixa o diretório "não sei" → escrita bloqueia; e `<<EOF`
@@ -983,7 +1038,7 @@ EOF
   r=$(python3 -I "$capy" 10 "$hn" "$P" twice 2>&1); echo "$r" | grep -qF "reset=ok"; ok $? "budget: decide() zera o contador de passos a cada pedido [$r]"
 }
 
-all() { group block && g_block; group pass && g_pass; group evade && g_evade; group closed && g_closed; group shell && g_shell; group wrap && g_wrap; g_lex; g_dest; group cfg && g_cfg; group tools && g_tools; group msg && g_msg; group cond && g_cond; group ctx && g_ctx; group fuzz && g_fuzz
+all() { group block && g_block; group pass && g_pass; group evade && g_evade; group closed && g_closed; group shell && g_shell; group wrap && g_wrap; g_lex; g_dest; group cfg && g_cfg; group tools && g_tools; group layer && g_layer; group msg && g_msg; group cond && g_cond; group ctx && g_ctx; group fuzz && g_fuzz
         group check && g_check; group hook && g_hook; group budget && g_budget; return 0; }
 
 if [ -n "${RCG_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
@@ -1171,9 +1226,20 @@ echo "== $((n-fails))/$n ok =="
   mutant budget "a palavra de comando que é uma função não é reexecutada antes dos ramos especiais (bash(), env(), cd(), find(), eval()…)" 's/^        if fw in st.get("funcs", {}) and fw not in st.setdefault("calling", set()):/        if False:/'
   mutant budget "um cd coberto por uma função segue modelado como cd" 's/^            if done:$/            if False:/'
   mutant budget "uma atribuição coberta por uma função (export() { :; }) segue valendo" 's/ or kw or bool(done) or blk or/ or kw or blk or/'
+  mutant layer "a raiz do bundle nunca é deduzida do lugar do arquivo (sem camada de sessão)" 's/    return root if os.path.basename(here) == "guard" and root not in ("", "\/") else ""/    return ""/'
+  mutant layer "qualquer pasta (não só guard) vira camada de sessão" 's/os.path.basename(here) == "guard" and //'
+  mutant layer "a camada da sessão deixa de ser protegida (só o home)" 's/ or (bool(root) and any(inside(p, f"{root}\/{d}") for d in LAYER_PATHS))//'
+  mutant layer "o zdot\/ (ZDOTDIR do bundle) sai da camada protegida" 's/^LAYER_PATHS = ("guard", "zdot", "city\/settings.json")/LAYER_PATHS = ("guard", "city\/settings.json")/'
+  mutant layer "o guard\/ sai da camada protegida" 's/^LAYER_PATHS = ("guard", "zdot", "city\/settings.json")/LAYER_PATHS = ("zdot", "city\/settings.json")/'
+  mutant layer "o city\/settings.json sai da camada protegida" 's/^LAYER_PATHS = ("guard", "zdot", "city\/settings.json")/LAYER_PATHS = ("guard", "zdot")/'
+  mutant layer "a camada protegida vira o bundle INTEIRO (o trabalho da sessão deixa de passar)" 's/^LAYER_PATHS = ("guard", "zdot", "city\/settings.json")/LAYER_PATHS = ("", )/'
+  mutant layer "claude_conf deixa de ser consultado na escrita de arquivo" 's/p is None or claude_conf(p) or (inside/p is None or (inside/'
+  mutant layer "o selfcheck da camada não exige o disableAllHooks:false escrito" 's/if layer_root() and s.get("disableAllHooks") is not False:/if False:/'
+  mutant layer "o selfcheck da camada aceita qualquer valor falso (0, [], ausente→None) no lugar do false" 's/if layer_root() and s.get("disableAllHooks") is not False:/if layer_root() and s.get("disableAllHooks") is None:/'
+  mutant layer "o selfcheck exige o false escrito também no servidor (o Hetzner regride)" 's/if layer_root() and s.get("disableAllHooks") is not False:/if s.get("disableAllHooks") is not False:/'
   echo "-- contra um stub que só sai 0 (o servidor ANTES desta fatia)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"; printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$T/stub.py"
-  r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,shell,wrap,lex,dest,cfg,tools,msg,check,cond" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"
+  r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,shell,wrap,lex,dest,cfg,tools,layer,msg,check,cond" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"
   case "$r" in "RESULT 0/"*|"") ok 1 "stub deveria falhar quase tudo ($r)";; *) ok 0 "stub falha os casos ($r)";; esac
   echo "== final: $((n-fails))/$n ok =="
 }
