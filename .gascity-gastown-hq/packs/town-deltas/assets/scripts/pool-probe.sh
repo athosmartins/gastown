@@ -13,8 +13,8 @@
 # call to a file has no such combination: `sh <this file> gastown.dog`.
 #
 # Contract. The SAME probe: same bd calls (same flags, same order), same veto filter, same tiers, and
-# the same STDOUT in every case (one JSON array of at most one bead, or `[]`) - except the two deliberate
-# differences below (the disk floor, ga-vln2py; the sling filter, ga-b97dgq), each with its own selftest.
+# the same STDOUT in every case (one JSON array of at most one bead, or `[]`) - except the three deliberate
+# differences below (the disk floor, ga-vln2py; the sling filter, ga-b97dgq; the gate focus hold, ga-6fkx9je), each with its own selftest.
 # It is read-only (bd ready/list/query/show, gc session list, jq): nothing in here removes anything. The proof
 # is pool-probe.selftest.sh, which runs the engine's own text (pool-probe.golden-1c.txt) and this file against
 # the same fixtures and compares stdout, the argv of every bd call and the exit code.
@@ -59,8 +59,8 @@ mark() {
 # The city's own formula work still flows - it is what gets the city out of the hole: order molecules and their steps
 # (the stale-db cleanup: type molecule / step, gc.pool_demand, gc.step_ref - no gc.kind), gc.kind work, and tiers 2 and 3.
 # What counts as a story is ONE definition, DISK_HOLD_NEW_STORIES_JQ in the lib; a shape it does not recognise flows.
-# This is one of the two places where the answer deliberately differs from the engine's probe (the other is the sling filter,
-# ga-b97dgq, below), and it differs only while the disk is low:
+# This is one of the three places where the answer deliberately differs from the engine's probe (the others are the gate focus
+# hold, ga-6fkx9je, and the sling filter, ga-b97dgq, both below), and it differs only while the disk is low:
 # with the disk fine (or unreadable) stdout, the bd calls and the exit code are byte-for-byte the engine's.
 # `[]` from the hold is a real "nothing for you": drain, do not look for a story by another route.
 # The hold runs AFTER the engine's --limit=20 window (ga-nyug12): 20 stories older than a formula bead would fill the window,
@@ -88,6 +88,38 @@ pp_log() {
   printf "%s pool-probe[%s]: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$target" "$*" >> "$pp_f" 2>/dev/null || true
 }
 [ "$disk_state" = unknown ] && pp_log "free disk unreadable (lib=$disk_lib) - fail-open, new stories not held back (ga-vln2py)"
+
+# ga-6fkx9je: GATE FOCUS MODE (Athos 07/10, ga-kqa08j). While the gate is the bottleneck (gate-focus-mode.sh says active=1) the
+# builder pools take no NEW story, only fixes: gate:needs-fix / gate:fix-attempt:N, origem:auto-healer-notify, impacto:dano-ao-vivo
+# (GATE_FOCUS_FIX_JQ, gate-focus-lib.sh). The wa/ps worker probes keep ONLY fixes; this probe cannot. The dog pool also carries the
+# city's own formula work (the stale-db cleanup molecule and its steps, gc.kind work - see the disk floor above): the Pilot never
+# dispatches it, so the mode never held it back, and starving it for the hours the mode stays ON would stop the reaper and the
+# orders. So the hold is the disk floor's minus the fix class: tier 1 loses the positively recognised NEW STORIES (the ONE
+# definition, DISK_HOLD_NEW_STORIES_JQ in the disk lib) that are not fixes; formula work, fixes and tiers 2 and 3 flow.
+# Three states of the mode, never two: ON -> hold; OFF -> as before; unknown (lib missing or corrupt, no state file, a state
+# older than GATE_FOCUS_STALE_S, anything but 0/1) -> as before, FAIL OPEN as the lib's contract says and as every other pause
+# does, with a line in the pool-probe log so "the mode is off" and "nobody could tell" never look the same. And a fourth case:
+# ON but the hold cannot be built or applied (a lib that does not give its text, jq failing) -> tier 1 answers nothing and is
+# marked unreadable (exit 3 when tiers 2 and 3 find nothing either): inert AND loud, never "no work" and never "go ahead".
+# A low disk wins over the mode: it holds every story, fixes included, so the disk block alone handles that case.
+# `[]` from the hold is a real "nothing for you": drain, do not look for a story by another route. The libs are read in
+# subshells so a corrupt copy cannot kill the probe. GATE_FOCUS_ACTIVE_OVERRIDE (the lib's own seam) pins the reading (selftests).
+focus_lib="${POOL_PROBE_FOCUS_LIB:-$(dirname "$0")/gate-focus-lib.sh}"
+# vazio/falhou/ilegível -> focus_state stays "unknown" (answer unchanged, fail-open, logged); never "1" and never a silent "0"
+focus_state=$( ( . "$focus_lib" && gate_focus_active ) 2>/dev/null )
+case "$focus_state" in 0|1) ;; *) focus_state=unknown ;; esac
+[ "$focus_state" = unknown ] && pp_log "gate focus state unreadable (lib=$focus_lib) - fail-open, new stories not held back (ga-6fkx9je)"
+focus_hold_jq=""
+if [ "$focus_state" = 1 ] && [ "$disk_state" != low ]; then
+  # vazio/falhou/ilegível -> empty fix predicate; the hold is then not built and tier 1 answers nothing (inert, marked, exit 3 if nothing else is found)
+  focus_fix_jq=$( ( . "$focus_lib" && printf "%s" "$GATE_FOCUS_FIX_JQ" ) 2>/dev/null )
+  # vazio/falhou/ilegível -> empty story definition; same: the hold is not built, tier 1 answers nothing
+  focus_story_jq=$( ( . "$disk_lib" && printf "%s" "$DISK_HOLD_NEW_STORIES_JQ" ) 2>/dev/null )
+  if [ -n "$focus_fix_jq" ] && [ -n "$focus_story_jq" ]; then
+    # per bead: it flows when the ONE story definition lets it through ([.] kept = not a story) or when it is a fix
+    focus_hold_jq="[ .[] | select( ([.] | $focus_story_jq) != [] or ($focus_fix_jq) ) ]"
+  fi
+fi
 
 # The length of the JSON list in $1, on stdout. rc 1 and NOTHING on stdout when jq cannot say (it failed, or it answered nothing).
 # One definition for a count (ga-nyug12, gate attempt 1): a count that could not be read is not 0. A caller that DECIDES on a count
@@ -207,6 +239,39 @@ if [ "$disk_state" = low ]; then
   else
     mark 1; t1_kept="[]"
     pp_log "free disk under the floor but the hold could not be applied (lib or jq) - tier 1 answers nothing (ga-vln2py)"
+  fi
+fi
+if [ "$focus_state" = 1 ] && [ "$disk_state" != low ]; then
+  # The disk block's shape, for the same reasons (the three counts DECIDE the refetch; the --limit=20 window can hold nothing but held
+  # stories while a fix or a formula bead waits outside it). Its variables are reused: the two blocks never both run, a low disk skips this one.
+  # vazio/falhou/ilegível (no hold text, or jq failed) -> tier 1 answers NOTHING (inert) and is marked unreadable like any tier that could not be read
+  if [ -n "$focus_hold_jq" ] && t1_held=$(printf "%s" "$t1_kept" | jq -c "$focus_hold_jq" 2>/dev/null); then
+    # vazio -> 0, no mark; falhou/ilegível (jq cannot count it, or answers nothing) -> tier 1 marked, count empty = 0: the "-gt 0" fails, no refetch on a guess
+    n_before=$(pp_len "$t1_kept") || mark 1
+    # vazio -> 0, no mark; falhou/ilegível -> tier 1 marked, count empty = 0: the "-eq 0" holds, so at worst ONE harmless extra refetch (it re-applies veto and hold itself)
+    n_after=$(pp_len "$t1_held") || mark 1
+    # vazio -> 0, no mark; falhou/ilegível -> tier 1 marked, count empty = 0: the "-ge" fails, no refetch - and never the silent conclusion "the window was not full"
+    n_window=$(pp_len "$t1_raw") || mark 1
+    pp_log "gate focus mode ON - tier 1 held back $(pp_minus "$n_before" "$n_after") new story/stories (ga-6fkx9je)"
+    t1_kept="$t1_held"
+    if [ "${n_before:-0}" -gt 0 ] && [ "${n_after:-0}" -eq 0 ] && [ "${n_window:-0}" -ge "$t1_window" ]; then
+      # vazio/falhou/ilegível (bd failed, the answer is empty or not JSON, or the hold cannot read it) -> tier 1 is marked unreadable and
+      # answers NOTHING (inert; exit 3 if tiers 2 and 3 find nothing either); a valid [] is a real "nothing"
+      if t1_all=$(t1_fetch 0) \
+        && t1_all_kept=$(printf "%s" "$t1_all" | jq -c --argjson now_ts "$(date +%s)" "$VETO_FILTER" 2>/dev/null) \
+        && t1_all_held=$(printf "%s" "$t1_all_kept" | jq -c "$focus_hold_jq" 2>/dev/null) && [ -n "$t1_all_held" ]; then
+        # vazio/falhou/ilegível -> LOG TEXT ONLY (the list itself was read above and is what gets used): a count jq cannot give prints "?", never "0 left"
+        n_all=$(pp_len "$t1_all_kept"); n_all_held=$(pp_len "$t1_all_held")
+        pp_log "gate focus mode ON, the --limit=$t1_window window held nothing but new stories - tier 1 refetched without a limit: $(pp_minus "$n_all" "$n_all_held") new story/stories held back, ${n_all_held:-?} left (ga-6fkx9je)"
+        t1_kept="$t1_all_held"
+      else
+        mark 1; t1_kept="[]"
+        pp_log "gate focus mode ON, the --limit=$t1_window window held nothing but new stories and the unlimited refetch could not be read - tier 1 answers nothing (ga-6fkx9je)"
+      fi
+    fi
+  else
+    mark 1; t1_kept="[]"
+    pp_log "gate focus mode ON but the hold could not be applied (lib or jq) - tier 1 answers nothing (ga-6fkx9je)"
   fi
 fi
 t1_kept=$(printf "%s" "$t1_kept" | drop_slings_for_taken_stories)   # ga-b97dgq: its own statement, so the line below stays the text work-order.registry.tsv matches
