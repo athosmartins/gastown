@@ -222,6 +222,12 @@ case "$op" in
     esac;;
   start)
     req=$(cat); [ $mode != startfail ] || { echo "gc-session-ssh: start recusado: falha falsa" >&2; exit 1; }
+    # a recusa de login do provider de verdade (ga-w7qwl1.2.4.2): a causa primeiro, depois o diag do agente (só metadados); a última linha leva um token plantado que NUNCA pode chegar ao log da prova
+    refuse_diag() { printf '%s\n' "gc-session-ssh: start recusado em mbp: o claude está DESLOGADO no domínio gráfico do host (claude auth status → loggedIn false): faça o login na sessão gráfica do MBP" \
+      "diagnostico do agente (so metadados):" "agente-diag v1 2026-10-30T13:00:00Z so metadados: nenhum conteudo de credencial, e-mail ou organizacao" "uid=501" "HOME=/Users/athos" "CLAUDE_CONFIG_DIR=nao-definida" \
+      "credenciais_home=/Users/athos/.claude/.credentials.json existe=sim legivel=sim tamanho_bytes=524" "auth_status_rc=1" 'auth_status_campos="loggedIn":false "authMethod":"none" ' "item_cofre_claude=ausente (rc=44)" \
+      "claude=/opt/homebrew/bin/claude real=/opt/homebrew/Caskroom/claude/2.1.0/claude" "lixo com token plantado sk-ant-oat01-PLANTEDSECRET0123456789ABCDEF" >&2; exit 1; }
+    [ $mode != startdiag ] || refuse_diag
     # as mesmas recusas do provider de verdade (scripts/gc-session-ssh:431-438, ga-w7qwl1.1.8): sem isto o falso aceitava um bloco de host que o real recusa e o e2e "passava" contra uma config que nunca abriria sessão no MBP
     guierr=$(python3 -I -c '
 import json, os, sys
@@ -248,6 +254,7 @@ elif h.get("gui_agent") and not (h.get("session_env") or {}).get("claude"):
     }
     if [ "$NAME" != "$S1" ]; then  # sessão leve de (g): só um sleep, sem claude e sem login de API
       [ $mode != startfail2 ] || [ "$NAME" != remote-test-remote-mbp-92 ] || { echo "gc-session-ssh: start recusado: falha falsa (2ª sessão leve)" >&2; exit 1; }
+      [ $mode != startdiag2 ] || [ "$NAME" != remote-test-remote-mbp-92 ] || refuse_diag
       mkdir -p "$(dirname "$SOCK")"; : > "$SOCK"
       nohup sh -c 'sleep 6007; : sessao-leve' > /dev/null 2>&1 < /dev/null &
       echo $! > "$S/panepid$sx"; touch "$S/running$sx"; agent_up; echo "$NAME" >> "$S/order"
@@ -763,6 +770,11 @@ g_e2e() {
   fail1 die die "FAIL (e) a sessão rodou" "sessão que morre antes do fim → reprova com a tela"
   fail1 hang hang "FAIL (e) a sessão rodou" "sessão que trava → reprova no prazo e é parada" --timeout 5
   fail1 startfail startfail "FAIL start pelo provider" "start que o provider recusa → reprova, o stop roda mesmo assim"
+  c startdiag && { FAKE_MODE=startdiag ep; [ $RC = 1 ] && has "$T/out" "FAIL start pelo provider" && has "$T/out" "RECUSA do provider em start pelo provider (rc 1)" && has "$T/out" "o claude está DESLOGADO" && has "$T/out" "uid=501" \
+      && has "$T/out" "credenciais_home=/Users/athos/.claude/.credentials.json existe=sim legivel=sim tamanho_bytes=524" && has "$T/out" 'item_cofre_claude=ausente (rc=44)' && has "$T/out" "FIM da recusa" && [ "$(calls stop)" -ge 1 ]
+    ok $? "e2e: start recusado por login → o log leva a recusa INTEIRA, com o diag do agente (o detalhe de 300 caracteres do FAIL não alcança o diag) (rc=$RC)"
+    ! has "$T/out" "PLANTEDSECRET" && ! has "$T/out" "sk-ant-oat01" && has "$T/out" "<REDIGIDO>"; ok $? "e2e: ...e o token plantado no texto da recusa NÃO chega ao log (redigido)"
+    lg=$(ls -t "$CITY"/.gc/logs/mbp-proof-*.log 2>/dev/null | head -1); [ -n "$lg" ] && has "$lg" "uid=501" && has "$lg" "FIM da recusa" && ! has "$lg" "PLANTEDSECRET"; ok $? "e2e: ...e o mesmo bloco, sem o token, está no ARQUIVO de log (o que se cola na bead), não só na tela"; }
   c athosback && { FAKE_DELAY=3 FAKE_GATE_AFTER_START=athos FAKE_MODE=ok ep; [ $RC = 4 ] && has "$T/out" "INTERROMPIDA" && has "$T/out" "Athos está no MBP" && [ "$(calls stop)" -ge 1 ] && [ ! -e "$SRV/gt-remote/proof" ] && ! grep -q '^[0-9:]* FAIL' "$T/out"; ok $? "e2e: o Athos volta ao MBP no meio → saída 4, nada mais medido, a sessão é parada e o MBP é limpo (rc=$RC)"; }
   c foreignpause && { FAKE_MODE=foreignpause ep; [ $RC = 4 ] && has "$T/out" "pausa do Athos ativa" && [ "$(calls stop)" -ge 1 ] && [ "$(cat "$SRV/gt-remote/PAUSE")" = "origem=athos desde=2026-10-18T10:00:00" ]; ok $? "e2e: o Athos liga a pausa dele no meio → saída 4 e a pausa DELE fica exatamente como estava (rc=$RC)"; }
   c healthwarn && { FAKE_GATE_AFTER_START=health FAKE_MODE=ok ep; [ $RC = 0 ] && has "$T/out" "aviso antes de" && has "$T/out" "MBP sem saúde"; ok $? "e2e: o MBP piora de saúde por causa da própria sessão → só avisa e segue (a saúde não aborta) (rc=$RC)"; }
@@ -793,6 +805,9 @@ g_e2e() {
   only1 gui-plisthome-unreadable plisthomebad "FAIL (f) a sessão nasceu num LaunchAgent do domínio gráfico" "(f) não dá para olhar ~/Library/LaunchAgents (um arquivo no lugar da pasta) → \"não sei\" reprova (f), nunca vira \"o plist não está lá\""
   only1 multi-serverdies serverdies "FAIL (g) parar a 1ª NÃO derruba a 2ª" "(g) o bootout do agente da 1ª leva o servidor do tmux e a 2ª sessão junto → só essa prova reprova"
   fail1 multi-agentleak agentleak "FAIL (g) parar a 1ª NÃO derruba a 2ª" "(g) o provider diz 0 no stop da 1ª mas o agente dela segue carregado → reprova"
+  c multi-startdiag2 && { FAKE_MODE=startdiag2 ep; nf=$(grep -c '^[0-9:]* FAIL' "$T/out")
+    [ $RC = 1 ] && has "$T/out" "FAIL (g) start da sessão leve remote-test-remote-mbp-92" && has "$T/out" "RECUSA do provider em (g) start da sessão leve remote-test-remote-mbp-92" && has "$T/out" "item_cofre_claude=ausente (rc=44)" && ! has "$T/out" "PLANTEDSECRET" && [ "$nf" = 1 ]
+    ok $? "e2e: a 2ª sessão leve recusada por login → (g) reprova e o log leva a recusa inteira, sem o token plantado (rc=$RC, provas reprovadas=$nf)"; }
   c multi-startfail2 && { FAKE_MODE=startfail2 ep; nf=$(grep -c '^[0-9:]* FAIL' "$T/out")
     [ $RC = 1 ] && has "$T/out" "FAIL (g) start da sessão leve remote-test-remote-mbp-92" && [ "$nf" = 1 ] && [ "$(calls "stop remote-test-remote-mbp-91")" -ge 1 ] && [ ! -e "$FAKE_STATE/running.remote-test-remote-mbp-91" ]; ok $? "e2e: a 2ª sessão leve que o provider recusa reprova (g), e a 1ª, já aberta, é parada (rc=$RC, provas reprovadas=$nf)"; }
   fail1 multi-tmuxbad tmuxbad "FAIL (g) depois dos stops" "(g) tmux que responde com erro de versão com as sessões leves abertas é \"não sei\" e REPROVA — nunca \"sem sessão\""
@@ -1007,6 +1022,19 @@ def new_run() -> str:'
   mutant e2e nozdot "o bundle sem o ambiente limpo passa" 'if s["session_path"] != SESSION_PATH:' 'if False:'
   mutant e2e meas-userbd,meas-fnbd,meas-realdolt,meas-pathhome,meas-pathfirst,meas-none "a medição de dentro da sessão não decide" 'ok, why = resolution_verdict(out, self.run, SHIMBIN, MHOME)' 'ok, why = True, "x"'
   mutant e2e meas-altered "o comando alterado pelo modelo vale" 'if x["cmd"].strip() == want and ' 'if '
+  mutant e2e startdiag "start recusado sem o texto da recusa no log" '        if not ok:
+            self.refusal("start pelo provider", p)
+' '        if not ok:
+            pass
+'
+  mutant e2e startdiag "recusa cortada em 300 caracteres (o diag some)" 'for ln in (txt[:REFUSAL_MAX].splitlines()' 'for ln in (txt[:300].splitlines()'
+  mutant e2e startdiag "recusa sem redação de segredo" 'txt = redact(self.out(p))' 'txt = self.out(p)'
+  mutant e2e startdiag "redação sem os padrões de token" '    for rx in SECRET_RX:
+        text = re.sub(rx, "<REDIGIDO>", text)
+    return text' '    return text'
+  mutant e2e multi-startdiag2 "(g) recusado sem o texto da recusa no log" '                    self.refusal(f"(g) start da sessão leve {n}", p)
+' '                    pass
+'
   mutant e2e meas-cutout "a saída cortada vale" ' and f"MEASEND-{self.run}" in x["out"]]' ']'
   mutant e2e meas-contentlist "resultado que não é texto vale" 'isinstance(x["out"], str) and ' ''
   mutant e2e meas-none "sem medição vira texto vazio" 'out = calls[-1]["out"] if calls else None' 'out = calls[-1]["out"] if calls else ""'

@@ -268,7 +268,10 @@ WTUNDO_SH = r"""wtundo() {
 # Então, num host com `gui_agent`, quem abre a sessão é um LaunchAgent POR SESSÃO: o start grava o plist em <remote_root>/run/ (NUNCA em ~/Library/LaunchAgents: não sobrevive a logout nem a reboot),
 # faz `launchctl bootstrap gui/<uid>`, e o agente confere o login DENTRO desse domínio e só então sobe o tmux do socket do provider. O agente existe só entre o start e o stop; o stop faz
 # bootout, apaga os arquivos e PROVA a ausência (`launchctl print` rc 113; 112 = o domínio gui nem existe, e nada vive num domínio que não existe): sem prova o stop FALHA, nunca "limpo".
-# O start varre antes de criar: agente do prefixo cuja sessão tmux não existe mais (stop que nunca rodou). Nenhuma credencial nova, nada no Keychain: o único comando do claude é `auth status`.
+# O start varre antes de criar: agente do prefixo cuja sessão tmux não existe mais (stop que nunca rodou). Nenhuma credencial nova e nenhuma leitura de segredo: o único comando do claude é `auth status`.
+# Exceção ESTREITA (ga-w7qwl1.2.4.2, decisão do Mayor 30/10): quando o login NÃO está ok (deslogado/ilegível) o agente grava <label>.agent.diag — só metadados, para dizer ONDE o claude olha e não achou login
+# (HOME, CLAUDE_CONFIG_DIR, stat do arquivo de credencial sem lê-lo, 3 campos de uma lista fixa do `auth status`, rc de `security find-generic-password -s` SEM -w/-g, realpath do claude). O start imprime o diag
+# na recusa (antes de apagá-lo) e o agent_down o apaga: nada dele sobra em run/. Caminho de sucesso: nenhum diag, nenhuma chamada a `security`.
 EX_GUI = 15  # recusa do start pelo domínio gráfico (14 é do start ABANDONADO, ga-0k82lw: outro caso, outro rc): sem sessão gráfica, claude deslogado/ilegível, agente que não subiu ou que não se conseguiu remover
 AGENT_PFX = "com.gascity.remote-session."  # prefixo FIXO dos labels (o que a varredura reconhece como nosso); label = prefixo + nome da sessão
 GUI_WAIT_S = 20  # quanto o start espera o veredito do agente (o `claude auth status` levou 1 s na medição)
@@ -286,7 +289,7 @@ agent_gone() {
 }
 agent_down() {
   launchctl bootout "gui/$U/$1" >/dev/null 2>&1
-  rm -f -- @RUN@/"$1".plist @RUN@/"$1".agent.sh @RUN@/"$1".agent.res @RUN@/"$1".agent.res.tmp
+  rm -f -- @RUN@/"$1".plist @RUN@/"$1".agent.sh @RUN@/"$1".agent.res @RUN@/"$1".agent.res.tmp @RUN@/"$1".agent.diag*
   agent_gone "$1" || return 1
   [ ! -e @RUN@/"$1".plist ] || { echo "agente $1: o plist continua em @RUN@" >&2; return 1; }
 }
@@ -305,7 +308,7 @@ agent_sweep || exit 15
 # O que substitui o `tmux new-session` do start: grava agente + plist, confere o plist, carrega no gui/<uid> e espera o veredito. Qualquer recusa remove o agente (provando) e o lançador.
 GUI_START = r"""printf %s @AGB64@ | base64 -d >@AGSH@ && printf %s @PLB64@ | base64 -d >@PLIST@ || { rm -f @LAUNCH@; agent_down @LABEL@; exit 1; }
 { ! command -v plutil >/dev/null 2>&1 || plutil -lint -s @PLIST@ >/dev/null 2>&1; } || { echo "o plist do agente @LABEL@ não passou no plutil -lint" >&2; rm -f @LAUNCH@; agent_down @LABEL@; exit 15; }
-rm -f @RES@ @RES@.tmp
+rm -f @RES@ @RES@.tmp @DIAG@ @DIAG@.tmp @DIAG@.sec
 launchctl bootstrap "gui/$U" @PLIST@ || { echo "launchctl bootstrap do agente @LABEL@ falhou" >&2; rm -f @LAUNCH@; agent_down @LABEL@; exit 15; }
 gi=0; while [ ! -s @RES@ ] && [ "$gi" -lt @WAIT@ ]; do sleep 1; gi=$((gi+1)); done
 gv=$(cat @RES@ 2>/dev/null)
@@ -317,15 +320,56 @@ case "$gv" in
   "") gm="o agente não respondeu em @WAIT@s";;
   *) gm="resposta ilegível do agente";;
 esac
-[ "$gv" = ok ] || { echo "start recusado em @HOST@: $gm" >&2; rm -f @LAUNCH@; agent_down @LABEL@; exit 15; }"""
+[ "$gv" = ok ] || { echo "start recusado em @HOST@: $gm" >&2
+  case "$gv" in deslogado|ilegivel*) if [ -s @DIAG@ ]; then echo "diagnostico do agente (so metadados):" >&2; head -c 2000 @DIAG@ >&2; else echo "diagnostico do agente: nao foi gravado" >&2; fi;; esac
+  rm -f @LAUNCH@; agent_down @LABEL@; exit 15; }"""
 # O agente (roda no launchd gui/<uid>, PATH próprio — o do launchd não tem o Homebrew do MBP): confere o login no PRÓPRIO domínio (três estados: logado / deslogado / ilegível — só "logado" segue; a saída
-# do claude, que tem e-mail e organização, nunca é gravada), abre a sessão, publica o veredito em @RES@ (troca atômica) e fica vivo enquanto a sessão existir. Só comando do claude: `auth status`.
+# do claude, que tem e-mail e organização, nunca é gravada: do diag só entram loggedIn/authMethod/apiProvider, por lista fixa), abre a sessão, publica o veredito em @RES@ (troca atômica) e fica vivo enquanto a sessão existir.
+# Só comando do claude: `auth status`. O diag (login não ok) é gravado ANTES do veredito: o start lê o diag assim que vê o veredito. `security` roda em 2º plano com prazo de 5 s (cofre trancado pode esperar um diálogo para sempre).
 GUI_AGENT = r"""#!/bin/sh
 PATH="@PATHX@$HOME/.local/bin:$HOME/go/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"; export PATH
 res=@RES@
+cl=@CLAUDE@
+# leituras do diag, cada uma com o vazio e o falhou em estados DIFERENTES (nunca o mesmo valor): stat do arquivo — ausente: existe=nao; stat que falha por outro motivo: existe=nao-sei (motivo);
+# cofre — rc 44: ausente; qualquer outro rc ou sem resposta em 5 s: nao-sei, nunca ausente; auth status — nenhum dos 3 campos: nenhum-campo-reconhecido (não é loggedIn false), o rc sai sempre; realpath — não resolveu: nao-resolvido
 say() { printf '%s\n' "$1" >"$res.tmp" && mv -f "$res.tmp" "$res"; }
-o=$(@CLAUDE@ auth status 2>&1 </dev/null); rc=$?
+clean() { printf '%s' "$1" | LC_ALL=C tr -cd 'A-Za-z0-9_./ ~:=+-' | cut -c1-200; }
+fsize() { case "$(uname -s)" in Darwin) stat -L -f %z "$1";; *) stat -L -c %s "$1";; esac; }
+fmeta() {
+  if m=$(fsize "$1" 2>&1); then
+    if [ -r "$1" ]; then r=sim; else r=nao; fi; echo "existe=sim legivel=$r tamanho_bytes=$(clean "$m")"
+  else
+    case "$m" in *"No such file"*) echo "existe=nao";; *) echo "existe=nao-sei ($(clean "${m##*: }"))";; esac
+  fi
+}
+vault_item() {
+  rm -f @DIAG@.sec
+  ( security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1; echo $? >@DIAG@.sec ) &
+  bp=$!; si=0
+  while [ ! -s @DIAG@.sec ] && [ "$si" -lt 5 ]; do sleep 1; si=$((si+1)); done
+  if [ ! -s @DIAG@.sec ]; then pkill -P "$bp" 2>/dev/null; kill "$bp" 2>/dev/null; echo "nao-sei (sem resposta em 5s)"; return 0; fi
+  sr=$(cat @DIAG@.sec); rm -f @DIAG@.sec
+  case "$sr" in 0) echo "existe (rc=0)";; 44) echo "ausente (rc=44)";; *) echo "nao-sei (rc=$(clean "$sr"))";; esac
+}
+diag() {
+  js=$(printf '%s\n' "$o" | grep -oE '"(loggedIn|authMethod|apiProvider)"[[:space:]]*:[[:space:]]*(true|false|"[A-Za-z0-9_.-]{1,40}")' | sed 's/[[:space:]]//g' | tr '\n' ' ')
+  rp=$(realpath "$cl" 2>/dev/null) || rp=$(readlink -f "$cl" 2>/dev/null) || rp=
+  {
+    echo "agente-diag v1 $(date -u +%Y-%m-%dT%H:%M:%SZ) so metadados: nenhum conteudo de credencial, e-mail ou organizacao"
+    echo "uid=$(id -u)"
+    echo "HOME=$(clean "${HOME-nao-definida}")"
+    if [ "${CLAUDE_CONFIG_DIR+x}" = x ]; then echo "CLAUDE_CONFIG_DIR=definida:$(clean "$CLAUDE_CONFIG_DIR")"; else echo "CLAUDE_CONFIG_DIR=nao-definida"; fi
+    echo "credenciais_home=$(clean "$HOME/.claude/.credentials.json") $(fmeta "$HOME/.claude/.credentials.json")"
+    [ "${CLAUDE_CONFIG_DIR+x}" != x ] || echo "credenciais_config_dir=$(clean "$CLAUDE_CONFIG_DIR/.credentials.json") $(fmeta "$CLAUDE_CONFIG_DIR/.credentials.json")"
+    echo "auth_status_rc=$(clean "$rc")"
+    echo "auth_status_campos=${js:-nenhum-campo-reconhecido}"
+    echo "item_cofre_claude=$(vault_item)"
+    echo "claude=$(clean "$cl") real=$(clean "${rp:-nao-resolvido}")"
+  } >@DIAG@.tmp && mv -f @DIAG@.tmp @DIAG@
+}
+o=$("$cl" auth status 2>&1 </dev/null); rc=$?
 lt=$(printf '%s\n' "$o" | grep -cE '"loggedIn"[[:space:]]*:[[:space:]]*true'); lf=$(printf '%s\n' "$o" | grep -cE '"loggedIn"[[:space:]]*:[[:space:]]*false')
+if [ "$rc" -ne 0 ] || [ "$lt" -eq 0 ] || [ "$lf" -ge 1 ]; then diag || :; fi
 if [ "$lf" -ge 1 ] && [ "$lt" -eq 0 ]; then say deslogado; exit 0; fi
 if [ "$rc" -ne 0 ] || [ "$lt" -eq 0 ] || [ "$lf" -ge 1 ]; then say "ilegivel rc=$rc"; exit 0; fi
 e=$(tmux -L @SOCK@ new-session -d -s @NAME@ -c @WORKDIR@ "sh @LAUNCH@" 2>&1) || { say "tmux: $(printf '%s' "$e" | head -n 1 | cut -c1-160)"; exit 0; }
@@ -656,7 +700,7 @@ def gui_files(cfg: Cfg, name: str) -> dict:
     """Os nomes do agente desta sessão: o label (prefixo fixo + nome) e os três arquivos em <remote_root>/run/ (fora de ~/Library/LaunchAgents)."""
     label = AGENT_PFX + name
     base = f"{cfg.root}/run/{label}"
-    return {"label": label, "plist": base + ".plist", "sh": base + ".agent.sh", "res": base + ".agent.res"}
+    return {"label": label, "plist": base + ".plist", "sh": base + ".agent.sh", "res": base + ".agent.res", "diag": base + ".agent.diag"}
 
 
 def gui_vals(cfg: Cfg) -> dict:
@@ -664,7 +708,7 @@ def gui_vals(cfg: Cfg) -> dict:
 
 
 def gui_agent_sh(cfg: Cfg, name: str, p: dict, lpath: str) -> str:
-    return subst(GUI_AGENT, {"@PATHX@": "".join(d + ":" for d in cfg.path_extra), "@RES@": q(gui_files(cfg, name)["res"]), "@CLAUDE@": q(cfg.claude_bin),
+    return subst(GUI_AGENT, {"@PATHX@": "".join(d + ":" for d in cfg.path_extra), "@RES@": q(gui_files(cfg, name)["res"]), "@DIAG@": q(gui_files(cfg, name)["diag"]), "@CLAUDE@": q(cfg.claude_bin),
                              "@SOCK@": q(cfg.socket), "@NAME@": q(name), "@WORKDIR@": q(p["work_dir"]), "@LAUNCH@": q(lpath), "@TGT@": tgt(name)})
 
 

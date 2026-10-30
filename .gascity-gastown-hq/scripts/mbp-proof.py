@@ -35,7 +35,7 @@ O QUE A PROVA CONFERE (os critérios do ga-w7qwl1.1; cada linha vira PASS/FAIL n
   (g) duas sessões abertas, parar a 1ª, a 2ª vive (ga-w7qwl1.2.4): depois que a sessão da prova sai, duas sessões LEVES (`sleep`; não pedem login de API) abrem pelo provider. O tmux do
       socket nasce dentro do job do agente da 1ª; a prova lê por ssh, direto no MBP, que parar a 1ª deixa o servidor, a 2ª sessão e o agente dela de pé e o agente da 1ª ausente, e que depois
       do stop da 2ª não sobra sessão, servidor nem agente. Não chama a API (não depende de o token estar válido, e roda mesmo quando (e) reprova por "Login expired"), MAS o agente do domínio gráfico só abre QUALQUER
-      sessão, até um `sleep`, com `claude auth status` = loggedIn true: com o login do MBP limpo o start é recusado (medido 30/10) e (f) e (g) ficam sem medir. Não roda se o Athos voltou (saída 4); se ele volta, ou o veredito do gate não se lê, DEPOIS do stop da sessão da prova e antes de (g), (g) não foi medida: a prova sai 4 INTERROMPIDA, nunca PASSOU.
+      sessão, até um `sleep`, com `claude auth status` = loggedIn true: com o login do MBP limpo o start é recusado (medido 30/10) e (f) e (g) ficam sem medir. Start recusado pelo provider: o log leva o texto INTEIRO da recusa, e com o login não ok ele traz o diag do agente (ga-w7qwl1.2.4.2; só metadados: HOME, CLAUDE_CONFIG_DIR, stat do arquivo de credencial, rc do cofre, binário), que diz ONDE o claude olhou e não achou login: cole o bloco na bead em vez de pedir /login às cegas. Não roda se o Athos voltou (saída 4); se ele volta, ou o veredito do gate não se lê, DEPOIS do stop da sessão da prova e antes de (g), (g) não foi medida: a prova sai 4 INTERROMPIDA, nunca PASSOU.
 
 O QUE TOCA NO MBP (tudo sob ~/gt-remote, e só o que está aqui) E O QUE DESFAZ
   install: gt-remote/bundle (o OUT do builder com --session-path, zdot/ incluído, igual ao que o verify confere), gt-remote/shim-bin (cliente do atalho; links bd, gc,
@@ -137,6 +137,14 @@ SECRET_RX = [r"ghp_[A-Za-z0-9]{30,}", r"gho_[A-Za-z0-9]{30,}", r"github_pat_[A-Z
 # o padrão genérico "chave": "valor" fica à parte: o manifest.json que o builder grava tem o campo `"token"` com o NOME do comando do hook (não é segredo) e este padrão o pega
 SECRET_KV = r"\"(?:password|passwd|secret|token|api_?key)\"\s*:\s*\"[^\"]{8,}\""
 SECRET_RX.append(SECRET_KV)
+REFUSAL_MAX = 4000  # o diag do agente tem ~12 linhas curtas; o que passa disto é lixo e é cortado, dizendo quanto
+
+
+def redact(text: str) -> str:
+    """Segunda camada (a primeira é o agente só escrever metadados): o que casa com os padrões de segredo da prova nunca vai ao log."""
+    for rx in SECRET_RX:
+        text = re.sub(rx, "<REDIGIDO>", text)
+    return text
 FORBIDDEN = [r"\.beads", r"\.dolt", r".*\.sqlite3?", r".*\.db", r".*\.csv", r".*\.xlsx?", r".*\.parquet", r"\.env(\..*)?", r"id_(?:rsa|ed25519|ecdsa|dsa)(?:\.pub)?",
              r".*\.pem", r".*\.p12", r".*\.pfx", r"credentials(?:\.json)?"]
 
@@ -841,6 +849,16 @@ class Proof:
     def out(p: subprocess.CompletedProcess) -> str:
         return (p.stdout + p.stderr).decode("utf-8", "replace").strip()
 
+    def refusal(self, what: str, p: subprocess.CompletedProcess) -> None:
+        """Start recusado pelo provider (ga-w7qwl1.2.4.2): o texto INTEIRO vai para o log, linha a linha, para colar na bead. Com o login do claude não ok no domínio gráfico ele traz o diag do agente (só metadados).
+        O `[:300]` do check cortaria o diag. Texto vazio é dito ("sem texto"), nunca omitido; passou do limite, o corte é dito com o tamanho original."""
+        txt = redact(self.out(p))
+        cut = f" (cortado em {REFUSAL_MAX} de {len(txt)} caracteres)" if len(txt) > REFUSAL_MAX else ""
+        self.say(f"RECUSA do provider em {what} (rc {p.returncode}); texto inteiro abaixo, com o diag do agente (só metadados) quando o login não está ok{cut}:")
+        for ln in (txt[:REFUSAL_MAX].splitlines() or ["(sem texto)"]):
+            self.say(f"  | {ln}")
+        self.say("FIM da recusa")
+
     def rsh(self, prog: str, stdin: bytes = b"", timeout: int = 120) -> subprocess.CompletedProcess:
         return rsh(f"export PATH={':'.join(PATHX)}:$PATH; {prog}", stdin, timeout)
 
@@ -982,7 +1000,10 @@ class Proof:
     def start(self) -> bool:
         self.started = True  # o provider marca o registro antes do ssh do start: se falhar no meio, o stop do fim limpa
         p = self.prov("start", SESSION, stdin=json.dumps(start_request(self.a.bead, self.a.model, self.run, self.wd)), timeout=120)
-        return self.check("start pelo provider (sessão de teste abre com o MBP livre)", p.returncode == 0, self.out(p)[:300])
+        ok = self.check("start pelo provider (sessão de teste abre com o MBP livre)", p.returncode == 0, self.out(p)[:300])
+        if not ok:
+            self.refusal("start pelo provider", p)
+        return ok
 
     def watch(self, want: str, what: str, secs: int) -> str:
         """Espera `want` na tela. Diálogo desconhecido ou sessão que morre antes = falha com a tela; nunca responde a diálogo."""
@@ -1175,6 +1196,7 @@ class Proof:
                 opened.append(n)  # o provider marca o registro antes do ssh do start: se falhar no meio, o stop do fim limpa
                 p = self.prov("start", n, stdin=json.dumps(light_request(n, self.wd)), timeout=120)
                 if not self.check(f"(g) start da sessão leve {n} pelo provider", p.returncode == 0, self.out(p)[:300]):
+                    self.refusal(f"(g) start da sessão leve {n}", p)
                     return
             s1 = snap()
             names1 = tmux_names(s1.get("tmux")) if "_erro" not in s1 else None

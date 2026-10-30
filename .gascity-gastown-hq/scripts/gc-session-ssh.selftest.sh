@@ -35,6 +35,10 @@
 #   o domínio; rc 1 ou label ainda carregado = o stop FALHA e a sessão fica no registro); o start recusa (exit 1, com a causa, nada aberto/carregado/em run/, evento 'refused') sem sessão gráfica, com o claude
 #   deslogado, ilegível, contraditório, travado, com plutil/bootstrap/tmux do agente falhando; varre antes de criar o novo as órfãs do prefixo (só arquivos, só no domínio, carregada+arquivos), poupa a de sessão
 #   viva e o que não é nosso, e se não prova a ausência de uma órfã não cria o agente novo; teto, nome repetido, sessão que morre logo e a regra de presença vêm antes/limpam; config de gui_agent/gui_wait_s/gui_proof_s.
+#   diag (ga-w7qwl1.2.4.2) — com o login NÃO ok (deslogado ou ilegível) o agente grava <label>.agent.diag com SÓ metadados (uid, HOME, CLAUDE_CONFIG_DIR, stat do arquivo de credencial sem lê-lo, 3 campos de uma lista
+#   fixa do `auth status`, rc do cofre por `security find-generic-password -s` SEM -w/-g, realpath do claude) ANTES do veredito; a recusa do start o imprime depois da causa e o agent_down o apaga; e-mail, organização, token e
+#   conteúdo de credencial plantados não chegam à mensagem, ao estado nem a run/; cofre sem resposta em 5 s, arquivo ausente / ilegível / fora do alcance do stat e diag que não deu para gravar são estados distintos; o caminho
+#   de sucesso e as recusas que não são de login não consultam o cofre.
 #   prep (ga-2hd02v.1.5.9) — o start grava a identidade git POR worktree e a confiança da pasta em ~/.claude.json do host, e qualquer falha derruba o start sem abrir nada: espelho BARE (sem
 #   extensions.worktreeConfig: o core.bare sai do config compartilhado e o commit do worktree continua funcionando, autor = a sessão), modo 600 e o resto do arquivo preservados, idempotente, uma identidade por
 #   worktree; pasta ausente / comum, ~/.claude.json ausente / ilegível (intacto, byte a byte) / com forma estranha, config.worktree travado, identidade que o git não lê de volta → exit 1 com o motivo, nenhum
@@ -57,7 +61,7 @@
 #   erro de ssh, flock, "tmux sem acesso" tolerado como "sem servidor", o `has` que engole o erro do tmux, melhor esforço da sessão
 #   ausente, o stop que não confere que a sessão sumiu, e o portão (sem a liberação, liberação de qualquer tipo, nome de teste frouxo ou sem
 #   âncora, sem conferir o sha do guarda, sem rodar o --selfcheck, script do host que sai 0, guarda irmão ilegível), e a regra de presença do MBP (grupo mbp: guarda de /Users/, validação da config, recusa/pausa/slot_cap, vigia, PATH extra,
-#   registro de sessões do list-running); a camada da sessão (grupo lay: o último --settings, o guarda e o settings do bundle no lugar do ~/.claude, o PATH da sessão na conferência, o padrão por host que dorme, a recusa do home num host que dorme, a validação do valor, a chave guard do dry-run); um mutante por trava, a conta sai no resumo da rodada; no grupo gui são 33 (gui: bootout/arquivos/prova de ausência do stop e da recusa, a varredura de órfãs e a ordem dela, o veredito do `auth status` (ilegível, rc, contraditório), plist fora de run/, label sem prefixo, KeepAlive, Aqua, validação da config, e os do start em duas chamadas: o piso da 2ª chamada, o rc 14 do abandonado contra o 15 do gui_agent, as funções do agente na 2ª; 5 do grupo abort: a marca <nome>.stop do stop, ga-0k82lw — o stop não a grava, o preparo do start não a apaga, a 2ª chamada não olha para ela, o stop não poda as marcas antigas (> 24 h), a poda sem limite de idade leva a marca recém-gravada; 20 do grupo lr: o cache nunca lido, start sem invalidar antes / depois, stop sem invalidar, gravação sem conferir a geração, prazo e relógio, geração e forma do arquivo, dry-run, list_cache_s em cinco formas, geração ilegível ou ausente, registro acertado com lista do cache, falha ao invalidar derrubando o start; 26 do grupo wt: wt-add/wt-rm do provider, o guarda DEPOIS do wt-add, o recolhimento só do que não perde trabalho e os nomes do engine; 9 do ambiente limpo da sessão, grupo mbp: session_env, ZDOTDIR, PATH explícito e claude absoluto, ga-w7qwl1.1.5).
+#   registro de sessões do list-running); a camada da sessão (grupo lay: o último --settings, o guarda e o settings do bundle no lugar do ~/.claude, o PATH da sessão na conferência, o padrão por host que dorme, a recusa do home num host que dorme, a validação do valor, a chave guard do dry-run); um mutante por trava, a conta sai no resumo da rodada; no grupo gui são 33 (gui: bootout/arquivos/prova de ausência do stop e da recusa, a varredura de órfãs e a ordem dela, o veredito do `auth status` (ilegível, rc, contraditório), plist fora de run/, label sem prefixo, KeepAlive, Aqua, validação da config, e os do start em duas chamadas: o piso da 2ª chamada, o rc 14 do abandonado contra o 15 do gui_agent, as funções do agente na 2ª, e o de sucesso que também grava diag; 15 do grupo diag: o diag nunca gravado, gravado depois do veredito, não impresso na recusa (e a recusa calada sobre o diag que não deu para gravar), ilegível sem diag, deixado em run/ pelo agent_down, com a saída crua do claude, com o conteúdo da credencial, o cofre com -w, sem prazo, qualquer rc lido como 'existe', CLAUDE_CONFIG_DIR ignorada, stat que falha lido como 'ausente', arquivo ilegível dito legível, valor sem sanitizar; 5 do grupo abort: a marca <nome>.stop do stop, ga-0k82lw — o stop não a grava, o preparo do start não a apaga, a 2ª chamada não olha para ela, o stop não poda as marcas antigas (> 24 h), a poda sem limite de idade leva a marca recém-gravada; 20 do grupo lr: o cache nunca lido, start sem invalidar antes / depois, stop sem invalidar, gravação sem conferir a geração, prazo e relógio, geração e forma do arquivo, dry-run, list_cache_s em cinco formas, geração ilegível ou ausente, registro acertado com lista do cache, falha ao invalidar derrubando o start; 26 do grupo wt: wt-add/wt-rm do provider, o guarda DEPOIS do wt-add, o recolhimento só do que não perde trabalho e os nomes do engine; 9 do ambiente limpo da sessão, grupo mbp: session_env, ZDOTDIR, PATH explícito e claude absoluto, ga-w7qwl1.1.5).
 #   Mais: contra um stub que só sai 0, quase tudo falha.
 # VARIÁVEIS: GCSSH_UNDER_TEST (script a testar) · GCSSH_ONLY (grupos separados por vírgula) · GCSSH_NO_MUTANTS=1 · GCSSH_MUTANTS_ONLY=<grupo> (pula os casos e roda só os mutantes desse grupo) · GCSSH_SHARD=K/N (pula os casos e roda só os mutantes de ordem ≡ K mod N; K e N decimais sem sinal nem zero à esquerda, N de 1 a 9999, K de 0 a N-1, senão exit 2; o stub só no K=0: a campanha de mutantes em N processos). Rodar ZERO casos e ZERO mutantes (grupo que não existe em GCSSH_ONLY/GCSSH_MUTANTS_ONLY, fatia K/N sem mutante nenhum) FALHA com 'NADA RODOU' (exit 1), nunca sai como '0/0 ok'; o grupo `shard` prova isso
 set -u
@@ -380,7 +384,7 @@ setup_gui() {
   mkdir -p "$T/extra"; local py rt; py=$(command -v python3); rt=$(command -v tmux)
   cat > "$T/extra/launchctl" <<'EOF'
 #!/bin/sh
-LC=@T@/lc; MODE=$(cat @T@/lc.mode 2>/dev/null)
+LC=@T@/lc; MODE=$(cat @T@/lc.mode 2>/dev/null); CD=$(cat @T@/lc.cfgdir 2>/dev/null)
 printf '%s\n' "launchctl $*" >> @T@/lc.log
 case "$1" in
 print)
@@ -400,7 +404,7 @@ bootstrap)
   [ ! -e "$LC/loaded/$label" ] || { echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; }
   mkdir -p "$LC/loaded"; echo "$3" > "$LC/loaded/$label"
   if [ "$(printf '%s' "$json" | jq -r .RunAtLoad)" = true ]; then
-    env -i HOME="$HOME" PATH=/usr/bin:/bin TMUX_TMPDIR="$TMUX_TMPDIR" FAKE_LAUNCHD=1 @PY@ -c 'import os,sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' "$a1" "$a2" </dev/null >/dev/null 2>&1 &
+    env -i HOME="$HOME" PATH=/usr/bin:/bin TMUX_TMPDIR="$TMUX_TMPDIR" FAKE_LAUNCHD=1 ${CD:+"CLAUDE_CONFIG_DIR=$CD"} @PY@ -c 'import os,sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' "$a1" "$a2" </dev/null >/dev/null 2>&1 &
     echo $! > "$LC/loaded/$label.pid"
   fi
   exit 0;;
@@ -422,6 +426,7 @@ case "$m" in
   in)      if [ "${FAKE_LAUNCHD:-}" = 1 ]; then printf '{\n  "loggedIn": true,\n  "authMethod": "claude.ai"\n}\n'; exit 0; else printf '{\n  "loggedIn": false\n}\n'; exit 1; fi;;
   out)     printf '{\n  "loggedIn": false\n}\n'; exit 1;;
   out0)    printf '{\n  "loggedIn": false\n}\n'; exit 0;;
+  outpii)  printf '{\n  "loggedIn": false,\n  "authMethod": "claude.ai",\n  "email": "leak@example.invalid",\n  "orgName": "LeakOrg",\n  "accessToken": "sk-ant-oat01-LEAKEDTOKEN0123456789"\n}\n'; exit 1;;
   truerc)  printf '{\n  "loggedIn": true\n}\n'; exit 1;;
   garbage) echo banana; exit 0;;
   both)    printf '"loggedIn": true\n"loggedIn": false\n'; exit 0;;
@@ -433,13 +438,19 @@ exit 0
 EOF
   printf '#!/bin/sh\ncase " $* " in *" new-session "*) [ ! -e @T@/tmux.fail ] || { echo "create session failed: boom" >&2; exit 1; };; esac\nexec @RT@ "$@"\n' > "$T/extra/tmux"
   printf '#!/bin/sh\n[ ! -e @T@/plutil.fail ] || { echo "plist: Invalid" >&2; exit 1; }\n[ -x /usr/bin/plutil ] || exit 0\nexec /usr/bin/plutil "$@"\n' > "$T/extra/plutil"
-  printf '#!/bin/sh\necho "security $*" >> @T@/security.log\nexit 1\n' > "$T/extra/security"
+  cat > "$T/extra/security" <<'EOF'
+#!/bin/sh
+echo "security $*" >> @T@/security.log
+[ ! -s @T@/security.sleep ] || sleep "$(cat @T@/security.sleep)"
+[ ! -s @T@/security.rc ] || exit "$(cat @T@/security.rc)"
+exit 1
+EOF
   sed -i.bak -e "s|@T@|$T|g" -e "s|@PY@|$py|g" -e "s|@RT@|$rt|g" "$T/extra/launchctl" "$T/claude" "$T/extra/tmux" "$T/extra/plutil" "$T/extra/security"; rm -f "$T"/extra/*.bak "$T"/claude.bak
   chmod +x "$T/extra/launchctl" "$T/claude" "$T/extra/tmux" "$T/extra/plutil" "$T/extra/security"; lcreset
 }
 lcreset() {  # o domínio gráfico existe e está vazio (agentes de antes são mortos); claude logado; nenhuma falha ligada
   local f; for f in "$T"/lc/loaded/*.pid; do [ -e "$f" ] && kill -s TERM -- "-$(cat "$f")" 2>/dev/null; done
-  find "$T/lc" -mindepth 1 -delete 2>/dev/null; mkdir -p "$T/lc/gui" "$T/lc/loaded"; : > "$T/lc.log"; : > "$T/claude.log"; : > "$T/security.log"; echo in > "$T/auth.mode"; rm -f "$T/lc.mode" "$T/tmux.fail" "$T/plutil.fail"
+  find "$T/lc" -mindepth 1 -delete 2>/dev/null; mkdir -p "$T/lc/gui" "$T/lc/loaded"; : > "$T/lc.log"; : > "$T/claude.log"; : > "$T/security.log"; echo in > "$T/auth.mode"; rm -f "$T/lc.mode" "$T/tmux.fail" "$T/plutil.fail" "$T/security.rc" "$T/security.sleep" "$T/lc.cfgdir"
 }
 zdot_put() {  # zdot_put PATH — os 4 arquivos que o remote-bundle-build.py --session-path instala em <raiz>/zdot (a linha do PATH é a que o provider confere)
   mkdir -p "$RR/zdot" "$T/shim-bin"; for f in .zshenv .zprofile .zshrc env.sh; do printf "export PATH='%s'\n" "$1" > "$RR/zdot/$f"; done
@@ -583,11 +594,11 @@ nload() { ls "$T/lc/loaded" 2>/dev/null | grep -vc '\.pid$'; }  # quantos labels
 nrun() { ls "$RR/run" 2>/dev/null | grep -c '^com\.gascity\.remote-session\.'; }  # quantos arquivos de agente sobram em <raiz>/run
 evt() { jq -e --arg e "$1" --arg s "$2" 'select(.event==$e and .session==$s)' "$T/state/m/events.jsonl" >/dev/null 2>&1; }
 lcline() { grep -n "$1" "$T/lc.log" | tail -1 | cut -d: -f1; }  # número da ÚLTIMA linha do log do launchctl que casa (vazio = nunca)
-gui_refuse() {  # gui_refuse DESCRIÇÃO FRAGMENTO-DO-ERRO [auth.mode [lc.mode [arquivo-de-falha]]] — start recusado: exit 1 com a causa, nada aberto, nada carregado, nada em run/, evento 'refused', Keychain intocado, claude só 'auth status' no gui
+gui_refuse() {  # gui_refuse DESCRIÇÃO FRAGMENTO-DO-ERRO [auth.mode [lc.mode [arquivo-de-falha]]] — start recusado: exit 1 com a causa, nada aberto, nada carregado, nada em run/, evento 'refused', Keychain só com a consulta de atributos (login não ok) e nunca outra coisa, claude só 'auth status' no gui
   lcreset; [ -z "${3:-}" ] || echo "$3" > "$T/auth.mode"; [ -z "${4:-}" ] || echo "$4" > "$T/lc.mode"; [ -z "${5:-}" ] || : > "$T/$5"
   mkdir -p "$T/state/m"; : > "$T/state/m/events.jsonl"; fresh
   pv start w-remote-m-9 < <(req "$HOLD")
-  [ $RC = 1 ] && has "$T/err" "$2" && [ "$(count x "${SOCK}m")" = 0 ] && [ "$(nload)" = 0 ] && [ "$(nrun)" = 0 ] && [ ! -e "$T/state/m/running/w-remote-m-9" ] && [ ! -s "$T/security.log" ] \
+  [ $RC = 1 ] && has "$T/err" "$2" && [ "$(count x "${SOCK}m")" = 0 ] && [ "$(nload)" = 0 ] && [ "$(nrun)" = 0 ] && [ ! -e "$T/state/m/running/w-remote-m-9" ] && ! grep -qvxF 'security find-generic-password -s Claude Code-credentials' "$T/security.log" \
     && ! grep -qv '^auth status FAKE_LAUNCHD=1$' "$T/claude.log" && jq -e 'select(.event=="refused" and .session=="w-remote-m-9" and (.reason|startswith("gui_agent:")))' "$T/state/m/events.jsonl" >/dev/null 2>&1
   ok $? "gui: $1 → start recusado (exit 1) com a causa, nada aberto/carregado/em run/, evento 'refused' (rc=$RC $(head -c 140 "$T/err"))"
 }
@@ -603,7 +614,9 @@ g_gui() {
   grep -q '<key>RunAtLoad</key><true/>' "$T/plist.out" && grep -q '<key>KeepAlive</key><false/>' "$T/plist.out" && grep -q '<string>Aqua</string>' "$T/plist.out"; ok $? "gui: o plist roda ao carregar, NÃO se reergue sozinho (KeepAlive false) e só carrega na sessão Aqua"
   [ "$(jq -r '.gui_agent.bootstrap | join(" ")' "$T/out")" = "launchctl bootstrap gui/<uid> $RR/run/${L}w-remote-m-0.plist" ]; ok $? "gui: o carregamento é um bootstrap no domínio gui/<uid> do plist que está em run/"
   jq -r '.gui_agent.script[]' "$T/out" > "$T/agent.out"
-  [ "$(grep -cF "$T/claude" "$T/agent.out")" = 1 ] && grep -qF "$T/claude auth status " "$T/agent.out" && ! grep -qiE 'security|keychain|setup-token|add-generic|logout|auth login|api[_-]?key|token' "$T/agent.out"; ok $? "gui: o agente chama o claude uma vez, só para 'auth status', e não toca Keychain nem credencial (5)"
+  [ "$(grep -cF "$T/claude" "$T/agent.out")" = 1 ] && grep -qxF "cl=$T/claude" "$T/agent.out" && [ "$(grep -cE '(^|[;&|(] *)"\$cl"' "$T/agent.out")" = 1 ] && grep -qF '$("$cl" auth status ' "$T/agent.out" \
+    && ! grep -qiE 'keychain|setup-token|add-generic|delete-generic|logout|auth login|api[_-]?key|token' "$T/agent.out"; ok $? "gui: o agente só EXECUTA o claude uma vez, para 'auth status' (o caminho dele aparece uma vez, em cl=, e o resto só o resolve) e nada nele mexe em credencial (5)"
+  sl=$(grep 'security' "$T/agent.out"); [ "$(printf '%s\n' "$sl" | grep -c .)" = 1 ] && printf '%s' "$sl" | grep -qF 'security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1;' && ! printf '%s' "$sl" | grep -qE ' -[a-zA-Z]*[wg]( |$)'; ok $? "gui: a ÚNICA menção a 'security' é 'find-generic-password -s' SEM -w/-g (só atributos: existe/não existe), com a saída descartada (ga-w7qwl1.2.4.2)"
   grep -qF "new-session -d -s w-remote-m-0" "$T/agent.out" && grep -qF "sh $RR/run/w-remote-m-0.sh" "$T/agent.out" && jq -r '.launcher[]' "$T/out" | grep -q 'taskpolicy -b -p'; ok $? "gui: a sessão que o agente abre é o MESMO lançador, com o vigia de prioridade (o agente não contorna a regra do MBP) (7)"
   nossh; ok $? "gui: o dry-run não conecta"
   pv --dry-run start w-1 < <(req "claude --x"); [ $RC = 0 ] && [ "$(jq -r .gui_agent "$T/out")" = null ]; ok $? "gui: host sem gui_agent (o servidor Linux) não ganha agente"
@@ -616,8 +629,8 @@ g_gui() {
   [ -e "$T/lc/loaded/${L}w-remote-m-1" ] && [ -f "$RR/run/${L}w-remote-m-1.plist" ] && [ -f "$RR/run/${L}w-remote-m-1.agent.sh" ]; ok $? "gui: o agente está carregado e o plist e o script ficam em <raiz>/run"
   grep -qx "launchctl bootstrap gui/$(id -u) $RR/run/${L}w-remote-m-1.plist" "$T/lc.log"; ok $? "gui: o bootstrap foi no domínio gui/<uid> com o plist de run/"
   [ ! -e "$RH/Library/LaunchAgents" ] && [ -z "$(find "$T" -name "${L}*" -not -path "$T/lc/*" -not -path "$RR/run/*" 2>/dev/null)" ]; ok $? "gui: nada foi gravado em ~/Library/LaunchAgents nem fora de run/ (1)"
-  [ -s "$T/claude.log" ] && ! grep -qv '^auth status FAKE_LAUNCHD=1$' "$T/claude.log" && [ ! -s "$T/security.log" ]; ok $? "gui: o claude só rodou 'auth status', sempre dentro do domínio gráfico, e o Keychain não foi tocado (5)"
-  [ "$(cat "$RR/run/${L}w-remote-m-1.agent.res" 2>/dev/null)" = ok ] && ! grep -rqs authMethod "$RR/run" "$T/state" "$T/err"; ok $? "gui: a saída do 'auth status' (e-mail, organização) não é gravada em lugar nenhum: só o veredito 'ok'"
+  [ -s "$T/claude.log" ] && ! grep -qv '^auth status FAKE_LAUNCHD=1$' "$T/claude.log" && [ ! -s "$T/security.log" ] && [ ! -e "$RR/run/${L}w-remote-m-1.agent.diag" ]; ok $? "gui: o claude só rodou 'auth status', sempre dentro do domínio gráfico; com o login ok o Keychain não foi tocado e nenhum diag foi gravado (5)"
+  [ "$(cat "$RR/run/${L}w-remote-m-1.agent.res" 2>/dev/null)" = ok ] && ! grep -rqs 'claude\.ai' "$RR/run" "$T/state" "$T/err"; ok $? "gui: a saída do 'auth status' (e-mail, organização) não é gravada em lugar nenhum: só o veredito 'ok'"
   evt started w-remote-m-1; ok $? "gui: o start deixa a linha 'started' no events.jsonl"
   # --- 3: o stop faz bootout, apaga e PROVA a ausência ---
   : > "$T/lc.log"; pv stop w-remote-m-1 </dev/null; rc=$RC
@@ -653,14 +666,14 @@ g_gui() {
   rm -f "$T/lc.mode"; echo in > "$T/auth.mode"
   pv start w-remote-m-2 < <(req "$HOLD"); pv start w-remote-m-1 < <(req "$HOLD")
   tmux -L "${SOCK}m" kill-session -t =w-remote-m-1  # a sessão some por fora: o agente fica carregado e os arquivos em run/ (o stop nunca rodou)
-  printf x > "$RR/run/${L}w-remote-m-5.plist"; printf x > "$RR/run/${L}w-remote-m-5.agent.sh"  # só arquivos (start que morreu no meio)
+  printf x > "$RR/run/${L}w-remote-m-5.plist"; printf x > "$RR/run/${L}w-remote-m-5.agent.sh"; printf x > "$RR/run/${L}w-remote-m-5.agent.diag"; printf x > "$RR/run/${L}w-remote-m-5.agent.diag.sec"  # só arquivos (start que morreu no meio, com o diag e o marcador do cofre)
   echo "$RR/run/${L}w-remote-m-6.plist" > "$T/lc/loaded/${L}w-remote-m-6"  # só no domínio (stop que apagou os arquivos mas não derrubou)
   echo x > "$T/lc/loaded/com.apple.fake"; printf x > "$RR/run/outro.plist"; printf x > "$RR/run/${L}w-remote-m-7.plist.bak"  # NÃO são nossos: outro prefixo, outro nome, outro sufixo
   [ -e "$T/lc/loaded/${L}w-remote-m-1" ] && [ -f "$RR/run/${L}w-remote-m-1.plist" ] && [ -f "$RR/run/${L}w-remote-m-1.agent.sh" ] && [ -f "$RR/run/${L}w-remote-m-5.plist" ] && [ -e "$T/lc/loaded/${L}w-remote-m-6" ] && [ -e "$T/lc/loaded/com.apple.fake" ]; ok $? "gui: precondição da varredura — as órfãs (1 carregada+arquivos, 5 só arquivos, 6 só no domínio) e o que não é nosso estão montados ANTES do start; sem isso os casos abaixo passariam no vazio"
   : > "$T/lc.log"; pv start w-remote-m-3 < <(req "$HOLD"); ok $RC "gui: start com órfãs pendentes abre (rc=$RC $(head -c 200 "$T/err"))"
   [ ! -e "$T/lc/loaded/${L}w-remote-m-9" ]; ok $? "gui: a sobra da recusa acima (carregada, sem arquivos) também foi varrida, já pelo start seguinte (4)"
   [ ! -e "$T/lc/loaded/${L}w-remote-m-1" ] && [ ! -e "$RR/run/${L}w-remote-m-1.plist" ] && [ ! -e "$RR/run/${L}w-remote-m-1.agent.sh" ] && [ ! -e "$RR/run/${L}w-remote-m-1.agent.res" ]; ok $? "gui: órfã de sessão que sumiu por fora (carregada + arquivos) é varrida (4)"
-  [ ! -e "$RR/run/${L}w-remote-m-5.plist" ] && [ ! -e "$RR/run/${L}w-remote-m-5.agent.sh" ]; ok $? "gui: órfã que só tem arquivos em run/ é varrida (4)"
+  [ ! -e "$RR/run/${L}w-remote-m-5.plist" ] && [ ! -e "$RR/run/${L}w-remote-m-5.agent.sh" ] && [ ! -e "$RR/run/${L}w-remote-m-5.agent.diag" ] && [ ! -e "$RR/run/${L}w-remote-m-5.agent.diag.sec" ]; ok $? "gui: órfã que só tem arquivos em run/ é varrida, com o diag e o marcador do cofre (4)"
   [ ! -e "$T/lc/loaded/${L}w-remote-m-6" ]; ok $? "gui: órfã que só está carregada no domínio é varrida (4)"
   [ -e "$T/lc/loaded/${L}w-remote-m-2" ] && [ -f "$RR/run/${L}w-remote-m-2.plist" ] && ! grep -q "^launchctl bootout .*${L}w-remote-m-2\$" "$T/lc.log"; ok $? "gui: o agente de uma sessão VIVA não é tocado pela varredura (4)"
   [ -e "$T/lc/loaded/com.apple.fake" ] && [ -f "$RR/run/outro.plist" ] && [ -e "$RR/run/${L}w-remote-m-7.plist.bak" ] && ! grep -q 'decoy' "$T/lc.log"; ok $? "gui: o que não é do prefixo (ou não tem a forma de agente nosso) fica: a varredura não é faxina geral (4)"
@@ -764,6 +777,61 @@ tree_sig() {  # tree_sig PASTA → assinatura (caminhos + conteúdo) da árvore;
   ( cd "$1" && find . | LC_ALL=C sort | while IFS= read -r f; do if [ -f "$f" ]; then printf '%s %s\n' "$f" "$(cksum < "$f")"; else printf '%s dir\n' "$f"; fi; done )
 }
 mzero() { [ "$(count x "${SOCK}m")" = 0 ] && [ ! -e "$RR/run/$1.sh" ]; }  # mzero SESSÃO: nada aberto no host m e nenhum lançador deixado
+# ---------- diag: com o login NÃO ok o agente do domínio gráfico grava <label>.agent.diag (SÓ metadados) e a recusa o imprime (ga-w7qwl1.2.4.2) ----------
+# Medido em 30/10 no MBP: `claude auth status` por ssh = loggedIn true e dentro do agente = false, e a prova só sabia pedir /login às cegas. O diag diz ONDE o claude olhou (HOME, CLAUDE_CONFIG_DIR, o arquivo de
+# credencial por stat, o cofre por rc, o binário) sem ler nem imprimir credencial. Mesmos launchd/claude/security falsos do grupo gui; o claude falso `outpii` solta e-mail, organização e um token plantados.
+g_diag() {
+  setup_mbp; cfgm '{"gui_proof_s":2}'; mode livre; fresh; local L=com.gascity.remote-session. credn real
+  mkdir -p "$T/state/m/running"; find "$T/state/m/running" -mindepth 1 -delete; : > "$T/state/m/events.jsonl"; : > "$T/state/m/session-ssh.log"
+  mkdir -p "$T/home/.claude"; printf '{"claudeAiOauth":{"accessToken":"sk-ant-oat01-PLANTEDSECRET0123456789"}}' > "$T/home/.claude/.credentials.json"
+  credn=$(wc -c < "$T/home/.claude/.credentials.json" | tr -d ' '); real=$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$T/claude")
+  leak() { ! grep -rqsE 'sk-ant|PLANTEDSECRET|LEAKEDTOKEN|leak@example|LeakOrg' "$T/err" "$T/state" "$RR" "$T/claude.log" "$T/security.log" "$T/lc.log" "$T/ssh.log"; }
+  dstart() {  # dstart AUTH.MODE [security.rc [security.sleep [CLAUDE_CONFIG_DIR]]] → start recusado; o diag que a recusa imprimiu está em $T/err
+    lcreset; echo "$1" > "$T/auth.mode"; [ -z "${2:-}" ] || echo "$2" > "$T/security.rc"; [ -z "${3:-}" ] || echo "$3" > "$T/security.sleep"; [ -z "${4:-}" ] || printf '%s' "$4" > "$T/lc.cfgdir"
+    mkdir -p "$T/state/m"; : > "$T/state/m/events.jsonl"; fresh; pv start w-remote-m-9 < <(req "$HOLD")
+  }
+  # --- o diag completo, com e-mail, organização e token na saída do claude e no arquivo de credencial: nada disso sai; o veredito só vem DEPOIS do diag (o cofre demora 1 s) ---
+  dstart outpii 44 1
+  [ $RC = 1 ] && has "$T/err" 'DESLOGADO' && has "$T/err" 'diagnostico do agente (so metadados):' && has "$T/err" "uid=$(id -u)" && has "$T/err" "HOME=$T/home" && has "$T/err" 'CLAUDE_CONFIG_DIR=nao-definida' \
+    && has "$T/err" "credenciais_home=$T/home/.claude/.credentials.json existe=sim legivel=sim tamanho_bytes=$credn" && has "$T/err" 'auth_status_rc=1' && has "$T/err" 'auth_status_campos="loggedIn":false "authMethod":"claude.ai"' \
+    && has "$T/err" 'item_cofre_claude=ausente (rc=44)' && has "$T/err" "claude=$T/claude real=$real"
+  ok $? "diag: login deslogado → a recusa traz a causa E o diag (uid, HOME, CLAUDE_CONFIG_DIR, stat do arquivo de credencial, campos do auth status, cofre, binário), gravado ANTES do veredito (rc=$RC $(head -c 160 "$T/err"))"
+  head -n 1 "$T/err" | grep -q 'DESLOGADO'; ok $? "diag: a CAUSA vem primeiro (o evento 'refused' guarda os 200 primeiros caracteres: o diag não pode empurrar a causa para fora)"
+  jq -e 'select(.event=="refused" and .session=="w-remote-m-9" and (.reason|startswith("gui_agent: start recusado")) and (.reason|contains("DESLOGADO")))' "$T/state/m/events.jsonl" >/dev/null 2>&1; ok $? "diag: o evento 'refused' continua começando pela causa"
+  leak && ! has "$T/err" 'authMethod": "' && ! has "$T/err" 'accessToken'; ok $? "diag: nenhum e-mail, organização, token nem conteúdo do arquivo de credencial chega à mensagem, ao estado, ao log nem a run/ (grep do plantado = 0)"
+  [ "$(grep -c . "$T/security.log")" = 1 ] && grep -qxF 'security find-generic-password -s Claude Code-credentials' "$T/security.log"; ok $? "diag: o cofre recebeu UMA consulta, 'find-generic-password -s' SEM -w/-g (só existe/não existe)"
+  [ "$(nrun)" = 0 ] && [ "$(nload)" = 0 ] && [ ! -e "$T/state/m/running/w-remote-m-9" ]; ok $? "diag: depois da recusa o diag e o marcador do cofre não sobram em run/ e o agente não fica carregado"
+  # --- o cofre tem três respostas, e "não sei" não vira "ausente" ---
+  dstart out 0; [ $RC = 1 ] && has "$T/err" 'item_cofre_claude=existe (rc=0)'; ok $? "diag: cofre com o item (rc 0) → 'existe' (rc=$RC)"
+  dstart out 36; [ $RC = 1 ] && has "$T/err" 'item_cofre_claude=nao-sei (rc=36)' && ! has "$T/err" 'item_cofre_claude=ausente'; ok $? "diag: rc do cofre que não é 0 nem 44 (36 = interação não permitida) → 'nao-sei', NUNCA 'ausente' (rc=$RC)"
+  cfgm '{"gui_proof_s":2,"gui_wait_s":12}'; dstart out "" 10
+  [ $RC = 1 ] && has "$T/err" 'DESLOGADO' && has "$T/err" 'item_cofre_claude=nao-sei (sem resposta em 5s)' && ! has "$T/err" 'não respondeu em'; ok $? "diag: cofre que não responde (diálogo esperando alguém) tem prazo de 5 s: o veredito sai, e o diag diz 'sem resposta', não 'ausente' (rc=$RC $(head -c 200 "$T/err"))"
+  cfgm '{"gui_proof_s":2}'
+  # --- CLAUDE_CONFIG_DIR: definida ou não, e o caminho só com caracteres de caminho ---
+  dstart out 44 "" "$T/cfg dir;pwn"
+  [ $RC = 1 ] && has "$T/err" "CLAUDE_CONFIG_DIR=definida:$T/cfg dirpwn" && has "$T/err" "credenciais_config_dir=$T/cfg dirpwn/.credentials.json existe=nao" && has "$T/err" 'credenciais_home='; ok $? "diag: CLAUDE_CONFIG_DIR definida aparece (e o arquivo dentro dela é olhado à parte); o que não é caractere de caminho sai do valor (rc=$RC $(head -c 200 "$T/err"))"
+  # --- o arquivo de credencial: tem / não tem / não consegui olhar (três estados), sempre por stat, sem lê-lo ---
+  mv "$T/home/.claude/.credentials.json" "$T/cred.keep"; dstart out 44
+  [ $RC = 1 ] && has "$T/err" "credenciais_home=$T/home/.claude/.credentials.json existe=nao" && ! has "$T/err" 'existe=nao-sei'; ok $? "diag: arquivo de credencial ausente → 'existe=nao' (rc=$RC)"
+  mv "$T/cred.keep" "$T/home/.claude/.credentials.json"
+  if [ "$(id -u)" != 0 ]; then
+    chmod 000 "$T/home/.claude/.credentials.json"; dstart out 44; chmod 600 "$T/home/.claude/.credentials.json"
+    [ $RC = 1 ] && has "$T/err" "existe=sim legivel=nao tamanho_bytes=$credn"; ok $? "diag: arquivo que existe mas ESTE processo não lê → 'existe=sim legivel=nao' (rc=$RC)"
+    chmod 000 "$T/home/.claude"; dstart out 44; chmod 700 "$T/home/.claude"
+    [ $RC = 1 ] && has "$T/err" 'existe=nao-sei (Permission denied)' && ! grep -qE 'credenciais_home=.* existe=nao$' "$T/err"; ok $? "diag: pasta que o stat não alcança (sem permissão) → 'existe=nao-sei', NUNCA 'existe=nao' (rc=$RC $(head -c 200 "$T/err"))"
+  fi
+  # --- login ilegível também ganha o diag, sem a saída crua do claude ---
+  dstart garbage; [ $RC = 1 ] && has "$T/err" 'não consegui ler o login' && has "$T/err" 'auth_status_rc=0' && has "$T/err" 'auth_status_campos=nenhum-campo-reconhecido' && ! has "$T/err" banana; ok $? "diag: auth status ilegível → diag com 'nenhum-campo-reconhecido' (não é 'loggedIn false') e sem a saída crua (rc=$RC)"
+  dstart truerc; [ $RC = 1 ] && has "$T/err" 'auth_status_rc=1' && has "$T/err" 'auth_status_campos="loggedIn":true'; ok $? "diag: loggedIn true com rc 1 (em que não se confia) → diag mostra os dois sinais (rc=$RC)"
+  # --- o diag que não deu para gravar é um 3º estado, dito (e o veredito sai mesmo assim) ---
+  mkdir -p "$RR/run/${L}w-remote-m-9.agent.diag.tmp"; dstart out 44; rmdir "$RR/run/${L}w-remote-m-9.agent.diag.tmp"
+  [ $RC = 1 ] && has "$T/err" 'DESLOGADO' && has "$T/err" 'diagnostico do agente: nao foi gravado' && ! has "$T/err" 'uid='; ok $? "diag: diag que não pôde ser gravado → a recusa continua com a causa e diz 'nao foi gravado' (não fica calada, nem imprime lixo) (rc=$RC)"
+  # --- o que NÃO é recusa de login não consulta o cofre nem imprime diag ---
+  gui_refuse "tmux do agente que não abre a sessão" 'o tmux do agente não abriu a sessão' "" "" tmux.fail; [ ! -s "$T/security.log" ] && ! has "$T/err" 'diagnostico do agente'; ok $? "diag: recusa que não é de login (o tmux do agente) NÃO consulta o cofre e não imprime diag"
+  gui_refuse "plutil reprova o plist" 'plutil -lint' "" "" plutil.fail; [ ! -s "$T/security.log" ] && ! has "$T/err" 'diagnostico do agente'; ok $? "diag: plutil que reprova o plist NÃO consulta o cofre e não imprime diag"
+  rm -f "$T/home/.claude/.credentials.json"; rmdir "$T/home/.claude" 2>/dev/null; lcreset
+}
+
 g_lay() {
   local st="$RR/city/settings.json" gf="$RR/guard/$GUARDF" h ln d expr sig w c nm v n1=dog-remote-m-gajoin01 pool
   setup_mbp; cfgm; mode livre
@@ -1383,7 +1451,7 @@ g_shard() {  # o filtro do PRÓPRIO selftest (GCSSH_SHARD, GCSSH_ONLY, GCSSH_MUT
   [ $rr = 0 ] && [ "$(printf '%s\n' "$oo" | grep -c '^ok   mutante .* pego')" = 1 ] && printf '%s\n' "$oo" | grep -q '^== final: 1/1 ok ==$' && ! printf '%s\n' "$oo" | grep -q 'NADA RODOU'; ok $? "shard: (controle) GCSSH_SHARD=1/9999 roda exatamente 1 mutante, pego, e sai 0 (rc=$rr: $(printf '%s' "$oo" | tail -c 110))"
 }
 
-all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group lay && g_lay; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group gui && g_gui; group acct && g_acct; group prof && g_prof; group lr && g_lr; group lrd && g_lrd; group abort && g_abort; group shard && g_shard; return 0; }
+all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group lay && g_lay; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group gui && g_gui; group diag && g_diag; group acct && g_acct; group prof && g_prof; group lr && g_lr; group lrd && g_lrd; group abort && g_abort; group shard && g_shard; return 0; }
 
 if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
 # GCSSH_SHARD=K/N: dois decimais canônicos (sem sinal, sem espaço, sem zero à esquerda: `[ 3 = 03 ]` é falso e $((mn % 010)) é octal, então a fatia ficaria vazia ou trocada sem aviso), N de 1 a 9999 e K de 0 a N-1
@@ -1616,10 +1684,27 @@ case "$shn" in [1-9]*) ;; *) shard_bad;; esac
   mutant gui "2ª chamada sem o piso do veredito do agente (o ssh é cortado com o agente subindo)" 's/max(OPEN_MIN + (cfg.gui_wait if cfg.gui else 0), int(/max(OPEN_MIN, int(/'
   mutant gui "start abandonado lido como recusa do domínio gráfico (o rc 14 vira o do gui_agent)" 's/^EX_GUI = 15/EX_GUI = 14/;s/exit 15/exit 14/g'
   mutant gui "2ª chamada sem as funções do agente (agent_down e o U do gui/<uid> não existem lá)" 's/\.replace("@AGENT1@", agent1)/.replace("@AGENT1@", "")/'
+  # diag (ga-w7qwl1.2.4.2): cada guarda do diagnóstico de login removida TEM que reprovar o grupo diag (ou o gui, nos casos do caminho de sucesso)
+  mutant diag "diag nunca gravado (o agente só dá o veredito)" 's/then diag || :; fi$/then :; fi/'
+  mutant diag "veredito publicado ANTES do diag (a recusa lê o diag cedo demais)" 's/^if \[ "\$rc" -ne 0 \] || \[ "\$lt" -eq 0 \] || \[ "\$lf" -ge 1 \]; then diag || :; fi$/:/;s/then say deslogado; exit 0; fi$/then say deslogado; diag; exit 0; fi/'
+  mutant diag "a recusa não imprime o diag" 's/head -c 2000 @DIAG@ >&2;/:;/'
+  mutant diag "a recusa de login não diz que o diag não foi gravado" 's/else echo "diagnostico do agente: nao foi gravado" >&2; fi;; esac/else :; fi;; esac/'
+  mutant diag "login ilegível não ganha o diag na recusa" 's/case "\$gv" in deslogado|ilegivel\*)/case "$gv" in deslogado)/'
+  mutant diag "agent_down deixa o diag em run/" 's/ @RUN@\/"\$1"\.agent\.diag\*$//'
+  mutant diag "diag com a saída crua do auth status (e-mail, organização, token)" 's/echo "auth_status_campos=\${js:-nenhum-campo-reconhecido}"/echo "auth_status_campos=$o"/'
+  mutant diag "diag com o conteúdo do arquivo de credencial" 's/tamanho_bytes=\$(clean "\$m")/tamanho_bytes=$(clean "$m") $(cat "$1")/'
+  mutant diag "consulta ao cofre com -w (lê o segredo)" 's/security find-generic-password -s/security find-generic-password -w -s/'
+  mutant diag "consulta ao cofre sem prazo (diálogo esperando alguém trava o agente)" 's/\[ "\$si" -lt 5 \]/[ "$si" -lt 500 ]/'
+  mutant diag "qualquer rc do cofre vira 'existe'" 's/0) echo "existe (rc=0)";; 44)/*) echo "existe (rc=0)";; 44)/'
+  mutant diag "CLAUDE_CONFIG_DIR definida lida como não definida" 's/if \[ "\${CLAUDE_CONFIG_DIR+x}" = x \]; then echo "CLAUDE_CONFIG_DIR=definida/if false; then echo "CLAUDE_CONFIG_DIR=definida/'
+  mutant diag "stat que não alcança o arquivo lido como 'existe=nao'" 's/\*) echo "existe=nao-sei (\$(clean "\${m##\*: }"))";; esac/*) echo "existe=nao";; esac/'
+  mutant diag "arquivo que o processo não lê dito legível" 's/if \[ -r "\$1" \]; then r=sim; else r=nao; fi/r=sim/'
+  mutant diag "valor sem tirar o que não é caractere de caminho" 's/LC_ALL=C tr -cd [^|]*| //'
+  mutant gui "o caminho de SUCESSO também consulta o cofre e grava diag" 's/^e=\$(tmux/diag; e=$(tmux/'
   [ -n "${GCSSH_MUTANTS_ONLY:-}" ] || [ "${GCSSH_SHARD%/*}" != 0 ] || {
   echo "-- contra um stub que só sai 0 (a versão 'anterior' não tinha provider nenhum)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"
-  r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate,lay,prep,wt,gui,acct,prof" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
+  r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate,lay,prep,wt,gui,diag,acct,prof" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
   case "$r" in "RESULT 0/"*|"") ok 1 "stub deveria falhar quase tudo ($r)";; *) ok 0 "stub falha os casos novos ($r)";; esac
   }
   echo "== final: $((n-fails))/$n ok =="
