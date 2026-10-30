@@ -24,8 +24,11 @@
 #   lançamento (g_launch): prefixo nice 19 + SCHED_IDLE + ionice idle + timeout -k, com o que existir no PATH; sem `timeout` o item não começa.
 #   sinais (g_send): send() com um membro da sessão que o runner não pode sinalizar (o bash root do helper do gt-iso-run, item wa-suite): o sinal chega aos outros, inclusive aos que vêm depois do que recusou, sem levantar ·
 #     grupo do líder já sumido (o timeout do GNU muda de grupo) ainda sinaliza os membros · ninguém aceitou o sinal = False, nunca True por ter tentado.
-# CONTROLE NEGATIVO: cada mutante (um trecho do script trocado) TEM que reprovar a bateria.
-# VARIÁVEIS: HB_UNDER_TEST (script a testar) · HB_PY (interpretador; padrão /usr/bin/python3) · HB_NO_MUTANTS=1 · HB_ONLY=<grupo> (reg tick run ram reap fill off state logs launch send; sem mutantes)
+#   teto (g_ceil, hermético; g_cgrp, o kernel de verdade): cada item começa num escopo systemd do usuário com TasksMax/MemoryMax (sem gerenciador de usuário NÃO começa) · o tick lê pids.events/memory.events do
+#     cgroup do item e o mata (teto-processos / teto-memoria; contador ilegível ≠ zero estouros) · o caminho do cgroup só vale se for o escopo DESTA rodada na ballast.slice · fim de rodada e stop mandam
+#     cgroup.kill (pega quem fez setsid) · os picos do item entram em results.jsonl. g_cgrp só roda onde há systemd --user (senão `skip`, que NÃO conta como passou): fork em laço e alocador, ambos LIMITADOS por construção.
+# CONTROLE NEGATIVO: cada mutante (um trecho do script trocado) TEM que reprovar a bateria. Mutante com descrição `[teto]` roda só os grupos do teto.
+# VARIÁVEIS: HB_UNDER_TEST (script a testar) · HB_PY (interpretador; padrão /usr/bin/python3) · HB_NO_MUTANTS=1 · HB_ONLY=<grupo> (reg tick run ram reap fill off state logs launch send ceil cgrp; sem mutantes)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 P="${HB_UNDER_TEST:-$HERE/hetzner-ballast.py}"
@@ -54,7 +57,7 @@ check() {  # check "DESCRIÇÃO" ESPERADO REAL
 W="$T/w"; mkdir -p "$W/bin"
 printf '#!/bin/sh\n# timeout de brinquedo (o do macOS não existe): descarta "-k K DUR" e roda\nshift 3; exec "$@"\n' > "$W/bin/timeout"; chmod +x "$W/bin/timeout"
 NCPU=16
-N=0; H=""; FP=""; NOW=0; U=0; NI=0; ID=0; EXTRA_ENV=""; LP='[]'; PID=""; RUN=""
+N=0; H=""; FP=""; NOW=0; U=0; NI=0; ID=0; EXTRA_ENV=""; LP='[]'; PID=""; RUN=""; CEIL=""; SD=""; CGD=""
 
 # ── fixtures ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 writestat() {  # /proc/stat: a linha agregada + uma por núcleo (o governo conta os cpuN)
@@ -74,7 +77,7 @@ newhome() {
   printf '#!/bin/sh\nsleep 300\n' > "$H/items/sleeper.sh"; chmod +x "$H/items/sleeper.sh"
   printf '#!/bin/sh\necho "linha de log"\necho '"'"'BALLAST-SUMMARY: {"pass": 3, "fail": 0}'"'"'\nsleep 300\n' > "$H/items/summary.sh"; chmod +x "$H/items/summary.sh"
   : > "$H/items.tsv"; reg 'hq|work|4|1024|3600|300|-|sleeper.sh'
-  NOW=1800000000; U=0; NI=0; ID=0; EXTRA_ENV=""; LP='[]'; setmem 28000; writestat
+  NOW=1800000000; U=0; NI=0; ID=0; EXTRA_ENV=""; LP='[]'; CEIL=""; setmem 28000; writestat
 }
 alive() {  # alive PID ITEM RUN [RSS_KB=1024] [ESTADO=S] — o processo do item aparece no /proc de mentira (líder de sessão, com a marca na linha de comando)
   mkdir -p "$FP/$1"
@@ -88,7 +91,7 @@ member() {  # member PID SID [RSS_KB] — um filho do item (mesma sessão)
 gone() { rm -rf "$FP/$1"; }   # o processo sumiu do /proc
 bt() {  # bt [ARGS…] → $OUT (stdout), $RC. Padrão: tick
   [ $# -gt 0 ] || set -- tick
-  OUT=$(env PATH="$W/bin:$PATH" BALLAST_HOME="$H" BALLAST_PROC="$FP" BALLAST_NOW="$NOW" BALLAST_LAUNCH_PREFIX="$LP" BALLAST_TEST=1 $EXTRA_ENV "$PY" -I "$P" "$@" 2>"$W/err"); RC=$?
+  OUT=$(env PATH="$W/bin:$PATH" BALLAST_HOME="$H" BALLAST_PROC="$FP" BALLAST_NOW="$NOW" BALLAST_LAUNCH_PREFIX="$LP" BALLAST_TEST=1 BALLAST_CEILING="${CEIL:-off}" $EXTRA_ENV "$PY" -I "$P" "$@" 2>"$W/err"); RC=$?
 }
 jget() {  # jget CAMPO.PONTADO → valor do $OUT (JSON), texto simples; índice de lista como número; null/ausente → "null"
   printf '%s' "$OUT" | "$PY" -I -c 'import sys,json
@@ -557,7 +560,7 @@ waitlines() {  # waitlines ARQUIVO N — espera (até 10 s: o mini carregado lev
 g_launch() {
   newhome; LP='5'; bt status --json
   check "launch: BALLAST_LAUNCH_PREFIX que não é uma lista JSON de textos → configuração inválida, rc 3 (nunca um prefixo vazio por engano)" "3" "$RC"
-  newhome; EXTRA_ENV="BALLAST_TEST=0"; LP='[]'; bt status --json; r1=$RC; LP='["chrt","-i","0"]'; bt status --json; r2=$RC; LP='["nice","-n","19"]'; bt status --json
+  newhome; CEIL=systemd; EXTRA_ENV="BALLAST_TEST=0"; LP='[]'; bt status --json; r1=$RC; LP='["chrt","-i","0"]'; bt status --json; r2=$RC; LP='["nice","-n","19"]'; bt status --json
   check "launch: fora do selftest o prefixo precisa ter nice: [] e um prefixo sem nice → rc 3; com nice → rc 0" "3 3 0" "$r1 $r2 $RC"
   newhome; LP='["nice", 3]'; bt status --json
   check "launch: lista com item que não é texto também é recusada (rc 3)" "3" "$RC"
@@ -620,9 +623,177 @@ PYEOF
   check "send: nada existe mais (grupo e membros sumidos) → False e não levanta" "False tentou=103" "$(printf '%s\n' "$o" | sed -n 's/^5 //p')"
 }
 
-if [ -n "${HB_MUTANT:-}" ]; then g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
+# ── g_ceil ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# Teto de sistema por item (ga-kgnjkt8). O nice 19/SCHED_IDLE protege a CPU, não a tabela de processos nem a RAM (29/10 16:30Z uma fork bomb de uma sessão sem teto parou o nó). Cada item entra num escopo
+# systemd do usuário (ballast.slice/ballast-<rodada>.scope) com TasksMax e MemoryMax, e o governo lê os contadores do kernel a cada tick. Aqui o systemd-run é de brinquedo (anota o que recebeu e roda
+# o resto) e o cgroup é uma pasta de fixtures (BALLAST_CGROUP_ROOT); o que o kernel faz de verdade está no g_cgrp.
+waitfile() {  # waitfile ARQUIVO — espera (até 10 s) o arquivo existir
+  local i=0; while [ "$i" -lt 50 ] && [ ! -e "$1" ]; do sleep 0.2; i=$((i+1)); done; [ -e "$1" ]
+}
+fakesd() {  # fakesd — CEIL=systemd com um barramento de mentira ($T/rt/bus) e um systemd-run de brinquedo que anota o que recebeu (argumentos e ambiente) em $SD/call.N e roda o que vem depois do `--`
+  CEIL=systemd; rm -rf "$T/rt" "$T/cg"; mkdir -p "$T/rt" "$T/cg"; : > "$T/rt/bus"
+  EXTRA_ENV="BALLAST_RUNTIME_DIR=$T/rt BALLAST_CGROUP_ROOT=$T/cg"
+  SD="$W/sd$N"; rm -rf "$SD"; mkdir -p "$SD"
+  cat > "$W/bin/systemd-run" <<EOS
+#!/bin/sh
+D=$SD
+n=\$(ls "\$D" | grep -c '^call\.'); n=\$((n + 1))
+{ printf 'ARGV:'; for a in "\$@"; do printf ' [%s]' "\$a"; done; echo; echo "XDG=\${XDG_RUNTIME_DIR:-unset}"; echo "DBUS=\${DBUS_SESSION_BUS_ADDRESS:-unset}"; } > "\$D/call.\$n"
+while [ \$# -gt 0 ] && [ "\$1" != -- ]; do shift; done
+shift
+exec "\$@"
+EOS
+  chmod +x "$W/bin/systemd-run"
+}
+callhas() { local c; c=$(grep -c -F -- "[$1]" "$SD/call.1" 2>/dev/null); echo "${c:-0}"; }   # quantas vezes o argumento $1 aparece na 1ª chamada do systemd-run de brinquedo
+ceil_one() {  # ceil_one — newhome + o item hq (4 núcleos) rodando sob o systemd-run de brinquedo, visível no /proc de mentira, com o cgroup de mentira montado (CGD): PID, RUN e CGD
+  newhome; fakesd; seed; good 50; good 50; good 50; PID=$(started_pid); RUN=$(started_run); alive "$PID" hq "$RUN"
+  waitfile "$H/runs/$RUN/cgroup"; sleep 0.5   # o item escreve o cgroup dele no começo; o meu (de mentira) vai por cima depois
+  CGD="$T/cg/user.slice/user-1000.slice/user@1000.service/ballast.slice/ballast-$RUN.scope"
+  printf '/user.slice/user-1000.slice/user@1000.service/ballast.slice/ballast-%s.scope\n' "$RUN" > "$H/runs/$RUN/cgroup"
+  mkdir -p "$CGD"; printf 'max 0\n' > "$CGD/pids.events"; printf 'low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n' > "$CGD/memory.events"; : > "$CGD/cgroup.kill"; : > "$CGD/cgroup.procs"
+}
+g_ceil() {
+  local D3 i
+  # lançamento: o item começa dentro de um escopo com teto, e o item não herda o barramento do usuário
+  newhome; fakesd; : > "$H/items.tsv"; printf '#!/bin/sh\nenv > "$BALLAST_RUN_DIR/env.txt"\nsleep 300\n' > "$H/items/envdump.sh"; chmod +x "$H/items/envdump.sh"; reg 'ev|work|4|1024|3600|300|-|envdump.sh'
+  seed; good 50; good 50; good 50; RUN=$(started_run); waitfile "$SD/call.1"; waitfile "$H/runs/$RUN/env.txt"
+  check "teto: o item começa por systemd-run --user --scope --collect, na unidade ballast-<rodada> da ballast.slice" "1 1 1 1 1" "$(callhas --user) $(callhas --scope) $(callhas --collect) $(callhas "--unit=ballast-$RUN") $(callhas --slice=ballast.slice)"
+  check "teto: TasksMax=4096, MemoryMax=1280M (rss_mb 1024 x 1,25), sem swap, e o kernel mata só o que estourou (OOMPolicy=continue: o item ainda grava o rc e os picos)" "1 1 1 1" "$(callhas TasksMax=4096) $(callhas MemoryMax=1280M) $(callhas MemorySwapMax=0) $(callhas OOMPolicy=continue)"
+  check "teto: o systemd-run recebe o barramento do usuário (XDG_RUNTIME_DIR e DBUS_SESSION_BUS_ADDRESS)" "XDG=$T/rt DBUS=unix:path=$T/rt/bus" "$(grep '^XDG=' "$SD/call.1" 2>/dev/null) $(grep '^DBUS=' "$SD/call.1" 2>/dev/null)"
+  check "teto: ...mas o item NÃO herda o barramento (não pede ao gerenciador um escopo fora do teto)" "0" "$(grep -c -E '^(XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS)=' "$H/runs/$RUN/env.txt" 2>/dev/null)"
+  check "teto: a meta.json da rodada guarda o teto que valeu (tasks 4096, mem_mb 1280)" "4096 1280" "$("$PY" -I -c 'import json,sys; c=json.load(open(sys.argv[1])).get("ceiling") or {}; print(c.get("tasks"), c.get("mem_mb"))' "$H/runs/$RUN/meta.json" 2>/dev/null)"
+  newhome; fakesd; EXTRA_ENV="$EXTRA_ENV BALLAST_TASKS_MAX=77 BALLAST_MEM_FACTOR=2"; seed; good 50; good 50; good 50; waitfile "$SD/call.1"
+  check "teto: BALLAST_TASKS_MAX e BALLAST_MEM_FACTOR mudam o teto (TasksMax=77, MemoryMax=2048M)" "1 1" "$(callhas TasksMax=77) $(callhas MemoryMax=2048M)"
+  newhome; fakesd; EXTRA_ENV="$EXTRA_ENV BALLAST_TASKS_MAX=3"; bt status --json; r1=$RC; EXTRA_ENV="$EXTRA_ENV BALLAST_TASKS_MAX=4096 BALLAST_MEM_FACTOR=0.5"; bt status --json
+  check "teto: BALLAST_TASKS_MAX abaixo de 16 ou BALLAST_MEM_FACTOR abaixo de 1 → configuração inválida (rc 3), nunca um teto que mata o item de cara" "3 3" "$r1 $RC"
+  newhome; CEIL=off; EXTRA_ENV="BALLAST_TEST=0"; bt status --json
+  check "teto: fora do selftest BALLAST_CEILING=off é recusado (rc 3): o lastro nunca roda sem teto por engano" "3" "$RC"
+
+  # pronto ou não: sem gerenciador de usuário o item NÃO começa (o teto é condição, não enfeite)
+  newhome; fakesd; rm -f "$T/rt/bus"; seed; good 50; good 50; good 50
+  check "teto: sem o barramento do usuário (sem sessão aberta nem linger) o item NÃO começa" "[]" "$(jget started)"
+  check "teto: ...a nota do tick diz sem-teto e o stderr diz o motivo" "1 1" "$(jget note | grep -c 'sem-teto') $(grep -c 'sem teto' "$W/err")"
+  check "teto: ...e não fica pasta de rodada pela metade" "0" "$(ls "$H/runs" 2>/dev/null | wc -l | tr -d ' ')"
+  bt status --json
+  check "teto: o status diz que o teto NÃO está pronto, com o motivo (o barramento)" "false 1" "$(jget ceiling.ready) $(jget ceiling.why | grep -c 'bus')"
+  newhome; fakesd; rm -f "$W/bin/systemd-run"; D3="$W/sdnp"; rm -rf "$D3"; mkdir -p "$D3"; ln -sf /bin/sh "$D3/sh"; ln -sf "$(command -v sleep)" "$D3/sleep"; EXTRA_ENV="$EXTRA_ENV PATH=$W/bin:$D3"; seed; good 50; good 50; good 50
+  check "teto: sem systemd-run no PATH o item NÃO começa" "[]" "$(jget started)"
+  bt status --json; check "teto: ...e o status diz que o teto NÃO está pronto" "false" "$(jget ceiling.ready)"
+  newhome; fakesd; bt status --json
+  check "teto: pronto, o status mostra o modo e os limites (systemd, 4096 tarefas, fator 1.25)" "systemd true 4096 1.25" "$(jget ceiling.mode) $(jget ceiling.ready) $(jget ceiling.tasks_max) $(jget ceiling.mem_factor)"
+
+  # o tick lê os contadores do kernel do cgroup do item
+  ceil_one; adv 50 0; bt
+  check "teto: sem estouro (max 0, oom_kill 0) nada é morto e a nota não fala de teto" "0 0" "$(nkilled) $(jget note | grep -c teto)"
+  printf 'max 7\n' > "$CGD/pids.events"; adv 50 0; bt
+  check "teto: fork recusado no cgroup do item (pids.events max>0) → morto de imediato (KILL) com o motivo teto-processos" "1 teto-processos KILL" "$(nkilled) $(jget killed.0.why) $(jget killed.0.sig)"
+  check "teto: ...e o governo escreve 1 no cgroup.kill do item (pega também quem fez setsid e some da sessão)" "1" "$(cat "$CGD/cgroup.kill")"
+  isdead "$PID"; check "teto: ...e o item parou de verdade" "0" "$?"
+  ceil_one; printf 'low 0\nhigh 0\nmax 0\noom 1\noom_kill 1\noom_group_kill 0\n' > "$CGD/memory.events"; adv 50 0; bt
+  check "teto: o kernel matou algo no cgroup do item (memory.events oom_kill>0) → morto com o motivo teto-memoria" "1 teto-memoria" "$(nkilled) $(jget killed.0.why)"
+  ceil_one; printf 'low 0\nhigh 0\nmax 42\noom 0\noom_kill 0\noom_group_kill 0\n' > "$CGD/memory.events"; adv 50 0; bt
+  check "teto: memory.events max>0 sem oom_kill (o kernel só recuperou cache no limite) NÃO é estouro" "0" "$(nkilled)"
+  ceil_one; rm -f "$CGD/pids.events"; adv 50 0; bt
+  check "teto: pids.events ilegível → NÃO mata (o kernel segue impondo o teto) e a nota diz teto-ilegivel:<rodada>" "0 1" "$(nkilled) $(jget note | grep -c "teto-ilegivel:$RUN")"
+  ceil_one; printf 'lixo\n' > "$CGD/pids.events"; adv 50 0; bt
+  check "teto: pids.events que não é contador (lixo) também é ilegível, nunca 0 estouros" "0 1" "$(nkilled) $(jget note | grep -c "teto-ilegivel:$RUN")"
+  ceil_one; rm -f "$CGD/pids.events"; printf 'low 0\nhigh 0\nmax 0\noom 1\noom_kill 1\noom_group_kill 0\n' > "$CGD/memory.events"; adv 50 0; bt
+  check "teto: um contador ilegível não esconde o outro (pids.events some, oom_kill=1 → teto-memoria)" "1 teto-memoria" "$(nkilled) $(jget killed.0.why)"
+  ceil_one; : > "$H/runs/$RUN/cgroup"; adv 50 0; bt
+  check "teto: o item ainda não disse o cgroup dele (arquivo vazio) → não mata, nota teto-ilegivel:<rodada>" "0 1" "$(nkilled) $(jget note | grep -c "teto-ilegivel:$RUN")"
+
+  # o caminho do cgroup vem de um arquivo: só vale se for exatamente o escopo DESTA rodada na ballast.slice (nunca a sessão de login de alguém)
+  ceil_one; mkdir -p "$T/cg/user.slice/user-1000.slice/session-3.scope"; : > "$T/cg/user.slice/user-1000.slice/session-3.scope/cgroup.kill"; printf 'max 9\n' > "$T/cg/user.slice/user-1000.slice/session-3.scope/pids.events"
+  printf '/user.slice/user-1000.slice/session-3.scope\n' > "$H/runs/$RUN/cgroup"; adv 50 0; bt
+  check "teto: caminho fora da ballast.slice (a sessão de login) NUNCA é lido nem recebe kill" "0 0 1" "$(nkilled) $(wc -c < "$T/cg/user.slice/user-1000.slice/session-3.scope/cgroup.kill" | tr -d ' ') $(jget note | grep -c "teto-caminho:$RUN")"
+  ceil_one; printf '/user.slice/user-1000.slice/user@1000.service/ballast.slice/ballast-outra-1700000000.scope\n' > "$H/runs/$RUN/cgroup"; adv 50 0; bt
+  check "teto: escopo de OUTRA rodada da ballast.slice também é recusado (o nome tem que ser o desta rodada)" "0 1" "$(nkilled) $(jget note | grep -c "teto-caminho:$RUN")"
+  ceil_one; printf '/user.slice/user-1000.slice/user@1000.service/../../../x/ballast.slice/ballast-%s.scope\n' "$RUN" > "$H/runs/$RUN/cgroup"; adv 50 0; bt
+  check "teto: caminho com .. é recusado" "0 1" "$(nkilled) $(jget note | grep -c "teto-caminho:$RUN")"
+
+  # fim de rodada: o que sobrou no cgroup (quem fez setsid) leva kill, e os picos do item entram no resultado
+  ceil_one; echo 0 > "$H/runs/$RUN/rc"; gone "$PID"; adv 50 0; bt
+  check "teto: a rodada acabou (rc gravado, ninguém na sessão) → o governo manda kill ao que SOBROU no cgroup" "1" "$(cat "$CGD/cgroup.kill")"
+  ceil_one; echo 0 > "$H/runs/$RUN/rc"; printf 'pids_peak 37\nmem_peak 123731968\npids_hits 0\noom_kill 0\n' > "$H/runs/$RUN/ceiling"; gone "$PID"; adv 50 0; bt
+  check "teto: o relatório do item (picos lidos de dentro do escopo) entra na linha do results.jsonl" "ok 37 118 0 0" "$(rj why) $(rj ceiling.tasks_peak) $(rj ceiling.mem_peak_mb) $(rj ceiling.tasks_hit) $(rj ceiling.oom_kill)"
+  ceil_one; echo 0 > "$H/runs/$RUN/rc"; gone "$PID"; adv 50 0; bt
+  check "teto: sem relatório o resultado diz ceiling null (não sei os picos), nunca 0" "ok null" "$(rj why) $(rj ceiling)"
+  ceil_one; echo 0 > "$H/runs/$RUN/rc"; printf 'pids_peak lixo\nmem_peak 5\n' > "$H/runs/$RUN/ceiling"; gone "$PID"; adv 50 0; bt
+  check "teto: relatório com campo ilegível → o campo é null e o que dá para ler fica (mem_peak 5 bytes = 0 MB)" "null 0" "$(rj ceiling.tasks_peak) $(rj ceiling.mem_peak_mb)"
+  ceil_one; echo 0 > "$H/runs/$RUN/rc"; printf 'pids_peak 4096\nmem_peak 1\npids_hits 12\noom_kill 0\n' > "$H/runs/$RUN/ceiling"; gone "$PID"; adv 50 0; bt
+  check "teto: o item saiu rc 0 mas o relatório diz fork recusado → a rodada fecha como teto-processos (cooldown de falha), não ok" "teto-processos" "$(rj why)"
+  ceil_one; echo 137 > "$H/runs/$RUN/rc"; printf 'pids_peak 30\nmem_peak 83886080\npids_hits 0\noom_kill 1\n' > "$H/runs/$RUN/ceiling"; gone "$PID"; adv 50 0; bt
+  check "teto: o kernel matou o maior do item (oom_kill 1; o rc é 137) → a rodada fecha como teto-memoria, com o pico de memória" "teto-memoria 80" "$(rj why) $(rj ceiling.mem_peak_mb)"
+  rm -f "$W/bin/systemd-run"
+}
+
+# ── g_cgrp ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# O kernel de verdade (ga-kgnjkt8): só onde há um gerenciador de usuário do systemd (Linux, sessão aberta ou linger); nos outros ambientes a bateria diz `skip` e isso NÃO conta como passou. Todo
+# "descontrolado" daqui é LIMITADO POR CONSTRUÇÃO (300 filhos, 400 MB): sem o teto o teste reprova, não derruba a máquina. A leitura de /proc/stat e meminfo continua de mentira; processo e cgroup são reais.
+cgrp_ok() {
+  [ "$(uname -s)" = Linux ] && command -v systemd-run > /dev/null 2>&1 && [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -S "$XDG_RUNTIME_DIR/bus" ] && systemd-run --user --scope --quiet --collect -p TasksMax=16 true > /dev/null 2>&1
+}
+cgrp_item() {  # cgrp_item NOME 'corpo python' RSS_MB — newhome com UM item real (script python em $H/items/NOME.py) sob o systemd-run REAL; o item começa no 3º tick livre. PID e RUN
+  newhome; CEIL=systemd; : > "$H/items.tsv"
+  printf '#!%s\nimport os, time\nRD = os.environ["BALLAST_RUN_DIR"]\n%s\n' "$PY" "$2" > "$H/items/$1.py"; chmod +x "$H/items/$1.py"; reg "$1|work|4|$3|3600|300|-|$1.py"
+}
+cgrp_start() { seed; good 50; good 50; good 50; PID=$(started_pid); RUN=$(started_run); alive "$PID" "$1" "$RUN"; }
+g_cgrp() {
+  local sp mb canary cg i EP
+  if ! cgrp_ok; then echo "skip cgrp: sem systemd-run --user utilizável aqui (precisa de Linux com gerenciador de usuário): os casos do kernel de verdade NÃO rodaram"; return 0; fi
+  # (1) fork em laço, limitado a 300 filhos: com TasksMax=40 o item consegue no máximo 40; sem teto consegue os 300
+  cgrp_item fk 'n = 0
+for _ in range(300):
+    try:
+        pid = os.fork()
+    except OSError:
+        continue
+    if pid == 0:
+        time.sleep(60)
+        os._exit(0)
+    n += 1
+open(RD + "/spawned", "w").write(str(n))
+time.sleep(60)' 1024
+  EXTRA_ENV="BALLAST_TASKS_MAX=40"; cgrp_start fk; waitfile "$H/runs/$RUN/spawned"; sp=$(cat "$H/runs/$RUN/spawned" 2>/dev/null || echo 0)
+  check "cgrp: o item que tenta criar 300 filhos com TasksMax=40 consegue entre 10 e 40 (sem teto seriam 300; criou $sp)" "1" "$([ "$sp" -ge 10 ] && [ "$sp" -le 40 ] && echo 1 || echo 0)"
+  canary=0; sh -c 'exit 0' && canary=1
+  check "cgrp: ...e quem está fora do escopo (o sshd do nó) continua criando processos com o item no teto" "1" "$canary"
+  adv 50 0; bt
+  check "cgrp: o tick seguinte vê o fork recusado no cgroup de verdade e mata o item com o motivo teto-processos" "teto-processos" "$(jget killed.0.why)"
+  cg="/sys/fs/cgroup$(cat "$H/runs/$RUN/cgroup" 2>/dev/null)"; i=0; while [ "$i" -lt 25 ] && [ -d "$cg" ]; do sleep 0.2; i=$((i+1)); done
+  check "cgrp: ...e o cgroup do item sumiu (nenhum filho sobrou)" "gone" "$([ -d "$cg" ] && echo vivo || echo gone)"
+  gone "$PID"; adv 50 0; bt
+  check "cgrp: a rodada fecha como teto-processos" "teto-processos" "$(rj why)"
+  # (2) memória: alocador limitado a 400 MB (10 x 40); rss_mb 64 → MemoryMax=80M: o kernel o mata no 2º bloco
+  cgrp_item hog 'chunks = []
+for i in range(10):
+    chunks.append(bytearray(b"x") * (40 << 20))
+    open(RD + "/mb", "w").write(str((i + 1) * 40))
+    time.sleep(0.1)
+time.sleep(60)' 64
+  cgrp_start hog; i=0; while [ "$i" -lt 60 ] && [ ! -e "$H/runs/$RUN/rc" ] && [ "$(cat "$H/runs/$RUN/mb" 2>/dev/null || echo 0)" -lt 400 ]; do sleep 0.25; i=$((i+1)); done
+  mb=$(cat "$H/runs/$RUN/mb" 2>/dev/null || echo 0)
+  check "cgrp: o alocador de 400 MB com MemoryMax=80M é morto pelo kernel antes de passar de 80 MB (marca: $mb MB)" "1" "$([ "$mb" -le 80 ] && echo 1 || echo 0)"
+  i=0; while [ "$i" -lt 25 ] && [ ! -s "$H/runs/$RUN/ceiling" ]; do sleep 0.2; i=$((i+1)); done; gone "$PID"; adv 50 0; bt
+  check "cgrp: a rodada fecha como teto-memoria, com oom_kill 1 e o pico lidos de dentro do escopo" "teto-memoria 1" "$(rj why) $(rj ceiling.oom_kill)"
+  # (3) quem faz setsid sai da sessão do item e o governo, por sessão, não o vê: o stop tem que pegá-lo pelo cgroup
+  cgrp_item es 'import subprocess
+subprocess.Popen(["setsid", "sh", "-c", "echo $$ > \"$1\"; exec sleep 301", "_", RD + "/esc.pid"])
+time.sleep(60)' 1024
+  cgrp_start es; waitfile "$H/runs/$RUN/esc.pid"; sleep 0.3; EP=$(cat "$H/runs/$RUN/esc.pid" 2>/dev/null || echo 0)
+  check "cgrp: o escapee (setsid) está vivo e fora da sessão do item" "1" "$(plive "$EP" && [ "$(ps -o sid= -p "$EP" | tr -d ' ')" != "$PID" ] && echo 1 || echo 0)"
+  bt stop
+  pdead "$EP"; check "cgrp: o stop mata também quem fez setsid (o cgroup.kill pega; a sessão não o enxerga)" "0" "$?"
+  kill -9 "$EP" 2>/dev/null
+}
+
+if [ -n "${HB_MUTANT:-}" ]; then
+  if [ "${HB_MUTANT_GROUPS:-}" = teto ]; then g_ceil; g_cgrp; else g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; fi
+  echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?
+fi
 if [ -n "${HB_ONLY:-}" ]; then "g_$HB_ONLY"; echo "── $((n - fails))/$n ok (só g_$HB_ONLY)"; [ "$fails" = 0 ]; exit $?; fi
-g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send
+g_reg; g_tick; g_run; g_ram; g_reap; g_fill; g_off; g_state; g_logs; g_launch; g_send; g_ceil; g_cgrp
 
 [ -n "${HB_NO_MUTANTS:-}" ] || {
   echo "── controle negativo: cada mutante tem que reprovar a bateria ──"
@@ -814,8 +985,9 @@ PYEOF
   while IFS="$(printf '\t')" read -r idx st desc; do
     if [ "$st" != OK ]; then ok 1 "mutante '$desc': a âncora não casa exatamente 1 vez (o script mudou?)"; continue; fi
     case "$desc" in "[linux]"*) [ -r /proc/self/oom_score_adj ] || { echo "skip mutante '$desc' (sem /proc/self/oom_score_adj neste host)"; continue; };; esac
+    grp=""; case "$desc" in "[teto]"*) grp=teto ;; esac
     while [ "$(jobs -r | wc -l | tr -d ' ')" -ge "$JOBS" ]; do sleep 0.3; done
-    ( HB_MUTANT=1 HB_UNDER_TEST="$T/mut$idx.py" bash "$0" 2>&1 | tail -1 > "$T/mres.$idx" ) &
+    ( HB_MUTANT=1 HB_MUTANT_GROUPS="$grp" HB_UNDER_TEST="$T/mut$idx.py" bash "$0" 2>&1 | tail -1 > "$T/mres.$idx" ) &
   done < "$T/mutants.idx"
   wait
   while IFS="$(printf '\t')" read -r idx st desc; do
