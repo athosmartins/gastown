@@ -35,9 +35,21 @@ COMO DECIDE (a 1ª regra que casa vale; tudo é lido da bead, nada é gravado ne
      mac-only e fora do que a varredura de conteúdo do espelho segura, porque "teste que o nó tem" é o que vale. Nada é inferido para código que o texto não cita. Achou -> node, basis `derivado`
      (`info`: teste-derivado:<código>=<teste>); mas se o texto tem palavra informativa de dado de lead ou de envio de WhatsApp (os freios de DERIVED_BLOCK_INFO) -> mini, `freio-derivado:<palavras>`.
      Não achou -> unknown. Repo/git/espelho ilegível -> unknown com `info` `teste-derivado-ilegivel:<motivo>`; nunca vira node.
+  7. CAMINHO DERIVADO (ga-2hd02v.3.20; só quando a bead NÃO cita nenhum arquivo de código; medido 30/10: 13 de 30 beads sondadas caíam em unknown `sem-prova-de-codigo-e-teste` porque o texto NOMEIA o módulo mas
+     não escreve o caminho): o caminho sai do próprio repo do WA em origin/main, nunca de palpite. (a) NOMES: palavra com `_` ou `-` no texto (ficha_donos, form-fill; maiúscula vale; até 30 por bead) que é o nome
+     de arquivo de código (sem a extensão, >=5 letras, nada genérico) na árvore do repo; um nome com mais de 3 arquivos é ambíguo (`info`: caminho-derivado-ambiguo:<nome>=N) e não deriva nada; palavra colada a
+     `/` ou a uma extensão é caminho, não nome. (b) IRMÃS: os arquivos de código tocados pelos commits `fix|feat(<id>)` das beads de MESMO PAI (o campo `parent` ou o id sem o último `.N`; até 40 commits dos últimos 45 dias, WA_NODE_SIBLING_DAYS; um `git log`
+     com prazo próprio, WA_NODE_SIBLING_TIMEOUT, 15 s) que ainda existem na árvore. Mais de 10 arquivos derivados no total = nenhum (`caminho-derivado-demais:N`; é palpite largo). Os caminhos derivados passam pelos MESMOS
+     filtros dos citados, sem afrouxar nada: filtro do rsync (fora dele -> mini `caminho-derivado-fora-do-filtro:<p>`), lista mac-only (mini `caminho-derivado-so-no-mac:<p>`), as moles e o PII da regra 3/4 (que já rodaram antes)
+     e os freios de dado de lead/envio da regra 6 (mini `freio-derivado:…`). A prova do teste é a mesma da regra 6 (o teste que o repo já tem para o código derivado) ou, se a bead cita o teste, o próprio teste citado.
+     Achou -> node, basis `derivado`, motivo `prova-caminho-derivado:N-teste(s)+M-codigo(s)` (`info`: caminho-derivado:<nome:X|irmas>=<caminho>, teste-derivado:<código>=<teste>). Nada derivado ou nenhum teste -> unknown como antes.
+     Falha de leitura (repo, git, rsync, mac-only, espelho, git log das irmãs sem resposta) -> unknown com `info` `caminho-derivado-ilegivel:<motivo>`; "falhou" nunca é "vazio" e nunca é node. Custo: os `git ls-tree`/`git log` só
+     rodam com nome ou pai para consultar; o `git log` das irmãs fica num cache por pai (6 h; o cache nunca decide: o conteúdo dele passa pela árvore e pelos filtros, e cache ilegível/vencido/de outro pai é recalculado);
+     o JSON leva `custo` ({ms, derivacao_ms, cache}) e o Pilot o grava na linha da sonda. NÃO há LLM nem `recall` por sonda: o recall de beads fechadas parecidas levou >120 s numa consulta sob load 80 (medido), então a
+     fonte "3 beads parecidas" do pedido original NÃO foi implementada. O cache por (id, updated_at) do veredito já existe no dispatcher (memo da passada do nó); o cache daqui é só o do `git log` das irmãs.
 
-CÓDIGOS DE SAÍDA: 0 node · 10 mini · 11 unknown · 2 uso. A linha de stdout é um JSON: {"verdict","basis","reasons":[...],"paths":[...],"tests":[...],"info":[...]}; basis = label | text | derivado | "" (só o node tem).
-O QUE NÃO FAZ: não lê dado, não abre o nó, não toca o Dolt, não escreve na bead. Lê só stdin (o JSON do `bd show --json`), o filtro, a lista mac-only, (só com `.md` fora do rsync) o filtro que o espelho serve e (só com código citado sem teste citado) a árvore e o conteúdo dos TESTES do repo do WA em origin/main, por `git ls-tree`/`git grep`: nunca a árvore de trabalho.
+CÓDIGOS DE SAÍDA: 0 node · 10 mini · 11 unknown · 2 uso. A linha de stdout é um JSON: {"verdict","basis","reasons":[...],"paths":[...],"tests":[...],"custo":{"ms","derivacao_ms","cache"},"info":[...]}; basis = label | text | derivado | "" (só o node tem).
+O QUE NÃO FAZ: não lê dado, não abre o nó, não toca o Dolt, não escreve na bead. Lê só stdin (o JSON do `bd show --json`), o filtro, a lista mac-only, (só com `.md` fora do rsync) o filtro que o espelho serve e (só com código citado sem teste citado) a árvore e o conteúdo dos TESTES do repo do WA em origin/main, por `git ls-tree`/`git grep`: nunca a árvore de trabalho; (só sem código citado, regra 7) a árvore de código do repo e o `git log` dos commits das beads irmãs. ESCREVE uma única coisa: o cache do `git log` das irmãs (WA_NODE_CACHE, padrão <cidade>/.gc/cache/wa-node-classify; escrita atômica, opcional: sem ele o classificador só fica mais lento).
 LIMITES: a exceção do espelho confia na varredura de conteúdo (>=20 telefones ou >=3 CPFs distintos por arquivo): lista pequena, nome, e-mail e CNPJ num `.md` passam; vale o mesmo resíduo do bloco 3b do filtro. É heurística de TEXTO sobre a bead; o texto pode omitir que o teste abre um banco. NÃO são extraídos: pasta sem arquivo (`data/`), arquivo sem nome (`.env`), extensão fora da lista, nome com
   sufixo (`x.py.bak` não vira `x.py`). Para esses a regra 3a não age; quem segura o dado é o filtro do rsync (o nó nunca o recebe) e, no caso de `.env`/`.db`, a palavra mole da regra 4. O resíduo cai no nó como teste vermelho e a bead volta ao mini pelo gate (custo, não vazamento:
   o dado não chega ao nó de qualquer jeito). A lista de palavras moles é deliberadamente larga (o vocabulário do WA é todo de lead/terreno): na dúvida a bead fica no mini, como hoje.
@@ -46,6 +58,7 @@ LIMITES: a exceção do espelho confia na varredura de conteúdo (>=20 telefones
   já é lido, o ctx-check só grava etiqueta e comentário de lacuna, e o worker do nó não recebe comentário (ga-2hd02v.10).
 """
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -53,6 +66,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -104,6 +118,24 @@ GENERIC_STEMS = frozenset(("utils", "helpers", "helper", "common", "config", "se
 MAX_DERIVED_PER_STEM = 25                                            # testes candidatos por módulo (ordem alfabética); acima disso o excesso nem é lido
 MAX_DERIVED_TESTS = 100                                              # candidatos no total, para o rsync -n e o git grep ficarem curtos
 DERIVED_BLOCK_INFO = ("dado-de-lead", "envio-whatsapp")              # palavras informativas que, só para a prova derivada (mais fraca), mandam ao mini (lista do Mayor em ga-2hd02v.3.15); banco e credencial da mesma lista já são moles e bloqueiam antes
+NAME_RE = re.compile(r"(?<![\w/.\-~$])([A-Za-z][A-Za-z0-9]*(?:[_\-][A-Za-z0-9]+)+)(?![\w/]|\.\w)")   # `ficha_donos`, `form-fill`: nome de módulo/tela/daemon SEM caminho (o que tem pasta ou extensão é caminho e já foi lido)
+MAX_NAME_TOKENS = 30                                                 # nomes distintos lidos de uma bead
+MAX_FILES_PER_NAME = 3                                               # um nome que casa mais arquivos que isto é ambíguo: não deriva nada dele
+MAX_DERIVED_CODE = 10                                                # arquivos de código derivados no total; acima disso a bead não é sobre um módulo só: não deriva nada
+PARENT_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*(?:\.[0-9]+)*$")    # id de bead (com níveis `.N`): o pai vai no padrão do `git log --grep`, então só esta forma entra
+SIBLING_MAX_COMMITS = 40                                             # commits das irmãs lidos (o git para de andar no histórico ao achar tantos)
+SIBLING_MAX_NAMES = 200                                              # arquivos guardados no cache por pai
+try:
+    SIBLING_TIMEOUT = max(1, int(os.environ.get("WA_NODE_SIBLING_TIMEOUT", "15")))   # prazo próprio do `git log` das irmãs, menor que o do check do dispatcher (30 s): estourou -> unknown com a nota, nada vai ao cache
+except ValueError:
+    SIBLING_TIMEOUT = 15
+try:
+    SIBLING_DAYS = min(3650, max(1, int(os.environ.get("WA_NODE_SIBLING_DAYS", "45"))))   # teto de 10 anos: o git, com `--since` anterior a 1970 (~30000 dias), devolve ZERO commits SEM erro — um "vazio" falso que viraria unknown sem nota; o `--grep` lê TODA mensagem de commit que anda: medido (30/10, load ~80, ~12 mil commits) 19-22 s sem limite, 6,8 s com 90 dias, 3,2 s com 30; irmã mais velha que isto não é derivada (menos prova, nunca prova errada)
+except ValueError:
+    SIBLING_DAYS = 45
+SIBLING_TTL = 6 * 3600                                               # o cache dos arquivos das irmãs vale 6 h (vencido = recalcula; irmã nova que o cache não viu só faz derivar MENOS, nunca algo errado)
+CACHE_DIR = os.environ.get("WA_NODE_CACHE", os.path.join(HERE, "..", ".gc", "cache", "wa-node-classify"))
+COST = {"derivacao_ms": 0, "cache": "-"}                             # o que a regra 7 gastou nesta execução (vai em `custo` na saída): "-" sem consulta às irmãs, hit/miss/nao-gravou com
 
 # palavras do texto (sem acento, minúsculas). slug -> regex. Larga de propósito (ver LIMITES).
 SOFT = (
@@ -420,10 +452,14 @@ def file_stem(path):
     return base.rsplit(".", 1)[0] if "." in base else base
 
 
+def valid_stem(s):
+    """`s` se serve para achar teste/código por nome (no formato, longo o bastante, nada genérico), senão ""."""
+    return s if STEM_RE.match(s) and len(s) >= MIN_STEM and s not in GENERIC_STEMS else ""
+
+
 def module_stem(path):
     """o nome de módulo de um arquivo de código citado, ou "" se não serve para achar teste por nome (fora do formato, curto demais, genérico demais)."""
-    s = file_stem(path)
-    return s if STEM_RE.match(s) and len(s) >= MIN_STEM and s not in GENERIC_STEMS else ""
+    return valid_stem(file_stem(path))
 
 
 def grep_cites(stem, tests):
@@ -489,6 +525,169 @@ def derived_tests(code, globs):
     return found
 
 
+def derivable_code(f):
+    """arquivo de código (DERIVE_EXT) que não é teste e tem nome seguro: o que a regra 7 pode propor como "o código da bead"."""
+    return f.rsplit(".", 1)[-1] in DERIVE_EXT and not TEST_RE.search(f) and all(SAFE_SEG.match(x) for x in f.split("/"))
+
+
+def name_tokens(text):
+    """nomes de módulo que o texto cita SEM caminho (snake_case ou com hífen -> snake_case), na ordem em que aparecem e sem repetir. Só os que valem como nome (valid_stem); o que é caminho
+    (dir/arq.ext, ~/x, o prefixo do repo) sai antes, porque já foi lido pela regra 3."""
+    flat = PATH_RE.sub(" ", HOME_RE.sub(" ", text.replace(REPO_ABS, "")))
+    out = []
+    for m in NAME_RE.finditer(flat):
+        s = valid_stem(m.group(1).lower().replace("-", "_"))
+        if s and s not in out:
+            out.append(s)
+            if len(out) >= MAX_NAME_TOKENS:
+                break
+    return out
+
+
+def parent_of(b):
+    """id do pai da bead (o que os commits das irmãs citam): o campo `parent` do `bd show --json` ou, sem ele, o id sem o último `.N`. "" quando não há pai ou o id não tem a forma de id de bead."""
+    p = b.get("parent")
+    if isinstance(p, str) and PARENT_RE.match(p):
+        return p
+    i = b.get("id")
+    if isinstance(i, str) and "." in i:
+        p = i.rsplit(".", 1)[0]
+        if PARENT_RE.match(p):
+            return p
+    return ""
+
+
+def cache_file(parent):
+    return os.path.join(CACHE_DIR, "sib-" + hashlib.sha1(parent.encode("utf-8")).hexdigest()[:20] + ".json")
+
+
+def cache_get(parent):
+    """arquivos guardados para o pai, ou None. Sem cache, vencido, de outro pai ou ilegível -> None e a quem chama recalcula: o cache só poupa tempo, nunca decide nada (e o conteúdo dele ainda passa
+    pela árvore e pelos filtros como se tivesse acabado de sair do git)."""
+    try:
+        with open(cache_file(parent), encoding="utf-8") as fh:
+            d = json.load(fh)
+        age = time.time() - float(d["ts"])
+        if d["parent"] == parent and -60 <= age <= SIBLING_TTL and isinstance(d["files"], list) and all(isinstance(x, str) for x in d["files"]):
+            return d["files"]
+    except Exception:
+        pass
+    return None
+
+
+def cache_put(parent, files):
+    """grava (escrita atômica) e apaga o que passou de 2 TTL. True se gravou; qualquer falha de disco -> False e segue sem cache (o resultado já está na mão)."""
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        path = cache_file(parent)
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"parent": parent, "ts": time.time(), "files": files}, fh)
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        now = time.time()
+        for n in os.listdir(CACHE_DIR):
+            q = os.path.join(CACHE_DIR, n)
+            if n.startswith("sib-") and n.endswith(".json") and now - os.path.getmtime(q) > 2 * SIBLING_TTL:
+                os.unlink(q)
+        return True
+    except Exception:
+        return False
+
+
+def sibling_log(parent):
+    """arquivos de código tocados pelos commits de REPO_REF (dos últimos SIBLING_DAYS dias) que citam `<pai>.N` (as irmãs da bead e ela mesma). Do cache quando há; senão `git log --grep` limitado em dias, commits e tempo. Nenhum commit -> []
+    (legítimo, e vai ao cache); git ausente, sem resposta no prazo ou rc != 0 -> Unreadable e NADA vai ao cache: nunca "as irmãs não tocaram em nada"."""
+    hit = cache_get(parent)
+    if hit is not None:
+        COST["cache"] = "hit"
+        return hit
+    pat = "(^|[^A-Za-z0-9.-])" + parent.replace(".", "\\.") + "\\.[0-9]+([^0-9.]|$)"
+    try:
+        r = subprocess.run([GIT, "-C", REPO_DIR, "log", REPO_REF, "--since=%d.days.ago" % SIBLING_DAYS, "-E", "--grep=" + pat, "--name-only", "--format=", "-z", "-n", str(SIBLING_MAX_COMMITS), "--"],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=repo_git_env(), timeout=SIBLING_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        raise Unreadable("irmas-git-sem-resposta")
+    if r.returncode != 0:
+        raise Unreadable("irmas-git-rc-%d" % r.returncode)
+    names = sorted(set(x.strip("\n") for x in r.stdout.decode("utf-8", "replace").split("\0")))
+    names = [x for x in names if x and derivable_code(x)][:SIBLING_MAX_NAMES]
+    COST["cache"] = "miss" if cache_put(parent, names) else "nao-gravou"
+    return names
+
+
+def derive_code(b, text):
+    """({arquivo de código: origem}, notas) que a bead NOMEIA sem citar o caminho (regra 7): (a) nome snake_case/hífen do texto = nome de arquivo de código em REPO_REF (até MAX_FILES_PER_NAME; mais que isso
+    é ambíguo e não deriva); (b) arquivos de código que os commits das irmãs (mesmo pai) tocaram e que ainda existem em REPO_REF. Mais de MAX_DERIVED_CODE no total -> nada. Sem nome nem pai o repo nem é
+    lido ({}, []); repo/git ilegível -> Unreadable (quem chama devolve unknown com a nota, nunca node)."""
+    names, parent = name_tokens(text), parent_of(b)
+    if not names and not parent:
+        return {}, []
+    tree = repo_tree()
+    present = set(tree)
+    by_stem, notes, out = {}, [], {}
+    for f in tree:
+        if derivable_code(f):
+            by_stem.setdefault(file_stem(f), []).append(f)
+    for n in names:
+        fs = sorted(by_stem.get(n, []))
+        if len(fs) > MAX_FILES_PER_NAME:
+            notes.append("caminho-derivado-ambiguo:%s=%d" % (n, len(fs)))
+            continue
+        for f in fs:
+            out.setdefault(f, "nome:" + n)
+    if parent:
+        for f in sibling_log(parent):
+            if f in present:
+                out.setdefault(f, "irmas")
+    if len(out) > MAX_DERIVED_CODE:
+        return {}, notes + ["caminho-derivado-demais:%d" % len(out)]
+    return out, notes
+
+
+def judged_derived(found, tag, paths, tests, info, dinfo):
+    """o veredito de uma prova DERIVADA (regras 6 e 7): node `<tag>:N-teste(s)+M-codigo(s)`; mas lead/envio no texto (DERIVED_BLOCK_INFO) mandam ao mini, porque é uma prova mais fraca que o teste citado."""
+    blocked = [s for s in DERIVED_BLOCK_INFO if s in info]
+    if blocked:
+        return "mini", ["freio-derivado:" + ",".join(blocked)], paths, tests, info + dinfo
+    ntests = len(set(t for ts in found.values() for t in ts))
+    return "node", ["%s:%d-teste(s)+%d-codigo(s)" % (tag, ntests, len(found))], paths, tests, info + dinfo
+
+
+def path_derivation(b, text, paths, tests, info, extra):
+    """regra 7 (ga-2hd02v.3.20): a bead não cita código; o código que ela nomeia (derive_code) passa pelos MESMOS filtros do citado (rsync, mac-only) e ganha prova. Devolve a tupla do classify, ou None
+    (nada derivado, ou derivado sem teste: segue unknown). `extra` recebe o que vai em `info`. Fora do filtro/só no Mac -> mini; leitura que falha sobe como Unreadable."""
+    dcode, notes = derive_code(b, text)
+    extra += notes
+    if not dcode:
+        return None
+    dpaths = sorted(dcode)
+    cpairs = ["caminho-derivado:%s=%s" % (dcode[p], p) for p in dpaths]
+    extra += cpairs[:6] + (["caminho-derivado-mais:%d" % (len(cpairs) - 6)] if len(cpairs) > 6 else [])
+    dsent = sent_by_filter(dpaths)
+    globs = mac_only_globs()
+    hard = []
+    for p in dpaths:
+        if p not in dsent:
+            hard.append("caminho-derivado-fora-do-filtro:" + p)
+        elif any(fnmatch.fnmatchcase(p, g) for g in globs):
+            hard.append("caminho-derivado-so-no-mac:" + p)
+    if hard:
+        return "mini", sorted(set(hard)), paths, tests, info + extra
+    if tests:   # a bead cita o teste e nomeia o código: a mesma prova da regra 5, só que o caminho do código veio do repo
+        found = dict((p, list(tests)) for p in dpaths)
+    else:
+        found = derived_tests(dpaths, globs)
+        pairs = ["teste-derivado:%s=%s" % (c, t) for c in dpaths for t in found.get(c, [])]
+        extra += pairs[:6] + (["teste-derivado-mais:%d" % (len(pairs) - 6)] if len(pairs) > 6 else [])
+    if not found:
+        return None
+    return judged_derived(found, "prova-caminho-derivado", paths, tests, info, extra)
+
+
 def classify(b):
     """(veredito, motivos, caminhos, testes, info)."""
     labels = labels_of(b)
@@ -545,12 +744,21 @@ def classify(b):
     if found:
         pairs = ["teste-derivado:%s=%s" % (c, t) for c in code for t in found.get(c, [])]
         dinfo = pairs[:6] + (["teste-derivado-mais:%d" % (len(pairs) - 6)] if len(pairs) > 6 else [])
-        blocked = [s for s in DERIVED_BLOCK_INFO if s in info]
-        if blocked:   # prova mais fraca que o teste citado: lead/envio no texto mandam ao mini
-            return "mini", ["freio-derivado:" + ",".join(blocked)], paths, tests, info + dinfo
-        ntests = len(set(t for ts in found.values() for t in ts))
-        return "node", ["prova-teste-derivado:%d-teste(s)+%d-codigo(s)" % (ntests, len(found))], paths, tests, info + dinfo
-    return "unknown", ["sem-prova-de-codigo-e-teste"], paths, tests, info + note
+        return judged_derived(found, "prova-teste-derivado", paths, tests, info, dinfo)
+    # regra 7: NENHUM código citado -> o código que a bead nomeia sem caminho (módulo/tela/daemon) ou que as irmãs tocaram, pelos mesmos filtros do citado.
+    # vazio (nada nomeado, nada na árvore, derivado sem teste) -> segue unknown, SEM nota; falhou/ilegível (repo, git, cache de irmãs, rsync, mac-only, espelho) -> unknown + nota `caminho-derivado-ilegivel`, nunca node e nunca "vazio"
+    extra = []
+    if not code:
+        t0 = time.monotonic()
+        try:
+            res = path_derivation(b, text, paths, tests, info, extra)
+        except Unreadable as e:
+            res = None
+            extra.append("caminho-derivado-ilegivel:" + str(e))
+        COST["derivacao_ms"] = int((time.monotonic() - t0) * 1000)
+        if res:
+            return res
+    return "unknown", ["sem-prova-de-codigo-e-teste"], paths, tests, info + note + extra
 
 
 def main(argv):
@@ -558,6 +766,7 @@ def main(argv):
         sys.stderr.write("uso: wa-node-classify.py < bead.json   (o JSON do `bd show <id> --json`)\n")
         return EX_USAGE
     # stdin vazio ou ilegível -> unknown (via Unreadable em load_bead); acima do teto -> unknown
+    t0 = time.monotonic()
     raw = sys.stdin.buffer.read(MAX_IN + 1)
     try:
         if len(raw) > MAX_IN:
@@ -572,10 +781,12 @@ def main(argv):
     if "etiqueta-node:ok" in why:
         basis = "label"
     elif v == "node":
-        basis = "derivado" if any(w.startswith("prova-teste-derivado:") for w in why) else "text"
+        basis = "derivado" if any(w.startswith(("prova-teste-derivado:", "prova-caminho-derivado:")) for w in why) else "text"
     else:
         basis = ""
-    print(json.dumps({"verdict": v, "basis": basis, "reasons": why, "paths": paths, "tests": tests, "info": info}, ensure_ascii=False))
+    # custo: ms da execução inteira e da regra 7 (0 se ela não rodou) + o estado do cache das irmãs; vem ANTES de info (quem lê o fim da linha continua achando `"info": [...]}`)
+    custo = {"ms": int((time.monotonic() - t0) * 1000), "derivacao_ms": COST["derivacao_ms"], "cache": COST["cache"]}
+    print(json.dumps({"verdict": v, "basis": basis, "reasons": why, "paths": paths, "tests": tests, "custo": custo, "info": info}, ensure_ascii=False))
     return {"node": EX_NODE, "mini": EX_MINI}.get(v, EX_UNKNOWN)
 
 

@@ -112,9 +112,15 @@ padrao de sondas volta a 12	_pw_cap="${PILOT_WA_NODE_PASS_PROBES:-30}"	_pw_cap="
 leitura guarda toda entrada do info	map(tostring | select(test("-ilegivel")))	map(tostring)
 leitura sem teto de entradas	select(test("-ilegivel"))) | .[:6] | map(.[:80])	select(test("-ilegivel"))) | map(.[:80])
 leitura sem corte de caracteres	| .[:6] | map(.[:80])	| .[:6]
-info que nao e lista vira leitura limpa	map(.[:80])) else null end)}'	map(.[:80])) else [] end)}'
+info que nao e lista vira leitura limpa	map(.[:80])) else null end), custo:	map(.[:80])) else [] end), custo:
 info ausente vira leitura limpa	leitura: (if (.info | type) == "array" then (.info | map(	leitura: (if true then ((.info // []) | map(
-sonda sem a leitura	,paths:$d.paths,leitura:$d.leitura}'	,paths:$d.paths}'
+sonda sem a leitura	,paths:$d.paths,leitura:$d.leitura,custo:$d.custo}'	,paths:$d.paths,custo:$d.custo}'
+sonda sem o custo	,leitura:$d.leitura,custo:$d.custo}'	,leitura:$d.leitura}'
+custo que nao e objeto vira objeto zerado	else null end)} else null end)}'	else null end)} else {ms:0,derivacao_ms:0,cache:null} end)}'
+custo ms que nao e numero vira 0	if (.custo.ms | type) == "number" then .custo.ms else null end	if (.custo.ms | type) == "number" then .custo.ms else 0 end
+custo derivacao_ms que nao e numero vira 0	if (.custo.derivacao_ms | type) == "number" then .custo.derivacao_ms else null end	if (.custo.derivacao_ms | type) == "number" then .custo.derivacao_ms else 0 end
+custo cache sem corte	(.custo.cache | .[:16])	.custo.cache
+custo cache que nao e texto passa	if (.custo.cache | type) == "string" then	if true then
 3.18: o hold nunca expira	then return 3; fi; return 0 ;;	then return 0; fi; return 0 ;;
 3.18: o limite exige passadas a MAIS (-gt no lugar de -ge)	-ge "${_PWP_HOLD_MAX:-0}" ]; then return 3	-gt "${_PWP_HOLD_MAX:-0}" ]; then return 3
 3.18: limite 0 passa a expirar na hora	[ "${_PWP_HOLD_MAX:-0}" -gt 0 ] && [ "${_PWP_HOLD_PRIOR	[ "${_PWP_HOLD_MAX:-0}" -ge 0 ] && [ "${_PWP_HOLD_PRIOR

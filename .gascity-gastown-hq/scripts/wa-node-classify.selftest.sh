@@ -27,6 +27,7 @@ bad() { n=$((n+1)); echo "FAIL $1"; fails=$((fails+1)); }
 PY=${WA_NODE_SELFTEST_PY:-python3}
 export WA_NODE_MIRROR="$T/espelho-ausente"   # os casos antigos valem SEM espelho (cai no filtro do rsync); o espelho entra só nos casos da seção "espelho git", com um stub
 export WA_NODE_REPO="$T/wa-repo-ausente"     # idem o repo do WA (regra 6): os casos antigos nunca olham o repo de verdade desta máquina; a seção "teste derivado" monta um de mentira
+export WA_NODE_CACHE="$T/cache"            # cache das irmãs (regra 7): nunca o do .gc/ de verdade; os casos que precisam de cache limpo/proibido trocam por env
 
 CLS="$CLS_REAL"; OUT=""; RC=0
 run() { OUT=$(printf '%s' "$1" | "$PY" -I "$CLS" 2>/dev/null); RC=$?; }
@@ -203,6 +204,15 @@ RP="$T/wa-repo"; mkdir -p "$RP"
 gw() { env -i HOME="$T" PATH="$PATH" GIT_CONFIG_NOSYSTEM=1 git -C "$RP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false "$@"; }
 wf() { mkdir -p "$RP/$(dirname "$1")"; printf '%s\n' "$2" > "$RP/$1"; }   # wf <caminho> <conteúdo>
 gw init -q
+gwold() { env -i HOME="$T" PATH="$PATH" GIT_CONFIG_NOSYSTEM=1 GIT_AUTHOR_DATE="2020-01-01T00:00:00" GIT_COMMITTER_DATE="2020-01-01T00:00:00" git -C "$RP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false "$@"; }   # commit de 2020: fora da janela das irmãs
+# o commit velho é o 1º da história de propósito: com ele no topo o `--since` cortaria também os commits novos que vêm abaixo
+wf lib/velha_mod.py "# velha_mod"; wf tests/test_velha_mod.py "velha_mod"; gw add lib/velha_mod.py tests/test_velha_mod.py && gwold commit -q -m "feat(wa-par5.1): velha_mod" || bad "commit velho das irmas nao montado"
+# irmãs (ga-2hd02v.3.20, regra 7): commits `feat(wa-par1.1)`... que tocam arquivos; wa-par1.3 (sem caminho nem nome no texto) herda os de wa-par1.1/.2; wa-par9.1 é de OUTRO pai; wa-par3.1 criou um arquivo que depois saiu da árvore; wa-par4.1 tocou 11 arquivos
+wf lib/irma_mod.py "# irma_mod"; wf tests/test_irma_mod.py "irma_mod"; gw add lib/irma_mod.py tests/test_irma_mod.py && gw commit -q -m "feat(wa-par1.1): irma_mod"
+wf lib/irma_two.py "# irma_two"; gw add lib/irma_two.py && gw commit -q -m "fix(wa-par1.2): irma_two"
+wf lib/outro_mod.py "# outro_mod"; gw add lib/outro_mod.py && gw commit -q -m "fix(wa-par9.1): outro_mod"
+wf lib/removido_mod.py "# removido_mod"; gw add lib/removido_mod.py && gw commit -q -m "feat(wa-par3.1): removido_mod"; gw rm -q lib/removido_mod.py && gw commit -q -m "chore: remove removido_mod"
+for i in 01 02 03 04 05 06 07 08 09 10 11; do wf "lib/mega_$i.py" "# mega_$i"; done; gw add lib && gw commit -q -m "feat(wa-par4.1): mega" || bad "commits das irmas nao montados"
 for m in foo_parser bar_service bar_service_extra utils abcd silent_mod subs_mod orfa_unica flag_mod mac_mod tok_mod ext_mod inner_mod boundary many_mod huge_mod cap_a cap_b cap_c cap_d cap_e late_mod; do wf "lib/$m.py" "# $m"; done
 wf lib/js_mod.js "// js_mod"; wf scripts/run_job.sh "# run_job"; wf lib/dash-mod.py "# dash-mod"; wf tests/test_dash-mod_wa.py "dash-mod"; wf lib/css_mod.css "/* css_mod */"; wf tests/test_css_mod_wa.py "css_mod"   # nome com hífen: fora do formato de módulo
 wf tests/test_foo_parser.py "from lib.foo_parser import parse"; wf tests/test_foo_parser_extra_wa_x1.py "import foo_parser"; wf tests/auto_response/test_foo_parser_sub.py "foo_parser"
@@ -218,6 +228,13 @@ for m in cap_a cap_b cap_c cap_d cap_e; do for i in $(seq -w 1 21); do wf "tests
 # nome solto (ga-2hd02v.3.17): atalho de arquivo em outra pasta. loose_page.html é único; dup_page.html existe em 2 pastas; raiz_page.html mora na raiz; dupr_page.html mora na raiz E em templates/; solto_run.sh tem teste; shared/notas_solto.md é pasta que nunca sai
 wf templates/loose_page.html "<p>x</p>"; wf templates/dup_page.html "<p>a</p>"; wf daemons/templates/dup_page.html "<p>b</p>"; wf raiz_page.html "<p>r</p>"; wf dupr_page.html "<p>r</p>"; wf templates/dupr_page.html "<p>t</p>"; wf "templates/com espaco/pagina_estranha.html" "<p>e</p>"
 wf scripts/solto_run.sh "# solto_run"; wf tests/test_solto_run.py "solto_run"; wf shared/notas_solto.md "# notas"; wf fixtures/solto_dado.json "{}"
+# regra 7 (ga-2hd02v.3.20): código que a bead NOMEIA sem caminho. ficha_donos/form_fill têm teste; dupmod_x mora em 2 pastas; fora_mod mora em shared/ (nunca sai); mac_code_mod entra na lista mac-only do caso; sem_teste_mod não tem teste; ambig_mod mora em 4 pastas; db_x tem nome curto; limcap_NN são 12 módulos
+wf lib/ficha_donos.py "# ficha_donos"; wf tests/test_ficha_donos.py "ficha_donos"; wf lib/form_fill.py "# form_fill"; wf tests/test_form_fill.py "form_fill"
+wf lib/dupmod_x.py "# dupmod_x"; wf daemons/dupmod_x.py "# dupmod_x"; wf tests/test_dupmod_x.py "dupmod_x"
+wf shared/fora_mod.py "# fora_mod"; wf tests/test_fora_mod.py "fora_mod"; wf lib/mac_code_mod.py "# mac_code_mod"; wf tests/test_mac_code_mod.py "mac_code_mod"
+wf lib/sem_teste_mod.py "# sem_teste_mod"; wf lib/db_x.py "# db_x"; wf tests/test_db_x.py "db_x"
+for d in pkg1 pkg2 pkg3 pkg4; do wf "$d/ambig_mod.py" "# ambig_mod"; done; wf tests/test_ambig_mod.py "ambig_mod"
+for i in 01 02 03 04 05 06 07 08 09 10 11 12; do wf "lib/limcap_$i.py" "# limcap_$i"; wf "tests/test_limcap_$i.py" "limcap_$i"; done
 gw add -A && gw commit -q -m 1 && gw update-ref refs/remotes/origin/main HEAD || bad "repo de mentira do WA não montado"
 wf tests/test_late_mod.py "late_mod"; gw add -A && gw commit -q -m 2   # o teste de late_mod só existe no HEAD, não em origin/main
 git_ok=$(gw rev-parse --verify -q refs/remotes/origin/main >/dev/null && gw ls-tree -r --name-only origin/main | grep -c 'test_foo_parser'); [ "$git_ok" = 3 ] && ok "repo de mentira do WA montado (origin/main tem 3 testes de foo_parser; o HEAD tem um a mais em late_mod)" || bad "repo de mentira do WA errado ($git_ok)"
@@ -305,6 +322,100 @@ expect "solto: árvore ilegível (repo inexistente) -> segue solto (mini) COM a 
 expect "solto: com a árvore ilegível o caminho citado com pasta NÃO é adotado (não dá para saber se o solto é o da raiz) -> segue solto (mini) COM a nota" "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar templates/loose_page.html (loose_page.html)")" 10 'caminho-fora-do-filtro:loose_page\.html.*caminho-solto-ilegivel:repo-git-rc-128'
 export WA_NODE_REPO="$T/wa-repo-ausente" WA_NODE_MIRROR="$T/espelho-ausente"
 
+# ---- caminho derivado (ga-2hd02v.3.20, regra 7): a bead NÃO cita código com caminho, mas NOMEIA o módulo (snake_case/hífen) ou é irmã de beads cujos commits tocaram o código -> o caminho que o repo do WA já tem, julgado pelos MESMOS filtros do citado
+export WA_NODE_REPO="$RP" WA_NODE_MIRROR="$T/mirror-ok"
+DESCI() { printf '{"id":"%s","title":"t","description":"%s"}' "$1" "$2"; }   # DESCI <id> <texto>: bead com id explícito (o das irmãs vem do id)
+CUSTO0='"custo": \{"ms": [0-9]+, "derivacao_ms": 0, "cache": "-"\}'
+cachef() { "$PY" -I -c 'import hashlib,sys; print("sib-"+hashlib.sha1(sys.argv[1].encode()).hexdigest()[:20]+".json")' "$1"; }
+seedc() { # seedc <dir> <pai> <idade em s> <lista json> [pai gravado no arquivo]: um cache de irmãs escrito à mão
+  mkdir -p "$1"; "$PY" -I -c 'import json,sys,time; json.dump({"parent": sys.argv[4], "ts": time.time()-float(sys.argv[2]), "files": json.loads(sys.argv[3])}, open(sys.argv[1], "w"))' "$1/$(cachef "$2")" "$3" "$4" "${5:-$2}"
+}
+N_OK='"verdict": "node", "basis": "derivado"'
+expect "caminho: nome snake_case no texto vira o código do repo + o teste que o repo tem -> node derivado, com a origem e o par em info e paths vazio" "$(DESC 'revisar ficha_donos quando a entrada vem vazia')" 0 "$N_OK, \"reasons\": \[\"prova-caminho-derivado:1-teste\(s\)\+1-codigo\(s\)\"\], \"paths\": \[\], \"tests\": \[\].*\"info\": \[\"caminho-derivado:nome:ficha_donos=lib/ficha_donos\.py\", \"teste-derivado:lib/ficha_donos\.py=tests/test_ficha_donos\.py\"\]\}\$"
+expect "caminho: nome com hífen (form-fill) vale como form_fill" "$(DESC 'revisar o form-fill quando o campo vem vazio')" 0 "$N_OK.*caminho-derivado:nome:form_fill=lib/form_fill\.py"
+expect "caminho: maiúscula no texto (Ficha_Donos) acha o mesmo arquivo" "$(DESC 'revisar a Ficha_Donos quando vem vazia')" 0 "$N_OK.*caminho-derivado:nome:ficha_donos=lib/ficha_donos\.py"
+expect "caminho: um nome que existe em 2 pastas deriva os 2 (até 3), cada um com o teste do módulo" "$(DESC 'revisar dupmod_x quando vem vazio')" 0 'prova-caminho-derivado:1-teste\(s\)\+2-codigo\(s\).*"caminho-derivado:nome:dupmod_x=daemons/dupmod_x\.py", "caminho-derivado:nome:dupmod_x=lib/dupmod_x\.py"'
+expect "caminho: teste CITADO + código nomeado -> node, o teste citado é a prova (sem par teste-derivado em info)" "$(DESC 'tests/test_x.py cobre sem_teste_mod quando vem vazio')" 0 "$N_OK, \"reasons\": \[\"prova-caminho-derivado:1-teste\(s\)\+1-codigo\(s\)\"\], \"paths\": \[\"tests/test_x\.py\"\].*\"info\": \[\"caminho-derivado:nome:sem_teste_mod=lib/sem_teste_mod\.py\"\]\}\$"
+expect "caminho: código com nome mas SEM teste e nenhum teste citado -> unknown, e o que foi derivado fica em info" "$(DESC 'revisar sem_teste_mod quando vem vazio')" 11 'sem-prova-de-codigo-e-teste.*"info": \["caminho-derivado:nome:sem_teste_mod=lib/sem_teste_mod\.py"\]\}$'
+expect "caminho: nome que não existe no repo -> unknown SEM nota (vazio é um estado legítimo)" "$(DESC 'revisar modulo_inexistente quando vem vazio')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "caminho: texto sem nome nenhum -> unknown SEM nota e a regra 7 nem roda (derivacao_ms 0)" "$(DESC 'melhorar a mensagem de erro do importador')" 11 "sem-prova-de-codigo-e-teste.*$CUSTO0.*$SEMNOTA"
+expect "caminho: nome curto (db_x) não vale como nome: nem consulta o repo" "$(DESC 'revisar db_x quando vem vazio')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "caminho: nome de 4 arquivos (ambig_mod) é ambíguo: não deriva nenhum, e diz isso" "$(DESC 'revisar ambig_mod quando vem vazio')" 11 'sem-prova-de-codigo-e-teste.*"info": \["caminho-derivado-ambiguo:ambig_mod=4"\]\}$'
+expect "caminho: o que tem pasta (docs/ficha_donos) é caminho, não nome solto" "$(DESC 'ver a pasta docs/ficha_donos quando vem vazia')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "caminho: nome seguido de ponto+letras (ficha_donos.xyz) é arquivo, não nome" "$(DESC 'ver ficha_donos.xyz quando vem vazio')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "caminho: nome seguido de barra (ficha_donos/algo) é pasta, não nome" "$(DESC 'ver ficha_donos/algo quando vem vazio')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "caminho: código CITADO sem teste NÃO é re-derivado por nome (a regra 7 só roda sem código citado)" "$(DESC 'ajustar lib/sem_teste_mod.py e a ficha_donos')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "caminho: 12 nomes (mais que o teto de 10 arquivos) -> a bead não é sobre um módulo só: nada derivado, e diz isso" "$(DESC 'revisar limcap_01 limcap_02 limcap_03 limcap_04 limcap_05 limcap_06 limcap_07 limcap_08 limcap_09 limcap_10 limcap_11 limcap_12')" 11 'sem-prova-de-codigo-e-teste.*"info": \["caminho-derivado-demais:12"\]\}$'
+expect "caminho: 10 nomes (o teto) ainda derivam; em info 6 + o resto contado" "$(DESC 'revisar limcap_01 limcap_02 limcap_03 limcap_04 limcap_05 limcap_06 limcap_07 limcap_08 limcap_09 limcap_10')" 0 'prova-caminho-derivado:10-teste\(s\)\+10-codigo\(s\).*"caminho-derivado-mais:4"'
+# o caminho derivado passa pelo MESMO filtro do citado: o que o rsync segura (shared/) ou a lista mac-only segura manda ao mini; derivar nunca afrouxa regra
+expect "caminho: código derivado que o filtro do rsync segura (shared/) -> mini, com o caminho na razão" "$(DESC 'revisar fora_mod quando vem vazio')" 10 '"reasons": \["caminho-derivado-fora-do-filtro:shared/fora_mod\.py"\]'
+printf '# so no mac\nlib/mac_code_mod.py\n' > "$T/macs-derivado7.txt"
+expect "caminho: controle — mac_code_mod sem a lista mac-only é node" "$(DESC 'revisar mac_code_mod quando vem vazio')" 0 "$N_OK"
+export WA_NODE_MAC_ONLY="$T/macs-derivado7.txt"
+expect "caminho: código derivado que está na lista mac-only -> mini, com o caminho na razão" "$(DESC 'revisar mac_code_mod quando vem vazio')" 10 '"reasons": \["caminho-derivado-so-no-mac:lib/mac_code_mod\.py"\]'
+unset WA_NODE_MAC_ONLY
+expect "caminho: um derivado fora do filtro entre dois que passam leva a bead toda ao mini" "$(DESC 'revisar ficha_donos e fora_mod quando vem vazio')" 10 '"reasons": \["caminho-derivado-fora-do-filtro:shared/fora_mod\.py"\]'
+# palavras duras/moles e freios valem como sempre
+expect "caminho-freio: lead no texto manda ao mini (prova fraca), com a origem em info" "$(DESC 'revisar ficha_donos: o lead some da lista')" 10 '"reasons": \["freio-derivado:dado-de-lead"\].*caminho-derivado:nome:ficha_donos=lib/ficha_donos\.py'
+expect "caminho-freio: envio no texto manda ao mini" "$(DESC 'revisar ficha_donos antes de enviar a mensagem')" 10 '"reasons": \["freio-derivado:envio-whatsapp"\]'
+expect "caminho: palavra mole (banco) ainda vence" "$(DESC 'revisar ficha_donos que abre um sqlite')" 10 'moles:banco-de-dados'
+expect "caminho: telefone no texto ainda vence" "$(DESC 'revisar ficha_donos (31) 98876-5432')" 10 '"reasons": \["dado-no-texto"\]'
+expect "caminho: node:ok continua dando basis label (a regra 7 nem roda)" "$(labels "$(DESC 'revisar ficha_donos')" '["node:ok"]')" 0 '"basis": "label"'
+# falhou/ilegível: unknown COM a nota, nunca node e nunca o mesmo resultado do vazio
+NOTA7() { printf 'sem-prova-de-codigo-e-teste.*"info": \\[.*"caminho-derivado-ilegivel:%s"\\]\\}$' "$1"; }   # a nota é a ÚLTIMA de info; o que já se derivou antes de a leitura falhar fica registrado à frente dela
+FF=$(DESC 'revisar ficha_donos quando a entrada vem vazia')
+export WA_NODE_REPO="$T/wa-repo-ausente"; expect "caminho: repo inexistente -> unknown com a nota (não 'nada derivado')" "$FF" 11 "$(NOTA7 repo-git-rc-128)"; export WA_NODE_REPO="$RP"
+export WA_NODE_RSYNC="$T/rs-rc1";         expect "caminho: rsync que falha na hora de julgar o caminho derivado -> unknown com a nota" "$FF" 11 "$(NOTA7 rsync-rc-1)"; unset WA_NODE_RSYNC
+export WA_NODE_MAC_ONLY="$T/nao-existe.txt"; expect "caminho: lista mac-only ausente -> unknown com a nota (sem caminho citado a lista nunca era lida: a regra 7 lê por conta própria)" "$FF" 11 "$(NOTA7 mac-only-ilegivel)"; unset WA_NODE_MAC_ONLY
+export WA_NODE_GIT="$T/git-grep-quebra";  expect "caminho: git grep que falha ao procurar o teste derivado -> unknown com a nota" "$FF" 11 "$(NOTA7 repo-grep-rc-2)"; unset WA_NODE_GIT
+export WA_NODE_MIRROR="$T/mirror-75";     expect "caminho: espelho em atualização ao julgar o teste derivado -> unknown com a nota" "$FF" 11 "$(NOTA7 espelho-rc-75)"; export WA_NODE_MIRROR="$T/mirror-ok"
+export WA_NODE_REPO="$T/wa-repo-ausente"; expect "caminho: nome curto com o repo ausente não vira nota (nada a consultar)" "$(DESC 'revisar db_x quando vem vazio')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"; export WA_NODE_REPO="$RP"
+# irmãs: o pai vem do id (sem o último .N) ou do campo parent; os arquivos vêm dos commits que citam <pai>.N, só os que ainda existem em origin/main, e passam pelos mesmos filtros
+find "$T/cache" -mindepth 1 -delete 2>/dev/null
+expect "irmas: bead sem caminho nem nome herda o código dos commits das irmãs (.1 e .2) e o teste que o repo tem; 1ª vez = cache miss" "$(DESCI wa-par1.3 'corrigir o caso de borda')" 0 "$N_OK, \"reasons\": \[\"prova-caminho-derivado:1-teste\(s\)\+1-codigo\(s\)\"\].*\"cache\": \"miss\"\}.*\"info\": \[\"caminho-derivado:irmas=lib/irma_mod\.py\", \"caminho-derivado:irmas=lib/irma_two\.py\", \"teste-derivado:lib/irma_mod\.py=tests/test_irma_mod\.py\"\]\}\$"
+[ -f "$T/cache/$(cachef wa-par1)" ] && ok "irmas: o miss gravou o cache do pai wa-par1" || bad "irmas: o miss não gravou o cache"
+expect "irmas: 2ª vez, o mesmo pai vem do cache (hit) e dá o mesmo veredito" "$(DESCI wa-par1.4 'corrigir o caso de borda')" 0 "$N_OK.*\"cache\": \"hit\"\}.*caminho-derivado:irmas=lib/irma_mod\.py"
+expect "irmas: o campo parent da bead vale quando o id não tem ponto" "$(printf '{"id":"wa-zzz9","parent":"wa-par1","title":"t","description":"corrigir o caso de borda"}')" 0 "$N_OK.*caminho-derivado:irmas=lib/irma_mod\.py"
+expect "irmas: pai de outro grupo (wa-par9) não herda o de wa-par1" "$(DESCI wa-par9.2 'corrigir o caso de borda')" 11 'sem-prova-de-codigo-e-teste.*"info": \["caminho-derivado:irmas=lib/outro_mod\.py"\]\}$'
+expect "irmas: pai sem nenhum commit (wa-par2) -> unknown SEM nota (vazio é legítimo), e o miss foi medido" "$(DESCI wa-par2.1 'corrigir o caso de borda')" 11 "sem-prova-de-codigo-e-teste.*\"cache\": \"miss\".*$SEMNOTA"
+expect "irmas: id sem ponto e sem campo parent -> nenhuma consulta às irmãs (cache '-') e unknown SEM nota" "$(DESCI wa-par1 'corrigir o caso de borda')" 11 "sem-prova-de-codigo-e-teste.*$CUSTO0.*$SEMNOTA"
+expect "irmas: campo parent com forma estranha é ignorado (nada vai ao git)" "$(printf '{"id":"wa-zzz8","parent":"wa-par1 -x","title":"t","description":"corrigir o caso de borda"}')" 11 "sem-prova-de-codigo-e-teste.*$CUSTO0.*$SEMNOTA"
+expect "irmas: arquivo que a irmã criou e que SAIU de origin/main não é derivado" "$(DESCI wa-par3.2 'corrigir o caso de borda')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "irmas: mais de 10 arquivos nas irmãs -> a bead não é sobre um módulo só: nada derivado, e diz isso" "$(DESCI wa-par4.2 'corrigir o caso de borda')" 11 'sem-prova-de-codigo-e-teste.*"info": \["caminho-derivado-demais:11"\]\}$'
+expect "irmas: nome no texto + irmãs: as duas origens entram (sem repetir o mesmo arquivo)" "$(DESCI wa-par1.5 'corrigir irma_mod quando vem vazio')" 0 'caminho-derivado:nome:irma_mod=lib/irma_mod\.py", "caminho-derivado:irmas=lib/irma_two\.py"'
+# o cache só poupa tempo: o que ele guarda passa pela árvore e pelos filtros como se tivesse saído do git agora; vencido/torto/de outro pai/ilegível = recalcula
+seedc "$T/cache-s" wa-parc 60 '["lib/ficha_donos.py"]'
+export WA_NODE_CACHE="$T/cache-s"
+expect "cache: pai SEM commits no git mas com cache fresco -> usa o cache (hit): prova que o cache é consultado" "$(DESCI wa-parc.1 'corrigir o caso de borda')" 0 "$N_OK.*\"cache\": \"hit\".*caminho-derivado:irmas=lib/ficha_donos\.py"
+seedc "$T/cache-s" wa-parv $((7*3600)) '["lib/ficha_donos.py"]'
+expect "cache: vencido (7 h) -> recalcula (miss) e o git não tem commit: unknown SEM nota" "$(DESCI wa-parv.1 'corrigir o caso de borda')" 11 "sem-prova-de-codigo-e-teste.*\"cache\": \"miss\".*$SEMNOTA"
+seedc "$T/cache-s" wa-parw 60 '["lib/ficha_donos.py"]' wa-outro
+expect "cache: arquivo de cache de OUTRO pai -> recalcula (miss)" "$(DESCI wa-parw.1 'corrigir o caso de borda')" 11 "sem-prova-de-codigo-e-teste.*\"cache\": \"miss\".*$SEMNOTA"
+mkdir -p "$T/cache-s"; echo 'isto nao e json' > "$T/cache-s/$(cachef wa-parx)"
+expect "cache: arquivo torto -> recalcula (miss), não derruba" "$(DESCI wa-parx.1 'corrigir o caso de borda')" 11 "sem-prova-de-codigo-e-teste.*\"cache\": \"miss\".*$SEMNOTA"
+seedc "$T/cache-s" wa-pary 60 '["lib/nao_existe_mais.py"]'
+expect "cache: arquivo do cache que não está mais em origin/main não é derivado" "$(DESCI wa-pary.1 'corrigir o caso de borda')" 11 "sem-prova-de-codigo-e-teste.*\"cache\": \"hit\".*$SEMNOTA"
+seedc "$T/cache-s" wa-parz 60 '["shared/fora_mod.py"]'
+expect "cache: arquivo do cache que o filtro segura -> mini (o cache não tem voz sobre o filtro)" "$(DESCI wa-parz.1 'corrigir o caso de borda')" 10 'caminho-derivado-fora-do-filtro:shared/fora_mod\.py'
+export WA_NODE_CACHE="/dev/null/sem-cache"
+expect "cache: pasta de cache que não dá para criar -> segue sem cache e diz (nao-gravou), o veredito não muda" "$(DESCI wa-par1.3 'corrigir o caso de borda')" 0 "$N_OK.*\"cache\": \"nao-gravou\""
+# a leitura do git das irmãs que falha: unknown + nota, e NADA vai ao cache (falhou não é 'as irmãs não tocaram em nada')
+stub git-log-quebra 'for a in "$@"; do [ "$a" = log ] && exit 2; done; exec git "$@"'
+stub git-log-lento 'for a in "$@"; do [ "$a" = log ] && sleep 6; done; exec git "$@"'
+export WA_NODE_CACHE="$T/cache-q"
+export WA_NODE_GIT="$T/git-log-quebra"; expect "irmas: git log que falha (rc 2) -> unknown com a nota, nunca node" "$(DESCI wa-par1.3 'corrigir o caso de borda')" 11 "$(NOTA7 irmas-git-rc-2)"; unset WA_NODE_GIT
+[ ! -e "$T/cache-q" ] && ok "irmas: a falha do git não gravou cache" || bad "irmas: a falha do git gravou cache"
+export WA_NODE_GIT="$T/git-log-lento" WA_NODE_SIBLING_TIMEOUT=1; expect "irmas: git log que não responde no prazo próprio -> unknown com a nota" "$(DESCI wa-par1.3 'corrigir o caso de borda')" 11 "$(NOTA7 irmas-git-sem-resposta)"; unset WA_NODE_GIT WA_NODE_SIBLING_TIMEOUT
+export WA_NODE_SIBLING_TIMEOUT=abc; expect "irmas: prazo ilegível volta ao padrão e não derruba" "$(DESCI wa-par1.3 'corrigir o caso de borda')" 0 "$N_OK"; unset WA_NODE_SIBLING_TIMEOUT
+expect "irmas: commit da irmã mais velho que a janela (45 dias; o de 2020) não é derivado -> unknown SEM nota (vazio é legítimo)" "$(DESCI wa-par5.2 'corrigir o caso de borda')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+export WA_NODE_SIBLING_DAYS=99999 WA_NODE_CACHE="$T/cache-largo"; expect "irmas: janela larga (WA_NODE_SIBLING_DAYS=99999 vira o teto de 3650 dias) enxerga o commit de 2020 -> node derivado (cache à parte: o pai vem de outra janela). Sem o teto o git, com --since anterior a 1970, devolve zero commits SEM erro" "$(DESCI wa-par5.2 'corrigir o caso de borda')" 0 "$N_OK.*caminho-derivado:irmas=lib/velha_mod\.py"
+export WA_NODE_SIBLING_DAYS=abc WA_NODE_CACHE="$T/cache-abc"; expect "irmas: janela ilegível volta aos 45 dias (o commit de 2020 segue fora) e não derruba" "$(DESCI wa-par5.2 'corrigir o caso de borda')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+export WA_NODE_SIBLING_DAYS=0 WA_NODE_CACHE="$T/cache-zero"; expect "irmas: janela 0 vira 1 dia (piso): as irmãs de minutos atrás seguem dentro -> node derivado. Sem o piso, --since=0.days.ago é 'agora' e não sobra commit" "$(DESCI wa-par1.3 'corrigir o caso de borda')" 0 "$N_OK"
+unset WA_NODE_SIBLING_DAYS; export WA_NODE_CACHE="$T/cache"
+export WA_NODE_CACHE="$T/cache"
+expect "custo: a saída diz o tempo total e o da regra 7 (>0 quando ela rodou)" "$(DESC 'revisar ficha_donos quando a entrada vem vazia')" 0 '"custo": \{"ms": [0-9]+, "derivacao_ms": [1-9][0-9]*, "cache": "-"\}, "info"'
+export WA_NODE_REPO="$T/wa-repo-ausente" WA_NODE_MIRROR="$T/espelho-ausente"
+
 # ---- o classificador não deixa resíduo e só aceita stdin
 tmp_residue() { # tmp_residue <classificador> -> nº de itens que sobraram num TMPDIR só dele (a bead cita caminhos, então o classificador cria a árvore temporária)
   local d; d=$(mktemp -d "$T/tmpd.XXXXXX")
@@ -343,10 +454,12 @@ mutant() { # mutant <nome> <trecho original> <trecho novo> <json> <rc> <regex> [
   export WA_NODE_FILTER="$REAL_FILTER" WA_NODE_MAC_ONLY="$REAL_MAC"
   for e in $envspec; do export "$e"; done   # várias VAR=valor separadas por espaço ($T não tem espaço)
   CLS="$CLS_REAL"
+  eval "${MUTANT_PRE:-:}"   # recria o estado que o caso precisa (um cache de irmãs escrito à mão): o original reescreve o cache ao recalcular, e o mutante leria o que o original gravou
   if ! check "$json" "$rc" "$rx"; then
     bad "mutante $name VAZIO: o classificador ORIGINAL já reprova o caso designado (rc=$RC, esperado $rc; saída: $(printf '%s' "$OUT" | cut -c1-200))"
   else
     CLS="$M"
+    eval "${MUTANT_PRE:-:}"
     if check "$json" "$rc" "$rx"; then bad "mutante $name SOBREVIVEU (o caso designado ainda passa)"
     elif printf '%s' "$OUT" | grep -q -E 'nao-consegui:(filtro|mac-only)-ilegivel' && ! printf '%s' "$rx" | grep -q 'ilegivel'; then
       bad "mutante $name morreu PELO AMBIENTE, não pela mutação (rc=$RC; saída: $(printf '%s' "$OUT" | cut -c1-200))"
@@ -356,13 +469,15 @@ mutant() { # mutant <nome> <trecho original> <trecho novo> <json> <rc> <regex> [
   unset WA_NODE_FILTER WA_NODE_MAC_ONLY; for e in $envspec; do unset "${e%%=*}"; done
   export WA_NODE_MIRROR="$T/espelho-ausente"   # o padrão da bateria (um envspec pode ter trocado e desarmado)
   export WA_NODE_REPO="$T/wa-repo-ausente"     # idem o repo do WA (a regra 6 só vê o repo de mentira nos casos que o pedem por envspec)
+  export WA_NODE_CACHE="$T/cache"              # idem o cache das irmãs (um envspec que o troca o desarmou; sem isto o mutante gravaria no .gc/ de verdade)
 }
+mutant_pre() { MUTANT_PRE="$1"; shift; mutant "$@"; MUTANT_PRE=""; }   # mutant_pre '<comando>' <args do mutant>: o comando roda antes de CADA execução (original e mutante)
 mutant sem-node-mini     '"node:mini" in labels'                       'False'                                  "$(labels "$GOOD" '["node:mini"]')" 10 'etiqueta-node:mini'
 mutant sem-epic          'b.get("issue_type") == "epic"'               'False'                                  "$(field "$GOOD" issue_type '"epic"')" 10 '"epic"'
 mutant sem-pii           'if has_pii(json.dumps'                       'if False and has_pii(json.dumps'        "$(DESC 'lib/x.py tests/test_x.py (31) 98876-5432')" 10 'dado-no-texto'
 mutant pii-sem-cauda     'len(set(d[-8:])) > 3'                        'len(set(d[-8:])) >= 0'                  "$(DESC 'lib/x.py tests/test_x.py +55 31 99999-9999')" 0 '"verdict": "node"'
 mutant filtro-ignorado   'if p not in sent and p not in via_mirror:'   'if False:'                              "$WITHDB" 10 'caminho-fora-do-filtro'
-mutant mac-ignorado      'elif any(fnmatch.fnmatchcase(p, g) for g in globs):' 'elif False:'                    "$(DESC 'lib/x.py e tests/test_launchd_plist.py')" 10 'so-no-mac' "WA_NODE_MAC_ONLY=$T/macs.txt"
+mutant mac-ignorado      'hard.append("so-no-mac:" + p)' 'pass'                    "$(DESC 'lib/x.py e tests/test_launchd_plist.py')" 10 'so-no-mac' "WA_NODE_MAC_ONLY=$T/macs.txt"
 # o canário tem DUAS metades (o de código TEM de sair, os de segredo NÃO): um mutante por metade e um para as duas; cada um com o rsync que só ELE separa do original
 mutant sem-canario       'if any(c not in sent for c in ok_canary) or any(c in sent for c in no_canary):' 'if False:'          "$GOOD" 11 'canario-errado' "WA_NODE_RSYNC=$T/rs-mudo"
 mutant sem-canario-codigo 'if any(c not in sent for c in ok_canary) or any(' 'if False or any('                          "$GOOD" 11 'canario-errado' "WA_NODE_RSYNC=$T/rs-mudo"
@@ -407,7 +522,7 @@ D_FOO=$(DESC 'Corrigir lib/foo_parser.py quando a entrada vem vazia.')
 mutant derivado-sem-freio       'if blocked:'                          'if False:'                                  "$(DESC 'Corrigir lib/foo_parser.py; o lead some da lista')" 10 'freio-derivado:dado-de-lead' "$DV"
 mutant derivado-freio-sem-lead  'DERIVED_BLOCK_INFO = ("dado-de-lead", "envio-whatsapp")' 'DERIVED_BLOCK_INFO = ("envio-whatsapp",)' "$(DESC 'Corrigir lib/foo_parser.py; o lead some da lista')" 10 'freio-derivado:dado-de-lead' "$DV"
 mutant derivado-freio-sem-envio 'DERIVED_BLOCK_INFO = ("dado-de-lead", "envio-whatsapp")' 'DERIVED_BLOCK_INFO = ("dado-de-lead",)' "$(DESC 'Corrigir lib/foo_parser.py antes de enviar a mensagem')" 10 'freio-derivado:envio-whatsapp' "$DV"
-mutant derivado-basis-text      'basis = "derivado" if any(w.startswith("prova-teste-derivado:") for w in why) else "text"' 'basis = "text"' "$D_FOO" 0 '"basis": "derivado"' "$DV"
+mutant derivado-basis-text      'basis = "derivado" if any(w.startswith(("prova-teste-derivado:", "prova-caminho-derivado:")) for w in why) else "text"' 'basis = "text"' "$D_FOO" 0 '"basis": "derivado"' "$DV"
 mutant derivado-sem-maior       ' and not any(rest == m or rest.startswith(m + "_") for m in longer))' ')' "$(DESC 'ajustar lib/bar_service.py')" 0 'prova-teste-derivado:1-teste\(s\)' "$DV"
 mutant derivado-sem-generico    ' and s not in GENERIC_STEMS'          ''                                           "$(DESC 'ajustar lib/utils.py')" 11 'sem-prova-de-codigo-e-teste' "$DV"
 mutant derivado-sem-minimo      ' and len(s) >= MIN_STEM'              ''                                           "$(DESC 'ajustar lib/abcd.py')" 11 'sem-prova-de-codigo-e-teste' "$DV"
@@ -451,6 +566,41 @@ mutant solto-citado-ignora-a-raiz 'if len(cited) == 1 and ok and p not in tree:'
 mutant solto-citado-sem-arvore    'if len(cited) == 1 and ok and p not in tree:' 'if len(cited) == 1 and p not in tree:' "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar templates/loose_page.html (loose_page.html)")" 10 'caminho-fora-do-filtro:loose_page\.html.*caminho-solto-ilegivel:repo-git-rc-128'
 mutant solto-citado-sem-arvore-nem-raiz 'if len(cited) == 1 and ok and p not in tree:' 'if len(cited) == 1:'                "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar templates/loose_page.html (loose_page.html)")" 10 'caminho-fora-do-filtro:loose_page\.html.*caminho-solto-ilegivel:repo-git-rc-128'
 mutant solto-arvore-lida-nao-marca-ok 'tree, ok = set(repo_tree()), True' 'tree, ok = set(repo_tree()), False'  "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar templates/dup_page.html (dup_page.html)")" 0 'caminho-solto:dup_page\.html=templates/dup_page\.html' "$SV"
+# caminho derivado (ga-2hd02v.3.20, regra 7): um mutante por linha da regra; o repo/espelho de mentira vêm por envspec e o cache é PROIBIDO (/dev/null/...) para o original e o mutante recalcularem do git
+R7="WA_NODE_REPO=$RP WA_NODE_MIRROR=$T/mirror-ok WA_NODE_CACHE=/dev/null/sem-cache"
+FD=$(DESC 'revisar ficha_donos quando a entrada vem vazia')
+mutant caminho-sem-hifen        '.lower().replace("-", "_")'           '.lower()'                                   "$(DESC 'revisar o form-fill quando o campo vem vazio')" 0 'caminho-derivado:nome:form_fill' "$R7"
+mutant caminho-sem-minuscula    '.lower().replace("-", "_")'           '.replace("-", "_")'                         "$(DESC 'revisar a Ficha_Donos quando vem vazia')" 0 'caminho-derivado:nome:ficha_donos' "$R7"
+mutant caminho-nome-curto       's = valid_stem(m.group(1).lower().replace("-", "_"))' 's = m.group(1).lower().replace("-", "_")' "$(DESC 'revisar db_x quando vem vazio')" 11 "$SEMNOTA" "$R7"
+mutant caminho-nome-com-pasta   '(?<![\w/.\-~$])([A-Za-z]'             '(?<![\w.\-~$])([A-Za-z]'                    "$(DESC 'ver a pasta docs/ficha_donos quando vem vazia')" 11 "$SEMNOTA" "$R7"
+mutant caminho-nome-com-ext     '[A-Za-z0-9]+)+)(?![\w/]|\.\w)'        '[A-Za-z0-9]+)+)(?![\w/])'                   "$(DESC 'ver ficha_donos.xyz quando vem vazio')" 11 "$SEMNOTA" "$R7"
+mutant caminho-nome-com-barra   '[A-Za-z0-9]+)+)(?![\w/]|\.\w)'        '[A-Za-z0-9]+)+)(?![\w]|\.\w)'               "$(DESC 'ver ficha_donos/algo quando vem vazio')" 11 "$SEMNOTA" "$R7"
+mutant caminho-ambiguo          'if len(fs) > MAX_FILES_PER_NAME:'     'if False:'                                  "$(DESC 'revisar ambig_mod quando vem vazio')" 11 'caminho-derivado-ambiguo:ambig_mod=4' "$R7"
+mutant caminho-sem-teto         'if len(out) > MAX_DERIVED_CODE:'      'if False:'                                  "$(DESC 'revisar limcap_01 limcap_02 limcap_03 limcap_04 limcap_05 limcap_06 limcap_07 limcap_08 limcap_09 limcap_10 limcap_11 limcap_12')" 11 'caminho-derivado-demais:12' "$R7"
+mutant caminho-sem-teto-irmas   'if len(out) > MAX_DERIVED_CODE:'      'if False:'                                  "$(DESCI wa-par4.2 'corrigir o caso de borda')" 11 'caminho-derivado-demais:11' "$R7"
+mutant caminho-sem-filtro       'if p not in dsent:'                   'if False:'                                  "$(DESC 'revisar fora_mod quando vem vazio')" 10 'caminho-derivado-fora-do-filtro:shared/fora_mod' "$R7"
+mutant caminho-sem-mac-only     'hard.append("caminho-derivado-so-no-mac:" + p)' 'pass'                             "$(DESC 'revisar mac_code_mod quando vem vazio')" 10 'caminho-derivado-so-no-mac:lib/mac_code_mod' "$R7 WA_NODE_MAC_ONLY=$T/macs-derivado7.txt"
+mutant caminho-citado-vale      'if tests:   # a bead cita o teste'    'if False:   # a bead cita o teste'         "$(DESC 'tests/test_x.py cobre sem_teste_mod quando vem vazio')" 0 'prova-caminho-derivado' "$R7"
+mutant caminho-teste-de-mentira 'found = derived_tests(dpaths, globs)' 'found = dict((p, ["tests/x.py"]) for p in dpaths)' "$(DESC 'revisar sem_teste_mod quando vem vazio')" 11 'sem-prova-de-codigo-e-teste' "$R7"
+mutant caminho-falha-vira-vazio 'extra.append("caminho-derivado-ilegivel:" + str(e))' 'pass'                          "$FD" 11 'caminho-derivado-ilegivel:repo-git-rc-128' "WA_NODE_REPO=$T/wa-repo-ausente WA_NODE_MIRROR=$T/mirror-ok WA_NODE_CACHE=/dev/null/sem-cache"
+mutant caminho-com-codigo-citado 'if not code:'                         'if True:'                                   "$(DESC 'ajustar lib/sem_teste_mod.py e a ficha_donos')" 11 "$SEMNOTA" "$R7"
+mutant caminho-basis-text       'w.startswith(("prova-teste-derivado:", "prova-caminho-derivado:"))' 'w.startswith("prova-teste-derivado:")' "$FD" 0 '"basis": "derivado"' "$R7"
+mutant caminho-sem-freio        'if blocked:'                          'if False:'                                  "$(DESC 'revisar ficha_donos: o lead some da lista')" 10 'freio-derivado:dado-de-lead.*caminho-derivado:nome:ficha_donos' "$R7"
+mutant caminho-custo-zero       '"derivacao_ms": COST["derivacao_ms"]' '"derivacao_ms": 0'                          "$FD" 0 '"derivacao_ms": [1-9][0-9]*' "$R7"
+mutant irmas-sem-campo-parent   'if isinstance(p, str) and PARENT_RE.match(p):' 'if False:'                         "$(printf '{"id":"wa-zzz9","parent":"wa-par1","title":"t","description":"corrigir o caso de borda"}')" 0 'caminho-derivado:irmas=lib/irma_mod' "$R7"
+mutant irmas-id-inteiro         'p = i.rsplit(".", 1)[0]'              'p = i'                                      "$(DESCI wa-par1.3 'corrigir o caso de borda')" 0 'caminho-derivado:irmas=lib/irma_mod' "$R7"
+mutant irmas-sem-arvore         'if f in present:'                     'if True:'                                   "$(DESCI wa-par3.2 'corrigir o caso de borda')" 11 "$SEMNOTA" "$R7"
+mutant irmas-rc-ignorado        'raise Unreadable("irmas-git-rc-%d" % r.returncode)' 'pass'                         "$(DESCI wa-par1.3 'corrigir o caso de borda')" 11 'caminho-derivado-ilegivel:irmas-git-rc-2' "$R7 WA_NODE_GIT=$T/git-log-quebra"
+mutant irmas-sem-resposta       'raise Unreadable("irmas-git-sem-resposta")' 'return []'                            "$(DESCI wa-par1.3 'corrigir o caso de borda')" 11 'caminho-derivado-ilegivel:irmas-git-sem-resposta' "$R7 WA_NODE_GIT=$T/git-log-lento WA_NODE_SIBLING_TIMEOUT=1"
+mutant irmas-nao-diz-que-nao-gravou 'COST["cache"] = "miss" if cache_put(parent, names) else "nao-gravou"' 'COST["cache"] = "miss"' "$(DESCI wa-par1.3 'corrigir o caso de borda')" 0 '"cache": "nao-gravou"' "$R7"
+mutant irmas-sem-janela         '"--since=%d.days.ago" % SIBLING_DAYS, '                 ''                    "$(DESCI wa-par5.2 'corrigir o caso de borda')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA" "$R7"
+mutant irmas-janela-sem-piso    'min(3650, max(1, int(os.environ.get("WA_NODE_SIBLING_DAYS", "45"))))' 'min(3650, int(os.environ.get("WA_NODE_SIBLING_DAYS", "45")))' "$(DESCI wa-par1.3 'corrigir o caso de borda')" 0 "$N_OK" "$R7 WA_NODE_SIBLING_DAYS=0"
+mutant irmas-janela-sem-teto    'min(3650, max(1, int(os.environ.get("WA_NODE_SIBLING_DAYS", "45"))))' 'max(1, int(os.environ.get("WA_NODE_SIBLING_DAYS", "45")))' "$(DESCI wa-par5.2 'corrigir o caso de borda')" 0 "$N_OK.*caminho-derivado:irmas=lib/velha_mod\\.py" "$R7 WA_NODE_SIBLING_DAYS=99999"
+# cache: o estado é escrito à mão antes de cada execução (o original, ao recalcular, regrava o cache e o mutante leria o que ele gravou)
+CM="WA_NODE_REPO=$RP WA_NODE_MIRROR=$T/mirror-ok WA_NODE_CACHE=$T/cache-m"
+mutant_pre "seedc $T/cache-m wa-parc 60 '[\"lib/ficha_donos.py\"]'" cache-ignorado '-60 <= age <= SIBLING_TTL' 'False' "$(DESCI wa-parc.1 'corrigir o caso de borda')" 0 '"cache": "hit"' "$CM"
+mutant_pre "seedc $T/cache-m wa-parv $((7*3600)) '[\"lib/ficha_donos.py\"]'" cache-vencido-vale '-60 <= age <= SIBLING_TTL' '-60 <= age' "$(DESCI wa-parv.1 'corrigir o caso de borda')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA" "$CM"
+mutant_pre "seedc $T/cache-m wa-parw 60 '[\"lib/ficha_donos.py\"]' wa-outro" cache-outro-pai 'd["parent"] == parent and ' '' "$(DESCI wa-parw.1 'corrigir o caso de borda')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA" "$CM"
 # o resíduo no TMPDIR: o mutante que não apaga a árvore tem de deixar item para trás (senão o teste de "sem resíduo" passaria mesmo sem a limpeza)
 if mk_mutant sem-limpeza 'shutil.rmtree(root, ignore_errors=True)' 'pass'; then
   left=$(tmp_residue "$T/mut-sem-limpeza.py")

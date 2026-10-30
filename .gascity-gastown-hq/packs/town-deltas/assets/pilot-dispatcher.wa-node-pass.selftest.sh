@@ -622,6 +622,29 @@ reset; chk wa-m1 10; jq -cn --arg long "$long" '{verdict:"mini",basis:"",reasons
 T_EXEMPT=shadow pass "$S3" >/dev/null
 [ "$(probe_of wa-m1 | jq -c '[(.leitura|length), (.leitura|map(length)|max), (.leitura[0]|startswith("teste-derivado-ilegivel:0"))]' 2>/dev/null)" = '[6,80,true]' ] \
   && ok "leitura: no máximo 6 entradas de 80 caracteres (a linha da sonda não cresce com o info)" || bad "teto da leitura: $(probe_of wa-m1 | cut -c1-300)"
+# ga-2hd02v.3.20: `custo` = o que o classificador mediu de si (ms total, ms da derivação de caminho, cache das irmãs). Vai para a linha da sonda para o custo por sonda ser LIDO, não suposto.
+# Objeto -> carregado; ausente ou que não é objeto -> null (o campo todo); campo que não é número/texto -> null NESSE campo. "Não medi" nunca vira 0 ms.
+reset; chk wa-m1 11; echo '{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste"],"paths":[],"custo":{"ms":412,"derivacao_ms":380,"cache":"miss"},"info":[]}' > "$WORK/chk.wa-m1.raw"
+T_EXEMPT=shadow pass "$S3" >/dev/null
+[ "$(probe_of wa-m1 | jq -c '.custo' 2>/dev/null)" = '{"ms":412,"derivacao_ms":380,"cache":"miss"}' ] && ok "custo: o objeto que o classificador mediu vai inteiro para a linha da sonda" || bad "custo carregado: '$(probe_of wa-m1)'"
+reset; chk wa-m1 11; echo '{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste"],"paths":[],"info":[]}' > "$WORK/chk.wa-m1.raw"
+T_EXEMPT=shadow pass "$S3" >/dev/null
+[ "$(probe_of wa-m1 | jq -c '.custo' 2>/dev/null)" = 'null' ] && ok "custo: saída sem o campo (classificador antigo) é null, não {ms:0}" || bad "custo ausente: '$(probe_of wa-m1)'"
+reset; chk wa-m1 11; echo '{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste"],"paths":[],"custo":"rapido","info":[]}' > "$WORK/chk.wa-m1.raw"
+T_EXEMPT=shadow pass "$S3" >/dev/null
+[ "$(probe_of wa-m1 | jq -c '.custo' 2>/dev/null)" = 'null' ] && ok "custo: valor que não é objeto é null (texto não vira custo)" || bad "custo texto: '$(probe_of wa-m1)'"
+reset; chk wa-m1 11; echo '{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste"],"paths":[],"custo":{"ms":"muito","derivacao_ms":5,"cache":7},"info":[]}' > "$WORK/chk.wa-m1.raw"
+T_EXEMPT=shadow pass "$S3" >/dev/null
+[ "$(probe_of wa-m1 | jq -c '.custo' 2>/dev/null)" = '{"ms":null,"derivacao_ms":5,"cache":null}' ] && ok "custo: campo que não é número/texto fica null só nele (o vizinho válido sobrevive, nada vira 0)" || bad "custo com campos ruins: '$(probe_of wa-m1)'"
+reset; chk wa-m1 11; echo '{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste"],"paths":[],"custo":{"ms":5,"derivacao_ms":"x","cache":"hit"},"info":[]}' > "$WORK/chk.wa-m1.raw"
+T_EXEMPT=shadow pass "$S3" >/dev/null
+[ "$(probe_of wa-m1 | jq -c '.custo' 2>/dev/null)" = '{"ms":5,"derivacao_ms":null,"cache":"hit"}' ] && ok "custo: derivacao_ms que não é número também fica null só nele (ms e cache válidos sobrevivem, nada vira 0)" || bad "custo com derivacao_ms ruim: '$(probe_of wa-m1)'"
+reset; chk wa-m1 11; jq -cn --arg long "$long" '{verdict:"unknown",basis:"",reasons:["sem-prova-de-codigo-e-teste"],paths:[],custo:{ms:1,derivacao_ms:1,cache:("hit"+$long)},info:[]}' > "$WORK/chk.wa-m1.raw"
+T_EXEMPT=shadow pass "$S3" >/dev/null
+[ "$(probe_of wa-m1 | jq -c '[(.custo.cache|length), (.custo.cache|startswith("hit"))]' 2>/dev/null)" = '[16,true]' ] && ok "custo: o texto do cache é cortado em 16 caracteres (a linha da sonda não cresce)" || bad "teto do cache: $(probe_of wa-m1 | cut -c1-300)"
+reset; chk wa-m1 124; chk wa-n1 2
+T_EXEMPT=shadow pass "$S3" >/dev/null
+[ "$(probe_of wa-m1 | jq -c '.custo' 2>/dev/null)" = 'null' ] && [ "$(probe_of wa-n1 | jq -c '.custo' 2>/dev/null)" = 'null' ] && ok "custo: sem saída do classificador (timeout, error) é null" || bad "custo sem saída: m1='$(probe_of wa-m1)' n1='$(probe_of wa-n1)'"
 # sem saída por definição (prazo, rc fora do contrato): 'sem-saida', a sonda ainda é contada
 reset; chk wa-m1 124; chk wa-n1 2
 T_EXEMPT=shadow pass "$S3" >/dev/null
