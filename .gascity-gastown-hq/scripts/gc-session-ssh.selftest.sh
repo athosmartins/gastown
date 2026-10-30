@@ -1249,6 +1249,71 @@ g_abort() {  # ga-0k82lw: o start que o mini ABANDONOU (prazo do provider estour
   pv stop abort-3 </dev/null; rm -f "$bin/sha256sum" "$T/state/a/running/"* 2>/dev/null; cfg 3
 }
 
+g_scope() {  # ga-kgnjkt8 fatia 2: teto POR SESSÃO no start remoto. O claude e as ferramentas dele moram na árvore do lançador; foi lá que uma fork bomb sem teto parou o nó (29/10). O lançador passa a rodar o comando num escopo systemd do usuário (TasksMax/MemoryMax por sessão) e com o limite de tarefas do usuário baixado pelo prlimit
+  local l="$T/scope.l.sh" xdg="$T/scope.xdg" noxdg="$T/scope.noxdg" sb="$T/scope.sb" sbn="$T/scope.sbn" sbp="$T/scope.sbp" x rc a b ra rb
+  mkdir -p "$xdg" "$noxdg" "$sb" "$sbn" "$sbp" "$RR/run" "$RR/city/.gc/agents/dog"
+  python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])" "$xdg/bus"   # um socket de verdade: o lançador testa `[ -S .../bus ]`
+  for t in sh id rm cat env sleep; do for d in "$sb" "$sbn" "$sbp"; do ln -sf "$(command -v $t)" "$d/$t"; done; done
+  printf '#!/bin/sh\n: > "%s/scope.ran"\nexit "${SCOPE_RC:-0}"\n' "$T" > "$sb/claude"; cp "$sb/claude" "$sbn/claude"; cp "$sb/claude" "$sbp/claude"; chmod +x "$sb/claude" "$sbn/claude" "$sbp/claude"
+  printf '#!/bin/sh\necho "$@" > "%s/scope.sdr"\nwhile [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done\nshift\nexec "$@"\n' "$T" > "$sb/systemd-run"; cp "$sb/systemd-run" "$sbp/systemd-run"; chmod +x "$sb/systemd-run" "$sbp/systemd-run"   # systemd-run de brinquedo: só $sb e $sbp
+  printf '#!/bin/sh\ncase "$*" in *--noheadings*) echo "${FAKE_NPROC_SOFT:-unlimited}"; exit 0;; esac\necho "$1" > "%s/scope.nproc"\nshift\nexec "$@"\n' "$T" > "$sb/prlimit"; cp "$sb/prlimit" "$sbn/prlimit"; chmod +x "$sb/prlimit" "$sbn/prlimit"   # prlimit de brinquedo: em $sb e $sbn (o $sbp não tem); responde ao limite atual (FAKE_NPROC_SOFT) e anota o --nproc que recebeu
+  # roda o lançador que o dry-run mostrou, numa areia de PATH ($1 = areia, $2 = pasta do runtime do usuário, resto = variáveis extras); rc em $rc
+  runl() { local pa="$1" xd="$2"; shift 2; rm -f "$T/scope.ran" "$T/scope.nproc" "$T/scope.sdr" "$RR/run/dog-1.exit"; cp "$l" "$T/scope.l.run.sh"
+    env -i PATH="$pa" XDG_RUNTIME_DIR="$xd" HOME="$T/home" "$@" sh "$T/scope.l.run.sh" >/dev/null 2>&1; rc=$?; }
+  # --- o dry-run mostra o lançador com o teto; host SEM session_scope fica como sempre foi
+  cfg 3; fresh; pv --dry-run start dog-1 < <(req claude); jq -r '.launcher[]' "$T/out" > "$l"
+  ! grep -q -e systemd-run -e prlimit -e ulimit "$l"; ok $? "scope: host sem session_scope → o lançador não tem systemd-run nem prlimit (tudo como antes)"
+  [ "$(jq -r .session_scope "$T/out")" = null ]; ok $? "scope: ...e o dry-run diz session_scope null"
+  cfg 3 25 '{"session_scope":{"tasks_max":2048,"memory_max":"6G","nproc_soft":8192}}'; fresh; pv --dry-run start dog-1 < <(req claude); jq -r '.launcher[]' "$T/out" > "$l"
+  grep -qF -e '--nproc=8192:' "$l" && ! grep -q 'ulimit' "$l"; ok $? "scope: o limite de tarefas do usuário vai pelo prlimit (o ulimit -u do dash, o sh do nó, NÃO existe), só o soft: --nproc=8192:"
+  grep -qE '"\$SDR" --user --scope --quiet --collect --unit=gc-session-dog-1-\$\$ -p TasksMax=2048 -p MemoryMax=6G -p MemorySwapMax=0 -- \$RL sh -c ' "$l"; ok $? "scope: o comando da sessão roda em systemd-run --user --scope (unidade gc-session-<sessão>-<pid>) com TasksMax=2048, MemoryMax=6G e sem swap, e o prlimit entra DENTRO do escopo"
+  [ "$(jq -c .session_scope "$T/out")" = '{"memory_max":"6G","nproc_soft":8192,"tasks_max":2048}' ]; ok $? "scope: o dry-run diz o teto que valeu"
+  cfg 3 25 '{"session_scope":{}}'; fresh; pv --dry-run start dog-1 < <(req claude)
+  [ "$(jq -c .session_scope "$T/out")" = '{"memory_max":"6G","nproc_soft":8192,"tasks_max":2048}' ]; ok $? "scope: session_scope {} liga com os padrões (2048 tarefas, 6G, nproc 8192): objeto vazio NÃO é 'desligado'"
+  cfg 3 25 '{"session_scope":{"nproc_soft":0}}'; fresh; pv --dry-run start dog-1 < <(req claude); jq -r '.launcher[]' "$T/out" > "$l"
+  ! grep -q -e prlimit -e '\$RL' "$l" && grep -q -F 'TasksMax=2048' "$l"; ok $? "scope: nproc_soft 0 = sem prlimit (o escopo continua)"
+  # --- config inválida recusa (exit 1, sem ssh, dizendo a chave): nunca liga um teto diferente do pedido em silêncio
+  for x in '"sim"' 'true' 'false' '[]' '5' '{"tasks_max":0}' '{"tasks_max":63}' '{"tasks_max":"2048"}' '{"tasks_max":true}' '{"tasks_max":1.5}' '{"tasks_max":1000001}' '{"memory_max":"6 GB"}' '{"memory_max":"0"}' '{"memory_max":"-1G"}' '{"memory_max":6}' '{"memory_max":"6GB"}' '{"memory_max":""}' '{"memory_max":"1000000G"}' '{"memory_max":"6144"}' '{"memory_max":"1K"}' '{"memory_max":"255M"}' '{"nproc_soft":-1}' '{"nproc_soft":"8192"}' '{"nproc_soft":true}' '{"nproc_soft":255}' '{"bogus":1}'; do
+    cfg 3 25 "{\"session_scope\":$x}"; fresh; pv --dry-run start dog-1 < <(req claude); [ $RC = 1 ] && has "$T/err" "'session_scope'" && ! has "$T/err" Traceback && nossh; ok $? "scope: session_scope=$x recusa a config com a mensagem do provider (exit 1, cita 'session_scope', SEM traceback, sem ssh) (rc=$RC)"
+  done
+  for x in '{"tasks_max":64}' '{"tasks_max":1000000}' '{"memory_max":"512M"}' '{"memory_max":"256M"}' '{"memory_max":"1T"}' '{"memory_max":"262144K"}' '{"nproc_soft":256}' '{"nproc_soft":1000000}' '{"nproc_soft":0}' 'null'; do
+    cfg 3 25 "{\"session_scope\":$x}"; fresh; pv --dry-run start dog-1 < <(req claude); [ $RC = 0 ]; ok $? "scope: session_scope=$x é aceito (rc=$RC)"
+  done
+  cfg 3 25 '{"presence_gate":true}'; fresh; pv --dry-run start dog-1 < <(req claude); [ $RC = 0 ]; ok $? "scope: (controle) host de presença sozinho é aceito (rc=$RC)"
+  cfg 3 25 '{"session_scope":{},"presence_gate":true}'; fresh; pv --dry-run start dog-1 < <(req claude); [ $RC = 1 ] && has "$T/err" "'session_scope' é do host Linux" && nossh; ok $? "scope: session_scope num host macOS (presença/gui) recusa dizendo que o escopo é do host Linux com systemd (rc=$RC)"
+  # --- o lançador gerado, EXECUTADO numa areia de PATH (nada de systemd de verdade aqui)
+  cfg 3 25 '{"session_scope":{"tasks_max":2048,"memory_max":"6G","nproc_soft":8192}}'; fresh; pv --dry-run start dog-1 < <(req claude); jq -r '.launcher[]' "$T/out" > "$l"
+  runl "$sbn" "$xdg"; [ $rc = 126 ] && [ ! -e "$T/scope.ran" ] && grep -q 'sem systemd --user' "$RR/run/dog-1.exit"; ok $? "scope: sem systemd-run no host (e com prlimit e barramento) o lançador RECUSA (rc 126, 'sem systemd --user' no .exit) e o comando NÃO roda sem teto (rc=$rc)"
+  runl "$sb" "$noxdg"; [ $rc = 126 ] && [ ! -e "$T/scope.ran" ] && grep -q 'sem systemd --user' "$RR/run/dog-1.exit"; ok $? "scope: sem o barramento do usuário (sem gerenciador; com systemd-run e prlimit) recusa do mesmo jeito (rc=$rc)"
+  runl "$sbp" "$xdg"; [ $rc = 126 ] && [ ! -e "$T/scope.ran" ] && grep -q 'sem prlimit' "$RR/run/dog-1.exit"; ok $? "scope: com nproc_soft ligado e SEM prlimit no host recusa (rc 126, 'sem prlimit'), nunca roda calado só com o escopo (rc=$rc)"
+  runl "$sb" "$xdg" FAKE_NPROC_SOFT=lixo; [ $rc = 126 ] && [ ! -e "$T/scope.ran" ] && grep -q 'não consegui ler o limite' "$RR/run/dog-1.exit"; ok $? "scope: limite atual de tarefas ilegível (o prlimit respondeu lixo) recusa, não 'sem limite' (rc=$rc)"
+  runl "$sb" "$xdg"; [ $rc = 0 ] && [ -e "$T/scope.ran" ] && [ ! -e "$RR/run/dog-1.exit" ]; ok $? "scope: com systemd-run, prlimit e barramento o comando roda (rc=$rc) e o .exit não aparece"
+  grep -qE -e '--user --scope --quiet --collect --unit=gc-session-dog-1-[0-9]+ -p TasksMax=2048 -p MemoryMax=6G -p MemorySwapMax=0 -- [^ ]*prlimit --nproc=8192: sh -c' "$T/scope.sdr"; ok $? "scope: o systemd-run recebeu o teto, uma unidade com o pid do lançador (única mesmo se o nome da sessão voltar) e o prlimit --nproc=8192: antes do comando"
+  [ "$(cat "$T/scope.nproc" 2>/dev/null)" = '--nproc=8192:' ]; ok $? "scope: o prlimit pôs só o soft (--nproc=8192:)"
+  runl "$sb" "$xdg" FAKE_NPROC_SOFT=4096; [ $rc = 0 ] && [ -e "$T/scope.ran" ] && [ ! -e "$T/scope.nproc" ]; ok $? "scope: o limite só BAIXA: um que já era menor (4096) não é mexido (nem sobe para 8192) e o comando roda (rc=$rc)"
+  runl "$sb" "$xdg" SCOPE_RC=7; [ $rc = 7 ] && grep -q 'saiu com 7' "$RR/run/dog-1.exit"; ok $? "scope: o rc do comando atravessa o escopo (7) e o .exit diz 'saiu com 7' (rc=$rc)"
+  # --- o kernel de verdade (Linux com systemd --user; senão skip, que NÃO conta como passou), com o sh do nó: duas sessões, uma bate no teto e a outra segue criando processos; e o limite de tarefas visto de DENTRO
+  if [ "$(uname -s)" = Linux ] && command -v systemd-run >/dev/null 2>&1 && command -v prlimit >/dev/null 2>&1 && [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -S "$XDG_RUNTIME_DIR/bus" ] && systemd-run --user --scope --quiet --collect -p TasksMax=16 true >/dev/null 2>&1; then
+    printf 'import os, sys, time\ntag, want = sys.argv[1], int(sys.argv[2])\nn = 0\nfor _ in range(want):\n    try:\n        pid = os.fork()\n    except OSError:\n        continue\n    if pid == 0:\n        time.sleep(20)\n        os._exit(0)\n    n += 1\nopen("%s/scope.n." + tag, "w").write(str(n))\ntime.sleep(8)\n' "$T" > "$T/scope.fork.py"
+    printf 'import resource, sys\nopen("%s/scope.lim." + sys.argv[1], "w").write(str(resource.getrlimit(resource.RLIMIT_NPROC)[0]))\n' "$T" > "$T/scope.lim.py"
+    a="scp$$a"; b="scp$$b"; rm -f "$T/scope.n.a" "$T/scope.n.b" "$T/scope.lim.u" "$T/scope.lim.l"
+    cfg 3 25 '{"session_scope":{"tasks_max":64,"memory_max":"1G","nproc_soft":0}}'
+    fresh; pv --dry-run start "$a" < <(req "python3 -I $T/scope.fork.py a 300") ; jq -r '.launcher[]' "$T/out" > "$T/scope.la.sh"
+    fresh; pv --dry-run start "$b" < <(req "python3 -I $T/scope.fork.py b 20") ; jq -r '.launcher[]' "$T/out" > "$T/scope.lb.sh"
+    ( env PATH="$PATH" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" HOME="$T/home" sh "$T/scope.la.sh" >/dev/null 2>&1 & ); ( env PATH="$PATH" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" HOME="$T/home" sh "$T/scope.lb.sh" >/dev/null 2>&1 & )
+    ra=0; rb=0; for _ in $(seq 1 60); do ra=$(cat "$T/scope.n.a" 2>/dev/null || echo 0); rb=$(cat "$T/scope.n.b" 2>/dev/null || echo 0); [ "$ra" != 0 ] && [ "$rb" != 0 ] && break; sleep 0.25; done
+    [ "$ra" -ge 10 ] && [ "$ra" -le 64 ]; ok $? "scope: a sessão que tenta criar 300 filhos com tasks_max=64 consegue entre 10 e 64 (sem teto seriam 300; criou $ra)"
+    [ "$rb" = 20 ]; ok $? "scope: ...e a OUTRA sessão, no mesmo instante, cria os 20 filhos dela (o teto é por sessão: criou $rb)"
+    systemctl --user stop "gc-session-$a-*" "gc-session-$b-*" >/dev/null 2>&1
+    cfg 3 25 '{"session_scope":{"nproc_soft":8192}}'; fresh; pv --dry-run start "$a" < <(req "python3 -I $T/scope.lim.py u"); jq -r '.launcher[]' "$T/out" > "$T/scope.lu.sh"
+    fresh; pv --dry-run start "$b" < <(req "python3 -I $T/scope.lim.py l"); jq -r '.launcher[]' "$T/out" > "$T/scope.ll.sh"
+    env PATH="$PATH" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" HOME="$T/home" sh "$T/scope.lu.sh" >/dev/null 2>&1
+    env PATH="$PATH" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" HOME="$T/home" prlimit --nproc=4096: sh "$T/scope.ll.sh" >/dev/null 2>&1
+    [ "$(cat "$T/scope.lim.u" 2>/dev/null)" = 8192 ]; ok $? "scope: com o sh do nó (dash) o comando da sessão nasce com RLIMIT_NPROC 8192 (visto de dentro: $(cat "$T/scope.lim.u" 2>/dev/null))"
+    [ "$(cat "$T/scope.lim.l" 2>/dev/null)" = 4096 ]; ok $? "scope: ...e um limite que já era 4096 continua 4096 (só baixa; visto de dentro: $(cat "$T/scope.lim.l" 2>/dev/null))"
+  else echo "skip scope: sem systemd-run --user e prlimit utilizáveis aqui (Linux com gerenciador de usuário): os casos do kernel de verdade NÃO rodaram"; fi
+}
+
 g_shard() {  # o filtro do PRÓPRIO selftest (GCSSH_SHARD, GCSSH_ONLY, GCSSH_MUTANTS_ONLY): fatia inválida, ou filtro que não pega nada, não pode sair verde (gate de 23/10 da ga-w7qwl1.1.8: GCSSH_SHARD=10/10 rodava zero e saía 0)
   # cada filho é ESTE arquivo com um filtro; os de recusa levam GCSSH_NO_MUTANTS=1: se a validação voltar a deixar passar, o filho roda "zero casos" e não a campanha de mutantes
   local s oo rr
@@ -1273,7 +1338,7 @@ g_shard() {  # o filtro do PRÓPRIO selftest (GCSSH_SHARD, GCSSH_ONLY, GCSSH_MUT
   [ $rr = 0 ] && [ "$(printf '%s\n' "$oo" | grep -c '^ok   mutante .* pego')" = 1 ] && printf '%s\n' "$oo" | grep -q '^== final: 1/1 ok ==$' && ! printf '%s\n' "$oo" | grep -q 'NADA RODOU'; ok $? "shard: (controle) GCSSH_SHARD=1/9999 roda exatamente 1 mutante, pego, e sai 0 (rc=$rr: $(printf '%s' "$oo" | tail -c 110))"
 }
 
-all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group gui && g_gui; group acct && g_acct; group prof && g_prof; group lr && g_lr; group lrd && g_lrd; group abort && g_abort; group shard && g_shard; return 0; }
+all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group gui && g_gui; group acct && g_acct; group prof && g_prof; group lr && g_lr; group lrd && g_lrd; group abort && g_abort; group scope && g_scope; group shard && g_shard; return 0; }
 
 if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
 # GCSSH_SHARD=K/N: dois decimais canônicos (sem sinal, sem espaço, sem zero à esquerda: `[ 3 = 03 ]` é falso e $((mn % 010)) é octal, então a fatia ficaria vazia ou trocada sem aviso), N de 1 a 9999 e K de 0 a N-1
@@ -1496,10 +1561,37 @@ case "$shn" in [1-9]*) ;; *) shard_bad;; esac
   mutant gui "2ª chamada sem o piso do veredito do agente (o ssh é cortado com o agente subindo)" 's/max(OPEN_MIN + (cfg.gui_wait if cfg.gui else 0), int(/max(OPEN_MIN, int(/'
   mutant gui "start abandonado lido como recusa do domínio gráfico (o rc 14 vira o do gui_agent)" 's/^EX_GUI = 15/EX_GUI = 14/;s/exit 15/exit 14/g'
   mutant gui "2ª chamada sem as funções do agente (agent_down e o U do gui/<uid> não existem lá)" 's/\.replace("@AGENT1@", agent1)/.replace("@AGENT1@", "")/'
+  mutant scope "o comando da sessão roda sem o escopo (o scope_pre some do run_cmd)" 's/{scope_pre}sh -c/sh -c/'
+  mutant scope "o escopo perde o TasksMax" 's/ -p TasksMax={sc\["tasks_max"\]}//'
+  mutant scope "o escopo perde o MemoryMax" 's/ -p MemoryMax={sc\["memory_max"\]}//'
+  mutant scope "o escopo perde o MemorySwapMax=0" 's/ -p MemorySwapMax=0 -- / -- /'
+  mutant scope "o escopo deixa de ser --collect" 's/--quiet --collect --unit=/--quiet --unit=/'
+  mutant scope "a unidade perde o pid do lançador (nome repetido colide)" 's/--unit=gc-session-{name}-\$\$/--unit=gc-session-{name}/'
+  mutant scope "sem systemd-run o lançador segue sem teto (não recusa)" 's/\[ -n "\$SDR" \] && //'
+  mutant scope "sem o barramento do usuário o lançador segue sem teto" 's/ && \[ -S "\$XDG_RUNTIME_DIR\/bus" \]//'
+  mutant scope "a recusa do lançador sai com 0 em vez de 126" 's/exit 126/exit 0/g'
+  mutant scope "sem prlimit o lançador segue só com o escopo (calado)" '/sem prlimit (util-linux) no host/d'
+  mutant scope "limite atual ilegível vira 'sem limite' em vez de recusar" 's/""|\*\[!0-9\]\*) echo "teto da sessão: não consegui ler o limite de tarefas (prlimit): a sessão não abre sem teto" >{q(exitf)}; exit 126 ;;/""|*[!0-9]*) RL= ;;/'
+  mutant scope "o prlimit sobe um limite que já era menor" 's/\[ "\$lim" -gt {n} \]/true/'
+  mutant scope "nproc_soft 0 liga o prlimit mesmo assim" 's/        if sc\["nproc_soft"\]:  # o `ulimit/        if True:  # o `ulimit/'
+  mutant scope "o prlimit sai da linha do comando" 's/ + ("\$RL " if sc\["nproc_soft"\] else "")//'
+  mutant scope "o prlimit põe o hard também" 's/RL="\$PRL --nproc={n}:"/RL="$PRL --nproc={n}:{n}"/g'
+  mutant scope "tasks_max sem faixa" 's/64 <= out\["tasks_max"\] <= 1000000/True/'
+  mutant scope "memory_max sem o piso de 256M" 's/< SCOPE_MEM_MIN_MB/< 0/'
+  mutant scope "memory_max aceita número sem sufixo (bytes)" 's/(\[1-9\]\[0-9\]{0,5})(\[KMGT\])/([1-9][0-9]{0,5})([KMGT]?)/'
+  mutant scope "chave desconhecida do session_scope é aceita" 's/ or set(sc) - set(SCOPE_KEYS)//'
+  mutant scope "forma errada (texto, booleano) do session_scope é aceita" 's/not isinstance(sc, dict) or //'
+  mutant scope "objeto vazio desliga o teto" 's/        if sc is None:/        if not sc:/'
+  mutant scope "nproc_soft sem faixa" 's/(out\["nproc_soft"\] == 0 or 256 <= out\["nproc_soft"\] <= 1000000)/True/'
+  mutant scope "host macOS aceita o escopo" 's/if self.scope and (self.gui or self.gate):/if False:/'
+  mutant scope "o dry-run não diz o teto" 's/ session_scope=cfg.scope,//'
+  mutant scope "o padrão de tasks_max muda" 's/"tasks_max": 2048, "memory_max"/"tasks_max": 4096, "memory_max"/'
+  mutant scope "o padrão de memory_max muda" 's/"memory_max": "6G", "nproc_soft": 8192}/"memory_max": "8G", "nproc_soft": 8192}/'
+  mutant scope "o padrão de nproc_soft muda" 's/"nproc_soft": 8192}/"nproc_soft": 16384}/'
   [ -n "${GCSSH_MUTANTS_ONLY:-}" ] || [ "${GCSSH_SHARD%/*}" != 0 ] || {
   echo "-- contra um stub que só sai 0 (a versão 'anterior' não tinha provider nenhum)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"
-  r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate,prep,wt,gui,acct,prof" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
+  r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate,prep,wt,gui,acct,prof,scope" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
   case "$r" in "RESULT 0/"*|"") ok 1 "stub deveria falhar quase tudo ($r)";; *) ok 0 "stub falha os casos novos ($r)";; esac
   }
   echo "== final: $((n-fails))/$n ok =="

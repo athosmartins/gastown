@@ -4,7 +4,7 @@ interface das locais (start, stop, interrupt, is-running, peek, nudge, send-keys
 meta, attach). ga-2hd02v.1.1, desenho do ga-ukxa3k, fatia 2. Python 3.9+, só biblioteca padrão.
 
 Contents
-  Uso · O que faz · Vários hosts e o MBP · Cache do list-running · O que NÃO faz · Configuração · Códigos de saída
+  Uso · O que faz · Vários hosts e o MBP · Cache do list-running · Teto por sessão · O que NÃO faz · Configuração · Códigos de saída
 
 USO
   GC_SESSION=exec:<cidade>/scripts/gc-session-ssh                (ou, no híbrido, `remote_exec` — patch em docs/pending-engine-window/)
@@ -82,13 +82,19 @@ O QUE NÃO FAZ (cada item é de outra fatia ou é recusa de propósito)
   que {remote_home}/.claude/hooks/remote-clone-guard.py é byte a byte o do repositório e que o `--selfcheck` dele aprova as settings
   do host e a pasta da sessão (hook em Bash/Edit/Write/MultiEdit/NotebookEdit, com `|| exit 2`, sem disableAllHooks em nenhuma camada); senão exit 12 do script e nada abre.
 
+TETO POR SESSÃO (ga-kgnjkt8, decisão do Mayor 30/10; runbook: "Teto por sessão")
+  29/10 o nó parou por 3 h; a causa provável, reproduzida em cgroup com teto, é uma fork bomb de uma sessão de revisor sem teto. O claude e as ferramentas dele moram na árvore do lançador, que no nó fica num session-N.scope do logind (medido), FORA de qualquer teto do
+  gerenciador de usuário. `session_scope` na config do host (ausente/null = desligado; objeto, até o vazio, liga) faz o lançador rodar o comando num escopo systemd do usuário (`systemd-run --user --scope
+  -p TasksMax -p MemoryMax -p MemorySwapMax=0`, unidade gc-session-<sessão>-<pid>) com o limite de tarefas do USUÁRIO baixado pelo prlimit dentro dele (o ulimit -u do dash, o sh do nó, não existe; só baixa).
+  Sem systemd-run, sem o barramento do usuário, sem prlimit ou com o limite atual ilegível o lançador RECUSA (rc 126, motivo no .exit): a sessão nunca roda calada sem teto. Host macOS não tem escopo (recusa).
+
 CONFIGURAÇÃO  $GC_SSH_CONFIG ou <cidade>/.gc/session-ssh.json (cidade = pasta acima de scripts/)
   {"default_host": "hetzner", "hosts": {"hetzner": {"ssh": "hetzner-teste", "cap": 4,
      "remote_root": "/home/runner/gt-remote/bundle", "remote_home": "/home/runner"}}}
   obrigatórios: ssh (alias/destino), cap (teto de sessões deste host, contado SÓ no socket do provider, separado do teto do mini),
   remote_root (= --remote-root do remote-bundle-build.py), remote_home. opcionais: socket (gc-remote), connect_timeout (10),
   timeout (25) e start_timeout (60) em segundos, list_cache_s (10; inteiro de 0 a 120, 0 desliga o cache do list-running INTEIRO; qualquer outra coisa recusa a config), list_down_cache_s (30; inteiro de 0 a 60, 0 desliga só o cache do host fora; qualquer outra coisa recusa a config), ssh_opts [], env_allow [], mini_home, real_sessions_released_by (ver acima), worktree_prepare (true/false; padrão true, e false num host
-  com presence_gate: preparo do worktree no start, ver acima; texto no lugar de true/false é erro de configuração), worktree_rigs ({"dog": "gascity"}: papel → rig dos worktrees que o provider cria e recolhe; ausente = nenhum). Só para o notebook (MBP): path_extra [] (dirs
+  com presence_gate: preparo do worktree no start, ver acima; texto no lugar de true/false é erro de configuração), worktree_rigs ({"dog": "gascity"}: papel → rig dos worktrees que o provider cria e recolhe; ausente = nenhum), session_scope ({"tasks_max": 2048, "memory_max": "6G", "nproc_soft": 8192}: teto por sessão, ver acima; ausente/null = desligado, {} = os padrões, chave desconhecida ou valor fora da faixa recusa a config). Só para o notebook (MBP): path_extra [] (dirs
   absolutos à frente do PATH do ssh sem login: /opt/homebrew/bin), presence_gate (true), gate_cmd ([lista]), presence_lib (padrão
   <remote_home>/gt-remote/bin/mbp-presence.sh), watch_s (5), sleeps (true), session_env ({"path": [pastas], "claude": "/abs/claude"}; OBRIGATÓRIO em
   host que dorme, ga-w7qwl1.1.5: o claude da sessão roda com ZDOTDIR=<remote_root>/zdot e CLAUDE_ENV_FILE=<remote_root>/zdot/env.sh do bundle
@@ -151,6 +157,13 @@ EX_CAP, EX_EXISTS, EX_POLICY, EX_PREP = 10, 11, 12, 13
 # Cache de TTL curto da resposta BOA do list-running, por host (ga-it7qiq.5): as ~16-20 chamadas em série de um `gc rig list --json` têm respostas idênticas (números medidos no cabeçalho, CACHE DO list-running).
 # Só o que o host respondeu entra; erro, timeout e resposta cortada nunca são guardados nem viram lista vazia. start e stop invalidam. `list_cache_s` na config do host: 0 desliga, máximo LIST_TTL_MAX.
 LIST_TTL, LIST_TTL_MAX = 10, 120
+# Teto POR SESSÃO no host Linux (ga-kgnjkt8, decisão do Mayor 30/10): o claude e as ferramentas dele moram na árvore do lançador, que no nó fica num session-N.scope do logind, FORA de qualquer teto do gerenciador de
+# usuário (medido; é onde roda a fork bomb de uma sessão de revisor que, reproduzida, explica a parada do nó em 29/10). `session_scope` na config do host liga: o lançador roda o comando num escopo systemd do usuário com TasksMax/MemoryMax POR
+# SESSÃO e baixa o ulimit de tarefas (cinto e suspensório: o ulimit conta as tarefas do usuário inteiro, o escopo conta as da sessão e limita a memória). Ausente/null = desligado, como sempre foi; objeto (até o vazio) liga.
+SCOPE_KEYS = ("tasks_max", "memory_max", "nproc_soft")
+SCOPE_DEFAULT = {"tasks_max": 2048, "memory_max": "6G", "nproc_soft": 8192}
+SCOPE_MEM = re.compile(r"([1-9][0-9]{0,5})([KMGT])")  # com sufixo (sem ele o systemd lê BYTES: uma sessão com 6144 morreria na hora); entra em script de shell, então o formato é fechado
+SCOPE_MEM_MIN_MB = 256
 # Cache NEGATIVO (ga-sml4tqk): o FATO "o host não respondeu" (ssh 255 ou tempo esgotado) também é guardado por host, por `list_down_cache_s` s (padrão LIST_DOWN_TTL; 0 desliga; máximo LIST_DOWN_TTL_MAX), e dentro do prazo o list-running
 # devolve ERRO rápido sem tentar o ssh (nunca lista, nem vazia). Sem ele, com o host fora cada uma das 16-20 chamadas em série de um `gc rig list --json` pagava o ConnectTimeout/timeout inteiro: 160-500 s.
 LIST_DOWN_TTL, LIST_DOWN_TTL_MAX = 30, 60
@@ -436,6 +449,9 @@ class Cfg:
             raise Fail(f"host {self.host}: 'gui_agent' é obrigatório num host que dorme (notebook): sem ele o tmux nasce no ssh e o claude da sessão fica deslogado (Keychain)")
         if self.gui and not self.claude_bin:
             raise Fail(f"host {self.host}: 'gui_agent' exige 'session_env.claude' (o agente confere o login com esse claude)")
+        self.scope = self.session_scope(h.get("session_scope"))
+        if self.scope and (self.gui or self.gate):  # o escopo é do systemd: o host macOS (agente gráfico, presença) não o tem
+            raise Fail(f"host {self.host}: 'session_scope' é do host Linux com systemd; o host com gui_agent/presence_gate é macOS")
         self.gui_wait, self.gui_proof = self.num(h, "gui_wait_s", GUI_WAIT_S), self.num(h, "gui_proof_s", GUI_PROOF_S)
         self.plib = self.need(h, "presence_lib", PATH_RE, self.home + "/gt-remote/bin/mbp-presence.sh")
         self.gate_cmd = h.get("gate_cmd") or [os.path.join(self.city_guess, "scripts", "mbp-run.sh"), "--check"]
@@ -508,6 +524,24 @@ class Cfg:
         if not isinstance(v, str) or not rx.fullmatch(v) or v in ("/", "") or v.startswith("-"):
             raise Fail(f"host {self.host}: '{key}' ausente ou inválido ({v!r})")
         return v
+
+    def session_scope(self, sc):
+        """None = desligado (ausente ou null); objeto = liga, com os padrões nas chaves que faltam. Chave desconhecida, forma errada ou valor fora da faixa recusa a config (nunca liga um teto diferente do pedido)."""
+        if sc is None:
+            return None
+        bad = lambda why: Fail(f"host {self.host}: 'session_scope' {why} ({sc!r})")
+        if not isinstance(sc, dict) or set(sc) - set(SCOPE_KEYS):
+            raise bad(f"tem que ser um objeto só com {'/'.join(SCOPE_KEYS)}")
+        out = dict(SCOPE_DEFAULT, **sc)
+        isint = lambda v: isinstance(v, int) and not isinstance(v, bool)
+        if not (isint(out["tasks_max"]) and 64 <= out["tasks_max"] <= 1000000):
+            raise bad("'tasks_max' tem que ser um inteiro de 64 a 1000000")
+        m = SCOPE_MEM.fullmatch(out["memory_max"]) if isinstance(out["memory_max"], str) else None
+        if not m or int(m.group(1)) * {"K": 1 / 1024, "M": 1, "G": 1024, "T": 1048576}[m.group(2)] < SCOPE_MEM_MIN_MB:
+            raise bad(f"'memory_max' tem que ser N + K/M/G/T (N de 1 a 999999) e pelo menos {SCOPE_MEM_MIN_MB}M")
+        if not (isint(out["nproc_soft"]) and (out["nproc_soft"] == 0 or 256 <= out["nproc_soft"] <= 1000000)):
+            raise bad("'nproc_soft' tem que ser 0 (sem prlimit) ou um inteiro de 256 a 1000000")
+        return out
 
     def num(self, h: dict, key: str, default: int) -> int:
         v = h.get(key, default)
@@ -723,12 +757,26 @@ def launcher(cfg: Cfg, name: str, p: dict, secrets: dict | None = None) -> str:
     if first and "=" not in first and first not in ("env", "exec"):
         look = f"command -v {q(first)} >/dev/null 2>&1"
         out.append(f'{f"(PATH={q(cfg.spath)}; {look})" if cfg.spath else look} || {{ echo "comando não encontrado: "{q(first)} >{q(exitf)}; exit 127; }}')
+    scope_pre = ""
+    if cfg.scope:  # teto POR SESSÃO (o systemd-run é procurado ANTES de o lançador exportar o PATH da sessão): sem systemd --user a sessão NÃO abre sem teto (rc 126 e o motivo no .exit), nunca roda calada sem ele
+        sc = cfg.scope
+        out += ["SDR=$(command -v systemd-run) || SDR=",
+                "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}; export XDG_RUNTIME_DIR",
+                "DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}; export DBUS_SESSION_BUS_ADDRESS",
+                f'{{ [ -n "$SDR" ] && [ -S "$XDG_RUNTIME_DIR/bus" ]; }} || {{ echo "teto da sessão: sem systemd --user (systemd-run ou $XDG_RUNTIME_DIR/bus ausentes): a sessão não abre sem teto" >{q(exitf)}; exit 126; }}']
+        if sc["nproc_soft"]:  # o `ulimit -u` do dash (o sh do nó) NÃO existe: o limite vai pelo prlimit, DENTRO do escopo, e só BAIXA (um limite que já era menor fica como está). Sem prlimit, ou sem ler o limite atual, a sessão não abre
+            n = sc["nproc_soft"]
+            out += ["PRL=$(command -v prlimit) || PRL=",
+                    f'[ -n "$PRL" ] || {{ echo "teto da sessão: sem prlimit (util-linux) no host: a sessão não abre sem teto" >{q(exitf)}; exit 126; }}',
+                    'lim=$("$PRL" --noheadings --output SOFT --nproc 2>/dev/null) || lim=',
+                    f'case "$lim" in unlimited) RL="$PRL --nproc={n}:" ;; ""|*[!0-9]*) echo "teto da sessão: não consegui ler o limite de tarefas (prlimit): a sessão não abre sem teto" >{q(exitf)}; exit 126 ;; *) if [ "$lim" -gt {n} ]; then RL="$PRL --nproc={n}:"; else RL=; fi ;; esac']
+        scope_pre = (f'"$SDR" --user --scope --quiet --collect --unit=gc-session-{name}-$$ -p TasksMax={sc["tasks_max"]} -p MemoryMax={sc["memory_max"]} -p MemorySwapMax=0 -- ' + ("$RL " if sc["nproc_soft"] else ""))
     if cfg.gate:  # o vigia nasce ANTES do PATH explícito: usa o do host (ps/renice/taskpolicy), não o da sessão
         out.append(f"bash -c {q(WATCH)} _ {q(cfg.plib)} $$ {cfg.watch_s} </dev/null >/dev/null 2>&1 &")
     if cfg.spath:
         out += [f"export ZDOTDIR={q(cfg.zdot)}", f"export CLAUDE_ENV_FILE={q(cfg.zdot + '/env.sh')}", f"export PATH={q(cfg.spath)}"]
     assign = "".join(f"{k}={q(v)} " for k, v in (secrets or {}).items())  # prefixo do comando final, não `export`: só o claude herda a chave (nem o vigia nem o resto do lançador a têm), e ela nunca vai para argv
-    run_cmd = f"{assign}{'nice -n 10 ' if cfg.gate else ''}sh -c {q(p['command'])}"  # notebook do Athos: começa em nice 10 (mbp-run.sh, modo livre)
+    run_cmd = f"{assign}{'nice -n 10 ' if cfg.gate else ''}{scope_pre}sh -c {q(p['command'])}"  # notebook do Athos: começa em nice 10 (mbp-run.sh, modo livre)
     return "\n".join(out + [run_cmd, "rc=$?", f'[ "$rc" -eq 0 ] || echo "saiu com $rc" >{q(exitf)}', 'exit "$rc"']) + "\n"
 
 
@@ -965,7 +1013,7 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     lpath = f"{run_dir}/{name}.sh"
     if dry:
         wtd = {"worktree": {"rig": wt["rig"], "path": wt["path"], "add": f"{wt['bin']} wt-add {wt['rig']} {name}", "rm": f"{wt['bin']} wt-rm {wt['rig']} {name}", "start_timeout": start_timeout}} if wt else {}
-        print(json.dumps(dict(p, **wtd, host=cfg.host, session=name, session_kind="teste" if TEST_RE.fullmatch(name) else "real", would_refuse=would_refuse, claude_account=acct_view, model_profile=prof_view, launcher=launcher(cfg, name, p, secrets).split("\n"),
+        print(json.dumps(dict(p, **wtd, host=cfg.host, session=name, session_kind="teste" if TEST_RE.fullmatch(name) else "real", would_refuse=would_refuse, claude_account=acct_view, model_profile=prof_view, launcher=launcher(cfg, name, p, secrets).split("\n"), session_scope=cfg.scope,
                               prepare=({"git_user": name, "git_email": f"{name}@gastown.invalid", "trust_file": f"{cfg.home}/.claude.json", "work_dir": p["work_dir"]} if cfg.prepare else None),
                               gate=cfg.gate_cmd if cfg.gate else None, path_extra=cfg.path_extra,
                               session_env={"path": cfg.spath, "claude": cfg.claude_bin, "zdot": cfg.zdot} if cfg.spath else None,
