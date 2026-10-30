@@ -244,6 +244,7 @@ elif h.get("gui_agent") and not (h.get("session_env") or {}).get("claude"):
       case $gm in nores) ;; badres) echo "ilegivel rc=1" > "$BUNDLE/run/$LABEL.agent.res";; *) echo ok > "$BUNDLE/run/$LABEL.agent.res";; esac
       : > "$BUNDLE/run/$LABEL.plist"
       [ $gm != plisthome ] || { mkdir -p "$SRV/Library/LaunchAgents"; : > "$SRV/Library/LaunchAgents/$LABEL.plist"; }
+      [ $gm != plisthomebad ] || { mkdir -p "$SRV/Library"; : > "$SRV/Library/LaunchAgents"; }  # um ARQUIVO onde devia haver a pasta: olhar o plist dá ENOTDIR (não dá para saber), não ENOENT (não está lá)
     }
     if [ "$NAME" != "$S1" ]; then  # sessão leve de (g): só um sleep, sem claude e sem login de API
       [ $mode != startfail2 ] || [ "$NAME" != remote-test-remote-mbp-92 ] || { echo "gc-session-ssh: start recusado: falha falsa (2ª sessão leve)" >&2; exit 1; }
@@ -789,6 +790,7 @@ g_e2e() {
   only1 gui-badres badres "FAIL (f) a sessão nasceu num LaunchAgent do domínio gráfico" "(f) veredito do agente que não é \`ok\` (ilegível) → só (f) reprova"
   only1 gui-notloaded notloaded "FAIL (f) a sessão nasceu num LaunchAgent do domínio gráfico" "(f) agente que não está carregado em gui/<uid> → só (f) reprova"
   only1 gui-plisthome plisthome "FAIL (f) a sessão nasceu num LaunchAgent do domínio gráfico" "(f) plist em ~/Library/LaunchAgents (sobreviveria a reboot e logout) → só (f) reprova"
+  only1 gui-plisthome-unreadable plisthomebad "FAIL (f) a sessão nasceu num LaunchAgent do domínio gráfico" "(f) não dá para olhar ~/Library/LaunchAgents (um arquivo no lugar da pasta) → \"não sei\" reprova (f), nunca vira \"o plist não está lá\""
   only1 multi-serverdies serverdies "FAIL (g) parar a 1ª NÃO derruba a 2ª" "(g) o bootout do agente da 1ª leva o servidor do tmux e a 2ª sessão junto → só essa prova reprova"
   fail1 multi-agentleak agentleak "FAIL (g) parar a 1ª NÃO derruba a 2ª" "(g) o provider diz 0 no stop da 1ª mas o agente dela segue carregado → reprova"
   c multi-startfail2 && { FAKE_MODE=startfail2 ep; nf=$(grep -c '^[0-9:]* FAIL' "$T/out")
@@ -904,6 +906,15 @@ open(sys.argv[4], "w").write(s.replace(old, new))' "$P" "$1" "$2" "$3"
   mutant e2e ok "o stop deixar a marca .stop passa a reprovar o MBP limpo" '[x for x in (s["run_dir"] or []) if not STOP_RE.fullmatch(x)] == [] and s["procs"] == []' 's["run_dir"] in (None, []) and s["procs"] == []'
   mutant e2e ok "(g) nunca roda" '            self.multi()
 ' '            pass
+'
+  mutant e2e gui-plisthome-unreadable "(f) olha o plist em ~/Library/LaunchAgents com lexists: erro de leitura vira \"ausente\"" 'try:
+    os.lstat("%s/Library/LaunchAgents/%s.plist" % (C["home"], label))
+    out["plist_home"] = True
+except FileNotFoundError:
+    out["plist_home"] = False
+except OSError:
+    out["plist_home"] = None
+' 'out["plist_home"] = os.path.lexists("%s/Library/LaunchAgents/%s.plist" % (C["home"], label))
 '
   mutant e2e multi-serverdies,multi-agentleak "(g) não confere o estado depois de parar a 1ª" 'names2 == {b} and run_b == "true" and s2.get("labels", {}).get(lb) == 0 and absent(s2.get("labels", {}).get(la)),' 'True,'
   mutant e2e gui-nores,gui-badres,gui-notloaded,gui-plisthome "(f) passa sem conferir o agente" 'ok = g.get("loaded_rc") == 0 and g.get("res") == "ok" and g.get("plist_run") is True and g.get("plist_home") is False' 'ok = True'

@@ -622,7 +622,7 @@ print(json.dumps({"removed": removed}))
 """
 
 # (f) o agente do domínio gráfico (ga-w7qwl1.1.8), lido NO MBP enquanto a sessão vive. O que prova que o `claude auth status` rodou LÁ DENTRO é o veredito que o próprio agente grava (`ok` só com
-# loggedIn true e rc 0); o `claude auth status` pelo ssh (Background) é só informativo: é o contraste que justifica o agente. Cada leitura que não responde vira None, nunca "ausente".
+# loggedIn true e rc 0); o `claude auth status` pelo ssh (Background) é só informativo: é o contraste que justifica o agente. Leitura que não responde: launchctl → loaded_rc None; veredito ilegível → res None; plist em ~/Library/LaunchAgents que não dá para olhar → None, nunca "ausente" (o chamador exige `is False`); plist em run/ que não dá para olhar → False, e o chamador exige `is True`, então reprova do mesmo jeito.
 GUI = r"""
 import json, os, re, subprocess, sys
 C = json.loads(sys.argv[1])
@@ -642,7 +642,14 @@ try:
 except OSError:
     out["res"] = None
 out["plist_run"] = os.path.isfile("%s/%s.plist" % (C["run"], label))
-out["plist_home"] = os.path.lexists("%s/Library/LaunchAgents/%s.plist" % (C["home"], label))
+# vazio (o plist não existe) → False; falhou (permissão, um arquivo onde devia haver pasta) → None: os.path.lexists devolveria False nos dois, e "não consegui olhar" passaria por "não está lá"; o chamador exige `is False`
+try:
+    os.lstat("%s/Library/LaunchAgents/%s.plist" % (C["home"], label))
+    out["plist_home"] = True
+except FileNotFoundError:
+    out["plist_home"] = False
+except OSError:
+    out["plist_home"] = None
 rc, o = sh([C["claude"], "auth", "status"])
 lt, lf = len(re.findall(r'"loggedIn"\s*:\s*true', o)), len(re.findall(r'"loggedIn"\s*:\s*false', o))
 out["ssh_auth"] = {"rc": rc, "state": "true" if rc == 0 and lt and not lf else "false" if lf and not lt else "ilegivel"}
