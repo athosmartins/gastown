@@ -32,7 +32,13 @@ What it does, every run (launchd StartInterval, single instance via flock):
      a day or more, so in production it usually cannot: the switch then goes ahead (fail-open, by decision - the
      alternative is crews that never move) but it is LOGGED as "owner unverified", COUNTED, remembered as unverified (the
      normal identity TTL applies), and checked as soon as the CLI has refreshed the token: a wrong owner is alerted and
-     its source quarantined so it is never written again.
+     its source quarantined so it is never written again. Two things keep that fail-open from looping and from believing a
+     NAME (ga-xoe5ao.2): the same unverified login (same refresh token) is not written again, unchanged, for UNVERIFIED_HOLD_S
+     - the heal-fallback had written one stored copy 32 times in 2 h 12 (log #226-#257) because the default went back to "no
+     access token" minutes after each write; a login that is held is skipped like a quarantined one and the next account
+     with a login is tried. And a login the PROFILE has already said is somebody else's (`owners`: refresh-token fingerprint
+     -> e-mail, learned from every profile answer on the default and from every owner-mismatch) is refused as a source,
+     whatever the name of the item that holds it says.
   4. VERIFY: after a switch, every session that had a Remote Control bridge must still have one 60 s later. A check that
      cannot be made (sessions dir unreadable, window missed) says so; it never reports success. Three verdicts, not two: up,
      LOST (push), and NOT VERIFIED - a running session whose session file exists but could not be read is neither (log +
@@ -109,7 +115,7 @@ UNVERIFIED_HOLD_S = IDENTITY_TTL_S  # ga-xoe5ao.2: a login written without the p
 OWNERS_KEEP_S = 40 * 86400      # ga-xoe5ao.2: how long the job remembers whose a refresh token was (a refresh token lives ~30 days)
 OWNERS_MAX = 64                 # ... and how many it remembers: the newest (one new entry per rotation of the account that holds the default)
 HELD_MAX = 32                   # held logins are few; a state that grew past this is pruned, oldest first
-VERIFY_AFTER_S = 60            # the CLI re-reads the item every ~30 s; the bridge is checked this long after a switch
+VERIFY_AFTER_S = 60             # the CLI re-reads the item every ~30 s; the bridge is checked this long after a switch
 VERIFY_GIVE_UP_S = 900          # a check (bridges, owner) made later than this after the switch is not blamed on the switch
 MIN_REFRESH_LEFT_S = 86400      # a login whose refresh token has < 1 day left is not a source
 ALERT_EVERY_S = 6 * 3600
@@ -427,7 +433,7 @@ def identity(st: dict, blob: dict, t: float) -> Optional[str]:
     e = profile_email(o["accessToken"]) if f else None
     if e:
         st["identity"] = {"fp": f, "email": e, "at": t, "via": "profile"}
-        note_owner(st, fp(o.get("refreshToken")), e, t)
+        note_owner(st, fp(o.get("refreshToken")), e, t)       # ga-xoe5ao.2: the profile vouched for this token, so for the refresh token that comes with it
         return e
     return c.get("email") if fresh else None
 
@@ -446,6 +452,7 @@ def note_owner(st: dict, rfp: Optional[str], email: str, t: float) -> None:
     never a token), so that a copy of that login found later in ANOTHER account's item is known for what it is."""
     if not rfp or not isinstance(email, str) or not email:
         return
+    # vazio → a new table; falhou/ilegível → a new table too (knowledge is lost, none is invented)
     owners = st.get("owners")
     owners = _prune(owners if isinstance(owners, dict) else {}, OWNERS_KEEP_S, OWNERS_MAX - 1, t)
     owners[rfp] = {"email": email, "at": t}
@@ -453,7 +460,7 @@ def note_owner(st: dict, rfp: Optional[str], email: str, t: float) -> None:
 
 
 def known_owner(st: Optional[dict], rfp: Optional[str], t: float) -> Optional[Tuple[str, float]]:
-    """(e-mail, when) if the profile once said whose the login with this refresh-token fingerprint is; None = nobody ever did."""
+    """(e-mail, when) if the profile said, within OWNERS_KEEP_S, whose the login with this refresh-token fingerprint is; else None."""
     # vazio → None: the job was never told whose it is, so the source goes on as before (the fail-open of step 4: the profile
     # cannot vouch for an expired copy); falhou/ilegível → None too, by that same decision: a damaged table loses knowledge, it never invents any
     owners = (st or {}).get("owners")
@@ -465,27 +472,22 @@ def known_owner(st: Optional[dict], rfp: Optional[str], t: float) -> Optional[Tu
 
 def hold_login(st: dict, rfp: Optional[str], svc: str, target: str, t: float) -> None:
     """ga-xoe5ao.2: an UNVERIFIED switch was just made from this exact login (same refresh token). Remembered, so that the
-    same blind switch is not made again every cycle while nothing has confirmed the login or changed it."""
+    same blind switch is not made again every cycle: it lapses after UNVERIFIED_HOLD_S, and a new login is another key."""
     if not rfp:
         return
+    # vazio → a new table; falhou/ilegível → a new table too (the holds are lost, none is invented: at worst one more try per login)
     held = st.get("unverified_logins")
     held = _prune(held if isinstance(held, dict) else {}, UNVERIFIED_HOLD_S, HELD_MAX - 1, t)
     held[rfp] = {"svc": svc, "target": target, "at": t}
     st["unverified_logins"] = held
 
 
-def release_login(st: dict, rfp: Optional[str]) -> None:
-    """The profile has had its say about this login (it is the target's, or somebody else's): nothing is held on it any more."""
-    held = st.get("unverified_logins")
-    if rfp and isinstance(held, dict):
-        held.pop(rfp, None)
-
-
 def held_login(st: Optional[dict], rfp: Optional[str], t: float) -> Optional[str]:
     """Why this login must not be written again yet (None = it may be): an unverified switch was made from it less than
-    UNVERIFIED_HOLD_S ago and neither the profile nor a new login has said anything since."""
+    UNVERIFIED_HOLD_S ago. A new login has a new refresh token, so it is another key and is not held."""
     # vazio → None: nothing was written from it without a verdict, so the first unverified switch (the normal production path)
-    # goes ahead; falhou/ilegível → HELD: a record that is there but has no usable time is still a hold (the inert side: nothing is written)
+    # goes ahead, and so does a `unverified_logins` of the wrong shape (knowledge lost, none invented); falhou/ilegível → HELD: a
+    # record that is there but has no usable time still holds (the inert side: nothing is written) until the next hold_login prunes it
     held = (st or {}).get("unverified_logins")
     if not rfp or not isinstance(held, dict) or rfp not in held:
         return None
@@ -1403,8 +1405,8 @@ def load_source(email: str, t: float, st: Optional[dict] = None) -> Tuple[Option
             continue
         h = held_login(st, rfp, t)
         if h is not None:
-            why.append(f"{svc}: held - an unverified switch from this very login was made {h}, and the profile has not said whose it "
-                       f"is since; it is not written again until it is logged in again or {UNVERIFIED_HOLD_S // 3600} h have passed")
+            why.append(f"{svc}: held - an unverified switch from this very login was made {h}; it is not written again until it is "
+                       f"logged in again or {UNVERIFIED_HOLD_S // 3600} h have passed")
             continue
         return (svc, acct, blob), [], False      # type: ignore[return-value]
     return None, why, False
@@ -1542,9 +1544,8 @@ def resolve_unverified(st: dict, t: float) -> None:
               f"(the profile answered after the CLI refreshed it): that source is quarantined and will not be written again "
               f"until it is logged in again; the crews are on {owner}'s account now, not {target}'s", t)
         st.setdefault("bad_sources", {})[str(src)] = {"rfp": un.get("rfp"), "owner": owner, "at": t}
-        note_owner(st, un.get("rfp"), owner, t)                # ga-xoe5ao.2: that LOGIN is owner's, wherever a copy of it is kept
+        note_owner(st, un.get("rfp"), owner, t)                # ga-xoe5ao.2: that LOGIN is owner's (the quarantine's own inference: the default came from that source)
         st["unverified_last"] = {"result": "mismatch", "email": target, "owner": owner, "at": t}
-    release_login(st, un.get("rfp"))                           # the profile has had its say: the login is not "held" any more
     st.pop("unverified", None)
 
 
@@ -1605,7 +1606,7 @@ def _follow(st: dict, dec: dict, user: str, t: float, dry: bool) -> int:
         st["unverified_switches"] = n
         st["identity"] = {"fp": f_new, "email": target, "at": t, "via": "switch-unverified"}
         st["unverified"] = {"email": target, "source": svc, "rfp": fp(blob["claudeAiOauth"].get("refreshToken")), "fp": f_new, "at": t}
-        hold_login(st, fp(blob["claudeAiOauth"].get("refreshToken")), svc, target, t)     # ga-xoe5ao.2: this login is not written again, unchanged, every cycle
+        hold_login(st, fp(blob["claudeAiOauth"].get("refreshToken")), svc, target, t)     # ga-xoe5ao.2: not written again, unchanged, for UNVERIFIED_HOLD_S
         log("WARN", f"source owner unverified: the profile could not say whose the {target} login in {svc} is (its access "
                     f"token is expired); switching anyway (fail-open, unverified switch #{n}) - the owner is checked once the "
                     "CLI has refreshed the token")

@@ -1048,6 +1048,67 @@ def test_each_unverified_login_gets_its_own_single_try_not_one_try_for_the_whole
     assert w.state()["unverified_switches"] == 2
 
 
+def test_a_switch_whose_write_failed_is_not_counted_as_tried(w):
+    """Breaks if the attempt is recorded before the write: a write `security` refused would hold a login that was never written."""
+    _heal_loop_world(w)
+    w.mp.setenv("FAKE_SEC_WFAIL", crew.DEFAULT_SERVICE)           # `security` refuses the write
+    w.run()
+    assert w.writes() == []
+    w.mp.delenv("FAKE_SEC_WFAIL")
+    w.run(at=w.now + 240)
+    assert w.writes().count(crew.DEFAULT_SERVICE) == 1            # the next cycle still gets its first try
+
+
+def test_a_default_with_no_refresh_token_adds_nothing_to_the_owner_table_and_does_not_break_the_run(w):
+    """Breaks if a login with no refresh token gets a key of its own in the table: the state file is written with sorted keys,
+    and a table that mixes a text key with a missing one makes the whole run fail at the very end."""
+    w.default("crypto", blob("crypto"))
+    w.account("crypto", blob("crypto"))
+    w.decide("crypto")
+    w.run()                                                       # a normal tick: the table now has one entry
+    w.default("b85", blob("b85", refresh=False))                  # a setup-token the profile still answers for
+    w.run(at=w.now + 60)
+    assert list(w.state()["owners"]) == [crew.fp("sk-ant-ort01-crypto-ref")]
+
+
+def test_the_owner_table_stays_bounded_keeps_the_newest_and_forgets_the_very_old():
+    """Breaks if the table that is published in the state file every minute grows for ever, or keeps the oldest when it is full."""
+    st: dict = {}
+    for i in range(crew.OWNERS_MAX + 10):
+        crew.note_owner(st, f"{i:08x}", EMAIL["amb"], T0 + i)
+    assert len(st["owners"]) == crew.OWNERS_MAX
+    assert f"{crew.OWNERS_MAX + 9:08x}" in st["owners"] and f"{0:08x}" not in st["owners"]
+    crew.note_owner(st, "feedbeef", EMAIL["b85"], T0)
+    assert crew.known_owner(st, "feedbeef", T0 + 1) == (EMAIL["b85"], T0)
+    assert crew.known_owner(st, "feedbeef", T0 + crew.OWNERS_KEEP_S + 1) is None            # a refresh token that old is dead anyway
+
+
+@pytest.mark.parametrize("damage", [lambda rec: {"svc": rec["svc"]}, lambda rec: "garbage", lambda rec: {"svc": rec["svc"], "at": True}],
+                         ids=["no-time", "not-a-record", "time-is-a-bool"])
+def test_a_hold_record_that_lost_its_time_still_holds_the_login(w, damage):
+    """Breaks if 'could not read the record' ends as 'nothing was written from this login': the failed read must land on the inert side."""
+    _heal_loop_world(w)
+    w.run()
+    st = w.state()
+    (rfp, rec), = st["unverified_logins"].items()                 # the one record the first switch left
+    st["unverified_logins"][rfp] = damage(rec)                    # ...now without a usable time
+    (w.d / "crew_state.json").write_text(json.dumps(st))
+    _blank_default(w)
+    w.run(at=w.now + 2 * crew.IDENTITY_TTL_S)                     # long after the window: only the lost time can be what still holds it
+    assert w.writes().count(crew.DEFAULT_SERVICE) == 1
+
+
+def test_damaged_owner_and_hold_tables_lose_knowledge_but_never_crash_or_invent_any(w):
+    """Breaks if a table of the wrong shape crashes the run (a launchd job that crashes silently is what this job exists to remove),
+    or if 'the table could not be read' is taken as 'this login is somebody else's'."""
+    amb_rfp = crew.fp("sk-ant-ort01-amb-ref")                     # a list that even CONTAINS the fingerprint: it is still not a table
+    (w.d / "crew_state.json").write_text(json.dumps({"owners": "garbage", "unverified_logins": [amb_rfp]}))
+    assert _switch_crypto_to_amb(w) == 0
+    assert _rt(w.get(crew.DEFAULT_SERVICE)) == "sk-ant-ort01-amb-ref"        # the switch went ahead, as it did before the tables existed
+    s = w.state()
+    assert isinstance(s["owners"], dict) and isinstance(s["unverified_logins"], dict) and "run failed" not in w.log()
+
+
 # ── ga-xoe5ao.2, defect 1: a login the profile already gave to ANOTHER account is never written as this one's ──────────
 def test_a_login_the_profile_already_gave_to_another_account_is_not_written_as_this_ones(w):
     """Breaks if the source is still picked by the NAME of the item. amb's item holds b85's login (a hand copy of the default,
@@ -1085,7 +1146,8 @@ def test_a_stored_copy_of_the_wanted_accounts_own_login_is_still_a_source_after_
 
 
 def test_a_login_that_turned_out_to_be_someone_elses_is_refused_from_every_place_it_is_stored(w):
-    """Breaks if the quarantine stays per ITEM: a copy of the same login kept in the reserve item is written all over again."""
+    """Breaks if the quarantine stays per ITEM: a copy of the same login kept in the reserve item is written all over again.
+    The copy turns up AFTER the hold window, so the only thing that can still refuse it is what the profile said about the login."""
     _switch_crypto_to_amb(w)                                      # amb's item actually holds b85's login (nobody could tell)...
     w.default("b85", blob("b85-refreshed", rt="b85-rotated"))     # ...and the profile says so once the CLI has refreshed it
     w.run(at=w.now + 70)
@@ -1093,7 +1155,7 @@ def test_a_login_that_turned_out_to_be_someone_elses_is_refused_from_every_place
     crossed = blob("amb")                                         # the very login that was quarantined, copied to amb's reserve item
     crossed["claudeAiOauth"]["expiresAt"] = int((T0 - 30 * 3600) * 1000)
     w.put(crew.reserve_service(EMAIL["amb"]), crossed)
-    w.run(at=w.now + 140)
+    w.run(at=w.now + crew.IDENTITY_TTL_S + 600)
     assert w.writes().count(crew.DEFAULT_SERVICE) == 1            # only the first, blind switch: the copy is not written as amb's
 
 
