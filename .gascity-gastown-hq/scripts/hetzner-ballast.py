@@ -425,7 +425,7 @@ CG_RE = re.compile(r"^/(?:[A-Za-z0-9_.@:-]+/)*ballast\.slice/ballast-([a-z0-9_-]
 
 def ceiling_ready(cfg):
     """(ok, motivo). `off` (só no selftest) vale sempre. Senão precisa de systemd-run no PATH e do barramento do gerenciador de usuário (<runtime>/bus): sem sessão aberta nem linger não há gerenciador e o item NÃO começa."""
-    # vazio (sem systemd-run, sem barramento) → não pronto, com o motivo; falhou/ilegível (stat negado: exists dá False) → também não pronto: o item sem teto é o que derrubou o nó
+    # vazio (sem systemd-run, sem barramento) → não pronto, com o motivo; falhou/ilegível (stat negado: exists dá False) → também não pronto: o nó já parou uma vez (29/10) por processo sem teto, e item sem teto é a mesma exposição
     if cfg.ceiling == "off":
         return True, ""
     if shutil.which("systemd-run") is None:
@@ -476,7 +476,7 @@ def read_events(path):
 
 def ceiling_hit(cfg, run, notes):
     """`teto-processos` se o kernel recusou fork no cgroup do item (pids.events max), `teto-memoria` se matou algo nele (memory.events oom_kill); None se não estourou OU se não consegui ler — a nota diz
-    qual leitura falhou (o kernel segue impondo o teto: só o governo fica sem informação, e isso nunca vira 'estourou' nem 'tudo certo' calado)."""
+    que a leitura do teto falhou nesta rodada (o kernel segue impondo o teto: só o governo fica sem informação, e isso nunca vira 'estourou' nem 'tudo certo' calado)."""
     d, why = cgroup_dir(cfg, run)
     if d is None:
         notes.append("teto-%s:%s" % (why, run))
@@ -923,7 +923,7 @@ def do_tick(cfg):
     # vazio (nada roda) → []; falhou/ilegível (tabela de processos) → null, nunca []
     rec["running"] = sorted(r["item"] for r in run.values()) if procs is not None else None
     # começar itens: ligado, tudo lido, CPU livre por idle_ticks leituras seguidas, orçamento = núcleos livres - reserva. `work` primeiro; `filler` só com o que sobrar.
-    # sem teto não começa nada: o item sem teto foi o que derrubou o nó (29/10); a nota fica no registro do tick e o motivo no stderr (cron.err)
+    # sem teto não começa nada: o nó já parou uma vez (29/10) por processo sem teto, e item sem teto é a mesma exposição; a nota fica no registro do tick e o motivo no stderr (cron.err)
     ceil_ok, ceil_why = ceiling_ready(cfg)
     if on and not ceil_ok:
         notes.append("sem-teto")
