@@ -33,7 +33,7 @@ COMO DECIDE (a 1ª regra que casa vale; tudo é lido da bead, nada é gravado ne
      do arquivo de código sem a extensão (>=5 letras, nada genérico como utils/config), E cujo CONTEÚDO cita o módulo como palavra inteira (nome parecido sozinho não prova). Teste que pertence a um
      módulo de nome mais longo que também existe (test_bar_service_extra_* é de bar_service_extra, não de bar_service) não conta. O teste ainda tem de passar pelo filtro do rsync, fora da lista
      mac-only e fora do que a varredura de conteúdo do espelho segura, porque "teste que o nó tem" é o que vale. Nada é inferido para código que o texto não cita. Achou -> node, basis `derivado`
-     (`info`: teste-derivado:<código>=<teste>); mas se o texto tem palavra informativa de dado de lead ou de envio de WhatsApp (os freios de DERIVED_BLOCK_INFO) -> mini, `freio-derivado:<palavras>`.
+     (`info`: teste-derivado:<código>=<teste>); mas se o texto tem palavra informativa de envio de WhatsApp (o freio de DERIVED_BLOCK_INFO; `dado-de-lead` saiu em ga-2hd02v.3.21) -> mini, `freio-derivado:<palavras>`.
      Não achou -> unknown. Repo/git/espelho ilegível -> unknown com `info` `teste-derivado-ilegivel:<motivo>`; nunca vira node.
   7. CAMINHO DERIVADO (ga-2hd02v.3.20; só quando a bead NÃO cita nenhum arquivo de código; medido 30/10: 13 de 30 beads sondadas caíam em unknown `sem-prova-de-codigo-e-teste` porque o texto NOMEIA o módulo mas
      não escreve o caminho): o caminho sai do próprio repo do WA em origin/main, nunca de palpite. (a) NOMES: palavra com `_` ou `-` no texto (ficha_donos, form-fill; maiúscula vale; até 30 por bead) que é o nome
@@ -41,26 +41,36 @@ COMO DECIDE (a 1ª regra que casa vale; tudo é lido da bead, nada é gravado ne
      `/` ou a uma extensão é caminho, não nome. (b) IRMÃS: os arquivos de código tocados pelos commits `fix|feat(<id>)` das beads de MESMO PAI (o campo `parent` ou o id sem o último `.N`; até 40 commits dos últimos 45 dias, WA_NODE_SIBLING_DAYS; um `git log`
      com prazo próprio, WA_NODE_SIBLING_TIMEOUT, 15 s) que ainda existem na árvore. Mais de 10 arquivos derivados no total = nenhum (`caminho-derivado-demais:N`; é palpite largo). Os caminhos derivados passam pelos MESMOS
      filtros dos citados, sem afrouxar nada: filtro do rsync (fora dele -> mini `caminho-derivado-fora-do-filtro:<p>`), lista mac-only (mini `caminho-derivado-so-no-mac:<p>`), as moles e o PII da regra 3/4 (que já rodaram antes)
-     e os freios de dado de lead/envio da regra 6 (mini `freio-derivado:…`). A prova do teste é a mesma da regra 6 (o teste que o repo já tem para o código derivado) ou, se a bead cita o teste, o próprio teste citado.
+     e o freio de envio da regra 6 (mini `freio-derivado:envio-whatsapp`). A prova do teste é a mesma da regra 6 (o teste que o repo já tem para o código derivado) ou, se a bead cita o teste, o próprio teste citado.
      Achou -> node, basis `derivado`, motivo `prova-caminho-derivado:N-teste(s)+M-codigo(s)` (`info`: caminho-derivado:<nome:X|irmas>=<caminho>, teste-derivado:<código>=<teste>). Nada derivado ou nenhum teste -> unknown como antes.
      Falha de leitura (repo, git, rsync, mac-only, espelho, git log das irmãs sem resposta) -> unknown com `info` `caminho-derivado-ilegivel:<motivo>`; "falhou" nunca é "vazio" e nunca é node. Custo: os `git ls-tree`/`git log` só
      rodam com nome ou pai para consultar; o `git log` das irmãs fica num cache por pai (6 h; o cache nunca decide: o conteúdo dele passa pela árvore e pelos filtros, e cache ilegível/vencido/de outro pai é recalculado);
      o JSON leva `custo` ({ms, derivacao_ms, cache}) e o Pilot o grava na linha da sonda. NÃO há LLM nem `recall` por sonda: o recall de beads fechadas parecidas levou >120 s numa consulta sob load 80 (medido), então a
      fonte "3 beads parecidas" do pedido original NÃO foi implementada. O cache por (id, updated_at) do veredito já existe no dispatcher (memo da passada do nó); o cache daqui é só o do `git log` das irmãs.
+  8. CÓDIGO DERIVADO DO TESTE (ga-2hd02v.3.21; só quando a bead cita >=1 teste e NENHUM código e a regra 7 não derivou nada): o código é o que o próprio TESTE importa. Lê-se o teste citado em origin/main
+     (`git show`, nunca a árvore de trabalho; teste que não está lá é novo e não há o que ler) e só os `import`/`require` ESTÁTICOS contam: Python por `ast` (nada é executado; `import a.b`, `from a.b import c`, relativo `from .x import y`;
+     o nome é procurado na raiz, em lib/, daemons/ e scripts/ — as raízes do pytest.ini e dos `sys.path.insert` dos testes do WA — e na pasta do teste e na de cima) e JS/CJS/MJS/TS por `require('./x')`/`import … from './x'`/`import('./x')`
+     (só caminho relativo; pacote npm e builtin não são do repo). Entram só arquivos de código (py/sh/js/mjs/cjs/ts, fora de tests/) que EXISTEM em origin/main; stdlib e pacote de terceiros não casam arquivo nenhum e somem sozinhos.
+     Os arquivos achados passam pelos MESMOS filtros do citado, sem afrouxar nada: um que o filtro do rsync nega -> mini `codigo-do-teste-fora-do-filtro:<p>`; um da lista mac-only -> mini `codigo-do-teste-so-no-mac:<p>` (o teste não roda no nó sem
+     o módulo que importa); mais de 10 -> nenhum (`codigo-do-teste-demais:N`); o freio de envio da regra 6 vale. Achou e passou -> node, basis `derivado`, motivo `prova-codigo-derivado-do-teste:N-teste(s)+M-codigo(s)` (`info`: codigo-do-teste:<teste>=<código>).
+     Nada importado do repo -> unknown SEM nota (vazio é legítimo). Falha de leitura (repo, git show, teste que não parseia, rsync, mac-only) -> unknown com `info` `codigo-do-teste-ilegivel:<motivo>`; "falhou" nunca é "vazio" e nunca é node.
 
 CÓDIGOS DE SAÍDA: 0 node · 10 mini · 11 unknown · 2 uso. A linha de stdout é um JSON: {"verdict","basis","reasons":[...],"paths":[...],"tests":[...],"custo":{"ms","derivacao_ms","cache"},"info":[...]}; basis = label | text | derivado | "" (só o node tem).
-O QUE NÃO FAZ: não lê dado, não abre o nó, não toca o Dolt, não escreve na bead. Lê só stdin (o JSON do `bd show --json`), o filtro, a lista mac-only, (só com `.md` fora do rsync) o filtro que o espelho serve e (só com código citado sem teste citado) a árvore e o conteúdo dos TESTES do repo do WA em origin/main, por `git ls-tree`/`git grep`: nunca a árvore de trabalho; (só sem código citado, regra 7) a árvore de código do repo e o `git log` dos commits das beads irmãs. ESCREVE uma única coisa: o cache do `git log` das irmãs (WA_NODE_CACHE, padrão <cidade>/.gc/cache/wa-node-classify; escrita atômica, opcional: sem ele o classificador só fica mais lento).
+O QUE NÃO FAZ: não lê dado, não abre o nó, não toca o Dolt, não escreve na bead. Lê só stdin (o JSON do `bd show --json`), o filtro, a lista mac-only, (só com `.md` fora do rsync) o filtro que o espelho serve e (só com código citado sem teste citado) a árvore e o conteúdo dos TESTES do repo do WA em origin/main, por `git ls-tree`/`git grep`: nunca a árvore de trabalho; (só sem código citado, regra 7) a árvore de código do repo e o `git log` dos commits das beads irmãs; (só com teste citado e sem código, regra 8) o texto dos testes citados, por `git show` em REPO_REF. ESCREVE uma única coisa: o cache do `git log` das irmãs (WA_NODE_CACHE, padrão <cidade>/.gc/cache/wa-node-classify; escrita atômica, opcional: sem ele o classificador só fica mais lento).
 LIMITES: a exceção do espelho confia na varredura de conteúdo (>=20 telefones ou >=3 CPFs distintos por arquivo): lista pequena, nome, e-mail e CNPJ num `.md` passam; vale o mesmo resíduo do bloco 3b do filtro. É heurística de TEXTO sobre a bead; o texto pode omitir que o teste abre um banco. NÃO são extraídos: pasta sem arquivo (`data/`), arquivo sem nome (`.env`), extensão fora da lista, nome com
   sufixo (`x.py.bak` não vira `x.py`). Para esses a regra 3a não age; quem segura o dado é o filtro do rsync (o nó nunca o recebe) e, no caso de `.env`/`.db`, a palavra mole da regra 4. O resíduo cai no nó como teste vermelho e a bead volta ao mini pelo gate (custo, não vazamento:
   o dado não chega ao nó de qualquer jeito). A lista de palavras moles é deliberadamente larga (o vocabulário do WA é todo de lead/terreno): na dúvida a bead fica no mini, como hoje.
-  A regra 6 prova que existe um teste do módulo que o cita; NÃO prova que ele cobre a mudança da bead, nem que roda sem recurso vivo (pode abrir banco, rede ou Chrome, ou dar skip e ficar verde sem provar nada): isso cai no nó como teste
+  A regra 8 prova que o teste citado IMPORTA o módulo, não que o módulo seja o que a bead quer mudar nem que o teste cubra a mudança; também não segue import em cadeia (o que o módulo importa), nem o `__init__.py` do pacote pai, nem carga dinâmica
+  (`importlib`, `__import__`, `spec_from_file_location`, `subprocess`): o que faltar no nó cai como teste vermelho e a bead volta ao mini pelo gate. A regra 6 prova que existe um teste do módulo que o cita; NÃO prova que ele cobre a mudança da bead, nem que roda sem recurso vivo (pode abrir banco, rede ou Chrome, ou dar skip e ficar verde sem provar nada): isso cai no nó como teste
   vermelho/skip e a bead volta ao mini pelo gate. Por isso o basis é `derivado` e não `text`: quem for ligar o modo auto pode tratar os dois de um jeito diferente. Plano, comentário e ctx-check NÃO entram: o plano (design/notes/acceptance_criteria)
   já é lido, o ctx-check só grava etiqueta e comentário de lacuna, e o worker do nó não recebe comentário (ga-2hd02v.10).
 """
+import ast
 import fnmatch
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -68,6 +78,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+import warnings
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FILTER = os.environ.get("WA_NODE_FILTER", os.path.join(HERE, "hetzner-rsync-filter.wa.txt"))
@@ -117,11 +128,16 @@ MIN_STEM = 5                                                         # nome curt
 GENERIC_STEMS = frozenset(("utils", "helpers", "helper", "common", "config", "settings", "server", "client", "models", "routes", "index", "shared", "setup", "types", "tools", "utility", "utilities", "runner", "worker", "daemon"))
 MAX_DERIVED_PER_STEM = 25                                            # testes candidatos por módulo (ordem alfabética); acima disso o excesso nem é lido
 MAX_DERIVED_TESTS = 100                                              # candidatos no total, para o rsync -n e o git grep ficarem curtos
-DERIVED_BLOCK_INFO = ("dado-de-lead", "envio-whatsapp")              # palavras informativas que, só para a prova derivada (mais fraca), mandam ao mini (lista do Mayor em ga-2hd02v.3.15); banco e credencial da mesma lista já são moles e bloqueiam antes
+DERIVED_BLOCK_INFO = ("envio-whatsapp",)                             # palavra informativa que, só para a prova derivada (mais fraca), manda ao mini. `dado-de-lead` saiu (ga-2hd02v.3.21): é regex de VOCABULÁRIO (lead, terreno, lote, construtora, proprietário...), não de dado, e segurava 18 beads (ga-2hd02v.3.17) — 4 das 15 P0/P1 WA aprovadas (30/10). O dado em si é barrado por portões que não mudam: filtro do rsync, varredura PII do espelho, dado-no-texto (telefone/CPF no JSON da bead) e as moles; banco e credencial já bloqueiam antes
 NAME_RE = re.compile(r"(?<![\w/.\-~$])([A-Za-z][A-Za-z0-9]*(?:[_\-][A-Za-z0-9]+)+)(?![\w/]|\.\w)")   # `ficha_donos`, `form-fill`: nome de módulo/tela/daemon SEM caminho (o que tem pasta ou extensão é caminho e já foi lido)
 MAX_NAME_TOKENS = 30                                                 # nomes distintos lidos de uma bead
 MAX_FILES_PER_NAME = 3                                               # um nome que casa mais arquivos que isto é ambíguo: não deriva nada dele
 MAX_DERIVED_CODE = 10                                                # arquivos de código derivados no total; acima disso a bead não é sobre um módulo só: não deriva nada
+# regra 8 (código derivado do teste, ga-2hd02v.3.21): o que o teste citado importa
+MAX_TEST_BYTES = 1_000_000                                           # teste maior que isto não é analisado (o git já o devolveu inteiro, mas não passa pelo parse): ilegível, nunca "sem import"
+IMPORT_ROOTS = ("", "lib", "daemons", "scripts")                     # onde um `import x` do WA procura: a raiz e lib/ (pytest.ini: pythonpath = . lib) e daemons/ e scripts/ (os sys.path.insert dos testes); mais a pasta do teste e a de cima
+JS_TEST_EXT = ("js", "cjs", "mjs", "ts")                             # testes de que se lê `require`/`import`; teste .sh e o resto não têm o que ler (vazio legítimo)
+JS_IMPORT_RE = re.compile(r"""(?:\brequire\s*\(|\bimport\s*\(|\bfrom\s+|\bimport\s+)\s*(['"])([^'"\n]+)\1""")   # require('x') / import('x') / import a from 'x' / import 'x' / export … from 'x'
 PARENT_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*(?:\.[0-9]+)*$")    # id de bead (com níveis `.N`): o pai vai no padrão do `git log --grep`, então só esta forma entra
 SIBLING_MAX_COMMITS = 40                                             # commits das irmãs lidos (o git para de andar no histórico ao achar tantos)
 SIBLING_MAX_NAMES = 200                                              # arquivos guardados no cache por pai
@@ -649,7 +665,7 @@ def derive_code(b, text):
 
 
 def judged_derived(found, tag, paths, tests, info, dinfo):
-    """o veredito de uma prova DERIVADA (regras 6 e 7): node `<tag>:N-teste(s)+M-codigo(s)`; mas lead/envio no texto (DERIVED_BLOCK_INFO) mandam ao mini, porque é uma prova mais fraca que o teste citado."""
+    """o veredito de uma prova DERIVADA (regras 6, 7 e 8): node `<tag>:N-teste(s)+M-codigo(s)`; mas envio no texto (DERIVED_BLOCK_INFO) manda ao mini, porque é uma prova mais fraca que o teste citado."""
     blocked = [s for s in DERIVED_BLOCK_INFO if s in info]
     if blocked:
         return "mini", ["freio-derivado:" + ",".join(blocked)], paths, tests, info + dinfo
@@ -686,6 +702,119 @@ def path_derivation(b, text, paths, tests, info, extra):
     if not found:
         return None
     return judged_derived(found, "prova-caminho-derivado", paths, tests, info, extra)
+
+
+def repo_show(path):
+    """texto de `path` em REPO_REF (`git show`; nunca a árvore de trabalho). git ausente ou sem resposta no prazo, rc != 0 (o caminho já foi visto na árvore, então não existir é falha) ou arquivo grande demais
+    -> Unreadable: nunca "o teste está vazio". Um arquivo de 0 bytes lido com sucesso é texto vazio e é legítimo."""
+    # vazio → texto "" (0 bytes lidos com sucesso: o teste não importa nada); falhou/ilegível → Unreadable (git ausente, prazo, rc != 0, arquivo grande), nunca "teste vazio"
+    try:
+        r = subprocess.run([GIT, "-C", REPO_DIR, "show", REPO_REF + ":" + path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=repo_git_env(), timeout=REPO_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        raise Unreadable("teste-git-sem-resposta")
+    if r.returncode != 0:
+        raise Unreadable("teste-git-rc-%d" % r.returncode)
+    if len(r.stdout) > MAX_TEST_BYTES:
+        raise Unreadable("teste-grande")
+    return r.stdout.decode("utf-8", "replace")
+
+
+def py_imports(src):
+    """[(nível, módulo, nomes)] de todo `import`/`from … import` do código Python `src`, em qualquer ponto do arquivo (import dentro de função também conta). Só `ast.parse`: nada é executado.
+    Texto que não parseia -> Unreadable (não sei o que ele importa); sem nenhum import -> [] (legítimo)."""
+    # vazio → [] (arquivo sem import é legítimo); falhou/ilegível → Unreadable("teste-nao-parseia"), nunca []
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")   # `\d` em string comum vira SyntaxWarning no stderr; não muda o que se lê
+            tree = ast.parse(src)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        raise Unreadable("teste-nao-parseia")
+    out = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            out += [(0, a.name, []) for a in n.names]
+        elif isinstance(n, ast.ImportFrom):
+            out.append((n.level or 0, n.module or "", [a.name for a in n.names if a.name != "*"]))
+    return out
+
+
+def py_candidates(test, level, module, names):
+    """arquivos de REPO_REF que um `import`/`from` do `test` pode estar nomeando (ainda sem saber se existem): `a/b.py` e `a/b/__init__.py` por raiz; em `from a import c`, `c` também pode ser submódulo (`a/c.py`).
+    Relativo (`level` > 0) parte da pasta do teste; absoluto procura em IMPORT_ROOTS e na pasta do teste e na de cima. Nome que não casa arquivo do repo (stdlib, terceiro) simplesmente não existe na árvore."""
+    parts = [x for x in module.split(".") if x]
+    mods = ([parts] if parts else []) + [parts + [n] for n in names]
+    tdir = posixpath.dirname(test)
+    if level:
+        base = tdir
+        for _ in range(level - 1):
+            base = posixpath.dirname(base)
+        roots = [base]
+    else:
+        roots = list(dict.fromkeys(list(IMPORT_ROOTS) + [tdir, posixpath.dirname(tdir)]))
+    out = []
+    for r in roots:
+        for m in mods:
+            stem = posixpath.join(r, *m)
+            out += [stem + ".py", stem + "/__init__.py"]
+    return out
+
+
+def js_candidates(test, spec):
+    """arquivos de REPO_REF que `require('<spec>')`/`import … from '<spec>'` do `test` pode estar nomeando. Só caminho relativo (`./`, `../`) é do repo; pacote npm e builtin (`fs`, `node:path`) não; relativo que sai do repo também não."""
+    if not spec.startswith(("./", "../")):
+        return []
+    base = posixpath.normpath(posixpath.join(posixpath.dirname(test), spec))
+    if base == ".." or base.startswith("../"):
+        return []
+    exts = ("js", "cjs", "mjs", "ts")
+    return [base] + [base + "." + e for e in exts] + [base + "/index." + e for e in exts]
+
+
+def imported_code(tests):
+    """{arquivo de código: [testes citados que o importam]} (regra 8). Só entra arquivo que EXISTE em REPO_REF e é código (derivable_code: py/sh/js/mjs/cjs/ts, fora de tests/). Teste citado que não está em REPO_REF
+    (novo nesta bead) ou de extensão que não sei ler (.sh...) não tem o que ler e não entra; nada importado do repo -> {} (vazio é um estado legítimo). repo, git show ou parse que falha -> Unreadable."""
+    present = set(repo_tree())
+    found = {}
+    for t in sorted(set(tests)):
+        ext = t.rsplit(".", 1)[-1]
+        if t not in present or not (ext == "py" or ext in JS_TEST_EXT):
+            continue
+        # vazio → este teste não importa nada do repo (segue para o próximo); falhou/ilegível → Unreadable sobe e a regra devolve unknown com a nota, nunca "sem import"
+        src = repo_show(t)
+        if ext == "py":
+            cands = [c for lvl, mod, names in py_imports(src) for c in py_candidates(t, lvl, mod, names)]
+        else:
+            cands = [c for m in JS_IMPORT_RE.finditer(src) for c in js_candidates(t, m.group(2))]
+        for c in cands:
+            if c in present and derivable_code(c) and t not in found.setdefault(c, []):
+                found[c].append(t)
+    return {c: ts for c, ts in found.items() if ts}
+
+
+def import_derivation(tests, paths, info, extra):
+    """regra 8 (ga-2hd02v.3.21): a bead cita teste e nenhum código; o código que o teste IMPORTA (imported_code) passa pelos MESMOS filtros do citado (rsync, mac-only). Devolve a tupla do classify, ou None (nada
+    importado do repo, ou mais de MAX_DERIVED_CODE: segue unknown). `extra` recebe o que vai em `info`. Fora do filtro/só no Mac -> mini; leitura que falha sobe como Unreadable."""
+    found = imported_code(tests)
+    if not found:
+        return None
+    dpaths = sorted(found)
+    if len(dpaths) > MAX_DERIVED_CODE:
+        extra.append("codigo-do-teste-demais:%d" % len(dpaths))
+        return None
+    pairs = ["codigo-do-teste:%s=%s" % (t, c) for c in dpaths for t in found[c]]
+    extra += pairs[:6] + (["codigo-do-teste-mais:%d" % (len(pairs) - 6)] if len(pairs) > 6 else [])
+    # vazio (o filtro não deixa sair nenhum dos arquivos) → todos entram em `hard` e a bead vai ao mini; falhou/ilegível (filtro, rsync, canário, lista mac-only ausente ou sem glob) → Unreadable sobe (unknown com a nota), nunca "todos passam"
+    dsent = sent_by_filter(dpaths)
+    globs = mac_only_globs()
+    hard = []
+    for p in dpaths:
+        if p not in dsent:
+            hard.append("codigo-do-teste-fora-do-filtro:" + p)   # o teste importa o módulo e o nó não o recebe: rodaria vermelho
+        elif any(fnmatch.fnmatchcase(p, g) for g in globs):
+            hard.append("codigo-do-teste-so-no-mac:" + p)
+    if hard:
+        return "mini", sorted(set(hard)), paths, tests, info + extra
+    return judged_derived(found, "prova-codigo-derivado-do-teste", paths, tests, info, extra)
 
 
 def classify(b):
@@ -747,6 +876,8 @@ def classify(b):
         return judged_derived(found, "prova-teste-derivado", paths, tests, info, dinfo)
     # regra 7: NENHUM código citado -> o código que a bead nomeia sem caminho (módulo/tela/daemon) ou que as irmãs tocaram, pelos mesmos filtros do citado.
     # vazio (nada nomeado, nada na árvore, derivado sem teste) -> segue unknown, SEM nota; falhou/ilegível (repo, git, cache de irmãs, rsync, mac-only, espelho) -> unknown + nota `caminho-derivado-ilegivel`, nunca node e nunca "vazio"
+    # regra 8 (ga-2hd02v.3.21): teste citado, nenhum código, e a regra 7 não derivou nada -> o código que o teste importa. vazio (o teste não importa nada do repo) -> segue unknown, SEM nota;
+    # falhou/ilegível (repo, git show, teste que não parseia, rsync, mac-only) -> unknown + nota `codigo-do-teste-ilegivel`, nunca node e nunca "vazio"
     extra = []
     if not code:
         t0 = time.monotonic()
@@ -755,6 +886,12 @@ def classify(b):
         except Unreadable as e:
             res = None
             extra.append("caminho-derivado-ilegivel:" + str(e))
+        if res is None and tests:
+            try:
+                res = import_derivation(tests, paths, info, extra)
+            except Unreadable as e:
+                res = None
+                extra.append("codigo-do-teste-ilegivel:" + str(e))
         COST["derivacao_ms"] = int((time.monotonic() - t0) * 1000)
         if res:
             return res
@@ -781,7 +918,7 @@ def main(argv):
     if "etiqueta-node:ok" in why:
         basis = "label"
     elif v == "node":
-        basis = "derivado" if any(w.startswith(("prova-teste-derivado:", "prova-caminho-derivado:")) for w in why) else "text"
+        basis = "derivado" if any(w.startswith(("prova-teste-derivado:", "prova-caminho-derivado:", "prova-codigo-derivado-do-teste:")) for w in why) else "text"
     else:
         basis = ""
     # custo: ms da execução inteira e da regra 7 (0 se ela não rodou) + o estado do cache das irmãs; vem ANTES de info (quem lê o fim da linha continua achando `"info": [...]}`)

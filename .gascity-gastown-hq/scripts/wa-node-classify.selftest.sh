@@ -10,7 +10,9 @@
 #   teto de 40 caminhos · códigos de saída 0/10/11/2 · as regexes de telefone/CPF são as do hetzner-pii-scan.py.
 #   · TESTE DERIVADO (ga-2hd02v.3.15, regra 6): um repo git de mentira faz o papel do repo do WA (origin/main; o working tree e o HEAD à frente não valem); node/derivado só com código rastreado + teste de nome do módulo
 #   que CITA o módulo (palavra inteira) + teste que o nó tem (rsync, mac-only, espelho); módulo mais longo, nome curto/genérico, prefixo sem `_`, extensão fora de py/js/cjs/mjs e código que não existe em origin/main NÃO ganham teste;
-#   lead/envio no texto mandam ao mini (freio-derivado); repo/ref/git/grep/espelho que falham dão unknown COM a nota e vazio dá unknown SEM nota (três estados).
+#   envio no texto manda ao mini (freio-derivado; lead/terreno/lote/construtora NÃO freiam mais, ga-2hd02v.3.21); repo/ref/git/grep/espelho que falham dão unknown COM a nota e vazio dá unknown SEM nota (três estados).
+#   · CÓDIGO DERIVADO DO TESTE (ga-2hd02v.3.21, regra 8): teste citado e NENHUM código -> o código que o teste IMPORTA (import/from em Python por ast, require/import em JS, lidos em origin/main); só existente e de código (não tests/),
+#   pelos MESMOS filtros do citado (fora do filtro / só no Mac = mini; mais de 10 = nenhum); a regra 7 e a 5 vencem a 8; teste novo, sem import do repo, import dinâmico ou apoio de teste = unknown SEM nota; git show/parse/repo que falham = unknown COM a nota.
 # CONTROLE NEGATIVO: cada mutante abaixo troca UMA linha do classificador numa cópia e o caso designado tem de reprovar; mutante que sobrevive reprova esta bateria. Um mutante só vale se o
 #   ORIGINAL passa o mesmo caso no mesmo ambiente e se ele não morre por causa do ambiente (ver as 3 regras acima de mk_mutant); caso e mutante de rsync usam stubs que só o mutante separa do original.
 # COMO RODAR: bash scripts/wa-node-classify.selftest.sh   (macOS /bin/bash 3.2 e Linux). Pesado o bastante para ir ao nó: scripts/mbp-run.sh --repo hq scripts/wa-node-classify.selftest.sh
@@ -235,8 +237,20 @@ wf shared/fora_mod.py "# fora_mod"; wf tests/test_fora_mod.py "fora_mod"; wf lib
 wf lib/sem_teste_mod.py "# sem_teste_mod"; wf lib/db_x.py "# db_x"; wf tests/test_db_x.py "db_x"
 for d in pkg1 pkg2 pkg3 pkg4; do wf "$d/ambig_mod.py" "# ambig_mod"; done; wf tests/test_ambig_mod.py "ambig_mod"
 for i in 01 02 03 04 05 06 07 08 09 10 11 12; do wf "lib/limcap_$i.py" "# limcap_$i"; wf "tests/test_limcap_$i.py" "limcap_$i"; done
+# regra 8 (ga-2hd02v.3.21): código que o TESTE citado importa. imp_alpha/imp_beta/imp_js_* são código; cada tests/test_imp_* importa de um jeito (e tests/imp_support.py é apoio de teste, não código)
+wf lib/imp_alpha.py "# imp_alpha"; wf lib/imp_beta.py "# imp_beta"; wf lib/imp_js_mod.js "// imp_js_mod"; wf lib/imp_js_dir/index.js "// imp_js_dir"; wf lib/imp_js_esm.mjs "// imp_js_esm"; wf tests/imp_support.py "# apoio de teste"
+wf tests/test_imp_a.py "from lib.imp_alpha import x"; wf tests/test_imp_bare.py $'import sys\nimport imp_alpha'
+wf tests/test_imp_from.py $'from lib import imp_alpha, imp_beta\nfrom lib.imp_alpha import *'; wf tests/test_imp_fn.py $'def test_x():\n    from lib.imp_beta import y\n    assert y'
+wf tests/test_imp_rel.py "from ..lib.imp_alpha import x"
+wf tests/test_imp_stdlib.py $'import os, json\nimport pytest\nfrom pathlib import Path'; wf tests/test_imp_dyn.py $'import importlib\nmod = importlib.import_module("lib.imp_alpha")'
+wf tests/test_imp_quebrado.py "def (:"; wf tests/test_imp_vazio.py ""; wf tests/test_imp_apoio.py "from tests.imp_support import algo"
+wf tests/test_imp_fora.py "from shared.fora_mod import x"; wf tests/test_imp_mac.py "from lib.mac_code_mod import x"
+wf tests/test_imp_sete.py "$(for i in 01 02 03 04 05 06 07; do printf 'from lib.limcap_%s import x\n' "$i"; done)"; wf tests/test_imp_onze.py "$(for i in 01 02 03 04 05 06 07 08 09 10 11; do printf 'from lib.limcap_%s import x\n' "$i"; done)"
+wf tests/test_imp_head.py "import os"   # em origin/main não importa nada; no HEAD (2º commit) importa imp_alpha: o nó recebe origin/main
+wf tests/test_imp_js.cjs $'const a = require(\'../lib/imp_js_mod.js\');\nconst d = require("../lib/imp_js_dir");\nconst fs = require(\'fs\');\nconst npm = require(\'imp_pacote_npm\');'; wf tests/test_imp_esm.mjs "import y from '../lib/imp_js_esm.mjs';"
+{ printf '# '; head -c 1100000 /dev/zero | tr '\0' x; printf '\n'; } > "$RP/tests/test_imp_grande.py"   # acima do teto de 1 MB de leitura
 gw add -A && gw commit -q -m 1 && gw update-ref refs/remotes/origin/main HEAD || bad "repo de mentira do WA não montado"
-wf tests/test_late_mod.py "late_mod"; gw add -A && gw commit -q -m 2   # o teste de late_mod só existe no HEAD, não em origin/main
+wf tests/test_late_mod.py "late_mod"; wf tests/test_imp_head.py "from lib.imp_alpha import x"; gw add -A && gw commit -q -m 2   # o teste de late_mod só existe no HEAD, não em origin/main
 git_ok=$(gw rev-parse --verify -q refs/remotes/origin/main >/dev/null && gw ls-tree -r --name-only origin/main | grep -c 'test_foo_parser'); [ "$git_ok" = 3 ] && ok "repo de mentira do WA montado (origin/main tem 3 testes de foo_parser; o HEAD tem um a mais em late_mod)" || bad "repo de mentira do WA errado ($git_ok)"
 mkdir -p "$T/wa-repo-vazio"; env -i HOME="$T" PATH="$PATH" git -C "$T/wa-repo-vazio" init -q
 env -i HOME="$T" PATH="$PATH" git -C "$T/wa-repo-vazio" update-ref refs/remotes/origin/main "$(env -i HOME="$T" PATH="$PATH" git -C "$T/wa-repo-vazio" -c user.email=t@t -c user.name=t commit-tree "$(env -i HOME="$T" PATH="$PATH" git -C "$T/wa-repo-vazio" hash-object -t tree /dev/null)" -m vazio)"   # origin/main existe e a árvore é VAZIA
@@ -250,7 +264,8 @@ SEMNOTA='"info": \[\]\}$'   # unknown SEM nota: o repo respondeu e não há test
 expect "derivado: node com basis derivado, 3 testes (um em subpasta) e os pares em info" "$(DESC 'Corrigir lib/foo_parser.py quando a entrada vem vazia.')" 0 '"verdict": "node", "basis": "derivado", "reasons": \["prova-teste-derivado:3-teste\(s\)\+1-codigo\(s\)"\].*"info": \["teste-derivado:lib/foo_parser\.py=tests/auto_response/test_foo_parser_sub\.py", "teste-derivado:lib/foo_parser\.py=tests/test_foo_parser\.py", "teste-derivado:lib/foo_parser\.py=tests/test_foo_parser_extra_wa_x1\.py"\]\}$'
 expect "derivado: o teste citado continua dando basis text (a regra 5 vem antes)" "$(DESC 'Corrigir lib/foo_parser.py com tests/test_foo_parser.py')" 0 '"basis": "text".*prova-no-texto'
 expect "derivado: node:ok continua dando basis label" "$(labels "$(DESC 'Corrigir lib/foo_parser.py')" '["node:ok"]')" 0 '"basis": "label"'
-expect "derivado: teste citado SEM código citado não deriva nada" "$(DESC 'rodar tests/test_foo_parser.py')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "derivado: teste citado SEM código citado não deriva nada pelo NOME (a regra 6 só vale com código citado); o teste que só cita 'foo_parser' no texto, sem import, também não ganha pela regra 8" "$(DESC 'rodar tests/auto_response/test_foo_parser_sub.py')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "derivado: teste citado SEM código citado que IMPORTA o módulo ganha pela regra 8 (ga-2hd02v.3.21), não pela 6" "$(DESC 'rodar tests/test_foo_parser.py')" 0 '"basis": "derivado", "reasons": \["prova-codigo-derivado-do-teste:1-teste\(s\)\+1-codigo\(s\)"\].*codigo-do-teste:tests/test_foo_parser\.py=lib/foo_parser\.py'
 expect "derivado: código citado sem teste no repo -> unknown sem nota" "$(DESC 'ajustar lib/orfa_unica.py')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
 expect "derivado: código que NÃO existe em origin/main não ganha o teste de nome igual (test_novo_modulo existe)" "$(DESC 'criar lib/novo_modulo.py')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
 expect "derivado: só o código que tem teste conta; o sem teste não atrapalha nem entra na contagem" "$(DESC 'ajustar lib/foo_parser.py e lib/orfa_unica.py')" 0 'prova-teste-derivado:3-teste\(s\)\+1-codigo\(s\)'
@@ -278,9 +293,10 @@ expect "derivado: script .sh com teste .py" "$(DESC 'ajustar scripts/run_job.sh'
 expect "derivado: mais de 6 pares: 6 em info e o resto contado (teste-derivado-mais)" "$(DESC 'ajustar lib/many_mod.py')" 0 'prova-teste-derivado:7-teste\(s\)\+1-codigo\(s\).*test_many_mod_6\.py", "teste-derivado-mais:1"\]\}$'
 expect "derivado: teto de 25 testes por módulo" "$(DESC 'ajustar lib/huge_mod.py')" 0 'prova-teste-derivado:25-teste\(s\)\+1-codigo\(s\).*"teste-derivado-mais:19"\]\}$'
 expect "derivado: teto de 100 candidatos no total (5 módulos x 21 testes)" "$(DESC 'ajustar lib/cap_a.py lib/cap_b.py lib/cap_c.py lib/cap_d.py lib/cap_e.py')" 0 'prova-teste-derivado:100-teste\(s\)\+5-codigo\(s\)'
-expect "freio: lead no texto manda ao mini (prova fraca), com os pares em info" "$(DESC 'Corrigir lib/foo_parser.py; o lead some da lista')" 10 '"verdict": "mini", "basis": "", "reasons": \["freio-derivado:dado-de-lead"\].*teste-derivado:lib/foo_parser\.py='
+expect "freio: lead no texto NÃO segura mais a prova derivada (ga-2hd02v.3.21: era vocabulário, não dado) -> node; o lead fica só em info" "$(DESC 'Corrigir lib/foo_parser.py; o lead some da lista')" 0 '"verdict": "node", "basis": "derivado".*"info": \["dado-de-lead", "teste-derivado:lib/foo_parser\.py='
+expect "freio: terreno, lote, construtora e proprietário no texto também não seguram" "$(DESC 'Corrigir lib/foo_parser.py: o terreno e o lote da construtora do proprietario')" 0 '"verdict": "node", "basis": "derivado"'
 expect "freio: envio no texto manda ao mini" "$(DESC 'Corrigir lib/foo_parser.py antes de enviar a mensagem')" 10 '"reasons": \["freio-derivado:envio-whatsapp"\]'
-expect "freio: lead e envio juntos, na ordem da lista" "$(DESC 'Corrigir lib/foo_parser.py: o lead recebe o envio duplicado')" 10 '"reasons": \["freio-derivado:dado-de-lead,envio-whatsapp"\]'
+expect "freio: lead e envio juntos: só o envio freia (e é o único motivo)" "$(DESC 'Corrigir lib/foo_parser.py: o lead recebe o envio duplicado')" 10 '"reasons": \["freio-derivado:envio-whatsapp"\]'
 expect "freio: palavras informativas que NÃO são da lista (deploy, tela) não bloqueiam a prova derivada" "$(DESC 'Corrigir lib/foo_parser.py no deploy da tela')" 0 '"basis": "derivado"'
 expect "freio: sem prova derivada o lead no texto não muda o unknown (continua não sei, não vira mini)" "$(DESC 'ajustar lib/orfa_unica.py; o lead some')" 11 'sem-prova-de-codigo-e-teste'
 expect "derivado: palavra mole (banco) ainda vence" "$(DESC 'Corrigir lib/foo_parser.py que abre um sqlite')" 10 'moles:banco-de-dados'
@@ -356,7 +372,7 @@ expect "caminho: código derivado que está na lista mac-only -> mini, com o cam
 unset WA_NODE_MAC_ONLY
 expect "caminho: um derivado fora do filtro entre dois que passam leva a bead toda ao mini" "$(DESC 'revisar ficha_donos e fora_mod quando vem vazio')" 10 '"reasons": \["caminho-derivado-fora-do-filtro:shared/fora_mod\.py"\]'
 # palavras duras/moles e freios valem como sempre
-expect "caminho-freio: lead no texto manda ao mini (prova fraca), com a origem em info" "$(DESC 'revisar ficha_donos: o lead some da lista')" 10 '"reasons": \["freio-derivado:dado-de-lead"\].*caminho-derivado:nome:ficha_donos=lib/ficha_donos\.py'
+expect "caminho-freio: lead no texto NÃO segura mais a prova derivada (ga-2hd02v.3.21) -> node, com a origem do caminho em info" "$(DESC 'revisar ficha_donos: o lead some da lista')" 0 '"verdict": "node", "basis": "derivado".*"info": \["dado-de-lead", "caminho-derivado:nome:ficha_donos=lib/ficha_donos\.py"'
 expect "caminho-freio: envio no texto manda ao mini" "$(DESC 'revisar ficha_donos antes de enviar a mensagem')" 10 '"reasons": \["freio-derivado:envio-whatsapp"\]'
 expect "caminho: palavra mole (banco) ainda vence" "$(DESC 'revisar ficha_donos que abre um sqlite')" 10 'moles:banco-de-dados'
 expect "caminho: telefone no texto ainda vence" "$(DESC 'revisar ficha_donos (31) 98876-5432')" 10 '"reasons": \["dado-no-texto"\]'
@@ -414,6 +430,50 @@ export WA_NODE_SIBLING_DAYS=0 WA_NODE_CACHE="$T/cache-zero"; expect "irmas: jane
 unset WA_NODE_SIBLING_DAYS; export WA_NODE_CACHE="$T/cache"
 export WA_NODE_CACHE="$T/cache"
 expect "custo: a saída diz o tempo total e o da regra 7 (>0 quando ela rodou)" "$(DESC 'revisar ficha_donos quando a entrada vem vazia')" 0 '"custo": \{"ms": [0-9]+, "derivacao_ms": [1-9][0-9]*, "cache": "-"\}, "info"'
+export WA_NODE_REPO="$T/wa-repo-ausente" WA_NODE_MIRROR="$T/espelho-ausente"
+
+# ---- código derivado do teste (ga-2hd02v.3.21, regra 8): a bead cita >=1 teste e NENHUM código (e a regra 7 não derivou nada) -> o código que o TESTE importa (import/require estático, lido em origin/main), pelos MESMOS filtros do citado
+export WA_NODE_REPO="$RP" WA_NODE_MIRROR="$T/mirror-ok"
+C8_OK='"verdict": "node", "basis": "derivado", "reasons": \["prova-codigo-derivado-do-teste:'
+NOTA8() { printf 'sem-prova-de-codigo-e-teste.*"info": \\["codigo-do-teste-ilegivel:%s"\\]\\}$' "$1"; }
+T8() { DESC "Corrigir o caso de borda; teste em $1"; }   # T8 <teste>: bead que cita só um teste (sem palavra de lead/envio/banco no texto)
+expect "importa: pacote.módulo (from lib.imp_alpha import x) -> node derivado, com o par teste=código em info" "$(T8 tests/test_imp_a.py)" 0 "$C8_OK"'1-teste\(s\)\+1-codigo\(s\)"\].*"info": \["codigo-do-teste:tests/test_imp_a\.py=lib/imp_alpha\.py"\]\}$'
+expect "importa: nome solto (import imp_alpha; lib/ está no pythonpath)" "$(T8 tests/test_imp_bare.py)" 0 "$C8_OK"'1-teste\(s\)\+1-codigo\(s\).*codigo-do-teste:tests/test_imp_bare\.py=lib/imp_alpha\.py'
+expect "importa: from lib import a, b -> os dois são submódulos (e o import * não atrapalha)" "$(T8 tests/test_imp_from.py)" 0 "$C8_OK"'1-teste\(s\)\+2-codigo\(s\).*lib/imp_alpha\.py", "codigo-do-teste:tests/test_imp_from\.py=lib/imp_beta\.py"'
+expect "importa: import dentro de função também conta" "$(T8 tests/test_imp_fn.py)" 0 "$C8_OK"'1-teste\(s\)\+1-codigo\(s\).*=lib/imp_beta\.py'
+expect "importa: relativo (from ..lib.imp_alpha) sobe da pasta do teste" "$(T8 tests/test_imp_rel.py)" 0 "$C8_OK"'1-teste\(s\)\+1-codigo\(s\).*=lib/imp_alpha\.py'
+expect "importa: dois testes que importam o mesmo módulo -> 2 testes + 1 código" "$(DESC 'Corrigir o caso de borda; testes em tests/test_imp_a.py e tests/test_imp_bare.py')" 0 "$C8_OK"'2-teste\(s\)\+1-codigo\(s\)'
+expect "importa: require JS (.cjs): arquivo com extensão e pasta com index; fs e pacote npm não são do repo" "$(T8 tests/test_imp_js.cjs)" 0 "$C8_OK"'1-teste\(s\)\+2-codigo\(s\).*=lib/imp_js_dir/index\.js", "codigo-do-teste:tests/test_imp_js\.cjs=lib/imp_js_mod\.js"\]\}$'
+expect "importa: import ... from './x' (.mjs)" "$(T8 tests/test_imp_esm.mjs)" 0 "$C8_OK"'1-teste\(s\)\+1-codigo\(s\).*=lib/imp_js_esm\.mjs'
+expect "importa: mais de 6 pares -> 6 em info e o resto contado (codigo-do-teste-mais)" "$(T8 tests/test_imp_sete.py)" 0 "$C8_OK"'1-teste\(s\)\+7-codigo\(s\).*lib/limcap_06\.py", "codigo-do-teste-mais:1"\]\}$'
+expect "custo: a regra 8 conta no derivacao_ms (>0 quando ela rodou)" "$(T8 tests/test_imp_a.py)" 0 '"custo": \{"ms": [0-9]+, "derivacao_ms": [1-9][0-9]*, "cache": "-"\}, "info"'
+# vazio é legítimo: unknown SEM nota
+expect "vazio: teste que só importa stdlib/pytest -> unknown SEM nota" "$(T8 tests/test_imp_stdlib.py)" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "vazio: carga dinâmica (importlib.import_module) não é import estático -> unknown SEM nota" "$(T8 tests/test_imp_dyn.py)" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "vazio: teste de 0 bytes lido com sucesso -> unknown SEM nota" "$(T8 tests/test_imp_vazio.py)" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "vazio: teste que não está em origin/main (novo nesta bead) não tem o que ler -> unknown SEM nota" "$(T8 tests/test_imp_novo.py)" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "vazio: apoio de teste (tests/imp_support.py) não é código -> unknown SEM nota" "$(T8 tests/test_imp_apoio.py)" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "vazio: o que vale é origin/main (o import que só existe no HEAD não conta)" "$(T8 tests/test_imp_head.py)" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "demais: teste que importa 11 módulos do repo -> nenhum (palpite largo), com a nota" "$(T8 tests/test_imp_onze.py)" 11 'sem-prova-de-codigo-e-teste.*"info": \["codigo-do-teste-demais:11"\]\}$'
+# os filtros do citado valem para o derivado
+expect "filtro: o teste importa um módulo que o rsync nega (shared/) -> mini, o nó rodaria vermelho" "$(T8 tests/test_imp_fora.py)" 10 '"reasons": \["codigo-do-teste-fora-do-filtro:shared/fora_mod\.py"\]'
+export WA_NODE_MAC_ONLY="$T/macs-derivado7.txt"
+expect "mac-only: o teste importa um módulo só do Mac -> mini" "$(T8 tests/test_imp_mac.py)" 10 '"reasons": \["codigo-do-teste-so-no-mac:lib/mac_code_mod\.py"\]'
+unset WA_NODE_MAC_ONLY
+expect "freio: envio no texto manda ao mini (a prova é mais fraca que o teste+código citados)" "$(DESC 'Corrigir o envio da mensagem; teste em tests/test_imp_a.py')" 10 '"reasons": \["freio-derivado:envio-whatsapp"\]'
+expect "freio: lead/terreno no texto NÃO freia" "$(DESC 'Corrigir o lead do terreno; teste em tests/test_imp_a.py')" 0 "$C8_OK"
+expect "mole: palavra de banco no texto ainda vence" "$(DESC 'Corrigir o sqlite; teste em tests/test_imp_a.py')" 10 'moles:banco-de-dados'
+expect "duro: telefone no texto ainda vence" "$(DESC 'Corrigir o caso (31) 98876-5432; teste em tests/test_imp_a.py')" 10 '"reasons": \["dado-no-texto"\]'
+expect "ordem: nome snake_case que a regra 7 deriva (ficha_donos) vence a regra 8" "$(DESC 'Corrigir ficha_donos; teste em tests/test_imp_a.py')" 0 '"reasons": \["prova-caminho-derivado:'
+expect "ordem: teste + código citados -> a regra 5 (basis text); a 8 nem roda" "$(DESC 'Corrigir lib/foo_parser.py; teste em tests/test_imp_a.py')" 0 '"basis": "text".*prova-no-texto:1-teste\(s\)\+1-codigo'
+# falhou/ilegível: unknown COM a nota (nunca node, nunca o mesmo resultado do vazio)
+expect "ilegível: teste que não parseia -> unknown com a nota" "$(T8 tests/test_imp_quebrado.py)" 11 "$(NOTA8 teste-nao-parseia)"
+expect "ilegível: teste de mais de 1 MB não é lido -> unknown com a nota" "$(T8 tests/test_imp_grande.py)" 11 "$(NOTA8 teste-grande)"
+stub git-show-quebra 'for a in "$@"; do [ "$a" = show ] && exit 2; done; exec git "$@"'   # só o `git show` falha (rc 2)
+stub git-show-lento 'for a in "$@"; do [ "$a" = show ] && sleep 6; done; exec git "$@"'
+export WA_NODE_GIT="$T/git-show-quebra"; expect "ilegível: git show que falha (rc 2) -> unknown com a nota, nunca 'teste sem import'" "$(T8 tests/test_imp_a.py)" 11 "$(NOTA8 teste-git-rc-2)"; unset WA_NODE_GIT
+export WA_NODE_GIT="$T/git-show-lento" WA_NODE_REPO_TIMEOUT=1; expect "ilegível: git show que não responde no prazo -> unknown com a nota" "$(T8 tests/test_imp_a.py)" 11 "$(NOTA8 teste-git-sem-resposta)"; unset WA_NODE_GIT WA_NODE_REPO_TIMEOUT
+export WA_NODE_REPO="$T/wa-repo-ausente"; expect "ilegível: repo inexistente -> unknown com a nota (não 'nada importado')" "$(T8 tests/test_imp_a.py)" 11 "$(NOTA8 repo-git-rc-128)"; export WA_NODE_REPO="$RP"
 export WA_NODE_REPO="$T/wa-repo-ausente" WA_NODE_MIRROR="$T/espelho-ausente"
 
 # ---- o classificador não deixa resíduo e só aceita stdin
@@ -519,10 +579,10 @@ mutant so-neg-sem-canario-pasta 'no_canary += list(CANARY_OPEN_NO)' 'pass' "$(DE
 # teste derivado (regra 6): um mutante por linha da regra; o repo de mentira e o espelho de mentira vêm por envspec (o padrão da bateria é repo e espelho AUSENTES)
 DV="WA_NODE_REPO=$RP WA_NODE_MIRROR=$T/mirror-ok"
 D_FOO=$(DESC 'Corrigir lib/foo_parser.py quando a entrada vem vazia.')
-mutant derivado-sem-freio       'if blocked:'                          'if False:'                                  "$(DESC 'Corrigir lib/foo_parser.py; o lead some da lista')" 10 'freio-derivado:dado-de-lead' "$DV"
-mutant derivado-freio-sem-lead  'DERIVED_BLOCK_INFO = ("dado-de-lead", "envio-whatsapp")' 'DERIVED_BLOCK_INFO = ("envio-whatsapp",)' "$(DESC 'Corrigir lib/foo_parser.py; o lead some da lista')" 10 'freio-derivado:dado-de-lead' "$DV"
-mutant derivado-freio-sem-envio 'DERIVED_BLOCK_INFO = ("dado-de-lead", "envio-whatsapp")' 'DERIVED_BLOCK_INFO = ("dado-de-lead",)' "$(DESC 'Corrigir lib/foo_parser.py antes de enviar a mensagem')" 10 'freio-derivado:envio-whatsapp' "$DV"
-mutant derivado-basis-text      'basis = "derivado" if any(w.startswith(("prova-teste-derivado:", "prova-caminho-derivado:")) for w in why) else "text"' 'basis = "text"' "$D_FOO" 0 '"basis": "derivado"' "$DV"
+mutant derivado-sem-freio       'if blocked:'                          'if False:'                                  "$(DESC 'Corrigir lib/foo_parser.py antes de enviar a mensagem')" 10 'freio-derivado:envio-whatsapp' "$DV"
+mutant derivado-freio-com-lead  'DERIVED_BLOCK_INFO = ("envio-whatsapp",)' 'DERIVED_BLOCK_INFO = ("dado-de-lead", "envio-whatsapp")' "$(DESC 'Corrigir lib/foo_parser.py; o lead some da lista')" 0 '"basis": "derivado"' "$DV"
+mutant derivado-freio-sem-envio 'DERIVED_BLOCK_INFO = ("envio-whatsapp",)' 'DERIVED_BLOCK_INFO = ()'                  "$(DESC 'Corrigir lib/foo_parser.py antes de enviar a mensagem')" 10 'freio-derivado:envio-whatsapp' "$DV"
+mutant derivado-basis-text      'basis = "derivado" if any(w.startswith(("prova-teste-derivado:", "prova-caminho-derivado:", "prova-codigo-derivado-do-teste:")) for w in why) else "text"' 'basis = "text"' "$D_FOO" 0 '"basis": "derivado"' "$DV"
 mutant derivado-sem-maior       ' and not any(rest == m or rest.startswith(m + "_") for m in longer))' ')' "$(DESC 'ajustar lib/bar_service.py')" 0 'prova-teste-derivado:1-teste\(s\)' "$DV"
 mutant derivado-sem-generico    ' and s not in GENERIC_STEMS'          ''                                           "$(DESC 'ajustar lib/utils.py')" 11 'sem-prova-de-codigo-e-teste' "$DV"
 mutant derivado-sem-minimo      ' and len(s) >= MIN_STEM'              ''                                           "$(DESC 'ajustar lib/abcd.py')" 11 'sem-prova-de-codigo-e-teste' "$DV"
@@ -548,6 +608,33 @@ mutant derivado-sem-pares       'dinfo = pairs[:6] + ('                'dinfo = 
 mutant derivado-sem-teto-pares  'dinfo = pairs[:6] + ('                'dinfo = pairs + ('                          "$(DESC 'ajustar lib/many_mod.py')" 0 'test_many_mod_6\.py", "teste-derivado-mais:1"\]\}$' "$DV"
 mutant derivado-sem-teto-modulo 'mine[:MAX_DERIVED_PER_STEM]'          'mine'                                       "$(DESC 'ajustar lib/huge_mod.py')" 0 'prova-teste-derivado:25-teste' "$DV"
 mutant derivado-sem-teto-total  ')[:MAX_DERIVED_TESTS]'                ')'                                          "$(DESC 'ajustar lib/cap_a.py lib/cap_b.py lib/cap_c.py lib/cap_d.py lib/cap_e.py')" 0 'prova-teste-derivado:100-teste' "$DV"
+# código derivado do teste (ga-2hd02v.3.21, regra 8): um mutante por linha da regra; repo e espelho de mentira por envspec ($DV)
+C8="$DV"
+T8M() { DESC "Corrigir o caso de borda; teste em $1"; }
+C8_RX='"verdict": "node", "basis": "derivado", "reasons": \["prova-codigo-derivado-do-teste:'
+mutant codigo-sem-freio          'return judged_derived(found, "prova-codigo-derivado-do-teste", paths, tests, info, extra)' 'return "node", ["prova-codigo-derivado-do-teste:1-teste(s)+1-codigo(s)"], paths, tests, info + extra' "$(DESC 'Corrigir o envio da mensagem; teste em tests/test_imp_a.py')" 10 'freio-derivado:envio-whatsapp' "$C8"
+mutant codigo-sem-filtro         'hard.append("codigo-do-teste-fora-do-filtro:" + p)' 'pass'                  "$(T8M tests/test_imp_fora.py)" 10 'codigo-do-teste-fora-do-filtro:shared/fora_mod' "$C8"
+mutant codigo-sem-mac-only       'hard.append("codigo-do-teste-so-no-mac:" + p)' 'pass'                      "$(T8M tests/test_imp_mac.py)" 10 'codigo-do-teste-so-no-mac:lib/mac_code_mod' "$C8 WA_NODE_MAC_ONLY=$T/macs-derivado7.txt"
+mutant codigo-sem-teto           'if len(dpaths) > MAX_DERIVED_CODE:' 'if False:'                           "$(T8M tests/test_imp_onze.py)" 11 'codigo-do-teste-demais:11' "$C8"
+mutant codigo-sem-teto-pares     'extra += pairs[:6] + (["codigo-do-teste-mais:%d"' 'extra += pairs + (["codigo-do-teste-mais:%d"' "$(T8M tests/test_imp_sete.py)" 0 'lib/limcap_06\.py", "codigo-do-teste-mais:1"\]\}$' "$C8"
+mutant codigo-sem-par-em-info    'extra += pairs[:6] + (["codigo-do-teste-mais:%d"' 'extra += [] + (["codigo-do-teste-mais:%d"' "$(T8M tests/test_imp_a.py)" 0 'codigo-do-teste:tests/test_imp_a\.py=lib/imp_alpha\.py' "$C8"
+mutant codigo-basis-text         '"prova-caminho-derivado:", "prova-codigo-derivado-do-teste:"))' '"prova-caminho-derivado:"))' "$(T8M tests/test_imp_a.py)" 0 '"basis": "derivado"' "$C8"
+mutant codigo-regra7-primeiro    'if res is None and tests:'           'if tests:'                             "$(DESC 'Corrigir ficha_donos; teste em tests/test_imp_a.py')" 0 '"reasons": \["prova-caminho-derivado:' "$C8"
+mutant codigo-falha-vira-vazio   'extra.append("codigo-do-teste-ilegivel:" + str(e))' 'pass'                  "$(T8M tests/test_imp_a.py)" 11 'codigo-do-teste-ilegivel:teste-git-rc-2' "$C8 WA_NODE_GIT=$T/git-show-quebra"
+mutant codigo-parse-vira-vazio   'raise Unreadable("teste-nao-parseia")' 'return []'                         "$(T8M tests/test_imp_quebrado.py)" 11 'codigo-do-teste-ilegivel:teste-nao-parseia' "$C8"
+mutant codigo-show-rc-ignorado   'raise Unreadable("teste-git-rc-%d" % r.returncode)' 'pass'                  "$(T8M tests/test_imp_a.py)" 11 'codigo-do-teste-ilegivel:teste-git-rc-2' "$C8 WA_NODE_GIT=$T/git-show-quebra"
+mutant codigo-show-sem-resposta  'raise Unreadable("teste-git-sem-resposta")' 'return ""'                     "$(T8M tests/test_imp_a.py)" 11 'codigo-do-teste-ilegivel:teste-git-sem-resposta' "$C8 WA_NODE_GIT=$T/git-show-lento WA_NODE_REPO_TIMEOUT=1"
+mutant codigo-grande-vale        'if len(r.stdout) > MAX_TEST_BYTES:' 'if False:'                           "$(T8M tests/test_imp_grande.py)" 11 'codigo-do-teste-ilegivel:teste-grande' "$C8"
+mutant codigo-novo-vira-erro     'if t not in present or not (ext == "py" or ext in JS_TEST_EXT):' 'if not (ext == "py" or ext in JS_TEST_EXT):' "$(T8M tests/test_imp_novo.py)" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA" "$C8"
+mutant codigo-le-head            'REPO_REF + ":" + path'               '"HEAD:" + path'                        "$(T8M tests/test_imp_head.py)" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA" "$C8"
+mutant codigo-sem-existir        'if c in present and derivable_code(c) and t not in found.setdefault(c, []):' 'if derivable_code(c) and t not in found.setdefault(c, []):' "$(T8M tests/test_imp_a.py)" 0 "$C8_RX" "$C8"
+mutant codigo-apoio-conta        'and derivable_code(c) and t not in found.setdefault' 'and t not in found.setdefault' "$(T8M tests/test_imp_apoio.py)" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA" "$C8"
+mutant codigo-relativo-sem-nivel 'for _ in range(level - 1):'          'for _ in range(0):'                    "$(T8M tests/test_imp_rel.py)" 0 "$C8_RX" "$C8"
+mutant codigo-sem-submodulo      'mods = ([parts] if parts else []) + [parts + [n] for n in names]' 'mods = ([parts] if parts else [])' "$(T8M tests/test_imp_from.py)" 0 '2-codigo\(s\)' "$C8"
+mutant codigo-sem-raiz-lib       'IMPORT_ROOTS = ("", "lib", "daemons", "scripts")' 'IMPORT_ROOTS = ("", "daemons", "scripts")' "$(T8M tests/test_imp_bare.py)" 0 "$C8_RX" "$C8"
+mutant codigo-sem-index-js       ' + [base + "/index." + e for e in exts]' ''                                 "$(T8M tests/test_imp_js.cjs)" 0 '2-codigo\(s\)' "$C8"
+mutant codigo-sem-import-from    '\bfrom\s+|'                          ''                                      "$(T8M tests/test_imp_esm.mjs)" 0 "$C8_RX" "$C8"
+mutant codigo-sem-import-em-funcao 'for n in ast.walk(tree):'          'for n in tree.body:'                   "$(T8M tests/test_imp_fn.py)" 0 "$C8_RX" "$C8"
 # nome solto (ga-2hd02v.3.17): um mutante por linha da regra
 SV="WA_NODE_REPO=$RP WA_NODE_MIRROR=$T/mirror-ok"
 S_HTML=$(DESC "lib/x.py e $SOLTO_TESTE: ajustar loose_page.html")
@@ -584,8 +671,8 @@ mutant caminho-citado-vale      'if tests:   # a bead cita o teste'    'if False
 mutant caminho-teste-de-mentira 'found = derived_tests(dpaths, globs)' 'found = dict((p, ["tests/x.py"]) for p in dpaths)' "$(DESC 'revisar sem_teste_mod quando vem vazio')" 11 'sem-prova-de-codigo-e-teste' "$R7"
 mutant caminho-falha-vira-vazio 'extra.append("caminho-derivado-ilegivel:" + str(e))' 'pass'                          "$FD" 11 'caminho-derivado-ilegivel:repo-git-rc-128' "WA_NODE_REPO=$T/wa-repo-ausente WA_NODE_MIRROR=$T/mirror-ok WA_NODE_CACHE=/dev/null/sem-cache"
 mutant caminho-com-codigo-citado 'if not code:'                         'if True:'                                   "$(DESC 'ajustar lib/sem_teste_mod.py e a ficha_donos')" 11 "$SEMNOTA" "$R7"
-mutant caminho-basis-text       'w.startswith(("prova-teste-derivado:", "prova-caminho-derivado:"))' 'w.startswith("prova-teste-derivado:")' "$FD" 0 '"basis": "derivado"' "$R7"
-mutant caminho-sem-freio        'if blocked:'                          'if False:'                                  "$(DESC 'revisar ficha_donos: o lead some da lista')" 10 'freio-derivado:dado-de-lead.*caminho-derivado:nome:ficha_donos' "$R7"
+mutant caminho-basis-text       'w.startswith(("prova-teste-derivado:", "prova-caminho-derivado:", "prova-codigo-derivado-do-teste:"))' 'w.startswith("prova-teste-derivado:")' "$FD" 0 '"basis": "derivado"' "$R7"
+mutant caminho-sem-freio        'if blocked:'                          'if False:'                                  "$(DESC 'revisar ficha_donos antes de enviar a mensagem')" 10 'freio-derivado:envio-whatsapp.*caminho-derivado:nome:ficha_donos' "$R7"
 mutant caminho-custo-zero       '"derivacao_ms": COST["derivacao_ms"]' '"derivacao_ms": 0'                          "$FD" 0 '"derivacao_ms": [1-9][0-9]*' "$R7"
 mutant irmas-sem-campo-parent   'if isinstance(p, str) and PARENT_RE.match(p):' 'if False:'                         "$(printf '{"id":"wa-zzz9","parent":"wa-par1","title":"t","description":"corrigir o caso de borda"}')" 0 'caminho-derivado:irmas=lib/irma_mod' "$R7"
 mutant irmas-id-inteiro         'p = i.rsplit(".", 1)[0]'              'p = i'                                      "$(DESCI wa-par1.3 'corrigir o caso de borda')" 0 'caminho-derivado:irmas=lib/irma_mod' "$R7"
