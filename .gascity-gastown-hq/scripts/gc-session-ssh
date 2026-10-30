@@ -145,6 +145,9 @@ EX_CAP, EX_EXISTS, EX_POLICY, EX_PREP = 10, 11, 12, 13
 # Cache de TTL curto da resposta BOA do list-running, por host (ga-it7qiq.5): as ~16-20 chamadas em série de um `gc rig list --json` têm respostas idênticas (números medidos no cabeçalho, CACHE DO list-running).
 # Só o que o host respondeu entra; erro, timeout e resposta cortada nunca são guardados nem viram lista vazia. start e stop invalidam. `list_cache_s` na config do host: 0 desliga, máximo LIST_TTL_MAX.
 LIST_TTL, LIST_TTL_MAX = 10, 120
+# Cache NEGATIVO (ga-sml4tqk): o FATO "o host não respondeu" (ssh 255 ou tempo esgotado) também é guardado por host, por `list_down_cache_s` s (padrão LIST_DOWN_TTL; 0 desliga; máximo LIST_DOWN_TTL_MAX), e dentro do prazo o list-running
+# devolve ERRO rápido sem tentar o ssh (nunca lista, nem vazia). Sem ele, com o host fora cada uma das 16-20 chamadas em série de um `gc rig list --json` pagava o ConnectTimeout/timeout inteiro: 160-500 s.
+LIST_DOWN_TTL, LIST_DOWN_TTL_MAX = 30, 60
 TEST_RE = re.compile(r"remote-(?:e2e|test)-[A-Za-z0-9_-]+")  # a sessão MÍNIMA de teste: a única que abre sem a liberação e sem o guarda de clone
 GUARD = "remote-clone-guard.py"
 # Lançadores de pool do MINI: claude-lowprio.sh baixa a prioridade (renice) e carrega o A/B de --effort; claude-ctxcap-ab.sh carrega o A/B de --autocompact
@@ -402,6 +405,10 @@ class Cfg:
         self.list_ttl = h.get("list_cache_s", LIST_TTL)
         if not isinstance(self.list_ttl, int) or isinstance(self.list_ttl, bool) or not 0 <= self.list_ttl <= LIST_TTL_MAX:
             raise Fail(f"host {self.host}: 'list_cache_s' tem que ser um inteiro de 0 a {LIST_TTL_MAX} (0 desliga o cache do list-running) ({self.list_ttl!r})")
+        # host fora (cache negativo): ausente → LIST_DOWN_TTL; 0 desliga; texto, bool, negativo ou acima do teto → recusa a config (nunca "ausente"); list_cache_s 0 desliga o cache do list-running INTEIRO, os dois
+        self.down_ttl = h.get("list_down_cache_s", LIST_DOWN_TTL)
+        if not isinstance(self.down_ttl, int) or isinstance(self.down_ttl, bool) or not 0 <= self.down_ttl <= LIST_DOWN_TTL_MAX:
+            raise Fail(f"host {self.host}: 'list_down_cache_s' tem que ser um inteiro de 0 a {LIST_DOWN_TTL_MAX} (0 desliga o cache do host fora) ({self.down_ttl!r})")
         self.ssh_opts = [str(x) for x in h.get("ssh_opts") or []]
         self.env_allow = set(h.get("env_allow") or [])
         self.mini_home = os.path.realpath(h.get("mini_home") or os.path.expanduser("~"))
@@ -1148,12 +1155,13 @@ def lr_invalidate(cfg: Cfg) -> None:
         os.replace(tmp, lr_path(cfg, "gen"))
     except OSError as e:
         cfg.log(f"list-running: não consegui trocar a geração do cache ({e}); o que está guardado vale no máximo {cfg.list_ttl}s")
-    try:
-        os.unlink(lr_path(cfg, "cache.json"))
-    except FileNotFoundError:
-        pass
-    except OSError as e:
-        cfg.log(f"list-running: não consegui apagar o cache ({e}); ele vale no máximo {cfg.list_ttl}s")
+    for leaf, ttl in (("cache.json", cfg.list_ttl), ("down.json", cfg.down_ttl)):  # a lista guardada E o fato "o host não respondeu": start/stop mudam o que os dois dizem
+        try:
+            os.unlink(lr_path(cfg, leaf))
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            cfg.log(f"list-running: não consegui apagar {leaf} ({e}); ele vale no máximo {ttl}s")
 
 
 def lr_read(cfg: Cfg, gen: str):
@@ -1187,6 +1195,39 @@ def lr_write(cfg: Cfg, gen: str, ts: float, live: list) -> None:
             pass
 
 
+def lr_down_read(cfg: Cfg, gen: str):
+    """(motivo, idade em s) do último "o host não respondeu" visto, dentro do prazo e da mesma geração; senão None. None = pergunte ao host."""
+    # vazio (sem arquivo) → None, pergunta ao host; falhou/ilegível/forma errada → None também: sem prova de "fora" não há erro rápido (um arquivo torto nunca inventa um host fora)
+    try:
+        with open(lr_path(cfg, "down.json")) as f:
+            c = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(c, dict):
+        return None
+    ts, msg = c.get("ts"), c.get("msg")
+    if c.get("gen") != gen or not isinstance(ts, (int, float)) or not isinstance(msg, str) or not msg:
+        return None
+    age = time.time() - ts
+    return (msg, int(age)) if 0 <= age < cfg.down_ttl else None  # idade negativa = o relógio voltou: não prova que está fora
+
+
+def lr_down_write(cfg: Cfg, gen: str, msg: str) -> None:
+    """Guarda o fato "o host não respondeu" (troca atômica). O carimbo é o de AGORA, de quando a falha foi vista: o prazo conta a partir de saber que está fora, não de quando a pergunta começou
+    (com o ssh levando 25 s para falhar, o carimbo do começo deixaria 5 s de uso). Auxiliar: se não gravar, o custo é só o ssh da próxima chamada."""
+    tmp = os.path.join(cfg.state, "lr", f"down.tmp{os.getpid()}")
+    try:
+        cfg.mkstate("lr")
+        with open(tmp, "w") as f:
+            json.dump({"gen": gen, "ts": time.time(), "msg": msg}, f)
+        os.replace(tmp, lr_path(cfg, "down.json"))
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def host_live(cfg: Cfg, dry: bool) -> tuple:
     """(sessões do host, t0). t0 = quando a pergunta ao host começou; None = a lista veio do cache e o host NÃO foi perguntado. Erro do host (Unreachable/Fail) sobe como
     sempre: o cache só guarda resposta boa e NUNCA é o plano B de um erro (ssh tentado que falha = erro, não a lista de segundos atrás). Dentro do prazo o ssh nem é tentado: é a defasagem aceita."""
@@ -1195,11 +1236,23 @@ def host_live(cfg: Cfg, dry: bool) -> tuple:
         hit = lr_read(cfg, gen)
         if hit is not None:
             return hit, None
+        down = lr_down_read(cfg, gen) if cfg.down_ttl else None
+        if down is not None:  # o host não respondeu há pouco: ERRO rápido (Unreachable, como o ssh que falha de verdade), nunca lista, e o ssh nem é tentado
+            raise Unreachable(f"{down[0]} [fato guardado há {down[1]}s, vale {cfg.down_ttl}s: este ssh nem foi tentado]")
     t0 = time.time()
-    _, out, _ = run(cfg, "list-running", "sessions", dry)
+    try:
+        _, out, _ = run(cfg, "list-running", "sessions", dry)
+    except Unreachable as e:  # só "não respondeu" (ssh 255 ou tempo esgotado) vira o fato "fora"; resposta cortada/sem marcadores (Fail) continua erro de cada chamada
+        if gen is not None and cfg.down_ttl and lr_gen(cfg) == gen:  # start/stop durante a pergunta: o fato pode ser de antes da mudança, não guarda
+            lr_down_write(cfg, gen, str(e))
+        raise
     live = [x for x in out.split("\n") if x]
     if gen is not None and lr_gen(cfg) == gen:  # start/stop (ou geração que sumiu/ilegível) durante a pergunta: a resposta pode ser de antes da mudança, não guarda
         lr_write(cfg, gen, t0, live)
+        try:
+            os.unlink(lr_path(cfg, "down.json"))  # o host respondeu: o fato "fora" de antes morre (já vencido ou de uma chamada que correu ao lado)
+        except OSError:
+            pass  # ausente (o normal) ou sem permissão: o fato vence sozinho em list_down_cache_s s
     return live, t0
 
 
