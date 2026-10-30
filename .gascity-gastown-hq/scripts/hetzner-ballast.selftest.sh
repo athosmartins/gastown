@@ -55,6 +55,7 @@ check() {  # check "DESCRIÇÃO" ESPERADO REAL
   if [ "$2" = "$3" ]; then ok 0 "$1"; else ok 1 "$1 (esperado '$2', veio '$3')"; fi
 }
 W="$T/w"; mkdir -p "$W/bin"
+LU=$(id -run); mkdir -p "$T/linger"; : > "$T/linger/$LU"   # linger ligado por padrão (o arquivo que `loginctl enable-linger` cria); os casos de linger trocam BALLAST_LINGER_DIR pelo EXTRA_ENV
 printf '#!/bin/sh\n# timeout de brinquedo (o do macOS não existe): descarta "-k K DUR" e roda\nshift 3; exec "$@"\n' > "$W/bin/timeout"; chmod +x "$W/bin/timeout"
 NCPU=16
 N=0; H=""; FP=""; NOW=0; U=0; NI=0; ID=0; EXTRA_ENV=""; LP='[]'; PID=""; RUN=""; CEIL=""; SD=""; CGD=""; CGN=""
@@ -91,7 +92,7 @@ member() {  # member PID SID [RSS_KB] — um filho do item (mesma sessão)
 gone() { rm -rf "$FP/$1"; }   # o processo sumiu do /proc
 bt() {  # bt [ARGS…] → $OUT (stdout), $RC. Padrão: tick
   [ $# -gt 0 ] || set -- tick
-  OUT=$(env PATH="$W/bin:$PATH" BALLAST_HOME="$H" BALLAST_PROC="$FP" BALLAST_NOW="$NOW" BALLAST_LAUNCH_PREFIX="$LP" BALLAST_TEST=1 BALLAST_CEILING="${CEIL:-off}" $EXTRA_ENV "$PY" -I "$P" "$@" 2>"$W/err"); RC=$?
+  OUT=$(env PATH="$W/bin:$PATH" BALLAST_HOME="$H" BALLAST_PROC="$FP" BALLAST_NOW="$NOW" BALLAST_LAUNCH_PREFIX="$LP" BALLAST_TEST=1 BALLAST_CEILING="${CEIL:-off}" BALLAST_LINGER_DIR="$T/linger" $EXTRA_ENV "$PY" -I "$P" "$@" 2>"$W/err"); RC=$?
 }
 jget() {  # jget CAMPO.PONTADO → valor do $OUT (JSON), texto simples; índice de lista como número; null/ausente → "null"
   printf '%s' "$OUT" | "$PY" -I -c 'import sys,json
@@ -672,11 +673,25 @@ g_ceil() {
 
   # pronto ou não: sem gerenciador de usuário o item NÃO começa (o teto é condição, não enfeite)
   newhome; fakesd; rm -f "$T/rt/bus"; seed; good 50; good 50; good 50
-  check "teto: sem o barramento do usuário (sem sessão aberta nem linger) o item NÃO começa" "[]" "$(jget started)"
+  check "teto: com linger mas sem o barramento do usuário (o gerenciador não está de pé) o item NÃO começa" "[]" "$(jget started)"
   check "teto: ...a nota do tick diz sem-teto e o stderr diz o motivo" "1 1" "$(jget note | grep -c 'sem-teto') $(grep -c 'sem teto' "$W/err")"
   check "teto: ...e não fica pasta de rodada pela metade" "0" "$(ls "$H/runs" 2>/dev/null | wc -l | tr -d ' ')"
   bt status --json
   check "teto: o status diz que o teto NÃO está pronto, com o motivo (o barramento)" "false 1" "$(jget ceiling.ready) $(jget ceiling.why | grep -c 'bus')"
+  # linger: o barramento sozinho NÃO é "pronto". Quem pergunta o status por ssh tem sessão e, com ela, o barramento; o cron não tem nenhum dos dois (gate 1 da ga-kgnjkt8)
+  newhome; fakesd; mkdir -p "$T/nolinger"; EXTRA_ENV="$EXTRA_ENV BALLAST_LINGER_DIR=$T/nolinger"; seed; good 50; good 50; good 50
+  check "teto: com o barramento presente MAS sem linger o item NÃO começa (o cron não tem a sessão que sobe o gerenciador)" "[]" "$(jget started)"
+  check "teto: ...a nota do tick diz sem-teto e o stderr diz que falta o linger" "1 1" "$(jget note | grep -c 'sem-teto') $(grep -c 'sem linger' "$W/err")"
+  bt status --json
+  check "teto: ...e o status, perguntado COM o barramento à mão, diz NÃO pronto pelo motivo do linger (a resposta é a de quem começa o item)" "true false 1" "$([ -e "$T/rt/bus" ] && echo true || echo false) $(jget ceiling.ready) $(jget ceiling.why | grep -c 'sem linger')"
+  EXTRA_ENV="$EXTRA_ENV BALLAST_LINGER_DIR=$T/inexistente"; bt status --json
+  check "teto: a pasta do linger nem existir é 'sem linger' (não pronto), não 'ilegível'" "false 1 0" "$(jget ceiling.ready) $(jget ceiling.why | grep -c 'sem linger') $(jget ceiling.why | grep -c 'não consegui ler')"
+  newhome; fakesd; : > "$T/notadir"; EXTRA_ENV="$EXTRA_ENV BALLAST_LINGER_DIR=$T/notadir"; seed; good 50; good 50; good 50
+  check "teto: linger que NÃO consegui ler (a pasta é um arquivo: ENOTDIR) → o item NÃO começa, com a nota sem-teto" "[] 1" "$(jget started) $(jget note | grep -c 'sem-teto')"
+  bt status --json
+  check "teto: ...o status diz que NÃO li o linger (outro motivo que 'sem linger': ilegível nunca vira 'ligado' nem 'desligado')" "false 1 0" "$(jget ceiling.ready) $(jget ceiling.why | grep -c 'não consegui ler se o linger') $(jget ceiling.why | grep -c 'sem linger')"
+  mkdir -p "$T/lingerdir/$LU"; EXTRA_ENV="$EXTRA_ENV BALLAST_LINGER_DIR=$T/lingerdir"; bt status --json
+  check "teto: o 'arquivo' de linger que é uma pasta também é ilegível, nunca linger ligado" "false 1" "$(jget ceiling.ready) $(jget ceiling.why | grep -c 'não consegui ler se o linger')"
   newhome; fakesd; rm -f "$W/bin/systemd-run"; D3="$W/sdnp"; rm -rf "$D3"; mkdir -p "$D3"; ln -sf /bin/sh "$D3/sh"; ln -sf "$(command -v sleep)" "$D3/sleep"; EXTRA_ENV="$EXTRA_ENV PATH=$W/bin:$D3"; seed; good 50; good 50; good 50
   check "teto: sem systemd-run no PATH o item NÃO começa" "[]" "$(jget started)"
   bt status --json; check "teto: ...e o status diz que o teto NÃO está pronto" "false" "$(jget ceiling.ready)"
@@ -725,11 +740,22 @@ g_ceil() {
   check "teto: o item saiu rc 0 mas o relatório diz fork recusado → a rodada fecha como teto-processos (cooldown de falha), não ok" "teto-processos" "$(rj why)"
   ceil_one; echo 137 > "$H/runs/$RUN/rc"; printf 'pids_peak 30\nmem_peak 83886080\npids_hits 0\noom_kill 1\n' > "$H/runs/$RUN/ceiling"; gone "$PID"; adv 50 0; bt
   check "teto: o kernel matou o maior do item (oom_kill 1; o rc é 137) → a rodada fecha como teto-memoria, com o pico de memória" "teto-memoria 80" "$(rj why) $(rj ceiling.mem_peak_mb)"
+  # stop: o cgroup.kill que NÃO deu para confirmar aparece em cgroup_unverified (um setsid pode ter sobrado e a sessão não o vê); escopo já vazio e rodada sem teto não são aviso (rc segue 0)
+  ceil_one; gone "$PID"; rm -f "$CGD/cgroup.kill"; mkdir "$CGD/cgroup.kill"; bt stop
+  check "teto: stop com o escopo vivo mas o cgroup.kill RECUSADO (o kernel não aceita a escrita) → a rodada entra em cgroup_unverified, rc 0" "$RUN 0" "$(jget cgroup_unverified.0) $RC"
+  ceil_one; gone "$PID"; : > "$H/runs/$RUN/cgroup"; bt stop
+  check "teto: stop com o caminho do cgroup ilegível (o item não o escreveu) → cgroup_unverified (não sei: nunca 'nada a matar')" "$RUN" "$(jget cgroup_unverified.0)"
+  ceil_one; gone "$PID"; rm -rf "$CGD"; bt stop
+  check "teto: stop com o escopo já SUMIDO (nada a matar) → sem cgroup_unverified" "null" "$(jget cgroup_unverified)"
+  ceil_one; gone "$PID"; bt stop
+  check "teto: stop com o cgroup.kill gravado → sem cgroup_unverified, e o cgroup.kill recebeu 1" "null 1" "$(jget cgroup_unverified) $(cat "$CGD/cgroup.kill")"
+  newhome; seed; good 50; good 50; good 50; PID=$(started_pid); RUN=$(started_run); alive "$PID" hq "$RUN"; gone "$PID"; bt stop
+  check "teto: stop de uma rodada SEM teto (sem meta.ceiling, sem cgroup) → sem cgroup_unverified (não há o que conferir)" "null" "$(jget cgroup_unverified)"
   rm -f "$W/bin/systemd-run"
 }
 
 # ── g_cgrp ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-# O kernel de verdade (ga-kgnjkt8): só onde há um gerenciador de usuário do systemd (Linux, sessão aberta ou linger); nos outros ambientes a bateria diz `skip` e isso NÃO conta como passou. Todo
+# O kernel de verdade (ga-kgnjkt8): só onde há um gerenciador de usuário do systemd de pé (Linux, com sessão aberta aqui; o linger vem de fixture); nos outros ambientes a bateria diz `skip` e isso NÃO conta como passou. Todo
 # "descontrolado" daqui é LIMITADO POR CONSTRUÇÃO (300 filhos, 400 MB): sem o teto o teste reprova, não derruba a máquina. A leitura de /proc/stat e meminfo continua de mentira; processo e cgroup são reais.
 cgrp_ok() {
   [ "$(uname -s)" = Linux ] && command -v systemd-run > /dev/null 2>&1 && [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -S "$XDG_RUNTIME_DIR/bus" ] && systemd-run --user --scope --quiet --collect -p TasksMax=16 true > /dev/null 2>&1
@@ -1007,12 +1033,27 @@ a linha da rodada não diz que houve órfãos@@        row["orfaos"] = True@@   
 [teto] BALLAST_CEILING=off vale fora do selftest@@    if raw == "off" and test:@@    if raw == "off":
 [teto] BALLAST_TASKS_MAX aceita qualquer valor (sem o mínimo de 16)@@_num(env, "BALLAST_TASKS_MAX", 4096, int, 16)@@_num(env, "BALLAST_TASKS_MAX", 4096, int, 0)
 [teto] BALLAST_MEM_FACTOR aceita fator abaixo de 1 (teto menor que o rss_mb)@@_num(env, "BALLAST_MEM_FACTOR", 1.25, float, 1.0)@@_num(env, "BALLAST_MEM_FACTOR", 1.25, float, 0.0)
+[teto] sem linger o item começa assim mesmo (só o barramento decide)@@    if lg == "no":@@    if False:
+[teto] linger que não consegui ler vira pronto@@    if lg != "yes":@@    if False:
+[teto] a pasta do linger sem o arquivo do usuário vira 'não consegui ler' (outro motivo)@@        return "no", path@@        return "ilegivel", path
+[teto] uma pasta no lugar do arquivo de linger conta como linger ligado@@    if not stat.S_ISREG(st.st_mode):@@    if False:
+[teto] erro de stat do linger (ENOTDIR, permissão) conta como linger ligado@@        return "ilegivel", "%s: %s" % (path, e)@@        return "yes", path
 [teto] o status não traz o bloco ceiling@@"ceiling": {"mode": cfg.ceiling, "ready": ceil_ok@@"ceilingX": {"mode": cfg.ceiling, "ready": ceil_ok
 [teto-linux] o item não escreve o cgroup dele (o governo não sabe onde ler)@@'[ -z "$BALLAST_CEILING_ON" ] || { { cut -d: -f3@@'[ -n "$BALLAST_CEILING_ON" ] || { { cut -d: -f3
 [teto-linux] o relatório do item perde o fork recusado@@sed -n "s/^max /pids_hits /p" $c/pids.events;@@
 [teto-linux] o relatório do item perde o oom_kill@@sed -n "s/^oom_kill /oom_kill /p" $c/memory.events;@@
 [teto-linux] o relatório do item perde o pico de memória@@echo "mem_peak $(cat $c/memory.peak)";@@
-[teto-linux] o stop não manda kill ao cgroup de cada rodada aberta (o escapee de setsid sobrevive)@@        cgroup_kill(cfg, rn)@@        pass
+[teto-linux] o stop não manda kill ao cgroup de cada rodada aberta (o escapee de setsid sobrevive)@@        if cgroup_kill(cfg, rn) == "unknown" and (read_meta(cfg, rn) or {}).get("ceiling"):@@        if False:
+[teto] o stop não avisa quando o cgroup.kill de uma rodada com teto não saiu (cgroup_unverified)@@        if cgroup_kill(cfg, rn) == "unknown" and (read_meta(cfg, rn) or {}).get("ceiling"):@@        if cgroup_kill(cfg, rn) == "x" and (read_meta(cfg, rn) or {}).get("ceiling"):
+[teto] escopo que já sumiu (nada a matar) conta como kill não confirmado@@            return "gone"@@            return "unknown"
+[teto] cgroup.kill que o kernel recusou conta como escopo vazio@@        except OSError:
+            pass
+        return "unknown"@@        except OSError:
+            pass
+        return "gone"
+[teto] caminho do cgroup ilegível conta como escopo vazio (nada a matar)@@    if d is None:
+        return "unknown"@@    if d is None:
+        return "gone"
 MUT
   "$PY" -I - "$P" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import re, sys

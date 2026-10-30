@@ -17,7 +17,8 @@ TETO DE SISTEMA POR ITEM  (ga-kgnjkt8; runbook: "Teto de sistema por item")
   O nice 19 protege a CPU, não a tabela de processos nem a RAM, e o governo só olha a RAM uma vez por minuto e só enxerga a SESSÃO do item. Por isso cada item entra num escopo systemd do usuário
   (ballast.slice/ballast-<rodada>.scope) com TasksMax e MemoryMax (rss_mb x fator). O tick lê pids.events (fork recusado) e memory.events (oom_kill) do cgroup do item e o mata de imediato
   (teto-processos / teto-memoria); o fim de rodada e o stop mandam cgroup.kill, que pega também quem fez setsid. Contador ilegível ou caminho que não é o escopo DESTA rodada nunca vira 'zero estouros'
-  nem alcança outro cgroup. Sem o gerenciador de usuário do systemd (sem sessão aberta e sem linger) o item NÃO começa: nota sem-teto no tick, motivo no stderr.
+  nem alcança outro cgroup. Sem LINGER ligado para o usuário (ou sem o barramento do gerenciador de usuário) o item NÃO começa: nota sem-teto no tick, motivo no stderr. O linger é exigido mesmo com sessão
+  aberta: quem pergunta o status (ssh) está DENTRO de uma sessão, e é ela que sobe o gerenciador; o tick do cron não abre sessão, então só o linger é um fato que os dois enxergam igual.
 UM TICK  (exit 0 sempre que "não consegui ler" — vira nota no registro; 3 só se não dá para gravar)
   1 lê o registro, /proc/stat, /proc/meminfo e a tabela de processos  2 dá fim aos itens que acabaram (results.jsonl); item que bateu no teto de sistema leva KILL; sobrevivente na sessão de um item que já gravou o rc (órfão) leva TERM depois
   de BALLAST_ORPHAN_GRACE_S (180 s) e a rodada fecha pelo rc do item, com `orfaos` na linha  3 sem a chave `on`: mata o que roda e sai  4 RAM: pausa (SIGSTOP),
@@ -35,17 +36,19 @@ TRÊS ESTADOS
 ARQUIVOS  (em $BALLAST_HOME, padrão ~/gt-remote/ballast)
   items.tsv · items/ · on (a chave: presente = ligado) · state.json · lock · ticks.jsonl · results.jsonl · runs/<rodada>/{meta.json,log,rc,final,cgroup,ceiling}
 STOP  rc 0 = a sessão de cada item esvaziou (TERM+CONT, KILL 3 s depois no que sobrar) · 3 = não li os processos, nada foi morto · 5 = sobrou processo vivo (`survivors`) ou a tabela ficou
-  ilegível depois do TERM (`unverified`): NÃO diz que parou · outro = o stop não rodou.
-USO  hetzner-ballast.py tick | status [--json] | stop      env: BALLAST_HOME BALLAST_PROC BALLAST_NOW BALLAST_ITEMS BALLAST_ITEMS_DIR BALLAST_LAUNCH_PREFIX (JSON, com `nice`; BALLAST_TEST=1 só no selftest) BALLAST_CEILING (systemd; off só no selftest) BALLAST_TASKS_MAX BALLAST_MEM_FACTOR BALLAST_RUNTIME_DIR BALLAST_CGROUP_ROOT e os limites BALLAST_* de load_config
+  ilegível depois do TERM (`unverified`): NÃO diz que parou · outro = o stop não rodou. `cgroup_unverified` (rc 0): rodadas com teto cujo cgroup.kill não deu para confirmar (quem fez setsid pode ter sobrado).
+USO  hetzner-ballast.py tick | status [--json] | stop      env: BALLAST_HOME BALLAST_PROC BALLAST_NOW BALLAST_ITEMS BALLAST_ITEMS_DIR BALLAST_LAUNCH_PREFIX (JSON, com `nice`; BALLAST_TEST=1 só no selftest) BALLAST_CEILING (systemd; off só no selftest) BALLAST_TASKS_MAX BALLAST_MEM_FACTOR BALLAST_RUNTIME_DIR BALLAST_LINGER_DIR BALLAST_CGROUP_ROOT e os limites BALLAST_* de load_config
 """
 import fcntl
 import json
 import math
 import os
+import pwd
 import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -105,6 +108,7 @@ def load_config(env):
         ceiling=_ceiling(env.get("BALLAST_CEILING", "").strip(), env.get("BALLAST_TEST") == "1"),
         tasks_max=_num(env, "BALLAST_TASKS_MAX", 4096, int, 16), mem_factor=_num(env, "BALLAST_MEM_FACTOR", 1.25, float, 1.0),
         runtime_dir=env.get("BALLAST_RUNTIME_DIR") or env.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid(), cgroup_root=env.get("BALLAST_CGROUP_ROOT") or "/sys/fs/cgroup",
+        linger_dir=env.get("BALLAST_LINGER_DIR") or "/var/lib/systemd/linger",
         home=home, proc=env.get("BALLAST_PROC", "/proc"), now=int(raw) if raw else int(time.time()),
         registry=env.get("BALLAST_ITEMS") or os.path.join(home, "items.tsv"), items_dir=env.get("BALLAST_ITEMS_DIR") or os.path.join(home, "items"),
         idle_min_pct=_num(env, "BALLAST_IDLE_MIN_PCT", 15.0, float, 0.0), idle_ticks=_num(env, "BALLAST_IDLE_TICKS", 3, int, 1),
@@ -423,16 +427,43 @@ def default_prefix():
 CG_RE = re.compile(r"^/(?:[A-Za-z0-9_.@:-]+/)*ballast\.slice/ballast-([a-z0-9_-]+)\.scope$")
 
 
+def linger_state(cfg):
+    """("yes" | "no" | "ilegivel", detalhe). `loginctl enable-linger` cria o arquivo <linger_dir>/<usuário>; é o fato de que o gerenciador de usuário sobrevive sem sessão aberta."""
+    # vazio (arquivo ausente, ou a pasta nem existe) → "no" (sem linger); falhou/ilegível (sem nome para o uid, stat negado, não é arquivo comum) → "ilegivel": também não pronto, com outro motivo; nunca "yes"
+    try:
+        name = pwd.getpwuid(os.getuid()).pw_name
+    except (KeyError, OSError) as e:
+        return "ilegivel", "sem nome de usuário para o uid %d (%s)" % (os.getuid(), e)
+    path = os.path.join(cfg.linger_dir, name)
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return "no", path
+    except OSError as e:
+        return "ilegivel", "%s: %s" % (path, e)
+    if not stat.S_ISREG(st.st_mode):
+        return "ilegivel", "%s não é um arquivo comum" % path
+    return "yes", path
+
+
 def ceiling_ready(cfg):
-    """(ok, motivo). `off` (só no selftest) vale sempre. Senão precisa de systemd-run no PATH e do barramento do gerenciador de usuário (<runtime>/bus): sem sessão aberta nem linger não há gerenciador e o item NÃO começa."""
-    # vazio (sem systemd-run, sem barramento) → não pronto, com o motivo; falhou/ilegível (stat negado: exists dá False) → também não pronto: o nó já parou uma vez (29/10) por processo sem teto, e item sem teto é a mesma exposição
+    """(ok, motivo). `off` (só no selftest) vale sempre. Senão precisa de systemd-run no PATH, de LINGER ligado para o usuário e do barramento do gerenciador de usuário (<runtime>/bus).
+    Por que o linger e não só o barramento: o status é perguntado por ssh, DENTRO de uma sessão de login, e é essa sessão que sobe o gerenciador de usuário e o barramento; o tick do cron não abre sessão
+    (o PAM do cron não tem pam_systemd) e só acha o barramento se o gerenciador sobrevive sem ela, isto é, com linger. O barramento sozinho respondia "pronto" a quem pergunta e "sem teto" a quem começa o item.
+    PATH e XDG_RUNTIME_DIR também vêm do ambiente de quem pergunta; no nó dão o mesmo que no cron (/usr/bin/systemd-run, /run/user/<uid>)."""
+    # vazio (sem systemd-run, sem linger, sem barramento) → não pronto, com o motivo; falhou/ilegível (linger que não consegui ler, stat negado: exists dá False) → também não pronto: o nó já parou uma vez (29/10) por processo sem teto, e item sem teto é a mesma exposição
     if cfg.ceiling == "off":
         return True, ""
     if shutil.which("systemd-run") is None:
         return False, "systemd-run ausente do PATH"
+    lg, why = linger_state(cfg)
+    if lg == "no":
+        return False, "sem linger para o usuário (%s ausente): o gerenciador de usuário do systemd só existe com sessão aberta e o tick do cron não acha o barramento; remédio: loginctl enable-linger <usuário> (root, uma vez)" % why
+    if lg != "yes":
+        return False, "não consegui ler se o linger está ligado (%s): sem essa leitura o teto não vale" % why
     bus = os.path.join(cfg.runtime_dir, "bus")
     if not os.path.exists(bus):
-        return False, "sem gerenciador de usuário do systemd (%s ausente: nenhuma sessão aberta e sem linger)" % bus
+        return False, "linger ligado mas sem o barramento do gerenciador de usuário (%s ausente): o gerenciador não está de pé" % bus
     return True, ""
 
 
@@ -492,17 +523,25 @@ def ceiling_hit(cfg, run, notes):
 
 
 def cgroup_kill(cfg, run):
-    """Manda o kernel matar TUDO o que está no escopo do item (cgroup.kill, kernel >= 5.14), inclusive quem fez setsid e a sessão não enxerga. Só o escopo desta rodada (cgroup_dir)."""
-    # vazio/falhou (cgroup sem o arquivo, já sumido, sem permissão, caminho que não valida) → False e nada feito: o kill por sessão já foi tentado e este é só o complemento
+    """Manda o kernel matar TUDO o que está no escopo do item (cgroup.kill, kernel >= 5.14), inclusive quem fez setsid e a sessão não enxerga. Só o escopo desta rodada (cgroup_dir).
+    Volta "killed" (escrevi 1 no cgroup.kill), "gone" (a pasta do escopo não existe mais: o kernel a remove quando o último processo sai, não há o que matar) ou "unknown" (NÃO consegui: caminho que
+    não valida, pasta sem cgroup.kill (kernel < 5.14), sem permissão, pasta que não consigo ler). O kill por sessão já foi tentado e este é só o complemento: quem precisa saber se ele valeu olha o retorno."""
+    # vazio (a pasta do escopo sumiu) → "gone"; falhou/ilegível (caminho que não valida, escrita negada, sem cgroup.kill, stat negado) → "unknown", nunca "gone" nem "killed"
     d, _ = cgroup_dir(cfg, run)
     if d is None:
-        return False
+        return "unknown"
     try:
         with open(os.path.join(d, "cgroup.kill"), "w") as f:
             f.write("1")
-        return True
+        return "killed"
     except OSError:
-        return False
+        try:
+            os.stat(d)
+        except FileNotFoundError:
+            return "gone"
+        except OSError:
+            pass
+        return "unknown"
 
 
 def read_ceiling_report(path):
@@ -1062,12 +1101,17 @@ def do_stop(cfg):
         except Fail:
             pass
     left = wait_gone(cfg, run, 3) if run else {}
+    unverified = []
     for rn in unf:   # quem fez setsid sai da sessão e `wait_gone` não o vê: o cgroup de toda rodada aberta leva kill (rodada sem teto/sem cgroup: nada a fazer)
-        cgroup_kill(cfg, rn)
+        # rodada que nasceu num escopo (meta.ceiling) e cujo kill NÃO confirmei ("unknown"): um setsid pode ter sobrado e o stop não sabe; "gone" (escopo já vazio) e rodada sem teto não são aviso
+        if cgroup_kill(cfg, rn) == "unknown" and (read_meta(cfg, rn) or {}).get("ceiling"):
+            unverified.append(rn)
     if left:   # o que sobrou na sessão (inclusive filho que o item pôs no mundo depois do 1º scan) leva KILL pelo pid, e o grupo do líder junto
         for rn, pids in left.items():
             send(dict(run[rn], members=pids), signal.SIGKILL)
         left = wait_gone(cfg, run, 2)
+    if unverified:
+        out["cgroup_unverified"] = unverified
     if left is None:
         out["stopped"], out["unverified"] = [], True
     elif left:

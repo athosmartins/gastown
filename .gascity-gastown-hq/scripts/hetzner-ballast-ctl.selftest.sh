@@ -46,7 +46,7 @@ if cmd == "status":
     out = {"items": [{"name": "hq-selftests", "role": "work", "cores": 4, "eligible": True, "why": ""}], "registry_errors": [], "running": run}
     ceil = {"mode": "systemd", "ready": True, "why": "", "tasks_max": 4096, "mem_factor": 1.25}   # ~/gov.ceiling.notready: sem gerenciador de usuário · ~/gov.ceiling.absent: governo antigo (o status nem tem a chave)
     if os.path.exists(os.path.expanduser("~/gov.ceiling.notready")):
-        ceil.update(ready=False, why="sem gerenciador de usuario do systemd (bus ausente: nenhuma sessao aberta e sem linger)")
+        ceil.update(ready=False, why="sem linger para o usuario (/var/lib/systemd/linger/runner ausente): o gerenciador de usuario do systemd so existe com sessao aberta e o cron nao acha o barramento")
     if not os.path.exists(os.path.expanduser("~/gov.ceiling.absent")):
         out["ceiling"] = ceil
     print(json.dumps(out))
@@ -251,6 +251,31 @@ g_ctl() {
   check "status: teto NÃO pronto → 'teto: NÃO PRONTO' com o motivo (estado, não leitura que falhou: rc 0)" "0 1 1" "$RC $(printf '%s' "$OUT" | grep -c 'teto: NÃO PRONTO') $(printf '%s' "$OUT" | grep -c 'gerenciador de usuario')"
   newenv; ctl install; : > "$NODE/gov.ceiling.absent"; ctl status
   check "status: governo antigo sem teto → diz que o governo instalado NÃO tem teto (rode install), nunca 'teto: pronto'" "1 0" "$(printf '%s' "$OUT" | grep -c 'NÃO tem teto') $(printf '%s' "$OUT" | grep -c 'teto: pronto')"
+  # o governo de VERDADE respondendo pelo ssh (gate 1 da ga-kgnjkt8). O de mentira acima devolve o que mandam, então não vê a diferença entre "há barramento" (quem pergunta por ssh tem sessão)
+  # e "o cron acha o barramento": aqui o governo é o real, com systemd-run e barramento de brinquedo e a pasta de linger escolhida pelo teste (o ssh de mentira herda as variáveis).
+  real_gov() {  # real_gov PASTA_DO_LINGER
+    cp "$HERE/hetzner-ballast.py" "$NODE/gt-remote/bin/hetzner-ballast.py"; printf '#!/bin/sh\nexit 0\n' > "$BIN/systemd-run"; chmod +x "$BIN/systemd-run"
+    mkdir -p "$T/rt$N" "$T/proc$N"; : > "$T/rt$N/bus"; export BALLAST_RUNTIME_DIR="$T/rt$N" BALLAST_PROC="$T/proc$N" BALLAST_LINGER_DIR="$1"
+  }
+  newenv; ctl install; mkdir -p "$T/ling$N"; real_gov "$T/ling$N"; ctl on
+  check "on: governo de VERDADE, barramento presente e SEM linger → rc 3, a chave NÃO é posta e a mensagem diz que falta o linger" "3 0 1" "$RC $(on_flag) $(printf '%s' "$OUT" | grep -c 'sem linger')"
+  ctl status
+  check "status: ...e o status mostra 'teto: NÃO PRONTO' com o motivo do linger (o barramento existe e a resposta continua 'não')" "1 1" "$(printf '%s' "$OUT" | grep -c 'teto: NÃO PRONTO') $(printf '%s' "$OUT" | grep -c 'sem linger')"
+  : > "$T/ling$N/$(id -run)"; ctl on
+  check "on: o MESMO governo e barramento, agora COM linger → rc 0 e a chave posta (controle: a recusa de cima era o linger, não outra coisa)" "0 1" "$RC $(on_flag)"
+  newenv; ctl install; : > "$T/notadir$N"; real_gov "$T/notadir$N"; ctl on
+  check "on: governo de VERDADE e linger que NÃO consegui ler (a pasta é um arquivo) → rc 3, a chave NÃO é posta e a mensagem diz que não li" "3 0 1" "$RC $(on_flag) $(printf '%s' "$OUT" | grep -c 'não consegui ler se o linger')"
+  unset BALLAST_RUNTIME_DIR BALLAST_PROC BALLAST_LINGER_DIR
+
+  # a nota do último tick é o que o CRON enfrentou (sem-teto...): o status a mostra; sem nota não inventa; nota que não é texto é ILEGÍVEL
+  newenv; ctl install; mkdir -p "$NODE/gt-remote/ballast"
+  printf '{"t": %s, "mode": "ligado", "note": "sem-teto"}\n' "$(date +%s)" > "$NODE/gt-remote/ballast/ticks.jsonl"; ctl status
+  check "status: o último tick traz a nota sem-teto → o status a mostra (NOTA=sem-teto)" "1" "$(printf '%s' "$OUT" | grep -c 'NOTA=sem-teto')"
+  printf '{"t": %s, "mode": "ligado", "note": ""}\n' "$(date +%s)" > "$NODE/gt-remote/ballast/ticks.jsonl"; ctl status
+  check "status: tick de nota vazia ou sem o campo → nenhuma NOTA= (e o tick aparece)" "0 1" "$(printf '%s' "$OUT" | grep -c 'NOTA=') $(printf '%s' "$OUT" | grep -c 'último tick: há')"
+  printf '{"t": %s, "mode": "ligado", "note": 7}\n' "$(date +%s)" > "$NODE/gt-remote/ballast/ticks.jsonl"; ctl status
+  check "status: nota que não é texto → NOTA=ILEGÍVEL (nunca 'sem nota')" "1" "$(printf '%s' "$OUT" | grep -c 'NOTA=ILEGÍVEL')"
+
   newenv; ctl install; mkdir -p "$NODE/gt-remote/ballast"
   printf '{"ts":"z","item":"hq-selftests","run":"hq-selftests-3","rc":0,"why":"teto-processos","summary":null,"summary_why":"ausente","ceiling":{"tasks_peak":4096,"tasks_hit":12,"mem_peak_mb":50,"oom_kill":null,"segredo":"nao-pode"}}\n' > "$NODE/gt-remote/ballast/results.jsonl"; ctl pull; OUTF="$R/.gc/hetzner-ballast/results.jsonl"
   check "pull: os picos do teto (ceiling) vêm na linha do resultado — tasks_hit 12, oom_kill null (não sei) — e só os quatro campos conhecidos (a chave estranha 'segredo' não passa)" "12 null 0" "$("$PY" -I -c 'import json,sys; c=json.loads(open(sys.argv[1]).readline())["ceiling"]; print(c["tasks_hit"], json.dumps(c["oom_kill"]))' "$OUTF" 2>/dev/null) $(grep -c 'nao-pode' "$OUTF")"
@@ -286,7 +311,7 @@ pull sem results.jsonl no nó cai no caminho do vazio@@    10) say "pull: o nó 
 o pull duplica a rodada que já veio@@    if d["run"] in seen:
         continue@@    if False:
         continue
-o pull traz campo fora da lista branca@@    row = {k: (clean(d[k]) if k == "summary" else scal(d[k])) for k in KEEP if k in d}@@    row = dict(d)
+o pull traz campo fora da lista branca@@    row = {k: (clean(d[k]) if k == "summary" else scal(d[k])) for k in KEEP if k in d and k != "ceiling"}@@    row = dict(d)
 o pull não corta string longa@@        return v[:160]@@        return v
 status não acusa PARADO@@    if cron == "1":
         print("PARADO:@@    if False:
@@ -316,6 +341,8 @@ ligar sem nada instalado não avisa@@[ "$out" != "instalado=0" ] ||@@true ||
 install aceita argumento que não existe@@  install)   { [ $# -eq 1 ] || { [ $# -eq 2 ] && [ "$2" = "--allow-dirty" ]; }; } || die 2 "$USO"; shift@@  install)   shift
 uninstall aceita argumento a mais@@  uninstall) [ $# -eq 1 ] || die 2 "$USO"; cmd_uninstall@@  uninstall) cmd_uninstall
 off aceita argumento a mais@@  off)       [ $# -eq 1 ] || die 2 "$USO"; cmd_flag on off@@  off)       cmd_flag on off
+o status não mostra a nota do último tick (o fail-closed do cron fica invisível)@@    nt = "" if note is None or note == "" else (" NOTA=%s" % note if isinstance(note, str) else " NOTA=ILEGÍVEL")@@    nt = ""
+nota do tick que não é texto vira 'sem nota'@@ else " NOTA=ILEGÍVEL")@@ else "")
 burn aceita argumento fora de on|off@@  burn)      [ $# -eq 2 ] && case "$2" in on|off) true ;; *) false ;; esac || die 2@@  burn)      true || die 2
 MUT
   "$PY" -I - "$P" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'

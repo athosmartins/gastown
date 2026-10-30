@@ -91,9 +91,9 @@ else:
 ')
   case "$v" in
     pronto|absent) return 0 ;;
-    antigo) die 3 "o governo instalado no nó não conhece teto (o status dele não traz 'ceiling'): rode 'hetzner-ballast.sh install' com o commit do teto antes de ligar. A chave on NÃO foi posta." ;;
-    nao:*) die 3 "o teto NÃO está pronto no nó e sem ele nenhum item começa: ${v#nao:}. Remédio: 'loginctl enable-linger runner' (root, uma vez, no nó) ou uma sessão aberta; depois repita o on. A chave on NÃO foi posta." ;;
-    *) die 3 "não consegui ler a resposta do governo do nó sobre o teto: não liguei o lastro (falta de leitura NÃO é 'pronto'). A chave on NÃO foi posta." ;;
+    antigo) die 3 "o governo instalado no nó não conhece teto (o status dele não traz 'ceiling'): rode 'hetzner-ballast.sh install' com o commit do teto antes de ligar. Não pus a chave on agora (se ela já existia de um on anterior, continua: 'off' a apaga)." ;;
+    nao:*) die 3 "o teto NÃO está pronto no nó e sem ele nenhum item começa: ${v#nao:}. Remédio, se faltar o linger: 'loginctl enable-linger runner' (root, uma vez, no nó; uma sessão aberta NÃO basta, o cron não tem sessão); depois repita o on. Não pus a chave on agora (se ela já existia de um on anterior, continua: o governo não começa item sem teto, e 'off' a apaga)." ;;
+    *) die 3 "não consegui ler a resposta do governo do nó sobre o teto: não liguei o lastro (falta de leitura NÃO é 'pronto'). Não pus a chave on agora (se ela já existia de um on anterior, continua: 'off' a apaga)." ;;
   esac
 }
 
@@ -150,7 +150,7 @@ H=$HOME; echo "* * * * * flock -n $H/gt-remote/ballast/cron.lock /usr/bin/python
     *) die 3 "não consegui instalar a linha da crontab" ;;
   esac
   say "instalado em $NODE (commit ${head:0:9}, dirty=$dirty): governo, ${#pairs[@]} arquivos e a crontab. O lastro está DESLIGADO: 'hetzner-ballast.sh on' para ligar."
-  say "O TETO por item exige o gerenciador de usuário do systemd no nó (sem ele nenhum item começa): rode 'loginctl enable-linger runner' no nó, como root, uma vez. 'hetzner-ballast.sh status' diz se o teto está pronto e o 'on' recusa sem ele."
+  say "O TETO por item exige o gerenciador de usuário do systemd no nó SEM sessão aberta (o cron não tem sessão; sem isso nenhum item começa): rode 'loginctl enable-linger runner' no nó, como root, uma vez. 'hetzner-ballast.sh status' diz se o teto está pronto e o 'on' recusa sem ele."
 }
 
 cmd_uninstall() {
@@ -244,7 +244,11 @@ if tst == "absent" or (tst == "0" and not traw.strip()):
 elif isinstance(tick, dict) and isinstance(tick.get("t"), int) and now is not None:
     age = now - tick["t"]
     why = "o último tick tem mais de 5 min"
-    print("último tick: há %ds (%s) rodando=%s livre=%s%% ram=%sMB" % (age, tick.get("mode"), tick.get("running"), tick.get("free_pct"), tick.get("mem_avail_mb")))
+    # a nota é o que o tick DISSE de si (sem-teto, teto-ilegivel:<rodada>, nao-comecou:<item>...): o status por ssh responde pelo contexto dele, só a nota mostra o que o cron enfrentou.
+    # ausente ou vazia = o tick não teve nota (governo antigo, ou nada a dizer); presente mas não texto = ILEGÍVEL, nunca "sem nota"
+    note = tick.get("note")
+    nt = "" if note is None or note == "" else (" NOTA=%s" % note if isinstance(note, str) else " NOTA=ILEGÍVEL")
+    print("último tick: há %ds (%s) rodando=%s livre=%s%% ram=%sMB%s" % (age, tick.get("mode"), tick.get("running"), tick.get("free_pct"), tick.get("mem_avail_mb"), nt))
 else:
     bad = 1
     print("último tick: ILEGÍVEL (leitura rc=%s, ou a última linha não é um tick — truncada?): não sei se o cron está rodando" % tst)
