@@ -14,12 +14,14 @@
 #   chave id+updated_at) · (4) a sonda `check` (só o rc 0 com JSON node vale) · (5) adotar/devolver a rota com um bd falso COM estado: confirma lendo, restaura no desfazer, nunca toca bead que mudou de dono ·
 #   (6) a passada inteira: shadow só observa e grava; on tenta na ordem, para na capacidade (rc 12) e nos orçamentos (sondas, segundos, falhas, vagas do nó), memoriza o que o nó recusou, tira da pista o que ficou ·
 #   (7) as regiões VERBATIM de dispatch_one: o bloco do yield (alvo que não é wa-worker do store do WA solta) e o braço do pool (adota antes do gancho; rc 1 devolve a rota e solta; rc 2 não mexe; adotar que falha
-#   não chega ao gancho) · (8) o gancho exporta o rc do apply · (9) a ordem dos pontos de chamada · (6b, ga-2hd02v.3.16) o waiter P0/P1 da cessão: a pista dele é percorrida primeiro, ele sem veredito legível (unknown/timeout/erro, sondado ou memorizado) segura a P2+ com veredito node, e o resumo conta as P2+ que foram ao nó com um P0/P1 esperando.
+#   não chega ao gancho) · (8) o gancho exporta o rc do apply · (9) a ordem dos pontos de chamada · (6b, ga-2hd02v.3.16) o waiter P0/P1 da cessão: a pista dele é percorrida primeiro, ele sem veredito legível (unknown/timeout/erro, sondado ou memorizado) segura a P2+ com veredito node, e o resumo conta as P2+ que foram ao nó com um P0/P1 esperando · (6c, ga-2hd02v.3.16, gate 1) os TRÊS estados do waiter: "não se sabe se ele vai ao nó" (pré-filtro ilegível / recusa que não se lê, apply rc 11 ou que nem chegou ao apply, memória `released`) segura
+#   a P2+ — só o motivo DEFINITIVO (dono, veto, rota alheia, node:mini, recusa do pool, apply rc 10, memória mini) o solta.
 # COMO RODA: as funções e as regiões são extraídas VERBATIM do dispatcher (awk) e rodam em shells filhos sob `set -euo pipefail`, PATH de sandbox (selftest-sandbox-path.lib.sh: sem gc/bd reais), bd e
 #   wa-node-dispatch.sh falsos. Contra um dispatcher sem a fatia o arquivo se recusa a começar — o vermelho honesto.
 # CONTROLE NEGATIVO: cada guarda desligada numa cópia do dispatcher (WNP_NO_MUTANTS=1 pula) tem que reprovar este arquivo.
-# Variáveis: PILOT_DISPATCHER_PATH · WNP_NO_MUTANTS=1
+# Variáveis: PILOT_DISPATCHER_PATH · WNP_NO_MUTANTS=1 (ou o argumento --no-mutants: o `mbp-run.sh --repo hq` repassa argumentos ao `bash`, nunca variáveis de ambiente)
 set -uo pipefail
+[ "${1:-}" != "--no-mutants" ] || WNP_NO_MUTANTS=1
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCHER="${PILOT_DISPATCHER_PATH:-$SELF_DIR/pilot-dispatcher.sh}"
 PASS=0; FAIL=0
@@ -45,6 +47,7 @@ F_PASS="$(need_fn _pilot_wa_node_pass)"; F_VETO="$(need_fn _pilot_node_first_vet
 F_DECIDE="$(need_fn _pilot_wa_node_decide)"; F_STATE="$(need_fn _pilot_wa_node_pass_state)"
 F_CLASS="$(need_fn _pilot_priority_class_of)"
 F_HOLD="$(need_fn _pilot_wa_node_pass_hold_for)"; F_WLANE="$(need_fn _pilot_wa_node_pass_waiter_lane)"
+F_WHYV="$(need_fn _pilot_wa_node_pass_why_verdict)"
 VETO_LINE="$(grep -E '^PILOT_NODE_FIRST_VETO_LABELS="' "$DISPATCHER" | head -1)"
 PWP_INIT="$(grep -E '^(_PWP_[A-Z_]+|_PILOT_WA_NODE_PASS|_PWN_APPLY_RC)=' "$DISPATCHER")"
 EXEMPT_LINE="$(grep -E '^PILOT_WA_NODE_EXEMPT="' "$DISPATCHER" | head -1)"
@@ -130,9 +133,10 @@ PRELUDE='
   [ -z "${T_MEMO_TTL+x}" ] || PILOT_WA_NODE_PASS_MINI_TTL="$T_MEMO_TTL"
   eval "$VETO_LINE"; eval "$PWP_INIT"
   PILOT_WA_NODE_PASS_MEMO="$WORK/city/.gc/wa-node-pass-memo.tsv"; PILOT_WA_NODE_PASS_LOG="$WORK/city/.gc/wa-node-exempt.jsonl"
-  eval "$F_VETO"; eval "$F_SPAWN"; eval "$F_MODE"; eval "$F_PRE"; eval "$F_MHIT"; eval "$F_MPUT"; eval "$F_CHECK"; eval "$F_STATE"; eval "$F_ADOPT"; eval "$F_UNADOPT"; eval "$F_CLASS"; eval "$F_HOLD"; eval "$F_WLANE"; eval "$F_PASS"
+  eval "$F_VETO"; eval "$F_SPAWN"; eval "$F_MODE"; eval "$F_PRE"; eval "$F_MHIT"; eval "$F_MPUT"; eval "$F_CHECK"; eval "$F_STATE"; eval "$F_ADOPT"; eval "$F_UNADOPT"; eval "$F_CLASS"; eval "$F_HOLD"; eval "$F_WLANE"; eval "$F_WHYV"; eval "$F_PASS"
   _PY_WAIT_ID="${T_WAIT-}"; _PY_WAIT_PRIO=1   # o waiter da cessão (ga-5fn5p3), como a varredura do waiter o deixa antes da passada; vazio = nenhum P0/P1 espera
-  _pilot_priority_refusal_of() { case "${T_REFUSAL-}" in FAIL) return 1 ;; *) printf "%s" "${T_REFUSAL-}"; return 0 ;; esac; }
+  # T_REFUSAL vale para toda bead; com T_REFUSAL_ID, SÓ para a bead desse id (as demais: ninguém recusa) — é como o waiter tem a recusa ilegível e a P2 não
+  _pilot_priority_refusal_of() { local _ri=""; if [ -n "${T_REFUSAL_ID-}" ]; then _ri=$(printf "%s" "$1" | jq -r ".id // empty" 2>/dev/null) || _ri=""; [ "$_ri" = "$T_REFUSAL_ID" ] || return 0; fi; case "${T_REFUSAL-}" in FAIL) return 1 ;; *) printf "%s" "${T_REFUSAL-}"; return 0 ;; esac; }
   _top_candidate() { printf "%s" "$1" | jq -c ".[0]"; }
   _bead_tier() { echo feature; }
   _pilot_sweep_note() { echo "$*" >> "$WORK/notes"; }
@@ -505,6 +509,58 @@ r=$(T_WAIT=wa-w1 hold "$P9B" blind);  [ "$r" = "rc=2" ] && ok "hold_for: classe 
 r=$(T_WAIT=wa-w1 hold "$P9B" unseen); [ "$r" = "rc=2" ] && ok "hold_for: classe ilegível + waiter unseen → rc 2" || bad "hold_for classe ilegível/unseen: $r"
 r=$(T_WAIT=wa-w1 hold "$P9B" out);    [ "$r" = "rc=1" ] && ok "hold_for: classe ilegível mas o waiter tem veredito → rc 1 (a retenção nem valeria: nada a contar)" || bad "hold_for classe ilegível/out: $r"
 r=$(T_WAIT=wa-w1 hold "" blind);      [ "$r" = "rc=2" ] && ok "hold_for: bead ilegível/vazia + waiter blind → rc 2, nunca 0" || bad "hold_for bead vazia: $r"
+
+echo "── (6c) ga-2hd02v.3.16 (gate 1): o waiter em TRÊS estados — 'não se sabe' segura a P2+, só o motivo DEFINITIVO a solta"
+# O gate reprovou a 1ª entrega (root-class error-vs-empty): "não consegui saber se o waiter vai ao nó" virava _pw_wv=out e SOLTAVA a P2+ — o palpite sobre o P1 que a mudança existe para tirar. Dois caminhos reproduzidos pelo revisor:
+# (1a) o pré-filtro do waiter falha por motivo ILEGÍVEL (unreadable, refusal-unknown) e não por motivo definitivo (dono, veto, rota alheia, node:mini, recusa do pool); (1b) o waiter tem veredito node, o dispatch_one falha e o apply
+# sai com rc 11 (unknown) ou nem chega ao apply — o resto DESTA passada seguia com wv=node. Mais um irmão da mesma classe: a memória `released` (tentativa anterior que nunca chegou a veredito) era lida como "não vai ao nó".
+# (1a) pré-filtro do waiter ilegível: a recusa do probe do pool não se lê SÓ para o waiter (a P2 é lida normalmente) — nada vai ao nó, nada é escrito em bead, e o resumo diz blind (não "out")
+reset; chk wa-p2a 0; setok wa-p2a
+T_REFUSAL=FAIL T_REFUSAL_ID=wa-w1 T_WAIT=wa-w1 pass "[$W1,$P2A]" >/dev/null
+[ "$(d1)" = "-" ] && [ ! -f "$WORK/bd.calls" ] && ok "(1a) waiter com a recusa do pool ilegível (refusal-unknown): a P2 com veredito node NÃO vai ao nó e nada é escrito em bead" || bad "(1a) P2 tomou a vaga do nó com a recusa do waiter ilegível: d1=$(d1)"
+summ | jq -e '.held==1 and .p2_to_node==0 and .waiter_verdict=="blind" and .skipped["refusal-unknown"]==1' >/dev/null 2>&1 && ok "(1a) resumo: held=1 p2_to_node=0 waiter_verdict=blind (o sinal de que ninguém sabia NÃO some) e skipped.refusal-unknown=1" || bad "(1a) resumo do waiter refusal-unknown: $(summ | cut -c1-300)"
+[ "$(wnd_calls)" = 1 ] && grep -q 'wa-p2a' "$WORK/wnd.calls" && ok "(1a) o waiter nem foi sondado (o pré-filtro o parou); só a P2 foi" || bad "(1a) sondas: $(wnd_calls)"
+WSP="$(jbp 1 'wa-w x' U1 wa-worker story:approved)"
+reset; chk wa-p2a 0; setok wa-p2a
+T_WAIT='wa-w x' pass "[$WSP,$P2A]" >/dev/null
+[ "$(d1)" = "-" ] && ok "(1a) waiter com id fora de [A-Za-z0-9._-] (unreadable): a P2 NÃO vai ao nó" || bad "(1a) waiter unreadable soltou a P2: d1=$(d1)"
+summ | jq -e '.held==1 and .waiter_verdict=="blind" and .skipped.unreadable==1' >/dev/null 2>&1 && ok "(1a) resumo: waiter_verdict=blind e skipped.unreadable=1" || bad "(1a) resumo do waiter unreadable: $(summ | cut -c1-300)"
+# o que continua DEFINITIVO e solta a P2+: a recusa do pool que se LEU (refused:*) — o nó também não o levaria
+reset; chk wa-p2a 0; setok wa-p2a
+T_REFUSAL=label:story:refino-escalado T_REFUSAL_ID=wa-w1 T_WAIT=wa-w1 pass "[$W1,$P2A]" >/dev/null
+[ "$(d1)" = "wa-p2a small feature pass=1;" ] && ok "(1a) waiter recusado pelo pool (refused, lido): não vai ao nó e não segura a P2" || bad "(1a) waiter refused segurou a P2: d1=$(d1)"
+summ | jq -e '.held==0 and .p2_to_node==1 and .waiter_verdict=="out" and .skipped.refused==1' >/dev/null 2>&1 && ok "(1a) resumo: waiter_verdict=out held=0 p2_to_node=1 skipped.refused=1" || bad "(1a) resumo do waiter refused: $(summ | cut -c1-300)"
+# a tabela do motivo do pré-filtro → veredito do waiter: SÓ o definitivo é out; ilegível, vazio e motivo que ninguém conhece são blind (um motivo NOVO nunca solta a P2+ por omissão)
+whyv() { WHY="$1" run_t 'echo "[$(_pilot_wa_node_pass_why_verdict "$WHY")]"'; }
+for w in not-wa has-owner no-node-ok node:mini routed:mila-wa routed:wa-worker-remote veto:node:never veto:exec:manual refused:label:story:refino-escalado; do
+  [ "$(whyv "$w")" = "[out]" ] && ok "motivo '$w' (definitivo): o waiter é out" || bad "motivo '$w' deveria ser out: $(whyv "$w")"
+done
+for w in unreadable refusal-unknown "" zzz-novo; do
+  [ "$(whyv "$w")" = "[blind]" ] && ok "motivo '$w' (não se sabe / desconhecido): o waiter é blind" || bad "motivo '$w' deveria ser blind: $(whyv "$w")"
+done
+# (1b) o waiter tem veredito node, o dispatch_one falha: o que o apply disse manda no resto DA MESMA passada. rc 11 e 'nada chegou ao apply' = não se sabe (segura); rc 10 = o apply disse mini (solta)
+reset; chk wa-w1 0; chk wa-p2a 0; echo 1 > "$WORK/d1.rc.wa-w1"; echo 11 > "$WORK/d1.apply.wa-w1"; setok wa-p2a
+T_WAIT=wa-w1 T_SPAWN=pilot T_SLOTS=3 pass "[$W1,$P2A]" >/dev/null
+[ "$(d1)" = "wa-w1 small feature pass=1;" ] && [ "$(memo_of)" = "wa-w1:unknown," ] && ok "(1b) waiter node + apply rc 11: a P2 NÃO toma a vaga na MESMA passada (e o waiter fica memorizado unknown)" || bad "(1b) apply rc 11: d1=$(d1) memo=$(memo_of)"
+summ | jq -e '.held==1 and .p2_to_node==0 and .released==1 and .waiter_verdict=="blind"' >/dev/null 2>&1 && ok "(1b) apply rc 11: resumo held=1 p2_to_node=0 released=1 waiter_verdict=blind (não 'node')" || bad "(1b) resumo do apply rc 11: $(summ | cut -c1-300)"
+reset; chk wa-w1 0; chk wa-p2a 0; echo 1 > "$WORK/d1.rc.wa-w1"; setok wa-p2a
+T_WAIT=wa-w1 T_SPAWN=pilot T_SLOTS=3 pass "[$W1,$P2A]" >/dev/null
+[ "$(d1)" = "wa-w1 small feature pass=1;" ] && [ "$(memo_of)" = "wa-w1:released," ] && ok "(1b) waiter node + nada chegou ao apply: a P2 NÃO toma a vaga na mesma passada (memória released)" || bad "(1b) sem apply: d1=$(d1) memo=$(memo_of)"
+summ | jq -e '.held==1 and .p2_to_node==0 and .released==1 and .waiter_verdict=="blind"' >/dev/null 2>&1 && ok "(1b) sem apply: resumo held=1 p2_to_node=0 waiter_verdict=blind" || bad "(1b) resumo sem apply: $(summ | cut -c1-300)"
+reset; chk wa-w1 0; chk wa-p2a 0; echo 1 > "$WORK/d1.rc.wa-w1"; echo 7 > "$WORK/d1.apply.wa-w1"; setok wa-p2a
+T_WAIT=wa-w1 T_SPAWN=pilot T_SLOTS=3 pass "[$W1,$P2A]" >/dev/null
+[ "$(d1)" = "wa-w1 small feature pass=1;" ] && summ | jq -e '.waiter_verdict=="blind" and .stopped=="hook-held" and .p2_to_node==0' >/dev/null 2>&1 && ok "(1b) apply com outro rc (a escrita pode ter acontecido): a passada para e o resumo diz blind, não 'node'" || bad "(1b) apply rc 7: d1=$(d1) $(summ | cut -c1-300)"
+reset; chk wa-w1 0; chk wa-p2a 0; echo 1 > "$WORK/d1.rc.wa-w1"; echo 10 > "$WORK/d1.apply.wa-w1"; setok wa-p2a
+T_WAIT=wa-w1 T_SPAWN=pilot T_SLOTS=3 pass "[$W1,$P2A]" >/dev/null
+[ "$(d1)" = "wa-w1 small feature pass=1;wa-p2a small feature pass=1;" ] && [ "$(memo_of)" = "wa-w1:mini," ] && ok "(1b) waiter node + apply rc 10 (o apply DISSE mini: definitivo): a P2 vai ao nó na mesma passada" || bad "(1b) apply rc 10: d1=$(d1) memo=$(memo_of)"
+summ | jq -e '.held==0 and .p2_to_node==1 and .waiter_verdict=="out"' >/dev/null 2>&1 && ok "(1b) apply rc 10: resumo held=0 p2_to_node=1 waiter_verdict=out" || bad "(1b) resumo do apply rc 10: $(summ | cut -c1-300)"
+# memória do waiter: `released` (tentativa anterior sem veredito) e `sampled` (o shadow mediu node, mas a chave dele é outra) NÃO são "não vai ao nó": seguram. Só `mini` solta (testado acima: "waiter memorizado como mini: não segura").
+for mv in released sampled; do
+  reset; ( eval "$PRELUDE"; _pilot_wa_node_pass_memo_put wa-w1 U1 "$mv" ) >/dev/null 2>&1; chk wa-p2a 0; setok wa-p2a
+  T_WAIT=wa-w1 pass "[$W1,$P2A]" >/dev/null
+  [ "$(d1)" = "-" ] && [ "$(wnd_calls)" = 1 ] && ok "(memória) waiter memorizado como $mv (sem veredito de verdade): a P2 NÃO vai ao nó — só ela foi sondada" || bad "(memória) waiter $mv soltou a P2: d1=$(d1) sondas=$(wnd_calls)"
+  summ | jq -e '.held==1 and .waiter_verdict=="blind"' >/dev/null 2>&1 && ok "(memória) waiter $mv: resumo held=1 waiter_verdict=blind" || bad "(memória) resumo do waiter $mv: $(summ | cut -c1-300)"
+done
 
 echo "── (7) dispatch_one: o bloco do yield e o braço do pool (regiões VERBATIM)"
 run_block() {
