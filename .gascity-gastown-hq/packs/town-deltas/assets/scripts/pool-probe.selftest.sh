@@ -35,6 +35,10 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/pool-probe-selftest.XXXXXX")"
 trap '[ -n "${TMP:-}" ] && [ -d "$TMP" ] && rm -rf -- "$TMP"' EXIT
 FAKE="$TMP/bin"; FIX="$TMP/fix"; mkdir -p "$FAKE" "$FIX"
 GOOD_LIB="$SELF_DIR/disk-headroom-lib.sh"
+# ga-6fkx9je: the probe reads the gate focus mode too (gate-focus-lib.sh). Pin it OFF so these sections stay about the engine's probe and the
+# disk: without the pin the probe reads the REAL state file, and this selftest would go red on the mini whenever the mode is ON.
+# pool-probe-gate-focus.selftest.sh holds the proof of the mode itself.
+export GATE_FOCUS_ACTIVE_OVERRIDE=0
 
 # ---- the engine's probe: unwrap `sh -c '<body>' -- <target>` exactly as the shell would ----------------
 golden_line="$(cat "$GOLDEN")"
