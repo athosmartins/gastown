@@ -13504,6 +13504,8 @@ _PWP_UPD=""          # updated_at da bead (a chave da memória junto com o id)
 _PWP_MEMO_V=""       # veredito lembrado por _pilot_wa_node_pass_memo_hit
 _PWP_V=""            # saída de _pilot_wa_node_pass_check: node | mini | unknown | timeout | error | missing
 _PWP_BASIS=""        # a base do veredito node (label | text)
+_PWP_DETAIL='{"reasons":null,"classes":null,"paths":null}'   # JSON {reasons,classes,paths} do último `check`: lista (pode ser []) = o classificador respondeu; null = NÃO li (timeout, erro, saída que não é JSON de veredito)
+_PWP_TOKENS=""       # palavras "veredito:classe" da última sonda (a classe é o motivo até o 1º `:`); o resumo da passada soma estas
 _PWP_ADOPTED=0       # 1 iff esta passada tirou o carimbo da bead que está em dispatch_one (o desfazer só devolve o que ela tirou)
 _PILOT_WA_NODE_PASS=0   # 1 SÓ enquanto a passada entrega uma bead a dispatch_one (modo on); dispatch_one lê
 _PWN_APPLY_RC=""     # o rc do `apply` da última _pilot_wa_node_decide (vazio = não chegou ao apply)
@@ -13611,8 +13613,8 @@ _pilot_wa_node_pass_memo_put() {
 # 124/137/143 timeout; script ausente = missing (a passada para); qualquer outra coisa, inclusive rc 0 com saída que não é um veredito node, = error — o terceiro estado nunca vira node. Sem loja, o script a acha pelo routes.jsonl.
 # Sempre devolve 0.
 _pilot_wa_node_pass_check() {
-  local _pc_id="${1:-}" _pc_store="${2:-}" _pc_dir _pc_out="" _pc_rc=0 _pc_vb="" _pc_to
-  _PWP_V="error"; _PWP_BASIS=""
+  local _pc_id="${1:-}" _pc_store="${2:-}" _pc_dir _pc_out="" _pc_rc=0 _pc_vb="" _pc_to _pc_det=""
+  _PWP_V="error"; _PWP_BASIS=""; _PWP_DETAIL='{"reasons":null,"classes":null,"paths":null}'
   _pc_dir="${PILOT_WA_NODE_SCRIPTS:-${GC_CITY:-/nonexistent}/scripts}"
   if [ ! -x "$_pc_dir/wa-node-dispatch.sh" ]; then _PWP_V="missing"; return 0; fi
   _pc_to="${PILOT_WA_NODE_PASS_CHECK_TIMEOUT:-30}"; case "$_pc_to" in ''|*[!0-9]*) _pc_to=30 ;; esac
@@ -13630,6 +13632,28 @@ _pilot_wa_node_pass_check() {
     11) _PWP_V=unknown ;;
     124|137|143) _PWP_V=timeout ;;
   esac
+  # ga-2hd02v.3.17: os motivos e caminhos que o classificador deu (só rc 0/10/11 trazem JSON de veredito). vazio (reasons=[]) → "[]": o classificador respondeu sem motivo;
+  # falhou/ilegível (sem saída, JSON que o jq não lê, reasons que não é lista) → null: "não li" NUNCA vira "sem motivo". Só a LEITURA do detalhe falha aqui; o veredito acima não depende dela.
+  case "$_pc_rc" in
+    0|10|11) _pc_det=$(printf '%s' "$_pc_out" | jq -c '{reasons: (if (.reasons | type) == "array" then (.reasons[:12] | map(tostring | .[:80])) else null end), classes: (if (.reasons | type) == "array" then (.reasons | map(tostring | split(":")[0] | gsub("[[:space:]]"; "_")) | unique) else null end), paths: (if (.paths | type) == "array" then (.paths[:10] | map(tostring | .[:120])) else null end)}' 2>/dev/null) || _pc_det=""
+             [ -z "$_pc_det" ] || _PWP_DETAIL="$_pc_det" ;;
+  esac
+  return 0
+}
+
+# _pilot_wa_node_pass_probe_note <id> <pista> — grava UMA linha `wa-node-pass-probe` por sonda (veredito, base, motivos, classes, caminhos que o classificador deu) e deixa em _PWP_TOKENS as palavras "veredito:classe"
+# que o resumo da passada soma (ga-2hd02v.3.17: a passada de 05:39Z sondou 12 e mandou 0 ao nó, e o log só dizia "mini 5 · não sei 7" sem o porquê). A classe é o motivo até o 1º `:` (o resto é o caminho/palavra da bead).
+# vazio (reasons=[]: o classificador respondeu sem motivo) → "sem-motivo"; falhou/ilegível (reasons null: saída que o jq não leu) → "ilegivel"; sem saída por definição (timeout, error, missing) → "sem-saida": os três nunca se confundem.
+# Só observa: se a linha não grava ou o jq falha, avisa e segue — o veredito e o despacho não leem nada daqui. Sempre devolve 0.
+_pilot_wa_node_pass_probe_note() {
+  local _pn_id="${1:-}" _pn_lane="${2:-}" _pn_log
+  _pn_log="${PILOT_WA_NODE_PASS_LOG:-${GC_CITY:-/nonexistent}/.gc/wa-node-exempt.jsonl}"
+  # vazio (nenhuma classe) → o próprio jq já devolve "sem-motivo"; falhou (jq) → "<veredito>:ilegivel": a sonda continua somada no resumo, como "não li", nunca omitida nem "sem motivo"
+  _PWP_TOKENS=$(printf '%s' "$_PWP_DETAIL" | jq -r --arg v "$_PWP_V" '.classes as $c | (if ($v == "node" or $v == "mini" or $v == "unknown") then (if $c == null then ["ilegivel"] elif ($c | length) == 0 then ["sem-motivo"] else $c end) else ["sem-saida"] end) | map($v + ":" + .) | join(" ")' 2>/dev/null) || _PWP_TOKENS="${_PWP_V}:ilegivel"
+  [ -n "$_PWP_TOKENS" ] || _PWP_TOKENS="${_PWP_V}:ilegivel"
+  { jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg b "$_pn_id" --arg l "$_pn_lane" --arg v "$_PWP_V" --arg ba "$_PWP_BASIS" --argjson d "$_PWP_DETAIL" \
+      '{ts:$ts,event:"wa-node-pass-probe",bead:$b,lane:$l,verdict:$v,basis:$ba,reasons:$d.reasons,classes:$d.classes,paths:$d.paths}' >> "$_pn_log"; } 2>/dev/null \
+    || warn "ga-2hd02v.3.17: não consegui gravar a linha de sonda de $_pn_id em $_pn_log"
   return 0
 }
 
@@ -13742,7 +13766,7 @@ _pilot_wa_node_pass_why_verdict() {
 # Ordem de cada candidata: pré (sem escrita) → memória → orçamento (sondas e segundos) → `check` → (shadow: registra) / (on: dispatch_one). Para: despacho parado · vagas do nó esgotadas (_PWN_SLOTS) · falhas demais ·
 # apply rc 12 (nó cheio: capacidade é do nó, a bead NÃO é memorizada) · apply com outro rc (a escrita pode ter acontecido: para sem memorizar) · Dolt saturado (antes de escrever) · script ausente. Falha por bead (apply 10/11, ou nada chegou ao apply) é memorizada.
 _pilot_wa_node_pass() {
-  local _pw_lane _pw_pool _pw_slots _pw_wa _pw_n _pw_pick _pw_id _pw_upd _pw_tier _pw_rc _pw_keepmax _pw_cap _pw_secs _pw_maxfail _pw_t0 _pw_log _pw_sk _pw_skj
+  local _pw_lane _pw_pool _pw_slots _pw_wa _pw_n _pw_pick _pw_id _pw_upd _pw_tier _pw_rc _pw_keepmax _pw_cap _pw_secs _pw_maxfail _pw_t0 _pw_log _pw_sk _pw_skj _pw_rsn="" _pw_rsj _pw_rs
   local _pw_total=0 _pw_elig=0 _pw_memo=0 _pw_probed=0 _pw_node=0 _pw_mini=0 _pw_unk=0 _pw_tmo=0 _pw_err=0 _pw_kept=0 _pw_rel=0 _pw_fails=0 _pw_stop="" _pw_skipped=""
   # ga-2hd02v.3.16: o waiter da cessão. _pw_lanes = a ordem das pistas; _pw_wl = a pista dele; _pw_wv = o veredito dele: "" (não há waiter de WA nas pistas) | unseen (ainda não olhado) | node | out (SABE-SE que não irá ao nó) | blind (NÃO se sabe: sem veredito legível, ou o que impediu o veredito não se leu)
   local _pw_lanes="small big" _pw_wl="" _pw_wv="" _pw_isw=0 _pw_held=0 _pw_p2n=0 _pw_hrc=0 _pw_clsblind=0
@@ -13754,7 +13778,9 @@ _pilot_wa_node_pass() {
     esac
     return 0
   fi
-  _pw_cap="${PILOT_WA_NODE_PASS_PROBES:-12}"; case "$_pw_cap" in ''|*[!0-9]*) _pw_cap=12 ;; esac
+  # 30 sondas (era 12, ga-2hd02v.3.17): a sonda média custa ~2 s (máx. 12 s, medido nas 179 do pool), então 30 cabem em ~60 s dos 120 s de PASS_SECS, que seguem sendo o teto real da varredura; com 12, a conta de TTL
+  # (mini 6 h, unknown 1 h) pedia ~75 sondas/h e a passada dava ~40, e as beads com veredito node ficavam esperando a vez
+  _pw_cap="${PILOT_WA_NODE_PASS_PROBES:-30}"; case "$_pw_cap" in ''|*[!0-9]*) _pw_cap=30 ;; esac
   _pw_secs="${PILOT_WA_NODE_PASS_SECS:-120}"; case "$_pw_secs" in ''|*[!0-9]*) _pw_secs=120 ;; esac
   _pw_maxfail="${PILOT_WA_NODE_PASS_MAX_FAILS:-3}"; case "$_pw_maxfail" in ''|*[!0-9]*) _pw_maxfail=3 ;; esac
   _pw_log="${PILOT_WA_NODE_PASS_LOG:-${GC_CITY:-/nonexistent}/.gc/wa-node-exempt.jsonl}"
@@ -13823,6 +13849,7 @@ _pilot_wa_node_pass() {
       if [ $(( SECONDS - _pw_t0 )) -ge "$_pw_secs" ]; then _pw_stop="budget-secs"; break; fi
       _pw_probed=$((_pw_probed + 1))
       _pilot_wa_node_pass_check "$_pw_id" ""
+      _pilot_wa_node_pass_probe_note "$_pw_id" "$_pw_lane"; _pw_rsn="$_pw_rsn $_PWP_TOKENS"
       case "$_PWP_V" in
         node)
           _pw_node=$((_pw_node + 1))
@@ -13892,19 +13919,23 @@ _pilot_wa_node_pass() {
   _pw_skj=$(printf '%s' "$_pw_skipped" | jq -cR 'split(" ") | map(select(length > 0)) | group_by(.) | map({key: .[0], value: length}) | from_entries' 2>/dev/null) || _pw_skj="{}"
   [ -n "$_pw_skj" ] || _pw_skj="{}"
   _pw_sk=$(printf '%s' "$_pw_skj" | jq -r 'to_entries | map("\(.key)=\(.value)") | join(",")' 2>/dev/null) || _pw_sk=""
+  # vazio (nenhuma sonda) → {} (verdade: nada foi sondado); falhou (jq) → null: "não somei" nunca é "{}" (nenhuma decisão lê isto; o relatório lê as linhas por sonda)
+  _pw_rsj=$(printf '%s\n' "$_pw_rsn" | jq -cR 'split(" ") | map(select(length > 0)) | group_by(.) | map({key: .[0], value: length}) | from_entries' 2>/dev/null) || _pw_rsj="null"
+  [ -n "$_pw_rsj" ] || _pw_rsj="null"
+  _pw_rs=$(printf '%s' "$_pw_rsj" | jq -r 'if . == null then "ilegivel" else (to_entries | map("\(.key)=\(.value)") | join(",")) end' 2>/dev/null) || _pw_rs="ilegivel"
   _PWP_LAST_STOP="${_pw_stop:-}"
-  log "ga-2hd02v.9: passada de WA no nó (modo=$_PWP_MODE): candidatas WA=$_pw_total · elegíveis=$_pw_elig (puladas: ${_pw_sk:-nenhuma}) · memória=$_pw_memo · sondadas=$_pw_probed (node $_pw_node · mini $_pw_mini · unknown $_pw_unk · timeout $_pw_tmo · erro $_pw_err) · ficaram com o nó=$_pw_kept · P2+ ao nó com P0/P1 esperando=$_pw_p2n · seguradas pelo waiter sem veredito=$_pw_held (classe ilegível, não segurada: $_pw_clsblind) · soltas=$_pw_rel · parou: ${_pw_stop:-fim da lista}"
+  log "ga-2hd02v.9: passada de WA no nó (modo=$_PWP_MODE): candidatas WA=$_pw_total · elegíveis=$_pw_elig (puladas: ${_pw_sk:-nenhuma}) · memória=$_pw_memo · sondadas=$_pw_probed (node $_pw_node · mini $_pw_mini · unknown $_pw_unk · timeout $_pw_tmo · erro $_pw_err) · ficaram com o nó=$_pw_kept · P2+ ao nó com P0/P1 esperando=$_pw_p2n · seguradas pelo waiter sem veredito=$_pw_held (classe ilegível, não segurada: $_pw_clsblind) · soltas=$_pw_rel · motivos: ${_pw_rs:-nenhum} · parou: ${_pw_stop:-fim da lista}"
   if [ "$_pw_held" -gt 0 ]; then
     log "ga-2hd02v.3.16: $_pw_held P2+ com veredito node NÃO foram ao nó: o waiter da cessão P${_PY_WAIT_PRIO:-?} ${_PY_WAIT_ID:-?} está sem veredito legível (${_pw_wv:-?}) — a vaga do nó fica para ele, nunca para uma P2+ num palpite sobre o waiter (PILOT_WA_NODE_PASS_HOLD=0 desliga)."
   fi
   if [ "$_pw_clsblind" -gt 0 ]; then
     warn "ga-2hd02v.3.16: $_pw_clsblind bead(s) com veredito node e classe de prioridade ILEGÍVEL não foram seguradas enquanto o waiter da cessão ${_PY_WAIT_ID:-?} estava sem veredito (${_pw_wv:-?}) — a regra do yield (classe ilegível nunca segura) as deixa passar; contadas em class_blind no resumo."
   fi
-  { jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg m "$_PWP_MODE" --arg r "${PILOT_WA_NODE_ROUTE:-}" --arg stop "${_pw_stop:-none}" --argjson sk "$_pw_skj" \
+  { jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg m "$_PWP_MODE" --arg r "${PILOT_WA_NODE_ROUTE:-}" --arg stop "${_pw_stop:-none}" --argjson sk "$_pw_skj" --argjson rs "$_pw_rsj" \
       --argjson tot "$_pw_total" --argjson el "$_pw_elig" --argjson me "$_pw_memo" --argjson pr "$_pw_probed" --argjson nd "$_pw_node" --argjson mi "$_pw_mini" --argjson un "$_pw_unk" \
       --argjson tm "$_pw_tmo" --argjson er "$_pw_err" --argjson kp "$_pw_kept" --argjson rl "$_pw_rel" \
       --argjson p2n "$_pw_p2n" --argjson hd "$_pw_held" --argjson cb "$_pw_clsblind" --arg wid "${_PY_WAIT_ID:-}" --arg wv "$_pw_wv" \
-      '{ts:$ts,event:"wa-node-pass-summary",mode:$m,route:$r,wa_candidates:$tot,eligible:$el,skipped:$sk,memo_hits:$me,probed:$pr,node:$nd,mini:$mi,unknown:$un,timeout:$tm,error:$er,kept:$kp,released:$rl,p2_to_node:$p2n,held:$hd,class_blind:$cb,waiter:$wid,waiter_verdict:$wv,stopped:$stop}' >> "$_pw_log"; } 2>/dev/null \
+      '{ts:$ts,event:"wa-node-pass-summary",mode:$m,route:$r,wa_candidates:$tot,eligible:$el,skipped:$sk,memo_hits:$me,probed:$pr,node:$nd,mini:$mi,unknown:$un,timeout:$tm,error:$er,kept:$kp,released:$rl,p2_to_node:$p2n,held:$hd,class_blind:$cb,waiter:$wid,waiter_verdict:$wv,stopped:$stop,reasons:$rs}' >> "$_pw_log"; } 2>/dev/null \
     || warn "ga-2hd02v.9: não consegui gravar o resumo da passada de WA em $_pw_log"
   return 0
 }

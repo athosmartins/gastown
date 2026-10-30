@@ -48,6 +48,8 @@ F_DECIDE="$(need_fn _pilot_wa_node_decide)"; F_STATE="$(need_fn _pilot_wa_node_p
 F_CLASS="$(need_fn _pilot_priority_class_of)"
 F_HOLD="$(need_fn _pilot_wa_node_pass_hold_for)"; F_WLANE="$(need_fn _pilot_wa_node_pass_waiter_lane)"
 F_WHYV="$(need_fn _pilot_wa_node_pass_why_verdict)"
+# ga-2hd02v.3.17: opcional DE PROPÓSITO (fn_src, não need_fn): num dispatcher sem o registro de motivos o arquivo tem de reprovar nos testes (6d), não abortar com FATAL
+F_PNOTE="$(fn_src _pilot_wa_node_pass_probe_note)"
 VETO_LINE="$(grep -E '^PILOT_NODE_FIRST_VETO_LABELS="' "$DISPATCHER" | head -1)"
 PWP_INIT="$(grep -E '^(_PWP_[A-Z_]+|_PILOT_WA_NODE_PASS|_PWN_APPLY_RC)=' "$DISPATCHER")"
 EXEMPT_LINE="$(grep -E '^PILOT_WA_NODE_EXEMPT="' "$DISPATCHER" | head -1)"
@@ -69,10 +71,14 @@ cmd="$1"; id="$2"
 if [ "$cmd" = apply ]; then rc=12; [ -f "$W/apply.rc" ] && rc=$(cat "$W/apply.rc"); exit "$rc"; fi
 rc=11; [ -f "$W/chk.$id" ] && rc=$(cat "$W/chk.$id")
 basis=text; [ -f "$W/chk.$id.basis" ] && basis=$(cat "$W/chk.$id.basis")
+# ga-2hd02v.3.17: chk.<id>.reasons / chk.<id>.paths trazem a lista JSON que o classificador daria; chk.<id>.raw substitui a saída inteira (o que o jq não lê)
+rs='["x"]'; [ -f "$W/chk.$id.reasons" ] && rs=$(cat "$W/chk.$id.reasons")
+ps='[]'; [ -f "$W/chk.$id.paths" ] && ps=$(cat "$W/chk.$id.paths")
+if [ -f "$W/chk.$id.raw" ]; then cat "$W/chk.$id.raw"; exit "$rc"; fi
 case "$rc" in
-  0)  echo "{\"verdict\":\"node\",\"basis\":\"$basis\",\"reasons\":[]}" ;;
-  10) echo '{"verdict":"mini","basis":"","reasons":["x"]}' ;;
-  11) echo '{"verdict":"unknown","basis":"","reasons":["x"]}' ;;
+  0)  rs='[]'; [ -f "$W/chk.$id.reasons" ] && rs=$(cat "$W/chk.$id.reasons"); echo "{\"verdict\":\"node\",\"basis\":\"$basis\",\"reasons\":$rs,\"paths\":$ps}" ;;
+  10) echo "{\"verdict\":\"mini\",\"basis\":\"\",\"reasons\":$rs,\"paths\":$ps}" ;;
+  11) echo "{\"verdict\":\"unknown\",\"basis\":\"\",\"reasons\":$rs,\"paths\":$ps}" ;;
   99) echo 'isto nao e json' ; rc=0 ;;
 esac
 exit "$rc"
@@ -133,7 +139,7 @@ PRELUDE='
   [ -z "${T_MEMO_TTL+x}" ] || PILOT_WA_NODE_PASS_MINI_TTL="$T_MEMO_TTL"
   eval "$VETO_LINE"; eval "$PWP_INIT"
   PILOT_WA_NODE_PASS_MEMO="$WORK/city/.gc/wa-node-pass-memo.tsv"; PILOT_WA_NODE_PASS_LOG="$WORK/city/.gc/wa-node-exempt.jsonl"
-  eval "$F_VETO"; eval "$F_SPAWN"; eval "$F_MODE"; eval "$F_PRE"; eval "$F_MHIT"; eval "$F_MPUT"; eval "$F_CHECK"; eval "$F_STATE"; eval "$F_ADOPT"; eval "$F_UNADOPT"; eval "$F_CLASS"; eval "$F_HOLD"; eval "$F_WLANE"; eval "$F_WHYV"; eval "$F_PASS"
+  eval "$F_VETO"; eval "$F_SPAWN"; eval "$F_MODE"; eval "$F_PRE"; eval "$F_MHIT"; eval "$F_MPUT"; eval "$F_CHECK"; eval "$F_STATE"; eval "$F_ADOPT"; eval "$F_UNADOPT"; eval "$F_CLASS"; eval "$F_HOLD"; eval "$F_WLANE"; eval "$F_WHYV"; eval "$F_PASS"; eval "$F_PNOTE"
   _PY_WAIT_ID="${T_WAIT-}"; _PY_WAIT_PRIO=1   # o waiter da cessão (ga-5fn5p3), como a varredura do waiter o deixa antes da passada; vazio = nenhum P0/P1 espera
   # T_REFUSAL vale para toda bead; com T_REFUSAL_ID, SÓ para a bead desse id (as demais: ninguém recusa) — é como o waiter tem a recusa ilegível e a P2 não
   _pilot_priority_refusal_of() { local _ri=""; if [ -n "${T_REFUSAL_ID-}" ]; then _ri=$(printf "%s" "$1" | jq -r ".id // empty" 2>/dev/null) || _ri=""; [ "$_ri" = "$T_REFUSAL_ID" ] || return 0; fi; case "${T_REFUSAL-}" in FAIL) return 1 ;; *) printf "%s" "${T_REFUSAL-}"; return 0 ;; esac; }
@@ -335,7 +341,11 @@ reset; for i in a b c d e; do chk wa-$i 10; done
 T_PROBES=2 pass "$L5" >/dev/null; [ "$(wnd_calls)" = 2 ] && ok "PILOT_WA_NODE_PASS_PROBES=2: só 2 sondas" || bad "teto de sondas: $(wnd_calls)"
 jq -e 'select(.event=="wa-node-pass-summary" and .stopped=="budget-probes" and .probed==2)' "$PLOG" >/dev/null 2>&1 && ok "resumo: stopped=budget-probes" || bad "resumo do teto: $(tail -1 "$PLOG" | cut -c1-300)"
 reset; for i in a b c d e; do chk wa-$i 10; done
-T_PROBES=zzz pass "$L5" >/dev/null; [ "$(wnd_calls)" = 5 ] && ok "teto de sondas ilegível volta ao padrão (12): as 5 são sondadas" || bad "teto ilegível: $(wnd_calls)"
+T_PROBES=zzz pass "$L5" >/dev/null; [ "$(wnd_calls)" = 5 ] && ok "teto de sondas ilegível volta ao padrão (30): as 5 são sondadas" || bad "teto ilegível: $(wnd_calls)"
+# o padrão é 30 (ga-2hd02v.3.17): com 35 elegíveis e o teto sem valor, a passada sonda 30 e para por orçamento de sondas (com 12 pararia em 12)
+reset; L35="["; for i in $(seq 1 35); do chk wa-q$i 10; L35="$L35$([ "$i" -gt 1 ] && echo ,)$(jb wa-q$i U1 wa-worker x)"; done; L35="$L35]"
+pass "$L35" >/dev/null; [ "$(wnd_calls)" = 30 ] && ok "sem PILOT_WA_NODE_PASS_PROBES: 30 sondas de 35 elegíveis" || bad "padrão de sondas: $(wnd_calls)"
+jq -e 'select(.event=="wa-node-pass-summary" and .stopped=="budget-probes" and .probed==30)' "$PLOG" >/dev/null 2>&1 && ok "resumo: stopped=budget-probes com probed=30" || bad "resumo do padrão: $(tail -1 "$PLOG" | cut -c1-300)"
 # memória evita re-sondar a cabeça da fila: 2ª varredura (outro processo) não sonda as mesmas
 reset; for i in a b c d e; do chk wa-$i 10; done
 T_PROBES=3 pass "$L5" >/dev/null; pass "$L5" >/dev/null
@@ -561,6 +571,73 @@ for mv in released sampled; do
   [ "$(d1)" = "-" ] && [ "$(wnd_calls)" = 1 ] && ok "(memória) waiter memorizado como $mv (sem veredito de verdade): a P2 NÃO vai ao nó — só ela foi sondada" || bad "(memória) waiter $mv soltou a P2: d1=$(d1) sondas=$(wnd_calls)"
   summ | jq -e '.held==1 and .waiter_verdict=="blind"' >/dev/null 2>&1 && ok "(memória) waiter $mv: resumo held=1 waiter_verdict=blind" || bad "(memória) resumo do waiter $mv: $(summ | cut -c1-300)"
 done
+
+echo "── (6d) ga-2hd02v.3.17: o porquê de cada sonda fica no log (uma linha por sonda + a soma no resumo)"
+# a passada de 05:39Z sondou 12 e mandou 0 ao nó; o log só dizia "mini 5 · não sei 7". Aqui cada sonda grava veredito, motivos, classes e caminhos; "não li" nunca é "sem motivo".
+probe_of() { jq -c --arg b "$1" 'select(.event=="wa-node-pass-probe" and .bead==$b)' "$PLOG" 2>/dev/null | tail -1; }
+sumr() { jq -c 'select(.event=="wa-node-pass-summary") | .reasons' "$PLOG" 2>/dev/null | tail -1; }
+reset; chk wa-m1 10; echo '["moles:banco-de-dados","caminho-fora-do-filtro:shared/data/x.json"]' > "$WORK/chk.wa-m1.reasons"; echo '["shared/data/x.json"]' > "$WORK/chk.wa-m1.paths"
+T_EXEMPT=shadow pass "$S3" >/dev/null
+pl=$(probe_of wa-m1)
+[ "$(printf '%s' "$pl" | jq -c '[.verdict,.lane,.reasons,.classes,.paths]' 2>/dev/null)" = '["mini","small",["moles:banco-de-dados","caminho-fora-do-filtro:shared/data/x.json"],["caminho-fora-do-filtro","moles"],["shared/data/x.json"]]' ] \
+  && ok "mini: a linha da sonda traz veredito, pista, motivos, classes (motivo até o 1º ':') e caminhos" || bad "linha da sonda do mini: '$pl'"
+# vazio ([]): o classificador respondeu SEM motivo → reasons [] e a palavra "sem-motivo"; não é null
+reset; chk wa-m1 11; echo '[]' > "$WORK/chk.wa-m1.reasons"
+T_EXEMPT=shadow pass "$S3" >/dev/null
+[ "$(probe_of wa-m1 | jq -c '[.verdict,.reasons,.classes]' 2>/dev/null)" = '["unknown",[],[]]' ] && [ "$(sumr | jq -r '.["unknown:sem-motivo"] // "-"' 2>/dev/null)" = 1 ] \
+  && ok "reasons [] (o classificador respondeu sem motivo): a linha guarda [] e o resumo conta 'unknown:sem-motivo'" || bad "reasons []: linha='$(probe_of wa-m1)' resumo='$(sumr)'"
+# falhou/ilegível: saída que o jq não lê, ou JSON sem a lista, é null e "ilegivel" — NUNCA "sem-motivo"
+reset; chk wa-m1 10; echo 'isto nao e json' > "$WORK/chk.wa-m1.raw"
+T_EXEMPT=shadow pass "$S3" >/dev/null
+[ "$(probe_of wa-m1 | jq -c '[.verdict,.reasons,.classes,.paths]' 2>/dev/null)" = '["mini",null,null,null]' ] && [ "$(sumr | jq -r '.["mini:ilegivel"] // "-"' 2>/dev/null)" = 1 ] && [ "$(sumr | jq -r '.["mini:sem-motivo"] // "-"' 2>/dev/null)" = "-" ] \
+  && ok "rc 10 com saída ilegível: reasons=null e 'mini:ilegivel' no resumo (o veredito mini fica; 'não li' nunca vira 'sem motivo')" || bad "saída ilegível: linha='$(probe_of wa-m1)' resumo='$(sumr)'"
+reset; chk wa-m1 11; echo '{"verdict":"unknown","basis":"","reasons":"texto"}' > "$WORK/chk.wa-m1.raw"
+T_EXEMPT=shadow pass "$S3" >/dev/null
+[ "$(probe_of wa-m1 | jq -c '[.reasons,.classes]' 2>/dev/null)" = '[null,null]' ] && [ "$(sumr | jq -r '.["unknown:ilegivel"] // "-"' 2>/dev/null)" = 1 ] \
+  && ok "reasons que não é lista: null e 'unknown:ilegivel'" || bad "reasons que não é lista: linha='$(probe_of wa-m1)' resumo='$(sumr)'"
+# sem saída por definição (prazo, rc fora do contrato): 'sem-saida', a sonda ainda é contada
+reset; chk wa-m1 124; chk wa-n1 2
+T_EXEMPT=shadow pass "$S3" >/dev/null
+[ "$(probe_of wa-m1 | jq -c '[.verdict,.reasons]' 2>/dev/null)" = '["timeout",null]' ] && [ "$(probe_of wa-n1 | jq -c '[.verdict,.reasons]' 2>/dev/null)" = '["error",null]' ] \
+  && [ "$(sumr | jq -c '[.["timeout:sem-saida"], .["error:sem-saida"]]' 2>/dev/null)" = '[1,1]' ] && ok "timeout e error: a linha da sonda existe (reasons null) e o resumo conta 'sem-saida'" || bad "timeout/error: m1='$(probe_of wa-m1)' n1='$(probe_of wa-n1)' resumo='$(sumr)'"
+# a soma do resumo: uma palavra veredito:classe por sonda (classe repetida na mesma sonda conta UMA vez)
+reset; chk wa-m1 10; echo '["caminho-fora-do-filtro:a.db","caminho-fora-do-filtro:b.db","moles:credencial"]' > "$WORK/chk.wa-m1.reasons"; chk wa-n1 0; echo '["prova-teste-derivado:1-teste(s)+1-codigo(s)"]' > "$WORK/chk.wa-n1.reasons"; chk wa-n2 11; echo '["sem-prova-de-codigo-e-teste"]' > "$WORK/chk.wa-n2.reasons"
+T_EXEMPT=shadow pass "$S3" >/dev/null
+[ "$(sumr | jq -cS . 2>/dev/null)" = '{"mini:caminho-fora-do-filtro":1,"mini:moles":1,"node:prova-teste-derivado":1,"unknown:sem-prova-de-codigo-e-teste":1}' ] \
+  && ok "o resumo soma motivo × contagem por veredito (3 sondas → 4 palavras; classe repetida na mesma sonda conta 1)" || bad "soma do resumo: '$(sumr)'"
+grep -q 'motivos: .*mini:moles=1' "$WORK/lines" 2>/dev/null && ok "a linha do log do Pilot traz 'motivos: …' (o que o Athos lê sem abrir o jsonl)" || bad "log sem motivos: $(grep 'passada de WA' "$WORK/lines" 2>/dev/null | cut -c1-300)"
+# nenhuma sonda → {} (verdade: nada sondado), não null
+reset
+T_EXEMPT=shadow pass "[]" >/dev/null
+[ "$(sumr)" = '{}' ] && ok "passada sem sonda nenhuma: reasons {} no resumo (nada foi sondado), não null" || bad "resumo sem sondas: '$(sumr)'"
+# memória acertou → não houve sonda → nenhuma linha de sonda nova (a linha é por SONDA, não por candidata)
+reset; chk wa-m1 10; chk wa-n1 0; chk wa-n2 11; T_EXEMPT=shadow pass "$S3" >/dev/null; n1=$(grep -c '"wa-node-pass-probe"' "$PLOG" 2>/dev/null || true)
+T_EXEMPT=shadow pass "$S3" >/dev/null; n2=$(grep -c '"wa-node-pass-probe"' "$PLOG" 2>/dev/null || true)
+[ "$n1" = 3 ] && [ "$n2" = 4 ] && ok "a 2ª varredura só sonda o que a memória não tem (3 sondas na 1ª; na 2ª m1 mini e n2 unknown vêm da memória e só o node n1, que não é memorizado, é sondado: +1)" || bad "linhas de sonda: 1ª=$n1 2ª=$n2 (esperado 3 e 4)"
+# o teto: motivos e caminhos são aparados (12 × 80 e 10 × 120), mas as CLASSES saem da lista inteira — o motivo que vem depois do corte não some
+long=$(printf 'x%.0s' $(seq 1 100))
+reasons=$(jq -cn --arg long "$long" '[range(0;20) | "caminho-fora-do-filtro:p\(.)"] + ["so-no-mac:z", ("longo:" + $long)]')
+paths=$(jq -cn '[range(0;15) | "d/p\(.).db"]')
+reset; chk wa-m1 10; printf '%s' "$reasons" > "$WORK/chk.wa-m1.reasons"; printf '%s' "$paths" > "$WORK/chk.wa-m1.paths"
+T_EXEMPT=shadow pass "$S3" >/dev/null
+[ "$(probe_of wa-m1 | jq -c '[(.reasons|length), (.paths|length), (.classes|index("so-no-mac") != null), (.classes|index("longo") != null)]' 2>/dev/null)" = '[12,10,true,true]' ] \
+  && ok "teto: 12 motivos e 10 caminhos na linha, mas as classes vêm da lista inteira (so-no-mac e longo, depois do corte, aparecem)" || bad "teto: $(probe_of wa-m1 | cut -c1-300)"
+reset; chk wa-m1 10; printf '%s' "$reasons" > "$WORK/chk.wa-m1.reasons"
+T_EXEMPT=shadow pass "$S3" >/dev/null
+[ "$(printf '%s' "$reasons" | jq -c '.[21]|length')" -gt 80 ] && [ "$(sumr | jq -r 'to_entries | map(.key|length) | max' 2>/dev/null)" -lt 60 ] && ok "motivo de 100+ caracteres: a classe do resumo é só o prefixo até ':' (chave curta)" || bad "chave do resumo longa: '$(sumr)'"
+# modo on: a linha de sonda também sai (a bead que ficou com o nó tem veredito node e base)
+reset; chk wa-n1 0; echo '["prova-teste-derivado:1-teste(s)+1-codigo(s)"]' > "$WORK/chk.wa-n1.reasons"; echo derivado > "$WORK/chk.wa-n1.basis"; echo 0 > "$WORK/d1.rc.wa-n1"
+pass "$S3" >/dev/null
+[ "$(probe_of wa-n1 | jq -c '[.verdict,.basis,.reasons]' 2>/dev/null)" = '["node","derivado",["prova-teste-derivado:1-teste(s)+1-codigo(s)"]]' ] && ok "modo on: a bead que ficou com o nó também tem linha de sonda (node, base derivado, motivo da prova)" || bad "modo on sem linha de sonda: '$(probe_of wa-n1)'"
+# observar não decide: log que não grava (o caminho é uma pasta) avisa e a passada segue — veredito, memória e despacho iguais
+reset; chk wa-m1 10; chk wa-n1 0; echo 0 > "$WORK/d1.rc.wa-n1"
+r=$(SJ="$S3" run_t 'PILOT_WA_NODE_PASS_LOG="$WORK/city/.gc"; SMALL_CANDIDATES="$SJ"; BIG_CANDIDATES="[]"; _pilot_wa_node_pass; echo "D=$DISPATCHED"')
+[ "$r" = "D=1" ] && [ "$(memo_of)" = "wa-m1:mini," ] && grep -q 'WARN ga-2hd02v.3.17: não consegui gravar a linha de sonda' "$WORK/lines" 2>/dev/null \
+  && ok "log que não grava: avisa e a passada segue igual (n1 despachada, m1 memorizada como mini) — o registro só observa" || bad "log inescrevível mudou a decisão: r=$r memo=$(memo_of) avisos=$(grep -c WARN "$WORK/lines" 2>/dev/null)"
+# nada do registro vaza para a decisão: o veredito da sonda não muda com reasons ilegível
+reset; chk wa-n1 0; echo 'lixo' > "$WORK/chk.wa-n1.raw"; echo 0 > "$WORK/d1.rc.wa-n1"
+pass "$S3" >/dev/null
+[ "$(d1)" = "-" ] && ok "rc 0 com saída ilegível continua error (nunca node) — o detalhe dos motivos não abre porta nenhuma" || bad "saída ilegível despachou: $(d1)"
 
 echo "── (7) dispatch_one: o bloco do yield e o braço do pool (regiões VERBATIM)"
 run_block() {

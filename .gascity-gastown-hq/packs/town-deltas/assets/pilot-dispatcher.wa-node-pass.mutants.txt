@@ -100,3 +100,12 @@ apply rc 10 do waiter nao marca out	10) _pw_fails=$((_pw_fails + 1)); _pilot_wa_
 apply rc fora da tabela do waiter deixa wv em node	*)  if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi; _pw_stop="hook-held"; break ;;	*)  _pw_stop="hook-held"; break ;;
 memoria released do waiter vira out	case "${_PWP_MEMO_V:-}" in mini) _pw_wv=out ;; *) _pw_wv=blind ;; esac	case "${_PWP_MEMO_V:-}" in mini|released) _pw_wv=out ;; *) _pw_wv=blind ;; esac
 memoria sampled do waiter vira out	case "${_PWP_MEMO_V:-}" in mini) _pw_wv=out ;; *) _pw_wv=blind ;; esac	case "${_PWP_MEMO_V:-}" in mini|sampled) _pw_wv=out ;; *) _pw_wv=blind ;; esac
+sonda ilegivel vira sem-motivo	if $c == null then ["ilegivel"] elif	if $c == null then ["sem-motivo"] elif
+lista vazia de motivos vira ilegivel	then ["sem-motivo"]	then ["ilegivel"]
+timeout vira ilegivel	else ["sem-saida"] end)	else ["ilegivel"] end)
+classes saem so da lista cortada	(.reasons | map(tostring | split(":")[0] | gsub("[[:space:]]"; "_")) | unique)	(.reasons[:12] | map(tostring | split(":")[0] | gsub("[[:space:]]"; "_")) | unique)
+sem linha de sonda	_pilot_wa_node_pass_probe_note "$_pw_id" "$_pw_lane"; _pw_rsn="$_pw_rsn $_PWP_TOKENS"	:
+falha ao gravar a sonda nao avisa	|| warn "ga-2hd02v.3.17:	|| true "ga-2hd02v.3.17:
+resumo sem os motivos	stopped:$stop,reasons:$rs}	stopped:$stop}
+log sem os motivos	motivos: ${_pw_rs:-nenhum}	x
+padrao de sondas volta a 12	_pw_cap="${PILOT_WA_NODE_PASS_PROBES:-30}"	_pw_cap="${PILOT_WA_NODE_PASS_PROBES:-12}"

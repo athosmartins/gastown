@@ -6,11 +6,12 @@ Contents
 
 PARA QUÊ (Athos 20/10: "o que não pode é ficar menos do que 100% ocupado"): responder em um comando as duas perguntas que decidem os próximos passos da ga-2hd02v.3 —
   (1) quantas beads de WhatsApp o Pilot mandou ao nó, e a sombra já tem base para ligar `PILOT_WA_NODE_ROUTE=auto`? (2) quanto da CPU do nó foi usada, hora a hora?
-USO      wa-node-report.py [--hours N] [--city DIR] [--json] [--min-hours H] [--min-beads B] [--busy-pct P] [--pilot-log ARQ] [--dispatchable ARQ]
+USO      wa-node-report.py [--hours N] [--city DIR] [--json] [--min-hours H] [--min-beads B] [--busy-pct P] [--pilot-log ARQ] [--dispatchable ARQ] [--exempt-log ARQ]
          --hours N      janela, em horas, até agora (48; inteiro de 1 a 99999, "010" é dez)        --city DIR   a cidade (GC_CITY_PATH, senão /Users/athos/gt/.gascity-gastown-hq)
          --min-hours H  quantas HORAS UTC COM DADO bastam para REVISAR a flip para auto (24)        --min-beads B  quantas beads COM VEREDITO bastam (30)
          --busy-pct P   a partir de quantos % de CPU a leitura conta como "perto de 100%" (90)       --json       o mesmo em JSON
          --pilot-log    o log do Pilot (<cidade>/.gc/logs/pilot-dispatcher.log; o horário dele não traz fuso: é lido no fuso de quem roda, o mini)   --dispatchable  a fila (~/.gc/pilot-dispatchable.json)
+         --exempt-log   o log da passada do nó (<cidade>/.gc/wa-node-exempt.jsonl: uma linha `wa-node-pass-probe` por sonda, com os motivos do classificador)
          (a janela padrão é 48 h porque 24 horas com dado numa janela de 24 h não deixam folga: ela toca 25 horas UTC no máximo, e uma hora sem veredito já reprova)
          exit 0 ok · 2 uso · 3 NENHUM dos dois logs deu para usar (ausente ou ilegível) · 4 relatório não formado
 O QUE DIZ  1. a rota (<cidade>/.gc/wa-node-route.jsonl: o que o despachante e o Pilot gravam): cobertura da sombra (horas COM VEREDITO — node/mini/não sei —, não o intervalo entre a primeira e a última nem hora só de "não li"),
@@ -21,13 +22,16 @@ O QUE DIZ  1. a rota (<cidade>/.gc/wa-node-route.jsonl: o que o despachante e o 
               seguraram ANTES do gancho (<cidade>/.gc/logs/pilot-dispatcher.log) e o tamanho da fila despachável (~/.gc/pilot-dispatchable.json). O nó só recebe o que chega ao gancho; é o primeiro limite do uso dele por WA;
            3. a CPU do nó por hora, em UTC (<cidade>/.gc/hetzner-occupancy.jsonl: uma leitura a cada 15 min do hetzner-occupancy-watch), a média, quantas leituras ficaram perto de 100%
               e quantas sessões wa-worker-remote estavam vivas;
-           4. a prontidão MECÂNICA da sombra: horas e beads suficientes para alguém REVISAR. Não é aprovação: quem liga o `auto` é uma pessoa, depois de conferir uma a uma as beads `node` da lista.
+           4. a prontidão MECÂNICA da sombra: horas e beads suficientes para alguém REVISAR. Não é aprovação: quem liga o `auto` é uma pessoa, depois de conferir uma a uma as beads `node` da lista;
+           5. os MOTIVOS (ga-2hd02v.3.17: a passada de 05:39Z sondou 12 beads e mandou 0 ao nó, e o log só dizia "mini 5 · não sei 7"): de cada sonda da passada do Pilot (<cidade>/.gc/wa-node-exempt.jsonl),
+              o veredito e a classe de cada motivo; a tabela motivo × contagem (beads pela ÚLTIMA sonda, sondas ao todo, até 3 exemplos) e o resumo das passadas (quantas, quantas sondas, quantas ao nó, por que pararam).
 ESTADOS QUE NÃO SE CONFUNDEM  log ausente ("ainda não houve rodada") ≠ log vazio ≠ log ilegível ≠ zero decisões na janela. Linha que não dá para ler vem CONTADA e avisada, nunca omitida em
            silêncio. Linha de outro assunto no mesmo log (o `tipo:"reaper"` que o reaper grava em hetzner-occupancy.jsonl; um `event` que o despachante não conhece) não é leitura nem decisão: fica fora das contas e vem CONTADA. CPU que não foi lida (a 1ª leitura só semeia o baseline; o ssh falhou) NUNCA vira 0%: entra em "sem CPU lida". Sessões não lidas, ou lidas com entrada ilegível
            (`sessoes.ilegiveis`: a lista pode estar incompleta), não viram "0 sessões". Linha do Pilot cujo rc e `verdict` discordam NUNCA vira mini nem node: vai a "outro" e à lista de conferência.
-           O log do Pilot e a fila têm os mesmos três estados (ausente / vazio / ilegível), e a fila que não é o objeto com `items` em lista é ilegível, nunca "0 candidatas". Sem o log de rota, "quantas chegaram ao gancho
-           e quantas pararam antes" é NÃO SEI (null no JSON), nunca 0 e nunca "todas pararam".
-O QUE NÃO DIZ  que nenhuma bead com dado de lead foi ao nó: o relatório não vê o conteúdo da bead. Lista as que foram (e por quê) para a conferência humana. A garantia de que dado de lead
+           O log do Pilot, o da passada do nó e a fila têm os mesmos três estados (ausente / vazio / ilegível), e a fila que não é o objeto com `items` em lista é ilegível, nunca "0 candidatas". Sem o log de rota, "quantas chegaram ao gancho
+           e quantas pararam antes" é NÃO SEI (null no JSON), nunca 0 e nunca "todas pararam". Nos motivos, `sem-motivo` (o classificador respondeu sem razão) ≠ `ilegivel` (a razão não foi lida) ≠ `sem-saida`
+           (prazo/erro/script ausente: não houve resposta dele); sem NENHUMA sonda na janela o texto diz isso e não "zero motivos"; sonda sem bead/veredito conhecido e `event` desconhecido ficam FORA da tabela e CONTADOS.
+O QUE NÃO DIZ  se um motivo é CERTO: "caminho-fora-do-filtro" pode ser mini legítimo (dado, credencial, só-no-mac) ou um falso mini; a tabela diz quantas e dá exemplos para ler à mão. Também não diz que nenhuma bead com dado de lead foi ao nó: o relatório não vê o conteúdo da bead. Lista as que foram (e por quê) para a conferência humana. A garantia de que dado de lead
            não chega ao nó é o espelho git com a varredura de CPF/telefone, não este relatório. Também não diz que o WA RODOU bem no nó: só que a bead foi atribuída lá.
            No funil, "sem NENHUMA linha na rota" não é "o nó nunca viu": o gancho sai sem gravar com PILOT_WA_NODE_ROUTE=off, quando a bead já é do nó ou não deu para relê-la (label/auto), quando o despachante não
            está executável e quando o orçamento de spawn do sweep acabou. Por isso o relatório diz o número com essas palavras e avisa quando o Pilot não gravou linha nenhuma na janela (`gancho_gravou`).
@@ -60,6 +64,13 @@ ROTULOS = {
 SHADOW_PAR = {0: ("node", "node-sombra"), 10: ("mini", "mini"), 11: ("unknown", "nao-sei")}
 # os `event` que o despachante e o Pilot gravam em wa-node-route.jsonl; qualquer outro é evento DESCONHECIDO (formato novo?): contado e dito, nunca só somado em "linhas na janela"
 EVENTOS_ROTA = ("apply", "release", "read", "classify", "pilot-node-route")
+# wa-node-exempt.jsonl (a passada do Pilot que manda WA ao nó, ga-2hd02v.3.17): `wa-node-pass-probe` é UMA sonda do classificador (veredito + motivos); o resumo e a sombra são da mesma passada e ficam FORA do agregado de motivos
+EXEMPT_SONDA = "wa-node-pass-probe"
+EXEMPT_CONHECIDOS = ("wa-node-pass-summary", "wa-node-pass-shadow")
+# os vereditos que a sonda grava: os três do classificador (trazem motivos) e os três em que não houve saída dele (prazo, erro, script ausente)
+SONDA_VEREDITOS = ("node", "mini", "unknown", "timeout", "error", "missing")
+SONDA_CLASSIFICADOS = ("node", "mini", "unknown")
+SONDA_ROTULOS = {"node": "node", "mini": "mini", "unknown": "não sei", "timeout": "prazo estourou (sem veredito)", "error": "erro (sem veredito)", "missing": "script ausente (sem veredito)"}
 
 
 def num(x):
@@ -370,6 +381,82 @@ def analyse_occ(rows, lo, hi, busy_pct):
     }
 
 
+def sonda_tokens(verdict, classes):
+    """as palavras "veredito:classe" de UMA sonda, as mesmas que o Pilot soma no resumo da passada. vazio (classes=[]: o classificador respondeu sem motivo) → "sem-motivo";
+    falhou/ilegível (classes null, ou que não é lista de texto) → "ilegivel": "não li" NUNCA vira "sem motivo"; veredito sem saída do classificador (prazo, erro, script ausente) → "sem-saida"."""
+    if verdict not in SONDA_CLASSIFICADOS:
+        return [verdict + ":sem-saida"]
+    if not isinstance(classes, list) or any(not isinstance(c, str) or not c.strip() for c in classes):
+        return [verdict + ":ilegivel"]
+    if not classes:
+        return [verdict + ":sem-motivo"]
+    return [verdict + ":" + c for c in sorted(set(classes))]
+
+
+def analyse_motivos(rows, lo, hi):
+    """motivo × contagem das sondas da passada do nó (wa-node-exempt.jsonl). Só `wa-node-pass-probe` na janela entra no agregado; o veredito de uma bead é a ÚLTIMA sonda dela na janela (a mesma regra da rota).
+    `por_motivo[veredito:classe]` = {beads (pela última sonda), sondas (todas as da janela), exemplos (até 3 beads)}. Linha sem hora legível, sonda sem bead ou com veredito fora dos seis conhecidos NÃO entram no agregado e vêm
+    CONTADAS (sem_hora, fora_do_formato); `event` desconhecido idem (eventos_desconhecidos); resumo e sombra da passada vêm contados à parte (outros_conhecidos), e o resumo dá `passadas` (quantas, quantas sondas, quantas ao nó, por que pararam)."""
+    sem_hora = fora_formato = 0
+    ev = []
+    for i, r in enumerate(rows):
+        e = route_epoch(r)
+        if e is None:
+            sem_hora = sem_hora + 1
+            continue
+        if lo <= e <= hi:
+            ev.append((e, i, r))
+    ev.sort(key=lambda t: t[:2])
+    ultima, sondas_tok, conhecidos, novos = {}, {}, {}, {}
+    sondas = 0
+    pas = {"n": 0, "sondadas": 0, "node": 0, "parou_por": {}, "sem_numero": 0}
+    for _e, _i, r in ev:
+        kind = r.get("event")
+        if kind == "wa-node-pass-summary":
+            conhecidos[kind] = conhecidos.get(kind, 0) + 1
+            pas["n"] += 1
+            # vazio (campo ausente) e ilegível (texto, bool, negativo) são o mesmo aviso: a passada conta, mas o número dela NÃO entra na soma (nunca vira 0 em silêncio)
+            pr, nd = r.get("probed"), r.get("node")
+            if all(isinstance(x, int) and not isinstance(x, bool) and x >= 0 for x in (pr, nd)):
+                pas["sondadas"] += pr
+                pas["node"] += nd
+            else:
+                pas["sem_numero"] += 1
+            st = r.get("stopped")
+            st = st if isinstance(st, str) and st else "?"
+            pas["parou_por"][st] = pas["parou_por"].get(st, 0) + 1
+            continue
+        if kind in EXEMPT_CONHECIDOS:
+            conhecidos[kind] = conhecidos.get(kind, 0) + 1
+            continue
+        if kind != EXEMPT_SONDA:
+            nome = kind if (isinstance(kind, str) and kind) else "?"
+            novos[nome] = novos.get(nome, 0) + 1
+            continue
+        bid, v = r.get("bead"), r.get("verdict")
+        if not isinstance(bid, str) or not bid or v not in SONDA_VEREDITOS:
+            fora_formato += 1
+            continue
+        sondas += 1
+        toks = sonda_tokens(v, r.get("classes"))
+        for t in toks:
+            sondas_tok[t] = sondas_tok.get(t, 0) + 1
+        ultima[bid] = (v, toks)
+    por_veredito = {v: 0 for v in SONDA_VEREDITOS}
+    por_motivo = {}
+    for bid, (v, toks) in ultima.items():
+        por_veredito[v] += 1
+        for t in toks:
+            m = por_motivo.setdefault(t, {"beads": 0, "sondas": 0, "exemplos": []})
+            m["beads"] += 1
+            if len(m["exemplos"]) < 3:
+                m["exemplos"].append(bid)
+    for t, n in sondas_tok.items():
+        por_motivo.setdefault(t, {"beads": 0, "sondas": 0, "exemplos": []})["sondas"] = n
+    return {"sondas": sondas, "beads": len(ultima), "por_veredito": por_veredito, "por_motivo": por_motivo, "passadas": pas, "sem_hora": sem_hora,
+            "fora_do_formato": fora_formato, "outros_conhecidos": conhecidos, "eventos_desconhecidos": novos}
+
+
 # o log do Pilot: "[2026-10-20 15:50:54] [pilot-dispatcher] …". Só a bead de WA (id wa-…) entra; cada padrão é uma linha que o Pilot escreve ANTES do gancho do nó (ou no despacho ao mini)
 LOG_TS = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] ")
 # o id é `wa-` + base36 + sufixos `.N` (wa-hut4l5.4). O ponto final da frase ("Claim acquired on wa-qp98sy.") não é do id: com ele a mesma bead entraria duas vezes
@@ -605,6 +692,35 @@ def render(res):
         L.append("  base suficiente PARA REVISAR: confira as %d bead(s) da lista acima%s. Quem liga o auto é uma pessoa." % (p["a_conferir"], extra))
     else:
         L.append("  INSUFICIENTE: " + "; ".join(p["falta"]) + ". Não ligue o `auto` com isto.")
+    L.append("")
+    mo = res["motivos"]
+    L.append("[5] MOTIVOS DAS SONDAS DA PASSADA DO NÓ (%s) — por que o classificador deu cada veredito (ga-2hd02v.3.17)" % mo["arquivo"])
+    aviso = estado_txt(mo["estado"], mo["ilegiveis"], mo["arquivo"])
+    if aviso:
+        L.append("  " + aviso)
+    if mo["estado"] == "ok":
+        a = mo["analise"]
+        pa = a["passadas"]
+        L.append("  %d passada(s) com resumo na janela; sondaram %d bead(s) e mandaram %d ao nó; pararam por: %s" % (pa["n"], pa["sondadas"], pa["node"], ", ".join("%s=%d" % kv for kv in sorted(pa["parou_por"].items())) or "—"))
+        if pa["sem_numero"]:
+            L.append("  ATENÇÃO — %d resumo(s) sem número legível (probed/node ausente ou fora do formato): contados como passada, FORA das somas" % pa["sem_numero"])
+        if not a["sondas"]:
+            L.append("  nenhuma sonda `%s` na janela: a passada não gravou motivos (Pilot sem o ga-2hd02v.3.17, passada desligada ou memória de vereditos cobrindo tudo) — isto NÃO é 'zero motivos'" % EXEMPT_SONDA)
+        else:
+            L.append("  %d sonda(s) em %d bead(s) distinta(s); veredito da bead = a ÚLTIMA sonda dela na janela:" % (a["sondas"], a["beads"]))
+            for v in SONDA_VEREDITOS:
+                if a["por_veredito"][v]:
+                    L.append("    %-52s %d" % (SONDA_ROTULOS[v], a["por_veredito"][v]))
+            L.append("  motivo × contagem (uma bead conta em cada motivo que tem; `sem-motivo` = o classificador respondeu sem razão, `ilegivel` = a razão não foi lida, `sem-saida` = não houve saída dele):")
+            L.append("    %-44s %6s %7s  %s" % ("veredito:motivo", "beads", "sondas", "exemplos"))
+            for t, m in sorted(a["por_motivo"].items(), key=lambda kv: (-kv[1]["beads"], -kv[1]["sondas"], kv[0])):
+                L.append("    %-44s %6d %7d  %s" % (t, m["beads"], m["sondas"], ", ".join(m["exemplos"]) or "—"))
+        if a["sem_hora"] > 0:
+            L.append("  %d linha(s) do log sem hora legível, FORA das contas acima" % a["sem_hora"])
+        if a["fora_do_formato"]:
+            L.append("  ATENÇÃO — %d sonda(s) sem bead ou com veredito que este relatório não conhece, FORA das contas acima: o formato mudou?" % a["fora_do_formato"])
+        if len(a["eventos_desconhecidos"]) > 0:
+            L.append("  ATENÇÃO — %d linha(s) de `event` que este relatório não conhece, FORA das contas (%s): o formato do log mudou?" % (sum(a["eventos_desconhecidos"].values()), ", ".join("%s=%d" % kv for kv in sorted(a["eventos_desconhecidos"].items()))))
     return "\n".join(L) + "\n"
 
 
@@ -618,6 +734,7 @@ def parse_args(argv):
     ap.add_argument("--busy-pct", default="90")
     ap.add_argument("--pilot-log", default=None)
     ap.add_argument("--dispatchable", default=None)
+    ap.add_argument("--exempt-log", default=None)
     a = ap.parse_args(argv)
     # vazio ou fora de 'dígitos' → uso errado (rc 2), nunca um padrão silencioso; decimal mesmo com zero à esquerda
     for nome, v, lo_, hi_ in (("--hours", a.hours, 1, 99999), ("--min-hours", a.min_hours, 0, 99999), ("--min-beads", a.min_beads, 0, 99999), ("--busy-pct", a.busy_pct, 1, 100)):
@@ -626,7 +743,7 @@ def parse_args(argv):
             sys.exit(2)
     a.hours, a.min_hours, a.min_beads, a.busy_pct = int(a.hours, 10), int(a.min_hours, 10), int(a.min_beads, 10), int(a.busy_pct, 10)
     # ausente (None) → o caminho padrão; vazio ("") → uso errado, rc 2: um caminho em branco não pode virar "o padrão" em silêncio
-    for nome, v in (("--pilot-log", a.pilot_log), ("--dispatchable", a.dispatchable)):
+    for nome, v in (("--pilot-log", a.pilot_log), ("--dispatchable", a.dispatchable), ("--exempt-log", a.exempt_log)):
         if v is not None and v == "":
             sys.stderr.write("wa-node-report: %s quer um caminho (veio vazio)\n" % nome)
             sys.exit(2)
@@ -651,7 +768,10 @@ def main(argv):
     rota_p, occ_p = os.path.join(city, ".gc", "wa-node-route.jsonl"), os.path.join(city, ".gc", "hetzner-occupancy.jsonl")
     re_, rrows, rbad = read_jsonl(rota_p)
     oe, orows, obad = read_jsonl(occ_p)
+    exe_p = a.exempt_log if a.exempt_log is not None else os.path.join(city, ".gc", "wa-node-exempt.jsonl")
+    xe, xrows, xbad = read_jsonl(exe_p)
     ra = analyse_route(rrows, lo, hi) if re_ in ("ok", "vazio") else None
+    xa = analyse_motivos(xrows, lo, hi) if xe in ("ok", "vazio") else None
     oa = analyse_occ(orows, lo, hi, a.busy_pct) if oe in ("ok", "vazio") else None
     log_p = a.pilot_log if a.pilot_log is not None else os.path.join(city, ".gc", "logs", "pilot-dispatcher.log")
     fila_p = a.dispatchable if a.dispatchable is not None else os.path.join(os.path.expanduser("~"), ".gc", "pilot-dispatchable.json")
@@ -676,6 +796,7 @@ def main(argv):
         "funil": {"arquivo": log_p, "estado": fe, "analise": fa},
         "fila": {"arquivo": fila_p, "estado": qe, "analise": qa},
         "prontidao": prontidao(ra, a.min_hours, a.min_beads, a.hours) if ra else None,
+        "motivos": {"arquivo": exe_p, "estado": xe, "ilegiveis": xbad, "analise": xa},
     }
     try:
         corpo = (json.dumps(res, ensure_ascii=False, sort_keys=True) + "\n") if a.json else render(res)

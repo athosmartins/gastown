@@ -324,6 +324,50 @@ def mirror_reach(cands):
         return [], ["espelho-ilegivel:" + str(e)]
 
 
+RESOLVE_EXT = CODE_EXT + ("html", "md")   # nome solto só é trocado se for código/texto; nome solto de dado (.db, .csv, .log, .json...) nunca: segue julgado como arquivo da raiz, que o filtro não manda
+
+
+def resolve_loose(paths, sent):
+    """(paths, sent, nota para `info`). Nome solto (sem pasta, ex. `map_viewer.html`, `job_timeout.sh`) é julgado como arquivo da RAIZ do repo, mas a bead quase sempre o usa de atalho para um arquivo
+    de outra pasta (`templates/map_viewer.html`, `scripts/job_timeout.sh`): o falso "fora do filtro" e o código sem teste derivado (ga-2hd02v.3.17). Troca o nome solto pelo caminho real quando ele é inequívoco: (1) a própria bead cita UM caminho com pasta e esse
+    nome, ou (2) a árvore de REPO_REF tem UM arquivo com esse nome e nenhum na raiz. O caminho trocado passa pelo MESMO filtro, mac-only e espelho dos demais (nada é aberto por esta troca); só código/texto
+    (RESOLVE_EXT) é trocado, nunca dado. vazio (nenhum candidato, ou mais de um) -> o nome segue solto, fora do filtro = mini, como antes; falhou/ilegível (árvore) -> idem + nota
+    `caminho-solto-ilegivel:<motivo>`, nunca "resolvido"."""
+    if not paths:
+        return paths, sent, []
+    loose = [p for p in paths if "/" not in p and p.rsplit(".", 1)[-1].lower() in RESOLVE_EXT and (p not in sent or p.rsplit(".", 1)[-1].lower() in CODE_EXT)]   # texto/html que o filtro não manda, ou código solto (o filtro o deixa sair da raiz, mas sem o caminho real a regra 6 não acha o teste dele)
+    if not loose:
+        return paths, sent, []
+    foldered = [p for p in paths if "/" in p]
+    tree, tried, note, swap = set(), False, [], {}
+    for p in loose:
+        cited = sorted(set(q for q in foldered if q.rsplit("/", 1)[-1] == p))
+        if cited:
+            if len(cited) == 1:   # dois citados com o mesmo nome: não sei qual é, fica solto
+                swap[p] = cited[0]
+            continue
+        if not tried:
+            tried = True
+            try:
+                tree = set(repo_tree())
+            except Unreadable as e:
+                note = ["caminho-solto-ilegivel:" + str(e)]
+        hits = sorted(f for f in tree if f.rsplit("/", 1)[-1] == p)
+        if len(hits) == 1 and hits[0] != p and all(SAFE_SEG.match(sg) for sg in hits[0].split("/")):   # hits == [p]: o arquivo é o da raiz mesmo, nada a trocar
+            swap[p] = hits[0]
+    if not swap:
+        return paths, sent, note
+    out = []
+    for p in paths:
+        q = swap.get(p, p)
+        if q not in out:
+            out.append(q)
+    new = sorted(set(q for q in swap.values() if q not in sent))
+    if new:
+        sent = set(sent) | sent_by_filter(new)
+    return out, sent, note + ["caminho-solto:%s=%s" % (p, q) for p, q in swap.items()]
+
+
 def mac_only_globs():
     # ausente/ilegível -> Unreadable (sem a lista não sei o que tem de ficar no Mac); existe mas sem NENHUM glob (truncada? só comentários?) -> Unreadable também: a lista real nunca é vazia,
     # e "não sei" não pode ler como "nada é só-Mac"
@@ -460,11 +504,12 @@ def classify(b):
     if has_pii(json.dumps(b, ensure_ascii=False)):
         hard.append("dado-no-texto")
     sent = sent_by_filter(paths) if paths else None
+    paths, sent, loose_note = resolve_loose(paths, sent)   # nome solto -> o caminho real, quando é inequívoco (julgado pelo mesmo filtro)
     globs = mac_only_globs() if paths else []
     # texto neutro que o rsync não lista mas o espelho entrega (docs/, DESIGN.md...): só os .md fora da lista pagam a consulta ao espelho; os demais caminhos seguem como antes.
     # vazio (nenhum .md fora da lista) -> o espelho nem é consultado; falhou/ilegível -> nenhum chega e `info` leva espelho-ilegivel:<motivo> (o caminho segue 'fora do filtro' = mini, como antes desta regra)
     via_mirror, note = mirror_reach([p for p in paths if p not in sent and p.rsplit(".", 1)[-1].lower() in MIRROR_TEXT_EXT]) if paths else ([], [])
-    info += note + ["via-espelho:" + p for p in via_mirror]
+    info += loose_note + note + ["via-espelho:" + p for p in via_mirror]
     code, tests = [], []
     for p in paths:
         if p not in sent and p not in via_mirror:
