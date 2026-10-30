@@ -552,6 +552,9 @@ g_ctx() {  # gate da fatia 6a (tentativa 7, ga-37bwre): o trecho aninhado ($( ),
   b 2 "ctx: f() { git -C <alheio> commit; }; eval f" "f() { git -C $OTH commit; }; eval f"
   b 2 "ctx: f() { git -C <alheio> commit; }; export -f f; bash -c f" "f() { git -C $OTH commit; }; export -f f; bash -c f"
   b 2 "ctx: f() { … '{' …; git -C <alheio> commit; }; f (o fim da função não fecha)" "f() { :; echo '{'; git -C $OTH commit; }; f"
+  # A `{` entre aspas já não deixa a função aberta (a conta de chaves só lê as reservadas); o que exercita o fim do pedido é o texto de fato cortado, sem o `}` da função.
+  b 2 "ctx: f() { :; git -C <alheio> commit (falta o }, texto cortado): o corpo é reexecutado no fim e CONFERIDO" "f() { :; git -C $OTH commit -m x"
+  b 2 "ctx: ...e com a chamada f no fim" "f() { :; git -C $OTH commit -m x; f"
   b 2 "ctx: idem com newlines" "f() {
 :
 echo '{'
@@ -1152,6 +1155,9 @@ EOF
   # ficar aberta, desde que a conta de chaves só lê as reservadas; o que sobra para exercitar o fim do pedido é o texto de fato cortado).
   b 2 "budget: f e g sem o } (texto cortado) e um git no alheio no fim: o corpo reexecutado no fim é CONFERIDO, não engolido por g" "f() { :; function g { :; git -C $OTH commit -m x"
   b 2 "budget: ...e o g chamado dentro de f, depois de um cd <próprio> na própria g" "f() { function g { cd $OWN; git -C $OTH commit -m x; f; g"
+  # Falso positivo ASSUMIDO (lado fechado): a região "perdida" que uma definição aninhada abre NÃO termina no `}` dela, nem depois de uma chamada feita dentro dela — vale até o fim da reexecução do corpo.
+  # O cd <próprio> logo abaixo vale então "não sei" e o git bloqueia, embora no shell real o commit escreva no PRÓPRIO clone.
+  b 2 "budget: (falso positivo assumido) a região perdida sobrevive à chamada h e ao } da aninhada: o cd <próprio> depois dela vale não-sei" "h() { :; }; f() { :; function g { :; }; h; cd $OWN; }; cd $OTH; f; git commit -m x"
   b 2 "budget: controle — a função aninhada CHAMADA que escreve no alheio é bloqueada" "f() { function g { git -C $OTH commit -m x; }; g; }; f"
   # parecer do gate na tentativa 1: registrar a aninhada SEM CONDIÇÃO, com o ramo "chamada de função" antes do ramo git, deixava uma função chamada git pular o git_hit.
   # Uma função chamada git NUNCA isenta a chamada: pode não existir (a definição não rodou) e command git / env git / \git a ignoram.
