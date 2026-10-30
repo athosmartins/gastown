@@ -28,6 +28,20 @@ Decisão do Athos (06/10): ao vivo, sem reiniciar — mesmo link de RC, conversa
    renova o token e o perfil responde: dono certo → log `owner verified`; dono errado → alerta `owner-mismatch` + a fonte
    entra em quarentena (`bad_sources`, pela impressão do refresh token) e nunca mais é escrita até o login ser refeito.
    Se o perfil nunca responder em 15 min: log `still unverified` (sem push: sem sessão viva ninguém renova o token).
+   **Sem repetir a mesma troca (ga-xoe5ao.2):** a troca não verificada fica registrada pelo LOGIN (impressão do refresh token,
+   `unverified_logins` no estado). A MESMA cópia (mesmo refresh token) não é escrita de novo por 6 h (`UNVERIFIED_HOLD_S`), mesmo que o
+   perfil confirme o dono depois (a renovação do CLI consome aquela cópia; a que vale é a que o sync-back guarda, com refresh token novo):
+   o seguimento e o heal a pulam como pulam uma fonte em quarentena (a frase do alerta `no-login`, `stuck` ou `heal-no-source` diz `held`)
+   e passam à próxima conta com login. Solta: login novo (refresh token novo) ou as 6 h (uma tentativa a mais, depois segura de novo).
+   Registro sem horário legível continua segurando até outra troca não verificada limpar a tabela (lado inerte). Medido em 29/10 (log #226-#257): 32 trocas idênticas em 2 h 12, o heal
+   gravando a cópia guardada da athosb85 (access token vencido) a cada ~4 min porque o default voltava a "no access token" em ~3 min; o
+   mesmo padrão já aparece em 14–15/10 (28 `SWITCH ... (heal)` para a athosb85, 1 a 5 min entre eles, até 01:00Z; runbooks/hetzner-claude-login.md,
+   causa não investigada). **O que esvazia o token entre os ciclos NÃO foi identificado** (ninguém leu o chaveiro nem observou o CLI);
+   a trava corta o laço sem depender disso.
+   **De quem é o login (ga-xoe5ao.2):** o NOME do item não prova o dono. Toda vez que o perfil responde por um token vivo, o job guarda
+   "impressão do refresh token → conta" (`owners` no estado: só impressão e e-mail, 40 dias, 64 entradas) e também o desfecho `owner-mismatch`.
+   Uma fonte cujo refresh token o perfil já atribuiu a OUTRA conta é recusada (a frase diz `holds <conta>'s login, not <conta>'s`), em qualquer
+   lugar onde esteja (item próprio ou reserva: a quarentena é por item, o livro é por login).
 5. **Verify:** toda sessão que tinha bridge de Remote Control ainda a tem 60 s depois. Quem não pôde ser verificado diz que
    não foi (pasta de sessões ilegível, janela de 15 min perdida, zero bridges): nunca imprime "todas no ar". São TRÊS
    veredictos, não dois: *no ar*, *perdeu* (push `lost Remote Control`) e *não verificada* — sessão rodando cujo arquivo
@@ -154,6 +168,9 @@ Rodando o arquivo de testes novo contra o script do HEAD anterior (`cb6afb9d9`):
   não manda ninguém "refazer login", porque o login pode existir). Candidato de fallback ilegível é pulado (vale o próximo
   com login completo), mas o alerta `stuck` o nomeia em vez de dizer que ninguém tem login.
 - A decisão do pool NÃO tem gate de idade: `updated` só muda quando o pool troca de conta (não é heartbeat).
+- Uma troca não verificada não se repete com a mesma cópia: o 2º `unverified switch` do mesmo login (mesmo refresh token) não acontece por
+  6 h; o 1º continua sendo o caminho normal de produção (fail-open do item 4).
+- Um login que o perfil já deu a OUTRA conta nunca é escrito como se fosse da conta pedida, esteja em que item estiver.
 
 ## Liga/desliga
 - Kill switch: `touch /Users/athos/gt/.gascity-gastown-hq/.gc/no-crew-account` (ou `GC_CREW_ACCOUNT=0`).
@@ -183,8 +200,21 @@ Rodando o arquivo de testes novo contra o script do HEAD anterior (`cb6afb9d9`):
 - 2ª etapa (reinício em momento ocioso se o RC cair) fora de escopo.
 - (ga-yqzedv) O glifo que o claude real põe na frente da mensagem de limite não foi medido (nenhum pane nesse estado existia); o caminho do
   `gc session reset` só rodou contra um `gc` falso nos testes, nunca ao vivo; se o layout do claude mudar, as telas viram "não sei" (sem vigia).
+- (ga-xoe5ao.2) **Quem cruza os itens NÃO é este job.** Os quatro pontos de escrita no chaveiro do repo foram lidos (aqui só o `sync_back` e o
+  seguimento escrevem; o `sync_back` só grava no item da conta que o perfil confirmou) e uma simulação aleatória descartável (não versionada:
+  chaveiro e perfil em memória, itens corretos no começo; 450 sequências de 60 passos, 300 antes da mudança e 150 depois, com ~2.800 trocas,
+  ~1.600 sync-backs e ~200 divergências de dono) não gravou o login de uma conta no item de outra nenhuma vez. Escritores de FORA que
+  cruzam por desenho ou por engano: o `gt quota rotate` do engine (`internal/quota/keychain.go`, `SwapKeychainCredential`: sobrescreve o item
+  do diretório-alvo com o segredo do diretório-origem pelo NOME do diretório, e `SwapOAuthAccount` troca junto o `oauthAccount` do
+  `.claude.json`; não está ligado a nenhuma order nem cron da cidade, só roda se alguém o chamar), um login humano com o navegador numa conta
+  que não é a do diretório, e a cópia à mão do default para um item. O livro de donos só reconhece o que o perfil já viu passar pelo default:
+  um item semeado errado e nunca visto continua sendo descoberto só na 1ª troca para ele (uma troca desperdiçada, depois quarentena). Não
+  medido: se o `.claude.json` do diretório (`oauthAccount.emailAddress`, existe no CLI) serviria de 2ª testemunha de dono; não sei se o CLI o
+  atualiza junto com o item no login, e um falso positivo bloquearia um failover legítimo, por isso não foi usado.
+- (ga-xoe5ao.2) A trava só vale para a troca NÃO verificada. Um `SWITCH` verificado (o perfil respondeu pela cópia guardada) que se repita a
+  cada ciclo não é cortado por ela; não foi visto em produção e o mecanismo que esvazia o default (acima) não deveria agir sobre um token vivo.
 
-Testes: `scripts/test_claude_crew_account.py` (192 testes, shim de `security`, servidor de perfil em loopback, `tmux` falso que registra cada argv e cada tecla, `gc` falso que registra cada chamada). O harness é
+Testes: `scripts/test_claude_crew_account.py` (208 testes, shim de `security`, servidor de perfil em loopback, `tmux` falso que registra cada argv e cada tecla, `gc` falso que registra cada chamada). O harness é
 selado: todo teste roda com `CLAUDE_CREW_NOTIFY`, `CLAUDE_CREW_SECURITY` e `GC_CITY_PATH` fixados em stubs/tmp e `PATH`
 sem o `notify` real; no fim da sessão afirma que o log/estado/lock reais não mudaram e que nenhum sentinela foi executado;
 e o script roda de verdade sob `env -i`, com `python3` do pytest e com `/usr/bin/python3` (3.9, o do plist).
