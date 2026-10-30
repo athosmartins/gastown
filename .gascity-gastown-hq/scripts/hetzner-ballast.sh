@@ -56,6 +56,47 @@ stop_or_die() {
   die 3 "$1, mas NÃO consegui parar o que roda (stop rc=$rc): confira no nó (ps, ~/gt-remote/ballast)"
 }
 
+# O governo do nó é a trava de verdade (sem teto pronto nenhum item começa); aqui o `on` só não deixa ligar às cegas. Volta 0 = pode ligar (teto pronto, ou governo ainda não instalado: nada roda até o install).
+# Recusa (rc 3) com o motivo se o teto não está pronto, se o governo é antigo (o status não traz `ceiling`) ou se NÃO consegui ler a resposta: falta de leitura nunca vira "pronto". ssh que cai = rc 98.
+need_ceiling_ready() {
+  local raw rc v
+  raw=$(rsh 'g="$HOME/gt-remote/bin/hetzner-ballast.py"; if [ -e "$g" ]; then python3 -I "$g" status 2> /dev/null; echo "status_rc=$?"; else echo "status_rc=absent"; fi'); rc=$?
+  [ "$rc" -ne 255 ] || die 98 "ssh não conectou ($NODE): não liguei o lastro"
+  [ "$rc" -eq 0 ] || die 3 "não consegui perguntar ao governo do nó se o teto está pronto (rc=$rc): não liguei o lastro"
+  # vazio/falhou (sem a linha status_rc, status que saiu ≠ 0, resposta que não é um objeto JSON) → ilegivel; sem `ceiling` (ou sem `ready`) → antigo; governo ausente → absent
+  v=$(printf '%s\n' "$raw" | python3 -I -c '
+import json, sys
+ls = sys.stdin.read().splitlines()
+rl = [l for l in ls if l.startswith("status_rc=")]
+if not rl:
+    print("ilegivel")
+elif rl[-1] == "status_rc=absent":
+    print("absent")
+elif rl[-1] != "status_rc=0":
+    print("ilegivel")
+else:
+    try:
+        d = json.loads("\n".join(l for l in ls if not l.startswith("status_rc=")))
+    except ValueError:
+        d = None
+    c = d.get("ceiling") if isinstance(d, dict) else None
+    if not isinstance(d, dict):
+        print("ilegivel")
+    elif not isinstance(c, dict) or "ready" not in c:
+        print("antigo")
+    elif c.get("ready") is True:
+        print("pronto")
+    else:
+        print("nao:" + str(c.get("why", ""))[:300])
+')
+  case "$v" in
+    pronto|absent) return 0 ;;
+    antigo) die 3 "o governo instalado no nó não conhece teto (o status dele não traz 'ceiling'): rode 'hetzner-ballast.sh install' com o commit do teto antes de ligar. A chave on NÃO foi posta." ;;
+    nao:*) die 3 "o teto NÃO está pronto no nó e sem ele nenhum item começa: ${v#nao:}. Remédio: 'loginctl enable-linger runner' (root, uma vez, no nó) ou uma sessão aberta; depois repita o on. A chave on NÃO foi posta." ;;
+    *) die 3 "não consegui ler a resposta do governo do nó sobre o teto: não liguei o lastro (falta de leitura NÃO é 'pronto'). A chave on NÃO foi posta." ;;
+  esac
+}
+
 cmd_install() {
   local allow=0 f rel dst files=() dirty head want got rc p mode a b now sums=""
   [ "${1:-}" = "--allow-dirty" ] && allow=1
@@ -109,6 +150,7 @@ H=$HOME; echo "* * * * * flock -n $H/gt-remote/ballast/cron.lock /usr/bin/python
     *) die 3 "não consegui instalar a linha da crontab" ;;
   esac
   say "instalado em $NODE (commit ${head:0:9}, dirty=$dirty): governo, ${#pairs[@]} arquivos e a crontab. O lastro está DESLIGADO: 'hetzner-ballast.sh on' para ligar."
+  say "O TETO por item exige o gerenciador de usuário do systemd no nó (sem ele nenhum item começa): rode 'loginctl enable-linger runner' no nó, como root, uma vez. 'hetzner-ballast.sh status' diz se o teto está pronto e o 'on' recusa sem ele."
 }
 
 cmd_uninstall() {
@@ -130,6 +172,7 @@ cmd_flag() {  # cmd_flag NOME on|off
   local rc out=""
   # `on`: o 2º comando diz se há algo instalado (installed.json). Sem installed.json → só AVISA (a chave fica posta); ssh/rsh que falhou → rc 98/3 antes de qualquer aviso
   if [ "$2" = on ]; then
+    [ "$1" != on ] || need_ceiling_ready
     out=$(rsh "mkdir -p \"\$HOME/gt-remote/ballast\" && : > \"\$HOME/gt-remote/ballast/$1\" && { [ -e \"\$HOME/gt-remote/ballast/installed.json\" ] && echo instalado=1 || echo instalado=0; }"); rc=$?
   else
     rsh "rm -f \"\$HOME/gt-remote/ballast/$1\""; rc=$?
@@ -217,6 +260,13 @@ if isinstance(st, dict) and isinstance(st.get("items"), list):
         print("  item %-14s %-6s núcleos=%-4s %s" % (it.get("name"), it.get("role"), it.get("cores"), "elegível" if it.get("eligible") else "inerte: " + str(it.get("why"))))
     for e in st.get("registry_errors") or []:
         print("  ERRO NO REGISTRO: " + str(e))
+    c = st.get("ceiling")   # teto de sistema por item (ga-kgnjkt8): pronto / NÃO pronto (estado, não leitura que falhou) / governo antigo sem a chave (nunca "pronto")
+    if isinstance(c, dict) and c.get("ready") is True:
+        print("teto: pronto (%s, %s tarefas por item, memória = rss_mb x %s)" % (c.get("mode"), c.get("tasks_max"), c.get("mem_factor")))
+    elif isinstance(c, dict):
+        print("teto: NÃO PRONTO — nenhum item começa: %s" % c.get("why"))
+    else:
+        print("teto: o governo instalado no nó NÃO tem teto (rode install com o commit do teto)")
     if "running" in st and st["running"] is None:
         bad = 1
         print("  rodando: o governo NÃO conseguiu ler os processos")
@@ -241,7 +291,8 @@ cmd_pull() {
   printf '%s\n' "$raw" | python3 -I -c '
 import json, os, sys
 out = sys.argv[1]
-KEEP = ("ts", "item", "run", "role", "cores", "start", "secs", "rc", "why", "summary", "summary_why")
+KEEP = ("ts", "item", "run", "role", "cores", "start", "secs", "rc", "why", "summary", "summary_why", "ceiling")
+CEIL = ("tasks_peak", "tasks_hit", "mem_peak_mb", "oom_kill")   # os picos do teto: só estes quatro, inteiros ou null (não sei)
 def scal(v):
     if isinstance(v, str):
         return v[:160]
@@ -282,7 +333,11 @@ for l in sys.stdin.read().splitlines():
         continue
     if d["run"] in seen:
         continue
-    row = {k: (clean(d[k]) if k == "summary" else scal(d[k])) for k in KEEP if k in d}
+    row = {k: (clean(d[k]) if k == "summary" else scal(d[k])) for k in KEEP if k in d and k != "ceiling"}
+    if isinstance(d.get("ceiling"), dict):
+        row["ceiling"] = {k: (d["ceiling"][k] if isinstance(d["ceiling"].get(k), int) and not isinstance(d["ceiling"].get(k), bool) else None) for k in CEIL}
+    elif "ceiling" in d:
+        row["ceiling"] = None
     s = json.dumps(row)
     if len(s) > 8000:
         row["summary"] = None

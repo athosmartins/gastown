@@ -43,7 +43,13 @@ if os.path.exists(os.path.expanduser("~/gov.fail." + cmd)):
     sys.exit(3)
 if cmd == "status":
     run = None if os.path.exists(os.path.expanduser("~/gov.running.null")) else []   # ~/gov.running.null: o governo não leu os processos (running null)
-    print(json.dumps({"items": [{"name": "hq-selftests", "role": "work", "cores": 4, "eligible": True, "why": ""}], "registry_errors": [], "running": run}))
+    out = {"items": [{"name": "hq-selftests", "role": "work", "cores": 4, "eligible": True, "why": ""}], "registry_errors": [], "running": run}
+    ceil = {"mode": "systemd", "ready": True, "why": "", "tasks_max": 4096, "mem_factor": 1.25}   # ~/gov.ceiling.notready: sem gerenciador de usuário · ~/gov.ceiling.absent: governo antigo (o status nem tem a chave)
+    if os.path.exists(os.path.expanduser("~/gov.ceiling.notready")):
+        ceil.update(ready=False, why="sem gerenciador de usuario do systemd (bus ausente: nenhuma sessao aberta e sem linger)")
+    if not os.path.exists(os.path.expanduser("~/gov.ceiling.absent")):
+        out["ceiling"] = ceil
+    print(json.dumps(out))
 elif cmd == "stop":
     print(json.dumps({"stopped": []}))
 else:
@@ -222,6 +228,32 @@ g_ctl() {
   check "pull: results.jsonl existe e está vazio → rc 0, 0 novas" "0 1" "$RC $(printf '%s' "$OUT" | grep -c '0 novas')"
   rm -f "$NODE/gt-remote/ballast/results.jsonl"; mkdir "$NODE/gt-remote/ballast/results.jsonl"; mkdir -p "$R/.gc/hetzner-ballast"; printf '{"run": "antes"}\n' > "$OUTF"; ctl pull
   check "pull: results.jsonl que NÃO consegui ler (≠ ausente) → rc 3, diz que não leu e o arquivo local fica como estava" "3 1 1" "$RC $(printf '%s' "$OUT" | grep -c 'NÃO consegui LER results.jsonl') $(nlines "$OUTF")"
+
+  # ── ga-kgnjkt8: o teto por item. O governo é a trava de verdade (sem teto pronto nenhum item começa); o `on` só não deixa ligar às cegas, e o `status` mostra se o teto está pronto ──
+  on_flag() { [ -e "$NODE/gt-remote/ballast/on" ] && echo 1 || echo 0; }
+  newenv; ctl install
+  check "install: lembra que o teto exige o gerenciador de usuário do systemd no nó (loginctl enable-linger runner)" "1" "$(printf '%s' "$OUT" | grep -c 'enable-linger')"
+  newenv; ctl install; : > "$NODE/gov.ceiling.notready"; ctl on
+  check "on: o governo do nó diz que o teto NÃO está pronto → rc 3, a chave NÃO é posta, e a mensagem traz o motivo e o remédio (linger)" "3 0 1 1" "$RC $(on_flag) $(printf '%s' "$OUT" | grep -c 'gerenciador de usuario') $(printf '%s' "$OUT" | grep -c 'enable-linger')"
+  newenv; ctl install; : > "$NODE/gov.ceiling.absent"; ctl on
+  check "on: governo antigo no nó (o status não conhece teto) → rc 3, a chave NÃO é posta e manda rodar o install" "3 0 1" "$RC $(on_flag) $(printf '%s' "$OUT" | grep -c 'install')"
+  newenv; ctl install; : > "$NODE/gov.fail.status"; ctl on
+  check "on: o status do governo FALHOU → não sei se há teto: rc 3 e a chave NÃO é posta (nunca 'pronto' por falta de leitura)" "3 0" "$RC $(on_flag)"
+  newenv; ctl install; printf '#!/usr/bin/env python3\nprint("lixo{")\n' > "$NODE/gt-remote/bin/hetzner-ballast.py"; ctl on
+  check "on: o status responde algo que não é JSON → rc 3 e a chave NÃO é posta" "3 0" "$RC $(on_flag)"
+  newenv; ctl install; touch "$T/ssh.fail"; ctl on
+  check "on: ssh fora → rc 98 e a chave NÃO é posta" "98 0" "$RC $(on_flag)"
+  newenv; ctl install; ctl on
+  check "on: teto pronto → rc 0, chave posta e a mensagem não fala de teto recusado" "0 1 0" "$RC $(on_flag) $(printf '%s' "$OUT" | grep -c 'NÃO está pronto')"
+  newenv; ctl install; ctl status
+  check "status: teto pronto → a linha 'teto: pronto' com o modo e os limites, rc 0" "0 1 1" "$RC $(printf '%s' "$OUT" | grep -c 'teto: pronto') $(printf '%s' "$OUT" | grep -c '4096')"
+  newenv; ctl install; : > "$NODE/gov.ceiling.notready"; ctl status
+  check "status: teto NÃO pronto → 'teto: NÃO PRONTO' com o motivo (estado, não leitura que falhou: rc 0)" "0 1 1" "$RC $(printf '%s' "$OUT" | grep -c 'teto: NÃO PRONTO') $(printf '%s' "$OUT" | grep -c 'gerenciador de usuario')"
+  newenv; ctl install; : > "$NODE/gov.ceiling.absent"; ctl status
+  check "status: governo antigo sem teto → diz que o governo instalado NÃO tem teto (rode install), nunca 'teto: pronto'" "1 0" "$(printf '%s' "$OUT" | grep -c 'NÃO tem teto') $(printf '%s' "$OUT" | grep -c 'teto: pronto')"
+  newenv; ctl install; mkdir -p "$NODE/gt-remote/ballast"
+  printf '{"ts":"z","item":"hq-selftests","run":"hq-selftests-3","rc":0,"why":"teto-processos","summary":null,"summary_why":"ausente","ceiling":{"tasks_peak":4096,"tasks_hit":12,"mem_peak_mb":50,"oom_kill":null,"segredo":"nao-pode"}}\n' > "$NODE/gt-remote/ballast/results.jsonl"; ctl pull; OUTF="$R/.gc/hetzner-ballast/results.jsonl"
+  check "pull: os picos do teto (ceiling) vêm na linha do resultado — tasks_hit 12, oom_kill null (não sei) — e só os quatro campos conhecidos (a chave estranha 'segredo' não passa)" "12 null 0" "$("$PY" -I -c 'import json,sys; c=json.loads(open(sys.argv[1]).readline())["ceiling"]; print(c["tasks_hit"], json.dumps(c["oom_kill"]))' "$OUTF" 2>/dev/null) $(grep -c 'nao-pode' "$OUTF")"
 }
 
 if [ -n "${HBC_MUTANT:-}" ]; then g_install; g_ctl; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi

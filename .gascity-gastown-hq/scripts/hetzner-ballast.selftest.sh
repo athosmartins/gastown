@@ -28,7 +28,7 @@
 #     cgroup do item e o mata (teto-processos / teto-memoria; contador ilegível ≠ zero estouros) · o caminho do cgroup só vale se for o escopo DESTA rodada na ballast.slice · fim de rodada e stop mandam
 #     cgroup.kill (pega quem fez setsid) · os picos do item entram em results.jsonl. g_cgrp só roda onde há systemd --user (senão `skip`, que NÃO conta como passou): fork em laço e alocador, ambos LIMITADOS por construção.
 # CONTROLE NEGATIVO: cada mutante (um trecho do script trocado) TEM que reprovar a bateria. Mutante com descrição `[teto]` roda só os grupos do teto.
-# VARIÁVEIS: HB_UNDER_TEST (script a testar) · HB_PY (interpretador; padrão /usr/bin/python3) · HB_NO_MUTANTS=1 · HB_ONLY=<grupo> (reg tick run ram reap fill off state logs launch send ceil cgrp; sem mutantes)
+# VARIÁVEIS: HB_UNDER_TEST (script a testar) · HB_PY (interpretador; padrão /usr/bin/python3) · HB_NO_MUTANTS=1 · HB_MUTANTS_ONLY=teto (só os mutantes do teto) · HB_ONLY=<grupo> (reg tick run ram reap fill off state logs launch send ceil cgrp; sem mutantes)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 P="${HB_UNDER_TEST:-$HERE/hetzner-ballast.py}"
@@ -765,6 +765,21 @@ time.sleep(60)' 1024
   check "cgrp: ...e o cgroup do item sumiu (nenhum filho sobrou)" "gone" "$([ -d "$cg" ] && echo vivo || echo gone)"
   gone "$PID"; adv 50 0; bt
   check "cgrp: a rodada fecha como teto-processos" "teto-processos" "$(rj why)"
+  # (1b) o item que TERMINA sozinho grava o relatório de dentro do escopo (picos e fork recusado lidos do kernel): é o que o governo guarda no results.jsonl
+  cgrp_item fk2 'n = 0
+for _ in range(300):
+    try:
+        pid = os.fork()
+    except OSError:
+        continue
+    if pid == 0:
+        time.sleep(30)
+        os._exit(0)
+    n += 1
+open(RD + "/spawned", "w").write(str(n))' 1024
+  EXTRA_ENV="BALLAST_TASKS_MAX=40"; cgrp_start fk2; i=0; while [ "$i" -lt 50 ] && [ ! -s "$H/runs/$RUN/ceiling" ]; do sleep 0.2; i=$((i+1)); done
+  check "cgrp: o item que termina sozinho grava o relatório: pids_peak entre 10 e 40 e pids_hits > 0 (fork recusado), lidos do kernel" "1 1" "$(awk '$1=="pids_peak"{p=$2} $1=="pids_hits"{h=$2} END{print (p>=10 && p<=40 ? 1 : 0), (h>0 ? 1 : 0)}' "$H/runs/$RUN/ceiling" 2>/dev/null)"
+  check "cgrp: ...e o caminho do cgroup do item está no padrão ballast.slice/ballast-<rodada>.scope" "1" "$(grep -c "^/user.slice/.*/ballast.slice/ballast-$RUN.scope\$" "$H/runs/$RUN/cgroup" 2>/dev/null)"
   # (2) memória: alocador limitado a 400 MB (10 x 40); rss_mb 64 → MemoryMax=80M: o kernel o mata no 2º bloco
   cgrp_item hog 'chunks = []
 for i in range(10):
@@ -959,6 +974,45 @@ a rodada com órfão sai do orçamento só no tick seguinte (o run não é tirad
                 del run[r["run"]]@@                terminate(cfg, st, r, "orfaos", rec)
 a rodada limpa de órfãos fecha como orfaos e não pelo rc do item (ganharia o cooldown de falha)@@why = (None if orph else killed) or (@@why = killed or (
 a linha da rodada não diz que houve órfãos@@        row["orfaos"] = True@@        pass
+[teto] sem o barramento do usuário o item começa assim mesmo (o teto some quando não há gerenciador)@@    if not os.path.exists(bus):@@    if False:
+[teto] sem systemd-run no PATH o item começa assim mesmo@@    if shutil.which("systemd-run") is None:@@    if False:
+[teto] sem teto pronto o tick não bloqueia o começo de itens (a nota sem-teto não trava)@@"primeira-leitura", "lacuna", "sem-teto")@@"primeira-leitura", "lacuna")
+[teto] o systemd-run não leva TasksMax@@"-p", "TasksMax=%d" % cfg.tasks_max,@@
+[teto] o systemd-run não leva MemoryMax@@"-p", "MemoryMax=%dM" % mem_cap_mb(cfg, item),@@
+[teto] o systemd-run não leva MemorySwapMax=0@@"-p", "MemorySwapMax=0",@@
+[teto] OOMPolicy=kill mata o item inteiro e leva o rc e os picos junto@@"-p", "OOMPolicy=continue"@@"-p", "OOMPolicy=kill"
+[teto] o MemoryMax ignora o fator (rss_mb cru)@@    return int(math.ceil(item["rss_mb"] * cfg.mem_factor))@@    return int(item["rss_mb"])
+[teto] o escopo não é --collect (escopo morto por OOM fica como unidade failed)@@"--quiet", "--collect",@@"--quiet",
+[teto] a unidade não leva o nome da rodada@@"--unit=ballast-" + run@@"--unit=ballast"
+[teto] o item herda o barramento do usuário (pode pedir um escopo fora do teto)@@"-u", "DBUS_SESSION_BUS_ADDRESS"] + wrapper@@] + wrapper
+[teto] a meta.json não guarda o teto que valeu@@        meta["ceiling"] = {"tasks": cfg.tasks_max, "mem_mb": mem_cap_mb(cfg, item)}@@        pass
+[teto] fork recusado no cgroup do item não é lido (pids.events)@@    if pe is not None and pe.get("max", 0) > 0:@@    if False:
+[teto] zero forks recusados já conta como estouro@@    if pe is not None and pe.get("max", 0) > 0:@@    if pe is not None and pe.get("max", 0) >= 0:
+[teto] oom_kill no cgroup do item não é lido (memory.events)@@    if me is not None and me.get("oom_kill", 0) > 0:@@    if False:
+[teto] o max do memory.events (cache recuperado no limite) conta como estouro@@    if me is not None and me.get("oom_kill", 0) > 0:@@    if me is not None and me.get("max", 0) > 0:
+[teto] contador ilegível vira lista vazia e some a nota (ilegível ≠ zero estouros calado)@@    return out or None@@    return out
+[teto] o caminho do cgroup não é conferido (qualquer cgroup, até a sessão de login, recebe a leitura e o kill)@@    if not m or m.group(1) != run or any(s in (".", "..") for s in raw.split("/")):@@    if not raw:
+[teto] o nome da rodada no caminho não é conferido (escopo de outra rodada vale)@@    if not m or m.group(1) != run or any(@@    if not m or any(
+[teto] caminho com .. passa na conferência@@ or any(s in (".", "..") for s in raw.split("/")):@@:
+[teto] estouro de teto espera a graça do TERM em vez de KILL@@            elif breach:
+                kill_now(cfg, st, r, breach, rec)@@            elif breach:
+                terminate(cfg, st, r, breach, rec)
+[teto] o tick nunca lê o cgroup do item (meta.ceiling ignorada)@@(t is None and on and m.get("ceiling"))@@(t is None and on and False)
+[teto] kill_now não manda cgroup.kill@@    cgroup_kill(cfg, r["run"])   # quem fez setsid sai da sessão e o send() não o alcança; o cgroup alcança@@    pass
+[teto] o fim de rodada não manda kill ao que sobrou no cgroup@@    cgroup_kill(cfg, run)@@    pass
+[teto] relatório ilegível vira 0 (nunca null)@@        kv[k] = int(v) if v.isdigit() else None@@        kv[k] = int(v) if v.isdigit() else 0
+[teto] pico de memória do relatório fica em bytes@@mem // 1048576 if mem is not None else None@@mem if mem is not None else None
+[teto] o relatório com fork recusado não muda o motivo da rodada@@hit = ("teto-processos" if (rep or {}).get("tasks_hit") else@@hit = (None if (rep or {}).get("tasks_hit") else
+[teto] o relatório com oom_kill não muda o motivo da rodada@@else "teto-memoria" if (rep or {}).get("oom_kill") else None)@@else None if (rep or {}).get("oom_kill") else None)
+[teto] BALLAST_CEILING=off vale fora do selftest@@    if raw == "off" and test:@@    if raw == "off":
+[teto] BALLAST_TASKS_MAX aceita qualquer valor (sem o mínimo de 16)@@_num(env, "BALLAST_TASKS_MAX", 4096, int, 16)@@_num(env, "BALLAST_TASKS_MAX", 4096, int, 0)
+[teto] BALLAST_MEM_FACTOR aceita fator abaixo de 1 (teto menor que o rss_mb)@@_num(env, "BALLAST_MEM_FACTOR", 1.25, float, 1.0)@@_num(env, "BALLAST_MEM_FACTOR", 1.25, float, 0.0)
+[teto] o status não traz o bloco ceiling@@"ceiling": {"mode": cfg.ceiling, "ready": ceil_ok@@"ceilingX": {"mode": cfg.ceiling, "ready": ceil_ok
+[teto-linux] o item não escreve o cgroup dele (o governo não sabe onde ler)@@'[ -z "$BALLAST_CEILING_ON" ] || { { cut -d: -f3@@'[ -n "$BALLAST_CEILING_ON" ] || { { cut -d: -f3
+[teto-linux] o relatório do item perde o fork recusado@@sed -n "s/^max /pids_hits /p" $c/pids.events;@@
+[teto-linux] o relatório do item perde o oom_kill@@sed -n "s/^oom_kill /oom_kill /p" $c/memory.events;@@
+[teto-linux] o relatório do item perde o pico de memória@@echo "mem_peak $(cat $c/memory.peak)";@@
+[teto-linux] o stop não manda kill ao cgroup de cada rodada aberta (o escapee de setsid sobrevive)@@        cgroup_kill(cfg, rn)@@        pass
 MUT
   "$PY" -I - "$P" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import re, sys
@@ -985,7 +1039,9 @@ PYEOF
   while IFS="$(printf '\t')" read -r idx st desc; do
     if [ "$st" != OK ]; then ok 1 "mutante '$desc': a âncora não casa exatamente 1 vez (o script mudou?)"; continue; fi
     case "$desc" in "[linux]"*) [ -r /proc/self/oom_score_adj ] || { echo "skip mutante '$desc' (sem /proc/self/oom_score_adj neste host)"; continue; };; esac
-    grp=""; case "$desc" in "[teto]"*) grp=teto ;; esac
+    grp=""; case "$desc" in "[teto]"*|"[teto-linux]"*) grp=teto ;; esac
+    [ -z "${HB_MUTANTS_ONLY:-}" ] || [ "$grp" = "$HB_MUTANTS_ONLY" ] || continue
+    case "$desc" in "[teto-linux]"*) cgrp_ok || { echo "skip mutante '$desc' (sem systemd-run --user utilizável neste host)"; continue; };; esac
     while [ "$(jobs -r | wc -l | tr -d ' ')" -ge "$JOBS" ]; do sleep 0.3; done
     ( HB_MUTANT=1 HB_MUTANT_GROUPS="$grp" HB_UNDER_TEST="$T/mut$idx.py" bash "$0" 2>&1 | tail -1 > "$T/mres.$idx" ) &
   done < "$T/mutants.idx"
