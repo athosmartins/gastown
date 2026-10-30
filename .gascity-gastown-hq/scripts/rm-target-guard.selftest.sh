@@ -6,7 +6,7 @@
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec python3 -I - "${RMTG_UNDER_TEST:-$HERE/rm-target-guard.py}" "${1:-200}" <<'PYEOF'
-import importlib.util, json, os, random, re, shlex, shutil, subprocess, sys, tempfile
+import importlib.util, json, os, random, re, shlex, shutil, subprocess, sys, tempfile, time
 
 sys.dont_write_bytecode = True  # mutantes são reescritos em sequência: um .pyc velho (mesmo mtime e tamanho) faria o próximo rodar o código do anterior
 
@@ -146,6 +146,7 @@ P:s pushd @S/work/a >/dev/null; rm -f x ‖ P:s cd "$UNSET" && rm -f x ‖ P cd 
 B:s popd >/dev/null; rm -rf x ‖ P:s cd @S/work/a >/dev/null 2>&1 && rm -rf x ‖ B:p cd ../.. && cd lnkgit && rm -rf * ‖ B:p cd ../.. && cd lnkgit && rm -rf "$PWD" ‖ P:p cd .. && cd b && rm -rf *
 P:p cd .. && cd .. && rm -rf x ‖ P:p for i in 1 2; do :; done; cd .. && rm -rf x ‖ P:p cd .. && rm -rf x; for i in 1; do : ‖ B:p while true; do cd ../..; rm -rf x; done
 B:s FOO=1 cd @H/proj && rm -rf * ‖ B:s FOO=1 BAR=2 cd; rm -rf * ‖ B:s true || FOO=1 cd @H/proj && rm -rf * ‖ B:s FOO=1 pushd >/dev/null; rm -rf x ‖ P:s FOO=1 cd @S/work/a && rm -rf * ‖ P:s cd >/dev/null @S/work/a && rm -rf x ‖ P:s pushd >/dev/null @S/work/a && rm -rf x ‖ P:s cd 2>/dev/null @S/work/a && rm -rf x ‖ B:s cd >/dev/null; rm -rf x ‖ B:s pushd >/dev/null; rm -rf x
+B:s cd -LP @H/proj && rm -rf * ‖ B:s cd -PL @H/proj && rm -rf * ‖ B:s cd -Pe @H/proj && rm -rf * ‖ B:s cd -L -P @H/proj && rm -rf * ‖ B:s cd -P -- @H/proj && rm -rf * ‖ B:s pushd -n @H/proj >/dev/null; rm -rf * ‖ B:s pushd +1 >/dev/null; rm -rf * ‖ B:s cd -x @H/proj && rm -rf * ‖ P:s cd -LP @S/work/a && rm -rf * ‖ P:s cd -- -L && rm -rf * ‖ P:s cd -L -- -L && rm -rf * ‖ B:s cd -- - ; rm -rf x ‖ B:s cd -L -- - ; rm -rf x ‖ B:s cd -P -- - && rm -rf *
 """
 X = [("B", "C=\"rm -rf 'a @H/proj b'\"; $C"), ("B", "C='rm -rf \"a @H/proj b\"'; $C"), ("B", "C='rm -rf a # @H/proj'; $C"), ("B", "C='rm -rf a\\ @H/proj'; $C"), ("B", "C='rm -rf \"@H/proj\"'; eval \"$C\""), ("B", "C=\"rm -rf '@H/proj'\"; bash -c \"$C\""), ("B", "C='rm -Rf \"${HOME}/proj2\"'; eval \"$C\""), ("B", "echo `echo '`; rm -f @S/work/a; echo `echo '`"), ("P", "x=$((1 << 3 \n + 1))\nrm -f @S/work/a"), ("P", "x=$(( (1<<3)\n + 1 )); echo $x"), ("B", "x=$((rm -rf @H/proj) | wc)"), ("P", "for ((i=0;i<1<<3;i++)); do :; done\nrm -f @S/work/a"), ("B", "cat <<E\"O\"F\nx\nEOF\nrm -rf @H/proj"), ("B", "echo \"$(cat <<'EOF'\nit's\nEOF\n)\"; rm -rf @H/proj"), ("B", "git commit -m \"$(cat <<'EOF'\nfix: don't break\nEOF\n)\" && rm -rf @H/proj"), ("P", "git commit -m \"$(cat <<'EOF'\nfix: don't use rm -rf ~/gt-remote\nEOF\n)\""),
      ("B", "((x = 1 << 3))\nrm -rf @H/proj"), ("P", "((x = 1 << 3))\nrm -f @S/work/a"), ("B", "for ((i=0;i<1<<3;i++)); do :; done\nrm -rf @H/proj"), ("P", "echo $((1 << 3))\nrm -f @S/work/a"), ("P", "x=\"$(echo \"a\\\"b\")\"\nrm -f @S/work/a"),
@@ -248,8 +249,8 @@ check("tetos: curinga além de GLOB_MAX = alvo desconhecido, pasta além de LS_B
 check("opção do rm que vem de curinga: arquivo `-rf` na pasta faz `rm *` recursivo (e sem o arquivo passa)", not optglob(m), str(optglob(m)))
 
 # --- fuzzer contra o bash REAL: rm/unlink/rmdir/shred/find são FALSOS (primeiros no PATH), gravam verbo, cwd e argv exatamente como o shell os entregou ---
-LOG = f"{H}/log.bin"
-FAKE = "#!/bin/sh\n{ printf '%%s\\0' \"${0##*/}\" \"$PWD\" \"$@\"; printf '\\1\\n'; } >> %s\n" % LOG
+LD = os.path.realpath(tempfile.mkdtemp(prefix="rmtglg."))  # logs dos falsos, fora do HOME e do scratch (um arquivo a mais ali muda o que `*` expande)
+FAKE = "#!/bin/sh\n{ printf '%s\\0' \"${0##*/}\" \"$PWD\" \"$@\"; printf '\\1\\n'; } >> \"$RMTG_LOG\"\n"
 for n in ("rm", "unlink", "rmdir", "shred", "find"):
     open(f"{H}/bin/{n}", "w").write(FAKE); os.chmod(f"{H}/bin/{n}", 0o755)
 DENY = {".dolt", ".dolt-data", ".beads", ".git", ".gc-worktrees", "crew"}
@@ -281,14 +282,38 @@ def verdict(p, rec, sel):
 FZ = [CWD]  # cwd do pedido que o fuzzer está julgando: a raiz de um repo, ou uma pasta de scratch onde `$PWD` e o caminho relativo são inofensivos
 
 
-def touched(cmd):
-    open(LOG, "wb").close(); rc = 0
+def runfake(cmd, wait):
+    """(código de saída, registros dos falsos) do `cmd` no bash REAL. O log é UM POR CASO (RMTG_LOG) e o grupo de processos é esperado até esvaziar: um `&` dentro de um estágio de pipeline sobrevive ao `wait`
+    e, com um log só, gravaria o `rm` do caso anterior no log do seguinte (bypass fantasma medido no nó: o guard e o bash concordavam, o registro era de outro caso)."""
+    SEQ[0] += 1; lg = f"{LD}/{SEQ[0]}.bin"; open(lg, "wb").close(); rc = 0
+    pr = subprocess.Popen(["bash", "-c", cmd + "\nwait" * wait], cwd=FZ[0], env={"PATH": f"{H}/bin:/usr/bin:/bin", "HOME": H, "RMTG_LOG": lg}, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     try:
-        rc = subprocess.run(["bash", "-c", cmd], cwd=FZ[0], env={"PATH": f"{H}/bin:/usr/bin:/bin", "HOME": H}, capture_output=True, timeout=10).returncode
+        rc = pr.wait(timeout=10)
     except subprocess.TimeoutExpired:
         pass
+    for _ in range(100):  # até 2 s para o grupo esvaziar; o que sobrar é morto
+        try:
+            os.killpg(pr.pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.02)
+    try:
+        os.killpg(pr.pid, 9)
+    except ProcessLookupError:
+        pass
+    pr.wait()
+    # vazio → nenhum falso rodou (recs sem registro: nada tocou, o caso não é bypass); falhou/ilegível → a exceção derruba o selftest (falha alto, nunca vira "nada rodou")
+    recs = open(lg, "rb").read().split(b"\x01\n"); os.unlink(lg)
+    return rc, recs
+
+
+SEQ = [0]
+
+
+def touched(cmd):
+    rc, recs = runfake(cmd, False)  # sem `wait`: o código de saída é o do próprio comando (127/126/2 = nada rodou, o caso é descartado)
     hit = False
-    for rec in open(LOG, "rb").read().split(b"\x01\n"):
+    for rec in recs:
         if not rec:
             continue
         verb, cwd, *args = [x.decode("utf-8", "surrogateescape") for x in rec.split(b"\0")][:-1]
@@ -419,7 +444,7 @@ CDCWD = [f"{S}/work/a", f"{S}/work/a", f"{S}/work", f"{S}/work/b", f"{H}/proj/bu
 
 def cdcmd():
     t = rnd.choice(CDDIRS)
-    return rnd.choice([f"cd {t}", f"cd {t}", f"cd -P {t}", f"pushd {t} >/dev/null", f"pushd {t} >/dev/null 2>&1", "popd >/dev/null 2>&1", "cd", "pushd >/dev/null 2>&1", f"cd {t} 2>/dev/null", f"X=1 cd {t}", f"cd >/dev/null {t}", f"X=1 pushd {t} >/dev/null"])
+    return rnd.choice([f"cd {t}", f"cd {t}", f"cd -P {t}", f"cd -LP {t}", f"cd -L -- {t}", f"pushd {t} >/dev/null", f"pushd {t} >/dev/null 2>&1", "popd >/dev/null 2>&1", "cd", "pushd >/dev/null 2>&1", f"cd {t} 2>/dev/null", f"X=1 cd {t}", f"cd >/dev/null {t}", f"X=1 pushd {t} >/dev/null"])
 
 
 def rmcmd():
@@ -450,13 +475,9 @@ def prog(d=0):
 
 def pwdhit(cmd):
     """(algum rm RECURSIVO rodou numa pasta proibida, código de saída) no bash REAL."""
-    open(LOG, "wb").close(); rc = 0
-    try:
-        rc = subprocess.run(["bash", "-c", cmd + "\nwait"], cwd=FZ[0], env={"PATH": f"{H}/bin:/usr/bin:/bin", "HOME": H}, capture_output=True, timeout=10).returncode
-    except subprocess.TimeoutExpired:
-        pass
+    rc, recs = runfake(cmd, True)
     hit = False
-    for rec in open(LOG, "rb").read().split(b"\x01\n"):
+    for rec in recs:
         if not rec:
             continue
         verb, cwd, *args = [x.decode("utf-8", "surrogateescape") for x in rec.split(b"\0")][:-1]
@@ -508,7 +529,7 @@ MUT = [('~/shared/data real', 'rel[:2] == ["shared", "data"]', 'False'), ('~/sha
        ('tilde', 'return home() + s[1:] if s == "~" or s.startswith("~/")', 'return s if s == "~" or s.startswith("~/")'), ('glob', 'hits = sorted(itertools.islice(glob.iglob(p), GLOB_MAX + 1))', 'hits = []'), ('chave {a,b}', 'bs = [t] if UNK in t else [tilde(x) for x in braces(t)]', 'bs = [t]'),
        ('teto da chave', 'len(alts) <= 16', 'len(alts) <= 1600'), ('caixa', 'low = [unicodedata.normalize("NFC", x).casefold() for x in parts]', 'low = list(parts)'), ('HOME vence scratch', 'rel, relp = (low[k:], parts[k:]) if k is not None else (None, None)', 'rel, relp = None, None'),
        ('node_modules', 'any(c in ALLOW_COMP for c in parts)', 'False'), ('.cache', 'any(relp[:len(a)] == list(a) for a in ALLOW_HOME)', 'False'), ('pyc', '(f.endswith(".pyc") and not os.path.isdir(f))', 'False'), ('rimraf', 'or verb == "rimraf"', 'or False'),
-       ('popd', 'if os.path.basename(ws[0]) == "popd" or', 'if False or'), ('cd -', 'or args[:1] == ["-"] or', 'or False or'), ('lançador opaco', 'if verb in OPAQUE:', 'if False:'), ('source e .', 'verb in ("eval", "source", ".")', 'verb == "eval"'), ('shells ampliados', '"ash", "csh", "tcsh", "fish", "mksh"', '"ash", "mksh"'), ('interpretadores: pypy', 'pypy[\\d.]*|', ''), ('interpretadores: R, julia, osascript', '|tclsh|wish|Rscript|julia|osascript|jshell|groovy', ''), ('rm( como API de remoção', '(?:unlink|rmdir|rm)(?=', '(?:unlink|rmdir)(?='), ('-c genérico para corredor desconhecido', 'if a in ("-c", "--command") and x + 1 < len(args)', 'if False and x + 1 < len(args)'),
+       ('popd', 'if os.path.basename(ws[0]) == "popd" or', 'if False or'), ('cd -', 'or args[:1] == ["-"] or', 'or False or'), ('opção do cd colada (-LP)', 'r"-[LPe@]+"', 'r"-[LPe@]"'), ('-- fecha as opções do cd', 'dd = args[:1] == ["--"]', 'dd = False'), ('opção do cd/pushd que não conheço = não sei', 'or (not dd and args[:1] and args[0][:1] in ("-", "+"))', 'or False'), ('lançador opaco', 'if verb in OPAQUE:', 'if False:'), ('source e .', 'verb in ("eval", "source", ".")', 'verb == "eval"'), ('shells ampliados', '"ash", "csh", "tcsh", "fish", "mksh"', '"ash", "mksh"'), ('interpretadores: pypy', 'pypy[\\d.]*|', ''), ('interpretadores: R, julia, osascript', '|tclsh|wish|Rscript|julia|osascript|jshell|groovy', ''), ('rm( como API de remoção', '(?:unlink|rmdir|rm)(?=', '(?:unlink|rmdir)(?='), ('-c genérico para corredor desconhecido', 'if a in ("-c", "--command") and x + 1 < len(args)', 'if False and x + 1 < len(args)'),
        ('for depois do peel', 'if len(ws) > 3 and ws[0] in ("for", "select") and ws[2] == "in":', 'if False:'), ('select como for', 'ws[0] in ("for", "select") and ws[2] == "in"', 'ws[0] == "for" and ws[2] == "in"'),
        ('verbo por variável: valor que sei', 'known = [x for x in v if UNK not in x and x != ws[0]]', 'known = []'), ('verbo por variável: outro valor é "não sei"', 'known = [x for x in v if UNK not in x and x != ws[0]]', 'known = [x for x in v if len(v) == 1 and UNK not in x and x != ws[0]]'),
        ('rig: ancestrais só recursivos no ~/gt/<rig>', 'or (rec and (len(rel) == 2 or (len(rel) == 3 and rel[2] == "shared")))', 'or False'), ('rig: ~/gt/<rig>', '(len(rel) == 2 or (len(rel) == 3 and rel[2] == "shared"))', '(len(rel) == 3 and rel[2] == "shared")'),
@@ -603,7 +624,7 @@ for name, old, new in MUT:
         pass
 check(f"mutantes: {len(MUT)} guardas apagadas, todas reprovam a tabela", not alive, "; ".join(alive))
 os.chmod(f"{H}/work2/locked", 0o755); os.chmod(f"{H}/work2/xonly", 0o755); os.chmod(f"{H}/work2/rdonly", 0o755)
-shutil.rmtree(H, ignore_errors=True); shutil.rmtree(S, ignore_errors=True)
+shutil.rmtree(H, ignore_errors=True); shutil.rmtree(S, ignore_errors=True); shutil.rmtree(LD, ignore_errors=True)
 print(f"{sum(results)}/{len(results)} blocos ok")
 sys.exit(0 if all(results) else 1)
 PYEOF
