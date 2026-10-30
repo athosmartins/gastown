@@ -7,9 +7,9 @@
 # SUBCOMANDOS
 #   install [--allow-dirty]  sobe o governo, os itens e o registro (sha256 conferido ANTES de trocar qualquer arquivo) e põe UMA linha marcada na crontab do `runner` (a cada minuto). NÃO liga o lastro.
 #   uninstall                tira a linha marcada da crontab e para o que roda (stop). Os arquivos e os resultados ficam no nó.
-#   on | off                 cria / apaga a chave `on` no nó (off também para o que roda). Sem `on` o governo só mede e não começa nada.
+#   on | off                 cria / apaga a chave `on` no nó (off também para o que roda). Sem `on` o governo só mede e não começa nada. `on` RECUSA (rc 3) se o governo do nó não confirma o teto de sistema pronto (ga-kgnjkt8).
 #   burn on | off            liga / desliga o item `queima` (CPU pura quando não há trabalho útil; nasce DESLIGADO).
-#   status                   o que roda, a chave, a crontab e a idade do último tick (PARADO = cron instalado e último tick com mais de 5 min, ou nenhum tick 5 min depois do install).
+#   status                   o que roda, a chave, a crontab, a linha `teto:` (pronto / NÃO PRONTO / governo antigo sem teto) e a idade do último tick (PARADO = cron instalado e último tick com mais de 5 min, ou nenhum tick 5 min depois do install).
 #   pull                     traz results.jsonl do nó para <cidade>/.gc/hetzner-ballast/results.jsonl: só a lista branca de campos, valores curtos, sem duplicar a rodada.
 # CÓDIGOS DE SAÍDA: 0 ok · 2 uso · 3 recusado ou NÃO consegui (árvore suja, arquivo que chegou diferente, git ilegível, crontab ilegível, stop que não parou, results.jsonl ilegível, status com leitura que falhou)
 #   · 98 ssh fora (não conectou, ou caiu antes de eu ler o resultado de um stop ou da crontab: o que não deu para ler não vale como feito) · 99 nó desligado (falta .gc/hetzner-node.on)

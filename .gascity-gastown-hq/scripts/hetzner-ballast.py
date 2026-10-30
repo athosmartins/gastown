@@ -2,7 +2,7 @@
 """hetzner-ballast.py — o lastro do nó Hetzner: trabalho útil de baixa prioridade que ocupa a CPU que sobra e cede na hora. (ga-2hd02v.5) Python 3.9+, só biblioteca padrão.
 
 Contents
-  Para que serve · Roda ONDE · O contrato do nice · Um tick · Itens · Três estados · Arquivos · Uso
+  Para que serve · Roda ONDE · O contrato do nice · Teto de sistema por item · Um tick · Itens · Três estados · Arquivos · Uso
 
 PARA QUE SERVE
   Athos (20/10): "se está 100% ocupado a gente fica feliz; o que não pode é ficar menos". Mesmo com toda bead elegível indo ao nó, a fila tem buracos (madrugada de 20/10: 7 h em 0-15% de CPU).
@@ -13,8 +13,13 @@ O CONTRATO DO NICE
   Todo item roda em nice 19 + SCHED_IDLE (chrt -i 0) + ionice classe 3: o escalonador entrega a CPU a qualquer sessão (nice 0) na hora, sem esperar este governo. O /proc/stat conta esse tempo
   na coluna `nice`, e é por isso que ele NÃO é carga: carga = user+system+irq+softirq+steal (nice <= 0). O hetzner-capacity.py lê a mesma coluna (CPU em nice > 0 é folga da cidade) — sem isso o
   lastro faria o nó parecer "quente" e a cidade deixaria de mandar bead para ele.
+TETO DE SISTEMA POR ITEM  (ga-kgnjkt8; runbook: "Teto de sistema por item")
+  O nice 19 protege a CPU, não a tabela de processos nem a RAM, e o governo só olha a RAM uma vez por minuto e só enxerga a SESSÃO do item. Por isso cada item entra num escopo systemd do usuário
+  (ballast.slice/ballast-<rodada>.scope) com TasksMax e MemoryMax (rss_mb x fator). O tick lê pids.events (fork recusado) e memory.events (oom_kill) do cgroup do item e o mata de imediato
+  (teto-processos / teto-memoria); o fim de rodada e o stop mandam cgroup.kill, que pega também quem fez setsid. Contador ilegível ou caminho que não é o escopo DESTA rodada nunca vira 'zero estouros'
+  nem alcança outro cgroup. Sem o gerenciador de usuário do systemd (sem sessão aberta e sem linger) o item NÃO começa: nota sem-teto no tick, motivo no stderr.
 UM TICK  (exit 0 sempre que "não consegui ler" — vira nota no registro; 3 só se não dá para gravar)
-  1 lê o registro, /proc/stat, /proc/meminfo e a tabela de processos  2 dá fim aos itens que acabaram (results.jsonl); sobrevivente na sessão de um item que já gravou o rc (órfão) leva TERM depois
+  1 lê o registro, /proc/stat, /proc/meminfo e a tabela de processos  2 dá fim aos itens que acabaram (results.jsonl); item que bateu no teto de sistema leva KILL; sobrevivente na sessão de um item que já gravou o rc (órfão) leva TERM depois
   de BALLAST_ORPHAN_GRACE_S (180 s) e a rodada fecha pelo rc do item, com `orfaos` na linha  3 sem a chave `on`: mata o que roda e sai  4 RAM: pausa (SIGSTOP),
   retoma (SIGCONT) ou mata o maior  5 CPU livre = núcleos - carga(nice<=0); a conta de leituras livres seguidas anda ou zera  6 começa itens enquanto couberem no orçamento
   (núcleos livres - reserva): `work` primeiro; `filler` só com o que sobrar e é morto quando um `work` vai começar.
@@ -28,10 +33,10 @@ TRÊS ESTADOS
   state.json corrompido ou de forma errada vai para <arquivo>.corrupt-<época> e recomeça; ilegível por permissão = rc 3 (inerte). A escrita da pasta é conferida ANTES de qualquer efeito.
   O que o tick não leu fica null no registro (running, registry_errors, mode), nunca [].
 ARQUIVOS  (em $BALLAST_HOME, padrão ~/gt-remote/ballast)
-  items.tsv · items/ · on (a chave: presente = ligado) · state.json · lock · ticks.jsonl · results.jsonl · runs/<rodada>/{meta.json,log,rc,final}
+  items.tsv · items/ · on (a chave: presente = ligado) · state.json · lock · ticks.jsonl · results.jsonl · runs/<rodada>/{meta.json,log,rc,final,cgroup,ceiling}
 STOP  rc 0 = a sessão de cada item esvaziou (TERM+CONT, KILL 3 s depois no que sobrar) · 3 = não li os processos, nada foi morto · 5 = sobrou processo vivo (`survivors`) ou a tabela ficou
   ilegível depois do TERM (`unverified`): NÃO diz que parou · outro = o stop não rodou.
-USO  hetzner-ballast.py tick | status [--json] | stop      env: BALLAST_HOME BALLAST_PROC BALLAST_NOW BALLAST_ITEMS BALLAST_ITEMS_DIR BALLAST_LAUNCH_PREFIX (JSON, com `nice`; BALLAST_TEST=1 só no selftest) e os limites BALLAST_* de load_config
+USO  hetzner-ballast.py tick | status [--json] | stop      env: BALLAST_HOME BALLAST_PROC BALLAST_NOW BALLAST_ITEMS BALLAST_ITEMS_DIR BALLAST_LAUNCH_PREFIX (JSON, com `nice`; BALLAST_TEST=1 só no selftest) BALLAST_CEILING (systemd; off só no selftest) BALLAST_TASKS_MAX BALLAST_MEM_FACTOR BALLAST_RUNTIME_DIR BALLAST_CGROUP_ROOT e os limites BALLAST_* de load_config
 """
 import fcntl
 import json

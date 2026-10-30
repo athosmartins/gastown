@@ -43,7 +43,7 @@ killtree() {
   done
   return 0
 }
-cleanup() { killtree "$T/"; pkill -f "$T/" 2>/dev/null; sleep 0.2; chmod -R u+rwX "$T" 2>/dev/null; find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null; }
+cleanup() { killtree "$T/"; pkill -f "$T/" 2>/dev/null; command -v systemctl > /dev/null 2>&1 && systemctl --user stop "ballast-s$$-*" > /dev/null 2>&1; sleep 0.2; chmod -R u+rwX "$T" 2>/dev/null; find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null; }
 trap cleanup EXIT
 trap 'exit 143' TERM INT HUP   # sem isto um TERM/INT (TaskStop, ctrl-c) pula o EXIT e deixa os itens órfãos
 fails=0; n=0
@@ -57,7 +57,7 @@ check() {  # check "DESCRIÇÃO" ESPERADO REAL
 W="$T/w"; mkdir -p "$W/bin"
 printf '#!/bin/sh\n# timeout de brinquedo (o do macOS não existe): descarta "-k K DUR" e roda\nshift 3; exec "$@"\n' > "$W/bin/timeout"; chmod +x "$W/bin/timeout"
 NCPU=16
-N=0; H=""; FP=""; NOW=0; U=0; NI=0; ID=0; EXTRA_ENV=""; LP='[]'; PID=""; RUN=""; CEIL=""; SD=""; CGD=""
+N=0; H=""; FP=""; NOW=0; U=0; NI=0; ID=0; EXTRA_ENV=""; LP='[]'; PID=""; RUN=""; CEIL=""; SD=""; CGD=""; CGN=""
 
 # ── fixtures ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 writestat() {  # /proc/stat: a linha agregada + uma por núcleo (o governo conta os cpuN)
@@ -667,8 +667,8 @@ g_ceil() {
   check "teto: BALLAST_TASKS_MAX e BALLAST_MEM_FACTOR mudam o teto (TasksMax=77, MemoryMax=2048M)" "1 1" "$(callhas TasksMax=77) $(callhas MemoryMax=2048M)"
   newhome; fakesd; EXTRA_ENV="$EXTRA_ENV BALLAST_TASKS_MAX=3"; bt status --json; r1=$RC; EXTRA_ENV="$EXTRA_ENV BALLAST_TASKS_MAX=4096 BALLAST_MEM_FACTOR=0.5"; bt status --json
   check "teto: BALLAST_TASKS_MAX abaixo de 16 ou BALLAST_MEM_FACTOR abaixo de 1 → configuração inválida (rc 3), nunca um teto que mata o item de cara" "3 3" "$r1 $RC"
-  newhome; CEIL=off; EXTRA_ENV="BALLAST_TEST=0"; bt status --json
-  check "teto: fora do selftest BALLAST_CEILING=off é recusado (rc 3): o lastro nunca roda sem teto por engano" "3" "$RC"
+  newhome; CEIL=off; LP='["nice","-n","19"]'; EXTRA_ENV="BALLAST_TEST=0"; bt status --json; r1=$RC; CEIL=systemd; bt status --json
+  check "teto: fora do selftest BALLAST_CEILING=off é recusado (rc 3) e o mesmo ambiente com o teto de verdade vale (rc 0): o lastro nunca roda sem teto por engano" "3 0" "$r1 $RC"
 
   # pronto ou não: sem gerenciador de usuário o item NÃO começa (o teto é condição, não enfeite)
   newhome; fakesd; rm -f "$T/rt/bus"; seed; good 50; good 50; good 50
@@ -734,11 +734,11 @@ g_ceil() {
 cgrp_ok() {
   [ "$(uname -s)" = Linux ] && command -v systemd-run > /dev/null 2>&1 && [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -S "$XDG_RUNTIME_DIR/bus" ] && systemd-run --user --scope --quiet --collect -p TasksMax=16 true > /dev/null 2>&1
 }
-cgrp_item() {  # cgrp_item NOME 'corpo python' RSS_MB — newhome com UM item real (script python em $H/items/NOME.py) sob o systemd-run REAL; o item começa no 3º tick livre. PID e RUN
-  newhome; CEIL=systemd; : > "$H/items.tsv"
-  printf '#!%s\nimport os, time\nRD = os.environ["BALLAST_RUN_DIR"]\n%s\n' "$PY" "$2" > "$H/items/$1.py"; chmod +x "$H/items/$1.py"; reg "$1|work|4|$3|3600|300|-|$1.py"
+cgrp_item() {  # cgrp_item NOME 'corpo python' RSS_MB — newhome com UM item real (script python em $H/items/s<pid>-NOME.py) sob o systemd-run REAL. O nome leva o pid do selftest: a unidade do systemd é ballast-<item>-<época do relógio de mentira>, e sem isso uma rodada que morreu no meio (ou o mutante em paralelo) deixa um escopo de mesmo nome vivo e o próximo systemd-run recusa
+  newhome; CEIL=systemd; CGN="s$$-$1"; : > "$H/items.tsv"
+  printf '#!%s\nimport os, time\nRD = os.environ["BALLAST_RUN_DIR"]\n%s\n' "$PY" "$2" > "$H/items/$CGN.py"; chmod +x "$H/items/$CGN.py"; reg "$CGN|work|4|$3|3600|300|-|$CGN.py"
 }
-cgrp_start() { seed; good 50; good 50; good 50; PID=$(started_pid); RUN=$(started_run); alive "$PID" "$1" "$RUN"; }
+cgrp_start() { seed; good 50; good 50; good 50; PID=$(started_pid); RUN=$(started_run); alive "$PID" "$CGN" "$RUN"; }
 g_cgrp() {
   local sp mb canary cg i EP
   if ! cgrp_ok; then echo "skip cgrp: sem systemd-run --user utilizável aqui (precisa de Linux com gerenciador de usuário): os casos do kernel de verdade NÃO rodaram"; return 0; fi
@@ -778,7 +778,7 @@ for _ in range(300):
     n += 1
 open(RD + "/spawned", "w").write(str(n))' 1024
   EXTRA_ENV="BALLAST_TASKS_MAX=40"; cgrp_start fk2; i=0; while [ "$i" -lt 50 ] && [ ! -s "$H/runs/$RUN/ceiling" ]; do sleep 0.2; i=$((i+1)); done
-  check "cgrp: o item que termina sozinho grava o relatório: pids_peak entre 10 e 40 e pids_hits > 0 (fork recusado), lidos do kernel" "1 1" "$(awk '$1=="pids_peak"{p=$2} $1=="pids_hits"{h=$2} END{print (p>=10 && p<=40 ? 1 : 0), (h>0 ? 1 : 0)}' "$H/runs/$RUN/ceiling" 2>/dev/null)"
+  check "cgrp: o item que termina sozinho grava o relatório: pids_peak entre 10 e 40, pids_hits > 0 (fork recusado) e mem_peak > 0, lidos do kernel" "1 1 1" "$(awk '$1=="pids_peak"{p=$2} $1=="pids_hits"{h=$2} $1=="mem_peak"{m=$2} END{print (p>=10 && p<=40 ? 1 : 0), (h>0 ? 1 : 0), (m>0 ? 1 : 0)}' "$H/runs/$RUN/ceiling" 2>/dev/null)"
   check "cgrp: ...e o caminho do cgroup do item está no padrão ballast.slice/ballast-<rodada>.scope" "1" "$(grep -c "^/user.slice/.*/ballast.slice/ballast-$RUN.scope\$" "$H/runs/$RUN/cgroup" 2>/dev/null)"
   # (2) memória: alocador limitado a 400 MB (10 x 40); rss_mb 64 → MemoryMax=80M: o kernel o mata no 2º bloco
   cgrp_item hog 'chunks = []
@@ -796,11 +796,11 @@ time.sleep(60)' 64
   cgrp_item es 'import subprocess
 subprocess.Popen(["setsid", "sh", "-c", "echo $$ > \"$1\"; exec sleep 301", "_", RD + "/esc.pid"])
 time.sleep(60)' 1024
-  cgrp_start es; waitfile "$H/runs/$RUN/esc.pid"; sleep 0.3; EP=$(cat "$H/runs/$RUN/esc.pid" 2>/dev/null || echo 0)
-  check "cgrp: o escapee (setsid) está vivo e fora da sessão do item" "1" "$(plive "$EP" && [ "$(ps -o sid= -p "$EP" | tr -d ' ')" != "$PID" ] && echo 1 || echo 0)"
+  cgrp_start es; waitfile "$H/runs/$RUN/esc.pid"; sleep 0.3; EP=$(cat "$H/runs/$RUN/esc.pid" 2>/dev/null); case "$EP" in ''|*[!0-9]*|0|1) EP="" ;; esac   # pid inválido nunca vira kill: `kill -9 0` mata o GRUPO inteiro (o selftest junto)
+  check "cgrp: o escapee (setsid) está vivo e fora da sessão do item" "1" "$([ -n "$EP" ] && plive "$EP" && [ "$(ps -o sid= -p "$EP" | tr -d ' ')" != "$PID" ] && echo 1 || echo 0)"
   bt stop
-  pdead "$EP"; check "cgrp: o stop mata também quem fez setsid (o cgroup.kill pega; a sessão não o enxerga)" "0" "$?"
-  kill -9 "$EP" 2>/dev/null
+  if [ -n "$EP" ]; then pdead "$EP"; check "cgrp: o stop mata também quem fez setsid (o cgroup.kill pega; a sessão não o enxerga)" "0" "$?"; kill -9 "$EP" 2>/dev/null
+  else ok 1 "cgrp: o escapee nem nasceu (esc.pid ausente ou inválido): o item es não começou?"; fi
 }
 
 if [ -n "${HB_MUTANT:-}" ]; then
@@ -843,7 +843,7 @@ RAM crítica não mata na hora@@        if biggest:
             kill_now(cfg, st, biggest, "ram-critica", rec)
 RAM crítica manda TERM (um grupo parado não trata)@@kill_now(cfg, st, biggest, "ram-pausa", rec)@@terminate(cfg, st, biggest, "ram-pausa", rec)
 teto de RSS do item ignorado@@elif _int(cap) and r["rss_kb"] > cap * 1024:@@elif False:
-sem rc vira ok@@why = (None if orph else killed) or ("ok" if rc == 0 else@@why = (None if orph else killed) or ("ok" if rc in (0, None) else
+sem rc vira ok@@why = (None if orph else killed) or hit or ("ok" if rc == 0 else@@why = (None if orph else killed) or hit or ("ok" if rc in (0, None) else
 resumo que não é objeto vira dado@@    return (v, "") if isinstance(v, dict) else (None, "ilegivel")@@    return (v, "")
 vale a primeira linha de resumo, não a última@@        v = json.loads(lines[-1][len("BALLAST-SUMMARY: "):])@@        v = json.loads(lines[0][len("BALLAST-SUMMARY: "):])
 meta.json sumida vira cooldown 0 (errar para menos recomeça em cima)@@    cool = meta.get("cooldown_s") if meta else None
@@ -972,7 +972,7 @@ sem rc o item é dado por terminado (qualquer rodada velha perde os órfãos… 
     return _int(start)
 a rodada com órfão sai do orçamento só no tick seguinte (o run não é tirado da lista)@@                terminate(cfg, st, r, "orfaos", rec)
                 del run[r["run"]]@@                terminate(cfg, st, r, "orfaos", rec)
-a rodada limpa de órfãos fecha como orfaos e não pelo rc do item (ganharia o cooldown de falha)@@why = (None if orph else killed) or (@@why = killed or (
+a rodada limpa de órfãos fecha como orfaos e não pelo rc do item (ganharia o cooldown de falha)@@why = (None if orph else killed) or hit or (@@why = killed or hit or (
 a linha da rodada não diz que houve órfãos@@        row["orfaos"] = True@@        pass
 [teto] sem o barramento do usuário o item começa assim mesmo (o teto some quando não há gerenciador)@@    if not os.path.exists(bus):@@    if False:
 [teto] sem systemd-run no PATH o item começa assim mesmo@@    if shutil.which("systemd-run") is None:@@    if False:
