@@ -595,6 +595,30 @@ reset; chk wa-m1 11; echo '{"verdict":"unknown","basis":"","reasons":"texto"}' >
 T_EXEMPT=shadow pass "$S3" >/dev/null
 [ "$(probe_of wa-m1 | jq -c '[.reasons,.classes]' 2>/dev/null)" = '[null,null]' ] && [ "$(sumr | jq -r '.["unknown:ilegivel"] // "-"' 2>/dev/null)" = 1 ] \
   && ok "reasons que não é lista: null e 'unknown:ilegivel'" || bad "reasons que não é lista: linha='$(probe_of wa-m1)' resumo='$(sumr)'"
+# ga-2hd02v.3.17 (gate 1): "a leitura FALHOU" é um estado próprio da linha da sonda. O classificador respondeu (veredito e motivos), mas o `info` dele diz o que não conseguiu ler (`caminho-solto-ilegivel:…`,
+# `espelho-ilegivel:…`, `teste-derivado-ilegivel:…`) e o veredito pode estar pior do que o certo. `leitura`: lista com as entradas *-ilegivel (até 6 de 80 caracteres) = a leitura falhou; [] = leu tudo;
+# null = o `info` não foi lido (sem saída, saída ilegível, sem `info`, `info` que não é lista). Os três nunca se confundem, e o contrato de palavras do resumo (veredito:classe) não muda.
+reset; chk wa-m1 10; echo '{"verdict":"mini","basis":"","reasons":["caminho-fora-do-filtro:loose.html"],"paths":["loose.html"],"info":["tela-ao-vivo","caminho-solto-ilegivel:repo-git-rc-128","espelho-ilegivel:espelho-ausente"]}' > "$WORK/chk.wa-m1.raw"
+T_EXEMPT=shadow pass "$S3" >/dev/null
+[ "$(probe_of wa-m1 | jq -c '[.verdict,.classes,.leitura]' 2>/dev/null)" = '["mini",["caminho-fora-do-filtro"],["caminho-solto-ilegivel:repo-git-rc-128","espelho-ilegivel:espelho-ausente"]]' ] && [ "$(sumr | jq -r '.["mini:caminho-fora-do-filtro"] // "-"' 2>/dev/null)" = 1 ] && [ "$(sumr | jq -r '[keys[] | select(test("ilegivel"))] | length' 2>/dev/null)" = 0 ] \
+  && ok "leitura: a linha da sonda guarda só as entradas *-ilegivel do info ('tela-ao-vivo' fica de fora) e o resumo continua com as palavras veredito:classe" || bad "leitura que falhou: linha='$(probe_of wa-m1)' resumo='$(sumr)'"
+reset; chk wa-m1 10; echo '{"verdict":"mini","basis":"","reasons":["moles:x"],"paths":[],"info":[]}' > "$WORK/chk.wa-m1.raw"
+T_EXEMPT=shadow pass "$S3" >/dev/null
+[ "$(probe_of wa-m1 | jq -c '.leitura' 2>/dev/null)" = '[]' ] && ok "leitura: info [] (o classificador leu tudo) fica [] — não é null nem falha" || bad "info []: '$(probe_of wa-m1)'"
+reset; chk wa-m1 10; echo '{"verdict":"mini","basis":"","reasons":["moles:x"],"paths":[]}' > "$WORK/chk.wa-m1.raw"
+T_EXEMPT=shadow pass "$S3" >/dev/null
+[ "$(probe_of wa-m1 | jq -c '[.leitura, .classes]' 2>/dev/null)" = '[null,["moles"]]' ] && ok "leitura: sem info na saída é null (não li o info), sem tocar nas classes" || bad "sem info: '$(probe_of wa-m1)'"
+reset; chk wa-m1 11; echo '{"verdict":"unknown","basis":"","reasons":["moles:x"],"paths":[],"info":"caminho-solto-ilegivel:x"}' > "$WORK/chk.wa-m1.raw"
+T_EXEMPT=shadow pass "$S3" >/dev/null
+[ "$(probe_of wa-m1 | jq -c '.leitura' 2>/dev/null)" = 'null' ] && ok "leitura: info que não é lista é null (texto não vira falha nem leitura limpa)" || bad "info texto: '$(probe_of wa-m1)'"
+reset; chk wa-m1 124; chk wa-n1 2
+T_EXEMPT=shadow pass "$S3" >/dev/null
+[ "$(probe_of wa-m1 | jq -c '.leitura' 2>/dev/null)" = 'null' ] && [ "$(probe_of wa-n1 | jq -c '.leitura' 2>/dev/null)" = 'null' ] && ok "leitura: sem saída do classificador (timeout, error) é null" || bad "sem saída: m1='$(probe_of wa-m1)' n1='$(probe_of wa-n1)'"
+long=$(printf 'y%.0s' $(seq 1 100))
+reset; chk wa-m1 10; jq -cn --arg long "$long" '{verdict:"mini",basis:"",reasons:["moles:x"],paths:[],info:([range(0;8) | "teste-derivado-ilegivel:\(.)" + $long])}' > "$WORK/chk.wa-m1.raw"
+T_EXEMPT=shadow pass "$S3" >/dev/null
+[ "$(probe_of wa-m1 | jq -c '[(.leitura|length), (.leitura|map(length)|max), (.leitura[0]|startswith("teste-derivado-ilegivel:0"))]' 2>/dev/null)" = '[6,80,true]' ] \
+  && ok "leitura: no máximo 6 entradas de 80 caracteres (a linha da sonda não cresce com o info)" || bad "teto da leitura: $(probe_of wa-m1 | cut -c1-300)"
 # sem saída por definição (prazo, rc fora do contrato): 'sem-saida', a sonda ainda é contada
 reset; chk wa-m1 124; chk wa-n1 2
 T_EXEMPT=shadow pass "$S3" >/dev/null

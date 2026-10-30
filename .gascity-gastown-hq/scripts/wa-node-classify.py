@@ -330,28 +330,28 @@ RESOLVE_EXT = CODE_EXT + ("html", "md")   # nome solto só é trocado se for có
 def resolve_loose(paths, sent):
     """(paths, sent, nota para `info`). Nome solto (sem pasta, ex. `map_viewer.html`, `job_timeout.sh`) é julgado como arquivo da RAIZ do repo, mas a bead quase sempre o usa de atalho para um arquivo
     de outra pasta (`templates/map_viewer.html`, `scripts/job_timeout.sh`): o falso "fora do filtro" e o código sem teste derivado (ga-2hd02v.3.17). Troca o nome solto pelo caminho real quando ele é inequívoco: (1) a própria bead cita UM caminho com pasta e esse
-    nome, ou (2) a árvore de REPO_REF tem UM arquivo com esse nome e nenhum na raiz. O caminho trocado passa pelo MESMO filtro, mac-only e espelho dos demais (nada é aberto por esta troca); só código/texto
+    nome E a árvore de REPO_REF, lida, não tem arquivo da raiz com ele (o solto podia ser esse, e aí o citado é outro arquivo), ou (2) a árvore tem UM arquivo com esse nome e nenhum na raiz. O caminho trocado passa pelo MESMO filtro, mac-only e espelho dos demais (nada é aberto por esta troca); só código/texto
     (RESOLVE_EXT) é trocado, nunca dado. vazio (nenhum candidato, ou mais de um) -> o nome segue solto, fora do filtro = mini, como antes; falhou/ilegível (árvore) -> idem + nota
-    `caminho-solto-ilegivel:<motivo>`, nunca "resolvido"."""
+    `caminho-solto-ilegivel:<motivo>`, nunca "resolvido" (nas DUAS regras: sem a árvore não dá para saber se o solto é o da raiz, e palpite não vira node)."""
     if not paths:
         return paths, sent, []
     loose = [p for p in paths if "/" not in p and p.rsplit(".", 1)[-1].lower() in RESOLVE_EXT and (p not in sent or p.rsplit(".", 1)[-1].lower() in CODE_EXT)]   # texto/html que o filtro não manda, ou código solto (o filtro o deixa sair da raiz, mas sem o caminho real a regra 6 não acha o teste dele)
     if not loose:
         return paths, sent, []
     foldered = [p for p in paths if "/" in p]
-    tree, tried, note, swap = set(), False, [], {}
+    tree, tried, ok, note, swap = set(), False, False, [], {}
     for p in loose:
-        cited = sorted(set(q for q in foldered if q.rsplit("/", 1)[-1] == p))
-        if cited:
-            if len(cited) == 1:   # dois citados com o mesmo nome: não sei qual é, fica solto
-                swap[p] = cited[0]
-            continue
         if not tried:
             tried = True
             try:
-                tree = set(repo_tree())
+                tree, ok = set(repo_tree()), True
             except Unreadable as e:
                 note = ["caminho-solto-ilegivel:" + str(e)]
+        cited = sorted(set(q for q in foldered if q.rsplit("/", 1)[-1] == p))
+        if cited:
+            if len(cited) == 1 and ok and p not in tree:   # dois citados com o mesmo nome: não sei qual é; árvore ilegível ou com o nome na raiz: o solto pode ser o da raiz. Em ambos fica solto
+                swap[p] = cited[0]
+            continue
         hits = sorted(f for f in tree if f.rsplit("/", 1)[-1] == p)
         if len(hits) == 1 and hits[0] != p and all(SAFE_SEG.match(sg) for sg in hits[0].split("/")):   # hits == [p]: o arquivo é o da raiz mesmo, nada a trocar
             swap[p] = hits[0]

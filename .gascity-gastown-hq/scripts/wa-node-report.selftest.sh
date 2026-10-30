@@ -25,8 +25,12 @@
 #     avisa, e com linha gravada a ressalva "sem linha na rota não prova que o nó não viu" · log ausente ≠ vazio ≠ ilegível ≠ ok com zeros (nada na janela)
 #   FILA (~/.gc/pilot-dispatchable.json): WA entre o total, por prioridade (sem prioridade = P?), item que não é objeto contado · idade/VENCIDA (idade == ttl não venceu) · `generated_at` ausente/no futuro/impossível = idade null, sem quebrar ·
 #     items que não é lista, JSON que não é objeto, lixo e pasta = ilegível; ausente ≠ ilegível · caminhos padrão (log na cidade, fila em $HOME/.gc, nunca a do usuário de verdade) · caminho vazio = rc 2, não o padrão
+#   MOTIVOS (wa-node-exempt.jsonl, ga-2hd02v.3.17): veredito da bead = a ÚLTIMA sonda na janela; motivo × contagem (bead conta em cada motivo que tem) · sonda ≠ bead (o `node` não é memorizado: a mesma bead é sondada de novo a cada varredura) ·
+#     veredito `node` (o que o classificador DISSE) ≠ `kept`/`released` do resumo (o que FOI ao nó), nunca somados · modo sombra nunca despacha · resumo sem número legível = 'não dá para dizer', nunca 0 ·
+#     `leitura` da sonda classificada: falhou (lista com entradas, por motivo, até 3 exemplos) ≠ leu tudo ([]) ≠ ilegível (null/texto/item fora do formato) ≠ Pilot sem o campo; prazo/erro ficam fora ·
+#     janela fechada, hora ilegível, evento desconhecido e arquivo ausente/vazio/ilegível contados à parte.
 #   ESTADOS: ausente ≠ vazio ≠ ilegível (lixo, pasta no lugar do arquivo) · rc 3 só quando NENHUM dos dois logs serve (e JSON mesmo assim) · rc 2 em uso errado (inclui "010" = dez, nunca octal) · só leitura (nada novo, nada alterado) ·
-#     --json é UMA linha de JSON com as seis chaves (fila, funil, janela, ocupacao, prontidao, rota).
+#     --json é UMA linha de JSON com as sete chaves (fila, funil, janela, motivos, ocupacao, prontidao, rota).
 # CONTROLE NEGATIVO: cada mutante troca UMA trecho do script numa cópia (e FALHA se o trecho sumiu ou se repete: o script mudou, atualize o mutante) e a função designada tem de reprovar; mutante que sobrevive reprova esta bateria.
 #   O piso (MIN_MUT) impede que apagar mutantes passe por "todos mortos".
 # O QUE NÃO COBRE: o formato exato de cada linha do DESPACHANTE (`apply`/`release`) além dos padrões fixados aqui (se ele mudar o texto, a bead cai em 'sem veredito'); a do PILOT é a que o gancho real grava (hook_real), mas só
@@ -37,7 +41,7 @@
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REAL="$HERE/wa-node-report.py"
-MIN_MUT=228
+MIN_MUT=262
 T=$(mktemp -d "${TMPDIR:-/tmp}/wa-node-report.XXXXXX")
 trap 'find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null' EXIT
 fails=0; n=0; MUTANTS=0
@@ -287,17 +291,21 @@ FOR = "fora-do-filtro"
 SPC = "sem-prova-de-codigo-e-teste"
 
 
+ABSENT = object()   # resumo(..., kept=ABSENT): a chave não existe no resumo (≠ 0, ≠ ilegível)
+
+
 def sonda(bead, off, verdict, classes, **extra):
-    """a linha que _pilot_wa_node_pass_probe_note grava: {ts,event,bead,lane,verdict,basis,reasons,classes,paths}"""
-    r = {"ts": iso(off), "event": "wa-node-pass-probe", "bead": bead, "lane": "wa-worker-remote", "verdict": verdict, "basis": "", "reasons": ["x:y"], "classes": classes, "paths": []}
+    """a linha que _pilot_wa_node_pass_probe_note grava: {ts,event,bead,lane,verdict,basis,reasons,classes,paths,leitura}. leitura: [] = o classificador leu tudo, null = sem saída dele (prazo, erro); ABSENT = Pilot sem o campo"""
+    r = {"ts": iso(off), "event": "wa-node-pass-probe", "bead": bead, "lane": "wa-worker-remote", "verdict": verdict, "basis": "", "reasons": ["x:y"], "classes": classes, "paths": [],
+         "leitura": [] if verdict in ("node", "mini", "unknown") else None}
     r.update(extra)
-    return r
+    return {k: v for k, v in r.items() if v is not ABSENT}
 
 
 def resumo(off, probed, node, stopped, **extra):
     r = {"ts": iso(off), "event": "wa-node-pass-summary", "mode": "shadow", "route": "label", "probed": probed, "node": node, "stopped": stopped}
     r.update(extra)
-    return r
+    return {k: v for k, v in r.items() if v is not ABSENT}
 
 
 mt_linhas = [
@@ -330,11 +338,13 @@ mt_linhas = [
     {"ts": iso(-1 * H), "event": "wa-node-pass-probe", "bead": "wa-estranha", "verdict": "talvez", "classes": [FOR]},
     {"ts": iso(-1 * H), "event": "wa-node-pass-probe", "bead": "wa-sem-veredito", "classes": [FOR]},
     # a passada: três resumos na janela (um com número que não dá para ler) e um velho; a sombra; eventos que o relatório não conhece
-    resumo(-6 * H, 12, 0, "budget-probes"),
-    resumo(-4 * H, 5, 2, "none"),
-    resumo(-2 * H, "x", 1, "budget-secs"),
-    resumo(-3 * H, 0, 0, "none"),
-    resumo(-25 * H, 99, 9, "budget-probes"),
+    # sombra (nada é despachado: entrega 0); `on` com 2 vereditos node, 1 despacho que deu certo e 1 que falhou (solta); probed ilegível, SEM mode, kept 7 e SEM released; `on` sem kept e com released 5
+    # (kept e released andam juntos: sem um dos dois o resumo inteiro fica FORA da conta de entregas; nem o kept 7 nem o released 5 entram sozinhos)
+    resumo(-6 * H, 12, 0, "budget-probes", kept=0, released=0),
+    resumo(-4 * H, 5, 2, "none", mode="on", kept=1, released=1),
+    resumo(-2 * H, "x", 1, "budget-secs", mode=ABSENT, kept=7, released=ABSENT),
+    resumo(-3 * H, 0, 0, "none", mode="on", kept=ABSENT, released=5),
+    resumo(-25 * H, 99, 9, "budget-probes", kept=0, released=0),
     {"ts": iso(-1 * H), "event": "wa-node-pass-shadow", "bead": "wa-m1", "lane": "wa-worker-remote", "basis": "text", "stamped": False, "prio": 2},
     {"ts": iso(-1 * H), "event": "wa-node-pass-novo", "bead": "wa-m1"},
     {"ts": iso(-1 * H), "bead": "wa-m1"},
@@ -346,6 +356,26 @@ jl(os.path.join(city("mz"), ".gc", "wa-node-exempt.jsonl"), mt_linhas)
 jl(os.path.join(T, "exempt-alt.jsonl"), mt_linhas)
 # só resumo: arquivo com linhas, nenhuma sonda → "não gravou motivos", nunca "zero motivos"
 jl(os.path.join(city("mr"), ".gc", "wa-node-exempt.jsonl"), [resumo(-3 * H, 4, 0, "none")])
+# só passadas em modo `on` com kept/released legíveis (sem sombra, sem resumo ilegível): o texto não pode trazer o aviso de sombra nem o de número ilegível
+jl(os.path.join(city("mk"), ".gc", "wa-node-exempt.jsonl"), [resumo(-3 * H, 7, 4, "none", mode="on", kept=3, released=1), resumo(-1 * H, 6, 3, "none", mode="on", kept=3, released=0)])
+# nenhum número legível no resumo (probed, node, kept e released ausentes): o texto diz "não dá para dizer", nunca um 0 que pareça medida
+jl(os.path.join(city("mq"), ".gc", "wa-node-exempt.jsonl"), [resumo(-1 * H, ABSENT, ABSENT, "none", mode="on", kept=ABSENT, released=ABSENT)])
+# a leitura (gate 1): falhou (lista com entradas *-ilegivel) ≠ leu tudo ([]) ≠ ilegível (null, texto, item que não é texto) ≠ Pilot sem o campo; prazo/erro não são classificados e ficam fora; a de -25 h fica fora da janela
+jl(os.path.join(city("mw"), ".gc", "wa-node-exempt.jsonl"), [
+    sonda("wa-l1", -1 * H, "mini", [FOR], leitura=["caminho-solto-ilegivel:repo-git-rc-128", "espelho-ilegivel:espelho-ausente"]),
+    sonda("wa-l2", -2 * H, "node", [], leitura=["caminho-solto-ilegivel:a", "caminho-solto-ilegivel:b"]),   # o mesmo motivo duas vezes na MESMA sonda conta uma vez
+    sonda("wa-l3", -1 * H, "unknown", [SPC], leitura=[]),
+    sonda("wa-l4", -1 * H, "mini", [FOR], leitura=None),
+    sonda("wa-l5", -1 * H, "mini", [FOR], leitura="texto"),
+    sonda("wa-l6", -1 * H, "mini", [FOR], leitura=[7]),
+    sonda("wa-l7", -1 * H, "mini", [FOR], leitura=ABSENT),
+    sonda("wa-l8", -1 * H, "timeout", None),
+    sonda("wa-l9", -3 * H, "mini", [FOR], leitura=["teste-derivado-ilegivel:x"]),
+    sonda("wa-l10", -3 * H, "mini", [FOR], leitura=["teste-derivado-ilegivel:y"]),
+    sonda("wa-l9", -2 * H - 600, "mini", [FOR], leitura=["teste-derivado-ilegivel:z"]),   # a MESMA bead sondada de novo: conta como sonda, mas o exemplo não a repete
+    sonda("wa-l11", -1 * H, "mini", [FOR], leitura=[""]),   # item vazio = fora do formato
+    sonda("wa-lold", -25 * H, "mini", [FOR], leitura=["espelho-ilegivel:velho"]),
+])
 # a sonda de uma bead só, para o texto
 jl(os.path.join(city("m1"), ".gc", "wa-node-exempt.jsonl"), [sonda("wa-so1", -1 * H, "mini", [FOR])])
 # estados: vazio, só lixo, pasta no lugar do arquivo
@@ -357,7 +387,7 @@ os.makedirs(os.path.join(city("md"), ".gc", "wa-node-exempt.jsonl"), exist_ok=Tr
 with open(os.path.join(city("mx"), ".gc", "wa-node-exempt.jsonl"), "wb") as f:
     f.write(b"nao e json\n" + json.dumps(sonda("wa-mx", -1 * H, "mini", [FOR])).encode("utf-8") + b"\n")
 # as cidades de motivos (menos "mz") têm uma ocupação mínima: o relatório sai com rc 0
-for nome in ("mt", "mr", "m1", "mv", "ml", "md", "mx"):
+for nome in ("mt", "mr", "mk", "mq", "mw", "m1", "mv", "ml", "md", "mx"):
     jl(os.path.join(city(nome), ".gc", "hetzner-occupancy.jsonl"), [occ(-1 * H, cpu(50.0), ses([]))])
 
 # ---- o funil: o log do Pilot (hora local, sem fuso) em UTC e em BRT (UTC-3). Os checks usam --hours 24: as linhas de -25 h ficam de fora
@@ -473,7 +503,7 @@ python3 -I "$T/fx.py" "$FX" "$NOW" || { echo "o gerador de fixtures falhou"; exi
 # as cidades de fixture moram em $FX
 RT="$FX/rota"; OC="$FX/ocup"; MU="$FX/muitas"; SR="$FX/sr"; LR="$FX/lr"; DR="$FX/dr"; NA="$FX/na"; VZ="$FX/vz"; LX="$FX/lx"; DN="$FX/dn"; SP="$FX/span"; DIA="$FX/dia"; PV="$FX/pv"; OI="$FX/oi"; RL="$FX/real"; EV="$FX/ev"; SOR="$FX/sor"; SV="$FX/sv"; DG="$FX/deg"; SNU="$FX/snu"
 FU="$FX/funil"; F2="$FX/funil2"; PD="$FX/padrao"; HM="$FX/home"
-MT="$FX/mt"; MZ="$FX/mz"; MR="$FX/mr"; M1="$FX/m1"; MV="$FX/mv"; ML="$FX/ml"; MD="$FX/md"; MX="$FX/mx"
+MT="$FX/mt"; MZ="$FX/mz"; MR="$FX/mr"; MK="$FX/mk"; MQ="$FX/mq"; MW="$FX/mw"; M1="$FX/m1"; MV="$FX/mv"; ML="$FX/ml"; MD="$FX/md"; MX="$FX/mx"
 # os arquivos soltos (logs do Pilot, filas) moram em $FX; NOPILOT/NOFILA não existem de propósito
 PLU="$FX/pilot-utc.log"; PLB="$FX/pilot-brt.log"; NOPILOT="$FX/nao-existe.log"; NOFILA="$FX/nao-existe.json"
 
@@ -976,16 +1006,54 @@ chk_motivos_passadas() { # o resumo das passadas: quantas, sondaram, ao nó, por
   eq "$(mf passadas.sem_numero)" 1 "o resumo com probed 'x'" &&
   eq "$(mf 'passadas.parou_por|to_entries|map("\(.key)=\(.value)")|sort|join(",")')" "budget-probes=1,budget-secs=1,none=2" "por que pararam (duas pararam por none: a conta soma, não escreve 1)"
 }
+chk_motivos_entregas() { # o que FOI ao nó é `kept` (despacho que deu certo), não o veredito `node`; kept e released andam juntos; sem número legível = fora da conta, nunca 0; o modo de cada passada é contado
+  jrun UTC "$MT" --hours 24 &&
+  eq "$(mf passadas.kept)" 1 "só a passada em modo on do meio entregou (a sombra entrega 0; a sem kept fica fora)" && eq "$(mf passadas.released)" 1 "uma solta (veredito node, despacho falhou)" &&
+  eq "$(mf passadas.sem_numero_acao)" 2 "os dois resumos com metade do par: o kept 7 e o released 5 NÃO entram sozinhos" &&
+  eq "$(mf 'passadas.modos|to_entries|map("\(.key)=\(.value)")|sort|join(",")')" "?=1,on=2,shadow=1" "modo de cada passada (sem mode = ?)" &&
+  eq "$(mf passadas.node)" 2 "o veredito node continua sendo contado, com outro nome no texto" &&
+  jrun UTC "$MK" --hours 24 &&
+  eq "$(mf passadas.n)" 2 "mk: duas passadas" && eq "$(mf passadas.kept)" 6 "mk: 3 + 3" && eq "$(mf passadas.released)" 1 "mk: 1 + 0" && eq "$(mf passadas.sem_numero_acao)" 0 "mk: tudo legível" &&
+  eq "$(mf passadas.sondadas)" 13 "mk: 7 + 6" && eq "$(mf passadas.node)" 7 "mk: 4 + 3" && eq "$(mf 'passadas.modos|to_entries|map("\(.key)=\(.value)")|sort|join(",")')" "on=2" "mk: só on" &&
+  trun UTC "$MK" --hours 24 && sec5=$(printf '%s\n' "$OUT" | sed -n '/^\[5\] MOTIVOS/,$p') &&
+  has "$sec5" "ao nó de fato (despacho que deu certo): 6; soltas (veredito node, mas o despacho falhou): 1" && has "$sec5" "modo das passadas: on=2" &&
+  hasnt "$sec5" "modo sombra em" && hasnt "$sec5" "ATENÇÃO" &&
+  jrun UTC "$MQ" --hours 24 && eq "$(mf passadas.n)" 1 "mq: a passada conta" && eq "$(mf passadas.sem_numero)" 1 "mq: sem probed/node" && eq "$(mf passadas.sem_numero_acao)" 1 "mq: sem kept/released" &&
+  trun UTC "$MQ" --hours 24 && sec5=$(printf '%s\n' "$OUT" | sed -n '/^\[5\] MOTIVOS/,$p') &&
+  has "$sec5" "sondas e vereditos \`node\`: não dá para dizer (nenhum resumo com probed/node legível)" && has "$sec5" "ao nó de fato: não dá para dizer (nenhum resumo com kept/released legível)" &&
+  hasnt "$sec5" "ao nó de fato (despacho" && hasnt "$sec5" "sondas: " && hasnt "$sec5" "veredito \`node\` em" &&
+  trun UTC "$M1" --hours 24 && sec5=$(printf '%s\n' "$OUT" | sed -n '/^\[5\] MOTIVOS/,$p') &&
+  has "$sec5" "0 passada(s) com resumo na janela" && hasnt "$sec5" "ao nó de fato" && hasnt "$sec5" "modo das passadas" && hasnt "$sec5" "sondas: "
+}
+chk_motivos_leitura() { # a leitura que FALHOU é um estado próprio: falhou ≠ leu tudo ≠ ilegível ≠ Pilot sem o campo; só sonda classificada e da janela conta; o contrato veredito:motivo não muda
+  jrun UTC "$MW" --hours 24 &&
+  eq "$(mf leitura.falhou)" 5 "l1, l2, l9 (duas sondas) e l10 (a de -25 h fica fora; l3 leu tudo)" &&
+  eq "$(mf 'leitura.por_slug|to_entries|map("\(.key)=\(.value)")|sort|join(",")')" "caminho-solto-ilegivel=2,espelho-ilegivel=1,teste-derivado-ilegivel=3" "por motivo da falha; o mesmo motivo duas vezes na MESMA sonda (l2) conta uma" &&
+  eq "$(mf 'leitura.exemplos|join(",")')" "wa-l9,wa-l10,wa-l2" "no máximo 3 exemplos, na ordem da hora das sondas, sem repetir a bead (wa-l9 tem duas sondas)" &&
+  eq "$(mf leitura.ilegivel)" 4 "null, texto, item que não é texto e item vazio" && eq "$(mf leitura.sem_campo)" 1 "o Pilot sem o campo" &&
+  eq "$(mf sondas)" 12 "o contrato das sondas não mudou (12 na janela, o timeout incluso)" && eq "$(mf beads)" 11 "11 beads distintas (wa-l9 sondada duas vezes): o campo leitura não mexe nas beads" &&
+  jrun UTC "$MT" --hours 24 && eq "$(mf leitura.falhou)" 0 "mt: nenhuma leitura falhou" && eq "$(mf leitura.ilegivel)" 0 "mt: nada ilegível (timeout e error não são classificados)" && eq "$(mf leitura.sem_campo)" 0 "mt: todas têm o campo" &&
+  trun UTC "$MW" --hours 24 && sec5=$(printf '%s\n' "$OUT" | sed -n '/^\[5\] MOTIVOS/,$p') &&
+  has "$sec5" "ATENÇÃO — a leitura FALHOU em 5 sonda(s) classificada(s) (caminho-solto-ilegivel=2, espelho-ilegivel=1, teste-derivado-ilegivel=3)" && has "$sec5" "exemplos: wa-l9, wa-l10, wa-l2" &&
+  has "$sec5" "ATENÇÃO — 4 sonda(s) classificada(s) com o campo \`leitura\` ilegível (null ou fora do formato): não dá para dizer se a leitura falhou nelas" &&
+  has "$sec5" "1 sonda(s) classificada(s) de um Pilot sem o campo \`leitura\`: não dá para dizer se a leitura falhou nelas" &&
+  trun UTC "$MT" --hours 24 && sec5=$(printf '%s\n' "$OUT" | sed -n '/^\[5\] MOTIVOS/,$p') && hasnt "$sec5" "leitura" 
+}
 chk_motivos_janela() { # --hours 48 traz a sonda de -24 h -1 s e o resumo de -25 h; o futuro (+1 s) continua fora
   jrun UTC "$MT" --hours 48 &&
   eq "$(mf sondas)" 16 "sondas com 48 h" && eq "$(mf beads)" 15 "beads com 48 h" && eq "$(mm mini:fora-do-filtro beads)" 3 "wa-old entra, wa-futuro não" &&
-  eq "$(mf passadas.n)" 5 "passadas com 48 h" && eq "$(mf passadas.sondadas)" 116 "17 + 99" && eq "$(mf passadas.node)" 11 "2 + 9"
+  eq "$(mf passadas.n)" 5 "passadas com 48 h" && eq "$(mf passadas.sondadas)" 116 "17 + 99" && eq "$(mf passadas.node)" 11 "2 + 9" &&
+  eq "$(mf passadas.kept)" 1 "a velha entregou 0" && eq "$(mf passadas.released)" 1 "a velha soltou 0" && eq "$(mf 'passadas.modos.shadow')" 2 "a velha era sombra"
 }
 chk_motivos_texto() {
   trun UTC "$MT" --hours 24 && eq "$RC" 0 rc &&
   has "$OUT" "[5] MOTIVOS DAS SONDAS DA PASSADA DO NÓ" && has "$OUT" "15 sonda(s) em 14 bead(s) distinta(s)" &&
-  has "$OUT" "4 passada(s) com resumo na janela; sondaram 17 bead(s) e mandaram 2 ao nó; pararam por: budget-probes=1, budget-secs=1, none=2" &&
-  has "$OUT" "ATENÇÃO — 1 resumo(s) sem número legível" && has "$OUT" "2 linha(s) do log sem hora legível, FORA das contas acima" &&
+  has "$OUT" "4 passada(s) com resumo na janela; pararam por: budget-probes=1, budget-secs=1, none=2" && has "$OUT" "modo das passadas: on=2, ?=1, shadow=1" &&
+  has "$OUT" "sondas: 17 — a MESMA bead é sondada de novo a cada varredura" && has "$OUT" "veredito \`node\` em 2 sonda(s) — o que o classificador DISSE, não o que foi ao nó" &&
+  has "$OUT" "ao nó de fato (despacho que deu certo): 1; soltas (veredito node, mas o despacho falhou): 1" &&
+  has "$OUT" "modo sombra em 1 passada(s): nada é despachado" &&
+  hasnt "$OUT" "sondaram 17 bead(s)" && hasnt "$OUT" "mandaram 2 ao nó" &&
+  has "$OUT" "ATENÇÃO — 1 resumo(s) sem número legível" && has "$OUT" "ATENÇÃO — 2 resumo(s) sem \`kept\`/\`released\` legíveis" && has "$OUT" "2 linha(s) do log sem hora legível, FORA das contas acima" &&
   has "$OUT" "ATENÇÃO — 4 sonda(s) sem bead ou com veredito que este relatório não conhece" &&
   has "$OUT" 'ATENÇÃO — 2 linha(s) de `event` que este relatório não conhece, FORA das contas (?=1, wa-node-pass-novo=1)' &&
   has "$OUT" "mini:fora-do-filtro" && has "$OUT" "wa-m1, wa-m2" && has "$OUT" '`sem-motivo` = o classificador respondeu sem razão, `ilegivel` = a razão não foi lida, `sem-saida` = não houve saída dele' &&
@@ -1022,7 +1090,7 @@ for c in veredito_final sombra_nao_e_entrega ultimo_por_hora instaveis conferir_
          ocup_totais ocup_horas_utc ocup_hora09 ocup_wa_remoto ocup_hora_sem_cpu ocup_texto ocup_ilegiveis ocup_bordas sem_epoch tabela_72 ocup_nao_leitura ocup_so_reaper eventos_desconhecidos horas_so_sem_veredito node_anterior \
          funil_utc funil_fuso funil_texto funil_gancho funil_sem_rota funil_estados wa_id_sem_ponto linhas_degeneradas cpu_sem_nucleos relatorio_nao_formado fila_ok fila_texto fila_hora_ruim fila_estados caminhos_padrao caminho_vazio_rc2 \
          rc3_nenhum_log rc0_basta_um rota_vazia ausente_nao_e_zero args_rc2 args_validos horas_decimal now_env somente_leitura json_uma_linha \
-         motivos_agregado motivos_vazio_nao_e_falhou motivos_fora_das_contas motivos_passadas motivos_janela motivos_texto motivos_sem_sonda motivos_estados motivos_arquivo; do
+         motivos_agregado motivos_vazio_nao_e_falhou motivos_fora_das_contas motivos_passadas motivos_entregas motivos_leitura motivos_janela motivos_texto motivos_sem_sonda motivos_estados motivos_arquivo; do
   check "$c"
 done
 
@@ -1281,6 +1349,41 @@ mut motivos-caminho-explicito-ignorado chk_motivos_arquivo 'exe_p = a.exempt_log
 mut motivos-caminho-vazio-vira-padrao chk_motivos_arquivo '("--dispatchable", a.dispatchable), ("--exempt-log", a.exempt_log))' '("--dispatchable", a.dispatchable))'
 mut motivos-ilegivel-vira-zero chk_motivos_estados 'xa = analyse_motivos(xrows, lo, hi) if xe in ("ok", "vazio") else None' 'xa = analyse_motivos(xrows, lo, hi)'
 mut motivos-salva-o-exit-3 chk_motivos_estados 'if re_ not in ("ok", "vazio") and oe not in ("ok", "vazio"):' 'if re_ not in ("ok", "vazio") and oe not in ("ok", "vazio") and xe not in ("ok", "vazio"):'
+# -- o que FOI ao nó (kept) não é o veredito node; kept e released andam juntos; modo; "não sei" nunca vira 0
+mut motivos-leitura-falhou-calado chk_motivos_leitura 'leitura["falhou"] += 1' 'leitura["falhou"] += 0'
+mut motivos-leitura-slug-repetido chk_motivos_leitura 'for slug in {x.split(":", 1)[0] for x in lt}:' 'for slug in [x.split(":", 1)[0] for x in lt]:'
+mut motivos-leitura-slug-inteiro chk_motivos_leitura 'for slug in {x.split(":", 1)[0] for x in lt}:' 'for slug in {x for x in lt}:'
+mut motivos-leitura-exemplos-sem-teto chk_motivos_leitura 'if bid not in leitura["exemplos"] and len(leitura["exemplos"]) < 3:' 'if bid not in leitura["exemplos"]:'
+mut motivos-leitura-exemplo-repetido chk_motivos_leitura 'if bid not in leitura["exemplos"] and len(leitura["exemplos"]) < 3:' 'if len(leitura["exemplos"]) < 3:'
+mut motivos-leitura-conta-nao-classificada chk_motivos_leitura 'if v in SONDA_CLASSIFICADOS:' 'if True:'
+mut motivos-leitura-ilegivel-calado chk_motivos_leitura 'leitura["ilegivel"] += 1' 'leitura["ilegivel"] += 0'
+mut motivos-leitura-sem-campo-calado chk_motivos_leitura 'leitura["sem_campo"] += 1' 'leitura["sem_campo"] += 0'
+mut motivos-leitura-ausente-vira-ilegivel chk_motivos_leitura 'if lt is ABSENTE:' 'if False:'
+mut motivos-leitura-null-vira-limpa chk_motivos_leitura 'elif not isinstance(lt, list) or any(not isinstance(x, str) or not x for x in lt):' 'elif isinstance(lt, list) and any(not isinstance(x, str) or not x for x in lt):'
+mut motivos-leitura-item-vazio-passa chk_motivos_leitura 'any(not isinstance(x, str) or not x for x in lt)' 'any(not isinstance(x, str) for x in lt)'
+mut motivos-leitura-item-nao-texto-passa chk_motivos_leitura 'any(not isinstance(x, str) or not x for x in lt)' 'any(not x for x in lt)'
+mut motivos-leitura-texto-sem-aviso chk_motivos_leitura 'if le["falhou"]:' 'if False:'
+mut motivos-leitura-texto-sempre chk_motivos_leitura 'if le["falhou"]:' 'if True:'
+mut motivos-leitura-texto-ilegivel-calado chk_motivos_leitura 'if le["ilegivel"]:' 'if False:'
+mut motivos-leitura-texto-sem-campo-calado chk_motivos_leitura 'if le["sem_campo"]:' 'if False:'
+mut motivos-leitura-texto-ordem-por-contagem chk_motivos_leitura 'sorted(le["por_slug"].items())' 'sorted(le["por_slug"].items(), key=lambda kv: -kv[1])'
+mut json-sem-leitura chk_motivos_leitura '"passadas": pas, "leitura": leitura,' '"passadas": pas,'
+mut motivos-entregas-sem-kept chk_motivos_entregas 'pas["kept"] += kp' 'pas["kept"] += 0'
+mut motivos-entregas-sem-released chk_motivos_entregas 'pas["released"] += rl' 'pas["released"] += 0'
+mut motivos-entregas-kept-sozinho chk_motivos_entregas 'if all(isinstance(x, int) and not isinstance(x, bool) and x >= 0 for x in (kp, rl)):' 'if isinstance(kp, int) and not isinstance(kp, bool) and kp >= 0:' 'pas["released"] += rl' 'pas["released"] += rl if isinstance(rl, int) else 0'
+mut motivos-entregas-released-sozinho chk_motivos_entregas 'if all(isinstance(x, int) and not isinstance(x, bool) and x >= 0 for x in (kp, rl)):' 'if isinstance(rl, int) and not isinstance(rl, bool) and rl >= 0:' 'pas["kept"] += kp' 'pas["kept"] += kp if isinstance(kp, int) else 0'
+mut motivos-entregas-ilegivel-calado chk_motivos_entregas 'pas["sem_numero_acao"] += 1' 'pas["sem_numero_acao"] += 0'
+mut motivos-entregas-modo-calado chk_motivos_entregas 'pas["modos"][md] = pas["modos"].get(md, 0) + 1' 'pas["modos"][md] = 1'
+mut motivos-entregas-modo-ausente-vira-sombra chk_motivos_entregas 'md = md if isinstance(md, str) and md else "?"' 'md = md if isinstance(md, str) and md else "shadow"'
+mut motivos-texto-entrega-mostra-o-veredito chk_motivos_texto '(pa["kept"], pa["released"]))' '(pa["node"], pa["released"]))'
+mut motivos-texto-sem-aviso-de-entrega chk_motivos_texto '        if pa["sem_numero_acao"]:' '        if False:'
+mut motivos-texto-sombra-nunca chk_motivos_texto 'if pa["modos"].get("shadow"):' 'if False:'
+mut motivos-texto-sombra-sempre chk_motivos_entregas 'if pa["modos"].get("shadow"):' 'if True:'
+mut motivos-texto-entrega-zero-sem-medida chk_motivos_entregas 'if pa["sem_numero_acao"] < pa["n"]:' 'if True:'
+mut motivos-texto-sondas-zero-sem-medida chk_motivos_entregas 'if pa["sem_numero"] < pa["n"]:' 'if True:'
+mut motivos-texto-sem-passada-mostra-linhas chk_motivos_entregas '        if pa["n"]:' '        if True:'
+mut motivos-texto-sondas-viram-beads chk_motivos_texto 'sondas: %d — a MESMA bead é sondada' 'sondaram %d bead(s) — a MESMA bead é sondada'
+mut motivos-texto-veredito-vira-entrega chk_motivos_texto 'veredito `node` em %d sonda(s) — o que o classificador DISSE, não o que foi ao nó' 'mandaram %d ao nó'
 mut json-sem-motivos chk_json_uma_linha '        "motivos": {"arquivo": exe_p, "estado": xe, "ilegiveis": xbad, "analise": xa},' '        "motivos_": {"arquivo": exe_p, "estado": xe, "ilegiveis": xbad, "analise": xa},'
 mut motivos-escreve-no-log chk_somente_leitura '    xe, xrows, xbad = read_jsonl(exe_p)' "    open(exe_p, \"ab\").close()${nl}    xe, xrows, xbad = read_jsonl(exe_p)"
 

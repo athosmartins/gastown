@@ -109,3 +109,9 @@ falha ao gravar a sonda nao avisa	|| warn "ga-2hd02v.3.17:	|| true "ga-2hd02v.3.
 resumo sem os motivos	stopped:$stop,reasons:$rs}	stopped:$stop}
 log sem os motivos	motivos: ${_pw_rs:-nenhum}	x
 padrao de sondas volta a 12	_pw_cap="${PILOT_WA_NODE_PASS_PROBES:-30}"	_pw_cap="${PILOT_WA_NODE_PASS_PROBES:-12}"
+leitura guarda toda entrada do info	map(tostring | select(test("-ilegivel")))	map(tostring)
+leitura sem teto de entradas	select(test("-ilegivel"))) | .[:6] | map(.[:80])	select(test("-ilegivel"))) | map(.[:80])
+leitura sem corte de caracteres	| .[:6] | map(.[:80])	| .[:6]
+info que nao e lista vira leitura limpa	map(.[:80])) else null end)}'	map(.[:80])) else [] end)}'
+info ausente vira leitura limpa	leitura: (if (.info | type) == "array" then (.info | map(	leitura: (if true then ((.info // []) | map(
+sonda sem a leitura	,paths:$d.paths,leitura:$d.leitura}'	,paths:$d.paths}'

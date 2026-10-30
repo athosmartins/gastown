@@ -70,6 +70,7 @@ EXEMPT_CONHECIDOS = ("wa-node-pass-summary", "wa-node-pass-shadow")
 # os vereditos que a sonda grava: os três do classificador (trazem motivos) e os três em que não houve saída dele (prazo, erro, script ausente)
 SONDA_VEREDITOS = ("node", "mini", "unknown", "timeout", "error", "missing")
 SONDA_CLASSIFICADOS = ("node", "mini", "unknown")
+ABSENTE = object()  # a chave não existe na linha (≠ existe com null)
 SONDA_ROTULOS = {"node": "node", "mini": "mini", "unknown": "não sei", "timeout": "prazo estourou (sem veredito)", "error": "erro (sem veredito)", "missing": "script ausente (sem veredito)"}
 
 
@@ -396,7 +397,10 @@ def sonda_tokens(verdict, classes):
 def analyse_motivos(rows, lo, hi):
     """motivo × contagem das sondas da passada do nó (wa-node-exempt.jsonl). Só `wa-node-pass-probe` na janela entra no agregado; o veredito de uma bead é a ÚLTIMA sonda dela na janela (a mesma regra da rota).
     `por_motivo[veredito:classe]` = {beads (pela última sonda), sondas (todas as da janela), exemplos (até 3 beads)}. Linha sem hora legível, sonda sem bead ou com veredito fora dos seis conhecidos NÃO entram no agregado e vêm
-    CONTADAS (sem_hora, fora_do_formato); `event` desconhecido idem (eventos_desconhecidos); resumo e sombra da passada vêm contados à parte (outros_conhecidos), e o resumo dá `passadas` (quantas, quantas sondas, quantas ao nó, por que pararam)."""
+    CONTADAS (sem_hora, fora_do_formato); `event` desconhecido idem (eventos_desconhecidos); resumo e sombra da passada vêm contados à parte (outros_conhecidos), e o resumo dá `passadas`: quantas, o modo de cada uma, quantas SONDAS (a mesma bead é sondada de novo a cada varredura: o veredito `node` não é memorizado),
+    em quantas sondas o veredito foi `node` (o que o classificador DISSE) e, à parte, o que FOI ao nó: `kept` (despacho que deu certo) e `released` (veredito node, despacho que falhou), por que pararam.
+    `leitura` (só sonda CLASSIFICADA: node/mini/unknown) separa quatro estados do campo `leitura` da sonda: lista com entradas = a leitura FALHOU (`falhou`, por motivo em `por_slug`, até 3 `exemplos`); `[]` = leu tudo (não conta);
+    null, texto ou item que não é texto = `ilegivel`; chave ausente (Pilot sem o campo) = `sem_campo`. Os dois últimos NUNCA viram "leu tudo": o relatório diz que não dá para saber."""
     sem_hora = fora_formato = 0
     ev = []
     for i, r in enumerate(rows):
@@ -409,7 +413,8 @@ def analyse_motivos(rows, lo, hi):
     ev.sort(key=lambda t: t[:2])
     ultima, sondas_tok, conhecidos, novos = {}, {}, {}, {}
     sondas = 0
-    pas = {"n": 0, "sondadas": 0, "node": 0, "parou_por": {}, "sem_numero": 0}
+    pas = {"n": 0, "sondadas": 0, "node": 0, "kept": 0, "released": 0, "parou_por": {}, "modos": {}, "sem_numero": 0, "sem_numero_acao": 0}
+    leitura = {"falhou": 0, "por_slug": {}, "exemplos": [], "ilegivel": 0, "sem_campo": 0}
     for _e, _i, r in ev:
         kind = r.get("event")
         if kind == "wa-node-pass-summary":
@@ -422,6 +427,17 @@ def analyse_motivos(rows, lo, hi):
                 pas["node"] += nd
             else:
                 pas["sem_numero"] += 1
+            # o que foi AO NÓ é `kept` (despacho que deu certo), nunca `node` (veredito: conta antes de qualquer despacho, e na sombra nada é despachado). kept e released andam juntos: sem os dois legíveis o
+            # resumo inteiro fica FORA da conta de entregas e vem contado (nunca vira 0, nem entra só metade)
+            kp, rl = r.get("kept"), r.get("released")
+            if all(isinstance(x, int) and not isinstance(x, bool) and x >= 0 for x in (kp, rl)):
+                pas["kept"] += kp
+                pas["released"] += rl
+            else:
+                pas["sem_numero_acao"] += 1
+            md = r.get("mode")
+            md = md if isinstance(md, str) and md else "?"
+            pas["modos"][md] = pas["modos"].get(md, 0) + 1
             st = r.get("stopped")
             st = st if isinstance(st, str) and st else "?"
             pas["parou_por"][st] = pas["parou_por"].get(st, 0) + 1
@@ -438,6 +454,18 @@ def analyse_motivos(rows, lo, hi):
             fora_formato += 1
             continue
         sondas += 1
+        if v in SONDA_CLASSIFICADOS:
+            lt = r.get("leitura", ABSENTE)
+            if lt is ABSENTE:
+                leitura["sem_campo"] += 1
+            elif not isinstance(lt, list) or any(not isinstance(x, str) or not x for x in lt):
+                leitura["ilegivel"] += 1
+            elif lt:
+                leitura["falhou"] += 1
+                for slug in {x.split(":", 1)[0] for x in lt}:
+                    leitura["por_slug"][slug] = leitura["por_slug"].get(slug, 0) + 1
+                if bid not in leitura["exemplos"] and len(leitura["exemplos"]) < 3:
+                    leitura["exemplos"].append(bid)
         toks = sonda_tokens(v, r.get("classes"))
         for t in toks:
             sondas_tok[t] = sondas_tok.get(t, 0) + 1
@@ -453,7 +481,7 @@ def analyse_motivos(rows, lo, hi):
                 m["exemplos"].append(bid)
     for t, n in sondas_tok.items():
         por_motivo.setdefault(t, {"beads": 0, "sondas": 0, "exemplos": []})["sondas"] = n
-    return {"sondas": sondas, "beads": len(ultima), "por_veredito": por_veredito, "por_motivo": por_motivo, "passadas": pas, "sem_hora": sem_hora,
+    return {"sondas": sondas, "beads": len(ultima), "por_veredito": por_veredito, "por_motivo": por_motivo, "passadas": pas, "leitura": leitura, "sem_hora": sem_hora,
             "fora_do_formato": fora_formato, "outros_conhecidos": conhecidos, "eventos_desconhecidos": novos}
 
 
@@ -701,9 +729,25 @@ def render(res):
     if mo["estado"] == "ok":
         a = mo["analise"]
         pa = a["passadas"]
-        L.append("  %d passada(s) com resumo na janela; sondaram %d bead(s) e mandaram %d ao nó; pararam por: %s" % (pa["n"], pa["sondadas"], pa["node"], ", ".join("%s=%d" % kv for kv in sorted(pa["parou_por"].items())) or "—"))
+        L.append("  %d passada(s) com resumo na janela; pararam por: %s" % (pa["n"], ", ".join("%s=%d" % kv for kv in sorted(pa["parou_por"].items())) or "—"))
+        if pa["n"]:
+            L.append("  modo das passadas: %s" % ", ".join("%s=%d" % kv for kv in sorted(pa["modos"].items(), key=lambda kv: (-kv[1], kv[0]))))
+            # nenhum resumo legível = NÃO SEI, nunca um 0 que pareça medida
+            if pa["sem_numero"] < pa["n"]:
+                L.append("  sondas: %d — a MESMA bead é sondada de novo a cada varredura (o veredito `node` não é memorizado), então isto NÃO é um número de beads" % pa["sondadas"])
+                L.append("  veredito `node` em %d sonda(s) — o que o classificador DISSE, não o que foi ao nó" % pa["node"])
+            else:
+                L.append("  sondas e vereditos `node`: não dá para dizer (nenhum resumo com probed/node legível)")
+            if pa["sem_numero_acao"] < pa["n"]:
+                L.append("  ao nó de fato (despacho que deu certo): %d; soltas (veredito node, mas o despacho falhou): %d" % (pa["kept"], pa["released"]))
+            else:
+                L.append("  ao nó de fato: não dá para dizer (nenhum resumo com kept/released legível)")
+            if pa["modos"].get("shadow"):
+                L.append("  modo sombra em %d passada(s): nada é despachado, então 0 ao nó ali é o esperado — não prova que o nó não receberia" % pa["modos"]["shadow"])
         if pa["sem_numero"]:
             L.append("  ATENÇÃO — %d resumo(s) sem número legível (probed/node ausente ou fora do formato): contados como passada, FORA das somas" % pa["sem_numero"])
+        if pa["sem_numero_acao"]:
+            L.append("  ATENÇÃO — %d resumo(s) sem `kept`/`released` legíveis (ausente ou fora do formato): contados como passada, FORA da conta de entregas (nunca viram 0)" % pa["sem_numero_acao"])
         if not a["sondas"]:
             L.append("  nenhuma sonda `%s` na janela: a passada não gravou motivos (Pilot sem o ga-2hd02v.3.17, passada desligada ou memória de vereditos cobrindo tudo) — isto NÃO é 'zero motivos'" % EXEMPT_SONDA)
         else:
@@ -715,6 +759,13 @@ def render(res):
             L.append("    %-44s %6s %7s  %s" % ("veredito:motivo", "beads", "sondas", "exemplos"))
             for t, m in sorted(a["por_motivo"].items(), key=lambda kv: (-kv[1]["beads"], -kv[1]["sondas"], kv[0])):
                 L.append("    %-44s %6d %7d  %s" % (t, m["beads"], m["sondas"], ", ".join(m["exemplos"]) or "—"))
+        le = a["leitura"]
+        if le["falhou"]:
+            L.append("  ATENÇÃO — a leitura FALHOU em %d sonda(s) classificada(s) (%s): o veredito pode estar pior do que o certo (o que o classificador não leu, ele não pôde ver); exemplos: %s" % (le["falhou"], ", ".join("%s=%d" % kv for kv in sorted(le["por_slug"].items())), ", ".join(le["exemplos"])))
+        if le["ilegivel"]:
+            L.append("  ATENÇÃO — %d sonda(s) classificada(s) com o campo `leitura` ilegível (null ou fora do formato): não dá para dizer se a leitura falhou nelas" % le["ilegivel"])
+        if le["sem_campo"]:
+            L.append("  %d sonda(s) classificada(s) de um Pilot sem o campo `leitura`: não dá para dizer se a leitura falhou nelas" % le["sem_campo"])
         if a["sem_hora"] > 0:
             L.append("  %d linha(s) do log sem hora legível, FORA das contas acima" % a["sem_hora"])
         if a["fora_do_formato"]:

@@ -215,8 +215,8 @@ wf tests/test_old_inner_mod_wa.py "inner_mod"; wf tests/test_boundaryx_wa.py "bo
 for i in 1 2 3 4 5 6 7; do wf "tests/test_many_mod_$i.py" "many_mod"; done
 for i in $(seq -w 1 30); do wf "tests/test_huge_mod_$i.py" "huge_mod"; done
 for m in cap_a cap_b cap_c cap_d cap_e; do for i in $(seq -w 1 21); do wf "tests/test_${m}_$i.py" "$m"; done; done
-# nome solto (ga-2hd02v.3.17): atalho de arquivo em outra pasta. loose_page.html é único; dup_page.html existe em 2 pastas; raiz_page.html mora na raiz; solto_run.sh tem teste; shared/notas_solto.md é pasta que nunca sai
-wf templates/loose_page.html "<p>x</p>"; wf templates/dup_page.html "<p>a</p>"; wf daemons/templates/dup_page.html "<p>b</p>"; wf raiz_page.html "<p>r</p>"; wf "templates/com espaco/pagina_estranha.html" "<p>e</p>"
+# nome solto (ga-2hd02v.3.17): atalho de arquivo em outra pasta. loose_page.html é único; dup_page.html existe em 2 pastas; raiz_page.html mora na raiz; dupr_page.html mora na raiz E em templates/; solto_run.sh tem teste; shared/notas_solto.md é pasta que nunca sai
+wf templates/loose_page.html "<p>x</p>"; wf templates/dup_page.html "<p>a</p>"; wf daemons/templates/dup_page.html "<p>b</p>"; wf raiz_page.html "<p>r</p>"; wf dupr_page.html "<p>r</p>"; wf templates/dupr_page.html "<p>t</p>"; wf "templates/com espaco/pagina_estranha.html" "<p>e</p>"
 wf scripts/solto_run.sh "# solto_run"; wf tests/test_solto_run.py "solto_run"; wf shared/notas_solto.md "# notas"; wf fixtures/solto_dado.json "{}"
 gw add -A && gw commit -q -m 1 && gw update-ref refs/remotes/origin/main HEAD || bad "repo de mentira do WA não montado"
 wf tests/test_late_mod.py "late_mod"; gw add -A && gw commit -q -m 2   # o teste de late_mod só existe no HEAD, não em origin/main
@@ -290,8 +290,9 @@ SOLTO_TESTE='tests/test_x.py'
 expect "solto: html solto vira o único arquivo com esse nome na árvore (e passa pelo filtro)" "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar loose_page.html")" 0 '"verdict": "node".*"paths": \["lib/x\.py", "tests/test_x\.py", "templates/loose_page\.html"\].*caminho-solto:loose_page\.html=templates/loose_page\.html'
 expect "solto: nome que não existe em lugar algum da árvore -> segue solto (mini), SEM nota (vazio é um estado legítimo)" "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar nao_existe_em_lugar_algum.html")" 10 'caminho-fora-do-filtro:nao_existe_em_lugar_algum\.html.*"info": \["tela-ao-vivo"\]\}$'
 expect "solto: dois arquivos com o nome na árvore e nenhum citado -> segue solto (mini), sem nota de ilegível" "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar dup_page.html")" 10 'caminho-fora-do-filtro:dup_page\.html.*"info": \["tela-ao-vivo"\]\}$'
-expect "solto: dois na árvore mas a bead cita UM com pasta -> é esse (sem ler a árvore)" "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar templates/dup_page.html (dup_page.html)")" 0 '"paths": \["lib/x\.py", "tests/test_x\.py", "templates/dup_page\.html"\].*caminho-solto:dup_page\.html=templates/dup_page\.html'
+expect "solto: dois na árvore mas a bead cita UM com pasta -> é esse (a árvore lida confirma que não há arquivo da raiz com o nome)" "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar templates/dup_page.html (dup_page.html)")" 0 '"paths": \["lib/x\.py", "tests/test_x\.py", "templates/dup_page\.html"\].*caminho-solto:dup_page\.html=templates/dup_page\.html'
 expect "solto: a bead cita DOIS com pasta e o nome solto -> não sei qual: segue solto (mini)" "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar templates/dup_page.html e daemons/templates/dup_page.html (dup_page.html)")" 10 'caminho-fora-do-filtro:dup_page\.html'
+expect "solto: a bead cita templates/dupr_page.html mas o repo TEM dupr_page.html na raiz -> o solto pode ser o da raiz: não troca, segue solto (mini)" "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar templates/dupr_page.html (dupr_page.html)")" 10 'caminho-fora-do-filtro:dupr_page\.html'
 expect "solto: o arquivo mora na RAIZ do repo (o filtro não manda) -> continua mini com o próprio nome" "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar raiz_page.html")" 10 'caminho-fora-do-filtro:raiz_page\.html'
 expect "solto: o caminho trocado é julgado pelo mesmo filtro (pasta que nunca sai) -> mini com o caminho REAL na razão" "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar notas_solto.md")" 10 'caminho-fora-do-filtro:shared/notas_solto\.md'
 expect "solto: caminho real fora do formato seguro (espaço) não é adotado -> segue solto (mini)" "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar pagina_estranha.html")" 10 'caminho-fora-do-filtro:pagina_estranha\.html'
@@ -299,7 +300,9 @@ expect "solto: nome solto de DADO (.json) nunca é trocado, mesmo único na árv
 expect "solto: código solto ganha o caminho real e, com ele, o teste derivado" "$(DESC 'ajustar solto_run.sh')" 0 '"basis": "derivado".*caminho-solto:solto_run\.sh=scripts/solto_run\.sh.*teste-derivado:scripts/solto_run\.sh=tests/test_solto_run\.py'
 export WA_NODE_REPO="$T/wa-repo-ausente"
 expect "solto: árvore ilegível (repo inexistente) -> segue solto (mini) COM a nota; falhou não é 'vazio'" "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar loose_page.html")" 10 'caminho-fora-do-filtro:loose_page\.html.*caminho-solto-ilegivel:repo-git-rc-128'
-expect "solto: com a árvore ilegível o caminho citado com pasta ainda resolve (não precisa da árvore)" "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar templates/loose_page.html (loose_page.html)")" 0 '"verdict": "node".*caminho-solto:loose_page\.html=templates/loose_page\.html'
+# (ga-2hd02v.3.17, gate 1) ANTES: "com a árvore ilegível o caminho citado com pasta ainda resolve (não precisa da árvore)" -> node. Sem a árvore não dá para saber se o solto é o arquivo da RAIZ (aí o citado seria outro
+# arquivo): palpite não é prova, e falhou não pode virar node. Agora segue solto = mini, COM a nota; o caso foi invertido de propósito
+expect "solto: com a árvore ilegível o caminho citado com pasta NÃO é adotado (não dá para saber se o solto é o da raiz) -> segue solto (mini) COM a nota" "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar templates/loose_page.html (loose_page.html)")" 10 'caminho-fora-do-filtro:loose_page\.html.*caminho-solto-ilegivel:repo-git-rc-128'
 export WA_NODE_REPO="$T/wa-repo-ausente" WA_NODE_MIRROR="$T/espelho-ausente"
 
 # ---- o classificador não deixa resíduo e só aceita stdin
@@ -436,13 +439,18 @@ S_HTML=$(DESC "lib/x.py e $SOLTO_TESTE: ajustar loose_page.html")
 mutant solto-arvore-nao-troca    'swap[p] = hits[0]'                   'pass'                                       "$S_HTML" 0 'caminho-solto:loose_page\.html=templates/loose_page\.html' "$SV"
 mutant solto-citado-nao-troca    'swap[p] = cited[0]'                  'pass'                                       "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar templates/dup_page.html (dup_page.html)")" 0 'caminho-solto:dup_page\.html=templates/dup_page\.html' "$SV"
 mutant solto-citado-ignora       'cited = sorted(set(q for q in foldered if q.rsplit("/", 1)[-1] == p))' 'cited = []' "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar templates/dup_page.html (dup_page.html)")" 0 'caminho-solto:dup_page\.html=templates/dup_page\.html' "$SV"
-mutant solto-dois-citados-escolhe 'if len(cited) == 1:'                'if len(cited) >= 1:'                         "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar templates/dup_page.html e daemons/templates/dup_page.html (dup_page.html)")" 10 'caminho-fora-do-filtro:dup_page\.html' "$SV"
+mutant solto-dois-citados-escolhe 'if len(cited) == 1 and ok and p not in tree:' 'if len(cited) >= 1 and ok and p not in tree:' "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar templates/dup_page.html e daemons/templates/dup_page.html (dup_page.html)")" 10 'caminho-fora-do-filtro:dup_page\.html' "$SV"
 mutant solto-ambiguo-escolhe     'if len(hits) == 1 and'               'if len(hits) >= 1 and'                       "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar dup_page.html")" 10 'caminho-fora-do-filtro:dup_page\.html' "$SV"
 mutant solto-sem-formato-seguro  ' and all(SAFE_SEG.match(sg) for sg in hits[0].split("/")):' ':'                       "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar pagina_estranha.html")" 10 'caminho-fora-do-filtro:pagina_estranha\.html' "$SV"
 mutant solto-sem-filtro          'sent = set(sent) | sent_by_filter(new)' 'sent = set(sent) | set(new)'        "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar notas_solto.md")" 10 'caminho-fora-do-filtro:shared/notas_solto\.md' "$SV"
 mutant solto-dado-tambem         'RESOLVE_EXT = CODE_EXT + ("html", "md")' 'RESOLVE_EXT = CODE_EXT + ("html", "md", "json")' "$(DESC "lib/x.py e $SOLTO_TESTE: ler solto_dado.json")" 10 'caminho-fora-do-filtro:solto_dado\.json' "$SV"
 mutant solto-codigo-nao-resolve  ' and (p not in sent or p.rsplit(".", 1)[-1].lower() in CODE_EXT)]' ' and p not in sent]'         "$(DESC 'ajustar solto_run.sh')" 0 'caminho-solto:solto_run\.sh=scripts/solto_run\.sh' "$SV"
 mutant solto-falha-vira-vazio    'note = ["caminho-solto-ilegivel:" + str(e)]' 'note = []'                       "$S_HTML" 10 'caminho-solto-ilegivel:repo-git-rc-128'
+# a regra (1) (o citado com pasta) só vale com a árvore LIDA e sem arquivo da raiz com o nome: cada mutante volta a uma metade da regra antiga
+mutant solto-citado-ignora-a-raiz 'if len(cited) == 1 and ok and p not in tree:' 'if len(cited) == 1 and ok:'          "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar templates/dupr_page.html (dupr_page.html)")" 10 'caminho-fora-do-filtro:dupr_page\.html' "$SV"
+mutant solto-citado-sem-arvore    'if len(cited) == 1 and ok and p not in tree:' 'if len(cited) == 1 and p not in tree:' "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar templates/loose_page.html (loose_page.html)")" 10 'caminho-fora-do-filtro:loose_page\.html.*caminho-solto-ilegivel:repo-git-rc-128'
+mutant solto-citado-sem-arvore-nem-raiz 'if len(cited) == 1 and ok and p not in tree:' 'if len(cited) == 1:'                "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar templates/loose_page.html (loose_page.html)")" 10 'caminho-fora-do-filtro:loose_page\.html.*caminho-solto-ilegivel:repo-git-rc-128'
+mutant solto-arvore-lida-nao-marca-ok 'tree, ok = set(repo_tree()), True' 'tree, ok = set(repo_tree()), False'  "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar templates/dup_page.html (dup_page.html)")" 0 'caminho-solto:dup_page\.html=templates/dup_page\.html' "$SV"
 # o resíduo no TMPDIR: o mutante que não apaga a árvore tem de deixar item para trás (senão o teste de "sem resíduo" passaria mesmo sem a limpeza)
 if mk_mutant sem-limpeza 'shutil.rmtree(root, ignore_errors=True)' 'pass'; then
   left=$(tmp_residue "$T/mut-sem-limpeza.py")

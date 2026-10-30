@@ -13504,7 +13504,7 @@ _PWP_UPD=""          # updated_at da bead (a chave da memória junto com o id)
 _PWP_MEMO_V=""       # veredito lembrado por _pilot_wa_node_pass_memo_hit
 _PWP_V=""            # saída de _pilot_wa_node_pass_check: node | mini | unknown | timeout | error | missing
 _PWP_BASIS=""        # a base do veredito node (label | text)
-_PWP_DETAIL='{"reasons":null,"classes":null,"paths":null}'   # JSON {reasons,classes,paths} do último `check`: lista (pode ser []) = o classificador respondeu; null = NÃO li (timeout, erro, saída que não é JSON de veredito)
+_PWP_DETAIL='{"reasons":null,"classes":null,"paths":null,"leitura":null}'   # JSON {reasons,classes,paths,leitura} do último `check`: lista (pode ser []) = o classificador respondeu; null = NÃO li (timeout, erro, saída que não é JSON de veredito). leitura: as entradas *-ilegivel do `info` dele (a leitura que FALHOU), [] = leu tudo
 _PWP_TOKENS=""       # palavras "veredito:classe" da última sonda (a classe é o motivo até o 1º `:`); o resumo da passada soma estas
 _PWP_ADOPTED=0       # 1 iff esta passada tirou o carimbo da bead que está em dispatch_one (o desfazer só devolve o que ela tirou)
 _PILOT_WA_NODE_PASS=0   # 1 SÓ enquanto a passada entrega uma bead a dispatch_one (modo on); dispatch_one lê
@@ -13614,7 +13614,7 @@ _pilot_wa_node_pass_memo_put() {
 # Sempre devolve 0.
 _pilot_wa_node_pass_check() {
   local _pc_id="${1:-}" _pc_store="${2:-}" _pc_dir _pc_out="" _pc_rc=0 _pc_vb="" _pc_to _pc_det=""
-  _PWP_V="error"; _PWP_BASIS=""; _PWP_DETAIL='{"reasons":null,"classes":null,"paths":null}'
+  _PWP_V="error"; _PWP_BASIS=""; _PWP_DETAIL='{"reasons":null,"classes":null,"paths":null,"leitura":null}'
   _pc_dir="${PILOT_WA_NODE_SCRIPTS:-${GC_CITY:-/nonexistent}/scripts}"
   if [ ! -x "$_pc_dir/wa-node-dispatch.sh" ]; then _PWP_V="missing"; return 0; fi
   _pc_to="${PILOT_WA_NODE_PASS_CHECK_TIMEOUT:-30}"; case "$_pc_to" in ''|*[!0-9]*) _pc_to=30 ;; esac
@@ -13634,8 +13634,10 @@ _pilot_wa_node_pass_check() {
   esac
   # ga-2hd02v.3.17: os motivos e caminhos que o classificador deu (só rc 0/10/11 trazem JSON de veredito). vazio (reasons=[]) → "[]": o classificador respondeu sem motivo;
   # falhou/ilegível (sem saída, JSON que o jq não lê, reasons que não é lista) → null: "não li" NUNCA vira "sem motivo". Só a LEITURA do detalhe falha aqui; o veredito acima não depende dela.
+  # leitura: o `info` do classificador diz o que ELE não conseguiu ler (caminho-solto-ilegivel:…, espelho-ilegivel:…, teste-derivado-ilegivel:…); essas entradas (até 6 de 80 caracteres) são a leitura que FALHOU, [] é "leu tudo"
+  # e null é "o info não foi lido" (sem saída, JSON sem `info` ou com `info` que não é lista): os três nunca se confundem. Só vai para a linha da sonda; o veredito e o despacho não leem.
   case "$_pc_rc" in
-    0|10|11) _pc_det=$(printf '%s' "$_pc_out" | jq -c '{reasons: (if (.reasons | type) == "array" then (.reasons[:12] | map(tostring | .[:80])) else null end), classes: (if (.reasons | type) == "array" then (.reasons | map(tostring | split(":")[0] | gsub("[[:space:]]"; "_")) | unique) else null end), paths: (if (.paths | type) == "array" then (.paths[:10] | map(tostring | .[:120])) else null end)}' 2>/dev/null) || _pc_det=""
+    0|10|11) _pc_det=$(printf '%s' "$_pc_out" | jq -c '{reasons: (if (.reasons | type) == "array" then (.reasons[:12] | map(tostring | .[:80])) else null end), classes: (if (.reasons | type) == "array" then (.reasons | map(tostring | split(":")[0] | gsub("[[:space:]]"; "_")) | unique) else null end), paths: (if (.paths | type) == "array" then (.paths[:10] | map(tostring | .[:120])) else null end), leitura: (if (.info | type) == "array" then (.info | map(tostring | select(test("-ilegivel"))) | .[:6] | map(.[:80])) else null end)}' 2>/dev/null) || _pc_det=""
              [ -z "$_pc_det" ] || _PWP_DETAIL="$_pc_det" ;;
   esac
   return 0
@@ -13652,7 +13654,7 @@ _pilot_wa_node_pass_probe_note() {
   _PWP_TOKENS=$(printf '%s' "$_PWP_DETAIL" | jq -r --arg v "$_PWP_V" '.classes as $c | (if ($v == "node" or $v == "mini" or $v == "unknown") then (if $c == null then ["ilegivel"] elif ($c | length) == 0 then ["sem-motivo"] else $c end) else ["sem-saida"] end) | map($v + ":" + .) | join(" ")' 2>/dev/null) || _PWP_TOKENS="${_PWP_V}:ilegivel"
   [ -n "$_PWP_TOKENS" ] || _PWP_TOKENS="${_PWP_V}:ilegivel"
   { jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg b "$_pn_id" --arg l "$_pn_lane" --arg v "$_PWP_V" --arg ba "$_PWP_BASIS" --argjson d "$_PWP_DETAIL" \
-      '{ts:$ts,event:"wa-node-pass-probe",bead:$b,lane:$l,verdict:$v,basis:$ba,reasons:$d.reasons,classes:$d.classes,paths:$d.paths}' >> "$_pn_log"; } 2>/dev/null \
+      '{ts:$ts,event:"wa-node-pass-probe",bead:$b,lane:$l,verdict:$v,basis:$ba,reasons:$d.reasons,classes:$d.classes,paths:$d.paths,leitura:$d.leitura}' >> "$_pn_log"; } 2>/dev/null \
     || warn "ga-2hd02v.3.17: não consegui gravar a linha de sonda de $_pn_id em $_pn_log"
   return 0
 }
