@@ -57,6 +57,15 @@ Texto que antes ficava no topo do `remote-clone-guard.py` (saiu de lá para cabe
 
 Para liberar: pôr `"real_sessions_released_by": "<quem decidiu, quando>"` na entrada do host. Para travar de novo: tirar a chave. O `--dry-run` mostra `session_kind` "teste" ou "real". Selftest do provider **277 de 277** (229 casos + 47 mutantes pegos + o controle contra um stub).
 
+**Guarda do servidor desatualizado (ga-2w0hiow, 29/10).** O item 2 é fail-closed de propósito, e foi ele que parou o pool remoto de 15:02 às 17:45 (BRT) de 29/10: um merge em `scripts/remote-clone-guard.py` muda o guarda do repositório na hora (a cidade roda in-place, o arquivo do mini É o implantado), enquanto o do servidor só mudava por `push-bundle`, manual — que naquela noite também recusava (hook novo sem veredito na POLICY, ver `remote-worker-bundle.md`). Todo start remoto morria com `ausente ou diferente do repositório no host`, que só aparecia no `session-ssh.log`. Agora há `python3 -I $S/hetzner-claude.py sync-guard [--check]`:
+* compara o sha do guarda do repositório (o MESMO arquivo que o provider confere) com o do servidor; igual = "em dia" e nada é escrito;
+* `--check` só diz (exit 1) e avisa; sem ele, grava ao lado, confere o sha do que gravou, guarda o anterior em `remote-clone-guard.py.sync-bak`, troca por `mv` (atômico: sessão em andamento segue com o inode velho) e roda o `--selfcheck` do guarda NOVO contra o `settings.json` do servidor; **reprovou = REVERTE** (ou retira o novo, se não havia) e não tenta de novo para o mesmo guarda do repositório antes de 30 min;
+* exit 0 em dia/atualizado · 1 difere (`--check`) ou reprovou/falhou · 3 não consegui saber (ssh fora, resposta ilegível, guarda do repositório ilegível ou vazio, symlink no servidor, outra sincronização em andamento): nunca vira "em dia" e nunca apaga nada. `notify` no exit 1, quando troca o guarda e quando o exit 3 dura 30 min seguidos (detector que não sabe para sempre é silêncio), no máximo uma vez por hora por desfecho igual; estado em `<estado>/hetzner-guard-sync.state.json`;
+* é independente do `push-bundle` de propósito: o guarda não pode esperar pela classificação de um hook alheio. A mensagem de recusa do provider agora cita este comando;
+* o job é `scripts/com.gascity.hetzner-guard-sync.plist` (180 s). Instalar (`launchctl bootstrap`) e registrar na política do wait-for-dolt e no DPW é do Mayor, como foi com o capacity-step e o occupancy-watch; enquanto não estiver instalado, rodar o comando à mão (ou em laço) tem o mesmo efeito.
+
+**LIDO DO CÓDIGO e provado com o servidor em loopback** (`hetzner-claude.selftest.sh`: o shell, o sha, o `mv` e o `--selfcheck` do guarda de verdade rodam; 68 verificações novas, 12 delas mutantes pegos). **Não medido contra o Hetzner de verdade**: o primeiro uso real é do Mayor (`--check` primeiro).
+
 ## `rm -rf` sem humano no teclado
 
 
@@ -95,7 +104,8 @@ Mesmo claude, `--dangerously-skip-permissions`, `CLAUDE_PROJECT_DIR` = worktree 
 S=$GC_CITY_PATH/scripts
 GC_CITY_PATH=$GC_CITY_PATH python3 -I $S/hetzner-claude.py push-bundle --role dog --role-dir $GC_CITY_PATH/.gc/agents/dogs/gastown.dog-1 --out OUT
 ssh hetzner-teste 'python3 -I ~/.claude/hooks/remote-clone-guard.py --selfcheck ~/.claude/settings.json'   # 0 = guarda e settings batem
-bash $S/remote-clone-guard.selftest.sh; bash $S/remote-bundle-build.selftest.sh; bash $S/gc-session-ssh.selftest.sh   # herméticos
+python3 -I $S/hetzner-claude.py sync-guard --check; echo $?   # 0 = o guarda do servidor é o do repositório; 1 = difere (sem --check, troca e confere o --selfcheck); 3 = não sei
+bash $S/remote-clone-guard.selftest.sh; bash $S/remote-bundle-build.selftest.sh; bash $S/gc-session-ssh.selftest.sh; bash $S/hetzner-claude.selftest.sh   # herméticos
 ```
 
 **Defeito corrigido junto**: o `push-bundle` recusava o `settings.json` do servidor assim que o claude gravava `theme`/`agentPushNotifEnabled` (chave alheia ao bundle). `hetzner-claude.py` agora preserva `theme` e `agentPushNotifEnabled` do próprio servidor (`OWN_KEYS`) e continua recusando qualquer outra chave alheia (caso no `hetzner-claude.selftest.sh`, 256 casos).
