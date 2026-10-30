@@ -13,7 +13,16 @@ SUBCOMANDOS
   install-claude --installer-sha256 H [--version V]   instala o build nativo (V padrão = o do mini) como o usuário do servidor.
   plugins                   instala no servidor os plugins da lista PLUGINS (iguais aos do mini, sem o github).
   push-bundle --role R --role-dir D --out DIR   monta o bundle da fatia 1, leva ao servidor, confere o hash lá e instala a camada home.
-  canary                    sessão mínima do jeito do provider (--settings do bundle, --dangerously-skip-permissions): responde?
+  sync-guard [--check]      o remote-clone-guard.py do servidor tem que ser IGUAL ao do repositório: o provider (gc-session-ssh, real_gate) recusa TODA sessão real quando não é, e um merge nesse
+                            arquivo muda o do repositório na hora (a cidade roda in-place) enquanto o do servidor só muda por push-bundle (ga-2w0hiow, 29/10: 2h43 de pool remoto parado, em silêncio).
+                            Desacoplado do bundle de propósito: um hook novo sem veredito na POLICY recusa o push-bundle, e o guarda não pode esperar por isso. Compara o sha; igual → "em dia".
+                            --check só diz (exit 1 se difere ou falta) e avisa. Sem --check troca: grava ao lado, confere o sha, guarda o anterior em .sync-bak, troca por mv (atômico) e roda o --selfcheck do
+                            guarda NOVO contra o settings do servidor; reprovou → REVERTE (exit 1, aviso) e não tenta de novo para o mesmo guarda do repositório antes de 30 min. Três estados:
+                            0 em dia/atualizado · 1 difere (--check) ou reprovou/falhou (revertido) · 3 não consegui saber (ssh fora, resposta ilegível, guarda do repositório ilegível ou vazio, symlink no
+                            servidor, outra sincronização em andamento): nunca vira "em dia" nem apaga nada. Aviso (`notify`) em 1, quando troca o guarda e quando o 3 dura 30 min SEGUIDOS (detector que não sabe
+                            para sempre é silêncio), uma vez por hora por desfecho igual.
+                            Estado em <estado>/hetzner-guard-sync.state.json; o job que roda isto a cada 180 s é com.gascity.hetzner-guard-sync (plist em scripts/, instalar é do Mayor).
+  canary                   sessão mínima do jeito do provider (--settings do bundle, --dangerously-skip-permissions): responde?
   fingerprint [--save F | --compare F]   impressão da credencial do MINI, só atributos: o hash do oauthAccount DECIDE; o mdat do
                             Keychain só informa (o mini renova o token sozinho, então ele anda sem que ninguém mexa).
   leak-scan PATH...         procura formato de token do claude em arquivos; imprime arquivo e contagem, nunca o texto achado. Symlink para fora do
@@ -51,6 +60,7 @@ CONFIGURAÇÃO (ambiente)  HETZNER_SSH_HOST (hetzner-teste) · HETZNER_REMOTE_HO
   HETZNER_SSH_TIMEOUT (30) · HETZNER_PROBE_TIMEOUT (120) · HETZNER_LOCK_WAIT (20) · HETZNER_INSTALLER_URL (https://claude.ai/install.sh)
   HETZNER_BUILDER (remote-bundle-build.py ao lado deste script; só o selftest troca) · GC_SSH_CONFIG (a config do provider, <cidade>/.gc/session-ssh.json)
   HETZNER_SESSION_SSH (o provider gc-session-ssh, que este script carrega para ler a conta e a chave; só o selftest troca)
+  HETZNER_CLONE_GUARD (o guarda do repositório que o sync-guard leva; padrão: remote-clone-guard.py ao lado deste script, o mesmo que o provider confere; só o selftest troca) · HETZNER_SYNC_TIMEOUT (90)
 
 CÓDIGOS  0 ok · 1 bloqueado / falhou / MUDOU (fingerprint) · 2 uso ou configuração inválida · 3 recusa de segurança, ou "não consegui ler/saber" (nunca vira "limpo" nem "igual")
 """
@@ -759,6 +769,181 @@ def cmd_push_bundle(a) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- o guarda de clone NO servidor (ga-2w0hiow)
+
+GUARD_NAME = "remote-clone-guard.py"
+GUARD_SRC = os.environ.get("HETZNER_CLONE_GUARD") or os.path.join(HERE, GUARD_NAME)  # o do repositório, ao lado deste script: o MESMO arquivo que o provider confere em real_gate; só o selftest troca
+GUARD_DEST = f"{RHOME}/.claude/hooks/{GUARD_NAME}"
+SYNC_FILE = os.path.join(STATE_DIR, "hetzner-guard-sync.state.json")
+SYNC_LOCK = os.path.join(STATE_DIR, "hetzner-guard-sync.lock")
+SYNC_NOTIFY_EVERY = 3600  # o mesmo desfecho ruim avisa no máximo uma vez por hora
+SYNC_UNKNOWN_ALARM = 1800  # "não consegui saber" por tanto tempo seguido também avisa
+SYNC_RETRY = 1800  # guarda que reprovou o --selfcheck do servidor não é reinstalado em laço: espera isto, ou o guarda do repositório mudar
+SYNC_TIMEOUT = _env_int("HETZNER_SYNC_TIMEOUT", 90)  # a instalação leva o --selfcheck do guarda no servidor
+# Roda NO servidor com o guarda novo na ENTRADA PADRÃO e imprime UMA linha: OK | REVERTIDO <texto> | FALHOU <texto>. Grava ao lado (mesma pasta), confere o sha do que gravou, guarda o anterior em .sync-bak,
+# troca por mv (atômico: sessão em andamento segue com o inode velho) e roda o --selfcheck do guarda NOVO contra o settings do servidor; se reprova, devolve o anterior (ou retira o novo se não havia).
+SYNC_SH = (
+    'set -u; umask 022; g=%(g)s; st=%(st)s; tmp="$g.sync-tmp"; bak="$g.sync-bak"; trap \'rm -f "$tmp"\' EXIT; '
+    'mkdir -p "$(dirname "$g")" || { echo "FALHOU mkdir"; exit 0; }; '
+    'cat > "$tmp" || { echo "FALHOU gravar"; exit 0; }; chmod 755 "$tmp" || { echo "FALHOU chmod"; exit 0; }; '
+    'h=$( { sha256sum "$tmp" || shasum -a 256 "$tmp"; } 2>/dev/null | cut -d" " -f1 ); '
+    '[ "$h" = %(want)s ] || { echo "FALHOU o que gravei tem sha ${h:-ilegivel}, nao o do repositorio"; exit 0; }; '
+    'had=0; if [ -e "$g" ]; then cp -p "$g" "$bak" || { echo "FALHOU backup"; exit 0; }; had=1; fi; '
+    'mv -f "$tmp" "$g" || { echo "FALHOU mv"; exit 0; }; '
+    'o=$(python3 -I "$g" --selfcheck "$st" 2>&1); rc=$?; o=$(printf %%s "$o" | tr "\\n" " " | cut -c1-300); '
+    'if [ "$rc" = 0 ]; then echo OK; exit 0; fi; '
+    'if [ "$had" = 1 ]; then mv -f "$bak" "$g" && echo "REVERTIDO selfcheck rc=$rc: $o" || echo "FALHOU reverter (selfcheck rc=$rc): $o"; '
+    'else rm -f "$g" && echo "REVERTIDO (nao havia guarda antes) selfcheck rc=$rc: $o" || echo "FALHOU remover o guarda novo (selfcheck rc=$rc): $o"; fi'
+)
+
+
+class SyncLock:
+    """Uma sincronização por vez e SEM esperar: a trava do gate (Lock) espera até LOCK_WAIT s, e uma sincronização lenta o deixaria 'unknown'."""
+
+    def __enter__(self):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        self.f = open(SYNC_LOCK, "a")
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.got = True
+        except OSError:
+            self.got = False
+        return self
+
+    def __exit__(self, *_):
+        self.f.close()
+
+
+def guard_src():
+    """(bytes, None) do guarda do repositório, ou (None, motivo)."""
+    # vazio → (None, "vazio": instalar um guarda vazio tiraria a trava); falhou/ilegível → (None, o erro): nunca vira "igual" nem "ausente"
+    try:
+        with open(GUARD_SRC, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        return None, f"não consegui ler o guarda do repositório {GUARD_SRC}: {e.strerror or e}"
+    if not data.strip():
+        return None, f"o guarda do repositório {GUARD_SRC} está vazio"
+    return data, None
+
+
+def guard_on_host():
+    """('sha', hex) | ('absent', '') | ('unknown', motivo). Só a linha `SHA <64 hex>` vira sha; ssh fora, rc ≠ 0, linha que não conheço, symlink e sha que não calculou são 'unknown'."""
+    # vazio → "unknown" (resposta sem linha não diz que o arquivo falta); falhou/ilegível → "unknown": não é "ausente" (sobrescreveria) nem "igual" (deixaria passar)
+    r = ssh('g=' + shlex.quote(GUARD_DEST) + '; [ -L "$g" ] && { echo SYMLINK; exit 0; }; [ -e "$g" ] || { echo ABSENT; exit 0; }; '
+            'h=$( { sha256sum "$g" || shasum -a 256 "$g"; } 2>/dev/null | cut -d" " -f1 ); [ "${#h}" = 64 ] && echo "SHA $h" || echo UNREADABLE')
+    if r.conn_failed:
+        return "unknown", "ssh não chegou ao servidor" + (" (timeout)" if r.timed_out else f" (rc={r.rc} {_short(r.err, 80)})")
+    lines = r.out.strip().splitlines()
+    if r.rc != 0 or len(lines) != 1:
+        return "unknown", f"resposta do servidor que não reconheço (rc={r.rc}): {_short(r.out + r.err, 120)}"
+    if lines[0] == "ABSENT":
+        return "absent", ""
+    m = re.fullmatch(r"SHA ([0-9a-f]{64})", lines[0])
+    if m:
+        return "sha", m.group(1)
+    why = {"SYMLINK": "o guarda do servidor é um symlink: não mexo", "UNREADABLE": "o guarda do servidor existe mas não consegui calcular o sha dele"}
+    return "unknown", why.get(lines[0]) or f"linha do servidor que não reconheço: {_short(lines[0], 80)}"
+
+
+def guard_apply(data: bytes, want: str):
+    """('ok', '') | ('reverted', texto) | ('failed', texto) | ('unknown', texto)."""
+    script = SYNC_SH % {"g": shlex.quote(GUARD_DEST), "st": shlex.quote(f"{RHOME}/.claude/settings.json"), "want": want}
+    r = ssh(script, timeout=SYNC_TIMEOUT, stdin=data)
+    # vazio/ilegível → "unknown" (sem a linha esperada não sei se o guarda foi trocado); ssh que cai no meio → "unknown": o servidor pode ter ficado como estava OU trocado, a próxima leitura converge
+    if r.conn_failed:
+        return "unknown", ("a ssh caiu durante a instalação" + (" (timeout)" if r.timed_out else f" (rc={r.rc})")
+                           + ": o guarda do servidor pode ter ficado como estava OU trocado, confira com sync-guard --check")
+    lines = r.out.strip().splitlines()
+    if r.rc != 0 or len(lines) != 1:
+        return "unknown", f"resposta da instalação que não reconheço (rc={r.rc}): {_short(r.out + r.err, 160)}"
+    ln = lines[0]
+    if ln == "OK":
+        return "ok", ""
+    if ln.startswith("REVERTIDO "):
+        return "reverted", _short(ln[len("REVERTIDO "):], 300)
+    if ln.startswith("FALHOU "):
+        return "failed", _short(ln[len("FALHOU "):], 300)
+    return "unknown", f"resposta da instalação que não reconheço: {_short(ln, 160)}"
+
+
+def sync_prev():
+    """O último desfecho gravado."""
+    # vazio/ausente → {} (sem histórico: o aviso pode sair de novo); falhou/ilegível ou que não é objeto → {} (idem: avisar a mais é o lado seguro de um alarme)
+    try:
+        with open(SYNC_FILE) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def sync_done(state: str, msg: str, rc: int, want=None, event: bool = False) -> int:
+    """Imprime, loga, grava o desfecho e, só DEPOIS de gravar (o aviso se apoia no arquivo para não repetir), avisa. state ∈ ok | stale | failed | unknown.
+    Avisam `stale` e `failed` (uma vez por hora por desfecho igual) e `event` (o guarda do servidor foi trocado). `unknown` (ssh fora, resposta ilegível) só avisa depois de
+    SYNC_UNKNOWN_ALARM segundos SEGUIDOS sem saber: um detector que não sabe para sempre é silêncio (e o ssh fora de um minuto não vale um aviso)."""
+    now = time.time()
+    print(f"sync-guard: {state}: {msg}")
+    log(f"sync-guard {state}: {msg}")
+    prev = sync_prev()
+    key = f"{state}:{msg}"
+    notified = prev.get("notified_at") if prev.get("key") == key else None
+    notified = notified if isinstance(notified, (int, float)) and not isinstance(notified, bool) else None
+    since = prev.get("since") if prev.get("state") == state else None  # desde quando o desfecho é este estado (ilegível → agora: o relógio do alarme recomeça)
+    since = since if isinstance(since, (int, float)) and not isinstance(since, bool) and since <= now else now
+    loud = event or state in ("stale", "failed") or (state == "unknown" and now - since >= SYNC_UNKNOWN_ALARM)
+    will = loud and (event or notified is None or now - notified >= SYNC_NOTIFY_EVERY)
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(SYNC_FILE + ".tmp", "w") as f:
+            json.dump({"state": state, "msg": msg, "key": key, "at": now, "since": since, "want": want, "notified_at": now if will else notified}, f)
+        os.replace(SYNC_FILE + ".tmp", SYNC_FILE)
+    except OSError as e:
+        print(f"hetzner-claude: não consegui gravar {SYNC_FILE} ({e}): sem aviso nesta rodada", file=sys.stderr)
+        return rc
+    if will:
+        try:
+            subprocess.run(["notify", "-t", "Hetzner guarda", f"guarda de clone do servidor: {state}: {msg}"[:180]], capture_output=True, timeout=20, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError) as e:
+            log(f"notify falhou: {e}")
+    return rc
+
+
+def cmd_sync_guard(a) -> int:
+    try:
+        data, why = guard_src()
+        if data is None:
+            return sync_done("unknown", why, 3)
+        want = hashlib.sha256(data).hexdigest()
+        with SyncLock() as lk:
+            if not lk.got:
+                return sync_done("unknown", "outra sincronização em andamento (a trava do sync-guard está tomada): não espero nem mexo no servidor", 3)
+            kind, have = guard_on_host()
+            if kind == "unknown":
+                return sync_done("unknown", have, 3)
+            if kind == "sha" and have == want:
+                return sync_done("ok", f"em dia ({want[:12]})", 0, want)
+            what = "ausente no servidor" if kind == "absent" else f"servidor {have[:12]} != repositório {want[:12]}"
+            if a.check:
+                return sync_done("stale", f"desatualizado: {what} (sync-guard sem --check troca; ou push-bundle)", 1, want)
+            prev = sync_prev()
+            at = prev.get("at")
+            if prev.get("state") == "failed" and prev.get("want") == want and isinstance(at, (int, float)) and not isinstance(at, bool) and 0 <= time.time() - at < SYNC_RETRY:
+                print(f"sync-guard: failed: o servidor já reprovou este guarda do repositório há {int(time.time() - at)}s ({prev.get('msg')}); "
+                      f"não reinstalo em laço: espero {SYNC_RETRY}s ou o guarda do repositório mudar")
+                return 1
+            how, text = guard_apply(data, want)
+            if how == "ok":
+                return sync_done("ok", f"atualizado ({have[:12] if kind == 'sha' else 'ausente'} -> {want[:12]}); o anterior ficou em {GUARD_DEST}.sync-bak", 0, want, event=True)
+            if how == "reverted":
+                return sync_done("failed", f"o --selfcheck do servidor reprovou o guarda novo e ele foi revertido ({text})", 1, want)
+            if how == "failed":
+                return sync_done("failed", f"a instalação falhou no servidor: {text}", 1, want)
+            return sync_done("unknown", text, 3)
+    except Exception as e:  # noqa: BLE001 — falha inesperada NUNCA vira "em dia": exit 3 e diz por quê
+        return sync_done("unknown", f"erro interno: {type(e).__name__}: {_short(str(e), 120)}", 3)
+
+
 def cmd_canary(a) -> int:
     cmd = (REMOTE_PATH + f'd={shlex.quote(RHOME)}/gt-remote/canary; mkdir -p "$d" && cd "$d" || exit 125; '
            f'timeout 100 claude -p "Responda apenas: OK" --settings {shlex.quote(RROOT)}/city/settings.json --dangerously-skip-permissions '
@@ -903,6 +1088,9 @@ def main(argv=None) -> int:
     s.add_argument("--out", required=True)
     s.add_argument("--skills", action="store_true")
     s.set_defaults(fn=cmd_push_bundle)
+    s = sp.add_parser("sync-guard")
+    s.add_argument("--check", action="store_true")
+    s.set_defaults(fn=cmd_sync_guard)
     sp.add_parser("canary").set_defaults(fn=cmd_canary)
     s = sp.add_parser("fingerprint")
     g = s.add_mutually_exclusive_group()

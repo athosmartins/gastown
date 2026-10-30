@@ -5,6 +5,9 @@
 # real nem a credencial do mini. Os textos de erro de COTA e de login EXPIRADO são sintéticos (só o de "deslogado" foi medido em
 # 14/10): estes casos provam o classificador, não o texto real do claude — isso só se mede depois do login.
 # HETZNER_CLAUDE_UNDER_TEST=<arquivo> roda o mesmo selftest contra uma cópia alterada (mutante); HZC_FAILFAST=1 para na 1ª falha.
+# SYNC-GUARD (ga-2w0hiow, última seção): em dia (nada escrito), ausente, diferente (o anterior fica em .sync-bak), --check (não escreve, avisa uma vez), --selfcheck do servidor reprova (REVERTE byte a byte;
+# não reinstala em laço; guarda do repositório que mudou tenta de novo), ssh fora e ssh que cai DURANTE a instalação (exit 3, nunca "em dia"), guarda do repositório ilegível/vazio, sha ilegível, o que foi gravado
+# sem o sha esperado, symlink, outra sincronização em andamento. O shell, o sha, o mv e o --selfcheck do guarda de verdade rodam no "servidor" loopback; HZC_NO_MUTANTS=1 pula os 12 mutantes.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 S=${HETZNER_CLAUDE_UNDER_TEST:-$HERE/hetzner-claude.py}
@@ -516,5 +519,165 @@ except subprocess.TimeoutExpired: print("PENDUROU"); sys.exit(124)
 print(r.stdout, end=""); sys.exit(r.returncode)' "$@"; }
 out=$(hang python3 -I "$S" leak-scan "$T/scan/fifo"); eq "FIFO na árvore não pendura e não conta como lido" $? 3; has "diz o motivo" "$out" "não é arquivo comum"
 chmod 000 "$T/scan/lock"; out=$(python3 -I "$S" leak-scan "$T/scan/lock"); eq "pasta ilegível não é 'limpo'" $? 3; has "msg" "$out" "NÃO CONSEGUI LER"; chmod 755 "$T/scan/lock"
+echo "== sync-guard: o guarda do host tem que ser o do repositório (ga-2w0hiow)"
+# O "servidor" é $SRV e o ssh falso roda o comando DE VERDADE nele: o sha, a troca atômica e o --selfcheck do guarda de verdade (GOOD) EXECUTAM aqui.
+GOOD=$HERE/remote-clone-guard.py; HG=$SRV/.claude/hooks/remote-clone-guard.py; HSET=$SRV/.claude/settings.json; RG=$T/repo-guard.py
+export HETZNER_CLONE_GUARD=$RG
+cat >"$T/bin/sha256sum" <<'EOF'
+#!/bin/sh
+# delega ao sha256sum (ou shasum) de verdade; um flag em $FAKE faz a leitura do guarda do servidor (bad.read) ou o que o sync acabou de gravar (bad.tmp) devolver lixo
+case "$*" in
+  *.sync-tmp*) [ -f "$FAKE/sha.bad.tmp" ] && { echo "lixo  -"; exit 0; } ;;
+  *) [ -f "$FAKE/sha.bad.read" ] && { echo "lixo  -"; exit 0; } ;;
+esac
+PATH=${PATH#*:}
+if command -v sha256sum >/dev/null 2>&1; then exec sha256sum "$@"; else exec shasum -a 256 "$@"; fi
+EOF
+chmod +x "$T/bin/sha256sum"
+sg_settings() {  # sg_settings [COMANDO] — settings.json do "servidor" com o hook do guarda no caminho REAL (COMANDO no lugar dele faz o --selfcheck reprovar)
+  local c=${1:-"python3 -I $HG || exit 2"}
+  mkdir -p "$SRV/.claude"
+  printf '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"%s"}]},{"matcher":"Edit|Write|MultiEdit|NotebookEdit","hooks":[{"type":"command","command":"%s"}]}]}}\n' "$c" "$c" >"$HSET"
+}
+sg_reset() {  # repositório = GOOD; servidor sem guarda, com o settings certo; nenhum estado nem arquivo do sync
+  rm -f "$STATE"/hetzner-guard-sync.* "$FAKE"/* "$HG" "$HG.sync-tmp" "$HG.sync-bak"; : >"$FAKE/calls"
+  mkdir -p "$SRV/.claude/hooks"; cp "$GOOD" "$RG"; export HETZNER_CLONE_GUARD=$RG; sg_settings
+}
+sg_host_old() { { cat "$GOOD"; echo "# versao antiga do host"; } >"$HG"; chmod 755 "$HG"; cp "$HG" "$T/old-guard.copy"; }  # guarda do servidor DIFERENTE do repositório
+sg() {  # sg NOME RC_QUERIDO TEXTO [args…] — roda sync-guard; confere o rc e um trecho da saída
+  local name=$1 want=$2 txt=$3 out rc; shift 3
+  out=$(python3 -I "$S" sync-guard "$@" 2>&1); rc=$?; GOUT=$out
+  if [ "$rc" = "$want" ] && printf '%s' "$out" | grep -qF -- "$txt"; then ok; else bad "$name (rc=$rc, queria $want; saída: $out)"; fi
+}
+same() { if cmp -s "$2" "$3"; then ok; else bad "$1 (arquivos diferentes: $2 × $3)"; fi; }
+sg_case_emdia() {
+  sg_reset; cp "$GOOD" "$HG"; chmod 755 "$HG"; : >"$FAKE/ssh.argv.on"
+  sg "guarda igual ao do repositório: em dia" 0 "em dia"
+  no "em dia não deixa .sync-tmp no servidor" "$HG.sync-tmp"; no "nem .sync-bak" "$HG.sync-bak"
+  eq "e nenhuma chamada ssh instalou nada" "$(grep -c sync-tmp "$FAKE/ssh.argv" || true)" 0
+  eq "em dia não avisa" "$(notifys)" 0
+}
+sg_case_ausente() {
+  sg_reset
+  sg "sem guarda no servidor: instala" 0 "atualizado"
+  same "o guarda instalado é o do repositório, byte a byte" "$HG" "$RG"
+  if [ -x "$HG" ]; then ok; else bad "o guarda instalado precisa ser executável"; fi
+  eq "avisou UMA vez que trocou o guarda" "$(notifys)" 1
+}
+sg_case_diferente() {
+  sg_reset; sg_host_old
+  sg "guarda diferente no servidor: troca" 0 "atualizado"
+  same "o guarda do servidor passou a ser o do repositório" "$HG" "$RG"
+  same "o anterior ficou guardado em .sync-bak" "$HG.sync-bak" "$T/old-guard.copy"
+  no "e o temporário não sobrou" "$HG.sync-tmp"
+  eq "avisou uma vez" "$(notifys)" 1
+  sg "segunda rodada: em dia" 0 "em dia"; eq "e sem novo aviso" "$(notifys)" 1
+}
+sg_case_check() {
+  sg_reset; sg_host_old
+  sg "--check com guarda diferente: desatualizado (exit 1)" 1 "desatualizado" --check
+  same "--check não escreve no servidor" "$HG" "$T/old-guard.copy"; no "nem .sync-tmp" "$HG.sync-tmp"; no "nem .sync-bak" "$HG.sync-bak"
+  eq "avisou UMA vez" "$(notifys)" 1
+  sg "--check de novo, mesmo desfecho" 1 "desatualizado" --check
+  eq "e não repete o aviso dentro da hora" "$(notifys)" 1
+  sg_reset; cp "$GOOD" "$HG"; sg "--check com guarda igual: em dia" 0 "em dia" --check
+}
+sg_case_reprova() {
+  sg_reset; sg_host_old; sg_settings "python3 -I $HG || true"   # settings que o --selfcheck do guarda reprova (um `|| true` apaga o exit 2)
+  sg "o --selfcheck do servidor reprova o guarda novo: REVERTE (exit 1)" 1 "revertido"
+  same "o guarda anterior voltou, byte a byte" "$HG" "$T/old-guard.copy"; no "sem temporário" "$HG.sync-tmp"
+  eq "avisou uma vez" "$(notifys)" 1
+  : >"$FAKE/ssh.argv.on"
+  sg "segunda rodada, mesmo guarda do repositório: não reinstala em laço" 1 "reprovou"
+  eq "e nenhuma chamada ssh tentou instalar" "$(grep -c sync-tmp "$FAKE/ssh.argv" || true)" 0
+  eq "nem repetiu o aviso" "$(notifys)" 1
+  sg_settings; { cat "$GOOD"; echo "# outra versao"; } >"$RG"   # o guarda do repositório mudou: é outro guarda, tenta de novo (agora com o settings certo)
+  sg "o guarda do repositório mudou: tenta de novo e passa" 0 "atualizado"
+  same "e instalou o novo" "$HG" "$RG"
+  sg_reset; sg_settings "python3 -I $HG || true"
+  sg "sem guarda antes e o --selfcheck reprova: o novo é retirado (exit 1)" 1 "revertido"
+  no "o servidor segue sem guarda (não fica um guarda que reprova)" "$HG"
+}
+sg_case_ssh() {
+  sg_reset; sg_host_old
+  echo 255 >"$FAKE/ssh.rc"
+  sg "ssh fora: não sei (exit 3), NÃO 'em dia'" 3 "ssh não chegou"
+  eq "um minuto sem saber não é alarme: nada avisado" "$(notifys)" 0
+  python3 -I - "$STATE/hetzner-guard-sync.state.json" <<'PY'   # a rodada sem saber mais antiga foi há 2 h
+import json, sys, time
+p = sys.argv[1]
+d = json.load(open(p))
+d["since"] = time.time() - 7200
+json.dump(d, open(p, "w"))
+PY
+  sg "ssh fora há mais de 30 min SEGUIDOS: continua exit 3 e AGORA avisa" 3 "ssh não chegou"
+  eq "avisou uma vez" "$(notifys)" 1
+  sg "e na rodada seguinte, mesmo desfecho: não repete dentro da hora" 3 "ssh não chegou"; eq "continua uma" "$(notifys)" 1
+  echo sync-tmp >"$FAKE/ssh.rc.only"   # só a instalação cai; a leitura passa
+  sg "a ssh cai DURANTE a instalação: não sei (exit 3)" 3 "durante a instalação"
+  same "o guarda do servidor segue o que era" "$HG" "$T/old-guard.copy"
+}
+sg_case_repo() {
+  sg_reset; sg_host_old; export HETZNER_CLONE_GUARD=$T/nao-existe.py; : >"$FAKE/ssh.argv.on"
+  sg "guarda do repositório ilegível: não sei (exit 3)" 3 "não consegui ler"
+  no "e não falou com o servidor" "$FAKE/ssh.argv"
+  : >"$T/vazio.py"; export HETZNER_CLONE_GUARD=$T/vazio.py
+  sg "guarda do repositório VAZIO: não sei (exit 3), nunca instala um guarda vazio" 3 "vazio"
+  same "o servidor ficou como estava" "$HG" "$T/old-guard.copy"
+  export HETZNER_CLONE_GUARD=$RG
+}
+sg_case_host() {
+  sg_reset; sg_host_old; : >"$FAKE/sha.bad.read"
+  sg "sha do servidor ilegível: não sei (exit 3), não troca" 3 "não consegui calcular"
+  same "o guarda do servidor segue o que era" "$HG" "$T/old-guard.copy"
+  sg_reset; ln -s "$GOOD" "$HG"
+  sg "guarda do servidor é um symlink: não mexo (exit 3)" 3 "symlink"
+  if [ -L "$HG" ]; then ok; else bad "o symlink do servidor continua symlink"; fi
+  sg_reset; sg_host_old; : >"$FAKE/sha.bad.tmp"
+  sg "o que foi gravado no servidor não tem o sha do repositório: falhou (exit 1)" 1 "falhou"
+  same "o guarda anterior ficou intacto" "$HG" "$T/old-guard.copy"; no "sem temporário" "$HG.sync-tmp"
+}
+sg_case_lock() {
+  sg_reset; sg_host_old; rm -f "$T/lock.held"
+  python3 -I -c 'import fcntl,sys,time; f=open(sys.argv[1],"a"); fcntl.flock(f,fcntl.LOCK_EX); open(sys.argv[2],"w").close(); time.sleep(8)' "$STATE/hetzner-guard-sync.lock" "$T/lock.held" &
+  local lp=$! n=0; while [ ! -e "$T/lock.held" ] && [ $n -lt 50 ]; do sleep 0.1; n=$((n+1)); done
+  sg "outra sincronização em andamento: não espera nem toca no servidor (exit 3)" 3 "outra sincronização"
+  same "o guarda do servidor segue o que era" "$HG" "$T/old-guard.copy"
+  kill $lp 2>/dev/null; wait $lp 2>/dev/null; rm -f "$T/lock.held"
+}
+SG_CASES="sg_case_emdia sg_case_ausente sg_case_diferente sg_case_check sg_case_reprova sg_case_ssh sg_case_repo sg_case_host sg_case_lock"
+for c in $SG_CASES; do $c; done
+if [ -z "${HZC_NO_MUTANTS:-}" ]; then
+  sgmut() {  # sgmut DESCRIÇÃO OLD NEW CASO… — troca UM trecho do hetzner-claude.py (confirmado: tem que existir uma vez só) e os casos que o cobrem TÊM que reprovar
+    local desc=$1 old=$2 new=$3; shift 3
+    python3 -I - "$S" "$T/mutant.py" "$old" "$new" <<'PY'
+import sys
+src, dst, old, new = sys.argv[1:]
+s = open(src).read()
+if s.count(old) != 1:
+    sys.exit(7)
+open(dst, "w").write(s.replace(old, new))
+PY
+    if [ $? != 0 ]; then bad "mutante '$desc': o trecho a estragar não existe exatamente uma vez no hetzner-claude.py"; return; fi
+    if ( S=$T/mutant.py; HZC_FAILFAST=; fail=0; for c in "$@"; do $c; done >/dev/null 2>&1; [ "$fail" -gt 0 ] ); then ok; else bad "mutante '$desc' SOBREVIVEU: os casos $* não o pegaram"; fi
+  }
+  sgmut "sem a reversão (o guarda que reprova o --selfcheck fica)" 'then mv -f "$bak" "$g" && echo' 'then true && echo' sg_case_reprova
+  sgmut "--check também instala" 'if a.check:' 'if False:' sg_case_check
+  sgmut "sha diferente conta como em dia" 'if kind == "sha" and have == want:' 'if kind == "sha":' sg_case_diferente sg_case_check
+  sgmut "leitura ilegível vira ausente (e o servidor é sobrescrito)" 'echo UNREADABLE' 'echo ABSENT' sg_case_host
+  sgmut "sem a conferência do sha depois de gravar" '[ "$h" = %(want)s ] ||' 'true ||' sg_case_host
+  sgmut "sem o --selfcheck no servidor" 'o=$(python3 -I "$g" --selfcheck "$st" 2>&1); rc=$?; ' 'o=; rc=0; ' sg_case_reprova
+  sgmut "reinstala em laço o guarda que já reprovou" 'prev.get("state") == "failed" and prev.get("want") == want' 'False' sg_case_reprova
+  sgmut "avisa a cada rodada" 'notified is None or now - notified >= SYNC_NOTIFY_EVERY' 'True' sg_case_check sg_case_reprova
+  sgmut "o não-saber avisa de imediato (ssh fora de um minuto vira alarme)" '(state == "unknown" and now - since >= SYNC_UNKNOWN_ALARM)' 'state == "unknown"' sg_case_ssh
+  sgmut "o não-saber nunca avisa (detector mudo para sempre)" '(state == "unknown" and now - since >= SYNC_UNKNOWN_ALARM)' 'False' sg_case_ssh
+  sgmut "symlink no servidor é seguido" '[ -L "$g" ] && { echo SYMLINK; exit 0; }; ' '' sg_case_host
+  sgmut "sem a trava (duas sincronizações ao mesmo tempo)" 'self.got = True
+        except OSError:
+            self.got = False' 'self.got = True
+        except OSError:
+            self.got = True' sg_case_lock
+fi
+rm -f "$T/bin/sha256sum"; unset HETZNER_CLONE_GUARD
 echo "hetzner-claude.selftest: $pass ok, $fail falhas, $skip pulados"
 [ "$fail" = 0 ]
