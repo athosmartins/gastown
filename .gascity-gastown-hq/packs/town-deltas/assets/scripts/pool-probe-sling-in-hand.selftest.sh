@@ -19,6 +19,7 @@ set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROBE="${PP_PROBE_UNDER_TEST:-$SELF_DIR/pool-probe.sh}"        # override = mutation checks
+export GATE_FOCUS_ACTIVE_OVERRIDE=0   # ga-6fkx9je: the probe reads the gate focus mode too; pin it OFF (the real state file would turn this red on the mini whenever the mode is ON)
 PASS=0; FAIL=0
 ok()  { echo "  ✓ $*"; PASS=$((PASS+1)); }
 bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
