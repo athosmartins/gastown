@@ -43,6 +43,9 @@
 #   antes de um start que só chega depois dele não é guardada: ssh falso que SEGURA a resposta); erro, ssh fora e resposta cortada continuam erro e nada fica guardado, e cache vencido + host fora do ar é erro, não a lista
 #   velha; cache vencido, do futuro, vazio, ilegível ou de forma errada pergunta ao host; [] é resposta; geração ilegível = sem cache; dry-run não usa nem altera; list_cache_s (0 desliga, padrão 10, 0-120, o resto recusa a
 #   config); só o host com cache é poupado; lista do cache não mexe no registro de sessões; falha ao invalidar não derruba o start. A base de cfg()/cfgm() fixa list_cache_s=0 em todo host: os outros grupos esperam um ssh por list-running.
+#   lrd (ga-sml4tqk) — host FORA do ar: o fato "o host não respondeu" (só ssh 255 / tempo esgotado) também é guardado por list_down_cache_s s (30 por padrão, 0 desliga, teto 60; list_cache_s 0 desliga os dois) e devolve ERRO rápido sem ssh, nunca
+#   lista, nem vazia: 20 list-running seguidos com o ssh levando 1 s para falhar = 1 ssh, todos rc 1, bem abaixo de 20 s; resposta cortada/sem marcadores NÃO é guardada; vence o prazo = pergunta de novo; host de volta, start e stop apagam o
+#   fato; arquivo torto/ilegível/vazio/de outra geração/do futuro = pergunta ao host (nunca um "fora" inventado); dry-run não usa; list_down_cache_s validada (o resto recusa a config).
 #   abort (ga-0k82lw) — o start que o mini ABANDONOU (prazo do provider estourado; provider morto com kill -9 na parte lenta) não deixa tmux no host, com o ssh falso dos dois jeitos: plain (fecha o canal ao matar o provider) e orphan (deixa o
 #   script do host gravável, como o sshd com ControlMaster); o stop que chega na parte lenta do start com o provider vivo faz o start desistir dizendo que foi abandonado; controles: start lento dentro do prazo abre, stop e depois start novo do mesmo nome abre.
 # CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar: teto do host, nome
@@ -1427,6 +1430,21 @@ case "$shn" in [1-9]*) ;; *) shard_bad;; esac
   mutant lr "geração ausente conta como ilegível (cache nunca liga antes do 1º start)" '/^def lr_gen/,/^def lr_invalidate/s/^        return ""$/        return None/'
   mutant lr "lista do cache reconcilia o registro de sessões" 's/if not dry and t0 is not None:/if not dry:/'
   mutant lr "falha ao invalidar derruba o start" 's/^        cfg.log(f"list-running: não consegui trocar a geração do cache.*$/        raise/'
+  # lrd (ga-sml4tqk): o fato "o host não respondeu" — cada guarda do cache negativo removida TEM que reprovar o grupo
+  mutant lrd "fato 'fora' nunca lido (cada chamada paga o ssh)" 's/^        down = lr_down_read(cfg, gen) if cfg.down_ttl else None$/        down = None/'
+  mutant lrd "prazo do fato 'fora' ignorado (vale para sempre)" 's/return (msg, int(age)) if 0 <= age < cfg.down_ttl else None/return (msg, int(age))/'
+  mutant lrd "relógio que voltou (idade negativa) vale como 'fora'" 's/return (msg, int(age)) if 0 <= age < cfg.down_ttl/return (msg, int(age)) if age < cfg.down_ttl/'
+  mutant lrd "geração gravada no fato 'fora' ignorada" 's/    if c.get("gen") != gen or not isinstance(ts, (int, float)) or not isinstance(msg, str) or not msg:/    if not isinstance(ts, (int, float)) or not isinstance(msg, str) or not msg:/'
+  mutant lrd "motivo vazio no fato 'fora' aceito" 's/ or not isinstance(msg, str) or not msg:/ or not isinstance(msg, str):/'
+  mutant lrd "resposta cortada também vira 'fora' (só o ssh que não respondeu pode)" 's/^    except Unreachable as e:  # só "não respondeu"/    except Fail as e:  # só "não respondeu"/'
+  mutant lrd "start e stop não apagam o fato 'fora'" 's/(("cache.json", cfg.list_ttl), ("down.json", cfg.down_ttl))/(("cache.json", cfg.list_ttl),)/'
+  mutant lrd "host de volta não apaga o fato 'fora'" 's/^            os.unlink(lr_path(cfg, "down.json"))  # o host respondeu.*$/            pass/'
+  mutant lrd "list_down_cache_s de qualquer forma aceito" 's/^        if not isinstance(self.down_ttl, int) or isinstance(self.down_ttl, bool) or not 0 <= self.down_ttl <= LIST_DOWN_TTL_MAX:/        if False:/'
+  mutant lrd "list_down_cache_s sem teto" 's/or not 0 <= self.down_ttl <= LIST_DOWN_TTL_MAX:/or not 0 <= self.down_ttl:/'
+  mutant lrd "list_down_cache_s booleano aceito" 's/ or isinstance(self.down_ttl, bool)//'
+  mutant lrd "sem list_down_cache_s o fato 'fora' fica desligado" 's/h.get("list_down_cache_s", LIST_DOWN_TTL)/h.get("list_down_cache_s", 0)/'
+  mutant lrd "list_cache_s 0 ainda guarda o fato 'fora'" 's/    gen = None if dry or not cfg.list_ttl else lr_gen(cfg)/    gen = None if dry else lr_gen(cfg)/'
+  mutant lrd "dry-run usa o fato 'fora'" 's/    gen = None if dry or not cfg.list_ttl else lr_gen(cfg)/    gen = None if not cfg.list_ttl else lr_gen(cfg)/'
   mutant abort "stop não grava a marca <nome>.stop" 's/mkdir -p @RUN@ && : > @RUN@\/@NAME@\.stop/true/'
   mutant abort "1ª chamada do start não apaga a marca (um stop antigo trava o start novo)" 's/^    prep_body = """rm -f @STOPF@$/    prep_body = """true/'
   mutant abort "2ª chamada do start não olha a marca (abre depois do stop)" 's/^\[ ! -e @STOPF@ \] || .*$/true/'
