@@ -9,7 +9,7 @@
 #   só crew/ worker/ + prefixos do rig, nunca main/tag/apagar/reescrever/dado; `publish` empurra ao origin sem force. Leitura que falha ⇒ recusa (estado inerte), nunca "limpo". Limites e resíduos: ver o runbook.
 #   O origin pode mudar uma branch por baixo (o gate reescreve): o hook pergunta a ponta VIVA ao origin (ls-remote) e recusa/avisa o push que o publish não entregaria; o sync alinha a ponta já entregue à do origin (ga-jgxgn6).
 #
-# SUBCOMANDOS: init <rig> <origin-url> [--seed GITDIR] [--prefix P/]... | sync [rig] | publish [rig] | status [rig] | sparse [rig] | authorize <pubkey> | hostkey | sshd start|stop|status|run | tunnel start|stop|status|run <host-ssh>
+# SUBCOMANDOS: init <rig> <origin-url> [--seed GITDIR] [--prefix P/]... | sync [rig] | publish [rig] | status [rig] | maint [--dry-run] [--force] [rig] | sparse [rig] | authorize <pubkey> | hostkey | sshd start|stop|status|run | tunnel start|stop|status|run <host-ssh>
 #   (uso interno: serve · hook pre-receive|post-receive · pack-hook · spec-out <rig>)
 # CÓDIGOS: 0 ok · 1 pendente/falha visível · 2 uso · 3 recusado por não poder conferir (fail-closed) · 75 espelho em atualização (tente de novo) · 126 serve recusou
 set -u
@@ -21,7 +21,8 @@ SCAN=${HETZNER_MIRROR_SCAN:-$(dirname "$SELF")/hetzner-mirror-scan.py}
 PORT=${HETZNER_MIRROR_PORT:-2293}
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 export GIT_AUTHOR_NAME=gt-mirror GIT_AUTHOR_EMAIL=gt-mirror@localhost GIT_COMMITTER_NAME=gt-mirror GIT_COMMITTER_EMAIL=gt-mirror@localhost
-GIT=$(command -v git) || { echo "hetzner-mirror: git não encontrado" >&2; exit 3; }
+GIT=${HETZNER_MIRROR_GIT:-$(command -v git)} || { echo "hetzner-mirror: git não encontrado" >&2; exit 3; }   # HETZNER_MIRROR_GIT: só para teste (o selftest do maint injeta um git lento para provar prazo e teto de swap)
+[ -x "$GIT" ] || { echo "hetzner-mirror: git não encontrado ($GIT)" >&2; exit 3; }
 RIG_RE='^[a-z][a-z0-9_-]{0,40}$'
 DATA_DIRS=".beads/ data/ logs/"   # pastas que o filtro do rsync nega na Seção 3 por serem dado por natureza (inclui o backup de bead: regra do Athos)
 
@@ -90,6 +91,7 @@ cmd_init() {
   c() { "$GIT" -C "$r" config "$@"; }
   c remote.origin.url "$url"; c --replace-all remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'; c remote.origin.tagopt --no-tags
   c receive.denyDeletes true; c receive.denyNonFastForwards true; c receive.fsckObjects true
+  c gc.auto 0; c maintenance.auto false; c receive.autogc false   # auto-gc desligado de propósito (ga-pepqfkk): quem limpa o espelho é o `maint`, sem `repack --cruft` (= -a) no meio do fetch
   c --unset-all gtmirror.prefix 2>/dev/null; for p in $pfx; do c --add gtmirror.prefix "$p"; done
   "$GIT" -C "$r" symbolic-ref HEAD refs/remotes/origin/main
   for p in pre-receive post-receive; do printf '#!/bin/sh\nHETZNER_MIRROR_HOME=%q exec %q hook %s "$@"\n' "$MH" "$SELF" "$p" > "$r/hooks/$p"; chmod 755 "$r/hooks/$p"; done
@@ -192,6 +194,139 @@ cmd_status() {
     for e in lastfetcherror lastpublisherror; do [ -n "$("$GIT" -C "$r" config gtmirror.$e)" ] && { echo "  $e: $("$GIT" -C "$r" config gtmirror.$e)"; rc=1; }; done
     [ -z "$pend" ] && [ -n "$t" ] || rc=1
   done; return $rc
+}
+
+# ── maint: manutenção diária e leve dos espelhos (ga-pepqfkk) ───────────────────────────────────────────────────────────────────────────────────────────────────
+# POR QUE existe. O fetch do sync chama `git maintenance run --auto`, mas a trava objects/maintenance.lock — órfã desde 13/10, vinda por hardlink no `init --seed` (clone --local) — faz o git sair com rc 0 e CALADO sob --auto: o auto-gc
+#   nunca rodou e os soltos do WA chegaram a 1,84 GB. Apagar a trava NÃO é o conserto: o auto-gc de hoje usa `repack --cruft`, que equivale a `-a` (o repo inteiro, em RAM) e, com load ~50, estoura o swap. Então ele fica DESLIGADO de propósito
+#   (maint_pin_noauto; o init já nasce assim) e a manutenção é esta rodada: prune-packed → repack -d -l (SÓ os soltos alcançáveis, nunca -a; 1 thread, janela de 64 MB) → prune --expire (solto inalcançável com menos de 2 semanas FICA: push
+#   em curso e fetch ainda sem ref não perdem objeto). Portões — rodada PULADA (rc 0; o tique seguinte tenta): load < MAX_LOAD, disco livre ≥ piso + o tamanho dos soltos (o pack novo não passa disso), trava do sync livre (a MESMA gtm-fetch.lock:
+#   sync e maint nunca mexem no mesmo espelho juntos). Leitura de load, disco ou soltos que falha ⇒ RECUSA (rc 1), nunca "pode rodar"; a de swap que falha deixa a rodada CEGA (o log diz swap=?) e não a derruba. Sem rodada boa há OVERDUE_H ⇒ rc 1,
+#   para o launchd mostrar. Ajustes por env: HETZNER_MIRROR_MAINT_{EVERY_H,MIN_FREE_MB,MAX_LOAD,
+#   TIMEOUT,SWAP_STOP_MB,OVERDUE_H,LOOSE_WARN,EXPIRE,POLL} e, só para teste, _{FREE,LOAD,SWAP}_CMD (um comando que imprime o número).
+MAINT_PID=""; MAINT_LOCK=""; MAINT_REPO=""; MAINT_MARK=""; MAINT_RIG=""; MAINT_IDLE=""; MAINT_DL=0; MAINT_S0="?"; MAINT_SWAP_PEAK=0; MAINT_TIMEOUT=1800
+mlog() { echo "[$(iso)] maint $*"; }
+maint_num() { [[ "${1:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; }
+maint_lt() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 < b + 0) }'; }
+maint_knob() { local v=${!1:-}; if [[ "$v" =~ ^[0-9]{1,9}$ ]]; then echo "$v"; else echo "$2"; fi; }   # inteiro do env, ou o padrão se vier vazio/lixo (nunca vira 0 por engano)
+# disco livre (MB) do volume do espelho. falhou/ilegível → rc 1 (quem chama RECUSA: sem leitura não sei se o pack novo cabe); 0 MB vem escrito "0", não vazio
+maint_free_mb() { local v
+  if [ -n "${HETZNER_MIRROR_MAINT_FREE_CMD:-}" ]; then v=$(sh -c "$HETZNER_MIRROR_MAINT_FREE_CMD" 2>/dev/null) || return 1
+  else v=$(df -Pk "$1" 2>/dev/null | awk 'NR==2 { print int($4 / 1024) }') || return 1; fi
+  [[ "$v" =~ ^[0-9]{1,9}$ ]] && echo "$v"; }
+# load de 1 min (sysctl no macOS, /proc/loadavg no Linux). falhou/ilegível → rc 1 (RECUSA)
+maint_load() { local v
+  if [ -n "${HETZNER_MIRROR_MAINT_LOAD_CMD:-}" ]; then v=$(sh -c "$HETZNER_MIRROR_MAINT_LOAD_CMD" 2>/dev/null) || return 1
+  else v=$(sysctl -n vm.loadavg 2>/dev/null | awk '{ print $2 }'); [ -n "$v" ] || v=$(awk '{ print $1 }' /proc/loadavg 2>/dev/null); fi
+  maint_num "$v" && echo "$v"; }
+# swap em uso (MB, inteiro). falhou/ilegível → rc 1 e a rodada fica CEGA nesse ponto (o log diz swap=?): leitura que não consegui fazer nunca derruba um passo, nem vira "0"
+maint_swap_mb() { local v
+  if [ -n "${HETZNER_MIRROR_MAINT_SWAP_CMD:-}" ]; then v=$(sh -c "$HETZNER_MIRROR_MAINT_SWAP_CMD" 2>/dev/null) || return 1
+  else v=$(sysctl -n vm.swapusage 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "used") { x = $(i + 2); u = substr(x, length(x)); sub(/[MG]$/, "", x); print int(u == "G" ? x * 1024 : x); exit } }')
+    [ -n "$v" ] || v=$(awk '/^SwapTotal:/ { t = $2 } /^SwapFree:/ { f = $2 } END { if (t != "") print int((t - f) / 1024) }' /proc/meminfo 2>/dev/null); fi
+  [[ "$v" =~ ^[0-9]{1,9}$ ]] && echo "$v"; }
+# soltos do espelho: "<count> <KiB> <packs>" (count-objects -v). falhou/número ilegível → rc 1 (RECUSA: sem isso não sei quanto o pack novo ocupa); 0 soltos vem escrito "0"
+maint_loose() { local o; o=$("$GIT" -C "$1" count-objects -v 2>/dev/null) || return 1
+  o=$(awk '/^count:/ { c = $2 } /^size:/ { k = $2 } /^packs:/ { p = $2 } END { print c, k, p }' <<< "$o")
+  [[ "$o" =~ ^[0-9]+\ [0-9]+\ [0-9]+$ ]] && echo "$o"; }
+# fixa o auto-gc DESLIGADO no espelho (três portas: o fetch chama `maintenance run --auto`, o push chama `gc --auto`). igual → nada · vazio → grava · falhou/ilegível → tenta gravar; se a gravação também falha, rc 1 (o tique seguinte refaz)
+maint_pin_noauto() { local r=$1 kv k v cur rc=0
+  for kv in gc.auto=0 maintenance.auto=false receive.autogc=false; do k=${kv%%=*}; v=${kv#*=}
+    cur=$("$GIT" -C "$r" config --get "$k" 2>/dev/null); [ "$cur" = "$v" ] || "$GIT" -C "$r" config "$k" "$v" 2>/dev/null || rc=1; done; return $rc; }
+maint_kill_tree() { local c; for c in $(pgrep -P "$1" 2>/dev/null); do maint_kill_tree "$c"; done; kill -TERM "$1" 2>/dev/null; return 0; }   # o repack tem filhos (pack-objects): matar só o pai deixaria um órfão escrevendo
+# um repack morto por TERM deixa objects/pack/tmp_pack_* e .tmp-* (o git NÃO os apaga no sinal — medido em 30/10: 2 MB e crescendo no instante da morte) e o `prune --expire` só os varre depois de 2 semanas: num disco apertado
+# são centenas de MB parados. Com a trava do sync na mão ninguém mais grava ali (o push do servidor escreve na quarentena objects/incoming-*, não em objects/pack): apago o que nasceu DEPOIS da marca do começo da rodada, e só isso.
+# ilegível (find falha) → fica o arquivo e o aviso; nunca apaga por suposição
+maint_rm_tmp() { [ -n "$MAINT_REPO" ] && [ -e "$MAINT_MARK" ] || return 0
+  find "$MAINT_REPO/objects/pack" -maxdepth 1 -type f \( -name 'tmp_*' -o -name '.tmp-*' \) -newer "$MAINT_MARK" -exec rm -f {} + 2>/dev/null || mlog "$MAINT_RIG: aviso — não consegui varrer os tmp_pack_* do passo morto em $MAINT_REPO/objects/pack; confira à mão" >&2; return 0; }
+maint_cleanup() { [ -z "$MAINT_PID" ] || { maint_kill_tree "$MAINT_PID"; wait "$MAINT_PID" 2>/dev/null; maint_rm_tmp; }; [ -z "$MAINT_LOCK" ] || rm -rf "$MAINT_LOCK"; [ -z "$MAINT_MARK" ] || rm -f "$MAINT_MARK"; MAINT_PID=""; MAINT_LOCK=""; MAINT_MARK=""; return 0; }
+# maint_step <comando...>: roda sob nice 19, preso a MAINT_DL (prazo, epoch) e ao teto de swap. rc: o do comando · 124 estourou o prazo · 78 o swap subiu SWAP_STOP_MB desde o começo da rodada (passo parado).
+# A cada POLL s lê o swap (MAINT_SWAP_PEAK guarda o maior visto). Passo parado/cortado: maint_rm_tmp apaga os tmp_pack_* que ele deixou.
+maint_step() { local s rc stop; stop=$(maint_knob HETZNER_MIRROR_MAINT_SWAP_STOP_MB 1536)
+  ( exec nice -n 19 "$@" ) & MAINT_PID=$!
+  while kill -0 "$MAINT_PID" 2>/dev/null; do sleep "$(maint_knob HETZNER_MIRROR_MAINT_POLL 2)"
+    kill -0 "$MAINT_PID" 2>/dev/null || break   # terminou durante o sleep: o rc é o dele, não o de uma leitura de swap feita depois do fim
+    if [ "$MAINT_S0" != "?" ] && s=$(maint_swap_mb); then [ "$s" -le "$MAINT_SWAP_PEAK" ] || MAINT_SWAP_PEAK=$s
+      if [ $((s - MAINT_S0)) -ge "$stop" ]; then maint_kill_tree "$MAINT_PID"; wait "$MAINT_PID" 2>/dev/null; MAINT_PID=""; maint_rm_tmp; return 78; fi; fi
+    if [ "$(date +%s)" -ge "$MAINT_DL" ]; then maint_kill_tree "$MAINT_PID"; wait "$MAINT_PID" 2>/dev/null; MAINT_PID=""; maint_rm_tmp; return 124; fi
+  done
+  wait "$MAINT_PID"; rc=$?; MAINT_PID=""; return $rc; }
+maint_do() { local lbl=$1 t rc; shift; t=$(date +%s); maint_step "$@"; rc=$?
+  case $rc in
+    0) mlog "$MAINT_RIG: $lbl ok ($(( $(date +%s) - t )) s)" ;;
+    78) mlog "$MAINT_RIG: $lbl PARADO — o swap subiu $(maint_knob HETZNER_MIRROR_MAINT_SWAP_STOP_MB 1536) MB desde o começo da rodada; o próximo tique tenta de novo" >&2 ;;
+    124) mlog "$MAINT_RIG: $lbl CORTADO — passou do prazo da rodada (${MAINT_TIMEOUT} s); o próximo tique tenta de novo" >&2 ;;
+    *) mlog "$MAINT_RIG: $lbl FALHOU (rc $rc)" >&2 ;;
+  esac; return $rc; }
+# atraso: sem rodada boa há mais de OVERDUE_H (a última boa, ou a 1ª vez que o job viu o espelho). rc 0 = atrasada (e diz), 1 = em dia OU base ilegível (não sei dizer: não acusa)
+maint_late() { local rig=$1 base=$2 now=$3 mx; mx=$(maint_knob HETZNER_MIRROR_MAINT_OVERDUE_H 48); [[ "$base" =~ ^[0-9]{1,12}$ ]] || return 1
+  [ $((now - base)) -gt $((mx * 3600)) ] || return 1
+  mlog "$rig: ATRASADA — sem rodada boa há $(( (now - base) / 3600 )) h (limite $mx h): os portões vêm recusando; olhe load/disco, ou rode \`hetzner-mirror.sh maint --force $rig\` numa hora calma" >&2; }
+maint_run() {   # maint_run <rig> <repo> <dry> <now> <base>: com a trava do sync NA MÃO. rc 0 ok/pulada · 1 falhou, recusada ou atrasada
+  local rig=$1 r=$2 dry=$3 now=$4 base=$5 load free need cnt kib pk cnt2 kib2 pk2 free2 oid head exp np npk t0 rc=0 prune_ok=1 maxl minfree warn delta peak tmp
+  MAINT_RIG=$rig; maxl=$(maint_knob HETZNER_MIRROR_MAINT_MAX_LOAD 40); minfree=$(maint_knob HETZNER_MIRROR_MAINT_MIN_FREE_MB 3072); warn=$(maint_knob HETZNER_MIRROR_MAINT_LOOSE_WARN 5000)
+  MAINT_TIMEOUT=$(maint_knob HETZNER_MIRROR_MAINT_TIMEOUT 1800); exp=${HETZNER_MIRROR_MAINT_EXPIRE:-2.weeks.ago}
+  case "$exp" in ''|now|all|0|0.*) mlog "$rig: RECUSADA — validade de poda perigosa ('$exp'): sem ela um objeto recém-empurrado, ainda sem ref, seria apagado" >&2; return 1 ;; esac
+  load=$(maint_load) || { mlog "$rig: RECUSADA — não consegui ler o load (nada foi mexido)" >&2; return 1; }
+  if ! maint_lt "$load" "$maxl"; then mlog "$rig: pulada — load $load ≥ $maxl (o tique seguinte tenta)"; maint_late "$rig" "$base" "$now" && return 1; return 0; fi
+  tmp=$(maint_loose "$r") || { mlog "$rig: RECUSADA — não consegui contar os soltos (nada foi mexido)" >&2; return 1; }; set -- $tmp; cnt=$1 kib=$2 pk=$3
+  free=$(maint_free_mb "$r") || { mlog "$rig: RECUSADA — não consegui ler o disco livre (nada foi mexido)" >&2; return 1; }
+  need=$((minfree + kib / 1024))
+  if [ "$free" -lt "$need" ]; then mlog "$rig: pulada — disco livre $free MB < $need MB (piso $minfree + soltos $((kib / 1024)) MB: o pack novo não passa do tamanho deles)"; maint_late "$rig" "$base" "$now" && return 1; return 0; fi
+  # vazio → o filtro ainda não foi gerado: nada a proteger; ausente do repo → idem, e diz (o próximo sync o regera). O blob do filtro é inalcançável POR DESENHO (só o config guarda o oid): vai como <head> do prune para nunca ser podado
+  oid=$("$GIT" -C "$r" config --get gtmirror.sparseoid 2>/dev/null); head=""
+  if [ -n "$oid" ]; then if [[ "$oid" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] && "$GIT" -C "$r" cat-file -e "$oid" 2>/dev/null; then head=$oid; else mlog "$rig: aviso — gtmirror.sparseoid ($oid) não está no repo; o próximo sync o regera"; fi; fi
+  # vazio → nenhuma ref do origin (1º fetch não veio): TUDO seria "inalcançável"; falhou → idem. Nunca poda sem ao menos uma ref (prune-packed e repack seguem; o prune não)
+  [ -n "$("$GIT" -C "$r" for-each-ref --count=1 --format=x refs/remotes/origin 2>/dev/null)" ] || { prune_ok=0; mlog "$rig: aviso — o espelho não tem ref do origin; o prune fica de fora desta rodada" >&2; }
+  if [ "$dry" = 1 ]; then
+    # vazio → 0 (o git não listou nada); falhou → "?" (nunca 0: o pipe mascararia o rc do git, por isso a saída vai a uma variável antes de contar)
+    if tmp=$("$GIT" -C "$r" prune-packed -n 2>/dev/null); then npk=$(printf '%s' "$tmp" | awk 'END { print NR }'); else npk="?"; fi
+    if [ $prune_ok != 1 ]; then np="n/a"; elif tmp=$("$GIT" -C "$r" prune -n --expire="$exp" $head 2>/dev/null); then np=$(printf '%s' "$tmp" | awk 'END { print NR }'); else np="?"; fi
+    mlog "$rig: DRY-RUN — soltos=$cnt ($((kib / 1024)) MB) packs=$pk disco_livre=${free} MB load=$load; faria: prune-packed ($npk soltos já empacotados) → repack -d -l → prune --expire=$exp ($np inalcançáveis velhos); nada foi escrito"; return 0
+  fi
+  MAINT_S0=$(maint_swap_mb) || MAINT_S0="?"; if [ "$MAINT_S0" = "?" ]; then MAINT_SWAP_PEAK=0; else MAINT_SWAP_PEAK=$MAINT_S0; fi; t0=$(date +%s); MAINT_DL=$((t0 + MAINT_TIMEOUT))
+  mlog "$rig: ANTES soltos=$cnt ($((kib / 1024)) MB) packs=$pk disco_livre=${free} MB load=$load swap=${MAINT_S0} MB"
+  MAINT_REPO=$r; MAINT_MARK="$r/gtm-maint.mark"; : > "$MAINT_MARK" || { MAINT_MARK=""; mlog "$rig: aviso — não criei a marca da rodada; se um passo for morto, os tmp_pack_* dele ficam" >&2; }
+  maint_do "prune-packed" "$GIT" -C "$r" prune-packed -q \
+    && maint_do "repack -d -l (sem -a; 1 thread, janela 64m)" "$GIT" -C "$r" -c pack.threads=1 -c pack.windowMemory=64m repack -d -l -q || rc=1
+  if [ $rc = 0 ] && [ $prune_ok = 1 ]; then maint_do "prune --expire=$exp" "$GIT" -C "$r" prune --expire="$exp" $head || rc=1; fi
+  # falhou → "?" no log (a rodada já fez o trabalho; a leitura de depois não a desfaz nem a dá por perdida)
+  [ -z "$MAINT_MARK" ] || rm -f "$MAINT_MARK"; MAINT_MARK=""; MAINT_REPO=""
+  tmp=$(maint_loose "$r") && { set -- $tmp; cnt2=$1 kib2=$2 pk2=$3; } || { cnt2="?" kib2=0 pk2="?"; }
+  free2=$(maint_free_mb "$r") || free2="?"; delta="?"; peak="?"; [ "$MAINT_S0" = "?" ] || { delta=$((MAINT_SWAP_PEAK - MAINT_S0)); peak=$MAINT_SWAP_PEAK; }
+  mlog "$rig: DEPOIS soltos=$cnt2 ($((kib2 / 1024)) MB) packs=$pk2 disco_livre=${free2} MB pico_swap=+${delta} MB (${MAINT_S0}→${peak})"
+  [ "$delta" = "?" ] || [ "$delta" -le 1024 ] || mlog "$rig: AVISO — o swap subiu $delta MB durante a rodada (> 1024)" >&2
+  [[ "$cnt2" =~ ^[0-9]+$ ]] && [ "$cnt2" -gt "$warn" ] && mlog "$rig: AVISO — ainda $cnt2 soltos (> $warn): são inalcançáveis com menos de 2 semanas, ou chegaram durante a rodada" >&2
+  if [ $rc = 0 ]; then
+    if "$GIT" -C "$r" config gtmirror.maintokat "$(date +%s)"; then "$GIT" -C "$r" config --unset gtmirror.lastmainterror 2>/dev/null
+    else mlog "$rig: aviso — não gravei o carimbo da rodada (config ocupado ou ilegível): o próximo tique repete" >&2; fi
+    mlog "$rig: ok ($(( $(date +%s) - t0 )) s)"; return 0; fi
+  "$GIT" -C "$r" config gtmirror.lastmainterror "$(iso) rodada falhou, ver o log" 2>/dev/null; maint_late "$rig" "$base" "$now"; return 1
+}
+maint_one() {   # maint_one <rig> <dry> <force>: carimbo de frequência, trava do sync, e maint_run
+  local rig=$1 dry=$2 force=$3 r last seen base now every lk rc
+  r=$(repo_of "$rig"); now=$(date +%s); every=$(maint_knob HETZNER_MIRROR_MAINT_EVERY_H 20)
+  [ "$dry" = 1 ] || maint_pin_noauto "$r" || mlog "$rig: AVISO — não consegui fixar o auto-gc desligado (config ocupado ou ilegível); o próximo tique refaz" >&2
+  # vazio → nunca rodou bem (devida); ilegível → idem. O carimbo só LIMITA a frequência: o trabalho é idempotente e passa pelos mesmos portões
+  last=$("$GIT" -C "$r" config --get gtmirror.maintokat 2>/dev/null); [[ "$last" =~ ^[0-9]{1,12}$ ]] || last=""
+  seen=$("$GIT" -C "$r" config --get gtmirror.maintseenat 2>/dev/null); [[ "$seen" =~ ^[0-9]{1,12}$ ]] || { seen=""; [ "$dry" = 1 ] || { "$GIT" -C "$r" config gtmirror.maintseenat "$now" 2>/dev/null && seen=$now; }; }
+  base=${last:-$seen}
+  if [ "$force" = 0 ] && [ -n "$last" ] && [ $((now - last)) -lt $((every * 3600)) ]; then MAINT_IDLE="$MAINT_IDLE $rig($(( (now - last) / 3600 ))h)"; return 0; fi
+  lock_take "$r/gtm-fetch.lock" 0; lk=$?
+  if [ $lk = 1 ]; then mlog "$rig: pulada — $(lock_why 1 sync/maint)"; return 0
+  elif [ $lk != 0 ]; then mlog "$rig: RECUSADA — $(lock_why $lk maint "$r/gtm-fetch.lock")" >&2; return 1; fi
+  MAINT_LOCK="$r/gtm-fetch.lock"; maint_run "$rig" "$r" "$dry" "$now" "$base"; rc=$?
+  rm -rf "$r/gtm-fetch.lock"; MAINT_LOCK=""; return $rc
+}
+cmd_maint() {
+  local dry=0 force=0 rig="" rigs r rc=0
+  while [ $# -gt 0 ]; do case "$1" in --dry-run) dry=1 ;; --force) force=1 ;; -*) die 2 "maint: opção desconhecida: $1" ;; *) [ -z "$rig" ] || die 2 "maint: um espelho só"; rig=$1 ;; esac; shift; done
+  rigs=$(rigs_of "$rig") || exit $?
+  [ -n "$rigs" ] || { echo "maint: nenhum espelho (rode init)"; return 0; }
+  trap 'maint_cleanup; exit 143' TERM INT HUP
+  for r in $rigs; do maint_one "$r" "$dry" "$force" || rc=1; done
+  [ -z "$MAINT_IDLE" ] || mlog "em dia (última rodada boa há):$MAINT_IDLE"
+  trap - TERM INT HUP; return $rc
 }
 
 # ── o que o servidor toca: serve (comando forçado da chave), hooks do espelho e o gancho do pack ───────────────────────────────────────────────────────────────────
@@ -323,7 +458,7 @@ cmd_tunnel() {   # túnel reverso: a porta do sshd do espelho aparece no loopbac
 }
 
 case "${1:-}" in
-  init) shift; cmd_init "$@" ;; sync) cmd_sync "${2:-}" ;; publish) cmd_publish "${2:-}" ;; status) cmd_status "${2:-}" ;;
+  init) shift; cmd_init "$@" ;; sync) cmd_sync "${2:-}" ;; publish) cmd_publish "${2:-}" ;; status) cmd_status "${2:-}" ;; maint) shift; cmd_maint "$@" ;;
   sparse) sparse_spec "${2:-}" ;; authorize) cmd_authorize "${2:-}" ;; hostkey) sshd_conf && echo "[127.0.0.1]:$PORT $(cut -d' ' -f1,2 "$MH/host_key.pub")" ;;
   sshd) cmd_sshd "${2:-}" ;; tunnel) cmd_tunnel "${2:-}" "${3:-}" ;; serve) cmd_serve ;; hook) shift; cmd_hook "$@" ;; pack-hook) shift; cmd_pack_hook "$@" ;; spec-out) cmd_spec_out "${2:-}" ;;
   *) die 2 "uso: $(sed -n 's/^# SUBCOMANDOS: //p' "$SELF" | head -n 1)" ;;

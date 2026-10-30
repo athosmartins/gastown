@@ -66,6 +66,7 @@ com.gascity.flow-ledger-collector	nao-medido	nenhuma menção a bd/gc/dolt no pr
 com.gascity.git-lock-hygiene	nao-medido	só enumera rigs (gc rig list) para achar repositórios; o ato é git
 com.gascity.hetzner-mirror-sshd	nao-medido	nenhuma menção a bd/gc/dolt no programa. KeepAlive
 com.gascity.hetzner-mirror-sync	nao-medido	nenhuma menção a bd/gc/dolt no programa
+com.gascity.hetzner-mirror-maint	nao-medido	nenhuma chamada a bd/gc/dolt no programa (a manutenção do espelho só fala com git e df/sysctl; as menções a "gc" no texto são do auto-gc do git)
 com.gascity.hetzner-mirror-tunnel	nao-medido	nenhuma menção a bd/gc/dolt no programa. KeepAlive
 com.gascity.production-drift-guard	nao-medido	nenhuma menção a bd/gc/dolt no programa. KeepAlive
 com.gascity.ram-owner-sampler	nao-medido	só cita `gc session list` em comentário; amostra ps
