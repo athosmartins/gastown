@@ -17,8 +17,8 @@
 #   some (subgrupos: lexq aspas e `\` · lexs redirecionamento sem alvo · lexe palavra vazia · lexd `$'…'`/`$"…"` · lexu aspa ou `\` que não fecha, também num comentário `#` · lexr `$( )` do alvo
 #   de redirecionamento · lexh heredoc/`<<<`/find · lexp os controles que NÃO bloqueiam) · dest — o lugar onde o git escreve vem como ARGUMENTO, sem -C (worktree remove ../outro,
 #   clone/init <outro>/x, checkout-index --prefix=…; subgrupos destb e destp) · interp — o texto que um INTERPRETADOR (python -c, node -e, perl -e, ruby -e, awk) ou um pipe entrega a um
-#   shell roda: as 12 formas que só o cc-safety-net pegava (ga-tphd15o; subgrupos interpc código de interpretador e os delimitadores de literal que o guarda lê — q<…>, %Q{…}, [[…]] —, interpp pipe que um shell lê, interpe base64/rev/eval/printf -v e a atribuição/cd dentro de bloco em VÁRIAS linhas, com o fi/done/esac que o shell não lê como fecho — \fi, "fi", >x fi, fi) de case, find -exec fi).
-# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (224 mutantes); e
+#   shell roda: as 12 formas que só o cc-safety-net pegava (ga-tphd15o; subgrupos interpc código de interpretador e os delimitadores de literal que o guarda lê — q<…>, %Q{…}, [[…]] —, interpp pipe que um shell lê, interpe base64/rev/eval/printf -v e a atribuição/cd dentro de bloco em VÁRIAS linhas, com o fi/done/esac que o shell não lê como fecho — \fi, "fi", >x fi, fi) de case, find -exec fi; interpg o 2º elo em diante de uma cadeia && e tudo que está dentro de um grupo { } depois de && || |, o grupo que é elo de pipe, vai para o fundo ou é coproc (subshell), o corpo de função e a { } entre aspas).
+# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (272 mutantes); e
 #   contra um stub que só sai 0 (o servidor ANTES desta fatia: o hook do mini era `drop` e nada o substituía), quase tudo falha.
 # VARIÁVEIS: RCG_UNDER_TEST (guarda a testar) · RCG_ONLY (grupos, vírgula) · RCG_NO_MUTANTS=1
 # BUDGET (grupo à parte, ga-tih62nv): o pedido que fazia o guarda girar SEM FIM (e que o hook deixava seguir sem conferência ao estourar o prazo de 600 s do Claude Code) termina;
@@ -777,6 +777,60 @@ g_interp() {  # ga-tphd15o (achado do ga-nkfwixz, cc-safety-net como oráculo): 
     b 0 "pass: interp: trecho que pode não ter rodado, subshell, variável de variável, mas nada escreve no alheio: $c" "$c"
   done
   fi
+  if grp interpg interp; then
+  # Gate ga-tphd15o, tentativa 4 (parecer: "não sei se esta atribuição rodou" lido como "rodou", root-class error-vs-empty). Uma atribuição, um export, um printf -v, a chamada de uma função e um cd só
+  # valem como CERTOS quando o shell com certeza os rodou. Não rodou com certeza em: (a) QUALQUER elo de uma cadeia && depois do 1º (`[ -f x ] && c=ok && true`: o elo do meio só roda se o de antes
+  # deu certo — só o cd tem regra própria, ele vale enquanto a cadeia continua), (b) o 2º trecho em diante de um grupo `{ …; }` que vem depois de && ou || (só o 1º trecho do grupo levava o operador),
+  # (c) um grupo `{ …; }` que é elo de pipe ou vai para o fundo (roda num subshell: nada de dentro vale aqui fora, como no `( )`), e coproc. Mesmo erro, mesmas três formas, no texto de variável que o
+  # eval e o pipe leem, no GIT_DIR e no diretório. Cada caso aqui foi medido contra o bash REAL com um git falso: o git escreve no clone alheio.
+  local nl=$'\n'
+  for c in "c='$g'; [ -f /nonexistent ] && c=ok && true; eval \"\$c\"" "c='$g'; [ -f /nonexistent ] && export c=ok && true; eval \"\$c\"" \
+           "c='$g'; [ -f /nonexistent ] && printf -v c '%s' ok && true; eval \"\$c\"" "c='$g'; false && c=ok && true; echo \"\$c\" | sh" \
+           "c='$g'; f() { c=ok; }; [ -f /nonexistent ] && f && true; eval \"\$c\"" "c='$g'; f() { c=ok; }; [ -f /nonexistent ] && true && f && true; eval \"\$c\"" \
+           "export GIT_DIR=$OTH/.git; [ -f /nonexistent ] && export GIT_DIR=$OWN/.git && true; git commit -m x" "GIT_DIR=$OTH/.git; [ -f /nonexistent ] && GIT_DIR=$OWN/.git && true; git commit -m x" \
+           "cd $OTH; f() { cd $OWN; }; [ -f /nonexistent ] && f && true; git commit -m x" "cd $OTH; f() { cd $OWN; }; [ -f /nonexistent ] && f; git commit -m x"; do
+    b 2 "interpg: elo do MEIO de uma cadeia && (ou a função chamada nele) pode não ter rodado: $c" "$c"
+  done
+  for c in "c='$g'; [ -f /nonexistent ] && { true; c=ok; }; eval \"\$c\"" "c='$g'; true || { true; c=ok; }; eval \"\$c\"" \
+           "c='$g'${nl}[ -f /nonexistent ] && {${nl}true${nl}c=ok${nl}}${nl}eval \"\$c\"" "c='$g'${nl}true || {${nl}true${nl}c=ok${nl}}${nl}eval \"\$c\"" \
+           "c='$g'; [ -f /nonexistent ] && { { c=ok; }; true; }; eval \"\$c\"" "c='$g'; [ -f /nonexistent ] && { true; { c=ok; }; }; eval \"\$c\"" \
+           "c='$g'; [ -f /nonexistent ] && { true; c=ok; } && true; eval \"\$c\"" "c='$g'; if [ -f /nonexistent ]; then { true; c=ok; }; fi; eval \"\$c\"" \
+           "c='$g'; cat /dev/null | { true; c=ok; }; eval \"\$c\"" "c='$g'; [ -f /nonexistent ] && { true; export c=ok; }; echo \"\$c\" | sh" \
+           "c='$g'; [ -f /nonexistent ] && { true; printf -v c '%s' ok; }; eval \"\$c\"" \
+           "export GIT_DIR=$OTH/.git; [ -f /nonexistent ] && { true; export GIT_DIR=$OWN/.git; }; git commit -m x" "cd $OTH; [ -f /nonexistent ] && { true; cd $OWN; }; git commit -m x" \
+           "cd $OTH; f() { cd $OWN; }; [ -f /nonexistent ] && { true; f; }; git commit -m x"; do
+    b 2 "interpg: o 2º trecho em diante de um grupo { } depois de && ou || pode não ter rodado: $c" "$c"
+  done
+  for c in "c='$g'; { c=ok; } | cat; eval \"\$c\"" "c='$g'; { c=ok; } |& cat; eval \"\$c\"" "c='$g'; { true; c=ok; } | cat; eval \"\$c\"" "c='$g'; { c=ok; } & wait; eval \"\$c\"" \
+           "c='$g'${nl}{${nl}c=ok${nl}} | cat${nl}eval \"\$c\"" "c='$g'; { { c=ok; } | cat; }; eval \"\$c\"" "c='$g'; { c=ok; } 2>&1 | cat; eval \"\$c\"" \
+           "c='$g'; coproc { true; c=ok; }; wait; eval \"\$c\"" "c='$g'; coproc NAME { c=ok; }; wait; eval \"\$c\"" \
+           "export GIT_DIR=$OTH/.git; { export GIT_DIR=$OWN/.git; } | cat; git commit -m x" "export GIT_DIR=$OTH/.git; { export GIT_DIR=$OWN/.git; } & wait; git commit -m x" \
+           "cd $OTH; { cd $OWN; } | cat; git commit -m x" "cd $OTH; { true; cd $OWN; } | cat; git commit -m x" "cd $OTH; { cd $OWN; } & git commit -m x"; do
+    b 2 "interpg: grupo { } que é elo de pipe, vai para o fundo ou é coproc roda num subshell — o que ele atribui ou o cd dele não vale fora: $c" "$c"
+  done
+  # O mesmo, dentro do corpo de uma função (o corpo guardado perdia o `}` dos grupos de dentro e a chamada não sabia onde eles acabam), e a `}` entre aspas não fecha nem a função nem o grupo.
+  for c in "c='$g'; f() { { :; }; c=ok; }; eval \"\$c\"" "c='$g'; f() { { c=ok; } | cat; }; f; eval \"\$c\"" "c='$g'; f() { [ -f /nonexistent ] && { true; c=ok; }; }; f; eval \"\$c\"" \
+           "c='$g'; f() { { c=ok; } & }; f; wait; eval \"\$c\"" "c='$g'; f() { echo \"}\"; c=ok; }; eval \"\$c\"" "c='$g'; f() { true; echo \"}\"; c=ok; }; eval \"\$c\"" \
+           "c='$g'; f() { true; echo '}'; c=ok; }; eval \"\$c\"" "c='$g'; f() { true; echo \\}; c=ok; }; eval \"\$c\"" "c='$g'; f() { true; echo }; c=ok; }; eval \"\$c\"" "c='$g'; f() { echo {; c=ok; }; eval \"\$c\"" "c='$g'; f() { echo \"{\"; c=ok; }; eval \"\$c\"" "export GIT_DIR=$OTH/.git; f() { true; echo \"}\"; export GIT_DIR=$OWN/.git; }; git commit -m x" \
+           "c='$g'; [ -f /nonexistent ] && { true; \"}\"; c=ok; }; eval \"\$c\"" "c='$g'; [ -f /nonexistent ] && { true; '}'; c=ok; }; eval \"\$c\"" "c='$g'; [ -f /nonexistent ] && { true; \\}; c=ok; }; eval \"\$c\"" \
+           "c='$g'; f() { g() { :; }; }; [ -f /nonexistent ] && { f; c=ok; }; eval \"\$c\"" "c='$g'; f() { g() { :; }; }; f; [ -f /nonexistent ] && { true; c=ok; }; eval \"\$c\""; do
+    b 2 "interpg: grupo { } dentro de função, ou } entre aspas: $c" "$c"
+  done
+  # Controles: o grupo que SEI que rodou (sem && || | & antes ou depois dele) atribui de verdade, e o texto de depois vence o de antes; o cd e o GIT_DIR dele valem; o grupo que só LÊ ou usa -C próprio não bloqueia.
+  for c in "c='$g'; { c=ok; }; eval \"\$c\"" "c='$g'; { true; c=ok; }; eval \"\$c\"" "c='$g'; { true; { c=ok; }; }; eval \"\$c\"" "c='$g'; f() { { c=ok; }; }; f; eval \"\$c\"" \
+           "c='$g'; f() { echo \"{\"; c=ok; }; f; eval \"\$c\"" "c='$g'; f() { echo \"{\"; }; c=ok; eval \"\$c\"" "c='$g'; f() { echo {; }; c=ok; eval \"\$c\"" "c='$g'; { c=ok; } > /dev/null; eval \"\$c\"" \
+           "c='$g'; [ -f /nonexistent ] && { true; c=ok; }; c=ok; eval \"\$c\"" "c='$h'; [ -f /nonexistent ] && { true; c=ok; }; eval \"\$c\"" "c='$h'; { c=ok; } | cat; eval \"\$c\"" \
+           "cd $OTH; { cd $OWN; }; git commit -m x" "export GIT_DIR=$OTH/.git; { export GIT_DIR=$OWN/.git; }; git commit -m x" "{ git -C $OWN commit -m x; } | cat" \
+           "[ -d / ] && { git -C $OWN status; git -C $OWN commit -m x; }" "( cd $OTH; { cd $OWN; git commit -m x; } )" "cd $OTH; ( { cd $OWN; } | cat ); cd $OWN; git commit -m x"; do
+    b 0 "pass: interpg: grupo que rodou com certeza, ou que não escreve no alheio: $c" "$c"
+  done
+  # Falso positivo ASSUMIDO (lado fechado): o guarda não sabe que `true &&` sempre segue adiante — o elo do meio de uma cadeia e o grupo depois de `true &&` contam como "pode não ter rodado". Só pesa quando
+  # um texto nocivo foi guardado ANTES e a atribuição inofensiva vem DEPOIS, numa cadeia; com variável sem texto nocivo de antes nada bloqueia.
+  for c in "c='$g'; true && c=ok && true; eval \"\$c\"" "c='$g'; true && { true; c=ok; }; eval \"\$c\""; do
+    b 2 "interpg: (falso positivo assumido) cadeia que o shell roda por inteiro, mas o guarda não prova: $c" "$c"
+  done
+  b 0 "pass: interpg: sem texto nocivo de antes, a atribuição no meio da cadeia não bloqueia" "c=ok0; [ -f /nonexistent ] && c=ok && true; eval \"\$c\""
+  fi
 }
 g_fuzz() {  # fuzzer diferencial (gate ga-36d3ic, sugestão do revisor): o bash REAL com um git falso que registra onde escreveria é a verdade; o guarda
   # tem de bloquear toda escrita no alheio. Semente fixa (reproduzível). RCG_FUZZ_N muda o tamanho (padrão 200).
@@ -1094,6 +1148,10 @@ EOF
   b 0 "budget: controle — f() { { cd <próprio>; }; :; }; cd <alheio>; f; git commit — o grupo do começo do corpo RODA, o cd vale" "f() { { cd $OWN; }; :; }; cd $OTH; f; git commit -m x"
   b 0 "budget: controle — com uma bandeira de definição velha (foo(); no meio), o grupo { } do corpo de f NÃO reabre a definição: o cd e o git do próprio seguem certos" "f() { :; { :; }; }; foo(); f; cd $OWN && git commit -m x"
   b 2 "budget: f cuja chave não fecha (aspa tardia) com function g { } e um git no alheio: o corpo reexecutado no fim é CONFERIDO, não engolido por g" "f() { :; echo '{'; function g { :; }; git -C $OTH commit -m x; }; f"
+  # Texto cortado: f e g sem o `}` que as fecha. O corpo é reexecutado no fim do pedido e CONFERIDO; reabrir a definição de g ali engoliria o git do alheio (as `{` entre aspas já não fazem a função
+  # ficar aberta, desde que a conta de chaves só lê as reservadas; o que sobra para exercitar o fim do pedido é o texto de fato cortado).
+  b 2 "budget: f e g sem o } (texto cortado) e um git no alheio no fim: o corpo reexecutado no fim é CONFERIDO, não engolido por g" "f() { :; function g { :; git -C $OTH commit -m x"
+  b 2 "budget: ...e o g chamado dentro de f, depois de um cd <próprio> na própria g" "f() { function g { cd $OWN; git -C $OTH commit -m x; f; g"
   b 2 "budget: controle — a função aninhada CHAMADA que escreve no alheio é bloqueada" "f() { function g { git -C $OTH commit -m x; }; g; }; f"
   # parecer do gate na tentativa 1: registrar a aninhada SEM CONDIÇÃO, com o ramo "chamada de função" antes do ramo git, deixava uma função chamada git pular o git_hit.
   # Uma função chamada git NUNCA isenta a chamada: pode não existir (a definição não rodou) e command git / env git / \git a ignoram.
@@ -1177,7 +1235,7 @@ echo "== $((n-fails))/$n ok =="
   mutant cond "cd para diretório inexistente vale como se tivesse rodado" 's/    return p if p is None or os.path.isdir(p) else None/    return p/'
   mutant cond "a cadeia && que sustentava o cd acaba e o diretório continua valendo" 's/        if st.get("chain") and prev != "&&":/        if False:/'
   mutant cond "cd em padrão de case ou com ;; segue mudando o diretório" 's/            if st.get("lost") or kw or wrapped or ext or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;")/            if st.get("lost") or kw or wrapped or ext or prev in ("||", "|", "|\&") or term in ("|", "|\&", "\&")/'
-  mutant cond "{ cd a; } & mantém o diretório do grupo em background" 's/^\( *\)if term == "&":$/\1if False:/'
+  mutant cond "{ cd a; } & mantém o diretório do grupo em background" 's/            if gm and term in ("|", "|&", "&"):/            if False:/'
   mutant evade "bash -c não é aberto" 's/return sub(script\[0\], cwd, env)/pass/'
   mutant evade "eval não é aberto" 's/            return sub("\\n".join(" ".join(v) for v in reveal(seg\[1:\], seen(env, True))), cwd, env)/            pass/'
   mutant evade "\$( ) não é aberto" 's/r = sub(bytes.fromhex(m.group(1)).decode(), st\["cwd"\], {})/r = None/'
@@ -1320,7 +1378,7 @@ echo "== $((n-fails))/$n ok =="
   mutant budget "function NOME { aninhada num corpo reexecutado não marca a região como perdida" 's/if seg\[:1\] == \["function"\] or seg\[:1\] == \["{"\] and (prev == ")" or st.get("nhead")):/if seg[:1] == ["{"] and (prev == ")" or st.get("nhead")):/'
   mutant budget "NOME() { aninhada num corpo reexecutado não marca a região como perdida" 's/if seg\[:1\] == \["function"\] or seg\[:1\] == \["{"\] and (prev == ")" or st.get("nhead")):/if seg[:1] == ["function"]:/'
   mutant budget "na região perdida o cd volta a valer" 's/if st.get("lost") or kw or wrapped or ext or/if kw or wrapped or ext or/'
-  mutant budget "na região perdida a atribuição de variável volta a valer" 's/norun = bool(st.get("lost")) or kw/norun = kw/'
+  mutant budget "na região perdida a atribuição de variável volta a valer" 's/pn = bool(st.get("lost")) or kw/pn = kw/'
   mutant budget "uma chamada feita dentro da região perdida a encerra para o resto do corpo de fora" 's/^            st\["lost"\], st\["maybe"\] = saved, was$/            st.pop("lost", None); st["maybe"] = was/'
   mutant budget "function f { depois de || ou && vale como definição que sempre rodou" 's/";" if prev == ")" else prev/";"/'
   mutant budget "a aninhada não passa a existir quando f roda (a chamada dela de fora não é conferida)" 's/^                        st\["funcs"\]\.setdefault(nm, \[\])\.extend(rest)$/                        pass/'
@@ -1410,7 +1468,7 @@ echo "== $((n-fails))/$n ok =="
   mutant interpe "if/for/while/until/select/case em várias linhas não abrem bloco (a atribuição de dentro vale como certa)" 's/            bs.append(OPENS\[lead\])/            pass/'
   mutant interpe "fi/done/esac não fecham o bloco (a atribuição de DEPOIS dele vira \"talvez\")" 's/^            bs.pop()  # só o fecho/            pass  # só o fecho/'
   mutant interpe "qualquer fecho tira o bloco de cima da pilha, não só o que combina (o fi de um padrão de case, \"fi)\", fecha o if de fora)" 's/        elif bs and lead == bs\[-1\]:/        elif bs and lead in OPENS.values():/'
-  mutant interpe "dentro do bloco de várias linhas o trecho não é \"pode não ter rodado\"" 's/ or bool(bs)  # o trecho/  # o trecho/'
+  mutant interpe "dentro do bloco de várias linhas o trecho não é \"pode não ter rodado\"" 's/ or bool(bs) or any(/ or any(/'
   mutant interpe "o cd dentro do bloco de várias linhas vale depois do fi" 's/if (blk or bs) and new is not None:/if blk and new is not None:/'
   mutant interpe "o case não abre bloco (a atribuição na 2ª linha de um ramo vale como certa)" 's/, "case": "esac"}/}/'
   mutant interpe "then/do na frente de um if (then if x; then) escondem a abertura" 's/^LEAD = {"then", "do", /LEAD = {/'
@@ -1425,6 +1483,20 @@ echo "== $((n-fails))/$n ok =="
   mutant interpe "a marca de f ( não acaba num corpo que não é { … } (o grupo { … } seguinte vira corpo e nunca é conferido)" 's/^        if seg and seg\[0\] != "{":/        if False:/'
   mutant interpe "variantes demais passam sem conferir (o teto some)" 's/        if len(out) > MANY:/        if False:/'
   mutant interpe "variantes demais bloqueiam como falha do guarda, sem dizer o motivo" 's/        except Many:/        except ZeroDivisionError:/'
+  # interpg (gate ga-tphd15o, tentativa 4): cada guarda do "pode não ter rodado" por cadeia && e por grupo { } removida TEM que fazer o grupo falhar
+  mutant interpg "o elo do MEIO de uma cadeia && volta a valer como se tivesse rodado (só o último não)" 's/prev in ("||", "&&", "|", "|&", "case)") or bool(st.get("maybe"))/prev in ("||", "|", "|\&", "case)") or (prev == "\&\&" and term != "\&\&") or bool(st.get("maybe"))/'
+  mutant interpg "o { do começo do trecho não abre grupo" 's/^        n += x == "{"$/        n += 0/'
+  mutant interpg "coproc { } não abre grupo" 's/int(seg\[:1\] == \["coproc"\] and any(/int(False and any(/'
+  mutant interpg "grupo que pode não ter rodado não marca o que tem dentro" 's/ or bool(bs) or any(g\[0\] for g in gs)  # o trecho/ or bool(bs)  # o trecho/'
+  mutant interpg "o } de um grupo que é elo de pipe ou vai para o fundo não devolve o estado de antes" 's/            if gm and term in ("|", "|&", "&"):/            if False:/'
+  mutant interpg "o } não tira o grupo da pilha (o grupo que pode não ter rodado marca tudo que vem depois)" 's/            gm = gs.pop() if gs else None/            gm = gs[-1] if gs else None/'
+  mutant interpg "o } de um grupo dentro de função não é guardado com o corpo" 's/            if seg != \["}"\] or st\["fdepth"\]:/            if seg != ["}"]:/'
+  mutant interpg "o grupo que abre na mesma linha do corpo da função não conta na profundidade" 's/max(1, 1 + braces(seg\[1:\]))/1/'
+  mutant budget "function NOME { não conta como grupo aberto (a função de fora fecha cedo e o resto do corpo roda na definição)" 's/ or seg\[:1\] == \["function"\] and seg\[2:3\] == \["{"\] and not isinstance(seg\[2\], Q))/)/'
+  mutant interpg "um } entre aspas fecha o grupo e a função" 's/    return seg == \["}"\] and not isinstance(seg\[0\], Q)/    return seg == ["}"]/'
+  mutant interpg "o \"}\" entre aspas não é marcado como texto (Q)" 's/ | {"}"}  # as palavras/  # as palavras/'
+  mutant interpg "uma { entre aspas ou no meio do trecho (echo {) conta na profundidade da função" 's/^        if isinstance(x, Q) or x not in LEAD:$/        if False:/'
+  mutant interpg "o cd de dentro de um grupo ou de uma função que pode não ter rodado vale" 's/            if st.get("maybe") or any(g\[0\] for g in gs):/            if False:/'
   echo "-- contra um stub que só sai 0 (o servidor ANTES desta fatia)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"; printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$T/stub.py"
   r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,shell,wrap,lex,dest,cfg,tools,msg,check,cond,interp" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"

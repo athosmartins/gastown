@@ -63,7 +63,7 @@ WRAP, SPLIT = set(WOPT), {"-S", "--split-string"}  # env -S 'git -C x commit': o
 KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "{", "!", "coproc"}  # palavras reservadas que vêm ANTES de um comando: o git depois delas é o comando do trecho
 LEAD = {"then", "do", "else", "elif", "!", "{", "time"}  # palavras que só LIGAM um bloco ao comando seguinte (o comando de verdade é a próxima)
 OPENS = {"if": "fi", "for": "done", "while": "done", "until": "done", "select": "done", "case": "esac"}  # palavra que abre um bloco → a que o fecha
-BLOCK = LEAD | set(OPENS) | set(OPENS.values())  # as palavras que o shell só lê como reservadas no começo de um comando: com aspa, barra ou depois de redirecionamento são comando comum
+BLOCK = LEAD | set(OPENS) | set(OPENS.values()) | {"}"}  # as palavras que o shell só lê como reservadas no começo de um comando: com aspa, barra ou depois de redirecionamento são comando comum (o `"}"` entre aspas é um comando chamado }, não o fecho de um grupo)
 QM = chr(0xF0100)  # fim de palavra que levou aspa ou `\` (protect o põe, words tira): `\fi` e `"fi"` são o COMANDO fi, não o fecho do if
 OPAQUE = {"flock", "ionice", "chrt", "taskset", "parallel", "su", "runuser", "ssh", "script", "trap", "watch", "unshare", "nsenter", "chroot", "setpriv", "numactl",
           "strace", "fakeroot", "systemd-run", "busybox", "dbus-run-session", "xvfb-run", "unbuffer", "caffeinate", "tmux", "screen", "expect"}  # lançadores que não modelo: lista FECHADA (ver LIMITES)
@@ -371,6 +371,29 @@ def word(t: str):
     return Q(s) if QM in t and s in BLOCK else s
 
 
+def opens(seg: list) -> int:
+    """Quantos grupos `{ … }` o trecho abre: cada `{` do começo (depois de then, do, !, time ou de outra `{`) que o shell lê como reservada — uma que levou aspa ou barra é Q, texto; `echo {` não abre nada. `function NOME {` e `coproc [NOME] {` abrem um."""
+    n = 0
+    for x in seg:
+        if isinstance(x, Q) or x not in LEAD:
+            break
+        n += x == "{"
+    if n:
+        return n
+    # `function NOME {` e `coproc [NOME] {` trazem a `{` depois de uma palavra que não é de ligação
+    return int(seg[:1] == ["coproc"] and any(x == "{" and not isinstance(x, Q) for x in seg[1:3]) or seg[:1] == ["function"] and seg[2:3] == ["{"] and not isinstance(seg[2], Q))
+
+
+def closes(seg: list) -> bool:
+    """O trecho é só o `}` que fecha um grupo (o `"}"` entre aspas é um comando chamado }; `echo }` é texto)."""
+    return seg == ["}"] and not isinstance(seg[0], Q)
+
+
+def braces(seg: list) -> int:
+    """Quanto o trecho muda a profundidade de `{ }` (a conta de quando a função acaba)."""
+    return opens(seg) - closes(seg)
+
+
 def words(cmd: str) -> list:
     """As palavras do comando como (texto, operador?). operador = pontuação do SHELL (`;`, `&&`, `>`, `<(`…): `';'`, `\\;`, `'>'` e `''` são palavras, e a vazia FICA (`git -C '' -C x`).
     Aspa ou crase de COMENTÁRIO não conta (decomment). Aspa que ainda não fecha (ou `\\` no fim): o shell recusaria a linha; o guarda tira a aspa que o leitor
@@ -617,6 +640,9 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None, ma
     def sub(text: str, cwd, env: dict):  # trecho aninhado: mesmo contexto (variáveis do trecho de fora + as desta palavra, funções)
         return scan(text, cwd, terr, own, depth + 1, {**st["env"], **env}, st["funcs"], seen(env))
 
+    def snap():  # diretório, variáveis para o git e textos de variável AGORA, em cópias que ninguém mais altera (o que um `{ }` devolve ao fechar num subshell)
+        return st["cwd"], dict(st["env"]), {k: list(v) for k, v in st["may"].items()}
+
     def setvar(name: str, ts, unsure: bool, val: str = "$?"):
         """NOME passa a guardar `val` em env (o que o git lê: GIT_DIR…; "$?" = não sei) e os textos `ts` em may (o que eval/pipe leem; None = não sei o texto). Trecho que PODE não ter rodado:
         env vira "não sei" e may GUARDA os textos de antes E os novos — um valor inofensivo que talvez não tenha sido gravado não apaga o nocivo que talvez continue lá."""
@@ -664,8 +690,8 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None, ma
         if seg and seg[0] != "{":
             st.pop("func", None)  # a cabeça `f (` que não foi seguida de `{` não era uma definição: a bandeira não pode ficar velha para o próximo `{` do texto
         if st.get("fdepth"):  # dentro de `f() { … }`: o corpo NÃO roda agora — guardo os trechos e confiro na CHAMADA, no cwd de lá (um git ali roda onde `f` for chamada)
-            st["fdepth"] += seg.count("{") - seg.count("}")
-            if seg != ["}"]:
+            st["fdepth"] += braces(seg)  # só a `{`/`}` que o shell lê como reservada: a que levou aspa ou barra é texto (`echo "}"` não fecha a função)
+            if seg != ["}"] or st["fdepth"]:  # o `}` que fecha a PRÓPRIA função não se guarda; o de um grupo `{ … }` de dentro SIM: na chamada é ele que diz se o grupo foi para um subshell (`{ …; } | x`) e onde o grupo acaba
                 st["funcs"].setdefault(st["fname"], []).append((seg, prev, term))
             elif not st["fdepth"] and term == "&":
                 st["cwd"] = None
@@ -688,14 +714,16 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None, ma
         if not st.get("calling") and (seg[:1] == ["{"] and st.pop("func", False) or seg[:1] == ["function"] and seg[2:3] == ["{"]):  # nunca ao REEXECUTAR um corpo guardado (calling): o `{` guardado ali reabria a definição com o nome velho, desviava o resto do corpo para a lista errada e o laço de chamada percorria essa lista sem fim (ga-tih62nv)
             if seg[0] == "function":
                 st["fname"], seg = seg[1], seg[2:]
-            st["fdepth"], st["funcs"] = 1, st.get("funcs", {})
+            st["fdepth"], st["funcs"] = max(1, 1 + braces(seg[1:])), st.get("funcs", {})  # `f() { { …; }; }`: o grupo que abre na MESMA linha do corpo também conta, senão o `}` dele fechava a função e o resto do corpo rodava na definição (nunca menos de 1: uma `}` entre aspas na linha não fecha a função)
             st["funcs"].setdefault(st["fname"], [])
             if seg[1:]:
                 st["funcs"][st["fname"]].append((seg[1:], ";" if prev == ")" else prev, term))  # só o `)` do `f()` vira ";" (senão um corpo que começa por um grupo `{ … }` pareceria uma definição aninhada ao ser reexecutado); `||`, `&&`, `|`, `&` antes de `function f {` ficam: a definição pode não ter rodado
             return None
-        if seg == ["}"]:
-            if term == "&":
-                st["cwd"] = None  # `{ …; } &`: o grupo roda em background; o cd de dentro não vale aqui fora
+        gs = st.setdefault("gs", [])  # grupos `{ … }` abertos e ainda sem o `}`: (o grupo PODE não ter rodado, (cwd, env, may) de antes do `{`)
+        if closes(seg):
+            gm = gs.pop() if gs else None  # o grupo que este `}` fecha; nenhum = `}` sem `{` (texto cortado): não fecha nada
+            if gm and term in ("|", "|&", "&"):  # `{ …; } | x`, `{ …; } &`: o grupo roda num subshell e atribuição e cd de dentro NÃO valem aqui fora — volta o que havia antes do `{` (como o `)` de um subshell)
+                st["cwd"], st["env"], st["may"] = gm[1]  # inclui o cd de dentro (`{ cd a; } &`, `{ cd a; } | x`): o diretório de fora é o de antes
             return None
         lead = next((x for x in seg if isinstance(x, Q) or x not in LEAD), "")  # a 1ª palavra que não é palavra reservada de ligação (`then if x; …` abre um bloco); a que levou aspa, barra ou redirecionamento NÃO é reservada
         bs = st.setdefault("bstack", [])  # blocos abertos em linhas anteriores (if/for/while/until/case/select): quem está dentro PODE não ter rodado, igual à forma de uma linha (que o `then`/`do` do trecho já marca)
@@ -706,7 +734,10 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None, ma
         elif bs and lead == bs[-1]:
             bs.pop()  # só o fecho do bloco de cima desce (fi do if, done do for/while/until/select, esac do case): o `fi)` de um padrão de case não fecha o if de fora; na dúvida o bloco fica aberto (lado fechado)
         fw, done = next((x for x in seg if x not in KEYWORDS and not ASSIGN.fullmatch(x)), ""), ""  # a palavra que o shell chama: a 1ª que não é VAR=x nem palavra reservada
-        norun = bool(st.get("lost")) or kw or blk or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&") or bool(st.get("maybe")) or bool(bs)  # o trecho pode não ter rodado (maybe = o corpo de uma função chamada por um trecho assim; bs = dentro de um bloco aberto em linha anterior)
+        pn = bool(st.get("lost")) or kw or blk or prev in ("||", "&&", "|", "|&", "case)") or bool(st.get("maybe")) or bool(bs) or any(g[0] for g in gs)  # o trecho pode não ter rodado, pelo que vem ANTES dele (maybe = o corpo de uma função chamada por um trecho assim; bs = dentro de um bloco aberto em linha anterior; gs = dentro de um grupo `{ }` que pode não ter rodado). `&&` vale em QUALQUER elo da cadeia: só o 1º roda com certeza (`[ -f x ] && c=ok && true`); o cd da cadeia tem regra própria (ver o ramo do cd)
+        for _ in range(0 if ext else opens(seg)):  # `find -exec { }` roda um programa; fora disso, cada `{` do começo do trecho abre um grupo (o `coproc { }` já é "pode não ter rodado" pelo kw: roda num subshell)
+            gs.append((pn, snap()))  # uma cópia para CADA grupo: o `}` de dentro devolve a dele e o de fora ainda precisa da sua
+        norun = pn or term in ("|", "|&", "&", ";;")
         if fw in st.get("funcs", {}) and fw not in st.setdefault("calling", set()):  # uma função com nome de comando que trato adiante (bash, env, cd, find, eval, export, sudo, git…) é chamada como FUNÇÃO: o corpo roda, e o resto do trecho segue conferido como se o nome fosse o programa (command X e env X ignoram a função: lado fechado)
             r = call(fw, blind, norun)
             if r:
@@ -732,6 +763,8 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None, ma
             new = None if c == "popd" else chdir(seg[1:], st["cwd"], c == "pushd")
             if st.get("lost") or kw or wrapped or ext or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&"):
                 new = None
+            if st.get("maybe") or any(g[0] for g in gs):
+                new = None  # o cd do corpo de uma função chamada por um trecho que pode não ter rodado (`[ -f x ] && f`), ou de dentro de um grupo `{ }` que pode não ter rodado (`[ -f x ] && { true; cd a; }`), também pode não ter rodado
             if done:
                 new = None  # a função chamada cd/pushd/popd foi reexecutada acima: o que ela fez de verdade com o diretório eu não sei, e o cd modelado aqui pode nem ter rodado
             if (blk or bs) and new is not None:
