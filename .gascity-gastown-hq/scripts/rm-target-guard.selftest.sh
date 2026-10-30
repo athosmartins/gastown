@@ -14,11 +14,11 @@ GUARD, N = sys.argv[1], int(sys.argv[2])
 H = os.path.realpath(tempfile.mkdtemp(prefix="rmtgst."))  # HOME de teste: fica em /tmp de propósito (o HOME vence o scratch)
 S = os.path.realpath(tempfile.mkdtemp(prefix="rmtgsc."))  # scratch de verdade, fora do HOME
 for d in (".dolt-data/ga/.dolt/noms", ".beads", "proj/.git/objects", "proj/.git/refs", "proj/src", "proj/build", "proj/node_modules/p", "proj/__pycache__", "proj2/.git/objects", "proj2/.git/refs", "gt-remote/keys", "gt-remote/git/gascity/repo.git/objects",
-          "gt-remote/git/gascity/repo.git/refs", "gt-remote/git/gascity/wt/s1/src", ".cache/pip", "Library/CloudStorage/d", "gt/rig/shared/data", "gt/rig/crew/bob", "gt/rig/.gc-worktrees/w", "bin",
+          "gt-remote/git/gascity/repo.git/refs", "gt-remote/git/gascity/wt/s1/src", ".cache/pip", "Library/CloudStorage/d", "gt/rig/shared/data/ga", "gt/rig/crew/bob", "gt/wa/shared", "shared/data", "gt/rig/.gc-worktrees/w", "bin",
           "gt-remote/big/zrepo/.git", "work2/open", "work2/locked", "work2/xonly", "work2/rdonly"):
     os.makedirs(f"{H}/{d}")
 for f in ("notes.txt", "proj/src/a.py", "proj/src/m.pyc", "proj/build/x.o", "proj/.git/HEAD", "proj/.git/index.lock", "proj/.git/config", "proj2/.git/HEAD", "gt-remote/keys/gt_mirror", "gt-remote/git/gascity/repo.git/HEAD",
-          "gt-remote/git/gascity/wt/s1/.git", "gt-remote/git/gascity/wt/s1/src/a", ".dolt-data/ga/.dolt/noms/manifest", ".beads/b", ".cache/pip/w", "gt/rig/crew/bob/x.py", "proj/__pycache__/m.pyc"):
+          "gt-remote/git/gascity/wt/s1/.git", "gt-remote/git/gascity/wt/s1/src/a", ".dolt-data/ga/.dolt/noms/manifest", ".beads/b", ".cache/pip/w", "gt/rig/crew/bob/x.py", "proj/__pycache__/m.pyc", "shared/data/prod.db", "shared/note.txt"):
     open(f"{H}/{f}", "w").write("x\n")
 for i in range(100):  # mais de 80 entradas e o repo é a ÚLTIMA: o teto antigo de 80 não o via
     os.makedirs(f"{H}/gt-remote/big/a{i:03d}")
@@ -27,11 +27,13 @@ for d in ("work/a", "work/b", "work/.git", "srepo/.git", "srepo/src", "many"):
 for i in range(5):
     open(f"{S}/many/f{i}", "w").write("x")
 os.symlink(f"{H}/proj/.git", f"{S}/lnkgit"); os.symlink(f"{S}/work", f"{S}/lnkok")
+# layout REAL da máquina (ga-id0im4e, 4ª rodada): o dado de produção mora em ~/shared/data e o rig só o aponta (gt/wa/shared/data -> ~/shared/data, gt/wa/data -> shared/data); L e Ld são links que o texto normalizado perde ao subir com `..`
+os.symlink(f"{H}/shared/data", f"{H}/gt/wa/shared/data"); os.symlink("shared/data", f"{H}/gt/wa/data"); os.symlink(f"{H}/gt/rig/shared/data/ga", f"{S}/L"); os.symlink(f"{H}/.dolt-data/ga", f"{S}/Ld"); os.symlink(f"{H}/shared/data", f"{S}/lnkdata"); os.symlink(f"{S}/many", f"{H}/.beads/lnkout"); os.symlink(f"{S}/many", f"{H}/shared/data/yo")  # lnkout, yo: o `..` LÓGICO do cd cai em .beads / num link para shared/data, o físico cai fora
 os.chmod(f"{H}/work2/locked", 0); os.chmod(f"{H}/work2/xonly", 0o100); os.chmod(f"{H}/work2/rdonly", 0o400)
 DENIES = not os.access(f"{H}/work2/locked", os.R_OK | os.X_OK) and not os.access(f"{H}/work2/xonly", os.R_OK) and not os.access(f"{H}/work2/rdonly", os.X_OK)  # root (ou FS sem modo) lê tudo: sem negação não há o que provar
 os.environ["HOME"] = H
 CWD = f"{H}/proj"
-CWDS = {"s": f"{S}/work", "b": f"{H}/proj/build", "p": f"{S}/work/a", "h": H, "z": "/zzh/a/b"}  # z = HOME sintético fundo e vazio (/zzh/a/b): sem repo por perto para esconder as regras de HOME
+CWDS = {"w": f"{H}/gt/wa", "s": f"{S}/work", "b": f"{H}/proj/build", "p": f"{S}/work/a", "h": H, "z": "/zzh/a/b"}  # z = HOME sintético fundo e vazio (/zzh/a/b): sem repo por perto para esconder as regras de HOME
 
 
 def load(path):
@@ -47,7 +49,7 @@ def nest(k):
     return c
 
 
-# linhas "V cmd ‖ V cmd": V = B bloqueia, P passa; V:s|b|p|h|z = cwd (s=@S/work, b=proj/build, p=@S/work/a, h=@H, z=/zzh/a/b com HOME=/zzh/a/b); sem tag o cwd é @H/proj (raiz de repo)
+# linhas "V cmd ‖ V cmd": V = B bloqueia, P passa; V:s|b|p|h|z|w = cwd (w=@H/gt/wa, s=@S/work, b=proj/build, p=@S/work/a, h=@H, z=/zzh/a/b com HOME=/zzh/a/b); sem tag o cwd é @H/proj (raiz de repo)
 DSL = r"""
 B rm -fr ~/gt-remote ‖ B rm -r -f ~/gt-remote ‖ B rm --recursive --force ~/gt-remote ‖ B /bin/rm -rf ~/gt-remote ‖ B bash -c 'rm -rf ~/gt-remote' ‖ B env rm -rf ~/gt-remote ‖ B python3 -c "import subprocess; subprocess.run(['rm','-rf','@H/gt-remote'])" ‖ B rm -Rf ~/gt-remote ‖ B rm -rfv ~/gt-remote
 B rm -f -r ~/gt-remote ‖ B rm --recur --forc ~/gt-remote ‖ B rm ~/gt-remote -rf ‖ B rm -rf -- ~/gt-remote ‖ B rm -rf --no-preserve-root ~/gt-remote ‖ P rm ~/gt ‖ P rm -f ~/gt ‖ B sudo rm -rf ~/gt-remote ‖ B sudo -u bob rm -rf ~/gt-remote ‖ B env -i rm -rf ~/gt-remote ‖ B env A=1 rm -rf ~/gt-remote
@@ -115,6 +117,10 @@ B rm $UNSET ~/gt ‖ B rm -f $UNSET ~/gt ‖ P rm $UNSET ~/notes.txt ‖ P unlin
 B C='rm -rf ~/gt $(date)'; eval "$C" ‖ B C='rm -rf ~/gt $(date)'; $C ‖ B C='rm $(echo -rf) ~/gt'; bash -c "$C" ‖ B true && C='rm ~/.beads/{b..b} $(echo -f)'; $C ‖ P C='ls -la $(pwd)'; $C ‖ P C='echo $(date)'; eval "$C"
 B rm -rf {~/gt,x} ‖ B rm -rf x {y,~/gt} ‖ B rm --{a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q} $UNSET ‖ P rm -rf {x,@S/work/a}
 B F=-rf; rm $F -- ~/gt ‖ P rm ${U:-a,b} ‖ P U=; rm -rf ${U:-/tmp/ok,@H/gt} ‖ P D=aaaa; rm -rf ${D%%a} ‖ P F=-rf; unlink $F ~/gt
+B:w rm -f data/x.db ‖ B:w rm -f ./data/* ‖ B rm -f ~/gt/wa/data/x.db ‖ B rm -f @H/gt/wa/data/x.db ‖ B rm -f @H/shared/data/x.db ‖ B rm @H/shared/data/prod.db ‖ B rm -rf @H/shared/data ‖ B rm -f ~/gt/wa/shared/data/x.db ‖ B rm -f @S/lnkdata/x.db ‖ B rm -rf @S/lnkdata ‖ B cd @H/gt/wa && rm -f data/x.db ‖ B cd @S/lnkdata && rm -f x.db
+B find @H/shared -name '*.db' -delete ‖ B find @H/shared/data -name x -delete ‖ B find @H/gt/wa/data -name '*.db' -delete ‖ B rm -rf @H/shared ‖ P rm -f @H/shared/note.txt ‖ P rm -f ~/shared/other.txt ‖ P rm @H/shared/note.txt
+B rm -f @S/L/../ga2.db ‖ B rm -f @S/Ld/../ga2.db ‖ B rm -f @S/L/../ga*.db ‖ B find @S/Ld/.. -name 'ga2*' -delete ‖ B D=@S/L/..; rm -f $D/ga2.db ‖ B cd @S/L && rm -rf ../ga2.db ‖ B cd @S/Ld && rm -f ../ga2.db ‖ B (cd @S/L; rm -f ../ga2.db) ‖ B pushd @S/L >/dev/null; rm -f ../ga2.db
+B env -C @S/L rm -f ../ga2.db ‖ B sudo -D @S/Ld rm -f ../ga2.db ‖ B bash -c 'cd @S/L && rm -f ../ga2.db' ‖ B cd -P @S/L/.. && rm -f ga2.db ‖ B cd -P @S/Ld/.. && rm -f ga2.db ‖ B rm -rf */ ‖ B cd @H/.beads/lnkout/.. && rm -f b ‖ B env -C @H/.beads/lnkout/.. rm -f b ‖ B cd @S/lnkdata/yo/.. && rm -f prod.db ‖ B env -C @S/lnkdata/yo/.. rm -f prod.db ‖ B sudo -D @S/lnkdata/yo/.. rm -f prod.db ‖ P rm -f @S/lnkok/../many/f1 ‖ P cd @S/lnkok && rm -f ../many/f1 ‖ P rm -rf @S/lnkok/../many/f1
 """
 X = [("B", "C=\"rm -rf 'a @H/proj b'\"; $C"), ("B", "C='rm -rf \"a @H/proj b\"'; $C"), ("B", "C='rm -rf a # @H/proj'; $C"), ("B", "C='rm -rf a\\ @H/proj'; $C"), ("B", "C='rm -rf \"@H/proj\"'; eval \"$C\""), ("B", "C=\"rm -rf '@H/proj'\"; bash -c \"$C\""), ("B", "C='rm -Rf \"${HOME}/proj2\"'; eval \"$C\""), ("B", "echo `echo '`; rm -f @S/work/a; echo `echo '`"), ("P", "x=$((1 << 3 \n + 1))\nrm -f @S/work/a"), ("P", "x=$(( (1<<3)\n + 1 )); echo $x"), ("B", "x=$((rm -rf @H/proj) | wc)"), ("P", "for ((i=0;i<1<<3;i++)); do :; done\nrm -f @S/work/a"), ("B", "cat <<E\"O\"F\nx\nEOF\nrm -rf @H/proj"), ("B", "echo \"$(cat <<'EOF'\nit's\nEOF\n)\"; rm -rf @H/proj"), ("B", "git commit -m \"$(cat <<'EOF'\nfix: don't break\nEOF\n)\" && rm -rf @H/proj"), ("P", "git commit -m \"$(cat <<'EOF'\nfix: don't use rm -rf ~/gt-remote\nEOF\n)\""),
      ("B", "((x = 1 << 3))\nrm -rf @H/proj"), ("P", "((x = 1 << 3))\nrm -f @S/work/a"), ("B", "for ((i=0;i<1<<3;i++)); do :; done\nrm -rf @H/proj"), ("P", "echo $((1 << 3))\nrm -f @S/work/a"), ("P", "x=\"$(echo \"a\\\"b\")\"\nrm -f @S/work/a"),
@@ -191,7 +197,7 @@ def check(name, ok, detail=""):
 
 m = load(GUARD)
 bad = run_table(m)
-check(f"tabela: {len(TABLE)} casos", not bad, "\n     ".join(bad[:8]))
+check(f"tabela: {len(TABLE)} casos", not bad, "\n     ".join(bad[:40]))
 
 
 def e2e(raw=None, tool="Bash", cmd="ls", guard=GUARD):
@@ -237,6 +243,8 @@ def verdict(p, rec, sel):
     rel = p[len(H) + 1:].split("/")
     if rel[0] == "gt" and ((len(rel) >= 4 and rel[2:4] == ["shared", "data"]) or (rec and (len(rel) == 2 or (len(rel) == 3 and rel[2] == "shared")))):
         return True  # dado de produção do rig e os dois ancestrais que o levam junto
+    if rel[:2] == ["shared", "data"] or (rec and rel == ["shared"]):
+        return True  # o dado de produção MORA em ~/shared/data (o rig só o aponta por link): vale pelo caminho real, com qualquer operação
     if sel:
         return holds(p, DATA)
     return (len(p[len(H) + 1:].split("/")) == 1 and rec and not (os.path.exists(p) and not os.path.isdir(p))) or holds(p, REPOS)
@@ -277,17 +285,27 @@ def touched(cmd):
 
 rnd = random.Random(int(os.environ.get("RMTG_SEED", "7")))
 BAD = ["proj/.git/config", "proj/.git/HEAD", "proj", "proj2", ".dolt-data/ga", ".dolt-data/ga/.dolt/noms/manifest", ".beads/b", "gt-remote", "gt-remote/keys/gt_mirror", "gt-remote/git", "gt-remote/git/gascity",
-       "gt-remote/git/gascity/wt/s1", "gt-remote/big", "gt/rig", "gt/rig/shared", "gt/rig/shared/data", "gt/rig/crew/bob/x.py", "gt/rig/.gc-worktrees/w", "@S/lnkgit"]
-OK = ["proj/src/a.py", "proj/build", "proj/build/x.o", "proj/node_modules", "notes.txt", ".cache/pip/w", "proj/.git/index.lock", "gt-remote/git/gascity/wt/s1/src", "@S/work", "@S/work/a", "@S/srepo", "@S/many/f1", "proj/src/m.pyc"]
+       "gt-remote/git/gascity/wt/s1", "gt-remote/big", "gt/rig", "gt/rig/shared", "gt/rig/shared/data", "gt/rig/crew/bob/x.py", "gt/rig/.gc-worktrees/w", "@S/lnkgit", "shared", "shared/data", "shared/data/prod.db", "gt/wa/data", "gt/wa/data/prod.db", "gt/wa/shared/data/prod.db", "@S/lnkdata", "gt/wa/shared"]
+OK = ["proj/src/a.py", "proj/build", "proj/build/x.o", "proj/node_modules", "notes.txt", ".cache/pip/w", "proj/.git/index.lock", "gt-remote/git/gascity/wt/s1/src", "@S/work", "@S/work/a", "@S/srepo", "@S/many/f1", "proj/src/m.pyc", "shared/note.txt"]
 FLAGS = ["-rf", "-fr", "-r -f", "-f -r", "-Rf", "-rfv", "--recursive --force", "--recur --forc", "-r", "-f", "", "-rf --", "--recursive", "-vr"]
 WRAPS = ["env A=1", "command", "nohup", "nice -n 5", "time"] + [w for w in ("timeout 5", "stdbuf -oL") if shutil.which(w.split()[0])]
 heredocs = [0]
 
 
+HOPS = {}
+
+
+def hop(P):
+    """Link do scratch que aponta para o PRÓPRIO alvo: `hop/../nome` cai no pai do alvo pelo kernel (o texto normalizado cairia no scratch)."""
+    if P not in HOPS:
+        HOPS[P] = f"{S}/hop{len(HOPS)}"; os.symlink(P, HOPS[P])
+    return HOPS[P]
+
+
 def spell(rel):
     P = S + rel[2:] if rel.startswith("@S") else f"{H}/{rel}"
     d, b = os.path.split(P)
-    opts = [P, "'" + P + "'", d + "//" + b, d + "/./" + b, P[:5] + "''" + P[5:], d + "/" + b[:3] + "*", d + "/{" + b + ",zz}", os.path.relpath(P, CWD), P + "/"]
+    opts = [P, "'" + P + "'", d + "//" + b, d + "/./" + b, P[:5] + "''" + P[5:], d + "/" + b[:3] + "*", d + "/{" + b + ",zz}", os.path.relpath(P, CWD), P + "/", hop(P) + "/../" + b]
     if b[-1:].isalnum():
         opts.append(d + "/" + b[:-1] + "{" + b[-1] + ".." + b[-1] + "}")
     if P.startswith(H + "/"):
@@ -320,7 +338,7 @@ def late(s, P):
 def shape(s, P):
     d, b = os.path.split(P)
     ds = "~" + d[len(H):] if d.startswith(H) else d
-    return rnd.choice([core(s), core(s), f"D={s}; " + core('"$D"'), f"export D={s}; " + core("$D"), f"cd {ds} && " + core(shlex.quote(b)), f"(cd {ds}; " + core(shlex.quote(b)) + ")", f"echo {s} | xargs " + core(""),
+    return rnd.choice([core(s), core(s), f"D={s}; " + core('"$D"'), f"export D={s}; " + core("$D"), f"cd {ds} && " + core(shlex.quote(b)), f"(cd {ds}; " + core(shlex.quote(b)) + ")", f"cd {hop(P)} && " + core(shlex.quote("../" + b)), f"echo {s} | xargs " + core(""),
                        f"for f in {s}; do " + core('"$f"') + "; done", f"find {s} " + rnd.choice(["-mindepth 1 -delete", "-name '*.o' -delete", "-exec rm -rf {} +", "-type f -delete", "-name x -exec rm {} \\;"]),
                        f"R=rm; $R {rnd.choice(FLAGS)} {s}", "f() { " + core(s) + "; }; f", "python3 -c " + shlex.quote("import subprocess; subprocess.run(['rm','-rf','%s'])" % P)] + late(s, P))
 
@@ -349,7 +367,11 @@ for i in range(N):
 check(f"fuzzer vs bash real: {valid} comandos válidos, {nt} entregaram alvo proibido a um rm falso, bypass={byp} (falso positivo={fp}, só informativo)", byp == 0 and nt > valid // 4, "\n     ".join(miss[:6]))
 
 # --- mutantes: cada guarda apagada tem de reprovar a tabela ---
-MUT = [('componente negado', 'if c in DENY_COMP and not (', 'if False and not ('), ('trava velha .git/*.lock', 'low[-1].endswith(".lock")', 'False'), ('raiz', 'if len(parts) <= 1:', 'if False:'), ('HOME e ancestrais', 'if any(low == hp[:len(low)] for hp in hps):', 'if False:'),
+MUT = [('~/shared/data real', 'rel[:2] == ["shared", "data"]', 'False'), ('~/shared recursivo, mesmo com filtro de nome', 'rel == ["shared"]', 'False'), ('candidates: normpath antes do link', 'p = b if os.path.isabs(b) else os.path.join(cwd, b)', 'p = os.path.normpath(b if os.path.isabs(b) else os.path.join(cwd, b))'),
+       ('cd: só a forma lógica', 'else (os.path.normpath(p), os.path.realpath(p))', 'else (os.path.normpath(p),)'), ('cd: só a forma real', 'else (os.path.normpath(p), os.path.realpath(p))', 'else (os.path.realpath(p),)'),
+       ('cd_target sem dirs', 'return dirs(args[0], cwds, env) if args else [home()]', 'return [p for p, _ in candidates(args[0], cwds, env)] if args else [home()]'), ('env -C sem dirs', 'new = dirs(d, cwds, env); cwds = new', 'new = [p for p, _ in candidates(d, cwds, env)]; cwds = new'),
+       ('mass: barra final do padrão', 'pat.rstrip("/").rsplit("/", 1)[-1]', 'pat.rsplit("/", 1)[-1]'),
+       ('componente negado', 'if c in DENY_COMP and not (', 'if False and not ('), ('trava velha .git/*.lock', 'low[-1].endswith(".lock")', 'False'), ('raiz', 'if len(parts) <= 1:', 'if False:'), ('HOME e ancestrais', 'if any(low == hp[:len(low)] for hp in hps):', 'if False:'),
        ('pasta direta do HOME', 'if len(rel) == 1 and rec and not selective and not (', 'if False and not ('), ('CloudStorage', 'rel[:2] == ["library", "cloudstorage"]', 'False'), ('shared/data', 'rel[2:4] == ["shared", "data"]', 'False'),
        ('claude-<uid> compartilhado', 'rest[0].startswith("claude-") and len(rest) < 3', 'False'), ('tmux', 'rest[0].startswith("tmux-")', 'False'), ('pasta de sistema', 'if low[0] in SYSTEM:', 'if False:'), ('raiz de repo', 'return "rm.repo-root" if holds(f) else None', 'return None'),
        ('repo a 2 níveis', 'any(real(pb) and marked(pb, git) for pb in (os.path.join(pa, b) for b in kids(pa)))', 'False'), ('repo bare', 'os.path.isfile(j("HEAD"))', 'False'), ('estouro do orçamento', 'except OverflowError:\n        return True', 'except OverflowError:\n        return False'),

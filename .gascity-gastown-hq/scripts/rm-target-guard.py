@@ -5,14 +5,14 @@ DORMENTE: nenhum settings.json chama este arquivo; ligar é decisão do Mayor (A
 /tmp que outras sessões usam, seja qual for a ordem das flags ou o embrulho (`env`, `sudo`, `timeout`, `bash -c`, `eval`, `find -delete`, `xargs`, `python -c`); `rm -rf /tmp/x` e `rm -rf build` passam. Sai 2 em qualquer modo.
 COMO DECIDE: o texto é lido como o bash lê (aspas, `$'…'`, heredoc, `$( )`, `<( )`, crase, `cd`, `env -C`, `sudo -D`, chave `{a,b}` `{1..9}` na palavra do verbo e nas flags, opção do `rm` que não está escrita (`$F`, `${F:--rf}`, `$( )`, `{-rf,x}`, `rm *` com um arquivo `-rf`: o que não sei vale "talvez -r" para os operandos que sei), e variável com o escopo do bash: `V=x cmd`, subshell, pipe,
   `&&`, função, laço, `read`, `printf -v`, `+=`, `${V:-x}`, `C='rm -rf x'; $C`), os embrulhos saem, as opções do `rm`/`unlink`/`rmdir`/`shred`/`rimraf` são normalizadas e os OPERANDOS (`~`, `$HOME`, cwd, chave, glob que EXISTE)
-  são julgados em duas formas, o texto e o `realpath`: vale a pior. Proibido: componente `.dolt` `.dolt-data` `.beads` `.git` `.gc-worktrees` `crew`, `/` e pasta de 1º nível, HOME e ancestrais, pasta DIRETA do HOME, `~/Library/CloudStorage`,
-  `~/gt/*/shared/data` (e, numa remoção recursiva, `~/gt/<rig>` e `~/gt/<rig>/shared`), a raiz de /tmp e as pastas compartilhadas (`claude-<uid>`, `claude-<uid>/<projeto>`, `tmux-*`), pasta de sistema, raiz de repo git ou pasta que guarda um
+  são julgados em duas formas, o texto e o `realpath` (`L/..` depois de um link sobe pelo alvo, como o kernel; o destino de `cd` vale nas duas): vale a pior. Proibido: componente `.dolt` `.dolt-data` `.beads` `.git` `.gc-worktrees` `crew`, `/` e pasta de 1º nível, HOME e ancestrais, pasta DIRETA do HOME, `~/Library/CloudStorage`,
+  `~/shared/data` (o dado real, que o rig só aponta por link: vale o caminho real) e `~/gt/*/shared/data` (e, numa remoção recursiva, `~/shared`, `~/gt/<rig>` e `~/gt/<rig>/shared`), a raiz de /tmp e as pastas compartilhadas (`claude-<uid>`, `claude-<uid>/<projeto>`, `tmux-*`), pasta de sistema, raiz de repo git ou pasta que guarda um
   até 2 níveis abaixo, curinga que esvazia uma pasta que guarda repo. `find -delete|-exec rm` julga as raízes; `xargs rm`, alvo que não resolvo (`$VAR`, `$( )`) ou verbo que não resolvo com flag recursiva = bloqueado. Só `&&` fixa o cwd depois de um `cd`.
   Texto que o leitor não consegue fechar (aspas, `$( )`, crase, `${ }` ou heredoc sem fecho) e que cita remoção = bloqueado (`rm.unparsed`): perdeu o compasso do bash, e o que não dá para conferir não vira "liberado". Mesma regra para variável usada como comando (`C='rm -rf x $(date)'; eval "$C"`): o texto que ela recebeu cita remoção e não resolve.
 CÓDIGOS: 0 liberado · 2 bloqueado. Erro do guarda num pedido Bash, texto acima de MAX_CMD (256 KB) ou prazo LIMIT (8 s) estourado = bloqueado. Travar o python NÃO sai 2 (o executor mata e o pedido segue): o prazo é cooperativo.
 ATIVAÇÃO (do Mayor; agente não edita o settings do usuário): PreToolUse, matcher "Bash", UM hook `python3 -I <caminho>/rm-target-guard.py || exit 2` (o `|| exit 2` é OBRIGATÓRIO: cobre python que cai, some ou sai 1 ao escrever o aviso). O matcher é só Bash: tool que roda script de shell (Monitor) não é julgada. Para SUBSTITUIR a regra de prefixo,
   tire `Bash(rm -rf:*)` do `deny` (nó e overlays `pool-*`) ou do `ask` (mini: travou pool 54-97 min, ga-gkap9p) na MESMA camada. Primeiro o nó Hetzner com 48 h de observação; no mini só depois de refazer o replay das transcrições com 0 falso positivo.
-MEDIDO (29/10): selftest com 708 linhas de tabela e 191 mutantes mortos; fuzzer contra o bash REAL do nó (5.2.21) com 6 sementes de 1.500, ~8.600 comandos válidos, 0 bypass; as linhas de opção não escrita contra o bash 3.2.57 do mini e o 5.3 do brew, 0 divergência. "0 bypass" vale para as sementes rodadas: o fuzzer não é prova. Replay A/B (guard
+MEDIDO (29/10): selftest com 750 linhas de tabela e 199 mutantes mortos; fuzzer contra o bash REAL do nó (5.2.21) com 4 sementes de 1.500 (13, 26, 39, 52), 5.728 comandos válidos, 0 bypass (o guard anterior, no mesmo mundo e na semente 13, deixa passar 121); as linhas de opção não escrita contra o bash 3.2.57 do mini e o 5.3 do brew, 0 divergência (medidas antes da 4ª rodada). "0 bypass" vale só para as sementes rodadas e para o MUNDO do fuzzer (pastas, links `lnkgit`/`lnkdata`/`~/gt/wa/data -> shared/data`, saltos `link/../x` e `cd link && rm ../x`): outro layout de links não foi medido, e o fuzzer não é prova. Replay A/B (guard
   anterior x este) de 408 pedidos Bash reais das transcrições locais do mini: 0 bloqueios novos e 0 perdidos, pior caso 0,01 s; mas 175 deles já eram bloqueados (112 `rm.worktrees`: script Python por heredoc dentro de `.gc-worktrees`): medir antes de ligar no mini. Replay de 31.820 pedidos do nó, de versão anterior. Custo ~50 ms por chamada.
 LIMITES (trava contra engano, não sandbox): não vejo script que o comando executa (`bash x.sh`, `source`), alias/função de fora, caminho montado em pedaços, `rsync --delete`, `git clean`, `mv x /dev/null`, `git -c alias.x='!rm …'`, nem executor que
   recebe o rm como texto (`uv run python -c`, `tmux send-keys`, `at`); remoção NÃO recursiva de alvo desconhecido (`rm -f "$f"`) passa; `rm -rf *` em pasta direta do HOME ou de /tmp compartilhada julga cada achado, não a pasta (como o safe-clean). `D=(…)`, `${V^^}`, `${V:1:2}`, `${!V}`, `$((…))` valem "não sei"; chave até 16 alternativas, 3 níveis e 64 saídas.
@@ -62,7 +62,7 @@ RULES = {
     "rm.dolt": "dados do Dolt/beads (.dolt, .dolt-data, .beads): apagar derruba o plano de dados da cidade", "rm.git": "histórico de um repo (.git)",
     "rm.worktrees": "worktrees da cidade (.gc-worktrees): podem guardar trabalho de crew sem entregar", "rm.crew": "clone de crew (crew/): trabalho de agente sem entregar",
     "rm.root": "raiz do sistema de arquivos ou pasta de 1º nível", "rm.home": "o HOME ou um ancestral dele", "rm.home-child": "pasta direta do HOME (~/gt, ~/gt-remote, ~/.claude, ~/.ssh…) apagada por inteiro",
-    "rm.cloud": "~/Library/CloudStorage: documentos pessoais do Athos", "rm.rig-data": "~/gt/<rig>/shared/data (dados de produção) e as duas pastas que o levam junto, ~/gt/<rig> e ~/gt/<rig>/shared, removidas por inteiro", "rm.system": "pasta de sistema",
+    "rm.cloud": "~/Library/CloudStorage: documentos pessoais do Athos", "rm.rig-data": "~/shared/data e ~/gt/<rig>/shared/data (dados de produção; o rig só aponta para o real) e as pastas que o levam junto, ~/shared, ~/gt/<rig> e ~/gt/<rig>/shared, removidas por inteiro", "rm.system": "pasta de sistema",
     "rm.shared-tmp": "pasta de /tmp compartilhada com outras sessões (a raiz, claude-<uid>, claude-<uid>/<projeto>, tmux-*)", "rm.repo-root": "raiz de repo git (ou pasta que guarda um): trabalho sem entregar",
     "rm.mass": "curinga que esvazia uma pasta que guarda repo (rm -rf *)", "rm.target-unknown": "alvo que o guarda não consegue resolver (variável solta, substituição) numa remoção recursiva",
     "rm.too-deep": "comando aninhado fundo demais para conferir", "rm.too-big": "comando grande demais para conferir",
@@ -200,18 +200,18 @@ def candidates(raw: str, cwds: list, env: dict) -> list:
         for b in bs:
             for cwd in ([None] if os.path.isabs(b) else cwds):
                 if UNK in b or (cwd is None and not os.path.isabs(b)):
-                    out.append((None, None))
-                    continue
-                p = os.path.normpath(b if os.path.isabs(b) else os.path.join(cwd, b))
+                    out.append((None, None)); continue
+                p = b if os.path.isabs(b) else os.path.join(cwd, b)  # SEM normpath: `L/..` depois de um link sobe pelo alvo do link (o kernel resolve componente a componente); classify julga o normpath E o realpath
                 if re.search(r"[*?\[]", p):
                     # vazio → glob sem resultado: o rm recebe o texto como veio e o padrão vale; falhou/ilegível (permissão, laço de link) → glob devolve [] e o padrão vale
                     if sum(bool(re.search(r"[*?\[]", c)) for c in p.split("/")) > 2:  # curinga fundo (/*/*/*/x) percorre o disco inteiro: não expando; o TEXTO do padrão ainda é julgado e, numa remoção recursiva, vale alvo que não conheço
-                        out += [(p, p), (None, None)]
-                        continue
+                        out += [(p, p), (None, None)]; continue
                     hits = sorted(itertools.islice(glob.iglob(p), GLOB_MAX + 1))
                     out += [(h, p) for h in hits[:GLOB_MAX] or [p]] + ([(None, None)] if len(hits) > GLOB_MAX else [])  # achados além do teto: não os vi, valem como alvo que não conheço
                 else: out.append((p, None))
     return out
+
+dirs = lambda raw, cwds, env: list(dict.fromkeys(q for p, _ in candidates(raw, cwds, env) for q in ((None,) if p is None else (os.path.normpath(p), os.path.realpath(p)))))  # noqa: E731 — destino de cd/pushd/env -C/sudo -D: o `cd` lógico vai ao normpath, o `cd -P` e o kernel (`L/..`) ao realpath, e sem saber qual vale os dois. vazio → realpath devolve o próprio texto; falhou/ilegível (laço, sem permissão) → idem e o normpath vale junto; None segue "não sei"
 
 def present(p: str) -> bool:
     # vazio → não existe (FileNotFoundError, NotADirectoryError): sem marca; falhou/ilegível (sem permissão, laço de link, nome inválido) → conta como existente: o estado inerte é "tem marca"
@@ -259,7 +259,7 @@ def judge(f: str, rec: bool, selective: bool, pat) -> str | None:
     k = next((len(hp) for hp in hps if low[:len(hp)] == hp), None)
     rel, relp = (low[k:], parts[k:]) if k is not None else (None, None)
     if rel is not None and rel[:2] == ["library", "cloudstorage"]: return "rm.cloud"
-    if rel is not None and rel[:1] == ["gt"] and ((len(rel) >= 4 and rel[2:4] == ["shared", "data"]) or (rec and (len(rel) == 2 or (len(rel) == 3 and rel[2] == "shared")))):  # os 2 ancestrais levam o dado junto, com ou sem filtro de nome
+    if rel is not None and ((rel[:1] == ["gt"] and ((len(rel) >= 4 and rel[2:4] == ["shared", "data"]) or (rec and (len(rel) == 2 or (len(rel) == 3 and rel[2] == "shared"))))) or rel[:2] == ["shared", "data"] or (rec and rel == ["shared"])):  # os 2 ancestrais levam o dado junto, com ou sem filtro de nome; o dado REAL mora em ~/shared/data (o rig só o aponta por link: ~/gt/<rig>/shared/data, ~/gt/<rig>/data) e vale pelo caminho real, com qualquer operação
         return "rm.rig-data"
     if any(c in ALLOW_COMP for c in parts) or (f.endswith(".pyc") and not os.path.isdir(f)) or (relp is not None and any(relp[:len(a)] == list(a) for a in ALLOW_HOME)): return None
     if rel is not None:  # o HOME vence o scratch: um HOME dentro de /tmp (teste) continua sendo HOME
@@ -276,7 +276,7 @@ def judge(f: str, rec: bool, selective: bool, pat) -> str | None:
         if low[0] in SYSTEM: return "rm.system"
     if selective:  # filtro de nome: o que vale é só a regra absoluta e dado (Dolt, beads, repo bare) embaixo da raiz; árvore de trabalho com `.git` pode (`find . -name '*.pyc' -delete`)
         return "rm.repo-root" if holds(f, False) or (holds(f) and any(GITNAMES.search(p) for p in selective)) else None
-    if pat and MASS.fullmatch(pat.rsplit("/", 1)[-1]) and holds(os.path.dirname(pat)): return "rm.mass"
+    if pat and MASS.fullmatch(pat.rstrip("/").rsplit("/", 1)[-1]) and holds(os.path.dirname(pat.rstrip("/"))): return "rm.mass"
     return "rm.repo-root" if holds(f) else None
 
 def classify(p: str, rec: bool, selective: bool = False, pat=None):
@@ -504,7 +504,7 @@ def cd_target(ws: list, cwds: list, env: dict):
     if os.path.basename(ws[0]) == "popd": return [None]  # volta a uma pasta que não rastreio
     args = [a for a in ws[1:] if a not in ("-L", "-P", "-e", "-@", "--")]
     if args[:1] == ["-"]: return [None]
-    return [p for p, _ in candidates(args[0], cwds, env)] if args else [home()]
+    return dirs(args[0], cwds, env) if args else [home()]
 
 def inline(code: str, cwds: list, depth: int, env: dict):
     """Código inline de python/node/perl/ruby/awk. Confere `['rm','-rf',x]`, texto de shell com rm (`os.system`) e, se o código usa uma API de remoção (DELAPI) ou algum literal cita
@@ -654,7 +654,7 @@ def one(ws: list, cwds: list, depth: int, env: dict, feed: list, app=None, stron
         for a in pre if not wrapped else (): assign(a, env, cwds[0], strong)
         return None
     for d in cd:  # `env -C DIR cmd`, `sudo -D DIR cmd`: o comando de dentro roda em DIR (não resolvo = cwd "não sei", que barra a remoção recursiva)
-        new = [p for p, _ in candidates(d, cwds, env)]; cwds = new if len(new) <= 8 else new[:7] + [None]
+        new = dirs(d, cwds, env); cwds = new if len(new) <= 8 else new[:7] + [None]
     if ws[0] in ST["funcs"]:  # chamada de função: o que o corpo atribui entra como "talvez"
         for k, v in list(ST["fnvals"].items()): setvar(env, k, sorted(v), False)
     if len(ws) > 3 and ws[0] in ("for", "select") and ws[2] == "in":  # `for d in a b; do rm -rf "$d"; done` (e `time for …`): $d passa a valer cada item
