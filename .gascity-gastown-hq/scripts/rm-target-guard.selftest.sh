@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# rm-target-guard.selftest.sh (ga-id0im4e) — hermético: HOME e scratch de teste em tmp, sem rede, nenhum rm de verdade (rm/unlink/rmdir/shred/find FALSOS gravam o que o shell entregou). Quatro blocos:
-# tabela (B bloqueia, P passa; `:s|:b|:p|:h` troca o cwd), ponta a ponta (exit code, mensagem, falha do guarda), fuzzer diferencial contra o bash REAL (todo comando que entregou um alvo proibido
-# a um rm falso tem de bloquear) e mutantes (cada guarda apagada tem de reprovar a tabela). Uso: rm-target-guard.selftest.sh [N-do-fuzzer, padrão 200]. RMTG_UNDER_TEST=<arquivo> roda a
+# rm-target-guard.selftest.sh (ga-id0im4e) — hermético: HOME e scratch de teste em tmp, sem rede, nenhum rm de verdade (rm/unlink/rmdir/shred/find FALSOS gravam o que o shell entregou). Quatro blocos (o 3º tem dois fuzzers):
+# tabela (B bloqueia, P passa; `:s|:b|:p|:h` troca o cwd), ponta a ponta (exit code, mensagem, falha do guarda), fuzzers diferenciais contra o bash REAL (todo comando que entregou um alvo proibido
+# a um rm falso tem de bloquear; o 2º gera cd/pushd/popd em qualquer posição e põe o `pwd` no lugar do rm: rm recursivo rodado numa pasta proibida tem de bloquear) e mutantes (cada guarda apagada tem de reprovar a tabela). Uso: rm-target-guard.selftest.sh [N-do-fuzzer, padrão 200]. RMTG_UNDER_TEST=<arquivo> roda a
 # suíte contra outra cópia do guarda. Exit 0 = tudo passou. Os payloads com os.system/shell=True/rm -rf abaixo são TEXTO de teste, deliberados: o guarda só os lê, nada os executa.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -50,6 +50,7 @@ def nest(k):
 
 
 # linhas "V cmd ‖ V cmd": V = B bloqueia, P passa; V:s|b|p|h|z|w = cwd (w=@H/gt/wa, s=@S/work, b=proj/build, p=@S/work/a, h=@H, z=/zzh/a/b com HOME=/zzh/a/b); sem tag o cwd é @H/proj (raiz de repo)
+# união de cwd (5º FAIL do gate): com QUALQUER cd/pushd/popd no pedido o rm de alvo relativo, curinga, $PWD ou $(pwd) é julgado em cada pasta de {cwd original} ∪ {destino de todo cd}; o cd que o `||`, o pipe ou o `!` pulam não tira nenhuma pasta da união. Os `P` provam que a união não barra o que só toca pasta de scratch
 DSL = r"""
 B rm -fr ~/gt-remote ‖ B rm -r -f ~/gt-remote ‖ B rm --recursive --force ~/gt-remote ‖ B /bin/rm -rf ~/gt-remote ‖ B bash -c 'rm -rf ~/gt-remote' ‖ B env rm -rf ~/gt-remote ‖ B python3 -c "import subprocess; subprocess.run(['rm','-rf','@H/gt-remote'])" ‖ B rm -Rf ~/gt-remote ‖ B rm -rfv ~/gt-remote
 B rm -f -r ~/gt-remote ‖ B rm --recur --forc ~/gt-remote ‖ B rm ~/gt-remote -rf ‖ B rm -rf -- ~/gt-remote ‖ B rm -rf --no-preserve-root ~/gt-remote ‖ P rm ~/gt ‖ P rm -f ~/gt ‖ B sudo rm -rf ~/gt-remote ‖ B sudo -u bob rm -rf ~/gt-remote ‖ B env -i rm -rf ~/gt-remote ‖ B env A=1 rm -rf ~/gt-remote
@@ -78,7 +79,7 @@ B find ~ -name '*.pyc' -delete ‖ B find / -delete ‖ B find ~ -exec rm -rf {}
 B find ~/proj -exec sh -c 'rm -rf "$1"' _ {} \; ‖ B find @H/proj -name '*' -delete ‖ B find @H/proj -name '.*' -delete ‖ B find @H/proj -regex '.*' -delete ‖ B find @H/proj -mtime +1 -delete ‖ B find @H/gt-remote/git -name HEAD -delete ‖ P find @S -mindepth 1 -delete
 P find @S/work -name '*.o' -delete ‖ P find . -name '*.pyc' -delete ‖ P find ~/proj -name '*.pyc' -delete ‖ P find @H/proj/build -delete ‖ P find ~/proj -name x ‖ P find ~ -name x -print ‖ P find ~ -type f ‖ P find ~ -exec grep x {} + ‖ P find @H/proj/build -mindepth 1 -delete
 P find @H/proj -name '*.o' -delete ‖ B cd ~ && rm -rf * ‖ B cd ~; rm -rf gt-remote ‖ B (cd ~ && rm -rf gt-remote) ‖ B cd @H && rm -rf gt-remote ‖ B pushd ~ >/dev/null; rm -rf gt-remote ‖ B cd .. && rm -rf proj2 ‖ B:h cd gt-remote/git && rm -rf gascity ‖ P cd ~/proj && rm -rf build
-P cd @S/work && rm -rf a ‖ P cd @S/work && rm -rf * ‖ B cd @S/work; rm -rf * ‖ B cd @S/work || true; rm -rf * ‖ B cd @S/work & rm -rf * ‖ B popd; rm -rf * ‖ B cd $UNSET && rm -rf * ‖ B cd "$X" && rm -rf build ‖ P cd "$X" && rm -f build ‖ B (cd @S/work; rm -rf *) ‖ P:s rm -rf * ‖ B:h rm -rf proj2
+P cd @S/work && rm -rf a ‖ B cd @S/work && rm -rf * ‖ B cd @S/work; rm -rf * ‖ B cd @S/work || true; rm -rf * ‖ B cd @S/work & rm -rf * ‖ B popd; rm -rf * ‖ B cd $UNSET && rm -rf * ‖ B cd "$X" && rm -rf build ‖ P cd "$X" && rm -f build ‖ B (cd @S/work; rm -rf *) ‖ P:s rm -rf * ‖ B:h rm -rf proj2
 P echo rm -rf ~/gt-remote ‖ P printf '%s\n' 'rm -rf ~' ‖ P git commit -m "rm -rf ~/gt-remote" ‖ P grep -rn 'rm -rf' ~/gt-remote ‖ P man rm ‖ P which rm ‖ P command -v rm ‖ P type rm ‖ P ls ~/gt-remote ‖ P cat ~/notes.txt ‖ P # rm -rf ~ ‖ P echo "rm -rf ~" > note.txt ‖ P alias rm='rm -i' ‖ P rm
 P rm -rf ‖ P git rm -rf --cached x ‖ P bd show ga-1 ‖ P cd ~ ‖ P ls ‖ B python3 -c "import shutil; shutil.rmtree('@H/gt-remote')" ‖ B python3 -c "import os; os.system('rm -rf @H/gt-remote')" ‖ B python3 -c "import os; os.system('rm -rf ~/gt-remote')"
 B node -e "require('fs').rmSync('@H/gt-remote',{recursive:true,force:true})" ‖ B node -e "require('child_process').execSync('rm -rf @H/gt-remote')" ‖ B perl -e 'system("rm -rf @H/gt-remote")' ‖ B perl -e 'use File::Path qw(rmtree); rmtree("@H/gt-remote")'
@@ -122,7 +123,7 @@ B find @H/shared -name '*.db' -delete ‖ B find @H/shared/data -name x -delete 
 B rm -f @S/L/../ga2.db ‖ B rm -f @S/Ld/../ga2.db ‖ B rm -f @S/L/../ga*.db ‖ B find @S/Ld/.. -name 'ga2*' -delete ‖ B D=@S/L/..; rm -f $D/ga2.db ‖ B cd @S/L && rm -rf ../ga2.db ‖ B cd @S/Ld && rm -f ../ga2.db ‖ B (cd @S/L; rm -f ../ga2.db) ‖ B pushd @S/L >/dev/null; rm -f ../ga2.db
 B env -C @S/L rm -f ../ga2.db ‖ B sudo -D @S/Ld rm -f ../ga2.db ‖ B bash -c 'cd @S/L && rm -f ../ga2.db' ‖ B cd -P @S/L/.. && rm -f ga2.db ‖ B cd -P @S/Ld/.. && rm -f ga2.db ‖ B rm -rf */ ‖ B cd @H/.beads/lnkout/.. && rm -f b ‖ B env -C @H/.beads/lnkout/.. rm -f b ‖ B cd @S/lnkdata/yo/.. && rm -f prod.db ‖ B env -C @S/lnkdata/yo/.. rm -f prod.db ‖ B sudo -D @S/lnkdata/yo/.. rm -f prod.db ‖ P rm -f @S/lnkok/../many/f1 ‖ P cd @S/lnkok && rm -f ../many/f1 ‖ P rm -rf @S/lnkok/../many/f1
 B cd D && true; rm -rf * ‖ B cd D && true || true; rm -rf * ‖ B pushd D >/dev/null && true; rm -rf * ‖ B cd D && true & rm -rf * ‖ B cd D && cd E; rm -rf * ‖ B cd D && (true); rm -rf * ‖ B (cd D && true; rm -rf *) ‖ B cd D && true | cat; rm -rf * ‖ B:h cd /nonexistent && true; rm -rf gt-remote ‖ B cd D && true; cd E && true; rm -rf *
-P cd @S/work && true; rm -rf a ‖ P cd @S/work && rm -rf a; true ‖ P cd @S/work && (rm -rf *) ‖ P cd @S/work && (true; rm -rf *) ‖ P cd @S/work && true && rm -rf * ‖ P (cd @S/work && true); rm -rf build ‖ P cd @S/work && echo hi | rm -rf * ‖ P cd @H/proj/build && true; rm -rf *.o
+P cd @S/work && true; rm -rf a ‖ P cd @S/work && rm -rf a; true ‖ B cd @S/work && (rm -rf *) ‖ B cd @S/work && (true; rm -rf *) ‖ B cd @S/work && true && rm -rf * ‖ P (cd @S/work && true); rm -rf build ‖ B cd @S/work && echo hi | rm -rf * ‖ P cd @H/proj/build && true; rm -rf *.o
 B:p cd ~/gt-remote; rm -rf "$PWD" ‖ B:p cd ~; rm -rf $PWD ‖ B:p (cd ~; rm -rf $PWD) ‖ B:p pushd ~ >/dev/null; rm -rf $PWD ‖ B:p cd ~; D=$PWD; rm -rf "$D" ‖ B:p cd ~ && true; rm -rf $PWD ‖ B:p cd ~ && true; rm -rf $(pwd)/x ‖ B:p cd ~; rm -rf "$(pwd)" ‖ B:p cd ~; for d in $PWD; do rm -rf "$d"; done ‖ B:p cd ~; rm -rf ${PWD} ‖ B:p cd ~; rm -rf `pwd` ‖ B:p cd ~; D=$PWD/gt-remote; rm -rf "$D" ‖ B:p popd; rm -rf $PWD
 P:p cd @S/work; rm -rf $PWD ‖ P:p cd @S/work && true; rm -rf $PWD ‖ P:p rm -rf "$PWD" ‖ P:p cd ..; D=$PWD; rm -rf "$D"
 B rm -rf ** ‖ B rm -rf *** ‖ B rm -rf *? ‖ B rm -rf [!.]* ‖ B rm -rf [^.]* ‖ B rm -rf ./** ‖ B rm -rf ./[!.]* ‖ B rm -rf .?* ‖ P rm -rf x* ‖ P rm -rf _* ‖ P rm -rf 1* ‖ P rm -rf é* ‖ P rm -rf build* ‖ P rm -rf s*c ‖ P:b rm -rf ** ‖ P:b rm -rf [!.]*
@@ -134,6 +135,17 @@ B:p find -xE @H/gt-remote -delete ‖ B:p find -Ex @H/gt-remote -delete ‖ B:p 
 P find -xE @S/work -mindepth 1 -delete ‖ P find -- @S/work -mindepth 1 -delete ‖ P:p find -HLP @S/work -mindepth 1 -delete ‖ P:h find -xEd @S/work -mindepth 1 -delete
 B for a in /tmp/a1 /tmp/a2 /tmp/a3 /tmp/a4 /tmp/a5 /tmp/a6 /tmp/a7 /tmp/a8 ~/gt-remote; do for b in "" -1 -2 -3 -4 -5 -6 -7 -8; do rm -rf "$a$b"; done; done ‖ P for a in /tmp/a1 /tmp/a2 /tmp/a3 /tmp/a4 /tmp/a5 /tmp/a6 /tmp/a7 /tmp/a8; do for b in "" -1 -2 -3 -4 -5 -6 -7; do rm -rf "$a$b"; done; done ‖ B echo "import shutil,sys; shutil.rmtree(sys.argv[1])" | python3 - @H/gt-remote
 P echo $'C:\Users\bob' ‖ P grep -c $'\x' notes.txt ‖ P echo x{1..99999999999999999999} ‖ B rm -rf ~/x{1..99999999999999999999}
+B true || cd @S/work && rm -rf * ‖ B cd . || cd @S/work && rm -rf * ‖ B [ -d . ] || cd @S/work && rm -rf * ‖ B echo x | cd @S/work && rm -rf * ‖ B ! cd /nonexistent && rm -rf *
+B true || pushd @S/work >/dev/null && rm -rf * ‖ B bash -c 'true || cd @S/work && rm -rf *' ‖ B (true || cd @S/work) && rm -rf * ‖ B cd @S/work |& cd @S/work && rm -rf * ‖ B:s cd @H/proj || cd @S/work/a && rm -rf *
+B:s true || cd @H/proj && rm -rf "$PWD" ‖ B:s echo x | cd @H/proj && rm -rf "$(pwd)" ‖ B:s ! cd @H/proj && rm -rf $PWD ‖ B:s eval "cd @H/proj"; rm -rf * ‖ B:s bash -c "cd @H/proj"; rm -rf *
+B:s pushd @H/proj >/dev/null; popd >/dev/null; rm -rf * ‖ B:s cd @H/proj; cd @S/work && rm -rf * ‖ B:s cd @S/work/a; cd @H/proj; cd @S/work/b || rm -rf . ‖ B:s true || cd "$UNSET" && rm -rf x ‖ B:s cd - ; rm -rf x
+B:s popd >/dev/null 2>&1; rm -rf x ‖ B:s pushd >/dev/null 2>&1; rm -rf x ‖ B:p while true; do cd ..; rm -rf x; done ‖ B:p for i in 1 2 3; do cd ..; done; rm -rf x ‖ B:p f() { cd ..; }; f; f; rm -rf x
+B:p f() { cd sub; }; f; f; rm -rf x ‖ B:p for i in 1 2; do cd $PWD/a; done; rm -rf x ‖ P:p cd .. && rm -rf x ‖ P:p cd .. && rm -rf * ‖ P:p true || cd @S/work/b && rm -rf *
+P:p echo x | cd @S/work && rm -rf "$PWD" ‖ P:p ! cd @S/work/a && rm -rf $(pwd) ‖ P:p for d in a b; do cd @S/work/$d; done; rm -rf x ‖ P:p cd @S/work/a; cd @S/work/b; rm -rf * ‖ P:p f() { cd @S/work; }; f; f; rm -rf x
+P:s pushd @S/work/a >/dev/null; rm -f x ‖ P:s cd "$UNSET" && rm -f x ‖ P cd @H/proj/build && rm -rf x ‖ P:p cd @S/work || rm -rf x ‖ B:s pushd >/dev/null; rm -rf x
+B:s popd >/dev/null; rm -rf x ‖ P:s cd @S/work/a >/dev/null 2>&1 && rm -rf x ‖ B:p cd ../.. && cd lnkgit && rm -rf * ‖ B:p cd ../.. && cd lnkgit && rm -rf "$PWD" ‖ P:p cd .. && cd b && rm -rf *
+P:p cd .. && cd .. && rm -rf x ‖ P:p for i in 1 2; do :; done; cd .. && rm -rf x ‖ P:p cd .. && rm -rf x; for i in 1; do : ‖ B:p while true; do cd ../..; rm -rf x; done
+B:s FOO=1 cd @H/proj && rm -rf * ‖ B:s FOO=1 BAR=2 cd; rm -rf * ‖ B:s true || FOO=1 cd @H/proj && rm -rf * ‖ B:s FOO=1 pushd >/dev/null; rm -rf x ‖ P:s FOO=1 cd @S/work/a && rm -rf * ‖ P:s cd >/dev/null @S/work/a && rm -rf x ‖ P:s pushd >/dev/null @S/work/a && rm -rf x ‖ P:s cd 2>/dev/null @S/work/a && rm -rf x ‖ B:s cd >/dev/null; rm -rf x ‖ B:s pushd >/dev/null; rm -rf x
 """
 X = [("B", "C=\"rm -rf 'a @H/proj b'\"; $C"), ("B", "C='rm -rf \"a @H/proj b\"'; $C"), ("B", "C='rm -rf a # @H/proj'; $C"), ("B", "C='rm -rf a\\ @H/proj'; $C"), ("B", "C='rm -rf \"@H/proj\"'; eval \"$C\""), ("B", "C=\"rm -rf '@H/proj'\"; bash -c \"$C\""), ("B", "C='rm -Rf \"${HOME}/proj2\"'; eval \"$C\""), ("B", "echo `echo '`; rm -f @S/work/a; echo `echo '`"), ("P", "x=$((1 << 3 \n + 1))\nrm -f @S/work/a"), ("P", "x=$(( (1<<3)\n + 1 )); echo $x"), ("B", "x=$((rm -rf @H/proj) | wc)"), ("P", "for ((i=0;i<1<<3;i++)); do :; done\nrm -f @S/work/a"), ("B", "cat <<E\"O\"F\nx\nEOF\nrm -rf @H/proj"), ("B", "echo \"$(cat <<'EOF'\nit's\nEOF\n)\"; rm -rf @H/proj"), ("B", "git commit -m \"$(cat <<'EOF'\nfix: don't break\nEOF\n)\" && rm -rf @H/proj"), ("P", "git commit -m \"$(cat <<'EOF'\nfix: don't use rm -rf ~/gt-remote\nEOF\n)\""),
      ("B", "((x = 1 << 3))\nrm -rf @H/proj"), ("P", "((x = 1 << 3))\nrm -f @S/work/a"), ("B", "for ((i=0;i<1<<3;i++)); do :; done\nrm -rf @H/proj"), ("P", "echo $((1 << 3))\nrm -f @S/work/a"), ("P", "x=\"$(echo \"a\\\"b\")\"\nrm -f @S/work/a"),
@@ -398,10 +410,80 @@ for i in range(N):
         miss.append(cmd.replace(H, "$H").replace(S, "$S"))
 check(f"fuzzer vs bash real: {valid} comandos válidos, {nt} entregaram alvo proibido a um rm falso, bypass={byp} (falso positivo={fp}, só informativo)", byp == 0 and nt > valid // 4, "\n     ".join(miss[:6]))
 
+# --- fuzzer de cd/pushd/popd (5º FAIL do gate): gramática de comandos com cd em QUALQUER posição contra o bash REAL. O oráculo põe o `pwd` no lugar do rm: o rm falso grava a pasta onde o shell
+# o rodou, e rm recursivo numa pasta proibida (`verdict` da pasta) tem de ser bloqueado. Todo operando da gramática é "a pasta onde estou" (`*`, `.`, `./*`, `$PWD`, `$(pwd)`), então só o cwd decide ---
+CDDIRS = [f"{H}/proj", f"{H}/proj", f"{H}/proj/build", f"{H}/proj/src", f"{H}/proj2", f"{H}/gt-remote", f"{H}/gt-remote/git", H, "~", "~/proj", f"{S}/work", f"{S}/work/a", f"{S}/work/b", f"{S}/many", f"{S}/lnkgit", f"{S}/lnkok", f"{S}/nope",
+          "..", "..", "../..", ".", "build", "src", "a", "b", "-", '"$U"', "$OLDPWD", f"{H}/proj/.git"]
+CDCWD = [f"{S}/work/a", f"{S}/work/a", f"{S}/work", f"{S}/work/b", f"{H}/proj/build", f"{H}/proj/src", f"{H}/proj2", CWD, H]
+
+
+def cdcmd():
+    t = rnd.choice(CDDIRS)
+    return rnd.choice([f"cd {t}", f"cd {t}", f"cd -P {t}", f"pushd {t} >/dev/null", f"pushd {t} >/dev/null 2>&1", "popd >/dev/null 2>&1", "cd", "pushd >/dev/null 2>&1", f"cd {t} 2>/dev/null", f"X=1 cd {t}", f"cd >/dev/null {t}", f"X=1 pushd {t} >/dev/null"])
+
+
+def rmcmd():
+    return "rm " + rnd.choice(["-rf", "-fr", "-r -f", "-Rf", "--recursive --force", "-rfv"]) + " " + rnd.choice(["*", "*", ".", "./*", "$PWD", '"$PWD"', "${PWD}", "$(pwd)", '"$(pwd)"', "`pwd`"])
+
+
+def atom():
+    r = rnd.random()
+    return cdcmd() if r < .4 else rmcmd() if r < .75 else rnd.choice(["true", "false", "echo x", "[ -d . ]", "[ -d build ]", ":", "test -e src", "cd ."])
+
+
+def stmt(d, neg=True):  # `a | ! b` é erro de sintaxe: o `!` só abre um pipeline
+    r = rnd.random()
+    if d < 2 and r < .45:
+        inner = prog(d + 1)
+        return rnd.choice([f"( {inner} )", f"{{ {inner}; }}", f"bash -c {shlex.quote(inner)}", f"eval {shlex.quote(inner)}", f"for i in 1 2; do {inner}; done", f"while true; do {inner}; break; done", f"if true; then {inner}; fi",
+                           f"echo $({inner})", f"{{ f() {{ {inner}; }}; f; }}", f"{{ f() {{ {inner}; }}; f; f; }}", f"{{ {inner}; }} | cat", f"if {atom()}; then {inner}; else {atom()}; fi"])
+    return ("! " if r > .93 and neg else "") + atom()
+
+
+def prog(d=0):
+    out = stmt(d)
+    for _ in range(rnd.choice([0, 1, 1, 2, 2, 3, 4])):
+        sep = rnd.choice([" ; ", " && ", " && ", " || ", " || ", " | ", " |& ", "\n", " & "])
+        out += sep + stmt(d, sep.strip() not in ("|", "|&"))
+    return out
+
+
+def pwdhit(cmd):
+    """(algum rm RECURSIVO rodou numa pasta proibida, código de saída) no bash REAL."""
+    open(LOG, "wb").close(); rc = 0
+    try:
+        rc = subprocess.run(["bash", "-c", cmd + "\nwait"], cwd=FZ[0], env={"PATH": f"{H}/bin:/usr/bin:/bin", "HOME": H}, capture_output=True, timeout=10).returncode
+    except subprocess.TimeoutExpired:
+        pass
+    hit = False
+    for rec in open(LOG, "rb").read().split(b"\x01\n"):
+        if not rec:
+            continue
+        verb, cwd, *args = [x.decode("utf-8", "surrogateescape") for x in rec.split(b"\0")][:-1]
+        if verb == "rm" and any(a[:1] == "-" and a[:2] != "--" and set(a[1:]) & set("rR") or a.startswith("--rec") for a in args):
+            hit = hit or verdict(os.path.normpath(cwd), True, False) or verdict(os.path.realpath(cwd), True, False)
+    return hit, rc
+
+
+cdvalid = cdbyp = cdfp = cdnt = 0
+cdmiss = []
+for i in range(N):
+    FZ[0] = rnd.choice(CDCWD)
+    cmd = prog()
+    t, rc = pwdhit(cmd)
+    if rc in (2, 126, 127):  # sintaxe que esta versão do bash recusa (`|&` no 3.2): nada rodou
+        continue
+    cdvalid += 1; cdnt += t
+    g = m.decide({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": FZ[0]}) is not None
+    cdbyp += t and not g; cdfp += g and not t
+    if t and not g:
+        cdmiss.append(f"[cwd {FZ[0].replace(H, '$H').replace(S, '$S')}] " + cmd.replace(H, "$H").replace(S, "$S"))
+check(f"fuzzer de cd/pushd vs bash real: {cdvalid} comandos válidos, {cdnt} rodaram um rm recursivo numa pasta proibida, bypass={cdbyp} (falso positivo={cdfp}, só informativo)", cdbyp == 0 and (cdnt > cdvalid // 8 or N < 20), "\n     ".join(cdmiss[:6]))
+
 # --- mutantes: cada guarda apagada tem de reprovar a tabela ---
 MUT = [('~/shared/data real', 'rel[:2] == ["shared", "data"]', 'False'), ('~/shared recursivo, mesmo com filtro de nome', 'rel == ["shared"]', 'False'), ('candidates: normpath antes do link', 'p = b if os.path.isabs(b) else os.path.join(cwd, b)', 'p = os.path.normpath(b if os.path.isabs(b) else os.path.join(cwd, b))'),
        ('cd: só a forma lógica', 'else (os.path.normpath(p), os.path.realpath(p))', 'else (os.path.normpath(p),)'), ('cd: só a forma real', 'else (os.path.normpath(p), os.path.realpath(p))', 'else (os.path.realpath(p),)'),
-       ('cd_target sem dirs', 'return dirs(args[0], cwds, env) if args else [home()]', 'return [p for p, _ in candidates(args[0], cwds, env)] if args else [home()]'), ('env -C sem dirs', 'new = dirs(d, cwds, env); cwds = new', 'new = [p for p, _ in candidates(d, cwds, env)]; cwds = new'),
+       ('cd_target sem dirs', 'new = dirs(args[0], cwds, env) if args else [home()]', 'new = [p for p, _ in candidates(args[0], cwds, env)] if args else [home()]'), ('env -C sem dirs', 'cwds = cap(dirs(d, cwds, env))', 'cwds = cap([p for p, _ in candidates(d, cwds, env)])'),
        ('mass: barra final do padrão', 'pat.rstrip("/").rsplit("/", 1)[-1]', 'pat.rsplit("/", 1)[-1]'),
        ('componente negado', 'if c in DENY_COMP and not (', 'if False and not ('), ('trava velha .git/*.lock', 'low[-1].endswith(".lock")', 'False'), ('raiz', 'if len(parts) <= 1:', 'if False:'), ('HOME e ancestrais', 'if any(low == hp[:len(low)] for hp in hps):', 'if False:'),
        ('pasta direta do HOME', 'if len(rel) == 1 and rec and not selective and not (', 'if False and not ('), ('CloudStorage', 'rel[:2] == ["library", "cloudstorage"]', 'False'), ('shared/data', 'rel[2:4] == ["shared", "data"]', 'False'),
@@ -416,18 +498,17 @@ MUT = [('~/shared/data real', 'rel[:2] == ["shared", "data"]', 'False'), ('~/sha
        ('inline: literal direto à API', 'strict = DELCALL.findall(code) +', 'strict = [] +'), ('inline: recursão do literal pelado vem da API', 'rec = bool(DELREC.search(code)) or', 'rec = True or'), ('inline: literal direto é sempre recursivo', 'return check(strict, True, False, cwds, env)', 'return check(strict, rec, False, cwds, env)'), ('heredoc: variável de fora é desconhecida', 'denv = {k: [UNK] for k in env}', 'denv = env'), ('FileUtils amplo', 'FileUtils\\.(?:rm|remove)\\w*', 'FileUtils\\.rm_rf?'), ('inline: literal pelado vale como alvo', 'or check(bare, rec, False, cwds, env, True)', 'or None'),
        ('inline: rm dentro de literal liga os caminhos', 'or any(RM_TEXT.search(x) for x in lits)', 'or False'), ('inline: sem API, nenhum caminho estrito', '[x for x in lits if deletes and x and not', '[x for x in lits if True and x and not'),
        ('inline: sem API, nenhum literal pelado', 'bare = [x for x in lits if deletes and x and len(x)', 'bare = [x for x in lits if True and x and len(x)'), ('curinga fundo: o texto do padrão é julgado', 'out += [(p, p), (None, None)]', 'out += [(None, None)]'),
-       ('$( )', 'for body in substitutions(w):', 'for body in []:'), ('cd só com &&', 'lost, here = (uni(lost, here), cap(new)) if t == "&&" else (lost, uni(here, new))', 'lost, here = lost, cap(new)'), ('teto do glob', '([(None, None)] if len(hits) > GLOB_MAX else [])', '[]'),
+       ('$( )', 'for body in substitutions(w):', 'for body in []:'), ('teto do glob', '([(None, None)] if len(hits) > GLOB_MAX else [])', '[]'),
        ('xargs', 'if verb == "xargs":', 'if False:'), ('find', 'if verb == "find":', 'if False:'), ('env -S', '(b == "env" and key in ("-S", "--split-string"))', 'False'),
        ('npx -c', '(b == "npx" and key in ("-c", "--call"))', 'False'), ('flock -c', 'if b == "flock" and ws[:1] in', 'if False and ws[:1] in'), ('verbo desconhecido + flag recursiva', 'return check(ops, rec, () if rec else ("",), cwds, env)', 'pass'), ('verbo desconhecido sem flag: regras absolutas', 'return check(ops, rec, () if rec else ("",), cwds, env)', 'return check(ops, rec, False, cwds, env)'),
        ('export', 'if verb in ("export", "declare", "typeset", "local", "readonly"):', 'if False:'), ('cd nunca descarta o mais novo', 'cap = lambda m: m if len(m) <= 8 else m[:7] + [None]', 'cap = lambda m: m[:4]'), ('curinga fundo', 'for c in p.split("/")) > 2:', 'for c in p.split("/")) > 200:'),
        ('prazo', 'if time.monotonic() > DEADLINE:', 'if False:'), ('pasta compartilhada: arquivo solto', 'dir_ = os.path.isdir(f) or (rec and not os.path.lexists(f))', 'dir_ = True'),
-       ('heredoc de shell: cwd de todos os cd', 'hit = scan_bash(body, ever, depth + 1, denv) if', 'hit = scan_bash(body, cwds, depth + 1, denv) if'), ('heredoc de interpretador: cwd de todos os cd', 'inline(body, ever, depth + 1, denv)', 'inline(body, cwds, depth + 1, denv)'),
        ('find: nomes internos do git', '(holds(f) and any(GITNAMES.search(p) for p in selective))', 'False'), ('<( ) no lexer', 'c == "`" or (c in "<>" and nx == "(")', 'c == "`"'), ('saída de <( ) é programa', '(w[i] in "$<>" and w[i + 1:i + 2] == "(")', '(w[i] == "$" and w[i + 1:i + 2] == "(")'),
        ('echo|bash junta args', '[" ".join(ws[1:])] if ws and', '[] if ws and'), ('tamanho', 'if len(cmd) > MAX_CMD:', 'if False:'), ('profundidade', 'if depth > 6:', 'if depth > 600:'),
        ('tilde', 'return home() + s[1:] if s == "~" or s.startswith("~/")', 'return s if s == "~" or s.startswith("~/")'), ('glob', 'hits = sorted(itertools.islice(glob.iglob(p), GLOB_MAX + 1))', 'hits = []'), ('chave {a,b}', 'bs = [t] if UNK in t else [tilde(x) for x in braces(t)]', 'bs = [t]'),
        ('teto da chave', 'len(alts) <= 16', 'len(alts) <= 1600'), ('caixa', 'low = [unicodedata.normalize("NFC", x).casefold() for x in parts]', 'low = list(parts)'), ('HOME vence scratch', 'rel, relp = (low[k:], parts[k:]) if k is not None else (None, None)', 'rel, relp = None, None'),
        ('node_modules', 'any(c in ALLOW_COMP for c in parts)', 'False'), ('.cache', 'any(relp[:len(a)] == list(a) for a in ALLOW_HOME)', 'False'), ('pyc', '(f.endswith(".pyc") and not os.path.isdir(f))', 'False'), ('rimraf', 'or verb == "rimraf"', 'or False'),
-       ('popd', 'if os.path.basename(ws[0]) == "popd":', 'if False:'), ('lançador opaco', 'if verb in OPAQUE:', 'if False:'), ('source e .', 'verb in ("eval", "source", ".")', 'verb == "eval"'), ('shells ampliados', '"ash", "csh", "tcsh", "fish", "mksh"', '"ash", "mksh"'), ('interpretadores: pypy', 'pypy[\\d.]*|', ''), ('interpretadores: R, julia, osascript', '|tclsh|wish|Rscript|julia|osascript|jshell|groovy', ''), ('rm( como API de remoção', '(?:unlink|rmdir|rm)(?=', '(?:unlink|rmdir)(?='), ('-c genérico para corredor desconhecido', 'if a in ("-c", "--command") and x + 1 < len(args)', 'if False and x + 1 < len(args)'),
+       ('popd', 'if os.path.basename(ws[0]) == "popd" or', 'if False or'), ('cd -', 'or args[:1] == ["-"] or', 'or False or'), ('lançador opaco', 'if verb in OPAQUE:', 'if False:'), ('source e .', 'verb in ("eval", "source", ".")', 'verb == "eval"'), ('shells ampliados', '"ash", "csh", "tcsh", "fish", "mksh"', '"ash", "mksh"'), ('interpretadores: pypy', 'pypy[\\d.]*|', ''), ('interpretadores: R, julia, osascript', '|tclsh|wish|Rscript|julia|osascript|jshell|groovy', ''), ('rm( como API de remoção', '(?:unlink|rmdir|rm)(?=', '(?:unlink|rmdir)(?='), ('-c genérico para corredor desconhecido', 'if a in ("-c", "--command") and x + 1 < len(args)', 'if False and x + 1 < len(args)'),
        ('for depois do peel', 'if len(ws) > 3 and ws[0] in ("for", "select") and ws[2] == "in":', 'if False:'), ('select como for', 'ws[0] in ("for", "select") and ws[2] == "in"', 'ws[0] == "for" and ws[2] == "in"'),
        ('verbo por variável: valor que sei', 'known = [x for x in v if UNK not in x and x != ws[0]]', 'known = []'), ('verbo por variável: outro valor é "não sei"', 'known = [x for x in v if UNK not in x and x != ws[0]]', 'known = [x for x in v if len(v) == 1 and UNK not in x and x != ws[0]]'),
        ('rig: ancestrais só recursivos no ~/gt/<rig>', 'or (rec and (len(rel) == 2 or (len(rel) == 3 and rel[2] == "shared")))', 'or False'), ('rig: ~/gt/<rig>', '(len(rel) == 2 or (len(rel) == 3 and rel[2] == "shared"))', '(len(rel) == 3 and rel[2] == "shared")'),
@@ -438,8 +519,8 @@ MUT = [('~/shared/data real', 'rel[:2] == ["shared", "data"]', 'False'), ('~/sha
        ('dentro de { } a atribuição é talvez', ' or bool(blk["grp"] and blk["grp"][-1] is None)', ''), ('pipe e & rodam em subshell', 'iso = t in ("|", "|&", "&") or prev in ("|", "|&")', 'iso = False'),
        ('o que o pipe muda entra como talvez', 'if before is not None: merge(env, before)', 'if before is not None: pass'), ('else volta ao ambiente do if', 'top[1].append(dict(env)); env.clear(); env.update(top[0]); top[2] = k == "elif"', 'top[1].append(dict(env)); top[2] = k == "elif"'),
        ('fi e done juntam os ramos', 'fr.pop(); merge(env, top[0], *top[1])', 'fr.pop()'), ('then abre quadro', 'elif k in ("while", "until") or (k == "then" and not (top and top[2])):', 'elif k in ("while", "until"):'),
-       ('while alarga o ambiente', 'widen(env); ST["late"] = True\n        elif k == "then":', 'ST["late"] = True\n        elif k == "then":'), ('for alarga o ambiente', 'fr.append([dict(env), [], False]); widen(env); ST["late"] = True', 'fr.append([dict(env), [], False]); ST["late"] = True'),
-       ('subshell devolve o ambiente', 'here, snap, lost = saved.pop()\n            env.clear(); env.update(snap)', 'here, snap, lost = saved.pop()'), ('chamada de função', 'if ws[0] in ST["funcs"]:', 'if False:'),
+       ('while alarga o ambiente', 'widen(env); ST["late"] = True; ST["lp"] += 1\n        elif k == "then":', 'ST["late"] = True; ST["lp"] += 1\n        elif k == "then":'), ('for alarga o ambiente', 'fr.append([dict(env), [], False, True]); widen(env); ST["late"] = True; ST["lp"] += 1', 'fr.append([dict(env), [], False, True]); ST["late"] = True; ST["lp"] += 1'),
+       ('subshell devolve o ambiente', 'env.clear(); env.update(saved.pop())', 'saved.pop()'), ('chamada de função', 'if ws[0] in ST["funcs"]:', 'if False:'),
        ('cabeçalho f() {', 'if t == "(" and len(hd) == 1 and', 'if False and len(hd) == 1 and'), ('function f {', 'if k == "function":  #', 'if False:  #'),
        ('corpo de função alarga o ambiente', 'if b["fnew"]: ST["fn"] += 1; widen(env)', 'if b["fnew"]: ST["fn"] += 1'), ('2º passo', 'if not hit and ST["late"]:', 'if False:'),
        ('2º passo: valores já vistos', 'if ST["again"] else ():', 'if False else ():'), ('nome calculado vira "não sei"', 'if verb == "printf" else args)): wild(env)', 'if verb == "printf" else args)): pass'),
@@ -489,10 +570,13 @@ MUT = [('~/shared/data real', 'rel[:2] == ["shared", "data"]', 'False'), ('~/sha
        ('opção: chave que gera opção (palavra que não começa com -)', '+ [b for a in ws if "{" in a for b in braces(a)] +', '+'),
        ('variável vira comando: valor com $( ) e texto que cita remoção', 'if any(RM_TEXT.search(t) and UNK in', 'if False and any(RM_TEXT.search(t) and UNK in'), ('o texto recebido pela variável é guardado', 'ST["raw"].setdefault(m.group(1), set()).add(w[m.end():])', 'pass'),
        ('param: valor longo', 'or len(v) > 256 or w.count("*") > 2: return [UNK]', 'or w.count("*") > 2: return [UNK]'), ('param: muitos *', 'or len(v) > 256 or w.count("*") > 2: return [UNK]', 'or len(v) > 256: return [UNK]'),
-       ('cadeia &&: o fim dela junta onde o cd falhou', 'here, lost = uni(here, lost), []', 'here, lost = here, []'),
-       ('cadeia &&: `|` não fecha a cadeia', 't not in ("&&", "|", "|&", "(")', 't not in ("&&", "(")'), ('cadeia &&: `(` não fecha a cadeia', 't not in ("&&", "|", "|&", "(")', 't not in ("&&", "|", "|&")'),
-       ('cadeia &&: o que o cd perdeu volta ao fechar o subshell', 'here, snap, lost = saved.pop()', 'here, snap, _ = saved.pop()'), ('cadeia &&: o subshell começa sem o que o cd de fora perdeu', 'saved.append((here, dict(env), lost)); lost = []', 'saved.append((here, dict(env), lost))'),
-       ('cadeia &&: o cd guarda de onde saiu', 'lost, here = (uni(lost, here), cap(new)) if t == "&&"', 'lost, here = (lost, cap(new)) if t == "&&"'),
+       ('união: o 2º varrido julga o rm contra todos os cd', 'if hit or union != ctx or uni(ctx, ST["cds"]) == ctx: break', 'if True: break'), ('união: todo cd entra', 'ST["cds"] = uni(ST["cds"], new)', 'pass'),
+       ('união: o 1º varrido julga o cwd original', 'ST["cds"], union = [], ctx', 'ST["cds"], union = [], []'), ('união: o cd relativo parte de tudo que já vi', 'cd_target(cur, uni(cwds, ST["cds"]), env)', 'cd_target(cur, cwds, env)'),
+       ('união: cd relativo em laço ou função não fecha', 'return new + [None] if (ST["lp"] or ST["fn"]) and args and any(', 'return new if False and args and any('), ('união: o cd em função também', '(ST["lp"] or ST["fn"]) and args and any(', '(ST["lp"]) and args and any('),
+       ('união: o cd em laço também', '(ST["lp"] or ST["fn"]) and args and any(', '(ST["fn"]) and args and any('), ('união: a sonda sobe vários níveis', 'dirs(args[0], ["/.cdp" * 8], env)', 'dirs(args[0], ["/.cdp"], env)'),
+       ('união: while conta como laço', '; ST["lp"] += 1\n        elif k == "then":', '\n        elif k == "then":'), ('união: for conta como laço', 'widen(env); ST["late"] = True; ST["lp"] += 1\n    b["fnew"]', 'widen(env); ST["late"] = True\n    b["fnew"]'),
+       ('união: done fecha o laço', 'ST["lp"] -= top[3]', 'pass'), ('união: o 2º passo recomeça sem laço aberto', 'ST.update(again=True, fn=0, lp=0)', 'ST.update(again=True, fn=0)'),
+       ('união: redirecionamento não é argumento do cd', 'and not (j and isinstance(ws[j - 1], Op) and REDIR.fullmatch(ws[j - 1]))]', ']'), ('união: atribuição não é argumento do cd', 'if not ASSIGN.match(w) and not isinstance(w, Op)', 'if not isinstance(w, Op)'),
        ('$PWD vale cada cwd', '[c or UNK for c in cwds] if name == "PWD" and cwds else', '[cwds[0] or UNK] if name == "PWD" and cwds else'), ('$PWD de cwd que não sei vale "não sei"', '[c or UNK for c in cwds] if name == "PWD" and cwds else', '[c for c in cwds if c] if name == "PWD" and cwds else'),
        ('$PWD na atribuição vale cada cwd', '+ w[m.end():], cwds, env)]', '+ w[m.end():], cwds[:1], env)]'), ('$PWD na palavra vale cada cwd', 'ts, ifs = expand(raw, cwds, env),', 'ts, ifs = expand(raw, cwds[:1], env),'), ('$PWD no for vale cada cwd', 'for x in pieces(w, cwds, env)], strong)', 'for x in pieces(w, cwds[:1], env)], strong)'),
        ('curinga em massa: o formato, não a lista de grafias', 'MASS = re.compile(r"(?:[*?.]|\\[[^\\]]*\\])+")', 'MASS = re.compile(r"\\.?\\*|\\.\\[!\\.\\]\\*|\\.\\?\\*|\\.\\.\\?\\*|\\?\\*")'), ('curinga em massa: letra ou número torna o padrão estreito', 'MASS = re.compile(r"(?:[*?.]|\\[', 'MASS = re.compile(r"(?:[*?.\\w]|\\['),
