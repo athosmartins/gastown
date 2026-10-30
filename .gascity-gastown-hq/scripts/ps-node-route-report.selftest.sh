@@ -7,6 +7,8 @@
 # CASOS: a amostra limpa (contagens por modo, veredito, base) · linha de outro evento e linha ilegível contadas à parte · nada a medir (3) · perda contada pelo contador, só pelo aviso do log do Pilot, e o MAIOR dos dois ·
 #   o arquivo que existe e não lê (jsonl, contador, log do Pilot virados pasta, ou o jq que sai 0 sem escrever o resumo) é DESCONHECIDO (4), nunca "0" · uso (2) · só leitura · e a ponta a ponta: o gancho real perde linhas num log quebrado e o relatório as vê.
 # CONTROLE NEGATIVO: cada mutante troca UMA linha do relatório numa cópia e a bateria inteira tem de reprovar; mutante que sobrevive reprova esta bateria.
+#   EQUIVALENTE, de propósito sem mutante (ga-dw1h9h3, lastro hq-mutants, id ef6be6b454): `warn_n=$(grep -cF -- "$WARN_TXT" "$PLOG" 2>/dev/null || true)` com `|| true` → `&& true`. O `|| true` só muda o status da
+#   substituição de comando, que ninguém lê (o relatório roda sem `set -e`), e a saída do grep -c é a mesma nos dois: nenhuma bateria distingue um do outro. O mesmo vale para a linha do contador (`$LOST`).
 # COMO RODAR: bash scripts/ps-node-route-report.selftest.sh   (macOS /bin/bash 3.2 e Linux; precisa de jq e python3)
 #   REPORT_UNDER_TEST=<cópia do relatório> roda a bateria contra a cópia, sem mutantes, e para no 1º FAIL (é como o controle negativo chama a si mesmo).
 set -u
@@ -99,6 +101,16 @@ fi
 mkdir "$T/jq-mudo"; printf '#!/bin/sh\nexit 0\n' > "$T/jq-mudo/jq"; chmod +x "$T/jq-mudo/jq"
 newcity; J ps-1 shadow 0 "$NODE_TXT" 2026-10-23T10:00:00Z > "$(LOG)"; OUT=$(PATH="$T/jq-mudo:$PATH" "$REPORT" --city "$C" 2>&1); RC=$?
 expect "jq que sai 0 sem resumo: 4, 'DESCONHECIDO' (não 0 linhas)" 4 "linhas gravadas (decisões): DESCONHECIDO" "AMOSTRA SUBCONTADA OU DUVIDOSA"
+# o jsonl existe, LÊ (o jq acaba com êxito) mas não é arquivo regular (aqui um link para /dev/null: -f falso, -r verdadeiro): só um arquivo regular vale como o jsonl do shadow; um dispositivo que lê "vazio" não pode virar "0 linhas" (3, nada a medir)
+newcity; ln -s /dev/null "$(LOG)"; run
+expect "jsonl que não é arquivo regular mas lê (link para /dev/null): 4, 'DESCONHECIDO' (não 0 linhas, não 3)" 4 "linhas gravadas (decisões): DESCONHECIDO" "AMOSTRA SUBCONTADA OU DUVIDOSA"
+# o arquivo é regular e lê, mas o grep que conta as linhas não devolve número (sai 2 sem escrever nada): contagem que não é número é "não li" (4), nunca 0 perdas lidas e nunca um número em branco (o contador e o log do Pilot passam pelo mesmo isnum)
+mkdir "$T/grep-mudo"; printf '#!/bin/sh\nexit 2\n' > "$T/grep-mudo/grep"; chmod +x "$T/grep-mudo/grep"
+newcity; J ps-1 shadow 0 "$NODE_TXT" 2026-10-23T10:00:00Z > "$(LOG)"; printf 't1\tps-5\tshadow\tx\n' > "$C/.gc/ps-node-route.lost"; OUT=$(PATH="$T/grep-mudo:$PATH" "$REPORT" --city "$C" 2>&1); RC=$?
+expect "contador cujo grep não devolve número: 4, 'DESCONHECIDO' (não perdas em branco)" 4 "contador (ps-node-route.lost): DESCONHECIDO" "AMOSTRA SUBCONTADA OU DUVIDOSA"
+expect_not "ps-node-route.lost): 0" "contador cujo grep falha: não é dito como 0"
+newcity; J ps-1 shadow 0 "$NODE_TXT" 2026-10-23T10:00:00Z > "$(LOG)"; printf '[x] WARN: qualquer\n' > "$C/.gc/logs/pilot-dispatcher.log"; OUT=$(PATH="$T/grep-mudo:$PATH" "$REPORT" --city "$C" 2>&1); RC=$?
+expect "log do Pilot cujo grep não devolve número: 4, 'DESCONHECIDO' (não avisos em branco)" 4 "avisos no log do Pilot: DESCONHECIDO" "AMOSTRA SUBCONTADA OU DUVIDOSA"
 
 # ---- uso
 newcity; OUT=$("$REPORT" --foo 2>&1); RC=$?; expect "argumento desconhecido: 2" 2 "argumento desconhecido"
@@ -154,6 +166,8 @@ mutant jsonl-ilegivel-vira-0    '    add_doubt "$LOG existe e não foi possível
 mutant log-pilot-ilegivel-vira-0 'if [ "$plog_state" = ilegivel ]; then add_doubt' 'if false; then add_doubt'
 mutant linha-ilegivel-nao-conta 'if [ "$ileg" -gt 0 ]; then add_doubt' 'if false; then add_doubt'
 mutant resumo-vazio-vale-lido   '"$LOG" 2>/dev/null) && [ -n "$SUM" ]; then' '"$LOG" 2>/dev/null) || [ -n "$SUM" ]; then'
+mutant jsonl-nao-regular-vale-lido 'if [ -f "$LOG" ] && [ -r "$LOG" ] && SUM=' 'if [ -f "$LOG" ] || [ -r "$LOG" ] && SUM='
+mutant contagem-que-nao-e-numero-vale-lida "case \"\${1:-}\" in ''|*[!0-9]*) return 1 ;;" "case \"\${1:-}\" in ''|*[!0-9]*) return 0 ;;"
 mutant subcontada-sai-0         '  printf '"'"'%s\n'"'"' "$doubt" | sed '"'"'s/^/  - /'"'"'
   exit 4' '  printf '"'"'%s\n'"'"' "$doubt" | sed '"'"'s/^/  - /'"'"'
   exit 0'

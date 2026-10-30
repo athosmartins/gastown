@@ -18,11 +18,15 @@
 #  4. The Pilot consumes the shared list: pilot-dispatcher.sh carries no second
 #     copy of it.
 #
-# Not pinned on purpose: the `[ -n "$_id" ] || return 1` guard at the top of
-# gc_delivery_branch_pick has no behaviour of its own. Without it an empty id
-# still reaches gc_delivery_branch_globs, whose own empty-id guard (section 1)
-# returns 1 before the pick reads stdin — same rc, same (empty) output, same
-# stdin left unread. Two guards in series: a test cannot tell which one fired.
+# What the `[ -n "$_id" ] || return 1` guard at the top of gc_delivery_branch_pick
+# pins, and what it cannot (ga-dw1h9h3, hq-mutants). The RC it returns is pinned
+# (section 2, "empty bead id → rc 1"): `return 0` there would read as "picked"
+# with no branch name. Its PRESENCE is not: without it an empty id still reaches
+# gc_delivery_branch_globs, whose own empty-id guard (section 1) returns 1 before
+# the pick reads stdin — same rc, same (empty) output, same stdin left unread. Two
+# guards in series: a test cannot tell which one fired, so dropping the
+# `|| return 1` from that line (hq-mutants id 780bf08a58) is an EQUIVALENT mutant
+# and no case here fails on it, by design.
 #
 # Exit 0 iff every assertion holds.
 set -uo pipefail
@@ -94,6 +98,11 @@ assert_pick "ls-remote TAIL-match hazard: foreign ref ending the same way is rej
 assert_pick "tags / unrelated roots are ignored" 1 "" ga-abc "refs/tags/feat/ga-abc" "refs/remotes/upstream/feat/ga-abc"
 _o="$(printf '' | gc_delivery_branch_pick ga-abc)"; _rc=$?
 [ "$_rc" -eq 1 ] && [ -z "$_o" ] && ok "empty input → rc 1" || bad "empty input: rc=$_rc out='$_o'"
+# An empty bead id must never read as a pick: the ref line below WOULD match a non-empty id, and rc 0 with no name is "picked" to a caller that only tests the rc.
+_o="$(printf 'refs/heads/feat/ga-abc\n' | gc_delivery_branch_pick "")"; _rc=$?
+[ "$_rc" -eq 1 ] && [ -z "$_o" ] && ok "empty bead id → rc 1, no branch name" || bad "empty bead id: rc=$_rc out='$_o'"
+_o="$(printf 'refs/heads/feat/ga-abc\n' | gc_delivery_branch_pick)"; _rc=$?
+[ "$_rc" -eq 1 ] && [ -z "$_o" ] && ok "missing bead id argument → rc 1, no branch name" || bad "missing bead id: rc=$_rc out='$_o'"
 _o="$(printf 'refs/heads/feat/ga-abc\n' | GC_DELIVERY_BRANCH_PREFIXES="" gc_delivery_branch_pick ga-abc)"; _rc=$?
 [ "$_rc" -eq 1 ] && [ -z "$_o" ] && ok "unusable glob list → rc 1 (no guessing)" || bad "empty prefixes in pick: rc=$_rc out='$_o'"
 # The unusable glob list is refused BEFORE stdin is read: the producer (git
