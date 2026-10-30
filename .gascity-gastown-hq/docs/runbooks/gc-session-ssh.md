@@ -29,7 +29,8 @@ Bead ga-2hd02v.1.1 (fatia 2 do ga-2hd02v, desenho do estudo ga-ukxa3k, aprovada 
 | `socket` | não (`gc-remote`) | nome do socket do tmux no host (`tmux -L`): só as sessões deste provider existem nele |
 | `mini_home` | não (`~`) | home do mini, para reescrever `~/…` em `remote_home` |
 | `connect_timeout`, `timeout`, `start_timeout` | não (10, 25, 60 s) | prazos; o `start` leva `start_timeout` |
-| `list_cache_s` | não (`10`) | segundos que uma resposta BOA do `list-running` pode ser reaproveitada (ga-it7qiq.5, ver “Cache do `list-running`”). Inteiro de 0 a 120; **0 desliga** (é o freio de mão: edite a config, vale na próxima chamada, sem janela do engine); texto, `true`/`false`, negativo, acima de 120 ou `null` recusa a config |
+| `list_cache_s` | não (`10`) | segundos que uma resposta BOA do `list-running` pode ser reaproveitada (ga-it7qiq.5, ver “Cache do `list-running`”). Inteiro de 0 a 120; **0 desliga** (é o freio de mão: edite a config, vale na próxima chamada, sem janela do engine); texto, `true`/`false`, negativo, acima de 120 ou `null` recusa a config. **`0` desliga também o cache do host fora** (linha abaixo) |
+| `list_down_cache_s` | não (`30`) | segundos que o FATO “o host não respondeu” (ssh 255 ou tempo esgotado) vale: dentro do prazo o `list-running` devolve erro rápido, sem ssh (ga-sml4tqk, ver “Host fora” na seção do cache). Inteiro de 0 a 60; **0 desliga só este**; texto, `true`/`false`, negativo, acima de 60 ou `null` recusa a config |
 | `env_allow` | não | nomes de variável com cara de segredo que PODEM ir (ver abaixo) |
 | `ssh_opts` | não | opções extras do ssh (`["-p","2222"]`) |
 | `worktree_prepare` | não (`true`; `false` num host com `presence_gate`) | liga o **preparo do worktree no `start`** (identidade git + confiança da pasta, ver “Preparo do worktree”); texto no lugar de `true`/`false` é erro de configuração |
@@ -71,7 +72,7 @@ Cada operação é **um ssh** (ControlMaster em `~/.ssh/cm`, o mesmo do `mbp-run
 | `is-running`, `process-alive`, `get-last-activity` | `true`/`false`; `process-alive` procura os nomes na árvore do painel; atividade em RFC3339. **`false` só quando o tmux do host respondeu e a sessão não está na lista**; tmux que não consegue olhar (ex.: socket sem permissão) = erro (exit 1) com o motivo, como o `list-running` e o teto do `start` (que não contam “0 sessões” nesse caso) |
 | `nudge` | texto por `load-buffer`/`paste-buffer -p` + Enter (qualquer tamanho, aspas e quebras de linha) |
 | `send-keys`, `peek`, `clear-scrollback` | como no tmux local |
-| `list-running <prefixo>` | nomes das sessões do provider. **ssh fora = erro (exit 1), nunca lista vazia**: o engine trata erro como lista parcial e não decide nada com base num “vazio” falso. Uma resposta boa de até `list_cache_s` s (10) atrás é reaproveitada sem ssh (ver “Cache do `list-running`”); `start` e `stop` a invalidam |
+| `list-running <prefixo>` | nomes das sessões do provider. **ssh fora = erro (exit 1), nunca lista vazia**: o engine trata erro como lista parcial e não decide nada com base num “vazio” falso. Uma resposta boa de até `list_cache_s` s (10) atrás é reaproveitada sem ssh (ver “Cache do `list-running`”); `start` e `stop` a invalidam. Com o host fora, só a 1ª chamada paga o prazo do ssh: as seguintes, por `list_down_cache_s` s (30), devolvem o mesmo erro sem ssh |
 | `set-meta`, `get-meta`, `remove-meta` | ficam **no mini** (`<estado>/meta`); nada de meta vai para o servidor |
 | `attach` | `ssh -t … tmux attach` |
 | `check-image`, `copy-to`, `watch-startup`, `run-live` e qualquer operação desconhecida | **exit 2 (“não suportado”)**, sem abrir ssh, sem ler a entrada, sem tocar em sessão |
@@ -200,7 +201,7 @@ A recusa vem **antes** de registrar a sessão, de travar e de abrir o ssh (nada 
 
 | situação | resultado |
 |---|---|
-| ssh fora, tempo esgotado, resposta cortada, tmux ilegível (com o ssh **tentado**) | **erro (exit 1), como antes.** Nada é guardado, e o cache nunca é o plano B do erro — nem o vencido, nem o de 1 s atrás. (Dentro do prazo o ssh nem é tentado: a lista boa de poucos segundos atrás sai, e essa é a defasagem aceita, abaixo) |
+| ssh fora, tempo esgotado, resposta cortada, tmux ilegível (com o ssh **tentado**) | **erro (exit 1), como antes.** Nenhuma LISTA é guardada, e o cache de listas nunca é o plano B do erro — nem o vencido, nem o de 1 s atrás. (Dentro do prazo o ssh nem é tentado: a lista boa de poucos segundos atrás sai, e essa é a defasagem aceita, abaixo.) Só “não respondeu” deixa também o FATO “host fora”, seção seguinte |
 | cache vencido, de relógio que voltou (carimbo no futuro), vazio, ilegível ou com forma errada | pergunta ao host; o arquivo é reescrito |
 | `lr/gen` (a geração) que não dá para ler | esta chamada **não lê nem grava** cache: pergunta ao host |
 | `--dry-run` | não lê nem grava cache; imprime o que rodaria |
@@ -210,6 +211,20 @@ A recusa vem **antes** de registrar a sessão, de travar e de abrir o ssh (nada 
 **O acerto do registro de sessões nossas** (`<estado>/<host>/running/`, ver “O MBP como host”) só acontece quando o host foi perguntado: lista vinda do cache não mexe no registro.
 
 **Custo aceito (staleness).** Até `list_cache_s` s, uma sessão que caiu por conta própria continua na lista, e uma aberta por fora do provider não aparece. Isso só pode atrasar uma decisão de vaga (sobre-contagem), e o teto do host e a existência da sessão continuam conferidos **no host, na hora**, dentro do script do `start` — o cache nunca decide o teto. Quem precisa de exatidão absoluta (o `start` já a tem) usa `list_cache_s: 0`.
+
+**Host fora (ga-sml4tqk, 29/10).** Medido com o nó Hetzner saturado: `gc rig list` em texto levava 0,5 s, mas `gc rig list --json` passava de 120 s, com 6 cópias penduradas, cada uma esperando `gc-session-ssh list-running` → `ssh`. Causa: erro nunca era guardado, então cada uma das 16-20 chamadas em série pagava o `ConnectTimeout` (10 s) ou o `timeout` (25 s): 160-500 s. O `inflight-reclaim-guard` (20 s por consulta) ficou cego por 14+ ciclos. Conserto: o **fato** “o host não respondeu” é guardado por `list_down_cache_s` s (30 por padrão) em `<estado>/<host>/lr/down.json` = `{"gen", "ts", "msg"}`; dentro do prazo o `list-running` devolve o mesmo erro (exit 1, a mensagem diz que veio do guardado), **sem tentar o ssh**. Regras:
+
+| situação | resultado |
+|---|---|
+| ssh 255 ou tempo esgotado (só estes: `Unreachable`) | erro como antes e o fato é guardado, com o carimbo de quando a falha foi **vista** (não de quando a pergunta começou: com o ssh levando 25 s para falhar, o carimbo do começo deixaria 5 s de uso) |
+| resposta cortada, sem marcadores, tmux ilegível | erro de cada chamada, **nada** guardado |
+| fato dentro do prazo | erro rápido sem ssh — nunca lista, nem vazia; host `sleeps` (MBP) sem sessão nossa segue só saindo da lista |
+| fato vencido, de relógio que voltou, vazio, ilegível, sem `msg`/`ts` ou de outra geração | pergunta ao host (um arquivo torto nunca inventa um “fora”) |
+| o host respondeu | a lista passa a ser guardada e o fato some |
+| `start`, `stop` | trocam a geração e apagam o fato (a lista e o fato morrem juntos) |
+| `--dry-run`, `list_cache_s: 0`, `list_down_cache_s: 0` | não usam nem gravam o fato |
+
+Custo aceito: o host que volta continua “fora” por até `list_down_cache_s` s depois da última falha vista; o engine trata o erro como lista parcial, igual durante a queda. Com o ssh levando 1 s para falhar, 20 chamadas seguidas viram 1 ssh (antes 20), todas exit 1 (grupo `lrd` do selftest, 38 casos, 14 mutantes; contra o provider anterior 16 casos reprovam). O mesmo conserto vale para todo consumidor de `rig list`, incluindo o `gate-done`.
 
 **Sem trava de voo único (decisão).** Chamadas simultâneas com o cache frio perguntam todas ao host. Medido (acima): as chamadas de um `rig list` são em série, então o cache corta todas menos a primeira. Uma trava para deduplicar a onda fria transformaria “host fora do ar” em N prazos de `timeout` um atrás do outro (a cada espera, a seguinte também falha), que é pior que o problema.
 
