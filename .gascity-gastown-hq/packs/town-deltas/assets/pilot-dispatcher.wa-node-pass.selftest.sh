@@ -50,6 +50,7 @@ F_HOLD="$(need_fn _pilot_wa_node_pass_hold_for)"; F_WLANE="$(need_fn _pilot_wa_n
 F_WHYV="$(need_fn _pilot_wa_node_pass_why_verdict)"
 # ga-2hd02v.3.17: opcional DE PROPÓSITO (fn_src, não need_fn): num dispatcher sem o registro de motivos o arquivo tem de reprovar nos testes (6d), não abortar com FATAL
 F_PNOTE="$(fn_src _pilot_wa_node_pass_probe_note)"
+F_HPRIOR="$(need_fn _pilot_wa_node_pass_hold_prior)"; F_HPUT="$(need_fn _pilot_wa_node_pass_hold_put)"
 VETO_LINE="$(grep -E '^PILOT_NODE_FIRST_VETO_LABELS="' "$DISPATCHER" | head -1)"
 PWP_INIT="$(grep -E '^(_PWP_[A-Z_]+|_PILOT_WA_NODE_PASS|_PWN_APPLY_RC)=' "$DISPATCHER")"
 EXEMPT_LINE="$(grep -E '^PILOT_WA_NODE_EXEMPT="' "$DISPATCHER" | head -1)"
@@ -139,7 +140,9 @@ PRELUDE='
   [ -z "${T_MEMO_TTL+x}" ] || PILOT_WA_NODE_PASS_MINI_TTL="$T_MEMO_TTL"
   eval "$VETO_LINE"; eval "$PWP_INIT"
   PILOT_WA_NODE_PASS_MEMO="$WORK/city/.gc/wa-node-pass-memo.tsv"; PILOT_WA_NODE_PASS_LOG="$WORK/city/.gc/wa-node-exempt.jsonl"
-  eval "$F_VETO"; eval "$F_SPAWN"; eval "$F_MODE"; eval "$F_PRE"; eval "$F_MHIT"; eval "$F_MPUT"; eval "$F_CHECK"; eval "$F_STATE"; eval "$F_ADOPT"; eval "$F_UNADOPT"; eval "$F_CLASS"; eval "$F_HOLD"; eval "$F_WLANE"; eval "$F_WHYV"; eval "$F_PASS"; eval "$F_PNOTE"
+  PILOT_WA_NODE_PASS_HOLD_STATE="${T_HOLD_STATE-$WORK/city/.gc/wa-node-pass-hold.tsv}"
+  [ -z "${T_HOLD_MAX+x}" ] || PILOT_WA_NODE_PASS_HOLD_MAX_SWEEPS="$T_HOLD_MAX"
+  eval "$F_VETO"; eval "$F_SPAWN"; eval "$F_MODE"; eval "$F_PRE"; eval "$F_MHIT"; eval "$F_MPUT"; eval "$F_CHECK"; eval "$F_STATE"; eval "$F_ADOPT"; eval "$F_UNADOPT"; eval "$F_CLASS"; eval "$F_HOLD"; eval "$F_WLANE"; eval "$F_WHYV"; eval "$F_HPRIOR"; eval "$F_HPUT"; eval "$F_PASS"; eval "$F_PNOTE"
   _PY_WAIT_ID="${T_WAIT-}"; _PY_WAIT_PRIO=1   # o waiter da cessão (ga-5fn5p3), como a varredura do waiter o deixa antes da passada; vazio = nenhum P0/P1 espera
   # T_REFUSAL vale para toda bead; com T_REFUSAL_ID, SÓ para a bead desse id (as demais: ninguém recusa) — é como o waiter tem a recusa ilegível e a P2 não
   _pilot_priority_refusal_of() { local _ri=""; if [ -n "${T_REFUSAL_ID-}" ]; then _ri=$(printf "%s" "$1" | jq -r ".id // empty" 2>/dev/null) || _ri=""; [ "$_ri" = "$T_REFUSAL_ID" ] || return 0; fi; case "${T_REFUSAL-}" in FAIL) return 1 ;; *) printf "%s" "${T_REFUSAL-}"; return 0 ;; esac; }
@@ -662,6 +665,134 @@ r=$(SJ="$S3" run_t 'PILOT_WA_NODE_PASS_LOG="$WORK/city/.gc"; SMALL_CANDIDATES="$
 reset; chk wa-n1 0; echo 'lixo' > "$WORK/chk.wa-n1.raw"; echo 0 > "$WORK/d1.rc.wa-n1"
 pass "$S3" >/dev/null
 [ "$(d1)" = "-" ] && ok "rc 0 com saída ilegível continua error (nunca node) — o detalhe dos motivos não abre porta nenhuma" || bad "saída ilegível despachou: $(d1)"
+
+echo "── (6e) ga-2hd02v.3.18: o hold do waiter blind tem FIM — a 3ª passada seguida solta a P2+ com veredito node"
+# Medido 30/10 06:20 (pilot-dispatcher.log): "seguradas pelo waiter sem veredito=4 · ficaram com o nó=0" varredura após varredura, com o Hetzner a 14,4% de CPU há 773 min e 1 wa-worker-remote vivo de 6. O hold do 3.16 é certo por UMA
+# passada ("não consegui ler" não vira "o waiter não vai ao nó"), mas não tinha fim: um waiter cujo classificador responde unknown de forma PERSISTENTE congelava o nó inteiro para WA. Esta seção prova: (a) o contador por waiter
+# (arquivo de estado que sobrevive entre varreduras) e o fim do hold na 3ª passada blind seguida (PILOT_WA_NODE_PASS_HOLD_MAX_SWEEPS, padrão 2; 0 = o comportamento anterior); (b) o veredito legível (node/out) ZERA o contador, e
+# waiter outro recomeça do 0; (c) o contador só anda quando o waiter foi de fato olhado nesta passada (pista sem vaga, falta de leitura e ausência de waiter não andam nem zeram); (d) estado ilegível/que não grava NÃO solta a P2+
+# (segue segurando, e AVISA); (e) o waiter é sondado ANTES de qualquer P2+ (orçamento de sondas) para que o hold acabe por veredito quando possível.
+HOLD_STATE="$WORK/city/.gc/wa-node-pass-hold.tsv"
+hold_of() { [ -f "$HOLD_STATE" ] && awk -F'\t' '{print $2":"$3}' "$HOLD_STATE" | tr '\n' ',' || printf -- '-'; }
+# uma varredura: a memória de vereditos e o estado do hold SOBREVIVEM entre varreduras; só o que a anterior deixou em d1/lines/resumo é apagado
+sweep() { rm -f "$WORK/d1.calls" "$WORK/lines" "$PLOG" "$WORK/bd.calls"; pass "$@" >/dev/null; }
+# (a) o contador sobe a cada passada em que o waiter termina blind; com o padrão 2, as passadas 1 e 2 seguram e a 3ª solta
+reset; chk wa-w1 11; chk wa-p2a 0; setok wa-p2a
+T_WAIT=wa-w1 sweep "[$W1,$P2A]"
+[ "$(d1)" = "-" ] && [ "$(hold_of)" = "wa-w1:1," ] && ok "(a) passada 1, waiter blind: segura a P2 (nada vai ao nó) e o contador grava wa-w1:1" || bad "(a) passada 1: d1=$(d1) estado=$(hold_of)"
+T_WAIT=wa-w1 sweep "[$W1,$P2A]"
+[ "$(d1)" = "-" ] && [ "$(hold_of)" = "wa-w1:2," ] && ok "(a) passada 2, o mesmo waiter blind (memória unknown): segura de novo e o contador sobe para 2" || bad "(a) passada 2: d1=$(d1) estado=$(hold_of)"
+T_WAIT=wa-w1 sweep "[$W1,$P2A]"
+[ "$(d1)" = "wa-p2a small feature pass=1;" ] && [ "$(hold_of)" = "wa-w1:3," ] && ok "(a) passada 3, o mesmo waiter AINDA blind: o hold expira e a P2 com veredito node VAI ao nó (só ela: o waiter blind não é despachado)" || bad "(a) passada 3: d1=$(d1) estado=$(hold_of)"
+summ | jq -e '.hold_expired==1 and .held==0 and .p2_to_node==1 and .waiter_blind_passes==3 and .waiter_verdict=="blind"' >/dev/null 2>&1 && ok "(a) resumo da passada 3: hold_expired=1 held=0 p2_to_node=1 waiter_blind_passes=3 waiter_verdict=blind (o sinal de que o waiter segue cego NÃO some)" || bad "(a) resumo da passada 3: $(summ | cut -c1-400)"
+grep -q 'hold expirado (waiter blind há 3 passadas)' "$WORK/lines" 2>/dev/null && ok "(a) o log diz 'hold expirado (waiter blind há 3 passadas)'" || bad "(a) log sem 'hold expirado': $(grep 'ga-2hd02v' "$WORK/lines" 2>/dev/null | cut -c1-300)"
+grep -q 'holds expirados=1' "$WORK/lines" 2>/dev/null && ok "(a) a linha de resumo da passada traz 'holds expirados=1'" || bad "(a) linha de resumo sem holds expirados: $(grep 'passada de WA' "$WORK/lines" 2>/dev/null | cut -c1-500)"
+T_WAIT=wa-w1 sweep "[$W1,$P2A]"
+[ "$(d1)" = "wa-p2a small feature pass=1;" ] && [ "$(hold_of)" = "wa-w1:4," ] && ok "(a) passada 4: continua solto (o contador segue contando: wa-w1:4) — o hold não volta enquanto o waiter estiver blind" || bad "(a) passada 4: d1=$(d1) estado=$(hold_of)"
+# (b) o waiter que GANHA veredito zera o contador; depois disso o hold volta a valer por 2 passadas
+reset; chk wa-w1 11; chk wa-p2a 0; setok wa-p2a
+T_WAIT=wa-w1 sweep "[$W1,$P2A]"; T_WAIT=wa-w1 sweep "[$W1,$P2A]"
+[ "$(hold_of)" = "wa-w1:2," ] || bad "(b) preparo: estado=$(hold_of)"
+W1U2="$(jbp 1 wa-w1 U2 wa-worker story:approved)"; chk wa-w1 10
+T_WAIT=wa-w1 sweep "[$W1U2,$P2A]"
+[ "$(d1)" = "wa-p2a small feature pass=1;" ] && [ "$(hold_of)" = "wa-w1:0," ] && ok "(b) o waiter muda (updated_at novo), a sonda diz mini (veredito legível): a P2 vai ao nó e o contador ZERA (wa-w1:0)" || bad "(b) veredito legível: d1=$(d1) estado=$(hold_of)"
+W1U3="$(jbp 1 wa-w1 U3 wa-worker story:approved)"; chk wa-w1 11
+T_WAIT=wa-w1 sweep "[$W1U3,$P2A]"
+[ "$(d1)" = "-" ] && [ "$(hold_of)" = "wa-w1:1," ] && ok "(b) o waiter volta a ficar blind: o hold recomeça do 1 (segura) — o contador antigo não vazou" || bad "(b) recomeço: d1=$(d1) estado=$(hold_of)"
+reset; chk wa-w1 11; chk wa-p2a 0; setok wa-p2a
+T_WAIT=wa-w1 sweep "[$W1,$P2A]"; T_WAIT=wa-w1 sweep "[$W1,$P2A]"
+chk wa-w1 0; echo 0 > "$WORK/d1.rc.wa-w1"; W1U4="$(jbp 1 wa-w1 U4 wa-worker story:approved)"
+T_WAIT=wa-w1 sweep "[$W1U4,$P2A]"
+[ "$(hold_of)" = "wa-w1:0," ] && ok "(b) o waiter ganha veredito node: o contador zera também (node e out zeram)" || bad "(b) node não zerou: estado=$(hold_of)"
+# (b2) outro waiter recomeça do 0 (o contador é DO waiter, não da cidade)
+reset; chk wa-w1 11; chk wa-w2 11; chk wa-p2a 0; setok wa-p2a; W2="$(jbp 1 wa-w2 U1 wa-worker story:approved)"
+T_WAIT=wa-w1 sweep "[$W1,$P2A]"; T_WAIT=wa-w1 sweep "[$W1,$P2A]"
+T_WAIT=wa-w2 sweep "[$W2,$P2A]"
+[ "$(d1)" = "-" ] && [ "$(hold_of)" = "wa-w2:1," ] && ok "(b2) outro waiter (wa-w2) blind: recomeça do 1 e segura — a contagem de wa-w1 não vale para ele" || bad "(b2) outro waiter: d1=$(d1) estado=$(hold_of)"
+# o botão: valor de HOLD_MAX_SWEEPS
+reset; chk wa-w1 11; chk wa-p2a 0; setok wa-p2a
+for i in 1 2 3; do T_HOLD_MAX=3 T_WAIT=wa-w1 sweep "[$W1,$P2A]"; [ "$(d1)" = "-" ] || bad "(botão) MAX=3 soltou na passada $i: $(d1)"; done
+T_HOLD_MAX=3 T_WAIT=wa-w1 sweep "[$W1,$P2A]"
+[ "$(d1)" = "wa-p2a small feature pass=1;" ] && ok "(botão) HOLD_MAX_SWEEPS=3: três passadas seguram e a 4ª solta" || bad "(botão) MAX=3 na passada 4: d1=$(d1) estado=$(hold_of)"
+reset; chk wa-w1 11; chk wa-p2a 0; setok wa-p2a
+T_HOLD_MAX=1 T_WAIT=wa-w1 sweep "[$W1,$P2A]"; r1="$(d1)"; T_HOLD_MAX=1 T_WAIT=wa-w1 sweep "[$W1,$P2A]"
+[ "$r1" = "-" ] && [ "$(d1)" = "wa-p2a small feature pass=1;" ] && ok "(botão) HOLD_MAX_SWEEPS=1: a 1ª passada segura e a 2ª solta" || bad "(botão) MAX=1: 1ª=$r1 2ª=$(d1)"
+reset; chk wa-w1 11; chk wa-p2a 0; setok wa-p2a
+for i in 1 2 3 4 5; do T_HOLD_MAX=0 T_WAIT=wa-w1 sweep "[$W1,$P2A]"; done
+[ "$(d1)" = "-" ] && [ "$(hold_of)" = "-" ] && ok "(botão) HOLD_MAX_SWEEPS=0: o comportamento anterior — 5 passadas seguram, e o estado nem é gravado" || bad "(botão) MAX=0: d1=$(d1) estado=$(hold_of)"
+reset; chk wa-w1 11; chk wa-p2a 0; setok wa-p2a
+for i in 1 2; do T_HOLD_MAX=zzz T_WAIT=wa-w1 sweep "[$W1,$P2A]"; done; T_HOLD_MAX=zzz T_WAIT=wa-w1 sweep "[$W1,$P2A]"
+[ "$(d1)" = "wa-p2a small feature pass=1;" ] && ok "(botão) valor ilegível (zzz): vale o padrão 2 — a 3ª passada solta" || bad "(botão) MAX=zzz: d1=$(d1)"
+reset; chk wa-w1 11; chk wa-p2a 0; setok wa-p2a
+for i in 1 2 3 4; do PILOT_WA_NODE_PASS_HOLD=0 T_WAIT=wa-w1 sweep "[$W1,$P2A]"; done
+[ "$(hold_of)" = "-" ] && ok "(botão) PILOT_WA_NODE_PASS_HOLD=0 (sem retenção): o contador nem anda" || bad "(botão) HOLD=0 gravou estado: $(hold_of)"
+# (c) o contador só anda quando o waiter foi de fato olhado
+reset; chk wa-w1 11; chk wa-p2a 0; setok wa-p2a
+T_WAIT=wa-w1 sweep "[$W1,$P2A]"; T_WAIT=wa-w1 sweep "[$W1,$P2A]"
+sweep "[$P2A]"
+[ "$(hold_of)" = "wa-w1:2," ] && [ "$(d1)" = "wa-p2a small feature pass=1;" ] && ok "(c) varredura SEM waiter: nada é segurado, e o estado fica como estava (wa-w1:2) — um waiter que pisca não reinicia o contador" || bad "(c) sem waiter: d1=$(d1) estado=$(hold_of)"
+T_WAIT=wa-w1 sweep "[$W1,$P2A]"
+[ "$(d1)" = "wa-p2a small feature pass=1;" ] && [ "$(hold_of)" = "wa-w1:3," ] && ok "(c) o waiter volta blind: o contador continua de onde parou (wa-w1:3) e a P2 vai ao nó" || bad "(c) waiter volta: d1=$(d1) estado=$(hold_of)"
+reset; chk wa-w1 11; chk wa-p2a 0; setok wa-p2a
+T_WAIT=wa-w1 sweep "[$W1,$P2A]"; T_WAIT=wa-w1 sweep "[$W1,$P2A]"
+T_WAIT=wa-w1 T_SLOTS_BIG=0 sweep "[$P2A]" "[$W1]"
+[ "$(hold_of)" = "wa-w1:2," ] && ok "(c) waiter na pista big SEM vaga de despacho (não foi olhado): o contador não anda nem zera" || bad "(c) pista sem vaga mexeu no contador: estado=$(hold_of)"
+reset; chk wa-w1 11; chk wa-p2a 0; setok wa-p2a
+T_WAIT=wa-w1 sweep "[$W1,$P2A]"; T_WAIT=wa-w1 sweep "[$W1,$P2A]"
+T_WAIT=wa-w1 sweep "isto não é json" "[$P2A]"
+[ "$(hold_of)" = "wa-w1:2," ] && [ "$(d1)" = "wa-p2a big feature pass=1;" ] && ok "(c) pista small ilegível (não sei onde o waiter está): o contador não anda; o hold já expirado (2 passadas) vale" || bad "(c) pista ilegível: d1=$(d1) estado=$(hold_of)"
+reset; chk wa-w1 11; chk wa-p2a 0; setok wa-p2a
+T_EXEMPT=shadow T_WAIT=wa-w1 sweep "[$W1,$P2A]"; T_EXEMPT=shadow T_WAIT=wa-w1 sweep "[$W1,$P2A]"
+[ "$(hold_of)" = "-" ] && ok "(c) modo shadow (nunca segura nem despacha): o contador não anda" || bad "(c) shadow gravou estado: $(hold_of)"
+# o waiter com veredito node cujo apply devolve rc 11 termina blind: conta
+reset; chk wa-w1 0; chk wa-p2a 0; echo 1 > "$WORK/d1.rc.wa-w1"; echo 11 > "$WORK/d1.apply.wa-w1"; setok wa-p2a
+T_WAIT=wa-w1 T_SPAWN=pilot T_SLOTS=3 sweep "[$W1,$P2A]"
+[ "$(hold_of)" = "wa-w1:1," ] && ok "(c) waiter node + apply rc 11 (termina blind): o contador anda (wa-w1:1)" || bad "(c) apply rc 11: estado=$(hold_of)"
+# (c2) a P2+ solta pelo fim do hold e cujo dispatch FALHA não conta como 'foi ao nó por hold expirado'
+reset; chk wa-w1 11; chk wa-p2a 0; echo 1 > "$WORK/d1.rc.wa-p2a"
+for i in 1 2; do T_WAIT=wa-w1 sweep "[$W1,$P2A]"; done; T_WAIT=wa-w1 sweep "[$W1,$P2A]"
+summ | jq -e '.hold_expired==0 and .released==1' >/dev/null 2>&1 && ok "(c2) hold expirado mas o dispatch da P2 falhou (rc 1): hold_expired=0 released=1 — só conta a que ficou com o nó" || bad "(c2) resumo: $(summ | cut -c1-400)"
+# (d) estado ilegível ou que não grava NUNCA solta a P2+ — segue segurando, e AVISA
+reset; chk wa-w1 11; chk wa-p2a 0; setok wa-p2a; printf '1\twa-w1\tabc\n' > "$HOLD_STATE"
+T_WAIT=wa-w1 sweep "[$W1,$P2A]"
+[ "$(d1)" = "-" ] && [ "$(hold_of)" = "wa-w1:1," ] && ok "(d) estado com contagem ilegível ('abc'): conta como 0 — segura a P2, e a escrita da passada conserta o arquivo (wa-w1:1)" || bad "(d) contagem ilegível: d1=$(d1) estado=$(hold_of)"
+grep -q 'WARN.*leitura do estado do hold falhou' "$WORK/lines" 2>/dev/null && ok "(d) …e AVISA no log (o estado ilegível não passa calado)" || bad "(d) estado ilegível sem aviso: $(cut -c1-200 "$WORK/lines" 2>/dev/null | tr '\n' '|')"
+reset; chk wa-w1 11; chk wa-p2a 0; setok wa-p2a; echo x > "$WORK/city/.gc/notadir"
+for i in 1 2 3; do T_HOLD_STATE="$WORK/city/.gc/notadir/h.tsv" T_WAIT=wa-w1 sweep "[$W1,$P2A]"; done
+[ "$(d1)" = "-" ] && ok "(d) estado que não grava (pasta impossível): a P2 NUNCA é solta por isso — o contador não anda e o hold segura (o comportamento anterior)" || bad "(d) estado sem escrita soltou a P2: d1=$(d1)"
+grep -q 'WARN.*escrita do estado do hold falhou' "$WORK/lines" 2>/dev/null && ok "(d) …e AVISA que não gravou (sem isso o congelamento voltaria em silêncio)" || bad "(d) escrita falha sem aviso: $(cut -c1-200 "$WORK/lines" 2>/dev/null | tr '\n' '|')"
+rm -f "$WORK/city/.gc/notadir"
+# (e) o waiter é sondado ANTES de qualquer P2+ (a lista é [P2, waiter]; a ordem de trabalho da cidade põe P0/P1 antes na pista real, e o stub do teste não)
+reset; chk wa-w1 11; chk wa-p2a 0; setok wa-p2a
+T_PROBES=1 T_WAIT=wa-w1 pass "[$P2A,$W1]" >/dev/null
+[ "$(wnd_calls)" = 1 ] && grep -q 'wa-w1' "$WORK/wnd.calls" && ok "(e) 1 sonda no orçamento e a P2 vem antes na lista: a sonda vai para o WAITER (não para a P2)" || bad "(e) a sonda não foi ao waiter: $(cat "$WORK/wnd.calls" 2>/dev/null | tr '\n' '|')"
+summ | jq -e '.waiter_verdict=="blind" and .probed==1' >/dev/null 2>&1 && ok "(e) resumo: waiter_verdict=blind (ele foi olhado, não ficou unseen por falta de orçamento)" || bad "(e) resumo: $(summ | cut -c1-300)"
+reset; chk wa-w1 0; chk wa-p2a 0; setok wa-w1 wa-p2a
+T_PROBES=1 T_WAIT=wa-w1 pass "[$P2A,$W1]" >/dev/null
+[ "$(d1)" = "wa-w1 small feature pass=1;" ] && ok "(e) waiter com veredito node e a P2 antes na lista, 1 sonda: o waiter fica com a vaga do nó" || bad "(e) waiter perdeu a vaga para a P2: $(d1)"
+reset; chk wa-w1 0; chk wa-p2a 0; setok wa-w1 wa-p2a
+T_WAIT=ps-zz pass "[$P2A,$W1]" >/dev/null
+[ "$(d1)" = "wa-p2a small feature pass=1;" ] && ok "(e) waiter de outro rig: a ordem da lista não muda (só o waiter de WA passa à frente)" || bad "(e) ordem mudou sem waiter de WA: $(d1)"
+# os ajudantes sozinhos: hold_for com o hold expirado, e o estado
+holdx() { run_t "_PWP_HOLD_MAX=$1; _PWP_HOLD_PRIOR=$2; x=0; _pilot_wa_node_pass_hold_for '$3' '$4' || x=\$?; echo \"rc=\$x\""; }
+r=$(T_WAIT=wa-w1 holdx 2 1 "$P2A" blind);  [ "$r" = "rc=0" ] && ok "hold_for: prior 1 < max 2 → segura (rc 0)" || bad "hold_for prior<max: $r"
+r=$(T_WAIT=wa-w1 holdx 2 2 "$P2A" blind);  [ "$r" = "rc=3" ] && ok "hold_for: prior 2 >= max 2 → rc 3 (a retenção valeria e EXPIROU: segue, e quem chama conta)" || bad "hold_for prior=max: $r"
+r=$(T_WAIT=wa-w1 holdx 2 7 "$P2A" unseen); [ "$r" = "rc=3" ] && ok "hold_for: prior 7, waiter unseen → rc 3" || bad "hold_for prior>max unseen: $r"
+r=$(T_WAIT=wa-w1 holdx 0 9 "$P2A" blind);  [ "$r" = "rc=0" ] && ok "hold_for: max 0 → nunca expira (rc 0)" || bad "hold_for max=0: $r"
+r=$(T_WAIT=wa-w1 holdx 2 5 "$Q1" blind);   [ "$r" = "rc=1" ] && ok "hold_for: P1 com hold expirado → rc 1 (nunca foi segurado: nada a contar)" || bad "hold_for P1 expirado: $r"
+r=$(T_WAIT=wa-w1 holdx 2 5 "$P9B" blind);  [ "$r" = "rc=2" ] && ok "hold_for: classe ilegível com hold expirado → rc 2 (a classe ilegível segue contada, não vira 'expirado')" || bad "hold_for classe ilegível expirado: $r"
+r=$(T_WAIT=wa-w1 holdx 2 5 "$P2A" node);   [ "$r" = "rc=1" ] && ok "hold_for: waiter com veredito + hold expirado → rc 1" || bad "hold_for node expirado: $r"
+prior() { PID="$1" run_t 'x=0; o=$(_pilot_wa_node_pass_hold_prior "$PID") || x=$?; echo "rc=$x out=[$o]"'; }
+reset; r=$(prior wa-w1);                                                       [ "$r" = "rc=0 out=[0]" ] && ok "prior: sem arquivo → 0 (rc 0: ainda não houve passada blind)" || bad "prior sem arquivo: $r"
+( eval "$PRELUDE"; _pilot_wa_node_pass_hold_put wa-w1 4 ) >/dev/null 2>&1
+r=$(prior wa-w1);                                                              [ "$r" = "rc=0 out=[4]" ] && ok "prior: put 4 → prior 4" || bad "prior depois do put: $r"
+r=$(prior wa-w2);                                                              [ "$r" = "rc=0 out=[0]" ] && ok "prior: outro waiter → 0" || bad "prior de outro waiter: $r"
+r=$(prior "");                                                                 [ "$r" = "rc=0 out=[0]" ] && ok "prior: sem id → 0" || bad "prior sem id: $r"
+printf '1\twa-w1\n' > "$HOLD_STATE"; r=$(prior wa-w1);                         [ "$r" = "rc=1 out=[0]" ] && ok "prior: linha do waiter SEM contagem → 0 e rc 1 (ilegível, quem chama avisa)" || bad "prior sem contagem: $r"
+printf '1\twa-w1\t-3\n' > "$HOLD_STATE"; r=$(prior wa-w1);                     [ "$r" = "rc=1 out=[0]" ] && ok "prior: contagem negativa → 0 e rc 1" || bad "prior negativo: $r"
+( eval "$PRELUDE"; _pilot_wa_node_pass_hold_put 'wa-w x' 2 ) >/dev/null 2>&1
+r=$(prior 'wa-w x');                                                           [ "$r" = "rc=0 out=[2]" ] && [ "$(wc -l < "$HOLD_STATE" | tr -d ' ')" = 1 ] && ok "put/prior: id com espaço é normalizado igual nos dois lados e continua UMA linha de TSV" || bad "id estranho: $r linhas=$(wc -l < "$HOLD_STATE")"
+reset
 
 echo "── (7) dispatch_one: o bloco do yield e o braço do pool (regiões VERBATIM)"
 run_block() {

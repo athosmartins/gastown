@@ -409,6 +409,8 @@ PILOT_KIMI_ROUTE="kimi-lane"
 # a dispatch_one e, se o nó não ficar, devolve a rota e solta a claim. Só vale com PILOT_WA_NODE_ROUTE (on: label|auto · shadow: shadow|label|auto). Quem liga é uma pessoa; valor desconhecido = off. Os demais botões
 # (PILOT_WA_NODE_PASS_PROBES / _SECS / _CHECK_TIMEOUT / _MAX_FAILS / _MINI_TTL / _UNKNOWN_TTL / _RELEASED_TTL / _MEMO / _LOG / _HOLD) são lidos onde se usam, com padrão e valor ilegível = padrão.
 # ga-2hd02v.3.16: _HOLD (padrão ligada; só "0" desliga) é a retenção da P2+ pelo waiter da cessão sem veredito legível — ver o bloco acima de _pilot_wa_node_pass.
+# ga-2hd02v.3.18: _HOLD_MAX_SWEEPS (padrão 2; ilegível = padrão; 0 = a retenção sem fim, como era) é quantas passadas SEGUIDAS o mesmo waiter blind segura a P2+ — a seguinte solta; _HOLD_STATE é o arquivo do contador
+# (padrão $GC_CITY/.gc/wa-node-pass-hold.tsv, uma linha: epoch<TAB>waiter<TAB>passadas blind seguidas).
 PILOT_WA_NODE_EXEMPT="${PILOT_WA_NODE_EXEMPT:-off}"
 
 # ── ga-vln2py (P0, 17/10): DISK FLOOR — a HARD pause on NEW dispatch ──────────────────────────────
@@ -13509,6 +13511,8 @@ _PWP_TOKENS=""       # palavras "veredito:classe" da última sonda (a classe é 
 _PWP_ADOPTED=0       # 1 iff esta passada tirou o carimbo da bead que está em dispatch_one (o desfazer só devolve o que ela tirou)
 _PILOT_WA_NODE_PASS=0   # 1 SÓ enquanto a passada entrega uma bead a dispatch_one (modo on); dispatch_one lê
 _PWN_APPLY_RC=""     # o rc do `apply` da última _pilot_wa_node_decide (vazio = não chegou ao apply)
+_PWP_HOLD_MAX=0      # ga-2hd02v.3.18: quantas passadas SEGUIDAS o mesmo waiter blind segura a P2+ (0 = sem fim); a passada lê PILOT_WA_NODE_PASS_HOLD_MAX_SWEEPS no começo
+_PWP_HOLD_PRIOR=0    # ga-2hd02v.3.18: quantas passadas ANTERIORES seguidas este waiter terminou blind (o arquivo de estado, lido no começo da passada)
 _PWP_LAST_STOP=""   # por que a passada de WA no nó PAROU nesta varredura (capacity | keep-limit | ...; vazio = fim da lista ou não rodou). ga-w7qwl1.2.6: a carimbada que o nó levaria só vai ao MBP se a passada parou por falta de vaga do nó
 
 # _pilot_wa_node_pass_mode — deixa em _PWP_MODE off|shadow|on. vazio / valor que não existe / rota que não permite → off; DRY_RUN (a passada sonda e grava memória) → off.
@@ -13740,6 +13744,8 @@ _pilot_wa_node_pass_waiter_lane() {
 # (unknown/timeout/erro, sondado ou memorizado) e a bead é P2..P4. 1 em tudo o mais — inclusive classe de prioridade ilegível ou biblioteca de ordem não carregada (_pilot_priority_class_of devolve vazio): "não sei a classe"
 # nunca segura trabalho, a mesma regra do yield (_pilot_priority_yield_for) — mas NÃO em silêncio: rc 0 = segura · rc 1 = não segura · rc 2 = a retenção valeria (waiter sem veredito) e a classe não se lê, então NÃO segura e quem chama
 # CONTA (class_blind no resumo + aviso). Não escreve nada.
+# ga-2hd02v.3.18: rc 3 = a retenção valeria (waiter sem veredito, P2..P4) mas EXPIROU: o mesmo waiter já terminou blind _PWP_HOLD_PRIOR passadas seguidas, e o limite _PWP_HOLD_MAX (> 0) foi alcançado. NÃO segura —
+# quem chama deixa a P2+ seguir ao nó e CONTA (hold_expired no resumo). Classe ilegível continua rc 2 (a regra do yield vem antes do limite); _PWP_HOLD_MAX=0 nunca expira.
 _pilot_wa_node_pass_hold_for() {
   local _hf_b="${1:-}" _hf_wv="${2:-}" _hf_cls
   case "${PILOT_WA_NODE_PASS_HOLD:-1}" in 0) return 1 ;; esac
@@ -13747,7 +13753,7 @@ _pilot_wa_node_pass_hold_for() {
   case "$_hf_wv" in unseen|blind) ;; *) return 1 ;; esac
   _hf_cls=$(_pilot_priority_class_of "$_hf_b")
   case "$_hf_cls" in
-    2|3|4) return 0 ;;
+    2|3|4) if [ "${_PWP_HOLD_MAX:-0}" -gt 0 ] && [ "${_PWP_HOLD_PRIOR:-0}" -ge "${_PWP_HOLD_MAX:-0}" ]; then return 3; fi; return 0 ;;
     0|1)   return 1 ;;
     *)     return 2 ;;
   esac
@@ -13764,6 +13770,43 @@ _pilot_wa_node_pass_why_verdict() {
   esac
 }
 
+# _pilot_wa_node_pass_hold_prior <waiter> — imprime quantas passadas SEGUIDAS este waiter terminou blind (a linha única do arquivo de estado, ga-2hd02v.3.18); o id é normalizado para [A-Za-z0-9._-] igual nos dois lados.
+# vazio (sem id, sem arquivo, ou a linha é de OUTRO waiter) → imprime 0, rc 0: ainda não houve passada blind seguida; falhou/ilegível (arquivo que não abre, awk que falha, contagem que não é número) → imprime 0 e rc 1:
+# 0 é o estado INERTE (a retenção segue valendo, nunca solta a P2+ por não ter lido o contador) e o rc 1 faz quem chama AVISAR. Não escreve nada.
+_pilot_wa_node_pass_hold_prior() {
+  local _hp_id="${1:-}" _hp_f _hp_r
+  _hp_id="${_hp_id//[^A-Za-z0-9._-]/_}"
+  _hp_f="${PILOT_WA_NODE_PASS_HOLD_STATE:-${GC_CITY:-/nonexistent}/.gc/wa-node-pass-hold.tsv}"
+  { [ -n "$_hp_id" ] && [ -f "$_hp_f" ]; } || { printf '0'; return 0; }
+  [ -r "$_hp_f" ] || { printf '0'; return 1; }
+  # vazio (nenhuma linha deste waiter) → "": 0; falhou (awk) → 0 e rc 1
+  _hp_r=$(awk -F'\t' -v id="$_hp_id" '$2 == id { n = $3; hit = 1 } END { if (hit) print "row:" n }' "$_hp_f" 2>/dev/null) || { printf '0'; return 1; }
+  case "$_hp_r" in
+    '')            printf '0' ;;
+    row:|row:*[!0-9]*) printf '0'; return 1 ;;
+    row:*)         printf '%s' "${_hp_r#row:}" ;;
+    *)             printf '0'; return 1 ;;
+  esac
+  return 0
+}
+
+# _pilot_wa_node_pass_hold_put <waiter> <n> — grava a linha única do estado (epoch<TAB>waiter<TAB>n), por arquivo temporário + mv. Sempre devolve 0: o contador não pode derrubar a varredura.
+# vazio (sem id ou sem número) → não grava; falhou (pasta que não se cria, disco cheio, mv que falha) → AVISA e o contador não anda: o hold segue segurando (o estado inerte), nunca solta a P2+ por erro de escrita —
+# mas é por isso que o aviso existe: sem escrita o congelamento que o limite corrige voltaria calado.
+_pilot_wa_node_pass_hold_put() {
+  local _hw_id="${1:-}" _hw_n="${2:-}" _hw_f _hw_now
+  _hw_id="${_hw_id//[^A-Za-z0-9._-]/_}"
+  { [ -n "$_hw_id" ] && [ -n "$_hw_n" ]; } || return 0
+  case "$_hw_n" in *[!0-9]*) return 0 ;; esac
+  _hw_f="${PILOT_WA_NODE_PASS_HOLD_STATE:-${GC_CITY:-/nonexistent}/.gc/wa-node-pass-hold.tsv}"
+  # vazio/falhou (relógio mudo) → 0: o epoch só informa quem lê o arquivo, nenhuma decisão o usa
+  _hw_now=$(date +%s 2>/dev/null) || _hw_now=0
+  mkdir -p "$(dirname "$_hw_f")" 2>/dev/null || true
+  { printf '%s\t%s\t%s\n' "$_hw_now" "$_hw_id" "$_hw_n" > "$_hw_f.tmp" && mv "$_hw_f.tmp" "$_hw_f"; } 2>/dev/null \
+    || { warn "ga-2hd02v.3.18: escrita do estado do hold falhou ($_hw_f) — o contador de $_hw_id não anda e a retenção segue valendo (sem este arquivo o hold do waiter blind volta a não ter fim)"; rm -f "$_hw_f.tmp" 2>/dev/null || true; return 0; }
+  return 0
+}
+
 # _pilot_wa_node_pass — a passada. Uma vez por varredura, antes das pistas. Sempre devolve 0 (nada aqui derruba a varredura). Lê e, no modo on, reescreve SMALL_/BIG_CANDIDATES, _SLOTS e _COUNT e soma DISPATCHED.
 # Ordem de cada candidata: pré (sem escrita) → memória → orçamento (sondas e segundos) → `check` → (shadow: registra) / (on: dispatch_one). Para: despacho parado · vagas do nó esgotadas (_PWN_SLOTS) · falhas demais ·
 # apply rc 12 (nó cheio: capacidade é do nó, a bead NÃO é memorizada) · apply com outro rc (a escrita pode ter acontecido: para sem memorizar) · Dolt saturado (antes de escrever) · script ausente. Falha por bead (apply 10/11, ou nada chegou ao apply) é memorizada.
@@ -13772,6 +13815,9 @@ _pilot_wa_node_pass() {
   local _pw_total=0 _pw_elig=0 _pw_memo=0 _pw_probed=0 _pw_node=0 _pw_mini=0 _pw_unk=0 _pw_tmo=0 _pw_err=0 _pw_kept=0 _pw_rel=0 _pw_fails=0 _pw_stop="" _pw_skipped=""
   # ga-2hd02v.3.16: o waiter da cessão. _pw_lanes = a ordem das pistas; _pw_wl = a pista dele; _pw_wv = o veredito dele: "" (não há waiter de WA nas pistas) | unseen (ainda não olhado) | node | out (SABE-SE que não irá ao nó) | blind (NÃO se sabe: sem veredito legível, ou o que impediu o veredito não se leu)
   local _pw_lanes="small big" _pw_wl="" _pw_wv="" _pw_isw=0 _pw_held=0 _pw_p2n=0 _pw_hrc=0 _pw_clsblind=0
+  # ga-2hd02v.3.18: _pw_trk = 1 iff o contador do hold é lido e gravado nesta passada · _pw_wreached = 1 iff o waiter foi de fato olhado (saiu da lista) · _pw_hx = 1 iff a bead em mãos é uma P2+ solta pelo fim do hold ·
+  # _pw_expired = quantas P2+ foram ao nó por isso · _pw_wcount = quantas passadas seguidas o waiter está blind (com esta, se ele terminou blind)
+  local _pw_trk=0 _pw_wreached=0 _pw_hx=0 _pw_expired=0 _pw_wcount=0
   _PWP_LAST_STOP=""
   _pilot_wa_node_pass_mode
   if [ "$_PWP_MODE" = off ]; then
@@ -13802,6 +13848,16 @@ _pilot_wa_node_pass() {
       _pw_wl=""; _pw_wv=unseen
     fi
   fi
+  # ga-2hd02v.3.18: o hold do waiter blind tem FIM. _PWP_HOLD_MAX = PILOT_WA_NODE_PASS_HOLD_MAX_SWEEPS (padrão 2; valor ilegível = padrão; 0 = sem fim, como era); _PWP_HOLD_PRIOR = quantas passadas SEGUIDAS este mesmo waiter
+  # já terminou blind (arquivo de estado, que sobrevive entre varreduras). Só se rastreia (lê e grava) com waiter, modo on, retenção ligada e limite > 0: fora disso a passada não toca no arquivo.
+  _PWP_HOLD_MAX="${PILOT_WA_NODE_PASS_HOLD_MAX_SWEEPS:-2}"; case "$_PWP_HOLD_MAX" in ''|*[!0-9]*) _PWP_HOLD_MAX=2 ;; esac
+  _PWP_HOLD_PRIOR=0
+  if [ -n "${_PY_WAIT_ID:-}" ] && [ "$_PWP_MODE" = on ] && [ "$_PWP_HOLD_MAX" -gt 0 ] && [ "${PILOT_WA_NODE_PASS_HOLD:-1}" != 0 ]; then
+    _pw_trk=1
+    # vazio (sem arquivo / outro waiter) → 0; falhou/ilegível (arquivo que não abre, contagem que não é número) → 0 também, que é o estado INERTE: a retenção segue valendo, nunca solta a P2+ por não ter lido o contador — e AVISA
+    _PWP_HOLD_PRIOR=$(_pilot_wa_node_pass_hold_prior "$_PY_WAIT_ID") || warn "ga-2hd02v.3.18: leitura do estado do hold falhou (waiter ${_PY_WAIT_ID}) — conto 0 passadas blind: a retenção segue valendo, e a escrita desta passada conserta o arquivo"
+  fi
+  _pw_wcount="$_PWP_HOLD_PRIOR"
   for _pw_lane in $_pw_lanes; do
     [ -z "$_pw_stop" ] || break
     case "$_pw_lane" in
@@ -13824,7 +13880,13 @@ _pilot_wa_node_pass() {
         [ "$_pw_slots" -gt 0 ] || { { [ "$_pw_wv" != unseen ] || [ "$_pw_lane" != "$_pw_wl" ]; } || _pw_wv=out; break; }
       fi
       # vazio (pista sem pick) → fim da pista; falhou/ilegível ("null", id que não lê) → fim da pista também: nada é tentado sem id
-      _pw_pick=$(_top_candidate "$_pw_wa")
+      # ga-2hd02v.3.18: o waiter da cessão (de WA, nesta pista) é sondado ANTES de qualquer P2+ — o hold acaba por veredito quando possível, e o orçamento de sondas nunca se esgota nas P2+ antes de ele ser olhado.
+      # vazio (o waiter não está nesta lista, ou já foi olhado) → a ordem de sempre (_top_candidate); falhou/ilegível (o jq não lê a lista) → também a ordem de sempre: o waiter só perde a precedência, nada é solto
+      _pw_pick=""
+      if [ "$_pw_wreached" = 0 ] && [ -n "$_pw_wl" ] && [ "$_pw_lane" = "$_pw_wl" ]; then
+        _pw_pick=$(printf '%s' "$_pw_wa" | jq -c --arg id "$_PY_WAIT_ID" 'first(.[] | select(.id == $id))' 2>/dev/null) || _pw_pick=""
+      fi
+      [ -n "$_pw_pick" ] || _pw_pick=$(_top_candidate "$_pw_wa")
       { [ -n "$_pw_pick" ] && [ "$_pw_pick" != null ]; } || break
       _pw_id=$(printf '%s' "$_pw_pick" | jq -r '.id // ""' 2>/dev/null) || _pw_id=""
       [ -n "$_pw_id" ] || break
@@ -13832,7 +13894,7 @@ _pilot_wa_node_pass() {
       _pw_n=$(printf '%s' "$_pw_wa" | jq 'length' 2>/dev/null) || _pw_n=0
       case "$_pw_n" in ''|*[!0-9]*) _pw_n=0 ;; esac
       # ga-2hd02v.3.16: esta candidata é o waiter da cessão? (vazio → não; o id do waiter nunca é a string vazia)
-      _pw_isw=0; if [ -n "${_PY_WAIT_ID:-}" ] && [ "$_pw_id" = "$_PY_WAIT_ID" ]; then _pw_isw=1; fi
+      _pw_isw=0; if [ -n "${_PY_WAIT_ID:-}" ] && [ "$_pw_id" = "$_PY_WAIT_ID" ]; then _pw_isw=1; _pw_wreached=1; fi
       # o waiter que a passada não sonda: com motivo DEFINITIVO (veto, dono, rota alheia, node:mini, recusa do pool lida) ele não irá ao nó e não segura ninguém (out); com motivo ILEGÍVEL (a bead ou a recusa do pool que não se leu: unreadable,
       # refusal-unknown) NÃO SE SABE se irá (blind) e é a retenção (_pilot_wa_node_pass_hold_for) que segura a P2+ com veredito node — a tabela é _pilot_wa_node_pass_why_verdict, cujo padrão é blind
       if ! _pilot_wa_node_pass_pre "$_pw_pick"; then _pw_skipped="$_pw_skipped ${_PWP_WHY%%:*}"; if [ "$_pw_isw" = 1 ]; then _pw_wv=$(_pilot_wa_node_pass_why_verdict "${_PWP_WHY:-}"); fi; continue; fi
@@ -13872,10 +13934,12 @@ _pilot_wa_node_pass() {
       esac
       # ga-2hd02v.3.16: veredito node, mas o waiter da cessão ainda não tem veredito legível: a P2+ NÃO toma a vaga do nó num palpite sobre o P1. Não escreve nada e não memoriza (o node não se memoriza: é sondada de novo).
       # rc 0 segura · 2 = a retenção valeria mas a classe da bead não se lê: não segura (a regra do yield) e CONTA, para o aviso e o resumo dizerem
-      _pw_hrc=0; _pilot_wa_node_pass_hold_for "$_pw_pick" "$_pw_wv" || _pw_hrc=$?
+      # ga-2hd02v.3.18: rc 3 = o hold EXPIROU (o mesmo waiter já terminou blind _PWP_HOLD_PRIOR passadas seguidas): a P2+ segue ao nó; só conta em hold_expired se o dispatch der certo (abaixo)
+      _pw_hrc=0; _pw_hx=0; _pilot_wa_node_pass_hold_for "$_pw_pick" "$_pw_wv" || _pw_hrc=$?
       case "$_pw_hrc" in
         0) _pw_held=$((_pw_held + 1)); continue ;;
         2) _pw_clsblind=$((_pw_clsblind + 1)) ;;
+        3) _pw_hx=1 ;;
       esac
       # ── modo on: a candidata que o classificador manda ao nó vai a dispatch_one com a bandeira ──
       # O Dolt saturado (no início da varredura, ou agora) para as ESCRITAS, como nas pistas (dispatch_lane): claim + adoção + apply + soltura são ~10 escritas por tentativa. Sem sinal nenhum (_dolt_saturated devolve 0 com
@@ -13888,6 +13952,7 @@ _pilot_wa_node_pass() {
       _PILOT_WA_NODE_PASS=0
       if [ "$_pw_rc" = 0 ]; then
         _pw_kept=$((_pw_kept + 1)); _pw_slots=$((_pw_slots - 1)); DISPATCHED=$((DISPATCHED + 1))
+        if [ "$_pw_hx" = 1 ]; then _pw_expired=$((_pw_expired + 1)); fi
         # ga-2hd02v.3.16: P2..P4 que ficou com o nó enquanto um P0/P1 esperava vaga (a cessão que o mini aplica): é o número que mostra que a vaga do nó não está sendo cedida junto. Sem waiter, ou classe ilegível/vazia: não conta.
         if [ -n "${_PY_WAIT_ID:-}" ]; then
           case "$(_pilot_priority_class_of "$_pw_pick")" in 2|3|4) _pw_p2n=$((_pw_p2n + 1)) ;; esac
@@ -13916,6 +13981,14 @@ _pilot_wa_node_pass() {
       esac
     fi
   done
+  # ga-2hd02v.3.18: o contador do hold. Só anda quando o waiter foi de fato OLHADO nesta passada (_pw_wreached): terminou blind → +1; terminou com veredito legível (node/out) → zera; unseen (o orçamento, uma parada, a pista ilegível ou
+  # a falta de vaga de despacho da pista dele impediram de olhá-lo) → NÃO mexe — nem sobe nem zera: nada se aprendeu. Waiter ausente numa varredura também não mexe (um waiter que pisca não reinicia a contagem).
+  if [ "$_pw_trk" = 1 ] && [ "$_pw_wreached" = 1 ]; then
+    case "$_pw_wv" in
+      blind)    _pw_wcount=$((_PWP_HOLD_PRIOR + 1)); _pilot_wa_node_pass_hold_put "$_PY_WAIT_ID" "$_pw_wcount" ;;
+      node|out) _pw_wcount=0; _pilot_wa_node_pass_hold_put "$_PY_WAIT_ID" 0 ;;
+    esac
+  fi
   _PILOT_WA_NODE_PASS=0
   # vazio (nada pulado) → {} e "nenhuma"; falhou (jq) → {} também: é só o rótulo do log e do resumo, nenhuma decisão lê isto
   _pw_skj=$(printf '%s' "$_pw_skipped" | jq -cR 'split(" ") | map(select(length > 0)) | group_by(.) | map({key: .[0], value: length}) | from_entries' 2>/dev/null) || _pw_skj="{}"
@@ -13926,9 +13999,12 @@ _pilot_wa_node_pass() {
   [ -n "$_pw_rsj" ] || _pw_rsj="null"
   _pw_rs=$(printf '%s' "$_pw_rsj" | jq -r 'if . == null then "ilegivel" else (to_entries | map("\(.key)=\(.value)") | join(",")) end' 2>/dev/null) || _pw_rs="ilegivel"
   _PWP_LAST_STOP="${_pw_stop:-}"
-  log "ga-2hd02v.9: passada de WA no nó (modo=$_PWP_MODE): candidatas WA=$_pw_total · elegíveis=$_pw_elig (puladas: ${_pw_sk:-nenhuma}) · memória=$_pw_memo · sondadas=$_pw_probed (node $_pw_node · mini $_pw_mini · unknown $_pw_unk · timeout $_pw_tmo · erro $_pw_err) · ficaram com o nó=$_pw_kept · P2+ ao nó com P0/P1 esperando=$_pw_p2n · seguradas pelo waiter sem veredito=$_pw_held (classe ilegível, não segurada: $_pw_clsblind) · soltas=$_pw_rel · motivos: ${_pw_rs:-nenhum} · parou: ${_pw_stop:-fim da lista}"
+  log "ga-2hd02v.9: passada de WA no nó (modo=$_PWP_MODE): candidatas WA=$_pw_total · elegíveis=$_pw_elig (puladas: ${_pw_sk:-nenhuma}) · memória=$_pw_memo · sondadas=$_pw_probed (node $_pw_node · mini $_pw_mini · unknown $_pw_unk · timeout $_pw_tmo · erro $_pw_err) · ficaram com o nó=$_pw_kept · P2+ ao nó com P0/P1 esperando=$_pw_p2n · seguradas pelo waiter sem veredito=$_pw_held (classe ilegível, não segurada: $_pw_clsblind) · holds expirados=$_pw_expired · soltas=$_pw_rel · motivos: ${_pw_rs:-nenhum} · parou: ${_pw_stop:-fim da lista}"
   if [ "$_pw_held" -gt 0 ]; then
-    log "ga-2hd02v.3.16: $_pw_held P2+ com veredito node NÃO foram ao nó: o waiter da cessão P${_PY_WAIT_PRIO:-?} ${_PY_WAIT_ID:-?} está sem veredito legível (${_pw_wv:-?}) — a vaga do nó fica para ele, nunca para uma P2+ num palpite sobre o waiter (PILOT_WA_NODE_PASS_HOLD=0 desliga)."
+    log "ga-2hd02v.3.16: $_pw_held P2+ com veredito node NÃO foram ao nó: o waiter da cessão P${_PY_WAIT_PRIO:-?} ${_PY_WAIT_ID:-?} está sem veredito legível (${_pw_wv:-?}) — a vaga do nó fica para ele, nunca para uma P2+ num palpite sobre o waiter (PILOT_WA_NODE_PASS_HOLD=0 desliga; passadas blind seguidas contadas: ${_pw_wcount}, limite ${_PWP_HOLD_MAX} — ao alcançá-lo a P2+ segue ao nó; PILOT_WA_NODE_PASS_HOLD_MAX_SWEEPS=0 = sem limite, e aí nada é contado)."
+  fi
+  if [ "$_pw_expired" -gt 0 ]; then
+    log "ga-2hd02v.3.18: hold expirado (waiter blind há ${_pw_wcount} passadas): $_pw_expired P2+ com veredito node foram ao nó com o waiter da cessão P${_PY_WAIT_PRIO:-?} ${_PY_WAIT_ID:-?} ainda sem veredito legível — a retenção vale por ${_PWP_HOLD_MAX} passadas seguidas (PILOT_WA_NODE_PASS_HOLD_MAX_SWEEPS; 0 = segura sem fim) e o waiter segue sondado primeiro a cada passada."
   fi
   if [ "$_pw_clsblind" -gt 0 ]; then
     warn "ga-2hd02v.3.16: $_pw_clsblind bead(s) com veredito node e classe de prioridade ILEGÍVEL não foram seguradas enquanto o waiter da cessão ${_PY_WAIT_ID:-?} estava sem veredito (${_pw_wv:-?}) — a regra do yield (classe ilegível nunca segura) as deixa passar; contadas em class_blind no resumo."
@@ -13936,8 +14012,8 @@ _pilot_wa_node_pass() {
   { jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg m "$_PWP_MODE" --arg r "${PILOT_WA_NODE_ROUTE:-}" --arg stop "${_pw_stop:-none}" --argjson sk "$_pw_skj" --argjson rs "$_pw_rsj" \
       --argjson tot "$_pw_total" --argjson el "$_pw_elig" --argjson me "$_pw_memo" --argjson pr "$_pw_probed" --argjson nd "$_pw_node" --argjson mi "$_pw_mini" --argjson un "$_pw_unk" \
       --argjson tm "$_pw_tmo" --argjson er "$_pw_err" --argjson kp "$_pw_kept" --argjson rl "$_pw_rel" \
-      --argjson p2n "$_pw_p2n" --argjson hd "$_pw_held" --argjson cb "$_pw_clsblind" --arg wid "${_PY_WAIT_ID:-}" --arg wv "$_pw_wv" \
-      '{ts:$ts,event:"wa-node-pass-summary",mode:$m,route:$r,wa_candidates:$tot,eligible:$el,skipped:$sk,memo_hits:$me,probed:$pr,node:$nd,mini:$mi,unknown:$un,timeout:$tm,error:$er,kept:$kp,released:$rl,p2_to_node:$p2n,held:$hd,class_blind:$cb,waiter:$wid,waiter_verdict:$wv,stopped:$stop,reasons:$rs}' >> "$_pw_log"; } 2>/dev/null \
+      --argjson p2n "$_pw_p2n" --argjson hd "$_pw_held" --argjson cb "$_pw_clsblind" --argjson hx "$_pw_expired" --argjson wbp "$_pw_wcount" --arg wid "${_PY_WAIT_ID:-}" --arg wv "$_pw_wv" \
+      '{ts:$ts,event:"wa-node-pass-summary",mode:$m,route:$r,wa_candidates:$tot,eligible:$el,skipped:$sk,memo_hits:$me,probed:$pr,node:$nd,mini:$mi,unknown:$un,timeout:$tm,error:$er,kept:$kp,released:$rl,p2_to_node:$p2n,held:$hd,class_blind:$cb,hold_expired:$hx,waiter_blind_passes:$wbp,waiter:$wid,waiter_verdict:$wv,stopped:$stop,reasons:$rs}' >> "$_pw_log"; } 2>/dev/null \
     || warn "ga-2hd02v.9: não consegui gravar o resumo da passada de WA em $_pw_log"
   return 0
 }

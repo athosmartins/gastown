@@ -82,13 +82,13 @@ waiter recusado pelo pre-filtro segura	_pw_skipped="$_pw_skipped ${_PWP_WHY%%:*}
 waiter que nao e de WA conta como waiter da pista	  case "$_wl_id" in wa-*) ;; *) printf 'none'; return 0 ;; esac\n	
 pista do waiter sem vaga de despacho segura a outra pista	{ { [ "$_pw_wv" != unseen ] || [ "$_pw_lane" != "$_pw_wl" ]; } || _pw_wv=out; break; }	{ break; }
 contador de P2+ ao no nao conta	case "$(_pilot_priority_class_of "$_pw_pick")" in 2|3|4) _pw_p2n=$((_pw_p2n + 1)) ;; esac	:
-a passada nunca chama a retencao	_pw_hrc=0; _pilot_wa_node_pass_hold_for "$_pw_pick" "$_pw_wv" || _pw_hrc=$?	_pw_hrc=1
+a passada nunca chama a retencao	_pw_hrc=0; _pw_hx=0; _pilot_wa_node_pass_hold_for "$_pw_pick" "$_pw_wv" || _pw_hrc=$?	_pw_hrc=1; _pw_hx=0
 pista ilegivel com waiter vira sem waiter	      _pw_wl=""; _pw_wv=unseen\n	      _pw_wl=""\n
 o resumo nao grava p2_to_node	released:$rl,p2_to_node:$p2n,held:$hd,	released:$rl,held:$hd,
 classe ilegivel nao e sinalizada pela retencao	    *)     return 2 ;;\n	    *)     return 1 ;;\n
 o contador de classe ilegivel nao conta	        2) _pw_clsblind=$((_pw_clsblind + 1)) ;;	        2) : ;;
 valor novo do memo_hit libera a P2	mini) _pw_wv=out ;; *) _pw_wv=blind ;; esac	mini) _pw_wv=out ;; unknown) _pw_wv=blind ;; *) _pw_wv=out ;; esac
-o resumo nao grava class_blind	held:$hd,class_blind:$cb,waiter:$wid	held:$hd,waiter:$wid
+o resumo nao grava class_blind	held:$hd,class_blind:$cb,hold_expired:$hx	held:$hd,hold_expired:$hx
 pre-filtro ilegivel do waiter vira out (padrao da tabela)	*) printf 'blind' ;;	*) printf 'out' ;;
 o pre-filtro do waiter nao usa a tabela (sempre out)	_pw_wv=$(_pilot_wa_node_pass_why_verdict "${_PWP_WHY:-}"); fi; continue; fi	_pw_wv=out; fi; continue; fi
 recusa do pool lida (refused) deixa de ser definitiva	not-wa|has-owner|no-node-ok|node:mini|routed:*|veto:*|refused:*) printf 'out' ;;	not-wa|has-owner|no-node-ok|node:mini|routed:*|veto:*) printf 'out' ;;
@@ -115,3 +115,23 @@ leitura sem corte de caracteres	| .[:6] | map(.[:80])	| .[:6]
 info que nao e lista vira leitura limpa	map(.[:80])) else null end)}'	map(.[:80])) else [] end)}'
 info ausente vira leitura limpa	leitura: (if (.info | type) == "array" then (.info | map(	leitura: (if true then ((.info // []) | map(
 sonda sem a leitura	,paths:$d.paths,leitura:$d.leitura}'	,paths:$d.paths}'
+3.18: o hold nunca expira	then return 3; fi; return 0 ;;	then return 0; fi; return 0 ;;
+3.18: o limite exige passadas a MAIS (-gt no lugar de -ge)	-ge "${_PWP_HOLD_MAX:-0}" ]; then return 3	-gt "${_PWP_HOLD_MAX:-0}" ]; then return 3
+3.18: limite 0 passa a expirar na hora	[ "${_PWP_HOLD_MAX:-0}" -gt 0 ] && [ "${_PWP_HOLD_PRIOR	[ "${_PWP_HOLD_MAX:-0}" -ge 0 ] && [ "${_PWP_HOLD_PRIOR
+3.18: limite ilegivel vira 0 (sem fim)	*[!0-9]*) _PWP_HOLD_MAX=2 ;; esac	*[!0-9]*) _PWP_HOLD_MAX=0 ;; esac
+3.18: o contador nao sobe quando o waiter termina blind	blind)    _pw_wcount=$((_PWP_HOLD_PRIOR + 1)); _pilot_wa_node_pass_hold_put "$_PY_WAIT_ID" "$_pw_wcount" ;;	blind)    : ;;
+3.18: veredito legivel nao zera o contador	node|out) _pw_wcount=0; _pilot_wa_node_pass_hold_put "$_PY_WAIT_ID" 0 ;;	node|out) : ;;
+3.18: o contador anda sem o waiter ter sido olhado	if [ "$_pw_trk" = 1 ] && [ "$_pw_wreached" = 1 ]; then	if [ "$_pw_trk" = 1 ]; then
+3.18: o shadow tambem grava o contador	[ "$_PWP_MODE" = on ] && [ "$_PWP_HOLD_MAX" -gt 0 ]	[ "$_PWP_HOLD_MAX" -gt 0 ]
+3.18: HOLD=0 nao desliga o contador	&& [ "${PILOT_WA_NODE_PASS_HOLD:-1}" != 0 ]; then	; then
+3.18: o waiter nao e sondado primeiro	if [ "$_pw_wreached" = 0 ] && [ -n "$_pw_wl" ]	if [ "$_pw_wreached" = 9 ] && [ -n "$_pw_wl" ]
+3.18: o estado de outro waiter vale para este	'$2 == id { n = $3; hit = 1 }	'{ n = $3; hit = 1 }
+3.18: contagem ilegivel no estado solta a P2	row:|row:*[!0-9]*) printf '0'; return 1 ;;	row:|row:*[!0-9]*) printf '99'; return 1 ;;
+3.18: leitura do estado que falha nao avisa	warn "ga-2hd02v.3.18: leitura do estado do hold	: "ga-2hd02v.3.18: leitura do estado do hold
+3.18: escrita do estado que falha nao avisa	warn "ga-2hd02v.3.18: escrita do estado do hold	: "ga-2hd02v.3.18: escrita do estado do hold
+3.18: o rc 3 da retencao e ignorado	        3) _pw_hx=1 ;;	        3) : ;;
+3.18: P2 solta pelo fim do hold conta mesmo quando o dispatch falha	_pw_rel=$((_pw_rel + 1))	_pw_rel=$((_pw_rel + 1)); if [ "$_pw_hx" = 1 ]; then _pw_expired=$((_pw_expired + 1)); fi
+3.18: o despacho da P2 solta pelo fim do hold nao conta	if [ "$_pw_hx" = 1 ]; then _pw_expired=$((_pw_expired + 1)); fi\n        # ga-2hd02v.3.16	:\n        # ga-2hd02v.3.16
+3.18: o resumo nao grava hold_expired	hold_expired:$hx,waiter_blind_passes:$wbp,	waiter_blind_passes:$wbp,
+3.18: o resumo nao grava waiter_blind_passes	hold_expired:$hx,waiter_blind_passes:$wbp,	hold_expired:$hx,
+3.18: o log nao diz hold expirado	log "ga-2hd02v.3.18: hold expirado	: "ga-2hd02v.3.18: hold expirado
