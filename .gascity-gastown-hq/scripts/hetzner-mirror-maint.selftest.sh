@@ -8,7 +8,7 @@
 # com HMT_SLEEP, um repack lento (prazo e teto de swap). Leva ~30 s. HMT_M=<script> testa outra cópia do script (mutantes); HMT_KEEP=1 guarda o tmp.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd -P); M=${HMT_M:-$HERE/hetzner-mirror.sh}
-T=$(mktemp -d "${TMPDIR:-/tmp}/hmt.XXXXXX"); T=$(cd "$T" && pwd -P); chmod 700 "$T"; N=0; F=0; HMT_EXPECT=77
+T=$(mktemp -d "${TMPDIR:-/tmp}/hmt.XXXXXX"); T=$(cd "$T" && pwd -P); chmod 700 "$T"; N=0; F=0; HMT_EXPECT=80
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t GIT_TERMINAL_PROMPT=0
 export HETZNER_MIRROR_HOME=$T/mh HETZNER_MIRROR_ALLOW_WORKTREE=1 HETZNER_MIRROR_FILTER=$HERE/hetzner-rsync-filter.wa.txt HETZNER_MIRROR_SCAN=$HERE/hetzner-mirror-scan.py   # caminhos absolutos: um mutante (HMT_M) mora noutra pasta
 export HETZNER_MIRROR_MAINT_FREE_CMD='echo 99999' HETZNER_MIRROR_MAINT_LOAD_CMD='echo 1' HETZNER_MIRROR_MAINT_SWAP_CMD='echo 100' HETZNER_MIRROR_MAINT_POLL=1   # "tudo livre"
@@ -16,6 +16,9 @@ ok() { N=$((N+1)); echo "ok   $N - $1"; }
 bad() { N=$((N+1)); F=$((F+1)); echo "FAIL $N - $1"; [ -z "${2:-}" ] || echo "     $2" | head -n 8; return 0; }   # sempre 0: `A && bad .. || ok ..` contaria o caso duas vezes
 cleanup() { [ -z "${FAKE_OWNER:-}" ] || kill "$FAKE_OWNER" 2>/dev/null; [ -n "${HMT_KEEP:-}" ] && echo "(mantido: $T)" || rm -rf "$T"; }; trap cleanup EXIT
 rc_is() { local want=$1 desc=$2; shift 2; OUT=$("$@" 2>&1); local got=$?; [ "$got" = "$want" ] && ok "$desc" || bad "$desc (rc=$got, queria $want)" "$OUT"; }
+# rc_is_f: como rc_is, mas a saída vai a ARQUIVO. `$(...)` espera o EOF do pipe: um filho órfão que herdou o pipe seguraria a captura até morrer, e o caso "sem órfão" olharia DEPOIS
+# da morte dele e passaria vazio (foi assim que o mutante kill_parent_only sobreviveu). Com arquivo o comando volta na hora e o filho, se sobrou, ainda está vivo.
+rc_is_f() { local want=$1 desc=$2; shift 2; "$@" > "$T/rcf.out" 2>&1; local got=$?; OUT=$(cat "$T/rcf.out"); [ "$got" = "$want" ] && ok "$desc" || bad "$desc (rc=$got, queria $want)" "$OUT"; }
 has() { printf '%s' "$OUT" | grep -qF -- "$1" && ok "$2" || bad "$2 (faltou: $1)" "$OUT"; }
 hasnt() { printf '%s' "$OUT" | grep -qF -- "$1" && bad "$2 (apareceu: $1)" "$OUT" || ok "$2"; }
 loose() { git -C "$1" count-objects -v 2>/dev/null | awk '/^count:/ { print $2 }'; }
@@ -23,6 +26,10 @@ present() { git -C "$1" cat-file -e "$2" 2>/dev/null; }
 cfg() { git -C "$1" config --get "$2" 2>/dev/null; }
 mk_unreach() { local oid p; oid=$(printf 'unreach-%s-%s\n' "$2" "$RANDOM$RANDOM$RANDOM" | git -C "$1" hash-object -w --stdin); p="$1/objects/${oid:0:2}/${oid:2}"; [ "$3" != old ] || touch -t 202001010000 "$p"; echo "$oid"; }   # old = 3 semanas+ de idade
 pgrep_sleep() { pgrep -f 'sleep 3[12]$' > /dev/null 2>&1; }
+# "não sobrou filho" é uma afirmação NEGATIVA: só vale se o detector é capaz de ver um filho vivo nesta máquina (controle positivo; no nó Linux o pgrep é outro). Sem isto o caso passaria vazio.
+sleep 31 & CTRL=$!; sleep 1
+pgrep_sleep && ok "controle: o detector de filhos (pgrep -f 'sleep 31') enxerga um sleep vivo" || bad "controle: o detector de filhos NÃO enxerga um sleep 31 vivo — os casos 'sem órfão' abaixo passariam vazios"
+kill "$CTRL" 2>/dev/null; wait "$CTRL" 2>/dev/null
 
 # ── fixture: um "origin", um shim de git e espelhos criados pelo próprio `init` ────────────────────────────────────────────────────────────────────────────────────────
 REAL_GIT=$(command -v git); LOG=$T/git.log; : > "$LOG"; SWAPF=$T/swap; echo 100 > "$SWAPF"
@@ -31,7 +38,7 @@ cat > "$T/gitshim" <<'EOF'
 echo "$*" >> "$HMT_LOG"
 case " $* " in *" repack "*)
   [ -z "${HMT_TMPFILE:-}" ] || : > "$2/objects/pack/tmp_pack_HMT"
-  [ -z "${HMT_SWAPFILE:-}" ] || echo 3000 > "$HMT_SWAPFILE"
+  [ -z "${HMT_SWAPFILE:-}" ] || echo "${HMT_SWAPVAL:-3000}" > "$HMT_SWAPFILE"
   if [ -n "${HMT_SLEEP:-}" ]; then sleep "$HMT_SLEEP" & wait; fi;; esac
 exec "$HMT_REAL_GIT" "$@"
 EOF
@@ -115,7 +122,7 @@ kill "$FAKE_OWNER" 2>/dev/null; wait "$FAKE_OWNER" 2>/dev/null; FAKE_OWNER=""; r
 # ── prazo: repack lento é CORTADO, sem órfão, sem carimbo ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 OKAT=$(cfg "$R" gtmirror.maintokat)
 : > "$R/objects/pack/tmp_pack_OLDONE"; touch -t 202001010000 "$R/objects/pack/tmp_pack_OLDONE"   # um tmp que JÁ existia antes da rodada: não é do passo morto, não pode ser apagado
-rc_is 1 "repack além do prazo: rc 1" env HMT_SLEEP=31 HMT_TMPFILE=1 HETZNER_MIRROR_MAINT_TIMEOUT=2 "$M" maint --force wa; has "CORTADO" "prazo: diz CORTADO"
+rc_is_f 1 "repack além do prazo: rc 1" env HMT_SLEEP=31 HMT_TMPFILE=1 HETZNER_MIRROR_MAINT_TIMEOUT=2 "$M" maint --force wa; has "CORTADO" "prazo: diz CORTADO"
 sleep 1; pgrep_sleep && { bad "prazo: sobrou o filho do repack (sleep) rodando"; pkill -f 'sleep 3[12]$' 2>/dev/null; } || ok "prazo: o filho do repack também foi morto (sem órfão)"
 [ ! -e "$R/objects/pack/tmp_pack_HMT" ] && ok "prazo: o tmp_pack que o passo morto deixou foi apagado (o git não o apaga no sinal)" || bad "prazo: tmp_pack do passo morto ficou em objects/pack"
 [ -e "$R/objects/pack/tmp_pack_OLDONE" ] && ok "prazo: o tmp_pack que já existia antes da rodada NÃO foi tocado" || bad "prazo: apagou tmp_pack que não era do passo morto"
@@ -125,11 +132,16 @@ sleep 1; pgrep_sleep && { bad "prazo: sobrou o filho do repack (sleep) rodando";
 
 # ── teto de swap: o swap sobe durante o repack ⇒ PARADO ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
 echo 100 > "$SWAPF"
-rc_is 1 "swap sobe 2900 MB durante o repack: rc 1" env HMT_SLEEP=32 HMT_TMPFILE=1 HMT_SWAPFILE="$SWAPF" HETZNER_MIRROR_MAINT_SWAP_CMD="cat $SWAPF" "$M" maint --force wa; has "PARADO — o swap subiu 1536 MB" "swap: diz PARADO"
+rc_is_f 1 "swap sobe 2900 MB durante o repack: rc 1" env HMT_SLEEP=32 HMT_TMPFILE=1 HMT_SWAPFILE="$SWAPF" HETZNER_MIRROR_MAINT_SWAP_CMD="cat $SWAPF" "$M" maint --force wa; has "PARADO — o swap subiu 1536 MB" "swap: diz PARADO"
 sleep 1; pgrep_sleep && { bad "swap: sobrou o filho do repack"; pkill -f 'sleep 3[12]$' 2>/dev/null; } || ok "swap: o filho do repack também foi morto"
 [ ! -e "$R/objects/pack/tmp_pack_HMT" ] && ok "swap: o tmp_pack do passo parado foi apagado" || bad "swap: tmp_pack do passo parado ficou"
 echo 100 > "$SWAPF"
-rc_is 0 "swap ilegível: a rodada segue CEGA (leitura que não fiz não mata o passo)" env HETZNER_MIRROR_MAINT_SWAP_CMD='echo ?' "$M" maint --force wa; has "swap=? MB" "swap ilegível: o log diz ?"; has "pico_swap=+? MB" "swap ilegível: o pico é ?, não 0"
+# HMT_SLEEP=3: o repack dura mais que o 1º poll, então a leitura de swap DENTRO do laço roda de verdade (com um passo rápido ela nunca rodava, e o mutante "swap ilegível vira 99999" passava)
+rc_is 0 "swap ilegível: a rodada segue CEGA (leitura que não fiz não mata o passo)" env HMT_SLEEP=3 HETZNER_MIRROR_MAINT_SWAP_CMD='echo ?' "$M" maint --force wa; has "swap=? MB" "swap ilegível: o log diz ?"; has "pico_swap=+? MB" "swap ilegível: o pico é ?, não 0"
+
+echo 100 > "$SWAPF"
+rc_is 0 "swap sobe 500 MB (abaixo do teto de 1536): o passo NÃO é parado" env HMT_SLEEP=3 HMT_SWAPVAL=600 HMT_SWAPFILE="$SWAPF" HETZNER_MIRROR_MAINT_SWAP_CMD="cat $SWAPF" "$M" maint --force wa; has "pico_swap=+500 MB (100→600)" "swap: o pico visto durante o passo vai ao log"
+echo 100 > "$SWAPF"
 
 # ── atraso: portão fechado por muito tempo ⇒ rc 1 (o launchd mostra) ────────────────────────────────────────────────────────────────────────────────────────────────
 git -C "$R" config gtmirror.maintokat "$(( $(date +%s) - 100 * 3600 ))"

@@ -24,7 +24,7 @@ servidor (runner) ──ssh -p 2293──▶ túnel reverso ──▶ sshd próp
 | `scripts/hetzner-remote-git.sh` | servidor, `~/gt-remote/bin/` | `bootstrap pull wt-add wt-rm status scan` |
 | `packs/town-deltas/assets/hetzner-mirror-{sshd,tunnel,sync}.plist` | mini (launchd) | sshd e túnel de pé; `sync` a cada 5 min |
 | `packs/town-deltas/assets/hetzner-mirror-maint.plist` | mini (launchd) | `maint` a cada 1 h (cada espelho só é devido a cada 20 h), nice 19, I/O baixo (ga-pepqfkk); o deploy do gascity o instala sozinho (`scan_and_install_new_plists`) |
-| `scripts/hetzner-mirror-maint.selftest.sh` | — | hermético, sem sshd, 77 casos, ~30 s no nó Linux (`mbp-run.sh --repo hq`), ~75 s no mini carregado; git injetado por `HETZNER_MIRROR_GIT` e portões por `HETZNER_MIRROR_MAINT_{FREE,LOAD,SWAP}_CMD` |
+| `scripts/hetzner-mirror-maint.selftest.sh` | — | hermético, sem sshd, 80 casos, ~30 s no nó Linux (`mbp-run.sh --repo hq`), ~75 s no mini carregado; git injetado por `HETZNER_MIRROR_GIT` e portões por `HETZNER_MIRROR_MAINT_{FREE,LOAD,SWAP}_CMD` |
 | `scripts/hetzner-mirror.selftest.sh` | — | hermético, 356 casos, 0 falhas, sshd real, ~5 min com o mini carregado (19/10; 66 s a load 26–39 quando eram 319 casos) (`HMST_FAKE=1` troca o ssh por chamada direta, só para desenvolver) |
 | `<cidade>/.gc/hetzner-mirror/` · `~/gt-remote/{bin,git,keys}` | mini · servidor | estado (`repos/`, `state/<rig>/`, `authorized_keys`); só estas 3 pastas do servidor são desta fatia (o resto é do ga-zri39b) |
 
