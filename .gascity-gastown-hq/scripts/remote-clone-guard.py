@@ -14,7 +14,8 @@ COMO DECIDE (sei que pode / sei que não pode / não sei, e o último NÃO vira 
 CAMADA DA SESSÃO (ga-w7qwl1.2.7, host `mbp`): num notebook o ~/.claude é PESSOAL, e o guarda não vai para lá. O bundle o instala em <raiz>/guard/remote-clone-guard.py e o liga no arquivo de
   `--settings` da sessão (<raiz>/city/settings.json): só o `claude` aberto pelo provider o carrega. Quando este arquivo roda de uma pasta chamada `guard`, <raiz>/guard, <raiz>/zdot e <raiz>/city/settings.json
   (NÃO a <raiz> inteira: o diretório de trabalho de uma sessão pode ficar sob <raiz>/city ou <raiz>/work) passam a ser protegidos de Edit/Write, e o `--selfcheck` exige `disableAllHooks: false` ESCRITO no settings (MEDIDO no claude 2.1.314: `disableAllHooks: true` no ~/.claude/settings.json
-  pessoal OU em <pasta>/.claude/settings.json desliga, calado, o hook que vem do `--settings`; `false` no próprio `--settings` vence as duas camadas). O servidor (~/.claude/hooks/) não muda.
+  pessoal OU em <pasta>/.claude/settings.json desliga, calado, o hook que vem do `--settings`; `false` no próprio `--settings` vence as duas camadas). Nesse modo os caminhos também são comparados sem
+  distinguir caixa nem a forma Unicode (o APFS padrão não distingue: `GUARD/` é `guard/`), no território do clone inclusive. O servidor (~/.claude/hooks/) não muda: comparação exata.
 CÓDIGOS: 0 liberado · 2 bloqueado — também o pedido que o guarda não consegue analisar em STEP_LIMIT passos ou TIME_LIMIT segundos (hook estourado no Claude Code, 600 s, NÃO bloqueia: a
   chamada seguiria sem conferência; o guarda se corta antes e fecha, ver Budget). `--selfcheck [settings.json [pasta-do-projeto…]]`: 0 se o guarda decide como deveria numa pasta de teste E (com o settings) todo
   PreToolUse de Bash/Edit/Write/MultiEdit/NotebookEdit é EXATAMENTE `python3 -I <este arquivo> || exit 2`, sem campo que mude QUANDO dispara (só type/command/timeout) e
@@ -30,6 +31,7 @@ import shlex
 import signal
 import sys
 import tempfile
+import unicodedata
 
 TOOLS_FILE = {"Edit": "file_path", "Write": "file_path", "MultiEdit": "file_path", "NotebookEdit": "notebook_path"}
 READ = {"log", "status", "diff", "show", "rev-parse", "rev-list", "ls-files", "ls-tree", "cat-file", "blame", "describe", "shortlog",
@@ -87,8 +89,19 @@ CONT = re.compile(r"(?<!\\)((?:\\\\)*)\\\n")  # barra + newline com número ÍMP
 STEP_LIMIT, TIME_LIMIT, WORK = 50000, 5.0, [0]  # teto por pedido: passos de conferência (ver tick) e segundos de relógio (ver main); WORK = passos gastos até agora
 
 
+def fold(s: str) -> str:
+    return unicodedata.normalize("NFD", s).casefold()
+
+
 def inside(p: str, root: str) -> bool:
+    if FOLD:  # camada da sessão = notebook macOS: o APFS padrão não distingue caixa nem a forma Unicode, e `GUARD/` chega na mesma pasta que `guard/` sem casar com ela. Dobrar só fecha o lado do bloqueio (uma pasta de outro nome-igual-na-caixa, num disco que distingue, vira falso positivo)
+        p, root = fold(p), fold(root)
     return p == root or p.startswith(root.rstrip("/") + "/")
+
+
+def same(a: str, b: str) -> bool:
+    """O mesmo caminho pela mesma regra do inside(): na camada da sessão dobra caixa e forma Unicode, no servidor compara exato."""
+    return fold(a) == fold(b) if FOLD else a == b
 
 
 def res(p: str, cwd, shell: bool = True):
@@ -106,7 +119,7 @@ def res(p: str, cwd, shell: bool = True):
 
 def own_clone(proj, terr: str):
     p = os.path.realpath(proj) if proj else ""
-    while p and inside(p, terr) and p != terr:
+    while p and inside(p, terr) and not same(p, terr):  # parar na raiz do território pela MESMA régua do inside(): `GIT` no lugar de `git` é a raiz, e um .git ali não a transforma no "meu clone" (liberaria o território inteiro)
         if os.path.exists(os.path.join(p, ".git")):
             return p
         p = os.path.dirname(p)
@@ -123,11 +136,15 @@ def layer_root() -> str:
     return root if os.path.basename(here) == "guard" and root not in ("", "/") else ""
 
 
+FOLD = bool(layer_root())  # decidido uma vez, de onde ESTE arquivo roda: <raiz>/guard/ → dobra (inside, claude_conf); ~/.claude/hooks/ (servidor, Linux) → comparação exata, como sempre foi
+
+
 def claude_conf(p: str) -> bool:
     """Hook ou settings do claude no HOME, ou arquivo da camada da sessão (LAYER_PATHS sob a raiz do bundle): quem os escreve desliga este guarda (o provider só os confere na ABERTURA da sessão)."""
     h = os.path.realpath(os.path.expanduser("~")) + "/.claude/"
     root = layer_root()  # vazio → não há camada de sessão e vale só o home (o servidor, como sempre foi)
-    return (p.startswith(h) and bool(re.fullmatch(r"hooks/.*|settings[^/]*\.json", p[len(h):]))) or (bool(root) and any(inside(p, f"{root}/{d}") for d in LAYER_PATHS))
+    hf, pf = (fold(h), fold(p)) if FOLD else (h, p)  # a mesma dobra do inside(): `~/.CLAUDE/Settings.json` é o settings.json pessoal num APFS padrão
+    return (pf.startswith(hf) and bool(re.fullmatch(r"hooks/.*|settings[^/]*\.json", pf[len(hf):]))) or (bool(root) and any(inside(p, f"{root}/{d}") for d in LAYER_PATHS))
 
 
 def lists_only(sub: str, rest: list) -> bool:

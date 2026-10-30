@@ -19,7 +19,8 @@
 #   clone/init <outro>/x, checkout-index --prefix=…; subgrupos destb e destp) · layer — a camada da SESSÃO (ga-w7qwl1.2.7): o guarda instalado em <raiz>/guard/ (pasta `guard` sob a raiz do bundle)
 #   protege a própria camada (guard/, zdot/, city/settings.json — Edit/Write/MultiEdit/NotebookEdit, também por symlink) sem travar o trabalho, o resto do city nem nomes parecidos; a cópia do servidor
 #   (~/.claude/hooks) e uma pasta que não se chama `guard` NÃO protegem nada disso; o --selfcheck exige `disableAllHooks: false` ESCRITO no settings da camada (ausente/true/null/0/"false"/lista reprovam;
-#   o `true` da camada do projeto reprova em qualquer cópia); o hook via `sh -c` bloqueia (2) e libera (0), e guarda ausente ou com erro de sintaxe sai 2.
+#   o `true` da camada do projeto reprova em qualquer cópia); outra caixa ou forma Unicode (NFD) do mesmo arquivo cai na mesma regra, também no território do clone (APFS do macOS), e o servidor segue na comparação exata;
+#   o hook via `sh -c` bloqueia (2) e libera (0), e guarda ausente ou com erro de sintaxe sai 2.
 # CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (um mutante por trava; o resumo da rodada traz a conta); e
 #   contra um stub que só sai 0 (o servidor ANTES desta fatia: o hook do mini era `drop` e nada o substituía), quase tudo falha.
 # VARIÁVEIS: RCG_UNDER_TEST (guarda a testar) · RCG_ONLY (grupos, vírgula) · RCG_NO_MUTANTS=1
@@ -464,10 +465,45 @@ g_layer() {  # camada da SESSÃO (ga-w7qwl1.2.7): no MBP o guarda mora em <raiz>
     g 2 "layer: $1 no clone alheio continua bloqueado" "$1" "$2" "$OTH/f.txt"
   done
   g 2 "layer: o motivo da recusa diz que é hook/settings do claude" Write file_path "$LR/guard/remote-clone-guard.py"; grep -q "hook/settings do claude" "$T/err"; ok $? "layer: ...e a mensagem fala em hook/settings do claude"
+  # --- o APFS padrão do macOS não distingue caixa nem a forma Unicode: outra grafia do MESMO arquivo cai na mesma regra (achado da revisão de segurança do commit) ---
+  local up ownup lr2 nfd
+  for t in "Edit file_path" "Write file_path" "MultiEdit file_path" "NotebookEdit notebook_path"; do
+    set -- $t
+    for f in GUARD/remote-clone-guard.py Guard/novo.py ZDOT/env.sh Zdot/.zshenv CITY/Settings.json city/SETTINGS.JSON; do
+      g 2 "layer: $1 em <raiz>/$f (outra caixa do mesmo arquivo) é BLOQUEADO" "$1" "$2" "$LR/$f"
+    done
+    for f in WORK/x.txt City/Outro.txt GUARDX/f CITY/settings.json.bak; do
+      g 0 "layer: $1 em <raiz>/$f (trabalho, em outra caixa) segue passando" "$1" "$2" "$LR/$f"
+    done
+    g 2 "layer: $1 em ~/.CLAUDE/Settings.json (o settings pessoal, em outra caixa) é BLOQUEADO" "$1" "$2" "$HOME/.CLAUDE/Settings.json"
+    g 2 "layer: $1 em ~/.claude/HOOKS/x.py (outra caixa) é BLOQUEADO" "$1" "$2" "$HOME/.claude/HOOKS/x.py"
+  done
+  up="$(printf '%s' "$OTH" | tr a-z A-Z)"; ownup="$(printf '%s' "$OWN" | tr a-z A-Z)"
+  b 2 "layer: git -C <clone alheio em outra caixa> commit é BLOQUEADO (o território vale em qualquer caixa)" "git -C $up commit -m x"
+  g 2 "layer: Write no clone alheio em outra caixa é BLOQUEADO" Write file_path "$up/f.txt"
+  b 0 "layer: git -C <clone PRÓPRIO em outra caixa> commit segue liberado (a dobra vale para o próprio também)" "git -C $ownup commit -m x"
+  lr2="$HOME/gt-remote/bundlé"; mkdir -p "$lr2/guard"; cp "$src" "$lr2/guard/remote-clone-guard.py"  # `é` composto (NFC)
+  nfd="$(python3 -c 'import unicodedata,sys; print(unicodedata.normalize("NFD", sys.argv[1]), end="")' "$lr2")"  # o mesmo nome com `e` + acento solto
+  [ "$nfd" != "$lr2" ]; ok $? "layer: (preparo) a grafia NFD do nome da raiz difere da NFC"
+  local P="$lr2/guard/remote-clone-guard.py"
+  g 2 "layer: Write em <raiz>/guard/ escrita na forma NFC é BLOQUEADO" Write file_path "$lr2/guard/novo.py"
+  g 2 "layer: Write em <raiz>/guard/ escrita na forma NFD (o APFS chega na mesma pasta) é BLOQUEADO" Write file_path "$nfd/guard/novo.py"
+  local P="$LR/guard/remote-clone-guard.py"
+  # --- a RAIZ do território em outra caixa, com um .git dentro, NÃO vira "o meu clone" (own_clone parava a subida com `!=` exato enquanto o inside() já dobrava: subia até a raiz, achava o .git e liberava o território inteiro) ---
+  local R2="$T/h2" TR2
+  TR2="$R2/gt-remote/git"; mkdir -p "$TR2/r/wt/other" "$TR2/r/wt/mine" "$R2/gt-remote/GIT"; : > "$TR2/r/wt/other/.git"; : > "$TR2/r/wt/mine/.git"; : > "$R2/gt-remote/GIT/.git"
+  export RCG_ROOT="$TR2"
+  g 2 "layer: projeto = a raiz do território em outra caixa (com .git) não libera o clone alheio" Write file_path "$TR2/r/wt/other/f.txt" "$OWN" "$R2/gt-remote/GIT"
+  g 2 "layer: ...nem o git -C no clone alheio" Bash command "git -C $TR2/r/wt/other commit -m x" "$OWN" "$R2/gt-remote/GIT"
+  g 0 "layer: (controle) o clone próprio de verdade, na caixa certa, segue liberado com a mesma raiz" Write file_path "$TR2/r/wt/mine/f.txt" "$OWN" "$TR2/r/wt/mine"
+  g 2 "layer: (controle) ...e o alheio segue bloqueado a partir dele" Write file_path "$TR2/r/wt/other/f.txt" "$OWN" "$TR2/r/wt/mine"
+  unset RCG_ROOT
   local P="$src"  # o MESMO arquivo rodando de fora de uma pasta `guard` (o servidor, ~/.claude/hooks): a raiz do bundle NÃO ganha proteção
   g 0 "layer: o guarda do servidor não protege <raiz>/guard (não há camada de sessão: só o home)" Write file_path "$LR/guard/novo.py"
   g 0 "layer: ...nem <raiz>/city/settings.json" Write file_path "$LR/city/settings.json"
   g 2 "layer: ...mas segue protegendo ~/.claude/hooks" Write file_path "$HOME/.claude/hooks/x.py"
+  g 0 "layer: o guarda do servidor segue comparando a caixa exata (disco Linux distingue): ~/.CLAUDE/Settings.json passa" Write file_path "$HOME/.CLAUDE/Settings.json"
+  g 0 "layer: ...o clone alheio em outra caixa também (nada mudou para o Hetzner)" Write file_path "$up/f.txt"
   mkdir -p "$T/naoguard"; cp "$src" "$T/naoguard/remote-clone-guard.py"; local P="$T/naoguard/remote-clone-guard.py"
   g 0 "layer: a pasta do arquivo não se chama guard → nenhuma raiz é deduzida (irmãos dela não ficam protegidos)" Write file_path "$T/zdot/.zshenv"
   local P="$LR/guard/remote-clone-guard.py"
@@ -1237,6 +1273,12 @@ echo "== $((n-fails))/$n ok =="
   mutant layer "o selfcheck da camada não exige o disableAllHooks:false escrito" 's/if layer_root() and s.get("disableAllHooks") is not False:/if False:/'
   mutant layer "o selfcheck da camada aceita qualquer valor falso (0, [], ausente→None) no lugar do false" 's/if layer_root() and s.get("disableAllHooks") is not False:/if layer_root() and s.get("disableAllHooks") is None:/'
   mutant layer "o selfcheck exige o false escrito também no servidor (o Hetzner regride)" 's/if layer_root() and s.get("disableAllHooks") is not False:/if s.get("disableAllHooks") is not False:/'
+  mutant layer "a camada da sessão não dobra a caixa (FOLD desligado)" 's/^FOLD = bool(layer_root())/FOLD = False/'
+  mutant layer "o servidor também dobra a caixa (FOLD sempre ligado)" 's/^FOLD = bool(layer_root())/FOLD = True/'
+  mutant layer "o inside() não dobra (território e camada comparam a caixa exata)" 's/^        p, root = fold(p), fold(root)/        pass/'
+  mutant layer "o home do claude em outra caixa não é dobrado" 's/    hf, pf = (fold(h), fold(p)) if FOLD else (h, p)/    hf, pf = h, p/'
+  mutant layer "a dobra ignora a forma Unicode (só a caixa)" 's/unicodedata.normalize("NFD", s).casefold()/s.casefold()/'
+  mutant layer "o own_clone para na raiz do território pela comparação exata (!=), não pela régua do inside()" 's/and not same(p, terr):/and p != terr:/'
   echo "-- contra um stub que só sai 0 (o servidor ANTES desta fatia)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"; printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$T/stub.py"
   r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,shell,wrap,lex,dest,cfg,tools,layer,msg,check,cond" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"
