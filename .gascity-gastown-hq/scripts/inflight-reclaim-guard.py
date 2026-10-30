@@ -9486,7 +9486,7 @@ def _selftest():
           "when the rig-store scan fails",
           _rgl_result4 is None, f"got {_rgl_result4!r}")
 
-    # RGL-6/7/8 (ga-sml4tqk): the skip reason names WHICH query failed. `gc rig list --json`
+    # RGQ-1/2/3 (ga-sml4tqk): the skip reason names WHICH query failed. `gc rig list --json`
     # blocked > 120 s on a down host while the HQ `bd list` answered in 0.3 s, and the guard
     # logged "bd list failed" for both, which sent the investigation to the wrong store.
     subprocess.run, _ = _rgl_stub(1, "")
@@ -9494,7 +9494,7 @@ def _selftest():
         _rgl_r6, _rgl_why6 = _list_with_reason(list_inflight_beads, "bd list failed")
     finally:
         subprocess.run = _orig_run_rgl
-    check("RGL-6 (ga-sml4tqk): rig-list failure → the reason names `gc rig list` and its rc, not 'bd list failed'",
+    check("RGQ-1 (ga-sml4tqk): rig-list failure → the reason names `gc rig list` and its rc, not 'bd list failed'",
           _rgl_r6 is None and _rgl_why6.startswith("gc rig list failed") and "rc=1" in _rgl_why6,
           f"got {_rgl_r6!r} {_rgl_why6!r}")
 
@@ -9508,7 +9508,7 @@ def _selftest():
         _rgl_r7b, _rgl_why7b = _list_with_reason(list_stranded_inprogress_beads, "in_progress sweep failed")
     finally:
         subprocess.run = _orig_run_rgl
-    check("RGL-7 (ga-sml4tqk): HQ `bd list` failure keeps its own label (no stale rig-list reason leaks in)",
+    check("RGQ-2 (ga-sml4tqk): HQ `bd list` failure keeps its own label (no stale rig-list reason leaks in)",
           _rgl_r7 is None and _rgl_why7 == "bd list failed"
           and _rgl_r7b is None and _rgl_why7b == "in_progress sweep failed",
           f"got {_rgl_why7!r} / {_rgl_why7b!r}")
@@ -9522,14 +9522,14 @@ def _selftest():
         _rgl_r8, _rgl_why8 = _list_with_reason(list_stranded_inprogress_beads, "in_progress sweep failed")
     finally:
         subprocess.run = _orig_run_rgl
-    check("RGL-8 (ga-sml4tqk): a `gc rig list` TIMEOUT is named as such (the incident's shape)",
+    check("RGQ-3 (ga-sml4tqk): a `gc rig list` TIMEOUT is named as such (the incident's shape)",
           _rgl_r8 is None and _rgl_why8 == "gc rig list failed (timed out after 20s)", f"got {_rgl_why8!r}")
     subprocess.run, _ = _rgl_stub(0, json.dumps({"rigs": []}))
     try:  # a success returns reason None and clears whatever the last failure left behind
         _rgl_r9, _rgl_why9 = _list_with_reason(list_inflight_beads, "bd list failed")
     finally:
         subprocess.run = _orig_run_rgl
-    check("RGL-8b (ga-sml4tqk): a successful call returns reason None and the reason slot is cleared",
+    check("RGQ-3b (ga-sml4tqk): a successful call returns reason None and the reason slot is cleared",
           _rgl_r9 is not None and _rgl_why9 is None and _RIG_LIST_ERR is None, f"got {_rgl_why9!r} {_RIG_LIST_ERR!r}")
 
     # RGL-5: when the rig list DOES succeed, the per-rig bd list call must

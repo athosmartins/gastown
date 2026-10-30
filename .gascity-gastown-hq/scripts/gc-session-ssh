@@ -56,11 +56,17 @@ VÁRIOS HOSTS E O MBP (ga-w7qwl1)  O host de uma sessão vem de $GC_SSH_HOST, se
 
 CACHE DO list-running (ga-it7qiq.5)  `gc rig list --json` chama este script ~16-20 vezes por execução (medido 21/10: 16 filhos diretos, nunca dois vivos ao mesmo tempo; ~1 s cada com load 42) e as respostas são idênticas. A lista que o host deu de BOM (ssh respondeu, marcadores
   inteiros, tmux legível) é guardada por host em <estado>/<host>/lr/cache.json e reaproveitada por até `list_cache_s` s (10 por padrão; 0 desliga; máximo 120): dentro do prazo não há ssh, e o prefixo filtra
-  na saída (o cache guarda a lista inteira). O que NÃO é guardado, nem vira outra coisa: erro, ssh fora, tempo esgotado e resposta cortada continuam erro quando o ssh é tentado (o cache nunca é o plano B de um erro,
+  na saída (o cache guarda a lista inteira). O que NÃO é guardado COMO LISTA, nem vira outra coisa: erro, ssh fora, tempo esgotado e resposta cortada continuam erro quando o ssh é tentado (o cache de listas nunca é o plano B de um erro,
   e erro nunca vira lista vazia; dentro do prazo o ssh nem é tentado, e essa é a defasagem aceita); cache vencido, de relógio que voltou, ilegível ou de forma errada = pergunta ao host. `start` e `stop` trocam a geração (lr/gen) e apagam o cache — o start antes E depois do ssh
   —, e o guardado só vale com a geração que o chamador lê agora, então uma resposta lida antes de um start/stop que só chega depois dele não vale nem se for gravada. Geração que não dá para ler = esta
   chamada não lê nem grava cache. O acerto do registro de sessões nossas (<estado>/<host>/running/) só acontece com resposta do host, não com lista do cache. --dry-run não usa nem mexe no cache.
   Custo aceito: sessão que caiu por conta própria (ou aberta por fora do provider) aparece/some da lista até `list_cache_s` s depois; o teto do `start` e a existência continuam conferidos no host, na hora.
+  HOST FORA (ga-sml4tqk)  Com o host fora, o cache de cima não ajudava (erro nunca vira lista guardada): cada uma das 16-20 chamadas em série de um `gc rig list --json` pagava o ConnectTimeout (10 s) ou o timeout (25 s) inteiro,
+  160-500 s (medido em 29/10 com o nó saturado), e o inflight-reclaim-guard (20 s por consulta) ficou cego por 14+ ciclos. Agora o FATO "o host não respondeu" (só `Unreachable`: ssh 255 ou tempo esgotado) é guardado por host em
+  <estado>/<host>/lr/down.json por `list_down_cache_s` s (30 por padrão; 0 desliga; máximo 60), com o carimbo de quando a falha foi VISTA; dentro do prazo o list-running devolve o mesmo erro de antes sem tentar o ssh (a mensagem diz que
+  veio do guardado) — nunca lista, nem vazia, e um host `sleeps` segue a regra de sempre. Resposta cortada, sem marcadores e tmux ilegível NÃO viram esse fato (continuam erro de cada chamada). Vale a MESMA geração do cache de listas:
+  start e stop apagam o fato, o host que voltou a responder também, e arquivo torto/ilegível/vazio/de outra geração/do futuro = pergunta ao host (nunca um "fora" inventado). `list_cache_s` 0 desliga o cache do list-running INTEIRO,
+  os dois; --dry-run não usa. Custo aceito: o host que volta continua "fora" por até `list_down_cache_s` s depois da última falha vista (o engine trata o erro como lista parcial, igual durante a queda).
   Várias chamadas SIMULTÂNEAS com o cache frio perguntam todas ao host (sem trava de voo único: as de um `rig list` são em série, medido, e uma trava transformaria host fora do ar em N prazos um atrás do outro).
 
 O QUE NÃO FAZ (cada item é de outra fatia ou é recusa de propósito)
@@ -81,7 +87,7 @@ CONFIGURAÇÃO  $GC_SSH_CONFIG ou <cidade>/.gc/session-ssh.json (cidade = pasta 
      "remote_root": "/home/runner/gt-remote/bundle", "remote_home": "/home/runner"}}}
   obrigatórios: ssh (alias/destino), cap (teto de sessões deste host, contado SÓ no socket do provider, separado do teto do mini),
   remote_root (= --remote-root do remote-bundle-build.py), remote_home. opcionais: socket (gc-remote), connect_timeout (10),
-  timeout (25) e start_timeout (60) em segundos, list_cache_s (10; inteiro de 0 a 120, 0 desliga o cache do list-running; qualquer outra coisa recusa a config), ssh_opts [], env_allow [], mini_home, real_sessions_released_by (ver acima), worktree_prepare (true/false; padrão true, e false num host
+  timeout (25) e start_timeout (60) em segundos, list_cache_s (10; inteiro de 0 a 120, 0 desliga o cache do list-running INTEIRO; qualquer outra coisa recusa a config), list_down_cache_s (30; inteiro de 0 a 60, 0 desliga só o cache do host fora; qualquer outra coisa recusa a config), ssh_opts [], env_allow [], mini_home, real_sessions_released_by (ver acima), worktree_prepare (true/false; padrão true, e false num host
   com presence_gate: preparo do worktree no start, ver acima; texto no lugar de true/false é erro de configuração), worktree_rigs ({"dog": "gascity"}: papel → rig dos worktrees que o provider cria e recolhe; ausente = nenhum). Só para o notebook (MBP): path_extra [] (dirs
   absolutos à frente do PATH do ssh sem login: /opt/homebrew/bin), presence_gate (true), gate_cmd ([lista]), presence_lib (padrão
   <remote_home>/gt-remote/bin/mbp-presence.sh), watch_s (5), sleeps (true), session_env ({"path": [pastas], "claude": "/abs/claude"}; OBRIGATÓRIO em
@@ -1230,7 +1236,8 @@ def lr_down_write(cfg: Cfg, gen: str, msg: str) -> None:
 
 def host_live(cfg: Cfg, dry: bool) -> tuple:
     """(sessões do host, t0). t0 = quando a pergunta ao host começou; None = a lista veio do cache e o host NÃO foi perguntado. Erro do host (Unreachable/Fail) sobe como
-    sempre: o cache só guarda resposta boa e NUNCA é o plano B de um erro (ssh tentado que falha = erro, não a lista de segundos atrás). Dentro do prazo o ssh nem é tentado: é a defasagem aceita."""
+    sempre: o cache de listas só guarda resposta boa e NUNCA é o plano B de um erro (ssh tentado que falha = erro, não a lista de segundos atrás). Dentro do prazo o ssh nem é tentado: é a defasagem aceita.
+    ga-sml4tqk: o Unreachable também deixa o FATO "o host não respondeu" (lr_down_write), que dentro do prazo vira o mesmo erro sem ssh; lista guardada é só de resposta boa, e o erro rápido nunca é lista."""
     gen = None if dry or not cfg.list_ttl else lr_gen(cfg)  # None = sem cache nesta chamada (dry-run, cache desligado ou geração ilegível)
     if gen is not None:
         hit = lr_read(cfg, gen)
