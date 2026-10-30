@@ -30,6 +30,12 @@ O QUE A PROVA CONFERE (os critérios do ga-w7qwl1.1; cada linha vira PASS/FAIL n
       (o clone é raso, sem blobs e sem checkout fora de mbp-proof/) nem segredo novo no MBP depois; a varredura olha também DENTRO do base64 do
       spool (stdin_b64/stdout_b64/stderr_b64 e o cmd `rs1 <base64>`), e o que não decodifica é "sem verificar", que reprova
   (e) o bundle está instalado e CONFERIDO no MBP (verify lá) e a sessão roda `claude` com o --settings do bundle até o prompt de partida
+  (f) a sessão nasceu num LaunchAgent do domínio gráfico (ga-w7qwl1.1.8): com a sessão de pé, lido NO MBP — o agente está carregado em gui/<uid>, o veredito que ELE gravou é `ok` (o
+      `claude auth status` com loggedIn true rodou lá dentro), o plist está em run/ e NÃO em ~/Library/LaunchAgents. O `claude auth status` pelo ssh só entra no log, como contraste.
+  (g) duas sessões abertas, parar a 1ª, a 2ª vive (ga-w7qwl1.2.4): depois que a sessão da prova sai, duas sessões LEVES (`sleep`; não pedem login de API) abrem pelo provider. O tmux do
+      socket nasce dentro do job do agente da 1ª; a prova lê por ssh, direto no MBP, que parar a 1ª deixa o servidor, a 2ª sessão e o agente dela de pé e o agente da 1ª ausente, e que depois
+      do stop da 2ª não sobra sessão, servidor nem agente. Não chama a API (não depende de o token estar válido, e roda mesmo quando (e) reprova por "Login expired"), MAS o agente do domínio gráfico só abre QUALQUER
+      sessão, até um `sleep`, com `claude auth status` = loggedIn true: com o login do MBP limpo o start é recusado (medido 30/10) e (f) e (g) ficam sem medir. Não roda se o Athos voltou (saída 4).
 
 O QUE TOCA NO MBP (tudo sob ~/gt-remote, e só o que está aqui) E O QUE DESFAZ
   install: gt-remote/bundle (o OUT do builder com --session-path, zdot/ incluído, igual ao que o verify confere), gt-remote/shim-bin (cliente do atalho; links bd, gc,
@@ -37,7 +43,10 @@ O QUE TOCA NO MBP (tudo sob ~/gt-remote, e só o que está aqui) E O QUE DESFAZ
            gt-remote/bin/remote-bundle-build.py. Nada em ~/.claude, ~/.config nem ~/.ssh.
   e2e:     gt-remote/proof/<rodada> (clone raso, sem blobs; apagado no fim), uma entrada em ~/.claude.json (projects[<pasta>], a mesma que o claude gravaria ao aceitar
            a confiança; REMOVIDA no fim), gt-remote/PAUSE (só a desta rodada; só removida se a primeira linha ainda for a marca dela), gt-remote/bundle/run (apagada se
-           não existia). O branch worker/<rodada> no origin FICA (apagá-lo é decisão: --delete-branch).
+           não existia), as sessões leves de (g) (remote-test-remote-mbp-91 e -92, com os agentes delas, só entre o start e o stop). O branch worker/<rodada> no origin FICA (apagá-lo é decisão: --delete-branch).
+  run/*.stop: o provider deixa `<nome>.stop` em run/ depois de TODO stop (ga-0k82lw; o start seguinte do nome o apaga, o stop poda as de > 24 h) e o `verify` do bundle conta qualquer arquivo de run/
+           como "sobra". Por isso a prova tira as marcas de sessão de TESTE (padrão exato remote-test-remote-mbp-<n>.stop) ANTES das pré-condições, tolera a marca logo depois do stop e a remove na
+           limpeza; qualquer outro arquivo de run/ continua sendo acusado.
 
 CÓDIGOS  0 tudo passou · 1 alguma prova reprovou, ou recusei instalar (config do wrapper alheia/ilegível, builder ou verify falhou) · 2 uso · 3 não consegui começar (pré-condição: MBP não livre, tmux aberto ou sem resposta) · 4 interrompida: o Athos voltou ao MBP (nada mais foi medido; a sessão é parada)
 CONFIGURAÇÃO (ambiente)  MBP_PROOF_SSH (athos@athoss-macbook-pro, o nome do Tailscale; sem a variável, `e2e` e `install --apply` — só quem conecta — perguntam ao mbp-host.sh, que troca pela LAN .local só se ela responder e o Tailscale não; `plan` e `install` sem --apply não sondam a rede e mostram o nome do Tailscale) · MBP_PROOF_HOME (/Users/athos: o home no MBP) · MBP_PROOF_SESSION (remote-test-remote-mbp-1) ·
@@ -113,6 +122,12 @@ CLAUDE_BIN = os.environ.get("MBP_PROOF_CLAUDE") or MHOME + "/.local/bin/claude" 
 TOOLS = ("bd", "gc", "gate-done")  # os que a sessão tem de resolver para o atalho; `dolt` tem de ser recusado por ele (ou nem existir)
 WRAPPER_CFG = os.path.join(MINI_HOME, ".gastown", "remote-shim-mbp.json")
 SESSION_RE = re.compile(r"remote-test-remote-mbp-[0-9]{1,3}")
+# A marca que o provider deixa em run/ quando uma sessão de TESTE para (ga-0k82lw: o stop grava `<nome>.stop`, o start seguinte do mesmo nome a apaga com `rm -f`, o stop poda as de > 24 h): não é
+# resíduo de sessão nem de lançador, é contrato do provider. A prova a tolera onde olha run/ e a REMOVE ao limpar (só estas, só de nome de teste: nunca outro arquivo de run/).
+STOP_RX = r"remote-test-remote-mbp-[0-9]{1,3}\.stop"
+STOP_RE = re.compile(STOP_RX)
+AGENT_PFX = "com.gascity.remote-session."  # o prefixo FIXO dos labels do agente do domínio gráfico (scripts/gc-session-ssh, AGENT_PFX); label = prefixo + nome da sessão
+MULTI = ("remote-test-remote-mbp-91", "remote-test-remote-mbp-92")  # as duas sessões LEVES de (g), fora do nome da sessão da prova (a 1ª, a que roda o claude) e dentro do SESSION_RE e do teto (cap 2)
 BEAD_RE = re.compile(r"[a-z]{2,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,3}")
 MARK, NMARK = "E2E-42-OK", "NUDGE-25-OK"  # o prompt só traz `$((6*7))`/`$((5*5))`: ver o número na tela quer dizer que o comando RODOU, não que o texto foi ecoado
 DIALOGS = ("trust this folder", "Yes, I trust", "Bypass Permissions", "Enter to confirm", "Choose the text style", "Security notes", "Do you want to proceed",
@@ -183,9 +198,10 @@ def resolution_verdict(out, run: str, shimbin: str, home: str) -> tuple:
 
 
 def host_block() -> dict:
-    """O bloco `mbp` de session-ssh.json que a prova usa (a config VIVA só tem o servidor; a do MBP é decisão da fatia 3 e das janelas do engine)."""
+    """O bloco `mbp` de session-ssh.json que a prova usa (a config VIVA só tem o servidor; a do MBP é decisão da fatia 3 e das janelas do engine).
+    `gui_agent: true` (ga-w7qwl1.2.4): host que dorme EXIGE (ga-w7qwl1.1.8): sem ele o provider recusa o start (o tmux nasceria no ssh e o claude, deslogado)."""
     return {"ssh": SSH_TARGET, "cap": 2, "remote_root": BUNDLE, "remote_home": MHOME, "mini_home": MINI_HOME, "path_extra": PATHX,
-            "presence_gate": True, "sleeps": True, "session_env": {"path": SESSION_PATH, "claude": CLAUDE_BIN},
+            "presence_gate": True, "sleeps": True, "gui_agent": True, "session_env": {"path": SESSION_PATH, "claude": CLAUDE_BIN},
             "shim": {"spool_dir": SPOOL, "wrapper_config": WRAPPER_CFG, "idle_exit_s": 90, "poll_s": 2}}
 
 
@@ -209,6 +225,27 @@ def start_request(bead: str, model: str, run: str, workdir: str) -> dict:
     env.update(GC_SESSION_ORIGIN="ephemeral", GC_CITY=CITY, GC_CITY_PATH=CITY, LANG="en_US.UTF-8", TERM="xterm-256color")
     return {"command": cmd, "work_dir": workdir, "env": env, "prompt_flag": "",
             "prompt_suffix": shlex.quote(PROMPT.format(bead=bead, name=SESSION, run=run, measure=measure_cmd(run)))}
+
+
+def light_request(name: str, workdir: str) -> dict:
+    """Pedido de start de uma sessão LEVE de (g): só um `sleep` (nada de claude nem de login de API). Serve para provar o que o tmux e o agente do domínio gráfico fazem com
+    duas sessões abertas sem pesar no MBP; o provider a trata como qualquer sessão de teste (mesmo agente, mesmo socket, mesmo teto)."""
+    env = {k: name for k in ("GC_ALIAS", "GC_AGENT", "GC_SESSION_NAME", "GC_TEMPLATE")}
+    env.update(GC_SESSION_ORIGIN="ephemeral", GC_CITY=CITY, GC_CITY_PATH=CITY, LANG="en_US.UTF-8", TERM="xterm-256color")
+    return {"command": "sleep 600", "work_dir": workdir, "env": env, "prompt_flag": "", "prompt_suffix": ""}
+
+
+def tmux_names(t) -> object:
+    """Os nomes de sessão do servidor do tmux a partir do {rc, out, err} do `list-sessions`: o conjunto (vazio quando o texto de "sem servidor"/"sem socket" diz que não há servidor)
+    ou None = NÃO SEI (rc ausente, erro de versão, permissão, timeout). Nunca devolve o conjunto vazio por falha: quem compara trata None como reprovação."""
+    if not isinstance(t, dict) or not isinstance(t.get("rc"), int) or not isinstance(t.get("out"), str):
+        return None
+    if t["rc"] == 0:
+        return {l for l in t["out"].split("\n") if l.strip()}
+    err = str(t.get("err"))
+    if "no server running" in err or ("error connecting to" in err and "(No such file or directory)" in err):
+        return set()
+    return None
 
 
 def new_run() -> str:
@@ -527,6 +564,17 @@ try:
         res["removed"].append("~/.claude.json projects[%s]" % wd)
 except (OSError, ValueError) as e:
     res["claude_json_error"] = str(e)[:120]
+# as marcas <nome>.stop das sessões de teste (contrato do provider): só elas saem de run/, nenhum outro arquivo
+# vazio (sem run/ ou sem marca) → nada a remover; falhou (não listou ou não apagou) → errors, e `ok` fica falso: "não consegui limpar" nunca vira "limpo"
+try:
+    for m in sorted(os.listdir(C["bundle"] + "/run")):
+        if re.fullmatch(C["stop_rx"], m):
+            os.unlink(C["bundle"] + "/run/" + m)
+            res["removed"].append("run/" + m + " (marca do provider)")
+except FileNotFoundError:
+    pass
+except OSError as e:
+    res.setdefault("errors", []).append("run/ marcas: %s" % e.strerror)
 for d, flag in ((C["proofs"], C["proofs_new"]), (C["bundle"] + "/run", C["run_new"])):
     try:
         if flag and os.path.isdir(d) and not os.listdir(d):
@@ -544,6 +592,70 @@ if C["socket_new"] and os.path.exists(sock):
 res["ok"] = not os.path.lexists(wd) and "errors" not in res and "claude_json_error" not in res
 print(json.dumps(res))
 '''
+
+# As marcas <nome>.stop de sessão de teste que o provider deixou em run/ de uma rodada anterior. O `verify` do bundle conta QUALQUER arquivo sob a pasta como "sobra", então a rodada seguinte
+# recusaria começar por uma marca que o próprio provider apaga no próximo start. Só estas saem (padrão exato, só de nome de teste); outro arquivo de run/ fica e a pré-condição o acusa.
+MARKS = r"""
+import json, os, re, sys
+C = json.loads(sys.argv[1])
+run = C["run"]
+# vazio (sem run/) → nada a remover; falhou (não listou ou não apagou) → a exceção sai com rc != 0 e a prova NÃO começa: "não sei se há marca" não é "limpo"
+try:
+    names = sorted(os.listdir(run))
+except FileNotFoundError:
+    names = []
+removed = []
+for n in names:
+    if re.fullmatch(C["stop_rx"], n):
+        os.unlink(run + "/" + n)
+        removed.append(n)
+print(json.dumps({"removed": removed}))
+"""
+
+# (f) o agente do domínio gráfico (ga-w7qwl1.1.8), lido NO MBP enquanto a sessão vive. O que prova que o `claude auth status` rodou LÁ DENTRO é o veredito que o próprio agente grava (`ok` só com
+# loggedIn true e rc 0); o `claude auth status` pelo ssh (Background) é só informativo: é o contraste que justifica o agente. Cada leitura que não responde vira None, nunca "ausente".
+GUI = r"""
+import json, os, re, subprocess, sys
+C = json.loads(sys.argv[1])
+u = os.getuid()
+label = C["label"]
+def sh(a):  # (rc, stdout); rc None = não rodou (OSError/timeout): o chamador reprova, nunca assume
+    try:
+        r = subprocess.run(a, capture_output=True, text=True, timeout=25, stdin=subprocess.DEVNULL)
+        return r.returncode, r.stdout
+    except (OSError, subprocess.SubprocessError):
+        return None, ""
+out = {"label": label, "loaded_rc": sh(["launchctl", "print", "gui/%d/%s" % (u, label)])[0]}
+# vazio (sem arquivo) → res None: o chamador reprova ("sem veredito do agente"); falhou (ilegível) → res None também
+try:
+    with open("%s/%s.agent.res" % (C["run"], label)) as f:
+        out["res"] = f.read().strip()
+except OSError:
+    out["res"] = None
+out["plist_run"] = os.path.isfile("%s/%s.plist" % (C["run"], label))
+out["plist_home"] = os.path.lexists("%s/Library/LaunchAgents/%s.plist" % (C["home"], label))
+rc, o = sh([C["claude"], "auth", "status"])
+lt, lf = len(re.findall(r'"loggedIn"\s*:\s*true', o)), len(re.findall(r'"loggedIn"\s*:\s*false', o))
+out["ssh_auth"] = {"rc": rc, "state": "true" if rc == 0 and lt and not lf else "false" if lf and not lt else "ilegivel"}
+print(json.dumps(out))
+"""
+
+# (g) o servidor do tmux e os agentes, lidos NO MBP com várias sessões de teste abertas. tmux e launchctl que não respondem viram rc None: o chamador reprova, nunca "sessão ausente".
+MSNAP = r"""
+import json, os, subprocess, sys
+C = json.loads(sys.argv[1])
+u = os.getuid()
+env = dict(os.environ, PATH=":".join(C["path_extra"]) + ":" + os.environ.get("PATH", ""))
+def run(a):
+    try:
+        r = subprocess.run(a, capture_output=True, text=True, timeout=15, env=env, stdin=subprocess.DEVNULL)
+        return {"rc": r.returncode, "out": r.stdout.strip(), "err": r.stderr.strip()[:200]}
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"rc": None, "out": "", "err": "%s: %s" % (type(e).__name__, e)}
+out = {"tmux": run(["tmux", "-L", C["socket"], "list-sessions", "-F", "#{session_name}"])}
+out["labels"] = {l: run(["launchctl", "print", "gui/%d/%s" % (u, l)])["rc"] for l in C["labels"]}
+print(json.dumps(out))
+"""
 
 SWEEP = r'''
 import base64, errno, glob, json, os, re, sys
@@ -690,6 +802,7 @@ class Proof:
             json.dump({"default_host": HOST, "hosts": {HOST: host_block()}}, f, indent=1)
         self.env = dict(os.environ, GC_SSH_CONFIG=self.cfg_path, GC_EXEC_STATE_DIR=f"{base}/state", GC_SSH_HOST=HOST)
         self.started, self.paused_by_us, self.url, self.pre, self.sha, self.head0 = False, False, "", None, "", ""
+        self.interrupted = False  # o Athos voltou (Aborted): nada mais é aberto no MBP, nem as sessões leves de (g)
         self.created = {"proofs_new": False, "run_new": False, "socket_new": False}
         self.say(f"mbp-proof {self.run} · sessão {SESSION} · log {path} · config do provider {self.cfg_path}")
 
@@ -754,10 +867,22 @@ class Proof:
             return
         raise Aborted(f"antes de {stage}: {why}")
 
+    def clear_markers(self) -> bool:
+        """Tira de run/ as marcas .stop de sessão de teste de rodadas anteriores (ver MARKS). Só depois de o gate dizer que o MBP está livre."""
+        m = self.rpy(MARKS, {"run": BUNDLE + "/run", "stop_rx": STOP_RX})
+        if "_erro" in m or not isinstance(m.get("removed"), list):
+            self.say(f"não consegui limpar as marcas .stop do provider em run/ no MBP: {m.get('_erro', m)}")
+            return False
+        if m["removed"]:
+            self.say(f"marcas .stop do provider de rodadas anteriores removidas de run/: {m['removed']}")
+        return True
+
     def preconditions(self) -> bool:
         ok, why = self.free()
         self.say(f"gate do MBP (a regra do Athos, a mesma do start): {'livre' if ok else 'NÃO livre'} — {why}")
         if not ok:
+            return False
+        if not self.clear_markers():
             return False
         s = self.snap()
         if "_erro" in s:
@@ -781,7 +906,7 @@ class Proof:
             bad.append("já existe uma pausa em gt-remote/PAUSE (o gate deveria ter recusado)")
         if s["proofs"]:
             bad.append("sobrou algo em gt-remote/proof: " + ",".join(s["proofs"]))
-        if s["run_dir"]:
+        if s["run_dir"]:  # as marcas .stop de sessão de teste já foram tiradas por clear_markers(); o que sobra em run/ é de outra sessão
             bad.append("gt-remote/bundle/run não está vazia: " + ",".join(s["run_dir"]))
         if not s["claude_json"]["ok"]:
             bad.append("~/.claude.json ilegível: o claude do MBP nunca rodou aqui?")
@@ -990,6 +1115,76 @@ class Proof:
         ok2, _, why2 = judge_tree(rows0, t2.get("rows") or [], t0["watcher"])
         self.check("(b) sem a pausa o rebaixamento NÃO volta a subir (continua >= 19)", ok2, why2)
 
+    def gui_domain(self) -> None:
+        """(f) `claude auth status` no domínio gráfico (ga-w7qwl1.1.8): a sessão nasceu num LaunchAgent de gui/<uid> (o login do claude está no Keychain da sessão gráfica; pelo ssh dá loggedIn false).
+        Evidência lida NO MBP com a sessão de pé: agente carregado, o veredito que o PRÓPRIO agente gravou (`ok` = loggedIn true com rc 0, medido lá dentro), o plist em run/ e NÃO em ~/Library/LaunchAgents
+        (esse sobreviveria a reboot e logout). Leitura que não responde reprova; o `auth status` pelo ssh é só contraste, dito no log."""
+        label = AGENT_PFX + SESSION
+        name = "(f) a sessão nasceu num LaunchAgent do domínio gráfico: agente carregado em gui/<uid>, veredito do agente `ok` (claude auth status com loggedIn true LÁ DENTRO), plist em run/ e fora de ~/Library/LaunchAgents"
+        g = self.rpy(GUI, {"label": label, "run": BUNDLE + "/run", "home": MHOME, "claude": CLAUDE_BIN})
+        if "_erro" in g:
+            self.check(name, False, "não consegui ler o estado do agente no MBP: " + g["_erro"])
+            return
+        ok = g.get("loaded_rc") == 0 and g.get("res") == "ok" and g.get("plist_run") is True and g.get("plist_home") is False
+        self.check(name, ok, f"launchctl print gui/<uid>/{label} rc {g.get('loaded_rc')} · veredito {g.get('res')!r} · plist em run/ {g.get('plist_run')} · plist em ~/Library/LaunchAgents {g.get('plist_home')}")
+        self.say(f"contraste (informativo): `claude auth status` pelo ssh, fora do domínio gráfico = {g.get('ssh_auth')}")
+
+    def multi(self) -> None:
+        """(g) duas sessões abertas, parar a 1ª, a 2ª vive (ga-w7qwl1.2.4): o tmux do socket nasce DENTRO do job do agente da 1ª sessão, e o bootout desse agente não pode levar o servidor junto.
+        Duas sessões LEVES (um `sleep`: não chamam a API, mas o agente do domínio gráfico exige loggedIn true para abrir qualquer sessão), abertas pelo provider; o estado é lido por ssh, direto no MBP, e não pelo que o provider diz de si. Roda depois de a sessão da prova
+        sair (o teto do host é 2). As sessões abertas aqui são paradas em TODO caminho."""
+        a, b = MULTI
+        la, lb = AGENT_PFX + a, AGENT_PFX + b
+        if SESSION in MULTI:
+            self.check("(g) 2 sessões abertas, parar a 1ª, a 2ª vive", False, f"MBP_PROOF_SESSION {SESSION} colide com as sessões leves de (g) {MULTI}")
+            return
+        try:
+            self.still_free("abrir as duas sessões leves de (g)")
+        except Aborted as e:
+            self.say(f"(g) não rodou: {e}")
+            return
+        opened = []
+
+        def snap() -> dict:
+            return self.rpy(MSNAP, {"path_extra": PATHX, "socket": SOCKET, "labels": [la, lb]})
+
+        def absent(rc) -> bool:  # `launchctl print` 113 = ausente, 112 = nem o domínio gui existe (nada vive nele); None/outro = NÃO provado
+            return rc in (112, 113)
+        try:
+            for n in (a, b):
+                opened.append(n)  # o provider marca o registro antes do ssh do start: se falhar no meio, o stop do fim limpa
+                p = self.prov("start", n, stdin=json.dumps(light_request(n, self.wd)), timeout=120)
+                if not self.check(f"(g) start da sessão leve {n} pelo provider", p.returncode == 0, self.out(p)[:300]):
+                    return
+            s1 = snap()
+            names1 = tmux_names(s1.get("tmux")) if "_erro" not in s1 else None
+            self.check("(g) com as 2 sessões abertas o servidor do tmux lista as duas e os dois agentes estão carregados em gui/<uid>",
+                       names1 == {a, b} and s1.get("labels", {}).get(la) == 0 and s1.get("labels", {}).get(lb) == 0,
+                       s1["_erro"] if "_erro" in s1 else f"sessões {sorted(names1) if names1 is not None else 'ilegível'} · labels {s1.get('labels')}")
+            p = self.prov("stop", a, timeout=120)
+            if p.returncode == 0:
+                opened.remove(a)  # parada de fato; se falhou, o `finally` tenta de novo
+            self.check(f"(g) stop da 1ª sessão ({a}) pelo provider (o provider só sai 0 com o agente dela PROVADO ausente)", p.returncode == 0, self.out(p)[:300])
+            s2 = snap()
+            names2 = tmux_names(s2.get("tmux")) if "_erro" not in s2 else None
+            run_b = self.out(self.prov("is-running", b))
+            self.check("(g) parar a 1ª NÃO derruba a 2ª: o servidor do tmux (nascido no agente da 1ª) sobreviveu ao bootout dele, a 2ª sessão está de pé e o agente dela segue carregado; o da 1ª sumiu",
+                       names2 == {b} and run_b == "true" and s2.get("labels", {}).get(lb) == 0 and absent(s2.get("labels", {}).get(la)),
+                       s2["_erro"] if "_erro" in s2 else f"sessões {sorted(names2) if names2 is not None else 'ilegível'} · is-running {b} {run_b!r} · labels {s2.get('labels')}")
+        except (OSError, subprocess.SubprocessError) as e:
+            self.check("(g) 2 sessões abertas, parar a 1ª, a 2ª vive: execução sem interrupção", False, f"{type(e).__name__}: {e}")
+        finally:
+            for n in list(opened):  # o que sobrou aberto é parado aqui (stop é idempotente no provider); falha ao parar reprova, nunca fica calada
+                try:
+                    p = self.prov("stop", n, timeout=120)
+                    self.check(f"(g) sessão leve {n} parada pelo provider", p.returncode == 0, self.out(p)[:200])
+                except (OSError, subprocess.SubprocessError) as e:
+                    self.check(f"(g) sessão leve {n} parada pelo provider", False, f"não consegui parar: {type(e).__name__}: {e}")
+            s3 = snap()
+            names3 = tmux_names(s3.get("tmux")) if "_erro" not in s3 else None
+            self.check("(g) depois dos stops: nenhuma sessão, nenhum servidor do tmux respondendo e nenhum dos dois agentes carregado", names3 == set() and absent(s3.get("labels", {}).get(la)) and absent(s3.get("labels", {}).get(lb)),
+                       s3["_erro"] if "_erro" in s3 else f"sessões {sorted(names3) if names3 is not None else 'ilegível'} · labels {s3.get('labels')}")
+
     def finish(self, aborted: str = "") -> None:
         if self.paused_by_us:
             off = self.rpy(PAUSE_PY, {"pause": PAUSE, "mark": f"origem=mbp-proof:{self.run}", "mode": "off"})
@@ -1006,20 +1201,22 @@ class Proof:
                 self.check("(a) li o estado do MBP depois do stop", False, s["_erro"])
             else:
                 # o tmux deixa o ARQUIVO do socket quando a última sessão morre e o servidor sai (medido, 3.7c): sem servidor respondendo ele é inerte e uma sessão nova sobe por cima
-                clean = (tmux_state(s) == "livre" and s["run_dir"] in (None, []) and s["procs"] == [])
+                clean = (tmux_state(s) == "livre" and [x for x in (s["run_dir"] or []) if not STOP_RE.fullmatch(x)] == [] and s["procs"] == [])  # a marca .stop do provider não é lançador: a limpeza a remove
                 self.check("(a) o stop deixa o MBP limpo: nenhuma sessão e nenhum servidor do tmux respondendo, sem arquivo do lançador em run/, nenhum processo da sessão nem o vigia", clean,
                            f"tmux {s['tmux']} · socket {s['tmux_socket']} · run {s['run_dir']} · processos {s['procs']}")
                 sw = self.rpy(SWEEP, {"roots": [self.wd, SPOOL, SHIMBIN, BUNDLE], "globs": [f"{MHOME}/.claude/projects/*{self.run}*"], "secret_rx": SECRET_RX, "forbidden": FORBIDDEN,
                                     "skip": {f"{BUNDLE}/manifest.json": [SECRET_KV]}})
                 self.check("(d) varredura (antes de apagar a pasta de teste): nenhum segredo e nenhum arquivo de dado/credencial no clone, no spool, no atalho, no bundle nem na transcrição da sessão",
                            "_erro" not in sw and not sw["hits"] and not sw["forbidden"] and not sw["unverified"], f"{sw.get('scanned')} arquivos lidos · segredos {sw.get('hits')} · proibidos {sw.get('forbidden')} · sem verificar {sw.get('unverified')}" if "_erro" not in sw else sw["_erro"])
+        if self.started and not self.interrupted:  # (g) só depois de a prova ter chegado ao start (`started` = pré-condições, atalho e clone passaram; `pre` já é gravado ANTES de elas serem julgadas, então não serve) e com o Athos fora; a sessão da prova já saiu, então o teto de 2 está livre
+            self.multi()
         if self.a.delete_branch and self.url and self.sha:
             d = self.rsh(f"cd {shlex.quote(self.wd)} && git push origin --delete worker/{self.run}", timeout=120)
             self.say(f"branch worker/{self.run} apagado no origin: rc {d.returncode} {(d.stdout + d.stderr).decode('utf-8', 'replace').strip()[:160]}")
         q = subprocess.run([sys.executable, "-I", PUMP, "stop", "--host", HOST], capture_output=True, env=self.env, timeout=60)
         self.say(f"puxador do mini parado: rc {q.returncode} {self.out(q)[:120]}")
         if not self.a.keep and self.pre is not None:
-            c = self.rpy(CLEAN, {"workdir": self.wd, "proofs": PROOFS, "home": MHOME, "bundle": BUNDLE, "socket": SOCKET, **self.created})
+            c = self.rpy(CLEAN, {"workdir": self.wd, "proofs": PROOFS, "home": MHOME, "bundle": BUNDLE, "socket": SOCKET, "stop_rx": STOP_RX, **self.created})
             self.say(f"limpeza no MBP: {json.dumps(c, ensure_ascii=False)[:400]}")
             self.check("(a) pasta de teste, marca de confiança no ~/.claude.json e diretórios criados pela prova removidos", bool(c.get("ok")), json.dumps(c, ensure_ascii=False)[:200])
             post = self.snap(self.wd)
@@ -1061,6 +1258,7 @@ class Proof:
                 return 3
             self.still_free("abrir a sessão")
             if self.start():
+                self.gui_domain()
                 screen = self.watch(MARK, "(e) a sessão rodou `claude` com o --settings do bundle até os 6 passos", self.a.timeout)
                 if MARK in screen:
                     self.check("(e) a sessão rodou `claude` com o --settings do bundle e executou o prompt de partida até o fim", True)
@@ -1071,6 +1269,7 @@ class Proof:
                 self.say("--- tela final ---\n" + self.out(self.prov("peek", SESSION, "60"))[-2000:])
         except Aborted as e:
             self.say(f"INTERROMPIDA: o MBP deixou de estar livre — {e}. Nada mais é medido; a sessão é parada.")
+            self.interrupted = True
             code = 4
         except (OSError, subprocess.SubprocessError) as e:
             self.check("execução até o fim sem interrupção", False, f"{type(e).__name__}: {e}")

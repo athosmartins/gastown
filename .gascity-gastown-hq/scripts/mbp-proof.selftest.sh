@@ -9,7 +9,7 @@
 # GRUPOS: unit — host padrão do MBP sem MBP_PROOF_SSH (ga-bmmxka: Tailscale, LAN só com a porta 22 respondendo, saída ilegível = Tailscale, a variável vale como está), judge_tree (todo processo com folga tem de ser rebaixado, e ao menos um tinha folga), PAUSE/CLEAN/SWEEP rodados de verdade, pedido de start, identidade, padrões de segredo ·
 #   cli — argumento com cara de comando, sessão real, install sem --apply (nada conecta), plan contra o dry-run do provider (pula sem scripts/gc-session-ssh, p.ex. no nó Linux) ·
 #   install — instalação com o builder real: bundle conferido LÁ, run/ preservada, cliente + links + config, spool 0700, nada em ~/.claude nem ~/.ssh, config do wrapper diferente = não sobrescreve, transferência adulterada = reprova sem trocar, ssh fora / MBP não livre = 3 ·
-#   e2e — a prova inteira (a–e) contra o MBP falso, com modos de falha: cada prova reprova sozinha, o diálogo NUNCA é respondido, a sessão é parada em todo caminho, a pausa do Athos nunca é removida por nós, e o MBP volta ao que era (arquivos, ~/.claude.json, ~/.ssh, spool, bundle)
+#   e2e — a prova inteira (a–g) contra o MBP falso (o provider falso recusa o que o de verdade recusa: host que dorme sem gui_agent, teto de 2 sessões; deixa a marca .stop em run/; (f) o agente do domínio gráfico e (g) 2 sessões, parar a 1ª, a 2ª vive), com modos de falha: cada prova reprova sozinha, o diálogo NUNCA é respondido, a sessão é parada em todo caminho, a pausa do Athos nunca é removida por nós, e o MBP volta ao que era (arquivos, ~/.claude.json, ~/.ssh, spool, bundle)
 # CONTROLE NEGATIVO: cada guarda é trocada numa cópia (python, uma ocorrência exata) e os casos que a cobrem TÊM que passar a falhar.
 # VARIÁVEIS: MBPT_UNDER_TEST (script a testar) · MBPT_ONLY (grupos separados por vírgula; ou --only=a,b) · MBPT_CASES (casos; ou --cases=a,b) · MBPT_NO_MUTANTS=1 (ou --no-mutants) · MBPT_DEBUG=1 (ou --debug: mostra a saída do driver em cada e2e)
 # O QUE NÃO PROVA: o MBP de verdade (macOS, tmux, claude, a biblioteca de presença, o git/ssh com a credencial dele) — isso é o `e2e` ao vivo. Aqui o vigia falso olha o arquivo PAUSE e dá `renice`; a árvore de processos, o ps, o nice e o julgamento são reais.
@@ -65,6 +65,7 @@ shift
 cmd=$1
 if [ -n "${FAKE_UPLOAD_FAIL:-}" ]; then case $cmd in *"cat > "*"remote-bundle-build.py"*) cat > /dev/null; echo "cat: cannot write: Read-only file system" >&2; exit 1;; esac; fi
 if [ "${FAKE_MODE:-}" = snapfail ]; then case $cmd in *proofs_new*) touch "$FAKE_STATE/cleaned";; *'"plib"'*) [ ! -e "$FAKE_STATE/cleaned" ] || { cat > /dev/null; echo "snap: boom" >&2; exit 1; };; esac; fi  # a leitura DEPOIS da limpeza falha
+[ "${FAKE_MODE:-}" != markfail ] || case $cmd in *'"stop_rx"'*'"workdir"'*|*'"workdir"'*'"stop_rx"'*) ;; *'"stop_rx"'*) cat > /dev/null; echo "marks: boom" >&2; exit 1;; esac  # só a leitura que tira as marcas .stop de rodadas anteriores falha: o resto do ssh responde
 [ "${FAKE_MODE:-}" != measurefail ] || case $cmd in *'"marker"'*) cat > /dev/null; echo "measure: boom" >&2; exit 1;; esac  # a leitura da transcrição (a medição de dentro da sessão) falha
 [ "${FAKE_MODE:-}" != lostpause ] || case $cmd in *'"mode": "on"'*) HOME="$SRV" TMUX_TMPDIR="$SRV/tmp" ON_MBP=1 PATH="$SRV/fakebin:/usr/bin:/bin" sh -c "$cmd" > /dev/null; echo "client_loop: send disconnect: Broken pipe" >&2; exit 255;; esac  # a pausa É criada no MBP, mas a resposta se perde
 HOME="$SRV" TMUX_TMPDIR="$SRV/tmp" ON_MBP=1 PATH="$SRV/fakebin:/usr/bin:/bin" sh -c "$cmd"; rc=$?
@@ -128,7 +129,10 @@ EOF
 cat > "$T/fakeprov" <<'EOF'
 #!/bin/bash
 S="$FAKE_STATE"; echo "$*" >> "$S/provcalls"; op=${1:-}; shift
-NAME=remote-test-remote-mbp-1; G="$SRV/gt-remote"; BUNDLE="$G/bundle"; PAUSE="$G/PAUSE"; SOCK="$SRV/tmp/tmux-$(id -u)/gc-remote"; mode=${FAKE_MODE:-ok}
+S1=remote-test-remote-mbp-1; NAME=${1:-$S1}; G="$SRV/gt-remote"; BUNDLE="$G/bundle"; PAUSE="$G/PAUSE"; SOCK="$SRV/tmp/tmux-$(id -u)/gc-remote"; mode=${FAKE_MODE:-ok}
+# estado por sessão: a da prova (S1) usa os nomes de sempre (running, panepid, screen); as sessões leves de (g) levam o nome no sufixo. O agente do domínio gráfico (agent[.nome]) é carregado no start e sai no stop, como no provider.
+sx=; [ "$NAME" = "$S1" ] || sx=".$NAME"; LABEL="com.gascity.remote-session.$NAME"
+nrun() { ls "$S"/running "$S"/running.* 2> /dev/null | wc -l | tr -d ' '; }  # sessões abertas agora (o teto do host é 2, como no provider)
 kids() { ps -axo pid=,ppid= | awk -v r="$1" '{p[$1]=$2} END{for(i in p){q=i;n=0;while(q>1&&n<64){if(q==r){print i;break};q=p[q];n++}}}'; }
 killtree() { local k; k=$(kids "$1"); [ -n "$k" ] || return 0; kill -TERM $k 2>/dev/null; sleep 0.3; kill -KILL $k 2>/dev/null; return 0; }
 measure() {  # o passo 1 do prompt: o "modelo" copia o comando do pedido de start, a ferramenta Bash o roda (bash aqui, zsh no MBP) e o claude grava o uso e o resultado na transcrição
@@ -216,9 +220,40 @@ case "$op" in
     esac;;
   start)
     req=$(cat); [ $mode != startfail ] || { echo "gc-session-ssh: start recusado: falha falsa" >&2; exit 1; }
+    # as mesmas recusas do provider de verdade (scripts/gc-session-ssh:431-438, ga-w7qwl1.1.8): sem isto o falso aceitava um bloco de host que o real recusa e o e2e "passava" contra uma config que nunca abriria sessão no MBP
+    guierr=$(python3 -I -c '
+import json, os, sys
+try:
+    h = json.load(open(os.environ["GC_SSH_CONFIG"]))["hosts"]["mbp"]
+except (OSError, ValueError, KeyError) as e:
+    print(f"config do host ilegível: {type(e).__name__}"); sys.exit(0)  # ilegível NÃO é "sem erro": o falso recusa (inerte)
+if "gui_agent" in h and not isinstance(h["gui_agent"], bool):
+    print("host mbp: gui_agent tem que ser true ou false")
+elif h.get("sleeps") and not h.get("gui_agent", False):
+    print("host mbp: gui_agent é obrigatório num host que dorme (notebook): sem ele o tmux nasce no ssh e o claude da sessão fica deslogado (Keychain)")
+elif h.get("gui_agent") and not (h.get("session_env") or {}).get("claude"):
+    print("host mbp: gui_agent exige session_env.claude")')
+    [ -z "$guierr" ] || { echo "gc-session-ssh start: $guierr" >&2; exit 1; }
+    n=$(nrun); [ "$n" -lt 2 ] || { echo "host mbp está no teto: $n de 2 sessões" >&2; exit 10; }  # o teto do provider: com a sessão da prova aberta não cabem as duas leves de (g)
+    mkdir -p "$BUNDLE/run"; rm -f "$BUNDLE/run/$NAME.stop"  # o start de verdade apaga a marca do stop anterior antes de preparar
+    gm=$mode; [ "$NAME" = "$S1" ] || gm=ok  # os modos de falha do agente valem para a sessão da prova (f); as leves de (g) têm os seus
+    agent_up() {  # o agente do domínio gráfico: carregado, com o veredito `ok` e o plist em run/ (e NÃO em ~/Library/LaunchAgents)
+      [ $gm = notloaded ] || touch "$S/agent$sx"
+      case $gm in nores) ;; badres) echo "ilegivel rc=1" > "$BUNDLE/run/$LABEL.agent.res";; *) echo ok > "$BUNDLE/run/$LABEL.agent.res";; esac
+      : > "$BUNDLE/run/$LABEL.plist"
+      [ $gm != plisthome ] || { mkdir -p "$SRV/Library/LaunchAgents"; : > "$SRV/Library/LaunchAgents/$LABEL.plist"; }
+    }
+    if [ "$NAME" != "$S1" ]; then  # sessão leve de (g): só um sleep, sem claude e sem login de API
+      [ $mode != startfail2 ] || [ "$NAME" != remote-test-remote-mbp-92 ] || { echo "gc-session-ssh: start recusado: falha falsa (2ª sessão leve)" >&2; exit 1; }
+      mkdir -p "$(dirname "$SOCK")"; : > "$SOCK"
+      nohup sh -c 'sleep 6007; : sessao-leve' > /dev/null 2>&1 < /dev/null &
+      echo $! > "$S/panepid$sx"; touch "$S/running$sx"; agent_up; echo "$NAME" >> "$S/order"
+      [ $mode != tmuxbad ] || touch "$S/tmuxbad"  # a partir daqui o tmux responde com erro de versão: o estado das sessões vira "não sei"
+      exit 0
+    fi
     printf '%s' "$req" > "$S/startreq"
     wd=$(printf '%s' "$req" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["work_dir"])')
-    mkdir -p "$BUNDLE/run" "$(dirname "$SOCK")"; : > "$SOCK"; : > "$S/screen"; touch "$S/running" "$S/started"
+    mkdir -p "$BUNDLE/run" "$(dirname "$SOCK")"; : > "$SOCK"; : > "$S/screen"; touch "$S/running" "$S/started"; agent_up; echo "$NAME" >> "$S/order"
     L="$BUNDLE/run/$NAME.sh"; nw=${FAKE_NOWATCH:-}; kc=${FAKE_KILLCORE:-}   # os modos do vigia vêm do MODO do caso (fail1 só define FAKE_MODE)
     [ $mode != nowatch ] || nw=1; [ $mode != killcore ] || kc=1
     cat > "$L" <<EOS
@@ -231,16 +266,29 @@ EOS
     echo $! > "$S/panepid"
     ( agent "$wd" "$(basename "$wd")" ) > /dev/null 2>&1 < /dev/null &
     ;;
-  peek) cat "$S/screen" 2>/dev/null;;
+  peek) cat "$S/screen$sx" 2>/dev/null;;
   nudge) cat > "$S/nudged"; [ $mode != nonudge ] || { echo "nudge: falha falsa" >&2; exit 1; }
          [ $mode = nonudgeanswer ] || { ( sleep 0.4; echo "NUDGE-25-OK" >> "$S/screen" ) > /dev/null 2>&1 < /dev/null & };;
-  is-running) if [ -f "$S/running" ] && kill -0 "$(cat "$S/panepid")" 2>/dev/null; then echo true; else echo false; fi;;
-  list-running) [ ! -f "$S/running" ] || echo "$NAME";;
+  is-running) if [ -f "$S/running$sx" ] && kill -0 "$(cat "$S/panepid$sx")" 2>/dev/null; then echo true; else echo false; fi;;
+  list-running) for f in "$S"/running "$S"/running.*; do [ -f "$f" ] || continue; case $f in */running) echo "$S1";; *) echo "${f##*/running.}";; esac; done;;
   stop) [ $mode != stopfail ] || { echo "stop: falha falsa" >&2; exit 1; }
-        if [ -f "$S/panepid" ] && [ $mode != leaveproc ] && [ $mode != stopfail ]; then killtree "$(cat "$S/panepid")"; fi
+        if [ -f "$S/panepid$sx" ] && [ $mode != leaveproc ] && [ $mode != stopfail ]; then killtree "$(cat "$S/panepid$sx")"; fi
+        # serverdies: o servidor do tmux nasceu no agente da 1ª sessão ABERTA; o bootout desse agente leva o servidor e as outras sessões junto (o defeito que (g) existe para pegar)
+        first=$(head -1 "$S/order" 2> /dev/null)
+        if [ $mode = serverdies ] && [ "$NAME" = "$first" ]; then
+          for o in $(grep -vxF "$NAME" "$S/order" 2> /dev/null); do
+            osx=; [ "$o" = "$S1" ] || osx=".$o"
+            [ ! -f "$S/panepid$osx" ] || killtree "$(cat "$S/panepid$osx")"
+            rm -f "$S/running$osx" "$S/agent$osx"
+          done
+        fi
+        grep -vxF "$NAME" "$S/order" > "$S/order.tmp" 2> /dev/null; mv -f "$S/order.tmp" "$S/order" 2> /dev/null
+        mkdir -p "$BUNDLE/run"; : > "$BUNDLE/run/$NAME.stop"   # a marca do provider (ga-0k82lw): o stop grava, o start seguinte do mesmo nome a apaga
+        # o agente sai com a sessão (bootout + apaga + prova); `agentleak` é o stop que deixa o agente da 1ª sessão leve carregado, com o provider dizendo 0
+        { [ $mode = agentleak ] && [ "$NAME" = remote-test-remote-mbp-91 ]; } || rm -f "$S/agent$sx" "$BUNDLE/run/$LABEL.agent.res" "$BUNDLE/run/$LABEL.plist"
         [ $mode = leavefile ] || rm -f "$BUNDLE/run/$NAME.sh"
         [ $mode != cleansock ] || rm -f "$SOCK"   # o tmux de verdade (medido, 3.7c) deixa o ARQUIVO do socket quando a última sessão morre e o servidor sai; `cleansock` é um stop que o remove
-        [ $mode = leavesession ] || rm -f "$S/running";;   # `leavesession`: o stop que NÃO derruba a sessão (o tmux ainda a lista)
+        [ $mode = leavesession ] || rm -f "$S/running$sx";;   # `leavesession`: o stop que NÃO derruba a sessão (o tmux ainda a lista)
 esac
 exit 0
 EOF
@@ -252,12 +300,26 @@ S="$FAKE_STATE"
 case "$1" in
   list-sessions)
     case "${FAKE_TMUX:-}" in mismatch) echo "protocol version mismatch (client 8, server 7)" >&2; exit 1;; nosock) echo "error connecting to /tmp/tmux-501/gc-remote (No such file or directory)" >&2; exit 1;; esac
-    if [ -f "$S/running" ]; then echo remote-test-remote-mbp-1; exit 0; fi; echo "no server running" >&2; exit 1;;
+    [ ! -e "$S/tmuxbad" ] || { echo "protocol version mismatch (client 8, server 7)" >&2; exit 1; }  # (g) com o estado do tmux ilegível: nunca "sem sessão"
+    names=; [ ! -f "$S/running" ] || names=remote-test-remote-mbp-1
+    for f in "$S"/running.*; do [ -f "$f" ] && names="$names ${f##*/running.}"; done
+    if [ -n "$names" ]; then for n in $names; do echo "$n"; done; exit 0; fi; echo "no server running" >&2; exit 1;;
   list-panes) if [ -f "$S/running" ]; then cat "$S/panepid"; exit 0; fi; echo "can't find session" >&2; exit 1;;
 esac
 exit 1
 EOF
-printf '#!/bin/sh\nexit 0\n' > "$T/fake/claude"
+printf '#!/bin/sh\n[ "$1 $2" != "auth status" ] || { echo "{\\"loggedIn\\": false}"; exit 0; }  # pelo ssh o claude do MBP está deslogado (o Keychain é da sessão gráfica)\nexit 0\n' > "$T/fake/claude"
+cat > "$T/fake/launchctl" <<'EOF'
+#!/bin/sh
+# o launchctl do "MBP": só `print gui/<uid>[/<label>]`. O agente de uma sessão está carregado se o estado dela tem agent[.nome] (o provider o carrega no start e o tira no stop); ausente = 113, como no macOS
+S="$FAKE_STATE"
+[ "${1:-}" = print ] || exit 2
+t=${2:-}; lab=${t#gui/*/}
+[ "$lab" != "$t" ] || exit 0
+n=${lab#com.gascity.remote-session.}; [ "$n" != "$lab" ] || exit 113
+if [ "$n" = remote-test-remote-mbp-1 ]; then [ -f "$S/agent" ] && exit 0; exit 113; fi
+[ -f "$S/agent.$n" ] && exit 0; exit 113
+EOF
 chmod +x "$T/bin/"* "$T/fakeprov" "$T/fake/"* "$T/fake-remote-shim.py"
 # origin de isca: tem dado de "lead" que NUNCA pode aparecer no MBP
 git init -q "$T/seed" 2>/dev/null; mkdir -p "$T/seed/data" "$T/seed/.beads"
@@ -276,7 +338,7 @@ export PATH="$T/bin:$PATH"
 
 srv_skeleton() {  # o "MBP" antes da instalação: o que o Athos já tem (claude, tmux, git, python3, a biblioteca de presença, ~/.ssh, ~/.claude.json)
   find "$SRV" -mindepth 1 -delete 2> /dev/null; mkdir -p "$SRV/fakebin" "$SRV/tmp" "$SRV/gt-remote/bin" "$SRV/.ssh" "$SRV/.claude"
-  cp "$T/fake/tmux" "$T/fake/claude" "$SRV/fakebin/"
+  cp "$T/fake/tmux" "$T/fake/claude" "$T/fake/launchctl" "$SRV/fakebin/"
   for t in python3 git; do [ -x "/usr/bin/$t" ] || [ -x "/bin/$t" ] || ln -s "$(command -v $t)" "$SRV/fakebin/$t"; done
   find "$SRV/fakebin/git" -delete 2> /dev/null; printf '#!/bin/sh\n[ -z "${FAKE_GITFAIL:-}" ] || case " $* " in *" $FAKE_GITFAIL "*) echo "git: boom" >&2; exit 128;; esac\nexec %s "$@"\n' "$(command -v git)" > "$SRV/fakebin/git"; chmod +x "$SRV/fakebin/git"; rp=$(command -v ps); printf '#!/bin/sh\ncase "$*" in *nice=*) [ -z "${FAKE_PSNICE:-}" ] || { %s "$@" | sed "s/^\\( *[0-9]* *[0-9]* *\\)[-0-9]*/\\1-/"; exit 0; };; esac\nexec %s "$@"\n' "$rp" "$rp" > "$SRV/fakebin/ps"; chmod +x "$SRV/fakebin/ps"  # git que falha só no subcomando pedido (FAKE_GITFAIL); ps que não dá o nice (FAKE_PSNICE), como o "-" das tarefas de tempo real no nó Linux
   printf '#!/bin/sh\n' > "$SRV/gt-remote/bin/mbp-presence.sh"
@@ -330,7 +392,8 @@ assert "ga-w7qwl1.1" in r["prompt_suffix"] and "mbp-20260101-000000" in r["promp
 assert M.measure_cmd("mbp-20260101-000000") in r["prompt_suffix"] or "MEAS-mbp-20260101-000000" in r["prompt_suffix"], r["prompt_suffix"][:300]'; ok $? "unit: o pedido de start — identidade da sessão de teste, o --settings do city por ÚLTIMO, e o prompt só tem a conta (o número só aparece se o comando rodou) e o passo 1 de medição"; }
   c hostblock && { py 'h=M.host_block(); assert h["shim"]["spool_dir"]==M.SPOOL and h["path_extra"][0]==M.SHIMBIN and h["remote_root"]==M.BUNDLE and h["remote_home"]==M.MHOME
 assert M.client_config()=={"transport":"spool","spool_dir":M.SPOOL,"timeout_s":330}
-se=h["session_env"]; assert se=={"path":M.SESSION_PATH,"claude":M.CLAUDE_BIN} and se["path"][0]==M.SHIMBIN and se["claude"].startswith("/"), se'; ok $? "unit: o bloco do host mbp — o atalho PRIMEIRO no PATH; session_env leva o PATH explícito (atalho primeiro) e o claude por caminho absoluto; a config do cliente é só a puxada (sem host, usuário nem chave)"; }
+se=h["session_env"]; assert se=={"path":M.SESSION_PATH,"claude":M.CLAUDE_BIN} and se["path"][0]==M.SHIMBIN and se["claude"].startswith("/"), se
+assert h["sleeps"] is True and h.get("gui_agent") is True, h  # ga-w7qwl1.2.4: host que dorme sem gui_agent = o provider (1.8) recusa o start; tem de ser o booleano true, não "truthy"'; ok $? "unit: o bloco do host mbp — o atalho PRIMEIRO no PATH; session_env leva o PATH explícito (atalho primeiro) e o claude por caminho absoluto; gui_agent true (o host dorme; sem isso o provider recusa); a config do cliente é só a puxada (sem host, usuário nem chave)"; }
   c sessionpath && { MBP_PROOF_SESSION_PATH= MBP_PROOF_CLAUDE= py 'import os
 assert M.SESSION_PATH==[M.SHIMBIN,"/opt/homebrew/bin","/usr/local/bin","/usr/bin","/bin","/usr/sbin","/sbin"], M.SESSION_PATH
 assert not any(d.startswith(M.MHOME) and d!=M.SHIMBIN for d in M.SESSION_PATH) and M.CLAUDE_BIN==M.MHOME+"/.local/bin/claude", M.CLAUDE_BIN'; ok $? "unit: o PATH explícito padrão da sessão — o atalho primeiro, só pastas do sistema e do Homebrew, nem ~/.local/bin nem ~/go/bin; o claude por caminho absoluto"; }
@@ -575,7 +638,9 @@ g_install() {
 }
 
 # ---------------------------------------------------------------- e2e
-e2e_fixture() { mkgold || return 1; find "$SRV" -mindepth 1 -delete 2> /dev/null; cp -a "$GOLD/." "$SRV/"; world_reset; mkdir -p "$MINI/.gastown"; }
+e2e_fixture() { mkgold || return 1; find "$SRV" -mindepth 1 -delete 2> /dev/null; cp -a "$GOLD/." "$SRV/"; world_reset; mkdir -p "$MINI/.gastown"
+  [ -z "${FAKE_STALE_STOP:-}" ] || { mkdir -p "$SRV/gt-remote/bundle/run"; : > "$SRV/gt-remote/bundle/run/remote-test-remote-mbp-1.stop"; }  # a marca que o provider deixou na rodada anterior
+}
 ep() {  # ep [args do e2e] — um e2e completo contra o MBP falso; RC, $T/out
   e2e_fixture || { RC=99; return; }
   python3 -I "$P" e2e --repo-url "$URL" --timeout "${TMO:-60}" "$@" > "$T/out" 2> "$T/err"; RC=$?; kill_leftovers
@@ -586,6 +651,11 @@ fail1() {  # fail1 CASO MODO "FAIL ..." DESCRIÇÃO [args] — o modo reprova S�
   c "$name" || return 0
   FAKE_MODE=$mode ep "$@"; [ $RC = 1 ] && has "$T/out" "$want" && [ "$(calls stop)" -ge 1 ]; ok $? "e2e: $desc (rc=$RC)"
 }
+only1() {  # only1 CASO MODO "FAIL ..." DESCRIÇÃO — como fail1, e a ÚNICA prova reprovada é a nomeada: o modo não derruba nada além do que diz
+  local name=$1 mode=$2 want=$3 desc=$4; shift 4
+  c "$name" || return 0
+  FAKE_MODE=$mode ep "$@"; local nf; nf=$(grep -c '^[0-9:]* FAIL' "$T/out"); [ $RC = 1 ] && has "$T/out" "$want" && [ "$nf" = 1 ] && [ "$(calls stop)" -ge 1 ]; ok $? "e2e: $desc (rc=$RC, provas reprovadas=$nf)"
+}
 meas1() {  # meas1 CASO MODO DETALHE DESCRIÇÃO — a medição de dentro da sessão reprova (c) (e só ela), com o detalhe pedido na MESMA linha
   local name=$1 mode=$2 want=$3 desc=$4
   c "$name" || return 0
@@ -594,20 +664,23 @@ meas1() {  # meas1 CASO MODO DETALHE DESCRIÇÃO — a medição de dentro da se
 g_e2e() {
   c ok && { FAKE_MODE=ok ep
     r=$(sed -n 's/.*MBP-PROOF PASSOU: \([0-9]*\) de \([0-9]*\) provas.*/\1 \2/p' "$T/out"); set -- $r
-    [ $RC = 0 ] && [ -n "${1:-}" ] && [ "${1:-x}" = "${2:-y}" ] && [ "${1:-0}" -ge 20 ] && ! grep -q '^[0-9:]* FAIL' "$T/out"; ok $? "e2e: sessão completa → todas as provas passam (${1:-?} de ${2:-?}), nenhuma reprovada, saída 0 (rc=$RC)"
+    [ $RC = 0 ] && [ -n "${1:-}" ] && [ "${1:-x}" = "${2:-y}" ] && [ "${1:-0}" -ge 30 ] && ! grep -q '^[0-9:]* FAIL' "$T/out"; ok $? "e2e: sessão completa → todas as provas passam (${1:-?} de ${2:-?}), nenhuma reprovada, saída 0 (rc=$RC)"
     for want in "PASS bundle instalado em gt-remote/bundle e conferido NO MBP" "PASS cliente do atalho instalado em shim-bin" "PASS atalho bd do MBP chega ao mini" "PASS clone sem dado" "PASS start pelo provider" \
       'PASS (e) a sessão rodou `claude` com o --settings do bundle' "PASS (c) na sessão (medido por ela): bd, gc e gate-done resolvem para o atalho, dolt é recusado ou inalcançável" "PASS (c) o comentário da sessão está na bead, no mini" "PASS (d) commit no MBP, com a identidade da sessão" \
       "PASS (d) clone continua sem dado depois do commit" "PASS (d) o branch chegou ao origin DIRETO do MBP" "PASS (d) o branch aparece no mini" "PASS (c) hooks gc do city" "PASS (a) peek mostra a tela" "PASS (a) nudge entregue" \
       "PASS (a) a sessão respondeu ao nudge" "PASS (b) o vigia (biblioteca de presença de verdade) está de pé" "PASS (b) pausa do Athos ligada" "PASS (b) com a pausa ligada o gate do provider recusa" \
       "PASS (b) o vigia rebaixou a árvore da sessão" "PASS (b) a sessão NÃO foi morta" "PASS (b) pausa desta rodada desligada" "PASS (b) sem a pausa o rebaixamento NÃO volta a subir" "PASS (a) sessão parada pelo provider" \
-      "PASS (a) o stop deixa o MBP limpo" "PASS (d) varredura (antes de apagar a pasta de teste)" "PASS (a) pasta de teste, marca de confiança" "PASS (c)(d) varredura depois"; do
+      "PASS (a) o stop deixa o MBP limpo" "PASS (d) varredura (antes de apagar a pasta de teste)" "PASS (a) pasta de teste, marca de confiança" "PASS (c)(d) varredura depois" \
+      "PASS (f) a sessão nasceu num LaunchAgent do domínio gráfico" "PASS (g) start da sessão leve remote-test-remote-mbp-91" "PASS (g) start da sessão leve remote-test-remote-mbp-92" \
+      "PASS (g) com as 2 sessões abertas o servidor do tmux lista as duas" "PASS (g) stop da 1ª sessão (remote-test-remote-mbp-91)" "PASS (g) parar a 1ª NÃO derruba a 2ª" \
+      "PASS (g) sessão leve remote-test-remote-mbp-92 parada pelo provider" "PASS (g) depois dos stops: nenhuma sessão"; do
       has "$T/out" "$want"; ok $? "e2e: ${want#PASS }"
     done
     grep -F "PASS (c) na sessão (medido por ela)" "$T/out" | grep -qF "dolt recusado pelo atalho (rc 77)"; ok $? "e2e: a medição de dentro da sessão mostra bd, gc e gate-done no atalho e o dolt recusado pelo atalho (rc 77)"
     run=$(sed -n 's/.*mbp-proof \(mbp-[0-9]*-[0-9]*\) ·.*/\1/p' "$T/out" | head -1)
     sha=$(git -C "$T/origin.git" rev-parse "refs/heads/worker/$run" 2>/dev/null); [ -n "$sha" ] && [ "$(git -C "$T/origin.git" diff --name-only "$(git -C "$T/origin.git" rev-parse HEAD)" "$sha")" = "mbp-proof/$run.txt" ]; ok $? "e2e: no origin só existe o branch worker/<rodada> com UM arquivo novo, mbp-proof/<rodada>.txt (rodada ${run:-?})"
     [ -z "$(git -C "$T/origin.git" for-each-ref refs/heads/evil)" ]; ok $? "e2e: nenhum outro branch no origin"
-    [ "$(calls start)" = 1 ] && [ "$(calls stop)" -ge 1 ] && [ ! -e "$FAKE_STATE/running" ] && [ "$(calls nudge)" = 1 ]; ok $? "e2e: um start, um nudge, e a sessão foi parada pelo provider no fim"
+    [ "$(calls "start remote-test-remote-mbp-1")" = 1 ] && [ "$(calls "start remote-test-remote-mbp-91")" = 1 ] && [ "$(calls "start remote-test-remote-mbp-92")" = 1 ] && [ "$(calls stop)" -ge 3 ] && [ ! -e "$FAKE_STATE/running" ] && [ "$(ls "$FAKE_STATE"/running.* 2> /dev/null | wc -l | tr -d ' ')" = 0 ] && [ "$(calls nudge)" = 1 ]; ok $? "e2e: um start da sessão da prova, um nudge, as duas sessões leves de (g) abertas uma vez cada, e TODAS paradas pelo provider no fim"
     grep -q '^ensure' "$FAKE_STATE/pumpcalls" && grep -q '^stop' "$FAKE_STATE/pumpcalls"; ok $? "e2e: o puxador do mini foi subido antes e parado no fim"
     python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); assert "mbp-proof mbp-" in d["prompt_suffix"] and d["env"]["GC_SESSION_NAME"]=="remote-test-remote-mbp-1", d' "$FAKE_STATE/startreq"; ok $? "e2e: o provider recebeu o pedido com a identidade da sessão de teste e o prompt de partida"
     python3 -I -c 'import json,sys; assert json.load(open(sys.argv[1]+"/.claude.json"))==json.load(open(sys.argv[2]+"/.claude.json"))' "$SRV" "$GOLD"; ok $? "e2e: ~/.claude.json do MBP voltou ao que era (a marca de confiança da pasta de teste saiu)"
@@ -672,12 +745,12 @@ g_e2e() {
   # ---- pré-condições: não começa, saída 3, NENHUMA sessão aberta
   c athos && { FAKE_GATE=athos ep; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "NÃO livre"; ok $? "e2e: o Athos está no MBP → não começa, saída 3, nenhuma sessão aberta (rc=$RC)"; }
   c flag && { FAKE_GATE=flag ep; [ $RC = 3 ] && [ "$(calls start)" = 0 ]; ok $? "e2e: bandeira mbp-offload desligada → não começa (rc=$RC)"; }
-  c sshdead && { FAKE_SSH_DEAD=1 ep; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "não consegui ler o estado do MBP"; ok $? "e2e: ssh fora → não começa, saída 3 (rc=$RC)"; }
+  c sshdead && { FAKE_SSH_DEAD=1 ep; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "não consegui limpar as marcas .stop do provider" && has "$T/out" "Connection refused"; ok $? "e2e: ssh fora → a 1ª leitura do MBP (tirar as marcas .stop de rodadas anteriores) falha e a prova NÃO começa, saída 3, nenhum start (rc=$RC)"; }
   c shimdead && { FAKE_SHIM_DEAD=1 ep; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "NAO CONSEGUI começar: o atalho não chega ao mini"; ok $? "e2e: o atalho não chega ao mini → não começa, saída 3 (rc=$RC)"; }
   c shadow && { e2e_fixture; mkdir -p "$SRV/.local/bin"; printf '#!/bin/sh\n' > "$SRV/.local/bin/gc"; chmod +x "$SRV/.local/bin/gc"
     python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "esconderia o atalho" && has "$T/out" "gc="; ok $? "e2e: um gc REAL em ~/.local/bin esconderia o atalho nos hooks (que só chamam gc) → não começa, saída 3 (rc=$RC)"; }
   c userbd-start && { e2e_fixture; mkdir -p "$SRV/.local/bin" "$SRV/go/bin"; for t in bd dolt; do printf '#!/bin/sh\n' > "$SRV/.local/bin/$t"; chmod +x "$SRV/.local/bin/$t"; done; cp "$SRV/.local/bin/bd" "$SRV/go/bin/bd"
-    python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 0 ] && [ "$(calls start)" = 1 ] && ! has "$T/out" "esconderia o atalho" && has "$T/out" "PASS (c) na sessão (medido por ela)"; ok $? "e2e: o bd/dolt do usuário em ~/.local/bin e ~/go/bin NÃO impedem mais o início (a sessão tem PATH explícito e quem prova é a medição de dentro dela) (rc=$RC)"; }
+    python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 0 ] && [ "$(calls "start remote-test-remote-mbp-1")" = 1 ] && ! has "$T/out" "esconderia o atalho" && has "$T/out" "PASS (c) na sessão (medido por ela)"; ok $? "e2e: o bd/dolt do usuário em ~/.local/bin e ~/go/bin NÃO impedem mais o início (a sessão tem PATH explícito e quem prova é a medição de dentro dela) (rc=$RC)"; }
   c noclaude && { e2e_fixture; MBP_PROOF_CLAUDE="$SRV/fakebin/claude-que-nao-existe" python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "o claude do MBP não está em $SRV/fakebin/claude-que-nao-existe"; ok $? "e2e: o claude não está no caminho absoluto que a sessão usa → não começa, saída 3 (rc=$RC)"; }
   c nozdot && { e2e_fixture; python3 -I -c 'import json,sys; p=sys.argv[1]+"/gt-remote/bundle/manifest.json"; d=json.load(open(p)); d.pop("session_path"); json.dump(d,open(p,"w"))' "$SRV"
     python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; r1=$?; c1=$(calls start)
@@ -688,6 +761,21 @@ g_e2e() {
     [ $r1 = 3 ] && [ $r2 = 3 ] && [ $r3 = 3 ] && [ "$c1$c2$c3" = 000 ] && has "$T/out" "não leva o ambiente limpo da sessão" && has "$T/out2" "não leva o ambiente limpo da sessão" && has "$T/out3" "não leva o ambiente limpo da sessão"; ok $? "e2e: bundle sem session_path, com outra ordem de PATH ou com manifest ilegível → não começa (nunca \"igual ao esperado\"), saída 3 (rc=$r1/$r2/$r3)"; }
   c nopresence && { e2e_fixture; find "$SRV/gt-remote/bin/mbp-presence.sh" -delete; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "sem a biblioteca de presença"; ok $? "e2e: sem a biblioteca de presença no MBP → não começa (rc=$RC)"; }
   c swappause && { FAKE_MODE=swappause ep; [ $RC = 1 ] && has "$T/out" "a pausa NÃO é desta rodada" && [ "$(cat "$SRV/gt-remote/PAUSE")" = "origem=athos desde=2026-10-18T10:00:00" ] && [ "$(calls stop)" -ge 1 ]; ok $? "e2e: o Athos troca a pausa por uma dele depois da da prova → a prova NÃO a remove (nem no fim), reprova (b) e a pausa DELE fica como estava (rc=$RC)"; }
+  # ---- (f) o agente do domínio gráfico e (g) duas sessões abertas, parar a 1ª, a 2ª vive (ga-w7qwl1.2.4): cada falha reprova SÓ a sua prova
+  only1 gui-nores nores "FAIL (f) a sessão nasceu num LaunchAgent do domínio gráfico" "(f) agente sem o veredito (arquivo .agent.res ausente) → só (f) reprova"
+  only1 gui-badres badres "FAIL (f) a sessão nasceu num LaunchAgent do domínio gráfico" "(f) veredito do agente que não é \`ok\` (ilegível) → só (f) reprova"
+  only1 gui-notloaded notloaded "FAIL (f) a sessão nasceu num LaunchAgent do domínio gráfico" "(f) agente que não está carregado em gui/<uid> → só (f) reprova"
+  only1 gui-plisthome plisthome "FAIL (f) a sessão nasceu num LaunchAgent do domínio gráfico" "(f) plist em ~/Library/LaunchAgents (sobreviveria a reboot e logout) → só (f) reprova"
+  only1 multi-serverdies serverdies "FAIL (g) parar a 1ª NÃO derruba a 2ª" "(g) o bootout do agente da 1ª leva o servidor do tmux e a 2ª sessão junto → só essa prova reprova"
+  fail1 multi-agentleak agentleak "FAIL (g) parar a 1ª NÃO derruba a 2ª" "(g) o provider diz 0 no stop da 1ª mas o agente dela segue carregado → reprova"
+  c multi-startfail2 && { FAKE_MODE=startfail2 ep; nf=$(grep -c '^[0-9:]* FAIL' "$T/out")
+    [ $RC = 1 ] && has "$T/out" "FAIL (g) start da sessão leve remote-test-remote-mbp-92" && [ "$nf" = 1 ] && [ "$(calls "stop remote-test-remote-mbp-91")" -ge 1 ] && [ ! -e "$FAKE_STATE/running.remote-test-remote-mbp-91" ]; ok $? "e2e: a 2ª sessão leve que o provider recusa reprova (g), e a 1ª, já aberta, é parada (rc=$RC, provas reprovadas=$nf)"; }
+  fail1 multi-tmuxbad tmuxbad "FAIL (g) depois dos stops" "(g) tmux que responde com erro de versão com as sessões leves abertas é \"não sei\" e REPROVA — nunca \"sem sessão\""
+  c markfail && { FAKE_MODE=markfail ep; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "não consegui limpar as marcas .stop do provider" && has "$T/out" "marks: boom" && ! has "$T/out" "PASS bundle instalado"; ok $? "e2e: só a leitura que tira as marcas .stop falha (o resto do ssh responde) → a prova NÃO começa, saída 3, nenhum start, e nem chega às pré-condições seguintes (rc=$RC)"; }
+  c stalestop && { FAKE_STALE_STOP=1 FAKE_MODE=ok ep; r=$(sed -n 's/.*MBP-PROOF PASSOU: \([0-9]*\) de \([0-9]*\) provas.*/\1 \2/p' "$T/out"); set -- $r
+    [ $RC = 0 ] && [ -n "${1:-}" ] && [ "${1:-x}" = "${2:-y}" ] && [ -z "$(ls -A "$SRV/gt-remote/bundle/run" 2> /dev/null)" ]; ok $? "e2e: a marca .stop que o provider deixou na rodada anterior não impede a prova, e a limpeza a remove (run/ vazia no fim) (rc=$RC)"; }
+  c strayrun && { e2e_fixture; mkdir -p "$SRV/gt-remote/bundle/run"; : > "$SRV/gt-remote/bundle/run/outra-sessao.stop"; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?
+    [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "gt-remote/bundle/run não está vazia" && [ -e "$SRV/gt-remote/bundle/run/outra-sessao.stop" ]; ok $? "e2e: só a marca .stop de sessão de TESTE é tolerada: .stop de outro nome em run/ → não começa e o arquivo fica (rc=$RC)"; }
   c lostpause && { FAKE_MODE=lostpause ep; [ $RC = 1 ] && has "$T/out" "FAIL (b) pausa do Athos ligada" && [ ! -e "$SRV/gt-remote/PAUSE" ] && [ "$(calls stop)" -ge 1 ]; ok $? "e2e: a resposta do \"ligar a pausa\" se perde DEPOIS de o arquivo ser criado → reprova (b), mas tenta o \"desligar\": nenhuma pausa da prova fica no MBP (rc=$RC)"; }
   c badjson && { e2e_fixture; echo "isto nao e json" > "$SRV/.claude.json"; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "nunca rodou aqui" && [ "$(cat "$SRV/.claude.json")" = "isto nao e json" ]; ok $? "e2e: ~/.claude.json ilegível → não começa e não o reescreve (rc=$RC)"; }
   c gitblobs && { FAKE_GITFAIL=cat-file FAKE_MODE=ok ep; [ $RC = 1 ] && has "$T/out" "FAIL clone sem dado" && has "$T/out" "FAIL (d) clone continua sem dado"; ok $? "e2e: git cat-file que falha (no clone e depois do commit) → NÃO é \"0 blobs\": as duas provas de \"clone sem dado\" reprovam (rc=$RC)"; }
@@ -695,7 +783,7 @@ g_e2e() {
   c snapwalk && { e2e_fixture; find "$SRV/gt-remote/shim-bin" -delete; : > "$SRV/gt-remote/shim-bin"; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "não consegui ler o estado do MBP"; ok $? "e2e: shim-bin que não dá para varrer (é um arquivo) → NÃO é \"pasta vazia\": não começa, saída 3 (rc=$RC)"; }
   c staleproof && { e2e_fixture; mkdir -p "$SRV/gt-remote/proof/velho"; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "sobrou algo em gt-remote/proof" && [ -d "$SRV/gt-remote/proof/velho" ]; ok $? "e2e: sobra de uma rodada anterior em gt-remote/proof → não começa e não apaga o que não é dela (rc=$RC)"; }
   c stalesocket && { e2e_fixture; mkdir -p "$SRV/tmp/tmux-$(id -u)"; : > "$SRV/tmp/tmux-$(id -u)/gc-remote"; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; kill_leftovers
-    [ $RC = 0 ] && [ "$(calls start)" = 1 ] && [ -e "$SRV/tmp/tmux-$(id -u)/gc-remote" ] && has "$T/out" "PASS (c)(d) varredura depois"; ok $? "e2e: arquivo de socket do tmux que já estava lá, sem servidor, é inerte → a prova começa, passa, e NÃO apaga o socket que não é dela (rc=$RC)"; }
+    [ $RC = 0 ] && [ "$(calls "start remote-test-remote-mbp-1")" = 1 ] && [ -e "$SRV/tmp/tmux-$(id -u)/gc-remote" ] && has "$T/out" "PASS (c)(d) varredura depois"; ok $? "e2e: arquivo de socket do tmux que já estava lá, sem servidor, é inerte → a prova começa, passa, e NÃO apaga o socket que não é dela (rc=$RC)"; }
   c livesocket && { e2e_fixture; mkdir -p "$SRV/tmp/tmux-$(id -u)"; : > "$SRV/tmp/tmux-$(id -u)/gc-remote"; touch "$FAKE_STATE/running"; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "já há sessões no socket do provider"; ok $? "e2e: socket com sessão aberta de verdade → não começa (rc=$RC)"; }
   c foreignrun && { e2e_fixture; mkdir -p "$SRV/gt-remote/bundle/run"; echo x > "$SRV/gt-remote/bundle/run/outra.sh"; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && [ -f "$SRV/gt-remote/bundle/run/outra.sh" ]; ok $? "e2e: run/ com arquivo de outra sessão → não começa (e o verify do bundle também reprova) e o arquivo fica (rc=$RC)"; }
   c badrepo && { e2e_fixture; python3 -I "$P" e2e --repo-url "file:///nao/existe/aqui.git" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "nenhuma URL do origin respondeu" && [ ! -e "$SRV/gt-remote/proof" ]; ok $? "e2e: o MBP não alcança o origin com a credencial que já tem → não começa, nada criado (rc=$RC)"; }
@@ -763,6 +851,29 @@ open(sys.argv[4], "w").write(s.replace(old, new))' "$P" "$1" "$2" "$3"
   mutant install inst-ok "o spool não vira 0700" ' && chmod 700 {q(SPOOL)}' ''
   mutant e2e athos "o gate do MBP é ignorado" 'return g.returncode == 0, v.get("reason") or self.out(g)[:160]' 'return True, "livre"'
   mutant e2e athosback "still_free nunca aborta" '        raise Aborted(f"antes de {stage}: {why}")' '        return'
+  mutant unit,cli,e2e hostblock,cli-plan,ok "o bloco do host perde gui_agent (o provider recusa o start num host que dorme)" '"sleeps": True, "gui_agent": True, ' '"sleeps": True, '
+  # ---- ga-w7qwl1.2.4: a marca .stop do provider, o agente do domínio gráfico (f) e as duas sessões (g)
+  mutant e2e ok,stalestop "a limpeza deixa as marcas .stop do provider em run/" 'if re.fullmatch(C["stop_rx"], m):' 'if False:'
+  mutant e2e stalestop "a marca .stop que o provider deixou na rodada anterior não é tirada antes das pré-condições" 'if re.fullmatch(C["stop_rx"], n):' 'if False:'
+  mutant e2e strayrun "qualquer .stop em run/ é tolerado, não só o de sessão de teste" 'STOP_RX = r"remote-test-remote-mbp-[0-9]{1,3}\.stop"' 'STOP_RX = r".*\.stop"'
+  mutant e2e ok "o stop deixar a marca .stop passa a reprovar o MBP limpo" '[x for x in (s["run_dir"] or []) if not STOP_RE.fullmatch(x)] == [] and s["procs"] == []' 's["run_dir"] in (None, []) and s["procs"] == []'
+  mutant e2e ok "(g) nunca roda" '            self.multi()
+' '            pass
+'
+  mutant e2e multi-serverdies,multi-agentleak "(g) não confere o estado depois de parar a 1ª" 'names2 == {b} and run_b == "true" and s2.get("labels", {}).get(lb) == 0 and absent(s2.get("labels", {}).get(la)),' 'True,'
+  mutant e2e gui-nores,gui-badres,gui-notloaded,gui-plisthome "(f) passa sem conferir o agente" 'ok = g.get("loaded_rc") == 0 and g.get("res") == "ok" and g.get("plist_run") is True and g.get("plist_home") is False' 'ok = True'
+  mutant e2e multi-tmuxbad "tmux que não responde vira \"nenhuma sessão\" em (g)" '        return set()
+    return None
+
+
+def new_run() -> str:' '        return set()
+    return set()
+
+
+def new_run() -> str:'
+  mutant e2e markfail "clear_markers que falha deixa a prova seguir (\"não consegui limpar\" virando \"limpo\")" '            return False
+        if m["removed"]:' '            return True
+        if m["removed"]:'
   mutant e2e ok "o clone traz blobs" '"--no-checkout", "--depth", "1", "--filter=blob:none", ' '"--no-checkout", "--depth", "1", '
   mutant e2e evilpush "o hook de pre-push deixa passar qualquer ref" '[ "$rref" = "refs/heads/worker/%s" ] ||' 'true ||'
   mutant e2e shamismatch "o sha do origin não é comparado" 'bool(sha) and got == sha and g["remote_sha"] == sha,' 'bool(got),'
@@ -778,7 +889,7 @@ open(sys.argv[4], "w").write(s.replace(old, new))' "$P" "$1" "$2" "$3"
   mutant e2e ok,leavesocket "a limpeza não remove o socket que a prova criou" 'if C["socket_new"] and os.path.exists(sock):' 'if False:'
   mutant e2e livesocket "sessão aberta no socket do provider não impede a prova" '        if ts == "aberta":' '        if False:'
   mutant e2e stalesocket "o antes/depois acusa o socket que já existia" '(post["tmux_socket"] and not pre["tmux_socket"])' 'post["tmux_socket"]'
-  mutant e2e leavefile "o arquivo do lançador sobrando não conta" 'and s["run_dir"] in (None, []) and s["procs"] == [])' 'and s["procs"] == [])'
+  mutant e2e leavefile "o arquivo do lançador sobrando não conta" '[x for x in (s["run_dir"] or []) if not STOP_RE.fullmatch(x)] == [] and s["procs"] == [])' 's["procs"] == [])'
   mutant e2e leaveproc "processo sobrando não conta" ' and s["procs"] == [])' ')'
   mutant unit sweepb64 "SWEEP não decodifica os campos *_b64" '            if key.endswith("_b64"):' '            if False:'
   mutant unit sweepb64 "SWEEP não decodifica o cmd rs1" '            elif key == "cmd" and isinstance(v, str) and v.startswith("rs1 "):' '            elif False:'
