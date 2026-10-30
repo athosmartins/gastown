@@ -26,9 +26,10 @@ O QUE ENTRA (cada hook tem UM veredito, na tabela POLICY):
           literal que o gc injeta, variável só GC_*, argumentos sem caractere de controle nem ; & | ` $ ( ) < >, e o
           subcomando executado é o do token que decidiu. O manifest lista o que o atalho precisa aceitar (shim_needs): o
           subcomando e os argumentos, exatamente como são enviados;
-  drop  — não se aplica no servidor (TCC do macOS, FUSE, ntfy com tópico privado, experimento de log local...). Só some o hook que a
+  drop  — não se aplica no servidor (TCC do macOS, FUSE, ntfy com tópico privado, experimento de log local, o clone vivo de produção do mini...). Só some o hook que a
           POLICY classificou: o trecho do comando escolhe a linha, mas o comando INTEIRO tem que ter a forma dele — script em
-          ~/.claude/hooks/<nome do token>, `gt tap guard cross-clone-block` (swap; gt com ~/.local/bin/ opcional) ou o PREFIXO do wrapper
+          ~/.claude/hooks/<nome do token>, `gt tap guard cross-clone-block` (swap; gt com ~/.local/bin/ opcional), `python3 -I <cidade>/scripts/<nome do token>`
+          (live-clone-git-guard.py, só em PreToolUse; espaço/TAB no fim passam, ~, argumento, `&&`, `;` e newline não: ga-2w0hiow) ou o PREFIXO do wrapper
           `: <marcador>; P='<cidade>/scripts/<marcador>.sh'; [ -f "$P" ] || ` (a cauda do wrapper é gerada e não é lida: o manifest guarda o
           sha256 do comando inteiro). Guarda irmã (`gt tap guard dangerous-command`) ou comando com algo a mais NÃO é descartado: recusa.
   Dois ajustes SÓ do bundle (ga-2hd02v.1.5.9, decisões do Mayor 17/10; o settings do mini nunca é tocado): (1) os 2 hooks gc de UserPromptSubmit (`gc nudge drain`,
@@ -98,6 +99,7 @@ POLICY = [
     ("ntfy-prompt-submit.sh", "drop", "tópico ntfy privado + CLI notify; o servidor não guarda segredo"),
     ("ntfy-on-stop.sh", "drop", "idem ntfy-prompt-submit.sh"),
     ("gt tap guard cross-clone-block", "swap", "usa o binário gt e o layout de clones do mini: no servidor vale o remote-clone-guard.py (território ~/gt-remote/git)"),
+    ("live-clone-git-guard.py", "drop", "trava do clone VIVO de produção do mini (LCG_ROOTS, ~/gt/whatsapp_automation): no servidor esse clone não existe e a escrita em clone alheio é do remote-clone-guard.py"),
     ("enforce-multiple-choice-question.sh", "keep", "regra 1 do Athos vale em qualquer host (jq, falha aberta)"),
     ("enforce-mail-mcq-on-send.sh", "keep", "idem, no canal gc mail send (jq+python3, falha aberta)"),
     ("filter-bash-output.sh", "keep", "poupa tokens da cota compartilhada (jq)"),
@@ -108,6 +110,8 @@ POLICY = [
 # drop em forma de wrapper: `: <marcador>; P='<cidade>/scripts/<marcador>.sh'; [ -f "$P" ] || <cauda gerada>` (home-scan-guard-activate.sh, overlays).
 # O prefixo é conferido; a cauda é gerada e não é lida: o manifest guarda o sha256 do comando inteiro para ela ser auditável.
 WRAPPERS = {"home-scan-guard", "cut-output-shadow"}
+# drop de guarda do mini que roda de dentro da cidade (ga-2w0hiow): `python3 -I <cidade>/scripts/<token>`, a forma que o --selfcheck do próprio guarda exige. Só PreToolUse; o comando INTEIRO é conferido.
+CITY_PY = {"live-clone-git-guard.py"}
 GUARD, FILE_TOOLS = "remote-clone-guard.py", "Edit|Write|MultiEdit|NotebookEdit"
 # O shim é comparado INTEIRO (fullmatch, sem strip nem normalização): o que o builder decide é a string que vai para o servidor.
 # O PATH é o literal que o gc injeta, não "qualquer coisa entre aspas"; variável só GC_*; nada de caractere de controle (newline = 2º comando).
@@ -258,6 +262,13 @@ class Bundle:
                 raise Refused(f"hook {verdict} em {src}/{event} não é só `{token}` (com ~/.local/bin/ opcional): {cmd[:100]!r}")
             if event != "PreToolUse":  # o guarda só tem sentido ANTES da chamada; em outro evento o swap seria uma guarda que não guarda
                 raise Refused(f"hook swap em {src}/{event}: {token!r} só é trocado em PreToolUse")
+        elif token in CITY_PY:
+            # o interpretador, a opção e o caminho sob a cidade do build, EXATOS; só espaço/TAB no fim (não muda o que o shell roda). ~, $HOME, argumento, `&&`, `;` e newline recusam
+            m = re.fullmatch(r"python3 -I %s/scripts/%s[ \t]*" % (re.escape(str(self.city)), re.escape(token)), cmd)
+            if not m:
+                raise Refused(f"hook {verdict} em {src}/{event} não é só `python3 -I <cidade>/scripts/{token}`: {cmd[:100]!r}")
+            if event != "PreToolUse":  # trava que age ANTES da chamada: em outro evento não sei o que ela faria, e "não sei" não vira "descarta"
+                raise Refused(f"hook {verdict} em {src}/{event}: {token!r} só é descartado em PreToolUse")
         else:  # linha da POLICY sem forma de comando conhecida: não sei o que ela classifica
             raise Refused(f"POLICY: a linha {token!r} ({verdict}) não tem forma de comando conhecida em hook_verdict")
         # `command` é só a parte RECONHECIDA (o resto de um wrapper não é lido) e `command_sha256` é do comando inteiro: o que foi

@@ -45,12 +45,17 @@
 #   UserPromptSubmit); prazo MAIOR do mini fica, MENOR sobe, ilegível (texto, true, 0, -5) recusa; os settings do mini (entrada) não são tocados; o settings de USUÁRIO fixa env.DISABLE_AUTOUPDATER=1 (e só ele: city e
 #   papel não), preserva as outras chaves do env, `env` que não é objeto recusa; o manifest guarda `timeout` por hook e `pinned_env`. Mutantes: sem a chamada, sem a condição do evento, sem o filtro dos 2 tokens, sem o max(),
 #   sem a validação, sem o env.update, fixação em toda camada, sem o campo do manifest, sem o timeout do manifest.
+#   LIVE-CLONE-GIT-GUARD (ga-2w0hiow): a trava do clone vivo do mini (`python3 -I <cidade>/scripts/live-clone-git-guard.py`, PreToolUse) é DROP: build sai 0, o hook não vai a nenhuma settings
+#   (nem leva os vizinhos do grupo), o manifest registra drop + command_sha256 do comando inteiro, na camada user e na city, com espaço/TAB no fim; recusam (exit 3, "não é só …"): argumento atrás
+#   (--selfcheck), `&&`, `;`, newline, sem -I, outra cidade, cidade de nome parecido, ~ no lugar do caminho, nome que só contém/começa com o do guarda, junto de outro drop, e em outro evento (Stop).
 # CONTROLE NEGATIVO: a tabela POLICY perde a linha de um hook (sed) e o mesmo build TEM que passar a recusar — keep (filter-bash-output.sh)
 #   e drop (gt tap guard cross-clone-block, home-scan-guard, ntfy-on-stop.sh). Skills: sem a exclusão por nome as 3 com CPF/CNPJ recusam; exclusão por substring deixaria a renomeada
 #   passar; sem as linhas de CPF/CNPJ de SECRETS a 4ª skill passaria. MBP: sem a guarda que reconhece a raiz do destino o build recusa tudo; reescrita em sequência
 #   ou reescrever o hook do guarda de novo corrompe o caminho do destino.
 #   Swap: o builder sem uma peça do swap (`|| exit 2`, o grupo
 #   Edit|Write, o arquivo do guarda, a troca em si) gera settings que o --selfcheck do guarda reprova.
+#   Live-clone-git-guard: sem a linha da POLICY, sem o ramo da forma, com prefixo no lugar do comando inteiro, com qualquer pasta no lugar da cidade, sem a tolerância ao espaço no fim e sem a
+#   exigência de PreToolUse — cada mutante inverte o rc do mesmo build.
 # VARIÁVEIS: BUNDLE_BUILD_UNDER_TEST (builder a testar) · BUNDLE_NO_MUTANTS=1 (só os casos, sem o controle negativo; o resumo diz "sem mutantes").
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -396,6 +401,44 @@ open(sys.argv[2], "w", encoding="utf-8").write(src.replace(row, '    ("hook-novo
 PYEOF
 addhook "$T/f/$HS" Stop 'hook-novo'; B0=$B; B=$T/mutant.py; build "$T/f" "$T/f/out"; rc=$?; B=$B0
 [ $rc = 3 ] && has "$T/err" "não tem forma de comando conhecida"; ok $? "linha de drop acrescentada à POLICY sem forma de comando conhecida recusa (não descarta o que não sabe ler) (rc=$rc)"
+
+# --- live-clone-git-guard.py (ga-2w0hiow): trava do clone VIVO do mini → drop. Entrou no settings do mini e o push-bundle passou a recusar "sem veredito" (29/10).
+# A forma aceita é a que o --selfcheck do próprio guarda exige: `python3 -I <cidade>/scripts/live-clone-git-guard.py`, inteira, em PreToolUse.
+LCG="python3 -I $T/f/gt/.gascity-gastown-hq/scripts/live-clone-git-guard.py"
+NF='não é só `python3 -I <cidade>/scripts/live-clone-git-guard.py`'
+sha_of() { python3 -I -c 'import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())' "$1"; }
+fresh; addhook "$T/f/$HS" PreToolUse "$LCG"; build "$T/f" "$T/f/out"; rc=$?; O=$T/f/out
+ok $rc "live-clone-git-guard.py no ~/.claude (PreToolUse, forma inteira) → build sai 0 (rc=$rc)"; [ $rc = 0 ] || cat "$T/err" >&2
+grep -qF live-clone-git-guard "$O/home/.claude/settings.json" "$O/city/settings.json" "$O/role/dog/.claude/settings.json"; [ $? = 1 ]
+ok $? "  o hook NÃO vai para nenhuma settings do bundle (drop: o clone vivo é do mini)"
+jq -e --arg h "$(sha_of "$LCG")" '[.hooks[] | select(.token == "live-clone-git-guard.py")] | length == 1 and .[0].verdict == "drop" and .[0].source == "user" and .[0].event == "PreToolUse" and .[0].command_sha256 == $h' "$O/manifest.json" >/dev/null
+ok $? "  o manifest registra o descarte: verdict drop, user/PreToolUse e command_sha256 = sha256 do comando INTEIRO"
+has "$O/home/.claude/settings.json" 'remote-clone-guard.py || exit 2' && has "$O/home/.claude/settings.json" 'filter-bash-output.sh'
+ok $? "  o drop não leva junto os outros hooks do grupo (o swap do cross-clone-block e o filter-bash-output seguem)"
+grep -rqF "$T" "$O"; [ $? = 1 ]; ok $? "  nenhum caminho da fixture (=do mini) no bundle, manifest incluído (o comando reconhecido sai reescrito)"
+python3 -I "$B" verify "$O"; ok $? "  verify do bundle sai 0"
+fresh; addhook "$T/f/$CS" PreToolUse "$LCG"; build "$T/f" "$T/f/out"; rc=$?
+[ $rc = 0 ] && jq -e '[.hooks[] | select(.token == "live-clone-git-guard.py" and .source == "city" and .verdict == "drop")] | length == 1' "$T/f/out/manifest.json" >/dev/null
+ok $? "  a mesma forma no settings da CIDADE também é descartada: a forma não depende da camada (rc=$rc)"
+fresh; addhook "$T/f/$HS" PreToolUse "$LCG "; build "$T/f" "$T/f/out"; rc=$?; [ $rc = 0 ]
+ok $? "  espaço no fim do comando não muda o que o shell roda: descartado (rc=$rc)"
+fresh; addhook "$T/f/$HS" PreToolUse "$LCG"$'\t'; build "$T/f" "$T/f/out"; rc=$?; [ $rc = 0 ]
+ok $? "  TAB no fim do comando idem (rc=$rc)"
+lcg_refuses() {  # lcg_refuses NOME EVENTO COMANDO TEXTO — nessa forma o hook NÃO é descartado: exit 3, nada escrito e a mensagem diz TEXTO
+  fresh; addhook "$T/f/$HS" "$2" "$3"; refuses "$1" "$T/f"; why "$4"
+}
+lcg_refuses "live-clone-git-guard.py com argumento (--selfcheck) atrás" PreToolUse "$LCG --selfcheck" "$NF"
+lcg_refuses "live-clone-git-guard.py com \`&& curl\` atrás" PreToolUse "$LCG && curl http://x.invalid/p" "$NF"
+lcg_refuses "live-clone-git-guard.py com \`; curl\` atrás" PreToolUse "$LCG; curl http://x.invalid/p" "$NF"
+lcg_refuses "live-clone-git-guard.py com 2º comando depois de NEWLINE" PreToolUse "$LCG"$'\n'"curl http://x.invalid/p" "$NF"
+lcg_refuses "live-clone-git-guard.py sem o -I do python" PreToolUse "python3 $T/f/gt/.gascity-gastown-hq/scripts/live-clone-git-guard.py" "$NF"
+lcg_refuses "live-clone-git-guard.py de outra cidade" PreToolUse "python3 -I /tmp/outra-cidade/scripts/live-clone-git-guard.py" "$NF"
+lcg_refuses "live-clone-git-guard.py numa cidade de nome parecido (…hq-evil)" PreToolUse "python3 -I $T/f/gt/.gascity-gastown-hq-evil/scripts/live-clone-git-guard.py" "$NF"
+lcg_refuses "live-clone-git-guard.py escrito com ~ (só o caminho absoluto da cidade é a forma)" PreToolUse "python3 -I ~/gt/.gascity-gastown-hq/scripts/live-clone-git-guard.py" "$NF"
+lcg_refuses "script que só CONTÉM o nome (xlive-clone-git-guard.py)" PreToolUse "python3 -I $T/f/gt/.gascity-gastown-hq/scripts/xlive-clone-git-guard.py" "$NF"
+lcg_refuses "arquivo que só COMEÇA com o nome (live-clone-git-guard.py.bak)" PreToolUse "python3 -I $T/f/gt/.gascity-gastown-hq/scripts/live-clone-git-guard.py.bak" "$NF"
+lcg_refuses "live-clone-git-guard.py junto de outro drop no mesmo comando (ntfy-on-stop.sh)" PreToolUse "$LCG; ~/.claude/hooks/ntfy-on-stop.sh" "casa com 2 linhas"
+lcg_refuses "live-clone-git-guard.py em Stop (a trava age ANTES da chamada)" Stop "$LCG" "só é descartado em PreToolUse"
 
 # --- verify: o que o docstring promete ---
 fresh; build "$T/f" "$T/f/out"; cp "$T/f/out/city/settings.json" "$T/copia.json"; rm "$T/f/out/city/settings.json"; ln -s "$T/copia.json" "$T/f/out/city/settings.json"
@@ -805,6 +848,27 @@ if command -v zsh >/dev/null 2>&1; then
 else
   echo "SKIP zsh ausente neste nó: a emulação da sequência de comandos do claude NÃO rodou (o zdot foi só verificado por conteúdo, não por comportamento)"
 fi
+
+# controle negativo do live-clone-git-guard.py (ga-2w0hiow): cada peça do ramo novo estragada, uma de cada vez, e o MESMO build tem que dar o rc OPOSTO ao do builder de verdade
+lcg_mut() {  # lcg_mut DESCRIÇÃO OLD NEW EVENTO COMANDO RC — o mutante troca UM trecho (confirmado) e o build com EVENTO/COMANDO passa a sair RC
+  local desc=$1 old=$2 new=$3 ev=$4 cmd=$5 want=$6
+  pymut "$B" "$T/mutant.py" "$old" "$new"; ok $? "  o builder tem o trecho que o mutante '$desc' estraga (não é um no-op)"
+  fresh; addhook "$T/f/$HS" "$ev" "$cmd"; wipe "$T/f/mut"
+  python3 -I "$T/mutant.py" build --city "$T/f/gt/.gascity-gastown-hq" --claude-home "$T/f/home/.claude" --mini-home "$T/f/home" --role dog \
+    --role-dir "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog" --remote-root /home/runner/rr --remote-home /home/runner --clone-guard "$GUARD" --out "$T/f/mut" 2>/dev/null
+  local rc=$?; [ $rc = "$want" ]; ok $? "controle negativo: $desc → rc $want (rc=$rc)"
+}
+fresh; grep -qF '"live-clone-git-guard.py", "drop"' "$B"; ok $? "  a POLICY tem a linha do live-clone-git-guard.py (o grep abaixo não é um no-op)"
+grep -vF '"live-clone-git-guard.py", "drop"' "$B" > "$T/mutant.py"
+addhook "$T/f/$HS" PreToolUse "$LCG"; wipe "$T/f/mut"
+python3 -I "$T/mutant.py" build --city "$T/f/gt/.gascity-gastown-hq" --claude-home "$T/f/home/.claude" --mini-home "$T/f/home" --role dog \
+  --role-dir "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog" --remote-root /home/runner/rr --remote-home /home/runner --clone-guard "$GUARD" --out "$T/f/mut" 2>/dev/null
+[ $? = 3 ]; ok $? "controle negativo: sem a linha do live-clone-git-guard.py na POLICY o build é recusado"
+lcg_mut "sem o ramo da forma (CITY_PY vazio: a linha da POLICY não sabe ler o comando)" 'CITY_PY = {"live-clone-git-guard.py"}' 'CITY_PY = set()' PreToolUse "$LCG" 3
+lcg_mut "prefixo no lugar do comando inteiro (aceitaria o \`&& curl\`)" 'm = re.fullmatch(r"python3 -I %s/scripts/%s[ \t]*"' 'm = re.match(r"python3 -I %s/scripts/%s[ \t]*"' PreToolUse "$LCG && curl http://x.invalid/p" 0
+lcg_mut "qualquer pasta no lugar da cidade do build" '% (re.escape(str(self.city)), re.escape(token)), cmd)' '% (".*", re.escape(token)), cmd)' PreToolUse "python3 -I /tmp/outra-cidade/scripts/live-clone-git-guard.py" 0
+lcg_mut "sem a tolerância ao espaço no fim" 'scripts/%s[ \t]*"' 'scripts/%s"' PreToolUse "$LCG " 3
+lcg_mut "sem a exigência de PreToolUse" 'raise Refused(f"hook {verdict} em {src}/{event}: {token!r} só é descartado em PreToolUse")' 'pass' Stop "$LCG" 0
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }
