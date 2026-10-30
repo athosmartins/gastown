@@ -2,7 +2,7 @@
 """hetzner-ballast.py — o lastro do nó Hetzner: trabalho útil de baixa prioridade que ocupa a CPU que sobra e cede na hora. (ga-2hd02v.5) Python 3.9+, só biblioteca padrão.
 
 Contents
-  Para que serve · Roda ONDE · O contrato do nice · Um tick · Itens · Três estados · Arquivos · Uso
+  Para que serve · Roda ONDE · O contrato do nice · Teto de sistema por item · Um tick · Itens · Três estados · Arquivos · Uso
 
 PARA QUE SERVE
   Athos (20/10): "se está 100% ocupado a gente fica feliz; o que não pode é ficar menos". Mesmo com toda bead elegível indo ao nó, a fila tem buracos (madrugada de 20/10: 7 h em 0-15% de CPU).
@@ -13,8 +13,13 @@ O CONTRATO DO NICE
   Todo item roda em nice 19 + SCHED_IDLE (chrt -i 0) + ionice classe 3: o escalonador entrega a CPU a qualquer sessão (nice 0) na hora, sem esperar este governo. O /proc/stat conta esse tempo
   na coluna `nice`, e é por isso que ele NÃO é carga: carga = user+system+irq+softirq+steal (nice <= 0). O hetzner-capacity.py lê a mesma coluna (CPU em nice > 0 é folga da cidade) — sem isso o
   lastro faria o nó parecer "quente" e a cidade deixaria de mandar bead para ele.
+TETO DE SISTEMA POR ITEM  (ga-kgnjkt8; runbook: "Teto de sistema por item")
+  O nice 19 protege a CPU, não a tabela de processos nem a RAM, e o governo só olha a RAM uma vez por minuto e só enxerga a SESSÃO do item. Por isso cada item entra num escopo systemd do usuário
+  (ballast.slice/ballast-<rodada>.scope) com TasksMax e MemoryMax (rss_mb x fator). O tick lê pids.events (fork recusado) e memory.events (oom_kill) do cgroup do item e o mata de imediato
+  (teto-processos / teto-memoria); o fim de rodada e o stop mandam cgroup.kill, que pega também quem fez setsid. Contador ilegível ou caminho que não é o escopo DESTA rodada nunca vira 'zero estouros'
+  nem alcança outro cgroup. Sem o gerenciador de usuário do systemd (sem sessão aberta e sem linger) o item NÃO começa: nota sem-teto no tick, motivo no stderr.
 UM TICK  (exit 0 sempre que "não consegui ler" — vira nota no registro; 3 só se não dá para gravar)
-  1 lê o registro, /proc/stat, /proc/meminfo e a tabela de processos  2 dá fim aos itens que acabaram (results.jsonl); sobrevivente na sessão de um item que já gravou o rc (órfão) leva TERM depois
+  1 lê o registro, /proc/stat, /proc/meminfo e a tabela de processos  2 dá fim aos itens que acabaram (results.jsonl); item que bateu no teto de sistema leva KILL; sobrevivente na sessão de um item que já gravou o rc (órfão) leva TERM depois
   de BALLAST_ORPHAN_GRACE_S (180 s) e a rodada fecha pelo rc do item, com `orfaos` na linha  3 sem a chave `on`: mata o que roda e sai  4 RAM: pausa (SIGSTOP),
   retoma (SIGCONT) ou mata o maior  5 CPU livre = núcleos - carga(nice<=0); a conta de leituras livres seguidas anda ou zera  6 começa itens enquanto couberem no orçamento
   (núcleos livres - reserva): `work` primeiro; `filler` só com o que sobrar e é morto quando um `work` vai começar.
@@ -28,13 +33,14 @@ TRÊS ESTADOS
   state.json corrompido ou de forma errada vai para <arquivo>.corrupt-<época> e recomeça; ilegível por permissão = rc 3 (inerte). A escrita da pasta é conferida ANTES de qualquer efeito.
   O que o tick não leu fica null no registro (running, registry_errors, mode), nunca [].
 ARQUIVOS  (em $BALLAST_HOME, padrão ~/gt-remote/ballast)
-  items.tsv · items/ · on (a chave: presente = ligado) · state.json · lock · ticks.jsonl · results.jsonl · runs/<rodada>/{meta.json,log,rc,final}
+  items.tsv · items/ · on (a chave: presente = ligado) · state.json · lock · ticks.jsonl · results.jsonl · runs/<rodada>/{meta.json,log,rc,final,cgroup,ceiling}
 STOP  rc 0 = a sessão de cada item esvaziou (TERM+CONT, KILL 3 s depois no que sobrar) · 3 = não li os processos, nada foi morto · 5 = sobrou processo vivo (`survivors`) ou a tabela ficou
   ilegível depois do TERM (`unverified`): NÃO diz que parou · outro = o stop não rodou.
-USO  hetzner-ballast.py tick | status [--json] | stop      env: BALLAST_HOME BALLAST_PROC BALLAST_NOW BALLAST_ITEMS BALLAST_ITEMS_DIR BALLAST_LAUNCH_PREFIX (JSON, com `nice`; BALLAST_TEST=1 só no selftest) e os limites BALLAST_* de load_config
+USO  hetzner-ballast.py tick | status [--json] | stop      env: BALLAST_HOME BALLAST_PROC BALLAST_NOW BALLAST_ITEMS BALLAST_ITEMS_DIR BALLAST_LAUNCH_PREFIX (JSON, com `nice`; BALLAST_TEST=1 só no selftest) BALLAST_CEILING (systemd; off só no selftest) BALLAST_TASKS_MAX BALLAST_MEM_FACTOR BALLAST_RUNTIME_DIR BALLAST_CGROUP_ROOT e os limites BALLAST_* de load_config
 """
 import fcntl
 import json
+import math
 import os
 import re
 import shlex
@@ -82,11 +88,23 @@ def _prefix(raw, test=False):
     return v
 
 
+def _ceiling(raw, test=False):
+    """BALLAST_CEILING: vazio/systemd → o teto de verdade; `off` só no selftest (BALLAST_TEST=1). Qualquer outra coisa é configuração inválida (ValueError): o lastro nunca roda sem teto por engano."""
+    if raw in ("", "systemd"):
+        return "systemd"
+    if raw == "off" and test:
+        return "off"
+    raise ValueError("BALLAST_CEILING=%r inválido (systemd; off só no selftest)" % raw)
+
+
 def load_config(env):
     home = env.get("BALLAST_HOME") or os.path.join(os.path.expanduser("~"), "gt-remote", "ballast")
     raw = env.get("BALLAST_NOW", "").strip()
     prefix = env.get("BALLAST_LAUNCH_PREFIX", "").strip()
     return SimpleNamespace(
+        ceiling=_ceiling(env.get("BALLAST_CEILING", "").strip(), env.get("BALLAST_TEST") == "1"),
+        tasks_max=_num(env, "BALLAST_TASKS_MAX", 4096, int, 16), mem_factor=_num(env, "BALLAST_MEM_FACTOR", 1.25, float, 1.0),
+        runtime_dir=env.get("BALLAST_RUNTIME_DIR") or env.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid(), cgroup_root=env.get("BALLAST_CGROUP_ROOT") or "/sys/fs/cgroup",
         home=home, proc=env.get("BALLAST_PROC", "/proc"), now=int(raw) if raw else int(time.time()),
         registry=env.get("BALLAST_ITEMS") or os.path.join(home, "items.tsv"), items_dir=env.get("BALLAST_ITEMS_DIR") or os.path.join(home, "items"),
         idle_min_pct=_num(env, "BALLAST_IDLE_MIN_PCT", 15.0, float, 0.0), idle_ticks=_num(env, "BALLAST_IDLE_TICKS", 3, int, 1),
@@ -401,10 +419,123 @@ def default_prefix():
     return pre
 
 
+# ---- teto de sistema por item (ga-kgnjkt8) -------------------------------------------------------------------------------------------------------------------
+CG_RE = re.compile(r"^/(?:[A-Za-z0-9_.@:-]+/)*ballast\.slice/ballast-([a-z0-9_-]+)\.scope$")
+
+
+def ceiling_ready(cfg):
+    """(ok, motivo). `off` (só no selftest) vale sempre. Senão precisa de systemd-run no PATH e do barramento do gerenciador de usuário (<runtime>/bus): sem sessão aberta nem linger não há gerenciador e o item NÃO começa."""
+    # vazio (sem systemd-run, sem barramento) → não pronto, com o motivo; falhou/ilegível (stat negado: exists dá False) → também não pronto: o nó já parou uma vez (29/10) por processo sem teto, e item sem teto é a mesma exposição
+    if cfg.ceiling == "off":
+        return True, ""
+    if shutil.which("systemd-run") is None:
+        return False, "systemd-run ausente do PATH"
+    bus = os.path.join(cfg.runtime_dir, "bus")
+    if not os.path.exists(bus):
+        return False, "sem gerenciador de usuário do systemd (%s ausente: nenhuma sessão aberta e sem linger)" % bus
+    return True, ""
+
+
+def mem_cap_mb(cfg, item):
+    """MemoryMax do item em MB: o rss_mb do registro (que o governo já aplica por minuto) vezes o fator; o kernel é a rede de baixo para o que passa entre dois ticks."""
+    return int(math.ceil(item["rss_mb"] * cfg.mem_factor))
+
+
+def cgroup_dir(cfg, run):
+    """(pasta do cgroup do item, motivo). O item escreve o caminho dele em runs/<rodada>/cgroup (de dentro do escopo). Só vale o escopo DESTA rodada na ballast.slice, sem `.` nem `..`: o kill do governo
+    nunca pode alcançar outro cgroup (a sessão de login de alguém, o cron)."""
+    # vazio (arquivo vazio: o item ainda não escreveu) → (None, "ilegivel"); falhou/ilegível (ausente, sem permissão, não é texto) → (None, "ilegivel"); caminho de forma errada → (None, "caminho")
+    try:
+        with open(os.path.join(cfg.home, "runs", run, "cgroup"), "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+    except (OSError, UnicodeDecodeError):
+        return None, "ilegivel"
+    if not raw:
+        return None, "ilegivel"
+    m = CG_RE.match(raw)
+    if not m or m.group(1) != run or any(s in (".", "..") for s in raw.split("/")):
+        return None, "caminho"
+    return cfg.cgroup_root.rstrip("/") + raw, ""
+
+
+def read_events(path):
+    """{chave: inteiro} de um pids.events / memory.events, ou None."""
+    # vazio (nenhuma linha `chave número`) → None, não "zero estouros"; falhou/ilegível (ausente, sem permissão, não é texto) → None
+    try:
+        with open(path, "r", encoding="ascii") as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+    out = {}
+    for ln in text.splitlines():
+        k, _, v = ln.partition(" ")
+        if k and v.strip().isdigit():
+            out[k] = int(v.strip())
+    return out or None
+
+
+def ceiling_hit(cfg, run, notes):
+    """`teto-processos` se o kernel recusou fork no cgroup do item (pids.events max), `teto-memoria` se matou algo nele (memory.events oom_kill); None se não estourou OU se não consegui ler — a nota diz
+    que a leitura do teto falhou nesta rodada (o kernel segue impondo o teto: só o governo fica sem informação, e isso nunca vira 'estourou' nem 'tudo certo' calado)."""
+    d, why = cgroup_dir(cfg, run)
+    if d is None:
+        notes.append("teto-%s:%s" % (why, run))
+        return None
+    pe, me = read_events(os.path.join(d, "pids.events")), read_events(os.path.join(d, "memory.events"))
+    if pe is None or me is None:
+        notes.append("teto-ilegivel:%s" % run)
+    if pe is not None and pe.get("max", 0) > 0:
+        return "teto-processos"
+    if me is not None and me.get("oom_kill", 0) > 0:
+        return "teto-memoria"
+    return None
+
+
+def cgroup_kill(cfg, run):
+    """Manda o kernel matar TUDO o que está no escopo do item (cgroup.kill, kernel >= 5.14), inclusive quem fez setsid e a sessão não enxerga. Só o escopo desta rodada (cgroup_dir)."""
+    # vazio/falhou (cgroup sem o arquivo, já sumido, sem permissão, caminho que não valida) → False e nada feito: o kill por sessão já foi tentado e este é só o complemento
+    d, _ = cgroup_dir(cfg, run)
+    if d is None:
+        return False
+    try:
+        with open(os.path.join(d, "cgroup.kill"), "w") as f:
+            f.write("1")
+        return True
+    except OSError:
+        return False
+
+
+def read_ceiling_report(path):
+    """{tasks_peak, tasks_hit, mem_peak_mb, oom_kill} do relatório que o item grava de dentro do escopo (runs/<rodada>/ceiling), ou None. Campo ilegível é null (não sei), nunca 0."""
+    # vazio (arquivo vazio, ou nenhum campo legível) → None; falhou/ilegível (ausente, sem permissão, não é texto) → None; campo que não é número → null só nele
+    try:
+        with open(path, "r", encoding="ascii") as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+    kv = {}
+    for ln in text.splitlines():
+        k, _, v = ln.strip().partition(" ")
+        kv[k] = int(v) if v.isdigit() else None
+    mem = kv.get("mem_peak")
+    rep = {"tasks_peak": kv.get("pids_peak"), "tasks_hit": kv.get("pids_hits"), "mem_peak_mb": mem // 1048576 if mem is not None else None, "oom_kill": kv.get("oom_kill")}
+    return None if all(v is None for v in rep.values()) else rep
+
+
+WRAP = ('{ echo 1000 > /proc/self/oom_score_adj; } 2>/dev/null; '
+        '[ -z "$BALLAST_CEILING_ON" ] || { { cut -d: -f3 /proc/self/cgroup 2>/dev/null || :; } > "$BALLAST_RUN_DIR/cgroup.tmp"; mv "$BALLAST_RUN_DIR/cgroup.tmp" "$BALLAST_RUN_DIR/cgroup"; } 2>/dev/null; '
+        '"$@"; echo $? > "$BALLAST_RUN_DIR/rc"; '
+        '[ -z "$BALLAST_CEILING_ON" ] || { c=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); '
+        '{ echo "pids_peak $(cat $c/pids.peak)"; echo "mem_peak $(cat $c/memory.peak)"; sed -n "s/^max /pids_hits /p" $c/pids.events; sed -n "s/^oom_kill /oom_kill /p" $c/memory.events; } > "$BALLAST_RUN_DIR/ceiling"; } 2>/dev/null')
+
+
 def start_item(cfg, item, cores):
     argv, why = resolve_command(cfg, item)
     if argv is None:
         raise Unreadable(why)
+    ok, why = ceiling_ready(cfg)   # defesa em profundidade: o do_tick já não chega aqui sem teto
+    if not ok:
+        raise Unreadable("%s: sem teto, o item não começa (%s)" % (item["name"], why))
     run = "%s-%d" % (item["name"], cfg.now)
     rundir = os.path.join(cfg.home, "runs", run)
     k = 1
@@ -412,10 +543,12 @@ def start_item(cfg, item, cores):
         k += 1
         run = "%s-%d-%d" % (item["name"], cfg.now, k)
         rundir = os.path.join(cfg.home, "runs", run)
+    meta = {"item": item["name"], "role": item["role"], "cores": cores, "rss_mb": item["rss_mb"], "timeout_s": item["timeout_s"], "cooldown_s": item["cooldown_s"], "start": cfg.now}
+    if cfg.ceiling == "systemd":
+        meta["ceiling"] = {"tasks": cfg.tasks_max, "mem_mb": mem_cap_mb(cfg, item)}
     try:
         os.makedirs(rundir)
-        save_json(os.path.join(rundir, "meta.json"), {"item": item["name"], "role": item["role"], "cores": cores, "rss_mb": item["rss_mb"], "timeout_s": item["timeout_s"],
-                                                      "cooldown_s": item["cooldown_s"], "start": cfg.now})
+        save_json(os.path.join(rundir, "meta.json"), meta)
         log = open(os.path.join(rundir, "log"), "ab")
     except OSError as e:
         raise Fail("%s: não crio a rodada (%s)" % (rundir, e))
@@ -423,16 +556,24 @@ def start_item(cfg, item, cores):
            "BALLAST_RUN_DIR": rundir, "BALLAST_CORES": str(cores), "BALLAST_ITEM": item["name"]}
     prefix = cfg.launch_prefix if cfg.launch_prefix is not None else default_prefix()
     # oom_score_adj 1000: se o nó (sem swap) ficar sem memória, o kernel mata o lastro antes de uma sessão (subir o próprio valor não pede root); sem /proc (macOS) a linha é silenciosa
-    wrapper = ["sh", "-c", '{ echo 1000 > /proc/self/oom_score_adj; } 2>/dev/null; "$@"; echo $? > "$BALLAST_RUN_DIR/rc"', MARK + item["name"] + ":" + run] + prefix + ["timeout", "-k", "30", str(item["timeout_s"])] + argv
+    wrapper = ["sh", "-c", WRAP, MARK + item["name"] + ":" + run] + prefix + ["timeout", "-k", "30", str(item["timeout_s"])] + argv
+    if cfg.ceiling == "systemd":
+        # o escopo é criado pelo gerenciador de usuário ANTES do exec do item (systemd-run --scope faz exec no mesmo pid: a sessão e a marca continuam valendo); o item sai SEM o barramento, para não pedir
+        # ao gerenciador um escopo fora do teto. OOMPolicy=continue: o kernel mata só o maior do cgroup e o item ainda grava o rc e os picos (o governo lê o oom_kill no tick).
+        env["BALLAST_CEILING_ON"] = "1"
+        wrapper = [shutil.which("systemd-run"), "--user", "--scope", "--quiet", "--collect", "--unit=ballast-" + run, "--slice=ballast.slice", "-p", "TasksMax=%d" % cfg.tasks_max,
+                   "-p", "MemoryMax=%dM" % mem_cap_mb(cfg, item), "-p", "MemorySwapMax=0", "-p", "OOMPolicy=continue", "--", "env", "-u", "XDG_RUNTIME_DIR", "-u", "DBUS_SESSION_BUS_ADDRESS"] + wrapper
+        penv = dict(env, XDG_RUNTIME_DIR=cfg.runtime_dir, DBUS_SESSION_BUS_ADDRESS="unix:path=" + os.path.join(cfg.runtime_dir, "bus"))
+    else:
+        penv = env
     try:
-        p = subprocess.Popen(wrapper, cwd=rundir, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True, close_fds=True)
+        p = subprocess.Popen(wrapper, cwd=rundir, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=penv, start_new_session=True, close_fds=True)
     except OSError as e:
         raise Unreadable("%s: não executou (%s)" % (item["name"], e))
     finally:
         log.close()
     # o pid na meta: se o líder morrer deixando filho vivo na sessão, a rodada ainda é achada (a marca só vive na linha de comando do líder)
-    save_json(os.path.join(rundir, "meta.json"), {"item": item["name"], "role": item["role"], "cores": cores, "rss_mb": item["rss_mb"], "timeout_s": item["timeout_s"],
-                                                  "cooldown_s": item["cooldown_s"], "start": cfg.now, "pid": p.pid})
+    save_json(os.path.join(rundir, "meta.json"), dict(meta, pid=p.pid))
     return {"item": item["name"], "run": run, "pid": p.pid, "cores": cores}
 
 
@@ -467,6 +608,7 @@ def terminate(cfg, st, r, why, rec):
 
 def kill_now(cfg, st, r, why, rec):
     send(r, signal.SIGKILL)
+    cgroup_kill(cfg, r["run"])   # quem fez setsid sai da sessão e o send() não o alcança; o cgroup alcança
     st["term"][r["run"]] = cfg.now
     st["killed"][r["run"]] = why
     rec["killed"].append({"item": r["item"], "run": r["run"], "why": why, "sig": "KILL"})
@@ -531,13 +673,18 @@ def finalize(cfg, st, run, rec):
         pass
     killed = st["killed"].pop(run, None)
     st["term"].pop(run, None)
+    # picos do item lidos de dentro do escopo (null = não sei); o que sobrou no cgroup (quem fez setsid) leva kill: a rodada acabou
+    rep = read_ceiling_report(os.path.join(rundir, "ceiling"))
+    cgroup_kill(cfg, run)
     # órfãos: o item JÁ tinha gravado o rc e o governo só limpou o que sobrou; o desfecho é o do item (ok / rc-N), nunca "orfaos" (uma rodada boa ganharia o cooldown de falha)
     orph = killed == "orfaos"
-    why = (None if orph else killed) or ("ok" if rc == 0 else ("rc-%d" % rc if rc is not None else "morreu-sem-rc"))
+    # o relatório dizendo fork recusado / oom_kill vale mesmo com rc 0: o item bateu no teto, a rodada não é 'ok'
+    hit = ("teto-processos" if (rep or {}).get("tasks_hit") else "teto-memoria" if (rep or {}).get("oom_kill") else None)
+    why = (None if orph else killed) or hit or ("ok" if rc == 0 else ("rc-%d" % rc if rc is not None else "morreu-sem-rc"))
     summ, summ_why = read_summary(os.path.join(rundir, "log"))
     start = meta.get("start") if meta else None
     row = {"ts": iso(cfg.now), "item": item, "run": run, "role": meta.get("role") if meta else None, "cores": meta.get("cores") if meta else None, "start": start,
-           "secs": (cfg.now - start) if isinstance(start, int) else None, "rc": rc, "why": why, "summary": summ, "summary_why": summ_why}
+           "secs": (cfg.now - start) if isinstance(start, int) else None, "rc": rc, "why": why, "summary": summ, "summary_why": summ_why, "ceiling": rep}
     if orph:
         row["orfaos"] = True
     # a linha de resultado vem ANTES da marca: se a marca não grava, o tick seguinte repete a linha (repetida é melhor que perdida)
@@ -748,6 +895,8 @@ def do_tick(cfg):
             m = m or {}
             # vazio/ilegível (meta.json sem start, timeout_s ou rss_mb inteiros) → sem prazo e sem teto de RSS para ESTE item neste tick (com a nota acima): não mata por palpite (o `timeout -k` do lançamento ainda o limita)
             start, tmo, cap = m.get("start"), m.get("timeout_s"), m.get("rss_mb")
+            # teto de sistema: só lê o cgroup de quem foi lançado sob teto (meta.ceiling) e ainda não levou sinal; um estouro NÃO espera a graça do TERM (item que bateu no teto é lixo)
+            breach = ceiling_hit(cfg, r["run"], notes) if (t is None and on and m.get("ceiling")) else None
             if t is not None:
                 if cfg.now - t >= cfg.term_grace_s:
                     kill_now(cfg, st, r, st["killed"].get(r["run"], "term-ignorado"), rec)
@@ -756,6 +905,9 @@ def do_tick(cfg):
                     del run[r["run"]]       # já foi avisado: não conta como rodando para o resto do tick
             elif not on:
                 terminate(cfg, st, r, "desligado", rec)
+                del run[r["run"]]
+            elif breach:
+                kill_now(cfg, st, r, breach, rec)
                 del run[r["run"]]
             elif _int(start) and _int(tmo) and cfg.now - start > tmo + cfg.deadline_slack_s:
                 terminate(cfg, st, r, "prazo", rec)
@@ -771,7 +923,12 @@ def do_tick(cfg):
     # vazio (nada roda) → []; falhou/ilegível (tabela de processos) → null, nunca []
     rec["running"] = sorted(r["item"] for r in run.values()) if procs is not None else None
     # começar itens: ligado, tudo lido, CPU livre por idle_ticks leituras seguidas, orçamento = núcleos livres - reserva. `work` primeiro; `filler` só com o que sobrar.
-    block = any(n.startswith(("leitura-ilegivel", "registro-ilegivel", "primeira-leitura", "lacuna")) for n in notes)
+    # sem teto não começa nada: o nó já parou uma vez (29/10) por processo sem teto, e item sem teto é a mesma exposição; a nota fica no registro do tick e o motivo no stderr (cron.err)
+    ceil_ok, ceil_why = ceiling_ready(cfg)
+    if on and not ceil_ok:
+        notes.append("sem-teto")
+        print("hetzner-ballast: sem teto (%s): nenhum item começa" % ceil_why, file=sys.stderr)
+    block = any(n.startswith(("leitura-ilegivel", "registro-ilegivel", "primeira-leitura", "lacuna", "sem-teto")) for n in notes)
     if on and procs is not None and not block and free_ok and mem is not None and not st["paused"] and st["free_ticks"] >= cfg.idle_ticks:
         budget = int(ncpu - rec["fg_cores"] - cfg.reserve + 1e-9)
         running_names = seen_names | {k["item"] for k in rec["killed"]}
@@ -876,7 +1033,7 @@ def do_stop(cfg):
     e sai 3 (sem ler DEPOIS do TERM também não manda KILL: não mata às cegas). Se um tick está rodando (lock tomado por mais de 5 s) ou o estado não abre, mata do mesmo jeito e a rodada
     sai como morreu-sem-rc: parar vale mais que a anotação."""
     try:
-        run = current_runs(cfg)[2]
+        _procs, unf, run = current_runs(cfg)
     except Unreadable as e:
         raise Fail("stop: não consegui ler os processos (%s)" % e)
     out = {"stopped": []}
@@ -905,6 +1062,8 @@ def do_stop(cfg):
         except Fail:
             pass
     left = wait_gone(cfg, run, 3) if run else {}
+    for rn in unf:   # quem fez setsid sai da sessão e `wait_gone` não o vê: o cgroup de toda rodada aberta leva kill (rodada sem teto/sem cgroup: nada a fazer)
+        cgroup_kill(cfg, rn)
     if left:   # o que sobrou na sessão (inclusive filho que o item pôs no mundo depois do 1º scan) leva KILL pelo pid, e o grupo do líder junto
         for rn, pids in left.items():
             send(dict(run[rn], members=pids), signal.SIGKILL)
@@ -919,8 +1078,10 @@ def do_stop(cfg):
 
 # ---- status -------------------------------------------------------------------------------------------------------------------------------------------
 def do_status(cfg):
+    ceil_ok, ceil_why = ceiling_ready(cfg)
     out = {"home": cfg.home, "mode": "ligado" if os.path.exists(os.path.join(cfg.home, "on")) else "desligado", "state": "ok", "items": [], "registry_errors": [], "running": [],
-           "launch_prefix": cfg.launch_prefix if cfg.launch_prefix is not None else default_prefix()}
+           "launch_prefix": cfg.launch_prefix if cfg.launch_prefix is not None else default_prefix(),
+           "ceiling": {"mode": cfg.ceiling, "ready": ceil_ok, "why": ceil_why, "tasks_max": cfg.tasks_max, "mem_factor": cfg.mem_factor}}
     st = fresh_state()
     try:
         with open(os.path.join(cfg.home, "state.json"), "rb") as f:
