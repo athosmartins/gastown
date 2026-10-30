@@ -45,3 +45,11 @@ gate_focus_active() {
 
 # gate_focus_depth — the queue depth the owner last measured (empty if unknown).
 gate_focus_depth() { _gate_focus_field depth; }
+
+# GATE_FOCUS_FIX_JQ (ga-6fkx9je) — a jq predicate over ONE bead (input `.`): true for a FIX, the class the mode lets through
+# while it is ON. gate:needs-fix is a bead the gate already rejected (gate:fix-attempt:N stays when five gate paths remove
+# needs-fix, ga-ltjdx); origem:auto-healer-notify and impacto:dano-ao-vivo are production breakage, which is not "new work"
+# (Athos 07/10, 2nd decision). A bead whose labels cannot be read is not a fix (no `labels` key = no labels).
+# Read by pool-probe.sh. The Pilot (_filter_candidates) and the wa/ps worker probes still carry their own literal copy of this
+# list: a change to the class goes to all of them, and pool-probe-gate-focus.selftest.sh fails when the copies drift apart.
+GATE_FOCUS_FIX_JQ='any((.labels // [])[]; . == "gate:needs-fix" or startswith("gate:fix-attempt:") or . == "origem:auto-healer-notify" or . == "impacto:dano-ao-vivo")'
