@@ -23,6 +23,16 @@ python3 -I $S/remote-bundle-build.py verify OUT      # re-hasheia os arquivos, o
 
 Rode o selftest com `umask 022`: o caso "verify acusa bit de execução perdido" faz `chmod -x`, e o GNU chmod não mexe nos bits que a umask cobre — com `umask 077` sobra o `x` de grupo/outros (modo 655), o `verify` com razão não acusa nada e o caso falha por culpa do ambiente (359/360 com 077, 360/360 com 022, medido 30/10 no HEAD).
 
+**Achar TODOS os hooks sem veredito de uma vez** (o build para na 1ª recusa, então um hook novo custa uma rodada de `push-bundle` por vez; ga-2w0hiow, 29/10). Os tokens saem da própria `POLICY`, nunca de uma cópia à mão:
+
+```bash
+grep -E '^    \("[^"]+", "(keep|shim|drop|swap)"' $S/remote-bundle-build.py | sed -E 's/^    \("([^"]+)".*/\1/' > /tmp/policy-tokens.txt
+for f in ~/.claude/settings.json $GC_CITY_PATH/.gc/settings.json $GC_CITY_PATH/.gc/agents/dogs/gastown.dog-1/.claude/settings.json; do
+  jq -r '(.hooks // {}) | .. | .command? // empty' "$f"; done | grep -vF -f /tmp/policy-tokens.txt     # o que sair é hook sem linha na POLICY
+```
+
+Só o **token** é visto aqui: um hook que passa por esse filtro ainda pode recusar pela **forma** (o build diz qual e por quê). Cada hook novo precisa da linha na `POLICY` e, se não for `.sh` em `~/.claude/hooks`, de um ramo de forma no `hook_verdict` (foi o caso do `live-clone-git-guard.py`: a linha sozinha recusaria com "não tem forma de comando conhecida").
+
 Saída: `home/.claude/{settings.json,hooks/*}`, `city/settings.json`, `role/<papel>/.claude/{settings.json,skills/*}` e `manifest.json` (veredito por hook com `command` — a parte reconhecida — e `command_sha256` — do comando inteiro, o `drop` também —, `shim_needs`, chaves descartadas, sha256 de cada arquivo, `bundle_hash` sem data/hora). Códigos: 0 ok · 2 uso · 3 recusado · 4 `verify` achou diferença ou não leu o manifest, uma pasta ou um arquivo de `OUT`.
 
 **O que acontece com um `OUT` que já existe.** A troca apaga o que estava lá, então o builder só troca `OUT` se ele **não existe, está vazio ou é um bundle que ele mesmo gravou** (`manifest.json` com `version` 1, `bundle_hash` e `files`, e nada na pasta além do que o manifest lista). Qualquer outra coisa — pasta com arquivo alheio, arquivo comum, bundle com arquivo a mais ou com pasta que não deu para listar — sai **3 com "não apago"** e nada é mexido. Também sai 3 se `OUT` for (ou contiver) `--city`, `--claude-home`, `--role-dir` ou `--mini-home`, e se `OUT` já existe e há um `OUT.old` de uma troca anterior ao lado dele (remova-o ou escolha outro `OUT`; o builder não o apaga). `OUT` é resolvido com `realpath` antes de decidir, então `--out .` e symlink para a cidade valem pelo que apontam.

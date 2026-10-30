@@ -851,7 +851,7 @@ def real_gate(cfg: Cfg, name: str, work_dir: str) -> str:
         raise Fail(f"sessão real {name!r} recusada: não consegui ler o {GUARD} do repositório para conferir o do host: {e}")
     g, st = q(f"{cfg.home}/.claude/hooks/{GUARD}"), q(f"{cfg.home}/.claude/settings.json")
     return (f'h=$( {{ sha256sum {g} || shasum -a 256 {g}; }} 2>/dev/null | cut -d" " -f1)\n'
-            f'[ "$h" = {sha} ] || {{ echo "sessão real {name} recusada: {GUARD} ausente ou diferente do repositório no host" >&2; exit {EX_POLICY}; }}\n'
+            f'[ "$h" = {sha} ] || {{ echo "sessão real {name} recusada: {GUARD} ausente ou diferente do repositório no host (corrija com: hetzner-claude.py sync-guard)" >&2; exit {EX_POLICY}; }}\n'
             f'o=$(python3 -I {g} --selfcheck {st} {q(work_dir)} 2>&1) || {{ echo "sessão real {name} recusada: o --selfcheck do guarda reprovou as settings do host: $o" >&2; exit {EX_POLICY}; }}\n')
 
 

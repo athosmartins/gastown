@@ -721,9 +721,9 @@ g_gate() {  # a sessão REAL só abre com a liberação E o guarda conferido no 
   fresh; pv start g-ok < <(req cat); ok $RC "gate: liberada + guarda idêntico + settings aprovadas → a sessão real abre (rc=$RC $(head -c 200 "$T/err"))"
   pv is-running g-ok </dev/null; [ "$(cat "$T/out")" = true ]; ok $? "gate: ...e está de pé"; pv stop g-ok </dev/null
   find "$RH/.claude/hooks" -name "$GUARDF" -delete
-  fresh; pv start g-nog < <(req cat); [ $RC = 1 ] && has "$T/err" 'ausente ou diferente' && [ "$(count)" = 0 ] && [ ! -e "$RR/run/g-nog.sh" ]; ok $? "gate: guarda AUSENTE no host → recusa dizendo o guarda, nada aberto, nenhum lançador (rc=$RC)"
+  fresh; pv start g-nog < <(req cat); [ $RC = 1 ] && has "$T/err" 'ausente ou diferente' && has "$T/err" 'hetzner-claude.py sync-guard' && [ "$(count)" = 0 ] && [ ! -e "$RR/run/g-nog.sh" ]; ok $? "gate: guarda AUSENTE no host → recusa dizendo o guarda e o comando que o conserta (ga-2w0hiow), nada aberto, nenhum lançador (rc=$RC)"
   install_host; printf '\n# adulterado\n' >> "$RH/.claude/hooks/$GUARDF"
-  fresh; pv start g-dif < <(req cat); [ $RC = 1 ] && has "$T/err" 'ausente ou diferente' && [ "$(count)" = 0 ]; ok $? "gate: guarda do host DIFERENTE do repositório (1 linha a mais) → recusa (rc=$RC)"
+  fresh; pv start g-dif < <(req cat); [ $RC = 1 ] && has "$T/err" 'ausente ou diferente' && has "$T/err" 'hetzner-claude.py sync-guard' && [ "$(count)" = 0 ]; ok $? "gate: guarda do host DIFERENTE do repositório (1 linha a mais) → recusa e diz o comando que o conserta (rc=$RC)"
   install_host; st="$RH/.claude/settings.json"; h=$(cat "$st")
   local mut='sem o || exit 2 (falha aberta)@@.hooks.PreToolUse|=map(.hooks|=map(.command|=sub(" \\|\\| exit 2$";"")))
 sem o grupo de Edit/Write@@.hooks.PreToolUse|=map(select(.matcher=="Bash"))
