@@ -1113,6 +1113,7 @@ g_lr() {
   fresh; lrv list-running lr </dev/null; echo 'isto não é json' > "$C"; fresh; lrv list-running lr </dev/null; [ $RC = 0 ] && [ "$(cat "$T/out")" = lr-1 ] && [ "$(calls)" = 1 ] && jq -e '.live == ["lr-1"]' "$C" >/dev/null; ok $? "lr: cache ilegível é ignorado e reescrito (rc=$RC)"
   : > "$C"; fresh; lrv list-running lr </dev/null; [ "$(cat "$T/out")" = lr-1 ] && [ "$(calls)" = 1 ]; ok $? "lr: cache VAZIO (arquivo de 0 bytes) é ignorado, não lido como lista vazia"
   # --- erro nunca vira lista nem fica guardado ---
+  cfg 3 25 '{"list_cache_s":30,"list_down_cache_s":0}'  # o fato 'host fora' (grupo lrd) fica DESLIGADO aqui: estes casos encadeiam falhas e cada uma tem que chegar ao host
   rm -f "$C"; fresh; FAKE_SSH_FAIL=1 lrv list-running lr </dev/null; [ $RC = 1 ] && [ ! -s "$T/out" ] && [ ! -e "$C" ]; ok $? "lr: host fora do ar = erro e NADA guardado (rc=$RC)"
   fresh; FAKE_SSH_CUT=1 lrv list-running lr </dev/null; [ $RC = 1 ] && has "$T/err" 'sem marcadores' && [ ! -e "$C" ]; ok $? "lr: resposta cortada = erro e NADA guardado (rc=$RC)"
   fresh; lrv list-running lr </dev/null; [ $RC = 0 ] && [ "$(cat "$T/out")" = lr-1 ] && [ "$(calls)" = 1 ]; ok $? "lr: com o host de volta a resposta é a de verdade (as falhas não deixaram lista nem 'vazio' guardados)"
