@@ -408,6 +408,9 @@ QUOTA_CHECK = os.environ.get(
     "IRG_QUOTA_CHECK", os.path.join(GC_CITY, "scripts/claude-quota-check.sh"))
 
 
+_RIG_LIST_ERR = None  # ga-sml4tqk: why the LAST _list_rig_stores() call returned None (None = that call did not fail)
+
+
 def _list_rig_stores():
     """Return list of (name, path) for non-HQ rig stores, or None on a
     genuine query failure — distinct from a genuine empty result ([]).
@@ -428,12 +431,20 @@ def _list_rig_stores():
     Live-confirmed: wa-m4j75's clock only started tracking 2h05m after its
     actual claim began. None now propagates as a whole-cycle skip in both
     callers, matching every other fail-safe query in this file.
+
+    ga-sml4tqk: a None return also leaves WHY in _RIG_LIST_ERR, so the cycle's
+    skip message can say that `gc rig list` failed (not the HQ `bd list`, which
+    answers in 0.3 s while `gc rig list --json` blocked > 120 s on a down host).
     """
+    global _RIG_LIST_ERR
+    _RIG_LIST_ERR = None  # cleared on entry: a success never inherits the previous call's reason
     try:
         result = subprocess.run(
             ["gc", "--city", GC_CITY, "rig", "list", "--json"],
             capture_output=True, text=True, timeout=20)
         if result.returncode != 0 or not result.stdout.strip():
+            _RIG_LIST_ERR = (f"rc={result.returncode}: {(result.stderr or '').strip()[:120]}"
+                             if result.returncode != 0 else "empty output")
             return None
         data = json.loads(result.stdout)
         rigs = data.get("rigs", [])
@@ -444,8 +455,29 @@ def _list_rig_stores():
             and r.get("path")
             and os.path.isdir(r.get("path", ""))
         ]
-    except Exception:
+    except subprocess.TimeoutExpired:
+        _RIG_LIST_ERR = "timed out after 20s"
         return None
+    except Exception as exc:
+        _RIG_LIST_ERR = f"{type(exc).__name__}: {exc}"[:160]
+        return None
+
+
+def _list_with_reason(list_fn, hq_label):
+    """Run list_fn (list_inflight_beads / list_stranded_inprogress_beads) and return (result, reason).
+
+    ga-sml4tqk: both functions return None for two different failures (the HQ `bd list`, or
+    `gc rig list` after the HQ answered) and run_cycle used to call both "bd list failed". reason
+    is None when the call succeeded; on None it is `hq_label` unless the rig-list enumeration is
+    what failed, then "gc rig list failed (<why>)". _RIG_LIST_ERR is cleared BEFORE the call, so a
+    reason left by an earlier cycle can never be attributed to a failure that never reached rig list.
+    """
+    global _RIG_LIST_ERR
+    _RIG_LIST_ERR = None
+    result = list_fn()
+    if result is not None:
+        return result, None
+    return None, (hq_label if _RIG_LIST_ERR is None else f"gc rig list failed ({_RIG_LIST_ERR})")
 
 # Repos to search for builder branches
 REPOS = [
@@ -4667,19 +4699,19 @@ def run_cycle(state, escalated_alerted):
     now = time.time()
 
     # --- Query in-flight beads (fail-safe: skip cycle on error) ---
-    beads = list_inflight_beads()
+    beads, _why = _list_with_reason(list_inflight_beads, "bd list failed")
     if beads is None:
-        print("[INFLIGHT-RECLAIM] bd list failed — skipping cycle", flush=True)
-        _note_query_failure("bd list failed", now)
+        print(f"[INFLIGHT-RECLAIM] {_why} — skipping cycle", flush=True)
+        _note_query_failure(_why, now)
         return 0, 0
 
     # --- ga-vw26y: also sweep in_progress Pilot stories that lost story:in-flight
     #     (invisible to the label query above AND to the Pilot's open-only
     #     re-dispatch query). Fail-safe: None → skip cycle. ---
-    inprogress = list_stranded_inprogress_beads()
+    inprogress, _why = _list_with_reason(list_stranded_inprogress_beads, "in_progress sweep failed")
     if inprogress is None:
-        print("[INFLIGHT-RECLAIM] in_progress sweep failed — skipping cycle (safe)", flush=True)
-        _note_query_failure("in_progress sweep failed", now)
+        print(f"[INFLIGHT-RECLAIM] {_why} — skipping cycle (safe)", flush=True)
+        _note_query_failure(_why, now)
         return len(beads), 0
 
     # Merge + dedup by id (a bead can match both queries).
@@ -9453,6 +9485,52 @@ def _selftest():
     check("RGL-4 (ga-u8fly): list_inflight_beads() returns None (skips cycle) "
           "when the rig-store scan fails",
           _rgl_result4 is None, f"got {_rgl_result4!r}")
+
+    # RGL-6/7/8 (ga-sml4tqk): the skip reason names WHICH query failed. `gc rig list --json`
+    # blocked > 120 s on a down host while the HQ `bd list` answered in 0.3 s, and the guard
+    # logged "bd list failed" for both, which sent the investigation to the wrong store.
+    subprocess.run, _ = _rgl_stub(1, "")
+    try:
+        _rgl_r6, _rgl_why6 = _list_with_reason(list_inflight_beads, "bd list failed")
+    finally:
+        subprocess.run = _orig_run_rgl
+    check("RGL-6 (ga-sml4tqk): rig-list failure → the reason names `gc rig list` and its rc, not 'bd list failed'",
+          _rgl_r6 is None and _rgl_why6.startswith("gc rig list failed") and "rc=1" in _rgl_why6,
+          f"got {_rgl_r6!r} {_rgl_why6!r}")
+
+    def _rgl_hq_down(cmd, **kw):  # the HQ `bd list` fails; `gc rig list` would have answered
+        if isinstance(cmd, (list, tuple)) and cmd and cmd[0] == "bd":
+            return _RglResult(1, "")
+        return _RglResult(0, json.dumps({"rigs": []}))
+    subprocess.run = _rgl_hq_down
+    try:  # the previous call left a rig-list reason: the HQ failure must NOT inherit it
+        _rgl_r7, _rgl_why7 = _list_with_reason(list_inflight_beads, "bd list failed")
+        _rgl_r7b, _rgl_why7b = _list_with_reason(list_stranded_inprogress_beads, "in_progress sweep failed")
+    finally:
+        subprocess.run = _orig_run_rgl
+    check("RGL-7 (ga-sml4tqk): HQ `bd list` failure keeps its own label (no stale rig-list reason leaks in)",
+          _rgl_r7 is None and _rgl_why7 == "bd list failed"
+          and _rgl_r7b is None and _rgl_why7b == "in_progress sweep failed",
+          f"got {_rgl_why7!r} / {_rgl_why7b!r}")
+
+    def _rgl_rig_hang(cmd, **kw):  # `gc rig list --json` blocks until the guard's 20 s timeout
+        if isinstance(cmd, (list, tuple)) and cmd and cmd[0] == "gc":
+            raise subprocess.TimeoutExpired(cmd, 20)
+        return _RglResult(0, "[]")
+    subprocess.run = _rgl_rig_hang
+    try:
+        _rgl_r8, _rgl_why8 = _list_with_reason(list_stranded_inprogress_beads, "in_progress sweep failed")
+    finally:
+        subprocess.run = _orig_run_rgl
+    check("RGL-8 (ga-sml4tqk): a `gc rig list` TIMEOUT is named as such (the incident's shape)",
+          _rgl_r8 is None and _rgl_why8 == "gc rig list failed (timed out after 20s)", f"got {_rgl_why8!r}")
+    subprocess.run, _ = _rgl_stub(0, json.dumps({"rigs": []}))
+    try:  # a success returns reason None and clears whatever the last failure left behind
+        _rgl_r9, _rgl_why9 = _list_with_reason(list_inflight_beads, "bd list failed")
+    finally:
+        subprocess.run = _orig_run_rgl
+    check("RGL-8b (ga-sml4tqk): a successful call returns reason None and the reason slot is cleared",
+          _rgl_r9 is not None and _rgl_why9 is None and _RIG_LIST_ERR is None, f"got {_rgl_why9!r} {_RIG_LIST_ERR!r}")
 
     # RGL-5: when the rig list DOES succeed, the per-rig bd list call must
     # carry --limit 0 (ga-21kmp class — bd list --json silently truncates at
