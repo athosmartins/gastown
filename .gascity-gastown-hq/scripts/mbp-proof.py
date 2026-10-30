@@ -4,7 +4,7 @@ Modelo: hetzner-proof.py (e2e). Runbooks: gc-session-ssh.md (MBP), remote-shim.m
 
 ## Contents
 - Subcomandos
-- O que a prova confere (a–e)
+- O que a prova confere (a–g)
 - O que toca no MBP e o que desfaz
 - Códigos de saída
 - Configuração (ambiente)
@@ -35,7 +35,7 @@ O QUE A PROVA CONFERE (os critérios do ga-w7qwl1.1; cada linha vira PASS/FAIL n
   (g) duas sessões abertas, parar a 1ª, a 2ª vive (ga-w7qwl1.2.4): depois que a sessão da prova sai, duas sessões LEVES (`sleep`; não pedem login de API) abrem pelo provider. O tmux do
       socket nasce dentro do job do agente da 1ª; a prova lê por ssh, direto no MBP, que parar a 1ª deixa o servidor, a 2ª sessão e o agente dela de pé e o agente da 1ª ausente, e que depois
       do stop da 2ª não sobra sessão, servidor nem agente. Não chama a API (não depende de o token estar válido, e roda mesmo quando (e) reprova por "Login expired"), MAS o agente do domínio gráfico só abre QUALQUER
-      sessão, até um `sleep`, com `claude auth status` = loggedIn true: com o login do MBP limpo o start é recusado (medido 30/10) e (f) e (g) ficam sem medir. Não roda se o Athos voltou (saída 4).
+      sessão, até um `sleep`, com `claude auth status` = loggedIn true: com o login do MBP limpo o start é recusado (medido 30/10) e (f) e (g) ficam sem medir. Não roda se o Athos voltou (saída 4); se ele volta, ou o veredito do gate não se lê, DEPOIS do stop da sessão da prova e antes de (g), (g) não foi medida: a prova sai 4 INTERROMPIDA, nunca PASSOU.
 
 O QUE TOCA NO MBP (tudo sob ~/gt-remote, e só o que está aqui) E O QUE DESFAZ
   install: gt-remote/bundle (o OUT do builder com --session-path, zdot/ incluído, igual ao que o verify confere), gt-remote/shim-bin (cliente do atalho; links bd, gc,
@@ -45,10 +45,10 @@ O QUE TOCA NO MBP (tudo sob ~/gt-remote, e só o que está aqui) E O QUE DESFAZ
            a confiança; REMOVIDA no fim), gt-remote/PAUSE (só a desta rodada; só removida se a primeira linha ainda for a marca dela), gt-remote/bundle/run (apagada se
            não existia), as sessões leves de (g) (remote-test-remote-mbp-91 e -92, com os agentes delas, só entre o start e o stop). O branch worker/<rodada> no origin FICA (apagá-lo é decisão: --delete-branch).
   run/*.stop: o provider deixa `<nome>.stop` em run/ depois de TODO stop (ga-0k82lw; o start seguinte do nome o apaga, o stop poda as de > 24 h) e o `verify` do bundle conta qualquer arquivo de run/
-           como "sobra". Por isso a prova tira as marcas de sessão de TESTE (padrão exato remote-test-remote-mbp-<n>.stop) ANTES das pré-condições, tolera a marca logo depois do stop e a remove na
+           como "sobra". Por isso a prova tira as marcas de sessão de TESTE (padrão exato remote-test-remote-mbp-<n>.stop) ANTES das pré-condições (e o install --apply, antes da troca do bundle), tolera a marca logo depois do stop e a remove na
            limpeza; qualquer outro arquivo de run/ continua sendo acusado.
 
-CÓDIGOS  0 tudo passou · 1 alguma prova reprovou, ou recusei instalar (config do wrapper alheia/ilegível, builder ou verify falhou) · 2 uso · 3 não consegui começar (pré-condição: MBP não livre, tmux aberto ou sem resposta) · 4 interrompida: o Athos voltou ao MBP (nada mais foi medido; a sessão é parada)
+CÓDIGOS  0 tudo passou · 1 alguma prova reprovou, ou recusei instalar (config do wrapper alheia/ilegível, builder ou verify falhou) · 2 uso · 3 não consegui começar (pré-condição: MBP não livre, tmux aberto ou sem resposta) · 4 interrompida: o Athos voltou ao MBP, o veredito do gate não se lê, ou pediram para parar com SIGTERM/Ctrl-C (nada mais foi medido, nem as sessões leves de (g); a sessão é parada)
 CONFIGURAÇÃO (ambiente)  MBP_PROOF_SSH (athos@athoss-macbook-pro, o nome do Tailscale; sem a variável, `e2e` e `install --apply` — só quem conecta — perguntam ao mbp-host.sh, que troca pela LAN .local só se ela responder e o Tailscale não; `plan` e `install` sem --apply não sondam a rede e mostram o nome do Tailscale) · MBP_PROOF_HOME (/Users/athos: o home no MBP) · MBP_PROOF_SESSION (remote-test-remote-mbp-1) ·
   MBP_PROOF_POLL (10: segundos entre olhadas) · MBP_PROOF_WATCH_CYCLE (5: o watch_s do provider) · MBP_PROOF_SHIM_WAIT (60: quanto esperar o atalho) · GC_SSH_BIN (o ssh, como no provider) · GC_CITY_PATH · só o selftest troca: MBP_PROOF_PROV, MBP_PROOF_PUMP,
   MBP_PROOF_PATHX, MBP_PROOF_SHIM_CLIENT, MBP_PROOF_BUILDER, MBP_PROOF_SESSION_PATH (o PATH explícito da sessão), MBP_PROOF_CLAUDE (o caminho absoluto do claude no MBP)
@@ -566,15 +566,24 @@ except (OSError, ValueError) as e:
     res["claude_json_error"] = str(e)[:120]
 # as marcas <nome>.stop das sessões de teste (contrato do provider): só elas saem de run/, nenhum outro arquivo
 # vazio (sem run/ ou sem marca) → nada a remover; falhou (não listou ou não apagou) → errors, e `ok` fica falso: "não consegui limpar" nunca vira "limpo"
+# cada marca é tratada sozinha: a que sumiu entre o listdir e o unlink (FileNotFoundError) já está como se queria e não interrompe as seguintes; a que não dá para apagar vira erro e as seguintes seguem
 try:
-    for m in sorted(os.listdir(C["bundle"] + "/run")):
-        if re.fullmatch(C["stop_rx"], m):
-            os.unlink(C["bundle"] + "/run/" + m)
-            res["removed"].append("run/" + m + " (marca do provider)")
+    marks = sorted(os.listdir(C["bundle"] + "/run"))
 except FileNotFoundError:
-    pass
+    marks = []
 except OSError as e:
+    marks = []
     res.setdefault("errors", []).append("run/ marcas: %s" % e.strerror)
+for m in marks:
+    if not re.fullmatch(C["stop_rx"], m):
+        continue
+    try:
+        os.unlink(C["bundle"] + "/run/" + m)
+        res["removed"].append("run/" + m + " (marca do provider)")
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        res.setdefault("errors", []).append("run/%s: %s" % (m, e.strerror))
 for d, flag in ((C["proofs"], C["proofs_new"]), (C["bundle"] + "/run", C["run_new"])):
     try:
         if flag and os.path.isdir(d) and not os.listdir(d):
@@ -1140,8 +1149,12 @@ class Proof:
             return
         try:
             self.still_free("abrir as duas sessões leves de (g)")
-        except Aborted as e:
+        except Aborted as e:  # o Athos voltou, ou o veredito do gate não se lê, DEPOIS do stop da sessão da prova: (g) não foi medida, e "não medi" não é "passou": go() devolve 4 (INTERROMPIDA), como no resto da prova
+            self.interrupted = True
             self.say(f"(g) não rodou: {e}")
+            return
+        except (OSError, subprocess.SubprocessError) as e:  # o gate não respondeu (prazo, ssh): não sei se o MBP está livre → (g) reprova como não medida; a exceção não sai daqui, senão finish() morre antes de CLEAN e do puxador
+            self.check("(g) 2 sessões abertas, parar a 1ª, a 2ª vive: o gate do MBP não respondeu antes de abrir as sessões leves", False, f"{type(e).__name__}: {e}")
             return
         opened = []
 
@@ -1271,10 +1284,16 @@ class Proof:
             self.say(f"INTERROMPIDA: o MBP deixou de estar livre — {e}. Nada mais é medido; a sessão é parada.")
             self.interrupted = True
             code = 4
+        except KeyboardInterrupt:  # SIGTERM/Ctrl-C: o operador pediu para parar → como o Aborted: nada novo abre no MBP (nem as sessões leves de (g)), a sessão é parada e o MBP limpo em finish(), e a saída é 4 (sem traceback)
+            self.say("INTERROMPIDA: pediram para parar (SIGTERM/Ctrl-C). Nada mais é medido; a sessão é parada e o MBP limpo.")
+            self.interrupted = True
+            code = 4
         except (OSError, subprocess.SubprocessError) as e:
             self.check("execução até o fim sem interrupção", False, f"{type(e).__name__}: {e}")
         finally:
             self.finish()
+        if self.interrupted:  # (g) roda dentro de finish() e também pode descobrir que o Athos voltou: INTERROMPIDA vale mais que PASSOU (a saída 4 já vem do except Aborted acima nos demais casos)
+            code = code or 4
         bad = [n for n, ok in self.checks if not ok]
         self.say(f"MBP-PROOF {'PASSOU' if not bad and code == 0 else 'INTERROMPIDA' if code == 4 else 'FALHOU'}: {sum(ok for _, ok in self.checks)} de {len(self.checks)} provas" + (f"; faltou: {bad}" if bad else ""))
         return code or (1 if bad or not self.checks else 0)
@@ -1417,6 +1436,9 @@ def cmd_install(a: argparse.Namespace) -> int:
     got = v.stdout.decode().strip()
     if v.returncode != 0 or got != want:
         pr.say(f"verify NO MBP reprovou (rc {v.returncode}, hash {got[:12]} vs {want[:12]}): {v.stderr.decode()[:200]}; a pasta {stage} FICA para inspeção")
+        return 1
+    if not pr.clear_markers():  # a troca leva run/ junto, e o verify do bundle novo conta qualquer arquivo de lá como sobra: a marca .stop de sessão de teste que o provider deixou (e2e --keep, rodada morta antes da limpeza) reprovaria o (e)
+        pr.say(f"NAO INSTALEI: não consegui limpar as marcas .stop de run/; a pasta {stage} FICA para inspeção")
         return 1
     swap = (f"set -e; B={q(BUNDLE)}; N={q(stage)}; O={q(MGT)}/bundle.old.{stage_id}\n"
             f'[ ! -d "$B/run" ] || mv "$B/run" "$N/run"\n[ ! -e "$B" ] || mv "$B" "$O"\nmv "$N" "$B"\n[ ! -d "$O" ] || find "$O" -delete\n')

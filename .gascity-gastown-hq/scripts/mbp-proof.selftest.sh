@@ -210,6 +210,8 @@ case "$op" in
       echo '{"ok":false,"reason":"pausa do Athos ativa"}'; exit 1
     fi
     g=${FAKE_GATE:-free}; [ ! -f "$S/started" ] || [ -z "${FAKE_GATE_AFTER_START:-}" ] || g=$FAKE_GATE_AFTER_START
+    # a janela entre o stop da sessão da prova e o (g): o gate só muda DEPOIS de a linha `stop remote-test-remote-mbp-1` estar no registro (FAKE_GATE_AFTER_START vira já no start e cai na prova principal)
+    [ -z "${FAKE_GATE_AFTER_STOP:-}" ] || ! grep -qx 'stop remote-test-remote-mbp-1' "$S/provcalls" 2> /dev/null || g=$FAKE_GATE_AFTER_STOP
     case $g in
       free) echo '{"ok":true,"reason":"livre","cap":2,"slot_cap":2}';;
       athos) echo '{"ok":false,"reason":"Athos está no MBP (presença=mbp)"}'; exit 1;;
@@ -477,6 +479,23 @@ r=run(workdir=U+"/gt-remote/proof/../x"); assert not r["ok"]
 r=run(); assert r["ok"] and not os.path.exists(wd) and not os.path.exists(U+"/gt-remote/proof") and not os.path.exists(U+"/gt-remote/bundle/run"), r
 cj=json.load(open(U+"/.claude.json")); assert cj=={"projects":{"/x":{"a":1}},"keep":7}, cj
 r=run(); assert r["ok"]'; ok $? "unit: CLEAN — recusa pasta fora do padrão; apaga a pasta de teste e SÓ a chave dela no ~/.claude.json; remove só as pastas que a prova criou; repetir é inofensivo"; }
+  c cleanmarks && { mkdir -p "$T/u5/gt-remote/proof" "$T/u5/gt-remote/bundle/run"; echo '{}' > "$T/u5/.claude.json"
+    : > "$T/u5/gt-remote/bundle/run/remote-test-remote-mbp-1.stop"; : > "$T/u5/gt-remote/bundle/run/remote-test-remote-mbp-3.stop"; : > "$T/u5/gt-remote/bundle/run/outro.txt"
+    UD="$T/u5" py 'import subprocess,json,os
+U=os.environ["UD"]; run=U+"/gt-remote/bundle/run"
+# uma marca que o listdir devolve e some antes do unlink (outra limpeza, o próprio provider no start): vem ANTES das reais na ordem do sorted
+PRE="import os\n_l = os.listdir\nos.listdir = lambda p: ([\"remote-test-remote-mbp-0.stop\"] if p.endswith(\"/run\") else []) + _l(p)\n"
+def clean():
+    a={"workdir":U+"/gt-remote/proof/mbp-20260101-000000","proofs":U+"/gt-remote/proof","home":U,"bundle":U+"/gt-remote/bundle","socket":"gc-test-x","proofs_new":False,"run_new":False,"socket_new":False,"stop_rx":M.STOP_RX}
+    return json.loads(subprocess.run(["python3","-I","-",json.dumps(a)],input=(PRE+M.CLEAN).encode(),capture_output=True).stdout.decode().strip().split("\n")[-1])
+r=clean()
+assert r["ok"] and "errors" not in r, r
+assert sorted(os.listdir(run))==["outro.txt"], os.listdir(run)
+assert [x for x in r["removed"] if "marca do provider" in x]==["run/remote-test-remote-mbp-1.stop (marca do provider)","run/remote-test-remote-mbp-3.stop (marca do provider)"], r
+os.mkdir(run+"/remote-test-remote-mbp-2.stop"); open(run+"/remote-test-remote-mbp-4.stop","w").close()
+r=clean()
+assert not r["ok"] and any("run/" in e for e in r["errors"]), r
+assert sorted(os.listdir(run))==["outro.txt","remote-test-remote-mbp-2.stop"], os.listdir(run)'; ok $? "unit: CLEAN — marca que some entre o listdir e o unlink não para o laço (as outras saem), a que não dá para apagar vira erro e \`ok\` falso sem impedir as seguintes, e outro arquivo de run/ nunca sai"; }
   c sweeppy && { mkdir -p "$T/u3/ok" "$T/u3/g/.git/objects/ab" "$T/u3/glob1"; echo "tudo limpo" > "$T/u3/ok/a.txt"; printf 'ghp_%s\n' "$(printf 'b%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36)" > "$T/u3/ok/leak.txt"
     echo x > "$T/u3/ok/.env"; echo ghp_cccccccccccccccccccccccccccccccccccccc > "$T/u3/g/.git/objects/ab/pack"; echo "-----BEGIN RSA PRIVATE KEY-----" > "$T/u3/glob1/t.jsonl"
     UD="$T/u3" py 'import subprocess,json,os
@@ -617,6 +636,10 @@ g_install() {
     first=$(cat "$SRV/gt-remote/bundle/manifest.json"); proof install --apply > "$T/out" 2> "$T/err"; RC=$?
     [ $RC = 0 ] && [ "$(cat "$SRV/gt-remote/bundle/manifest.json")" = "$first" ] && [ -d "$SRV/gt-remote/bundle/run" ] && has "$T/out" "INSTALAÇÃO OK"; ok $? "install: repetir é inofensivo (mesmo bundle, run/ preservada) (rc=$RC)"
   }
+  c inst-stalestop && { srv_skeleton; mkdir -p "$SRV/gt-remote/bundle/run"; : > "$SRV/gt-remote/bundle/run/remote-test-remote-mbp-1.stop"; inst
+    [ $RC = 0 ] && has "$T/out" "INSTALAÇÃO OK" && ! has "$T/out" "FAIL" && [ -d "$SRV/gt-remote/bundle/run" ] && [ -z "$(ls "$SRV/gt-remote/bundle/run")" ]; ok $? "install: a marca .stop que o provider deixou em run/ (e2e --keep, ou morto antes da limpeza) é tirada ANTES da troca: o verify do bundle conta qualquer arquivo de run/ como sobra (rc=$RC)"
+    srv_skeleton; mkdir -p "$SRV/gt-remote/bundle/run"; : > "$SRV/gt-remote/bundle/run/gastown.dog-1.stop"; inst
+    [ $RC = 1 ] && has "$T/out" "FAIL (e) bundle instalado" && [ -e "$SRV/gt-remote/bundle/run/gastown.dog-1.stop" ]; ok $? "install: marca de sessão que NÃO é de teste continua em run/ e o (e) a acusa — só o padrão exato das sessões de teste sai (rc=$RC)"; }
   c inst-wrapper && { srv_skeleton; world_reset; mkdir -p "$MINI/.gastown"; echo '{"city": "outra"}' > "$MINI/.gastown/remote-shim-mbp.json"; before=$(dsig "$SRV"); proof install --apply > "$T/out" 2> "$T/err"; RC=$?
     [ $RC = 1 ] && has "$T/out" "NAO INSTALEI" && [ "$(dsig "$SRV")" = "$before" ] && [ "$(cat "$MINI/.gastown/remote-shim-mbp.json")" = '{"city": "outra"}' ]; ok $? "install: config do wrapper que já existe e é diferente → não sobrescreve e NÃO toca no MBP (rc=$RC)"; }
   c inst-tamper && { srv_skeleton; before=$(dsig "$SRV"); FAKE_TAMPER=1 inst
@@ -760,7 +783,7 @@ g_e2e() {
     python3 -I "$P" e2e --repo-url "$URL" > "$T/out3" 2> "$T/err"; r3=$?; c3=$(calls start)
     [ $r1 = 3 ] && [ $r2 = 3 ] && [ $r3 = 3 ] && [ "$c1$c2$c3" = 000 ] && has "$T/out" "não leva o ambiente limpo da sessão" && has "$T/out2" "não leva o ambiente limpo da sessão" && has "$T/out3" "não leva o ambiente limpo da sessão"; ok $? "e2e: bundle sem session_path, com outra ordem de PATH ou com manifest ilegível → não começa (nunca \"igual ao esperado\"), saída 3 (rc=$r1/$r2/$r3)"; }
   c nopresence && { e2e_fixture; find "$SRV/gt-remote/bin/mbp-presence.sh" -delete; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "sem a biblioteca de presença"; ok $? "e2e: sem a biblioteca de presença no MBP → não começa (rc=$RC)"; }
-  c swappause && { FAKE_MODE=swappause ep; [ $RC = 1 ] && has "$T/out" "a pausa NÃO é desta rodada" && [ "$(cat "$SRV/gt-remote/PAUSE")" = "origem=athos desde=2026-10-18T10:00:00" ] && [ "$(calls stop)" -ge 1 ]; ok $? "e2e: o Athos troca a pausa por uma dele depois da da prova → a prova NÃO a remove (nem no fim), reprova (b) e a pausa DELE fica como estava (rc=$RC)"; }
+  c swappause && { FAKE_MODE=swappause ep; [ $RC = 4 ] && has "$T/out" "a pausa NÃO é desta rodada" && has "$T/out" "FAIL (b) pausa desta rodada desligada" && has "$T/out" "(g) não rodou" && has "$T/out" "MBP-PROOF INTERROMPIDA" && [ "$(cat "$SRV/gt-remote/PAUSE")" = "origem=athos desde=2026-10-18T10:00:00" ] && [ "$(calls "start remote-test-remote-mbp-91")" = 0 ] && [ "$(calls stop)" -ge 1 ]; ok $? "e2e: o Athos troca a pausa por uma dele depois da da prova → a prova NÃO a remove (nem no fim), reprova (b), a pausa DELE fica como estava e, com ele de volta, o (g) não roda: saída 4, não 1 nem PASSOU (rc=$RC)"; }
   # ---- (f) o agente do domínio gráfico e (g) duas sessões abertas, parar a 1ª, a 2ª vive (ga-w7qwl1.2.4): cada falha reprova SÓ a sua prova
   only1 gui-nores nores "FAIL (f) a sessão nasceu num LaunchAgent do domínio gráfico" "(f) agente sem o veredito (arquivo .agent.res ausente) → só (f) reprova"
   only1 gui-badres badres "FAIL (f) a sessão nasceu num LaunchAgent do domínio gráfico" "(f) veredito do agente que não é \`ok\` (ilegível) → só (f) reprova"
@@ -771,6 +794,28 @@ g_e2e() {
   c multi-startfail2 && { FAKE_MODE=startfail2 ep; nf=$(grep -c '^[0-9:]* FAIL' "$T/out")
     [ $RC = 1 ] && has "$T/out" "FAIL (g) start da sessão leve remote-test-remote-mbp-92" && [ "$nf" = 1 ] && [ "$(calls "stop remote-test-remote-mbp-91")" -ge 1 ] && [ ! -e "$FAKE_STATE/running.remote-test-remote-mbp-91" ]; ok $? "e2e: a 2ª sessão leve que o provider recusa reprova (g), e a 1ª, já aberta, é parada (rc=$RC, provas reprovadas=$nf)"; }
   fail1 multi-tmuxbad tmuxbad "FAIL (g) depois dos stops" "(g) tmux que responde com erro de versão com as sessões leves abertas é \"não sei\" e REPROVA — nunca \"sem sessão\""
+  # (g) que NÃO pôde ser medida não é (g) que passou (gate ga-3rzridi, bloqueante 1): o Athos volta, ou o veredito do gate não se lê, NA JANELA entre o stop da sessão da prova e o (g)
+  c multi-athosback && { FAKE_GATE_AFTER_STOP=athos FAKE_MODE=ok ep
+    [ $RC = 4 ] && has "$T/out" "INTERROMPIDA" && has "$T/out" "(g) não rodou" && has "$T/out" "Athos está no MBP" && ! has "$T/out" "PASSOU" && ! grep -q '^[0-9:]* FAIL' "$T/out" && [ "$(calls "start remote-test-remote-mbp-91")" = 0 ] && [ "$(calls stop)" -ge 1 ] && [ ! -e "$SRV/gt-remote/proof" ]; ok $? "e2e: o Athos volta DEPOIS do stop da sessão da prova e ANTES do (g) → saída 4 INTERROMPIDA (nunca PASSOU com rc 0), nenhuma sessão leve aberta, o MBP é limpo (rc=$RC)"; }
+  c multi-gatebad && { FAKE_GATE_AFTER_STOP=garbage FAKE_MODE=ok ep
+    [ $RC = 4 ] && has "$T/out" "INTERROMPIDA" && has "$T/out" "(g) não rodou" && has "$T/out" "veredito do gate ilegível" && ! has "$T/out" "PASSOU" && [ "$(calls "start remote-test-remote-mbp-91")" = 0 ] && [ "$(calls stop)" -ge 1 ]; ok $? "e2e: o veredito do gate não se lê na janela do (g) → \"não sei\" é saída 4 INTERROMPIDA, não PASSOU, e nenhuma sessão leve abre (rc=$RC)"; }
+  c multi-gatehang && { py 'import io, subprocess
+pr = M.Proof.__new__(M.Proof)
+pr.checks, pr.interrupted, pr.f = [], False, io.StringIO()
+def hang(*a, **k): raise subprocess.TimeoutExpired("gc-session-ssh gate", 90)
+pr.prov = hang
+try:
+    pr.multi()
+except Exception as e:
+    raise AssertionError("multi() deixou escapar " + repr(e))
+bad = [n for n, ok in pr.checks if not ok]
+assert len(bad) == 1 and bad[0].startswith("(g)") and not any(ok for _, ok in pr.checks), pr.checks
+assert pr.interrupted is False, "gate que não responde não é o Athos voltando: reprova, não é INTERROMPIDA"'; ok $? "unit: o gate que não responde (timeout) antes do (g) → (g) REPROVA como não medida, e a exceção não sai de multi() (senão finish() morre antes de CLEAN e do puxador)"; }
+  c sigterm && { e2e_fixture || RC=99
+    FAKE_DELAY=3 FAKE_MODE=ok python3 -I "$P" e2e --repo-url "$URL" --timeout "${TMO:-60}" > "$T/out" 2> "$T/err" & pid=$!
+    for _ in $(seq 1 150); do [ -f "$FAKE_STATE/started" ] && break; sleep 0.1; done
+    kill -TERM $pid 2> /dev/null; wait $pid; RC=$?; kill_leftovers
+    [ -f "$FAKE_STATE/started" ] && [ "$RC" = 4 ] && has "$T/out" "pediram para parar" && has "$T/out" "MBP-PROOF INTERROMPIDA" && ! has "$T/out" "PASSOU" && ! has "$T/err" "Traceback" && [ "$(calls "start remote-test-remote-mbp-91")" = 0 ] && [ "$(calls stop)" -ge 1 ] && [ ! -e "$SRV/gt-remote/proof" ]; ok $? "e2e: SIGTERM no meio da prova (o operador pediu para parar) → saída 4 INTERROMPIDA sem traceback, a sessão é parada e o MBP limpo, mas as 2 sessões leves de (g) NÃO são abertas depois do pedido (rc=$RC)"; }
   c markfail && { FAKE_MODE=markfail ep; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "não consegui limpar as marcas .stop do provider" && has "$T/out" "marks: boom" && ! has "$T/out" "PASS bundle instalado"; ok $? "e2e: só a leitura que tira as marcas .stop falha (o resto do ssh responde) → a prova NÃO começa, saída 3, nenhum start, e nem chega às pré-condições seguintes (rc=$RC)"; }
   c stalestop && { FAKE_STALE_STOP=1 FAKE_MODE=ok ep; r=$(sed -n 's/.*MBP-PROOF PASSOU: \([0-9]*\) de \([0-9]*\) provas.*/\1 \2/p' "$T/out"); set -- $r
     [ $RC = 0 ] && [ -n "${1:-}" ] && [ "${1:-x}" = "${2:-y}" ] && [ -z "$(ls -A "$SRV/gt-remote/bundle/run" 2> /dev/null)" ]; ok $? "e2e: a marca .stop que o provider deixou na rodada anterior não impede a prova, e a limpeza a remove (run/ vazia no fim) (rc=$RC)"; }
@@ -853,7 +898,7 @@ open(sys.argv[4], "w").write(s.replace(old, new))' "$P" "$1" "$2" "$3"
   mutant e2e athosback "still_free nunca aborta" '        raise Aborted(f"antes de {stage}: {why}")' '        return'
   mutant unit,cli,e2e hostblock,cli-plan,ok "o bloco do host perde gui_agent (o provider recusa o start num host que dorme)" '"sleeps": True, "gui_agent": True, ' '"sleeps": True, '
   # ---- ga-w7qwl1.2.4: a marca .stop do provider, o agente do domínio gráfico (f) e as duas sessões (g)
-  mutant e2e ok,stalestop "a limpeza deixa as marcas .stop do provider em run/" 'if re.fullmatch(C["stop_rx"], m):' 'if False:'
+  mutant e2e ok,stalestop "a limpeza deixa as marcas .stop do provider em run/" 'if not re.fullmatch(C["stop_rx"], m):' 'if True:'
   mutant e2e stalestop "a marca .stop que o provider deixou na rodada anterior não é tirada antes das pré-condições" 'if re.fullmatch(C["stop_rx"], n):' 'if False:'
   mutant e2e strayrun "qualquer .stop em run/ é tolerado, não só o de sessão de teste" 'STOP_RX = r"remote-test-remote-mbp-[0-9]{1,3}\.stop"' 'STOP_RX = r".*\.stop"'
   mutant e2e ok "o stop deixar a marca .stop passa a reprovar o MBP limpo" '[x for x in (s["run_dir"] or []) if not STOP_RE.fullmatch(x)] == [] and s["procs"] == []' 's["run_dir"] in (None, []) and s["procs"] == []'
@@ -871,6 +916,22 @@ def new_run() -> str:' '        return set()
 
 
 def new_run() -> str:'
+  mutant e2e multi-athosback,multi-gatebad "(g) que não pôde ser medida (Athos voltou / gate ilegível) não marca a prova como interrompida" '            self.interrupted = True
+            self.say(f"(g) não rodou: {e}")' '            self.say(f"(g) não rodou: {e}")'
+  mutant e2e multi-athosback,multi-gatebad "go() ignora a interrupção descoberta dentro de finish()" '            code = code or 4' '            code = code'
+  mutant e2e multi-gatehang "o gate que não responde antes do (g) deixa a exceção escapar de multi()" '        except (OSError, subprocess.SubprocessError) as e:  # o gate não respondeu (prazo, ssh)' '        except ZeroDivisionError as e:  # o gate não respondeu (prazo, ssh)'
+  mutant e2e multi-gatehang "o gate que não responde antes do (g) vira \"passou\" (nenhuma prova registrada)" '            self.check("(g) 2 sessões abertas, parar a 1ª, a 2ª vive: o gate do MBP não respondeu antes de abrir as sessões leves", False,' '            self.check("(g) 2 sessões abertas, parar a 1ª, a 2ª vive: o gate do MBP não respondeu antes de abrir as sessões leves", True,'
+  mutant e2e sigterm "SIGTERM não marca a prova como interrompida (as sessões leves de (g) abrem depois do pedido para parar)" '        except KeyboardInterrupt:  # SIGTERM/Ctrl-C' '        except ZeroDivisionError:  # SIGTERM/Ctrl-C'
+  mutant unit cleanmarks "CLEAN para o laço das marcas na primeira que sumiu entre o listdir e o unlink" '    except FileNotFoundError:
+        pass
+    except OSError as e:
+        res.setdefault("errors", []).append("run/%s: %s" % (m, e.strerror))' '    except FileNotFoundError:
+        break
+    except OSError as e:
+        res.setdefault("errors", []).append("run/%s: %s" % (m, e.strerror))'
+  mutant unit cleanmarks "CLEAN engole a marca que não dá para apagar (\"não consegui limpar\" virando \"limpo\")" '        res.setdefault("errors", []).append("run/%s: %s" % (m, e.strerror))' '        pass'
+  mutant install inst-stalestop "o install --apply não tira a marca .stop antes da troca (o verify do bundle novo a acusa)" '    if not pr.clear_markers():  # a troca leva run/ junto' '    if False:  # a troca leva run/ junto'
+  mutant install inst-stalestop "o install --apply tira QUALQUER .stop de run/, não só o padrão das sessões de teste" 'STOP_RX = r"remote-test-remote-mbp-[0-9]{1,3}\.stop"' 'STOP_RX = r".*\.stop"'
   mutant e2e markfail "clear_markers que falha deixa a prova seguir (\"não consegui limpar\" virando \"limpo\")" '            return False
         if m["removed"]:' '            return True
         if m["removed"]:'
