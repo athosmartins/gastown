@@ -8,7 +8,7 @@
 # com HMT_SLEEP, um repack lento (prazo e teto de swap). Leva ~30 s. HMT_M=<script> testa outra cópia do script (mutantes); HMT_KEEP=1 guarda o tmp.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd -P); M=${HMT_M:-$HERE/hetzner-mirror.sh}
-T=$(mktemp -d "${TMPDIR:-/tmp}/hmt.XXXXXX"); T=$(cd "$T" && pwd -P); chmod 700 "$T"; N=0; F=0; HMT_EXPECT=73
+T=$(mktemp -d "${TMPDIR:-/tmp}/hmt.XXXXXX"); T=$(cd "$T" && pwd -P); chmod 700 "$T"; N=0; F=0; HMT_EXPECT=77
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t GIT_TERMINAL_PROMPT=0
 export HETZNER_MIRROR_HOME=$T/mh HETZNER_MIRROR_ALLOW_WORKTREE=1 HETZNER_MIRROR_FILTER=$HERE/hetzner-rsync-filter.wa.txt HETZNER_MIRROR_SCAN=$HERE/hetzner-mirror-scan.py   # caminhos absolutos: um mutante (HMT_M) mora noutra pasta
 export HETZNER_MIRROR_MAINT_FREE_CMD='echo 99999' HETZNER_MIRROR_MAINT_LOAD_CMD='echo 1' HETZNER_MIRROR_MAINT_SWAP_CMD='echo 100' HETZNER_MIRROR_MAINT_POLL=1   # "tudo livre"
@@ -70,6 +70,9 @@ rc_is 1 "validade de poda perigosa (now): RECUSADA" env HETZNER_MIRROR_MAINT_EXP
 rc_is 2 "espelho desconhecido: rc 2" "$M" maint nao-existe
 if grep -qE ' (repack|prune|prune-packed) ' "$LOG"; then bad "algum passo rodou apesar dos portões" "$(grep -E ' (repack|prune|prune-packed) ' "$LOG" | head -n 3)"; else ok "nenhum passo (prune-packed/repack/prune) rodou com portão fechado"; fi
 [ "$(loose "$R")" = "$BEFORE" ] && present "$R" "$OLD1" && ok "portões fechados: espelho intacto" || bad "portão fechado mexeu no espelho"
+# a porta de load: o mini vive em 47-64 (medido em 30/10), então o padrão é 80, e não os 40 da bead (que nunca abririam). Só leitura (--dry-run): o LOG acima já provou que portão fechado não roda passo
+rc_is 0 "load 79 (< 80, o regime normal do mini é 47-64): passa o portão" env HETZNER_MIRROR_MAINT_LOAD_CMD='echo 79' "$M" maint --dry-run wa; has "DRY-RUN" "load 79: chegou ao dry-run"
+rc_is 0 "load 80: pulada (a porta é < 80)" env HETZNER_MIRROR_MAINT_LOAD_CMD='echo 80' "$M" maint --dry-run wa; has "pulada — load 80 ≥ 80" "load 80: diz o motivo"
 
 # ── a rodada de verdade: receita, poda e carimbo ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 : > "$LOG"
@@ -85,9 +88,9 @@ if present "$R" "$OLD1" || present "$R" "$OLD2" || present "$R" "$OLD3"; then ba
 present "$R" "$NEW1" && present "$R" "$NEW2" && present "$R" "$NEW3" && ok "poda: os 3 inalcançáveis NOVOS (< 2 semanas) ficaram" || bad "poda: apagou inalcançável com menos de 2 semanas"
 present "$R" "$FILT" && ok "poda: o blob do filtro (velho, só no config) ficou" || bad "poda: apagou o blob do filtro"
 # rev-list --objects --all é o teste duro (todo objeto alcançável tem de existir). O fsck só entra por palavra de dano real: o init aponta o HEAD do espelho para refs/remotes/origin/main (de propósito) e um git novo acusa
-# badHeadTarget por isso — não é do maint, e um git mais velho (o nó Linux) nem conhece o id da mensagem, por isso ele é filtrado do TEXTO em vez de silenciado com -c.
+# badHeadTarget por isso (um git mais velho, o do nó Linux, diz "HEAD points to something strange") — não é do maint, e como o id da mensagem nem existe nos mais velhos ele é filtrado do TEXTO em vez de silenciado com -c.
 FS=$(git -C "$R" rev-list --objects --all 2>&1 > /dev/null); RLRC=$?
-FS="$FS$(git -C "$R" fsck --connectivity-only 2>&1 | grep -E 'missing|broken|corrupt|error|fatal' | grep -v badHeadTarget)"
+FS="$FS$(git -C "$R" fsck --connectivity-only 2>&1 | grep -E 'missing|broken|corrupt|error|fatal' | grep -v -E 'badHeadTarget|HEAD points to')"
 [ $RLRC = 0 ] && [ -z "$FS" ] && ok "o grafo alcançável segue inteiro (rev-list --objects --all e fsck --connectivity-only)" || bad "grafo quebrado depois da rodada" "$FS"
 [ "$(loose "$R")" = 4 ] && ok "soltos: só sobraram os 3 novos + o filtro (4), tudo alcançável virou pack" || bad "soltos depois: $(loose "$R"), esperava 4"
 [ -f "$R/objects/maintenance.lock" ] && ok "a trava órfã segue lá (a maint NÃO depende dela, e não a apaga)" || bad "a maint apagou a trava órfã"

@@ -200,7 +200,7 @@ cmd_status() {
 # POR QUE existe. O fetch do sync chama `git maintenance run --auto`, mas a trava objects/maintenance.lock — órfã desde 13/10, vinda por hardlink no `init --seed` (clone --local) — faz o git sair com rc 0 e CALADO sob --auto: o auto-gc
 #   nunca rodou e os soltos do WA chegaram a 1,84 GB. Apagar a trava NÃO é o conserto: o auto-gc de hoje usa `repack --cruft`, que equivale a `-a` (o repo inteiro, em RAM) e, com load ~50, estoura o swap. Então ele fica DESLIGADO de propósito
 #   (maint_pin_noauto; o init já nasce assim) e a manutenção é esta rodada: prune-packed → repack -d -l (SÓ os soltos alcançáveis, nunca -a; 1 thread, janela de 64 MB) → prune --expire (solto inalcançável com menos de 2 semanas FICA: push
-#   em curso e fetch ainda sem ref não perdem objeto). Portões — rodada PULADA (rc 0; o tique seguinte tenta): load < MAX_LOAD, disco livre ≥ piso + o tamanho dos soltos (o pack novo não passa disso), trava do sync livre (a MESMA gtm-fetch.lock:
+#   em curso e fetch ainda sem ref não perdem objeto). Portões — rodada PULADA (rc 0; o tique seguinte tenta): load < MAX_LOAD (80: o mini vive em 47-64 por horas, medido em 30/10 — com 40 a porta nunca abriria; quem protege de verdade é nice 19 + o teto de swap), disco livre ≥ piso + o tamanho dos soltos (o pack novo não passa disso), trava do sync livre (a MESMA gtm-fetch.lock:
 #   sync e maint nunca mexem no mesmo espelho juntos). Leitura de load, disco ou soltos que falha ⇒ RECUSA (rc 1), nunca "pode rodar"; a de swap que falha deixa a rodada CEGA (o log diz swap=?) e não a derruba. Sem rodada boa há OVERDUE_H ⇒ rc 1,
 #   para o launchd mostrar. Ajustes por env: HETZNER_MIRROR_MAINT_{EVERY_H,MIN_FREE_MB,MAX_LOAD,
 #   TIMEOUT,SWAP_STOP_MB,OVERDUE_H,LOOSE_WARN,EXPIRE,POLL} e, só para teste, _{FREE,LOAD,SWAP}_CMD (um comando que imprime o número).
@@ -264,7 +264,7 @@ maint_late() { local rig=$1 base=$2 now=$3 mx; mx=$(maint_knob HETZNER_MIRROR_MA
   mlog "$rig: ATRASADA — sem rodada boa há $(( (now - base) / 3600 )) h (limite $mx h): os portões vêm recusando; olhe load/disco, ou rode \`hetzner-mirror.sh maint --force $rig\` numa hora calma" >&2; }
 maint_run() {   # maint_run <rig> <repo> <dry> <now> <base>: com a trava do sync NA MÃO. rc 0 ok/pulada · 1 falhou, recusada ou atrasada
   local rig=$1 r=$2 dry=$3 now=$4 base=$5 load free need cnt kib pk cnt2 kib2 pk2 free2 oid head exp np npk t0 rc=0 prune_ok=1 maxl minfree warn delta peak tmp
-  MAINT_RIG=$rig; maxl=$(maint_knob HETZNER_MIRROR_MAINT_MAX_LOAD 40); minfree=$(maint_knob HETZNER_MIRROR_MAINT_MIN_FREE_MB 3072); warn=$(maint_knob HETZNER_MIRROR_MAINT_LOOSE_WARN 5000)
+  MAINT_RIG=$rig; maxl=$(maint_knob HETZNER_MIRROR_MAINT_MAX_LOAD 80); minfree=$(maint_knob HETZNER_MIRROR_MAINT_MIN_FREE_MB 3072); warn=$(maint_knob HETZNER_MIRROR_MAINT_LOOSE_WARN 5000)
   MAINT_TIMEOUT=$(maint_knob HETZNER_MIRROR_MAINT_TIMEOUT 1800); exp=${HETZNER_MIRROR_MAINT_EXPIRE:-2.weeks.ago}
   case "$exp" in ''|now|all|0|0.*) mlog "$rig: RECUSADA — validade de poda perigosa ('$exp'): sem ela um objeto recém-empurrado, ainda sem ref, seria apagado" >&2; return 1 ;; esac
   load=$(maint_load) || { mlog "$rig: RECUSADA — não consegui ler o load (nada foi mexido)" >&2; return 1; }

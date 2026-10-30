@@ -10,7 +10,7 @@
 #      writes the pin before anything else, so this proves the job really RAN on the live mirrors — polled for up to WAIT_S seconds because the kickstart is async;
 #   4. any maintenance round already in the launchd log is held to the acceptance numbers: no round whose swap peak is above +1024 MB (FAIL), and the latest round of each
 #      mirror ends under 5000 loose objects (WARN only: unreachable objects younger than 2 weeks legitimately stay loose). No round logged yet = soft skip: the two
-#      back-to-back rounds the story asks for need the gates (load < 40, disk) to open, which a deploy cannot force.
+#      back-to-back rounds the story asks for need the gates (load, disk) to open, which a deploy cannot force.
 #
 # Called by run.sh after deploy (STORY_ID=ga-pepqfkk). Exits 0 on pass. Overrides (tests): CITY, MH, LA_DIR, MAINT_LABEL, MAINT_LOG, PLIST_SRC, WAIT_S.
 
@@ -117,7 +117,7 @@ if [[ -r "$MAINT_LOG" ]] && grep -q ' maint .*: DEPOIS ' "$MAINT_LOG"; then
         fi
     done
 else
-    log "no maintenance round logged yet in $MAINT_LOG — soft skip: the acceptance rounds need the gates (load < 40, disk) to open"
+    log "no maintenance round logged yet in $MAINT_LOG — soft skip: the acceptance rounds need the gates (load, disk) to open"
     SKIPPED="$SKIPPED acceptance-rounds(none-yet)"
 fi
 
