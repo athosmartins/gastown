@@ -7,7 +7,7 @@
 # HETZNER_CLAUDE_UNDER_TEST=<arquivo> roda o mesmo selftest contra uma cópia alterada (mutante); HZC_FAILFAST=1 para na 1ª falha.
 # SYNC-GUARD (ga-2w0hiow, última seção): em dia (nada escrito), ausente, diferente (o anterior fica em .sync-bak), --check (não escreve, avisa uma vez), --selfcheck do servidor reprova (REVERTE byte a byte;
 # não reinstala em laço; guarda do repositório que mudou tenta de novo), ssh fora e ssh que cai DURANTE a instalação (exit 3, nunca "em dia"), guarda do repositório ilegível/vazio, sha ilegível, o que foi gravado
-# sem o sha esperado, symlink, outra sincronização em andamento. O shell, o sha, o mv e o --selfcheck do guarda de verdade rodam no "servidor" loopback; HZC_NO_MUTANTS=1 pula os 12 mutantes.
+# sem o sha esperado, symlink, outra sincronização em andamento, estado gravado que não dá para ler (JSON quebrado, não-objeto, `at` sem tipo de número: o sync segue e o aviso não some). O shell, o sha, o mv e o --selfcheck do guarda de verdade rodam no "servidor" loopback; HZC_NO_MUTANTS=1 pula os 15 mutantes.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 S=${HETZNER_CLAUDE_UNDER_TEST:-$HERE/hetzner-claude.py}
@@ -560,6 +560,7 @@ sg_case_emdia() {
 sg_case_ausente() {
   sg_reset
   sg "sem guarda no servidor: instala" 0 "atualizado"
+  hasnt "e não promete um .sync-bak que não existe (não havia guarda antes)" "$GOUT" ".sync-bak"; no "...nem cria um" "$HG.sync-bak"
   same "o guarda instalado é o do repositório, byte a byte" "$HG" "$RG"
   if [ -x "$HG" ]; then ok; else bad "o guarda instalado precisa ser executável"; fi
   eq "avisou UMA vez que trocou o guarda" "$(notifys)" 1
@@ -567,6 +568,7 @@ sg_case_ausente() {
 sg_case_diferente() {
   sg_reset; sg_host_old
   sg "guarda diferente no servidor: troca" 0 "atualizado"
+  has "e diz onde ficou o anterior" "$GOUT" ".sync-bak"
   same "o guarda do servidor passou a ser o do repositório" "$HG" "$RG"
   same "o anterior ficou guardado em .sync-bak" "$HG.sync-bak" "$T/old-guard.copy"
   no "e o temporário não sobrou" "$HG.sync-tmp"
@@ -645,7 +647,19 @@ sg_case_lock() {
   same "o guarda do servidor segue o que era" "$HG" "$T/old-guard.copy"
   kill $lp 2>/dev/null; wait $lp 2>/dev/null; rm -f "$T/lock.held"
 }
-SG_CASES="sg_case_emdia sg_case_ausente sg_case_diferente sg_case_check sg_case_reprova sg_case_ssh sg_case_repo sg_case_host sg_case_lock"
+sg_case_estado() {  # o estado gravado pelo sync que não dá para ler (ou que mente no tipo) NÃO derruba o sync e NÃO apaga o aviso: sem histórico legível, avisa de novo
+  sg_reset; sg_host_old; printf '{bad' >"$STATE/hetzner-guard-sync.state.json"
+  sg "estado em JSON quebrado: o sync segue e o --check ainda diz desatualizado (exit 1)" 1 "desatualizado" --check
+  eq "e avisou (sem histórico legível não há o que deduplicar)" "$(notifys)" 1
+  if python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if isinstance(d, dict) and d.get("state") == "stale" else 1)' "$STATE/hetzner-guard-sync.state.json"; then ok; else bad "o estado quebrado não foi substituído por um válido"; fi
+  printf '[1,2]' >"$STATE/hetzner-guard-sync.state.json"; rm -f "$FAKE/notify.log"
+  sg "estado que não é objeto: idem" 1 "desatualizado" --check; eq "avisou de novo" "$(notifys)" 1
+  sg_reset; sg_host_old   # 'at' que não é número: o laço de reprovação NÃO pula a instalação (ilegível não vira 'espere')
+  printf '{"state":"failed","msg":"x","want":"%s","at":"ontem"}' "$(python3 -I -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$RG")" >"$STATE/hetzner-guard-sync.state.json"
+  sg "estado failed com 'at' que não é número: instala em vez de pular" 0 "atualizado"
+  same "e instalou o guarda do repositório" "$HG" "$RG"
+}
+SG_CASES="sg_case_emdia sg_case_ausente sg_case_diferente sg_case_check sg_case_reprova sg_case_ssh sg_case_repo sg_case_host sg_case_lock sg_case_estado"
 for c in $SG_CASES; do $c; done
 if [ -z "${HZC_NO_MUTANTS:-}" ]; then
   sgmut() {  # sgmut DESCRIÇÃO OLD NEW CASO… — troca UM trecho do hetzner-claude.py (confirmado: tem que existir uma vez só) e os casos que o cobrem TÊM que reprovar
@@ -669,6 +683,11 @@ PY
   sgmut "sem o --selfcheck no servidor" 'o=$(python3 -I "$g" --selfcheck "$st" 2>&1); rc=$?; ' 'o=; rc=0; ' sg_case_reprova
   sgmut "reinstala em laço o guarda que já reprovou" 'prev.get("state") == "failed" and prev.get("want") == want' 'False' sg_case_reprova
   sgmut "avisa a cada rodada" 'notified is None or now - notified >= SYNC_NOTIFY_EVERY' 'True' sg_case_check sg_case_reprova
+  sgmut "estado quebrado derruba o sync (só OSError é tratado)" 'd = json.load(f)
+    except (OSError, ValueError):' 'd = json.load(f)
+    except OSError:' sg_case_estado
+  sgmut "estado que não é objeto passa como está" 'return d if isinstance(d, dict) else {}' 'return d' sg_case_estado
+  sgmut "'at' sem tipo de número entra na conta do laço" 'isinstance(at, (int, float)) and not isinstance(at, bool) and ' '' sg_case_estado
   sgmut "o não-saber avisa de imediato (ssh fora de um minuto vira alarme)" '(state == "unknown" and now - since >= SYNC_UNKNOWN_ALARM)' 'state == "unknown"' sg_case_ssh
   sgmut "o não-saber nunca avisa (detector mudo para sempre)" '(state == "unknown" and now - since >= SYNC_UNKNOWN_ALARM)' 'False' sg_case_ssh
   sgmut "symlink no servidor é seguido" '[ -L "$g" ] && { echo SYMLINK; exit 0; }; ' '' sg_case_host
