@@ -14,7 +14,7 @@
 #   chave id+updated_at) · (4) a sonda `check` (só o rc 0 com JSON node vale) · (5) adotar/devolver a rota com um bd falso COM estado: confirma lendo, restaura no desfazer, nunca toca bead que mudou de dono ·
 #   (6) a passada inteira: shadow só observa e grava; on tenta na ordem, para na capacidade (rc 12) e nos orçamentos (sondas, segundos, falhas, vagas do nó), memoriza o que o nó recusou, tira da pista o que ficou ·
 #   (7) as regiões VERBATIM de dispatch_one: o bloco do yield (alvo que não é wa-worker do store do WA solta) e o braço do pool (adota antes do gancho; rc 1 devolve a rota e solta; rc 2 não mexe; adotar que falha
-#   não chega ao gancho) · (8) o gancho exporta o rc do apply · (9) a ordem dos pontos de chamada.
+#   não chega ao gancho) · (8) o gancho exporta o rc do apply · (9) a ordem dos pontos de chamada · (6b, ga-2hd02v.3.16) o waiter P0/P1 da cessão: a pista dele é percorrida primeiro, ele sem veredito legível (unknown/timeout/erro, sondado ou memorizado) segura a P2+ com veredito node, e o resumo conta as P2+ que foram ao nó com um P0/P1 esperando.
 # COMO RODA: as funções e as regiões são extraídas VERBATIM do dispatcher (awk) e rodam em shells filhos sob `set -euo pipefail`, PATH de sandbox (selftest-sandbox-path.lib.sh: sem gc/bd reais), bd e
 #   wa-node-dispatch.sh falsos. Contra um dispatcher sem a fatia o arquivo se recusa a começar — o vermelho honesto.
 # CONTROLE NEGATIVO: cada guarda desligada numa cópia do dispatcher (WNP_NO_MUTANTS=1 pula) tem que reprovar este arquivo.
@@ -27,6 +27,12 @@ ok()  { PASS=$((PASS+1)); [ -n "${WNP_MUTANT:-}" ] || echo "  ✓ $*"; }
 bad() { FAIL=$((FAIL+1)); echo "  ✗ $*"; [ -z "${WNP_MUTANT:-}" ] || { echo "RESULT $FAIL/$((PASS+FAIL))"; exit 1; }; }
 [ -f "$DISPATCHER" ] || { echo "FATAL: dispatcher not found at $DISPATCHER" >&2; exit 2; }
 . "$SELF_DIR/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-sandbox-path.lib.sh" >&2; exit 2; }
+# ga-2hd02v.3.16: a classe de prioridade (P0/P1 vs P2+) é a DA CIDADE — a biblioteca de ordem real, não uma cópia (a mesma que o selftest do yield carrega)
+WO_LIB="${PILOT_WORK_ORDER_LIB:-$SELF_DIR/scripts/work-order.sh}"
+[ -f "$WO_LIB" ] || { echo "FATAL: work-order library not found at $WO_LIB" >&2; exit 2; }
+# shellcheck disable=SC1090
+. "$WO_LIB" || { echo "FATAL: cannot source $WO_LIB" >&2; exit 2; }
+[ -n "${WORK_ORDER_JQ_DEFS:-}" ] || { echo "FATAL: $WO_LIB did not define WORK_ORDER_JQ_DEFS" >&2; exit 2; }
 
 # vazio (a função/região não existe) → texto vazio e o need_fn recusa começar; falhou/ilegível (dispatcher que o awk não lê) → idem, nunca um valor inventado
 fn_src() { awk -v n="$1" '$0 ~ "^"n"\\(\\) *\\{"{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER"; }
@@ -37,6 +43,8 @@ F_MHIT="$(need_fn _pilot_wa_node_pass_memo_hit)"; F_MPUT="$(need_fn _pilot_wa_no
 F_CHECK="$(need_fn _pilot_wa_node_pass_check)"; F_ADOPT="$(need_fn _pilot_wa_node_adopt)"; F_UNADOPT="$(need_fn _pilot_wa_node_unadopt)"
 F_PASS="$(need_fn _pilot_wa_node_pass)"; F_VETO="$(need_fn _pilot_node_first_veto)"; F_SPAWN="$(need_fn _pilot_wa_node_spawn_mode)"
 F_DECIDE="$(need_fn _pilot_wa_node_decide)"; F_STATE="$(need_fn _pilot_wa_node_pass_state)"
+F_CLASS="$(need_fn _pilot_priority_class_of)"
+F_HOLD="$(need_fn _pilot_wa_node_pass_hold_for)"; F_WLANE="$(need_fn _pilot_wa_node_pass_waiter_lane)"
 VETO_LINE="$(grep -E '^PILOT_NODE_FIRST_VETO_LABELS="' "$DISPATCHER" | head -1)"
 PWP_INIT="$(grep -E '^(_PWP_[A-Z_]+|_PILOT_WA_NODE_PASS|_PWN_APPLY_RC)=' "$DISPATCHER")"
 EXEMPT_LINE="$(grep -E '^PILOT_WA_NODE_EXEMPT="' "$DISPATCHER" | head -1)"
@@ -122,7 +130,8 @@ PRELUDE='
   [ -z "${T_MEMO_TTL+x}" ] || PILOT_WA_NODE_PASS_MINI_TTL="$T_MEMO_TTL"
   eval "$VETO_LINE"; eval "$PWP_INIT"
   PILOT_WA_NODE_PASS_MEMO="$WORK/city/.gc/wa-node-pass-memo.tsv"; PILOT_WA_NODE_PASS_LOG="$WORK/city/.gc/wa-node-exempt.jsonl"
-  eval "$F_VETO"; eval "$F_SPAWN"; eval "$F_MODE"; eval "$F_PRE"; eval "$F_MHIT"; eval "$F_MPUT"; eval "$F_CHECK"; eval "$F_STATE"; eval "$F_ADOPT"; eval "$F_UNADOPT"; eval "$F_PASS"
+  eval "$F_VETO"; eval "$F_SPAWN"; eval "$F_MODE"; eval "$F_PRE"; eval "$F_MHIT"; eval "$F_MPUT"; eval "$F_CHECK"; eval "$F_STATE"; eval "$F_ADOPT"; eval "$F_UNADOPT"; eval "$F_CLASS"; eval "$F_HOLD"; eval "$F_WLANE"; eval "$F_PASS"
+  _PY_WAIT_ID="${T_WAIT-}"; _PY_WAIT_PRIO=1   # o waiter da cessão (ga-5fn5p3), como a varredura do waiter o deixa antes da passada; vazio = nenhum P0/P1 espera
   _pilot_priority_refusal_of() { case "${T_REFUSAL-}" in FAIL) return 1 ;; *) printf "%s" "${T_REFUSAL-}"; return 0 ;; esac; }
   _top_candidate() { printf "%s" "$1" | jq -c ".[0]"; }
   _bead_tier() { echo feature; }
@@ -389,6 +398,113 @@ T_NODE_ONLY=1 T_STOP=1 pass "$S3" >/dev/null; [ "$(wnd_calls)" = 0 ] && [ "$(d1)
 reset; chk wa-n1 0; chk wa-n2 0; echo 1 > "$WORK/d1.rc.wa-n1"; echo 12 > "$WORK/d1.apply.wa-n1"
 T_NODE_ONLY=1 pass "$S3" >/dev/null
 [ "$(d1)" = "wa-n1 small feature pass=1;" ] && ! grep -q 'wa-n1' "$MEMO" 2>/dev/null && ok "só-nó + nó cheio (rc 12): UMA tentativa por varredura (n2 nem é tentada) e a bead não é memorizada" || bad "só-nó + rc 12: d1=$(d1) memo=$(memo_of)"
+
+echo "── (6b) ga-2hd02v.3.16: o waiter P0/P1 da cessão e a vaga do nó"
+# Medido 30/10 00:2x (Mayor): "priority yield: 176 P2+ ceded to P1 wa-j6r97f (wa-worker 2/2)" e o Hetzner ocioso. A cessão (ga-5fn5p3) protege a RAM do MINI; a vaga do NÓ não é a que o waiter espera (a passada já corre ANTES das pistas
+# e dispensa o yield — ga-2hd02v.9). O que sobra, e é o que esta seção prova: (a) a P2+ com veredito node vai ao nó mesmo com um P1 esperando o mini, e o log conta quantas foram; (b) o PRÓPRIO waiter, se o nó o quer, passa à frente
+# das P2+ mesmo quando está na outra pista (a passada anda small→big, e as 1–3 vagas por varredura iam para as P2+ da small antes de o waiter ser olhado); (c) o waiter SEM veredito legível (unknown/timeout/erro, sondado agora ou
+# memorizado) segura a P2+ — "nunca solta P2 ao nó num palpite sobre a P1" — e nada mais: P0/P1 que não é o waiter, classe ilegível, waiter fora do nó, sem waiter e a chave PILOT_WA_NODE_PASS_HOLD=0 não seguram.
+jbp() { local p="$1"; shift; jb "$@" | jq -c --argjson p "$p" '.priority=$p'; }
+W1="$(jbp 1 wa-w1 U1 wa-worker story:approved)"; Q1="$(jbp 1 wa-q1 U1 wa-worker story:approved)"
+P2A="$(jbp 2 wa-p2a U1 wa-worker story:approved)"; P2B="$(jbp 2 wa-p2b U1 wa-worker story:approved)"
+setok() { local i; for i in "$@"; do echo 0 > "$WORK/d1.rc.$i"; done; }
+summ() { jq -c 'select(.event=="wa-node-pass-summary")' "$PLOG" 2>/dev/null | tail -1; }
+# (a) P1 espera o mini (veredito mini), P2 tem veredito node e há vaga: a P2 vai ao nó — e o resumo conta a P2+ que foi apesar da cessão
+reset; chk wa-w1 10; chk wa-p2a 0; setok wa-p2a
+T_WAIT=wa-w1 pass "[$W1,$P2A]" >/dev/null
+[ "$(d1)" = "wa-p2a small feature pass=1;" ] && ok "waiter P1 com veredito mini + P2 com veredito node + vaga: a P2 vai ao nó (a vaga do nó não é a que o waiter espera)" || bad "P2 não foi ao nó com o waiter em mini: $(d1)"
+summ | jq -e '.p2_to_node==1 and .held==0' >/dev/null 2>&1 && ok "resumo: p2_to_node=1 held=0 (quantas P2+ foram ao nó com um P0/P1 esperando)" || bad "resumo sem p2_to_node: $(summ | cut -c1-300)"
+grep -q 'P2+ ao nó com P0/P1 esperando=1' "$WORK/lines" 2>/dev/null && ok "o log da varredura diz 'P2+ ao nó com P0/P1 esperando=1'" || bad "log sem a contagem de P2+ ao nó: $(grep 'passada de WA' "$WORK/lines" 2>/dev/null | cut -c1-400)"
+# (b) o waiter está na pista big e as P2 na small; UMA vaga: o waiter (veredito node) fica com ela
+reset; chk wa-w1 0; chk wa-p2a 0; chk wa-p2b 0; setok wa-w1 wa-p2a wa-p2b
+T_WAIT=wa-w1 pass "[$P2A,$P2B]" "[$W1]" >/dev/null
+[ "$(d1)" = "wa-w1 big feature pass=1;" ] && ok "waiter na pista big, P2s na small, 1 vaga: o waiter (veredito node) vai ao nó PRIMEIRO" || bad "o waiter perdeu a vaga para as P2+ da outra pista: $(d1)"
+reset; chk wa-w1 0; chk wa-p2a 0; chk wa-p2b 0; setok wa-w1 wa-p2a wa-p2b
+T_WAIT=wa-w1 T_SPAWN=pilot T_SLOTS=3 pass "[$P2A,$P2B]" "[$W1]" >/dev/null
+[ "$(d1)" = "wa-w1 big feature pass=1;wa-p2a small feature pass=1;wa-p2b small feature pass=1;" ] && ok "com 3 vagas: o waiter primeiro e as duas P2 depois (a ordem das pistas só muda para o waiter)" || bad "ordem com 3 vagas: $(d1)"
+reset; chk wa-w1 0; chk wa-p2a 0; setok wa-w1 wa-p2a
+pass "[$P2A]" "[$W1]" >/dev/null
+[ "$(d1)" = "wa-p2a small feature pass=1;" ] && ok "SEM waiter (nenhum P0/P1 espera): a ordem de sempre, small antes de big" || bad "sem waiter a ordem mudou: $(d1)"
+reset; chk wa-w1 0; chk wa-p2a 0; setok wa-w1 wa-p2a
+T_WAIT=wa-w1 pass "[$W1,$P2A]" >/dev/null
+[ "$(d1)" = "wa-w1 small feature pass=1;" ] && ok "waiter e P2 na MESMA pista, 1 vaga: o waiter (P1, antes na ordem) fica com ela" || bad "waiter na mesma pista: $(d1)"
+# (c) waiter SEM veredito legível segura a P2+ com veredito node: nada vai ao nó, ninguém escreve em bead, a P2+ não vira memória
+for rc in 11 124 99; do
+  reset; chk wa-w1 $rc; chk wa-p2a 0; setok wa-p2a
+  T_WAIT=wa-w1 pass "[$W1,$P2A]" >/dev/null
+  [ "$(d1)" = "-" ] && [ ! -f "$WORK/bd.calls" ] && ok "waiter com sonda rc $rc (unknown/timeout/erro): a P2 com veredito node NÃO vai ao nó e nada é escrito em bead" || bad "P2 foi ao nó com o waiter rc $rc ilegível: d1=$(d1)"
+  summ | jq -e '.held==1 and .p2_to_node==0 and .kept==0' >/dev/null 2>&1 && ok "waiter rc $rc: resumo held=1 p2_to_node=0 kept=0" || bad "resumo do waiter rc $rc: $(summ | cut -c1-300)"
+done
+! grep -q 'wa-p2a' "$MEMO" 2>/dev/null && ok "a P2 segurada não entra na memória (o node não se memoriza: é sondada de novo quando o waiter tiver veredito)" || bad "a P2 segurada foi memorizada: $(memo_of)"
+reset; ( eval "$PRELUDE"; _pilot_wa_node_pass_memo_put wa-w1 U1 unknown ) >/dev/null 2>&1; chk wa-p2a 0; setok wa-p2a
+T_WAIT=wa-w1 pass "[$W1,$P2A]" >/dev/null
+[ "$(d1)" = "-" ] && [ "$(wnd_calls)" = 1 ] && grep -q 'wa-p2a' "$WORK/wnd.calls" && ok "waiter JÁ memorizado como unknown (nenhuma sonda dele): segura do mesmo jeito — só a P2 foi sondada" || bad "waiter memorizado unknown: d1=$(d1) sondas=$(wnd_calls)"
+# o memo_hit só devolve mini|unknown|released|sampled (outro valor tem TTL 0 e nem acerta): o `*` do caso é a rede de um valor NOVO — segura, nunca libera a P2+ num palpite sobre o waiter
+reset; chk wa-p2a 0; setok wa-p2a
+SJ="[$W1,$P2A]" T_WAIT=wa-w1 run_t 'SMALL_CANDIDATES="$SJ"; BIG_CANDIDATES="[]"; SMALL_COUNT=2; BIG_COUNT=0
+  _pilot_wa_node_pass_memo_hit() { case "$1" in wa-w1) _PWP_MEMO_V=zzz-novo; return 0 ;; *) return 1 ;; esac; }
+  _pilot_wa_node_pass; echo done' >/dev/null
+[ "$(d1)" = "-" ] && [ "$(wnd_calls)" = 1 ] && ok "memo_hit devolvendo um valor que a passada não conhece (waiter): segura (a P2 com veredito node não vai)" || bad "valor novo do memo_hit não segurou: d1=$(d1) sondas=$(wnd_calls)"
+# o que NÃO segura
+reset; ( eval "$PRELUDE"; _pilot_wa_node_pass_memo_put wa-w1 U1 mini ) >/dev/null 2>&1; chk wa-p2a 0; setok wa-p2a
+T_WAIT=wa-w1 pass "[$W1,$P2A]" >/dev/null; [ "$(d1)" = "wa-p2a small feature pass=1;" ] && ok "waiter memorizado como mini: não segura" || bad "waiter mini memorizado segurou: $(d1)"
+reset; W1V="$(jbp 1 wa-w1 U1 wa-worker story:approved,node:never)"; chk wa-p2a 0; setok wa-p2a
+T_WAIT=wa-w1 pass "[$W1V,$P2A]" >/dev/null; [ "$(d1)" = "wa-p2a small feature pass=1;" ] && ok "waiter com rótulo de veto (nunca irá ao nó): não segura" || bad "waiter vetado segurou: $(d1)"
+reset; W1O="$(jbp 1 wa-w1 U1 wa-worker story:approved mila-wa)"; chk wa-p2a 0; setok wa-p2a
+T_WAIT=wa-w1 pass "[$W1O,$P2A]" >/dev/null; [ "$(d1)" = "wa-p2a small feature pass=1;" ] && ok "waiter com dono (a passada nem o sonda): não segura" || bad "waiter com dono segurou: $(d1)"
+reset; chk wa-w1 11; chk wa-p2a 0; setok wa-p2a
+T_WAIT=ps-zz pass "[$W1,$P2A]" >/dev/null; [ "$(d1)" = "wa-p2a small feature pass=1;" ] && ok "waiter que NÃO está nas pistas de WA: não segura" || bad "waiter fora da passada segurou: $(d1)"
+# a lista das pistas mistura beads de todos os rigs: o waiter ps-*/ga-* está NELA, mas a passada só itera wa-* e nunca o veria — ficaria "unseen" e seguraria toda P2+ para sempre
+for NW in ps-zz ga-zz; do
+  reset; chk wa-w1 11; chk wa-p2a 0; setok wa-p2a; NWB="$(jbp 1 $NW U1 - story:approved)"
+  T_WAIT=$NW pass "[$NWB,$W1,$P2A]" "[]" >/dev/null; [ "$(d1)" = "wa-p2a small feature pass=1;" ] && ok "waiter $NW ESTÁ na pista (bead de outro rig): o nó não o ajuda, não segura — senão ficaria 'unseen' para sempre" || bad "waiter $NW (outro rig) na pista segurou a P2: $(d1)"
+done
+# a pista do waiter sem vaga de despacho: ele não pode ir ao nó nesta varredura, então não segura as P2+ da outra pista
+reset; chk wa-w1 0; chk wa-p2a 0; setok wa-w1 wa-p2a
+T_WAIT=wa-w1 T_SLOTS_BIG=0 pass "[$P2A]" "[$W1]" >/dev/null; [ "$(d1)" = "wa-p2a small feature pass=1;" ] && ok "waiter na pista big SEM vaga de despacho: não vai ao nó nesta varredura e por isso não segura a P2 da small" || bad "waiter sem vaga de pista segurou a P2: $(d1)"
+reset; chk wa-w1 11; chk wa-p2a 0; setok wa-p2a
+pass "[$W1,$P2A]" >/dev/null; [ "$(d1)" = "wa-p2a small feature pass=1;" ] && ok "sem waiter (a cessão ociosa): P1 unknown não segura P2 — o comportamento de sempre" || bad "sem waiter segurou: $(d1)"
+reset; chk wa-w1 11; chk wa-q1 0; setok wa-q1
+T_WAIT=wa-w1 pass "[$W1,$Q1]" >/dev/null; [ "$(d1)" = "wa-q1 small feature pass=1;" ] && ok "outro P1 (não é o waiter) com veredito node: nunca é segurado — só P2+ cede" || bad "P1 não-waiter foi segurado: $(d1)"
+reset; chk wa-w1 11; chk wa-p2a 0; setok wa-p2a; P9="$(jbp 9 wa-p2a U1 wa-worker story:approved)"
+T_WAIT=wa-w1 pass "[$W1,$P9]" >/dev/null; [ "$(d1)" = "wa-p2a small feature pass=1;" ] && ok "prioridade ilegível (classe 5): não segura — 'não sei a classe' nunca segura trabalho (a regra do yield)" || bad "classe ilegível segurou: $(d1)"
+summ | jq -e '.class_blind==1 and .held==0' >/dev/null 2>&1 && ok "…e a classe ilegível é CONTADA (class_blind=1, held=0): o fail-open não é silencioso" || bad "classe ilegível não foi contada: $(summ | cut -c1-300)"
+grep -q 'classe de prioridade ILEGÍVEL' "$WORK/lines" 2>/dev/null && ok "…e AVISADA no log (WARN com a causa)" || bad "classe ilegível sem aviso: $(cut -c1-160 "$WORK/lines" 2>/dev/null | tr '\n' '|')"
+reset; chk wa-w1 10; chk wa-p2a 0; setok wa-p2a
+T_WAIT=wa-w1 pass "[$W1,$P9]" >/dev/null; summ | jq -e '.class_blind==0' >/dev/null 2>&1 && ok "classe ilegível com o waiter COM veredito (mini): nada a contar (class_blind=0) — só conta quando a retenção valeria" || bad "contou classe ilegível sem retenção: $(summ | cut -c1-300)"
+reset; chk wa-w1 11; chk wa-p2a 0; setok wa-p2a
+PILOT_WA_NODE_PASS_HOLD=0 T_WAIT=wa-w1 pass "[$W1,$P2A]" >/dev/null; [ "$(d1)" = "wa-p2a small feature pass=1;" ] && ok "PILOT_WA_NODE_PASS_HOLD=0 desliga a retenção (o comportamento anterior)" || bad "HOLD=0 não desligou: $(d1)"
+reset; chk wa-w1 11; chk wa-p2a 0; setok wa-p2a
+PILOT_WA_NODE_PASS_HOLD=zzz T_WAIT=wa-w1 pass "[$W1,$P2A]" >/dev/null; [ "$(d1)" = "-" ] && ok "PILOT_WA_NODE_PASS_HOLD com valor ilegível: vale o padrão (ligada) — só '0' desliga" || bad "valor ilegível desligou a retenção: $(d1)"
+# o waiter quer o nó, mas o nó está cheio (apply rc 12): a passada para como sempre — a P2 não passa na frente
+reset; chk wa-w1 0; chk wa-p2a 0; echo 1 > "$WORK/d1.rc.wa-w1"; echo 12 > "$WORK/d1.apply.wa-w1"; setok wa-p2a
+T_WAIT=wa-w1 T_SPAWN=pilot T_SLOTS=3 pass "[$W1,$P2A]" >/dev/null; [ "$(d1)" = "wa-w1 small feature pass=1;" ] && ok "waiter com veredito node e nó cheio (rc 12): a passada para, a P2 nem é tentada" || bad "P2 passou na frente do waiter com o nó cheio: $(d1)"
+# pista ilegível COM waiter: não sei onde ele está (talvez na pista que não leio) — o estado inerte é segurar, nunca "sem waiter"; a pista legível ainda é percorrida (e sem waiter, a ilegível não segura nada)
+reset; chk wa-p2a 0; setok wa-p2a
+T_WAIT=wa-w1 pass "isto não é json" "[$P2A]" >/dev/null; [ "$(d1)" = "-" ] && ok "pista small ilegível + waiter conhecido: a P2 da big NÃO vai ao nó (não sei onde o waiter está)" || bad "pista ilegível com waiter não segurou: $(d1)"
+reset; chk wa-p2a 0; setok wa-p2a
+pass "isto não é json" "[$P2A]" >/dev/null; [ "$(d1)" = "wa-p2a big feature pass=1;" ] && ok "pista small ilegível SEM waiter: a big é percorrida como sempre" || bad "pista ilegível sem waiter: $(d1)"
+
+# os ajudantes sozinhos
+wlane() { SJ="$1" BJ="$2" run_t 'SMALL_CANDIDATES="$SJ"; BIG_CANDIDATES="$BJ"; x=0; o=$(_pilot_wa_node_pass_waiter_lane) || x=$?; echo "rc=$x out=[$o]"'; }
+r=$(T_WAIT=wa-w1 wlane "[$P2A]" "[$W1]");        [ "$r" = "rc=0 out=[big]" ]   && ok "pista do waiter: big" || bad "waiter_lane big: $r"
+r=$(T_WAIT=wa-w1 wlane "[$W1]" "[$P2A]");        [ "$r" = "rc=0 out=[small]" ] && ok "pista do waiter: small" || bad "waiter_lane small: $r"
+r=$(T_WAIT=wa-w1 wlane "[$P2A]" "[]");           [ "$r" = "rc=0 out=[none]" ]  && ok "waiter em nenhuma pista: none" || bad "waiter_lane none: $r"
+r=$(T_WAIT= wlane "[$W1]" "[]");                 [ "$r" = "rc=0 out=[none]" ]  && ok "sem waiter: none" || bad "waiter_lane sem waiter: $r"
+r=$(T_WAIT=ps-zz wlane "[$(jbp 1 ps-zz U1 - x)]" "[]"); [ "$r" = "rc=0 out=[none]" ] && ok "waiter que não é wa-*: none, mesmo estando na pista" || bad "waiter_lane ps: $r"
+r=$(T_WAIT=wa-w1 wlane "isto não é json" "[]");  [ "$r" = "rc=1 out=[]" ]      && ok "pista ilegível: rc 1 e NADA impresso (nunca 'none')" || bad "waiter_lane ilegível: $r"
+r=$(T_WAIT=wa-w1 wlane "[]" "isto não é json");  [ "$r" = "rc=1 out=[]" ]      && ok "pista big ilegível: rc 1 também" || bad "waiter_lane big ilegível: $r"
+hold() { run_t "x=0; _pilot_wa_node_pass_hold_for '$1' '$2' || x=\$?; echo \"rc=\$x\""; }
+r=$(T_WAIT=wa-w1 hold "$P2A" blind);  [ "$r" = "rc=0" ] && ok "hold_for: P2 + waiter blind → segura" || bad "hold_for P2/blind: $r"
+r=$(T_WAIT=wa-w1 hold "$P2A" unseen); [ "$r" = "rc=0" ] && ok "hold_for: P2 + waiter unseen → segura" || bad "hold_for P2/unseen: $r"
+for v in node out ""; do r=$(T_WAIT=wa-w1 hold "$P2A" "$v"); [ "$r" = "rc=1" ] && ok "hold_for: P2 + waiter '$v' → não segura" || bad "hold_for P2/'$v': $r"; done
+r=$(T_WAIT=wa-w1 hold "$Q1" blind);   [ "$r" = "rc=1" ] && ok "hold_for: P1 nunca é segurado" || bad "hold_for P1: $r"
+r=$(T_WAIT= hold "$P2A" blind);       [ "$r" = "rc=1" ] && ok "hold_for: sem waiter → não segura" || bad "hold_for sem waiter: $r"
+P9B="$(jbp 9 wa-p9 U1 wa-worker x)"
+r=$(T_WAIT=wa-w1 hold "$P9B" blind);  [ "$r" = "rc=2" ] && ok "hold_for: classe ilegível + waiter blind → rc 2 (não segura, e quem chama CONTA)" || bad "hold_for classe ilegível/blind: $r"
+r=$(T_WAIT=wa-w1 hold "$P9B" unseen); [ "$r" = "rc=2" ] && ok "hold_for: classe ilegível + waiter unseen → rc 2" || bad "hold_for classe ilegível/unseen: $r"
+r=$(T_WAIT=wa-w1 hold "$P9B" out);    [ "$r" = "rc=1" ] && ok "hold_for: classe ilegível mas o waiter tem veredito → rc 1 (a retenção nem valeria: nada a contar)" || bad "hold_for classe ilegível/out: $r"
+r=$(T_WAIT=wa-w1 hold "" blind);      [ "$r" = "rc=2" ] && ok "hold_for: bead ilegível/vazia + waiter blind → rc 2, nunca 0" || bad "hold_for bead vazia: $r"
 
 echo "── (7) dispatch_one: o bloco do yield e o braço do pool (regiões VERBATIM)"
 run_block() {
