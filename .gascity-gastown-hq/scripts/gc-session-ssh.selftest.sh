@@ -71,7 +71,7 @@ cat > "$T/bin/ssh" <<'EOF'
 #!/bin/sh
 # ssh falso: registra, simula falhas (FAKE_SSH_*) e roda o comando remoto aqui mesmo (sem as opções -o/-t, sem o destino)
 [ -z "${FAKE_SSH_LOG:-}" ] || printf '%s\n' "ssh $*" >> "$FAKE_SSH_LOG"
-[ -z "${FAKE_SSH_FAIL:-}" ] || { echo "ssh: connect to host fakehost port 22: Connection timed out" >&2; exit 255; }
+[ -z "${FAKE_SSH_FAIL:-}" ] || { [ -z "${FAKE_SSH_FAIL_AFTER:-}" ] || sleep "$FAKE_SSH_FAIL_AFTER"; echo "ssh: connect to host fakehost port 22: Connection timed out" >&2; exit 255; }  # FAKE_SSH_FAIL_AFTER=N: o host fora leva N s para falhar (o ConnectTimeout de verdade)
 [ -z "${FAKE_SSH_HANG:-}" ] || exec sleep 30
 while [ $# -gt 0 ]; do case "$1" in -o) shift 2;; -*) shift;; *) break;; esac; done
 [ -z "${FAKE_SSH_FAIL_HOST:-}" ] || [ "$FAKE_SSH_FAIL_HOST" != "$1" ] || { echo "ssh: connect to host $1 port 22: Operation timed out" >&2; exit 255; }
@@ -1159,6 +1159,56 @@ g_lr() {
   for x in lr-1 lr-5 lr-6; do pv stop $x </dev/null; done; rm -f "$T/state/a/running/"* 2>/dev/null; cfg 3
 }
 
+# ---------- lrd: host FORA do ar — o fato "não respondeu" também é guardado por pouco tempo, e devolve ERRO rápido (ga-sml4tqk) ----------
+g_lrd() {
+  local LR="$T/state/a/lr" D="$T/state/a/lr/down.json" i s t0 bad x
+  down() { rm -rf "$LR"; FAKE_SSH_FAIL=1 lrv list-running "" </dev/null; }  # estado limpo (sem lista guardada que esconda a falha) + o host fora visto uma vez: o fato 'fora' fica guardado
+  cfg 3 25 '{"list_cache_s":30,"list_down_cache_s":30}'; rm -rf "$LR"; fresh
+  t0=$SECONDS; bad=0
+  for i in $(seq 1 20); do
+    FAKE_SSH_FAIL=1 FAKE_SSH_FAIL_AFTER=1 lrv list-running "" </dev/null; [ $RC = 1 ] && [ ! -s "$T/out" ] || bad=$((bad+1))
+  done
+  s=$((SECONDS - t0))
+  [ "$bad" = 0 ]; ok $? "lrd: host fora → 20 list-running seguidos dão ERRO (rc 1) e nenhum devolve lista, nem vazia (falhas=$bad)"
+  [ "$(calls)" = 1 ]; ok $? "lrd: ...e só a 1ª chamada tenta o ssh (ssh=$(calls); sem o cache do host fora seriam 20)"
+  [ "$s" -lt 12 ]; ok $? "lrd: ...as 20 chamadas levam ${s}s (sem o cache do host fora: 20 s ou mais, o ssh leva 1 s para falhar)"
+  has "$T/err" 'Connection timed out' && has "$T/err" 'guardado'; ok $? "lrd: o erro rápido leva o motivo do ssh e diz que veio do que está guardado"
+  [ ! -e "$LR/cache.json" ]; ok $? "lrd: o host fora não deixa LISTA guardada (cache.json ausente)"
+  # --- vence o prazo: pergunta ao host de novo; o host de volta apaga o fato ---
+  age "$D" 100; fresh; FAKE_SSH_FAIL=1 lrv list-running "" </dev/null; [ $RC = 1 ] && [ "$(calls)" = 1 ] && jq -e '.ts > (now - 20)' "$D" >/dev/null; ok $? "lrd: fato vencido pergunta ao host de novo e, ainda fora, renova o carimbo (rc=$RC)"
+  age "$D" 100; fresh; lrv list-running "" </dev/null; [ $RC = 0 ] && [ ! -s "$T/out" ] && [ "$(calls)" = 1 ] && [ ! -e "$D" ] && [ -s "$LR/cache.json" ]; ok $? "lrd: host de volta = a resposta de verdade, o fato 'fora' some e a lista passa a ser guardada (rc=$RC)"
+  # --- só "não respondeu" é guardado: resposta cortada e sem marcadores continuam erro de cada chamada ---
+  rm -rf "$LR"
+  fresh; FAKE_SSH_CUT=1 lrv list-running "" </dev/null; [ $RC = 1 ] && [ ! -e "$D" ] && [ ! -e "$LR/cache.json" ]; ok $? "lrd: resposta cortada (o host respondeu torto) = erro e NADA guardado: nem lista nem 'fora' (rc=$RC)"
+  fresh; FAKE_SSH_JUNK=1 lrv list-running "" </dev/null; [ $RC = 1 ] && [ ! -e "$D" ] && [ ! -e "$LR/cache.json" ]; ok $? "lrd: resposta sem marcadores = erro e NADA guardado: nem lista nem 'fora' (rc=$RC)"
+  # --- ssh mudo (tempo esgotado) também é "não respondeu" ---
+  cfg 3 2 '{"list_cache_s":30,"list_down_cache_s":30}'; rm -rf "$LR"; fresh; FAKE_SSH_HANG=1 lrv list-running "" </dev/null; x=$RC
+  fresh; FAKE_SSH_HANG=1 lrv list-running "" </dev/null; [ $x = 1 ] && [ $RC = 1 ] && nossh && has "$T/err" 'não respondeu'; ok $? "lrd: ssh mudo (tempo esgotado) vira o fato 'fora': a 2ª chamada é erro rápido, sem ssh (rc=$x/$RC)"
+  # --- start e stop invalidam ---
+  cfg 3 25 '{"list_cache_s":30,"list_down_cache_s":30}'; rm -rf "$LR"; FAKE_SSH_FAIL=1 lrv list-running "" </dev/null; [ -s "$D" ]; ok $? "lrd: ponto de partida: o fato 'fora' está guardado"
+  pv stop lrd-x </dev/null; [ ! -e "$D" ]; ok $? "lrd: stop apaga o fato 'fora'"
+  FAKE_SSH_FAIL=1 lrv list-running "" </dev/null; [ -s "$D" ]; FAKE_SSH_FAIL=1 pv start lrd-x < <(req cat); [ $RC = 1 ] && [ ! -e "$D" ]; ok $? "lrd: start (que também falha, com o host fora) apaga o fato 'fora' (rc=$RC)"
+  # --- forma errada, carimbo do futuro, outra geração, arquivo ilegível: pergunta ao host, nunca erro inventado ---
+  for bad in '.msg=1' '.msg=""' 'del(.msg)' '.gen="outra"' 'del(.gen)' 'del(.ts)' '.ts=true' '.ts="agora"'; do
+    down; jq "$bad" "$D" > "$D.x" && mv "$D.x" "$D"; fresh; lrv list-running "" </dev/null
+    [ $RC = 0 ] && [ "$(calls)" = 1 ]; ok $? "lrd: fato com a forma errada ($bad) é ignorado: pergunta ao host, que respondeu (rc=$RC)"
+  done
+  down; age "$D" -1000; fresh; lrv list-running "" </dev/null; [ $RC = 0 ] && [ "$(calls)" = 1 ]; ok $? "lrd: carimbo no FUTURO (relógio que voltou) não prova nada: pergunta ao host (rc=$RC)"
+  for x in 'isto não é json' ''; do
+    down; printf '%s' "$x" > "$D"; fresh; lrv list-running "" </dev/null; [ $RC = 0 ] && [ "$(calls)" = 1 ]; ok $? "lrd: arquivo do fato 'fora' ilegível/vazio ('${x:-vazio}') é ignorado: pergunta ao host (rc=$RC)"
+  done
+  # --- dry-run não usa, 0 desliga, list_cache_s 0 desliga tudo, validação da chave ---
+  down; fresh; lrv --dry-run list-running "" </dev/null; [ $RC = 0 ] && has "$T/out" '"script"' && nossh; ok $? "lrd: dry-run não usa o fato 'fora' (mostra o que rodaria) (rc=$RC)"
+  cfg 3 25 '{"list_cache_s":30,"list_down_cache_s":0}'; rm -rf "$LR"; fresh; FAKE_SSH_FAIL=1 lrv list-running "" </dev/null; FAKE_SSH_FAIL=1 lrv list-running "" </dev/null; [ "$(calls)" = 2 ] && [ ! -e "$D" ]; ok $? "lrd: list_down_cache_s 0 desliga: 2 chamadas, 2 ssh e nada guardado"
+  cfg 3 25 '{"list_cache_s":0}'; rm -rf "$LR"; fresh; FAKE_SSH_FAIL=1 lrv list-running "" </dev/null; FAKE_SSH_FAIL=1 lrv list-running "" </dev/null; [ "$(calls)" = 2 ] && [ ! -e "$D" ]; ok $? "lrd: list_cache_s 0 desliga o cache do list-running INTEIRO, também o do host fora"
+  cfg 3 25 '{"list_cache_s":30}'; rm -rf "$LR"; fresh; FAKE_SSH_FAIL=1 lrv list-running "" </dev/null; FAKE_SSH_FAIL=1 lrv list-running "" </dev/null; [ "$(calls)" = 1 ] && [ -s "$D" ]; ok $? "lrd: sem list_down_cache_s o padrão (30 s) vale: 2 chamadas, 1 ssh"
+  for bad in '"30"' true false -1 61 1.5 null '[]' '{}'; do
+    cfg 3 25 "{\"list_cache_s\":30,\"list_down_cache_s\":$bad}"; fresh; lrv list-running "" </dev/null; [ $RC = 1 ] && has "$T/err" "'list_down_cache_s'" && nossh; ok $? "lrd: list_down_cache_s=$bad recusa a config nomeando a chave, sem ssh (rc=$RC)"
+  done
+  cfg 3 25 '{"list_cache_s":30,"list_down_cache_s":60}'; rm -rf "$LR"; fresh; lrv list-running "" </dev/null; [ $RC = 0 ]; ok $? "lrd: 60 (o teto) é aceito (rc=$RC)"
+  rm -rf "$LR" "$T/state/a/running"; cfg 3
+}
+
 g_abort() {  # ga-0k82lw: o start que o mini ABANDONOU (prazo do provider estourado, ou o engine mata o processo no meio) não pode deixar sessão no host: o script do host ainda roda e abriria a tmux "depois do close"
   local bin="$T/home/.local/bin" real i pid mode srt brc; real=$(command -v sha256sum); mkdir -p "$bin"
   slowhost() {  # passo lento ANTES do new-session: o portão de uma sessão real roda `sha256sum` no host (real_gate); o falso marca que começou, espera $1 s e chama o de verdade
@@ -1219,7 +1269,7 @@ g_shard() {  # o filtro do PRÓPRIO selftest (GCSSH_SHARD, GCSSH_ONLY, GCSSH_MUT
   [ $rr = 0 ] && [ "$(printf '%s\n' "$oo" | grep -c '^ok   mutante .* pego')" = 1 ] && printf '%s\n' "$oo" | grep -q '^== final: 1/1 ok ==$' && ! printf '%s\n' "$oo" | grep -q 'NADA RODOU'; ok $? "shard: (controle) GCSSH_SHARD=1/9999 roda exatamente 1 mutante, pego, e sai 0 (rc=$rr: $(printf '%s' "$oo" | tail -c 110))"
 }
 
-all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group gui && g_gui; group acct && g_acct; group prof && g_prof; group lr && g_lr; group abort && g_abort; group shard && g_shard; return 0; }
+all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group gui && g_gui; group acct && g_acct; group prof && g_prof; group lr && g_lr; group lrd && g_lrd; group abort && g_abort; group shard && g_shard; return 0; }
 
 if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
 # GCSSH_SHARD=K/N: dois decimais canônicos (sem sinal, sem espaço, sem zero à esquerda: `[ 3 = 03 ]` é falso e $((mn % 010)) é octal, então a fatia ficaria vazia ou trocada sem aviso), N de 1 a 9999 e K de 0 a N-1
