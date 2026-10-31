@@ -66,6 +66,7 @@ probe() {
   P_OUT="$(env -u GATE_FOCUS_ACTIVE_OVERRIDE -u GATE_FOCUS_STATE_FILE BD_LOG="$TMP/bd.log" BD_FIX="$FIX" PATH="$FAKE:$PATH" \
       GC_SESSION_ORIGIN=ephemeral DISK_FREE_OVERRIDE_MB=100000 POOL_PROBE_LOG="$TMP/pp.log" \
       POOL_PROBE_FOCUS_LIB="$FOCUS_LIB" POOL_PROBE_DISK_LIB="$DISK_LIB" POOL_PROBE_SLING_LIB="$SLING_LIB" \
+      POOL_PROBE_CHILDREN_LIB=/nonexistent/children-in-hand-lib.sh \
       "$@" sh "$PROBE" gastown.dog 2>"$TMP/err" </dev/null)"; P_RC=$?
   P_ERR="$(cat "$TMP/err")"
   P_IDS="$(printf '%s' "$P_OUT" | jq -r 'if type == "array" then map(.id) | join(",") else "?" end' 2>/dev/null)"
