@@ -1,4 +1,4 @@
-# pilot-dispatcher.wa-node-spawn.mutants.py — o mutador do pilot-dispatcher.wa-node-spawn.selftest.sh (ga-2hd02v.3): 89 quebras de UMA linha do pilot-dispatcher.sh, cada uma com um nome.
+# pilot-dispatcher.wa-node-spawn.mutants.py — o mutador do pilot-dispatcher.wa-node-spawn.selftest.sh (ga-2hd02v.3): 111 quebras de UMA linha do pilot-dispatcher.sh, cada uma com um nome.
 #
 # Contents
 #   Uso · Como cada mutante é escrito
@@ -507,6 +507,118 @@ def _():
 @m("idle-secs-longo")
 def _():
     rep('else _is=300; fi', 'else _is=0; fi')
+
+
+# ── H. ga-2hd02v.3.26: abertura do nó (retry sem o alias ocupado), reserva do P0/P1 ──
+
+@m("reapply-nao-pula-o-alias")
+def _():
+    rep('WA_NODE_SKIP_ALIASES="$_ra_skip" WA_NODE_SPAWN=', 'WA_NODE_SPAWN=')
+
+
+@m("decide-ignora-a-reserva")
+def _():
+    rep('    if _pilot_node_reserved_for "$_bj"; then', '    if false; then')
+
+
+@m("retry-sem-teto-de-tentativas")
+def _():
+    rep('    [ "$_wo_try" -lt "$_wo_max" ] || break', '    :')
+
+
+@m("retry-sem-teto-de-2")
+def _():
+    rep('if [ "$_wo_max" -gt 2 ]; then _wo_max=2; fi', ':')
+
+
+@m("retry-teto-sem-menos-um")
+def _():
+    rep('_wo_max=$(( _PWN_SLOTS - 1 ))', '_wo_max=$(( _PWN_SLOTS ))')
+
+
+@m("retry-por-qualquer-falha")
+def _():
+    rep('    [ "${_PNR_FAIL:-}" = busy ] || break', '    :')
+
+
+@m("retry-no-rc-2")
+def _():
+    rep('    [ "$_wo_rc" = 1 ] || break', '    [ "$_wo_rc" != 0 ] || break')
+
+
+@m("retry-ignora-orcamento-de-spawn")
+def _():
+    rep('if _pilot_slow_spawn_budget_spent || _pilot_dispatch_should_stop; then break; fi', 'if _pilot_dispatch_should_stop; then break; fi')
+
+
+@m("retry-ignora-despacho-parado")
+def _():
+    rep('if _pilot_slow_spawn_budget_spent || _pilot_dispatch_should_stop; then break; fi', 'if _pilot_slow_spawn_budget_spent; then break; fi')
+
+
+@m("retry-alias-fora-do-padrao")
+def _():
+    rep('    case "${_PNR_FAIL_ALIAS:-}" in wa-worker-remote-[1-9]) ;; *) break ;; esac', '    :')
+
+
+@m("retry-esquece-os-pulados")
+def _():
+    rep('_wo_skip="$_wo_skip $_PNR_FAIL_ALIAS"', '_wo_skip="$_PNR_FAIL_ALIAS"')
+
+
+@m("retry-ignora-o-rc-do-reapply")
+def _():
+    rep('if [ "$_wo_ra" != 0 ]; then _wo_rc="$_wo_ra"; break; fi', ':')
+
+
+@m("falha-de-abertura-nao-guarda-o-motivo")
+def _():
+    rep('    if [ "$_ro_st" = busy ]; then _PNR_FAIL=busy; fi', '    :')
+
+
+@m("falha-de-abertura-sempre-busy")
+def _():
+    rep('    if [ "$_ro_st" = busy ]; then _PNR_FAIL=busy; fi', '    _PNR_FAIL=busy')
+
+
+@m("falha-de-abertura-nao-zera")
+def _():
+    rep('  _PNR_FAIL=""; _PNR_FAIL_ALIAS=""', '  :')
+
+
+@m("abertura-ok-nao-limpa-a-reserva")
+def _():
+    rep('    0) _pilot_node_reserve_clear "$_wo_id" ;;', '    0) ;;')
+
+
+@m("abertura-falha-nao-reserva")
+def _():
+    rep('    1|2) _pilot_node_reserve_set "${_PWN_BJ:-}" "$_wo_id"', '    1|2) : "${_PWN_BJ:-}" "$_wo_id"')
+
+
+@m("reapply-incerto-nao-reserva")
+def _():
+    rep('    _pilot_node_reserve_set "${_PWN_BJ:-}" "$_ra_id" "apply refeito rc=$_ra_rc (resultado incerto)" 2', '    :')
+
+
+@m("reapply-incerto-nao-desfaz")
+def _():
+    rep('    _pilot_wa_node_settle "$_ra_id" "$_ra_store"', '    :')
+
+
+@m("rc-incerto-so-13-e-124")
+def _():
+    rep('    13|124|137|143|12[89]|1[3-9][0-9]|2[0-4][0-9]|25[0-5]) return 0 ;;', '    13|124) return 0 ;;')
+
+
+@m("decide-incerto-nao-reserva")
+def _():
+    rep('_pilot_node_reserve_set "$_bj" "$_id" "apply rc=$_rc (resultado incerto)" 2', ':')
+
+
+@m("decide-sinal-nao-reserva")
+def _():
+    rep('_pilot_node_reserve_set "$_bj" "$_id" "apply rc=$_rc (morto por sinal)" 2', ':')
 
 
 if len(sys.argv) == 2 and sys.argv[1] == "--list":

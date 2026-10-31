@@ -27,6 +27,7 @@
 #   estado que não é `active`, outro template, dois alias iguais) = OCUPADA, o inerte. Antes, toda sessão viva enchia um slot: 3 vivas (uma já sem bead) = 12 `sessao-viva` em toda varredura (27 em ~19 h).
 # Env: WA_NODE_SPAWN (pool|pilot, padrão pool; outro valor = pool), WA_NODE_SLOTS (1..9, padrão 1; vazio ou ilegível = 1), WA_NODE_ALIAS_PREFIX (wa-worker-remote-), WA_NODE_CAPACITY (hetzner-capacity.py), WA_NODE_CAPACITY_TIMEOUT (45 s), WA_NODE_IDLE_SECS (300 s: quanto tempo uma sessão sem bead fica quieta antes de valer como vaga; só modo pilot).
 # Env (identidade, para o wrapper de OUTRA loja — o ps-node-dispatch.sh da bead de PS): WA_NODE_SELF (nome que as mensagens e o comentário da bead usam, padrão wa-node-dispatch.sh), WA_NODE_STORY (bead que o comentário cita, padrão ga-2hd02v.1.10).
+# Env (ga-2hd02v.3.26): WA_NODE_SKIP_ALIASES (aliases separados por espaço ou vírgula que o apply NÃO escolhe nesta chamada: o gancho do Pilot achou a sessão do alias viva e ocupada entre a leitura do script e a dele e repete o apply sem ele; vazio ou só lixo = nenhum, o de sempre).
 # Env (teste): GC_CITY, WA_NODE_BD (bd), WA_NODE_GC (gc), WA_NODE_CLASSIFY, WA_NODE_PY, WA_NODE_ALIAS (alias único: ganha de SLOTS e do prefixo; padrão <prefixo>1), WA_NODE_ROUTE_TEMPLATE (wa-worker-remote), WA_NODE_LOG, WA_NODE_TIMEOUT (20 s), WA_NODE_SESSION_TIMEOUT (60 s, só para `gc session list`).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -42,6 +43,16 @@ SLOTS="${WA_NODE_SLOTS:-1}"; case "$SLOTS" in [1-9]) ;; *) SLOTS=1 ;; esac
 ALIASES=""; k=1
 if [ -n "${WA_NODE_ALIAS:-}" ]; then ALIASES="$WA_NODE_ALIAS"; SLOTS=1; else while [ "$k" -le "$SLOTS" ]; do ALIASES="$ALIASES ${PREFIX}$k"; k=$((k+1)); done; ALIASES="${ALIASES# }"; fi
 ALIAS="${ALIASES%% *}"   # o 1º: o único em pool, o de mensagem quando só há um
+# ga-2hd02v.3.26: aliases que ESTA chamada não escolhe (WA_NODE_SKIP_ALIASES). Eles continuam na conta de slots e de sessões vivas (uma bead em andamento ou uma sessão do alias segue contando); só deixam de ser candidatos a PICK e à sessão ociosa
+# reaproveitada. vazio (variável ausente ou vazia) → nenhum pulado, o de sempre; falhou/ilegível (token com caractere fora de [A-Za-z0-9._-], p.ex. glob ou aspas) → o token é IGNORADO (não pula nada: nenhum alias real tem esse nome), nunca vira "pular todos".
+SKIP=""
+while IFS= read -r _sk; do
+  case "$_sk" in ''|*[!A-Za-z0-9._-]*) continue ;; esac
+  SKIP="$SKIP $_sk"
+done <<EOF_SKIP
+$(printf '%s' "${WA_NODE_SKIP_ALIASES:-}" | tr -s ' ,\t' '\n\n\n')
+EOF_SKIP
+skipped() { case "$SKIP " in *" $1 "*) return 0 ;; esac; return 1; }   # 0 = este alias é pulado
 CAP="${WA_NODE_CAPACITY:-$HERE/hetzner-capacity.py}"
 CTMO="${WA_NODE_CAPACITY_TIMEOUT:-45}"
 case "$CTMO" in ''|*[!0-9]*) CTMO=45 ;; esac   # o oráculo mede o nó por ssh (o Pilot dá 40 s ao veredito inteiro); prazo ilegível volta ao padrão
@@ -157,6 +168,7 @@ apply)
     case "$(printf '%s' "$idle_json" | jq -r 'if type=="array" then "ok" else "x" end' 2>/dev/null)" in ok) ;; *) jlog apply "$id" 11 "ociosidade-ilegivel"; die 11 "não consegui avaliar quais sessões estão ociosas — fica no mini" ;; esac
     idle_al=$(printf '%s' "$idle_json" | jq -r '.[]' 2>/dev/null) || idle_al=""   # lista vazia lida → nenhuma ociosa provada; o formato já foi provado acima
     for A in $free_a; do
+      skipped "$A" && continue                                                 # ga-2hd02v.3.26: o gancho do Pilot recusou este alias nesta rodada (sessão ocupada): não é vaga para reaproveitar
       [ "$(printf '%s\n' "$live_al" | grep -cxF -- "$A")" = 1 ] || continue   # exatamente UMA sessão viva com o alias; duas = não há uma só para reaproveitar
       printf '%s\n' "$idle_al" | grep -qxF -- "$A" || continue                # e é a ociosa provada
       reuse_a="$reuse_a $A"; n_reuse=$((n_reuse+1))
@@ -169,9 +181,9 @@ apply)
   PICK=""; REUSED=0
   for A in $reuse_a; do PICK="$A"; REUSED=1; break; done
   if [ -z "$PICK" ]; then
-    for A in $free_a; do printf '%s\n' "$live_al" | grep -qxF -- "$A" || { PICK="$A"; break; }; done
+    for A in $free_a; do skipped "$A" && continue; printf '%s\n' "$live_al" | grep -qxF -- "$A" || { PICK="$A"; break; }; done
   fi
-  [ -n "$PICK" ] || { jlog apply "$id" 12 "slot-sem-alias-livre"; die 12 "todo alias sem bead em andamento ($free_a ) ainda tem sessão viva — sem slot livre agora"; }
+  [ -n "$PICK" ] || { jlog apply "$id" 12 "slot-sem-alias-livre"; die 12 "todo alias sem bead em andamento ($free_a ) ainda tem sessão viva${SKIP:+ ou foi pulado ($SKIP )} — sem slot livre agora"; }
   if [ "$SPAWN" = pilot ]; then
     # teto do nó (ga-2hd02v.3): o oráculo diz se cabe mais uma sessão (degrau × cap do provider × CPU/RAM medidos). Beads já atribuídas cuja sessão ainda não subiu o oráculo não vê: descontam da vaga dele.
     # vazio (sem saída) / falhou / ilegível (arquivo ausente, rc fora de 0/1, prazo, JSON ruim, rc e veredito que discordam, `free` que não é inteiro ≥ 1 num `node`) → 11, NUNCA node por engano; local (rc 1) → 12.
