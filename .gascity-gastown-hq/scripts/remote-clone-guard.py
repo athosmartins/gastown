@@ -791,6 +791,12 @@ def selfcheck(args: list) -> int:
                            and any(hook_re.fullmatch(h.get("command", "").strip()) and h.get("type") == "command" and set(h) <= {"type", "command", "timeout", "onFailure"} and h.get("onFailure", "block") == "block" for h in g.get("hooks", []))
                            for g in groups):
                     raise ValueError(f"{tool}: nenhum hook PreToolUse é exatamente `python3 -I {me} || exit 2` (só type/command/timeout e onFailure \"block\"; sem `if`, async…)")
+            # o claude NÃO carrega o settings INTEIRO se QUALQUER hook dele, de qualquer evento e não só o do guarda, traz onFailure fora de "continue"/"block" (MEDIDO): o guarda nem rodaria. vazio (sem o campo) → vale; ilegível (valor fora do enum) → o selfcheck falha
+            for ev, gs in (s.get("hooks") or {}).items():
+                for g in gs:
+                    for h in g.get("hooks", []):
+                        if "onFailure" in h and h["onFailure"] not in ("continue", "block"):
+                            raise ValueError(f"{ev}: onFailure {h['onFailure']!r} fora de \"continue\"/\"block\": o claude não carrega o settings inteiro (o guarda nem roda)")
         except (OSError, ValueError, AttributeError, KeyError, TypeError, re.error) as e:
             ok = False
             print(f"selfcheck: settings {args[0]}: {e}", file=sys.stderr)

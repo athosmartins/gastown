@@ -916,6 +916,17 @@ EOF
     setof "$s" "$of"; python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; [ $? = 1 ]; ok $? "check: hook com \`$of\` → falha (só \"block\", e só no hook)"
   done
   setof "$s" 'h["onFailure"] = "continue"'; python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; grep -q 'onFailure' "$T/err"; ok $? "check: ...e a falha diz que o problema é o onFailure"
+  # a CLASSE: um onFailure fora do enum em QUALQUER outro hook do arquivo (outro evento, ou um segundo hook no mesmo grupo) também derruba o settings inteiro, com o hook do guarda perfeito ao lado
+  for of in 'd["hooks"].setdefault("Stop", [{"hooks": [{"type": "command", "command": "true", "onFailure": "Block"}]}])' \
+            'd["hooks"].setdefault("Stop", [{"hooks": [{"type": "command", "command": "true", "onFailure": 1}]}])' \
+            'g["matcher"] == "Bash" and g["hooks"].append({"type": "command", "command": "true", "onFailure": "Block"})'; do
+    setof "$s" "$of"; python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; [ $? = 1 ] && grep -q 'fora de "continue"/"block"' "$T/err"; ok $? "check: outro hook do arquivo com \`${of:0:90}…\` → falha dizendo que o claude não carregaria o settings"
+  done
+  for of in 'd["hooks"].setdefault("Stop", [{"hooks": [{"type": "command", "command": "true", "onFailure": "continue"}]}])' \
+            'd["hooks"].setdefault("Stop", [{"hooks": [{"type": "command", "command": "true", "onFailure": "block"}]}])' \
+            'g["matcher"] == "Bash" and g["hooks"].append({"type": "command", "command": "true", "onFailure": "continue"})'; do
+    setof "$s" "$of"; python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; ok $? "check: outro hook do arquivo com onFailure válido (\`${of: -48}\`) → ok (o enum do claude é continue|block)"
+  done
   settings "$s" "Bash" "Edit|Write|MultiEdit|NotebookEdit"; python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));d["disableAllHooks"]=True;json.dump(d,open(sys.argv[1],"w"))' "$s"
   python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; [ $? = 1 ]; ok $? "check: disableAllHooks ligado → falha"
   settings "$s" "Bash" "Edit|Write|MultiEdit|NotebookEdit"; local pd="$T/proj" cl; mkdir -p "$pd/.claude"
@@ -1252,6 +1263,8 @@ echo "== $((n-fails))/$n ok =="
   mutant check "selfcheck aceita qualquer valor de onFailure (continue, Block, true…)" 's/ and h.get("onFailure", "block") == "block"//'
   mutant check "selfcheck vale onFailure pela verdade do valor (continue e Block passam)" 's/h.get("onFailure", "block") == "block"/h.get("onFailure", "block")/'
   mutant check "selfcheck exige o campo (o settings que o servidor tem hoje reprova)" 's/h.get("onFailure", "block") == "block"/h.get("onFailure") == "block"/'
+  mutant check "selfcheck só olha o onFailure dos hooks do guarda (um inválido em outro hook derruba o settings inteiro e passa)" 's/if "onFailure" in h and h\["onFailure"\] not in ("continue", "block"):/if False:/'
+  mutant check "selfcheck rejeita onFailure continue em OUTRO hook (o enum do claude tem os dois valores)" 's/h\["onFailure"\] not in ("continue", "block"):/h["onFailure"] != "block":/'
   mutant check "selfcheck ignora campo extra do grupo" 's/ and set(g) <= {"matcher", "hooks"}//'
   mutant check "selfcheck não exige type=command" 's/ and h.get("type") == "command"//'
   mutant budget "um { guardado, ao reexecutar um corpo, reabre a definição (o laço sem fim do pedido do runbook)" 's/if not st.get("calling") and (seg\[:1\] == \["{"\]/if (seg[:1] == ["{"]/'
