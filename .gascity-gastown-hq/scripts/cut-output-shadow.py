@@ -3,7 +3,9 @@
 hook, SHADOW MODE ONLY. Measures what a "cut large tool output before it enters the agent's context" FIXED RULE
 WOULD do, for every pool session (dog/wa-worker/ps-worker/reviewer — see pool-roles.json), and logs that to
 jev-experiment.jsonl. It NEVER modifies the real tool output, and it sends nothing anywhere: no network, no
-credential lookup, no AI.
+credential lookup, no AI. The command it logs is a fingerprint (first 300 characters) -- or a placeholder when
+those characters look like a credential or personal data (cut_output_egress.loggable_command): a token typed
+into a command line is not left at rest in the shared jev-experiment.jsonl.
 
 Per Athos's own authorization (AskUserQuestion in the Mayor session, 28/09 11:3x, cited in this
 bead's own description): the four new Jev shadow fronts start in SHADOW. The rule decides and
@@ -94,10 +96,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cut_output_classifier as coc  # noqa: E402
+import cut_output_egress as cegress  # noqa: E402
 import jev_experiment as je  # noqa: E402
 
 EXPERIMENT_FIXED = "cut-output-fixed"
-COMMAND_LOG_CHARS = 300  # the logged command is a fingerprint for the report, not a full replay
 
 DISABLED_SENTINEL = Path(
     os.environ.get(
@@ -139,7 +141,7 @@ def build_fixed_log_record(verdict: dict, meta: dict) -> dict:
         "session_id": meta.get("session_id"),
         "transcript_path": meta.get("transcript_path"),
         "tool_use_id": meta.get("tool_use_id"),
-        "command": meta.get("command", "")[:COMMAND_LOG_CHARS],
+        "command": cegress.loggable_command(meta.get("command", "")),
         "hook_event": meta.get("hook_event"),
         "exit_code": meta.get("exit_code"),
         "rule": verdict["rule"],
@@ -331,6 +333,12 @@ def _selftest_suite() -> int:
         ok("fixed record has referenced_later=None (filled in later, offline)", rec["referenced_later"] is None)
         ok("fixed record's tokens_would_save is non-negative", rec["tokens_would_save"] >= 0)
         ok("fixed record extracted a signature from the omitted noise", isinstance(rec["omitted_signatures"], list))
+        ok("fixed record: an ordinary command is kept as the logged fingerprint", rec["command"] == "cat log.txt")
+        cred_rec = build_fixed_log_record(verdict, {"tool_use_id": "tu-cred", "command": "curl -H 'Authorization: Bearer abcdef0123456789'"})
+        ok("fixed record: a credential typed into the command line is NOT left at rest in the log row",
+           cred_rec["command"] == cegress.COMMAND_WITHHELD and "abcdef0123456789" not in json.dumps(cred_rec))
+        ok("fixed record: a command that is not a string is logged as empty, never raises",
+           build_fixed_log_record(verdict, {"tool_use_id": "tu-odd", "command": ["ls"]})["command"] == "")
 
     # ---- regression, ga-wk0qi2 gate feedback attempt 1, blocking issue 1: an all-pass pytest run
     # with non-empty stderr must NOT lose the "N passed" summary just because process() appends
