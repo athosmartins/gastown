@@ -398,6 +398,12 @@ PILOT_NODE_FIRST="${PILOT_NODE_FIRST:-off}"
 PILOT_NODE_FIRST_VETO_LABELS="${PILOT_NODE_FIRST_VETO_LABELS:-node:never needs:engine-window exec:manual}"
 PILOT_NODE_CAPACITY_BIN="${PILOT_NODE_CAPACITY_BIN:-$GC_CITY/scripts/hetzner-capacity.py}"
 PILOT_NODE_FIRST_LOG="${PILOT_NODE_FIRST_LOG:-$GC_CITY/.gc/logs/node-first-shadow.jsonl}"
+# ga-2hd02v.3.24: prazo (segundos) do AVISO à sessão — `gc session nudge` (e o `submit` do REUSE) que entrega a bead. Era 15 fixo, e com o mini a load ~70 o nudge leva ~40 s (medido 30/10:
+# 'gc session nudge wa-worker-remote-3' = 40,7 s): rc=124 → "o aviso falhou" → o desfazer devolvia a bead ao mini (13x em 30/10; o Hetzner ficou com 1-2 workers e 7 vagas). Padrão 60.
+# vazio → 60; falhou/ilegível → 60 (não é inteiro de 1 a 9999 — letras, negativo, decimal, sufixo, 5+ dígitos; e "0", que no `timeout` é SEM prazo e penduraria a passada). Nunca vira 0 nem sem-prazo.
+# Os pontos de uso repetem `:-60` para quem carrega só um pedaço do script (os selftests extraem as funções).
+PILOT_NODE_NUDGE_TIMEOUT="${PILOT_NODE_NUDGE_TIMEOUT:-60}"
+case "$PILOT_NODE_NUDGE_TIMEOUT" in ''|*[!0-9]*|?????*) PILOT_NODE_NUDGE_TIMEOUT=60 ;; *) [ "$((10#$PILOT_NODE_NUDGE_TIMEOUT))" -ge 1 ] || PILOT_NODE_NUDGE_TIMEOUT=60 ;; esac
 # ga-do1ixn.3: a faixa Kimi (teste do Athos 26/10: Claude Code com o Kimi por baixo, só bead sem dado pessoal). Bead com o rótulo lane:kimi vai SÓ ao kimi-worker-remote (Hetzner, perfil Kimi
 # do scripts/gc-session-ssh) e o kimi-worker-remote só recebe lane:kimi. Sem a bandeira (ou com o nó desligado, a vaga ocupada, bead fora do HQ) a bead ESPERA: o Pilot não a manda a pool Claude (a sondagem dos dogs, que é do engine, lê gc.routed_to: a bead que ainda tem rota de pool fica visível a ela até o carimbo da passada — ver o runbook gc-session-ssh).
 # A espera carimba gc.routed_to=kimi-lane, que de propósito NÃO é nome de pool: nem a sondagem dos pools nem a demanda do engine a pegam, e o pilot-missing-route-watchdog não a vê "sem rota".
@@ -12382,7 +12388,7 @@ _pilot_node_first_dispatch() {
   if [ -z "$_nd_step" ]; then
     _nd_msg="Bead nova para você: $_nd_id — $_nd_title. Ela já está atribuída ao seu alias (GC_ALIAS=$_nd_alias): ache com 'bd list --status in_progress --assignee \"\$GC_ALIAS\" --json --limit 5' e siga o protocolo do dog."
     _nd_rc=0
-    timeout 15 gc --city "$GC_CITY" session nudge "$_nd_alias" "$_nd_msg" >/dev/null 2>&1 || _nd_rc=$?
+    timeout "${PILOT_NODE_NUDGE_TIMEOUT:-60}" gc --city "$GC_CITY" session nudge "$_nd_alias" "$_nd_msg" >/dev/null 2>&1 || _nd_rc=$?
     [ "$_nd_rc" -eq 0 ] || _nd_step="o aviso falhou (rc=$_nd_rc)"
   fi
   if [ -n "$_nd_step" ]; then
@@ -12474,7 +12480,7 @@ _pilot_kimi_dispatch() {
   if [ -z "$_kd_step" ]; then
     _kd_msg="Bead nova para você (faixa Kimi): $_kd_id — $_kd_title. Ela já está atribuída ao seu alias (GC_ALIAS=$_kd_alias): ache com 'bd list --status in_progress --assignee \"\$GC_ALIAS\" --json --limit 5' e siga o seu protocolo."
     _kd_rc=0
-    timeout 15 gc --city "$GC_CITY" session nudge "$_kd_alias" "$_kd_msg" >/dev/null 2>&1 || _kd_rc=$?
+    timeout "${PILOT_NODE_NUDGE_TIMEOUT:-60}" gc --city "$GC_CITY" session nudge "$_kd_alias" "$_kd_msg" >/dev/null 2>&1 || _kd_rc=$?
     [ "$_kd_rc" -eq 0 ] || _kd_step="o aviso falhou (rc=$_kd_rc)"
   fi
   if [ -n "$_kd_step" ]; then
@@ -12920,7 +12926,7 @@ _pilot_node_remote_open() {
   if [ -z "$_ro_step" ]; then
     _ro_msg="Bead nova para você: $_ro_id — $_ro_title. Ela já está atribuída ao seu alias (GC_ALIAS=$_ro_alias): ache com 'bd -C $_ro_rig list --status in_progress --assignee \"\$GC_ALIAS\" --json --limit 5' e siga o seu protocolo."
     _ro_rc=0
-    timeout 15 gc --city "$GC_CITY" session nudge "$_ro_alias" "$_ro_msg" >/dev/null 2>&1 || _ro_rc=$?
+    timeout "${PILOT_NODE_NUDGE_TIMEOUT:-60}" gc --city "$GC_CITY" session nudge "$_ro_alias" "$_ro_msg" >/dev/null 2>&1 || _ro_rc=$?
     [ "$_ro_rc" -eq 0 ] || _ro_step="o aviso falhou (rc=$_ro_rc)"
   fi
   if [ -n "$_ro_step" ]; then
@@ -16364,7 +16370,7 @@ TASK
         ;;
       *)
         log "  ga-mfeip: rig assign OK — $STORY_ID.assignee=$_SLING_TARGET (slot=$BUILDER_TARGET). Nudging crew."
-        timeout 15 gc --city "$GC_CITY" session nudge "$_SLING_TARGET" "$DISPATCH_TASK" \
+        timeout "${PILOT_NODE_NUDGE_TIMEOUT:-60}" gc --city "$GC_CITY" session nudge "$_SLING_TARGET" "$DISPATCH_TASK" \
           2>/dev/null \
           || warn "ga-mfeip: Could not nudge $_SLING_TARGET — crew will see $STORY_ID on next hook cycle"
         ;;
@@ -16612,11 +16618,11 @@ TASK
     # identity, so it lands on the SAME session we classified — never a 2nd one.
     # When spawning (no prior session), keep the legacy nudge to the identity.
     if [ "$_DISPATCH_REUSE" = "1" ]; then
-      timeout 15 gc --city "$GC_CITY" session submit "$_DISPATCH_SESS_REF" "$DISPATCH_TASK" --intent follow_up \
+      timeout "${PILOT_NODE_NUDGE_TIMEOUT:-60}" gc --city "$GC_CITY" session submit "$_DISPATCH_SESS_REF" "$DISPATCH_TASK" --intent follow_up \
         2>/dev/null \
         || { warn "Could not submit to $_DISPATCH_SESS_REF — un-suppressing sling (ga-h6trx3) so it stays bd-ready-visible instead of relying on the next hook cycle"; _pilot_unsuppress_sling "$GC_CITY" "$SLING_BEAD_ID"; }
     else
-      timeout 15 gc --city "$GC_CITY" session nudge "$_SLING_TARGET" "$DISPATCH_TASK" \
+      timeout "${PILOT_NODE_NUDGE_TIMEOUT:-60}" gc --city "$GC_CITY" session nudge "$_SLING_TARGET" "$DISPATCH_TASK" \
         2>/dev/null \
         || { warn "Could not nudge $_SLING_TARGET — un-suppressing sling (ga-h6trx3) so it stays bd-ready-visible instead of relying on the next hook cycle"; _pilot_unsuppress_sling "$GC_CITY" "$SLING_BEAD_ID"; }
     fi

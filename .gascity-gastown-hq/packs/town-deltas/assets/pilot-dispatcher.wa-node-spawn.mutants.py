@@ -310,7 +310,7 @@ def _():
 
 @m("sem-aviso")
 def _():
-    rep('timeout 15 gc --city "$GC_CITY" session nudge "$_ro_alias" "$_ro_msg" >/dev/null 2>&1 || _ro_rc=$?', ':')
+    rep('timeout "${PILOT_NODE_NUDGE_TIMEOUT:-60}" gc --city "$GC_CITY" session nudge "$_ro_alias" "$_ro_msg" >/dev/null 2>&1 || _ro_rc=$?', ':')
 
 
 @m("aviso-falha-ignorada")
