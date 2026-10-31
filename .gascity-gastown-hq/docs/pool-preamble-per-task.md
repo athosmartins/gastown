@@ -6,7 +6,9 @@
 • Regras de corte (todas declaradas no manifesto, todas provadas por `pool-preamble-build.py check`)
 • O texto da tarefa é conteúdo de fora
 • Medição (o que o bloco "Preâmbulo" do relatório diz, e o que não diz)
-• O que a sombra ainda não responde · Operação
+• O que a sombra ainda não responde
+• Carregador na reivindicação (ga-aijm2v.13, etapa 2b) — o que existe, o que o prime enxerga, o que falta
+• Operação
 
 **Estado:** a **sombra** está pronta no branch `feat/ga-aijm2v.7-preambulo-por-tarefa`; NADA está vivo até o gate mergear e a order `jev-preambulo` ser carregada.
 Mesmo depois disso **nenhuma sessão perde uma linha de doutrina**: todo registro sai com `aplicado: false`. A sombra só grava o que o Jev *cortaria*,
@@ -28,7 +30,8 @@ Onde está cada coisa:
 | consumidor (Jev → decisão → log) | `scripts/jev_preambulo_experiment.py` (`run`, `explain`) |
 | relatório (junta o log do gate na hora de ler) | `scripts/jev_preambulo_report.py` |
 | order + wrapper (cooldown 1h, `timeout`, `nice`, flock) | `packs/town-deltas/orders/jev-preambulo.toml`, `assets/scripts/jev-preambulo.sh` |
-| testes | `scripts/jev-preambulo.selftest.sh` (247 checagens), `assets/tests/jev-daily-report.test.sh` (bloco T11) |
+| carregador na reivindicação (etapa 2b, **inerte**: nada o chama ainda) | `scripts/jev_preambulo_claim.py` |
+| testes | `scripts/jev-preambulo.selftest.sh` (247 checagens), `scripts/jev-preambulo-claim.selftest.sh` (carregador), `assets/tests/jev-daily-report.test.sh` (bloco T11) |
 
 ## Regras de corte (todas declaradas no manifesto, todas provadas por `pool-preamble-build.py check`)
 
@@ -80,11 +83,45 @@ Marcador de injeção ⇒ nenhuma pergunta e nenhuma seção cortada. Falso posi
    já atribuída, ou carregar as seções opcionais sob demanda depois do claim) — decisão de desenho do Mayor + patch em `docs/pending-engine-window/` (build+swap é janela do Mayor).
    *Não confirmado contra um engine atual:* a única árvore do engine que consultei (`~/gt/.local-patches/_src-hookfix`, de 17/08, scratch defasado) mostra o `gc prime` lendo só a identidade da sessão
    (`GC_SESSION_NAME/ID`, `GC_TEMPLATE`, `GC_ALIAS`) e nenhuma entrada de bead — reconfirmar contra `origin/main` do engine antes de desenhar o patch.
+   **Resolvido no desenho (Mayor, 26/09, caminho (b)):** sem patch no engine — o prime entrega o núcleo e as seções opcionais são carregadas DEPOIS do claim por um comando da cidade
+   (seção abaixo).
 2. **Economia por sessão e aprovação no gate por braço** (critérios 5 e 6 da bead): só existem depois de (1). O limiar 0,3 e a lista `eligible` são ajustáveis pela sombra; seção cuja reprovação citada
    aparecer no A/B vira núcleo (mover de `eligible` para `never_cut` no manifesto).
 3. **Amostra.** Medido em 26/09 com o próprio `discover` (só `bd list`, 6 stores lidos): 84 tarefas de pool no último dia (dog 68, wa-worker 16) e 328 em 4 dias (dog 141, wa-worker 187) ≈ 82/dia,
    ou seja ≈ 160 registros na sombra de 48h, divididos por papel, seção e braço. **ps-worker teve 0 tarefas na janela** (mesma lacuna da etapa 1): ele fica SEM DADO, não "sem cortes" — herdar a conclusão do wa-worker é decisão à parte.
    O relatório marca amostra pequena (< 10) e vão de tempo curto (< 48h) como preliminar. A 1ª passada engole a janela de 4 dias em ~6 rodadas (`--limit 60`).
+
+## Carregador na reivindicação (ga-aijm2v.13, etapa 2b)
+
+**Estado (31/10):** existe e está testado, mas **inerte** — nenhuma order, hook ou linha de prompt o chama. Nenhuma sessão perde uma linha de doutrina por causa dele.
+
+```bash
+python3 "$GC_CITY_PATH/scripts/jev_preambulo_claim.py" --bead <id-reivindicada> --role <TD_ROLE> --arm experiment   # imprime as seções que o Jev manteve
+python3 "$GC_CITY_PATH/scripts/jev_preambulo_claim.py" --bead <id> --role <TD_ROLE> --arm experiment --all          # imprime TODAS as elegíveis, sem Jev (saída de emergência)
+python3 "$GC_CITY_PATH/scripts/jev_preambulo_claim.py" --bead <id> --role <TD_ROLE> --arm experiment --dry-run      # decide e imprime, não grava
+```
+
+- **Reusa a sombra sem copiar:** `process_entity` → `decide_sections` (mesmas perguntas, mesmo limiar, mesmos pisos e marcadores de injeção). A diferença é só que a resposta é **impressa** e gravada como registro
+  **vivo** (`mode: "preambulo_vivo"`, `fase: "vivo"`). O modo próprio é de propósito: `load_done` da sombra, o relatório do Preâmbulo e o relatório de supressão do dia só leem `mode: "preambulo"` / ignoram qualquer
+  evento que nomeie um modo, então o registro vivo não entra nos números da sombra (pinado no selftest).
+- **Falha vira doutrina completa** (critério "Jev fora/lento/erro ⇒ doutrina completa"): Jev fora, resposta inválida, bead ilegível, prazo estourado (`JEV_PREAMBULO_CLAIM_DEADLINE_S`, 25 s para a decisão inteira),
+  exceção inesperada ou marcador de injeção ⇒ **todas** as seções elegíveis do papel são impressas e o registro diz por quê (`falha_aberta`). Resposta parcial: as válidas decidem, as inválidas ficam.
+  Se nem a política carrega, o comando imprime um aviso **NÃO CARREGADA** que nomeia o fragmento a ler inteiro e sai 3 — nunca um stdout vazio que pareça "nada a carregar".
+- **Braço:** `--arm` é obrigatório e é o braço da **sessão**. `control` imprime uma linha e sai (sem Jev, sem registro): o controle guarda toda a doutrina no prime. O braço por bead da sombra continua no registro
+  como `arm_hash` — é outra atribuição, não confundir. O registro leva `alias` (`GC_ALIAS`, o slot) e `sessao` para o relatório juntar por sessão.
+- **`--all` fica no registro** (`pedido_manual`): sessão que precisou pedir de volta uma seção dispensada é a evidência mais forte de que o corte errou (critério: falha atribuída a seção cortada ⇒ a seção vira núcleo).
+
+**O que o `gc prime` enxerga (sonda hermética de 31/10, cidade descartável, `gc 1.1.1`, `prime --strict`):** num fragmento, `.TD_ROLE` e `.CityRoot` funcionam; `.AgentName` é a **instância do slot**
+(`gastown.dog-3`), venha por argumento ou por `GC_ALIAS`; `.TemplateName` é a instância salvo `GC_TEMPLATE`; `.SessionName`, `.SessionID`, `.Alias`, `.WorkDir` e `.RigName` renderizam **vazios**. Consequência: o prime consegue
+separar braços por **slot**, não por sessão nem por bead. O braço ao vivo, portanto, é por slot (ex.: paridade do dígito do slot), **não** o hash por bead da sombra — a A/A medida na sombra não é a mesma
+atribuição do A/B ao vivo, e braço por slot pode confundir (slots baixos pegam mais trabalho). O relatório precisa juntar por `alias` e **mostrar o equilíbrio dos braços** antes de qualquer comparação.
+
+**O que falta para o A/B ao vivo (fatias próprias, cada uma com seu gate — tocam o prime de TODA sessão de pool):**
+1. guardas por braço-de-slot no fragmento/manifesto (`guard_cond`, `check_fragment`, selftest D), atrás de um interruptor de env (`TD_PREAMBLE_AB`; ausente ⇒ prime byte-idêntico ao de hoje; ligar/desligar = uma linha no `city.toml`, do Mayor);
+2. a instrução no prompt para rodar o carregador logo após o claim, dentro da guarda do braço experimento. Atenção: `--store` padrão é o store do HQ; a bead de um wa-worker vive no store do rig, e lida do
+   HQ vira `bead_ilegivel` (falha aberta: seguro, mas aquela sessão não economiza nada) — a linha do prompt precisa passar `--store <caminho do rig>`;
+3. relatório: tokens/sessão **medidos** por braço (de transcrito, `pool-preamble-measure.py`), aprovação na 1ª tentativa por braço com intervalo (Wilson/Newcombe), junção por `alias`, equilíbrio dos braços e falhas que citam seção cortada.
+Só depois de (1)–(3) e de dias de dados vivos o critério de aceite da bead pode ser dado como cumprido.
 
 ## Operação
 
