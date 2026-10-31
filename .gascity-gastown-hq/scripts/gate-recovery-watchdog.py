@@ -4514,6 +4514,52 @@ def _beads_with_gate_label(label):
     return out
 
 
+def children_marker_verdict(child_rows, referenced):
+    """PURE (no I/O, unit-tested) — FIX 8 mother shield (ga-vdac4cj). Given the rows of
+    `bd list --parent <bead>` (or None when that read failed) and the set of source-bead:
+    values of the OPEN gate markers, is this bead a MOTHER whose work belongs to its children?
+      'held'    — at least one NOT-closed child is itself referenced by an open marker. The
+                  mother's own gate:queued/gate:reviewing label is then LEGITIMATE (a sliced
+                  feature, E11: the slices hold the markers, the mother carries the label as
+                  the "the gate has this" signal), so it is not a phantom and must not be cleared.
+      'none'    — the children were READ and none of them is open-and-marked (no children at
+                  all counts: that is the plain phantom this fix was written for, ga-yzw06).
+      'unknown' — the children could not be read (None / not a list / a row that is not an
+                  object or has no id). Never 'none': a failed read must not become "no
+                  children", because 'none' lets FIX 8 strip the label and hand the mother to
+                  the pool (the ga-vdac4cj incident)."""
+    if not isinstance(child_rows, list):
+        return "unknown"
+    held = False
+    for row in child_rows:
+        if not isinstance(row, dict) or not str(row.get("id") or "").strip():
+            return "unknown"
+        if str(row.get("status") or "") == "closed":
+            continue
+        if row.get("id") in referenced:
+            held = True
+    return "held" if held else "none"
+
+
+_FIX8_MOTHER_LOGGED = set()  # (bead, verdict) pairs already announced, so a held mother is one log line, not one per sweep
+
+
+def _bead_children_state(store, bid, referenced):
+    """'held' | 'none' | 'unknown' for `bid` (see children_marker_verdict). One `bd list --parent`
+    read, FRESH on purpose (not bd-list-cached.sh): the answer decides whether a label is
+    stripped, and a child that gained its marker a moment ago must not be missed.
+    vazio (`[]` with rc 0, which is also what a parent with no children answers) → 'none';
+    falhou/ilegível (bd rc≠0, timeout, blank output, output that is not a JSON array) → 'unknown'."""
+    r = sh(["bd", "-C", store, "list", "--parent", bid, "--json", "--limit", "0"], timeout=25)
+    if not r or r.returncode != 0:
+        return "unknown"
+    try:
+        rows = json.loads(r.stdout) if (r.stdout or "").strip() else None
+    except Exception:
+        return "unknown"
+    return children_marker_verdict(rows, referenced)
+
+
 def orphan_gate_label_verdict(confirm_hits, confirm_threshold):
     """PURE decision (no I/O, unit-tested) for FIX 8: has a (bead, gate:queued-or-
     -reviewing label) pair now been seen unreferenced by any open marker across enough
@@ -4559,6 +4605,13 @@ def reap_orphan_gate_labels(now, rstate):
     resets in-progress beads assigned to dead agents on its own 5min-cooldown sweep,
     independent of gate:* labels — this function does not duplicate that.
 
+    Mothers (ga-vdac4cj): a bead whose children carry the gate markers is not a phantom - the
+    feature was sliced (E11) and the label on the mother is the legitimate "the gate has this".
+    Clearing it made the mother a probe candidate and the pool dispatched a session onto a bead with
+    nothing left to build (measured 31/10: ga-hfx1kou, dog refused; wa-zmxywv.18/.19/.30, 2 workers
+    refused). A bead with an open child that IS referenced by an open marker is skipped, and so is one
+    whose children cannot be read (children_marker_verdict: held / none / unknown).
+
     Hysteresis via rstate.orphan_gate_label_hits (see orphan_gate_label_verdict): a
     (bead_id, label) pair must be re-detected as a candidate on ORPHAN_GATE_LABEL_
     CONFIRM_THRESHOLD consecutive sweeps before it is cleared. Any pair NOT re-detected
@@ -4575,12 +4628,28 @@ def reap_orphan_gate_labels(now, rstate):
     if referenced is None:
         return  # query failure → fail-safe skip (no blind action)
     candidates = {}  # (bead_id, label) -> store, for every unreferenced sighting this sweep
+    mother_state = {}  # bead_id -> 'held'|'none'|'unknown' (one children read per bead per sweep, even if it carries both labels)
     for label in ("gate:queued", "gate:reviewing"):
         beads = _beads_with_gate_label(label)
         if beads is None:
             return  # a store failed to answer → abort the WHOLE sweep, never act on a partial scan
         for bid, store in beads:
             if not bid or bid in referenced:
+                continue
+            # ga-vdac4cj: a MOTHER of a sliced feature (E11) has no marker of its own - its open children carry them - so
+            # "no marker references this bead" is not "phantom" for it. Three states (children_marker_verdict):
+            # held -> legitimate label, not a candidate; none -> the plain phantom, candidate as before;
+            # unknown (children unreadable) -> not a candidate THIS sweep either (the ledger drops it, so a flapping read
+            # never accumulates toward a clear) and said on the log, never a silent "no children".
+            if bid not in mother_state:
+                mother_state[bid] = _bead_children_state(store, bid, referenced)
+            if mother_state[bid] != "none":
+                if (bid, mother_state[bid]) not in _FIX8_MOTHER_LOGGED:
+                    _FIX8_MOTHER_LOGGED.add((bid, mother_state[bid]))
+                    print("[watchdog] FIX8 SKIP %s on %s: %s (ga-vdac4cj)"
+                          % (label, bid, "an open child holds a gate marker - the mother's label is legitimate"
+                             if mother_state[bid] == "held" else "its children could not be read - not treating it as a phantom"),
+                          flush=True)
                 continue
             candidates[(bid, label)] = store
     rstate.orphan_gate_label_hits = _update_orphan_gate_label_hits(rstate.orphan_gate_label_hits, set(candidates))
@@ -5886,6 +5955,88 @@ def _selftest():
         _RIG_PATHS["ts"] = _real_rig_paths_state["ts"]
         _RIG_PATHS["map"] = _real_rig_paths_state["map"]
         _RIG_PATHS["by_prefix"] = _real_rig_paths_state["by_prefix"]
+    # FIX 8 mother shield (ga-vdac4cj). children_marker_verdict is PURE: held / none / unknown.
+    _MS_REF = {"ga-mom.1", "ga-mom.2"}
+    ok(children_marker_verdict([{"id": "ga-mom.1", "status": "open"}], _MS_REF) == "held",
+       "ga-vdac4cj: an open child referenced by an open marker -> held (the mother's gate:queued is legitimate)")
+    ok(children_marker_verdict([{"id": "ga-mom.1", "status": "closed"}], _MS_REF) == "none",
+       "ga-vdac4cj: the only child is CLOSED -> none, even if a marker still names it (the work is no longer in the children's hands)")
+    ok(children_marker_verdict([{"id": "ga-other.1", "status": "open"}], _MS_REF) == "none",
+       "ga-vdac4cj: an open child with NO marker -> none (nothing in the gate holds the mother's label)")
+    ok(children_marker_verdict([], _MS_REF) == "none",
+       "ga-vdac4cj: no children at all (the plain ga-yzw06 phantom) -> none, FIX 8 keeps clearing it exactly as before")
+    ok(children_marker_verdict(None, _MS_REF) == "unknown",
+       "ga-vdac4cj: children read FAILED (None) -> unknown, never 'none'")
+    ok(children_marker_verdict({"error": "x"}, _MS_REF) == "unknown" and children_marker_verdict("oops", _MS_REF) == "unknown",
+       "ga-vdac4cj: an answer that is not a list -> unknown")
+    ok(children_marker_verdict([{"id": "ga-mom.1", "status": "open"}, "junk"], _MS_REF) == "unknown",
+       "ga-vdac4cj: a row that is not an object -> unknown (the whole read is distrusted, even if an earlier row was held)")
+    ok(children_marker_verdict([{"status": "open"}], _MS_REF) == "unknown",
+       "ga-vdac4cj: a child row with no id -> unknown")
+    ok(children_marker_verdict([{"id": "ga-mom.9", "status": "open"}, {"id": "ga-mom.2", "status": "in_progress"}], _MS_REF) == "held",
+       "ga-vdac4cj: ONE marked child among several is enough (in_progress counts as not closed)")
+    # End to end: reap_orphan_gate_labels on a mother. sh() is mocked; every write is recorded. Three sweeps with
+    # CONFIRM_THRESHOLD=3 is the point: before this fix the mother was cleared on the third.
+    import io, contextlib
+    class _MsRstate(object):
+        orphan_gate_label_hits = {}
+    def _ms_sweep(children_stdout, children_rc=0, n_sweeps=None, mother_labels=None):
+        calls = []
+        def _fake(args, timeout=20, stdin=None):
+            calls.append(list(args))
+            if args and args[0] == "gc":
+                return subprocess.CompletedProcess(args=args, returncode=0, stdout='{"rigs":[]}')
+            if args[:1] == ["bash"] and "type:quality-gate-marker" in args:
+                return subprocess.CompletedProcess(args=args, returncode=0,
+                    stdout='[{"id":"ga-mk1","labels":["type:quality-gate-marker","source-bead:ga-mom.1","gate-status:queued"]}]')
+            if args[:1] == ["bash"] and "gate:queued" in args:
+                return subprocess.CompletedProcess(args=args, returncode=0,
+                    stdout=json.dumps([{"id": "ga-mom", "labels": mother_labels or ["gate:queued", "story:approved"]}]))
+            if args[:1] == ["bash"] and "gate:reviewing" in args:
+                return subprocess.CompletedProcess(args=args, returncode=0, stdout="[]")
+            if args[:1] == ["bd"] and "--parent" in args:
+                return subprocess.CompletedProcess(args=args, returncode=children_rc, stdout=children_stdout)
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="")
+        _patched = dict(sh=_fake, GRW_ENABLED=True, GRW_DRY_RUN=False, GRW_REAP_ORPHAN_GATE_LABEL_ENABLED=True,
+                        notify=lambda msg, prio: None, _recovery_ledger=lambda *a, **k: None)
+        _saved_g = {k: globals()[k] for k in _patched}
+        _rs = _MsRstate()
+        _rs.orphan_gate_label_hits = {}
+        _saved_rp = dict(_RIG_PATHS)
+        _buf = io.StringIO()
+        try:
+            _RIG_PATHS["ts"] = 0.0; _RIG_PATHS["map"] = {}; _RIG_PATHS["by_prefix"] = {}
+            globals().update(_patched)
+            _FIX8_MOTHER_LOGGED.clear()
+            with contextlib.redirect_stdout(_buf):
+                for _ in range(n_sweeps or (ORPHAN_GATE_LABEL_CONFIRM_THRESHOLD + 2)):
+                    reap_orphan_gate_labels(0.0, _rs)
+        finally:
+            globals().update(_saved_g)
+            _RIG_PATHS["ts"] = _saved_rp["ts"]; _RIG_PATHS["map"] = _saved_rp["map"]; _RIG_PATHS["by_prefix"] = _saved_rp["by_prefix"]
+        _removed = [c for c in calls if c[:1] == ["bd"] and "label" in c and "remove" in c]
+        return _removed, _rs.orphan_gate_label_hits, _buf.getvalue()
+    _ms_held = '[{"id":"ga-mom.1","status":"open","labels":["gate:queued"]},{"id":"ga-mom.2","status":"open","labels":["gate:queued"]}]'
+    _removed, _hits, _out = _ms_sweep(_ms_held)
+    ok(_removed == [] and _hits == {},
+       "ga-vdac4cj REGRESSION (fails on the previous HEAD, which cleared it on sweep %d): a mother whose child .1 holds an open marker keeps its gate:queued across %d sweeps, and no ledger entry builds up" % (ORPHAN_GATE_LABEL_CONFIRM_THRESHOLD, ORPHAN_GATE_LABEL_CONFIRM_THRESHOLD + 2))
+    ok(_out.count("FIX8 SKIP gate:queued on ga-mom") == 1,
+       "ga-vdac4cj: a held mother is announced ONCE, not once per sweep (the log stays readable)")
+    _removed, _hits, _out = _ms_sweep("[]")
+    ok(len(_removed) == 1 and _removed[0][-2:] == ["gate:queued", "-q"],
+       "ga-vdac4cj: the plain phantom (children read, there are none) is STILL cleared on the confirm threshold - the shield did not switch FIX 8 off")
+    _removed, _hits, _out = _ms_sweep('[{"id":"ga-mom.3","status":"open","labels":["story:approved"]}]')
+    ok(len(_removed) == 1,
+       "ga-vdac4cj: a mother whose open child has NO marker is a phantom again -> cleared (the shield is not 'has children')")
+    _removed, _hits, _out = _ms_sweep("", children_rc=1)
+    ok(_removed == [] and _hits == {} and "children could not be read" in _out,
+       "ga-vdac4cj: the children read FAILED (rc 1) -> nothing is cleared, no ledger entry, and the log says so (inert and loud)")
+    _removed, _hits, _out = _ms_sweep("not json at all")
+    ok(_removed == [] and _hits == {} and "children could not be read" in _out,
+       "ga-vdac4cj: the children read printed something that is not JSON -> inert and loud, same as a failed read")
+    _removed, _hits, _out = _ms_sweep("")
+    ok(_removed == [] and "children could not be read" in _out,
+       "ga-vdac4cj: blank output with rc 0 is NOT '[]': unreadable, never 'no children'")
     # FIX 8 scope guard: reap_orphan_gate_labels must NEVER touch story:*/assignee — the
     # ga-yzw06 trap this bug explicitly warns against (an over-eager fix that repositions
     # lifecycle state instead of just clearing the phantom label). Static source-inspection
