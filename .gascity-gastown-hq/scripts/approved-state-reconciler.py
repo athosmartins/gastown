@@ -119,6 +119,14 @@ GATE_FOCUS_LIB = os.environ.get(
     os.path.join(CITY, "packs/town-deltas/assets/scripts/gate-focus-lib.sh"))
 GATE_FOCUS_STATE_FILE = os.environ.get(
     "GATE_FOCUS_STATE_FILE", os.path.join(CITY, ".gc/gate-focus.state"))
+# DISK_LIB (ga-4mxaa8): the free-disk reading and the "under the floor" verdict are decided by ONE
+# owner, disk-headroom-lib.sh — the one pool-probe.sh (holds new stories back) and the Pilot's disk
+# floor (pauses the sweep) call. The reconciler calls it too instead of re-implementing df and the
+# 5120 MB floor, so there is no second copy of the rule to drift from theirs. Same override name as
+# pool-probe.sh (POOL_PROBE_DISK_LIB), so one override means the same thing in each process.
+DISK_LIB = os.environ.get(
+    "POOL_PROBE_DISK_LIB",
+    os.path.join(CITY, "packs/town-deltas/assets/scripts/disk-headroom-lib.sh"))
 # QPOS_ABSENT/QPOS_UNREADABLE (ga-tky97 GATE-FEEDBACK fix): a bead's queue
 # position can fail to resolve to an int for two causally different reasons —
 # the dispatch queue snapshot itself was unreadable this cycle (unmeasured),
@@ -229,6 +237,7 @@ PAUSE_COMMON_MIN_PCT = int(os.environ.get("ARC_PAUSE_COMMON_MIN_PCT", "25"))
 PAUSE_COMMON_MIN_SWEEPS = int(os.environ.get("ARC_PAUSE_COMMON_MIN_SWEEPS", "10"))
 PAUSE_NOTE_OLDEST_N = 5   # beads named in the cause note (the count covers all of them)
 PAUSE_CAUSE_KEY = "pilot-pause"   # ONE bucket: a flip of the dominant reason is not a new incident
+DISK_LOW_CAUSE_KEY = "disk-low"   # ga-4mxaa8: ONE bucket for the live-disk cause (same pause_cause dict, own key)
 FLOW_AUTHORITY_TTL_SEC = int(os.environ.get("ARC_FLOW_AUTHORITY_TTL_SEC", "3600"))
 # Marker label stamped on a bead after its first Step 1b keyword-flag comment. Idempotency
 # gate (ga-1iz2e/AC1): a bead that already carries this label is skipped — comment once,
@@ -498,6 +507,8 @@ _read_pilot_sweep_pause_state_file = None  # () -> dict|None; parsed+freshness-c
                                              # pilot-sweep-pause-state.json (ga-nq0jo test seam)
 _read_gate_focus_file = None  # () -> {"active": bool, "depth": str}|None; the gate focus mode
                                 # as _read_gate_focus() would answer it (ga-pfnfr5 test seam)
+_read_disk_state_file = None  # () -> {"state": "ok"|"low", "free_mb": int, "floor_mb": int}|None; the
+                                # free disk as _read_disk_state() would answer it (ga-4mxaa8 test seam)
 
 
 # ── guarded subprocess ────────────────────────────────────────────────────────
@@ -2694,7 +2705,7 @@ def _alarm_record(state, bead_id):
 
 
 def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_throughput=None,
-                     dispatchable=None, cap_evidence=None, gate_focus=None):
+                     dispatchable=None, cap_evidence=None, gate_focus=None, disk=None):
     """Fire a starve alarm for a buildable bead that has not been dispatched.
 
     This is case 3 of the core guarantee: the bead matched NONE of this
@@ -2738,6 +2749,11 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
     is MEASURED to hold never gets here — _process_store() consulted
     _gate_focus_suppress_reason() first — so this only renders which state applies, via
     _gate_focus_body_line().
+
+    disk (ga-4mxaa8): the once-per-cycle _read_disk_state() answer (None = NÃO MEDIDO; the
+    default for a caller that did not measure it). Same contract as gate_focus: a new story the
+    disk is MEASURED to hold back never gets here (_disk_low_suppress_reason() folds it into the
+    one disk note), so this only renders which state applies, via _disk_body_line().
     """
     bead_id = bead.get("id") or bead.get("issue_id") or ""
     if not bead_id:
@@ -2816,6 +2832,7 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
     # checked, and hedge honestly that the list can itself go stale again.
     gate_line = _gate_queue_body_line(gate_depth, gate_throughput, age_min)
     focus_line = _gate_focus_body_line(gate_focus, _get_labels(bead))
+    disk_line = _disk_body_line(disk, bead)   # ga-4mxaa8: which of its states the disk reading was in
 
     # ga-tky97 AC4: a repeat alarm should say what changed since the last one
     # (position improved/worsened/unchanged), not just repeat the same claim —
@@ -2899,13 +2916,14 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
         "%s\n"
         "%s\n"
         "%s\n"
+        "%s\n"
         "%s\n\n"
         "This bead matched NONE of this reconciler's known non-buildable signals\n"
         "(blocked-on:*, waiting-on:*, depends-on:*, next-action:*, pool:refused:*,\n"
         "gate:{needs-fix,failed,queued,reviewing,needs-human}, exec:manual, ctx:thin,\n"
         "needs-human[-*], blocked-reason:*, any label scripts/pool-probe-vetoes.sh refuses,\n"
         "pilot:held(-until:*), pilot:reclaim-count:N, gate focus mode ON for a non-fix\n"
-        "bead). It should have been\n"
+        "bead, free disk under the floor for a new story). It should have been\n"
         "dispatched within %dmin.\n\n"
         "INVESTIGAR:\n"
         "1. tail -40 .gc/logs/pilot-dispatcher.log — o Pilot está varrendo?\n"
@@ -2917,7 +2935,7 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
         "   _extra_alarm_suppress_reason() em scripts/approved-state-reconciler.py antes\n"
         "   de re-despachar manualmente ou adicionar story:approved de volta.\n"
     ) % (bead_id, title, int(age_min), alarm_ordinal, gate_line, queue_line, pause_line,
-         focus_line, cap_line, STARVE_MIN, rig_root, bead_id)
+         focus_line, disk_line, cap_line, STARVE_MIN, rig_root, bead_id)
 
     notify_msg = ("STARVE ALARM%s: bead %s story:approved há %dmin, pilot alive, "
                   "não despachado — dispatch path failing" % (
@@ -3152,6 +3170,10 @@ class _PauseAggregator(object):
     tells the stall watchdogs to defer THEIR Mayor mail, and a pause note is not an escalation of
     a flow stall — a pause that never ends is precisely what they exist to catch), no phone push
     and no human-touch ledger row (nothing here asks a human to act).
+
+    Second cause, same object (ga-4mxaa8): new stories held back by a free disk MEASURED under the
+    floor fold in through add_disk() and go out as their own ONE note (DISK_LOW_CAUSE_KEY, same
+    1h/4h/12h backoff). The pause history above lags the disk by up to a sweep; this is the disk read now.
     """
 
     def __init__(self, now):
@@ -3159,6 +3181,8 @@ class _PauseAggregator(object):
         self._records = None
         self._read = False
         self.items = {}
+        self.disk_items = {}   # ga-4mxaa8: beads folded because the live disk reading is under the floor
+        self.disk = None       # the reading they were folded under (one per cycle, same for all)
 
     def attribute(self, age_min, node_bead=False):
         """(paused, total, {reason: n}) if the pause is the common cause of a bead that has
@@ -3185,8 +3209,114 @@ class _PauseAggregator(object):
             "id": bead_id, "age_min": age_min, "paused": paused, "total": total,
             "by_reason": by_reason, "title": (bead.get("title") or bead.get("name") or "?")[:70]}
 
+    def add_disk(self, bead, age_min, disk):
+        """Fold a new story the free disk (MEASURED under the floor) holds back — ga-4mxaa8."""
+        bead_id = bead.get("id") or bead.get("issue_id") or ""
+        if not bead_id or bead_id in self.disk_items:   # same id from two rig stores counts once
+            return
+        self.disk = disk
+        self.disk_items[bead_id] = {
+            "id": bead_id, "age_min": age_min,
+            "title": (bead.get("title") or bead.get("name") or "?")[:70]}
+
     def flush(self, state):
-        """Send the one note for this cycle's folded beads, if the backoff allows it."""
+        """Send this cycle's notes: the pause-cause one and the disk one — each its own backoff
+        bucket, and one failing must not cost the other."""
+        try:
+            self._flush_pause(state)
+        finally:
+            self._flush_disk(state)
+
+    def _flush_disk(self, state):
+        """The ONE disk note for this cycle's folded beads, if the backoff allows it (ga-4mxaa8).
+
+        Same shape as the pause note and the same reasons for what it does NOT do (no
+        _write_flow_authority, no phone push, no human-touch ledger row: nothing here asks a human to
+        act — the disk guards own the escalation, this only says why beads are waiting). Own bucket
+        key (DISK_LOW_CAUSE_KEY) in the same pause_cause dict, so the pruning and the corrupt-record
+        handling are the ones the pause note already has."""
+        if not self.disk_items:
+            return
+        now = self.now
+        disk = self.disk or {}
+        beads = sorted(self.disk_items.values(), key=lambda b: (-b["age_min"], b["id"]))
+        self.disk_items = {}
+        head = beads[0]
+
+        bucket = state.setdefault("pause_cause", {})
+        raw = bucket.get(DISK_LOW_CAUSE_KEY)
+        last, count = 0.0, 0
+        if isinstance(raw, dict):
+            try:
+                last, count = float(raw.get("last", 0.0)), int(raw.get("count", 0))
+            except (TypeError, ValueError):
+                # Corrupt record: "no prior note" — a visible note beats an exception that aborts the cycle.
+                last, count = 0.0, 0
+
+        if (now - last) < _alarm_backoff_sec(count):
+            _log("  disk-low backoff active (count=%d, last %.0fmin ago, next in >=%.0fmin) "
+                 "— %d bead(s) folded, no note" % (
+                 count, (now - last) / 60.0,
+                 (_alarm_backoff_sec(count) - (now - last)) / 60.0, len(beads)))
+            return
+
+        ordinal = count + 1
+        free, floor = disk.get("free_mb"), disk.get("floor_mb")
+        _log("DISK-LOW (common cause, not a per-bead dispatch failure): %d bead(s) | oldest %s %.0fmin | "
+             "free=%sMB floor=%sMB | ordinal=%d" % (len(beads), head["id"], head["age_min"], free, floor, ordinal))
+
+        if DRY_RUN:
+            _log("DRY_RUN: would send the disk-low note for %d bead(s) (ordinal=%d)" % (len(beads), ordinal))
+            return  # no state update, no mutations
+
+        subject = ("Reconciler: disco livre %sMB abaixo do piso %sMB — %d bead(s) esperando "
+                   "(mais antiga %s, %dmin) — causa comum, 1 nota por causa%s" % (
+                   free, floor, len(beads), head["id"], int(head["age_min"]),
+                   "" if ordinal == 1 else " (repeat #%d)" % ordinal))
+        lines = [
+            "APPROVED-STATE-RECONCILER: DISCO abaixo do piso — causa comum de %d bead(s) esperando" % len(beads),
+            "(uma nota por CAUSA, não uma por bead)",
+            "",
+            "Causa: o disco livre foi MEDIDO agora em %sMB, abaixo do piso de %sMB (disk-headroom-lib.sh). "
+            "Com o disco assim o pool probe segura toda história nova e o Pilot pausa o sweep, por "
+            "desenho (ga-vln2py): uma história nova não despacha, e isso não é falha do despacho." % (free, floor),
+            "Beads: %d, todas história nova segurada pelo disco. As %d mais antigas:" % (
+                len(beads), PAUSE_NOTE_OLDEST_N),
+        ]
+        for i, b in enumerate(beads[:PAUSE_NOTE_OLDEST_N], 1):
+            lines.append("  %d. %s — %dmin — %s" % (i, b["id"], int(b["age_min"]), b["title"]))
+        if len(beads) > PAUSE_NOTE_OLDEST_N:
+            lines.append("  (+%d outra(s) com a mesma causa)" % (len(beads) - PAUSE_NOTE_OLDEST_N))
+        lines += [
+            "",
+            "Nota #%d para esta causa. Backoff desta nota: 1h/4h/12h." % ordinal,
+            "",
+            "LIMITE: é UMA leitura, deste ciclo. Passo de fórmula e pool demand (gc.kind / gc.step_ref / "
+            "gc.pool_demand) e tipos que não são de história seguem despachando com o disco baixo e, "
+            "se pararem, alarmam por conta própria. Quando o disco voltar acima do piso, cada bead "
+            "que seguir parada volta a alarmar sozinha ('dispatch failing').",
+            "",
+            "CONFERIR:",
+            "1. df -m /private/var/vm — o disco livre agora (o mesmo caminho da lib).",
+            "2. dolt-disk-floor-guard / disk-ballast-guard: quem já está liberando espaço.",
+            "3. cat %s — o Pilot gravou a pausa 'disk floor'?" % PILOT_SWEEP_PAUSE_STATE_FILE,
+        ]
+        body = "\n".join(lines) + "\n"
+
+        if _do_mail_mayor is not None:
+            sent = bool(_do_mail_mayor(subject, body))
+        else:
+            proc = _sh([GC_BIN, "mail", "send", MAYOR_ADDR, "-s", subject, "-m", body, "--notify"],
+                       timeout=45)
+            sent = proc is not None and getattr(proc, "returncode", 1) == 0
+        if not sent:
+            _log("WARN: disk-low mail to %s FAILED for %d bead(s) — state still recorded, "
+                 "so the next note is due only after the backoff" % (MAYOR_ADDR, len(beads)))
+
+        bucket[DISK_LOW_CAUSE_KEY] = {"last": now, "count": ordinal}
+
+    def _flush_pause(self, state):
+        """Send the one pause-cause note for this cycle's folded beads, if the backoff allows it."""
         if not self.items:
             return
         now = self.now
@@ -3823,6 +3953,128 @@ def _gate_focus_body_line(gate_focus, labels):
     return "Modo foco do gate: DESLIGADO (medido) — não explica a espera."
 
 
+# ── free disk under the floor (ga-4mxaa8) ─────────────────────────────────────
+# 17/10 21:00-21:40, free disk under the floor: the pool probes hold every NEW STORY back (ga-09hfgh /
+# ga-vln2py, pool-probe.sh) and the Pilot's disk floor pauses the sweep, yet this reconciler mailed 25+
+# "STILL starving" alarms (repeat #2-#6), one per bead, for beads sitting deep in a ~190-item queue.
+# What it knew about the disk was INDIRECT: the Pilot's last-sweep pause record, written once per sweep
+# (11-40 min apart), so it is oldest exactly while the disk is falling — a record from before the drop
+# says "not paused", a missing/stale one says nothing — and it never looked at the disk itself. This reads
+# the disk directly, through the same lib the holders use, and folds the held beads into ONE note.
+# (The 17/10 log lines were rotated out before this was looked at, so the exact path that let those beads
+# through is not replayed from evidence; the lag above is a property of the code, not a reconstruction.)
+#
+# What the disk holds is a CLASS, not every bead: the lib's DISK_HOLD_NEW_STORIES_JQ. The beads it does
+# NOT cover keep the ordinary alarm. Python copy below, with a parity scenario in --selftest that runs
+# the lib's own jq text over a table of beads, so a change to the lib fails here instead of drifting.
+DISK_HOLD_ISSUE_TYPES = ("task", "bug", "feature", "chore", "epic", "spike")
+DISK_HOLD_EXEMPT_METADATA = ("gc.kind", "gc.step_ref", "gc.pool_demand")
+
+
+def _read_disk_state():
+    """The free disk as {"state": "ok"|"low", "free_mb": int, "floor_mb": int}, or None when it
+    cannot be told. `floor_mb` is the new-work floor the lib itself reports (DISK_NEW_WORK_MIN_MB) —
+    the one pool-probe.sh and the Pilot's disk floor use, so "low" here means what it means there.
+
+    Asks disk-headroom-lib.sh (disk_free_mb + disk_state_of) instead of running df here: where the
+    free space is read from, the floor, the kill switch and the override all live in ONE place.
+
+    Three answers, never two (root-class:error-vs-empty): ok, low, and None = NÃO MEDIDO. None covers
+    everything that is not a clean ok/low WITH a number: lib missing or not sourceable, bash failing or
+    timing out, df unreadable (the lib then says "unknown"), output of any other shape. A caller must
+    read None as "cannot confirm the disk is low", never as ok and never as low: it neither licenses
+    a suppression nor is reported as a fact.
+    """
+    if _read_disk_state_file is not None:
+        return _read_disk_state_file()   # test seam
+    script = ('. "$1" || exit 97; f=$(disk_free_mb) || f=""; '
+              'printf "%s %s %s" "$(disk_state_of "$f" "$DISK_NEW_WORK_MIN_MB")" "$f" "$DISK_NEW_WORK_MIN_MB"')
+    # vazio → n/a (an empty reading is "unknown" for the lib, which prints no number: 2 words, not 3);
+    # falhou/ilegível → None (NÃO MEDIDO: no suppression, the alarm says it did not know)
+    r = _sh(["bash", "-c", script, "disk-headroom", DISK_LIB], timeout=10)
+    if r is None or r.returncode != 0:
+        return None
+    parts = (r.stdout or "").split()
+    if len(parts) != 3 or parts[0] not in ("ok", "low"):
+        return None
+    if not (re.fullmatch(r"[0-9]{1,9}", parts[1]) and re.fullmatch(r"[0-9]{1,9}", parts[2])):
+        return None
+    return {"state": parts[0], "free_mb": int(parts[1]), "floor_mb": int(parts[2])}
+
+
+def _is_disk_held_story(bead):
+    """True if free disk under the floor holds THIS bead back: a NEW STORY — the lib's
+    DISK_HOLD_NEW_STORIES_JQ keeps a bead only if its issue_type is not a story type, or it carries
+    gc.kind / gc.step_ref / gc.pool_demand metadata (formula steps and pool demand keep flowing);
+    anything else is held. Follows the jq to the letter, including where it reads a bead as "kept":
+    a missing issue_type, and a metadata value that is neither null nor false (jq's `// ""`).
+
+    vazio → not held (no type = not a story, as in the jq); falhou/ilegível (metadata that is not an
+    object) → NOT held either: a bead this cannot read keeps the ordinary alarm, never a silence.
+    """
+    # vazio (no issue_type, or one that is not a story type) → not held, as in the jq; falhou/ilegível
+    # (a type that is not a string) → not in the tuple → not held: the ordinary alarm, never a silence
+    if bead.get("issue_type") not in DISK_HOLD_ISSUE_TYPES:
+        return False
+    # vazio (no metadata) → {} → no exemption key → held; falhou/ilegível (metadata that is not an
+    # object) → not held, same direction as above
+    meta = bead.get("metadata")
+    if meta is None:
+        meta = {}
+    if not isinstance(meta, dict):
+        return False
+    for k in DISK_HOLD_EXEMPT_METADATA:
+        # vazio (key absent, null, false or "") → this key exempts nothing; any other value, of any
+        # type, exempts (jq's `(.x // "") != ""`); a value that cannot be read as one of those
+        # cannot exist in JSON, so there is no falhou/ilegível case left for this read
+        v = meta.get(k)
+        if v is not None and v is not False and v != "":
+            return False
+    return True
+
+
+def _disk_low_suppress_reason(disk, bead):
+    """Suppress reason when the free disk is MEASURED under the floor and `bead` is a new story the
+    holders keep back — its wait is the disk, not a dispatch failure — else None.
+
+    None (do NOT suppress; fall through to the other checks and possibly the alarm) when:
+      - disk is None (NÃO MEDIDO: an unmeasured disk must never license a suppression);
+      - the disk is measured ok (it explains nothing);
+      - the bead is not of the held class (formula step / pool demand / not a story type): the
+        disk hold does not cover it, so a starve on it is real.
+    """
+    if disk is None or disk.get("state") != "low":
+        return None
+    if not _is_disk_held_story(bead):
+        return None
+    return ("disco livre %s MB abaixo do piso de %s MB — história nova segurada por desenho "
+            "(pool probe + piso do Pilot, ga-vln2py), a espera é o disco, não falha de despacho"
+            % (disk.get("free_mb"), disk.get("floor_mb")))
+
+
+def _disk_body_line(disk, bead):
+    """The alarm-body line for the free disk: which of its states this alarm is in. By the time an
+    alarm fires the disk did not explain the wait — it is fine, it does not cover this bead, or nobody
+    could tell; the line says which, so the reader does not have to guess whether the disk was ruled out."""
+    if disk is None:
+        return ("Disco livre: NÃO MEDIDO — a lib disk-headroom-lib.sh não respondeu ou o df não "
+                "deu número; se o disco estiver abaixo do piso de fato, esta espera pode ser a retenção "
+                "de história nova (pool probe + piso do Pilot).")
+    free, floor = disk.get("free_mb"), disk.get("floor_mb")
+    if disk.get("state") == "low":
+        if not _is_disk_held_story(bead):
+            return ("Disco livre: %s MB, ABAIXO do piso de %s MB (medido), mas este bead não é "
+                    "história nova (passo de fórmula/pool demand ou tipo que não é de história) — a "
+                    "retenção por disco não o cobre, então não explica a espera." % (free, floor))
+        # _process_store folds this case into the disk note before it gets here; a direct caller can
+        # still reach it, and then the honest sentence is the opposite of the one above.
+        return ("Disco livre: %s MB, ABAIXO do piso de %s MB (medido) e este bead é história nova — a "
+                "retenção por disco o segura, esta espera é provavelmente o disco." % (free, floor))
+    return ("Disco livre: %s MB, acima do piso de %s MB (medido) — não explica a espera. "
+            "(Entre o piso e 6144 MB o passo pesado do build ainda recusa, heavy-guard rc 75, mas o "
+            "despacho não é segurado.)" % (free, floor))
+
+
 def _pilot_queue_position(bead_id, dispatchable):
     """Return (index, total, ahead_by_priority) for bead_id within an already-
     read `dispatchable` dict (see _read_pilot_dispatchable), or None if
@@ -4397,7 +4649,7 @@ def _branch_stranded_reason(bead_id):
 def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
                     gate_depth=None, gate_throughput=None, dispatchable=None,
                     sweep_pause_state=None, cap_evidence=None, pause_agg=None,
-                    gate_focus=None):
+                    gate_focus=None, disk=None):
     """Scan story:approved open beads in rig_root; classify and act on each one.
 
     built_ids: set of bead ids with a live BUILT marker (from _gate_marker_source_beads(),
@@ -4879,6 +5131,21 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
                  bead_id, starve_age_min, sweep_pause_reason))
             continue
 
+        # FREE DISK UNDER THE FLOOR (ga-4mxaa8): the pause record above is the Pilot's LAST sweep,
+        # up to a sweep old — it cannot see a disk that fell since. This is the disk read NOW, once
+        # per cycle, through the same lib the holders use. A new story is held back by design while
+        # the disk is under the floor (pool probes + the Pilot's disk floor, ga-vln2py), whatever its
+        # place in the queue — the front of it included — so no per-bead alarm: the beads are folded
+        # into ONE disk note (backoff 1h/4h/12h), like the pause-cause fold at the end of this
+        # cascade. Not measured / measured ok / a bead of the class the disk does not hold →
+        # None → on to the checks below, exactly as before (the alarm body names the disk state).
+        disk_reason = _disk_low_suppress_reason(disk, bead)
+        if disk_reason is not None:
+            _log("  %s: daemon-age=%.0fmin, %s — folded into the disk-low note (no per-bead alarm)" % (
+                 bead_id, starve_age_min, disk_reason))
+            pause_agg.add_disk(bead, starve_age_min, disk)
+            continue
+
         # GATE FOCUS MODE (ga-pfnfr5): a whole-sweep pause for everything that is not a fix,
         # decided by Athos (07/10) while the gate queue is the bottleneck. The Pilot never hands
         # such a bead a session, so its wait is the mode working — three false "dispatch
@@ -4959,7 +5226,7 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
 
         # ALARM: buildable bead starving, pilot alive, pool has capacity, dispatch failing.
         _alarm_starving(rig_root, bead, starve_age_min, now, state, gate_depth, gate_throughput,
-                         dispatchable, cap_evidence, gate_focus)
+                         dispatchable, cap_evidence, gate_focus, disk)
         alarmed += 1
 
     if own_pause_agg:
@@ -5093,6 +5360,19 @@ def run_cycle(now, state):
              "ON" if gate_focus.get("active") else "OFF",
              " (gate queue=%s)" % gate_focus.get("depth") if gate_focus.get("depth") else ""))
 
+    # Free disk (ga-4mxaa8): also city-wide, read once per cycle. None = NÃO MEDIDO (lib missing or
+    # not sourceable, df unreadable); _disk_low_suppress_reason() reads that as "cannot confirm the
+    # disk is low" — it never suppresses — and the alarm body says so.
+    disk = _read_disk_state()
+    if disk is None:
+        _log("  free disk NÃO MEDIDO (disk-headroom-lib.sh did not answer or df gave no number) — a "
+             "new story held back by a low disk is not recognised this cycle, the alarm keeps firing "
+             "and says so (see ga-4mxaa8)")
+    else:
+        _log("  free disk: %s MB (floor %s MB) — %s" % (
+             disk.get("free_mb"), disk.get("floor_mb"),
+             "UNDER the floor: new stories are held back" if disk.get("state") == "low" else "ok"))
+
     total_p = total_r = total_a = 0
     pause_agg = _PauseAggregator(now)   # ga-5bzrzu: one per cycle, shared by every rig
 
@@ -5116,7 +5396,7 @@ def run_cycle(now, state):
             p, r, a = _process_store(rig_root, now, state, pilot_alive, built_ids,
                                       blocked_ids, gate_depth, gate_throughput,
                                       dispatchable, sweep_pause_state, cap_evidence,
-                                      pause_agg, gate_focus)
+                                      pause_agg, gate_focus, disk)
             total_p += p
             total_r += r
             total_a += a
@@ -5470,7 +5750,7 @@ def _selftest():
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers, _sh
     global _bd_blocked, _bd_blocker_rows, _bd_show_full, _bd_has_built_branch, _bd_branch_stranded
     global _read_pilot_dispatchable_file, _read_pilot_sweep_pause_state_file
-    global _read_gate_focus_file
+    global _read_gate_focus_file, _read_disk_state_file
     global _pilot_dispatchable_reason_file
     global _arc_ledger, _write_flow_authority
     global DRY_RUN, STARVE_MIN, FLOW_GRACE_MIN, ROUTE_COOLDOWN_SEC, ALARM_COOLDOWN_SEC
@@ -5675,6 +5955,10 @@ def _selftest():
     # city's gate queue happened to be deep would decide the outcome of unrelated scenarios.
     # None (NÃO MEDIDO) never suppresses — the same alarm-preserving default as the two reads above.
     _read_gate_focus_file = lambda: None
+    # And for the free disk (ga-4mxaa8): unstubbed, _read_disk_state() would run the real lib against the
+    # LIVE disk, so whether the machine running the selftest happened to be low on space would decide
+    # unrelated scenarios. None (NÃO MEDIDO) never suppresses — the same alarm-preserving default.
+    _read_disk_state_file = lambda: None
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _make_bead(bid, labels=None, title="Test story", assignee="",
@@ -11080,6 +11364,306 @@ def _selftest():
             "missing, lib answering 'banana' and bash that cannot run (_sh → None) → None")
     else:
         _bad("(ga-pfnfr5-h)", "results=%r" % (_pf_res,))
+
+    # ── ga-4mxaa8: free disk under the floor — one note, not one alarm per bead ───────────────────
+    # 17/10 21:00-21:40: 25+ "STILL starving" mails (repeat #2-#6), one per bead, while the disk was under the
+    # floor and the pool probes / the Pilot were holding every new story back by design. The reconciler's only
+    # disk signal was the Pilot's LAST-sweep pause record (up to a sweep old); it never read the disk.
+    _read_gate_focus_file = lambda: None      # hermetic again: nothing but the disk may explain a wait here
+    _DK_LOW = {"state": "low", "free_mb": 3900, "floor_mb": 5120}
+    _DK_OK = {"state": "ok", "free_mb": 9000, "floor_mb": 5120}
+    _DK_IDS = ["ga-4mxaa8-s%d" % i for i in range(6)]
+    _DK_TYPES = ["task", "bug", "feature", "chore", "task", "bug"]
+
+    def _dk_beads(ids=None, types=None):
+        ids = ids if ids is not None else _DK_IDS
+        types = types if types is not None else _DK_TYPES
+        return [_make_bead(b, labels=list(_FNEW), age_min=_STARVE + 5.0 + i, issue_type=t)
+                for i, (b, t) in enumerate(zip(ids, types))]
+
+    def _dk_seen(st, ids=None):
+        for i, b in enumerate(ids if ids is not None else _DK_IDS):
+            st["first_seen_approved"][b] = NOW - (_STARVE + 5 + i) * 60
+
+    def _dk_notes():
+        return [(s, b) for s, b in mail_calls if "disco livre" in s]
+
+    def _dk_alarmed():
+        return sorted({b for b in _DK_IDS + ["ga-4mxaa8-front"] if any(b in s for s, _ in _df_mails())})
+
+    # Pilot sweep record present and NOT paused (the stale-record case) and a queue snapshot that does not list
+    # these beads: before the fix every one of them reaches the alarm (AC2: a bead absent from the queue alarms).
+    _read_pilot_sweep_pause_state_file = _pause_off
+    _read_pilot_dispatchable_file = lambda: {"items": [{"id": "ga-4mxaa8-other", "priority": 2}]}
+    _read_pilot_log_lines = lambda: _pilot_recent()
+
+    print("\nScenario (ga-4mxaa8-a): THE REPRO — disk MEASURED under the floor, 6 new stories starving, the "
+          "Pilot's last sweep record says 'not paused' → NO per-bead 'dispatch failing', ONE disk note naming "
+          "them, and the log says each was folded")
+    _read_disk_state_file = lambda: dict(_DK_LOW)
+    _bd_approved = lambda root: _dk_beads()
+    st = _reset()
+    _dk_seen(st)
+    _dk_out = _run_logged(st)
+    _dk_n = _dk_notes()
+    if (not _df_mails() and len(_dk_n) == 1 and "6 bead(s)" in _dk_n[0][0]
+            and "3900MB abaixo do piso 5120MB" in _dk_n[0][0]
+            and all(b in _dk_n[0][1] for b in _DK_IDS[1:]) and _DK_IDS[0] not in _dk_n[0][1]   # the 5 OLDEST (age grows with the index)
+            and "(+1 outra(s)" in _dk_n[0][1]
+            and not notify_calls and not flow_authority_calls
+            and any("ga-4mxaa8-s0" in l and "folded into the disk-low note" in l for l in _dk_out.splitlines())
+            and "free disk: 3900 MB (floor 5120 MB) — UNDER the floor" in _dk_out):
+        _ok("(ga-4mxaa8-a): 0 per-bead mails, 1 disk note (6 beads, the 5 oldest named + '+1'), no push, no flow authority; "
+            "cycle log shows the reading and each fold")
+    else:
+        _bad("(ga-4mxaa8-a)", "df=%s notes=%s notify=%s log=%r" % (
+             [s for s, _ in _df_mails()], [s for s, _ in _dk_n], notify_calls,
+             [l for l in _dk_out.splitlines() if "ga-4mxaa8" in l or "free disk" in l][:4]))
+
+    print("\nScenario (ga-4mxaa8-b): backoff — the disk note repeats on the SAME 1h/4h/12h tiers: 1 / 0 at +10min / "
+          "'repeat #2' at +1h / 0 / 'repeat #3' after 4h more")
+    st = _reset()
+    _dk_seen(st)
+    _dkb = []
+    for _dt in (0, 600, 3700, 3700 + 600, 3700 + 14400 + 60):
+        _reset_captures()
+        _t = NOW + _dt
+        _read_pilot_log_lines = lambda: _pilot_recent_at(_t)
+        run_cycle(_t, st)
+        _dkb.append(([s for s, _ in _dk_notes()], len(_df_mails())))
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    if (len(_dkb[0][0]) == 1 and _dkb[1][0] == [] and len(_dkb[2][0]) == 1 and "repeat #2" in _dkb[2][0][0]
+            and _dkb[3][0] == [] and len(_dkb[4][0]) == 1 and "repeat #3" in _dkb[4][0][0]
+            and all(n == 0 for _, n in _dkb)):
+        _ok("(ga-4mxaa8-b): 1 / 0 / repeat #2 at +1h / 0 / repeat #3 after 4h more, and never a per-bead mail in between")
+    else:
+        _bad("(ga-4mxaa8-b)", "per-cycle (notes, per-bead mails): %r" % (_dkb,))
+
+    print("\nScenario (ga-4mxaa8-c): falsification — disk measured OK → the same 6 beads STILL alarm one by one "
+          "(the fix is not a blanket mute), no disk note, and each body says the disk was measured OK")
+    _read_disk_state_file = lambda: dict(_DK_OK)
+    st = _reset()
+    _dk_seen(st)
+    run_cycle(NOW, st)
+    _dkc = [b for s, b in _df_mails()]
+    if (_dk_alarmed() == sorted(_DK_IDS) and not _dk_notes() and _dkc
+            and all("Disco livre: 9000 MB, acima do piso de 5120 MB (medido)" in b for b in _dkc)):
+        _ok("(ga-4mxaa8-c): disk OK → 6 per-bead alarms, 0 disk notes, bodies say 'acima do piso ... (medido)'")
+    else:
+        _bad("(ga-4mxaa8-c)", "SAFETY VIOLATION or wrong body — alarmed=%s notes=%s" % (
+             _dk_alarmed(), [s for s, _ in _dk_notes()]))
+
+    print("\nScenario (ga-4mxaa8-d): falsification (root-class:error-vs-empty) — disk NOT MEASURED (seam returns None) "
+          "→ the 6 beads STILL alarm, the body says NÃO MEDIDO (not 'ok'), and the cycle log says so")
+    _read_disk_state_file = lambda: None
+    st = _reset()
+    _dk_seen(st)
+    _dk_out = _run_logged(st)
+    _dkd = [b for s, b in _df_mails()]
+    if (_dk_alarmed() == sorted(_DK_IDS) and not _dk_notes() and _dkd
+            and all("Disco livre: NÃO MEDIDO" in b and "acima do piso" not in b for b in _dkd)
+            and "free disk NÃO MEDIDO" in _dk_out):
+        _ok("(ga-4mxaa8-d): unmeasured disk does NOT suppress; body 'NÃO MEDIDO' (not 'acima do piso'); cycle log says so too")
+    else:
+        _bad("(ga-4mxaa8-d)", "SAFETY VIOLATION — an UNMEASURED disk silenced or mislabelled a starving bead "
+             "(root-class:error-vs-empty); alarmed=%s notes=%s" % (_dk_alarmed(), [s for s, _ in _dk_notes()]))
+
+    print("\nScenario (ga-4mxaa8-e): disk LOW but the held CLASS is only new stories — 2 stories fold into the note; "
+          "a formula step (gc.kind), a pool-demand bead, a non-story type and a bead with no type STILL alarm, "
+          "and their bodies say the disk hold does not cover them")
+    _read_disk_state_file = lambda: dict(_DK_LOW)
+    _dke_story = ["ga-4mxaa8-e-s1", "ga-4mxaa8-e-s2"]
+    _dke_other = {"ga-4mxaa8-e-kind": ("task", {"gc.kind": "step"}),
+                  "ga-4mxaa8-e-demand": ("bug", {"gc.pool_demand": "wa-worker"}),
+                  "ga-4mxaa8-e-type": ("molecule", {}),
+                  "ga-4mxaa8-e-none": (None, {})}
+    _dke_beads = _dk_beads(_dke_story, ["task", "bug"])
+    for _b, (_t, _m) in _dke_other.items():
+        _bb = _make_bead(_b, labels=list(_FNEW), age_min=_STARVE + 5.0, issue_type=_t)
+        _bb["metadata"] = dict(_m)
+        _dke_beads.append(_bb)
+    _bd_approved = lambda root: [dict(b) for b in _dke_beads]
+    st = _reset()
+    _dk_seen(st, _dke_story + list(_dke_other))
+    run_cycle(NOW, st)
+    _dke_alarm = sorted(b for b in _dke_other if any(b in s for s, _ in _df_mails()))
+    _dke_n = _dk_notes()
+    if (_dke_alarm == sorted(_dke_other) and len(_dke_n) == 1 and "2 bead(s)" in _dke_n[0][0]
+            and all(b in _dke_n[0][1] for b in _dke_story) and not any(b in _dke_n[0][1] for b in _dke_other)
+            and all("ABAIXO do piso de 5120 MB (medido), mas este bead não é história nova" in b
+                    for s, b in _df_mails())):
+        _ok("(ga-4mxaa8-e): 2 stories folded; step / pool-demand / non-story type / typeless bead alarm and say "
+            "'não é história nova'")
+    else:
+        _bad("(ga-4mxaa8-e)", "alarmed=%s notes=%s" % (_dke_alarm, [(s, [b for b in _dke_story + list(_dke_other) if b in bd]) for s, bd in _dke_n]))
+
+    print("\nScenario (ga-4mxaa8-f): queue position — FRONT of the queue is no exception while the disk is low "
+          "(folded), and with the disk OK 'starving' stays for the 1st in the queue only (the 2nd, queued behind it, is quiet)")
+    _read_pilot_dispatchable_file = lambda: {"items": [{"id": "ga-4mxaa8-front", "priority": 2},
+                                                       {"id": "ga-4mxaa8-second", "priority": 2}]}
+    _dkf_ids = ["ga-4mxaa8-front", "ga-4mxaa8-second"]
+    _bd_approved = lambda root: _dk_beads(_dkf_ids, ["task", "task"])
+    _read_disk_state_file = lambda: dict(_DK_LOW)
+    st = _reset()
+    _dk_seen(st, _dkf_ids)
+    run_cycle(NOW, st)
+    _dkf_low = (len(_df_mails()), [s for s, _ in _dk_notes()])
+    _read_disk_state_file = lambda: dict(_DK_OK)
+    st = _reset()
+    _dk_seen(st, _dkf_ids)
+    run_cycle(NOW, st)
+    _dkf_ok = sorted({b for b in _dkf_ids if any(b in s for s, _ in _df_mails())})
+    if (_dkf_low[0] == 0 and len(_dkf_low[1]) == 1 and "2 bead(s)" in _dkf_low[1][0]
+            and _dkf_ok == ["ga-4mxaa8-front"] and not _dk_notes()):
+        _ok("(ga-4mxaa8-f): disk low → front + second in ONE note, 0 alarms; disk ok → only the front alarms")
+    else:
+        _bad("(ga-4mxaa8-f)", "low=%r ok_alarmed=%r notes_after_ok=%r" % (_dkf_low, _dkf_ok, [s for s, _ in _dk_notes()]))
+    _read_pilot_dispatchable_file = lambda: {"items": [{"id": "ga-4mxaa8-other", "priority": 2}]}
+
+    print("\nScenario (ga-4mxaa8-g): a direct _process_store() call that never heard of the disk (disk not passed) keeps "
+          "the old behaviour — alarm, body NÃO MEDIDO")
+    _read_disk_state_file = lambda: dict(_DK_LOW)      # would suppress IF run_cycle had passed it down
+    _bd_approved = lambda root: _dk_beads(_DK_IDS[:1], _DK_TYPES[:1])
+    st = _reset()
+    _dk_seen(st, _DK_IDS[:1])
+    _process_store(RIG_ROOTS[0].strip(), NOW, st, True, set(), set())
+    _dkg = [b for s, b in _df_mails() if _DK_IDS[0] in s]
+    if len(_dkg) == 1 and "Disco livre: NÃO MEDIDO" in _dkg[0] and not _dk_notes():
+        _ok("(ga-4mxaa8-g): a caller that did not measure the disk gets no suppression and an honest NÃO MEDIDO")
+    else:
+        _bad("(ga-4mxaa8-g)", "mails=%s notes=%s" % (_dkg, _dk_notes()))
+
+    print("\nScenario (ga-4mxaa8-h): the suppress-reason and the held-class predicate — table, and PARITY with the "
+          "lib's own DISK_HOLD_NEW_STORIES_JQ run through the real jq")
+    _dkh_story = {"issue_type": "task", "metadata": {}}
+    _dkh_unit = (_disk_low_suppress_reason(None, _dkh_story),
+                 _disk_low_suppress_reason(dict(_DK_OK), _dkh_story),
+                 _disk_low_suppress_reason(dict(_DK_LOW), {"issue_type": "task", "metadata": {"gc.kind": "step"}}),
+                 _disk_low_suppress_reason(dict(_DK_LOW), _dkh_story))
+    _dkh_beads = [{"issue_type": t, "metadata": m}
+                  for t in ("task", "bug", "feature", "chore", "epic", "spike", "molecule", "", None, "Task", 7)
+                  for m in (None, {}, {"gc.kind": "step"}, {"gc.step_ref": "x"}, {"gc.pool_demand": "wa-worker"},
+                            {"gc.kind": ""}, {"gc.kind": None}, {"gc.kind": False}, {"gc.kind": 0},
+                            {"gc.kind": []}, {"gc.kind": "step", "gc.pool_demand": ""}, {"other": "x"})]
+    _dkh_beads += [{"metadata": {}}, {"issue_type": "task"}, {}]    # fields absent altogether
+    _dkh_lib = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "packs", "town-deltas",
+                            "assets", "scripts", "disk-headroom-lib.sh")
+    _dkh_diff = None
+    try:
+        _jq_text = subprocess.run(["bash", "-c", '. "$1" || exit 97; printf "%s" "$DISK_HOLD_NEW_STORIES_JQ"', "x",
+                                   _dkh_lib], capture_output=True, text=True, timeout=10).stdout   # third-state-waiver: test-only; an empty/failed read leaves _dkh_diff None and the scenario FAILS via _bad
+        _dkh_jq = subprocess.run(["jq", "-c", "length"], input="[]", capture_output=True, text=True, timeout=10)   # third-state-waiver: test-only jq probe; failure FAILS the scenario via _bad
+        _dkh_diff = []
+        if _jq_text and _dkh_jq.returncode == 0:
+            for _bd in _dkh_beads:
+                _o = subprocess.run(["jq", "-c", _jq_text], input=json.dumps([_bd]), capture_output=True, text=True, timeout=10)   # third-state-waiver: test-only; a jq failure is recorded in _dkh_diff as a mismatch
+                _kept = _o.returncode == 0 and len(json.loads(_o.stdout or "[]")) == 1
+                if _o.returncode != 0 or _kept == _is_disk_held_story(_bd):
+                    _dkh_diff.append(_bd)
+        else:
+            _dkh_diff = None
+    except Exception as _e:
+        _dkh_diff = None
+    _dkh_illegible = [_is_disk_held_story({"issue_type": "task", "metadata": m}) for m in ("x", ["gc.kind"], 3)]
+    if (_dkh_unit[:3] == (None, None, None) and _dkh_unit[3] and "3900" in _dkh_unit[3] and "5120" in _dkh_unit[3]
+            and _dkh_diff == [] and _dkh_illegible == [False, False, False]):
+        _ok("(ga-4mxaa8-h): None/ok/step-bead → no reason; low + story → reason with both numbers; %d beads agree with the "
+            "lib's own jq; illegible metadata → not held" % len(_dkh_beads))
+    else:
+        _bad("(ga-4mxaa8-h)", "unit=%r diff=%r illegible=%r (diff None = the lib text or jq could not be read)" % (
+             _dkh_unit, _dkh_diff if _dkh_diff is None else _dkh_diff[:3], _dkh_illegible))
+
+    print("\nScenario (ga-4mxaa8-i): REAL _read_disk_state() (seam OFF, real bash + the checked-out lib, the lib's "
+          "DISK_FREE_OVERRIDE_MB) — low / ok / floor from the environment / kill switch / unreadable reading / lib "
+          "missing / lib answering garbage / bash that cannot run; every non-clean answer is None, never ok and never low")
+    _dki_dir = tempfile.mkdtemp(prefix="arc-selftest-disk-")
+    _dki_fake = os.path.join(_dki_dir, "garbage-lib.sh")
+    with open(_dki_fake, "w") as _f:
+        _f.write("disk_free_mb() { printf '4000'; }\ndisk_state_of() { printf 'banana'; }\n")
+    _dki_env_keys = ("DISK_FREE_OVERRIDE_MB", "DISK_NEW_WORK_MIN_MB", "DISK_HEADROOM_ENABLED")
+    _dki_env = {k: os.environ.pop(k, None) for k in _dki_env_keys}
+    _dki_saved = (DISK_LIB, _sh, _read_disk_state_file)
+    _dki = {}
+
+    def _dki_read(free, **env):
+        for k in _dki_env_keys:
+            os.environ.pop(k, None)
+        if free is not None:
+            os.environ["DISK_FREE_OVERRIDE_MB"] = free
+        os.environ.update(env)
+        return _read_disk_state()
+
+    try:
+        globals()["DISK_LIB"] = _dkh_lib
+        _sh = _true_sh
+        _read_disk_state_file = None     # un-stub — force the real function body
+        _dki["low"] = _dki_read("3000")
+        _dki["ok"] = _dki_read("9000")
+        _dki["edge"] = _dki_read("5120")          # exactly the floor is NOT under it (the lib's -lt)
+        _dki["env_floor"] = _dki_read("3000", DISK_NEW_WORK_MIN_MB="2000")
+        _dki["killed"] = _dki_read("3000", DISK_HEADROOM_ENABLED="0")
+        _dki["bad_reading"] = _dki_read("abc")
+        _dki["huge"] = _dki_read("99999999999")
+        globals()["DISK_LIB"] = os.path.join(_dki_dir, "no-such-lib.sh")
+        _dki["nolib"] = _dki_read("3000")
+        globals()["DISK_LIB"] = _dki_fake
+        _dki["garbage"] = _dki_read("3000")
+        globals()["DISK_LIB"] = _dkh_lib
+        _sh = lambda *a, **kw: None     # what _sh answers when bash cannot run or times out
+        _dki["shnone"] = _dki_read("3000")
+    finally:
+        globals()["DISK_LIB"], _sh, _read_disk_state_file = _dki_saved[0], _dki_saved[1], lambda: None
+        for k in _dki_env_keys:
+            os.environ.pop(k, None)
+            if _dki_env[k] is not None:
+                os.environ[k] = _dki_env[k]
+        os.remove(_dki_fake)
+        os.rmdir(_dki_dir)
+    if (_dki.get("low") == {"state": "low", "free_mb": 3000, "floor_mb": 5120}
+            and _dki.get("ok") == {"state": "ok", "free_mb": 9000, "floor_mb": 5120}
+            and _dki.get("edge") == {"state": "ok", "free_mb": 5120, "floor_mb": 5120}
+            and _dki.get("env_floor") == {"state": "ok", "free_mb": 3000, "floor_mb": 2000}
+            and _dki.get("killed") == {"state": "ok", "free_mb": 3000, "floor_mb": 5120}
+            and all(_dki.get(k, "unset") is None for k in ("bad_reading", "huge", "nolib", "garbage", "shnone"))):
+        _ok("(ga-4mxaa8-i): 3000→low, 9000→ok, exactly the floor→ok, floor from the environment honoured, kill switch "
+            "→ok; unreadable / over-long reading, lib missing, lib answering 'banana' and bash that cannot run → None")
+    else:
+        _bad("(ga-4mxaa8-i)", "results=%r" % (_dki,))
+
+    print("\nScenario (ga-4mxaa8-j): the two notes are independent — a pause-note flush that blows up still lets "
+          "the disk note out (and the error is not swallowed); DRY_RUN sends nothing and records nothing")
+    _dkj_agg = _PauseAggregator(NOW)
+    _dkj_agg.add_disk({"id": "ga-4mxaa8-j", "title": "t"}, 90.0, dict(_DK_LOW))
+    _dkj_orig = _PauseAggregator._flush_pause
+    _dkj_state = {"pause_cause": {}}
+    _dkj_exc = None
+    _reset_captures()
+    try:
+        _PauseAggregator._flush_pause = lambda self, state: (_ for _ in ()).throw(RuntimeError("boom"))
+        try:
+            _dkj_agg.flush(_dkj_state)
+        except RuntimeError as _e:
+            _dkj_exc = _e
+    finally:
+        _PauseAggregator._flush_pause = _dkj_orig
+    _dkj_sent = len(_dk_notes())
+    _dkj_agg = _PauseAggregator(NOW)
+    _dkj_agg.add_disk({"id": "ga-4mxaa8-j", "title": "t"}, 90.0, dict(_DK_LOW))
+    _dkj_dry = {"pause_cause": {}}
+    _reset_captures()
+    DRY_RUN = True
+    try:
+        _dkj_agg.flush(_dkj_dry)
+    finally:
+        DRY_RUN = False
+    if (_dkj_exc is not None and _dkj_sent == 1 and _dkj_state["pause_cause"].get(DISK_LOW_CAUSE_KEY, {}).get("count") == 1
+            and not _dk_notes() and _dkj_dry["pause_cause"] == {}):
+        _ok("(ga-4mxaa8-j): disk note sent and recorded although the pause flush raised (the error still propagates); "
+            "DRY_RUN → no mail, no state")
+    else:
+        _bad("(ga-4mxaa8-j)", "exc=%r sent=%r state=%r dry_mails=%r dry_state=%r" % (
+             _dkj_exc, _dkj_sent, _dkj_state, _dk_notes(), _dkj_dry))
+    _read_pilot_dispatchable_file = lambda: None
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
