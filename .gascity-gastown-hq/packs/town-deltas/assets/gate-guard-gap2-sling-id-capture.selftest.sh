@@ -19,6 +19,19 @@
 #
 # THE FIX: drop the `P` — capture("Sling task bead: (?<id>[a-z][a-z0-9-]+)").
 #
+# ga-cyeq50a (second defect in the same capture): the id class [a-z][a-z0-9-]+
+# has no dot, so a hierarchical bead id is cut at its first dot —
+# "Sling task bead: ga-2hd02v.3.27" yielded "ga-2hd02v", the EPIC. GAP-2 then
+# read the epic's status/labels as if they were the sling's: an epic carrying
+# gate:needs-fix would send the child down free:fail-stranded (labels stripped,
+# gate:needs-fix stamped on it), and a closed epic would send it down the
+# free:pass-stranded arm (which still runs its own merge check before closing).
+# THE FIX: the id keeps its dotted numeric levels,
+# [a-z][a-z0-9-]+(?:\.[0-9]+)* (a sentence-final "." with no digit after it is
+# not part of the id). Sections 2 and 3b below are the proof: 2 feeds dotted ids
+# to the live program, 3b restores the dot-less class on a throwaway copy and
+# requires those same dotted checks to go RED.
+#
 # Strategy: this jq program lives inline inside Step 0c.2's `for SC_ID in
 # $GAP2_IDS; do ... done` sweep loop, not in a standalone function — it is not
 # reachable via GATE_GUARD_LIB_ONLY=1 sourcing (same constraint documented in
@@ -72,10 +85,10 @@ extract_sling_jq_program() {
 
 # ── 1. Structural: live source uses the Oniguruma-native form, not (?P< ─────
 echo "── 1. live source carries the fixed capture() syntax ──"
-if grep -qF 'capture("Sling task bead: (?<id>[a-z][a-z0-9-]+)")' "$GUARD"; then
-  ok "quality-gate-guard.sh contains the Oniguruma-native capture (no P)"
+if grep -qF 'capture("Sling task bead: (?<id>[a-z][a-z0-9-]+(?:\\.[0-9]+)*)")' "$GUARD"; then
+  ok "quality-gate-guard.sh contains the Oniguruma-native capture (no P) with dotted id levels (ga-cyeq50a)"
 else
-  bad "quality-gate-guard.sh is MISSING the expected fixed capture() line (ga-ale3o regression)"
+  bad "quality-gate-guard.sh is MISSING the expected fixed capture() line (ga-ale3o / ga-cyeq50a regression)"
 fi
 
 if grep -qF '(?P<' "$GUARD"; then
@@ -119,6 +132,49 @@ else
   RESULT3="$(echo "$FIXTURE3" | jq -r "$LIVE_PROGRAM" 2>/dev/null | head -1)"
   [ -z "$RESULT3" ] && ok "no 'Sling task bead' comment -> empty result (genuine no-match, not an error)" \
     || bad "expected empty for a comment set with no sling reference, got '$RESULT3'"
+
+  # ga-cyeq50a: hierarchical ids must come out WHOLE, never cut at the first dot
+  # (the cut id is the parent/epic — a different bead whose state GAP-2 would
+  # then mis-read as the sling's). Each fixture is one comment shaped like the
+  # Pilot's dispatch comment; the cases are the real ids from the filing plus the
+  # shapes the id can sit in (end of line, followed by prose, sentence period).
+  dotted_case() { # <label> <comment text (jq string body)> <expected id>
+    local label="$1" text="$2" want="$3" fx got
+    fx="{\"comments\":[{\"created_at\":\"2026-10-31T15:00:00Z\",\"text\":\"$text\"}]}"
+    got="$(echo "$fx" | jq -r "$LIVE_PROGRAM" 2>/dev/null | head -1)"
+    if [ "$got" = "$want" ]; then
+      ok "$label -> '$want'"
+    else
+      bad "$label: expected '$want', got '$got' (id cut at the dot? epic/parent id read instead of the sling's)"
+    fi
+  }
+  dotted_case "two-level dotted id (ga-2hd02v.3.27, the filing's case)" \
+    'Pilot dispatched builder.\nSling task bead: ga-2hd02v.3.27\nBuilder doctrine: fix bug.' 'ga-2hd02v.3.27'
+  dotted_case "one-level dotted id (ga-2hd02v.14)" \
+    'Sling task bead: ga-2hd02v.14' 'ga-2hd02v.14'
+  dotted_case "other rig prefix, dotted (wa-qrki7a.3 — the ga-61i9j5y incident id)" \
+    'Sling task bead: wa-qrki7a.3\nBuilder doctrine: fix bug.' 'wa-qrki7a.3'
+  dotted_case "three-level dotted id" \
+    'Sling task bead: wa-d3ys32.2.1' 'wa-d3ys32.2.1'
+  dotted_case "multi-digit levels are kept whole (ga-x.12 not ga-x.1)" \
+    'Sling task bead: ga-abc12.12.345\nrest' 'ga-abc12.12.345'
+  dotted_case "dotted id followed by prose on the same line" \
+    'Sling task bead: ga-2hd02v.3.24 was dispatched' 'ga-2hd02v.3.24'
+  dotted_case "sentence-final period is NOT part of a plain id" \
+    'Done. Sling task bead: ga-61i9j5y. Next steps follow.' 'ga-61i9j5y'
+  dotted_case "sentence-final period is NOT part of a dotted id" \
+    'Sling task bead: ga-2hd02v.3.27. Next steps follow.' 'ga-2hd02v.3.27'
+  dotted_case "dot followed by a non-digit does not extend the id" \
+    'Sling task bead: ga-61i9j5y.md' 'ga-61i9j5y'
+
+  # A dotted id in an OLDER comment must not beat a plain id in the NEWER one
+  # (sort_by(.created_at)|reverse still decides which comment wins).
+  FIXTURE4='{"comments":[
+    {"created_at":"2026-10-30T09:00:00Z","text":"Sling task bead: ga-2hd02v.3.27"},
+    {"created_at":"2026-10-31T09:00:00Z","text":"Sling task bead: ga-fgj1nt3"}]}'
+  RESULT4="$(echo "$FIXTURE4" | jq -r "$LIVE_PROGRAM" 2>/dev/null | head -1)"
+  [ "$RESULT4" = "ga-fgj1nt3" ] && ok "newest comment still wins when an older one holds a dotted id" \
+    || bad "expected 'ga-fgj1nt3' from the newest comment, got '$RESULT4'"
 fi
 
 # ── 3. MUTATION TEST: reverting to (?P<id> must silently break extraction,
@@ -134,8 +190,8 @@ MUTATE_OK=0
 python3 - "$MUTANT" <<'PYEOF' && MUTATE_OK=1
 import sys
 path = sys.argv[1]
-needle = 'capture("Sling task bead: (?<id>[a-z][a-z0-9-]+)")'
-mutant = 'capture("Sling task bead: (?P<id>[a-z][a-z0-9-]+)")'
+needle = r'capture("Sling task bead: (?<id>[a-z][a-z0-9-]+(?:\\.[0-9]+)*)")'
+mutant = r'capture("Sling task bead: (?P<id>[a-z][a-z0-9-]+(?:\\.[0-9]+)*)")'
 with open(path) as f:
     text = f.read()
 count = text.count(needle)
@@ -168,6 +224,52 @@ else
     fi
   fi
   rm -f /tmp/gate-ale3o-mutant-stderr-$$ 2>/dev/null || true
+fi
+
+# ── 3b. MUTATION TEST (ga-cyeq50a): restoring the dot-less id class must make
+#    the dotted-id extraction return the EPIC id — the exact wrong answer that
+#    GAP-2 would then read as the sling's state. Without this, section 2's
+#    dotted checks could pass against a program that never looked at the dot. ──
+echo "── 3b. MUTATION TEST: restoring the dot-less id class must cut ga-2hd02v.3.27 to ga-2hd02v ──"
+MUTANT_DOT="$(mktemp "${TMPDIR:-/tmp}/gate-cyeq50a-mutant-XXXXXX.sh" 2>/dev/null || echo "/tmp/gate-cyeq50a-mutant-$$.sh")"
+cleanup_mutant_dot() { rm -f "$MUTANT_DOT"; }
+trap 'cleanup_mutant; cleanup_mutant_dot' EXIT
+cp "$GUARD" "$MUTANT_DOT"
+
+MUTATE_DOT_OK=0
+python3 - "$MUTANT_DOT" <<'PYEOF' && MUTATE_DOT_OK=1
+import sys
+path = sys.argv[1]
+needle = r'capture("Sling task bead: (?<id>[a-z][a-z0-9-]+(?:\\.[0-9]+)*)")'
+mutant = r'capture("Sling task bead: (?<id>[a-z][a-z0-9-]+)")'
+with open(path) as f:
+    text = f.read()
+count = text.count(needle)
+if count != 1:
+    print("EXPECTED_EXACTLY_1_OCCURRENCE_GOT_%d" % count, file=sys.stderr)
+    sys.exit(1)
+with open(path, 'w') as f:
+    f.write(text.replace(needle, mutant, 1))
+PYEOF
+
+if [ "$MUTATE_DOT_OK" != "1" ]; then
+  bad "mutation-test 3b: could not construct the dot-less mutant (expected exactly 1 fixed capture() line to revert) — INCONCLUSIVE, treat as FAIL"
+else
+  MUTANT_DOT_PROGRAM="$(extract_sling_jq_program "$MUTANT_DOT")"
+  DOT_FX='{"comments":[{"created_at":"2026-10-31T15:00:00Z","text":"Sling task bead: ga-2hd02v.3.27"}]}'
+  MUTANT_DOT_RESULT="$(echo "$DOT_FX" | jq -r "$MUTANT_DOT_PROGRAM" 2>/dev/null | head -1)"
+  if [ "$MUTANT_DOT_RESULT" = "ga-2hd02v" ]; then
+    ok "mutant (dot-less class restored): ga-2hd02v.3.27 is cut to the epic 'ga-2hd02v' — reproduces ga-cyeq50a exactly, proves the dotted checks in section 2 are load-bearing"
+  else
+    bad "dot-less mutant did NOT reproduce the cut (got '$MUTANT_DOT_RESULT', wanted 'ga-2hd02v') — section 2's dotted checks may be vacuous"
+  fi
+  # And the same mutant must keep the PLAIN ids working: the only thing the
+  # mutant may break is the dot, otherwise 3b would be proving something else.
+  PLAIN_FX='{"comments":[{"created_at":"2026-10-31T15:00:00Z","text":"Sling task bead: ga-fgj1nt3"}]}'
+  MUTANT_PLAIN_RESULT="$(echo "$PLAIN_FX" | jq -r "$MUTANT_DOT_PROGRAM" 2>/dev/null | head -1)"
+  [ "$MUTANT_PLAIN_RESULT" = "ga-fgj1nt3" ] \
+    && ok "the dot-less mutant still extracts a plain id, so 3b isolates the dot and nothing else" \
+    || bad "dot-less mutant broke a plain id too (got '$MUTANT_PLAIN_RESULT') — 3b is not isolating the dot"
 fi
 
 # ── 4. Sanity: the live guard is still valid bash after the fix ─────────────

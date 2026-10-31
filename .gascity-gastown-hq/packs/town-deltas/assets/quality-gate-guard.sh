@@ -7436,10 +7436,20 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
     fi
 
     # Find sling bead ID from Pilot dispatch comment.
+    # ga-cyeq50a: the id keeps its dotted numeric levels (ga-2hd02v.3.27 is ONE
+    # id). The old dot-less class cut it at the first dot and returned the EPIC
+    # (ga-2hd02v), whose status/labels GAP-2 then read as the sling's. A "." with
+    # no digit after it (end of a sentence, ".md") is not part of the id.
+    # vazio → no comment, or none with a "Sling task bead:" id: SLING_ID="" →
+    # SLING_FOUND=0 → classify_parent_gap2 answers skip:no-sling (or
+    # skip:live-assignee, which it checks first), parent untouched; falhou/
+    # ilegível → the jq errors or SC_SHOW is unreadable: 2>/dev/null swallows it
+    # and SLING_ID is "" too, so it is indistinguishable from empty here (known,
+    # ga-ale3o) but lands on the same inert skip — never on a free:* arm.
     SLING_ID=$(echo "$SC_SHOW" | jq -r '
       .comments // [] | sort_by(.created_at) | reverse |
       .[] | .text // "" | select(test("Sling task bead:")) |
-      capture("Sling task bead: (?<id>[a-z][a-z0-9-]+)") | .id
+      capture("Sling task bead: (?<id>[a-z][a-z0-9-]+(?:\\.[0-9]+)*)") | .id
     ' 2>/dev/null | head -1 || echo "")
 
     SLING_FOUND=0
