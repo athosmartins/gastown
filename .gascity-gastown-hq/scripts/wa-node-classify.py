@@ -35,10 +35,13 @@ COMO DECIDE (a 1ª regra que casa vale; tudo é lido da bead, nada é gravado ne
      mac-only e fora do que a varredura de conteúdo do espelho segura, porque "teste que o nó tem" é o que vale. Nada é inferido para código que o texto não cita. Achou -> node, basis `derivado`
      (`info`: teste-derivado:<código>=<teste>); mas se o texto tem palavra informativa de envio de WhatsApp (o freio de DERIVED_BLOCK_INFO; `dado-de-lead` saiu em ga-2hd02v.3.21) -> mini, `freio-derivado:<palavras>`.
      Não achou -> unknown. Repo/git/espelho ilegível -> unknown com `info` `teste-derivado-ilegivel:<motivo>`; nunca vira node.
-  7. CAMINHO DERIVADO (ga-2hd02v.3.20; só quando a bead NÃO cita nenhum arquivo de código; medido 30/10: 13 de 30 beads sondadas caíam em unknown `sem-prova-de-codigo-e-teste` porque o texto NOMEIA o módulo mas
+  7. CAMINHO DERIVADO (ga-2hd02v.3.20; só quando a bead NÃO cita nenhum arquivo de código — nome solto com extensão de código que não existe em lugar nenhum da árvore lida, o `part.py` de um script de
+     diagnóstico, não conta como citado: `info` `caminho-solto-fora-da-arvore:<nome>`, ga-2hd02v.3.22; medido 30/10: 13 de 30 beads sondadas caíam em unknown `sem-prova-de-codigo-e-teste` porque o texto NOMEIA o módulo mas
      não escreve o caminho): o caminho sai do próprio repo do WA em origin/main, nunca de palpite. (a) NOMES: palavra com `_` ou `-` no texto (ficha_donos, form-fill; maiúscula vale; até 30 por bead) que é o nome
      de arquivo de código (sem a extensão, >=5 letras, nada genérico) na árvore do repo; um nome com mais de 3 arquivos é ambíguo (`info`: caminho-derivado-ambiguo:<nome>=N) e não deriva nada; palavra colada a
-     `/` ou a uma extensão é caminho, não nome. (b) IRMÃS: os arquivos de código tocados pelos commits `fix|feat(<id>)` das beads de MESMO PAI (o campo `parent` ou o id sem o último `.N`; até 40 commits dos últimos 45 dias, WA_NODE_SIBLING_DAYS; um `git log`
+     `/` ou a uma extensão é caminho, não nome. CÓPIA DE BACKUP (ga-2hd02v.3.22): candidato cuja PASTA tem a palavra bak/backup/backups/archive/archived (`lib.bak-20260313-200326/`, `archive/`; `old`/`orig`
+     não, são nomes de pasta viva) e que tem o homônimo VIVO (mesmo nome de arquivo, pasta sem essa palavra) é IGNORADO, não freado, e o vivo segue como candidato (`info`: caminho-derivado-backup-ignorado:N); a ambiguidade
+     conta só os vivos. Só há a cópia -> como antes: deriva e o filtro a freia. Não se generalizou para "ignora o que está fora do filtro": isso viraria o freio em preferência. (b) IRMÃS: os arquivos de código tocados pelos commits `fix|feat(<id>)` das beads de MESMO PAI (o campo `parent` ou o id sem o último `.N`; até 40 commits dos últimos 45 dias, WA_NODE_SIBLING_DAYS; um `git log`
      com prazo próprio, WA_NODE_SIBLING_TIMEOUT, 15 s) que ainda existem na árvore. Mais de 10 arquivos derivados no total = nenhum (`caminho-derivado-demais:N`; é palpite largo). Os caminhos derivados passam pelos MESMOS
      filtros dos citados, sem afrouxar nada: filtro do rsync (fora dele -> mini `caminho-derivado-fora-do-filtro:<p>`), lista mac-only (mini `caminho-derivado-so-no-mac:<p>`), as moles e o PII da regra 3/4 (que já rodaram antes)
      e o freio de envio da regra 6 (mini `freio-derivado:envio-whatsapp`). A prova do teste é a mesma da regra 6 (o teste que o repo já tem para o código derivado) ou, se a bead cita o teste, o próprio teste citado.
@@ -132,6 +135,7 @@ DERIVED_BLOCK_INFO = ("envio-whatsapp",)                             # palavra i
 NAME_RE = re.compile(r"(?<![\w/.\-~$])([A-Za-z][A-Za-z0-9]*(?:[_\-][A-Za-z0-9]+)+)(?![\w/]|\.\w)")   # `ficha_donos`, `form-fill`: nome de módulo/tela/daemon SEM caminho (o que tem pasta ou extensão é caminho e já foi lido)
 MAX_NAME_TOKENS = 30                                                 # nomes distintos lidos de uma bead
 MAX_FILES_PER_NAME = 3                                               # um nome que casa mais arquivos que isto é ambíguo: não deriva nada dele
+BACKUP_WORDS = frozenset(("bak", "backup", "backups", "archive", "archived"))   # palavra de PASTA que marca cópia: `lib.bak-20260313-200326/` e `archive/` existem no repo do WA, o resto é o mesmo nome por extenso; `old`/`orig` ficam de fora porque pasta viva pode ter esse nome
 MAX_DERIVED_CODE = 10                                                # arquivos de código derivados no total; acima disso a bead não é sobre um módulo só: não deriva nada
 # regra 8 (código derivado do teste, ga-2hd02v.3.21): o que o teste citado importa
 MAX_TEST_BYTES = 1_000_000                                           # teste maior que isto não é analisado (o git já o devolveu inteiro, mas não passa pelo parse): ilegível, nunca "sem import"
@@ -380,14 +384,16 @@ def resolve_loose(paths, sent):
     de outra pasta (`templates/map_viewer.html`, `scripts/job_timeout.sh`): o falso "fora do filtro" e o código sem teste derivado (ga-2hd02v.3.17). Troca o nome solto pelo caminho real quando ele é inequívoco: (1) a própria bead cita UM caminho com pasta e esse
     nome E a árvore de REPO_REF, lida, não tem arquivo da raiz com ele (o solto podia ser esse, e aí o citado é outro arquivo), ou (2) a árvore tem UM arquivo com esse nome e nenhum na raiz. O caminho trocado passa pelo MESMO filtro, mac-only e espelho dos demais (nada é aberto por esta troca); só código/texto
     (RESOLVE_EXT) é trocado, nunca dado. vazio (nenhum candidato, ou mais de um) -> o nome segue solto, fora do filtro = mini, como antes; falhou/ilegível (árvore) -> idem + nota
-    `caminho-solto-ilegivel:<motivo>`, nunca "resolvido" (nas DUAS regras: sem a árvore não dá para saber se o solto é o da raiz, e palpite não vira node)."""
+    `caminho-solto-ilegivel:<motivo>`, nunca "resolvido" (nas DUAS regras: sem a árvore não dá para saber se o solto é o da raiz, e palpite não vira node).
+    4º valor: os nomes soltos de código que NÃO existem em lugar nenhum da árvore lida (script de diagnóstico, `part.py`: ga-2hd02v.3.22), que a regra 7 não conta como "código citado". Só com a árvore
+    lida e a bead sem citar o nome com pasta; árvore ilegível -> nenhum (sem ela não dá para saber se o nome é de um arquivo novo da raiz). `info` leva `caminho-solto-fora-da-arvore:<nome>`."""
     if not paths:
-        return paths, sent, []
+        return paths, sent, [], set()
     loose = [p for p in paths if "/" not in p and p.rsplit(".", 1)[-1].lower() in RESOLVE_EXT and (p not in sent or p.rsplit(".", 1)[-1].lower() in CODE_EXT)]   # texto/html que o filtro não manda, ou código solto (o filtro o deixa sair da raiz, mas sem o caminho real a regra 6 não acha o teste dele)
     if not loose:
-        return paths, sent, []
+        return paths, sent, [], set()
     foldered = [p for p in paths if "/" in p]
-    tree, tried, ok, note, swap = set(), False, False, [], {}
+    tree, tried, ok, note, swap, ghosts = set(), False, False, [], {}, set()
     for p in loose:
         if not tried:
             tried = True
@@ -403,8 +409,11 @@ def resolve_loose(paths, sent):
         hits = sorted(f for f in tree if f.rsplit("/", 1)[-1] == p)
         if len(hits) == 1 and hits[0] != p and all(SAFE_SEG.match(sg) for sg in hits[0].split("/")):   # hits == [p]: o arquivo é o da raiz mesmo, nada a trocar
             swap[p] = hits[0]
+        elif ok and not hits and p.rsplit(".", 1)[-1].lower() in CODE_EXT:   # nenhum arquivo com esse nome em lugar nenhum (nem na raiz): não é código do repo, é script de diagnóstico ou arquivo novo
+            ghosts.add(p)
+    note += ["caminho-solto-fora-da-arvore:" + p for p in sorted(ghosts)]
     if not swap:
-        return paths, sent, note
+        return paths, sent, note, ghosts
     out = []
     for p in paths:
         q = swap.get(p, p)
@@ -413,7 +422,7 @@ def resolve_loose(paths, sent):
     new = sorted(set(q for q in swap.values() if q not in sent))
     if new:
         sent = set(sent) | sent_by_filter(new)
-    return out, sent, note + ["caminho-solto:%s=%s" % (p, q) for p, q in swap.items()]
+    return out, sent, note + ["caminho-solto:%s=%s" % (p, q) for p, q in swap.items()], ghosts
 
 
 def mac_only_globs():
@@ -635,21 +644,35 @@ def sibling_log(parent):
     return names
 
 
+def in_backup_dir(f):
+    """True se alguma PASTA do caminho (o nome do arquivo não conta) tem uma palavra de cópia (BACKUP_WORDS): `lib.bak-20260313-200326/x.py`, `archive/x.py`. Só olha o caminho; quem chama ignora a cópia
+    apenas quando existe o homônimo vivo, então uma pasta viva com nome de cópia perde a escolha para o outro homônimo mas nunca faz uma bead virar node sozinha."""
+    return any(t in BACKUP_WORDS for seg in f.split("/")[:-1] for t in re.split(r"[._\-0-9]+", seg.lower()) if t)
+
+
 def derive_code(b, text):
     """({arquivo de código: origem}, notas) que a bead NOMEIA sem citar o caminho (regra 7): (a) nome snake_case/hífen do texto = nome de arquivo de código em REPO_REF (até MAX_FILES_PER_NAME; mais que isso
-    é ambíguo e não deriva); (b) arquivos de código que os commits das irmãs (mesmo pai) tocaram e que ainda existem em REPO_REF. Mais de MAX_DERIVED_CODE no total -> nada. Sem nome nem pai o repo nem é
-    lido ({}, []); repo/git ilegível -> Unreadable (quem chama devolve unknown com a nota, nunca node)."""
+    é ambíguo e não deriva); (b) arquivos de código que os commits das irmãs (mesmo pai) tocaram e que ainda existem em REPO_REF. Cópia de backup (in_backup_dir) com homônimo vivo (mesmo nome de arquivo
+    fora de pasta de cópia) é ignorada nas duas fontes, e a ambiguidade de (a) conta só os vivos (ga-2hd02v.3.22: `lib.bak-*/followup_manager.py` freava `lib/followup_manager.py` como "fora do filtro"); só há
+    cópia -> o comportamento antigo (derivar a cópia, e o filtro a freia). Mais de MAX_DERIVED_CODE no total -> nada. Sem nome nem pai o repo nem é lido ({}, []); repo/git ilegível -> Unreadable (quem
+    chama devolve unknown com a nota, nunca node)."""
     names, parent = name_tokens(text), parent_of(b)
     if not names and not parent:
         return {}, []
     tree = repo_tree()
     present = set(tree)
-    by_stem, notes, out = {}, [], {}
+    by_stem, notes, out, live_stems = {}, [], {}, set()
     for f in tree:
         if derivable_code(f):
             by_stem.setdefault(file_stem(f), []).append(f)
+            if not in_backup_dir(f):
+                live_stems.add(file_stem(f))
+    ignored = 0
     for n in names:
         fs = sorted(by_stem.get(n, []))
+        if n in live_stems:
+            ignored += sum(1 for f in fs if in_backup_dir(f))
+            fs = [f for f in fs if not in_backup_dir(f)]
         if len(fs) > MAX_FILES_PER_NAME:
             notes.append("caminho-derivado-ambiguo:%s=%d" % (n, len(fs)))
             continue
@@ -658,7 +681,12 @@ def derive_code(b, text):
     if parent:
         for f in sibling_log(parent):
             if f in present:
+                if in_backup_dir(f) and file_stem(f) in live_stems:
+                    ignored += 1
+                    continue
                 out.setdefault(f, "irmas")
+    if ignored:
+        notes.append("caminho-derivado-backup-ignorado:%d" % ignored)
     if len(out) > MAX_DERIVED_CODE:
         return {}, notes + ["caminho-derivado-demais:%d" % len(out)]
     return out, notes
@@ -836,7 +864,7 @@ def classify(b):
     if has_pii(json.dumps(b, ensure_ascii=False)):
         hard.append("dado-no-texto")
     sent = sent_by_filter(paths) if paths else None
-    paths, sent, loose_note = resolve_loose(paths, sent)   # nome solto -> o caminho real, quando é inequívoco (julgado pelo mesmo filtro)
+    paths, sent, loose_note, ghosts = resolve_loose(paths, sent)   # nome solto -> o caminho real, quando é inequívoco (julgado pelo mesmo filtro); ghosts = soltos que não existem na árvore
     globs = mac_only_globs() if paths else []
     # texto neutro que o rsync não lista mas o espelho entrega (docs/, DESIGN.md...): só os .md fora da lista pagam a consulta ao espelho; os demais caminhos seguem como antes.
     # vazio (nenhum .md fora da lista) -> o espelho nem é consultado; falhou/ilegível -> nenhum chega e `info` leva espelho-ilegivel:<motivo> (o caminho segue 'fora do filtro' = mini, como antes desta regra)
@@ -884,7 +912,7 @@ def classify(b):
     # falhou/ilegível (repo, git show, teste que não parseia, rsync, mac-only) -> unknown + nota `codigo-do-teste-ilegivel`, nunca node e nunca "vazio"
     # a regra 7 que NÃO CONSEGUIU LER (r7_failed) não é "a regra 7 não derivou nada": o git log das irmãs pode ter o código que a regra 8 não veria (e o freio dele) -> a regra 8 NÃO roda, fica unknown + `caminho-derivado-ilegivel`
     extra = []
-    if not code:
+    if not [c for c in code if c not in ghosts]:   # nome solto que não existe na árvore (`part.py`) segue em `code` para a regra 5, mas não impede a 7 de achar o código que a bead nomeia
         t0 = time.monotonic()
         r7_failed = False
         try:

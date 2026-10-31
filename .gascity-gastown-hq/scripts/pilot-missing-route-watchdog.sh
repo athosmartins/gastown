@@ -226,6 +226,36 @@
 # none of the fifteen holds/wrappers/graph-steps/parks/active-gates/
 # recent-dispatches/ownership/terminal-gate/human-parks above applying.
 #
+# SECOND PASS — story:approved beads (ga-2hd02v.3.22 B). The story:* exclusion above stays for the FIRST
+# pass (chore/task/debt, with the self-heal). But "a story:approved bead waits in the Pilot's tier-2 queue" had
+# become a blind spot: the Mayor measured 6 P0/P1 approved WA beads without gc.routed_to (wa-lqfic6, wa-sgznbu,
+# wa-wx5q9a, wa-zmxywv.18.1/.18.2 + exec:manual ones) and no alarm, because this watchdog never looked at them.
+# Who "approves without routing"? Nobody has to: the Pilot stamps gc.routed_to itself when it dispatches
+# (dispatch_one, after the claim), so an approved bead is unrouted until the Pilot first acts on it — that is
+# the normal waiting state, not a missing step in the approval flow. What is NOT normal is a P0/P1 that sits
+# there with nothing holding it. So the second pass flags: status=open, not an epic, story:approved AND
+# exec:auto, priority <= PMRW_APPROVED_MAX_PRIORITY (default 1; P2/P3 queue behind P0/P1 for hours and would
+# drown the signal), no gc.routed_to, unassigned, last updated >= PMRW_APPROVED_MIN_MINUTES (default 30)
+# ago, and NONE of the reasons a bead is unrouted on purpose: gate:* (the gate owns it), blocked*/waiting-on:*/
+# next-action:*, an open `blocks` dependency in the same store, pilot:held (unexpired), pilot:refusal-count:*,
+# pilot:reclaim-count:*, no-auto-dispatch, needs:engine-window/framework:engine, story:in-flight,
+# pilot:dispatched(ing), a pilot.dispatched_at within PMRW_DISPATCH_RECENCY_MINUTES, sling wrappers,
+# graph.v2 steps, discovery:source. Measured live 31/10: 5 approved P0/P1 exec:auto unrouted WA beads, every
+# one carved out by one of those (gate:passed, assignee+gate, assignee+refusal, open dependency, epic) — the
+# pass is quiet today and exists to catch the next wa-sgznbu-shaped bead.
+# DETECTION-ONLY: no gc.routed_to is written and no comment is posted. A route put on from outside would
+# make a pool session claim the bead without the Pilot's pool-cap / node / claim checks (the wa-5wv49
+# double-dispatch class); the useful output is a person asking why the Pilot has not touched it.
+# It rides on the SAME `bd list --json --limit 0` read as the first pass (no extra bd call), alerts through
+# its own cooldown ledger (PMRW_APPROVED_STATE_FILE), and never changes run_sweep's return code.
+# A store that could not be read (or whose selection failed) is reported as PARTIAL/UNKNOWN, never as
+# "0 found" (ga-qpfza doctrine). The age is the time since the bead's last update, so it can only be
+# UNDER-stated. Related, not replaced: approved-state-reconciler.py alarms on approved-but-not-flowing beads, but
+# excuses a bead for its queue position ("enfileirado atrás de N itens ... despacho saudável") and stays silent
+# when it reads the Pilot as dead ("starving BUT pilot dead — no alarm"); this pass looks at the bead alone
+# and does not consult the queue or the Pilot's liveness. Kill-switch PMRW_APPROVED_ENABLED=0.
+# See --selftest scenarios 56-63.
+#
 # GRACE PERIOD (PMRW_GRACE_MINUTES, default 10): unlike GMMSW's gate-status
 # loss (happens once, atomically, at marker creation — 5min grace), an armed
 # bead can lose its route at MULTIPLE points in its lifecycle per ga-f54ui's
@@ -390,6 +420,12 @@ PMRW_AUTO_REPAIR="${PMRW_AUTO_REPAIR:-1}"
 # path already does) does not.
 PMRW_REPAIR_MAX_ATTEMPTS="${PMRW_REPAIR_MAX_ATTEMPTS:-3}"
 PMRW_REPAIR_RETRY_SLEEP_S="${PMRW_REPAIR_RETRY_SLEEP_S:-1}"
+# ga-2hd02v.3.22 (B): a SEPARATE, detection-only pass over story:approved + exec:auto beads
+# (see "SECOND PASS" in the header). Number knobs that are not plain digits fall back to the
+# default in _pmrw_approved_select (a typo must not turn the alarm off or into a firehose).
+PMRW_APPROVED_ENABLED="${PMRW_APPROVED_ENABLED:-1}"
+PMRW_APPROVED_MIN_MINUTES="${PMRW_APPROVED_MIN_MINUTES:-30}"
+PMRW_APPROVED_MAX_PRIORITY="${PMRW_APPROVED_MAX_PRIORITY:-1}"
 
 HQ="${PMRW_HQ:-/Users/athos/gt/.gascity-gastown-hq}"
 # Same store set as GOLW (gate-orphaned-label-watchdog.sh), same rationale:
@@ -403,6 +439,9 @@ BD_BIN="${PMRW_BD_BIN:-bd}"
 
 PMRW_STATE_DIR="${PMRW_STATE_DIR:-$HOME/.gastown/state}"
 STATE_FILE="${PMRW_STATE_FILE:-$PMRW_STATE_DIR/pilot-missing-route-watchdog.state.json}"
+# ga-2hd02v.3.22 (B): cooldown ledger of the second (story:approved) pass — its own file, so the
+# main pass's resolve/prune logic never sees (and never drops) an approved bead's entry.
+APPROVED_STATE_FILE="${PMRW_APPROVED_STATE_FILE:-$PMRW_STATE_DIR/pilot-missing-route-watchdog.approved.state.json}"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -752,6 +791,146 @@ _pmrw_resolve_tracked_state() {
   jq -nc --argjson st "$_new_state" --argjson rid "$_resolved_json" '{state: $st, resolved_ids: $rid}' 2>/dev/null
 }
 
+# _pmrw_approved_select <cand_json> <now_epoch>   (ga-2hd02v.3.22 B — second pass, see header)
+# Prints, as a compact JSON array, the beads of ONE store's `bd list --json` that are open +
+# story:approved + exec:auto + priority <= PMRW_APPROVED_MAX_PRIORITY, with NO gc.routed_to, whose last
+# update is >= PMRW_APPROVED_MIN_MINUTES old, and that carry none of the reasons a bead is legitimately
+# unrouted (held by the gate / assigned / blocked / dispatched a moment ago / parked for a person / ...).
+# vazio → "[]" rc 0 (nenhuma nesta store); falhou/ilegível (jq falhou, saída vazia ou que não é array) →
+# rc 1 e nada no stdout: o chamador conta a store como NÃO vista nesta passada, nunca como "0 achadas".
+# The unit is the SAME `bd list --json --limit 0` read run_sweep already did for the first pass: no extra bd call.
+# updated_at is the only clock there is (a label/comment resets it): the age UNDER-states, never over-states,
+# so a busy bead can hide longer than 30 min but a quiet one is never accused early. An updated_at that
+# does not parse leaves the bead out (same as the first pass) rather than guessing an age.
+_pmrw_approved_select() {
+  local _cand="$1" _now="$2" _min _maxpri _out
+  case "${PMRW_APPROVED_MIN_MINUTES:-}" in ''|*[!0-9]*) _min=30 ;; *) _min="$PMRW_APPROVED_MIN_MINUTES" ;; esac
+  case "${PMRW_APPROVED_MAX_PRIORITY:-}" in ''|*[!0-9]*) _maxpri=1 ;; *) _maxpri="$PMRW_APPROVED_MAX_PRIORITY" ;; esac
+  _out=$(printf '%s' "$_cand" | jq -c \
+      --argjson now_ts "$_now" --argjson minage "$(( _min * 60 ))" --argjson maxpri "$_maxpri" \
+      --argjson recency "$(( ${PMRW_DISPATCH_RECENCY_MINUTES:-240} * 60 ))" '
+      . as $all
+      | [ $all[] | select((.status // "") != "closed") | .id ] as $live
+      | [ $all[]
+          | select((.status // "") == "open")
+          | select((.issue_type // .type // "") != "epic")
+          | select((.labels // []) | index("story:approved"))
+          | select((.labels // []) | index("exec:auto"))
+          | select(((.priority | tonumber?) // 9) <= $maxpri)
+          | select(((.metadata["gc.routed_to"] // "") | test("\\S")) | not)
+          | select(((.assignee // "") | test("\\S")) | not)
+          | select(((.labels // []) | any(startswith("gate:") or startswith("blocked") or startswith("waiting-on:") or startswith("next-action:") or startswith("pilot:refusal-count:") or startswith("pilot:reclaim-count:"))) | not)
+          | select(((.labels // []) | any(. == "story:in-flight" or . == "pilot:dispatched" or . == "pilot:dispatching" or . == "no-auto-dispatch" or . == "pilot:no-auto-dispatch" or . == "needs:engine-window" or . == "framework:engine" or . == "discovery:source")) | not)
+          | select(
+              (((.labels // []) | index("pilot:held")) | not)
+              or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber?) | if length > 0 then (max < $now_ts) else false end))
+          | select(((.metadata["pilot.sling_for"] // "") | test("\\S")) | not)
+          | select(((.metadata["gc.root_bead_id"] // "") | test("\\S")) | not)
+          | select(((.metadata["gc.formula_contract"] // "") | test("\\S")) | not)
+          | select(((.metadata["pilot.dispatched_at"] // "") | tonumber? // 0) < ($now_ts - $recency))
+          | select(([ (.dependencies // [])[] | select(.type == "blocks") | .depends_on_id ] | map(. as $d | $live | index($d)) | any(. != null)) | not)
+          | select(((.updated_at // .created_at // "") | fromdateiso8601?) as $u | ($u != null) and ($u < ($now_ts - $minage)))
+        ]
+    ' 2>/dev/null) || return 1
+  [ -n "${_out:-}" ] || return 1
+  [ "$(printf '%s' "$_out" | jq -r 'type' 2>/dev/null)" = "array" ] || return 1
+  printf '%s\n' "$_out"
+}
+
+# _pmrw_approved_report <approved_tsv> <unread_stores> <total_stores> <now_epoch>   (ga-2hd02v.3.22 B)
+# Alerts (notify + mail to the mayor, cooldown per bead in APPROVED_STATE_FILE) on the beads the second pass
+# selected. DETECTION-ONLY BY DESIGN: it never stamps gc.routed_to and never comments on the bead. The Pilot
+# stamps the route itself when it dispatches (dispatch_one, after the claim), and a route put on by someone
+# else would make the bead claimable by a pool session without the Pilot's pool-cap / node / claim checks (the
+# wa-5wv49 double-dispatch class) — so the useful output here is a human reading WHY the Pilot has not touched
+# a P0/P1 approved bead, not a silent "fix". Never changes run_sweep's return code (the first pass owns it).
+# approved_tsv: one row per line, real TAB-separated (NOT the \t-escaped form the first pass uses): id, store, age_min,
+# priority, type — none can be empty by construction (age is a number or "?", priority a number, type falls back to "?").
+# vazio → loga "CLEAR" (0 nas stores lidas; não "OK:" — o selftest 27 conta as linhas "OK:" para provar que só um run varreu) e, se TODAS foram lidas, zera o ledger de cooldown; falhou/ilegível →
+# stores sem leitura saem como UNKNOWN/PARTIAL (nunca "OK: 0") e o ledger fica como está (cego não zera cooldown,
+# senão a bead volta a avisar assim que a leitura voltar).
+_pmrw_approved_report() {
+  local _tsv="$1" _unread="${2:-0}" _total="${3:-0}" _now="$4"
+  [ "${PMRW_APPROVED_ENABLED:-1}" = "1" ] || return 0
+  local _n; _n="$(printf '%s' "$_tsv" | grep -c . || true)"
+  [ -z "${_n:-}" ] && _n=0
+  local _ast="{}"
+  if [ -f "$APPROVED_STATE_FILE" ]; then
+    _ast="$(jq -c 'if type=="object" then . else {} end' "$APPROVED_STATE_FILE" 2>/dev/null)" || _ast="{}"
+    [ -z "${_ast:-}" ] && _ast="{}"
+  fi
+  if [ "$_n" -eq 0 ]; then
+    if [ "$_unread" -ge "$_total" ] && [ "$_total" -gt 0 ]; then
+      log "APPROVED: UNKNOWN: passada story:approved cega (0/${_total} stores legíveis) — nenhuma conclusão possível"
+    elif [ "$_unread" -gt 0 ]; then
+      log "APPROVED: PARTIAL: $(( _total - _unread ))/${_total} stores lidas; 0 aprovadas sem rota nas lidas (${_unread} sem leitura)"
+    else
+      log "APPROVED: CLEAR: 0 story:approved+exec:auto P<=${PMRW_APPROVED_MAX_PRIORITY} sem rota há >=${PMRW_APPROVED_MIN_MINUTES}min em ${_total} store(s)"
+      if [ "${PMRW_DRY_RUN:-0}" != "1" ] && [ -f "$APPROVED_STATE_FILE" ]; then rm -f "$APPROVED_STATE_FILE" 2>/dev/null || true; fi
+    fi
+    return 0
+  fi
+  local _bid _store _age _pri _typ _last _due="" _due_n=0 _newst
+  _newst="$( [ "$_unread" -gt 0 ] && printf '%s' "$_ast" || printf '{}' )"
+  while IFS=$'\t' read -r _bid _store _age _pri _typ; do
+    [ -z "${_bid:-}" ] && continue
+    log "APPROVED: ${_bid} ($(_store_name "$_store"), P${_pri} ${_typ}) story:approved+exec:auto sem gc.routed_to, parada há ${_age}min"
+    _last="$(printf '%s' "$_ast" | jq -r --arg id "$_bid" '.[$id].last_alert // 0' 2>/dev/null)"
+    case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
+    if [ "$_last" -eq 0 ] || [ $(( _now - _last )) -ge "$PMRW_ALERT_COOLDOWN_S" ]; then
+      _due="${_due}  ${_bid}  ($(_store_name "$_store"), P${_pri} ${_typ})  parada há ${_age}min"$'\n'
+      _due_n=$((_due_n + 1))
+      _last="$_now"
+    fi
+    _newst="$(printf '%s' "$_newst" | jq -c --arg id "$_bid" --argjson la "$_last" '.[$id] = {last_alert: $la}' 2>/dev/null)" || _newst="$_ast"
+  done < <(printf '%s' "$_tsv")
+  if [ "$_due_n" -eq 0 ]; then
+    log "APPROVED: ${_n} bead(s) já avisada(s) dentro do cooldown (${PMRW_ALERT_COOLDOWN_S}s) — sem nova notificação"
+    if [ "${PMRW_DRY_RUN:-0}" != "1" ]; then
+      mkdir -p "$PMRW_STATE_DIR" 2>/dev/null || true
+      printf '%s' "$_newst" > "$APPROVED_STATE_FILE" 2>/dev/null || true
+    fi
+    return 0
+  fi
+  if [ "${PMRW_DRY_RUN:-0}" = "1" ]; then
+    log "APPROVED: DRY_RUN: avisaria ${_due_n} bead(s) (notify + mail ao mayor); ledger não gravado"
+    return 0
+  fi
+  local _summary="APROVADAS SEM ROTA: ${_due_n} nova(s)/devida(s), ${_n} no total (story:approved + exec:auto, P<=${PMRW_APPROVED_MAX_PRIORITY}, sem gc.routed_to, paradas >=${PMRW_APPROVED_MIN_MINUTES}min)"
+  if [ -n "${PMRW_TEST_NOTIFIED:-}" ]; then
+    echo "notify:approved:$_summary" >> "$PMRW_TEST_NOTIFIED" 2>/dev/null || true
+  else
+    command -v "${NOTIFY_BIN}" >/dev/null 2>&1 && \
+      "${NOTIFY_BIN}" -t "Pilot: aprovada(s) sem rota" -p "${PMRW_NOTIFY_PRIORITY}" "$_summary" 2>/dev/null || true
+  fi
+  local _body="PILOT MISSING-ROUTE WATCHDOG — passada das APROVADAS (ga-2hd02v.3.22, só detecta).
+
+${_summary}
+
+NOVAS/DEVIDAS (${_due_n}):
+${_due}
+O que isto quer dizer: a bead está open, aprovada, auto, sem dono e sem gc.routed_to, e NADA que a segure de propósito
+(gate:*, blocked*, waiting-on:*, next-action:*, pilot:held, no-auto-dispatch, dependência aberta, despacho recente,
+refusal/reclaim) está nela. O Pilot carimba a rota sozinho ao despachar; se ela ficou >= ${PMRW_APPROVED_MIN_MINUTES}min sem nada,
+o Pilot não a enxergou ou a deixou de fora sem deixar marca. Onde olhar: grep '<id>' no pilot-dispatcher.log (EXCLUÍDO ...),
+e o classificador de nó se for bead do WA (wa-node-classify.py).
+NÃO foi gravado gc.routed_to em nenhuma bead e não há comentário nas beads: uma rota posta por fora faria um pool pegar a bead
+sem passar pelas checagens de capacidade/nó do Pilot.
+A idade é desde o último update da bead (o único relógio que existe): comentário/label novo a reinicia, então ela só pode ser
+SUBESTIMADA. Re-aviso da mesma bead suprimido por ${PMRW_ALERT_COOLDOWN_S}s (ledger: ${APPROVED_STATE_FILE}). Lista completa no log: ${LOG}"
+  if [ -n "${PMRW_TEST_MAILED:-}" ]; then
+    { echo "mail:pilot-missing-route-approved:$_summary"; printf '%s\n' "$_body"; } >> "$PMRW_TEST_MAILED" 2>/dev/null || true
+  else
+    command -v "$GC_BIN" >/dev/null 2>&1 && \
+      "$GC_BIN" mail send mayor \
+        -s "Beads sem rota (aprovadas): ${_due_n} P<=${PMRW_APPROVED_MAX_PRIORITY} story:approved exec:auto sem gc.routed_to há >=${PMRW_APPROVED_MIN_MINUTES}min" \
+        -m "$_body" 2>/dev/null || true
+  fi
+  mkdir -p "$PMRW_STATE_DIR" 2>/dev/null || true
+  printf '%s' "$_newst" > "$APPROVED_STATE_FILE" 2>/dev/null || true
+  return 0
+}
+
 run_sweep() {
   if [ "${PMRW_ENABLED:-1}" != "1" ]; then
     log "disabled (PMRW_ENABLED=0) — no-op"
@@ -798,6 +977,9 @@ run_sweep() {
   # NOT a failure and still advances stores_read.
   local stores_total=0 stores_read=0
   local store cand_json sel_json
+  # ga-2hd02v.3.22 (B): second pass accumulators. approved_unread counts the stores whose story:approved
+  # selection could not be computed (a different thing from "computed, found none") — see _pmrw_approved_select.
+  local approved_tsv="" approved_unread=0 appr_json appr_rows
   for store in $PMRW_STORES; do
     stores_total=$((stores_total + 1))
     # Re-stamp the lock heartbeat once per store (mirrors quality-gate-
@@ -851,6 +1033,30 @@ run_sweep() {
       continue
     fi
     stores_read=$((stores_read + 1))
+
+    # ga-2hd02v.3.22 (B): second pass on the SAME read. vazio → nada acrescentado; falhou/ilegível → a store
+    # entra em approved_unread (o relatório diz PARTIAL/UNKNOWN, nunca "0 achadas") e o resto do sweep segue.
+    if [ "${PMRW_APPROVED_ENABLED:-1}" = "1" ]; then
+      if appr_json="$(_pmrw_approved_select "$cand_json" "$now")"; then
+        appr_rows="$(printf '%s' "$appr_json" | jq -r --argjson now_ts "$now" --arg store "$store" '
+            .[] | [ .id, $store,
+                    ( ((.updated_at // .created_at // "") | fromdateiso8601? // null) as $e
+                      | if $e then ((($now_ts - $e) / 60) | floor | tostring) else "?" end ),
+                    ((.priority | tonumber? // 9) | tostring),
+                    (.issue_type // .type // "?") ] | join("\t")
+          ' 2>/dev/null)" || appr_rows=""
+        if [ -n "${appr_rows:-}" ]; then
+          approved_tsv="${approved_tsv}${appr_rows}"$'\n'
+        elif [ "$appr_json" != "[]" ]; then
+          # selecionou beads mas não conseguiu montar as linhas: falhou, não vazio → a store não foi vista
+          approved_unread=$((approved_unread + 1))
+          log "WARN: APPROVED: store '$store' tem aprovadas sem rota mas as linhas não saíram do jq — store conta como NÃO vista nesta passada"
+        fi
+      else
+        approved_unread=$((approved_unread + 1))
+        log "WARN: APPROVED: seleção das story:approved falhou na store '$store' — store conta como NÃO vista nesta passada (a primeira passada segue)"
+      fi
+    fi
 
     local rows
     # ga-no6qa: joined with an explicit unit-separator byte (octal 037 / US),
@@ -951,6 +1157,11 @@ run_sweep() {
       flagged_tsv="${flagged_tsv}${bid}\t${store}\t${age_min}\t${blabels}\t${btype}\n"
     done <<< "$rows"
   done
+
+  # ga-2hd02v.3.22 (B): the second pass reports here, BEFORE the first pass's early returns (an empty first pass
+  # returns right below). It only notifies/mails; run_sweep's own return code is untouched.
+  # Unseen stores = those the first pass could not read at all (stores_total - stores_read) + those whose selection failed.
+  _pmrw_approved_report "$approved_tsv" "$(( stores_total - stores_read + approved_unread ))" "$stores_total" "$now"
 
   # ── ga-9tgos: log + comment the repaired set (audit trail only — never
   # alarms; a repaired bead is working again, same "no side effect for a
@@ -1224,6 +1435,10 @@ if [ "${1:-}" = "--selftest" ] || [ "${PMRW_SELFTEST:-0}" = "1" ]; then
   PMRW_REPAIR_RETRY_SLEEP_S=0
   PMRW_STATE_DIR="$TMP/state"
   STATE_FILE="$TMP/state/pmrw.state.json"
+  APPROVED_STATE_FILE="$TMP/state/pmrw.approved.state.json"
+  PMRW_APPROVED_ENABLED=1
+  PMRW_APPROVED_MIN_MINUTES=30
+  PMRW_APPROVED_MAX_PRIORITY=1
   HQ="$TMP/hq"
   STORE_A="$TMP/store-a"
   STORE_B="$TMP/store-b"
@@ -1381,7 +1596,7 @@ BDSTUB
   reset_stores() {
     echo '[]' > "$TMP/fixtures/store-a.json"
     echo '[]' > "$TMP/fixtures/store-b.json"
-    rm -f "$STATE_FILE" 2>/dev/null
+    rm -f "$STATE_FILE" "$APPROVED_STATE_FILE" 2>/dev/null
   }
 
   # ── Scenario 1: armed + unrouted + aged, store-a → FLAGGED ────────────────
@@ -2275,6 +2490,125 @@ CRASHPY
   rc=$?
   [ "$rc" -eq 0 ] && ok "scenario 55: next-action:* excluded (return 0)" || bad "scenario 55 (ga-m8u5or REGRESSION): a bead parked with next-action:athos was flagged/repaired, got rc=$rc"
   [ ! -s "$C55" ] && [ ! -s "$N55" ] && [ ! -s "$M55" ] && ok "scenario 55: no repair write / alert fired on a next-action:* bead" || bad "scenario 55 (ga-m8u5or REGRESSION): next-action:* bead should never be repaired or alerted on"
+
+  # ── Scenarios 56-63 (ga-2hd02v.3.22 B): the SECOND pass — open + story:approved + exec:auto + P0/P1, no
+  # gc.routed_to, stopped >= 30min. Detection-only: never a comment, never a gc.routed_to write. ──────────────
+  MID_TS="$(date -u -v-20M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '20 minutes ago' +%Y-%m-%dT%H:%M:%SZ)"
+  mka() {  # id labels_csv updated_at priority [jq patch applied to the bead]
+    mk "$1" open "$2" "$3" | jq -c --argjson p "$4" ".priority = \$p | ${5:-.}"
+  }
+  to_store() { jq -s -c . > "$1"; }   # stdin: one bead per line → fixture array
+
+  echo "Scenario 56 (ga-2hd02v.3.22): P0 approved+auto, unrouted, 1h → alert (notify+mail), NO comment, NO route write"
+  reset_stores
+  mka wa-56 'story:approved,exec:auto' "$OLD_TS" 0 | to_store "$TMP/fixtures/store-a.json"
+  N56="$TMP/notif56"; M56="$TMP/mail56"; C56="$TMP/comm56"; U56="$TMP/upd56"; : > "$N56"; : > "$M56"; : > "$C56"; : > "$U56"
+  PMRW_TEST_NOTIFIED="$N56" PMRW_TEST_MAILED="$M56" PMRW_TEST_COMMENTS_LOG="$C56" PMRW_TEST_UPDATE_CALLS_LOG="$U56" run_sweep
+  rc=$?
+  [ "$rc" -eq 0 ] && ok "scenario 56: first pass untouched (story:* still excluded there, return 0)" || bad "scenario 56: run_sweep rc changed to $rc"
+  grep -q 'notify:approved:' "$N56" && grep -q 'wa-56' "$M56" && ok "scenario 56: notify + mail name the bead" || bad "scenario 56: approved-unrouted P0 produced no alert naming wa-56"
+  grep -q 'Beads sem rota\|aprovadas\|APROVADAS' "$M56" && ok "scenario 56: mail is the approved-pass report" || bad "scenario 56: mail is not the approved report"
+  [ ! -s "$C56" ] && ok "scenario 56: no comment on the bead (detection-only)" || bad "scenario 56: a comment was posted on an approved bead"
+  [ ! -s "$U56" ] && ok "scenario 56: no gc.routed_to write (the Pilot stamps the route; a stamp from here would skip its checks)" || bad "scenario 56: the approved pass WROTE to a bead"
+
+  echo "Scenario 57: the same bead on the next sweep → inside the cooldown → no second alert"
+  : > "$N56"; : > "$M56"
+  PMRW_TEST_NOTIFIED="$N56" PMRW_TEST_MAILED="$M56" PMRW_TEST_COMMENTS_LOG="$C56" run_sweep
+  [ ! -s "$N56" ] && [ ! -s "$M56" ] && ok "scenario 57: cooldown suppresses the re-alert" || bad "scenario 57: re-alerted inside the cooldown"
+  [ -s "$APPROVED_STATE_FILE" ] && ok "scenario 57: ledger kept while the bead stays flagged" || bad "scenario 57: ledger lost while still flagged"
+
+  echo "Scenario 58: one negative per carve-out + positives that must still fire (same sweep)"
+  reset_stores
+  {
+    mka ap-pos-p1        'story:approved,exec:auto'                         "$OLD_TS" 1
+    mka ap-pos-noctx     'story:approved,exec:auto'                         "$OLD_TS" 0
+    mka ap-pos-heldexp   'story:approved,exec:auto,pilot:held,pilot:held-until:1000' "$OLD_TS" 0
+    mka ap-pos-dispold   'story:approved,exec:auto'                         "$OLD_TS" 0 ".metadata[\"pilot.dispatched_at\"] = \"$DISPATCH_OLD_EPOCH\""
+    mka ap-pos-depgone   'story:approved,exec:auto'                         "$OLD_TS" 0 '.dependencies = [{"type":"blocks","depends_on_id":"ap-closed-elsewhere"}]'
+    mka ap-pos-parent    'story:approved,exec:auto'                         "$OLD_TS" 0 '.dependencies = [{"type":"parent-child","depends_on_id":"ap-neg-dep-target"}]'
+    mka ap-neg-routed    'story:approved,exec:auto'                         "$OLD_TS" 0 '.metadata["gc.routed_to"] = "wa-worker"'
+    mka ap-neg-assigned  'story:approved,exec:auto'                         "$OLD_TS" 0 '.assignee = "oracle-wa"'
+    mka ap-neg-p2        'story:approved,exec:auto'                         "$OLD_TS" 2
+    mka ap-neg-fresh     'story:approved,exec:auto'                         "$MID_TS" 0
+    mka ap-neg-manual    'story:approved,exec:manual'                       "$OLD_TS" 0
+    mka ap-neg-nostory   'exec:auto'                                        "$OLD_TS" 0
+    mka ap-neg-epic      'story:approved,exec:auto'                         "$OLD_TS" 0 '.issue_type = "epic"'
+    mka ap-neg-gatepass  'story:approved,exec:auto,gate:passed'             "$OLD_TS" 0
+    mka ap-neg-gatefail  'story:approved,exec:auto,gate:failed'             "$OLD_TS" 0
+    mka ap-neg-inflight  'story:approved,exec:auto,story:in-flight'         "$OLD_TS" 0
+    mka ap-neg-pdisp     'story:approved,exec:auto,pilot:dispatched'        "$OLD_TS" 0
+    mka ap-neg-held      'story:approved,exec:auto,pilot:held'              "$OLD_TS" 0
+    mka ap-neg-noauto    'story:approved,exec:auto,pilot:no-auto-dispatch'  "$OLD_TS" 0
+    mka ap-neg-blocked   'story:approved,exec:auto,blocked-by:wa-x'         "$OLD_TS" 0
+    mka ap-neg-waiting   'story:approved,exec:auto,waiting-on:wa-x'         "$OLD_TS" 0
+    mka ap-neg-nextact   'story:approved,exec:auto,next-action:athos'       "$OLD_TS" 0
+    mka ap-neg-refusal   'story:approved,exec:auto,pilot:refusal-count:1'   "$OLD_TS" 0
+    mka ap-neg-reclaim   'story:approved,exec:auto,pilot:reclaim-count:2'   "$OLD_TS" 0
+    mka ap-neg-engine    'story:approved,exec:auto,framework:engine'        "$OLD_TS" 0
+    mka ap-neg-disc      'story:approved,exec:auto,discovery:source'        "$OLD_TS" 0
+    mka ap-neg-dispnew   'story:approved,exec:auto'                         "$OLD_TS" 0 ".metadata[\"pilot.dispatched_at\"] = \"$DISPATCH_RECENT_EPOCH\""
+    mka ap-neg-wrapper   'story:approved,exec:auto'                         "$OLD_TS" 0 '.metadata["pilot.sling_for"] = "wa-1"'
+    mka ap-neg-graph     'story:approved,exec:auto'                         "$OLD_TS" 0 '.metadata["gc.root_bead_id"] = "ga-root"'
+    mka ap-neg-depopen   'story:approved,exec:auto'                         "$OLD_TS" 0 '.dependencies = [{"type":"blocks","depends_on_id":"ap-neg-dep-target"}]'
+    mka ap-neg-dep-target 'ctx:ready'                                       "$OLD_TS" 3
+    mk  ap-neg-closed closed 'story:approved,exec:auto' "$OLD_TS" | jq -c '.priority = 0'
+    mk  ap-neg-inprog in_progress 'story:approved,exec:auto' "$OLD_TS" | jq -c '.priority = 0'
+  } | to_store "$TMP/fixtures/store-a.json"
+  N58="$TMP/notif58"; M58="$TMP/mail58"; C58="$TMP/comm58"; : > "$N58"; : > "$M58"; : > "$C58"
+  PMRW_TEST_NOTIFIED="$N58" PMRW_TEST_MAILED="$M58" PMRW_TEST_COMMENTS_LOG="$C58" run_sweep
+  for pid in ap-pos-p1 ap-pos-noctx ap-pos-heldexp ap-pos-dispold ap-pos-depgone ap-pos-parent; do
+    grep -q "  ${pid}  " "$M58" && ok "scenario 58: $pid flagged" || bad "scenario 58: $pid should be flagged (missed alarm)"
+  done
+  for nid in $(grep -o 'ap-neg-[a-z0-9-]*' "$TMP/fixtures/store-a.json" | sort -u); do
+    if grep -q "  ${nid}  " "$M58"; then bad "scenario 58 (false positive): $nid was flagged"; else ok "scenario 58: $nid not flagged"; fi
+  done
+
+  echo "Scenario 59: a store that cannot be read is NOT '0 found' — UNKNOWN/PARTIAL, and the cooldown ledger survives"
+  reset_stores
+  mka wa-59 'story:approved,exec:auto' "$OLD_TS" 0 | to_store "$TMP/fixtures/store-b.json"
+  echo '__BD_FAIL__' > "$TMP/fixtures/store-a.json"
+  N59="$TMP/notif59"; M59="$TMP/mail59"; : > "$N59"; : > "$M59"
+  PMRW_TEST_NOTIFIED="$N59" PMRW_TEST_MAILED="$M59" run_sweep
+  [ -s "$APPROVED_STATE_FILE" ] && ok "scenario 59: bead in the readable store alerted (ledger written)" || bad "scenario 59: no ledger after an alert"
+  : > "$TMP/fixtures/store-b.json"; echo '[]' > "$TMP/fixtures/store-b.json"
+  LED59="$(cat "$APPROVED_STATE_FILE")"; : > "$TMP/pmrw.log"
+  PMRW_TEST_NOTIFIED="$N59" PMRW_TEST_MAILED="$M59" run_sweep
+  grep -q 'APPROVED: PARTIAL' "$LOG" && ! grep -q 'APPROVED: CLEAR' "$LOG" && ok "scenario 59: one unreadable store → PARTIAL, never OK" || bad "scenario 59: unreadable store printed an all-clear"
+  [ "$(cat "$APPROVED_STATE_FILE" 2>/dev/null)" = "$LED59" ] && ok "scenario 59: ledger untouched while blind" || bad "scenario 59: ledger changed on a partial read"
+  echo '__BD_FAIL__' > "$TMP/fixtures/store-b.json"; : > "$LOG"
+  PMRW_TEST_NOTIFIED="$N59" PMRW_TEST_MAILED="$M59" run_sweep
+  grep -q 'APPROVED: UNKNOWN' "$LOG" && ok "scenario 59: every store unreadable → UNKNOWN" || bad "scenario 59: blind sweep did not say UNKNOWN"
+
+  echo "Scenario 60: all stores read and nothing to report → OK, and the ledger is cleared"
+  reset_stores
+  mka wa-60 'story:approved,exec:auto' "$OLD_TS" 0 | to_store "$TMP/fixtures/store-a.json"
+  PMRW_TEST_NOTIFIED="$TMP/n60" PMRW_TEST_MAILED="$TMP/m60" run_sweep
+  [ -s "$APPROVED_STATE_FILE" ] || bad "scenario 60: precondition — ledger should exist after the alert"
+  echo '[]' > "$TMP/fixtures/store-a.json"; : > "$LOG"
+  PMRW_TEST_NOTIFIED="$TMP/n60" PMRW_TEST_MAILED="$TMP/m60" run_sweep
+  grep -q 'APPROVED: CLEAR' "$LOG" && [ ! -f "$APPROVED_STATE_FILE" ] && ok "scenario 60: OK verdict + ledger cleared" || bad "scenario 60: expected OK and no ledger"
+
+  echo "Scenario 61: DRY_RUN → logs, no notify/mail, no ledger"
+  reset_stores
+  mka wa-61 'story:approved,exec:auto' "$OLD_TS" 0 | to_store "$TMP/fixtures/store-a.json"
+  N61="$TMP/n61"; M61="$TMP/m61"; : > "$N61"; : > "$M61"; : > "$LOG"
+  PMRW_DRY_RUN=1 PMRW_TEST_NOTIFIED="$N61" PMRW_TEST_MAILED="$M61" run_sweep
+  [ ! -s "$N61" ] && [ ! -s "$M61" ] && [ ! -f "$APPROVED_STATE_FILE" ] && grep -q 'APPROVED: DRY_RUN' "$LOG" && ok "scenario 61: dry-run has no side effect" || bad "scenario 61: dry-run alerted or wrote the ledger"
+
+  echo "Scenario 62: kill-switch PMRW_APPROVED_ENABLED=0 → second pass silent (first pass unaffected)"
+  reset_stores
+  mka wa-62 'story:approved,exec:auto' "$OLD_TS" 0 | to_store "$TMP/fixtures/store-a.json"
+  N62="$TMP/n62"; M62="$TMP/m62"; : > "$N62"; : > "$M62"
+  PMRW_APPROVED_ENABLED=0 PMRW_TEST_NOTIFIED="$N62" PMRW_TEST_MAILED="$M62" run_sweep
+  [ ! -s "$N62" ] && [ ! -s "$M62" ] && ok "scenario 62: kill-switch silences the second pass" || bad "scenario 62: alerted with the pass disabled"
+
+  echo "Scenario 63: junk in the knobs falls back to the defaults (30min / P1), not to 'off' or 'everything'"
+  reset_stores
+  { mka wa-63-old 'story:approved,exec:auto' "$OLD_TS" 1; mka wa-63-mid 'story:approved,exec:auto' "$MID_TS" 1; mka wa-63-p2 'story:approved,exec:auto' "$OLD_TS" 2; } | to_store "$TMP/fixtures/store-a.json"
+  M63="$TMP/m63"; : > "$M63"
+  PMRW_APPROVED_MIN_MINUTES=abc PMRW_APPROVED_MAX_PRIORITY=x PMRW_TEST_NOTIFIED="$TMP/n63" PMRW_TEST_MAILED="$M63" run_sweep
+  grep -q '  wa-63-old  ' "$M63" && ! grep -q '  wa-63-mid  ' "$M63" && ! grep -q '  wa-63-p2  ' "$M63" && ok "scenario 63: defaults applied (old P1 flagged; 20min and P2 not)" || bad "scenario 63: junk knobs changed the selection"
+
 
   echo ""
   echo "pilot-missing-route-watchdog selftest: PASS=$PASS FAIL=$FAIL"
