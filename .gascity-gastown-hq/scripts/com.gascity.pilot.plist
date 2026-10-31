@@ -13,9 +13,9 @@
 		<key>HOME</key>
 		<string>/Users/athos</string>
 		<key>MAX_BIG</key>
-		<string>1</string>
+		<string>2</string>
 		<key>MAX_SMALL</key>
-		<string>3</string>
+		<string>8</string>
 		<key>PATH</key>
 		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
 		<key>PILOT_CTX_READY_RIGS</key>
@@ -43,7 +43,7 @@
 		<key>PILOT_WA_NODE_ROUTE</key>
 		<string>auto</string>
 		<key>PILOT_WA_NODE_SLOTS</key>
-		<string>3</string>
+		<string>5</string>
 		<key>PILOT_WA_NODE_SPAWN</key>
 		<string>pilot</string>
 		<key>PILOT_WA_WORKER_MAX</key>
