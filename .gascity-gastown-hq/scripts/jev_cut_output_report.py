@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 """jev_cut_output_report.py (ga-wk0qi2, child of ga-aijm2v) — daily/cumulative digest for the
-cut-large-output SHADOW front, fixed rule only (cut-output-shadow.py logs the raw shadow records; jev_cut_output_
-join.py adds the offline "was the cut content referenced later" verdict; the Jev tier is ga-d0hm85's). Reports CUMULATIVE
+cut-large-output SHADOW front: the fixed rule, and the Jev tier (ga-d0hm85) for a sample of the outputs the fixed rule does
+not reach (cut-output-shadow.py logs the raw shadow records; jev_cut_output_
+join.py adds the offline "was the cut content referenced later" verdict). Reports CUMULATIVE
 totals to date, same choice as jev_gate_fail_classify_report.py — this front is high-VOLUME (it
 fires on every large Bash output across every pool session, unlike a rare real-review-FAIL), so a
 running total is more informative on any given day than a slice that might be near-empty on a
 quiet day.
+
+THE JEV TIER'S THREE STATES (the reason this report has its own section for it): a Jev record is judged in full, judged in
+part, or NOT JUDGED, and the report keeps the three apart. Only a record judged IN FULL carries a tokens_would_save and
+only it enters the average; a partial record contributes a floor (tokens_saved_lower_bound) that is printed separately; a
+record or block that was NOT JUDGED is counted on its own, with its reasons, and is never a 0 and never in an average. The
+consumer does not trust the producer: a Jev row that carries a saving number without coverage "full" (the old tier's
+shape, a hand-edited row, a future bug) is counted as inconsistent and left out of every number. And an unmatched output
+whose Jev attempt left no result row is printed as a LOST attempt, not as a quiet day.
 
 NUMBERS ONLY, NO VERDICT: this script never says "safe to go live" or "not safe" — ga-aijm2v's
 own doctrine for every front here is "measure first, a HUMAN decides after seeing the number"
@@ -30,6 +39,9 @@ import jev_experiment as je  # noqa: E402
 from jev_cut_output_join import JOIN_MODE, RECORD_MODE, SOURCE_EXPERIMENTS, is_join_candidate, read_jsonl  # noqa: E402
 
 ERROR_EXPERIMENT = coc.ERROR_EXPERIMENT
+FIXED_EXPERIMENT = "cut-output-fixed"
+JEV_EXPERIMENT = "cut-output-jev"
+JEV_FULL_STATES = ("judged-relevant", "judged-cuttable")  # the only record states that may carry a saving number
 EVENT_SUCCESS = coc.EVENT_SUCCESS
 EVENT_FAILURE = coc.EVENT_FAILURE
 
@@ -39,6 +51,50 @@ EVENT_FAILURE = coc.EVENT_FAILURE
 # incident (the 40 stress-run rows, 21:56) is to leave the append-only shared log alone and exclude at read, so
 # these two are excluded by their exact entity_id -- a genuine error row is never ignored.
 IGNORED_ERROR_ENTITY_IDS = frozenset({"no-tool-use-id-a63be92ef344", "no-tool-use-id-afd9ff542c61"})
+
+
+def _is_number(v: object) -> bool:
+    """A real count/amount: an int or float that is not a bool (True is an int in Python and must not be a saving)."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _count_jev_row(s: dict, rec: dict) -> None:
+    """Adds one Jev-tier row's state, coverage, block and cost counters to `s`. Pure; a field that is missing or the wrong
+    type lands in an 'unreadable' bucket instead of being read as a value."""
+    state = rec.get("jev_state")
+    if state == "judged-relevant":
+        s["jev_judged_relevant"] += 1
+    elif state == "judged-cuttable":
+        s["jev_judged_cuttable"] += 1
+    elif state == "not-judged":
+        s["jev_not_judged"] += 1
+    else:
+        s["jev_state_unreadable"] += 1
+    coverage = rec.get("coverage")
+    if coverage in ("full", "partial", "none"):
+        s["cov_" + coverage] += 1
+    else:
+        s["cov_unreadable"] += 1
+    counts = [rec.get(k) for k in ("blocks_relevant", "blocks_cuttable", "blocks_not_judged")]
+    if all(_is_number(c) for c in counts):
+        s["blocks_relevant"] += counts[0]
+        s["blocks_cuttable"] += counts[1]
+        s["blocks_not_judged"] += counts[2]
+        s["blocks_total"] += sum(counts)
+    else:
+        s["rows_without_block_detail"] += 1
+    reasons = rec.get("not_judged_reasons")
+    if isinstance(reasons, dict):
+        for reason, n in reasons.items():
+            if isinstance(reason, str) and _is_number(n):
+                s["not_judged_reasons"][reason] = s["not_judged_reasons"].get(reason, 0) + n
+    if rec.get("jev_ok") is False:
+        s["calls_failed"] += 1
+    if rec.get("jev_called") is False:
+        s["calls_not_made"] += 1
+    for src, dst in (("jev_tokens_in", "tokens_in"), ("jev_tokens_out", "tokens_out")):
+        if _is_number(rec.get(src)):
+            s[dst] += rec[src]
 
 
 def compute_stats(records: list[dict]) -> dict:
@@ -67,7 +123,22 @@ def compute_stats(records: list[dict]) -> dict:
         "failure_count": 0,
         "event_unrecorded_count": 0,
         "no_gain_count": 0,  # rule "no-gain" -- shape recognized, cutting would not shrink it
+        # ---- Jev tier only (all zero for the fixed rule) ----
+        "jev_judged_relevant": 0,  # record states: judged, nothing to cut
+        "jev_judged_cuttable": 0,  # judged, at least one block cuttable
+        "jev_not_judged": 0,  # NOT ONE block judged -- never a 0, never in an average
+        "jev_state_unreadable": 0,  # a Jev row with no readable jev_state: counted apart, not guessed
+        "cov_full": 0, "cov_partial": 0, "cov_none": 0, "cov_unreadable": 0,
+        "inconsistent_count": 0,  # carries a saving number without coverage "full": left out of every number
+        "lower_bound_total": 0, "lower_bound_count": 0,  # partial records: the floor of the saving, printed apart
+        "blocks_total": 0, "blocks_relevant": 0, "blocks_cuttable": 0, "blocks_not_judged": 0,
+        "rows_without_block_detail": 0,  # the tier itself broke (exception record) or the counters are unreadable
+        "not_judged_reasons": {},  # block-level reason -> blocks
+        "calls_failed": 0, "calls_not_made": 0, "tokens_in": 0, "tokens_out": 0,
     } for exp in SOURCE_EXPERIMENTS}
+    tier = {"attempted": 0, "sampled_out": 0, "disabled": 0, "unrecorded": 0}
+    attempted_ids: set[str] = set()  # unmatched rows stamped 'attempted'
+    jev_result_ids: set[str] = set()  # entity ids that have a Jev result row
     joins: dict[tuple[str, str], bool | None] = {}
     candidates: set[tuple[str, str]] = set()  # records the join could act on (whether or not it has yet)
     event_of: dict[tuple[str, str], object] = {}  # (experiment, entity_id) -> the row's hook_event, for the join split
@@ -107,33 +178,67 @@ def compute_stats(records: list[dict]) -> dict:
         if isinstance(rec.get("entity_id"), str):
             event_of[(exp, rec["entity_id"])] = hook_event
         saved = rec.get("tokens_would_save")
-        if isinstance(saved, (int, float)):
+        saved_is_number = _is_number(saved)
+        real_cut = saved if saved_is_number else None  # the cut this row claims, for the where-did-every-cut-go accounting
+        if exp == JEV_EXPERIMENT:
+            if isinstance(rec.get("entity_id"), str):
+                jev_result_ids.add(rec["entity_id"])
+            _count_jev_row(s, rec)
+            coverage = rec.get("coverage")
+            if saved_is_number and not (coverage == "full" and rec.get("jev_state") in JEV_FULL_STATES):
+                # a number on a row that was not judged in full: do not average it, do not bucket it, say so
+                s["inconsistent_count"] += 1
+                saved_is_number = False
+                real_cut = None
+            lower_bound = rec.get("tokens_saved_lower_bound")
+            if coverage == "partial" and _is_number(lower_bound):
+                s["lower_bound_total"] += lower_bound
+                s["lower_bound_count"] += 1
+                real_cut = lower_bound
+        if saved_is_number:
             s["tokens_would_save_total"] += saved
             s["tokens_would_save_known"] += 1
-            if saved > 0:
-                if not rec.get("omitted_signatures"):
-                    s["no_signature_count"] += 1
-                elif not is_join_candidate(rec):
-                    s["unjoinable_count"] += 1
+        if real_cut is not None and real_cut > 0:
+            if not rec.get("omitted_signatures"):
+                s["no_signature_count"] += 1
+            elif not is_join_candidate(rec):
+                s["unjoinable_count"] += 1
         rule = rec.get("rule")
         if rule == "unknown":
             s["unknown_count"] += 1
         elif rule == "unmatched":
             s["unmatched_count"] += 1
+            if exp == FIXED_EXPERIMENT:
+                stamp = rec.get("jev_tier")
+                if stamp == "attempted":
+                    tier["attempted"] += 1
+                    if isinstance(rec.get("entity_id"), str):
+                        attempted_ids.add(rec["entity_id"])
+                elif stamp == "sampled-out":
+                    tier["sampled_out"] += 1
+                elif stamp == "disabled":
+                    tier["disabled"] += 1
+                else:
+                    tier["unrecorded"] += 1  # logged before the stamp existed (or unreadable): not guessed
         elif rule == "no-gain":
             s["no_gain_count"] += 1
 
+    by_experiment = {exp: {"referenced_true": 0, "referenced_false": 0, "referenced_unknown": 0} for exp in SOURCE_EXPERIMENTS}
     referenced_true = 0
     referenced_false = 0
     referenced_unknown = 0
     by_event = {"success": {"referenced_true": 0, "referenced_false": 0}, "failure": {"referenced_true": 0, "referenced_false": 0}}
     for key, v in joins.items():
+        slot = by_experiment[key[0]]
         if v is True:
             referenced_true += 1
+            slot["referenced_true"] += 1
         elif v is False:
             referenced_false += 1
+            slot["referenced_false"] += 1
         else:
             referenced_unknown += 1
+            slot["referenced_unknown"] += 1
         bucket = {EVENT_SUCCESS: "success", EVENT_FAILURE: "failure"}.get(event_of.get(key))  # type: ignore[arg-type]
         if bucket is not None and v is not None:
             by_event[bucket]["referenced_true" if v else "referenced_false"] += 1
@@ -149,7 +254,14 @@ def compute_stats(records: list[dict]) -> dict:
         "pending": len(candidates - set(joins)),
         # the same verdicts split by the event of the row they joined (rows with no hook_event are in neither)
         "by_event": by_event,
+        # and by the tier whose cut they are about (the fixed rule's and Jev's populations are not the same)
+        "by_experiment": by_experiment,
     }
+    # What became of the Jev tier for the unmatched outputs. "attempted" with no result row is a LOST attempt (the call or
+    # the hook died after the fixed-rule row was written): it is in no Jev number and the report says how many.
+    tier["unmatched"] = stats[FIXED_EXPERIMENT]["unmatched_count"]
+    tier["attempted_lost"] = len(attempted_ids - jev_result_ids)
+    stats["jev_tier"] = tier
     stats["errors"] = {"total": error_total, "by_kind": error_kinds}
     return stats
 

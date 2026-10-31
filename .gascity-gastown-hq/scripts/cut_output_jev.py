@@ -9,20 +9,28 @@ WHAT IT IS. cut-output-shadow.py (the PostToolUse/PostToolUseFailure Bash hook) 
 a SAMPLE of those, this module asks Jev "is this block something the agent would need to read again?" and logs what a
 cut based on its answers WOULD have saved. SHADOW ONLY: nothing is ever cut or changed, the hook still prints "{}".
 
-AUTHORIZATION AND WHAT LEAVES THE MACHINE. Athos, AskUserQuestion in the Mayor session, 28/09 11:3x, cited in
-ga-wk0qi2's description: he marked "Cortar saida de comando grande" among the Jev fronts, all starting in SHADOW ("o Jev
-decide e registra"). This tier is that front. Asking Jev means TEXT OF A COMMAND'S OUTPUT goes to Cloudflare Workers AI
-(model typesafe/jev, via jev_experiment.call_jev_multi) -- the gate (ga-nw6sbx) flagged that this egress had no separate
-citable authorization, and the Mayor took the tier out of phase 1 for that reason too. It is back with these limits, all
-enforced in code and covered by the selftest:
-  * only a deterministic SAMPLE of the unmatched outputs is sent (CUT_OUTPUT_SHADOW_JEV_SAMPLE_PCT, default 25);
-  * a block that looks like a credential or personal data (egress_withhold_reason: private keys, provider tokens, JWTs,
-    `password=...` assignments, CPF/CNPJ, formatted phone numbers, WhatsApp ids, e-mail addresses) is NEVER sent -- it is
-    "not-judged: withheld-*" and counted; the command line gets the same check;
+AUTHORIZATION AND WHAT LEAVES THE MACHINE. Asking Jev means TEXT OF A COMMAND'S OUTPUT goes to Cloudflare Workers AI (model
+typesafe/jev, via jev_experiment.call_jev_multi) -- outward-facing, and not undoable once sent. What Athos approved
+(AskUserQuestion in the Mayor session, 28/09 11:3x, quoted in ga-wk0qi2's description) is the FRONT, in SHADOW: "Cortar
+saida de comando grande" among the Jev fronts, "o Jev decide e registra". The gate (ga-nw6sbx) flagged that this does not
+say he accepted arbitrary pool-session command output leaving the machine, and the town's Regra N.4 is explicit that an
+authorization is not inherited from a feature to a side effect. So this tier SHIPS OFF: the code, the guard and the report
+exist and are tested; nothing is sent until a human turns it on. To turn it on, write the sample percentage as the first
+non-comment line of the file JEV_ENABLED_FILE (CUT_OUTPUT_SHADOW_JEV_ENABLED, default
+<city>/.gc/logs/cut-output-jev.enabled), with the authorization CITED in `#` comment lines -- who said yes, where, when
+(bead + comment id, or the AskUserQuestion answer with its timestamp):
+    # Athos, resposta ao AskUserQuestion em <bead>#<comentario>, 2026-..., "liga a 10%"
+    10
+An absent file, a comments-only file, or a value that is not a number in 0..100 is OFF. Even when ON:
+  * only a deterministic SAMPLE of the unmatched outputs is sent (the percentage in the file);
+  * a block that looks like a credential or personal data (egress_withhold_reason: private keys and multi-line secrets,
+    provider tokens, JWTs, DSNs with a password, cookies, `password=` / `"token": "..."` assignments, long mixed-case
+    tokens, CPF/CNPJ, formatted phone numbers, WhatsApp ids, e-mail addresses) is NEVER sent -- it is "not-judged:
+    withheld-*" and counted; the command line gets the same check; a multi-line secret withholds every block it touches;
   * at most MAX_STATE_CHARS characters per output (head + tail blocks; the middle is "not-judged: over-budget");
   * a kill switch for this tier alone: `touch` the CUT_OUTPUT_SHADOW_JEV_DISABLED sentinel (the whole hook has its own).
-The guard is a best-effort filter, not a proof: a name or a street address in plain prose is not detected. If that is
-not acceptable, set the sample to 0 or touch the sentinel -- the fixed-rule measurement is unaffected.
+The guard is a best-effort filter, not a proof: a name or a street address in plain prose is not detected, and an
+unusual secret format passes. That is exactly why the tier is OFF until someone who can accept that residual risk says so.
 
 THE THREE STATES (the reason this module exists in this shape). Seven gate reviews of phase 1 each found another place
 where "the judge could not tell" was written down as "measured, nothing to cut" -- the last (ga-nw6sbx) a call where Jev
@@ -92,7 +100,6 @@ TIER_ATTEMPTED = "attempted"
 TIER_SAMPLED_OUT = "sampled-out"
 TIER_DISABLED = "disabled"
 
-DEFAULT_SAMPLE_PCT = 25.0
 CUT_RULE = "jev-cut"
 
 
@@ -121,6 +128,13 @@ JEV_DISABLED_SENTINEL = Path(
     )
 )
 
+JEV_ENABLED_FILE = Path(
+    os.environ.get(
+        "CUT_OUTPUT_SHADOW_JEV_ENABLED",
+        "/Users/athos/gt/.gascity-gastown-hq/.gc/logs/cut-output-jev.enabled",
+    )
+)
+
 JEV_INSTRUCTIONS_TEMPLATE = (
     "You are shown a labeled block of raw text taken from the OUTPUT of a shell command an "
     "autonomous coding agent ran. The command was: {command!r}. The block's own text is "
@@ -139,16 +153,27 @@ COMMAND_WITHHELD = "[command withheld: it looks like it carries a credential or 
 # Tier decision: does THIS unmatched output get sent to Jev at all?
 # ---------------------------------------------------------------------------------------------------------------
 def sample_pct() -> float:
-    """The share of unmatched outputs sent to Jev, 0..100. Unset -> the default. A value that is set but cannot be
-    read (not a number, NaN, outside 0..100) is 0: not knowing how much to send is the inert answer, never "all"."""
-    raw = os.environ.get("CUT_OUTPUT_SHADOW_JEV_SAMPLE_PCT")
-    if raw is None or not raw.strip():
-        return DEFAULT_SAMPLE_PCT
+    """The share of unmatched outputs sent to Jev, 0..100 -- and 0 unless a human turned the tier on: the first non-comment
+    line of JEV_ENABLED_FILE, a number. Three states, one inert answer for the two that are not "somebody said yes":
+    file absent -> 0 (the default: off); file unreadable, comments only, not a number, NaN or outside 0..100 -> 0
+    (not knowing how much to send is never "send"). Read on each call (a tiny file, only for unmatched outputs), so
+    turning it on or off needs no restart. Never raises."""
     try:
-        value = float(raw.strip())
-    except ValueError:
-        return 0.0
-    return value if 0.0 <= value <= 100.0 else 0.0
+        raw = JEV_ENABLED_FILE.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return 0.0  # absent: the default, OFF
+    except (OSError, ValueError):
+        return 0.0  # unreadable (permissions, not a regular file, not UTF-8): inert
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            value = float(line)
+        except ValueError:
+            return 0.0
+        return value if 0.0 <= value <= 100.0 else 0.0
+    return 0.0  # comments only: nobody put a number
 
 
 def jev_tier(entity_id: str) -> str:
@@ -175,8 +200,9 @@ def jev_tier(entity_id: str) -> str:
 # Egress guard: text that looks like a credential or personal data is never sent.
 # Every pattern is linear on hostile input (no unbounded run in front of an anchor): blocks are up to MAX_STATE_CHARS.
 # ---------------------------------------------------------------------------------------------------------------
+_KEY_WORDS = r"(?:password|passwd|secret|token|api[_-]?key|apikey|private[_-]?key|credential|access[_-]?key)"
 _SECRET_RES = (
-    re.compile(r"-----BEGIN [A-Z ]{0,30}PRIVATE KEY-----"),
+    re.compile(r"-----BEGIN [A-Z0-9 ]{0,40}-----"),  # any PEM block: private key, certificate, PGP...
     re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
@@ -184,9 +210,24 @@ _SECRET_RES = (
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\bAIza[0-9A-Za-z_-]{30,}"),
     re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
-    re.compile(r"(?i)\b(?:authorization|bearer)\b[:\s]+[A-Za-z0-9._~+/=-]{12,}"),
-    re.compile(r"(?i)(?:password|passwd|secret|token|api[_-]?key|private[_-]?key|credential)\w*\s*[=:]\s*['\"]?[^\s'\"]{6,}"),
+    re.compile(r"(?i)\b(?:authorization|bearer)\b['\"]?[:\s]+[A-Za-z0-9._~+/=-]{12,}"),
+    # name = value, name: value, "name": "value", 'name': 'value', X-Api-Key: value -- the optional quote after the name
+    # is what a JSON / dict-repr dump has and a plain `name=value` pattern misses
+    re.compile(r"(?i)" + _KEY_WORDS + r"\w*['\"]?\s*[=:]\s*['\"]?[^\s'\"]{6,}"),
+    re.compile(r"(?i)\b(?:set-)?cookie\b['\"]?\s*[:=]\s*\S{8,}"),
+    # scheme://user:password@host -- a DSN / URL with credentials (bounded runs, linear)
+    re.compile(r"\b[a-z][a-z0-9+.-]{1,20}://[^\s/:@]{1,64}:[^\s/@]{3,}@"),
+    # a long token with upper AND lower case AND a digit (hex-only hashes -- git shas -- have no upper+lower mix, so they
+    # pass); the lookaheads are bounded so a hostile 100k-character run cannot make this quadratic
+    re.compile(r"(?=[A-Za-z0-9_-]{0,127}[A-Z])(?=[A-Za-z0-9_-]{0,127}[a-z])(?=[A-Za-z0-9_-]{0,127}\d)\b[A-Za-z0-9_-]{32,}"),
 )
+# A secret that ENDS a block ("password:" and the value on the next line, which is the next block): the block that follows
+# is withheld too.
+_ENDS_WITH_KEY_RE = re.compile(r"(?i)" + _KEY_WORDS + r"\w*['\"]?\s*[=:]\s*\Z")
+_PEM_BEGIN_RE = re.compile(r"-----BEGIN [A-Z0-9 ]{0,40}-----")
+_PEM_END_RE = re.compile(r"-----END [A-Z0-9 ]{0,40}-----")
+_K8S_SECRET_RE = re.compile(r"(?im)^[ \t]*kind:[ \t]*Secret[ \t]*$")
+_MAX_SPAN_MARKERS = 50  # a text with more begin-markers than this is a dump of keys: the whole output is one span
 _PII_RES = (
     re.compile(r"\b\d{3}\.\d{3}\.\d{3}-\d{2}\b"),  # CPF
     re.compile(r"\b\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\b"),  # CNPJ
@@ -235,6 +276,29 @@ def egress_withhold_reason(text: str) -> str | None:
     except Exception:  # noqa: BLE001 -- a guard that cannot read the text must not wave it through
         return "secret"
     return None
+
+
+def sensitive_spans(text: str) -> list[tuple[int, int]]:
+    """Character spans of `text` that hold a MULTI-LINE secret, found over the WHOLE output so that a key split across two
+    blocks cannot pass by looking harmless in each half: a PEM block from its BEGIN line to the matching END line (to the end
+    of the text when the END is missing, i.e. the output was truncated mid-key), and a Kubernetes `kind: Secret` manifest
+    to the end of its YAML document. Any block that overlaps a span is withheld by plan_send(). More markers than
+    _MAX_SPAN_MARKERS -> the whole output is one span (do not send). Never raises."""
+    spans: list[tuple[int, int]] = []
+    try:
+        for n, m in enumerate(_PEM_BEGIN_RE.finditer(text)):
+            if n >= _MAX_SPAN_MARKERS:
+                return [(0, len(text))]
+            end = _PEM_END_RE.search(text, m.end())
+            spans.append((m.start(), end.end() if end else len(text)))
+        for n, m in enumerate(_K8S_SECRET_RE.finditer(text)):
+            if n >= _MAX_SPAN_MARKERS:
+                return [(0, len(text))]
+            doc_end = text.find("\n---", m.end())
+            spans.append((m.start(), len(text) if doc_end < 0 else doc_end))
+    except Exception:  # noqa: BLE001 -- a guard that cannot scan the text must not wave it through
+        return [(0, len(text))]
+    return spans
 
 
 def loggable_command(command: object) -> str:
@@ -324,14 +388,23 @@ def plan_send(blocks: list[dict], text: str, max_chars: int | None = None) -> No
                 break
             used += b["chars"]
             eligible.add(b["idx"])
+    spans = sensitive_spans(text)  # over the WHOLE output: a secret split across two blocks looks harmless in each half
+    carry_over = False  # the previous block ended on a bare "password:" -- its value is the first line of THIS block
     for b in blocks:
         b["send"] = False
         b["state"] = BLOCK_NOT_JUDGED
         b["reason"] = None
+        # cheap for every block (only its tail): does it END on a bare `password:` whose value starts the next block?
+        ends_on_key = bool(_ENDS_WITH_KEY_RE.search(text[max(b["start"], b["end"] - 200):b["end"]].rstrip()))
         if b["idx"] not in eligible:
+            # never sent, so never scanned in full: a multi-MB output must not cost a full regex pass per block
             b["reason"] = "over-budget"
+            carry_over = ends_on_key
             continue
         withheld = egress_withhold_reason(text[b["start"]:b["end"]])
+        if withheld is None and (carry_over or any(b["start"] < span_end and span_start < b["end"] for span_start, span_end in spans)):
+            withheld = "secret"
+        carry_over = ends_on_key
         if withheld:
             b["reason"] = f"withheld-{withheld}"
             continue
@@ -638,6 +711,18 @@ def _selftest() -> int:
         "authorization header": "Authorization: Bearer abcdef123456789",
         "password assignment": "export DB_PASSWORD=hunter2hunter2",
         "token assignment": "token: 0123456789abcdef",
+        # the review's bypass: a quote between the name and the separator (JSON / python-dict dumps)
+        "json password": '{"password": "hunter2hunter2"}',
+        "json api_key with space before colon": '{"api_key" : "k3y-valu3-here"}',
+        "single-quoted dict token": "{'token': 'abcdef012345'}",
+        "x-api-key header": "X-Api-Key: 0123456789abcdef",
+        "cookie header": "Cookie: session=abcdef0123456789",
+        "set-cookie header": "Set-Cookie: sid=abcdef0123456789; HttpOnly",
+        "dsn with password": "DATABASE_URL=postgres://app:s3cretpw@db.internal:5432/app",
+        "url with credentials": "git clone https://user:ghpassword12@github.com/x/y.git",
+        "long mixed-case token": "id: Zk3Jq9XvB2nM7LpA4sD8fG1hT6yU0wRe",
+        "aws secret key assignment": "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG",
+        "pem certificate": "-----BEGIN CERTIFICATE-----\nMIIB",
     }
     for label, sample in secrets.items():
         ok(f"egress guard: {label} -> secret", egress_withhold_reason(sample) == "secret")
@@ -660,6 +745,12 @@ def _selftest() -> int:
         "github noreply": "Athos <12345+athos@users.noreply.github.com>",
         "pytest line": "test_mod.py::test_one PASSED [ 12%]",
         "tokens counter": "tokens_would_save=100",
+        "sha256 (hex only)": "sha256:" + "ab12" * 16,
+        "toolu id": "toolu_01A09q90qw90lq917835",
+        "worktree path": "/Users/athos/gt/.gc-worktrees/ga-d0hm85/.gascity-gastown-hq/scripts/cut_output_jev.py",
+        "branch name": "feat/ga-d0hm85-jev-na-sombra-do-corte-de-saida-fase-2-da-ga-wk0qi2",
+        "plain url": "see https://github.com/athosmartins/gastown/pull/70 for details",
+        "author word": "author: Athos",
     }
     for label, sample in harmless.items():
         ok(f"egress guard: {label} is NOT withheld", egress_withhold_reason(sample) is None)
@@ -673,6 +764,40 @@ def _selftest() -> int:
     egress_withhold_reason("a" * 60000 + "@" + "b" * 60000 + "token" + "=" * 5000)
     egress_withhold_reason(("a." * 30000) + "@" * 300)
     ok("egress guard: stays fast (linear) on hostile 100k-character runs", time.time() - t0 < 2.0)
+    # a PEM key that spans a block edge: no single block contains BOTH the BEGIN and the END marker, and the middle block
+    # (base64 body) matches no pattern by itself
+    pem = ("-----BEGIN RSA PRIVATE KEY-----\n" + "\n".join("MIIEowIBAAKCAQEA" + "0123456789abcdef" * 4 for _ in range(5)) + "\n-----END RSA PRIVATE KEY-----\n")
+    filler = lambda tag: "\n\n".join(f"{tag} paragraph {i}: " + "ordinary words " * 20 for i in range(4))  # noqa: E731
+    pem_text = filler("before") + "\n\n" + pem.replace("\n", "\n\n", 3) + "\n\n" + filler("after")
+    pbl = build_blocks(pem_text, max_blocks=13)
+    plan_send(pbl, pem_text, max_chars=10**6)
+    body_blocks = [b for b in pbl if "MIIEowIBAAKCAQEA" in pem_text[b["start"]:b["end"]]]
+    ok("setup: the PEM body is spread over more than one block, and a body block has no BEGIN/END marker of its own",
+       len(body_blocks) >= 2 and any("-----" not in pem_text[b["start"]:b["end"]] for b in body_blocks))
+    ok("review finding 2: every block the PEM key touches is withheld, including body blocks that look harmless alone",
+       all(not b["send"] and b["state"] == BLOCK_NOT_JUDGED and b["reason"].startswith("withheld-") for b in body_blocks))
+    ok("review finding 2: the paragraphs well before and after the key are still sent", pbl[0]["send"] and pbl[-1]["send"])
+    trunc = filler("before") + "\n\n-----BEGIN OPENSSH PRIVATE KEY-----\n\n" + "b3BlbnNzaC1rZXktdjEAAAAA" * 8
+    tbl = build_blocks(trunc, max_blocks=13)
+    plan_send(tbl, trunc, max_chars=10**6)
+    ok("review finding 2: a key TRUNCATED mid-way (BEGIN, no END) withholds everything after the BEGIN marker",
+       not tbl[-1]["send"] and tbl[0]["send"])
+    k8s = filler("before") + "\n\napiVersion: v1\nkind: Secret\nmetadata:\n  name: x\ndata:\n  value: dGhpcyBpcyBhIHNlY3JldA==\n\n" + filler("tail")
+    kbl = build_blocks(k8s, max_blocks=13)
+    plan_send(kbl, k8s, max_chars=10**6)
+    ok("review finding 2: a `kind: Secret` manifest withholds the blocks of its document", any(not b["send"] for b in kbl) and kbl[0]["send"])
+    # "password:" as the LAST line of one block, the value as the FIRST line of the next
+    split_key = filler("before") + "\n\ndb:\n  password:\n\nhunter2hunter2\n\n" + filler("after")
+    sbl = build_blocks(split_key, max_blocks=13)
+    plan_send(sbl, split_key, max_chars=10**6)
+    value_block = next(b for b in sbl if "hunter2hunter2" in split_key[b["start"]:b["end"]])
+    ok("review finding 2: a `password:` at the end of a block withholds the NEXT block, where the value is", not value_block["send"])
+    t_lin = time.time()
+    for hostile in ("A1" * 60000, ("a-" * 30000) + "Z9", "-----BEGIN X-----" * 400, "kind: Secret\n" * 400, "token:" * 20000):
+        hb = build_blocks(hostile)
+        plan_send(hb, hostile, max_chars=10**6)
+    ok("the strengthened guard + span scan stay fast (linear) on hostile 100k-character inputs", time.time() - t_lin < 5.0)
+
     bad_text = text12 + "\n\ncpf 123.456.789-09"
     bl = build_blocks(bad_text)
     plan_send(bl, bad_text, max_chars=10**6)
@@ -822,37 +947,47 @@ def _selftest() -> int:
         ov = judge("cmd", over, meta)
     ok("judge(): an output over the budget is partial (the middle is not-judged 'over-budget'), never full", ov["coverage"] == COVERAGE_PARTIAL and "over-budget" in ov["not_judged_reasons"] and ov["tokens_would_save"] is None and partition_ok(ov))
 
-    # ---- the tier decision ----
+    # ---- the tier decision: OFF unless a human wrote the enable file ----
+    mod = sys.modules[__name__]
     with tempfile.TemporaryDirectory() as td:
+        enabled = Path(td) / "jev.enabled"
         sentinel = Path(td) / "jev.disabled"
-        with mock.patch.object(sys.modules[__name__], "JEV_DISABLED_SENTINEL", sentinel):
-            with mock.patch.dict(os.environ, {"CUT_OUTPUT_SHADOW_JEV_SAMPLE_PCT": "100"}):
-                ok("jev_tier: pct 100, no sentinel -> attempted", jev_tier("e") == TIER_ATTEMPTED)
-                sentinel.write_text("x")
-                ok("jev_tier: the sentinel wins over pct 100 -> disabled", jev_tier("e") == TIER_DISABLED)
-                sentinel.unlink()
-            with mock.patch.dict(os.environ, {"CUT_OUTPUT_SHADOW_JEV_SAMPLE_PCT": "0"}):
-                ok("jev_tier: pct 0 -> disabled (not 'sampled-out')", jev_tier("e") == TIER_DISABLED)
-            for junk in ("lots", "nan", "-5", "250", "1e999"):
-                with mock.patch.dict(os.environ, {"CUT_OUTPUT_SHADOW_JEV_SAMPLE_PCT": junk}):
-                    ok(f"jev_tier: an unreadable setting ({junk!r}) is inert -> disabled, never 'send everything'", jev_tier("e") == TIER_DISABLED)
-            with mock.patch.dict(os.environ, {}, clear=False):
-                os.environ.pop("CUT_OUTPUT_SHADOW_JEV_SAMPLE_PCT", None)
-                ok("jev_tier: unset -> the default share", sample_pct() == DEFAULT_SAMPLE_PCT)
-            with mock.patch.dict(os.environ, {"CUT_OUTPUT_SHADOW_JEV_SAMPLE_PCT": "25"}):
-                ids = [f"toolu_{i:05d}" for i in range(4000)]
-                tiers = [jev_tier(i) for i in ids]
-                share = tiers.count(TIER_ATTEMPTED) / len(tiers)
-                ok(f"jev_tier: pct 25 attempts about a quarter (measured {share:.3f})", 0.21 < share < 0.29)
-                ok("jev_tier: the rest are 'sampled-out', and nothing is 'disabled' at pct 25", set(tiers) == {TIER_ATTEMPTED, TIER_SAMPLED_OUT})
-                ok("jev_tier: deterministic per entity_id", [jev_tier(i) for i in ids[:200]] == tiers[:200])
+        with mock.patch.object(mod, "JEV_ENABLED_FILE", enabled), mock.patch.object(mod, "JEV_DISABLED_SENTINEL", sentinel):
+            ok("jev_tier: NO enable file -> disabled (the tier ships OFF)", sample_pct() == 0.0 and jev_tier("e") == TIER_DISABLED)
+            enabled.write_text("# Athos, resposta ao AskUserQuestion em ga-xxxxxx#c1, 2026-11-01T12:00Z, 'liga a 100'\n\n100\n")
+            ok("jev_tier: comment lines (the authorization citation) are skipped; '100' -> attempted", sample_pct() == 100.0 and jev_tier("e") == TIER_ATTEMPTED)
+            enabled.write_text("# only a comment, nobody put a number\n")
+            ok("jev_tier: a comments-only file is OFF -- a citation alone is not a yes", sample_pct() == 0.0 and jev_tier("e") == TIER_DISABLED)
+            enabled.write_text("0\n")
+            ok("jev_tier: 0 -> disabled (not 'sampled-out')", jev_tier("e") == TIER_DISABLED)
+            for junk in ("lots", "nan", "-5", "250", "1e999", "10 percent", "\x00"):
+                enabled.write_text(f"# cited\n{junk}\n")
+                ok(f"jev_tier: an unreadable value ({junk!r}) is inert -> disabled, never 'send everything'", jev_tier("e") == TIER_DISABLED)
+            enabled.write_bytes(b"\xff\xfe not utf-8 \xff")
+            ok("jev_tier: a file that is not UTF-8 is OFF", jev_tier("e") == TIER_DISABLED)
+            enabled.unlink()
+            enabled.mkdir()
+            ok("jev_tier: an enable 'file' that cannot be read (a directory) is OFF", jev_tier("e") == TIER_DISABLED)
+            enabled.rmdir()
+            enabled.write_text("100\n")
+            sentinel.write_text("off")
+            ok("jev_tier: the kill-switch sentinel beats 'enabled at 100'", jev_tier("e") == TIER_DISABLED)
+            sentinel.unlink()
+            enabled.write_text("25\n")
+            ids = [f"toolu_{i:05d}" for i in range(4000)]
+            tiers = [jev_tier(i) for i in ids]
+            share = tiers.count(TIER_ATTEMPTED) / len(tiers)
+            ok(f"jev_tier: 25 attempts about a quarter (measured {share:.3f})", 0.21 < share < 0.29)
+            ok("jev_tier: the rest are 'sampled-out', and nothing is 'disabled' at 25", set(tiers) == {TIER_ATTEMPTED, TIER_SAMPLED_OUT})
+            ok("jev_tier: deterministic per entity_id", [jev_tier(i) for i in ids[:200]] == tiers[:200])
+
         # a sentinel whose check RAISES (permission denied on the logs dir) is ON: we cannot tell, so we do not send
         class _Unreadable:
             def exists(self) -> bool:
                 raise PermissionError(13, "Permission denied")
-        with mock.patch.object(sys.modules[__name__], "JEV_DISABLED_SENTINEL", _Unreadable()):
-            with mock.patch.dict(os.environ, {"CUT_OUTPUT_SHADOW_JEV_SAMPLE_PCT": "100"}):
-                ok("jev_tier: a sentinel that cannot be checked (PermissionError) counts as set -> disabled", jev_tier("e") == TIER_DISABLED)
+        enabled.write_text("100\n")
+        with mock.patch.object(mod, "JEV_ENABLED_FILE", enabled), mock.patch.object(mod, "JEV_DISABLED_SENTINEL", _Unreadable()):
+            ok("jev_tier: a sentinel that cannot be checked (PermissionError) counts as set -> disabled", jev_tier("e") == TIER_DISABLED)
 
     # ---- env knobs cannot crash the import ----
     ok("_env_number: unset -> default", _env_number("CUT_OUTPUT_SHADOW__NOPE", 7, int, 1, 9) == 7)

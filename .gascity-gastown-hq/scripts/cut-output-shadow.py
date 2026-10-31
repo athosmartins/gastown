@@ -55,13 +55,15 @@ experiment "cut-output-fixed", and the row's `rule` says which of the five thing
     read exactly like calls too small to consider, and the case count would pass for the count of large outputs. Its
     `jev_tier` field says what the Jev tier did with it: attempted / sampled-out / disabled.
 
-THE JEV TIER (ga-d0hm85), for the "unmatched" population only. Per call: tier = cut_output_jev.jev_tier(entity_id) -- a
-deterministic CUT_OUTPUT_SHADOW_JEV_SAMPLE_PCT share (default 25), off when the CUT_OUTPUT_SHADOW_JEV_DISABLED sentinel
-exists. The fixed row is written first, then (if attempted) cut_output_jev.judge() writes ONE row, experiment
-"cut-output-jev": every block of the output is relevant / cuttable / not-judged, and the record's coverage, saving and
-counters come from those states (a call Jev could not answer is NOT a zero). What leaves the machine: the text of the
-output's blocks (head+tail within a character budget) plus the command, to Cloudflare Workers AI -- minus any block that
-looks like a credential or personal data, which is withheld and counted. Authorization and limits: cut_output_jev.py.
+THE JEV TIER (ga-d0hm85), for the "unmatched" population only, SHIPPED OFF. Per call: tier = cut_output_jev.jev_tier(entity_id)
+-- "disabled" unless a human wrote a percentage into the CUT_OUTPUT_SHADOW_JEV_ENABLED file (the authorization is cited in
+that file's comment lines), then a deterministic share of calls is "attempted" and the rest "sampled-out"; the
+CUT_OUTPUT_SHADOW_JEV_DISABLED sentinel switches it off again. The fixed row is written first, then (if attempted)
+cut_output_jev.judge() writes ONE row, experiment "cut-output-jev": every block of the output is relevant / cuttable /
+not-judged, and the record's coverage, saving and counters come from those states (a call Jev could not answer is NOT a
+zero). What leaves the machine WHEN ON: the text of the output's blocks (head+tail within a character budget) plus the
+command, to Cloudflare Workers AI -- minus any block that looks like a credential or personal data, which is withheld and
+counted. Why it ships off, and the limits of the guard: cut_output_jev.py.
 
 RECORD MODE: every row goes to jev-experiment.jsonl with mode "cut-output" (cut_output_classifier.
 RECORD_MODE), never "shadow". That mode belongs to jev_experiment_report.summarize_shadow(), which
@@ -334,7 +336,7 @@ def _selftest() -> int:
 
     with tempfile.TemporaryDirectory() as guard_dir, \
          mock.patch.object(je, "JEV_LOG", Path(guard_dir) / "selftest-default-log.jsonl"), \
-         mock.patch.dict(os.environ, {"CUT_OUTPUT_SHADOW_JEV_SAMPLE_PCT": "0"}), \
+         mock.patch.object(cjev, "JEV_ENABLED_FILE", Path(guard_dir) / "no-such-jev-enabled-file"), \
          mock.patch.object(cjev, "JEV_DISABLED_SENTINEL", Path(guard_dir) / "no-such-jev-sentinel"), \
          mock.patch.object(je, "call_jev_multi", side_effect=_never_the_real_jev):
         rc_suite = _selftest_suite()
@@ -696,12 +698,19 @@ def _selftest_suite() -> int:
     def _rows(path: Path) -> list[dict]:
         return [json.loads(ln) for ln in path.read_text().splitlines()] if path.exists() else []
 
-    def _tier(pct) -> "mock._patch_dict":
-        return mock.patch.dict(os.environ, {"CUT_OUTPUT_SHADOW_JEV_SAMPLE_PCT": str(pct)})
+    @contextlib.contextmanager
+    def _tier(pct):
+        """The Jev tier at `pct` percent for the duration: a temp enable file (the only way to turn it on), with a citation
+        line like a real one would carry, patched in as JEV_ENABLED_FILE."""
+        with tempfile.TemporaryDirectory() as td_tier:
+            enabled_file = Path(td_tier) / "cut-output-jev.enabled"
+            enabled_file.write_text(f"# selftest: tier at {pct}%\n{pct}\n")
+            with mock.patch.object(cjev, "JEV_ENABLED_FILE", enabled_file):
+                yield
 
     clean_answers = {"ok": True, "answers": {f"block_{i}": 0.02 for i in range(13)}, "bad": {}, "tokens_in": 800, "tokens_out": 13}
 
-    # -- tier DISABLED (sample 0): exactly the phase-1 behavior, now with the stamp that says so --
+    # -- tier DISABLED: the DEFAULT (no enable file at all), exactly the phase-1 behavior, now with the stamp that says so --
     for label, out_text in (
         ("prose", prose_big),
         ("one 50k-char line", "y" * 50_000),
@@ -709,12 +718,12 @@ def _selftest_suite() -> int:
     ):
         with tempfile.TemporaryDirectory() as td:
             log_path = Path(td) / "jev-experiment.jsonl"
-            with mock.patch.object(je, "JEV_LOG", log_path), _tier(0), \
+            with mock.patch.object(je, "JEV_LOG", log_path), \
                  mock.patch.object(je, "call_jev_multi", return_value=clean_answers) as m_unm:
                 process(_unmatched_hook(out_text))
             unm_lines = log_path.read_text().splitlines() if log_path.exists() else []
             unm_rec = json.loads(unm_lines[0]) if unm_lines else {}
-            ok(f"unmatched, tier disabled ({label}): Jev is NOT called", m_unm.call_count == 0)
+            ok(f"unmatched, tier at its default (no enable file) ({label}): Jev is NOT called -- the tier ships OFF", m_unm.call_count == 0)
             ok(f"unmatched, tier disabled ({label}): exactly one row, in the fixed-rule experiment, this front's mode",
                len(unm_lines) == 1 and unm_rec.get("experiment") == EXPERIMENT_FIXED and unm_rec.get("mode") == coc.RECORD_MODE)
             ok(f"unmatched, tier disabled ({label}): the row says so -- jev_tier 'disabled', not absent and not 'sampled-out'", unm_rec.get("jev_tier") == cjev.TIER_DISABLED)
