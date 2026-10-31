@@ -13,8 +13,9 @@
 # call to a file has no such combination: `sh <this file> gastown.dog`.
 #
 # Contract. The SAME probe: same bd calls (same flags, same order), same veto filter, same tiers, and
-# the same STDOUT in every case (one JSON array of at most one bead, or `[]`) - except the three deliberate
-# differences below (the disk floor, ga-vln2py; the sling filter, ga-b97dgq; the gate focus hold, ga-6fkx9je), each with its own selftest.
+# the same STDOUT in every case (one JSON array of at most one bead, or `[]`) - except the four deliberate
+# differences below (the disk floor, ga-vln2py; the sling filter, ga-b97dgq; the gate focus hold, ga-6fkx9je; the mother filter,
+# ga-vdac4cj), each with its own selftest.
 # It is read-only (bd ready/list/query/show, gc session list, jq): nothing in here removes anything. The proof
 # is pool-probe.selftest.sh, which runs the engine's own text (pool-probe.golden-1c.txt) and this file against
 # the same fixtures and compares stdout, the argv of every bd call and the exit code.
@@ -59,8 +60,8 @@ mark() {
 # The city's own formula work still flows - it is what gets the city out of the hole: order molecules and their steps
 # (the stale-db cleanup: type molecule / step, gc.pool_demand, gc.step_ref - no gc.kind), gc.kind work, and tiers 2 and 3.
 # What counts as a story is ONE definition, DISK_HOLD_NEW_STORIES_JQ in the lib; a shape it does not recognise flows.
-# This is one of the three places where the answer deliberately differs from the engine's probe (the others are the gate focus
-# hold, ga-6fkx9je, and the sling filter, ga-b97dgq, both below), and it differs only while the disk is low:
+# This is one of the four places where the answer deliberately differs from the engine's probe (the others are the gate focus
+# hold, ga-6fkx9je, the sling filter, ga-b97dgq, and the mother filter, ga-vdac4cj, all below), and it differs only while the disk is low:
 # with the disk fine (or unreadable) stdout, the bd calls and the exit code are byte-for-byte the engine's.
 # `[]` from the hold is a real "nothing for you": drain, do not look for a story by another route.
 # The hold runs AFTER the engine's --limit=20 window (ga-nyug12): 20 stories older than a formula bead would fill the window,
@@ -181,6 +182,28 @@ else
   pp_log "sling filter lib missing or corrupt (lib=$sling_lib) - sling wisps are NOT filtered, tiers answer as the engine's probe would (ga-b97dgq)"
 fi
 
+# ga-vdac4cj: MOTHERS WHOSE CHILDREN ARE IN HAND. A feature sliced into children (E11) keeps its own gate:queued while the slices
+# hold the markers; when that label goes (grw FIX8 used to clear it as a "phantom"), the mother came back here as a plain ready story
+# and a dog session was spent on a bead with nothing to build (it refused: pool:refused:delivered-awaiting-gate). The filter is
+# `drop_mothers_with_children_in_hand`, defined in children-in-hand-lib.sh (the ONE definition of "in hand", shared with the Pilot; its
+# header has the three states). It drops, in every tier and BEFORE the oldest-pick, a candidate whose open children are in progress,
+# in the gate or in a delivery - and a candidate whose children COULD NOT BE READ: that one is also dropped and its tier is marked
+# unreadable (`|| mark N`), so the answer is inert AND loud (stderr line; exit 3 when nothing else is found), never "no work" and never
+# "go ahead". This is the fourth deliberate difference from the engine's answer. It costs ONE extra bd read per tier that holds a
+# candidate (`bd list --json --limit 0`, the store's not-closed beads grouped by parent; a tier with nothing in it costs none), because
+# the candidate's own row cannot tell: its dependent_count does not count parent-child links (measured 31/10, ga-hfx1kou is 0 in
+# list/ready rows and 2 in `bd show`). The engine's own bd calls keep their flags and their order; the extra read comes after them.
+# vazio/falhou/ilegível (lib missing, or it does not source cleanly) -> the pass-through below stays: the tier answers exactly as the
+# engine's probe would, and a line in the pool-probe log says the filter is off (the same degradation as the sling lib: a deploy fault,
+# not a verdict about any bead). The lib is tried in a subshell first so a corrupt copy cannot kill the probe.
+drop_mothers_with_children_in_hand() { cat; }
+children_lib="${POOL_PROBE_CHILDREN_LIB:-$(dirname "$0")/children-in-hand-lib.sh}"
+if [ -f "$children_lib" ] && ( . "$children_lib" ) >/dev/null 2>&1; then
+  . "$children_lib"
+else
+  pp_log "children filter lib missing or corrupt (lib=$children_lib) - mothers with children in hand are NOT held back, tiers answer as the engine's probe would (ga-vdac4cj)"
+fi
+
 # Print $1 and stop the whole probe when it holds a bead.
 found() {
   [ -n "$1" ] && [ "$1" != "[]" ] && printf "%s" "$1" && exit 0
@@ -276,20 +299,28 @@ if [ "$focus_state" = 1 ] && [ "$disk_state" != low ]; then
   fi
 fi
 t1_kept=$(printf "%s" "$t1_kept" | drop_slings_for_taken_stories)   # ga-b97dgq: its own statement, so the line below stays the text work-order.registry.tsv matches
+# vazio -> no mother in this answer (nothing looked up); falhou/ilegível (a mother's children could not be read, or the drop could not be applied) -> that candidate is dropped, the tier is marked unreadable, stderr says so
+t1_kept=$(printf "%s" "$t1_kept" | drop_mothers_with_children_in_hand) || mark 1   # ga-vdac4cj
 r=$(printf "%s" "$t1_kept" | drop_molecules_in_flight | jq -c 'sort_by(.updated_at // .created_at // "") | .[0:1]' 2>/dev/null)
 found "$r"
 
 # Tier 2 (legacy): workflow beads that carry gc.run_target=<target> and no gc.routed_to.
 legacy_candidates=$(bd ready --metadata-field "gc.run_target=$target" --metadata-field "gc.kind=workflow" --unassigned --exclude-type=epic --json --sort oldest --limit=20 2>/dev/null) || mark 2
 t2_unrouted=$(printf "%s" "$legacy_candidates" | jq '[.[] | select((.metadata["gc.routed_to"] // "") == "")]' 2>/dev/null) || mark 2
-r=$(printf "%s" "$t2_unrouted" | jq -c --argjson now_ts "$(date +%s)" "$VETO_FILTER" 2>/dev/null | drop_slings_for_taken_stories | jq -c '.[0:1]' 2>/dev/null)
+t2_kept=$(printf "%s" "$t2_unrouted" | jq -c --argjson now_ts "$(date +%s)" "$VETO_FILTER" 2>/dev/null | drop_slings_for_taken_stories)
+# same three states as tier 1 (ga-vdac4cj): the filter runs before the oldest-pick, and an unreadable look-up marks the tier
+t2_kept=$(printf "%s" "$t2_kept" | drop_mothers_with_children_in_hand) || mark 2
+r=$(printf "%s" "$t2_kept" | jq -c '.[0:1]' 2>/dev/null)
 found "$r"
 
 # Tier 3 (legacy, ephemeral store): open, unassigned, no open blocking dependency. As in the engine, a
 # jq that fails leaves "[]" appended to whatever it printed.
 t3_raw=$(bd query --json 'ephemeral=true AND status=open AND assignee=none' --limit=0 2>/dev/null) || mark 3
 legacy_ephemeral_candidates=$(printf "%s" "$t3_raw" | jq --arg target "$target" '[.[] | select((.assignee // "") == "") | select(((.metadata["gc.routed_to"] // "") == $target) or (((.metadata["gc.routed_to"] // "") == "") and ((.metadata["gc.run_target"] // "") == $target) and ((.metadata["gc.kind"] // "") == "workflow"))) | select(((.issue_type // .type // "") != "epic")) | select(([ (.dependencies // [])[] | select((.type // .dep_type // "") as $t | ($t == "blocks" or $t == "waits-for" or $t == "conditional-blocks")) | select((.status // .depends_on_status // "") != "closed") ] | length) == 0)] | sort_by(.created_at // "") | .[:20]' 2>/dev/null) || { mark 3; legacy_ephemeral_candidates="$legacy_ephemeral_candidates[]"; }
-r=$(printf "%s" "$legacy_ephemeral_candidates" | jq -c --argjson now_ts "$(date +%s)" "$VETO_FILTER" 2>/dev/null | drop_slings_for_taken_stories | jq -c '.[0:1]' 2>/dev/null)
+t3_kept=$(printf "%s" "$legacy_ephemeral_candidates" | jq -c --argjson now_ts "$(date +%s)" "$VETO_FILTER" 2>/dev/null | drop_slings_for_taken_stories)
+# same three states as tier 1 (ga-vdac4cj)
+t3_kept=$(printf "%s" "$t3_kept" | drop_mothers_with_children_in_hand) || mark 3
+r=$(printf "%s" "$t3_kept" | jq -c '.[0:1]' 2>/dev/null)
 found "$r"
 
 printf "[]"

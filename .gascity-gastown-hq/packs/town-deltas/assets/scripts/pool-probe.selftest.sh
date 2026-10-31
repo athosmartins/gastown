@@ -39,6 +39,11 @@ GOOD_LIB="$SELF_DIR/disk-headroom-lib.sh"
 # disk: without the pin the probe reads the REAL state file, and this selftest would go red on the mini whenever the mode is ON.
 # pool-probe-gate-focus.selftest.sh holds the proof of the mode itself.
 export GATE_FOCUS_ACTIVE_OVERRIDE=0
+# ga-vdac4cj: the probe's mother filter (children-in-hand-lib.sh) makes ONE extra bd read per tier that holds a candidate - a call the
+# engine's probe does not make, so "bd calls identical" would fail in every scenario with a candidate. Point the probe at a lib that does not
+# exist (it logs "children filter lib missing" and passes through, which is the engine's probe) so these sections stay about the engine's
+# probe. pool-probe-children.selftest.sh holds the proof of the filter itself, including its one extra read and that it is the ONLY difference.
+export POOL_PROBE_CHILDREN_LIB=/nonexistent/children-in-hand-lib.sh
 
 # ---- the engine's probe: unwrap `sh -c '<body>' -- <target>` exactly as the shell would ----------------
 golden_line="$(cat "$GOLDEN")"
