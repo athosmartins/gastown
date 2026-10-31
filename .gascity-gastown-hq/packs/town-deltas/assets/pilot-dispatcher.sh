@@ -13018,7 +13018,7 @@ _pilot_wa_node_rc_uncertain() {
 
 # _pilot_wa_node_reapply <id> <loja> <aliases-a-pular> — o apply de NOVO, depois de a abertura ter desfeito (e confirmado) o alias que estava ocupado, com WA_NODE_SKIP_ALIASES. Mesmo contrato do trecho do decide: deixa o rc em
 # _PWN_APPLY_RC e a linha em wa-node-route.jsonl (campo skip); devolve 0 = o apply escreveu outro alias (quem chama relê a bead e abre) · 1 = nada escrito (script ausente, recusa 10/11, nó cheio 12): a bead segue livre ·
-# 2 = rc incerto, a escrita pode ter pegado: desfaz o que tem a cara do apply (settle), reserva o nó e devolve 2 (segura).
+# 2 = rc incerto, a escrita pode ter pegado: desfaz o que tem a cara do apply (settle) e devolve 2 (segura); quem chama (_pilot_wa_node_open) reserva o nó para o P0/P1 em qualquer 1|2, então aqui não se reserva de novo.
 # vazio (script executável, aliases a pular vazios) → um apply igual ao primeiro; falhou/ilegível (script que sumiu, rc que não é número) → 1: o estado inerte é não escrever.
 _pilot_wa_node_reapply() {
   local _ra_id="${1:-}" _ra_store="${2:-}" _ra_skip="${3:-}" _ra_dir _ra_out="" _ra_rc=0 _ra_basis=any
@@ -13037,7 +13037,6 @@ _pilot_wa_node_reapply() {
   if _pilot_wa_node_rc_uncertain "$_ra_rc"; then
     warn "wa-node: $_ra_id — resultado da escrita desconhecido no apply refeito (rc=$_ra_rc); não despacho esta varredura"
     _pilot_wa_node_settle "$_ra_id" "$_ra_store"
-    _pilot_node_reserve_set "${_PWN_BJ:-}" "$_ra_id" "apply refeito rc=$_ra_rc (resultado incerto)" 2
     return 2
   fi
   return 1

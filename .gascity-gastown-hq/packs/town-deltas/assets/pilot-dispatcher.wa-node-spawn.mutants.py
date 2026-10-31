@@ -1,4 +1,4 @@
-# pilot-dispatcher.wa-node-spawn.mutants.py — o mutador do pilot-dispatcher.wa-node-spawn.selftest.sh (ga-2hd02v.3): 111 quebras de UMA linha do pilot-dispatcher.sh, cada uma com um nome.
+# pilot-dispatcher.wa-node-spawn.mutants.py — o mutador do pilot-dispatcher.wa-node-spawn.selftest.sh (ga-2hd02v.3): 110 quebras de UMA linha do pilot-dispatcher.sh, cada uma com um nome.
 #
 # Contents
 #   Uso · Como cada mutante é escrito
@@ -137,22 +137,22 @@ def _():
 # ── E. o settle ──
 @m("settle-ausente-rc13")
 def _():
-    rep('desconhecido (rc=$_rc); não despacho esta varredura"; _pilot_wa_node_settle "$_id" "$_store"; return 2 ;;', 'desconhecido (rc=$_rc); não despacho esta varredura"; return 2 ;;')
+    rep('desconhecido (rc=$_rc); não despacho esta varredura"; _pilot_wa_node_settle "$_id" "$_store"; _pilot_node_reserve_set', 'desconhecido (rc=$_rc); não despacho esta varredura"; _pilot_node_reserve_set')
 
 
 @m("settle-ausente-sinal")
 def _():
-    rep('a escrita pode ter acontecido; não despacho esta varredura"; _pilot_wa_node_settle "$_id" "$_store"; return 2 ;;', 'a escrita pode ter acontecido; não despacho esta varredura"; return 2 ;;')
+    rep('a escrita pode ter acontecido; não despacho esta varredura"; _pilot_wa_node_settle "$_id" "$_store"; _pilot_node_reserve_set', 'a escrita pode ter acontecido; não despacho esta varredura"; _pilot_node_reserve_set')
 
 
 @m("rc13-devolve-1")
 def _():
-    rep('desconhecido (rc=$_rc); não despacho esta varredura"; _pilot_wa_node_settle "$_id" "$_store"; return 2 ;;', 'desconhecido (rc=$_rc); não despacho esta varredura"; _pilot_wa_node_settle "$_id" "$_store"; return 1 ;;')
+    rep('"apply rc=$_rc (resultado incerto)" 2; return 2 ;;', '"apply rc=$_rc (resultado incerto)" 2; return 1 ;;')
 
 
 @m("sinal-devolve-1")
 def _():
-    rep('a escrita pode ter acontecido; não despacho esta varredura"; _pilot_wa_node_settle "$_id" "$_store"; return 2 ;;', 'a escrita pode ter acontecido; não despacho esta varredura"; _pilot_wa_node_settle "$_id" "$_store"; return 1 ;;')
+    rep('"apply rc=$_rc (morto por sinal)" 2; return 2 ;;', '"apply rc=$_rc (morto por sinal)" 2; return 1 ;;')
 
 
 @m("settle-roda-no-pool")
@@ -198,22 +198,22 @@ def _():
 
 @m("open-qualquer-dono")
 def _():
-    rep('  case "$_PWR_ALIAS" in\n    wa-worker-remote-[1-9]) ;;\n    *) warn "wa-node: $_wo_id depois', '  case "$_PWR_ALIAS" in\n    *) ;;\n    *) warn "wa-node: $_wo_id depois')
+    rep('    case "$_PWR_ALIAS" in\n      wa-worker-remote-[1-9]) ;;\n      *) warn "wa-node: $_wo_id depois', '    case "$_PWR_ALIAS" in\n      *) ;;\n      *) warn "wa-node: $_wo_id depois')
 
 
 @m("open-alias-largo")
 def _():
-    rep('    wa-worker-remote-[1-9]) ;;\n    *) warn "wa-node: $_wo_id depois', '    wa-worker-remote-*) ;;\n    *) warn "wa-node: $_wo_id depois')
+    rep('      wa-worker-remote-[1-9]) ;;\n      *) warn "wa-node: $_wo_id depois', '      wa-worker-remote-*) ;;\n      *) warn "wa-node: $_wo_id depois')
 
 
 @m("open-ignora-marca")
 def _():
-    rep('if [ "$_PWR_MARK" != "$_PWR_ALIAS" ] || [ "$_PWR_STATUS" != in_progress ]; then\n    warn', 'if [ "$_PWR_STATUS" != in_progress ]; then\n    warn')
+    rep('    if [ "$_PWR_MARK" != "$_PWR_ALIAS" ] || [ "$_PWR_STATUS" != in_progress ]; then\n      warn', '    if [ "$_PWR_STATUS" != in_progress ]; then\n      warn')
 
 
 @m("open-ignora-status")
 def _():
-    rep('if [ "$_PWR_MARK" != "$_PWR_ALIAS" ] || [ "$_PWR_STATUS" != in_progress ]; then\n    warn', 'if [ "$_PWR_MARK" != "$_PWR_ALIAS" ]; then\n    warn')
+    rep('    if [ "$_PWR_MARK" != "$_PWR_ALIAS" ] || [ "$_PWR_STATUS" != in_progress ]; then\n      warn', '    if [ "$_PWR_MARK" != "$_PWR_ALIAS" ]; then\n      warn')
 
 
 @m("open-leitura-ignorada")
@@ -594,11 +594,6 @@ def _():
 @m("abertura-falha-nao-reserva")
 def _():
     rep('    1|2) _pilot_node_reserve_set "${_PWN_BJ:-}" "$_wo_id"', '    1|2) : "${_PWN_BJ:-}" "$_wo_id"')
-
-
-@m("reapply-incerto-nao-reserva")
-def _():
-    rep('    _pilot_node_reserve_set "${_PWN_BJ:-}" "$_ra_id" "apply refeito rc=$_ra_rc (resultado incerto)" 2', '    :')
 
 
 @m("reapply-incerto-nao-desfaz")
