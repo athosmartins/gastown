@@ -2559,7 +2559,7 @@ CRASHPY
   for pid in ap-pos-p1 ap-pos-noctx ap-pos-heldexp ap-pos-dispold ap-pos-depgone ap-pos-parent; do
     grep -q "  ${pid}  " "$M58" && ok "scenario 58: $pid flagged" || bad "scenario 58: $pid should be flagged (missed alarm)"
   done
-  for nid in $(grep -o 'ap-neg-[a-z0-9-]*' "$TMP/fixtures/store-a.json" | sort -u); do
+  for nid in $(grep -o 'ap-neg-[a-z0-9-]*' "$TMP/fixtures/store-a.json" | sort -u); do   # third-state-waiver: lê o fixture que este mesmo teste acabou de escrever; se faltasse, o loop não rodaria e os positivos acima já reprovariam
     if grep -q "  ${nid}  " "$M58"; then bad "scenario 58 (false positive): $nid was flagged"; else ok "scenario 58: $nid not flagged"; fi
   done
 
@@ -2571,10 +2571,10 @@ CRASHPY
   PMRW_TEST_NOTIFIED="$N59" PMRW_TEST_MAILED="$M59" run_sweep
   [ -s "$APPROVED_STATE_FILE" ] && ok "scenario 59: bead in the readable store alerted (ledger written)" || bad "scenario 59: no ledger after an alert"
   : > "$TMP/fixtures/store-b.json"; echo '[]' > "$TMP/fixtures/store-b.json"
-  LED59="$(cat "$APPROVED_STATE_FILE")"; : > "$TMP/pmrw.log"
+  LED59="$(cat "$APPROVED_STATE_FILE")"; : > "$TMP/pmrw.log"   # third-state-waiver: o ledger acabou de ser conferido não-vazio duas linhas acima; é leitura do próprio teste
   PMRW_TEST_NOTIFIED="$N59" PMRW_TEST_MAILED="$M59" run_sweep
   grep -q 'APPROVED: PARTIAL' "$LOG" && ! grep -q 'APPROVED: CLEAR' "$LOG" && ok "scenario 59: one unreadable store → PARTIAL, never OK" || bad "scenario 59: unreadable store printed an all-clear"
-  [ "$(cat "$APPROVED_STATE_FILE" 2>/dev/null)" = "$LED59" ] && ok "scenario 59: ledger untouched while blind" || bad "scenario 59: ledger changed on a partial read"
+  [ "$(cat "$APPROVED_STATE_FILE" 2>/dev/null)" = "$LED59" ] && ok "scenario 59: ledger untouched while blind" || bad "scenario 59: ledger changed on a partial read"   # third-state-waiver: leitura ilegível dá vazio, que difere do LED59 não-vazio e reprova o teste (falhou não passa por igual)
   echo '__BD_FAIL__' > "$TMP/fixtures/store-b.json"; : > "$LOG"
   PMRW_TEST_NOTIFIED="$N59" PMRW_TEST_MAILED="$M59" run_sweep
   grep -q 'APPROVED: UNKNOWN' "$LOG" && ok "scenario 59: every store unreadable → UNKNOWN" || bad "scenario 59: blind sweep did not say UNKNOWN"
@@ -2608,6 +2608,17 @@ CRASHPY
   M63="$TMP/m63"; : > "$M63"
   PMRW_APPROVED_MIN_MINUTES=abc PMRW_APPROVED_MAX_PRIORITY=x PMRW_TEST_NOTIFIED="$TMP/n63" PMRW_TEST_MAILED="$M63" run_sweep
   grep -q '  wa-63-old  ' "$M63" && ! grep -q '  wa-63-mid  ' "$M63" && ! grep -q '  wa-63-p2  ' "$M63" && ok "scenario 63: defaults applied (old P1 flagged; 20min and P2 not)" || bad "scenario 63: junk knobs changed the selection"
+
+  echo "Scenario 64: a corrupt cooldown ledger (not JSON / not an object) is NOT 'bead already warned' — it fails toward ALERTING, loudly, and the ledger is rewritten valid"
+  for junk64 in 'isto {nao e json' '[1,2,3]' '"texto"'; do
+    reset_stores
+    mka wa-64 'story:approved,exec:auto' "$OLD_TS" 0 | to_store "$TMP/fixtures/store-a.json"
+    mkdir -p "$PMRW_STATE_DIR"; printf '%s' "$junk64" > "$APPROVED_STATE_FILE"
+    N64="$TMP/n64"; M64="$TMP/m64"; : > "$N64"; : > "$M64"; : > "$LOG"
+    PMRW_TEST_NOTIFIED="$N64" PMRW_TEST_MAILED="$M64" run_sweep
+    grep -q '  wa-64  ' "$M64" && ok "scenario 64: ledger '$junk64' → wa-64 alerted anyway (corrupt ledger ≠ already warned)" || bad "scenario 64: ledger '$junk64' silenced the alert"
+    [ "$(jq -r 'type' "$APPROVED_STATE_FILE" 2>/dev/null)" = "object" ] && [ "$(jq -r '.["wa-64"].last_alert // 0 | . > 0' "$APPROVED_STATE_FILE" 2>/dev/null)" = "true" ] && ok "scenario 64: ledger '$junk64' rewritten as a valid object holding wa-64" || bad "scenario 64: ledger '$junk64' was not rewritten valid"   # third-state-waiver: leitura do próprio teste; ledger ilegível ou ausente dá type != object e reprova o caso
+  done
 
 
   echo ""
