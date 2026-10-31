@@ -15,7 +15,7 @@
 #   5. python3 ausente ou quebrado na PATH da sessão → o hook sai 2 e a ferramenta é BLOQUEADA, até a escrita inocente (falha fechada); com python3 ela passa.
 #   6. (ga-14qtcy9) python3 que PENDURA: o prazo do PRÓPRIO claude estoura e a chamada só é bloqueada com `onFailure: "block"` no hook (o que o builder gera); sem o campo, ou com "continue", ela EXECUTA
 #      sem conferência. Um valor fora do enum ("Block") é PIOR que "continue": o claude não carrega o arquivo de settings inteiro (o guarda nem roda e as regras de permissão do arquivo somem) — por isso o
-#      --selfcheck só aceita o texto exato "block"; uma chave desconhecida no hook é só ignorada (o hook segue de pé). Prazo do hook reduzido a 2 s só no teste (o padrão do claude é 600 s).
+#      --selfcheck só aceita o texto exato "block"; uma chave desconhecida no hook é só ignorada (o hook segue de pé). Prazo do hook reduzido a 2 s só no teste (o padrão do claude é 600 s segundo a documentação).
 # O QUE NÃO PROVA: o claude do MBP (versão e Keychain não medidos — o teste imprime a versão que rodou; refaça a cada atualização do claude e no MBP, `mbp-proof`); que o guarda
 #   pegue toda forma de escrita (isso é o remote-clone-guard.selftest.sh); Bash que escreve dentro do bundle (o guarda é trava contra engano, não sandbox).
 # COMO RODA: sem o claude na PATH (nem em CLAUDE_BIN, nem em ~/.local/bin) o teste diz SKIP em voz alta e sai 0 — isso NÃO vale como prova. Cada caso é uma rodada do claude (~10 s).
@@ -151,7 +151,7 @@ clean; plan_write "$WOK"; CLPATH="$T/nopy" runcl --settings "$BS"; verdict block
 clean; plan_write "$WOK"; CLPATH="$T/badpy" runcl --settings "$BS"; verdict blocked "$WOK" "python3 QUEBRADO (sai 1) na PATH da sessão: a escrita comum é BLOQUEADA (falha fechada)"
 
 # ================= 5. onFailure (ga-14qtcy9): o prazo do PRÓPRIO claude estourado só bloqueia com `onFailure: "block"` no hook =================
-# python3 que PENDURA (não falta, não sai 1): `python3 -I <guarda> || exit 2` não responde até o prazo do hook (2 s aqui; 600 s é o padrão do claude no PreToolUse) e quem decide é o onFailure
+# python3 que PENDURA (não falta, não sai 1): `python3 -I <guarda> || exit 2` não responde até o prazo do hook (2 s aqui; o padrão do claude no PreToolUse é 600 s segundo a documentação, não conferido no binário) e quem decide é o onFailure
 mkdir -p "$T/hangpy"; for bn in sh cat env dirname sleep; do ln -sf "$(command -v $bn)" "$T/hangpy/$bn"; done
 printf '#!/bin/sh\nsleep 25\n' > "$T/hangpy/python3"; chmod +x "$T/hangpy/python3"
 jq '.hooks.PreToolUse |= map(.hooks |= map(.timeout = 2))' "$BS" > "$T/s_onf_block.json"                       # o do builder REAL (onFailure "block") com prazo curto
