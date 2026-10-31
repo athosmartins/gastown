@@ -17212,6 +17212,408 @@ dispatch_lane() {
   log "Lane $lane: dispatched ${filled} this sweep (cap=${cap}, slots_left=${slots})."
 }
 
+# ══ ga-hfx1kou: um dog do mini pega a P0/P1 aprovada de um rig cujo pool está CHEIO ════════════════════════════════════════════════════════════════
+# Ordem do Athos (31/10): "todos os P0 e P1 em aprovadas podem ser rodeados para os dogs". Medido: os pools são POR RIG (P0/P1 de WA só vão ao wa-worker, as de PS só ao ps-worker) e os dogs
+# ficavam ociosos enquanto o pool do rig estava cheio. (A metade HQ — toda P0/P1 aprovada do HQ sem gc.routed_to ganha gc.routed_to=gastown.dog — é do vigia
+# scripts/pilot-missing-route-watchdog.sh, _pmrw_approved_fix.)
+#
+# Esta passada roda DEPOIS das pistas: só empresta o que o caminho normal NÃO despachou nesta varredura. Uma bead é emprestada quando TODAS valem:
+#   · está numa loja de rig com pool próprio (wa-worker / ps-worker), é P0/P1, story:approved + exec:auto, aberta e sem dono, sem nenhum veto de despacho
+#     (pilot:no-auto-dispatch, next-action:*, exec:manual, gate:*, pilot:held*, lane:kimi, os vetos do probe do pool) e sem rota para outro alvo;
+#   · o pool do rig está POSITIVAMENTE cheio (vivos >= teto). Contagem ilegível ou pool com vaga NÃO empresta: com vaga o caminho normal é o dono;
+#   · há vaga de dog (vivos + os emprestados nesta varredura < PILOT_DOG_LEND_DOG_MAX, padrão 3 de 6 — o resto fica para o trabalho de rotina do dog);
+#   · o mini aguenta: disco ok (ou guard desligado de propósito) e memória não apertada nem cega. É MAIS ESTRITO que o portão global (que abre em leitura cega): esta capacidade
+#     é opcional, e dúvida não empresta;
+#   · WA: o classificador de nó diz mini ou unknown. node NUNCA vai a um dog do mini (o nó Hetzner é o dono dele) e esta versão também não o empresta ao dog-remote:
+#     ele não vê as lojas de rig nem o repo do WA, e uma bead sem ver a loja não é despachável. Timeout/erro/ausente = recusa.
+# O que o dog recebe é uma bead-gancho no HQ (a sonda do dog só lê o HQ, gc.routed_to=gastown.dog) que o manda trabalhar num worktree DO RIG, ler o CLAUDE.md DO RIG antes de editar,
+# e dar push + /gate-done de lá. O empréstimo NÃO gasta vaga do pool do rig: não mexe nas contagens dele.
+# Não toca: gate focus ligado (o clamp dos pools é decisão do Athos), Dolt saturado no início da varredura, passada só-nó, varredura parada, DRY_RUN.
+# Interruptor: PILOT_DOG_LEND = on (padrão, vazio) | shadow (só diz o que faria) | off (qualquer outra palavra também desliga).
+_PDL_WHY=""          # por que a última checagem recusou/falhou (para o log)
+_PDL_POOL=""; _PDL_RIG=""; _PDL_ROOT=""   # saída de _pilot_dog_lend_pool_of: pool, nome do rig e a loja (= o repo) da bead
+_PDL_POOL_LIVE=""; _PDL_POOL_MAX=""        # saída de _pilot_dog_lend_pool_full (para o log)
+_PDL_LENT=0          # quantas esta varredura já emprestou
+_PDL_DOG_LIVE=""     # dogs vivos (lido de novo a cada checagem; a leitura em si é cacheada pelo rastreio de ilegível do _pilot_live_session_count)
+_PDL_TASK=""; _PDL_TITLE=""                # saída de _pilot_dog_lend_prompt
+
+# _pilot_dog_lend_mode — imprime on | shadow | off.
+# vazio (variável não posta) → on: a ordem do Athos é que dogs peguem P0/P1 aprovada; falhou/ilegível (qualquer outra palavra) → off: a passada é capacidade OPCIONAL, dúvida não empresta.
+_pilot_dog_lend_mode() {
+  case "${PILOT_DOG_LEND:-}" in
+    ''|on|1) printf 'on' ;;
+    shadow) printf 'shadow' ;;
+    *) printf 'off' ;;
+  esac
+}
+
+# _pilot_dog_lend_veto <bead-json> — imprime "ok" se a bead PODE ser emprestada; senão o motivo (uma palavra). Sempre devolve 0 (quem decide lê o texto).
+# vazio (entrada sem saída do jq) → "unreadable", NUNCA "ok": só o "ok" escrito pelo programa libera; falhou/ilegível (jq, JSON que não é bead, lista de recusas do probe que não dá para ler) → veto
+# ("unreadable" / "refusal-unknown"). Prioridade pode ser número (1) ou texto ("P1"); qualquer outra coisa conta como 99 (não é P0/P1).
+_pilot_dog_lend_veto() {
+  local _json="${1:-}" _v _r
+  [ -n "$_json" ] || { printf 'unreadable'; return 0; }
+  _v=$(printf '%s' "$_json" | jq -r '
+    def lab: (.labels // []);
+    def has($l): (lab | any(.[]; . == $l));
+    def pri: (.priority | if type == "number" then . elif type == "string" then (sub("^[Pp]"; "") | (try tonumber catch 99)) else 99 end);
+    if type != "object" then "unreadable"
+    elif pri > 1 then "priority:P\(pri)"
+    elif ((.status // "") | tostring) != "open" then "status:\((.status // "?") | tostring)"
+    elif ((.assignee // "") | tostring | test("\\S")) then "assigned"
+    elif (has("story:approved") | not) then "not-approved"
+    elif (has("exec:auto") | not) then "not-exec-auto"
+    else
+      (lab | map(select(. == "pilot:no-auto-dispatch" or . == "no-auto-dispatch" or . == "exec:manual" or . == "story:in-flight" or . == "pilot:dispatched" or . == "pilot:dispatching" or . == "lane:kimi"
+                        or startswith("pilot:held") or startswith("next-action:") or startswith("gate:"))) | .[0]) as $bad
+      | if $bad != null then "label:\($bad)"
+        else ((.metadata["gc.routed_to"] // "") | tostring) as $r
+          | if ($r == "" or $r == "wa-worker" or $r == "ps-worker") then "ok" else "route:\($r)" end
+        end
+    end' 2>/dev/null) || { printf 'unreadable'; return 0; }
+  [ -n "$_v" ] || { printf 'unreadable'; return 0; }
+  if [ "$_v" = "ok" ]; then
+    # vazio ("" com rc 0) → nada no probe do pool recusa; falhou (rc != 0: biblioteca de vetos ausente, sem relógio, bead ilegível) → refusal-unknown, que VETA: não dá para dizer que o probe aceitaria
+    _r=$(_pilot_priority_refusal_of "$_json") || { printf 'refusal-unknown'; return 0; }
+    [ -z "$_r" ] || { printf 'refused:%s' "$_r"; return 0; }
+  fi
+  printf '%s' "$_v"
+  return 0
+}
+
+# _pilot_dog_lend_pool_of <id> — a bead vive na loja de um rig com pool próprio? Devolve 0 e deixa _PDL_POOL/_PDL_RIG/_PDL_ROOT; senão 1 e _PDL_WHY (store-unknown | not-a-pool-rig | no-gate-repo).
+# Chamar na shell do chamador, nunca em $(...) (_pilot_pool_store_verdict aquece a memória da lista de rigs lá).
+# vazio (id sem prefixo, sem routes.jsonl, prefixo que não está nele) → store-unknown; falhou/ilegível (veredito unknown de um dos pools) → store-unknown: a loja nunca é adivinhada.
+# O HQ, o traco-bim (repo sem gate) e qualquer rig sem pool próprio dão "blind" para os dois pools → not-a-pool-rig.
+_pilot_dog_lend_pool_of() {
+  local _id="${1:-}" _home _pool _unknown=0
+  _PDL_POOL=""; _PDL_RIG=""; _PDL_ROOT=""
+  _home=$(_pilot_bead_home_store "$_id") || _home=""
+  if [ -z "$_home" ]; then _PDL_WHY="store-unknown"; return 1; fi
+  case "$(printf '%s' "$_home" | tr 'A-Z' 'a-z')" in *traco*) _PDL_WHY="no-gate-repo"; return 1 ;; esac
+  for _pool in wa-worker ps-worker; do
+    _pilot_pool_store_verdict "$_pool" "$_home"
+    case "${_PSV_VERDICT:-unknown}" in
+      serves) _PDL_POOL="$_pool"; _PDL_RIG="${_PSV_POOL_RIG:-}"; _PDL_ROOT="$_home"; return 0 ;;
+      blind) ;;
+      *) _unknown=1 ;;
+    esac
+  done
+  if [ "$_unknown" = 1 ]; then _PDL_WHY="store-unknown"; else _PDL_WHY="not-a-pool-rig"; fi
+  return 1
+}
+
+# _pilot_dog_lend_pool_full <wa-worker|ps-worker> — 0 = POSITIVAMENTE cheio (vivos >= teto); 1 = tem vaga (o caminho normal é o dono: não empresta, em silêncio); 2 = não deu para ler (_PDL_WHY).
+# vazio/falhou/ilegível (contagem de vivos que não é inteiro, teto que não é inteiro) → 2: só um "cheio" medido empresta. Teto 0 → 2 também: é o pool desligado de propósito, e emprestar a ele
+# furaria a decisão. O teto lido é o que o resto do Pilot usa nesta varredura (já com o clamp do gate focus e o teto dinâmico). Só LÊ — não grava a contagem em cache nem muda o teto (uma leitura que falha só acende o aviso «uma vez por pool por varredura» que _pilot_pool_live_count já tem).
+_pilot_dog_lend_pool_full() {
+  local _pool="${1:-}" _max
+  case "$_pool" in
+    wa-worker) _max="${PILOT_WA_WORKER_MAX:-}" ;;
+    ps-worker) _max="${PILOT_PS_WORKER_MAX:-}" ;;
+    *) _PDL_WHY="pool-unknown"; return 2 ;;
+  esac
+  case "$_max" in ''|*[!0-9]*) _PDL_WHY="pool-max-unreadable"; return 2 ;; esac
+  if [ "$_max" -le 0 ]; then _PDL_WHY="pool-max-zero"; return 2; fi
+  if ! _pilot_pool_live_count "$_pool"; then _PDL_WHY="pool-count-unreadable"; return 2; fi
+  case "${_PCAP_N:-}" in ''|*[!0-9]*) _PDL_WHY="pool-count-unreadable"; return 2 ;; esac
+  _PDL_POOL_LIVE="$_PCAP_N"; _PDL_POOL_MAX="$_max"
+  [ "$_PCAP_N" -ge "$_max" ] && return 0
+  return 1
+}
+
+# _pilot_dog_lend_dog_free — 0 = há vaga de dog; 1 = não há (_PDL_WHY=no-free-dog); 2 = contagem ilegível (_PDL_WHY=dog-count-unreadable).
+# Vaga = dogs vivos + os que ESTA varredura já emprestou < PILOT_DOG_LEND_DOG_MAX (padrão 3 de 6: o resto do pool fica para o trabalho de rotina do dog).
+# vazio/falhou/ilegível (sessão não lida, teto que não é inteiro positivo) → 2: sem leitura não há "vaga". Chamar na shell do chamador (usa _PLSC_N).
+_pilot_dog_lend_dog_free() {
+  local _max="${PILOT_DOG_LEND_DOG_MAX:-3}"
+  case "$_max" in ''|*[!0-9]*) _max=3 ;; esac
+  if ! _pilot_live_session_count gastown.dog; then _PDL_WHY="dog-count-unreadable"; return 2; fi
+  case "${_PLSC_N:-}" in ''|*[!0-9]*) _PDL_WHY="dog-count-unreadable"; return 2 ;; esac
+  _PDL_DOG_LIVE="$_PLSC_N"
+  if [ $(( _PLSC_N + ${_PDL_LENT:-0} )) -lt "$_max" ]; then return 0; fi
+  _PDL_WHY="no-free-dog"
+  return 1
+}
+
+# _pilot_dog_lend_mini_ok — o mini aguenta mais um build? 0 = sim; 1 = não (_PDL_WHY). Os MESMOS leitores do resto do Pilot (_pilot_disk_floor, _pilot_memory_tight), com regra mais estrita:
+# vazio/falhou/ilegível (disco "unknown" = biblioteca ou df ilegível; memória com sonda cega) → NÃO empresta. O portão global abre nessas leituras para não travar o Pilot inteiro; aqui a capacidade é
+# opcional, então dúvida não empresta. Só "ok" e "off" (guard desligado pelo operador) liberam o disco.
+_pilot_dog_lend_mini_ok() {
+  if _pilot_disk_floor; then _PDL_WHY="disk-low (${PILOT_DISK_FLOOR_DETAIL:-?})"; return 1; fi
+  case "${PILOT_DISK_FLOOR_STATE:-unknown}" in
+    ok|off) ;;
+    *) _PDL_WHY="disk-${PILOT_DISK_FLOOR_STATE:-unknown} (${PILOT_DISK_FLOOR_DETAIL:-?})"; return 1 ;;
+  esac
+  if _pilot_memory_tight; then _PDL_WHY="memory-tight (${PILOT_MEM_TIGHT_REASON:-?}: ${PILOT_MEM_TIGHT_DETAIL:-?})"; return 1; fi
+  if [ -n "${PILOT_MEM_TIGHT_BLIND:-}" ]; then _PDL_WHY="memory-blind (${PILOT_MEM_TIGHT_BLIND})"; return 1; fi
+  return 0
+}
+
+# _pilot_dog_lend_node_gate <id> <loja> — SÓ para pool wa-worker. 0 = o classificador do Pilot diz mini ou unknown (vai a um dog do MINI); 1 = não (_PDL_WHY, e _PDL_VERDICT com o veredito).
+# node → node-verdict-reserved: o nó Hetzner é o dono dessa bead, NUNCA um dog do mini, e o dog-remote não vê as lojas de rig. timeout / error / missing (e qualquer coisa que não seja
+# mini/unknown) → node-verdict-<x>, recusa: o terceiro estado nunca vira mini. Só LÊ (wa-node-dispatch.sh check).
+_PDL_VERDICT=""
+_pilot_dog_lend_node_gate() {
+  _PDL_VERDICT=""
+  _pilot_wa_node_pass_check "${1:-}" "${2:-}"
+  _PDL_VERDICT="${_PWP_V:-error}"
+  case "$_PDL_VERDICT" in
+    mini|unknown) return 0 ;;
+    node) _PDL_WHY="node-verdict-reserved" ;;
+    *) _PDL_WHY="node-verdict-${_PDL_VERDICT}" ;;
+  esac
+  return 1
+}
+
+# _pilot_dog_lend_reread <id> <loja> — imprime o objeto da bead lido AGORA; rc 1 sem imprimir quando não deu.
+# vazio/falhou/ilegível (bd falhou, saída vazia, JSON que o jq não lê, bead de OUTRO id) → rc 1: quem chama NUNCA lê isso como "livre".
+_pilot_dog_lend_reread() {
+  local _id="${1:-}" _store="${2:-}" _o
+  { [ -n "$_id" ] && [ -n "$_store" ]; } || return 1
+  _o=$(bd -C "$_store" show "$_id" --json 2>/dev/null) || return 1
+  _o=$(printf '%s' "$_o" | jq -ce --arg id "$_id" 'if type == "array" then .[0] else . end | select(type == "object" and .id == $id)' 2>/dev/null) || return 1
+  [ -n "$_o" ] || return 1
+  printf '%s' "$_o"
+}
+
+# _pilot_dog_lend_still_free <id> <loja> — checagem estreita DEPOIS da claim: 0 = aberta, sem dono, sem in-flight/dispatched e COM a nossa claim; 1 = outra coisa; 2 = não deu para ler.
+# vazio/falhou/ilegível → 2; quem chama desfaz a claim, nunca segue.
+_pilot_dog_lend_still_free() {
+  local _f
+  _f=$(_pilot_dog_lend_reread "${1:-}" "${2:-}") || return 2
+  printf '%s' "$_f" | jq -e '(.status // "") == "open"
+      and (((.assignee // "") | tostring | test("\\S")) | not)
+      and ((.labels // []) | (any(.[]; . == "story:in-flight") | not) and (any(.[]; . == "pilot:dispatched") | not) and any(.[]; . == "pilot:dispatching"))' >/dev/null 2>&1 && return 0
+  return 1
+}
+
+# _pilot_dog_lend_release <id> <loja> <rota-original> — desfaz uma claim ANTES do sling: tira o rótulo e o carimbo e devolve a rota que a claim tirou. Cada escrita é melhor-esforço;
+# a rota é conferida de novo e, se não voltou, grita (sem a rota o pool do rig não vê mais a bead até o próximo varrimento a curar). Sempre devolve 0.
+_pilot_dog_lend_release() {
+  local _id="${1:-}" _store="${2:-}" _route="${3:-}" _back
+  bd -C "$_store" label remove "$_id" "pilot:dispatching" -q 2>/dev/null || true
+  bd -C "$_store" update "$_id" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+  if [ -n "$_route" ]; then
+    bd -C "$_store" update "$_id" --set-metadata "gc.routed_to=$_route" -q 2>/dev/null || true
+    # vazio/falhou (a releitura não veio ou não traz a rota) → grita: a bead pode ter ficado sem rota
+    _back=$(_pilot_dog_lend_reread "$_id" "$_store" | jq -r '.metadata["gc.routed_to"] // ""' 2>/dev/null) || _back=""
+    [ "$_back" = "$_route" ] || warn "dog-lend: ROUTE-RESTORE-UNCONFIRMED $_id — gc.routed_to=$_route pode não ter voltado (lido: '${_back:-?}'); sem a rota o pool do rig não a vê"
+  fi
+  return 0
+}
+
+# _pilot_dog_lend_prompt <id> <titulo> <prioridade> <pool> <rig> <raiz> <tipo> — monta _PDL_TITLE (1ª linha do sling = título da bead-gancho) e _PDL_TASK (o corpo).
+# Mesmas convenções de título do despacho normal ("fix bug …" / "build story …"), que outros detectores leem para reconhecer a bead-gancho.
+_pilot_dog_lend_prompt() {
+  local _id="${1:-}" _title="${2:-}" _prio="${3:-?}" _pool="${4:-}" _rig="${5:-}" _root="${6:-}" _type="${7:-}" _boot=""
+  case "$_type" in
+    bug|tech-debt) _PDL_TITLE="fix bug $_id: $_title" ;;
+    *) _PDL_TITLE="build story $_id: $_title" ;;
+  esac
+  case "$_pool" in
+    wa-worker) _boot="Then run the bootstrap the rig's CLAUDE.md prescribes for a fresh worktree — for WhatsApp Automation that is: install the pre-push hooks, run scripts/ensure_merge_driver.sh and scripts/ensure_symlinks.sh. Do not skip them: the push is refused without them." ;;
+    *) _boot="Then run whatever bootstrap the rig's CLAUDE.md prescribes for a fresh worktree (hooks, merge driver, symlinks) before you edit." ;;
+  esac
+  _PDL_TASK="LENT P${_prio} — a RIG bead, given to you (the dog) because the ${_pool} pool is FULL and a P0/P1 must not wait for a slot (ga-hfx1kou).
+Bead ID: ${_id}
+Title: ${_title}
+Priority: P${_prio}
+Rig: ${_rig:-?}
+City: ${GC_CITY:-?}
+Rig root: ${_root}
+Bead DB: ${_root}   (the bead lives in the RIG store, not in HQ; this hook bead you were slung is the HQ one)
+
+You work in the RIG's repo — not in HQ, not in the city tree. Steps, in order:
+1. Claim it: bd -C \"${_root}\" assign ${_id} \"\${BEADS_ACTOR:-\$GC_ALIAS}\" && bd -C \"${_root}\" update ${_id} --status in_progress
+   If the assign fails or the bead shows another owner, STOP: comment on this hook bead, close it, and drain-ack. Do not touch the rig bead.
+2. Read the full bead: bd -C \"${_root}\" show ${_id}
+3. Read ${_root}/CLAUDE.md BEFORE you edit anything — it holds the rig's rules (gate, tests, paths you may not touch). Follow it over any habit from HQ work.
+4. Work ONLY in your own worktree of the rig; the rig root must stay on main, never edit there:
+     git -C \"${_root}\" fetch origin main
+     git -C \"${_root}\" worktree add \"${_root}/.gc-worktrees/${_id}-\${GC_ALIAS:-dog}\" -b \"crew/\${GC_ALIAS:-dog}/${_id}\" origin/main
+     cd \"${_root}/.gc-worktrees/${_id}-\${GC_ALIAS:-dog}\"
+   ${_boot}
+5. Commit, push the branch from THAT worktree, then run /gate-done from it. The gate and the delivery are autonomous; no human review.
+6. Close the loop: after /gate-done, finish your normal dog routine on THIS hook bead (close it, drain-ack).
+No-diff deliverable (report, data-op, verified-live / no-changes finding)? Never exit with the rig bead in_progress: acceptance already met by the artifact itself -> bd -C \"${_root}\" close ${_id} --reason citing it. Missing an Athos decision -> park it (next-action:athos-decide label + athos.acao metadata) and release the claim."
+}
+
+# _pilot_dog_lend_one <bead-json (já relida)> — empresta UMA bead. Pré-condição: _PDL_POOL/_PDL_RIG/_PDL_ROOT são os desta bead e o veto/pool/dog/mini/nó já passaram. 0 = emprestada (ou "emprestaria", em shadow
+# e DRY_RUN, sem escrever nada); 1 = não emprestou (_PDL_WHY).
+# Ordem (a mesma do despacho normal, e por quê):
+#   1. claim (pilot.dispatching_at + pilot:dispatching) e a releitura estreita — quem chegou antes ganha;
+#   2. tira gc.routed_to=wa-worker/ps-worker ANTES do sling, para nenhum worker do pool pegar a bead em paralelo ao dog;
+#   3. sling a gastown.dog; antes do sling qualquer falha DESFAZ (claim fora, rota de volta); DEPOIS do sling nada se desfaz — o dog já está de posse do gancho;
+#   4. story:in-flight (confirmado por releitura) só depois do sling; sem confirmar, a claim FICA para a recuperação por TTL e a falha aparece.
+_pilot_dog_lend_one() {
+  local _json="${1:-}" _id _title _prio _type _route _store _pool _rig _lane _mode _ts _out _wrap="" _try=0 _max _sleep _t0 _orph _i _ok _tries _slept
+  _id=$(printf '%s' "$_json" | jq -r '.id // empty' 2>/dev/null) || _id=""
+  _title=$(printf '%s' "$_json" | jq -r '(.title // "") | gsub("[[:cntrl:]]"; " ")' 2>/dev/null) || _title=""
+  _prio=$(printf '%s' "$_json" | jq -r '.priority | if type == "number" then . elif type == "string" then sub("^[Pp]"; "") else "?" end' 2>/dev/null) || _prio="?"
+  _type=$(printf '%s' "$_json" | jq -r '.issue_type // ""' 2>/dev/null) || _type=""
+  _route=$(printf '%s' "$_json" | jq -r '.metadata["gc.routed_to"] // ""' 2>/dev/null) || _route=""
+  _store="${_PDL_ROOT:-}"; _pool="${_PDL_POOL:-}"; _rig="${_PDL_RIG:-}"
+  if [ -z "$_id" ] || [ -z "$_store" ] || [ -z "$_pool" ]; then _PDL_WHY="missing-context"; return 1; fi
+  _mode=$(_pilot_dog_lend_mode)
+  if [ "$_mode" = shadow ] || [ "${DRY_RUN:-0}" = "1" ]; then
+    log "dog-lend: $([ "$_mode" = shadow ] && echo SHADOW || echo DRY-RUN) would lend $_id → gastown.dog (pool=$_pool rig=${_rig:-?} P${_prio} verdict=${_PDL_VERDICT:-n/a}) — nothing written"
+    return 0
+  fi
+  _ts=$(date +%s 2>/dev/null) || _ts=""
+  case "$_ts" in ''|*[!0-9]*) _PDL_WHY="clock-unreadable"; return 1 ;; esac
+  # 1. claim
+  if ! bd -C "$_store" update "$_id" --set-metadata "pilot.dispatching_at=$_ts" -q 2>/dev/null \
+     || ! bd -C "$_store" label add "$_id" "pilot:dispatching" -q 2>/dev/null; then
+    _pilot_dog_lend_release "$_id" "$_store" ""
+    _PDL_WHY="claim-write-failed"; return 1
+  fi
+  if ! _pilot_dog_lend_still_free "$_id" "$_store"; then
+    _pilot_dog_lend_release "$_id" "$_store" ""
+    _PDL_WHY="claim-lost-or-unconfirmed"; return 1
+  fi
+  # 2. a rota do pool sai (só se havia uma)
+  if [ -n "$_route" ]; then
+    if ! bd -C "$_store" update "$_id" --unset-metadata "gc.routed_to" -q 2>/dev/null; then
+      _pilot_dog_lend_release "$_id" "$_store" "$_route"
+      _PDL_WHY="route-unset-failed"; return 1
+    fi
+  fi
+  # 3. sling a gastown.dog
+  _pilot_dog_lend_prompt "$_id" "$_title" "$_prio" "$_pool" "$_rig" "$_store" "$_type"
+  _max="${PILOT_DOG_LEND_SLING_ATTEMPTS:-2}"; case "$_max" in ''|*[!0-9]*|0) _max=2 ;; esac
+  _sleep="${PILOT_INFLIGHT_SLEEP:-2}"; case "$_sleep" in ''|*[!0-9]*) _sleep=2 ;; esac
+  # vazio (sem id na saída) → tenta de novo, depois procura a bead-gancho que o sling pode ter criado mesmo sem devolver o id (mesmo guard do despacho normal, ga-6psx5); falhou (gc, jq) → idem.
+  _t0=$(date -u -r "$(( _ts - 2 ))" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null) || _t0=""
+  while [ "$_try" -lt "$_max" ]; do
+    _try=$((_try + 1))
+    _out=$(printf '%s\n%s\n' "$_PDL_TITLE" "$_PDL_TASK" | gc --city "$GC_CITY" sling gastown.dog --stdin --json 2>/dev/null || echo "{}")
+    _wrap=$(printf '%s' "$_out" | jq -r '.bead_id // .id // empty' 2>/dev/null) || _wrap=""
+    [ -n "$_wrap" ] && break
+    if [ -n "$_t0" ]; then
+      _orph=$(bd -C "$GC_CITY" list --status open,in_progress --created-after "$_t0" --title "$_PDL_TITLE" --json --limit 5 2>/dev/null \
+        | jq -r --arg t "$_PDL_TITLE" '[.[] | select(.title == $t)] | sort_by(.created_at) | reverse | .[0].id // empty' 2>/dev/null) || _orph=""
+      if [ -n "$_orph" ] && [ "$_orph" != "null" ]; then _wrap="$_orph"; log "dog-lend: sling attempt $_try/$_max for $_id returned no bead_id but hook bead $_orph already exists — adopting it, not minting a duplicate"; break; fi
+    fi
+    [ "$_try" -lt "$_max" ] && [ "$_sleep" -gt 0 ] && sleep "$_sleep"
+  done
+  if [ -z "$_wrap" ]; then
+    _pilot_dog_lend_release "$_id" "$_store" "$_route"
+    _PDL_WHY="sling-no-bead-id"; return 1
+  fi
+  _ok=0
+  for _i in 1 2 3; do
+    if bd -C "$GC_CITY" show "$_wrap" --json 2>/dev/null | jq -e 'if type == "array" then .[0].id else .id end' >/dev/null 2>&1; then _ok=1; break; fi
+    [ "$_i" -lt 3 ] && [ "$_sleep" -gt 0 ] && sleep "$_sleep"
+  done
+  if [ "$_ok" != 1 ]; then
+    _pilot_dog_lend_release "$_id" "$_store" "$_route"
+    _PDL_WHY="sling-phantom-bead($_wrap)"; return 1
+  fi
+  # a partir daqui o dog está de posse do gancho: nada mais se desfaz
+  bd -C "$GC_CITY" update "$_wrap" --set-metadata "pilot.sling_for=$_id" -q 2>/dev/null || true
+  bd -C "$_store" update "$_id" --set-metadata "pilot.sling_bead=$_wrap" -q 2>/dev/null || true
+  # vazio/falhou (classify_lane sem saída) → small: a etiqueta de pista só alimenta a contagem de in-flight por pista
+  _lane=$(classify_lane "$_json" 2>/dev/null) || _lane=""
+  case "$_lane" in small|big) ;; *) _lane=small ;; esac
+  _tries="${PILOT_INFLIGHT_RETRIES:-5}"; case "$_tries" in ''|*[!0-9]*|0) _tries=5 ;; esac
+  _ok=0
+  for _i in $(seq 1 "$_tries"); do
+    bd -C "$_store" label add "$_id" "lane:${_lane}" -q 2>/dev/null || true
+    if bd -C "$_store" show "$_id" --json 2>/dev/null | jq -e --arg l "lane:${_lane}" 'if type == "array" then .[0] else . end | (.labels // []) | any(.[]; . == $l)' >/dev/null 2>&1; then _ok=1; break; fi
+    [ "$_i" -lt "$_tries" ] && [ "$_sleep" -gt 0 ] && sleep "$_sleep"
+  done
+  [ "$_ok" = 1 ] || warn "dog-lend: lane:${_lane} write UNCONFIRMED on $_id (hook bead $_wrap already slung) — the unclassified_lane residual will show it"
+  _ok=0
+  for _i in $(seq 1 "$_tries"); do
+    bd -C "$_store" label add "$_id" "story:in-flight" -q 2>/dev/null || true
+    if bd -C "$_store" show "$_id" --json 2>/dev/null | jq -e 'if type == "array" then .[0] else . end | (.labels // []) | any(.[]; . == "story:in-flight")' >/dev/null 2>&1; then _ok=1; break; fi
+    [ "$_i" -lt "$_tries" ] && [ "$_sleep" -gt 0 ] && sleep "$_sleep"
+  done
+  if [ "$_ok" != 1 ]; then
+    # sem in-flight confirmado a bead continuaria re-despachável: a claim FICA (a recuperação por TTL é a dona dela) e a falha aparece
+    err "dog-lend: inflight-unconfirmed on $_id after ${_tries} attempts (hook bead $_wrap already slung to gastown.dog) — leaving pilot:dispatching ON for TTL recovery"
+    _PDL_WHY="inflight-unconfirmed (hook $_wrap)"; return 1
+  fi
+  bd -C "$_store" label remove "$_id" "pilot:dispatching" -q 2>/dev/null || true
+  bd -C "$_store" label add    "$_id" "pilot:dispatched"  -q 2>/dev/null || true
+  bd -C "$_store" update "$_id" --set-metadata "pilot.dispatched_at=$(date +%s)" -q 2>/dev/null || true
+  bd -C "$_store" update "$_id" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+  bd -C "$_store" comment "$_id" "Pilot lent this P${_prio} to a gastown.dog (pool ${_pool} ${_PDL_POOL_LIVE:-?}/${_PDL_POOL_MAX:-?} FULL; ga-hfx1kou). Hook bead in HQ: ${_wrap}. The dog works in a worktree of ${_rig:-the rig} (${_store}), reads that rig's CLAUDE.md first, pushes and runs /gate-done from there. Node verdict: ${_PDL_VERDICT:-n/a}." 2>/dev/null \
+    || warn "dog-lend: could not post the dispatch comment to $_id"
+  # o ga-hpc1x do despacho normal: um dog vivo pode receber o nudge direto, então a bead-gancho não pode parecer demanda de pool livre até lá
+  if _pilot_pool_target_has_live_session gastown.dog; then _pilot_suppress_reused_sling "$GC_CITY" "$_wrap"; fi
+  timeout "${PILOT_NODE_NUDGE_TIMEOUT:-60}" gc --city "$GC_CITY" session nudge gastown.dog "$_PDL_TASK" >/dev/null 2>&1 \
+    || { warn "dog-lend: could not nudge gastown.dog — un-suppressing hook bead $_wrap so it stays bd-ready-visible"; _pilot_unsuppress_sling "$GC_CITY" "$_wrap"; }
+  if [ -n "${PILOT_LOG:-}" ]; then
+    jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg id "$_id" --arg pool "$_pool" --arg rig "${_rig:-}" --arg wrap "$_wrap" --arg v "${_PDL_VERDICT:-}" --arg p "$_prio" \
+      '{ts:$ts,event:"pilot_dog_lend",story_id:$id,pool:$pool,rig:$rig,sling_bead:$wrap,node_verdict:$v,priority:$p,target:"gastown.dog"}' >> "$PILOT_LOG" 2>/dev/null || true
+  fi
+  _PDL_WRAP="$_wrap"
+  return 0
+}
+_PDL_WRAP=""
+
+# _pilot_dog_lend_pass — a passada. Sempre devolve 0 (o `|| true` do chamador é só o cinto). Cada decisão vira uma linha "dog-lend: LENT|SKIP|SKIP-REST|FAILED|SHADOW|DRY-RUN …" — é o que o grep das 24 h lê.
+# Ordem por bead: loja do rig → veto (com o JSON do varrimento, barato) → pool cheio → vaga de dog → mini → releitura + veto de novo (os candidatos são do início da varredura e as pistas acabaram de
+# despachar) → veredito de nó (WA) → empresta. Corta quando acaba o teto da varredura. Dog sem vaga, contagem ilegível e mini apertado valem para TODAS as seguintes: cortam o laço.
+_pilot_dog_lend_pass() {
+  local _mode _cands _ordered _row _id _v _fresh _rc _considered=0 _seen=0 _max _maxc _skipped_other=0
+  _mode=$(_pilot_dog_lend_mode)
+  case "${PILOT_DOG_LEND:-}" in ''|on|1|shadow|off|0) ;; *) warn "dog-lend: PILOT_DOG_LEND='${PILOT_DOG_LEND}' is not on/shadow/off — the pass stays OFF (only an explicit on, or nothing, turns it on)" ;; esac
+  [ "$_mode" != off ] || return 0
+  _PDL_LENT=0; _PDL_WHY=""; _PDL_DOG_LIVE=""; _PDL_WRAP=""
+  if [ "${_PILOT_NODE_ONLY:-0}" = "1" ]; then log "dog-lend: SKIP-ALL node-only sweep (the mini is short on disk/memory)"; return 0; fi
+  if [ "${PILOT_GATE_FOCUS:-0}" = "1" ]; then log "dog-lend: SKIP-ALL gate focus mode is ON (the pools are clamped on purpose; new work is not lent either)"; return 0; fi
+  if [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ]; then log "dog-lend: SKIP-ALL Dolt was saturated/unreadable at the start of the sweep"; return 0; fi
+  if _pilot_dispatch_should_stop; then log "dog-lend: SKIP-ALL the dispatch phase was halted this sweep"; return 0; fi
+  _max="${PILOT_DOG_LEND_MAX_PER_SWEEP:-2}"; case "$_max" in ''|*[!0-9]*) _max=2 ;; esac
+  _maxc="${PILOT_DOG_LEND_MAX_CONSIDER:-6}"; case "$_maxc" in ''|*[!0-9]*) _maxc=6 ;; esac
+  # vazio ([] — nenhum candidato P0/P1 aprovado) → nada a fazer, em silêncio; falhou/ilegível (candidatos que não são JSON, ordenação que falha) → avisa e NÃO empresta
+  if ! _cands=$(jq -cn --argjson a "${SMALL_CANDIDATES:-[]}" --argjson b "${BIG_CANDIDATES:-[]}" '
+      def pri: (.priority | if type == "number" then . elif type == "string" then (sub("^[Pp]"; "") | (try tonumber catch 99)) else 99 end);
+      ($a + $b) | map(select(type == "object" and pri <= 1 and ((.labels // []) | any(.[]; . == "story:approved")))) | unique_by(.id)' 2>/dev/null); then
+    warn "dog-lend: the sweep's candidate lists are not readable JSON — nothing lent this sweep"; return 0
+  fi
+  [ "$_cands" != "[]" ] || return 0
+  if ! _ordered=$(_pilot_order_pool "$_cands") || [ -z "$_ordered" ]; then warn "dog-lend: could not order the P0/P1 candidates (work-order unreadable) — nothing lent this sweep"; return 0; fi
+  while IFS= read -r _row; do
+    [ -n "$_row" ] || continue
+    _id=$(printf '%s' "$_row" | jq -r '.id // empty' 2>/dev/null) || _id=""
+    [ -n "$_id" ] || continue
+    _seen=$((_seen + 1))
+    [ "$_PDL_LENT" -lt "$_max" ] || { log "dog-lend: SKIP-REST per-sweep cap reached ($_PDL_LENT/$_max)"; break; }
+    if ! _pilot_dog_lend_pool_of "$_id"; then _skipped_other=$((_skipped_other + 1)); [ "$_PDL_WHY" = "store-unknown" ] && log "dog-lend: SKIP $_id store-unknown (cannot tell which store it lives in)"; continue; fi
+    _v=$(_pilot_dog_lend_veto "$_row")
+    if [ "$_v" != ok ]; then log "dog-lend: SKIP $_id veto $_v"; continue; fi
+    _rc=0; _pilot_dog_lend_pool_full "$_PDL_POOL" || _rc=$?
+    if [ "$_rc" = 2 ]; then log "dog-lend: SKIP $_id ${_PDL_WHY} (pool $_PDL_POOL)"; continue; fi
+    [ "$_rc" = 0 ] || continue
+    _rc=0; _pilot_dog_lend_dog_free || _rc=$?
+    if [ "$_rc" != 0 ]; then log "dog-lend: SKIP-REST ${_PDL_WHY/no-free-dog/no free dog} (dogs live=${_PDL_DOG_LIVE:-?} lent=$_PDL_LENT max=${PILOT_DOG_LEND_DOG_MAX:-3})"; break; fi
+    if ! _pilot_dog_lend_mini_ok; then log "dog-lend: SKIP-REST mini not ok — $_PDL_WHY"; break; fi
+    _considered=$((_considered + 1))
+    if [ "$_considered" -gt "$_maxc" ]; then log "dog-lend: SKIP-REST consideration cap reached ($_maxc probes this sweep)"; break; fi
+    if ! _fresh=$(_pilot_dog_lend_reread "$_id" "$_PDL_ROOT"); then log "dog-lend: SKIP $_id re-read failed (the sweep's copy may be stale — never lent on it)"; continue; fi
+    _v=$(_pilot_dog_lend_veto "$_fresh")
+    if [ "$_v" != ok ]; then log "dog-lend: SKIP $_id veto-on-fresh-read $_v"; continue; fi
+    _PDL_VERDICT=""
+    if [ "$_PDL_POOL" = wa-worker ]; then
+      if ! _pilot_dog_lend_node_gate "$_id" "$_PDL_ROOT"; then log "dog-lend: SKIP $_id $_PDL_WHY (verdict=${_PDL_VERDICT:-?})"; continue; fi
+    fi
+    if _pilot_dog_lend_one "$_fresh"; then
+      _PDL_LENT=$((_PDL_LENT + 1))
+      if [ "$_mode" = on ] && [ "${DRY_RUN:-0}" != "1" ]; then
+        log "dog-lend: LENT $_id → gastown.dog (pool=$_PDL_POOL ${_PDL_POOL_LIVE:-?}/${_PDL_POOL_MAX:-?} rig=${_PDL_RIG:-?} hook=${_PDL_WRAP:-?} verdict=${_PDL_VERDICT:-n/a})"
+      fi
+    else
+      log "dog-lend: FAILED $_id ${_PDL_WHY:-?} (nothing left half-done except what the reason says)"
+    fi
+  done < <(printf '%s' "$_ordered" | jq -c '.[]' 2>/dev/null)
+  log "dog-lend: pass done mode=$_mode seen=$_seen lent=$_PDL_LENT not-in-a-pool-rig=$_skipped_other"
+  return 0
+}
+
 # ga-2hd02v.9: a passada de WA no nó roda UMA vez, antes das pistas, e (modo on) tira da pista o que ficou com o nó. Padrão off. Nunca derruba a varredura (devolve sempre 0; o `|| true` é a rede de segurança do set -e).
 # ga-do1ixn.3: a faixa Kimi roda ANTES: tira das pistas toda bead lane:kimi (nenhuma chega ao laço normal nem à passada de WA) e leva no máximo uma ao kimi-worker-remote. Sempre devolve 0.
 _pilot_kimi_lane_pass || true
@@ -17226,6 +17628,10 @@ fi
 if [ "$BIG_SLOTS" -gt "0" ] && [ "$BIG_COUNT" -gt "0" ]; then
   dispatch_lane "big" "$BIG_CANDIDATES" "$BIG_SLOTS"
 fi
+
+# ga-hfx1kou: DEPOIS das duas pistas, o que o caminho normal não despachou e é P0/P1 aprovada de um rig com pool CHEIO pode ir a um dog do mini (PILOT_DOG_LEND, padrão on). Só roda quando a varredura chega
+# até aqui: com as DUAS pistas cheias o Pilot sai antes de varrer candidatos ("Both lanes full … backing off") e não há lista para emprestar. Sempre devolve 0; o `|| true` é a rede de segurança do set -e.
+_pilot_dog_lend_pass || true
 
 # ── Step 4b: REMOVED (ga-9t9acg.2) ────────────────────────────────────────────
 # It rescanned the rig DBs when the HQ pool was non-empty but dispatched=0 (ga-y1m40: every HQ candidate vetoed,

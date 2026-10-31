@@ -126,6 +126,7 @@ run_site() {
     _pilot_unsuppress_sling() { echo unsup >> "$run/unsup"; }
     GC_CITY="$run/city"; _SLING_TARGET=crew; DISPATCH_TASK=tarefa; _DISPATCH_SESS_REF=ref; SLING_BEAD_ID=b-1
     _nd_alias=a; _nd_msg=m; _nd_rc=0; _kd_alias=a; _kd_msg=m; _kd_rc=0; _ro_alias=a; _ro_msg=m; _ro_rc=0
+    _PDL_TASK=tarefa; _wrap=b-w   # ga-hfx1kou.2: o ponto de aviso do empréstimo ao dog (_pilot_dog_lend_one)
     eval "$stmt"
   ) > "$run/out" 2>&1
 }
