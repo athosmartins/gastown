@@ -40,7 +40,7 @@ for _f in _pilot_mbp_stamped_pre _pilot_mbp_stamped_gate _pilot_mbp_stamped_chec
   FNS="$FNS"$'\n'"$_b"
 done
 # as declarações REAIS dos globais do passo (um global sem declaração quebra em `set -u`, como no despachante)
-INIT_G="$(grep -E '^(_PMS_[A-Z_]+|_PILOT_WA_MBP_PASS|_PMN_APPLY_RC|_PWP_LAST_STOP|_PWP_MODE|_PWP_MEMO_V|_PWP_ADOPTED)=' "$DISPATCHER")"
+INIT_G="$(grep -E '^(_PMS_[A-Z_]+|_PILOT_WA_MBP_PASS|_PMN_APPLY_RC|_PWP_LAST_STOP|_PWP_NODE_BOUND|_PWP_MODE|_PWP_MEMO_V|_PWP_ADOPTED)=' "$DISPATCHER")"
 [ -n "$INIT_G" ] || { echo "FATAL: os globais do passo (_PMS_*) não estão declarados em $DISPATCHER" >&2; exit 2; }
 # os trechos REAIS de dispatch_lane e dispatch_one
 YREG="$(awk 'f==0 && $0=="  _PNY_EXEMPT_THIS=0" {f=1; next} f==1 {print} f==1 && /^  fi$/ {exit}' "$DISPATCHER")"
@@ -290,17 +290,48 @@ reset; r=$(P 'null'); eq "candidata null: não é bead de WA" "$r" "rc=1 why=not
 reset; r=$(FAKE_VETO=node:never P "$BASE"); eq "rótulo de veto do nó-primeiro: não oferece, sem check" "$r $(ncalls)" "rc=1 why=veto:node:never stop= probes=0 0"
 reset; r=$(P "$(sb $ID "" wa-worker "story:approved,node:mini")"); eq "rótulo node:mini: não oferece, sem check" "$r $(ncalls)" "rc=1 why=node:mini stop= probes=0 0"
 reset; r=$(P "$(sb $ID "" wa-worker "story:approved,node:ok")"); eq "rótulo node:ok sem a passada do Hetzner ligada: oferece (a regra não se aplica)" "$r" "rc=0 why= stop= probes=1"
-# Hetzner primeiro
+# Hetzner primeiro (ga-2hd02v.3.25): a regra SÓ segura a bead que a passada JULGOU node nesta varredura e não despachou (_PWP_NODE_BOUND); o resto vai ao `check` do MBP.
+# Antes a regra segurava TODA WA em rota auto sempre que a parada não era capacity|keep-limit (31/10: 222 de 227 puladas por hetzner-first, offered=0).
 OKB="$(sb $ID "" wa-worker "story:approved,node:ok")"
-for spec in '|hetzner-first' 'end|hetzner-first' 'max-fails|hetzner-first' 'budget-probes|hetzner-first' 'capacity|ok' 'keep-limit|ok'; do
-  reset; r=$(PILOT_WA_NODE_ROUTE=label PRE="_PWP_MODE=on; _PWP_LAST_STOP='${spec%|*}'" P "$OKB" | cut -d' ' -f1,2)
-  case "${spec#*|}" in ok) eq "Hetzner ligado (rota label), bead node:ok, a passada parou em '${spec%|*}': o nó está cheio, o MBP pode" "$r" "rc=0 why=" ;; *) eq "Hetzner ligado (rota label), bead node:ok, a passada parou em '${spec%|*}': fica para o Hetzner" "$r" "rc=1 why=hetzner-first" ;; esac
+BND=" $ID"   # o conjunto da varredura, no formato que a passada grava: cada id com um espaço na frente
+STOPS_ABERTAS='|end|max-fails|budget-probes|budget-secs|hook-held|should-stop|dolt-saturated|check-missing'
+# (a) bead JULGADA node e retida: fica para o Hetzner, qualquer que seja a parada (menos nó cheio)
+for st in ${STOPS_ABERTAS//|/ }; do
+  reset; r=$(PILOT_WA_NODE_ROUTE=label PRE="_PWP_MODE=on; _PWP_LAST_STOP='$st'; _PWP_NODE_BOUND='$BND'" P "$OKB" | cut -d' ' -f1,2); eq "rota label, node:ok, NO conjunto do nó, a passada parou em '$st': fica para o Hetzner" "$r" "rc=1 why=hetzner-first"
 done
-reset; r=$(PILOT_WA_NODE_ROUTE=label PRE='_PWP_MODE=on; _PWP_LAST_STOP=""' P "$BASE" | cut -d' ' -f1,2); eq "Hetzner ligado (rota label), bead SEM node:ok: não é dele, o MBP pode" "$r" "rc=0 why="
-reset; r=$(PILOT_WA_NODE_ROUTE=auto PRE='_PWP_MODE=on; _PWP_LAST_STOP=""' P "$BASE" | cut -d' ' -f1,2); eq "Hetzner ligado (rota auto): qualquer WA é dele primeiro" "$r" "rc=1 why=hetzner-first"
-reset; r=$(PILOT_WA_NODE_ROUTE=auto PRE='_PWP_MODE=on; _PWP_LAST_STOP=capacity' P "$BASE" | cut -d' ' -f1,2); eq "...rota auto e o nó cheio (capacity): o MBP pode" "$r" "rc=0 why="
-for rt in "" off shadow xx; do reset; r=$(PILOT_WA_NODE_ROUTE="$rt" PRE='_PWP_MODE=on; _PWP_LAST_STOP=""' P "$OKB" | cut -d' ' -f1,2); eq "passada ligada mas rota '$rt' (a passada não leva bead): a regra não se aplica" "$r" "rc=0 why="; done
-for pm in off shadow; do reset; r=$(PILOT_WA_NODE_ROUTE=auto PRE="_PWP_MODE=$pm; _PWP_LAST_STOP=''" P "$OKB" | cut -d' ' -f1,2); eq "passada do Hetzner em '$pm': não leva bead, o MBP pode" "$r" "rc=0 why="; done
+reset; r=$(PILOT_WA_NODE_ROUTE=label PRE="_PWP_MODE=on; _PWP_LAST_STOP=''; _PWP_NODE_BOUND='$BND'" P "$OKB" | cut -d' ' -f1,2); eq "rota label, node:ok, NO conjunto do nó, parada vazia (fim da lista): fica para o Hetzner" "$r" "rc=1 why=hetzner-first"
+reset; r=$(PILOT_WA_NODE_ROUTE=auto PRE="_PWP_MODE=on; _PWP_LAST_STOP=budget-secs; _PWP_NODE_BOUND='$BND'" P "$BASE" | cut -d' ' -f1,2); eq "rota auto, NO conjunto do nó (veredito node que a passada não despachou), parada budget-secs: fica para o Hetzner" "$r" "rc=1 why=hetzner-first"
+for st in capacity keep-limit; do
+  reset; r=$(PILOT_WA_NODE_ROUTE=label PRE="_PWP_MODE=on; _PWP_LAST_STOP='$st'; _PWP_NODE_BOUND='$BND'" P "$OKB" | cut -d' ' -f1,2); eq "rota label, node:ok, NO conjunto, a passada parou em '$st': o nó está cheio, o MBP pode" "$r" "rc=0 why="
+  reset; r=$(PILOT_WA_NODE_ROUTE=auto PRE="_PWP_MODE=on; _PWP_LAST_STOP='$st'; _PWP_NODE_BOUND='$BND'" P "$BASE" | cut -d' ' -f1,2); eq "rota auto, NO conjunto, a passada parou em '$st': o nó está cheio, o MBP pode" "$r" "rc=0 why="
+done
+# (b) bead que a passada NÃO julgou node (não consta no conjunto): vai ao check do MBP, qualquer que seja a parada — é o bug da bead ga-2hd02v.3.25
+for st in '' ${STOPS_ABERTAS//|/ } capacity keep-limit; do
+  reset; r=$(PILOT_WA_NODE_ROUTE=auto PRE="_PWP_MODE=on; _PWP_LAST_STOP='$st'" P "$BASE" | cut -d' ' -f1,2); eq "rota auto, FORA do conjunto do nó, a passada parou em '${st:-vazio}': a bead vai ao check do MBP" "$r" "rc=0 why="
+  reset; r=$(PILOT_WA_NODE_ROUTE=label PRE="_PWP_MODE=on; _PWP_LAST_STOP='$st'" P "$OKB" | cut -d' ' -f1,2); eq "rota label, node:ok, FORA do conjunto do nó, a passada parou em '${st:-vazio}': a bead vai ao check do MBP" "$r" "rc=0 why="
+done
+# a aceitação 1: veredito `unknown`/`mini`/`released` na memória do nó (chave sem mbp:), a passada parou por orçamento: a bead é OFERECIDA ao MBP e o check roda
+for v in unknown mini released; do
+  for st in budget-secs budget-probes max-fails hook-held; do
+    reset; memo_put "$ID" "$UPD" $v; r=$(PILOT_WA_NODE_ROUTE=auto PRE="_PWP_MODE=on; _PWP_LAST_STOP='$st'" P "$BASE" | cut -d' ' -f1,2); eq "memória do nó '$v' (chave sem mbp:), rota auto, parada '$st': oferece ao MBP" "$r $(ncalls)" "rc=0 why= 1"
+  done
+done
+# memória do nó ilegível ou de outro updated_at: NÃO é «node» nem «mini» por chute — não segura a bead, o check do MBP decide
+reset; printf 'lixo sem tabulacao\n\t\t\t\n' > "$MEMO"; r=$(PILOT_WA_NODE_ROUTE=auto PRE='_PWP_MODE=on; _PWP_LAST_STOP=budget-secs' P "$BASE" | cut -d' ' -f1,2); eq "memória do nó ilegível (lixo no TSV), parada budget-secs: não segura, o check do MBP decide" "$r $(ncalls)" "rc=0 why= 1"
+reset; memo_put "$ID" "2026-10-24T00:00:00Z" unknown; r=$(PILOT_WA_NODE_ROUTE=auto PRE='_PWP_MODE=on; _PWP_LAST_STOP=budget-secs' P "$BASE" | cut -d' ' -f1,2); eq "memória do nó de OUTRO updated_at: não segura, o check do MBP decide" "$r $(ncalls)" "rc=0 why= 1"
+# o conjunto casa por id INTEIRO (espaço dos dois lados): vizinhos de prefixo/sufixo não seguram a bead; vários ids no conjunto, ela no meio, seguram
+for nb in " wa-abc1" " wa-abc123" " xwa-abc12" " wa-abc12x" " wa-abc1 wa-abc123" ""; do
+  reset; r=$(PILOT_WA_NODE_ROUTE=auto PRE="_PWP_MODE=on; _PWP_LAST_STOP=budget-secs; _PWP_NODE_BOUND='$nb'" P "$BASE" | cut -d' ' -f1,2); eq "conjunto do nó '$nb' (ids vizinhos, nunca o inteiro): a bead não fica retida" "$r" "rc=0 why="
+done
+for nb in " wa-zzz $ID" " wa-zzz $ID wa-yyy" " $ID wa-yyy"; do
+  reset; r=$(PILOT_WA_NODE_ROUTE=auto PRE="_PWP_MODE=on; _PWP_LAST_STOP=budget-secs; _PWP_NODE_BOUND='$nb'" P "$BASE" | cut -d' ' -f1,2); eq "conjunto do nó '$nb' (o id inteiro no meio/fim/começo): a bead fica para o Hetzner" "$r" "rc=1 why=hetzner-first"
+done
+# a rota label só retém a de node:ok: a bead sem node:ok, mesmo no conjunto, é do MBP; passada desligada/shadow ou rota que não leva bead: a regra não se aplica
+reset; r=$(PILOT_WA_NODE_ROUTE=label PRE="_PWP_MODE=on; _PWP_LAST_STOP=budget-secs; _PWP_NODE_BOUND='$BND'" P "$BASE" | cut -d' ' -f1,2); eq "Hetzner ligado (rota label), bead SEM node:ok (mesmo no conjunto): não é dele, o MBP pode" "$r" "rc=0 why="
+for rt in "" off shadow xx; do reset; r=$(PILOT_WA_NODE_ROUTE="$rt" PRE="_PWP_MODE=on; _PWP_LAST_STOP=budget-secs; _PWP_NODE_BOUND='$BND'" P "$OKB" | cut -d' ' -f1,2); eq "passada ligada mas rota '$rt' (a passada não leva bead), bead no conjunto: a regra não se aplica" "$r" "rc=0 why="; done
+for pm in off shadow; do reset; r=$(PILOT_WA_NODE_ROUTE=auto PRE="_PWP_MODE=$pm; _PWP_LAST_STOP=''; _PWP_NODE_BOUND='$BND'" P "$OKB" | cut -d' ' -f1,2); eq "passada do Hetzner em '$pm', bead no conjunto: não leva bead, o MBP pode" "$r" "rc=0 why="; done
+# o conjunto não declarado (variável ausente) não derruba o passo sob set -u
+reset; r=$(PILOT_WA_NODE_ROUTE=auto PRE='_PWP_MODE=on; _PWP_LAST_STOP=budget-secs; unset _PWP_NODE_BOUND' P "$BASE" | cut -d' ' -f1,2); eq "conjunto do nó nem declarado (unset), set -u: não segura e não aborta" "$r" "rc=0 why="
 # orçamentos
 reset; r=$(PRE='_PMS_TAKEN=2' P "$BASE"); eq "levou os 2 do teto (padrão 2): para a varredura" "$r $(ncalls)" "rc=1 why=taken-limit stop=taken-limit probes=0 0"
 reset; r=$(PRE='_PMS_TAKEN=1' P "$BASE" | cut -d' ' -f1); eq "levou 1 de 2: ainda oferece" "$r" "rc=0"
@@ -582,6 +613,15 @@ p1=$(lnof '_pilot_mbp_stamped_pre "$pick"'); y1=$(lnof '_pilot_priority_pool_bou
 eq "o passo é chamado em UM lugar de dispatch_lane" "$(grep -cF -- '_pilot_mbp_stamped_pre "$pick"' "$DISPATCHER")" "1"
 # a passada de WA no nó deixa o motivo da parada
 eq "a passada de WA no nó zera o motivo da parada na entrada e o grava antes do resumo" "$(awk '/^_pilot_wa_node_pass\(\)/{f=1} f&&/^  _PWP_LAST_STOP=""$/{a++} f&&/^  _PWP_LAST_STOP="\$\{_pw_stop:-\}"$/{b++} f&&/^}$/{exit} END{print a+0 "," b+0}' "$DISPATCHER")" "1,1"
+# ga-2hd02v.3.25: o conjunto das beads que a passada julgou node e NÃO despachou (_PWP_NODE_BOUND) — zera na entrada e cresce em 3 pontos, cada um com a guarda do id. O comportamento está em pilot-dispatcher.wa-node-pass.selftest.sh (a passada real); aqui a forma, para os mutantes.
+PASS_SRC="$(awk '/^_pilot_wa_node_pass\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+nb_reset=$(printf '%s\n' "$PASS_SRC" | grep -n '^  _PWP_NODE_BOUND=""$' | cut -d: -f1 | head -1); nb_mode=$(printf '%s\n' "$PASS_SRC" | grep -n '^  _pilot_wa_node_pass_mode$' | cut -d: -f1 | head -1)
+eq "a passada zera o conjunto do nó UMA vez, na entrada, antes de qualquer saída (antes de ler o modo)" "$(printf '%s\n' "$PASS_SRC" | grep -c '^  _PWP_NODE_BOUND=""$') $([ -n "$nb_reset" ] && [ -n "$nb_mode" ] && [ "$nb_reset" -lt "$nb_mode" ] && echo antes || echo depois)" "1 antes"
+eq "a passada acrescenta ao conjunto do nó em exatamente 3 pontos" "$(printf '%s\n' "$PASS_SRC" | grep -cF '_PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id"')" "3"
+eq "...cada acréscimo atrás da guarda do id (id fora de [A-Za-z0-9._-] não entra)" "$(printf '%s\n' "$PASS_SRC" | grep -cF 'case "$_pw_id" in *[!A-Za-z0-9._-]*) ;; *) _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id" ;; esac')" "3"
+eq "...um na retenção do waiter da cessão (veredito node retido)" "$(printf '%s\n' "$PASS_SRC" | grep -c '_pw_held=\$((_pw_held + 1)); case .* _PWP_NODE_BOUND=.*; continue ;;')" "1"
+eq "...um no Dolt saturado, antes do break (veredito node sem escrita)" "$(printf '%s\n' "$PASS_SRC" | grep -c '_PWP_NODE_BOUND=.*; _pw_stop="dolt-saturated"; break; fi')" "1"
+eq "...um no rc do apply fora da tabela (a escrita pode ter acontecido), antes do break" "$(printf '%s\n' "$PASS_SRC" | grep -c '_PWP_NODE_BOUND=.*; _pw_stop="hook-held"; break ;;')" "1"
 # ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
 echo; echo "=== F. o caminho inteiro: lane → claim → adoção → apply → sessão ==="
 # O trecho REAL de dispatch_lane (pré + pulos + bandeira), um dispatch_one cujo miolo é o trecho REAL do yield e do gancho, e as funções REAIS (pré, adoção, gancho, abertura da sessão, contabilidade) com bd, gc e
@@ -847,9 +887,14 @@ mut pre-json-ruim-livre  $PRE_ "2>/dev/null) || { _PMS_WHY=\"unreadable\"; retur
 mut pre-sem-veto         $PRE_ '[ -z "$_sp_veto" ] || { _PMS_WHY="veto:$_sp_veto"; return 1; }' ':'
 mut pre-sem-node-mini    $PRE_ '*,node:mini,*) _PMS_WHY="node:mini"; return 1 ;;' '*,node:mini-x,*) _PMS_WHY="node:mini"; return 1 ;;'
 mut pre-hetzner-nao      $PRE_ 'if [ "${_PWP_MODE:-off}" = on ]; then' 'if false; then'
-mut pre-hetzner-sem-capacity $PRE_ 'capacity|keep-limit) ;; *) _PMS_WHY="hetzner-first"; return 1 ;; esac' 'keep-limit) ;; *) _PMS_WHY="hetzner-first"; return 1 ;; esac'
-mut pre-hetzner-sem-keep $PRE_ 'capacity|keep-limit) ;; *) _PMS_WHY="hetzner-first"; return 1 ;; esac' 'capacity) ;; *) _PMS_WHY="hetzner-first"; return 1 ;; esac'
-mut pre-hetzner-qualquer-parada $PRE_ 'capacity|keep-limit) ;; *) _PMS_WHY="hetzner-first"; return 1 ;; esac' '*) ;; esac'
+mut pre-hetzner-sem-capacity $PRE_ '        capacity|keep-limit) ;;' '        keep-limit) ;;'
+mut pre-hetzner-sem-keep $PRE_ '        capacity|keep-limit) ;;' '        capacity) ;;'
+mut pre-hetzner-qualquer-parada $PRE_ '        capacity|keep-limit) ;;' '        *) ;;'
+mut pre-hetzner-segura-tudo $PRE_ 'case "${_PWP_NODE_BOUND:-} " in *" $_sp_id "*)' 'case "${_PWP_NODE_BOUND:-} " in *)'
+mut pre-hetzner-id-por-prefixo $PRE_ '*" $_sp_id "*) _PMS_WHY="hetzner-first"' '*"$_sp_id"*) _PMS_WHY="hetzner-first"'
+mut pre-hetzner-conjunto-sem-fim $PRE_ 'case "${_PWP_NODE_BOUND:-} " in' 'case "${_PWP_NODE_BOUND:-}" in'
+mut pre-hetzner-conjunto-sem-padrao $PRE_ 'case "${_PWP_NODE_BOUND:-} " in' 'case "$_PWP_NODE_BOUND " in'
+mut pre-hetzner-conjunto-ignorado $PRE_ '*" $_sp_id "*) _PMS_WHY="hetzner-first"; return 1 ;; esac ;;' '*" $_sp_id "*) : ;; esac ;;'
 mut pre-hetzner-auto-nao $PRE_ 'auto) _sp_h=1 ;;' 'auto) ;;'
 mut pre-hetzner-label-todos $PRE_ 'label) case ",$_sp_labels," in *,node:ok,*) _sp_h=1 ;; esac ;;' 'label) _sp_h=1 ;;'
 mut pre-sem-teto-levadas $PRE_ 'if [ "${_PMS_TAKEN:-0}" -ge "$_sp_max" ]; then' 'if false; then'
@@ -1016,5 +1061,15 @@ mut um-rc2-devolve       - 'elif [ "$_RP_MBP_RC" = 2 ]; then
 mut parada-nao-zera      - '  _PWP_LAST_STOP=""
 ' ''
 mut parada-nao-grava     - '  _PWP_LAST_STOP="${_pw_stop:-}"' '  :'
+# ── o conjunto de beads julgadas node que a passada não despachou (ga-2hd02v.3.25)
+mut conjunto-nao-zera    _pilot_wa_node_pass '  _PWP_NODE_BOUND=""
+' ''
+mut conjunto-zera-depois _pilot_wa_node_pass '  _PWP_NODE_BOUND=""
+  _pilot_wa_node_pass_mode' '  _pilot_wa_node_pass_mode
+  _PWP_NODE_BOUND=""'
+mut conjunto-retida-nao-grava _pilot_wa_node_pass '_pw_held=$((_pw_held + 1)); case "$_pw_id" in *[!A-Za-z0-9._-]*) ;; *) _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id" ;; esac; continue ;;' '_pw_held=$((_pw_held + 1)); continue ;;'
+mut conjunto-dolt-nao-grava _pilot_wa_node_pass 'then case "$_pw_id" in *[!A-Za-z0-9._-]*) ;; *) _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id" ;; esac; _pw_stop="dolt-saturated"; break; fi' 'then _pw_stop="dolt-saturated"; break; fi'
+mut conjunto-hook-nao-grava _pilot_wa_node_pass 'case "$_pw_id" in *[!A-Za-z0-9._-]*) ;; *) _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id" ;; esac; _pw_stop="hook-held"; break ;;' '_pw_stop="hook-held"; break ;;'
+mut conjunto-sem-guarda-id _pilot_wa_node_pass 'case "$_pw_id" in *[!A-Za-z0-9._-]*) ;; *) _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id" ;; esac; continue ;;' '_PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id"; continue ;;'
 echo "---"; echo "$PASS/$((PASS+FAIL)) ok"
 [ $FAIL -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($FAIL)"; exit 1; }

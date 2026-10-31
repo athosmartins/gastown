@@ -884,6 +884,47 @@ reset; r=$(AR_NODE_ONLY=1 AR_RC=2 run_arm);  case "$r" in "rc=1 result=wa_node_u
 reset; r=$(AR_NODE_ONLY=1 AR_ADOPT=1 AR_RC=0 run_arm); [ "$r" = "rc=1 result=wa_node_pass_released NOT-CONTINUED ev=ADOPT,RELEASE wa-node-pass," ] && ok "só-nó + passada, adotar falhou: o gancho NEM é chamado — $r" || bad "arm só-nó, adotar falhou: $r"
 reset; r=$(AR_NODE_ONLY=1 AR_PASS=0 AR_RC=1 run_arm); case "$r" in "rc=1 result=disk_floor_node_only"*"ev=DECIDE,"*) ok "só-nó FORA da passada (bead de lane), gancho rc 1: continua soltando com disk_floor_node_only, sem tocar na rota — $r" ;; *) bad "arm só-nó fora da passada: $r" ;; esac
 
+echo "── (7z) ga-2hd02v.3.25: o conjunto das beads que a passada JULGOU node e NÃO despachou (_PWP_NODE_BOUND) — só estas ficam para o Hetzner; o MBP toma as demais"
+# A passada não memoriza `node` de propósito (um acerto de memória a faria PULAR a bead); então «julgada node nesta varredura» é este conjunto, e é ele que _pilot_mbp_stamped_pre lê na regra «Hetzner primeiro».
+passb() { # passb '<small json>' [big json] → "BOUND=[ids] STOP=[parada]" depois de UMA passada
+  SJ="$1" BJ="${2:-[]}" run_t 'SMALL_CANDIDATES="$SJ"; BIG_CANDIDATES="$BJ"; _pilot_wa_node_pass; echo "BOUND=[$_PWP_NODE_BOUND] STOP=[$_PWP_LAST_STOP]"'
+}
+# despachada (ficou com o nó): saiu da pista e é do nó — NÃO consta (a que não está na pista nem chega ao MBP); a mini e a n2 (parada pelo limite de 1 vaga) também não
+reset; chk wa-m1 10; chk wa-n1 0; chk wa-n2 0; setok wa-n1
+r=$(passb "$S3"); [ "$r" = "BOUND=[] STOP=[keep-limit]" ] && ok "(7z) despachada (rc 0), mini e a que o limite de vagas deixou sem sonda: conjunto vazio, parada keep-limit" || bad "(7z) despachada: $r"
+# Dolt saturado: veredito node sem escrita → a bead é do nó e consta. A unknown (m1) sondada antes NÃO consta.
+reset; chk wa-n1 0; setok wa-n1
+r=$(T_DOLT=1 passb "$S3"); [ "$r" = "BOUND=[ wa-n1] STOP=[dolt-saturated]" ] && ok "(7z) Dolt saturado agora: a node sem despacho consta (e só ela: a unknown sondada antes não)" || bad "(7z) Dolt saturado: $r"
+reset; chk wa-n1 0; setok wa-n1
+r=$(PILOT_DOLT_SATURATED_AT_START=1 passb "$S3"); [ "$r" = "BOUND=[ wa-n1] STOP=[dolt-saturated]" ] && ok "(7z) Dolt saturado NO INÍCIO da varredura: a node sem despacho consta também" || bad "(7z) Dolt saturado no início: $r"
+# apply com rc fora da tabela (a escrita pode ter acontecido): a bead consta e a passada para (hook-held); as seguintes não são sondadas e não constam
+reset; chk wa-n1 0; chk wa-n2 0; echo 1 > "$WORK/d1.rc.wa-n1"; echo 7 > "$WORK/d1.apply.wa-n1"
+r=$(passb "$S3"); [ "$r" = "BOUND=[ wa-n1] STOP=[hook-held]" ] && [ "$(d1)" = "wa-n1 small feature pass=1;" ] && ok "(7z) apply rc 7: a bead em mãos consta, a passada para em hook-held, n2 nem é sondada nem consta" || bad "(7z) hook-held: $r / $(d1)"
+# apply rc 10/11/vazio: a memória guarda mini/unknown/released e a bead segue ao MBP: NÃO consta. rc 12: nó cheio, não consta.
+reset; chk wa-m1 0; chk wa-n1 0; chk wa-n2 0; for i in wa-m1 wa-n1 wa-n2; do echo 1 > "$WORK/d1.rc.$i"; done; echo 10 > "$WORK/d1.apply.wa-m1"; echo 11 > "$WORK/d1.apply.wa-n1"
+r=$(passb "$S3"); [ "$r" = "BOUND=[] STOP=[]" ] && [ "$(memo_of)" = "wa-m1:mini,wa-n1:unknown,wa-n2:released," ] && ok "(7z) apply rc 10 / 11 / sem apply: viram memória mini/unknown/released e NÃO constam (o MBP as examina)" || bad "(7z) rc 10/11/vazio: $r / $(memo_of)"
+reset; chk wa-n1 0; echo 1 > "$WORK/d1.rc.wa-n1"; echo 12 > "$WORK/d1.apply.wa-n1"
+r=$(passb "$S3"); [ "$r" = "BOUND=[] STOP=[capacity]" ] && ok "(7z) apply rc 12 (nó cheio): a passada para em capacity e a bead NÃO consta (o nó não a leva)" || bad "(7z) rc 12: $r"
+# retida pelo waiter da cessão (P0/P1 sem veredito): as P2 com veredito node constam, na ordem; o waiter (pulado pelo pré) não
+reset; chk wa-p2a 0; chk wa-p2b 0; setok wa-p2a wa-p2b
+r=$(T_REFUSAL=FAIL T_REFUSAL_ID=wa-w1 T_WAIT=wa-w1 passb "[$W1,$P2A,$P2B]"); [ "$r" = "BOUND=[ wa-p2a wa-p2b] STOP=[]" ] && [ "$(d1)" = "-" ] && ok "(7z) retidas pelo waiter sem veredito: as duas P2 com veredito node constam (formato ' id1 id2'), nenhuma é despachada" || bad "(7z) retidas pelo waiter: $r / $(d1)"
+# SEM sondar: orçamento de segundos ou de sondas, memória, base de texto em rota label, shadow — nada disso constitui «julgada node»
+reset; chk wa-n1 0; setok wa-n1
+r=$(T_SECS=0 passb "$S3"); [ "$r" = "BOUND=[] STOP=[budget-secs]" ] && [ "$(wnd_calls)" = 0 ] && ok "(7z) orçamento de segundos esgotado antes de sondar: conjunto vazio (nada foi julgado), parada budget-secs — é o caso dos 222 de 227 de 31/10" || bad "(7z) budget-secs: $r / sondas=$(wnd_calls)"
+reset; chk wa-n1 0; setok wa-n1
+r=$(T_PROBES=1 passb "$S3"); [ "$r" = "BOUND=[] STOP=[budget-probes]" ] && ok "(7z) orçamento de sondas esgotado (1ª sonda foi a unknown): conjunto vazio, parada budget-probes" || bad "(7z) budget-probes: $r"
+reset; chk wa-n1 0; setok wa-n1; ( eval "$PRELUDE"; _pilot_wa_node_pass_memo_put wa-n1 U1 unknown ) >/dev/null 2>&1
+r=$(passb "[$(jb wa-n1 U1 wa-worker story:approved)]"); [ "$r" = "BOUND=[] STOP=[]" ] && [ "$(wnd_calls)" = 0 ] && ok "(7z) bead com memória unknown fresca: pulada sem sonda, NÃO consta (vai ao check do MBP)" || bad "(7z) memória unknown: $r"
+reset; chk wa-n1 0; setok wa-n1
+r=$(T_ROUTE=label passb "[$(jb wa-n1 U1 wa-worker story:approved,node:ok)]"); [ "$r" = "BOUND=[] STOP=[]" ] && [ "$(d1)" = "-" ] && [ "$(wnd_calls)" = 1 ] && summ | jq -e '.node==1 and .skipped.basis==1 and .kept==0' >/dev/null 2>&1 && ok "(7z) rota label com veredito node por TEXTO (a base não é label): o nó não a leva, NÃO consta" || bad "(7z) base de texto em rota label: $r / $(d1)"
+reset; chk wa-n1 0; setok wa-n1
+r=$(T_EXEMPT=shadow passb "$S3"); [ "$r" = "BOUND=[] STOP=[]" ] && ok "(7z) shadow: a passada só observa, conjunto vazio" || bad "(7z) shadow: $r"
+# o conjunto zera em CADA passada, inclusive na desligada: o da varredura anterior nunca segura bead nesta
+reset; chk wa-n1 0; setok wa-n1
+r=$(SJ="$S3" BJ="[]" T_DOLT=1 run_t 'SMALL_CANDIDATES="$SJ"; BIG_CANDIDATES="$BJ"; _pilot_wa_node_pass; a="$_PWP_NODE_BOUND"; T_DOLT=""; _pilot_wa_node_pass; b="$_PWP_NODE_BOUND"; PILOT_WA_NODE_EXEMPT=off; _pilot_wa_node_pass; echo "1a=[$a] 2a=[$b] desligada=[$_PWP_NODE_BOUND]"')
+[ "$r" = "1a=[ wa-n1] 2a=[] desligada=[]" ] && ok "(7z) o conjunto zera a cada passada (a 2ª, que despacha a n1, e a desligada começam do vazio)" || bad "(7z) zerar a cada passada: $r"
+grep -qE '^_PWP_NODE_BOUND=""( |$)' <<<"$PWP_INIT" && ok "(7z) o conjunto nasce vazio (declarado junto de _PWP_LAST_STOP)" || bad "(7z) _PWP_NODE_BOUND não nasce vazio no dispatcher"
+
 echo "── (8) o gancho exporta o rc do apply (a passada decide por ele: 12 = nó cheio)"
 dec() { ( eval "$PRELUDE"; eval "$F_DECIDE"; _pilot_wa_node_open() { return 0; }; _pilot_slow_spawn_budget_spent() { return 1; }; _pilot_wa_node_settle() { :; }
           x=0; _pilot_wa_node_decide wa-a "$WORK/store" wa-worker || x=$?; echo "ret=$x apply_rc=${_PWN_APPLY_RC:-<vazio>}" ) 2>&1 | tail -1; }

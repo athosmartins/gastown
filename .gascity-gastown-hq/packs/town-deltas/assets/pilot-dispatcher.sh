@@ -13341,15 +13341,21 @@ EOF_PMS_PRE
   _sp_veto=$(_pilot_node_first_veto "$_sp_labels")
   [ -z "$_sp_veto" ] || { _PMS_WHY="veto:$_sp_veto"; return 1; }
   case ",$_sp_labels," in *,node:mini,*) _PMS_WHY="node:mini"; return 1 ;; esac
-  # Hetzner primeiro (o nó 24/7 não perde a vez): com a passada de WA no nó LIGADA, a bead que ela levaria (rota label: a de node:ok; auto: qualquer uma) só vem ao MBP se a passada parou por falta de vaga do nó.
-  # vazio (passada desligada ou que não rodou) → a regra não se aplica; falhou/ilegível (parada que não é capacity|keep-limit, inclusive vazia) → a bead fica para o Hetzner: NÃO oferece ao MBP
+  # Hetzner primeiro (o nó 24/7 não perde a vez), SÓ para a bead que o nó de fato leva (ga-2hd02v.3.25). Com a passada de WA no nó LIGADA, a bead que ela levaria (rota label: a de node:ok; auto: qualquer uma) fica para o Hetzner quando a passada a JULGOU node NESTA varredura e não a despachou
+  # (conjunto _PWP_NODE_BOUND: retida pelo waiter da cessão, Dolt saturado, rc do apply fora da tabela) e a parada não foi capacity|keep-limit (nó cheio: o nó não a leva e ela vem ao MBP). Qualquer outra vai ao `check` do MBP, que tem as suas regras de dados: a de veredito mini/unknown na memória do nó,
+  # a que a passada nem sondou (parou por budget-secs, budget-probes, max-fails ou hook-held) e a sondada sem node. Antes toda WA em rota auto ficava retida sempre que a parada não era capacity|keep-limit: 31/10, 222 de 227 puladas por hetzner-first e offered=0, o MBP o dia todo sem bead.
+  # O `node` NÃO está na memória de propósito (um acerto de memória faz a passada pular a bead, e ela nunca iria ao nó): «julgada node» é o conjunto da varredura.
+  # vazio (passada desligada ou que não rodou, ou conjunto vazio) → nada é retido: a bead segue ao `check` do MBP; falhou/ilegível (id que não consta no conjunto, ou conjunto que não se escreveu) → também NÃO retém: na dúvida se o nó a leva ela nunca fica parada, quem decide é o `check` do MBP
   if [ "${_PWP_MODE:-off}" = on ]; then
     case "${PILOT_WA_NODE_ROUTE:-}" in
       label) case ",$_sp_labels," in *,node:ok,*) _sp_h=1 ;; esac ;;
       auto) _sp_h=1 ;;
     esac
     if [ "$_sp_h" = 1 ]; then
-      case "${_PWP_LAST_STOP:-}" in capacity|keep-limit) ;; *) _PMS_WHY="hetzner-first"; return 1 ;; esac
+      case "${_PWP_LAST_STOP:-}" in
+        capacity|keep-limit) ;;
+        *) case "${_PWP_NODE_BOUND:-} " in *" $_sp_id "*) _PMS_WHY="hetzner-first"; return 1 ;; esac ;;
+      esac
     fi
   fi
   _sp_cap="${PILOT_WA_MBP_STAMPED_PROBES:-12}"; case "$_sp_cap" in ''|*[!0-9]*) _sp_cap=12 ;; esac
@@ -13520,6 +13526,7 @@ _PWN_APPLY_RC=""     # o rc do `apply` da última _pilot_wa_node_decide (vazio =
 _PWP_HOLD_MAX=0      # ga-2hd02v.3.18: quantas passadas SEGUIDAS o mesmo waiter blind segura a P2+ (0 = sem fim); a passada lê PILOT_WA_NODE_PASS_HOLD_MAX_SWEEPS no começo
 _PWP_HOLD_PRIOR=0    # ga-2hd02v.3.18: quantas passadas ANTERIORES seguidas este waiter terminou blind (o arquivo de estado, lido no começo da passada)
 _PWP_LAST_STOP=""   # por que a passada de WA no nó PAROU nesta varredura (capacity | keep-limit | ...; vazio = fim da lista ou não rodou). ga-w7qwl1.2.6: a carimbada que o nó levaria só vai ao MBP se a passada parou por falta de vaga do nó
+_PWP_NODE_BOUND=""  # ga-2hd02v.3.25: ids (" id1 id2", cada um com espaço na frente) das beads que a passada JÁ JULGOU node NESTA varredura e não despachou (retida pelo waiter da cessão, Dolt saturado, rc do apply fora da tabela): só essas ficam para o nó e o MBP não as toma. Zera no começo de cada passada
 
 # _pilot_wa_node_pass_mode — deixa em _PWP_MODE off|shadow|on. vazio / valor que não existe / rota que não permite → off; DRY_RUN (a passada sonda e grava memória) → off.
 # `on` só com rota label|auto (com shadow o gancho nunca leva bead: seriam claims à toa); `shadow` com shadow|label|auto. Sempre devolve 0.
@@ -13826,6 +13833,7 @@ _pilot_wa_node_pass() {
   # _pw_expired = quantas P2+ foram ao nó por isso · _pw_wcount = quantas passadas seguidas o waiter está blind (com esta, se ele terminou blind)
   local _pw_trk=0 _pw_wreached=0 _pw_hx=0 _pw_expired=0 _pw_wcount=0
   _PWP_LAST_STOP=""
+  _PWP_NODE_BOUND=""
   _pilot_wa_node_pass_mode
   if [ "$_PWP_MODE" = off ]; then
     case "${PILOT_WA_NODE_EXEMPT:-off}" in
@@ -13944,14 +13952,16 @@ _pilot_wa_node_pass() {
       # ga-2hd02v.3.18: rc 3 = o hold EXPIROU (o mesmo waiter já terminou blind _PWP_HOLD_PRIOR passadas seguidas): a P2+ segue ao nó; só conta em hold_expired se o dispatch der certo (abaixo)
       _pw_hrc=0; _pw_hx=0; _pilot_wa_node_pass_hold_for "$_pw_pick" "$_pw_wv" || _pw_hrc=$?
       case "$_pw_hrc" in
-        0) _pw_held=$((_pw_held + 1)); continue ;;
+        # ga-2hd02v.3.25: veredito node que o waiter da cessão reteve — a bead é do nó e o MBP não a toma. Id legível ([A-Za-z0-9._-]) → entra no conjunto; id ilegível → não entra (o MBP também o recusa como ilegível)
+        0) _pw_held=$((_pw_held + 1)); case "$_pw_id" in *[!A-Za-z0-9._-]*) ;; *) _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id" ;; esac; continue ;;
         2) _pw_clsblind=$((_pw_clsblind + 1)) ;;
         3) _pw_hx=1 ;;
       esac
       # ── modo on: a candidata que o classificador manda ao nó vai a dispatch_one com a bandeira ──
       # O Dolt saturado (no início da varredura, ou agora) para as ESCRITAS, como nas pistas (dispatch_lane): claim + adoção + apply + soltura são ~10 escritas por tentativa. Sem sinal nenhum (_dolt_saturated devolve 0 com
       # reason=unreadable) conta como saturado: o estado inerte é não escrever. As sondas acima são leitura e já correram.
-      if [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ] || _dolt_saturated; then _pw_stop="dolt-saturated"; break; fi
+      # ga-2hd02v.3.25: veredito node que a escrita parada do Dolt impediu de despachar — a bead segue sendo do nó (mesma regra do conjunto acima)
+      if [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ] || _dolt_saturated; then case "$_pw_id" in *[!A-Za-z0-9._-]*) ;; *) _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id" ;; esac; _pw_stop="dolt-saturated"; break; fi
       _PILOT_WA_NODE_PASS=1; _PWN_APPLY_RC=""; DISPATCH_RESULT=""
       _pw_tier=$(_bead_tier "$_pw_pick")
       _pw_rc=0
@@ -13977,7 +13987,8 @@ _pilot_wa_node_pass() {
           11) _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" unknown; if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi ;;
           '') _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" released; if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi ;;
           12) _pw_stop="capacity"; break ;;
-          *)  if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi; _pw_stop="hook-held"; break ;;
+          # ga-2hd02v.3.25: rc do apply fora da tabela = a escrita pode ter acontecido e o estado desta bead NÃO se sabe: ela entra no conjunto e fica fora do MBP nesta varredura (mesma regra de id legível)
+          *)  if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi; case "$_pw_id" in *[!A-Za-z0-9._-]*) ;; *) _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id" ;; esac; _pw_stop="hook-held"; break ;;
         esac
       fi
     done
