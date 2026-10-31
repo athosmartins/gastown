@@ -120,7 +120,7 @@ WRAPPERS = {"home-scan-guard", "cut-output-shadow"}
 CITY_PY = {"live-clone-git-guard.py"}
 GUARD, FILE_TOOLS = "remote-clone-guard.py", "Edit|Write|MultiEdit|NotebookEdit"
 # O hook do guarda sai com `onFailure: "block"` (claude >= 2.1.295; o schema do 2.1.302 diz: falha = não iniciou, prazo estourado, saída fora de 0/2 ou JSON inválido, e "block" a conta como saída 2):
-# sem o campo, o prazo do PRÓPRIO claude (600 s no PreToolUse) estourado deixa a chamada seguir sem conferência. O `--selfcheck` do guarda aceita o campo (só esse valor) e continua aceitando o hook sem ele.
+# sem o campo, o prazo do PRÓPRIO claude (600 s no PreToolUse, segundo a documentação; não conferido no binário) estourado deixa a chamada seguir sem conferência (MEDIDO com prazo de 2 s no teste). O `--selfcheck` do guarda aceita o campo (só esse valor) e continua aceitando o hook sem ele.
 GUARD_ON_FAILURE = "block"
 # O shim é comparado INTEIRO (fullmatch, sem strip nem normalização): o que o builder decide é a string que vai para o servidor.
 # O PATH é o literal que o gc injeta, não "qualquer coisa entre aspas"; variável só GC_*; nada de caractere de controle (newline = 2º comando).
