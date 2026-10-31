@@ -1,0 +1,334 @@
+diff --git a/third_party/beads/backend/conformance/lifecycle_create_contract.go b/third_party/beads/backend/conformance/lifecycle_create_contract.go
+index 831974df7..266fe17b0 100644
+--- a/third_party/beads/backend/conformance/lifecycle_create_contract.go
++++ b/third_party/beads/backend/conformance/lifecycle_create_contract.go
+@@ -348,7 +348,18 @@ func RunLifecycleCreateInheritsParentLabels(t *testing.T, ctx context.Context, f
+ 	t.Helper()
+ 
+ 	parent := fixture.IssuePrefix + "-lcc-inherit-parent"
+-	seedLifecycleCreateIssue(t, ctx, fixture, lifecycleCreateIssue(parent, "lcc-shared", "lcc-from-parent"))
++	// The parent is a CLOSED, gated one: besides the two classification labels
++	// it carries the cycle state of the process it already went through. A child
++	// born under it is new work and must not inherit any of that state
++	// (ga-y5z6hzh: slices of closed parents were born gate:passed/story:done and
++	// the dispatcher skipped them in silence).
++	seedLifecycleCreateIssue(t, ctx, fixture, lifecycleCreateIssue(parent,
++		"lcc-shared", "lcc-from-parent",
++		"gate:passed", "story:done", "story:gate", "story:in-flight", "story:epic-split",
++		"gate-approved:0123456789abcdef0123456789abcdef01234567",
++		"exec:manual", "pilot:no-auto-dispatch", "pilot:reclaim-count:1",
++		"delivery:tested", "next-action:mayor",
++	))
+ 
+ 	inherited, err := fixture.Lifecycle.Create(ctx, publicops.CreateRequest{
+ 		Actor:                   "writer",
+@@ -357,17 +368,22 @@ func RunLifecycleCreateInheritsParentLabels(t *testing.T, ctx context.Context, f
+ 		InheritLabelsFromParent: true,
+ 		Issue: &types.Issue{
+ 			Title: "inheriting child", Status: types.StatusOpen, Priority: 2,
+-			IssueType: types.TypeTask, Labels: []string{"lcc-own", "lcc-shared"},
++			// gate:queued is the caller's own decision: only INHERITED state is
++			// dropped, a label named in the request is kept.
++			IssueType: types.TypeTask, Labels: []string{"lcc-own", "lcc-shared", "gate:queued"},
+ 		},
+ 	})
+ 	if err != nil {
+ 		t.Fatalf("Create inheriting child: %v", err)
+ 	}
+ 	// A label the child and the parent both carry is one label, not two: the
+-	// set comparison is what says so.
+-	assertLifecycleCreateLabels(t, "inheriting child result", inherited.Issue, "lcc-own", "lcc-shared", "lcc-from-parent")
++	// set comparison is what says so. It also says the parent's cycle state did
++	// not come along.
++	assertLifecycleCreateLabels(t, "inheriting child result", inherited.Issue,
++		"lcc-own", "lcc-shared", "gate:queued", "lcc-from-parent")
+ 	assertLifecycleCreateLabels(t, "inheriting child row",
+-		lifecycleCreateRow(t, ctx, fixture, inherited.Issue.ID), "lcc-own", "lcc-shared", "lcc-from-parent")
++		lifecycleCreateRow(t, ctx, fixture, inherited.Issue.ID),
++		"lcc-own", "lcc-shared", "gate:queued", "lcc-from-parent")
+ 
+ 	// With inheritance off, the request's own labels are the whole set — the
+ 	// authoritative clause standing alone.
+diff --git a/third_party/beads/cmd/bd/create_labels_test.go b/third_party/beads/cmd/bd/create_labels_test.go
+index 6b0b5e1db..9e03dd88b 100644
+--- a/third_party/beads/cmd/bd/create_labels_test.go
++++ b/third_party/beads/cmd/bd/create_labels_test.go
+@@ -102,3 +102,58 @@ func TestMergeCreateLabelsStillInheritsNonStateLabels(t *testing.T) {
+ 		t.Fatalf("merged labels = %v, want %v", got, inherited)
+ 	}
+ }
++
++// ga-y5z6hzh: a slice created under a CLOSED, gated parent was born with the
++// parent's cycle state (gate:passed, story:done, ...) and the dispatcher skipped
++// it as already finished. The fixture is the label set such a parent held.
++func TestMergeCreateLabelsDoesNotInheritCycleLabels(t *testing.T) {
++	got := mergeCreateLabels(
++		[]string{"explicit-label"},
++		[]string{
++			"area:infra",
++			"gate:passed",
++			"gate:nonblocking-findings",
++			"gate-approved:0123456789abcdef0123456789abcdef01234567",
++			"gate-sha-failed:48d62592411a65c77aca2ef29224faa651664593:code",
++			"lane:small",
++			"story:done",
++			"story:gate",
++			"story:in-flight",
++			"story:epic-split",
++			"story:approved",
++			"exec:manual",
++			"exec:auto",
++			"pilot:no-auto-dispatch",
++			"pilot:reclaim-count:1",
++			"delivery:tested",
++			"next-action:mayor",
++		},
++	)
++	want := []string{"explicit-label", "area:infra", "lane:small", "story:approved", "exec:auto"}
++
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("merged labels = %v, want %v (only classification may be inherited)", got, want)
++	}
++}
++
++// The filter is about what is INHERITED. A label the caller asks for by name is
++// the caller's decision and must survive, state-looking or not.
++func TestMergeCreateLabelsKeepsExplicitCycleLabels(t *testing.T) {
++	got := mergeCreateLabels(
++		[]string{"gate:queued", "exec:manual"},
++		[]string{"gate:queued", "pilot:held", "lane:small"},
++	)
++	want := []string{"gate:queued", "exec:manual", "lane:small"}
++
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("merged labels = %v, want %v", got, want)
++	}
++}
++
++// A parent that carries nothing but state yields a child with no labels at all:
++// nil, as before, not an empty slice.
++func TestMergeCreateLabelsAllStateParentYieldsNil(t *testing.T) {
++	if got := mergeCreateLabels(nil, []string{"gate:passed", "story:done"}); got != nil {
++		t.Fatalf("merged labels = %v, want nil", got)
++	}
++}
+diff --git a/third_party/beads/internal/types/label_inherit.go b/third_party/beads/internal/types/label_inherit.go
+index 2f40ebabf..67221b19e 100644
+--- a/third_party/beads/internal/types/label_inherit.go
++++ b/third_party/beads/internal/types/label_inherit.go
+@@ -2,38 +2,74 @@ package types
+ 
+ import "strings"
+ 
+-// Labels a child never inherits from its parent.
++// Labels a child never inherits from its parent (ga-y5z6hzh, ga-2svou8).
+ //
+-// `bd create --parent` copies the parent's labels onto the new child. Most of
+-// them are classification (lane:small, ctx:*) and are worth carrying down. The
+-// families below are not: they record what an automation OBSERVED about one
+-// specific bead — a gate verdict, a retry counter, a refusal reason, a
+-// lifecycle flag. A child born with them reads as if it had already been
+-// through that process and failed it, so a brand-new slice shows up parked or
+-// escalated without ever having run.
++// `bd create --parent` copies the parent's labels onto the new child. Some of
++// them classify the work (area:*, lane:*, node:*, framework:*, origem:*) and are
++// worth carrying down. The rest record where ONE specific bead stands in a
++// process: a gate verdict, a retry counter, a refusal, a delivery status, a
++// "done" or "in flight" mark. A child born with those reads as if it had already
++// been through the process, so a brand-new slice of a closed parent shows up as
++// finished (gate:passed, story:done) or parked (exec:manual, pilot:*) without
++// any work having happened, and the dispatcher skips it in silence.
+ //
+-// The match is on the label NAMESPACE (a literal prefix, case-sensitive), not
+-// a substring: "gates:review", "mygate:x" and a bare "pilot" are unrelated
+-// labels and keep being inherited.
++// Rule of thumb for adding to the lists: would the label be TRUE of a bead that
++// was created one second ago under this parent? If not, it is state.
++//
++// The match is on the label NAMESPACE (a literal prefix, case-sensitive), not a
++// substring: "gates:review", "mygate:x" and a bare "pilot" are unrelated labels
++// and keep being inherited.
+ var nonInheritableLabelPrefixes = []string{
+-	"gate:",            // gate verdicts and counters: gate:failed, gate:fix-attempt:N, gate:needs-human:*
+-	"gate-sha-failed:", // per-SHA gate failure memo
+-	"pilot:",           // pilot bookkeeping: reclaim/refusal counters, refused-reason
+-	"lifecycle:",       // lifecycle flags such as lifecycle:label-conflict
++	"gate:",        // gate verdicts and counters: gate:passed, gate:fix-attempt:N, gate:needs-human:*
++	"gate-",        // gate memos keyed by sha/run: gate-approved:<sha>, gate-sha-failed:<sha>:*, gate-status:*
++	"pilot:",       // dispatcher bookkeeping: no-auto-dispatch, held*, reclaim/refusal counters, refused-reason
++	"pool:",        // pool refusals (pool:refused:*)
++	"lifecycle:",   // lifecycle flags such as lifecycle:label-conflict
++	"delivery:",    // delivery status: delivery:tested, delivery:partial, delivery:failed
++	"next-action:", // who owns the next move on THIS bead
++	"blocked:",     // blockers of this bead
++	"blocked-",     // blocked-on:<id>, blocked-reason:<why>
++	"audit:",       // post-merge audit state
++	"auto-refino:", // refiner progress on this bead
++	"refino:",      // refiner verdicts on this bead
++	"impacto:",     // live-damage mark, backed by evidence about one specific bead
+ }
+ 
+ // nonInheritableLabels are single labels (not a family) with the same problem.
+ var nonInheritableLabels = map[string]struct{}{
+-	"story:needs-human": {},
++	"exec:manual":          {}, // "a human runs this one by hand" - about the parent
++	"needs-human":          {},
++	"needs-human-decision": {},
++	"ctx:thin":             {},
++	"scope:needs-review":   {},
++}
++
++// The story: namespace is the story lifecycle (done, gate, in-flight,
++// epic-split, ...). It is blocked as a whole and only these labels, which arm or
++// classify the work rather than record progress, may be inherited. A story:
++// state added later is therefore NOT inherited until someone lists it here:
++// a child missing a label is a one-line fix, a child carrying a stale state
++// label vanishes from the dispatcher.
++const storyNamespace = "story:"
++
++var inheritableStoryLabels = map[string]struct{}{
++	"story:approved":     {},
++	"story:unrefined":    {},
++	"story:needs-refino": {},
++	"story:needs-device": {},
+ }
+ 
+ // IsInheritableLabel reports whether a label may be copied from a parent onto a
+-// new child. It governs INHERITANCE only: a label the caller asks for by name
+-// is never filtered, so `--labels gate:queued` still works.
++// new child. It governs INHERITANCE only: a label the caller asks for by name is
++// never filtered, so `--labels gate:queued` still works.
+ func IsInheritableLabel(label string) bool {
+ 	if _, blocked := nonInheritableLabels[label]; blocked {
+ 		return false
+ 	}
++	if strings.HasPrefix(label, storyNamespace) {
++		_, allowed := inheritableStoryLabels[label]
++		return allowed
++	}
+ 	for _, prefix := range nonInheritableLabelPrefixes {
+ 		if strings.HasPrefix(label, prefix) {
+ 			return false
+diff --git a/third_party/beads/internal/types/label_inherit_test.go b/third_party/beads/internal/types/label_inherit_test.go
+index 7bdf79ffe..19bd33e3e 100644
+--- a/third_party/beads/internal/types/label_inherit_test.go
++++ b/third_party/beads/internal/types/label_inherit_test.go
+@@ -10,28 +10,90 @@ func TestIsInheritableLabel(t *testing.T) {
+ 		label string
+ 		want  bool
+ 	}{
+-		// State families: never inherited.
++		// ga-y5z6hzh: the cycle labels a slice of a CLOSED parent was born with
++		// (wa-93uf5c.4/.5, wa-zmxywv.30.1, wa-xmpoab.2.1, ga-2hd02v.3.x).
++		{"gate:passed", false},
++		{"story:done", false},
++		{"story:gate", false},
++		{"gate-approved:0123456789abcdef0123456789abcdef01234567", false},
++		{"exec:manual", false},
++		{"pilot:reclaim-count:1", false},
++		{"pilot:no-auto-dispatch", false},
++		{"story:epic-split", false},
++
++		// ga-2svou8: a slice of a parent the gate had failed.
+ 		{"gate:failed", false},
+ 		{"gate:fix-attempt:2", false},
++		{"gate:needs-fix", false},
++		{"gate:needs-human", false},
+ 		{"gate:needs-human:technical", false},
+ 		{"gate-sha-failed:48d62592411a65c77aca2ef29224faa651664593:code", false},
+-		{"pilot:reclaim-count:escalated-at-3", false},
+-		{"pilot:refused-reason:umbrella-sliced-owned-by-live-crew", false},
+ 		{"lifecycle:label-conflict", false},
++		{"pilot:refused-reason:umbrella-sliced-owned-by-live-crew", false},
+ 		{"story:needs-human", false},
+ 
+-		// Classification and look-alikes: still inherited.
++		// The rest of the process-state families the dispatcher keys on.
++		{"gate:queued", false},
++		{"gate:nonblocking-findings", false},
++		{"gate-status:passed", false},
++		{"pilot:held-until:1793313976", false},
++		{"pool:refused:engine-rebuild-required", false},
++		{"delivery:tested", false},
++		{"delivery:partial", false},
++		{"next-action:mayor", false},
++		{"next-action:athos-decide", false},
++		{"blocked:engine-window", false},
++		{"blocked-on:ga-3azujf", false},
++		{"blocked-reason:decision", false},
++		{"audit:pending", false},
++		{"auto-refino:refining", false},
++		{"refino:info-gap", false},
++		{"impacto:dano-ao-vivo", false},
++		{"needs-human", false},
++		{"needs-human-decision", false},
++		{"ctx:thin", false},
++		{"scope:needs-review", false},
++		{"story:in-flight", false},
++		{"story:epic", false},
++		{"story:blocked", false},
++		{"story:cancelled", false},
++		{"story:awaiting-external-merge", false},
++		{"story:needs-approval", false},
++		{"story:refinement-in-progress", false},
++		{"story:refino-review", false},
++		{"story:refino-escalado", false},
++		// A story: state nobody has listed yet must NOT leak down.
++		{"story:some-state-added-next-month", false},
++
++		// Classification: still inherited.
++		{"area:infra", true},
+ 		{"lane:small", true},
++		{"node:never", true},
++		{"framework:engine", true},
++		{"scope:advisory", true},
++		{"origem:athos", true},
+ 		{"ctx:ready", true},
+-		{"story:needs-refino", true},
++		{"exec:auto", true},
++		{"needs:engine-window", true},
++		{"waiting-on:janela-engine", true},
++		{"followup:nonblocking", true},
++		{"story:approved", true},
+ 		{"story:unrefined", true},
++		{"story:needs-refino", true},
++		{"story:needs-device", true},
++
++		// Prefix families, not substrings: look-alikes keep being inherited.
+ 		{"gates:review", true},
+ 		{"mygate:failed", true},
+ 		{"Gate:failed", true},
+ 		{"gate", true},
+ 		{"pilot", true},
+ 		{"lifecycle", true},
+-		{"waiting-on:external", true},
++		{"deliveryx:y", true},
++		{"unblocked:yes", true},
++		{"stories:x", true},
++		{"story", true},
++		{"exec:manual-review", true},
+ 		{"", true},
+ 	}
+ 	for _, tc := range cases {
+@@ -42,17 +104,17 @@ func TestIsInheritableLabel(t *testing.T) {
+ }
+ 
+ func TestFilterInheritableLabels(t *testing.T) {
+-	in := []string{"lane:small", "gate:failed", "ctx:ready", "pilot:held", "story:needs-human"}
++	in := []string{"lane:small", "gate:passed", "area:infra", "story:done", "exec:manual", "ctx:ready"}
+ 	got := FilterInheritableLabels(in)
+-	want := []string{"lane:small", "ctx:ready"}
++	want := []string{"lane:small", "area:infra", "ctx:ready"}
+ 	if !reflect.DeepEqual(got, want) {
+ 		t.Fatalf("FilterInheritableLabels = %v, want %v", got, want)
+ 	}
+-	if !reflect.DeepEqual(in, []string{"lane:small", "gate:failed", "ctx:ready", "pilot:held", "story:needs-human"}) {
++	if !reflect.DeepEqual(in, []string{"lane:small", "gate:passed", "area:infra", "story:done", "exec:manual", "ctx:ready"}) {
+ 		t.Fatalf("input was mutated: %v", in)
+ 	}
+ 
+-	if got := FilterInheritableLabels([]string{"gate:failed"}); got != nil {
++	if got := FilterInheritableLabels([]string{"gate:passed", "story:done"}); got != nil {
+ 		t.Fatalf("all-state input = %v, want nil", got)
+ 	}
+ 	if got := FilterInheritableLabels(nil); got != nil {
