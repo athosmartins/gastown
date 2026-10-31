@@ -895,6 +895,27 @@ for g in d["hooks"]["PreToolUse"]:
 json.dump(d, open(sys.argv[1], "w"))
 EOF
   python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; ok $? "check: \`timeout\` no hook é só prazo, não muda quando dispara → ok"
+  # onFailure (claude >= 2.1.295, ga-14qtcy9): a falha do hook (prazo do claude estourado, não iniciou, saiu com código fora de 0/2, JSON inválido) conta como saída 2. O hook do servidor pode levá-lo, e SÓ com o
+  # texto exato "block": "continue" é a falha aberta de volta, e um valor fora do enum (outra caixa, tipo errado) o claude pode tratar como hook inválido. Ausente segue valendo (o settings que o servidor tem antes do push-bundle).
+  setof() {  # setof ARQ CÓDIGO — o settings bom, com CÓDIGO (python, carga deliberada do teste) aplicado a cada hook (h) e a cada grupo (g) do PreToolUse
+    settings "$1" "Bash" "Edit|Write|MultiEdit|NotebookEdit"; python3 - "$1" "$2" <<'EOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+for g in d["hooks"]["PreToolUse"]:
+    h = g["hooks"][0]
+    exec(sys.argv[2])
+json.dump(d, open(sys.argv[1], "w"))
+EOF
+  }
+  local of
+  for of in 'h["onFailure"] = "block"' 'h["onFailure"] = "block"; h["timeout"] = 5' 'g["matcher"] == "Bash" and h.update(onFailure="block")'; do
+    setof "$s" "$of"; python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; ok $? "check: hook com \`$of\` → ok (o campo é opcional e só vale o texto exato \"block\")"
+  done
+  for of in 'h["onFailure"] = "continue"' 'h["onFailure"] = "Block"' 'h["onFailure"] = "block "' 'h["onFailure"] = ""' 'h["onFailure"] = True' 'h["onFailure"] = None' 'h["onFailure"] = 1' 'h["onFailure"] = ["block"]' \
+            'h["onFailure"] = "block"; h["async"] = True' 'g["onFailure"] = "block"' 'g["matcher"] == "Bash" and h.update(onFailure="continue")'; do
+    setof "$s" "$of"; python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; [ $? = 1 ]; ok $? "check: hook com \`$of\` → falha (só \"block\", e só no hook)"
+  done
+  setof "$s" 'h["onFailure"] = "continue"'; python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; grep -q 'onFailure' "$T/err"; ok $? "check: ...e a falha diz que o problema é o onFailure"
   settings "$s" "Bash" "Edit|Write|MultiEdit|NotebookEdit"; python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));d["disableAllHooks"]=True;json.dump(d,open(sys.argv[1],"w"))' "$s"
   python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; [ $? = 1 ]; ok $? "check: disableAllHooks ligado → falha"
   settings "$s" "Bash" "Edit|Write|MultiEdit|NotebookEdit"; local pd="$T/proj" cl; mkdir -p "$pd/.claude"

@@ -18,7 +18,7 @@ CAMADA DA SESSÃO (ga-w7qwl1.2.7, host `mbp`): num notebook o ~/.claude é PESSO
   distinguir caixa nem a forma Unicode (o APFS padrão não distingue: `GUARD/` é `guard/`), no território do clone inclusive. O servidor (~/.claude/hooks/) não muda: comparação exata.
 CÓDIGOS: 0 liberado · 2 bloqueado — também o pedido que o guarda não consegue analisar em STEP_LIMIT passos ou TIME_LIMIT segundos (hook estourado no Claude Code, 600 s, NÃO bloqueia: a
   chamada seguiria sem conferência; o guarda se corta antes e fecha, ver Budget). `--selfcheck [settings.json [pasta-do-projeto…]]`: 0 se o guarda decide como deveria numa pasta de teste E (com o settings) todo
-  PreToolUse de Bash/Edit/Write/MultiEdit/NotebookEdit é EXATAMENTE `python3 -I <este arquivo> || exit 2`, sem campo que mude QUANDO dispara (só type/command/timeout) e
+  PreToolUse de Bash/Edit/Write/MultiEdit/NotebookEdit é EXATAMENTE `python3 -I <este arquivo> || exit 2`, sem campo que mude QUANDO dispara (só type/command/timeout e `onFailure: "block"`, opcional) e
   sem `disableAllHooks` nele nem em <pasta>/.claude/settings[.local].json; 1 caso contrário (o provider confere antes de abrir sessão real). Edit/Write em ~/.claude/hooks/** e ~/.claude/settings*.json bloqueiam.
 LIMITES (é trava contra engano, não sandbox): a lista do que NÃO vejo e dos falsos positivos está no runbook, seção "Como o guarda decide".
 """
@@ -786,10 +786,11 @@ def selfcheck(args: list) -> int:
                         raise ValueError(f"{f}: disableAllHooks ligado na camada do projeto")
             for tool in ("Bash",) + tuple(TOOLS_FILE):
                 # além do comando, nenhum campo que mude QUANDO o hook dispara (`if`: o hook antigo só disparava em `git -C *`; `async`…). vazio → o grupo/hook sem campo extra vale; ilegível (grupo ou hook que não é objeto) → AttributeError/TypeError, e o selfcheck falha
+                # onFailure (claude >= 2.1.295): a falha do hook (prazo estourado, não iniciou, saída fora de 0/2, JSON inválido) vira saída 2. vazio (ausente) → o hook vale como antes, com a falha aberta; ilegível (qualquer valor que não seja o texto exato "block": continue, outra caixa, outro tipo) → este hook não conta e o selfcheck falha
                 if not any((g.get("matcher") in (None, "", "*") or re.fullmatch(g["matcher"], tool)) and set(g) <= {"matcher", "hooks"}
-                           and any(hook_re.fullmatch(h.get("command", "").strip()) and h.get("type") == "command" and set(h) <= {"type", "command", "timeout"} for h in g.get("hooks", []))
+                           and any(hook_re.fullmatch(h.get("command", "").strip()) and h.get("type") == "command" and set(h) <= {"type", "command", "timeout", "onFailure"} and h.get("onFailure", "block") == "block" for h in g.get("hooks", []))
                            for g in groups):
-                    raise ValueError(f"{tool}: nenhum hook PreToolUse é exatamente `python3 -I {me} || exit 2` (sem `if`, async… — só type/command/timeout)")
+                    raise ValueError(f"{tool}: nenhum hook PreToolUse é exatamente `python3 -I {me} || exit 2` (só type/command/timeout e onFailure \"block\"; sem `if`, async…)")
         except (OSError, ValueError, AttributeError, KeyError, TypeError, re.error) as e:
             ok = False
             print(f"selfcheck: settings {args[0]}: {e}", file=sys.stderr)

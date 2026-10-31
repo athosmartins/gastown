@@ -19,7 +19,7 @@ USO
 O QUE ENTRA (cada hook tem UM veredito, na tabela POLICY):
   keep  — o script é portável (bash/jq/python3, sem nada de macOS) e é copiado para home/.claude/hooks/;
   swap  — o hook do mini não serve no servidor mas NÃO pode sumir: `gt tap guard cross-clone-block` (usa o binário gt e o layout de clones
-          do mini) entra como `python3 -I {remote_home}/.claude/hooks/remote-clone-guard.py || exit 2` — em PreToolUse para Bash e também
+          do mini) entra como `python3 -I {remote_home}/.claude/hooks/remote-clone-guard.py || exit 2` (com `"onFailure": "block"`) — em PreToolUse para Bash e também
           para Edit|Write|MultiEdit|NotebookEdit — e o remote-clone-guard.py vai junto (ga-2hd02v.1.5). `|| exit 2` porque hook que sai 1 ou
           127 (python3 ausente, arquivo apagado) falha ABERTO. O `if: Bash(git -C *)` do original não se repete: o guarda decide por dentro;
   shim  — o comando só chama `gc` (handoff, prime, nudge drain, mail check) e fica como está: no servidor `gc` é o
@@ -119,6 +119,9 @@ WRAPPERS = {"home-scan-guard", "cut-output-shadow"}
 # drop de guarda do mini que roda de dentro da cidade (ga-2w0hiow): `python3 -I <cidade>/scripts/<token>`, a forma que o --selfcheck do próprio guarda exige. Só PreToolUse; o comando INTEIRO é conferido.
 CITY_PY = {"live-clone-git-guard.py"}
 GUARD, FILE_TOOLS = "remote-clone-guard.py", "Edit|Write|MultiEdit|NotebookEdit"
+# O hook do guarda sai com `onFailure: "block"` (claude >= 2.1.295; o schema do 2.1.302 diz: falha = não iniciou, prazo estourado, saída fora de 0/2 ou JSON inválido, e "block" a conta como saída 2):
+# sem o campo, o prazo do PRÓPRIO claude (600 s no PreToolUse) estourado deixa a chamada seguir sem conferência. O `--selfcheck` do guarda aceita o campo (só esse valor) e continua aceitando o hook sem ele.
+GUARD_ON_FAILURE = "block"
 # O shim é comparado INTEIRO (fullmatch, sem strip nem normalização): o que o builder decide é a string que vai para o servidor.
 # O PATH é o literal que o gc injeta, não "qualquer coisa entre aspas"; variável só GC_*; nada de caractere de controle (newline = 2º comando).
 GC_PATH = 'export PATH="$HOME/go/bin:$HOME/.local/bin:$PATH" && '
@@ -287,7 +290,7 @@ class Bundle:
 
     def guard_hook(self) -> dict:
         where = f"{self.a.remote_root}/guard" if self.session_layer else f"{self.a.remote_home}/.claude/hooks"
-        return {"type": "command", "command": f"python3 -I {where}/{GUARD} || exit 2"}
+        return {"type": "command", "command": f"python3 -I {where}/{GUARD} || exit 2", "onFailure": GUARD_ON_FAILURE}
 
     def session_guard(self, out: dict) -> None:
         """Camada da sessão: o guarda e o `disableAllHooks: false` ficam ESCRITOS no arquivo de --settings (o do usuário não é entregue e o do projeto/pessoal pode desligar hooks)."""
@@ -474,6 +477,7 @@ class Bundle:
                 **({"guard_layer": "session"} if self.session_layer else {}),
                 "session_path": self.session_dirs,
                 "hooks": self.hooks, "shim_needs": sorted(self.shim_needs), "clone_guard": self.swaps > 0 or self.session_layer,
+                **({"guard_on_failure": GUARD_ON_FAILURE} if self.swaps > 0 or self.session_layer else {}),
                 "dropped_keys": {k: sorted(set(v)) for k, v in sorted(self.dropped_keys.items())},
                 "dropped_rules": dict(sorted(self.dropped_rules.items())),
                 "excluded_skills": self.excluded, "excluded_skills_missing": self.excluded_missing,

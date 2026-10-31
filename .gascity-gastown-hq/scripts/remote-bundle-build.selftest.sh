@@ -346,6 +346,10 @@ jq -e --arg c "$GCMD" '[.hooks.PreToolUse[] | select(.matcher == "Edit|Write|Mul
 cmp -s "$GUARD" "$GF" && [ -x "$GF" ]; ok $? "swap: o guarda vai no bundle idêntico ao do repositório e executável"
 jq -e --arg c "$GCMD" '.clone_guard == true and ([.hooks[] | select(.verdict == "swap")] | length == 1) and ((.hooks[] | select(.verdict == "swap") | .replaced_by) == $c)' "$M" >/dev/null; ok $? "swap: o manifest diz clone_guard=true e, no hook, o que o substituiu (replaced_by)"
 has "$T/outp" "clone_guard=true"; ok $? "swap: a linha ok do build diz clone_guard=true (quem lê só a saída sabe que o servidor ficou com o guarda)"
+# onFailure (ga-14qtcy9): o prazo do PRÓPRIO claude (600 s no PreToolUse), a partida que falha e a saída fora de 0/2 também bloqueiam; o campo é só do guarda
+jq -e --arg c "$GCMD" '[.hooks.PreToolUse[].hooks[] | select(.command == $c)] | length == 2 and all(.onFailure == "block")' "$ST" >/dev/null; ok $? "swap: os 2 hooks do guarda (Bash, Edit|Write…) saem com onFailure \"block\": o prazo do PRÓPRIO claude estourado também bloqueia"
+{ jq -e --arg c "$GCMD" '[.hooks | to_entries[] | .value[].hooks[] | select(.command != $c) | has("onFailure")] | all(. == false)' "$ST" && jq -e '[.hooks | to_entries[] | .value[].hooks[] | has("onFailure")] | all(. == false)' "$O/city/settings.json"; } >/dev/null; ok $? "swap: nenhum outro hook (user, city) ganha onFailure: o campo é só do guarda"
+jq -e '.guard_on_failure == "block"' "$M" >/dev/null; ok $? "swap: o manifest registra guard_on_failure=block (o que o builder FIXOU, como timeout e pinned_env)"
 jq -e '.hooks[] | select(.verdict == "swap") | (.command | startswith("gt tap guard")) or (.command | endswith("cross-clone-block"))' "$M" >/dev/null; ok $? "swap: o manifest guarda o comando ORIGINAL reconhecido (auditável)"
 sed "s#/home/runner/.claude#$O/home/.claude#g" "$ST" > "$T/s.json"; python3 -I "$GF" --selfcheck "$T/s.json" >/dev/null 2>"$T/err"; ok $? "swap: o --selfcheck do guarda aprova as settings GERADAS (as 5 ferramentas, '|| exit 2')"
 python3 -I "$B" verify "$O"; ok $? "swap: verify do bundle com o guarda sai 0"
@@ -353,6 +357,7 @@ fresh; jq 'del(.hooks.PreToolUse[0].hooks[0])' "$T/f/$HS" > "$T/m.json" && cp "$
 [ $rc = 0 ] && jq -e '.clone_guard == false' "$T/f/out/manifest.json" >/dev/null && [ ! -e "$T/f/out/home/.claude/hooks/remote-clone-guard.py" ] && ! grep -q remote-clone-guard "$T/f/out/home/.claude/settings.json"
 ok $? "swap: sem o cross-clone-block no mini não há swap nem guarda no bundle (clone_guard=false; quem decide se isso basta é o provider) (rc=$rc)"
 has "$T/outp" "clone_guard=false" && ! has "$T/outp" "clone_guard=true"; ok $? "swap: sem o hook no mini a linha ok diz clone_guard=false (o silêncio não pode parecer 'tem guarda')"
+jq -e 'has("guard_on_failure") | not' "$T/f/out/manifest.json" >/dev/null; ok $? "swap: ...e o manifest não diz guard_on_failure (não há hook do guarda para levar o campo)"
 fresh; addhook "$T/f/$HS" Stop 'gt tap guard cross-clone-block'
 refuses "cross-clone-block em outro evento que não PreToolUse (o swap seria uma guarda que não guarda)" "$T/f"
 why "só é trocado em PreToolUse"
@@ -393,10 +398,22 @@ swapmut() {  # swapmut DESCRIÇÃO SED — o builder sem uma peça do swap gera 
   sed "s#/home/runner/.claude#$T/f/mut/home/.claude#g" "$T/f/mut/home/.claude/settings.json" > "$T/s.json"
   python3 -I "$T/f/mut/home/.claude/hooks/remote-clone-guard.py" --selfcheck "$T/s.json" >/dev/null 2>&1; [ $? != 0 ]; ok $? "mutante '$1' pego pelo --selfcheck do guarda"
 }
-swapmut "sem '|| exit 2' (falha aberta)" 's/ || exit 2"}/"}/'
+swapmut "sem '|| exit 2' (falha aberta)" 's/ || exit 2", "onFailure"/", "onFailure"/'
 swapmut "sem o grupo Edit|Write" 's/if self.swaps > swaps:/if False:/'
 swapmut "sem o arquivo do guarda no bundle" 's/^        elif self.swaps:$/        elif False:/'
 swapmut "sem a troca (o gt do mini segue nas settings)" 's/if v == "swap":/if False:/'
+onfmut() {  # onfmut DESCRIÇÃO SED ARQUIVO PROGRAMA-JQ — o builder estragado TEM que gerar um ARQUIVO que o PROGRAMA (que o builder de verdade satisfaz) reprova (o --selfcheck do guarda aceita o hook sem o campo, então só este jq o pega)
+  fresh; sed "$2" "$B" > "$T/mutant.py"
+  if cmp -s "$B" "$T/mutant.py"; then ok 1 "mutante '$1': o sed não mudou nada"; return; fi
+  wipe "$T/f/mut"; python3 -I "$T/mutant.py" build --city "$T/f/gt/.gascity-gastown-hq" --claude-home "$T/f/home/.claude" --mini-home "$T/f/home" --role dog \
+    --role-dir "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog" --remote-root /home/runner/rr --remote-home /home/runner --clone-guard "$GUARD" --out "$T/f/mut" 2>/dev/null
+  if [ $? != 0 ]; then ok 0 "mutante '$1' pego (o build recusou)"; return; fi
+  jq -e "$4" "$T/f/mut/$3" >/dev/null 2>&1; [ $? != 0 ]; ok $? "mutante '$1' pego pelo jq do caso"
+}
+ONF_JQ='[.hooks.PreToolUse[].hooks[] | select(.command | contains("remote-clone-guard"))] | length == 2 and all(.onFailure == "block")'
+onfmut "o hook do guarda sai sem o campo onFailure" 's/, "onFailure": GUARD_ON_FAILURE}/}/' home/.claude/settings.json "$ONF_JQ"
+onfmut "o valor do campo vira continue (a falha de prazo do claude volta a seguir sem conferência)" 's/^GUARD_ON_FAILURE = "block"/GUARD_ON_FAILURE = "continue"/' home/.claude/settings.json "$ONF_JQ"
+onfmut "o manifest não registra guard_on_failure" 's/\*\*({"guard_on_failure": GUARD_ON_FAILURE} if self.swaps > 0 or self.session_layer else {}),//' manifest.json '.guard_on_failure == "block"'
 
 fresh; python3 - "$B" "$T/mutant.py" <<'PYEOF'
 import sys
@@ -862,8 +879,8 @@ sess_good() {  # sess_good OUT [PREFIXO_EXTRA] — 0 só se o bundle da camada d
   local o=$1 ex=${2:-$MB} c="python3 -I $MB/guard/remote-clone-guard.py || exit 2"
   [ ! -e "$o/home" ] || return 1  # nada para o ~/.claude do host
   { cmp -s "$GUARD" "$o/guard/remote-clone-guard.py" && [ -x "$o/guard/remote-clone-guard.py" ]; } || return 2
-  jq -e --arg c "$c" '.disableAllHooks == false and ([.hooks.PreToolUse[] | select(.matcher == "Bash") | .hooks[].command] | index($c) != null) and ([.hooks.PreToolUse[] | select(.matcher == "Edit|Write|MultiEdit|NotebookEdit") | .hooks[].command] | index($c) != null)' "$o/city/settings.json" >/dev/null || return 3
-  jq -e --arg r "$MB" '.guard_layer == "session" and .clone_guard == true and .install.guard == ($r + "/guard") and (.install | has("home/.claude") | not)' "$o/manifest.json" >/dev/null || return 4
+  jq -e --arg c "$c" '.disableAllHooks == false and ([.hooks.PreToolUse[] | select(.matcher == "Bash") | .hooks[].command] | index($c) != null) and ([.hooks.PreToolUse[] | select(.matcher == "Edit|Write|MultiEdit|NotebookEdit") | .hooks[].command] | index($c) != null) and ([.hooks.PreToolUse[].hooks[] | select(.command == $c)] | all(.onFailure == "block"))' "$o/city/settings.json" >/dev/null || return 3
+  jq -e --arg r "$MB" '.guard_layer == "session" and .clone_guard == true and .guard_on_failure == "block" and .install.guard == ($r + "/guard") and (.install | has("home/.claude") | not)' "$o/manifest.json" >/dev/null || return 4
   python3 -I "$B" verify "$o" >/dev/null 2>&1 || return 5
   grep -rhoE '/Users/[^" ;:]*' "$o" | grep -vE "^($MB|$ex)(/|\$)" >/dev/null; [ $? = 1 ] || return 6  # todo /Users/ sob a raiz do bundle (ou sob o prefixo que o caso pediu)
   sed "s#$MB/guard#$o/guard#g" "$o/city/settings.json" > "$T/s.json"; python3 -I "$o/guard/remote-clone-guard.py" --selfcheck "$T/s.json" >/dev/null 2>&1 || return 7  # o guarda DA CAMADA aprova o settings gerado
@@ -908,6 +925,7 @@ sessmut "o guarda só em Bash (o grupo Edit|Write sai)" 'for m in ("Bash", FILE_
 sessmut "o arquivo do guarda não vai em guard/" 'if self.session_layer:  # sempre: o city/settings.json' 'if False:  # sempre: o city/settings.json'
 sessmut "a camada de USUÁRIO do mini continua indo para home/.claude" 'if self.session_layer and kind == "user":' 'if False and kind == "user":'
 sessmut "o manifest não diz guard_layer" '**({"guard_layer": "session"} if self.session_layer else {})' '**({})'
+sessmut "o hook do guarda da camada sai com onFailure continue (a falha de prazo do claude volta a seguir sem conferência)" 'GUARD_ON_FAILURE = "block"' 'GUARD_ON_FAILURE = "continue"'
 sessmut "o hook aponta para o guarda do ~/.claude (home) e não para guard/" 'where = f"{self.a.remote_root}/guard" if self.session_layer else f"{self.a.remote_home}/.claude/hooks"' 'where = f"{self.a.remote_home}/.claude/hooks"'
 pymut "$B" "$T/mutant.py" 'if self.session_layer:  # o script iria para' 'if False:  # o script iria para'; ok $? "  o builder tem a recusa do hook keep na camada (o mutante abaixo não é um no-op)"
 sess_keep "$T/mutant.py" --guard-layer session; [ $? = 0 ]; ok $? "controle negativo: sem a recusa o hook keep passaria a escrever em {remote_home}/.claude/hooks"

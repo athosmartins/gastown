@@ -754,12 +754,16 @@ sem o grupo de Bash@@.hooks.PreToolUse|=map(select(.matcher!="Bash"))
 sem MultiEdit na lista@@.hooks.PreToolUse[1].matcher="Edit|Write|NotebookEdit"
 com disableAllHooks@@.disableAllHooks=true
 chamando outro guarda@@.hooks.PreToolUse|=map(.hooks|=map(.command|=sub("remote-clone-guard";"outro-guard")))
+com onFailure continue (a falha aberta de volta, ga-14qtcy9)@@.hooks.PreToolUse|=map(.hooks|=map(.onFailure="continue"))
+com onFailure fora do enum (Block)@@.hooks.PreToolUse|=map(.hooks|=map(.onFailure="Block"))
 sem hooks nenhum@@del(.hooks)'
   while IFS= read -r ln; do
     [ -n "$ln" ] || continue; d=${ln%%@@*}; expr=${ln#*@@}
     printf '%s' "$h" | jq "$expr" > "$st"; fresh
     pv start g-set < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'selfcheck' && [ "$(count)" = 0 ]; ok $? "gate: settings do host $d → o --selfcheck reprova e nada abre (rc=$RC $(head -c 120 "$T/err"))"
   done <<< "$mut"
+  printf '%s' "$h" | jq '.hooks.PreToolUse|=map(.hooks|=map(.onFailure="block"))' > "$st"; fresh
+  pv start g-onf < <(req "$HOLD"); ok $RC "gate: settings do host com onFailure \"block\" nos hooks do guarda (a forma que o bundle gera, ga-14qtcy9) → o --selfcheck aprova e a sessão real abre (rc=$RC $(head -c 160 "$T/err"))"; pv stop g-onf </dev/null
   printf '{ isto não é json' > "$st"; fresh; pv start g-set < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'selfcheck' && [ "$(count)" = 0 ]; ok $? "gate: settings do host ilegíveis (JSON quebrado) → recusa"
   rm -f "$st"; fresh; pv start g-set < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'selfcheck' && [ "$(count)" = 0 ]; ok $? "gate: settings do host AUSENTES → recusa"
   install_host
@@ -863,12 +867,16 @@ sem MultiEdit na lista@@.hooks.PreToolUse[1].matcher="Edit|Write|NotebookEdit"
 com disableAllHooks=true@@.disableAllHooks=true
 SEM o disableAllHooks:false explícito (um disableAllHooks:true pessoal ou do projeto o desligaria sem ninguém ver)@@del(.disableAllHooks)
 chamando outro guarda@@.hooks.PreToolUse|=map(.hooks|=map(.command|=sub("remote-clone-guard";"outro-guard")))
+com onFailure continue (a falha aberta de volta, ga-14qtcy9)@@.hooks.PreToolUse|=map(.hooks|=map(.onFailure="continue"))
+com onFailure fora do enum (Block)@@.hooks.PreToolUse|=map(.hooks|=map(.onFailure="Block"))
 sem hooks nenhum@@del(.hooks)'
   while IFS= read -r ln; do
     [ -n "$ln" ] || continue; d=${ln%%@@*}; expr=${ln#*@@}
     printf '%s' "$h" | jq "$expr" > "$st"; fresh
     pv start w-remote-m-5 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'selfcheck' && mzero w-remote-m-5; ok $? "lay: settings do bundle $d → o --selfcheck reprova e nada abre (rc=$RC $(head -c 120 "$T/err"))"
   done <<< "$mut"
+  printf '%s' "$h" | jq '.hooks.PreToolUse|=map(.hooks|=map(.onFailure="block"))' > "$st"; fresh
+  pv start w-remote-m-5 < <(req "$HOLD"); ok $RC "lay: settings do bundle com onFailure \"block\" nos hooks do guarda (a forma que o builder gera, ga-14qtcy9) → o --selfcheck aprova e a sessão real abre (rc=$RC $(head -c 160 "$T/err"))"; pv stop w-remote-m-5 </dev/null
   printf '%s' "$h" | jq --arg rh "$RH" --arg g "$GUARDF" '.hooks.PreToolUse|=map(.hooks|=map(.command|="python3 -I \($rh)/.claude/hooks/\($g) || exit 2"))' > "$st"; fresh
   pv start w-remote-m-5 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'selfcheck' && mzero w-remote-m-5; ok $? "lay: settings do bundle com o hook apontando para o guarda do ~/.claude do host (a camada de casa) → reprova: na sessão o guarda é o do bundle (rc=$RC)"
   printf '{ isto não é json' > "$st"; fresh; pv start w-remote-m-5 < <(req "$HOLD"); [ $RC = 1 ] && has "$T/err" 'selfcheck' && mzero w-remote-m-5; ok $? "lay: settings do bundle ilegíveis (JSON quebrado) → recusa"
