@@ -20,8 +20,20 @@
 #   wa-node-dispatch.sh falsos. Contra um dispatcher sem a fatia o arquivo se recusa a começar — o vermelho honesto.
 # CONTROLE NEGATIVO: cada guarda desligada numa cópia do dispatcher (WNP_NO_MUTANTS=1 pula) tem que reprovar este arquivo.
 # Variáveis: PILOT_DISPATCHER_PATH · WNP_NO_MUTANTS=1 (ou o argumento --no-mutants: o `mbp-run.sh --repo hq` repassa argumentos ao `bash`, nunca variáveis de ambiente)
+# FATIA (ga-2hd02v.3.26): a bateria inteira (mais de 150 mutantes, ~27 s cada no nó) passa do teto de 3600 s do `mbp-run.sh`. `--mut-slice A-B` roda só os mutantes de A a B (contados de 1, na ordem do mutants.txt),
+#   em fatias paralelas no nó. vazio (argumento ausente) → todos os mutantes; falhou/ilegível (o que não é N-M com 1 <= A <= B) → recusa com rc 2 sem rodar nada: uma fatia errada não pode passar por bateria inteira.
 set -uo pipefail
 [ "${1:-}" != "--no-mutants" ] || WNP_NO_MUTANTS=1
+MUT_FROM=1; MUT_TO=999999
+if [ "${1:-}" = "--mut-slice" ]; then
+  case "${2:-}" in
+    [0-9]*-[0-9]*) MUT_FROM="${2%%-*}"; MUT_TO="${2##*-}" ;;
+    *) echo "FATAL: --mut-slice quer A-B (números), veio '${2:-}'" >&2; exit 2 ;;
+  esac
+  case "$MUT_FROM$MUT_TO" in *[!0-9]*) echo "FATAL: --mut-slice quer A-B (números), veio '$2'" >&2; exit 2 ;; esac
+  [ "$2" = "$MUT_FROM-$MUT_TO" ] || { echo "FATAL: --mut-slice quer A-B (números), veio '$2'" >&2; exit 2; }
+  if [ "$MUT_FROM" -lt 1 ] || [ "$MUT_FROM" -gt "$MUT_TO" ]; then echo "FATAL: --mut-slice quer 1 <= A <= B, veio '$2'" >&2; exit 2; fi
+fi
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCHER="${PILOT_DISPATCHER_PATH:-$SELF_DIR/pilot-dispatcher.sh}"
 PASS=0; FAIL=0
@@ -996,8 +1008,11 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
   MUTANTS_FILE="$SELF_DIR/pilot-dispatcher.wa-node-pass.mutants.txt"
   if [ -f "$MUTANTS_FILE" ]; then
     # formato: nome<TAB>âncora<TAB>troca, uma linha por mutante (\n escrito como \\n)
+    mi=0
     while IFS=$'\t' read -r mname manchor mrepl; do
       [ -n "$mname" ] || continue
+      mi=$((mi+1))
+      if [ "$mi" -lt "$MUT_FROM" ] || [ "$mi" -gt "$MUT_TO" ]; then continue; fi
       manchor="${manchor//\\n/$'\n'}"; mrepl="${mrepl//\\n/$'\n'}"
       mutant "$mname" "$manchor" "$mrepl"
     done < "$MUTANTS_FILE"
