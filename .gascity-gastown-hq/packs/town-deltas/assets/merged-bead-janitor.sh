@@ -1252,7 +1252,11 @@ while IFS= read -r rig; do
   fetch_once "$RGITDIR" "$RCONTAINER"
 
   # in_progress beads in this rig's store.
-  INPROG=$(bd -C "$RPATH" list --status in_progress --json 2>/dev/null || echo '[]')
+  # --limit 0 (ga-26jevvc, rule ga-21kmp): `bd list` cuts at 50 by default and says so only on stderr,
+  # so past 50 in_progress beads in one rig the 51st+ would never be swept.
+  # vazio → nothing to sweep; falhou/ilegível → '[]' too, which is inert here (the loop below acts only
+  # on the beads this read returned, so an empty read touches nothing; the next sweep re-reads).
+  INPROG=$(bd -C "$RPATH" list --status in_progress --limit 0 --json 2>/dev/null || echo '[]')
   [ -z "$INPROG" ] && INPROG='[]'
   N=$(printf '%s' "$INPROG" | jq 'length' 2>/dev/null || echo 0)
   log "rig $RNAME ($RPREFIX): $N in_progress bead(s) [store=$RPATH git=$RGITDIR default=$RDEFAULT]"
@@ -1459,7 +1463,11 @@ EOF
   # computation below mirrors the in_progress sweep line-for-line (F_-prefixed
   # vars); see that sweep's comments above for the false-close history each guard
   # defends against (repo-scoping, branch self-guard, strict subject-scope).
-  INFLIGHT=$(bd -C "$RPATH" list --status open --json -l story:in-flight 2>/dev/null || echo '[]')
+  # --limit 0 (ga-26jevvc, rule ga-21kmp): same reason as the in_progress read above — `bd list` stops at
+  # 50 silently, so past 50 open story:in-flight beads in one rig the 51st+ would never be reconciled.
+  # vazio → nothing to sweep; falhou/ilegível → '[]' too, inert (the loop below acts only on the beads
+  # this read returned).
+  INFLIGHT=$(bd -C "$RPATH" list --status open --limit 0 --json -l story:in-flight 2>/dev/null || echo '[]')
   [ -z "$INFLIGHT" ] && INFLIGHT='[]'
   FN=$(printf '%s' "$INFLIGHT" | jq 'length' 2>/dev/null || echo 0)
   [ "$FN" = "0" ] || log "rig $RNAME ($RPREFIX): $FN open story:in-flight bead(s) to check for stranded-wrapper reconciliation"

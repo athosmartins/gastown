@@ -970,8 +970,8 @@ eq "in-flight active (not yet done): in-flight guard wins over commit signal" \
 # repo-scoping, branch self-guard) as the in_progress sweep, not a fresh or
 # looser decision path.
 echo "── 9. Drift-guard: ga-hcj4 stranded open+story:in-flight sweep ──"
-grep -qF 'list --status open --json -l story:in-flight' "$JANITOR" \
-  && ok "queries open+story:in-flight beads (third bucket)" || bad "open+story:in-flight query missing"
+grep -qF 'list --status open --limit 0 --json -l story:in-flight' "$JANITOR" \
+  && ok "queries open+story:in-flight beads (third bucket), unbounded (--limit 0, ga-26jevvc)" || bad "open+story:in-flight query missing or lost --limit 0"
 grep -qF 'janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH"' "$JANITOR" \
   && ok "in-flight bucket reuses janitor_decide unchanged (no parallel decision fn)" || bad "in-flight bucket does not call janitor_decide"
 grep -qF 'scan_commit_subject_for_bead "$RGITDIR" "$RCONTAINER" "origin/$RDEFAULT" "$FID"' "$JANITOR" \
@@ -1985,6 +1985,124 @@ if bv_closed; then bad "story with an unparseable updated_at was closed"; else o
 grep -qF 'state=unknown' "$BV_OUT" && ok "...and the log names the unreadable state" || bad "an unreadable age is kept silently"
 bv_run 5000 "$PASSED" "ten-minutes"
 if bv_closed; then bad "an unparseable grace setting dropped the wait and closed the story"; else ok "gate:passed + non-numeric grace setting -> NOT closed (the typo holds, loudly)"; fi
+
+echo ""
+echo "── ga-26jevvc: the sweeps read EVERY in_progress / open story:in-flight bead — bd list cuts at 50 ──"
+# `bd list` returns at most 50 rows unless told otherwise, and says so only on stderr (ga-21kmp), so a sweep that
+# lists without --limit 0 never sees the 51st bead of a rig. Three layers: a class guard over the janitor's text,
+# one pin per sweep read, and the REAL sweep against a stub bd that has bd's real cut-off with the merged bead
+# sitting at position 51. `--all` is exempt: measured on the live store, `bd list --all` returns everything
+# (5642 gate markers, no --limit), which is why markers_for_bead is not on the list.
+# vazio → the janitor has no bd list line the pattern knows (the guard would pass having looked at nothing):
+# that is its own failure below, never an "ok"; falhou/ilegível → same empty, same failure.
+LIST_LINES=$(grep -nE 'bd -C [^|]*[[:space:]]list[[:space:]]' "$JANITOR" | grep -vE '^[0-9]+:[[:space:]]*#' || true)
+LIST_N=$(printf '%s\n' "$LIST_LINES" | grep -c . || true)
+UNBOUNDED=$(printf '%s\n' "$LIST_LINES" | grep -e '--json' | grep -vE -e '--limit 0|--all' || true)
+if [ "${LIST_N:-0}" -lt 3 ]; then
+  bad "class guard looked at only ${LIST_N:-0} bd list line(s) (the janitor has 5 today): the pattern no longer matches how the janitor calls bd, so a pass here would prove nothing"
+elif [ -z "$UNBOUNDED" ]; then ok "class guard: all $LIST_N bd list --json lines in the janitor carry --limit 0 (or --all)"
+else bad "class guard: bd list --json without --limit 0/--all (cut at 50, silently): $UNBOUNDED"; fi
+grep -qF 'list --status in_progress --limit 0 --json' "$JANITOR" \
+  && ok "the in_progress read is unbounded (--limit 0)" || bad "the in_progress read lost --limit 0"
+
+LIM="$T/ga26jevvc"; mkdir -p "$LIM"; LIM_N=0
+# lim_fixture <inflight|inprog> <total> <merged_index> — a fresh run dir $LIM_D: a rig clone whose origin/main holds
+# "fix(<merged id>): merged work", and <total> beads ga-lm001.. all in the bucket under test. ONLY bead number
+# <merged_index> has merge evidence (a bug), so the janitor closes exactly that one iff it gets to see it. The
+# others are EPICS: they exist to push the merged bead past the cut, so the janitor never closes one by accident
+# (it never closes an epic) and skips the commit/branch scans for them. A 51-bead sweep still costs ~35 s on the
+# mini under its usual load (measured 31/10: ~60 s with bugs as filler, ~35 s with epics) — process forks per
+# bead, which the scenarios below pay twice; the controls use 5 beads for that reason.
+# The stub bd cuts `list` at 50 unless --limit 0 / --all (bd 1.1.0 as measured), and the stub notify keeps THESE
+# sweeps from pushing a real notification to the Athos (the older botvu2 scenarios above stub gc and bd but not
+# notify, so a run without a notify stub in the caller's PATH can still push one from there).
+lim_fixture() {
+  local bucket="$1" total="$2" idx="$3" status labels
+  LIM_N=$((LIM_N+1)); LIM_D="$LIM/run$LIM_N"; LIM_MID=$(printf 'ga-lm%03d' "$idx")
+  mkdir -p "$LIM_D/bin" "$LIM_D/city/.gc/logs"
+  case "$bucket" in
+    inflight) status="open";        labels='["story:in-flight"]' ;;
+    inprog)   status="in_progress"; labels='[]' ;;
+  esac
+  git init -q --bare -b main "$LIM_D/origin.git"
+  git init -q -b main "$LIM_D/rig"
+  ( cd "$LIM_D/rig" && echo a > a && git add a \
+    && git -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false commit -q -m base \
+    && echo b > b && git add b \
+    && git -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false commit -q -m "fix($LIM_MID): merged work" \
+    && git remote add origin "$LIM_D/origin.git" && git push -q origin main ) >/dev/null 2>&1
+  jq -n --argjson n "$total" --argjson mi "$idx" --arg st "$status" --argjson lb "$labels" \
+    '[range(1; $n+1) | {id: ("ga-lm" + ((1000+.)|tostring|.[1:])), title: "fixture bead", issue_type: (if . == $mi then "bug" else "epic" end), status: $st, assignee: "", labels: $lb}]' > "$LIM_D/beads.json"
+  cat > "$LIM_D/bin/gc" <<STUB
+#!/usr/bin/env bash
+if [ "\$3" = "rig" ] && [ "\$4" = "list" ]; then
+  printf '{"rigs":[{"name":"limrig","prefix":"ga","path":"$LIM_D/rig","default_branch":"main","hq":false}]}'
+fi
+exit 0
+STUB
+  printf '#!/bin/sh\nexit 0\n' > "$LIM_D/bin/notify"
+  cat > "$LIM_D/bin/bd" <<'STUB'
+#!/usr/bin/env bash
+D="$(cd "$(dirname "$0")/.." && pwd)"
+printf '%s\n' "$*" >> "$D/bd.log"
+[ "${1:-}" = "-C" ] && shift 2
+cmd="${1:-}"
+case "$cmd" in
+  list)
+    # The fixture holds no gate markers, and markers_for_bead asks once per bead: answer without the jq forks.
+    case " $* " in *" type:quality-gate-marker "*) printf '[]'; exit 0 ;; esac
+    shift; st=""; lim=""; all=0; lbl=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --status)   st="$2"; shift ;;
+        --limit|-n) lim="$2"; shift ;;
+        -l)         lbl+=("$2"); shift ;;
+        --all)      all=1 ;;
+      esac
+      shift
+    done
+    if [ -z "$lim" ]; then if [ "$all" = "1" ]; then lim=0; else lim=50; fi; fi
+    lj=$(printf '%s\n' "${lbl[@]:-}" | jq -R . | jq -sc 'map(select(length > 0))')
+    jq -c --arg st "$st" --argjson all "$all" --argjson want "$lj" --argjson lim "$lim" '
+      [.[] | . as $b | select(($all == 1 or $b.status != "closed") and ($st == "" or $b.status == $st)
+                              and ($want | all(. as $l | (($b.labels // []) | index($l)) != null)))]
+      | if $lim == 0 then . else .[0:$lim] end' "$D/beads.json" ;;
+  show)     jq -c --arg id "${2:-}" '[.[] | select(.id == $id)]' "$D/beads.json" ;;
+  comments) printf '[]' ;;
+  close)    jq --arg id "${2:-}" 'map(if .id == $id then .status = "closed" else . end)' "$D/beads.json" > "$D/beads.tmp" \
+              && mv "$D/beads.tmp" "$D/beads.json" ;;
+esac
+exit 0
+STUB
+  chmod +x "$LIM_D/bin/gc" "$LIM_D/bin/bd" "$LIM_D/bin/notify"; : > "$LIM_D/bd.log"
+}
+# lim_sweep — one real janitor run against $LIM_D. LIM_LOG = the bd calls of this run; LIM_OUT = the janitor's log.
+lim_sweep() {
+  LIM_OUT="$LIM_D/out.log"; LIM_LOG="$LIM_D/bd.log"; : > "$LIM_LOG"
+  env GC_CITY_PATH="$LIM_D/city" JANITOR_LOG_STDOUT=1 JANITOR_DRY_RUN=0 PATH="$LIM_D/bin:$PATH" bash "$JANITOR" > "$LIM_OUT" 2>&1
+}
+lim_closed() { grep -qE " close $LIM_MID( |\$)" "$LIM_LOG"; }
+lim_closes() { grep -cE ' close ga-lm' "$LIM_LOG" || true; }
+
+# The control first: a merged bead inside the first 50 closes in any version — proves the fixture, stub and sweep work.
+lim_fixture inflight 5 3; lim_sweep
+if lim_closed; then ok "control: 5 in-flight beads, the merged one is #3 -> closed"; else bad "control: in-flight fixture does not close its merged bead (#3) — the harness is broken, not the janitor"; fi
+eq "...and only that one was closed" "$(lim_closes)" "1"
+lim_fixture inprog 5 3; lim_sweep
+if lim_closed; then ok "control: 5 in_progress beads, the merged one is #3 -> closed"; else bad "control: in_progress fixture does not close its merged bead (#3) — the harness is broken, not the janitor"; fi
+eq "...and only that one was closed" "$(lim_closes)" "1"
+
+# The bug: the merged bead is #51 — past the cut. Only an unbounded read reaches it.
+lim_fixture inflight 51 51; lim_sweep
+grep -qF 'rig limrig (ga): 51 open story:in-flight bead(s)' "$LIM_OUT" \
+  && ok "in-flight sweep counted all 51 beads" || bad "in-flight sweep did not see 51 beads (bd list cut at 50): $(grep -F 'story:in-flight bead(s)' "$LIM_OUT" | head -1)"
+if lim_closed; then ok "the 51st open story:in-flight bead (merged) is closed"; else bad "the 51st open story:in-flight bead was never swept — bd list cut at 50"; fi
+eq "...and only that one was closed" "$(lim_closes)" "1"
+lim_fixture inprog 51 51; lim_sweep
+grep -qF 'rig limrig (ga): 51 in_progress bead(s)' "$LIM_OUT" \
+  && ok "in_progress sweep counted all 51 beads" || bad "in_progress sweep did not see 51 beads (bd list cut at 50): $(grep -F 'in_progress bead(s)' "$LIM_OUT" | head -1)"
+if lim_closed; then ok "the 51st in_progress bead (merged) is closed"; else bad "the 51st in_progress bead was never swept — bd list cut at 50"; fi
+eq "...and only that one was closed" "$(lim_closes)" "1"
 
 echo ""
 echo "──────────────────────────────────────────"
