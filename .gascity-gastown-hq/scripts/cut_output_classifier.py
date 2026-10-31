@@ -21,8 +21,9 @@ output into one of these shapes:
   5. None ("unstructured"): output is large but does not match any fixed shape above. This module
      answers ONLY "does a fixed, no-AI rule apply here, and if so what would it keep", so for such an
      output it has no verdict of its own to give. The caller (cut-output-shadow.py) records it with
-     unmatched_verdict() -- rule "unmatched", "no fixed rule applies, so nothing is cut" -- and sends
-     it nowhere else (a Jev tier for these outputs was split off this bead: ga-d0hm85).
+     unmatched_verdict() -- rule "unmatched", "no fixed rule applies, so nothing is cut". A separate,
+     opt-in tier (cut_output_jev.py, ga-d0hm85) may judge a sample of these outputs with Jev; this
+     module never does, and never sends anything anywhere.
 
 SINGLE SOURCE (ga-wk0qi2 gate attempt 4): a classifier only chooses WHICH LINES to keep, and
 _verdict_from_kept_lines() derives everything else from that one partition -- kept_text,
@@ -255,6 +256,22 @@ def unmatched_verdict(text: str) -> dict:
     is simply not written) would leave to read as a call too small to consider. Never raises."""
     lines, offsets = _split_lines(text)
     return _verdict_from_kept_lines("unmatched", text, lines, offsets, set(range(len(lines))), reason="no-fixed-rule-applies")
+
+
+def omit_lines_verdict(rule: str, text: str, omit_ranges: list[tuple[int, int]]) -> dict:
+    """The verdict for a cut decided by something other than a shape rule (the Jev tier, ga-d0hm85): omit the LINE
+    ranges [start, end) of `text`, keep every other line. Built through the same single partition as every
+    other verdict (_verdict_from_kept_lines), so the same invariants hold -- kept and omitted tile the text, the
+    marker cost is inside chars_after/tokens_after, and a cut that would not shrink the output comes back as
+    the explicit rule "no-gain" instead of a phantom saving. A range outside the text is clipped, an empty or
+    inverted one omits nothing. With NOTHING omitted the verdict is "no-gain" too (the text is kept whole), so
+    a caller that wants "nothing to cut" as its own fact must not ask. Never raises."""
+    lines, offsets = _split_lines(text)
+    total = len(lines)
+    omit: set[int] = set()
+    for start, end in omit_ranges:
+        omit.update(range(max(0, start), min(total, end)))
+    return _verdict_from_kept_lines(rule, text, lines, offsets, set(range(total)) - omit)
 
 
 def classify_pytest(text: str) -> dict | None:
@@ -978,10 +995,10 @@ def _selftest() -> int:
     for v in violations[:8]:
         print(f"    violation: {v}")
 
-    # ---- Mayor 28/09 23:1x: the Jev tier left this bead (ga-d0hm85), so a large output NO fixed rule applies to is no
-    # longer handed to anything. classify_output() still answers None for it (no verdict from a rule), and the caller
-    # records that as a verdict of its own -- 'unmatched', "I do not know how to cut this, so I do not cut it" -- built
-    # the same single-source way as every other one, so the same partition oracles hold for it ----
+    # ---- a large output NO fixed rule applies to: classify_output() answers None for it (no verdict from a rule), and the
+    # caller records that as a verdict of its own -- 'unmatched', "I do not know how to cut this, so I do not cut it" --
+    # built the same single-source way as every other one, so the same partition oracles hold for it. (What happens to it
+    # next -- the opt-in Jev tier, ga-d0hm85 -- is cut_output_jev.py's business, not this module's.) ----
     unmatched_fn = globals().get("unmatched_verdict")
     # large enough to be considered (>= MIN_CHARS_TO_CONSIDER) and short enough that no rule applies (<= DEFAULT_MAX_LOG_LINES lines)
     unmatched_prose = "\n\n".join(f"paragraph {i} with some ordinary words" for i in range(80))
