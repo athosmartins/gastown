@@ -3,10 +3,13 @@
 #
 #   A. answers   the three-way answer on fixtures: covered / the 25/10 incident (conf ON, 12 beads, 2 rows) / no arms file, empty, unreadable / too few runs /
 #                the thresholds / a gate log that cannot be read is rc 2, never "0 runs" / conf absent, warn, off, invalid / kill-switch flags / own kill switch
-#   B. counting  what is a run (dry runs, closed beads, old, future, beadless are not), per BEAD not per row, the conf-age gate, corrupt / invalid arm rows
+#   B. counting  what is a run (dry runs, closed beads, old, future are not), per BEAD not per row, the conf-age gate, corrupt / invalid arm rows,
+#                and a gate log that is only PARTLY readable (unparseable lines, verdicts with no usable ts/bead, an empty bead): NAO SEI unless provably before
+#                the window (gate-fix 1: 40 truncated lines used to read as "dentro do limite"); the detector's reader pinned to the report's own reader
 #   C. producers the diagnosis parses a line made by the REAL guard block (extracted, run with the guard's own log()), and the arms we count are written by the
 #                REAL check (third-state-reads-check.py): the builder's --no-record path never counts as coverage
-#   D. alarm     cooldown, a failed delivery is retried and fails the --order run, recovery re-arms, an inconclusive tick keeps the marks, hostile bead ids
+#   D. alarm     cooldown, a failed delivery is retried and fails the --order run, recovery re-arms, an inconclusive tick keeps the marks (also the one that
+#                returned early and the one that could only read the log in part), hostile bead ids, a sibling that dies at import in any way
 #   E. controls  mutants of the detector, each of which one case above must catch (a selftest that cannot fail proves nothing)
 # Hermetic: scratch dir only, throw-away git repo, a stub router; needs python3 and git. Env: TSAC_KEEP=1 keeps the scratch dir,
 # TSAC_SHOW_KILLS=1 prints which assertion killed each mutant (to see that it died of the intended difference). bash 3.2 safe.
@@ -96,7 +99,7 @@ case_thresholds() { newcity thr; conf mode=enforce; runs ga-t 20; arms ga-t 1 18
   newcity thre; conf mode=enforce; runs ga-t 20; arms ga-t 1 18; run TSAC_MAX_UNCOVERED_PCT=5; want 1 "the percentage is tunable (5%: 2 of 20 alarms)"
   run TSAC_MAX_UNCOVERED_PCT=garbage; want 0 "a garbage value is the default (10%), never 'no limit'"; }
 case_blind() { newcity bl1; conf mode=enforce; rm -f "$C/.gc/quality-gate.jsonl"
-  run; want 2 "gate log absent: rc 2 (NAO SEI), never '0 runs'" "NAO SEI.*NAO e 0 runs"; mails 1 "...and a 'blind' alarm"; mailhas "cego|alarme-cego" "...with its own subject"
+  run; want 2 "gate log absent: rc 2 (NAO SEI), never '0 runs'" "NAO SEI.*NAO e 0 runs"; mails 1 "...and a 'blind' alarm"; mailhas "alarme-cego -- nao consegui ler quality-gate.jsonl" "...with its own subject"
   newcity bl2; conf mode=enforce; : > "$C/.gc/quality-gate.jsonl"; run; want 2 "gate log empty: rc 2"
   newcity bl3; conf mode=enforce; printf 'garbage not json at all\n{"half": \n' > "$C/.gc/quality-gate.jsonl"; run; want 2 "gate log with only unparseable lines: rc 2"
   if [ "$IS_ROOT" = 0 ]; then newcity bl4; conf mode=enforce; runs ga-b 6; chmod 000 "$C/.gc/quality-gate.jsonl"; run; chmod 644 "$C/.gc/quality-gate.jsonl"; want 2 "gate log unreadable (chmod 000): rc 2"; fi
@@ -119,9 +122,10 @@ case_covered; case_incident; case_no_file; case_few_runs; case_thresholds; case_
 
 echo "== B. counting =="
 case_noise() { newcity noise; conf mode=enforce; runs ga-r 6; arms ga-r 1 6
-  v 2026-10-31T11:00:00Z ga-dry FAIL 1; v 2026-10-31T11:01:00Z ga-closed SKIPPED_BEAD_CLOSED; v 2026-10-30T12:00:00Z ga-old PASS; v 2026-10-31T16:00:00Z ga-future PASS; v 2026-10-31T11:02:00Z "" PASS
+  v 2026-10-31T11:00:00Z ga-dry FAIL 1; v 2026-10-31T11:01:00Z ga-closed SKIPPED_BEAD_CLOSED; v 2026-10-30T12:00:00Z ga-old PASS; v 2026-10-31T16:00:00Z ga-future PASS
+  v 2026-10-30T12:05:00Z "" PASS; v 2026-10-31T16:05:00Z "" FAIL   # a verdict with an empty bead is only a gap while it is inside the window (case_gate_log_gaps)
   printf '{"ts":"2026-10-31T11:03:00Z","event":"guard_dispatched","bead":"ga-ev"}\n' >> "$C/.gc/quality-gate.jsonl"
-  run; want 0 "dry runs, closed beads, a 26h-old run, a future one, a beadless one and other events are not runs: 6 beads, all covered" "veredito real na janela: 6;"; }
+  run; want 0 "dry runs, closed beads, a 26h-old run, a future one, beadless ones outside the window and other events are not runs: 6 beads, all covered" "veredito real na janela: 6;"; }
 case_per_bead() { newcity pb; conf mode=enforce; runs ga-p 5; arms ga-p 1 5; v 2026-10-31T12:00:00Z ga-p1 FAIL; v 2026-10-31T13:00:00Z ga-p1 PASS
   arm ga-orphan holdout; printf '{"bead":"ga-old","arm":"enforce","ts":"2026-09-01T00:00:00Z"}\n' >> "$C/.gc/third-state-reads-arms.jsonl"; v 2026-10-31T12:30:00Z ga-old PASS
   run; want 0 "a bead with 3 runs counts once; a row from a month ago still covers its bead; a row without a run is not a run: 6 beads, 6 covered" "veredito real na janela: 6; com braco: 6"; }
@@ -141,7 +145,76 @@ case_flags_cannot_stat() { newcity fl; conf mode=enforce; runs ga-l 12; ln -s th
   run; want 1 "a kill-switch flag that cannot be stat'ed (a symlink loop) is NOT a switch, as in the check and the guard: the divergence is still seen" "DIVERGE"; printf '%s' "$OUT" | grep -q 'ilegivel.*tratado como ausente' && ok "...and the unreadable flag is said" || bad "unreadable flag not announced"
   newcity fl2; conf mode=enforce; runs ga-l 8; arms ga-l 1 8; mkdir "$C/.gc/gate-hardchecks.off"; TZ=UTC touch -t 202610250000 "$C/.gc/gate-hardchecks.off"
   run; want 0 "a DIRECTORY named gate-hardchecks.off is not the guard's flag (it tests -f): no stale-switch alarm" "dentro do limite"; mails 0 "...no mail"; }
-case_noise; case_per_bead; case_conf_age; case_arm_rows; case_flags_cannot_stat
+# A gate log that is only PARTLY readable (ga-r4z4ve gate-fix 1). junk <line>... appends raw lines; trunc <n> [dated] appends n dispatcher_complete lines cut off mid-write
+# (dated: the ts survived, inside the window; otherwise the cut came before it). A run the detector cannot read is never "fewer runs": NAO SEI, unless it is provably old.
+junk() { printf '%s\n' "$@" >> "$C/.gc/quality-gate.jsonl"; }
+trunc() { local i=0; while [ "$i" -lt "$1" ]; do i=$((i+1))
+  if [ "${2:-}" = dated ]; then printf '{"ts":"2026-10-31T11:%02d:00Z","event":"dispatcher_complete","branch":"b","bead":"ga-tr%d\n' "$i" "$i" >> "$C/.gc/quality-gate.jsonl"
+  else printf '{"event":"dispatcher_complete","branch":"b","bead":"ga-tr%d\n' "$i" >> "$C/.gc/quality-gate.jsonl"; fi; done; }
+case_gate_log_gaps() { local row
+  newcity gp1; conf mode=enforce; runs ga-g 6; arms ga-g 1 5
+  run; want 0 "baseline: 6 beads, 5 arms, one hole (below 'at least 2'): within the limit" "dentro do limite"; mails 0 "...no mail"
+  trunc 40 dated
+  run; want 2 "the same log + 40 truncated lines dated inside the window (the gate's repro): NAO SEI, rc 2" "NAO SEI.*40 linha\(s\) ilegivel\(is\): 40 com ts dentro da janela"
+  printf '%s' "$OUT" | grep -q 'dentro do limite' && bad "...it must not claim 'cobertura dentro do limite' over 40 lines it could not read" || ok "...and it does not claim 'cobertura dentro do limite'"
+  mailhas "alarme-cego -- quality-gate.jsonl tem trechos" "...with its own blind mail"
+  newcity gp2; conf mode=enforce; runs ga-g 6; arms ga-g 1 6; trunc 3
+  run; want 2 "3 truncated lines with no ts of their own, last in the file: nothing proves them old, NAO SEI" "3 sem data propria que nao da para provar"
+  newcity gp3; conf mode=enforce; v 2026-06-04T10:00:00Z ga-june1; trunc 18
+  junk '{"ts":"2026-06-04T10:30:00Z","event":"dispatcher_comp' '{"ts":"2026-06-04T10:31:00Z","ev'; v 2026-06-04T11:00:00Z ga-june2; runs ga-g 6; arms ga-g 1 6
+  run; want 0 "20 old unreadable lines (18 with no ts, 2 dated June) between June rows, as in the live city: provably old, rc 0" "dentro do limite"
+  printf '%s' "$OUT" | grep -q '20 provadamente anteriores' && ok "...and said, not hidden" || bad "old unreadable lines not said :: $(printf '%s' "$OUT" | grep ilegivel)"
+  newcity gp4; conf mode=enforce; v 2026-06-04T10:00:00Z ga-june1; trunc 2; runs ga-g 6; arms ga-g 1 6
+  run; want 2 "2 lines with no ts whose NEXT readable row is inside the window may be from inside it: NAO SEI" "2 sem data propria"
+  newcity gp5; conf mode=enforce; runs ga-g 6; arms ga-g 1 6; junk '{"ts":"2026-10-29T08:00:00Z","event":"dispatcher_comp' '{"ts":"2026-10-31T16:30:00Z","event":"dispatcher_comp'
+  run; want 0 "a truncated line dated before the window, and one dated after now, cannot be a run in it: rc 0" "dentro do limite"
+  newcity gp6; conf mode=enforce; runs ga-g 6; arms ga-g 1 6; junk '{"ts":"2026-13-45T25:61:61Z","event":"dispatcher_comp'
+  run; want 2 "a truncated line whose ts has the right shape but is no date (month 13) is undated: NAO SEI, not a crash" "1 sem data propria"
+  newcity gp7; conf mode=enforce; runs ga-g 3; trunc 2 dated
+  run; want 2 "too few beads (3) AND unreadable lines in the window: NAO SEI, not 'sem conclusao' with rc 0 (the lines may be the other runs)" "NAO SEI"
+  printf '%s' "$OUT" | grep -q 'sem conclusao' && bad "...it must not say 'sem conclusao: poucos beads' as if it had counted them" || ok "...and it does not say 'poucos beads'"
+  newcity gp8; conf mode=enforce; runs ga-g 12; trunc 3 dated
+  run; want 1 "12 beads without an arm + 3 unreadable lines: still a divergence, rc 1" "DIVERGE"; mails 1 "...one mail"
+  mailhas "ATENCAO: quality-gate.jsonl: 3 linha\(s\) ilegivel.*pode ser maior" "...which says the real number may be larger"
+  for row in '{"event":"dispatcher_complete","bead":"ga-nots","result":"PASS","dry_run":"0"}' '{"ts":"yesterday","event":"dispatcher_complete","bead":"ga-nots","result":"FAIL","dry_run":"0"}' \
+             '{"ts":12345,"event":"dispatcher_complete","bead":"ga-nots","result":"PASS","dry_run":"0"}' '{"ts":"2026-10-31T11:30:00Z","event":"dispatcher_complete","bead":7,"result":"PASS","dry_run":"0"}'; do
+    newcity gp9; conf mode=enforce; runs ga-g 6; arms ga-g 1 6; junk "$row"
+    run; want 2 "a PASS|FAIL verdict whose ts or bead cannot be used (${row:0:44}...) may be a run: NAO SEI" "1 veredito\(s\) sem ts/bead legivel"
+  done
+  newcity gp10; conf mode=enforce; runs ga-g 6; arms ga-g 1 6; junk '{"event":"guard_dispatched","bead":"ga-x"}' '{"event":"dispatcher_complete","bead":"ga-nots","result":"SKIPPED_BEAD_CLOSED"}' '{"event":"dispatcher_complete","bead":"ga-nots","result":"PASS","dry_run":"1"}'
+  run; want 0 "rows with no ts that are NOT a real PASS|FAIL verdict (another event, SKIPPED, a dry run) are not runs: rc 0" "dentro do limite"
+  newcity gp11; conf mode=enforce; v 2026-06-04T10:00:00Z ga-june1; junk '{"event":"dispatcher_complete","bead":"ga-nots","result":"PASS","dry_run":"0"}'; v 2026-06-04T11:00:00Z ga-june2; runs ga-g 6; arms ga-g 1 6
+  run; want 0 "a verdict with no ts between two June rows is placed by them: old, rc 0" "dentro do limite"
+  printf '%s' "$OUT" | grep -q '1 provadamente anteriores' && ok "...and said" || bad "old verdict without ts not said :: $(printf '%s' "$OUT" | grep veredito)"
+  newcity gp12; conf mode=enforce; runs ga-g 6; arms ga-g 1 6; v 2026-10-31T11:30:00Z "" FAIL
+  run; want 2 "a real verdict with an EMPTY bead (the dispatcher could not read the marker) inside the window is a run nobody can name: NAO SEI" "1 veredito\(s\) com bead vazio na janela"; }
+# The detector reads the gate log itself (it needs the file order, which report.read_jsonl throws away): it must call the same lines rows, bad and dated.
+case_reader_parity() { newcity rp; conf mode=enforce; runs ga-p 3
+  junk '' '   ' 'not json' '[1, 2]' '7' 'null' '"a string"' '{"ts":"2026-10-31T11:00:00Z","event":"disp' '{"event":"no ts' '{"ts":"2026-10-31T11:10:00Z"}' '{"event":"dispatcher_complete","bead":"ga-nots","result":"PASS"}' '{"ts":"bad","event":"dispatcher_complete","bead":"ga-b","result":"FAIL"}'
+  printf 'crlf line\r\n{"ts":"2026-10-31T11:20:00Z","event":"x"}\r\n' >> "$C/.gc/quality-gate.jsonl"
+  printf '\377\376 not utf8 {"ts":"2026-10-31T11:21:00Z"\n' >> "$C/.gc/quality-gate.jsonl"
+  printf 'a\vb {"ts":"2026-10-31T11:22:00Z","e\n' >> "$C/.gc/quality-gate.jsonl"
+  v 2026-10-31T11:30:00Z ga-p9
+  "$PY" -B -I -c '
+import datetime, importlib.util, sys
+def load(p, n):
+    s = importlib.util.spec_from_file_location(n, p); m = importlib.util.module_from_spec(s); s.loader.exec_module(m); return m
+det, rep = load(sys.argv[1], "d"), load(sys.argv[2], "r")
+path = sys.argv[3]
+gs, items = det.read_gate_log(path, rep)
+st, rows, bad, bad_ts = rep.read_jsonl(path)
+assert gs == st == "ok", (gs, st)
+assert [x for k, x in items if k == "row"] == rows, "the two readers disagree on which lines are rows"
+assert sum(1 for k, _ in items if k == "bad") == bad, "the two readers disagree on how many lines are bad"
+assert [x for k, x in items if k == "bad" and x is not None] == bad_ts, "the two readers disagree on the ts of the bad lines"
+now = rep.parse_ts("2026-10-31T15:00:00Z"); lo = now - datetime.timedelta(hours=24)
+g = det.gate_gaps(items, lo, now, rep, True)
+assert sum(v for k, v in g.items() if k.startswith("lin_")) == bad, ("a bad line was not placed anywhere", g)
+assert sum(v for k, v in g.items() if k.startswith("reg_")) == rep.verdicts(rows)[1] == 2, ("a verdict row was not placed anywhere", g)
+for gone in (sys.argv[4], sys.argv[5]):
+    assert det.read_gate_log(gone, rep)[0] == rep.read_jsonl(gone)[0] != "ok", gone
+' "${DETX:-$DETB}" "$HERE/third-state-report.py" "$C/.gc/quality-gate.jsonl" "$W/no-such-log" "$C/.gc/logs" 2>"$W/par.err" && ok "the detector's reader and report.read_jsonl agree on rows, bad lines, their ts, and on absent / unreadable; every bad line and gap row is placed" || bad "reader parity: $(tail -2 "$W/par.err" | tr '\n' '|')"; }
+case_noise; case_per_bead; case_conf_age; case_arm_rows; case_flags_cannot_stat; case_gate_log_gaps; case_reader_parity
 
 echo "== C. producers: the guard's real log line and the check's real rows =="
 case_diag() { newcity dg; conf mode=enforce; runs ga-d 6; arms ga-d 1 2
@@ -223,12 +296,28 @@ case_cli_edges() { newcity ce; conf mode=enforce; runs ga-k 8
   i=0; while [ "$i" -lt 50 ] && ! grep -q held "$C/held.out" 2>/dev/null; do i=$((i+1)); sleep 0.1; done
   NOLOCK=""; run; want 2 "another instance holds the lock: the CLI run says it did NOT run (rc 2), never a clean 0" "outra inst"; ARGS="--order"; run; want 0 "...and the order tick just leaves (rc 0): the holder covers this round" "saindo"; ARGS=""
   wait; newcity ce2; conf mode=enforce; runs ga-k 8; : > "$C/.gc/runtime"; NOLOCK=""; run; want 2 "a lock that cannot be created: NAO SEI (rc 2), never 'ran fine'" "lock"; NOLOCK="--no-lock"; }
-case_cooldown; case_failed_delivery; case_rearm; case_inconclusive_keeps; case_seen_garbage; case_fallback_and_hostile; case_delivery_errors; case_cli_edges
+case_cego_kept_early() { newcity ck; conf mode=enforce; runs ga-k 8; rm -f "$C/.gc/quality-gate.jsonl"
+  run; want 2 "tick 1: gate log absent, blind" "NAO SEI"; mails 1 "...alarmed"
+  conf mode=warn; AT=2026-10-31T16:00:00Z run; want 0 "tick 2: conf switched to warn, nothing to cover and the gate log is not even read" "nao sorteia braco"
+  conf mode=enforce; AT=2026-10-31T17:00:00Z run; want 2 "tick 3: back to enforce, the gate log still absent" "NAO SEI"; mails 1 "...the blind mark survived the tick that did not look: still deduped"; AT=""; }
+case_gaps_keep_diverge() { newcity gk; conf mode=enforce; runs ga-k 12
+  run; want 1 "tick 1: 12 beads, no arms: alarmed" "DIVERGE"; mails 1 "...once"
+  arms ga-k 1 12; trunc 2 dated; AT=2026-10-31T16:00:00Z run; want 2 "tick 2: the arms are there but 2 lines of the window are unreadable: it cannot say it is fixed, NAO SEI" "NAO SEI"; mails 2 "...with its own blind mail"
+  rm -f "$C/.gc/third-state-reads-arms.jsonl"; AT=2026-10-31T17:00:00Z run; want 1 "tick 3: the arms are gone again, the lines still there: a divergence" "DIVERGE"
+  mails 2 "...and the mark of tick 1 survived the tick that could not judge: deduped (no third mail)"; AT=""; }
+case_cooldown; case_failed_delivery; case_rearm; case_inconclusive_keeps; case_cego_kept_early; case_gaps_keep_diverge; case_seen_garbage; case_fallback_and_hostile; case_delivery_errors; case_cli_edges
 case_crash_and_siblings() { local SRC="${DETX:-$DET}"; newcity cr; conf mode=enforce; runs ga-k 8; mkbin "$W/bin-crash"; rm -f "$W/bin-crash/third-state-report.py"
-  printf 'def read_jsonl(p):\n    raise RuntimeError("boom")\ndef verdicts(r):\n    return ([], 0, 0, 0)\n' > "$W/bin-crash/third-state-report.py"; cp "$SRC" "$W/bin-crash/third-state-arm-coverage.py"
+  printf 'def verdicts(r):\n    raise RuntimeError("boom")\n' > "$W/bin-crash/third-state-report.py"; cp "$SRC" "$W/bin-crash/third-state-arm-coverage.py"
   DETX="$W/bin-crash/third-state-arm-coverage.py"; run; DETX=""; want 2 "a crash inside the detector is rc 2 (NAO SEI), never rc 1 (a finding)" "internal error: RuntimeError"
   mkbin "$W/bin-nosib"; rm -f "$W/bin-nosib/third-state-reads-check.py"; cp "$SRC" "$W/bin-nosib/third-state-arm-coverage.py"; DETX="$W/bin-nosib/third-state-arm-coverage.py"; : > "$MAIL"; rm -f "$C/state/third-state-arm-coverage-seen.json"; run; DETX=""
-  want 2 "a missing sibling script is blind (rc 2), not 'no conf'" "NAO SEI"; mailhas "cego|irmaos|carregar" "...and alarmed"; }
+  want 2 "a missing sibling script is blind (rc 2), not 'no conf'" "NAO SEI"; mailhas "alarme-cego -- nao consegui carregar os scripts irmaos" "...and alarmed"
+  # a sibling that dies at import in a way nobody listed (a NameError) or that exits: still blind AND alarmed -- not the generic "internal error", not a silent rc 0
+  mkbin "$W/bin-nameerr"; rm -f "$W/bin-nameerr/third-state-report.py"; printf 'x = an_undefined_name\n' > "$W/bin-nameerr/third-state-report.py"; cp "$SRC" "$W/bin-nameerr/third-state-arm-coverage.py"
+  DETX="$W/bin-nameerr/third-state-arm-coverage.py"; : > "$MAIL"; rm -f "$C/state/third-state-arm-coverage-seen.json"; run; DETX=""
+  want 2 "a sibling that raises a NameError at import is blind (rc 2)" "NAO SEI.*NameError"; mailhas "alarme-cego -- nao consegui carregar os scripts irmaos" "...and ALARMED (the blind alarm, not the generic crash)"
+  mkbin "$W/bin-exit"; rm -f "$W/bin-exit/third-state-report.py"; printf 'import sys\nsys.exit(0)\n' > "$W/bin-exit/third-state-report.py"; cp "$SRC" "$W/bin-exit/third-state-arm-coverage.py"
+  DETX="$W/bin-exit/third-state-arm-coverage.py"; : > "$MAIL"; rm -f "$C/state/third-state-arm-coverage-seen.json"; run; DETX=""
+  want 2 "a sibling that calls sys.exit(0) at import is blind too, never a silent rc 0" "NAO SEI.*SystemExit"; }
 case_crash_and_siblings
 if [ ! -d "$W/bin/__pycache__" ] && { [ "$HAD_PYC" = 1 ] || [ ! -d "$HERE/__pycache__" ]; }; then ok "no __pycache__ written next to the detector or its siblings"; else bad "the detector left a __pycache__ behind"; fi
 ORDER_TOML="$HERE/../orders/third-state-arm-coverage.toml"
@@ -280,6 +369,30 @@ mutant oserror_uncaught 'except (OSError, subprocess.SubprocessError):' 'except 
 mutant timeout_ignored 'timeout=timeout_s' 'timeout=300' case_delivery_errors
 mutant no_lock 'fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)' 'pass' case_cli_edges
 mutant oldest_line_wins 'if m and m.group(3) in beads:' 'if m and m.group(3) in beads and m.group(3) not in out:' case_diag
+# the partly readable gate log (gate-fix 1): each way of throwing the unreadable part away, and each way of misplacing it, must die
+UNK='unknown = g["lin_in"] + g["lin_doubt"] + g["reg_in"] + g["reg_doubt"] + blank'
+mutant lines_dropped "$UNK" 'unknown = g["reg_in"] + g["reg_doubt"] + blank' case_gate_log_gaps
+mutant no_ts_dropped "$UNK" 'unknown = g["lin_in"] + g["lin_doubt"] + blank' case_gate_log_gaps
+mutant blank_dropped "$UNK" 'unknown = g["lin_in"] + g["lin_doubt"] + g["reg_in"] + g["reg_doubt"]' case_gate_log_gaps
+mutant rows_unchecked 'g = gate_gaps(items, lo, now, report, no_ts > 0)' 'g = gate_gaps(items, lo, now, report, False)' case_gate_log_gaps
+mutant every_row_a_gap 'elif check_rows and report.verdicts([x])[1]:' 'elif check_rows:' case_gate_log_gaps
+mutant blank_any_window 'elif lo <= t <= now:' 'else:' case_noise
+PLACE='return "out" if after is not None and after < lo else "doubt"'
+mutant undated_is_old "$PLACE" 'return "out"' case_gate_log_gaps
+mutant undated_is_doubt "$PLACE" 'return "doubt"' case_gate_log_gaps
+mutant undated_after_any "$PLACE" 'return "out" if after is not None else "doubt"' case_gate_log_gaps
+mutant own_ts_ignored 'return "in" if lo <= own <= now else "out"' 'return "in"' case_gate_log_gaps
+mutant own_ts_future_ok 'return "in" if lo <= own <= now else "out"' 'return "in" if lo <= own else "out"' case_gate_log_gaps
+mutant bad_ts_unguarded 'except (TypeError, ValueError):' 'except TypeError:' case_gate_log_gaps
+mutant poucos_runs_trusted 'if unknown and res["verdict"] != "diverge":' 'if unknown and res["verdict"] == "ok":' case_gate_log_gaps
+mutant diverge_blinded 'if unknown and res["verdict"] != "diverge":' 'if unknown:' case_gate_log_gaps
+mutant no_caveat 'body + " ATENCAO: " + gaps_text(g) + " O numero real de beads sem braco pode ser maior."' 'body' case_gate_log_gaps
+mutant gaps_unsaid 'if any(g.values()):   # said whenever anything is unreadable' 'if False:   # said whenever anything is unreadable' case_gate_log_gaps
+mutant partial_forgets_diverge $'res["unevaluated"] = ["diverge"]\n        return blind(res, "cego|gate-log-parcial"' $'res["unevaluated"] = []\n        return blind(res, "cego|gate-log-parcial"' case_gaps_keep_diverge
+mutant early_forgets '(["diverge"] if res["state"] == "interruptor" else []) + ["cego"]' '(["diverge"] if res["state"] == "interruptor" else [])' case_cego_kept_early
+mutant sibling_narrow 'except (Exception, SystemExit) as e:' 'except (OSError, SyntaxError, ImportError, AttributeError) as e:' case_crash_and_siblings
+mutant scalar_is_row $'if isinstance(d, dict):\n            items.append(("row", d))' $'if d is not None:\n            items.append(("row", d))' case_reader_parity
+mutant bad_ts_lost 'items.append(("bad", stamp(report, m.group(1)) if m else None))' 'items.append(("bad", None))' case_reader_parity
 
 echo "selftest: $PASS passed, $FAILN failed"
 REACHED_END=1

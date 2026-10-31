@@ -4,9 +4,10 @@
 Why: on 25/10 the check was ON (.gc/third-state-reads.conf: enforce, 50%) and had no effect for six days — 2 rows in .gc/third-state-reads-arms.jsonl
 against 437 beads with a first gate verdict — and nothing complained: "switched on" and "ran" are different facts and every file kept looking healthy.
 The cause (ga-r4z4ve): step 2e lived only in formulas/mol-quality-gate-runner.toml, which nothing pours (the live gate is guard -> dispatcher ->
-reviewers), so it ran only when someone found the formula and typed it by hand — the 2 rows can only be such loose runs, the builder's /gate-done uses
---no-record. ga-vywjzsp moved 2b-2e into the guard (Step 5b-pre5), so every swept marker draws and records its arm. This watches that from the OUTSIDE, with a source the guard does not write: every bead with a real verdict in
-quality-gate.jsonl (dispatcher_complete PASS|FAIL, not a dry run) must have a row in the arms file, whatever the guard's own labels say.
+reviewers), so it ran only when someone found the formula and typed it by hand — the 2 rows most likely come from such loose runs (the builder's /gate-done
+uses --no-record; where exactly they came from cannot be read from outside the mini).
+ga-vywjzsp moved 2b-2e into the guard (Step 5b-pre5), so every swept marker draws and records its arm. This watches that from the OUTSIDE, with a source the guard
+does not write: every bead with a real verdict in quality-gate.jsonl (dispatcher_complete PASS|FAIL, not a dry run) must have a row in the arms file, whatever the guard's own labels say.
 
 Counted per BEAD, not per row: the first row of a bead wins forever, so a re-run finds the row of its first sweep. Only mode=enforce draws arms
 (warn / off / no conf record nothing by design: said, not alarmed). Runs that completed before conf mtime + TSAC_SLACK_H are not counted: their
@@ -14,6 +15,10 @@ marker may have been swept before the check was switched on. Alarm "diverge" = a
 TSAC_MIN_UNCOVERED of them without an arm AND more than TSAC_MAX_UNCOVERED_PCT % of them without one (a few legitimate holes exist: a diff that edits
 the check itself is not judged, a fetch can fail — both fail open and loud in the guard). On their own keys: a conf the check cannot parse (it answers
 NÃO SEI to every submission), a kill-switch flag standing longer than TSAC_SWITCH_MAX_H, and a gate log or sibling script that cannot be read (blind).
+A gate log that is only PARTLY readable is blind too (ga-r4z4ve gate-fix 1): an unparseable line, a PASS|FAIL verdict whose ts or bead cannot be used, or one with an
+empty bead (the dispatcher could not read the marker) may be a run nobody can see. Each is dated by its own ts, else by the readable row written after it (the log is
+appended in order); only what is provably before the window is left out. Anything else makes "ok" and "poucos-runs" into NÃO SEI (key cego|gate-log-parcial);
+a "diverge" stands and says the real number may be larger.
 Each key is cooldown-deduped (TSAC_ESCALATE_AFTER_S), forgotten when its condition was evaluated and is gone, kept when it could not be evaluated.
 
 Exit (CLI): 0 nothing to report (also: not switched on, too few runs) | 1 an alarmable finding | 2 NÃO SEI (never "0 runs", never "ok").
@@ -57,7 +62,7 @@ def load_sibling(fname):
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         return mod, ""
-    except (OSError, SyntaxError, ImportError, AttributeError) as e:
+    except (Exception, SystemExit) as e:   # not a list of the failures someone imagined: a sibling that dies at import in ANY way is 'cego' (and a sys.exit(0) at import would read as 'nothing to report')
         return None, "%s: %s: %s" % (fname, type(e).__name__, e)
 
 
@@ -122,6 +127,85 @@ def guard_lines(path, beads, tail):
     return "ok", out
 
 
+def stamp(report, v):
+    """-> datetime | None. A ts in the gate log's own format (report.parse_ts); anything else is None, never a guess."""
+    # vazio → None (no ts key); falhou/ilegível → None as well: the caller keeps "I do not know when" as its own state and never reads it as "old"
+    try:
+        return report.parse_ts(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def read_gate_log(path, report):
+    """-> (state, items) in FILE order: ("row", dict) | ("bad", ts | None). The same rule as report.read_jsonl (a line is a row iff it parses to a JSON object; every other
+    non-blank line is bad, with its ts when still legible), but it keeps the order, which read_jsonl throws away and which is the only thing that dates a fragment with no
+    ts of its own. The selftest pins the two readers to the same counts."""
+    # vazio → ("ok", []): a real empty file; falhou/ilegível → "absent" (ENOENT) / "unreadable" (any other error) with no items: the caller is blind, never "0 runs"
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except FileNotFoundError:
+        return "absent", []
+    except OSError:
+        return "unreadable", []
+    items = []
+    for line in raw.decode("utf-8", "replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            d = None
+        if isinstance(d, dict):
+            items.append(("row", d))
+            continue
+        m = report.TS_RE.search(line)
+        items.append(("bad", stamp(report, m.group(1)) if m else None))
+    return "ok", items
+
+
+def place(own, after, lo, now):
+    """-> "in" | "out" | "doubt". Its own ts decides; with none, the readable row written AFTER it does (it was written before that row): a row before the window proves
+    it is old. Nothing after it, or something not before the window: "doubt" -- counted as possibly inside, never as old."""
+    if own is not None:
+        return "in" if lo <= own <= now else "out"
+    return "out" if after is not None and after < lo else "doubt"
+
+
+def gate_gaps(items, lo, now, report, check_rows):
+    """-> {"lin_<p>": unparseable lines, "reg_<p>": real PASS|FAIL verdict rows with no usable ts/bead} for p in in|doubt|out: what the readable verdicts say nothing about.
+    check_rows: verdicts() found such rows (its no_ts count), so each row needs the per-row look; without them only the lines are placed."""
+    # vazio → all zeros (every line parsed, every verdict has a ts and a bead); falhou/ilegível → counted by where it falls (see place): every one lands in a bucket, none is dropped,
+    # and only "out" may leave the answer alone
+    g = dict.fromkeys(("lin_in", "lin_doubt", "lin_out", "reg_in", "reg_doubt", "reg_out"), 0)
+    nxt, after = [None] * len(items), None
+    for i in range(len(items) - 1, -1, -1):   # the ts of the nearest readable row written after each position
+        nxt[i] = after
+        kind, x = items[i]
+        if kind == "row":
+            t = stamp(report, x.get("ts"))
+            if t is not None:
+                after = t
+    for i, (kind, x) in enumerate(items):
+        if kind == "bad":
+            g["lin_" + place(x, nxt[i], lo, now)] += 1
+        elif check_rows and report.verdicts([x])[1]:   # verdicts() is the one that says which rows have no usable ts/bead
+            g["reg_" + place(stamp(report, x.get("ts")), nxt[i], lo, now)] += 1
+    return g
+
+
+def gaps_text(g):
+    """One sentence on what the readable rows of the gate log do not account for ('' when nothing)."""
+    parts, lin, reg = [], g["lin_in"] + g["lin_doubt"] + g["lin_out"], g["reg_in"] + g["reg_doubt"] + g["reg_out"]
+    if lin:
+        parts.append("%d linha(s) ilegivel(is): %d com ts dentro da janela, %d sem data propria que nao da para provar anteriores a janela, %d provadamente anteriores (nao contam)" % (lin, g["lin_in"], g["lin_doubt"], g["lin_out"]))
+    if reg:
+        parts.append("%d veredito(s) sem ts/bead legivel: %d dentro da janela, %d sem como provar que sao anteriores, %d provadamente anteriores (nao contam)" % (reg, g["reg_in"], g["reg_doubt"], g["reg_out"]))
+    if g["blank"]:
+        parts.append("%d veredito(s) com bead vazio na janela (o dispatcher nao leu o bead do marker)" % g["blank"])
+    return "quality-gate.jsonl: " + "; ".join(parts) + "." if parts else ""
+
+
 def flag_age(path, now, regular):
     """-> (seconds since its mtime, "") | (None, "") when there is no such flag | (None, why) when it cannot be told. `regular`: only a regular file counts (the guard's `[ -f ]`)."""
     # vazio → (None, ""): no flag, the check is not switched off; falhou/ilegível (stat denied, a symlink loop) → (None, why): the check (killed()) and the guard (`[ -f ]`)
@@ -154,7 +238,7 @@ def measure(city, now, a):
     gc = os.path.join(city, ".gc")
     state = os.environ.get("THIRD_STATE_READS_STATE_DIR") or gc
     res = {"city": city, "state": "", "mode": "-", "pct": "-", "window": "-", "evaluated": False, "runs": 0, "covered": 0, "uncovered": [], "split": {},
-           "rows": 0, "bad_rows": 0, "last_arm": None, "arms_file": "-", "switches": [], "diag": [], "notes": [], "verdict": "", "alarms": {}, "unevaluated": [], "rc": RC_OK}
+           "rows": 0, "bad_rows": 0, "gaps": {}, "last_arm": None, "arms_file": "-", "switches": [], "diag": [], "notes": [], "verdict": "", "alarms": {}, "unevaluated": [], "rc": RC_OK}
     tool, why_tool = load_sibling("third-state-reads-check.py")
     report, why_report = load_sibling("third-state-report.py")
     if tool is None or report is None:
@@ -191,7 +275,7 @@ def measure(city, now, a):
     if res["state"] != "":
         res["verdict"] = res["state"]
         res["rc"] = RC_FOUND if res["alarms"] else RC_OK
-        res["unevaluated"] = ["diverge"] if res["state"] == "interruptor" else []
+        res["unevaluated"] = (["diverge"] if res["state"] == "interruptor" else []) + ["cego"]   # this tick did not read the gate log either: its "cego" marks stay
         return res
     res["state"] = "ligada"
     lo = now - datetime.timedelta(hours=a.window_h)
@@ -202,17 +286,27 @@ def measure(city, now, a):
         res["notes"].append("conf alterada em %s: runs so contam a partir de %s (a folga cobre markers varridos antes)" % (conf_t.strftime("%Y-%m-%dT%H:%MZ"), lo.strftime("%Y-%m-%dT%H:%MZ")))
     res["window"] = "%s -> %s UTC (%dh)" % (lo.strftime("%Y-%m-%dT%H:%MZ"), now.strftime("%Y-%m-%dT%H:%MZ"), a.window_h)
     # vazio → no rows says nothing about runs: blind (NÃO SEI), never "0 runs"; falhou/ilegível → "absent" / "unreadable": blind as well
-    gs, rows, _, _ = report.read_jsonl(os.path.join(gc, "quality-gate.jsonl"))
+    gs, items = read_gate_log(os.path.join(gc, "quality-gate.jsonl"), report)
+    rows = [d for k, d in items if k == "row"]
     if gs != "ok" or not rows:
         why = {"absent": "ausente", "unreadable": "ilegivel"}.get(gs, "vazio")
         res["unevaluated"] = ["diverge"]
         return blind(res, "cego|gate-log", "gate:3o-estado-alarme-cego -- nao consegui ler quality-gate.jsonl",
                      "third-state-arm-coverage nao conseguiu ler %s/quality-gate.jsonl (%s): sem os runs nao ha como dizer se os bracos estao sendo gravados. DESCONHECIDO, nao 'ok' (ga-r4z4ve)." % (gc, why),
                      "quality-gate.jsonl %s: nenhum run contado (isto NAO e 0 runs)" % why)
-    runs = {}
-    for t, _, d in report.verdicts(rows)[0]:
+    vs, no_ts, _, _ = report.verdicts(rows)
+    runs, blank = {}, 0
+    for t, _, d in vs:
         if lo <= t <= now and d["bead"].strip():
             runs.setdefault(d["bead"], t)
+        elif lo <= t <= now:
+            blank += 1   # a real verdict whose bead the dispatcher could not read (extract "bead_id" came back empty): a run nobody can name, not "no run"
+    # vazio → all zeros (nothing unreadable); falhou/ilegível → counted by where it falls (gate_gaps): a line or verdict that cannot be read is NÃO SEI unless it is provably
+    # before the window, never "fewer runs"
+    g = gate_gaps(items, lo, now, report, no_ts > 0)
+    g["blank"] = blank
+    res["gaps"] = g
+    unknown = g["lin_in"] + g["lin_doubt"] + g["reg_in"] + g["reg_doubt"] + blank
     ast, arms, nrows, nbad, last = scan_arms(os.path.join(state, tool.ARMS), set(runs))
     res.update(evaluated=True, runs=len(runs), arms_file=ast, rows=nrows, bad_rows=nbad, last_arm=last)
     res["covered"] = sum(1 for b in runs if arms.get(b) in ARM_VALUES)
@@ -240,8 +334,19 @@ def measure(city, now, a):
             "3o estado nao esta rodando para eles: o mesmo buraco silencioso do ga-r4z4ve. Sem braco: %s. %s Veja: grep 'HARDCHECK step=2e' %s/logs/quality-gate-guard.log | tail; flags %s/gate-hardchecks.off "
             "e %s/%s; o arquivo de bracos precisa estar gravavel (estado dele: %s). Runbook: docs/runbooks/third-state-report.md, secao 'Alarme'." % (u, n, res["window"], state, tool.ARMS, a.max_pct, a.min_uncovered, res["mode"], res["pct"], sample,
             " ".join(res["diag"]), gc, gc, state, tool.KILL, ast))
+        if unknown:
+            subject, body = res["alarms"]["diverge"]
+            res["alarms"]["diverge"] = (subject, body + " ATENCAO: " + gaps_text(g) + " O numero real de beads sem braco pode ser maior.")
     else:
         res["verdict"] = "ok"
+    if unknown and res["verdict"] != "diverge":   # "ok" and "poucos-runs" both claim to know how many runs there were; with unreadable ones inside the window they do not (an earlier "diverge" mark is kept: this tick could not judge it)
+        res["unevaluated"] = ["diverge"]
+        return blind(res, "cego|gate-log-parcial", "gate:3o-estado-alarme-cego -- quality-gate.jsonl tem trechos que nao consegui ler",
+                     "third-state-arm-coverage leu %s/quality-gate.jsonl so em parte: %s Os %d beads que li nao sao necessariamente todos os da janela, entao 'cobertura dentro do limite' nao se aplica: DESCONHECIDO, nao 'ok' (ga-r4z4ve). "
+                     "Veja as linhas que nao sao JSON: grep -nv '^{.*}$' %s/quality-gate.jsonl | tail -20" % (gc, gaps_text(g), n, gc),
+                     gaps_text(g) + " (isto NAO e 'cobertura ok')")
+    if any(g.values()):   # said whenever anything is unreadable, provably old or not (a clean-looking "ok" must not hide that the log is not clean); here it has not changed the answer
+        res["notes"].append(gaps_text(g))
     res["rc"] = RC_FOUND if res["alarms"] else RC_OK
     return res
 

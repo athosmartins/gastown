@@ -8,8 +8,10 @@
 #       controller fired it — that is a NOTE below, the only proof is `gc order history` after >= 1h);
 #   (3) the hermetic selftest passes on the live tree (answers, counting, the real guard line and the real check's rows, alarm mechanics, mutants);
 #   (4) THE ACCEPTANCE, on the LIVE city, read-only: the detector reads the live gate log and the live arms file and finds every bead of the last 24h with a
-#       real verdict covered. A divergence (exit 1) FAILS this test — that is the bug the bead is about; "could not tell" (exit 2) fails too. Not switched on,
-#       mode warn/off, a recent kill switch and too few runs are NOTES, not failures: they are the Mayor's switches, not a defect of this change.
+#       real verdict covered. A divergence (exit 1) FAILS this test — that is the bug the bead is about; "could not tell" (exit 2) fails too, and that includes a
+#       gate log the detector could read only in part. Not switched on, mode warn/off, a recent kill switch, too few runs and the detector's OWN kill switch are
+#       NOTES, not failures: they are the Mayor's switches, not a defect of this change — but each of them means the live coverage was NOT proven, and the last
+#       line says so ("PASS (wiring only ...)") instead of a bare PASS.
 #
 # Nothing is written outside a scratch dir (the detector runs with --no-alarm --no-lock). Called by run.sh after deploy (STORY_ID=ga-r4z4ve). Exits 0 on pass.
 
@@ -79,22 +81,30 @@ grep -q 'selftest: [0-9]* passed, 0 failed' "$S/selftest.out" || fail "the selft
 log "third-state-arm-coverage.selftest.sh: $(grep 'selftest:' "$S/selftest.out") ✓"
 
 # ── 4. the acceptance, on the LIVE city, read-only ─────────────────────────────────────────────
-rc=0; python3 -I "$DET" --city "$CITY" --no-alarm --no-lock --json > "$S/live.json" 2> "$S/live.err" || rc=$?
-python3 -I "$DET" --city "$CITY" --no-alarm --no-lock > "$S/live.txt" 2>&1 || true
-if [[ "$rc" -eq 2 ]]; then fail "the detector could not tell on the live city (NÃO SEI): $(head -6 "$S/live.txt" | tr '\n' '|' | cut -c1-500)"; fi
-if [[ "$rc" -eq 1 ]]; then cat "$S/live.txt" >&2; fail "THE BUG THIS BEAD IS ABOUT: beads with a real gate verdict have no recorded third-state arm (or the conf is unreadable / a kill switch is forgotten) — read the report above"; fi
-[[ "$rc" -eq 0 ]] || fail "the detector exited $rc on the live city: $(head -3 "$S/live.txt")"
-verdict="$(python3 -I -c 'import json, sys; d = json.load(open(sys.argv[1])); print(d["verdict"], d["runs"], d["covered"], len(d["uncovered"]))' "$S/live.json")" || fail "the detector's JSON on the live city is unreadable"
-set -- $verdict
-case "$1" in
-  ok)            log "live: $2 bead(s) with a real verdict in the last 24h, $3 with a recorded arm, $4 without (inside the limit) ✓" ;;
-  poucos-runs)   note "live: only $2 bead(s) with a verdict in the window — too few to conclude; re-run later (this is not a pass of the coverage, only of the wiring)" ;;
-  nao-ligada)    note "live: .gc/third-state-reads.conf is absent — the check is not switched on, so there is nothing to cover (the Mayor's switch)" ;;
-  sem-braco)     note "live: the conf is mode=warn/off — it draws no arm by design, nothing to cover (the Mayor's switch)" ;;
-  interruptor)   note "live: a kill-switch flag is present (younger than the alarm age) — the check is off on purpose, nothing to cover" ;;
-  *)             fail "unexpected verdict '$1' from the detector on the live city: $(head -4 "$S/live.txt")" ;;
-esac
-grep -E '^  (checagem|arquivo|beads|janela)|cidade:' "$S/live.txt" | cut -c1-230 | while IFS= read -r l; do log "live: $l"; done
+# vazio → the detector's own kill switch is off: it prints a NOTE (no JSON) and exits 0; falhou/ilegível → n/a. That is 'not checked', never 'unreadable JSON' and never a pass of the coverage
+PROVED=1
+if [[ "${THIRD_STATE_ARM_COVERAGE:-}" == "off" || -e "$CITY/.gc/third-state-arm-coverage.off" ]]; then
+  note "the detector's own kill switch is on (THIRD_STATE_ARM_COVERAGE=off or .gc/third-state-arm-coverage.off): it reads nothing, so the live coverage was NOT checked here"
+  PROVED=0
+else
+  rc=0; python3 -I "$DET" --city "$CITY" --no-alarm --no-lock --json > "$S/live.json" 2> "$S/live.err" || rc=$?
+  python3 -I "$DET" --city "$CITY" --no-alarm --no-lock > "$S/live.txt" 2>&1 || true
+  if [[ "$rc" -eq 2 ]]; then fail "the detector could not tell on the live city (NÃO SEI): $(head -6 "$S/live.txt" | tr '\n' '|' | cut -c1-500)"; fi
+  if [[ "$rc" -eq 1 ]]; then cat "$S/live.txt" >&2; fail "THE BUG THIS BEAD IS ABOUT: beads with a real gate verdict have no recorded third-state arm (or the conf is unreadable / a kill switch is forgotten) — read the report above"; fi
+  [[ "$rc" -eq 0 ]] || fail "the detector exited $rc on the live city: $(head -3 "$S/live.txt")"
+  verdict="$(python3 -I -c 'import json, sys; d = json.load(open(sys.argv[1])); print(d["verdict"], d["runs"], d["covered"], len(d["uncovered"]), sum(d["gaps"].values()))' "$S/live.json")" || fail "the detector's JSON on the live city is unreadable"
+  set -- $verdict
+  case "$1" in
+    ok)            log "live: $2 bead(s) with a real verdict in the last 24h, $3 with a recorded arm, $4 without (inside the limit) ✓"
+                   [[ "$5" -eq 0 ]] || note "live: $5 unreadable line(s) / verdict(s) without a usable ts or bead in the gate log, all provably older than the window (the report above counts them)" ;;
+    poucos-runs)   note "live: only $2 bead(s) with a verdict in the window — too few to conclude; re-run later (this is not a pass of the coverage, only of the wiring)" ; PROVED=0;;
+    nao-ligada)    note "live: .gc/third-state-reads.conf is absent — the check is not switched on, so there is nothing to cover (the Mayor's switch)" ; PROVED=0;;
+    sem-braco)     note "live: the conf is mode=warn/off — it draws no arm by design, nothing to cover (the Mayor's switch)" ; PROVED=0;;
+    interruptor)   note "live: a kill-switch flag is present (younger than the alarm age) — the check is off on purpose, nothing to cover" ; PROVED=0;;
+    *)             fail "unexpected verdict '$1' from the detector on the live city: $(head -4 "$S/live.txt")" ;;
+  esac
+  grep -E '^  (checagem|arquivo|beads|janela)|cidade:' "$S/live.txt" | cut -c1-230 | while IFS= read -r l; do log "live: $l"; done
+fi
 
-log "PASS"
+if [[ "$PROVED" -eq 1 ]]; then log "PASS"; else log "PASS (wiring only -- the live coverage was NOT proven, see the NOTE above)"; fi
 exit 0
