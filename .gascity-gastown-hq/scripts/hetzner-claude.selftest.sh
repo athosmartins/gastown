@@ -534,10 +534,10 @@ PATH=${PATH#*:}
 if command -v sha256sum >/dev/null 2>&1; then exec sha256sum "$@"; else exec shasum -a 256 "$@"; fi
 EOF
 chmod +x "$T/bin/sha256sum"
-sg_settings() {  # sg_settings [COMANDO] — settings.json do "servidor" com o hook do guarda no caminho REAL (COMANDO no lugar dele faz o --selfcheck reprovar)
-  local c=${1:-"python3 -I $HG || exit 2"}
+sg_settings() {  # sg_settings [COMANDO [CAMPOS]] — settings.json do "servidor" com o hook do guarda no caminho REAL (COMANDO no lugar dele faz o --selfcheck reprovar; CAMPOS = JSON a mais no hook, ex. ,"onFailure":"block")
+  local c=${1:-"python3 -I $HG || exit 2"} x=${2:-}
   mkdir -p "$SRV/.claude"
-  printf '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"%s"}]},{"matcher":"Edit|Write|MultiEdit|NotebookEdit","hooks":[{"type":"command","command":"%s"}]}]}}\n' "$c" "$c" >"$HSET"
+  printf '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"%s"%s}]},{"matcher":"Edit|Write|MultiEdit|NotebookEdit","hooks":[{"type":"command","command":"%s"%s}]}]}}\n' "$c" "$x" "$c" "$x" >"$HSET"
 }
 sg_reset() {  # repositório = GOOD; servidor sem guarda, com o settings certo; nenhum estado nem arquivo do sync
   rm -f "$STATE"/hetzner-guard-sync.* "$FAKE"/* "$HG" "$HG.sync-tmp" "$HG.sync-bak"; : >"$FAKE/calls"
@@ -600,6 +600,14 @@ sg_case_reprova() {
   sg "sem guarda antes e o --selfcheck reprova: o novo é retirado (exit 1)" 1 "revertido"
   no "o servidor segue sem guarda (não fica um guarda que reprova)" "$HG"
 }
+sg_case_onfailure() {  # o settings do servidor depois do push-bundle com onFailure "block" nos hooks do guarda (ga-14qtcy9): o --selfcheck do guarda NOVO o aprova e a troca vale; "continue" (a falha aberta de volta) reprova e REVERTE
+  sg_reset; sg_host_old; sg_settings "" ',"onFailure":"block"'
+  sg "settings do servidor com onFailure \"block\" nos hooks do guarda: o --selfcheck aprova e o guarda novo fica (exit 0)" 0 "atualizado"
+  same "o guarda instalado é o do repositório" "$HG" "$RG"
+  sg_reset; sg_host_old; sg_settings "" ',"onFailure":"continue"'
+  sg "settings com onFailure \"continue\": o --selfcheck reprova o guarda novo e REVERTE (exit 1)" 1 "revertido"
+  same "o guarda anterior voltou, byte a byte" "$HG" "$T/old-guard.copy"
+}
 sg_case_ssh() {
   sg_reset; sg_host_old
   echo 255 >"$FAKE/ssh.rc"
@@ -659,7 +667,7 @@ sg_case_estado() {  # o estado gravado pelo sync que não dá para ler (ou que m
   sg "estado failed com 'at' que não é número: instala em vez de pular" 0 "atualizado"
   same "e instalou o guarda do repositório" "$HG" "$RG"
 }
-SG_CASES="sg_case_emdia sg_case_ausente sg_case_diferente sg_case_check sg_case_reprova sg_case_ssh sg_case_repo sg_case_host sg_case_lock sg_case_estado"
+SG_CASES="sg_case_emdia sg_case_ausente sg_case_diferente sg_case_check sg_case_reprova sg_case_onfailure sg_case_ssh sg_case_repo sg_case_host sg_case_lock sg_case_estado"
 for c in $SG_CASES; do $c; done
 if [ -z "${HZC_NO_MUTANTS:-}" ]; then
   sgmut() {  # sgmut DESCRIÇÃO OLD NEW CASO… — troca UM trecho do hetzner-claude.py (confirmado: tem que existir uma vez só) e os casos que o cobrem TÊM que reprovar
