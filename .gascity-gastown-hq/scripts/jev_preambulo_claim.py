@@ -23,9 +23,10 @@ THE THIRD STATE IS "PRINT IT" (fail-open, the acceptance criterion "Jev out/slow
     - Jev unavailable / slow / error / malformed answer  -> that section (or all of them) printed;
     - the whole decision exceeds DEADLINE_S                -> ALL eligible sections printed ("tempo_esgotado");
     - the bead cannot be read                              -> ALL eligible sections printed ("bead_ilegivel");
-    - an unexpected exception                              -> ALL eligible sections printed ("erro_inesperado").
-  If even the policy cannot be loaded the loader cannot know what the prime withheld: it prints a notice that says
-  so and names the fragment file to read in full, and exits 3 (never an empty stdout that reads like "nothing to load").
+    - an unexpected exception INSIDE the decision          -> ALL eligible sections printed ("erro_inesperado").
+  If the policy cannot be loaded, or anything OUTSIDE the decision raises (the policy script at import, rendering, the
+  record), the loader cannot know what the prime withheld: it prints a notice that says so and names the fragment file
+  to read in full, and exits 3 (never rc=1 with an empty stdout, which reads like "nothing to load").
 
 ARMS
   --arm is REQUIRED and is the arm of the SESSION (decided at prime by pool slot, not here): the control arm keeps the
