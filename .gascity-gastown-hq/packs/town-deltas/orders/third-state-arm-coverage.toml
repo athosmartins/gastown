@@ -1,0 +1,17 @@
+# ga-r4z4ve: the third-state check (ga-57e7l0.1, step 2e) sat ON for six days with no effect — .gc/third-state-reads.conf said enforce/50%, the arms file
+# had 2 rows against 437 beads with a first gate verdict — and nothing complained. Cause: step 2e lived only in formulas/mol-quality-gate-runner.toml,
+# which nothing pours; ga-vywjzsp moved it into the guard (Step 5b-pre5). This is the watch on the result, from a source the guard does not write:
+# every bead with a real verdict in .gc/quality-gate.jsonl must have a row in .gc/third-state-reads-arms.jsonl (docs/runbooks/third-state-report.md).
+# Detection only: reads the gate log, the arms file, the conf, two kill-switch flags and the guard log; writes only its own dedup marks
+# (.gc/runtime/packs/maintenance/) and its lock (.gc/runtime/). Alarms the Mayor (escalation-router, topic infra) once per cooldown: runs without an arm, a conf the check cannot
+# parse, a kill-switch flag standing > 72h, a gate log it cannot read. --order: the alarm IS the channel, so the exec exits 0 once every finding was
+# alarmed or deduped and exits 2 only when an alarm DELIVERY failed (the order runner records that as a failed run).
+# Cadence: one pass reads the gate log and the arms file. Measured 2.8 s on a synthetic 71 MB gate log (200k lines) with 20k arm rows; the live log is
+# smaller (not timed live). The window it judges is 24h, so a break shows up in hours, not in the 6 days it took by hand. A gc order (fresh exec each
+# tick), never a raw plist, and it self-locks (flock) like the other guards. timeout 600s = up to 3 alarms of 120s each plus the pass.
+[order]
+description = "Alarm the Mayor when beads get a gate verdict but no third-state arm is recorded, when the check's conf is unreadable, or when its kill switch is forgotten (detection only)"
+trigger = "cooldown"
+interval = "1h"
+timeout = "600s"
+exec = "$PACK_DIR/assets/third-state-arm-coverage.py --order"
