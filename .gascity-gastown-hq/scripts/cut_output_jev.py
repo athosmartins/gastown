@@ -237,21 +237,28 @@ _PII_RES = (
     re.compile(r"\b55\d{2}9?\d{8}\b"),  # 5531999998888 (a WhatsApp number)
     re.compile(r"@(?:s\.whatsapp\.net|c\.us|g\.us)\b"),  # a WhatsApp jid
 )
-# A run of token characters this long that mixes upper case, lower case and a digit looks like a generated secret. Hex-only
-# strings (git shas, sha256) have no upper+lower mix and pass. Linear: finditer walks the text once and each run is inspected
-# only through its first _TOKEN_INSPECT characters (a lookahead-per-position regex was quadratic on a hostile 100k run).
+# A run of token characters this long that mixes upper case, lower case and a digit ANYWHERE in it looks like a generated secret
+# (a secret can follow a long benign prefix inside the same run, so the whole run is inspected, not a window). Hex-only strings
+# (git shas, sha256) have no upper+lower mix and pass. Linear: finditer walks the text once, runs are disjoint, and each is
+# scanned once (a lookahead-per-position regex was quadratic on a hostile 100k run).
 _TOKEN_RUN_RE = re.compile(r"[A-Za-z0-9_-]{32,}")
-_TOKEN_INSPECT = 128
-_TOKEN_MAX_RUNS = 2000  # more long runs than this is a dump of identifiers/hashes: stop looking (and do not call it a secret)
+_TOKEN_MAX_RUNS = 2000  # more long runs than this is a dump of identifiers/hashes: too many to inspect, so DO NOT SEND it
 
 
 def _has_token_like_run(text: str) -> bool:
     for n, m in enumerate(_TOKEN_RUN_RE.finditer(text)):
         if n >= _TOKEN_MAX_RUNS:
-            return False
-        head = text[m.start():m.start() + _TOKEN_INSPECT]
-        if any(c.isupper() for c in head) and any(c.islower() for c in head) and any(c.isdigit() for c in head):
-            return True
+            return True  # cannot inspect them all: the inert answer is "withhold", never "probably fine"
+        upper = lower = digit = False
+        for c in m.group(0):
+            if c.isupper():
+                upper = True
+            elif c.islower():
+                lower = True
+            elif c.isdigit():
+                digit = True
+            if upper and lower and digit:
+                return True
     return False
 
 
@@ -824,6 +831,14 @@ def _selftest() -> int:
     ok("the guard + span scan stay linear on hostile 100k+ character inputs (production budget; bound is generous, not tight)", time.time() - t_lin < 10.0)
     ok("a long mixed-case run is still caught after the rewrite (and a hex-only run of the same length is not)",
        egress_withhold_reason("k=" + "aB3" * 20) == "secret" and egress_withhold_reason("sha " + "ab12" * 16) is None)
+    ok("review finding 3: a secret that FOLLOWS a long benign prefix in the same run is caught (the 128-char window missed it)",
+       egress_withhold_reason("id=" + "a" * 300 + "Zk3Jq9XvB2nM7LpA4sD8fG1hT6") == "secret"
+       and egress_withhold_reason("id=" + "a" * 5000 + "-" + "b" * 5000) is None)
+    many_hex = " ".join(("%032x" % i) for i in range(2500))  # 2500 benign 32-char hex runs: more than the scan will inspect
+    ok("review finding 3: more long runs than the scan will inspect is WITHHELD, not waved through (inert on hostile input)",
+       egress_withhold_reason(many_hex) == "secret" and egress_withhold_reason(" ".join(("%032x" % i) for i in range(50))) is None)
+    ok("review finding 3: ... and a secret placed AFTER 2100 benign long runs cannot hide behind them",
+       egress_withhold_reason(" ".join(("%032x" % i) for i in range(2100)) + " Zk3Jq9XvB2nM7LpA4sD8fG1hT6yU0wRe") == "secret")
 
     bad_text = text12 + "\n\ncpf 123.456.789-09"
     bl = build_blocks(bad_text)
