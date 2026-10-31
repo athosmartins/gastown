@@ -1342,7 +1342,7 @@ job() { cd "\$HOME/$X" || return 97; env$envline \$MBP_BG nice -n "\$MBP_NICE" $
 mbp_supervise job
 EOF
   run_remote EXEC "$JOBDEF"
-  # nó: 126/127 = o shell não executou ou não achou o comando (aqui, tipicamente uma ferramenta que o nó não tem): não é veredito, e a regra é a mesma da sombra do pytest (shadow_no_verdict). O scratch sai SEMPRE (mesmo com --keep:
+  # nó: 126/127 = o shell não executou ou não achou o comando (aqui, tipicamente uma ferramenta que o nó não tem): não é veredito (a sombra do pytest lê o 126/127 do mesmo jeito: shadow_no_verdict). O scratch sai SEMPRE (mesmo com --keep:
   # esta execução não vale) e o MBP roda o comando. Sem pull: não há resultado a trazer.
   if [ "$HOSTKIND" = linux ] && { [ $RC -eq 126 ] || [ $RC -eq 127 ]; }; then
     SECS=$(( $(date +%s) - T0 )); log_run "exec" "$mode" "$SLOT" "$RC" "$SECS" "$@"; scratch_clean
