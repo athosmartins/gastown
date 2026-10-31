@@ -31,7 +31,7 @@ devolver pisa em bead que mudou	  [ "$_un_st" = "open||" ] || return 0	  :
 devolver nao faz nada	  [ "${_PWP_ADOPTED:-0}" = "1" ] || return 0\n  _PWP_ADOPTED=0	  return 0
 shadow despacha	          if [ "$_PWP_MODE" = shadow ]; then\n            { jq -cn	          if false; then\n            { jq -cn
 rc 12 do apply nao para a passada	          12) _pw_stop="capacity"; break ;;	          12) _pw_fails=$((_pw_fails + 1)) ;;
-rc incerto do apply nao para a passada	fi; _pw_stop="hook-held"; break ;;	fi; _pw_fails=$((_pw_fails + 1)) ;;
+rc incerto do apply nao para a passada	esac; _pw_stop="hook-held"; break ;;	esac; _pw_fails=$((_pw_fails + 1)) ;;
 o que ficou no no continua na pista	_pw_pool=$(printf '%s' "$_pw_pool" | jq -c --arg id "$_pw_id" '[ .[] | select(.id != $id) ]' 2>/dev/null) || {	_pw_pool=$(printf '%s' "$_pw_pool") || {
 sem limite de vagas do no	[ "$_pw_kept" -lt "$_pw_keepmax" ] || { _pw_stop="keep-limit"; break; }	:
 sem teto de sondas	if [ "$_pw_probed" -ge "$_pw_cap" ]; then _pw_stop="budget-probes"; break; fi	:
@@ -62,8 +62,8 @@ braco: adotar que falha segue ao gancho	          DISPATCH_RESULT="wa_node_pass_
 gancho nao exporta o rc do apply	if [ "$_mode" != shadow ] && [ "${DRY_RUN:-0}" != "1" ]; then _PWN_APPLY_RC="$_rc"; fi	:
 gancho nao zera o rc na entrada	  _PWN_APPLY_RC=""\n  case "$_mode" in shadow|label|auto) ;; *) return 1 ;; esac	  case "$_mode" in shadow|label|auto) ;; *) return 1 ;; esac
 resultado novo fora do pilot_sweep	"wa_node_pass_released", "kimi_lane_released"	"kimi_lane_released"
-Dolt saturado agora nao para a passada	if [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ] || _dolt_saturated; then _pw_stop="dolt-saturated"; break; fi	if [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ]; then _pw_stop="dolt-saturated"; break; fi
-Dolt saturado no inicio nao para a passada	if [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ] || _dolt_saturated; then _pw_stop="dolt-saturated"; break; fi	if _dolt_saturated; then _pw_stop="dolt-saturated"; break; fi
+Dolt saturado agora nao para a passada	if [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ] || _dolt_saturated; then case "$_pw_id" in	if [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ]; then case "$_pw_id" in
+Dolt saturado no inicio nao para a passada	if [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ] || _dolt_saturated; then case "$_pw_id" in	if _dolt_saturated; then case "$_pw_id" in
 a chave DISPATCH_TO_CAPACITY nao vale na passada	if [ "${DISPATCH_TO_CAPACITY:-1}" != "1" ] && [ "$_pw_keepmax" -gt 1 ]; then _pw_keepmax=1; fi	:
 bloco: a so-no vence a bandeira da passada	  if [ "${_PILOT_WA_NODE_PASS:-0}" = "1" ]; then\n    # ga-2hd02v.9: passada de WA no n	  if [ "${_PILOT_WA_NODE_PASS:-0}" = "1" ] && [ "${_PILOT_NODE_ONLY:-0}" != "1" ]; then\n    # ga-2hd02v.9: passada de WA no n
 braco: rc 1 na so-no solta sem devolver a rota	        elif [ "${_PILOT_WA_NODE_PASS:-0}" = "1" ]; then	        elif [ "${_PILOT_WA_NODE_PASS:-0}" = "1" ] && [ "${_PILOT_NODE_ONLY:-0}" != "1" ]; then
@@ -97,7 +97,7 @@ dono do waiter deixa de ser definitivo	not-wa|has-owner|no-node-ok|node:mini|rou
 apply rc 11 do waiter deixa wv em node	11) _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" unknown; if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi ;;	11) _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" unknown ;;
 waiter sem apply deixa wv em node	'') _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_released_memo "$_pw_pick" "$_pw_id" "$_pw_upd"; if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi ;;	'') _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_released_memo "$_pw_pick" "$_pw_id" "$_pw_upd" ;;
 apply rc 10 do waiter nao marca out	10) _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" mini; if [ "$_pw_isw" = 1 ]; then _pw_wv=out; fi ;;	10) _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" mini ;;
-apply rc fora da tabela do waiter deixa wv em node	*)  if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi; _pw_stop="hook-held"; break ;;	*)  _pw_stop="hook-held"; break ;;
+apply rc fora da tabela do waiter deixa wv em node	*)  if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi; case "$_pw_id" in	*)  case "$_pw_id" in
 memoria released do waiter vira out	case "${_PWP_MEMO_V:-}" in mini) _pw_wv=out ;; *) _pw_wv=blind ;; esac	case "${_PWP_MEMO_V:-}" in mini|released) _pw_wv=out ;; *) _pw_wv=blind ;; esac
 memoria sampled do waiter vira out	case "${_PWP_MEMO_V:-}" in mini) _pw_wv=out ;; *) _pw_wv=blind ;; esac	case "${_PWP_MEMO_V:-}" in mini|sampled) _pw_wv=out ;; *) _pw_wv=blind ;; esac
 sonda ilegivel vira sem-motivo	if $c == null then ["ilegivel"] elif	if $c == null then ["sem-motivo"] elif
