@@ -474,6 +474,19 @@ stub git-show-lento 'for a in "$@"; do [ "$a" = show ] && sleep 6; done; exec gi
 export WA_NODE_GIT="$T/git-show-quebra"; expect "ilegível: git show que falha (rc 2) -> unknown com a nota, nunca 'teste sem import'" "$(T8 tests/test_imp_a.py)" 11 "$(NOTA8 teste-git-rc-2)"; unset WA_NODE_GIT
 export WA_NODE_GIT="$T/git-show-lento" WA_NODE_REPO_TIMEOUT=1; expect "ilegível: git show que não responde no prazo -> unknown com a nota" "$(T8 tests/test_imp_a.py)" 11 "$(NOTA8 teste-git-sem-resposta)"; unset WA_NODE_GIT WA_NODE_REPO_TIMEOUT
 export WA_NODE_REPO="$T/wa-repo-ausente"; expect "ilegível: repo inexistente -> unknown com a nota (não 'nada importado')" "$(T8 tests/test_imp_a.py)" 11 "$(NOTA8 repo-git-rc-128)"; export WA_NODE_REPO="$RP"
+# a regra 7 que NÃO CONSEGUIU LER não é "a regra 7 não derivou nada": com teste citado, a regra 8 NÃO pode correr atrás dela (o git log das irmãs que falhou podia ter o código e o freio dele) -> unknown com a nota da regra 7, nunca node
+R7Q="Corrigir o caso de borda; teste em tests/test_imp_a.py"   # bead COM PAI (wa-par1.2 -> irmãs wa-par1.*) e um teste citado que importa lib.imp_alpha
+export WA_NODE_CACHE="$T/cache-r8p"   # o caso legível GRAVA o cache das irmãs; ele tem pasta própria para o cache das falhas (abaixo) seguir sem arquivo
+expect "r7 lê: irmãs legíveis + teste citado -> a regra 7 vence (prova-caminho-derivado), a 8 nem roda" "$(DESCI wa-par1.2 "$R7Q")" 0 '"reasons": \["prova-caminho-derivado:'
+export WA_NODE_CACHE="$T/cache-r8q"   # nunca gravado (a falha do git não grava): um cache válido das irmãs esconderia a falha
+export WA_NODE_GIT="$T/git-log-quebra"; expect "r7 falha + teste citado: git log das irmãs com rc 2 -> unknown com a nota da regra 7; a regra 8 NÃO decide (antes: node pelo import do teste)" "$(DESCI wa-par1.2 "$R7Q")" 11 "$(NOTA7 irmas-git-rc-2)"; unset WA_NODE_GIT
+export WA_NODE_GIT="$T/git-log-lento" WA_NODE_SIBLING_TIMEOUT=1; expect "r7 falha + teste citado: git log das irmãs sem resposta no prazo -> unknown com a nota da regra 7, sem regra 8" "$(DESCI wa-par1.2 "$R7Q")" 11 "$(NOTA7 irmas-git-sem-resposta)"; unset WA_NODE_GIT WA_NODE_SIBLING_TIMEOUT
+[ ! -e "$T/cache-r8q" ] && ok "r7 falha + teste citado: a falha do git não gravou cache" || bad "r7 falha + teste citado: a falha do git gravou cache"
+export WA_NODE_CACHE="$T/cache"
+expect "r7 sem pai: sem irmãs para ler a regra 7 não falha, e a 8 corre (o git log quebrado nem é chamado)" "$(DESC "$R7Q")" 0 "$C8_OK"
+# teste citado que a regra 8 não lê (novo nesta bead, ausente de origin/main) não conta no N-teste(s) e é nomeado em info
+expect "r8: teste citado que não foi lido (novo) é nomeado em info; o motivo conta só o que provou" "$(DESC 'Corrigir o caso de borda; testes em tests/test_imp_a.py e tests/test_imp_novo.py')" 0 "$C8_OK"'1-teste\(s\)\+1-codigo\(s\).*"codigo-do-teste:tests/test_imp_a\.py=lib/imp_alpha\.py", "teste-nao-lido:tests/test_imp_novo\.py"\]\}$'
+expect "r8: mais de 3 testes não lidos -> 3 nomeados e o resto contado (teste-nao-lido-mais)" "$(DESC 'Corrigir o caso de borda; testes em tests/test_imp_a.py, tests/test_n1.py, tests/test_n2.py, tests/test_n3.py e tests/test_n4.py')" 0 "$C8_OK"'1-teste\(s\)\+1-codigo\(s\).*"teste-nao-lido:tests/test_n1\.py", "teste-nao-lido:tests/test_n2\.py", "teste-nao-lido:tests/test_n3\.py", "teste-nao-lido-mais:1"\]\}$'
 export WA_NODE_REPO="$T/wa-repo-ausente" WA_NODE_MIRROR="$T/espelho-ausente"
 
 # ---- o classificador não deixa resíduo e só aceita stdin
@@ -619,7 +632,7 @@ mutant codigo-sem-teto           'if len(dpaths) > MAX_DERIVED_CODE:' 'if False:
 mutant codigo-sem-teto-pares     'extra += pairs[:6] + (["codigo-do-teste-mais:%d"' 'extra += pairs + (["codigo-do-teste-mais:%d"' "$(T8M tests/test_imp_sete.py)" 0 'lib/limcap_06\.py", "codigo-do-teste-mais:1"\]\}$' "$C8"
 mutant codigo-sem-par-em-info    'extra += pairs[:6] + (["codigo-do-teste-mais:%d"' 'extra += [] + (["codigo-do-teste-mais:%d"' "$(T8M tests/test_imp_a.py)" 0 'codigo-do-teste:tests/test_imp_a\.py=lib/imp_alpha\.py' "$C8"
 mutant codigo-basis-text         '"prova-caminho-derivado:", "prova-codigo-derivado-do-teste:"))' '"prova-caminho-derivado:"))' "$(T8M tests/test_imp_a.py)" 0 '"basis": "derivado"' "$C8"
-mutant codigo-regra7-primeiro    'if res is None and tests:'           'if tests:'                             "$(DESC 'Corrigir ficha_donos; teste em tests/test_imp_a.py')" 0 '"reasons": \["prova-caminho-derivado:' "$C8"
+mutant codigo-regra7-primeiro    'if res is None and tests and not r7_failed:' 'if tests and not r7_failed:'                             "$(DESC 'Corrigir ficha_donos; teste em tests/test_imp_a.py')" 0 '"reasons": \["prova-caminho-derivado:' "$C8"
 mutant codigo-falha-vira-vazio   'extra.append("codigo-do-teste-ilegivel:" + str(e))' 'pass'                  "$(T8M tests/test_imp_a.py)" 11 'codigo-do-teste-ilegivel:teste-git-rc-2' "$C8 WA_NODE_GIT=$T/git-show-quebra"
 mutant codigo-parse-vira-vazio   'raise Unreadable("teste-nao-parseia")' 'return []'                         "$(T8M tests/test_imp_quebrado.py)" 11 'codigo-do-teste-ilegivel:teste-nao-parseia' "$C8"
 mutant codigo-show-rc-ignorado   'raise Unreadable("teste-git-rc-%d" % r.returncode)' 'pass'                  "$(T8M tests/test_imp_a.py)" 11 'codigo-do-teste-ilegivel:teste-git-rc-2' "$C8 WA_NODE_GIT=$T/git-show-quebra"
@@ -635,6 +648,11 @@ mutant codigo-sem-raiz-lib       'IMPORT_ROOTS = ("", "lib", "daemons", "scripts
 mutant codigo-sem-index-js       ' + [base + "/index." + e for e in exts]' ''                                 "$(T8M tests/test_imp_js.cjs)" 0 '2-codigo\(s\)' "$C8"
 mutant codigo-sem-import-from    '\bfrom\s+|'                          ''                                      "$(T8M tests/test_imp_esm.mjs)" 0 "$C8_RX" "$C8"
 mutant codigo-sem-import-em-funcao 'for n in ast.walk(tree):'          'for n in tree.body:'                   "$(T8M tests/test_imp_fn.py)" 0 "$C8_RX" "$C8"
+# a regra 7 que não leu NÃO libera a regra 8 (o "falhou" não vira "a 7 não derivou nada"); o cache à parte nunca é gravado pela falha, então original e mutante enxergam o mesmo git quebrado
+mutant codigo-r7-falha-libera-r8 'if res is None and tests and not r7_failed:' 'if res is None and tests:' "$(DESCI wa-par1.2 'Corrigir o caso de borda; teste em tests/test_imp_a.py')" 11 "$(NOTA7 irmas-git-rc-2)" "$C8 WA_NODE_GIT=$T/git-log-quebra WA_NODE_CACHE=$T/cache-r8q-m"
+mutant codigo-r7-falha-sem-flag  'r7_failed = True'  'r7_failed = False' "$(DESCI wa-par1.2 'Corrigir o caso de borda; teste em tests/test_imp_a.py')" 11 "$(NOTA7 irmas-git-rc-2)" "$C8 WA_NODE_GIT=$T/git-log-quebra WA_NODE_CACHE=$T/cache-r8q-m"
+mutant codigo-teste-nao-lido-mudo 'unread.append(t)' 'pass' "$(DESC 'Corrigir o caso de borda; testes em tests/test_imp_a.py e tests/test_imp_novo.py')" 0 'teste-nao-lido:tests/test_imp_novo\.py' "$C8"
+mutant codigo-sem-teto-nao-lidos 'unread[:3]' 'unread' "$(DESC 'Corrigir o caso de borda; testes em tests/test_imp_a.py, tests/test_n1.py, tests/test_n2.py, tests/test_n3.py e tests/test_n4.py')" 0 'teste-nao-lido:tests/test_n3\.py", "teste-nao-lido-mais:1"\]\}$' "$C8"
 # nome solto (ga-2hd02v.3.17): um mutante por linha da regra
 SV="WA_NODE_REPO=$RP WA_NODE_MIRROR=$T/mirror-ok"
 S_HTML=$(DESC "lib/x.py e $SOLTO_TESTE: ajustar loose_page.html")
