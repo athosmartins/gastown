@@ -4,7 +4,7 @@
 - Os pisos (três, mais o par do push)
 - Quem faz o quê (4 peças, entregues em fatias)
 - heavy-guard.sh: uso e códigos de saída
-- Trecho pronto para o pre-commit do repo beads
+- O pre-commit do repo beads: o guarda já está no hook
 - Interruptores
 - Como conferir que está vivo
 - Limites conhecidos
@@ -66,27 +66,23 @@ heavy-guard.sh --check [--min-free-mb N] [--wait-secs S] [--what RÓTULO]
 
 75/76 ficam FORA da faixa 96..99 do `mbp-run.sh` ("rode local") de propósito: uma recusa nunca pode ser lida como licença para rodar aqui. Cada recusa vai (melhor esforço) para `$GC_CITY_PATH/.gc/logs/heavy-guard.log`.
 
-## Trecho pronto para o pre-commit do repo beads
+## O pre-commit do repo beads: o guarda já está no hook
 
-O repo do beads (onde o `golangci-lint` do pre-commit rodou na hora do incidente) NÃO é editado por esta bead. Para ligar o guarda lá, no hook de pre-commit (script git) ou como hook local do framework pre-commit:
+O repo do beads (onde o `golangci-lint` do pre-commit rodou na hora do incidente, 31/10) NÃO precisa mais de trecho colado: o `.githooks/pre-commit` dele já embrulha o lint no `heavy-guard.sh` da cidade (ga-opj0hnt, ga-f43ofc5). Onde está:
 
-```sh
-# ga-vln2py: sem golangci-lint nem go build com o disco do mini abaixo do piso
-GUARD="${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}/scripts/heavy-guard.sh"
-if [ -x "$GUARD" ]; then "$GUARD" --check --what "pre-commit golangci-lint" || exit $?
-else echo "pre-commit: disco NÃO checado ($GUARD ausente)" >&2; fi
-```
+- **Branch `consolidated/bd-forktop-20260830` do fork do beads**: commit `926cf5487` (ga-opj0hnt).
+- **Linha `main` do clone principal (`/Users/athos/gt/beads`, hook v1.3.0)**: commit `15cda8b31` (ga-f43ofc5), branch `fix/ga-f43ofc5-precommit-heavy-guard-main` no `fork`. É o mesmo guarda, mais `GOTOOLCHAIN` repassado ao guarda nos dois caminhos (o hook da `main` já fixa `go_toolchain`; o guarda precisa recebê-lo para o linter pré-compilado e o `go run` usarem esse mesmo `go`). Esse `main` local NÃO é a `origin/main` do upstream (em 31/10 estava 652 commits atrás dela e divergia no hook): não há PR para o upstream, e nada foi empurrado para `main` de remoto nenhum; o commit está só na branch do `fork` e no `main` local do clone principal.
 
-```yaml
-# .pre-commit-config.yaml (hook local que embrulha o comando)
-- id: golangci-lint-guarded
-  name: golangci-lint (guarda de disco)
-  entry: /Users/athos/gt/.gascity-gastown-hq/scripts/heavy-guard.sh --what golangci-lint -- golangci-lint run
-  language: system
-  pass_filenames: false
-```
+O que o hook faz com arquivo `*.go` no stage (commit sem Go não passa por aqui):
 
-Um commit recusado com 75 não é um commit falho: espere o disco ou rode o commit quando voltar. Não use `--no-verify` para contornar.
+1. Prefere o `golangci-lint` já compilado (`$HOME/go/bin/golangci-lint`, ou `GOLANGCI_LINT_BIN`), se for exatamente a versão fixada no hook (hoje 2.10.1) e tiver sido compilado com um Go **pelo menos tão novo** quanto a diretiva `go` do `go.mod`. Qualquer dúvida (não executável, `--version` ilegível, `go.mod` sem diretiva, versão ou Go diferentes) cai no `go run`, nunca num binário não conferido. Rótulo do guarda: `pre-commit golangci-lint` → piso de **6 GB** livres (classe pesada), com `--max-disk-drop-mb 2048`.
+2. Sem binário que sirva, `go run …golangci-lint@v2.10.1` com o rótulo `go-build golangci-lint` → piso da classe Go, **13 GB** livres, com `--max-disk-drop-mb 6144`. No mini isso quer dizer "recusado" sem o binário pré-compilado: é de propósito, foi esse build a frio que encheu o disco.
+3. O código de saída do guarda é o do hook: **75** disco baixo, **76** disco ilegível, **78** parado pela vigia durante o lint, **79** outro passo pesado segurando a trava. Nenhum deles se confunde com o **1** de "o linter achou problema". Recusado não é commit falho: espere o disco e refaça o commit. Não use `--no-verify`.
+4. Guarda ausente (`$GC_CITY_PATH/scripts/heavy-guard.sh`, padrão `/Users/athos/gt/.gascity-gastown-hq/scripts/heavy-guard.sh`; CI, notebook fora da cidade): o lint é **PULADO** com uma linha ruidosa no stderr (`pre-commit: golangci-lint SKIPPED — heavy-guard not found …`) e o commit segue; o CI do repo ainda roda o lint. Quem quer o lint local aponta `GC_CITY_PATH` para a cidade.
+
+Consequência prática: com o mini abaixo de 6 GB livres, um commit com Go no beads é recusado com 75 até o disco voltar.
+
+Conferir: `bash scripts/test-pre-commit-heavy-guard.sh` na raiz do clone do beads (45 casos, com `go`, linter e guarda de mentira; não compila nem lint nada de verdade). **Não medido:** uma rodada ponta a ponta do `golangci-lint` real sob o guarda (o disco estava em 5–6 GB, abaixo do piso de 6 GB que o próprio guarda impõe).
 
 ## Interruptores
 
@@ -113,7 +109,7 @@ Um commit recusado com 75 não é um commit falho: espere o disco ou rode o comm
 
 ## Limites conhecidos
 
-- O guarda só protege quem o chama. Hoje: o selftest do jsonl-archive, o fallback local das baterias (por doutrina) e o gate. O pre-commit do beads depende do trecho acima ser aplicado naquele repo.
+- O guarda só protege quem o chama. Hoje: o selftest do jsonl-archive, o fallback local das baterias (por doutrina) e o gate. O pre-commit do beads já chama o guarda (seção acima), nas duas linhas do repo; clone ou branch do beads mais velho que `926cf5487`/`15cda8b31`, ou commit feito sem o guarda na máquina, não está coberto. Só a parte Go do commit passa pelo guarda: `gofmt` e o hook do próprio `bd` rodam fora dele.
 - `go test/build/vet/install` têm destino remoto: o MBP, por `mbp-run.sh --exec --go` (não o nó Linux: o `--go` é só do MBP). Com o MBP fora (rc 96..99) o passo ESPERA, não volta ao mini. `golangci-lint` não tem destino remoto hoje; com disco baixo ele espera.
 - A detecção de passo Go olha o rótulo e a linha de comando, não o que um script faz por dentro; um build disparado por `make`, `bash x.sh` ou um hook só é guardado se quem chama rotular o passo `go-…`. Fora do reconhecimento também: `go -C <dir> test`, `go run`, `go generate`, rótulo no plural.
 - O parágrafo do gate sobre baterias do hq (`gate_hq_selftest_rules`) só sai com o nó ligado (`.gc/hetzner-node.on`); com o nó desligado o revisor não recebe a instrução do guarda por ali (o pool recebe pela seção `hq-selftest-node`, sempre).
