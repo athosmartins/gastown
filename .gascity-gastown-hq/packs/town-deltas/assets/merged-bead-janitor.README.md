@@ -82,6 +82,17 @@ evidence) is never blocked by this — it's an all-or-nothing gate over
   (`ga-soxi9`, `ga-9n9z7`): the bead's only trace in `origin/main` was the
   patch-staging commit. Signals (B)/(C) are unaffected — a real gate marker or
   merged branch for the same bead still closes it normally.
+- **Hierarchical ids never borrow a parent's or a sibling's merge** (ga-61i9j5y).
+  A child bead is `<parent>.<n>`, and a `.` followed by a letter or digit
+  *continues* the id: the epic `wa-qrki7a` is **not** a whole token inside
+  `fix(wa-qrki7a.1): …`, and `wa-qrki7a.1` is not one inside `wa-qrki7a.10` (only a
+  sentence-ending `.` is a boundary). The sling-bead fallback (ga-vokwv) reads the
+  Pilot's `Sling task bead: <id>` comment whole and never probes an ancestor, the
+  bead's `parent`, or any other dotted id (a child or a sibling is a real work bead,
+  never a wrapper). Before this, `wa-qrki7a.3` was auto-closed twice on 31/10 with
+  `sling-bead-evidence via sling-task bead wa-qrki7a [commit 500fc9f07]`: the comment
+  `Sling task bead: wa-qrki7a.3` was cut at the dot to the epic's id, and the epic id
+  "matched" the commit of the sibling `wa-qrki7a.1`.
 - No signal → **keep**. A stale **unmerged** branch contributes nothing.
 
 ## Durable prevention — commit convention (fixes the sibling root cause)
