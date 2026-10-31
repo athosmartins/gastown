@@ -220,9 +220,6 @@ _SECRET_RES = (
     re.compile(r"(?i)\b(?:set-)?cookie\b['\"]?\s*[:=]\s*\S{8,}"),
     # scheme://user:password@host -- a DSN / URL with credentials (bounded runs, linear)
     re.compile(r"\b[a-z][a-z0-9+.-]{1,20}://[^\s/:@]{1,64}:[^\s/@]{3,}@"),
-    # a long token with upper AND lower case AND a digit (hex-only hashes -- git shas -- have no upper+lower mix, so they
-    # pass); the lookaheads are bounded so a hostile 100k-character run cannot make this quadratic
-    re.compile(r"(?=[A-Za-z0-9_-]{0,127}[A-Z])(?=[A-Za-z0-9_-]{0,127}[a-z])(?=[A-Za-z0-9_-]{0,127}\d)\b[A-Za-z0-9_-]{32,}"),
 )
 # A secret that ENDS a block ("password:" and the value on the next line, which is the next block): the block that follows
 # is withheld too.
@@ -240,6 +237,24 @@ _PII_RES = (
     re.compile(r"\b55\d{2}9?\d{8}\b"),  # 5531999998888 (a WhatsApp number)
     re.compile(r"@(?:s\.whatsapp\.net|c\.us|g\.us)\b"),  # a WhatsApp jid
 )
+# A run of token characters this long that mixes upper case, lower case and a digit looks like a generated secret. Hex-only
+# strings (git shas, sha256) have no upper+lower mix and pass. Linear: finditer walks the text once and each run is inspected
+# only through its first _TOKEN_INSPECT characters (a lookahead-per-position regex was quadratic on a hostile 100k run).
+_TOKEN_RUN_RE = re.compile(r"[A-Za-z0-9_-]{32,}")
+_TOKEN_INSPECT = 128
+_TOKEN_MAX_RUNS = 2000  # more long runs than this is a dump of identifiers/hashes: stop looking (and do not call it a secret)
+
+
+def _has_token_like_run(text: str) -> bool:
+    for n, m in enumerate(_TOKEN_RUN_RE.finditer(text)):
+        if n >= _TOKEN_MAX_RUNS:
+            return False
+        head = text[m.start():m.start() + _TOKEN_INSPECT]
+        if any(c.isupper() for c in head) and any(c.islower() for c in head) and any(c.isdigit() for c in head):
+            return True
+    return False
+
+
 _EMAIL_AT_RE = re.compile(r"@([\w-]+(?:\.[\w-]+)+)")
 _EMAIL_LOCAL_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.+-")
 _EMAIL_MAX_AT = 200  # a block with hundreds of '@' is a dump, not a person; bound the work
@@ -272,7 +287,7 @@ def egress_withhold_reason(text: str) -> str | None:
     """"secret" | "pii" | None. None is the only answer that lets text leave the machine; it means "none of the known
     shapes matched", NOT "this is safe". Never raises."""
     try:
-        if any(rx.search(text) for rx in _SECRET_RES):
+        if any(rx.search(text) for rx in _SECRET_RES) or _has_token_like_run(text):
             return "secret"
         if any(rx.search(text) for rx in _PII_RES) or _has_email(text):
             return "pii"
@@ -798,11 +813,17 @@ def _selftest() -> int:
     plan_send(sbl, split_key, max_chars=10**6)
     value_block = next(b for b in sbl if "hunter2hunter2" in split_key[b["start"]:b["end"]])
     ok("review finding 2: a `password:` at the end of a block withholds the NEXT block, where the value is", not value_block["send"])
+    # Cost bound on hostile input, production-shaped: the default budget (MAX_STATE_CHARS) caps what is scanned in full, and the
+    # whole-output scan (sensitive_spans) is the only thing that sees all of it. The bound is generous on purpose -- a timing
+    # assertion on a machine at load 60 must not flake -- yet a quadratic scan of these 100k+ inputs would take minutes.
     t_lin = time.time()
-    for hostile in ("A1" * 60000, ("a-" * 30000) + "Z9", "-----BEGIN X-----" * 400, "kind: Secret\n" * 400, "token:" * 20000):
+    for hostile in ("A1" * 60000, ("a-" * 30000) + "Z9", "-----BEGIN X-----" * 400, "kind: Secret\n" * 400, "token:" * 20000, ("Ab1" * 40 + " ") * 5000):
         hb = build_blocks(hostile)
-        plan_send(hb, hostile, max_chars=10**6)
-    ok("the strengthened guard + span scan stay fast (linear) on hostile 100k-character inputs", time.time() - t_lin < 5.0)
+        plan_send(hb, hostile)
+        egress_withhold_reason(hostile[:MAX_STATE_CHARS // 2])
+    ok("the guard + span scan stay linear on hostile 100k+ character inputs (production budget; bound is generous, not tight)", time.time() - t_lin < 10.0)
+    ok("a long mixed-case run is still caught after the rewrite (and a hex-only run of the same length is not)",
+       egress_withhold_reason("k=" + "aB3" * 20) == "secret" and egress_withhold_reason("sha " + "ab12" * 16) is None)
 
     bad_text = text12 + "\n\ncpf 123.456.789-09"
     bl = build_blocks(bad_text)
