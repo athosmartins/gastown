@@ -47,7 +47,7 @@
 #   CADEIA        nó Linux -> MBP -> mini, com os mesmos códigos 96..99: qualquer motivo para o nó não rodar (bandeira, inalcançável, sem saúde,
 #                 slots cheios, base ausente, ssh que caiu no meio, filtro ilegível, repo que não é wa, teste mac-only) cai no MBP, e daí no
 #                 que já existia. Servidor fora do ar NUNCA trava o gate. O pytest vai ao nó sempre; o --exec só com --node-first (item seguinte).
-#   --EXEC        (ga-kfxzpt) sem --node-first o --exec é só do MBP, como sempre: o build de Go (--go), o laboratório do Dolt e o jsonl levam variáveis, binários e dados que NÃO podem ir ao servidor alugado.
+#   --EXEC        (ga-kfxzpt) sem --node-first o --exec é só do MBP, como sempre: o build de Go (--go), o laboratório do Dolt e a conferência do jsonl levam variáveis, binários e dados que NÃO podem ir ao servidor alugado.
 #                 Com --node-first a cadeia é a mesma (nó -> MBP; 96..99 quando nenhum rodou) e o nó só entra se: (1) o preflight dele diz `rea_tools=<lista>` (hetzner-rea-tools.sh install; `none` = nunca instalado,
 #                 vazio = marcador ilegível ou meio instalado: o nó NÃO é usado) e o comando não cita uma ferramenta conhecida (rea, ghidra, adb...) que a lista não tem; (2) cada --push é UM arquivo comum de pacote de app
 #                 (apk, aab, jar, asar, so, exe...) de até HETZNER_EXEC_PUSH_MAX_MB (1024): o --exec não passa por filtro nem por varredura de conteúdo, então diretório, link e qualquer outra extensão ficam no MBP;

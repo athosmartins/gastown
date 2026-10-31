@@ -114,7 +114,7 @@ Um commit recusado com 75 não é um commit falho: espere o disco ou rode o comm
 ## Limites conhecidos
 
 - O guarda só protege quem o chama. Hoje: o selftest do jsonl-archive, o fallback local das baterias (por doutrina) e o gate. O pre-commit do beads depende do trecho acima ser aplicado naquele repo.
-- `go test/build/vet/install` têm destino remoto: o MBP, por `mbp-run.sh --exec --go` (não o nó Linux: `--exec` roda só no MBP). Com o MBP fora (rc 96..99) o passo ESPERA, não volta ao mini. `golangci-lint` não tem destino remoto hoje; com disco baixo ele espera.
+- `go test/build/vet/install` têm destino remoto: o MBP, por `mbp-run.sh --exec --go` (não o nó Linux: o `--go` é só do MBP). Com o MBP fora (rc 96..99) o passo ESPERA, não volta ao mini. `golangci-lint` não tem destino remoto hoje; com disco baixo ele espera.
 - A detecção de passo Go olha o rótulo e a linha de comando, não o que um script faz por dentro; um build disparado por `make`, `bash x.sh` ou um hook só é guardado se quem chama rotular o passo `go-…`. Fora do reconhecimento também: `go -C <dir> test`, `go run`, `go generate`, rótulo no plural.
 - O parágrafo do gate sobre baterias do hq (`gate_hq_selftest_rules`) só sai com o nó ligado (`.gc/hetzner-node.on`); com o nó desligado o revisor não recebe a instrução do guarda por ali (o pool recebe pela seção `hq-selftest-node`, sempre).
 - Uma sessão que JÁ está dentro de um passo quando o disco cai não é interrompida por esta fatia. Exceção: o push e o selftest/bateria de mutantes lançados pelo guarda, que levam a sua própria vigia (acima). O `hq-mutate.py` (motor do nó Hetzner) tem a dele, por slot.

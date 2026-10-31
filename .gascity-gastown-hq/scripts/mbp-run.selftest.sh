@@ -49,6 +49,9 @@
 # CHROMIUM DO NÓ (ga-aptlug): o pytest do nó exporta PLAYWRIGHT_BROWSERS_PATH e LD_LIBRARY_PATH (hetzner-chromium.sh install) SÓ com o marcador `ready` + browsers/ + libpath.txt legível e não vazio;
 #   marcador ausente/vazio, sem browsers/, libpath ausente/vazio/ilegível = NENHUMA das duas (e o LD_LIBRARY_PATH de antes fica como estava); o bloco que o mbp-run mandou roda DE VERDADE num HOME de teste; 4 mutantes (uma porta cada).
 #   Fora do pytest do nó (job do MBP, selftest do hq) o bloco não existe.
+# --EXEC NO NÓ (ga-kfxzpt; MBP_SELFTEST_ONLY=nodeexec roda só esta parte): sem --node-first o --exec nunca toca o nó; com ele a cadeia nó -> MBP e as portas do nó: o marcador de ferramentas (rea_tools none / vazio / lista), o comando que cita
+#   ferramenta que o nó não tem, o push só de UM arquivo comum de pacote de app, o --env com nome de segredo, o rc 126/127 do nó que não é veredito (o scratch sai mesmo com --keep) e o scratch que nasce vazio; o job do nó roda DE VERDADE (JAVA_HOME,
+#   PATH, REA_JADX_MCP_JAR); 4 controles negativos (uma porta cada).
 # MBP_RUN_UNDER_TEST=<script> roda a mesma bateria contra outro mbp-run.sh (ex.: o antigo, para ver os testes novos falharem).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
