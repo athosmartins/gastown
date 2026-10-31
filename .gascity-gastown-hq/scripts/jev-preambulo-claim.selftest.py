@@ -236,6 +236,11 @@ def test_policy_down():
     empty.write_text("", encoding="utf-8")
     rc, out, _ = run(policy=dict(POL, ppb=SimpleNamespace(FRAGMENT=empty, parse_fragment=POL["ppb"].parse_fragment)))
     ok("an EMPTY fragment is a failure, not 'no sections to load'", rc == 3 and "NÃO CARREGADA" in out)
+    # A DIRECTORY where the fragment should be: the path exists but cannot be read as a file (IsADirectoryError, an OSError),
+    # unlike the missing path above. vazio -> n/a; falhou/ilegivel -> the same exit-3 notice, naming the error that was raised.
+    rc, out, recs = run(policy=dict(POL, ppb=SimpleNamespace(FRAGMENT=tmp, parse_fragment=POL["ppb"].parse_fragment)))
+    ok("a fragment path that is a DIRECTORY (exists, unreadable as a file): exit 3, NÃO CARREGADA, the notice names IsADirectoryError, no record",
+       rc == 3 and "NÃO CARREGADA" in out and "IsADirectoryError" in out and recs == [], out[:240])
     rc, out, _ = run(role="intruder")
     ok("an unknown role: exit 3 and the notice", rc == 3 and "papel desconhecido" in out)
     sans = dict(POL, ppb=SimpleNamespace(FRAGMENT=tmp / "x.md", parse_fragment=lambda t: [b for b in POL["ppb"].parse_fragment(
