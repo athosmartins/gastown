@@ -646,8 +646,25 @@ git_in() {
 
 # token_bounded <bead_id> <text> — rc0 iff text contains bead_id as a whole
 # token (not a substring of a longer id). Guards e.g. wa-1 vs wa-12.
+#
+# HIERARCHICAL ids (ga-61i9j5y): a child bead is "<parent>.<n>" — wa-qrki7a.3 is the third
+# child of the epic wa-qrki7a — so a "." followed by an alphanumeric CONTINUES the id exactly
+# as another letter does: wa-qrki7a is NOT a whole token inside "fix(wa-qrki7a.1)", and
+# wa-qrki7a.1 is not one inside "wa-qrki7a.10" or "wa-qrki7a.1.2". Only a "." that ends a
+# sentence ("closes ga-abc." / "ga-abc. Next") or is followed by punctuation/end is a boundary.
+# "." used to count as a boundary, so the epic id matched every child's commit header: a
+# child's merge read as the epic's and (via the sling-bead fallback) closed wa-qrki7a.3 twice
+# with the commit of its sibling wa-qrki7a.1. The id is regex-escaped for the same reason —
+# its dots are literal, not "any character". Still `grep … >/dev/null`, never `grep -q`
+# (ga-5bxuam: under pipefail the early exit SIGPIPEs printf and a match reads as no match).
+# vazio → an empty id never matches; falhou/ilegível → escaping failed or came back empty:
+# rc1 (no match), because a match is what closes a bead and a broken regex must not invent one.
 token_bounded() {
-  printf '%s' "$2" | grep -E "(^|[^[:alnum:]-])$1([^[:alnum:]-]|\$)" >/dev/null
+  local id_re
+  [ -n "$1" ] || return 1
+  id_re=$(printf '%s' "$1" | sed 's/\./\\./g') || return 1
+  [ -n "$id_re" ] || return 1
+  printf '%s' "$2" | grep -E "(^|[^[:alnum:]-])${id_re}(\$|[^[:alnum:].-]|\.(\$|[^[:alnum:]]))" >/dev/null
 }
 
 # scan_commit_for_bead <git_dir> <is_container> <ref> <bead_id>
@@ -1040,13 +1057,44 @@ branch_label_from_markers() {
 # ga-0jcit's real fix landed under its FIRST wrapper (ga-w4ah2) while two later
 # re-dispatches (chasing the same already-fixed bug) carried no code at all, so
 # only trying the newest metadata value would have missed the actual evidence.
+#
+# ga-61i9j5y — two rules keep a bead from borrowing the merge of its PARENT or a SIBLING:
+#  1. The id is read WHOLE, hierarchical suffix included. The class used to be
+#     [a-z][a-z0-9-]+, which stops at the first ".": the Pilot's own comment
+#     "Sling task bead: wa-qrki7a.3" came back as "wa-qrki7a" — the EPIC — and, being
+#     different from the bead's id, the caller's self-reference skip let it through.
+#  2. Only an id that can really be this bead's wrapper is returned. The Pilot hands out
+#     two kinds: the bead itself (rig-native, == "$b.id"; the caller skips it) and a fresh,
+#     top-level task bead minted by `gc sling` (ga-w4ah2). Neither is in the bead's own
+#     hierarchy, so an id is DROPPED when it is an ancestor of the bead ("$bid" starts with
+#     "<id>."), is its parent (the `parent` field or a parent-child dependency, for a
+#     child whose own id is not dotted), or is any OTHER dotted id (a child, a grandchild or
+#     a sibling is a real work bead with its own lifecycle, never a wrapper). Whatever the
+#     comment says, the epic's merge is not this child's merge, and a sibling's is not
+#     either: in doubt the id is dropped and the bead stays open.
+# vazio → no id / no parent / no dependencies in the JSON: nothing to compare against, the id
+# rules above still apply and a missing field never ADDS an id; falhou/ilegível → jq cannot
+# parse the blob: no output at all, so the caller's loop has nothing to probe and the bead is
+# kept (the inert outcome); a field of the wrong type (a numeric parent, a string
+# `dependencies`) is ignored, never trusted, and the ids that are still readable are returned.
 sling_beads_from_show() {
   printf '%s' "$1" | jq -r '
     (if type=="array" then .[0] else . end) as $b
-    | ([$b.metadata["pilot.sling_bead"]? // empty] | map(select(. != null and . != "")))
-      + ([($b.comments // [])[] | .text // "" | select(test("Sling task bead:")) |
-          capture("Sling task bead: (?<id>[a-z][a-z0-9-]+)") | .id])
-    | unique[]
+    | ($b.id // "") as $bid
+    | ([$b.parent? // empty]
+       + [($b.dependencies // [])[]? | select((.type // .dependency_type // "") == "parent-child") | (.id // .depends_on_id // empty)]
+       | map(select(type == "string"))) as $parents
+    | ( ([$b.metadata["pilot.sling_bead"]? // empty] | map(select(. != null and . != "")))
+        + ([($b.comments // [])[] | .text // "" | select(test("Sling task bead:")) |
+            capture("Sling task bead: (?<id>[a-z][a-z0-9-]+(?:\\.[0-9]+)*)") | .id]) )
+    | map(select(type == "string"))
+    | unique
+    | map(. as $s
+          | select($s == $bid
+                   or ( ($s | contains(".") | not)
+                        and (($bid | startswith($s + ".")) | not)
+                        and ([$parents[] | select(. == $s)] | length == 0) )))
+    | .[]
   ' 2>/dev/null || true
 }
 

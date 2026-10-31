@@ -467,6 +467,35 @@ rc1 token_bounded "wa-1"    "feat(wa-1or2): unrelated longer id"      # wa-1 mus
 rc1 token_bounded "wa-1or2" "see commit wa-1or2x for details"          # trailing alnum breaks boundary
 rc1 token_bounded "wa-1or2" "totally unrelated message"
 
+# ── 2a. token_bounded — HIERARCHICAL ids (ga-61i9j5y) ───────────────────────
+# A child bead is "<parent>.<n>"; a "." followed by an alphanumeric CONTINUES the id, so an epic is NOT a
+# whole token inside its child's commit header. The real incident: wa-qrki7a.3 was auto-closed twice
+# (07:25Z and 10:24Z, 31/10) with the commit of its SIBLING wa-qrki7a.1 ("fix(wa-qrki7a.1): gate
+# ga-bph1tej …") because the epic id "matched" it ("." counted as a boundary).
+echo "── 2a. token_bounded — hierarchical ids (ga-61i9j5y) ──"
+rc1 token_bounded "wa-qrki7a"   "fix(wa-qrki7a.1): gate ga-bph1tej"          # the EPIC is not its child's commit (the incident)
+rc1 token_bounded "wa-qrki7a"   "fix(wa-qrki7a.10): another child"
+rc1 token_bounded "wa-qrki7a"   "Merge crew/x/wa-qrki7a.3: e-mail anexos"     # ...nor a child's merge landing
+rc0 token_bounded "wa-qrki7a.1" "fix(wa-qrki7a.1): gate ga-bph1tej"            # a child IS its own commit
+rc1 token_bounded "wa-qrki7a.1" "fix(wa-qrki7a.10): another child"             # .1 is not .10
+rc1 token_bounded "wa-qrki7a.1" "fix(wa-qrki7a.1.2): a grandchild"             # a child is not its grandchild's commit
+rc1 token_bounded "wa-qrki7a.3" "fix(wa-qrki7a.1): gate ga-bph1tej"            # ...nor a SIBLING's
+rc0 token_bounded "ga-2hd02v.3" "fix(ga-2hd02v.3): a two-level parent's own commit"
+rc1 token_bounded "ga-2hd02v.3" "fix(ga-2hd02v.3.28): its child"
+# A "." that ends a sentence is still a boundary (a body line "... closes ga-abc." must keep matching):
+rc0 token_bounded "wa-qrki7a"   "closes wa-qrki7a."
+rc0 token_bounded "wa-qrki7a"   "closes wa-qrki7a. Next sentence"
+rc0 token_bounded "wa-qrki7a"   $'closes wa-qrki7a.\nsecond line of the body'
+rc0 token_bounded "wa-qrki7a.3" "closes wa-qrki7a.3."
+rc0 token_bounded "wa-qrki7a"   "see wa-qrki7a.1 and wa-qrki7a"               # a LATER bounded occurrence still counts
+rc1 token_bounded "wa-qrki7a"   "see wa-qrki7a.1 and wa-qrki7a.2"
+rc1 token_bounded "wa-qrki7a"   "fix(wa-qrki7a.md): x"                         # "." + alnum continues, whatever follows (fail-closed)
+# The id's own dots are literal, not "any character":
+rc1 token_bounded "wa-qrki7a.3" "fix(wa-qrki7aX3): would match under a wildcard dot"
+rc1 token_bounded "wa-qrki7a.3" "fix(wa-qrki7a-3): neither"
+# vazio → an empty id never matches (it used to match any text):
+rc1 token_bounded "" "fix(wa-qrki7a.1): anything"
+
 # ── 2b. subject_impl_scopes_bead — THE DISCRIMINATOR (ga-wisp-ld35wuw) ───────
 # rc0 iff the bead id is the IMPLEMENTING conventional-commit SCOPE (header before the
 # first colon), rc1 if it is only a trailing context/motivation reference. This is the
@@ -496,6 +525,11 @@ rc1 subject_impl_scopes_bead "merge wa-iy9s8 into main" "wa-iy9s8"              
 rc1 subject_impl_scopes_bead 'Revert "fix(wa-iy9s8): add thing"' "wa-iy9s8"                # git default revert → undo, not delivery
 rc1 subject_impl_scopes_bead "revert: fix(wa-iy9s8): add thing" "wa-iy9s8"                 # conventional revert → reject
 rc1 subject_impl_scopes_bead "fix(wa-1or2): unrelated longer id" "wa-1"                    # token boundary: wa-1 ≠ wa-1or2
+# ga-61i9j5y — the scope is the WHOLE hierarchical id: a child's commit is not its parent's or its sibling's.
+rc1 subject_impl_scopes_bead "fix(wa-qrki7a.1): gate ga-bph1tej — envio Zoho" "wa-qrki7a"      # parent epic ≠ the child's scope
+rc1 subject_impl_scopes_bead "fix(wa-qrki7a.1): gate ga-bph1tej — envio Zoho" "wa-qrki7a.3"    # a sibling ≠ the scope
+rc0 subject_impl_scopes_bead "fix(wa-qrki7a.1): gate ga-bph1tej — envio Zoho" "wa-qrki7a.1"    # the child's own scope
+rc0 subject_impl_scopes_bead "fix(wa-qrki7a): epic-level change" "wa-qrki7a"                    # the epic's own commit is still the epic's
 
 # ── 3. merge-evidence helpers — real git, no network ────────────────────────
 echo "── 3. scan_commit_for_bead + branch_merged (real repo) ──"
@@ -1076,6 +1110,58 @@ eq "metadata-only (no comments key) → the one wrapper id" "$(sling_beads_from_
 SHOW_MIXED='{"metadata": {}, "comments": [{"text": "Sling task bead: NOTLOWER", "created_at": "x"}, {"text": "Sling task bead: ga-good1", "created_at": "y"}]}'
 eq "malformed sibling comment does not block a valid match" "$(sling_beads_from_show "$SHOW_MIXED")" "ga-good1"
 
+echo "  -- 11a2. sling_beads_from_show: hierarchical ids, never the parent's or a sibling's merge (ga-61i9j5y) --"
+# THE INCIDENT, shape read live off wa-qrki7a.3 (31/10): the metadata holds the bead's OWN dotted id, the
+# Pilot's dispatch comment names it too, and the bead is the 3rd child of the epic wa-qrki7a. The old
+# extraction cut the comment's id at the first "." — "wa-qrki7a", the EPIC — which differs from the bead's id,
+# so the caller's self-reference skip let it through and the commit of the sibling wa-qrki7a.1 closed the bead.
+SHOW_INC='{"id":"wa-qrki7a.3","parent":"wa-qrki7a","issue_type":"feature",
+  "dependencies":[{"id":"wa-qrki7a","type":"parent-child","status":"in_progress","issue_type":"epic"}],
+  "metadata":{"pilot.sling_bead":"wa-qrki7a.3"},
+  "comments":[{"text":"Pilot dispatched builder wa-worker-1 at 2026-10-31T07:07:02Z\n(tier=feature, lane=small, rig=whatsapp_automation).\nSling task bead: wa-qrki7a.3\nBuilder doctrine: implement","created_at":"2026-10-31T07:07:10Z"}]}'
+eq "the bead's own dotted id is read WHOLE — the epic is not conjured out of it" \
+   "$(sling_beads_from_show "$SHOW_INC")" "wa-qrki7a.3"
+SHOW_INC_COMMENT_ONLY=$(jq -c 'del(.metadata)' <<<"$SHOW_INC")
+eq "...from the comment alone too (no metadata to lean on)" \
+   "$(sling_beads_from_show "$SHOW_INC_COMMENT_ONLY")" "wa-qrki7a.3"
+SHOW_INC_PERIOD=$(jq -c '.comments[0].text = "Sling task bead: wa-qrki7a.3. Builder doctrine: implement" | del(.metadata)' <<<"$SHOW_INC")
+eq "...a sentence period after the id is not part of it" \
+   "$(sling_beads_from_show "$SHOW_INC_PERIOD")" "wa-qrki7a.3"
+SHOW_DEEP='{"id":"ga-2hd02v.3.28","metadata":{},"comments":[{"text":"Sling task bead: ga-2hd02v.3.28\nBuilder doctrine: fix bug"}]}'
+eq "a two-level id (ga-2hd02v.3.28) is read whole" "$(sling_beads_from_show "$SHOW_DEEP")" "ga-2hd02v.3.28"
+
+# The parent / an ancestor is never a wrapper, whoever wrote it (a hand-typed comment, an old record).
+SHOW_ANC=$(jq -c '.comments[0].text = "Sling task bead: wa-qrki7a\nBuilder doctrine: implement" | .metadata["pilot.sling_bead"] = "wa-qrki7a"' <<<"$SHOW_INC")
+eq "an ancestor named outright (comment AND metadata) is dropped — the epic is not this child's wrapper" \
+   "$(sling_beads_from_show "$SHOW_ANC")" ""
+SHOW_ANC2='{"id":"ga-2hd02v.3.28","metadata":{"pilot.sling_bead":"ga-2hd02v"},"comments":[{"text":"Sling task bead: ga-2hd02v.3"}]}'
+eq "grandparent and parent of a two-level id are both dropped" "$(sling_beads_from_show "$SHOW_ANC2")" ""
+# A parent that is NOT a dotted prefix (the child's own id has no dot): the parent field / parent-child link says so.
+SHOW_PAR='{"id":"wa-kid1","parent":"wa-mom1","metadata":{},"comments":[{"text":"Sling task bead: wa-mom1"}]}'
+eq "an explicit parent (the parent field) is dropped even when the ids are not dotted" "$(sling_beads_from_show "$SHOW_PAR")" ""
+SHOW_PAR_DEP='{"id":"wa-kid1","metadata":{},"dependencies":[{"id":"wa-mom1","type":"parent-child"}],"comments":[{"text":"Sling task bead: wa-mom1"}]}'
+eq "...and so is a parent-child dependency when the parent field is absent" "$(sling_beads_from_show "$SHOW_PAR_DEP")" ""
+SHOW_PAR_DEP2='{"id":"wa-kid1","metadata":{},"dependencies":[{"depends_on_id":"wa-mom1","dependency_type":"parent-child"}],"comments":[{"text":"Sling task bead: wa-mom1"}]}'
+eq "...whichever of the two key spellings bd uses" "$(sling_beads_from_show "$SHOW_PAR_DEP2")" ""
+# A sibling, a child or a grandchild is a real work bead with its own lifecycle, never a wrapper.
+SHOW_SIB='{"id":"wa-qrki7a.3","metadata":{},"comments":[{"text":"Sling task bead: wa-qrki7a.1"}]}'
+eq "a SIBLING (another dotted id) is dropped" "$(sling_beads_from_show "$SHOW_SIB")" ""
+SHOW_KID='{"id":"ga-abc12","metadata":{},"comments":[{"text":"Sling task bead: ga-abc12.1"},{"text":"Sling task bead: ga-abc12.1.2"}]}'
+eq "a CHILD and a GRANDCHILD of the bead are dropped" "$(sling_beads_from_show "$SHOW_KID")" ""
+# ...but the guard is not a blanket block: everything that can be this bead's wrapper still comes through.
+SHOW_OK='{"id":"ga-0jcit","metadata":{"pilot.sling_bead":"ga-803hq"},"comments":[{"text":"Sling task bead: ga-w4ah2"},{"text":"Sling task bead: ga-0jcit"}]}'
+eq "minted top-level wrappers (ga-w4ah2, ga-803hq) and the bead's own id still come through" \
+   "$(sling_beads_from_show "$SHOW_OK" | tr '\n' ',')" "ga-0jcit,ga-803hq,ga-w4ah2,"
+SHOW_LONGER='{"id":"wa-qrki7a2","metadata":{},"comments":[{"text":"Sling task bead: wa-qrki7a"}]}'
+eq "a shared prefix WITHOUT the dot is not an ancestor (wa-qrki7a2 is not a child of wa-qrki7a)" \
+   "$(sling_beads_from_show "$SHOW_LONGER")" "wa-qrki7a"
+SHOW_BLOCKS='{"id":"wa-kid1","metadata":{},"dependencies":[{"id":"wa-other1","type":"blocks"}],"comments":[{"text":"Sling task bead: wa-other1"}]}'
+eq "a non-parent dependency is not a parent (only parent-child links are dropped)" "$(sling_beads_from_show "$SHOW_BLOCKS")" "wa-other1"
+# falhou/ilegível → nothing to probe, never a crash and never an invented id.
+eq "unparseable show output → no sling id" "$(sling_beads_from_show 'this is not json {')" ""
+SHOW_TYPES='{"id":"x-1","parent":7,"metadata":{"pilot.sling_bead":5},"comments":[{"text":"Sling task bead: ga-fine1"}],"dependencies":"nope"}'
+eq "wrongly typed fields are ignored, the readable id survives" "$(sling_beads_from_show "$SHOW_TYPES")" "ga-fine1"
+
 echo "  -- 11b. sling_signals_for_id (real git + synthetic marker JSON) --"
 T10="$(mktemp -d 2>/dev/null || mktemp -d -t janitor-t10)"
 trap 'rm -rf "$T10" 2>/dev/null || true; rm -rf "$T7B" 2>/dev/null || true; rm -rf "$T7" 2>/dev/null || true; rm -rf "$T" 2>/dev/null || true' EXIT
@@ -1132,6 +1218,28 @@ eq "branch self-guard rejects a final-segment mismatch" \
    "$(sling_signals_for_id "$R10" 0 "main" "zz" "$R10" 0 "main" "tt-branchy-lon" "$M_EMPTY")" \
    "0 0 0 - -"
 
+echo "  -- 11b3. sling_signals_for_id: a SIBLING's commit is not the epic's, nor another child's (ga-61i9j5y) --"
+# origin/main holds ONLY the commit of wa-qrki7a.1 — what the incident's repo looked like for wa-qrki7a.3.
+R61="$T10/repo61"
+git init -q -b main "$R61"
+( cd "$R61" && echo base > base.txt && git add base.txt && git commit -q -m "base commit" \
+  && echo zoho > zoho.txt && git add zoho.txt && git commit -q -m "fix(wa-qrki7a.1): gate ga-bph1tej — envio Zoho" )
+SIB_SHA=$(git -C "$R61" rev-parse --short=9 HEAD)
+git -C "$R61" update-ref refs/remotes/origin/main refs/heads/main
+eq "the EPIC id finds nothing in the sibling's commit (was: 1 0 0 <sha> -, the 'commit 500fc9f07' of the incident)" \
+   "$(sling_signals_for_id "$R61" 0 "main" "wa" "$R61" 0 "main" "wa-qrki7a" "$M_EMPTY")" "0 0 0 - -"
+eq "the bead's own id (wa-qrki7a.3) finds nothing either" \
+   "$(sling_signals_for_id "$R61" 0 "main" "wa" "$R61" 0 "main" "wa-qrki7a.3" "$M_EMPTY")" "0 0 0 - -"
+eq "the sibling's OWN id still finds its commit (the signal is not neutered)" \
+   "$(sling_signals_for_id "$R61" 0 "main" "wa" "$R61" 0 "main" "wa-qrki7a.1" "$M_EMPTY")" "1 0 0 ${SIB_SHA} -"
+( cd "$R61" && echo epic > epic.txt && git add epic.txt && git commit -q -m "fix(wa-qrki7a): epic-level change" )
+EPIC_SHA=$(git -C "$R61" rev-parse --short=9 HEAD)
+git -C "$R61" update-ref refs/remotes/origin/main refs/heads/main
+eq "the epic's own commit is still evidence for the epic" \
+   "$(sling_signals_for_id "$R61" 0 "main" "wa" "$R61" 0 "main" "wa-qrki7a" "$M_EMPTY")" "1 0 0 ${EPIC_SHA} -"
+eq "...and still not for its child wa-qrki7a.3" \
+   "$(sling_signals_for_id "$R61" 0 "main" "wa" "$R61" 0 "main" "wa-qrki7a.3" "$M_EMPTY")" "0 0 0 - -"
+
 echo "  -- 11b2. sling_fallback_eligible_reason (ga-v8ui5 gate-feedback follow-up) --"
 # GATE-FEEDBACK (2026-07-30, gate_run=ga-wisp-617q8ra): janitor_decide's new
 # keep:superseded-marker-needs-merge-evidence reason (§12 below) is a SECOND
@@ -1162,9 +1270,9 @@ done
 echo "  -- 11c. drift-guard: live wiring in the ga-hcj4 sweep --"
 grep -q 'sling_beads_from_show()' "$JANITOR"  && ok "defines sling_beads_from_show"  || bad "missing sling_beads_from_show def"
 grep -q 'sling_signals_for_id()' "$JANITOR"   && ok "defines sling_signals_for_id"   || bad "missing sling_signals_for_id def"
-grep -qF 'capture("Sling task bead: (?<id>[a-z][a-z0-9-]+)")' "$JANITOR" \
-  && ok "uses the WORKING jq named-group syntax (?<id>...), not the P-form quality-gate-guard.sh uses" \
-  || bad "sling id capture regex missing or reverted to the broken (?P<id>...) form"
+grep -qF 'capture("Sling task bead: (?<id>[a-z][a-z0-9-]+(?:\\.[0-9]+)*)")' "$JANITOR" \
+  && ok "uses the WORKING jq named-group syntax (?<id>...) and reads the hierarchical suffix whole (.N)" \
+  || bad "sling id capture regex missing, reverted to the broken (?P<id>...) form, or cutting wa-qrki7a.3 at the dot (ga-61i9j5y)"
 grep -qF 'if [ "$F_VERDICT" = "keep" ] && [ "$(sling_fallback_eligible_reason "$F_REASON")" = "1" ]; then' "$JANITOR" \
   && ok "fallback gated via sling_fallback_eligible_reason (never overrides epic/open-marker keeps)" \
   || bad "fallback gating condition missing, loosened, or reverted to the single-string no-merge-evidence check"
@@ -1985,6 +2093,87 @@ if bv_closed; then bad "story with an unparseable updated_at was closed"; else o
 grep -qF 'state=unknown' "$BV_OUT" && ok "...and the log names the unreadable state" || bad "an unreadable age is kept silently"
 bv_run 5000 "$PASSED" "ten-minutes"
 if bv_closed; then bad "an unparseable grace setting dropped the wait and closed the story"; else ok "gate:passed + non-numeric grace setting -> NOT closed (the typo holds, loudly)"; fi
+
+echo ""
+echo "── ga-61i9j5y: the REAL sweep on the wa-qrki7a.3 incident (stub bd/gc + a real git fixture) ──"
+# The janitor, end to end, on the shape that closed wa-qrki7a.3 TWICE on 31/10 (07:25Z, 10:24Z): origin/main
+# holds the commit of its SIBLING wa-qrki7a.1 and nothing for .3, and the Pilot's dispatch comment on .3 reads
+# "Sling task bead: wa-qrki7a.3". Four open story:in-flight beads, one stub bd that serves them and logs every call:
+#   wa-qrki7a.3  the incident       -> KEPT (was closed "sling-bead-evidence via sling-task bead wa-qrki7a [commit <the sibling's>]")
+#   wa-kid2      a child whose id is NOT dotted, its PARENT wa-mom2 has a commit of its own -> KEPT (same borrowed proof, other shape)
+#   wa-qrki7a.1  the sibling         -> closed on ITS OWN commit (positive control: the sweep still closes)
+#   wa-legit1    a real minted wrapper (wa-wrap9) carries the fix -> closed via the wrapper (ga-vokwv's fallback still works)
+HB="$T/ga61i9j5y"; mkdir -p "$HB/bin" "$HB/city/.gc/logs"
+git init -q --bare -b main "$HB/origin.git"
+git init -q -b main "$HB/rig"
+( cd "$HB/rig" && echo a > a && git add a && git commit -q -m "base" \
+  && echo b > b && git add b && git commit -q -m "fix(wa-qrki7a.1): gate ga-bph1tej — envio Zoho" \
+  && echo c > c && git add c && git commit -q -m "fix(wa-wrap9): the real fix, named after the sling wrapper" \
+  && echo d > d && git add d && git commit -q -m "fix(wa-mom2): the parent's own work" \
+  && git remote add origin "$HB/origin.git" && git push -q origin main ) >/dev/null 2>&1
+# hb_bead <id> <parent id | -> <the id the dispatch comment and pilot.sling_bead name> — one open story:in-flight bead.
+hb_bead() {
+  jq -n --arg id "$1" --arg par "$2" --arg sling "$3" '
+    {id:$id, title:("fixture " + $id), issue_type:"feature", status:"open", assignee:"",
+     labels:["story:in-flight","pilot:dispatched"], metadata:{"pilot.sling_bead":$sling},
+     comments:[{text:("Pilot dispatched builder wa-worker-1 at 2026-10-31T07:07:02Z\n(tier=feature, lane=small, rig=whatsapp_automation).\nSling task bead: " + $sling + "\nBuilder doctrine: implement"), created_at:"2026-10-31T07:07:10Z"}]}
+    + (if $par == "-" then {} else {parent:$par, dependencies:[{id:$par, type:"parent-child", status:"in_progress", issue_type:"epic"}]} end)'
+}
+{ hb_bead wa-qrki7a.3 wa-qrki7a wa-qrki7a.3; hb_bead wa-kid2 wa-mom2 wa-mom2
+  hb_bead wa-qrki7a.1 wa-qrki7a wa-qrki7a.1; hb_bead wa-legit1 - wa-wrap9; } | jq -s '.' > "$HB/beads.json"
+cat > "$HB/bin/gc" <<STUB
+#!/usr/bin/env bash
+if [ "\$3" = "rig" ] && [ "\$4" = "list" ]; then
+  printf '{"rigs":[{"name":"fixrig","prefix":"wa","path":"$HB/rig","default_branch":"main","hq":false}]}'
+fi
+exit 0
+STUB
+cat > "$HB/bin/bd" <<'STUB'
+#!/usr/bin/env bash
+D="$(cd "$(dirname "$0")/.." && pwd)"
+printf '%s\n' "$*" >> "$D/bd.log"
+[ "${1:-}" = "-C" ] && shift 2
+case "${1:-}" in
+  list)
+    case " $* " in
+      *"story:in-flight"*) jq -c '[.[] | select(.status == "open") | del(.comments)]' "$D/beads.json" ;;
+      *) printf '[]' ;;
+    esac ;;
+  show)     jq -c --arg id "${2:-}" '.[] | select(.id == $id)' "$D/beads.json" ;;
+  comments) printf '[]' ;;
+esac
+exit 0
+STUB
+chmod +x "$HB/bin/gc" "$HB/bin/bd"; : > "$HB/bd.log"
+HB_OUT="$HB/out.log"
+env GC_CITY_PATH="$HB/city" JANITOR_LOG_STDOUT=1 JANITOR_DRY_RUN=0 PATH="$HB/bin:$PATH" bash "$JANITOR" > "$HB_OUT" 2>&1
+hb_closed() { grep -qE " close $1 " "$HB/bd.log"; }
+
+grep -qF '4 open story:in-flight bead(s) to check' "$HB_OUT" \
+  && ok "the sweep saw all four fixture beads (the checks below cannot pass vacuously)" \
+  || bad "the sweep did not list the four fixture beads — the harness is not serving them: $(grep -m2 'in-flight\|ERROR\|WARN' "$HB_OUT" | cut -c1-200)"
+if hb_closed 'wa-qrki7a\.3'; then
+  bad "THE INCIDENT: wa-qrki7a.3 was closed with its sibling's commit — $(grep -m1 'CLOSED-INFLIGHT wa-qrki7a.3' "$HB_OUT" | cut -c1-230)"
+else
+  ok "wa-qrki7a.3 (origin/main holds only the commit of its sibling .1) is NOT closed"
+fi
+grep -qF 'keep-inflight wa-qrki7a.3 (fixrig) — no-merge-evidence' "$HB_OUT" \
+  && ok "...and the log says why: no-merge-evidence (the sling id 'wa-qrki7a' was never probed)" \
+  || bad "wa-qrki7a.3 has no 'keep-inflight … no-merge-evidence' line: $(grep -m2 'wa-qrki7a.3' "$HB_OUT" | cut -c1-200)"
+grep -q 'sling-task bead wa-qrki7a ' "$HB_OUT" \
+  && bad "the epic wa-qrki7a was still probed as a sling-task bead: $(grep -m1 'sling-task bead wa-qrki7a ' "$HB_OUT" | cut -c1-200)" \
+  || ok "no line in the sweep log borrows the epic's id as a sling-task bead"
+if hb_closed 'wa-kid2'; then
+  bad "wa-kid2 was closed with the commit of its PARENT wa-mom2 — $(grep -m1 'CLOSED-INFLIGHT wa-kid2' "$HB_OUT" | cut -c1-230)"
+else
+  ok "wa-kid2 (parent wa-mom2 has its own commit, ids not dotted) is NOT closed with the parent's commit"
+fi
+if hb_closed 'wa-qrki7a\.1'; then ok "positive control: wa-qrki7a.1 IS closed on its own commit"; else bad "wa-qrki7a.1 was not closed on its OWN commit — the sweep is neutered: $(grep -m2 'wa-qrki7a.1' "$HB_OUT" | cut -c1-200)"; fi
+grep -qE 'CLOSED-INFLIGHT wa-qrki7a\.1 \(fixrig\) — commit-in-origin-main' "$HB_OUT" \
+  && ok "...as commit-in-origin-main" || bad "wa-qrki7a.1 closed for the wrong reason: $(grep -m1 'CLOSED-INFLIGHT wa-qrki7a.1' "$HB_OUT" | cut -c1-200)"
+if hb_closed 'wa-legit1'; then ok "positive control: wa-legit1 IS closed through its real wrapper wa-wrap9 (ga-vokwv's fallback survives)"; else bad "wa-legit1 was not closed through its wrapper — the fallback is dead: $(grep -m2 'wa-legit1' "$HB_OUT" | cut -c1-200)"; fi
+grep -qE 'CLOSED-INFLIGHT wa-legit1 \(fixrig\) — sling-bead-evidence.*via sling-task bead wa-wrap9 \[commit ' "$HB_OUT" \
+  && ok "...as sling-bead-evidence via sling-task bead wa-wrap9 [commit …]" || bad "wa-legit1 closed for the wrong reason: $(grep -m1 'CLOSED-INFLIGHT wa-legit1' "$HB_OUT" | cut -c1-200)"
 
 echo ""
 echo "──────────────────────────────────────────"
