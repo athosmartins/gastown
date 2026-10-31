@@ -15,6 +15,7 @@
 #        (REA/APK; o comando roda em ~/gt-remote/exec/<slot>; --push copia P para ./in/; --pull traz REL de volta;
 #         o scratch é APAGADO ao fim (capturas de REA nunca ficam) salvo --keep. Para redirecionar saída use
 #         `-- sh -c 'rea ... > out.json'`.)
+#   mbp-run.sh --exec --node-first [...] -- <comando>    # (ga-kfxzpt; é o que o rea-run.sh passa) tenta o nó Linux ANTES do MBP; as condições estão em "O NÓ LINUX", item --EXEC
 #   mbp-run.sh --exec --go [--push P]... [--env K=V]... -- <comando>      # go build/test/vet no MBP (ga-edkfip)
 #        (--go põe no comando as 3 variáveis de CGO que o build do engine (cmd/gc) exige no MBP: CGO_CPPFLAGS=-I…/icu4c/include,
 #         CGO_LDFLAGS=-L…/icu4c/lib e CGO_CXXFLAGS=-isystem …/MacOSX.sdk/usr/include/c++/v1 (o c++ das Command Line Tools do MBP não acha
@@ -45,7 +46,13 @@
 #                 a pausa existe porque o MBP é o notebook dele, o nó é máquina dedicada (presença sempre LIVRE).
 #   CADEIA        nó Linux -> MBP -> mini, com os mesmos códigos 96..99: qualquer motivo para o nó não rodar (bandeira, inalcançável, sem saúde,
 #                 slots cheios, base ausente, ssh que caiu no meio, filtro ilegível, repo que não é wa, teste mac-only) cai no MBP, e daí no
-#                 que já existia. Servidor fora do ar NUNCA trava o gate. Só pytest vai ao nó (--exec segue no MBP; é a bead do REA).
+#                 que já existia. Servidor fora do ar NUNCA trava o gate. O pytest vai ao nó sempre; o --exec só com --node-first (item seguinte).
+#   --EXEC        (ga-kfxzpt) sem --node-first o --exec é só do MBP, como sempre: o build de Go (--go), o laboratório do Dolt e o jsonl levam variáveis, binários e dados que NÃO podem ir ao servidor alugado.
+#                 Com --node-first a cadeia é a mesma (nó -> MBP; 96..99 quando nenhum rodou) e o nó só entra se: (1) o preflight dele diz `rea_tools=<lista>` (hetzner-rea-tools.sh install; `none` = nunca instalado,
+#                 vazio = marcador ilegível ou meio instalado: o nó NÃO é usado) e o comando não cita uma ferramenta conhecida (rea, ghidra, adb...) que a lista não tem; (2) cada --push é UM arquivo comum de pacote de app
+#                 (apk, aab, jar, asar, so, exe...) de até HETZNER_EXEC_PUSH_MAX_MB (1024): o --exec não passa por filtro nem por varredura de conteúdo, então diretório, link e qualquer outra extensão ficam no MBP;
+#                 (3) nenhum --env tem nome de segredo (TOKEN, SECRET, KEY, PASS, AUTH, COOKIE, CRED, SESSION). rc 126/127 do nó (o shell não achou ou não executou o comando) não é veredito: o comando roda no MBP.
+#                 O scratch do nó nasce VAZIO a cada execução e é apagado ao fim; o ssh que cai no meio não deixa apagar, e as capturas ficam lá até o próximo uso do mesmo slot. Só comando de leitura/recon: a queda no meio refaz tudo no host seguinte.
 #   SEGURANÇA     o rsync para o nó usa SÓ scripts/hetzner-rsync-filter.wa.txt, com --delete-excluded. O filtro olha NOME e pasta, nunca o conteúdo: nome de segredo
 #                 ou de dado conhecido não sai, e fora de tests/ só sai código e os arquivos de dado/config listados POR CAMINHO (nome desconhecido fica inerte).
 #                 Filtro fora da forma que o filter_sane confere = o nó NÃO é usado. O CONTEÚDO é conferido por node_guard (scripts/hetzner-pii-scan.py): arquivo
@@ -190,7 +197,7 @@ usage() { sed -n '2,/^[^#]/{/^#/p;}' "$0" | sed 's/^# \{0,1\}//' >&2; }   # só 
 
 repo=""; dir="$PWD"; mode=pytest; seed_repo=""
 pause_arg=""; host_sel=auto
-pushes=(); pulls=(); envs=(); keep=0; audit_dirs=(); golang=0
+pushes=(); pulls=(); envs=(); keep=0; audit_dirs=(); golang=0; nodefirst=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --host) host_sel="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
@@ -206,6 +213,7 @@ while [ $# -gt 0 ]; do
     --pull) pulls+=("${2:-}"); shift $(( $# > 1 ? 2 : 1 )) ;;
     --env) envs+=("${2:-}"); shift $(( $# > 1 ? 2 : 1 )) ;;
     --go) golang=1; shift ;;
+    --node-first) nodefirst=1; shift ;;
     --keep) keep=1; shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
@@ -222,6 +230,10 @@ if [ "$golang" = 1 ]; then
   [ "$mode" = exec ] || { say "--go só vale com --exec (é para um go build/test no MBP)"; exit 97; }
   envs=("CGO_CPPFLAGS=-I/opt/homebrew/opt/icu4c/include" "CGO_LDFLAGS=-L/opt/homebrew/opt/icu4c/lib"
         "CGO_CXXFLAGS=-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1" "${envs[@]+"${envs[@]}"}")
+fi
+# --node-first (ga-kfxzpt): só no --exec, sem --host (a cadeia é a escolha) e sem --go (as variáveis de CGO acima são caminhos do macOS). Qualquer outra combinação é uso errado e nada roda.
+if [ "$nodefirst" = 1 ]; then
+  [ "$mode" = exec ] && [ "$host_sel" = auto ] && [ "$golang" = 0 ] || { say "--node-first só vale com --exec, sem --host e sem --go (o build de Go é do MBP)"; exit 97; }
 fi
 # nomes na máquina remota: no MBP a base é gt-remote/whatsapp_automation e o venv gt-remote/venv; no nó Linux (montado pelo Mayor) são wa-base e venv-wa.
 # O nó tem wa e hq (hq-base, sem venv: "none" = não conferir); ps no nó Linux não existe (vazio → o chamador cai no MBP). O hq não existe no MBP (vazio → 97, roda local).
@@ -332,6 +344,11 @@ echo "disk_mb=$(df -Pk "$HOME" 2>/dev/null | awk 'NR == 2 && $4 ~ /^[0-9]+$/ { p
 # pytest-xdist no venv do nó: 1 tem · 0 não tem · vazio = não consegui olhar (o lado local trata vazio como 0: não injeta -n)
 sp=$(ls -d "$HOME/gt-remote/$WAVENV"/lib/python3*/site-packages 2>/dev/null | head -1)
 if [ -n "$sp" ] && ls "$sp" >/dev/null 2>&1; then if ls "$sp" | grep -q '^pytest_xdist-'; then echo "xdist=1"; else echo "xdist=0"; fi; else echo "xdist="; fi
+# ferramentas de REA do nó (hetzner-rea-tools.sh install grava o marcador `ready` por último): none = nunca instalado · lista (java,jadx,apktool...) = marcador com TOOLS= e os três executáveis no lugar ·
+# vazio = não consegui saber (marcador que existe e não abre, sem TOOLS=, ou instalação incompleta); o lado local trata vazio como "não usa o nó", nunca como none nem como lista
+rt=$HOME/.local/share/rea-tools
+if [ ! -e "$rt/ready" ]; then echo "rea_tools=none"
+else t=$(sed -n 's/^TOOLS=//p' "$rt/ready" 2>/dev/null | head -n 1 | tr ' ' ','); if [ -n "$t" ] && [ -x "$rt/bin/java" ] && [ -x "$rt/bin/jadx" ] && [ -x "$rt/bin/apktool" ]; then echo "rea_tools=$t"; else echo "rea_tools="; fi; fi
 presence_probe
 for d in "$HOME"/gt-remote/slots/*/; do
   [ -d "$d" ] || continue
@@ -1120,7 +1137,7 @@ fi
 
 # ---- caminho normal (pytest | exec) ----------------------------------------------------------------------------
 # pytest: CADEIA nó Linux -> MBP (-> o chamador roda no mini quando sobra 96..99). Cada host é uma TENTATIVA (attempt_pytest) que devolve o rc do pytest, ou 96..99 = "este host
-# não rodou, tente o próximo". exec (REA/APK) continua só no MBP.
+# não rodou, tente o próximo". exec (REA/APK): só no MBP, a não ser com --node-first (seção --exec, mais abaixo).
 mac_gates() { # as chaves do MBP: bandeira e pausa do Athos
   [ -f "$FLAG" ] || { say "offload desligado (falta $FLAG) — rode local"; return 99; }
   [ -e "$PAUSEFILE" ] && { say "pausado pelo Athos ($(head -n 1 "$PAUSEFILE" 2>/dev/null | cut -c1-100)) — rode local"; return 99; }
@@ -1243,54 +1260,121 @@ EOF
   return $RC
 }
 
-# ---- --exec (REA/APK): só no MBP -----------------------------------------------------------------------------------------------
-run_exec() {
-  local X kv p envline pl rel dest JOBDEF SECS
-  preflight || { rc=$?; log_refusal; exit $rc; }
+# ---- --exec (REA/APK) -------------------------------------------------------------------------------------------------------------
+# Sem --node-first, só o MBP (cabeçalho, item --EXEC). Com ele, a cadeia nó -> MBP do pytest: cada host é uma TENTATIVA (attempt_exec) que devolve o rc do comando, ou 96..99 = "este host não rodou, tente o próximo".
+NODE_EXEC_EXT=" apk apks xapk apkm aab dex jar aar so dylib asar exe dll ipa "   # pacote de app, que é para o que o --exec existe; json, zip, txt, db... não são e ficam no MBP
+NODE_EXEC_MAX_MB=$(num_or "${HETZNER_EXEC_PUSH_MAX_MB:-1024}" 1024); [ "$NODE_EXEC_MAX_MB" -ge 1 ] || NODE_EXEC_MAX_MB=1024
+# ferramentas que o REA costuma chamar: comando que cita uma que o nó não lista vai direto ao MBP, sem empurrar o arquivo em vão. É economia, não segurança: o que ela não pega, o rc 126/127 do nó pega
+NODE_EXEC_KNOWN=" rea ghidra ghidraRun analyzeHeadless jadx apktool java adb hopper ida idat "
+
+# node_push_ok <caminho>: 0 = pode ir ao nó. O --exec não passa por filtro nem por varredura de conteúdo (o pytest passa pelos dois), então a fronteira é a FORMA: UM arquivo comum (nem diretório nem link) de pacote de app, até NODE_EXEC_MAX_MB.
+node_push_ok() {
+  local p="$1" b ext="" sz
+  [ -f "$p" ] && [ ! -L "$p" ] || { say "push '$p': só arquivo comum vai ao $HNAME (diretório, link e caminho ausente ficam no MBP)"; return 1; }
+  # vazio → nome sem ponto: a extensão fica vazia, não casa a lista e o push é recusado (nunca "sem extensão = vale")
+  b=${p##*/}; case "$b" in *.*) ext=$(printf '%s' "${b##*.}" | tr 'A-Z' 'a-z') ;; esac
+  case "$NODE_EXEC_EXT" in *" $ext "*) ;; *) say "push '$p': a extensão '${ext:-nenhuma}' não é de pacote de app — fica no MBP"; return 1 ;; esac
+  # vazio/falhou → wc sem número: "não consegui medir" recusa, nunca "cabe"
+  sz=$(wc -c < "$p" 2>/dev/null | tr -d ' ')
+  isnum "$sz" || { say "push '$p': não consegui medir o tamanho — fica no MBP"; return 1; }
+  [ "$sz" -le $(( NODE_EXEC_MAX_MB * 1048576 )) ] || { say "push '$p': $(( sz / 1048576 )) MB passa do teto de ${NODE_EXEC_MAX_MB} MB — fica no MBP"; return 1; }
+  return 0
+}
+# node_exec_gate <comando...>: o --exec pode ir ao nó? Usa o PF do preflight deste host (já lido), pushes e envs. 0 = vai · 98/97 = não vai: o motivo fica no log (fall) e quem chama tenta o MBP.
+node_exec_gate() {
+  local rt w p kv k
+  # vazio → rea_tools ausente do preflight ou ilegível no nó = "não sei" = o nó NÃO é usado (nunca "nenhuma ferramenta" nem "todas"); none = o nó nunca recebeu as ferramentas
+  rt=$(pf_get rea_tools)
+  case "$rt" in
+    none) say "o $HNAME ainda não tem as ferramentas de REA (hetzner-rea-tools.sh install) — não é usado"; fall sem-ferramentas 98; return 98 ;;
+    "") say "não consegui ler as ferramentas de REA do $HNAME (marcador ilegível ou instalação incompleta) — não é usado"; fall ilegivel:rea_tools 98; return 98 ;;
+  esac
+  for w in $(printf '%s\n' "$*" | tr -c 'A-Za-z0-9_' ' '); do
+    case "$NODE_EXEC_KNOWN" in *" $w "*) case ",$rt," in *",$w,"*) ;; *) say "o comando cita '$w' e o $HNAME só tem: ${rt//,/ } — vai ao MBP"; fall "sem-ferramenta:$w" 98; return 98 ;; esac ;; esac
+  done
+  for p in "${pushes[@]+"${pushes[@]}"}"; do [ -n "$p" ] || continue; node_push_ok "$p" || { fall push-recusado 97; return 97; }; done
+  for kv in "${envs[@]+"${envs[@]}"}"; do
+    k=$(printf '%s' "${kv%%=*}" | tr 'a-z' 'A-Z')
+    case "$k" in *TOKEN*|*SECRET*|*KEY*|*PASS*|*AUTH*|*COOKIE*|*CRED*|*SESSION*) say "--env $k parece segredo: não vai ao $HNAME"; fall env-recusado 97; return 97 ;; esac
+  done
+  return 0
+}
+scratch_clean() { "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "find $X -mindepth 1 -delete" >/dev/null 2>&1 || say "AVISO: scratch $X não foi limpo"; }   # X: o scratch da tentativa (global, como SLOT e RC)
+
+# Uma tentativa de --exec no host da vez (use_host). Libera o slot e apaga a saída temporária antes de devolver, para a próxima tentativa partir do zero.
+attempt_exec() {
+  local rc
+  _attempt_exec "$@"; rc=$?
+  release
+  [ -z "${TMPOUT:-}" ] || rm -f "$TMPOUT"; TMPOUT=""
+  return $rc
+}
+_attempt_exec() {
+  local kv p envline pl rel dest JOBDEF SECS rc pathlines wipe
+  preflight || { rc=$?; log_refusal; return $rc; }
+  if [ "$HOSTKIND" = linux ]; then node_exec_gate "$@" || return $?; fi
   SLOT_INFO=$(slot_info_for "exec" "$mode" "$@")
-  acquire || exit $?
+  acquire || { rc=$?; if [ $rc -eq 96 ]; then fall slots "$rc"; else fall ssh-caiu "$rc"; fi; return $rc; }
   T0=$(date +%s)
   mkdir -p "$CITY/.gc/run" 2>/dev/null; TMPOUT=$(mktemp "$CITY/.gc/run/mbp-run.XXXXXX")
   RC=0
   qargs=$(printf '%q ' "$@")
   X="gt-remote/exec/$SLOT"
-  "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "mkdir -p $X/in" || { say "ssh caiu ao preparar o scratch"; exit 98; }
+  # nó: o scratch do slot começa VAZIO (o ssh que caiu no meio de uma execução anterior não pôde apagar o dela, e capturas de REA não ficam no servidor alugado); o MBP segue como era
+  wipe=""; [ "$HOSTKIND" != linux ] || wipe="find $X -mindepth 1 -delete 2>/dev/null; "
+  "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "${wipe}mkdir -p $X/in" || { say "ssh caiu ao preparar o scratch"; fall ssh-caiu 98; return 98; }
   for p in "${pushes[@]+"${pushes[@]}"}"; do
     [ -n "$p" ] || continue
-    "$RSYNC_BIN" -a -e "$SSH_BIN $SSH_OPTS" "$p" "$MBP_HOST:$X/in/" >/dev/null 2>&1 || { say "push de $p falhou"; exit 98; }
+    "$RSYNC_BIN" -a -e "$SSH_BIN $SSH_OPTS" "$p" "$MBP_HOST:$X/in/" >/dev/null 2>&1 || { say "push de $p falhou"; fall push-falhou 98; scratch_clean; return 98; }
   done
   envline=""
   for kv in "${envs[@]+"${envs[@]}"}"; do [ -n "$kv" ] && envline="$envline $(printf '%q' "$kv")"; done
+  if [ "$HOSTKIND" = linux ]; then
+    # o que o REA pede no nó: os wrappers jadx/apktool/java do hetzner-rea-tools.sh na frente do PATH, um JDK completo por JAVA_HOME ABSOLUTO e o jar do jadx por REA_JADX_MCP_JAR (só se existe); um --env do chamador com o mesmo nome vence
+    pathlines='export PATH="$HOME/.local/share/rea-tools/bin:$HOME/gt-remote/rea/bin:$HOME/.local/bin:$PATH" JAVA_HOME="$HOME/.local/share/rea-tools/jdk"'$'\n''[ ! -f "$HOME/.local/share/rea-tools/jadx-headless-mcp.jar" ] || export REA_JADX_MCP_JAR="$HOME/.local/share/rea-tools/jadx-headless-mcp.jar"'
+  else
+    pathlines='export PATH="$HOME/gt-remote/rea/bin:/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:$PATH"'$'\n''export GHIDRA_INSTALL_DIR="${GHIDRA_INSTALL_DIR:-/opt/homebrew/opt/ghidra/libexec}"'$'\n''export JAVA_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home}"'
+  fi
   IFS= read -r -d '' JOBDEF <<EOF || true
-export PATH="\$HOME/gt-remote/rea/bin:/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:\$PATH"
-export GHIDRA_INSTALL_DIR="\${GHIDRA_INSTALL_DIR:-/opt/homebrew/opt/ghidra/libexec}"
-export JAVA_HOME="\${JAVA_HOME:-/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home}"
+$pathlines
 job() { cd "\$HOME/$X" || return 97; env$envline \$MBP_BG nice -n "\$MBP_NICE" $qargs; }
 mbp_supervise job
 EOF
   run_remote EXEC "$JOBDEF"
+  # nó: 126/127 = o shell não executou ou não achou o comando (aqui, tipicamente uma ferramenta que o nó não tem): não é veredito, e a regra é a mesma da sombra do pytest (shadow_no_verdict). O scratch sai SEMPRE (mesmo com --keep:
+  # esta execução não vale) e o MBP roda o comando. Sem pull: não há resultado a trazer.
+  if [ "$HOSTKIND" = linux ] && { [ $RC -eq 126 ] || [ $RC -eq 127 ]; }; then
+    SECS=$(( $(date +%s) - T0 )); log_run "exec" "$mode" "$SLOT" "$RC" "$SECS" "$@"; scratch_clean
+    say "rc=$RC no $HNAME: o shell não achou ou não executou o comando (não é veredito)"; return 98
+  fi
   for pl in "${pulls[@]+"${pulls[@]}"}"; do
     rel=${pl%%:*}; dest=${pl#*:}
     [ -n "$rel" ] && [ -n "$dest" ] || continue
     "$RSYNC_BIN" -a -e "$SSH_BIN $SSH_OPTS" "$MBP_HOST:$X/$rel" "$dest" >/dev/null 2>&1 || say "pull de $rel falhou"
   done
-  if [ $keep -eq 0 ]; then
-    "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "find $X -mindepth 1 -delete" >/dev/null 2>&1 || say "AVISO: scratch $X não foi limpo"
-  fi
+  if [ $keep -eq 0 ]; then scratch_clean; fi
   SECS=$(( $(date +%s) - T0 ))
-  if [ $RC -eq 255 ]; then say "ssh caiu durante a execução — rode local"; log_run "exec" "$mode" "$SLOT" 255 "$SECS" "$@"; exit 98; fi
+  if [ $RC -eq 255 ]; then say "ssh caiu durante a execução — rode local"; log_run "exec" "$mode" "$SLOT" 255 "$SECS" "$@"; return 98; fi
   if [ $RC -eq 124 ]; then say "timeout de ${RUN_TIMEOUT}s"; fi
   log_run "exec" "$mode" "$SLOT" "$RC" "$SECS" "$@"
-  exit $RC
+  say "rodou em $HOSTLOG ($HNAME) slot=$SLOT secs=$SECS rc=$RC"
+  return $RC
 }
 
 # ---- orquestração ------------------------------------------------------------------------------------------------------------------
 if [ "$mode" = exec ]; then
-  [ "$host_sel" != linux ] || { say "--exec roda só no MBP (o nó Linux é de pytest)"; exit 97; }
+  [ "$host_sel" != linux ] || { say "--exec não tem modo só-nó: use --node-first (nó Linux e, se ele não rodar, o MBP)"; exit 97; }
+  # com --node-first e a bandeira do nó ligada: nó primeiro; 96..99 = ele não rodou e a cadeia segue ao MBP (a bandeira desligada é o interruptor, não uma recusa: segue calado)
+  if [ "$nodefirst" = 1 ] && [ -f "$NODE_FLAG" ]; then
+    [ $# -gt 0 ] || { say "faltou o comando (use -- <comando>)"; exit 97; }
+    use_host linux
+    attempt_exec "$@"; nrc=$?
+    case $nrc in 96|97|98|99) say "o nó Linux não rodou (rc=$nrc) — tentando o MBP" ;; *) exit $nrc ;; esac
+  fi
   mac_gates || exit $?
   [ $# -gt 0 ] || { say "faltou o comando (use -- <comando>)"; exit 97; }
   use_host mbp
-  run_exec "$@"
+  attempt_exec "$@"; exit $?
 fi
 
 # pytest. Com o nó possível, a validação de uso vem antes (precisa do repo); sem o nó, a ordem de sempre: as chaves do MBP primeiro (rc 99 sem olhar os argumentos).

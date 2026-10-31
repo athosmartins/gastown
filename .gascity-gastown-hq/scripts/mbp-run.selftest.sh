@@ -154,7 +154,8 @@ case "$name" in
       fi
       if [ -n "$out_v" ]; then printf '%b\n' "$out_v"; else echo "${STUB_RUN_OUT:-stub-run-ok}"; fi
       exit "$rc_v"
-    else echo "stub-exec-ok"; exit "${STUB_RUN_RC:-0}"; fi ;;
+    else rc_v=${STUB_RUN_RC:-0}; if [ "$host" = hetzner ]; then rc_v=${STUB_RUN_RC_NODE:-$rc_v}; else rc_v=${STUB_RUN_RC_MBP:-$rc_v}; fi   # --exec: o rc também vale POR host (a cadeia nó -> MBP, ga-kfxzpt)
+      echo "stub-exec-ok"; exit "$rc_v"; fi ;;
   DIRECT)
     echo "DIRECT:$args" >> "$STUB_LOG"
     case "$args" in *"cat > gt-remote/freeze-"*) cat > "$(dirname "$STUB_LOG")/freeze-sent.txt" ;; esac
@@ -1254,6 +1255,89 @@ fi
 shadow_end
 node_seed_cases
 node_hq_cases
+node_exec_cases
+}
+
+# ===== --exec --node-first: o nó antes do MBP (ga-kfxzpt; MBP_SELFTEST_ONLY=nodeexec roda só esta parte) =====
+# O preflight do nó roda DE VERDADE (/proc falso e HOME falso, onde tools_on/tools_off montam o marcador das ferramentas de REA); STUB_RUN_RC_NODE/_MBP dão o rc do comando por host; o job do nó também roda de verdade (STUB_RUNMODE=exec).
+node_exec_cases() {
+echo "--- --exec --node-first: o nó antes do MBP (ga-kfxzpt)"
+local rc t c S MD RT="$T/home/.local/share/rea-tools"
+tools_on() { mkdir -p "$RT/bin"; for t in java jadx apktool; do printf '#!/bin/sh\necho "fake-%s"\n' "$t" > "$RT/bin/$t"; chmod +x "$RT/bin/$t"; done; printf 'TOOLS=%s\nINSTALLED_AT=x\n' "${1:-java jadx apktool}" > "$RT/ready"; }
+tools_off() { rm -f "$RT/ready" "$RT/bin/java" "$RT/bin/jadx" "$RT/bin/apktool" "$RT/jadx-headless-mcp.jar"; }
+xrun() { "$RUN" --exec --node-first "$@" >"$T/out" 2>"$T/err"; echo $?; }
+nready() { reset; date > "$NODEFLAG"; tools_on "$@"; }   # nó ligado e com as ferramentas
+echo x > "$T/in.apk"; echo x > "$T/x.json"; echo x > "$T/UP.APK"; mkdir -p "$T/pdir"; ln -sf "$T/in.apk" "$T/link.apk"; dd if=/dev/zero of="$T/big.apk" bs=1048576 count=2 2>/dev/null
+# opt-in: sem --node-first nada muda (o MBP é o único destino) e combinação inválida morre antes de falar com qualquer host
+nready; "$RUN" --exec -- true >"$T/out" 2>"$T/err"; expect "--exec sem --node-first, nó pronto: segue no MBP" 0 "$?"; hasnt "…e nunca toca o nó" "$STUB_LOG" 'HOSTCALL:hetzner'
+for c in "--node-first -- true" "--exec --node-first --go -- true" "--exec --node-first --host mbp -- true" "--exec --node-first --host linux -- true"; do
+  nready; rc=$("$RUN" $c >/dev/null 2>&1; echo $?); expect "uso errado '$c'" 97 "$rc"; hasnt "…nada falou com host nenhum" "$STUB_LOG" 'HOSTCALL'
+done
+# o nó roda
+nready; rc=$(xrun -- true); expect "nó pronto: o --exec roda no nó" 0 "$rc"
+has "…o log marca exec e host hetzner" "$J" '"mode":"exec".*"host":"hetzner"'; hasnt "…sem tocar o MBP" "$STUB_LOG" 'HOSTCALL:mbp'; has "…e diz onde rodou" "$T/err" 'rodou em hetzner \(nó Linux\)'
+has "…o scratch do nó nasce vazio (find antes do mkdir)" "$STUB_LOG" 'DIRECT:.*find gt-remote/exec/1 -mindepth 1 -delete 2>/dev/null; mkdir -p gt-remote/exec/1/in'
+nready; rc=$(STUB_RUN_RC_NODE=3 xrun -- true); expect "o rc do comando no nó é propagado (3)" 3 "$rc"; hasnt "…sem tentar o MBP" "$STUB_LOG" 'HOSTCALL:mbp'
+nready; rc=$(xrun --push "$T/in.apk" --pull "o.json:$T/" -- true); expect "push de .apk e pull vão ao nó" 0 "$rc"
+has "…o push foi ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:gt-remote/exec/1/in/'; has "…o pull veio do nó" "$STUB_LOG" 'RSYNC:.*hetzner-teste:gt-remote/exec/1/o\.json'; has "…e o scratch do nó é apagado ao fim" "$STUB_LOG" 'DIRECT:.*hetzner-teste find gt-remote/exec/1 -mindepth 1 -delete$'
+# as ferramentas: none, marcador sem lista, instalação incompleta, marcador ilegível — cada "não sei" tem o seu motivo e NENHUM vira "pode"
+reset; date > "$NODEFLAG"; tools_off; rc=$(xrun -- true); expect "sem as ferramentas (none): cai no MBP e roda" 0 "$rc"
+has "…motivo sem-ferramentas no host hetzner" "$J" '"reason":"sem-ferramentas".*"host":"hetzner"'; has "…e a execução é do MBP" "$J" '"mode":"exec".*"host":"mbp"'; has "…avisa que tentou o MBP" "$T/err" 'o nó Linux não rodou \(rc=98\) — tentando o MBP'
+hasnt "…nenhum slot nem rsync no nó" "$STUB_LOG" 'HOSTCALL:hetzner:SLOT|RSYNC:.* hetzner-teste:'
+nready; printf 'INSTALLED_AT=x\n' > "$RT/ready"; rc=$(xrun -- true); expect "marcador sem TOOLS=: cai no MBP" 0 "$rc"; has "…motivo ilegivel:rea_tools (≠ none)" "$J" '"reason":"ilegivel:rea_tools".*"host":"hetzner"'
+nready; rm -f "$RT/bin/apktool"; rc=$(xrun -- true); expect "instalação incompleta (sem o apktool): cai no MBP" 0 "$rc"; has "…motivo ilegivel:rea_tools" "$J" '"reason":"ilegivel:rea_tools"'
+nready; chmod 000 "$RT/ready"; rc=$(xrun -- true); chmod 644 "$RT/ready"; expect "marcador sem permissão de leitura: cai no MBP" 0 "$rc"; has "…motivo ilegivel:rea_tools" "$J" '"reason":"ilegivel:rea_tools"'
+nready; rc=$(xrun --push "$T/in.apk" -- sh -c 'rea analyze-javascript-application in/in.apk'); expect "comando cita 'rea' e o nó não o lista: cai no MBP" 0 "$rc"
+has "…motivo sem-ferramenta:rea" "$J" '"reason":"sem-ferramenta:rea"'; hasnt "…e o arquivo NÃO foi empurrado ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'
+nready "java jadx apktool rea"; rc=$(xrun -- sh -c 'rea --version'); expect "…com 'rea' na lista o nó roda" 0 "$rc"; has "…no host hetzner" "$J" '"mode":"exec".*"host":"hetzner"'
+nready; rc=$(xrun -- jadx -d out in/x.apk); expect "comando só com ferramentas do nó (jadx): roda no nó" 0 "$rc"; has "…no host hetzner" "$J" '"mode":"exec".*"host":"hetzner"'
+# a fronteira dos dados: UM arquivo comum de pacote de app; o resto fica no MBP (o MBP é o notebook do Athos, o nó é um servidor alugado)
+for c in "arquivo .json:$T/x.json" "diretório:$T/pdir" "link:$T/link.apk" "caminho ausente:$T/none.apk"; do
+  nready; rc=$(xrun --push "${c#*:}" -- true); expect "push recusado ao nó (${c%%:*}): cai no MBP e roda" 0 "$rc"
+  has "…motivo push-recusado no host hetzner" "$J" '"reason":"push-recusado".*"host":"hetzner"'; hasnt "…nada foi empurrado ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'
+done
+nready; rc=$(HETZNER_EXEC_PUSH_MAX_MB=1 xrun --push "$T/big.apk" -- true); expect "push acima do teto (2 MB > 1 MB): cai no MBP" 0 "$rc"; has "…motivo push-recusado" "$J" '"reason":"push-recusado"'
+nready; rc=$(xrun --push "$T/UP.APK" -- true); expect "extensão em maiúsculas (.APK) vale" 0 "$rc"; has "…e o push vai ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:gt-remote/exec/1/in/'
+nready; rc=$(xrun --env API_TOKEN=s3cr3tvalue -- true); expect "--env com nome de segredo: cai no MBP" 0 "$rc"; has "…motivo env-recusado" "$J" '"reason":"env-recusado".*"host":"hetzner"'; hasnt "…o VALOR nunca aparece na mensagem" "$T/err" 's3cr3tvalue'
+nready; rc=$(xrun --env JADX_HEAP_MB=2048 -- true); expect "--env de nome comum vai ao nó" 0 "$rc"; has "…host hetzner" "$J" '"mode":"exec".*"host":"hetzner"'
+# o 126/127 do nó não é veredito: o scratch sai (mesmo com --keep) e o MBP roda; no MBP o 127 segue como era
+nready; rc=$(STUB_RUN_RC_NODE=127 xrun --keep -- sh -c x); expect "rc 127 no nó (ferramenta ausente): roda no MBP" 0 "$rc"
+has "…o 127 é logado no host hetzner" "$J" '"mode":"exec".*"rc":127.*"host":"hetzner"'; has "…e o MBP rodou" "$J" '"mode":"exec".*"rc":0.*"host":"mbp"'; has "…o scratch do nó sai MESMO com --keep" "$STUB_LOG" 'DIRECT:.*hetzner-teste find gt-remote/exec/1 -mindepth 1 -delete$'
+reset; tools_off; rc=$(STUB_RUN_RC=127 "$RUN" --exec -- x >/dev/null 2>&1; echo $?); expect "no MBP o 127 segue sendo o rc do comando" 127 "$rc"
+# falhas do nó: o ssh cai no meio, o nó fora do ar, os dois fora
+nready; rc=$(STUB_RUN_RC_NODE=255 xrun -- true); expect "ssh cai NO MEIO no nó: cai no MBP e roda" 0 "$rc"; has "…a queda é logada com rc 255 no host hetzner" "$J" '"rc":255.*"host":"hetzner"'
+nready; rc=$(STUB_UNREACHABLE_NODE=1 xrun -- true); expect "nó fora do ar: cai no MBP e roda" 0 "$rc"; has "…recusa do nó no log, com motivo e host" "$J" '"mode":"preflight".*"reason":"inalcancavel".*"host":"hetzner"'
+nready; rc=$(STUB_UNREACHABLE=1 xrun -- true); expect "nó E MBP fora: 98 (quem chamou roda no mini)" 98 "$rc"
+nready; for t in 1 2 3 4 5 6; do mkslot $t; done; rc=$(STUB_SLOTS=exec xrun -- true); expect "slots do nó cheios: cai no MBP" 0 "$rc"; has "…motivo slots no host hetzner" "$J" '"reason":"slots".*"host":"hetzner"'
+# as chaves: a bandeira do nó desligada é o interruptor (segue calado ao MBP); as do MBP não valem para o nó
+reset; tools_on; rc=$(xrun -- true); expect "bandeira do nó desligada: segue ao MBP" 0 "$rc"; hasnt "…sem tocar o nó" "$STUB_LOG" 'HOSTCALL:hetzner'; hasnt "…e sem recusa no log" "$J" '"host":"hetzner"'
+nready; rm -f "$FLAG"; rc=$(xrun -- true); expect "MBP desligado, nó pronto: roda no nó" 0 "$rc"; has "…host hetzner" "$J" '"mode":"exec".*"host":"hetzner"'
+reset; date > "$NODEFLAG"; tools_off; rm -f "$FLAG"; rc=$(xrun -- true); expect "nó sem ferramentas e MBP desligado: 99" 99 "$rc"
+nready; echo "origem=painel desde=hoje" > "$FLAG_PAUSE"; rc=$(xrun -- true); expect "pausa do Athos NÃO vale para o nó" 0 "$rc"; has "…roda no nó" "$J" '"mode":"exec".*"host":"hetzner"'
+date > "$FLAG"
+# o job do nó (o que o mbp-run mandou) e o job do MBP, que segue igual
+nready; rc=$(xrun -- true); S=$(lsf EXEC hetzner)
+has "job do nó: PATH com os wrappers do hetzner-rea-tools na frente" "$S" '^export PATH="\$HOME/\.local/share/rea-tools/bin:'; has "…JAVA_HOME ABSOLUTO do JDK do nó" "$S" 'JAVA_HOME="\$HOME/\.local/share/rea-tools/jdk"'
+has "…e o jar do REA só se ele existe" "$S" '^\[ ! -f "\$HOME/\.local/share/rea-tools/jadx-headless-mcp\.jar" \] \|\| export REA_JADX_MCP_JAR='; hasnt "…nada de Homebrew nem Ghidra" "$S" 'opt/homebrew|GHIDRA'
+reset; "$RUN" --exec -- true >/dev/null 2>&1; has "job do MBP: segue com o JDK do Homebrew" "$(lsf EXEC mbp)" 'openjdk@21'; has "…e com o Ghidra" "$(lsf EXEC mbp)" 'GHIDRA_INSTALL_DIR'
+nready; STUB_RUNMODE=exec "$RUN" --exec --node-first -- sh -c 'echo JH=$JAVA_HOME; echo MCP=${REA_JADX_MCP_JAR:-nenhum}; jadx' >"$T/out" 2>"$T/err"; expect "job do nó rodando de verdade" 0 "$?"
+has "…JAVA_HOME aponta o JDK do nó" "$T/out" "^JH=$T/home/\.local/share/rea-tools/jdk$"; has "…sem o jar, REA_JADX_MCP_JAR não é exportado" "$T/out" '^MCP=nenhum$'; has "…jadx resolve para o wrapper do nó" "$T/out" '^fake-jadx$'
+: > "$RT/jadx-headless-mcp.jar"; STUB_RUNMODE=exec "$RUN" --exec --node-first -- sh -c 'echo MCP=${REA_JADX_MCP_JAR:-nenhum}' >"$T/out" 2>"$T/err"; has "…com o jar no lugar, REA_JADX_MCP_JAR aponta para ele" "$T/out" "^MCP=$RT/jadx-headless-mcp\.jar$"
+# o que o preflight do nó diz das ferramentas
+reset; tools_off; "$RUN" --host linux --check >"$T/out" 2>/dev/null; has "check sem marcador: rea_tools=none" "$T/out" '^rea_tools=none$'
+tools_on; "$RUN" --host linux --check >"$T/out" 2>/dev/null; has "check com marcador: a lista de TOOLS=" "$T/out" '^rea_tools=java,jadx,apktool$'
+tools_on "java jadx apktool rea"; "$RUN" --host linux --check >"$T/out" 2>/dev/null; has "…e com a ferramenta a mais" "$T/out" '^rea_tools=java,jadx,apktool,rea$'
+printf 'INSTALLED_AT=x\n' > "$RT/ready"; "$RUN" --host linux --check >"$T/out" 2>/dev/null; has "check com marcador ilegível: rea_tools vazio (≠ none)" "$T/out" '^rea_tools=$'
+# controles negativos: cada porta nova, tirada sozinha, volta ao defeito (o mutante tem de deixar de reproduzir o que o script real faz)
+MD="$T/mutdir-exec"; mkdir -p "$MD"; for t in mbp-host.sh mbp-presence.sh mbp-controle.sh hetzner-pii-scan.py hetzner-mac-only.txt hetzner-rsync-filter.wa.txt; do ln -sf "$HERE/$t" "$MD/$t"; done   # o mutante lê os irmãos do script pelo $HERE dele
+xmut() { python3 -I -c 'import sys; s=open(sys.argv[1]).read(); a=sys.argv[2]; assert s.count(a)==1, "ancora: %d" % s.count(a); open(sys.argv[4],"w").write(s.replace(a, sys.argv[3]))' "$RUN" "$1" "$2" "$MD/mbp-run.sh" && chmod +x "$MD/mbp-run.sh"; }
+xobs() { n=$((n+1)); if grep -q -E -e "$3" "$2"; then echo "ok   $1"; else echo "FAIL $1: '$3' ausente em $2"; fails=$((fails+1)); fi; }
+if xmut 'node_push_ok "$p" || { fall push-recusado 97; return 97; }' 'true'; then nready; "$MD/mbp-run.sh" --exec --node-first --push "$T/x.json" -- true >/dev/null 2>&1; xobs "controle: sem node_push_ok o .json VAZA ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'; else bad "controle push: âncora do mutante"; fi
+if xmut '*TOKEN*|*SECRET*|' '*NUNCA*|'; then nready; "$MD/mbp-run.sh" --exec --node-first --env API_TOKEN=x -- true >/dev/null 2>&1; xobs "controle: sem a porta do --env o segredo vai ao nó" "$J" '"mode":"exec".*"host":"hetzner"'; else bad "controle env: âncora do mutante"; fi
+if xmut '{ [ $RC -eq 126 ] || [ $RC -eq 127 ]; }' 'false'; then nready; STUB_RUN_RC_NODE=127 "$MD/mbp-run.sh" --exec --node-first -- x >/dev/null 2>&1; rc=$?; expect "controle: sem a regra do 126/127 o rc 127 do nó vira o veredito" 127 "$rc"; else bad "controle 127: âncora do mutante"; fi
+if xmut '[ "$nodefirst" = 1 ] && [ -f "$NODE_FLAG" ]' '[ -f "$NODE_FLAG" ]'; then nready; "$MD/mbp-run.sh" --exec -- true >/dev/null 2>&1; xobs "controle: sem o opt-in o --exec comum vai ao nó" "$STUB_LOG" 'HOSTCALL:hetzner'; else bad "controle opt-in: âncora do mutante"; fi
+tools_off
+reset
 }
 
 # ===== a semeadura do nó (MBP_SELFTEST_ONLY=semeadura roda só esta parte) =====
@@ -1692,6 +1776,7 @@ if [ -n "${MBP_SELFTEST_ONLY:-}" ]; then
     presenca) presenca_cases; neg_presenca ;;
     chave) chave_cases ;;
     node) node_cases ;;
+    nodeexec) node_exec_cases ;;
     host) host_cases ;;
     semeadura) xdist_on; node_seed_cases ;;
     *) echo "MBP_SELFTEST_ONLY desconhecido: $MBP_SELFTEST_ONLY" >&2; exit 2 ;;
