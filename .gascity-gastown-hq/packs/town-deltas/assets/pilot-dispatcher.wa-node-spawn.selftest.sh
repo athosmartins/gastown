@@ -53,7 +53,7 @@ done
 T="$(mktemp -d "${TMPDIR:-/tmp}/wa-node-spawn.XXXXXX")" || exit 2
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/scripts" "$T/city" "$T/bin"
-export FAKE_STATE="$T/state.json" FAKE_LOG="$T/calls" FAKE_BD_LOG="$T/bdcalls" FAKE_GC_LOG="$T/gccalls" FAKE_ORDER="$T/order" FAKE_NSHOW="$T/nshow" T_SLOW="$T/slow" T_RSV="$T/rsv"
+export FAKE_STATE="$T/state.json" FAKE_LOG="$T/calls" FAKE_BD_LOG="$T/bdcalls" FAKE_GC_LOG="$T/gccalls" FAKE_ORDER="$T/order" FAKE_NSHOW="$T/nshow" T_SLOW="$T/slow" T_RSV="$T/rsv" T_PNR="$T/pnr"
 
 # wa-node-dispatch.sh falso: anota os argumentos e o ambiente que recebeu (WA_NODE_SPAWN/WA_NODE_SLOTS), e — no apply de verdade — "escreve": copia FAKE_BEAD2 para o estado.
 # FAKE_APPLY_WRITES: 1 escreve, 0 não (padrão: escreve só se o rc for 0).
@@ -167,10 +167,10 @@ sj "$T/s.empty.json" '[]'
 reset() {
   : > "$T/calls"; : > "$T/bdcalls"; : > "$T/gccalls"; : > "$T/err"; : > "$T/order"
   echo 0 > "$T/nshow"; echo 0 > "$T/slow"
-  rm -f "$T/city/.gc/wa-node-route.jsonl" "$T/rsv"
+  rm -f "$T/city/.gc/wa-node-route.jsonl" "$T/rsv" "$T/pnr" "$T/pnr.done"
   cp "$T/b.free.json" "$T/state.json"
   unset FAKE_BD_UPDATE_MODE FAKE_BD_UPDATE_RC FAKE_BD_SHOW_FAIL_FROM FAKE_GC_LIST_RC FAKE_GC_NEW_RC FAKE_GC_WAKE_RC FAKE_GC_CLOSE_RC FAKE_GC_NUDGE_RC \
-        FAKE_APPLY_WRITES FAKE_RC FAKE_RC_SKIP FAKE_BEAD2_SKIP FAKE_OUT PRE_SLOW PWN_SPAWN PWN_SLOTS PWN_BJ PRE_PASS PRE_NODEONLY PRE_RSV PILOT_WA_NODE_RESERVE PILOT_WA_NODE_SPAWN PILOT_WA_NODE_SLOTS PILOT_WA_NODE_ROUTE DRY_RUN PILOT_SLOW_SPAWN_SECS
+        FAKE_APPLY_WRITES FAKE_RC FAKE_RC_SKIP FAKE_BEAD2_SKIP FAKE_OUT PRE_SLOW PRE_EVAL _PILOT_HALT PWN_SPAWN PWN_SLOTS PWN_BJ PRE_PASS PRE_NODEONLY PRE_RSV PILOT_WA_NODE_RESERVE PILOT_WA_NODE_SPAWN PILOT_WA_NODE_SLOTS PILOT_WA_NODE_ROUTE DRY_RUN PILOT_SLOW_SPAWN_SECS
   export FAKE_SESSIONS="$T/s.empty.json" FAKE_BEAD2="$T/b.ap2.json"
 }
 pilot() { export PILOT_WA_NODE_SPAWN=pilot PILOT_WA_NODE_SLOTS="${1:-3}"; }
@@ -181,7 +181,9 @@ H() {
     bash -c "$PRELUDE"$'\n'"$FNS"$'\n''_PILOT_SLOW_SPAWN_SEEN="${PRE_SLOW:-0}"; _PWN_SPAWN="${PWN_SPAWN:-pool}"; _PWN_SLOTS="${PWN_SLOTS:-1}"
 # ga-2hd02v.3.26: o contexto da reserva do nó — passada de WA / passada só-nó em curso (PRE_PASS, PRE_NODEONLY), a bead que o decide leu (PWN_BJ) e a reserva já em pé (PRE_RSV); o que sobra dela vai para $T/rsv
 _PILOT_WA_NODE_PASS="${PRE_PASS:-0}"; _PILOT_NODE_ONLY="${PRE_NODEONLY:-0}"; _PWN_BJ="${PWN_BJ:-}"; _PNR_RESERVED_IDS="${PRE_RSV:-}"; _PNR_RESERVED_N=0
-"$@"; _hrc=$?; echo "$_PILOT_SLOW_SPAWN_SEEN" > "$T_SLOW"; echo "$_PNR_RESERVED_IDS" > "$T_RSV"; echo "rc=$_hrc"' _ "$@" 2>>"$T/err" | tail -1
+# PRE_EVAL: código do teste que roda ANTES da função (um falso no lugar de uma peça, ou uma variável de uma chamada anterior que ficou); _PNR_FAIL e _PNR_FAIL_ALIAS vão para $T_PNR
+eval "${PRE_EVAL:-}"
+"$@"; _hrc=$?; echo "$_PILOT_SLOW_SPAWN_SEEN" > "$T_SLOW"; echo "$_PNR_RESERVED_IDS" > "$T_RSV"; echo "${_PNR_FAIL:-}|${_PNR_FAIL_ALIAS:-}" > "$T_PNR"; echo "rc=$_hrc"' _ "$@" 2>>"$T/err" | tail -1
 }
 D() { # D <modo> <rc do script> [dry] — o decide inteiro, alvo wa-worker
   export PILOT_WA_NODE_ROUTE="$1" FAKE_RC="${2:-0}" DRY_RUN="${3:-0}"
@@ -633,6 +635,31 @@ BUSYW; export PWN_SLOTS=3 PRE_SLOW=1 FAKE_BEAD2_SKIP="$T/b.ap3.json"; r=$(W)
 eq "o orçamento de spawn do sweep já gasto: alias ocupado desfaz e devolve 1, mas NÃO refaz o apply (0 applies)" "$r $(napply) $(stt)" "rc=1 0 $FREE"
 BUSYW; export PWN_SLOTS=3 FAKE_BEAD2_SKIP="$T/b.ap3.json"; r=$(W)
 eq "(contraprova) o mesmo sem o orçamento gasto: refaz o apply e abre o -3" "$r $(napply) $(stt)" "rc=0 1 in_progress,wa-worker-remote-3,wa-worker-remote-3"
+# o despacho já parado (_PILOT_HALT: o orçamento de tempo do sweep estourou): alias ocupado desfaz e devolve 1, mas não refaz o apply — o sweep acabou para os candidatos
+BUSYW; export PWN_SLOTS=3 _PILOT_HALT=time-budget FAKE_BEAD2_SKIP="$T/b.ap3.json"; r=$(W)
+eq "o despacho do sweep já parado (_PILOT_HALT): alias ocupado desfaz e devolve 1, mas NÃO refaz o apply (0 applies)" "$r $(napply) $(stt)" "rc=1 0 $FREE"
+# o alias que a peça devolve como ocupado tem de ter a forma wa-worker-remote-<1-9> ANTES de entrar na lista de pulos (vira variável de ambiente do script). A peça de verdade só devolve o alias que recebeu, já validado; o falso devolve lixo
+BUSYW; export PWN_SLOTS=3 FAKE_BEAD2_SKIP="$T/b.ap3.json" PRE_EVAL='_pilot_node_remote_open() { _PNR_FAIL=busy; _PNR_FAIL_ALIAS="lixo; wa-worker-remote-2"; return 1; }'; r=$(W)
+eq "a peça devolve «busy» com um alias que não é wa-worker-remote-<1-9>: NÃO refaz o apply (0 applies) e devolve 1" "$r $(napply)" "rc=1 0"
+BUSYW; export PWN_SLOTS=3 FAKE_BEAD2_SKIP="$T/b.ap3.json" PRE_EVAL='_pilot_node_remote_open() { if [ -e "${T_PNR}.done" ]; then return 0; fi; : > "${T_PNR}.done"; _PNR_FAIL=busy; _PNR_FAIL_ALIAS=wa-worker-remote-2; return 1; }'; r=$(W)
+eq "(contraprova) o mesmo falso com o alias na forma certa (falha na 1ª abertura, abre na 2ª): refaz o apply (1 apply) e devolve 0" "$r $(napply)" "rc=0 1"
+# o motivo da falha de abertura (_PNR_FAIL / _PNR_FAIL_ALIAS) é zerado na entrada: o que sobrou de outra chamada nunca vira «busy»
+pnr() { tr -d ' \n' < "$T/pnr" 2>/dev/null || true; }
+reset; cp "$T/b.ap2.json" "$T/state.json"; export PRE_EVAL='_PNR_FAIL=busy; _PNR_FAIL_ALIAS=wa-worker-remote-9'; r=$(O wa-worker-remote-2)
+eq "abertura que deu certo zera o motivo que sobrou de uma chamada anterior (vazio, vazio)" "$r $(pnr)" "rc=0 |"
+BUSYW; r=$(O wa-worker-remote-2)
+eq "alias ocupado: o motivo é «busy» e o alias é o que foi tentado" "$r $(pnr)" "rc=1 busy|wa-worker-remote-2"
+reset; cp "$T/b.ap2.json" "$T/state.json"; export FAKE_GC_LIST_RC=1; r=$(O wa-worker-remote-2)
+eq "lista de sessões ilegível: o motivo é «other» (não é do alias)" "$r $(pnr)" "rc=1 other|wa-worker-remote-2"
+# o apply refeito: toda a tabela do rc incerto (prazo, sinais) segura (2) e desfaz o que tem a cara do apply; os rc de «nada rodou» (125-127, 10, 11) e o 12 deixam a bead livre (1)
+for c in 124 137 143 129 130 139 255; do
+  reset; pilot 3; export FAKE_SESSIONS="$T/s.busy.json" FAKE_RC_SKIP=$c FAKE_APPLY_WRITES=1 FAKE_BEAD2_SKIP="$T/b.ap3.json"; r=$(D label 0)
+  eq "apply refeito com rc $c (incerto) que ESCREVEU: devolve 2, o settle desfaz (bead livre)" "$r $(napply) $(stt)" "rc=2 2 $FREE"
+done
+for c in 10 11 125 126 127; do
+  reset; pilot 3; export FAKE_SESSIONS="$T/s.busy.json" FAKE_RC_SKIP=$c; r=$(D label 0)
+  eq "apply refeito com rc $c (nada rodou/recusou): devolve 1, bead livre, sem settle" "$r $(napply) $(stt) $(nupd)" "rc=1 2 $FREE 1"
+done
 # ── a reserva do nó (o gancho do P0/P1 falhou): W = _pilot_wa_node_open direto, com o contexto da reserva ──
 rsv() { tr -d ' \n' < "$T/rsv" 2>/dev/null || true; }
 BUSYW; export PRE_PASS=1 PWN_BJ="$B1"; r=$(W)
@@ -671,6 +698,13 @@ reset; pilot 3; cp "$T/b.free.p2.json" "$T/state.json"; export FAKE_APPLY_WRITES
 eq "decide, apply rc 13 + P2: devolve 2 e NÃO reserva" "$r $(rsv)" "rc=2 "
 reset; pilot 3; cp "$T/b.free.p1.json" "$T/state.json"; export FAKE_APPLY_WRITES=1; r=$(D label 143)
 eq "decide, apply morto por sinal (143) + P1: devolve 2 e reserva" "$r $(rsv)" "rc=2 $ID"
+# 143 e 137 caem no ramo de cima da tabela; o resto de 128+n (129, 130, 139, 255) é o ramo do sinal — que também reserva
+for c in 129 130 139 255; do
+  reset; pilot 3; cp "$T/b.free.p1.json" "$T/state.json"; export FAKE_APPLY_WRITES=1; r=$(D label $c)
+  eq "decide, apply morto por sinal ($c, ramo do 128+n) + P1: devolve 2 e reserva" "$r $(rsv)" "rc=2 $ID"
+done
+reset; pilot 3; cp "$T/b.free.p2.json" "$T/state.json"; export FAKE_APPLY_WRITES=1; r=$(D label 130)
+eq "decide, apply morto por sinal (130) + P2: devolve 2 e NÃO reserva" "$r $(rsv)" "rc=2 "
 
 # ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
 echo

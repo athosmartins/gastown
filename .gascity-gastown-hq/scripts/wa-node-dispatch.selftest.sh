@@ -650,7 +650,7 @@ mutant pendentes-ignorados 'if [ $((cfree - pend)) -lt 1 ]; then' 'if [ "$cfree"
 fresh; cap '{"verdict":"node","free":1}' 0; busyat 1; pm apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
 mutant pendentes-vivos-descontam $'for A in $busy_a; do printf \'%s\\n\' "$live_al" | grep -qxF -- "$A" ||' 'for A in $busy_a; do false ||'
 fresh; cap '{"verdict":"node","free":1}' 0; busyat 1; sessions "[$(live 1)]"; pm apply wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
-mutant alias-vivo-ignorado $'for A in $free_a; do printf \'%s\\n\' "$live_al" | grep -qxF -- "$A" ||' 'for A in $free_a; do false ||'
+mutant alias-vivo-ignorado $'for A in $free_a; do skipped "$A" && continue; printf \'%s\\n\' "$live_al" | grep -qxF -- "$A" ||' 'for A in $free_a; do skipped "$A" && continue; false ||'
 fresh; sessions "[$(live 1)]"; pm apply wa-t1; if [ "$(who)" = wa-worker-remote-2 ]; then survived; else killed; fi
 mutant todos-ocupados 'if [ -z "$free_a" ]; then' 'if false; then'
 fresh; busyat 1; busyat 2; busyat 3; pm apply wa-t1; if [ "$RC" = 12 ] && printf '%s' "$OUT" | grep -q 'estão ocupados'; then survived; else killed; fi
@@ -738,7 +738,7 @@ mutant ociosa-pool-reaproveita $'  if [ "$SPAWN" = pilot ]; then\n    idle_json=
 fresh; sessions "[$(quiet 1)]"; d apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
 mutant ociosa-alias-repetido '[ "$(printf '"'"'%s\n'"'"' "$live_al" | grep -cxF -- "$A")" = 1 ] || continue' 'true'
 fresh; busyat 1; sessions "[$(live 1),$(quiet 2),$(quiet 2),$(quiet 3)]"; SL=4 pm apply wa-t1; if [ "$RC" = 0 ] && [ "$(who)" = wa-worker-remote-3 ]; then survived; else killed; fi
-mutant ociosa-ignora-bead $'    for A in $free_a; do\n      [ "$(printf' $'    for A in $ALIASES; do\n      [ "$(printf'
+mutant ociosa-ignora-bead $'    for A in $free_a; do\n      skipped "$A" && continue' $'    for A in $ALIASES; do\n      skipped "$A" && continue'
 fresh; busyat 1; busyat 2; sessions "[$(quiet 1),$(quiet 2),$(live 3)]"; pm apply wa-t1; if [ "$RC" = 12 ] && ! wrote; then survived; else killed; fi
 mutant ociosa-prefere-novo 'for A in $reuse_a; do PICK="$A"; REUSED=1; break; done' ':'
 fresh; sessions "[$(quiet 3)]"; pm apply wa-t1; if [ "$(who)" = wa-worker-remote-3 ]; then survived; else killed; fi
@@ -757,11 +757,11 @@ fresh; busyat 1; sessions "[$(live 1),$(quiet 2),$(quiet 3)]"; pm apply wa-t1; i
 mutant ociosa-ilegivel-segue 'ok) ;; *) jlog apply "$id" 11 "ociosidade-ilegivel"; die 11 "não consegui avaliar quais sessões estão ociosas — fica no mini" ;; esac' 'ok) ;; *) ;; esac'
 fresh; busyat 1; sessions "[$(live 1),$(quiet 2),$(quiet 3)]"; PATH="$T/failjq:$PATH" pm apply wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
 mutant pulo-ignorado-no-pick 'for A in $free_a; do skipped "$A" && continue; printf' 'for A in $free_a; do printf'
-fresh; WA_NODE_SKIP_ALIASES=wa-worker-remote-1 pm apply wa-t1; if [ "$(who)" = wa-worker-remote-1 ]; then survived; else killed; fi
+fresh; WA_NODE_SKIP_ALIASES=wa-worker-remote-1 pm apply wa-t1; if [ "$(who)" = wa-worker-remote-2 ]; then survived; else killed; fi
 mutant pulo-ignorado-na-ociosa 'skipped "$A" && continue                                                 # ga-2hd02v.3.26: o gancho' ': # ga-2hd02v.3.26: o gancho'
-fresh; busyat 1; sessions "[$(live 1),$(quiet 2),$(quiet 3)]"; WA_NODE_SKIP_ALIASES=wa-worker-remote-2 pm apply wa-t1; if [ "$(who)" = wa-worker-remote-2 ]; then survived; else killed; fi
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2),$(quiet 3)]"; WA_NODE_SKIP_ALIASES=wa-worker-remote-2 pm apply wa-t1; if [ "$(who)" = wa-worker-remote-3 ]; then survived; else killed; fi
 mutant pulo-lixo-entra "case \"\$_sk\" in ''|*[!A-Za-z0-9._-]*) continue ;; esac" "case \"\$_sk\" in '') continue ;; esac"
-fresh; WA_NODE_SKIP_ALIASES="wa-worker-remote-1 wa-worker-remote-2 wa-worker-remote-3 ;rm" pm apply wa-t1; case "$OUT" in *';rm'*) survived ;; *) killed ;; esac
+fresh; WA_NODE_SKIP_ALIASES="wa-worker-remote-1 wa-worker-remote-2 wa-worker-remote-3 ;rm" pm apply wa-t1; case "$OUT" in *';rm'*) killed ;; *) survived ;; esac
 mutant pulo-sai-da-conta 'if [ $((live - n_reuse)) -ge "$SLOTS" ]; then jlog apply' 'if [ $((live - n_reuse - $(printf '"'"'%s\n'"'"' "$live_al" | grep -cxF -- "${SKIP# }" || true))) -ge "$SLOTS" ]; then jlog apply'
 fresh; sessions "[$(live 1),$(live 2),$(live 3)]"; WA_NODE_SKIP_ALIASES=wa-worker-remote-3 pm apply wa-t1; if [ "$RC" != 12 ]; then survived; else killed; fi
 
