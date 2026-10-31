@@ -837,9 +837,9 @@ r=$(prior 'wa-w x');                                                           [
 reset
 
 echo "── (6f) ga-2hd02v.3.26: o P0/P1 que perde o gancho NÃO perde a vaga — memória released só para P2+, reserva do nó, retenção na passada só-nó"
-# passx '<small json>' '<código depois da passada>' — roda a passada e depois o código (no MESMO shell: a reserva e o veredito final são do processo)
+# passx '<small json>' '<código depois da passada>' — roda a passada e depois o código (no MESMO shell: a reserva e o veredito final são do processo). PX_PRE='<código>' roda ANTES da passada (a PRELUDE zera os globais da reserva, então o resto de uma varredura anterior se planta aqui, não no ambiente)
 passx() { SJ="$1" run_t 'SMALL_CANDIDATES="$SJ"; BIG_CANDIDATES="[]"; SMALL_COUNT=$(echo "$SMALL_CANDIDATES"|jq length 2>/dev/null || echo 0); BIG_COUNT=0
-    _pilot_wa_node_pass; '"$2"; }
+    eval "${PX_PRE:-}"; _pilot_wa_node_pass; '"$2"; }
 P1R="$(jbp 1 wa-r1 U1 wa-worker story:approved)"; P3A="$(jbp 3 wa-p3a U1 wa-worker story:approved)"
 hold_expr() { printf '%s' 'x=0; _pilot_node_p2_hold_for "$P3J" || x=$?; echo "hold=$x why=${_PNH_WHY:-} ids=[${_PNR_RESERVED_IDS:-}] n=${_PNR_RESERVED_N:-0} wv=${_PWP_WV_FINAL:-}"'; }
 export P3J="$P3A" P1J="$P1R"
@@ -904,6 +904,19 @@ r=$(T_WAIT=wa-w1 passx "[$W1,$P3A]" "$(hold_expr)")
 case "$r" in "hold=1 why= "*) ok "(6f) waiter que foi ao nó (veredito não é blind/unseen): a P3 não é retida na só-nó: $r" ;; *) bad "(6f) waiter despachado reteve a P3: '$r'" ;; esac
 r=$(run_t '_PY_WAIT_ID=wa-w1; x=0; _pilot_node_p2_hold_for "$P3J" || x=$?; echo "hold=$x wv=[${_PWP_WV_FINAL:-}]"')
 [ "$r" = "hold=1 wv=[]" ] && ok "(6f) passada que não rodou (veredito final vazio): a P3 não é retida — vazio nunca vira 'waiter cego'" || bad "(6f) veredito vazio reteve: '$r'"
+# (h) só o rc 0 da retenção do waiter segura a P2+ na só-nó: o rc 1 (não há o que reter), o 2 (classe ilegível) e o 3 (hold expirado) a deixam seguir ao nó — a peça é trocada por um falso que devolve cada rc
+hf() { run_t '_pilot_wa_node_pass_hold_for() { return '"$1"'; }; x=0; _pilot_node_p2_hold_for "$P3J" || x=$?; echo "hold=$x why=[${_PNH_WHY:-}]"'; }
+r=$(hf 0); [ "$r" = "hold=0 why=[waiter]" ] && ok "(6f) retenção do waiter com rc 0: a só-nó segura a P3, motivo 'waiter'" || bad "(6f) rc 0 da retenção: '$r'"
+for c in 1 2 3; do
+  r=$(hf $c); [ "$r" = "hold=1 why=[]" ] && ok "(6f) retenção do waiter com rc $c (1 nada a reter, 2 classe ilegível, 3 hold expirado): a só-nó NÃO segura a P3" || bad "(6f) rc $c da retenção segurou a P3: '$r'"
+done
+# (i) a reserva, o veredito final e a contagem de retidas valem POR VARREDURA: o que sobrou de uma passada anterior (reserva velha, veredito blind, retidas) é zerado na entrada da passada, com ela ligada e com ela desligada
+reset
+r=$(PX_PRE='_PNR_RESERVED_IDS=" wa-velha "; _PNR_RESERVED_N=1; _PWP_WV_FINAL=blind; _PNH_HELD=4' passx "[]" 'echo "ids=[${_PNR_RESERVED_IDS:-}] n=${_PNR_RESERVED_N:-0} wv=[${_PWP_WV_FINAL:-}] held=${_PNH_HELD:-0}"')
+[ "$r" = "ids=[] n=0 wv=[] held=0" ] && ok "(6f) a passada zera na entrada a reserva, o veredito final e as retidas que sobraram da varredura anterior" || bad "(6f) resto da varredura anterior sobreviveu à passada: '$r'"
+reset
+r=$(T_EXEMPT=off PX_PRE='_PNR_RESERVED_IDS=" wa-velha "; _PNR_RESERVED_N=1; _PWP_WV_FINAL=blind; _PNH_HELD=4' passx "[]" 'echo "ids=[${_PNR_RESERVED_IDS:-}] n=${_PNR_RESERVED_N:-0} wv=[${_PWP_WV_FINAL:-}] held=${_PNH_HELD:-0}"')
+[ "$r" = "ids=[] n=0 wv=[] held=0" ] && ok "(6f) o mesmo com a passada DESLIGADA (volta antes de tudo): o resto da varredura anterior também é zerado" || bad "(6f) resto da varredura anterior sobreviveu à passada desligada: '$r'"
 
 echo "── (7) dispatch_one: o bloco do yield e o braço do pool (regiões VERBATIM)"
 run_block() {
