@@ -65,12 +65,15 @@ if [ ! -e "$D/ready" ]; then echo "MARK ausente"; echo FIM; exit 0; fi
 mk() { grep -E "^$1=" "$D/ready" 2>/dev/null | head -n 1 | sed -e "s/^$1=//"; }
 j=$(mk JDK_VERSION); x=$(mk JADX_VERSION); a=$(mk APKTOOL_VERSION); m=$(mk JADX_MCP_VERSION)
 echo "MARK ${j:-ilegivel} ${x:-ilegivel} ${a:-ilegivel} ${m:-ilegivel}"
+# vazio/falhou → java que não roda ou sem "Temurin-" na saída: ERRO, diferente de qualquer versão do pin (o mini diz quebrado), nunca "igual"
 v=$(jdk_ver); echo "JDK ${v:-ERRO}"
 if "$D/jdk/bin/java" --list-modules 2>/dev/null | grep -q '^jdk\.compiler@'; then echo "COMP 1"; else echo "COMP 0"; fi
+# vazio/falhou → o sha256sum não leu o arquivo (ausente, link quebrado, sem permissão): "ausente", diferente de qualquer hash do pin (o mini diz quebrado)
 for p in "JADXJAR jadx.jar" "APKJAR apktool.jar" "MCPJAR jadx-headless-mcp.jar"; do
   set -- $p; s=$(sha256sum "$D/$2" 2>/dev/null | awk '{print $1}'); echo "$1 ${s:-ausente}"
 done
 if mcp_ok "$D/jadx-headless-mcp.jar" 2>/dev/null; then echo "MCPCLS 1"; else echo "MCPCLS 0"; fi
+# vazio/falhou → wrapper que não roda ou sem saída: ERRO, diferente da versão do pin (o mini diz quebrado)
 v=$("$D/bin/jadx" --version 2>&1 | tail -n 1); echo "JADXV ${v:-ERRO}"
 v=$("$D/bin/apktool" --version 2>&1 | tail -n 1); echo "APKV ${v:-ERRO}"
 echo FIM
@@ -99,6 +102,7 @@ fetch "https://github.com/1013503897/jadx-headless-mcp/releases/download/v$MV/ja
 mkdir "$W/jdk" && tar -xzf "$W/jdk.tgz" -C "$W/jdk" || { echo "RECUSO o tar do JDK não abriu"; exit 4; }
 J=$W/jdk/jdk-$JV
 [ -x "$J/bin/java" ] || { echo "RECUSO o tar do JDK não traz jdk-$JV/bin/java"; exit 4; }
+# vazio/falhou → java que não roda ou sem "Temurin-" na saída: v vazio ≠ $JV e o install recusa antes de mexer em qualquer pasta
 v=$("$J/bin/java" -version 2>&1 | sed -n 's/.*Temurin-\([0-9][0-9.+]*\).*/\1/p' | head -n 1)
 [ "$v" = "$JV" ] || { echo "RECUSO o java do tar diz '${v:-nada}' e o pin é $JV"; exit 4; }
 "$J/bin/java" --list-modules 2>/dev/null | grep -q '^jdk\.compiler@' || { echo "RECUSO o JDK não tem o módulo jdk.compiler (o REA exige JDK completo)"; exit 4; }
@@ -131,6 +135,7 @@ case "${APKTOOL_HEAP_MB:-}" in ''|*[!0-9]*) APKTOOL_HEAP_MB=2048 ;; esac
 exec "$D/jdk/bin/java" "-Xmx${APKTOOL_HEAP_MB}m" -Dfile.encoding=UTF-8 -Djdk.util.zip.disableZip64ExtraFieldValidation=true -Djdk.nio.zipfs.allowDotZipEntry=true -jar "$D/apktool.jar" "$@"
 W2
 chmod 755 "$D/bin/jadx" "$D/bin/apktool"
+# vazio/falhou → ferramenta que não roda: v vazio ≠ a versão do pin e o install recusa SEM gravar o marcador
 v=$("$D/bin/jadx" --version 2>&1 | tail -n 1); [ "$v" = "$XV" ] || { echo "RECUSO jadx --version diz '${v:-nada}' e o pin é $XV"; exit 4; }
 v=$("$D/bin/apktool" --version 2>&1 | tail -n 1); [ "$v" = "$AV" ] || { echo "RECUSO apktool --version diz '${v:-nada}' e o pin é $AV"; exit 4; }
 echo "STEP ferramentas-rodam"

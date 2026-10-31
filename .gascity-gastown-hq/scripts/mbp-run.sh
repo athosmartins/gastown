@@ -1270,6 +1270,7 @@ NODE_EXEC_KNOWN=" rea ghidra ghidraRun analyzeHeadless jadx apktool java adb hop
 # node_push_ok <caminho>: 0 = pode ir ao nó. O --exec não passa por filtro nem por varredura de conteúdo (o pytest passa pelos dois), então a fronteira é a FORMA: UM arquivo comum (nem diretório nem link) de pacote de app, até NODE_EXEC_MAX_MB.
 node_push_ok() {
   local p="$1" b ext="" sz
+  case "$p" in -*) say "push '$p': caminho que começa com '-' seria lido como opção pelo rsync — fica no MBP"; return 1 ;; esac
   [ -f "$p" ] && [ ! -L "$p" ] || { say "push '$p': só arquivo comum vai ao $HNAME (diretório, link e caminho ausente ficam no MBP)"; return 1; }
   # vazio → nome sem ponto: a extensão fica vazia, não casa a lista e o push é recusado (nunca "sem extensão = vale")
   b=${p##*/}; case "$b" in *.*) ext=$(printf '%s' "${b##*.}" | tr 'A-Z' 'a-z') ;; esac

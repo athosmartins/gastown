@@ -3,7 +3,7 @@
 ## Contents
 
 • Por quê e resultado medido (11/10/2026) · Como ligar e desligar · **Presença do Athos: o MBP é o notebook dele (ga-77c1qg)** · Como usar
-• Sessões de pool no MBP (ga-w7qwl1) · Revisor do gate (ga-xm1jfl) · **Atalho do pytest dos workers e crews (ga-fl2nek)** · **Nó Linux de testes (Hetzner, ga-zri39b)** · REA pesado: `rea-run.sh` · **Go no MBP (ga-edkfip)** · Host do MBP: Tailscale por padrão (ga-bmmxka) · Códigos de saída · O que mora no MBP (`~/gt-remote`) · Manutenção
+• Sessões de pool no MBP (ga-w7qwl1) · Revisor do gate (ga-xm1jfl) · **Atalho do pytest dos workers e crews (ga-fl2nek)** · **Nó Linux de testes (Hetzner, ga-zri39b)** · REA pesado: `rea-run.sh` (ga-szz40p) · **Go no MBP (ga-edkfip)** · Host do MBP: Tailscale por padrão (ga-bmmxka) · Códigos de saída · O que mora no MBP (`~/gt-remote`) · Manutenção
 • Limites conhecidos
 
 ## Por quê e resultado medido (11/10/2026)

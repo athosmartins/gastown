@@ -1299,6 +1299,7 @@ for c in "arquivo .json:$T/x.json" "diretório:$T/pdir" "link:$T/link.apk" "cami
   nready; rc=$(xrun --push "${c#*:}" -- true); expect "push recusado ao nó (${c%%:*}): cai no MBP e roda" 0 "$rc"
   has "…motivo push-recusado no host hetzner" "$J" '"reason":"push-recusado".*"host":"hetzner"'; hasnt "…nada foi empurrado ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'
 done
+nready; : > "$T/-x.apk"; rc=$( cd "$T" && "$RUN" --exec --node-first --push -x.apk -- true >"$T/out" 2>"$T/err"; echo $? ); expect "push de caminho que começa com '-' (o rsync leria como opção): cai no MBP" 0 "$rc"; has "…motivo push-recusado no host hetzner" "$J" '"reason":"push-recusado".*"host":"hetzner"'; hasnt "…nada foi empurrado ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'
 nready; rc=$(HETZNER_EXEC_PUSH_MAX_MB=1 xrun --push "$T/big.apk" -- true); expect "push acima do teto (2 MB > 1 MB): cai no MBP" 0 "$rc"; has "…motivo push-recusado" "$J" '"reason":"push-recusado"'
 nready; rc=$(xrun --push "$T/UP.APK" -- true); expect "extensão em maiúsculas (.APK) vale" 0 "$rc"; has "…e o push vai ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:gt-remote/exec/1/in/'
 nready; rc=$(xrun --env API_TOKEN=s3cr3tvalue -- true); expect "--env com nome de segredo: cai no MBP" 0 "$rc"; has "…motivo env-recusado" "$J" '"reason":"env-recusado".*"host":"hetzner"'; hasnt "…o VALOR nunca aparece na mensagem" "$T/err" 's3cr3tvalue'
