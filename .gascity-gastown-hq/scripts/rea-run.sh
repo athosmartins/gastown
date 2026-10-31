@@ -11,7 +11,7 @@
 #
 # USO
 #   rea-run.sh [--local] [--wait-s N] [--push P]... [--pull REL:LOCAL]... [--env K=V]... -- <comando> [args]
-#        (sem --local: tenta o MBP via `mbp-run.sh --exec` e só cai para o mini nos códigos 96..99 dele; --push copia P para
+#        (sem --local: tenta o nó Linux e depois o MBP via `mbp-run.sh --exec --node-first` e só cai para o mini nos códigos 96..99 dele; --push copia P para
 #         ./in/ do scratch, --pull traz REL do scratch para LOCAL antes da limpeza, --env exporta K=V ao comando. Para
 #         redirecionar saída use `-- sh -c 'rea ... > out.json'`.)
 #   rea-run.sh --check          # mostra disco, swap e outro `rea` e sai (0 pode rodar · 92 sem folga · 93 não consegui ler)
@@ -38,9 +38,9 @@
 #   128+n   o wrapper recebeu o sinal n; o comando e seus filhos foram encerrados e o scratch apagado
 #
 # COMO FUNCIONA
-#   MBP: `mbp-run.sh --exec ... -- cmd` (chave, saúde do MBP, slot e limpeza do scratch remoto são dele). rc 96..99 → mini.
+#   nó Linux/MBP: `mbp-run.sh --exec --node-first ... -- cmd` (a cadeia, as chaves, a saúde, o slot e a limpeza do scratch remoto são dele; o log dele diz qual host rodou; aqui `mbp` = "via mbp-run.sh"). rc 96..99 → mini.
 #        ATENÇÃO: o rc 98 também sai quando o ssh cai NO MEIO da execução; nesse caso o comando pode já ter rodado (em parte)
-#        no MBP e roda de novo no mini. Use só comando de leitura/recon (idempotente), que é o caso do REA.
+#        no nó ou no MBP e roda de novo no host seguinte, até o mini. Use só comando de leitura/recon (idempotente), que é o caso do REA.
 #        --pull no MBP: o destino é conferido por identidade (inode+ctime+tamanho; mtime não serve, o rsync -a copia o do
 #        MBP) e "não mudou" vira 93/pull-falhou. Limite: pull de arquivo byte-idêntico que o rsync pulou lê como "não chegou" —
 #        apague o destino antigo antes de pedir de novo.
@@ -294,14 +294,14 @@ if [ $force_local -eq 0 ] && [ ! -x "$MBP_RUN" ]; then
   say "mbp-run.sh ausente ou sem permissão de execução ($MBP_RUN) — rodando no mini"; log_event fallback mbp 0 "mbp-run-ausente"
 fi
 if [ $force_local -eq 0 ] && [ -x "$MBP_RUN" ]; then
-  margs=(--exec)
+  margs=(--exec --node-first)
   for p in "${pushes[@]+"${pushes[@]}"}"; do margs+=(--push "$p"); done
   pull_before=()
   for pl in "${pulls[@]+"${pulls[@]}"}"; do margs+=(--pull "$pl"); pull_before+=("$(pull_sig "${pl#*:}")"); done
   for kv in "${envs[@]+"${envs[@]}"}"; do margs+=(--env "$kv"); done
   "$MBP_RUN" "${margs[@]}" -- "$@"; rc=$?
   case $rc in
-    96|97|98|99) say "MBP indisponível (mbp-run rc=$rc) — rodando no mini$([ $rc -eq 98 ] && printf ' (rc 98 também sai com o ssh caindo no meio: o comando pode já ter rodado, em parte, no MBP)')"
+    96|97|98|99) say "nó Linux e MBP indisponíveis (mbp-run rc=$rc) — rodando no mini$([ $rc -eq 98 ] && printf ' (rc 98 também sai com o ssh caindo no meio: o comando pode já ter rodado, em parte, no nó ou no MBP)')"
                  log_event fallback mbp "$rc" "mbp-rc-$rc" ;;   # gate:fallback
     *) MODE=mbp; pull_missing=""; i=0
        for pl in "${pulls[@]+"${pulls[@]}"}"; do

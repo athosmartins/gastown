@@ -215,7 +215,7 @@ reset_env; export STUB_MBP_RC=0 STUB_MBP_OUT=remoto-ok
 run -- sh -c "echo local > '$MARK'"
 eq "MBP rc 0: rc 0" 0 "$RC"; has "MBP: saída do mbp-run" remoto-ok "$OUT"
 [ ! -e "$MARK" ]; ok "MBP rc 0: comando NÃO rodou no mini" $?
-has "MBP: chamou --exec" "--exec -- sh -c" "$(cat "$STUB_MBP_LOG")"
+has "MBP: chamou --exec com --node-first" "--exec --node-first -- sh -c" "$(cat "$STUB_MBP_LOG")"
 has "MBP: log ran/mbp" '"mode":"mbp"' "$(cat "$LOGF")"
 reset_env; export STUB_MBP_RC=3
 run -- sh -c "echo local > '$MARK'"; eq "MBP rc do comando propagado" 3 "$RC"
@@ -231,7 +231,7 @@ reset_env; rm -f "$T/nobin"; REA_RUN_MBP_RUN="$T/nao-existe" run -- sh -c "echo 
 eq "mbp-run ausente: roda no mini" 0 "$RC"; [ -e "$MARK" ]; ok "mbp-run ausente: comando rodou" $?
 reset_env; export STUB_MBP_RC=0; echo x > "$T/in.txt"
 run --push "$T/in.txt" --pull "out.txt:$T/o.txt" --env A=1 --env B=2 -- sh -c 'true'
-has "MBP: repassa push/pull/env" "--exec --push $T/in.txt --pull out.txt:$T/o.txt --env A=1 --env B=2 -- sh -c true" "$(cat "$STUB_MBP_LOG")"
+has "MBP: repassa push/pull/env" "--exec --node-first --push $T/in.txt --pull out.txt:$T/o.txt --env A=1 --env B=2 -- sh -c true" "$(cat "$STUB_MBP_LOG")"
 
 # --pull no caminho do MBP: o mbp-run real só AVISA quando o pull falha e sai com o rc do comando (0). O wrapper confere se o
 # destino chegou NESTA execução; o critério é identidade (inode+ctime+tamanho), nunca mtime: o rsync -a copia o mtime do MBP.
