@@ -1267,8 +1267,9 @@ node_exec_cases
 node_exec_cases() {
 echo "--- --exec --node-first: o nó antes do MBP (ga-kfxzpt)"
 local rc t c S MD RT="$T/home/.local/share/rea-tools"
-tools_on() { mkdir -p "$RT/bin"; for t in java jadx apktool; do printf '#!/bin/sh\necho "fake-%s"\n' "$t" > "$RT/bin/$t"; chmod +x "$RT/bin/$t"; done; printf 'TOOLS=%s\nINSTALLED_AT=x\n' "${1:-java jadx apktool}" > "$RT/ready"; }
-tools_off() { rm -f "$RT/ready" "$RT/bin/java" "$RT/bin/jadx" "$RT/bin/apktool" "$RT/jadx-headless-mcp.jar"; }
+tools_on() { mkdir -p "$RT/bin"; for t in java jadx apktool; do printf '#!/bin/sh\necho "fake-%s"\n' "$t" > "$RT/bin/$t"; chmod +x "$RT/bin/$t"; done; printf 'TOOLS=%s\nINSTALLED_AT=x\n' "${1:-java jadx apktool}" > "$RT/ready"
+  case " ${1:-} " in *" rea "*) printf '#!/bin/sh\necho "fake-rea $*"\n' > "$RT/bin/rea"; chmod +x "$RT/bin/rea" ;; *) rm -f "$RT/bin/rea" ;; esac; }   # o preflight exige bin/rea quando o marcador diz rea (ga-03w2fck)
+tools_off() { rm -f "$RT/ready" "$RT/bin/java" "$RT/bin/jadx" "$RT/bin/apktool" "$RT/bin/rea" "$RT/jadx-headless-mcp.jar"; }
 xrun() { "$RUN" --exec --node-first "$@" >"$T/out" 2>"$T/err"; echo $?; }
 nready() { reset; date > "$NODEFLAG"; tools_on "$@"; }   # nó ligado e com as ferramentas
 # fixtures de pacote SINTÉTICOS, gerados aqui (nenhum binário no repo): a partir do ga-jq08gyi o nó confere o CONTEÚDO do --push, então "echo x > in.apk" deixou de ser um pacote. Telefones e CPFs saem de um gerador
@@ -1347,7 +1348,37 @@ nready; rm -f "$RT/bin/apktool"; rc=$(xrun -- true); expect "instalação incomp
 nready; chmod 000 "$RT/ready"; rc=$(xrun -- true); chmod 644 "$RT/ready"; expect "marcador sem permissão de leitura: cai no MBP" 0 "$rc"; has "…motivo ilegivel:rea_tools" "$J" '"reason":"ilegivel:rea_tools"'
 nready; rc=$(xrun --push "$T/in.apk" -- sh -c 'rea analyze-javascript-application in/in.apk'); expect "comando cita 'rea' e o nó não o lista: cai no MBP" 0 "$rc"
 has "…motivo sem-ferramenta:rea" "$J" '"reason":"sem-ferramenta:rea"'; hasnt "…e o arquivo NÃO foi empurrado ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'
-nready "java jadx apktool rea"; rc=$(xrun -- sh -c 'rea --version'); expect "…com 'rea' na lista o nó roda" 0 "$rc"; has "…no host hetzner" "$J" '"mode":"exec".*"host":"hetzner"'
+# rea (ga-03w2fck): com o rea no marcador o nó TEM o rea, mas só os subcomandos da lista de PERMITIDOS vão a ele. Fora da lista, forma que não se lê e lista ilegível ficam no MBP, cada um com o seu motivo no log
+RA="$T/rea-allow.txt"; printf '# teste\ninspect-android-package apk por apktool e jadx\n\nsearch-android-classes busca no jadx\n' > "$RA"
+nready "java jadx apktool rea"; rc=$(HETZNER_REA_ALLOWLIST="$RA" xrun --push "$T/in.apk" -- rea inspect-android-package in/in.apk); expect "rea de subcomando DA LISTA: roda no nó" 0 "$rc"
+has "…no host hetzner" "$J" '"mode":"exec".*"host":"hetzner"'; hasnt "…sem tocar o MBP" "$STUB_LOG" 'HOSTCALL:mbp'; has "…e o apk foi ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:gt-remote/exec/1/in/'
+nready "java jadx apktool rea"; rc=$(HETZNER_REA_ALLOWLIST="$RA" xrun --push "$T/in.apk" -- rea inspect-macho in/in.apk); expect "rea de subcomando FORA da lista: cai no MBP e roda" 0 "$rc"
+has "…motivo rea-fora-da-lista:inspect-macho no host hetzner" "$J" '"reason":"rea-fora-da-lista:inspect-macho".*"host":"hetzner"'; has "…a execução é do MBP" "$J" '"mode":"exec".*"host":"mbp"'
+hasnt "…o arquivo NÃO foi empurrado ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'; has "…e diz por quê" "$T/err" "o subcomando 'inspect-macho' do rea não está na lista do nó"
+# forma que não se lê: o subcomando tem de vir logo depois do `rea`. Cada uma é MBP, mesmo quando um subcomando DA LISTA aparece em outro lugar do comando
+for c in "rea --version" "rea" "rea --format json inspect-android-package in/in.apk" "sh -c rea\ inspect-android-package\ in/in.apk" "env rea inspect-android-package in/in.apk" "/usr/local/bin/rea inspect-android-package in/in.apk" "printf inspect-android-package rea" "rea Inspect-Android-Package" "rea 'inspect-android-package;ls'"; do
+  nready "java jadx apktool rea"; rc=$(eval "HETZNER_REA_ALLOWLIST=\"\$RA\" xrun -- $c"); expect "rea em forma que não se lê ($c): cai no MBP e roda" 0 "$rc"
+  has "…motivo rea-forma-desconhecida no host hetzner" "$J" '"reason":"rea-forma-desconhecida".*"host":"hetzner"'; has "…a execução é do MBP" "$J" '"mode":"exec".*"host":"mbp"'
+done
+# a lista ilegível manda TUDO do rea ao MBP, até o subcomando que ela mesma traz: ausente, vazia, linha sem porquê, nome fora do formato, nome repetido, uma linha ruim no fim. O motivo é rea-lista-ilegivel, nunca fora-da-lista
+printf '# so comentario\n\n' > "$T/ra-vazia.txt"; printf 'inspect-android-package\n' > "$T/ra-sempq.txt"; printf 'Inspect-Android-Package x\n' > "$T/ra-nome.txt"
+printf 'inspect-android-package a\ninspect-android-package b\n' > "$T/ra-dup.txt"; printf 'inspect-android-package a\nsearch!classes b\n' > "$T/ra-fim.txt"; printf 'inspect-android-package  \t \n' > "$T/ra-branco.txt"
+for c in "ausente:$T/nao-existe.txt" "diretório:$T/pdir" "sem nenhuma entrada:$T/ra-vazia.txt" "linha sem porquê:$T/ra-sempq.txt" "só espaço no lugar do porquê:$T/ra-branco.txt" "nome fora do formato:$T/ra-nome.txt" "nome repetido:$T/ra-dup.txt" "linha ruim no FIM:$T/ra-fim.txt"; do
+  nready "java jadx apktool rea"; rc=$(HETZNER_REA_ALLOWLIST="${c#*:}" xrun --push "$T/in.apk" -- rea inspect-android-package in/in.apk); expect "lista ilegível (${c%%:*}): o rea cai no MBP e roda" 0 "$rc"
+  has "…motivo rea-lista-ilegivel no host hetzner" "$J" '"reason":"rea-lista-ilegivel".*"host":"hetzner"'; hasnt "…e NÃO como fora-da-lista" "$J" 'rea-fora-da-lista'; hasnt "…nada foi empurrado ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'
+done
+# o arquivo que o repositório entrega precisa ser legível e trazer exatamente o que o runbook diz (um arquivo quebrado mandaria todo rea ao MBP em silêncio)
+nready "java jadx apktool rea"; rc=$(xrun --push "$T/in.apk" -- rea inspect-android-package in/in.apk); expect "lista DO REPOSITÓRIO: inspect-android-package vai ao nó" 0 "$rc"; has "…no host hetzner" "$J" '"mode":"exec".*"host":"hetzner"'
+nready "java jadx apktool rea"; rc=$(xrun --push "$T/in.apk" -- rea setup); expect "lista DO REPOSITÓRIO: setup (muda a config do usuário) fica no MBP" 0 "$rc"; has "…motivo rea-fora-da-lista:setup" "$J" '"reason":"rea-fora-da-lista:setup"'
+for c in update uninstall mcp inspect-macho analyze decompile recover-javascript-sources extract-artifact inspect-jeb-client; do
+  nready "java jadx apktool rea"; rc=$(xrun -- rea $c x); expect "lista DO REPOSITÓRIO: '$c' fica no MBP" 0 "$rc"; has "…motivo rea-fora-da-lista:$c" "$J" "\"reason\":\"rea-fora-da-lista:$c\""
+done
+nready "java jadx apktool rea"; rc=$(xrun -- rea list-adb-devices); expect "lista DO REPOSITÓRIO: subcomando adb também fica no MBP (a porta das ferramentas, que cita 'adb', fecha antes)" 0 "$rc"; has "…motivo sem-ferramenta:adb" "$J" '"reason":"sem-ferramenta:adb"'
+n_repo=$(grep -c -E '^[a-z][a-z0-9-]* +[^ ]' "$HERE/rea-node-allowlist.txt"); [ "$n_repo" -ge 1 ] && ok "a lista do repositório tem $n_repo entradas, todas com porquê" || bad "a lista do repositório não tem entrada legível"
+# o rea que o job do nó acha é o wrapper do hetzner-rea-tools (rea-tools/bin na frente do PATH)
+nready "java jadx apktool rea"; STUB_RUNMODE=exec HETZNER_REA_ALLOWLIST="$RA" "$RUN" --exec --node-first -- rea inspect-android-package in/x.apk >"$T/out" 2>"$T/err"; expect "job do nó com rea de verdade" 0 "$?"; has "…o rea resolve para o wrapper do nó e recebe os argumentos" "$T/out" '^fake-rea inspect-android-package in/x\.apk$'
+# o marcador diz rea mas o wrapper não está lá: instalação incompleta, o nó inteiro sai (nunca "o marcador basta")
+nready "java jadx apktool rea"; rm -f "$RT/bin/rea"; rc=$(xrun -- jadx -d out in/x.apk); expect "marcador com rea e SEM bin/rea: cai no MBP" 0 "$rc"; has "…motivo ilegivel:rea_tools" "$J" '"reason":"ilegivel:rea_tools"'
 nready; rc=$(xrun -- jadx -d out in/x.apk); expect "comando só com ferramentas do nó (jadx): roda no nó" 0 "$rc"; has "…no host hetzner" "$J" '"mode":"exec".*"host":"hetzner"'
 # a fronteira dos dados: UM arquivo comum de pacote de app; o resto fica no MBP (o MBP é o notebook do Athos, o nó é um servidor alugado)
 for c in "arquivo .json:$T/x.json" "diretório:$T/pdir" "link:$T/link.apk" "caminho ausente:$T/none.apk"; do
@@ -1471,7 +1502,7 @@ nready; rc=$(PATH="$T/pbin:$PATH" xrun --push "$T/ok.apk" -- true); expect "varr
 NOSP="$T/noscanpush"; mkdir -p "$NOSP"; for c in mbp-host.sh mbp-presence.sh mbp-controle.sh hetzner-pii-scan.py hetzner-mac-only.txt hetzner-rsync-filter.wa.txt; do ln -sf "$HERE/$c" "$NOSP/$c"; done; cp "$RUN" "$NOSP/mbp-run.sh"
 nready; "$NOSP/mbp-run.sh" --exec --node-first --push "$T/ok.apk" -- true >"$T/out" 2>"$T/err"; expect "sem o hetzner-push-scan.py ao lado: cai no MBP e roda (varredura que não roda NÃO é 'nada retido')" 0 "$?"; has "…a checagem de credencial, a 1ª que precisa do varredor, recusa: credencial-ilegivel" "$J" '"reason":"credencial-ilegivel".*"host":"hetzner"'; hasnt "…nada foi empurrado ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'
 # controles negativos: cada porta nova, tirada sozinha, volta ao defeito (o mutante tem de deixar de reproduzir o que o script real faz)
-MD="$T/mutdir-exec"; mkdir -p "$MD"; for t in mbp-host.sh mbp-presence.sh mbp-controle.sh hetzner-pii-scan.py hetzner-push-scan.py hetzner-mac-only.txt hetzner-rsync-filter.wa.txt; do ln -sf "$HERE/$t" "$MD/$t"; done   # o mutante lê os irmãos do script pelo $HERE dele
+MD="$T/mutdir-exec"; mkdir -p "$MD"; for t in mbp-host.sh mbp-presence.sh mbp-controle.sh hetzner-pii-scan.py hetzner-push-scan.py hetzner-mac-only.txt hetzner-rsync-filter.wa.txt rea-node-allowlist.txt; do ln -sf "$HERE/$t" "$MD/$t"; done   # o mutante lê os irmãos do script pelo $HERE dele
 xmut() { python3 -I -c 'import sys; s=open(sys.argv[1]).read(); a=sys.argv[2]; assert s.count(a)==1, "ancora: %d" % s.count(a); open(sys.argv[4],"w").write(s.replace(a, sys.argv[3]))' "$RUN" "$1" "$2" "$MD/mbp-run.sh" && chmod +x "$MD/mbp-run.sh"; }
 xobs() { n=$((n+1)); if grep -q -E -e "$3" "$2"; then echo "ok   $1"; else echo "FAIL $1: '$3' ausente em $2"; fails=$((fails+1)); fi; }
 if xmut 'node_push_ok "$p" || { fall push-recusado 97; return 97; }' 'true'; then nready; "$MD/mbp-run.sh" --exec --node-first --push "$T/link.apk" -- true >/dev/null 2>&1; xobs "controle: sem node_push_ok o LINK para um APK válido (que o varredor aceita) VAZA ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'; else bad "controle push: âncora do mutante"; fi
@@ -1487,8 +1518,8 @@ if xmut '{ [ $RC -eq 126 ] || [ $RC -eq 127 ]; }' 'false'; then nready; STUB_RUN
 if xmut '[ "$nodefirst" = 1 ] && [ -f "$NODE_FLAG" ]' '[ -f "$NODE_FLAG" ]'; then nready; "$MD/mbp-run.sh" --exec -- true >/dev/null 2>&1; xobs "controle: sem o opt-in o --exec comum vai ao nó" "$STUB_LOG" 'HOSTCALL:hetzner'; else bad "controle opt-in: âncora do mutante"; fi
 # ga-jq08gyi: o varredor de conteúdo. A chamada, e a regra "só o rc 0 passa" (3 = não deu para ler, 2 = o varredor errou), tiradas uma a uma, deixam o defeito voltar
 if xmut 'node_push_scan "$p" || { fall "$PUSH_WHY" 97; return 97; }' 'true'; then nready; "$MD/mbp-run.sh" --exec --node-first --push "$T/l30.jar" -- true >/dev/null 2>&1; xobs "controle: sem a chamada do varredor, o .jar com a lista VAI ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'; else bad "controle varredor: âncora do mutante"; fi
-if xmut '    0) return 0 ;;' '    0|3) return 0 ;;'; then nready; "$MD/mbp-run.sh" --exec --node-first --push "$T/enc.apk" -- true >/dev/null 2>&1; xobs "controle: se o rc 3 (não deu para ler) valesse como 'passa', o pacote cifrado iria ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'; else bad "controle rc 3: âncora do mutante"; fi
-if xmut '    0) return 0 ;;' '    0|2) return 0 ;;'; then nready; PATH="$T/pbin:$PATH" "$MD/mbp-run.sh" --exec --node-first --push "$T/ok.apk" -- true >/dev/null 2>&1; xobs "controle: se o rc 2 do varredor de pacote valesse como 'passa', o pacote iria ao nó sem varredura" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'; else bad "controle rc 2: âncora do mutante"; fi
+if xmut $'    0) return 0 ;;\n    1) say "push ' $'    0|3) return 0 ;;\n    1) say "push '; then nready; "$MD/mbp-run.sh" --exec --node-first --push "$T/enc.apk" -- true >/dev/null 2>&1; xobs "controle: se o rc 3 (não deu para ler) valesse como 'passa', o pacote cifrado iria ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'; else bad "controle rc 3: âncora do mutante"; fi
+if xmut $'    0) return 0 ;;\n    1) say "push ' $'    0|2) return 0 ;;\n    1) say "push '; then nready; PATH="$T/pbin:$PATH" "$MD/mbp-run.sh" --exec --node-first --push "$T/ok.apk" -- true >/dev/null 2>&1; xobs "controle: se o rc 2 do varredor de pacote valesse como 'passa', o pacote iria ao nó sem varredura" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'; else bad "controle rc 2: âncora do mutante"; fi
 # e cada guarda do próprio varredor: o mutante vive num diretório À PARTE, como arquivo comum (gravar através de um link sobrescreveria o varredor de verdade)
 MP="$T/mutdir-push"; mkdir -p "$MP"; ln -sf "$HERE/hetzner-pii-scan.py" "$MP/hetzner-pii-scan.py"
 pm() { # pm <o que o mutante quebra> <rc que o DEFEITO devolve> <âncora> <troca> <args do varredor...>: com a guarda tirada, o varredor tem de devolver o rc do defeito
@@ -1510,6 +1541,15 @@ pm "sem a checagem de credencial o JWT passa" 0 '            if CRED.search(t):'
 pm "sem recusar o 7z o pacote com 7z passa" 0 '    elif buf.startswith(OPAQUE):' '    elif False:' apk "$T/7z.apk"
 pm "sem checar o fim do fluxo o gzip cortado passa" 0 '    if not d.eof or d.unused_data:' '    if False:' apk "$T/gzcut.apk"
 pm "se o erro inesperado devolvesse 0 o zip corrompido passaria" 0 $'ascii(str(e))[:160]))\n        return 3' $'ascii(str(e))[:160]))\n        return 0' apk "$T/bad.apk"
+# rea (ga-03w2fck): cada porta da lista de permitidos, tirada sozinha, volta ao defeito (o rea do subcomando fora da lista, da forma ilegível ou da lista quebrada VAI ao nó)
+if xmut '*" rea "*) rea_node_ok "$@" || return $? ;; esac' '*" rea "*) true ;; esac'; then nready "java jadx apktool rea"; HETZNER_REA_ALLOWLIST="$RA" "$MD/mbp-run.sh" --exec --node-first --push "$T/in.apk" -- rea inspect-macho in/in.apk >/dev/null 2>&1; xobs "controle: sem a conferência do rea o subcomando FORA da lista vai ao nó" "$J" '"mode":"exec".*"host":"hetzner"'; else bad "controle rea-gate: âncora do mutante"; fi
+if xmut '[ "${1:-}" = rea ] || {' 'true || {'; then nready "java jadx apktool rea"; HETZNER_REA_ALLOWLIST="$RA" "$MD/mbp-run.sh" --exec --node-first -- printf inspect-android-package rea >/dev/null 2>&1; xobs "controle: sem o argv0 = rea, um subcomando da lista no lugar errado vai ao nó" "$J" '"mode":"exec".*"host":"hetzner"'; else bad "controle rea-argv0: âncora do mutante"; fi
+if xmut '[ -f "$REA_ALLOW" ] || return 2' '[ -f "$REA_ALLOW" ] || return 0'; then nready "java jadx apktool rea"; HETZNER_REA_ALLOWLIST="$T/nao-existe.txt" "$MD/mbp-run.sh" --exec --node-first -- rea inspect-macho in/in.apk >/dev/null 2>&1; xobs "controle: lista ausente lida como 'tudo permitido' manda o rea ao nó" "$J" '"mode":"exec".*"host":"hetzner"'; else bad "controle rea-ausente: âncora do mutante"; fi
+if xmut '[ -n "$why" ] || return 2   # o porquê é obrigatório' ':'; then nready "java jadx apktool rea"; HETZNER_REA_ALLOWLIST="$T/ra-sempq.txt" "$MD/mbp-run.sh" --exec --node-first -- rea inspect-android-package in/in.apk >/dev/null 2>&1; xobs "controle: sem exigir o porquê a linha crua passa e o rea vai ao nó" "$J" '"mode":"exec".*"host":"hetzner"'; else bad "controle rea-porque: âncora do mutante"; fi
+if xmut 'case "$seen" in *" $sub "*) return 2 ;; esac' ':'; then nready "java jadx apktool rea"; HETZNER_REA_ALLOWLIST="$T/ra-dup.txt" "$MD/mbp-run.sh" --exec --node-first -- rea inspect-android-package in/in.apk >/dev/null 2>&1; xobs "controle: sem a checagem de nome repetido a lista duplicada passa" "$J" '"mode":"exec".*"host":"hetzner"'; else bad "controle rea-dup: âncora do mutante"; fi
+if xmut '[[ "$sub" =~ ^[a-z][a-z0-9-]*$ ]] || return 2' ':'; then nready "java jadx apktool rea"; HETZNER_REA_ALLOWLIST="$T/ra-fim.txt" "$MD/mbp-run.sh" --exec --node-first -- rea inspect-android-package in/in.apk >/dev/null 2>&1; xobs "controle: sem o formato do nome a linha ruim no FIM não derruba a lista" "$J" '"mode":"exec".*"host":"hetzner"'; else bad "controle rea-formato: âncora do mutante"; fi
+if xmut '[ "$n" -ge 1 ] || return 2' ':'; then nready "java jadx apktool rea"; HETZNER_REA_ALLOWLIST="$T/ra-vazia.txt" "$MD/mbp-run.sh" --exec --node-first -- rea inspect-android-package in/in.apk >/dev/null 2>&1; xobs "controle: lista sem entrada lida como lista válida muda o motivo para fora-da-lista" "$J" 'rea-fora-da-lista:inspect-android-package'; else bad "controle rea-vazia: âncora do mutante"; fi
+if xmut '&& { case ",$t," in *,rea,*) [ -x "$rt/bin/rea" ] ;; esac; }' ''; then nready "java jadx apktool rea"; rm -f "$RT/bin/rea"; "$MD/mbp-run.sh" --exec --node-first -- jadx -d out in/x.apk >/dev/null 2>&1; xobs "controle: sem checar o bin/rea o marcador mentiroso basta e o nó roda" "$J" '"mode":"exec".*"host":"hetzner"'; else bad "controle rea-bin: âncora do mutante"; fi
 tools_off
 reset
 }

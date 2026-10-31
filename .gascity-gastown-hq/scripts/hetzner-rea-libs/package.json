@@ -1,0 +1,9 @@
+{
+  "name": "hetzner-rea-libs",
+  "version": "1.0.0",
+  "private": true,
+  "description": "fixa o rea-agents e as dependencias dele (hetzner-rea-tools.sh)",
+  "dependencies": {
+    "rea-agents": "6.4.0"
+  }
+}

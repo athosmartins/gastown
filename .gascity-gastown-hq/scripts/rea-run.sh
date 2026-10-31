@@ -13,7 +13,7 @@
 #   rea-run.sh [--local] [--wait-s N] [--push P]... [--pull REL:LOCAL]... [--env K=V]... -- <comando> [args]
 #        (sem --local: tenta o nó Linux e depois o MBP via `mbp-run.sh --exec --node-first` e só cai para o mini nos códigos 96..99 dele; --push copia P para
 #         ./in/ do scratch, --pull traz REL do scratch para LOCAL antes da limpeza, --env exporta K=V ao comando. Para
-#         redirecionar saída use `-- sh -c 'rea ... > out.json'`.)
+#         redirecionar saída no mini use `-- sh -c 'rea ... > out.json'`; para o `rea` ir ao nó Linux use a forma direta `-- rea <subcomando> ...` e redirecione NA CHAMADA (`rea-run.sh ... -- rea <sub> ... > out.json`, o stdout volta pelo ssh): `sh -c` não se classifica e vai ao MBP.)
 #   rea-run.sh --check          # mostra disco, swap e outro `rea` e sai (0 pode rodar · 92 sem folga · 93 não consegui ler)
 #
 #   --local é OBRIGATÓRIO quando o comando fala com algo do mini (o Chrome descartável em 127.0.0.1:$PORT do recon web da
@@ -39,6 +39,8 @@
 #
 # COMO FUNCIONA
 #   nó Linux/MBP: `mbp-run.sh --exec --node-first ... -- cmd` (a cadeia, as chaves, a saúde, o slot e a limpeza do scratch remoto são dele; o log dele diz qual host rodou; aqui `mbp` = "via mbp-run.sh"). rc 96..99 → mini.
+#        O `rea` só vai ao nó se o comando é `rea <subcomando> ...` e o subcomando está em scripts/rea-node-allowlist.txt (lista de PERMITIDOS, com o porquê de cada um; ga-03w2fck); fora da lista, forma que não se lê ou lista ilegível vai ao MBP
+#        (a decisão é do mbp-run.sh, não daqui: o rc 1 de um subcomando que o nó não atende é veredito, não 126/127, e não seria repetido no MBP).
 #        ATENÇÃO: o rc 98 também sai quando o ssh cai NO MEIO da execução; nesse caso o comando pode já ter rodado (em parte)
 #        no nó ou no MBP e roda de novo no host seguinte, até o mini. Use só comando de leitura/recon (idempotente), que é o caso do REA.
 #        --pull no MBP: o destino é conferido por identidade (inode+ctime+tamanho; mtime não serve, o rsync -a copia o do

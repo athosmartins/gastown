@@ -4,7 +4,7 @@
 
 • Resumo · Por que a versão é fixa · O patch (helper Swift, 60 s → 300 s)
 • Comandos do dia a dia (`check` e `apply`) · Códigos de saída · O que fazer quando o `check` não dá 0
-• Atualizar o REA (só por bead) · MBP · Issue upstream · Limites conhecidos e o que NÃO foi provado
+• Atualizar o REA (só por bead) · MBP · Nó Linux (Hetzner) · Issue upstream · Limites conhecidos e o que NÃO foi provado
 
 ## Resumo
 - Versão fixada: **`rea-agents@6.4.0`** (arquivo `scripts/rea-patches/PIN`).
@@ -67,6 +67,11 @@ Regra: **versão nova só entra por uma bead dedicada** (rota `gastown.dog` ou c
 - Instalação separada, em `~/gt-remote/rea` (Node 22; ver `mbp-offload.md`). Caminho do pacote: `~/gt-remote/rea/lib/node_modules/rea-agents`.
 - **Situação conferida em 12/10/2026 (só leitura, por ssh):** versão **6.4.0**, mas o arquivo está **pristine** (sha256 `c71a355f…1b05`, `timeout: 60_000` na linha 135): o patch **não** foi aplicado lá. Não foi alterado nesta bead: o MBP é o nó ocioso e a execução de 11/10 deu rc 0 em 75 s sem o patch. Se o MBP passar a rodar compilação do helper sob load, o `rea-patch.sh` precisa rodar **lá** (ele lê arquivos locais): copie `scripts/rea-patch.sh` e `scripts/rea-patches/` para o MBP e rode `REA_PKG_DIR=$HOME/gt-remote/rea/lib/node_modules/rea-agents ./rea-patch.sh apply`.
 - `rea update` no MBP segue a mesma regra: só por bead.
+
+## Nó Linux (Hetzner)
+- O `rea-agents@6.4.0` também mora no nó, instalado por `scripts/hetzner-rea-tools.sh install` a partir de `scripts/hetzner-rea-libs/package-lock.json` (não por `npm install --global`), e só recebe os subcomandos de `scripts/rea-node-allowlist.txt`. Detalhe, procedência e ativação: `hetzner-rea-tools.md`.
+- **O patch dos 300 s NÃO se aplica lá:** é do helper Swift (`DarwinProcessRunTokenReader`), só do macOS. `rea-patch.sh` não roda no nó.
+- **Atualizar o REA vira dois lugares:** o pin do MBP (`scripts/rea-patches/PIN`, roteiro acima) e o do nó (`REA_VERSION`, `REA_INTEGRITY`, `REA_LOCK_SHA256` em `hetzner-rea-tools.pin`, com o lock regerado). Versões diferentes entre o MBP e o nó fazem o mesmo subcomando responder diferente conforme o host; atualize os dois na mesma bead.
 
 ## Issue upstream
 A ideia é pedir ao projeto (`morluto/rea`) que o prazo de compilação do helper Swift seja configurável (variável de ambiente ou opção, como já existe `REA_GHIDRA_STARTUP_TIMEOUT_MS`), para eliminar o patch local. O texto não deve conter dado interno: sem nomes de host, caminhos do usuário, alvos analisados nem beads. A issue foi aberta em 12/10/2026 com autorização do Athos (comentário do Mayor na bead `ga-pfc2ww`): <https://github.com/morluto/rea/issues/2184> (o rascunho está no comentário do dog na mesma bead). Se ela for atendida, a bead de atualização do roteiro acima troca o patch pela variável de ambiente.

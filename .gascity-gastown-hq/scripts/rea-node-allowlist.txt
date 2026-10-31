@@ -1,0 +1,35 @@
+# rea-node-allowlist.txt — os subcomandos do `rea` que o rea-run.sh pode mandar ao nó Linux (Hetzner). Tudo que NÃO está aqui roda no MBP. DADO, não código: scripts/mbp-run.sh (node_exec_gate) lê as linhas abaixo; nunca `source`. (ga-03w2fck)
+#
+# Contents
+#   Formato · Por que uma lista de PERMITIDOS · Como entra um subcomando · O que fica no MBP e por quê · A lista
+#
+# FORMATO: uma linha por subcomando, `<subcomando> <porquê>`. O porquê é OBRIGATÓRIO: linha sem ele, subcomando fora de [a-z][a-z0-9-]*, repetido, ou arquivo sem nenhuma entrada = lista ILEGÍVEL, e lista ilegível manda TUDO ao MBP
+#   (motivo `rea-lista-ilegivel` no mbp-run.jsonl). Uma linha ruim derruba a lista inteira, de propósito: arquivo meio escrito não pode valer pela metade.
+#
+# POR QUE UMA LISTA DE PERMITIDOS (decisão do Mayor, 31/10/2026): o `rea` 6.4.0 tem ~120 subcomandos e boa parte precisa do que só o MBP tem (Hopper, IDA, JEB, Ghidra, LLDB, macOS, aparelho adb, Chrome). No nó um subcomando que o nó não atende
+#   NÃO cai para o MBP sozinho: `rea inspect-macho` rodado no nó contra um arquivo que não é Mach-O saiu com rc 1 (`capability_unavailable`), que é um VEREDITO, não um 126/127, e o mbp-run.sh não repete veredito no MBP. Então "tenta no nó e, se
+#   falhar, vai ao MBP" não existe para o rea: a única forma segura é decidir ANTES. Subcomando fora da lista, forma de chamada que não dá para ler, ou lista ilegível = MBP (fail-closed: nunca o nó por chute).
+#
+# COMO UM SUBCOMANDO ENTRA: (1) só LÊ um arquivo local que o --push leva (apk, asar, jar...: o --exec do nó não empurra json, diretório nem link), (2) roda no nó com o que o hetzner-rea-tools.sh instala (JDK, jadx, apktool, o jar do jadx, o node), sem Hopper/IDA/JEB/
+#   Ghidra/LLDB/adb/Chrome/macOS, (3) NÃO escreve fora do scratch nem em ~/ (nada de caminho absoluto de saída, setup, update), (4) foi RODADO no nó, com o ambiente que o job do mbp-run.sh monta, e saiu 0. Só a prova (4) vale: "a ajuda diz que é Android" não basta.
+#   Para propor mais um: rode-o no nó com um alvo real, anote aqui o rc e o tempo, e abra bead. Subcomando novo que o rea ganhar numa versão nova NÃO entra sozinho (a lista é por nome e o pin do rea é fixo).
+#
+# O QUE FICA NO MBP E POR QUÊ (nenhum destes está na lista; a razão é a do grupo):
+#   Nomeiam ferramenta ou aparelho que o nó não tem   *-jeb-* (JEB), observe-native-calls (LLDB), todo *-adb-* e capture-adb-screen (adb e aparelho: o nó não tem nenhum)
+#   Chrome/CDP e rede                   *-web-*, *-browser-*, *-electron-*, discover-webmcp-tools, observe-javascript-runtime (precisam do navegador e do endereço 127.0.0.1 do mini; o recon web é --local no mini)
+#   Muda a configuração do usuário      setup, update, uninstall, mcp (escrevem em ~/ do usuário do nó, que guarda as credenciais do nó; `update` ainda troca a versão fixa do rea: rea-versao-fixa-e-patch.md)
+#   Escreve em caminho ABSOLUTO que o chamador escolhe   recover-javascript-sources, export-web-scripts, extract-artifact, extract-firmware, evidence-export (o nó roda como o usuário do nó: o destino não pode ser livre)
+#   Entrada é Evidence JSON             project-*-application-graph, trace-application-feature, trace-javascript-semantics, compare-*, inspect-analysis-view, evidence-import, reconcile-javascript-runtime... (o --push só leva pacote de app; json fica no MBP)
+#   Escolhem o motor pelo alvo          analyze, inspect, decompile, function, instructions, xrefs, search, trace, inspect-artifact: com um apk podem usar o jadx, com um app da Apple outro motor; sem medir cada alvo não dá para afirmar qual
+#   Não medidos no nó                   o resto, inclusive os que a própria ajuda diz rodar "without Hopper" (inspect-macho, inspect-plist, inspect-signature, list-architectures, demangle-swift) e os formatos Apple/PE/firmware: podem até rodar no
+#                                       nó, mas ninguém mediu. Ficar fora da lista é o padrão seguro; entrar é o que exige prova (candidatos para uma bead própria).
+#
+# A LISTA (medido em 31/10/2026 no nó, com o PATH/JAVA_HOME/REA_JADX_MCP_JAR do job do mbp-run.sh; APK = com.simplemobiletools.flashlight 5.10.1, 10 MB, sha256 b4cd07c4…9bb3; ASAR = montado à mão, 257 B):
+inspect-apktool-client       só confere o apktool do nó e não abre alvo nenhum; rc 0 em 2,8 s (provider Apktool 3.0.3)
+inspect-android-package      manifesto, SDKs, permissões e classes do APK por apktool+jadx; rc 0 em 11,3 s
+decode-android-resources     manifesto, metadados e strings do APK por apktool; rc 0 em 7,6 s
+search-android-classes       busca por nome de classe no APK pelo jadx; rc 0 em 11,6 s
+inspect-android-class        inventário de membros de UMA classe do APK; rc 0 em 12,2 s
+inspect-android-method       decompila UM método do APK pelo jadx; rc 0 em 16,6 s
+trace-android-references     referências de entrada de uma classe/método do APK; rc 0 em 11,1 s
+analyze-javascript-application  reconstrução ESTÁTICA de um ASAR/app Electron local, sem executá-lo (só node); rc 0 em 3,6 s

@@ -49,7 +49,9 @@
 #                 que já existia. Servidor fora do ar NUNCA trava o gate. O pytest vai ao nó sempre; o --exec só com --node-first (item seguinte).
 #   --EXEC        (ga-kfxzpt) sem --node-first o --exec é só do MBP, como sempre: o build de Go (--go), o laboratório do Dolt e a conferência do jsonl levam variáveis, binários e dados que NÃO podem ir ao servidor alugado.
 #                 Com --node-first a cadeia é a mesma (nó -> MBP; 96..99 quando nenhum rodou) e o nó só entra se: (1) o preflight dele diz `rea_tools=<lista>` (hetzner-rea-tools.sh install; `none` = nunca instalado,
-#                 vazio = marcador ilegível ou meio instalado: o nó NÃO é usado) e o comando não cita uma ferramenta conhecida (rea, ghidra, adb...) que a lista não tem; (2) cada --push é UM arquivo comum de pacote de app
+#                 vazio = marcador ilegível ou meio instalado: o nó NÃO é usado) e o comando não cita uma ferramenta conhecida (rea, ghidra, adb...) que a lista não tem; o `rea` só vai se for `rea <subcomando> ...` com o
+#                 subcomando em scripts/rea-node-allowlist.txt (lista de PERMITIDOS, com o porquê de cada um; ga-03w2fck): subcomando fora da lista, forma que não se lê (`sh -c`, `env`, opção antes do subcomando) ou lista ilegível = MBP, motivos
+#                 `rea-fora-da-lista:<sub>` · `rea-forma-desconhecida` · `rea-lista-ilegivel` (o rc 1 de um subcomando que o nó não atende é veredito, não 126/127: por isso a decisão é antes); (2) cada --push é UM arquivo comum de pacote de app
 #                 (apk, aab, jar, asar, so, exe...) de até HETZNER_EXEC_PUSH_MAX_MB (1024); diretório, link e qualquer outra extensão ficam no MBP. O --exec não passa pelo filtro nem pelo node_guard do pytest, então o CONTEÚDO é conferido por
 #                 scripts/hetzner-push-scan.py (ga-jq08gyi): os magic bytes do tipo que o nome diz e a lista de telefones/CPFs (os limiares do hetzner-pii-scan.py) no arquivo e em CADA membro de zip, recursivo; retido ou "não deu para ler" = MBP;
 #                 (3) só vão ao nó os --env da ALLOWLIST (JADX_HEAP_MB, APKTOOL_HEAP_MB e REA_*; o veto por nome de segredo — TOKEN, SECRET, KEY, PASS, AUTH, COOKIE, CRED, SESSION — vale por cima) e nenhum valor de --env nem palavra do comando
@@ -346,11 +348,11 @@ echo "disk_mb=$(df -Pk "$HOME" 2>/dev/null | awk 'NR == 2 && $4 ~ /^[0-9]+$/ { p
 # pytest-xdist no venv do nó: 1 tem · 0 não tem · vazio = não consegui olhar (o lado local trata vazio como 0: não injeta -n)
 sp=$(ls -d "$HOME/gt-remote/$WAVENV"/lib/python3*/site-packages 2>/dev/null | head -1)
 if [ -n "$sp" ] && ls "$sp" >/dev/null 2>&1; then if ls "$sp" | grep -q '^pytest_xdist-'; then echo "xdist=1"; else echo "xdist=0"; fi; else echo "xdist="; fi
-# ferramentas de REA do nó (hetzner-rea-tools.sh install grava o marcador `ready` por último): none = nunca instalado · lista (java,jadx,apktool...) = marcador com TOOLS= e os três executáveis no lugar ·
+# ferramentas de REA do nó (hetzner-rea-tools.sh install grava o marcador `ready` por último): none = nunca instalado · lista (java,jadx,apktool,rea...) = marcador com TOOLS= e os três executáveis no lugar (mais o bin/rea, se a lista diz rea) ·
 # vazio = não consegui saber (marcador que existe e não abre, sem TOOLS=, ou instalação incompleta); o lado local trata vazio como "não usa o nó", nunca como none nem como lista
 rt=$HOME/.local/share/rea-tools
 if [ ! -e "$rt/ready" ]; then echo "rea_tools=none"
-else t=$(sed -n 's/^TOOLS=//p' "$rt/ready" 2>/dev/null | head -n 1 | tr ' ' ','); if [ -n "$t" ] && [ -x "$rt/bin/java" ] && [ -x "$rt/bin/jadx" ] && [ -x "$rt/bin/apktool" ]; then echo "rea_tools=$t"; else echo "rea_tools="; fi; fi
+else t=$(sed -n 's/^TOOLS=//p' "$rt/ready" 2>/dev/null | head -n 1 | tr ' ' ','); if [ -n "$t" ] && [ -x "$rt/bin/java" ] && [ -x "$rt/bin/jadx" ] && [ -x "$rt/bin/apktool" ] && { case ",$t," in *,rea,*) [ -x "$rt/bin/rea" ] ;; esac; }; then echo "rea_tools=$t"; else echo "rea_tools="; fi; fi
 presence_probe
 for d in "$HOME"/gt-remote/slots/*/; do
   [ -d "$d" ] || continue
@@ -1330,6 +1332,8 @@ node_exec_gate() {
   for w in $(printf '%s\n' "$*" | tr -c 'A-Za-z0-9_' ' '); do
     case "$NODE_EXEC_KNOWN" in *" $w "*) case ",$rt," in *",$w,"*) ;; *) say "o comando cita '$w' e o $HNAME só tem: ${rt//,/ } — vai ao MBP"; fall "sem-ferramenta:$w" 98; return 98 ;; esac ;; esac
   done
+  # rea (ga-03w2fck): o nó TEM o rea (passou acima), mas só roda os subcomandos da lista de permitidos. Citar a palavra `rea` em QUALQUER posição aciona a conferência, e só a forma `rea <subcomando> ...` passa por ela.
+  case " $(printf '%s\n' "$*" | tr -c 'A-Za-z0-9_' ' ') " in *" rea "*) rea_node_ok "$@" || return $? ;; esac
   for p in "${pushes[@]+"${pushes[@]}"}"; do [ -n "$p" ] || continue; node_push_ok "$p" || { fall push-recusado 97; return 97; }; done
   for kv in "${envs[@]+"${envs[@]}"}"; do
     [ -n "$kv" ] || continue   # vazio → o --env sem valor: o job também o ignora (_attempt_exec); nada a conferir
@@ -1344,6 +1348,45 @@ node_exec_gate() {
   # o CONTEÚDO por último: é a checagem cara (lê o pacote inteiro) e as baratas acima já podem ter deixado o comando no MBP
   for p in "${pushes[@]+"${pushes[@]}"}"; do [ -n "$p" ] || continue; node_push_scan "$p" || { fall "$PUSH_WHY" 97; return 97; }; done
   return 0
+}
+# ---- rea: a LISTA DE PERMITIDOS (ga-03w2fck) ---------------------------------------------------------------------------------------
+# O marcador de ferramentas diz que o nó TEM o rea; QUAIS subcomandos podem ir é esta lista (scripts/rea-node-allowlist.txt, com o porquê de cada um). O motivo de existir: no nó, um subcomando que o nó não atende (Hopper, JEB,
+# adb, Chrome...) sai com rc 1 = VEREDITO, e o 126/127 que manda o comando ao MBP não vale para ele. Então a decisão é ANTES: fora da lista, forma que não dá para ler, ou lista ilegível = MBP, nunca o nó por chute.
+REA_ALLOW=${HETZNER_REA_ALLOWLIST:-$HERE/rea-node-allowlist.txt}
+# rea_allow_has <subcomando>: 0 = está na lista · 1 = li a lista inteira e o subcomando NÃO está · 2 = não consegui ler a lista (arquivo ausente/ilegível, linha sem porquê, nome fora do formato, nome repetido, ou nenhuma entrada).
+# Uma linha ruim derruba a lista INTEIRA: arquivo meio escrito não vale pela metade. Quem chama manda 1 e 2 ao MBP, e só o motivo no log os distingue.
+rea_allow_has() {
+  local content line sub why seen=" " n=0 hit=1
+  # vazio → arquivo sem nenhuma entrada = 2 (ilegível), nunca "lista vazia, nada vai ao nó" com cara de decisão; falhou/ilegível → o cat falha e é 2 (a leitura inteira vem antes de qualquer veredito, então um erro no meio não vira lista curta)
+  [ -f "$REA_ALLOW" ] || return 2
+  content=$(cat "$REA_ALLOW" 2>/dev/null) || return 2
+  while IFS= read -r line; do
+    case "$line" in ''|'#'*) continue ;; esac
+    case "$line" in *[![:space:]]*) ;; *) continue ;; esac   # só espaço em branco
+    sub=${line%%[[:space:]]*}; why=${line#"$sub"}; why=${why#"${why%%[![:space:]]*}"}
+    [[ "$sub" =~ ^[a-z][a-z0-9-]*$ ]] || return 2
+    [ -n "$why" ] || return 2   # o porquê é obrigatório
+    case "$seen" in *" $sub "*) return 2 ;; esac
+    seen="$seen$sub "; n=$((n + 1))
+    [ "$sub" = "${1:-}" ] && hit=0
+  done <<< "$content"
+  [ "$n" -ge 1 ] || return 2
+  return $hit
+}
+# rea_node_ok <argv do comando...>: 0 = pode ir ao nó · 98 = vai ao MBP (o motivo fica no log). Só vale a forma `rea <subcomando> ...`, com o subcomando logo depois do `rea`: `sh -c '...rea...'`, `env`, `timeout`, caminho
+# do rea, opção global antes do subcomando e qualquer outra coisa não se classificam sem interpretar shell, então vão ao MBP. O subcomando só entra no log depois de passar pelo formato [a-z][a-z0-9-]*.
+rea_node_ok() {
+  local sub rc
+  # vazio → comando sem 2º argumento ("rea" sozinho): forma desconhecida = MBP; falhou/ilegível → idem (nunca "sem subcomando = vale")
+  [ "${1:-}" = rea ] || { say "o comando cita o rea fora da forma 'rea <subcomando> ...' (começa por '${1:-}') — vai ao MBP"; fall rea-forma-desconhecida 98; return 98; }
+  sub=${2:-}
+  [[ "$sub" =~ ^[a-z][a-z0-9-]*$ ]] || { say "o 2º argumento do rea não é um subcomando legível — vai ao MBP"; fall rea-forma-desconhecida 98; return 98; }
+  rea_allow_has "$sub"; rc=$?
+  case $rc in
+    0) return 0 ;;
+    1) say "o subcomando '$sub' do rea não está na lista do nó (${REA_ALLOW##*/}) — vai ao MBP"; fall "rea-fora-da-lista:$sub" 98; return 98 ;;
+    *) say "não consegui ler a lista de subcomandos do rea no nó ($REA_ALLOW) — todo rea vai ao MBP"; fall rea-lista-ilegivel 98; return 98 ;;
+  esac
 }
 scratch_clean() { "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "find $X -mindepth 1 -delete" >/dev/null 2>&1 || say "AVISO: scratch $X não foi limpo"; }   # X: o scratch da tentativa (global, como SLOT e RC)
 

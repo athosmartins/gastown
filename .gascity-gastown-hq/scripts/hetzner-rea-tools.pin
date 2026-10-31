@@ -1,9 +1,9 @@
-# hetzner-rea-tools.pin — as ferramentas de REA que o nó Linux (aarch64) tem em ~/.local/share/rea-tools: JDK completo, jadx, apktool e o jar do jadx que o REA usa. DADO, não código: scripts/hetzner-rea-tools.sh lê as linhas KEY=valor abaixo por grep (nunca `source`).
+# hetzner-rea-tools.pin — as ferramentas de REA que o nó Linux (aarch64) tem em ~/.local/share/rea-tools: JDK completo, jadx, apktool, o jar do jadx que o REA usa e o próprio rea-agents. DADO, não código: scripts/hetzner-rea-tools.sh lê as linhas KEY=valor abaixo por grep (nunca `source`).
 #
 # Contents
 #   De onde vem cada hash · O que o REA pede · Como atualizar
 #
-# DE ONDE VEM CADA HASH (conferido em 31/10/2026, ga-kfxzpt; a prova NÃO é a mesma para os quatro: abaixo, o que cada um teve — JDK três coincidências, jadx digest + parte do código, apktool só a assinatura PGP, jar do REA o hash do próprio REA):
+# DE ONDE VEM CADA HASH (conferido em 31/10/2026, ga-kfxzpt; a prova NÃO é a mesma para os quatro primeiros: abaixo, o que cada um teve — JDK três coincidências, jadx digest + parte do código, apktool só a assinatura PGP, jar do REA o hash do próprio REA; o rea-agents, a última linha, tem a sua prova própria):
 #   JDK        Temurin 21.0.9+10 (OpenJDK21U-jdk_aarch64_linux_hotspot_21.0.9_10.tar.gz, GitHub adoptium/temurin21-binaries). O sha256 do arquivo.sha256.txt do release == o digest do GitHub == o do download, e a assinatura
 #              destacada (.sig) deu `Good signature` da chave do Adoptium 3B04D753C9050D9A5D343F39843C48A565F8F04B, baixada de packages.adoptium.net para um chaveiro vazio; o fingerprint é o que o próprio Adoptium publica em adoptium.net/installation/gpg-verification/ (conferido na mesma data).
 #   jadx       jadx-1.5.6.zip (GitHub skylot/jadx; o digest do GitHub == o do download). O jadx não assina o zip; o que se provou: as 776 entradas do jadx-core-1.5.6.jar e as 32 do jadx-cli-1.5.6-all.jar, ASSINADOS no Maven
@@ -12,6 +12,11 @@
 #   apktool    o jar de org.apktool:apktool-cli:3.0.3 do Maven Central, assinatura (.asc) `Good signature` da chave B74F1749DC15C852BB51CE64C3CC0A201EC7DA75 (uid "Connor Tumbleson"; a chave veio de keyserver.ubuntu.com pelo id que a própria assinatura traz e não foi confrontada com outra página).
 #              Não é o mesmo arquivo do apktool_3.0.3.jar do release do GitHub (outro hash e outro tamanho; o do GitHub tem atestado de proveniência do Sigstore, o do Maven tem a assinatura PGP conferida aqui).
 #   jar do REA jadx-headless-mcp-0.7.1-all.jar (GitHub 1013503897/jadx-headless-mcp): o sha256 é o que o PRÓPRIO rea-agents 6.4.0 fixa em dist/android/JadxRelease.js (o REA "não baixa nem instala" o jar) == o digest do GitHub == o download.
+#   rea-agents rea-agents@6.4.0 do npm (ga-03w2fck, 31/10/2026). O npm não tem assinatura GPG de release; a garantia é uma CADEIA: REA_LOCK_SHA256 (sha256 do scripts/hetzner-rea-libs/package-lock.json) é conferido no mini e no nó antes de o npm abrir qualquer coisa;
+#              o lock fixa os 149 pacotes (rea-agents + 148 dependências) por sha512, TODOS de registry.npmjs.org, nenhum com script de instalação (e o install roda `npm ci --ignore-scripts` de qualquer jeito); REA_INTEGRITY é o sha512 do tarball do
+#              rea-agents e tem de ser igual ao do lock (conferido no mini e no nó). Conferido em 31/10/2026 por duas vias independentes: o `npm view rea-agents@6.4.0 dist.integrity` do nó, e o tarball BAIXADO no mini (1.825.761 bytes) cujo sha512 deu o mesmo valor.
+#              E o arquivo do pacote que o scripts/rea-patch.sh trata (dist/process/DarwinProcessRunTokenReader.js) tem no tarball o sha256 pristine c71a355f…1b05 que o MANIFEST.tsv de rea-patches/6.4.0 registra. NÃO foi comparada a árvore das 148 dependências com nada além do
+#              próprio lock (gerado com `npm install --package-lock-only --ignore-scripts`, npm 10.9 do Node 22.22.3 do pin do Node). O patch do prazo do helper Swift (rea-patches) é só do macOS (DarwinProcessRunTokenReader) e NÃO se aplica no nó. Atualizar o rea: rea-versao-fixa-e-patch.md.
 # O QUE O REA PEDE (lido em rea-agents 6.4.0, dist/android/Jadx*.js e dist/apktool/*.js): JAVA_HOME ABSOLUTO de um JDK >= 17 COM o módulo jdk.compiler (um JRE não serve), REA_JADX_MCP_JAR com o caminho absoluto do jar acima e um `apktool` no PATH
 #   (o REA só roda `apktool --version` e `apktool d`: decodificar; não há aapt2 para aarch64 no Linux, então `apktool b` não é suportado aqui). O mbp-run.sh exporta as três coisas no job do nó.
 # COMO ATUALIZAR: baixe o artefato novo, confira a assinatura/os dois caminhos acima, troque as linhas daquele artefato de uma vez (JADX: as DUAS), rode `bash scripts/hetzner-rea-tools.selftest.sh` e depois `bash scripts/hetzner-rea-tools.sh install`.
@@ -25,3 +30,6 @@ APKTOOL_VERSION=3.0.3
 APKTOOL_JAR_SHA256=29fc610eed9dd349e75d40fd5af02538e0118b08d56a61ef6f53f8256adadc9a
 JADX_MCP_VERSION=0.7.1
 JADX_MCP_JAR_SHA256=6e5eacf500b64292bfb73c49797c1958f6ee44646e43e868039ae7feb573ff75
+REA_VERSION=6.4.0
+REA_INTEGRITY=sha512-Vj1zWfSlna5bphGoaoI/TcVBuYvze9u+OyPC3Shz8YkBqaCTqB4COnnRoX7XDwMpwI24ZlFEel2yEj0k8LTWEQ==
+REA_LOCK_SHA256=6c530c4e808a26402015aa7dc9978ac2f55f63e37eaae976395e52f6c0ff20ce
