@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """jev_cut_output_join.py (ga-wk0qi2, child of ga-aijm2v) — OFFLINE join for the cut-large-
 output SHADOW front. cut-output-shadow.py (the live PostToolUse + PostToolUseFailure hook) logs, for every large Bash
-output, what the fixed rule WOULD have cut and a handful of "signatures" (bead ids, absolute
+output, what the fixed rule WOULD have cut (and, for a sample of the outputs no fixed rule applies to, what the Jev
+tier -- cut_output_jev.py, ga-d0hm85 -- judged cuttable) and a handful of "signatures" (bead ids, absolute
 paths, sha-looking tokens, error-line snippets) extracted from the cut/would-cut portion. That
 alone cannot say whether the agent actually needed the cut content later -- the only way to know
 is to look at what the SAME session did in LATER turns, which does not exist yet at hook time.
@@ -82,9 +83,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import jev_experiment as je  # noqa: E402
 from cut_output_classifier import JOIN_MODE, RECORD_MODE, extract_signatures  # noqa: E402,F401  (JOIN_MODE is re-exported to the report; extract_signatures is used by the selftest)
 
-# The fixed rule is the only source: the Jev tier that used to be a second one left this bead (ga-d0hm85), and a row
-# still carrying its old experiment name is nobody's candidate, however complete it looks.
-SOURCE_EXPERIMENTS = ("cut-output-fixed",)
+# The two tiers that can cut something: the fixed rule, and the Jev tier (ga-d0hm85). A Jev row is a candidate only
+# when it carries signatures, and cut_output_jev writes signatures ONLY for blocks it judged cuttable -- a not-judged
+# or all-relevant record has none, so "Jev could not tell" can never be joined into a referenced-later rate.
+# (The 40 legacy stress-run rows of this experiment name carry mode "shadow", which RECORD_MODE excludes.)
+SOURCE_EXPERIMENTS = ("cut-output-fixed", "cut-output-jev")
 
 DEFAULT_LOG_DIR = Path(os.environ.get("JEV_CUT_OUTPUT_JOIN_DIR", "/Users/athos/gt/.gascity-gastown-hq/.gc/logs"))
 LOCK_PATH = DEFAULT_LOG_DIR / "jev-cut-output-join.lock"
@@ -640,12 +643,24 @@ def _selftest() -> int:
         ok("select_candidates: e2 has no signatures -> excluded", "e2" not in cand_ids)
         ok("select_candidates: e7 (unjoined fixed-rule record, has signatures) -> included", "e7" in cand_ids)
         ok("select_candidates: e4 belongs to a different experiment -> excluded", "e4" not in cand_ids)
-        ok("select_candidates: record missing entity_id -> excluded, does not raise", len(cands) == 1)
+        ok("select_candidates: record missing entity_id -> excluded, does not raise", len(cands) == 2)
 
-        # Mayor 28/09 23:1x (7th gate rejection): the Jev tier is out of this bead (ga-d0hm85), so the fixed rule is the
-        # ONLY source this join reads. A complete-looking row of the old Jev experiment is nobody's candidate.
-        ok("the join's one source experiment is the fixed rule (the Jev tier is ga-d0hm85's)", SOURCE_EXPERIMENTS == ("cut-output-fixed",))
-        ok("select_candidates: a row of the old Jev experiment is not a candidate, however complete it looks", "e3" not in cand_ids)
+        # ga-d0hm85: the Jev tier is a source again, but only a row that carries signatures can be joined -- and those
+        # exist only for blocks Jev judged cuttable.
+        ok("the join's source experiments are the fixed rule and the Jev tier", SOURCE_EXPERIMENTS == ("cut-output-fixed", "cut-output-jev"))
+        ok("select_candidates: e3 (unjoined Jev-tier record that carries signatures) -> included", "e3" in cand_ids)
+        jev_rows = [
+            {"mode": RECORD_MODE, "experiment": "cut-output-jev", "entity_id": "j-notjudged", "omitted_signatures": [], "jev_state": "not-judged",
+             "coverage": "none", "tokens_would_save": None, "transcript_path": "/tmp/j", "tool_use_id": "tu-j1", "ts": base_ts},
+            {"mode": RECORD_MODE, "experiment": "cut-output-jev", "entity_id": "j-relevant", "omitted_signatures": [], "jev_state": "judged-relevant",
+             "coverage": "full", "tokens_would_save": 0, "transcript_path": "/tmp/j", "tool_use_id": "tu-j2", "ts": base_ts},
+            {"mode": RECORD_MODE, "experiment": "cut-output-jev", "entity_id": "j-partial", "omitted_signatures": ["ga-cutme1"], "jev_state": "judged-cuttable",
+             "coverage": "partial", "tokens_would_save": None, "transcript_path": "/tmp/j", "tool_use_id": "tu-j3", "ts": base_ts},
+        ]
+        jev_ids = {c["entity_id"] for c in select_candidates(jev_rows, since_hours=0, limit=10)}
+        ok("select_candidates: a Jev record that judged nothing (no signatures) is never a candidate -- 'could not tell' is not joined", "j-notjudged" not in jev_ids)
+        ok("select_candidates: a Jev record that judged everything relevant (no signatures) is not a candidate either", "j-relevant" not in jev_ids)
+        ok("select_candidates: a PARTIAL Jev record is a candidate for the blocks it did judge cuttable", "j-partial" in jev_ids)
 
         cands_limited = select_candidates(recs2, since_hours=0, limit=1)
         ok("select_candidates respects --limit", len(cands_limited) == 1)

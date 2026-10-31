@@ -86,8 +86,9 @@ JEV_LOG = Path(os.environ.get("JEV_EXPERIMENT_LOG", "/Users/athos/gt/.gascity-ga
 
 
 # the experiment names of the cut-large-output front (cut-output-shadow.py); its rows are mode "cut-output".
-# "cut-output-jev" stays in this tuple although nothing writes it any more (the Jev tier is ga-d0hm85's): the 40 legacy
-# rows this exclusion exists for carry exactly that name in the live, append-only log.
+# "cut-output-jev" is written again by the Jev tier (cut_output_jev.py, ga-d0hm85) -- under mode "cut-output", which is what
+# keeps those rows out of summarize_shadow(). The 40 legacy stress-run rows this exclusion exists for carry the same
+# experiment name under mode "shadow" in the live, append-only log, and are still excluded here.
 CUT_OUTPUT_EXPERIMENTS = ("cut-output-fixed", "cut-output-jev")
 
 
