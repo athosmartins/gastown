@@ -5,7 +5,7 @@
 # -- the ENGINE only ever prints "{}", so the guarantee "a shadow cannot alter a tool result" is held by
 # cut-output-shadow.py, not by this wrapper (a selftest pins the relay). It never blocks and every failure mode here
 # is exit 0. See
-# cut-output-shadow.py's own header for the full design (the fixed-rule measurement -- the Jev tier is ga-d0hm85's --,
+# cut-output-shadow.py's own header for the full design (the fixed-rule measurement and the Jev tier, which ships OFF -- ga-d0hm85 --,
 # PASSO 0's updatedToolOutput shape finding, fail-open discipline).
 #
 # TWO EVENTS, ONE WRAPPER: Claude Code sends a Bash call's output on PostToolUse only when the call SUCCEEDED

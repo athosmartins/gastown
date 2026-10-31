@@ -30,6 +30,13 @@ trap 'rm -rf "$SCRATCH"' EXIT
 # still pass their own JEV_EXPERIMENT_LOG explicitly, this is the net under the ones that don't.
 export JEV_EXPERIMENT_LOG="$SCRATCH/jev-experiment.default.jsonl"
 
+# The Jev tier (cut_output_jev.py) is OFF unless the enable file exists, and the engine's default path for that file (and for
+# its kill-switch sentinel) is the LIVE city's. If someone turns the tier on in production, a suite that left those defaults
+# would start attempting real Jev calls from here. Pin both into the scratch dir for the whole suite; the one test that needs
+# the tier ON passes its own file explicitly.
+export CUT_OUTPUT_SHADOW_JEV_ENABLED="$SCRATCH/jev-never-enabled"
+export CUT_OUTPUT_SHADOW_JEV_DISABLED="$SCRATCH/jev-never-disabled"
+
 # hook_json <tool_name> <stdout> <stderr> [command] -> the PostToolUse JSON on stdin
 hook_json() {
   jq -cn --arg t "$1" --arg out "$2" --arg err "$3" --arg cmd "${4-}" \
@@ -220,7 +227,7 @@ fi
 
 # ─────────────────────────────────────────────────────────────────────────
 echo ""
-echo "-- live dispatch to the REAL cut-output-shadow.py (fixed rule only: no network, no credential lookup) --"
+echo "-- live dispatch to the REAL cut-output-shadow.py (the Jev tier is off here: no network, no credential lookup) --"
 # ─────────────────────────────────────────────────────────────────────────
 LOG="$SCRATCH/jev-experiment.jsonl"
 PYTEST_OUT=$(python3 -c "
@@ -245,11 +252,10 @@ print('\n\n'.join(f'random unstructured paragraph {i} with generic prose text, n
 ")
 UNSTRUCT_JSON="$(hook_json Bash "$UNSTRUCT_OUT" '' 'some-tool --verbose')"
 
-# Mayor 28/09 23:1x (7th gate rejection): the Jev tier left this bead (ga-d0hm85), so a large output no fixed rule
-# applies to must reach NOTHING outside the process: one 'unmatched' row, {} on stdout. "Jev is never contacted" is
-# measured on the real process, not read off the source: JEV_SECRET_BIN points at a script that leaves a marker file
-# if anything runs it (the credential lookup was the first thing the old tier did), and the credentials are
-# unset so that lookup would have had to run it.
+# ga-d0hm85: the Jev tier ships OFF. With no enable file, a large output no fixed rule applies to reaches NOTHING outside the
+# process: one 'unmatched' row stamped jev_tier=disabled, {} on stdout. "Jev is never contacted" is measured on the real process,
+# not read off the source: JEV_SECRET_BIN points at a script that leaves a marker file if anything runs it (the credential
+# lookup is the first thing a Jev call does), and the credentials are unset so that lookup would have had to run it.
 cat > "$SCRATCH/secret-marker" <<MARKER
 #!/bin/sh
 : > "$SCRATCH/secret-was-run"
@@ -260,10 +266,45 @@ rm -f "$LOG" "$SCRATCH/secret-was-run"
 run "$UNSTRUCT_JSON" "JEV_EXPERIMENT_LOG=$LOG" "CLOUDFLARE_ACCOUNT_ID=" "CLOUDFLARE_API_TOKEN=" "JEV_SECRET_BIN=$SCRATCH/secret-marker"
 if [ "$RC" -eq 0 ] && [ "$OUT" = "{}" ] && [ ! -e "$SCRATCH/secret-was-run" ] && [ -f "$LOG" ] && [ "$(wc -l < "$LOG" | tr -d ' ')" = "1" ] \
    && [ "$(jq -r .experiment < "$LOG")" = "cut-output-fixed" ] && [ "$(jq -r .rule < "$LOG")" = "unmatched" ] \
+   && [ "$(jq -r .jev_tier < "$LOG")" = "disabled" ] \
    && [ "$(jq -r '.tokens_would_save | type' < "$LOG")" = "null" ] && [ "$(jq -r '.omitted_signatures | length' < "$LOG")" = "0" ]; then
-  ok "live: large unstructured output -> the secret CLI is never run, one cut-output-fixed row with rule=unmatched and tokens_would_save=null, {} on stdout"
+  ok "live: large unstructured output, tier OFF by default -> the secret CLI is never run, one cut-output-fixed row with rule=unmatched, jev_tier=disabled, tokens_would_save=null, {} on stdout"
 else
-  bad "live unmatched case: rc=$RC out=[$OUT] secret-cli-was-run=[$([ -e "$SCRATCH/secret-was-run" ] && echo YES || echo no)] log=[$(cat "$LOG" 2>/dev/null)]"
+  bad "live unmatched case (tier off): rc=$RC out=[$OUT] secret-cli-was-run=[$([ -e "$SCRATCH/secret-was-run" ] && echo YES || echo no)] log=[$(cat "$LOG" 2>/dev/null)]"
+fi
+
+# The tier ON (an enable file with a cited authorization and 100%), through the real wrapper and the real engine. No network:
+# the credential lookup is the stub above, which fails -> the call cannot be made -> Jev "vault_unavailable". What must hold:
+# the lookup WAS attempted (the tier really ran), two rows with the same entity_id, the second one NOT JUDGED with a null saving
+# (never a 0), and {} on stdout.
+printf '# selftest only: stands in for "<who said yes>, <bead#comment>, <when>"\n100\n' > "$SCRATCH/jev-enabled-100"
+rm -f "$LOG" "$SCRATCH/secret-was-run"
+run "$UNSTRUCT_JSON" "JEV_EXPERIMENT_LOG=$LOG" "CUT_OUTPUT_SHADOW_JEV_ENABLED=$SCRATCH/jev-enabled-100" "CLOUDFLARE_ACCOUNT_ID=" "CLOUDFLARE_API_TOKEN=" "JEV_SECRET_BIN=$SCRATCH/secret-marker"
+if [ "$RC" -eq 0 ] && [ "$OUT" = "{}" ] && [ -e "$SCRATCH/secret-was-run" ] && [ -f "$LOG" ] && [ "$(wc -l < "$LOG" | tr -d ' ')" = "2" ] \
+   && [ "$(sed -n 1p "$LOG" | jq -r .jev_tier)" = "attempted" ] && [ "$(sed -n 2p "$LOG" | jq -r .experiment)" = "cut-output-jev" ] \
+   && [ "$(sed -n 1p "$LOG" | jq -r .entity_id)" = "$(sed -n 2p "$LOG" | jq -r .entity_id)" ] \
+   && [ "$(sed -n 2p "$LOG" | jq -r .jev_state)" = "not-judged" ] && [ "$(sed -n 2p "$LOG" | jq -r .coverage)" = "none" ] \
+   && [ "$(sed -n 2p "$LOG" | jq -r '.tokens_would_save | type')" = "null" ] && [ "$(sed -n 2p "$LOG" | jq -r .jev_error)" = "vault_unavailable" ]; then
+  ok "live: tier ON but Jev unreachable -> two rows (attempted, then cut-output-jev) with one entity_id, the Jev row not-judged / coverage none / tokens_would_save null (never 0), {} on stdout"
+else
+  bad "live unmatched case (tier on, vault down): rc=$RC out=[$OUT] secret-cli-was-run=[$([ -e "$SCRATCH/secret-was-run" ] && echo YES || echo no)] log=[$(cat "$LOG" 2>/dev/null)]"
+fi
+
+# The egress guard on the real process: an output that is ALL credential is never put in front of Jev -- no call, so the
+# credential lookup is never even started, and the Jev row says every block was withheld.
+CRED_OUT=$(python3 -c "
+print('\n\n'.join(f'export SERVICE_{i}_TOKEN=abcdefghij0123456789klmnop{i}  # line {i}' for i in range(60)))
+")
+CRED_JSON="$(hook_json Bash "$CRED_OUT" '' 'env')"
+rm -f "$LOG" "$SCRATCH/secret-was-run"
+run "$CRED_JSON" "JEV_EXPERIMENT_LOG=$LOG" "CUT_OUTPUT_SHADOW_JEV_ENABLED=$SCRATCH/jev-enabled-100" "CLOUDFLARE_ACCOUNT_ID=" "CLOUDFLARE_API_TOKEN=" "JEV_SECRET_BIN=$SCRATCH/secret-marker"
+if [ "$RC" -eq 0 ] && [ "$OUT" = "{}" ] && [ ! -e "$SCRATCH/secret-was-run" ] && [ "$(wc -l < "$LOG" | tr -d ' ')" = "2" ] \
+   && [ "$(sed -n 2p "$LOG" | jq -r .jev_called)" = "false" ] && [ "$(sed -n 2p "$LOG" | jq -r .jev_state)" = "not-judged" ] \
+   && [ "$(sed -n 2p "$LOG" | jq -r '.not_judged_reasons | keys | join(",")')" = "withheld-secret" ] \
+   && ! grep -q "abcdefghij0123456789" "$LOG"; then
+  ok "live: an output made of credentials -> no Jev call and no credential lookup, every block withheld-secret, and the credential text is in no log row"
+else
+  bad "live egress guard: rc=$RC out=[$OUT] secret-cli-was-run=[$([ -e "$SCRATCH/secret-was-run" ] && echo YES || echo no)] log=[$(cat "$LOG" 2>/dev/null | cut -c1-400)]"
 fi
 
 # a large FAILING pytest run (exit 1) through the real wrapper and the real engine: measured, and the row says

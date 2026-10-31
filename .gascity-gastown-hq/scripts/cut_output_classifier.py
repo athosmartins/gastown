@@ -21,8 +21,9 @@ output into one of these shapes:
   5. None ("unstructured"): output is large but does not match any fixed shape above. This module
      answers ONLY "does a fixed, no-AI rule apply here, and if so what would it keep", so for such an
      output it has no verdict of its own to give. The caller (cut-output-shadow.py) records it with
-     unmatched_verdict() -- rule "unmatched", "no fixed rule applies, so nothing is cut" -- and sends
-     it nowhere else (a Jev tier for these outputs was split off this bead: ga-d0hm85).
+     unmatched_verdict() -- rule "unmatched", "no fixed rule applies, so nothing is cut". A separate,
+     opt-in tier (cut_output_jev.py, ga-d0hm85) may judge a sample of these outputs with Jev; this
+     module never does, and never sends anything anywhere.
 
 SINGLE SOURCE (ga-wk0qi2 gate attempt 4): a classifier only chooses WHICH LINES to keep, and
 _verdict_from_kept_lines() derives everything else from that one partition -- kept_text,
@@ -994,10 +995,10 @@ def _selftest() -> int:
     for v in violations[:8]:
         print(f"    violation: {v}")
 
-    # ---- Mayor 28/09 23:1x: the Jev tier left this bead (ga-d0hm85), so a large output NO fixed rule applies to is no
-    # longer handed to anything. classify_output() still answers None for it (no verdict from a rule), and the caller
-    # records that as a verdict of its own -- 'unmatched', "I do not know how to cut this, so I do not cut it" -- built
-    # the same single-source way as every other one, so the same partition oracles hold for it ----
+    # ---- a large output NO fixed rule applies to: classify_output() answers None for it (no verdict from a rule), and the
+    # caller records that as a verdict of its own -- 'unmatched', "I do not know how to cut this, so I do not cut it" --
+    # built the same single-source way as every other one, so the same partition oracles hold for it. (What happens to it
+    # next -- the opt-in Jev tier, ga-d0hm85 -- is cut_output_jev.py's business, not this module's.) ----
     unmatched_fn = globals().get("unmatched_verdict")
     # large enough to be considered (>= MIN_CHARS_TO_CONSIDER) and short enough that no rule applies (<= DEFAULT_MAX_LOG_LINES lines)
     unmatched_prose = "\n\n".join(f"paragraph {i} with some ordinary words" for i in range(80))

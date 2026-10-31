@@ -23,10 +23,12 @@ non-comment line of the file JEV_ENABLED_FILE (CUT_OUTPUT_SHADOW_JEV_ENABLED, de
     10
 An absent file, a comments-only file, or a value that is not a number in 0..100 is OFF. Even when ON:
   * only a deterministic SAMPLE of the unmatched outputs is sent (the percentage in the file);
-  * a block that looks like a credential or personal data (egress_withhold_reason: private keys and multi-line secrets,
-    provider tokens, JWTs, DSNs with a password, cookies, `password=` / `"token": "..."` assignments, long mixed-case
-    tokens, CPF/CNPJ, formatted phone numbers, WhatsApp ids, e-mail addresses) is NEVER sent -- it is "not-judged:
-    withheld-*" and counted; the command line gets the same check; a multi-line secret withholds every block it touches;
+  * a block that looks like a credential or personal data (egress_withhold_reason, per block: PEM markers, provider tokens,
+    JWTs, DSNs with a password, cookies, `password=` / `"token": "..."` assignments, long mixed-case tokens, CPF/CNPJ,
+    formatted phone numbers, WhatsApp ids, e-mail addresses) is NEVER sent -- it is "not-judged: withheld-*" and counted;
+    sensitive_spans() looks at the WHOLE output for multi-line secrets (a PEM key BEGIN..END, a truncated one, a
+    `kind: Secret` manifest) and withholds every block such a span touches, and a block that ends on a bare `password:`
+    withholds the next one; the command line gets the per-block check (loggable_command);
   * at most MAX_STATE_CHARS characters per output (head + tail blocks; the middle is "not-judged: over-budget");
   * a kill switch for this tier alone: `touch` the CUT_OUTPUT_SHADOW_JEV_DISABLED sentinel (the whole hook has its own).
 The guard is a best-effort filter, not a proof: a name or a street address in plain prose is not detected, and an
@@ -51,7 +53,7 @@ and the numbers are DERIVED from those states, never from a subset of the text:
 
 THE PARTITION. build_blocks() tiles the output into contiguous blocks (every line in exactly one; the separator
 blank lines travel with the paragraph before them), so chars_relevant + chars_cuttable + chars_not_judged ==
-chars_before for EVERY record. Text that was never put in front of Jev (a head+tail budget leaves the middle out; a
+chars_before for every record that has block detail (all of them but the exception record, whose counters are None). Text that was never put in front of Jev (a head+tail budget leaves the middle out; a
 withheld block) is a not-judged block, not a gap. The saving is computed through cut_output_classifier.omit_lines_verdict
 -- the same single partition, with the marker cost inside -- so a Jev cut and a fixed-rule cut are measured the same way.
 
@@ -158,6 +160,7 @@ def sample_pct() -> float:
     file absent -> 0 (the default: off); file unreadable, comments only, not a number, NaN or outside 0..100 -> 0
     (not knowing how much to send is never "send"). Read on each call (a tiny file, only for unmatched outputs), so
     turning it on or off needs no restart. Never raises."""
+    # vazio (file absent / no number in it) -> 0, tier OFF; falhou/ilegível (unreadable, not UTF-8, not a number) -> 0, tier OFF
     try:
         raw = JEV_ENABLED_FILE.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -180,7 +183,7 @@ def jev_tier(entity_id: str) -> str:
     """TIER_ATTEMPTED | TIER_SAMPLED_OUT | TIER_DISABLED for one unmatched output. Deterministic per entity_id (never
     per-run random, same discipline as jev_experiment.assign_arm), so a retried hook decides the same way. Never raises.
     An unreadable kill-switch sentinel counts as ON: if we cannot tell whether the switch is set, we do not send."""
-    # sentinel: absent -> tier proceeds; present -> disabled; unreadable (permission, bad path) -> disabled (inert)
+    # vazio (no sentinel) -> the tier proceeds to its percentage; presente -> disabled; falhou/ilegível (permission, bad path) -> disabled
     try:
         if JEV_DISABLED_SENTINEL.exists():
             return TIER_DISABLED
@@ -259,8 +262,8 @@ def _has_email(text: str) -> bool:
             start -= 1
         local = text[start:at].lower()
         domain = m.group(1).lower()
-        if local.startswith(("noreply", "no-reply")) or domain.endswith("noreply.github.com") or domain.endswith("anthropic.com") and local.startswith("noreply"):
-            continue
+        if local.startswith(("noreply", "no-reply")) or domain.endswith("noreply.github.com"):
+            continue  # the sender addresses git and GitHub put in every commit trailer
         return True
     return True  # more '@' signs than we are willing to inspect: do not send
 
@@ -477,6 +480,8 @@ def resolve_blocks(blocks: list[dict], jev_result: dict | None) -> None:
         garbled is in `bad`, never read as a low probability;
       * answer noul in [0, 1]: relevant when noul >= 0.5 OR the model is not confident enough to cut
         (confidence = max(noul, 1 - noul) < CONFIDENCE_THRESHOLD); cuttable when noul < 0.5 AND confident enough."""
+    # vazio (no call made / no answer for a block) -> not-judged, never a low probability; falhou/ilegível (call failed, answer not
+    # a number in [0, 1], answers not a dict) -> not-judged with the failure CLASS as the reason
     ok_call = isinstance(jev_result, dict) and jev_result.get("ok") is True
     answers = jev_result.get("answers") if ok_call else None
     bad = jev_result.get("bad") if ok_call else None
@@ -535,6 +540,7 @@ def build_jev_record(jev_result: dict | None, blocks: list[dict], text: str, met
     chars_relevant + chars_cuttable + chars_not_judged == chars_before; blocks_* add up to block_count; no block is
     still pending; tokens_would_save is not None only when coverage == "full"."""
     rec = _base_record(text, meta)
+    # vazio (jev_result None: nothing was sendable, no call) -> jev_called False, jev_ok None; falhou (ok False) -> jev_ok False + the error class
     called = jev_result is not None
     rec["jev_called"] = called
     rec["jev_ok"] = bool(jev_result.get("ok")) if called else None
