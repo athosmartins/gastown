@@ -218,6 +218,15 @@ mkdir -p "$STATE" 2>/dev/null || true
 after() { local want="$1" prev=""; for a in $args; do [ "$prev" = "$want" ] && { echo "$a"; return; }; prev="$a"; done; }
 
 case "$args" in
+  *"list --json --limit 0")
+    # ga-vdac4cj: the children read (children-in-hand-lib.sh: ONE `bd [-C db] list --json --limit 0` per filter call = every
+    # not-closed bead of the store, grouped by .parent by the lib; NOT `list --parent`, and NOT keyed on the candidate's
+    # dependent_count, which bd list/ready rows do not set for parent-child links). Each call is logged (the whole argv) so a
+    # scenario can prove HOW the Pilot looks; FAKE_STORE_JSON is the answer, FAKE_STORE_FAIL=1 makes the read fail. Default `[]` =
+    # a store with no children, which keeps every other scenario byte-identical to before this seam existed.
+    echo "$args" >> "$STATE/store-reads.log" 2>/dev/null || true
+    [ "${FAKE_STORE_FAIL:-0}" = "1" ] && exit 1
+    printf '%s' "${FAKE_STORE_JSON:-[]}" ;;
   *" blocked"*)
     # The `bd blocked` SUBCOMMAND (space-prefixed token), NOT the `--exclude-label
     # story:blocked` flag that the ctx:ready candidate queries now pass (ga-mfeip
@@ -1038,6 +1047,9 @@ run_ctxready() {
 #   $2 = PILOT_QUOTA_OVERRIDE  ("2" → force the quota-pause early-exit)
 #   $3 = PILOT_EMIT_DISPATCHABLE ("0" → disable the emit; default 1)
 #   $4 = FAKE_INFLIGHT_JSON (occupy slots → exercise the both-lanes-full path)
+#   $5 = FAKE_STORE_JSON (ga-vdac4cj: what the children read `bd list --json --limit 0` answers - the store's not-closed beads;
+#        "" = [] = no children anywhere)
+#   $6 = FAKE_STORE_FAIL (ga-vdac4cj: "1" = that read fails)
 # Emits the file path on stdout (caller jq's it). The file is reset each run.
 EMIT_FILE="$WORK/pilot-dispatchable.json"
 run_emit() {
@@ -1060,6 +1072,8 @@ run_emit() {
     PILOT_QUOTA_OVERRIDE="${2:-}" \
     PILOT_EMIT_DISPATCHABLE="${3:-1}" \
     FAKE_INFLIGHT_JSON="${4:-[]}" \
+    FAKE_STORE_JSON="${5:-}" \
+    FAKE_STORE_FAIL="${6:-0}" \
     FAKE_BLOCKED_IDS="" \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   echo "$EMIT_FILE"
@@ -5069,6 +5083,72 @@ if jq -e '[.items[].id] | (index("tt-emit-clean") != null) and (index("tt-emit-a
   ok "emit kept the clean bead and excluded the assigned one (filter parity)"
 else
   bad "emit did not apply the assigned-veto correctly (got: $(jq -c '[.items[].id]' "$F19B" 2>/dev/null))"
+fi
+
+echo "Scenario 19m (ga-vdac4cj): a MOTHER whose children are in hand is not a candidate - neither in the emit nor in the dispatch pick"
+# tt-mother is the older P0, a sliced feature whose two slices hold the gate markers; tt-plain is a plain bead. BOTH rows carry
+# dependent_count 0 - as `bd ready` / `bd list` print them (measured 31/10: parent-child links are not counted there; the real mother
+# ga-hfx1kou is 0 in the list row and 2 in `bd show`), so the Pilot cannot tell from the row which is the mother: it asks the store.
+# The incident: the mother kept coming back as a plain ready bead while its slices sat in the gate, and a builder was spent on it.
+VDAC_MOTHER='{"id":"tt-mother","title":"sliced mother","priority":0,"issue_type":"bug","description":"mother of two slices, full description for the children filter test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","dependent_count":0,"dependency_count":0,"metadata":{}}'
+VDAC_PLAIN='{"id":"tt-plain","title":"plain bead","priority":1,"issue_type":"bug","description":"plain ready bug, full description for the children filter test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-02T00:00:00Z","dependent_count":0,"dependency_count":0,"metadata":{}}'
+VDAC_BUGS="[$VDAC_MOTHER,$VDAC_PLAIN]"
+VDAC_LOG="$FIXCITY/.gc/logs/pilot-dispatcher.log"
+# a store row for a child of tt-mother, the way bd prints one (.parent + the parent-child edge), in the given state
+vdac_kid() { # <n> <status> <labels-json>
+  printf '{"id":"tt-mother.%s","status":"%s","parent":"tt-mother","labels":%s,"dependent_count":0,"dependencies":[{"issue_id":"tt-mother.%s","depends_on_id":"tt-mother","type":"parent-child"}]}' "$1" "$2" "$3" "$1"
+}
+rm -f "$STATE/store-reads.log"
+FV1="$(run_emit "$VDAC_BUGS" "" 1 "[]" "[$(vdac_kid 1 open '["gate:queued"]'),$(vdac_kid 2 open '["gate:queued"]')]")"
+if jq -e '[.items[].id] | (index("tt-mother") == null) and (index("tt-plain") != null)' "$FV1" >/dev/null 2>&1; then
+  ok "children in the gate, mother row dependent_count 0: the emit drops the mother and keeps the plain bead"
+else
+  bad "children in the gate: emit wrong (got: $(jq -c '[.items[].id]' "$FV1" 2>/dev/null))"
+fi
+if grep -q 'Lane picks — small: tt-plain' "$VDAC_LOG"; then ok "…and the dispatch pick is the plain bead, not the older P0 mother"; else bad "…dispatch pick wrong: $(grep 'Lane picks' "$VDAC_LOG" | head -2)"; fi
+if grep -q 'EXCLUÍDO tt-mother por _filter_open_children: filhas em mãos' "$VDAC_LOG"; then ok "…and the log names the mother, the filter and the reason"; else bad "…no EXCLUÍDO line for tt-mother in the log"; fi
+if grep -q 'EXCLUÍDO tt-plain por _filter_open_children' "$VDAC_LOG"; then bad "…the plain bead was logged as excluded"; else ok "…and the plain bead is not logged as excluded"; fi
+if [ -s "$STATE/store-reads.log" ] && ! grep -qv 'list --json --limit 0$' "$STATE/store-reads.log" && ! grep -q 'list --parent' "$STATE/store-reads.log"; then
+  ok "…the Pilot reads the store with the one bulk call ($(wc -l < "$STATE/store-reads.log" | tr -d ' ') read(s), all 'list --json --limit 0', never 'list --parent')"
+else
+  bad "…store reads wrong: $(tr '\n' '|' < "$STATE/store-reads.log" 2>/dev/null)"
+fi
+
+FV2="$(run_emit "$VDAC_BUGS" "" 1 "[]" "[$(vdac_kid 1 open '[]'),$(vdac_kid 2 closed '["gate:queued"]')]")"
+if jq -e '[.items[].id] | (index("tt-mother") != null) and (index("tt-plain") != null)' "$FV2" >/dev/null 2>&1; then
+  ok "control: children merely ready / closed -> the mother stays in the emit"
+else
+  bad "control: emit wrong (got: $(jq -c '[.items[].id]' "$FV2" 2>/dev/null))"
+fi
+if grep -q 'Lane picks — small: tt-mother' "$VDAC_LOG"; then ok "…and it is the dispatch pick (P0, older)"; else bad "…dispatch pick wrong: $(grep 'Lane picks' "$VDAC_LOG" | head -2)"; fi
+if grep -q 'EXCLUÍDO tt-mother' "$VDAC_LOG"; then bad "control: a mother with nothing in hand was logged as excluded"; else ok "…and nothing is logged as excluded"; fi
+
+FV2b="$(run_emit "$VDAC_BUGS" "" 1 "[]" '[{"id":"tt-other.1","status":"open","parent":"tt-other","labels":["gate:queued"],"dependencies":[{"issue_id":"tt-other.1","depends_on_id":"tt-other","type":"parent-child"}]}]')"
+if jq -e '[.items[].id] | (index("tt-mother") != null) and (index("tt-plain") != null)' "$FV2b" >/dev/null 2>&1; then
+  ok "control: ANOTHER bead's child in the gate holds nobody here"
+else
+  bad "control: a bystander's child held a bead (got: $(jq -c '[.items[].id]' "$FV2b" 2>/dev/null))"
+fi
+
+FV3="$(run_emit "$VDAC_BUGS" "" 1 "[]" "" 1)"
+if jq -e '[.items[].id] | (index("tt-mother") == null) and (index("tt-plain") == null)' "$FV3" >/dev/null 2>&1; then
+  ok "children unreadable (the bulk read fails): inert - NO candidate is in the emit (the row cannot say which are mothers)"
+else
+  bad "children unreadable: emit wrong (got: $(jq -c '[.items[].id]' "$FV3" 2>/dev/null))"
+fi
+if grep -q 'EXCLUÍDO tt-mother por _filter_open_children: filhas ilegíveis' "$VDAC_LOG" && grep -q 'WARN: holding tt-mother back .* could NOT be read' "$VDAC_LOG"; then
+  ok "…and it is LOUD: EXCLUÍDO + WARN in the log"
+else
+  bad "…no loud log lines for the unreadable mother: $(grep -c tt-mother "$VDAC_LOG") mentions"
+fi
+if grep -q 'Lane picks — small: tt-' "$VDAC_LOG"; then bad "…a bead was picked although the children could not be read: $(grep 'Lane picks' "$VDAC_LOG" | head -2)"; else ok "…and nothing is picked this sweep"; fi
+
+rm -f "$STATE/store-reads.log"
+FV4="$(run_emit)"
+if jq -e '(.items | length) > 0' "$FV4" >/dev/null 2>&1 && ! grep -q 'EXCLUÍDO .* por _filter_open_children' "$VDAC_LOG"; then
+  ok "the default fixture (the store answers []): nothing held back, the emit is not empty"
+else
+  bad "the default fixture changed: items=$(jq -c '[.items[].id]' "$FV4" 2>/dev/null) log=$(grep -c 'EXCLUÍDO .* por _filter_open_children' "$VDAC_LOG")"
 fi
 
 echo "Scenario 19h: emit chain = real dispatch chain (ga-aprov: no blocked/manual/waiting leak into Aprovadas)"
