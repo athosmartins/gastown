@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import threading
@@ -56,7 +57,24 @@ import jev_preambulo_experiment as pe  # noqa: E402
 MODE_VIVO = "preambulo_vivo"
 FASE_VIVO = "vivo"
 ARMS = ("experiment", "control")
-DEADLINE_S = float(os.environ.get("JEV_PREAMBULO_CLAIM_DEADLINE_S", "25"))  # whole decision: bead read + Jev call
+DEFAULT_DEADLINE_S = 25.0
+
+
+def parse_deadline(raw: str | None) -> float:
+    """The decision deadline in seconds from JEV_PREAMBULO_CLAIM_DEADLINE_S. vazio/ausente -> the default (25 s);
+    falhou/ilegivel (not a number, nan, inf, zero, negative, or larger than threading.TIMEOUT_MAX, which Thread.join
+    rejects with OverflowError) -> ALSO the default: a bad env var must not crash the import (the session would get rc=1
+    and an empty stdout) nor turn into an infinite or instant deadline."""
+    if raw is None or not raw.strip():
+        return DEFAULT_DEADLINE_S
+    try:
+        v = float(raw)
+    except ValueError:
+        return DEFAULT_DEADLINE_S
+    return v if math.isfinite(v) and 0 < v <= threading.TIMEOUT_MAX else DEFAULT_DEADLINE_S
+
+
+DEADLINE_S = parse_deadline(os.environ.get("JEV_PREAMBULO_CLAIM_DEADLINE_S"))  # whole decision: bead read + Jev call
 EXIT_NO_POLICY = 3
 
 
@@ -114,9 +132,18 @@ def notice_no_policy(reason: str, role: str | None) -> str:
         "## Doutrina por tarefa — NÃO CARREGADA (ga-aijm2v.13)\n"
         f"O carregador não conseguiu decidir quais seções opcionais faltam ({reason}).\n"
         "Trate TODA a doutrina opcional como pendente: leia o arquivo inteiro antes de seguir —\n"
-        f"{fragment_path()}\n"
+        f"{_fragment_path_text()}\n"
         f"(papel pedido: {role or 'não informado'}). Procure os blocos marcados `td:<id>` que o seu prime não trouxe.\n"
     )
+
+
+def _fragment_path_text() -> str:
+    """The fragment path for the notice. falhou -> a fixed hint instead of an exception: the notice is the LAST thing a
+    session can read when the loader is down, so building it must never be the thing that raises."""
+    try:
+        return str(fragment_path())
+    except Exception:  # noqa: BLE001
+        return "packs/town-deltas/template-fragments/town-deltas.template.md (em $GC_CITY_PATH)"
 
 
 # ── the decision ───────────────────────────────────────────────────────────────────────
@@ -211,10 +238,21 @@ def _stamp(rec: dict, *, bead_id: str, arm: str, kept: list[str], cut: list[str]
     return rec
 
 
-def run_claim(*, bead_id: str, store: str, role: str, arm: str, show_all: bool = False, dry_run: bool = False,
-              ask=pe.call_jev_noul_multi, read_bead=None, log_path=None, deadline_s: float | None = None,
-              policy: dict | None = None) -> tuple[int, str]:
-    """(exit code, text for the session's stdout). Never raises. Writes at most one record (not on dry-run/control)."""
+def run_claim(**kw) -> tuple[int, str]:
+    """(exit code, text for the session's stdout). Never raises (bar KeyboardInterrupt): whatever _run_claim did not
+    already turn into a fail-open or a policy notice -- a policy script that raises at import, a render or stamp bug --
+    becomes the exit-3 "NÃO CARREGADA" notice that names the fragment, so the session reads the doctrine in full
+    instead of getting rc=1 and an empty stdout. Arguments: see _run_claim."""
+    try:
+        return _run_claim(**kw)
+    except (Exception, SystemExit) as e:  # noqa: BLE001 - nothing may escape into the session's first minute
+        return EXIT_NO_POLICY, notice_no_policy(f"erro inesperado: {type(e).__name__}: {e}"[:300], kw.get("role"))
+
+
+def _run_claim(*, bead_id: str, store: str, role: str, arm: str, show_all: bool = False, dry_run: bool = False,
+               ask=pe.call_jev_noul_multi, read_bead=None, log_path=None, deadline_s: float | None = None,
+               policy: dict | None = None) -> tuple[int, str]:
+    """The body of run_claim. Writes at most one record (not on dry-run/control)."""
     t0 = time.time()
     if arm == "control":
         return 0, ("## Doutrina por tarefa (ga-aijm2v.13): braço controle — a doutrina completa já veio no prime; "
@@ -226,6 +264,8 @@ def run_claim(*, bead_id: str, store: str, role: str, arm: str, show_all: bool =
         texts = section_texts(policy)
     except pe.PolicyError as e:
         return EXIT_NO_POLICY, notice_no_policy(str(e)[:300], role)
+    except (Exception, SystemExit) as e:  # noqa: BLE001 - e.g. the policy script raising RuntimeError/SystemExit at import
+        return EXIT_NO_POLICY, notice_no_policy(f"{type(e).__name__}: {e}"[:300], role)
     if role not in policy["eligible"]:
         return EXIT_NO_POLICY, notice_no_policy(f"papel desconhecido: {role!r}", role)
     eligible = list(policy["eligible"][role])

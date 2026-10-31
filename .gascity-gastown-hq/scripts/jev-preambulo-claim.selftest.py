@@ -27,6 +27,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -122,6 +123,17 @@ def test_sections():
     ok("Jev needs everything: all eligible sections printed, in fragment order",
        rc == 0 and printed(out) == ELIG, str(printed(out)))
     ok("each printed section is byte-for-byte its fragment text", all(TEXTS[s] in out for s in ELIG))
+    # TEXTS comes from the loader's own section_texts(), so the line above cannot catch an error in section_texts itself.
+    # The independent pin: the prime's own renderer (pool-preamble-build.py role_text) must contain every eligible text verbatim.
+    ppb = POL["ppb"]
+    blocks = ppb.parse_fragment(ppb.FRAGMENT.read_text(encoding="utf-8"))
+    ok("precondition: the dog has eligible sections (else the per-role pin below proves nothing)", bool(ELIG))
+    for role, secs in POL["eligible"].items():
+        rendered = ppb.role_text(blocks, POL["manifest"], role)
+        bad = [s for s in secs if TEXTS[s] not in rendered]
+        ok(f"role {role}: every eligible section's text appears verbatim in the prime's own render (ppb.role_text)", not bad, str(bad))
+    ok("...control: that check is capable of failing (a one-character-off text is NOT found in the render)",
+       (TEXTS[ELIG[0]] + "x") not in ppb.role_text(blocks, POL["manifest"], "dog"))
     ok("nothing outside the eligible set is ever printed (a core section's text is absent)", TEXTS["rule-1"][:80] not in out)
 
 
@@ -262,6 +274,43 @@ def test_policy_down():
     ok("end to end through the CLI: assets dir with no loader -> exit 3 and the notice on STDOUT (where the session reads)",
        r.returncode == 3 and "NÃO CARREGADA" in r.stdout, f"rc={r.returncode} out={r.stdout[:120]!r} err={r.stderr[:120]!r}")
 
+    # A policy script that raises something load_policy() does not list (RuntimeError) or exits (SystemExit) at import:
+    # before, the CLI died with rc=1, a traceback on stderr and an EMPTY stdout. Now it is the same exit-3 notice.
+    for label, body in (("raises RuntimeError at import", "raise RuntimeError('boom')\n"), ("calls sys.exit(5) at import", "import sys\nsys.exit(5)\n")):
+        bad = Path(tempfile.mkdtemp(prefix="claim-selftest-"))
+        (bad / "pool-preamble-build.py").write_text(body, encoding="utf-8")
+        env = dict(os.environ, JEV_PREAMBULO_ASSETS=str(bad), JEV_EXPERIMENT_LOG=str(tmp / "log.jsonl"), PYTHONDONTWRITEBYTECODE="1")
+        r = subprocess.run([sys.executable, str(HERE / "jev_preambulo_claim.py"), "--bead", "ga-x", "--role", "dog", "--arm", "experiment"],
+                           capture_output=True, text=True, env=env, timeout=60)
+        ok(f"a policy script that {label}: exit 3 and the notice on STDOUT, never rc=1 with an empty stdout",
+           r.returncode == 3 and "NÃO CARREGADA" in r.stdout and str(bad.parent / "template-fragments" / "town-deltas.template.md") in r.stdout, f"rc={r.returncode} out={r.stdout[:160]!r} err={r.stderr[:160]!r}")
+    # Anything else that blows up AFTER the policy loaded (here: stamping the record) is the same notice, not a traceback.
+    with mock.patch.object(cl, "_stamp", side_effect=TypeError("stamp bug")):
+        rc, out, recs = run(ask=fake_ask(p=0.9))
+    ok("an unexpected exception after the policy loaded: run_claim still returns (exit 3, the notice names the error)",
+       rc == 3 and "NÃO CARREGADA" in out and "TypeError" in out, out[:200])
+
+    # The deadline env var: a bad value is the default, never an import crash (before: ValueError/OverflowError, rc=1, empty stdout).
+    for raw in (None, "", "  ", "abc", "nan", "inf", "-inf", "0", "-3", "1e300"):
+        ok(f"JEV_PREAMBULO_CLAIM_DEADLINE_S={raw!r} -> the default {cl.DEFAULT_DEADLINE_S} s", cl.parse_deadline(raw) == cl.DEFAULT_DEADLINE_S, str(cl.parse_deadline(raw)))
+    ok("...and a good value is honoured (control: the parser is not just returning the default)", cl.parse_deadline("7.5") == 7.5)
+    def join_accepts(seconds: float) -> bool:
+        th = threading.Thread(target=lambda: None)
+        th.start()
+        try:
+            th.join(seconds)
+            return True
+        except OverflowError:
+            return False
+    ok("...control: Thread.join really does reject a raw 1e300 (so the 1e300 case above is a real one)", not join_accepts(float("1e300")))
+    ok("...and every parsed deadline is one Thread.join accepts", all(join_accepts(cl.parse_deadline(r)) for r in ("1e300", "7.5", "abc")))
+    for raw in ("abc", "nan", "inf"):
+        env = dict(os.environ, JEV_PREAMBULO_CLAIM_DEADLINE_S=raw, PYTHONDONTWRITEBYTECODE="1")
+        r = subprocess.run([sys.executable, str(HERE / "jev_preambulo_claim.py"), "--bead", "ga-x", "--role", "dog", "--arm", "control"],
+                           capture_output=True, text=True, env=env, timeout=60)
+        ok(f"the CLI starts with JEV_PREAMBULO_CLAIM_DEADLINE_S={raw}: rc 0 and the control line (no import crash)",
+           r.returncode == 0 and "braço controle" in r.stdout, f"rc={r.returncode} err={r.stderr[-160:]!r}")
+
 
 # ── G ───────────────────────────────────────────────────────────────────────────────
 def test_isolation():
@@ -270,10 +319,26 @@ def test_isolation():
     tmp = Path(tempfile.mkdtemp(prefix="claim-selftest-"))
     log = tmp / "jev.jsonl"
     log.write_text(json.dumps(recs[0]) + "\n", encoding="utf-8")
+    live = recs[0]
+    # Precondition for every check below: the live record is one each consumer WOULD count if it lost its mode filter
+    # (an answered record with an entity id, on the experiment arm). Without it a "== empty" result below proves nothing.
+    ok("precondition: the live record is answered, has an entity id and is on the experiment arm",
+       live.get("mode") == cl.MODE_VIVO and live.get("jev_status") == "ok" and bool(live.get("entity_id")) and live.get("arm") == "experiment", str(live)[:200])
+    # Each consumer is checked twice: the live record yields nothing, AND the SAME record with only its mode changed IS
+    # seen. The second half is what shows the first half can fail (summarize() returns {experiment: {counter: n}}, so a
+    # sum over its top-level values is 0 for ANY input and would stay green if the record leaked).
     ok("the shadow's load_done ignores a live record (the shadow still processes that bead)", pe.load_done(log) == set())
-    ok("the preambulo report's dedupe ignores it (A/A numbers stay the shadow's)", rp.dedupe_records([recs[0]]) == [])
-    s = jr.summarize([recs[0]])
-    ok("the daily suppression report counts nothing from it", sum(v for v in s.values() if isinstance(v, (int, float))) == 0, str(s)[:200])
+    seen_log = tmp / "seen.jsonl"
+    seen_log.write_text(json.dumps(dict(live, mode=pe.MODE)) + "\n", encoding="utf-8")
+    ok("...control: the same record under the shadow's mode IS seen by load_done", pe.load_done(seen_log) == {live["entity_id"]}, str(pe.load_done(seen_log)))
+    ok("the preambulo report's dedupe ignores it (A/A numbers stay the shadow's)", rp.dedupe_records([live]) == [])
+    ok("...control: the same record under the report's mode IS counted by dedupe_records",
+       len(rp.dedupe_records([dict(live, mode=pe.MODE)])) == 1)
+    s = jr.summarize([live])
+    ok("the daily suppression report counts nothing from it (summarize() == {})", s == {}, str(s)[:200])
+    sc = jr.summarize([{k: v for k, v in live.items() if k != "mode"}])
+    ok("...control: the same record WITHOUT a mode IS counted by summarize() (one experiment_fired)",
+       sum(c.get("experiment_fired", 0) for c in sc.values()) == 1, str(sc)[:200])
 
     section("H. a record that cannot be written never costs the session its doctrine")
     blocker = tmp / "a-file"
