@@ -4,7 +4,7 @@
 
 • Regra e estado (INERTE) · O que há no repositório · Como o classificador decide
 • A escada de modos do Pilot · N slots: o modo `pilot` (ga-2hd02v.3)
-• A passada de WA no nó: `PILOT_WA_NODE_EXEMPT` (ga-2hd02v.9) · Auditoria dos `wa-worker*` do Pilot
+• A vaga do P0/P1 quando o gancho falha (ga-2hd02v.3.26) · A passada de WA no nó: `PILOT_WA_NODE_EXEMPT` (ga-2hd02v.9) · Auditoria dos `wa-worker*` do Pilot
 • Como ligar, passo a passo · Como desligar · O que depende de outras histórias
 • A prova do dia seguinte: `wa-node-report.py` (ga-2hd02v.3) · O que não foi provado
 
@@ -121,6 +121,16 @@ O que muda: o `apply` desconta as ociosas da conta de slots e **prefere reaprove
 **Limites que ficam** (ver "O que não foi provado"): o teto do engine está em `agents/wa-worker-remote/agent.toml` (5) e o do host em `.gc/session-ssh.json` (`cap` 10 em 31/10, dividido com `dog-remote` e `gate-reviewer`); `PILOT_WA_NODE_SLOTS` não passa de nenhum dos dois. Desfazer não conferido deixa a bead com o dono: as varreduras seguintes a **seguram** (2) até alguém a soltar à mão com `wa-node-dispatch.sh release <bead>` e `bd update <bead> --status open`.
 
 **A janela é o oráculo, não o N.** O N é só o teto de quantas sessões podem existir; quantas cabem agora quem diz é o `hetzner-capacity.py` (passos de CPU e RAM, `hetzner-capacity.md`). A sessão de WA conta como sempre-ocupada, então **não foi preciso mudar o oráculo**. O que segura a ocupação do nó hoje não são os slots, é a **elegibilidade**: medido em 20/10, dos 167 beads WA abertos e `story:approved`, só 5 são `node` (99 `mini`, 63 `unknown`). Mais de ~5 slots rende pouco até a elegibilidade subir; o `shadow` mede isso antes de alargar.
+
+## A vaga do P0/P1 quando o gancho falha (ga-2hd02v.3.26)
+
+Medido em 31/10: a P1 `wa-s46yz2.1` foi ao nó (`apply` rc 0), o gancho não leu a lista de sessões, desfez a escrita e a bead voltou; na MESMA varredura a passada só-nó do disk floor deu o nó à P3 `wa-x5zg10`. E o alias que o `apply` escolhe (`remote-1`, «sessão ociosa reaproveitada») ganhou sessão viva ~19 s depois, antes de o gancho abrir. Três correções, cada uma com a sua chave:
+
+* **Reserva por varredura (`PILOT_WA_NODE_RESERVE`, padrão ligado; `0` desliga).** Quando o gancho NÃO põe no nó um P0/P1 (desfeito = 1, ou segurado = 2, ou rc incerto do `apply`), o nó fica reservado para ele até o fim da varredura: P2..P4 não toma a vaga, nem no gancho nem na passada só-nó. Vale só dentro da varredura (a próxima recomeça do zero) e só para P0/P1 sem o mini de reserva; classe de prioridade ilegível nunca segura ninguém. O resumo da passada de WA ganhou `node_reserved`. P0/P1 que a passada solta sem chegar ao `apply` deixa de ser memorizada como `released` por 15 min.
+* **Alias ocupado é pulado (`WA_NODE_SKIP_ALIASES`).** O `wa-node-dispatch.sh apply` aceita uma lista (espaço ou vírgula) de aliases que ele não escolhe, mas que ainda contam como ocupados na conta de slots; sem alias livre sobra o rc 12. Quando a abertura falha só porque o alias já tinha sessão viva (rc 1, `busy`, `wa-worker-remote-N`), o gancho refaz o `apply` sem ele, no máximo `min(PILOT_WA_NODE_SLOTS-1, 2)` vezes e só com o orçamento de spawn e o despacho de pé. Lista ilegível, decisão, sessão que não abre e aviso que falha não são do alias: não há nova tentativa.
+* **A passada só-nó do disk floor respeita a retenção.** `_pilot_node_only_wa_pre` consulta `_pilot_node_p2_hold_for` (reserva ou waiter da cessão com veredito final) antes de gastar a sonda: a P2+ retida fica fora do nó nesta varredura, sem sonda e sem claim.
+
+Prova viva (24 h do `pilot-dispatcher.log` depois do reload do Pilot): nenhuma linha «alias já tem uma sessão viva» e nenhuma P2+ indo ao nó numa varredura em que um P0/P1 teve o gancho falhado.
 
 ## A passada de WA no nó: `PILOT_WA_NODE_EXEMPT` (ga-2hd02v.9)
 
