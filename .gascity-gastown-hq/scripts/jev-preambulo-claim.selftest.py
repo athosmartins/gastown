@@ -178,6 +178,11 @@ def test_fail_open():
     with mock.patch.object(cl.pe, "process_entity", return_value=("outcome_nobody_wrote_for", "x")):
         rc, out, recs = run()
     cases.append(("the shadow's code returns a status this loader does not know", rc, out, recs, "estado_desconhecido"))
+    # run_claim re-forces the full list whenever fail_open is set, so it cannot show what decide() itself returned: ask it directly.
+    with mock.patch.object(cl.pe, "process_entity", return_value=("outcome_nobody_wrote_for", "x")):
+        d = cl.decide("ga-t1", "/fake/store", "dog", POL, read_bead=lambda s, b: bead())
+    ok("decide() itself keeps every eligible section for an unknown status and names it (not only the belt-and-braces in run_claim)",
+       d["kept"] == ELIG and d["cut"] == [] and str(d["fail_open"]).startswith("estado_desconhecido"), str(d["fail_open"]))
     for label, rc, out, recs, reason in cases:
         ok(f"{label}: rc 0 and EVERY eligible section printed", rc == 0 and printed(out) == ELIG, str(printed(out)))
         ok(f"{label}: the header says Jev did not decide, nothing dispensed", "COMPLETA, nada foi dispensado" in out)
