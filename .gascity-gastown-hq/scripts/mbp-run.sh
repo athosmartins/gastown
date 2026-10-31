@@ -50,8 +50,10 @@
 #   --EXEC        (ga-kfxzpt) sem --node-first o --exec é só do MBP, como sempre: o build de Go (--go), o laboratório do Dolt e a conferência do jsonl levam variáveis, binários e dados que NÃO podem ir ao servidor alugado.
 #                 Com --node-first a cadeia é a mesma (nó -> MBP; 96..99 quando nenhum rodou) e o nó só entra se: (1) o preflight dele diz `rea_tools=<lista>` (hetzner-rea-tools.sh install; `none` = nunca instalado,
 #                 vazio = marcador ilegível ou meio instalado: o nó NÃO é usado) e o comando não cita uma ferramenta conhecida (rea, ghidra, adb...) que a lista não tem; (2) cada --push é UM arquivo comum de pacote de app
-#                 (apk, aab, jar, asar, so, exe...) de até HETZNER_EXEC_PUSH_MAX_MB (1024): o --exec não passa por filtro nem por varredura de conteúdo, então diretório, link e qualquer outra extensão ficam no MBP;
-#                 (3) nenhum --env tem nome de segredo (TOKEN, SECRET, KEY, PASS, AUTH, COOKIE, CRED, SESSION). rc 126/127 do nó (o shell não achou ou não executou o comando) não é veredito: o comando roda no MBP.
+#                 (apk, aab, jar, asar, so, exe...) de até HETZNER_EXEC_PUSH_MAX_MB (1024); diretório, link e qualquer outra extensão ficam no MBP. O --exec não passa pelo filtro nem pelo node_guard do pytest, então o CONTEÚDO é conferido por
+#                 scripts/hetzner-push-scan.py (ga-jq08gyi): os magic bytes do tipo que o nome diz e a lista de telefones/CPFs (os limiares do hetzner-pii-scan.py) no arquivo e em CADA membro de zip, recursivo; retido ou "não deu para ler" = MBP;
+#                 (3) só vão ao nó os --env da ALLOWLIST (JADX_HEAP_MB, APKTOOL_HEAP_MB e REA_*; o veto por nome de segredo — TOKEN, SECRET, KEY, PASS, AUTH, COOKIE, CRED, SESSION — vale por cima) e nenhum valor de --env nem palavra do comando
+#                 tem cara de credencial (JWT, sk-, Bearer, chave privada, token de provedor, URL com usuário:senha@). O que não passa roda no MBP, não é erro. rc 126/127 do nó (o shell não achou ou não executou o comando) não é veredito: o comando roda no MBP.
 #                 O scratch do nó nasce VAZIO a cada execução e é apagado ao fim; o ssh que cai no meio não deixa apagar, e as capturas ficam lá até o próximo uso do mesmo slot. Só comando de leitura/recon: a queda no meio refaz tudo no host seguinte.
 #   SEGURANÇA     o rsync para o nó usa SÓ scripts/hetzner-rsync-filter.wa.txt, com --delete-excluded. O filtro olha NOME e pasta, nunca o conteúdo: nome de segredo
 #                 ou de dado conhecido não sai, e fora de tests/ só sai código e os arquivos de dado/config listados POR CAMINHO (nome desconhecido fica inerte).
@@ -1266,14 +1268,34 @@ NODE_EXEC_EXT=" apk apks xapk apkm aab dex jar aar so dylib asar exe dll ipa "  
 NODE_EXEC_MAX_MB=$(num_or "${HETZNER_EXEC_PUSH_MAX_MB:-1024}" 1024); [ "$NODE_EXEC_MAX_MB" -ge 1 ] || NODE_EXEC_MAX_MB=1024
 # ferramentas que o REA costuma chamar: comando que cita uma que o nó não lista vai direto ao MBP, sem empurrar o arquivo em vão. É economia, não segurança: o que ela não pega, o rc 126/127 do nó pega
 NODE_EXEC_KNOWN=" rea ghidra ghidraRun analyzeHeadless jadx apktool java adb hopper ida idat "
+# ga-jq08gyi: ALLOWLIST de NOMES de --env que vão ao nó (o que não está nela deixa o --exec no MBP, que é o notebook do Athos; o nó é um servidor alugado): os heaps dos wrappers do hetzner-rea-tools.sh e, no
+# node_exec_gate, o prefixo REA_ (o que o REA lê). O veto por nome de segredo (TOKEN, SECRET, KEY...) continua valendo POR CIMA, para o prefixo (REA_API_TOKEN).
+NODE_EXEC_ENV_OK=" JADX_HEAP_MB APKTOOL_HEAP_MB "
+# cred_refuse <motivo> <mensagem> <texto...>: valor de --env ou palavra do comando com CARA de credencial (JWT, sk-..., Bearer, chave privada, token de provedor, URL com usuário:senha@). Quem olha é
+# hetzner-push-scan.py --creds: o MESMO Python aqui e no selftest (a regex NÃO é de grep, cujo dialeto muda entre o macOS, que roda isto, e o Linux, onde se testa). Heurística de FORMA: erra para o lado do MBP, que custa só o nó
+# parado. No --env, o segredo sem forma conhecida quem barra é a allowlist de nomes acima; no argv do comando esta é a ÚNICA barreira (credencial sem forma conhecida passa). 0 = RECUSA: achou (rc 1), ou NÃO consegui olhar (rc 3,
+# python3 ou o script ausentes, sinal) e então o motivo é credencial-ilegivel, nunca "achei"; 1 = limpo, e SÓ o rc 0 do varredor vale como limpo. O texto nunca é impresso.
+cred_refuse() {
+  local reason=$1 msg=$2 out rc; shift 2
+  # vazio → o varredor não imprimiu nada: vale o rc dele, e só o 0 é "limpo"; falhou/ilegível → rc ≠ 0 e ≠ 1 (erro, python3 ou o script ausentes, sinal): RECUSA com credencial-ilegivel, nunca "limpo"
+  out=$(python3 -I "$HERE/hetzner-push-scan.py" --creds -- "$@" 2>&1); rc=$?
+  case $rc in
+    0) return 1 ;;
+    1) say "$msg" ;;
+    *) say "não consegui conferir se há credencial no que iria ao $HNAME (rc=$rc${out:+: $out}) — vai ao MBP"; reason=credencial-ilegivel ;;
+  esac
+  fall "$reason" 97; return 0
+}
 
-# node_push_ok <caminho>: 0 = pode ir ao nó. O --exec não passa por filtro nem por varredura de conteúdo (o pytest passa pelos dois), então a fronteira é a FORMA: UM arquivo comum (nem diretório nem link) de pacote de app, até NODE_EXEC_MAX_MB.
+# push_ext <caminho>: a extensão em minúsculas (vazio = nome sem ponto). Uma conta só, para a FORMA (node_push_ok) e o CONTEÚDO (node_push_scan) lerem o mesmo tipo.
+push_ext() { local b=${1##*/}; case "$b" in *.*) printf '%s' "${b##*.}" | tr 'A-Z' 'a-z' ;; esac; }
+# node_push_ok <caminho>: 0 = pode ir ao nó, pela FORMA: UM arquivo comum (nem diretório nem link) de pacote de app, até NODE_EXEC_MAX_MB. O CONTEÚDO é do node_push_scan, logo abaixo (o --exec não passa pelo node_guard do pytest).
 node_push_ok() {
-  local p="$1" b ext="" sz
+  local p="$1" ext sz
   case "$p" in -*) say "push '$p': caminho que começa com '-' seria lido como opção pelo rsync — fica no MBP"; return 1 ;; esac
   [ -f "$p" ] && [ ! -L "$p" ] || { say "push '$p': só arquivo comum vai ao $HNAME (diretório, link e caminho ausente ficam no MBP)"; return 1; }
   # vazio → nome sem ponto: a extensão fica vazia, não casa a lista e o push é recusado (nunca "sem extensão = vale")
-  b=${p##*/}; case "$b" in *.*) ext=$(printf '%s' "${b##*.}" | tr 'A-Z' 'a-z') ;; esac
+  ext=$(push_ext "$p")
   case "$NODE_EXEC_EXT" in *" $ext "*) ;; *) say "push '$p': a extensão '${ext:-nenhuma}' não é de pacote de app — fica no MBP"; return 1 ;; esac
   # vazio/falhou → wc sem número: "não consegui medir" recusa, nunca "cabe"
   sz=$(wc -c < "$p" 2>/dev/null | tr -d ' ')
@@ -1281,9 +1303,24 @@ node_push_ok() {
   [ "$sz" -le $(( NODE_EXEC_MAX_MB * 1048576 )) ] || { say "push '$p': $(( sz / 1048576 )) MB passa do teto de ${NODE_EXEC_MAX_MB} MB — fica no MBP"; return 1; }
   return 0
 }
+# node_push_scan <caminho>: o CONTEÚDO do pacote (ga-jq08gyi). A extensão é só o NOME: um .jar/.apks/.asar pode carregar uma lista de leads. hetzner-push-scan.py confere os magic bytes do tipo que o nome diz e varre o arquivo e cada
+# membro de zip (recursivo) com o critério do hetzner-pii-scan.py. Só o rc 0 dele deixa passar: 1 = retido (conteúdo ou tipo), 3 = não deu para ler, e QUALQUER outro (2 uso, 126/127 sem python3 ou sem o script, sinal) é "não sei" =
+# o nó NÃO é usado. Erro e "nada retido" não são a mesma coisa. PUSH_WHY leva o motivo para o log. LIMITE: é um retrato de segundos antes da cópia; arquivo editado nessa janela não é revarrido (como o node_guard).
+PUSH_WHY=""
+node_push_scan() {
+  local p="$1" out rc
+  # vazio → sem saída: vale o rc; falhou/ilegível → rc ≠ 0 e ≠ 1 (python3 ou o script ausentes, erro, sinal): push-ilegivel e o nó NÃO é usado, nunca "nada retido"
+  out=$(python3 -I "$HERE/hetzner-push-scan.py" "$(push_ext "$p")" "$p" 2>&1); rc=$?
+  case $rc in
+    0) return 0 ;;
+    1) say "push '$p': $out — fica no MBP"; PUSH_WHY=push-conteudo ;;
+    *) say "push '$p': não consegui conferir o conteúdo (rc=$rc${out:+: $out}) — fica no MBP"; PUSH_WHY=push-ilegivel ;;
+  esac
+  return 1
+}
 # node_exec_gate <comando...>: o --exec pode ir ao nó? Usa o PF do preflight deste host (já lido), pushes e envs. 0 = vai · 98/97 = não vai: o motivo fica no log (fall) e quem chama tenta o MBP.
 node_exec_gate() {
-  local rt w p kv k
+  local rt w p kv k n ok lst
   # vazio → rea_tools ausente do preflight ou ilegível no nó = "não sei" = o nó NÃO é usado (nunca "nenhuma ferramenta" nem "todas"); none = o nó nunca recebeu as ferramentas
   rt=$(pf_get rea_tools)
   case "$rt" in
@@ -1295,9 +1332,17 @@ node_exec_gate() {
   done
   for p in "${pushes[@]+"${pushes[@]}"}"; do [ -n "$p" ] || continue; node_push_ok "$p" || { fall push-recusado 97; return 97; }; done
   for kv in "${envs[@]+"${envs[@]}"}"; do
-    k=$(printf '%s' "${kv%%=*}" | tr 'a-z' 'A-Z')
+    [ -n "$kv" ] || continue   # vazio → o --env sem valor: o job também o ignora (_attempt_exec); nada a conferir
+    n=${kv%%=*}; k=$(printf '%s' "$n" | tr 'a-z' 'A-Z')
     case "$k" in *TOKEN*|*SECRET*|*KEY*|*PASS*|*AUTH*|*COOKIE*|*CRED*|*SESSION*) say "--env $k parece segredo: não vai ao $HNAME"; fall env-recusado 97; return 97 ;; esac
+    # allowlist (ga-jq08gyi): nome inválido (vazio, com espaço, começando por dígito) nunca está nela, e nome da lista só vale com a MESMA caixa; fora dela = o MBP, com o nome (nunca o valor) na mensagem
+    ok=0; case "$n" in ''|[0-9]*|*[!A-Za-z0-9_]*) ;; REA_*) ok=1 ;; *) case "$NODE_EXEC_ENV_OK" in *" $n "*) ok=1 ;; esac ;; esac
+    if [ $ok -ne 1 ]; then lst=${NODE_EXEC_ENV_OK# }; say "--env $(printf '%q' "$n") não está na lista de nomes que vão ao $HNAME (${lst% }, REA_*) — vai ao MBP"; fall env-fora-da-lista 97; return 97; fi
+    cred_refuse env-valor-credencial "--env $n tem valor com cara de credencial (JWT, sk-, Bearer, chave, URL com senha...): não vai ao $HNAME" "${kv#*=}" && return 97
   done
+  cred_refuse argv-credencial "um argumento do comando tem cara de credencial (JWT, sk-, Bearer, chave, URL com senha...): não vai ao $HNAME" "$@" && return 97
+  # o CONTEÚDO por último: é a checagem cara (lê o pacote inteiro) e as baratas acima já podem ter deixado o comando no MBP
+  for p in "${pushes[@]+"${pushes[@]}"}"; do [ -n "$p" ] || continue; node_push_scan "$p" || { fall "$PUSH_WHY" 97; return 97; }; done
   return 0
 }
 scratch_clean() { "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "find $X -mindepth 1 -delete" >/dev/null 2>&1 || say "AVISO: scratch $X não foi limpo"; }   # X: o scratch da tentativa (global, como SLOT e RC)

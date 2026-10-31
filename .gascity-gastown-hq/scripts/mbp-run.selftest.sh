@@ -50,8 +50,9 @@
 #   marcador ausente/vazio, sem browsers/, libpath ausente/vazio/ilegível = NENHUMA das duas (e o LD_LIBRARY_PATH de antes fica como estava); o bloco que o mbp-run mandou roda DE VERDADE num HOME de teste; 4 mutantes (uma porta cada).
 #   Fora do pytest do nó (job do MBP, selftest do hq) o bloco não existe.
 # --EXEC NO NÓ (ga-kfxzpt; MBP_SELFTEST_ONLY=nodeexec roda só esta parte): sem --node-first o --exec nunca toca o nó; com ele a cadeia nó -> MBP e as portas do nó: o marcador de ferramentas (rea_tools none / vazio / lista), o comando que cita
-#   ferramenta que o nó não tem, o push só de UM arquivo comum de pacote de app, o --env com nome de segredo, o rc 126/127 do nó que não é veredito (o scratch sai mesmo com --keep) e o scratch que nasce vazio; o job do nó roda DE VERDADE (JAVA_HOME,
-#   PATH, REA_JADX_MCP_JAR); 4 controles negativos (uma porta cada).
+#   ferramenta que o nó não tem, o push só de UM arquivo comum de pacote de app, o rc 126/127 do nó que não é veredito (o scratch sai mesmo com --keep) e o scratch que nasce vazio; o job do nó roda DE VERDADE (JAVA_HOME,
+#   PATH, REA_JADX_MCP_JAR). ga-jq08gyi: o --env é ALLOWLIST de nomes (com o veto por nome de segredo por cima), valor de --env e palavra do comando com cara de credencial ficam no MBP, e o CONTEÚDO do --push é conferido por
+#   hetzner-push-scan.py (magic bytes, lista de telefones/CPFs em cada membro de zip, aninhado, gzip/bzip2/xz, tetos; fixtures sintéticos gerados aqui). Um controle negativo por porta, no mbp-run.sh e no varredor.
 # MBP_RUN_UNDER_TEST=<script> roda a mesma bateria contra outro mbp-run.sh (ex.: o antigo, para ver os testes novos falharem).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -1270,7 +1271,61 @@ tools_on() { mkdir -p "$RT/bin"; for t in java jadx apktool; do printf '#!/bin/s
 tools_off() { rm -f "$RT/ready" "$RT/bin/java" "$RT/bin/jadx" "$RT/bin/apktool" "$RT/jadx-headless-mcp.jar"; }
 xrun() { "$RUN" --exec --node-first "$@" >"$T/out" 2>"$T/err"; echo $?; }
 nready() { reset; date > "$NODEFLAG"; tools_on "$@"; }   # nó ligado e com as ferramentas
-echo x > "$T/in.apk"; echo x > "$T/x.json"; echo x > "$T/UP.APK"; mkdir -p "$T/pdir"; ln -sf "$T/in.apk" "$T/link.apk"; dd if=/dev/zero of="$T/big.apk" bs=1048576 count=2 2>/dev/null
+# fixtures de pacote SINTÉTICOS, gerados aqui (nenhum binário no repo): a partir do ga-jq08gyi o nó confere o CONTEÚDO do --push, então "echo x > in.apk" deixou de ser um pacote. Telefones e CPFs saem de um gerador
+# com semente fixa (nenhuma lista literal neste arquivo); a premissa "o oráculo conta N" é conferida mais abaixo contra o hetzner-pii-scan.py de verdade.
+cat > "$T/mkfix.py" <<'PYEOF'
+import bz2, gzip, io, json, lzma, random, struct, sys, zipfile
+def phones(n):
+    r = random.Random(7)
+    return ["+55 %d 9%04d-%04d" % (r.randint(11, 99), r.randint(1000, 9999), r.randint(1000, 9999)) for _ in range(n)]
+def cpfs(n):
+    r = random.Random(11)
+    return ["%03d.%03d.%03d-%02d" % (r.randint(100, 999), r.randint(100, 999), r.randint(100, 999), r.randint(10, 99)) for _ in range(n)]
+def csv(n, k="tel"):
+    return ("lead,contato\n" + "".join("lead-%d,%s\n" % (i, v) for i, v in enumerate(phones(n) if k == "tel" else cpfs(n)))).encode()
+M = [("AndroidManifest.xml", b"\x03\x00\x08\x00" + bytes(range(64)) * 4), ("classes.dex", b"dex\n035\x00" + bytes(range(256)) * 8), ("resources.arsc", b"\x02\x00\x0c\x00" + bytes(200)),
+     ("lib/arm64-v8a/libx.so", b"\x7fELF\x02\x01\x01" + bytes(100)), ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n"), ("assets/vazio.txt", b"")]   # o esqueleto de um APK pequeno, com um membro de 0 bytes
+def mkzip(members, method=zipfile.ZIP_DEFLATED):
+    b = io.BytesIO()
+    with zipfile.ZipFile(b, "w", method) as z:
+        for name, data in members:
+            z.writestr(name, data)
+    return b.getvalue()
+def asar(files):   # cabeçalho de pickle do Chromium: [4][tamanho do cabeçalho][tamanho do payload][tamanho do JSON][JSON + pad], depois os arquivos CRUS, sem compressão
+    off, ents, blobs = 0, {}, b""
+    for k, v in files:
+        ents[k] = {"size": len(v), "offset": str(off)}; blobs += v; off += len(v)
+    js = json.dumps({"files": ents}).encode()
+    payload = struct.pack("<I", len(js)) + js + b"\0" * (-len(js) % 4)
+    hb = struct.pack("<I", len(payload)) + payload
+    return struct.pack("<II", 4, len(hb)) + hb + blobs
+kind, out = sys.argv[1], sys.argv[2]
+n = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+arg = sys.argv[4] if len(sys.argv) > 4 else ""
+lead = [("dados/leads.csv", csv(n, arg or "tel"))] if n else []
+if kind == "apk": data = mkzip(M + lead)                                                  # n telefones (ou CPFs, arg=cpf) num membro deflate
+elif kind == "csv": data = csv(n, arg or "tel")                                           # só o CSV, para a premissa contra o oráculo
+elif kind == "stored": data = mkzip(M + lead, zipfile.ZIP_STORED)                         # o mesmo, sem compressão
+elif kind == "nested": data = mkzip([("splits/base.apk", mkzip(M + lead)), ("splits/config.xxhdpi.apk", mkzip(M))])   # xapk/apks: zip dentro de zip
+elif kind in ("gz", "bz2", "xz"): data = mkzip(M + [("assets/leads.csv." + kind, {"gz": gzip.compress, "bz2": bz2.compress, "xz": lzma.compress}[kind](csv(n)))])   # a lista dentro de um membro comprimido
+elif kind == "gztrunc": g = gzip.compress(csv(n)); data = mkzip(M + [("assets/leads.csv.gz", g[:len(g) // 2])])                       # gzip cortado no meio
+elif kind == "gzbomb": data = mkzip(M + [("assets/zeros.gz", gzip.compress(bytes(n * 1048576)))])                                     # n MB de zeros dentro de um gzip
+elif kind == "trailing": data = mkzip(M) + (csv(n) if n else b"")                         # lista colada DEPOIS do fim do zip: nenhum membro a mostra
+elif kind == "encrypted":
+    raw = bytearray(mkzip(M)); raw[6] |= 1; raw[raw.find(b"PK\x01\x02") + 8] |= 1; data = bytes(raw)   # bit 0 dos flags (cifrado) no cabeçalho local e no diretório central
+elif kind == "corrupt": data = b"PK\x03\x04" + bytes(range(200))
+elif kind == "asar": data = asar([("app.js", b"console.log(1)\n")] + lead)
+elif kind == "bin": data = {"dex": b"dex\n035\x00", "so": b"\x7fELF\x02\x01\x01\x00", "dylib": b"\xcf\xfa\xed\xfe", "exe": b"MZ\x90\x00", "dll": b"MZ\x90\x00"}[arg] + bytes(range(256)) * 4 + (csv(n) if n else b"")
+elif kind == "bomb": data = mkzip(M + [("assets/zeros.bin", bytes(n * 1048576))])        # n MB de zeros: poucos KB comprimidos
+elif kind == "deep":                                                                      # n zips um dentro do outro
+    data = mkzip(M)
+    for _ in range(n - 1): data = mkzip([("inner.zip", data)])
+elif kind == "opaque": data = mkzip(M + [("assets/dados.7z", b"7z\xbc\xaf\x27\x1c" + bytes(64))])
+else: sys.exit("tipo desconhecido: " + kind)
+open(out, "wb").write(data)
+PYEOF
+mk() { python3 -I "$T/mkfix.py" "$@"; }   # mk <tipo> <saída> [n] [arg]
+mk apk "$T/in.apk"; cp "$T/in.apk" "$T/UP.APK"; echo x > "$T/x.json"; mkdir -p "$T/pdir"; ln -sf "$T/in.apk" "$T/link.apk"; { cat "$T/in.apk"; dd if=/dev/zero bs=1048576 count=2 2>/dev/null; } > "$T/big.apk"
 # opt-in: sem --node-first nada muda (o MBP é o único destino) e combinação inválida morre antes de falar com qualquer host
 nready; "$RUN" --exec -- true >"$T/out" 2>"$T/err"; expect "--exec sem --node-first, nó pronto: segue no MBP" 0 "$?"; hasnt "…e nunca toca o nó" "$STUB_LOG" 'HOSTCALL:hetzner'
 for c in "--node-first -- true" "--exec --node-first --go -- true" "--exec --node-first --host mbp -- true" "--exec --node-first --host linux -- true"; do
@@ -1304,6 +1359,26 @@ nready; rc=$(HETZNER_EXEC_PUSH_MAX_MB=1 xrun --push "$T/big.apk" -- true); expec
 nready; rc=$(xrun --push "$T/UP.APK" -- true); expect "extensão em maiúsculas (.APK) vale" 0 "$rc"; has "…e o push vai ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:gt-remote/exec/1/in/'
 nready; rc=$(xrun --env API_TOKEN=s3cr3tvalue -- true); expect "--env com nome de segredo: cai no MBP" 0 "$rc"; has "…motivo env-recusado" "$J" '"reason":"env-recusado".*"host":"hetzner"'; hasnt "…o VALOR nunca aparece na mensagem" "$T/err" 's3cr3tvalue'
 nready; rc=$(xrun --env JADX_HEAP_MB=2048 -- true); expect "--env de nome comum vai ao nó" 0 "$rc"; has "…host hetzner" "$J" '"mode":"exec".*"host":"hetzner"'
+# ga-jq08gyi (achado 1): o --env do nó é ALLOWLIST de NOMES (JADX_HEAP_MB, APKTOOL_HEAP_MB, REA_*); o que não está nela fica no MBP (cai nele, não é erro), tenha ou não nome de segredo:
+# o defeito era a denylist por substring, que deixava passar PDPJ_JWT, *_BEARER e DSN com senha embutida. Os exemplos de credencial são montados em PARTES: nenhuma linha deste arquivo é um JWT ou uma chave de verdade.
+CRED_JWT="eyJ""abcdef01.eyJ""abcdef02.abcdef03"
+CREDS=("$CRED_JWT" "sk""-proj0123456789abcdef" "Bearer ""abcdefgh12345678" "-----BEGIN ""RSA PRIVATE KEY-----" "gh""p_0123456789abcdefghij0123" "AK""IA0123456789ABCDEF" "postgres://us""er:pw""d@db.example/x")
+for c in "FOO_JWT=1" "FOO_JWT=$CRED_JWT" "PDPJ_JWT=1" "DB_BEARER=1" "DATABASE_URL=x" "HOME=/tmp" "jadx_heap_mb=1" "JADX_HEAP_MB_X=1" "REA=1" "NOME RUIM=1" "JADX_HEAP_MB APKTOOL_HEAP_MB=1" "1X=2"; do
+  nready; rc=$(xrun --env "$c" -- true); expect "--env '${c%%=*}' fora da allowlist: cai no MBP e roda" 0 "$rc"
+  has "…motivo env-fora-da-lista no host hetzner" "$J" '"reason":"env-fora-da-lista".*"host":"hetzner"'; has "…e a execução é do MBP" "$J" '"mode":"exec".*"host":"mbp"'
+  hasnt "…o nó nem chegou a dar slot" "$STUB_LOG" 'HOSTCALL:hetzner:SLOT'; hasnt "…o VALOR nunca aparece na mensagem" "$T/err" 'abcdef01'
+done
+for c in "APKTOOL_HEAP_MB=1024" "REA_JADX_MCP_JAR=/x/y.jar" "REA_FOO=bar"; do nready; rc=$(xrun --env "$c" -- true); expect "--env '${c%%=*}' na allowlist vai ao nó" 0 "$rc"; has "…host hetzner" "$J" '"mode":"exec".*"host":"hetzner"'; done
+for c in "REA_API_TOKEN=x" "REA_SESSION_ID=1"; do nready; rc=$(xrun --env "$c" -- true); expect "--env '${c%%=*}' (REA_ + nome de segredo): o veto por nome vale por cima da allowlist" 0 "$rc"; has "…motivo env-recusado" "$J" '"reason":"env-recusado".*"host":"hetzner"'; done
+# nome da allowlist com VALOR que parece credencial (JWT, sk-, Bearer, chave privada, token de provedor, URL com usuário:senha@) e o mesmo no argv do comando: fica no MBP; o valor nunca é impresso
+for c in "${CREDS[@]}"; do
+  nready; rc=$(xrun --env "JADX_HEAP_MB=$c" -- true); expect "--env com VALOR de credencial (${c:0:6}…): cai no MBP e roda" 0 "$rc"
+  has "…motivo env-valor-credencial no host hetzner" "$J" '"reason":"env-valor-credencial".*"host":"hetzner"'; hasnt "…o VALOR nunca aparece na mensagem" "$T/err" "${c:0:12}"
+  nready; rc=$(xrun -- sh -c "echo $c"); expect "argv com credencial (${c:0:6}…): cai no MBP e roda" 0 "$rc"
+  has "…motivo argv-credencial no host hetzner" "$J" '"reason":"argv-credencial".*"host":"hetzner"'; has "…e a execução é do MBP" "$J" '"mode":"exec".*"host":"mbp"'; hasnt "…o VALOR nunca aparece na mensagem" "$T/err" "${c:0:12}"
+done
+# sem falso positivo no que o REA passa de verdade: hash, caminho e nome com "sk-" no meio de uma palavra seguem ao nó
+nready; rc=$(xrun --env APKTOOL_HEAP_MB=2048 -- sh -c 'jadx -d out in/x.apk; echo disk-image-0123456789abcdef 0123456789abcdef0123456789abcdef /tmp/scratch-501/in/app.apk'); expect "comando sem cara de credencial: roda no nó" 0 "$rc"; has "…host hetzner" "$J" '"mode":"exec".*"host":"hetzner"'
 # o 126/127 do nó não é veredito: o scratch sai (mesmo com --keep) e o MBP roda; no MBP o 127 segue como era
 nready; rc=$(STUB_RUN_RC_NODE=127 xrun --keep -- sh -c x); expect "rc 127 no nó (ferramenta ausente): roda no MBP" 0 "$rc"
 has "…o 127 é logado no host hetzner" "$J" '"mode":"exec".*"rc":127.*"host":"hetzner"'; has "…e o MBP rodou" "$J" '"mode":"exec".*"rc":0.*"host":"mbp"'; has "…o scratch do nó sai MESMO com --keep" "$STUB_LOG" 'DIRECT:.*hetzner-teste find gt-remote/exec/1 -mindepth 1 -delete$'
@@ -1332,14 +1407,109 @@ reset; tools_off; "$RUN" --host linux --check >"$T/out" 2>/dev/null; has "check 
 tools_on; "$RUN" --host linux --check >"$T/out" 2>/dev/null; has "check com marcador: a lista de TOOLS=" "$T/out" '^rea_tools=java,jadx,apktool$'
 tools_on "java jadx apktool rea"; "$RUN" --host linux --check >"$T/out" 2>/dev/null; has "…e com a ferramenta a mais" "$T/out" '^rea_tools=java,jadx,apktool,rea$'
 printf 'INSTALLED_AT=x\n' > "$RT/ready"; "$RUN" --host linux --check >"$T/out" 2>/dev/null; has "check com marcador ilegível: rea_tools vazio (≠ none)" "$T/out" '^rea_tools=$'
+# ga-jq08gyi (achado 2): o CONTEÚDO do pacote. node_push_ok olhava só o NOME (a extensão); um .jar/.apks/.asar pode carregar uma lista de leads e o node_guard (do pytest) não roda no --exec.
+# hetzner-push-scan.py confere os magic bytes do tipo que a extensão diz e varre o arquivo e cada membro de zip (recursivo) com o critério do hetzner-pii-scan.py: rc 0 passa, 1 retido, 3 não deu para ler (terceiro estado).
+scan() { python3 -I "$HERE/hetzner-push-scan.py" "$@" >"$T/scan.out" 2>&1; echo $?; }
+sc() { local want=$1 d=$2 rc; shift 2; rc=$(scan "$@"); expect "scanner: $d" "$want" "$rc"; }   # sc <rc esperado> <nome> <args do scanner>
+mk csv "$T/l30.csv" 30; mk csv "$T/c3.csv" 3 cpf; printf 'l30.csv\nc3.csv\n' | python3 -I "$HERE/hetzner-pii-scan.py" "$T" > "$T/oracle.out" 2>/dev/null
+has "premissa: o oráculo (hetzner-pii-scan.py) retém o CSV de 30 telefones" "$T/oracle.out" '^(2[0-9]|30)[[:space:]]+0[[:space:]]+l30\.csv$'; has "…e o de 3 CPFs" "$T/oracle.out" '^0[[:space:]]+3[[:space:]]+c3\.csv$'
+mk apk "$T/ok.apk"; mk apk "$T/l30.jar" 30; mk stored "$T/l30s.jar" 30; mk apk "$T/l3.jar" 3; mk apk "$T/c3.jar" 3 cpf; mk nested "$T/l30.apks" 30; mk nested "$T/clean.apks" 0; mk gz "$T/gz30.apk" 30; mk trailing "$T/tr30.apk" 30
+mk encrypted "$T/enc.apk"; mk corrupt "$T/bad.apk"; mk asar "$T/l30.asar" 30; mk asar "$T/ok.asar" 0; mk opaque "$T/7z.apk"; echo "isto é um texto" > "$T/text.apk"; : > "$T/empty.apk"
+sc 0 "APK pequeno de verdade passa" apk "$T/ok.apk"; has "…e diz quantas unidades leu" "$T/scan.out" '^ok: [0-9]+ unidades'
+sc 1 ".jar com CSV de 30 telefones dentro fica retido" jar "$T/l30.jar"; has "…diz QUAL membro e as contagens" "$T/scan.out" '^retido: arquivo!dados/leads\.csv: [0-9]+ telefones, 0 CPFs$'; hasnt "…e nunca um número" "$T/scan.out" '\+55|[0-9]{4}-[0-9]{4}'
+sc 1 "…o mesmo sem compressão (stored)" jar "$T/l30s.jar"; sc 0 "lista pequena (3 telefones) passa, como no node_guard" jar "$T/l3.jar"; sc 1 "3 CPFs retêm" jar "$T/c3.jar"
+sc 1 "zip DENTRO de zip (.apks/xapk) com a lista" apks "$T/l30.apks"; sc 0 "…o mesmo bundle sem a lista passa (o aninhado não vira falso positivo)" apks "$T/clean.apks"
+sc 1 "membro gzip com a lista" apk "$T/gz30.apk"; mk bz2 "$T/bz30.apk" 30; mk xz "$T/xz30.apk" 30; sc 1 "membro bzip2 com a lista" apk "$T/bz30.apk"; sc 1 "membro xz com a lista" apk "$T/xz30.apk"
+mk gztrunc "$T/gzcut.apk" 30; sc 3 "membro gzip CORTADO no meio: não deu para ler" apk "$T/gzcut.apk"; mk gzbomb "$T/gzbomb.apk" 8; sc 0 "controle: 8 MB de zeros num gzip passam com o teto padrão" apk "$T/gzbomb.apk"; sc 3 "gzip que descomprime além do teto (--member-max-mb 1)" --member-max-mb 1 apk "$T/gzbomb.apk"; has "…e diz que passou do teto (não 'truncado': o limite do gzip e o fim do fluxo se cobrem, a mensagem é o que cada um tem de seu)" "$T/scan.out" 'descomprime além do teto'
+sc 1 "lista colada DEPOIS do fim do zip (só a varredura crua do arquivo pega)" apk "$T/tr30.apk"
+sc 3 "membro cifrado: não deu para ler (terceiro estado)" apk "$T/enc.apk"; has "…e diz que é cifrado" "$T/scan.out" '^ilegível: arquivo!.*cifrado'
+sc 3 "zip corrompido: não deu para ler" apk "$T/bad.apk"; sc 3 "contêiner que o varredor não abre (7z) dentro do pacote" apk "$T/7z.apk"
+sc 1 "asar com a lista CRUA dentro" asar "$T/l30.asar"; sc 0 "asar sem lista passa" asar "$T/ok.asar"
+for c in dex so dylib exe dll; do mk bin "$T/ok.$c" 0 "$c"; mk bin "$T/l30.$c" 30 "$c"; sc 0 "binário .$c com o magic certo passa" "$c" "$T/ok.$c"; sc 1 "binário .$c com a lista dentro fica retido" "$c" "$T/l30.$c"; done
+sc 1 "texto chamado .apk (magic errado)" apk "$T/text.apk"; has "…diz que o começo não é do tipo" "$T/scan.out" '^retido: arquivo: .*magic'; sc 1 "arquivo vazio chamado .apk" apk "$T/empty.apk"
+cp "$T/ok.exe" "$T/fake.so"; sc 1 ".so que começa com MZ" so "$T/fake.so"; cp "$T/ok.apk" "$T/fake.dex"; sc 1 ".dex que é um zip" dex "$T/fake.dex"; sc 1 "extensão que o scanner não conhece (.json) nunca vale" json "$T/x.json"; sc 2 "uso errado (sem o arquivo)" apk
+# --creds: o MESMO motor (Python) nas duas máquinas; a regex NÃO roda no grep do macOS, que ninguém aqui testou. Cada forma de credencial retém; texto comum passa; sem o -- é uso errado
+for c in "${CREDS[@]}"; do sc 1 "--creds: ${c:0:6}… tem cara de credencial" --creds -- "$c"; done
+sc 1 "--creds: basta UM texto entre vários" --creds -- ok1 ok2 "$CRED_JWT" ok3; sc 0 "--creds: sem nenhum texto" --creds --
+sc 0 "--creds: texto comum (comando, hash, caminho, disk-image-…, número) não tem cara" --creds -- sh -c 'jadx -d out in/x.apk' disk-image-0123456789abcdef 0123456789abcdef0123456789abcdef /tmp/scratch-501/in/app.apk 2048 'Bearer tokens' 'task-0123456789abcdef'
+sc 2 "--creds sem o -- é uso errado" --creds "$CRED_JWT"; hasnt "…e o texto nunca é impresso" "$T/scan.out" 'abcdef01'
+# a lista de extensões do mbp-run.sh e a tabela de tipos do scanner andam juntas: toda extensão do NODE_EXEC_EXT tem fixture que passa (extensão nova sem tipo conhecido aqui quebra este laço)
+for c in $(sed -n 's/^NODE_EXEC_EXT="\([^"]*\)".*/\1/p' "$HERE/mbp-run.sh"); do
+  case "$c" in apk|apks|xapk|apkm|aab|jar|aar|ipa) cp "$T/ok.apk" "$T/each.$c" ;; dex|so|dylib|exe|dll) mk bin "$T/each.$c" 0 "$c" ;; asar) mk asar "$T/each.$c" 0 ;; *) : > "$T/each.$c" ;; esac
+  sc 0 "toda extensão do NODE_EXEC_EXT tem tipo conhecido (.$c)" "$c" "$T/each.$c"
+done
+# tetos: zip bomba (8 MB de zeros = poucos KB), bytes totais e profundidade. Passa com os tetos padrão; com o teto baixo, é "não deu para ler", nunca "limpo"
+mk bomb "$T/bomb.apk" 8; mk deep "$T/deep3.apk" 3; mk deep "$T/deep6.apk" 6
+sc 0 "controle: os 8 MB de zeros passam com os tetos padrão" apk "$T/bomb.apk"; sc 3 "membro que descomprime além do teto (--member-max-mb 1)" --member-max-mb 1 apk "$T/bomb.apk"; sc 3 "mais bytes lidos que o teto total (--total-max-mb 4)" --total-max-mb 4 apk "$T/bomb.apk"
+sc 0 "3 zips um dentro do outro passam no teto padrão de profundidade" apk "$T/deep3.apk"; sc 3 "6 zips aninhados passam do teto" apk "$T/deep6.apk"; sc 3 "…e com --max-depth 2 já 3 passam do teto" --max-depth 2 apk "$T/deep3.apk"
+# a régua é a do hetzner-pii-scan.py: o varredor de pacote conta como ele (paridade com `counts` num corpus) e tem os mesmos limiares (como o varredor do espelho: um não muda sem o outro)
+cat > "$T/parity.py" <<'PYEOF'
+import importlib.util as u, random, sys
+def load(n, p):
+    s = u.spec_from_file_location(n, p); m = u.module_from_spec(s); s.loader.exec_module(m); return m
+pii = load("pii", sys.argv[1] + "/hetzner-pii-scan.py"); ps = load("ps", sys.argv[1] + "/hetzner-push-scan.py"); rx = ps.regexes(pii)
+r = random.Random(3)
+def ph(): return r.choice(["+55 %d 9%04d-%04d", "(%d) 9%04d-%04d", "55%d9%04d%04d", "+55 (%d) %04d-%04d"]) % (r.randint(11, 99), r.randint(1000, 9999), r.randint(1000, 9999))
+def cp(): return "%03d.%03d.%03d-%02d" % (r.randint(0, 999), r.randint(0, 999), r.randint(0, 999), r.randint(0, 99))
+C = ["", "sem nada", "+55 11 99999-9999 (11) 98888-8888 11 97777-7777", "(11) 91234-5678 (11) 91234-5678 (11) 91234-5678", "123.456.789-09 123.456.789-09 111.222.333-44", "5511912345678 e 115511912345678", "ação: +55 21 98765-4321\n\tção 123.456.789-09"]
+C += [" ".join(ph() if r.random() < .6 else cp() for _ in range(r.randint(0, 40))) for _ in range(300)]
+bad = [t for t in C if pii.counts(t) != ps.collect(t.encode("utf-8"), rx)]
+print("divergências: %d de %d" % (len(bad), len(C))); sys.exit(1 if bad else 0)
+PYEOF
+python3 -I "$T/parity.py" "$HERE" > "$T/parity.out" 2>&1; expect "scanner: conta como o hetzner-pii-scan.py (paridade de counts num corpus)" 0 "$?"; has "…0 divergências" "$T/parity.out" '^divergências: 0 de '
+if grep -q '^MIN_PHONES, MIN_CPFS = 20, 3 ' "$HERE/hetzner-push-scan.py" && grep -q 'nph, ncp = None, None, 20, 3$' "$HERE/hetzner-pii-scan.py"; then ok "limiares: 20 telefones / 3 CPFs, os mesmos do hetzner-pii-scan.py"; else bad "limiares do varredor de pacote divergem dos do hetzner-pii-scan.py"; fi
+# pelo mbp-run de verdade: os quatro casos de aceite e o terceiro estado
+nready; rc=$(xrun --push "$T/ok.apk" -- true); expect "(iii) APK pequeno de verdade: vai ao nó" 0 "$rc"; has "…o push foi ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:gt-remote/exec/1/in/'; has "…host hetzner" "$J" '"mode":"exec".*"host":"hetzner"'
+nready; rc=$(xrun --push "$T/l30.jar" -- true); expect "(ii) .jar com CSV de 30 telefones dentro: cai no MBP e roda" 0 "$rc"; has "…motivo push-conteudo no host hetzner" "$J" '"reason":"push-conteudo".*"host":"hetzner"'
+hasnt "…nada foi empurrado ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'; has "…a execução é do MBP" "$J" '"mode":"exec".*"host":"mbp"'; hasnt "…nenhum número na mensagem" "$T/err" '\+55|[0-9]{4}-[0-9]{4}'
+nready; rc=$(xrun --push "$T/l3.jar" -- true); expect "…o mesmo .jar com 3 telefones (abaixo do limiar) vai ao nó" 0 "$rc"; has "…host hetzner" "$J" '"mode":"exec".*"host":"hetzner"'
+nready; rc=$(xrun --push "$T/text.apk" -- true); expect "(iv) arquivo .apk com conteúdo de texto: cai no MBP e roda" 0 "$rc"; has "…motivo push-conteudo" "$J" '"reason":"push-conteudo".*"host":"hetzner"'; hasnt "…nada foi empurrado ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'
+nready; rc=$(xrun --push "$T/enc.apk" -- true); expect "pacote que o varredor não consegue ler (cifrado): cai no MBP e roda" 0 "$rc"; has "…motivo push-ilegivel (terceiro estado, ≠ push-conteudo)" "$J" '"reason":"push-ilegivel".*"host":"hetzner"'
+nready; rc=$(xrun --push "$T/ok.apk" --push "$T/l30.jar" -- true); expect "dois --push, um deles com a lista: NENHUM vai ao nó" 0 "$rc"; hasnt "…nada foi empurrado ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'
+mkdir -p "$T/pbin"; printf '#!/bin/sh\ncase "$*" in *--creds*) ;; *hetzner-push-scan.py*) exit 2 ;; esac\nexec %s "$@"\n' "$(command -v python3)" > "$T/pbin/python3"; chmod +x "$T/pbin/python3"   # só a varredura do PACOTE erra (rc 2); a de credencial segue real
+nready; rc=$(PATH="$T/pbin:$PATH" xrun --push "$T/ok.apk" -- true); expect "varredor de PACOTE que erra (rc 2): cai no MBP e roda" 0 "$rc"; has "…motivo push-ilegivel" "$J" '"reason":"push-ilegivel".*"host":"hetzner"'; hasnt "…nada foi empurrado ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'
+NOSP="$T/noscanpush"; mkdir -p "$NOSP"; for c in mbp-host.sh mbp-presence.sh mbp-controle.sh hetzner-pii-scan.py hetzner-mac-only.txt hetzner-rsync-filter.wa.txt; do ln -sf "$HERE/$c" "$NOSP/$c"; done; cp "$RUN" "$NOSP/mbp-run.sh"
+nready; "$NOSP/mbp-run.sh" --exec --node-first --push "$T/ok.apk" -- true >"$T/out" 2>"$T/err"; expect "sem o hetzner-push-scan.py ao lado: cai no MBP e roda (varredura que não roda NÃO é 'nada retido')" 0 "$?"; has "…a checagem de credencial, a 1ª que precisa do varredor, recusa: credencial-ilegivel" "$J" '"reason":"credencial-ilegivel".*"host":"hetzner"'; hasnt "…nada foi empurrado ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'
 # controles negativos: cada porta nova, tirada sozinha, volta ao defeito (o mutante tem de deixar de reproduzir o que o script real faz)
-MD="$T/mutdir-exec"; mkdir -p "$MD"; for t in mbp-host.sh mbp-presence.sh mbp-controle.sh hetzner-pii-scan.py hetzner-mac-only.txt hetzner-rsync-filter.wa.txt; do ln -sf "$HERE/$t" "$MD/$t"; done   # o mutante lê os irmãos do script pelo $HERE dele
+MD="$T/mutdir-exec"; mkdir -p "$MD"; for t in mbp-host.sh mbp-presence.sh mbp-controle.sh hetzner-pii-scan.py hetzner-push-scan.py hetzner-mac-only.txt hetzner-rsync-filter.wa.txt; do ln -sf "$HERE/$t" "$MD/$t"; done   # o mutante lê os irmãos do script pelo $HERE dele
 xmut() { python3 -I -c 'import sys; s=open(sys.argv[1]).read(); a=sys.argv[2]; assert s.count(a)==1, "ancora: %d" % s.count(a); open(sys.argv[4],"w").write(s.replace(a, sys.argv[3]))' "$RUN" "$1" "$2" "$MD/mbp-run.sh" && chmod +x "$MD/mbp-run.sh"; }
 xobs() { n=$((n+1)); if grep -q -E -e "$3" "$2"; then echo "ok   $1"; else echo "FAIL $1: '$3' ausente em $2"; fails=$((fails+1)); fi; }
-if xmut 'node_push_ok "$p" || { fall push-recusado 97; return 97; }' 'true'; then nready; "$MD/mbp-run.sh" --exec --node-first --push "$T/x.json" -- true >/dev/null 2>&1; xobs "controle: sem node_push_ok o .json VAZA ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'; else bad "controle push: âncora do mutante"; fi
-if xmut '*TOKEN*|*SECRET*|' '*NUNCA*|'; then nready; "$MD/mbp-run.sh" --exec --node-first --env API_TOKEN=x -- true >/dev/null 2>&1; xobs "controle: sem a porta do --env o segredo vai ao nó" "$J" '"mode":"exec".*"host":"hetzner"'; else bad "controle env: âncora do mutante"; fi
+if xmut 'node_push_ok "$p" || { fall push-recusado 97; return 97; }' 'true'; then nready; "$MD/mbp-run.sh" --exec --node-first --push "$T/link.apk" -- true >/dev/null 2>&1; xobs "controle: sem node_push_ok o LINK para um APK válido (que o varredor aceita) VAZA ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'; else bad "controle push: âncora do mutante"; fi
+if xmut '*TOKEN*|*SECRET*|' '*NUNCA*|'; then nready; "$MD/mbp-run.sh" --exec --node-first --env REA_API_TOKEN=x -- true >/dev/null 2>&1; xobs "controle: sem o veto por nome, REA_API_TOKEN (nome liberado pelo prefixo) vai ao nó" "$J" '"mode":"exec".*"host":"hetzner"'; else bad "controle env: âncora do mutante"; fi
+# ga-jq08gyi: cada porta nova, tirada sozinha, deixa o defeito voltar. A do grep que ERRA é a do terceiro estado: "não consegui olhar" tem de valer como "tem cara de credencial", nunca como "não tem"
+if xmut 'if [ $ok -ne 1 ]; then lst=' 'if false; then lst='; then nready; "$MD/mbp-run.sh" --exec --node-first --env FOO_JWT=1 -- true >/dev/null 2>&1; xobs "controle: sem a allowlist, FOO_JWT (nome sem cara de segredo) vai ao nó" "$J" '"mode":"exec".*"host":"hetzner"'; else bad "controle allowlist: âncora do mutante"; fi
+if xmut '"${kv#*=}" && return 97' '"${kv#*=}" && false'; then nready; "$MD/mbp-run.sh" --exec --node-first --env "JADX_HEAP_MB=$CRED_JWT" -- true >/dev/null 2>&1; xobs "controle: sem a checagem do valor, o JWT em JADX_HEAP_MB vai ao nó" "$J" '"mode":"exec".*"host":"hetzner"'; else bad "controle valor: âncora do mutante"; fi
+if xmut '"$@" && return 97' '"$@" && false'; then nready; "$MD/mbp-run.sh" --exec --node-first -- sh -c "echo $CRED_JWT" >/dev/null 2>&1; xobs "controle: sem a checagem do argv, o JWT no comando vai ao nó" "$J" '"mode":"exec".*"host":"hetzner"'; else bad "controle argv: âncora do mutante"; fi
+mkdir -p "$T/gbin"; printf '#!/bin/sh\ncase "$*" in *--creds*) exit 2 ;; esac\nexec %s "$@"\n' "$(command -v python3)" > "$T/gbin/python3"; chmod +x "$T/gbin/python3"   # só a chamada --creds erra (rc 2); o resto do python3 segue real
+nready; rc=$(PATH="$T/gbin:$PATH" xrun -- true); expect "varredor de credencial que ERRA (rc 2): cai no MBP e roda" 0 "$rc"; has "…motivo credencial-ilegivel (não consegui olhar ≠ achei)" "$J" '"reason":"credencial-ilegivel".*"host":"hetzner"'; hasnt "…o nó nem chegou a dar slot" "$STUB_LOG" 'HOSTCALL:hetzner:SLOT'
+if xmut '    0) return 1 ;;' '    0|2) return 1 ;;'; then nready; PATH="$T/gbin:$PATH" "$MD/mbp-run.sh" --exec --node-first -- true >/dev/null 2>&1; xobs "controle: se o erro (rc 2) do varredor de credencial valesse como 'limpo', o comando iria ao nó" "$J" '"mode":"exec".*"host":"hetzner"'; else bad "controle cred rc 2: âncora do mutante"; fi
 if xmut '{ [ $RC -eq 126 ] || [ $RC -eq 127 ]; }' 'false'; then nready; STUB_RUN_RC_NODE=127 "$MD/mbp-run.sh" --exec --node-first -- x >/dev/null 2>&1; rc=$?; expect "controle: sem a regra do 126/127 o rc 127 do nó vira o veredito" 127 "$rc"; else bad "controle 127: âncora do mutante"; fi
 if xmut '[ "$nodefirst" = 1 ] && [ -f "$NODE_FLAG" ]' '[ -f "$NODE_FLAG" ]'; then nready; "$MD/mbp-run.sh" --exec -- true >/dev/null 2>&1; xobs "controle: sem o opt-in o --exec comum vai ao nó" "$STUB_LOG" 'HOSTCALL:hetzner'; else bad "controle opt-in: âncora do mutante"; fi
+# ga-jq08gyi: o varredor de conteúdo. A chamada, e a regra "só o rc 0 passa" (3 = não deu para ler, 2 = o script nem abriu), tiradas uma a uma, deixam o defeito voltar
+if xmut 'node_push_scan "$p" || { fall "$PUSH_WHY" 97; return 97; }' 'true'; then nready; "$MD/mbp-run.sh" --exec --node-first --push "$T/l30.jar" -- true >/dev/null 2>&1; xobs "controle: sem a chamada do varredor, o .jar com a lista VAI ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'; else bad "controle varredor: âncora do mutante"; fi
+if xmut '    0) return 0 ;;' '    0|3) return 0 ;;'; then nready; "$MD/mbp-run.sh" --exec --node-first --push "$T/enc.apk" -- true >/dev/null 2>&1; xobs "controle: se o rc 3 (não deu para ler) valesse como 'passa', o pacote cifrado iria ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'; else bad "controle rc 3: âncora do mutante"; fi
+if xmut '    0) return 0 ;;' '    0|2) return 0 ;;'; then nready; PATH="$T/pbin:$PATH" "$MD/mbp-run.sh" --exec --node-first --push "$T/ok.apk" -- true >/dev/null 2>&1; xobs "controle: se o rc 2 do varredor de pacote valesse como 'passa', o pacote iria ao nó sem varredura" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'; else bad "controle rc 2: âncora do mutante"; fi
+# e cada guarda do próprio varredor: o mutante vive num diretório À PARTE, como arquivo comum (gravar através de um link sobrescreveria o varredor de verdade)
+MP="$T/mutdir-push"; mkdir -p "$MP"; ln -sf "$HERE/hetzner-pii-scan.py" "$MP/hetzner-pii-scan.py"
+pm() { # pm <o que o mutante quebra> <rc que o DEFEITO devolve> <âncora> <troca> <args do varredor...>: com a guarda tirada, o varredor tem de devolver o rc do defeito
+  local d=$1 want=$2 rc; rm -f "$MP/hetzner-push-scan.py"
+  if python3 -I -c 'import sys; s=open(sys.argv[1]).read(); a=sys.argv[2]; assert s.count(a)==1, "ancora: %d" % s.count(a); open(sys.argv[4],"w").write(s.replace(a, sys.argv[3]))' "$HERE/hetzner-push-scan.py" "$3" "$4" "$MP/hetzner-push-scan.py"; then
+    shift 4; python3 -I "$MP/hetzner-push-scan.py" "$@" >/dev/null 2>&1; rc=$?; expect "controle do varredor: $d" "$want" "$rc"
+  else bad "controle do varredor ($d): âncora do mutante"; fi
+}
+pm "sem os magic bytes o .so que é texto/MZ passa" 0 'if not magic_ok(ext, f.read(8)):' 'if False:' so "$T/fake.so"
+pm "sem ler os membros o .jar com a lista passa" 0 '            zip_members(f, "arquivo", 0, st)' '            pass' jar "$T/l30.jar"
+pm "sem a recursão o zip dentro de zip passa" 0 '        zip_members(io.BytesIO(buf), label, depth, st)' '        pass' apks "$T/l30.apks"
+pm "sem abrir o gzip a lista passa" 0 '        walk(inflate(kind, buf, label, st), "%s!%s" % (label, kind), depth + 1, st)' '        pass' apk "$T/gz30.apk"
+pm "sem a leitura crua a lista colada no fim passa" 0 '            unit(mm, "arquivo", st)' '            pass' apk "$T/tr30.apk"
+pm "com limiares altos a lista de 30 passa" 0 'MIN_PHONES, MIN_CPFS = 20, 3' 'MIN_PHONES, MIN_CPFS = 200, 300' jar "$T/l30.jar"
+pm "sem o teto de membro a bomba passa" 0 '            if info.file_size > st.member_max:' '            if False:' --member-max-mb 1 apk "$T/bomb.apk"
+pm "sem o teto de bytes lidos a bomba passa" 0 '    if st.read > st.total_max:' '    if False:' --total-max-mb 4 apk "$T/bomb.apk"
+pm "sem o teto de profundidade o aninhamento fundo passa" 0 $'def zip_members(f, label, depth, st):\n    if depth >= st.max_depth:' $'def zip_members(f, label, depth, st):\n    if False:' --max-depth 2 apk "$T/deep3.apk"
+pm "sem a checagem de credencial o JWT passa" 0 '            if CRED.search(t):' '            if False:' --creds -- "$CRED_JWT"
+pm "sem recusar o 7z o pacote com 7z passa" 0 '    elif buf.startswith(OPAQUE):' '    elif False:' apk "$T/7z.apk"
+pm "sem checar o fim do fluxo o gzip cortado passa" 0 '    if not d.eof or d.unused_data:' '    if False:' apk "$T/gzcut.apk"
+pm "se o erro inesperado devolvesse 0 o zip corrompido passaria" 0 $'ascii(str(e))[:160]))\n        return 3' $'ascii(str(e))[:160]))\n        return 0' apk "$T/bad.apk"
 tools_off
 reset
 }
