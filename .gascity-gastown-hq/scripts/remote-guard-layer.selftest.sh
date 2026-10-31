@@ -13,6 +13,9 @@
 #      SEM o false) provam que o teste enxerga a diferença;
 #   4. com vários --settings só o ÚLTIMO vale: o do bundle por último (a forma do comando do pool) bloqueia; na ordem inversa não — por isso o provider confere o último;
 #   5. python3 ausente ou quebrado na PATH da sessão → o hook sai 2 e a ferramenta é BLOQUEADA, até a escrita inocente (falha fechada); com python3 ela passa.
+#   6. (ga-14qtcy9) python3 que PENDURA: o prazo do PRÓPRIO claude estoura e a chamada só é bloqueada com `onFailure: "block"` no hook (o que o builder gera); sem o campo, ou com "continue", ela EXECUTA
+#      sem conferência. Um valor fora do enum ("Block") é PIOR que "continue": o claude não carrega o arquivo de settings inteiro (o guarda nem roda e as regras de permissão do arquivo somem) — por isso o
+#      --selfcheck só aceita o texto exato "block"; uma chave desconhecida no hook é só ignorada (o hook segue de pé). Prazo do hook reduzido a 2 s só no teste (o padrão do claude é 600 s).
 # O QUE NÃO PROVA: o claude do MBP (versão e Keychain não medidos — o teste imprime a versão que rodou; refaça a cada atualização do claude e no MBP, `mbp-proof`); que o guarda
 #   pegue toda forma de escrita (isso é o remote-clone-guard.selftest.sh); Bash que escreve dentro do bundle (o guarda é trava contra engano, não sandbox).
 # COMO RODA: sem o claude na PATH (nem em CLAUDE_BIN, nem em ~/.local/bin) o teste diz SKIP em voz alta e sai 0 — isso NÃO vale como prova. Cada caso é uma rodada do claude (~10 s).
@@ -146,6 +149,25 @@ clean; plan_write "$WPROT"; runcl --settings "$BS" --settings '{"env": {"X": "1"
 clean; plan_write "$WOK"; CLPATH="$GOODPATH" runcl --settings "$BS"; verdict ran "$WOK" "(controle) com python3 na PATH a escrita comum passa"
 clean; plan_write "$WOK"; CLPATH="$T/nopy" runcl --settings "$BS"; verdict blocked "$WOK" "python3 AUSENTE da PATH da sessão: até a escrita comum é BLOQUEADA (falha fechada: \`python3 … || exit 2\`)"
 clean; plan_write "$WOK"; CLPATH="$T/badpy" runcl --settings "$BS"; verdict blocked "$WOK" "python3 QUEBRADO (sai 1) na PATH da sessão: a escrita comum é BLOQUEADA (falha fechada)"
+
+# ================= 5. onFailure (ga-14qtcy9): o prazo do PRÓPRIO claude estourado só bloqueia com `onFailure: "block"` no hook =================
+# python3 que PENDURA (não falta, não sai 1): `python3 -I <guarda> || exit 2` não responde até o prazo do hook (2 s aqui; 600 s é o padrão do claude no PreToolUse) e quem decide é o onFailure
+mkdir -p "$T/hangpy"; for bn in sh cat env dirname sleep; do ln -sf "$(command -v $bn)" "$T/hangpy/$bn"; done
+printf '#!/bin/sh\nsleep 25\n' > "$T/hangpy/python3"; chmod +x "$T/hangpy/python3"
+jq '.hooks.PreToolUse |= map(.hooks |= map(.timeout = 2))' "$BS" > "$T/s_onf_block.json"                       # o do builder REAL (onFailure "block") com prazo curto
+jq '.hooks.PreToolUse |= map(.hooks |= map(del(.onFailure)))' "$T/s_onf_block.json" > "$T/s_onf_none.json"      # o mesmo SEM o campo (o hook de antes)
+jq '.hooks.PreToolUse |= map(.hooks |= map(.onFailure = "continue"))' "$T/s_onf_block.json" > "$T/s_onf_continue.json"
+jq '.hooks.PreToolUse |= map(.hooks |= map(.onFailure = "Block"))' "$T/s_onf_block.json" > "$T/s_onf_bad.json"   # fora do enum (outra caixa)
+jq -e '[.hooks.PreToolUse[].hooks[] | .onFailure] == ["block", "block"]' "$BS" >/dev/null; ok $? "o settings que o builder REAL gera leva onFailure \"block\" nos 2 hooks do guarda (a base dos casos abaixo)"
+clean; plan_write "$WOK"; CLPATH="$GOODPATH" runcl --settings "$T/s_onf_block.json"; verdict ran "$WOK" "(controle) com onFailure \"block\" e o guarda respondendo, a escrita comum PASSA (o campo não derruba o guarda)"
+clean; plan_write "$WPROT"; CLPATH="$GOODPATH" runcl --settings "$T/s_onf_block.json"; verdict blocked "$WPROT" "(controle) com onFailure \"block\" a escrita na camada protegida segue BLOQUEADA pela saída 2 do guarda"; hook_blocked; ok $? "...e o motivo que chegou ao modelo é a recusa do remote-clone-guard"
+clean; plan_write "$WOK"; CLPATH="$T/hangpy" runcl --settings "$T/s_onf_block.json"; verdict blocked "$WOK" "python3 que PENDURA + onFailure \"block\": o prazo do hook estoura e o claude BLOQUEIA até a escrita comum"; grep -qF 'blocking because onFailure is' "$T/api.log"; ok $? "...e o motivo que chegou ao modelo diz que o bloqueio é do onFailure"
+clean; plan_write "$WOK"; CLPATH="$T/hangpy" runcl --settings "$T/s_onf_none.json"; verdict ran "$WOK" "controle negativo: o MESMO settings SEM o onFailure → o prazo estoura e a escrita EXECUTA (a falha aberta que o campo fecha)"
+clean; plan_write "$WOK"; CLPATH="$T/hangpy" runcl --settings "$T/s_onf_continue.json"; verdict ran "$WOK" "onFailure \"continue\" (o padrão, escrito): o prazo estoura e a escrita EXECUTA"
+clean; plan_write "$WPROT"; CLPATH="$GOODPATH" runcl --settings "$T/s_onf_bad.json"; verdict ran "$WPROT" "onFailure \"Block\" (fora do enum): o claude NÃO carrega o arquivo de settings INTEIRO e o guarda nem roda, a escrita na camada protegida EXECUTA (por isso o --selfcheck só aceita o texto exato \"block\")"
+grep -qF 'settings files did not load' "$T/cl.out"; ok $? "...e o claude diz na saída que o arquivo não carregou (os hooks e as regras de permissão dele ficam sem efeito)"
+jq '.hooks.PreToolUse |= map(.hooks |= map(del(.onFailure) | .zzzCampoNovo = true))' "$T/s_onf_block.json" > "$T/s_unknown.json"
+clean; plan_write "$WPROT"; CLPATH="$GOODPATH" runcl --settings "$T/s_unknown.json"; verdict blocked "$WPROT" "chave DESCONHECIDA no hook (o que um claude anterior ao campo onFailure veria): é ignorada, o hook segue de pé e o guarda bloqueia"
 
 echo "== $((n-fails))/$n ok =="
 [ "$fails" = 0 ]

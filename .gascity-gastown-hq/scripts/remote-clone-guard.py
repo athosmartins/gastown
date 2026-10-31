@@ -786,7 +786,7 @@ def selfcheck(args: list) -> int:
                         raise ValueError(f"{f}: disableAllHooks ligado na camada do projeto")
             for tool in ("Bash",) + tuple(TOOLS_FILE):
                 # além do comando, nenhum campo que mude QUANDO o hook dispara (`if`: o hook antigo só disparava em `git -C *`; `async`…). vazio → o grupo/hook sem campo extra vale; ilegível (grupo ou hook que não é objeto) → AttributeError/TypeError, e o selfcheck falha
-                # onFailure (claude >= 2.1.295): a falha do hook (prazo estourado, não iniciou, saída fora de 0/2, JSON inválido) vira saída 2. vazio (ausente) → o hook vale como antes, com a falha aberta; ilegível (qualquer valor que não seja o texto exato "block": continue, outra caixa, outro tipo) → este hook não conta e o selfcheck falha
+                # onFailure (claude >= 2.1.295): a falha do hook (prazo estourado, não iniciou, saída fora de 0/2, JSON inválido) vira saída 2. vazio (ausente) → o hook vale como antes, com a falha aberta; ilegível (qualquer valor que não seja o texto exato "block": continue, outra caixa, outro tipo; MEDIDO no claude 2.1.302: valor fora do enum faz o claude NÃO carregar o settings inteiro, hooks e regras de permissão) → este hook não conta e o selfcheck falha
                 if not any((g.get("matcher") in (None, "", "*") or re.fullmatch(g["matcher"], tool)) and set(g) <= {"matcher", "hooks"}
                            and any(hook_re.fullmatch(h.get("command", "").strip()) and h.get("type") == "command" and set(h) <= {"type", "command", "timeout", "onFailure"} and h.get("onFailure", "block") == "block" for h in g.get("hooks", []))
                            for g in groups):
