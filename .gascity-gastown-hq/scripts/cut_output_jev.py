@@ -9,10 +9,6 @@ WHAT IT IS. cut-output-shadow.py (the PostToolUse/PostToolUseFailure Bash hook) 
 a SAMPLE of those, this module asks Jev "is this block something the agent would need to read again?" and logs what a
 cut based on its answers WOULD have saved. SHADOW ONLY: nothing is ever cut or changed, the hook still prints "{}".
 
-SLICE 2/4 NOTE (ga-d0hm85.2): this module ships UNWIRED. Nothing imports it until slice 3/4 (ga-d0hm85.3) makes the engine
-call jev_tier() / judge(); the engine behaviors described below (the fixed row written first and stamped jev_tier, the report
-counters) arrive with slices 3 and 4. Slice 3 deletes this note.
-
 AUTHORIZATION AND WHAT LEAVES THE MACHINE. Asking Jev means TEXT OF A COMMAND'S OUTPUT goes to Cloudflare Workers AI (model
 typesafe/jev, via jev_experiment.call_jev_multi) -- outward-facing, and not undoable once sent. What Athos approved
 (AskUserQuestion in the Mayor session, 28/09 11:3x, quoted in ga-wk0qi2's description) is the FRONT, in SHADOW: "Cortar
