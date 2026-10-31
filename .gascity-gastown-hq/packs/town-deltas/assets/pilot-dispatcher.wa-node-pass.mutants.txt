@@ -157,3 +157,12 @@ custo cache que nao e texto passa	if (.custo.cache | type) == "string" then	if t
 3.26: o portao so-no ignora a reserva	  if _pilot_node_reserved_for "$_ph_b"; then _PNH_WHY=reserved; return 0; fi	  :
 3.26: o portao so-no ignora o waiter da cessao	  if [ "$_ph_rc" = 0 ]; then _PNH_WHY=waiter; return 0; fi	  :
 3.26: o portao so-no segura tambem o hold expirado	  if [ "$_ph_rc" = 0 ]; then _PNH_WHY=waiter; return 0; fi	  if [ "$_ph_rc" != 1 ]; then _PNH_WHY=waiter; return 0; fi
+3.25: a passada nao zera o conjunto do no	  _PWP_NODE_BOUND=""\n  _pilot_wa_node_pass_mode	  _pilot_wa_node_pass_mode
+3.25: a retida pelo waiter nao entra no conjunto	_pw_held=$((_pw_held + 1)); case "$_pw_id" in *[!A-Za-z0-9._-]*) ;; *) _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id" ;; esac; continue ;;	_pw_held=$((_pw_held + 1)); continue ;;
+3.25: o Dolt saturado nao deixa a node no conjunto	then case "$_pw_id" in *[!A-Za-z0-9._-]*) ;; *) _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id" ;; esac; _pw_stop="dolt-saturated"; break; fi	then _pw_stop="dolt-saturated"; break; fi
+3.25: o apply fora da tabela nao deixa a bead no conjunto	case "$_pw_id" in *[!A-Za-z0-9._-]*) ;; *) _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id" ;; esac; _pw_stop="hook-held"; break ;;	_pw_stop="hook-held"; break ;;
+3.25: a unknown sondada entra no conjunto	unknown) _pw_unk=$((_pw_unk + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" unknown;	unknown) _pw_unk=$((_pw_unk + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" unknown; _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id";
+3.25: o apply rc 10 deixa a bead no conjunto	10) _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" mini;	10) _pw_fails=$((_pw_fails + 1)); _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id"; _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" mini;
+3.25: o apply rc 12 deixa a bead no conjunto	12) _pw_stop="capacity"; break ;;	12) _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id"; _pw_stop="capacity"; break ;;
+3.25: a despachada fica no conjunto	_pw_kept=$((_pw_kept + 1)); _pw_slots=$((_pw_slots - 1)); DISPATCHED=$((DISPATCHED + 1))	_pw_kept=$((_pw_kept + 1)); _pw_slots=$((_pw_slots - 1)); DISPATCHED=$((DISPATCHED + 1)); _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id"
+3.25: o conjunto grava o id sem o espaco da frente	_PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id" ;; esac; continue ;;	_PWP_NODE_BOUND="$_PWP_NODE_BOUND$_pw_id" ;; esac; continue ;;
