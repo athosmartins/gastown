@@ -1,5 +1,5 @@
 ## Contents
-- Como rodar · Como ler uma célula · Ler os 7 dias contra a meta · Limites conhecidos · Ligar a fatia 2 · Manter o ledger manual
+- Como rodar · Como ler uma célula · Ler os 7 dias contra a meta · Limites conhecidos · Ligar a fatia 2 · Manter o ledger manual · Alarme: todo run precisa ter braço (ga-r4z4ve)
 
 # Relatório do 3º estado (ga-57e7l0.2)
 
@@ -64,3 +64,17 @@ na bead ga-57e7l0.1. A conf é `.gc/third-state-reads.conf`, uma chave por linha
 ## Manter o ledger manual
 `packs/town-deltas/assets/third-state-manual.tsv`: uma linha por (bead, dia UTC) — `bead<TAB>AAAA-MM-DD<TAB>3o-estado|outro<TAB>fonte`. Vale para todo FAIL de revisor da bead naquele dia.
 Linha que não parseia é contada ("N linhas ilegíveis no ledger") e **não** é aplicada. Ledger ausente = `NÃO SEI: ledger manual ausente`; só o rótulo decide. Edite por commit, nunca em produção.
+
+## Alarme: todo run precisa ter braço (ga-r4z4ve)
+Em 25/10 a checagem estava **ligada** (`enforce`, 50%) e não fez nada por 6 dias: 2 linhas no arquivo de braços contra 437 beads com 1º veredito. Nada avisou, porque "ligada" e "rodou" são fatos diferentes.
+- **Causa (provada):** o passo 2e vivia só em `formulas/mol-quality-gate-runner.toml`, que nenhum processo despeja: o gate vivo é guard → dispatcher → revisores, nenhum dos 6 arquivos vivos do gate citava um passo da fórmula em 633 versões (medido no ga-vywjzsp) e `gate-review-task.lib.sh` não manda o revisor rodar o 2e. Rodar o passo dependia de um revisor achar a fórmula sozinho (o ga-vywjzsp viu isso com o 2c, gate-run ga-1htlfu).
+  As 2 linhas só podem ter vindo de uma rodada solta assim: o `/gate-done` do builder usa `--no-record` desde a 1ª versão e não grava braço. A origem exata das 2 linhas não se lê de fora do mini.
+  Não era o `GC_CITY_PATH`: a conf é achada (nenhum marcador varrido tem `gate-tsr:nao-ligado`) e as 2 linhas estão no arquivo certo. Também não era "o revisor não executa" um passo que lhe mandaram: ninguém mandou.
+- **Conserto (ga-vywjzsp, já no ar):** o Step 5b-pre5 do guard roda `gate-hard-checks.sh 2e --bead` em todo marcador varrido, grava o braço, põe o rótulo `gate-tsr:<veredito>` no marcador e a linha `HARDCHECK step=2e ... arm=` em `.gc/logs/quality-gate-guard.log`.
+  Medido em 31/10 ~15:15Z nos 203 marcadores de 29–31/10 que o `bd list` devolve: 199 varridos e todos com `gate-tsr:*` (ok 173, aviso 17, fail 6, nao-consegui-medir 3); os 4 sem rótulo eram 3 ainda `gate-status:ready` (nascidos há < 30 min) e 1 retirado pelo autor antes de qualquer varredura.
+- **Alarme:** a order `third-state-arm-coverage` (1h, `assets/third-state-arm-coverage.py --order`, somente leitura) confere **por fora do guard** que todo bead com veredito real em `quality-gate.jsonl` nas últimas 24h tem linha no arquivo de braços (por bead, não por linha: a 1ª linha vale para sempre).
+  Avisa o Mayor (`escalation-router`, tópico infra) quando há ≥ 5 beads com veredito, ≥ 2 sem braço **e** mais de 10% sem braço. O aviso lista os beads e, pelo log do guard, o porquê (`nao-consegui-medir/fetch-falhou`, `ferramenta-alterada-no-diff`, ou "sem linha HARDCHECK": o 5b-pre5 não rodou para ele).
+- **Outras chaves de alarme**, cada uma com cooldown de 24h e esquecida quando a condição some: conf que a checagem não lê (ela responde `NÃO SEI` a tudo e o guard segue sem ela), interruptor (`.gc/third-state-reads-check.off`, `.gc/gate-hardchecks.off`) parado há mais de 72h, e `quality-gate.jsonl` ou script irmão ilegível (cego; nunca "0 runs").
+- **Não alarma:** conf ausente, `mode=warn|off` (não sorteiam braço por desenho), interruptor recente, poucos runs, runs de antes de `mtime da conf + 8h` (o marcador pode ter sido varrido antes de ligar).
+- **O que NÃO cobre:** a *qualidade* da medição. Um braço gravado com veredito `nao-consegui-medir` conta como coberto; isso se lê no rótulo `gate-tsr:*` do marcador e na linha do log.
+- **Ler à mão:** `python3 packs/town-deltas/assets/third-state-arm-coverage.py --no-alarm` (`--json` para máquina; só lê). Calar o alarme: `THIRD_STATE_ARM_COVERAGE=off` ou `.gc/third-state-arm-coverage.off`. Limiares: `TSAC_WINDOW_H`, `TSAC_MIN_RUNS`, `TSAC_MIN_UNCOVERED`, `TSAC_MAX_UNCOVERED_PCT` (cabeçalho do script).
