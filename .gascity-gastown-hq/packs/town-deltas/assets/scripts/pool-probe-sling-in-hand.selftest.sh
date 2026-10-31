@@ -20,6 +20,8 @@ set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROBE="${PP_PROBE_UNDER_TEST:-$SELF_DIR/pool-probe.sh}"        # override = mutation checks
 export GATE_FOCUS_ACTIVE_OVERRIDE=0   # ga-6fkx9je: the probe reads the gate focus mode too; pin it OFF (the real state file would turn this red on the mini whenever the mode is ON)
+# ga-vdac4cj: the probe's mother filter (children-in-hand-lib.sh) makes one extra bd read this fake bd does not serve (it would hold every candidate back as unreadable); point it at a lib that does not exist so this file stays about the sling filter. pool-probe-children.selftest.sh holds the proof of the mother filter.
+export POOL_PROBE_CHILDREN_LIB=/nonexistent/children-in-hand-lib.sh
 PASS=0; FAIL=0
 ok()  { echo "  ✓ $*"; PASS=$((PASS+1)); }
 bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }

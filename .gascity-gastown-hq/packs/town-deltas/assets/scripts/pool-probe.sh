@@ -201,7 +201,7 @@ children_lib="${POOL_PROBE_CHILDREN_LIB:-$(dirname "$0")/children-in-hand-lib.sh
 if [ -f "$children_lib" ] && ( . "$children_lib" ) >/dev/null 2>&1; then
   . "$children_lib"
 else
-  pp_log "children filter lib missing or corrupt (lib=$children_lib) - mothers with children in hand are NOT held back, tiers answer as the engine's probe would (ga-vdac4cj)"
+  pp_log "children filter lib missing or corrupt (lib=$children_lib) - mothers with children in hand are NOT filtered, tiers answer as the engine's probe would (ga-vdac4cj)"
 fi
 
 # Print $1 and stop the whole probe when it holds a bead.
