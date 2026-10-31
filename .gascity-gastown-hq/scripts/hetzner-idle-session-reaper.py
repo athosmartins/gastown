@@ -8,8 +8,10 @@ PALIATIVO até o patch do engine da ga-2hd02v.1.22 entrar na janela (docs/pendin
 a sessão manual que o idle_timeout acabou de dormir, e 3 sessões dog-remote vivas sem bead seguram os 3 slots do nó (20/10 06:39 e 13:0x: "sem alias dog-remote-<n> livre").
 Quando o patch entrar: descarregar o job (docs/runbooks/hetzner-idle-session-reaper.md) e apagar estes arquivos.
 REGRA  o launchd do mini roda isto a cada 600 s (com.gascity.hetzner-idle-session-reaper). Duas leituras, cada uma com três estados (leu / não consegui ler / vale X):
-         `gc session list --json`   as sessões dos templates HETZNER_REAP_TEMPLATES (dog-remote, gate-reviewer-remote, kimi-worker-remote), com state e closed
-         `bd list --include-infra --status open,in_progress --json --limit 0`   quem SEGURA bead: assignee = o id, o session_name, o name ou o alias da sessão
+         `gc session list --json`   as sessões dos templates HETZNER_REAP_TEMPLATES (dog-remote, gate-reviewer-remote, kimi-worker-remote), com state e closed.
+                                    Duas portas (ga-2hd02v.3.27): o campo `template` OU o NOME (session_name/name/alias/agent_name == <template> ou <template>-...), porque a sessão
+                                    re-adotada pelo engine vira bead-casca, sem `template` (a lista tende a sair assim). Nome com `-remote-<host>-` (HETZNER_REAP_OTHER_HOSTS, padrão mbp) é de outro nó: fora.
+         `bd list --include-infra --status open,in_progress --json --limit 0`   quem SEGURA bead: assignee = o id, o session_name, o name, o alias ou o agent_name da sessão
        "não consegui ler" (qualquer das duas) = ninguém é fechado e o estado nem anda. Bead ABERTA também segura a sessão (a in_progress sozinha não basta).
        kimi-worker-remote (ga-do1ixn.5) entra: a bead dele é do rig gascity, na loja da HQ, como a do dog-remote.
        wa-worker-remote fica de fora de propósito: a bead dele mora na loja da WA, que o bd da HQ não lê; sem provar "sem bead" não se fecha.
@@ -28,6 +30,7 @@ import errno
 import fcntl
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -60,8 +63,11 @@ def load_config(env):
     templates = [s.strip() for s in env.get("HETZNER_REAP_TEMPLATES", "dog-remote,gate-reviewer-remote,kimi-worker-remote").split(",") if s.strip()]
     if not templates:
         raise ValueError("HETZNER_REAP_TEMPLATES vazio")
+    # sessão de outro host remoto (o MBP: `-remote-mbp-`) não é ocupação do Hetzner; vazio na variável = nenhum host excluído (mesma convenção do vigia de ocupação)
+    hosts = [s.strip().lower() for s in env.get("HETZNER_REAP_OTHER_HOSTS", "mbp").split(",") if s.strip()]
     return SimpleNamespace(
         city=city, gc_dir=os.path.join(city, ".gc"), templates=templates,
+        other_hosts_re=re.compile(r"-remote-(%s)(-|$)" % "|".join(re.escape(h) for h in hosts)) if hosts else None,
         grace_s=_num(env, "HETZNER_REAP_GRACE_S", 900, int, 60), min_live_runs=_num(env, "HETZNER_REAP_MIN_LIVE_RUNS", 2, int, 1),
         gc_timeout_s=_num(env, "HETZNER_REAP_GC_TIMEOUT_S", 60, int, 1), bd_timeout_s=_num(env, "HETZNER_REAP_BD_TIMEOUT_S", 60, int, 1),
         gc_bin=env.get("GC_BIN", "gc"), bd_bin=env.get("BD_BIN", "bd"), now=int(raw) if raw else int(time.time()))
@@ -181,12 +187,32 @@ def load_state(path, now, dry):
 
 
 # ---- leituras ----------------------------------------------------------------------------------------------------------------------------------------
-def _ours(c, template):
+NAME_KEYS = ("session_name", "name", "alias", "agent_name")  # os nomes pelos quais uma sessão se chama (e pelos quais uma bead aponta para ela: ver describe)
+
+
+def _by_template(c, template):
     return isinstance(template, str) and any(template == t or template.endswith("/" + t) or template.endswith("." + t) for t in c.templates)
 
 
+def _by_name_family(c, s):
+    """Segunda porta (ga-2hd02v.3.27): algum nome da sessão é `<template>` ou `<template>-...` e ela não é de outro host (`-remote-mbp-`)."""
+    # vazio → nenhum nome em texto = a porta fica fechada (não é nossa, não entra na lista); ilegível (nome que não é texto) = idem, é ignorado; só um nome que casa a família abre a porta
+    names = [s[k] for k in NAME_KEYS if isinstance(s.get(k), str) and s[k]]
+    if c.other_hosts_re is not None and any(c.other_hosts_re.search(n) for n in names):
+        return False
+    return any(n == t or n.startswith(t + "-") for n in names for t in c.templates)
+
+
+def _ours(c, s):
+    """Sessão dos nossos templates. Duas portas, porque o campo `template` NÃO é confiável (ga-2hd02v.3.27): a sessão que o engine re-adotou depois de um reinício
+    vira uma bead-casca (só agent_name/session_name/state/synced_at, sem template/alias/command) e a lista tende a sair sem `template`
+    (inferido das beads; a linha da lista não foi guardada). Três revisores do gate ficaram assim de 7 h a 1 dia, contados pelo vigia de ocupação
+    (que identifica pelo NOME) e invisíveis aqui (sessoes=0)."""
+    return _by_template(c, s.get("template")) or _by_name_family(c, s)
+
+
 def read_sessions(c):
-    """(linhas, ilegiveis, None) ou (None, 0, motivo). linhas = as sessões dos nossos templates que não estão fechadas."""
+    """(linhas, ilegiveis, None) ou (None, 0, motivo). linhas = as sessões dos nossos templates (pelo template ou pelo nome da família) que não estão fechadas."""
     # vazio → {"sessions": []} = nenhuma sessão nossa, nada a fazer (leu); falhou/ilegível/envelope de erro → (None, 0, motivo): ninguém é fechado e o estado não anda
     rc, out, _err, why = run_cmd([c.gc_bin, "--city", c.city, "session", "list", "--json"], c.gc_timeout_s)
     motivo = _failed(rc, why, "gc")
@@ -205,7 +231,7 @@ def read_sessions(c):
     for s in lst:
         if not isinstance(s, dict):
             bad += 1
-        elif _ours(c, s.get("template")) and s.get("closed") is not True:
+        elif _ours(c, s) and s.get("closed") is not True:
             rows.append(s)
     return rows, bad, None
 
@@ -235,7 +261,7 @@ def describe(s):
     sid = _str(s, "id")
     if sid == "-":
         sid = None
-    owners = {v for v in (sid, _str(s, "session_name"), _str(s, "name"), _str(s, "alias")) if v}
+    owners = {v for v in (sid,) + tuple(_str(s, k) for k in NAME_KEYS) if v}  # agent_name também: mais um dono possível só segura a sessão (lado inerte)
     return sid, _str(s, "name") or _str(s, "session_name") or _str(s, "alias") or "?", owners
 
 

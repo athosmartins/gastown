@@ -513,10 +513,16 @@ check "duas cópias que já existem: a -2 não foi pisada" 1 "$(grep -c -F '"ses
 
 # 32. o template aparece com prefixo de rig ou de pacote (<rig>/<template>, <pack>.<template>): é nosso; quem só TERMINA igual, sem o separador, ou só começa igual, não é
 new_world templates
-sessions "$(row ga-p1 dog-remote-1 gastown/dog-remote active)" "$(row ga-p2 dog-remote-2 core.dog-remote active)" "$(row ga-p3 dog-remote-3 xdog-remote active)" "$(row ga-p4 dog-remote-4 gastown/xdog-remote active)" "$(row ga-p5 dog-remote-5 dog-remote-x active)"
+sessions "$(row ga-p1 dog-remote-1 gastown/dog-remote active)" "$(row ga-p2 dog-remote-2 core.dog-remote active)" "$(row ga-p3 outra-3 xdog-remote active)" "$(row ga-p4 outra-4 gastown/xdog-remote active)" "$(row ga-p5 outra-5 dog-remote-x active)"
 printf '{"versao":1,"sessoes":{"ga-p1":{"desde":1,"vivas_seguidas":9},"ga-p2":{"desde":1,"vivas_seguidas":9},"ga-p3":{"desde":1,"vivas_seguidas":9},"ga-p4":{"desde":1,"vivas_seguidas":9},"ga-p5":{"desde":1,"vivas_seguidas":9}},"atualizado_em":1}\n' > "$STATE"
 reap $T0
 check "templates: fecha <rig>/<template> e <pack>.<template>, e só eles" "ga-p1 ga-p2" "$(closed)"
+# ga-2hd02v.3.27: o NOME da família também abre a porta, MESMO com um `template` que não é nosso (não se sabe o que o engine põe no template da casca; perder o zumbi custa mais que o nome falso, que o engine não gera)
+new_world nomeVenceTemplate
+sessions "$(row ga-q1 dog-remote-6 xdog-remote active)"
+printf '{"versao":1,"sessoes":{"ga-q1":{"desde":1,"vivas_seguidas":9}},"atualizado_em":1}\n' > "$STATE"
+reap $T0
+check "templates: nome dog-remote-6 com template estranho ainda é visto pelo nome (decisão da ga-2hd02v.3.27)" "ga-q1" "$(closed)"
 
 # 33. entrada da lista de sessões que não é objeto é contada em ilegiveis e mais nada acontece com ela
 new_world ilegiveis
@@ -538,6 +544,58 @@ if [ -z "$pid" ]; then vivo=sem-pid; elif kill -0 "$pid" 2>/dev/null; then vivo=
 check "gc que trava: o processo foi morto ao estourar o teto" morto "$vivo"
 check "gc que trava: a rodada diz gc-timeout e não fecha" 1 "$(grep -c -F 'gc-timeout' "$W/out")"
 check "gc que trava: o estado não anda" "$before" "$(sum "$STATE")"
+
+# 35-41. ga-2hd02v.3.27: a sessão-casca (o engine a re-adotou depois de um reinício; a lista tende a sair SEM `template`, só id/session_name/state) tem de ser vista pelo NOME da família.
+# O incidente de 31/10: 3 revisores do gate (gate-reviewer-remote-adhoc-<hex>) parados 7 h a 1 dia, contados pelo vigia de ocupação e invisíveis aqui (sessoes=0).
+stub() { # stub <id> <session_name> <state> [extra json, ex.: ,"agent_name":"x"]: linha SEM template, como a lista devolve a casca
+  printf '{"id":"%s","session_name":"%s","state":"%s","attached":false,"closed":false%s}' "$1" "$2" "$3" "${4:-}"
+}
+resumo() { sed 's/^[^ ]* //' "$W/out"; }
+
+new_world cascaIncidente
+sessions "$(stub ga-axm0ves gate-reviewer-remote-adhoc-492d8c2307 active)" "$(stub ga-iw1plal gate-reviewer-remote-adhoc-0db7f9547a active)" "$(stub ga-x0abe5g gate-reviewer-remote-adhoc-bd1fccde3c active)"
+reap $T0
+check "casca do incidente: a 1ª leitura já VÊ as 3 (sessoes=3, antes do conserto era 0)" "sessoes=3 com_bead=0 fechadas=0 falhas=0 ilegiveis=0" "$(resumo)"
+reap $((T0+600)); reap $((T0+1200))
+check "casca do incidente: as 3 sem bead fecham na 3ª leitura" "ga-axm0ves ga-iw1plal ga-x0abe5g" "$(closed)"
+
+new_world cascaTemplateVazio
+sessions "$(stub ga-ttt gate-reviewer-remote-adhoc-aaaaaaaaaa active ',"template":""')" "$(stub ga-ddd dog-remote-2 active ',"template":null')"
+reap $T0; reap $((T0+600)); reap $((T0+1200))
+check "casca com template \"\" ou null: fecha pelo nome" "ga-ttt ga-ddd" "$(closed)"
+
+new_world cascaOutroHost
+sessions "$(stub ga-mmm dog-remote-mbp-1 active)" "$(stub ga-nnn gate-reviewer-remote-mbp-adhoc-1 active)"
+reap $T0; reap $((T0+600)); reap $((T0+1200))
+check "casca de outro host (-remote-mbp-): não é nossa, nunca fecha" "" "$(closed)"
+check "casca de outro host: sessoes=0" "sessoes=0 com_bead=0 fechadas=0 falhas=0 ilegiveis=0" "$(resumo)"
+REAP_X="HETZNER_REAP_OTHER_HOSTS="; reap $((T0+1800)); reap $((T0+2400)); reap $((T0+3000)); REAP_X=""
+check "HETZNER_REAP_OTHER_HOSTS vazio: nenhum host é excluído, a casca -mbp- passa a ser vista" "sessoes=2" "$(resumo | cut -d' ' -f1)"
+
+new_world cascaNaoNossa
+sessions "$(stub ga-w1 wa-worker-remote-9 active)" "$(stub ga-w2 gate-reviewer-remoteX-1 active)" "$(stub ga-w3 mayor active)" "$(stub ga-w4 dog-1 active)" "$(stub ga-w5 xdog-remote-1 active)"
+reap $T0; reap $((T0+600)); reap $((T0+1200))
+check "casca que não é de família nossa (wa-worker-remote, parecido, local): nunca fecha" "" "$(closed)"
+check "casca que não é de família nossa: sessoes=0" "sessoes=0 com_bead=0 fechadas=0 falhas=0 ilegiveis=0" "$(resumo)"
+
+new_world cascaComBead
+sessions "$(stub ga-aaa gate-reviewer-remote-adhoc-1111111111 active)" "$(stub ga-bbb gate-reviewer-remote-adhoc-2222222222 active)"
+printf '[{"id":"ga-b1","status":"in_progress","assignee":"gate-reviewer-remote-adhoc-1111111111"},{"id":"ga-b2","status":"open","assignee":"ga-bbb"}]\n' > "$FAKE/beads.json"
+for d in 0 600 1200 2400; do reap $((T0+d)); done
+check "casca com bead in_progress no session_name ou aberta no id: não fecha" "" "$(closed)"
+check "casca com bead: com_bead=2" "sessoes=2 com_bead=2 fechadas=0 falhas=0 ilegiveis=0" "$(resumo)"
+
+new_world cascaAgentName
+sessions "$(stub ga-aaa gate-reviewer-remote-adhoc-3333333333 active ',"agent_name":"gate-reviewer-remote-adhoc-4444444444"')"
+bead gate-reviewer-remote-adhoc-4444444444
+for d in 0 600 1200 2400; do reap $((T0+d)); done
+check "bead no agent_name (nome diferente do session_name): segura a casca" "" "$(closed)"
+
+# a casca que a lista marca como fechada, ou o estado que não é vivo, nunca é fechada de novo (a mesma regra das linhas com template)
+new_world cascaFechadaDorme
+sessions "$(stub ga-ccc gate-reviewer-remote-adhoc-5555555555 asleep)" "$(printf '{"id":"ga-ddd","session_name":"gate-reviewer-remote-adhoc-6666666666","state":"active","closed":true}')"
+reap $T0; reap $((T0+600)); reap $((T0+1200))
+check "casca dormindo ou já fechada: não fecha (a dormindo nem 'viva' é; a fechada nem entra)" "" "$(closed)"
 
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
