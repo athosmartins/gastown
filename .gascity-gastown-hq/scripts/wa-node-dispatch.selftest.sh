@@ -11,6 +11,8 @@
 #   N SLOTS (ga-2hd02v.3): WA_NODE_SPAWN=pilot com WA_NODE_SLOTS aliases · escolhe o 1º alias sem bead e sem sessão viva · todos ocupados = 12 · leitura de qualquer alias ilegível = 11 · só `pilot` consulta o oráculo de capacidade
 #   (local = 12; ausente, mudo, lento, incoerente ou sem `free` = 11; as beads atribuídas cuja sessão não subiu descontam da vaga) · a bead leva a marca pilot.wa_node_alias e NUNCA gc.routed_to · pool continua com 1 slot · N inválido = 1 ·
 #   release solta as duas formas e só de alias do nó.
+#   PULO DE ALIAS (ga-2hd02v.3.26): WA_NODE_SKIP_ALIASES (espaço ou vírgula) tira aliases de PICK e da sessão ociosa reaproveitada, mas eles seguem na conta de slots e de sessões vivas · tudo pulado = 12 slot-sem-alias-livre ·
+#   token ilegível (glob, aspas, ;) é IGNORADO, nunca vira «pular todos» · vazio = o de sempre.
 #   IDENTIDADE (ga-2hd02v.3): WA_NODE_SELF e WA_NODE_STORY trocam o nome que as mensagens e o comentário da bead usam e a bead que o comentário cita (o wrapper da bead de PS) · padrão = o texto da 1.10 byte a byte
 #   nas partes fixas · vazio = padrão · valor com espaço, aspa, $, crase, ;, barra, quebra de linha ou acima de 64 caracteres = padrão (o valor vai para um comentário DA BEAD) · 64 exatos passam.
 # CONTROLE NEGATIVO: cada mutante troca UMA linha numa cópia do script e o caso designado tem de reprovar; mutante que sobrevive reprova esta bateria.
@@ -113,7 +115,7 @@ PYEOF
 CAPOUT="$T/cap.json"; CAPRC="$T/cap.rc"; CAPCALLS="$T/cap.calls"
 export STUB_CALLS="$CALLS" STUB_STATE="$STATE" STUB_GCCALLS="$GCCALLS" STUB_SESS="$SESS" STUB_CLSOUT="$CLSOUT" STUB_CLSRC="$CLSRC" STUB_CAP_OUT="$CAPOUT" STUB_CAP_RC="$CAPRC" STUB_CAP_CALLS="$CAPCALLS"
 export GC_CITY="$CITY" WA_NODE_BD="$T/bd" WA_NODE_GC="$T/gc" WA_NODE_CLASSIFY="$T/cls.py" WA_NODE_LOG="$CITY/.gc/wa-node-route.jsonl" WA_NODE_TIMEOUT=20
-export WA_NODE_CAPACITY="$T/cap.py"; unset WA_NODE_SPAWN WA_NODE_SLOTS WA_NODE_ALIAS WA_NODE_ALIAS_PREFIX WA_NODE_CAPACITY_TIMEOUT   # o ambiente de quem roda não vaza para a bateria
+export WA_NODE_CAPACITY="$T/cap.py"; unset WA_NODE_SPAWN WA_NODE_SLOTS WA_NODE_ALIAS WA_NODE_ALIAS_PREFIX WA_NODE_CAPACITY_TIMEOUT WA_NODE_SKIP_ALIASES   # o ambiente de quem roda não vaza para a bateria
 
 NODE_TEXT='{"verdict":"node","basis":"text","reasons":["prova-no-texto:1-teste(s)+1-codigo"],"paths":[],"tests":[],"info":[]}'
 NODE_LABEL='{"verdict":"node","basis":"label","reasons":["etiqueta-node:ok"],"paths":[],"tests":[],"info":[]}'
@@ -399,6 +401,38 @@ mkdir -p "$T/failjq"; REAL_JQ=$(command -v jq)
 printf '#!/bin/sh\ncase "$*" in *fromdateiso8601*) exit 5 ;; esac\nexec "%s" "$@"\n' "$REAL_JQ" > "$T/failjq/jq"; chmod +x "$T/failjq/jq"
 fresh; busyat 1; sessions "[$(live 1),$(quiet 2),$(quiet 3)]"; PATH="$T/failjq:$PATH" pm apply wa-t1; expect_rc "ociosa: o jq da ociosidade falha (rc 5) -> 11 sem escrita" 11 w0
 grep -q 'ociosidade-ilegivel' "$CITY/.gc/wa-node-route.jsonl" && ok "ociosa: o log diz ociosidade-ilegivel" || bad "ociosa: log: $(cat "$CITY/.gc/wa-node-route.jsonl")"
+# -- pular alias (ga-2hd02v.3.26). O gancho do Pilot achou a sessão do alias que o apply escolheu viva e ocupada (31/10 09:47:57Z: o apply reaproveitou o -1 «ociosa», 19 s depois a lista do gancho a viu busy) e repete o apply SEM ele.
+#    vazio/ausente = o de sempre; o alias pulado nunca é PICK nem sessão ociosa reaproveitada, mas SEGUE na conta de slots e de sessões vivas; token ilegível é ignorado (nunca vira «pular todos»).
+fresh; pm apply wa-t1; expect_rc "pulo: sem WA_NODE_SKIP_ALIASES o 1º alias livre (-1), como sempre -> 0" 0
+[ "$(who)" = wa-worker-remote-1 ] && ok "pulo: sem o pulo vai para o -1" || bad "pulo: foi para $(who)"
+fresh; WA_NODE_SKIP_ALIASES=wa-worker-remote-1 pm apply wa-t1; expect_rc "pulo: -1 pulado, nenhuma outra sessão -> 0" 0
+[ "$(who)" = wa-worker-remote-2 ] && [ "$(mark)" = wa-worker-remote-2 ] && ok "pulo: vai para o -2 (dono e marca do alias novo)" || bad "pulo: foi para $(who) marca=$(mark)"
+fresh; WA_NODE_SKIP_ALIASES="wa-worker-remote-1,wa-worker-remote-2" pm apply wa-t1; expect_rc "pulo: -1 e -2 pulados (vírgula) -> 0" 0
+[ "$(who)" = wa-worker-remote-3 ] && ok "pulo: lista com vírgula vai para o -3" || bad "pulo: vírgula foi para $(who)"
+fresh; WA_NODE_SKIP_ALIASES="wa-worker-remote-1 wa-worker-remote-2" pm apply wa-t1; expect_rc "pulo: -1 e -2 pulados (espaço) -> 0" 0
+[ "$(who)" = wa-worker-remote-3 ] && ok "pulo: lista com espaço vai para o -3" || bad "pulo: espaço foi para $(who)"
+fresh; WA_NODE_SKIP_ALIASES="wa-worker-remote-1 wa-worker-remote-2 wa-worker-remote-3" pm apply wa-t1; expect_rc "pulo: todos pulados -> 12 sem escrita" 12 w0
+grep -q 'slot-sem-alias-livre' "$CITY/.gc/wa-node-route.jsonl" && ok "pulo: o log diz slot-sem-alias-livre (o token de sempre)" || bad "pulo: log: $(cat "$CITY/.gc/wa-node-route.jsonl")"
+printf '%s' "$OUT" | grep -q 'foi pulado (' && ok "pulo: a mensagem diz que houve pulo" || bad "pulo: mensagem: $OUT"
+fresh; WA_NODE_SKIP_ALIASES="wa-worker-remote-1 wa-worker-remote-2 wa-worker-remote-3 ;rm * \$(x)" pm apply wa-t1; expect_rc "pulo: todos pulados + lixo -> 12 sem escrita" 12 w0
+case "$OUT" in *';rm'*|*'$(x)'*) bad "pulo: o token ilegível apareceu na mensagem: $OUT" ;; *) ok "pulo: token ilegível não entra na mensagem" ;; esac
+# lixo sozinho NUNCA pula nada (nenhum alias real tem esse nome)
+for junk in '*' ';' '$(touch x)' "'" '"wa-worker-remote-1"' '..' ' ' ',,' 'wa-worker-remote-1;'; do
+  fresh; WA_NODE_SKIP_ALIASES="$junk" pm apply wa-t1; [ "$RC" = 0 ] && [ "$(who)" = wa-worker-remote-1 ] && ok "pulo: valor ilegível '$junk' não pula nada -> -1" || bad "pulo: '$junk' rc=$RC foi para $(who)"
+done
+fresh; WA_NODE_SKIP_ALIASES="" pm apply wa-t1; [ "$RC" = 0 ] && [ "$(who)" = wa-worker-remote-1 ] && ok "pulo: valor vazio = o de sempre" || bad "pulo: vazio rc=$RC foi para $(who)"
+# o pulado SEGUE contando: uma bead em andamento no alias pulado continua ocupando o slot (e uma sessão viva continua contando)
+fresh; busyat 1; busyat 2; WA_NODE_SKIP_ALIASES=wa-worker-remote-3 pm apply wa-t1; expect_rc "pulo: -1 e -2 com bead e o -3 pulado -> 12 sem escrita (pular não inventa vaga)" 12 w0
+fresh; sessions "[$(live 1),$(live 2),$(live 3)]"; WA_NODE_SKIP_ALIASES=wa-worker-remote-3 pm apply wa-t1; expect_rc "pulo: 3 sessões vivas em 3 slots, o -3 pulado -> 12 sem escrita (a sessão do pulado segue contando)" 12 w0
+grep -q 'sessao-viva n=3' "$CITY/.gc/wa-node-route.jsonl" && ok "pulo: o log segue com sessao-viva n=3 (o pulado não sai da conta)" || bad "pulo: log: $(cat "$CITY/.gc/wa-node-route.jsonl")"
+# a sessão ociosa do alias pulado NÃO é reaproveitada: o apply refeito pega outra
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2),$(quiet 3)]"; WA_NODE_SKIP_ALIASES=wa-worker-remote-2 pm apply wa-t1; expect_rc "pulo: -2 e -3 ociosas, o -2 pulado -> 0" 0
+[ "$(who)" = wa-worker-remote-3 ] && ok "pulo: reaproveita a ociosa do -3, não a do -2 pulado" || bad "pulo: foi para $(who)"
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2),$(quiet 3)]"; WA_NODE_SKIP_ALIASES="wa-worker-remote-2 wa-worker-remote-3" pm apply wa-t1; expect_rc "pulo: as duas ociosas puladas -> 12 sem escrita (o -1 tem bead; sessão viva segue contando)" 12 w0
+fresh; sessions "[$(quiet 3)]"; WA_NODE_SKIP_ALIASES=wa-worker-remote-3 pm apply wa-t1; expect_rc "pulo: só a ociosa do -3 e ela pulada -> 0 em alias novo" 0
+[ "$(who)" = wa-worker-remote-1 ] && ok "pulo: sem a ociosa do -3, abre o alias livre (-1)" || bad "pulo: foi para $(who)"
+# o pulo não dispensa o resto: oráculo local ainda manda
+fresh; cap "$CAP_LOCAL" 1; WA_NODE_SKIP_ALIASES=wa-worker-remote-1 pm apply wa-t1; expect_rc "pulo: oráculo diz local -> 12 sem escrita (pular não dispensa o oráculo)" 12 w0
 # -- leituras ilegíveis: qualquer uma = 11, nunca livre
 fresh; STUB_FAIL_LIST_ALIAS=wa-worker-remote-2 pm apply wa-t1; expect_rc "slots: a leitura do -2 falha (o -1 estava livre) -> 11 sem escrita" 11 w0
 fresh; STUB_FAIL_LIST_ALIAS=wa-worker-remote-3 pm apply wa-t1; expect_rc "slots: a leitura do -3 falha -> 11 sem escrita" 11 w0
@@ -722,6 +756,14 @@ mutant ociosa-rastro 'rn=" [sessão ociosa reaproveitada]"' 'rn=""'
 fresh; busyat 1; sessions "[$(live 1),$(quiet 2),$(quiet 3)]"; pm apply wa-t1; if grep -q 'reaproveitada' "$CITY/.gc/wa-node-route.jsonl"; then survived; else killed; fi
 mutant ociosa-ilegivel-segue 'ok) ;; *) jlog apply "$id" 11 "ociosidade-ilegivel"; die 11 "não consegui avaliar quais sessões estão ociosas — fica no mini" ;; esac' 'ok) ;; *) ;; esac'
 fresh; busyat 1; sessions "[$(live 1),$(quiet 2),$(quiet 3)]"; PATH="$T/failjq:$PATH" pm apply wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
+mutant pulo-ignorado-no-pick 'for A in $free_a; do skipped "$A" && continue; printf' 'for A in $free_a; do printf'
+fresh; WA_NODE_SKIP_ALIASES=wa-worker-remote-1 pm apply wa-t1; if [ "$(who)" = wa-worker-remote-1 ]; then survived; else killed; fi
+mutant pulo-ignorado-na-ociosa 'skipped "$A" && continue                                                 # ga-2hd02v.3.26: o gancho' ': # ga-2hd02v.3.26: o gancho'
+fresh; busyat 1; sessions "[$(live 1),$(quiet 2),$(quiet 3)]"; WA_NODE_SKIP_ALIASES=wa-worker-remote-2 pm apply wa-t1; if [ "$(who)" = wa-worker-remote-2 ]; then survived; else killed; fi
+mutant pulo-lixo-entra "case \"\$_sk\" in ''|*[!A-Za-z0-9._-]*) continue ;; esac" "case \"\$_sk\" in '') continue ;; esac"
+fresh; WA_NODE_SKIP_ALIASES="wa-worker-remote-1 wa-worker-remote-2 wa-worker-remote-3 ;rm" pm apply wa-t1; case "$OUT" in *';rm'*) survived ;; *) killed ;; esac
+mutant pulo-sai-da-conta 'if [ $((live - n_reuse)) -ge "$SLOTS" ]; then jlog apply' 'if [ $((live - n_reuse - $(printf '"'"'%s\n'"'"' "$live_al" | grep -cxF -- "${SKIP# }" || true))) -ge "$SLOTS" ]; then jlog apply'
+fresh; sessions "[$(live 1),$(live 2),$(live 3)]"; WA_NODE_SKIP_ALIASES=wa-worker-remote-3 pm apply wa-t1; if [ "$RC" != 12 ]; then survived; else killed; fi
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

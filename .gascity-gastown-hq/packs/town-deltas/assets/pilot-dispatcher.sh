@@ -12170,6 +12170,16 @@ _pilot_node_only_wa_pre() {
     _basis=label
     printf '%s' "$_b" | jq -e '(.labels // []) | index("node:ok")' >/dev/null 2>&1 || return 1
   fi
+  # ga-2hd02v.3.26: esta passada dava o nó à P2+ sem passar pela retenção do waiter da cessão (_pilot_wa_node_pass_hold_for) nem pela reserva do P0/P1 cujo gancho falhou: medido 31/10 06:12, a P3 wa-x5zg10 levou o nó
+  # na mesma varredura em que o gancho da P1 falhou. Agora a P2..P4 retida NÃO gasta sonda nem claim: pulada aqui, sem escrever. vazio (sem reserva e sem veredito final de waiter) → segue como sempre; falhou/ilegível
+  # (classe da bead que não se lê, retenção expirada) → segue também (classe ilegível nunca segura trabalho; o aviso está dentro do helper).
+  if _pilot_node_p2_hold_for "$_b"; then
+    _PNH_HELD=$(( ${_PNH_HELD:-0} + 1 ))
+    if [ "$_PNH_HELD" = 1 ]; then
+      log "  ga-2hd02v.3.26: passada só-nó — $_id (P2+) fica fora do nó nesta varredura (${_PNH_WHY:-?}): ${_PNR_RESERVED_IDS:+reserva do P0/P1 ($_PNR_RESERVED_IDS) · }waiter da cessão ${_PY_WAIT_ID:-nenhum} com veredito '${_PWP_WV_FINAL:-}'; as demais P2+ também (contadas, sem outro aviso)"
+    fi
+    return 1
+  fi
   case "$_cap" in ''|*[!0-9]*) _cap=6 ;; esac
   [ "$_PNW_PROBES" -lt "$_cap" ] || return 1
   _dir="${PILOT_WA_NODE_SCRIPTS:-$GC_CITY/scripts}"
@@ -12748,6 +12758,8 @@ _pilot_kimi_lane_pass() {
 # A leitura do slot e das sessões tem os três estados dentro do wa-node-dispatch.sh (ocupado ou "não sei" = não vai).
 _pilot_wa_node_decide() {
   local _id="${1:-}" _store="${2:-}" _tgt="${3:-}" _mode="${PILOT_WA_NODE_ROUTE:-off}" _dir _out="" _rc=0 _basis=any _bj="" _bo=""
+  # ga-2hd02v.3.26: a cópia da bead que o gancho releu, para a reserva do nó ler a prioridade de quem falhou. vazio (nenhuma releitura: saiu antes) → "" e a classe não se lê → nada é reservado.
+  _PWN_BJ=""
   # ga-2hd02v.9: o rc do `apply` DESTA chamada, para a passada de WA decidir por ele (12 = nó cheio; 10/11 = a bead não é do nó). Zerado na entrada: sair antes do apply deixa vazio, nunca o rc de outra bead.
   _PWN_APPLY_RC=""
   case "$_mode" in shadow|label|auto) ;; *) return 1 ;; esac
@@ -12763,6 +12775,13 @@ _pilot_wa_node_decide() {
       node) warn "wa-node: $_id já é do nó (dono ou rota wa-worker-remote*) — seguro: sem carimbo do mini e sem sessão do mini; a próxima varredura relê"; return 2 ;;
       *) warn "wa-node: não consegui reler $_id — não sei se já é do nó; seguro: sem carimbo do mini e sem sessão do mini; a próxima varredura relê"; return 2 ;;
     esac
+    _PWN_BJ="$_bj"
+    # ga-2hd02v.3.26: a P2+ NÃO toma o nó numa varredura em que o gancho de um P0/P1 falhou (a reserva, _pilot_node_reserve_set): a vaga que ele não conseguiu usar é dele na próxima varredura, e não da P3 que chegou depois.
+    # vazio (nenhuma reserva nesta varredura) → segue; falhou/ilegível (a classe da bead não se lê) → segue também, com aviso: classe ilegível nunca segura trabalho (a regra do yield). Nada escrito: 1, a bead segue como estava.
+    if _pilot_node_reserved_for "$_bj"; then
+      log "  ga-2hd02v.3.26: $_id (P2+) NÃO vai ao nó nesta varredura — o nó está reservado para o P0/P1 cujo gancho falhou (ids:${_PNR_RESERVED_IDS:-}) (PILOT_WA_NODE_RESERVE=0 desliga); nada escrito"
+      return 1
+    fi
   fi
   _dir="${PILOT_WA_NODE_SCRIPTS:-$GC_CITY/scripts}"
   if [ ! -x "$_dir/wa-node-dispatch.sh" ]; then
@@ -12797,9 +12816,9 @@ _pilot_wa_node_decide() {
   fi
   case "$_rc" in
     0) ;;
-    13|124|137|143) warn "wa-node: $_id — resultado da escrita desconhecido (rc=$_rc); não despacho esta varredura"; _pilot_wa_node_settle "$_id" "$_store"; return 2 ;;
+    13|124|137|143) warn "wa-node: $_id — resultado da escrita desconhecido (rc=$_rc); não despacho esta varredura"; _pilot_wa_node_settle "$_id" "$_store"; _pilot_node_reserve_set "$_bj" "$_id" "apply rc=$_rc (resultado incerto)" 2; return 2 ;;
     # morto por qualquer outro sinal (128+n: HUP 129, INT 130, QUIT 131, ABRT 134, SEGV 139, PIPE 141...) = o mesmo "não sei se já escreveu"; 125-127 (o timeout falhou, não deu para executar, não achou) e o resto: nada rodou
-    12[89]|1[3-9][0-9]|2[0-4][0-9]|25[0-5]) warn "wa-node: $_id — o despachante morreu por sinal (rc=$_rc); a escrita pode ter acontecido; não despacho esta varredura"; _pilot_wa_node_settle "$_id" "$_store"; return 2 ;;
+    12[89]|1[3-9][0-9]|2[0-4][0-9]|25[0-5]) warn "wa-node: $_id — o despachante morreu por sinal (rc=$_rc); a escrita pode ter acontecido; não despacho esta varredura"; _pilot_wa_node_settle "$_id" "$_store"; _pilot_node_reserve_set "$_bj" "$_id" "apply rc=$_rc (morto por sinal)" 2; return 2 ;;
     *) return 1 ;;
   esac
   if [ "$_PWN_SPAWN" = pilot ]; then
@@ -12892,6 +12911,9 @@ _pilot_node_idle_secs() {
 _pilot_node_remote_open() {
   local _ro_tpl="$1" _ro_alias="$2" _ro_id="$3" _ro_store="$4" _ro_title="$5" _ro_key="$6" _ro_idle="${7:-}" _ro_rig="${8:-}" _ro_sj="" _ro_st="" _ro_rc=0 _ro_t0=0 _ro_step="" _ro_sess=0 _ro_msg=""
   case "$_ro_idle" in ''|*[!0-9]*) _ro_idle=-1 ;; esac
+  # ga-2hd02v.3.26: o QUE falhou, para quem chama decidir se vale outro alias. vazio (abriu, ou ainda não falhou) → "" e alias ""; falhou → "busy" (o alias tinha sessão viva: SÓ este é do alias) ou "other" (lista ilegível,
+  # decisão que não saiu, sessão que não abriu, aviso que falhou: nada disso é do alias, outro alias não conserta). Zerado na entrada: ler o que sobrou de outra chamada nunca vira "busy".
+  _PNR_FAIL=""; _PNR_FAIL_ALIAS=""
   [ -n "$_ro_rig" ] || _ro_rig="$_ro_store"
   _ro_sj=$(gc_json_or_unknown timeout 20 gc --city "$GC_CITY" session list --json) || _ro_sj=""
   if ! printf '%s' "$_ro_sj" | jq -e '.sessions | type == "array"' >/dev/null 2>&1; then
@@ -12930,6 +12952,8 @@ _pilot_node_remote_open() {
     [ "$_ro_rc" -eq 0 ] || _ro_step="o aviso falhou (rc=$_ro_rc)"
   fi
   if [ -n "$_ro_step" ]; then
+    _PNR_FAIL=other; _PNR_FAIL_ALIAS="$_ro_alias"
+    if [ "$_ro_st" = busy ]; then _PNR_FAIL=busy; fi
     warn "ga-2hd02v.3: nó ($_ro_tpl): $_ro_id → $_ro_alias: $_ro_step — desfaço a escrita e a bead segue no mini"
     if _pilot_node_remote_rollback "$_ro_alias" "$_ro_id" "$_ro_store" "$_ro_sess" "$_ro_key"; then return 1; fi
     return 2
@@ -12943,21 +12967,80 @@ _pilot_node_remote_open() {
 # vazio (dono ou marca vazios) → 2 sem escrever; falhou/ilegível (bead que não leu, dono que não é wa-worker-remote-1..9, marca diferente do dono, status que não é in_progress) → 2 SEM escrever: não é o que o apply
 # escreve, e desfazer por cima de uma bead que outro mexeu pisaria nele; a próxima varredura relê.
 _pilot_wa_node_open() {
-  local _wo_id="${1:-}" _wo_store="${2:-}" _wo_rc=0
-  if ! _pilot_wa_node_read "$_wo_id" "$_wo_store"; then
-    warn "wa-node: não consegui reler $_wo_id depois do apply — não sei a qual alias abrir a sessão; seguro: sem sessão e sem desfazer; a próxima varredura relê"
-    return 2
-  fi
-  case "$_PWR_ALIAS" in
-    wa-worker-remote-[1-9]) ;;
-    *) warn "wa-node: $_wo_id depois do apply está com dono '${_PWR_ALIAS:-}' (esperava wa-worker-remote-<1-9>) — seguro: sem sessão e sem desfazer; a próxima varredura relê"; return 2 ;;
+  local _wo_id="${1:-}" _wo_store="${2:-}" _wo_rc=0 _wo_skip="" _wo_try=0 _wo_max=0 _wo_ra=0
+  # ga-2hd02v.3.26: o alias que o apply escolheu pode ter ganhado sessão viva entre a lista DELE e a do gancho (medido 31/10: 19 s de diferença, remote-1 «ociosa reaproveitada» e depois «busy»). Esse é o único
+  # fracasso que é do alias: o gancho desfaz (confirmado) e refaz o apply sem ele, no máximo min(SLOTS-1, 2) vezes. vazio (SLOTS ausente ou 1) → 0 tentativas: o desenho de sempre; falhou/ilegível (SLOTS que não seja
+  # UM dígito de 1 a 9) → 0 também. Lista ilegível, decisão, sessão que não abre e aviso que falha NÃO são do alias: outro alias não os conserta, então não há nova tentativa.
+  case "${_PWN_SLOTS:-1}" in [2-9]) _wo_max=$(( _PWN_SLOTS - 1 )); if [ "$_wo_max" -gt 2 ]; then _wo_max=2; fi ;; esac
+  while :; do
+    _wo_rc=0
+    if ! _pilot_wa_node_read "$_wo_id" "$_wo_store"; then
+      warn "wa-node: não consegui reler $_wo_id depois do apply — não sei a qual alias abrir a sessão; seguro: sem sessão e sem desfazer; a próxima varredura relê"
+      return 2
+    fi
+    case "$_PWR_ALIAS" in
+      wa-worker-remote-[1-9]) ;;
+      *) warn "wa-node: $_wo_id depois do apply está com dono '${_PWR_ALIAS:-}' (esperava wa-worker-remote-<1-9>) — seguro: sem sessão e sem desfazer; a próxima varredura relê"; return 2 ;;
+    esac
+    if [ "$_PWR_MARK" != "$_PWR_ALIAS" ] || [ "$_PWR_STATUS" != in_progress ]; then
+      warn "wa-node: $_wo_id depois do apply está com marca '${_PWR_MARK:-}' e status '$_PWR_STATUS' (esperava marca=$_PWR_ALIAS e in_progress) — seguro: sem sessão e sem desfazer; a próxima varredura relê"
+      return 2
+    fi
+    _pilot_node_remote_open wa-worker-remote "$_PWR_ALIAS" "$_wo_id" "$_wo_store" "$_PWR_TITLE" pilot.wa_node_alias "$(_pilot_node_idle_secs)" whatsapp_automation || _wo_rc=$?
+    # só o rc 1 (desfeito e CONFIRMADO: a bead está livre) por alias ocupado, com tentativa sobrando e o sweep ainda de pé, refaz o apply; o rc 2 (desfazer não confirmado) nunca: a bead pode estar com o alias
+    [ "$_wo_rc" = 1 ] || break
+    [ "${_PNR_FAIL:-}" = busy ] || break
+    [ "$_wo_try" -lt "$_wo_max" ] || break
+    case "${_PNR_FAIL_ALIAS:-}" in wa-worker-remote-[1-9]) ;; *) break ;; esac
+    if _pilot_slow_spawn_budget_spent || _pilot_dispatch_should_stop; then break; fi
+    _wo_try=$((_wo_try + 1)); _wo_skip="$_wo_skip $_PNR_FAIL_ALIAS"
+    log "  ga-2hd02v.3.26: $_wo_id — o alias $_PNR_FAIL_ALIAS já tinha sessão viva quando o gancho foi abrir (o apply e a lista do gancho divergiram); desfeito e confirmado — refaço o apply sem ele (tentativa $_wo_try de $_wo_max; pulados:$_wo_skip)"
+    _wo_ra=0; _pilot_wa_node_reapply "$_wo_id" "$_wo_store" "$_wo_skip" || _wo_ra=$?
+    if [ "$_wo_ra" != 0 ]; then _wo_rc="$_wo_ra"; break; fi
+  done
+  # a bead que o nó ficou (0) deixa a reserva; a que o gancho NÃO conseguiu pôr no nó (1 desfeito, 2 segura) reserva o nó para ela quando é P0/P1 e não tem o mini de reserva (_pilot_node_reserve_set decide)
+  case "$_wo_rc" in
+    0) _pilot_node_reserve_clear "$_wo_id" ;;
+    1|2) _pilot_node_reserve_set "${_PWN_BJ:-}" "$_wo_id" "a sessão do nó não abriu (${_PNR_FAIL:-?} em ${_PNR_FAIL_ALIAS:-?}; rc=$_wo_rc)" "$_wo_rc" ;;
   esac
-  if [ "$_PWR_MARK" != "$_PWR_ALIAS" ] || [ "$_PWR_STATUS" != in_progress ]; then
-    warn "wa-node: $_wo_id depois do apply está com marca '${_PWR_MARK:-}' e status '$_PWR_STATUS' (esperava marca=$_PWR_ALIAS e in_progress) — seguro: sem sessão e sem desfazer; a próxima varredura relê"
+  return "$_wo_rc"
+}
+
+# _pilot_wa_node_rc_uncertain <rc> — exit 0 iff o rc do `apply` diz «a escrita pode ter acontecido e não sei»: 13, prazo estourado (124), morto por sinal (137, 143, qualquer 128+n). É a tabela do _pilot_wa_node_decide, para
+# quem refaz o apply. 125-127 (o timeout falhou, não deu para executar, não achou) e o resto (10, 11, 12...): nada rodou, ou o script recusou. vazio/falhou (rc que não é número) → 1: não é incerto, mas quem chama só
+# chega aqui com o rc que acabou de medir.
+_pilot_wa_node_rc_uncertain() {
+  case "${1:-}" in
+    13|124|137|143|12[89]|1[3-9][0-9]|2[0-4][0-9]|25[0-5]) return 0 ;;
+  esac
+  return 1
+}
+
+# _pilot_wa_node_reapply <id> <loja> <aliases-a-pular> — o apply de NOVO, depois de a abertura ter desfeito (e confirmado) o alias que estava ocupado, com WA_NODE_SKIP_ALIASES. Mesmo contrato do trecho do decide: deixa o rc em
+# _PWN_APPLY_RC e a linha em wa-node-route.jsonl (campo skip); devolve 0 = o apply escreveu outro alias (quem chama relê a bead e abre) · 1 = nada escrito (script ausente, recusa 10/11, nó cheio 12): a bead segue livre ·
+# 2 = rc incerto, a escrita pode ter pegado: desfaz o que tem a cara do apply (settle), reserva o nó e devolve 2 (segura).
+# vazio (script executável, aliases a pular vazios) → um apply igual ao primeiro; falhou/ilegível (script que sumiu, rc que não é número) → 1: o estado inerte é não escrever.
+_pilot_wa_node_reapply() {
+  local _ra_id="${1:-}" _ra_store="${2:-}" _ra_skip="${3:-}" _ra_dir _ra_out="" _ra_rc=0 _ra_basis=any
+  case "${PILOT_WA_NODE_ROUTE:-}" in label) _ra_basis=label ;; esac
+  _ra_dir="${PILOT_WA_NODE_SCRIPTS:-$GC_CITY/scripts}"
+  if [ ! -x "$_ra_dir/wa-node-dispatch.sh" ]; then
+    warn "wa-node: $_ra_dir/wa-node-dispatch.sh não está executável — $_ra_id segue no mini"
+    return 1
+  fi
+  _ra_out=$(WA_NODE_SKIP_ALIASES="$_ra_skip" WA_NODE_SPAWN="${_PWN_SPAWN:-}" WA_NODE_SLOTS="${_PWN_SLOTS:-1}" timeout "${PILOT_WA_NODE_TIMEOUT:-90}" "$_ra_dir/wa-node-dispatch.sh" apply "$_ra_id" --store "$_ra_store" --basis "$_ra_basis" 2>/dev/null) || _ra_rc=$?
+  _PWN_APPLY_RC="$_ra_rc"
+  mkdir -p "$GC_CITY/.gc" 2>/dev/null || true
+  jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg b "$_ra_id" --arg m "${PILOT_WA_NODE_ROUTE:-}" --argjson rc "$_ra_rc" --arg o "$_ra_out" --arg sp "${_PWN_SPAWN:-}" --argjson sl "${_PWN_SLOTS:-1}" --arg sk "$_ra_skip" \
+    '{ts:$ts,event:"pilot-node-route",bead:$b,mode:$m,rc:$rc,out:$o,spawn:$sp,slots:$sl,skip:$sk}' >> "$GC_CITY/.gc/wa-node-route.jsonl" 2>/dev/null || true
+  if [ "$_ra_rc" = 0 ]; then return 0; fi
+  if _pilot_wa_node_rc_uncertain "$_ra_rc"; then
+    warn "wa-node: $_ra_id — resultado da escrita desconhecido no apply refeito (rc=$_ra_rc); não despacho esta varredura"
+    _pilot_wa_node_settle "$_ra_id" "$_ra_store"
+    _pilot_node_reserve_set "${_PWN_BJ:-}" "$_ra_id" "apply refeito rc=$_ra_rc (resultado incerto)" 2
     return 2
   fi
-  _pilot_node_remote_open wa-worker-remote "$_PWR_ALIAS" "$_wo_id" "$_wo_store" "$_PWR_TITLE" pilot.wa_node_alias "$(_pilot_node_idle_secs)" whatsapp_automation || _wo_rc=$?
-  return "$_wo_rc"
+  return 1
 }
 
 # _pilot_wa_node_settle <id> <loja> — SÓ no modo pilot, depois de um rc incerto do apply (13, prazo, sinal). A escrita pode ter pegado e então NINGUÉM abriria a sessão (no modo pool o pool a abre sozinho, pela rota; aqui a
@@ -13766,6 +13849,83 @@ _pilot_wa_node_pass_hold_for() {
   esac
 }
 
+# ── ga-2hd02v.3.26: a RESERVA do nó para o P0/P1 cujo gancho falhou ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# Medido 31/10 06:08-06:12: o gancho do P1 wa-s46yz2.1 falhou («não consegui ler a lista de sessões»), a passada parou (hook-held) e, NA MESMA varredura, a passada só-nó do disk floor deu o nó à P3 wa-x5zg10 — a P1 perdeu a vaga
+# que acabara de tentar usar. A reserva é o conjunto de ids em _PNR_RESERVED_IDS (" id1 id2 "), por VARREDURA: nasce quando o gancho de um P0/P1 falha SEM mini de reserva (passada de WA, passada só-nó, ou rc 2 «segura» em qualquer lugar)
+# e morre sozinha (o conjunto é zerado no começo da passada de WA, que roda uma vez por varredura antes das pistas; nada sobrevive no disco). Enquanto existir, a P2..P4 não toma o nó (decide, passada só-nó); o P0/P1 segue livre. Sem estado
+# entre varreduras de propósito: a falha persistente de um P0/P1 não congela o nó, porque na varredura seguinte ele é o PRIMEIRO a tentar e a P2+ só fica de fora depois que ELE falhou de novo. PILOT_WA_NODE_RESERVE=0 desliga a reserva.
+_PNR_RESERVED_IDS=""
+_PNR_RESERVED_N=0
+_PWP_WV_FINAL=""
+_PNH_HELD=0
+_PNH_WHY=""
+
+# _pilot_node_reserve_on — exit 0 iff a reserva está ligada. vazio (variável ausente) → ligada; ilegível (qualquer valor que não seja exatamente 0) → ligada também: o erro de digitação nunca desliga a proteção.
+_pilot_node_reserve_on() {
+  [ "${PILOT_WA_NODE_RESERVE:-1}" != 0 ]
+}
+
+# _pilot_node_reserve_set <bead-json> <id> <motivo> [<rc>] — registra a reserva do nó para <id> SE ele é P0/P1 e não tem o mini de reserva: dentro da passada de WA (_PILOT_WA_NODE_PASS=1) ou da passada só-nó (_PILOT_NODE_ONLY=1), ou
+# com <rc> = 2 (o gancho o SEGUROU: a bead pode estar com o nó e não vai ao mini nesta varredura). Fora disso o P0/P1 cai no pool do mini e o nó segue livre. Sempre devolve 0: a reserva nunca derruba a varredura.
+# vazio (sem id, sem JSON) → nada; falhou/ilegível (JSON que o jq não lê, biblioteca de ordem não carregada, classe 5 «não sei») → NÃO reserva e AVISA: classe ilegível nunca segura trabalho (a regra do yield); P2..P4 → nada
+# (a falha de uma P2+ não segura ninguém).
+_pilot_node_reserve_set() {
+  local _rs_b="${1:-}" _rs_id="${2:-}" _rs_why="${3:-}" _rs_rc="${4:-}" _rs_nb _rs_cls
+  _pilot_node_reserve_on || return 0
+  _rs_id="${_rs_id//[^A-Za-z0-9._-]/_}"
+  [ -n "$_rs_id" ] || return 0
+  if [ "$_rs_rc" != 2 ] && [ "${_PILOT_WA_NODE_PASS:-0}" != 1 ] && [ "${_PILOT_NODE_ONLY:-0}" != 1 ]; then return 0; fi
+  _rs_nb=$(printf '%s' "$_rs_b" | jq -c 'if type == "array" then .[0] else . end | select(type == "object")' 2>/dev/null) || _rs_nb=""
+  _rs_cls=$(_pilot_priority_class_of "$_rs_nb")
+  case "$_rs_cls" in
+    0|1) ;;
+    2|3|4) return 0 ;;
+    *) warn "ga-2hd02v.3.26: o gancho do nó falhou para $_rs_id ($_rs_why), mas a classe de prioridade dela não se lê — NÃO reservo o nó (classe ilegível nunca segura trabalho)"; return 0 ;;
+  esac
+  case "${_PNR_RESERVED_IDS:-}" in *" $_rs_id "*) return 0 ;; esac
+  _PNR_RESERVED_IDS="${_PNR_RESERVED_IDS:- }$_rs_id "
+  _PNR_RESERVED_N=$(( ${_PNR_RESERVED_N:-0} + 1 ))
+  log "  ga-2hd02v.3.26: o gancho do nó falhou para $_rs_id (P${_rs_cls}): $_rs_why — o nó fica RESERVADO para ela até o fim desta varredura: P2+ não toma a vaga (PILOT_WA_NODE_RESERVE=0 desliga)"
+  return 0
+}
+
+# _pilot_node_reserve_clear <id> — a bead ficou com o nó: tira-a da reserva (a vaga foi usada por quem era dela). vazio (id fora da reserva, ou reserva vazia) → nada. Sempre devolve 0.
+_pilot_node_reserve_clear() {
+  local _rc_id="${1:-}"
+  _rc_id="${_rc_id//[^A-Za-z0-9._-]/_}"
+  [ -n "$_rc_id" ] || return 0
+  case "${_PNR_RESERVED_IDS:-}" in *" $_rc_id "*) _PNR_RESERVED_IDS="${_PNR_RESERVED_IDS/ $_rc_id / }" ;; esac
+  return 0
+}
+
+# _pilot_node_reserved_for <bead-json> — exit 0 iff a reserva existe e esta bead é P2..P4 (não pode tomar o nó). 1 em tudo o mais: sem reserva, reserva desligada, P0/P1 e classe ilegível. Classe ilegível NÃO segura
+# (a regra do yield) mas AVISA, porque há uma reserva em pé e a bead passa por cima dela; não escreve nada.
+# vazio (nenhuma reserva nesta varredura) → 1 sem ler a bead; falhou/ilegível (JSON que não lê, biblioteca de ordem não carregada, classe 5) → 1 com aviso.
+_pilot_node_reserved_for() {
+  local _rf_b="${1:-}" _rf_nb _rf_cls
+  case "${_PNR_RESERVED_IDS:-}" in ''|' ') return 1 ;; esac
+  _pilot_node_reserve_on || return 1
+  _rf_nb=$(printf '%s' "$_rf_b" | jq -c 'if type == "array" then .[0] else . end | select(type == "object")' 2>/dev/null) || _rf_nb=""
+  _rf_cls=$(_pilot_priority_class_of "$_rf_nb")
+  case "$_rf_cls" in
+    2|3|4) return 0 ;;
+    0|1) return 1 ;;
+    *) warn "ga-2hd02v.3.26: há uma reserva do nó (${_PNR_RESERVED_IDS# }) e a classe de prioridade desta bead não se lê — ela NÃO é segurada (classe ilegível nunca segura trabalho)"; return 1 ;;
+  esac
+}
+
+# _pilot_node_p2_hold_for <bead-json> — exit 0 iff a P2..P4 NÃO deve tomar o nó agora, por um de dois motivos (deixa o motivo em _PNH_WHY): `reserved` (o gancho de um P0/P1 falhou nesta varredura) ou `waiter` (a retenção do
+# waiter da cessão: ele não tem veredito legível, _pilot_wa_node_pass_hold_for com o veredito FINAL da passada, _PWP_WV_FINAL). É o portão da passada só-nó do disk floor, que não passava por nenhum dos dois. 1 em tudo o mais.
+# vazio (sem reserva e sem veredito final: a passada não rodou ou não havia waiter de WA) → 1; falhou/ilegível (o rc 2 «classe ilegível» e o rc 3 «hold expirado» da retenção) → 1: não segura, como na passada.
+_pilot_node_p2_hold_for() {
+  local _ph_b="${1:-}" _ph_rc=0
+  _PNH_WHY=""
+  if _pilot_node_reserved_for "$_ph_b"; then _PNH_WHY=reserved; return 0; fi
+  _pilot_wa_node_pass_hold_for "$_ph_b" "${_PWP_WV_FINAL:-}" || _ph_rc=$?
+  if [ "$_ph_rc" = 0 ]; then _PNH_WHY=waiter; return 0; fi
+  return 1
+}
+
 # _pilot_wa_node_pass_why_verdict <_PWP_WHY> — o veredito do WAITER quando _pilot_wa_node_pass_pre diz não: imprime `out` (motivo DEFINITIVO: a passada SABE que ele não irá ao nó — dono, veto, rota alheia, node:mini, recusa do pool que
 # se leu, id que não é de WA, falta de node:ok no modo label) ou `blind` (NÃO SE SABE: unreadable, refusal-unknown — a bead ou a recusa do pool que não se leu —, motivo vazio e qualquer motivo que esta lista não conheça). Só `blind` segura a P2+.
 # O padrão é blind de propósito: um motivo NOVO do pré-filtro nunca solta a P2+ por omissão — tem de ser posto na lista de `out` por quem sabe que ele é definitivo (ga-2hd02v.3.16, gate 1: "não consegui ler" virava `out` e soltava a P2+).
@@ -13814,6 +13974,19 @@ _pilot_wa_node_pass_hold_put() {
   return 0
 }
 
+# _pilot_wa_node_pass_released_memo <bead-json> <id> <upd> — memoriza `released` (TTL de 15 min) para a bead que a passada soltou SEM chegar ao apply (adoção que falhou, orçamento de spawn gasto, script ausente), EXCETO P0/P1 (ga-2hd02v.3.26):
+# com a memória a P0/P1 pulava as passadas seguintes e a P3 ficava com a vaga que era dela. Ela é tentada de novo na varredura seguinte; o teto de falhas da passada (max-fails) já limita o custo. Sempre devolve 0.
+# vazio (classe P2..P4) → memoriza como sempre; falhou/ilegível (classe que não se lê: biblioteca de ordem não carregada, JSON que o jq não lê, classe 5) → memoriza também: classe ilegível nunca ganha trato especial (a regra do yield).
+_pilot_wa_node_pass_released_memo() {
+  local _rm_b="${1:-}" _rm_id="${2:-}" _rm_upd="${3:-}" _rm_cls
+  _rm_cls=$(_pilot_priority_class_of "$_rm_b")
+  case "$_rm_cls" in
+    0|1) log "  ga-2hd02v.3.26: $_rm_id (P${_rm_cls}) soltou sem chegar ao apply — NÃO memorizo «released»: P0/P1 é tentada de novo na próxima varredura, não daqui a 15 min"; return 0 ;;
+  esac
+  _pilot_wa_node_pass_memo_put "$_rm_id" "$_rm_upd" released
+  return 0
+}
+
 # _pilot_wa_node_pass — a passada. Uma vez por varredura, antes das pistas. Sempre devolve 0 (nada aqui derruba a varredura). Lê e, no modo on, reescreve SMALL_/BIG_CANDIDATES, _SLOTS e _COUNT e soma DISPATCHED.
 # Ordem de cada candidata: pré (sem escrita) → memória → orçamento (sondas e segundos) → `check` → (shadow: registra) / (on: dispatch_one). Para: despacho parado · vagas do nó esgotadas (_PWN_SLOTS) · falhas demais ·
 # apply rc 12 (nó cheio: capacidade é do nó, a bead NÃO é memorizada) · apply com outro rc (a escrita pode ter acontecido: para sem memorizar) · Dolt saturado (antes de escrever) · script ausente. Falha por bead (apply 10/11, ou nada chegou ao apply) é memorizada.
@@ -13826,6 +13999,8 @@ _pilot_wa_node_pass() {
   # _pw_expired = quantas P2+ foram ao nó por isso · _pw_wcount = quantas passadas seguidas o waiter está blind (com esta, se ele terminou blind)
   local _pw_trk=0 _pw_wreached=0 _pw_hx=0 _pw_expired=0 _pw_wcount=0
   _PWP_LAST_STOP=""
+  # ga-2hd02v.3.26: a reserva do nó e o veredito final do waiter valem POR VARREDURA: zerados aqui, antes do early return do modo off, para que nada de uma varredura anterior (ou de outra bead) segure a P2+ desta.
+  _PNR_RESERVED_IDS=""; _PNR_RESERVED_N=0; _PWP_WV_FINAL=""; _PNH_HELD=0
   _pilot_wa_node_pass_mode
   if [ "$_PWP_MODE" = off ]; then
     case "${PILOT_WA_NODE_EXEMPT:-off}" in
@@ -13975,7 +14150,7 @@ _pilot_wa_node_pass() {
         case "${_PWN_APPLY_RC:-}" in
           10) _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" mini; if [ "$_pw_isw" = 1 ]; then _pw_wv=out; fi ;;
           11) _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" unknown; if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi ;;
-          '') _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" released; if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi ;;
+          '') _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_released_memo "$_pw_pick" "$_pw_id" "$_pw_upd"; if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi ;;
           12) _pw_stop="capacity"; break ;;
           *)  if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi; _pw_stop="hook-held"; break ;;
         esac
@@ -13997,6 +14172,9 @@ _pilot_wa_node_pass() {
     esac
   fi
   _PILOT_WA_NODE_PASS=0
+  # ga-2hd02v.3.26: o veredito do waiter ao FIM da passada, para a passada só-nó do disk floor (que roda depois, na mesma varredura) segurar a P2+ pelo mesmo critério da passada. vazio (sem waiter de WA nas pistas) → "" e
+  # a retenção não vale (rc 1); falhou/ilegível não existe aqui: _pw_wv só recebe "" | unseen | node | out | blind.
+  _PWP_WV_FINAL="$_pw_wv"
   # vazio (nada pulado) → {} e "nenhuma"; falhou (jq) → {} também: é só o rótulo do log e do resumo, nenhuma decisão lê isto
   _pw_skj=$(printf '%s' "$_pw_skipped" | jq -cR 'split(" ") | map(select(length > 0)) | group_by(.) | map({key: .[0], value: length}) | from_entries' 2>/dev/null) || _pw_skj="{}"
   [ -n "$_pw_skj" ] || _pw_skj="{}"
@@ -14006,7 +14184,7 @@ _pilot_wa_node_pass() {
   [ -n "$_pw_rsj" ] || _pw_rsj="null"
   _pw_rs=$(printf '%s' "$_pw_rsj" | jq -r 'if . == null then "ilegivel" else (to_entries | map("\(.key)=\(.value)") | join(",")) end' 2>/dev/null) || _pw_rs="ilegivel"
   _PWP_LAST_STOP="${_pw_stop:-}"
-  log "ga-2hd02v.9: passada de WA no nó (modo=$_PWP_MODE): candidatas WA=$_pw_total · elegíveis=$_pw_elig (puladas: ${_pw_sk:-nenhuma}) · memória=$_pw_memo · sondadas=$_pw_probed (node $_pw_node · mini $_pw_mini · unknown $_pw_unk · timeout $_pw_tmo · erro $_pw_err) · ficaram com o nó=$_pw_kept · P2+ ao nó com P0/P1 esperando=$_pw_p2n · seguradas pelo waiter sem veredito=$_pw_held (classe ilegível, não segurada: $_pw_clsblind) · holds expirados=$_pw_expired · soltas=$_pw_rel · motivos: ${_pw_rs:-nenhum} · parou: ${_pw_stop:-fim da lista}"
+  log "ga-2hd02v.9: passada de WA no nó (modo=$_PWP_MODE): candidatas WA=$_pw_total · elegíveis=$_pw_elig (puladas: ${_pw_sk:-nenhuma}) · memória=$_pw_memo · sondadas=$_pw_probed (node $_pw_node · mini $_pw_mini · unknown $_pw_unk · timeout $_pw_tmo · erro $_pw_err) · ficaram com o nó=$_pw_kept · P2+ ao nó com P0/P1 esperando=$_pw_p2n · reservas do nó (gancho de P0/P1 falhou)=${_PNR_RESERVED_N:-0} · seguradas pelo waiter sem veredito=$_pw_held (classe ilegível, não segurada: $_pw_clsblind) · holds expirados=$_pw_expired · soltas=$_pw_rel · motivos: ${_pw_rs:-nenhum} · parou: ${_pw_stop:-fim da lista}"
   if [ "$_pw_held" -gt 0 ]; then
     log "ga-2hd02v.3.16: $_pw_held P2+ com veredito node NÃO foram ao nó: o waiter da cessão P${_PY_WAIT_PRIO:-?} ${_PY_WAIT_ID:-?} está sem veredito legível (${_pw_wv:-?}) — a vaga do nó fica para ele, nunca para uma P2+ num palpite sobre o waiter (PILOT_WA_NODE_PASS_HOLD=0 desliga; passadas blind seguidas contadas: ${_pw_wcount}, limite ${_PWP_HOLD_MAX} — ao alcançá-lo a P2+ segue ao nó; PILOT_WA_NODE_PASS_HOLD_MAX_SWEEPS=0 = sem limite, e aí nada é contado)."
   fi
@@ -14019,8 +14197,8 @@ _pilot_wa_node_pass() {
   { jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg m "$_PWP_MODE" --arg r "${PILOT_WA_NODE_ROUTE:-}" --arg stop "${_pw_stop:-none}" --argjson sk "$_pw_skj" --argjson rs "$_pw_rsj" \
       --argjson tot "$_pw_total" --argjson el "$_pw_elig" --argjson me "$_pw_memo" --argjson pr "$_pw_probed" --argjson nd "$_pw_node" --argjson mi "$_pw_mini" --argjson un "$_pw_unk" \
       --argjson tm "$_pw_tmo" --argjson er "$_pw_err" --argjson kp "$_pw_kept" --argjson rl "$_pw_rel" \
-      --argjson p2n "$_pw_p2n" --argjson hd "$_pw_held" --argjson cb "$_pw_clsblind" --argjson hx "$_pw_expired" --argjson wbp "$_pw_wcount" --arg wid "${_PY_WAIT_ID:-}" --arg wv "$_pw_wv" \
-      '{ts:$ts,event:"wa-node-pass-summary",mode:$m,route:$r,wa_candidates:$tot,eligible:$el,skipped:$sk,memo_hits:$me,probed:$pr,node:$nd,mini:$mi,unknown:$un,timeout:$tm,error:$er,kept:$kp,released:$rl,p2_to_node:$p2n,held:$hd,class_blind:$cb,hold_expired:$hx,waiter_blind_passes:$wbp,waiter:$wid,waiter_verdict:$wv,stopped:$stop,reasons:$rs}' >> "$_pw_log"; } 2>/dev/null \
+      --argjson rsv "${_PNR_RESERVED_N:-0}" --argjson p2n "$_pw_p2n" --argjson hd "$_pw_held" --argjson cb "$_pw_clsblind" --argjson hx "$_pw_expired" --argjson wbp "$_pw_wcount" --arg wid "${_PY_WAIT_ID:-}" --arg wv "$_pw_wv" \
+      '{ts:$ts,event:"wa-node-pass-summary",mode:$m,route:$r,wa_candidates:$tot,eligible:$el,skipped:$sk,memo_hits:$me,probed:$pr,node:$nd,mini:$mi,unknown:$un,timeout:$tm,error:$er,kept:$kp,released:$rl,p2_to_node:$p2n,node_reserved:$rsv,held:$hd,class_blind:$cb,hold_expired:$hx,waiter_blind_passes:$wbp,waiter:$wid,waiter_verdict:$wv,stopped:$stop,reasons:$rs}' >> "$_pw_log"; } 2>/dev/null \
     || warn "ga-2hd02v.9: não consegui gravar o resumo da passada de WA em $_pw_log"
   return 0
 }

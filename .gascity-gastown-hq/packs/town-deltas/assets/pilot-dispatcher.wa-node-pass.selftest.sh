@@ -51,8 +51,12 @@ F_WHYV="$(need_fn _pilot_wa_node_pass_why_verdict)"
 # ga-2hd02v.3.17: opcional DE PROPÓSITO (fn_src, não need_fn): num dispatcher sem o registro de motivos o arquivo tem de reprovar nos testes (6d), não abortar com FATAL
 F_PNOTE="$(fn_src _pilot_wa_node_pass_probe_note)"
 F_HPRIOR="$(need_fn _pilot_wa_node_pass_hold_prior)"; F_HPUT="$(need_fn _pilot_wa_node_pass_hold_put)"
+# ga-2hd02v.3.26: a memória «released» só para P2+ e a reserva do nó para o P0/P1 cujo gancho falhou. fn_src, não need_fn, DE PROPÓSITO: num dispatcher sem a fatia (o HEAD anterior) o arquivo tem de reprovar caso a
+# caso nos testes (6f), não abortar com FATAL — é o controle negativo que diz QUAIS casos o conserto muda
+F_RMEMO="$(fn_src _pilot_wa_node_pass_released_memo)"; F_RSON="$(fn_src _pilot_node_reserve_on)"; F_RSSET="$(fn_src _pilot_node_reserve_set)"; F_RSCLR="$(fn_src _pilot_node_reserve_clear)"
+F_RSFOR="$(fn_src _pilot_node_reserved_for)"; F_P2HOLD="$(fn_src _pilot_node_p2_hold_for)"
 VETO_LINE="$(grep -E '^PILOT_NODE_FIRST_VETO_LABELS="' "$DISPATCHER" | head -1)"
-PWP_INIT="$(grep -E '^(_PWP_[A-Z_]+|_PILOT_WA_NODE_PASS|_PWN_APPLY_RC)=' "$DISPATCHER")"
+PWP_INIT="$(grep -E '^(_PWP_[A-Z_]+|_PNR_[A-Z_]+|_PNH_[A-Z_]+|_PILOT_WA_NODE_PASS|_PWN_APPLY_RC|_PWN_BJ)=' "$DISPATCHER")"
 EXEMPT_LINE="$(grep -E '^PILOT_WA_NODE_EXEMPT="' "$DISPATCHER" | head -1)"
 { [ -n "$VETO_LINE" ] && [ -n "$PWP_INIT" ] && [ -n "$EXEMPT_LINE" ]; } || { echo "FATAL: config lines (veto / _PWP_* / PILOT_WA_NODE_EXEMPT) not found in $DISPATCHER" >&2; exit 2; }
 BLOCK_SRC="$(region '^  local _PYS_TARGET _PYS_NATIVE=0$' '^  # ── wa-root-worktree-isolation')"
@@ -142,7 +146,7 @@ PRELUDE='
   PILOT_WA_NODE_PASS_MEMO="$WORK/city/.gc/wa-node-pass-memo.tsv"; PILOT_WA_NODE_PASS_LOG="$WORK/city/.gc/wa-node-exempt.jsonl"
   PILOT_WA_NODE_PASS_HOLD_STATE="${T_HOLD_STATE-$WORK/city/.gc/wa-node-pass-hold.tsv}"
   [ -z "${T_HOLD_MAX+x}" ] || PILOT_WA_NODE_PASS_HOLD_MAX_SWEEPS="$T_HOLD_MAX"
-  eval "$F_VETO"; eval "$F_SPAWN"; eval "$F_MODE"; eval "$F_PRE"; eval "$F_MHIT"; eval "$F_MPUT"; eval "$F_CHECK"; eval "$F_STATE"; eval "$F_ADOPT"; eval "$F_UNADOPT"; eval "$F_CLASS"; eval "$F_HOLD"; eval "$F_WLANE"; eval "$F_WHYV"; eval "$F_HPRIOR"; eval "$F_HPUT"; eval "$F_PASS"; eval "$F_PNOTE"
+  eval "$F_VETO"; eval "$F_SPAWN"; eval "$F_MODE"; eval "$F_PRE"; eval "$F_MHIT"; eval "$F_MPUT"; eval "$F_CHECK"; eval "$F_STATE"; eval "$F_ADOPT"; eval "$F_UNADOPT"; eval "$F_CLASS"; eval "$F_HOLD"; eval "$F_WLANE"; eval "$F_WHYV"; eval "$F_HPRIOR"; eval "$F_HPUT"; eval "$F_RMEMO"; eval "$F_RSON"; eval "$F_RSSET"; eval "$F_RSCLR"; eval "$F_RSFOR"; eval "$F_P2HOLD"; eval "$F_PASS"; eval "$F_PNOTE"
   _PY_WAIT_ID="${T_WAIT-}"; _PY_WAIT_PRIO=1   # o waiter da cessão (ga-5fn5p3), como a varredura do waiter o deixa antes da passada; vazio = nenhum P0/P1 espera
   # T_REFUSAL vale para toda bead; com T_REFUSAL_ID, SÓ para a bead desse id (as demais: ninguém recusa) — é como o waiter tem a recusa ilegível e a P2 não
   _pilot_priority_refusal_of() { local _ri=""; if [ -n "${T_REFUSAL_ID-}" ]; then _ri=$(printf "%s" "$1" | jq -r ".id // empty" 2>/dev/null) || _ri=""; [ "$_ri" = "$T_REFUSAL_ID" ] || return 0; fi; case "${T_REFUSAL-}" in FAIL) return 1 ;; *) printf "%s" "${T_REFUSAL-}"; return 0 ;; esac; }
@@ -155,6 +159,8 @@ PRELUDE='
     local _i; _i=$(printf "%s" "$1" | jq -r .id)
     echo "$_i $2 $3 pass=${_PILOT_WA_NODE_PASS:-?}" >> "$WORK/d1.calls"
     _PWN_APPLY_RC=""; [ ! -f "$WORK/d1.apply.$_i" ] || _PWN_APPLY_RC=$(cat "$WORK/d1.apply.$_i")
+    # ga-2hd02v.3.26: o gancho real (decide→open) registra a reserva do nó quando a sessão não abre; d1.reserve.<id> (o rc do open) faz o stub fazer o mesmo, com a bead JSON que a passada entregou
+    [ ! -f "$WORK/d1.reserve.$_i" ] || _pilot_node_reserve_set "$1" "$_i" "stub: a sessão do nó não abriu" "$(cat "$WORK/d1.reserve.$_i")"
     DISPATCH_RESULT="r_$_i"
     return "$(cat "$WORK/d1.rc.$_i" 2>/dev/null || echo 1)"
   }
@@ -558,7 +564,8 @@ T_WAIT=wa-w1 T_SPAWN=pilot T_SLOTS=3 pass "[$W1,$P2A]" >/dev/null
 summ | jq -e '.held==1 and .p2_to_node==0 and .released==1 and .waiter_verdict=="blind"' >/dev/null 2>&1 && ok "(1b) apply rc 11: resumo held=1 p2_to_node=0 released=1 waiter_verdict=blind (não 'node')" || bad "(1b) resumo do apply rc 11: $(summ | cut -c1-300)"
 reset; chk wa-w1 0; chk wa-p2a 0; echo 1 > "$WORK/d1.rc.wa-w1"; setok wa-p2a
 T_WAIT=wa-w1 T_SPAWN=pilot T_SLOTS=3 pass "[$W1,$P2A]" >/dev/null
-[ "$(d1)" = "wa-w1 small feature pass=1;" ] && [ "$(memo_of)" = "wa-w1:released," ] && ok "(1b) waiter node + nada chegou ao apply: a P2 NÃO toma a vaga na mesma passada (memória released)" || bad "(1b) sem apply: d1=$(d1) memo=$(memo_of)"
+# ga-2hd02v.3.26: o waiter aqui é P1 — a memória «released» (TTL 900 s) só existe para P2+; a P1 é tentada de novo na varredura seguinte (a prova com P2 está em (6f))
+[ "$(d1)" = "wa-w1 small feature pass=1;" ] && [ "$(memo_of)" = "-" ] && ok "(1b) waiter P1 node + nada chegou ao apply: a P2 NÃO toma a vaga na mesma passada e a P1 NÃO fica memorizada released" || bad "(1b) sem apply: d1=$(d1) memo=$(memo_of)"
 summ | jq -e '.held==1 and .p2_to_node==0 and .released==1 and .waiter_verdict=="blind"' >/dev/null 2>&1 && ok "(1b) sem apply: resumo held=1 p2_to_node=0 waiter_verdict=blind" || bad "(1b) resumo sem apply: $(summ | cut -c1-300)"
 reset; chk wa-w1 0; chk wa-p2a 0; echo 1 > "$WORK/d1.rc.wa-w1"; echo 7 > "$WORK/d1.apply.wa-w1"; setok wa-p2a
 T_WAIT=wa-w1 T_SPAWN=pilot T_SLOTS=3 pass "[$W1,$P2A]" >/dev/null
@@ -816,6 +823,75 @@ printf '1\twa-w1\t-3\n' > "$HOLD_STATE"; r=$(prior wa-w1);                     [
 ( eval "$PRELUDE"; _pilot_wa_node_pass_hold_put 'wa-w x' 2 ) >/dev/null 2>&1
 r=$(prior 'wa-w x');                                                           [ "$r" = "rc=0 out=[2]" ] && [ "$(wc -l < "$HOLD_STATE" | tr -d ' ')" = 1 ] && ok "put/prior: id com espaço é normalizado igual nos dois lados e continua UMA linha de TSV" || bad "id estranho: $r linhas=$(wc -l < "$HOLD_STATE")"
 reset
+
+echo "── (6f) ga-2hd02v.3.26: o P0/P1 que perde o gancho NÃO perde a vaga — memória released só para P2+, reserva do nó, retenção na passada só-nó"
+# passx '<small json>' '<código depois da passada>' — roda a passada e depois o código (no MESMO shell: a reserva e o veredito final são do processo)
+passx() { SJ="$1" run_t 'SMALL_CANDIDATES="$SJ"; BIG_CANDIDATES="[]"; SMALL_COUNT=$(echo "$SMALL_CANDIDATES"|jq length 2>/dev/null || echo 0); BIG_COUNT=0
+    _pilot_wa_node_pass; '"$2"; }
+P1R="$(jbp 1 wa-r1 U1 wa-worker story:approved)"; P3A="$(jbp 3 wa-p3a U1 wa-worker story:approved)"
+hold_expr() { printf '%s' 'x=0; _pilot_node_p2_hold_for "$P3J" || x=$?; echo "hold=$x why=${_PNH_WHY:-} ids=[${_PNR_RESERVED_IDS:-}] n=${_PNR_RESERVED_N:-0} wv=${_PWP_WV_FINAL:-}"'; }
+export P3J="$P3A" P1J="$P1R"
+# (a) o gancho do P1 falha DEPOIS do apply (rc 0 = o nó foi escrito, a sessão não abriu → desfeito): a passada para, o P1 reserva o nó, a P3 do disk floor (mesma varredura) fica de fora
+reset; chk wa-r1 0; chk wa-p3a 0; echo 1 > "$WORK/d1.rc.wa-r1"; echo 0 > "$WORK/d1.apply.wa-r1"; echo 1 > "$WORK/d1.reserve.wa-r1"; setok wa-p3a
+r=$(passx "[$P1R,$P3A]" "$(hold_expr)")
+[ "$(d1)" = "wa-r1 small feature pass=1;" ] && ok "(6f) P1 com gancho falho (apply rc 0, sessão não abriu): a passada para ali — a P3 não é despachada" || bad "(6f) a P3 tomou a vaga na passada: d1=$(d1)"
+[ "$r" = "hold=0 why=reserved ids=[ wa-r1 ] n=1 wv=" ] && ok "(6f) a P3 FICA FORA do nó depois da falha do P1: reserva em pé (ids=[ wa-r1 ], 1), motivo 'reserved' (sem waiter da cessão: o veredito final é vazio) — a passada só-nó do disk floor não lhe dá a vaga" || bad "(6f) reserva/retenção após a falha do P1: '$r'"
+summ | jq -e '.stopped=="hook-held" and .node_reserved==1 and .p2_to_node==0' >/dev/null 2>&1 && ok "(6f) resumo da passada: stopped=hook-held node_reserved=1 p2_to_node=0" || bad "(6f) resumo da reserva: $(summ | cut -c1-300)"
+[ "$(memo_of)" = "-" ] && ok "(6f) o P1 que perdeu o gancho NÃO fica memorizado released (nem unknown): a próxima varredura o tenta de novo" || bad "(6f) memória do P1 após a falha: $(memo_of)"
+grep -q 'RESERVADO' "$WORK/lines" && ok "(6f) o log diz que o nó ficou RESERVADO e para quem" || bad "(6f) sem a linha da reserva no log: $(cat "$WORK/lines" 2>/dev/null | cut -c1-200)"
+# (b) o MESMO caso mas com P2+ reprovada no gancho: a falha de uma P2+ não reserva o nó (só P0/P1)
+reset; chk wa-p2a 0; echo 1 > "$WORK/d1.rc.wa-p2a"; echo 0 > "$WORK/d1.apply.wa-p2a"; echo 1 > "$WORK/d1.reserve.wa-p2a"
+r=$(passx "[$P2A]" "$(hold_expr)")
+case "$r" in "hold=1 why= ids=[] n=0"*) ok "(6f) o gancho de uma P2 que falha NÃO reserva o nó: $r" ;; *) bad "(6f) P2 reservou o nó: '$r'" ;; esac
+# (c) a reserva é por varredura e some sozinha: sem falha de gancho nada fica reservado, e uma P0/P1 NUNCA é retida pela reserva
+reset; chk wa-r1 0; chk wa-p3a 0; setok wa-r1 wa-p3a
+r=$(passx "[$P1R,$P3A]" "$(hold_expr)")
+case "$r" in "hold=1 why= ids=[] n=0"*) ok "(6f) passada sem falha de gancho: nenhuma reserva, a P3 não é retida: $r" ;; *) bad "(6f) reserva sem falha de gancho: '$r'" ;; esac
+reset; chk wa-r1 0; echo 1 > "$WORK/d1.rc.wa-r1"; echo 0 > "$WORK/d1.apply.wa-r1"; echo 1 > "$WORK/d1.reserve.wa-r1"
+r=$(passx "[$P1R]" 'x=0; _pilot_node_p2_hold_for "$P1J" || x=$?; echo "hold=$x"')
+[ "$r" = "hold=1" ] && ok "(6f) a reserva do P1 NÃO retém um P0/P1 (a outra P1 segue livre para tentar)" || bad "(6f) P1 retido pela reserva: '$r'"
+reset; chk wa-r1 0; echo 1 > "$WORK/d1.rc.wa-r1"; echo 0 > "$WORK/d1.apply.wa-r1"; echo 1 > "$WORK/d1.reserve.wa-r1"
+r=$(PILOT_WA_NODE_RESERVE=0 passx "[$P1R]" "$(hold_expr)")
+case "$r" in "hold=1 why= ids=[] n=0"*) ok "(6f) PILOT_WA_NODE_RESERVE=0 desliga a reserva: nada reservado, a P3 não é retida" ;; *) bad "(6f) PILOT_WA_NODE_RESERVE=0 não desligou: '$r'" ;; esac
+r=$(PILOT_WA_NODE_RESERVE=talvez passx "[$P1R]" "$(hold_expr)")
+case "$r" in "hold=0 why=reserved"*) ok "(6f) PILOT_WA_NODE_RESERVE='talvez' (ilegível): continua LIGADA — o erro de digitação nunca desliga a proteção" ;; *) bad "(6f) reserva ilegível desligou: '$r'" ;; esac
+# (d) o dispatch_one PRÓPRIO do gancho (rc 2 «segura») reserva mesmo fora das passadas; um rc 1 fora delas não (o P0/P1 cai no pool do mini)
+reset
+r=$(run_t '_PILOT_WA_NODE_PASS=0; _PILOT_NODE_ONLY=0; _pilot_node_reserve_set "$P1J" wa-r1 "teste" 1; echo "ids=[${_PNR_RESERVED_IDS:-}]"')
+[ "$r" = "ids=[]" ] && ok "(6f) rc 1 FORA das passadas (o P0/P1 cai no pool do mini): não reserva o nó" || bad "(6f) rc 1 fora das passadas reservou: '$r'"
+r=$(run_t '_PILOT_WA_NODE_PASS=0; _PILOT_NODE_ONLY=0; _pilot_node_reserve_set "$P1J" wa-r1 "teste" 2; echo "ids=[${_PNR_RESERVED_IDS:-}]"')
+[ "$r" = "ids=[ wa-r1 ]" ] && ok "(6f) rc 2 («segura», a bead pode estar com o nó) reserva mesmo fora das passadas" || bad "(6f) rc 2 não reservou: '$r'"
+r=$(run_t '_PILOT_WA_NODE_PASS=1; _pilot_node_reserve_set "$P1J" wa-r1 "teste" 1; _pilot_node_reserve_set "$P1J" wa-r1 "de novo" 1; echo "ids=[${_PNR_RESERVED_IDS:-}] n=${_PNR_RESERVED_N:-0}"')
+[ "$r" = "ids=[ wa-r1 ] n=1" ] && ok "(6f) a mesma bead reservada duas vezes conta UMA" || bad "(6f) reserva duplicada: '$r'"
+r=$(run_t '_PILOT_WA_NODE_PASS=1; _pilot_node_reserve_set "$P1J" wa-r1 "teste" 1; _pilot_node_reserve_clear wa-r1; echo "ids=[${_PNR_RESERVED_IDS:-}]"; x=0; _pilot_node_p2_hold_for "$P3J" || x=$?; echo "hold=$x"' )
+[ "$r" = "hold=1" ] && ok "(6f) a bead que ficou com o nó sai da reserva (clear): a P3 deixa de ser retida" || bad "(6f) clear não soltou a P3: '$r'"
+# (e) falhou/ilegível: classe da bead que não se lê → NÃO reserva e AVISA (classe ilegível nunca segura trabalho); id ilegível → nada
+reset
+r=$(run_t '_PILOT_WA_NODE_PASS=1; _pilot_node_reserve_set "isto não é json" wa-r1 "teste" 1; echo "ids=[${_PNR_RESERVED_IDS:-}]"')
+[ "$r" = "ids=[]" ] && grep -q 'classe de prioridade dela não se lê' "$WORK/lines" && ok "(6f) JSON da bead ilegível: NÃO reserva e avisa (nunca 'P0/P1' por palpite)" || bad "(6f) JSON ilegível: '$r' / $(cat "$WORK/lines" 2>/dev/null | cut -c1-200)"
+r=$(run_t '_PILOT_WA_NODE_PASS=1; _pilot_node_reserve_set "$P1J" "" "teste" 1; echo "ids=[${_PNR_RESERVED_IDS:-}]"')
+[ "$r" = "ids=[]" ] && ok "(6f) id vazio: não reserva" || bad "(6f) id vazio reservou: '$r'"
+reset
+r=$(run_t '_PNR_RESERVED_IDS=" wa-r1 "; x=0; _pilot_node_reserved_for "isto não é json" || x=$?; echo "x=$x"')
+[ "$r" = "x=1" ] && grep -q 'NÃO é segurada' "$WORK/lines" && ok "(6f) reserva em pé + bead cuja classe não se lê: NÃO é segurada, com aviso" || bad "(6f) classe ilegível segurou: '$r' / $(cat "$WORK/lines" 2>/dev/null | cut -c1-200)"
+# (f) a memória «released» é só de P2+ (a classe da biblioteca de ordem): a P2 sem apply fica memorizada 900 s como sempre; a P1, não
+reset; chk wa-p2a 0; echo 1 > "$WORK/d1.rc.wa-p2a"
+pass "[$P2A]" >/dev/null
+[ "$(memo_of)" = "wa-p2a:released," ] && ok "(6f) P2 que soltou sem chegar ao apply: memória released como sempre" || bad "(6f) P2 sem apply: memo=$(memo_of)"
+reset; chk wa-r1 0; echo 1 > "$WORK/d1.rc.wa-r1"
+pass "[$P1R]" >/dev/null
+[ "$(memo_of)" = "-" ] && grep -q 'NÃO memorizo' "$WORK/lines" && ok "(6f) P1 que soltou sem chegar ao apply: NÃO fica memorizada e o log diz por quê" || bad "(6f) P1 sem apply: memo=$(memo_of) / $(cat "$WORK/lines" 2>/dev/null | cut -c1-200)"
+reset; chk wa-r1 0; echo 1 > "$WORK/d1.rc.wa-r1"
+r=$(run_t '_pilot_wa_node_pass_released_memo "isto não é json" wa-zz U9; echo done'); [ "$(memo_of)" = "wa-zz:released," ] && ok "(6f) released_memo com bead ilegível: a classe não se lê → segue memorizando como antes (a regra de antes; só P0/P1 lida é isentada)" || bad "(6f) released_memo ilegível: memo=$(memo_of) r=$r"
+# (g) o veredito FINAL do waiter fica guardado e a passada só-nó o consulta: waiter blind segura a P2+ lá também
+reset; chk wa-w1 0; chk wa-p3a 0; echo 1 > "$WORK/d1.rc.wa-w1"; setok wa-p3a
+r=$(T_WAIT=wa-w1 T_SPAWN=pilot T_SLOTS=3 passx "[$W1,$P3A]" "$(hold_expr)")
+[ "$r" = "hold=0 why=waiter ids=[] n=0 wv=blind" ] && ok "(6f) waiter P1 que acabou blind: a passada só-nó (mesmo shell) retém a P3 — motivo 'waiter', veredito final 'blind'" || bad "(6f) retenção do waiter na só-nó: '$r'"
+reset; chk wa-w1 0; chk wa-p3a 0; setok wa-w1 wa-p3a
+r=$(T_WAIT=wa-w1 passx "[$W1,$P3A]" "$(hold_expr)")
+case "$r" in "hold=1 why= "*) ok "(6f) waiter que foi ao nó (veredito não é blind/unseen): a P3 não é retida na só-nó: $r" ;; *) bad "(6f) waiter despachado reteve a P3: '$r'" ;; esac
+r=$(run_t '_PY_WAIT_ID=wa-w1; x=0; _pilot_node_p2_hold_for "$P3J" || x=$?; echo "hold=$x wv=[${_PWP_WV_FINAL:-}]"')
+[ "$r" = "hold=1 wv=[]" ] && ok "(6f) passada que não rodou (veredito final vazio): a P3 não é retida — vazio nunca vira 'waiter cego'" || bad "(6f) veredito vazio reteve: '$r'"
 
 echo "── (7) dispatch_one: o bloco do yield e o braço do pool (regiões VERBATIM)"
 run_block() {

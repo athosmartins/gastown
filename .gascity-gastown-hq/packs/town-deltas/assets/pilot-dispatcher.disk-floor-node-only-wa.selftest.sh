@@ -34,6 +34,10 @@ region() { RA="$1" RB="$2" awk 'f==0 && $0 ~ ENVIRON["RA"] {f=1} f==1 && n>0 && 
 FUNC_ON="$(fn_src _pilot_node_only_wa_route_on)"; FUNC_WA="$(fn_src _pilot_node_only_wa_pre)"; FUNC_NC="$(fn_src _pilot_node_only_candidate_pre)"
 FUNC_TMPL="$(fn_src wa_worker_template)"; FUNC_ISPOOL="$(fn_src _pilot_priority_target_is_pool)"
 PNW_INIT="$(grep -E '^_PNW_PROBES=' "$DISPATCHER")"
+# ga-2hd02v.3.26: o portão de retenção que a passada só-nó consulta antes de gastar a sonda (reserva do P0/P1 cujo gancho falhou, ou waiter da cessão). Opcionais de propósito: no dispatcher SEM a fatia vêm vazios e só
+# as asserções novas reprovam, uma a uma (o resto do arquivo segue valendo). A classe de prioridade é a DA CIDADE: a biblioteca de ordem real, não uma cópia.
+FUNC_P2H="$(fn_src _pilot_node_p2_hold_for)"; FUNC_RSVFOR="$(fn_src _pilot_node_reserved_for)"; FUNC_RSVON="$(fn_src _pilot_node_reserve_on)"; FUNC_CLS="$(fn_src _pilot_priority_class_of)"; FUNC_PHF="$(fn_src _pilot_wa_node_pass_hold_for)"
+WO_LIB="${PILOT_WORK_ORDER_LIB:-$SELF_DIR/scripts/work-order.sh}"
 # ga-2hd02v.4: _pilot_node_only_candidate_pre também delega a bead ps-* a _pilot_node_only_ps_pre; o harness carrega o que a função sob teste chama (a prova do caminho de PS mora em pilot-dispatcher.ps-node-route.selftest.sh).
 # Aqui PILOT_PS_NODE_ROUTE nunca é definida: a bead ps-* segue NÃO candidata.
 FUNC_PSON="$(fn_src _pilot_node_only_ps_route_on)"; FUNC_PS="$(fn_src _pilot_node_only_ps_pre)"; PNP_INIT="$(grep -E '^_PNP_PROBES=' "$DISPATCHER")"
@@ -73,7 +77,7 @@ run_pre() {
   (
     set -euo pipefail
     PATH="$SANDBOX_PATH"; SELFTEST_WORK="$WORK"; export SELFTEST_WORK
-    log()  { :; }
+    log()  { [ -z "${PR_LOG:-}" ] || printf '%s\n' "$*" >> "$PR_LOG"; }
     warn() { :; }
     GC_CITY="$WORK/city"; PILOT_WA_NODE_SCRIPTS="$WORK/scripts"; DRY_RUN="${PR_DRY:-0}"
     [ -z "${PR_ROUTE+x}" ] || PILOT_WA_NODE_ROUTE="$PR_ROUTE"
@@ -82,6 +86,14 @@ run_pre() {
     eval "$PNW_INIT"
     _pilot_priority_pool_bound_pre() { return 0; }
     _pilot_priority_node_exempt_pre() { return "${PR_DOG_EXEMPT:-1}"; }
+    # a retenção: por padrão um falso que responde PR_HOLD (0 = retida, 1 = não retida); com PR_REAL=1 as funções REAIS (reserva em PR_RSV, sem waiter da cessão)
+    _PNH_HELD=0; _PNH_WHY=""; _PNR_RESERVED_IDS="${PR_RSV:-}"; _PNR_RESERVED_N=0; _PWP_WV_FINAL=""; _PY_WAIT_ID=""
+    if [ -n "${PR_REAL:-}" ]; then
+      . "$WO_LIB" || exit 99
+      eval "$FUNC_CLS"; eval "$FUNC_RSVON"; eval "$FUNC_RSVFOR"; eval "$FUNC_PHF"; eval "$FUNC_P2H"
+    else
+      _pilot_node_p2_hold_for() { _PNH_WHY=reserved; return "${PR_HOLD:-1}"; }
+    fi
     eval "$FUNC_ON"; eval "$FUNC_WA"; eval "$FUNC_NC"; eval "$FUNC_PSON"; eval "$FUNC_PS"; eval "$PNP_INIT"
     c() { local x=0; _pilot_node_only_candidate_pre "$1" || x=$?; printf '%s ' "$x"; }
     eval "$1"
@@ -143,6 +155,50 @@ r=$(PR_ROUTE=auto PR_CAP=2 run_pre 'c "'"$(q "$J_LABEL")"'"; c "'"$(q "$J_LABEL"
 reset; wnd 0
 r=$(PR_ROUTE=auto PR_CAP=x run_pre 'c "'"$(q "$J_LABEL")"'"; echo'); r="${r% }"
 [ "$r" = 0 ] && ok "teto ilegível volta ao padrão (não desliga a passada nem a abre sem limite)" || bad "teto ilegível: rc=$r"
+echo "── (1) ga-2hd02v.3.26: a P2+ retida (reserva do P0/P1 cujo gancho falhou, ou waiter da cessão) NÃO gasta sonda nem claim"
+# medido 31/10 06:12: na varredura em que o gancho da P1 falhou, esta passada deu o nó à P3 wa-x5zg10 (ela não passava pela retenção da passada de WA)
+J_P3='{"id":"wa-p7","priority":3,"labels":["story:approved","node:ok"],"metadata":{}}'
+J_P1='{"id":"wa-p8","priority":1,"labels":["story:approved","node:ok"],"metadata":{}}'
+J_NOP='{"id":"wa-p9","labels":["story:approved","node:ok"],"metadata":{}}'
+hc() { printf 'c "%s"; ' "$(q "$1")"; }   # a chamada do candidate_pre para o JSON dado
+tail_expr='echo "held=$_PNH_HELD probes=$_PNW_PROBES"'
+reset; wnd 0; : > "$WORK/pre.log"
+r=$(PR_ROUTE=label PR_HOLD=0 PR_LOG="$WORK/pre.log" run_pre "$(hc "$J_LABEL")$tail_expr")
+[ "$r" = "1 held=1 probes=0" ] && [ "$(calls)" = 0 ] && ok "retida (portão diz sim): NÃO é candidata, UMA retida contada e NENHUMA sonda gasta — $r" || bad "a retida gastou sonda ou virou candidata ($r, sondas=$(calls))"
+reset; wnd 0; : > "$WORK/pre.log"
+r=$(PR_ROUTE=label PR_HOLD=0 PR_LOG="$WORK/pre.log" run_pre "$(hc "$J_LABEL")$(hc "$J_LABEL")$(hc "$J_LABEL")$tail_expr")
+[ "$r" = "1 1 1 held=3 probes=0" ] && [ "$(calls)" = 0 ] && ok "três retidas: três contadas, zero sondas — $r" || bad "contagem das retidas ($r, sondas=$(calls))"
+[ "$(wc -l < "$WORK/pre.log" | tr -d ' ')" = 1 ] && grep -q 'fica fora do nó' "$WORK/pre.log" && ok "o log diz UMA vez por varredura (a 1ª retida) e nomeia o motivo" || bad "log das retidas: $(cat "$WORK/pre.log")"
+reset; wnd 0
+r=$(PR_ROUTE=label PR_HOLD=1 run_pre "$(hc "$J_LABEL")$tail_expr")
+[ "$r" = "0 held=0 probes=1" ] && [ "$(calls)" = 1 ] && ok "portão diz não: candidata pela sonda como sempre (UMA sonda, 0 retidas) — $r" || bad "sem retenção a candidata mudou ($r, sondas=$(calls))"
+# o portão fica DEPOIS dos filtros de entrada: o que não seria candidata de qualquer jeito não conta como retida
+reset; wnd 0
+r=$(PR_ROUTE=auto PR_HOLD=0 run_pre "$(hc "$J_ROUTED")$(hc "$J_OWNED")$(hc "$J_PS")$(hc "$J_GA")"'c "isto não é json"; '"$tail_expr")
+[ "$r" = "1 1 1 1 1 held=0 probes=0" ] && [ "$(calls)" = 0 ] && ok "com rota, com dono, ps-*, ga-* e JSON ilegível: NÃO candidatas e NÃO contadas como retidas — $r" || bad "o portão contou o que já não era candidata ($r)"
+reset; wnd 0
+r=$(PR_ROUTE=label PR_HOLD=0 run_pre "$(hc "$J_PLAIN")$tail_expr")
+[ "$r" = "1 held=0 probes=0" ] && ok "modo label sem node:ok: NÃO candidata e não contada como retida — $r" || bad "label sem node:ok contou retida ($r)"
+# o portão vem ANTES do teto de sondas (a retida nem lê o contador)
+reset; wnd 0
+r=$(PR_ROUTE=label PR_HOLD=0 PR_CAP=0 run_pre "$(hc "$J_LABEL")$tail_expr")
+[ "$r" = "1 held=1 probes=0" ] && ok "com o teto em 0 a retida ainda é contada como retida (o portão vem antes do teto)" || bad "ordem portão/teto ($r)"
+echo "── (1) ga-2hd02v.3.26: com a reserva e a biblioteca de ordem REAIS"
+reset; wnd 0
+r=$(PR_ROUTE=label PR_REAL=1 PR_RSV=" wa-r1 " run_pre "$(hc "$J_P3")$tail_expr")
+[ "$r" = "1 held=1 probes=0" ] && [ "$(calls)" = 0 ] && ok "reserva em pé + P3: fica fora do nó, 0 sondas — $r" || bad "a P3 não foi retida pela reserva ($r, sondas=$(calls))"
+reset; wnd 0
+r=$(PR_ROUTE=label PR_REAL=1 PR_RSV=" wa-r1 " run_pre "$(hc "$J_P1")$tail_expr")
+[ "$r" = "0 held=0 probes=1" ] && [ "$(calls)" = 1 ] && ok "reserva em pé + P1: segue (o P0/P1 nunca é retido pela reserva) — $r" || bad "a P1 foi retida pela reserva ($r, sondas=$(calls))"
+reset; wnd 0
+r=$(PR_ROUTE=label PR_REAL=1 run_pre "$(hc "$J_P3")$tail_expr")
+[ "$r" = "0 held=0 probes=1" ] && ok "SEM reserva e sem waiter: a P3 segue como sempre — $r" || bad "sem reserva a P3 foi retida ($r)"
+reset; wnd 0
+r=$(PR_ROUTE=label PR_REAL=1 PR_RSV=" wa-r1 " run_pre "$(hc "$J_NOP")$tail_expr")
+[ "$r" = "0 held=0 probes=1" ] && ok "reserva em pé + bead SEM prioridade legível: NÃO é retida (classe ilegível nunca segura trabalho) — $r" || bad "classe ilegível foi retida ($r)"
+reset; wnd 0
+r=$(PR_ROUTE=label PR_REAL=1 PR_RSV=" wa-r1 " PILOT_WA_NODE_RESERVE=0 run_pre "$(hc "$J_P3")$tail_expr")
+[ "$r" = "0 held=0 probes=1" ] && ok "PILOT_WA_NODE_RESERVE=0: a reserva em pé não retém ninguém — $r" || bad "reserva desligada reteve ($r)"
 echo "── (1) a bead de dog continua como era"
 reset; wnd 0
 r=$(PR_ROUTE=off PR_DOG_EXEMPT=0 run_pre 'c "'"$(q "$J_GA")"'"; echo'); r="${r% }"
@@ -263,6 +319,9 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
   mutant "o bloco pos-claim solta a bead de WA com rota ligada" $'    elif [ "$_PYS_NATIVE" = "1" ] && [ "$_PYS_TARGET" = "wa-worker" ] && _pilot_node_only_wa_route_on; then' $'    elif false; then'
   mutant "o bloco pos-claim deixa passar bead do HQ com alvo wa-worker" $'    elif [ "$_PYS_NATIVE" = "1" ] && [ "$_PYS_TARGET" = "wa-worker" ]' $'    elif [ "$_PYS_TARGET" = "wa-worker" ]'
   mutant "o rc 1 do gancho cai no pool do mini na passada so-no" $'        elif [ "${_PILOT_NODE_ONLY:-0}" = "1" ]; then' $'        elif false; then'
+  mutant "a passada so-no nao consulta a retencao" $'  if _pilot_node_p2_hold_for "$_b"; then\n    _PNH_HELD=' $'  if false; then\n    _PNH_HELD='
+  mutant "a retida ainda gasta sonda" $'    return 1\n  fi\n  case "$_cap" in' $'    :\n  fi\n  case "$_cap" in'
+  mutant "a retida nao e contada" '    _PNH_HELD=$(( ${_PNH_HELD:-0} + 1 ))' '    :'
   mutant "o rc 1 na passada so-no nao solta a claim" $'          DISPATCH_RESULT="disk_floor_node_only"\n          return 1\n        fi\n        : # pool' $'          DISPATCH_RESULT="disk_floor_node_only"\n        fi\n        : # pool'
 fi
 echo "── $PASS ok, $FAIL falhas"

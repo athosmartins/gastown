@@ -40,7 +40,7 @@ sem teto de falhas	[ "$_pw_fails" -lt "$_pw_maxfail" ] || { _pw_stop="max-fails"
 memoria nao e consultada	if _pilot_wa_node_pass_memo_hit "$_pw_id" "$_pw_upd"; then	if false; then
 mini nao e memorizado	_pw_mini=$((_pw_mini + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" mini; if [ "$_pw_isw" = 1 ]; then _pw_wv=out; fi; continue ;;	_pw_mini=$((_pw_mini + 1)); if [ "$_pw_isw" = 1 ]; then _pw_wv=out; fi; continue ;;
 unknown nao e memorizado	_pw_unk=$((_pw_unk + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" unknown; if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi; continue ;;	_pw_unk=$((_pw_unk + 1)); if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi; continue ;;
-falha sem apply nao e memorizada	'') _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" released; if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi ;;	'') _pw_fails=$((_pw_fails + 1)) ;;
+falha sem apply nao e memorizada	'') _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_released_memo "$_pw_pick" "$_pw_id" "$_pw_upd"; if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi ;;	'') _pw_fails=$((_pw_fails + 1)) ;;
 o pre-filtro nao roda	if ! _pilot_wa_node_pass_pre "$_pw_pick"; then	if false; then
 modo label aceita node por texto	if [ "${PILOT_WA_NODE_ROUTE:-}" = label ] && [ "$_PWP_BASIS" != label ]; then _pw_skipped="$_pw_skipped basis"; if [ "$_pw_isw" = 1 ]; then _pw_wv=out; fi; continue; fi	:
 a vaga da pista nao cai	_pw_slots=$((_pw_slots - 1)); DISPATCHED=$((DISPATCHED + 1))	DISPATCHED=$((DISPATCHED + 1))
@@ -84,7 +84,7 @@ pista do waiter sem vaga de despacho segura a outra pista	{ { [ "$_pw_wv" != uns
 contador de P2+ ao no nao conta	case "$(_pilot_priority_class_of "$_pw_pick")" in 2|3|4) _pw_p2n=$((_pw_p2n + 1)) ;; esac	:
 a passada nunca chama a retencao	_pw_hrc=0; _pw_hx=0; _pilot_wa_node_pass_hold_for "$_pw_pick" "$_pw_wv" || _pw_hrc=$?	_pw_hrc=1; _pw_hx=0
 pista ilegivel com waiter vira sem waiter	      _pw_wl=""; _pw_wv=unseen\n	      _pw_wl=""\n
-o resumo nao grava p2_to_node	released:$rl,p2_to_node:$p2n,held:$hd,	released:$rl,held:$hd,
+o resumo nao grava p2_to_node	released:$rl,p2_to_node:$p2n,node_reserved:$rsv,held:$hd,	released:$rl,node_reserved:$rsv,held:$hd,
 classe ilegivel nao e sinalizada pela retencao	    *)     return 2 ;;\n	    *)     return 1 ;;\n
 o contador de classe ilegivel nao conta	        2) _pw_clsblind=$((_pw_clsblind + 1)) ;;	        2) : ;;
 valor novo do memo_hit libera a P2	mini) _pw_wv=out ;; *) _pw_wv=blind ;; esac	mini) _pw_wv=out ;; unknown) _pw_wv=blind ;; *) _pw_wv=out ;; esac
@@ -95,7 +95,7 @@ recusa do pool lida (refused) deixa de ser definitiva	not-wa|has-owner|no-node-o
 node:mini deixa de ser definitivo para o waiter	not-wa|has-owner|no-node-ok|node:mini|routed:*|veto:*|refused:*) printf 'out' ;;	not-wa|has-owner|no-node-ok|routed:*|veto:*|refused:*) printf 'out' ;;
 dono do waiter deixa de ser definitivo	not-wa|has-owner|no-node-ok|node:mini|routed:*|veto:*|refused:*) printf 'out' ;;	not-wa|no-node-ok|node:mini|routed:*|veto:*|refused:*) printf 'out' ;;
 apply rc 11 do waiter deixa wv em node	11) _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" unknown; if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi ;;	11) _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" unknown ;;
-waiter sem apply deixa wv em node	'') _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" released; if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi ;;	'') _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" released ;;
+waiter sem apply deixa wv em node	'') _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_released_memo "$_pw_pick" "$_pw_id" "$_pw_upd"; if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi ;;	'') _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_released_memo "$_pw_pick" "$_pw_id" "$_pw_upd" ;;
 apply rc 10 do waiter nao marca out	10) _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" mini; if [ "$_pw_isw" = 1 ]; then _pw_wv=out; fi ;;	10) _pw_fails=$((_pw_fails + 1)); _pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" mini ;;
 apply rc fora da tabela do waiter deixa wv em node	*)  if [ "$_pw_isw" = 1 ]; then _pw_wv=blind; fi; _pw_stop="hook-held"; break ;;	*)  _pw_stop="hook-held"; break ;;
 memoria released do waiter vira out	case "${_PWP_MEMO_V:-}" in mini) _pw_wv=out ;; *) _pw_wv=blind ;; esac	case "${_PWP_MEMO_V:-}" in mini|released) _pw_wv=out ;; *) _pw_wv=blind ;; esac
@@ -141,3 +141,19 @@ custo cache que nao e texto passa	if (.custo.cache | type) == "string" then	if t
 3.18: o resumo nao grava hold_expired	hold_expired:$hx,waiter_blind_passes:$wbp,	waiter_blind_passes:$wbp,
 3.18: o resumo nao grava waiter_blind_passes	hold_expired:$hx,waiter_blind_passes:$wbp,	hold_expired:$hx,
 3.18: o log nao diz hold expirado	log "ga-2hd02v.3.18: hold expirado	: "ga-2hd02v.3.18: hold expirado
+3.26: o veredito final do waiter nao e gravado	  _PWP_WV_FINAL="$_pw_wv"	  :
+3.26: P0/P1 que solta sem apply tambem e memorizada	    0|1) log "  ga-2hd02v.3.26: $_rm_id (P${_rm_cls}) soltou	    9) log "  ga-2hd02v.3.26: $_rm_id (P${_rm_cls}) soltou
+3.26: a passada memoriza released sem a excecao do P0/P1	_pilot_wa_node_pass_released_memo "$_pw_pick" "$_pw_id" "$_pw_upd"; if	_pilot_wa_node_pass_memo_put "$_pw_id" "$_pw_upd" released; if
+3.26: a passada nao zera a reserva da varredura anterior	  _PNR_RESERVED_IDS=""; _PNR_RESERVED_N=0; _PWP_WV_FINAL=""; _PNH_HELD=0	  :
+3.26: o resumo nao grava node_reserved	node_reserved:$rsv,	
+3.26: a falha de uma P2+ tambem reserva o no	    0|1) ;;\n    2|3|4) return 0 ;;	    0|1|2|3|4) ;;\n    9) return 0 ;;
+3.26: classe ilegivel reserva o no	    2|3|4) return 0 ;;\n    *) warn "ga-2hd02v.3.26: o gancho do n	    2|3|4) return 0 ;;\n    *) : "ga-2hd02v.3.26: o gancho do n
+3.26: a reserva ligada nao respeita PILOT_WA_NODE_RESERVE=0	  [ "${PILOT_WA_NODE_RESERVE:-1}" != 0 ]	  true
+3.26: a falha fora da passada tambem reserva	  if [ "$_rs_rc" != 2 ] && [ "${_PILOT_WA_NODE_PASS:-0}" != 1 ] && [ "${_PILOT_NODE_ONLY:-0}" != 1 ]; then return 0; fi	  :
+3.26: a mesma bead reservada duas vezes conta duas	  case "${_PNR_RESERVED_IDS:-}" in *" $_rs_id "*) return 0 ;; esac	  :
+3.26: o clear nao tira a bead da reserva	*" $_rc_id "*) _PNR_RESERVED_IDS="${_PNR_RESERVED_IDS/ $_rc_id / }" ;; esac	*" $_rc_id "*) : ;; esac
+3.26: a reserva segura tambem o P0/P1	    2|3|4) return 0 ;;\n    0|1) return 1 ;;	    0|1|2|3|4) return 0 ;;\n    9) return 1 ;;
+3.26: a reserva segura a classe ilegivel	trabalho)"; return 1 ;;\n  esac\n}\n\n# _pilot_node_p2_hold_for	trabalho)"; return 0 ;;\n  esac\n}\n\n# _pilot_node_p2_hold_for
+3.26: o portao so-no ignora a reserva	  if _pilot_node_reserved_for "$_ph_b"; then _PNH_WHY=reserved; return 0; fi	  :
+3.26: o portao so-no ignora o waiter da cessao	  if [ "$_ph_rc" = 0 ]; then _PNH_WHY=waiter; return 0; fi	  :
+3.26: o portao so-no segura tambem o hold expirado	  if [ "$_ph_rc" = 0 ]; then _PNH_WHY=waiter; return 0; fi	  if [ "$_ph_rc" != 1 ]; then _PNH_WHY=waiter; return 0; fi
