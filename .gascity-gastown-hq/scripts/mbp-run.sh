@@ -104,6 +104,7 @@ PRESENCE_LIB="$HERE/mbp-presence.sh"
 CONTROLE="$HERE/mbp-controle.sh"
 MIN_AVAIL_MB=${MBP_MIN_AVAIL_MB:-3072}
 MAX_SWAP_MB=${MBP_MAX_SWAP_MB:-8192}               # TETO absoluto do swap usado; sozinho não decide mais (era 5120, ga-9e2rjh)
+MAX_SWAP_MB_LIVRE=${MBP_MAX_SWAP_MB_LIVRE:-16384}  # teto com o MBP LIVRE (bloqueado/ocioso): swap parado de dias antes recusava o dia todo (31/10: 8.784 MB, pressão normal, 51% livre)
 MAX_SWAP_GROWTH_MB=${MBP_MAX_SWAP_GROWTH_MB:-128}  # swap que CRESCE mais que isto na janela abaixo = o MBP está trocando memória agora
 SWAP_SAMPLE_S=${MBP_SWAP_SAMPLE_S:-2}
 [ "$SWAP_SAMPLE_S" -ge 1 ] 2>/dev/null || SWAP_SAMPLE_S=2   # janela em segundos: precisa ser inteiro >= 1; outra coisa volta ao padrão
@@ -392,7 +393,7 @@ EOF
 }
 
 preflight() {
-  local out rc avail swap delta pressure power batt disk
+  local out rc avail swap delta pressure power batt disk tswap
   REFUSAL=""; REFUSAL_RC=98
   # Script remoto: toda leitura que vazia, falha ou vem em formato inesperado deixa o campo VAZIO (nunca 0, nunca "normal");
   # o lado local lê campo vazio como "não consegui saber" e recusa (estado inerte). $1 = janela da amostra de swap, em segundos.
@@ -419,7 +420,10 @@ preflight() {
   isint "$delta" || { refuse ilegivel:swap_delta "crescimento do swap do $HNAME ilegível"; return 98; }    # gate:ilegivel-delta
   [ "$delta" -le "$MAX_SWAP_GROWTH_MB" ] || { refuse swap_cresce "$HNAME trocando memória agora (swap cresceu $delta MB em ${SWAP_SAMPLE_S}s > $MAX_SWAP_GROWTH_MB)"; return 98; }    # gate:cresce
   isnum "$swap" || { refuse ilegivel:swap "swap usado do $HNAME ilegível"; return 98; }    # gate:ilegivel-swap
-  [ "$swap" -lt "$MAX_SWAP_MB" ] || { refuse swap_teto "$HNAME com swap acima do teto ($swap MB >= $MAX_SWAP_MB)"; return 98; }    # gate:teto
+  # Teto do swap: no MBP LIVRE (o Athos não está usando) vale o teto maior — pressão normal e swap parado já foram conferidos acima,
+  # e o macOS não devolve swap antigo. Em uso, presença ilegível (PRES=uso) ou no nó Linux, vale o teto de sempre.
+  tswap=$MAX_SWAP_MB; if [ "$HOSTKIND" = mac ] && [ "${PRES:-uso}" = livre ]; then tswap=$MAX_SWAP_MB_LIVRE; fi
+  [ "$swap" -lt "$tswap" ] || { refuse swap_teto "$HNAME com swap acima do teto ($swap MB >= $tswap; presença ${PRES:-?})"; return 98; }    # gate:teto
   # fonte de energia ilegível recusa com motivo próprio (antes caía em "battery" e virava recusa por bateria baixa no log)
   case "$power" in ac|battery) ;; *) refuse ilegivel:power "fonte de energia do $HNAME ilegível ('${power:-}')"; return 98 ;; esac    # gate:ilegivel-power
   if [ "$power" = battery ]; then

@@ -366,7 +366,7 @@ mkdir -p "$T/home/gt-remote/venv-wa/lib/python3.14/site-packages/pytest_xdist-3.
 : > "$T/mac-only.txt"
 REAL_RSYNC=$(PATH=/usr/bin:/bin:/opt/homebrew/bin command -v rsync)
 export REAL_RSYNC HETZNER_MAC_ONLY_LIST="$T/mac-only.txt" HETZNER_SHADOW_PCT=0 STUB_PROCDIR="$T/proc"
-unset MBP_MAX_SWAP_MB MBP_MAX_SWAP_GROWTH_MB MBP_SWAP_SAMPLE_S MBP_MAX_PRESSURE_LEVEL MBP_MIN_AVAIL_MB MBP_MIN_BATT MBP_MAX_SLOTS MBP_SLOT_MAX_AGE_S MBP_RUN_TIMEOUT_S MBP_HOST
+unset MBP_MAX_SWAP_MB MBP_MAX_SWAP_MB_LIVRE MBP_MAX_SWAP_GROWTH_MB MBP_SWAP_SAMPLE_S MBP_MAX_PRESSURE_LEVEL MBP_MIN_AVAIL_MB MBP_MIN_BATT MBP_MAX_SLOTS MBP_SLOT_MAX_AGE_S MBP_RUN_TIMEOUT_S MBP_HOST
 export PATH="$T/bin:$PATH" MBP_CITY="$T/city" MBP_SSH="$T/bin/ssh" MBP_RSYNC="$T/bin/rsync"
 # ga-bmmxka: sem MBP_HOST o mbp-run.sh sonda a porta 22 do MBP; aqui a sonda é um stub (HOSTPROBE_UP = hosts que "respondem"; por padrão só o
 # Tailscale), então nenhum caso depende de DNS, de nc nem do MBP de verdade.
@@ -1763,8 +1763,13 @@ reset; rc=$(STUB_SWAP_MB=5248 STUB_AVAIL_MB=3900 run -- tests/test_x.py); expect
 hasnt "e não registra recusa" "$J" '"mode":"preflight"'
 reset; rc=$(STUB_SWAP_MB=7900 run -- tests/test_x.py); expect "swap 7900 MB parado passa (abaixo do teto)" 0 "$rc"
 # 18 teto absoluto do swap (padrão 8192, configurável)
-reset; eq "swap 9000 MB (acima do teto) recusa" "98:swap_teto" "$(STUB_SWAP_MB=9000 outcome "$RUN")"; has "teto no log com o número" "$J" '"swap_mb":9000'
-reset; eq "teto é configurável (MBP_MAX_SWAP_MB=4000)" "98:swap_teto" "$(MBP_MAX_SWAP_MB=4000 STUB_SWAP_MB=6000 outcome "$RUN")"
+reset; eq "em uso: swap 9000 MB (acima do teto) recusa" "98:swap_teto" "$(STUB_LOCKED=0 STUB_IDLE_S=30 STUB_SWAP_MB=9000 outcome "$RUN")"; has "teto no log com o número" "$J" '"swap_mb":9000'
+reset; eq "em uso: teto é configurável (MBP_MAX_SWAP_MB=4000)" "98:swap_teto" "$(STUB_LOCKED=0 STUB_IDLE_S=30 MBP_MAX_SWAP_MB=4000 STUB_SWAP_MB=6000 outcome "$RUN")"
+# 18b LIVRE (tela bloqueada): swap parado antigo não recusa até o teto maior (31/10: 8.784 MB recusou o dia todo com o MBP ocioso)
+reset; eq "livre: swap 9000 MB parado PASSA" "0:-" "$(STUB_LOCKED=1 STUB_SWAP_MB=9000 outcome "$RUN")"
+reset; eq "livre: swap 17000 MB (acima do teto livre) recusa" "98:swap_teto" "$(STUB_LOCKED=1 STUB_SWAP_MB=17000 outcome "$RUN")"
+reset; eq "livre: teto livre é configurável (MBP_MAX_SWAP_MB_LIVRE=10000)" "98:swap_teto" "$(STUB_LOCKED=1 MBP_MAX_SWAP_MB_LIVRE=10000 STUB_SWAP_MB=12000 outcome "$RUN")"
+reset; eq "livre mas swap CRESCENDO ainda recusa" "98:swap_cresce" "$(STUB_LOCKED=1 STUB_SWAP_MB=9000 STUB_SWAP2_MB=9400 outcome "$RUN")"
 # 19 swap CRESCENDO recusa (o MBP está trocando memória agora); fronteira 128 passa, 129 recusa; encolher passa
 reset; eq "swap 5000→5400 recusa" "98:swap_cresce" "$(STUB_SWAP_MB=5000 STUB_SWAP2_MB=5400 outcome "$RUN")"
 has "crescimento no log" "$J" '"swap_delta_mb":400'
@@ -1892,7 +1897,7 @@ mutant pressao        98:pressao              STUB_PRESSURE=2
 mutant ilegivel-delta 98:ilegivel:swap_delta  STUB_SWAP_RAW=garbage
 mutant cresce         98:swap_cresce          STUB_SWAP_MB=5000 STUB_SWAP2_MB=5400
 mutant ilegivel-swap  98:ilegivel:swap        "STUB_PF_RAW=avail_mb=8000\nswap_mb=\nswap_delta_mb=0\npressure=1\npower=ac\nbatt=90"
-mutant teto           98:swap_teto            STUB_SWAP_MB=9000
+mutant teto           98:swap_teto            STUB_SWAP_MB=17000
 mutant ilegivel-power 98:ilegivel:power       STUB_PMSET_FAIL=1
 mutant ilegivel-batt  98:ilegivel:batt        "STUB_PMSET_RAW=Now drawing from 'Battery Power'"
 
