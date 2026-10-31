@@ -103,6 +103,56 @@ PAIR=$(rig_gitdir "$CONTAINERREPO")
 eq "container gdir"      "${PAIR%$'\t'*}" "$CONTAINERREPO/.repo.git"
 eq "container flag"      "${PAIR#*$'\t'}" "1"
 
+# ── 2b. token_bounded / subject_impl_scopes_bead — hierarchical ids (ga-ewy82a2) ──
+# Irmão 2 de ga-61i9j5y. Incidente de origem (merged-bead-janitor, 31/10): wa-qrki7a.3 foi
+# auto-fechada 2x com o commit 500fc9f07 da irmã wa-qrki7a.1, porque o id do ÉPICO (wa-qrki7a)
+# "casava" o cabeçalho fix(wa-qrki7a.1): — "." contava como fronteira de token. Esta cópia de
+# token_bounded (story-delivery.sh) tinha o mesmo buraco: o reconciler de task lia o commit de
+# uma descendente como "merge verificado" do ancestral (épico↔filha, filha .1↔neta .1.2).
+# Um id filho é "<pai>.<n>"; um "." seguido de alfanumérico CONTINUA o id, só ponto final de
+# frase é fronteira. Quais asserções REPROVAM no código antigo (pegam o bug) e quais só
+# guardam contra regressão está marcado em cada bloco.
+echo "── 2b. token_bounded / subject_impl_scopes_bead (hierarchical ids, ga-ewy82a2) ──"
+# PEGA O BUG (reprova no código antigo): id ancestral contra o cabeçalho de uma descendente.
+rc1 token_bounded "wa-qrki7a"   "fix(wa-qrki7a.1): gate ga-bph1tej aprova a fatia 1"
+rc1 token_bounded "wa-qrki7a"   "fix(wa-qrki7a.3): outra filha"
+rc1 token_bounded "wa-qrki7a"   "wa-qrki7a.1.2: neto"
+rc1 token_bounded "wa-qrki7a.1" "fix(wa-qrki7a.1.2): neta"
+# GUARDA DE REGRESSÃO (já passava antes; não pode quebrar): id mais curto/irmão não casa
+# o commit de outro id — .3 vs .1 (irmã) e .1 vs .10 (alfanumérico continua o id).
+rc1 token_bounded "wa-qrki7a.3" "fix(wa-qrki7a.1): irmã"
+rc1 token_bounded "wa-qrki7a.1" "fix(wa-qrki7a.10): décima filha"
+# Aterrissagens genuínas continuam reconhecidas (sem regressão).
+rc0 token_bounded "wa-qrki7a.1" "fix(wa-qrki7a.1): gate ga-bph1tej aprova a fatia 1"
+rc0 token_bounded "wa-qrki7a"   "fix(wa-qrki7a): o épico em si"
+rc0 token_bounded "wa-qrki7a.1" "feat(area/wa-qrki7a.1): caminho com id pontilhado"
+rc0 token_bounded "wa-qrki7a.1" "wa-qrki7a.1: lead nu"
+# Ponto final de FRASE é fronteira (id no fim da frase), com ou sem texto depois.
+rc0 token_bounded "wa-qrki7a"   "closes wa-qrki7a."
+rc0 token_bounded "wa-qrki7a"   "closes wa-qrki7a. Next sentence"
+rc0 token_bounded "wa-qrki7a.1" "see wa-qrki7a.1, then wa-qrki7a.2"
+# Pontos do id são LITERAIS: "ga-abc.1" não casa "ga-abcX1".
+rc1 token_bounded "ga-abc.1"    "fix(ga-abcX1): outro id"
+# vazio → sem casamento; falhou/ilegível (id que não vira regex sã) → sem casamento.
+# O regex antigo com id vazio casava quase qualquer cabeçalho: "fix(): x" fechava bead.
+rc1 token_bounded ""            "fix(): x"
+rc1 token_bounded ""            "qualquer texto"
+# Texto vazio nunca casa um id real.
+rc1 token_bounded "wa-qrki7a"   ""
+# Id que não é id de bead (metacaractere de regex) nunca vira regex: sem casamento.
+rc1 token_bounded 'ga-.*'       "fix(ga-anything): x"
+rc1 token_bounded 'ga-a|b'      "fix(b): x"
+# O discriminador de escopo herda a leitura inteira do id.
+rc1 subject_impl_scopes_bead "fix(wa-qrki7a.1): gate ga-bph1tej" "wa-qrki7a"
+rc1 subject_impl_scopes_bead "feat(area/wa-qrki7a.1): x"          "wa-qrki7a"
+rc1 subject_impl_scopes_bead "wa-qrki7a.1: x"                     "wa-qrki7a"
+rc1 subject_impl_scopes_bead "fix(wa-qrki7a.1): x"                "wa-qrki7a.3"
+rc0 subject_impl_scopes_bead "fix(wa-qrki7a.1): x"                "wa-qrki7a.1"
+rc0 subject_impl_scopes_bead "feat(area/wa-qrki7a.1): x"          "wa-qrki7a.1"
+rc0 subject_impl_scopes_bead "fix bug wa-qrki7a.1: x"             "wa-qrki7a.1"
+rc0 subject_impl_scopes_bead "Merge crew/x/wa-qrki7a.1: x"        "wa-qrki7a.1"
+rc0 subject_impl_scopes_bead "fix(wa-qrki7a): x"                  "wa-qrki7a"
+
 # ── 3. scan_commit_subject_for_bead — real-git integration (content check) ──
 # Build a throwaway git repo with a real merge history so the DoD's "branch is
 # an ancestor" and "no commit landed" scenarios are proven against real git,
@@ -133,6 +183,18 @@ echo "fix2" > "$WORK/fix2.txt"
 git -C "$WORK" add fix2.txt
 git -C "$WORK" commit -q -m "fix(unrelated): tweak unrelated area (ga-266z8-context-only)"
 
+# ga-ewy82a2 fixtures — the 31/10 wa-qrki7a incident, in real git. Épico wa-qrki7a; só as
+# filhas .1 e .10 pousaram na main (a .3 NÃO pousou). Antes do conserto, o id do ÉPICO casava
+# o cabeçalho de .1 (o "." era fronteira) e o reconciler daria "merge verificado" ao épico sem
+# que nada dele estivesse no ar. A .10 vem DEPOIS da .1 para provar que o laço continua
+# depois de rejeitar o commit da .10 ao procurar a .1 (git log vai do mais novo ao mais velho).
+echo "c1" > "$WORK/child1.txt"
+git -C "$WORK" add child1.txt
+git -C "$WORK" commit -q -m "fix(wa-qrki7a.1): gate ga-bph1tej aprova a fatia 1"
+echo "c10" > "$WORK/child10.txt"
+git -C "$WORK" add child10.txt
+git -C "$WORK" commit -q -m "fix(wa-qrki7a.10): décima filha"
+
 git -C "$WORK" push -q origin main
 
 BARE_PAIR=$(rig_gitdir "$REPO")
@@ -146,6 +208,18 @@ rc1 scan_commit_subject_for_bead "$BARE_GDIR" "$BARE_CONTAINER" "no-such-ref" "g
 
 FOUND_SHA=$(scan_commit_subject_for_bead "$BARE_GDIR" "$BARE_CONTAINER" "main" "ga-266z8-merged" 2>/dev/null || true)
 if [ -n "$FOUND_SHA" ]; then ok "scan prints a sha for the merged bead ($FOUND_SHA)"; else bad "scan printed no sha for the merged bead"; fi
+
+# ga-ewy82a2: id hierárquico lido inteiro — o ancestral não empresta o merge da descendente.
+rc1 scan_commit_subject_for_bead "$BARE_GDIR" "$BARE_CONTAINER" "main" "wa-qrki7a"     # PEGA O BUG: épico, só filhas pousaram
+rc1 scan_commit_subject_for_bead "$BARE_GDIR" "$BARE_CONTAINER" "main" "wa-qrki7a.3"   # guarda de regressão: irmã .1 pousou, a .3 não
+rc0 scan_commit_subject_for_bead "$BARE_GDIR" "$BARE_CONTAINER" "main" "wa-qrki7a.1"   # guarda de regressão: aterrissagem genuína
+rc0 scan_commit_subject_for_bead "$BARE_GDIR" "$BARE_CONTAINER" "main" "wa-qrki7a.10"
+CHILD1_SHA=$(scan_commit_subject_for_bead "$BARE_GDIR" "$BARE_CONTAINER" "main" "wa-qrki7a.1" 2>/dev/null || true)
+CHILD1_SUBJ=$(git -C "$WORK" log -1 --format='%s' "$CHILD1_SHA" 2>/dev/null || true)
+case "$CHILD1_SUBJ" in
+  "fix(wa-qrki7a.1): "*) ok "scan de wa-qrki7a.1 devolve o commit da .1, não o da .10 ($CHILD1_SHA)" ;;
+  *) bad "scan de wa-qrki7a.1 devolveu o commit errado: sha=[$CHILD1_SHA] subject=[$CHILD1_SUBJ]" ;;
+esac
 
 # ── 4. End-to-end: verdict wiring matches the real content-check outcome ────
 echo "── 4. End-to-end verdict wiring ──"

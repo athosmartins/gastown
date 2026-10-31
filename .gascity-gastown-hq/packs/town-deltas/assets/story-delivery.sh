@@ -75,9 +75,33 @@ git_in() {
 }
 
 # token_bounded <bead_id> <text> — rc0 iff text contains bead_id as a whole
-# token (not a substring of a longer id).
+# token (not a substring of a longer id). Guards e.g. wa-1 vs wa-12.
+#
+# HIERARCHICAL ids (ga-ewy82a2, irmão 2 de ga-61i9j5y — merged-bead-janitor.sh tem a outra
+# cópia desta função): uma bead filha é "<pai>.<n>" — wa-qrki7a.3 é a terceira filha do épico
+# wa-qrki7a — então um "." seguido de alfanumérico CONTINUA o id, exatamente como outra letra
+# continuaria: wa-qrki7a NÃO é um token inteiro dentro de "fix(wa-qrki7a.1)", e wa-qrki7a.1
+# não é um dentro de "wa-qrki7a.10" nem de "wa-qrki7a.1.2". Só o "." que fecha uma frase
+# ("closes ga-abc." / "ga-abc. Next") ou vem antes de pontuação/fim de texto é fronteira.
+# "." já contou como fronteira aqui: o id do épico casava o cabeçalho de cada filha (e o da
+# filha .1 casava o de uma neta .1.2), e scan_commit_subject_for_bead (o reconciler de task,
+# ~linha 1935) lia o commit de uma descendente como prova de merge do ancestral — dava
+# "merge verificado" a uma bead sem que nada dela estivesse no ar. (O incidente que expôs a
+# classe foi no janitor: wa-qrki7a.3 fechada 2x em 31/10 com o commit da irmã .1.) Os pontos do
+# id são literais no regex (não "qualquer caractere") e o id só pode ter [A-Za-z0-9._-]: um
+# id que não é um id de bead não vira regex. Continua `grep … >/dev/null`, nunca `grep -q`
+# (ga-5bxuam: sob pipefail a saída antecipada dá SIGPIPE no printf e um casamento lê como
+# não-casamento).
+# vazio → id vazio nunca casa; falhou/ilegível → id fora de [A-Za-z0-9._-], escape que falhou
+# ou voltou vazio, ou grep que errou: sem casamento (rc≠0), porque é o casamento que fecha a
+# bead e um regex quebrado não pode inventar um.
 token_bounded() {
-  printf '%s' "$2" | grep -E "(^|[^[:alnum:]-])$1([^[:alnum:]-]|\$)" >/dev/null
+  local id_re
+  [ -n "$1" ] || return 1
+  case "$1" in *[!A-Za-z0-9._-]*) return 1 ;; esac
+  id_re=$(printf '%s' "$1" | sed 's/\./\\./g') || return 1
+  [ -n "$id_re" ] || return 1
+  printf '%s' "$2" | grep -E "(^|[^[:alnum:]-])${id_re}(\$|[^[:alnum:].-]|\.(\$|[^[:alnum:]]))" >/dev/null
 }
 
 # subject_impl_scopes_bead <subject_line> <bead_id> — rc0 iff <bead_id> is the
