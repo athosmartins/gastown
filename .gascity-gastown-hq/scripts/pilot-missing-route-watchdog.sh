@@ -243,9 +243,15 @@
 # graph.v2 steps, discovery:source. Measured live 31/10: 5 approved P0/P1 exec:auto unrouted WA beads, every
 # one carved out by one of those (gate:passed, assignee+gate, assignee+refusal, open dependency, epic) — the
 # pass is quiet today and exists to catch the next wa-sgznbu-shaped bead.
-# DETECTION-ONLY: no gc.routed_to is written and no comment is posted. A route put on from outside would
-# make a pool session claim the bead without the Pilot's pool-cap / node / claim checks (the wa-5wv49
+# DETECTION-ONLY for rig stores and P2+: no gc.routed_to is written there and no comment is posted. A route put on from
+# outside would make a pool session claim the bead without the Pilot's pool-cap / node / claim checks (the wa-5wv49
 # double-dispatch class); the useful output is a person asking why the Pilot has not touched it.
+# EXCEPTION (ga-hfx1kou, ordem do Athos 31/10): in the HQ store, P0/P1 only, the watchdog stamps gc.routed_to=gastown.dog on
+# the bead in the SAME sweep (_pmrw_approved_fix). Reason: the dogs' probe only sees open + unassigned + gc.routed_to=gastown.dog,
+# so an HQ approved bead with no route was invisible to every dog (6 P0s sat 44 min while a dog took a P3); wa-worker/ps-worker
+# cannot read the HQ, so gastown.dog is the only possible route there, and the dog pool is capped by the engine, not by the
+# Pilot's pool-cap. The fixer re-reads and re-applies every veto before writing, confirms by reading back, skips lane:kimi
+# (the Kimi lane stamps its own route), and a write it cannot confirm becomes an alarm (fix=failed|unverified|unread|raced).
 # It rides on the SAME `bd list --json --limit 0` read as the first pass (no extra bd call), alerts through
 # its own cooldown ledger (PMRW_APPROVED_STATE_FILE), and never changes run_sweep's return code.
 # A store that could not be read (or whose selection failed) is reported as PARTIAL/UNKNOWN, never as
@@ -254,7 +260,7 @@
 # excuses a bead for its queue position ("enfileirado atrás de N itens ... despacho saudável") and stays silent
 # when it reads the Pilot as dead ("starving BUT pilot dead — no alarm"); this pass looks at the bead alone
 # and does not consult the queue or the Pilot's liveness. Kill-switch PMRW_APPROVED_ENABLED=0.
-# See --selftest scenarios 56-63.
+# See --selftest scenarios 56-63 (detection) and 65-78 (the fixer).
 #
 # GRACE PERIOD (PMRW_GRACE_MINUTES, default 10): unlike GMMSW's gate-status
 # loss (happens once, atomically, at marker creation — 5min grace), an armed
@@ -420,12 +426,20 @@ PMRW_AUTO_REPAIR="${PMRW_AUTO_REPAIR:-1}"
 # path already does) does not.
 PMRW_REPAIR_MAX_ATTEMPTS="${PMRW_REPAIR_MAX_ATTEMPTS:-3}"
 PMRW_REPAIR_RETRY_SLEEP_S="${PMRW_REPAIR_RETRY_SLEEP_S:-1}"
-# ga-2hd02v.3.22 (B): a SEPARATE, detection-only pass over story:approved + exec:auto beads
+# ga-2hd02v.3.22 (B): a SEPARATE pass over story:approved + exec:auto beads
 # (see "SECOND PASS" in the header). Number knobs that are not plain digits fall back to the
 # default in _pmrw_approved_select (a typo must not turn the alarm off or into a firehose).
 PMRW_APPROVED_ENABLED="${PMRW_APPROVED_ENABLED:-1}"
 PMRW_APPROVED_MIN_MINUTES="${PMRW_APPROVED_MIN_MINUTES:-30}"
 PMRW_APPROVED_MAX_PRIORITY="${PMRW_APPROVED_MAX_PRIORITY:-1}"
+# ga-hfx1kou: the FIXER inside that pass (_pmrw_approved_fix). HQ store ONLY and P0/P1 ONLY (P2+ and the rig stores stay
+# detection-only): it stamps gc.routed_to=gastown.dog on an approved bead the dogs' probe cannot see. PMRW_APPROVED_FIX=0 is the
+# kill-switch (the detection keeps alarming); PMRW_APPROVED_ENABLED=0 silences the whole pass, fixer included. Number knobs that
+# are not plain digits fall back to these defaults inside the function. Min age 0 = the same sweep that sees the bead.
+PMRW_APPROVED_FIX="${PMRW_APPROVED_FIX:-1}"
+PMRW_APPROVED_FIX_MIN_MINUTES="${PMRW_APPROVED_FIX_MIN_MINUTES:-0}"
+PMRW_APPROVED_FIX_MAX_PRIORITY="${PMRW_APPROVED_FIX_MAX_PRIORITY:-1}"
+PMRW_APPROVED_FIX_MAX_PER_SWEEP="${PMRW_APPROVED_FIX_MAX_PER_SWEEP:-20}"
 
 HQ="${PMRW_HQ:-/Users/athos/gt/.gascity-gastown-hq}"
 # Same store set as GOLW (gate-orphaned-label-watchdog.sh), same rationale:
@@ -804,8 +818,10 @@ _pmrw_resolve_tracked_state() {
 # does not parse leaves the bead out (same as the first pass) rather than guessing an age.
 _pmrw_approved_select() {
   local _cand="$1" _now="$2" _min _maxpri _out
-  case "${PMRW_APPROVED_MIN_MINUTES:-}" in ''|*[!0-9]*) _min=30 ;; *) _min="$PMRW_APPROVED_MIN_MINUTES" ;; esac
-  case "${PMRW_APPROVED_MAX_PRIORITY:-}" in ''|*[!0-9]*) _maxpri=1 ;; *) _maxpri="$PMRW_APPROVED_MAX_PRIORITY" ;; esac
+  # ga-hfx1kou: optional 3rd/4th args (minutes, max priority) let the FIXER ask the SAME question with its own
+  # thresholds (age 0, P<=1) instead of copying this filter. Absent/empty/non-numeric → the detection knobs → their defaults.
+  case "${3:-${PMRW_APPROVED_MIN_MINUTES:-}}" in ''|*[!0-9]*) _min=30 ;; *) _min="${3:-$PMRW_APPROVED_MIN_MINUTES}" ;; esac
+  case "${4:-${PMRW_APPROVED_MAX_PRIORITY:-}}" in ''|*[!0-9]*) _maxpri=1 ;; *) _maxpri="${4:-$PMRW_APPROVED_MAX_PRIORITY}" ;; esac
   _out=$(printf '%s' "$_cand" | jq -c \
       --argjson now_ts "$_now" --argjson minage "$(( _min * 60 ))" --argjson maxpri "$_maxpri" \
       --argjson recency "$(( ${PMRW_DISPATCH_RECENCY_MINUTES:-240} * 60 ))" '
@@ -837,15 +853,158 @@ _pmrw_approved_select() {
   printf '%s\n' "$_out"
 }
 
+# _pmrw_approved_fix <cand_json> <store> <now_epoch>   (ga-hfx1kou — ordem do Athos 31/10 ~10:49 BRT)
+# O CONSERTO da passada das aprovadas, SÓ para a store HQ e SÓ para P0/P1: toda bead open + story:approved +
+# exec:auto + P<=PMRW_APPROVED_FIX_MAX_PRIORITY (1) sem gc.routed_to ganha gc.routed_to=gastown.dog NA MESMA passada
+# (idade mínima PMRW_APPROVED_FIX_MIN_MINUTES, default 0). Medido: 6 P0 do HQ sem rota ficaram 44 min invisíveis
+# à sonda dos dogs (que só enxerga open + sem dono + gc.routed_to=gastown.dog) enquanto um dog pegou uma P3.
+# Por que SÓ o HQ: wa-worker/ps-worker não leem o HQ (ga-vp2zr0), então a rota certa de uma bead do HQ é sempre
+# gastown.dog; nas stores dos rigs a rota é decisão do Pilot (pool-cap, classificador de nó) e continua só-detecta.
+# Por que SÓ P0/P1: o Pilot deixa de propósito as P2+ sem rota quando cede a vez (_pilot_priority_yield_release —
+# uma rota de dog fura o yield de prioridade); para P0/P1 é exatamente o que se quer.
+# REUSA o filtro de _pmrw_approved_select (todo veto: gate:*, next-action:*, no-auto-dispatch, held, dependência
+# aberta, dispatching/in-flight, atribuída...) com os limiares do conserto, e tira lane:kimi (a faixa Kimi põe a
+# própria rota kimi-lane; gastown.dog a mandaria para o pool Claude). Antes de CADA escrita relê a bead e repete
+# o mesmo filtro (a bead pode ter sido pega pelo Pilot entre a lista e a escrita); depois da escrita relê de novo e só
+# declara FIXED se metadata["gc.routed_to"] voltou gastown.dog (NÃO usa _bead_recheck_status: ele devolve
+# "not-armed" para bead sem ctx:ready, o que aqui seria "resolvida" sem nada gravado).
+# Três estados, nunca colapsados (doutrina ga-p5q3):
+#   leitura/seleção ilegível         → NENHUMA escrita; rc 1 (store sem leitura) ou linha A ... unread (bead sem releitura)
+#   escrita feita mas não confirmada → linha A ... failed (confirmado ainda vazio) | unverified (releitura falhou)
+#   confirmada                       → FIXED + comentário de auditoria + linha D (sai do alarme)
+# Saída (stdout), uma linha por bead tratada, TAB-separada:
+#   D <id>                                   resolvida (consertada, ou mudou sob nós: já roteada/atribuída/pega/fechada) → NÃO alarma
+#   A <id> <store> <idade_min> <prio> <tipo> <estado>   alarma já (estado: unread|failed|unverified|raced)
+# Beads que ficaram de fora pelo teto PMRW_APPROVED_FIX_MAX_PER_SWEEP (20) não saem nenhuma linha: seguem na detecção.
+# DRY_RUN só loga WOULD. Kill-switch PMRW_APPROVED_FIX=0. Knob com lixo → default (P1, 0 min, 20).
+_pmrw_approved_fix() {
+  local _cand="$1" _store="$2" _now="$3"
+  [ "${PMRW_APPROVED_FIX:-1}" = "1" ] || return 0
+  local _fmin _fmax _fcap _route="gastown.dog" _sel _list _b _id _age _pri _typ _n=0 _left
+  case "${PMRW_APPROVED_FIX_MIN_MINUTES:-}" in ''|*[!0-9]*) _fmin=0 ;; *) _fmin="$PMRW_APPROVED_FIX_MIN_MINUTES" ;; esac
+  case "${PMRW_APPROVED_FIX_MAX_PRIORITY:-}" in ''|*[!0-9]*) _fmax=1 ;; *) _fmax="$PMRW_APPROVED_FIX_MAX_PRIORITY" ;; esac
+  case "${PMRW_APPROVED_FIX_MAX_PER_SWEEP:-}" in ''|*[!0-9]*) _fcap=20 ;; *) _fcap="$PMRW_APPROVED_FIX_MAX_PER_SWEEP" ;; esac
+  # vazio → "[]" rc 0 (nada a consertar); falhou/ilegível → rc 1 e nada no stdout (o chamador conta a store como NÃO vista)
+  _sel="$(_pmrw_approved_select "$_cand" "$_now" "$_fmin" "$_fmax")" || {
+    log "WARN: APPROVED-FIX: seleção falhou na store '$_store' — NENHUMA escrita nesta passada"
+    return 1
+  }
+  _list="$(printf '%s' "$_sel" | jq -c '
+      [ .[] | select(((.labels // []) | index("lane:kimi")) | not) ]
+      | sort_by([ ((.priority | tonumber?) // 9), (.updated_at // .created_at // "") ]) | .[]
+    ' 2>/dev/null)" || {
+    log "WARN: APPROVED-FIX: jq falhou ao ordenar a seleção da store '$_store' — NENHUMA escrita nesta passada"
+    return 1
+  }
+  [ -n "${_list:-}" ] || return 0
+  local _fresh _still _attempt _v _vstate _vroute _vlabels _outcome
+  while IFS= read -r _b; do
+    [ -z "${_b:-}" ] && continue
+    _id="$(printf '%s' "$_b" | jq -r '.id // empty' 2>/dev/null)"
+    [ -z "${_id:-}" ] && continue
+    if [ "$_n" -ge "$_fcap" ]; then
+      _left="$(printf '%s\n' "$_list" | grep -c . || true)"
+      log "APPROVED-FIX: teto de ${_fcap} escrita(s) por passada atingido (capped) — o resto espera a próxima passada (${_left} elegível(is) no total nesta store)"
+      break
+    fi
+    _n=$((_n + 1))
+    _age="$(printf '%s' "$_b" | jq -r --argjson now_ts "$_now" '((.updated_at // .created_at // "") | fromdateiso8601? // null) as $e | if $e then ((($now_ts - $e) / 60) | floor | tostring) else "?" end' 2>/dev/null)"
+    _pri="$(printf '%s' "$_b" | jq -r '(.priority | tonumber? // 9) | tostring' 2>/dev/null)"
+    _typ="$(printf '%s' "$_b" | jq -r '.issue_type // .type // "?"' 2>/dev/null)"
+    [ -z "${_age:-}" ] && _age="?"; [ -z "${_pri:-}" ] && _pri=9; [ -z "${_typ:-}" ] && _typ="?"
+    if [ "${PMRW_DRY_RUN:-0}" = "1" ]; then
+      log "APPROVED-FIX: DRY_RUN: WOULD stamp $_id ($(_store_name "$_store"), P${_pri} ${_typ}, parada há ${_age}min) gc.routed_to=$_route — nada gravado"
+      continue
+    fi
+    # Releitura fresca + o MESMO filtro. vazio (a bead não veio na leitura) ou falhou/ilegível → NÃO escreve e ALARMA (unread);
+    # veio mas o filtro já não a deixa elegível (roteada, atribuída, pega pelo Pilot, fechada, vetada) → resolvida sob nós, sem escrita, sem alarme.
+    _fresh="$("$BD_BIN" -C "$_store" list --id "$_id" --all --json 2>/dev/null | jq -c 'if type=="array" then . else [.] end' 2>/dev/null)"
+    if [ -z "${_fresh:-}" ] || [ "$_fresh" = "null" ] \
+       || [ "$(printf '%s' "$_fresh" | jq -r --arg id "$_id" '[ .[] | select(.id == $id) ] | length' 2>/dev/null)" != "1" ]; then
+      log "WARN: APPROVED-FIX: $_id — releitura fresca falhou ou não trouxe a bead — NADA gravado; segue como alarme (unread)"
+      printf 'A\t%s\t%s\t%s\t%s\t%s\tunread\n' "$_id" "$_store" "$_age" "$_pri" "$_typ"
+      continue
+    fi
+    _still="$(_pmrw_approved_select "$_fresh" "$_now" "$_fmin" "$_fmax")" || _still=""
+    if [ -z "${_still:-}" ]; then
+      log "WARN: APPROVED-FIX: $_id — filtro falhou sobre a releitura — NADA gravado; segue como alarme (unread)"
+      printf 'A\t%s\t%s\t%s\t%s\t%s\tunread\n' "$_id" "$_store" "$_age" "$_pri" "$_typ"
+      continue
+    fi
+    if [ "$(printf '%s' "$_still" | jq -r --arg id "$_id" '[ .[] | select(.id == $id) ] | length' 2>/dev/null)" != "1" ]; then
+      log "APPROVED-FIX: SKIP $_id — a releitura fresca não a deixa mais elegível (já roteada/atribuída/pega pelo Pilot/fechada/vetada) — nada gravado"
+      printf 'D\t%s\n' "$_id"
+      continue
+    fi
+    # Escreve e CONFIRMA lendo de volta. vazio → tenta de novo (até PMRW_REPAIR_MAX_ATTEMPTS) e sai failed; falhou/ilegível → idem e sai unverified.
+    _outcome="failed"; _vstate="empty"; _attempt=1; _vlabels=""
+    while [ "$_attempt" -le "${PMRW_REPAIR_MAX_ATTEMPTS:-3}" ]; do
+      "$BD_BIN" -C "$_store" update "$_id" --set-metadata "gc.routed_to=$_route" -q 2>/dev/null || true
+      _v="$("$BD_BIN" -C "$_store" list --id "$_id" --all --json 2>/dev/null | jq -c 'if type=="array" then . else [.] end' 2>/dev/null)"
+      if [ -z "${_v:-}" ] || [ "$_v" = "null" ]; then
+        _vstate="error"
+      else
+        _vstate="$(printf '%s' "$_v" | jq -r --arg id "$_id" '
+            ([ .[] | select(.id == $id) ] | .[0]) as $b
+            | if $b == null then "gone"
+              elif ($b.status // "") == "closed" then "closed"
+              else (($b.metadata["gc.routed_to"] // "") | if test("\\S") then . else "empty" end) end' 2>/dev/null)"
+        [ -z "${_vstate:-}" ] && _vstate="error"
+      fi
+      case "$_vstate" in
+        "$_route") _outcome="fixed"; break ;;
+        gone|closed) _outcome="moot"; break ;;
+        empty) _outcome="failed" ;;
+        error) _outcome="unverified" ;;
+        *) _outcome="other"; break ;;   # alguém gravou OUTRA rota no meio: não é nossa, não a sobrescrevemos de novo
+      esac
+      log "  - APPROVED-FIX $_id: tentativa ${_attempt}/${PMRW_REPAIR_MAX_ATTEMPTS:-3} — confirmação '$_vstate' — tentando de novo"
+      _attempt=$((_attempt + 1))
+      if [ "$_attempt" -le "${PMRW_REPAIR_MAX_ATTEMPTS:-3}" ] && [ "${PMRW_REPAIR_RETRY_SLEEP_S:-0}" != "0" ]; then sleep "$PMRW_REPAIR_RETRY_SLEEP_S"; fi
+    done
+    case "$_outcome" in
+      fixed)
+        # O Pilot pode ter pego a bead entre a releitura e a escrita: a confirmação mostra o claim → risco de DOIS despachos.
+        _vlabels="$(printf '%s' "$_v" | jq -r --arg id "$_id" '[ .[] | select(.id == $id) ] | .[0].labels // [] | map(select(. == "pilot:dispatching" or . == "pilot:dispatched" or . == "story:in-flight")) | join(",")' 2>/dev/null)"
+        if [ -n "${_vlabels:-}" ]; then
+          log "WARN: APPROVED-FIX: RACE $_id — gc.routed_to=$_route gravado, mas a bead já carrega ${_vlabels} (o Pilot a pegou no mesmo instante): conferir se há DOIS despachos (wrapper do Pilot + dog pela rota)"
+          printf 'A\t%s\t%s\t%s\t%s\t%s\traced\n' "$_id" "$_store" "$_age" "$_pri" "$_typ"
+        else
+          log "APPROVED-FIX: FIXED $_id ($(_store_name "$_store"), P${_pri} ${_typ}, parada há ${_age}min): gc.routed_to=$_route gravado e confirmado"
+          printf 'D\t%s\n' "$_id"
+        fi
+        printf '%s' "pilot-missing-route-watchdog (ga-hfx1kou): bead aprovada P${_pri} do HQ (story:approved + exec:auto) sem gc.routed_to há ${_age}min — a sonda dos dogs não a enxergava. Carimbada gc.routed_to=${_route} nesta passada e confirmada por releitura (ordem do Athos 31/10: toda P0/P1 aprovada pode ser pega por dog). Se o Pilot a despachar ao mesmo tempo, o claim dele (pilot:dispatching/story:in-flight) vence e o log do watchdog marca RACE." \
+          | "$BD_BIN" -C "$_store" comment "$_id" --stdin 2>/dev/null || log "WARN: APPROVED-FIX: bd comment (auditoria) falhou para $_id"
+        ;;
+      moot)
+        log "APPROVED-FIX: SKIP $_id — sumiu/fechou durante o conserto ($_vstate) — nada a fazer"
+        printf 'D\t%s\n' "$_id"
+        ;;
+      other)
+        log "APPROVED-FIX: SKIP $_id — já tem outra rota ($_vstate) gravada por outro (Pilot/pessoa) — não sobrescrita"
+        printf 'D\t%s\n' "$_id"
+        ;;
+      failed|unverified)
+        log "WARN: APPROVED-FIX: $_outcome $_id — ${PMRW_REPAIR_MAX_ATTEMPTS:-3} tentativa(s) e a rota $_route $( [ "$_outcome" = failed ] && echo 'continua ausente na releitura' || echo 'não pôde ser confirmada' ) — segue como alarme"
+        printf 'A\t%s\t%s\t%s\t%s\t%s\t%s\n' "$_id" "$_store" "$_age" "$_pri" "$_typ" "$_outcome"
+        ;;
+    esac
+  done <<< "$_list"
+  return 0
+}
+
 # _pmrw_approved_report <approved_tsv> <unread_stores> <total_stores> <now_epoch>   (ga-2hd02v.3.22 B)
 # Alerts (notify + mail to the mayor, cooldown per bead in APPROVED_STATE_FILE) on the beads the second pass
-# selected. DETECTION-ONLY BY DESIGN: it never stamps gc.routed_to and never comments on the bead. The Pilot
-# stamps the route itself when it dispatches (dispatch_one, after the claim), and a route put on by someone
-# else would make the bead claimable by a pool session without the Pilot's pool-cap / node / claim checks (the
-# wa-5wv49 double-dispatch class) — so the useful output here is a human reading WHY the Pilot has not touched
-# a P0/P1 approved bead, not a silent "fix". Never changes run_sweep's return code (the first pass owns it).
+# selected. THIS FUNCTION ONLY REPORTS: it never stamps gc.routed_to and never comments on a bead. Whether a bead is
+# also FIXED is decided before, by _pmrw_approved_fix (ga-hfx1kou: HQ + P0/P1 only; the rows it could not fix arrive here
+# with a 6th field). Everywhere else — rig stores, P2+ — the pass stays detection-only: the Pilot stamps those routes itself
+# when it dispatches (dispatch_one, after the claim), and a route put on by someone else would make the bead claimable by
+# a pool session without the Pilot's pool-cap / node / claim checks (the wa-5wv49 double-dispatch class), so the useful
+# output there is a human reading WHY the Pilot has not touched a P0/P1 approved bead. Never changes run_sweep's return
+# code (the first pass owns it).
 # approved_tsv: one row per line, real TAB-separated (NOT the \t-escaped form the first pass uses): id, store, age_min,
-# priority, type — none can be empty by construction (age is a number or "?", priority a number, type falls back to "?").
+# priority, type — none can be empty by construction (age is a number or "?", priority a number, type falls back to "?") —
+# and an OPTIONAL 6th field `fix` (unread|failed|unverified|raced) on the rows _pmrw_approved_fix could not resolve.
 # vazio → loga "CLEAR" (0 nas stores lidas; não "OK:" — o selftest 27 conta as linhas "OK:" para provar que só um run varreu) e, se TODAS foram lidas, zera o ledger de cooldown; falhou/ilegível →
 # stores sem leitura saem como UNKNOWN/PARTIAL (nunca "OK: 0") e o ledger fica como está (cego não zera cooldown,
 # senão a bead volta a avisar assim que a leitura voltar).
@@ -870,15 +1029,15 @@ _pmrw_approved_report() {
     fi
     return 0
   fi
-  local _bid _store _age _pri _typ _last _due="" _due_n=0 _newst
+  local _bid _store _age _pri _typ _fix _last _due="" _due_n=0 _newst
   _newst="$( [ "$_unread" -gt 0 ] && printf '%s' "$_ast" || printf '{}' )"
-  while IFS=$'\t' read -r _bid _store _age _pri _typ; do
+  while IFS=$'\t' read -r _bid _store _age _pri _typ _fix; do
     [ -z "${_bid:-}" ] && continue
-    log "APPROVED: ${_bid} ($(_store_name "$_store"), P${_pri} ${_typ}) story:approved+exec:auto sem gc.routed_to, parada há ${_age}min"
+    log "APPROVED: ${_bid} ($(_store_name "$_store"), P${_pri} ${_typ}) story:approved+exec:auto sem gc.routed_to, parada há ${_age}min${_fix:+ fix=${_fix}}"
     _last="$(printf '%s' "$_ast" | jq -r --arg id "$_bid" '.[$id].last_alert // 0' 2>/dev/null)"
     case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
     if [ "$_last" -eq 0 ] || [ $(( _now - _last )) -ge "$PMRW_ALERT_COOLDOWN_S" ]; then
-      _due="${_due}  ${_bid}  ($(_store_name "$_store"), P${_pri} ${_typ})  parada há ${_age}min"$'\n'
+      _due="${_due}  ${_bid}  ($(_store_name "$_store"), P${_pri} ${_typ})  parada há ${_age}min${_fix:+  fix=${_fix}}"$'\n'
       _due_n=$((_due_n + 1))
       _last="$_now"
     fi
@@ -903,7 +1062,7 @@ _pmrw_approved_report() {
     command -v "${NOTIFY_BIN}" >/dev/null 2>&1 && \
       "${NOTIFY_BIN}" -t "Pilot: aprovada(s) sem rota" -p "${PMRW_NOTIFY_PRIORITY}" "$_summary" 2>/dev/null || true
   fi
-  local _body="PILOT MISSING-ROUTE WATCHDOG — passada das APROVADAS (ga-2hd02v.3.22, só detecta).
+  local _body="PILOT MISSING-ROUTE WATCHDOG — passada das APROVADAS (ga-2hd02v.3.22; ga-hfx1kou: no HQ, P0/P1, ela também carimba a rota).
 
 ${_summary}
 
@@ -914,8 +1073,12 @@ O que isto quer dizer: a bead está open, aprovada, auto, sem dono e sem gc.rout
 refusal/reclaim) está nela. O Pilot carimba a rota sozinho ao despachar; se ela ficou >= ${PMRW_APPROVED_MIN_MINUTES}min sem nada,
 o Pilot não a enxergou ou a deixou de fora sem deixar marca. Onde olhar: grep '<id>' no pilot-dispatcher.log (EXCLUÍDO ...),
 e o classificador de nó se for bead do WA (wa-node-classify.py).
-NÃO foi gravado gc.routed_to em nenhuma bead e não há comentário nas beads: uma rota posta por fora faria um pool pegar a bead
-sem passar pelas checagens de capacidade/nó do Pilot.
+Nas stores dos rigs e nas P2+ esta passada SÓ DETECTA: não foi gravado gc.routed_to nelas e não há comentário nas beads (uma rota
+posta por fora faria um pool pegar a bead sem passar pelas checagens de capacidade/nó do Pilot).
+No HQ, P0/P1 (ga-hfx1kou, ordem do Athos 31/10) o watchdog carimba gc.routed_to=gastown.dog sozinho na mesma passada e confirma lendo de
+volta. As linhas com fix=... abaixo são as que ele TENTOU e não fechou: fix=unread (não releu a bead: nada gravado), fix=failed
+(gravou ${PMRW_REPAIR_MAX_ATTEMPTS}x e a rota continua ausente), fix=unverified (gravou mas a releitura falhou: pode ter pegado),
+fix=raced (gravou e o Pilot pegou a bead no mesmo instante: conferir se há DOIS despachos).
 A idade é desde o último update da bead (o único relógio que existe): comentário/label novo a reinicia, então ela só pode ser
 SUBESTIMADA. Re-aviso da mesma bead suprimido por ${PMRW_ALERT_COOLDOWN_S}s (ledger: ${APPROVED_STATE_FILE}). Lista completa no log: ${LOG}"
   if [ -n "${PMRW_TEST_MAILED:-}" ]; then
@@ -979,7 +1142,7 @@ run_sweep() {
   local store cand_json sel_json
   # ga-2hd02v.3.22 (B): second pass accumulators. approved_unread counts the stores whose story:approved
   # selection could not be computed (a different thing from "computed, found none") — see _pmrw_approved_select.
-  local approved_tsv="" approved_unread=0 appr_json appr_rows
+  local approved_tsv="" approved_unread=0 appr_json appr_rows fix_out fix_blind fix_alarm_rows fix_ids_json appr_json_f
   for store in $PMRW_STORES; do
     stores_total=$((stores_total + 1))
     # Re-stamp the lock heartbeat once per store (mirrors quality-gate-
@@ -1037,7 +1200,23 @@ run_sweep() {
     # ga-2hd02v.3.22 (B): second pass on the SAME read. vazio → nada acrescentado; falhou/ilegível → a store
     # entra em approved_unread (o relatório diz PARTIAL/UNKNOWN, nunca "0 achadas") e o resto do sweep segue.
     if [ "${PMRW_APPROVED_ENABLED:-1}" = "1" ]; then
+      # ga-hfx1kou: o CONSERTO roda ANTES da detecção, só no HQ (ver _pmrw_approved_fix). Cega (rc 1) → nenhuma escrita e a store
+      # conta como NÃO vista (PARTIAL/UNKNOWN); as linhas D/A que ele devolve tiram as já resolvidas da lista de alarme e põem as que falharam.
+      fix_out=""; fix_blind=0; fix_alarm_rows=""
+      if [ "$store" = "$HQ" ] && [ "${PMRW_APPROVED_FIX:-1}" = "1" ]; then
+        fix_out="$(_pmrw_approved_fix "$cand_json" "$store" "$now")" || fix_blind=1
+        fix_alarm_rows="$(printf '%s\n' "$fix_out" | awk -F'\t' 'BEGIN{OFS="\t"} $1=="A"{print $2,$3,$4,$5,$6,$7}')"
+      fi
       if appr_json="$(_pmrw_approved_select "$cand_json" "$now")"; then
+        if [ -n "${fix_out:-}" ]; then
+          # vazio → nada a tirar; falhou/ilegível → a lista de detecção fica SEM filtro (falso alarme possível, alarme perdido nunca)
+          fix_ids_json="$(printf '%s\n' "$fix_out" | awk -F'\t' '$1=="D"||$1=="A"{print $2}' | jq -R -s -c 'split("\n") | map(select(length>0))' 2>/dev/null)"
+          if [ -n "${fix_ids_json:-}" ] && appr_json_f="$(printf '%s' "$appr_json" | jq -c --argjson ids "$fix_ids_json" 'map(select(.id as $i | ($ids | index($i)) == null))' 2>/dev/null)" && [ -n "${appr_json_f:-}" ]; then
+            appr_json="$appr_json_f"
+          else
+            log "WARN: APPROVED-FIX: não consegui tirar as beads tratadas da lista de detecção da store '$store' — a lista segue sem filtro (pode repetir uma já consertada)"
+          fi
+        fi
         appr_rows="$(printf '%s' "$appr_json" | jq -r --argjson now_ts "$now" --arg store "$store" '
             .[] | [ .id, $store,
                     ( ((.updated_at // .created_at // "") | fromdateiso8601? // null) as $e
@@ -1053,9 +1232,15 @@ run_sweep() {
           log "WARN: APPROVED: store '$store' tem aprovadas sem rota mas as linhas não saíram do jq — store conta como NÃO vista nesta passada"
         fi
       else
-        approved_unread=$((approved_unread + 1))
+        approved_unread=$((approved_unread + 1)); fix_blind=0   # já contada como não vista; não conta duas vezes
         log "WARN: APPROVED: seleção das story:approved falhou na store '$store' — store conta como NÃO vista nesta passada (a primeira passada segue)"
       fi
+      if [ "$fix_blind" = "1" ]; then
+        approved_unread=$((approved_unread + 1))
+        log "WARN: APPROVED-FIX: o conserto ficou cego na store '$store' (seleção falhou) — store conta como NÃO vista nesta passada"
+      fi
+      # as que o conserto TENTOU e não conseguiu confirmar alarmam já, com o estado (6º campo), sem esperar os 30 min da detecção
+      if [ -n "${fix_alarm_rows:-}" ]; then approved_tsv="${approved_tsv}${fix_alarm_rows}"$'\n'; fi
     fi
 
     local rows
@@ -1553,6 +1738,9 @@ case "$verb" in
     fi
     if [ "$persist" = "1" ]; then
       base="$PMRW_TEST_RECHECK_DIR/${storekey}-${bid}.json"
+      # ga-hfx1kou: a marker file "<failcount file>.unreadable" simulates the connection dying RIGHT AFTER the write:
+      # the write is accepted (exit 0) but every later read of the bead fails — the "could not confirm" third state.
+      if [ -f "${fcfile}.unreadable" ]; then echo '__BD_FAIL__' > "$base"; exit 0; fi
       cur=""
       if [ -f "$base" ] && ! grep -qx '__BD_FAIL__' "$base" 2>/dev/null; then
         cur="$(jq -c '.[0] // empty' "$base" 2>/dev/null)"
@@ -1562,7 +1750,10 @@ case "$verb" in
         [ -f "$mainf" ] && cur="$(jq -c --arg id "$bid" '[.[] | select(.id==$id)][0] // empty' "$mainf" 2>/dev/null)"
       fi
       [ -z "$cur" ] && cur="{\"id\":\"${bid}\",\"status\":\"open\",\"labels\":[\"ctx:ready\",\"exec:auto\"],\"issue_type\":\"bug\",\"metadata\":{}}"
-      printf '[%s]' "$(printf '%s' "$cur" | jq -c --arg k "$key" --arg v "$val" '.metadata[$k] = $v')" > "$base"
+      newjson="$(printf '%s' "$cur" | jq -c --arg k "$key" --arg v "$val" '.metadata[$k] = $v')"
+      # ga-hfx1kou: marker "<failcount file>.raced" = the Pilot claimed the bead in the very instant the write landed.
+      [ -f "${fcfile}.raced" ] && newjson="$(printf '%s' "$newjson" | jq -c '.labels += ["pilot:dispatching"]')"
+      printf '[%s]' "$newjson" > "$base"
     fi
     ;;
   *) echo "[]" ;;
@@ -2620,6 +2811,175 @@ CRASHPY
     [ "$(jq -r 'type' "$APPROVED_STATE_FILE" 2>/dev/null)" = "object" ] && [ "$(jq -r '.["wa-64"].last_alert // 0 | . > 0' "$APPROVED_STATE_FILE" 2>/dev/null)" = "true" ] && ok "scenario 64: ledger '$junk64' rewritten as a valid object holding wa-64" || bad "scenario 64: ledger '$junk64' was not rewritten valid"   # third-state-waiver: leitura do próprio teste; ledger ilegível ou ausente dá type != object e reprova o caso
   done
 
+
+  # ── Scenarios 65-77 (ga-hfx1kou): the FIXER. Ordem do Athos 31/10: toda bead do HQ aprovada P0/P1 sem
+  # gc.routed_to ganha gc.routed_to=gastown.dog NA MESMA passada (antes: só detectava; 6 P0 ficaram 44 min
+  # invisíveis à sonda dos dogs). P2+ e as outras stores continuam só-detecta. ──────────────────────────────
+  reset_hq() { reset_stores; echo '[]' > "$TMP/fixtures/hq.json"; rm -f "$TMP"/recheck/hq-* "$TMP"/repair-failcount/hq-* 2>/dev/null; }
+  fx_persist() { local i; for i in "$@"; do echo 0 > "$PMRW_TEST_REPAIR_FAILCOUNT_DIR/hq-$i"; done; }   # a escrita desta bead "gruda" no stub
+  # vazio → "" (nada gravado); falhou/ilegível → "" também: o teste só compara com gastown.dog, e "" reprova, que é o lado seguro.
+  hq_route() { jq -r '.[0].metadata["gc.routed_to"] // ""' "$TMP/recheck/hq-$1.json" 2>/dev/null; }
+  run_fx() {  # run_fx <tag> — varre HQ + store-a; logs do cenário em $TMP/{n,m,c,u}<tag>; os PMRW_* do chamador passam
+    local t="$1"; : > "$TMP/n$t"; : > "$TMP/m$t"; : > "$TMP/c$t"; : > "$TMP/u$t"; : > "$LOG"
+    PMRW_STORES="$HQ $STORE_A" PMRW_TEST_NOTIFIED="$TMP/n$t" PMRW_TEST_MAILED="$TMP/m$t" PMRW_TEST_COMMENTS_LOG="$TMP/c$t" PMRW_TEST_UPDATE_CALLS_LOG="$TMP/u$t" run_sweep
+  }
+
+  echo "Scenario 65 (ga-hfx1kou a): HQ approved P0/P1 sem rota → gc.routed_to=gastown.dog na mesma passada (1 min de idade, com ou sem ctx:ready)"
+  reset_hq
+  {
+    mka fx-p0    'story:approved,exec:auto'           "$FRESH_TS" 0
+    mka fx-p1    'story:approved,exec:auto,ctx:ready' "$FRESH_TS" 1
+    mka fx-noctx 'story:approved,exec:auto'           "$OLD_TS"   0
+  } | to_store "$TMP/fixtures/hq.json"
+  fx_persist fx-p0 fx-p1 fx-noctx
+  run_fx 65; rc=$?
+  for fid in fx-p0 fx-p1 fx-noctx; do
+    [ "$(hq_route $fid)" = "gastown.dog" ] && ok "scenario 65: $fid recebeu gc.routed_to=gastown.dog (gravado e confirmado)" || bad "scenario 65: $fid NÃO recebeu a rota (aprovada P0/P1 do HQ continua invisível aos dogs)"
+    grep -q "FIXED $fid" "$LOG" && ok "scenario 65: $fid logada como FIXED" || bad "scenario 65: $fid sem linha FIXED no log"
+    grep -q "comment:$fid" "$TMP/c65" && ok "scenario 65: $fid ganhou o comentário de auditoria" || bad "scenario 65: $fid sem comentário de auditoria"
+  done
+  [ "$rc" -eq 0 ] && ok "scenario 65: rc da varredura intacto (0)" || bad "scenario 65: rc mudou para $rc"
+  [ ! -s "$TMP/m65" ] && [ ! -s "$TMP/n65" ] && ok "scenario 65: bead consertada não alarma (nenhum mail/notify)" || bad "scenario 65: alarmou uma bead que foi consertada"
+
+  echo "Scenario 66 (ga-hfx1kou): um negativo por veto no HQ — NENHUM é carimbado; o positivo da mesma varredura é (o laço rodou de verdade)"
+  reset_hq
+  {
+    mka fx-pos          'story:approved,exec:auto'                         "$OLD_TS" 0
+    mka fx-neg-kimi     'story:approved,exec:auto,lane:kimi'               "$OLD_TS" 0
+    mka fx-neg-manual   'story:approved,exec:manual'                       "$OLD_TS" 0
+    mka fx-neg-nostory  'exec:auto'                                        "$OLD_TS" 0
+    mka fx-neg-routed   'story:approved,exec:auto'                         "$OLD_TS" 0 '.metadata["gc.routed_to"] = "wa-worker"'
+    mka fx-neg-assigned 'story:approved,exec:auto'                         "$OLD_TS" 0 '.assignee = "oracle-wa"'
+    mka fx-neg-gate     'story:approved,exec:auto,gate:passed'             "$OLD_TS" 0
+    mka fx-neg-nextact  'story:approved,exec:auto,next-action:athos'       "$OLD_TS" 0
+    mka fx-neg-noauto   'story:approved,exec:auto,pilot:no-auto-dispatch'  "$OLD_TS" 0
+    mka fx-neg-noauto2  'story:approved,exec:auto,no-auto-dispatch'        "$OLD_TS" 0
+    mka fx-neg-held     'story:approved,exec:auto,pilot:held'              "$OLD_TS" 0
+    mka fx-neg-dispatching 'story:approved,exec:auto,pilot:dispatching'    "$OLD_TS" 0
+    mka fx-neg-inflight 'story:approved,exec:auto,story:in-flight'         "$OLD_TS" 0
+    mka fx-neg-engine   'story:approved,exec:auto,needs:engine-window'     "$OLD_TS" 0
+    mka fx-neg-refusal  'story:approved,exec:auto,pilot:refusal-count:1'   "$OLD_TS" 0
+    mka fx-neg-epic     'story:approved,exec:auto'                         "$OLD_TS" 0 '.issue_type = "epic"'
+    mka fx-neg-wrapper  'story:approved,exec:auto'                         "$OLD_TS" 0 '.metadata["pilot.sling_for"] = "wa-1"'
+    mka fx-neg-dep      'story:approved,exec:auto'                         "$OLD_TS" 0 '.dependencies = [{"type":"blocks","depends_on_id":"fx-neg-dep-target"}]'
+    mka fx-neg-dep-target 'ctx:ready'                                      "$OLD_TS" 3
+    mk  fx-neg-closed closed 'story:approved,exec:auto' "$OLD_TS" | jq -c '.priority = 0'
+    mk  fx-neg-inprog in_progress 'story:approved,exec:auto' "$OLD_TS" | jq -c '.priority = 0'
+  } | to_store "$TMP/fixtures/hq.json"
+  fx_persist fx-pos $(jq -r '.[].id' "$TMP/fixtures/hq.json" | grep '^fx-neg-')   # third-state-waiver: lê o fixture que este mesmo teste acabou de escrever; se viesse vazio, o positivo abaixo reprovaria
+  run_fx 66
+  [ "$(hq_route fx-pos)" = "gastown.dog" ] && ok "scenario 66: o positivo da mesma varredura foi carimbado" || bad "scenario 66: fx-pos não foi carimbado (laço não rodou?)"
+  for nid in $(jq -r '.[].id' "$TMP/fixtures/hq.json" | grep '^fx-neg-'); do   # third-state-waiver: mesmo fixture escrito acima; vazio faria o positivo reprovar
+    if grep -q "^update:${nid}\$" "$TMP/u66"; then bad "scenario 66 (falso positivo): $nid foi escrito"; else ok "scenario 66: $nid não foi tocado"; fi
+  done
+
+  echo "Scenario 67 (ga-hfx1kou d): P2 no HQ continua SÓ-DETECTA — alarma (quando a janela de detecção o inclui), nunca é escrito"
+  reset_hq
+  { mka fx-p2 'story:approved,exec:auto' "$OLD_TS" 2; mka fx-p1b 'story:approved,exec:auto' "$OLD_TS" 1; } | to_store "$TMP/fixtures/hq.json"
+  fx_persist fx-p2 fx-p1b
+  PMRW_APPROVED_MAX_PRIORITY=2 run_fx 67
+  ! grep -q '^update:fx-p2$' "$TMP/u67" && [ -z "$(hq_route fx-p2)" ] && ok "scenario 67: P2 NÃO foi carimbada" || bad "scenario 67: P2 foi carimbada — o fixer vazou para fora de P0/P1"
+  grep -q '  fx-p2  ' "$TMP/m67" && ok "scenario 67: P2 sem rota segue alarmando (detecção intacta)" || bad "scenario 67: a detecção da P2 sumiu"
+  [ "$(hq_route fx-p1b)" = "gastown.dog" ] && ! grep -q '  fx-p1b  ' "$TMP/m67" && ok "scenario 67: a P1 da mesma passada foi consertada e não alarma" || bad "scenario 67: P1 não foi consertada, ou alarmou mesmo consertada"
+
+  echo "Scenario 68: bead de OUTRA store (rig) não é escrita — o fixer vale só para o HQ (wa-worker/ps-worker não leem o HQ, e a rota de rig é do Pilot)"
+  reset_hq
+  mka wa-68 'story:approved,exec:auto' "$OLD_TS" 0 | to_store "$TMP/fixtures/store-a.json"
+  mka fx-68 'story:approved,exec:auto' "$OLD_TS" 0 | to_store "$TMP/fixtures/hq.json"
+  echo 0 > "$PMRW_TEST_REPAIR_FAILCOUNT_DIR/store-a-wa-68"; fx_persist fx-68
+  run_fx 68
+  ! grep -q '^update:wa-68$' "$TMP/u68" && ok "scenario 68: wa-68 (store-a) NÃO foi escrita" || bad "scenario 68: o fixer escreveu numa bead fora do HQ"
+  grep -q '  wa-68  ' "$TMP/m68" && ok "scenario 68: wa-68 segue só alarmando" || bad "scenario 68: a detecção da store-a sumiu"
+  [ "$(hq_route fx-68)" = "gastown.dog" ] && ok "scenario 68: a bead do HQ da mesma passada foi carimbada" || bad "scenario 68: fx-68 do HQ não foi carimbada"
+
+  echo "Scenario 69 (ga-hfx1kou c1): HQ ilegível → NENHUMA escrita e a passada diz PARTIAL (nunca CLEAR)"
+  reset_hq
+  echo '__BD_FAIL__' > "$TMP/fixtures/hq.json"
+  echo '[]' > "$TMP/fixtures/store-a.json"
+  fx_persist fx-69
+  run_fx 69
+  [ ! -s "$TMP/u69" ] && ok "scenario 69: nenhuma escrita com o HQ cego" || bad "scenario 69: escreveu com o HQ ilegível"
+  grep -q 'APPROVED: PARTIAL' "$LOG" && ! grep -q 'APPROVED: CLEAR' "$LOG" && ok "scenario 69: PARTIAL, nunca CLEAR" || bad "scenario 69: passada cega não disse PARTIAL"
+
+  echo "Scenario 70 (ga-hfx1kou c2): a releitura fresca da bead falha → NENHUMA escrita e ALARME na hora (a P0 não espera 30 min)"
+  reset_hq
+  mka fx-70 'story:approved,exec:auto' "$FRESH_TS" 0 | to_store "$TMP/fixtures/hq.json"
+  echo '__BD_FAIL__' > "$TMP/recheck/hq-fx-70.json"; fx_persist fx-70
+  run_fx 70
+  ! grep -q '^update:fx-70$' "$TMP/u70" && ok "scenario 70: nada gravado sem conseguir reler" || bad "scenario 70: gravou sem conseguir reler a bead"
+  grep -q '  fx-70  .*fix=unread' "$TMP/m70" && ok "scenario 70: o mail nomeia a bead com fix=unread" || bad "scenario 70: releitura ilegível não alarmou"
+  ! grep -q "FIXED fx-70" "$LOG" && ok "scenario 70: não foi logada como FIXED" || bad "scenario 70: logou FIXED sem confirmar"
+
+  echo "Scenario 71 (ga-hfx1kou c3): a escrita não gruda → ${PMRW_REPAIR_MAX_ATTEMPTS} tentativas, fix=failed, alarme; a escrita que gruda mas não dá para confirmar → fix=unverified"
+  reset_hq
+  { mka fx-71 'story:approved,exec:auto' "$FRESH_TS" 0; mka fx-71u 'story:approved,exec:auto' "$FRESH_TS" 0; } | to_store "$TMP/fixtures/hq.json"
+  echo 0 > "$PMRW_TEST_REPAIR_FAILCOUNT_DIR/hq-fx-71u"; : > "$PMRW_TEST_REPAIR_FAILCOUNT_DIR/hq-fx-71u.unreadable"   # fx-71: sem arquivo de failcount → o stub aceita e NÃO grava
+  run_fx 71
+  [ "$(grep -c '^update:fx-71$' "$TMP/u71")" -eq "$PMRW_REPAIR_MAX_ATTEMPTS" ] && ok "scenario 71: tentou ${PMRW_REPAIR_MAX_ATTEMPTS}x e parou" || bad "scenario 71: número de tentativas errado"   # third-state-waiver: conta as chamadas do stub que o próprio cenário acabou de gravar; log vazio daria 0 e reprovaria o -eq
+  grep -q '  fx-71  .*fix=failed' "$TMP/m71" && ok "scenario 71: fix=failed no mail" || bad "scenario 71: escrita perdida não alarmou como failed"
+  grep -q '  fx-71u  .*fix=unverified' "$TMP/m71" && ok "scenario 71: escrita não confirmável vira fix=unverified" || bad "scenario 71: unverified não alarmou"
+  ! grep -q 'FIXED fx-71' "$LOG" && ok "scenario 71: nenhuma das duas foi logada como FIXED" || bad "scenario 71: logou FIXED sem confirmar"
+
+  echo "Scenario 72: kill-switch PMRW_APPROVED_FIX=0 e DRY_RUN → zero escrita; a detecção segue"
+  reset_hq
+  mka fx-72 'story:approved,exec:auto' "$OLD_TS" 0 | to_store "$TMP/fixtures/hq.json"; fx_persist fx-72
+  PMRW_APPROVED_FIX=0 run_fx 72
+  [ ! -s "$TMP/u72" ] && grep -q '  fx-72  ' "$TMP/m72" && ok "scenario 72: kill-switch → sem escrita, a detecção alarma" || bad "scenario 72: kill-switch não desligou o fixer, ou a detecção sumiu"
+  reset_hq
+  mka fx-72d 'story:approved,exec:auto' "$OLD_TS" 0 | to_store "$TMP/fixtures/hq.json"; fx_persist fx-72d
+  PMRW_DRY_RUN=1 run_fx 72d
+  [ ! -s "$TMP/u72d" ] && [ ! -s "$TMP/c72d" ] && grep -q 'WOULD.*fx-72d' "$LOG" && ok "scenario 72: DRY_RUN → só loga WOULD, sem escrita nem comentário" || bad "scenario 72: DRY_RUN escreveu ou não logou WOULD"
+
+  echo "Scenario 73: teto por passada — PMRW_APPROVED_FIX_MAX_PER_SWEEP=2 de 4 beads: as 2 primeiras na ordem prioridade>idade; o resto espera (e a velha ainda alarma)"
+  reset_hq
+  {
+    mka fx-c1 'story:approved,exec:auto' "$OLD_TS"   0
+    mka fx-c2 'story:approved,exec:auto' "$FRESH_TS" 0
+    mka fx-c3 'story:approved,exec:auto' "$OLD_TS"   1
+    mka fx-c4 'story:approved,exec:auto' "$MID_TS"   0
+  } | to_store "$TMP/fixtures/hq.json"
+  fx_persist fx-c1 fx-c2 fx-c3 fx-c4
+  PMRW_APPROVED_FIX_MAX_PER_SWEEP=2 run_fx 73
+  [ "$(hq_route fx-c1)" = "gastown.dog" ] && [ "$(hq_route fx-c4)" = "gastown.dog" ] && ok "scenario 73: as duas P0 mais velhas foram carimbadas" || bad "scenario 73: a ordem prioridade>idade não valeu"
+  [ -z "$(hq_route fx-c2)" ] && [ -z "$(hq_route fx-c3)" ] && ok "scenario 73: o excedente ficou sem rota" || bad "scenario 73: o teto não segurou"
+  grep -q 'capped\|teto' "$LOG" && ok "scenario 73: o log diz que bateu no teto" || bad "scenario 73: teto silencioso"
+  grep -q '  fx-c3  ' "$TMP/m73" && ok "scenario 73: a P1 velha que ficou de fora alarma pela detecção" || bad "scenario 73: a P1 que ficou sem rota não alarmou"
+
+  echo "Scenario 74: lixo nos knobs cai nos defaults (P1, 20 por passada), nunca em 'tudo' nem em 'nada'"
+  reset_hq
+  { mka fx-j1 'story:approved,exec:auto' "$OLD_TS" 1; mka fx-j2 'story:approved,exec:auto' "$OLD_TS" 2; mka fx-j3 'story:approved,exec:auto' "$OLD_TS" 0; } | to_store "$TMP/fixtures/hq.json"
+  fx_persist fx-j1 fx-j2 fx-j3
+  PMRW_APPROVED_FIX_MAX_PRIORITY=x PMRW_APPROVED_FIX_MAX_PER_SWEEP=abc PMRW_APPROVED_FIX_MIN_MINUTES=zz run_fx 74
+  [ "$(hq_route fx-j1)" = "gastown.dog" ] && [ "$(hq_route fx-j3)" = "gastown.dog" ] && [ -z "$(hq_route fx-j2)" ] && ok "scenario 74: defaults aplicados (P0/P1 carimbadas, P2 não)" || bad "scenario 74: knob com lixo mudou a seleção"
+
+  echo "Scenario 75: a bead mudou ENTRE a lista e a escrita (o Pilot a pegou: pilot:dispatching) → a releitura fresca veta, nada é escrito"
+  reset_hq
+  mka fx-75 'story:approved,exec:auto' "$OLD_TS" 0 | to_store "$TMP/fixtures/hq.json"
+  printf '[%s]' "$(mka fx-75 'story:approved,exec:auto,pilot:dispatching' "$OLD_TS" 0)" > "$TMP/recheck/hq-fx-75.json"; fx_persist fx-75
+  run_fx 75
+  ! grep -q '^update:fx-75$' "$TMP/u75" && ok "scenario 75: sem escrita sobre uma bead que o Pilot acabou de pegar" || bad "scenario 75: escreveu por cima do claim do Pilot"
+
+  echo "Scenario 76: a bead já tem rota na releitura (outra passada, ou o Pilot) → não regrava, não alarma, não loga FIXED"
+  reset_hq
+  mka fx-76 'story:approved,exec:auto' "$OLD_TS" 0 | to_store "$TMP/fixtures/hq.json"
+  printf '[%s]' "$(mka fx-76 'story:approved,exec:auto' "$OLD_TS" 0 '.metadata["gc.routed_to"] = "gastown.dog"')" > "$TMP/recheck/hq-fx-76.json"; fx_persist fx-76
+  run_fx 76
+  ! grep -q '^update:fx-76$' "$TMP/u76" && [ ! -s "$TMP/m76" ] && ! grep -q 'FIXED fx-76' "$LOG" && ok "scenario 76: já roteada → nada a fazer, nada a dizer" || bad "scenario 76: mexeu/alarmou numa bead que já tinha rota"
+
+  echo "Scenario 77: idempotência — a 2ª varredura sobre a mesma bead não regrava"
+  reset_hq
+  mka fx-77 'story:approved,exec:auto' "$OLD_TS" 0 | to_store "$TMP/fixtures/hq.json"; fx_persist fx-77
+  run_fx 77
+  N77A="$(grep -c '^update:fx-77$' "$TMP/u77")"   # third-state-waiver: conta as chamadas do stub da 1ª passada; log vazio daria 0 e o -eq 1 abaixo reprovaria
+  run_fx 77
+  [ "$N77A" -eq 1 ] && [ "$(grep -c '^update:fx-77$' "$TMP/u77")" -eq 0 ] && ok "scenario 77: 1 escrita na 1ª passada, 0 na 2ª" || bad "scenario 77: escrita repetida (${N77A} na 1ª)"   # third-state-waiver: conta o log do stub na 2ª passada; vazio = 0 é o valor esperado e o -eq 1 da 1ª passada cobre o vazio
+
+  echo "Scenario 78: o Pilot pegou a bead NO INSTANTE da escrita (a leitura de confirmação já mostra pilot:dispatching) → não é FIXED limpo: fix=raced alarma (risco de DOIS despachos)"
+  reset_hq
+  mka fx-78 'story:approved,exec:auto' "$OLD_TS" 0 | to_store "$TMP/fixtures/hq.json"; fx_persist fx-78; : > "$PMRW_TEST_REPAIR_FAILCOUNT_DIR/hq-fx-78.raced"
+  run_fx 78
+  grep -q '  fx-78  .*fix=raced' "$TMP/m78" && ok "scenario 78: a corrida vira alarme fix=raced" || bad "scenario 78: corrida com o Pilot passou em silêncio"
+  ! grep -q 'FIXED fx-78' "$LOG" && grep -q 'RACE fx-78' "$LOG" && ok "scenario 78: logada como RACE, não como FIXED" || bad "scenario 78: o log não distingue a corrida"
 
   echo ""
   echo "pilot-missing-route-watchdog selftest: PASS=$PASS FAIL=$FAIL"
