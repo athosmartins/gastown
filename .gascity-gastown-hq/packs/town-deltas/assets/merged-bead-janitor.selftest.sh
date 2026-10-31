@@ -530,6 +530,16 @@ rc1 subject_impl_scopes_bead "fix(wa-qrki7a.1): gate ga-bph1tej — envio Zoho" 
 rc1 subject_impl_scopes_bead "fix(wa-qrki7a.1): gate ga-bph1tej — envio Zoho" "wa-qrki7a.3"    # a sibling ≠ the scope
 rc0 subject_impl_scopes_bead "fix(wa-qrki7a.1): gate ga-bph1tej — envio Zoho" "wa-qrki7a.1"    # the child's own scope
 rc0 subject_impl_scopes_bead "fix(wa-qrki7a): epic-level change" "wa-qrki7a"                    # the epic's own commit is still the epic's
+# ...and a genuine landing of a DOTTED id is still recognised in every accepted header form (the guard against
+# over-tightening: measured on this repo's last 6000 commits, all 3351 whole-id verdicts were unchanged):
+rc0 subject_impl_scopes_bead "feat(warming/ga-2hd02v.3.28): path-segment scope" "ga-2hd02v.3.28"
+rc0 subject_impl_scopes_bead "Merge crew/mila/wa-qrki7a.3: e-mail anexos" "wa-qrki7a.3"
+rc0 subject_impl_scopes_bead "wa-qrki7a.3: bare-id lead" "wa-qrki7a.3"
+rc0 subject_impl_scopes_bead "fix bug wa-qrki7a.3: retry logic" "wa-qrki7a.3"
+rc0 subject_impl_scopes_bead "merge(wa-86jr.1+wa-o3zs.2): multi-id scope" "wa-o3zs.2"
+rc1 subject_impl_scopes_bead "merge(wa-86jr.1+wa-o3zs.2): multi-id scope" "wa-o3zs"             # its parent, same header
+rc1 subject_impl_scopes_bead "fix(ga-2hd02v.3.28): MBP livre não recusa por swap" "ga-2hd02v.3"  # a real subject of this repo: the parent task
+rc1 subject_impl_scopes_bead "fix(ga-2hd02v.3.28): MBP livre não recusa por swap" "ga-2hd02v"    # ...and the epic
 
 # ── 3. merge-evidence helpers — real git, no network ────────────────────────
 echo "── 3. scan_commit_for_bead + branch_merged (real repo) ──"
