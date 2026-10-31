@@ -257,6 +257,22 @@ def unmatched_verdict(text: str) -> dict:
     return _verdict_from_kept_lines("unmatched", text, lines, offsets, set(range(len(lines))), reason="no-fixed-rule-applies")
 
 
+def omit_lines_verdict(rule: str, text: str, omit_ranges: list[tuple[int, int]]) -> dict:
+    """The verdict for a cut decided by something other than a shape rule (the Jev tier, ga-d0hm85): omit the LINE
+    ranges [start, end) of `text`, keep every other line. Built through the same single partition as every
+    other verdict (_verdict_from_kept_lines), so the same invariants hold -- kept and omitted tile the text, the
+    marker cost is inside chars_after/tokens_after, and a cut that would not shrink the output comes back as
+    the explicit rule "no-gain" instead of a phantom saving. A range outside the text is clipped, an empty or
+    inverted one omits nothing. With NOTHING omitted the verdict is "no-gain" too (the text is kept whole), so
+    a caller that wants "nothing to cut" as its own fact must not ask. Never raises."""
+    lines, offsets = _split_lines(text)
+    total = len(lines)
+    omit: set[int] = set()
+    for start, end in omit_ranges:
+        omit.update(range(max(0, start), min(total, end)))
+    return _verdict_from_kept_lines(rule, text, lines, offsets, set(range(total)) - omit)
+
+
 def classify_pytest(text: str) -> dict | None:
     """None if `text` is not recognizably a pytest run (no "test session starts" line). Otherwise
     a verdict dict from _verdict_from_kept_lines().
