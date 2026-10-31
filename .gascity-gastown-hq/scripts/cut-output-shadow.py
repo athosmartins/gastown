@@ -2,10 +2,9 @@
 """cut-output-shadow.py (ga-wk0qi2, child of ga-aijm2v) — PostToolUse:Bash AND PostToolUseFailure:Bash
 hook, SHADOW MODE ONLY. Measures what a "cut large tool output before it enters the agent's context" FIXED RULE
 WOULD do, for every pool session (dog/wa-worker/ps-worker/reviewer — see pool-roles.json), and logs that to
-jev-experiment.jsonl. It NEVER modifies the real tool output, and it sends nothing anywhere: no network, no
-credential lookup, no AI. The command it logs is a fingerprint (first 300 characters) -- or a placeholder when
-those characters look like a credential or personal data (cut_output_egress.loggable_command): a token typed
-into a command line is not left at rest in the shared jev-experiment.jsonl.
+jev-experiment.jsonl. It NEVER modifies the real tool output. The FIXED rule sends nothing anywhere (no network, no
+credential lookup, no AI); the Jev tier (cut_output_jev.py, ga-d0hm85) DOES send text to Cloudflare Workers AI for a
+sample of the outputs the fixed rule cannot cut -- see "THE JEV TIER" below for exactly what, and how to turn it off.
 
 Per Athos's own authorization (AskUserQuestion in the Mayor session, 28/09 11:3x, cited in this
 bead's own description): the four new Jev shadow fronts start in SHADOW. The rule decides and
@@ -14,11 +13,10 @@ script's stdout is therefore ALWAYS the literal two characters `{}` (a no-op hoo
 -- regardless of what the classifier concludes. See PASSO 0 below for why a real cut,
 WHEN one is eventually authorized, cannot just be a string.
 
-SCOPE, decided by the Mayor (28/09 23:1x) after the gate rejected this bead seven times: THIS bead ships the fixed
-rule only. Every rejection found another "could not know reads as measured nothing" hole, and every one was in the
-tier that asked Jev to judge the output the fixed rule does not cut. That tier is ga-d0hm85 (it starts once the fixed
-rule has about a week of data); it is not here, not switched off behind a constant, and nothing in the report or the
-log reads a Jev field. Its code lives in this branch's history (a2d6a71f0) for whoever picks that bead up.
+SCOPE. Phase 1 (ga-wk0qi2, merged 29/09) shipped the fixed rule alone: the Mayor (28/09 23:1x) took the Jev tier out after
+the gate rejected the bead seven times, every time for another "could not know reads as measured nothing" hole in it.
+Phase 2 (ga-d0hm85, this file's Jev call) puts it back, rebuilt around explicit states instead of numbers derived from
+a subset of the text -- cut_output_jev.py's docstring is the design; the last rejection (ga-nw6sbx) is its test case.
 
 PASSO 0 (mandatory prerequisite, done once, NOT wired into this script): proven live against
 the installed Claude Code 2.1.283 that a PostToolUse hook CAN replace Bash's tool output before
@@ -52,9 +50,20 @@ experiment "cut-output-fixed", and the row's `rule` says which of the five thing
   * "unknown": a pytest run it cannot read (killed or truncated, no final summary): nothing would be cut, and
     tokens_would_save is None -- a third state, not a zero-token cut;
   * "unmatched": a large output NO fixed rule applies to (prose, one long line, a JSON blob, `bd show`, a short
-    diff...): nothing would be cut, tokens_would_save None, nothing for the join. It is a row instead of silence so
-    that the report can say how much large output the rule never reaches -- without it that population would read
-    exactly like calls too small to consider, and the case count would pass for the count of large outputs.
+    diff...): nothing would be cut by the FIXED rule, tokens_would_save None, nothing for the join. It is a row instead of
+    silence so that the report can say how much large output the rule never reaches -- without it that population would
+    read exactly like calls too small to consider, and the case count would pass for the count of large outputs. Its
+    `jev_tier` field says what the Jev tier did with it: attempted / sampled-out / disabled.
+
+THE JEV TIER (ga-d0hm85), for the "unmatched" population only, SHIPPED OFF. Per call: tier = cut_output_jev.jev_tier(entity_id)
+-- "disabled" unless a human wrote a percentage into the CUT_OUTPUT_SHADOW_JEV_ENABLED file (the authorization is cited in
+that file's comment lines), then a deterministic share of calls is "attempted" and the rest "sampled-out"; the
+CUT_OUTPUT_SHADOW_JEV_DISABLED sentinel switches it off again. The fixed row is written first, then (if attempted)
+cut_output_jev.judge() writes ONE row, experiment "cut-output-jev": every block of the output is relevant / cuttable /
+not-judged, and the record's coverage, saving and counters come from those states (a call Jev could not answer is NOT a
+zero). What leaves the machine WHEN ON: the text of the output's blocks (head+tail within a character budget) plus the
+command, to Cloudflare Workers AI -- minus any block that looks like a credential or personal data, which is withheld and
+counted. Why it ships off, and the limits of the guard: cut_output_jev.py.
 
 RECORD MODE: every row goes to jev-experiment.jsonl with mode "cut-output" (cut_output_classifier.
 RECORD_MODE), never "shadow". That mode belongs to jev_experiment_report.summarize_shadow(), which
@@ -69,7 +78,9 @@ is caught and turns into printing "{}" and exit(0). Nothing this script does can
 the worst case is a lost shadow measurement, never a lost or altered tool result. That is not "free": the hook is
 SYNCHRONOUS -- the agent waits for it after every Bash call. Below the size gate that is one jq call in the wrapper;
 above it, a python start plus the classifier, bounded by the wrapper's 12s watchdog and the 15s hook timeout in
-pool-roles.json. Measured on this machine (29/09, one run each): 1.0s for a 6.3 MB single line, 6.3s for an 8.9 MB
+pool-roles.json. The Jev tier adds a network call to that path for the sampled share of unmatched outputs, bounded by
+its own 9s deadline (cut_output_jev.JEV_DEADLINE_S, below the watchdog so a slow Jev is logged, not killed silently).
+Measured on this machine (29/09, one run each): 1.0s for a 6.3 MB single line, 6.3s for an 8.9 MB
 pytest-shaped output, 11.0s for a 6.3 MB log-shaped dump -- so an output that size lands at the watchdog (it is then
 killed and counted as engine_rc_137, not lost silently). How large a payload Claude Code really hands a hook is NOT
 verified; settle that before this ever graduates past shadow. A lost measurement is not silent, though: main() writes
@@ -83,7 +94,7 @@ done, as an emergency kill switch.
 CLI:
   python3 cut-output-shadow.py             (no args) -- the real hook entrypoint, reads the
       PostToolUse / PostToolUseFailure hook JSON from stdin, ALWAYS prints "{}" to stdout, exit 0 always.
-  python3 cut-output-shadow.py selftest    -- pure (writes only to throwaway logs), no network.
+  python3 cut-output-shadow.py selftest    -- pure (writes only to throwaway logs); the Jev call is mocked, no network.
 """
 from __future__ import annotations
 
@@ -97,6 +108,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cut_output_classifier as coc  # noqa: E402
 import cut_output_egress as cegress  # noqa: E402
+import cut_output_jev as cjev  # noqa: E402
 import jev_experiment as je  # noqa: E402
 
 EXPERIMENT_FIXED = "cut-output-fixed"
@@ -116,12 +128,17 @@ def _now_iso() -> str:
 def _entity_id(meta: dict) -> str:
     """The record's join key: the real tool_use_id when the hook input had one, otherwise a fresh
     unique id. A shared placeholder would make every id-less record collide on one key, so the first
-    join would mark all of them as already joined."""
+    join would mark all of them as already joined. process() chooses it ONCE per call and puts it in meta["entity_id"]:
+    the fixed-rule row and the Jev row of the same call must carry the same key, or the report could not match an
+    attempted Jev call to its result (a fresh uuid per row would make every id-less call look like a lost one)."""
+    chosen = meta.get("entity_id")
+    if isinstance(chosen, str) and chosen:
+        return chosen
     tool_use_id = meta.get("tool_use_id")
     return tool_use_id if tool_use_id else f"no-tool-use-id-{uuid.uuid4().hex[:12]}"
 
 
-def build_fixed_log_record(verdict: dict, meta: dict) -> dict:
+def build_fixed_log_record(verdict: dict, meta: dict, jev_tier: str | None = None) -> dict:
     """Pure. `verdict` is classify_output()'s return, which now carries its own POSITION-based
     `omitted_text` (never re-derived here by content-diffing kept_text against the original —
     that silently miscounted a genuinely-repeated line as "kept" wherever else it occurred;
@@ -133,7 +150,7 @@ def build_fixed_log_record(verdict: dict, meta: dict) -> dict:
     # is cut, and that is NOT the same fact as "cutting saves 0 tokens" (nothing was evaluated) -- so
     # tokens_would_save is None (third state), which the report keeps out of its average.
     not_evaluated = verdict["rule"] in ("unknown", "unmatched")
-    return {
+    record = {
         "ts": _now_iso(),
         "mode": coc.RECORD_MODE,
         "experiment": EXPERIMENT_FIXED,
@@ -157,6 +174,12 @@ def build_fixed_log_record(verdict: dict, meta: dict) -> dict:
         "omitted_signatures": coc.extract_signatures(omitted_text),
         "referenced_later": None,  # filled in by the offline join (jev_cut_output_join.py)
     }
+    if jev_tier is not None:
+        # Only an "unmatched" row says what became of the Jev tier for it: attempted (a Jev row should follow; none
+        # means the attempt was lost, e.g. killed by the wrapper's watchdog), sampled-out, or disabled. A row without
+        # the key was written before this field existed -- the report counts those apart, it does not guess.
+        record["jev_tier"] = jev_tier
+    return record
 
 
 def _log(record: dict) -> None:
@@ -255,14 +278,21 @@ def process(hook_input: dict) -> None:
         "hook_event": hook_event,
         "exit_code": exit_code,
     }
+    meta["entity_id"] = _entity_id(meta)  # once per call: the fixed row and the Jev row must share it
 
     verdict = coc.classify_output(command, text)
+    tier = None
     if verdict is None:
-        # Large, but no fixed rule applies. Nothing else is asked about it (the Jev tier is ga-d0hm85's): it is
-        # recorded as the rule's own third state, so the report can say how much large output the rule never
-        # reaches instead of letting that population vanish into "too small to consider".
+        # Large, but no fixed rule applies. It is recorded as the rule's own third state, so the report can say how
+        # much large output the rule never reaches instead of letting that population vanish into "too small to
+        # consider" -- and, for a deterministic sample of them, the Jev tier (cut_output_jev.py) judges it.
         verdict = coc.unmatched_verdict(text)
-    _log(build_fixed_log_record(verdict, meta))
+        tier = cjev.jev_tier(meta["entity_id"])
+    # The fixed-rule row goes out FIRST, stamped with what the Jev tier will do. If the call below is killed (the
+    # wrapper's watchdog) or dies, the stamp "attempted" with no Jev row is how the report knows the attempt was lost.
+    _log(build_fixed_log_record(verdict, meta, jev_tier=tier))
+    if tier == cjev.TIER_ATTEMPTED:
+        _log(cjev.judge(command, text, meta))
 
 
 def main() -> int:
@@ -298,9 +328,24 @@ def _selftest() -> int:
     import tempfile
     from unittest import mock
 
+    real_jev_calls: list = []
+
+    def _never_the_real_jev(state, questions):  # noqa: ANN001
+        real_jev_calls.append(1)
+        return {"ok": False, "error": "selftest_guard"}
+
     with tempfile.TemporaryDirectory() as guard_dir, \
-         mock.patch.object(je, "JEV_LOG", Path(guard_dir) / "selftest-default-log.jsonl"):
-        return _selftest_suite()
+         mock.patch.object(je, "JEV_LOG", Path(guard_dir) / "selftest-default-log.jsonl"), \
+         mock.patch.object(cjev, "JEV_ENABLED_FILE", Path(guard_dir) / "no-such-jev-enabled-file"), \
+         mock.patch.object(cjev, "JEV_DISABLED_SENTINEL", Path(guard_dir) / "no-such-jev-sentinel"), \
+         mock.patch.object(je, "call_jev_multi", side_effect=_never_the_real_jev):
+        rc_suite = _selftest_suite()
+        # every test that wants the Jev call patches call_jev_multi itself; reaching THIS one means a test could have
+        # sent text to the network (or the vault) -- counted here, because the deadline wrapper would swallow the error
+        if real_jev_calls:
+            print(f"  FAIL selftest isolation: {len(real_jev_calls)} test(s) reached the default (guarded) call_jev_multi")
+            return 1
+        return rc_suite
 
 
 def _selftest_suite() -> int:
@@ -333,12 +378,6 @@ def _selftest_suite() -> int:
         ok("fixed record has referenced_later=None (filled in later, offline)", rec["referenced_later"] is None)
         ok("fixed record's tokens_would_save is non-negative", rec["tokens_would_save"] >= 0)
         ok("fixed record extracted a signature from the omitted noise", isinstance(rec["omitted_signatures"], list))
-        ok("fixed record: an ordinary command is kept as the logged fingerprint", rec["command"] == "cat log.txt")
-        cred_rec = build_fixed_log_record(verdict, {"tool_use_id": "tu-cred", "command": "curl -H 'Authorization: Bearer abcdef0123456789'"})
-        ok("fixed record: a credential typed into the command line is NOT left at rest in the log row",
-           cred_rec["command"] == cegress.COMMAND_WITHHELD and "abcdef0123456789" not in json.dumps(cred_rec))
-        ok("fixed record: a command that is not a string is logged as empty, never raises",
-           build_fixed_log_record(verdict, {"tool_use_id": "tu-odd", "command": ["ls"]})["command"] == "")
 
     # ---- regression, ga-wk0qi2 gate feedback attempt 1, blocking issue 1: an all-pass pytest run
     # with non-empty stderr must NOT lose the "N passed" summary just because process() appends
@@ -642,55 +681,203 @@ def _selftest_suite() -> int:
             ok("process(): pytest case logged experiment cut-output-fixed", rec["experiment"] == EXPERIMENT_FIXED)
             ok("process(): pytest case logged the right tool_use_id", rec["tool_use_id"] == "tu-pytest")
 
-    # ---- Mayor 28/09 23:1x, after the 7th gate rejection: THIS bead ships the FIXED RULE only. Every rejection found
-    # a new "could not know reads as measured nothing" hole in the Jev tier, so that tier moved to ga-d0hm85. A large
-    # output no fixed rule applies to is therefore sent NOWHERE: it is one 'unmatched' row, the rule's own third
-    # state ("I do not know how to cut this, so I do not cut it"). Not a silent skip (that would read exactly like a
-    # call too small to consider, so the report could not say how much large output the rule never reaches), and
-    # not a zero-token cut (nothing was evaluated). ----
+    # ---- the "unmatched" population and the Jev tier (ga-d0hm85). A large output NO fixed rule applies to is the rule's
+    # own third state ("I do not know how to cut this, so I do not cut it") -- never a silent skip (that would read like
+    # a call too small to consider) and never a zero-token cut (nothing was evaluated). What happens NEXT depends on
+    # the tier: disabled / sampled-out -> that one row; attempted -> a second row from cut_output_jev.judge(). ----
     prose_big = "\n\n".join(f"random unstructured paragraph number {i} with no test/log shape at all, just prose padding to grow it" for i in range(80))
 
-    def _unmatched_hook(stdout: str, tuid: str = "tu-unm", **kw) -> dict:
-        h = {"tool_name": "Bash", "tool_response": {"stdout": stdout, "stderr": ""}, "tool_use_id": tuid,
+    def _unmatched_hook(stdout: str, tuid: str | None = "tu-unm", **kw) -> dict:
+        h = {"tool_name": "Bash", "tool_response": {"stdout": stdout, "stderr": ""},
              "session_id": "s-unm", "transcript_path": "/tmp/s-unm.jsonl", "tool_input": {"command": "some-tool --verbose"}}
+        if tuid is not None:
+            h["tool_use_id"] = tuid
         h.update(kw)
         return h
 
+    def _rows(path: Path) -> list[dict]:
+        return [json.loads(ln) for ln in path.read_text().splitlines()] if path.exists() else []
+
+    @contextlib.contextmanager
+    def _tier(pct):
+        """The Jev tier at `pct` percent for the duration: a temp enable file (the only way to turn it on), with a citation
+        line like a real one would carry, patched in as JEV_ENABLED_FILE."""
+        with tempfile.TemporaryDirectory() as td_tier:
+            enabled_file = Path(td_tier) / "cut-output-jev.enabled"
+            enabled_file.write_text(f"# selftest: tier at {pct}%\n{pct}\n")
+            with mock.patch.object(cjev, "JEV_ENABLED_FILE", enabled_file):
+                yield
+
+    clean_answers = {"ok": True, "answers": {f"block_{i}": 0.02 for i in range(13)}, "bad": {}, "tokens_in": 800, "tokens_out": 13}
+
+    # -- tier DISABLED: the DEFAULT (no enable file at all), exactly the phase-1 behavior, now with the stamp that says so --
     for label, out_text in (
         ("prose", prose_big),
         ("one 50k-char line", "y" * 50_000),
-        ("150 lines of 395 chars (~59k, the size the Jev tier used to sample)", "\n".join(f"{i:04d} " + "x" * 390 for i in range(150))),
+        ("150 lines of 395 chars (~59k)", "\n".join(f"{i:04d} " + "x" * 390 for i in range(150))),
     ):
         with tempfile.TemporaryDirectory() as td:
             log_path = Path(td) / "jev-experiment.jsonl"
             with mock.patch.object(je, "JEV_LOG", log_path), \
-                 mock.patch.object(je, "call_jev_multi", return_value={"ok": True, "answers": {}, "bad": {}}) as m_unm:
+                 mock.patch.object(je, "call_jev_multi", return_value=clean_answers) as m_unm:
                 process(_unmatched_hook(out_text))
             unm_lines = log_path.read_text().splitlines() if log_path.exists() else []
             unm_rec = json.loads(unm_lines[0]) if unm_lines else {}
-            ok(f"unmatched ({label}): Jev is NEVER called -- nothing leaves the machine and nothing waits on a network", m_unm.call_count == 0)
-            ok(f"unmatched ({label}): exactly one row, in the fixed-rule experiment (there is no other tier), this front's mode",
+            ok(f"unmatched, tier at its default (no enable file) ({label}): Jev is NOT called -- the tier ships OFF", m_unm.call_count == 0)
+            ok(f"unmatched, tier disabled ({label}): exactly one row, in the fixed-rule experiment, this front's mode",
                len(unm_lines) == 1 and unm_rec.get("experiment") == EXPERIMENT_FIXED and unm_rec.get("mode") == coc.RECORD_MODE)
+            ok(f"unmatched, tier disabled ({label}): the row says so -- jev_tier 'disabled', not absent and not 'sampled-out'", unm_rec.get("jev_tier") == cjev.TIER_DISABLED)
             ok(f"unmatched ({label}): rule 'unmatched' with its own reason -- not 'unknown' (that one means a recognized shape)",
                unm_rec.get("rule") == "unmatched" and unm_rec.get("reason") == "no-fixed-rule-applies")
             ok(f"unmatched ({label}): tokens_would_save is None (third state), never a measured 0 and never a guess",
                "tokens_would_save" in unm_rec and unm_rec["tokens_would_save"] is None)
-            ok(f"unmatched ({label}): nothing cut -> chars/tokens after == before, nothing omitted, no signature for the join",
+            ok(f"unmatched ({label}): nothing cut by the fixed rule -> chars/tokens after == before, nothing omitted, no signature for the join",
                unm_rec.get("chars_before") == len(out_text) and unm_rec.get("chars_after") == unm_rec.get("chars_before")
                and unm_rec.get("tokens_after") == unm_rec.get("tokens_before") and unm_rec.get("omitted_signatures") == [])
             ok(f"unmatched ({label}): the row still carries what the report splits on and the join keys on",
                unm_rec.get("hook_event") == coc.EVENT_SUCCESS and unm_rec.get("exit_code") is None and unm_rec.get("entity_id") == "tu-unm"
                and unm_rec.get("session_id") == "s-unm")
 
-    # a failing command's unstructured output is the same 'unmatched' row, and the row says where it came from
+    # -- tier ATTEMPTED (sample 100): two rows, same entity_id, one call --
     with tempfile.TemporaryDirectory() as td:
         log_path = Path(td) / "jev-experiment.jsonl"
-        with mock.patch.object(je, "JEV_LOG", log_path), \
-             mock.patch.object(je, "call_jev_multi", return_value={"ok": True, "answers": {}, "bad": {}}) as m_unm_f:
+        with mock.patch.object(je, "JEV_LOG", log_path), _tier(100), \
+             mock.patch.object(je, "call_jev_multi", return_value=clean_answers) as m_att:
+            process(_unmatched_hook(prose_big))
+        att = _rows(log_path)
+        ok("unmatched, tier attempted: exactly ONE Jev call", m_att.call_count == 1)
+        ok("unmatched, tier attempted: two rows -- the fixed-rule row FIRST, then the Jev row",
+           len(att) == 2 and [r.get("experiment") for r in att] == [EXPERIMENT_FIXED, cjev.EXPERIMENT_JEV])
+        ok("unmatched, tier attempted: the fixed row is stamped jev_tier 'attempted' (so a missing Jev row is a LOST attempt)", att[0].get("jev_tier") == cjev.TIER_ATTEMPTED)
+        ok("unmatched, tier attempted: both rows carry this front's mode and the SAME entity_id", all(r.get("mode") == coc.RECORD_MODE for r in att) and att[0]["entity_id"] == att[1]["entity_id"] == "tu-unm")
+        ok("unmatched, tier attempted: the Jev row is judged-cuttable / full with a real saving (answers were clean noise)",
+           att[1].get("jev_state") == cjev.STATE_CUTTABLE and att[1].get("coverage") == cjev.COVERAGE_FULL and isinstance(att[1].get("tokens_would_save"), int) and att[1]["tokens_would_save"] > 0)
+        ok("unmatched, tier attempted: the Jev row carries the session/transcript/tool ids the join needs",
+           att[1].get("session_id") == "s-unm" and att[1].get("transcript_path") == "/tmp/s-unm.jsonl" and att[1].get("tool_use_id") == "tu-unm")
+        ok("unmatched, tier attempted: the partition holds on the row process() really wrote",
+           att[1]["chars_relevant"] + att[1]["chars_cuttable"] + att[1]["chars_not_judged"] == att[1]["chars_before"] == len(prose_big))
+
+    # -- THE gate verdict ga-nw6sbx, end to end: an ok call whose every block is unparseable is NOT "saved 0 tokens" --
+    all_bad_call = {"ok": True, "answers": {}, "bad": {f"block_{i}": "unparseable_answer: x" for i in range(13)}, "tokens_in": 800, "tokens_out": 1}
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "jev-experiment.jsonl"
+        with mock.patch.object(je, "JEV_LOG", log_path), _tier(100), mock.patch.object(je, "call_jev_multi", return_value=all_bad_call):
+            process(_unmatched_hook(prose_big, "tu-bad"))
+        bad_rows = _rows(log_path)
+        ok("ga-nw6sbx end to end: Jev answered ok but judged no block -> jev_state 'not-judged', coverage 'none'",
+           len(bad_rows) == 2 and bad_rows[1].get("jev_state") == cjev.STATE_NOT_JUDGED and bad_rows[1].get("coverage") == cjev.COVERAGE_NONE)
+        ok("ga-nw6sbx end to end: ... and tokens_would_save is None, not 0 (the old tier logged 0, identical to 'judged everything relevant')",
+           "tokens_would_save" in bad_rows[1] and bad_rows[1]["tokens_would_save"] is None)
+        ok("ga-nw6sbx end to end: ... with the reason counted, not hidden", bad_rows[1].get("blocks_not_judged") == bad_rows[1].get("block_count") > 0 and bad_rows[1].get("not_judged_reasons"))
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "jev-experiment.jsonl"
+        relevant_call = {"ok": True, "answers": {f"block_{i}": 0.95 for i in range(13)}, "bad": {}, "tokens_in": 800, "tokens_out": 1}
+        with mock.patch.object(je, "JEV_LOG", log_path), _tier(100), mock.patch.object(je, "call_jev_multi", return_value=relevant_call):
+            process(_unmatched_hook(prose_big, "tu-rel"))
+        rel_row = _rows(log_path)[1]
+        ok("ga-nw6sbx end to end: 'judged everything relevant' is a DIFFERENT row -- judged-relevant / full / a measured 0",
+           rel_row.get("jev_state") == cjev.STATE_RELEVANT and rel_row.get("coverage") == cjev.COVERAGE_FULL and rel_row.get("tokens_would_save") == 0)
+
+    # -- the whole call failed, or ran past the deadline: a row, not silence, and not a number --
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "jev-experiment.jsonl"
+        with mock.patch.object(je, "JEV_LOG", log_path), _tier(100), \
+             mock.patch.object(je, "call_jev_multi", return_value={"ok": False, "error": "vault_unavailable"}):
+            process(_unmatched_hook(prose_big, "tu-down"))
+        down = _rows(log_path)
+        ok("Jev unreachable: still two rows; the Jev row is not-judged with the reason class, no number",
+           len(down) == 2 and down[1].get("jev_state") == cjev.STATE_NOT_JUDGED and down[1].get("tokens_would_save") is None
+           and down[1].get("jev_ok") is False and down[1].get("jev_error") == "vault_unavailable")
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "jev-experiment.jsonl"
+        with mock.patch.object(je, "JEV_LOG", log_path), _tier(100), mock.patch.object(cjev, "JEV_DEADLINE_S", 0.2), \
+             mock.patch.object(je, "call_jev_multi", side_effect=lambda st, q: (time.sleep(3), clean_answers)[1]):
+            t_start = time.time()
+            process(_unmatched_hook(prose_big, "tu-slow"))
+            waited = time.time() - t_start
+        slow_rows = _rows(log_path)
+        ok("a Jev call slower than the deadline: process() returns in about the deadline (it does not wait for Jev)", waited < 1.5)
+        ok("... and the lost call is a row: not-judged 'call-failed:deadline', not silence (the watchdog would have left none)",
+           len(slow_rows) == 2 and slow_rows[1].get("jev_state") == cjev.STATE_NOT_JUDGED and set(slow_rows[1].get("not_judged_reasons", {})) == {"call-failed:deadline"})
+
+    # -- the egress guard, through process(): the text of a credential never reaches call_jev_multi --
+    secret_out = "\n\n".join(f"paragraph {i} " + "filler text " * 30 for i in range(10)) + "\n\nexport API_TOKEN=abcdef0123456789abcdef\n\n" + "tail filler " * 40
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "jev-experiment.jsonl"
+        with mock.patch.object(je, "JEV_LOG", log_path), _tier(100), \
+             mock.patch.object(je, "call_jev_multi", return_value=clean_answers) as m_sec:
+            process(_unmatched_hook(secret_out, "tu-sec", tool_input={"command": "env | grep -i token; curl -H 'Authorization: Bearer abcdef0123456789abcdef'"}))
+        sec_rows = _rows(log_path)
+        sent_state = str(m_sec.call_args[0][0]) if m_sec.call_count else ""
+        ok("egress guard end to end: the credential line and the credential in the command were NOT sent", m_sec.call_count == 1 and "abcdef0123456789abcdef" not in sent_state)
+        ok("egress guard end to end: the withheld block is counted as not-judged 'withheld-secret' -> a partial record, never a full one",
+           sec_rows[1].get("coverage") == cjev.COVERAGE_PARTIAL and sec_rows[1].get("not_judged_reasons", {}).get("withheld-secret", 0) >= 1 and sec_rows[1].get("tokens_would_save") is None)
+        ok("egress guard end to end: the logged row does not contain the credential either", "abcdef0123456789abcdef" not in log_path.read_text())
+
+    # -- sampling and the kill switch --
+    ids = [f"toolu_samp_{i}" for i in range(60)]
+    with _tier(25):
+        tiers_by_id = {i: cjev.jev_tier(i) for i in ids}
+    att_id = next(i for i, t in tiers_by_id.items() if t == cjev.TIER_ATTEMPTED)
+    out_id = next(i for i, t in tiers_by_id.items() if t == cjev.TIER_SAMPLED_OUT)
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "jev-experiment.jsonl"
+        with mock.patch.object(je, "JEV_LOG", log_path), _tier(25), mock.patch.object(je, "call_jev_multi", return_value=clean_answers) as m_samp:
+            process(_unmatched_hook(prose_big, out_id))
+            sampled_rows = _rows(log_path)
+            ok("sampled-out: one row stamped 'sampled-out', and no call", len(sampled_rows) == 1 and sampled_rows[0].get("jev_tier") == cjev.TIER_SAMPLED_OUT and m_samp.call_count == 0)
+            process(_unmatched_hook(prose_big, att_id))
+            ok("sampled-in: the same output with another id IS attempted (the sample is per call, deterministic)", m_samp.call_count == 1 and len(_rows(log_path)) == 3)
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "jev-experiment.jsonl"
+        sentinel = Path(td) / "jev.disabled"
+        sentinel.write_text("off")
+        with mock.patch.object(je, "JEV_LOG", log_path), _tier(100), mock.patch.object(cjev, "JEV_DISABLED_SENTINEL", sentinel), \
+             mock.patch.object(je, "call_jev_multi", return_value=clean_answers) as m_kill:
+            process(_unmatched_hook(prose_big, "tu-kill"))
+        kill_rows = _rows(log_path)
+        ok("kill switch (the Jev sentinel) beats sample 100: one row stamped 'disabled', no call", len(kill_rows) == 1 and kill_rows[0].get("jev_tier") == cjev.TIER_DISABLED and m_kill.call_count == 0)
+
+    # -- a call with NO tool_use_id: the two rows still share a key (a fresh id per row would make the attempt look lost) --
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "jev-experiment.jsonl"
+        with mock.patch.object(je, "JEV_LOG", log_path), _tier(100), mock.patch.object(je, "call_jev_multi", return_value=clean_answers):
+            process(_unmatched_hook(prose_big, None))
+        nid = _rows(log_path)
+        ok("no tool_use_id: both rows share one non-empty entity_id, and neither pretends to have a tool_use_id",
+           len(nid) == 2 and nid[0]["entity_id"] == nid[1]["entity_id"] and nid[0]["entity_id"].startswith("no-tool-use-id-")
+           and nid[0]["tool_use_id"] is None and nid[1]["tool_use_id"] is None)
+
+    # -- a failing command's unstructured output: same two-row shape, and the rows say where it came from --
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "jev-experiment.jsonl"
+        with mock.patch.object(je, "JEV_LOG", log_path), _tier(100), mock.patch.object(je, "call_jev_multi", return_value=clean_answers):
             process(_failure_hook("Exit code 3\n" + prose_big, tool_input={"command": "some-tool"}))
-        unm_f = json.loads(log_path.read_text().splitlines()[0]) if log_path.exists() else {}
-        ok("unmatched, PostToolUseFailure: no Jev call, one 'unmatched' row carrying hook_event and exit_code",
-           m_unm_f.call_count == 0 and unm_f.get("rule") == "unmatched" and unm_f.get("hook_event") == coc.EVENT_FAILURE and unm_f.get("exit_code") == 3)
+        unm_f = _rows(log_path)
+        ok("unmatched, PostToolUseFailure: both rows carry hook_event and exit_code, and the Jev row's size excludes the header",
+           len(unm_f) == 2 and all(r.get("hook_event") == coc.EVENT_FAILURE and r.get("exit_code") == 3 for r in unm_f) and unm_f[1].get("chars_before") == len(prose_big))
+
+    # -- the fixed rules never consult the tier: classification comes first --
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "jev-experiment.jsonl"
+        pytest_for_tier = "=" * 30 + " test session starts " + "=" * 30 + "\n" + "".join(f"t{i} PASSED\n" for i in range(300)) + "=" * 30 + " 300 passed in 1.0s " + "=" * 30 + "\n"
+        with mock.patch.object(je, "JEV_LOG", log_path), _tier(100), \
+             mock.patch.object(je, "call_jev_multi", side_effect=AssertionError("a fixed-rule output must not reach Jev")) as m_fx:
+            process(_unmatched_hook(pytest_for_tier, "tu-fx", tool_input={"command": "pytest"}))
+        fx_rows = _rows(log_path)
+        ok("a pytest output with the tier at 100%: one row, no call, and no jev_tier key (the stamp belongs to unmatched rows only)",
+           m_fx.call_count == 0 and len(fx_rows) == 1 and fx_rows[0].get("rule") == "pytest" and "jev_tier" not in fx_rows[0])
+
+    # -- the tier itself blowing up after the fixed row is written: the attempt is visibly lost, the hook still answers --
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "jev-experiment.jsonl"
+        with _tier(100), mock.patch.object(cjev, "judge", side_effect=RuntimeError("tier bug with 123.456.789-09")):
+            rc_t, out_t = _run_main(json.dumps(_unmatched_hook(prose_big, "tu-tierbug")), td, log_path)
+        tb_rows = _rows(log_path)
+        ok("a crash inside the Jev tier: main() still prints {} / rc 0", rc_t == 0 and out_t.strip() == "{}")
+        ok("... the fixed row (stamped 'attempted') was already written, and ONE engine error row follows -- an attempt with no result is countable",
+           [r.get("experiment") for r in tb_rows] == [EXPERIMENT_FIXED, coc.ERROR_EXPERIMENT] and tb_rows[0].get("jev_tier") == cjev.TIER_ATTEMPTED)
+        ok("... and the error row names the class only, never the message", tb_rows[1].get("error") == "RuntimeError" and "123.456" not in log_path.read_text())
 
     # a hook input whose tool_input.command is not a string (null / missing / odd type) is still a measurable large
     # output: the command is only a fingerprint for the report, so "don't know" is an empty command, not a TypeError
@@ -699,17 +886,18 @@ def _selftest_suite() -> int:
         with tempfile.TemporaryDirectory() as td:
             log_path = Path(td) / "jev-experiment.jsonl"
             raised_cmd = False
-            with mock.patch.object(je, "JEV_LOG", log_path):
+            with mock.patch.object(je, "JEV_LOG", log_path), _tier(100), mock.patch.object(je, "call_jev_multi", return_value=clean_answers):
                 try:
                     process(_unmatched_hook(prose_big, tool_input={"command": odd_cmd}))
                 except Exception:
                     raised_cmd = True
             cmd_lines = log_path.read_text().splitlines() if log_path.exists() else []
-            ok(f"non-string tool_input.command ({odd_cmd!r}): process() does not raise and still logs the measurement",
-               not raised_cmd and len(cmd_lines) == 1 and json.loads(cmd_lines[0]).get("command") == "")
+            ok(f"non-string tool_input.command ({odd_cmd!r}): process() does not raise and still logs the measurement (both rows)",
+               not raised_cmd and len(cmd_lines) == 2 and json.loads(cmd_lines[0]).get("command") == "" and json.loads(cmd_lines[1]).get("command") == "")
 
+    # the engine file no longer carries the OLD tier's helpers: one implementation of the Jev logic, in cut_output_jev.py
     _mod = sys.modules[__name__]
-    ok("no Jev tier left in this module for a report to read: no record builder, no experiment name, no deadline caller",
+    ok("the Jev logic lives in cut_output_jev.py only: this module keeps no record builder, no chunker, no deadline caller of its own",
        not any(hasattr(_mod, n) for n in ("EXPERIMENT_JEV", "build_jev_log_record", "build_jev_state_and_questions", "call_jev_with_deadline", "chunk_text")))
 
     # ---- gate_run ga-75ya0i, blocking issue 2: this front's rows must not be read as F0 shadow rows. The daily
