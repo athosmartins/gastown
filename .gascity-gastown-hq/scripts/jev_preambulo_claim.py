@@ -158,8 +158,13 @@ def decide(bead_id: str, store: str, role: str, policy: dict, ask=pe.call_jev_no
                 "record": _minimal_record(bead_id, store, role, policy, eligible, "bead_ilegivel")}
     ent = {"entity_id": bead_id, "bead": bead, "store": store, "pool": role}
     status, detail = pe.process_entity(ent, policy, ask=ask)
-    if status != "logged":  # skip_no_eligible_sections: nothing the prime could have withheld
+    if status == "skip_no_eligible_sections":  # nothing the prime could have withheld: empty, and that is the truth
         return {"kept": [], "cut": [], "fail_open": None, "record": _minimal_record(bead_id, store, role, policy, [], status)}
+    if status != "logged":
+        # A status this code was not written for (the shadow's code grew an outcome). That is not "nothing to withhold":
+        # we do not know what Jev decided, so the inert state is the full optional doctrine, with the reason named.
+        return {"kept": eligible, "cut": [], "fail_open": "estado_desconhecido: " + str(status)[:80],
+                "record": _minimal_record(bead_id, store, role, policy, eligible, "estado_desconhecido")}
     rec = detail
     # decide_sections already kept every section in both cases below; naming the reason is what lets the session's
     # header say "Jev did not decide" instead of "Jev dispensed nothing". "parcial" (some answers usable) is NOT a
