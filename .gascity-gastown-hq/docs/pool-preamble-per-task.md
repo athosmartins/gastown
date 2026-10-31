@@ -105,8 +105,10 @@ python3 "$GC_CITY_PATH/scripts/jev_preambulo_claim.py" --bead <id> --role <TD_RO
   **vivo** (`mode: "preambulo_vivo"`, `fase: "vivo"`). O modo próprio é de propósito: `load_done` da sombra, o relatório do Preâmbulo e o relatório de supressão do dia só leem `mode: "preambulo"` / ignoram qualquer
   evento que nomeie um modo, então o registro vivo não entra nos números da sombra (pinado no selftest).
 - **Falha vira doutrina completa** (critério "Jev fora/lento/erro ⇒ doutrina completa"): Jev fora, resposta inválida, bead ilegível, prazo estourado (`JEV_PREAMBULO_CLAIM_DEADLINE_S`, 25 s para a decisão inteira),
-  exceção inesperada ou marcador de injeção ⇒ **todas** as seções elegíveis do papel são impressas e o registro diz por quê (`falha_aberta`). Resposta parcial: as válidas decidem, as inválidas ficam.
-  Se nem a política carrega, o comando imprime um aviso **NÃO CARREGADA** que nomeia o fragmento a ler inteiro e sai 3 — nunca um stdout vazio que pareça "nada a carregar".
+  exceção inesperada **dentro da decisão** (a pergunta ao Jev, a leitura da bead) ou marcador de injeção ⇒ **todas** as seções elegíveis do papel são impressas e o registro diz por quê (`falha_aberta`). Resposta parcial: as válidas decidem, as inválidas ficam.
+  Se nem a política carrega (fragmento ausente/ilegível, script de política que levanta qualquer exceção ou chama `sys.exit` no import), ou se qualquer outra exceção escapa **fora** da decisão (montar a saída, carimbar o registro),
+  o comando imprime um aviso **NÃO CARREGADA** que nomeia o fragmento a ler inteiro e sai 3 — nunca um stdout vazio que pareça "nada a carregar" (nesse caminho a sessão lê o fragmento à mão; não é a lista de seções impressa).
+  `JEV_PREAMBULO_CLAIM_DEADLINE_S` ilegível (texto, `nan`, `inf`, zero ou negativo) vale o padrão de 25 s — não derruba o comando.
 - **Braço:** `--arm` é obrigatório e é o braço da **sessão**. `control` imprime uma linha e sai (sem Jev, sem registro): o controle guarda toda a doutrina no prime. O braço por bead da sombra continua no registro
   como `arm_hash` — é outra atribuição, não confundir. O registro leva `alias` (`GC_ALIAS`, o slot) e `sessao` para o relatório juntar por sessão.
 - **`--all` fica no registro** (`pedido_manual`): sessão que precisou pedir de volta uma seção dispensada é a evidência mais forte de que o corte errou (critério: falha atribuída a seção cortada ⇒ a seção vira núcleo).
