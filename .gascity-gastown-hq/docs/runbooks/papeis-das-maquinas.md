@@ -28,7 +28,7 @@ O gargalo do mini é disco e swap, não CPU. A limpeza do hq (15 → 5,5 GB, 21/
 
 ## Hetzner
 
-- **Workers e revisores remotos** (ga-2hd02v): dog-remote, wa-worker-remote (3 vagas, `PILOT_WA_NODE_SLOTS`), gate-reviewer-remote; ps-worker remoto em modo sombra (`hetzner-ps-node.md`). A bead só vai ao nó com `node:ok` (só código e teste). Capacidade: `hetzner-capacity.md`.
+- **Workers e revisores remotos** (ga-2hd02v): dog-remote, wa-worker-remote (5 vagas, `PILOT_WA_NODE_SLOTS`), gate-reviewer-remote; ps-worker remoto em modo sombra (`hetzner-ps-node.md`). A bead só vai ao nó com `node:ok` (só código e teste). Capacidade: `hetzner-capacity.md`.
 - **Sem dado de beads:** o nó lê o Dolt do mini por atalho ssh; nada de beads, lead ou credencial fica gravado lá.
 - **Trabalho pesado sob demanda:** GC `--full` do Dolt (runbook da ga-2895yv.1.1.2), testes noturnos (`hetzner-nightly-tests.md`).
 - **Servidor pago trabalha sempre** (Athos 14/10): vaga ociosa com fila apta ao nó é bug (ex.: ga-2hd02v.3.12).
