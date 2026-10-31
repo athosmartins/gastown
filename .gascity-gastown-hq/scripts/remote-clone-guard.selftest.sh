@@ -896,7 +896,7 @@ json.dump(d, open(sys.argv[1], "w"))
 EOF
   python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; ok $? "check: \`timeout\` no hook é só prazo, não muda quando dispara → ok"
   # onFailure (claude >= 2.1.295, ga-14qtcy9): a falha do hook (prazo do claude estourado, não iniciou, saiu com código fora de 0/2, JSON inválido) conta como saída 2. O hook do servidor pode levá-lo, e SÓ com o
-  # texto exato "block": "continue" é a falha aberta de volta, e um valor fora do enum (outra caixa, tipo errado) o claude pode tratar como hook inválido. Ausente segue valendo (o settings que o servidor tem antes do push-bundle).
+  # texto exato "block": "continue" é a falha aberta de volta, e um valor fora do enum (outra caixa, tipo errado) faz o claude NÃO carregar o settings inteiro (MEDIDO, remote-guard-layer.selftest.sh). Ausente segue valendo (o settings que o servidor tem antes do push-bundle).
   setof() {  # setof ARQ CÓDIGO — o settings bom, com CÓDIGO (python, carga deliberada do teste) aplicado a cada hook (h) e a cada grupo (g) do PreToolUse
     settings "$1" "Bash" "Edit|Write|MultiEdit|NotebookEdit"; python3 - "$1" "$2" <<'EOF'
 import json, sys
@@ -1247,7 +1247,11 @@ echo "== $((n-fails))/$n ok =="
   mutant destb "--opção VALOR (valor no token seguinte) não é lido" 's/if eq else (out, True)/if eq else (out, False)/'
   mutant destb "--opção=VALOR não é lido" 's/out, val = (out + \[v\], False) if eq else/out, val = (out, False) if eq else/'
   mutant destp "URL (https://…) vira caminho" 's/ and not URL.match(x)\]/]/'
-  mutant check "selfcheck ignora campo extra do hook (if, async…)" 's/ and set(h) <= {"type", "command", "timeout"}//'
+  mutant check "selfcheck ignora campo extra do hook (if, async…)" 's/ and set(h) <= {"type", "command", "timeout", "onFailure"}//'
+  mutant check "selfcheck não aceita o campo onFailure (o hook que o builder gera reprova)" 's/{"type", "command", "timeout", "onFailure"}/{"type", "command", "timeout"}/'
+  mutant check "selfcheck aceita qualquer valor de onFailure (continue, Block, true…)" 's/ and h.get("onFailure", "block") == "block"//'
+  mutant check "selfcheck vale onFailure pela verdade do valor (continue e Block passam)" 's/h.get("onFailure", "block") == "block"/h.get("onFailure", "block")/'
+  mutant check "selfcheck exige o campo (o settings que o servidor tem hoje reprova)" 's/h.get("onFailure", "block") == "block"/h.get("onFailure") == "block"/'
   mutant check "selfcheck ignora campo extra do grupo" 's/ and set(g) <= {"matcher", "hooks"}//'
   mutant check "selfcheck não exige type=command" 's/ and h.get("type") == "command"//'
   mutant budget "um { guardado, ao reexecutar um corpo, reabre a definição (o laço sem fim do pedido do runbook)" 's/if not st.get("calling") and (seg\[:1\] == \["{"\]/if (seg[:1] == ["{"]/'
