@@ -1304,6 +1304,26 @@ nready; rc=$(HETZNER_EXEC_PUSH_MAX_MB=1 xrun --push "$T/big.apk" -- true); expec
 nready; rc=$(xrun --push "$T/UP.APK" -- true); expect "extensão em maiúsculas (.APK) vale" 0 "$rc"; has "…e o push vai ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:gt-remote/exec/1/in/'
 nready; rc=$(xrun --env API_TOKEN=s3cr3tvalue -- true); expect "--env com nome de segredo: cai no MBP" 0 "$rc"; has "…motivo env-recusado" "$J" '"reason":"env-recusado".*"host":"hetzner"'; hasnt "…o VALOR nunca aparece na mensagem" "$T/err" 's3cr3tvalue'
 nready; rc=$(xrun --env JADX_HEAP_MB=2048 -- true); expect "--env de nome comum vai ao nó" 0 "$rc"; has "…host hetzner" "$J" '"mode":"exec".*"host":"hetzner"'
+# ga-jq08gyi (achado 1): o --env do nó é ALLOWLIST de NOMES (JADX_HEAP_MB, APKTOOL_HEAP_MB, REA_*); o que não está nela fica no MBP (cai nele, não é erro), tenha ou não nome de segredo:
+# o defeito era a denylist por substring, que deixava passar PDPJ_JWT, *_BEARER e DSN com senha embutida. Os exemplos de credencial são montados em PARTES: nenhuma linha deste arquivo é um JWT ou uma chave de verdade.
+CRED_JWT="eyJ""abcdef01.eyJ""abcdef02.abcdef03"
+CREDS=("$CRED_JWT" "sk""-proj0123456789abcdef" "Bearer ""abcdefgh12345678" "-----BEGIN ""RSA PRIVATE KEY-----" "gh""p_0123456789abcdefghij0123" "AK""IA0123456789ABCDEF" "postgres://us""er:pw""d@db.example/x")
+for c in "FOO_JWT=1" "FOO_JWT=$CRED_JWT" "PDPJ_JWT=1" "DB_BEARER=1" "DATABASE_URL=x" "HOME=/tmp" "jadx_heap_mb=1" "JADX_HEAP_MB_X=1" "REA=1" "NOME RUIM=1" "JADX_HEAP_MB APKTOOL_HEAP_MB=1" "1X=2"; do
+  nready; rc=$(xrun --env "$c" -- true); expect "--env '${c%%=*}' fora da allowlist: cai no MBP e roda" 0 "$rc"
+  has "…motivo env-fora-da-lista no host hetzner" "$J" '"reason":"env-fora-da-lista".*"host":"hetzner"'; has "…e a execução é do MBP" "$J" '"mode":"exec".*"host":"mbp"'
+  hasnt "…o nó nem chegou a dar slot" "$STUB_LOG" 'HOSTCALL:hetzner:SLOT'; hasnt "…o VALOR nunca aparece na mensagem" "$T/err" 'abcdef01'
+done
+for c in "APKTOOL_HEAP_MB=1024" "REA_JADX_MCP_JAR=/x/y.jar" "REA_FOO=bar"; do nready; rc=$(xrun --env "$c" -- true); expect "--env '${c%%=*}' na allowlist vai ao nó" 0 "$rc"; has "…host hetzner" "$J" '"mode":"exec".*"host":"hetzner"'; done
+for c in "REA_API_TOKEN=x" "REA_SESSION_ID=1"; do nready; rc=$(xrun --env "$c" -- true); expect "--env '${c%%=*}' (REA_ + nome de segredo): o veto por nome vale por cima da allowlist" 0 "$rc"; has "…motivo env-recusado" "$J" '"reason":"env-recusado".*"host":"hetzner"'; done
+# nome da allowlist com VALOR que parece credencial (JWT, sk-, Bearer, chave privada, token de provedor, URL com usuário:senha@) e o mesmo no argv do comando: fica no MBP; o valor nunca é impresso
+for c in "${CREDS[@]}"; do
+  nready; rc=$(xrun --env "JADX_HEAP_MB=$c" -- true); expect "--env com VALOR de credencial (${c:0:6}…): cai no MBP e roda" 0 "$rc"
+  has "…motivo env-valor-credencial no host hetzner" "$J" '"reason":"env-valor-credencial".*"host":"hetzner"'; hasnt "…o VALOR nunca aparece na mensagem" "$T/err" "${c:0:12}"
+  nready; rc=$(xrun -- sh -c "echo $c"); expect "argv com credencial (${c:0:6}…): cai no MBP e roda" 0 "$rc"
+  has "…motivo argv-credencial no host hetzner" "$J" '"reason":"argv-credencial".*"host":"hetzner"'; has "…e a execução é do MBP" "$J" '"mode":"exec".*"host":"mbp"'; hasnt "…o VALOR nunca aparece na mensagem" "$T/err" "${c:0:12}"
+done
+# sem falso positivo no que o REA passa de verdade: hash, caminho e nome com "sk-" no meio de uma palavra seguem ao nó
+nready; rc=$(xrun --env APKTOOL_HEAP_MB=2048 -- sh -c 'jadx -d out in/x.apk; echo disk-image-0123456789abcdef 0123456789abcdef0123456789abcdef /tmp/scratch-501/in/app.apk'); expect "comando sem cara de credencial: roda no nó" 0 "$rc"; has "…host hetzner" "$J" '"mode":"exec".*"host":"hetzner"'
 # o 126/127 do nó não é veredito: o scratch sai (mesmo com --keep) e o MBP roda; no MBP o 127 segue como era
 nready; rc=$(STUB_RUN_RC_NODE=127 xrun --keep -- sh -c x); expect "rc 127 no nó (ferramenta ausente): roda no MBP" 0 "$rc"
 has "…o 127 é logado no host hetzner" "$J" '"mode":"exec".*"rc":127.*"host":"hetzner"'; has "…e o MBP rodou" "$J" '"mode":"exec".*"rc":0.*"host":"mbp"'; has "…o scratch do nó sai MESMO com --keep" "$STUB_LOG" 'DIRECT:.*hetzner-teste find gt-remote/exec/1 -mindepth 1 -delete$'
@@ -1337,7 +1357,14 @@ MD="$T/mutdir-exec"; mkdir -p "$MD"; for t in mbp-host.sh mbp-presence.sh mbp-co
 xmut() { python3 -I -c 'import sys; s=open(sys.argv[1]).read(); a=sys.argv[2]; assert s.count(a)==1, "ancora: %d" % s.count(a); open(sys.argv[4],"w").write(s.replace(a, sys.argv[3]))' "$RUN" "$1" "$2" "$MD/mbp-run.sh" && chmod +x "$MD/mbp-run.sh"; }
 xobs() { n=$((n+1)); if grep -q -E -e "$3" "$2"; then echo "ok   $1"; else echo "FAIL $1: '$3' ausente em $2"; fails=$((fails+1)); fi; }
 if xmut 'node_push_ok "$p" || { fall push-recusado 97; return 97; }' 'true'; then nready; "$MD/mbp-run.sh" --exec --node-first --push "$T/x.json" -- true >/dev/null 2>&1; xobs "controle: sem node_push_ok o .json VAZA ao nó" "$STUB_LOG" 'RSYNC:.* hetzner-teste:'; else bad "controle push: âncora do mutante"; fi
-if xmut '*TOKEN*|*SECRET*|' '*NUNCA*|'; then nready; "$MD/mbp-run.sh" --exec --node-first --env API_TOKEN=x -- true >/dev/null 2>&1; xobs "controle: sem a porta do --env o segredo vai ao nó" "$J" '"mode":"exec".*"host":"hetzner"'; else bad "controle env: âncora do mutante"; fi
+if xmut '*TOKEN*|*SECRET*|' '*NUNCA*|'; then nready; "$MD/mbp-run.sh" --exec --node-first --env REA_API_TOKEN=x -- true >/dev/null 2>&1; xobs "controle: sem o veto por nome, REA_API_TOKEN (nome liberado pelo prefixo) vai ao nó" "$J" '"mode":"exec".*"host":"hetzner"'; else bad "controle env: âncora do mutante"; fi
+# ga-jq08gyi: cada porta nova, tirada sozinha, deixa o defeito voltar. A do grep que ERRA é a do terceiro estado: "não consegui olhar" tem de valer como "tem cara de credencial", nunca como "não tem"
+if xmut 'if [ $ok -ne 1 ]; then lst=' 'if false; then lst='; then nready; "$MD/mbp-run.sh" --exec --node-first --env FOO_JWT=1 -- true >/dev/null 2>&1; xobs "controle: sem a allowlist, FOO_JWT (nome sem cara de segredo) vai ao nó" "$J" '"mode":"exec".*"host":"hetzner"'; else bad "controle allowlist: âncora do mutante"; fi
+if xmut 'if looks_cred "${kv#*=}"; then' 'if false; then'; then nready; "$MD/mbp-run.sh" --exec --node-first --env "JADX_HEAP_MB=$CRED_JWT" -- true >/dev/null 2>&1; xobs "controle: sem a checagem do valor, o JWT em JADX_HEAP_MB vai ao nó" "$J" '"mode":"exec".*"host":"hetzner"'; else bad "controle valor: âncora do mutante"; fi
+if xmut 'if looks_cred "$@"; then' 'if false; then'; then nready; "$MD/mbp-run.sh" --exec --node-first -- sh -c "echo $CRED_JWT" >/dev/null 2>&1; xobs "controle: sem a checagem do argv, o JWT no comando vai ao nó" "$J" '"mode":"exec".*"host":"hetzner"'; else bad "controle argv: âncora do mutante"; fi
+mkdir -p "$T/gbin"; printf '#!/bin/sh\ncase "$*" in *"-E -i -q"*) exit 2 ;; esac\nexec %s "$@"\n' "$(command -v grep)" > "$T/gbin/grep"; chmod +x "$T/gbin/grep"   # só a chamada do looks_cred erra (rc 2); o resto do grep segue real
+nready; rc=$(PATH="$T/gbin:$PATH" xrun -- true); expect "grep que ERRA na checagem de credencial (rc 2): cai no MBP e roda" 0 "$rc"; has "…motivo argv-credencial (não olhou = tem cara)" "$J" '"reason":"argv-credencial".*"host":"hetzner"'
+if xmut '[ $? -ne 1 ]; }' '[ $? -eq 0 ]; }'; then nready; PATH="$T/gbin:$PATH" "$MD/mbp-run.sh" --exec --node-first -- true >/dev/null 2>&1; xobs "controle: se o erro do grep valesse como 'não tem', o comando iria ao nó" "$J" '"mode":"exec".*"host":"hetzner"'; else bad "controle grep: âncora do mutante"; fi
 if xmut '{ [ $RC -eq 126 ] || [ $RC -eq 127 ]; }' 'false'; then nready; STUB_RUN_RC_NODE=127 "$MD/mbp-run.sh" --exec --node-first -- x >/dev/null 2>&1; rc=$?; expect "controle: sem a regra do 126/127 o rc 127 do nó vira o veredito" 127 "$rc"; else bad "controle 127: âncora do mutante"; fi
 if xmut '[ "$nodefirst" = 1 ] && [ -f "$NODE_FLAG" ]' '[ -f "$NODE_FLAG" ]'; then nready; "$MD/mbp-run.sh" --exec -- true >/dev/null 2>&1; xobs "controle: sem o opt-in o --exec comum vai ao nó" "$STUB_LOG" 'HOSTCALL:hetzner'; else bad "controle opt-in: âncora do mutante"; fi
 tools_off

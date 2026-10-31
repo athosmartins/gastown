@@ -1266,6 +1266,15 @@ NODE_EXEC_EXT=" apk apks xapk apkm aab dex jar aar so dylib asar exe dll ipa "  
 NODE_EXEC_MAX_MB=$(num_or "${HETZNER_EXEC_PUSH_MAX_MB:-1024}" 1024); [ "$NODE_EXEC_MAX_MB" -ge 1 ] || NODE_EXEC_MAX_MB=1024
 # ferramentas que o REA costuma chamar: comando que cita uma que o nó não lista vai direto ao MBP, sem empurrar o arquivo em vão. É economia, não segurança: o que ela não pega, o rc 126/127 do nó pega
 NODE_EXEC_KNOWN=" rea ghidra ghidraRun analyzeHeadless jadx apktool java adb hopper ida idat "
+# ga-jq08gyi: o que o nó recebe do --exec além do pacote é só o que está nestas listas. ALLOWLIST de NOMES de --env (o que não está nela fica no MBP, que é o notebook do Athos; o nó é um servidor alugado): os heaps dos
+# wrappers do hetzner-rea-tools.sh e, mais abaixo, o prefixo REA_ (o que o REA lê). O veto por nome de segredo (TOKEN, SECRET, KEY...) continua valendo POR CIMA, para o prefixo (REA_API_TOKEN).
+NODE_EXEC_ENV_OK=" JADX_HEAP_MB APKTOOL_HEAP_MB "
+# valor de --env ou palavra do comando com CARA de credencial: JWT, sk-..., Bearer, chave privada, token de provedor (GitHub, Slack, AWS, Google), URL com usuário:senha@. Heurística de FORMA: erra para o lado do MBP (mandar o comando
+# ao MBP custa só o nó parado). No --env, o segredo sem forma conhecida quem barra é a allowlist de nomes acima; no argv do comando esta heurística é a ÚNICA barreira (credencial sem forma conhecida passa)
+NODE_CRED_RE='eyJ[A-Za-z0-9_=-]{6,}\.[A-Za-z0-9_=-]{6,}|(^|[^A-Za-z0-9])sk-[A-Za-z0-9_-]{12,}|bearer[[:space:]]+[A-Za-z0-9._~+/=-]{8,}|-----BEGIN [A-Z ]*PRIVATE KEY|(^|[^A-Za-z0-9])(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|[A-Za-z][A-Za-z0-9+.-]*://[^/@[:space:]]+:[^/@[:space:]]+@'
+# 0 = ALGUM argumento tem cara de credencial. O grep devolve 1 = não achou (o ÚNICO resultado que deixa passar), 0 = achou, 2 = erro (regex que este grep não lê, falta de memória): "não consegui olhar" vale como "tem cara", nunca como "não tem".
+# Here-string e não pipe: com pipefail, um grep -q que sai no primeiro achado faria o printf devolver 141.
+looks_cred() { local data; data=$(printf '%s\n' "$@"); grep -E -i -q -e "$NODE_CRED_RE" <<< "$data"; [ $? -ne 1 ]; }
 
 # node_push_ok <caminho>: 0 = pode ir ao nó. O --exec não passa por filtro nem por varredura de conteúdo (o pytest passa pelos dois), então a fronteira é a FORMA: UM arquivo comum (nem diretório nem link) de pacote de app, até NODE_EXEC_MAX_MB.
 node_push_ok() {
@@ -1283,7 +1292,7 @@ node_push_ok() {
 }
 # node_exec_gate <comando...>: o --exec pode ir ao nó? Usa o PF do preflight deste host (já lido), pushes e envs. 0 = vai · 98/97 = não vai: o motivo fica no log (fall) e quem chama tenta o MBP.
 node_exec_gate() {
-  local rt w p kv k
+  local rt w p kv k n ok lst
   # vazio → rea_tools ausente do preflight ou ilegível no nó = "não sei" = o nó NÃO é usado (nunca "nenhuma ferramenta" nem "todas"); none = o nó nunca recebeu as ferramentas
   rt=$(pf_get rea_tools)
   case "$rt" in
@@ -1295,9 +1304,15 @@ node_exec_gate() {
   done
   for p in "${pushes[@]+"${pushes[@]}"}"; do [ -n "$p" ] || continue; node_push_ok "$p" || { fall push-recusado 97; return 97; }; done
   for kv in "${envs[@]+"${envs[@]}"}"; do
-    k=$(printf '%s' "${kv%%=*}" | tr 'a-z' 'A-Z')
+    [ -n "$kv" ] || continue   # vazio → o --env sem valor: o job também o ignora (_attempt_exec); nada a conferir
+    n=${kv%%=*}; k=$(printf '%s' "$n" | tr 'a-z' 'A-Z')
     case "$k" in *TOKEN*|*SECRET*|*KEY*|*PASS*|*AUTH*|*COOKIE*|*CRED*|*SESSION*) say "--env $k parece segredo: não vai ao $HNAME"; fall env-recusado 97; return 97 ;; esac
+    # allowlist (ga-jq08gyi): nome inválido (vazio, com espaço, começando por dígito) nunca está nela, e nome da lista só vale com a MESMA caixa; fora dela = o MBP, com o nome (nunca o valor) na mensagem
+    ok=0; case "$n" in ''|[0-9]*|*[!A-Za-z0-9_]*) ;; REA_*) ok=1 ;; *) case "$NODE_EXEC_ENV_OK" in *" $n "*) ok=1 ;; esac ;; esac
+    if [ $ok -ne 1 ]; then lst=${NODE_EXEC_ENV_OK# }; say "--env $(printf '%q' "$n") não está na lista de nomes que vão ao $HNAME (${lst% }, REA_*) — vai ao MBP"; fall env-fora-da-lista 97; return 97; fi
+    if looks_cred "${kv#*=}"; then say "--env $n tem valor com cara de credencial (JWT, sk-, Bearer, chave, URL com senha...): não vai ao $HNAME"; fall env-valor-credencial 97; return 97; fi
   done
+  if looks_cred "$@"; then say "um argumento do comando tem cara de credencial (JWT, sk-, Bearer, chave, URL com senha...): não vai ao $HNAME"; fall argv-credencial 97; return 97; fi
   return 0
 }
 scratch_clean() { "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "find $X -mindepth 1 -delete" >/dev/null 2>&1 || say "AVISO: scratch $X não foi limpo"; }   # X: o scratch da tentativa (global, como SLOT e RC)
