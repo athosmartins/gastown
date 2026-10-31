@@ -11550,8 +11550,9 @@ def _selftest():
                             "assets", "scripts", "disk-headroom-lib.sh")
     _dkh_diff = None
     try:
+        # third-state-waiver: test-only; an empty/failed read leaves _dkh_diff None and the scenario FAILS via _bad
         _jq_text = subprocess.run(["bash", "-c", '. "$1" || exit 97; printf "%s" "$DISK_HOLD_NEW_STORIES_JQ"', "x",
-                                   _dkh_lib], capture_output=True, text=True, timeout=10).stdout   # third-state-waiver: test-only; an empty/failed read leaves _dkh_diff None and the scenario FAILS via _bad
+                                   _dkh_lib], capture_output=True, text=True, timeout=10).stdout
         _dkh_jq = subprocess.run(["jq", "-c", "length"], input="[]", capture_output=True, text=True, timeout=10)   # third-state-waiver: test-only jq probe; failure FAILS the scenario via _bad
         _dkh_diff = []
         if _jq_text and _dkh_jq.returncode == 0:
