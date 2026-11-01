@@ -1,13 +1,26 @@
 # ga-9uv1xps.3: PENDING nudges fenced to a session that already ended (46 of 50 measured on 2026-11-01). The rule is NOT to
 # re-fence, move or delete them: each one is a pointer to a bead (the durable record) and the engine's 24 h TTL collects it;
-# nudge-queue-hygiene.py keeps its invariant of never touching non-warning items. nudge-stranded-census.py is
-# READ-ONLY and alarms (rc 1, STRANDED-INFO) only for an item of an UNKNOWN shape whose fence is confirmed closed
-# and that has < 6 h of TTL left: that would mean information is about to be lost and the rule must be revisited.
+# nudge-queue-hygiene.py keeps its invariant of never touching non-warning items. nudge-stranded-census.py never writes the
+# queue or a bead. It raises STRANDED-INFO (rc 1) only for an item of an UNKNOWN shape whose fence is confirmed closed and
+# that has < 6 h of TTL left (information about to be lost: the rule must be revisited), and it says "cannot tell" (rc 2) when
+# it could not decide such an item or read the queue. Both reach a human through `notify` (the wrapper passes --notify): the
+# exit code alone would not, because order-exec-failure-watchdog needs the same order to fail in 2 consecutive 5-min sweeps and
+# this one runs once per 3 h. A notice that notify could not deliver ends the run rc 3 and is retried by the next run.
 #
 # 3h: the census looks at the last 6 h of an item's 24 h TTL, so two runs see every item before it expires (a single
 # 6h cooldown could miss one by the drift of a late run).
+#
+# timeout 240s is declared, not left to the engine default (300 s, a SIGKILL that leaves no summary, no log and no notice): the
+# census spends at most --deadline-s 150 s asking bd and then up to 2 x 30 s on notify, which fits. A run that is killed anyway
+# has written nothing but a failed-order line in supervisor.log. The cost of a normal run is not measured on the live city yet
+# (this was built on the Hetzner node, which has no city): every summary line of $STATE_DIR/nudge-stranded-census.jsonl
+# carries `duration_s`, so read it after the first runs.
+#
+# This file only takes effect once merged and loaded by the city (orders are auto-discovered from the pack): merged is not
+# live, so confirm the first run in the order history after the merge and check that `notify` resolves in the order's PATH.
 [order]
-description = "Read-only census of PENDING nudges fenced to a closed session; alarms only for an unknown-shape item about to expire (ga-9uv1xps.3)"
+description = "Census of PENDING nudges fenced to a closed session; notifies on an unknown-shape item about to expire and on a run that cannot tell (ga-9uv1xps.3)"
 trigger = "cooldown"
 interval = "3h"
+timeout = "240s"
 exec = "$PACK_DIR/assets/scripts/nudge-stranded-census.sh"
