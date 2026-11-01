@@ -294,7 +294,8 @@ reset; r=$(P "$(sb $ID "" wa-worker "story:approved,node:ok")"); eq "rótulo nod
 # Antes a regra segurava TODA WA em rota auto sempre que a parada não era capacity|keep-limit (31/10: 222 de 227 puladas por hetzner-first, offered=0).
 OKB="$(sb $ID "" wa-worker "story:approved,node:ok")"
 BND=" $ID"   # o conjunto da varredura, no formato que a passada grava: cada id com um espaço na frente
-STOPS_ABERTAS='|end|max-fails|budget-probes|budget-secs|hook-held|should-stop|dolt-saturated|check-missing'
+# os valores de parada que _pilot_wa_node_pass de fato grava em _PWP_LAST_STOP, fora capacity|keep-limit (nó cheio); o fim da lista NÃO tem nome: é o valor vazio, que tem caso próprio em (a) e (b)
+STOPS_ABERTAS='|max-fails|budget-probes|budget-secs|hook-held|should-stop|dolt-saturated|check-missing'
 # (a) bead JULGADA node e retida: fica para o Hetzner, qualquer que seja a parada (menos nó cheio)
 for st in ${STOPS_ABERTAS//|/ }; do
   reset; r=$(PILOT_WA_NODE_ROUTE=label PRE="_PWP_MODE=on; _PWP_LAST_STOP='$st'; _PWP_NODE_BOUND='$BND'" P "$OKB" | cut -d' ' -f1,2); eq "rota label, node:ok, NO conjunto do nó, a passada parou em '$st': fica para o Hetzner" "$r" "rc=1 why=hetzner-first"
