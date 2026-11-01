@@ -522,6 +522,40 @@ gate_deliver_review_task() {
   return 1
 }
 
+# gate_ack_loop_needed — rc 0 iff the Step 7b ACK loop could still ACT on some reviewer slot; rc 1 iff all it could do is poll, sleep and log.
+# ga-86aie91. Measured on the live dispatcher log (14/10 - 01/11, 18 days): 1798 review tasks were ACCEPTED by the nudge queue at the first send and
+# 2 were refused; the loop re-queued something 5 times in all that time, and 3881 of its lines read "its task nudge is already queued ... NOT
+# stacking another copy". Since ga-g3m45n, gate_deliver_review_task in retry mode returns 10 and does nothing for a slot whose nudge the queue
+# ACCEPTED (REVIEWER_NUDGE_SENT[k]=1), so when every slot not yet ACKed is in that state the loop's only effects are log lines and a REVIEWER_ACKED
+# flag that nothing else reads. It still held the gate lock for a median 152 s per admission: 38% of a 396 s round (01/11 01:50-03:50, 16 rounds, budget=60 s),
+# the largest single segment of it, while admissions stayed at ~7-8/h. Waiting decides nothing: a reviewer that never consumes its task is caught by
+# Phase C (primary session confirmed closed → re-queue, ga-peb71d), by the run's verdict timeout (anchored on task-sent-at, not on this loop) and by
+# gate-recovery-watchdog — none of them reads the ACK flag.
+# A slot is "done" only when its flag is EXACTLY "1". 0, unset (a slot nobody filled in) or junk = the first send was refused or nobody can say, the
+# loop CAN re-queue it, so it runs exactly as before. A slot already ACKed needs nothing, whatever its nudge flag says.
+# Kill switch: the file $GC_CITY/.gc/gate-ack-skip.off (read on every admission: no redeploy, no plist reload) or GATE_ACK_SKIP=0 in the dispatcher's
+# environment (the launchd plist: it needs a reload) → the loop always runs. Unset, 1 or a
+# typo = the skip stays ON: only a literal 0 (or the file) brings the old loop back, so a mistyped value cannot silently disable the optimisation.
+# SELFTEST-EXTRACT gate-ack-loop-needed-fn: BEGIN
+gate_ack_loop_needed() {
+  local _k
+  # vazio (unset) → the skip is ON; falhou/ilegível (a typo) → ON too: only a literal 0 gives the old loop back.
+  case "${GATE_ACK_SKIP:-1}" in 0) return 0 ;; esac
+  # vazio (no file) → the skip stays ON; falhou/ilegível (a file that exists but cannot be read) → -e answers for the name, so it reads as OFF =
+  # the old loop; a directory that cannot be statted reads as "no file".
+  if [ -e "${GC_CITY:-/nonexistent}/.gc/gate-ack-skip.off" ]; then return 0; fi
+  # vazio (no slot) / falhou (the array is not declared) → nothing says the loop is useless, so it runs: the old behaviour is the inert state.
+  declare -p VERDICT_BEAD_IDS >/dev/null 2>&1 || return 0
+  [ "${#VERDICT_BEAD_IDS[@]}" -gt 0 ] || return 0
+  for _k in "${!VERDICT_BEAD_IDS[@]}"; do
+    [ "${REVIEWER_ACKED[$_k]:-0}" = "1" ] && continue
+    # vazio (unset) / falhou (anything but "1") → the slot can still be re-queued: the loop runs.
+    [ "${REVIEWER_NUDGE_SENT[$_k]:-0}" = "1" ] || return 0
+  done
+  return 1
+}
+# SELFTEST-EXTRACT gate-ack-loop-needed-fn: END
+
 # ga-fe5at: cascade extracted from ga-z3i2p's Step 5a fix (quality-gate-guard.sh)
 # — the SAME undeliverable-bare-name defect existed at 4 more mail(NOTIFY_AUTHOR)
 # sites in THIS file, each copy-pasting a bare `gc mail send "$NOTIFY_AUTHOR"`
@@ -19323,7 +19357,8 @@ log "Gate-run bead: $GATE_RUN_ID"
 GATE_ADMITTING_RUN="$GATE_RUN_ID"
 # ga-yjrg7n6: the marker of this round is admitted. The pre-admission budget stops applying, and the waiting flag comes down unless
 # other markers are still queued (this round admits one and re-execs for the next): the ACK wait below (step-7b-ack) is idle time, and
-# a verdict that landed is collected there as before the budget existed when nobody waits behind this run.
+# a verdict that landed is collected there as before the budget existed when nobody waits behind this run. When the ACK loop has nothing to act
+# on and is skipped (ga-86aie91), the same collection is made once, right after it, under the label step-7b-skip.
 gate_preadmit_mark_admitted "${COUNT:-}"
 # ga-ub8yq: one self-contained record joining run+bead+size, keyed by GATE_RUN_ID
 # (unique per attempt) so gate-review-size-report.py can pair each attempt with
@@ -19904,9 +19939,22 @@ if [ "$GATE_LOCK_ENABLED" = "1" ]; then _gate_lock_write_hb; fi
 # HARD CONSTRAINT (memory gate-dispatcher-set-e-pipefail-crash): set -euo pipefail
 # is active — every command below is `|| true`-guarded or used as a condition so a
 # transient failure can never head-of-line-block the gate.
+# SELFTEST-EXTRACT step-7b-ack-block: BEGIN
 ACK_MAX_RETRIES="${ACK_MAX_RETRIES:-4}"
 ACK_WAIT_SECS="${ACK_WAIT_SECS:-20}"
+# ── ga-86aie91: do not hold the lock for a wait that cannot change anything ───────────────────────────────────────
+# When the queue already ACCEPTED every slot's task nudge, a retry is dismissed (rc 10, ga-g3m45n) and this loop can only poll, sleep and log: a
+# median 152 s per admission with the gate lock held (measured, see gate_ack_loop_needed), during which the next marker waits. Then the loop is not
+# run and the round goes straight on. Any slot the loop COULD still re-queue (first send refused, slot not filled in) keeps the loop exactly as it
+# was, wait included. The skipped loop was also the one safe point after admission where deferred finished runs get collected once the last queued
+# marker is admitted (ga-yjrg7n6), so that call is made once below, under its own label.
+ACK_LOOP_SKIPPED=0
+if ! gate_ack_loop_needed; then
+  ACK_LOOP_SKIPPED=1
+  log "Step 7b (ga-86aie91): the task nudge was accepted for all ${#VERDICT_BEAD_IDS[@]} reviewer slot(s) — a retry would be dismissed (ga-g3m45n), so the ACK loop has nothing to act on and is NOT run (it held the lock ~150 s per admission). A reviewer that never consumes its task is caught by Phase C / the verdict timeout / gate-recovery-watchdog, as before."
+fi
 for _ack_attempt in $(seq 1 "$ACK_MAX_RETRIES"); do
+  [ "$ACK_LOOP_SKIPPED" != "1" ] || break
   _all_acked=1
   # ga-xwdl: snapshot session state + "now" ONCE per attempt (not per-reviewer,
   # same bounding idiom as ga-4u16h's RECONVENE_SESS_JSON below) so the
@@ -20036,10 +20084,15 @@ for _ack_attempt in $(seq 1 "$ACK_MAX_RETRIES"); do
   sleep "$ACK_WAIT_SECS" || true
 done
 for k in "${!VERDICT_BEAD_IDS[@]}"; do
-  if [ "${REVIEWER_ACKED[$k]:-0}" != "1" ]; then
+  # ga-86aie91: a loop that was not run did not try anything, so it has no "after N attempts" to report (the log line above says why).
+  if [ "$ACK_LOOP_SKIPPED" != "1" ] && [ "${REVIEWER_ACKED[$k]:-0}" != "1" ]; then
     warn "  Reviewer $((k+1)) never ACKed after ${ACK_MAX_RETRIES} attempts — relying on verdict-poll + DISPATCHING_TTL + monitor backstops (session=${SESSION_IDS[$k]})"
   fi
 done
+# ga-86aie91: the one-shot stand-in for the loop's safe point (see the block above). A simple list at column 0, not a nested call: it is a no-op while
+# another marker still waits for admission, and collects the deferred finished runs when this was the last one queued — what the loop's first pass did.
+[ "$ACK_LOOP_SKIPPED" != "1" ] || gate_midsweep_collect "step-7b-skip" || true
+# SELFTEST-EXTRACT step-7b-ack-block: END
 
 log "Verdicts requested (timeout=${VERDICT_TIMEOUT_MINUTES}m) — checking once now; if incomplete, a future sweep's Phase C finalizes (ga-eqjo, no longer blocking here)."
 
