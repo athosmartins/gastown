@@ -61,7 +61,9 @@ expect "a mesma ida entra com a janela padrão (7 dias)" 0 '"foram_ao_no_com_evi
 { ida 60 wa-h 0 - ; } > "$L"
 expect "ida sem out legível: 'não sei', contada à parte (nunca 'sem evidência')" 0 '"foram_ao_no_com_evidencia": 0.*"idas_sem_out_legivel": 1' --json
 expect "e o texto AVISA que não deu para saber" 0 'AVISO: 1 ida\(s\) ao nó sem `out` legível'
-{ ida 60 wa-i 0 "$EV"; echo 'isto não é json'; echo '{"event":"release"}'; echo '[1,2]'; } > "$L"
+{ printf '{"ts":"%s","event":"pilot-node-route","bead":"wa-m","mode":"auto","rc":0,"out":"{\\"verdict\\": corrupt"}\n' "$(iso $((NOW - 60*60)))"; } > "$L"
+expect "out com JSON corrompido (corrupt): 'não sei', contado à parte, nunca 'sem evidência'" 0 '"foram_ao_no_com_evidencia": 0.*"idas_sem_out_legivel": 1' --json
+{ ida 60 wa-i 0 "$EV"; echo 'linha corrupt: nao e json'; echo '{"event":"release"}'; echo '[1,2]'; } > "$L"
 expect "linhas ilegíveis (lixo, sem bead/hora, não-objeto) são CONTADAS, não omitidas" 0 '"linhas_ilegiveis": 3' --json
 expect "e o texto AVISA delas" 0 'AVISO: 3 linha\(s\) do log de rota ilegível'
 expect "a ida legível ao lado do lixo continua valendo" 0 '"foram_ao_no_com_evidencia": 1' --json
@@ -106,7 +108,7 @@ EOF
 prep_antes() { { rel 120 wa-d; ida 60 wa-d 0 "$EV"; } > "$L"; }
 prep_semout() { { ida 60 wa-h 0 - ; } > "$L"; }
 prep_semev() { { ida 120 wa-c 0 "$SEM"; rel 60 wa-c; } > "$L"; }
-prep_lixo() { { ida 60 wa-i 0 "$EV"; echo 'isto não é json'; } > "$L"; }
+prep_lixo() { { ida 60 wa-i 0 "$EV"; echo 'linha corrupt: nao e json'; } > "$L"; }
 prep_rc13() { { ida 120 wa-e 0 "$EV"; rel 60 wa-e 13; } > "$L"; }
 prep_ultima() { { ida 200 wa-l 0 "$EV"; rel 150 wa-l; ida 100 wa-l 0 "$EV"; } > "$L"; }
 prep_ausente() { rm -rf "$L"; }
