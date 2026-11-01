@@ -85,11 +85,17 @@ case "$*" in
     ;;
   *motherduck_invoice_usage_check.py*--json*)
     [ "${FAKE_MD_FAIL:-0}" = "1" ] && exit 1
-    echo "${FAKE_MD_JSON:-{\"projected_monthly_hours\": 45.2, \"threshold_hours\": 92.0, \"below_threshold\": true}}"
+    # NOT "${FAKE_MD_JSON:-{...}}": the expansion ends at the FIRST "}", so a SET
+    # FAKE_MD_JSON came out with a stray trailing "}" (invalid JSON). Latent until
+    # ga-m4t9wfg: no earlier test fed the JSON to the real parser.
+    if [ -n "${FAKE_MD_JSON:-}" ]; then echo "$FAKE_MD_JSON"; else echo '{"projected_monthly_hours": 45.2, "threshold_hours": 92.0, "below_threshold": true}'; fi
     ;;
   *-c*)
     # the inline `python3 -c` JSON-verdict parser: emulate its real logic
     # minimally so main()'s wiring is actually exercised, not just stubbed.
+    # FAKE_MD_REAL_PARSER=1 (ga-m4t9wfg) runs the REAL inline parser instead, so
+    # a test can prove the classification of a given check JSON end to end.
+    if [ "${FAKE_MD_REAL_PARSER:-0}" = "1" ]; then exec /usr/bin/env python3 "$@"; fi
     if [ "${FAKE_MD_VERDICT:-}" != "" ]; then echo "$FAKE_MD_VERDICT"; else echo "N/A(parse-falhou)"; fi
     ;;
 esac
@@ -255,6 +261,42 @@ OUT="$(FAKE_MD_JSON='{"projected_monthly_hours": 45.2, "threshold_hours": 92.0, 
 case "$OUT" in *"abaixo do teto"*) ok "below threshold -> verdict names it explicitly" ;; *) bad "expected 'abaixo do teto' verdict, got '$OUT'" ;; esac
 OUT="$(FAKE_MD_FAIL=1 _motherduck_verdict)"
 case "$OUT" in "N/A(falhou)") ok "python invocation fails -> N/A(falhou)" ;; *) bad "expected N/A(falhou), got '$OUT'" ;; esac
+
+echo "── _motherduck_verdict (ga-m4t9wfg): REAL parser — 'aguardando' vs 'could not measure' ──"
+# Check JSON shape is the live one (measured 2026-11-01). Only the fields that
+# drive the classification vary.
+_md_json() { # <conclusive> <n_full_days> <min_days> <today> [<projected> <below>]
+  printf '{"conclusive": %s, "n_full_days": %s, "min_days_required": %s, "partial_today_date": %s, "projected_monthly_hours": %s, "threshold_hours": 92.0, "below_threshold": %s}' \
+    "$1" "$2" "$3" "$4" "${5:-null}" "${6:-null}"
+}
+_md_real() { FAKE_MD_REAL_PARSER=1 FAKE_MD_JSON="$1" _motherduck_verdict; }
+OUT="$(_md_real "$(_md_json false 0 7 '"2026-11-01"')")"
+case "$OUT" in aguardando*) ok "day 1, 0/7 full days, conclusive=false -> 'aguardando' (the expected wait, not a failure)" ;; *) bad "day-1 wait must be 'aguardando*', got '$OUT'" ;; esac
+case "$OUT" in *"0/7"*) ok "the wait verdict says how far along it is (0/7)" ;; *) bad "expected '0/7' in the wait verdict, got '$OUT'" ;; esac
+OUT="$(_md_real "$(_md_json false 3 7 '"2026-11-04"' 40.0)")"
+case "$OUT" in aguardando*) ok "day 4 with all 3 calendar-possible full days (projection present but not conclusive) -> still 'aguardando'" ;; *) bad "day 4, 3/7 must wait, got '$OUT'" ;; esac
+OUT="$(_md_real "$(_md_json false 0 7 '"2026-11-15"')")"
+[ "$OUT" = "N/A(inconclusivo)" ] && ok "day 15 with 0 full days -> N/A(inconclusivo): mid-month emptiness is NOT a wait (still trips)" || bad "mid-month 0 days must stay N/A(inconclusivo), got '$OUT'"
+OUT="$(_md_real "$(_md_json false 1 7 '"2026-11-04"' 40.0)")"
+[ "$OUT" = "N/A(inconclusivo)" ] && ok "day 4 with 1 of 3 possible full days -> N/A(inconclusivo): days are missing, not a wait" || bad "missing days must stay N/A(inconclusivo), got '$OUT'"
+OUT="$(_md_real '{"conclusive": false, "min_days_required": 7, "partial_today_date": "2026-11-01", "projected_monthly_hours": null, "threshold_hours": 92.0, "below_threshold": null}')"
+[ "$OUT" = "N/A(inconclusivo)" ] && ok "n_full_days key absent -> N/A(inconclusivo), never an assumed wait" || bad "absent n_full_days must stay N/A(inconclusivo), got '$OUT'"
+OUT="$(_md_real '{"conclusive": false, "n_full_days": 0, "min_days_required": 7, "projected_monthly_hours": null, "threshold_hours": 92.0, "below_threshold": null}')"
+[ "$OUT" = "N/A(inconclusivo)" ] && ok "date absent -> N/A(inconclusivo): without the date the calendar cannot vouch for the wait" || bad "absent date must stay N/A(inconclusivo), got '$OUT'"
+OUT="$(_md_real "$(_md_json false 0 7 '"not-a-date"')")"
+[ "$OUT" = "N/A(inconclusivo)" ] && ok "unreadable date -> N/A(inconclusivo)" || bad "garbled date must stay N/A(inconclusivo), got '$OUT'"
+OUT="$(_md_real "$(_md_json '"false"' 0 7 '"2026-11-01"')")"
+[ "$OUT" = "N/A(inconclusivo)" ] && ok "conclusive as the STRING \"false\" -> N/A(inconclusivo): only the JSON boolean false counts" || bad "string conclusive must stay N/A(inconclusivo), got '$OUT'"
+OUT="$(_md_real "$(_md_json false false 7 '"2026-11-01"')")"
+[ "$OUT" = "N/A(inconclusivo)" ] && ok "n_full_days=false (a bool is not a count) -> N/A(inconclusivo)" || bad "bool n_full_days must stay N/A(inconclusivo), got '$OUT'"
+OUT="$(_md_real "$(_md_json true 8 7 '"2026-11-09"')")"
+[ "$OUT" = "N/A(inconclusivo)" ] && ok "conclusive=true yet no projection (inconsistent answer) -> N/A(inconclusivo)" || bad "conclusive-but-empty must stay N/A(inconclusivo), got '$OUT'"
+OUT="$(_md_real "$(_md_json true 8 7 '"2026-11-09"' 45.2 true)")"
+case "$OUT" in "45.2h/mes projetado (abaixo do teto 92h)") ok "conclusive window with a projection -> the numeric verdict, untouched" ;; *) bad "conclusive verdict changed, got '$OUT'" ;; esac
+OUT="$(_md_real 'not json at all')"
+[ "$OUT" = "N/A(json-invalido)" ] && ok "non-JSON answer -> N/A(json-invalido), still not a wait" || bad "garbage must stay N/A(json-invalido), got '$OUT'"
+OUT="$(FAKE_MD_REAL_PARSER=1 FAKE_MD_FAIL=1 _motherduck_verdict)"
+[ "$OUT" = "N/A(falhou)" ] && ok "the check itself failing (no JSON at all) -> N/A(falhou), never confused with the wait" || bad "check failure must stay N/A(falhou), got '$OUT'"
 
 echo "── _extract_field <data_line> <key> ──"
 LINE='<!-- storage-inventory:data mac_mini_used_gb=180.25 s3_total_gb=270.10 ts=2026-09-25 -->'
@@ -692,6 +734,68 @@ DATA_LINE="$(grep -m1 '^<!-- storage-inventory:data ' "$DOC_PATH")"
 : > "$STORAGE_INVENTORY_LOG"
 BUCKETS="$S3_ALL6"; _run_main_s3
 grep -q "S3: faturado=6.00GB.*status=novo" "$STORAGE_INVENTORY_LOG" && ok "the next complete round is a clean 'novo' baseline (6.00)" || bad "expected status=novo with faturado=6.00; got: $(grep 'S3: faturado' "$STORAGE_INVENTORY_LOG")"
+
+# ════════════════════════════════════════════════════════════════════════════
+# 8. ga-m4t9wfg — MotherDuck "aguardando 7d". The job runs on DAY 1, when the
+#    new invoice has 0 full days BY CONSTRUCTION, so the check answers
+#    conclusive=false every month. That used to be N/A(inconclusivo) -> overall
+#    rc 1 -> an open "atencao necessaria" bug every month, burying real alerts.
+#    A wait is expected and must not trip; "could not measure" must keep
+#    tripping; and the wait must never be drawn as ✅ (it is not a measurement).
+# ════════════════════════════════════════════════════════════════════════════
+MD_DAY1_JSON='{"invoice_id": "5yAMHCrAnMHDxeB7", "cutover_date": "2026-08-15", "n_full_days": 0, "min_days_required": 7, "conclusive": false, "projected_monthly_hours": null, "threshold_hours": 92.0, "below_threshold": null, "partial_today_date": "2026-11-01", "partial_today_hours": 4.0835}'
+MD_MIDMONTH_JSON='{"invoice_id": "5yAMHCrAnMHDxeB7", "cutover_date": "2026-08-15", "n_full_days": 0, "min_days_required": 7, "conclusive": false, "projected_monthly_hours": null, "threshold_hours": 92.0, "below_threshold": null, "partial_today_date": "2026-11-15", "partial_today_hours": 4.0835}'
+_run_main_md() { # <check-json> [VAR=value ...]  — runs main() with the REAL verdict parser
+  local json="$1" kv; shift
+  (
+    export FAKE_DF_TOTAL_KB=209715200 FAKE_DF_USED_KB=104857600 FAKE_AWS_BYTES=1073741824 \
+      FAKE_DRIVE_OUTPUT="12.00 15.00 80.0" FAKE_MD_REAL_PARSER=1 FAKE_MD_JSON="$json" \
+      FAKE_BD_LOG="$SCRATCH/fake-bd.log"
+    for kv in "$@"; do export "$kv"; done
+    main >/dev/null
+  )
+}
+BUCKETS="$S3_ALL6"
+
+echo "── main (ga-m4t9wfg): day 1, MotherDuck 'aguardando', every other vector healthy -> exit 0 ──"
+fresh_doc
+: > "$SCRATCH/fake-bd.log"; : > "$STORAGE_INVENTORY_LOG"
+_run_main_md "$MD_DAY1_JSON"
+RC=$?
+[ "$RC" -eq 0 ] && ok "MotherDuck waiting for its 7 days + all else healthy -> exit 0 (no monthly false alarm)" || bad "expected exit 0 on the day-1 wait, got $RC"
+MDROW="$(grep -m1 'MotherDuck compute' "$DOC_PATH")"
+case "$MDROW" in *aguardando*) ok "doc row says 'aguardando'" ;; *) bad "expected 'aguardando' in the MotherDuck row: $MDROW" ;; esac
+case "$MDROW" in *"| ⏳ |") ok "doc row status is ⏳" ;; *) bad "expected the row to end with '| ⏳ |': $MDROW" ;; esac
+case "$MDROW" in *"✅ |") bad "a wait must NEVER be drawn as ✅ — it is not a measurement: $MDROW" ;; *) ok "the wait is not drawn as ✅" ;; esac
+grep -q 'MotherDuck: aguardando.*status=⏳' "$STORAGE_INVENTORY_LOG" && ok "log records the wait with status=⏳" || bad "expected 'MotherDuck: aguardando... status=⏳' in the log: $(grep 'MotherDuck:' "$STORAGE_INVENTORY_LOG")"
+grep -q 'BD-CALLED.*create.*--type=chore' "$SCRATCH/fake-bd.log" && ok "clean-with-wait run files the closed chore" || bad "expected a chore-type summary bead: $(cat "$SCRATCH/fake-bd.log")"
+grep -q 'BD-CALLED.*create.*--type=bug' "$SCRATCH/fake-bd.log" && bad "the wait must not open an 'atencao necessaria' bug" || ok "no 'atencao necessaria' bug opened"
+grep -q 'BD-CALLED.*close.*reason.*aguardando' "$SCRATCH/fake-bd.log" && ok "the close reason admits MotherDuck was NOT measured this round" || bad "expected the close reason to mention 'aguardando': $(grep 'close' "$SCRATCH/fake-bd.log")"
+grep -q '⏳ = MotherDuck aguardando' "$DOC_PATH" && ok "the legend explains ⏳" || bad "expected the ⏳ legend in the generated block"
+
+echo "── main (ga-m4t9wfg): the wait does NOT mask another vector that is out of band ──"
+: > "$SCRATCH/fake-bd.log"; : > "$STORAGE_INVENTORY_LOG"
+_run_main_md "$MD_DAY1_JSON" FAKE_DF_USED_KB=157286400
+RC=$?
+[ "$RC" -ne 0 ] && ok "MotherDuck waiting + Mac mini +50% -> still nonzero" || bad "a wait must not hide a real deviation, got $RC"
+grep -q 'BD-CALLED.*create.*--type=bug' "$SCRATCH/fake-bd.log" && ok "...and the open bug is filed" || bad "expected the bug bead for the real deviation"
+
+echo "── main (ga-m4t9wfg): mid-month 0 full days is NOT a wait -> still trips ──"
+fresh_doc
+: > "$SCRATCH/fake-bd.log"; : > "$STORAGE_INVENTORY_LOG"
+_run_main_md "$MD_MIDMONTH_JSON"
+RC=$?
+[ "$RC" -ne 0 ] && ok "day 15 with 0 full days (the count is broken, not young) -> nonzero" || bad "expected nonzero on the mid-month emptiness, got $RC"
+case "$(grep -m1 'MotherDuck compute' "$DOC_PATH")" in *"N/A(inconclusivo)"*"| N/A |") ok "row stays N/A(inconclusivo) / N/A" ;; *) bad "expected N/A(inconclusivo) | N/A: $(grep -m1 'MotherDuck compute' "$DOC_PATH")" ;; esac
+grep -q 'BD-CALLED.*create.*--type=bug' "$SCRATCH/fake-bd.log" && ok "...and an open bug is filed" || bad "expected an open bug for the mid-month emptiness"
+
+echo "── main (ga-m4t9wfg): the check failing outright (Chrome/CDP down) still trips ──"
+fresh_doc
+: > "$SCRATCH/fake-bd.log"; : > "$STORAGE_INVENTORY_LOG"
+_run_main_md "$MD_DAY1_JSON" FAKE_MD_FAIL=1
+RC=$?
+[ "$RC" -ne 0 ] && ok "no answer from the check -> nonzero (could-not-measure is not a wait)" || bad "expected nonzero when the check fails, got $RC"
+case "$(grep -m1 'MotherDuck compute' "$DOC_PATH")" in *"N/A(falhou)"*) ok "row says N/A(falhou)" ;; *) bad "expected N/A(falhou): $(grep -m1 'MotherDuck compute' "$DOC_PATH")" ;; esac
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

@@ -36,6 +36,10 @@
 # This inventory reports that script's compute verdict (the one real,
 # working measurement that exists) rather than inventing an unverified
 # storage-bytes query against MotherDuck internals.
+# That check needs >= 7 FULL days on the current invoice, and this job runs on
+# day 1 (new invoice, 0 full days), so the usual verdict is "aguardando 7d"
+# (status ⏳, does not trip the overall verdict, not a measurement — ga-m4t9wfg).
+# "Could not measure" (N/A(falhou) etc.) still trips; see _motherduck_verdict.
 #
 # SAFE-EDIT DESIGN: never rewrites Part 0's own hand-maintained table cells.
 # Writes only inside a delimited block (storage-inventory:begin/end HTML
@@ -296,6 +300,20 @@ PYEOF
 # _motherduck_verdict — the compute-hours verdict from the one real,
 # existing MotherDuck measurement in this rig. Always "N/A(reason)" on any
 # failure, never a fabricated number.
+#
+# THREE outcomes when there is no projection (ga-m4t9wfg), not two:
+#   - "aguardando Nd (...)"  — EXPECTED: the invoice is too young to hold N
+#     full days (this job runs on day 1 of the month, when the new invoice has
+#     0 full days by construction). It is not a failure and does not trip the
+#     overall verdict. It is NOT a measurement either: the status is ⏳, never
+#     ✅, and the row says "aguardando" so nobody reads it as "healthy".
+#   - "N/A(falhou)" / "N/A(json-invalido)" / "N/A(parse-falhou)" — could not
+#     measure. Trips the overall verdict (ga-utr9qf: "not measured" must never
+#     look healthy).
+#   - "N/A(inconclusivo)" — the check answered but gave no projection and the
+#     calendar does NOT explain it (fields missing/garbled, or mid-month with
+#     days missing). Trips like the failures: waiting is only believed when the
+#     month really is that young AND every full day the calendar allows is there.
 _motherduck_verdict() {
   if [ ! -f "$MOTHERDUCK_CHECK_SCRIPT" ]; then echo "N/A(script-ausente)"; return 1; fi
   local json
@@ -303,15 +321,44 @@ _motherduck_verdict() {
   if [ -z "$json" ]; then echo "N/A(falhou)"; return 1; fi
   "$PYTHON_BIN" -c '
 import json, sys
+from datetime import date
 try:
     d = json.loads(sys.argv[1])
 except Exception:
     print("N/A(json-invalido)"); sys.exit(0)
+
+def aguardando(d):
+    # Returns the "aguardando" verdict, or None = "this is not a legitimate wait".
+    # vazio (key absent/None) -> None; falhou/ilegivel (wrong type, bad date) -> None.
+    # Both land in N/A(inconclusivo), which trips the overall verdict (loud, inert).
+    conc = d.get("conclusive")
+    n = d.get("n_full_days")
+    need = d.get("min_days_required")
+    today = d.get("partial_today_date")
+    if conc is not False:
+        return None
+    if isinstance(n, bool) or isinstance(need, bool):
+        return None
+    if not isinstance(n, int) or not isinstance(need, int):
+        return None
+    if need < 1 or n < 0 or n >= need:
+        return None
+    try:
+        elapsed = date.fromisoformat(today).day - 1   # full days the month can hold so far
+    except Exception:
+        return None
+    # A wait is only legitimate when the month is too young to hold `need` full
+    # days AND every full day it can hold is present (day 1: 0 of 0). Day 15 with
+    # 0 days, or day 4 with 1 day, is a measurement problem, not a wait.
+    if elapsed >= need or n < elapsed:
+        return None
+    return "aguardando %dd (%d/%d dias cheios; fatura nova, o veredito so fecha com %d dias)" % (need, n, need, need)
+
 proj = d.get("projected_monthly_hours")
 thr = d.get("threshold_hours")
 below = d.get("below_threshold")
 if proj is None or thr is None or below is None:
-    print("N/A(inconclusivo)")
+    print(aguardando(d) or "N/A(inconclusivo)")
 elif below:
     print(f"{proj:.1f}h/mes projetado (abaixo do teto {thr:.0f}h)")
 else:
@@ -419,7 +466,7 @@ _commit_doc() {
 # failure = open bug routed to gastown.dog (left open on purpose — closing
 # it here would hide the exact thing this story exists to surface).
 _file_summary_bead() {
-  local table="$1" overall_rc="$2" title body bead_id meta
+  local table="$1" overall_rc="$2" md_waiting="${3:-0}" title body bead_id meta close_reason
   body="Inventario mensal de storage automatizado (ga-z297h). Tabela desta rodada:
 $table
 
@@ -427,8 +474,12 @@ Doc atualizado: $DOC_PATH
 Log completo: $LOG"
   if [ "$overall_rc" -eq 0 ]; then
     title="Inventario de storage mensal OK ($(date -u '+%Y-%m-%d'))"
+    close_reason="inventario mensal limpo, nenhum vetor fora da banda"
+    # A clean run with MotherDuck still waiting did NOT measure MotherDuck: say so
+    # in the closing reason instead of letting "limpo" imply it was checked.
+    [ "$md_waiting" = "1" ] && close_reason="$close_reason (MotherDuck: aguardando dias cheios na fatura nova, nao medido nesta rodada)"
     bead_id=$(timeout 30 "$BD_BIN" -C "$CITY" create --title="$title" --type=chore --priority=3 --labels=storage-inventory --description="$body" --silent 2>/dev/null)
-    [ -n "$bead_id" ] && timeout 30 "$BD_BIN" -C "$CITY" close "$bead_id" --reason "inventario mensal limpo, nenhum vetor fora da banda" -q 2>/dev/null
+    [ -n "$bead_id" ] && timeout 30 "$BD_BIN" -C "$CITY" close "$bead_id" --reason "$close_reason" -q 2>/dev/null
   else
     title="Inventario de storage mensal: atencao necessaria ($(date -u '+%Y-%m-%d'))"
     meta='{"gc.routed_to":"gastown.dog"}'
@@ -541,9 +592,12 @@ main() {
   # MotherDuck (compute verdict — see header note on why not storage bytes)
   local md_verdict md_status
   md_verdict=$(_motherduck_verdict) || true
+  # "aguardando*" MUST be its own branch: the default (*) below is ✅, so an
+  # unlisted verdict would read as "measured and healthy" (ga-m4t9wfg).
   case "$md_verdict" in
     *ACIMA*) md_status="⚠️" ;;
     N/A*) md_status="N/A" ;;
+    aguardando*) md_status="⏳" ;;
     *) md_status="✅" ;;
   esac
   log "MotherDuck: $md_verdict status=$md_status"
@@ -558,9 +612,14 @@ main() {
   # (GATE-FEEDBACK ga-z297h attempt 1, blocking issue 1). Listing the BAD
   # statuses instead is how 🔴 would have slipped through as "not ⚠️".
   local st
-  for st in "$mm_free_status" "$mm_status" "$s3_status" "$drv_status" "$md_status"; do
+  for st in "$mm_free_status" "$mm_status" "$s3_status" "$drv_status"; do
     if [ "$st" != "✅" ] && [ "$st" != "novo" ]; then overall_rc=1; fi
   done
+  # MotherDuck has ONE extra healthy-for-the-verdict status: ⏳ = "aguardando
+  # Nd" (new invoice, window not closed yet — expected on every day-1 run,
+  # ga-m4t9wfg). It is allowed only in this slot, so any other vector showing
+  # ⏳ would still trip above. N/A and ⚠️ still trip here exactly as before.
+  if [ "$md_status" != "✅" ] && [ "$md_status" != "novo" ] && [ "$md_status" != "⏳" ]; then overall_rc=1; fi
 
   local table_md
   table_md="| Vetor | Medido em | Valor atual | Rodada anterior | Δ | Status |
@@ -582,7 +641,7 @@ main() {
     echo "$BEGIN_MARK"
     echo "${HDR_PREFIX} (script mensal, ga-z297h)"
     echo ""
-    echo "${LEGEND_PREFIX} (launchd \`com.gascity.storage-inventory-monthly\`, mensal). Não edite manualmente entre os marcadores — a próxima rodada sobrescreve. ⚠️ = vetor saiu de ±${DEVIATION_PCT}% da rodada anterior. No espaço livre do Mac mini, ⚠️/🔴 = abaixo dos pisos do dolt-disk-floor-guard (≤${FLOOR_WARN_GB} GB / ≤${FLOOR_CRITICAL_GB} GB), não variação."
+    echo "${LEGEND_PREFIX} (launchd \`com.gascity.storage-inventory-monthly\`, mensal). Não edite manualmente entre os marcadores — a próxima rodada sobrescreve. ⚠️ = vetor saiu de ±${DEVIATION_PCT}% da rodada anterior. No espaço livre do Mac mini, ⚠️/🔴 = abaixo dos pisos do dolt-disk-floor-guard (≤${FLOOR_WARN_GB} GB / ≤${FLOOR_CRITICAL_GB} GB), não variação. ⏳ = MotherDuck aguardando dias cheios na fatura nova (esperado no dia 1; NÃO é uma medição, e não é falha)."
     echo ""
     # On a failed measurement (mm_used/s3_total/drv_used empty), carry the
     # PREVIOUS recorded value forward instead of writing 0 — a literal 0
@@ -618,7 +677,7 @@ main() {
     case "$commit_result" in commitado|sem-mudanca|git-pulado*) ;; *) overall_rc=1 ;; esac
   fi
 
-  _file_summary_bead "$table_md" "$overall_rc"
+  _file_summary_bead "$table_md" "$overall_rc" "$([ "$md_status" = "⏳" ] && echo 1 || echo 0)"
   return "$overall_rc"
 }
 
