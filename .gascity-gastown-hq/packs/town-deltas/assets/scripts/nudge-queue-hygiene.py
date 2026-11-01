@@ -69,8 +69,11 @@ is "cannot tell" — kept, counted in dead_kept_undecided. (A dead_at in the FUT
 not old, so it is kept without being counted.) The same holds for the file: a dead key that is PRESENT but
 not a list is rc 2, nothing written. The decision keys on dead_at, never on created_at (an item
 dead-lettered by this very run has an old created_at and a fresh dead_at).
-The engine patch that makes this redundant is staged in docs/pending-engine-window/ga-j96y0n-*.patch;
-until that window this script is the only thing bounding the file.
+The engine patch that makes this redundant is IN the engine since the 2026-10-23 window (commit 8f1be0e2b,
+tag engwin-20261023, which is what `gc version` prints; file kept as
+docs/pending-engine-window/ga-j96y0n-*.patch.APLICADO-20261023): the engine's own pruneDeadQueuedNudges now
+drops a bead-less dead item after the same 7 days. This rule is therefore redundant on that engine, not
+harmful (same threshold), and it still bounds the file on an engine built without the patch (a rollback).
 
 Default is a DRY RUN; the order passes --apply.
 """

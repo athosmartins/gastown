@@ -15,8 +15,10 @@
 # ga-j96y0n adds a second rule in the same pass: drop BEAD-LESS dead-letter items older than 7 days.
 # The engine's pruneDeadQueuedNudges only ever drops a dead item that has a bead_id, so a bead-less one
 # is kept forever (measured 10/10: 108 items 7-98 days old = 3.7 MB that every queue operation reads
-# and every mutation rewrites). A bead-backed dead item is never touched here. The engine patch that makes this redundant is
-# staged in docs/pending-engine-window/ga-j96y0n-nudge-dead-ttl.patch (not applied: needs the window).
+# and every mutation rewrites). A bead-backed dead item is never touched here. The engine patch that makes this
+# redundant was applied in the 2026-10-23 window (tag engwin-20261023; file kept as
+# docs/pending-engine-window/ga-j96y0n-nudge-dead-ttl.patch.APLICADO-20261023). The rule stays as a net for an
+# engine built without it: same 7-day threshold, so on the current engine the two agree.
 #
 # 30m: the queue only needs to be tidy relative to a 24 h TTL / 7 d dead retention, and a run is one
 # 5-8 MB JSON read + (only when something moves) one atomic rewrite under the lock.
