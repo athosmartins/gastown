@@ -1,0 +1,29 @@
+# ga-pmu761v: pack the LOOSE git objects of the live repos at night, with a lean incremental repack.
+#
+# gc.auto=0 and maintenance.auto=false are deliberate (a 52-way detached auto-gc storm once filled the boot disk), so nothing packs
+# loose objects by itself and they grow without a ceiling. Measured 31/10 21:2x: the live WhatsApp repo held 54,830 loose objects = 2.47GiB
+# against 440MiB packed; a manual lean `git repack -d` freed 2,085MB in ~8 min. The town's git-maintenance-runner (every 6h) does the same
+# job but does nothing below 10GB free, and the mini lives at 3-6GB — so it skipped 245 of 885 cycles in its own log, 4 of its last 6
+# cycles among them. This job covers that gap, at night, with its own disk/swap watchdog. Full rationale, the states and the
+# safety rules: header of assets/scripts/git-loose-repack.sh.
+#
+# cooldown 30m, NOT a cron expression: an order's cron is evaluated in UTC (see engine-window-reboot-noon.toml), and the
+# window is local time. The script reads the local clock itself (the jsonl-archive's window lib) and ends at once outside
+# 00:00-04:59; the 30m tick is what retries a repo that was deferred (disk or swap) earlier in the same night.
+#
+# timeout 6600s: the script ends itself at its own 6000s deadline (+ the cleanup of a stopped repack and a final count, < 400s),
+# so the kill never meets a healthy run; it stays under the 120-minute stale age of the lock it shares with
+# git-maintenance-runner.sh (/tmp/git-maintenance-runner.lock), so that runner cannot reclaim a live run's lock. selftest S20 fails
+# if the timeout stops covering the deadline or passes the lock's stale age, or if the interval passes 30m.
+#
+# Only ONE instance exists (this pack's orders register for the city scope); the script is single-flight anyway.
+#
+# Verify after a reload:  gc order show git-loose-repack   -> Source: .../town-deltas/...
+#                         bash $GC_CITY_PATH/packs/town-deltas/assets/scripts/git-loose-repack.sh --dry-run
+#                         tail -3 $GC_CITY_PATH/.gc/logs/git-loose-repack.log
+[order]
+description = "Pack the loose git objects of the live repos at night (lean incremental repack, behind heavy-guard) — gc.auto=0 lets them grow without a ceiling and the 6-hourly runner skips below 10GB free"
+trigger = "cooldown"
+interval = "30m"
+timeout = "6600s"
+exec = "$PACK_DIR/assets/scripts/git-loose-repack.sh"
