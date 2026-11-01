@@ -11,6 +11,12 @@
   - VERDICT_TIMEOUT_MINUTES fica AUSENTE de propósito (default 22 no script). O
     45 provisório de 19/09 05:31 saiu às 06:30, quando o piso por custo de selftest
     (ga-4158gs, gate_heavy_selftest_floor_minutes) entrou no ar.
+  - GATE_PREADMIT_BUDGET_SECS=60 (Mayor 01/11 01:2x; default 150): medido 31/10 23:00-01/11 01:10,
+    cada rodada de admissão gastava 30-305 s reconferindo runs em voo (Phase C) antes de abrir a
+    próxima; o gate abria ~6 revisões/h, que com revisão de ~27 min dá ~3 revisores ao mesmo tempo,
+    com o Hetzner ocioso (load 3/16) e o teto remoto em 7. Run não alcançada vai para a frente da
+    próxima rodada (GATE_PHASE_C_DEFERRED_FILE); custo = finalize/timeout de uma run atrasa ~1 rodada.
+  - GATE_FULL_SUITE_ADVISORY_RIGS=whatsapp_automation: estava só no instalado (drift), trazido p/ cá.
 -->
 <plist version="1.0">
 <dict>
@@ -24,6 +30,10 @@
 		<string>300</string>
 		<key>GATE_DOLT_CPU_WARM</key>
 		<string>280</string>
+		<key>GATE_FULL_SUITE_ADVISORY_RIGS</key>
+		<string>whatsapp_automation</string>
+		<key>GATE_PREADMIT_BUDGET_SECS</key>
+		<string>60</string>
 		<key>GATE_MAX_ADMITS_PER_SWEEP</key>
 		<string>3</string>
 		<key>GC_CITY_PATH</key>
