@@ -28,7 +28,9 @@
 #   · instância única (mkdir) e o interruptor do maestro ($CITY/.gc/disk-recovery.off): ligado = sai 10 sem ler nem agir, também quando alguém chama este degrau à mão.
 # TRÊS ESTADOS    tem / não-tem / não-consegui-saber. df, swap, launchctl, ps, footprint, deploy_freeze ou sqlite ilegíveis NUNCA viram "tem bastante disco", "sem ligação", "livre" ou "descongelado":
 #   o degrau não age naquilo (e, se nada foi feito, sai 30). Depois de já ter agido, uma leitura que falha só PARA o degrau (não reinicia o seguinte às cegas).
-# CONTRATO        `--run` (real) ou `--dry-run` (lê tudo, diz o que faria; não toma trava, não grava log, não reinicia, não despausa, sai 10). stdout = UMA linha (ASCII: o maestro filtra para
+#   A fila do demand-dashboard segue a mesma regra e a linha final NUNCA diz "nada a fazer"/"conferida" por cima de dúvida: sobra de pausa nossa que não consegui desfazer = 20; fila ilegível no
+#   início = 30 se nada foi reiniciado (se algo foi, rc 0 e a linha avisa); no TERM a linha só diz "conferida" se a conferência deu certo, "NAO confirmada" se não, e nada se não havia pausa nossa em aberto.
+# CONTRATO        `--run` (real) ou `--dry-run` (lê tudo, diz o que faria; não toma trava, não grava log, não reinicia, não despausa, sai 10, ou 30 se nao conseguiu ler). stdout = UMA linha (ASCII: o maestro filtra para
 #   caracteres imprimíveis), e NADA antes dela em stdout/stderr (o maestro lê só a 1ª linha dos dois juntos): tudo o mais vai para $LOG.
 #   Saída 0 = agiu e terminou · 10 = nada a fazer ou uma guarda adiou · 20 = falhou (reinício sem prova, despausa não confirmada, TERM) · 30 = não consegui ler o estado (não agiu) · 2 = uso.
 #   Com falha e sucesso na mesma rodada vale 20 (a linha diz os dois). O maestro dá 900 s e manda TERM→KILL: o TERM despausa a fila rápido (a nossa) antes de sair; KILL não dá para pegar,
@@ -72,6 +74,8 @@ PAUSE_ARMED=0
 DD_CURL_S=""
 DD_PAUSED=""
 DD_BY=""
+LEFT_TXT=""      # o que a conferencia da fila (sobra de pausa NOSSA) achou, para a linha final; vazio = nada a dizer
+LEFT_RC=0        # 0 = fila conferida · 20 = sobra de pausa nossa NAO despausada · 30 = nao consegui ler a fila
 
 cfg() {  # $1=nome $2=padrão → define a variável $1 com DR_$1 (só dígitos, até 9); vazio → padrão; lixo → padrão E registra em CFG_WARN (limiar que não leio não vira "sem limite")
   local v
@@ -321,13 +325,19 @@ ensure_despaused() {  # $1=segundos máx. Garante que a pausa NOSSA (system_paus
 
 # ── sinais: o maestro manda TERM (e KILL 2 s depois) ao passar de 900 s ───────────────────────────────────────────────────────────
 on_signal() {
+  local qtxt=""
   log "WARN: recebi $1"
   if [ -n "$RB_PID" ]; then pkill -TERM -P "$RB_PID" 2>/dev/null; kill -TERM "$RB_PID" 2>/dev/null; fi
+  # a linha final diz da fila SO o que foi de fato conferido: PAUSE_ARMED=0 → nao ha pausa nossa em aberto, qtxt fica vazio (a linha nao fala da fila, fora o que a conferencia do inicio ja achou em LEFT_TXT)
+  # conferi (rc 0) → "conferida" · falhou/NAO consegui confirmar (rc 1) → "NAO confirmada", nunca "conferida" · a leitura de AGORA vale mais que a do inicio, entao LEFT_TXT sai da linha
   if [ "$PAUSE_ARMED" = 1 ]; then
     DD_CURL_S=1
-    if ensure_despaused 2; then log "fila conferida/despausada na saida"; else log "ERRO: sai por $1 com a fila do demand-dashboard POSSIVELMENTE PAUSADA por nos"; fi
+    if ensure_despaused 2; then log "fila conferida/despausada na saida"; qtxt="; fila do demand-dashboard conferida (nao esta pausada por nos)"
+    else log "ERRO: sai por $1 com a fila do demand-dashboard POSSIVELMENTE PAUSADA por nos"; qtxt="; fila do demand-dashboard NAO confirmada (se estiver pausada por nos, despausar a mao)"; fi
+    LEFT_TXT=""
   fi
-  finish 20 "D3 interrompido ($1)${ACTED_TXT:+ depois de: $ACTED_TXT}; a fila do demand-dashboard foi conferida"
+  # o estado da fila vem ANTES da lista do que ja reiniciei: e a parte que importa para quem le, e a lista (ate 3 daemons) e o que o corte de 290 pode comer
+  finish 20 "D3 interrompido ($1)${LEFT_TXT:+; $LEFT_TXT}$qtxt${ACTED_TXT:+; depois de: $ACTED_TXT}"
 }
 trap 'on_signal TERM' TERM
 trap 'on_signal INT' INT
@@ -400,7 +410,11 @@ restart_guarded() {  # demand-dashboard. $1=pid antigo. Roda o guardado, CONFERE
   verdict=""
   if [ -n "$RB_OUT" ]; then verdict=$(grep 'VEREDITO' "$RB_OUT" 2>/dev/null | tail -n 1 | LC_ALL=C tr -cd '[:print:]' | cut -c1-160); rm -f "$RB_OUT" 2>/dev/null; RB_OUT=""; fi
   log "guardado rc=$rc ${verdict:+($verdict)}"
-  if ensure_despaused "$D3_DESPAUSE_S"; then PAUSE_ARMED=0; dp="fila conferida (livre ou de outro dono)"; else dp="fila NAO confirmada (se estiver pausada por nos, despausar a mao)"; fi
+  if ensure_despaused "$D3_DESPAUSE_S"; then
+    PAUSE_ARMED=0; dp="fila conferida (livre ou de outro dono)"
+    # lida AGORA e nao e pausa nossa: a duvida da conferencia do inicio (sobra nao despausada / fila ilegivel) acabou; a linha final nao a repete
+    if [ "$LEFT_RC" != 0 ]; then log "fila conferida agora: a duvida da conferencia inicial (rc $LEFT_RC) acabou"; LEFT_TXT=""; LEFT_RC=0; fi
+  else dp="fila NAO confirmada (se estiver pausada por nos, despausar a mao)"; fi
   if [ "$rc" -ne 0 ]; then RESTART_WHY="guardado rc=$rc${verdict:+ [$verdict]}; $dp"; return 1; fi
   if [ "$PAUSE_ARMED" = 1 ]; then RESTART_WHY="$dp"; return 1; fi
   if ! wait_new_pid "com.whatsapp.demand-dashboard" "$old" "$(health_of demand-dashboard)"; then RESTART_WHY="sem PID novo + porta 8095 em ${D3_READY_S}s; $dp"; return 1; fi
@@ -417,6 +431,13 @@ T_START=$(now_s)
 log "inicio ($([ "$DRY" = 1 ] && echo dry-run || echo run)) pid=$$ orcamento=${D3_BUDGET_S}s recuperado>${RECOVERED_MB}MB"
 
 PFX=""; [ "$DRY" = 1 ] && PFX="DRY-RUN "
+finish_q() {  # $1=rc natural $2=cabeça $3=resto. A ÚNICA saída depois da conferência da fila: o que a conferência achou (LEFT_TXT) entra LOGO NO COMEÇO da linha (o corte de 290 não o derruba) e sobe o rc
+  # fila com sobra nossa NÃO despausada (LEFT_RC=20) → 20, nunca "nada a fazer" · fila ilegível (30) com NADA reiniciado (rc natural 10) → 30, não 10 · já agiu (rc 0) → continua 0 e a linha só avisa
+  local rc=$1 head=$2 rest=$3
+  if [ "$LEFT_RC" = 20 ] && [ "$rc" != 20 ]; then rest="$head: $rest"; head="falhou"; rc=20
+  elif [ "$LEFT_RC" = 30 ] && [ "$rc" = 10 ]; then rest="$head: $rest"; head="nao consegui ler e nao agi"; rc=30; fi
+  finish "$rc" "${PFX}D3 $head: ${LEFT_TXT:+$LEFT_TXT; }$rest"
+}
 
 if [ -e "$OFF" ]; then finish 10 "${PFX}D3 desligado: interruptor $(basename "$OFF") ligado, nada lido nem feito"; fi
 
@@ -439,14 +460,27 @@ FREE0=$M_FREE; SWAP0=$M_SWAP; FREE=$M_FREE; SWAP=$M_SWAP
 log "leitura: livre=${FREE}MB swap=${SWAP}MB (recuperado = livre > ${RECOVERED_MB}MB)"
 
 # pausa NOSSA que sobrou de uma rodada que o maestro matou (KILL não se pega): desfaz antes de qualquer coisa. Só em --run; pausa de outro dono nem é tocada
+# vazio/lida e nao pausada → nada a dizer · pausa nossa despausada e lida de volta → LEFT_TXT conta, rc inalterado · pausa nossa que NAO consegui desfazer → LEFT_RC=20 (a fila segue parada)
+# falhou/ilegível (daemon fora do ar, HTTP != 200, JSON ruim, sem jq) → LEFT_RC=30: não sei se há pausa nossa; a linha final NUNCA diz "nada a fazer" por cima disso (finish_q)
 if [ "$DRY" != 1 ]; then
-  if dd_get_config && [ "$DD_PAUSED" = 1 ]; then
-    case "$DD_BY" in "$AGENT":*) log "WARN: achei a fila pausada por nos ('$DD_BY'), sobra de rodada anterior: despausando"; DD_CURL_S=""; ensure_despaused "$D3_DESPAUSE_S" || log "ERRO: nao consegui despausar a sobra" ;; esac
+  if dd_get_config; then
+    if [ "$DD_PAUSED" = 1 ]; then
+      case "$DD_BY" in
+        "$AGENT":*)
+          log "WARN: achei a fila pausada por nos ('$DD_BY'), sobra de rodada anterior: despausando"
+          DD_CURL_S=""; PAUSE_ARMED=1    # armado enquanto despauso: um TERM no meio ainda tenta de novo antes de sair
+          if ensure_despaused "$D3_DESPAUSE_S"; then PAUSE_ARMED=0; LEFT_TXT="sobra de pausa nossa da rodada anterior: despausada e conferida"
+          else log "ERRO: nao consegui despausar a sobra"; LEFT_TXT="fila do demand-dashboard NAO despausada (sobra de pausa nossa da rodada anterior; despausar a mao)"; LEFT_RC=20; fi ;;
+      esac
+    fi
+  else
+    log "WARN: nao consegui ler a fila do demand-dashboard no inicio: nao sei se ha pausa nossa"
+    LEFT_TXT="fila do demand-dashboard ilegivel no inicio (nao sei se ha pausa nossa)"; LEFT_RC=30
   fi
 fi
 
 if [ "$FREE" -gt "$RECOVERED_MB" ]; then
-  finish 10 "${PFX}D3 nada a fazer: disco ja recuperado (livre ${FREE} MB > ${RECOVERED_MB} MB, swap ${SWAP} MB)"
+  finish_q 10 "nada a fazer" "disco ja recuperado (livre ${FREE} MB > ${RECOVERED_MB} MB, swap ${SWAP} MB)"
 fi
 
 # scan: pid, freeze, idade, footprint de cada daemon da allowlist
@@ -454,8 +488,8 @@ i=0
 for n in $NAMES; do i=$((i + 1)); scan_one "$i" "$n"; done
 ORDER=$(i=0; for n in $NAMES; do i=$((i + 1)); [ "$(getv "ELIG_$i")" = 1 ] && echo "$(getv "FP_$i") $i"; done | sort -k1,1nr -k2,2n | awk '{print $2}')
 if [ -z "$ORDER" ]; then
-  if [ "$UNK" = 1 ]; then finish 30 "${PFX}D3 nao consegui ler algum daemon e nenhum outro e elegivel (livre ${FREE} MB): $SKIPS"; fi
-  finish 10 "${PFX}D3 nada a fazer: nenhum daemon elegivel (livre ${FREE} MB): $SKIPS"
+  if [ "$UNK" = 1 ]; then finish_q 30 "nao consegui ler" "algum daemon e nenhum outro e elegivel (livre ${FREE} MB): $SKIPS"; fi
+  finish_q 10 "nada a fazer" "nenhum daemon elegivel (livre ${FREE} MB): $SKIPS"
 fi
 log "elegiveis por footprint (maior primeiro): $(for k in $ORDER; do printf '%s=%sMB ' "$(nth "$k")" "$(getv "FP_$k")"; done)"
 
@@ -517,12 +551,12 @@ fi
 
 TAIL="livre ${FREE0}->${FREE} MB swap ${SWAP0}->${SWAP} MB"
 if [ -n "$FAIL_TXT" ]; then
-  finish 20 "D3 falhou: $FAIL_TXT${ACTED_TXT:+; antes disso reiniciei: $ACTED_TXT}; $TAIL"
+  finish_q 20 "falhou" "$FAIL_TXT${ACTED_TXT:+; antes disso reiniciei: $ACTED_TXT}; $TAIL"
 fi
 if [ "$ACTED_N" -gt 0 ]; then
-  finish 0 "D3 agiu: reiniciei $ACTED_TXT; $TAIL${STOP_TXT:+; parei: $STOP_TXT}${SKIPS:+; pulos: $SKIPS}"
+  finish_q 0 "agiu" "reiniciei $ACTED_TXT; $TAIL${STOP_TXT:+; parei: $STOP_TXT}${SKIPS:+; pulos: $SKIPS}"
 fi
 if [ "$UNK" = 1 ]; then
-  finish 30 "D3 nao consegui ler e nao agi: ${STOP_TXT:-algum daemon}${SKIPS:+; pulos: $SKIPS}; $TAIL"
+  finish_q 30 "nao consegui ler e nao agi" "${STOP_TXT:-algum daemon}${SKIPS:+; pulos: $SKIPS}; $TAIL"
 fi
-finish 10 "D3 adiado, nada reiniciado: ${STOP_TXT:-sem motivo registrado}${SKIPS:+; pulos: $SKIPS}; $TAIL"
+finish_q 10 "adiado, nada reiniciado" "${STOP_TXT:-sem motivo registrado}${SKIPS:+; pulos: $SKIPS}; $TAIL"

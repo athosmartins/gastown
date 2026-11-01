@@ -10,7 +10,9 @@
 #   footprint 99/100 MB, janela de ligação 1799/1801 s) · ordem por footprint e parada ao recuperar · só labels da allowlist · cada guarda de ligação (pix dialing/bridged, voicebot live, banco
 #   ausente/corrompido/sem tabela = não sei), e a guarda de novo ENTRE um daemon e o seguinte · freeze (congelado, livre, ilegível) · prova do restart (PID novo + porta; kickstart que falha,
 #   mesmo PID, porta fora, 4xx) · demand-dashboard pelo guardado (argumentos, env, notify desligado, pausa nossa que sobra é desfeita E lida de volta, pausa alheia intocada, despausa recusada,
-#   daemon voltando devagar, guardado que estoura o tempo, sobra de rodada anterior) · TERM no meio do guardado despausa a fila · orçamento de tempo · trava (viva, morta, solta no fim) ·
+#   daemon voltando devagar, guardado que estoura o tempo, sobra de rodada anterior) · TERM no meio do guardado despausa a fila ·
+#   a LINHA FINAL nunca diz "conferida"/"nada a fazer" por cima de dúvida na fila (TERM com daemon fora do ar / PATCH recusado / sem pausa nossa em aberto / no meio da despausa da sobra; sobra nossa que
+#   o PATCH recusou = 20; fila ilegível no início = 30 se nada foi reiniciado; o guardado que deixa a fila livre apaga a dúvida; o aviso sobrevive ao corte de 290) · orçamento de tempo · trava (viva, morta, solta no fim) ·
 #   interruptor · dry-run sem efeito colateral · df/swap lidos do jeito certo (nunca `df /`) e ilegíveis = 30 · variável numérica inválida · rotação do log · bancos só lidos.
 # COMO RODAR      bash scripts/disk-recovery-d3-ram-daemons.selftest.sh        (~1-3 min)
 #   Para testar uma cópia modificada do degrau (mutantes): DR_D3_PATH=/caminho/disk-recovery-d3-ram-daemons.mutN.sh bash scripts/disk-recovery-d3-ram-daemons.selftest.sh
@@ -353,11 +355,102 @@ if [ -f "$SD/guarded.started" ]; then
   d3pid=$(cat "$LOCK/pid" 2>/dev/null); kill -TERM "$d3pid" 2>/dev/null
   for _ in $(seq 1 100); do [ -f "$W/term.rc" ] && break; sleep 0.1; done
   OUT=$(cat "$W/term.out" 2>/dev/null); RC=$(cat "$W/term.rc" 2>/dev/null || echo ?)
-  expect 20 "interrompido (TERM)" "TERM: sai 20 com a linha dizendo"; eq "$(cut -c1-2 < "$SD/dd_config")" "0|" "TERM: a pausa nossa foi desfeita antes de sair"; lockgone "TERM"
+  expect 20 "interrompido (TERM)" "TERM: sai 20 com a linha dizendo"; has "$OUT" "fila do demand-dashboard conferida" "TERM: a fila foi conferida de verdade, a linha diz"; eq "$(cut -c1-2 < "$SD/dd_config")" "0|" "TERM: a pausa nossa foi desfeita antes de sair"; lockgone "TERM"
   eq "$(pgrep -f "$W/guarded" | head -1)" "" "TERM: o guardado em andamento foi encerrado junto"
 else
   nope "TERM: o guardado stub nao chegou a rodar"
 fi
+
+section "sobra de pausa nossa e fila ilegivel: a linha final nao diz 'nada a fazer' nem 'conferida' por cima de duvida (gate-fix 1)"
+# sobra NOSSA + despausa recusada (400) + disco ja recuperado: a fila SEGUE PARADA → 20, nunca "nada a fazer" com rc 10
+reset; printf '1|disk-recovery-d3: restart guardado ga-1p1i5jr.3' > "$SD/dd_config"; printf '9000' > "$SD/free"; echo patch400 > "$SD/dd_mode"; run_d3
+expect 20 "fila do demand-dashboard NAO despausada" "sobra nossa + PATCH recusado (400) + livre 9000: 20 e a linha diz que a fila segue parada"
+hasnt "$OUT" "D3 nada a fazer" "sobra nao despausada: a cabeca da linha nao e 'nada a fazer'"; has "$OUT" "disco ja recuperado" "sobra nao despausada: a linha ainda diz o resto (disco recuperado)"
+has "$CALLS" "PATCH-RECUSADO" "sobra nao despausada: tentou despausar"; eq "$(cut -c1-2 < "$SD/dd_config")" "1|" "sobra nao despausada: a fila continua pausada (e a linha nao mente)"; lockgone "sobra nao despausada"
+# a sobra existe e o disco NAO recuperou: segue agindo nos outros daemons, mas o rc final e 20 (acao + duvida na fila = 20, como no restart guardado)
+reset; printf '1|disk-recovery-d3: restart guardado ga-1p1i5jr.3' > "$SD/dd_config"; echo patch400 > "$SD/dd_mode"; setproc demand-dashboard 2 -; setproc ficha360 4 50; run_d3
+expect 20 "NAO despausada" "sobra nao despausada + disco nao recuperou: 20 mesmo tendo reiniciado outro"; has "$OUT" "reiniciei map-viewer" "sobra nao despausada: o que foi reiniciado entra na linha"
+# o guardado deixou a fila livre depois: a duvida do inicio acabou, nada de 20 por uma sobra que ja nao existe
+reset; printf '1|disk-recovery-d3: restart guardado ga-1p1i5jr.3' > "$SD/dd_config"; echo patch400 > "$SD/dd_mode"; setproc map-viewer 4 50; setproc ficha360 4 50; run_d3
+expect 0 "reiniciei demand-dashboard" "sobra nao despausada mas o guardado deixou a fila livre e lida: 0"; hasnt "$OUT" "NAO despausada" "fila conferida depois: a linha nao repete a duvida do inicio"
+# sobra nossa despausada e lida de volta: rc inalterado, a linha conta
+reset; printf '1|disk-recovery-d3: restart guardado ga-1p1i5jr.3' > "$SD/dd_config"; printf '9000' > "$SD/free"; run_d3
+expect 10 "sobra de pausa nossa da rodada anterior: despausada e conferida" "sobra despausada e lida de volta: 10 e a linha conta"; eq "$(cut -c1-2 < "$SD/dd_config")" "0|" "sobra despausada: fila livre"
+# pausa de outro dono: nao tocada e nao e duvida
+reset; printf '1|athos: parada' > "$SD/dd_config"; printf '9000' > "$SD/free"; run_d3; expect 10 "ja recuperado" "sobra de OUTRO dono: nao e duvida, 10"; hasnt "$OUT" "fila" "sobra de outro dono: a linha nao fala da fila"
+# fila ilegivel no inicio: nao sei ≠ "nada a fazer"
+for dm in down http500 garbage; do
+  reset; echo "$dm" > "$SD/dd_mode"; printf '9000' > "$SD/free"; run_d3
+  expect 30 "fila do demand-dashboard ilegivel no inicio" "fila ilegivel ($dm) + livre 9000: 30, nao 10"; hasnt "$OUT" "D3 nada a fazer" "fila ilegivel ($dm): a cabeca da linha nao e 'nada a fazer'"; eq "$(kicks)" "" "fila ilegivel ($dm): nada reiniciado"; eq "$(npatch)" 0 "fila ilegivel ($dm): nenhum PATCH"
+done
+reset; echo down > "$SD/dd_mode"; for l in demand-dashboard map-viewer ficha360 clientes-dashboard; do setproc $l 2 -; done; run_d3
+expect 30 "ilegivel no inicio" "fila ilegivel + nenhum daemon elegivel: 30"
+reset; echo down > "$SD/dd_mode"; addpix dialing 5; run_d3; expect 30 "ilegivel no inicio" "fila ilegivel + ligacao em curso (adiado): 30, nao 10"
+# fila ilegivel mas ja agiu em outro daemon: rc 0, a linha avisa logo no comeco
+reset; echo down > "$SD/dd_mode"; setproc demand-dashboard 2 -; run_d3
+expect 0 "agiu: fila do demand-dashboard ilegivel no inicio" "fila ilegivel + reiniciou outro daemon: rc 0 e a linha avisa no comeco"; has "$OUT" "reiniciei map-viewer" "fila ilegivel + agiu: diz o que reiniciou"
+# o aviso vem ANTES do que pode ser cortado nos 290: uma linha longa de pulos nao o derruba
+reset; echo down > "$SD/dd_mode"; for l in demand-dashboard map-viewer ficha360 clientes-dashboard; do setproc $l 3 00:30; done; run_d3
+expect 30 "ilegivel no inicio" "fila ilegivel + linha longa de pulos: o aviso sobrevive ao corte de 290"
+# dry-run nao le a fila e nao muda de rc por causa dela
+reset; echo down > "$SD/dd_mode"; run_d3 --dry-run; expect 10 "DRY-RUN D3: faria reiniciar" "dry-run com fila ilegivel: sem efeito (dry-run nao confere a fila)"
+
+section "TERM: a linha so diz da fila o que foi conferido (gate-fix 1)"
+# term_run <arquivo-sinal em $SD> <comando ao chegar no ponto, ou vazio> [VAR=valor ...] — roda o degrau em segundo plano, manda TERM quando o sinal aparece; deixa OUT/RC como o run_d3
+term_run() {
+  local sig=$1 act=$2 d3pid; shift 2
+  rm -f "$W/term.out" "$W/term.rc"
+  ( env -i HOME="$W/home" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TMPDIR="$W/tmp" STUB_DIR="$SD" DR_CITY="$CITY" DR_D3_WA="$WA" DR_D3_PIX_DB="$PIX" DR_D3_VOICE_DB="$VOICE" \
+      DR_D3_GUARDED="$W/guarded" DR_D3_FREEZE_CMD="$W/freeze" DR_FREE_MB_FILE="$SD/free" DR_SWAP_MB_FILE="$SD/swap" DR_D3_SETTLE_S=0 DR_D3_READY_S=3 DR_D3_DRAIN_S=3 DR_D3_DESPAUSE_S=3 \
+      DR_D3_GUARD_SLACK_S=100 DR_D3_CMD_S=5 DR_D3_CURL_S=2 "$@" "$D3" --run > "$W/term.out" 2>&1; echo $? > "$W/term.rc" ) &
+  BGP=$!; BG_PIDS="$BG_PIDS $BGP"
+  for _ in $(seq 1 150); do [ -f "$SD/$sig" ] && break; sleep 0.1; done
+  if [ ! -f "$SD/$sig" ]; then OUT=""; RC="?"; return 1; fi
+  [ -z "$act" ] || eval "$act"
+  d3pid=$(cat "$LOCK/pid" 2>/dev/null); kill -TERM "$d3pid" 2>/dev/null
+  for _ in $(seq 1 150); do [ -f "$W/term.rc" ] && break; sleep 0.1; done
+  OUT=$(cat "$W/term.out" 2>/dev/null); RC=$(cat "$W/term.rc" 2>/dev/null || echo ?); CALLS=$(cat "$SD/calls" 2>/dev/null)
+  return 0
+}
+# TERM no meio do guardado com o daemon FORA DO AR: a despausa nao se confirma → a linha NAO pode dizer "conferida"
+reset; setproc map-viewer 4 50; setproc ficha360 4 50; echo slow > "$SD/guarded.mode"
+if term_run guarded.started "echo down > '$SD/dd_mode'"; then
+  expect 20 "interrompido (TERM)" "TERM com o daemon fora do ar: 20"; has "$OUT" "fila do demand-dashboard NAO confirmada" "TERM + despausa nao confirmada: a linha diz 'NAO confirmada'"
+  hasnt "$OUT" "conferida" "TERM + despausa nao confirmada: a linha NAO diz 'conferida'"; eq "$(cut -c1-2 < "$SD/dd_config")" "1|" "TERM + daemon fora do ar: a fila de fato ficou pausada (a linha nao mente)"; lockgone "TERM com daemon fora do ar"
+else nope "TERM com daemon fora do ar: o guardado stub nao chegou a rodar"; fi
+# TERM no meio do guardado e despausa recusada (400): idem
+reset; setproc map-viewer 4 50; setproc ficha360 4 50; echo slow > "$SD/guarded.mode"
+if term_run guarded.started "echo patch400 > '$SD/dd_mode'"; then
+  expect 20 "fila do demand-dashboard NAO confirmada" "TERM + PATCH recusado (400): 20 e 'NAO confirmada'"; hasnt "$OUT" "conferida" "TERM + PATCH recusado: nao diz 'conferida'"
+else nope "TERM + PATCH recusado: o guardado stub nao chegou a rodar"; fi
+# TERM no meio do guardado com a fila OK: conferida de verdade
+reset; setproc map-viewer 4 50; setproc ficha360 4 50; echo slow > "$SD/guarded.mode"
+if term_run guarded.started ""; then
+  expect 20 "fila do demand-dashboard conferida" "TERM com a fila acessivel: a linha diz 'conferida'"; hasnt "$OUT" "NAO confirmada" "TERM com a fila acessivel: nao diz 'NAO confirmada'"; eq "$(cut -c1-2 < "$SD/dd_config")" "0|" "TERM com a fila acessivel: pausa nossa desfeita"
+else nope "TERM com a fila acessivel: o guardado stub nao chegou a rodar"; fi
+# TERM quando NAO ha pausa nossa em aberto (reiniciando o map-viewer): a linha nao fala da fila
+reset; setproc ficha360 4 50; hookfor map-viewer "touch '$SD/kick.started'; sleep 60"
+if term_run kick.started ""; then
+  expect 20 "interrompido (TERM)" "TERM sem pausa nossa em aberto: 20"; hasnt "$OUT" "fila" "TERM sem pausa nossa em aberto: a linha nao fala da fila"; eq "$(npatch)" 0 "TERM sem pausa nossa em aberto: nenhum PATCH"; lockgone "TERM sem pausa"
+else nope "TERM sem pausa nossa: o kickstart stub nao chegou a rodar"; fi
+# TERM no meio da despausa da sobra (daemon recusa o PATCH): o degrau tenta de novo na saida e a linha diz 'NAO confirmada'
+reset; printf '1|disk-recovery-d3: restart guardado ga-1p1i5jr.3' > "$SD/dd_config"; echo patch400 > "$SD/dd_mode"; printf '9000' > "$SD/free"
+( while ! grep -q PATCH-RECUSADO "$SD/calls" 2>/dev/null; do sleep 0.1; done; touch "$SD/sobra.tentou" ) & BG_PIDS="$BG_PIDS $!"
+if term_run sobra.tentou "" DR_D3_DESPAUSE_S=30; then
+  expect 20 "fila do demand-dashboard NAO confirmada" "TERM no meio da despausa da sobra: 20 e 'NAO confirmada'"; hasnt "$OUT" "conferida" "TERM no meio da despausa da sobra: nao diz 'conferida'"
+  [ "$(printf '%s\n' "$CALLS" | grep -c PATCH-RECUSADO)" -ge 1 ] && ok "TERM no meio da despausa da sobra: tentou despausar" || nope "TERM no meio da despausa da sobra: nenhuma tentativa"
+else nope "TERM no meio da despausa da sobra: o degrau nao chegou a tentar"; fi
+# sobra nossa NAO despausada no inicio e TERM depois, com o PATCH ainda recusado: a leitura de agora vale mais que a do inicio (uma frase so, sem "NAO despausada" + "NAO confirmada" juntas)
+reset; printf '1|disk-recovery-d3: restart guardado ga-1p1i5jr.3' > "$SD/dd_config"; echo patch400 > "$SD/dd_mode"; setproc ficha360 4 50; hookfor map-viewer "touch '$SD/kick.started'; sleep 60"
+if term_run kick.started ""; then
+  expect 20 "fila do demand-dashboard NAO confirmada" "sobra nao despausada + TERM: 20 e 'NAO confirmada'"; hasnt "$OUT" "NAO despausada" "sobra nao despausada + TERM: a frase do inicio sai da linha (vale a leitura de agora)"
+else nope "sobra nao despausada + TERM: o kickstart stub nao chegou a rodar"; fi
+# TERM no guardado DEPOIS de 3 reinicios (lista longa) com a fila inconfirmavel: o estado da fila vem antes da lista e sobrevive ao corte de 290
+reset; setproc demand-dashboard 4 101; setproc clientes-dashboard 4 120; echo slow > "$SD/guarded.mode"
+if term_run guarded.started "echo down > '$SD/dd_mode'"; then
+  expect 20 "fila do demand-dashboard NAO confirmada" "TERM depois de 3 reinicios + fila inconfirmavel: a linha longa mantem 'NAO confirmada'"; has "$OUT" "depois de: map-viewer pid" "TERM depois de 3 reinicios: a lista do que foi reiniciado ainda aparece"
+  has "$OUT" "ficha360 pid" "TERM depois de 3 reinicios: o 2o reiniciado esta na lista"
+else nope "TERM depois de 3 reinicios: o guardado stub nao chegou a rodar"; fi
 
 section "orçamento de tempo"
 reset; EXTRA_ENV="DR_D3_BUDGET_S=5"; run_d3; expect 10 "sem tempo para map-viewer" "orcamento menor que o pior caso: nao comeca"; eq "$(kicks)" "" "sem tempo: nada reiniciado"
