@@ -310,7 +310,8 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
   mutant "a sonda não é dry-run" '--dry-run --basis "$_basis" >/dev/null' '--basis "$_basis" >/dev/null'
   mutant "a rota desligada deixa passar" $'  case "${PILOT_WA_NODE_ROUTE:-}" in label|auto) ;; *) return 1 ;; esac\n  [ "${DRY_RUN:-0}" != "1" ]' $'  [ "${DRY_RUN:-0}" != "1" ]'
   mutant "o DRY_RUN deixa passar" $'label|auto) ;; *) return 1 ;; esac\n  [ "${DRY_RUN:-0}" != "1" ]' $'label|auto) ;; *) return 1 ;; esac\n  :'
-  mutant "a sonda vale com qualquer rc" '  [ "$_rc" = 0 ]' '  return 0'
+  # a âncora começa no \n de propósito (ga-4g5awmy): sem ele ela também casa com a linha de 4 espaços `[ "$_rc" = 0 ] || continue` do dog-lend, que contém os 2 espaços como substring, e o mutador reprova por "não casa exatamente 1 vez"
+  mutant "a sonda vale com qualquer rc" $'\n  [ "$_rc" = 0 ]' $'\n  return 0'
   mutant "o teto de sondas não vale" '  [ "$_PNW_PROBES" -lt "$_cap" ] || return 1' '  :'
   mutant "label sem node:ok gasta a sonda" '    printf '"'"'%s'"'"' "$_b" | jq -e '"'"'(.labels // []) | index("node:ok")'"'"' >/dev/null 2>&1 || return 1' '    :'
   mutant "bead com dono ou rota gasta a sonda" '  [ -z "$_own" ] || return 1' '  :'
