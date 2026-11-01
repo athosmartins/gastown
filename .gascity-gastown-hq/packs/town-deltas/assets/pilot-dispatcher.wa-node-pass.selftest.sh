@@ -15,7 +15,9 @@
 #   (6) a passada inteira: shadow só observa e grava; on tenta na ordem, para na capacidade (rc 12) e nos orçamentos (sondas, segundos, falhas, vagas do nó), memoriza o que o nó recusou, tira da pista o que ficou ·
 #   (7) as regiões VERBATIM de dispatch_one: o bloco do yield (alvo que não é wa-worker do store do WA solta) e o braço do pool (adota antes do gancho; rc 1 devolve a rota e solta; rc 2 não mexe; adotar que falha
 #   não chega ao gancho) · (8) o gancho exporta o rc do apply · (9) a ordem dos pontos de chamada · (6b, ga-2hd02v.3.16) o waiter P0/P1 da cessão: a pista dele é percorrida primeiro, ele sem veredito legível (unknown/timeout/erro, sondado ou memorizado) segura a P2+ com veredito node, e o resumo conta as P2+ que foram ao nó com um P0/P1 esperando · (6c, ga-2hd02v.3.16, gate 1) os TRÊS estados do waiter: "não se sabe se ele vai ao nó" (pré-filtro ilegível / recusa que não se lê, apply rc 11 ou que nem chegou ao apply, memória `released`) segura
-#   a P2+ — só o motivo DEFINITIVO (dono, veto, rota alheia, node:mini, recusa do pool, apply rc 10, memória mini) o solta.
+#   a P2+ — só o motivo DEFINITIVO (dono, veto, rota alheia, node:mini, recusa do pool, apply rc 10, memória mini) o solta ·
+#   (7z, ga-2hd02v.3.25) o conjunto _PWP_NODE_BOUND: o que a passada JULGOU node e NÃO despachou (retida pelo waiter, Dolt saturado, apply rc fora da tabela) é o único que o «Hetzner primeiro» segura do MBP;
+#   despachada, mini/unknown/released (apply rc 10/11/sem apply), não sondada (orçamento de segundos/sondas, limite de vagas) e rc 12 (nó cheio) NÃO constam, e o conjunto zera a cada passada.
 # COMO RODA: as funções e as regiões são extraídas VERBATIM do dispatcher (awk) e rodam em shells filhos sob `set -euo pipefail`, PATH de sandbox (selftest-sandbox-path.lib.sh: sem gc/bd reais), bd e
 #   wa-node-dispatch.sh falsos. Contra um dispatcher sem a fatia o arquivo se recusa a começar — o vermelho honesto.
 # CONTROLE NEGATIVO: cada guarda desligada numa cópia do dispatcher (WNP_NO_MUTANTS=1 pula) tem que reprovar este arquivo.
