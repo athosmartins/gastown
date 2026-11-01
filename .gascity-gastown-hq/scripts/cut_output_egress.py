@@ -60,7 +60,7 @@ _SECRET_RES = (
     # scheme://user:password@host -- a DSN / URL with credentials (bounded runs, linear)
     re.compile(r"\b[a-z][a-z0-9+.-]{1,20}://[^\s/:@]{1,64}:[^\s/@]{3,}@"),
     # command-line shapes the `name=value` rule above cannot see (gate review of ga-d0hm85.1, medium finding). All are linear;
-    # the flags that only mean something after a command word (curl -u, docker login -p, mysql -p) are _SEGMENT_RULES below.
+    # the flags that only mean something after a command word (curl -u, docker login -p, mysql -p) are _COMMAND_FLAG_RULES below.
     # `--password VALUE` / `--token VALUE` with a SPACE; `--token-file x` and `--password-stdin` have a '-' right after the name
     re.compile(r"(?i)(?<![\w-])--(?:password|passwd|secret|token|api[_-]?key|access[_-]?key)\s+[^\s-]\S{5,}"),
     # `Authorization: <scheme> <value>` for any scheme word (Basic, Token, Digest...); the Bearer rule above wants the value first
@@ -68,14 +68,17 @@ _SECRET_RES = (
     re.compile(r"hooks\.slack\.com/services/[A-Za-z0-9]{6,}/[A-Za-z0-9]{6,}/[A-Za-z0-9]{8,}"),  # a Slack webhook URL is the credential
 )
 # A flag that is a credential only because of the command it belongs to: (command word, flag). The flag is looked for ANYWHERE after
-# the FIRST command word within one command segment (a newline, '|', ';' or '&' ends a segment). A bounded gap between the two
-# (a lazy {0,200}) was the first cut and let `curl <a few headers> -u user:pass` through once the flag sat 200+ characters in, still
-# inside the logged prefix (security review of the gate-fix commit). Linear: each segment gets one search for the word and one for
-# the flag; neither pattern has an unbounded run in front of an anchor.
-_SEGMENT_RES = re.compile(r"[^\n|;&]+")
-_SEGMENT_RULES = (
-    (re.compile(r"(?i)\bcurl\b"), re.compile(r"(?i)\s(?:-u|--user)\s+[^\s:]{1,64}:\S{3,}")),  # curl -u user:pass
-    (re.compile(r"(?i)\b(?:docker|podman|nerdctl)\s+login\b"), re.compile(r"(?i)\s(?:-p|--password)\s+\S{3,}")),  # docker login -p PASS
+# the FIRST command word in the text. Two earlier cuts were wrong: a bounded gap between the two (a lazy {0,200}) let `curl <a few
+# headers> -u user:pass` through once the flag sat 200+ characters in, still inside the logged prefix; and splitting the text at
+# newline, '|', ';' and '&' broke on a separator INSIDE quotes (`-H 'Content-Type: a; charset=utf-8' -u user:pass`) and on a
+# backslash-continued multi-line curl -- both need a shell parser to get right (security reviews of the gate-fix commits). So there is
+# no gap bound and no segmentation: a flag far from its word, or past some separator, is withheld too. That can withhold a command
+# that did not carry a credential, which costs one fingerprint; a miss leaks one. Linear: one search for the word and one for the flag.
+_COMMAND_FLAG_RULES = (
+    # curl -u user:pass, -uuser:pass (attached), --user user:pass; `--user-agent` / `--upload-file` have a '-' after the name and are not it
+    (re.compile(r"(?i)\bcurl\b"), re.compile(r"(?i)\s(?:-u\s*|--user(?:\s+|=))[^\s:]{1,64}:\S{3,}")),
+    # docker login -p PASS, -pPASS (attached), --password PASS / --password=PASS; `--password-stdin` has a '-' after the name
+    (re.compile(r"(?i)\b(?:docker|podman|nerdctl)\s+login\b"), re.compile(r"(?i)\s(?:-p\s*|--password(?:\s+|=))\S{3,}")),
     # mysql -pPASS (no space: with a bare `-p` mysql prompts). `-P` is the PORT, so only the command word is case-insensitive.
     (re.compile(r"(?i:\bmysql(?:dump|admin|pump)?)\b"), re.compile(r"\s-p\S{3,}")),
 )
@@ -149,18 +152,14 @@ def _has_email(text: str) -> bool:
     return text.find("@", pos) >= 0  # do not send in that case
 
 
-def _has_segment_flag_secret(text: str) -> bool:
-    """True when one command segment holds a credential flag that belongs to its command (_SEGMENT_RULES): `curl ... -u user:pass`,
-    `docker login ... -p PASS`, `mysql ... -pPASS`. Each segment is walked once, so it is linear however far the flag sits from
-    the command word."""
-    for seg in _SEGMENT_RES.finditer(text):
-        s = seg.group(0)
-        if len(s) < 6:
-            continue  # shorter than the shortest command word plus a flag: nothing to find
-        for word_rx, flag_rx in _SEGMENT_RULES:
-            w = word_rx.search(s)
-            if w and flag_rx.search(s, w.end()):
-                return True
+def _has_command_flag_secret(text: str) -> bool:
+    """True when `text` holds a credential flag that belongs to a command word that comes BEFORE it (_COMMAND_FLAG_RULES):
+    `curl ... -u user:pass`, `docker login ... -p PASS`, `mysql ... -pPASS`. Two searches per rule over the whole text, so it is
+    linear however far the flag sits from the command word."""
+    for word_rx, flag_rx in _COMMAND_FLAG_RULES:
+        w = word_rx.search(text)
+        if w and flag_rx.search(text, w.end()):
+            return True
     return False
 
 
@@ -168,9 +167,9 @@ def egress_withhold_reason(text: str) -> str | None:
     """"secret" | "pii" | None. None is the only answer that lets text leave the machine; it means "none of the known
     shapes matched", NOT "this is safe". Never raises."""
     try:
-        # vazio (nenhum segmento tem palavra de comando + flag) → essa regra não casa, as outras seguem; falhou/ilegível (o scan
-        # levantou) → o except abaixo devolve "secret" e retém.
-        if any(rx.search(text) for rx in _SECRET_RES) or _has_segment_flag_secret(text) or _has_token_like_run(text):
+        # vazio (nenhuma palavra de comando seguida de flag de credencial) → essa regra não casa, as outras seguem; falhou/ilegível
+        # (o scan levantou) → o except abaixo devolve "secret" e retém.
+        if any(rx.search(text) for rx in _SECRET_RES) or _has_command_flag_secret(text) or _has_token_like_run(text):
             return "secret"
         if any(rx.search(text) for rx in _PII_RES) or _has_email(text):
             return "pii"
@@ -369,7 +368,7 @@ def _selftest() -> int:
         ok(f"egress guard (mainstream shapes the first cut missed): {label} -> secret", egress_withhold_reason(sample) == "secret")
     # ---- security review of the gate-fix commit: the curl / docker login / mysql rules looked for the flag at most 200 characters past
     # the command word, so `curl <a few headers> -u user:pass` (flag at 200..300, INSIDE the logged prefix) passed. The flag is now
-    # looked for anywhere after the command word within the same command segment (a newline, '|', ';' or '&' ends the segment).
+    # looked for at any distance after the first command word (see the no-segmentation cases below for why not "per segment").
     far_flag = {
         "curl -u": ("curl https://api.example.invalid/x", " -u admin:s3cretpw"),
         "docker login -p": ("docker login registry.example.invalid", " -u me -p s3cretpw"),
@@ -380,13 +379,34 @@ def _selftest() -> int:
             sample = cmd_word + " --opt" * (gap // 6) + flag
             ok(f"far flag: {label}, flag ~{gap} characters after the command word -> secret, and the command is withheld",
                egress_withhold_reason(sample) == "secret" and loggable_command(sample) == COMMAND_WITHHELD)
-    ok("far flag: the flag must be in the command's own segment -- before the command word, or past a ';' '|' newline, it is not that command's flag",
+    # second security review: splitting the text into "segments" at ';' '|' '&' newline is wrong without a shell parser. A separator
+    # INSIDE quotes (a Content-Type header with `; charset=`) or a backslash-continued multi-line curl put the word and its flag in
+    # different segments. So there is no segmentation: the flag is looked for anywhere after the first command word, and a flag
+    # that merely sits past some separator is withheld too (a false positive costs one command; a false negative leaks a credential).
+    for label, sample in {
+        "separator inside quotes": "curl -H 'Content-Type: application/json; charset=utf-8' -u admin:s3cretpw https://x",
+        "pipe inside double quotes": 'curl -H "X-Filter: a|b" -u admin:s3cretpw https://x',
+        "ampersand inside a URL": "curl 'https://x/?a=1&b=2' -u admin:s3cretpw",
+        "backslash-continued multi-line": "curl -X POST \\\n  -H 'A: b' \\\n  -u admin:s3cretpw \\\n  https://x",
+        "attached -u (no space)": "curl -uadmin:s3cretpw https://x",
+        "docker login attached -p": "docker login -u me -ps3cretpw registry.example.invalid",
+        "docker login --password=VALUE": "docker login -u me --password=s3cretpw registry.example.invalid",
+        "mysql after a separator": "cd /srv; mysql -h db -u root -ps3cretpw app",
+        "flag past a separator is still withheld (no segmentation)": "curl https://x ; ls -u admin:s3cretpw",
+        "the first command word counts (a second one after the flag does not hide it)": "curl -u admin:s3cretpw https://x ; curl https://y",
+    }.items():
+        ok(f"no segmentation: {label} -> secret, and the command is withheld",
+           egress_withhold_reason(sample) == "secret" and loggable_command(sample) == COMMAND_WITHHELD)
+    ok("no segmentation: a flag BEFORE the first command word, or a similar-looking flag, is not a credential flag",
        all(egress_withhold_reason(s) is None for s in (
            "ls -u admin:s3cretpw ; curl https://x",
-           "curl https://x ; ls -u admin:s3cretpw",
-           "curl https://x | grep -u admin:s3cretpw",
            "echo -u admin:s3cretpw curl",
-           "mysql -h db\nls -ps3cretpw")))
+           "curl --upload-file notes.txt https://x",
+           "curl --user-agent mytool/1.0 https://x",
+           "curl --user-agent=Mozilla:5.0 https://x",
+           "curl -sS -o out.txt https://x",
+           "docker login --pull-timeout 5 registry.example.invalid",
+           "mysql -h db -u root -p app")))
     for label, sample in {
         "git push -u": "git push -u origin main",
         "docker run -u uid:gid": "docker run -u app server",
