@@ -11625,11 +11625,30 @@ def _selftest():
 
     print("\nScenario (ga-4mxaa8-i): REAL _read_disk_state() (seam OFF, real bash + the checked-out lib, the lib's "
           "DISK_FREE_OVERRIDE_MB) — low / ok / floor from the environment / kill switch / unreadable reading / lib "
-          "missing / lib answering garbage / bash that cannot run; every non-clean answer is None, never ok and never low")
+          "missing / fake libs wrong in one place each / bash that cannot run; every non-clean answer is None, never ok and never low")
     _dki_dir = tempfile.mkdtemp(prefix="arc-selftest-disk-")
-    _dki_fake = os.path.join(_dki_dir, "garbage-lib.sh")
-    with open(_dki_fake, "w") as _f:
-        _f.write("disk_free_mb() { printf '4000'; }\ndisk_state_of() { printf 'banana'; }\n")
+    # Fake libs, one per row, each wrong in exactly ONE place and clean in the rest, so each case reaches the guard of
+    # _read_disk_state() it is named for and not an earlier one (a reading is "<state> <free> <floor>": 3 words, rc 0).
+    # The real lib cannot reach the last guards (it answers "unknown" for a reading that is not a number or over 9
+    # digits, and replaces a bad floor with 5120), so those need fakes. A mutant that deletes the guard turns this red.
+    _dki_rows = (   # name, state word, free MB, floor MB (None = the lib never sets it), bash exit status
+        ("state",    "banana", "4000",       "5120",       0),   # parts[0] is not ok/low
+        ("toomany",  "ok 7",   "4000",       "5120",       0),   # 4 words, each of them a clean one
+        ("nofloor",  "ok",     "4000",       None,         0),   # 2 words: the floor was never printed
+        ("freenan",  "ok",     "4000MB",     "5120",       0),   # free MB is not a number
+        ("floornan", "ok",     "4000",       "abc",        0),   # floor MB is not a number
+        ("freebig",  "ok",     "1234567890", "5120",       0),   # free MB over 9 digits
+        ("floorbig", "ok",     "4000",       "1234567890", 0),   # floor MB over 9 digits
+        ("badrc",    "ok",     "4000",       "5120",       5),   # a clean 3-word answer, but bash exits non-zero
+    )
+    _dki_libs = {}
+    for _dki_n, _dki_st, _dki_fr, _dki_fl, _dki_rc in _dki_rows:
+        _dki_libs[_dki_n] = os.path.join(_dki_dir, _dki_n + "-lib.sh")
+        with open(_dki_libs[_dki_n], "w") as _f:
+            _f.write("disk_free_mb() { printf '%s' '" + _dki_fr + "'; }\n"
+                     "disk_state_of() { printf '%s' '" + _dki_st + "'; }\n"
+                     + ("DISK_NEW_WORK_MIN_MB=" + _dki_fl + "\n" if _dki_fl is not None else "")
+                     + ("trap 'exit " + str(_dki_rc) + "' EXIT\n" if _dki_rc else ""))
     _dki_env_keys = ("DISK_FREE_OVERRIDE_MB", "DISK_NEW_WORK_MIN_MB", "DISK_HEADROOM_ENABLED")
     _dki_env = {k: os.environ.pop(k, None) for k in _dki_env_keys}
     _dki_saved = (DISK_LIB, _sh, _read_disk_state_file)
@@ -11641,7 +11660,10 @@ def _selftest():
         if free is not None:
             os.environ["DISK_FREE_OVERRIDE_MB"] = free
         os.environ.update(env)
-        return _read_disk_state()
+        try:
+            return _read_disk_state()
+        except Exception as e:   # a guard that is gone lets the function raise: a red result, not a selftest crash
+            return ("RAISED", repr(e))
 
     try:
         globals()["DISK_LIB"] = _dkh_lib
@@ -11652,12 +11674,16 @@ def _selftest():
         _dki["edge"] = _dki_read("5120")          # exactly the floor is NOT under it (the lib's -lt)
         _dki["env_floor"] = _dki_read("3000", DISK_NEW_WORK_MIN_MB="2000")
         _dki["killed"] = _dki_read("3000", DISK_HEADROOM_ENABLED="0")
+        # the real lib answers both with "unknown" and no number (2 words): the word-count OR the state-word guard of
+        # _read_disk_state() stops them, and neither one alone is pinned by them; the digit-count guard is never
+        # reached with the real lib — only the fake libs below pin each of those guards
         _dki["bad_reading"] = _dki_read("abc")
         _dki["huge"] = _dki_read("99999999999")
         globals()["DISK_LIB"] = os.path.join(_dki_dir, "no-such-lib.sh")
         _dki["nolib"] = _dki_read("3000")
-        globals()["DISK_LIB"] = _dki_fake
-        _dki["garbage"] = _dki_read("3000")
+        for _dki_n, _dki_p in _dki_libs.items():
+            globals()["DISK_LIB"] = _dki_p
+            _dki[_dki_n] = _dki_read("3000")
         globals()["DISK_LIB"] = _dkh_lib
         _sh = lambda *a, **kw: None     # what _sh answers when bash cannot run or times out
         _dki["shnone"] = _dki_read("3000")
@@ -11667,16 +11693,20 @@ def _selftest():
             os.environ.pop(k, None)
             if _dki_env[k] is not None:
                 os.environ[k] = _dki_env[k]
-        os.remove(_dki_fake)
+        for _dki_p in _dki_libs.values():
+            os.remove(_dki_p)
         os.rmdir(_dki_dir)
     if (_dki.get("low") == {"state": "low", "free_mb": 3000, "floor_mb": 5120}
             and _dki.get("ok") == {"state": "ok", "free_mb": 9000, "floor_mb": 5120}
             and _dki.get("edge") == {"state": "ok", "free_mb": 5120, "floor_mb": 5120}
             and _dki.get("env_floor") == {"state": "ok", "free_mb": 3000, "floor_mb": 2000}
             and _dki.get("killed") == {"state": "ok", "free_mb": 3000, "floor_mb": 5120}
-            and all(_dki.get(k, "unset") is None for k in ("bad_reading", "huge", "nolib", "garbage", "shnone"))):
+            and all(_dki.get(k, "unset") is None
+                    for k in ("bad_reading", "huge", "nolib", "shnone") + tuple(_dki_libs))):
         _ok("(ga-4mxaa8-i): 3000→low, 9000→ok, exactly the floor→ok, floor from the environment honoured, kill switch "
-            "→ok; unreadable / over-long reading, lib missing, lib answering 'banana' and bash that cannot run → None")
+            "→ok; unreadable / over-long reading, lib missing and bash that cannot run → None; a lib wrong in ONE place "
+            "(state word, 4 words, 2 words, free or floor not a number / over 9 digits, bash exit status) → None, each "
+            "through its own guard")
     else:
         _bad("(ga-4mxaa8-i)", "results=%r" % (_dki,))
 
