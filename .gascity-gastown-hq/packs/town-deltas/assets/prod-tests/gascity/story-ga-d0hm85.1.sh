@@ -7,7 +7,8 @@
 #      large-output hook call of every pool session, silently, as a lost measurement);
 #   2. the guard's own hermetic selftest passes on the deployed copy;
 #   3. the REAL hook wrapper, given a large output and a command line that carries a credential, writes ONE row whose `command`
-#      is the placeholder and whose text contains no trace of the credential, and prints {}.
+#      is the placeholder and whose text contains no trace of the credential, and prints {};
+#   4. the same when the credential STARTS inside the logged 300 characters and ENDS after them (the command is judged before it is cut).
 #
 # Called by run.sh after deploy (STORY_ID=ga-d0hm85.1). Exits 0 on pass. Never touches the network or the live log.
 
@@ -54,6 +55,29 @@ assert r["experiment"] == "cut-output-fixed" and r["mode"] == "cut-output", r
 assert r["command"].startswith("[command withheld"), r["command"]
 PYEOF
 log "deployed hook: one row, command withheld, credential nowhere in it, {} on stdout ✓"
+
+# 4. gate fix 1: a credential that STARTS inside the logged 300 characters and ENDS after them (a DSN: the '@' that closes the
+#    password is past the cut) must not leave its first part in the row either -- the command is judged before it is cut.
+DSN_PW='Zk3Jq9XvB2nM'
+PAYLOAD2="$(python3 - "$BIG" "$DSN_PW" <<'PYEOF'
+import json, sys
+cmd = "x" * 270 + " psql postgres://app:" + sys.argv[2] + "@db.internal:5432/app"
+print(json.dumps({"tool_name": "Bash", "tool_response": {"stdout": sys.argv[1], "stderr": ""}, "tool_use_id": "prodtest-ga-d0hm85.1-straddle",
+                  "session_id": "prodtest", "transcript_path": "/tmp/prodtest.jsonl", "tool_input": {"command": cmd}}))
+PYEOF
+)"
+OUT2="$(printf '%s' "$PAYLOAD2" | env JEV_EXPERIMENT_LOG="$TMP/hook2.jsonl" CUT_OUTPUT_SHADOW_DISABLED="$TMP/never-hook-disabled" \
+        bash "$SCRIPTS/cut-output-shadow.sh" 2>"$TMP/hook2.err")"
+[ "$OUT2" = "{}" ] || fail "the deployed wrapper printed [$OUT2] for the straddling command, expected {} (stderr: $(head -c 300 "$TMP/hook2.err"))"
+[ -f "$TMP/hook2.jsonl" ] && [ "$(wc -l < "$TMP/hook2.jsonl" | tr -d ' ')" = "1" ] || fail "expected exactly ONE row for the straddling command, got: $(head -c 400 "$TMP/hook2.jsonl" 2>/dev/null)"
+# the first characters of the password are inside the logged prefix, so grep for a short fragment of it, not just the whole value
+grep -q "Zk3Jq9" "$TMP/hook2.jsonl" && fail "the first part of a credential that straddles the logged prefix is AT REST in the shadow log row"
+python3 - "$(cat "$TMP/hook2.jsonl")" <<'PYEOF' || fail "the straddling command's row is not the withheld placeholder: $(head -c 300 "$TMP/hook2.jsonl")"
+import json, sys
+r = json.loads(sys.argv[1])
+assert r["command"].startswith("[command withheld"), r["command"]
+PYEOF
+log "deployed hook: a credential straddling the logged prefix is withheld whole ✓"
 
 log "PASS"
 exit 0

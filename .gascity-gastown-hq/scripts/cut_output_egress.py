@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""cut_output_egress.py (ga-d0hm85, slice 1/3) -- the egress guard of the cut-large-output SHADOW front.
+"""cut_output_egress.py (ga-d0hm85, slice 1/4) -- the egress guard of the cut-large-output SHADOW front.
 
 ## Contents
   What it is · Why it exists · Limits · CLI
 
 WHAT IT IS. Pure functions that decide whether a piece of command output (or a command line) LOOKS like a credential or
-personal data, so that it is neither sent to a third party (the Jev tier, cut_output_jev.py) nor left at rest in the shared
-jev-experiment.jsonl. egress_withhold_reason() answers "secret" | "pii" | None for one block of text; sensitive_spans()
+personal data, so that it is neither sent to a third party (the Jev tier, built in the later slices of ga-d0hm85) nor left at
+rest in the shared jev-experiment.jsonl. egress_withhold_reason() answers "secret" | "pii" | None for one block of text; sensitive_spans()
 finds MULTI-LINE secrets over the WHOLE output (a PEM key BEGIN..END, a truncated one, a `kind: Secret` manifest) so a key
 split across two blocks cannot look harmless in each half; ends_on_secret_key() says a block ends on a bare `password:` whose
-value starts the next one; loggable_command() is the command as it may be logged or sent.
+value starts the next one (both are for the Jev planner of the later slices -- in this slice only the selftest calls them);
+loggable_command() is the command as it may be logged or sent, and the only function of this module the shadow engine calls today.
 
 WHY IT EXISTS. Phase 1 logged `command[:300]` raw, so a token typed into a command line sat in a log several daily reports read.
 The Jev tier would also put block text in front of Cloudflare Workers AI -- outward-facing and not undoable. Two automated
@@ -18,7 +19,8 @@ after a long benign prefix, a cap that failed OPEN); every one is a test below.
 
 LIMITS. A best-effort filter, not a proof: a name or a street address in plain prose is not detected, and an unusual secret
 format passes. None means "none of the known shapes matched", NOT "safe". Every bound fails toward WITHHOLDING (more '@' signs, more
-long runs, more markers than the scan will inspect -> do not send). Every pattern is linear on hostile input.
+long runs, more markers than the scan will inspect, a command word that runs past the judged window -> do not send). Every
+pattern is linear on hostile input.
 
 CLI:
   python3 cut_output_egress.py selftest     pure, no network, no files
@@ -30,6 +32,9 @@ import sys
 import time
 
 COMMAND_LOG_CHARS = 300  # the command we log (and send) is a fingerprint, not a full replay
+# The command is JUDGED over this many characters but LOGGED over COMMAND_LOG_CHARS: a credential that starts inside the logged
+# prefix and ends after it must be seen whole (the gate caught loggable_command judging the already-cut prefix -- ga-d0hm85.1).
+COMMAND_JUDGE_CHARS = 4096
 COMMAND_WITHHELD = "[command withheld: it looks like it carries a credential or personal data]"
 
 
@@ -54,6 +59,17 @@ _SECRET_RES = (
     re.compile(r"(?i)\b(?:set-)?cookie\b['\"]?\s*[:=]\s*\S{8,}"),
     # scheme://user:password@host -- a DSN / URL with credentials (bounded runs, linear)
     re.compile(r"\b[a-z][a-z0-9+.-]{1,20}://[^\s/:@]{1,64}:[^\s/@]{3,}@"),
+    # command-line shapes the `name=value` rule above cannot see (gate review of ga-d0hm85.1, medium finding). All are linear;
+    # the three that look for a flag AFTER a command word (curl, docker login, mysql) look at most 200 characters past it.
+    # `--password VALUE` / `--token VALUE` with a SPACE; `--token-file x` and `--password-stdin` have a '-' right after the name
+    re.compile(r"(?i)(?<![\w-])--(?:password|passwd|secret|token|api[_-]?key|access[_-]?key)\s+[^\s-]\S{5,}"),
+    # `Authorization: <scheme> <value>` for any scheme word (Basic, Token, Digest...); the Bearer rule above wants the value first
+    re.compile(r"(?i)\bauthorization\b['\"]?\s*[:=]\s*[A-Za-z][A-Za-z0-9_-]{0,20}\s+[A-Za-z0-9._~+/=-]{8,}"),
+    re.compile(r"hooks\.slack\.com/services/[A-Za-z0-9]{6,}/[A-Za-z0-9]{6,}/[A-Za-z0-9]{8,}"),  # a Slack webhook URL is the credential
+    re.compile(r"(?i)\bcurl\b[^\n|;&]{0,200}?\s(?:-u|--user)\s+[^\s:]{1,64}:\S{3,}"),  # curl -u user:pass
+    re.compile(r"(?i)\b(?:docker|podman|nerdctl)\s+login\b[^\n|;&]{0,200}?\s(?:-p|--password)\s+\S{3,}"),  # docker login -p PASS
+    # mysql -pPASS (no space: with a bare `-p` mysql prompts). `-P` is the PORT, so only the command word is case-insensitive.
+    re.compile(r"(?i:\bmysql(?:dump|admin|pump)?)\b[^\n|;&]{0,200}?\s-p\S{3,}"),
 )
 # A secret that ENDS a block ("password:" and the value on the next line, which is the next block): the block that follows
 # is withheld too.
@@ -121,7 +137,8 @@ def _has_email(text: str) -> bool:
         if local.startswith(("noreply", "no-reply")) or domain.endswith("noreply.github.com"):
             continue  # the sender addresses git and GitHub put in every commit trailer
         return True
-    return True  # more '@' signs than we are willing to inspect: do not send
+    # inspected _EMAIL_MAX_AT '@' signs and none was an address: only a 201st '@' is "more than we are willing to inspect"
+    return text.find("@", pos) >= 0  # do not send in that case
 
 
 def egress_withhold_reason(text: str) -> str | None:
@@ -141,7 +158,7 @@ def sensitive_spans(text: str) -> list[tuple[int, int]]:
     """Character spans of `text` that hold a MULTI-LINE secret, found over the WHOLE output so that a key split across two
     blocks cannot pass by looking harmless in each half: a PEM block from its BEGIN line to the matching END line (to the end
     of the text when the END is missing, i.e. the output was truncated mid-key), and a Kubernetes `kind: Secret` manifest
-    to the end of its YAML document. Any block that overlaps a span is withheld by plan_send(). More markers than
+    to the end of its YAML document. The caller (the Jev planner, a later slice) must withhold any block that overlaps a span. More markers than
     _MAX_SPAN_MARKERS -> the whole output is one span (do not send). Never raises."""
     spans: list[tuple[int, int]] = []
     try:
@@ -166,16 +183,41 @@ def ends_on_secret_key(tail: str) -> bool:
     return bool(_ENDS_WITH_KEY_RE.search(tail.rstrip()))
 
 
+def _word_open_at_window_end(command: str) -> bool:
+    """True when the judged window (COMMAND_JUDGE_CHARS) cuts a word in two AND that word starts inside the logged prefix: the
+    rest of it is unjudged, and a shape with no bounded length (a DSN password up to its '@', a long token run) may be completed
+    by it. That is the third state -- "cannot tell" -- and it is answered like a match. A command that fits the window, one the
+    window ends between words of, and a cut word that starts past the logged prefix (so none of it is logged) are all fine."""
+    if len(command) <= COMMAND_JUDGE_CHARS:
+        return False
+    if command[COMMAND_JUDGE_CHARS - 1].isspace() or command[COMMAND_JUDGE_CHARS].isspace():
+        return False
+    start = COMMAND_JUDGE_CHARS
+    while start > 0 and not command[start - 1].isspace():
+        start -= 1
+    return start < COMMAND_LOG_CHARS
+
+
 def loggable_command(command: object) -> str:
-    """The command as it may be written to the shared jev-experiment.jsonl and shown to Jev: a fingerprint (first
-    COMMAND_LOG_CHARS characters), or COMMAND_WITHHELD when those characters look like a credential or personal data.
+    """The command as it may be written to the shared jev-experiment.jsonl (and, in the later Jev slices, shown to Jev): a
+    fingerprint (first COMMAND_LOG_CHARS characters), or COMMAND_WITHHELD when the command looks like it carries a credential
+    or personal data. The command is JUDGED over COMMAND_JUDGE_CHARS, well past what is logged, because a secret that starts
+    inside the logged prefix and ends after it is incomplete in the prefix and passes every rule that needs a minimum length or
+    a closing anchor; ANY match in the window withholds, wherever it sits. A word that runs from the logged prefix past the
+    window is withheld too (_word_open_at_window_end). The head is judged on its own as well: a shape can stop matching when
+    more characters follow it, and that must not turn a withheld prefix into a logged one.
     Not a string (null, a number, a list) -> "": the command is only a fingerprint, not knowing it costs nothing.
-    The fixed-rule row and the Jev row both use this, so a token typed into a command line is not left at rest in a log
-    several daily reports read. Never raises."""
+    The fixed-rule row uses this, so a token typed into a command line is not left at rest in a log several daily reports
+    read. Never raises."""
     if not isinstance(command, str):
         return ""
     head = command[:COMMAND_LOG_CHARS]
-    return COMMAND_WITHHELD if egress_withhold_reason(head) else head
+    window = command[:COMMAND_JUDGE_CHARS]
+    # vazio (nada reconhecido no head nem na janela) → o head é logado; falhou/ilegível (o guard não conseguiu ler) →
+    # egress_withhold_reason já devolve "secret" e retém; janela que corta uma palavra aberta a partir do head ("não sei") → retém.
+    if egress_withhold_reason(head) or egress_withhold_reason(window) or _word_open_at_window_end(command):
+        return COMMAND_WITHHELD
+    return head
 
 
 
@@ -247,10 +289,69 @@ def _selftest() -> int:
         ok(f"egress guard: {label} is NOT withheld", egress_withhold_reason(sample) is None)
     ok("loggable_command: a plain command is kept (first COMMAND_LOG_CHARS characters)", loggable_command("ls -la " + "x" * 400) == ("ls -la " + "x" * 400)[:COMMAND_LOG_CHARS])
     ok("loggable_command: a command with a bearer token is replaced by the placeholder", loggable_command("curl -H 'Authorization: Bearer abcdef0123456789'") == COMMAND_WITHHELD)
-    past = loggable_command("x" * 310 + "password=hunter2hunter2")
-    ok("loggable_command: a credential PAST the logged prefix is cut off with it -- not logged, not sent, and the prefix is not mistaken for one",
-       "hunter2" not in past and past == "x" * COMMAND_LOG_CHARS)
+    past = loggable_command("x" * 310 + " password=hunter2hunter2")
+    ok("loggable_command: a credential just PAST the logged prefix, inside the judged window, withholds the command (gate fix 1: the command is judged BEFORE it is cut)",
+       past == COMMAND_WITHHELD)
     ok("loggable_command: not a string -> empty, never a raise", all(loggable_command(v) == "" for v in (None, 123, ["ls"], b"x")))
+
+    # ---- gate feedback attempt 1 (ga-d0hm85.1), blocking issue 1: a credential that STARTS inside the logged prefix and ENDS after
+    # it was judged on its cut-off prefix (every shape that needs a minimum length or a closing anchor saw an incomplete secret) and
+    # the prefix was logged. The THIRD state -- "the cut-off tail may complete a secret" -- must not be handled as "no secret".
+    straddle_shapes = {
+        "dsn password (the '@' is past the cut)": "psql postgres://app:Zk3Jq9XvB2nM@db.internal:5432/app",
+        "ghp_ token": "ghp_" + "a1" * 20,
+        "generic mixed-case token": "id: " + "Zk3Jq9XvB2nM7LpA4sD8fG1hT6yU0wRe" * 2,
+        "sk- key": "key sk-" + "a1b2c3d4e5" * 5,
+        "bearer token": "curl -H 'Authorization: Bearer " + "abcdef0123" * 4 + "'",
+        "password= value": "export DB_PASSWORD=hunter2hunter2",
+        "slack token": "notify xoxb-" + "1234567890-" * 4 + "abc",
+    }
+    for label, shape in straddle_shapes.items():
+        # k = how many characters of the secret land inside the logged prefix: 0 (all past the cut) .. len(shape) (all inside)
+        leaks = [k for k in range(len(shape) + 1)
+                 if loggable_command("x" * (COMMAND_LOG_CHARS - k - 1) + " " + shape + " tail") != COMMAND_WITHHELD]
+        ok(f"straddle: {label} is judged uncut as a secret AND the command is withheld at every cut offset 0..{len(shape)}",
+           egress_withhold_reason(shape) is not None and not leaks)
+        if leaks:
+            print(f"       offsets whose logged prefix leaks part of the secret: {leaks}")
+    far = "ls " + "word " * 1000 + "password=hunter2hunter2"  # the credential sits past the judged window: not logged, not judged
+    ok("loggable_command: a credential far past the judged window is neither judged nor logged -- the head is kept (the window is a bound, not 'withhold every long command')",
+       len(far) > COMMAND_JUDGE_CHARS and loggable_command(far) == far[:COMMAND_LOG_CHARS] and "hunter2" not in loggable_command(far))
+    open_dsn = "psql postgres://app:" + "q" * (COMMAND_JUDGE_CHARS + 900) + "@db/app"
+    ok("loggable_command: a word that starts INSIDE the logged prefix and runs past the judged window (its closing '@' is unjudged) is withheld -- unknown is not 'no secret'",
+       loggable_command(open_dsn) == COMMAND_WITHHELD)
+    late_word = "echo " + "a " * 200 + "z" * (COMMAND_JUDGE_CHARS + 50)  # the cut word starts at index 405: none of it is logged
+    ok("loggable_command: ... but a long command whose window ends between words, or inside a word that started past the logged prefix, keeps its head",
+       loggable_command("ls " + "word " * 1000) == ("ls " + "word " * 1000)[:COMMAND_LOG_CHARS]
+       and loggable_command(late_word) == late_word[:COMMAND_LOG_CHARS])
+    # the cut can also END a shape that the longer text no longer matches: AKIA + 16 upper-case chars followed by MORE word characters
+    # is not a key id (the \b fails), but the head ends right after the 16th. The head is judged too, so this stays withheld.
+    akia = "x" * (COMMAND_LOG_CHARS - 21) + " AKIA" + "B" * 30
+    ok("loggable_command: the head is judged as well as the window (a shape the longer text stops matching still withholds)",
+       egress_withhold_reason(akia) is None and loggable_command(akia) == COMMAND_WITHHELD)
+    ok("e-mail scan boundary: exactly _EMAIL_MAX_AT non-address '@' signs are all inspected and pass; one more is withheld",
+       egress_withhold_reason(" @x" * 200) is None and egress_withhold_reason(" @x" * 201) == "pii")
+    for label, sample in {
+        "long flag with a space separator: --password VALUE": "mytool --password Hunter2Hunter2 --host db",
+        "long flag with a space separator: --token VALUE": "deploy --token abcdef0123456789 now",
+        "Authorization: Basic <base64>": "curl -H 'Authorization: Basic dXNlcjpwYXNzd29yZA==' https://x",
+        "Authorization: Token <value>": "curl -H 'Authorization: Token abcdef0123456789' https://x",
+        "Slack webhook URL": "curl -X POST https://hooks.slack.com/" + "services/T01234567/B01234567/" + "abcdefghijklmnopqrstuvwx",
+        "curl -u user:pass": "curl -u admin:s3cretpw https://api.example.invalid/x",
+        "docker login -p PASS": "docker login -u me -p s3cretpw registry.example.invalid",
+        "mysql -pPASS": "mysql -h db -u root -ps3cretpw app",
+    }.items():
+        ok(f"egress guard (mainstream shapes the first cut missed): {label} -> secret", egress_withhold_reason(sample) == "secret")
+    for label, sample in {
+        "git push -u": "git push -u origin main",
+        "docker run -u uid:gid": "docker run -u app server",
+        "mysql with a bare -p (prompts)": "mysql -h db -u root -p app",
+        "mysql -P is the PORT, not a password": "mysql -h db -P3306 -u root app",
+        "--token-file path": "tool --token-file /etc/tool/token.txt",
+        "--password-stdin": "docker login --password-stdin < pw.txt",
+        "authorization in prose": "authorization: ok",
+    }.items():
+        ok(f"egress guard: {label} is NOT withheld", egress_withhold_reason(sample) is None)
     ok("a long mixed-case run is still caught after the rewrite (and a hex-only run of the same length is not)",
        egress_withhold_reason("k=" + "aB3" * 20) == "secret" and egress_withhold_reason("sha " + "ab12" * 16) is None)
     ok("review finding 3: a secret that FOLLOWS a long benign prefix in the same run is caught (the 128-char window missed it)",
@@ -286,7 +387,8 @@ def _selftest() -> int:
     ok("ends_on_secret_key: a key WITH its value, or ordinary text, does not", not ends_on_secret_key("password: hunter2hunter2") and not ends_on_secret_key("nothing here\n"))
 
     t_lin = time.time()
-    for hostile in ("A1" * 60000, ("a-" * 30000) + "Z9", "-----BEGIN X-----" * 400, "kind: Secret\n" * 400, "token:" * 20000, ("Ab1" * 40 + " ") * 5000):
+    for hostile in ("A1" * 60000, ("a-" * 30000) + "Z9", "-----BEGIN X-----" * 400, "kind: Secret\n" * 400, "token:" * 20000, ("Ab1" * 40 + " ") * 5000,
+                    "curl " * 20000, "docker login " * 8000, "mysql " * 16000, "--token " * 12000, "Authorization:" * 8000):
         sensitive_spans(hostile)
         egress_withhold_reason(hostile[:10000])
     ok("the guard and the span scan stay linear on hostile 100k+ character inputs (production-shaped; bound generous, not tight, so load 60 cannot flake it)",

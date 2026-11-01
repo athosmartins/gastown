@@ -337,6 +337,10 @@ def _selftest_suite() -> int:
         cred_rec = build_fixed_log_record(verdict, {"tool_use_id": "tu-cred", "command": "curl -H 'Authorization: Bearer abcdef0123456789'"})
         ok("fixed record: a credential typed into the command line is NOT left at rest in the log row",
            cred_rec["command"] == cegress.COMMAND_WITHHELD and "abcdef0123456789" not in json.dumps(cred_rec))
+        straddle_cmd = "x" * (cegress.COMMAND_LOG_CHARS - 30) + " psql postgres://app:Zk3Jq9XvB2nM@db.internal:5432/app"  # gate fix, ga-d0hm85.1: the DSN password starts INSIDE the logged 300 and its '@' is past it
+        straddle_rec = build_fixed_log_record(verdict, {"tool_use_id": "tu-straddle", "command": straddle_cmd})
+        ok("fixed record: a credential that STARTS inside the logged prefix and ENDS after it is not left at rest in the log row either",
+           straddle_rec["command"] == cegress.COMMAND_WITHHELD and "Zk3Jq9" not in json.dumps(straddle_rec))
         ok("fixed record: a command that is not a string is logged as empty, never raises",
            build_fixed_log_record(verdict, {"tool_use_id": "tu-odd", "command": ["ls"]})["command"] == "")
 
