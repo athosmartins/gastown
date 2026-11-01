@@ -4,7 +4,8 @@
 # Runs nudge-pollers-prune.py against SANDBOX directories (never the live .gc/nudges), with a canned `ps`.
 # No gc, no city, no network. Exit 0 iff every assertion holds. NPP_PRUNE_UNDER_TEST points the run at a
 # mutated copy (mutation checks): every guard below must have a case that dies with its mutant.
-# Mac-only on purpose: BSD `date -v` / `mktemp -t` (the order itself runs on the mini).
+# Runs on macOS (the order itself runs on the mini) and on the Linux test node: `date` and `mktemp` try the BSD form,
+# then the GNU one (ga-9uv1xps.2: the mini's disk was under the heavy-step floor, so the node was the only place to run it).
 set -uo pipefail
 ulimit -f 204800 2>/dev/null || true   # a runaway write in a fixture stops at ~200 MB instead of filling the disk
 
@@ -19,11 +20,16 @@ eq()  { if [ "$2" = "$3" ]; then ok "$1 (=$2)"; else bad "$1: expected [$3], got
 command -v jq >/dev/null 2>&1 || { echo "FATAL: jq required"; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "FATAL: python3 required"; exit 1; }
 
-SBX="$(mktemp -d -t nudge-pollers-prune-selftest)" || { echo "FATAL: mktemp"; exit 1; }
-trap 'rm -rf "$SBX"' EXIT
+SBX="$(mktemp -d "${TMPDIR:-/tmp}/nudge-pollers-prune-selftest.XXXXXX")" || { echo "FATAL: mktemp"; exit 1; }
+trap 'chmod -R u+rwx "$SBX" 2>/dev/null; rm -rf "$SBX"' EXIT
 
-# BSD date/touch: a failed date must stop the whole selftest (an empty stamp would age nothing and pass for the wrong reason)
-stamp() { date -v-"$1" '+%Y%m%d%H%M' || { echo "FATAL: stamp $1: date failed" >&2; kill -TERM $$; }; }
+# <N>d -> touch -t stamp N days ago. BSD `date -v-Nd`, else GNU `date -d "N days ago"`. A failed date must stop the whole
+# selftest (an empty stamp would age nothing and pass for the wrong reason).
+stamp() {
+  local n="${1%d}"
+  date -v-"${n}d" '+%Y%m%d%H%M' 2>/dev/null || date -d "$n days ago" '+%Y%m%d%H%M' 2>/dev/null \
+    || { echo "FATAL: stamp $1: date failed" >&2; kill -TERM $$; }
+}
 
 # ---------------------------------------------------------------- prune fixtures
 digest() { python3 -c 'import hashlib,sys; print(hashlib.sha256((sys.argv[1]+"\x00"+sys.argv[2]).encode()).digest()[:8].hex())' "$1" "$2"; }
@@ -113,17 +119,54 @@ eq "locked stem: kept_locked=1, nothing deleted" "$(jf '[.kept_locked,.deleted_f
 eq "its 3 files (plus the sentinel) are still there" "$(nfiles "$P")" "4"
 wait "$holder" 2>/dev/null
 
-echo "== P4b. an unreadable .pid or .pid.lock is 'cannot tell' for that stem: kept and counted, the run goes on"
+echo "== P4b. an unreadable .pid or .pid.lock is 'cannot tell' for that stem: kept, counted as undecided (never as live), WARNed, the run goes on"
 new_pdir p4b
 unr_pid="$(mkstem "$P" unreadable-pid ga-wisp-u1 25d)"; chmod 000 "$P/$unr_pid.pid"
 unr_lock="$(mkstem "$P" unreadable-lock ga-wisp-u2 25d)"; chmod 000 "$P/$unr_lock.pid.lock"
 fine="$(mkstem "$P" fine-dead ga-wisp-u3 25d)"
-OUT="$(prune --apply 2>/dev/null)"; rc=$?
+OUT="$(prune --apply 2>"$SBX/p4b.err")"; rc=$?
 eq "rc 0 (nothing failed that the run could not survive)" "$rc" "0"
-eq "the unreadable-.pid stem is kept as live-by-doubt, the unreadable-lock stem as undecided" "$(jf '[.kept_live,.kept_undecided]|join("/")')" "1/1"
+eq "both unreadable stems are undecided, none is 'live'" "$(jf '[.kept_live,.kept_undecided]|join("/")')" "0/2"
 eq "both stems are intact (3 + 3 files), the third is gone" "$(nfiles "$P")" "6"
 eq "the readable dead stem was pruned" "$(ls "$P" | grep -c "^$fine\.")" "0"
+eq "the unreadable .pid is named in a WARN on stderr" "$(grep -c "^WARN: kept undecided: .*$unr_pid\.pid: cannot read the .pid" "$SBX/p4b.err")" "1"
+eq "the unreadable lock is named in a WARN on stderr" "$(grep -c "^WARN: kept undecided: .*$unr_lock\.pid\.lock: cannot open the lock" "$SBX/p4b.err")" "1"
 chmod 644 "$P/$unr_pid.pid" "$P/$unr_lock.pid.lock"
+
+echo "== P4c. a pollers dir whose entries cannot be stat'ed (mode r--): every stem is undecided, with or without a .pid; same failure, same label"
+new_pdir p4c
+s1="$(mkstem "$P" nostat-one ga-wisp-n1 25d)"; s2="$(mkstem "$P" nostat-two ga-wisp-n2 25d)"
+chmod 400 "$P"
+OUT="$(prune --apply 2>"$SBX/p4c.err")"; rc=$?
+chmod 755 "$P"
+eq "rc 0" "$rc" "0"
+eq "2 stems with a .pid: kept_live=0, kept_undecided=2, nothing deleted" "$(jf '[.kept_live,.kept_undecided,.deleted_files]|join("/")')" "0/2/0"
+eq "…and the files are all still there" "$(nfiles "$P")" "6"
+eq "a WARN per stem says why (the .pid cannot be opened in a dir without search permission)" "$(grep -c "^WARN: kept undecided: .*\.pid: cannot read the .pid" "$SBX/p4c.err")" "2"
+rm -f "$P"/*.pid
+chmod 400 "$P"
+OUT="$(prune --apply 2>"$SBX/p4c2.err")"
+chmod 755 "$P"
+eq "the same dir WITHOUT .pid files lands in the same bucket (undecided=2)" "$(jf '[.kept_live,.kept_undecided]|join("/")')" "0/2"
+eq "…and there the WARN is about the unreadable file times (the mtime branch)" "$(grep -c "^WARN: kept undecided: .*cannot read the file times" "$SBX/p4c2.err")" "2"
+
+echo "== P4d. a garbled .pid is 'no signal b', never a crash: a superscript two passes str.isdigit() but not int()"
+new_pdir p4d
+garbled="$(mkstem "$P" garbled-pid ga-wisp-g1 25d $'\xc2\xb2')"
+empty_pid="$(mkstem "$P" empty-pid ga-wisp-g2 25d "")"
+OUT="$(prune --apply 2>/dev/null)"; rc=$?
+eq "rc 0 (no traceback)" "$rc" "0"
+eq "both dead stems pruned, none live" "$(jf '[.deleted_stems,.kept_live]|join("/")')" "2/0"
+
+echo "== P4e. signal a beats an unreadable .pid: the stem of a LIVE poller is live, not undecided (the .pid is not needed to know)"
+new_pdir p4e
+lu="$(mkstem "$P" live-unreadable-pid ga-wisp-lu 25d)"; chmod 000 "$P/$lu.pid"
+echo "4242 /opt/homebrew/bin/gc nudge poll --city /x --session live-unreadable-pid ga-wisp-lu" > "$SBX/ps.lines"
+OUT="$(prune --apply 2>"$SBX/p4e.err")"; rc=$?
+chmod 644 "$P/$lu.pid"
+eq "rc 0" "$rc" "0"
+eq "kept_live=1, kept_undecided=0" "$(jf '[.kept_live,.kept_undecided]|join("/")')" "1/0"
+eq "no WARN, nothing deleted" "$(grep -c '^WARN' "$SBX/p4e.err")/$(nfiles "$P")" "0/3"
 
 echo "== P5. names outside the stem pattern, and non-regular files, are never touched"
 new_pdir p5
@@ -153,6 +196,10 @@ eq "…and nothing deleted" "$(nfiles "$P")" "3"
 echo "4002 /opt/homebrew/bin/gc nudge poll --city /x --session" > "$SBX/ps.lines"
 OUT="$(prune --apply 2>/dev/null)"; rc=$?
 eq "a live poller with a dangling --session: rc 2" "$rc" "2"
+echo "4004 /opt/homebrew/bin/gc nudge poll --city /x some-agent" > "$SBX/ps.lines"
+OUT="$(prune --apply 2>/dev/null)"; rc=$?
+eq "a live poller with an agent but no --session: rc 2" "$rc" "2"
+eq "…and nothing deleted" "$(nfiles "$P")" "3"
 echo "4003 /usr/bin/vim a-file nudge poll more words" > "$SBX/ps.lines"
 OUT="$(prune --apply 2>/dev/null)"; rc=$?
 eq "a non-gc process that merely mentions 'nudge poll' does NOT abort the run" "$rc" "0"
@@ -170,6 +217,9 @@ eq "…and nothing deleted" "$(nfiles "$P")" "9"
 OUT="$(prune --apply --min-age-days 0.5 2>/dev/null)"; rc=$?
 eq "--min-age-days below 1 is refused: rc 2" "$rc" "2"
 eq "…and nothing deleted" "$(nfiles "$P")" "9"
+OUT="$(prune --apply --min-age-days nan 2>/dev/null)"; rc=$?
+eq "--min-age-days nan is refused: rc 2" "$rc" "2"
+eq "…and nothing deleted" "$(nfiles "$P")" "9"
 OUT="$(prune --apply --min-age-days 30 2>/dev/null)"
 eq "--min-age-days 30: 20-day-old stems are young" "$(jf '[.kept_young,.deleted_files]|join("/")')" "3/0"
 
@@ -180,6 +230,27 @@ prune --apply --log "$SBX/p8/out.jsonl" >/dev/null
 prune --apply --log "$SBX/p8/out.jsonl" >/dev/null
 eq "2 runs -> 2 json lines" "$(jq -c . "$SBX/p8/out.jsonl" | wc -l | tr -d ' ')" "2"
 eq "first run deleted 3, second 0" "$(jq -s -r 'map(.deleted_files)|join("/")' "$SBX/p8/out.jsonl")" "3/0"
+
+echo "== P9. an unlink that fails is reported: rc 1, unlink_errors counted, the stem is not counted as deleted"
+new_pdir p9
+mkstem "$P" unlink-fails ga-wisp-f1 20d >/dev/null
+chmod 500 "$P"
+OUT="$(prune --apply 2>"$SBX/p9.err")"; rc=$?
+chmod 755 "$P"
+eq "rc 1" "$rc" "1"
+eq "3 unlink errors, 0 stems deleted" "$(jf '[.unlink_errors,.deleted_stems]|join("/")')" "3/0"
+eq "3 WARN lines" "$(grep -c '^WARN: unlink ' "$SBX/p9.err")" "3"
+eq "the files are still there" "$(nfiles "$P")" "3"
+
+echo "== P10. the order entrypoint (nudge-pollers-prune.sh) end to end against a sandbox city"
+CITY10="$SBX/p10/city"; mkdir -p "$CITY10/.gc/nudges/pollers"; P="$CITY10/.gc/nudges/pollers"; : > "$SBX/ps.lines"
+mkstem "$P" wrapper-dead ga-wisp-w1 12d >/dev/null
+young10="$(mkstem "$P" wrapper-young ga-wisp-w2 1d)"
+OUT="$(GC_CITY="$CITY10" GC_PACK_STATE_DIR="$SBX/p10/state" bash "$SELF_DIR/nudge-pollers-prune.sh" --ps-cmd "$SBX/fake-ps.sh")"; rc=$?
+eq "rc 0" "$rc" "0"
+eq "it applies (the order's flag), dead stem gone, young stem kept" "$(jf '[.mode,.deleted_stems,.kept_young]|join("/")')" "apply/1/1"
+eq "the young stem is intact" "$(ls "$P" | grep -c "^$young10\.")" "3"
+eq "one json line was logged under the state dir" "$(jq -c . "$SBX/p10/state/nudge-pollers-prune.jsonl" | wc -l | tr -d ' ')" "1"
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"

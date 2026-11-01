@@ -29,8 +29,11 @@ A stem is removed (all of its files) only when ALL of these hold:
     (an empty process list is not "no pollers");
   * a live `nudge poll` process whose target cannot be parsed   -> rc 2, nothing deleted
     (it could own any stem, so no stem can be called dead);
-  * a stem whose file times cannot be read, or whose .pid.lock can be neither opened nor locked for a
-    reason other than "someone holds it"                        -> kept, counted in kept_undecided;
+  * a stem whose file times cannot be read, whose .pid exists but cannot be read, or whose .pid.lock can
+    be neither opened nor locked for a reason other than "someone holds it"
+                                                                -> kept, counted in kept_undecided, one
+                                                                   WARN line each on stderr (first 20 of a run);
+                                                                   never counted as kept_live;
   * the pollers dir missing                                     -> rc 2, never created (a wrong path);
   * a garbled/empty .pid is "no signal b", not "alive": signal a still covers every live poller.
 What it never touches: a name that does not match <stem>.(pid|pid.lock|log), anything that is not a
@@ -54,6 +57,8 @@ import time
 FILE_RE = re.compile(r"^(?P<stem>.+-(?P<digest>[0-9a-f]{16}))\.(?P<kind>pid\.lock|pid|log)$")
 MAX_DELETES_DEFAULT = 100000   # a pollers dir this size is not a normal cleanup: stop and say so
 MIN_AGE_DAYS_DEFAULT = 7.0
+WARN_CAP = 20                  # stderr lines per run for "kept undecided"; the summary counts all of them
+PID_LIVE, PID_NOT_LIVE, PID_UNREADABLE = "live", "not-live", "unreadable"
 
 
 class CannotTell(Exception):
@@ -141,25 +146,32 @@ def live_digests(procs):
     return out
 
 
-def pid_file_is_live(pid_path, procs):
-    """Signal b. True when the .pid names a live process whose command line has `nudge poll`, or when the .pid
-    cannot be read for a reason other than 'it is not there' (keeping is the safe error). Missing or garbled ->
-    False (no signal b, NOT 'alive': signal a still covers every live poller); a PID that exists but is some
-    other command (PID reuse) -> False."""
-    # vazio/lixo (sem dígitos) -> sem sinal b; ausente -> sem sinal b; falhou/ilegível (EACCES, EIO…) -> True: mantém o stem
+def pid_file_state(pid_path, procs):
+    """Signal b, three answers (state, detail):
+      PID_LIVE        the .pid names a live process whose command line has `nudge poll` (even one whose target we
+                      cannot parse: keeping is the safe error);
+      PID_NOT_LIVE    the .pid is missing, empty or garbled (no signal b, NOT 'alive': signal a still covers every
+                      live poller), or names a dead PID, or a PID that exists but is some other command (PID reuse);
+      PID_UNREADABLE  the .pid exists but cannot be read (EACCES, EIO...): we CANNOT TELL. The caller keeps the
+                      stem (inert) but must count it as undecided and say so - it must not look like a live poller.
+    detail is the OS error text for PID_UNREADABLE, else ''."""
+    # vazio/lixo (sem dígitos) -> NOT_LIVE; ausente -> NOT_LIVE; falhou/ilegível (EACCES, EIO…) -> UNREADABLE (mantém E conta como undecided)
     try:
         with open(pid_path, "r", encoding="utf-8", errors="replace") as fh:
             text = fh.read(64).strip()
     except FileNotFoundError:
-        return False
-    except OSError:
-        return True
-    if not text.isdigit() or int(text) <= 0:
-        return False
+        return PID_NOT_LIVE, ""
+    except OSError as exc:
+        return PID_UNREADABLE, str(exc)
+    # ASCII digits only: str.isdigit() also accepts e.g. a superscript two, which int() rejects (ValueError -> every run dies)
+    if not re.fullmatch(r"[0-9]+", text) or int(text) <= 0:
+        return PID_NOT_LIVE, ""
     cmd = procs.get(int(text))
-    # PID gone -> no signal (False); PID alive but not a `nudge poll` (reused PID) -> no signal (False);
-    # alive and `nudge poll` (even one whose target we cannot parse) -> live (True): keeping is the safe error.
-    return cmd is not None and loose_is_poll(cmd)
+    # PID gone -> no signal; PID alive but not a `nudge poll` (reused PID) -> no signal;
+    # alive and `nudge poll` (even one whose target we cannot parse) -> live: keeping is the safe error.
+    if cmd is not None and loose_is_poll(cmd):
+        return PID_LIVE, ""
+    return PID_NOT_LIVE, ""
 
 
 def collect_stems(pollers_dir):
@@ -214,7 +226,19 @@ def main(argv=None):
     summary = {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
                "mode": "apply" if args.apply else "dry-run", "dir": pollers_dir, "min_age_days": args.min_age_days}
 
+    undecided = {"shown": 0, "total": 0}
+
+    def note_undecided(msg):
+        """A stem kept because we could not tell. Always counted by the caller; the stderr line is capped so a
+        systemic read problem (thousands of stems) does not drown the log, and finish() says how many were not shown."""
+        undecided["total"] += 1
+        if undecided["shown"] < WARN_CAP:
+            undecided["shown"] += 1
+            print(f"WARN: kept undecided: {msg}", file=sys.stderr)
+
     def finish(rc, **extra):
+        if undecided["total"] > undecided["shown"]:
+            print(f"WARN: ... and {undecided['total'] - undecided['shown']} more kept undecided (see kept_undecided)", file=sys.stderr)
         summary.update(extra)
         summary["rc"] = rc
         summary["elapsed_s"] = round(time.time() - started, 2)
@@ -222,8 +246,8 @@ def main(argv=None):
         print(json.dumps(summary, sort_keys=True))
         return rc
 
-    if args.min_age_days < 1:
-        return finish(2, error="--min-age-days below 1: refusing (a stem touched today may be about to restart)")
+    if not (args.min_age_days >= 1):       # also refuses nan (nan < 1 is False and would make every dead stem eligible)
+        return finish(2, error="--min-age-days must be a number >= 1: refusing (a stem touched today may be about to restart)")
     if not os.path.isdir(pollers_dir):
         # dir ausente -> rc 2, nunca criado (caminho errado, não "nada a limpar")
         return finish(2, error="pollers dir missing: not created, nothing to do")
@@ -244,10 +268,17 @@ def main(argv=None):
               "to_delete_stems": 0, "to_delete_files": 0}
     doomed = []
     for stem, rec in sorted(stems.items()):
-        if rec["digest"] in digests or (("pid" in rec["files"]) and pid_file_is_live(rec["files"]["pid"], procs)):
+        pid_state, pid_detail = PID_NOT_LIVE, ""
+        if rec["digest"] not in digests and "pid" in rec["files"]:
+            pid_state, pid_detail = pid_file_state(rec["files"]["pid"], procs)
+        if rec["digest"] in digests or pid_state == PID_LIVE:
             counts["kept_live"] += 1
+        elif pid_state == PID_UNREADABLE:
+            counts["kept_undecided"] += 1          # .pid existe mas não lê -> mantém, mas como "não sei", nunca como "vivo"
+            note_undecided(f"{rec['files']['pid']}: cannot read the .pid: {pid_detail}")
         elif not rec["mtime_ok"]:
             counts["kept_undecided"] += 1          # idade ilegível -> mantém
+            note_undecided(f"{stem}: cannot read the file times")
         elif rec["mtime"] > cutoff:
             counts["kept_young"] += 1
         else:
@@ -275,8 +306,9 @@ def main(argv=None):
                     lock_fh = open(lock_path, "r+b")
                 except FileNotFoundError:
                     lock_fh = None
-                except OSError:
+                except OSError as exc:
                     counts["kept_undecided"] += 1
+                    note_undecided(f"{lock_path}: cannot open the lock: {exc}")
                     continue
                 if lock_fh is not None:
                     # lock livre -> segue; segurado por outro processo -> kept_locked; falhou por outro motivo -> kept_undecided
@@ -287,6 +319,7 @@ def main(argv=None):
                             counts["kept_locked"] += 1
                             continue
                         counts["kept_undecided"] += 1
+                        note_undecided(f"{lock_path}: cannot lock: {exc}")
                         continue
             removed_all = True
             # the lock file goes last, while we still hold it
