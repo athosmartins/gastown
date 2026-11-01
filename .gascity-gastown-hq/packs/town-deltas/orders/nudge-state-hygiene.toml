@@ -1,0 +1,21 @@
+# ga-9uv1xps: two loose ends of the engine's nudge state that no order covered.
+#
+# 1. <city>/.gc/nudges/pollers/ is never pruned by the engine: 3 files per poller stem (.pid, .pid.lock, .log),
+#    32,639 files measured on 2026-11-01 (17,956 stems, oldest 19/09, ~700 new files/day, ~96% of the stems from
+#    one-shot ad-hoc / dog / ps-worker sessions).
+#    nudge-pollers-prune.py removes a stem only when it is DEAD (no live `gc nudge poll` whose target hashes to the
+#    stem, and its .pid is not a live poller), untouched for >= 7 days, and its flock is free. A `ps` that fails,
+#    is empty, or does not list the script itself makes the run delete NOTHING (rc 2).
+# 2. PENDING nudges fenced to a session that already ended (46 of 49 measured). The rule is NOT to re-fence, move or
+#    delete them: each one is a pointer to a bead (the durable record) and the engine's 24 h TTL collects it;
+#    nudge-queue-hygiene.py keeps its invariant of never touching non-warning items. nudge-stranded-census.py is
+#    READ-ONLY and alarms (rc 1, STRANDED-INFO) only for an item of an UNKNOWN shape whose fence is confirmed closed
+#    and that has < 6 h of TTL left: that would mean information is about to be lost and the rule must be revisited.
+#
+# 3h: the census looks at the last 6 h of an item's 24 h TTL, so two runs see every item before it expires (a single
+# 6h cooldown could miss one by the drift of a late run). The prune is cheap (one directory scan, ~5 s for 33k files).
+[order]
+description = "Prune dead nudge-poller files older than 7d (.gc/nudges/pollers) and run the read-only census of PENDING nudges fenced to a closed session (ga-9uv1xps)"
+trigger = "cooldown"
+interval = "3h"
+exec = "$PACK_DIR/assets/scripts/nudge-state-hygiene.sh"
