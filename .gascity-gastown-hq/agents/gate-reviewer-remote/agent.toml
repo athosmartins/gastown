@@ -6,7 +6,11 @@
 # o dispatcher (gate-remote-reviewers.lib.sh). INERTE: sem a flag $GC_CITY/.gc/gate-remote-reviewers.on ninguém abre este template.
 # Ligar, provar e as decisões do Mayor: docs/runbooks/gate-reviewer-remote.md.
 #
-# max_active_sessions = 3 (era 2; ga-yjrg7n6): o nó tem teto 6 no total (`cap` em .gc/session-ssh.json, dividido entre todas as sessões `*-remote-*`:
+# max_active_sessions = 7 (Mayor 01/11 00:5x, pergunta do Athos "faz sentido só 2 revisores com MBP e Hetzner recrutados?"): medido às 00:50, fila
+# do gate 13, modo foco ligado, nó em load 3/16 núcleos com 27 GB livres e só 3 revisores lá (teto do template 4); o cap do host já é 10. Com o
+# foco ligado os builders só pegam conserto (≤2 por pool), então 7 deixa 3 vagas do nó pra eles. Quem segura carga continua sendo o cap do host e
+# o cheque de Dolt do dispatcher (dolt-calm); o teto local do mini (1-3, dinâmico) NÃO muda — ele mede o mini, não o nó.
+# Histórico: era 3 (era 2; ga-yjrg7n6): o nó tem teto 6 no total (`cap` em .gc/session-ssh.json, dividido entre todas as sessões `*-remote-*`:
 # dog-remote usa até 1 na prática, wa-worker-remote 0-1) e o run de código usa 1 revisor (ga-5hdsr), então 3 = três runs ao mesmo tempo no nó.
 # Folga para os outros templates remotos: NÃO garantida. Os tetos deles (dog-remote 3, wa-worker-remote 3, mais ps/kimi 1 cada) somam com este
 # mais que o cap 6 do host; quem limita é o cap do host (a lib confere o total do nó antes do teto do template e o provider recusa no flock:
@@ -21,7 +25,7 @@
 # O atalho `bd` do nó não passa `bd label add|remove` nem `gc runtime drain-ack` (rc 77): o veredito volta por `bd comment` + `bd close`,
 # caminho que o dispatcher já aceita (ga-86l90a8 PASS, ga-w7pm55 FAIL). Alargar o atalho é decisão de segurança do Mayor, não feita.
 idle_timeout = "10m"
-max_active_sessions = 3
+max_active_sessions = 7
 min_active_sessions = 0
 model = "sonnet"
 provider = "claude-headless"
