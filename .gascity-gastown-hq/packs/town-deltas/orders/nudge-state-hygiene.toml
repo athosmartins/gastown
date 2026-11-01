@@ -6,7 +6,7 @@
 #    nudge-pollers-prune.py removes a stem only when it is DEAD (no live `gc nudge poll` whose target hashes to the
 #    stem, and its .pid is not a live poller), untouched for >= 7 days, and its flock is free. A `ps` that fails,
 #    is empty, or does not list the script itself makes the run delete NOTHING (rc 2).
-# 2. PENDING nudges fenced to a session that already ended (46 of 49 measured). The rule is NOT to re-fence, move or
+# 2. PENDING nudges fenced to a session that already ended (46 of 50 measured on 2026-11-01). The rule is NOT to re-fence, move or
 #    delete them: each one is a pointer to a bead (the durable record) and the engine's 24 h TTL collects it;
 #    nudge-queue-hygiene.py keeps its invariant of never touching non-warning items. nudge-stranded-census.py is
 #    READ-ONLY and alarms (rc 1, STRANDED-INFO) only for an item of an UNKNOWN shape whose fence is confirmed closed
