@@ -241,6 +241,13 @@ s_lock() {
   run_sut --run
   eq "S13 trava velha (dono morto) é tomada: rc 0" "$RC" 0
   reap
+  newcase; spawn "$T/fakejob-A.sh"; export D2_FREE_MB=2500
+  : >"$C/umarquivo"; export D2_LOCK="$C/umarquivo/lock.d"
+  run_sut --run
+  eq "S13 trava que não dá para criar (erro de gravação): rc 30, não é 'outra instância'" "$RC" 30
+  hasnt "S13 ...e a linha não diz 'outra instância'" "$OUT" "outra instância"
+  job_alive "$JOBPID"; check $? "S13 o job segue vivo (sem trava, não age)"
+  reap
 }
 
 s_dry_run() {  # só diz; não escreve nada

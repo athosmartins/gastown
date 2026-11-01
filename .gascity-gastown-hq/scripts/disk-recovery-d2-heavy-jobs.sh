@@ -17,7 +17,7 @@
 #   0   agiu e terminou     (parou ao menos um e todos morreram)
 #   10  nada a fazer, ou uma guarda adiou (nada rodando · rodando mas o livre está acima do piso de parada do job · outra instância em execução)
 #   20  falhou              (não conseguiu gravar o registro, o processo não morreu, erro interno)
-#   30  não consegui ler o estado e por isso NÃO agi (df, ps ou allowlist ilegíveis; regex larga demais)
+#   30  não consegui ler o estado e por isso NÃO agi (df, ps ou allowlist ilegíveis; não conseguiu criar a trava; regex larga demais)
 #   --dry-run devolve os mesmos códigos como previsão (0 = agiria). Quem avisa o Athos (notify/mail em 0/20) é o orquestrador: este degrau só escreve o próprio log.
 #
 # A ALLOWLIST. Casa por REGEX contra a linha de comando do processo E a do PAI (o job de verdade tem o pai do launchd), nunca por tamanho de memória. O arquivo é
@@ -192,14 +192,15 @@ stop_pid() {  # $1=match $2=parent $3=pid → rc 0 = morreu (comprovado), 1 = n�
   return 1
 }
 
-acquire_lock() {
-  mkdir -p "$(dirname "$LOCKD")" 2>/dev/null || return 1
+acquire_lock() {  # rc 0 = tomei · 1 = outra instância viva · 2 = não consegui criar a trava (erro de gravação: NÃO é "outra instância")
+  mkdir -p "$(dirname "$LOCKD")" 2>/dev/null || return 2
   if mkdir "$LOCKD" 2>/dev/null; then printf '%s' "$$" >"$LOCKD/pid"; LOCK_HELD=1; return 0; fi
   local p; p=$(cat "$LOCKD/pid" 2>/dev/null)
-  if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then return 1; fi
+  if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then return 1; fi      # pid ilegível = trava abandonada (entre o mkdir e o pid do dono passam microssegundos)
   rm -rf "$LOCKD" 2>/dev/null
   if mkdir "$LOCKD" 2>/dev/null; then printf '%s' "$$" >"$LOCKD/pid"; LOCK_HELD=1; return 0; fi
-  return 1
+  [ -d "$LOCKD" ] && return 1
+  return 2
 }
 
 trim_log() {  # o log não cresce sem fim: acima de 512 KB fica com as últimas 2000 linhas
@@ -275,7 +276,7 @@ rfb_run_id() {  # $1=pid $2=início_epoch → RUNID_RES = "ID <id>" | "NONE" | "
 
 # ── --run / --dry-run ───────────────────────────────────────────────────────────────────────────────────────────────────────
 do_run() {
-  local free id adapter re pre stop_mb resume_mb window maxage how procs n pid et p
+  local free id adapter re pre stop_mb resume_mb window maxage how procs n pid et p lrc
   load_allowlist || finish 30 "$ALLOW_ERR; não ajo"
   free=$(read_free_mb) || finish 30 "não consegui ler o livre de $VOLUME (df); não ajo"      # MUT:freefail
   local plan="" idle="" held="" row
@@ -317,7 +318,9 @@ $plan
 EOF
     finish 0 "pararia $summary_stopped (nada foi tocado)"
   fi
-  acquire_lock || finish 10 "outra instância do D2 em execução ($LOCKD): saio sem agir"
+  acquire_lock; lrc=$?
+  [ "$lrc" -eq 1 ] && finish 10 "outra instância do D2 em execução ($LOCKD): saio sem agir"
+  [ "$lrc" -eq 0 ] || finish 30 "não consegui criar a trava $LOCKD (erro de gravação): não ajo"
   trim_log
   local start rid rrc resume_hint=""
   while IFS= read -r line; do
