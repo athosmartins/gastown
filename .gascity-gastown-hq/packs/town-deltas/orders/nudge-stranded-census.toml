@@ -1,0 +1,13 @@
+# ga-9uv1xps.3: PENDING nudges fenced to a session that already ended (46 of 50 measured on 2026-11-01). The rule is NOT to
+# re-fence, move or delete them: each one is a pointer to a bead (the durable record) and the engine's 24 h TTL collects it;
+# nudge-queue-hygiene.py keeps its invariant of never touching non-warning items. nudge-stranded-census.py is
+# READ-ONLY and alarms (rc 1, STRANDED-INFO) only for an item of an UNKNOWN shape whose fence is confirmed closed
+# and that has < 6 h of TTL left: that would mean information is about to be lost and the rule must be revisited.
+#
+# 3h: the census looks at the last 6 h of an item's 24 h TTL, so two runs see every item before it expires (a single
+# 6h cooldown could miss one by the drift of a late run).
+[order]
+description = "Read-only census of PENDING nudges fenced to a closed session; alarms only for an unknown-shape item about to expire (ga-9uv1xps.3)"
+trigger = "cooldown"
+interval = "3h"
+exec = "$PACK_DIR/assets/scripts/nudge-stranded-census.sh"
