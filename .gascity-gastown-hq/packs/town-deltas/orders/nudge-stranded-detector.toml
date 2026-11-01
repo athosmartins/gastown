@@ -1,0 +1,28 @@
+# ga-gj1jr7x: alarm when a PENDING nudge sits unattended because nobody is going to deliver it.
+#
+# Measured 2026-10-31: `digo-wa` had a nudge PENDING (due now, never attempted) for 1h54min while its session was
+# alive and idle and no `gc nudge poll` process existed. The engine starts a poller only when a nudge is enqueued
+# (ga-55jx16q: that poller can die of SIGPIPE; an OOM, a reboot or a kill ends the same way) and nothing re-arms it.
+# nudge-queue-hygiene cannot see this (it only touches WARNING-prefixed items), so the miss was silent.
+#
+# DETECTION ONLY. Raises one `notify` per run listing the stranded nudge ids not yet alarmed (each id alarms once while
+# it stays pending; the seen-file is in the pack state dir) and keeps a third,
+# separate state, "cannot tell" (queue/ps/tmux+gc unreadable), that is counted on its own and alarms on its own
+# cooldown: a blind detector must not look like a quiet one. No poller re-arm, no queue write, no bd call.
+# Out of scope: the engine fix (docs/pending-engine-window/ga-55jx16q-nudge-poller-sigpipe.*).
+#
+# Cost of ONE run, measured 2026-11-01 on the live city (53 pending, 1.4 MB state.json): 8-10 s wall (10.05 s on the last
+# run), nearly all of it the single `gc session list --json --state all` call that runs only when an old due item has no
+# poller and tmux does not settle its liveness; a run with nothing to check reads one JSON file and one `ps`. 5m is
+# therefore well above the cost of a run (and the script holds a single-instance lock, ga-y0g5x, so a slow run cannot
+# stack). A stranded nudge is alarmed on the first sweep after it is 10 min old, i.e. at most ~15 min after it became
+# due, provided the notify gets through (if not, the next sweep retries and the run exits rc 3); the acceptance bar
+# "one alarm within two sweeps" holds for any item already past the age threshold.
+#
+# This file only takes effect once merged and loaded by the city (orders are auto-discovered from the pack): merged is
+# not live, so confirm the first run in the order history after the merge.
+[order]
+description = "Alarm (notify) on a PENDING nudge older than 10 min whose live target session has no `gc nudge poll`; read-only, deduped per nudge id, 'cannot tell' kept as its own state (ga-gj1jr7x)"
+trigger = "cooldown"
+interval = "5m"
+exec = "$PACK_DIR/assets/scripts/nudge-stranded-detector.sh"
