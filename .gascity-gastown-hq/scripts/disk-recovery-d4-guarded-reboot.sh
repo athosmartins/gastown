@@ -18,7 +18,7 @@
 #   volume de dados, nunca `df /`)  4 cooldown de 6 h, teto de 2 por 24 h, mini no ar há < 2 h por qualquer causa (com o disco ainda baixo depois de
 #   um reinício nosso: NÃO reinicia de novo e escala UMA vez por reinício)  5 espera (10 min depois que uma guarda adiou, 30 min depois de um pedido que não derrubou o mini)  6 pré-checagem: FileVault
 #   desligado + autologin do usuário do console + postcheck pós-boot carregado (senão o mini volta parado na tela de senha)  7 guardas  8 `--run`:
-#   aviso -p 5 ANTES → 60 s de carência (o interruptor ainda aborta) → RELÊ disco e guardas (o veredito de minutos atrás não vale) → grava e CONFERE
+#   aviso -p 5 ANTES (entrega CONFIRMADA; se o push não foi, mail ao Mayor; os dois falharam = rc 30 e NÃO reinicia) → 60 s de carência (o interruptor ainda aborta) → RELÊ disco e guardas (o veredito de minutos atrás não vale) → grava e CONFERE
 #   a marca do reinício → só então pede o reinício; pedido com erro, ou mini ainda no ar 180 s depois, desfaz a marca e sai 20.
 #
 # GUARDAS (todas avaliadas; qualquer uma bloqueia = 10 + espera + aviso; nenhuma bloqueia mas alguma ilegível = 30): ligação em curso
@@ -159,24 +159,27 @@ out_raw() {  # primeira linha de $RB_OUT SEM filtrar (preserva o TAB do estado<T
 }
 rb_clean() { [ -n "$RB_OUT" ] && rm -f "$RB_OUT" 2>/dev/null; RB_OUT=""; return 0; }
 
-send_notify() {  # $1=prioridade $2=título $3=mensagem. dry-run só registra. Falha do notify é dita no log e nunca derruba a rodada
+send_notify() {  # $1=prioridade $2=título $3=mensagem. rc 0 = ENTREGUE; rc 1 = NÃO confirmado (rc≠0, prazo estourado ou sem arquivo temporário: quem depende da entrega NÃO a presume). dry-run só registra e devolve 0
   if [ "$DRY" = 1 ]; then log "(notify -p $1 '$2' — não enviado em dry-run) $3"; return 0; fi
   local rc
+  # NOTIFY_STRICT_EXIT=1: sem ele o notify sai 0 também em dedup/digest/segurado-até-as-7h (nada chegou); com ele, nos caminhos de política, rc 0 = push com 2xx e o resto é rc≠0 (ga-trv57j); só NOTIFY_DISABLE/PYTEST_CURRENT_TEST/preview ainda saem 0 sem enviar (ambiente de teste, não o do launchd)
   # O notify decide push-vs-resumo-horário pela REDAÇÃO, não pelo -p (ga-ff6t9): prioridade >= 4 = "tem de chegar no celular" → NOTIFY_FORCE_PUSH=1
   if [ "$1" -ge 4 ]; then
-    NOTIFY_FORCE_PUSH=1 run_bounded "$NOTIFY_TIMEOUT_S" "$NOTIFY" -p "$1" -t "$2" "$3"; rc=$?
+    NOTIFY_STRICT_EXIT=1 NOTIFY_FORCE_PUSH=1 run_bounded "$NOTIFY_TIMEOUT_S" "$NOTIFY" -p "$1" -t "$2" "$3"; rc=$?
   else
-    run_bounded "$NOTIFY_TIMEOUT_S" "$NOTIFY" -p "$1" -t "$2" "$3"; rc=$?
+    NOTIFY_STRICT_EXIT=1 run_bounded "$NOTIFY_TIMEOUT_S" "$NOTIFY" -p "$1" -t "$2" "$3"; rc=$?
   fi
-  [ "$rc" -eq 0 ] || log "WARN: notify rc=$rc ($(out_line))"
+  [ "$rc" -eq 0 ] || log "WARN: notify NÃO confirmado rc=$rc ($(out_line))"
   rb_clean
+  [ "$rc" -eq 0 ]
 }
-send_mail() {  # $1=assunto $2=corpo
+send_mail() {  # $1=assunto $2=corpo. rc 0 = entregue; rc 1 = não confirmado (mesmo contrato do send_notify)
   if [ "$DRY" = 1 ]; then log "(mail ao Mayor '$1' — não enviado em dry-run)"; return 0; fi
   run_bounded "$MAIL_TIMEOUT_S" "$GCBIN" mail send mayor --from disk-recovery-d4 -s "$1" -m "$2"
   local rc=$?
-  [ "$rc" -eq 0 ] || log "WARN: gc mail send mayor rc=$rc ($(out_line))"
+  [ "$rc" -eq 0 ] || log "WARN: gc mail send mayor NÃO confirmado rc=$rc ($(out_line))"
   rb_clean
+  [ "$rc" -eq 0 ]
 }
 
 # ── estado (chave=valor, escrito inteiro e trocado com mv) ─────────────────────────────────────────────────────────────────────
@@ -279,6 +282,7 @@ precheck_env() {  # rc 0 = ok; rc 20 = reprovou (PRE_WHY); rc 30 = não consegui
   out=$("$FDESETUP" status 2>&1); rc=$?
   [ "$rc" -eq 0 ] || { PRE_WHY="fdesetup status falhou (rc=$rc: $(printf '%s' "$out" | head -1))"; return 30; }
   case "$out" in
+    *"Deferred enablement"*) PRE_WHY="FileVault tem habilitação ADIADA ($(printf '%s' "$out" | head -1)): ele liga no próximo login e o mini para na tela de senha"; return 20 ;;
     "FileVault is Off."*) ;;
     *"FileVault is On"*|*"progress"*) PRE_WHY="FileVault não está desligado ($(printf '%s' "$out" | head -1)): depois do boot o mini para na tela de senha e a cidade fica no escuro"; return 20 ;;
     *) PRE_WHY="fdesetup devolveu um texto que não reconheço ($(printf '%s' "$out" | head -1))"; return 30 ;;
@@ -337,15 +341,16 @@ load_nightly_blocks() {  # define scraper_daily_state e DOLT_MAINT_PATTERN_DEFAU
 G_STATE=""; G_WHY=""
 guard_calls() {  # ligação em curso (pix + voicebot), lida em 3 estados
   G_STATE="unknown"; G_WHY=""
-  local rc line
+  local rc line st=""
   if [ ! -r "$CALLS_PY" ]; then G_WHY="$CALLS_PY não legível"; return 0; fi
   run_bounded "$GUARD_TIMEOUT_S" "$PY" -I "$CALLS_PY" --max-age-min "$CALL_MAX_AGE_MIN"; rc=$?
   line=$(out_raw)
-  case "$line" in *$'\t'*) line=${line#*$'\t'} ;; esac
+  case "$line" in *$'\t'*) st=${line%%$'\t'*}; line=${line#*$'\t'} ;; esac
   line=$(printf '%s' "$line" | tr -d '\r')
-  case "$rc" in
-    0) G_STATE="ok" ;;
-    1) G_STATE="block" ;;
+  # o contrato do leitor é 0/1/2 COM a linha "estado<TAB>detalhe": rc 1 também é traceback do python, então o rc só vale junto com o estado que o próprio leitor imprime (senão é "não sei")
+  case "$rc:$st" in
+    0:ok) G_STATE="ok" ;;
+    1:block) G_STATE="block" ;;
     *) G_STATE="unknown"; line="rc=$rc: ${line:-(sem saída)}" ;;
   esac
   G_WHY=$line; rb_clean; return 0
@@ -418,15 +423,18 @@ alert_throttled() {  # $1=título $2=corpo — push no máximo 1 por DEFER_NOTIF
   if [ "$S_DEFER_NOTIFY" -gt 0 ] && [ $(( n - S_DEFER_NOTIFY )) -ge 0 ] && [ $(( n - S_DEFER_NOTIFY )) -lt "$DEFER_NOTIFY_S" ]; then
     log "aviso '$t' suprimido (último há $(( n - S_DEFER_NOTIFY ))s < ${DEFER_NOTIFY_S}s)"; return 0
   fi
-  send_notify 5 "$t" "$body"
-  S_DEFER_NOTIFY=$n
+  # o carimbo só vale com a entrega CONFIRMADA: aviso que não saiu e foi carimbado = 1 h de silêncio sem ninguém saber
+  if send_notify 5 "$t" "$body"; then S_DEFER_NOTIFY=$n; else log "WARN: aviso '$t' NÃO entregue — não carimbo defer_notify_ts, tento de novo na próxima rodada"; fi
 }
+ESC_NOTE=""   # o que a escalada fez, para o texto da linha de stdout ("escalado" só se saiu mesmo)
 escalate_low_after_reboot() {  # $1=última marca de reinício $2=motivo. UMA vez por reinício (esc_for): o disco segue baixo e este degrau NÃO reinicia de novo
-  [ "$DRY" = 1 ] && return 0
-  [ "$S_ESC_FOR" = "$1" ] && { log "escalada deste reinício ($1) já foi feita — não repito"; return 0; }
-  send_notify 5 "Disco: segue baixo depois do reinício automático" "Livre ${FREE_MB} MB. $2 O D4 NÃO reinicia de novo. Precisa de um humano: o que está comendo o disco depois do boot? Log: $LOG"
-  send_mail "Disco: D4 não reinicia de novo e o disco segue baixo (livre ${FREE_MB} MB)" "O D4 da escada de disco (ga-1p1i5jr.4) recusou um novo reinício automático: $2 Livre agora: ${FREE_MB} MB. Isto é o fim da escada: precisa de um humano. Estado: $STATE · log: $LOG"
-  S_ESC_FOR=$1
+  [ "$DRY" = 1 ] && { ESC_NOTE="dry-run: não escalo"; return 0; }
+  [ "$S_ESC_FOR" = "$1" ] && { log "escalada deste reinício ($1) já foi feita — não repito"; ESC_NOTE="escalada deste reinício já feita"; return 0; }
+  local ok=0
+  send_notify 5 "Disco: segue baixo depois do reinício automático" "Livre ${FREE_MB} MB. $2 O D4 NÃO reinicia de novo. Precisa de um humano: o que está comendo o disco depois do boot? Log: $LOG" && ok=1
+  send_mail "Disco: D4 não reinicia de novo e o disco segue baixo (livre ${FREE_MB} MB)" "O D4 da escada de disco (ga-1p1i5jr.4) recusou um novo reinício automático: $2 Livre agora: ${FREE_MB} MB. Isto é o fim da escada: precisa de um humano. Estado: $STATE · log: $LOG" && ok=1
+  if [ "$ok" = 0 ]; then log "ERROR: escalada NÃO entregue (notify e mail falharam) — não gravo esc_for, repito na próxima rodada"; ESC_NOTE="escalada NÃO entregue"; return 0; fi
+  ESC_NOTE="escalado"; S_ESC_FOR=$1
   state_save || log "WARN: não gravei esc_for em $STATE — a escalada pode se repetir na próxima rodada"
 }
 
@@ -480,14 +488,14 @@ if [ "$LAST" -gt 0 ]; then
   if [ "$age" -lt "$COOLDOWN_S" ]; then
     why="O último reinício automático foi há $(( age / 60 )) min (cooldown de $(( COOLDOWN_S / 3600 )) h)."
     escalate_low_after_reboot "$LAST" "$why"
-    emit 10 "cooldown: $why O disco segue em ${FREE_MB}MB: NÃO reinicio de novo (escalado)"
+    emit 10 "cooldown: $why O disco segue em ${FREE_MB}MB: NÃO reinicio de novo ($ESC_NOTE)"
   fi
 fi
 n24=$(count_since "$NOW" "$DAY_WINDOW_S")
 if [ "$n24" -ge "$DAY_CAP" ]; then
   why="Já houve $n24 reinício(s) automático(s) nas últimas $(( DAY_WINDOW_S / 3600 )) h (teto $DAY_CAP)."
   escalate_low_after_reboot "$LAST" "$why"
-  emit 10 "teto diário: $why O disco segue em ${FREE_MB}MB: NÃO reinicio de novo (escalado)"
+  emit 10 "teto diário: $why O disco segue em ${FREE_MB}MB: NÃO reinicio de novo ($ESC_NOTE)"
 fi
 up=$(( NOW - BOOT_EPOCH ))
 if [ "$up" -lt "$MIN_UPTIME_S" ]; then
@@ -533,8 +541,18 @@ if [ "$DRY" = 1 ]; then
 fi
 
 # 8 — o reinício de verdade: aviso → carência → releitura → grava e confere → pede
-send_notify 5 "Disco: reiniciando o mini em ${GRACE_S}s" "Livre ${FREE_MB} MB (${TIER}), swap ${SWAP}. Guardas ok: ${GUARDS_SUMMARY}. Volto em ~2 min (auto-login + postcheck). Para ABORTAR agora: touch ${OFF}"
-log "aviso enviado; carência de ${GRACE_S}s (o interruptor $OFF aborta)"
+# O aviso é CONDIÇÃO do reinício, não cortesia (decisão do Athos: "e AVISA"): sem ninguém avisado a carência para abortar é teatro. Não entregou (notify rc≠0 ou prazo
+# estourado = "não sei") → 2º canal, o mail ao Mayor; os dois falharam → não reinicia (inerte), espera e tenta de novo. Nunca "aviso enviado" sem confirmação.
+WARN_TXT="Livre ${FREE_MB} MB (${TIER}), swap ${SWAP}. Guardas ok: ${GUARDS_SUMMARY}. Volto em ~2 min (auto-login + postcheck). Para ABORTAR agora: touch ${OFF}"
+WARN_VIA="notify"
+if ! send_notify 5 "Disco: reiniciando o mini em ${GRACE_S}s" "$WARN_TXT"; then
+  if send_mail "Disco: reiniciando o mini em ${GRACE_S}s (o push NÃO foi confirmado)" "$WARN_TXT"; then WARN_VIA="mail ao Mayor (o push NÃO foi confirmado)"
+  else
+    S_DEFER_UNTIL=$(( NOW + DEFER_S )); state_save || log "WARN: não gravei a espera em $STATE"
+    emit 30 "não consegui AVISAR (notify e mail ao Mayor falharam) — NÃO reinicio; tento de novo às $(hhmm "$S_DEFER_UNTIL"); livre=${FREE_MB}MB"
+  fi
+fi
+log "aviso entregue por ${WARN_VIA}; carência de ${GRACE_S}s (o interruptor $OFF aborta)"
 g=0
 while [ "$g" -lt "$GRACE_S" ]; do
   [ -e "$OFF" ] && break
@@ -552,8 +570,8 @@ run_guards; grc=$?
 case "$grc" in
   1)
     S_DEFER_UNTIL=$(( NOW + DEFER_S ))
-    send_notify 5 "Disco: reinício cancelado na última checagem (${BLOCK_NAMES})" "Depois do aviso, a guarda mudou: ${BLOCK_WHY}. NÃO reiniciei. Tento de novo às $(hhmm "$S_DEFER_UNTIL")."
-    S_DEFER_NOTIFY=$NOW; state_save || log "WARN: não gravei a espera em $STATE"
+    send_notify 5 "Disco: reinício cancelado na última checagem (${BLOCK_NAMES})" "Depois do aviso, a guarda mudou: ${BLOCK_WHY}. NÃO reiniciei. Tento de novo às $(hhmm "$S_DEFER_UNTIL")." && S_DEFER_NOTIFY=$NOW
+    state_save || log "WARN: não gravei a espera em $STATE"
     emit 10 "adiado na releitura final — guarda(s) bloqueando (${BLOCK_NAMES}): ${BLOCK_WHY}; livre=${FREE_MB}MB" ;;
   2)
     send_notify 5 "Disco: reinício cancelado, guarda ilegível na última checagem" "Depois do aviso não consegui ler: ${UNK_WHY}. NÃO reiniciei."
@@ -569,7 +587,7 @@ if ! state_save; then
   drop_mark "$MARK"
   emit 20 "não consegui gravar o estado ($STATE) — sem a marca do reinício eu poderia reiniciar em laço; NÃO reinicio"
 fi
-state_load || { drop_mark "$MARK"; emit 20 "gravei o estado mas não consegui relê-lo ($STATE_ERR) — NÃO reinicio"; }
+state_load || emit 20 "gravei o estado mas não consegui relê-lo ($STATE_ERR) — NÃO reinicio (a marca pode estar no disco: legível, conta como cooldown; ilegível, a próxima rodada sai 30 — nos dois casos NÃO reinicia)"
 case ",$S_REBOOTS," in
   *",$MARK,"*) ;;
   *) emit 20 "gravei o estado mas a marca $MARK não está nele quando releio — NÃO reinicio" ;;
@@ -585,7 +603,8 @@ else
 fi
 # rc 124 = o pedido estourou o prazo: NÃO sei se o evento chegou ao loginwindow (o mini pode cair daqui a pouco). Terceiro estado: mantém a marca (soltá-la
 # perderia o cooldown se ele cair) e espera como no rc 0. Só um rc que o comando DEVOLVEU (erro de entrega, permissão) é falha definida.
-if [ "$rrc" -eq 124 ]; then log "WARN: o pedido de reinício estourou ${REBOOT_TIMEOUT_S}s (rc 124) — não sei se pegou; espero como se tivesse pegado"; fi
+REQ_DESC="aceito (rc 0)"   # só o que se SABE: rc 124 é "não sei se pegou", e o log/stdout/aviso abaixo dizem isso, não "aceito"
+if [ "$rrc" -eq 124 ]; then REQ_DESC="enviado, mas estourou o prazo (rc 124: não sei se pegou)"; log "WARN: o pedido de reinício estourou ${REBOOT_TIMEOUT_S}s (rc 124) — não sei se pegou; espero como se tivesse pegado"; fi
 if [ "$rrc" -ne 0 ] && [ "$rrc" -ne 124 ]; then
   why="o pedido de reinício falhou (rc=$rrc: $(out_line))"; rb_clean
   drop_mark "$MARK"; S_DEFER_UNTIL=$(( NOW + ATTEMPT_GAP_S )); state_save || log "ERROR: não consegui desfazer a marca $MARK em $STATE — fica contando (inerte: bloqueia por ${COOLDOWN_S}s)"
@@ -593,10 +612,11 @@ if [ "$rrc" -ne 0 ] && [ "$rrc" -ne 124 ]; then
   emit 20 "$why — o mini NÃO reiniciou; desfiz a marca"
 fi
 rb_clean
-log "pedido aceito (rc 0); esperando até ${WAIT_S}s o mini cair — se este processo continuar vivo, o reinício não aconteceu"
+log "pedido ${REQ_DESC}; esperando até ${WAIT_S}s o mini cair — se este processo continuar vivo, o reinício não aconteceu"
 w=0
 while [ "$w" -lt "$WAIT_S" ]; do sleep 1; w=$((w + 1)); done
-# chegou aqui = o mini NÃO caiu: o pedido foi aceito mas ninguém reiniciou (diálogo de app, sessão travada...). Não conta como reinício.
+# chegou aqui = o mini AINDA não caiu (≠ "não vai cair": um logout lento pode terminar depois dos ${WAIT_S}s). Solta a marca para o caso comum (diálogo de app, sessão travada):
+# se ele cair mesmo assim, o piso de 2 h de uptime segura o laço, mas o cooldown e a escalada DESTA queda se perdem — risco aceito nesta fatia, fechar na 3/3 (marca "pendente" conferida pelo boottime).
 drop_mark "$MARK"; S_DEFER_UNTIL=$(( NOW + ATTEMPT_GAP_S )); state_save || log "ERROR: não consegui desfazer a marca $MARK em $STATE"
-send_notify 5 "Disco: pedi o reinício e o mini NÃO caiu" "Livre ${FREE_MB} MB. O pedido foi aceito mas o mini continuava no ar ${WAIT_S}s depois (um app segurando o logout?). Não conta como reinício; tento de novo em $(( ATTEMPT_GAP_S / 60 )) min. Log: $LOG"
-emit 20 "pedido de reinício aceito mas o mini continuou no ar por ${WAIT_S}s — NÃO reiniciou; desfiz a marca (nova tentativa em ${ATTEMPT_GAP_S}s)"
+send_notify 5 "Disco: pedi o reinício e o mini NÃO caiu" "Livre ${FREE_MB} MB. O pedido foi ${REQ_DESC}, e o mini continuava no ar ${WAIT_S}s depois (um app segurando o logout?). Não conta como reinício; tento de novo em $(( ATTEMPT_GAP_S / 60 )) min. Log: $LOG"
+emit 20 "pedido de reinício ${REQ_DESC}; o mini continuou no ar por ${WAIT_S}s — NÃO reiniciou; desfiz a marca (nova tentativa em ${ATTEMPT_GAP_S}s)"

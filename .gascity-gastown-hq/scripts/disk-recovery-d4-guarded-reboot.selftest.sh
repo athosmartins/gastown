@@ -5,7 +5,8 @@
 #   O que prova · Como não reinicia · Filtro de cenários
 #
 # O QUE PROVA: o reinício só acontece com TODAS as guardas "ok", e "não consegui ler" (3º estado) NUNCA reinicia (disco, estado, pré-checagem,
-#   cada guarda, a extração do código do reinício noturno); o aviso sai ANTES do pedido; a marca do reinício está NO DISCO antes do pedido; as guardas
+#   cada guarda, a extração do código do reinício noturno); o aviso sai ANTES do pedido e com entrega CONFIRMADA (push falho → mail; os dois falhos
+#   ou prazo estourado → não reinicia; escalada e carimbos de "já avisei" só com entrega confirmada); a marca do reinício está NO DISCO antes do pedido; as guardas
 #   são relidas depois da carência; cooldown de 6 h, teto de 2 por 24 h, mini no ar há < 2 h, espera de 10 min; pedido que falha ou que não derruba
 #   o mini desfaz a marca e sai 20; UMA linha no stdout; dry-run não escreve nem avisa. A guarda de ligação é um STUB (o leitor de verdade e o
 #   código dele têm selftest próprio: disk-recovery-d4-calls-in-flight.selftest.sh).
@@ -58,9 +59,9 @@ mk_case() {  # $1=nome → C=$T/<nome> com stubs "tudo ok" e o vetor ENVV
   echo 0 > "$C/launchctl.rc"; echo 1 > "$C/pgrep.rc"; : > "$C/pgrep.out"
   echo 0 > "$C/sender.rc"; echo "central_sender_restart_safe: fila sem envio em voo — pode reiniciar" > "$C/sender.out"
   printf 'ok\tpix: nenhuma ligação em curso; voicebot: nenhuma ligação em curso\n' > "$C/calls.out"; echo 0 > "$C/calls.rc"
-  echo 0 > "$C/reboot.rc"; echo 5000000 > "$C/df.kb"
-  stub notify "echo \"\$*\" >> $C/notify.log; [ -f $C/notify.hook ] && bash $C/notify.hook \"\$*\"; exit 0"
-  stub gc "echo \"\$*\" >> $C/gc.log"
+  echo 0 > "$C/reboot.rc"; echo 5000000 > "$C/df.kb"; echo 0 > "$C/notify.rc"; echo 0 > "$C/gc.rc"; : > "$C/notify.env"
+  stub notify "echo \"\$*\" >> $C/notify.log; env | grep -E '^NOTIFY_STRICT_EXIT=' >> $C/notify.env; [ -f $C/notify.hook ] && bash $C/notify.hook \"\$*\"; exit \$(cat $C/notify.rc)"
+  stub gc "echo \"\$*\" >> $C/gc.log; exit \$(cat $C/gc.rc)"
   stub fdesetup "cat $C/fdesetup.out; exit \$(cat $C/fdesetup.rc)"
   stub defaults "cat $C/autologin.out; exit \$(cat $C/autologin.rc)"
   stub launchctl "echo 'gui/501/x = { state = not running }'; exit \$(cat $C/launchctl.rc)"
@@ -149,7 +150,7 @@ chk "NO_REAL_REBOOT sem stub: osascript NÃO foi chamado e a marca foi desfeita"
 section "o pedido estoura o prazo: não sei se pegou"
 mk_case rb_to; setenv "DR4_REBOOT_CMD=sleep 5"; setenv "DR4_REBOOT_TIMEOUT_S=1"
 run_sut --run
-chk "pedido que estoura o prazo espera como se tivesse pegado (não 'falhou'; veio $RC: $OUT)" '[ "$RC" = 20 ] && contains "continuou no ar" && ! contains "falhou"'
+chk "pedido que estoura o prazo espera como se tivesse pegado (não 'falhou'; veio $RC: $OUT)" '[ "$RC" = 20 ] && contains "continuou no ar" && ! contains "falhou" && contains "não sei se pegou" && ! contains "aceito (rc 0)"'
 
 section "o pedido falha / não derruba o mini"
 mk_case rb_fail; echo 1 > "$C/reboot.rc"
@@ -168,7 +169,26 @@ mk_case rb_up   # reboot.rc 0 e o stub não mata ninguém
 run_sut --run
 check "mini vivo depois do pedido: rc 20 (veio $RC: $OUT)" [ "$RC" = 20 ]
 check "mini vivo depois do pedido: uma linha" one_line
-chk "mini vivo depois do pedido: diz que NÃO reiniciou, desfez a marca e avisou" 'contains "NÃO reiniciou" && ! state_has "reboots=$NOW" && grep -q "NÃO caiu" "$C/notify.log"'
+chk "mini vivo depois do pedido: diz que NÃO reiniciou, desfez a marca e avisou" 'contains "NÃO reiniciou" && contains "aceito (rc 0)" && ! state_has "reboots=$NOW" && grep -q "NÃO caiu" "$C/notify.log"'
+
+section "o AVISO não saiu: sem aviso CONFIRMADO não reinicia, e ninguém carimba 'já avisei' sem entrega (gate ga-24wp723)"
+mk_case nt_ok; touch "$C/reboot.dies"; run_sut --run
+check "o notify roda com NOTIFY_STRICT_EXIT=1 (sem ele rc 0 não prova entrega)" grep -q "NOTIFY_STRICT_EXIT=1" "$C/notify.env"
+mk_case nt_fail; echo 1 > "$C/notify.rc"; touch "$C/reboot.dies"; run_sut --run
+chk "push falhou e o mail ao Mayor saiu: reinicia e o log diz 'mail', não 'notify' (veio $RC)" '[ "$RC" = 143 ] && [ "$(n_mail)" = 1 ] && grep -q "aviso entregue por mail" "$C/log" && ! grep -q "aviso entregue por notify" "$C/log"'
+mk_case nt_dead; echo 1 > "$C/notify.rc"; echo 1 > "$C/gc.rc"; run_sut --run
+expect_no_reboot "push E mail falharam" 30 "não consegui AVISAR"
+chk "push E mail falharam: sem marca, espera de 10 min gravada e o log NÃO diz que o aviso saiu" '! state_has "reboots=$NOW" && state_has "defer_until=$((NOW + 600))" && ! grep -q "aviso entregue" "$C/log"'
+mk_case nt_to; stub notify "sleep 5"; setenv "DR4_NOTIFY_TIMEOUT_S=1"; echo 1 > "$C/gc.rc"; run_sut --run
+expect_no_reboot "push que estoura o prazo (não sei) E mail falho: prazo estourado não é 'entregue'" 30 "não consegui AVISAR"
+mk_case esc_dead; saved_state $((NOW - 3600)); echo 1 > "$C/notify.rc"; echo 1 > "$C/gc.rc"; run_sut --run
+chk "escalada sem entrega: NÃO grava esc_for e a linha não diz 'escalado' (veio: $OUT)" '[ "$RC" = 10 ] && ! state_has "esc_for=$((NOW - 3600))" && contains "escalada NÃO entregue" && ! contains "(escalado)"'
+echo 0 > "$C/gc.rc"; run_sut --run
+chk "só o mail voltou: a escalada sai na rodada seguinte e grava esc_for (veio: $OUT)" 'contains "(escalado)" && state_has "esc_for=$((NOW - 3600))"'
+mk_case thr_dead; echo 1 > "$C/sender.rc"; echo "central_sender_restart_safe: 1 envio(s) em voo" > "$C/sender.out"; echo 1 > "$C/notify.rc"; run_sut --run
+chk "adiamento cujo push NÃO saiu: não carimba defer_notify_ts (veio $RC)" '[ "$RC" = 10 ] && state_has "defer_notify_ts=0"'
+mk_case re_dead; echo "echo 1 > '$C/sender.rc'; echo 'central_sender_restart_safe: 1 envio(s) em voo' > '$C/sender.out'" > "$C/notify.hook"; echo 1 > "$C/notify.rc"; run_sut --run
+chk "cancelamento na releitura cujo push NÃO saiu: não carimba defer_notify_ts (veio $RC: $OUT)" '[ "$RC" = 10 ] && no_reboot && state_has "defer_notify_ts=0"'
 
 # ═══ disco, interruptor ═════════════════════════════════════════════════════════════════════════════════════════════════════════
 section "disco"
@@ -197,7 +217,7 @@ run_sut --run;  expect_no_reboot "cooldown (1 h atrás)" 10 "cooldown"
 chk "cooldown: escalou UMA vez (notify -p 5 + mail ao Mayor) e gravou esc_for" 'grep -q -- "-p 5" "$C/notify.log" && [ "$(n_mail)" = 1 ] && state_has "esc_for=$((NOW - 3600))"'
 run_sut --run;  chk "cooldown (2ª rodada): NÃO escala duas vezes pelo mesmo reinício (mail=$(n_mail))" '[ "$RC" = 10 ] && [ "$(n_mail)" = 1 ]'
 mk_case cool_dry; saved_state $((NOW - 3600))
-run_sut --dry-run; chk "cooldown em dry-run: rc 10, sem aviso e sem mail" '[ "$RC" = 10 ] && [ "$(n_notify)" = 0 ] && [ "$(n_mail)" = 0 ]'
+run_sut --dry-run; chk "cooldown em dry-run: rc 10, sem aviso e sem mail, e a linha NÃO diz 'escalado'" '[ "$RC" = 10 ] && [ "$(n_notify)" = 0 ] && [ "$(n_mail)" = 0 ] && contains "dry-run: não escalo" && ! contains "(escalado)"'
 mk_case cool_edge; saved_state $((NOW - 21600)); touch "$C/reboot.dies"
 run_sut --run;  check "cooldown: com exatamente 6 h já pode (kill 143; veio $RC: $OUT)" [ "$RC" = 143 ]
 mk_case cap; saved_state "$((NOW - 50000)),$((NOW - 30000))"
@@ -227,6 +247,8 @@ mk_case pre_fv;  echo "FileVault is On." > "$C/fdesetup.out"
 run_sut --run;  expect_no_reboot "FileVault ligado" 20 "FileVault"
 mk_case pre_fv3; echo 2 > "$C/fdesetup.rc"
 run_sut --run;  expect_no_reboot "fdesetup falha (não sei)" 30 "pré-checagem ilegível"
+mk_case pre_fv4; printf 'FileVault is Off.\nDeferred enablement appears to be active for user x.\n' > "$C/fdesetup.out"
+run_sut --run;  expect_no_reboot "FileVault 'Off' com habilitação ADIADA (liga no próximo login)" 20 "ADIADA"
 mk_case pre_al1; echo 1 > "$C/autologin.rc"; echo "The domain/default pair of (x, autoLoginUser) does not exist" > "$C/autologin.out"
 run_sut --run;  expect_no_reboot "autologin não configurado" 20 "autologin"
 mk_case pre_al2; echo "outro" > "$C/autologin.out"
@@ -282,6 +304,8 @@ mk_case u_calls2; echo 2 > "$C/calls.rc"; printf 'unknown\tpix: banco ausente\n'
 unk_case "leitor de ligações devolve unknown (rc 2)" "banco ausente"
 mk_case u_calls3; echo 7 > "$C/calls.rc"
 unk_case "leitor de ligações com rc estranho" "rc=7"
+mk_case u_calls4; echo 1 > "$C/calls.rc"; printf 'Traceback (most recent call last): ValueError\n' > "$C/calls.out"
+unk_case "leitor de ligações: rc 1 de TRACEBACK não é 'há ligação'" "rc=1"
 mk_case u_snd1; echo 2 > "$C/sender.rc"; echo "central_sender_restart_safe: NAO SEI se ha envio em voo" > "$C/sender.out"
 unk_case "envio: NÃO SEI (rc 2)" "sender"
 mk_case u_snd2; echo 1 > "$C/sender.rc"; echo "Traceback (most recent call last): ValueError" > "$C/sender.out"
