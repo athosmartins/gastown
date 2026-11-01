@@ -60,16 +60,24 @@ _SECRET_RES = (
     # scheme://user:password@host -- a DSN / URL with credentials (bounded runs, linear)
     re.compile(r"\b[a-z][a-z0-9+.-]{1,20}://[^\s/:@]{1,64}:[^\s/@]{3,}@"),
     # command-line shapes the `name=value` rule above cannot see (gate review of ga-d0hm85.1, medium finding). All are linear;
-    # the three that look for a flag AFTER a command word (curl, docker login, mysql) look at most 200 characters past it.
+    # the flags that only mean something after a command word (curl -u, docker login -p, mysql -p) are _SEGMENT_RULES below.
     # `--password VALUE` / `--token VALUE` with a SPACE; `--token-file x` and `--password-stdin` have a '-' right after the name
     re.compile(r"(?i)(?<![\w-])--(?:password|passwd|secret|token|api[_-]?key|access[_-]?key)\s+[^\s-]\S{5,}"),
     # `Authorization: <scheme> <value>` for any scheme word (Basic, Token, Digest...); the Bearer rule above wants the value first
     re.compile(r"(?i)\bauthorization\b['\"]?\s*[:=]\s*[A-Za-z][A-Za-z0-9_-]{0,20}\s+[A-Za-z0-9._~+/=-]{8,}"),
     re.compile(r"hooks\.slack\.com/services/[A-Za-z0-9]{6,}/[A-Za-z0-9]{6,}/[A-Za-z0-9]{8,}"),  # a Slack webhook URL is the credential
-    re.compile(r"(?i)\bcurl\b[^\n|;&]{0,200}?\s(?:-u|--user)\s+[^\s:]{1,64}:\S{3,}"),  # curl -u user:pass
-    re.compile(r"(?i)\b(?:docker|podman|nerdctl)\s+login\b[^\n|;&]{0,200}?\s(?:-p|--password)\s+\S{3,}"),  # docker login -p PASS
+)
+# A flag that is a credential only because of the command it belongs to: (command word, flag). The flag is looked for ANYWHERE after
+# the FIRST command word within one command segment (a newline, '|', ';' or '&' ends a segment). A bounded gap between the two
+# (a lazy {0,200}) was the first cut and let `curl <a few headers> -u user:pass` through once the flag sat 200+ characters in, still
+# inside the logged prefix (security review of the gate-fix commit). Linear: each segment gets one search for the word and one for
+# the flag; neither pattern has an unbounded run in front of an anchor.
+_SEGMENT_RES = re.compile(r"[^\n|;&]+")
+_SEGMENT_RULES = (
+    (re.compile(r"(?i)\bcurl\b"), re.compile(r"(?i)\s(?:-u|--user)\s+[^\s:]{1,64}:\S{3,}")),  # curl -u user:pass
+    (re.compile(r"(?i)\b(?:docker|podman|nerdctl)\s+login\b"), re.compile(r"(?i)\s(?:-p|--password)\s+\S{3,}")),  # docker login -p PASS
     # mysql -pPASS (no space: with a bare `-p` mysql prompts). `-P` is the PORT, so only the command word is case-insensitive.
-    re.compile(r"(?i:\bmysql(?:dump|admin|pump)?)\b[^\n|;&]{0,200}?\s-p\S{3,}"),
+    (re.compile(r"(?i:\bmysql(?:dump|admin|pump)?)\b"), re.compile(r"\s-p\S{3,}")),
 )
 # A secret that ENDS a block ("password:" and the value on the next line, which is the next block): the block that follows
 # is withheld too.
@@ -141,11 +149,28 @@ def _has_email(text: str) -> bool:
     return text.find("@", pos) >= 0  # do not send in that case
 
 
+def _has_segment_flag_secret(text: str) -> bool:
+    """True when one command segment holds a credential flag that belongs to its command (_SEGMENT_RULES): `curl ... -u user:pass`,
+    `docker login ... -p PASS`, `mysql ... -pPASS`. Each segment is walked once, so it is linear however far the flag sits from
+    the command word."""
+    for seg in _SEGMENT_RES.finditer(text):
+        s = seg.group(0)
+        if len(s) < 6:
+            continue  # shorter than the shortest command word plus a flag: nothing to find
+        for word_rx, flag_rx in _SEGMENT_RULES:
+            w = word_rx.search(s)
+            if w and flag_rx.search(s, w.end()):
+                return True
+    return False
+
+
 def egress_withhold_reason(text: str) -> str | None:
     """"secret" | "pii" | None. None is the only answer that lets text leave the machine; it means "none of the known
     shapes matched", NOT "this is safe". Never raises."""
     try:
-        if any(rx.search(text) for rx in _SECRET_RES) or _has_token_like_run(text):
+        # vazio (nenhum segmento tem palavra de comando + flag) → essa regra não casa, as outras seguem; falhou/ilegível (o scan
+        # levantou) → o except abaixo devolve "secret" e retém.
+        if any(rx.search(text) for rx in _SECRET_RES) or _has_segment_flag_secret(text) or _has_token_like_run(text):
             return "secret"
         if any(rx.search(text) for rx in _PII_RES) or _has_email(text):
             return "pii"
@@ -342,6 +367,26 @@ def _selftest() -> int:
         "mysql -pPASS": "mysql -h db -u root -ps3cretpw app",
     }.items():
         ok(f"egress guard (mainstream shapes the first cut missed): {label} -> secret", egress_withhold_reason(sample) == "secret")
+    # ---- security review of the gate-fix commit: the curl / docker login / mysql rules looked for the flag at most 200 characters past
+    # the command word, so `curl <a few headers> -u user:pass` (flag at 200..300, INSIDE the logged prefix) passed. The flag is now
+    # looked for anywhere after the command word within the same command segment (a newline, '|', ';' or '&' ends the segment).
+    far_flag = {
+        "curl -u": ("curl https://api.example.invalid/x", " -u admin:s3cretpw"),
+        "docker login -p": ("docker login registry.example.invalid", " -u me -p s3cretpw"),
+        "mysql -pPASS": ("mysql -h db -u root", " -ps3cretpw app"),
+    }
+    for label, (cmd_word, flag) in far_flag.items():
+        for gap in (150, 250, 450, 1500, 3500):
+            sample = cmd_word + " --opt" * (gap // 6) + flag
+            ok(f"far flag: {label}, flag ~{gap} characters after the command word -> secret, and the command is withheld",
+               egress_withhold_reason(sample) == "secret" and loggable_command(sample) == COMMAND_WITHHELD)
+    ok("far flag: the flag must be in the command's own segment -- before the command word, or past a ';' '|' newline, it is not that command's flag",
+       all(egress_withhold_reason(s) is None for s in (
+           "ls -u admin:s3cretpw ; curl https://x",
+           "curl https://x ; ls -u admin:s3cretpw",
+           "curl https://x | grep -u admin:s3cretpw",
+           "echo -u admin:s3cretpw curl",
+           "mysql -h db\nls -ps3cretpw")))
     for label, sample in {
         "git push -u": "git push -u origin main",
         "docker run -u uid:gid": "docker run -u app server",
@@ -388,7 +433,8 @@ def _selftest() -> int:
 
     t_lin = time.time()
     for hostile in ("A1" * 60000, ("a-" * 30000) + "Z9", "-----BEGIN X-----" * 400, "kind: Secret\n" * 400, "token:" * 20000, ("Ab1" * 40 + " ") * 5000,
-                    "curl " * 20000, "docker login " * 8000, "mysql " * 16000, "--token " * 12000, "Authorization:" * 8000):
+                    "curl " * 20000, "docker login " * 8000, "mysql " * 16000, "--token " * 12000, "Authorization:" * 8000,
+                    "curl;" * 25000, "curl -u " * 12000, ("curl -u " + "a" * 63 + " ") * 1500, ("mysql -p" + " ") * 12000):
         sensitive_spans(hostile)
         egress_withhold_reason(hostile[:10000])
     ok("the guard and the span scan stay linear on hostile 100k+ character inputs (production-shaped; bound generous, not tight, so load 60 cannot flake it)",
