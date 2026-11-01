@@ -20,8 +20,8 @@ so the file is now `docs/pending-engine-window/ga-j96y0n-nudge-dead-ttl.patch.AP
 
 ## Rule: stranded PENDING nudges
 **Do not re-fence, move or delete a PENDING nudge because its session ended. The engine's 24 h TTL is its
-garbage collector.** Measured on the live queue (49 items): 46 were fenced to a session whose bead is closed, and
-all 46 were pointers to a bead that holds the durable record:
+garbage collector.** Measured on the live queue on 2026-11-01 (census run: 50 pending): 46 were fenced to a session whose bead is
+closed, and all 46 were pointers to a bead that holds the durable record:
 
 | class (by the text) | stranded | durable record |
 |---|---|---|
@@ -65,7 +65,7 @@ them. `assets/scripts/nudge-pollers-prune.py` removes a stem only when it is dea
   is the worst of the two.
 - Logs (one json line per run): `$GC_CITY_RUNTIME_DIR/packs/town-deltas/nudge-pollers-prune.jsonl` and
   `nudge-stranded-census.jsonl`.
-- Selftest: `assets/scripts/nudge-state-hygiene.selftest.sh` (71 assertions, ~12 s); `NSH_PRUNE_UNDER_TEST`,
+- Selftest: `assets/scripts/nudge-state-hygiene.selftest.sh` (75 assertions, ~12 s); `NSH_PRUNE_UNDER_TEST`,
   `NSH_CENSUS_UNDER_TEST`, `NSH_WRAPPER_UNDER_TEST` run it against a mutated copy.
 
 ## Not verified
