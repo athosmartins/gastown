@@ -1,0 +1,51 @@
+# disk-recovery-d2-allowlist.tsv — a ALLOWLIST do degrau D2 da escada de recuperação de disco (ga-1p1i5jr.2).
+#
+# ## Contents
+#   Formato · O que entra · Linhas ATIVAS · Candidatos REJEITADOS (e por quê) · Como promover um candidato
+#
+# FORMATO. Uma linha por job, 9 colunas separadas por TAB (nunca espaço; campo vazio = `-`). Linha em branco e linha que começa com `#` são ignoradas.
+#   1 id               nome curto, minúsculas/dígitos/ponto/hífen (é a chave do registro de "o que foi parado")
+#   2 adapter          COMO ler o run_id e COMO retomar (código em disk-recovery-d2-heavy-jobs.sh; hoje só `rfb`; a leitura do run_id já está, a retomada automática é a fatia ga-1p1i5jr.2.1)
+#   3 match_regex      ERE aplicada à linha de comando COMPLETA do processo (ps -axww). Âncora no começo: só o interpretador do job casa
+#   4 parent_regex     ERE aplicada à linha de comando do PAI. O job de verdade tem o pai do launchd (job_timeout.sh ...); um `python3 -m py_compile` ou um
+#                      --dry-run rodado por gente/teste NÃO tem esse pai e nunca é tocado
+#   5 stop_below_mb    só PARA se o livre do volume de dados estiver <= isso (MB)
+#   6 resume_above_mb  só RETOMA se o livre estiver >= isso (MB). Tem de ser MAIOR que a coluna 5 (histerese: senão para e retoma em loop)
+#   7 resume_window    janela em que a retomada é permitida, `H1-H2` em horas locais (21-6 = das 21h às 6h) ou `-` = a qualquer hora
+#   8 resume_max_age_s depois disso o run parado é ABANDONADO (o dado que o retomaria já não vale); `-` = nunca expira
+#   9 como             texto livre: COMO para e COMO retoma (é a documentação viva; o código faz o que está aqui)
+#   Nesta fatia o --run só APLICA a coluna 5; as colunas 6 a 8 são lidas e validadas e as 6 e 7 vão na dica de retomada à mão. Quem as aplica é o --resume (ga-1p1i5jr.2.1).
+#
+# O QUE ENTRA. Só entra job que (a) é lote em segundo plano, reiniciável, (b) um SIGTERM no meio não deixa o destino inconsistente, (c) tem retomada que não
+# perde o trabalho já feito (ou o livre é tão baixo que perder vale a pena), e (d) um kill dele não vira alarme para o Athos. Nada fora desta lista é parado
+# pelo D2: o script casa por regex contra ESTA lista, não por tamanho de memória — "o maior consumidor" nunca é critério.
+#
+# LINHAS ATIVAS
+#
+# rfb-monthly-refresh — o refresh mensal do espelho RFB por stream (com.whatsapp.rfb-monthly-refresh, 00:15 diário, ~5-11 h). Medido em 01/11: pegada ~2,2 GB
+# de memória (o RSS mostra 43 MB; o que pesa é a memória comprimida/em swap, e o swap sai do MESMO disco). Não grava dump local (temp_directory='').
+# RETOMA POR TABELA, NÃO DO PONTO: cada tabela que termina e é verificada grava `_meta/stream-run-<run_id>.<tabela>.json` no S3; a tabela em andamento
+# recomeça do ZERO (horas). Por isso o piso de parada é BAIXO (3072 MB = 3 GB, a regra do bead "se recomeça do zero, só pare abaixo de 3 GB"), não os 5 GB em
+# que o D2 é chamado. Retomar é explícito (`--resume-run <id>`), dentro da janela 21-6 e do portão de disco do próprio job (8,25 GiB = 8448 MB). O tick
+# das 00:15 seguinte começa um run NOVO e apaga chaves temporárias com mais de 24 h: por isso 86400 s de validade.
+# Sinal: TERM no python (SIGINT não serve: sob launchd o filho de `&` herda SIGINT ignorado, medido). O job_timeout.sh (pai) repassa e sai 143, sem push
+# (só o estouro de tempo no modo hard avisa; este job é --soft).
+rfb-monthly-refresh	rfb	^[^ ]*[Pp]ython[^ ]* ([^ ]+ )*[^ ]*scripts/rfb_(monthly|stream)_refresh\.py( |$)	job_timeout\.sh [0-9]+ com\.whatsapp\.rfb-(monthly-refresh|stream-resume)	3072	8448	21-6	86400	para: SIGTERM no python, KILL após a graça; retoma: rfb_stream_refresh.py --resume-run <run_id> (checkpoint por tabela no S3; a tabela em andamento recomeça do zero), janela 21-6, livre >= 8448 MB
+
+# CANDIDATOS REJEITADOS (o registro existe para ninguém repetir a análise; razão = o que foi medido/lido em 01/11/2026)
+#
+# lotes-rebuild — scripts/map_viewer/rebuild_lotes_layer.py via launchd/lotes-rebuild-wrapper.sh.
+#   Rejeitado: (1) o wrapper manda "job falhou" por notify a QUALQUER saída não-zero — parar no D2 acordaria o Athos por algo que o D2 fez de propósito;
+#   (2) constrói num banco de trabalho local (_lotes_work_local) e publica a camada no fim; NÃO provei que um kill no meio da publicação deixa a camada
+#   consistente. Para promover: o wrapper entender um marcador "parado pelo D2" (sem push) + prova de que a publicação é atômica.
+# property-search-rebuild — scripts/build_property_search_db.py via launchd/property-search-rebuild-wrapper.sh.
+#   Rejeitado SÓ pelo alarme: o construtor é atômico (arquivo temporário + os.replace) e `--if-changed` é barato e reiniciável, MAS o wrapper empurra toda
+#   saída não-zero ao Athos (wa-c9yaz: "não pode falhar calado"). Para promover: o mesmo marcador "parado pelo D2". É o candidato mais próximo de entrar.
+# sync-to-motherduck — .property-scrapers/runtime/main/scripts/sync_to_motherduck.py.
+#   Rejeitado: escreve num destino externo (MotherDuck) e eu não tenho prova de que um kill no meio o deixa consistente nem de que retomar não repete a carga.
+# jsonl-archive-pack — `git pack-objects` em .gc/runtime/packs/maintenance/jsonl-archive.
+#   Rejeitado: é manutenção do próprio hq (dono: a rotina de arquivo), não um lote reiniciável; matar um pack-objects deixa `tmp_pack_*` no disco — PIORA
+#   o aperto que o D2 quer aliviar. A limpeza desses restos é do D1 (safe-clean), não do D2.
+#
+# COMO PROMOVER UM CANDIDATO. (1) Provar (a)-(d) acima com medição, não com leitura de código; (2) se precisa de run_id/retomada própria, escrever o adapter em
+# disk-recovery-d2-heavy-jobs.sh E o caso no selftest; (3) acrescentar a linha ATIVA aqui, com a razão e o piso de parada justificado; (4) rodar o selftest.
