@@ -109,5 +109,5 @@ notice text is ASCII (ntfy sends the title as an HTTP header).
 - The live queue changed between the two measurements (2 of the 5 `oracle-wa` PENDING items had become DEAD, expired).
 - The cost of a run on the live city is not measured (built on the Hetzner node, which has no city): the first runs of
   the jsonl log carry `duration_s`. The 150 s budget and the 240 s timeout are bounds, not measurements.
-- Not run on the mini: `notify` resolving in the order's PATH, the mini's `python3` version (tested on 3.12 only), and what
-  the engine does with the cooldown of a run that exited non-zero (taken from the watchdog's own header).
+- Not run on the mini: `notify` resolving in the order's PATH, the mini's own `python3` (the selftest passes on 3.9.25, 3.12 and
+  3.14.8), and what the engine does with the cooldown of a run that exited non-zero (taken from the watchdog's own header).
