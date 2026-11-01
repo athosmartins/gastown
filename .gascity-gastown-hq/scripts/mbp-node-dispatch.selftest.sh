@@ -230,8 +230,12 @@ unset MBP_NODE_GATE_CMD MBP_NODE_SESSIONS_CMD
 fresh '{"description":"Em lib/foo_parser.py a funcao quebra com string vazia. Teste em tests/test_foo_parser.py."}'
 REAL_CLS_SAVED="$MBP_NODE_CLASSIFY"; unset MBP_NODE_CLASSIFY; d check wa-t1; expect_rc "classificador real: código + teste citados -> node (0)" 0 w0
 printf '%s' "$OUT" | grep -q '"verdict": "node"' && ok "classificador real: a saída é a do classificador do WA" || bad "classificador real: saída $OUT"
-fresh '{"description":"lib/foo.py lê queue.db; tests/test_foo.py"}'
-d check wa-t1; expect_rc "classificador real: cita banco (queue.db) -> mini (10)" 10 w0
+fresh '{"description":"lib/foo.py lê data/helper.py; tests/test_foo.py"}'
+d check wa-t1; expect_rc "classificador real: cita código que o filtro não deixa sair (data/helper.py) -> mini (10)" 10 w0
+fresh '{"description":"lib/foo.py mede queue.db; tests/test_foo.py"}'
+d check wa-t1; expect_rc "classificador real: queue.db citado como PROVA, com código e teste -> node (0) (ga-t05a1z9)" 0 w0
+fresh '{"description":"o teste tests/test_foo.py mede queue.db"}'
+d check wa-t1; expect_rc "classificador real: queue.db citado SEM código -> segue mini (10)" 10 w0
 fresh '{"description":"Em lib/foo_parser.py a funcao quebra. Teste em tests/test_foo_parser.py."}'
 d apply wa-t1; expect_rc "classificador real + apply: bead com código e teste -> 0" 0
 [ "$(bead '."wa-t1".assignee')" = wa-worker-remote-mbp-1 ] && ok "classificador real + apply: dono wa-worker-remote-mbp-1" || bad "classificador real + apply: $(jq -c '."wa-t1"' "$STATE")"

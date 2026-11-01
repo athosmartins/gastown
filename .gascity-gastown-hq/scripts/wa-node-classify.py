@@ -21,6 +21,14 @@ COMO DECIDE (a 1ª regra que casa vale; tudo é lido da bead, nada é gravado ne
      = volta à regra acima (mini) e `info` leva `espelho-ilegivel:<motivo>`; json/txt/yaml... nunca ganham a exceção (é onde mora dado com nome neutro). O `.md` entregue vai em `info` como
      `via-espelho:<caminho>`; ele não conta como prova (nem código nem teste); (b) a bead (todos os campos, metadata
      incluída) tem telefone ou CPF com a forma do hetzner-pii-scan.py, porque o TEXTO da bead viaja ao nó e dado de lead não pode ir junto                               -> mini
+     EVIDÊNCIA ≠ DEPENDÊNCIA (ga-t05a1z9): a bead cita banco/log/json como PROVA medida ("medido em queue.db"), não como algo que o código leia para ser construído ou testado. Um caminho que o nó não recebe
+     (o filtro o segura, ou ele veio fora do formato: absoluto, `~/`, `$HOME/`, molde `<data>-x.json`) deixa de ser duro e vira `info` `evidencia-de-dado:<caminho>` quando (i) é arquivo de dado/log: extensão
+     EVIDENCE_EXT, ou qualquer extensão que não seja código/.plist/.sql/.env dentro de uma pasta data/dados/logs; (ii) o nome NÃO parece segredo (SECRET_*, inclui português: segredo, chave, senha...); e (iii) a bead
+     cita >=1 arquivo de CÓDIGO que o filtro deixa passar (nome solto que não existe na árvore não conta). Um `.md` que o rsync não nega por regra mas o espelho RETÉM (a varredura de conteúdo achou telefone/CPF nele:
+     docs/data_dictionary.md tem 38 telefones e 4 CPFs) segue a mesma regra como `evidencia-de-doc:<caminho>` — e NUNCA vai ao nó. Espelho ilegível não retém nada: o doc segue duro. Sem código citado, código fora do
+     filtro, nome com cara de segredo e `.plist`/`.sql`/`.env` seguem duros como antes; telefone/CPF no texto (b) continua duro e vence a evidência. O dado em si continua sem ir ao nó: quem garante é o filtro do
+     rsync + a varredura do espelho, que não mudam aqui. O token de evidência também sai do texto das MOLES (regra 4), do mais longo ao mais curto: `queue.db` citado não é `moles:banco-de-dados` e
+     `/Users/.../x.db` citado não é `moles:host-mac`; a palavra mole escrita em prosa ("banco", "token", "login") segue valendo.
   4. MOLES (palavras que dizem "toca recurso vivo": banco real, credencial, host Mac): `node:ok` (decisão humana) as ignora e o motivo `moles-ignoradas` fica na resposta; sem
      `node:ok`                                                                                      -> mini
      INFORMATIVAS (produção/deploy, tela, lead, cliente, terreno, envio...): vocabulário do produto e da entrega, NÃO bloqueiam; vão para `info`, que o Pilot grava no jsonl da sombra
@@ -117,6 +125,15 @@ CANARY_DOC = "docs/zz_wa_node_canary.md"                             # a visão 
 CANARY_OPEN_NO = ("shared/zz_wa_node_canary.md", "logs/zz_wa_node_canary.md")   # pasta que nunca sai (Seção 3): a visão "só negações" TEM de segurar mesmo sendo .md
 CANARY_MIRROR_NO = ("data/zz_wa_node_canary.json", "zz_wa_node_canary.db", ".env")   # o espelho TEM de segurar (as mesmas famílias que a Seção 1 / pastas de dado)
 MIRROR_MIN_RULES = 20                                                # a Seção 1 traduzida tem mais que isto; menos = filtro cortado
+# evidência ≠ dependência (ga-t05a1z9): a bead cita um banco, log ou doc como PROVA medida ("medido em queue.db"), não como algo que o código precise ler para ser construído ou testado. Caminho de DADO/LOG que o nó
+# não recebe deixa de ser regra dura e vira `info`, mas só se a bead cita >=1 arquivo de CÓDIGO que o filtro deixa passar. O dado em si continua sem ir ao nó (quem garante é o filtro do rsync + a varredura do espelho,
+# que não mudam aqui) e telefone/CPF no texto continua duro. Código, .env/.plist/.sql e nome com cara de segredo (SECRET_*, em português também) nunca são evidência: seguem duros.
+EVIDENCE_EXT = ("db", "sqlite", "sqlite3", "log", "json", "jsonl", "csv", "parquet", "xlsx")
+EVIDENCE_DIRS = ("data", "dados", "logs")                            # pasta de dado/log: um SEGMENTO do caminho (shared/data/x.db tem o `data`)
+NOT_EVIDENCE_EXT = CODE_EXT + ("sql", "plist", "env")                # código e config de host/segredo que o nó não recebe são dependência de verdade, mesmo dentro de uma pasta de dado
+SECRET_PREFIX = ("segred", "chave", "senha", "secret", "token", "credenc", "credential", "passw", "privat", "privad", "oauth", "jwt", "cookie", "keystore", "apikey", "auth", "login", "cert")
+SECRET_WORD = ("key", "keys", "pem", "p12", "pfx", "env", "pass", "pwd", "netrc")   # palavra INTEIRA: `key` casa map_key.json mas não monkey_patch.json
+MAX_EVIDENCE_INFO = 8                                                # evidências nomeadas em `info`; o resto vira `evidencia-de-dado-mais:N`
 # regra 6 (teste derivado, ga-2hd02v.3.15): o teste que o repo do WA já tem para o código citado
 REPO_DIR = os.environ.get("WA_NODE_REPO", REPO_ABS.rstrip("/"))      # o repo do WA no mini: dele saem a árvore e o conteúdo dos testes
 REPO_REF = os.environ.get("WA_NODE_REPO_REF", "origin/main")         # o que o espelho entrega ao nó; nunca a árvore de trabalho (o que não está commitado o nó não tem)
@@ -226,10 +243,12 @@ def labels_of(b):
 
 
 def extract_paths(text):
-    """(caminhos válidos em ordem, motivos duros). Caminho fora do formato seguro vira motivo duro: nunca vai ao disco."""
-    seen, out, hard = set(), [], []
-    if HOME_RE.search(text):
-        hard.append("caminho-fora-do-formato")
+    """(caminhos válidos em ordem, motivos duros, caminhos FORA DO FORMATO). Caminho fora do formato seguro (absoluto, `..`, `~/`, `$VAR/`, segmento torto) NUNCA vai ao disco; quem chama decide se ele é
+    motivo duro (`caminho-fora-do-formato`) ou evidência de dado (evidence_kind): aqui só se junta o que foi visto, cada texto uma vez: primeiro os `~/`/`$VAR/`, depois os demais, cada grupo na ordem em que aparece na bead."""
+    seen, out, hard, odd = set(), [], [], []
+    for m in HOME_RE.finditer(text):   # ~/x.json, $HOME/x.py: o nó não tem o home do Mac
+        if m.group(0) not in odd:
+            odd.append(m.group(0))
     for m in PATH_RE.finditer(text):
         p = m.group(1)
         if p.startswith(REPO_ABS):
@@ -241,13 +260,34 @@ def extract_paths(text):
         seen.add(p)
         segs = p.split("/")
         if p.startswith("/") or any(s in ("", ".", "..") for s in segs) or not all(SAFE_SEG.match(s) for s in segs):
-            hard.append("caminho-fora-do-formato")
+            if p not in odd:
+                odd.append(p)
             continue
         if len(out) >= MAX_PATHS:   # o 41º caminho válido estoura o teto; exatamente 40 ainda vale
             hard.append("caminhos-demais")
             break
         out.append(p)
-    return out, hard
+    return out, hard, odd
+
+
+def secretish(p):
+    """True se o NOME do caminho parece segredo (segredo/chave/senha/token/credencial/.pem...). Só olha o texto do caminho. Existe porque a palavra mole `credencial` do SOFT só conhece o inglês (`secret\\w*`,
+    `credencia\\w*`): `~/segredos/chave.json` não pode virar "evidência de dado" por ser .json. Na dúvida é True (o caminho segue duro, como era antes de ga-t05a1z9)."""
+    toks = [t for t in re.split(r"[^a-z0-9]+", norm(p)) if t]
+    return any(t.startswith(SECRET_PREFIX) or t in SECRET_WORD for t in toks)
+
+
+def evidence_kind(p):
+    """"dado" se `p` (um caminho que o nó NÃO recebe) é arquivo de DADO/LOG: extensão de dado (EVIDENCE_EXT) ou, com qualquer extensão que não seja código/config de host, dentro de pasta de dado/log
+    (EVIDENCE_DIRS). Código, .plist/.sql/.env, caminho sem extensão e nome com cara de segredo -> "" (dependência de verdade: segue duro). Só olha o texto do caminho; não lê nada."""
+    segs = p.split("/")
+    base = segs[-1]
+    ext = base.rsplit(".", 1)[-1].lower() if "." in base else ""
+    if not ext or ext in NOT_EVIDENCE_EXT or secretish(p):
+        return ""
+    if ext in EVIDENCE_EXT or any(s.lower() in EVIDENCE_DIRS for s in segs[:-1]):
+        return "dado"
+    return ""
 
 
 def sent_by_filter(paths, only_denies=False):
@@ -360,20 +400,21 @@ def mirror_denied(rules, paths):
 
 
 def mirror_reach(cands):
-    """(caminhos que chegam ao nó PELO ESPELHO, nota para `info`). `cands`: caminhos de texto (MIRROR_TEXT_EXT) que o rsync não lista. Chegam se (1) o filtro do rsync não os NEGA por regra
-    (segredo, dado, pasta que nunca sai) e (2) o filtro do espelho, com a varredura de conteúdo, também não. Qualquer leitura que falhe -> nenhum chega + nota `espelho-ilegivel:<motivo>`
-    (o mesmo resultado de antes desta regra: caminho fora do filtro -> mini)."""
+    """(caminhos que chegam ao nó PELO ESPELHO, nota para `info`, caminhos que o ESPELHO RETEVE). `cands`: caminhos de texto (MIRROR_TEXT_EXT) que o rsync não lista. Chegam se (1) o filtro do rsync não os NEGA por regra
+    (segredo, dado, pasta que nunca sai) e (2) o filtro do espelho, com a varredura de conteúdo, também não. Retidos = passam em (1) e o espelho nega em (2) (a varredura de conteúdo achou telefone/CPF neles,
+    ex.: docs/data_dictionary.md, ga-t05a1z9): continuam sem ir ao nó; quem chama pode tratá-los como referência citada, nunca como algo que chegou. Qualquer leitura que falhe -> nenhum chega, NENHUM é retido
+    + nota `espelho-ilegivel:<motivo>` (o mesmo resultado de antes desta regra: caminho fora do filtro -> mini; "não consegui ler" nunca vira "retido")."""
     if not cands:
-        return [], []
+        return [], [], []
     try:
         open_sent = sent_by_filter(cands, only_denies=True)
         ok = [p for p in cands if p in open_sent]
         if not ok:
-            return [], []
+            return [], [], []
         denied = mirror_denied(mirror_rules(), ok)
-        return [p for p in ok if p not in denied], []
+        return [p for p in ok if p not in denied], [], [p for p in ok if p in denied]
     except Unreadable as e:
-        return [], ["espelho-ilegivel:" + str(e)]
+        return [], ["espelho-ilegivel:" + str(e)], []
 
 
 RESOLVE_EXT = CODE_EXT + ("html", "md")   # nome solto só é trocado se for código/texto; nome solto de dado (.db, .csv, .log, .json...) nunca: segue julgado como arquivo da raiz, que o filtro não manda
@@ -859,7 +900,7 @@ def classify(b):
         return "mini", ["etiqueta-node:mini"], [], [], info
     if b.get("issue_type") == "epic":
         return "mini", ["epic"], [], [], info
-    paths, hard = extract_paths(text)
+    paths, hard, odd = extract_paths(text)
     # o texto inteiro da bead (todos os campos, metadata incluída) vai ao nó: dado de lead nele é duro. json.dumps do que o json.loads leu não falha
     if has_pii(json.dumps(b, ensure_ascii=False)):
         hard.append("dado-no-texto")
@@ -868,12 +909,12 @@ def classify(b):
     globs = mac_only_globs() if paths else []
     # texto neutro que o rsync não lista mas o espelho entrega (docs/, DESIGN.md...): só os .md fora da lista pagam a consulta ao espelho; os demais caminhos seguem como antes.
     # vazio (nenhum .md fora da lista) -> o espelho nem é consultado; falhou/ilegível -> nenhum chega e `info` leva espelho-ilegivel:<motivo> (o caminho segue 'fora do filtro' = mini, como antes desta regra)
-    via_mirror, note = mirror_reach([p for p in paths if p not in sent and p.rsplit(".", 1)[-1].lower() in MIRROR_TEXT_EXT]) if paths else ([], [])
+    via_mirror, note, withheld = mirror_reach([p for p in paths if p not in sent and p.rsplit(".", 1)[-1].lower() in MIRROR_TEXT_EXT]) if paths else ([], [], [])
     info += loose_note + note + ["via-espelho:" + p for p in via_mirror]
-    code, tests = [], []
+    code, tests, blocked = [], [], []
     for p in paths:
         if p not in sent and p not in via_mirror:
-            hard.append("caminho-fora-do-filtro:" + p)
+            blocked.append(("caminho-fora-do-filtro:" + p, p, p))   # duro, a não ser que seja evidência de dado (decidido abaixo, quando já se sabe se a bead cita código)
         elif any(fnmatch.fnmatchcase(p, g) for g in globs):
             hard.append("so-no-mac:" + p)
         elif p in via_mirror:
@@ -883,9 +924,30 @@ def classify(b):
         elif p.rsplit(".", 1)[-1] in CODE_EXT:
             code.append(p)
         # senão: o filtro deixa sair (ex.: /templates/x.html, /CLAUDE.md) e o nó o tem, mas não é código nem teste: nem bloqueia nem conta como prova
+    # evidência ≠ dependência (ga-t05a1z9): o que o filtro ou o formato seguraram é motivo duro, EXCETO caminho de dado/log (ou doc que o espelho reteve) quando a bead cita >=1 arquivo de CÓDIGO que o filtro deixa
+    # passar (nome solto que não existe na árvore, `ghosts`, não é código). Vira `info` (evidencia-de-dado:/evidencia-de-doc:), nunca vai ao nó: o filtro e o espelho seguem segurando o dado.
+    # vazio (nada segurado, ou bead sem código citado) -> nenhuma evidência: o que foi segurado continua duro, como antes; falhou (espelho ilegível: `withheld` vem vazio + nota `espelho-ilegivel`) -> o doc continua
+    # duro, "não consegui ler" nunca vira "retido" nem evidência. Nome com cara de segredo (secretish) e código/.plist/.sql/.env fora do filtro nunca são evidência.
+    blocked += [("caminho-fora-do-formato", o, o) for o in odd]
+    has_code = any(c not in ghosts for c in code)
+    evid = []
+    for why_hard, p, tok in blocked:
+        kind = "doc" if p in withheld and not secretish(p) else evidence_kind(p)
+        if has_code and kind:
+            evid.append((kind, p, tok))
+        else:
+            hard.append(why_hard)
+    names = ["evidencia-de-%s:%s" % (k, p) for k, p, _ in evid]
+    info += names[:MAX_EVIDENCE_INFO] + (["evidencia-de-dado-mais:%d" % (len(names) - MAX_EVIDENCE_INFO)] if len(names) > MAX_EVIDENCE_INFO else [])
     if hard:
         return "mini", sorted(set(hard)), paths, tests, info
-    soft = [slug for slug, rx in SOFT_RE if rx.search(ntext)]
+    # a palavra mole não pode vir do próprio caminho de evidência: `queue.db` casa `\.db\b` (banco) e `/Users/athos/shared/data/x.db` casa `/users/` (host Mac) só por estarem CITADOS como prova. Tira os tokens
+    # de evidência do texto das moles; "banco", "sqlite", "token"... escritos em prosa continuam valendo, e o `ntext` das INFORMATIVAS não muda.
+    # do MAIS LONGO ao mais curto: o nome solto `x.db` está dentro do absoluto `/Users/.../x.db`; tirando o curto primeiro o longo deixa de casar e sobra `/users/` (host Mac) do próprio caminho de evidência
+    soft_text = ntext
+    for tok in sorted(set(norm(t.replace(REPO_ABS, "")) for _, _, t in evid), key=len, reverse=True):
+        soft_text = soft_text.replace(tok, " ")
+    soft = [slug for slug, rx in SOFT_RE if rx.search(soft_text)]
     override = "node:ok" in labels
     if soft and not override:
         return "mini", ["moles:" + s for s in soft], paths, tests, info

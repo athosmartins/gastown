@@ -574,8 +574,13 @@ cmt_ok "identidade com _ - . e dígitos passa" ga-2hd02v.4.1 ps_node-dispatch.v2
 fresh; unset WA_NODE_CLASSIFY
 jq -c '."wa-t1" += {"description":"Em lib/foo_parser.py a funcao quebra com string vazia. Teste em tests/test_foo_parser.py."}' "$STATE" > "$STATE.n" && mv "$STATE.n" "$STATE"
 d apply wa-t1; expect_rc "ponta a ponta com o classificador real: bead de código+teste -> 0" 0
-fresh; jq -c '."wa-t1" += {"description":"lib/foo.py lê queue.db; tests/test_foo.py"}' "$STATE" > "$STATE.n" && mv "$STATE.n" "$STATE"
-d apply wa-t1; expect_rc "ponta a ponta com o classificador real: bead que cita .db -> 10 sem escrita" 10 w0
+fresh; jq -c '."wa-t1" += {"description":"lib/foo.py lê data/helper.py; tests/test_foo.py"}' "$STATE" > "$STATE.n" && mv "$STATE.n" "$STATE"
+d apply wa-t1; expect_rc "ponta a ponta com o classificador real: bead que cita código que o filtro não deixa sair -> 10 sem escrita" 10 w0
+# ga-t05a1z9: banco citado como PROVA (com código e teste) já não é duro; sem código citado segue duro e a bead fica no mini sem escrita
+fresh; jq -c '."wa-t1" += {"description":"lib/foo.py mede queue.db; tests/test_foo.py"}' "$STATE" > "$STATE.n" && mv "$STATE.n" "$STATE"
+d apply wa-t1; expect_rc "ponta a ponta com o classificador real: .db citado como prova + código + teste -> 0" 0
+fresh; jq -c '."wa-t1" += {"description":"o teste tests/test_foo.py mede queue.db"}' "$STATE" > "$STATE.n" && mv "$STATE.n" "$STATE"
+d apply wa-t1; expect_rc "ponta a ponta com o classificador real: .db citado SEM código -> 10 sem escrita" 10 w0
 export WA_NODE_CLASSIFY="$T/cls.py"
 
 # ---- controle negativo

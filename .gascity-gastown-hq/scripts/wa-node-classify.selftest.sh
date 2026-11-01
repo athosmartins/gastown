@@ -13,6 +13,8 @@
 #   envio no texto manda ao mini (freio-derivado; lead/terreno/lote/construtora NÃO freiam mais, ga-2hd02v.3.21); repo/ref/git/grep/espelho que falham dão unknown COM a nota e vazio dá unknown SEM nota (três estados).
 #   · CÓDIGO DERIVADO DO TESTE (ga-2hd02v.3.21, regra 8): teste citado e NENHUM código -> o código que o teste IMPORTA (import/from em Python por ast, require/import em JS, lidos em origin/main); só existente e de código (não tests/),
 #   pelos MESMOS filtros do citado (fora do filtro / só no Mac = mini; mais de 10 = nenhum); a regra 7 e a 5 vencem a 8; teste novo, sem import do repo, import dinâmico ou apoio de teste = unknown SEM nota; git show/parse/repo que falham = unknown COM a nota.
+#   · EVIDÊNCIA ≠ DEPENDÊNCIA (ga-t05a1z9): banco/log/json citado como PROVA vira `info` (evidencia-de-dado:/evidencia-de-doc:) e não barra, mas só com >=1 código citado que o filtro deixa passar; segue duro dado sem
+#   código, código fora do filtro, .plist/.sql/.env, nome com cara de segredo (português também) e telefone/CPF; absoluto/~/$HOME de dado também é evidência; o token sai do texto das moles (do mais longo ao mais curto).
 # CONTROLE NEGATIVO: cada mutante abaixo troca UMA linha do classificador numa cópia e o caso designado tem de reprovar; mutante que sobrevive reprova esta bateria. Um mutante só vale se o
 #   ORIGINAL passa o mesmo caso no mesmo ambiente e se ele não morre por causa do ambiente (ver as 3 regras acima de mk_mutant); caso e mutante de rsync usam stubs que só o mutante separa do original.
 # COMO RODAR: bash scripts/wa-node-classify.selftest.sh   (macOS /bin/bash 3.2 e Linux). Pesado o bastante para ir ao nó: scripts/mbp-run.sh --repo hq scripts/wa-node-classify.selftest.sh
@@ -38,6 +40,10 @@ check() { run "$1"; [ "$RC" = "$2" ] && printf '%s' "$OUT" | grep -q -E -e "$3";
 expect() { # expect <rótulo> <json> <rc> <regex>
   if check "$2" "$3" "$4"; then ok "$1"; else bad "$1 (rc=$RC, esperado $3; saída: $(printf '%s' "$OUT" | cut -c1-230))"; fi
 }
+expect_not() { # expect_not <rótulo> <json> <rc> <regex que NÃO pode aparecer na saída> — o rc tem de bater E a saída não pode casar (ex.: o doc retido NÃO chegou pelo espelho)
+  run "$2"
+  if [ "$RC" = "$3" ] && ! printf '%s' "$OUT" | grep -q -E -e "$4"; then ok "$1"; else bad "$1 (rc=$RC, esperado $3 sem /$4/; saída: $(printf '%s' "$OUT" | cut -c1-230))"; fi
+}
 labels() { printf '%s' "${1%\}},\"labels\":$2}"; }
 field() { printf '%s' "${1%\}},\"$2\":$3}"; }
 
@@ -57,7 +63,8 @@ expect "node: telefone sintético (cauda repetida) não conta como dado" "$(DESC
 # ---- mini
 expect "mini: etiqueta node:mini vence node:ok" "$(labels "$GOOD" '["node:ok","node:mini"]')" 10 'etiqueta-node:mini'
 expect "mini: epic" "$(field "$GOOD" issue_type '"epic"')" 10 '"reasons": \["epic"\]'
-expect "mini: banco .db citado (o filtro segura)" "$WITHDB" 10 'caminho-fora-do-filtro:queue\.db'
+expect "mini: banco .db citado SEM código (o filtro segura; evidência exige código citado, ga-t05a1z9)" "$(DESC 'o teste tests/test_x.py mede queue.db')" 10 'caminho-fora-do-filtro:queue\.db'
+expect "mini: banco citado em PROSA ainda é mole, mesmo com o .db virando evidência (ga-t05a1z9)" "$WITHDB" 10 'moles:banco-de-dados'
 expect "mini: pasta data/ citada (o filtro segura mesmo sendo .py)" "$(DESC 'lib/x.py usa data/helper.py; tests/test_x.py')" 10 'caminho-fora-do-filtro:data/helper\.py'
 expect "mini: credentials*.json citado" "$(DESC 'lib/x.py lê config/credentials_prod.json; tests/test_x.py')" 10 'caminho-fora-do-filtro:config/credentials_prod\.json'
 expect "mini: doc .md fora do filtro, SEM espelho legível (cai no filtro do rsync e diz por quê)" "$(DESC 'lib/x.py conforme docs/guia.md; tests/test_x.py')" 10 'caminho-fora-do-filtro:docs/guia\.md.*espelho-ilegivel:espelho-sem-resposta'
@@ -67,18 +74,48 @@ expect "mini: banco citado sem etiqueta (mole)" "$(DESC 'lib/x.py abre um sqlite
 expect "mini: credencial citada sem etiqueta" "$(DESC 'lib/x.py usa o token do pdpj; tests/test_x.py')" 10 'moles:credencial'
 expect "mini: host Mac citado sem etiqueta" "$(DESC 'lib/x.py roda osascript; tests/test_x.py')" 10 'moles:host-mac'
 expect "node:ok ignora a mole e DIZ que ignorou" "$(labels "$(DESC 'lib/x.py abre um sqlite; tests/test_x.py')" '["node:ok"]')" 0 'moles-ignoradas:banco-de-dados'
-expect "duro vence node:ok: caminho que o filtro segura" "$(labels "$WITHDB" '["node:ok"]')" 10 'caminho-fora-do-filtro:queue\.db'
+expect "duro vence node:ok: caminho que o filtro segura" "$(labels "$(DESC 'lib/x.py usa data/helper.py; tests/test_x.py')" '["node:ok"]')" 10 'caminho-fora-do-filtro:data/helper\.py'
+expect "duro vence node:ok: dado SEM código citado (evidência exige código, ga-t05a1z9)" "$(labels "$(DESC 'o teste tests/test_x.py mede queue.db')" '["node:ok"]')" 10 'caminho-fora-do-filtro:queue\.db'
 expect "duro vence node:ok: telefone no texto" "$(labels "$(DESC 'lib/x.py tests/test_x.py (31) 98876-5432')" '["node:ok"]')" 10 'dado-no-texto'
 expect "caminho com .. : fora do formato, não entra na lista que vai ao disco" "$(DESC 'lib/x.py e ../escape.py com tests/test_x.py')" 10 'caminho-fora-do-formato.*"paths": \["lib/x\.py", "tests/test_x\.py"\]'
 expect "caminho absoluto: fora do formato" "$(DESC 'lib/x.py e /etc/zz_evil.py com tests/test_x.py')" 10 'caminho-fora-do-formato.*"paths": \["lib/x\.py", "tests/test_x\.py"\]'
 expect "caminho com letra não-ASCII: fora do formato (SAFE_SEG)" "$(DESC 'lib/x.py tests/test_x.py e lib/ação.py')" 10 'caminho-fora-do-formato.*"paths": \["lib/x\.py", "tests/test_x\.py"\]'
 expect "~/caminho: host Mac, fora do formato" "$(DESC 'lib/x.py tests/test_x.py e ~/segredos/chave.json')" 10 'caminho-fora-do-formato'
-expect '$HOME/caminho: host Mac, fora do formato' "$(DESC 'lib/x.py tests/test_x.py e $HOME/dados/y.csv')" 10 'caminho-fora-do-formato'
-expect "extensão em MAIÚSCULA também passa pelo filtro" "$(DESC 'lib/x.py tests/test_x.py e DATA/Leads.CSV')" 10 'caminho-fora-do-filtro:DATA/Leads\.CSV'
-expect ".sqlite3 citado (o filtro segura)" "$(DESC 'lib/x.py tests/test_x.py e data/x.sqlite3')" 10 'caminho-fora-do-filtro:data/x\.sqlite3'
+expect '$HOME/caminho: host Mac, fora do formato' "$(DESC 'lib/x.py tests/test_x.py e $HOME/bin/y.sh')" 10 'caminho-fora-do-formato'
+expect "extensão em MAIÚSCULA também passa pelo filtro (sem código citado: o dado segue duro)" "$(DESC 'tests/test_x.py e DATA/Leads.CSV')" 10 'caminho-fora-do-filtro:DATA/Leads\.CSV'
+expect ".sqlite3 citado (o filtro segura; sem código citado segue duro)" "$(DESC 'tests/test_x.py e data/x.sqlite3')" 10 'caminho-fora-do-filtro:data/x\.sqlite3'
 P39=$(for i in $(seq 1 39); do printf 'lib/m%d.py ' "$i"; done)
 expect "node: exatamente 40 caminhos (39 de código + 1 teste) ainda valem" "$(DESC "${P39}tests/test_x.py")" 0 '"verdict": "node"'
 expect "mini: o 41º caminho estoura o teto" "$(DESC "${P39}lib/m40.py tests/test_x.py")" 10 'caminhos-demais'
+# ---- evidência ≠ dependência (ga-t05a1z9): a bead cita banco/log/json como PROVA ("medido em queue.db"). O caminho de DADO que o nó NÃO recebe vira `info` (evidencia-de-dado:) e nunca vai ao nó, mas só se a bead cita
+#      >=1 arquivo de CÓDIGO que o filtro deixa passar. Segue duro: dado sem código citado, código fora do filtro, .plist/.sql/.env, nome com cara de segredo (em português também) e telefone/CPF no texto.
+EVID='{"id":"wa-e1","title":"scripts/foo.py devolve lista vazia","description":"Medido em queue.db: 3 linhas sem dono. Corrigir scripts/foo.py; teste em tests/test_foo.py"}'
+expect "evidência: .db citado como prova + código + teste = node, e a bead DIZ que o .db foi evidência" "$EVID" 0 '"verdict": "node".*"info": \[.*"evidencia-de-dado:queue\.db"'
+expect "evidência: o caminho continua em paths (nada some em silêncio)" "$EVID" 0 '"paths": \["scripts/foo\.py", "queue\.db", "tests/test_foo\.py"\]'
+expect "evidência: o .db citado sozinho NÃO dispara a mole de banco (a palavra .db veio do próprio caminho)" "$EVID" 0 '"reasons": \["prova-no-texto:1-teste\(s\)\+1-codigo"\]'
+expect "evidência: .log .json .sqlite .csv .jsonl .parquet também" "$(DESC 'scripts/foo.py e tests/test_foo.py; medido em a.log b/c.json d.sqlite e.csv f.jsonl g.parquet')" 0 '"verdict": "node".*evidencia-de-dado:a\.log.*evidencia-de-dado:b/c\.json.*evidencia-de-dado:d\.sqlite.*evidencia-de-dado:e\.csv.*evidencia-de-dado:f\.jsonl.*evidencia-de-dado:g\.parquet'
+expect "evidência: etiqueta node:ok não muda o que é evidência" "$(labels "$EVID" '["node:ok"]')" 0 '"basis": "label".*evidencia-de-dado:queue\.db'
+expect "evidência: SEM código citado o dado segue duro" "$(DESC 'o teste tests/test_foo.py mede queue.db')" 10 'caminho-fora-do-filtro:queue\.db'
+expect "evidência: código que o filtro NÃO deixa passar não conta como código citado (dado e código seguem duros)" "$(DESC 'data/helper.py mede queue.db; tests/test_foo.py')" 10 'caminho-fora-do-filtro:data/helper\.py", "caminho-fora-do-filtro:queue\.db'
+expect "evidência: com código bom citado, só o código fora do filtro vira motivo (o .db não)" "$(DESC 'scripts/foo.py usa data/helper.py e mede queue.db; tests/test_foo.py')" 10 '"reasons": \["caminho-fora-do-filtro:data/helper\.py"\]'
+expect "evidência: nome com cara de segredo segue duro (senha)" "$(DESC 'scripts/foo.py lê config/senha_prod.json; tests/test_foo.py')" 10 'caminho-fora-do-filtro:config/senha_prod\.json'
+expect "evidência: pasta com cara de segredo segue dura (segredos, em português)" "$(DESC 'scripts/foo.py lê dados/segredos/x.csv; tests/test_foo.py')" 10 'caminho-fora-do-filtro:dados/segredos/x\.csv'
+expect "evidência: palavra INTEIRA key segue dura (map_key.json)" "$(DESC 'scripts/foo.py lê config/map_key.json; tests/test_foo.py')" 10 'caminho-fora-do-filtro:config/map_key\.json'
+expect "evidência: key dentro de outra palavra NÃO é segredo (monkey_patch.json)" "$(DESC 'scripts/foo.py lê config/monkey_patch.json; tests/test_foo.py')" 0 'evidencia-de-dado:config/monkey_patch\.json'
+expect "evidência: caminho ABSOLUTO de dado (fora do formato) também, sem disparar host-mac" "$(DESC 'scripts/foo.py e tests/test_foo.py; medido em /Users/athos/shared/data/v.db')" 0 '"verdict": "node".*evidencia-de-dado:/Users/athos/shared/data/v\.db'
+expect "evidência: ~/ de dado também" "$(DESC 'scripts/foo.py e tests/test_foo.py; medido em ~/shared/data/v.db')" 0 'evidencia-de-dado:~/shared/data/v\.db'
+expect 'evidência: $HOME/ de dado também' "$(DESC 'scripts/foo.py e tests/test_foo.py; medido em $HOME/dados/y.csv')" 0 'evidencia-de-dado:\$HOME/dados/y\.csv'
+expect "evidência: molde de nome (<data>-x.json) também" "$(DESC 'scripts/foo.py e tests/test_foo.py; fragmento lib/changelog.d/<data>-wa-x.json')" 0 'evidencia-de-dado:-wa-x\.json'
+expect "evidência: .plist do home segue duro (artefato de host, não dado)" "$(DESC 'scripts/foo.py e tests/test_foo.py; plist em ~/Library/LaunchAgents/com.x.plist')" 10 'caminho-fora-do-formato'
+expect "evidência: ~/segredos/chave.json segue duro mesmo com código citado" "$(DESC 'scripts/foo.py e tests/test_foo.py; ver ~/segredos/chave.json')" 10 'caminho-fora-do-formato'
+expect "evidência: nome solto + o absoluto que o contém não deixam sobrar host-mac (tira o mais longo primeiro)" "$(DESC 'scripts/foo.py e tests/test_foo.py; lot.db medido em /Users/athos/shared/data/m/lot.db')" 0 '"verdict": "node"'
+expect "evidência não vence telefone/CPF no texto" "$(DESC 'scripts/foo.py e tests/test_foo.py; medido em queue.db, cliente (31) 98876-5432')" 10 '"reasons": \["dado-no-texto"\]'
+expect "evidência: credencial escrita em PROSA segue mole (e é a única razão: o .db não soma banco)" "$(DESC 'scripts/foo.py e tests/test_foo.py; medido em queue.db; o token expira')" 10 '"reasons": \["moles:credencial"\]'
+expect "evidência: banco escrito em PROSA segue mole" "$(DESC 'scripts/foo.py e tests/test_foo.py; medido em queue.db; abre o banco')" 10 '"reasons": \["moles:banco-de-dados"\]'
+EV10=$(for i in 1 2 3 4 5 6 7 8 9 10; do printf 'x%d.log ' "$i"; done)
+expect "evidência: o info nomeia até 8 e conta o resto" "$(DESC "scripts/foo.py tests/test_foo.py medido em ${EV10}")" 0 'evidencia-de-dado:x8\.log", "evidencia-de-dado-mais:2"'
+expect_not "evidência: a 9ª não é nomeada" "$(DESC "scripts/foo.py tests/test_foo.py medido em ${EV10}")" 0 'evidencia-de-dado:x9\.log'
+
 # ---- unknown
 expect "unknown: lib/x.py.bak não vira lib/x.py (a prova de 'código' seria de um arquivo que ninguém citou)" "$(DESC 'lib/x.py.bak e tests/test_x.py')" 11 '"paths": \["tests/test_x\.py"\]'
 expect "node: ponto final de frase não atrapalha o caminho" "$(DESC 'Ajustar lib/x.py. Depois rodar tests/test_x.py.')" 0 '"paths": \["lib/x.py", "tests/test_x.py"\]'
@@ -155,13 +192,19 @@ export WA_NODE_MIRROR="$T/mirror-ok"
 expect "node: .md fora da lista do rsync, mas o espelho entrega (docs/) — e DIZ que foi pelo espelho" "$(DESC "${DOCS}docs/runbooks/guia.md")" 0 '"verdict": "node".*"info": \[.*"via-espelho:docs/runbooks/guia\.md"'
 expect "node: DESIGN.md na raiz (o espelho entrega)" "$(DESC "${DOCS}DESIGN.md")" 0 '"verdict": "node".*via-espelho:DESIGN\.md'
 expect "node: .md maiúsculo (README.MD) também" "$(DESC "${DOCS}docs/LEIAME.MD")" 0 'via-espelho:docs/LEIAME\.MD'
-expect "mini: .md que a varredura de CONTEÚDO sinalizou (espelho nega) segue fora" "$(DESC "${DOCS}docs/sinalizado.md")" 10 'caminho-fora-do-filtro:docs/sinalizado\.md'
+expect "mini: .md que a varredura de CONTEÚDO sinalizou (espelho nega), SEM código citado, segue fora" "$(DESC "tests/test_x.py conforme docs/sinalizado.md")" 10 'caminho-fora-do-filtro:docs/sinalizado\.md'
+# ga-t05a1z9: o retido pela varredura (docs/data_dictionary.md: 38 telefones e 4 CPFs) NUNCA vai ao nó; com código citado a bead deixa de ser barrada por ele e o doc vira evidência (não "via-espelho")
+expect "evidência de DOC: .md que a varredura reteve + código citado = node, como evidencia-de-doc" "$(DESC "${DOCS}docs/sinalizado.md")" 0 '"verdict": "node".*"info": \[.*"evidencia-de-doc:docs/sinalizado\.md"'
+expect_not "evidência de DOC: o retido NÃO aparece como entregue pelo espelho" "$(DESC "${DOCS}docs/sinalizado.md")" 0 'via-espelho:docs/sinalizado'
 expect "mini: .md em pasta que o rsync NUNCA deixa sair (shared/), mesmo o espelho não negando" "$(DESC "${DOCS}shared/notas.md")" 10 'caminho-fora-do-filtro:shared/notas\.md'
-expect "mini: .md dentro de logs/ (pasta de dado) segue fora" "$(DESC "${DOCS}logs/relatorio.md")" 10 'caminho-fora-do-filtro:logs/relatorio\.md'
-expect "mini: .json neutro em docs/ NÃO ganha o espelho (só texto .md)" "$(DESC "${DOCS}docs/auto_response/ab_results/x.json")" 10 'caminho-fora-do-filtro:docs/auto_response/ab_results/x\.json'
+expect "mini: .md dentro de logs/ (pasta de dado), SEM código citado, segue fora" "$(DESC "tests/test_x.py conforme logs/relatorio.md")" 10 'caminho-fora-do-filtro:logs/relatorio\.md'
+expect "evidência: .md dentro de logs/ + código citado = evidencia-de-dado (o espelho NÃO o entrega)" "$(DESC "${DOCS}logs/relatorio.md")" 0 'evidencia-de-dado:logs/relatorio\.md'
+expect "mini: .json neutro em docs/ NÃO ganha o espelho (só texto .md), SEM código citado" "$(DESC "tests/test_x.py conforme docs/auto_response/ab_results/x.json")" 10 'caminho-fora-do-filtro:docs/auto_response/ab_results/x\.json'
+expect_not "evidência: .json neutro em docs/ + código vira evidencia-de-dado, NUNCA via-espelho" "$(DESC "${DOCS}docs/auto_response/ab_results/x.json")" 0 'via-espelho'
 expect "mini: .txt neutro em docs/ também não" "$(DESC "${DOCS}docs/notas.txt")" 10 'caminho-fora-do-filtro:docs/notas\.txt'
-expect "mini: um .md entregue e um .db na mesma bead — o .db segura" "$(DESC "${DOCS}docs/guia.md e queue.db")" 10 'caminho-fora-do-filtro:queue\.db'
-expect "mini: .md entregue + .md sinalizado — só o sinalizado vira motivo" "$(DESC "${DOCS}docs/guia.md e docs/sinalizado.md")" 10 '"reasons": \["caminho-fora-do-filtro:docs/sinalizado\.md"\]'
+expect "mini: um .md entregue e um código fora do filtro na mesma bead — o código segura" "$(DESC "${DOCS}docs/guia.md e data/helper.py")" 10 'caminho-fora-do-filtro:data/helper\.py'
+expect "node: um .md entregue e um .db citado como prova — o .db é evidência, o .md vem pelo espelho" "$(DESC "${DOCS}docs/guia.md e queue.db")" 0 'evidencia-de-dado:queue\.db.*via-espelho:docs/guia\.md|via-espelho:docs/guia\.md.*evidencia-de-dado:queue\.db'
+expect "mini: .md entregue + .md sinalizado, SEM código — só o sinalizado vira motivo" "$(DESC "tests/test_x.py conforme docs/guia.md e docs/sinalizado.md")" 10 '"reasons": \["caminho-fora-do-filtro:docs/sinalizado\.md"\]'
 expect "unknown: só doc citado (sem código nem teste) deixa de ser mini, mas segue sem prova" "$(DESC 'ajustar docs/runbooks/guia.md')" 11 'sem-prova-de-codigo-e-teste.*via-espelho'
 expect "unknown: .md entregue pelo espelho em docs/tests/ NÃO é teste (casa tests?/ mas não é prova)" "$(DESC 'ajustar lib/x.py conforme docs/tests/plan.md')" 11 'sem-prova-de-codigo-e-teste.*via-espelho:docs/tests/plan\.md'
 expect "unknown: idem em docs/test/ (singular)" "$(DESC 'ajustar lib/x.py conforme docs/test/README.md')" 11 'sem-prova-de-codigo-e-teste.*via-espelho:docs/test/README\.md'
@@ -309,7 +352,8 @@ expect "freio: lead e envio juntos: só o envio freia (e é o único motivo)" "$
 expect "freio: palavras informativas que NÃO são da lista (deploy, tela) não bloqueiam a prova derivada" "$(DESC 'Corrigir lib/foo_parser.py no deploy da tela')" 0 '"basis": "derivado"'
 expect "freio: sem prova derivada o lead no texto não muda o unknown (continua não sei, não vira mini)" "$(DESC 'ajustar lib/orfa_unica.py; o lead some')" 11 'sem-prova-de-codigo-e-teste'
 expect "derivado: palavra mole (banco) ainda vence" "$(DESC 'Corrigir lib/foo_parser.py que abre um sqlite')" 10 'moles:banco-de-dados'
-expect "derivado: caminho duro (.db) ainda vence" "$(DESC 'Corrigir lib/foo_parser.py e queue.db')" 10 'caminho-fora-do-filtro:queue\.db'
+expect "derivado: caminho duro (código fora do filtro) ainda vence" "$(DESC 'Corrigir lib/foo_parser.py e data/helper.py')" 10 'caminho-fora-do-filtro:data/helper\.py'
+expect "derivado: .db citado como prova NÃO tira a prova derivada (ga-t05a1z9), e fica registrado" "$(DESC 'Corrigir lib/foo_parser.py e queue.db')" 0 '"basis": "derivado".*evidencia-de-dado:queue\.db'
 expect "derivado: telefone no texto ainda vence" "$(DESC 'Corrigir lib/foo_parser.py (31) 98876-5432')" 10 '"reasons": \["dado-no-texto"\]'
 # falhou/ilegível: unknown COM a nota (nunca node, nunca o mesmo resultado do vazio)
 NOTA() { printf 'sem-prova-de-codigo-e-teste.*"info": \\["teste-derivado-ilegivel:%s"\\]\\}$' "$1"; }
@@ -338,7 +382,8 @@ expect "solto: a bead cita templates/dupr_page.html mas o repo TEM dupr_page.htm
 expect "solto: o arquivo mora na RAIZ do repo (o filtro não manda) -> continua mini com o próprio nome" "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar raiz_page.html")" 10 'caminho-fora-do-filtro:raiz_page\.html'
 expect "solto: o caminho trocado é julgado pelo mesmo filtro (pasta que nunca sai) -> mini com o caminho REAL na razão" "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar notas_solto.md")" 10 'caminho-fora-do-filtro:shared/notas_solto\.md'
 expect "solto: caminho real fora do formato seguro (espaço) não é adotado -> segue solto (mini)" "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar pagina_estranha.html")" 10 'caminho-fora-do-filtro:pagina_estranha\.html'
-expect "solto: nome solto de DADO (.json) nunca é trocado, mesmo único na árvore" "$(DESC "lib/x.py e $SOLTO_TESTE: ler solto_dado.json")" 10 'caminho-fora-do-filtro:solto_dado\.json'
+expect "solto: nome solto de DADO (.json) nunca é trocado, mesmo único na árvore (agora é evidência, no nome que a bead escreveu)" "$(DESC "lib/x.py e $SOLTO_TESTE: ler solto_dado.json")" 0 '"paths": \["lib/x\.py", "tests/test_x\.py", "solto_dado\.json"\].*evidencia-de-dado:solto_dado\.json'
+expect_not "solto: o nome solto de DADO não ganha nota de troca (caminho-solto:)" "$(DESC "lib/x.py e $SOLTO_TESTE: ler solto_dado.json")" 0 'caminho-solto:solto_dado'
 expect "solto: código solto ganha o caminho real e, com ele, o teste derivado" "$(DESC 'ajustar solto_run.sh')" 0 '"basis": "derivado".*caminho-solto:solto_run\.sh=scripts/solto_run\.sh.*teste-derivado:scripts/solto_run\.sh=tests/test_solto_run\.py'
 # nome solto de CÓDIGO que não existe em lugar nenhum da árvore (ga-2hd02v.3.22; script de diagnóstico, `part.py`): não é "código citado" para a regra 7, mas segue em `paths` e na regra 5
 expect "fantasma: script de diagnóstico citado (part_diag.py, fora do repo) não impede a regra 7: o módulo nomeado deriva (node) e a nota diz o que foi ignorado" "$(DESC 'diagnostico em part_diag.py: revisar ficha_donos quando vem vazia')" 0 '"verdict": "node", "basis": "derivado".*"paths": \["part_diag\.py"\].*caminho-solto-fora-da-arvore:part_diag\.py.*caminho-derivado:nome:ficha_donos=lib/ficha_donos\.py'
@@ -570,7 +615,7 @@ mutant sem-node-mini     '"node:mini" in labels'                       'False'  
 mutant sem-epic          'b.get("issue_type") == "epic"'               'False'                                  "$(field "$GOOD" issue_type '"epic"')" 10 '"epic"'
 mutant sem-pii           'if has_pii(json.dumps'                       'if False and has_pii(json.dumps'        "$(DESC 'lib/x.py tests/test_x.py (31) 98876-5432')" 10 'dado-no-texto'
 mutant pii-sem-cauda     'len(set(d[-8:])) > 3'                        'len(set(d[-8:])) >= 0'                  "$(DESC 'lib/x.py tests/test_x.py +55 31 99999-9999')" 0 '"verdict": "node"'
-mutant filtro-ignorado   'if p not in sent and p not in via_mirror:'   'if False:'                              "$WITHDB" 10 'caminho-fora-do-filtro'
+mutant filtro-ignorado   'if p not in sent and p not in via_mirror:'   'if False:'                              "$(DESC 'o teste tests/test_x.py mede queue.db')" 10 'caminho-fora-do-filtro'
 mutant mac-ignorado      'hard.append("so-no-mac:" + p)' 'pass'                    "$(DESC 'lib/x.py e tests/test_launchd_plist.py')" 10 'so-no-mac' "WA_NODE_MAC_ONLY=$T/macs.txt"
 # o canário tem DUAS metades (o de código TEM de sair, os de segredo NÃO): um mutante por metade e um para as duas; cada um com o rsync que só ELE separa do original
 mutant sem-canario       'if any(c not in sent for c in ok_canary) or any(c in sent for c in no_canary):' 'if False:'          "$GOOD" 11 'canario-errado' "WA_NODE_RSYNC=$T/rs-mudo"
@@ -591,15 +636,15 @@ mutant abs-vira-mole     'norm(text.replace(REPO_ABS, ""))'            'norm(tex
 mutant sem-catch-all    'except Exception as e:'                      'except ZeroDivisionError as e:'         "$("$PY" -I -c 'print("["*200000)')" 11 'erro-inesperado'
 mutant teto-frouxo       'if len(out) >= MAX_PATHS:'                   'if len(out) > MAX_PATHS:'               "$(DESC "${P39}lib/m40.py tests/test_x.py")" 10 'caminhos-demais'
 mutant sufixo-vira-arquivo '(?![\w\-]|\.\w)'                           '(?![\w])'                               "$(DESC 'lib/x.py.bak e tests/test_x.py')" 11 '"paths": \["tests/test_x\.py"\]'
-mutant sem-maiuscula     ', re.IGNORECASE)'                            ')'                                      "$(DESC 'lib/x.py tests/test_x.py e DATA/Leads.CSV')" 10 'caminho-fora-do-filtro:DATA/Leads\.CSV'   # 1ª ocorrência = PATH_RE (HOME_RE vem depois)
-mutant sem-sqlite3       '|db|sqlite3?|xlsx|'                          '|db|sqlite|xlsx|'                       "$(DESC 'lib/x.py tests/test_x.py e data/x.sqlite3')" 10 'caminho-fora-do-filtro:data/x\.sqlite3'
-mutant sem-home          'if HOME_RE.search(text):'                    'if False:'                              "$(DESC 'lib/x.py tests/test_x.py e ~/segredos/chave.json')" 10 'caminho-fora-do-formato'
+mutant sem-maiuscula     ', re.IGNORECASE)'                            ')'                                      "$(DESC 'tests/test_x.py e DATA/Leads.CSV')" 10 'caminho-fora-do-filtro:DATA/Leads\.CSV'   # 1ª ocorrência = PATH_RE (HOME_RE vem depois)
+mutant sem-sqlite3       '|db|sqlite3?|xlsx|'                          '|db|sqlite|xlsx|'                       "$(DESC 'tests/test_x.py e data/x.sqlite3')" 10 'caminho-fora-do-filtro:data/x\.sqlite3'
+mutant sem-home          'for m in HOME_RE.finditer(text):'            'for m in []:'                              "$(DESC 'lib/x.py tests/test_x.py e ~/segredos/chave.json')" 10 'caminho-fora-do-formato'
 mutant mac-vazio-vale    'if not globs:'                               'if False:'                              "$GOOD" 11 'mac-only-vazio' "WA_NODE_MAC_ONLY=$T/macs-vazio.txt"
 # espelho git: cada mutante troca UMA linha da regra nova e o caso designado reprova; o ambiente do caso (stub do espelho) vem em "VAR=valor"
 mutant espelho-sem-negacoes 'open_sent = sent_by_filter(cands, only_denies=True)' 'open_sent = set(cands)' "$(DESC "${DOCS}shared/notas.md")" 10 'caminho-fora-do-filtro:shared/notas\.md' "WA_NODE_MIRROR=$T/mirror-ok"
-mutant espelho-sem-varredura 'denied = mirror_denied(mirror_rules(), ok)' 'denied = set()' "$(DESC "${DOCS}docs/sinalizado.md")" 10 'caminho-fora-do-filtro:docs/sinalizado\.md' "WA_NODE_MIRROR=$T/mirror-ok"
+mutant espelho-sem-varredura 'denied = mirror_denied(mirror_rules(), ok)' 'denied = set()' "$(DESC "tests/test_x.py conforme docs/sinalizado.md")" 10 'caminho-fora-do-filtro:docs/sinalizado\.md' "WA_NODE_MIRROR=$T/mirror-ok"
 mutant espelho-vira-teste 'elif p in via_mirror:' 'elif False:' "$(DESC 'ajustar lib/x.py conforme docs/tests/plan.md')" 11 'sem-prova-de-codigo-e-teste.*via-espelho:docs/tests/plan\.md' "WA_NODE_MIRROR=$T/mirror-ok"
-mutant espelho-ext-solta 'MIRROR_TEXT_EXT = ("md",)' 'MIRROR_TEXT_EXT = ("md", "json", "txt")' "$(DESC "${DOCS}docs/auto_response/ab_results/x.json")" 10 'caminho-fora-do-filtro:docs/auto_response/ab_results/x\.json' "WA_NODE_MIRROR=$T/mirror-ok"
+mutant espelho-ext-solta 'MIRROR_TEXT_EXT = ("md",)' 'MIRROR_TEXT_EXT = ("md", "json", "txt")' "$(DESC "tests/test_x.py conforme docs/auto_response/ab_results/x.json")" 10 'caminho-fora-do-filtro:docs/auto_response/ab_results/x\.json' "WA_NODE_MIRROR=$T/mirror-ok"
 mutant espelho-falha-vira-chega 'return [], ["espelho-ilegivel:" + str(e)]' 'return cands, ["espelho-ilegivel:" + str(e)]' "$(DESC "${DOCS}docs/runbooks/guia.md")" 10 'espelho-ilegivel:espelho-sem-resposta'
 mutant espelho-rc-ignorado 'raise Unreadable("espelho-rc-%d" % r.returncode)' 'pass' "$(DESC "${DOCS}docs/runbooks/guia.md")" 10 'espelho-ilegivel:espelho-rc-75' "WA_NODE_MIRROR=$T/mirror-75"
 mutant espelho-sem-raiz 'lines[0] != "/*" or ' '' "$(DESC "${DOCS}docs/runbooks/guia.md")" 10 'espelho-ilegivel:espelho-formato' "WA_NODE_MIRROR=$T/mirror-sem-raiz"
@@ -684,7 +729,7 @@ mutant solto-dois-citados-escolhe 'if len(cited) == 1 and ok and p not in tree:'
 mutant solto-ambiguo-escolhe     'if len(hits) == 1 and'               'if len(hits) >= 1 and'                       "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar dup_page.html")" 10 'caminho-fora-do-filtro:dup_page\.html' "$SV"
 mutant solto-sem-formato-seguro  ' and all(SAFE_SEG.match(sg) for sg in hits[0].split("/")):' ':'                       "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar pagina_estranha.html")" 10 'caminho-fora-do-filtro:pagina_estranha\.html' "$SV"
 mutant solto-sem-filtro          'sent = set(sent) | sent_by_filter(new)' 'sent = set(sent) | set(new)'        "$(DESC "lib/x.py e $SOLTO_TESTE: ajustar notas_solto.md")" 10 'caminho-fora-do-filtro:shared/notas_solto\.md' "$SV"
-mutant solto-dado-tambem         'RESOLVE_EXT = CODE_EXT + ("html", "md")' 'RESOLVE_EXT = CODE_EXT + ("html", "md", "json")' "$(DESC "lib/x.py e $SOLTO_TESTE: ler solto_dado.json")" 10 'caminho-fora-do-filtro:solto_dado\.json' "$SV"
+mutant solto-dado-tambem         'RESOLVE_EXT = CODE_EXT + ("html", "md")' 'RESOLVE_EXT = CODE_EXT + ("html", "md", "json")' "$(DESC "lib/x.py e $SOLTO_TESTE: ler solto_dado.json")" 0 '"paths": \["lib/x\.py", "tests/test_x\.py", "solto_dado\.json"\].*evidencia-de-dado:solto_dado\.json' "$SV"
 mutant solto-codigo-nao-resolve  ' and (p not in sent or p.rsplit(".", 1)[-1].lower() in CODE_EXT)]' ' and p not in sent]'         "$(DESC 'ajustar solto_run.sh')" 0 'caminho-solto:solto_run\.sh=scripts/solto_run\.sh' "$SV"
 mutant solto-falha-vira-vazio    'note = ["caminho-solto-ilegivel:" + str(e)]' 'note = []'                       "$S_HTML" 10 'caminho-solto-ilegivel:repo-git-rc-128'
 # a regra (1) (o citado com pasta) só vale com a árvore LIDA e sem arquivo da raiz com o nome: cada mutante volta a uma metade da regra antiga
@@ -741,6 +786,21 @@ CM="WA_NODE_REPO=$RP WA_NODE_MIRROR=$T/mirror-ok WA_NODE_CACHE=$T/cache-m"
 mutant_pre "seedc $T/cache-m wa-parc 60 '[\"lib/ficha_donos.py\"]'" cache-ignorado '-60 <= age <= SIBLING_TTL' 'False' "$(DESCI wa-parc.1 'corrigir o caso de borda')" 0 '"cache": "hit"' "$CM"
 mutant_pre "seedc $T/cache-m wa-parv $((7*3600)) '[\"lib/ficha_donos.py\"]'" cache-vencido-vale '-60 <= age <= SIBLING_TTL' '-60 <= age' "$(DESCI wa-parv.1 'corrigir o caso de borda')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA" "$CM"
 mutant_pre "seedc $T/cache-m wa-parw 60 '[\"lib/ficha_donos.py\"]' wa-outro" cache-outro-pai 'd["parent"] == parent and ' '' "$(DESCI wa-parw.1 'corrigir o caso de borda')" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA" "$CM"
+# ---- controle negativo da evidência (ga-t05a1z9): cada linha nova do classificador tem um mutante e um caso que só o original passa
+mutant ev-sem-codigo      'has_code = any(c not in ghosts for c in code)'  'has_code = True'                         "$(DESC 'o teste tests/test_foo.py mede queue.db')" 10 'caminho-fora-do-filtro:queue\.db'
+mutant ev-sem-extensao    'if ext in EVIDENCE_EXT or any(s.lower() in EVIDENCE_DIRS for s in segs[:-1]):' 'if any(s.lower() in EVIDENCE_DIRS for s in segs[:-1]):' "$EVID" 0 'evidencia-de-dado:queue\.db'
+mutant ev-sem-pasta       'if ext in EVIDENCE_EXT or any(s.lower() in EVIDENCE_DIRS for s in segs[:-1]):' 'if ext in EVIDENCE_EXT:'  "$(DESC "${DOCS}logs/relatorio.md")" 0 'evidencia-de-dado:logs/relatorio\.md' "WA_NODE_MIRROR=$T/mirror-ok"
+mutant ev-segredo         'if not ext or ext in NOT_EVIDENCE_EXT or secretish(p):' 'if not ext or ext in NOT_EVIDENCE_EXT:' "$(DESC 'scripts/foo.py lê config/senha_prod.json; tests/test_foo.py')" 10 'caminho-fora-do-filtro:config/senha_prod\.json'
+mutant ev-codigo-fora     'if not ext or ext in NOT_EVIDENCE_EXT or secretish(p):' 'if not ext or secretish(p):' "$(DESC 'lib/x.py usa data/helper.py; tests/test_x.py')" 10 'caminho-fora-do-filtro:data/helper\.py'
+mutant ev-segredo-prefixo 't.startswith(SECRET_PREFIX) or t in SECRET_WORD' 't in SECRET_WORD'                         "$(DESC 'scripts/foo.py lê dados/segredos/x.csv; tests/test_foo.py')" 10 'caminho-fora-do-filtro:dados/segredos/x\.csv'
+mutant ev-segredo-palavra 't.startswith(SECRET_PREFIX) or t in SECRET_WORD' 't.startswith(SECRET_PREFIX)'               "$(DESC 'scripts/foo.py lê config/map_key.json; tests/test_foo.py')" 10 'caminho-fora-do-filtro:config/map_key\.json'
+mutant ev-key-em-palavra  't.startswith(SECRET_PREFIX) or t in SECRET_WORD' 't.startswith(SECRET_PREFIX) or any(w in t for w in SECRET_WORD)' "$(DESC 'scripts/foo.py lê config/monkey_patch.json; tests/test_foo.py')" 0 'evidencia-de-dado:config/monkey_patch\.json'
+mutant ev-mole-fica       'soft_text = soft_text.replace(tok, " ")'        'pass'                                   "$EVID" 0 '"reasons": \["prova-no-texto:1-teste\(s\)\+1-codigo"\]'
+mutant ev-ordem           'key=len, reverse=True'                           'key=len, reverse=False'                 "$(DESC 'scripts/foo.py e tests/test_foo.py; lot.db medido em /Users/athos/shared/data/m/lot.db')" 0 '"verdict": "node"'
+mutant ev-formato-solto   'blocked += [("caminho-fora-do-formato", o, o) for o in odd]' 'blocked += []'                  "$(DESC 'lib/x.py e /etc/zz_evil.py com tests/test_x.py')" 10 'caminho-fora-do-formato'
+mutant ev-doc-retido      'kind = "doc" if p in withheld and not secretish(p) else evidence_kind(p)' 'kind = evidence_kind(p)' "$(DESC "${DOCS}docs/sinalizado.md")" 0 'evidencia-de-doc:docs/sinalizado\.md' "WA_NODE_MIRROR=$T/mirror-ok"
+mutant ev-retido-na-falha 'return [], ["espelho-ilegivel:" + str(e)], []' 'return [], ["espelho-ilegivel:" + str(e)], cands' "$(DESC 'lib/x.py conforme docs/guia.md; tests/test_x.py')" 10 'caminho-fora-do-filtro:docs/guia\.md.*espelho-' "WA_NODE_MIRROR=$T/espelho-ausente"
+mutant ev-info-sem-teto   'info += names[:MAX_EVIDENCE_INFO] +'            'info += names +'                        "$(DESC "scripts/foo.py tests/test_foo.py medido em ${EV10}")" 0 'evidencia-de-dado:x8\.log", "evidencia-de-dado-mais:2"'
 # o resíduo no TMPDIR: o mutante que não apaga a árvore tem de deixar item para trás (senão o teste de "sem resíduo" passaria mesmo sem a limpeza)
 if mk_mutant sem-limpeza 'shutil.rmtree(root, ignore_errors=True)' 'pass'; then
   left=$(tmp_residue "$T/mut-sem-limpeza.py")
