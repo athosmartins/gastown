@@ -5,12 +5,12 @@
 #   O que prova · Hermetismo · Cenários de parada (S) · Bateria de mutantes
 #
 # O QUE PROVA. Que o D2 (a) só para o que a allowlist manda, só com o disco no piso e só com o pai certo; (b) nunca age quando não consegue LER o estado (df, ps, allowlist)
-# — três estados, "não sei" não vira "baixo" nem "bom"; (c) só afirma que parou depois de PROVAR a morte, e escala TERM→KILL; (d) não para sem antes gravar o registro;
+# — três estados, "não sei" não vira "baixo" nem "bom"; (c) só afirma que parou depois de PROVAR a morte (ps E kill -0), escala TERM→KILL e não manda KILL às cegas quando não consegue provar; (d) não para sem antes gravar o registro;
 # (e) devolve UMA linha e os códigos do contrato. A retomada (--resume) e os cenários dela vêm na fatia 2/2 (ga-1p1i5jr.2.1).
 # Cada guarda tem um MUTANTE: a bateria final estraga uma linha do script (marcada `# MUT:<nome>`) e exige que o cenário correspondente FALHE.
 #
 # HERMETISMO. Processos de brinquedo (um `bash fakejob-A.sh` num diretório temporário) levam TERM/KILL de verdade — nada além deles. ps/aws/df vêm de stubs ou de
-# D2_FREE_MB; a allowlist é a do teste (a real só é lida em modo --dry-run, com ps simulado). O pior que escreve em disco são alguns KB em $TMPDIR. Duração ~1 min.
+# D2_FREE_MB; a allowlist é a do teste (a real só é lida em modo --dry-run, com ps simulado); o df de verdade só roda em s_real_df (somente leitura). O pior que escreve em disco são alguns KB em $TMPDIR. Duração ~1 min.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -71,7 +71,15 @@ fi
 [ "${STUB_AWS_AMBIG:-0}" = 1 ] && echo "2026-11-01 05:00:18       1506 stream-run-$((E + 1))-${P}.cnpj_socios.json"
 exit 0
 EOF
-chmod +x "$T/stub-ps" "$T/stub-aws"
+cat >"$T/stub-ps-seq" <<'EOF'
+#!/bin/bash
+# as STUB_PS_GOOD primeiras chamadas são o ps de verdade; depois STUB_PS_AFTER: fail = ps quebrado · empty = ps legível sem nenhum job
+n=$(($(cat "${STUB_PS_COUNT:?}" 2>/dev/null || echo 0) + 1)); echo "$n" >"$STUB_PS_COUNT"
+[ "$n" -le "${STUB_PS_GOOD:-1}" ] && exec ps "$@"
+[ "${STUB_PS_AFTER:-fail}" = fail ] && exit 1
+printf '    1     0 %s 10-00:00:01 /sbin/launchd\n' "$(id -u)"
+EOF
+chmod +x "$T/stub-ps" "$T/stub-ps-seq" "$T/stub-aws"
 mkdir -p "$T/tmp"
 
 ALLOW_RE='^bash [^ ]*/fakejob-A\.sh$'
@@ -90,7 +98,7 @@ newcase() {  # cria um diretório de caso, exporta o ambiente do D2 e (opcional)
   export D2_AWS_BIN="$T/stub-aws"
   export STUB_AWS_FAIL=0 STUB_AWS_NONE=0 STUB_AWS_AMBIG=0
   export TMPDIR="$T/tmp"
-  unset D2_FREE_MB D2_PS_BIN D2_DF_BIN D2_NOW STUB_PS_FILE
+  unset D2_FREE_MB D2_PS_BIN D2_DF_BIN D2_NOW D2_VOLUME D2_LOCKPS_BIN D2_LOCK_WAIT_S STUB_PS_FILE STUB_PS_COUNT STUB_PS_GOOD STUB_PS_AFTER
   mk_allow "$D2_ALLOWLIST" "$ALLOW_RE" "$ALLOW_PRE" 3072 8000 21-6 3600
 }
 run_sut() {  # args → OUT (stdout), RC; confere que o stdout é UMA linha
@@ -112,6 +120,7 @@ s_usage() {
   run_sut --nada; eq "S1 argumento desconhecido: rc 2" "$RC" 2
   run_sut --run --dry-run; eq "S1 dois argumentos: rc 2" "$RC" 2
   run_sut --resume; eq "S1 --resume ainda não existe (fatia 2/2): rc 2" "$RC" 2
+  [ ! -e "$D2_LOG" ]; check $? "S1 uso errado não escreve no log de produção"
 }
 
 s_stop_guard() {  # livre ACIMA do piso: o job fica
@@ -183,7 +192,7 @@ s_parent_guard() {  # casa a regex do processo mas não o pai: intocável
 s_df_unreadable() {
   newcase; spawn "$T/fakejob-A.sh"; export D2_DF_BIN="$T/nao-existe"
   run_sut --run
-  eq "S8 df ilegível: rc 30 (não leu, não agiu)" "$RC" 30
+  eq "S8 df ilegível: rc 30 (não leu, não agiu)" "$RC" 30; has "S8 a causa na linha é o df" "$OUT" "(df)"
   job_alive "$JOBPID"; check $? "S8 o job segue vivo"
   [ ! -e "$D2_STATE" ]; check $? "S8 nada registrado"
   reap
@@ -192,7 +201,7 @@ s_df_unreadable() {
 s_ps_unreadable() {
   newcase; spawn "$T/fakejob-A.sh"; export D2_FREE_MB=2500 D2_PS_BIN="$T/nao-existe"
   run_sut --run
-  eq "S9 ps ilegível: rc 30" "$RC" 30
+  eq "S9 ps ilegível: rc 30" "$RC" 30; has "S9 a causa na linha é o ps" "$OUT" "ler o ps"
   job_alive "$JOBPID"; check $? "S9 o job segue vivo"
   reap
 }
@@ -204,7 +213,7 @@ s_broad_regex() {  # regex larga demais: 4 processos casam, limite 3
   local p1 p2 p3 p4
   spawn "$T/fakejob-A.sh"; p1=$JOBPID; spawn "$T/fakejob-B.sh"; p2=$JOBPID; spawn "$T/fakejob-C.sh"; p3=$JOBPID; spawn "$T/fakejob-D.sh"; p4=$JOBPID
   run_sut --run
-  eq "S10 regex que casa 4 processos (limite 3): rc 30" "$RC" 30
+  eq "S10 regex que casa 4 processos (limite 3): rc 30" "$RC" 30; has "S10 a causa na linha é a regex larga" "$OUT" "larga demais"
   local alive=0 p; for p in $p1 $p2 $p3 $p4; do job_alive "$p" && alive=$((alive + 1)); done
   eq "S10 nenhum dos 4 foi tocado" "$alive" 4
   reap
@@ -212,12 +221,13 @@ s_broad_regex() {  # regex larga demais: 4 processos casam, limite 3
 
 s_allowlist_invalid() {
   newcase; export D2_FREE_MB=2500
-  printf 'joba\trfb\tx\ty\t3072\t8000\t21-6\t3600\n' >"$D2_ALLOWLIST"; run_sut --run; eq "S11 linha com 8 colunas: rc 30" "$RC" 30
-  mk_allow "$D2_ALLOWLIST" "$ALLOW_RE" "$ALLOW_PRE" 8000 3072 21-6 3600; run_sut --run; eq "S11 resume <= stop (sem histerese): rc 30" "$RC" 30
-  mk_allow "$D2_ALLOWLIST" "$ALLOW_RE" "$ALLOW_PRE" 3072 8000 21-21 3600; run_sut --run; eq "S11 janela início = fim: rc 30" "$RC" 30
-  mk_allow "$D2_ALLOWLIST" '(' "$ALLOW_PRE" 3072 8000 21-6 3600; run_sut --run; eq "S11 regex que não compila: rc 30" "$RC" 30
-  printf '# só comentário\n\n' >"$D2_ALLOWLIST"; run_sut --run; eq "S11 allowlist sem linha ativa: rc 30" "$RC" 30
-  rm -f "$D2_ALLOWLIST"; run_sut --run; eq "S11 allowlist ausente: rc 30" "$RC" 30
+  a30() { run_sut --run; eq "S11 $1: rc 30" "$RC" 30; has "S11 $1: a causa na linha" "$OUT" "$2"; }
+  printf 'joba\trfb\tx\ty\t3072\t8000\t21-6\t3600\n' >"$D2_ALLOWLIST"; a30 "linha com 8 colunas" "esperava 9 colunas"
+  mk_allow "$D2_ALLOWLIST" "$ALLOW_RE" "$ALLOW_PRE" 8000 3072 21-6 3600; a30 "resume <= stop (sem histerese)" "histerese"
+  mk_allow "$D2_ALLOWLIST" "$ALLOW_RE" "$ALLOW_PRE" 3072 8000 21-21 3600; a30 "janela início = fim" "início = fim"
+  mk_allow "$D2_ALLOWLIST" '(' "$ALLOW_PRE" 3072 8000 21-6 3600; a30 "regex que não compila" "regex inválida"
+  printf '# só comentário\n\n' >"$D2_ALLOWLIST"; a30 "allowlist sem linha ativa" "sem nenhuma linha ativa"
+  rm -f "$D2_ALLOWLIST"; a30 "allowlist ausente" "ilegível"
 }
 
 s_state_unwritable() {  # sem registro, não para
@@ -244,9 +254,26 @@ s_lock() {
   newcase; spawn "$T/fakejob-A.sh"; export D2_FREE_MB=2500
   : >"$C/umarquivo"; export D2_LOCK="$C/umarquivo/lock.d"
   run_sut --run
-  eq "S13 trava que não dá para criar (erro de gravação): rc 30, não é 'outra instância'" "$RC" 30
+  eq "S13 trava que não dá para criar (erro de gravação): rc 30, não é 'outra instância'" "$RC" 30; has "S13 ...a causa na linha é a trava" "$OUT" "a trava"
   hasnt "S13 ...e a linha não diz 'outra instância'" "$OUT" "outra instância"
   job_alive "$JOBPID"; check $? "S13 o job segue vivo (sem trava, não age)"
+  reap
+  newcase; spawn "$T/fakejob-A.sh"; stub_env_for_job; export D2_FREE_MB=2500   # o pid da trava é de OUTRO programa vivo (pid reaproveitado): não é D2, a trava é abandonada
+  mkdir -p "$D2_LOCK"; printf '%s' "$JOBPID" >"$D2_LOCK/pid"
+  run_sut --run; eq "S13 pid da trava reaproveitado por outro programa: trava tomada (rc 0)" "$RC" 0
+  reap
+  newcase; spawn "$T/fakejob-A.sh"; export D2_FREE_MB=2500 D2_LOCKPS_BIN="$T/nao-existe"   # não consigo ver quem é o dono: não roubo a trava
+  mkdir -p "$D2_LOCK"; printf '%s' "$$" >"$D2_LOCK/pid"
+  run_sut --run; eq "S13 dono da trava ilegível: rc 30 (não roubo)" "$RC" 30
+  [ -d "$D2_LOCK" ]; check $? "S13 ...e a trava do outro continua lá"
+  job_alive "$JOBPID"; check $? "S13 o job segue vivo"
+  reap
+  newcase; spawn "$T/fakejob-A.sh"; stub_env_for_job; export D2_FREE_MB=2500 D2_LOCK_WAIT_S=0   # pasta da trava SEM pid: nova = o dono está começando; velha = abandonada
+  mkdir -p "$D2_LOCK"
+  run_sut --run; eq "S13 pasta de trava nova sem pid (dono começando): rc 10, não é abandonada" "$RC" 10
+  [ -d "$D2_LOCK" ]; check $? "S13 ...e a pasta segue lá"
+  touch -t 202001010000 "$D2_LOCK"
+  run_sut --run; eq "S13 pasta de trava velha sem pid (> 2 min): abandonada, tomada (rc 0)" "$RC" 0
   reap
 }
 
@@ -285,12 +312,40 @@ s_real_allowlist() {  # a allowlist REAL contra um ps simulado: o regex de verda
   hasnt "S2 processo de OUTRO usuário (9001) não é alvo" "$OUT" "9001"
   : >"$C/ps.txt"; printf '    1     0 %s 10-00:00:01 /sbin/launchd\n' "$MYUID" >"$C/ps.txt"
   run_sut --dry-run; eq "S2 nada rodando: rc 10" "$RC" 10
-  unset D2_FREE_MB D2_PS_BIN; run_sut --dry-run
-  has "S2 a leitura REAL do df devolve um inteiro positivo de MB" "$OUT" "livre "
-  case "$OUT" in *"livre "[1-9]*) ok "S2 o df real foi lido (inteiro positivo)" ;; *) [ "$RC" = 10 ] && bad "S2 df real não deu inteiro: $OUT" || ok "S2 df real lido (rc $RC)" ;; esac
 }
 
-SCENARIOS="s_usage s_dry_run s_real_allowlist s_stop_guard s_stop_ok s_stop_ambiguous s_stop_s3_down s_stubborn s_parent_guard s_df_unreadable s_ps_unreadable s_broad_regex s_allowlist_invalid s_state_unwritable s_lock"
+s_real_df() {  # df de VERDADE (sem D2_FREE_MB) e ps só com o launchd: rc 10 exige que o df tenha sido lido (rc 30 = df falhou) e o MB tem de bater com um df independente
+  newcase; export D2_PS_BIN="$T/stub-ps" STUB_PS_FILE="$C/ps.txt"; printf '    1     0 %s 10-00:00:01 /sbin/launchd\n' "$MYUID" >"$C/ps.txt"
+  local vol=/System/Volumes/Data got want; [ -d "$vol" ] || vol=/; export D2_VOLUME="$vol"      # no nó Linux o volume do mini não existe
+  run_sut --dry-run
+  eq "S2b df real: rc 10 (leu o livre; rc 30 = o df falhou)" "$RC" 10
+  got=$(printf '%s' "$OUT" | sed -n 's/.*(livre \([0-9][0-9]*\) MB).*/\1/p'); want=$(( $(df -Pk "$vol" | awk 'NR==2 { print $4 }') / 1024 ))
+  [ -n "$got" ] && [ $((got > want ? got - want : want - got)) -le 1024 ]; check $? "S2b o MB lido (${got:-nenhum}) bate com um df independente ($want) a ±1024 MB"
+}
+
+s_recheck_unreadable() {  # o ps lê na 1ª passada e falha na re-conferência: ninguém recebe sinal
+  newcase; spawn "$T/fakejob-A.sh"; export D2_FREE_MB=2500 D2_PS_BIN="$T/stub-ps-seq" STUB_PS_COUNT="$C/n" STUB_PS_GOOD=1 STUB_PS_AFTER=fail
+  run_sut --run
+  eq "S14 ps falha na re-conferência: rc 30 (identidade não provada, não agiu)" "$RC" 30; has "S14 a causa na linha é a re-conferência" "$OUT" "re-conferência"
+  job_alive "$JOBPID"; check $? "S14 o job segue vivo (nenhum sinal sem identidade provada)"
+  [ ! -e "$D2_STATE" ]; check $? "S14 nada registrado"
+  reap
+}
+
+s_stop_unproven() {  # depois do TERM o ps quebra (fail) ou deixa de listar o pid que ainda vive (empty): morte NÃO provada = rc 20, sem KILL às cegas
+  local mode
+  for mode in fail empty; do
+    newcase; mk_allow "$D2_ALLOWLIST" '^bash [^ ]*/fakejob-stubborn-A\.sh$' "$ALLOW_PRE" 3072 8000 21-6 3600
+    spawn "$T/fakejob-stubborn-A.sh"; export D2_FREE_MB=2500 D2_PS_BIN="$T/stub-ps-seq" STUB_PS_COUNT="$C/n" STUB_PS_GOOD=2 STUB_PS_AFTER=$mode
+    run_sut --run
+    eq "S15 ($mode) morte não comprovada: rc 20" "$RC" 20; has "S15 ($mode) a linha diz que NÃO foi comprovada" "$OUT" "NÃO comprovada"
+    job_alive "$JOBPID"; check $? "S15 ($mode) sem KILL às cegas: o job que ignora TERM segue vivo"
+    eq "S15 ($mode) o registro tem STOPPING e STOP_FAILED (não STOPPED)" "$(cut -f2 "$D2_STATE" | tr '\n' ',')" "STOPPING,STOP_FAILED,"
+    reap
+  done
+}
+
+SCENARIOS="s_usage s_dry_run s_real_allowlist s_real_df s_recheck_unreadable s_stop_unproven s_stop_guard s_stop_ok s_stop_ambiguous s_stop_s3_down s_stubborn s_parent_guard s_df_unreadable s_ps_unreadable s_broad_regex s_allowlist_invalid s_state_unwritable s_lock"
 
 SUT="$REAL"
 echo "=== disk-recovery-d2-heavy-jobs.selftest.sh ==="
@@ -322,9 +377,17 @@ kill_mutant() {  # $1=nome $2=tag $3=linha nova $4=cenário
   else bad "mutante '$1' SOBREVIVEU ao cenário $4 (a guarda não está protegida pelo teste)"; fi
   FAIL=$before                                   # as falhas do mutante eram esperadas: não contam como falha do selftest
 }
+kill_mutant dfread        dfread        '  out=$("$DF_BIN" -Pk "$VOLUME/__nao_existe__" 2>/dev/null) || return 1      # MUT:dfread' s_real_df
+kill_mutant dfparse       dfparse       '  printf "%s\n" "$out" | awk '"'"'NR==2 { printf "%d", 1; ok=1 } END { exit ok ? 0 : 1 }'"'"'      # MUT:dfparse' s_real_df
 kill_mutant parent        parent        '        if (cmd[p] ~ ENVIRON["RE"]) printf "%s\t%s\t%s\t%d\t%s\n", p, U[p], PP[p], secs(E[p]), cmd[p]   # MUT:parent' s_parent_guard
 kill_mutant stopguard     stopguard     '    if false; then       # MUT:stopguard' s_stop_guard
 kill_mutant freefail      freefail      '  free=$(read_free_mb) || free=0      # MUT:freefail' s_df_unreadable
+kill_mutant pidgone       pidgone       '    [ "$r" -eq 1 ] && return 0      # MUT:pidgone' s_stop_unproven
+kill_mutant killunknown   killunknown   '  :                      # MUT:killunknown' s_stop_unproven
+kill_mutant recheck       recheck       '    if false; then :; fi      # MUT:recheck' s_recheck_unreadable
+kill_mutant lockowner     lockowner     '  return 0      # MUT:lockowner' s_lock
+kill_mutant lockunknown   lockunknown   '      :      # MUT:lockunknown' s_lock
+kill_mutant lockyoung     lockyoung     '      :      # MUT:lockyoung' s_lock
 kill_mutant killescalate  killescalate  '  :                   # MUT:killescalate' s_stubborn
 kill_mutant record        record        '      :      # MUT:record' s_stop_ok
 kill_mutant recordfirst   recordfirst   '    state_append STOPPING "$id" "$pid" "$start" - "$free" "x" || true      # MUT:recordfirst' s_state_unwritable

@@ -17,9 +17,9 @@ scripts/disk-recovery-d2-heavy-jobs.sh --run       # para de verdade o que a all
 ```
 
 ## Contrato
-stdout = exatamente UMA linha. Códigos: `0` agiu e terminou · `10` nada a fazer ou uma guarda adiou · `20` falhou · `30` não consegui ler o estado (e portanto não agi) · `2` uso errado. Notificação e mail em rc 0/20 são do orquestrador (`disk-recovery-ladder.sh`); o D2 só escreve o próprio log (`.gc/logs/disk-recovery-d2.log`).
+stdout = exatamente UMA linha. Códigos: `0` agiu e terminou · `10` nada a fazer ou uma guarda adiou · `20` falhou (registro não gravou, processo não morreu, **morte não comprovada**) · `30` não consegui ler o estado (e portanto não agi) · `2` uso errado (não escreve no log). Notificação e mail em rc 0/20 são do orquestrador (`disk-recovery-ladder.sh`); o D2 só escreve o próprio log (`.gc/logs/disk-recovery-d2.log`).
 
-"Não consegui ler" nunca vira "baixo" nem "bom": df, ps ou allowlist ilegíveis dão rc 30 e nenhuma ação.
+"Não consegui ler" nunca vira "baixo" nem "bom": df, ps ou allowlist ilegíveis dão rc 30 e nenhuma ação. O mesmo vale no meio do caminho: ps ilegível na re-conferência antes do primeiro sinal = rc 30 (se algo já tinha sido parado, rc 20); depois do TERM, ps ilegível ou pid vivo que a allowlist não lista mais = "morte não comprovada" = rc 20, **sem KILL às cegas**.
 
 ## A allowlist
 Uma linha por job, 9 colunas separadas por TAB: `id adapter match_regex parent_regex stop_below_mb resume_above_mb resume_window resume_max_age_s como`. O formato, o que qualifica e os candidatos REJEITADOS (com o motivo medido) estão no cabeçalho do próprio arquivo. Hoje só há uma linha ativa: `rfb-monthly-refresh` (para com livre ≤ 3072 MB; retoma com livre ≥ 8448 MB, janela 21h–6h, validade 24 h).
@@ -30,7 +30,7 @@ Rejeitados (precisam de marcador "parado pelo D2" no wrapper, para não acordar 
 **Por tabela, não do ponto.** Cada tabela que termina e é verificada grava `s3://urblink-motherduck-backups/real_estate/rfb/_meta/stream-run-<run_id>.<tabela>.json`; ao retomar com `--resume-run <run_id>` essas tabelas são reaproveitadas, e a tabela em andamento recomeça do **zero** (horas). Por isso o piso de parada é **3 GB**, não os 5 GB em que o orquestrador chama o D2. O tick das 00:15 começa um run NOVO e apaga chaves temporárias com mais de 24 h.
 
 ## Registro de "o que parei"
-`.gc/disk-recovery-d2.state` (TSV: `epoch EVENT id pid início_epoch run_id livre_mb detalhe`). O `STOPPING` é gravado ANTES do sinal (sem registro, não para: rc 20 e o job segue vivo); `STOPPED` só depois de provar a morte por `ps`; `STOP_FAILED` se não morreu.
+`.gc/disk-recovery-d2.state` (TSV: `epoch EVENT id pid início_epoch run_id livre_mb detalhe`). O `STOPPING` é gravado ANTES do sinal (sem registro, não para: rc 20 e o job segue vivo); `STOPPED` só depois de provar a morte por `ps` **e** por `kill -0` (zumbi conta como morto); `STOP_FAILED` se não morreu ou se a morte não foi comprovada.
 
 O `run_id` é `<epoch>-<pid>` do python do job: o D2 o LÊ do S3 (chave `stream-run-<epoch>-<pid>.*` com o pid do processo parado e a hora de início do processo ±5 s). Se não achar, achar mais de um ou o S3 estiver fora, grava `-`. **Nunca adivinha.**
 
@@ -38,12 +38,12 @@ O `run_id` é `<epoch>-<pid>` do python do job: o D2 o LÊ do S3 (chave `stream-
 Com o livre ≥ 8448 MB e dentro da janela 21h–6h: `rfb_stream_refresh.py --resume-run <run_id>`, com o run_id da linha de saída do `--run` (ou da coluna 6 do `STOPPED`). Se for `-`, não foi lido: olhar as chaves `stream-run-*` em `_meta/` e NÃO chutar. O portão do próprio job recusa (rc 3 "NÃO RODEI") fora da janela ou com o disco apertado.
 
 ## Guardas
-Allowlist inválida / regex que casa mais de 3 processos → rc 30. Só processos do mesmo usuário; só o filho do pai certo (`job_timeout.sh` do launchd: `py_compile` ou `--dry-run` rodados por gente/teste nunca casam). Identidade re-conferida logo antes de cada sinal (pid reaproveitado). TERM → graça → KILL só se ainda listado. Trava por `mkdir` com tomada de trava velha. Histerese: `resume_above_mb` > `stop_below_mb` (validado).
+Allowlist inválida / regex que casa mais de 3 processos → rc 30. Só processos do mesmo usuário; só o filho do pai certo (`job_timeout.sh` do launchd: `py_compile` ou `--dry-run` rodados por gente/teste nunca casam). Identidade re-conferida logo antes de cada sinal (pid reaproveitado). TERM → graça → KILL só se ainda listado. Trava por `mkdir`: o dono é conferido pela linha de comando (pid reaproveitado por outro programa não prende o D2); dono que não consigo ver = rc 30, não roubo; pasta sem pid e com menos de 2 min = outro D2 começando (rc 10), mais velha = abandonada. Trava que não dá para criar é rc 30, nunca "outra instância". Histerese: `resume_above_mb` > `stop_below_mb` (validado).
 
 ## Selftest
-`scripts/disk-recovery-d2-heavy-jobs.selftest.sh` (hermético: processos de brinquedo + stubs de ps/aws; só mata o que ele mesmo criou) e uma bateria de **6 mutantes** (cada guarda estragada tem de derrubar o seu cenário). Rodar sob o guarda de disco:
+`scripts/disk-recovery-d2-heavy-jobs.selftest.sh` (hermético: processos de brinquedo + stubs de ps/aws; só mata o que ele mesmo criou) e uma bateria de **14 mutantes** (cada guarda estragada tem de derrubar o seu cenário). O `s_real_df` lê o df de verdade (só leitura) e exige rc 10 + MB igual a um df independente: df quebrado não passa. Leva alguns minutos com a máquina carregada. Rodar sob o guarda de disco:
 ```
-scripts/heavy-guard.sh --what selftest-d2 --min-free-mb 6144 --max-file-mb 20 -- bash scripts/disk-recovery-d2-heavy-jobs.selftest.sh
+scripts/heavy-guard.sh --what selftest-d2 --max-file-mb 512 -- bash scripts/disk-recovery-d2-heavy-jobs.selftest.sh
 ```
 
 ## Quem chama o quê

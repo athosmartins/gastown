@@ -16,8 +16,8 @@
 # CONTRATO (o do Mayor + o do orquestrador dog-2). stdout: UMA linha, sempre ("D2 --run: ..."). Códigos de saída:
 #   0   agiu e terminou     (parou ao menos um e todos morreram)
 #   10  nada a fazer, ou uma guarda adiou (nada rodando · rodando mas o livre está acima do piso de parada do job · outra instância em execução)
-#   20  falhou              (não conseguiu gravar o registro, o processo não morreu, erro interno)
-#   30  não consegui ler o estado e por isso NÃO agi (df, ps ou allowlist ilegíveis; não conseguiu criar a trava; regex larga demais)
+#   20  falhou              (não conseguiu gravar o registro, o processo não morreu ou a morte não foi comprovada, erro interno)
+#   30  não consegui ler o estado e por isso NÃO agi (df, ps ou allowlist ilegíveis; ps ilegível na re-conferência antes do primeiro sinal; não consegui criar nem verificar a trava; regex larga demais)
 #   --dry-run devolve os mesmos códigos como previsão (0 = agiria). Quem avisa o Athos (notify/mail em 0/20) é o orquestrador: este degrau só escreve o próprio log.
 #
 # A ALLOWLIST. Casa por REGEX contra a linha de comando do processo E a do PAI (o job de verdade tem o pai do launchd), nunca por tamanho de memória. O arquivo é
@@ -35,13 +35,14 @@
 # `rfb_stream_refresh.py --resume-run <run_id>`: o run_id está na linha FIM do --run e no registro. Se for `-`, o D2 não o leu (S3 fora do ar, nenhuma chave casando ou
 # mais de uma): então NÃO se adivinha; ver as chaves stream-run-* em RFB_META_URI. Sem retomar, o tick das 00:15 recomeça do zero.
 #
-# GUARDAS. (1) só mexe em processo da allowlist, do MEU usuário, com o pai certo, e re-confere a identidade imediatamente antes de cada sinal (pid reaproveitado nunca
-# recebe KILL); (2) "não consegui medir" nunca vira "disco baixo" nem "disco bom": é rc 30 e não age; (3) o registro é gravado ANTES do kill — sem registro, não para;
+# GUARDAS. (1) só mexe em processo da allowlist, do MEU usuário, com o pai certo, e re-confere a identidade logo antes do TERM e de novo logo antes do KILL (pid reaproveitado
+# não recebe sinal; resta só a janela de milissegundos entre a checagem e o kill); (2) "não consegui medir" nunca vira "disco baixo" nem "disco bom": é rc 30 e não age; (3) o registro é gravado ANTES do kill — sem registro, não para;
 # (4) TERM primeiro (SIGINT não serve: sob launchd o filho de `&` o herda ignorado), KILL só depois da graça e só se o processo ainda for o job; morte comprovada
-# por ps, não suposta; (5) regex que casa mais de $D2_MAX_MATCH processos = regex larga demais: rc 30, nada é tocado; (6) instância única por trava (mkdir).
+# por ps E por kill -0, não suposta (ps ilegível, ou pid vivo que não casa mais com a allowlist = "não provei", rc 20, sem KILL às cegas); (5) regex que casa mais de $D2_MAX_MATCH processos =
+# regex larga demais: rc 30, nada é tocado; (6) instância única por trava (mkdir): o dono é conferido pela LINHA DE COMANDO, não só pelo pid (pid reaproveitado não prende o D2).
 #
 # VARIÁVEIS (todas opcionais; as de TESTE estão marcadas). D2_CITY D2_ALLOWLIST D2_STATE D2_LOG D2_LOCK D2_VOLUME D2_TERM_GRACE_S D2_KILL_WAIT_S D2_MAX_MATCH D2_S3_TIMEOUT_S
-# D2_RFB_META_URI · binários: D2_PS_BIN D2_DF_BIN D2_AWS_BIN · TESTE: D2_FREE_MB D2_NOW.
+# D2_RFB_META_URI D2_LOCK_WAIT_S · binários: D2_PS_BIN D2_DF_BIN D2_AWS_BIN · TESTE: D2_FREE_MB D2_NOW D2_LOCKPS_BIN.
 # TESTE: bash scripts/disk-recovery-d2-heavy-jobs.selftest.sh   (hermético: processos de brinquedo, ps/df/aws simulados; nada real é parado; bateria de mutantes inclusa).
 #
 # bash 3.2 (o /bin/bash do macOS): sem declare -A, mapfile, ${v,,}.
@@ -57,6 +58,7 @@ LOG="${D2_LOG:-$GCDIR/logs/disk-recovery-d2.log}"
 LOCKD="${D2_LOCK:-$GCDIR/disk-recovery-d2.lock.d}"
 VOLUME="${D2_VOLUME:-/System/Volumes/Data}"
 PS_BIN="${D2_PS_BIN:-ps}"
+LOCKPS_BIN="${D2_LOCKPS_BIN:-ps}"   # só para conferir o dono da trava (pid → linha de comando); o teste troca por um que falha
 DF_BIN="${D2_DF_BIN:-df}"
 AWS_BIN="${D2_AWS_BIN:-aws}"
 RFB_META_URI="${D2_RFB_META_URI:-s3://urblink-motherduck-backups/real_estate/rfb/_meta/}"
@@ -75,6 +77,7 @@ TERM_GRACE_S=$(num D2_TERM_GRACE_S 20)
 KILL_WAIT_S=$(num D2_KILL_WAIT_S 5)
 MAX_MATCH=$(num D2_MAX_MATCH 3)
 S3_TIMEOUT_S=$(num D2_S3_TIMEOUT_S 40)
+LOCK_WAIT_S=$(num D2_LOCK_WAIT_S 2)
 
 MODE=""; DRY=0; DONE=0; LOCK_HELD=0; RB=""
 
@@ -118,8 +121,8 @@ read_free_mb() {  # stdout: MB livres no volume de dados; rc 1 = não consegui l
     case "$v" in *[!0-9]*) return 1 ;; esac
     printf '%s' "$v"; return 0
   fi
-  out=$("$DF_BIN" -Pk "$VOLUME" 2>/dev/null) || return 1
-  printf '%s\n' "$out" | awk 'NR==2 && $4 ~ /^[0-9]+$/ { printf "%d", $4/1024; ok=1 } END { exit ok ? 0 : 1 }'
+  out=$("$DF_BIN" -Pk "$VOLUME" 2>/dev/null) || return 1      # MUT:dfread
+  printf '%s\n' "$out" | awk 'NR==2 && $4 ~ /^[0-9]+$/ { printf "%d", $4/1024; ok=1 } END { exit ok ? 0 : 1 }'      # MUT:dfparse
 }
 
 run_bounded() {  # $1=segundos, resto=comando; stdout do comando em $RB; rc do comando ou 124 se estourou
@@ -169,36 +172,72 @@ pid_listed() {  # $1=match $2=parent $3=pid → rc 0 = ainda é o job vivo, 1 = 
   printf '%s\n' "$o" | awk -F'\t' -v p="$3" '$1 == p { f = 1 } END { exit f ? 0 : 1 }'
 }
 
-stop_pid() {  # $1=match $2=parent $3=pid → rc 0 = morreu (comprovado), 1 = não morreu / não consegui provar
+pid_gone() {  # $1=pid → rc 0 = o processo não existe mais (ou virou zumbi) · 1 = ainda existe, ou não consegui provar que sumiu
+  local st
+  kill -0 "$1" 2>/dev/null || return 0                      # ESRCH (ou pid de outro usuário: o nosso sumiu)
+  # vazio → o ps não lista o pid; falhou/ilegível → idem: as duas coisas dão "não provei" (rc 1), nunca "sumiu"
+  st=$(ps -o stat= -p "$1" 2>/dev/null | tr -d ' ')
+  case "$st" in Z*) return 0 ;; esac
+  return 1
+}
+
+stop_pid() {  # $1=match $2=parent $3=pid → rc 0 = morreu (comprovado: fora da allowlist no ps E sem processo/zumbi) · 1 = vivo depois de TERM+KILL · 2 = NÃO provei (ps ilegível, ou o pid vive sem casar mais com a allowlist): não mando KILL às cegas
   local re=$1 pre=$2 pid=$3 i=0 max r
   kill -TERM "$pid" 2>/dev/null
   max=$((TERM_GRACE_S * 5))
   while [ "$i" -lt "$max" ]; do
     pid_listed "$re" "$pre" "$pid"; r=$?
-    [ "$r" -eq 1 ] && return 0
+    [ "$r" -eq 1 ] && pid_gone "$pid" && return 0      # MUT:pidgone
     sleep 0.2; i=$((i + 1))
   done
   pid_listed "$re" "$pre" "$pid"; r=$?
-  [ "$r" -eq 1 ] && return 0
-  [ "$r" -eq 0 ] || return 1                      # não consigo ler o ps: não mando KILL às cegas e não digo que morreu
+  if [ "$r" -eq 1 ]; then pid_gone "$pid" && return 0; fi
+  [ "$r" -eq 0 ] || return 2                      # MUT:killunknown
   log "pid $pid sobreviveu à graça de ${TERM_GRACE_S}s depois do TERM: KILL"
   kill -KILL "$pid" 2>/dev/null                   # MUT:killescalate
   i=0; max=$((KILL_WAIT_S * 5))
   while [ "$i" -lt "$max" ]; do
     pid_listed "$re" "$pre" "$pid"; r=$?
-    [ "$r" -eq 1 ] && return 0
+    [ "$r" -eq 1 ] && pid_gone "$pid" && return 0
     sleep 0.2; i=$((i + 1))
   done
+  [ "$r" -eq 0 ] && return 1
+  return 2
+}
+
+lock_owner() {  # $1=pid → rc 0 = o dono vive E é um D2 · 1 = morto, ou o pid é de outro programa (reaproveitado) · 2 = não consegui ver (a trava fica)
+  local c prc
+  kill -0 "$1" 2>/dev/null || return 1
+  # vazio → o pid sumiu entre o kill e o ps = dono morto (1); falhou/ilegível (rc >= 2, ex. binário ausente) → não sei (2): não roubo a trava
+  c=$("$LOCKPS_BIN" -o command= -p "$1" 2>/dev/null); prc=$?
+  [ "$prc" -le 1 ] || return 2
+  case "$c" in *disk-recovery-d2*) return 0 ;; esac      # MUT:lockowner
   return 1
 }
 
-acquire_lock() {  # rc 0 = tomei · 1 = outra instância viva · 2 = não consegui criar a trava (erro de gravação: NÃO é "outra instância")
+acquire_lock() {  # rc 0 = tomei · 1 = outra instância (viva, ou começando agora) · 2 = não consegui criar nem verificar a trava (NÃO é "outra instância")
+  local p i max o old try
   mkdir -p "$(dirname "$LOCKD")" 2>/dev/null || return 2
-  if mkdir "$LOCKD" 2>/dev/null; then printf '%s' "$$" >"$LOCKD/pid"; LOCK_HELD=1; return 0; fi
-  local p; p=$(cat "$LOCKD/pid" 2>/dev/null)
-  if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then return 1; fi      # pid ilegível = trava abandonada (entre o mkdir e o pid do dono passam microssegundos)
-  rm -rf "$LOCKD" 2>/dev/null
-  if mkdir "$LOCKD" 2>/dev/null; then printf '%s' "$$" >"$LOCKD/pid"; LOCK_HELD=1; return 0; fi
+  for try in 1 2; do
+    if mkdir "$LOCKD" 2>/dev/null; then
+      printf '%s' "$$" >"$LOCKD/pid" 2>/dev/null || { rm -rf "$LOCKD" 2>/dev/null; return 2; }
+      LOCK_HELD=1; return 0
+    fi
+    p=""; i=0; max=$((LOCK_WAIT_S * 5))
+    # vazio → o dono criou a pasta e ainda não gravou o pid: espero até D2_LOCK_WAIT_S e depois julgo pela idade; falhou/ilegível → idem (sem pid legível): só a idade (> 2 min) a torna abandonada
+    while [ "$i" -le "$max" ]; do p=$(cat "$LOCKD/pid" 2>/dev/null); [ -n "$p" ] && break; sleep 0.2; i=$((i + 1)); done
+    [ -d "$LOCKD" ] || continue                       # o dono terminou e soltou a trava enquanto eu esperava: tento tomar de novo
+    if [ -n "$p" ]; then
+      lock_owner "$p"; o=$?
+      [ "$o" -eq 0 ] && return 1
+      [ "$o" -eq 1 ] || return 2      # MUT:lockunknown
+    else
+      # sem pid depois da espera: só é trava abandonada se a pasta tem mais de 2 min; idade ilegível = não sei = não toco; pasta nova = o dono está começando
+      old=$(find "$LOCKD" -maxdepth 0 -mmin +2 2>/dev/null) || return 2
+      [ -n "$old" ] || return 1      # MUT:lockyoung
+    fi
+    rm -rf "$LOCKD" 2>/dev/null
+  done
   [ -d "$LOCKD" ] && return 1
   return 2
 }
@@ -276,7 +315,7 @@ rfb_run_id() {  # $1=pid $2=início_epoch → RUNID_RES = "ID <id>" | "NONE" | "
 
 # ── --run / --dry-run ───────────────────────────────────────────────────────────────────────────────────────────────────────
 do_run() {
-  local free id adapter re pre stop_mb resume_mb window maxage how procs n pid et p lrc
+  local free id adapter re pre stop_mb resume_mb window maxage how procs n pid et p lrc start
   load_allowlist || finish 30 "$ALLOW_ERR; não ajo"
   free=$(read_free_mb) || finish 30 "não consegui ler o livre de $VOLUME (df); não ajo"      # MUT:freefail
   local plan="" idle="" held="" row
@@ -296,17 +335,18 @@ EOF
     while IFS= read -r p; do
       [ -n "$p" ] || continue
       pid=$(printf '%s' "$p" | cut -f1); et=$(printf '%s' "$p" | cut -f4)
-      plan="${plan}${id}${TAB}${pid}${TAB}${et}${TAB}${stop_mb}${TAB}${resume_mb}${TAB}${window}${TAB}${re}${TAB}${pre}${NL}"
+      start="-"; [ "$et" -ge 0 ] 2>/dev/null && start=$(( $(now) - et ))      # fixado AGORA: o 2º processo do plano não herda a demora de parar o 1º
+      plan="${plan}${id}${TAB}${pid}${TAB}${start}${TAB}${stop_mb}${TAB}${resume_mb}${TAB}${window}${TAB}${re}${TAB}${pre}${NL}"
     done <<EOF
 $procs
 EOF
   done <<EOF
 $ROWS
 EOF
-  local summary_stopped="" summary_failed="" line
+  local summary_stopped="" summary_failed="" summary_unread="" line srp why
   if [ -z "$plan" ]; then
-    local why="$held"; [ -n "$idle" ] && why="${why}${why:+; }$idle"
-    finish 10 "nada a parar: $why (livre ${free} MB)"
+    local msg="$held"; [ -n "$idle" ] && msg="${msg}${msg:+; }$idle"
+    finish 10 "nada a parar: $msg (livre ${free} MB)"
   fi
   if [ "$DRY" = 1 ]; then
     while IFS= read -r line; do
@@ -320,27 +360,27 @@ EOF
   fi
   acquire_lock; lrc=$?
   [ "$lrc" -eq 1 ] && finish 10 "outra instância do D2 em execução ($LOCKD): saio sem agir"
-  [ "$lrc" -eq 0 ] || finish 30 "não consegui criar a trava $LOCKD (erro de gravação): não ajo"
+  [ "$lrc" -eq 0 ] || finish 30 "não consegui criar nem verificar a trava $LOCKD (erro de gravação, ou ps/find ilegível): não ajo"
   trim_log
-  local start rid rrc resume_hint=""
+  local rid rrc resume_hint=""
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    IFS="$TAB" read -r id pid et stop_mb resume_mb window re pre <<EOF
+    IFS="$TAB" read -r id pid start stop_mb resume_mb window re pre <<EOF
 $line
 EOF
-    start="-"; [ "$et" -ge 0 ] 2>/dev/null && start=$(( $(now) - et ))
     # re-confere a identidade AGORA, imediatamente antes do primeiro sinal: pid que sumiu ou foi reaproveitado não recebe nada
     pid_listed "$re" "$pre" "$pid"; rrc=$?
-    if [ "$rrc" -eq 2 ]; then summary_failed="${summary_failed}${summary_failed:+; }$id (pid $pid): ps ilegível na re-conferência, não toquei"; continue; fi
+    if [ "$rrc" -eq 2 ]; then summary_unread="${summary_unread}${summary_unread:+; }$id (pid $pid)"; log "$id pid $pid: ps ilegível na re-conferência, não toquei"; continue; fi      # MUT:recheck
     if [ "$rrc" -eq 1 ]; then log "$id pid $pid sumiu antes do sinal: nada a parar"; continue; fi
     state_append STOPPING "$id" "$pid" "$start" - "$free" "livre ${free} MB <= piso ${stop_mb} MB" || { summary_failed="${summary_failed}${summary_failed:+; }$id (pid $pid): não consegui gravar o registro em $STATE, então NÃO parei"; log "$id: registro ilegível, não parei"; continue; }      # MUT:recordfirst
     log "$id pid $pid: TERM (livre ${free} MB <= piso ${stop_mb} MB; início_epoch=$start)"
-    if stop_pid "$re" "$pre" "$pid"; then
+    stop_pid "$re" "$pre" "$pid"; srp=$?
+    if [ "$srp" -eq 0 ]; then
       rid="-"
       if rfb_run_id "$pid" "$start"; then
         case "$RUNID_RES" in
           "ID "*) rid=${RUNID_RES#ID } ;;
-          NONE) log "$id: nenhum checkpoint no S3 para o pid $pid (nada a retomar além do zero)" ;;
+          NONE) log "$id: nenhuma chave stream-run-<epoch>-$pid casa (se este run era um --resume-run, as chaves ficam sob o run_id ANTIGO): run_id fica '-', não adivinho" ;;
           *) log "$id: mais de um run casa pid+hora ($RUNID_RES): não adivinho o run_id" ;;
         esac
       else
@@ -355,13 +395,18 @@ EOF
         resume_hint="${resume_hint}${resume_hint:+; }$id: retomar à mão com rfb_stream_refresh.py --resume-run $rid quando livre >= ${resume_mb} MB (janela ${window})"
       fi
     else
-      state_append STOP_FAILED "$id" "$pid" "$start" - "$free" "não morreu depois de TERM+KILL" || true
-      log "$id pid $pid: NÃO morreu depois de TERM e KILL"
-      summary_failed="${summary_failed}${summary_failed:+; }$id (pid $pid) não morreu depois de TERM+KILL"
+      if [ "$srp" -eq 1 ]; then why="não morreu depois de TERM+KILL"; else why="morte NÃO comprovada (ps ilegível, ou o pid vive sem casar mais com a allowlist)"; fi
+      state_append STOP_FAILED "$id" "$pid" "$start" - "$free" "$why" || true
+      log "$id pid $pid: $why"
+      summary_failed="${summary_failed}${summary_failed:+; }$id (pid $pid): $why"
     fi
   done <<EOF
 $plan
 EOF
+  if [ -n "$summary_unread" ]; then      # nada foi parado nem falhou: o ps não deixou conferir, então não agi (rc 30); se já houve ação, é falha parcial (rc 20)
+    [ -n "$summary_stopped$summary_failed" ] || finish 30 "não consegui ler o ps na re-conferência de $summary_unread; não agi"
+    summary_failed="${summary_failed}${summary_failed:+; }$summary_unread: ps ilegível na re-conferência, não toquei"
+  fi
   if [ -n "$summary_failed" ]; then
     finish 20 "FALHOU: $summary_failed${summary_stopped:+ | parou: $summary_stopped}"
   fi
@@ -369,7 +414,7 @@ EOF
   finish 0 "parou $summary_stopped; $resume_hint"
 }
 
-usage() { MODE="${MODE:-uso}"; finish 2 "uso: $0 --run | --dry-run"; }
+usage() { MODE="${MODE:-uso}"; DRY=1; finish 2 "uso: $0 --run | --dry-run"; }      # DRY=1: uso errado não escreve no log de produção
 case "${1:-}" in
   --run)     MODE="--run" ;;
   --dry-run) MODE="--dry-run"; DRY=1 ;;
