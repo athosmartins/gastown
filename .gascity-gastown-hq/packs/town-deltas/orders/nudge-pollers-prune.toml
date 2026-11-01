@@ -1,0 +1,14 @@
+# ga-9uv1xps.2: <city>/.gc/nudges/pollers/ is never pruned by the engine: 3 files per poller stem (.pid, .pid.lock, .log),
+# 32,639 files measured on 2026-11-01 (17,956 stems, oldest 19/09, ~700 new files/day, ~96% of the stems from
+# one-shot ad-hoc / dog / ps-worker sessions).
+# nudge-pollers-prune.py removes a stem only when it is DEAD (no live `gc nudge poll` whose target hashes to the
+# stem, and its .pid is not a live poller), untouched for >= 7 days, and its flock is free. A `ps` that fails,
+# is empty, or does not list the script itself makes the run delete NOTHING (rc 2).
+#
+# 3h: the prune is cheap (one directory scan, ~5 s for 33k files) and the growth is ~700 files/day, so a run
+# every 3 h never has more than ~90 new files to look at.
+[order]
+description = "Prune dead nudge-poller files older than 7d from .gc/nudges/pollers (ga-9uv1xps.2)"
+trigger = "cooldown"
+interval = "3h"
+exec = "$PACK_DIR/assets/scripts/nudge-pollers-prune.sh"
