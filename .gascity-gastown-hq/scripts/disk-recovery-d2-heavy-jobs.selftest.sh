@@ -7,11 +7,13 @@
 # O QUE PROVA. Que o D2 (a) só para o que a allowlist manda, só com o disco no piso e só com o pai certo; (b) nunca age quando não consegue LER o estado (df, ps, allowlist,
 # registro) — três estados, "não sei" não vira "baixo" nem "bom"; (c) só afirma que parou depois de PROVAR a morte (ps E kill -0), escala TERM→KILL e não manda KILL às cegas quando não consegue provar;
 # (d) não para sem antes gravar o registro; (e) retoma só com o disco de volta, na janela, com run_id LIDO e bem formado (nunca adivinhado) e com o ambiente do plist — e não retoma quando a trava não
-# pôde ser criada (rc 30, causa diferente de "outra instância"); (f) devolve UMA linha e os códigos do contrato.
+# pôde ser criada (rc 30, causa diferente de "outra instância"); (f) devolve UMA linha e os códigos do contrato; (g) o job lançado pela retomada não sobrevive à decisão que o lançou: `launchctl submit` é KeepAlive (o launchd
+# relança o job depois de TODA saída), então quando o job acaba — com qualquer código, ou parado pela escada — o rótulo some e o código de saída fica guardado; o launchd de brinquedo RELANÇA de verdade (R20-R26).
 # Cada guarda tem um MUTANTE: a bateria final estraga uma linha do script (marcada `# MUT:<nome>`) e exige que o cenário correspondente FALHE.
 #
 # HERMETISMO. Processos de brinquedo (um `bash fakejob-A.sh` num diretório temporário) levam TERM/KILL de verdade — nada além deles. ps/aws/launchctl/df vêm de stubs ou de
-# D2_FREE_MB; a allowlist é a do teste (a real só é lida em modo --dry-run, com ps simulado); o df de verdade só roda em s_real_df (somente leitura). O pior que escreve em disco são alguns KB em $TMPDIR. Duração ~1 min.
+# D2_FREE_MB; a allowlist é a do teste (a real só é lida em modo --dry-run, com ps simulado); o df de verdade só roda em s_real_df (somente leitura). O launchctl de brinquedo, em STUB_LC_RUN, EXECUTA o comando
+# do `submit` (uma raiz do rfb de brinquedo em bash puro, sob $TMPDIR) com KeepAlive, e o `reap` mata o que sobrar. O pior que escreve em disco são alguns KB em $TMPDIR. Duração ~2 min.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -31,10 +33,19 @@ eq()   { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (obtive '$2', esperava '
 has()  { case "$2" in *"$3"*) ok "$1" ;; *) bad "$1 (não achei '$3' em: $2)" ;; esac; }
 hasnt() { case "$2" in *"$3"*) bad "$1 (achei '$3' em: $2)" ;; *) ok "$1" ;; esac; }
 
+lc_cleanup() {  # mata o supervisor e o job que o stub-launchctl (modo STUB_LC_RUN) deixou de pé num cenário
+  local f p
+  for f in "$T"/case*/lc.log.sup "$T"/case*/lc.log.pid; do
+    [ -f "$f" ] || continue
+    p=$(cat "$f" 2>/dev/null); [ -n "$p" ] && kill -KILL "$p" 2>/dev/null
+  done
+  return 0
+}
 reap() {
   local p
   for p in $JOBS; do kill -KILL "$p" 2>/dev/null; wait "$p" 2>/dev/null; done
   JOBS=""
+  lc_cleanup
 }
 finish_all() { reap; rm -rf "$T"; }
 trap finish_all EXIT
@@ -82,20 +93,62 @@ printf '    1     0 %s 10-00:00:01 /sbin/launchd\n' "$(id -u)"
 EOF
 cat >"$T/stub-launchctl" <<'EOF'
 #!/bin/bash
+# launchctl de brinquedo. Padrão: `list` com resposta ENLATADA (STUB_LC_MODE = alive | gone | listfail | listfail2).
+# STUB_LC_RUN=1: o `submit` EXECUTA o comando do jeito que o launchd executa um job de `submit` — KeepAlive: relança depois de TODA saída, mesmo rc 0 (aqui
+# STUB_LC_THROTTLE s depois, em vez dos ~10 s do launchd), até o `remove`; o `remove` termina o job com SIGTERM e para o relançamento. `list` mostra PID enquanto o job vive.
+# Estado ao lado do log: .submitted (o rótulo existe) · .pid (job vivo) · .sup (supervisor) · .started · .runs (uma linha por lançamento) · .status (rc do último).
 LOG="${STUB_LC_LOG:?}"
 case "${1:-}" in
-  submit) { echo "--- submit"; printf '%s\n' "$@"; } >>"$LOG"; [ "${STUB_LC_SUBMIT_FAIL:-0}" = 1 ] && exit 1; : >"$LOG.submitted"; exit 0 ;;
-  remove) echo "--- remove $*" >>"$LOG"; rm -f "$LOG.submitted"; exit 0 ;;
-  list)   echo "--- list $*" >>"$LOG"
-          [ "${STUB_LC_MODE:-}" = listfail ] && exit 1      # o próprio launchctl quebrado (rc 1), que NÃO é o "não conheço o rótulo" (113)
-          [ -f "$LOG.submitted" ] || exit 113
-          case "${STUB_LC_MODE:-alive}" in
-            alive) printf '{\n\t"LastExitStatus" = 0;\n\t"PID" = 4242;\n};\n' ;;
-            rc3)   printf '{\n\t"LastExitStatus" = 768;\n};\n' ;;
-            rc1)   printf '{\n\t"LastExitStatus" = 256;\n};\n' ;;
-            gone)  exit 113 ;;
-          esac
-          exit 0 ;;
+  submit)
+    { echo "--- submit"; printf '%s\n' "$@"; } >>"$LOG"
+    [ "${STUB_LC_SUBMIT_FAIL:-0}" = 1 ] && exit 1
+    : >"$LOG.submitted"
+    [ "${STUB_LC_RUN:-0}" = 1 ] || exit 0
+    shift; OUTF=/dev/null
+    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
+      case "$1" in -o) OUTF=$2; shift ;; esac
+      shift
+    done
+    shift      # o `--`
+    rm -f "$LOG.started"
+    (
+      while [ -f "$LOG.submitted" ]; do
+        "$@" >>"$OUTF" 2>&1 &
+        jp=$!; echo "$jp" >"$LOG.pid"; echo run >>"$LOG.runs"; : >"$LOG.started"
+        wait "$jp"; echo $? >"$LOG.status"; rm -f "$LOG.pid"
+        [ -f "$LOG.submitted" ] || break
+        sleep "${STUB_LC_THROTTLE:-1}"
+      done
+    ) >/dev/null 2>&1 &
+    echo $! >"$LOG.sup"
+    i=0; while [ ! -f "$LOG.started" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done      # como o launchd: o job já está de pé quando o submit volta
+    exit 0 ;;
+  remove)
+    echo "--- remove $*" >>"$LOG"
+    n=$(cat "$LOG.rmn" 2>/dev/null || echo 0)
+    if [ "$n" -lt "${STUB_LC_REMOVE_FAILS:-0}" ]; then echo $((n + 1)) >"$LOG.rmn"; exit 1; fi      # as primeiras STUB_LC_REMOVE_FAILS chamadas FALHAM (nada é removido)
+    [ -f "$LOG.submitted" ] || exit 113      # rótulo desconhecido (já removido)
+    rm -f "$LOG.submitted"
+    [ "${STUB_LC_RUN:-0}" = 1 ] && [ -f "$LOG.pid" ] && kill -TERM "$(cat "$LOG.pid")" 2>/dev/null
+    exit 0 ;;
+  list)
+    echo "--- list $*" >>"$LOG"
+    [ "${STUB_LC_MODE:-}" = listfail ] && exit 1      # o próprio launchctl quebrado (rc 1), que NÃO é o "não conheço o rótulo" (113)
+    [ -f "$LOG.submitted" ] || exit 113
+    [ "${STUB_LC_MODE:-}" = listfail2 ] && exit 1     # quebra só DEPOIS do submit (o list de antes, que deu 113, passou)
+    if [ "${STUB_LC_RUN:-0}" = 1 ]; then
+      if [ -f "$LOG.pid" ] && kill -0 "$(cat "$LOG.pid")" 2>/dev/null; then
+        printf '{\n\t"LastExitStatus" = 0;\n\t"PID" = %s;\n};\n' "$(cat "$LOG.pid")"
+      else
+        printf '{\n\t"LastExitStatus" = %s;\n};\n' $(( $(cat "$LOG.status" 2>/dev/null || echo 0) * 256 ))
+      fi
+      exit 0
+    fi
+    case "${STUB_LC_MODE:-alive}" in
+      alive) printf '{\n\t"LastExitStatus" = 0;\n\t"PID" = 4242;\n};\n' ;;
+      gone)  exit 113 ;;
+    esac
+    exit 0 ;;
 esac
 exit 64
 EOF
@@ -120,7 +173,7 @@ newcase() {  # cria um diretório de caso, exporta o ambiente do D2 e (opcional)
   # folgas generosas: o stub responde na hora, então não custam tempo; só evitam falso vermelho com a máquina em swap (load 36 medido em 01/11: S5 já falhou por timeout do S3)
   export D2_TERM_GRACE_S=1 D2_KILL_WAIT_S=6 D2_S3_TIMEOUT_S=15 D2_RESUME_WATCH_S=1 D2_MAX_MATCH=3
   export D2_AWS_BIN="$T/stub-aws" D2_LAUNCHCTL_BIN="$T/stub-launchctl" D2_RFB_PLIST="$T/fixture.plist" D2_RFB_ROOT=/nonexistent-root D2_RFB_PYTHON=/nonexistent-python
-  export STUB_LC_LOG="$C/lc.log" STUB_LC_MODE=alive STUB_AWS_FAIL=0 STUB_AWS_NONE=0 STUB_AWS_AMBIG=0 STUB_LC_SUBMIT_FAIL=0
+  export STUB_LC_LOG="$C/lc.log" STUB_LC_MODE=alive STUB_AWS_FAIL=0 STUB_AWS_NONE=0 STUB_AWS_AMBIG=0 STUB_LC_SUBMIT_FAIL=0 STUB_LC_RUN=0 STUB_LC_THROTTLE=1 STUB_LC_REMOVE_FAILS=0
   export TMPDIR="$T/tmp" D2_HOUR=23
   unset D2_FREE_MB D2_PS_BIN D2_DF_BIN D2_NOW D2_VOLUME D2_LOCKPS_BIN D2_LOCK_WAIT_S STUB_PS_FILE STUB_PS_COUNT STUB_PS_GOOD STUB_PS_AFTER STUB_STATE_FAIL
   mk_allow "$D2_ALLOWLIST" "$ALLOW_RE" "$ALLOW_PRE" 3072 8000 21-6 3600
@@ -141,6 +194,45 @@ state_line() {  # $1=evento $2=pid $3=início $4=run_id $5=ts
   printf '%s\t%s\tjoba\t%s\t%s\t%s\t5000\tfixture\n' "${5:-$NOW0}" "$1" "$2" "$3" "$4" >>"$D2_STATE"
 }
 stub_env_for_job() { export STUB_AWS_PID="$JOBPID" STUB_AWS_EPOCH="$(date +%s)"; }
+
+# ── a retomada de VERDADE: o launchctl de brinquedo executa o comando do submit (KeepAlive) sobre uma raiz do rfb de brinquedo ──────────────
+LABEL_T="com.gascity.d2-resume.rfb"
+mk_rfb_root() {  # $1=modo do job de brinquedo (exit3 | exit1 | ok-after2 | fail-after2 | long) → liga STUB_LC_RUN e aponta o D2 para a raiz de brinquedo
+  RFBROOT="$C/rfbroot"; RCFILE="$C/city/.gc/disk-recovery-d2-resume-rfb.rc"; mkdir -p "$RFBROOT/scripts"
+  cat >"$RFBROOT/scripts/job_timeout.sh" <<'EOF'
+#!/bin/bash
+# job_timeout.sh de brinquedo: <segundos> <rótulo> --soft -- <comando...>; o comando roda como FILHO e o rc é repassado (como o de verdade)
+shift 4
+"$@"
+exit $?
+EOF
+  cat >"$RFBROOT/scripts/rfb_stream_refresh.py" <<'EOF'
+#!/bin/bash
+# "python" de brinquedo: o modo vem de toy.mode (ao lado de scripts/); cada execução deixa uma linha em toy.runs e o seu pid em toy.pid
+root=$(cd "$(dirname "$0")/.." && pwd)
+echo "run $*" >>"$root/toy.runs"; echo $$ >"$root/toy.pid"
+case "$(cat "$root/toy.mode" 2>/dev/null)" in
+  exit3) exit 3 ;;
+  exit1) exit 1 ;;
+  ok-after2) sleep 2; exit 0 ;;
+  fail-after2) sleep 2; exit 1 ;;
+  long) i=0; while [ "$i" -lt 40 ]; do sleep 1; i=$((i + 1)); done; exit 0 ;;      # limitado: se o cenário não o matar, ele some sozinho
+esac
+exit 99
+EOF
+  chmod +x "$RFBROOT/scripts/job_timeout.sh" "$RFBROOT/scripts/rfb_stream_refresh.py"
+  printf '%s\n' "$1" >"$RFBROOT/toy.mode"
+  export D2_RFB_ROOT="$RFBROOT" D2_RFB_PYTHON=/bin/bash STUB_LC_RUN=1
+}
+toy_runs() { if [ -f "$RFBROOT/toy.runs" ]; then wc -l <"$RFBROOT/toy.runs" | tr -d ' '; else echo 0; fi; }      # quantas vezes o job de brinquedo EXECUTOU
+label_gone() {  # $1=segundos → rc 0 = o rótulo da retomada sumiu do launchd de brinquedo (list = 113) dentro do prazo
+  local i=0 max=$(( $1 * 5 ))
+  while [ "$i" -lt "$max" ]; do
+    "$T/stub-launchctl" list "$LABEL_T" >/dev/null 2>&1; [ $? -eq 113 ] && return 0
+    sleep 0.2; i=$((i + 1))
+  done
+  return 1
+}
 
 # ═════════════════ CENÁRIOS DE PARADA ═══════════════════════════════════════════════════════════════════════════════════════
 s_usage() {
@@ -406,21 +498,26 @@ r_launch_ok() {
   run_sut --resume; eq "R14 depois de retomada não há mais pendente: rc 10" "$RC" 10
 }
 
-r_refused() {
-  newcase; export D2_FREE_MB=9000 STUB_LC_MODE=rc3; state_line STOPPED 66632 "$NOW0" "$RID_OK"
+r_refused() {  # o job de brinquedo roda DE VERDADE dentro do launchd de brinquedo (STUB_LC_RUN) e sai com o rc 3 do portão dele
+  newcase; mk_rfb_root exit3; export D2_FREE_MB=9000; state_line STOPPED 66632 "$NOW0" "$RID_OK"
   run_sut --resume
   eq "R5 o job recusa (rc 3 NÃO RODEI): rc 10" "$RC" 10
   eq "R5 o registro ganhou RESUME_REFUSED" "$(tail -n 1 "$D2_STATE" | cut -f2)" "RESUME_REFUSED"
-  export STUB_LC_MODE=alive; rm -f "$STUB_LC_LOG.submitted"; run_sut --resume
+  has "R5 a linha diz que o job recusou" "$OUT" "recusou"
+  eq "R5 o job rodou uma vez" "$(toy_runs)" 1
+  printf 'long\n' >"$RFBROOT/toy.mode"; run_sut --resume
   eq "R5 segue pendente: na próxima tentativa o job sobe (rc 0)" "$RC" 0
+  eq "R5 ...e rodou de novo (2 execuções)" "$(toy_runs)" 2
+  reap
 }
 
 r_crash() {
-  newcase; export D2_FREE_MB=9000 STUB_LC_MODE=rc1; state_line STOPPED 66632 "$NOW0" "$RID_OK"
+  newcase; mk_rfb_root exit1; export D2_FREE_MB=9000; state_line STOPPED 66632 "$NOW0" "$RID_OK"
   run_sut --resume
   eq "R6 o job sai com rc 1 antes da vigia: rc 20" "$RC" 20
   eq "R6 o registro ganhou RESUME_FAILED" "$(tail -n 1 "$D2_STATE" | cut -f2)" "RESUME_FAILED"
   has "R6 a linha manda retomar à mão com o run_id" "$OUT" "$RID_OK"
+  has "R6 a linha diz o rc com que o job saiu" "$OUT" "rc 1"
 }
 
 r_no_guess() {  # run_id '-' e S3 ilegível: NÃO inventa
@@ -522,8 +619,85 @@ r_list_fails() {  # launchctl list quebrado (rc 1) != "o launchd não conhece o 
   eq "R19 segue pendente" "$(tail -n 1 "$D2_STATE" | cut -f2)" "STOPPED"
 }
 
+r_lifecycle() {  # `launchctl submit` é KeepAlive: o launchd relança o job depois de TODA saída (~10 s), até o `remove`. O job que acaba DEPOIS da vigia tem de levar o rótulo embora
+  local mode want
+  for mode in ok-after2 fail-after2; do
+    want=0; [ "$mode" = fail-after2 ] && want=1
+    newcase; mk_rfb_root "$mode"; export D2_FREE_MB=9000; state_line STOPPED 66632 "$NOW0" "$RID_OK"
+    run_sut --resume
+    eq "R20 ($mode) o job segue vivo depois da vigia: rc 0 (retomou)" "$RC" 0
+    label_gone 10; check $? "R20 ($mode) quando o job acaba o rótulo SOME do launchd (sem isso o KeepAlive o relança)"
+    sleep 3      # três vezes o intervalo de relançamento do launchd de brinquedo
+    eq "R20 ($mode) o job rodou UMA vez: o launchd não o relançou" "$(toy_runs)" 1
+    eq "R20 ($mode) o código de saída do job ficou guardado (rc $want)" "$(cat "$RCFILE" 2>/dev/null)" "$want"
+    reap
+  done
+}
+
+r_stop_again() {  # a escada para de novo o job que ela mesma retomou (D2 --run: TERM no python): o launchd não pode desfazer a parada relançando o job
+  newcase; mk_rfb_root long; export D2_FREE_MB=9000; state_line STOPPED 66632 "$NOW0" "$RID_OK"
+  run_sut --resume
+  eq "R21 retomou: rc 0" "$RC" 0
+  local tp; tp=$(cat "$RFBROOT/toy.pid" 2>/dev/null)
+  [ -n "$tp" ] && kill -0 "$tp" 2>/dev/null; check $? "R21 pré-condição: o job de brinquedo está vivo (pid ${tp:-?})"
+  kill -TERM "$tp" 2>/dev/null
+  label_gone 10; check $? "R21 o job levou TERM e o rótulo SOME (o launchd não relança o que a escada acabou de parar)"
+  sleep 3
+  eq "R21 o job rodou UMA vez (não voltou sozinho)" "$(toy_runs)" 1
+  eq "R21 o código que ficou é o do TERM (143)" "$(cat "$RCFILE" 2>/dev/null)" 143
+  reap
+}
+
+r_stale_rc() {  # o código de saída de uma retomada ANTERIOR (um 0 velho) não pode ser lido como o desta, nem impedir o job de rodar
+  newcase; mk_rfb_root exit3; export D2_FREE_MB=9000; state_line STOPPED 66632 "$NOW0" "$RID_OK"
+  printf '0\n' >"$RCFILE"
+  run_sut --resume
+  eq "R22 com um rc 0 velho no arquivo o job rodou mesmo assim" "$(toy_runs)" 1
+  eq "R22 ...e o código lido é o DESTE job (3, recusou): rc 10" "$RC" 10
+  eq "R22 ...o registro é RESUME_REFUSED, não RESUME_STARTED" "$(tail -n 1 "$D2_STATE" | cut -f2)" "RESUME_REFUSED"
+  reap
+}
+
+r_no_code() {  # o rótulo sumiu dentro da vigia e NÃO deixou código de saída: não sei o que houve → rc 20, nunca "terminou bem"
+  newcase; export D2_FREE_MB=9000 STUB_LC_MODE=gone; state_line STOPPED 66632 "$NOW0" "$RID_OK"
+  run_sut --resume
+  eq "R23 rótulo sumiu sem código de saída: rc 20" "$RC" 20
+  has "R23 a linha diz que não leu o código" "$OUT" "não li o código"
+  eq "R23 o registro ganhou RESUME_FAILED" "$(tail -n 1 "$D2_STATE" | cut -f2)" "RESUME_FAILED"
+}
+
+r_list_fails_after() {  # launchctl list quebra DEPOIS do submit (rc 1, que NÃO é o 113 de "sumiu"): não sei se a retomada está de pé → rc 20, nunca "viva"
+  newcase; export D2_FREE_MB=9000 STUB_LC_MODE=listfail2; state_line STOPPED 66632 "$NOW0" "$RID_OK"
+  run_sut --resume
+  eq "R24 launchctl list quebra depois do submit: rc 20" "$RC" 20
+  has "R24 a causa na linha é o launchctl list" "$OUT" "launchctl list"
+  eq "R24 o registro ganhou RESUME_FAILED" "$(tail -n 1 "$D2_STATE" | cut -f2)" "RESUME_FAILED"
+}
+
+r_rc_unclearable() {  # não consigo apagar o código de saída da retomada anterior (aqui o caminho é uma PASTA, que `rm -f` não apaga): não sei ler o próximo → rc 30 e nada é lançado
+  newcase; mk_rfb_root exit3; export D2_FREE_MB=9000; state_line STOPPED 66632 "$NOW0" "$RID_OK"
+  mkdir -p "$RCFILE/dentro"
+  run_sut --resume
+  eq "R25 código de saída anterior que não dá para apagar: rc 30" "$RC" 30
+  has "R25 a causa na linha é esse arquivo" "$OUT" "não consegui apagar"
+  ! grep -q '^--- submit' "$STUB_LC_LOG"; check $? "R25 nenhum submit (o job não foi lançado)"
+  eq "R25 segue pendente" "$(tail -n 1 "$D2_STATE" | cut -f2)" "STOPPED"
+}
+
+r_remove_fails_once() {  # o `remove` do wrapper FALHA uma vez: o launchd relança o wrapper, que já achou o código gravado e NÃO roda o job de novo — só tenta remover outra vez
+  newcase; mk_rfb_root ok-after2; export D2_FREE_MB=9000 STUB_LC_REMOVE_FAILS=1; state_line STOPPED 66632 "$NOW0" "$RID_OK"
+  run_sut --resume
+  eq "R26 retomou: rc 0" "$RC" 0
+  label_gone 12; check $? "R26 o rótulo some na 2ª tentativa de remover (o wrapper relançado)"
+  sleep 3
+  eq "R26 o wrapper foi lançado 2 vezes (o remove falhou na 1ª)" "$(wc -l <"$STUB_LC_LOG.runs" | tr -d ' ')" 2
+  eq "R26 ...mas o JOB rodou uma vez só" "$(toy_runs)" 1
+  reap
+}
+
 SCENARIOS="s_usage s_dry_run s_real_allowlist s_real_df s_recheck_unreadable s_stop_unproven s_stop_guard s_stop_ok s_stop_ambiguous s_stop_s3_down s_stubborn s_parent_guard s_df_unreadable s_ps_unreadable s_broad_regex s_allowlist_invalid s_state_unwritable s_lock
-r_nothing r_hysteresis r_window r_launch_ok r_refused r_crash r_no_guess r_derive r_bad_rid r_too_old r_already_running r_plist_unreadable r_not_in_allowlist r_submit_fails r_lock r_start_record r_list_fails"
+r_nothing r_hysteresis r_window r_launch_ok r_refused r_crash r_no_guess r_derive r_bad_rid r_too_old r_already_running r_plist_unreadable r_not_in_allowlist r_submit_fails r_lock r_start_record r_list_fails
+r_lifecycle r_stop_again r_stale_rc r_no_code r_list_fails_after r_rc_unclearable r_remove_fails_once"
 
 SUT="$REAL"
 echo "=== disk-recovery-d2-heavy-jobs.selftest.sh ==="
@@ -576,6 +750,12 @@ kill_mutant ridvalid      ridvalid      '    if false; then      # MUT:ridvalid'
 kill_mutant resumelock    resumelock    '  acquire_lock || finish 10 "outra instância do D2 em execução ($LOCKD): saio sem agir"; lrc=0      # MUT:resumelock' r_lock
 kill_mutant startrecord   startrecord   '      0)  state_append RESUME_STARTED "$id" "$pid" "$start" "$rid" "$free" "$LAUNCH_MSG" || true      # MUT:startrecord' r_start_record
 kill_mutant listfail      listfail      '  :      # MUT:listfail' r_list_fails
+kill_mutant wrapper       wrapper       'RESUME_WRAPPER='"'"'rcf=$1; lab=$2; lc=$3; root=$4; shift 4; ( cd "$root" && exec "$@" ); rc=$?; printf "%s\n" "$rc" >"$rcf"; exit "$rc"'"'"'      # MUT:wrapper' r_lifecycle
+kill_mutant wrapperguard  wrapper       'RESUME_WRAPPER='"'"'rcf=$1; lab=$2; lc=$3; root=$4; shift 4; ( cd "$root" && exec "$@" ); rc=$?; printf "%s\n" "$rc" >"$rcf"; "$lc" remove "$lab"; exit "$rc"'"'"'      # MUT:wrapper' r_remove_fails_once
+kill_mutant rcclear       rcclear       '  :      # MUT:rcclear' r_stale_rc
+kill_mutant rccheck       rccheck       '  :      # MUT:rccheck' r_rc_unclearable
+kill_mutant rcread        rcread        '  code=${code:-0}      # MUT:rcread' r_no_code
+kill_mutant watchlist     watchlist     '    :      # MUT:watchlist' r_list_fails_after
 
 echo "=== resultado: $PASS passaram, $FAIL falharam ==="
 [ "$FAIL" -eq 0 ]
