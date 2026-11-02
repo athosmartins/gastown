@@ -18,7 +18,7 @@
 #   · MOLES POR EVIDÊNCIA (ga-qkc02kk, regra 4): a palavra mole na bead é prosa e só informa; o código dos arquivos de prova (lido em origin/main) é que barra. Três estados: leu e achou (nome de banco solto, caminho fixado, argv/chamada do cofre,
 #   osascript/launchctl/security, perfil do Chrome) -> mini mesmo SEM palavra; leu e não achou (docstring/comentário, connect(variável), env de token, `import secrets`, /Users/… sozinho, banco solto em TESTE) -> a palavra vai em info;
 #   o Python que parseia acha o MESMO idioma que o texto de .sh/.js (gate-fix 1): binário do cofre com caminho, linha de shell/f-string ("secret x"), wrapper do repo (secret_bin/lib.secret_cli), connect_over_cdp/run_osascript como chamada,
-#   `security` com caminho/em linha de shell, banco em f-string; prosa em string ("the secret key…", "lib/security") não conta;
+#   `security` com caminho/em linha de shell, banco em f-string, DDL `CREATE SECRET` do DuckDB; prosa em string ("the secret key…", "httpfs/secret S3", "lib/security") não conta;
 #   não consegui ler (repo, arquivo > 1 MB) ou tudo é novo -> a palavra volta a barrar, com a nota. Código só das irmãs é palpite (informa); o que a bead NOMEIA barra; node:ok, exec:manual, PII e freio de envio não mudam.
 #   · TESTE IMPORTADOR (regra 6b): código sem teste de nome ganha os testes que o IMPORTAM (import estático que resolve para o mesmo arquivo; string/comentário não conta — em JS, require em comentário não conta e require em string conta; não parseia
 #   é pulado e contado; mais de 60 candidatos: o excesso não é lido e a nota avisa; git que falha = unknown com a nota).
@@ -347,13 +347,14 @@ wf lib/mole_credcall.py $'def cmd(n, secret_bin):\n    return [secret_bin(), n]'
 wf lib/mole_credmod.py $'import lib.secret_cli as sc\nX = sc'; wf tests/test_mole_credmod.py $'from lib.mole_credmod import X'
 wf lib/mole_credpem.py $'KEY = "/etc/app/server.pem"'; wf tests/test_mole_credpem.py $'from lib.mole_credpem import KEY'   # só o CRED_FILE_RE conhece .pem
 wf lib/mole_credjson.py $'P = "gdrive_credentials.json"'; wf tests/test_mole_credjson.py $'from lib.mole_credjson import P'   # prefixo no nome: o CRED_FILE_RE (começo/barra) não pega, o CRED_SHELL_RE (como o texto) pega
+wf lib/mole_credsql.py $'import duckdb\ndef con():\n    c = duckdb.connect()\n    c.execute("CREATE OR REPLACE SECRET s3_x (TYPE s3, PROVIDER credential_chain, "\n              "REGION \'us-east-1\')")\n    return c'; wf tests/test_mole_credsql.py $'from lib.mole_credsql import con'   # DDL do DuckDB (lib/mds_s3.py, lib/rfb_s3.py no WA): credencial AWS; achado pelo diferencial ast x texto sobre o WA origin/main
 wf lib/mole_hostcdp.py $'async def f(p):\n    return await p.chromium.connect_over_cdp("http://localhost:9222")'; wf tests/test_mole_hostcdp.py $'from lib.mole_hostcdp import f'
 wf lib/mole_hostcall.py $'def f():\n    run_osascript("x")'; wf tests/test_mole_hostcall.py $'from lib.mole_hostcall import f'
 wf lib/mole_hostmod.py $'import osascript\nX = 1'; wf tests/test_mole_hostmod.py $'from lib.mole_hostmod import X'
 wf lib/mole_hostpath.py $'import subprocess\nsubprocess.run(["/usr/bin/security", "find-generic-password"])'; wf tests/test_mole_hostpath.py $'from lib.mole_hostpath import subprocess'
 wf lib/mole_hostshell.py $'import os\nos.system("security find-generic-password -s x")'; wf tests/test_mole_hostshell.py $'from lib.mole_hostshell import os'
 wf lib/mole_dbf.py $'import sqlite3\ndef c(n):\n    return sqlite3.connect(f"shared/data/{n}.db")'; wf tests/test_mole_dbf.py $'from lib.mole_dbf import c'
-wf lib/mole_prose.py $'def f(n):\n    raise RuntimeError("the secret key is missing")\nX = "lib/security"\nY = "lib/secret"\nZ = "security headers are off"\nW = f"the {n} secret is missing"'; wf tests/test_mole_prose.py $'from lib.mole_prose import f'
+wf lib/mole_prose.py $'def f(n):\n    raise RuntimeError("the secret key is missing")\nX = "lib/security"\nY = "lib/secret"\nZ = "security headers are off"\nW = f"the {n} secret is missing"\nV = "setup httpfs/secret S3 falhou - leitura indisponivel"'; wf tests/test_mole_prose.py $'from lib.mole_prose import f'
 wf lib/impt_macmod.py $'# impt_macmod'; wf tests/test_impt_mac_x.py $'from lib.impt_macmod import x'   # o único teste que importa impt_macmod é só-no-Mac (macs-impt.txt)
 wf lib/mole_sibdb.py $'P = "shared/data/y.db"'; wf tests/test_mole_sibdb.py $'mole_sibdb'
 gw add lib/mole_sibdb.py tests/test_mole_sibdb.py && gw commit -q -m "feat(wa-molp1.1): mole_sibdb" || bad "commit da irma do mole nao montado"
@@ -658,6 +659,7 @@ expect "mole: evidência - linha de shell os.popen(\"secret motherduck-token\")"
 expect "mole: evidência - f-string os.popen(f\"secret {n}\") (o pedaço dinâmico vira palavra)" "$(DESC 'ajustar lib/mole_credfstr.py')" 10 'moles:credencial.*mole_credfstr\.py\[sh:secret _\]'
 expect "mole: evidência - arquivo de chave (.pem)" "$(DESC 'ajustar lib/mole_credpem.py')" 10 'moles:credencial.*mole_credpem\.py\[server\.pem\]'
 expect "mole: evidência - arquivo de credencial com prefixo no nome (gdrive_credentials.json), como o ramo de texto acha" "$(DESC 'ajustar lib/mole_credjson.py')" 10 'moles:credencial.*mole_credjson\.py\[sh:credentials\.json\]'
+expect "mole: evidência - DDL do DuckDB CREATE OR REPLACE SECRET … credential_chain (credencial AWS; strings adjacentes)" "$(DESC 'ajustar lib/mole_credsql.py')" 10 'moles:credencial.*mole_credsql\.py\[sh:CREATE OR REPLACE SECRET\]'
 expect "mole: evidência - chamada ao wrapper do repo secret_bin()" "$(DESC 'ajustar lib/mole_credcall.py')" 10 'moles:credencial.*mole_credcall\.py\[secret_bin\(\)\]'
 expect "mole: evidência - módulo do wrapper do repo (lib.secret_cli)" "$(DESC 'ajustar lib/mole_credmod.py')" 10 'moles:credencial.*mole_credmod\.py\[import lib\.secret_cli\]'
 expect "mole: evidência - connect_over_cdp(...) como CHAMADA (o HOST_RE de string não vê nome de função)" "$(DESC 'ajustar lib/mole_hostcdp.py')" 10 'moles:host-mac.*mole_hostcdp\.py\[connect_over_cdp\(\)\]'
@@ -666,7 +668,7 @@ expect "mole: evidência - módulo do Mac (import osascript)" "$(DESC 'ajustar l
 expect "mole: evidência - /usr/bin/security com CAMINHO no argv0" "$(DESC 'ajustar lib/mole_hostpath.py')" 10 'moles:host-mac.*mole_hostpath\.py\[argv:security\]'
 expect "mole: evidência - linha de shell \"security find-generic-password …\"" "$(DESC 'ajustar lib/mole_hostshell.py')" 10 'moles:host-mac.*mole_hostshell\.py\[security find-generic-password\]'
 expect "mole: evidência - banco montado em f-string (shared/data/{n}.db)" "$(DESC 'ajustar lib/mole_dbf.py')" 10 'moles:banco-de-dados.*mole_dbf\.py\[shared/data/_\.db\]'
-expect_not "mole: PROSA em string (\"the secret key is missing\", \"lib/security\", \"lib/secret\", \"security headers are off\", f\"the {n} secret is missing\") NÃO é evidência" "$(DESC 'ajustar lib/mole_prose.py')" 0 'moles:|mole-evidencia'
+expect_not "mole: PROSA em string (\"the secret key is missing\", \"httpfs/secret S3 falhou\", \"lib/security\", \"lib/secret\", \"security headers are off\", f\"the {n} secret is missing\") NÃO é evidência" "$(DESC 'ajustar lib/mole_prose.py')" 0 'moles:|mole-evidencia'
 expect_not "mole: nome de banco solto num TESTE que não parseia (texto) também não conta" "$(DESC 'ajustar lib/mole_tbare2.py')" 0 'moles:|mole-evidencia'
 # três estados: não consegui ler / nada para ler -> a palavra volta a valer (como antes), e a resposta diz por quê
 export WA_NODE_REPO="$T/wa-repo-ausente"
@@ -1006,7 +1008,8 @@ mutant importador-show-vira-vazio    'src = repo_show(t)   # falhou/ilegível ->
 mutant mole-cofre-caminho-ignorado   '    if t.startswith(("/", "~", "$", "_/", "bin/")) or "/bin/" in t:' '    if False:'                       "$(DESC 'ajustar lib/mole_credpath.py')" 10 'moles:credencial' "$MD"
 mutant mole-cofre-bin-ignorado       '"_/", "bin/")) or "/bin/" in t:'                  '"_/", "bin/")) or False:'                          "$(DESC 'ajustar lib/mole_credconst.py')" 10 'moles:credencial' "$MD"
 mutant mole-cofre-json-shell         '|run)\b)|bitwarden|(?<![\w/])\.env\b|credentials?[\w\-]*\.json'  '|run)\b)|bitwarden|(?<![\w/])\.env\b' "$(DESC 'ajustar lib/mole_credjson.py')" 10 'moles:credencial' "$MD"
-mutant mole-cofre-shell-ignorado     '                m = CRED_SHELL_RE.search(t)'        '                m = None'                                "$(DESC 'ajustar lib/mole_credpopen.py')" 10 'moles:credencial' "$MD"
+mutant mole-cofre-sql-ignorado       '|\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:PERSISTENT\s+|TEMPORARY\s+)?SECRET\b", re.I)   # texto de UMA string'  '", re.I)   # texto de UMA string'  "$(DESC 'ajustar lib/mole_credsql.py')" 10 'moles:credencial' "$MD"
+mutant mole-cofre-shell-ignorado    '                m = CRED_SHELL_RE.search(t)'        '                m = None'                                "$(DESC 'ajustar lib/mole_credpopen.py')" 10 'moles:credencial' "$MD"
 mutant mole-fstring-ignorada         '        elif isinstance(n, ast.JoinedStr):'          '        elif False:'                                  "$(DESC 'ajustar lib/mole_dbf.py')" 10 'moles:banco-de-dados' "$MD"
 mutant mole-fstring-pedacos-soltos   ' and id(n) not in docs and id(n) not in pieces:'     ' and id(n) not in docs:'                           "$(DESC 'ajustar lib/mole_prose.py')" 0 '"verdict": "node"' "$MD"
 mutant mole-cofre-wrapper-chamada    'secret(?:_bin|_cli)?$|^_*(?:bw'                    'secret$|^_*(?:bw'                                  "$(DESC 'ajustar lib/mole_credcall.py')" 10 'moles:credencial' "$MD"
