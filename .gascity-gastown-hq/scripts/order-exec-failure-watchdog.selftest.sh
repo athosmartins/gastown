@@ -26,7 +26,9 @@ ok()  { echo "  ✓ $*"; PASS=$((PASS+1)); }
 bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 eq()  { if [ "$2" = "$3" ]; then ok "$1 (=$2)"; else bad "$1: expected [$3], got [$2]"; fi; }
 
-TMP="$(mktemp -d)"
+# vazio/falhou → sai: nunca segue com TMP vazio (os "$TMP/..." cairiam na raiz)
+TMP="$(mktemp -d)" || { echo "FATAL: mktemp falhou"; exit 1; }
+[ -d "$TMP" ] || { echo "FATAL: mktemp nao criou $TMP"; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
 
 # ── hermetic stubs ─────────────────────────────────────────────────────────
@@ -217,6 +219,80 @@ grep -q '<string>com.gascity.order-exec-failure-watchdog</string>' "$PLIST" \
 grep -q '<key>ProcessType</key><string>Interactive</string>' "$PLIST" \
   && ok "ProcessType=Interactive set (DAS-deferral guard, ga-u04vp lesson)" \
   || bad "ProcessType=Interactive missing — watchdog could itself go silently deferred"
+
+# ── Lastro hq-mutants (ga-qec2rdl) ──────────────────────────────────────────
+# Ate aqui nenhum caso lia o STATUS de run_sweep, o limite exato do cooldown e do clamp, o ramo "so linhas
+# benignas" nem o script EXECUTADO (o guard do modo lib). date, wc e tail de mentira (funcoes deste shell,
+# como os stubs de gc/notify no PATH) fazem falhar o que de graca nao falha.
+# EQUIVALENTES (lastro): 829c43a963 bc42a497e0 237afdb31f 8dc1c151f3 5f72a8c256 0720001ec3 5a0417f77d 4cfff30377
+# 2752235dc1 0f4a812dbe c2c2b2831a (`cmd || true` -> `cmd && true` em escrita de log/estado: ninguem le o status
+# e nao ha set -e) e aaa8b8590e 6082e67a18 (`command -v X && X ... || true` -> `&& true`: so muda o status de
+# _alert, que o run_sweep descarta).
+date() { if [ "${1-}" = "+%s" ] && [ -n "${FAKE_NOW:-}" ]; then echo "$FAKE_NOW"; else command date "$@"; fi; }
+
+# ── 12. status de run_sweep e o cooldown no limite exato ────────────────────
+echo "── 12. run_sweep devolve 1 so quando alerta; o cooldown acaba exatamente em OEFW_COOLDOWN_SEC ──"
+FAKE_NOW=2000000000
+mkdir -p "${OEFW_STATE}.fail-counts" "${OEFW_STATE}.cooldown"
+echo 1 > "${OEFW_STATE}.fail-counts/cd-edge"; echo $((FAKE_NOW - OEFW_COOLDOWN_SEC + 1)) > "${OEFW_STATE}.cooldown/cd-edge"
+append "2026/08/02 10:00:00 gc: order exec cd-edge failed: exit status 1"
+GC_BEFORE12=$(gc_call_count)
+run_sweep; rc=$?
+eq "1 s antes do fim do cooldown: suprime o alerta e sai 0 (rc/novos mails)" "$rc/$(( $(gc_call_count) - GC_BEFORE12 ))" "0/0"
+echo 1 > "${OEFW_STATE}.fail-counts/cd-edge"; echo $((FAKE_NOW - OEFW_COOLDOWN_SEC)) > "${OEFW_STATE}.cooldown/cd-edge"
+append "2026/08/02 10:05:00 gc: order exec cd-edge failed: exit status 1"
+run_sweep; rc=$?
+eq "exatamente no fim do cooldown: alerta e sai 1 (rc/novos mails)" "$rc/$(( $(gc_call_count) - GC_BEFORE12 ))" "1/1"
+FAKE_NOW=""
+
+# ── 13. so linhas benignas ──────────────────────────────────────────────────
+echo "── 13. varredura so com linhas output: (sem failed:) registra 'only benign'; falha real nao ──"
+: > "$OEFW_LOG"
+append "2026/08/02 11:00:00 gc: order exec only-out output: algo aconteceu"
+run_sweep; rc=$?
+[ "$rc" = "0" ] && grep -F "only benign(context-canceled)/output lines" "$OEFW_LOG" >/dev/null \
+  && ok "so output: registra 'only benign' e sai 0" || bad "so output: rc=$rc log=$(cat "$OEFW_LOG")"
+: > "$OEFW_LOG"
+append "2026/08/02 11:05:00 gc: order exec real-fail failed: exit status 1"
+run_sweep
+grep -F "only benign" "$OEFW_LOG" >/dev/null \
+  && bad "falha real foi registrada como 'only benign'" || ok "falha real nao e registrada como 'only benign'"
+
+# ── 14. entradas ruins do supervisor.log ────────────────────────────────────
+echo "── 14. supervisor.log ausente, wc que falha, tail que falha, bootstrap e clamp no limite ──"
+SAVED_SUPERVISOR_LOG="$SUPERVISOR_LOG"
+SUPERVISOR_LOG="$TMP/nao-existe.log"; : > "$OEFW_LOG"; run_sweep; rc=$?; SUPERVISOR_LOG="$SAVED_SUPERVISOR_LOG"
+[ "$rc" = "0" ] && grep -F "WARN supervisor.log not found" "$OEFW_LOG" >/dev/null \
+  && ok "supervisor.log ausente: avisa e sai 0" || bad "supervisor.log ausente: rc=$rc"
+CUR14="$(cat "$OEFW_STATE")"
+wc() { return 1; }; : > "$OEFW_LOG"; run_sweep; rc=$?; unset -f wc
+[ "$rc" = "0" ] && grep -F "could not stat" "$OEFW_LOG" >/dev/null && [ "$(cat "$OEFW_STATE")" = "$CUR14" ] \
+  && ok "tamanho ilegivel: 'could not stat', sai 0 e o cursor nao anda" || bad "tamanho ilegivel: rc=$rc"
+append "2026/08/02 12:00:00 gc: order exec tail-edge failed: exit status 1"
+tail() { return 1; }; : > "$OEFW_LOG"; run_sweep; rc=$?; unset -f tail
+[ "$rc" = "0" ] && grep -F "tail read of" "$OEFW_LOG" >/dev/null && [ "$(cat "$OEFW_STATE")" = "$CUR14" ] \
+  && [ ! -f "${OEFW_STATE}.fail-counts/tail-edge" ] \
+  && ok "leitura que falha: avisa, sai 0, nao avanca o cursor e nao conta a falha" || bad "tail falha: rc=$rc"
+rm -f "$OEFW_STATE"; : > "$OEFW_LOG"; run_sweep; rc=$?
+[ "$rc" = "0" ] && grep -F "BOOTSTRAP: first run" "$OEFW_LOG" >/dev/null \
+  && [ "$(cat "$OEFW_STATE")" = "$(wc -c < "$SUPERVISOR_LOG" | tr -d ' ')" ] \
+  && ok "primeira varredura: planta o cursor no fim e sai 0" || bad "bootstrap: rc=$rc"
+SZ14="$(wc -c < "$SUPERVISOR_LOG" | tr -d ' ')"
+echo $((SZ14 - 20)) > "$OEFW_STATE"; OEFW_MAX_READ_BYTES=20; : > "$OEFW_LOG"; run_sweep; OEFW_MAX_READ_BYTES=5000000
+grep -F "exceeds clamp" "$OEFW_LOG" >/dev/null \
+  && bad "exatamente OEFW_MAX_READ_BYTES novos bytes foram tratados como excesso" || ok "novos bytes == teto: le tudo, sem aviso de clamp"
+echo $((SZ14 - 21)) > "$OEFW_STATE"; OEFW_MAX_READ_BYTES=20; : > "$OEFW_LOG"; run_sweep; OEFW_MAX_READ_BYTES=5000000
+grep -F "exceeds clamp" "$OEFW_LOG" >/dev/null \
+  && ok "um byte acima do teto: clamp avisado" || bad "um byte acima do teto nao foi tratado como excesso"
+
+# ── 15. o script executado ──────────────────────────────────────────────────
+echo "── 15. executado: ORDER_EXEC_FAILURE_WATCHDOG_LIB=1 so define; sem ela roda uma varredura ──"
+: > "$TMP/exec.log"
+ORDER_EXEC_FAILURE_WATCHDOG_LIB=1 OEFW_LOG="$TMP/exec.log" GC_SUPERVISOR_LOG="$TMP/nao-existe.log" bash "$WATCHDOG" >/dev/null 2>&1; rc=$?
+[ "$rc" = "0" ] && [ ! -s "$TMP/exec.log" ] && ok "LIB=1: executar nao varre nada" || bad "LIB=1 executado: rc=$rc log=$(cat "$TMP/exec.log")"
+ORDER_EXEC_FAILURE_WATCHDOG_LIB=0 OEFW_LOG="$TMP/exec.log" GC_SUPERVISOR_LOG="$TMP/nao-existe.log" bash "$WATCHDOG" >/dev/null 2>&1; rc=$?
+[ "$rc" = "0" ] && grep -F "WARN supervisor.log not found" "$TMP/exec.log" >/dev/null \
+  && ok "sem LIB: executar roda uma varredura" || bad "sem LIB executado: rc=$rc"
 
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"
