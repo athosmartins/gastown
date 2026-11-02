@@ -13753,14 +13753,16 @@ _pilot_wa_node_pass_check() {
 # que o resumo da passada soma (ga-2hd02v.3.17: a passada de 05:39Z sondou 12 e mandou 0 ao nó, e o log só dizia "mini 5 · não sei 7" sem o porquê). A classe é o motivo até o 1º `:` (o resto é o caminho/palavra da bead).
 # vazio (reasons=[]: o classificador respondeu sem motivo) → "sem-motivo"; falhou/ilegível (reasons null: saída que o jq não leu) → "ilegivel"; sem saída por definição (timeout, error, missing) → "sem-saida": os três nunca se confundem.
 # Só observa: se a linha não grava ou o jq falha, avisa e segue — o veredito e o despacho não leem nada daqui. Sempre devolve 0.
+# ga-7xd8g8f: `prio` = a prioridade 0..4 que a passada LEU na bead no instante da sonda (3º argumento = _pilot_priority_class_of). A prioridade muda depois (medido 02/11: wa-mb4goy foi sondada como P3 e hoje é P1), então juntar a sonda com a prioridade
+# de hoje inventa «P2 antes de P0». vazio/ilegível (classe 5 = prioridade que a biblioteca não lê, ou classe que não veio) → null: «não li» NUNCA vira 0.
 _pilot_wa_node_pass_probe_note() {
-  local _pn_id="${1:-}" _pn_lane="${2:-}" _pn_log
+  local _pn_id="${1:-}" _pn_lane="${2:-}" _pn_pc="${3:-}" _pn_log
   _pn_log="${PILOT_WA_NODE_PASS_LOG:-${GC_CITY:-/nonexistent}/.gc/wa-node-exempt.jsonl}"
   # vazio (nenhuma classe) → o próprio jq já devolve "sem-motivo"; falhou (jq) → "<veredito>:ilegivel": a sonda continua somada no resumo, como "não li", nunca omitida nem "sem motivo"
   _PWP_TOKENS=$(printf '%s' "$_PWP_DETAIL" | jq -r --arg v "$_PWP_V" '.classes as $c | (if ($v == "node" or $v == "mini" or $v == "unknown") then (if $c == null then ["ilegivel"] elif ($c | length) == 0 then ["sem-motivo"] else $c end) else ["sem-saida"] end) | map($v + ":" + .) | join(" ")' 2>/dev/null) || _PWP_TOKENS="${_PWP_V}:ilegivel"
   [ -n "$_PWP_TOKENS" ] || _PWP_TOKENS="${_PWP_V}:ilegivel"
-  { jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg b "$_pn_id" --arg l "$_pn_lane" --arg v "$_PWP_V" --arg ba "$_PWP_BASIS" --argjson d "$_PWP_DETAIL" \
-      '{ts:$ts,event:"wa-node-pass-probe",bead:$b,lane:$l,verdict:$v,basis:$ba,reasons:$d.reasons,classes:$d.classes,paths:$d.paths,leitura:$d.leitura,custo:$d.custo}' >> "$_pn_log"; } 2>/dev/null \
+  { jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg b "$_pn_id" --arg l "$_pn_lane" --arg v "$_PWP_V" --arg ba "$_PWP_BASIS" --arg pc "$_pn_pc" --argjson d "$_PWP_DETAIL" \
+      '{ts:$ts,event:"wa-node-pass-probe",bead:$b,lane:$l,verdict:$v,basis:$ba,prio:(if ($pc | test("\\A[0-4]\\z")) then ($pc | tonumber) else null end),reasons:$d.reasons,classes:$d.classes,paths:$d.paths,leitura:$d.leitura,custo:$d.custo}' >> "$_pn_log"; } 2>/dev/null \
     || warn "ga-2hd02v.3.17: não consegui gravar a linha de sonda de $_pn_id em $_pn_log"
   return 0
 }
@@ -14010,6 +14012,8 @@ _pilot_wa_node_pass() {
   # ga-2hd02v.3.18: _pw_trk = 1 iff o contador do hold é lido e gravado nesta passada · _pw_wreached = 1 iff o waiter foi de fato olhado (saiu da lista) · _pw_hx = 1 iff a bead em mãos é uma P2+ solta pelo fim do hold ·
   # _pw_expired = quantas P2+ foram ao nó por isso · _pw_wcount = quantas passadas seguidas o waiter está blind (com esta, se ele terminou blind)
   local _pw_trk=0 _pw_wreached=0 _pw_hx=0 _pw_expired=0 _pw_wcount=0
+  # ga-7xd8g8f: a ordem da passada é CLASSE de prioridade primeiro, pista depois. _pw_rounds = as rodadas (hot = P0/P1 · rest = P2+ e prioridade ilegível · all = sem filtro de classe) · _pw_round = a rodada em curso · _pw_rf = o filtro de classe do jq
+  local _pw_rounds="hot rest" _pw_round="" _pw_rf="" _pw_defs=""
   _PWP_LAST_STOP=""
   # ga-2hd02v.3.26: a reserva do nó e o veredito final do waiter valem POR VARREDURA: zerados aqui, antes do early return do modo off, para que nada de uma varredura anterior (ou de outra bead) segure a P2+ desta.
   _PNR_RESERVED_IDS=""; _PNR_RESERVED_N=0; _PWP_WV_FINAL=""; _PNH_HELD=0
@@ -14053,6 +14057,16 @@ _pilot_wa_node_pass() {
     _PWP_HOLD_PRIOR=$(_pilot_wa_node_pass_hold_prior "$_PY_WAIT_ID") || warn "ga-2hd02v.3.18: leitura do estado do hold falhou (waiter ${_PY_WAIT_ID}) — conto 0 passadas blind: a retenção segue valendo, e a escrita desta passada conserta o arquivo"
   fi
   _pw_wcount="$_PWP_HOLD_PRIOR"
+  # ga-7xd8g8f (decisão do Athos 02/11, «leve P0/P1 lá»): a P0/P1 que o classificador manda ao nó passa à frente de QUALQUER P2+, em qualquer pista. Antes a passada andava pista a pista (small → big) e, dentro da pista, por prioridade: uma P3 da small com
+  # veredito node tomava a vaga do nó (e as 30 sondas / 120 s do orçamento) antes de uma P0 da big ser sequer olhada. Agora são duas rodadas sobre as MESMAS pistas e os MESMOS contadores (vagas, orçamento, falhas): hot (classe 0/1) e depois rest (2..4 e a prioridade
+  # que não se lê — «não sei a classe» nunca passa à frente de ninguém, a mesma regra do hold). A rodada hot respeita a ordem das pistas (a do waiter primeiro); a rest, também. Medido em 02/11 (24 h): 34 de 56 passadas pararam por orçamento antes de chegar à big.
+  # vazio (a biblioteca de ordem não está carregada: WORK_ORDER_JQ_DEFS vazio) → NÃO sei a classe de ninguém: uma rodada só, sem filtro (a ordem de antes) e AVISA; falhou/ilegível (o jq que não lê a pista) → a rodada pula a pista, como já pulava
+  _pw_defs="${WORK_ORDER_JQ_DEFS:-}"
+  if [ -z "$_pw_defs" ]; then
+    _pw_rounds="all"
+    warn "ga-7xd8g8f: a biblioteca de ordem (WORK_ORDER_JQ_DEFS) não está carregada — não sei a classe de prioridade das candidatas; a passada anda pista a pista como antes (a P0/P1 da big NÃO passa à frente das P2+ da small nesta varredura)"
+  fi
+  for _pw_round in $_pw_rounds; do
   for _pw_lane in $_pw_lanes; do
     [ -z "$_pw_stop" ] || break
     case "$_pw_lane" in
@@ -14060,8 +14074,14 @@ _pilot_wa_node_pass() {
       big)   _pw_pool="${BIG_CANDIDATES:-[]}";   _pw_slots="${BIG_SLOTS:-0}" ;;
     esac
     case "$_pw_slots" in ''|*[!0-9]*) _pw_slots=0 ;; esac
-    # vazio ([]) → nada a fazer; falhou/ilegível (a pista que o jq não lê) → pula a pista e avisa: o estado inerte é a pista como estava
-    _pw_wa=$(printf '%s' "$_pw_pool" | jq -c '[ .[] | select((.id // "") | startswith("wa-")) ]' 2>/dev/null) || { warn "ga-2hd02v.9: a pista $_pw_lane não é uma lista que eu leia — a passada de WA a pula"; continue; }
+    # o filtro de classe da rodada: as duas rodadas PARTICIONAM a pista (hot = classe <= 1, rest = classe > 1, e a classe 5 — prioridade que a biblioteca não lê — cai em rest), então nenhuma bead some nem aparece duas vezes
+    case "$_pw_round" in
+      hot)  _pw_rf='| select(wo_prio_class <= 1)' ;;
+      rest) _pw_rf='| select(wo_prio_class > 1)' ;;
+      *)    _pw_rf='' ;;
+    esac
+    # vazio ([]) → nada a fazer; falhou/ilegível (a pista que o jq não lê) → pula a pista e avisa: o estado inerte é a pista como estava (o aviso sai só na 1ª rodada: a 2ª leria a mesma pista e repetiria a causa)
+    _pw_wa=$(printf '%s' "$_pw_pool" | jq -c "$([ "$_pw_round" = all ] || printf '%s' "$_pw_defs")"' [ .[] | select((.id // "") | startswith("wa-")) '"$_pw_rf"' ]' 2>/dev/null) || { [ "$_pw_round" != "${_pw_rounds%% *}" ] || warn "ga-2hd02v.9: a pista $_pw_lane não é uma lista que eu leia — a passada de WA a pula"; continue; }
     [ -n "$_pw_wa" ] || continue
     _pw_n=$(printf '%s' "$_pw_wa" | jq 'length' 2>/dev/null) || _pw_n=0
     case "$_pw_n" in ''|*[!0-9]*) _pw_n=0 ;; esac
@@ -14108,7 +14128,7 @@ _pilot_wa_node_pass() {
       if [ $(( SECONDS - _pw_t0 )) -ge "$_pw_secs" ]; then _pw_stop="budget-secs"; break; fi
       _pw_probed=$((_pw_probed + 1))
       _pilot_wa_node_pass_check "$_pw_id" ""
-      _pilot_wa_node_pass_probe_note "$_pw_id" "$_pw_lane"; _pw_rsn="$_pw_rsn $_PWP_TOKENS"
+      _pilot_wa_node_pass_probe_note "$_pw_id" "$_pw_lane" "$(_pilot_priority_class_of "$_pw_pick")"; _pw_rsn="$_pw_rsn $_PWP_TOKENS"
       case "$_PWP_V" in
         node)
           _pw_node=$((_pw_node + 1))
@@ -14178,6 +14198,7 @@ _pilot_wa_node_pass() {
         big)   BIG_CANDIDATES="$_pw_pool";   BIG_SLOTS="$_pw_slots";   BIG_COUNT=$(printf '%s' "$_pw_pool" | jq 'length' 2>/dev/null || echo 0) ;;
       esac
     fi
+  done
   done
   # ga-2hd02v.3.18: o contador do hold. Só anda quando o waiter foi de fato OLHADO nesta passada (_pw_wreached): terminou blind → +1; terminou com veredito legível (node/out) → zera; unseen (o orçamento, uma parada, a pista ilegível ou
   # a falta de vaga de despacho da pista dele impediram de olhá-lo) → NÃO mexe — nem sobe nem zera: nada se aprendeu. Waiter ausente numa varredura também não mexe (um waiter que pisca não reinicia a contagem).

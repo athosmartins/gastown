@@ -16,6 +16,8 @@
 #   (7) as regiões VERBATIM de dispatch_one: o bloco do yield (alvo que não é wa-worker do store do WA solta) e o braço do pool (adota antes do gancho; rc 1 devolve a rota e solta; rc 2 não mexe; adotar que falha
 #   não chega ao gancho) · (8) o gancho exporta o rc do apply · (9) a ordem dos pontos de chamada · (6b, ga-2hd02v.3.16) o waiter P0/P1 da cessão: a pista dele é percorrida primeiro, ele sem veredito legível (unknown/timeout/erro, sondado ou memorizado) segura a P2+ com veredito node, e o resumo conta as P2+ que foram ao nó com um P0/P1 esperando · (6c, ga-2hd02v.3.16, gate 1) os TRÊS estados do waiter: "não se sabe se ele vai ao nó" (pré-filtro ilegível / recusa que não se lê, apply rc 11 ou que nem chegou ao apply, memória `released`) segura
 #   a P2+ — só o motivo DEFINITIVO (dono, veto, rota alheia, node:mini, recusa do pool, apply rc 10, memória mini) o solta ·
+#   (6g, ga-7xd8g8f) a CLASSE manda primeiro, a pista só desempata: duas rodadas (hot = P0/P1, rest = P2+ e prioridade ilegível) sobre as mesmas pistas e os mesmos contadores — a P0/P1 com veredito node passa à frente de qualquer P2+ de QUALQUER pista, no nó e no orçamento
+#   de sondas; a P0/P1 mini-only não segura a P2+ (política A do Athos); a partição não perde nem duplica bead; sem a biblioteca de ordem a passada anda como antes e AVISA; a linha da sonda guarda a prioridade que a passada leu (ilegível → null) ·
 #   (7z, ga-2hd02v.3.25) o conjunto _PWP_NODE_BOUND: o que a passada JULGOU node e NÃO despachou (retida pelo waiter, Dolt saturado, apply rc fora da tabela) é o único que o «Hetzner primeiro» segura do MBP;
 #   despachada, mini/unknown/released (apply rc 10/11/sem apply), não sondada (orçamento de segundos/sondas, limite de vagas) e rc 12 (nó cheio) NÃO constam, e o conjunto zera a cada passada.
 # COMO RODA: as funções e as regiões são extraídas VERBATIM do dispatcher (awk) e rodam em shells filhos sob `set -euo pipefail`, PATH de sandbox (selftest-sandbox-path.lib.sh: sem gc/bd reais), bd e
@@ -460,8 +462,8 @@ reset; chk wa-w1 0; chk wa-p2a 0; chk wa-p2b 0; setok wa-w1 wa-p2a wa-p2b
 T_WAIT=wa-w1 T_SPAWN=pilot T_SLOTS=3 pass "[$P2A,$P2B]" "[$W1]" >/dev/null
 [ "$(d1)" = "wa-w1 big feature pass=1;wa-p2a small feature pass=1;wa-p2b small feature pass=1;" ] && ok "com 3 vagas: o waiter primeiro e as duas P2 depois (a ordem das pistas só muda para o waiter)" || bad "ordem com 3 vagas: $(d1)"
 reset; chk wa-w1 0; chk wa-p2a 0; setok wa-w1 wa-p2a
-pass "[$P2A]" "[$W1]" >/dev/null
-[ "$(d1)" = "wa-p2a small feature pass=1;" ] && ok "SEM waiter (nenhum P0/P1 espera): a ordem de sempre, small antes de big" || bad "sem waiter a ordem mudou: $(d1)"
+pass "[$P2A]" "[$P2B]" >/dev/null
+[ "$(d1)" = "wa-p2a small feature pass=1;" ] && ok "SEM waiter, MESMA classe (P2 na small, P2 na big), 1 vaga: a ordem de sempre, small antes de big (ga-7xd8g8f: a classe manda primeiro, a pista só desempata dentro dela)" || bad "sem waiter, mesma classe, a ordem das pistas mudou: $(d1)"
 reset; chk wa-w1 0; chk wa-p2a 0; setok wa-w1 wa-p2a
 T_WAIT=wa-w1 pass "[$W1,$P2A]" >/dev/null
 [ "$(d1)" = "wa-w1 small feature pass=1;" ] && ok "waiter e P2 na MESMA pista, 1 vaga: o waiter (P1, antes na ordem) fica com ela" || bad "waiter na mesma pista: $(d1)"
@@ -815,8 +817,8 @@ reset; chk wa-w1 0; chk wa-p2a 0; setok wa-w1 wa-p2a
 T_PROBES=1 T_WAIT=wa-w1 pass "[$P2A,$W1]" >/dev/null
 [ "$(d1)" = "wa-w1 small feature pass=1;" ] && ok "(e) waiter com veredito node e a P2 antes na lista, 1 sonda: o waiter fica com a vaga do nó" || bad "(e) waiter perdeu a vaga para a P2: $(d1)"
 reset; chk wa-w1 0; chk wa-p2a 0; setok wa-w1 wa-p2a
-T_WAIT=ps-zz pass "[$P2A,$W1]" >/dev/null
-[ "$(d1)" = "wa-p2a small feature pass=1;" ] && ok "(e) waiter de outro rig: a ordem da lista não muda (só o waiter de WA passa à frente)" || bad "(e) ordem mudou sem waiter de WA: $(d1)"
+T_WAIT=ps-zz pass "[$P2A,$P2B]" >/dev/null
+[ "$(d1)" = "wa-p2a small feature pass=1;" ] && ok "(e) waiter de outro rig: a ordem da lista não muda (só o waiter de WA passa à frente; a P1 que passa à frente por CLASSE, não por ser waiter, é a seção 6g)" || bad "(e) ordem mudou sem waiter de WA: $(d1)"
 # os ajudantes sozinhos: hold_for com o hold expirado, e o estado
 holdx() { run_t "_PWP_HOLD_MAX=$1; _PWP_HOLD_PRIOR=$2; x=0; _pilot_wa_node_pass_hold_for '$3' '$4' || x=\$?; echo \"rc=\$x\""; }
 r=$(T_WAIT=wa-w1 holdx 2 1 "$P2A" blind);  [ "$r" = "rc=0" ] && ok "hold_for: prior 1 < max 2 → segura (rc 0)" || bad "hold_for prior<max: $r"
@@ -919,6 +921,84 @@ r=$(PX_PRE='_PNR_RESERVED_IDS=" wa-velha "; _PNR_RESERVED_N=1; _PWP_WV_FINAL=bli
 reset
 r=$(T_EXEMPT=off PX_PRE='_PNR_RESERVED_IDS=" wa-velha "; _PNR_RESERVED_N=1; _PWP_WV_FINAL=blind; _PNH_HELD=4' passx "[]" 'echo "ids=[${_PNR_RESERVED_IDS:-}] n=${_PNR_RESERVED_N:-0} wv=[${_PWP_WV_FINAL:-}] held=${_PNH_HELD:-0}"')
 [ "$r" = "ids=[] n=0 wv=[] held=0" ] && ok "(6f) o mesmo com a passada DESLIGADA (volta antes de tudo): o resto da varredura anterior também é zerado" || bad "(6f) resto da varredura anterior sobreviveu à passada desligada: '$r'"
+
+echo "── (6g) ga-7xd8g8f: a P0/P1 que o classificador manda ao nó passa à frente de QUALQUER P2+, em qualquer pista — a classe manda primeiro, a pista só desempata"
+# Decisão do Athos 02/11 (AskUserQuestion do Mayor, «Pode, e leve P0/P1 lá»): opção A (a P2/P3 segue usando o nó quando a P0/P1 que espera é mini-only) + opção C (a P0/P1 que PODE ir ao nó vai primeiro). Antes a passada andava pista a pista (small → big): uma P3 da small com
+# veredito node tomava a vaga do nó, e as 30 sondas / 120 s do orçamento, antes de uma P0 da big ser olhada. Medido em 02/11 (24 h, .gc/wa-node-exempt.jsonl): 34 de 56 passadas pararam por orçamento (12 sondas · 22 segundos) e NENHUMA dessas sondou a big.
+H0B="$(jbp 0 wa-h0b U1 wa-worker story:approved)"; H1B="$(jbp 1 wa-h1b U1 wa-worker story:approved)"; H1S="$(jbp 1 wa-h1s U1 wa-worker story:approved)"
+P3S="$(jbp 3 wa-p3s U1 wa-worker story:approved)"; P3B="$(jbp 3 wa-p3b U1 wa-worker story:approved)"; P9S="$(jbp 9 wa-p9s U1 wa-worker story:approved)"
+probed_order() { [ -f "$WORK/wnd.calls" ] && awk '{printf "%s ", $2}' "$WORK/wnd.calls" || printf -- '-'; }
+# (a) a P3 da small e a P0 da big, as duas com veredito node, UMA vaga: a P0 fica com o nó
+reset; chk wa-p3s 0; chk wa-h0b 0; setok wa-p3s wa-h0b
+r=$(pass "[$P3S]" "[$H0B]")
+[ "$(d1)" = "wa-h0b big feature pass=1;" ] && ok "(a) P3 na small + P0 na big, ambas node, 1 vaga: a P0 vai ao nó PRIMEIRO (era a P3, por andar a small antes)" || bad "(a) a P3 tomou a vaga da P0: $(d1)"
+[ "$r" = "S=wa-p3s B= SS=5 BS=4 D=1 C=1/0 PASSFLAG=0" ] && ok "(a) estado final: a P0 saiu da big e consumiu a vaga DA BIG; a P3 segue na small — $r" || bad "(a) estado final: $r"
+summ | jq -e '.kept==1 and .stopped=="keep-limit"' >/dev/null 2>&1 && ok "(a) resumo: kept=1, a passada parou por limite de vagas (a P3 não foi tentada)" || bad "(a) resumo: $(summ | cut -c1-300)"
+reset; chk wa-p3s 0; chk wa-h0b 0; setok wa-p3s wa-h0b
+T_SPAWN=pilot T_SLOTS=3 pass "[$P3S]" "[$H0B]" >/dev/null
+[ "$(d1)" = "wa-h0b big feature pass=1;wa-p3s small feature pass=1;" ] && ok "(b) com 3 vagas: a P0 primeiro e a P3 depois — o nó continua adiantando a P3 quando há vaga sobrando" || bad "(b) ordem com 3 vagas: $(d1)"
+# (c) política A (decisão do Athos): a P0 é mini-only → NÃO espera nem segura o nó; a P3 com veredito node usa a capacidade própria do nó
+reset; chk wa-h0b 10; chk wa-p3s 0; setok wa-p3s
+pass "[$P3S]" "[$H0B]" >/dev/null
+[ "$(d1)" = "wa-p3s small feature pass=1;" ] && [ "$(memo_of)" = "wa-h0b:mini," ] && ok "(c) P0 mini-only na big + P3 node na small: a P3 vai ao nó (o nó é capacidade própria) e a P0 vira memória mini" || bad "(c) a P0 mini-only segurou a P3: d1=$(d1) memo=$(memo_of)"
+reset; chk wa-h0b 11; chk wa-p3s 0; setok wa-p3s
+pass "[$P3S]" "[$H0B]" >/dev/null
+[ "$(d1)" = "wa-p3s small feature pass=1;" ] && ok "(c) P0 com veredito unknown (a passada não sabe) NÃO segura a P3 sozinha: segurar é do waiter da cessão (6c), não da ordem" || bad "(c) P0 unknown segurou a P3: $(d1)"
+# (d) o orçamento de sondas vai primeiro para a P0/P1, em qualquer pista
+reset; chk wa-p3s 0; chk wa-h0b 11
+T_PROBES=1 pass "[$P3S]" "[$H0B]" >/dev/null
+[ "$(wnd_calls)" = 1 ] && grep -q 'wa-h0b' "$WORK/wnd.calls" && ok "(d) 1 sonda no orçamento, a P0 está na big e a P3 na small: a sonda vai para a P0 (antes ia para a P3 e a big nem era olhada)" || bad "(d) a sonda foi para $(probed_order)"
+summ | jq -e '.probed==1 and .stopped=="budget-probes"' >/dev/null 2>&1 && ok "(d) resumo: probed=1 stopped=budget-probes" || bad "(d) resumo: $(summ | cut -c1-300)"
+# (e) as duas rodadas PARTICIONAM as pistas: cada bead é sondada UMA vez, nenhuma some, e a ordem é hot (small, big) e depois rest (small, big)
+reset; for i in h1s h0b p3s p3b; do chk wa-$i 10; done
+pass "[$P3S,$H1S]" "[$H0B,$P3B]" >/dev/null
+[ "$(probed_order)" = "wa-h1s wa-h0b wa-p3s wa-p3b " ] && ok "(e) ordem das sondas: P1 da small, P0 da big (rodada hot), depois P3 da small e P3 da big (rodada rest) — 4 beads, cada uma uma vez" || bad "(e) ordem/partição: '$(probed_order)'"
+summ | jq -e '.wa_candidates==4 and .probed==4 and .mini==4' >/dev/null 2>&1 && ok "(e) resumo: wa_candidates=4 probed=4 (as rodadas somam as pistas inteiras)" || bad "(e) resumo: $(summ | cut -c1-300)"
+# limite conhecido (fora do que o Athos pediu): DENTRO da rodada hot a ordem das pistas continua small → big; P0 contra P1 entre pistas não é reordenado
+reset; chk wa-h1s 0; chk wa-h0b 0; setok wa-h1s wa-h0b
+pass "[$H1S]" "[$H0B]" >/dev/null
+[ "$(d1)" = "wa-h1s small feature pass=1;" ] && ok "(e) limite conhecido: P1 da small e P0 da big na MESMA rodada hot, 1 vaga — a small vem antes (a ordem entre P0 e P1 de pistas diferentes não é o que a decisão de 02/11 muda)" || bad "(e) ordem dentro da rodada hot: $(d1)"
+# (f) prioridade que a biblioteca não lê (classe 5): «não sei a classe» NUNCA passa à frente de ninguém, mas também não some
+reset; chk wa-p9s 0; chk wa-h0b 0; setok wa-p9s wa-h0b
+pass "[$P9S]" "[$H0B]" >/dev/null
+[ "$(d1)" = "wa-h0b big feature pass=1;" ] && ok "(f) prioridade ilegível na small + P0 na big, 1 vaga: a P0 passa à frente (a ilegível cai na rodada rest)" || bad "(f) a ilegível passou à frente da P0: $(d1)"
+reset; chk wa-p9s 0; chk wa-h0b 0; setok wa-p9s wa-h0b
+T_SPAWN=pilot T_SLOTS=3 pass "[$P9S]" "[$H0B]" >/dev/null
+[ "$(d1)" = "wa-h0b big feature pass=1;wa-p9s small feature pass=1;" ] && ok "(f) com 3 vagas a prioridade ilegível também é tentada (na rodada rest): nenhuma bead some na partição" || bad "(f) a prioridade ilegível sumiu: $(d1)"
+# (f2) a fronteira das rodadas é 1|2: a P2 (classe 2) é da rodada rest, não some nem entra na hot
+reset; chk wa-p2a 0; chk wa-h0b 0; setok wa-p2a wa-h0b
+T_SPAWN=pilot T_SLOTS=3 pass "[$P2A]" "[$H0B]" >/dev/null
+[ "$(d1)" = "wa-h0b big feature pass=1;wa-p2a small feature pass=1;" ] && ok "(f2) P2 na small + P0 na big, 3 vagas: a P0 primeiro e a P2 depois (a classe 2 é da rodada rest)" || bad "(f2) fronteira P1|P2: $(d1)"
+# (g) biblioteca de ordem ausente (WORK_ORDER_JQ_DEFS vazio): não se sabe a classe de ninguém → UMA rodada sem filtro, a ordem de antes (pista a pista), e AVISA — nunca «nada a fazer»
+reset; chk wa-p3s 0; chk wa-h0b 0; setok wa-p3s wa-h0b
+SJ="[$P3S]" BJ="[$H0B]" T_SPAWN=pilot T_SLOTS=3 run_t 'WORK_ORDER_JQ_DEFS=""; SMALL_CANDIDATES="$SJ"; BIG_CANDIDATES="$BJ"; SMALL_COUNT=1; BIG_COUNT=1; _pilot_wa_node_pass; echo done' >/dev/null
+[ "$(d1)" = "wa-p3s small feature pass=1;wa-h0b big feature pass=1;" ] && ok "(g) sem a biblioteca de ordem: as duas beads são tentadas, pista a pista (small → big) — nada some e nada é tratado como vazio" || bad "(g) sem biblioteca: $(d1)"
+grep -q 'ga-7xd8g8f: a biblioteca de ordem' "$WORK/lines" 2>/dev/null && ok "(g) …e o aviso diz que a P0/P1 da big NÃO passa à frente nesta varredura" || bad "(g) sem aviso da biblioteca ausente: $(cut -c1-160 "$WORK/lines" 2>/dev/null | tr '\n' '|')"
+# (h) a linha da sonda guarda a prioridade QUE A PASSADA LEU (a de hoje não serve: wa-mb4goy foi sondada como P3 e hoje é P1); ilegível → null, nunca 0
+reset; for i in h0b p3s p9s; do chk wa-$i 10; done
+pass "[$P3S,$P9S]" "[$H0B]" >/dev/null
+r=$(jq -rs '[.[] | select(.event=="wa-node-pass-probe") | "\(.bead)=\(.prio)"] | sort | join(",")' "$PLOG" 2>/dev/null)
+[ "$r" = "wa-h0b=0,wa-p3s=3,wa-p9s=null" ] && ok "(h) a linha de sonda traz prio: P0→0, P3→3, prioridade ilegível→null (não 0) — $r" || bad "(h) prio na linha da sonda: '$r'"
+reset; chk wa-h0b 10
+SJ="[]" BJ="[$H0B]" run_t 'WORK_ORDER_JQ_DEFS=""; SMALL_CANDIDATES="$SJ"; BIG_CANDIDATES="$BJ"; SMALL_COUNT=0; BIG_COUNT=1; _pilot_wa_node_pass; echo done' >/dev/null
+[ "$(jq -rs '[.[] | select(.event=="wa-node-pass-probe") | .prio] | map(tostring) | join(",")' "$PLOG" 2>/dev/null)" = "null" ] && ok "(h) sem a biblioteca (classe que não vem): prio=null, a sonda continua sendo gravada" || bad "(h) prio sem biblioteca: $(cat "$PLOG" 2>/dev/null | cut -c1-200)"
+# (i) shadow só observa: as duas rodadas não duplicam a linha-sombra nem mexem na pista
+reset; for i in h1s h0b p3s p3b; do chk wa-$i 0; done
+r=$(T_EXEMPT=shadow pass "[$P3S,$H1S]" "[$H0B,$P3B]")
+[ "$r" = "S=wa-p3s,wa-h1s B=wa-h0b,wa-p3b SS=5 BS=5 D=0 C=2/2 PASSFLAG=0" ] && [ "$(d1)" = "-" ] && ok "(i) shadow: as pistas e as vagas ficam como estavam e nada é despachado — $r" || bad "(i) shadow mexeu no estado: $r d1=$(d1)"
+[ "$(jq -rs '[.[] | select(.event=="wa-node-pass-shadow") | .bead] | sort | join(",")' "$PLOG" 2>/dev/null)" = "wa-h0b,wa-h1s,wa-p3b,wa-p3s" ] && ok "(i) shadow: uma linha-sombra por bead (4 beads, cada uma uma vez — a rodada rest não relê a hot)" || bad "(i) linhas-sombra: $(jq -rs '[.[] | select(.event=="wa-node-pass-shadow") | .bead] | join(",")' "$PLOG" 2>/dev/null)"
+# (j) pista ilegível: UM aviso por varredura (a 2ª rodada lê a mesma pista e repetiria a mesma causa), e a outra pista segue sendo percorrida
+reset; chk wa-p3b 0; setok wa-p3b
+pass "isto não é json" "[$P3B]" >/dev/null
+[ "$(grep -c 'não é uma lista que eu leia' "$WORK/lines" 2>/dev/null)" = 1 ] && [ "$(d1)" = "wa-p3b big feature pass=1;" ] && ok "(j) pista small ilegível: UM aviso (não dois, um por rodada) e a big é percorrida" || bad "(j) avisos=$(grep -c 'não é uma lista que eu leia' "$WORK/lines" 2>/dev/null) d1=$(d1)"
+# (k) o nó cheio (apply rc 12) com a P0 na mão para a passada inteira: a P3 NÃO toma a vaga que a P0 acabou de tentar
+reset; chk wa-h0b 0; chk wa-p3s 0; echo 1 > "$WORK/d1.rc.wa-h0b"; echo 12 > "$WORK/d1.apply.wa-h0b"; setok wa-p3s
+T_SPAWN=pilot T_SLOTS=3 pass "[$P3S]" "[$H0B]" >/dev/null
+[ "$(d1)" = "wa-h0b big feature pass=1;" ] && summ | jq -e '.stopped=="capacity" and .kept==0' >/dev/null 2>&1 && ok "(k) P0 com veredito node e o nó cheio (rc 12): a passada PARA, a P3 nem é tentada" || bad "(k) a P3 passou depois do rc 12 da P0: d1=$(d1) $(summ | cut -c1-200)"
+# (l) o waiter da cessão continua com a pista dele primeiro DENTRO da rodada hot (6b-b); uma P0 não-waiter da outra pista vem depois dele
+reset; chk wa-h1b 0; chk wa-h0s 0; setok wa-h1b wa-h0s; H0S="$(jbp 0 wa-h0s U1 wa-worker story:approved)"
+T_WAIT=wa-h1b pass "[$H0S]" "[$H1B]" >/dev/null
+[ "$(d1)" = "wa-h1b big feature pass=1;" ] && ok "(l) waiter P1 na big + P0 não-waiter na small, 1 vaga: a pista do waiter vai primeiro dentro da rodada hot (a regra do 6b segue valendo)" || bad "(l) waiter: $(d1)"
 
 echo "── (7) dispatch_one: o bloco do yield e o braço do pool (regiões VERBATIM)"
 run_block() {

@@ -166,3 +166,15 @@ custo cache que nao e texto passa	if (.custo.cache | type) == "string" then	if t
 3.25: o apply rc 12 deixa a bead no conjunto	12) _pw_stop="capacity"; break ;;	12) _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id"; _pw_stop="capacity"; break ;;
 3.25: a despachada fica no conjunto	_pw_kept=$((_pw_kept + 1)); _pw_slots=$((_pw_slots - 1)); DISPATCHED=$((DISPATCHED + 1))	_pw_kept=$((_pw_kept + 1)); _pw_slots=$((_pw_slots - 1)); DISPATCHED=$((DISPATCHED + 1)); _PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id"
 3.25: o conjunto grava o id sem o espaco da frente	_PWP_NODE_BOUND="$_PWP_NODE_BOUND $_pw_id" ;; esac; continue ;;	_PWP_NODE_BOUND="$_PWP_NODE_BOUND$_pw_id" ;; esac; continue ;;
+6g: rodadas invertidas (rest antes de hot)	local _pw_rounds="hot rest"	local _pw_rounds="rest hot"
+6g: a P1 sai da rodada hot (e nao entra na rest)	hot)  _pw_rf='| select(wo_prio_class <= 1)' ;;	hot)  _pw_rf='| select(wo_prio_class <= 0)' ;;
+6g: a rodada hot pega todas as classes	hot)  _pw_rf='| select(wo_prio_class <= 1)' ;;	hot)  _pw_rf='| select(wo_prio_class <= 4)' ;;
+6g: a P1 entra nas duas rodadas	select(wo_prio_class > 1)	select(wo_prio_class >= 1)
+6g: a P2 sai da rodada rest	select(wo_prio_class > 1)	select(wo_prio_class > 2)
+6g: sem a biblioteca ainda filtra por classe	_pw_rounds="all"	_pw_rounds="hot rest"
+6g: sem a biblioteca, sem aviso	warn "ga-7xd8g8f: a biblioteca de ordem (WORK_ORDER_JQ_DEFS)	: "ga-7xd8g8f: a biblioteca de ordem (WORK_ORDER_JQ_DEFS)
+6g: pista ilegivel avisa em cada rodada	[ "$_pw_round" != "${_pw_rounds%% *}" ] || 	: ; 
+6g: prioridade ilegivel na sonda vira 0	then ($pc | tonumber) else null end	then ($pc | tonumber) else 0 end
+6g: a sonda nao recebe a classe	"$_pw_lane" "$(_pilot_priority_class_of "$_pw_pick")"; _pw_rsn=	"$_pw_lane" ""; _pw_rsn=
+6g: a rodada sem filtro filtra rest	*)    _pw_rf='' ;;	*)    _pw_rf='| select(wo_prio_class > 1)' ;;
+6g: o filtro vai sem as definicoes da biblioteca	"$([ "$_pw_round" = all ] || printf '%s' "$_pw_defs")"	""
