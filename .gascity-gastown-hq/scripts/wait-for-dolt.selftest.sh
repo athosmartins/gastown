@@ -10,6 +10,10 @@
 #   prazo 0 · sonda indisponível (lib ausente, sem a função, sem lsof) → rc 76 e NÃO roda · sonda que falha ou devolve lixo → nunca "pronto" · só um decoy (pgrep devolve um PID
 #   que não é o dolt) → continua esperando · prazo ilegível → padrão 300 + AVISO (observado pelo prazo anunciado) · flag vence a env · uso errado → 64 · janela de boot: fora dela
 #   o wrapper é transparente, dentro dela espera, uptime ilegível/lixo → trata como boot · lib achada ao lado do script quando não há WAIT_FOR_DOLT_LIB.
+# BORDAS (ga-ow127o6, lastro hq-mutants): inteiro no teto (3600), 6 dígitos com zeros, 7 dígitos · relógio de mentira (date/sysctl): uptime 0, relógio antes do boot, date ou
+#   sysctl que SAEM ≠0 imprimindo um valor bom, date com lixo · --timeout/--boot-window com valor mas sem comando · --boot-window 1 · lib que existe mas não carrega (76) · prazo 0 não anuncia espera.
+# EQUIVALENTE (ga-ow127o6; 7fb475c066, o `return 0` do ramo "passa de $4" de pick_int virando `return 1`): pick_int só é chamada em `X=$(pick_int ...)`, o script não tem `set -e` e ninguém
+#   lê o status da substituição (só o stdout, o padrão), então `return 0` e `return 1` deixam o mesmo estado e o mesmo rc de saída: nenhum caso vê a diferença.
 # CONTROLE NEGATIVO: cada guarda é adulterada (sed numa cópia, pela marca `GUARD:` do script) e o caso que a cobre TEM que passar a falhar; mutante que não muda o arquivo também falha.
 # VARIÁVEIS: WFD_UNDER_TEST (script a testar) · WFD_NO_MUTANTS=1
 set -u
@@ -59,6 +63,29 @@ EOF
 chmod +x "$T"/bin/* "$T/cmd.sh"
 for b in ps pgrep sysctl; do ln -s "$T/bin/$b" "$T/bin-nolsof/$b"; done
 for b in date dirname sleep; do ln -s "$(command -v "$b")" "$T/bin-nolsof/$b"; done
+
+# relógio de mentira (ga-ow127o6): `date +%s` e `sysctl -n kern.boottime` com valores FIXOS, para os casos de borda do uptime; qualquer outro `date` é o de verdade
+mkdir -p "$T/bin-clock"
+cat > "$T/bin-clock/date" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *"+%s"*)
+    case "$(cat "$WFD_STATE/clock_mode" 2>/dev/null)" in
+      junk) echo abc; exit 0 ;;
+      failval) cat "$WFD_STATE/clock_now"; exit 1 ;;
+      *) cat "$WFD_STATE/clock_now" ;;
+    esac ;;
+  *) exec /bin/date "$@" ;;
+esac
+EOF
+cat > "$T/bin-clock/sysctl" <<'EOF'
+#!/bin/sh
+echo "{ sec = $(cat "$WFD_STATE/clock_boot"), usec = 0 } Mon Jan  1 00:00:00 2026"
+[ "$(cat "$WFD_STATE/sysctl_rc" 2>/dev/null)" = fail ] && exit 1
+exit 0
+EOF
+chmod +x "$T/bin-clock/date" "$T/bin-clock/sysctl"
+for b in ps lsof pgrep; do ln -s "$T/bin/$b" "$T/bin-clock/$b"; done
 
 dolt_down() { [ -r "$S/pid" ] && kill "$(cat "$S/pid")" 2>/dev/null; rm -f "$S/pid"; }
 dolt_up() { dolt_down; sleep 600 >/dev/null 2>&1 & echo $! > "$S/pid"; disown 2>/dev/null; }
@@ -111,6 +138,37 @@ t_boot_window_invalid() { fresh; set_uptime 5000; run_w --timeout 1 --boot-windo
 t_lib_beside_script() { fresh; dolt_up; mkdir -p "$T/pair"; cp "$W" "$T/pair/wait-for-dolt.sh"; cp "$LIBSRC" "$T/pair/dolt-pid-lib.sh"
   local save="$W"; W="$T/pair/wait-for-dolt.sh"; WAIT_FOR_DOLT_LIB=UNSET run_w --timeout 2 -- "$T/cmd.sh"; local r=$rc; W="$save"; [ "$r" = 0 ] && ran; }
 
+# ---- bordas (ga-ow127o6): ids dos mutantes do lastro entre parênteses
+t_pick_int_edges() {   # (3635f5965f 7bbb4d4855 7bfe6de6dc) o teto vale, 6 dígitos com zeros valem, 7 dígitos já "passam de"
+  fresh; up_later 0.4; run_w --timeout 3600 -- "$T/cmd.sh"
+  [ "$rc" = 0 ] && ran && errhas 'prazo 3600s' && ! errhas 'AVISO' || return 1
+  fresh; up_later 0.4; run_w --timeout 000999 -- "$T/cmd.sh"
+  [ "$rc" = 0 ] && ran && errhas 'prazo 999s' && ! errhas 'AVISO' || return 1
+  fresh; up_later 0.4; run_w --timeout 0000999 -- "$T/cmd.sh"
+  [ "$rc" = 0 ] && ran && errhas 'AVISO' && errhas 'prazo 300s'; }
+clock() {   # $1 agora · $2 boot · $3 modo do date (ok|junk|failval) · $4 rc do sysctl (ok|fail)
+  printf '%s' "$1" > "$S/clock_now"; printf '%s' "$2" > "$S/clock_boot"; printf '%s' "${3:-ok}" > "$S/clock_mode"; printf '%s' "${4:-ok}" > "$S/sysctl_rc"; }
+run_clock() { WFD_PATH="$T/bin-clock:/usr/bin:/bin:/usr/sbin:/sbin" run_w --timeout 2 --boot-window 900 -- "$T/cmd.sh"; }
+t_clock_uptime_zero() { fresh; dolt_up; clock 1700000000 1700000000; run_clock   # (9fc62b8b6a) agora == boot é uptime 0, legível, dentro da janela
+  [ "$rc" = 0 ] && ran && ! errhas 'uptime ilegível'; }
+t_clock_before_boot() { fresh; dolt_up; clock 1700000000 1700000100; run_clock   # (3ebedb39a7 ecb4339113) relógio ANTES do boot não é uptime: trata como boot e avisa
+  [ "$rc" = 0 ] && ran && errhas 'uptime ilegível'; }
+t_clock_date_fails() { fresh; dolt_up; clock 1700005000 1700000000 failval; run_clock   # (703f6bcd5d 93cac30401) date que SAI ≠0 não vale, mesmo imprimindo um número que passaria da janela
+  [ "$rc" = 0 ] && ran && errhas 'uptime ilegível'; }
+t_clock_date_junk() { fresh; dolt_up; clock abc 1700000000 junk; run_clock   # (0f2673a407) date com lixo no lugar do epoch
+  [ "$rc" = 0 ] && ran && errhas 'uptime ilegível'; }
+t_sysctl_fails_with_value() { fresh; dolt_up; clock 1700005000 1700000000 ok fail; run_clock   # (052196032d) sysctl que SAI ≠0 não vale, mesmo imprimindo um boottime bom
+  [ "$rc" = 0 ] && ran && errhas 'uptime ilegível'; }
+t_usage_messages() { fresh; dolt_up   # (6cd8e541b2 2cfd7b401b 24722d8d73 1f13454702) a flag COM valor e SEM comando é "falta o comando", a flag sem valor é "sem valor"
+  run_w --timeout 5; [ "$rc" = 64 ] && errhas 'falta o comando' && ! ran || return 1
+  run_w --boot-window 5; [ "$rc" = 64 ] && errhas 'falta o comando' && ! ran || return 1
+  run_w --timeout; [ "$rc" = 64 ] && errhas '--timeout sem valor' || return 1
+  run_w --boot-window; [ "$rc" = 64 ] && errhas '--boot-window sem valor'; }
+t_boot_window_one() { fresh; set_uptime 5000; run_w --timeout 1 --boot-window 1 -- "$T/cmd.sh"; [ "$rc" = 0 ] && ran && [ ! -s "$T/err" ]; }   # (86d0acd77d) janela de 1 s já é janela: fora dela passa direto
+t_lib_load_fails() { fresh; dolt_up; echo 'return 1' > "$T/lib-bad.sh"; WAIT_FOR_DOLT_LIB="$T/lib-bad.sh" run_w --timeout 1 -- "$T/cmd.sh"   # (8393335752) lib legível que não carrega: 76, comando NÃO roda
+  [ "$rc" = 76 ] && ! ran && errhas 'não consegui carregar'; }
+t_timeout_zero_quiet() { fresh; run_w --timeout 0 -- "$T/cmd.sh"; [ "$rc" = 75 ] && ! ran && errhas 'NÃO ficou pronto' && ! errhas 'aguardando o Dolt'; }   # (4f383fec9d) prazo 0 sai antes de anunciar espera
+
 if [ ! -r "$W" ]; then echo "FAIL o script a testar não existe: $W"; exit 1; fi
 ok_t() { "$1"; ok $? "$2"; }
 ok_t t_ready_rc_args       "Dolt pronto: exec, rc 7 e argumentos com espaço preservados, silencioso"
@@ -132,6 +190,16 @@ ok_t t_boot_edge           "uptime == janela conta como fora do boot"
 ok_t t_boot_unreadable     "uptime ilegível (sysctl falha ou lixo): trata como boot, espera e avisa"
 ok_t t_boot_window_invalid "janela ilegível: AVISO e padrão 0 (sempre espera)"
 ok_t t_lib_beside_script   "sem WAIT_FOR_DOLT_LIB a lib é a que está ao lado do script"
+ok_t t_pick_int_edges      "inteiro: 3600 vale sem AVISO, 000999 (6 dígitos) vale 999, 0000999 (7 dígitos) cai no padrão com AVISO"
+ok_t t_clock_uptime_zero   "relógio: agora == boot é uptime 0, legível (sem AVISO), dentro da janela"
+ok_t t_clock_before_boot   "relógio antes do boot: uptime ilegível, trata como boot e avisa"
+ok_t t_clock_date_fails    "date que sai ≠0 (mesmo imprimindo um número): uptime ilegível, não passa direto"
+ok_t t_clock_date_junk     "date com lixo no lugar do epoch: uptime ilegível"
+ok_t t_sysctl_fails_with_value "sysctl que sai ≠0 (mesmo imprimindo um boottime bom): uptime ilegível"
+ok_t t_usage_messages      "flag com valor e sem comando = 'falta o comando'; flag sem valor = 'sem valor'"
+ok_t t_boot_window_one     "janela de 1 s: uptime longo passa direto, silencioso"
+ok_t t_lib_load_fails      "lib legível que não carrega: rc 76 e NÃO roda"
+ok_t t_timeout_zero_quiet  "prazo 0: 75 sem anunciar espera"
 bash32=$(/bin/bash --version | head -1); echo "     (rodou no: $bash32)"
 
 # ---- controle negativo
