@@ -1605,6 +1605,523 @@ eq("report does not list it among CONSTRUÍVEIS MAS PARADAS", "CONSTRUÍVEIS MAS
 m.check_approved, m.check_gate, m.check_pilot, m.check_dolt, m.RIGS = _km_ca, _km_cg, _km_cp, _km_cd, _km_rigs
 m._read_pilot_log_tail = _km_read_tail
 
+print("── ga-7n003iz: hq-mutants do lastro — copia FRESCA do modulo, cada limite, contagem e corte no valor exato ──")
+# O modulo `m` acima ja foi remendado por muitos testes (e nem todos devolvem o original); aqui cada caso carrega o
+# arquivo de novo, entao nenhum fake antigo vaza. NOWV tem segundos inteiros: "N minutos atras" volta como N exato.
+import contextlib, io, json, os, subprocess, sys, tempfile, time, types
+import importlib.util as _iu
+
+NOWV = 1760000000.0
+_LW = tempfile.mkdtemp(prefix="imp-lastro.")
+
+
+_KNOBS = ("IMP_STARVE_MIN", "IMP_HELD_LOOP_MAX", "IMP_GATE_STALL_MIN", "IMP_PILOT_DEAD_MIN", "IMP_MAX_CLASSIFY",
+          "IMP_SWEEP_BUDGET_MIN", "TSW_DELIVERY_STALL_HOURS")
+
+
+def _fresh():
+    # os limiares nascem de variaveis de ambiente: tira-as so durante a carga, para os valores esperados valerem
+    env0 = {k: os.environ.pop(k) for k in _KNOBS if k in os.environ}
+    try:
+        sp = _iu.spec_from_file_location("imp_lastro", m.__file__)
+        f = _iu.module_from_spec(sp)
+        sp.loader.exec_module(f)
+    finally:
+        os.environ.update(env0)
+    f.NOW = NOWV
+    return f
+
+
+def _t(name, fn, exp):
+    # excecao -> uma linha FAIL com o motivo, nao a queda do selftest inteiro
+    try:
+        got = fn()
+    except Exception as e:
+        got = "raised %s: %s" % (type(e).__name__, e)
+    eq(name, got, exp)
+
+
+def _iso(sec_ago):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOWV - sec_ago))
+
+
+def _logts(sec_ago):
+    # os logs do dispatcher/pilot trazem hora LOCAL sem fuso; o modulo faz strptime ingenuo e .timestamp() local
+    return time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(NOWV - sec_ago))
+
+
+def _res(rc=0, out=""):
+    return types.SimpleNamespace(returncode=rc, stdout=out)
+
+
+# ── carga do modulo: a ordem do sys.path e o aviso quando o watchdog nao importa ──
+_shadow = tempfile.mkdtemp(prefix="imp-shadow.", dir=_LW)
+with open(os.path.join(_shadow, "park_labels.py"), "w") as _fh:
+    _fh.write("PARK_LABELS = ('shadow-label',)\n")
+_path0, _pl0 = list(sys.path), sys.modules.pop("park_labels", None)
+sys.path.insert(0, _shadow)
+try:
+    _t("sys.path: o diretorio do proprio script vem ANTES de uma entrada anterior (park_labels e o dele, nao o da sombra)",
+       lambda: "shadow-label" in _fresh().PARKING_LABELS, False)
+finally:
+    sys.path[:] = _path0
+    sys.modules.pop("park_labels", None)
+    if _pl0 is not None:
+        sys.modules["park_labels"] = _pl0
+
+_sfl0 = _iu.spec_from_file_location
+
+
+def _sfl_boom(name, *a, **k):
+    if name == "throughput_stall_watchdog":
+        raise RuntimeError("x" * 100)
+    return _sfl0(name, *a, **k)
+
+
+_iu.spec_from_file_location = _sfl_boom
+try:
+    _t("import do watchdog falhou: o aviso leva os 80 primeiros caracteres do erro, nem 79 nem 81",
+       lambda: _fresh()._TSW_LOAD_WARN.count("x"), 80)
+finally:
+    _iu.spec_from_file_location = _sfl0
+
+# ── _sh: o que ele PEDE ao subprocess (texto capturado, errors=replace, 20 s) ──
+_kw = []
+
+
+def _run_faithful(args, **kw):
+    _kw.append(kw)
+    if not kw.get("capture_output"):
+        return types.SimpleNamespace(returncode=0, stdout=None)
+    raw = ("caf" + chr(233) + "\n").encode("utf-8")
+    return types.SimpleNamespace(returncode=0, stdout=raw.decode("utf-8", kw.get("errors", "strict")) if kw.get("text") else raw)
+
+
+_run0 = subprocess.run
+subprocess.run = _run_faithful
+try:
+    _sh_r = _fresh()._sh(["x"])
+finally:
+    subprocess.run = _run0
+eq("_sh: stdout capturado e decodificado (str, nao bytes e nao None)", _sh_r.stdout, "caf" + chr(233) + "\n")
+eq("_sh: errors=replace e timeout padrao de 20 s", (_kw[0].get("errors"), _kw[0].get("timeout")), ("replace", 20))
+
+# ── _bd_json: saida lida, e os tres estados (lista / vazio / nao consegui ler) ──
+def _bdj(r, **kw):
+    f = _fresh()
+    seen = []
+    f._sh = lambda args, timeout=20: (seen.append((args, timeout)) or r)
+    return f._bd_json("/root", "lab", **kw), seen, f
+
+
+_v, _seen, _f = _bdj(_res(0, '[{"id": "a"}]'))
+eq("_bd_json: rc 0 e lista JSON -> (lista, True)", _v, ([{"id": "a"}], True))
+eq("_bd_json: sem include_infra a consulta NAO leva --include-infra (padrao False)",
+   _seen[0][0], [_f.BD, "-C", "/root", "list", "-l", "lab", "--status", "open", "--json", "-n", "200"])
+_v, _seen, _f = _bdj(_res(0, "[]"), include_infra=True, status="closed")
+eq("_bd_json: include_infra=True acrescenta --include-infra no fim e o status vai na consulta",
+   _seen[0][0][-3:], ["-n", "200", "--include-infra"])
+eq("_bd_json: status passado vai na consulta", _seen[0][0][6:8], ["--status", "closed"])
+eq("_bd_json: envelope {issues: [...]}", _bdj(_res(0, '{"issues": [{"id": "i"}]}'))[0], ([{"id": "i"}], True))
+eq("_bd_json: envelope {beads: [...]}", _bdj(_res(0, '{"beads": [{"id": "b"}]}'))[0], ([{"id": "b"}], True))
+eq("_bd_json: objeto sem issues/beads -> ([], True)", _bdj(_res(0, "{}"))[0], ([], True))
+eq("_bd_json: stdout vazio com rc 0 -> ([], True) (vazio nao e falha)", _bdj(_res(0, ""))[0], ([], True))
+eq("_bd_json: comando nao rodou (None) -> (None, False)", _bdj(None)[0], (None, False))
+eq("_bd_json: rc 1 mesmo com JSON bom na saida -> (None, False)", _bdj(_res(1, '[{"id": "a"}]'))[0], (None, False))
+eq("_bd_json: rc 0 e JSON ilegivel -> (None, False)", _bdj(_res(0, "{nope"))[0], (None, False))
+
+# ── _load_routes: so entradas com prefixo E caminho; linha torta pulada ──
+_city = tempfile.mkdtemp(prefix="imp-city.", dir=_LW)
+os.makedirs(os.path.join(_city, ".beads"))
+with open(os.path.join(_city, ".beads", "routes.jsonl"), "w") as _fh:
+    _fh.write('{"prefix": "lx", "path": "../lexbh"}\n\n{"path": "../only-path"}\n{"prefix": "nopath"}\nnot json\n')
+eq("_load_routes: so a entrada com prefixo E caminho entra (caminho sem prefixo nao vira chave None)",
+   _fresh()._load_routes(_city), {"lx": os.path.normpath(os.path.join(_city, "../lexbh"))})
+
+# ── _bd_show_labels_text ──
+def _lt(r):
+    f = _fresh()
+    seen = []
+    f._sh = lambda args, timeout=20: (seen.append((args, timeout)) or r)
+    return f._bd_show_labels_text("/root", "ga-1"), seen, f
+
+
+eq("labels: comando nao rodou -> None", _lt(None)[0], None)
+eq("labels: rc 1 mesmo com LABELS na saida -> None", _lt(_res(1, "LABELS: a\n"))[0], None)
+_v, _seen, _f = _lt(_res(0, "ga-1 [P2 · DEFERRED]\nLABELS: a, b ,c\n"))
+eq("labels: cabecalho com a bolinha + LABELS (aparados) -> status:deferred, a, b, c", _v, ["status:deferred", "a", "b", "c"])
+eq("labels: o bd show roda com timeout de 15 s e o argv exato", _seen[0], ([_f.BD, "-C", "/root", "show", "ga-1"], 15))
+eq("labels: ' DEFERRED]' sem a bolinha tambem vale", _lt(_res(0, "ga-1 [P2 DEFERRED]\n"))[0], ["status:deferred"])
+eq("labels: ' BLOCKED]' sem a bolinha tambem vale", _lt(_res(0, "ga-1 [P2 BLOCKED]\n"))[0], ["status:blocked"])
+eq("labels: cabecalho com a bolinha + BLOCKED", _lt(_res(0, "ga-1 [P2 · BLOCKED]\nLABELS: z\n"))[0], ["status:blocked", "z"])
+eq("labels: sem linha LABELS -> [] (vazio nao e falha)", _lt(_res(0, "ga-1 [P2 OPEN]\n"))[0], [])
+
+# ── _gate_source_beads ──
+def _gsb(markers, ok):
+    f = _fresh()
+    seen = []
+    f._bd_json = lambda root, label, status="open", include_infra=False: (seen.append((root, label, include_infra)) or (markers, ok))
+    return f._gate_source_beads(), seen, f
+
+
+_mk = [{"labels": ["type:quality-gate-marker", "source-bead:ga-1", "source-bead: ga-2 ", "source-bead:"]},
+       {"labels": ["source-bead:wa-3", 7]}]
+_v, _seen, _f = _gsb(_mk, True)
+eq("gate_source_beads: ids dos source-bead:* aparados, label vazio ignorado", _v, {"ga-1", "ga-2", "wa-3"})
+eq("gate_source_beads: le os markers do city com include_infra=True", _seen, [(_f.CITY, "type:quality-gate-marker", True)])
+eq("gate_source_beads: leitura falhou (ok False) com markers na mao -> conjunto vazio, nunca suprime", _gsb(_mk, False)[0], set())
+eq("gate_source_beads: sem markers -> conjunto vazio", _gsb([], True)[0], set())
+eq("gate_source_beads: markers None -> conjunto vazio", _gsb(None, True)[0], set())
+
+# ── classify_bead: o teto do held-loop vale mesmo se o vocabulario de parqueio deixar de cobrir pilot:held ──
+_f = _fresh()
+_f.PARKING_LABELS = ()
+_held = ["pilot:held-until:%d" % i for i in range(5)]
+eq("classify held-loop: 5 labels com teto 5 -> held (no teto ainda e espera legitima)", _f.classify_bead("b", _held, set()), ("held", ""))
+eq("classify held-loop: 6 labels com teto 5 -> stuck held-loop:6x", _f.classify_bead("b", _held + ["pilot:held-until:9"], set()), ("stuck", "held-loop:6x"))
+eq("classify held-loop: teto passado por argumento (2): 2 labels held, 3 labels stuck",
+   (_f.classify_bead("b", _held[:2], set(), 2), _f.classify_bead("b", _held[:3], set(), 2)), (("held", ""), ("stuck", "held-loop:3x")))
+
+# ── check_approved: o snapshot do Pilot (idade x ttl), o erro de leitura e as contagens ──
+def _snap(obj):
+    p = os.path.join(_LW, "snap-%d.json" % len(os.listdir(_LW)))
+    with open(p, "w") as fh:
+        json.dump(obj, fh)
+    return p
+
+
+def _ca(snap, path=None, patch=None):
+    f = _fresh()
+    f.DISPATCHABLE_JSON = path or _snap(snap)
+    f._check_approved_fallback = lambda warns: {"FALLBACK": True, "warns": list(warns)}
+    f._gate_source_beads = lambda: set()
+    if patch:
+        patch(f)
+    return f.check_approved()
+
+
+_STALE = "snapshot dispatchable desatualizado (%s > ttl×2=%dmin) — usando story:approved como fallback"
+eq("snapshot de 5 min com ttl 600: fresco, vai pelo caminho dispatchable com idade 5.0",
+   (lambda r: (r.get("FALLBACK"), r["from_dispatchable"], r["total"], r["snap_age_min"], r["warns"]))(
+       _ca({"generated_at": _iso(300), "ttl_seconds": 600, "items": []})), (None, True, 0, 5.0, []))
+eq("snapshot de 25 min com ttl 600 (limite 20): velho -> fallback e o aviso diz 25min e ttl×2=20min",
+   _ca({"generated_at": _iso(1500), "ttl_seconds": 600, "items": []}), {"FALLBACK": True, "warns": [_STALE % ("25min", 20)]})
+eq("snapshot com idade IGUAL ao limite (20 min) ainda e fresco",
+   "FALLBACK" in _ca({"generated_at": _iso(1200), "ttl_seconds": 600, "items": []}), False)
+eq("sem ttl_seconds vale o padrao de 600 s: 1201 s de idade passa de 20 min -> fallback",
+   "FALLBACK" in _ca({"generated_at": _iso(1201), "items": []}), True)
+eq("sem ttl_seconds: 1200 s de idade ainda e fresco",
+   "FALLBACK" in _ca({"generated_at": _iso(1200), "items": []}), False)
+eq("generated_at ilegivel -> velho por falta de idade: o aviso diz 9999min",
+   _ca({"generated_at": "", "ttl_seconds": 600, "items": []}), {"FALLBACK": True, "warns": [_STALE % ("9999min", 20)]})
+
+_longdir = os.path.join(_LW, "d" * 100)
+os.makedirs(_longdir)
+try:
+    open(_longdir)
+except Exception as _e:
+    _msg = str(_e)
+eq("a mensagem de erro do open() passa de 81 caracteres (precondicao do teste de corte)", len(_msg) > 81, True)
+eq("snapshot ilegivel: o aviso carrega os 80 primeiros caracteres do erro",
+   _ca(None, path=_longdir)["warns"], ["erro ao ler pilot-dispatchable.json (%s) — usando story:approved" % _msg[:80]])
+eq("snapshot ausente: aviso proprio e fallback",
+   _ca(None, path=os.path.join(_LW, "nao-existe.json"))["warns"], ["~/.gc/pilot-dispatchable.json ausente — usando story:approved como fallback"])
+
+
+def _items_fixture(f):
+    kinds = {"ga-p1": ("parked", "label"), "ga-p2": ("parked", "in-gate"), "ga-p3": ("parked", "kimi-lane"),
+             "ga-f": ("flowing", ""), "ga-h": ("held", ""), "ga-s": ("stuck", ""), "ga-l": ("stuck", "held-loop:6x")}
+    f.classify_bead = lambda bid, labels, gsb: kinds[bid]
+    f._root_for_bead = lambda bid, store: (None, None) if bid == "ga-nr" else ("/root", "HQ")
+    f._bd_show_labels_text = lambda root, bid: None if bid == "ga-re" else (["lane:small", "x"] if bid == "ga-s" else [])
+
+
+_r = _ca({"generated_at": _iso(180), "ttl_seconds": 600, "items": [
+    {"id": i, "store": "hq", "title": "t" * 60} for i in ("ga-p1", "ga-p2", "ga-p3", "ga-f", "ga-h", "ga-s", "ga-l", "ga-nr", "ga-re")]},
+    patch=_items_fixture)
+eq("check_approved: contagens exatas por tipo (parked 3 = label + in-gate + kimi; construiveis 4; flowing 1; held 1)",
+   {k: _r[k] for k in ("total", "parked_count", "in_gate_count", "kimi_lane_count", "buildable_count", "flowing_count", "held_count")},
+   {"total": 9, "parked_count": 3, "in_gate_count": 1, "kimi_lane_count": 1, "buildable_count": 4, "flowing_count": 1, "held_count": 1})
+eq("check_approved: as paradas levam titulo cortado em 55, a faixa (lane:) e o motivo do held-loop",
+   _r["stuck"], [{"id": "ga-s", "rig": "HQ", "title": "t" * 55, "lane": "small"},
+                 {"id": "ga-l", "rig": "HQ", "title": "t" * 55, "reason": "held-loop:6x"}])
+eq("check_approved: sem rota -> no_route; bd show falhou -> read_err (cada um no seu balde)", (_r["no_route"], _r["read_err"]), (["ga-nr"], ["ga-re"]))
+_r0 = _ca({"generated_at": _iso(180), "ttl_seconds": 600, "items": [{"id": "ga-p1", "title": None}]}, patch=_items_fixture)
+eq("check_approved: so um parked (titulo None, sem quebrar) -> flowing 0, held 0, nenhuma parada, nenhuma construivel",
+   (_r0["flowing_count"], _r0["held_count"], _r0["stuck"], _r0["buildable_count"]), (0, 0, [], 0))
+
+# ── _check_approved_fallback ──
+def _fb(beads_by_root, rigs, gate=frozenset()):
+    f = _fresh()
+    f.RIGS = rigs
+    f._gate_source_beads = lambda: set(gate)
+    f._bd_json = lambda root, label, status="open", include_infra=False: beads_by_root[root]
+    return f._check_approved_fallback(["herdado"])
+
+
+_hdr = lambda i: "pilot:held-until:%d" % i
+_HQ = [{"id": "fl", "labels": ["story:in-flight"]}, {"id": "km", "labels": ["lane:kimi"]},
+       {"id": "hd", "labels": [_hdr(NOWV + 3600)]}, {"id": "mg", "assignee": "mayor", "labels": []},
+       {"id": "nd", "labels": ["story:needs-device"]}, {"id": "mk", "labels": []}, {"id": "gl", "labels": ["gate:reviewing"]}]
+_WA = [{"id": "nf", "labels": ["gate:needs-fix", "gate:reviewing"], "updated_at": _iso(45 * 60), "title": "n" * 60},
+       {"id": "frs", "labels": [], "updated_at": _iso(5 * 60)},
+       {"id": "hl6", "labels": [_hdr(i) for i in range(6)], "title": "h" * 60},
+       {"id": "pasth", "labels": [_hdr(NOWV - 10)]},
+       {"id": "noage", "labels": []},
+       {"id": "edge", "labels": [], "updated_at": _iso(20 * 60)},
+       {"id": "old", "labels": [], "updated_at": _iso(61 * 60), "title": "o" * 60}]
+_r = _fb({"/hq": (_HQ, True), "/wa": (_WA, True)}, [("HQ", "/hq"), ("WA", "/wa")], gate={"mk"})
+eq("fallback: balde por balde (in-flight 1, kimi 1, held 3, mayor 1, fresca 2, no gate 2)",
+   _r["_ok_reasons"], {"in-flight": 1, "held": 3, "mayor": 1, "fresh": 2, "in-gate": 2, "kimi-lane": 1})
+eq("fallback: totais (14 aprovadas; parked = held 3 + mayor 1 + gate 2 + kimi 1; construiveis = total - paradas - in-flight)",
+   {k: _r[k] for k in ("total", "_total_approved", "parked_count", "in_gate_count", "kimi_lane_count", "buildable_count", "flowing_count", "held_count")},
+   {"total": 14, "_total_approved": 14, "parked_count": 7, "in_gate_count": 2, "kimi_lane_count": 1, "buildable_count": 10, "flowing_count": 1, "held_count": 3})
+eq("fallback: so 3 ficam paradas, na ordem das rigs, com idade em minutos (ou 'idade?') e titulo cortado em 55",
+   _r["stuck"], [{"rig": "WA", "id": "nf", "title": "n" * 55, "reason": "45min"},
+                 {"rig": "WA", "id": "noage", "title": "", "reason": "idade?"},
+                 {"rig": "WA", "id": "old", "title": "o" * 55, "reason": "61min"}])
+eq("fallback: marca o caminho como NAO-dispatchable, sem idade de snapshot, e herda os avisos",
+   (_r["from_dispatchable"], _r["snap_age_min"], _r["warns"], _r["read_err"]), (False, None, ["herdado"], []))
+# Equivalentes que NENHUM caso pega (o lastro continua listando): no fallback, o ramo do teto de held-loop (len(held) > HELD_LOOP_MAX, o titulo, `future` e o
+# float(...) > NOW) e codigo morto, porque o `any(l.startswith("pilot:held-until"))` anterior ja deu `continue` em toda bead com esse label e `held` ali e sempre []:
+# 034ff3c5c7 28aef54d0b 65d267fb2c 7b6ccba54c 11c28b96bf 103b46b79f 23488fecc2 b5f5119856 ccbe12616b 7b47daf7fe 530e68166d. Mais cb7a532be1 f4d95ae8c3 (os booleanos
+# flowing/held do dicionario de `buildable` nunca sao lidos: so len(buildable) sai) e 561c28a6c7 (`>=` atribui o mesmo valor). O caso abaixo prova a premissa do ramo morto.
+eq("fallback: qualquer pilot:held-until:* (6 labels, passado ou futuro) e held, nunca parada - o ramo do teto de held-loop fica atras deste",
+   [b["id"] for b in _r["stuck"] if b["id"] in ("hl6", "pasth", "hd")], [])
+_r = _fb({"/hq": ([], True)}, [("HQ", "/hq")])
+eq("fallback sem nenhuma aprovada: tudo zero (total, baldes, in-flight)",
+   (_r["total"], _r["flowing_count"], _r["buildable_count"], _r["_ok_reasons"]),
+   (0, 0, 0, {"in-flight": 0, "held": 0, "mayor": 0, "fresh": 0, "in-gate": 0, "kimi-lane": 0}))
+_r = _fb({"/hq": (None, False)}, [("HQ", "/hq")])
+eq("fallback com loja ilegivel: aviso por loja e nada contado como 'sem aprovadas'",
+   (_r["warns"], _r["total"]), (["herdado", "não consegui ler story:approved de: HQ (Dolt/bd)"], 0))
+
+# ── check_gate ──
+def _cg(markers, ok=True, tail=None, gc=None):
+    f = _fresh()
+    seen = []
+    f._bd_json = lambda root, label, status="open", include_infra=False: (seen.append((root, label, include_infra)) or (markers, ok))
+
+    def sh(args, timeout=20):
+        if args[0] == "tail":
+            return None if tail is None else _res(0, tail)
+        return None if gc is None else _res(0, gc)
+
+    f._sh = sh
+    return f.check_gate(), seen, f
+
+
+_v, _seen, _f = _cg(None, ok=False)
+eq("check_gate: marker ilegivel -> {read_err: True} (e a leitura pede include_infra=True do city)", (_v, _seen), ({"read_err": True}, [(_f.CITY, "type:quality-gate-marker", True)]))
+_M = [{"id": "m1", "labels": ["gate-status:queued"], "updated_at": _iso(1800)},
+      {"id": "m2", "labels": ["gate-status:dispatching"], "updated_at": _iso(300)},
+      {"id": "m3", "labels": ["gate-status:needs-rebase"]}, {"id": "m4", "labels": ["gate-status:error"]},
+      {"id": "m5", "labels": ["gate-status:passed"]}]
+_PASS = lambda sec: _logts(sec) + " [qgd] Gate PASSED: ga-x\n"
+_v = _cg(_M, tail=_PASS(60), gc="gate-reviewer-1  active\n")[0]
+eq("check_gate: ativos (queued+dispatching), parked (needs-rebase+error), o mais antigo e o ultimo merge",
+   (_v["active"], _v["parked"], _v["oldest_active_min"], _v["last_pass_min"], _v["reviewer_alive"], _v["stalled"], _v["stall_reason"]),
+   (["m1", "m2"], ["m3", "m4"], 30.0, 1.0, True, False, ""))
+eq("check_gate: o mais antigo vence mesmo quando o jovem vem primeiro",
+   _cg(list(reversed(_M[:2])), tail=_PASS(60), gc="")[0]["oldest_active_min"], 30.0)
+eq("check_gate: marker sem idade legivel convive com um de idade (a idade que existe vence)",
+   _cg([{"id": "a", "labels": ["gate-status:queued"], "updated_at": _iso(600)},
+        {"id": "b", "labels": ["gate-status:queued"]}], tail=_PASS(60), gc="")[0]["oldest_active_min"], 10.0)
+eq("check_gate: so-needs-rebase e so-error, cada um sozinho, vao para parked",
+   _cg([{"id": "r", "labels": ["gate-status:needs-rebase"]}, {"id": "e", "labels": ["gate-status:error"]}], tail=_PASS(60), gc="")[0]["parked"], ["r", "e"])
+
+for _gc, _alive in (("foo active\nbar awake\n", False), ("gate-reviewer-1 asleep\n", False), ("gate-reviewer-1 awake\n", True),
+                    ("x\ngate-reviewer-2 active\n", True), ("", False), (None, False)):
+    eq("reviewer vivo? %r -> %s" % (_gc, _alive), _cg(_M, tail=_PASS(60), gc=_gc)[0]["reviewer_alive"], _alive)
+
+def _stall(active_sec, pass_sec, gc=""):
+    mk = [] if active_sec is None else [{"id": "q", "labels": ["gate-status:queued"], "updated_at": _iso(active_sec)}]
+    v = _cg(mk, tail=None if pass_sec is None else _PASS(pass_sec), gc=gc)[0]
+    return (v["stalled"], v["stall_reason"])
+
+
+_H = 165 * 60
+eq("stall por idade: marker de 166 min, merge recente, sem reviewer -> travado, motivo cita 166min",
+   _stall(166 * 60, 60), (True, "marker preso há 166min (reviewer pode estar congelado)"))
+eq("stall por idade: marker de EXATOS 165 min nao e travado", _stall(_H, 60), (False, ""))
+eq("stall por idade: com reviewer vivo nao e travado", _stall(200 * 60, 60, gc="gate-reviewer-1 active\n"), (False, ""))
+eq("stall por silencio: 1 marker novo, nenhum merge no log, sem reviewer -> travado", _stall(60, None), (True, "0 merge na janela + nenhum reviewer vivo"))
+eq("stall por silencio: ultimo merge ha EXATOS 165 min nao e travado", _stall(60, _H), (False, ""))
+eq("stall por silencio: ultimo merge ha 166 min -> travado", _stall(60, _H + 60), (True, "0 merge na janela + nenhum reviewer vivo"))
+eq("stall por silencio: merge recente -> nao travado", _stall(60, 60), (False, ""))
+eq("stall por silencio: nenhum marker ativo nao e travamento, mesmo sem merge", _stall(None, None), (False, ""))
+eq("stall por silencio: com reviewer vivo nao e travado", _stall(60, None, gc="gate-reviewer-1 awake\n"), (False, ""))
+eq("check_gate: tail do log que nao rodou (None) -> last_pass_min None, sem quebrar", _cg(_M, tail=None, gc="")[0]["last_pass_min"], None)
+
+# ── check_pilot / check_dolt ──
+def _cp(tail):
+    f = _fresh()
+    f._sh = lambda args, timeout=20: None if tail is None else _res(0, tail)
+    return f.check_pilot()
+
+
+eq("check_pilot: log que nao veio -> {alive: None}", _cp(None), {"alive": None})
+eq("check_pilot: log vazio -> {alive: None}", _cp(""), {"alive": None})
+eq("check_pilot: ultima linha com hora ha 5 min -> vivo", _cp("x\n" + _logts(300) + " sweep\n"), {"alive": True, "last_sweep_min": 5.0})
+eq("check_pilot: ha EXATOS 20 min -> nao vivo (limite)", _cp(_logts(1200) + " sweep\n"), {"alive": False, "last_sweep_min": 20.0})
+eq("check_pilot: ha 19 min -> vivo", _cp(_logts(19 * 60) + " sweep\n")["alive"], True)
+eq("check_pilot: ha 21 min -> morto", _cp(_logts(21 * 60) + " sweep\n")["alive"], False)
+eq("check_pilot: texto sem nenhuma hora -> morto com last_sweep_min None", _cp("sem hora nenhuma\n"), {"alive": False, "last_sweep_min": None})
+
+
+def _cd(r, ticks=(100.0, 101.0)):
+    f = _fresh()
+    seen = []
+    f._sh = lambda args, timeout=20: (seen.append((args, timeout)) or r)
+    it = iter(ticks)
+    t0 = time.time
+    time.time = lambda: next(it)
+    try:
+        return f.check_dolt(), seen, f
+    finally:
+        time.time = t0
+
+
+_v, _seen, _f = _cd(_res(0, "[]"))
+eq("check_dolt: rc 0 -> responde, latencia 1000 ms para 1 s (milissegundos, nao 1001)", _v, {"responsive": True, "latency_ms": 1000})
+eq("check_dolt: o bd list roda com timeout de 15 s e o argv exato", _seen, [([_f.BD, "-C", _f.CITY, "list", "-n", "1", "--json"], 15)])
+eq("check_dolt: rc 1 -> nao responde", _cd(_res(1, "[]"))[0]["responsive"], False)
+eq("check_dolt: rc 2 -> nao responde", _cd(_res(2, "[]"))[0]["responsive"], False)
+eq("check_dolt: comando que nao rodou -> nao responde", _cd(None)[0]["responsive"], False)
+
+# ── auxiliares de saturacao: cada fronteira de vaga/candidato ──
+_f = _fresh()
+_S = lambda s, b: {"small": s, "big": b}
+eq("_pool_saturated: big com 1 vaga e 3 candidatos pode despachar -> nao saturado", _f._pool_saturated(_S(0, 1), _S(0, 3)), False)
+eq("_pool_saturated: sem candidatos conhecidos, small=0 big=1 -> nao saturado (1 vaga basta)", _f._pool_saturated(_S(0, 1), None), False)
+eq("_pool_saturated: sem candidatos conhecidos, as duas lanes em 0 -> saturado", _f._pool_saturated(_S(0, 0), None), True)
+eq("_saturation_reason: small=1 big=0, candidatos so de big -> wrong_lane", _f._saturation_reason(_S(1, 0), _S(0, 2)), "wrong_lane")
+eq("_saturation_reason: small=0 big=1, candidatos so de small -> wrong_lane", _f._saturation_reason(_S(0, 1), _S(2, 0)), "wrong_lane")
+eq("_saturation_reason: as duas lanes sem vaga -> both_empty", _f._saturation_reason(_S(0, 0), _S(2, 2)), "both_empty")
+eq("_saturation_reason: zero candidatos nas duas lanes -> zero_candidates", _f._saturation_reason(_S(1, 1), _S(0, 0)), "zero_candidates")
+eq("_saturation_reason: pool nao saturado -> None", _f._saturation_reason(_S(1, 1), _S(1, 1)), None)
+eq("_starved_lanes: so small tem candidato sem vaga (big com 0 vagas mas 0 candidatos nao conta)", _f._starved_lanes(_S(0, 0), _S(3, 0)), "small")
+eq("_starved_lanes: small com 1 vaga nao esta faltando -> '?'", _f._starved_lanes(_S(1, 0), _S(3, 0)), "?")
+eq("_starved_lanes: 1 candidato basta para a lane contar", _f._starved_lanes(_S(0, 2), _S(1, 0)), "small")
+eq("_starved_lanes: as duas faltando", _f._starved_lanes(_S(0, 0), _S(2, 5)), "small/big")
+_stk7 = [{"rig": "HQ", "id": "s%d" % i} for i in range(1, 8)]
+_six = ", ".join("HQ/s%d" % i for i in range(1, 7))
+_n = _f._pool_cap_note(_stk7)
+eq("_pool_cap_note: conta 7 mas lista so os 6 primeiros", (" 7 construível(is)" in _n, _six in _n, "HQ/s7" in _n), (True, True, False))
+_n = _f._saturation_note("both_empty", _S(0, 0), _S(2, 2), _stk7)
+eq("_saturation_note: conta 7 mas lista so os 6 primeiros", (" 7 construível(is)" in _n, _six in _n, "HQ/s7" in _n), (True, True, False))
+
+# ── main(): o relatorio inteiro, com os check_* trocados por resultados conhecidos ──
+_G_OK = {"active": [], "parked": [], "last_pass_min": 5.0, "reviewer_alive": True, "oldest_active_min": None, "stalled": False, "stall_reason": ""}
+_P_OK = {"alive": True, "last_sweep_min": 1.0}
+_D_OK = {"responsive": True, "latency_ms": 10}
+
+
+def _A(**kw):
+    a = {"total": 3, "parked_count": 0, "buildable_count": 0, "flowing_count": 0, "held_count": 0, "stuck": [],
+         "read_err": [], "warns": [], "from_dispatchable": True, "snap_age_min": 3.0}
+    a.update(kw)
+    return a
+
+
+def _stuck(n, **extra):
+    return [dict({"rig": "HQ", "id": "s%d" % i}, **extra) for i in range(1, n + 1)]
+
+
+def _main(a, g=None, p=None, d=None, log=None, rows=None):
+    f = _fresh()
+    f.check_approved = lambda: a
+    f.check_gate = lambda: g or _G_OK
+    f.check_pilot = lambda: p or _P_OK
+    f.check_dolt = lambda: d or _D_OK
+    f.RIGS = [("HQ", "/hq")]
+    f._read_pilot_log_tail = lambda: log
+    runs = []
+
+    def fake_run(args, **kw):
+        runs.append((args, kw))
+        return types.SimpleNamespace(returncode=0, stdout=json.dumps(rows or []))
+
+    buf, code, run0 = io.StringIO(), None, subprocess.run
+    subprocess.run = fake_run
+    try:
+        with contextlib.redirect_stdout(buf):
+            try:
+                f.main()
+            except SystemExit as e:
+                code = e.code
+    finally:
+        subprocess.run = run0
+    return code, buf.getvalue(), runs, f
+
+
+_ids = lambda lo, hi, pre="HQ/s", suf="": ", ".join("%s%d%s" % (pre, i, suf) for i in range(lo, hi + 1))
+_c, _o, _runs, _f = _main(_A(stuck=_stuck(9, lane="small"), buildable_count=9, total=9))
+eq("main: 9 construiveis paradas e nada em build -> exit 1; a falha lista as 6 primeiras",
+   (_c, "9 bead(s) CONSTRUÍVEIS na fila do Pilot, 0 em build (pilot vivo): " + _ids(1, 6) + "\n" in _o), (1, True))
+eq("main: a linha das paradas lista as 8 primeiras, cada uma com a sua lane",
+   "CONSTRUÍVEIS MAS PARADAS (9): " + _ids(1, 8, suf="(lane:small)") + "\n" in _o, True)
+eq("main: sem in_gate_count/kimi_lane_count no resultado, a linha de parked imprime 0 e 0",
+   "(já-construídas-no-gate: 0, esperando na faixa Kimi: 0)" in _o, True)
+eq("main: o cabecalho da fila cita a idade do snapshot (3min atras)", "dispatchable — snapshot 3min atrás): 9 total" in _o, True)
+eq("main: a consulta de in-flight pede texto capturado, 15 s e o argv do store",
+   _runs, [([_f.BD, "-C", "/hq", "list", "-l", "story:in-flight", "--json"], {"capture_output": True, "text": True, "timeout": 15})])
+_c, _o, _, _ = _main(_A(stuck=_stuck(2), buildable_count=2, in_gate_count=2, kimi_lane_count=4, snap_age_min=None))
+eq("main: in_gate_count 2 e kimi_lane_count 4 aparecem; sem snapshot o cabecalho nao tem nota de idade",
+   ("(já-construídas-no-gate: 2, esperando na faixa Kimi: 4)" in _o, "FILA DO PILOT (dispatchable): 3 total" in _o), (True, True))
+
+_c, _o, _, _ = _main(_A(from_dispatchable=False, total=7, buildable_count=7, stuck=_stuck(7, reason="30min"), snap_age_min=None))
+eq("main (fallback): 7 aprovadas paradas -> exit 1; a falha lista as 6 primeiras com o motivo de cada uma",
+   (_c, "7 bead(s) APROVADA(s) parada(s) em silêncio (pilot vivo, fallback story:approved): " + _ids(1, 6, suf=" (30min)") + "\n" in _o), (1, True))
+eq("main (fallback): sem _ok_reasons todos os baldes imprimem 0",
+   "em build agora (in-flight): 0   • held: 0   • mayor-reservada: 0   • recém-despachada: 0   • esperando na faixa Kimi: 0\n" in _o, True)
+eq("main (fallback): o total vem de total quando _total_approved falta", "APROVADAS (fallback story:approved — snapshot indisponível): 7 total" in _o, True)
+
+_H = _fresh().DELIVERY_STALL_HOURS
+_rows = ([{"id": "r%d" % i, "updated_at": _iso(300)} for i in range(1, 10)]
+         + [{"id": "t%d" % i, "updated_at": _iso((_H * 60 + 120) * 60)} for i in range(1, 9)]
+         + [{"id": "edge", "updated_at": _iso((_H * 60 + 1) * 60)}, {"id": "x-wisp-1", "updated_at": _iso(60)}])
+_c, _o, _, _ = _main(_A(parked_count=3), rows=_rows)
+eq("main: 9 em build (lista as 8 primeiras) e 9 parados (8 primeiros; o de +1 min do limite conta como parado)",
+   ("EM BUILD AGORA (real, todos os stores): 9 — " + _ids(1, 8, "HQ/r") + "\n" in _o,
+    "9 in-flight mas parado(s) > %.0fh sem atualização → aguardando humano, não building: %s\n" % (_H, _ids(1, 8, "HQ/t")) in _o),
+   (True, True))
+eq("main: ✅ com build ativo: 'Construindo 9 agora' lista 6 ids e a fila parqueada diz que ha build acima",
+   (_c, "Construindo 9 agora (" + _ids(1, 6, "HQ/r") + ") — a máquina ESTÁ produzindo, não ociosa.\n" in _o,
+    "fila dispatchable parqueada (mas há build ativo acima) (3 parked)." in _o), (0, True, True))
+_c, _o, _, _ = _main(_A(parked_count=3))
+eq("main: fila so de parked e nenhum build -> 'ocioso correto (3 parked)'", (_c, "→ ocioso correto (3 parked)." in _o), (0, True))
+_c, _o, _, _ = _main(_A(parked_count=1))
+eq("main: 1 parked e 0 construiveis (parked > 0 no limite) ja cai no texto da fila parqueada", "→ ocioso correto (1 parked)." in _o, True)
+for _name, _kw in (("0 construiveis e 0 parked", {}), ("2 construiveis e 3 parked", {"buildable_count": 2, "parked_count": 3}),
+                   ("fallback com 0 construiveis e 3 parked", {"from_dispatchable": False, "parked_count": 3})):
+    _c, _o, _, _ = _main(_A(**_kw))
+    eq("main ✅ %s: texto generico, sem 'Fila inflada'" % _name,
+       (_c, "Nenhuma construível parada em silêncio; gate fluindo" in _o, "Fila inflada" in _o), (0, True, False))
+
+for _g, _want in (({"active": ["m1"], "oldest_active_min": 30.4}, "GATE: 1 ativo(s) na fila (mais antigo na fila: 30 min), 0 parked"),
+                  ({"active": ["m1"], "oldest_active_min": None}, "GATE: 1 ativo(s) na fila (mais antigo na fila: ? min), 0 parked"),
+                  ({"active": []}, "GATE: 0 ativo(s) na fila, 0 parked"),
+                  ({"active": [], "last_pass_min": None}, "último merge —")):
+    _c, _o, _, _ = _main(_A(), g=dict(_G_OK, **_g))
+    eq("main: linha do GATE %r" % (_g,), _want in _o, True)
+
+_c, _o, _, _ = _main(_A(read_err=["r%d" % i for i in range(1, 10)], no_route=["n%d" % i for i in range(1, 10)]))
+eq("main: 9 bd show falhos e 9 sem rota -> exit 2 (INCERTO) com 8 ids em cada aviso",
+   (_c, "não consegui classificar 9 bead(s) (bd show falhou): " + _ids(1, 8, "r") + "\n" in _o,
+    "9 bead(s) com prefixo sem rota conhecida (fora de .beads/routes.jsonl e do fallback fixo wa-/ps-/ga-): "
+    + _ids(1, 8, "n") + "\n" in _o), (2, True, True))
+
+_stuck7 = _A(stuck=_stuck(7), buildable_count=7)
+for _mins, _code, _frag in ((5, 2, "sweep do Pilot AINDA EM VOO há 5min (dentro do orçamento de 15min) — aguardando conclusão antes de julgar stall: " + _ids(1, 6) + "\n"),
+                            (15, 2, "sweep do Pilot AINDA EM VOO há 15min (dentro do orçamento de 15min) — aguardando conclusão antes de julgar stall: " + _ids(1, 6) + "\n"),
+                            (16, 1, "(pilot vivo) [sweep em voo há 16min, acima do orçamento de 15min — tratando como stall, não espera]: " + _ids(1, 6) + "\n")):
+    _c, _o, _, _ = _main(_stuck7, log=[_logts(_mins * 60) + " [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ==="])
+    eq("main: sweep em voo ha %d min com 7 paradas -> exit %d e o aviso lista 6 ids" % (_mins, _code), (_c, _frag in _o), (_code, True))
+
+import shutil
+shutil.rmtree(_LW, ignore_errors=True)   # os arquivos do bloco acima nao sobram no TMPDIR
+
 print()
 print("RESULT: %d passed, %d failed" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
