@@ -14,7 +14,9 @@
 # HERMETISMO. Processos de brinquedo (um `bash fakejob-A.sh` num diretório temporário) levam TERM/KILL de verdade — nada além deles; a allowlist do teste é ancorada no diretório temporário DESTA instância,
 # então duas instâncias do selftest podem rodar ao mesmo tempo na máquina sem matar os toys uma da outra (S17). ps/aws/launchctl/df vêm de stubs ou de
 # D2_FREE_MB; a allowlist é a do teste (a real só é lida em modo --dry-run, com ps simulado); o df de verdade só roda em s_real_df (somente leitura). O launchctl de brinquedo, em STUB_LC_RUN, EXECUTA o comando
-# do `submit` (uma raiz do rfb de brinquedo em bash puro, sob $TMPDIR) com KeepAlive, e o `reap` mata o que sobrar. O pior que escreve em disco são alguns KB em $TMPDIR. Duração ~2 min.
+# do `submit` (uma raiz do rfb de brinquedo em bash puro, sob $TMPDIR) com KeepAlive, e o `reap` mata o que sobrar. Pid LIDO DE ARQUIVO (os .sup/.pid do launchctl de brinquedo, o toy.pid) só leva sinal se a linha de
+# comando dele carregar o diretório temporário DESTA instância (own_pid/kill_own; o stub exige ainda que o job seja filho do supervisor dele): um arquivo de pid velho, cujo número o macOS já deu a outro programa, não
+# leva KILL (S18); sem poder provar de quem é o pid, ninguém recebe sinal. O pior que escreve em disco são alguns KB em $TMPDIR. Duração ~2 min.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -34,16 +36,36 @@ eq()   { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (obtive '$2', esperava '
 has()  { case "$2" in *"$3"*) ok "$1" ;; *) bad "$1 (não achei '$3' em: $2)" ;; esac; }
 hasnt() { case "$2" in *"$3"*) bad "$1 (achei '$3' em: $2)" ;; *) ok "$1" ;; esac; }
 
-lc_cleanup() {  # mata o supervisor e o job que o stub-launchctl (modo STUB_LC_RUN) deixou de pé num cenário
-  local f p
-  for f in "$T"/case*/lc.log.sup "$T"/case*/lc.log.pid; do
-    [ -f "$f" ] || continue
-    p=$(cat "$f" 2>/dev/null); [ -n "$p" ] && kill -KILL "$p" 2>/dev/null
+# Identidade antes de sinal (S18). Um pid LIDO DE ARQUIVO pode já ser de outro programa: o macOS reaproveita pids em minutos (o espaço vai até 99999; medido no mini a 02/11, load ~90: ~650 pids/s = volta em ~2,5 min; o revisor
+# do gate mediu ~300 pids/s = ~5,5 min) e esta bateria dura mais que isso sob load. O $T é único (mktemp), então só um processo DESTA instância carrega "$T/" na linha de comando.
+# vazio (o ps não lista o pid: já morreu) → não é nosso, nada a sinalizar; falhou/ilegível (ps quebrado) → idem: o estado inerte é NÃO sinalizar, nunca "sinaliza assim mesmo".
+own_pid() {  # $1=pid → rc 0 = o pid vive E a linha de comando dele carrega o $T desta instância · 1 = não provei que é nosso
+  local c
+  [ -n "${1:-}" ] || return 1
+  c=$(ps -o command= -p "$1" 2>/dev/null) || return 1
+  case "$c" in *"$T/"*) return 0 ;; esac
+  return 1
+}
+kill_own() {  # $1=sinal $2=pid → sinaliza SÓ se own_pid provar; pid velho, reaproveitado ou ilegível não leva nada
+  own_pid "$2" && kill -"$1" "$2" 2>/dev/null
+  return 0
+}
+lc_cleanup() {  # termina o supervisor e o job que o stub-launchctl (modo STUB_LC_RUN) deixou de pé num cenário, sem sinal às cegas
+  local d f p
+  for d in "$T"/case*; do
+    rm -f "$d/lc.log.submitted"      # o supervisor para de relançar sozinho: não depende de pid algum
+    for f in "$d/lc.log.sup" "$d/lc.log.pid"; do
+      [ -f "$f" ] || continue
+      p=$(cat "$f" 2>/dev/null)
+      kill_own KILL "$p"             # só se o pid ainda for um processo DESTA instância
+      rm -f "$f"                     # cada arquivo de pid vale UMA varredura: a próxima reap não o relê (o pid pode ter mudado de dono)
+    done
   done
   return 0
 }
 reap() {
   local p
+  # os $JOBS são filhos DIRETOS deste shell e ainda não reapados (nenhum cenário dá wait neles antes do reap; o único `wait` solto, em r_reread, roda sem spawn): o kernel guarda o pid até o wait daqui, então o kill não erra de alvo
   for p in $JOBS; do kill -KILL "$p" 2>/dev/null; wait "$p" 2>/dev/null; done
   JOBS=""
   lc_cleanup
@@ -99,6 +121,13 @@ cat >"$T/stub-launchctl" <<'EOF'
 # STUB_LC_THROTTLE s depois, em vez dos ~10 s do launchd), até o `remove`; o `remove` termina o job com SIGTERM e para o relançamento. `list` mostra PID enquanto o job vive.
 # Estado ao lado do log: .submitted (o rótulo existe) · .pid (job vivo) · .sup (supervisor) · .started · .runs (uma linha por lançamento) · .status (rc do último).
 LOG="${STUB_LC_LOG:?}"
+own_job() {  # rc 0 = $LOG.pid é um job VIVO e FILHO do supervisor deste rótulo ($LOG.sup); o pid fica em JOBP. pid velho, reaproveitado ou ilegível (vazio ou ps quebrado) → 1: ninguém recebe sinal por causa dele
+  local sp pp
+  JOBP=$(cat "$LOG.pid" 2>/dev/null); sp=$(cat "$LOG.sup" 2>/dev/null)
+  [ -n "$JOBP" ] && [ -n "$sp" ] || return 1
+  pp=$(ps -o ppid= -p "$JOBP" 2>/dev/null | tr -d ' ')
+  [ -n "$pp" ] && [ "$pp" = "$sp" ]
+}
 case "${1:-}" in
   submit)
     { echo "--- submit"; printf '%s\n' "$@"; } >>"$LOG"
@@ -120,6 +149,7 @@ case "${1:-}" in
         [ -f "$LOG.submitted" ] || break
         sleep "${STUB_LC_THROTTLE:-1}"
       done
+      rm -f "$LOG.sup"      # o supervisor acabou: o pid dele não vale mais para ninguém
     ) >/dev/null 2>&1 &
     echo $! >"$LOG.sup"
     i=0; while [ ! -f "$LOG.started" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done      # como o launchd: o job já está de pé quando o submit volta
@@ -130,7 +160,7 @@ case "${1:-}" in
     if [ "$n" -lt "${STUB_LC_REMOVE_FAILS:-0}" ]; then echo $((n + 1)) >"$LOG.rmn"; exit 1; fi      # as primeiras STUB_LC_REMOVE_FAILS chamadas FALHAM (nada é removido)
     [ -f "$LOG.submitted" ] || exit 113      # rótulo desconhecido (já removido)
     rm -f "$LOG.submitted"
-    [ "${STUB_LC_RUN:-0}" = 1 ] && [ -f "$LOG.pid" ] && kill -TERM "$(cat "$LOG.pid")" 2>/dev/null
+    if [ "${STUB_LC_RUN:-0}" = 1 ] && own_job; then kill -TERM "$JOBP" 2>/dev/null; fi      # só o filho vivo do MEU supervisor; um .pid velho não leva TERM
     exit 0 ;;
   list)
     echo "--- list $*" >>"$LOG"
@@ -138,8 +168,8 @@ case "${1:-}" in
     [ -f "$LOG.submitted" ] || exit 113
     [ "${STUB_LC_MODE:-}" = listfail2 ] && exit 1     # quebra só DEPOIS do submit (o list de antes, que deu 113, passou)
     if [ "${STUB_LC_RUN:-0}" = 1 ]; then
-      if [ -f "$LOG.pid" ] && kill -0 "$(cat "$LOG.pid")" 2>/dev/null; then
-        printf '{\n\t"LastExitStatus" = 0;\n\t"PID" = %s;\n};\n' "$(cat "$LOG.pid")"
+      if own_job; then
+        printf '{\n\t"LastExitStatus" = 0;\n\t"PID" = %s;\n};\n' "$JOBP"
       else
         printf '{\n\t"LastExitStatus" = %s;\n};\n' $(( $(cat "$LOG.status" 2>/dev/null || echo 0) * 256 ))
       fi
@@ -673,8 +703,8 @@ r_stop_again() {  # a escada para de novo o job que ela mesma retomou (D2 --run:
   run_sut --resume
   eq "R21 retomou: rc 0" "$RC" 0
   local tp; tp=$(cat "$RFBROOT/toy.pid" 2>/dev/null)
-  [ -n "$tp" ] && kill -0 "$tp" 2>/dev/null; check $? "R21 pré-condição: o job de brinquedo está vivo (pid ${tp:-?})"
-  kill -TERM "$tp" 2>/dev/null
+  own_pid "$tp"; check $? "R21 pré-condição: o job de brinquedo está vivo e é deste selftest (pid ${tp:-?})"
+  kill_own TERM "$tp"      # toy.pid é arquivo de pid: só leva TERM se o pid ainda for o toy (linha de comando sob o $T)
   label_gone 10; check $? "R21 o job levou TERM e o rótulo SOME (o launchd não relança o que a escada acabou de parar)"
   sleep 3
   eq "R21 o job rodou UMA vez (não voltou sozinho)" "$(toy_runs)" 1
@@ -758,9 +788,38 @@ r_pending_unreadable() {  # o registro existe e não consigo LÊ-LO: rc 30, nunc
   chmod 644 "$D2_STATE"
 }
 
+s_pid_identity() {  # S18: pid LIDO DE ARQUIVO só leva sinal se provar ser desta instância (arquivo velho + pid reaproveitado por outro programa); e o que prova ainda leva (senão "nunca mata" passaria)
+  local foreign own out
+  newcase
+  sleep 300 & foreign=$!; JOBS="$JOBS $foreign"      # "outro programa": a linha de comando dele ("sleep 300") não carrega o $T desta instância
+  spawn "$T/fakejob-A.sh"; own=$JOBPID               # um processo DESTA instância
+  mkdir -p "$C/failps"; printf '#!/bin/bash\nexit 1\n' >"$C/failps/ps"; chmod +x "$C/failps/ps"
+  # lc_cleanup com o ps QUEBRADO: não consegui provar de quem são os pids → ninguém recebe sinal (inerte), os arquivos mesmo assim são consumidos
+  printf '%s\n' "$foreign" >"$C/lc.log.sup"; printf '%s\n' "$own" >"$C/lc.log.pid"; : >"$C/lc.log.submitted"
+  ( PATH="$C/failps:$PATH"; lc_cleanup ); sleep 0.3      # tempo de um KILL (se houvesse) chegar: sem isso o job_alive logo abaixo pode ver o alvo ainda vivo
+  job_alive "$foreign"; check $? "S18 ps quebrado: o pid de outro programa NÃO leva KILL"
+  job_alive "$own"; check $? "S18 ps quebrado: nem o nosso (não provei, não sinalizo: estado inerte)"
+  [ ! -e "$C/lc.log.sup" ] && [ ! -e "$C/lc.log.pid" ] && [ ! -e "$C/lc.log.submitted" ]; check $? "S18 ps quebrado: os arquivos foram consumidos e o rótulo some (o supervisor não relança)"
+  # lc_cleanup com o ps de verdade: o arquivo VELHO aponta para outro programa (.sup) e para o nosso (.pid)
+  printf '%s\n' "$foreign" >"$C/lc.log.sup"; printf '%s\n' "$own" >"$C/lc.log.pid"; : >"$C/lc.log.submitted"
+  lc_cleanup; sleep 0.3
+  job_alive "$foreign"; check $? "S18 o pid de OUTRO programa num arquivo de pid velho NÃO leva KILL"
+  job_alive "$own"; [ $? -ne 0 ]; check $? "S18 o pid que prova ser desta instância leva KILL (o teste não passa por 'nunca mata')"
+  [ ! -e "$C/lc.log.sup" ] && [ ! -e "$C/lc.log.pid" ]; check $? "S18 cada arquivo de pid vale UMA varredura (a próxima reap não o relê)"
+  lc_cleanup; job_alive "$foreign"; check $? "S18 uma 2ª varredura (a reap de depois de cada cenário) deixa o pid de fora em paz"
+  # o stub-launchctl: .pid aponta para um programa que NÃO é filho do supervisor (.sup) → `list` não o mostra como PID e `remove` não manda TERM
+  newcase; export STUB_LC_RUN=1
+  sleep 300 & foreign=$!; JOBS="$JOBS $foreign"      # outro "outro programa", vivo: o de cima pode já ter sido morto por uma implementação ruim da varredura
+  : >"$C/lc.log.submitted"; printf '%s\n' "$foreign" >"$C/lc.log.pid"; printf '%s\n' "$own" >"$C/lc.log.sup"      # o pai de $foreign é ESTE shell, não $own: o .pid não é filho do "supervisor"
+  job_alive "$foreign"; check $? "S18 stub: pré-condição: o pid de fora está vivo"
+  out=$("$T/stub-launchctl" list x 2>/dev/null)
+  hasnt "S18 stub: o list não mostra como PID de job o pid que não é filho do supervisor" "$out" '"PID"'
+  "$T/stub-launchctl" remove x; job_alive "$foreign"; check $? "S18 stub: o remove não manda TERM ao pid que não é filho do supervisor"
+}
+
 SCENARIOS="s_usage s_dry_run s_real_allowlist s_real_df s_recheck_unreadable s_stop_unproven s_stop_guard s_stop_ok s_stop_ambiguous s_stop_s3_down s_stubborn s_parent_guard s_df_unreadable s_ps_unreadable s_broad_regex s_allowlist_invalid s_state_unwritable s_lock s_isolation s_stop_resumed
 r_nothing r_hysteresis r_window r_launch_ok r_refused r_crash r_no_guess r_derive r_bad_rid r_too_old r_already_running r_plist_unreadable r_not_in_allowlist r_submit_fails r_lock r_start_record r_list_fails
-r_lifecycle r_stop_again r_stale_rc r_no_code r_list_fails_after r_rc_unclearable r_remove_fails_once r_reread r_pending_unreadable r_launchctl_abs"
+r_lifecycle r_stop_again r_stale_rc r_no_code r_list_fails_after r_rc_unclearable r_remove_fails_once r_reread r_pending_unreadable r_launchctl_abs s_pid_identity"
 
 SUT="$REAL"
 echo "=== disk-recovery-d2-heavy-jobs.selftest.sh ==="
