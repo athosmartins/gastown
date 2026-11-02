@@ -597,5 +597,75 @@ sessions "$(stub ga-ccc gate-reviewer-remote-adhoc-5555555555 asleep)" "$(printf
 reap $T0; reap $((T0+600)); reap $((T0+1200))
 check "casca dormindo ou já fechada: não fecha (a dormindo nem 'viva' é; a fechada nem entra)" "" "$(closed)"
 
+# ga-7n003iz: unidade em processo. O resto deste arquivo dirige o executável de ponta a ponta com gc/bd de mentira; aqui
+# run_cmd (texto, reap de 5 s), _by_template (rig/t e rig.t) e read_sessions (cada falha é (None, 0, motivo)) no valor exato.
+# Equivalentes: 185e0165d4 (errors="replace" já liga o modo texto do Popen, universal_newlines é redundante), b8f7a7b9a9 (held só é lido com sessões na lista),
+# 7cf10d9a72 (prev["desde"] <= now: no empate os dois lados dão o mesmo valor).
+cat > "$T/blk.py" <<'PY'
+import importlib.util, os, subprocess, sys
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location("hir", sys.argv[1])
+r = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(r)
+bad = []
+
+def chk(name, got, want):
+    if got != want:
+        bad.append(name)
+        print("FAIL %s: want %r got %r" % (name, want, got))
+
+# run_cmd: o que sai do comando volta como TEXTO; depois do kill do grupo o reap espera no maximo 5 s
+chk("run_cmd: stdout e stderr voltam como texto, nao como bytes",
+    r.run_cmd([sys.executable, "-c", "import sys; sys.stdout.write('ok'); sys.stderr.write('e')"], 20), (0, "ok", "e", None))
+
+class P:
+    pid, returncode, seen = 2 ** 22, None, []
+    def __init__(self, *a, **k):
+        pass
+    def communicate(self, timeout=None):
+        P.seen.append(timeout)
+        if len(P.seen) == 1:
+            raise subprocess.TimeoutExpired("x", timeout)
+        return "", ""
+
+popen, killpg = subprocess.Popen, os.killpg
+subprocess.Popen, os.killpg = P, lambda pid, sig: None
+try:
+    got = r.run_cmd(["x"], 7)
+finally:
+    subprocess.Popen, os.killpg = popen, killpg
+chk("run_cmd: estoura o tempo -> timeout; o reap depois do kill espera no maximo 5 s", (got, P.seen), ((None, "", "", "timeout"), [7, 5]))
+
+# _by_template: a familia por <x>/<t> e <x>.<t>, nao por <x>-<t>
+c = r.load_config({"GC_CITY_PATH": "/x"})
+chk("_by_template: exato, rig/t e rig.t casam; rig-t, None e numero nao",
+    [r._by_template(c, t) for t in ("dog-remote", "rig/dog-remote", "rig.dog-remote", "rig-dog-remote", None, 7)],
+    [True, True, True, False, False, False])
+
+# read_sessions: cada falha devolve (None, 0, motivo); a linha torta so e contada quando a leitura valeu
+real_run_cmd = r.run_cmd
+def rs(rc, out, why=None):
+    r.run_cmd = lambda argv, timeout: (rc, out, "", why)
+    return r.read_sessions(c)
+try:
+    chk("read_sessions: gc rc 1", rs(1, ""), (None, 0, "gc-falhou"))
+    chk("read_sessions: gc estourou o tempo", rs(None, "", "timeout"), (None, 0, "gc-timeout"))
+    chk("read_sessions: JSON ilegivel", rs(0, "{nope"), (None, 0, "json-ilegivel"))
+    chk("read_sessions: saida vazia", rs(0, "  "), (None, 0, "saida-vazia"))
+    chk("read_sessions: envelope com ok falso", rs(0, '{"ok": false, "sessions": []}'), (None, 0, "ok-falso"))
+    chk("read_sessions: sem a lista sessions", rs(0, '{"sessions": 5}'), (None, 0, "sem-lista-sessions"))
+    chk("read_sessions: 1 nossa aberta, 1 nossa fechada (fora), 1 linha torta (contada)",
+        rs(0, '{"sessions": [5, {"template": "dog-remote"}, {"template": "dog-remote", "closed": true}]}'),
+        ([{"template": "dog-remote"}], 1, None))
+finally:
+    r.run_cmd = real_run_cmd
+
+print("DONE %d" % len(bad))
+PY
+# vazio/falhou → sem a linha final 'DONE 0': vermelho, e as linhas FAIL do bloco aparecem logo abaixo
+BLK_OUT=$(python3 "$T/blk.py" "$EXE" 2>&1)
+check "unidade em processo: run_cmd, _by_template e read_sessions no valor exato" "DONE 0" "$(printf '%s\n' "$BLK_OUT" | tail -1)"
+printf '%s\n' "$BLK_OUT" | grep '^FAIL' | sed 's/^/    /'
+
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
