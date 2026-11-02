@@ -12,7 +12,7 @@ TRÊS ESTADOS (sempre): node = li tudo e há prova de que é código + teste que
 
 COMO DECIDE (a 1ª regra que casa vale; tudo é lido da bead, nada é gravado nela):
   1. entrada que não é um objeto de bead (JSON ilegível, sem id/título, texto grande demais)      -> unknown
-  2. etiqueta `node:mini` (decisão humana) ou tipo epic                                           -> mini
+  2. etiqueta `node:mini` (decisão humana), etiqueta `exec:manual` (um humano executa à mão; ga-qkc02kk) ou tipo epic -> mini
   3. DURAS (nem `node:ok` vence): (a) todo caminho de ARQUIVO citado na bead (forma dir/arq.ext, extensão da lista PATH_RE, maiúscula ou minúscula) passa pelo filtro REAL do rsync (um
      `rsync -n` sobre uma árvore temporária com os caminhos citados + 3 canários; canário errado = unknown) e pela lista mac-only, porque o nó simplesmente não tem o arquivo; caminho
      absoluto, `..`, `~/...`, `$VAR/...` ou fora do formato; mais de 40 caminhos; EXCEÇÃO (ga-2hd02v.3): um `.md` que o rsync não lista (docs/, DESIGN.md...) chega ao nó pelo ESPELHO git, que
@@ -28,9 +28,19 @@ COMO DECIDE (a 1ª regra que casa vale; tudo é lido da bead, nada é gravado ne
      docs/data_dictionary.md tem 38 telefones e 4 CPFs) segue a mesma regra como `evidencia-de-doc:<caminho>` — e NUNCA vai ao nó. Espelho ilegível não retém nada: o doc segue duro. Sem código citado, código fora do
      filtro, nome com cara de segredo e `.plist`/`.sql`/`.env` seguem duros como antes; telefone/CPF no texto (b) continua duro e vence a evidência. O dado em si continua sem ir ao nó: quem garante é o filtro do
      rsync + a varredura do espelho, que não mudam aqui. O token de evidência também sai do texto das MOLES (regra 4), do mais longo ao mais curto: `queue.db` citado não é `moles:banco-de-dados` e
-     `/Users/.../x.db` citado não é `moles:host-mac`; a palavra mole escrita em prosa ("banco", "token", "login") segue valendo.
-  4. MOLES (palavras que dizem "toca recurso vivo": banco real, credencial, host Mac): `node:ok` (decisão humana) as ignora e o motivo `moles-ignoradas` fica na resposta; sem
-     `node:ok`                                                                                      -> mini
+     `/Users/.../x.db` citado não é `moles:host-mac`.
+     ÂNCORA DERIVADA (ga-qkc02kk): a bead que cita SÓ dado/log (nenhum código citado) e cujo segurado inteiro seria evidência ganha o "código citado" que a regra 7 acharia — o que ela NOMEIA sem caminho ou que as irmãs tocaram
+     (anchor_code), pelos MESMOS filtros (rsync, mac-only). Com âncora o dado vira `info` (`evidencia-ancorada-em-derivado:N`) e a prova (teste) ainda é exigida adiante (regras 6-7). Sem âncora — nada derivado, derivado demais
+     (>10 arquivos), código que o nó não recebe (`ancora-derivada-fora-do-no`) ou leitura que falhou (`ancora-derivada-ilegivel:<motivo>`) — o dado segue duro. Telefone/CPF e só-no-Mac já são duros e impedem a tentativa.
+  4. MOLES (recurso vivo: banco real, credencial, host Mac) POR EVIDÊNCIA NO CÓDIGO (ga-qkc02kk). A palavra escrita na bead ("banco", "token", "osascript") é PROSA e só informa. O portão é o ÚLTIMO (depois da prova das regras
+     5-8): o `node` que a prova produz — menos o de `node:ok`, decisão humana que ignora as moles (`moles-ignoradas`, pela palavra) — é lido no CÓDIGO dos arquivos da prova em origin/main (`git show`, nunca a árvore de trabalho): o que
+     a bead cita, o que ela NOMEIA (regra 7a), o código que o teste citado importa (regra 8) e os testes. Python: só o código executável, por `ast` (docstring e comentário não contam); sh/js/ts e Python que não parseia: o texto sem as
+     linhas de comentário (mais largo). EVIDÊNCIA: (credencial) chamada ou argv do cofre (`secret`, `bw`), módulo do cofre, arquivo de credencial (.env, credentials*.json, token.json...); (banco-de-dados) caminho de produção fixado
+     (`shared/data/x.db`, `md:`, `~/`/`/Users/…/x.db`) e, fora de teste, nome de banco solto (`"queue.db"`); (host-mac) osascript/launchctl/security/adb, perfil do Chrome do Mac. NÃO são evidência: variável de ambiente com nome de token,
+     `sqlite3.connect(variavel)`, `import secrets` (stdlib), `/Users/…` sozinho, nome de banco solto num TESTE (ele cria o seu em tmp). TRÊS ESTADOS: leu e achou -> `moles:<slug>` -> mini (mesmo sem palavra); leu e não achou -> a palavra só
+     vai em `info` (`mole-so-em-prosa:<slug>`); NÃO consegui ler (git, arquivo > 1 MB: `mole-ilegivel:<motivo>`) ou nada que exista em origin/main para ler (tudo novo: `mole-sem-arquivo-lido`) -> volta a palavra e ela bloqueia, como antes.
+     Arquivo NOVO (ainda não está em origin/main) não soma evidência e não bloqueia, se ao menos UM existente foi lido (`mole-arquivo-novo:N`). Código que só as IRMÃS tocaram (regra 7b) é palpite: é lido e a evidência dele só INFORMA
+     (`mole-evidencia-irma:`), e se não der para lê-lo é só a nota `mole-irma-ilegivel`. Sem prova nenhuma o veredito é `unknown` (antes a palavra o fazia `mini`) e a palavra vai em `info` (`palavra-mole:<slug>`).
      INFORMATIVAS (produção/deploy, tela, lead, cliente, terreno, envio...): vocabulário do produto e da entrega, NÃO bloqueiam; vão para `info`, que o Pilot grava no jsonl da sombra
      para medir o acerto antes de ligar. MEDIDO (19/10, 400 beads WA fechadas): bloqueando por elas, 0 de 400 passavam; sem bloquear, ~4% citam teste + código sem caminho duro.
      Quem segura o resíduo é o que não depende de palavra: caminho pelo filtro real, telefone/CPF no texto, e o gate depois.
@@ -41,7 +51,10 @@ COMO DECIDE (a 1ª regra que casa vale; tudo é lido da bead, nada é gravado ne
      do arquivo de código sem a extensão (>=5 letras, nada genérico como utils/config), E cujo CONTEÚDO cita o módulo como palavra inteira (nome parecido sozinho não prova). Teste que pertence a um
      módulo de nome mais longo que também existe (test_bar_service_extra_* é de bar_service_extra, não de bar_service) não conta. O teste ainda tem de passar pelo filtro do rsync, fora da lista
      mac-only e fora do que a varredura de conteúdo do espelho segura, porque "teste que o nó tem" é o que vale. Nada é inferido para código que o texto não cita. Achou -> node, basis `derivado`
-     (`info`: teste-derivado:<código>=<teste>); mas se o texto tem palavra informativa de envio de WhatsApp (o freio de DERIVED_BLOCK_INFO; `dado-de-lead` saiu em ga-2hd02v.3.21) -> mini, `freio-derivado:<palavras>`.
+     6b TESTE IMPORTADOR (ga-qkc02kk): código SEM teste de nome ganha os testes de `tests/` que o IMPORTAM — `git grep -w <módulo>` acha candidatos (até 60) e só conta o `import` estático (Python por `ast`; JS por require/import relativo)
+     que resolve para O MESMO arquivo; citar o nome numa string ou comentário não conta; candidato que não parseia é pulado e contado (`teste-importador-nao-parseou:N`). Passa pelos mesmos filtros do teste de nome (rsync, mac-only, espelho) e o par
+     sai em `info` como `teste-importador:<código>=<teste>`. Só roda para código que não achou teste de nome; git/grep/leitura que falha -> unknown com `teste-derivado-ilegivel`.
+     Achou -> node, basis `derivado` (`info`: teste-derivado:<código>=<teste>); mas se o texto tem palavra informativa de envio de WhatsApp (o freio de DERIVED_BLOCK_INFO; `dado-de-lead` saiu em ga-2hd02v.3.21) -> mini, `freio-derivado:<palavras>`.
      Não achou -> unknown. Repo/git/espelho ilegível -> unknown com `info` `teste-derivado-ilegivel:<motivo>`; nunca vira node.
   7. CAMINHO DERIVADO (ga-2hd02v.3.20; só quando a bead NÃO cita nenhum arquivo de código — nome solto com extensão de código que não existe em lugar nenhum da árvore lida, o `part.py` de um script de
      diagnóstico, não conta como citado: `info` `caminho-solto-fora-da-arvore:<nome>`, ga-2hd02v.3.22; medido 30/10: 13 de 30 beads sondadas caíam em unknown `sem-prova-de-codigo-e-teste` porque o texto NOMEIA o módulo mas
@@ -67,8 +80,8 @@ COMO DECIDE (a 1ª regra que casa vale; tudo é lido da bead, nada é gravado ne
      Nada importado do repo -> unknown SEM nota (vazio é legítimo). Falha de leitura (repo, git show, teste que não parseia, rsync, mac-only) -> unknown com `info` `codigo-do-teste-ilegivel:<motivo>`; "falhou" nunca é "vazio" e nunca é node.
 
 CÓDIGOS DE SAÍDA: 0 node · 10 mini · 11 unknown · 2 uso. A linha de stdout é um JSON: {"verdict","basis","reasons":[...],"paths":[...],"tests":[...],"custo":{"ms","derivacao_ms","cache"},"info":[...]}; basis = label | text | derivado | "" (só o node tem).
-O QUE NÃO FAZ: não lê dado, não abre o nó, não toca o Dolt, não escreve na bead. Lê só stdin (o JSON do `bd show --json`), o filtro, a lista mac-only, (só com `.md` fora do rsync) o filtro que o espelho serve e (só com código citado sem teste citado) a árvore e o conteúdo dos TESTES do repo do WA em origin/main, por `git ls-tree`/`git grep`: nunca a árvore de trabalho; (só sem código citado, regra 7) a árvore de código do repo e o `git log` dos commits das beads irmãs; (só com teste citado e sem código, regra 8) o texto dos testes citados, por `git show` em REPO_REF. ESCREVE uma única coisa: o cache do `git log` das irmãs (WA_NODE_CACHE, padrão <cidade>/.gc/cache/wa-node-classify; escrita atômica, opcional: sem ele o classificador só fica mais lento).
-LIMITES: a exceção do espelho confia na varredura de conteúdo (>=20 telefones ou >=3 CPFs distintos por arquivo): lista pequena, nome, e-mail e CNPJ num `.md` passam; vale o mesmo resíduo do bloco 3b do filtro. É heurística de TEXTO sobre a bead; o texto pode omitir que o teste abre um banco. NÃO são extraídos: pasta sem arquivo (`data/`), arquivo sem nome (`.env`), extensão fora da lista, nome com
+O QUE NÃO FAZ: não lê dado, não abre o nó, não toca o Dolt, não escreve na bead. Lê só stdin (o JSON do `bd show --json`), o filtro, a lista mac-only, (só com `.md` fora do rsync) o filtro que o espelho serve e (só com código citado sem teste citado) a árvore e o conteúdo dos TESTES do repo do WA em origin/main, por `git ls-tree`/`git grep`: nunca a árvore de trabalho; (só sem código citado, regra 7) a árvore de código do repo e o `git log` dos commits das beads irmãs; (só com teste citado e sem código, regra 8) o texto dos testes citados, por `git show` em REPO_REF; (só quando há `node` com prova, regra 4) o texto dos arquivos da prova, por `git show` em REPO_REF, e (regra 6b) os testes que citam o módulo. ESCREVE uma única coisa: o cache do `git log` das irmãs (WA_NODE_CACHE, padrão <cidade>/.gc/cache/wa-node-classify; escrita atômica, opcional: sem ele o classificador só fica mais lento).
+LIMITES: a evidência das moles é heurística de TEXTO sobre o código dos arquivos da prova: não segue import em cadeia (um módulo limpo que importa outro que abre o banco passa; o teste vermelho no nó devolve a bead ao mini pelo gate), não vê `sqlite3.connect(variavel)` cujo valor vem de fora, nem evidência depois do 4000º caractere de UMA string; nome de banco solto é lido como banco de produção (pode ser um banco temporário do módulo: erra para o lado do mini). A exceção do espelho confia na varredura de conteúdo (>=20 telefones ou >=3 CPFs distintos por arquivo): lista pequena, nome, e-mail e CNPJ num `.md` passam; vale o mesmo resíduo do bloco 3b do filtro. É heurística de TEXTO sobre a bead; o texto pode omitir que o teste abre um banco. NÃO são extraídos: pasta sem arquivo (`data/`), arquivo sem nome (`.env`), extensão fora da lista, nome com
   sufixo (`x.py.bak` não vira `x.py`). Para esses a regra 3a não age; quem segura o dado é o filtro do rsync (o nó nunca o recebe) e, no caso de `.env`/`.db`, a palavra mole da regra 4. O resíduo cai no nó como teste vermelho e a bead volta ao mini pelo gate (custo, não vazamento:
   o dado não chega ao nó de qualquer jeito). A lista de palavras moles é deliberadamente larga (o vocabulário do WA é todo de lead/terreno): na dúvida a bead fica no mini, como hoje.
   A regra 8 prova que o teste citado IMPORTA o módulo, não que o módulo seja o que a bead quer mudar nem que o teste cubra a mudança; também não segue import em cadeia (o que o módulo importa), nem o `__init__.py` do pacote pai, nem carga dinâmica
@@ -173,6 +186,28 @@ except ValueError:
 SIBLING_TTL = 6 * 3600                                               # o cache dos arquivos das irmãs vale 6 h (vencido = recalcula; irmã nova que o cache não viu só faz derivar MENOS, nunca algo errado)
 CACHE_DIR = os.environ.get("WA_NODE_CACHE", os.path.join(HERE, "..", ".gc", "cache", "wa-node-classify"))
 COST = {"derivacao_ms": 0, "cache": "-"}                             # o que a regra 7 gastou nesta execução (vai em `custo` na saída): "-" sem consulta às irmãs, hit/miss/nao-gravou com
+PROOF = set()    # arquivos de CÓDIGO e TESTE em que a prova desta execução se apoia (citados e derivados): é neles que as moles procuram evidência (regra 4, ga-qkc02kk)
+PROOF_SOFT = set()   # código que só as IRMÃS tocaram (regra 7b): palpite de onde a bead mexe, não citação. É lido, mas a evidência dele só INFORMA (`mole-evidencia-irma`), não bloqueia
+DERIVED_SRC = {}     # código derivado -> origem ("nome:<x>" ou "irmas"), preenchido pela regra 7
+PROSE = []       # moles que só aparecem escritas na bead (palavra); informam, não bloqueiam quando a leitura dos arquivos de prova deu certo
+NOTES = []       # notas de `info` que as funções fundas (teste importador, âncora) deixam para o fim da resposta
+TEST_VIA = {}    # (código, teste) -> "importador" quando o teste veio da regra 6b (importa o módulo) e não do nome
+# regra 4 (moles por EVIDÊNCIA, ga-qkc02kk): "banco", "token", "osascript" escritos na bead são PROSA; o que decide se a bead depende de recurso vivo é o que o CÓDIGO dos arquivos de prova mostra. Lê-se o texto de origin/main
+# (`git show`, nunca a árvore de trabalho). Python: só o código executável, por `ast` (docstring e comentário não contam); o resto (sh/js/ts) e Python que não parseia: o texto sem as linhas de comentário (mais largo: na dúvida acha MAIS evidência).
+SCAN_EXT = ("py", "sh", "js", "mjs", "cjs", "ts")                    # extensões de que se lê evidência; .css/.html não têm o que ler
+# (sem teto de arquivos lidos: a prova já é limitada pelos tetos que existem — 40 caminhos citados, 100 testes derivados, 10 códigos derivados —, no pior caso ~150 `git show`, medido 2,3 s com a máquina carregada)
+MAX_STR_LEN = 4000                                                   # limite de custo do regex: de UMA string só os primeiros 4000 caracteres são lidos (dado embutido, SQL gigante). PONTO CEGO conhecido: um `.db`/`osascript` depois do 4000º caractere de uma mesma string não é visto
+MOLE_SLUGS = ("banco-de-dados", "credencial", "host-mac")
+MOLE_INFO_MAX = 6                                                    # pares slug=arquivo nomeados em `info`; o resto vira `mole-evidencia-mais:N`
+CRED_CLI = frozenset(("secret", "bw", "bws", "bitwarden"))           # argv do CLI do cofre: ["secret", "motherduck-token"] é o idioma do WA (26+20+8 ocorrências)
+CRED_CALL_RE = re.compile(r"^_*(?:get_|load_|read_|fetch_|resolve_)?secret$|^_*(?:bw|bws|bitwarden)(?:_\w+)?$", re.I)   # `_secret("x")`, `secret(...)`, `bw_get`; `secrets.token_hex` (stdlib) não casa
+CRED_MOD_RE = re.compile(r"(?:^|\.)(?:_?bitwarden\w*|keychain\w*|credentials?\w*|secret)(?:\.|$)", re.I)   # módulo do cofre/chaveiro; `secrets` (stdlib: números aleatórios) NÃO casa
+CRED_FILE_RE = re.compile(r"(?:^|[/\\])(?:\.env(?:\.[\w\-]+)?|credentials?[\w\-]*\.json|token\.json|client_secrets?[\w\-]*\.json|service[_\-]?account[\w\-]*\.json|[\w\-]+\.(?:pem|p12|pfx))$", re.I)   # abrir arquivo de credencial
+CRED_TEXT_RE = re.compile(r"\$\(\s*secret\s+\S|(?<![\w\-])secret\s+[\"'$\w][\w\-\"']*|\bbw\s+(?:get|unlock|login)\b|bitwarden|(?<![\w/])\.env\b|credentials?[\w\-]*\.json|token\.json|client_secrets?[\w\-]*\.json", re.I)   # texto de .sh/.js e de Python que não parseia
+HOST_RE = re.compile(r"\b(?:osascript|launchctl|plutil|pmset|pbcopy|pbpaste|caffeinate|screencapture)\b|Google Chrome|Chrome\.app|Application Support/Google/Chrome|/Applications/|LaunchAgents|LaunchDaemons|~/Library|remote-debugging-port|connect_over_cdp|\bbrew\s+(?:install|services|list)\b|\badb\s+(?:shell|devices|connect|push|pull|-s)\b")   # recurso do Mac do Athos que o nó não tem; `/Users/...` sozinho NÃO conta (é caminho-padrão, não recurso)
+HOST_ARGV = frozenset(("adb", "osascript", "launchctl", "security", "pmset", "plutil", "pbcopy"))   # string que é SÓ o executável (argv[0] de subprocess)
+DB_PINNED_RE = re.compile(r"shared/data/[^\s\"']*\.(?:db|sqlite3?|duckdb)\b|(?<![\w])md:[\w\-]*|/Users/[\w.\-]+/[^\s\"']*\.(?:db|sqlite3?|duckdb)\b|~/[^\s\"']*\.(?:db|sqlite3?|duckdb)\b|\.duckdb\b")   # caminho de banco de PRODUÇÃO fixado (vale em código e em teste)
+DB_BARE_RE = re.compile(r"(?<![\w\-])[\w\-][\w.\-]*\.(?:db|sqlite3?|duckdb)(?![\w])")   # nome de banco solto ("queue.db", "construtoras.db"): em código conta como banco de produção (heurística: o WA monta o caminho por pedaços, "shared" / "data" / "x.db"); em TESTE é o banco que o teste cria em tmp, por isso não conta lá
 
 # palavras do texto (sem acento, minúsculas). slug -> regex. Larga de propósito (ver LIMITES).
 SOFT = (
@@ -495,9 +530,14 @@ def repo_git_env():
     return env
 
 
+_TREE = []   # cache de uma execução da árvore de REPO_REF (lista com 0 ou 1 item)
+
+
 def repo_tree():
     """caminhos dos arquivos de REPO_REF no repo do WA (o que o espelho entrega ao nó). Ref de formato estranho, git ausente ou sem resposta no prazo, rc != 0 (repo ou ref inexistente) e árvore VAZIA
     (a real nunca é vazia) -> Unreadable: nunca "o repo não tem testes"."""
+    if _TREE:   # só uma leitura que DEU CERTO fica guardada (as moles, a âncora e as regras 6-8 pedem a mesma árvore); falha sobe de novo, nunca vira "árvore vazia"
+        return _TREE[0]
     if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_./\-]*", REPO_REF):
         raise Unreadable("repo-ref-invalida")
     try:
@@ -509,6 +549,7 @@ def repo_tree():
     files = [x for x in r.stdout.decode("utf-8", "replace").split("\0") if x]
     if not files:
         raise Unreadable("repo-vazio")
+    _TREE.append(files)
     return files
 
 
@@ -570,9 +611,17 @@ def derived_tests(code, globs):
                       if (rest == s or rest.startswith(s + "_")) and not any(rest == m or rest.startswith(m + "_") for m in longer))
         if mine:
             cand[p] = (s, mine[:MAX_DERIVED_PER_STEM])
-    if not cand:
+    # regra 6b (ga-qkc02kk): código SEM teste de nome ganha os testes que o IMPORTAM (import estático que resolve para o mesmo arquivo). vazio -> nenhum; leitura que falha sobe como Unreadable
+    imp = {}
+    for p in code:
+        s = module_stem(p) if p in present and p.rsplit(".", 1)[-1] in DERIVE_EXT else ""
+        if s and p not in cand and (p.endswith(".py") or p.rsplit(".", 1)[-1] in JS_TEST_EXT):
+            its = importer_tests(p, s, present)
+            if its:
+                imp[p] = (s, its)
+    if not cand and not imp:
         return {}
-    allc = sorted(set(t for _, ts in cand.values() for t in ts))[:MAX_DERIVED_TESTS]
+    allc = sorted(set(t for _, ts in list(cand.values()) + list(imp.values()) for t in ts))[:MAX_DERIVED_TESTS]
     sent = sent_by_filter(allc)
     keep = [t for t in allc if t in sent and not any(fnmatch.fnmatchcase(t, g) for g in globs)]
     if keep:
@@ -588,6 +637,12 @@ def derived_tests(code, globs):
         ok = [t for t in ts if t in hits]
         if ok:
             found[p] = ok
+    for p, (s, ts) in imp.items():   # o import já provou que o teste usa o módulo (o grep -w só achou o candidato): passa só pelos filtros do nó
+        ok = [t for t in ts if t in keep]
+        if ok:
+            found[p] = ok
+            for t in ok:
+                TEST_VIA[(p, t)] = "importador"
     return found
 
 
@@ -738,6 +793,9 @@ def judged_derived(found, tag, paths, tests, info, dinfo):
     blocked = [s for s in DERIVED_BLOCK_INFO if s in info]
     if blocked:
         return "mini", ["freio-derivado:" + ",".join(blocked)], paths, tests, info + dinfo
+    for c in found:                                                 # os arquivos de código e de teste desta prova são onde as moles procuram evidência (regra 4); código só das irmãs é palpite: lido, mas só informa
+        (PROOF_SOFT if DERIVED_SRC.get(c) == "irmas" else PROOF).add(c)
+    PROOF.update(t for ts in found.values() for t in ts)
     ntests = len(set(t for ts in found.values() for t in ts))
     return "node", ["%s:%d-teste(s)+%d-codigo(s)" % (tag, ntests, len(found))], paths, tests, info + dinfo
 
@@ -750,6 +808,7 @@ def path_derivation(b, text, paths, tests, info, extra):
     if not dcode:
         return None
     dpaths = sorted(dcode)
+    DERIVED_SRC.update(dcode)
     cpairs = ["caminho-derivado:%s=%s" % (dcode[p], p) for p in dpaths]
     extra += cpairs[:6] + (["caminho-derivado-mais:%d" % (len(cpairs) - 6)] if len(cpairs) > 6 else [])
     dsent = sent_by_filter(dpaths)
@@ -766,25 +825,25 @@ def path_derivation(b, text, paths, tests, info, extra):
         found = dict((p, list(tests)) for p in dpaths)
     else:
         found = derived_tests(dpaths, globs)
-        pairs = ["teste-derivado:%s=%s" % (c, t) for c in dpaths for t in found.get(c, [])]
+        pairs = ["%s:%s=%s" % ("teste-importador" if TEST_VIA.get((c, t)) else "teste-derivado", c, t) for c in dpaths for t in found.get(c, [])]
         extra += pairs[:6] + (["teste-derivado-mais:%d" % (len(pairs) - 6)] if len(pairs) > 6 else [])
     if not found:
         return None
     return judged_derived(found, "prova-caminho-derivado", paths, tests, info, extra)
 
 
-def repo_show(path):
+def repo_show(path, what="teste"):
     """texto de `path` em REPO_REF (`git show`; nunca a árvore de trabalho). git ausente ou sem resposta no prazo, rc != 0 (o caminho já foi visto na árvore, então não existir é falha) ou arquivo grande demais
     -> Unreadable: nunca "o teste está vazio". Um arquivo de 0 bytes lido com sucesso é texto vazio e é legítimo."""
     # vazio → texto "" (0 bytes lidos com sucesso: o teste não importa nada); falhou/ilegível → Unreadable (git ausente, prazo, rc != 0, arquivo grande), nunca "teste vazio"
     try:
         r = subprocess.run([GIT, "-C", REPO_DIR, "show", REPO_REF + ":" + path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=repo_git_env(), timeout=REPO_TIMEOUT)
     except (OSError, subprocess.TimeoutExpired):
-        raise Unreadable("teste-git-sem-resposta")
+        raise Unreadable(what + "-git-sem-resposta")
     if r.returncode != 0:
-        raise Unreadable("teste-git-rc-%d" % r.returncode)
+        raise Unreadable("%s-git-rc-%d" % (what, r.returncode))
     if len(r.stdout) > MAX_TEST_BYTES:
-        raise Unreadable("teste-grande")
+        raise Unreadable(what + "-grande")
     return r.stdout.decode("utf-8", "replace")
 
 
@@ -890,14 +949,199 @@ def import_derivation(tests, paths, info, extra):
     return judged_derived(found, "prova-codigo-derivado-do-teste", paths, tests, info, extra)
 
 
-def classify(b):
-    """(veredito, motivos, caminhos, testes, info)."""
+def py_exec_parts(src):
+    """(strings, calls, modules) do código EXECUTÁVEL de `src` (Python), sem docstring e sem comentário, por `ast.parse` (nada é executado). Não parseia -> None: quem chama cai no texto (mais largo)."""
+    # vazio (arquivo sem string nem chamada) -> três listas vazias, legítimo; falhou/ilegível (SyntaxError, ValueError, RecursionError, MemoryError) -> None, NUNCA listas vazias
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            tree = ast.parse(src)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
+    docs = set()
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and n.body:
+            f = n.body[0]
+            if isinstance(f, ast.Expr) and isinstance(f.value, ast.Constant) and isinstance(f.value.value, str):
+                docs.add(id(f.value))
+    strs, calls, mods = [], [], []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in docs:
+            strs.append(n.value[:MAX_STR_LEN])
+        elif isinstance(n, ast.Call):
+            f = n.func
+            nm = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else "")
+            if nm:
+                calls.append(nm)
+        elif isinstance(n, ast.Import):
+            mods += [a.name for a in n.names]
+        elif isinstance(n, ast.ImportFrom):
+            mods += [n.module or ""] + [(n.module or "") + "." + a.name for a in n.names]
+    return strs, calls, mods
+
+
+def strip_comment_lines(text):
+    """o texto sem as linhas que SÓ têm comentário (#, //, *, /*): serve para sh/js e para Python que não parseia. Não tira comentário no fim da linha (mais largo, na dúvida acha mais evidência)."""
+    return "\n".join(l for l in text.splitlines() if not l.strip().startswith(("#", "//", "*", "/*")))
+
+
+def scan_evidence(path, text, is_test):
+    """{slug: [o que achou]} das moles que o CÓDIGO de `path` mostra (regra 4, ga-qkc02kk). Só o que a lista do Mayor nomeia: (credencial) chamada/argv do cofre (`secret`, `bw`), módulo do cofre, arquivo de credencial
+    (.env, credentials*.json, token.json...); (banco-de-dados) caminho de banco de PRODUÇÃO — `shared/data/x.db`, `md:`, `~/`/`/Users/…/x.db` e, só fora de teste, nome de banco solto (`"queue.db"`: o WA monta o caminho por
+    pedaços); (host-mac) osascript/launchctl/Chrome do Mac/adb. Variável de ambiente com nome de token, `sqlite3.connect(variavel)` e `/Users/…` sozinho NÃO são evidência: o teste os substitui, ou é só caminho-padrão.
+    Vazio -> {}. Python que não parseia -> o texto sem linhas de comentário (mais largo). Nunca lê o disco: `text` é o que o `git show` devolveu."""
+    out = {}
+
+    def hit(slug, what):
+        out.setdefault(slug, [])
+        if what not in out[slug]:
+            out[slug].append(what[:48])
+
+    parts = py_exec_parts(text) if path.endswith(".py") else None
+    if parts is not None:
+        strs, calls, mods = parts
+        for c in calls:
+            if CRED_CALL_RE.match(c):
+                hit("credencial", c + "()")
+        for m in mods:
+            if CRED_MOD_RE.search(m):
+                hit("credencial", "import " + m)
+        for t in strs:
+            if t in CRED_CLI:
+                hit("credencial", "argv:" + t)
+            elif CRED_FILE_RE.search(t):
+                hit("credencial", CRED_FILE_RE.search(t).group(0).strip("/\\"))
+            if t in HOST_ARGV:
+                hit("host-mac", "argv:" + t)
+            else:
+                m = HOST_RE.search(t)
+                if m:
+                    hit("host-mac", m.group(0))
+            m = DB_PINNED_RE.search(t) or (None if is_test else DB_BARE_RE.search(t))
+            if m:
+                hit("banco-de-dados", m.group(0))
+        return out
+    blob = strip_comment_lines(text)
+    for rx, slug in ((CRED_TEXT_RE, "credencial"), (HOST_RE, "host-mac"), (DB_PINNED_RE, "banco-de-dados")):
+        m = rx.search(blob)
+        if m:
+            hit(slug, m.group(0).strip())
+    if not is_test and "banco-de-dados" not in out:
+        m = DB_BARE_RE.search(blob)
+        if m:
+            hit("banco-de-dados", m.group(0))
+    return out
+
+
+def mole_gate(proof, prose, soft_files=()):
+    """(motivos duros, info) das moles de uma bead que JÁ tem prova de código+teste (regra 4, ga-qkc02kk). As moles procuram EVIDÊNCIA no código dos arquivos de prova (citados e derivados), lidos em REPO_REF; a palavra
+    escrita na bead (`prose`) só informa quando a leitura deu certo. TRÊS ESTADOS: (1) leu e achou evidência -> `moles:<slug>` (mini), mesmo sem palavra; (2) leu e NÃO achou -> sem motivo, a palavra vai em `info`
+    (`mole-so-em-prosa:<slug>`); (3) NÃO consegui ler (git, arquivo grande demais) ou não havia arquivo nenhum que existisse em REPO_REF (tudo novo) -> volta a regra antiga, a palavra bloqueia
+    (`moles:<slug>` das palavras), e `info` diz por quê (`mole-ilegivel:<motivo>`, sempre, mesmo sem palavra; `mole-sem-arquivo-lido` quando tudo é novo e há palavra). "Não li" nunca vira "li e não achei". Arquivo NOVO (não está em REPO_REF) não tem o que ler: não soma evidência e não bloqueia, desde que ao menos UM arquivo
+    existente tenha sido lido (o nó só precisa construir e testar o arquivo novo contra fixtures; o que ele faria em produção é do mini, depois do merge)."""
+    files = sorted(f for f in proof if f.rsplit(".", 1)[-1] in SCAN_EXT)
+    fallback = ["moles:" + s for s in prose]
+    evsoft, softbad = {}, []
+    # vazio (nenhum arquivo de prova com extensão lida) -> sem base para dizer "não achei": volta a palavra; falhou/ilegível (árvore, git show, arquivo grande) -> volta a palavra + nota, nunca "sem evidência"
+    try:
+        tree = set(repo_tree())
+        ev, novos, nread = {}, [], 0
+        for f in files:
+            if f not in tree:
+                novos.append(f)
+                continue
+            text = repo_show(f, "arquivo")
+            nread += 1
+            for slug, whats in scan_evidence(f, text, bool(TEST_RE.search(f))).items():
+                ev.setdefault(slug, []).extend((f, w) for w in whats)
+        for f in sorted(x for x in soft_files if x not in proof and x in tree and x.rsplit(".", 1)[-1] in SCAN_EXT):   # palpite das irmãs: lê, mas a evidência só informa
+            # vazio (sem evidência) -> nada a informar; falhou/ilegível (git, arquivo grande) -> SÓ a nota `mole-irma-ilegivel`: um palpite que informa não pode, ao falhar, virar a palavra que barra
+            try:
+                soft_text = repo_show(f, "arquivo")
+            except Unreadable as e:
+                softbad.append("mole-irma-ilegivel:" + str(e))
+                continue
+            for slug, whats in scan_evidence(f, soft_text, bool(TEST_RE.search(f))).items():
+                evsoft.setdefault(slug, []).extend((f, w) for w in whats)
+    except Unreadable as e:
+        return fallback, ["mole-ilegivel:" + str(e)]   # `-ilegivel` é o que o Pilot soma em `leitura` (a leitura que FALHOU): sai MESMO sem palavra, porque "não consegui varrer" não pode parecer "varri e não achei"
+    if nread == 0:
+        return fallback, (["mole-sem-arquivo-lido"] if prose else [])
+    hard = ["moles:" + s for s in MOLE_SLUGS if s in ev]
+    pairs = ["mole-evidencia:%s=%s[%s]" % (s, f, w) for s in MOLE_SLUGS for f, w in ev.get(s, [])]
+    info = pairs[:MOLE_INFO_MAX] + (["mole-evidencia-mais:%d" % (len(pairs) - MOLE_INFO_MAX)] if len(pairs) > MOLE_INFO_MAX else [])
+    info += ["mole-so-em-prosa:" + s for s in prose if s not in ev]
+    soft_pairs = ["mole-evidencia-irma:%s=%s[%s]" % (s, f, w) for s in MOLE_SLUGS for f, w in evsoft.get(s, [])]
+    info += soft_pairs[:MOLE_INFO_MAX] + (["mole-evidencia-irma-mais:%d" % (len(soft_pairs) - MOLE_INFO_MAX)] if len(soft_pairs) > MOLE_INFO_MAX else [])
+    info += softbad[:MOLE_INFO_MAX]
+    if novos and (prose or ev or evsoft):   # só quando a regra das moles teve o que decidir; sem palavra e sem evidência o arquivo novo não muda nada e a resposta fica como era
+        info.append("mole-arquivo-novo:%d" % len(novos))
+    return hard, info
+
+
+MAX_IMPORTER_SCAN = 60   # testes que citam o módulo e são lidos para ver se IMPORTAM (ordem alfabética); acima disso o excesso nem é lido (menos prova, nunca prova errada)
+
+
+def importer_tests(code, stem, present):
+    """testes de `tests/` em REPO_REF que IMPORTAM `code` (regra 6b, ga-qkc02kk): a prova de "teste vizinho" para código sem teste de nome. O `git grep -w <módulo>` só acha candidatos; quem prova é o `import` estático
+    (Python por `ast`, JS por require/import relativo) que resolve para O MESMO arquivo — citar o nome numa string ou comentário não conta. Vazio (grep rc 1, ou nenhum candidato resolve) -> []; git/grep/leitura do
+    candidato que falha -> Unreadable (sobe: nunca "ninguém importa"); candidato que não parseia é PULADO e contado em NOTES (a regra só afirma o que provou)."""
+    try:
+        r = subprocess.run([GIT, "-C", REPO_DIR, "grep", "-l", "-w", "-F", "-z", "-e", stem, REPO_REF, "--", "tests"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=repo_git_env(), timeout=REPO_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        raise Unreadable("repo-grep-sem-resposta")
+    if r.returncode not in (0, 1):
+        raise Unreadable("repo-grep-rc-%d" % r.returncode)
+    pre = REPO_REF + ":"
+    hits = sorted(x[len(pre):] for x in r.stdout.decode("utf-8", "replace").split("\0") if x.startswith(pre))
+    if r.returncode == 0 and not hits:
+        raise Unreadable("repo-grep-ilegivel")
+    cand = [t for t in hits if t in present and (t.rsplit(".", 1)[-1] == "py" or t.rsplit(".", 1)[-1] in JS_TEST_EXT)][:MAX_IMPORTER_SCAN]
+    out, skipped = [], 0
+    for t in cand:
+        src = repo_show(t)   # falhou/ilegível -> Unreadable sobe (a regra devolve unknown com a nota)
+        try:
+            if t.endswith(".py"):
+                cands = [c for lvl, mod, names in py_imports(src) for c in py_candidates(t, lvl, mod, names)]
+            else:
+                cands = [c for m in JS_IMPORT_RE.finditer(src) for c in js_candidates(t, m.group(2))]
+        except Unreadable:
+            skipped += 1
+            continue
+        if code in cands:
+            out.append(t)
+    if skipped:
+        NOTES.append("teste-importador-nao-parseou:%d" % skipped)
+    return out[:MAX_DERIVED_PER_STEM]
+
+
+def anchor_code(b, text):
+    """({código derivado: origem}, notas) para a bead que só cita DADO (ga-qkc02kk): o código que ela nomeia sem caminho ou que as irmãs tocaram (derive_code, a mesma derivação da regra 7: nomes e irmãs) serve de âncora para o dado citado virar
+    evidência — sem âncora a bead só tem dado e nada a construir. O código ancorado passa pelos MESMOS filtros do citado (rsync, mac-only); um que o nó não recebe -> sem âncora e o dado segue duro. Nada derivado ->
+    ({}, notas); leitura que falha (repo, git, cache, rsync, mac-only) -> Unreadable sobe e quem chama deixa o dado duro, com nota."""
+    dcode, notes = derive_code(b, text)
+    if not dcode:
+        return {}, notes
+    dpaths = sorted(dcode)
+    dsent = sent_by_filter(dpaths)
+    globs = mac_only_globs()
+    if any(p not in dsent or any(fnmatch.fnmatchcase(p, g) for g in globs) for p in dpaths):
+        return {}, notes + ["ancora-derivada-fora-do-no"]
+    return dcode, notes
+
+
+def classify_core(b):
+    """(veredito, motivos, caminhos, testes, info) SEM o portão das moles (regra 4): `classify` o aplica ao `node` que sair daqui. Deixa em PROSE as moles escritas na bead e em PROOF os arquivos da prova."""
     labels = labels_of(b)
     text = bead_text(b)
     ntext = norm(text.replace(REPO_ABS, ""))   # o prefixo absoluto do repo não é dependência de host (o caminho em si é julgado por extract_paths); outro /Users/... continua mole
     info =[slug for slug, rx in INFO_RE if rx.search(ntext)]
     if "node:mini" in labels:
         return "mini", ["etiqueta-node:mini"], [], [], info
+    # `exec:manual` = um HUMANO executa à mão (criar chave em console, aparelho físico): um construtor do nó nunca faz isso. O Pilot já não roteia essas beads, mas a palavra mole ("chave", "secret") era o que as
+    # segurava aqui por acaso (wa-zmxywv.35.3.4: «Athos: criar a chave da API da Anthropic» virou `node` quando a palavra deixou de barrar). A trava passa a ser explícita e não depende de vocabulário.
+    if "exec:manual" in labels:
+        return "mini", ["etiqueta-exec:manual"], [], [], info
     if b.get("issue_type") == "epic":
         return "mini", ["epic"], [], [], info
     paths, hard, odd = extract_paths(text)
@@ -930,6 +1174,18 @@ def classify(b):
     # duro, "não consegui ler" nunca vira "retido" nem evidência. Nome com cara de segredo (secretish) e código/.plist/.sql/.env fora do filtro nunca são evidência.
     blocked += [("caminho-fora-do-formato", o, o) for o in odd]
     has_code = any(c not in ghosts for c in code)
+    # ÂNCORA DERIVADA (ga-qkc02kk, b): a bead só cita DADO/LOG que o nó não recebe (9 das 43 P0/P1 do WA, medido na ga-t05a1z9 em 01/11) e nenhum código. O código que ela nomeia sem caminho ou que as irmãs tocaram (anchor_code, mesma
+    # derivação da regra 7, pelos mesmos filtros) faz o papel do "código citado": o dado vira evidência, e a prova (teste) ainda é exigida adiante. Só tenta quando TUDO que está segurado seria evidência e não há outra
+    # razão dura (telefone/CPF, só-no-Mac, caminhos demais). vazio (nada derivado) -> o dado segue duro; falhou/ilegível (repo, git, rsync, mac-only) -> o dado segue duro + nota `ancora-derivada-ilegivel`, nunca âncora.
+    if not has_code and blocked and not hard and all(("doc" if p in withheld and not secretish(p) else evidence_kind(p)) for _, p, _ in blocked):
+        try:
+            anc, anotes = anchor_code(b, text)
+        except Unreadable as e:
+            anc, anotes = {}, ["ancora-derivada-ilegivel:" + str(e)]
+        info += anotes
+        if anc:
+            has_code = True
+            info.append("evidencia-ancorada-em-derivado:%d" % len(anc))
     evid = []
     for why_hard, p, tok in blocked:
         kind = "doc" if p in withheld and not secretish(p) else evidence_kind(p)
@@ -948,12 +1204,13 @@ def classify(b):
     for tok in sorted(set(norm(t.replace(REPO_ABS, "")) for _, _, t in evid), key=len, reverse=True):
         soft_text = soft_text.replace(tok, " ")
     soft = [slug for slug, rx in SOFT_RE if rx.search(soft_text)]
+    PROSE[:] = soft   # a palavra mole é PROSA (ga-qkc02kk): quem decide é a evidência no código da prova, aplicada por `classify` ao `node` que sair daqui (mole_gate)
     override = "node:ok" in labels
-    if soft and not override:
-        return "mini", ["moles:" + s for s in soft], paths, tests, info
     why = ["moles-ignoradas:" + ",".join(soft)] if soft else []
     if override:
         return "node", why + ["etiqueta-node:ok"], paths, tests, info
+    PROOF.update(code)    # o que a bead cita é o que as moles leem (um nome solto que não existe na árvore cai em "arquivo novo" no portão)
+    PROOF.update(tests)
     if tests and code:
         return "node", ["prova-no-texto:%d-teste(s)+%d-codigo" % (len(tests), len(code))], paths, tests, info
     # regra 6: código citado e nenhum teste citado -> o teste que o repo já tem para esse código.
@@ -965,7 +1222,7 @@ def classify(b):
         except Unreadable as e:
             note = ["teste-derivado-ilegivel:" + str(e)]
     if found:
-        pairs = ["teste-derivado:%s=%s" % (c, t) for c in code for t in found.get(c, [])]
+        pairs = ["%s:%s=%s" % ("teste-importador" if TEST_VIA.get((c, t)) else "teste-derivado", c, t) for c in code for t in found.get(c, [])]
         dinfo = pairs[:6] + (["teste-derivado-mais:%d" % (len(pairs) - 6)] if len(pairs) > 6 else [])
         return judged_derived(found, "prova-teste-derivado", paths, tests, info, dinfo)
     # regra 7: NENHUM código citado -> o código que a bead nomeia sem caminho (módulo/tela/daemon) ou que as irmãs tocaram, pelos mesmos filtros do citado.
@@ -993,6 +1250,27 @@ def classify(b):
         if res:
             return res
     return "unknown", ["sem-prova-de-codigo-e-teste"], paths, tests, info + note + extra
+
+
+def classify(b):
+    """(veredito, motivos, caminhos, testes, info). As moles (regra 4) são o ÚLTIMO portão: classify_core acha a prova; se o veredito é `node` (menos por `node:ok`, que é decisão humana e ignora as moles), o
+    mole_gate lê o código dos arquivos de prova e só `moles:<slug>` com EVIDÊNCIA manda ao mini. Sem prova nenhuma o veredito segue `unknown` (antes uma palavra mole o fazia `mini`) e as palavras vão em
+    `info` como `palavra-mole:<slug>`. PII, freio de envio, caminho duro e `node:mini` são decididos antes e não mudam."""
+    PROOF.clear()
+    PROOF_SOFT.clear()
+    DERIVED_SRC.clear()
+    del PROSE[:]
+    del NOTES[:]
+    TEST_VIA.clear()
+    v, why, paths, tests, info = classify_core(b)
+    if v == "node" and "etiqueta-node:ok" not in why:
+        hard, notes = mole_gate(PROOF, list(PROSE), PROOF_SOFT)
+        if hard:
+            return "mini", hard, paths, tests, info + NOTES + notes
+        info = info + notes
+    elif v == "unknown" and PROSE:
+        info = info + ["palavra-mole:" + s for s in PROSE]
+    return v, why, paths, tests, info + NOTES
 
 
 def main(argv):

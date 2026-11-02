@@ -15,6 +15,11 @@
 #   pelos MESMOS filtros do citado (fora do filtro / só no Mac = mini; mais de 10 = nenhum); a regra 7 e a 5 vencem a 8; teste novo, sem import do repo, import dinâmico ou apoio de teste = unknown SEM nota; git show/parse/repo que falham = unknown COM a nota.
 #   · EVIDÊNCIA ≠ DEPENDÊNCIA (ga-t05a1z9): banco/log/json citado como PROVA vira `info` (evidencia-de-dado:/evidencia-de-doc:) e não barra, mas só com >=1 código citado que o filtro deixa passar; segue duro dado sem
 #   código, código fora do filtro, .plist/.sql/.env, nome com cara de segredo (português também) e telefone/CPF; absoluto/~/$HOME de dado também é evidência; o token sai do texto das moles (do mais longo ao mais curto).
+#   · MOLES POR EVIDÊNCIA (ga-qkc02kk, regra 4): a palavra mole na bead é prosa e só informa; o código dos arquivos de prova (lido em origin/main) é que barra. Três estados: leu e achou (nome de banco solto, caminho fixado, argv/chamada do cofre,
+#   osascript/launchctl/security, perfil do Chrome) -> mini mesmo SEM palavra; leu e não achou (docstring/comentário, connect(variável), env de token, `import secrets`, /Users/… sozinho, banco solto em TESTE) -> a palavra vai em info;
+#   não consegui ler (repo, arquivo > 1 MB) ou tudo é novo -> a palavra volta a barrar, com a nota. Código só das irmãs é palpite (informa); o que a bead NOMEIA barra; node:ok, exec:manual, PII e freio de envio não mudam.
+#   · TESTE IMPORTADOR (regra 6b): código sem teste de nome ganha os testes que o IMPORTAM (import estático que resolve para o mesmo arquivo; string/comentário não conta; não parseia é pulado e contado; git que falha = unknown com a nota).
+#   · ÂNCORA DO DADO (regra 3): a bead que cita só dado e NOMEIA o módulo é ancorada pelo código derivado (mesmos filtros); sem âncora/fora do nó/leitura que falha o dado segue duro; PII e item que não é evidência impedem a tentativa.
 # CONTROLE NEGATIVO: cada mutante abaixo troca UMA linha do classificador numa cópia e o caso designado tem de reprovar; mutante que sobrevive reprova esta bateria. Um mutante só vale se o
 #   ORIGINAL passa o mesmo caso no mesmo ambiente e se ele não morre por causa do ambiente (ver as 3 regras acima de mk_mutant); caso e mutante de rsync usam stubs que só o mutante separa do original.
 # COMO RODAR: bash scripts/wa-node-classify.selftest.sh   (macOS /bin/bash 3.2 e Linux). Pesado o bastante para ir ao nó: scripts/mbp-run.sh --repo hq scripts/wa-node-classify.selftest.sh
@@ -62,6 +67,8 @@ expect "node: palavras do produto (lead, deploy, tela) só informam" "$(DESC 'li
 expect "node: telefone sintético (cauda repetida) não conta como dado" "$(DESC 'lib/x.py e tests/test_x.py usam +55 31 99999-9999 como exemplo')" 0 '"verdict": "node"'
 # ---- mini
 expect "mini: etiqueta node:mini vence node:ok" "$(labels "$GOOD" '["node:ok","node:mini"]')" 10 'etiqueta-node:mini'
+expect "mini: etiqueta exec:manual (um humano executa à mão) - nem a prova de código+teste a leva ao nó (ga-qkc02kk)" "$(labels "$GOOD" '["exec:manual"]')" 10 '"reasons": \["etiqueta-exec:manual"\]'
+expect "mini: exec:manual também vence node:ok (decisão de executar à mão não é palavra mole)" "$(labels "$GOOD" '["node:ok","exec:manual"]')" 10 'etiqueta-exec:manual'
 expect "mini: epic" "$(field "$GOOD" issue_type '"epic"')" 10 '"reasons": \["epic"\]'
 expect "mini: banco .db citado SEM código (o filtro segura; evidência exige código citado, ga-t05a1z9)" "$(DESC 'o teste tests/test_x.py mede queue.db')" 10 'caminho-fora-do-filtro:queue\.db'
 expect "mini: banco citado em PROSA ainda é mole, mesmo com o .db virando evidência (ga-t05a1z9)" "$WITHDB" 10 'moles:banco-de-dados'
@@ -301,6 +308,46 @@ wf tests/test_imp_sete.py "$(for i in 01 02 03 04 05 06 07; do printf 'from lib.
 wf tests/test_imp_head.py "import os"   # em origin/main não importa nada; no HEAD (2º commit) importa imp_alpha: o nó recebe origin/main
 wf tests/test_imp_js.cjs $'const a = require(\'../lib/imp_js_mod.js\');\nconst d = require("../lib/imp_js_dir");\nconst fs = require(\'fs\');\nconst npm = require(\'imp_pacote_npm\');'; wf tests/test_imp_esm.mjs "import y from '../lib/imp_js_esm.mjs';"
 { printf '# '; head -c 1100000 /dev/zero | tr '\0' x; printf '\n'; } > "$RP/tests/test_imp_grande.py"   # acima do teto de 1 MB de leitura
+# moles por EVIDÊNCIA (ga-qkc02kk, regra 4), teste IMPORTADOR (regra 6b) e âncora do dado (regra 3): um arquivo de mentira para cada estado. mole_clean só tem as palavras em docstring/comentário e conecta a uma VARIÁVEL (nada disso é
+# evidência); mole_db/mole_pin/mole_cred/mole_credfn/mole_host/mole_secarg/mole_shhost/mole_jshost/mole_broken mostram o que CONTA (nome de banco solto, caminho fixado, argv do cofre, chamada _secret, osascript, security, launchctl) e
+# mole_stdsec/mole_envtok/mole_users/mole_shclean/mole_brokencm o que NÃO conta (`import secrets` da stdlib, env de token, /Users/… sozinho, comentário). O teste de mole_tbare tem "queue.db" solto (teste cria banco em tmp: não conta); o de mole_tpin fixa o caminho de produção.
+wf lib/mole_clean.py $'"""Abre queue.db com o secret do Bitwarden (so aqui, na docstring)."""\nimport sqlite3\n# secret("x") e osascript so em comentario\ndef abre(db):\n    return sqlite3.connect(db)'
+wf tests/test_mole_clean.py $'import sqlite3\nfrom lib.mole_clean import abre\nDB = "queue.db"\ndef test_x(tmp_path):\n    abre(str(tmp_path / DB))'
+wf lib/mole_db.py $'import os\nDB = os.path.join("shared", "data", "queue.db")'; wf tests/test_mole_db.py $'from lib.mole_db import DB'
+wf lib/mole_pin.py $'P = "shared/data/x.db"'; wf tests/test_mole_pin.py $'from lib.mole_pin import P'
+wf lib/mole_cred.py $'import subprocess\ndef tok():\n    return subprocess.run(["secret", "motherduck-token"])'; wf tests/test_mole_cred.py $'from lib.mole_cred import tok'
+wf lib/mole_credfn.py $'def _secret(n):\n    return n\nTOK = _secret("x")'; wf tests/test_mole_credfn.py $'from lib.mole_credfn import TOK'
+wf lib/mole_stdsec.py $'import secrets\nX = secrets.token_hex(8)'; wf tests/test_mole_stdsec.py $'from lib.mole_stdsec import X'
+wf lib/mole_envtok.py $'import os\nT = os.environ.get("WHAPI_TOKEN")'; wf tests/test_mole_envtok.py $'from lib.mole_envtok import T'
+wf lib/mole_host.py $'import subprocess\nsubprocess.run(["osascript", "-e", "x"])'; wf tests/test_mole_host.py $'from lib.mole_host import subprocess'
+wf lib/mole_secarg.py $'import subprocess\nsubprocess.run(["security", "find-generic-password"])'; wf tests/test_mole_secarg.py $'from lib.mole_secarg import subprocess'
+wf lib/mole_users.py $'HOME = "/Users/athos/x"'; wf tests/test_mole_users.py $'from lib.mole_users import HOME'
+wf lib/mole_shclean.sh $'#!/bin/sh\n# launchctl so no comentario\necho oi'; wf tests/test_mole_shclean.py $'mole_shclean'
+wf lib/mole_shhost.sh $'#!/bin/sh\nlaunchctl list'; wf tests/test_mole_shhost.py $'mole_shhost'
+wf lib/mole_jshost.js $'const cp = require(\'child_process\');\ncp.execSync(\'osascript -e x\');'; wf tests/test_mole_jshost.cjs $'mole_jshost'
+wf lib/mole_broken.py $'def (:\nDB = "queue.db"'; wf tests/test_mole_broken.py $'mole_broken'                    # Python que não parseia: lê o texto (mais largo) e acha queue.db
+wf lib/mole_brokencm.py $'def (:\n# queue.db so em comentario'; wf tests/test_mole_brokencm.py $'mole_brokencm'     # idem, mas o texto só tem comentário: sem evidência
+wf lib/mole_tbare.py $'X = 1'; wf tests/test_mole_tbare.py $'from lib.mole_tbare import X\nDB = "queue.db"'
+wf lib/mole_tpin.py $'X = 1'; wf tests/test_mole_tpin.py $'from lib.mole_tpin import X\nDB = "/Users/athos/shared/data/queue.db"'
+wf lib/mole_big.py "# x"; { printf '# '; head -c 1100000 /dev/zero | tr '\0' x; printf '\n'; } > "$RP/lib/mole_big.py"; wf tests/test_mole_big.py $'mole_big'   # acima do teto de 1 MB de leitura: ilegível
+wf lib/mole_tbare2.py $'X = 1'; wf tests/test_mole_tbare2.py $'def (:\nDB = "queue.db"\nmole_tbare2'   # teste que não parseia: texto, e o nome solto no TESTE continua sem valer
+wf lib/mole_credfile.py $'P = "/etc/app/credentials_prod.json"'; wf tests/test_mole_credfile.py $'mole_credfile'
+wf lib/mole_md.py $'CON = "md:analytics"'; wf tests/test_mole_md.py $'mole_md_x'   # (o teste não cita o módulo: a evidência é a do código, não a prova)
+wf lib/mole_chrome.py $'PROFILE = "Library/Application Support/Google/Chrome/Default"'; wf tests/test_mole_chrome.py $'mole_chrome'
+wf lib/impt_macmod.py $'# impt_macmod'; wf tests/test_impt_mac_x.py $'from lib.impt_macmod import x'   # o único teste que importa impt_macmod é só-no-Mac (macs-impt.txt)
+wf lib/mole_sibdb.py $'P = "shared/data/y.db"'; wf tests/test_mole_sibdb.py $'mole_sibdb'
+gw add lib/mole_sibdb.py tests/test_mole_sibdb.py && gw commit -q -m "feat(wa-molp1.1): mole_sibdb" || bad "commit da irma do mole nao montado"
+wf lib/mole_sibbig.py "# x"; { printf '# '; head -c 1100000 /dev/zero | tr '\0' x; printf '\n'; } > "$RP/lib/mole_sibbig.py"; wf tests/test_mole_sibbig.py $'mole_sibbig'
+gw add lib/mole_sibbig.py tests/test_mole_sibbig.py && gw commit -q -m "feat(wa-molp2.1): mole_sibbig" || bad "commit da irma grande do mole nao montado"   # wa-molp2.2 herda um palpite que NÃO dá para ler (> 1 MB)   # wa-molp1.2 herda mole_sibdb pelas irmãs (palpite: só informa)
+# teste IMPORTADOR (regra 6b): impt_target só tem teste que o IMPORTA (nome sem relação); impt_ghost só é CITADO por um teste (string, sem import); impt_jsx é requerido por um teste .cjs; impt_unparse só tem um teste que não parseia
+wf lib/impt_target.py $'# impt_target'; wf tests/test_other_area.py $'from lib.impt_target import x'
+wf lib/impt_ghost.py $'# impt_ghost'; wf tests/test_mentions_ghost.py $'# impt_ghost\nX = "impt_ghost"'
+wf lib/impt_jsx.js $'// impt_jsx'; wf tests/area_js.cjs $'const m = require(\'../lib/impt_jsx.js\');'
+wf lib/impt_unparse.py $'# impt_unparse'; wf tests/test_broken_area.py $'def (:\n# impt_unparse'
+# âncora do dado (regra 3): a bead cita só queue.db e NOMEIA o módulo. anchor_mod é limpo; anchor_out mora em shared/ (o nó não recebe); anchor_db tem "queue.db" no código
+wf lib/anchor_mod.py $'# anchor_mod'; wf tests/test_anchor_mod.py $'anchor_mod'
+wf shared/anchor_out.py $'# anchor_out'; wf tests/test_anchor_out.py $'anchor_out'
+wf lib/anchor_db.py $'D = "queue.db"'; wf tests/test_anchor_db.py $'anchor_db'
 gw add -A && gw commit -q -m 1 && gw update-ref refs/remotes/origin/main HEAD || bad "repo de mentira do WA não montado"
 wf tests/test_late_mod.py "late_mod"; wf tests/test_imp_head.py "from lib.imp_alpha import x"; gw add -A && gw commit -q -m 2   # o teste de late_mod só existe no HEAD, não em origin/main
 git_ok=$(gw rev-parse --verify -q refs/remotes/origin/main >/dev/null && gw ls-tree -r --name-only origin/main | grep -c 'test_foo_parser'); [ "$git_ok" = 3 ] && ok "repo de mentira do WA montado (origin/main tem 3 testes de foo_parser; o HEAD tem um a mais em late_mod)" || bad "repo de mentira do WA errado ($git_ok)"
@@ -351,7 +398,7 @@ expect "freio: envio no texto manda ao mini" "$(DESC 'Corrigir lib/foo_parser.py
 expect "freio: lead e envio juntos: só o envio freia (e é o único motivo)" "$(DESC 'Corrigir lib/foo_parser.py: o lead recebe o envio duplicado')" 10 '"reasons": \["freio-derivado:envio-whatsapp"\]'
 expect "freio: palavras informativas que NÃO são da lista (deploy, tela) não bloqueiam a prova derivada" "$(DESC 'Corrigir lib/foo_parser.py no deploy da tela')" 0 '"basis": "derivado"'
 expect "freio: sem prova derivada o lead no texto não muda o unknown (continua não sei, não vira mini)" "$(DESC 'ajustar lib/orfa_unica.py; o lead some')" 11 'sem-prova-de-codigo-e-teste'
-expect "derivado: palavra mole (banco) ainda vence" "$(DESC 'Corrigir lib/foo_parser.py que abre um sqlite')" 10 'moles:banco-de-dados'
+expect "derivado: palavra mole (banco) SEM evidência no código só informa (ga-qkc02kk; a evidência é que barra, ver a seção das moles)" "$(DESC 'Corrigir lib/foo_parser.py que abre um sqlite')" 0 'prova-teste-derivado.*mole-so-em-prosa:banco-de-dados'
 expect "derivado: caminho duro (código fora do filtro) ainda vence" "$(DESC 'Corrigir lib/foo_parser.py e data/helper.py')" 10 'caminho-fora-do-filtro:data/helper\.py'
 expect "derivado: .db citado como prova NÃO tira a prova derivada (ga-t05a1z9), e fica registrado" "$(DESC 'Corrigir lib/foo_parser.py e queue.db')" 0 '"basis": "derivado".*evidencia-de-dado:queue\.db'
 expect "derivado: telefone no texto ainda vence" "$(DESC 'Corrigir lib/foo_parser.py (31) 98876-5432')" 10 '"reasons": \["dado-no-texto"\]'
@@ -440,7 +487,7 @@ expect "backup: o commit da irmã tocou o vivo E a cópia -> só o vivo entra" "
 # palavras duras/moles e freios valem como sempre
 expect "caminho-freio: lead no texto NÃO segura mais a prova derivada (ga-2hd02v.3.21) -> node, com a origem do caminho em info" "$(DESC 'revisar ficha_donos: o lead some da lista')" 0 '"verdict": "node", "basis": "derivado".*"info": \["dado-de-lead", "caminho-derivado:nome:ficha_donos=lib/ficha_donos\.py"'
 expect "caminho-freio: envio no texto manda ao mini" "$(DESC 'revisar ficha_donos antes de enviar a mensagem')" 10 '"reasons": \["freio-derivado:envio-whatsapp"\]'
-expect "caminho: palavra mole (banco) ainda vence" "$(DESC 'revisar ficha_donos que abre um sqlite')" 10 'moles:banco-de-dados'
+expect "caminho: palavra mole (banco) SEM evidência no código só informa (ga-qkc02kk)" "$(DESC 'revisar ficha_donos que abre um sqlite')" 0 'prova-caminho-derivado.*mole-so-em-prosa:banco-de-dados'
 expect "caminho: telefone no texto ainda vence" "$(DESC 'revisar ficha_donos (31) 98876-5432')" 10 '"reasons": \["dado-no-texto"\]'
 expect "caminho: node:ok continua dando basis label (a regra 7 nem roda)" "$(labels "$(DESC 'revisar ficha_donos')" '["node:ok"]')" 0 '"basis": "label"'
 # falhou/ilegível: unknown COM a nota, nunca node e nunca o mesmo resultado do vazio
@@ -528,7 +575,7 @@ expect "mac-only: o teste importa um módulo só do Mac -> mini" "$(T8 tests/tes
 unset WA_NODE_MAC_ONLY
 expect "freio: envio no texto manda ao mini (a prova é mais fraca que o teste+código citados)" "$(DESC 'Corrigir o envio da mensagem; teste em tests/test_imp_a.py')" 10 '"reasons": \["freio-derivado:envio-whatsapp"\]'
 expect "freio: lead/terreno no texto NÃO freia" "$(DESC 'Corrigir o lead do terreno; teste em tests/test_imp_a.py')" 0 "$C8_OK"
-expect "mole: palavra de banco no texto ainda vence" "$(DESC 'Corrigir o sqlite; teste em tests/test_imp_a.py')" 10 'moles:banco-de-dados'
+expect "mole: palavra de banco no texto, com o código que o teste importa SEM evidência, só informa (ga-qkc02kk)" "$(DESC 'Corrigir o sqlite; teste em tests/test_imp_a.py')" 0 'prova-codigo-derivado-do-teste.*mole-so-em-prosa:banco-de-dados'
 expect "duro: telefone no texto ainda vence" "$(DESC 'Corrigir o caso (31) 98876-5432; teste em tests/test_imp_a.py')" 10 '"reasons": \["dado-no-texto"\]'
 expect "ordem: nome snake_case que a regra 7 deriva (ficha_donos) vence a regra 8" "$(DESC 'Corrigir ficha_donos; teste em tests/test_imp_a.py')" 0 '"reasons": \["prova-caminho-derivado:'
 expect "ordem: teste + código citados -> a regra 5 (basis text); a 8 nem roda" "$(DESC 'Corrigir lib/foo_parser.py; teste em tests/test_imp_a.py')" 0 '"basis": "text".*prova-no-texto:1-teste\(s\)\+1-codigo'
@@ -553,6 +600,73 @@ expect "r7 sem pai: sem irmãs para ler a regra 7 não falha, e a 8 corre (o git
 # teste citado que a regra 8 não lê (novo nesta bead, ausente de origin/main) não conta no N-teste(s) e é nomeado em info
 expect "r8: teste citado que não foi lido (novo) é nomeado em info; o motivo conta só o que provou" "$(DESC 'Corrigir o caso de borda; testes em tests/test_imp_a.py e tests/test_imp_novo.py')" 0 "$C8_OK"'1-teste\(s\)\+1-codigo\(s\).*"codigo-do-teste:tests/test_imp_a\.py=lib/imp_alpha\.py", "teste-nao-lido:tests/test_imp_novo\.py"\]\}$'
 expect "r8: mais de 3 testes não lidos -> 3 nomeados e o resto contado (teste-nao-lido-mais)" "$(DESC 'Corrigir o caso de borda; testes em tests/test_imp_a.py, tests/test_n1.py, tests/test_n2.py, tests/test_n3.py e tests/test_n4.py')" 0 "$C8_OK"'1-teste\(s\)\+1-codigo\(s\).*"teste-nao-lido:tests/test_n1\.py", "teste-nao-lido:tests/test_n2\.py", "teste-nao-lido:tests/test_n3\.py", "teste-nao-lido-mais:1"\]\}$'
+export WA_NODE_REPO="$T/wa-repo-ausente" WA_NODE_MIRROR="$T/espelho-ausente"
+
+# ---- moles por EVIDÊNCIA (ga-qkc02kk, regra 4): a palavra mole escrita na bead é PROSA; quem decide é o CÓDIGO dos arquivos de prova, lido em origin/main. Três estados: leu e achou -> `moles:` (mesmo sem palavra); leu e não achou -> a
+# palavra só informa (`mole-so-em-prosa:`); NÃO consegui ler / nada existente para ler -> volta a palavra (`mole-ilegivel:` / `mole-sem-arquivo-lido`). node:ok, PII, freio de envio e node:mini seguem como eram.
+export WA_NODE_REPO="$RP" WA_NODE_MIRROR="$T/mirror-ok"
+ME='"verdict": "node", "basis": "derivado"'
+expect "mole: palavras de banco/credencial/host SEM evidência no código (docstring e comentário não contam; connect(variável) não conta) NÃO barram: node + info" "$(DESC 'ajustar lib/mole_clean.py que abre um sqlite com o token e roda osascript')" 0 "$ME.*mole-so-em-prosa:banco-de-dados\", \"mole-so-em-prosa:credencial\", \"mole-so-em-prosa:host-mac"
+expect "mole: prova no texto (código+teste citados) também passa pelo portão: sem evidência, a palavra só informa (e o nome solto \"queue.db\" no TESTE não é banco de produção)" "$(DESC 'lib/mole_clean.py abre um sqlite; tests/test_mole_clean.py')" 0 '"verdict": "node", "basis": "text".*mole-so-em-prosa:banco-de-dados'
+expect "mole: evidência vence SEM palavra nenhuma - nome de banco solto no código (\"queue.db\", o WA monta o caminho por pedaços)" "$(DESC 'ajustar lib/mole_db.py')" 10 'moles:banco-de-dados.*mole-evidencia:banco-de-dados=lib/mole_db\.py\[queue\.db\]'
+expect "mole: evidência - caminho de produção fixado (shared/data/x.db)" "$(DESC 'ajustar lib/mole_pin.py')" 10 'moles:banco-de-dados.*\[shared/data/x\.db\]'
+expect "mole: evidência - argv do cofre (\"secret\")" "$(DESC 'ajustar lib/mole_cred.py')" 10 'moles:credencial.*mole-evidencia:credencial=lib/mole_cred\.py\[argv:secret\]'
+expect "mole: evidência - chamada _secret(...)" "$(DESC 'ajustar lib/mole_credfn.py')" 10 'moles:credencial.*\[_secret\(\)\]'
+expect "mole: evidência - osascript no argv" "$(DESC 'ajustar lib/mole_host.py')" 10 'moles:host-mac.*mole-evidencia:host-mac=lib/mole_host\.py\[argv:osascript\]'
+expect "mole: evidência - \"security\" sozinho no argv (só a lista de executáveis pega)" "$(DESC 'ajustar lib/mole_secarg.py')" 10 'moles:host-mac.*\[argv:security\]'
+expect "mole: evidência em .sh (texto, sem as linhas de comentário) - launchctl" "$(DESC 'ajustar lib/mole_shhost.sh')" 10 'moles:host-mac.*mole_shhost\.sh\[launchctl\]'
+expect "mole: evidência em .js - osascript" "$(DESC 'ajustar lib/mole_jshost.js')" 10 'moles:host-mac.*mole_jshost\.js\[osascript\]'
+expect "mole: Python que não parseia lê o TEXTO (mais largo) e acha o banco" "$(DESC 'ajustar lib/mole_broken.py')" 10 'moles:banco-de-dados.*mole_broken\.py\[queue\.db\]'
+expect "mole: caminho de produção FIXADO no teste (/Users/…/queue.db) também é evidência" "$(DESC 'ajustar lib/mole_tpin.py')" 10 'moles:banco-de-dados.*tests/test_mole_tpin\.py'
+expect_not "mole: \`import secrets\` (stdlib, números aleatórios) NÃO é cofre" "$(DESC 'ajustar lib/mole_stdsec.py')" 0 'moles:|mole-evidencia'
+expect_not "mole: variável de ambiente com nome de token NÃO é evidência (o teste a substitui)" "$(DESC 'ajustar lib/mole_envtok.py')" 0 'moles:|mole-evidencia'
+expect_not "mole: \`/Users/…\` sozinho NÃO é recurso do host (é caminho-padrão)" "$(DESC 'ajustar lib/mole_users.py')" 0 'moles:|mole-evidencia'
+expect_not "mole: .sh que só cita launchctl em COMENTÁRIO não tem evidência" "$(DESC 'ajustar lib/mole_shclean.sh')" 0 'moles:|mole-evidencia'
+expect_not "mole: Python que não parseia e só tem comentário não tem evidência" "$(DESC 'ajustar lib/mole_brokencm.py')" 0 'moles:|mole-evidencia'
+expect_not "mole: nome de banco solto no TESTE (o teste cria o seu em tmp) NÃO conta" "$(DESC 'ajustar lib/mole_tbare.py')" 0 'moles:|mole-evidencia'
+expect "mole: node:ok é decisão humana e continua ignorando as moles (mesmo com evidência no código e com a palavra no texto)" "$(labels "$(DESC 'ajustar lib/mole_db.py que abre um sqlite')" '["node:ok"]')" 0 '"basis": "label".*moles-ignoradas:banco-de-dados'
+expect "mole: evidência - arquivo de credencial (credentials_prod.json)" "$(DESC 'ajustar lib/mole_credfile.py')" 10 'moles:credencial.*credentials_prod\.json'
+expect "mole: evidência - conexão MotherDuck (md:...)" "$(DESC 'ajustar lib/mole_md.py e tests/test_mole_md.py')" 10 'moles:banco-de-dados.*\[md:analytics\]'
+expect "mole: evidência - perfil do Chrome do Mac" "$(DESC 'ajustar lib/mole_chrome.py')" 10 'moles:host-mac.*Application Support/Google/Chrome'
+expect_not "mole: nome de banco solto num TESTE que não parseia (texto) também não conta" "$(DESC 'ajustar lib/mole_tbare2.py')" 0 'moles:|mole-evidencia'
+# três estados: não consegui ler / nada para ler -> a palavra volta a valer (como antes), e a resposta diz por quê
+export WA_NODE_REPO="$T/wa-repo-ausente"
+expect "mole: repo ilegível + palavra -> a palavra vale (mini) e a leitura que falhou é nomeada" "$(DESC 'lib/mole_clean.py abre um sqlite; tests/test_mole_clean.py')" 10 'moles:banco-de-dados.*"mole-ilegivel:repo-git-rc-128"'
+expect "mole: repo ilegível SEM palavra -> node como antes, mas o info NÃO esconde que a varredura não rodou (\"não li\" != \"li e não achei\")" "$(DESC 'lib/mole_clean.py e tests/test_mole_clean.py')" 0 '"verdict": "node", "basis": "text".*"mole-ilegivel:repo-git-rc-128"'
+export WA_NODE_REPO="$RP"
+expect "mole: todos os arquivos da prova são NOVOS + palavra -> não há o que ler, a palavra vale" "$(DESC 'lib/novo_zz.py abre um sqlite; tests/test_novo_zz.py')" 10 'moles:banco-de-dados.*"mole-sem-arquivo-lido"'
+expect "mole: um arquivo existente limpo + um NOVO + palavra -> node (o novo não tem o que ler e não bloqueia; o nó o constrói contra fixtures)" "$(DESC 'lib/mole_clean.py e lib/novo_zz.py abrem um sqlite; tests/test_mole_clean.py')" 0 '"verdict": "node", "basis": "text".*mole-so-em-prosa:banco-de-dados", "mole-arquivo-novo:1"'
+expect "mole: arquivo grande demais para ler (> 1 MB) + palavra -> a palavra vale, com a nota" "$(DESC 'lib/mole_big.py abre um sqlite; tests/test_mole_big.py')" 10 'moles:banco-de-dados.*"mole-ilegivel:arquivo-grande"'
+expect "mole: arquivo grande demais SEM palavra -> node, com a nota de que não foi lido" "$(DESC 'lib/mole_big.py e tests/test_mole_big.py')" 0 '"verdict": "node".*"mole-ilegivel:arquivo-grande"'
+expect "mole: palavra mole SEM nenhuma prova de código+teste fica unknown (antes era mini) e a palavra vai em info" "$(DESC 'revisar o banco de dados do painel')" 11 'sem-prova-de-codigo-e-teste.*"palavra-mole:banco-de-dados"'
+# código que só as IRMÃS tocaram é palpite de onde a bead mexe: a evidência nele INFORMA, não bloqueia; o que a bead NOMEIA bloqueia
+expect "mole: evidência em código derivado só das irmãs (palpite) informa e não barra" "$(DESCI wa-molp1.2 'corrigir o caso de borda')" 0 'prova-caminho-derivado.*mole-evidencia-irma:banco-de-dados=lib/mole_sibdb\.py\[shared/data/y\.db\]'
+expect "mole: palpite das irmãs que NÃO dá para ler (> 1 MB) só vira NOTA: um palpite que informa não vira a palavra que barra ao falhar" "$(DESCI wa-molp2.2 'corrigir o caso de borda que abre um sqlite')" 0 'prova-caminho-derivado.*mole-so-em-prosa:banco-de-dados", "mole-irma-ilegivel:arquivo-grande"'
+expect_not "mole: ...e esse palpite não vira \`moles:\`" "$(DESCI wa-molp1.2 'corrigir o caso de borda')" 0 'moles:'
+expect "mole: evidência em código que a bead NOMEIA (mole_db) bloqueia" "$(DESC 'ajustar mole_db quando vem vazio')" 10 'moles:banco-de-dados.*mole-evidencia:banco-de-dados=lib/mole_db\.py'
+# as travas de exposição não mudam: freio de envio vale também para a prova pelo teste IMPORTADOR
+expect "freio: envio de WhatsApp ainda manda ao mini na prova pelo teste importador" "$(DESC 'ajustar lib/impt_target.py e o envio por whatsapp')" 10 'freio-derivado:envio-whatsapp'
+expect "pii: telefone no texto segue duro mesmo com a âncora derivada" "$(DESC 'Medido em queue.db (31) 98876-5432; ajustar anchor_mod quando vem vazio')" 10 'caminho-fora-do-filtro:queue\.db.*dado-no-texto'
+# ---- teste IMPORTADOR (regra 6b, ga-qkc02kk): código citado SEM teste de nome ganha os testes de tests/ que o IMPORTAM (import estático que resolve para o mesmo arquivo)
+expect "importador: o teste de nome sem relação que IMPORTA o módulo é a prova (basis derivado, par nomeado como teste-importador)" "$(DESC 'ajustar lib/impt_target.py')" 0 "$ME, \"reasons\": \[\"prova-teste-derivado:1-teste\(s\)\+1-codigo\(s\)\"\].*\"teste-importador:lib/impt_target\.py=tests/test_other_area\.py\""
+expect "importador: teste que só CITA o nome numa string/comentário (sem import) não prova nada" "$(DESC 'ajustar lib/impt_ghost.py')" 11 'sem-prova-de-codigo-e-teste'
+expect "importador: require relativo em teste .cjs também prova" "$(DESC 'ajustar lib/impt_jsx.js')" 0 "$ME.*\"teste-importador:lib/impt_jsx\.js=tests/area_js\.cjs\""
+expect "importador: candidato que não parseia é PULADO e contado (a regra só afirma o que provou)" "$(DESC 'ajustar lib/impt_unparse.py')" 11 'sem-prova-de-codigo-e-teste.*"teste-importador-nao-parseou:1"'
+expect "importador: pela regra 7 (módulo NOMEADO, sem caminho) o par também sai como teste-importador" "$(DESC 'ajustar impt_target quando vem vazio')" 0 "$ME.*\"teste-importador:lib/impt_target\.py=tests/test_other_area\.py\""
+printf '# so comentario\ntests/test_impt_mac*.py\n' > "$T/macs-impt.txt"
+export WA_NODE_MAC_ONLY="$T/macs-impt.txt"; expect "importador: o único teste que importa é só-no-Mac -> sem prova (o nó não o tem): unknown" "$(DESC 'ajustar lib/impt_macmod.py')" 11 'sem-prova-de-codigo-e-teste'; unset WA_NODE_MAC_ONLY
+stub git-grep-quebra 'for a in "$@"; do [ "$a" = grep ] && exit 2; done; exec git "$@"'
+export WA_NODE_GIT="$T/git-grep-quebra"; expect "importador: git grep que falha -> unknown COM a nota (\"não consegui\" != \"ninguém importa\")" "$(DESC 'ajustar lib/impt_target.py')" 11 'sem-prova-de-codigo-e-teste.*"teste-derivado-ilegivel:repo-grep-rc-2"'; unset WA_NODE_GIT
+# ---- âncora do dado (regra 3, ga-qkc02kk): a bead cita SÓ dado/log que o nó não recebe e NOMEIA o módulo -> o código derivado (pelos mesmos filtros) ancora o dado como evidência
+expect "âncora: dado citado + módulo nomeado e limpo -> node; o dado vira evidência e a prova ainda é exigida" "$(DESC 'Medido em queue.db; ajustar anchor_mod quando vem vazio')" 0 "$ME.*\"evidencia-ancorada-em-derivado:1\".*\"evidencia-de-dado:queue\.db\""
+expect_not "âncora: só dado e NADA derivável segue duro (sem âncora inventada)" "$(DESC 'Medido em queue.db: 3 linhas sem dono')" 10 'evidencia-ancorada'
+expect "âncora: só dado e nada derivável -> mini pelo caminho" "$(DESC 'Medido em queue.db: 3 linhas sem dono')" 10 'caminho-fora-do-filtro:queue\.db'
+expect "âncora: módulo nomeado que o nó NÃO recebe (shared/) não ancora: o dado segue duro" "$(DESC 'Medido em queue.db; ajustar anchor_out quando vem vazio')" 10 'caminho-fora-do-filtro:queue\.db.*ancora-derivada-fora-do-no'
+expect "âncora: módulo ancorado com evidência no código -> as moles barram" "$(DESC 'Medido em queue.db; ajustar anchor_db quando vem vazio')" 10 'moles:banco-de-dados.*evidencia-ancorada-em-derivado:1'
+expect_not "âncora: se algo segurado NÃO é evidência (plist de LaunchAgents), nem se tenta ancorar" "$(DESC 'Medido em queue.db e ~/Library/LaunchAgents/x.plist; ajustar anchor_mod quando vem vazio')" 10 'evidencia-ancorada'
+expect "âncora: ...e o dado segue duro junto com o plist" "$(DESC 'Medido em queue.db e ~/Library/LaunchAgents/x.plist; ajustar anchor_mod quando vem vazio')" 10 'caminho-fora-do-filtro:queue\.db.*caminho-fora-do-formato'
+export WA_NODE_REPO="$T/wa-repo-ausente"
+expect "âncora: repo ilegível -> o dado segue duro e a nota diz que a âncora não foi lida" "$(DESC 'Medido em queue.db; ajustar anchor_mod quando vem vazio')" 10 'caminho-fora-do-filtro:queue\.db.*"ancora-derivada-ilegivel:repo-git-rc-128"'
 export WA_NODE_REPO="$T/wa-repo-ausente" WA_NODE_MIRROR="$T/espelho-ausente"
 
 # ---- o classificador não deixa resíduo e só aceita stdin
@@ -612,6 +726,7 @@ mutant() { # mutant <nome> <trecho original> <trecho novo> <json> <rc> <regex> [
 }
 mutant_pre() { MUTANT_PRE="$1"; shift; mutant "$@"; MUTANT_PRE=""; }   # mutant_pre '<comando>' <args do mutant>: o comando roda antes de CADA execução (original e mutante)
 mutant sem-node-mini     '"node:mini" in labels'                       'False'                                  "$(labels "$GOOD" '["node:mini"]')" 10 'etiqueta-node:mini'
+mutant sem-exec-manual     'if "exec:manual" in labels:'                  'if False:'                              "$(labels "$GOOD" '["exec:manual"]')" 10 'etiqueta-exec:manual'
 mutant sem-epic          'b.get("issue_type") == "epic"'               'False'                                  "$(field "$GOOD" issue_type '"epic"')" 10 '"epic"'
 mutant sem-pii           'if has_pii(json.dumps'                       'if False and has_pii(json.dumps'        "$(DESC 'lib/x.py tests/test_x.py (31) 98876-5432')" 10 'dado-no-texto'
 mutant pii-sem-cauda     'len(set(d[-8:])) > 3'                        'len(set(d[-8:])) >= 0'                  "$(DESC 'lib/x.py tests/test_x.py +55 31 99999-9999')" 0 '"verdict": "node"'
@@ -622,7 +737,6 @@ mutant sem-canario       'if any(c not in sent for c in ok_canary) or any(c in s
 mutant sem-canario-codigo 'if any(c not in sent for c in ok_canary) or any(' 'if False or any('                          "$GOOD" 11 'canario-errado' "WA_NODE_RSYNC=$T/rs-mudo"
 mutant sem-canario-segredo 'or any(c in sent for c in no_canary):'    'or False:'                              "$GOOD" 11 'canario-errado' "WA_NODE_RSYNC=$T/rs-tudo"
 mutant rc-ignorado       'if r.returncode != 0:'                       'if False:'                              "$GOOD" 11 'rsync-rc-23' "WA_NODE_RSYNC=$T/rs-parcial"
-mutant sem-moles         'if soft and not override:'                   'if False:'                              "$(DESC 'lib/x.py abre um sqlite; tests/test_x.py')" 10 'moles:banco-de-dados'
 mutant label-ignorada    'override = "node:ok" in labels'              'override = False'                       "$(labels "$NOPROOF" '["node:ok"]')" 0 'label'
 mutant prova-frouxa      'if tests and code:'                          'if tests or True:'                      "$NOPROOF" 11 'sem-prova'
 mutant unreadable-node   'v, why, paths, tests, info = "unknown", ["nao-consegui:"' 'v, why, paths, tests, info = "node", ["nao-consegui:"' 'isto nao e json' 11 'json-ilegivel'
@@ -701,8 +815,8 @@ mutant codigo-basis-text         '"prova-caminho-derivado:", "prova-codigo-deriv
 mutant codigo-regra7-primeiro    'if res is None and tests and not r7_failed:' 'if tests and not r7_failed:'                             "$(DESC 'Corrigir ficha_donos; teste em tests/test_imp_a.py')" 0 '"reasons": \["prova-caminho-derivado:' "$C8"
 mutant codigo-falha-vira-vazio   'extra.append("codigo-do-teste-ilegivel:" + str(e))' 'pass'                  "$(T8M tests/test_imp_a.py)" 11 'codigo-do-teste-ilegivel:teste-git-rc-2' "$C8 WA_NODE_GIT=$T/git-show-quebra"
 mutant codigo-parse-vira-vazio   'raise Unreadable("teste-nao-parseia")' 'return []'                         "$(T8M tests/test_imp_quebrado.py)" 11 'codigo-do-teste-ilegivel:teste-nao-parseia' "$C8"
-mutant codigo-show-rc-ignorado   'raise Unreadable("teste-git-rc-%d" % r.returncode)' 'pass'                  "$(T8M tests/test_imp_a.py)" 11 'codigo-do-teste-ilegivel:teste-git-rc-2' "$C8 WA_NODE_GIT=$T/git-show-quebra"
-mutant codigo-show-sem-resposta  'raise Unreadable("teste-git-sem-resposta")' 'return ""'                     "$(T8M tests/test_imp_a.py)" 11 'codigo-do-teste-ilegivel:teste-git-sem-resposta' "$C8 WA_NODE_GIT=$T/git-show-lento WA_NODE_REPO_TIMEOUT=1"
+mutant codigo-show-rc-ignorado   'raise Unreadable("%s-git-rc-%d" % (what, r.returncode))' 'pass'                  "$(T8M tests/test_imp_a.py)" 11 'codigo-do-teste-ilegivel:teste-git-rc-2' "$C8 WA_NODE_GIT=$T/git-show-quebra"
+mutant codigo-show-sem-resposta  'raise Unreadable(what + "-git-sem-resposta")' 'return ""'                     "$(T8M tests/test_imp_a.py)" 11 'codigo-do-teste-ilegivel:teste-git-sem-resposta' "$C8 WA_NODE_GIT=$T/git-show-lento WA_NODE_REPO_TIMEOUT=1"
 mutant codigo-grande-vale        'if len(r.stdout) > MAX_TEST_BYTES:' 'if False:'                           "$(T8M tests/test_imp_grande.py)" 11 'codigo-do-teste-ilegivel:teste-grande' "$C8"
 mutant codigo-novo-vira-erro     'if t not in present or not (ext == "py" or ext in JS_TEST_EXT):' 'if not (ext == "py" or ext in JS_TEST_EXT):' "$(T8M tests/test_imp_novo.py)" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA" "$C8"
 mutant codigo-le-head            'REPO_REF + ":" + path'               '"HEAD:" + path'                        "$(T8M tests/test_imp_head.py)" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA" "$C8"
@@ -801,6 +915,44 @@ mutant ev-formato-solto   'blocked += [("caminho-fora-do-formato", o, o) for o i
 mutant ev-doc-retido      'kind = "doc" if p in withheld and not secretish(p) else evidence_kind(p)' 'kind = evidence_kind(p)' "$(DESC "${DOCS}docs/sinalizado.md")" 0 'evidencia-de-doc:docs/sinalizado\.md' "WA_NODE_MIRROR=$T/mirror-ok"
 mutant ev-retido-na-falha 'return [], ["espelho-ilegivel:" + str(e)], []' 'return [], ["espelho-ilegivel:" + str(e)], cands' "$(DESC 'lib/x.py conforme docs/guia.md; tests/test_x.py')" 10 'caminho-fora-do-filtro:docs/guia\.md.*espelho-' "WA_NODE_MIRROR=$T/espelho-ausente"
 mutant ev-info-sem-teto   'info += names[:MAX_EVIDENCE_INFO] +'            'info += names +'                        "$(DESC "scripts/foo.py tests/test_foo.py medido em ${EV10}")" 0 'evidencia-de-dado:x8\.log", "evidencia-de-dado-mais:2"'
+# ---- controle negativo das moles por evidência, do teste importador e da âncora (ga-qkc02kk): cada linha nova do classificador tem um mutante e um caso que só o original passa
+MD="WA_NODE_REPO=$RP WA_NODE_MIRROR=$T/mirror-ok"
+MR="WA_NODE_REPO=$T/wa-repo-ausente WA_NODE_MIRROR=$T/espelho-ausente"
+MCLEAN="$(DESC 'ajustar lib/mole_clean.py que abre um sqlite com o token e roda osascript')"
+mutant mole-sem-evidencia        'hard = ["moles:" + s for s in MOLE_SLUGS if s in ev]' 'hard = []'                                          "$(DESC 'ajustar lib/mole_db.py')" 10 'moles:banco-de-dados' "$MD"
+mutant mole-palavra-barra        'hard = ["moles:" + s for s in MOLE_SLUGS if s in ev]' 'hard = ["moles:" + s for s in MOLE_SLUGS if s in ev or s in prose]' "$MCLEAN" 0 'mole-so-em-prosa:banco-de-dados' "$MD"
+mutant mole-falha-vira-sem-evid  'return fallback, ["mole-ilegivel:" + str(e)]'         'return [], ["mole-ilegivel:" + str(e)]'            "$(DESC 'lib/mole_clean.py abre um sqlite; tests/test_mole_clean.py')" 10 'moles:banco-de-dados.*mole-ilegivel' "$MR"
+mutant mole-falha-sem-nota       'fallback, ["mole-ilegivel:" + str(e)]'                'fallback, []'                                      "$(DESC 'lib/mole_clean.py e tests/test_mole_clean.py')" 0 'mole-ilegivel:repo-git-rc-128' "$MR"
+mutant mole-sem-base-vira-vazio  '    if nread == 0:'                                    '    if False:'                                     "$(DESC 'lib/novo_zz.py abre um sqlite; tests/test_novo_zz.py')" 10 'moles:banco-de-dados.*mole-sem-arquivo-lido' "$MD"
+mutant mole-novo-bloqueia        'novos.append(f)'                                      'raise Unreadable("novo")'                          "$(DESC 'lib/mole_clean.py e lib/novo_zz.py abrem um sqlite; tests/test_mole_clean.py')" 0 'mole-arquivo-novo:1' "$MD"
+mutant mole-docstring-conta      'and isinstance(n.value, str) and id(n) not in docs:'  'and isinstance(n.value, str):'                    "$(DESC 'ajustar lib/mole_clean.py')" 0 '"verdict": "node"' "$MD"
+mutant mole-sem-ast              'parts = py_exec_parts(text) if path.endswith(".py") else None' 'parts = None'                                 "$(DESC 'ajustar lib/mole_clean.py')" 0 '"verdict": "node"' "$MD"
+mutant mole-teste-bare-conta     'm = DB_PINNED_RE.search(t) or (None if is_test else DB_BARE_RE.search(t))' 'm = DB_PINNED_RE.search(t) or DB_BARE_RE.search(t)' "$(DESC 'ajustar lib/mole_tbare.py')" 0 '"verdict": "node"' "$MD"
+mutant mole-texto-teste-bare     '    if not is_test and "banco-de-dados" not in out:'  '    if "banco-de-dados" not in out:'                 "$(DESC 'ajustar lib/mole_tbare2.py')" 0 '"verdict": "node"' "$MD"
+mutant mole-stdlib-secrets       '|secret)(?:\.|$)", re.I)'                            '|secrets?)(?:\.|$)", re.I)'                       "$(DESC 'ajustar lib/mole_stdsec.py')" 0 '"verdict": "node"' "$MD"
+mutant mole-cofre-argv-ignorado  '            if t in CRED_CLI:'                        '            if False:'                             "$(DESC 'ajustar lib/mole_cred.py')" 10 'moles:credencial' "$MD"
+mutant mole-cofre-chamada        '            if CRED_CALL_RE.match(c):'               '            if False:'                             "$(DESC 'ajustar lib/mole_credfn.py')" 10 'moles:credencial' "$MD"
+mutant mole-cofre-arquivo        '            elif CRED_FILE_RE.search(t):'            '            elif False:'                           "$(DESC 'ajustar lib/mole_credfile.py')" 10 'moles:credencial' "$MD"
+mutant mole-host-argv-ignorado   '            if t in HOST_ARGV:'                       '            if False:'                             "$(DESC 'ajustar lib/mole_secarg.py')" 10 'moles:host-mac' "$MD"
+mutant mole-chrome-ignorado      '|Application Support/Google/Chrome'                   ''                                                  "$(DESC 'ajustar lib/mole_chrome.py')" 10 'moles:host-mac' "$MD"
+mutant mole-md-ignorado          '|(?<![\w])md:[\w\-]*'                              ''                                                  "$(DESC 'ajustar lib/mole_md.py e tests/test_mole_md.py')" 10 'moles:banco-de-dados' "$MD"
+mutant mole-users-conta          '|~/Library|remote-debugging-port'                    '|~/Library|/Users/[A-Za-z]|remote-debugging-port' "$(DESC 'ajustar lib/mole_users.py')" 0 '"verdict": "node"' "$MD"
+mutant mole-texto-com-comentario '    blob = strip_comment_lines(text)'               '    blob = text'                                   "$(DESC 'ajustar lib/mole_shclean.sh')" 0 '"verdict": "node"' "$MD"
+mutant mole-irma-bloqueia        '(PROOF_SOFT if DERIVED_SRC.get(c) == "irmas" else PROOF).add(c)' 'PROOF.add(c)'                           "$(DESCI wa-molp1.2 'corrigir o caso de borda')" 0 'mole-evidencia-irma' "$MD"
+mutant mole-irma-falha-barra     'softbad.append("mole-irma-ilegivel:" + str(e))'      'raise'                                             "$(DESCI wa-molp2.2 'corrigir o caso de borda que abre um sqlite')" 0 'mole-irma-ilegivel:arquivo-grande' "$MD"
+mutant mole-irma-nao-le          'for f in sorted(x for x in soft_files if x not in proof'  'for f in sorted(x for x in soft_files if False and x not in proof' "$(DESCI wa-molp1.2 'corrigir o caso de borda')" 0 'mole-evidencia-irma' "$MD"
+mutant mole-portao-no-label      'if v == "node" and "etiqueta-node:ok" not in why:'   'if v == "node":'                                   "$(labels "$(DESC 'ajustar lib/mole_db.py que abre um sqlite')" '["node:ok"]')" 0 '"basis": "label"' "$MD"
+mutant mole-palavra-sem-prova    'elif v == "unknown" and PROSE:'                      'elif False:'                                       "$(DESC 'revisar o banco de dados do painel')" 11 'palavra-mole:banco-de-dados' "$MD"
+mutant importador-sem-import     '        if code in cands:'                           '        if True:'                                      "$(DESC 'ajustar lib/impt_ghost.py')" 11 'sem-prova-de-codigo-e-teste' "$MD"
+mutant importador-nome-vence     'if s and p not in cand and (p.endswith(".py")'       'if s and (p.endswith(".py")'                       "$(DESC 'Corrigir lib/foo_parser.py quando a entrada vem vazia.')" 0 'prova-teste-derivado:3-teste' "$MD"
+mutant importador-sem-mac-only   '        ok = [t for t in ts if t in keep]'           '        ok = list(ts)'                                 "$(DESC 'ajustar lib/impt_macmod.py')" 11 'sem-prova-de-codigo-e-teste' "$MD WA_NODE_MAC_ONLY=$T/macs-impt.txt"
+mutant importador-rotulo-regra6  '"teste-importador" if TEST_VIA.get((c, t)) else "teste-derivado", c, t) for c in code' '"teste-derivado" if TEST_VIA.get((c, t)) else "teste-derivado", c, t) for c in code' "$(DESC 'ajustar lib/impt_target.py')" 0 'teste-importador:lib/impt_target' "$MD"
+mutant importador-rotulo-regra7  '"teste-importador" if TEST_VIA.get((c, t)) else "teste-derivado", c, t) for c in dpaths' '"teste-derivado" if TEST_VIA.get((c, t)) else "teste-derivado", c, t) for c in dpaths' "$(DESC 'ajustar impt_target quando vem vazio')" 0 'teste-importador:lib/impt_target' "$MD"
+mutant importador-pula-sem-nota  'NOTES.append("teste-importador-nao-parseou:%d" % skipped)' 'pass'                                           "$(DESC 'ajustar lib/impt_unparse.py')" 11 'teste-importador-nao-parseou:1' "$MD"
+mutant ancora-sem-filtro         '    if any(p not in dsent or any(fnmatch.fnmatchcase(p, g) for g in globs) for p in dpaths):' '    if False:'      "$(DESC 'Medido em queue.db; ajustar anchor_out quando vem vazio')" 10 'caminho-fora-do-filtro:queue\.db.*ancora-derivada-fora-do-no' "$MD"
+mutant ancora-falha-sem-nota     '        info += anotes'                              '        pass'                                          "$(DESC 'Medido em queue.db; ajustar anchor_mod quando vem vazio')" 10 'ancora-derivada-ilegivel:repo-git-rc-128' "$MR"
+mutant ancora-ignora-pii         'if not has_code and blocked and not hard and all('    'if not has_code and blocked and all('              "$(DESC 'Medido em queue.db (31) 98876-5432; ajustar anchor_mod quando vem vazio')" 10 'caminho-fora-do-filtro:queue\.db.*dado-no-texto' "$MD"
+mutant ancora-sem-exigir-evid    'for _, p, _ in blocked):'                            'for _, p, _ in []):'                               "$(DESC 'Medido em queue.db e ~/Library/LaunchAgents/x.plist; ajustar anchor_mod quando vem vazio')" 10 'caminho-fora-do-filtro:queue\.db.*caminho-fora-do-formato' "$MD"
 # o resíduo no TMPDIR: o mutante que não apaga a árvore tem de deixar item para trás (senão o teste de "sem resíduo" passaria mesmo sem a limpeza)
 if mk_mutant sem-limpeza 'shutil.rmtree(root, ignore_errors=True)' 'pass'; then
   left=$(tmp_residue "$T/mut-sem-limpeza.py")
