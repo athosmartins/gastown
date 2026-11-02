@@ -169,6 +169,7 @@ ln -s "$ROOT/city/skills/does-not-exist" "$ROOT/wa/crew/m1/.claude/skills/demo"
 OUT="$(run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
 note "json: $OUT"
 [[ "$(json_field "$OUT" drift_count)" -ge 1 ]] && ok "drift flagged (dangling symlink)" || bad "expected drift>=1"
+[[ "$OUT" == *"dangling symlink"* ]] && ok "...and the reason says it is dangling, not merely 'resolves to'" || bad "expected the dangling-symlink reason"
 rm -rf "$ROOT"
 
 # ══ 6. redirected symlink ═════════════════════════════════════════════════════
@@ -370,6 +371,39 @@ for BAD_MANIFEST in '[]' 'null' '{"skills": "oops"}'; do
     [[ "$RC" == "1" ]] && ok "exit 1 (manifest=$BAD_MANIFEST)" || bad "expected exit 1, got $RC (manifest=$BAD_MANIFEST)"
     rm -rf "$ROOT"
 done
+
+# ══ 14. what the hq-mutants sweep found loose (ga-hq1qc5y): the exit codes, the stderr switches, git failing in each way ═══
+# EQUIVALENT, documented: b7c9d8d8cd (`info`'s `return 0` -> `1`: nobody reads info's status and there is no set -e), 0eee0688b9 (`list_city_skills`'s `return 0` -> `1`: it is only
+# ever the command of an assignment), 20adc40c2f (realpath vs the python fallback: both print the physical path), 6c338436aa and 9a09ceee49 (`$ok && exit 0 || exit 1` is the last
+# command: falling off the end exits with the status of `$ok`, which is 1 exactly when the explicit exit would have been).
+scenario "exit codes and the stderr switches"
+rc=0; "$AUDIT" --help >/dev/null 2>&1 || rc=$?
+[[ "$rc" == 0 ]] && ok "--help exits 0" || bad "--help exited $rc"
+err="$("$AUDIT" --bogus 2>&1 >/dev/null)"; rc=$?
+[[ "$rc" == 2 && "$err" == *"unknown arg: --bogus"* ]] && ok "an unknown argument is named and exits 2" || bad "unknown argument: rc=$rc err=[$err]"
+ROOT="$(mktemp -d)"; make_fixture "$ROOT"; write_manifest "$ROOT/city"
+audit_err() { SKILL_AUDIT_CITY="$ROOT/city" SKILL_AUDIT_WA="$ROOT/wa" SKILL_AUDIT_MANIFEST="$ROOT/city/.gc/state/skill-manifest.json" SKILL_AUDIT_SKILLS_JSON="$SKILLS_JSON" "$AUDIT" "$@" 2>&1 >/dev/null; }
+e="$(audit_err)";             [[ "$e" == *"=== skill-audit (city:"* && "$e" == *"=== summary:"* ]] && ok "no flags: the header and the summary go to stderr" || bad "no flags: stderr=[$e]"
+e="$(audit_err --quiet)";     [[ -z "$e" ]] && ok "--quiet: nothing on stderr" || bad "--quiet: stderr=[$e]"
+e="$(audit_err --json-only)"; [[ "$e" == *"=== skill-audit (city:"* && "$e" != *"=== summary:"* ]] && ok "--json-only: the header, no summary" || bad "--json-only: stderr=[$e]"
+rm -rf "$ROOT"
+
+# canon_merged_to_origin_main asks git four things; any of them failing — even while printing what a healthy run prints — must read as "not clean and merged"
+scenario "git failing in any one way is never read as 'clean and merged'"
+GSTUB="$(mktemp -d)"; GREAL="$(command -v git)"
+printf '#!/bin/sh\ncase "$3 $4" in\n  "rev-parse --is-inside-work-tree") [ "${GITSTUB_FAIL:-}" = inside ] && { "$GITSTUB_REAL" "$@"; exit 1; } ;;\n  "rev-parse --show-toplevel") [ "${GITSTUB_FAIL:-}" = toplevel ] && { "$GITSTUB_REAL" "$@"; exit 1; } ;;\n  "status --porcelain") [ "${GITSTUB_FAIL:-}" = status ] && exit 1 ;;\n  "clean -ndx") [ "${GITSTUB_FAIL:-}" = clean ] && exit 1 ;;\nesac\nexec "$GITSTUB_REAL" "$@"\n' > "$GSTUB/git"; chmod +x "$GSTUB/git"
+ROOT="$(mktemp -d)"; git_fixture_with_origin "$ROOT"
+printf 'gate-merged fix content\n' >> "$ROOT/city/skills/demo/SKILL.md"
+git -C "$ROOT/city" add -A
+git -C "$ROOT/city" commit -q -m "fix(ga-demo): gate-merged change"
+git -C "$ROOT/city" update-ref refs/remotes/origin/main "$(git -C "$ROOT/city" rev-parse HEAD)"
+for f in none inside toplevel status clean; do
+    OUT="$(PATH="$GSTUB:$PATH" GITSTUB_REAL="$GREAL" GITSTUB_FAIL="$f" run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
+    n="$(json_field "$OUT" offpath_count)"
+    if [[ "$f" == none ]]; then [[ "$n" == 0 ]] && ok "control: through the stub, with nothing failing, the merged change is accepted" || bad "control: offpath_count=$n"
+    else [[ "$n" -ge 1 ]] && ok "git ($f) fails but prints what a healthy run prints: flagged, not accepted" || bad "git ($f) failing was read as clean and merged: offpath_count=$n"; fi
+done
+rm -rf "$ROOT" "$GSTUB"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo
