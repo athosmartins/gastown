@@ -20,6 +20,13 @@
 #      só de unknown, linhas ilegíveis (inclusive registro cortado ou colado em outro, e
 #      linha ilegível que cita nonloopback), log ausente; 100% unknown nunca vira LIMPO;
 #      argumento inválido, inclusive horas com zero à esquerda (octal no bash).
+#
+# Mutantes EQUIVALENTES do lastro hq-mutants (ga-eedg7fw) — nenhum teste de COMPORTAMENTO os reprova, e por isso não há caso para eles:
+#   - `mkdir -p "$(dirname "$LOG")" 2>/dev/null || true` em emit e em take_lock, com `||` → `&&`: o script roda com `set -uo pipefail` (SEM -e) e o rc desse mkdir
+#     não é lido em lugar nenhum. O que o mkdir do LOG faz de verdade — a pasta passar a existir — é conferido no B7; o do lock não tem caso próprio (o `mkdir "$LOCKD"` seguinte é quem falharia).
+#   - emit: `return 1` → `return 0` na gravação que falha e `return 0` → `return 1` no fim: as quatro chamadas de emit em sample são comandos soltos, NENHUMA lê o rc.
+#     O contrato que se observa é a mensagem no stderr e o que fica (ou não) no log: B7.
+#   Se um dia algum chamador passar a ler o rc do emit, esses quatro viram killable e este parágrafo deve sair.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -63,10 +70,22 @@ case "\$mode" in
   ok)    cat "$FIX/snap.out"; exit 0 ;;
   empty) exit 1 ;;
   fail)  echo "lsof: WARNING: can't stat() something" >&2; exit 2 ;;
+  rc1)   cat "$FIX/snap.out"; exit 1 ;;
+  rc2)   cat "$FIX/snap.out"; exit 2 ;;
+  rc3)   cat "$FIX/snap.out"; exit 3 ;;
 esac
 exit 3
 EOF
-chmod +x "$STUBS/ps" "$STUBS/pgrep" "$STUBS/lsof"
+# awk: passa tudo para o awk de verdade, EXCETO (com $FIX/awk_break) o programa que lê o retrato do lsof (o único que usa o vetor isport) — o caso "o parse quebrou".
+REAL_AWK="$(command -v awk)"
+cat >"$STUBS/awk" <<EOF
+#!/bin/sh
+if [ -f "$FIX/awk_break" ]; then
+  case "\$*" in *isport*) echo "awk: parser exploded"; exit 2 ;; esac
+fi
+exec "$REAL_AWK" "\$@"
+EOF
+chmod +x "$STUBS/ps" "$STUBS/pgrep" "$STUBS/lsof" "$STUBS/awk"
 touch "$FIX/listen_ok"
 
 HDR='COMMAND   PID  USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME'
@@ -134,6 +153,27 @@ run_sample; rc=$?
 check "A6 lsof falhou (rc 2) → rc 2"                           test "$rc" = 2
 check "A6 state=unknown — falha NUNCA vira clean"              test "$(field state)" = unknown
 check "A6 stderr diz UNKNOWN"                                  grep -q UNKNOWN "$WORK/err"
+
+# A6 acima sai com rc 2 SEM saída, e a falta de LISTEN já o faria unknown: não prova a regra do rc. Aqui o lsof IMPRIME o retrato inteiro (com LISTEN) e sai com
+# rc != 0: rc >= 2 invalida o retrato (falhou/estourou), rc 1 (algum item não achado) não.
+snap "$(est 127.0.0.1:52756 127.0.0.1:50001)"
+for m in rc2 rc3; do
+  echo "$m" >"$FIX/snap.mode"; run_sample; rc=$?
+  check "A6b lsof imprime o retrato com LISTEN mas sai com ${m#rc} → unknown (rc 2), nunca clean" test "$rc/$(field state)" = "2/unknown"
+  check "A6b ($m) o motivo cita o rc ${m#rc}" test "$(field why | grep -c "lsof falhou (rc=${m#rc})")" = 1
+done
+echo rc1 >"$FIX/snap.mode"; run_sample; rc=$?
+check "A6b lsof imprime o retrato e sai com 1 → o retrato vale: clean, total 1, rc 0" test "$rc/$(field state)/$(field total)" = "0/clean/1"
+
+# O awk que lê o retrato quebra (saída que não casa o formato): unknown com o motivo certo, contagens 0 — nunca clean com zeros.
+snap "$(est 127.0.0.1:52756 127.0.0.1:50001)"; : >"$FIX/awk_break"
+run_sample; rc=$?
+rm -f "$FIX/awk_break"
+check "A6c o awk do parse quebra → unknown, rc 2" test "$rc/$(field state)" = "2/unknown"
+check "A6c o motivo é 'saída do lsof ilegível' e as contagens ficam 0" test "$(field why | grep -c 'ilegível')/$(field total)/$(field remote)" = "1/0/0"
+check "A6c stderr diz que não conseguiu ler a saída do lsof" grep -q 'não consegui ler a saída do lsof' "$WORK/err"
+snap "$(est 127.0.0.1:52756 127.0.0.1:50001)"; run_sample; rc=$?
+check "A6c (controle) sem o awk quebrado o mesmo retrato é clean, rc 0" test "$rc/$(field state)/$(field total)" = "0/clean/1"
 
 { echo "$HDR"; est 127.0.0.1:52756 127.0.0.1:50001; } >"$FIX/snap.out"; echo ok >"$FIX/snap.mode"
 run_sample; rc=$?
@@ -205,6 +245,27 @@ for i in $(seq 1 12); do
 done
 n="$(nlines)"
 check "B5 log respeita o teto de linhas (12 amostras, teto 10 → ≤ 10, ≥ 7)" test "$n" -le 10 -a "$n" -ge 7
+
+# O teto nas BORDAS (o B5 só vê que o log não cresce sem fim): com teto 10, até 10 linhas ficam como estão; a 11ª corta para as últimas 10*3/4 = 7.
+snap "$(est 127.0.0.1:52756 127.0.0.1:50001)"
+fill() { local i; : >"$LOG"; for i in $(seq 1 "$1"); do echo "filler $i"; done >>"$LOG"; }
+fill 8; DOLT_PEER_AUDIT_MAX_LINES=10 run_sample_keep; rc=$?
+check "B5b teto 10: 8 linhas + a amostra = 9 → nada cortado (a 1ª linha continua a primeira)" test "$rc/$(nlines)/$(sed -n 1p "$LOG")" = "0/9/filler 1"
+fill 9; DOLT_PEER_AUDIT_MAX_LINES=10 run_sample_keep; rc=$?
+check "B5b teto 10: 9 linhas + a amostra = 10 → EXATAMENTE no teto, nada cortado (só corta ao PASSAR dele)" test "$rc/$(nlines)/$(sed -n 1p "$LOG")" = "0/10/filler 1"
+fill 10; DOLT_PEER_AUDIT_MAX_LINES=10 run_sample_keep; rc=$?
+check "B5b teto 10: 10 linhas + a amostra = 11 → cortado para as últimas 7" test "$rc/$(nlines)" = "0/7"
+check "B5b o corte guarda o FIM: a 1ª linha é a 'filler 5' e a última é a amostra nova" test "$(sed -n 1p "$LOG")/$(field state)" = "filler 5/clean"
+
+# Gravação do log: pasta que não existe é criada; log que não dá para escrever (um diretório no lugar do arquivo) diz isso no stderr e a amostra não trava.
+# (O rc do emit não é lido por ninguém — mutantes equivalentes, ver o cabeçalho —, então o contrato observável é este: a mensagem e o que fica no log.)
+rm -rf "$WORK/newdir"
+PATH="$STUBS:$PATH" GC_CITY="$CITY" DOLT_PEER_AUDIT_LOG="$WORK/newdir/sub/peers.jsonl" DOLT_PEER_AUDIT_LOCK="$LOCKD" bash "$SCRIPT" sample >"$WORK/out" 2>"$WORK/err"; rc=$?
+check "B7 a pasta do log não existe → é criada e a amostra entra (1 linha)" test "$rc/$(wc -l <"$WORK/newdir/sub/peers.jsonl" 2>/dev/null | tr -d ' ')" = "0/1"
+mkdir -p "$WORK/logdir.d"
+PATH="$STUBS:$PATH" GC_CITY="$CITY" DOLT_PEER_AUDIT_LOG="$WORK/logdir.d" DOLT_PEER_AUDIT_LOCK="$LOCKD" bash "$SCRIPT" sample >"$WORK/out" 2>"$WORK/err"; rc=$?
+check "B7 log impossível de escrever → stderr 'não consegui gravar <log>'" grep -q "não consegui gravar $WORK/logdir.d" "$WORK/err"
+check "B7 o lock é solto mesmo assim (a próxima amostra não fica pulada)" test ! -d "$LOCKD"
 
 # Append anterior cortado no meio (ENOSPC, kill): sem \n final, o registro novo colava na
 # ponta cortada e o report lia as duas como UMA linha (gate ga-nt9vmg, defeito 2).
@@ -288,10 +349,17 @@ check "C11 log ausente → INSUFICIENTE (a sonda nunca rodou), rc 2" nunca_rodou
 gen 25 0 600 >"$LOG"
 check "C12 janela configurável: 24h com 25h de cobertura → LIMPO" test "$(verdict 24)" = LIMPO
 
-for bad in abc 0 00 -5 1.5 99999999999999999999; do
+for bad in abc 0 00 -5 1.5 99999999999999999999 1000000 0000001; do
   rep "$bad" >/dev/null; rc=$?
   check "C13 horas inválidas ('$bad') → rc 64"                  test "$rc" = 64
 done
+# A fronteira dos 6 dígitos: 999999 h é janela VÁLIDA (a validação passa; o log é que não cobre tudo isso), 1000000 (7 dígitos) não — acima.
+out="$(rep 999999)"; rc=$?
+check "C13b 999999 (6 dígitos) é horas válidas: rc ≠ 64 e sem a mensagem de uso" test "$rc" != 64 -a "$(printf '%s' "$out" | grep -c 'uso:')" = 0
+out="$(rep 000001)"; rc=$?
+check "C13b '000001' (6 dígitos, zero à esquerda) também passa a validação (1 h)" test "$rc" != 64 -a "$(printf '%s' "$out" | grep -c 'uso:')" = 0
+bash "$SCRIPT" bogus >"$WORK/out" 2>&1; rc=$?
+check "C13c subcomando desconhecido → rc 64 e a linha de uso" test "$rc/$(grep -c 'uso:' "$WORK/out")" = "64/1"
 
 # "08"/"09" são octal inválido para o bash ($((...)) → erro com exit 1 = o código do BLOQUEADO,
 # sem veredito) e "010" virava 8h calado mas imprimia "10h". Horas são decimais, sempre.
