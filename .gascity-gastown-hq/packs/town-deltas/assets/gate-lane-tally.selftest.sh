@@ -551,6 +551,153 @@ mutant merged-unmarked 's/key = f"?{i}"/key = "?"/' && {
 mutant rc-after-json 's/    if p.returncode != 0:   # before the JSON/    if False:   # before the JSON/' && {
   [ "$(pj "$(PATH="$T/bin:$PATH" FAKE_BD_MODE=fail python3 "$T/mut-rc-after-json.py" --log "$L3" --now "$NOW" --json --bug-city /cityA)" "d['tr_stores_failed']")" != "$(pj "$JF" "d['tr_stores_failed']")" ] && ok "task-rapida mutation: without the rc check the failure reads as a JSON-decode message (the check above sees it)" || bad "task-rapida mutation 'rc-after-json' survives"; }
 
+# ── lastro hq-mutants (ga-5mnu1pp): the edges, tables and fallbacks the checks above never put on an exact value ──────────────
+# In process, so the module's own functions get the exact input: a log line ON the window start, a run time of exactly 600 s, a decision
+# in the same second as its run, a notify that exits 1 (not 3), a bd that quotes 130 characters. Every expectation was derived by hand from
+# the rules in the module's docstring, then checked against the real tally. Not killable, on purpose: L258 `found[row["id"]] = True -> False`
+# (8773afd2e5): `found` is read only through len() and sorted(), never by value.
+PYT='
+import contextlib, importlib.util, io, json, os, shutil, sys
+sys.dont_write_bytecode = True
+tally, T = sys.argv[1], sys.argv[2]
+os.environ["GC_CITY_PATH"] = "/hq"
+os.environ["PATH"] = T + "/bin:" + os.environ["PATH"]
+os.environ["FAKE_BD_JSON"] = T + "/glt-nobugs.json"
+open(T + "/glt-nobugs.json", "w").write("[]")
+sp = importlib.util.spec_from_file_location("glt", tally)
+m = importlib.util.module_from_spec(sp)
+sp.loader.exec_module(m)
+fails = []
+def chk(name, got, want):
+    if got != want:
+        fails.append("FAIL " + name + ": got " + repr(got)[:240] + " want " + repr(want)[:240])
+def run(*argv):
+    o, e = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(o), contextlib.redirect_stderr(e):
+        try:
+            rc = m.main(list(argv))
+        except SystemExit as x:
+            rc = x.code
+    return rc, o.getvalue(), e.getvalue()
+def mk(name, *lines):
+    p = T + "/" + name
+    open(p, "w").write("".join((l if isinstance(l, str) else json.dumps(l)) + "\n" for l in lines))
+    return p
+def ev(ts, **k):
+    return dict(ts=ts, **k)
+class P:
+    def __init__(self, rc=0, out="", err=""):
+        self.returncode, self.stdout, self.stderr = rc, out, err
+seen = []
+def fake(rc=0, out="", err=""):
+    def f(cmd, **kw):
+        seen.append(kw.get("timeout"))
+        return P(rc, out, err)
+    return f
+real_which, real_run, real_store = shutil.which, m.subprocess.run, m._read_store
+NOW = "2026-10-08T12:00:00Z"
+now = m._ts(NOW)
+GL, DC = "gate_lane", "dispatcher_complete"
+# the codes table: the 1 in column 3 marks a doc/test diff bounced by a mechanical check
+rc, out, err = run("--list-codes")
+chk("--list-codes exits 0", rc, 0)
+chk("the mechanical-check codes are exactly the six doc/test bounces", sorted(l.split("\t")[0] for l in out.splitlines() if l.split("\t")[2] == "1"), ["history-code", "history-unverified", "scan-failed", "scan-findings", "test-failed", "test-unrunnable"])
+chk("--help carries the first line of the docstring (argparse wraps it, so compare on single spaces)", "how many gate rounds the DOC/TEST fast lane saved" in " ".join(run("--help")[1].split()), True)
+# one decision, no signal: the smallest window that still has to be tallied
+lone = mk("glt-lone.jsonl", ev("2026-10-02T09:00:00Z", event=GL, lane="normal", marker="only", reason_code="code-or-prompt"))
+chk("--json keeps non-ASCII text readable", "código" in run("--log", lone, "--now", NOW, "--json")[1], True)
+h1 = T + "/glt-h1.jsonl"
+shutil.which = lambda n: None
+try:
+    rc, out, err = run("--log", lone, "--now", NOW, "--weekly", "--out", h1, "--no-notify")
+finally:
+    shutil.which = real_which
+chk("--weekly --no-notify with no notify on PATH: rc 0 and nothing on stderr", (rc, err), (0, ""))
+hist = open(h1).read().splitlines() if os.path.exists(h1) else []
+chk("a window with exactly ONE decision still appends its history line, text unescaped", (len(hist), len(hist) == 1 and "código" in hist[0]), (1, True))
+rc, out, err = run("--log", lone, "--now", NOW, "--weekly", "--out", T + "/no-such-dir/h.jsonl", "--no-notify")
+chk("--weekly that cannot append says so and exits 2", (rc, "could not append" in err), (2, True))
+shutil.which = lambda n: "/x/notify"
+try:
+    for rc_n, want in ((1, True), (0, False)):
+        m.subprocess.run = fake(rc_n)
+        rc, out, err = run("--log", lone, "--now", NOW, "--weekly", "--out", T + "/glt-h2.jsonl")
+        chk("notify exit " + str(rc_n) + " is reported on stderr only when it is not 0", (rc, "`notify` exited " in err), (0, want))
+finally:
+    shutil.which, m.subprocess.run = real_which, real_run
+chk("notify gets a 30 s budget", seen, [30, 30])
+# a log line ON the window start (2026-10-01T12:00:00Z) and, right after it, a line cut INSIDE its ts (no head to date it by: it is placed
+# by the line before); a decision with no marker; a tie in time
+le = mk("glt-edge.jsonl",
+        ev("2026-10-01T12:00:00Z", event=GL, lane="normal", marker="edge", reason_code="code-or-prompt"),
+        "{\"ts\":\"2026-10-01T12:00:",
+        ev("2026-10-02T09:00:00Z", event=GL, lane="normal", branch="b1", reason_code="code-or-prompt"),
+        ev("2026-10-02T09:01:00Z", event=GL, lane="normal", branch="b2", reason_code="code-or-prompt"),
+        ev("2026-10-02T09:02:00Z", event=GL, lane="normal", reason_code="code-or-prompt"),
+        ev("2026-10-03T09:00:00Z", event=GL, lane="fast", marker="tie", would_have_reviewers=4, reason_code="fast"),
+        ev("2026-10-03T09:00:00Z", event=DC, lane="fast", marker="tie", result="PASS"))
+r = m.tally(le, 7, now)
+chk("the window start is inclusive for a decision AND for the cut line after it; a marker-less decision is keyed by its branch", (r["decisions"], r["unreadable_lines"]), (5, 1))
+chk("a decision made in the same second as its run is the one in effect (4 reviewers, none assumed)", (r["reviewer_runs_saved"], r["saved_unmatched_assumed_1"]), (4, 0))
+# task-rapida run times ON the 10 min bar, a 0 s run, and a run with no marker and no elapsed_s
+tr = [ev("2026-10-02T09:00:00Z", event=GL, lane="task-rapida", marker="t%d" % s, bead="ga-t%d" % s, tr_code="granted") for s in (0, 599, 600, 601, 1200)]
+tr += [ev("2026-10-02T10:00:00Z", event=DC, lane="task-rapida", marker="t%d" % s, result="PASS", elapsed_s=s) for s in (0, 599, 600, 601, 1200)]
+tr.append(ev("2026-10-02T11:00:00Z", event=DC, lane="task-rapida", marker="", result="PASS"))
+r = m.tally(mk("glt-tr.jsonl", *tr), 7, now)
+chk("the 10 min bar is strict: 600 s is not over, 601 s and 1200 s are", r["tr_over_10min"], 2)
+chk("a 0 s run time is readable; only the marker-less run without elapsed_s is unknown, and it is a run of its own", (r["tr_elapsed_unknown"], r["tr_unattributed"], r["tr_runs"]), (1, 1, 6))
+chk("median and max of the five readable run times", (r["tr_elapsed_median_s"], r["tr_elapsed_max_s"]), (600.0, 1200))
+# the grant is the marker LAST decision; a bug counts only if it was opened strictly after it
+lg = mk("glt-grant.jsonl",
+        ev("2026-10-02T09:00:00Z", event=GL, lane="normal", marker="ge", reason_code="code-or-prompt", tr_code="risk-file"),
+        ev("2026-10-04T09:00:00Z", event=GL, lane="task-rapida", marker="ge", bead="ga-ge", tr_code="granted"))
+open(T + "/glt-bugs.json", "w").write(json.dumps([dict(id="bug-A", title="ga-ge", created_at="2026-10-04T09:00:00Z"), dict(id="bug-B", title="ga-ge", created_at="2026-10-03T00:00:00Z"), dict(id="bug-C", title="ga-ge", created_at="2026-10-04T09:00:01Z")]))
+os.environ["FAKE_BD_JSON"] = T + "/glt-bugs.json"
+chk("only a bug opened after the LAST decision counts (not one at that second, not one between the two decisions)", m.tally(lg, 7, now, cities=["/cityA"])["tr_bugs_after_ids"], ["bug-C"])
+for mode, why in (("fail", "bd saiu com 1"), ("badrow", "linha do bd ileg")):
+    os.environ["FAKE_BD_MODE"] = mode
+    r = m.tally(lg, 7, now, cities=["/cityA"])
+    chk("bd " + mode + " on an explicit store: the grant is un-looked-up and the count is null, never 0", (r["tr_bugs_after"], r["tr_bugs_uncovered"], any(why in f for f in r["tr_stores_failed"])), (None, 1, True))
+del os.environ["FAKE_BD_MODE"]
+# grants with an empty or non-text rig or bead: lost per reason, gc is never asked, no rig is listed
+lr = mk("glt-norig.jsonl",
+        ev("2026-10-02T09:00:00Z", event=GL, lane="task-rapida", marker="n1", bead="ga-n1", rig="", tr_code="granted"),
+        ev("2026-10-02T09:01:00Z", event=GL, lane="task-rapida", marker="n2", bead="ga-n2", rig=5, tr_code="granted"),
+        ev("2026-10-02T09:02:00Z", event=GL, lane="task-rapida", marker="n3", bead="ga-n3", tr_code="granted"),
+        ev("2026-10-02T09:03:00Z", event=GL, lane="task-rapida", marker="n4", bead=5, tr_code="granted"))
+os.environ["FAKE_GC_LOG"] = T + "/glt-gc.log"
+r = m.tally(lr, 7, now)
+chk("grants lost for a missing bead or a missing rig are counted per reason", r["tr_bugs_note"], "1 concedida(s): sem bead de origem no evento; 3 concedida(s): sem rig no evento e nenhuma --bug-city dada")
+chk("no grant names a usable rig: gc is never asked, no rig is listed, 4 grants un-looked-up", (os.path.exists(T + "/glt-gc.log"), r["tr_grant_rigs"], r["tr_bugs_after"], r["tr_bugs_uncovered"]), (False, [], None, 4))
+r = m.tally(lone, 7, now)
+chk("no grants at all: a real 0, nothing found, nothing un-looked-up", (r["tr_bugs_after"], r["tr_bugs_found_partial"], r["tr_bugs_uncovered"]), (0, 0, 0))
+# the helpers on their own: what they quote, what they accept, how long they wait
+m.subprocess.run = fake(3, "", "x" * 130)
+chk("a failing bd is quoted up to 120 characters", m._read_store("/c", "s", 5)[1], "bd saiu com 3: " + "x" * 120)
+m.subprocess.run = fake(2, "", "y" * 130)
+chk("a failing gc is quoted up to 120 characters", m._rig_paths("/c")[1], "gc rig list saiu com 2: " + "y" * 120)
+rigs = [dict(name="a", path="/pa"), 5, dict(name=7, path="/x"), dict(name="b", path=3), dict(name="c", path="rel")]
+seen[:] = []
+m.subprocess.run = fake(0, json.dumps(dict(rigs=rigs)))
+chk("a rig is a row with a text name and an absolute text path, nothing else", m._rig_paths("/c"), ({"a": "/pa"}, ""))
+m.subprocess.run = real_run
+m._read_store = lambda s, since, timeout: (seen.append(timeout) or ([], ""))
+m._bugs_after([("ga-x", None, now)], ["/cityA"], None, "", "s")
+m._read_store = real_store
+chk("gc rig list and bd get 90 s by default", seen, [90, 90])
+# the one-line notify and the report, with the counts a window can really have
+r = m.tally(lone, 7, now)
+chk("ONE decision is a headline, not the no-decision warning", m.notify_line(dict(r, decisions=1, fast=0)).startswith("0/1 diffs na fast-lane"), True)
+chk("unmatched fast runs are disclosed whenever there is a decision", "; 2 run(s) fast sem decisão pareada" in m.notify_line(dict(r, decisions=1, saved_unmatched_assumed_1=2)), True)
+chk("...and not when there is no decision, nor when none is unmatched", ["sem decisão pareada" in m.notify_line(dict(r, decisions=0, saved_unmatched_assumed_1=2, fast_runs_completed=1)), "sem decisão pareada" in m.notify_line(dict(r, decisions=3, saved_unmatched_assumed_1=0))], [False, False])
+chk("the lost-bugs reason is quoted up to 140 characters", "(" + "n" * 140 + ");" in m.notify_line(dict(r, tr_granted=1, tr_bugs_after=None, tr_bugs_uncovered=1, tr_bugs_note="n" * 150)), True)
+chk("the fast-lane share is 100 x fast / decisions, rounded", "fast-lane 1 (33%)" in m.render(dict(r, decisions=3, fast=1)), True)
+print("\n".join(fails))
+print("DONE", len(fails))
+'
+GLT_OUT=$(python3 -c "$PYT" "$TALLY" "$T" 2>&1)
+case "$GLT_OUT" in *"DONE 0") ok "lastro hq-mutants: window edges, tables, fallbacks and the notify/weekly exits all held (in process)" ;; *) bad "lastro hq-mutants block: $GLT_OUT" ;; esac
+
 echo
 echo "== gate-lane-tally.selftest: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]
