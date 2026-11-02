@@ -213,8 +213,8 @@ _s3proof_repair_then_prove "$T/P4" db1 && ok "already proven → returns 0" || b
 ! grep -q -- '--exclude manifest' "$CALLS" && ok "…without uploading anything" || bad "uploaded although already proven"
 
 # ── hq-mutants lastro (ga-ow127o6): status codes, silence and fail-closed edges the cases above never crossed ──
-# Every "NOT proven" below is asserted by BOTH the status and the library's own reason in $LOGF, and $LOGF is emptied
-# before each case: a reason that is absent (log unreadable or never written) makes the case fail, never pass.
+# Where a case expects a refusal it asserts the status AND, wherever the library logs one, its own reason in $LOGF
+# (emptied before the case): a reason that is absent (log unreadable or never written) fails the case, never passes it.
 echo "── _s3proof_manifest_tables: status 0 and silence on nothing-to-list ──"
 # mutants aa1c83c38a (early `return 0` -> `return 1`), 484a86890e (no early return: a missing file prints a redirect error),
 # 678b5a69fb (`|| true` -> `&& true`: a manifest with no table ids would end with grep's status 1)
@@ -270,7 +270,10 @@ sed "s/$(tid 6)/$(tid 77)/" "$T/Z1/manifest" > "$FB/db1/manifest"
 _s3proof_local_closure_ok "$T/Z1" && ok "setup: local dir is a closed backup" || bad "setup: local dir not closed"
 _s3proof_mirror_identical "$T/Z1" db1 && ok "setup: S3 already holds every local file (same sizes)" || bad "setup: dry run sees a difference"
 _s3proof_s3_closure_ok db1 && bad "setup: the S3 manifest should name a missing table" || ok "setup: S3 manifest names a table the bucket lacks"
+: > "$LOGF"
 _s3proof_restorable_and_identical "$T/Z1" db1 && bad "identical-but-not-closed S3 was PROVEN" || ok "closed local + identical sizes but S3 not closed → NOT proven"
+# the refusal comes from the S3 stage and the proof stops there: the mirror stage never ran (its OK line is not in the log)
+grep -q 'MISSING from the bucket' "$LOGF" && ! grep -q 'mirror check' "$LOGF" && ok "…refused by the S3 closure stage, before the mirror check" || bad "wrong stage refused: $(cat "$LOGF")"
 
 echo "── _s3proof_repair_then_prove: a failed upload ends the repair ──"
 # mutants e79f244d55 (`return 1` -> `return 0`), 37a188edd3 (no `|| return 1`: the loop would retry up to S3PROOF_REPAIR_ROUNDS times)
@@ -278,6 +281,7 @@ reset_bucket; mkdir_backup "$T/Y1" 6; : > "$CALLS"
 FAKE_SYNC_FAIL=1 _s3proof_repair_then_prove "$T/Y1" db1 && bad "repair_then_prove succeeded though the upload failed" || ok "upload fails → repair_then_prove fails"
 N_UP="$(grep -c 's3 sync .* --exclude manifest' "$CALLS")"
 [ "$N_UP" -eq 1 ] && ok "…after exactly ONE upload attempt (no retry of a failed upload)" || bad "expected 1 upload attempt, saw $N_UP"
+grep -q 'table upload to .* FAILED' "$LOGF" && ! grep -q 'still NOT proven' "$LOGF" && ok "…saying the upload failed, not that the repair rounds ran out" || bad "wrong reason: $(cat "$LOGF")"
 
 # ── the ga-tyaozh checksum export reaches the aws child ──────────────────────────
 echo "── AWS_REQUEST_CHECKSUM_CALCULATION (ga-tyaozh) ──"

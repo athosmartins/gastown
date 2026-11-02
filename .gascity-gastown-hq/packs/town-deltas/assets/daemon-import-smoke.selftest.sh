@@ -338,8 +338,9 @@ line="$(printf '%s\n' "$OUT" | sed -n 's/^SMOKE_DETAIL=sys.path at failure: //p'
 [ "$(verdict)" = "FAIL" ] && [ "${#line}" -eq 600 ] && [ "${line: -3}" = "..." ] && ok "T27 sys.path detail on FAIL: exactly 600 characters" || bad "T27 got verdict=$(verdict) detail is ${#line} chars"
 
 # ── hq-mutants lastro (ga-ow127o6): interpreter flags, wrapper corners, interpreter checks and cut widths that T1-T27 never crossed ──
-# T1-T27 launch every daemon as `python script.py` with no flag and no script argument, so parse_python_args' flag loop, the wrapper
-# reader's indentation/comment/cd rules and the width of the reason lines only ever ran on their easy side. The probe entrypoint below
+# T1-T27 launch the daemon as `python script.py` (T11 aside, which is `-m flask run`) with no interpreter flag before the script and no
+# script argument, so parse_python_args' flag loop, the wrapper reader's indentation/comment/cd rules and the width of the reason lines
+# only ever ran on their easy side. The probe entrypoint below
 # writes what the CHILD saw (argv, working directory, -O level), so how the launch was rebuilt is observable and not only the verdict.
 mk_probe() {   # $1 = a mk_tree dir
   cat > "$1/daemons/probe.py" <<'EOF'
@@ -386,6 +387,14 @@ done
 # EQUIVALENT (ga-ow127o6; 43a00b5a1b and 9e5c3fe8fd, `len(a) > 2` -> `len(a) >= 2` on the attached -m / -c forms): the only 2-character
 # string that startswith("-m") is "-m" itself, which the `a in ("-m", "-c")` alternative before it already took, so `> 2` and `>= 2`
 # raise for exactly the same arguments: no launch line separates them.
+
+# ── T31: -I and -P change how sys.path[0] is built, so they are not emulated ──
+R="$TMP_ROOT/t31"; mk_tree "$R"
+for fl in -I -P; do
+  mk_plist "$TMP_ROOT/t31.plist" "$R" '{}' "$R/venv/bin/python3" $fl "$R/daemons/dash.py"
+  run_smoke "$TMP_ROOT/t31.plist"
+  [ "$(verdict)" = "UNKNOWN" ] && [ "$RC" -eq 2 ] && has "$(reason)" "changes how sys.path[0] is built" && ok "T31 [$fl]: UNKNOWN rc=2, not emulated" || bad "T31 [$fl] got verdict=$(verdict) rc=$RC reason=$(reason)"
+done
 
 # ── T32: a relative entrypoint is resolved against the WorkingDirectory ──
 # mutant a508996b07 (`if not os.path.isabs(script)`)
@@ -461,6 +470,7 @@ mk_plist "$TMP_ROOT/t38.plist" "$R" '{}' "$R/venv/bin/python3" "$R/daemons/dash.
 run_smoke "$TMP_ROOT/t38.plist"
 want="ImportError: $(cut_to x 200) (entrypoint $R/daemons/dash.py, cwd $R)"
 [ "$(verdict)" = "FAIL" ] && [ "$(reason)" = "$want" ] && ok "T38 FAIL reason: the message is cut to exactly 200 characters" || bad "T38 FAIL reason [$(reason)]"
+# vazio → dline="" e o `-eq 300` reprova; falhou/ilegível (sem a linha de detalhe) → idem, nunca passa por ausência (vale para a leitura do RuntimeError abaixo também)
 dline="$(printf '%s\n' "$OUT" | sed -n 's/^SMOKE_DETAIL=\(ImportError: .*\)$/\1/p' | head -1)"
 [ "${#dline}" -eq 300 ] && [ "${dline: -3}" = "..." ] && ok "T38 FAIL detail line: cut to exactly 300 characters" || bad "T38 FAIL detail is ${#dline} chars: [${dline:0:60}]"
 python3 -I -c 'print("raise RuntimeError(\"y\" * 400)")' > "$R/daemons/routes/cls_contacts.py"

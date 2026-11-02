@@ -110,7 +110,7 @@ grep -q "window has already passed" "$OUT4" && ok "4: warning states the deadlin
 grep -q "manually within ~" "$OUT4" && bad "4: told operator to act within a window that had already closed" || ok "4: did NOT give a stale 'within ~Ns' instruction"
 
 # ── hq-mutants lastro (ga-ow127o6): scenarios 5-8 close the survivors the scenarios above never reached.
-# Each "absent" check below is paired with a positive check on the SAME log, so a log that is empty or
+# Each "absent" check on a LOG below is paired with a positive check on the SAME log, so a log that is empty or
 # unreadable reprova instead of passing the absence (empty → the positive check fails; ilegível → same).
 
 echo ""

@@ -102,8 +102,8 @@ echo
 echo "== whole-script run with stubbed df/du/timeout/getconf (ga-ow127o6, hq-mutants lastro) =="
 
 # Everything below `dob_targets` in the script (argument parsing, the lib-mode guard, the collection loop and
-# the output) was only ever sourced past, never executed here. The stubs make the run hermetic: no real df/du
-# and no real hostname data, with fixed numbers so each branch shows up in the summary line or in the log.
+# the output) was only ever sourced past, never executed here. The stubs make the run hermetic: no real
+# df/du/timeout/getconf, with fixed numbers so each branch shows up in the summary line or in the log.
 #   $DRT/T            du -> 500K, no errors                     (a clean root)
 #   $HOME/shared/data du -> 1000K and ONE stderr line           (summed, but counted as blocked)
 #   $HOME/.cache      timeout -> rc 124                         (TIMEOUT, not summed, blocked)
@@ -156,8 +156,8 @@ want_json='{"used_kb":10000,"measured_kb":1750,"blocked_dirs":3}'
 
 # default run: the summary line on stdout. mutants 071a05e875 b31737e0da e8766b2e36 (argument parsing, the default
 # must NOT be json), 2683e20a59 5f92c9db66 (the lib guard must not fire here), f824a17009 (the target list is read),
-# 9f59831d9e 29bc7faf68 2b67dd3db3 (empty target skipped, others kept), 60a2a6a9bb 8e485a046c (missing dir skipped,
-# present dirs measured), e8696aafb9 e73e7ff858 cc2428a6e1 4305bf2b22 332cf48af6 (only a root WITH permission errors
+# 9f59831d9e 29bc7faf68 2b67dd3db3 (a non-empty target is not skipped by the empty-target guard), 60a2a6a9bb 8e485a046c
+# (present dirs are measured; the missing one is skipped in the run further down), e8696aafb9 e73e7ff858 cc2428a6e1 4305bf2b22 332cf48af6 (only a root WITH permission errors
 # is blocked: the clean root, the one-line-of-errors root), fa07ff7749 4b76eb3cb2 8fc5fe1bc8 (summary vs json)
 dob_run
 # vazio → o cat devolve "" e a igualdade reprova; ilegível (arquivo ausente) → idem
