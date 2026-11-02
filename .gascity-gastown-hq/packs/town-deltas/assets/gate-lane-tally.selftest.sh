@@ -605,7 +605,7 @@ chk("the mechanical-check codes are exactly the six doc/test bounces", sorted(l.
 chk("--help carries the first line of the docstring (argparse wraps it, so compare on single spaces)", "how many gate rounds the DOC/TEST fast lane saved" in " ".join(run("--help")[1].split()), True)
 # one decision, no signal: the smallest window that still has to be tallied
 lone = mk("glt-lone.jsonl", ev("2026-10-02T09:00:00Z", event=GL, lane="normal", marker="only", reason_code="code-or-prompt"))
-chk("--json keeps non-ASCII text readable", "código" in run("--log", lone, "--now", NOW, "--json")[1], True)
+chk("--json keeps non-ASCII text readable", "c\u00f3digo" in run("--log", lone, "--now", NOW, "--json")[1], True)
 h1 = T + "/glt-h1.jsonl"
 shutil.which = lambda n: None
 try:
@@ -614,7 +614,7 @@ finally:
     shutil.which = real_which
 chk("--weekly --no-notify with no notify on PATH: rc 0 and nothing on stderr", (rc, err), (0, ""))
 hist = open(h1).read().splitlines() if os.path.exists(h1) else []
-chk("a window with exactly ONE decision still appends its history line, text unescaped", (len(hist), len(hist) == 1 and "código" in hist[0]), (1, True))
+chk("a window with exactly ONE decision still appends its history line, text unescaped", (len(hist), len(hist) == 1 and "c\u00f3digo" in hist[0]), (1, True))
 rc, out, err = run("--log", lone, "--now", NOW, "--weekly", "--out", T + "/no-such-dir/h.jsonl", "--no-notify")
 chk("--weekly that cannot append says so and exits 2", (rc, "could not append" in err), (2, True))
 shutil.which = lambda n: "/x/notify"
@@ -688,8 +688,8 @@ chk("gc rig list and bd get 90 s by default", seen, [90, 90])
 # the one-line notify and the report, with the counts a window can really have
 r = m.tally(lone, 7, now)
 chk("ONE decision is a headline, not the no-decision warning", m.notify_line(dict(r, decisions=1, fast=0)).startswith("0/1 diffs na fast-lane"), True)
-chk("unmatched fast runs are disclosed whenever there is a decision", "; 2 run(s) fast sem decisão pareada" in m.notify_line(dict(r, decisions=1, saved_unmatched_assumed_1=2)), True)
-chk("...and not when there is no decision, nor when none is unmatched", ["sem decisão pareada" in m.notify_line(dict(r, decisions=0, saved_unmatched_assumed_1=2, fast_runs_completed=1)), "sem decisão pareada" in m.notify_line(dict(r, decisions=3, saved_unmatched_assumed_1=0))], [False, False])
+chk("unmatched fast runs are disclosed whenever there is a decision", "; 2 run(s) fast sem decis\u00e3o pareada" in m.notify_line(dict(r, decisions=1, saved_unmatched_assumed_1=2)), True)
+chk("...and not when there is no decision, nor when none is unmatched", ["sem decis\u00e3o pareada" in m.notify_line(dict(r, decisions=0, saved_unmatched_assumed_1=2, fast_runs_completed=1)), "sem decis\u00e3o pareada" in m.notify_line(dict(r, decisions=3, saved_unmatched_assumed_1=0))], [False, False])
 chk("the lost-bugs reason is quoted up to 140 characters", "(" + "n" * 140 + ");" in m.notify_line(dict(r, tr_granted=1, tr_bugs_after=None, tr_bugs_uncovered=1, tr_bugs_note="n" * 150)), True)
 chk("the fast-lane share is 100 x fast / decisions, rounded", "fast-lane 1 (33%)" in m.render(dict(r, decisions=3, fast=1)), True)
 print("\n".join(fails))

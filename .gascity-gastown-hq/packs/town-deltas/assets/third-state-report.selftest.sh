@@ -273,8 +273,8 @@ finally:
 chk("classify: an empty gate_run is unknown and is never read", (list(res.values()), calls), ([("desconhecido", "-")], []))
 # the cells: exactly 5 observations, exactly 60% and 30%, and the range when some reads are missing
 chk("first_cell: n=5 is a percentage, and exactly 60% reaches the goal", m.first_cell(dict(n=5, **{"pass": 3})), ("60% (3/5)", "atinge"))
-chk("third_cell: exactly 30% does NOT reach the goal", m.third_cell(dict(third=3, outro=7, unk=0)), ("30% (3/10)", "NÃO atinge"))
-chk("third_cell with unread runs: a ceiling of exactly 30% is no conclusion, a floor of exactly 30% misses the goal", (m.third_cell(dict(third=1, outro=7, unk=2))[1], m.third_cell(dict(third=3, outro=5, unk=2))[1]), ("sem conclusão", "NÃO atinge"))
+chk("third_cell: exactly 30% does NOT reach the goal", m.third_cell(dict(third=3, outro=7, unk=0)), ("30% (3/10)", "N\u00c3O atinge"))
+chk("third_cell with unread runs: a ceiling of exactly 30% is no conclusion, a floor of exactly 30% misses the goal", (m.third_cell(dict(third=1, outro=7, unk=2))[1], m.third_cell(dict(third=3, outro=5, unk=2))[1]), ("sem conclus\u00e3o", "N\u00c3O atinge"))
 # the report on a window whose first and last verdicts sit EXACTLY on its edges, with a cut line on each edge too
 EDGE = city("tsr-edge", v("2026-10-09T09:00:00Z", "A1", "PASS", reason="ok"), v("2026-10-16T09:00:00Z", "A2", "FAIL", reason="Reviewer 1 FAIL: x", gate_run="R1"), v("2026-10-12T00:00:00Z", "A3", "PASS", dry_run="1"), v("2026-10-12T00:00:00Z", "A4", "SKIPPED"), "{\"ts\":\"2026-10-09T09:00:00Z\",\"event\":\"dispatcher_comp", "{\"ts\":\"2026-10-16T09:00:00Z\",\"event\":\"dispatcher_comp")
 rc, out, err = main("--city", EDGE, *NL)
