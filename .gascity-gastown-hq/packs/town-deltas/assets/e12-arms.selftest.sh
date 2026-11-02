@@ -66,12 +66,15 @@ run assign ga-abc /store;       [ -z "$OUT" ] && [ -z "$ERR" ] && [ "$RC" = 0 ] 
 [ ! -e "$SD/e12-roster.jsonl" ] && ok "no conf: no roster row (an absent experiment records nothing)" || bad "no conf: a roster was written"
 run arm ga-abc;                 [ -z "$OUT" ] && [ "$RC" = 4 ] && ok "no conf: arm prints nothing, exit 4 — no experiment is NOT 'control'" || bad "no conf: arm out='$OUT' rc=$RC"
 run block ga-abc /store --no-record; [ -z "$OUT" ] && [ "$RC" = 0 ] && ok "no conf: block --no-record is inert too" || bad "no conf: block --no-record out='$OUT' rc=$RC"
+# $(...) swallows trailing newlines, so the empty-OUT checks above cannot see a stray "\n": count the bytes instead.
+_n="$(/bin/bash "$E12" assign ga-abc /store 2>/dev/null | wc -c | tr -d ' ')"
+[ "$_n" = 0 ] && ok "no conf: assign writes zero bytes to stdout (not even a newline)" || bad "no conf: assign wrote $_n byte(s) to stdout"
 
 echo "== 2. a conf that cannot be read is its own state — never 'no conf' =="
 # The Pilot discards stderr and logs only a non-zero exit. If an invalid conf answered like "no conf" (exit 0, empty) a typo at turn-on
 # would run the experiment at 0% with no roster row and no log line — the ga-shag3i finding on E9. Not repeated here.
 for bc in "treated_pcts=50" "treated_pct=abc" "treated_pct=0" "treated_pct=101" "treated_pct=-5" "treated_pct=" "treated_pct=5 0" "treated_pct=50x" \
-          "just-a-line" "salt=x" "treated_pct=50" ; do
+          "treated_pct=0100" "just-a-line" "salt=x" "treated_pct=50" ; do
   newstate
   if [ "$bc" = "treated_pct=50" ]; then conf "treated_pct=50" "treated_pct=abc"; bc="treated_pct=50 THEN treated_pct=abc"; else conf "$bc"; fi
   run state
@@ -81,6 +84,8 @@ for bc in "treated_pcts=50" "treated_pct=abc" "treated_pct=0" "treated_pct=101" 
   case "$ERR" in *"NOT running"*) ok "bad conf '$bc': stderr says the experiment is NOT running" ;; *) bad "bad conf '$bc': stderr='$ERR'" ;; esac
   run assign ga-abc /store
   [ -z "$OUT" ] && [ "$RC" = 6 ] && [ ! -e "$SD/e12-roster.jsonl" ] && ok "bad conf '$bc': assign prints nothing, exit 6, no roster row" || bad "bad conf '$bc': assign out='$OUT' rc=$RC rows=$(rows)"
+  run arm ga-abc
+  [ -z "$OUT" ] && [ "$RC" = 2 ] && ok "bad conf '$bc': arm prints nothing and exits 2" || bad "bad conf '$bc': arm out='$OUT' rc=$RC"
 done
 newstate; : > "$SD/e12-ab.conf"; run state
 case "$OUT" in invalid:*) ok "empty conf → $OUT (what a failed write leaves behind must not switch the experiment on)" ;; *) bad "empty conf → '$OUT'" ;; esac
@@ -342,6 +347,8 @@ fi
 echo "== 6. usage =="
 run;            [ -z "$OUT" ] && [ "$RC" = 2 ] && case "$ERR" in *usage*) true ;; *) false ;; esac && ok "no command → usage on stderr, exit 2" || bad "no command: out='$OUT' rc=$RC err='$ERR'"
 run frobnicate; [ -z "$OUT" ] && [ "$RC" = 2 ] && ok "unknown command → exit 2" || bad "unknown command: rc=$RC"
+newstate; conf treated_pct=50
+run arm;        [ -z "$OUT" ] && [ "$RC" = 2 ] && ok "arm without a bead id → exit 2, prints nothing (the word 'arm' is not a bead)" || bad "arm without a bead: out='$OUT' rc=$RC"
 
 # This selftest ends in `rm -rf "$W"`. If mktemp fails (the disk has been near full here) the old code went on with W empty and wrote to
 # "/s1", "/want"…; the sibling selftest, worse, turned its empty path into the CURRENT directory and deleted it while printing PASS.
@@ -395,6 +402,56 @@ for _sh in "${BASH:-/bin/bash}" /bin/bash; do
   _o="$("$_sh" -c 'set -euo pipefail; . "$1"; e12_resolve ga-s8-rec2 store stage 1; echo "arm=$E12_ARM"' _ "$E12" 2>&1)"; _rc=$?
   [ "$_rc" = 0 ] && [ "$_o" = "arm=treated" ] && [ "$(rowsfor ga-s8-rec2)" = 1 ] && [ "$(wc -l < "$SD/e12-roster.jsonl" | tr -d ' ')" = 3 ] && ok "$_sh: …and the next record over the now-clean tail adds no extra newline (3 lines)" || bad "$_sh: record over a clean tail under set -euo pipefail: exit=$_rc out='${_o:0:120}' lines=$(wc -l < "$SD/e12-roster.jsonl" | tr -d ' ')"
 done
+
+# The CLI cases above reach e12_record only through e12_recorded_arm and e12_resolve, whose own guards come first, so the guards inside
+# e12_record (no jq, no state dir, an empty row, a roster that is not a file, an unreadable last byte, an append that fails) were never read
+# by their status, and e12_conf_load / e12_main were never run under set -e. Each case below calls the function in a child that sources
+# the library, with a FUNCTION shim standing in for jq, tr, od or mkdir that FAILS BUT STILL PRINTS A GOOD-LOOKING VALUE — the third state a
+# happy-path test never produces. (ga-qec2rdl, hq-mutants lastro.) EQUIVALENT, documented: 4f28f91c90 and de3fb6044f (`{ [ -f ] && [ -r ]; } ||
+# return 3` in e12_recorded_arm): the jq call right below fails with rc 2 on exactly the roster those guards turn away, and that failure is
+# already mapped to rc 3. Measured with and without the guard on a directory, a chmod-000 file and a dangling link: rc 3, empty stdout.
+echo "== 9. e12_record and e12_conf_load: the status of every branch =="
+rec() { # <prelude> — a child sources the lib, runs the prelude (shims), calls e12_record and prints its status
+  "${BASH:-/bin/bash}" -c '. "$1"; E12_STATE_DIR="$2"; E12_PCT=50; eval "$3"; e12_record b-1 /st treated stage1; echo "rc=$?"' _ "$E12" "$SD" "$1" 2>/dev/null
+}
+rc_is() { # <wanted rc> <title> <prelude>
+  local got; got="$(rec "$3")"
+  [ "$got" = "rc=$1" ] && ok "$2 (rc=$1)" || bad "$2: wanted rc=$1, got '${got:-nothing}'"
+}
+roster_lines() { if [ -e "$SD/e12-roster.jsonl" ]; then wc -l < "$SD/e12-roster.jsonl" | tr -d ' '; else echo none; fi; }
+NOJQ="$W/nojq"; mkdir -p "$NOJQ"
+for _t in mkdir date tail od tr cat; do ln -s "$(command -v "$_t")" "$NOJQ/$_t"; done
+SD="$W/nojq-state"; export E12_STATE_DIR="$SD"
+_o="$(PATH="$NOJQ" rec '')"
+[ "$_o" = "rc=3" ] && [ ! -e "$SD" ] && ok "no jq: rc 3, and the state directory is not even created" || bad "no jq: got '$_o', state dir $([ -e "$SD" ] && echo created || echo absent)"
+newstate; : > "$W/blocker"; SD="$W/blocker/sub"; export E12_STATE_DIR="$SD"
+rc_is 3 "state directory that cannot be created (its parent is a file)" ''
+newstate; rc_is 3 "mkdir that fails but did create the directory: nothing is recorded" 'mkdir() { command mkdir "$@"; return 1; }'
+[ "$(roster_lines)" = none ] && ok "…and no roster was written" || bad "mkdir failed but a roster appeared ($(roster_lines) line(s))"
+newstate; rc_is 3 "a treated_pct jq cannot read" 'E12_PCT=abc'
+newstate; rc_is 3 "jq that fails but prints a row" 'jq() { echo ROW; return 5; }'
+[ "$(roster_lines)" = none ] && ok "…and no roster was written" || bad "failing jq still produced a roster ($(roster_lines) line(s))"
+newstate; rc_is 3 "jq that exits 0 and prints nothing" 'jq() { return 0; }'
+[ "$(roster_lines)" = none ] && ok "…and no empty row was appended" || bad "empty jq output still produced a roster ($(roster_lines) line(s))"
+newstate; ln -s "$W/gone" "$SD/e12-roster.jsonl"
+rc_is 3 "roster that is a dangling symlink" ''
+[ ! -e "$W/gone" ] && ok "…and the append did not create its target through the link" || bad "the dangling roster link was written through"
+newstate; printf '{"x":1}\n' > "$SD/e12-roster.jsonl"
+rc_is 3 "last byte read by a tr that fails but prints 0a" 'tr() { printf 0a; return 1; }'
+[ "$(roster_lines)" = 1 ] && ok "…and nothing was appended" || bad "failing tr still appended ($(roster_lines) line(s))"
+newstate; printf '{"x":1}\n' > "$SD/e12-roster.jsonl"
+rc_is 3 "last byte that od reports as garbage" 'od() { echo zz; }'
+[ "$(roster_lines)" = 1 ] && ok "…and nothing was appended" || bad "garbage last byte still appended ($(roster_lines) line(s))"
+if [ "$(id -u)" != 0 ]; then
+  newstate; printf '{"x":1}\n' > "$SD/e12-roster.jsonl"; chmod 444 "$SD/e12-roster.jsonl"
+  rc_is 3 "roster that cannot be appended to" ''
+  chmod 600 "$SD/e12-roster.jsonl"
+fi
+newstate
+_o="$("${BASH:-/bin/bash}" -c 'set -e; . "$1"; e12_conf_load; echo "reached state=$E12_STATE"' _ "$E12" 2>&1)"; _rc=$?
+[ "$_rc" = 0 ] && [ "$_o" = "reached state=absent" ] && ok "no conf: e12_conf_load under set -e is an answer (absent), not an abort" || bad "e12_conf_load under set -e: exit=$_rc out='$_o'"
+_o="$("${BASH:-/bin/bash}" -c 'set -e; . "$1"; e12_main' _ "$E12" 2>/dev/null)"; _rc=$?
+[ "$_rc" = 2 ] && ok "e12_main with no argument under set -e: usage, exit 2 (shifting zero arguments is not an abort)" || bad "e12_main under set -e: exit=$_rc"
 
 echo
 echo "e12-arms selftest: $PASS passed, $FAILN failed"
