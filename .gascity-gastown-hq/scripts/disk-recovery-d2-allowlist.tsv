@@ -5,7 +5,7 @@
 #
 # FORMATO. Uma linha por job, 9 colunas separadas por TAB (nunca espaço; campo vazio = `-`). Linha em branco e linha que começa com `#` são ignoradas.
 #   1 id               nome curto, minúsculas/dígitos/ponto/hífen (é a chave do registro de "o que foi parado")
-#   2 adapter          COMO ler o run_id e COMO retomar (código em disk-recovery-d2-heavy-jobs.sh; hoje só `rfb`; a leitura do run_id já está, a retomada automática é a fatia ga-1p1i5jr.2.1)
+#   2 adapter          COMO ler o run_id e COMO retomar (código em disk-recovery-d2-heavy-jobs.sh; hoje só `rfb`)
 #   3 match_regex      ERE aplicada à linha de comando COMPLETA do processo (ps -axww). Âncora no começo: só o interpretador do job casa
 #   4 parent_regex     ERE aplicada à linha de comando do PAI. O job de verdade tem o pai do launchd (job_timeout.sh ...); um `python3 -m py_compile` ou um
 #                      --dry-run rodado por gente/teste NÃO tem esse pai e nunca é tocado
@@ -14,7 +14,6 @@
 #   7 resume_window    janela em que a retomada é permitida, `H1-H2` em horas locais (21-6 = das 21h às 6h) ou `-` = a qualquer hora
 #   8 resume_max_age_s depois disso o run parado é ABANDONADO (o dado que o retomaria já não vale); `-` = nunca expira
 #   9 como             texto livre: COMO para e COMO retoma (é a documentação viva; o código faz o que está aqui)
-#   Nesta fatia o --run só APLICA a coluna 5; as colunas 6 a 8 são lidas e validadas e as 6 e 7 vão na dica de retomada à mão. Quem as aplica é o --resume (ga-1p1i5jr.2.1).
 #
 # O QUE ENTRA. Só entra job que (a) é lote em segundo plano, reiniciável, (b) um SIGTERM no meio não deixa o destino inconsistente, (c) tem retomada que não
 # perde o trabalho já feito (ou o livre é tão baixo que perder vale a pena), e (d) um kill dele não vira alarme para o Athos. Nada fora desta lista é parado

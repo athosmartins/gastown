@@ -2,7 +2,7 @@
 # disk-recovery-d2-heavy-jobs.sh — degrau D2 da escada de recuperação de disco do mini (ga-1p1i5jr.2, missão ga-1p1i5jr).
 #
 # ## Contents
-#   Para que serve · Uso · Contrato (saída e códigos) · A allowlist · O que o rfb ensina · O registro do que foi parado · Como retomar (à mão nesta fatia) · Guardas · Variáveis · Teste
+#   Para que serve · Uso · Contrato (saída e códigos) · A allowlist · O que o rfb ensina · O registro do que foi parado · Retomar · Guardas · Variáveis · Teste
 #
 # PARA QUE SERVE. A escada (ga-1p1i5jr.1, scripts/disk-recovery-ladder.sh) chama este degrau quando o livre do volume de dados ficou <= 5 GB por 15 min: D1 (limpar
 # arquivo) já tentou. Aqui se PARA, e só se para, jobs pesados e reiniciáveis que estão na ALLOWLIST (scripts/disk-recovery-d2-allowlist.tsv). Memória pesada vira
@@ -10,14 +10,15 @@
 # Decisão do Athos para a escada (citável): AskUserQuestion na sessão do Mayor, 01/11/2026 ~11:00 BRT, "A qualquer hora, com guardas (Recomendado)".
 #
 # USO
-#   disk-recovery-d2-heavy-jobs.sh --dry-run   só diz o que faria. Não toma trava, não grava estado nem log, não lê o S3.
+#   disk-recovery-d2-heavy-jobs.sh --dry-run   só diz o que faria. Não toma trava, não grava estado nem log, não lê o S3, não chama launchctl.
 #   disk-recovery-d2-heavy-jobs.sh --run       real: para o que a allowlist manda parar e anota o que parou.
+#   disk-recovery-d2-heavy-jobs.sh --resume    ADITIVO (fora do contrato da escada): retoma o que o --run parou, quando o disco voltou. Seguro de repetir a cada tick.
 #
 # CONTRATO (o do Mayor + o do orquestrador dog-2). stdout: UMA linha, sempre ("D2 --run: ..."). Códigos de saída:
-#   0   agiu e terminou     (parou ao menos um e todos morreram)
-#   10  nada a fazer, ou uma guarda adiou (nada rodando · rodando mas o livre está acima do piso de parada do job · outra instância em execução)
-#   20  falhou              (não conseguiu gravar o registro, o processo não morreu ou a morte não foi comprovada, erro interno)
-#   30  não consegui ler o estado e por isso NÃO agi (df, ps ou allowlist ilegíveis; ps ilegível na re-conferência antes do primeiro sinal; não consegui criar nem verificar a trava; regex larga demais)
+#   0   agiu e terminou     (--run: parou ao menos um e todos morreram · --resume: lançou a retomada)
+#   10  nada a fazer, ou uma guarda adiou (nada rodando · rodando mas o livre está acima do piso de parada do job · outra instância em execução · retomar ainda não pode: disco, janela, o job recusou)
+#   20  falhou              (não conseguiu gravar o registro, o processo não morreu ou a morte não foi comprovada, a retomada não subiu, erro interno)
+#   30  não consegui ler o estado e por isso NÃO agi (df, ps, allowlist, registro, plist ou launchctl list ilegíveis; ps ilegível na re-conferência antes do primeiro sinal; não consegui criar nem verificar a trava; regex larga demais)
 #   --dry-run devolve os mesmos códigos como previsão (0 = agiria). Quem avisa o Athos (notify/mail em 0/20) é o orquestrador: este degrau só escreve o próprio log.
 #
 # A ALLOWLIST. Casa por REGEX contra a linha de comando do processo E a do PAI (o job de verdade tem o pai do launchd), nunca por tamanho de memória. O arquivo é
@@ -25,15 +26,20 @@
 #
 # O QUE O RFB ENSINA (a pergunta do bead: retoma do ponto ou do zero?). Por TABELA: a que terminou e foi verificada tem checkpoint no S3 e é reaproveitada; a que estava
 # em andamento recomeça do ZERO (horas). Por isso o piso de parada do rfb é 3 GB (não os 5 GB em que o D2 é chamado): acima disso o D2 devolve 10 e deixa o job
-# terminar a tabela. O tick das 00:15 seguinte começa um run NOVO — a retomada tem de vir antes dele (o --resume é a fatia 2/2, bead ga-1p1i5jr.2.1).
+# terminar a tabela. O tick das 00:15 seguinte começa um run NOVO — a retomada tem de vir antes dele, e este script é quem a faz.
 #
 # O REGISTRO DO QUE FOI PARADO. $D2_STATE (padrão $CITY/.gc/disk-recovery-d2.state), TSV de eventos, só acrescenta:
 #   epoch  EVENTO  id  pid  início_epoch  run_id  livre_MB  detalhe          (campo vazio = `-`)
 #   STOPPING (gravado ANTES do kill) → STOPPED (morreu; carrega o run_id lido do S3) | STOP_FAILED
+#   RESUME_STARTED · RESUME_REFUSED (o próprio job disse "não rodei": segue pendente) · RESUME_FAILED · ABANDONED (velho demais, saiu da allowlist, já há outro processo)
+#   "Pendente de retomada" = o último evento do id é STOPPING, STOPPED ou RESUME_REFUSED.
 #
-# COMO RETOMAR (à mão, nesta fatia; o --resume automático é a fatia 2/2, bead ga-1p1i5jr.2.1). Com o livre >= resume_above_mb do job e dentro da janela dele, rodar
-# `rfb_stream_refresh.py --resume-run <run_id>`: o run_id está na linha FIM do --run e no registro. Se for `-`, o D2 não o leu (S3 fora do ar, nenhuma chave casando ou
-# mais de uma): então NÃO se adivinha; ver as chaves stream-run-* em RFB_META_URI. Sem retomar, o tick das 00:15 recomeça do zero.
+# RETOMAR (--resume). Só retoma o pendente se: o livre >= resume_above_mb do job; está na janela dele; não há processo do job rodando; o run não passou de resume_max_age_s;
+# e o run_id é LIDO (do registro ou do S3, casando pid + hora de início do processo parado) e tem a forma `<epoch>-<pid>` — NUNCA adivinhado. Lança via
+# `launchctl submit` (fora deste processo, para não morrer com o orquestrador) com o MESMO ambiente do plist do job (teto de memória e de RSS inclusos) e espera
+# $D2_RESUME_WATCH_S s: se o job passar dos portões dele e seguir vivo, é 0; se o portão dele recusar (rc 3 "NÃO RODEI": janela, disco 8,25 GiB, outro processo), é 10 e segue pendente.
+# QUEM CHAMA --resume: a escada chama o D2 só no aperto, então algo tem de chamá-lo quando o disco volta (tick do orquestrador ou um agendador próprio). Sem chamador,
+# o job fica parado até o tick das 00:15, que recomeça do zero.
 #
 # GUARDAS. (1) só mexe em processo da allowlist, do MEU usuário, com o pai certo, e re-confere a identidade logo antes do TERM e de novo logo antes do KILL (pid reaproveitado
 # não recebe sinal; resta só a janela de milissegundos entre a checagem e o kill); (2) "não consegui medir" nunca vira "disco baixo" nem "disco bom": é rc 30 e não age; (3) o registro é gravado ANTES do kill — sem registro, não para;
@@ -42,8 +48,8 @@
 # regex larga demais: rc 30, nada é tocado; (6) instância única por trava (mkdir): o dono é conferido pela LINHA DE COMANDO, não só pelo pid (pid reaproveitado não prende o D2).
 #
 # VARIÁVEIS (todas opcionais; as de TESTE estão marcadas). D2_CITY D2_ALLOWLIST D2_STATE D2_LOG D2_LOCK D2_VOLUME D2_TERM_GRACE_S D2_KILL_WAIT_S D2_MAX_MATCH D2_S3_TIMEOUT_S
-# D2_RFB_META_URI D2_LOCK_WAIT_S · binários: D2_PS_BIN D2_DF_BIN D2_AWS_BIN · TESTE: D2_FREE_MB D2_NOW D2_LOCKPS_BIN.
-# TESTE: bash scripts/disk-recovery-d2-heavy-jobs.selftest.sh   (hermético: processos de brinquedo, ps/df/aws simulados; nada real é parado; bateria de mutantes inclusa).
+# D2_RESUME_WATCH_S D2_RFB_ROOT D2_RFB_PYTHON D2_RFB_PLIST D2_RFB_META_URI D2_LOCK_WAIT_S · binários: D2_PS_BIN D2_DF_BIN D2_AWS_BIN D2_LAUNCHCTL_BIN D2_PYTHON3_BIN · TESTE: D2_FREE_MB D2_NOW D2_HOUR D2_LOCKPS_BIN.
+# TESTE: bash scripts/disk-recovery-d2-heavy-jobs.selftest.sh   (hermético: processos de brinquedo, ps/df/aws/launchctl simulados; nada real é parado; bateria de mutantes inclusa).
 #
 # bash 3.2 (o /bin/bash do macOS): sem declare -A, mapfile, ${v,,}.
 set -uo pipefail
@@ -61,7 +67,14 @@ PS_BIN="${D2_PS_BIN:-ps}"
 LOCKPS_BIN="${D2_LOCKPS_BIN:-ps}"   # só para conferir o dono da trava (pid → linha de comando); o teste troca por um que falha
 DF_BIN="${D2_DF_BIN:-df}"
 AWS_BIN="${D2_AWS_BIN:-aws}"
+LAUNCHCTL_BIN="${D2_LAUNCHCTL_BIN:-launchctl}"
+PYTHON3_BIN="${D2_PYTHON3_BIN:-/usr/bin/python3}"
+RFB_ROOT="${D2_RFB_ROOT:-/Users/athos/gt/whatsapp_automation}"
+RFB_PYTHON="${D2_RFB_PYTHON:-/opt/homebrew/bin/python3}"
+RFB_PLIST="${D2_RFB_PLIST:-$HOME/Library/LaunchAgents/com.whatsapp.rfb-monthly-refresh.plist}"
 RFB_META_URI="${D2_RFB_META_URI:-s3://urblink-motherduck-backups/real_estate/rfb/_meta/}"
+RESUME_LABEL="com.gascity.d2-resume.rfb"
+RESUME_LOG="$GCDIR/logs/disk-recovery-d2-resume-rfb.log"
 MYUID=$(id -u)
 TAB=$(printf '\t')
 NL='
@@ -78,6 +91,7 @@ KILL_WAIT_S=$(num D2_KILL_WAIT_S 5)
 MAX_MATCH=$(num D2_MAX_MATCH 3)
 S3_TIMEOUT_S=$(num D2_S3_TIMEOUT_S 40)
 LOCK_WAIT_S=$(num D2_LOCK_WAIT_S 2)
+WATCH_S=$(num D2_RESUME_WATCH_S 25)
 
 MODE=""; DRY=0; DONE=0; LOCK_HELD=0; RB=""
 
@@ -113,6 +127,10 @@ trap on_exit EXIT
 now() {
   local v="${D2_NOW:-}"
   case "$v" in ''|*[!0-9]*) date +%s ;; *) printf '%s' "$v" ;; esac
+}
+hour_now() {
+  local v="${D2_HOUR:-}"
+  case "$v" in ''|*[!0-9]*) date +%H ;; *) printf '%s' "$v" ;; esac
 }
 
 read_free_mb() {  # stdout: MB livres no volume de dados; rc 1 = não consegui ler (nunca imprime 0 no lugar do erro)
@@ -294,6 +312,15 @@ EOF
   return 0
 }
 
+row_of() { printf '%s' "$ROWS" | awk -F'\t' -v id="$1" '$1 == id { print; exit }'; }
+
+in_window() {  # $1=H1-H2 ("-" = sempre)
+  [ "$1" = "-" ] && return 0
+  local a=${1%-*} b=${1#*-} h
+  h=$(hour_now); a=$((10#$a)); b=$((10#$b)); h=$((10#$h))
+  if [ "$a" -lt "$b" ]; then [ "$h" -ge "$a" ] && [ "$h" -lt "$b" ]; else [ "$h" -ge "$a" ] || [ "$h" -lt "$b" ]; fi
+}
+
 # ── adapter rfb ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 rfb_run_id() {  # $1=pid $2=início_epoch → RUNID_RES = "ID <id>" | "NONE" | "AMBIGUOUS"; rc 1 = não consegui ler o S3 (sem subshell: o temporário é limpo no cleanup)
   local rc lo hi
@@ -311,6 +338,64 @@ rfb_run_id() {  # $1=pid $2=início_epoch → RUNID_RES = "ID <id>" | "NONE" | "
     END { n = 0; for (k in ids) { n++; one = k }
       if (n == 1) print "ID " one; else if (n == 0) print "NONE"; else print "AMBIGUOUS" }' "$RB") || return 1
   [ -n "$RUNID_RES" ] || return 1
+}
+
+rfb_plist_env() {  # stdout: K=V do EnvironmentVariables do plist do job; rc 1 = ilegível/vazio (não chuto o ambiente)
+  local out
+  out=$("$PYTHON3_BIN" -I -c '
+import plistlib, re, sys
+d = plistlib.load(open(sys.argv[1], "rb")).get("EnvironmentVariables")
+if not isinstance(d, dict) or not d:
+    sys.exit(1)
+for k, v in d.items():
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k) or not isinstance(v, str) or "\n" in v:
+        sys.exit(1)
+    print(k + "=" + v)' "$RFB_PLIST" 2>/dev/null) || return 1
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+
+rfb_launch() {  # $1=run_id → rc 0 = subiu e seguiu vivo · 10 = o próprio job recusou (rc 3) · 20 = falhou · 30 = ambiente do plist ilegível. LAUNCH_MSG diz o que houve
+  local rid=$1 envl kv lrc i=0 out st code
+  LAUNCH_MSG=""
+  envl=$(rfb_plist_env) || { LAUNCH_MSG="não consegui ler o EnvironmentVariables de $RFB_PLIST (não chuto o ambiente do job)"; return 30; }
+  # vazio (rc 113: o launchd não conhece o rótulo) → não há retomada, segue para o submit; falhou/ilegível (qualquer outro rc) → não sei se já há uma viva: rc 30, não lanço outra por cima
+  out=$("$LAUNCHCTL_BIN" list "$RESUME_LABEL" 2>/dev/null); lrc=$?
+  case "$lrc" in 0|113) ;; *) LAUNCH_MSG="launchctl list $RESUME_LABEL falhou (rc $lrc): não sei se já há uma retomada viva, não lanço outra"; return 30 ;; esac      # MUT:listfail
+  if [ "$lrc" -eq 0 ]; then
+    case "$out" in
+      *'"PID" = '[0-9]*) LAUNCH_MSG="já existe uma retomada viva ($RESUME_LABEL)"; return 10 ;;
+      *) "$LAUNCHCTL_BIN" remove "$RESUME_LABEL" >/dev/null 2>&1 ;;
+    esac
+  fi
+  mkdir -p "$(dirname "$RESUME_LOG")" 2>/dev/null
+  set -- /usr/bin/env
+  while IFS= read -r kv; do [ -n "$kv" ] && set -- "$@" "$kv"; done <<EOF
+$envl
+EOF
+  set -- "$@" /bin/bash -c 'cd "$1" && shift && exec "$@"' _ "$RFB_ROOT" /bin/bash "$RFB_ROOT/scripts/job_timeout.sh" 21600 com.whatsapp.rfb-stream-resume --soft -- \
+    "$RFB_PYTHON" "$RFB_ROOT/scripts/rfb_stream_refresh.py" --resume-run "$rid"
+  "$LAUNCHCTL_BIN" submit -l "$RESUME_LABEL" -o "$RESUME_LOG" -e "$RESUME_LOG" -- "$@" >/dev/null 2>&1 \
+    || { LAUNCH_MSG="launchctl submit falhou"; return 20; }
+  # a vigia: vivo (tem PID) → espera; sumiu ou o list falhou → rc 20 (o job foi submetido e não posso afirmar que está de pé); terminou (sem PID) → leio o código de saída
+  while [ "$i" -lt "$WATCH_S" ]; do
+    out=$("$LAUNCHCTL_BIN" list "$RESUME_LABEL" 2>/dev/null) \
+      || { LAUNCH_MSG="o launchd não lista $RESUME_LABEL depois do submit"; return 20; }
+    case "$out" in
+      *'"PID" = '[0-9]*) sleep 1; i=$((i + 1)) ;;
+      *) break ;;
+    esac
+  done
+  if [ "$i" -ge "$WATCH_S" ]; then LAUNCH_MSG="retomada --resume-run $rid viva depois de ${WATCH_S}s (passou dos portões do job); log: $RESUME_LOG"; return 0; fi
+  st=$(printf '%s\n' "$out" | sed -n 's/.*"LastExitStatus" = \([0-9][0-9]*\);.*/\1/p' | head -n 1)
+  "$LAUNCHCTL_BIN" remove "$RESUME_LABEL" >/dev/null 2>&1
+  case "$st" in '') LAUNCH_MSG="a retomada terminou antes de ${WATCH_S}s e não li o código de saída"; return 20 ;; esac
+  code=$st; [ "$st" -gt 255 ] && code=$((st / 256))
+  case "$code" in
+    0) LAUNCH_MSG="a retomada --resume-run $rid já terminou com sucesso (rc 0)"; return 0 ;;
+    3) LAUNCH_MSG="o job recusou a retomada (rc 3 NÃO RODEI: janela, disco 8,25 GiB, outro processo ou mês já carregado); log: $RESUME_LOG"; return 10 ;;
+    *) LAUNCH_MSG="a retomada --resume-run $rid saiu com rc $code antes de ${WATCH_S}s; log: $RESUME_LOG"; return 20 ;;
+  esac
 }
 
 # ── --run / --dry-run ───────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -384,16 +469,12 @@ EOF
           *) log "$id: mais de um run casa pid+hora ($RUNID_RES): não adivinho o run_id" ;;
         esac
       else
-        log "$id: não consegui ler o S3 (run_id fica '-': não adivinho; ver as chaves stream-run-* em $RFB_META_URI)"
+        log "$id: não consegui ler o S3 (o run_id fica para o --resume tentar de novo)"
       fi
       state_append STOPPED "$id" "$pid" "$start" "$rid" "$free" "morreu; livre antes ${free} MB" || log "ALERTA: $id morreu mas o registro STOPPED não gravou (o STOPPING já está lá)"      # MUT:record
       log "$id pid $pid: parado (run_id=$rid)"
       summary_stopped="${summary_stopped}${summary_stopped:+; }$id (pid $pid, livre ${free} MB <= ${stop_mb}; run_id ${rid})"
-      if [ "$rid" = "-" ]; then
-        resume_hint="${resume_hint}${resume_hint:+; }$id: run_id NÃO lido (ver stream-run-* em $RFB_META_URI)"
-      else
-        resume_hint="${resume_hint}${resume_hint:+; }$id: retomar à mão com rfb_stream_refresh.py --resume-run $rid quando livre >= ${resume_mb} MB (janela ${window})"
-      fi
+      resume_hint="${resume_hint}${resume_hint:+; }$id: retomar com --resume quando livre >= ${resume_mb} MB (janela ${window})"
     else
       if [ "$srp" -eq 1 ]; then why="não morreu depois de TERM+KILL"; else why="morte NÃO comprovada (ps ilegível, ou o pid vive sem casar mais com a allowlist)"; fi
       state_append STOP_FAILED "$id" "$pid" "$start" - "$free" "$why" || true
@@ -414,11 +495,102 @@ EOF
   finish 0 "parou $summary_stopped; $resume_hint"
 }
 
-usage() { MODE="${MODE:-uso}"; DRY=1; finish 2 "uso: $0 --run | --dry-run"; }      # DRY=1: uso errado não escreve no log de produção
+# ── --resume ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+pending_rows() {  # stdout: "id<TAB>pid<TAB>início<TAB>run_id<TAB>stop_epoch" dos ids cujo ÚLTIMO evento deixa a retomada pendente
+  # vazio (sem arquivo = o D2 nunca parou nada) → rc 0 sem linhas; falhou/ilegível (o arquivo existe e o awk não o lê) → rc != 0, e quem chama dá rc 30
+  [ -f "$STATE" ] || return 0
+  awk -F'\t' '
+    NF >= 7 { ev[$3] = $2; pid[$3] = $4; st[$3] = $5; rid[$3] = $6
+      if ($2 == "STOPPING" || $2 == "STOPPED") ts[$3] = $1
+      if ($2 == "STOPPED" && $6 != "-") rid[$3] = $6 }
+    END { for (i in ev) if (ev[i] == "STOPPING" || ev[i] == "STOPPED" || ev[i] == "RESUME_REFUSED") printf "%s\t%s\t%s\t%s\t%s\n", i, pid[i], st[i], rid[i], ts[i] }' "$STATE"
+}
+
+do_resume() {
+  local free pend line id pid start rid stopts row adapter re pre stop_mb resume_mb window maxage how procs age lrc code
+  local started="" failed="" unread="" waiting="" abandoned="" norec="" any=0
+  load_allowlist || finish 30 "$ALLOW_ERR; não ajo"
+  pend=$(pending_rows) || finish 30 "não consegui ler o registro $STATE; não ajo"
+  [ -n "$pend" ] || finish 10 "nada a retomar (nenhum job parado pendente em $STATE)"
+  free=$(read_free_mb) || finish 30 "não consegui ler o livre de $VOLUME (df); não ajo"
+  acquire_lock; lrc=$?      # rc 0 tomei · 1 outra instância · 2 não consegui criar nem verificar (NÃO é "outra instância": mesmo contrato do --run)      # MUT:resumelock
+  [ "$lrc" -eq 1 ] && finish 10 "outra instância do D2 em execução ($LOCKD): saio sem agir"
+  [ "$lrc" -eq 0 ] || finish 30 "não consegui criar nem verificar a trava $LOCKD (erro de gravação, ou ps/find ilegível): não retomo"
+  trim_log
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    IFS="$TAB" read -r id pid start rid stopts <<EOF
+$line
+EOF
+    any=1
+    row=$(row_of "$id")
+    if [ -z "$row" ]; then
+      state_append ABANDONED "$id" "$pid" "$start" "$rid" "$free" "saiu da allowlist"
+      abandoned="${abandoned}${abandoned:+; }$id (saiu da allowlist)"; continue
+    fi
+    IFS="$TAB" read -r id adapter re pre stop_mb resume_mb window maxage how <<EOF
+$row
+EOF
+    case "$stopts" in ''|*[!0-9]*) unread="${unread}${unread:+; }$id: registro sem hora válida do STOP"; continue ;; esac
+    age=$(( $(now) - stopts ))
+    if [ "$maxage" != "-" ] && [ "$age" -gt "$maxage" ]; then
+      state_append ABANDONED "$id" "$pid" "$start" "$rid" "$free" "parado há ${age}s > ${maxage}s: o run já não vale"
+      abandoned="${abandoned}${abandoned:+; }$id (parado há ${age}s > ${maxage}s: o próximo tick recomeça do zero)"; continue
+    fi
+    procs=$(find_procs "$re" "$pre") || { unread="${unread}${unread:+; }$id: não consegui ler o ps"; continue; }
+    if [ -n "$procs" ]; then
+      state_append ABANDONED "$id" "$pid" "$start" "$rid" "$free" "já há processo do job rodando"
+      abandoned="${abandoned}${abandoned:+; }$id (já há processo rodando: pid $(printf '%s\n' "$procs" | head -n 1 | cut -f1))"; continue
+    fi
+    if [ "$free" -lt "$resume_mb" ]; then      # MUT:hyst
+      waiting="${waiting}${waiting:+; }$id (livre ${free} MB < ${resume_mb} MB)"; continue
+    fi
+    if ! in_window "$window"; then      # MUT:window
+      waiting="${waiting}${waiting:+; }$id (fora da janela $window)"; continue
+    fi
+    if [ "$rid" = "-" ]; then
+      if rfb_run_id "$pid" "$start"; then
+        case "$RUNID_RES" in "ID "*) rid=${RUNID_RES#ID } ;; esac
+      else
+        unread="${unread}${unread:+; }$id: não consegui ler o S3 para achar o run_id (não adivinho)"; continue      # MUT:noguess
+      fi
+    fi
+    case "$rid" in '-'|'') rid="" ;; esac
+    if [ -z "$rid" ]; then
+      state_append ABANDONED "$id" "$pid" "$start" - "$free" "sem run_id comprovado: nada a retomar"
+      abandoned="${abandoned}${abandoned:+; }$id (sem checkpoint no S3 casando pid $pid: o tick da noite recomeça do zero)"; continue
+    fi
+    if ! printf '%s' "$rid" | grep -Eq '^[0-9]+-[0-9]+$'; then      # MUT:ridvalid
+      state_append ABANDONED "$id" "$pid" "$start" "$rid" "$free" "run_id com forma inválida"
+      abandoned="${abandoned}${abandoned:+; }$id (run_id com forma inválida no registro: recuso)"; continue
+    fi
+    log "$id: retomando --resume-run $rid (livre ${free} MB >= ${resume_mb})"
+    rfb_launch "$rid"; code=$?
+    case "$code" in
+      0)  state_append RESUME_STARTED "$id" "$pid" "$start" "$rid" "$free" "$LAUNCH_MSG" || { norec="${norec}${norec:+; }$id"; log "ALERTA: $id retomou (--resume-run $rid) mas o registro RESUME_STARTED não gravou: o próximo --resume pode lançar de novo"; }      # MUT:startrecord
+          started="${started}${started:+; }$id --resume-run $rid: $LAUNCH_MSG" ;;
+      10) state_append RESUME_REFUSED "$id" "$pid" "$start" "$rid" "$free" "$LAUNCH_MSG"
+          waiting="${waiting}${waiting:+; }$id: $LAUNCH_MSG" ;;
+      30) unread="${unread}${unread:+; }$id: $LAUNCH_MSG" ;;
+      *)  state_append RESUME_FAILED "$id" "$pid" "$start" "$rid" "$free" "$LAUNCH_MSG"
+          failed="${failed}${failed:+; }$id --resume-run $rid: $LAUNCH_MSG (retome à mão com o run_id)" ;;
+    esac
+  done <<EOF
+$pend
+EOF
+  [ "$any" = 1 ] || finish 10 "nada a retomar"
+  if [ -n "$failed" ]; then finish 20 "FALHOU: $failed${started:+ | retomou: $started}${unread:+ | não li: $unread}"; fi
+  if [ -n "$started" ]; then finish 0 "retomou $started${norec:+ | ALERTA: o job subiu mas o registro RESUME_STARTED NÃO gravou ($norec): um novo --resume pode lançar de novo se ele cair}${waiting:+ | adiado: $waiting}${abandoned:+ | abandonado: $abandoned}${unread:+ | não li: $unread}"; fi
+  if [ -n "$unread" ]; then finish 30 "não consegui ler o estado e não retomei: $unread"; fi
+  finish 10 "nada retomado: ${waiting}${waiting:+${abandoned:+ | }}${abandoned:+abandonado: $abandoned}"
+}
+
+usage() { MODE="${MODE:-uso}"; DRY=1; finish 2 "uso: $0 --run | --dry-run | --resume"; }      # DRY=1: uso errado não escreve no log de produção
 case "${1:-}" in
   --run)     MODE="--run" ;;
   --dry-run) MODE="--dry-run"; DRY=1 ;;
+  --resume)  MODE="--resume" ;;
   *)         usage ;;
 esac
 [ "$#" -eq 1 ] || usage
-do_run
+if [ "$MODE" = "--resume" ]; then do_resume; else do_run; fi
