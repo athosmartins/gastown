@@ -1597,7 +1597,8 @@ _pilot_infer_crew_from_owner() {
 # pick_pool_builder then SKIPS a full crew so the bead lands on a less-loaded peer (or
 # defers if all are full — better than piling on one). Counts are memoized per rig-DB
 # for the sweep (1 bd query per rig). Matches the crew by exact name, short name
-# (mila-wa→mila) and session-id forms (mila-wa-<sid>). PILOT_MAX_INFLIGHT_PER_CREW=0
+# (mila-wa→mila) and session-id forms (mila-wa-<sid>) — but NOT remote sessions
+# (…-remote-…: Hetzner node or MBP, ga-ohw13b4 — they have their own capacity). PILOT_MAX_INFLIGHT_PER_CREW=0
 # disables. FAIL-OPEN: no rig context / probe error → not capped (never blocks dispatch).
 PILOT_MAX_INFLIGHT_PER_CREW="${PILOT_MAX_INFLIGHT_PER_CREW:-3}"
 _PILOT_INFLIGHT_RIGS_DONE=""
@@ -1622,8 +1623,13 @@ _crew_inflight_count() {
       _PILOT_INFLIGHT_RIGS_DONE="$_PILOT_INFLIGHT_RIGS_DONE $rig"
       ;;
   esac
+  # Sessão remota (nó Hetzner ou MBP: wa-worker-remote-N, wa-worker-remote-mbp, ps-worker-remote-N, dog-remote-N…) NÃO é vaga do mini (ga-ohw13b4): o nome curto «wa-worker» casa por prefixo («wa-worker-»)
+  # também com wa-worker-remote-*, e 3 beads em curso no nó enchiam as 4 vagas wa-worker-1..4 de uma vez — o pick devolvia vazio e a bead adiava («all crew busy»)
+  # ANTES de chegar ao gancho do nó. A capacidade do nó é do nó (_PWN_SLOTS) e a do MBP é do MBP; este teto guarda o mini. O segmento «remote» é palavra inteira (entre «-» ou nas
+  # pontas): o sufixo de sessão «gawispremote1» continua contando, e as wa-worker-adhoc-* (workers efêmeros do próprio mini) também. Lista vazia ou ilegível → n=0
+  # (abre, como antes).
   printf '%s\n' "$_PILOT_INFLIGHT_MAP" | awk -F'\t' -v r="$rig" -v c="$crew" -v s="$short" '
-    $1==r { a=$2; if (a==c || a==s || index(a,c"-")==1 || index(a,s"-")==1) n++ }
+    $1==r { a=$2; if (a ~ /(^|-)remote(-|$)/) next; if (a==c || a==s || index(a,c"-")==1 || index(a,s"-")==1) n++ }
     END { print n+0 }'
 }
 _crew_at_inflight_cap() {
