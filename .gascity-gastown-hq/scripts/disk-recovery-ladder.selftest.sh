@@ -2,9 +2,11 @@
 # disk-recovery-ladder.selftest.sh — testa o maestro da escada de recuperação de disco (ga-1p1i5jr.1) SEM tocar na máquina.
 #
 # O QUE É SIMULADO  df, swap e relógio (arquivos `DR_FREE_MB_FILE` / `DR_SWAP_MB_FILE` / `DR_NOW_FILE`: cada "rodada" do launchd é uma chamada com a hora que o teste escolhe, então 6 h de reinício
-#   passam em segundos), os degraus D2/D3/D4 (stubs que registram a chamada e devolvem o rc que o teste manda), `notify` e `gc mail` (stubs que só anotam). Nada real é parado, reiniciado
-#   ou enviado. O trecho que lê o `df`/`sysctl` de verdade é testado com shims no PATH (o `df` shim também prova que NUNCA se lê `df /`).
-# O QUE É VERIFICADO  uma seção por regra do maestro (títulos abaixo): fronteiras dos limiares, histerese, lacuna, ordem e um degrau por rodada, piso duro, teto de 6 h do D4, leituras ilegíveis = não age.
+#   passam em segundos), os degraus D2/D3/D4 (stubs que registram a chamada e devolvem o rc que o teste manda), `notify` e `gc mail` (stubs que anotam a chamada e falham quando o teste manda; o `notify` imita os
+#   códigos de política do de verdade quando recebe NOTIFY_STRICT_EXIT=1: 10 segurado, 11 dedup, 12 resumo/teto). Nada real é parado, reiniciado ou enviado. O trecho que lê o `df`/`sysctl` de verdade é testado
+#   com shims no PATH (o `df` shim também prova que NUNCA se lê `df /`); `mv`, `ln` e `cp` com defeito entram do mesmo jeito, para provar que o arquivo de estado nunca fica sem existir.
+# O QUE É VERIFICADO  uma seção por regra do maestro (títulos abaixo): fronteiras dos limiares, histerese, lacuna, ordem e um degrau por rodada, piso duro, teto de 6 h do D4, leituras ilegíveis = não age,
+#   e "tentado ≠ entregue": nenhuma marca de "já avisei" é gravada sem um canal confirmar (notify e mail falhando → a rodada seguinte avisa de novo).
 # COMO RODAR     bash scripts/disk-recovery-ladder.selftest.sh        (~3-5 min sob carga)
 #   O caminho de quem tem o disco apertado é pelo guarda: scripts/heavy-guard.sh --what selftest-hq --max-file-mb 512 -- bash scripts/disk-recovery-ladder.selftest.sh
 #   Para testar uma cópia modificada do maestro (mutantes): DR_LADDER_PATH=/caminho/disk-recovery-ladder.mutN.sh ST_FAILFAST=1 bash scripts/disk-recovery-ladder.selftest.sh
@@ -44,8 +46,8 @@ for n in d2 d3 d4; do
   cp /dev/null "$W/stubs/$n"
   cat > "$W/stubs/$n" <<'STUB'
 #!/bin/bash
-# degrau simulado. Modo em $STUB_DIR/mode.<nome>: linhas rc=N msg=... setfree=N slp=N killp=1
-n=$(basename "$0"); rc=0; msg="stub $n"; setfree=""; slp=0; killp=0
+# degrau simulado. Modo em $STUB_DIR/mode.<nome>: linhas rc=N msg=... setfree=N slp=N killp=1 waitfor=ARQUIVO (espera o arquivo existir, no máx. 30 s: segura o degrau sem depender da velocidade da máquina)
+n=$(basename "$0"); rc=0; msg="stub $n"; setfree=""; slp=0; killp=0; waitfor=""
 [ -f "$STUB_DIR/mode.$n" ] && . "$STUB_DIR/mode.$n"
 echo "$n $1" >> "$STUB_DIR/calls"
 echo $$ > "$STUB_DIR/pid.$n"
@@ -53,6 +55,7 @@ cp "$DR_STATE" "$STUB_DIR/state_at_call.$n" 2>/dev/null
 [ -n "$setfree" ] && printf '%s' "$setfree" > "$DR_FREE_MB_FILE"
 [ "$killp" = 1 ] && kill -9 "$PPID"
 [ "$slp" -gt 0 ] && sleep "$slp"
+w=0; while [ -n "$waitfor" ] && [ ! -e "$waitfor" ] && [ "$w" -lt 300 ]; do sleep 0.1; w=$((w+1)); done
 echo "$msg"
 exit "$rc"
 STUB
@@ -62,8 +65,10 @@ cat > "$W/stubs/notify" <<'STUB'
 #!/bin/bash
 p=""; t=""
 while [ $# -gt 1 ]; do case "$1" in -p) p=$2; shift 2 ;; -t) t=$2; shift 2 ;; *) shift ;; esac; done
-echo "p=$p force=${NOTIFY_FORCE_PUSH:-} t=$t msg=$1" >> "$STUB_DIR/notify.log"
-case "$(cat "$STUB_DIR/notify.mode" 2>/dev/null)" in fail) echo "boom"; exit 1 ;; hang) sleep 30 ;; esac
+echo "p=$p force=${NOTIFY_FORCE_PUSH:-} t=$t msg=$1 strict=${NOTIFY_STRICT_EXIT:-}" >> "$STUB_DIR/notify.log"
+# strict=N = como o notify de verdade (scripts/notify, policy_exit): sem NOTIFY_STRICT_EXIT sai 0 em todo caminho que não empurrou (resumo, dedup, segurado até as 7h); com ele sai N (10 segurado, 11 dedup, 12 resumo/teto, ...)
+m=$(cat "$STUB_DIR/notify.mode" 2>/dev/null)
+case "$m" in fail) echo "boom"; exit 1 ;; hang) sleep 30 ;; strict=*) [ "${NOTIFY_STRICT_EXIT:-}" = 1 ] && { echo "policy"; exit "${m#strict=}"; } ;; esac
 exit 0
 STUB
 cat > "$W/stubs/gc" <<'STUB'
@@ -123,7 +128,7 @@ nmail()   { local n; n=$(grep -c -F -- "$1" "$SD/mail.log" 2>/dev/null); echo "$
 sv()  { sed -n "s/^$1=//p" "$STATE" 2>/dev/null | head -n 1; }
 logtxt() { cat "$LOG" 2>/dev/null; }
 mkstate() {  # arquivo since2 since3 since4 [acted4_ts] [hard_n]: estado COMPLETO (todas as chaves do save_state) escrito à mão; última leitura = T0, sem lacuna
-  printf 'v=1\nlast_ts=%s\nlast_free_mb=2900\nlast_swap_mb=0\nhard_n=%s\nhard_ts=0\nacted4_ts=%s\nesc4=0\nwarn_ts=0\nwarn2_ts=0\nhb_ts=%s\nsince2=%s\nsince3=%s\nsince4=%s\nst2=none\nst3=none\nst4=none\nat2=0\nat3=0\nat4=0\nnt2=0\nnt3=0\nnt4=0\n' \
+  printf 'v=1\nlast_ts=%s\nlast_free_mb=2900\nlast_swap_mb=0\nhard_n=%s\nhard_ts=0\nacted4_ts=%s\nesc4=0\nwarn_ts=0\nhb_ts=%s\nsince2=%s\nsince3=%s\nsince4=%s\nst2=none\nst3=none\nst4=none\nat2=0\nat3=0\nat4=0\nnt2=0\nnt3=0\nnt4=0\nut2=0\nut3=0\nut4=0\n' \
     "$T0" "${6:-0}" "${5:-0}" "$T0" "$2" "$3" "$4" > "$1"
 }
 mode() { printf '%s\n' "${@:2}" > "$SD/mode.$1"; }
@@ -184,6 +189,18 @@ tick MISSING 0 $((T0 + 3600))
 eq "$(nnotify 'p=4 force=1')" 2 "aviso de leitura impossível: de novo depois de 1 h"
 reset; setfree 20000; setswap 0; printf 'zz' > "$W/now"; runl --run
 eq "$RC" 30 "relógio ilegível → 30"; has "$OUT" "relógio ilegível" "relógio ilegível: diz"
+# gate-fix 2 (tentado ≠ entregue): o carimbo de "1 por hora" só vale depois que o notify CONFIRMOU; sem confirmação a rodada seguinte avisa de novo
+reset; echo fail > "$SD/notify.mode"; tick MISSING 0 "$T0"
+eq "$(nnotify 'p=4 force=1'),$(sv warn_ts)" "1,0" "df ilegível com o notify falhando: 1 tentativa e o carimbo de 1 h NÃO é gravado"
+rm -f "$SD/notify.mode"; tick MISSING 0 $((T0 + 120))
+eq "$(nnotify 'p=4 force=1'),$(sv warn_ts)" "2,$((T0 + 120))" "…notify de volta: a rodada seguinte avisa e só então grava o carimbo"
+tick MISSING 0 $((T0 + 240))
+eq "$(nnotify 'p=4 force=1')" 2 "…e depois fica calado (1 por hora)"
+# carimbo no FUTURO (relógio que andou para trás): "agora - carimbo" negativo não pode calar o aviso
+reset; tick 20000 0 "$T0"
+sed 's/^warn_ts=0$/warn_ts=9999999999/' "$STATE" > "$STATE.x" && mv "$STATE.x" "$STATE"
+tick MISSING 0 $((T0 + 120))
+eq "$(nnotify 'p=4 force=1')" 1 "carimbo de aviso no FUTURO (relógio andou para trás): não cala o aviso de leitura impossível"
 
 section "leitura ilegível: swap"
 for bad in MISSING "" abc -1 2.5; do
@@ -242,6 +259,32 @@ eq "$RC" 20 "…a saída do maestro continua 20 nas rodadas sem aviso"
 has "$(logtxt)" "FALHOU de novo: o aviso e o mail dele saíram há" "…e o log diz que suprimiu"
 tick 5000 0 $((T0 + 4500))
 eq "$(nnotify 'p=4 force=1 t=Disco: degrau D2 FALHOU'),$(nmail 'D2 FALHOU')" "2,2" "passada 1 h do último aviso: avisa de novo"
+
+section "aviso que NINGUÉM recebeu não vira carimbo de 1 h (gate-fix 2: tentado ≠ entregue)"
+reset; mode d2 rc=20; echo fail > "$SD/notify.mode"; echo fail > "$SD/mail.mode"
+walk 5000 0 "$T0" $((T0 + 900)) 300
+eq "$(nnotify 'p=4 force=1 t=Disco: degrau D2 FALHOU'),$(nmail 'D2 FALHOU'),$(sv nt2)" "1,1,0" "D2 FALHOU com notify e mail sem confirmação: 1 tentativa de cada, carimbo NÃO gravado"
+has "$(logtxt)" "aviso de D2 FALHOU NÃO entregue" "…e o log diz que vai repetir"
+rm -f "$SD/notify.mode" "$SD/mail.mode"
+tick 5000 0 $((T0 + 1200))
+eq "$(nnotify 'p=4 force=1 t=Disco: degrau D2 FALHOU'),$(nmail 'D2 FALHOU'),$(sv nt2)" "2,2,$((T0 + 1200))" "canais de volta: a chamada seguinte do D2 (5 min) avisa e só então grava o carimbo"
+tick 5000 0 $((T0 + 1500))
+eq "$(nnotify 'p=4 force=1 t=Disco: degrau D2 FALHOU'),$(nmail 'D2 FALHOU')" "2,2" "…entregue: calado de novo pela hora seguinte"
+reset; mode d2 rc=0
+walk 5000 0 "$T0" $((T0 + 900)) 300
+mode d2 rc=20
+walk 5000 0 $((T0 + 1400)) $((T0 + 2400)) 500; tick 5000 0 $((T0 + 2700))
+eq "$(nnotify 'p=3 force= t=Disco: degrau D2 agiu'),$(nnotify 'p=4 force=1 t=Disco: degrau D2 FALHOU')" "1,1" "D2 agiu e 30 min depois FALHA: o aviso de FALHOU sai (o carimbo do 'agiu' não cala outra classe de aviso)"
+reset; mode d2 rc=30; echo fail > "$SD/notify.mode"
+walk 5000 0 "$T0" $((T0 + 900)) 300
+eq "$(nnotify 'p=3 force= t=Disco: degrau D2 não leu'),$(sv ut2)" "1,0" "D2 não leu com o notify falhando: 1 tentativa e o carimbo de 1 h NÃO é gravado"
+rm -f "$SD/notify.mode"; tick 5000 0 $((T0 + 1200))
+eq "$(nnotify 'p=3 force= t=Disco: degrau D2 não leu'),$(sv ut2)" "2,$((T0 + 1200))" "…notify de volta: a chamada seguinte do D2 (5 min) avisa e só então grava o carimbo"
+tick 5000 0 $((T0 + 1500))
+eq "$(nnotify 'p=3 force= t=Disco: degrau D2 não leu')" 2 "…entregue: calado de novo pela hora seguinte"
+reset; mode d2 rc=30; mode d3 rc=10; mode d4 rc=30
+walk 2500 0 "$T0" $((T0 + 3600)) 300
+eq "$(nnotify 'p=3 force= t=Disco: degrau D2 não leu'),$(nnotify 'p=4 force=1 t=Disco: degrau D4 não leu')" "1,1" "D2 não leu aos 15 min e D4 não leu aos 60: os dois avisos saem (carimbo POR degrau; o D2 em -p 3 não cala o D4 em -p 4 forçado)"
 
 section "D2: estourou o tempo → TERM e conta como falha"
 reset; XENV=(DR_RUNG_TIMEOUT_S=1); mode d2 slp=30
@@ -352,6 +395,14 @@ walk 2900 0 "$T0" $((T0 + 3500)) 100
 eq "$(ncall d4 --run)" 0 "D2 e D3 ausentes: o D4 NÃO é chamado antes do tempo dele (aos 3500 s)"
 tick 2900 0 $((T0 + 3600))
 eq "$(ncall d4 --run)" 1 "…e é chamado aos 3600 s"
+# gate-fix 2: a marca "já avisei" (absent) só é gravada depois que o notify CONFIRMOU; sem isso o D2 sumido fica mudo pelo episódio inteiro
+reset; XENV=("DR_D2_CMD=$W/nao-existe"); echo fail > "$SD/notify.mode"
+walk 5000 0 "$T0" $((T0 + 900)) 300
+eq "$(nnotify 'p=4 force=1 t=Disco: degrau D2 ausente'),$(sv st2)" "1,none" "D2 ausente com o notify falhando: 1 tentativa e a marca 'já avisei' (absent) NÃO é gravada"
+rm -f "$SD/notify.mode"; tick 5000 0 $((T0 + 1000))
+eq "$(nnotify 'p=4 force=1 t=Disco: degrau D2 ausente'),$(sv st2)" "2,absent" "…notify de volta: a rodada seguinte avisa e só então grava absent"
+tick 5000 0 $((T0 + 1100)); tick 5000 0 $((T0 + 1200))
+eq "$(nnotify 'p=4 force=1 t=Disco: degrau D2 ausente')" 2 "…e depois fica calado (uma vez por episódio)"
 
 section "teto de 6 h do D4: sem reinício em laço"
 reset; mode d2 rc=10; mode d3 rc=10; mode d4 rc=0
@@ -369,6 +420,50 @@ eq "$(sv st4),$(sv esc4),$(sv acted4_ts)" "none,0,$((T0 + 3600))" "disco recuper
 reset; XENV=(DR_D2_HOLD_S=60 DR_D3_HOLD_S=120 DR_D4_HOLD_S=180); mode d2 rc=10; mode d3 rc=10; mode d4 rc=0
 walk 2500 0 "$T0" $((T0 + 180)) 60; tick 9000 0 $((T0 + 240)); walk 2500 0 $((T0 + 300)) $((T0 + 540)) 60
 eq "$(ncall d4 --run),$(nnotify 'preciso de um humano')" "1,1" "novo episódio dentro de 6 h: D4 não repete e escala"
+
+section "escalada do teto de 6 h: só conta como feita se algum canal CONFIRMOU a entrega (gate-fix 2: tentado ≠ entregue)"
+# D4 agiu aos 60 min; a repetição do 'acted' é aos 30 min (T0+5400): é aí que o teto de 6 h cai na escalada. Rodadas de 300 s (a lacuna máxima é 600 s).
+capwalk() { reset; mode d2 rc=10; mode d3 rc=10; mode d4 rc=0; walk 2500 0 "$T0" $((T0 + 5100)) 300; }
+# o instante T0+5100 (D4 já agiu, o teto está prestes a cair na escalada) é guardado uma vez; cada variante volta a ele sem refazer a caminhada de 5100 s
+caprestore() { rm -f "$SD/notify.mode" "$SD/mail.mode" "$CITY/.gc/disk-recovery.nosave"; cp "$W/cap.state" "$STATE"; cp "$W/cap.calls" "$SD/calls"; : > "$SD/notify.log"; : > "$SD/mail.log"; : > "$LOG"; }
+capwalk; cp "$STATE" "$W/cap.state"; cp "$SD/calls" "$W/cap.calls"
+cp "$STATE" "$W/state.before"; cp "$LOG" "$W/log.before"; : > "$SD/notify.log"; : > "$SD/mail.log"
+setfree 2500; setswap 0; printf '%s' $((T0 + 5400)) > "$W/now"; runl --dry-run
+has "$OUT" "ESCALA:" "dry-run no teto de 6 h: mostra a escalada"
+cmp -s "$STATE" "$W/state.before" && cmp -s "$LOG" "$W/log.before" && ok "dry-run no teto: estado e log intactos (esc4 não gravado)" || nope "dry-run no teto mexeu no estado ou no log"
+eq "$(nnotify p=)$(nmail to=)" 00 "dry-run no teto: nada de notify/mail"
+echo fail > "$SD/notify.mode"; echo fail > "$SD/mail.mode"
+tick 2500 0 $((T0 + 5400))
+eq "$(nnotify 'preciso de um humano'),$(nmail 'já disparou'),$(sv esc4)" "1,1,0" "escalada com notify E mail sem confirmação: 1 tentativa de cada e esc4 NÃO gravado"
+has "$(logtxt)" "escalada NÃO entregue" "…e o log diz que repete"
+rm -f "$SD/notify.mode" "$SD/mail.mode"
+tick 2500 0 $((T0 + 5520))
+eq "$(nnotify 'preciso de um humano'),$(nmail 'já disparou'),$(sv esc4)" "2,2,1" "canais de volta: a rodada seguinte escala de novo (o único 'preciso de um humano' não se perde)"
+walk 2500 0 $((T0 + 5640)) $((T0 + 6000)) 120
+eq "$(nnotify 'preciso de um humano'),$(nmail 'já disparou'),$(ncall d4 --run)" "2,2,1" "…entregue: calado de novo, e o D4 nunca é chamado de novo"
+for ch in notify mail; do
+  caprestore; echo fail > "$SD/$ch.mode"
+  tick 2500 0 $((T0 + 5400)); rm -f "$SD/$ch.mode"; tick 2500 0 $((T0 + 5520))
+  eq "$(sv esc4),$(nnotify 'preciso de um humano'),$(nmail 'já disparou')" "1,1,1" "só o $ch falhou: o outro canal entregou, a escalada vale e NÃO repete"
+done
+# NOTIFY_STRICT_EXIT=1 só nos avisos de -p >= 4 (push forçado): sem ele o notify sai 0 em todo caminho que não empurrou e o rc 0 não prova que chegou ao telefone.
+# Com ele (scripts/notify, policy_exit): 10 segurado até as 7h (silêncio 22h–7h do Athos; fica no history.db e o flush das 7h empurra) e 11 dedup = o aviso já está garantido; 12 resumo/teto, 1 transporte, 13, 14 = nada saiu.
+for code in 10 11 12 13 14 1; do
+  caprestore; echo "strict=$code" > "$SD/notify.mode"; echo fail > "$SD/mail.mode"
+  tick 2500 0 $((T0 + 5400)); tick 2500 0 $((T0 + 5520))
+  case "$code" in
+    10|11) eq "$(sv esc4),$(nnotify 'preciso de um humano')" "1,1" "notify rc=$code com STRICT (segurado até as 7h / dedup) + mail sem confirmação: a escalada vale e NÃO repete (nada se perde)"
+           has "$(logtxt)" "conto como entregue" "…e o log diz que contou como entregue" ;;
+    *)     eq "$(sv esc4),$(nnotify 'preciso de um humano')" "0,2" "notify rc=$code com STRICT (nada saiu) + mail sem confirmação: a escalada NÃO vale e repete a cada rodada" ;;
+  esac
+done
+has "$(grep -F 'preciso de um humano' "$SD/notify.log")" "force=1" "o notify da escalada sai com o push forçado"
+has "$(grep -F 'preciso de um humano' "$SD/notify.log")" "strict=1" "…e com NOTIFY_STRICT_EXIT=1"
+reset; echo strict=12 > "$SD/notify.mode"; mode d2 rc=0; mode d3 rc=0
+walk 3500 0 "$T0" $((T0 + 1800)) 300
+hasnt "$(grep -F 'degrau D2 agiu' "$SD/notify.log")" "strict=1" "D2 agiu (-p 3, roteamento normal): sem STRICT (rc 0 = o roteador aceitou, resumo incluído)"
+has "$(grep -F 'degrau D3 agiu' "$SD/notify.log")" "strict=1" "D3 agiu (-p 4 forçado): com STRICT"
+has "$(logtxt)" "notify NÃO confirmado rc=12" "…e o resumo mudo em -p 4 vira 'NÃO confirmado' no log"
 
 section "D4 falhou ou adiou: a marca de reinício volta"
 reset; mode d2 rc=10; mode d3 rc=10; mode d4 rc=20
@@ -400,6 +495,14 @@ for body in "lixo sem chave" "v=1\nsince2=abc" "v=1\nst2=bogus" "v=1\nsince2=-5"
   [ -n "$(ls "$STATE".corrupt-* 2>/dev/null)" ] && ok "estado '$lbl': posto de lado" || nope "estado '$lbl': não pôs de lado"
   eq "$(sv since2)" $((T0 + 900)) "estado '$lbl': cronômetro recomeça agora"
   eq "$(sv acted4_ts)" $((T0 + 900)) "estado '$lbl': acted4_ts = AGORA (não sei se o D4 acabou de disparar)"
+done
+
+for k in ut2 ut3 ut4; do   # campos novos do gate-fix 2: um valor que não é número chegaria à aritmética do carimbo e, sob set -u, abortaria a rodada
+  reset; tick 20000 0 "$T0"
+  sed "s/^$k=0\$/$k=abc/" "$STATE" > "$STATE.x" && mv "$STATE.x" "$STATE"
+  tick 20000 0 $((T0 + 120))
+  eq "$RC" 0 "estado salvo com $k=abc: a rodada segue (0), sem abortar"
+  has "$OUT" "estado salvo ilegível" "estado salvo com $k=abc: ilegível, avisa e recomeça"
 done
 
 section "estado CORTADO numa fronteira de linha (prefixo válido): chave que falta não vira 0 em silêncio"
@@ -447,6 +550,15 @@ if [ "$(id -u)" != 0 ]; then
   touch -t 200001010000 "$CITY/.gc/disk-recovery.nosave"; tick 20000 0 $((T0 + 240))
   eq "$(nnotify 'p=4 force=1 t=Disco: a escada não consegue gravar o estado')" 2 "…e de novo depois de 1 h"
   chmod 755 "$W/ro"
+  # gate-fix 2: a marca do aviso (arquivo vazio) só é tocada depois que o notify CONFIRMOU
+  reset; mkdir -p "$W/ro"; chmod 555 "$W/ro"; XENV=("DR_STATE=$W/ro/state"); echo fail > "$SD/notify.mode"
+  tick 20000 0 "$T0"
+  eq "$(nnotify 'p=4 force=1 t=Disco: a escada não consegue gravar o estado')" 1 "estado não gravável com o notify falhando: 1 tentativa"
+  [ ! -e "$CITY/.gc/disk-recovery.nosave" ] && ok "…e a marca de 1 h NÃO é gravada" || nope "marca gravada sem o notify confirmar"
+  rm -f "$SD/notify.mode"; tick 20000 0 $((T0 + 120))
+  eq "$(nnotify 'p=4 force=1 t=Disco: a escada não consegue gravar o estado')" 2 "…notify de volta: a rodada seguinte avisa"
+  [ -e "$CITY/.gc/disk-recovery.nosave" ] && ok "…e só então grava a marca" || nope "marca não gravada depois da entrega"
+  chmod 755 "$W/ro"
 
   section "estado ruim + estado não gravável: o arquivo ruim FICA no lugar até o novo estar gravado (senão o acted4_ts se perde de vez)"
   # limite do teste: dir somente-leitura também barra o rename, então isto prova o comportamento visível (nada some, o novo nasce com acted4_ts=agora), não a ordem tmp→aside em si (essa está no save_state)
@@ -489,6 +601,30 @@ if [ "$(id -u)" != 0 ]; then
   eq "$(sed -n 's/^acted4_ts=//p' "$W/ro/state" | head -n 1)" $((T0 + 240)) "…com a marca do reinício gravada"
 fi
 
+section "estado novo troca o ruim por rename: o STATE nunca fica sem existir (sem ele = 'primeira rodada' = teto de 6 h perdido)"
+mkdir -p "$W/mvbin" "$W/lnbin"
+printf '#!/bin/bash\ncase "$*" in *.tmp.*) exit 1 ;; esac\nexec /bin/mv "$@"\n' > "$W/mvbin/mv"   # só o mv do estado NOVO (arquivo .tmp.) falha
+printf '#!/bin/bash\nexit 1\n' > "$W/lnbin/ln"; cp "$W/lnbin/ln" "$W/lnbin/cp"                    # nem link nem cópia da evidência
+chmod 755 "$W/mvbin/mv" "$W/lnbin/ln" "$W/lnbin/cp"
+reset; mode d4 rc=0
+tick 1400 0 "$T0"; tick 1400 0 $((T0 + 120))
+eq "$(ncall d4 --run)" 1 "D4 disparou uma vez (2 leituras < 1,5 GB)"
+printf 'lixo' > "$STATE"
+XENV=("PATH=$W/mvbin:$PATH"); tick 1400 0 $((T0 + 240)); XENV=()
+eq "$RC" 30 "o mv do estado novo falhou → 30"
+[ "$(cat "$STATE" 2>/dev/null)" = lixo ] && ok "…o estado ruim continua no lugar (nunca houve um instante sem STATE)" || nope "o STATE sumiu quando o mv do estado novo falhou"
+[ -n "$(ls "$STATE".corrupt-* 2>/dev/null)" ] && ok "…e a evidência (.corrupt) foi guardada" || nope "sem .corrupt"
+hasnt "$(logtxt)" "não consegui guardar o estado ruim" "…sem aviso falso de evidência perdida (a 2ª gravação da rodada reconhece o .corrupt que já existe)"
+tick 1400 0 $((T0 + 360)); tick 1400 0 $((T0 + 480))
+eq "$(ncall d4 --run)" 1 "…e as rodadas seguintes NÃO reiniciam de novo (o teto de 6 h valeu o tempo todo)"
+reset; printf 'lixo' > "$STATE"; XENV=("PATH=$W/lnbin:$PATH"); tick 20000 0 "$T0"
+eq "$RC,$(sv acted4_ts)" "0,$T0" "sem link nem cópia da evidência: o estado novo é gravado mesmo assim (acted4_ts = agora)"
+has "$(logtxt)" "não consegui guardar o estado ruim" "…e o log diz que a evidência se perdeu"
+reset; mkdir -p "$STATE"
+tick 20000 0 "$T0"
+[ "$RC" = 0 ] && [ -f "$STATE" ] && ok "estado que é um DIRETÓRIO (sem link duro, sem cópia): sai do caminho e o estado novo nasce, a escada não fica cega" || nope "diretório no lugar do estado: rc=$RC e o estado novo não nasceu"
+[ -n "$(ls -d "$STATE".corrupt-* 2>/dev/null)" ] && ok "…e o diretório foi guardado como .corrupt" || nope "o diretório sumiu sem ser guardado"
+
 section "kill switch e dry-run"
 reset; walk 5000 0 "$T0" $((T0 + 800)) 100
 cp "$STATE" "$W/state.before"; cp "$LOG" "$W/log.before"
@@ -505,7 +641,9 @@ reset; printf 'lixo' > "$STATE"; runl --dry-run
 reset; touch "$OFF"; runl --dry-run; eq "$RC" 10 "dry-run respeita o kill switch"
 
 section "trava de instância única"
-reset; walk 5000 0 "$T0" $((T0 + 800)) 100; mode d2 rc=10 slp=3
+# o degrau da 1ª instância fica parado até o arquivo de liberação existir (em vez de um sleep fixo de 3 s): a trava segue ocupada pelo tempo que o teste precisar, qualquer que seja a velocidade da máquina
+rm -f "$W/release"
+reset; walk 5000 0 "$T0" $((T0 + 800)) 100; mode d2 rc=10 "waitfor=$W/release"
 printf '%s' 5000 > "$W/free"; printf '%s' 0 > "$W/swap"; printf '%s' $((T0 + 900)) > "$W/now"
 ( env -i "${BASE[@]}" /bin/bash "$LADDER" --run > "$W/first.out" 2>&1 ) &
 bgpid=$!
@@ -514,7 +652,7 @@ runl --run
 eq "$RC" 10 "segunda instância enquanto a primeira roda → 10"
 has "$(logtxt)" "outra instância" "…e diz no log"
 runl --dry-run; eq "$RC" 0 "dry-run não toma a trava"
-wait "$bgpid"
+touch "$W/release"; wait "$bgpid"
 [ ! -d "$LOCK" ] && ok "primeira instância liberou a trava" || nope "trava sobrou"
 reset; mkdir "$LOCK"; ( : ) & dead=$!; wait "$dead"; echo "$dead" > "$LOCK/pid"
 tick 20000 0 "$T0"; eq "$RC" 0 "trava de pid morto é refeita"
@@ -535,21 +673,25 @@ eq "$(ncallall)" 0 "DR_D2_HOLD_S=abc: usou 900 (não 0): nada chamado aos 600 s"
 has "$(logtxt)" "DR_D2_HOLD_S='abc'->900" "…e o log diz que caiu no padrão"
 has "$(logtxt)" "DR_HYST_MB='99999999999'->512" "número comprido demais também cai no padrão"
 has "$(logtxt)" "DR_D4_HOLD_S='-1'->3600" "número negativo também"
+reset; XENV=(DR_D4_HARD_N=0)
+tick 20000 0 "$T0"; tick 20000 0 $((T0 + 120))
+eq "$(ncall d4 --run)" 0 "DR_D4_HARD_N=0 (abaixo do mínimo, 1) cai no padrão: com o disco folgado o D4 NÃO é chamado"
+has "$(logtxt)" "DR_D4_HARD_N='0'->2" "…e o log diz que caiu no padrão"
 
 section "notify e mail com defeito não derrubam a rodada"
 reset; echo fail > "$SD/notify.mode"; echo fail > "$SD/mail.mode"
 walk 5000 0 "$T0" $((T0 + 900)) 100
 eq "$RC,$(sv st2)" "0,acted" "notify e mail falhando: o degrau agiu, rodada 0, marca acted"
-has "$(logtxt)" "WARN: notify rc=1" "notify falhou: WARN no log"
-has "$(logtxt)" "WARN: gc mail send mayor rc=1" "mail falhou: WARN no log"
+has "$(logtxt)" "WARN: notify NÃO confirmado rc=1" "notify falhou: WARN no log"
+has "$(logtxt)" "WARN: gc mail send mayor NÃO confirmado rc=1" "mail falhou: WARN no log"
 reset; XENV=("DR_GC_BIN=$W/sem-gc")
 walk 5000 0 "$T0" $((T0 + 900)) 100
-has "$(logtxt)" "WARN: gc mail send mayor rc=127" "gc ausente: WARN rc=127, sem travar"
+has "$(logtxt)" "WARN: gc mail send mayor NÃO confirmado rc=127" "gc ausente: WARN rc=127, sem travar"
 reset; XENV=(DR_NOTIFY_TIMEOUT_S=1); echo hang > "$SD/notify.mode"
 walk 5000 0 "$T0" $((T0 + 800)) 100
 SECONDS=0; tick 5000 0 $((T0 + 900)); el=$SECONDS
 [ "$el" -le 25 ] && ok "notify travado é cortado (${el}s)" || nope "notify travado segurou a rodada ${el}s"
-has "$(logtxt)" "WARN: notify rc=124" "notify travado: rc=124 no log"
+has "$(logtxt)" "WARN: notify NÃO confirmado rc=124" "notify travado: rc=124 no log"
 reset; XENV=("TMPDIR=$W/nao/existe")
 walk 5000 0 "$T0" $((T0 + 900)) 100
 eq "$(sv st2)" unknown "sem mktemp: o degrau fica unknown (não 'agiu')"
