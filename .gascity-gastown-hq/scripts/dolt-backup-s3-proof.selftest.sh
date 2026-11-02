@@ -23,8 +23,9 @@ CALLS="$T/aws-calls.log"; : > "$CALLS"
 # ── the fake aws ─────────────────────────────────────────────────────────────────
 cat > "$T/aws" <<'STUB'
 #!/bin/bash
-# fake aws — see selftest header. Env knobs: FAKE_LIST_FAIL, FAKE_SYNC_FAIL,
-# FAKE_SYNC_NOOP, FAKE_DRYRUN_FAIL, FAKE_CP_UP_FAIL, FB (bucket dir), CALLS (call log).
+# fake aws — see selftest header. Env knobs: FAKE_LIST_FAIL, FAKE_LIST_PARTIAL_FAIL (prints every key,
+# then exits 255), FAKE_SYNC_FAIL, FAKE_SYNC_NOOP, FAKE_DRYRUN_FAIL, FAKE_CP_UP_FAIL, FB (bucket dir),
+# CALLS (call log).
 echo "aws $* [csum=${AWS_REQUEST_CHECKSUM_CALCULATION:-<unset>}]" >> "$CALLS"
 sub="$1"; shift
 case "$sub" in
@@ -34,7 +35,7 @@ case "$sub" in
     d="$FB/${prefix%/}"
     if [ ! -d "$d" ] || [ -z "$(ls -A "$d" 2>/dev/null)" ]; then echo "None"; exit 0; fi
     out=""; for f in "$d"/*; do out="${out:+$out	}${prefix}$(basename "$f")"; done
-    echo "$out"; exit 0 ;;
+    echo "$out"; [ "${FAKE_LIST_PARTIAL_FAIL:-0}" = 1 ] && exit 255; exit 0 ;;
   s3)
     op="$1"; shift
     case "$op" in
@@ -99,7 +100,7 @@ mkdir_backup() { # <dir> <n_tables>  — tables 1..n; odd ones raw, even ones .d
     if [ $((i%2)) -eq 1 ]; then printf 'data%s' "$i" > "$d/$(tid "$i")"; else printf 'darc%s' "$i" > "$d/$(tid "$i").darc"; fi
   done
 }
-reset_bucket() { rm -rf "$FB"; mkdir -p "$FB"; : > "$CALLS"; : > "$LOGF"; unset FAKE_LIST_FAIL FAKE_SYNC_FAIL FAKE_SYNC_NOOP FAKE_DRYRUN_FAIL FAKE_CP_UP_FAIL; }
+reset_bucket() { rm -rf "$FB"; mkdir -p "$FB"; : > "$CALLS"; : > "$LOGF"; unset FAKE_LIST_FAIL FAKE_LIST_PARTIAL_FAIL FAKE_SYNC_FAIL FAKE_SYNC_NOOP FAKE_DRYRUN_FAIL FAKE_CP_UP_FAIL; }
 
 # ── _s3proof_manifest_tables ─────────────────────────────────────────────────────
 echo "── _s3proof_manifest_tables ──"
@@ -210,6 +211,73 @@ N_UP="$(grep -c 's3 sync .* --exclude manifest' "$CALLS")"
 reset_bucket; mkdir_backup "$T/P4" 6; mkdir_backup "$FB/db1" 6; : > "$CALLS"
 _s3proof_repair_then_prove "$T/P4" db1 && ok "already proven → returns 0" || bad "perfect mirror not proven"
 ! grep -q -- '--exclude manifest' "$CALLS" && ok "…without uploading anything" || bad "uploaded although already proven"
+
+# ── hq-mutants lastro (ga-ow127o6): status codes, silence and fail-closed edges the cases above never crossed ──
+# Every "NOT proven" below is asserted by BOTH the status and the library's own reason in $LOGF, and $LOGF is emptied
+# before each case: a reason that is absent (log unreadable or never written) makes the case fail, never pass.
+echo "── _s3proof_manifest_tables: status 0 and silence on nothing-to-list ──"
+# mutants aa1c83c38a (early `return 0` -> `return 1`), 484a86890e (no early return: a missing file prints a redirect error),
+# 678b5a69fb (`|| true` -> `&& true`: a manifest with no table ids would end with grep's status 1)
+for f in "$T/mempty" "$T/does-not-exist" "$T/mgarbage"; do
+  err="$(_s3proof_manifest_tables "$f" 2>&1 >/dev/null)"; rc=$?
+  [ "$rc" -eq 0 ] && [ -z "$err" ] && ok "$(basename "$f"): status 0 and nothing on stderr" || bad "$(basename "$f"): rc=$rc stderr='$err'"
+done
+
+echo "── _s3proof_local_closure_ok: a non-empty manifest that names no tables ──"
+# mutant f31b34c6c2 (`return 1` -> `return 0` on "names no tables")
+mkdir -p "$T/L6"; printf 'this is not a manifest' > "$T/L6/manifest"; : > "$LOGF"
+_s3proof_local_closure_ok "$T/L6" && bad "a manifest naming no tables was PROVEN" || ok "manifest present but naming no tables → NOT proven"
+grep -q 'names no tables' "$LOGF" && ok "…for that reason (not the empty-manifest one)" || bad "log lacks 'names no tables': $(cat "$LOGF")"
+
+echo "── AWS / BUCKET unset: every entry point refuses, each variable on its own ──"
+# mutants d625ba574a 4d36b4381a 42c05997a4 (`||` -> `&&`: refused only when BOTH are unset), f08c5aedbf f1cb3e76c3 (`return 1` -> `return 0`)
+for var in AWS BUCKET; do
+  reset_bucket; mkdir_backup "$FB/db1" 4; mkdir_backup "$T/E1" 4
+  : > "$LOGF"; (unset "$var"; _s3proof_s3_closure_ok db1) && bad "s3_closure_ok proven with $var unset" || ok "s3_closure_ok refuses with $var unset"
+  grep -q 'AWS/BUCKET not set' "$LOGF" && ok "…and says AWS/BUCKET not set" || bad "s3_closure_ok($var unset): no reason in the log: $(cat "$LOGF")"
+  : > "$LOGF"; (unset "$var"; _s3proof_mirror_identical "$T/E1" db1) && bad "mirror_identical called identical with $var unset" || ok "mirror_identical refuses with $var unset"
+  grep -q 'AWS/BUCKET not set' "$LOGF" && ok "…and says AWS/BUCKET not set" || bad "mirror_identical($var unset): no reason in the log: $(cat "$LOGF")"
+  : > "$LOGF"; : > "$CALLS"; (unset "$var"; _s3proof_mirror_up "$T/E1" db1) && bad "mirror_up uploaded with $var unset" || ok "mirror_up refuses with $var unset"
+  grep -q 'AWS/BUCKET not set' "$LOGF" && [ ! -s "$CALLS" ] && ok "…with its reason in the log and not one aws call" || bad "mirror_up($var unset): log='$(cat "$LOGF")' calls=$(grep -c . "$CALLS")"
+done
+
+echo "── _s3proof_s3_closure_ok: mktemp failures are fail-closed and leave nothing behind ──"
+# mutants 58485a53f7 (first mktemp), dcefab2861 (second mktemp): `return 1` -> `return 0`. The stub fails the Nth call.
+MKN="$T/mktemp.n"; mkdir -p "$T/tmpd"
+mktemp() { local n; n="$(cat "$MKN" 2>/dev/null || echo 0)"; n=$((n+1)); echo "$n" > "$MKN"; [ "$n" = "${MKTEMP_FAIL_AT:-0}" ] && return 1; command mktemp "$@"; }
+for at in 1 2; do
+  reset_bucket; mkdir_backup "$FB/db1" 4; : > "$MKN"; rm -f "$T"/tmpd/*
+  TMPDIR="$T/tmpd" MKTEMP_FAIL_AT=$at _s3proof_s3_closure_ok db1 && bad "mktemp call #$at failed and the S3 copy was PROVEN" || ok "mktemp call #$at fails → NOT proven"
+  grep -q 'mktemp failed' "$LOGF" && ok "…saying so" || bad "mktemp #$at: no 'mktemp failed' in the log: $(cat "$LOGF")"
+  [ -z "$(ls -A "$T/tmpd")" ] && ok "…and no temp file is left behind" || bad "mktemp #$at left: $(ls "$T/tmpd")"
+done
+unset -f mktemp
+
+echo "── _s3proof_s3_closure_ok: a listing that fails halfway, and a manifest that names nothing ──"
+# mutant 6fb70f7977 (`||` -> `&&` on "rc != 0 OR empty"), 20a19985f5 (`return 1` -> `return 0` on "S3 manifest names no tables")
+reset_bucket; mkdir_backup "$FB/db1" 8
+FAKE_LIST_PARTIAL_FAIL=1 _s3proof_s3_closure_ok db1 && bad "a listing that exited non-zero was trusted for its keys" || ok "listing prints every key but exits non-zero → NOT proven (unknown ≠ fine)"
+grep -q 'could not list' "$LOGF" && ok "…as a listing failure" || bad "no 'could not list' in the log: $(cat "$LOGF")"
+reset_bucket; mkdir -p "$FB/db1"; printf 'not a manifest' > "$FB/db1/manifest"; printf 'x' > "$FB/db1/$(tid 1)"
+_s3proof_s3_closure_ok db1 && bad "an S3 manifest naming no tables was PROVEN" || ok "S3 manifest that names no tables → NOT proven"
+grep -q 'names no tables' "$LOGF" && ok "…for that reason" || bad "no 'names no tables' in the log: $(cat "$LOGF")"
+
+echo "── _s3proof_restorable_and_identical: every stage must hold on its own ──"
+# mutant f20f5cb02b (S3 closure stage loses its `|| return 1`): local closed + local == S3 byte for byte in size, but the S3 manifest
+# names a table nobody has (same-length id swapped in), so only the S3-closure stage can refuse it
+reset_bucket; mkdir_backup "$T/Z1" 6; mkdir_backup "$FB/db1" 6
+sed "s/$(tid 6)/$(tid 77)/" "$T/Z1/manifest" > "$FB/db1/manifest"
+_s3proof_local_closure_ok "$T/Z1" && ok "setup: local dir is a closed backup" || bad "setup: local dir not closed"
+_s3proof_mirror_identical "$T/Z1" db1 && ok "setup: S3 already holds every local file (same sizes)" || bad "setup: dry run sees a difference"
+_s3proof_s3_closure_ok db1 && bad "setup: the S3 manifest should name a missing table" || ok "setup: S3 manifest names a table the bucket lacks"
+_s3proof_restorable_and_identical "$T/Z1" db1 && bad "identical-but-not-closed S3 was PROVEN" || ok "closed local + identical sizes but S3 not closed → NOT proven"
+
+echo "── _s3proof_repair_then_prove: a failed upload ends the repair ──"
+# mutants e79f244d55 (`return 1` -> `return 0`), 37a188edd3 (no `|| return 1`: the loop would retry up to S3PROOF_REPAIR_ROUNDS times)
+reset_bucket; mkdir_backup "$T/Y1" 6; : > "$CALLS"
+FAKE_SYNC_FAIL=1 _s3proof_repair_then_prove "$T/Y1" db1 && bad "repair_then_prove succeeded though the upload failed" || ok "upload fails → repair_then_prove fails"
+N_UP="$(grep -c 's3 sync .* --exclude manifest' "$CALLS")"
+[ "$N_UP" -eq 1 ] && ok "…after exactly ONE upload attempt (no retry of a failed upload)" || bad "expected 1 upload attempt, saw $N_UP"
 
 # ── the ga-tyaozh checksum export reaches the aws child ──────────────────────────
 echo "── AWS_REQUEST_CHECKSUM_CALCULATION (ga-tyaozh) ──"
