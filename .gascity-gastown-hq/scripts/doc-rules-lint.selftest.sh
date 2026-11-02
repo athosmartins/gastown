@@ -443,6 +443,154 @@ PYEOF
   fi
 fi
 
+# ---------------------------------------------------------------- lastro hq-mutants (ga-5mnu1pp): every edge ON its exact value
+# In process: the parser, the Contents rule, @import depth and the 200-line cap, the 100-column wrap, the fixer's blank lines, the exit codes.
+# Not killable, on purpose: L135 `i = 0` (09a292562b: rebound by the `for` before any read); L150, L159 and L160 `m.group(1)[0]` -> `[1]`
+# (11f31a3190 ff2906b462 f6481f352b: a fence run is one repeated character); L218 `i < c_idx` -> `<=` (6c1083c9ac: `others` already leaves
+# c_idx out); L214 `not others` -> `others` (44cfbe0b43: REQUIRE_CONTENTS_WITHOUT_H2 is True, so the condition is False either way); L226 `h[0] > 2` -> `>= 2` (b09a71442d: a ## before Contents ends in contents-late first); L247 `len(m.group(0))` -> `group(1)`
+# (c9a2330390: either way the span becomes blanks); L535 (9e6cae76dd 4811986b78 569352adef 5ce418c91f b486d0be6a fba0354185: the `del
+# lines[c_idx]` is dead code, after the section is cut the line at c_idx is the next heading or the end, never a blank); L545 `j <=
+# len(lines)` (13f08e727f: past the end there is no heading to read).
+echo "-- lastro: edges, defaults and exits, in process"
+cat > "$SBX/lastro.py" <<'PYEOF'
+import contextlib, importlib.util, io, os, subprocess, sys, types
+from unittest import mock
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location("drl", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+W = sys.argv[2] + "/lastro"
+os.makedirs(W, exist_ok=True)
+fails = []
+def chk(name, got, want):
+    if callable(got):
+        try: got = got()
+        except BaseException as e: got = "raised " + repr(e)
+    if got != want: fails.append("FAIL " + name + ": got " + repr(got)[:300] + " want " + repr(want)[:300])
+def lint_msg(fn):
+    try: fn(); return "no error"
+    except m.LintError as e: return str(e)
+    except BaseException as e: return "raised " + repr(e)
+def run(argv):
+    o, e = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(o), contextlib.redirect_stderr(e):
+        try: rc = m.main(argv)
+        except SystemExit as x: rc = "exit %s" % (x.code,)
+    return rc, o.getvalue(), e.getvalue()
+def put(rel, text):
+    p = os.path.join(W, rel); os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8", newline="") as f: f.write(text)
+    return p
+K = lambda *ls: m.Doc(list(ls)).kinds
+E = lambda *ls: m.evaluate_contents(m.Doc(list(ls)))
+LONG = "x" * 320
+
+# the parser: front matter, fences, comments, section ends, title matching
+chk("Doc: a --- far from the top is not front matter (only a --- on the FIRST line opens it)", K("# T", "text", "---", "more"), ["heading", "text", "text", "text"])
+chk("Doc: a fence with an info string is closed by a bare fence of the same length, whatever the indent of either", (K("```python", "x = 1", "```", "text"), K("```", "x", "  ```", "text"), K("  ```", "x", "```", "text")), (["code", "code", "code", "text"],) * 3)
+chk("Doc: a closing fence shorter than the opener does not close it, even indented", K("````", "x", "  ```", "text"), ["code", "code", "code", "code"])
+chk("Doc: an inline code span at the start of a line is text, indented or not", (K("```a``` b"), K("  ```a``` b")), (["text"], ["text"]))
+chk("Doc: a multi-line comment ends at its -->, a one-line <!----> ends at once", (K("<!--", "x", "-->", "text"), K("<!---->", "text")), (["comment", "comment", "comment", "text"], ["comment", "text"]))
+chk("Doc.section_end: a ### heading does not end a ## section, the next ## does", m.Doc(["## C", "### s", "x", "## D"]).section_end(0), 3)
+chk("title_in: an empty title is found; a non-word last character needs no boundary; whole words only", (m.title_in("", "x"), m.title_in("foo?", "see foo?x"), m.title_in("foo", "foobar"), m.title_in("foo", "a foo b")), (True, True, False, True))
+
+# rule (b): where Contents is missing, late, incomplete
+chk("evaluate_contents: no ## at all is contents-missing at line 1, and with others it points at the first of them", (E("# T", "text"), E("# T", "", "## Alpha")[:2]), ((m.R_MISSING, 1, 'doc has > 300 chars but no "## Contents" section before the first other "##"'), (m.R_MISSING, 3)))
+chk("evaluate_contents: a second ## Contents is not a title to list", E("# T", "", "## Contents", "", "• Alpha", "## Alpha", "x", "## Contents", "y"), None)
+chk("evaluate_contents: a ## Contents after another ## is contents-late, naming it and its line", E("# T", "", "## Alpha", "x", "## Contents", "", "• Alpha"), (m.R_LATE, 5, '"## Contents" must come before the first other "##" (found after "## Alpha" at line 3)'))
+chk("evaluate_contents: one intro paragraph before Contents is fine; a paragraph and a ### heading are 2 blocks", (E("# T", "", "para", "", "## Contents", "", "• Alpha", "## Alpha"), E("# T", "", "para", "", "### Sub", "", "## Contents", "", "• Alpha", "## Alpha")), (None, (m.R_LATE, 7, '"## Contents" must follow the title (at most 1 intro paragraph before it); found 2 blocks before it')))
+chk("evaluate_contents: blocks are counted from the very first line", E("intro one", "", "intro two", "", "## Contents", "", "\u2022 Alpha", "## Alpha"), (m.R_LATE, 5, '"## Contents" must follow the title (at most 1 intro paragraph before it); found 2 blocks before it'))
+def many(n): return ["# T", "", "## Contents", ""] + sum([["## T%d" % i, "x"] for i in range(1, n + 1)], [])
+shown = lambda k: ", ".join('"T%d"' % i for i in range(1, k + 1))
+chk("evaluate_contents: 9 missing titles list 8 and an ellipsis, 8 list all 8", (E(*many(9)), E(*many(8))), ((m.R_INCOMPLETE, 3, "Contents does not list 9 title(s): " + shown(8) + " …"), (m.R_INCOMPLETE, 3, "Contents does not list 8 title(s): " + shown(8))))
+chk("evaluate_contents: the Contents heading line itself is not part of the text the titles are looked up in", E("# T", "", "## Contents", "", "## ## contents"), (m.R_INCOMPLETE, 3, 'Contents does not list 1 title(s): "## contents"'))
+
+# rule (a): @imports, depth, the cap and its two messages
+def chain(prefix, n):
+    for i in range(1, n + 1): put("%s/c%d.md" % (prefix, i), ("@c%d.md\n" % (i + 1)) if i < n else "end\n")
+    return os.path.join(W, prefix, "c1.md")
+chk("effective_lines: a chain of 21 files is within the depth limit", lint_msg(lambda: m.effective_lines(chain("ch21", 21), [], [])), "no error")
+chk("effective_lines: a chain of 22 files is deeper than 20, and the message says 20", lint_msg(lambda: m.effective_lines(chain("ch22", 22), [], [])).endswith("@import chain deeper than 20"), True)
+imp_a = put("imp/a.md", "@b.md\n" + "y\n" * 150); put("imp/b.md", "z\n" * 60)
+chk("check_max_lines: 201 own lines are flagged at line 201", m.check_max_lines(put("own201.md", "x\n" * 201)), (m.R_MAX_LINES, 201, "201 lines > 200"))
+chk("check_max_lines: imported lines are counted and named, and flagged at line 1", m.check_max_lines(imp_a), (m.R_MAX_LINES, 1, "effective 210 lines > 200 (own 150 + imported 60 from b.md)"))
+chk("excluded_by_path: beads/ at the top is out, a file named beads is not, beads deeper is not", (m.excluded_by_path("beads/x.md"), m.excluded_by_path("beads"), m.excluded_by_path("a/beads/x.md")), (True, False, False))
+
+# errors that say why
+chk("read_text: a file that is not there is a LintError that says why", lint_msg(lambda: m.read_text(os.path.join(W, "nope.md"))), "%s: cannot read (No such file or directory)" % os.path.join(W, "nope.md"))
+if os.geteuid() != 0:
+    d = os.path.join(W, "noaccess"); os.makedirs(os.path.join(d, "sub"), exist_ok=True); os.chmod(d, 0)
+    msg = lint_msg(lambda: m.resolve_import("sub/x.md", d)); os.chmod(d, 0o755)
+    chk("resolve_import: a stat that fails for another reason than 'not there' is a LintError that says why", msg, "%s: cannot stat @import target (Permission denied)" % os.path.join(d, "sub/x.md"))
+    d = os.path.join(W, "ro"); p = put("ro/x.md", "t"); os.chmod(d, 0o555)
+    msg = lint_msg(lambda: m.write_text(p, "new")); os.chmod(d, 0o755)
+    chk("write_text: a dir that cannot be written is a LintError that says why", msg, "%s: cannot write (Permission denied)" % p)
+seen = []
+with mock.patch.object(m.subprocess, "run", side_effect=lambda cmd, **kw: seen.append(kw.get("timeout")) or types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")): m.run_git(["a"], "/")
+chk("run_git: git gets a 120 s budget", seen, [120])
+with mock.patch.object(m.subprocess, "run", side_effect=OSError(2, "boom")): msg = lint_msg(lambda: m.run_git(["a", "b", "c"], "/"))
+chk("run_git: a git that cannot run is a LintError naming only the first two arguments", msg, "git a b: [Errno 2] boom")
+
+# which files, and how they are named
+with mock.patch.object(m, "git_toplevel", return_value="/r"), mock.patch.object(m, "diff_files", return_value=["/r/sub/x.md", "/r/y.md"]): items, missing = m.collect(types.SimpleNamespace(diff="A..B", files=[]), "/r/sub")
+chk("collect --diff: names are relative to the git toplevel, not to --root", [i[1] for i in items], ["sub/x.md", "y.md"])
+a_md = put("dd/x/a.md", "t"); elsewhere = os.path.join(W, "elsewhere"); os.makedirs(elsewhere, exist_ok=True)
+chk("collect: one file given twice, spelled two ways, is one file", len(m.collect(types.SimpleNamespace(diff=None, files=[a_md, os.path.join(W, "dd/x/../x/a.md")]), elsewhere)[0]), 1)
+
+top = os.path.join(W, "top"); put("top/a.md", "t"); put("top/sub/a.md", "t")
+with mock.patch.object(m, "git_toplevel", return_value=top), mock.patch.object(m, "diff_files", return_value=[os.path.join(top, "a.md")]): items = m.collect(types.SimpleNamespace(diff="A..B", files=["a.md"]), os.path.join(top, "sub"))[0]
+chk("collect: two different files that share a display name are two files", len(items), 2)
+
+# the check run: counts, the hint
+R1 = os.path.join(W, "r1"); put("r1/a.md", "short\n"); put("r1/node_modules/x.md", "short\n")
+rc, out, err = run(["--check", "--root", R1, "--upstream-ref", "none", "a.md", "node_modules/x.md"])
+chk("--check: one file checked, one excluded, none violating", (rc, "doc-rules-lint: 1 file(s) checked, 0 violation(s), 1 skipped (excluded)" in out), (0, True))
+R2 = os.path.join(W, "r2"); put("r2/CLAUDE.md", "# T\n\n## Contents\n\n• A\n\n## A\n\n" + "filler\n" * 193)
+rc, out, err = run(["--check", "--root", R2, "--upstream-ref", "none", "CLAUDE.md"])
+chk("--check: a CLAUDE.md that is only too long is flagged at 201 and gets no --fix-contents hint (the fixer cannot shorten it)", (rc, "CLAUDE.md:201: [claude-md-max-lines] 201 lines > 200" in out, "hint:" in out), (1, True, False))
+R3 = os.path.join(W, "r3"); put("r3/bad.md", LONG + "\n")
+rc, out, err = run(["--check", "--root", R3, "--upstream-ref", "none", "bad.md"])
+chk("--check: a missing Contents is flagged at line 1 and the hint names the file", (rc, "bad.md:1: [contents-missing]" in out, "--fix-contents bad.md" in out), (1, True, True))
+
+with mock.patch.object(m.Upstream, "contains", return_value=True): rc, out, err = run(["--check", "--root", R3, "--upstream-ref", "none", "bad.md"])
+chk("--check: a violating file that exists upstream is not ours, so it is skipped and counted as skipped", (rc, "doc-rules-lint: 0 file(s) checked, 0 violation(s), 1 skipped (excluded)" in out), (0, True))
+
+# contents_lines: dedup, empty titles, exactly 100 columns
+chk("contents_lines: duplicates and empty titles are dropped", m.contents_lines(["a", "", "a", "b"]), ["• a · b"])
+chk("contents_lines: a line holds up to exactly 100 columns and no more", (m.contents_lines(["a" * 47, "b" * 48]), m.contents_lines(["a" * 47, "b" * 49])), (["• " + "a" * 47 + " · " + "b" * 48], ["• " + "a" * 47, "• " + "b" * 49]))
+
+# the fixer: where the blank lines go
+C = "## Contents"
+cases = [
+    ("title, intro, sections", "# T\n\n" + LONG + "\n\n## Alpha\n\na\n\n## Beta\n\nb\n", "# T\n\n" + C + "\n\n• Alpha · Beta\n\n" + LONG + "\n\n## Alpha\n\na\n\n## Beta\n\nb\n"),
+    ("no title: nothing before Contents", "intro\n\n" + LONG + "\n\n## Alpha\n\na\n", C + "\n\n• Alpha\n\nintro\n\n" + LONG + "\n\n## Alpha\n\na\n"),
+    ("no blank after the title: both blanks are kept", "# T\n" + LONG + "\n\n## Alpha\n\na\n", "# T\n\n" + C + "\n\n• Alpha\n\n" + LONG + "\n\n## Alpha\n\na\n"),
+    ("blank lines before the title", "\n\n# T\n\n" + LONG + "\n\n## Alpha\n\na\n", "\n\n# T\n\n" + C + "\n\n• Alpha\n\n" + LONG + "\n\n## Alpha\n\na\n"),
+    ("front matter and nothing else", "---\nk: " + "v" * 320 + "\n---\n", "---\nk: " + "v" * 320 + "\n---\n\n" + C + "\n\n• (sem seções ##)\n\n"),
+    ("an incomplete Contents is rebuilt in place", "# T\n\n" + C + "\n\n• Alpha\n\n## Alpha\n\n" + LONG + "\n\n## Beta\n\nb\n", "# T\n\n" + C + "\n\n• Alpha · Beta\n\n## Alpha\n\n" + LONG + "\n\n## Beta\n\nb\n"),
+    ("a Contents that came last moves up and leaves no trailing blank", "# T\n\n" + LONG + "\n\n## Alpha\n\na\n\n" + C + "\n\n• Alpha\n", "# T\n\n" + C + "\n\n• Alpha\n\n" + LONG + "\n\n## Alpha\n\na\n"),
+]
+for name, src, want in cases:
+    chk("fix_text: " + name, lambda: m.fix_text(src), want)
+chk("fix_text: exactly 300 characters are left alone, 301 get a Contents", (m.fix_text("x" * 300) == "x" * 300, m.fix_text("x" * 301) != "x" * 301), (True, True))
+half = "# T\r\n" + LONG + "\r\n## A\na\n"
+chk("fix_text: line endings follow the majority — a lone CRLF and exactly half CRLF both give LF", ("\r" in m.fix_text("# T\r\n" + LONG + "\n## A\na\n"), "\r" in m.fix_text(half)), (False, False))
+with mock.patch.object(m, "evaluate_contents", side_effect=lambda doc: (m.R_MISSING, 7, "still bad")): msg = lint_msg(lambda: m.fix_text("# T\n\n" + LONG + "\n"))
+chk("fix_text: a fix that still fails the rule is a LintError naming the rule and its message", msg, "fixer could not produce a compliant Contents (contents-missing: still bad)")
+
+# the commands: exits
+put("fx/a.md", "short\n")
+with mock.patch.object(m, "read_text", side_effect=m.LintError("boom")): rc, out, err = run(["--fix-contents", "--root", os.path.join(W, "fx"), "--upstream-ref", "none", "a.md"])
+chk("--fix-contents: a file that cannot be read is counted and the exit is 2", (rc, "boom" in err), (2, True))
+with mock.patch.object(m, "cmd_check", side_effect=RuntimeError("boom")): rc, out, err = run(["--check", "--root", elsewhere, "x.md"])
+chk("main: an error nobody listed is exit 2 and says internal error", (rc, "internal error: RuntimeError: boom" in err), (2, True))
+chk("main: no mode is a usage error, and a --diff outside a git repository is exit 2", (run(["x.md"])[0], run(["--check", "--root", elsewhere, "--diff", "A..B"])[0]), ("exit 2", 2))
+
+print("\n".join(fails))
+print("DONE", len(fails))
+PYEOF
+LASTRO_OUT="$("$PY" "$SBX/lastro.py" "$SUT" "$SBX" 2>&1)"
+case "$LASTRO_OUT" in *"DONE 0") ok "lastro: parser, rules, imports, cap, wrap, fixer and exits all held on their exact values" ;; *) bad "lastro block" "$LASTRO_OUT" ;; esac
+
 echo
 echo "doc-rules-lint selftest: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]
