@@ -328,4 +328,150 @@ EOF
 o="$(PPM_GATE_LOG="$W/gate_nohist.jsonl" python3 "$TOOL" gate-rate --cutover 2026-09-25T00:00:00Z --window-hours 48 --history-windows 2 2>&1)"; rc=$?
 { [ $rc -eq 2 ] && echo "$o" | grep -q 'SEM CONTROLE HISTÓRICO' && ! echo "$o" | grep -q 'sem significância'; } && ok "queda 90% -> 50% (p~0) sem histórico: 'SEM CONTROLE HISTÓRICO', exit 2 (não 'sem significância', exit 0)" || { bad "queda significativa sem histórico mal classificada (rc=$rc)"; echo "$o" | sed 's/^/      /' | tail -5; }
 
+# ── lastro hq-mutants (ga-5mnu1pp): os limites, defaults e saidas que as fixtures acima nunca poem num valor exato ─────────────────────
+# Em processo: cada funcao do script recebe a entrada exata (transcrito na idade-limite com o relogio fixo, sessao no segundo do corte, bead no
+# instante exato de cada janela, p exatamente 0.10, 40 beads). Os valores esperados saem das regras do docstring e de tabela de Wilson.
+# NAO matavel, de proposito: L327 `r["rig"] == rig` -> `!=` (67bdc90f2d: mech_fails so e chamada sem rig, o `rig is None` ja decide);
+# L332 `ts < hi_a` -> `<=` (7396ce259a: rig que so tem bead no instante hi_a entra na lista mas bucket() o exclui, e a linha so sai com n>0);
+# L189 `len(v) - 1` -> `len(v) - 0` (7c813362ab: ceil(0.9*n) - 1 e sempre menor que n, o min() nunca escolhe o outro lado).
+echo "== lastro: bordas, defaults e saidas (em processo)"
+cat > "$W/lastro.py" <<'EOF'
+import argparse, contextlib, datetime, importlib.util, io, json, os, sys, time
+from pathlib import Path
+from unittest import mock
+sys.dont_write_bytecode = True
+tool, W = sys.argv[1], sys.argv[2] + "/lastro"
+os.makedirs(W, exist_ok=True)
+os.environ["PPM_PROJECTS"], os.environ["PPM_GATE_LOG"] = W + "/projects", W + "/gate-x.jsonl"
+spec = importlib.util.spec_from_file_location("ppm2", tool)
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+fails = []
+def chk(name, got, want):
+    if callable(got):
+        try: got = got()
+        except BaseException as e: got = "raised " + repr(e)
+    if got != want: fails.append("FAIL " + name + ": got " + repr(got)[:300] + " want " + repr(want)[:300])
+def run(fn, *a):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        try: r = fn(*a)
+        except SystemExit as e: r = "exit %s" % (e.code,)
+        except Exception as e: r = "raised " + repr(e)
+    return r, " ".join(buf.getvalue().split()), buf.getvalue()
+def wr(name, rows):
+    p = W + "/" + name
+    open(p, "w").write("".join((r if isinstance(r, str) else json.dumps(r)) + "\n" for r in rows))
+    return p
+NS = argparse.Namespace
+
+# scan_notes, role_of
+m.VANISHED[0] = 2
+chk("scan_notes: vanished transcripts are counted", m.scan_notes(), "  (transcritos que sumiram durante a varredura e ficaram de fora: 2)")
+m.VANISHED[0] = 0
+chk("role_of: an unknown alias keeps 28 characters and what precedes -adhoc-", (m.role_of("x" * 40), m.role_of("foo-adhoc-123")), ("other:" + "x" * 28, "other:foo"))
+
+# one transcript: the FIRST timestamp, the FIRST user message, a usage with one key, a message with no usage
+rows = [{"type": "user", "timestamp": "2026-09-20T10:00:00Z", "message": {"content": "[gascity] wa-worker-1 • ts"}},
+        {"type": "user", "timestamp": "2026-09-20T11:00:00Z", "message": {"content": "hello"}},
+        {"type": "assistant", "timestamp": "2026-09-20T12:00:00Z", "message": {"id": "a1", "usage": {"input_tokens": 10}, "content": []}},
+        {"type": "assistant", "timestamp": "2026-09-20T13:00:00Z", "message": {"id": "a2", "content": []}}]
+s = m.scan_session(wr("s1.jsonl", rows))
+chk("scan_session: start is the FIRST timestamp, the role comes from the FIRST user message, a missing usage key counts 0 and a message with no usage is no turn", (s["start"].isoformat(), s["role"], s["first"], s["turns"]), ("2026-09-20T10:00:00+00:00", "wa-worker", 10, 1))
+
+# sessions(): a transcript exactly at the age limit stays, half a second older goes (the clock is fixed)
+os.makedirs(W + "/pj/-p", exist_ok=True)
+good = [{"type": "user", "timestamp": "2026-09-20T10:00:00Z", "message": {"content": "[gascity] gastown.dog-1 • ts"}}, {"type": "assistant", "timestamp": "2026-09-20T10:00:01Z", "message": {"id": "m", "usage": {"input_tokens": 5}, "content": []}}]
+FIXED = 1000000000.0
+for name, age in (("edge", 3600), ("older", 3600.5)):
+    p = wr("pj/-p/" + name + ".jsonl", good); os.utime(p, (FIXED - age, FIXED - age))
+m.PROJECTS = Path(W + "/pj")
+with mock.patch.object(time, "time", return_value=FIXED): got = [os.path.basename(x["path"]) for x in m.sessions(1)]
+chk("sessions: a transcript exactly since_hours old stays, half a second older goes", got, ["edge.jsonl"])
+
+# first-turn: the cutover is inclusive for 'after', a session with no start is counted, a role may miss a side, p10/p90, the JSON, the exits
+def S(role, start, first): return {"role": role, "start": m.parse_ts(start) if start else None, "first": first, "tools": m.Counter()}
+sess = [S("dog", "2026-09-22T00:00:00Z", 300), S("dog", "2026-09-23T00:00:00Z", 400), S("gone", "2026-09-20T00:00:00Z", 500), S("newr", "2026-09-25T00:00:00Z", 700), S("dog", None, 1)]
+CLEAN = "(varredura completa: nenhum transcrito sumiu; toda tool_use tinha id)"
+with mock.patch.object(m, "sessions", side_effect=lambda since, roles=None: iter(sess)):
+    r, t, raw = run(m.cmd_first_turn, NS(roles="", cutover="2026-09-23T00:00:00Z", since_hours=24, json=False))
+    chk("first-turn with a cutover: rc 0, a session AT the cutover is after it, one with no start is counted, 33% of +100 over 300", (r, "(sessões sem timestamp legível: 1)" in t, "dog 1 300 1 400 +100 33%" in t), (0, True, True))
+    chk("first-turn: a role missing a side shows 0 for it, never a median of nothing", ("gone 1 500 0 0 (falta amostra de um dos lados)" in t, "newr 0 0 1 700 (falta amostra de um dos lados)" in t), (True, True))
+    chk("first-turn with a cutover: a scan that lost nothing says so", CLEAN in t, True)
+    r, t, raw = run(m.cmd_first_turn, NS(roles="", cutover=None, since_hours=24, json=False))
+    chk("first-turn without a cutover: rc 0, and the same sentence when nothing was lost", (r, t.startswith(CLEAN + " papel")), (0, True))
+v20 = [S("other:façade", None, 100 * i) for i in range(1, 21)] + [S("small", None, 10 * i) for i in range(1, 6)]
+with mock.patch.object(m, "sessions", side_effect=lambda since, roles=None: iter(v20)):
+    r, t, raw = run(m.cmd_first_turn, NS(roles="", cutover=None, since_hours=24, json=True))
+d = json.loads(raw)["roles"]
+chk("first-turn --json: rc 0, 2-space indent, text unescaped", (r, raw.startswith("{\n  \"cutover\""), "other:façade" in raw), (0, True, True))
+chk("first-turn --json: median, p10 (a tenth of the list, at least one value) and p90 of 20 values and of 5", (d["other:façade"]["after"], d["small"]["after"]), ({"n": 20, "median": 1050, "p10": 150, "p90": 1800}, {"n": 5, "median": 30, "p10": 10, "p90": 50}))
+
+# denied-attempts: against a small manifest
+man = wr("man.json", [json.dumps({"common": {"deny_tools": ["Workflow"]}, "roles": {"d": {"agents": ["gastown.dog"]}, "w": {"agents": ["wa-worker"]}}})])
+def D(role, start, tools): return {"role": role, "start": m.parse_ts(start), "tools": m.Counter(tools)}
+dsess = [D("dog", "2026-09-26T00:00:00Z", {"Workflow": 2, "Read": 1}), D("wa-worker", "2026-09-25T00:00:00Z", {"Workflow": 5})]
+with mock.patch.object(m, "MANIFEST", Path(man)), mock.patch.object(m, "sessions", side_effect=lambda since, roles=None: iter(dsess)):
+    r, t, raw = run(m.cmd_denied, NS(since_hours=48, cutover="2026-09-26T00:00:00Z", strict=False))
+    chk("denied-attempts: a session AT the cutover is counted (before it is not), the count is printed, a denied tool is reported, and without --strict the exit is 0", (r, "(depois do corte): {'dog': 1}" in t, "dog: tentou tool NEGADA: {'Workflow': 2}" in t), (0, True, True))
+    chk("denied-attempts --strict: the same finding exits 1", run(m.cmd_denied, NS(since_hours=48, cutover="2026-09-26T00:00:00Z", strict=True))[0], 1)
+    r, t, raw = run(m.cmd_denied, NS(since_hours=48, cutover="2026-10-01T00:00:00Z", strict=False))
+    chk("denied-attempts: with no session after the cutover it says nenhuma, and exits 2", (r, "(depois do corte): nenhuma" in t), (2, True))
+
+# the statistics
+chk("wilson: (0, 0) when there is nothing, and the 95% Wilson interval of 3 in 10", (m.wilson(0, 0), tuple(round(x, 4) for x in m.wilson(3, 10))), ((0.0, 0.0), (0.1078, 0.6032)))
+chk("norm_cdf: 0 is 0.5 and 1.96 is 0.975", (m.norm_cdf(0), round(m.norm_cdf(1.96), 3)), (0.5, 0.975))
+
+# load_gate: a line that is not JSON and a record with a bad ts are both counted
+m.GATE_LOG = Path(wr("gate-bad.jsonl", ["not json", {"event": "dispatcher_complete", "dry_run": "0", "result": "PASS", "ts": "nope", "bead": "x"}, {"event": "dispatcher_complete", "dry_run": "0", "result": "PASS", "ts": "2026-01-01T00:00:00Z", "bead": "y"}]))
+runs, bad = m.load_gate()
+chk("load_gate: one good record, two unreadable lines", (len(runs), bad), (1, 2))
+
+# gate-rate
+def G(bead, ts, res, rig="ra", reason=""): return {"ts": ts, "event": "dispatcher_complete", "bead": bead, "rig": rig, "result": res, "reason": reason, "dry_run": "0"}
+def blk(prefix, start, n, k, rig="ra"):
+    t0 = m.parse_ts(start)
+    return [G("%s%d" % (prefix, i), (t0 + datetime.timedelta(hours=i)).strftime("%Y-%m-%dT%H:%M:%SZ"), "PASS" if i < k else "FAIL", rig) for i in range(n)]
+def gr(rows, w=48, hw=2, cut="2026-01-10T00:00:00Z"):
+    m.GATE_LOG = Path(wr("g.jsonl", rows))
+    return run(m.cmd_gate_rate, NS(cutover=cut, window_hours=w, history_windows=hw))
+T1 = [G("B1", "2026-01-08T00:00:00Z", "FAIL", "rx", "TIMEOUT x"), G("B2", "2026-01-08T12:00:00Z", "PASS", "rb"), G("B3", "2026-01-09T00:00:00Z", "PASS", "rb"), G("B4", "2026-01-09T12:00:00Z", "FAIL", "rb", "Reviewer 1 FAIL"),
+      G("A1", "2026-01-10T00:00:00Z", "FAIL", "ra", "TIMEOUT y"), G("A2", "2026-01-10T12:00:00Z", "PASS", "rb"), G("A3", "2026-01-11T00:00:00Z", "PASS", "rb"), G("A4", "2026-01-12T00:00:00Z", "PASS", "rc")]
+r, t, raw = gr(T1)
+chk("gate-rate: a bead exactly at the window start is before, one exactly at the cut is after, one exactly at the end is out; the intervals are Wilson in percent", ("ANTES 2/4 = 50.0% IC95% [15.0%, 85.0%]" in t, "DEPOIS 2/3 = 66.7% IC95% [20.8%, 93.9%]" in t), (True, True))
+chk("gate-rate: the per-rig lines follow the same edges (a rig whose only bead is AT the window start is listed, one only at the end is not)", ("rig rx antes 0/1 depois 0/0" in t, "rig ra antes 0/0 depois 0/1" in t, "rig rb antes 2/3 depois 2/2" in t, "rig rc" in t), (True, True, True, False))
+chk("gate-rate: mechanical FAILs are counted on the same edges (1 of 2 before, 1 of 1 after)", "ANTES 1/2 DEPOIS 1/1" in t, True)
+chk("gate-rate: a rising rate is OK (rc 0) and a sample under 40 is called small", (r, "VEREDITO: OK — sem queda. [amostra pequena: <40 beads num lado]" in t), (0, True))
+r, t, raw = gr([G("B1", "2026-01-09T00:00:00Z", "FAIL", "ra", "TIMEOUT x")])
+chk("gate-rate: one side with no beads is SEM AMOSTRA (exit 2), after the mechanical line that one side is enough to print", (r, "VEREDITO: SEM AMOSTRA de um dos lados" in t, "ANTES 1/1 DEPOIS 0/0" in t), (2, True, True))
+chk("gate-rate: the header gives the window after the cut in whole hours (2000, not 1999)", "janela 2000h antes x 2000h depois" in gr([], w=2000, hw=0)[1], True)
+B40, A40 = blk("b", "2026-01-08T00:00:00Z", 40, 28), blk("a", "2026-01-10T00:00:00Z", 40, 24)
+HIST = blk("p", "2026-01-06T00:00:00Z", 20, 12) + blk("q", "2026-01-04T00:00:00Z", 20, 14)
+r, t, raw = gr(B40 + A40 + HIST)
+chk("gate-rate: the history is the two 48 h windows before the first one, each from n>=20, and its range", ("histórico (2 janelas de 48h anteriores, n>=20): 60%(n=20) 70%(n=20)" in t, "faixa histórica: 60% a 70%" in t), (True, True))
+chk("gate-rate: delta, z and p come from the pooled rate; exactly 40 beads is not a small sample", ("delta = -10.0 pontos (z=-0.94; P(queda por acaso)=0.17)" in t, "[amostra pequena" in t), (True, False))
+chk("gate-rate: a drop that lands exactly ON the lowest historical rate is inside the historical range", (r, "VEREDITO: abaixo do ANTES mas dentro da faixa histórica (o gate varia sozinho) (p=0.17)." in t), (0, True))
+r, t, raw = gr(B40 + A40)
+chk("gate-rate: with no usable history a non-significant drop is just not significant, exit 0", (r, "abaixo do ANTES mas sem significância (p=0.17)." in t), (0, True))
+r, t, raw = gr(B40 + blk("a", "2026-01-10T00:00:00Z", 40, 28))
+chk("gate-rate: equal rates are OK, exit 0", (r, "VEREDITO: OK — sem queda." in t, "[amostra pequena" in t), (0, True, False))
+with mock.patch.object(m, "norm_cdf", return_value=0.10):
+    r, t, raw = gr(B40 + blk("a", "2026-01-10T00:00:00Z", 40, 20) + HIST)
+    chk("gate-rate: p exactly 0.10 is not below 0.10: below the history it is still no alert", (r, "ALERTA" in t), (0, False))
+    r, t, raw = gr(B40 + A40)
+    chk("gate-rate: p exactly 0.10 with no history is not 'sem controle histórico' either", (r, "SEM CONTROLE" in t), (0, False))
+
+# main(): the defaults, the usage errors, the help line
+seen = {}
+with mock.patch.object(m, "cmd_first_turn", side_effect=lambda a: seen.update(ft=a) or 0), mock.patch.object(m, "cmd_denied", side_effect=lambda a: seen.update(dn=a) or 0), mock.patch.object(m, "cmd_gate_rate", side_effect=lambda a: seen.update(gr=a) or 0):
+    m.main(["first-turn"]); m.main(["denied-attempts"]); m.main(["gate-rate", "--cutover", "2026-01-10T00:00:00Z"])
+chk("main: the defaults are 24 h, 48 h, a 48 h window and 6 history windows", (seen["ft"].since_hours, seen["dn"].since_hours, seen["gr"].window_hours, seen["gr"].history_windows), (24, 48, 48, 6))
+chk("main: no command, and gate-rate with no --cutover, are usage errors (exit 2)", (run(m.main, [])[0], run(m.main, ["gate-rate"])[0]), ("exit 2", "exit 2"))
+chk("main --help: the description is the first line of the docstring", "MEDE" in run(m.main, ["--help"])[1], True)
+
+print("\n".join(fails))
+print("DONE", len(fails))
+EOF
+LOUT="$(python3 "$W/lastro.py" "$TOOL" "$W" 2>&1)"
+case "$LOUT" in *"DONE 0") ok "lastro: bordas das janelas, tabela de Wilson, defaults e saidas do script, todos nos valores exatos" ;; *) bad "lastro: $LOUT" ;; esac
+
 echo; echo "== resultado: $PASS ok, $FAIL falha(s)"; [ "$FAIL" -eq 0 ]
