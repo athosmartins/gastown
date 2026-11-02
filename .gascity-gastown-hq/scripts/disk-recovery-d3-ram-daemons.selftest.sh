@@ -4,7 +4,7 @@
 # ## Contents
 #   O que é simulado · O que é verificado · Como rodar
 #
-# O QUE É SIMULADO  launchctl (list/kickstart), ps, footprint, curl (API do demand-dashboard e as portas), df e sysctl são shims no PATH; os bancos de ligação são sqlite REAIS e temporários
+# O QUE É SIMULADO  launchctl (list/kickstart), ps (por PID e a lista -ax do Safari), footprint, top (bw-serve), osascript (quit do Safari), secret (prova do cofre), sleep (modo lento), curl (API do demand-dashboard e as portas), df e sysctl são shims no PATH; os bancos de ligação são sqlite REAIS e temporários
 #   (pix_call_log e voicebot_call_log); o restart guardado, o deploy_freeze e o relógio do disco (arquivos DR_FREE_MB_FILE / DR_SWAP_MB_FILE) são stubs. Nada real é reiniciado, pausado ou enviado.
 # O QUE É VERIFICADO  saída = UMA linha, ASCII, ≤ 290, nada antes dela (stdout+stderr juntos, como o maestro lê) e rc 0/10/20/30/2 em cada cenário · fronteiras (livre 4608/4609, idade 3599/3600 s,
 #   footprint 99/100 MB, janela de ligação 1799/1801 s) · ordem por footprint e parada ao recuperar · só labels da allowlist · cada guarda de ligação (pix dialing/bridged, voicebot live, banco
@@ -13,7 +13,10 @@
 #   daemon voltando devagar, guardado que estoura o tempo, sobra de rodada anterior) · TERM no meio do guardado despausa a fila ·
 #   a LINHA FINAL nunca diz "conferida"/"nada a fazer" por cima de dúvida na fila (TERM com daemon fora do ar / PATCH recusado / sem pausa nossa em aberto / no meio da despausa da sobra; sobra nossa que
 #   o PATCH recusou = 20; fila ilegível no início = 30 se nada foi reiniciado; o guardado que deixa a fila livre apaga a dúvida; o aviso sobrevive ao corte de 290) · orçamento de tempo · trava (viva, morta, solta no fim) ·
-#   interruptor · dry-run sem efeito colateral · df/swap lidos do jeito certo (nunca `df /`) e ilegíveis = 30 · variável numérica inválida · rotação do log · bancos só lidos.
+#   interruptor · dry-run sem efeito colateral · df/swap lidos do jeito certo (nunca `df /`) e ilegíveis = 30 · variável numérica inválida · rotação do log · bancos só lidos ·
+#   (ga-1p1i5jr.7) Safari: só o executável Safari.app/.../Safari, idade 7199/7200 s, prova de que saiu, falha não para o resto e não repete por 6 h, lista de processos vazia/ilegível ≠ fechado ·
+#   bw-serve: MEM+CMPRS 800/801 MB e unidades do top, idade 21599/21600 s, secret antes e depois (valor nunca lido), ordem Safari → bw-serve → daemons ·
+#   label ausente ≠ domínio errado · "D3 retomou o envio" na linha · sobra de pausa desfeita antes de ler o disco · teto de tempo em segundos de relógio.
 # COMO RODAR      bash scripts/disk-recovery-d3-ram-daemons.selftest.sh        (~1-3 min)
 #   Para testar uma cópia modificada do degrau (mutantes): DR_D3_PATH=/caminho/disk-recovery-d3-ram-daemons.mutN.sh bash scripts/disk-recovery-d3-ram-daemons.selftest.sh
 set -uo pipefail
@@ -30,7 +33,7 @@ BG_PIDS=""
 cleanup() { local p; for p in $BG_PIDS; do kill "$p" 2>/dev/null; done; chmod -R u+rwx "$W" 2>/dev/null; rm -rf "$W"; }
 trap cleanup EXIT
 SD="$W/sd"; BIN="$W/bin"; CITY="$W/city"; WA="$W/wa"; PIX="$W/pix.db"; VOICE="$W/voice.db"
-LOG="$CITY/.gc/logs/disk-recovery-d3.log"; LOCK="$CITY/.gc/disk-recovery-d3.lock"; OFF="$CITY/.gc/disk-recovery.off"
+LOG="$CITY/.gc/logs/disk-recovery-d3.log"; LOCK="$CITY/.gc/disk-recovery-d3.lock"; OFF="$CITY/.gc/disk-recovery.off"; STAMP="$CITY/.gc/disk-recovery-d3-safari-fail.stamp"
 mkdir -p "$BIN" "$W/tmp" "$W/home" "$WA"
 PASS=0; FAIL=0; OUT=""; RC=0; EXTRA_ENV=""
 ok()   { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
@@ -50,6 +53,7 @@ case "${1:-}" in
     [ -f "$S/launchctl.listempty" ] && exit 0
     printf 'PID\tStatus\tLabel\n'
     printf -- '-\t0\tcom.apple.algo\n'
+    [ -f "$S/launchctl.nodomain" ] && exit 0
     while read -r label pid et fp unit; do printf '%s\t0\t%s\n' "$pid" "$label"; done < "$S/procs"
     if [ -f "$S/launchctl.big" ]; then awk 'BEGIN { for (i = 0; i < 4000; i++) printf "-\t0\tcom.apple.filler.%0200d\n", i }'; fi
     exit 0
@@ -75,8 +79,14 @@ esac
 SH
 cat > "$BIN/ps" <<'SH'
 #!/bin/bash
-pid=""; while [ $# -gt 0 ]; do case "$1" in -p) pid=$2; shift ;; esac; shift; done
+pid=""; ax=0; while [ $# -gt 0 ]; do case "$1" in -p) pid=$2; shift ;; -axo) ax=1 ;; esac; shift; done
 [ -f "$STUB_DIR/ps.fail" ] && exit 1
+if [ "$ax" = 1 ]; then   # lista de processos (Safari): apps = "pid etime comm"; apps.fail / apps.empty / apps.garbage = ilegivel
+  [ -f "$STUB_DIR/apps.fail" ] && exit 1
+  [ -f "$STUB_DIR/apps.empty" ] && exit 0
+  [ -f "$STUB_DIR/apps.garbage" ] && { echo "ps: opcao estranha"; exit 0; }
+  cat "$STUB_DIR/apps"; exit 0
+fi
 [ -f "$STUB_DIR/ps.garbage.$pid" ] && { echo "lixo"; exit 0; }
 awk -v p="$pid" '$2==p {print "  " $3; f=1} END {exit f ? 0 : 1}' "$STUB_DIR/procs"
 SH
@@ -152,6 +162,43 @@ cat > "$BIN/sysctl" <<'SH'
 [ -f "$STUB_DIR/sysctl.fail" ] && exit 1
 cat "$STUB_DIR/sysctl.out"
 SH
+cat > "$BIN/top" <<'SH'
+#!/bin/bash
+S="$STUB_DIR"; pid=""
+while [ $# -gt 0 ]; do case "$1" in -pid) pid=$2; shift ;; esac; shift; done
+[ -f "$S/top.fail.$pid" ] && exit 1
+printf 'Processes: 400 total\nDisks: 1/2 read\n\n'
+[ -f "$S/top.garbage.$pid" ] && { echo "nada aqui"; exit 0; }
+printf 'MEM    CMPRS\n'
+[ -f "$S/top.$pid" ] && cat "$S/top.$pid"
+exit 0
+SH
+cat > "$BIN/osascript" <<'SH'
+#!/bin/bash
+S="$STUB_DIR"; echo "osascript $*" >> "$S/calls"
+mode=ok; rc=0; setfree=""; [ -f "$S/osa.mode" ] && . "$S/osa.mode"
+[ "$mode" = slow ] && sleep 60
+[ "$rc" -ne 0 ] && { echo "execution error: Not authorized to send Apple events to Safari. (-1743)" >&2; exit "$rc"; }
+[ "$mode" = breakps ] && touch "$S/apps.fail"
+if [ "$mode" = ok ]; then grep -v '/Safari.app/Contents/MacOS/Safari$' "$S/apps" > "$S/apps.new"; mv "$S/apps.new" "$S/apps"; fi
+[ -n "$setfree" ] && printf '%s' "$setfree" > "$S/free"
+exit 0
+SH
+cat > "$BIN/secret" <<'SH'
+#!/bin/bash
+S="$STUB_DIR"; echo "secret $*" >> "$S/calls"
+if [ /dev/fd/1 -ef /dev/null ]; then echo "stdout-do-secret=devnull" >> "$S/calls"; else echo "stdout-do-secret=CAPTURADO" >> "$S/calls"; fi   # o degrau tem de mandar o stdout para /dev/null
+echo "S3CR3T-CANARY-VALUE"   # o valor: o degrau NUNCA pode le-lo
+if [ -f "$S/secret.fail_n" ]; then n=$(cat "$S/secret.fail_n"); if [ "$n" -gt 0 ]; then echo $((n - 1)) > "$S/secret.fail_n"; echo "secret: bw serve unavailable" >&2; exit 5; fi; fi
+[ -f "$S/secret.fail" ] && { echo "secret: no response from bw serve" >&2; exit 5; }
+exit 0
+SH
+cat > "$BIN/sleep" <<'SH'
+#!/bin/bash
+# com sleep.slow o `sleep 0.05` do run_bounded fica 10x mais lento (host carregado); os de 1 s ou mais passam intactos
+if [ -f "$STUB_DIR/sleep.slow" ] && [ "${1:-}" = 0.05 ]; then exec /bin/sleep 0.5; fi
+exec /bin/sleep "$@"
+SH
 chmod 755 "$BIN"/*
 cat > "$W/guarded" <<'SH'
 #!/bin/bash
@@ -192,6 +239,11 @@ hookfor() {  # $1=label $2..=comando que o kickstart roda DEPOIS de reiniciar (e
   local l=$1; shift; printf '%s\n' "$*" > "$SD/hook.$l.sh"; printf 'hook="bash %s/hook.%s.sh"\n' "$SD" "$l" >> "$SD/kick.com.whatsapp.$l"
 }
 setproc()  { awk -v l="com.whatsapp.$1" -v f="$2" -v v="$3" '$1==l {$f=v} {print}' "$SD/procs" > "$SD/procs.new" && mv "$SD/procs.new" "$SD/procs"; }   # campos: 2=pid 3=etime 4=fp 5=unidade
+addsafari() { printf '%5s %s %s\n' 9100 "$1" "/System/Volumes/Preboot/Cryptexes/App/System/Applications/Safari.app/Contents/MacOS/Safari" >> "$SD/apps"; }   # $1=etime do Safari aberto
+addbw()     { printf 'com.gastown.bw-serve %s %s 1 MB\n' "$1" "$2" >> "$SD/procs"; printf '%s\n' "$3" > "$SD/top.$1"; }              # $1=pid $2=etime $3="MEM CMPRS" que o top mostra
+hookbw()    { printf '%s\n' "$*" > "$SD/hook.bw.sh"; printf 'hook="bash %s/hook.bw.sh"\n' "$SD" >> "$SD/kick.com.gastown.bw-serve"; }     # efeito colateral depois do kickstart do bw-serve
+seqall()    { printf '%s\n' "$CALLS" | awk '/^osascript/ {printf "O,"} /^secret/ {printf "S,"} /^kickstart/ {sub(/.*gui\/[0-9]+\//, ""); sub(/com\.whatsapp\./, ""); sub(/com\.gastown\./, ""); printf "%s,", $0} /^guarded/ {printf "G,"}'; }
+alloff()    { local l; for l in demand-dashboard map-viewer ficha360 clientes-dashboard; do setproc $l 2 -; done; }                       # todos os daemons da allowlist parados
 reset() {
   rm -rf "$SD" "$CITY"; mkdir -p "$SD" "$CITY/.gc/logs" "$W/tmp"; rm -f "$W/tmp"/* 2>/dev/null
   cat > "$SD/procs" <<'EOF'
@@ -199,6 +251,11 @@ com.whatsapp.demand-dashboard 1001 05:00:00 500 MB
 com.whatsapp.map-viewer 1002 02:10:04 700 MB
 com.whatsapp.ficha360 1003 07:34:47 140 MB
 com.whatsapp.clientes-dashboard 1004 03:00:00 73 MB
+EOF
+  cat > "$SD/apps" <<'EOF'
+    1 05:00:00 /sbin/launchd
+  412 03:10:11 /usr/sbin/cfprefsd
+14869 22:19:25 /System/Library/PrivateFrameworks/SafariPlatformSupport.framework/Versions/A/XPCServices/com.apple.SafariPlatformSupport.Helper.xpc/Contents/MacOS/com.apple.SafariPlatformSupport.Helper
 EOF
   echo 2000 > "$SD/counter"; printf '3000' > "$SD/free"; printf '4800' > "$SD/swap"; printf '0|' > "$SD/dd_config"
   : > "$SD/calls"; mkdbs; EXTRA_ENV=""
@@ -264,8 +321,8 @@ reset; setproc demand-dashboard 4 1.5 ; setproc demand-dashboard 5 GB; run_d3 --
 reset; setproc demand-dashboard 4 800000 ; setproc demand-dashboard 5 KB; run_d3 --dry-run; has "$OUT" "demand-dashboard (781 MB)" "footprint em KB convertido"
 reset; setproc map-viewer 4 99; run_d3 --dry-run; has "$OUT" "map-viewer (99 MB < 100 MB)" "footprint 99 MB: pulado"
 reset; setproc map-viewer 4 100; run_d3 --dry-run; has "$OUT" "map-viewer (100 MB)" "footprint 100 MB: elegivel"
-reset; for n in 1 2 3; do :; done; run_d3
-bad=$(printf '%s\n' "$CALLS" | grep '^kickstart' | grep -v -E 'gui/[0-9]+/com\.whatsapp\.(demand-dashboard|map-viewer|ficha360|clientes-dashboard)$' || true)
+reset; addbw 5001 08:00:00 "700M 300M"; run_d3   # com o bw-serve grande tambem: so os labels da allowlist (os 4 + o bw-serve) sao reiniciados
+bad=$(printf '%s\n' "$CALLS" | grep '^kickstart' | grep -v -E 'gui/[0-9]+/(com\.whatsapp\.(demand-dashboard|map-viewer|ficha360|clientes-dashboard)|com\.gastown\.bw-serve)$' || true)
 eq "$bad" "" "so labels da allowlist foram reiniciados"
 reset; EXTRA_ENV="DR_D3_PIX_DB=$W/nao-existe.db"; run_d3; expect 30 "pix=?" "banco pix ausente: 30, sem reiniciar"; eq "$(kicks)" "" "banco pix ausente: nada reiniciado"; [ ! -e "$W/nao-existe.db" ] && ok "banco ausente NAO e criado" || nope "banco ausente foi criado"
 
@@ -301,7 +358,9 @@ reset; printf 'isto nao e um banco sqlite, e so lixo suficiente para ter mais de
 reset; sqlite3 "$PIX" "DROP TABLE pix_call_log;"; run_d3; expect 30 "pix=?" "tabela pix_call_log ausente: 30"
 reset; : > "$VOICE"; run_d3; expect 30 "voicebot=?" "banco voicebot vazio (0 bytes, como o voicebot_call_log.db real): 30"
 reset; addvoice live 10; rm -f "$PIX"; run_d3; expect 10 "ligacao em curso" "uma viva + outra ilegivel: vale a viva (10, nao 30)"
-reset; addpix dialing 10; before=$(md5 -q "$PIX"); b2=$(md5 -q "$VOICE"); run_d3; after=$(md5 -q "$PIX"); a2=$(md5 -q "$VOICE"); eq "$before$b2" "$after$a2" "guardas so leem: os dois bancos ficam byte a byte iguais"
+# cksum (POSIX, no mini e no no Linux): o md5 -q nao existe no Linux e la o teste "passava" comparando vazio com vazio; sem soma legivel o teste FALHA
+reset; addpix dialing 10; before=$(cksum < "$PIX"; cksum < "$VOICE"); run_d3; after=$(cksum < "$PIX"; cksum < "$VOICE")
+case "$before" in *[0-9]*) eq "$before" "$after" "guardas so leem: os dois bancos ficam byte a byte iguais" ;; *) nope "guardas so leem: cksum nao devolveu soma (teste vazio)" ;; esac
 reset; hookfor map-viewer "sqlite3 '$VOICE' \"INSERT INTO voicebot_call_log (call_id,status) VALUES ('x','live');\""; run_d3
 expect 0 "parei: ligacao em curso (pix=0 voicebot=1) antes de demand-dashboard" "ligacao aparece entre um daemon e o seguinte: para (rc 0 porque agiu)"; eq "$(kicks)" "map-viewer," "guarda reavaliada antes de CADA daemon: so o map-viewer foi reiniciado"
 
@@ -321,13 +380,13 @@ section "demand-dashboard pelo restart guardado"
 reset; setproc map-viewer 4 50; setproc ficha360 4 50; run_d3
 expect 0 "reiniciei demand-dashboard pid 1001->2001" "guardado ok: reiniciou"; eq "$(kicks)" "G,demand-dashboard," "guardado ok: so o guardado reinicia o demand-dashboard"
 has "$CALLS" "guarded disk-recovery-d3 ga-1p1i5jr.3 | DRAIN=3 READY=3 NOTIFY=/nonexistent URL=http://127.0.0.1:8095" "guardado chamado com agente, bead, tetos e notify desligado (sem aviso duplicado)"
-eq "$(cat "$SD/dd_config" | cut -c1-2)" "0|" "guardado ok: fila despausada no fim"; eq "$(npatch)" 0 "guardado ok: D3 nao precisou despausar nada"
+eq "$(cat "$SD/dd_config" | cut -c1-2)" "0|" "guardado ok: fila despausada no fim"; eq "$(npatch)" 0 "guardado ok: D3 nao precisou despausar nada"; hasnt "$OUT" "retomou" "guardado ok: a linha nao fala em retomada (o guardado ja despausou)"
 reset; setproc map-viewer 4 50; setproc ficha360 4 50; echo leave_paused > "$SD/guarded.mode"; run_d3
-expect 0 "reiniciei demand-dashboard" "guardado deixa a fila pausada (nossa): D3 despausa"; eq "$(cat "$SD/dd_config" | cut -c1-2)" "0|" "pausa nossa que sobrou: lida de volta 0"; eq "$(npatch)" 1 "pausa nossa que sobrou: exatamente 1 PATCH de despausa"
+expect 0 "reiniciei demand-dashboard" "guardado deixa a fila pausada (nossa): D3 despausa"; has "$OUT" "D3 retomou o envio da fila do demand-dashboard (a pausa era nossa)" "D3 despausou a fila sozinho: a linha final DIZ que foi ele quem retomou o envio"; eq "$(cat "$SD/dd_config" | cut -c1-2)" "0|" "pausa nossa que sobrou: lida de volta 0"; eq "$(npatch)" 1 "pausa nossa que sobrou: exatamente 1 PATCH de despausa"
 has "$CALLS" "PATCH sp=0 by=disk-recovery-d3:" "despausa assinada com o prefixo do degrau"
 reset; setproc map-viewer 4 50; setproc ficha360 4 50; echo leave_paused > "$SD/guarded.mode"; touch "$SD/dd_numeric"; run_d3; expect 0 "reiniciei demand-dashboard" "system_paused numerico (1) tambem e lido"
 reset; setproc map-viewer 4 50; setproc ficha360 4 50; echo fail_after_pause > "$SD/guarded.mode"; run_d3
-expect 20 "demand-dashboard: guardado rc=1 [VEREDITO: FALHOU - OutreachWorker nao drenou]; fila conferida" "guardado falha depois de pausar: 20 e fila despausada por nos"; eq "$(cat "$SD/dd_config" | cut -c1-2)" "0|" "guardado falha: pausa nossa desfeita"
+expect 20 "demand-dashboard: guardado rc=1 [VEREDITO: FALHOU - OutreachWorker nao drenou]; fila conferida" "guardado falha depois de pausar: 20 e fila despausada por nos"; eq "$(cat "$SD/dd_config" | cut -c1-2)" "0|" "guardado falha: pausa nossa desfeita"; has "$OUT" "D3 retomou o envio: a pausa era nossa" "guardado falha + D3 despausa: a linha diz que o D3 retomou o envio"
 reset; setproc map-viewer 4 50; setproc ficha360 4 50; echo fail_nopause > "$SD/guarded.mode"; run_d3; expect 20 "guardado rc=1" "guardado falha sem pausar: 20"; eq "$(npatch)" 0 "guardado falha sem pausar: D3 nao mexe na fila"
 reset; setproc map-viewer 4 50; setproc ficha360 4 50; echo foreign > "$SD/guarded.mode"; printf '1|athos: parada de emergencia' > "$SD/dd_config"; run_d3
 expect 0 "reiniciei demand-dashboard" "pausa de outro dono: reinicia"; eq "$(cat "$SD/dd_config")" "1|athos: parada de emergencia" "pausa de outro dono: INTOCADA"; eq "$(npatch)" 0 "pausa de outro dono: nenhum PATCH"
@@ -478,6 +537,87 @@ reset; head -c 5000 /dev/zero | tr '\0' 'x' > "$LOG"; EXTRA_ENV="DR_D3_LOG_MAX_K
 reset; run_d3 >/dev/null; has "$(cat "$LOG")" "FIM rc=0:" "log tem a linha FIM com o rc"; has "$(cat "$LOG")" "reiniciando map-viewer" "log tem o detalhe de cada reinicio"
 reset; run_d3; hasnt "$OUT" "[" "nenhum carimbo de log vaza para a saida"
 reset; for l in demand-dashboard map-viewer ficha360 clientes-dashboard; do setproc $l 3 00:30; done; run_d3; expect 10 "nenhum daemon elegivel" "linha longa de pulos fica <= 290 e ASCII"
+
+section "Safari: fecha o que esta aberto ha mais de 2 h, prova que saiu e nunca confunde ilegivel com fechado (ga-1p1i5jr.7)"
+reset; run_d3; hasnt "$CALLS" "osascript" "so o helper SafariPlatformSupport na lista: Safari fechado, osascript nunca chamado"; hasnt "$OUT" "afari" "Safari fechado: a linha nao fala dele"
+reset; printf '%5s 05:00:00 /Users/x/Safari.app/Contents/MacOS/SafariHelper\n%5s 05:00:00 /Applications/Safari Technology Preview.app/Contents/MacOS/Safari Technology Preview\n' 9200 9201 >> "$SD/apps"; run_d3 >/dev/null
+hasnt "$CALLS" "osascript" "outro executavel com 'Safari' no nome (SafariHelper, Technology Preview): nao e o Safari"
+reset; addsafari 1-02:00:00; run_d3; expect 0 "fechei Safari (aberto ha 26h)" "Safari aberto ha 26 h: fechado e a linha diz"; eq "$(seqall)" "O,map-viewer,G,demand-dashboard,ficha360," "Safari primeiro, depois os daemons (nao recuperou)"
+has "$CALLS" "osascript -e tell application \"Safari\" to quit" "o quit e pelo osascript"; lockgone "Safari fechado"; [ ! -e "$STAMP" ] && ok "quit ok: nenhuma marca de falha" || nope "quit ok deixou marca de falha"
+reset; addsafari 01:59:59; run_d3 >/dev/null; hasnt "$CALLS" "osascript" "Safari com 7199 s: ainda novo, nao e fechado"
+reset; addsafari 02:00:00; run_d3 >/dev/null; has "$CALLS" "osascript" "Safari com 7200 s: fechado"
+reset; addsafari 5-00:10:00; echo 'setfree=4700' > "$SD/osa.mode"; run_d3
+expect 0 "parei: disco recuperado" "Safari fechado recupera o disco: para"; eq "$(seqall)" "O," "recuperou no Safari: nem bw-serve nem daemons"; has "$OUT" "fechei Safari (aberto ha 120h)" "recuperou no Safari: diz o que fez"
+reset; addsafari 1-00:00:00; run_d3 --dry-run; expect 10 "faria reiniciar (maior primeiro): fechar safari (aberto ha 24h), map-viewer" "dry-run: diz que fecharia o Safari"; hasnt "$CALLS" "osascript" "dry-run: osascript nao chamado"; [ ! -e "$STAMP" ] && ok "dry-run: nenhuma marca gravada" || nope "dry-run gravou marca"
+reset; addsafari 1-00:00:00; EXTRA_ENV="DR_D3_BUDGET_S=5"; run_d3; expect 10 "sem tempo para safari" "sem tempo para o Safari: nao comeca"; hasnt "$CALLS" "osascript" "sem tempo: osascript nao chamado"
+# ── ilegivel NUNCA vira "fechado": a lista de processos vazia, com lixo ou que falha
+for m in fail empty garbage; do
+  reset; addsafari 1-00:00:00; touch "$SD/apps.$m"; run_d3; expect 0 "safari (lista de processos (ps) ilegivel)" "lista de processos $m: pulado como 'nao sei'"; hasnt "$CALLS" "osascript" "lista de processos $m: osascript nao chamado"
+  reset; alloff; touch "$SD/apps.$m"; run_d3; expect 30 "safari (lista de processos (ps) ilegivel)" "lista de processos $m e nada mais elegivel: 30, nao 10"
+done
+# ── falha do quit: nao para o resto, rc 20, marca, nao repete por 6 h
+reset; addsafari 1-00:00:00; echo 'rc=1' > "$SD/osa.mode"; run_d3
+expect 20 "safari: osascript rc=1 (execution error: Not authorized" "osascript recusado: 20 e a linha diz o erro"; has "$OUT" "e reiniciei: map-viewer" "Safari que nao fecha nao impede os daemons (segue e diz)"; eq "$(seqall)" "O,map-viewer,G,demand-dashboard,ficha360," "osascript falhou: os daemons rodaram"
+case "$(cat "$STAMP" 2>/dev/null)" in ''|*[!0-9]*) nope "osascript falhou: marca de falha ausente ou nao numerica" ;; *) ok "osascript falhou: marca de falha gravada (epoch)" ;; esac
+run_d3; eq "$(printf '%s\n' "$CALLS" | grep -c '^osascript')" 1 "2a rodada dentro das 6 h: osascript NAO e repetido"; has "$OUT" "safari (quit falhou ha 0 min, nao repito antes de 360 min)" "2a rodada: a linha diz que nao repete"
+echo $(( $(date +%s) - 22000 )) > "$STAMP"; run_d3 >/dev/null; eq "$(printf '%s\n' "$CALLS" | grep -c '^osascript')" 2 "falha de 22000 s atras (> 6 h): tenta de novo"
+echo 'rc=0' > "$SD/osa.mode"; echo $(( $(date +%s) - 22000 )) > "$STAMP"; run_d3 >/dev/null; [ ! -e "$STAMP" ] && ok "quit ok depois de uma falha antiga: a marca some" || nope "marca ficou depois do quit ok"
+reset; addsafari 1-00:00:00; for g in abc ""; do printf '%s' "$g" > "$STAMP"; run_d3 >/dev/null; hasnt "$CALLS" "osascript" "marca '$g' ilegivel: osascript nao chamado"; done
+reset; alloff; addsafari 1-00:00:00; printf 'abc' > "$STAMP"; run_d3; expect 30 "marca da ultima falha de quit ilegivel" "marca ilegivel e nada mais a fazer: 30"
+reset; addsafari 1-00:00:00; echo $(( $(date +%s) + 99999 )) > "$STAMP"; run_d3 >/dev/null; hasnt "$CALLS" "osascript" "marca do futuro (relogio voltou): nao sei quando falhou, nao tenta"
+# Safari que falha (soft) E um daemon que falha (halting) na mesma rodada: a linha traz as DUAS falhas
+reset; addsafari 1-00:00:00; echo 'rc=1' > "$SD/osa.mode"; echo 'rc=113' > "$SD/kick.com.whatsapp.map-viewer"; run_d3
+expect 20 "safari: osascript rc=1" "Safari falha e o map-viewer tambem: a linha diz a falha do Safari"; has "$OUT" "map-viewer: kickstart rc=113" "Safari falha e o map-viewer tambem: a linha diz a falha do daemon"; eq "$(seqall)" "O,map-viewer," "as duas falhas: o daemon que falha para a rodada"
+reset; addsafari 1-00:00:00; echo 'mode=noeffect' > "$SD/osa.mode"; EXTRA_ENV="DR_D3_SAFARI_QUIT_S=2"; run_d3; expect 20 "safari: osascript rc=0 mas o Safari seguiu aberto 2s depois" "osascript rc 0 mas o Safari fica: 20 (nao confia so no rc)"; [ -e "$STAMP" ] && ok "Safari que nao saiu: marca gravada" || nope "Safari que nao saiu: sem marca"
+reset; addsafari 1-00:00:00; echo 'mode=breakps' > "$SD/osa.mode"; EXTRA_ENV="DR_D3_SAFARI_QUIT_S=2"; run_d3; expect 20 "a lista de processos ficou ilegivel: nao provei que o Safari saiu" "quit ok mas a prova ilegivel: 20, nunca 'fechei'"; hasnt "$OUT" "fechei Safari" "prova ilegivel: a linha nao diz que fechou"
+reset; addsafari 1-00:00:00; echo 'mode=slow' > "$SD/osa.mode"; EXTRA_ENV="DR_D3_CMD_S=1"; run_d3; expect 20 "safari: osascript rc=124" "osascript travado (prompt de permissao): encerrado no teto, 20"
+
+section "bw-serve: so passa de 800 MB (MEM+CMPRS), com o secret respondendo antes e depois; o valor do segredo nunca e lido (ga-1p1i5jr.7)"
+reset; run_d3 >/dev/null; hasnt "$CALLS" "secret" "bw-serve nao carregado: nada feito, secret nao chamado"
+reset; addbw 5001 08:00:00 "500M 300M"; run_d3 --dry-run; hasnt "$OUT" "bw-serve" "800 MB (500M+300M): nao passa de 800, fora"
+reset; addbw 5001 08:00:00 "500M 301M"; run_d3 --dry-run; has "$OUT" "bw-serve (801 MB)" "801 MB: entra"
+reset; addbw 5001 08:00:00 "900000K 0K"; run_d3 --dry-run; has "$OUT" "bw-serve (878 MB)" "unidade K convertida"
+reset; addbw 5001 08:00:00 "1G 100M+"; run_d3 --dry-run; has "$OUT" "bw-serve (1124 MB)" "unidade G e sufixo + do top lidos"
+reset; addbw 5001 08:00:00 "1.5G 2048K-"; run_d3 --dry-run; has "$OUT" "bw-serve (1538 MB)" "decimal e sufixo - do top lidos"
+reset; addbw 5001 05:59:59 "700M 300M"; run_d3 --dry-run; hasnt "$OUT" "bw-serve" "bw-serve com 21599 s: ainda novo, fora"
+reset; addbw 5001 06:00:00 "700M 300M"; run_d3 --dry-run; has "$OUT" "bw-serve (1000 MB)" "bw-serve com 21600 s: entra"
+reset; addbw 5001 08:00:00 "700M 300M"; run_d3 --dry-run; hasnt "$CALLS" "secret" "dry-run: o secret NAO e chamado (ele pode carregar o job)"; hasnt "$CALLS" "kickstart" "dry-run com bw-serve grande: nenhum kickstart"
+# ── ilegivel NUNCA vira "pequeno"/"ok"
+for m in fail garbage; do
+  reset; addbw 5001 08:00:00 "700M 300M"; touch "$SD/top.$m.5001"; run_d3; expect 0 "bw-serve (MEM+CMPRS (top) ilegivel)" "top $m: bw-serve pulado como 'nao sei', os daemons seguem"; hasnt "$(seqall)" "bw-serve" "top $m: bw-serve nao reiniciado"
+done
+reset; alloff; addbw 5001 08:00:00 "700M 300M"; rm -f "$SD/top.5001"; run_d3; expect 30 "bw-serve (MEM+CMPRS (top) ilegivel)" "top sem a linha de valores e nada mais elegivel: 30 (nao e '0 MB')"
+reset; addbw 5001 08:00:00 "700X 300M"; run_d3 --dry-run; has "$OUT" "bw-serve (MEM+CMPRS (top) ilegivel)" "unidade desconhecida (X): ilegivel, nao entra como 0 MB"; hasnt "$OUT" "faria reiniciar (maior primeiro): bw-serve" "unidade desconhecida: bw-serve nao entra na lista do que faria"
+reset; alloff; addbw 5001 08:00:00 "700M 300M"; echo 3 > "$SD/freeze.com.gastown.bw-serve"; run_d3; expect 30 "bw-serve (deploy_freeze ilegivel)" "freeze do bw-serve ilegivel: 30"
+reset; addbw 5001 08:00:00 "700M 300M"; echo 0 > "$SD/freeze.com.gastown.bw-serve"; run_d3; has "$OUT" "bw-serve (congelado (deploy_freeze))" "bw-serve congelado: pulado"; hasnt "$(seqall)" "bw-serve" "bw-serve congelado: nao reiniciado"
+reset; addbw 5001 08:00:00 "700M 300M"; touch "$SD/secret.fail"; run_d3; has "$(cat "$LOG")" "pulo bw-serve: secret ja falha antes do restart (cofre doente: nao mexo)" "secret ja falhando antes: o cofre nao e tocado (o motivo vai no log; a linha de 290 pode cortar o fim)"; hasnt "$(seqall)" "bw-serve" "secret ja falhando: sem kickstart do bw-serve"
+reset; alloff; addbw 5001 08:00:00 "700M 300M"; touch "$SD/secret.fail"; run_d3; expect 30 "cofre doente" "secret ja falhando e nada mais a fazer: 30"
+reset; addbw 5001 08:00:00 "700M 300M"; addpix dialing 5; run_d3; expect 10 "ligacao em curso (pix=1 voicebot=0) antes de bw-serve" "ligacao em curso: o bw-serve espera"; eq "$(seqall)" "S," "ligacao em curso: so o secret de antes rodou, nem bw-serve nem daemons"
+# ── restart
+reset; addbw 5001 08:00:00 "700M 300M"; echo '30M 20M' > "$SD/top.2001"; echo 'setfree=4700' > "$SD/kick.com.gastown.bw-serve"; run_d3
+expect 0 "reiniciei bw-serve pid 5001->2001 1000->50 MB secret ok" "bw-serve grande: reiniciado, PID novo + secret ok, MEM antes->depois"; eq "$(seqall)" "S,bw-serve,S," "secret ANTES, kickstart, secret DEPOIS; recuperou: nenhum daemon"
+has "$OUT" "parei: disco recuperado" "recuperou no bw-serve: diz por que parou"; has "$CALLS" "secret motherduck-token" "a prova usa o item configurado"
+eq "$(grep -rl S3CR3T "$W" --exclude-dir=bin 2>/dev/null | head -1)" "" "o VALOR do segredo nao vazou (nem linha, nem log, nem arquivo temporario)"; lockgone "bw-serve reiniciado"
+has "$CALLS" "stdout-do-secret=devnull" "o stdout do secret vai para /dev/null (o valor nao passa nem pelo arquivo temporario)"; hasnt "$CALLS" "stdout-do-secret=CAPTURADO" "nenhuma chamada do secret com o stdout capturado"
+reset; addsafari 1-00:00:00; addbw 5001 08:00:00 "700M 300M"; run_d3; expect 0 "fechei Safari" "Safari + bw-serve + daemons"; eq "$(seqall)" "O,S,bw-serve,S,map-viewer,G,demand-dashboard,ficha360," "ordem: Safari, bw-serve, daemons"
+reset; addbw 5001 08:00:00 "700M 300M"; echo 'rc=7' > "$SD/kick.com.gastown.bw-serve"; run_d3; expect 20 "bw-serve: kickstart rc=7" "kickstart do bw-serve falha: 20"; eq "$(seqall)" "S,bw-serve," "bw-serve falhou: para, nenhum daemon"
+reset; addbw 5001 08:00:00 "700M 300M"; echo 'mode=samepid' > "$SD/kick.com.gastown.bw-serve"; run_d3; expect 20 "bw-serve: sem PID novo + secret respondendo" "bw-serve com o mesmo PID: 20"
+reset; addbw 5001 08:00:00 "700M 300M"; hookbw "touch '$SD/secret.fail'"; EXTRA_ENV="DR_D3_READY_S=2"; run_d3
+expect 20 "COFRE SEM RESPOSTA" "secret falha DEPOIS do restart: 20 e o aviso 'COFRE SEM RESPOSTA'"; eq "$(seqall | sed 's/S,//g')" "bw-serve," "secret falhou depois: o degrau PARA, nenhum daemon reiniciado"; lockgone "secret falhou depois"
+reset; addbw 5001 08:00:00 "700M 300M"; hookbw "echo 2 > '$SD/secret.fail_n'"; echo 'setfree=4700' >> "$SD/kick.com.gastown.bw-serve"; EXTRA_ENV="DR_D3_READY_S=15"; run_d3
+expect 0 "bw-serve pid 5001->2001" "cofre voltando devagar (2 falhas, 3a ok): espera e prova"
+reset; addbw 5001 08:00:00 "700M 300M"; EXTRA_ENV="DR_D3_BUDGET_S=5"; run_d3; expect 10 "sem tempo para bw-serve" "sem tempo para o bw-serve: nao comeca"; hasnt "$CALLS" "secret" "sem tempo: secret nao chamado"
+
+section "label ausente x dominio errado, sobra de pausa antes de ler o disco, teto de tempo em segundos de relogio (ga-1p1i5jr.7)"
+reset; grep -v map-viewer "$SD/procs" > "$SD/procs.new"; mv "$SD/procs.new" "$SD/procs"; run_d3; expect 0 "map-viewer (nao carregado no launchd)" "label fora da lista (dominio certo): 'nao carregado', os outros agem"; hasnt "$(kicks)" "map-viewer" "label nao carregado: nao reiniciado"
+reset; touch "$SD/launchctl.nodomain"; run_d3; expect 30 "launchctl ilegivel" "lista sem nenhum label da cidade (dominio errado): 30, nao 'nada a fazer'"; eq "$(kicks)" "" "dominio errado: nada reiniciado"
+reset; printf '1|disk-recovery-d3: restart guardado ga-1p1i5jr.3' > "$SD/dd_config"; rm -f "$SD/free"; run_d3
+expect 30 "sobra de pausa nossa da rodada anterior: despausada e conferida" "df ilegivel + sobra de pausa nossa: a linha conta a sobra desfeita"; eq "$(cut -c1-2 < "$SD/dd_config")" "0|" "df ilegivel: a pausa nossa foi desfeita ANTES de ler o disco"
+reset; printf '1|disk-recovery-d3: restart guardado ga-1p1i5jr.3' > "$SD/dd_config"; echo patch400 > "$SD/dd_mode"; rm -f "$SD/free"; run_d3
+expect 20 "fila do demand-dashboard NAO despausada" "df ilegivel + sobra que o PATCH recusou: 20 (a fila segue parada e a linha diz)"; has "$OUT" "df do volume Data ilegivel" "df ilegivel + sobra: a linha tambem diz o df"
+# run_bounded: o teto de 1 s e de RELOGIO. Com o `sleep 0.05` 10x mais lento (host carregado) contar tiques levaria ~10 s
+touch "$SD/sleep.slow"; rb=$( ( eval "$(sed -n '/^run_bounded() {/,/^}/p' "$D3")"; PATH="$BIN:$PATH"; export STUB_DIR="$SD" TMPDIR="$W/tmp"; T0=$SECONDS; run_bounded 1 sleep 30; echo "$? $((SECONDS - T0))" ) 2>/dev/null ); rm -f "$SD/sleep.slow"
+set -- $rb; eq "${1:-?}" 124 "run_bounded: comando que estoura o teto sai com 124"; [ "${2:-99}" -le 6 ] && ok "run_bounded: teto de 1 s em relogio (${2:-?} s com o sleep 0.05 10x mais lento)" || nope "run_bounded: teto de 1 s levou ${2:-?} s com o sleep lento (conta tiques, nao segundos)"
 
 printf '\n%s passaram, %s falharam\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
