@@ -2,7 +2,7 @@
 
 ## Contents
 
-• O que faz (a cada 60 s, sob flock) · A tela do limite e o Escape (ga-ci3uao) · A mensagem de limite sem o modal e o último degrau (ga-yqzedv) · Garantias · Liga/desliga · Riscos abertos (não medidos)
+• O que faz (a cada 60 s, sob flock) · A tela do limite e o Escape (ga-ci3uao) · A mensagem de limite sem o modal e o último degrau (ga-yqzedv) · Ninguém fica sem aviso: sem login completo, login queimado, login a vencer (ga-xoe5ao.4) · Garantias · Liga/desliga · Riscos abertos (não medidos)
 
 Fase 2 da ga-xoe5ao. O pool headless (ga-8hcnvb.1, `claude-pool-account.py`) decide a conta; este script **segue** a decisão
 para quem usa Remote Control (Mayor + crews), reescrevendo o item DEFAULT do Keychain `Claude Code-credentials`.
@@ -154,11 +154,55 @@ novo) existe mas **não foi medida**, por isso não foi implementada.
 qualquer prefixo não-alfanumérico). Se o claude real desenhar outra coisa, a consequência é "não sei" (sem vigia), nunca "parada" por engano.
 Rodando o arquivo de testes novo contra o script do HEAD anterior (`cb6afb9d9`): 47 reprovam e 145 passam (os antigos, mais os novos que só afirmam que nada acontece: layout não medido, mensagem velha com trabalho depois, só o Escape armado). Medi em duas rodadas: 45 reprovam / 145 passam na versão de 190 testes; os 2 testes de falha injetada (transcript ausente/ilegível/corrompido, `gc` que não roda/estoura/responde lixo) foram rodados à parte e reprovam com `AttributeError`, porque `transcript_says` e `gc_session_id` não existem lá (reprovam por ausência da função, não por comportamento errado).
 
+## Ninguém fica sem aviso: sem login completo, login queimado, login a vencer (ga-xoe5ao.4)
+**O que aconteceu (relato da bead, log do mini):** de 01/11 08:39Z a 02/11 03:10Z (~18,5 h) o item default ficou sem access token ("holds no full login" a cada minuto) e
+**ninguém foi avisado**. 08:36Z troca cega para a terrenos (#323), o default voltou a "no access token" em ~3 min; heal cego para a throw.away.amb (#324, 08:39Z) e a athosb85 (#325,
+08:43Z), cada uma vazia de novo em 3–4 min; 08:48Z "cannot heal" (terrenos segurada 6 h, athoscrypto em quarentena, sem reserva). A cada 6 h os holds venciam e as três eram escritas
+de novo (02:37Z #332, 02:40Z #333, 02:50Z #334). Só um login humano (03:10Z) encerrou. Mesma classe, menor, em 29/10 20Z–30/10 02Z.
+
+**Por que ninguém soube: três defeitos do próprio job, lidos no código** (o `notify` e o log reais ficam no mini, então qual deles comeu os pushes de 01/11 **não foi medido aqui**):
+1. `alert()` dava o push por entregue com o `notify` saindo 0 e ficava calado 6 h. O contrato do próprio `notify` (`policy_exit`, citado em `git-loose-repack.sh`/`notify_send`, `claude-pool-guard.py`/`send_alert`
+   e `disk-recovery-ladder.sh`/ENTREGA): por padrão TODO caminho que não empurrou sai 0 ("rc 0 nunca diz 'chegou'") e fonte desconhecida vai ao digest mudo; com `NOTIFY_STRICT_EXIT=1` + `NOTIFY_FORCE_PUSH=1` o rc diz
+   o que houve. Agora `push()` pede os dois. Entregue = 0, 10 (segurado até as 7h) ou 11 (o título já saiu há < 30 min); 12 (digest/teto), 13, 1 ou outro = não entregue, repete em 5 min.
+2. O título era sempre "Troca de conta (crews)" e o `notify` descarta o 2º push de um título em 30 min: `default-not-full` (08:39Z) e `heal-no-source` (08:48Z) estão a 9 min. O título agora leva a chave.
+3. Nada durável. Além do push, **um mail ao Mayor** (`gc mail send mayor/ --from controller`, o formato do crew-pushguard-check): um no começo do episódio e um no fim.
+
+**Episódio (`watch_no_login` anota, `tell_no_login` avisa, nesta ordem e DEPOIS do heal da rodada, para o aviso dizer quais contas falharam e por quê).** "Sem login completo" = default ausente
+ou sem login completo. Com `NO_LOGIN_WARN_S` = 10 min SEGUIDOS sai UM push (lembrete a cada 6 h enquanto durar) e UM mail com a causa por conta (`Tried: ...`) e o comando que resolve (`claude auth login`
+no config dir da conta que o pool quer: UM login basta, o job o escreve no default em ~1 min). Termina quando há login completo por `NO_LOGIN_END_S` = 10 min (um heal que esvazia de novo em 3–4 min é o
+MESMO episódio); o fim também sai por push + mail, repetido até chegar nos dois (ou 1 h). Episódio de < 10 min não avisa nada, nem o fim. Leitura que não consegue dizer (keychain travado) não estende nem
+encerra; registro de episódio ilegível recomeça o relógio (o aviso atrasa, nunca adianta). Estado: `no_login`, `no_login_last`. Os avisos imediatos de antes (`default-not-full` etc.) continuam, agora sob o contrato estrito do `notify`.
+
+**Login queimado (`burn` / `dead_login`).** Uma escrita cega (cópia guardada, access token vencido) cujo default fica "no access token" em até 30 min tem a cara de um refresh recusado pelo CLI (inferência do log #323-#325, não observada no CLI):
+1 strike para aquele refresh token (`burned` no estado). Com `BURN_LIMIT` = 2 o login está morto: não é escrito de novo enquanto o refresh token for o mesmo (login refeito = outra chave), em vez de a cada
+6 h para sempre. Dois e não um porque o custo é assimétrico: reescrever um login morto custa quase nada (o default já estava vazio); marcar morto um login bom por uma queda sem relação com ele repetiria as
+18 h. Um refresh que pegou (access token diferente num login completo) zera os strikes; registro de strikes ilegível = morto (lado inerte). Só o login que falhou DUAS vezes sai do "uma tentativa a mais a cada
+6 h" da ga-xoe5ao.2; o hold de 6 h continua valendo para a 1ª.
+
+**Login a vencer (`warn_expiring`).** O refresh token tem validade ABSOLUTA (~30 dias do login; se a rotação a estende NÃO foi medido, ga-yyltfk): athosmartins BACKUP 30/10 13:57Z, terrenos (item padrão) 02/11
+19:53Z, as 3 contas de diretório ~04/11. Logins feitos juntos vencem juntos. A cada hora o job lê o melhor login de cada conta (o do default conta para quem o segura); a que acaba em <= 7 dias gera UM push por
+dia (`expiring:<conta>`, sem forçar: o silêncio da noite vale) com o comando. É o gatilho certo para um relogin automático: refazer a T-7 dias não custa outage se falhar.
+
+**Por que os itens guardados ficam vencidos (item 3 da bead): o que se sabe e o que não.**
+- Sabido: (a) validade absoluta de ~30 dias sem renovação agendada; (b) a cópia guardada envelhece a cada rotação do refresh (~8 h de uso, medido na ga-yyltfk) e o sync-back só salva enquanto a conta segura o
+  default e o perfil confirma o dono; (c) toda cópia guardada tem o access token vencido, então toda escrita é cega.
+- Hipótese, NÃO medida: o CLI recusa o refresh de uma cópia cujo refresh token já foi rotacionado e deixa o item sem access token (é a assinatura que o `burn` usa). Confirmar exige o Keychain do mini: comparar, por conta,
+  o fingerprint do refresh token do item guardado com o do default na hora em que a conta saiu dele (só fingerprints, nunca o token).
+- "sync-back ... skipped: the stored login is a NEWER one" (14 h de linhas iguais): a comparação é por `refreshTokenExpiresAt` e só diz algo dentro de UMA linhagem de login; entre dois logins da mesma conta (um refeito
+  depois) ou com item contaminado ela não prova qual está vivo. **Não consegui determinar daqui se estava errada** (sem log nem Keychain neste nó). Não mudei a regra (não sobrescrever é o lado inerte); a linha agora
+  sai UMA vez por mudança de fatos e traz as duas impressões, as duas datas de vencimento e o dono que a tabela conhece.
+
+**Relogin automático (item 2 da bead): NÃO entregue aqui.** Precisa do Chrome CDP, do `secret`/gmail-totp e da skill federated-site-login, que só existem no mini (este código foi escrito no nó Hetzner). A única tentativa
+registrada (ga-yyltfk, 04/10, terrenos@) chegou ao "Authorize" e parou no quebra-cabeça anti-bot da Anthropic; o Mayor decidiu então que contornar isso está fora, mesmo com autorização, e cada tentativa pode mandar um
+"Tap Yes" ao celular do Athos. Para a bead de relogin no mini: (1) acionar pela previsão (T-7 dias), não depois do outage; (2) se o quebra-cabeça aparecer, a conta é "inviável por automação" e só então se chama o
+Athos, com o comando exato; (3) login de escopo completo (`claude auth login`, nunca setup-token) em CLAUDE_CONFIG_DIR próprio, com `hasCompletedOnboarding=true`. O job já o recebe sem mudança: um login novo no
+config dir da conta é achado pelo `load_source` no minuto seguinte.
+
 ## Garantias
 - Nunca chama `claude`; custo de crédito zero (só o perfil, grátis). Nunca escreve no item hasheado do pool.
 - Token nunca em argv, ambiente, log, estado ou notificação.
 - `--dry-run`: só stderr; não escreve, não notifica, não toca o log real; se perder o flock, diz isso.
-- Alerta só conta como "avisado" se o `notify` saiu com 0; se falhou, tenta de novo em 5 min (não em 6 h).
+- Alerta só conta como "avisado" se o `notify` (contrato estrito, `NOTIFY_STRICT_EXIT=1`) saiu com 0, 10 ou 11; senão tenta de novo em 5 min (não em 6 h). O título leva a condição.
 - Saída: 0 = rodou (ou outra rodada tinha o lock); **1** = crash (com alerta `crash`, dedup 6 h) ou lock que não abre.
 - Linha do `security -i` > 4000 bytes é recusada (medido 07/10: o `security -i` corta a linha em 4096 e executa o resto como 2º comando).
 - Estado corrompido/ilegível: log WARN + `state_reset` no estado (arquivo ausente = 1ª rodada, normal).
@@ -193,6 +237,11 @@ Rodando o arquivo de testes novo contra o script do HEAD anterior (`cb6afb9d9`):
   aparecer como alerta recorrente (fail-closed), não como perda de login. Exceção: a cópia guardada que não é login
   completo (setup-token, sem o escopo de sessões ou sem access token, login a < 1 dia de vencer) não serve às crews de
   qualquer jeito e é substituída pelo login completo do default, sem comparar datas.
+- (ga-xoe5ao.4) A regra dos 2 strikes se apoia na assinatura "no access token em até 30 min da escrita": é inferência de log (#323-#325), não observação do CLI. Se o CLI esvaziar o item por outro motivo duas vezes
+  seguidas, um login bom é marcado morto até ser refeito (a conta cai para as outras; custo pequeno, mas existe). Sem decisão do pool (arquivo ausente) o episódio nem é rastreado: `_follow` não roda. `NOTIFY_FORCE_PUSH`
+  acorda de madrugada nas quedas reais; só a previsão de vencimento respeita o silêncio da noite.
+- (ga-xoe5ao.4) O episódio olha só o estado ESTRUTURAL do default (login completo presente). Um login presente que o CLI não consegue renovar mas que não esvazia o item não seria um episódio; não foi visto no
+  incidente, e tratar "access token vencido há N min" como queda arriscaria falso alarme à noite (sessões ociosas podem não renovar), então não foi feito sem dado.
 - O servidor tolera o refresh token antigo após a rotação?
 - `gc` reinicia crew com `--resume`? (não verificado)
 - O perfil (`oauthAccount`) pode ficar na conta antiga enquanto o token é da nova.
@@ -214,7 +263,7 @@ Rodando o arquivo de testes novo contra o script do HEAD anterior (`cb6afb9d9`):
 - (ga-xoe5ao.2) A trava só vale para a troca NÃO verificada. Um `SWITCH` verificado (o perfil respondeu pela cópia guardada) que se repita a
   cada ciclo não é cortado por ela; não foi visto em produção e o mecanismo que esvazia o default (acima) não deveria agir sobre um token vivo.
 
-Testes: `scripts/test_claude_crew_account.py` (208 testes, shim de `security`, servidor de perfil em loopback, `tmux` falso que registra cada argv e cada tecla, `gc` falso que registra cada chamada). O harness é
+Testes: `scripts/test_claude_crew_account.py` (237 testes, shim de `security`, servidor de perfil em loopback, `tmux` falso que registra cada argv e cada tecla, `gc` falso que registra cada chamada e aceita `mail send`, `notify` falso que registra o ambiente (STRICT/FORCE) e devolve o rc pedido). O harness é
 selado: todo teste roda com `CLAUDE_CREW_NOTIFY`, `CLAUDE_CREW_SECURITY` e `GC_CITY_PATH` fixados em stubs/tmp e `PATH`
 sem o `notify` real; no fim da sessão afirma que o log/estado/lock reais não mudaram e que nenhum sentinela foi executado;
 e o script roda de verdade sob `env -i`, com `python3` do pytest e com `/usr/bin/python3` (3.9, o do plist).
