@@ -122,6 +122,10 @@ nnotify() { local n; n=$(grep -c -F -- "$1" "$SD/notify.log" 2>/dev/null); echo 
 nmail()   { local n; n=$(grep -c -F -- "$1" "$SD/mail.log" 2>/dev/null); echo "${n:-0}"; }
 sv()  { sed -n "s/^$1=//p" "$STATE" 2>/dev/null | head -n 1; }
 logtxt() { cat "$LOG" 2>/dev/null; }
+mkstate() {  # arquivo since2 since3 since4 [acted4_ts] [hard_n]: estado COMPLETO (todas as chaves do save_state) escrito à mão; última leitura = T0, sem lacuna
+  printf 'v=1\nlast_ts=%s\nlast_free_mb=2900\nlast_swap_mb=0\nhard_n=%s\nhard_ts=0\nacted4_ts=%s\nesc4=0\nwarn_ts=0\nwarn2_ts=0\nhb_ts=%s\nsince2=%s\nsince3=%s\nsince4=%s\nst2=none\nst3=none\nst4=none\nat2=0\nat3=0\nat4=0\nnt2=0\nnt3=0\nnt4=0\n' \
+    "$T0" "${6:-0}" "${5:-0}" "$T0" "$2" "$3" "$4" > "$1"
+}
 mode() { printf '%s\n' "${@:2}" > "$SD/mode.$1"; }
 reset() {
   rm -rf "$CITY" "$W/ro"; mkdir -p "$CITY/.gc/logs"
@@ -209,6 +213,7 @@ walk 5000 0 $((T0 + 1200)) $((T0 + 2400)) 300
 eq "$(ncall d2 --run)" 1 "D2 acted: não repete em 25 min"
 tick 5000 0 $((T0 + 2700))
 eq "$(ncall d2 --run)" 2 "D2 acted: repete aos 30 min"
+eq "$(nnotify 'p=3 force= t=Disco: degrau D2 agiu'),$(nmail 'D2 agiu')" "2,2" "D2 acted que repete: cada vez avisa e manda mail (só FALHOU é limitado)"
 
 section "D2: cada código de saída do degrau"
 for row in "10 idle 0 0 0" "20 failed 20 1 1" "30 unknown 0 0 0" "7 failed 20 1 1"; do
@@ -223,6 +228,20 @@ for row in "10 idle 0 0 0" "20 failed 20 1 1" "30 unknown 0 0 0" "7 failed 20 1 
 done
 reset; mode d2 rc=30; walk 5000 0 "$T0" $((T0 + 900)) 100
 has "$(cat "$SD/notify.log")" "não leu o estado" "D2 rc=30: avisa que o degrau não leu o estado"
+eq "$(nnotify 'p=3 force= t=Disco: degrau D2 não leu')" 1 "D2 rc=30: -p 3 sem push forçado (normal)"
+reset; mode d2 rc=10; mode d3 rc=10; mode d4 rc=30; walk 2500 0 "$T0" $((T0 + 3600)) 300
+eq "$(nnotify 'p=4 force=1 t=Disco: degrau D4 não leu')" 1 "D4 rc=30 (cego com o disco crítico): -p 4 com push forçado"
+
+section "D2 que continua FALHANDO: 1 aviso + 1 mail por hora por degrau, o resto só no log"
+reset; mode d2 rc=20
+walk 5000 0 "$T0" $((T0 + 4200)) 100   # chamadas aos 900 s e a cada 300 s depois; a última rodada (4200 s) é uma chamada sem aviso
+c=$(ncall d2 --run)
+[ "$c" -ge 10 ] && ok "D2 foi chamado $c vezes em 1 h (repete a cada 5 min)" || nope "D2 chamado só $c vezes"
+eq "$(nnotify 'p=4 force=1 t=Disco: degrau D2 FALHOU'),$(nmail 'D2 FALHOU')" "1,1" "…mas só 1 aviso (push forçado) e 1 mail"
+eq "$RC" 20 "…a saída do maestro continua 20 nas rodadas sem aviso"
+has "$(logtxt)" "FALHOU de novo: o aviso e o mail dele saíram há" "…e o log diz que suprimiu"
+tick 5000 0 $((T0 + 4500))
+eq "$(nnotify 'p=4 force=1 t=Disco: degrau D2 FALHOU'),$(nmail 'D2 FALHOU')" "2,2" "passada 1 h do último aviso: avisa de novo"
 
 section "D2: estourou o tempo → TERM e conta como falha"
 reset; XENV=(DR_RUNG_TIMEOUT_S=1); mode d2 slp=30
@@ -250,8 +269,7 @@ section "1ª passada com VÁRIOS degraus vencidos ao mesmo tempo: D2 primeiro, d
 # Com rodadas a cada 5 min o cronômetro de um nível só vence depois de o de baixo já ter sido chamado, então o walk acima nunca tem dois
 # vencidos juntos. Aqui o estado é escrito à mão (D2/D3/D4 vencidos, nenhum chamado ainda, leitura anterior de 2 min atrás, sem lacuna).
 reset; mode d2 rc=10; mode d3 rc=10; mode d4 rc=10
-printf 'v=1\nlast_ts=%s\nlast_free_mb=2900\nlast_swap_mb=0\nhard_n=0\nacted4_ts=0\nesc4=0\nwarn_ts=0\nwarn2_ts=0\nhb_ts=%s\nsince2=%s\nsince3=%s\nsince4=%s\nst2=none\nst3=none\nst4=none\nat2=0\nat3=0\nat4=0\n' \
-  "$T0" "$T0" $((T0 - 4000)) $((T0 - 4000)) $((T0 - 4000)) > "$STATE"
+mkstate "$STATE" $((T0 - 4000)) $((T0 - 4000)) $((T0 - 4000))
 tick 2900 0 $((T0 + 120))
 eq "$(ncall d2 --run)$(ncall d3 --run)$(ncall d4 --run)" 100 "D2, D3 e D4 vencidos juntos, nenhum chamado: a 1ª rodada chama SÓ o D2"
 tick 2900 0 $((T0 + 240))
@@ -280,6 +298,10 @@ eq "$(ncallall)" 0 "leituras abaixo do piso alternando com acima: nunca seguidas
 for row in "1536 0" "1535 1"; do set -- $row; reset; tick "$1" 0 "$T0"; tick "$1" 0 $((T0 + 120)); eq "$(ncall d4 --run)" "$2" "2 leituras de $1 MB seguidas: D4 chamado $2 vez (o piso duro é < 1536)"; done
 reset; tick 1400 0 "$T0"; tick 1400 0 $((T0 + 700))
 eq "$(ncallall)" 0 "lacuna de 700 s entre as 2 leituras: a contagem recomeça (nada)"
+reset; tick 1400 0 "$T0"; tick 1400 0 $((T0 + 1)); tick 1400 0 $((T0 + 99))
+eq "$(ncall d4 --run)" 0 "rodadas coladas (1 s e 99 s depois, p.ex. --run à mão ao lado da agendada) contam como UMA leitura: nada"
+tick 1400 0 $((T0 + 100))
+eq "$(ncall d4 --run)" 1 "…a 2ª leitura só conta a partir de 100 s depois da 1ª: D4"
 
 section "histerese de 512 MB"
 reset; tick 5000 0 "$T0"; tick 5631 0 $((T0 + 300)); tick 5000 0 $((T0 + 600))
@@ -368,7 +390,7 @@ tick 2500 0 $((T0 + 3600 + 4000))
 eq "$(sv since4),$(sv acted4_ts)" "$((T0 + 3600 + 4000)),$((T0 + 3600))" "boot (lacuna longa): cronômetros zeram e a hora do último reinício fica"
 
 section "estado salvo ilegível: põe de lado, avisa, recomeça do zero"
-for body in "lixo sem chave" "v=1\nsince2=abc" "v=1\nst2=bogus" "v=1\nsince2=-5" "v=1\nlast_ts=1.5" "since2=5" ""; do
+for body in "lixo sem chave" "v=1\nsince2=abc" "v=1\nst2=bogus" "v=1\nsince2=-5" "v=1\nlast_ts=1.5" "since2=5" "v=1" "v=1\nlast_ts=1000800" ""; do
   lbl=$(printf "$body" | tr '\n' ' '); [ -n "$lbl" ] || lbl="(vazio)"
   reset; walk 5000 0 "$T0" $((T0 + 800)) 100
   printf "$body" > "$STATE"
@@ -377,7 +399,41 @@ for body in "lixo sem chave" "v=1\nsince2=abc" "v=1\nst2=bogus" "v=1\nsince2=-5"
   has "$OUT" "estado salvo ilegível" "estado '$lbl': avisa"
   [ -n "$(ls "$STATE".corrupt-* 2>/dev/null)" ] && ok "estado '$lbl': posto de lado" || nope "estado '$lbl': não pôs de lado"
   eq "$(sv since2)" $((T0 + 900)) "estado '$lbl': cronômetro recomeça agora"
+  eq "$(sv acted4_ts)" $((T0 + 900)) "estado '$lbl': acted4_ts = AGORA (não sei se o D4 acabou de disparar)"
 done
+
+section "estado CORTADO numa fronteira de linha (prefixo válido): chave que falta não vira 0 em silêncio"
+reset; walk 5000 0 "$T0" $((T0 + 800)) 100; cp "$STATE" "$W/state.good"
+nlines=$(wc -l < "$W/state.good")
+for keep in 1 2 8 $((nlines - 1)); do
+  head -n "$keep" "$W/state.good" > "$STATE"; rm -f "$STATE".corrupt-*
+  tick 5000 0 $((T0 + 900))
+  eq "$RC,$(ncall d2 --run)" "0,0" "estado cortado em $keep de $nlines linhas → rodada segue, D2 NÃO chamado por histórico que não li"
+  has "$OUT" "estado salvo ilegível, incompleto ou inválido" "estado cortado em $keep linhas: AVISA (antes passava sem aviso)"
+  [ -n "$(ls "$STATE".corrupt-* 2>/dev/null)" ] && ok "estado cortado em $keep linhas: posto de lado" || nope "estado cortado em $keep linhas: não pôs de lado"
+  eq "$(sv acted4_ts)" $((T0 + 900)) "estado cortado em $keep linhas: acted4_ts = AGORA"
+done
+reset; walk 5000 0 "$T0" $((T0 + 800)) 100; tick 5000 0 $((T0 + 900))
+[ -z "$(ls "$STATE".corrupt-* 2>/dev/null)" ] && ok "estado COMPLETO (controle): não é posto de lado" || nope "estado completo foi posto de lado"
+
+section "estado perdido DEPOIS de o D4 disparar: o teto de 6 h vale (reinício em laço impossível)"
+for body in "lixo sem chave" "v=1" "v=1\nlast_ts=1000120" ""; do
+  lbl=$(printf "$body" | tr '\n' ' '); [ -n "$lbl" ] || lbl="(vazio)"
+  reset; mode d4 rc=0
+  tick 1400 0 "$T0"; tick 1400 0 $((T0 + 120))
+  eq "$(ncall d4 --run)" 1 "estado '$lbl': D4 disparou uma vez (2 leituras < 1,5 GB)"
+  printf "$body" > "$STATE"
+  tick 1400 0 $((T0 + 240)); tick 1400 0 $((T0 + 360)); tick 1400 0 $((T0 + 480))
+  eq "$(ncall d4 --run)" 1 "estado '$lbl' perdido + 2 leituras < 1,5 GB seguidas: o D4 NÃO é chamado de novo"
+  eq "$(nnotify 'p=5 force=1 t=Disco: segue baixo'),$(nmail 'já disparou')" "1,1" "estado '$lbl': escala UMA vez (push forçado + mail) em vez de reiniciar"
+done
+tick 1400 0 $((T0 + 240 + 21840)); tick 1400 0 $((T0 + 240 + 21960))
+eq "$(ncall d4 --run)" 2 "passadas 6 h da perda do estado: o D4 volta a poder ser chamado"
+reset; mode d4 rc=0
+tick 1400 0 "$T0"; tick 1400 0 $((T0 + 120)); rm -f "$STATE"
+tick 1400 0 $((T0 + 240)); tick 1400 0 $((T0 + 360))
+eq "$(ncall d4 --run)" 2 "estado AUSENTE (apagado à mão) é 1ª rodada de propósito: zera inclusive o teto (documentado no cabeçalho)"
+has "$(logtxt)" "primeira rodada" "…e o log diz que é a primeira rodada"
 reset; tick 20000 0 "$T0"; has "$(logtxt)" "primeira rodada" "sem estado = primeira rodada (sem aviso de corrompido)"
 [ -z "$(ls "$STATE".corrupt-* 2>/dev/null)" ] && ok "primeira rodada não cria .corrupt" || nope "criou .corrupt à toa"
 if [ "$(id -u)" != 0 ]; then
@@ -385,7 +441,22 @@ if [ "$(id -u)" != 0 ]; then
   tick 20000 0 "$T0"
   eq "$RC" 30 "estado não gravável → 30"
   has "$(logtxt)" "não consegui gravar o estado" "estado não gravável: WARN no log"
+  eq "$(nnotify 'p=4 force=1 t=Disco: a escada não consegue gravar o estado')" 1 "estado não gravável: avisa -p 4 com push forçado (a escada está cega)"
+  tick 20000 0 $((T0 + 120))
+  eq "$(nnotify 'p=4 force=1 t=Disco: a escada não consegue gravar o estado')" 1 "…no máximo 1 por hora (2ª rodada calada)"
+  touch -t 200001010000 "$CITY/.gc/disk-recovery.nosave"; tick 20000 0 $((T0 + 240))
+  eq "$(nnotify 'p=4 force=1 t=Disco: a escada não consegue gravar o estado')" 2 "…e de novo depois de 1 h"
   chmod 755 "$W/ro"
+
+  section "estado ruim + estado não gravável: o arquivo ruim FICA no lugar até o novo estar gravado (senão o acted4_ts se perde de vez)"
+  # limite do teste: dir somente-leitura também barra o rename, então isto prova o comportamento visível (nada some, o novo nasce com acted4_ts=agora), não a ordem tmp→aside em si (essa está no save_state)
+  reset; mkdir -p "$W/ro"; XENV=("DR_STATE=$W/ro/state"); mode d4 rc=0
+  printf 'lixo' > "$W/ro/state"; chmod 555 "$W/ro"
+  tick 20000 0 "$T0"
+  [ "$(cat "$W/ro/state" 2>/dev/null)" = lixo ] && [ -z "$(ls "$W/ro"/state.corrupt-* 2>/dev/null)" ] && ok "gravação falhou: o estado ruim continua no lugar (nada posto de lado)" || nope "estado ruim sumiu sem o novo estar gravado"
+  chmod 755 "$W/ro"
+  tick 20000 0 $((T0 + 120))
+  [ -n "$(ls "$W/ro"/state.corrupt-* 2>/dev/null)" ] && eq "$(sed -n 's/^acted4_ts=//p' "$W/ro/state" | head -n 1)" $((T0 + 120)) "gravável de novo: o ruim vai para .corrupt e o novo estado nasce com acted4_ts = agora" || nope "gravável de novo: não pôs de lado ou não gravou"
 
   section "estado não gravável COM degrau vencido: o degrau NÃO é chamado (sem a marca no disco, reinício ou falha repetiriam a chamada)"
   reset; mkdir -p "$W/ro"; XENV=("DR_STATE=$W/ro/state"); mode d2 rc=0
@@ -401,8 +472,7 @@ if [ "$(id -u)" != 0 ]; then
   # D2, D3 e D4 vencidos juntos (estado escrito à mão, como na seção da 1ª passada) e estado não gravável: a rodada ACABA no primeiro
   # degrau que não pôde gravar a marca; não tenta o D3 nem o D4 (uma linha só, não três) e nenhum é chamado.
   reset; mkdir -p "$W/ro"; XENV=("DR_STATE=$W/ro/state"); mode d2 rc=0; mode d3 rc=0; mode d4 rc=0
-  printf 'v=1\nlast_ts=%s\nlast_free_mb=2900\nlast_swap_mb=0\nhard_n=0\nacted4_ts=0\nesc4=0\nwarn_ts=0\nwarn2_ts=0\nhb_ts=%s\nsince2=%s\nsince3=%s\nsince4=%s\nst2=none\nst3=none\nst4=none\nat2=0\nat3=0\nat4=0\n' \
-    "$T0" "$T0" $((T0 - 4000)) $((T0 - 4000)) $((T0 - 4000)) > "$W/ro/state"
+  mkstate "$W/ro/state" $((T0 - 4000)) $((T0 - 4000)) $((T0 - 4000))
   chmod 555 "$W/ro"
   tick 2900 0 $((T0 + 120))
   eq "$(ncallall),$RC,$(grep -c -F 'NÃO chamado: não consegui gravar a marca' "$LOG" 2>/dev/null)" "0,30,1" "D2, D3 e D4 vencidos e estado não gravável: nenhum chamado, saída 30, e a rodada acaba no 1º degrau (1 linha, não 1 por degrau)"
@@ -450,6 +520,10 @@ reset; mkdir "$LOCK"; ( : ) & dead=$!; wait "$dead"; echo "$dead" > "$LOCK/pid"
 tick 20000 0 "$T0"; eq "$RC" 0 "trava de pid morto é refeita"
 reset; sleep 30 & other=$!; mkdir "$LOCK"; echo "$other" > "$LOCK/pid"
 tick 20000 0 "$T0"; eq "$RC" 0 "trava com pid vivo que NÃO é o maestro (pid reaproveitado) é refeita"
+kill "$other" 2>/dev/null; wait "$other" 2>/dev/null
+reset; mkdir -p "$W/psbin"; printf '#!/bin/bash\nexit 1\n' > "$W/psbin/ps"; chmod 755 "$W/psbin/ps"
+sleep 30 & other=$!; mkdir "$LOCK"; echo "$other" > "$LOCK/pid"; XENV=("PATH=$W/psbin:$PATH")
+tick 20000 0 "$T0"; eq "$RC" 10 "trava com pid VIVO e ps sem resposta → na dúvida a outra instância é a dona (10), a trava não é roubada"
 kill "$other" 2>/dev/null; wait "$other" 2>/dev/null
 reset; mkdir "$LOCK"; tick 20000 0 "$T0"; eq "$RC" 10 "trava sem pid e recém-criada → ocupada (10)"
 touch -t 200001010000 "$LOCK"; tick 20000 0 "$T0"; eq "$RC" 0 "trava sem pid e velha (> 1 min) é refeita"
