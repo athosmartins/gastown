@@ -12,7 +12,9 @@ bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 
-# Fake `gc`: "session list" reports no attached sessions (keeps output clean);
+# Fake `gc`: "session list" reports no attached sessions (keeps output clean)
+# unless FAKE_GC_SESSIONS_JSON gives another listing, or FAKE_GC_SESSION_RC makes
+# it fail (ga-ow127o6: scenarios 6-7);
 # "reload --soft" fails FAKE_GC_RELOAD_FAIL_COUNT times (tracked via a counter
 # file) before succeeding, so a test can simulate a lock busy for N attempts.
 FAKE_GC="$TMP/fake-gc"
@@ -20,7 +22,8 @@ cat > "$FAKE_GC" <<'EOF'
 #!/usr/bin/env bash
 case "$1" in
     session)
-        echo '{"sessions": []}'
+        if [ -n "${FAKE_GC_SESSION_RC:-}" ]; then exit "$FAKE_GC_SESSION_RC"; fi
+        if [ -n "${FAKE_GC_SESSIONS_JSON:-}" ]; then echo "$FAKE_GC_SESSIONS_JSON"; else echo '{"sessions": []}'; fi
         exit 0
         ;;
     reload)
@@ -105,6 +108,90 @@ rc=$?
 [ "$rc" -eq 0 ] && ok "4: script still exits 0" || bad "4: expected exit 0, got $rc"
 grep -q "window has already passed" "$OUT4" && ok "4: warning states the deadline already passed" || bad "4: missing already-passed guidance, got: $(grep 'skill-deploy:.*reload\|skill-deploy:.*window' "$OUT4")"
 grep -q "manually within ~" "$OUT4" && bad "4: told operator to act within a window that had already closed" || ok "4: did NOT give a stale 'within ~Ns' instruction"
+
+# ── hq-mutants lastro (ga-ow127o6): scenarios 5-8 close the survivors the scenarios above never reached.
+# Each "absent" check below is paired with a positive check on the SAME log, so a log that is empty or
+# unreadable reprova instead of passing the absence (empty → the positive check fails; ilegível → same).
+
+echo ""
+echo "── Scenario 5: bad arguments / bad source are refused with exit 1 and write nothing ──"
+# mutants 56e2d88b4a (usage exit), be70b3c7c7 (source dir missing), 1d30e04436 (SKILL.md missing): `exit 1` -> `exit 0`
+CITY5="$TMP/city5"; mkdir -p "$CITY5"
+OUT5="$TMP/out5.log"
+EMPTY_SRC5="$TMP/empty-src5"; mkdir -p "$EMPTY_SRC5"
+SKILL_DEPLOY_CITY="$CITY5" GC="$FAKE_GC" bash "$J" >"$OUT5" 2>&1
+rc=$?
+# vazio → o grep de "usage:" falha e o check reprova; falhou/ilegível → idem (nunca passa por ausência)
+[ "$rc" -eq 1 ] && grep -q "usage: skill-deploy.sh" "$OUT5" && ok "5: no arguments -> usage + exit 1" || bad "5: no arguments: expected usage + exit 1, got rc=$rc: $(head -n 2 "$OUT5" 2>/dev/null)"
+SKILL_DEPLOY_CITY="$CITY5" GC="$FAKE_GC" bash "$J" only-a-name >"$OUT5" 2>&1
+rc=$?
+[ "$rc" -eq 1 ] && grep -q "usage: skill-deploy.sh" "$OUT5" && ok "5: one argument -> usage + exit 1" || bad "5: one argument: expected usage + exit 1, got rc=$rc: $(head -n 2 "$OUT5" 2>/dev/null)"
+SKILL_DEPLOY_CITY="$CITY5" GC="$FAKE_GC" bash "$J" fixture-skill "$TMP/no-such-dir" >"$OUT5" 2>&1
+rc=$?
+[ "$rc" -eq 1 ] && grep -q "source directory not found: $TMP/no-such-dir" "$OUT5" && ok "5: missing source dir -> message + exit 1" || bad "5: missing source dir: expected message + exit 1, got rc=$rc: $(head -n 2 "$OUT5" 2>/dev/null)"
+SKILL_DEPLOY_CITY="$CITY5" GC="$FAKE_GC" bash "$J" fixture-skill "$EMPTY_SRC5" >"$OUT5" 2>&1
+rc=$?
+[ "$rc" -eq 1 ] && grep -q "SKILL.md not found in $EMPTY_SRC5" "$OUT5" && ok "5: source dir without SKILL.md -> message + exit 1" || bad "5: no SKILL.md: expected message + exit 1, got rc=$rc: $(head -n 2 "$OUT5" 2>/dev/null)"
+[ ! -e "$CITY5/skills" ] && [ ! -e "$CITY5/.claude" ] && ok "5: none of the four refusals wrote to the city sinks" || bad "5: a refused deploy still created a city sink"
+
+echo ""
+echo "── Scenario 6: attached sessions are warned about and listed, and the deploy is not blocked ──"
+# mutants d2c52abd7f (neg-if on `command -v gc`), 93028eca27 + c279799168 (neg-if / -n -> -z on the attached test),
+# 1f73161660 (neg-if on the listing loop)
+CITY6="$TMP/city6"; mkdir -p "$CITY6"
+COUNTER6="$TMP/counter6"
+OUT6="$TMP/out6.log"
+SESS6='{"sessions":[{"name":"mayor","id":"s-1","attached":true},{"name":"dog","id":"s-2","attached":false},{"name":"deacon","id":"s-3","attached":true}]}'
+SKILL_DEPLOY_CITY="$CITY6" GC="$FAKE_GC" SKILL_DEPLOY_RELOAD_RETRY_WAIT=0 \
+    FAKE_GC_COUNTER_FILE="$COUNTER6" FAKE_GC_SESSIONS_JSON="$SESS6" \
+    bash "$J" fixture-skill "$SRC_SKILL" >"$OUT6" 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && ok "6: attached sessions only warn (exit 0, deploy not blocked)" || bad "6: expected exit 0, got $rc"
+grep -q "WARNING — human-attached sessions detected" "$OUT6" && ok "6: attached-sessions WARNING printed" || bad "6: missing attached-sessions WARNING, got: $(grep 'skill-deploy:' "$OUT6" 2>/dev/null | head -n 2)"
+grep -q "^  - mayor (s-1)$" "$OUT6" && grep -q "^  - deacon (s-3)$" "$OUT6" && ok "6: every attached session is listed by name and id" || bad "6: attached sessions not listed one per line, got: $(grep '^  - ' "$OUT6" 2>/dev/null)"
+grep -q "s-2" "$OUT6" && bad "6: a session that is NOT attached was listed" || ok "6: the unattached session is not listed"
+grep -q "No attached sessions" "$OUT6" && bad "6: said 'No attached sessions' while two are attached" || ok "6: did NOT claim 'No attached sessions'"
+[ -f "$CITY6/skills/fixture-skill/SKILL.md" ] && ok "6: the skill was still written to the city sink" || bad "6: the deploy did not run after the warning"
+
+echo ""
+echo "── Scenario 7: 'gc session list' failing does not abort the deploy ──"
+# mutant 53e55ea66c: `|| true` -> `&& true` at the end of the session probe (set -e + pipefail would abort on gc's rc)
+CITY7="$TMP/city7"; mkdir -p "$CITY7"
+COUNTER7="$TMP/counter7"
+OUT7="$TMP/out7.log"
+SKILL_DEPLOY_CITY="$CITY7" GC="$FAKE_GC" SKILL_DEPLOY_RELOAD_RETRY_WAIT=0 \
+    FAKE_GC_COUNTER_FILE="$COUNTER7" FAKE_GC_SESSION_RC=3 \
+    bash "$J" fixture-skill "$SRC_SKILL" >"$OUT7" 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && ok "7: exit 0 although 'gc session list' exited 3" || bad "7: expected exit 0, got $rc: $(tail -n 2 "$OUT7" 2>/dev/null)"
+grep -q "No attached sessions — safe to deploy" "$OUT7" && ok "7: unreadable session list is reported as 'no attached sessions' and the deploy goes on" || bad "7: missing 'No attached sessions' line, got: $(grep 'skill-deploy:' "$OUT7" 2>/dev/null | head -n 2)"
+grep -q "Done. Skill 'fixture-skill' deployed" "$OUT7" && ok "7: the deploy ran to the end" || bad "7: the deploy stopped before the end"
+
+echo ""
+echo "── Scenario 8: the manifest entry is recorded, and a manifest that cannot be written is reported ──"
+# mutant 8d4ccc1ca4: `if <python manifest writer>` -> `if ! ...` (success and failure messages swapped)
+CITY8="$TMP/city8"; mkdir -p "$CITY8"
+COUNTER8="$TMP/counter8"
+OUT8="$TMP/out8.log"
+MANIFEST8="$TMP/m8/skill-manifest.json"
+SKILL_DEPLOY_CITY="$CITY8" GC="$FAKE_GC" SKILL_MANIFEST="$MANIFEST8" SKILL_DEPLOY_RELOAD_RETRY_WAIT=0 \
+    FAKE_GC_COUNTER_FILE="$COUNTER8" \
+    bash "$J" fixture-skill "$SRC_SKILL" >"$OUT8" 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && grep -q "Manifest updated (fixture-skill -> " "$OUT8" && ok "8: manifest written -> 'Manifest updated' + exit 0" || bad "8: expected 'Manifest updated' + exit 0, got rc=$rc: $(grep -i 'manifest' "$OUT8" 2>/dev/null | head -n 2)"
+grep -q "failed to update manifest" "$OUT8" && bad "8: the success path also warned the manifest failed" || ok "8: no failure WARNING on a good write"
+# vazio → o grep do nome falha e o check reprova; falhou/ilegível (arquivo ausente) → idem
+grep -q '"fixture-skill"' "$MANIFEST8" 2>/dev/null && ok "8: the manifest file records the skill" || bad "8: manifest file missing or without the skill"
+# a manifest PATH that is a directory: open() raises IsADirectoryError, which the writer does not swallow
+CITY8B="$TMP/city8b"; mkdir -p "$CITY8B"
+MANIFEST8B="$TMP/m8b/manifest-is-a-dir"; mkdir -p "$MANIFEST8B"
+OUT8B="$TMP/out8b.log"
+SKILL_DEPLOY_CITY="$CITY8B" GC="$FAKE_GC" SKILL_MANIFEST="$MANIFEST8B" SKILL_DEPLOY_RELOAD_RETRY_WAIT=0 \
+    FAKE_GC_COUNTER_FILE="$COUNTER8" \
+    bash "$J" fixture-skill "$SRC_SKILL" >"$OUT8B" 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && grep -q "WARNING — failed to update manifest at $MANIFEST8B" "$OUT8B" && ok "8: unwritable manifest -> WARNING, deploy not aborted (exit 0)" || bad "8: expected WARNING + exit 0, got rc=$rc: $(grep -i 'manifest' "$OUT8B" 2>/dev/null | head -n 2)"
+grep -q "Manifest updated" "$OUT8B" && bad "8: claimed 'Manifest updated' for a manifest that could not be written" || ok "8: no 'Manifest updated' claim on a failed write"
 
 echo ""
 echo "skill-deploy selftest: PASS=$PASS FAIL=$FAIL"
