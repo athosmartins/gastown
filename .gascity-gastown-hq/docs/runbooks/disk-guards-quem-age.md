@@ -27,12 +27,18 @@ usados: 85% ≈ 34 GiB livres, 92% ≈ 17, 97% ≈ 6.
 | < 8 GiB WARN, < 3 GiB CRITICAL | `com.gascity.dolt-disk-floor-guard` (FG) | 5 min | 12 funções de reclaim (reapers de scratchpad e transcript, GOCACHE, órfãos, resíduo de backup…), `gc dolt-cleanup`, ressuscita o Dolt | ATIVO, em WARN (07:52: `avail=6GB`) |
 | ≤ 2 GiB (recria a ≥ 15) | `com.gascity.disk-ballast-guard` | 2 min | só apaga/recria o próprio lastro de ~2 GiB e notifica; nunca chama `gc`/`bd` | ATIVO, ainda não disparou |
 | sem degrau | `com.gascity.city-disk-autoprune` | 6 h | worktrees mergeadas, logs grandes, transcripts >7 d | **DRY-RUN** (`CITY_AUTOPRUNE_DRY_RUN=1` no plist). Últimas remoções reais: worktrees 12/09, transcripts 04/09 |
-| 85% / 75% de `df /` | `com.whatsapp.disk-watchdog` (rig WA) | 30 min | 6 funções de limpeza | ATIVO mas **CEGO** — ver abaixo |
+| 85% / 75% de `df /` | `com.whatsapp.disk-watchdog` (rig WA) | 30 min | 6 funções de limpeza | **APOSENTADO** em 02/11 (`wa-5wjfhg`) — ver abaixo |
 | — | `com.gascity.city-health-sentinel` | 4 min | só lê os GiB livres; `kickstart` do gate/pilot | não é guarda de disco |
 
 **O watchdog do WA está cego.** `disk_pct()` é `df / | awk …`. No mesmo instante: `df /` → 71% (12 Gi usados,
 volume de sistema selado); `df /System/Volumes/Data` → 98%. Ele loga "OK: disk 66% < 85%" com o disco em 98%; o
 limiar de 85% só dispararia com menos de ~2 GiB livres. DPM e snapshot-guard leem `/System/Volumes/Data`.
+
+**Aposentado em 02/11/2026 (`wa-5wjfhg`).** Medido antes de aposentar: 4 das 6 limpezas nunca apagaram nada — todo
+`find` partia de um atalho (`/tmp`, `<wa>/shared/data`, `<wa>/logs`) e `find` sem `-H` não entra em atalho. As 2 que
+funcionavam já têm dono: snapshots de scraper = DPM passo 7; cache do Go = FG + DPM. A de `shared/data`, se o `df`
+fosse consertado, apagaria todo `*snapshot*` de produção menos os 3 últimos. Script e plist saíram do repo do WA; o
+job levou `bootout` e o plist instalado está em `docs/launchd-archive/` (`ga-ydv6tmn`).
 
 ## Quem apaga o quê
 
@@ -42,9 +48,9 @@ limiar de 85% só dispararia com menos de ~2 GiB livres. DPM e snapshot-guard le
 | Transcripts (`~/.claude/projects/**/*.jsonl`) | FG → `transcript-reaper.sh`; DPM passo 11; autoprune (dry-run) | reaper: sessão morta e ≥ 24 h; DPM: `-mtime +7 -delete` em **todo** projeto da máquina; autoprune: +7 d só no escopo da cidade | DPM sem escopo, sem checar sessão, sem log por arquivo, e leva `subagents/*.jsonl` |
 | `~/.claude/history.jsonl` e `~/.claude/file-history/<sessão>` (ga-mnznp8, 18/10) | FG → `claude_home_trim.py`, no máximo 1×/h, em WARN e CRITICAL (só com o disco < 8 GB) | history: passou de 100 MB → mantém os últimos 40 MB a partir de uma quebra de linha, **no mesmo inode** (as ~20 sessões que o têm aberto seguem anexando; o `cp` diário das 04:00 para o S3 passa a levar só a parte mantida, e os transcripts em `projects/` seguem sincronizados à parte); file-history: pasta parada há ≥ 3 d, fora de `gc session list`, sem transcript recente e que não é a do chamador. Qualquer dúvida (gc falhou, resposta malformada, pasta ilegível) = não apaga | só o FG. `usage-analytics.jsonl` (171 MB) e `credit-cache-updater.log` (30 MB) só são **medidos** na mesma passada: o `log-token-usage.sh` grava `output_bytes` sempre 0 e o launchd `com.claude.credit-cache-updater` loga uma linha a cada 30 s — o conserto é na origem, não um corte |
 | Estado do plugin security-guidance (`~/.claude/security/security_warnings_state_*`) e `pip-*` no temp do usuário (ga-j4r9o8, 19/10) | `claude-security-janitor.py`, 1×/h pelo launchd — **só depois de o Mayor instalar** (`docs/runbooks/claude-security-janitor.md`) | estado: mtime > 3 d (o plugin, sozinho, só apaga com > 30 d); pip: > 2 h e nenhum pip vivo. Qualquer leitura que falha (dir, `ps`, sonda) = não apaga. Também **detecta**, sem instalar nada, se o python do hook perdeu o `claude_agent_sdk` | o passo "tmp órfão" do DPM pode varrer o mesmo temp — critério não comparado |
-| Cache do Go (`~/Library/Caches/go-build`) | FG; DPM; WA (cego) | FG: `go clean -cache` (≥ 3 GB; com go ativo só em CRITICAL); DPM: `rm` do conteúdo | DPM nunca checa go ativo (o teste de "ocupado" dele vale só para `gdrive_reader`). `go/pkg/mod` (2,1 GB liberados hoje) só o DPM limpa |
+| Cache do Go (`~/Library/Caches/go-build`) | FG; DPM | FG: `go clean -cache` (≥ 3 GB; com go ativo só em CRITICAL); DPM: `rm` do conteúdo | DPM nunca checa go ativo (o teste de "ocupado" dele vale só para `gdrive_reader`). `go/pkg/mod` (2,1 GB liberados hoje) só o DPM limpa |
 | go-build órfãos, code_sign_clone órfãos, dirs de teste do bd | FG; DPM passos 13, 8 e 14 | cada um tem o seu | critérios não comparados linha a linha |
-| Snapshots de scraper | DPM passo 7 (mantém 3); WA (2 funções, cego) | — | — |
+| Snapshots de scraper | DPM passo 7 (mantém 3) | — | — |
 | Bancos Dolt órfãos; lastro; snapshots do Time Machine; Trash, tarballs e tmp órfão | um dono cada (FG; ballast; snapshot-guard; DPM) | — | nenhuma |
 
 Medido hoje, para não superestimar: nenhuma sessão viva ou suspensa tem transcript com mais de 1 dia (82
@@ -94,5 +100,5 @@ Não feito, de propósito: nenhuma guarda viva foi alterada. O disco está em em
 vivo; e a proposta literal pioraria os degraus (item 2). Critério "1 só script com `rm` por recurso": **não
 cumprido** para scratchpads, transcripts, cache do Go, go-build, code_sign_clone e dirs de teste do bd.
 
-Pendente: `ga-88pmhi` (DPM → reapers), `ga-xpswpd` (script do root), `wa-5wjfhg` (watchdog cego),
+Pendente: `ga-88pmhi` (DPM → reapers), `ga-xpswpd` (script do root),
 `wa-pjq3ff` (symlink pendurado `com.urblink.inbound-review-3d.plist`).

@@ -36,3 +36,4 @@ com.whatsapp.wa-daily-warm.plist.disabled-by-mayor-20260712	~/Library/LaunchAgen
 dot-disabled/com.whatsapp.peter-deploy-watch.plist	~/Library/LaunchAgents/.disabled/com.whatsapp.peter-deploy-watch.plist	file	-	737	2026-07-02T02:59:59Z	38b8314bab6b6ea70c9e7084af7ba00ea4c8b44d26ae90ee1cc3549ef6b4576c
 retired/com.athos.post-reboot-recovery.plist	~/Library/LaunchAgents/com.athos.post-reboot-recovery.plist	file	-	607	2026-07-10T19:24:14Z	97b2d547d94dd6f7ef1a9287466805a14af7b5baf5fcd7abf5c18085d6d6bdba
 retired/post_reboot_recovery.sh	~/.property-scrapers/post_reboot_recovery.sh	file	-	2601	2026-07-10T19:24:04Z	d718e8e3c36edd957971ff3b2648f8b648926133732be2e300895627869f081c
+com.whatsapp.disk-watchdog.plist.retired-20261102	~/Library/LaunchAgents/com.whatsapp.disk-watchdog.plist	file	-	1106	2026-05-22T18:27:28Z	cb0efc6aa40a795db6b810080c0dad02d47511cfabc3e89162f4fd0dd3742539

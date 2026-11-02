@@ -2,6 +2,7 @@
 - O que é
 - Como restaurar
 - Aposentado: post-reboot-recovery
+- Aposentado: disk-watchdog do WA
 
 ## O que é
 
@@ -52,3 +53,15 @@ O que a execução de 2026-10-15 23:43 (log em `/tmp/post_reboot_recovery.log`) 
 
 Como o job não estava carregado, não foi preciso `bootout`. Os dois arquivos foram removidos de `~/Library/LaunchAgents`
 e de `~/.property-scrapers` durante o ga-j86sid; as cópias estão em `retired/`.
+
+## Aposentado: disk-watchdog do WA
+
+`com.whatsapp.disk-watchdog.plist.retired-20261102` — o plist que estava instalado em `~/Library/LaunchAgents`.
+
+O job rodava `whatsapp_automation/scripts/disk_watchdog.sh` a cada 30 min, media o disco pelo `df /` (o volume de
+sistema selado, ~70% com o de dados em 98%) e por isso nunca disparou. Aposentado em `wa-5wjfhg` (mergeada 02/11/2026):
+script e plist saíram do repo do WA. Em 02/11 ~16h50 o job levou `launchctl bootout` (rodava com saída 127, porque o
+script já não existia) e o plist instalado saiu de `~/Library/LaunchAgents` para cá (`ga-ydv6tmn`). Por que não foi
+consertado e quem cobre cada limpeza: `docs/runbooks/disk-guards-quem-age.md`.
+
+Restaurar não faz sentido sem o script, que só existe no histórico do repo do WA (`git show 98170d675^:scripts/disk_watchdog.sh`).

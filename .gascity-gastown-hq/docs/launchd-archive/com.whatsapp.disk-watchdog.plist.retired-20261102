@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.whatsapp.disk-watchdog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/athos/gt/whatsapp_automation/scripts/disk_watchdog.sh</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/athos/gt/whatsapp_automation/logs/disk_watchdog.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/athos/gt/whatsapp_automation/logs/disk_watchdog.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/athos/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/athos</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/athos/gt/whatsapp_automation</string>
+</dict>
+</plist>
