@@ -243,9 +243,67 @@ def c_registry():
         ("atribuição repetida", V + V, "tem código além"),
         ("valor que não é dict", NAME + " = []\n", "tem código além"),
         ("sem a atribuição", '"""d"""\n', "não define"),
+        ("chave que não é texto", NAME + " = {1: {}}\n", "chave que não é um texto literal"),
+        ("chave que é um nome", NAME + " = {k: {}}\n", "chave que não é um texto literal"),
     ):
         msg = unknown(R, text)
         assert frag in msg, (label, msg)
+
+
+def c_git():
+    seen, real = {}, m.subprocess
+
+    def good(cmd, **kw):
+        seen.update(kw)
+        return types.SimpleNamespace(returncode=0, stdout=b"out", stderr=b"")
+
+    m.subprocess = types.SimpleNamespace(run=good, SubprocessError=real.SubprocessError)
+    try:
+        assert m.git("/r", "rev-parse") == b"out"
+        assert seen["timeout"] == 120, seen
+        m.subprocess.run = lambda cmd, **kw: (_ for _ in ()).throw(FileNotFoundError("sem git"))
+        msg = unknown(m.git, "/r", "rev-parse", "--verify")
+        assert msg == "git rev-parse: FileNotFoundError: sem git", msg
+        m.subprocess.run = lambda cmd, **kw: types.SimpleNamespace(returncode=3, stdout=b"", stderr=b"fatal: x\n")
+        msg = unknown(m.git, "/r", "a", "b", "c", "d")
+        assert msg == "git a b c: rc=3: fatal: x", msg
+    finally:
+        m.subprocess = real
+
+
+def c_tree():
+    m.git = lambda *a, **kw: b"x" * 200 + b"\0"
+    msg = unknown(m.tree_entries, "r", "sha")
+    assert msg == "linha do ls-tree fora do formato: " + repr("x" * 80), msg
+
+
+def c_blob():
+    e = ent(7, 3, "lib/a.py")
+    for label, raw, want in (
+        ("dado mais curto que o cabeçalho", ("%s blob 3\nab" % e.oid).encode(), "blob de 'lib/a.py' veio com 2 bytes, esperava 3"),
+        ("tamanho que o ls-tree não anunciou", ("%s blob 4\nabcd\n" % e.oid).encode(), "blob de 'lib/a.py' veio com 4 bytes, esperava 3"),
+    ):
+        msg = unknown(export, [e], 1 << 60, (lambda r: (lambda *a, **kw: r))(raw))
+        assert msg == want, (label, msg)
+
+
+def c_utf8():
+    m.git = lambda *a, **kw: b"\xff\xfe"
+    msg = unknown(m.load_trusted, "r", "0123456789abcdef0123456789abcdef01234567", "g12", m.Path("/x"))
+    assert msg == "lib/launchd_paid_guard.py em 0123456789ab não é UTF-8", msg
+
+
+def c_facade():
+    m.git = lambda repo, *a, **kw: b"f.py\n"
+    g = m.GitFacade("repo", "A...B", ["p.plist", "q.plist"])
+    ls = ["git", "-C", "/x", "ls-files", "-z", "--", "*.plist"]
+    for argv, kw, want in ((ls, {}, b"p.plist\0q.plist\0"), (ls, {"text": True}, "p.plist\0q.plist\0"),
+                           (["git", "diff", "--name-only", "A...B"], {}, b"f.py\n"),
+                           (["git", "diff", "--name-only", "--diff-filter=A", "A...B"], {"text": True}, "f.py\n")):
+        r = g.run(argv, **kw)
+        assert (r.returncode, r.stdout) == (0, want), (argv, r)
+    msg = unknown(g.run, ["x", "y", "z", "ls-files", "-z", "--", "*.plist"])
+    assert "o guard pediu um comando que o atalho não prevê" in msg, msg
 
 
 try:
@@ -331,6 +389,17 @@ case_u_batch() { uc batch; }
 case_u_header() { uc header; }
 case_u_entries() { uc entries; }
 case_u_registry() { uc registry; }
+# Fora do alcance destes casos: a89c4d08ba 1d719f54b0 49ab621386 (equivalentes: o split do ls-tree cai no mesmo ValueError, e nl == 0 só existe com pos == 0, onde o corte é vazio dos
+# dois jeitos), b82742161c b451aff2f3 (flush=True: só se vê se o processo morre depois de escrever), d414b9aca8 f6affd9302 a01c4377f4 82a7bd8828 (pedem uma cena de G12 com 6+ plists)
+# e d4b87a34d1 (pede um guard de confiança que levante depois de carregar).
+case_u_git() { uc git; }
+case_u_tree() { uc tree; }
+case_u_blob() { uc blob; }
+case_u_utf8() { uc utf8; }
+case_u_facade() { uc facade; }
+case_help() { ( cd "$T" && env -i PATH="$PATH_RUN" "$PY" -I -B "$EXE" -h ) >"$T/out" 2>"$T/err"; [ $? = 0 ] && has "$T/out" "usage: wa-remote-guards.py"; }
+case_scratch_parents() { local d="$T/par-$RANDOM-$$/p2"; SHA=$S_CLEAN; runx -- --scratch "$d/sc"; [ "$RC" = 0 ] && [ -d "$d/sc/tree" ]; }
+case_internal_error() { : > "$T/afile"; SHA=$S_CLEAN; runx -- --scratch "$T/afile/$(rep 200 d)"; [ "$RC" = 2 ] && grep -qE "erro interno NotADirectoryError: .{160}$" "$T/out" && grep -qxF "wa-remote-guards: RESULT=UNKNOWN sha=? trusted=?" "$T/out"; }
 case_cut_120() { SHA=$S_CLEAN; runx -- --trusted-ref refs/remotes/origin/longerr; [ "$RC" = 2 ] && grep -qE "ValueError: d{120}\)$" "$T/out" && grep -qE "G6 levantou RuntimeError: a{120}$" "$T/out" && grep -qE "G7 levantou RuntimeError: b{120}$" "$T/out" && grep -qE "G7b levantou RuntimeError: c{120}$" "$T/out"; }
 case_sha_long() { SHA=$(rep 60 a); runx; [ "$RC" = 2 ] && has "$T/out" "recebi '$(rep 50 a)'" && grep -qxF "wa-remote-guards: RESULT=UNKNOWN sha=$(rep 40 a) trusted=?" "$T/out"; }
 case_sha_blob() { SHA=$BLOB; runx; [ "$RC" = 2 ] && has "$T/out" "${BLOB:0:12} não é um commit do rig"; }
@@ -383,6 +452,14 @@ ck u_disk "a margem de 512 MiB de disco: free == total + margem segue, 1 byte a 
 ck u_batch "401 blobs saem em dois lotes do cat-file (400 e 1), todos gravados na mesma pasta (a pasta repetida não é erro)"
 ck u_header "cabeçalho do cat-file com 2 campos, oid outro, tipo que não é blob ou sem quebra de linha → NÃO SEI do blob, nunca gravado"
 ck u_entries "ls-tree: o gitlink (tamanho '-') vira 0 e o blob comum traz o tamanho dele"
+ck u_git "git(): timeout de 120 s; OSError cita o 1º argumento; rc != 0 cita os 3 primeiros e leva o stderr"
+ck u_tree "ls-tree com linha fora do formato: o NÃO SEI cita só os 80 primeiros caracteres dela"
+ck u_blob "blob com dado mais curto que o cabeçalho, ou com tamanho que o ls-tree não anunciou: NÃO SEI com os dois números"
+ck u_utf8 "arquivo de confiança que não é UTF-8: a mensagem cita os 12 primeiros hex do sha de confiança"
+ck u_facade "o atalho do subprocess: ls-files e diff devolvem rc 0 (texto ou bytes) e um comando de 7 palavras que não é git -C é recusado"
+ck help "-h imprime o uso e sai com 0"
+ck scratch_parents "--scratch cria as pastas que faltam no caminho"
+ck internal_error "erro fora do execute(): rc 2, a linha RESULT=UNKNOWN com sha=? e a mensagem cortada em 160"
 ck u_registry "registro lido sem executar: docstring opcional, __future__ ignorado, uma só atribuição literal de dict; o resto (2ª docstring, chamada, outro import, outro nome, repetida, não-dict, ausente) → NÃO SEI"
 ck cut_120 "a mensagem de exceção do guard de confiança (G12 ao carregar, G6, G7, G7b ao rodar) entra no relatório cortada em 120 caracteres"
 ck sha_long "--sha de 60 letras: a mensagem cita só as 50 primeiras e o RESULT as 40 primeiras"
@@ -463,6 +540,21 @@ mutant linha-confianca-em-13 export_line '@{tsha[:12]} exportados=' '@{tsha[:13]
 mutant linha-kb-por-1025 export_line "stats['bytes'] // 1024} KB" "stats['bytes'] // 1025} KB"
 mutant repo-opcional usage_required 'ap.add_argument("--repo", required=True)' 'ap.add_argument("--repo", required=False)'
 mutant sha-opcional usage_required 'ap.add_argument("--sha", required=True)' 'ap.add_argument("--sha", required=False)'
+mutant git-timeout-em-121 u_git 'GIT_TIMEOUT = 120' 'GIT_TIMEOUT = 121'
+mutant git-oserror-cita-o-2o-argumento u_git "{args[0] if args else ''}" "{args[1] if args else ''}"
+mutant git-rc-cita-4-argumentos u_git "' '.join(args[:3])" "' '.join(args[:4])"
+mutant ls-tree-corta-em-81 u_tree 'safe(os.fsdecode(rec))[:80]!r' 'safe(os.fsdecode(rec))[:81]!r'
+mutant blob-curto-passa u_blob 'if len(data) != size or size != e.size:' 'if len(data) != size and size != e.size:'
+mutant utf8-cita-13-hex u_utf8 'tsha[:12]} não é UTF-8' 'tsha[:13]} não é UTF-8'
+mutant atalho-ls-files-por-tamanho u_facade 'is_ls_files = len(a) == 7 and a[:2] == ["git", "-C"]' 'is_ls_files = len(a) == 7 or a[:2] == ["git", "-C"]'
+mutant atalho-ls-files-por-argumentos u_facade 'a[:2] == ["git", "-C"] and a[3:] ==' 'a[:2] == ["git", "-C"] or a[3:] =='
+mutant atalho-diff-com-rc-1 u_facade 'return subprocess.CompletedProcess(a, 0, out.decode("utf-8") if kw.get("text") else out' 'return subprocess.CompletedProcess(a, 1, out.decode("utf-8") if kw.get("text") else out'
+mutant atalho-ls-files-com-rc-1 u_facade 'return subprocess.CompletedProcess(a, 0, out.decode("utf-8", "surrogateescape")' 'return subprocess.CompletedProcess(a, 1, out.decode("utf-8", "surrogateescape")'
+mutant registro-chave-que-nao-e-texto u_registry 'isinstance(k, ast.Constant) and isinstance(k.value, str)' 'isinstance(k, ast.Constant) or isinstance(k.value, str)'
+mutant ajuda-desligada help 'add_help=True' 'add_help=False'
+mutant scratch-sem-pais scratch_parents 'scratch.mkdir(parents=True, exist_ok=True, mode=0o700)' 'scratch.mkdir(parents=False, exist_ok=True, mode=0o700)'
+mutant erro-interno-sai-com-3 internal_error 'sys.exit(2)' 'sys.exit(3)'
+mutant erro-interno-corta-em-161 internal_error 'safe(e)[:160]}\nwa-remote-guards: RESULT=UNKNOWN sha=? trusted=?' 'safe(e)[:161]}\nwa-remote-guards: RESULT=UNKNOWN sha=? trusted=?'
 
 
 # ══ contrato com os guards REAIS (lidos de origin/main do rig WA; o rig não é tocado) ═══════════════════════════════════════════════════════════════
