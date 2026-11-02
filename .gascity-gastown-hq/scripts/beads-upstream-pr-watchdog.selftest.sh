@@ -32,7 +32,9 @@ bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 eq()  { if [ "$2" = "$3" ]; then ok "$1 (=$2)"; else bad "$1: expected [$3], got [$2]"; fi; }
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+# Sourcing the watchdog in lib mode must run nothing; if it ever ran its entry point it would end with `exit 0` and this file would stop right there, green.
+REACHED_END=0
+trap 'rc=$?; rm -rf "$TMP"; if [ "$REACHED_END" != 1 ] && [ "$rc" = 0 ]; then echo "FAIL: selftest aborted before its last line" >&2; exit 1; fi' EXIT
 
 # sanitize_path <path> -> same scheme the bd stub uses to name per-city
 # fixture files (must match verbatim).
@@ -545,6 +547,87 @@ else
 fi
 rm -rf "$BUPW_LOCK_DIR" "${BUPW_LOCK_DIR}.reaping" 2>/dev/null
 
+# ── Part 3b: the rest of the lock ladder, the entry point, the unreadable-input branches (ga-hq1qc5y, hq-mutants lastro) ──
+echo ""
+echo "== lock edges, the script as a program, unreadable gh / bd output =="
+# EQUIVALENT, documented: `|| true` -> `&& true` after a command whose status nobody reads and under no `set -e` (9122e0cab9, da12ce03da, 02d2feffe8, 8db6498b62,
+# 2986485ef0, 6d485cfc2d, f59c4652e3, a859477f33, 75643e9927, 83c269f339); the same in log() after the append (c57a9845cf): log's status is read only by run_sweep's
+# last statement, and a sweep cannot get that far with an unwritable log (every command in it redirects stderr into $LOG, and a failed redirection skips the command: with
+# the log unwritable the sweep stops at its first gh call and returns 0 there, measured); the `.reaping` guard `return 1` -> `0` after `[ ! -s HB ]` (84b1276392):
+# _bupw_lock_holder_dead says "dead" only for a pid read from the heartbeat's first line, so a heartbeat that is empty at that point cannot be; the stat chain
+# `A || B || C` -> `A || B && C` (f33a615f4e): it prints the age of whichever of the BSD and GNU forms answers, and an empty line more, which $(...) drops
+# (`A && B || C`, 63d6ca95b6, does not: below).
+lk_reset() { rm -rf "$BUPW_LOCK_DIR" "${BUPW_LOCK_DIR}.reaping" "${BUPW_LOCK_DIR}".reaping.dead.* 2>/dev/null; }
+( : ) & DPID=$!; wait "$DPID" 2>/dev/null   # a pid that was alive a moment ago and is not any more
+lk_dead() { lk_reset; mkdir "$BUPW_LOCK_DIR"; echo "$DPID:deadtoken" > "$BUPW_LOCK_HB"; }
+# the clock and stat are stubbed: the age is `stat -f %m` (BSD, macOS) or else `stat -c %Y` (GNU); a real GNU stat answers `-f %m` with a filesystem report and rc 1, so the real age is garbage
+# there and only the mini's means anything. age_gnu models a stat whose BSD form fails quietly.
+age_bsd() { date() { echo 1000; }; stat() { case "$1" in -f) echo "$MT" ;; *) return 1 ;; esac; }; }
+age_gnu() { date() { echo 1000; }; stat() { case "$1" in -f) return 1 ;; -c) echo "$MT" ;; esac; }; }
+eq "the age of a path that is not there is 'very old'" "$(_bupw_lock_path_age "$TMP/no-such-path")" "999999999"
+eq "the age through the BSD form of stat" "$(age_bsd; MT=990 _bupw_lock_path_age "$TMP/x")" "10"
+eq "the age through the GNU form of stat (the BSD form fails)" "$(age_gnu; MT=990 _bupw_lock_path_age "$TMP/x")" "10"
+lk_reset; mkdir "$BUPW_LOCK_DIR"; echo "garbage" > "$BUPW_LOCK_HB"
+BUPW_LOCK_TOKEN="$$:g" _acquire_bupw_lock && bad "a heartbeat pid that does not parse was read as a dead holder and the lock was taken" || ok "a heartbeat pid that does not parse is NOT a dead holder: the acquire backs off"
+eq "...and the heartbeat is left as it was" "$(cat "$BUPW_LOCK_HB")" "garbage"
+lk_reset; rc=0; ( BUPW_LOCK_HB="$BUPW_LOCK_DIR/no/such/heartbeat"; _acquire_bupw_lock ) || rc=$?
+eq "a heartbeat that cannot be written: the acquire says no" "$rc" "1"
+[ ! -d "$BUPW_LOCK_DIR" ] && ok "...and gives the lock directory back" || bad "...the lock directory was left behind"
+lk_dead; mkdir "${BUPW_LOCK_DIR}.reaping"; rc=0; ( age_bsd; MT=1000 BUPW_LOCK_TOKEN="$$:r1" _acquire_bupw_lock ) || rc=$?
+eq "a dead holder, but another reclaimer is at work (a fresh .reaping): back off" "$rc" "1"
+eq "...and the dead holder's heartbeat is untouched" "$(cat "$BUPW_LOCK_HB")" "$DPID:deadtoken"
+lk_dead; mkdir "${BUPW_LOCK_DIR}.reaping"; rc=0; ( age_bsd; MT=900 BUPW_LOCK_TOKEN="$$:r2" _acquire_bupw_lock ) || rc=$?
+eq "a .reaping older than the TTL is stale: the reclaim goes through" "$rc" "0"
+eq "...and the heartbeat now holds our token" "$(head -n1 "$BUPW_LOCK_HB")" "$$:r2"
+[ -z "$(ls -d "${BUPW_LOCK_DIR}".reaping* 2>/dev/null)" ] && ok "...and no .reaping or .reaping.dead leftover" || bad "leftover: $(ls -d "${BUPW_LOCK_DIR}".reaping* 2>/dev/null | tr '\n' ' ')"
+lk_dead; mkdir "${BUPW_LOCK_DIR}.reaping"; rc=0; ( age_bsd; MT=990 BUPW_LOCK_REAP_TTL=10 BUPW_LOCK_TOKEN="$$:r3" _acquire_bupw_lock ) || rc=$?
+eq "a .reaping exactly as old as the TTL (10 s) is stale" "$rc" "0"
+lk_dead; rc=0; ( n=0; _bupw_lock_holder_dead() { n=$((n + 1)); [ "$n" -le 1 ]; }; BUPW_LOCK_TOKEN="$$:r4" _acquire_bupw_lock ) || rc=$?
+eq "the holder turns out ALIVE on the second look: back off" "$rc" "1"
+[ ! -d "${BUPW_LOCK_DIR}.reaping" ] && ok "...and the .reaping claim is given back" || bad "...the .reaping claim was left behind"
+lk_dead; rc=0; ( _bupw_lock_write_hb() { : > "$BUPW_LOCK_HB"; }; BUPW_LOCK_TOKEN="$$:r5" _acquire_bupw_lock ) || rc=$?
+eq "the takeover's heartbeat did not land: back off" "$rc" "1"
+[ ! -d "${BUPW_LOCK_DIR}.reaping" ] && ok "...and the .reaping claim is given back" || bad "...the .reaping claim was left behind"
+lk_reset; mkdir "$BUPW_LOCK_DIR"; echo "$$:rel" > "$BUPW_LOCK_HB"; rc=0; BUPW_LOCK_TOKEN="$$:rel" _release_bupw_lock || rc=$?
+eq "releasing a lock we own returns 0" "$rc" "0"
+echo "$$:other" > "$BUPW_LOCK_HB"; mkdir -p "$BUPW_LOCK_DIR"; rc=0; BUPW_LOCK_TOKEN="$$:rel" _release_bupw_lock || rc=$?
+eq "releasing a lock somebody else holds returns 0 too" "$rc" "0"
+[ -d "$BUPW_LOCK_DIR" ] && ok "...and leaves it alone" || bad "...a lock we do not own was removed"
+lk_reset
+# the script as a program (the rest of this file sources it in lib mode): it takes the lock, sweeps, lets go; it backs off from a live holder
+mkdir -p "$TMP/main-tmp"; MLK="$TMP/main-tmp/beads-upstream-pr-watchdog.lock.d"
+run_main() { env -u BEADS_UPSTREAM_PR_WATCHDOG_LIB TMPDIR="$TMP/main-tmp" BUPW_LOCK_ENABLED="$1" BUPW_STATE="$TMP/main-state.json" BUPW_LOG="$TMP/main.log" bash "$WATCHDOG" >/dev/null 2>&1; }
+rm -rf "$MLK"; : > "$TMP/main.log"; rc=0; run_main 1 || rc=$?
+eq "the script with no lock taken exits 0" "$rc" "0"
+grep -q 'sweep complete' "$TMP/main.log" && ok "...it sweeps" || bad "...it did not sweep: $(cat "$TMP/main.log")"
+[ ! -d "$MLK" ] && ok "...and lets the lock go when it exits" || bad "...the lock directory was left behind"
+mkdir "$MLK"; echo "$$:main" > "$MLK/heartbeat"; : > "$TMP/main.log"; rc=0; run_main 1 || rc=$?
+eq "the script facing a LIVE holder exits 0" "$rc" "0"
+grep -q 'holds the lock' "$TMP/main.log" && ok "...says it backed off" || bad "...no back-off line: $(cat "$TMP/main.log")"
+grep -q 'sweep complete' "$TMP/main.log" && bad "...and still swept" || ok "...and does not sweep"
+: > "$TMP/main.log"; rc=0; run_main 0 || rc=$?
+grep -q 'sweep complete' "$TMP/main.log" && ok "with the lock switched off the live holder is not in the way: it sweeps" || bad "lock off, yet no sweep: $(cat "$TMP/main.log")"
+rm -rf "$MLK"; : > "$TMP/main.log"
+env BEADS_UPSTREAM_PR_WATCHDOG_LIB=1 TMPDIR="$TMP/main-tmp" BUPW_LOCK_ENABLED=1 BUPW_LOG="$TMP/main.log" bash -c '. "$1"' _ "$WATCHDOG" >/dev/null 2>&1
+{ [ ! -s "$TMP/main.log" ] && [ ! -d "$MLK" ]; } && ok "sourced in lib mode it defines the functions and runs nothing (no sweep, no lock)" || bad "lib mode ran: $(cat "$TMP/main.log")"
+# unreadable input: gh that is missing, gh that answers garbage, a state that cannot be written, a city whose bd answers garbage
+rc=0; ( PATH=/nonexistent; run_sweep ) >/dev/null 2>&1 || rc=$?
+eq "run_sweep with no gh on PATH returns 0" "$rc" "0"
+GHBAD="$TMP/gh-bad"; mkdir -p "$GHBAD"; printf '#!/bin/sh\necho "this is not json"\n' > "$GHBAD/gh"; chmod +x "$GHBAD/gh"
+rm -f "$TMP/bad-state.json"; : > "$TMP/bad.log"; rc=0; ( PATH="$GHBAD:$PATH"; STATE="$TMP/bad-state.json"; LOG="$TMP/bad.log"; run_sweep ) >/dev/null 2>&1 || rc=$?
+eq "run_sweep over a gh that answers garbage returns 0" "$rc" "0"
+{ grep -q 'unparseable' "$TMP/bad.log" && [ ! -e "$TMP/bad-state.json" ]; } && ok "...says so and writes no state (garbage is not 'no PRs')" || bad "...garbage gh output: log=[$(cat "$TMP/bad.log")] state=$([ -e "$TMP/bad-state.json" ] && echo written || echo none)"
+: > "$TMP/notadir"; rc=0; ( BUPW_LOCK_HB="$TMP/notadir/heartbeat"; _bupw_lock_write_hb ) || rc=$?
+eq "a heartbeat write that fails is told by the file, not by the status: 0" "$rc" "0"
+mkdir -p "$TMP/state-is-a-dir"; : > "$TMP/warn.log"; ( STATE="$TMP/state-is-a-dir"; LOG="$TMP/warn.log"; run_sweep ) >/dev/null 2>&1
+grep -q 'failed to write state file' "$TMP/warn.log" && ok "a state file that cannot be written is said in the log" || bad "unwritable state, no WARN: $(cat "$TMP/warn.log")"
+rm -f "$TMP/ok-state.json"; : > "$TMP/ok.log"; ( STATE="$TMP/ok-state.json"; LOG="$TMP/ok.log"; run_sweep ) >/dev/null 2>&1
+grep -q 'failed to write state file' "$TMP/ok.log" && bad "a state file that WAS written is reported as unwritable" || ok "...and one that was written is not reported as unwritable"
+cp "$GC_RIG_LIST_FIXTURE" "$TMP/rig-list.save"; printf '{"rigs": [{"name": "g", "path": "/fake/garbage"}]}' > "$GC_RIG_LIST_FIXTURE"; write_bd_fixture "/fake/garbage" 'this is not json'
+: > "$TMP/de.txt"; rows="$(BUPW_DISCOVERY_ERRORS="$TMP/de.txt" discover_tracker_beads 2>/dev/null)"
+cp "$TMP/rig-list.save" "$GC_RIG_LIST_FIXTURE"; clear_bd_fixture "/fake/garbage"
+{ [ -z "$rows" ] && grep -qx '/fake/garbage' "$TMP/de.txt"; } && ok "a city whose bd answers garbage is an unknown city (recorded as a discovery error), not an empty one" || bad "garbage bd output: rows=[$rows] errors=[$(cat "$TMP/de.txt")]"
+
 # ── Part 4: plist points at the canonical deployed path ─────────────────────
 echo ""
 echo "== plist wiring =="
@@ -566,4 +649,5 @@ fi
 
 echo ""
 echo "== $PASS passed, $FAIL failed =="
+REACHED_END=1
 [ "$FAIL" -eq 0 ]
