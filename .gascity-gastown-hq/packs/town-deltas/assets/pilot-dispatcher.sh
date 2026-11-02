@@ -14598,11 +14598,30 @@ LIVESEC
   # and refuse the duplicate. FAIL-OPEN by construction: a missing/unreadable
   # pilot.sling_bead, a closed wrapper, or any bd/jq error → fall through and
   # dispatch exactly as today (a transient glitch never blocks a real dispatch).
+  #
+  # ga-9s8k2fw — a bead is never its OWN wrapper. The node-first dispatch (HQ beads, to a
+  # dog-remote alias) and the rig-native dispatch (see "pilot.sling_bead=$STORY_ID" below)
+  # use the bead itself as the target and stamp pilot.sling_bead=<itself>. Read back at
+  # the next dispatch, that id is the bead being dispatched right now: status open by
+  # definition, and _sling_is_live finds the fresh delivery branch of the gate's PREVIOUS
+  # run — so the guard declared "a live wrapper already carries this" and skipped the
+  # bead, every sweep, until the branch aged out (P0 ga-1p1i5jr.1: 15 sweeps / ~5h with nobody on it; 287 such skips
+  # in the log). The guard only has something to say when ANOTHER bead carries the
+  # dispatch, so a self-reference is treated like "no wrapper recorded" (fall through).
+  # Only this dispatch-time guard needed it: the TTL-release and NEVERSTARTED callers of
+  # _sling_is_live already resolve a self-reference to the bead's own DB and decide
+  # "keep the claim", not "refuse to dispatch".
   if [ "${PILOT_DEDUP_GUARD:-1}" = "1" ]; then
     local _EXISTING_SLING _EXISTING_SLING_STATUS
+    # vazio → "" (no wrapper recorded: dispatch as today); falhou/ilegível → "" too, deliberately:
+    # this guard is fail-open by design (a bd/jq glitch must never block a real dispatch).
     _EXISTING_SLING=$(bd -C "$STORY_BEAD_CITY" show "$STORY_ID" --json 2>/dev/null \
       | jq -r 'if type=="array" then .[0] else . end | (.metadata["pilot.sling_bead"] // "")' \
       2>/dev/null || echo "")
+    if [ -n "$_EXISTING_SLING" ] && [ "$_EXISTING_SLING" = "$STORY_ID" ]; then
+      log "ga-9s8k2fw: $STORY_ID has pilot.sling_bead=itself (node-first / rig-native dispatch) — a bead is not its own wrapper, ga-cnvy1 dedup does not apply; dispatching."
+      _EXISTING_SLING=""
+    fi
     if [ -n "$_EXISTING_SLING" ] && [ "$_EXISTING_SLING" != "null" ]; then
       # The sling/wrapper task bead always lives in GC_CITY (created by gc sling in HQ).
       _EXISTING_SLING_STATUS=$(bd -C "$GC_CITY" show "$_EXISTING_SLING" --json 2>/dev/null \

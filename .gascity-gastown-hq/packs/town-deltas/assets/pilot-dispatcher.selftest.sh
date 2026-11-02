@@ -355,8 +355,17 @@ case "$args" in
           extra=$(printf '%s' "$FAKE_SLING_LABELS" | jq -r --arg id "$id" '.[$id] // ""' 2>/dev/null || echo "")
           [ -n "$extra" ] && lbls="${lbls:+$lbls,}\"$extra\""
         fi
-        printf '{"id":"%s","status":"%s","assignee":"%s","labels":[%s],"description":%s}' \
-          "$id" "$st" "$asg" "$lbls" "$(printf '%s' "$desc" | jq -Rs .)" ;;
+        # ga-9s8k2fw: FAKE_STORY_SLING_BEAD_MAP is a JSON map {"<storyid>":"<slingid>"} —
+        # the pilot.sling_bead the Pilot stamped on that bead at its previous dispatch.
+        # Only emitted when the map names this id, so every scenario that does not set it
+        # keeps the exact output it had before this seam existed (no "metadata" key at all).
+        meta_kv=""
+        if [ -n "${FAKE_STORY_SLING_BEAD_MAP:-}" ]; then
+          _msb=$(printf '%s' "$FAKE_STORY_SLING_BEAD_MAP" | jq -r --arg id "$id" '.[$id] // ""' 2>/dev/null || echo "")
+          [ -n "$_msb" ] && meta_kv=$(printf ',"metadata":{"pilot.sling_bead":"%s"}' "$_msb")
+        fi
+        printf '{"id":"%s","status":"%s","assignee":"%s","labels":[%s],"description":%s%s}' \
+          "$id" "$st" "$asg" "$lbls" "$(printf '%s' "$desc" | jq -Rs .)" "$meta_kv" ;;
     esac ;;
   *"-l ctx:ready"*)
     # ctx:ready chore/task/debt candidate query (PILOT_CTX_READY_QUERIES). MUST be
@@ -890,6 +899,41 @@ run_sling_retry() { # $1=FAKE_SLING_FAIL_TIMES  $2=FAKE_SLING_ALWAYS_FAIL(0|1)  
     FAKE_SLING_ALWAYS_FAIL="${2:-0}" \
     FAKE_SLING_ORPHAN_JSON="${3:-}" \
     FAKE_BUGS_JSON='[{"id":"tt-flight","title":"Durable in-flight fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+# Runs a REAL (non-dry) dispatch of tt-flight whose previous dispatch left
+# pilot.sling_bead=<$1> on it (ga-9s8k2fw: the ga-cnvy1 live-wrapper dedup guard).
+#   $1 = the wrapper id stamped on the story: "tt-flight" (the bead itself — node-first /
+#        rig-native dispatch, where the bead IS its own target) or a distinct id (a real
+#        sling/convoy wrapper)
+#   $2 = PILOT_TEST_DEAD_SLINGS seam. OMIT it and the seam stays unset (the real
+#        liveness check runs). Pass it — "" included — and it is set, so "" means "every
+#        wrapper is LIVE" and "tt-sling-dead" means that one is DEAD.
+run_dedup_wrapper() { # $1=pilot.sling_bead on the story  $2=PILOT_TEST_DEAD_SLINGS (optional)
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
+    DRY_RUN=0 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
+    PILOT_SLING_RETRIES=3 \
+    PILOT_SLING_SLEEP=0 \
+    PILOT_INFLIGHT_RETRIES=3 \
+    PILOT_INFLIGHT_SLEEP=0 \
+    FAKE_BLOCKED_IDS="" \
+    FAKE_SUPPRESS_INFLIGHT=0 \
+    FAKE_STORY_SLING_BEAD_MAP="{\"tt-flight\":\"$1\"}" \
+    ${2+"PILOT_TEST_DEAD_SLINGS=$2"} \
+    FAKE_BUGS_JSON='[{"id":"tt-flight","title":"Durable in-flight fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{"pilot.sling_bead":"'"$1"'"}}]' \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
 }
@@ -3006,6 +3050,61 @@ if echo "$LOG13C" | grep "no bead_id for tt-flight after" >/dev/null; then
   bad "REGRESSION: fell through to the legacy persistent-failure path despite an adoptable orphan"
 else
   ok "did not fall through to the legacy 'failed after N attempts' path"
+fi
+
+# ── Scenario 13d: ga-cnvy1 live-wrapper dedup must not read a bead as ITS OWN wrapper (ga-9s8k2fw) ──
+# Live incident (02/11): P0 ga-1p1i5jr.1 sat with nobody on it from 00:56Z to 05:46Z while P3
+# beads ran. 15 sweeps logged "ga-cnvy1: SKIPPING dispatch of ga-1p1i5jr.1 — a LIVE wrapper
+# (ga-1p1i5jr.1, ...)": the wrapper id was the bead's OWN id. A bead dispatched node-first (HQ)
+# or rig-native is its own target, so the previous dispatch left pilot.sling_bead=<itself>; the guard then read the
+# bead (status open — it is the one being dispatched) as "a wrapper that is open", asked _sling_is_live
+# about it, found the fresh branch of the gate's previous run, and declared the work "already
+# dispatched" — a deadlock until that branch aged out. 287 such skips in the log, 15 of them on the P0.
+# The guard exists for a DIFFERENT bead carrying the dispatch (the convoy storm: ~15 sibling wrappers
+# for one target), so a bead can never be its own wrapper. Driven through the REAL dispatcher
+# (non-dry): PILOT_TEST_DEAD_SLINGS="" makes every wrapper LIVE, exactly what the fresh branch did.
+echo "Scenario 13d: a bead whose pilot.sling_bead is ITSELF is dispatched, not skipped as 'already has a live wrapper' (ga-9s8k2fw)"
+LOG13D_SELF="$(run_dedup_wrapper tt-flight "")"
+# vazio → count 0 (no sling was made); falhou/ilegível → the same 0, which makes the "== 1" check below fail loudly.
+_13d_self_n="$(cat "$STATE/sling_n" 2>/dev/null || echo 0)"
+if echo "$LOG13D_SELF" | grep -F "ga-cnvy1: SKIPPING dispatch of tt-flight — a LIVE wrapper (tt-flight," >/dev/null; then
+  bad "REGRESSION (ga-9s8k2fw): the dedup guard skipped tt-flight because its wrapper is tt-flight itself"
+else
+  ok "dedup guard did not treat tt-flight as its own live wrapper"
+fi
+if [ -f "$STATE/tt-flight.inflight" ] && [ "$_13d_self_n" = "1" ]; then
+  ok "tt-flight with pilot.sling_bead=itself WAS dispatched (gc sling x1, story:in-flight landed)"
+else
+  bad "tt-flight with pilot.sling_bead=itself was NOT dispatched (sling calls=$_13d_self_n, inflight marker=$([ -f "$STATE/tt-flight.inflight" ] && echo yes || echo no))"
+fi
+
+# Non-regression of ga-cnvy1 itself: a DISTINCT wrapper that is open and LIVE still blocks a 2nd sling.
+LOG13D_LIVE="$(run_dedup_wrapper tt-sling-live "")"
+_13d_live_n="$(cat "$STATE/sling_n" 2>/dev/null || echo 0)"
+if echo "$LOG13D_LIVE" | grep -F "ga-cnvy1: SKIPPING dispatch of tt-flight — a LIVE wrapper (tt-sling-live," >/dev/null; then
+  ok "a DISTINCT live wrapper (tt-sling-live) still makes the guard skip (ga-cnvy1 not regressed)"
+else
+  bad "REGRESSION (ga-cnvy1): a distinct open+live wrapper no longer blocks the duplicate sling"
+fi
+if [ ! -f "$STATE/tt-flight.inflight" ] && [ "$_13d_live_n" = "0" ]; then
+  ok "no 2nd sling was minted while the distinct wrapper is live (gc sling x0)"
+else
+  bad "REGRESSION (ga-cnvy1): a duplicate sling was minted next to a live wrapper (sling calls=$_13d_live_n)"
+fi
+if grep -F "released tt-flight" "$STATE/releases.log" >/dev/null 2>&1; then
+  ok "the skip released the pilot:dispatching claim so the next sweep can retry"
+else
+  bad "the ga-cnvy1 skip left the pilot:dispatching claim on tt-flight"
+fi
+
+# And a DISTINCT wrapper that is DEAD is still closed and replaced (unchanged by this fix).
+LOG13D_DEAD="$(run_dedup_wrapper tt-sling-dead "tt-sling-dead")"
+_13d_dead_n="$(cat "$STATE/sling_n" 2>/dev/null || echo 0)"
+if echo "$LOG13D_DEAD" | grep -F "ga-cnvy1: existing wrapper (tt-sling-dead" >/dev/null \
+   && [ -f "$STATE/tt-flight.inflight" ] && [ "$_13d_dead_n" = "1" ]; then
+  ok "a DISTINCT dead wrapper is declared stale and tt-flight is dispatched fresh (gc sling x1)"
+else
+  bad "REGRESSION (ga-cnvy1): a distinct dead wrapper no longer gets replaced (sling calls=$_13d_dead_n)"
 fi
 
 # ── Scenarios 14: ga-x3nmz Claude 5h-quota back-off ───────────────────────────
