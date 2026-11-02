@@ -61,7 +61,7 @@ run arm planner ga-abc;            [ "$RC" = 0 ] && { [ "$OUT" = on ] || [ "$OUT
 
 # a malformed conf must be its own state, never "absent": a typo'd key silently running at 0% is the failure
 for bc in "plannr_pct=50" "planner_pct=101" "planner_pct=abc" "planner_pct=-5" "planner_pct=" "planner_pct=5 0" "complexity=yes" \
-          "salt=has space" "salt=" "just-a-line" "planner_pct=0" ; do
+          "salt=has space" "salt=" "just-a-line" "planner_pct=0" "planner_pct=0100" ; do
   newstate; conf "$bc"
   run state
   case "$OUT" in invalid:*) ok "bad conf '$bc' → $OUT" ;; *) bad "bad conf '$bc' → state='$OUT' (must be invalid:*)" ;; esac
@@ -266,7 +266,7 @@ newstate; conf planner_pct=100 salt=t1; mkdir "$SD/e9-roster.jsonl"
 run assign ga-w1 /s
 [ -z "$OUT" ] && [ "$RC" = 3 ] && ok "a roster that cannot be READ (here: a directory): no arm, exit 3 — never a recompute" || bad "unreadable roster: out='$OUT' rc=$RC"
 run peek ga-w1; [ -z "$OUT" ] && [ "$RC" = 3 ] && ok "peek on an unreadable roster: no arm, exit 3" || bad "peek unreadable: out='$OUT' rc=$RC"
-run block ga-w1 /s; [ -z "$OUT" ] && ok "block on an unreadable roster adds nothing to the prompt" || bad "block unreadable: printed ${#OUT} bytes"
+run block ga-w1 /s; [ -z "$OUT" ] && [ "$RC" = 0 ] && ok "block on an unreadable roster adds nothing to the prompt, exit 0" || bad "block unreadable: printed ${#OUT} bytes rc=$RC"
 if [ "$(id -u)" != 0 ]; then
   newstate; conf planner_pct=100 salt=t1; printf '{"event":"assign","bead":"ga-w2","salt":"t1","planner_arm":"off"}\n' > "$SD/e9-roster.jsonl"; chmod 000 "$SD/e9-roster.jsonl"
   run assign ga-w2 /s; chmod 600 "$SD/e9-roster.jsonl"
@@ -460,7 +460,7 @@ fi
 
 echo "== 4. complexity (computed from facts) =="
 cx() { run complexity "$@"; }
-tbl="1 1 0 0:S|2 1 0 0:S|3 1 0 0:M|2 2 0 0:M|7 2 0 0:M|8 1 0 0:L|1 3 0 0:L|4 5 0 0:L|1 1 1 0:L|1 1 0 1:L|2 2 1 1:L|08 1 0 0:L|007 02 0 0:M"
+tbl="1 1 0 0:S|2 1 0 0:S|3 1 0 0:M|2 2 0 0:M|7 2 0 0:M|8 1 0 0:L|1 3 0 0:L|4 5 0 0:L|1 1 1 0:L|1 1 0 1:L|2 2 1 1:L|08 1 0 0:L|007 02 0 0:M|999999 1 0 0:L"
 oldifs="$IFS"; IFS='|'; for row in $tbl; do IFS="$oldifs"; args="${row%%:*}"; want="${row##*:}"
   # shellcheck disable=SC2086
   cx $args; [ "$OUT" = "$want" ] && [ "$RC" = 0 ] && ok "complexity $args → $want" || bad "complexity $args → '$OUT' rc=$RC, wanted $want"; IFS='|'; done; IFS="$oldifs"
@@ -469,7 +469,7 @@ for badargs in "0 1 0 0" "1 0 0 0" "x 1 0 0" "-1 1 0 0" "1.5 1 0 0" "1 1 2 0" "1
   # shellcheck disable=SC2086
   cx $badargs; [ -z "$OUT" ] && [ "$RC" = 2 ] && ok "bad args '$badargs' → no level, exit 2" || bad "bad args '$badargs' → out='$OUT' rc=$RC"
 done
-run complexity; [ -z "$OUT" ] && [ "$RC" = 2 ] && ok "no args → exit 2" || bad "no args → out='$OUT' rc=$RC"
+run complexity; [ -z "$OUT" ] && [ "$RC" = 2 ] && [ "$ERR" = "e9: bad complexity arguments: " ] && ok "no args → exit 2, and the message lists no arguments (the command word was shifted off)" || bad "no args → out='$OUT' rc=$RC err='$ERR'"
 
 echo "== 5. finalize (what the dispatcher writes after the refiner returns) =="
 F="arquivos=2 superficies=1 externo=0 migracao=0"
@@ -499,7 +499,7 @@ runin "$(bead "complexity:L" '{"story.complexidade":"L"}')" finalize
 runin "$(bead "complexity:S" '{"story.complexidade_fatos":"arquivos=dois superficies=1 externo=0 migracao=0","story.complexidade":"S"}')" finalize
 case "$OUT" in *"UNLABEL complexity:S"*"UNSET story.complexidade"*"STATUS complexity=malformed:"*) ok "malformed facts + a recorded level → both removed" ;; *) bad "finalize malformed+level: '$OUT'" ;; esac
 runin "$(bead "" '{"story.complexidade_fatos":"desconhecido: x"}')" finalize
-[ "$OUT" = "STATUS complexity=unknown" ] && ok "desconhecido and nothing recorded → no UNSET (no write for a key the bead never had)" || bad "finalize unknown, nothing recorded: '$OUT'"
+[ "$OUT" = "STATUS complexity=unknown" ] && [ "$RC" = 0 ] && ok "desconhecido and nothing recorded → no UNSET (no write for a key the bead never had), exit 0" || bad "finalize unknown, nothing recorded: '$OUT' rc=$RC"
 runin "$(bead "complexity:S" "$(jq -nc --arg f "$F" '{"story.complexidade_fatos":$f,"story.complexidade":"S"}')")" finalize
 case "$OUT" in *UNSET*) bad "good facts must SET the level, not unset it: '$OUT'" ;; *) ok "good facts: the level is SET (overwritten), never unset" ;; esac
 for badf in "arquivos=2 superficies=1 externo=0" "arquivos=2 superficies=1 externo=0 migracao=0 extra=1" "arquivos=2 arquivos=3 superficies=1 externo=0 migracao=0" \
@@ -509,7 +509,7 @@ for badf in "arquivos=2 superficies=1 externo=0" "arquivos=2 superficies=1 exter
   case "$OUT" in *"STATUS complexity=malformed:"*) case "$OUT" in *SET*|*LABEL\ *) bad "malformed '$badf' still wrote a level: '$OUT'" ;; *) ok "malformed facts '$badf' → malformed, nothing written" ;; esac ;; *) bad "malformed '$badf' → '$OUT'" ;; esac
 done
 # the reads that can fail: bd show of an id it cannot find prints [] — "could not read the bead" is NOT "the bead has no complexity"
-runin '[]' finalize;                [ "$OUT" = "STATUS complexity=unreadable" ] && ok "bd show → [] is unreadable, not absent" || bad "finalize []: '$OUT'"
+runin '[]' finalize;                [ "$OUT" = "STATUS complexity=unreadable" ] && [ "$RC" = 0 ] && ok "bd show → [] is unreadable, not absent (exit 0: the word is the answer)" || bad "finalize []: '$OUT' rc=$RC"
 runin '' finalize;                  [ "$OUT" = "STATUS complexity=unreadable" ] && ok "empty stdin is unreadable" || bad "finalize empty: '$OUT'"
 runin 'not json' finalize;          [ "$OUT" = "STATUS complexity=unreadable" ] && ok "non-JSON is unreadable" || bad "finalize garbage: '$OUT'"
 for m in '"a string"' '[1,2]' 'null' '7'; do
@@ -551,7 +551,7 @@ echo "== 7. plancheck =="
 plan() { jq -nc --arg p "$1" '[{id:"ga-p",labels:[],metadata:{"story.plano_tecnico":$p}}]'; }
 FULL=$'ARQUIVOS: a.py — f()\nABORDAGEM:\n 1. muda f\nCASOS-LIMITE: leitura vazia vs falha\nTESTE QUE REPROVA: t_f falha no HEAD\nNAO VERIFIQUEI: nada'
 runin "$(plan "$FULL")" plancheck;                      [ "$OUT" = ok ] && ok "a complete plan → ok" || bad "plancheck full: '$OUT'"
-runin "$(bead "" '{}')" plancheck;                     [ "$OUT" = absent ] && ok "no plan → absent" || bad "plancheck none: '$OUT'"
+runin "$(bead "" '{}')" plancheck;                     [ "$OUT" = absent ] && [ "$RC" = 0 ] && ok "no plan → absent, exit 0" || bad "plancheck none: '$OUT' rc=$RC"
 runin "$(plan "   ")" plancheck;                         [ "$OUT" = absent ] && ok "a whitespace-only plan → absent (an empty shell is not a plan)" || bad "plancheck blank: '$OUT'"
 runin "$(plan $'ARQUIVOS: a.py\nABORDAGEM: x')" plancheck
 [ "$OUT" = "incomplete:CASOS-LIMITE(ausente),TESTE QUE REPROVA(ausente),NAO VERIFIQUEI(ausente)" ] && ok "missing sections are NAMED" || bad "plancheck missing: '$OUT'"
@@ -579,6 +579,103 @@ newstate; conf planner_pct=100 complexity=off salt=t1
 run block ga-b3 /store/x
 case "$OUT" in *"TECHNICAL PLAN"*) case "$OUT" in *"COMPLEXITY FACTS"*) bad "complexity=off but facts asked" ;; *) ok "complexity=off: plan only" ;; esac ;; *) bad "plan-only block missing the plan" ;; esac
 run block "" /store/x; [ -z "$OUT" ] && [ "$RC" = 2 ] && ok "block with no bead id → nothing, exit 2" || bad "block empty id: out=${#OUT} rc=$RC"
+
+echo "== 9. the status of every branch, and the functions the CLI never reaches on its own =="
+# ga-hq1qc5y (hq-mutants lastro). The cases above read stdout and, for assign, the exit code; they never read the status of e9_record's own
+# guards or of e9_recorded_arm's jq, never ran e9_conf_load or e9_main under set -e, and never called e9_level_of_facts. Each case below runs a
+# child that sources the library; where a command has to fail in a way the real tools do not, a FUNCTION shim FAILS AFTER DOING OR PRINTING THE
+# GOOD THING (the third state a happy-path test never produces). EQUIVALENT, documented: df54f81999 (`last="$(…)" || :` -> `&& :`: an assignment
+# that is not the last element of an AND-OR list is exempt from errexit either way and nobody reads the list's status; the 141-tail case in
+# section 3 runs under set -euo pipefail and is green with both); 1319ac4b9f and f5aa70ca4e (`{ [ -f ] && [ -r ]; } || return 3` in
+# e9_recorded_arm: the jq call right below fails with rc 2 on exactly the roster those guards turn away and that is already mapped to 3; the
+# directory, mode-000 and dangling-link cases of section 3 stay green without them).
+kid() { /bin/bash -c "$1" _ "$E9" 2>&1; }   # <script>: a child shell; $1 in the script is the library
+newstate
+_o="$(kid 'set -e; . "$1"; e9_conf_load; echo "reached state=$E9_STATE"')"; _rc=$?
+[ "$_rc" = 0 ] && [ "$_o" = "reached state=absent" ] && ok "no conf: e9_conf_load under set -e is an answer (absent), not an abort" || bad "e9_conf_load without a conf under set -e: exit=$_rc out='$_o'"
+conf planner_pct=100 salt=k1; touch "$SD/no-e9-ab"
+_o="$(kid 'set -e; . "$1"; e9_conf_load; echo "reached state=$E9_STATE"')"; _rc=$?
+[ "$_rc" = 0 ] && [ "$_o" = "reached state=killed" ] && ok "conf + kill switch: e9_conf_load under set -e answers killed, it does not abort" || bad "e9_conf_load with the kill switch under set -e: exit=$_rc out='$_o'"
+_o="$(kid 'set -e; . "$1"; e9_main')"; _rc=$?
+[ "$_rc" = 2 ] && ok "e9_main with no argument under set -e: usage, exit 2 (shifting zero arguments is not an abort)" || bad "e9_main under set -e: exit=$_rc out='$_o'"
+run frobnicate; [ -z "$OUT" ] && [ "$RC" = 2 ] && ok "unknown command: exit 2" || bad "unknown command: out='$OUT' rc=$RC"
+for _s in arm arms; do
+  run "$_s" bogus ga-a1 < /dev/null
+  [ -z "$OUT" ] && [ "$RC" = 2 ] && case "$ERR" in usage:*) true ;; *) false ;; esac && ok "$_s with a kind other than planner: usage on stderr, exit 2" || bad "$_s bogus: out='$OUT' rc=$RC err='$ERR'"
+done
+newstate; conf planner_pct=abc
+run arm planner ga-a1; [ -z "$OUT" ] && [ "$RC" = 2 ] && ok "invalid conf: arm prints nothing and exits 2" || bad "invalid conf: arm out='$OUT' rc=$RC"
+OUT="$(printf 'ga-a1\n' | e9 arms planner 2>/dev/null)"; RC=$?
+[ -z "$OUT" ] && [ "$RC" = 2 ] && ok "invalid conf: arms prints nothing and exits 2" || bad "invalid conf: arms out='$OUT' rc=$RC"
+# the edges: a salt of 32 characters is the longest accepted; the arm test is strictly "bucket < pct" (bucket computed here, not by the script)
+_s32="$(printf 'x%.0s' $(seq 1 32))"
+newstate; conf "salt=$_s32" planner_pct=50; run state
+[ "$OUT" = "active planner_pct=50 complexity=off salt=$_s32" ] && ok "a 32-character salt is accepted" || bad "32-character salt → '$OUT'"
+newstate; conf "salt=${_s32}x" planner_pct=50; run state
+[ "$OUT" = "invalid:salt-too-long" ] && ok "a 33-character salt is too long" || bad "33-character salt → '$OUT'"
+_bk=$(( 16#$(printf '%s' "e9-planner:t1:ga-a1" | openssl dgst -sha256 -r | cut -c1-8) % 100 ))
+newstate; conf planner_pct="$_bk" complexity=on salt=t1; run arm planner ga-a1; _lo="$OUT"
+conf planner_pct=$((_bk+1)) complexity=on salt=t1; run arm planner ga-a1
+[ "$_lo" = off ] && [ "$OUT" = on ] && ok "ga-a1 has bucket $_bk: pct=$_bk is off, pct=$((_bk+1)) is on" || bad "bucket edge (bucket $_bk): pct=$_bk → '$_lo', pct=$((_bk+1)) → '$OUT'"
+# e9_record: every guard read by its status, against a roster that must stay as it was
+rec() { # <prelude>: the child runs the prelude (shims), calls e9_record and prints its status
+  /bin/bash -c '. "$1"; E9_STATE_DIR="$2"; eval "$3"; e9_record assign bead=b-1 store=/st salt=s planner_arm=on; echo "rc=$?"' _ "$E9" "$SD" "$1" 2>/dev/null
+}
+rc_is() { local got; got="$(rec "$3")"; [ "$got" = "rc=$1" ] && ok "$2 (rc=$1)" || bad "$2: wanted rc=$1, got '${got:-nothing}'"; }   # <rc> <title> <prelude>
+roster_lines() { if [ -e "$SD/e9-roster.jsonl" ]; then nlines; else echo none; fi; }
+SD="$W/nojq-state"; export E9_STATE_DIR="$SD"
+if [ -z "$(PATH="$_nojq" command -v jq 2>/dev/null)" ]; then
+  _o="$(PATH="$_nojq" rec '')"
+  [ "$_o" = "rc=3" ] && [ ! -e "$SD" ] && ok "no jq: rc 3, and the state directory is not even created" || bad "no jq: got '$_o', state dir $([ -e "$SD" ] && echo created || echo absent)"
+fi
+newstate; rc_is 3 "mkdir that fails but did create the directory: nothing is recorded" 'mkdir() { command mkdir "$@"; return 1; }'
+[ "$(roster_lines)" = none ] && ok "…and no roster was written" || bad "mkdir failed but a roster appeared ($(roster_lines) line(s))"
+newstate; rc_is 3 "jq that fails but prints a row" 'jq() { echo ROW; return 5; }'
+[ "$(roster_lines)" = none ] && ok "…and no roster was written" || bad "failing jq still produced a roster ($(roster_lines) line(s))"
+newstate; rc_is 3 "jq that exits 0 and prints nothing" 'jq() { return 0; }'
+[ "$(roster_lines)" = none ] && ok "…and no empty row was appended" || bad "empty jq output still produced a roster ($(roster_lines) line(s))"
+if [ "$(id -u)" != 0 ]; then
+  newstate; printf '{"x":1}\n' > "$SD/e9-roster.jsonl"; chmod 444 "$SD/e9-roster.jsonl"
+  rc_is 3 "roster that cannot be appended to: 3, not printf's 1" ''
+  chmod 600 "$SD/e9-roster.jsonl"
+fi
+# e9_recorded_arm: a jq that fails is "cannot tell" (3), whatever it printed on the way
+arm_is() { # <wanted> <title> <prelude>: e9_recorded_arm b-1 s over a roster that holds "on" for it
+  local got
+  got="$(/bin/bash -c '. "$1"; E9_STATE_DIR="$2"; eval "$3"; o="$(e9_recorded_arm b-1 s)"; echo "rc=$? out=$o"' _ "$E9" "$SD" "$3" 2>/dev/null)"
+  [ "$got" = "$1" ] && ok "$2 ($1)" || bad "$2: wanted '$1', got '$got'"
+}
+newstate; printf '%s\n' '{"event":"assign","bead":"b-1","salt":"s","planner_arm":"on"}' > "$SD/e9-roster.jsonl"
+arm_is "rc=0 out=on" "control: the real jq reads the recorded arm" ''
+arm_is "rc=3 out=" "jq that fails but prints a row" 'jq() { echo ROW:on; return 5; }'
+arm_is "rc=3 out=" "jq that fails and prints nothing" 'jq() { return 5; }'
+# assign / peek / block
+newstate; conf planner_pct=50 salt=t1
+for _id in "ga bad" ""; do
+  run assign "$_id" /store
+  [ -z "$OUT" ] && [ "$RC" = 3 ] && [ "$ERR" = "e9: cannot assign an arm to '$_id'" ] && ok "assign of '$_id': exit 3, and the reason is the id itself (not an rc from further down)" || bad "assign of '$_id': out='$OUT' rc=$RC err='$ERR'"
+  run peek "$_id"
+  [ -z "$OUT" ] && [ "$RC" = 3 ] && [ "$ERR" = "e9: cannot peek an arm for '$_id'" ] && ok "peek of '$_id': exit 3, the same reason" || bad "peek of '$_id': out='$OUT' rc=$RC err='$ERR'"
+done
+newstate; conf planner_pct=100 salt=t1; run assign ga-pk9 /s; run peek ga-pk9
+[ "$OUT" = on ] && [ "$RC" = 0 ] && ok "peek of a recorded bead: the recorded arm, exit 0" || bad "peek recorded: out='$OUT' rc=$RC"
+OUT="$(E9_SHA_TOOLS=none /bin/bash "$E9" peek ga-pk8 2>/dev/null)"; RC=$?
+[ -z "$OUT" ] && [ "$RC" = 3 ] && ok "peek with no sha tool: prints nothing, exit 3 (no arm is neither on nor off)" || bad "peek, no sha tool: out='$OUT' rc=$RC"
+_ctl=""; for _b in ga-a1 ga-b2 wa-c3 ga-d4 ps-e5; do [ "$(recipe "$_b" t1 1)" = off ] && { _ctl="$_b"; break; }; done
+[ -n "$_ctl" ] || { echo "FAIL: no control bead at pct=1" >&2; exit 1; }
+newstate; conf planner_pct=1 salt=t1; run block "$_ctl" /store
+[ -z "$OUT" ] && [ "$RC" = 0 ] && [ "$(nlines)" = 1 ] && ok "control arm, complexity off: block adds nothing and exits 0 (the row is still recorded)" || bad "control block: ${#OUT} bytes rc=$RC rows=$(nlines)"
+# e9_level_of_facts always exits 0 and prints the word; check/plancheck exit codes
+lvl_is() { local got; got="$(/bin/bash -c '. "$1"; o="$(e9_level_of_facts "$2")"; echo "rc=$? $o"' _ "$E9" "$3" 2>/dev/null)"; [ "$got" = "rc=0 $1" ] && ok "level of $2 → $1, exit 0" || bad "level of $2: wanted 'rc=0 $1', got '$got'"; }   # <word> <title> <facts>
+lvl_is unknown "no facts" ''
+lvl_is unknown "\"desconhecido\"" 'desconhecido: sem acesso'
+lvl_is unknown "prose" 'pequena, mexe em um arquivo'
+lvl_is S "good facts" 'arquivos=2 superficies=1 externo=0 migracao=0'
+lvl_is L "good facts, one per line" $'externo=1\nmigracao=0\nsuperficies=1\narquivos=2'
+lvl_is unknown "facts that repeat a key (all four are set, but each must appear once)" 'arquivos=2 superficies=1 externo=0 migracao=0 arquivos=3'
+chk "$(bead "complexity:S" '{"story.complexidade_fatos":"arquivos=2 superficies=1 externo=0","story.complexidade":"S"}')"
+[ "$RC" = 11 ] && case "$OUT" in malformed:faltam-ou-repetem*) true ;; *) false ;; esac && ok "recorded level next to facts that do not parse → malformed (exit 11)" || bad "check, unparsable facts: '$OUT' rc=$RC"
+runin '[]' plancheck; [ "$OUT" = unreadable ] && [ "$RC" = 0 ] && ok "plancheck of an unreadable bead: unreadable, exit 0" || bad "plancheck []: '$OUT' rc=$RC"
 
 echo
 echo "e9-arms selftest: $PASS passed, $FAILN failed"
