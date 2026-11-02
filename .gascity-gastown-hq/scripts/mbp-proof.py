@@ -51,7 +51,7 @@ O QUE TOCA NO MBP (tudo sob ~/gt-remote, e só o que está aqui) E O QUE DESFAZ
 CÓDIGOS  0 tudo passou · 1 alguma prova reprovou, ou recusei instalar (config do wrapper alheia/ilegível, builder ou verify falhou) · 2 uso · 3 não consegui começar (pré-condição: MBP não livre, tmux aberto ou sem resposta) · 4 interrompida: o Athos voltou ao MBP, o veredito do gate não se lê, ou pediram para parar com SIGTERM/Ctrl-C (nada mais foi medido, nem as sessões leves de (g); a sessão é parada)
 CONFIGURAÇÃO (ambiente)  MBP_PROOF_SSH (athos@athoss-macbook-pro, o nome do Tailscale; sem a variável, `e2e` e `install --apply` — só quem conecta — perguntam ao mbp-host.sh, que troca pela LAN .local só se ela responder e o Tailscale não; `plan` e `install` sem --apply não sondam a rede e mostram o nome do Tailscale) · MBP_PROOF_HOME (/Users/athos: o home no MBP) · MBP_PROOF_SESSION (remote-test-remote-mbp-1) ·
   MBP_PROOF_POLL (10: segundos entre olhadas) · MBP_PROOF_WATCH_CYCLE (5: o watch_s do provider) · MBP_PROOF_SHIM_WAIT (60: quanto esperar o atalho) · GC_SSH_BIN (o ssh, como no provider) · GC_CITY_PATH · só o selftest troca: MBP_PROOF_PROV, MBP_PROOF_PUMP,
-  MBP_PROOF_PATHX, MBP_PROOF_SHIM_CLIENT, MBP_PROOF_BUILDER, MBP_PROOF_SESSION_PATH (o PATH explícito da sessão), MBP_PROOF_CLAUDE (o caminho absoluto do claude no MBP)
+  MBP_PROOF_PATHX, MBP_PROOF_SHIM_CLIENT, MBP_PROOF_BUILDER, MBP_PROOF_SESSION_PATH (o PATH explícito da sessão), MBP_PROOF_CLAUDE (o caminho absoluto do claude no MBP), MBP_PROOF_POOL_FILE (o arquivo da conta atual do pool, claude_account do bloco do host)
 """
 from __future__ import annotations
 
@@ -108,6 +108,7 @@ BUILDER = os.environ.get("MBP_PROOF_BUILDER") or os.path.join(HERE, "remote-bund
 SHIM_CLIENT = os.environ.get("MBP_PROOF_SHIM_CLIENT") or os.path.join(HERE, "remote-shim.py")
 SSH_BIN = os.environ.get("GC_SSH_BIN") or "ssh"
 MINI_HOME = os.path.realpath(os.path.expanduser("~"))
+POOL_FILE = os.environ.get("MBP_PROOF_POOL_FILE") or os.path.join(MINI_HOME, "shared", "data", "claude_pool_current_account.json")  # a conta atual do pool (o mesmo arquivo do hetzner no session-ssh.json); só o selftest troca
 
 MGT = MHOME + "/gt-remote"
 BUNDLE, SHIMBIN, SPOOL, PROOFS, MBIN = MGT + "/bundle", MGT + "/shim-bin", MGT + "/shim", MGT + "/proof", MGT + "/bin"
@@ -207,9 +208,11 @@ def resolution_verdict(out, run: str, shimbin: str, home: str) -> tuple:
 
 def host_block() -> dict:
     """O bloco `mbp` de session-ssh.json que a prova usa (a config VIVA só tem o servidor; a do MBP é decisão da fatia 3 e das janelas do engine).
-    `gui_agent: true` (ga-w7qwl1.2.4): host que dorme EXIGE (ga-w7qwl1.1.8): sem ele o provider recusa o start (o tmux nasceria no ssh e o claude, deslogado)."""
+    `gui_agent: true` (ga-w7qwl1.2.4): host que dorme EXIGE (ga-w7qwl1.1.8): sem ele o provider recusa o start (o tmux nasceria no ssh e o claude, deslogado).
+    `claude_account` (ga-w7qwl1.2.4.3): a sessão recebe a conta do pool pela chave do cofre (claude-oauth-token-<e-mail>, a do hetzner), não pelo Keychain do domínio gráfico — lá o
+    item 'Claude Code-credentials' sombreia o arquivo e `claude auth status` diz loggedIn false. Só o arquivo da conta atual; o `secret` fica no padrão do provider."""
     return {"ssh": SSH_TARGET, "cap": 2, "remote_root": BUNDLE, "remote_home": MHOME, "mini_home": MINI_HOME, "path_extra": PATHX,
-            "presence_gate": True, "sleeps": True, "gui_agent": True, "session_env": {"path": SESSION_PATH, "claude": CLAUDE_BIN},
+            "presence_gate": True, "sleeps": True, "gui_agent": True, "claude_account": {"current_file": POOL_FILE}, "session_env": {"path": SESSION_PATH, "claude": CLAUDE_BIN},
             "shim": {"spool_dir": SPOOL, "wrapper_config": WRAPPER_CFG, "idle_exit_s": 90, "poll_s": 2}}
 
 

@@ -403,7 +403,8 @@ assert M.measure_cmd("mbp-20260101-000000") in r["prompt_suffix"] or "MEAS-mbp-2
   c hostblock && { py 'h=M.host_block(); assert h["shim"]["spool_dir"]==M.SPOOL and h["path_extra"][0]==M.SHIMBIN and h["remote_root"]==M.BUNDLE and h["remote_home"]==M.MHOME
 assert M.client_config()=={"transport":"spool","spool_dir":M.SPOOL,"timeout_s":330}
 se=h["session_env"]; assert se=={"path":M.SESSION_PATH,"claude":M.CLAUDE_BIN} and se["path"][0]==M.SHIMBIN and se["claude"].startswith("/"), se
-assert h["sleeps"] is True and h.get("gui_agent") is True, h  # ga-w7qwl1.2.4: host que dorme sem gui_agent = o provider (1.8) recusa o start; tem de ser o booleano true, não "truthy"'; ok $? "unit: o bloco do host mbp — o atalho PRIMEIRO no PATH; session_env leva o PATH explícito (atalho primeiro) e o claude por caminho absoluto; gui_agent true (o host dorme; sem isso o provider recusa); a config do cliente é só a puxada (sem host, usuário nem chave)"; }
+assert h["sleeps"] is True and h.get("gui_agent") is True, h  # ga-w7qwl1.2.4: host que dorme sem gui_agent = o provider (1.8) recusa o start; tem de ser o booleano true, não "truthy"
+ca=h.get("claude_account"); assert ca=={"current_file":M.POOL_FILE} and M.POOL_FILE.startswith("/") and M.POOL_FILE.endswith("/shared/data/claude_pool_current_account.json"), (ca, M.POOL_FILE)  # ga-w7qwl1.2.4.3: a conta do cofre (como o hetzner), nunca o login do Keychain do domínio gráfico; sem "secret" (o padrão do provider vale)'; ok $? "unit: o bloco do host mbp — o atalho PRIMEIRO no PATH; session_env leva o PATH explícito (atalho primeiro) e o claude por caminho absoluto; gui_agent true (o host dorme; sem isso o provider recusa); claude_account aponta o arquivo da conta atual do pool (a chave vem do cofre, não do Keychain); a config do cliente é só a puxada (sem host, usuário nem chave)"; }
   c sessionpath && { MBP_PROOF_SESSION_PATH= MBP_PROOF_CLAUDE= py 'import os
 assert M.SESSION_PATH==[M.SHIMBIN,"/opt/homebrew/bin","/usr/local/bin","/usr/bin","/bin","/usr/sbin","/sbin"], M.SESSION_PATH
 assert not any(d.startswith(M.MHOME) and d!=M.SHIMBIN for d in M.SESSION_PATH) and M.CLAUDE_BIN==M.MHOME+"/.local/bin/claude", M.CLAUDE_BIN'; ok $? "unit: o PATH explícito padrão da sessão — o atalho primeiro, só pastas do sistema e do Homebrew, nem ~/.local/bin nem ~/go/bin; o claude por caminho absoluto"; }
@@ -615,9 +616,14 @@ g_cli() {
   if c cli-plan || c cli-plan-nosonda; then
     if [ -x "$HERE/gc-session-ssh" ]; then
       # o provider acha a cidade pelo GC_CITY do pedido e as regras de caminho são em ordem: o "MBP" não pode ficar debaixo de dirname(cidade) (no real é gt-remote ao lado de gt)
-      PD="$T/plan"; mkdir -p "$PD/gt/city/.gc" "$PD/mbp"
+      PD="$T/plan"; mkdir -p "$PD/gt/city/.gc" "$PD/mbp" "$MINI/shared/data"
+      # ga-w7qwl1.2.4.3: o bloco do MBP leva claude_account; o dry-run do provider LÊ o arquivo da conta atual do pool (e recusa se ele sumir), só não lê a chave do cofre
+      printf '{"current": "pool-conta@example.com"}\n' > "$MINI/shared/data/claude_pool_current_account.json"
       c cli-plan && { GC_CITY_PATH="$PD/gt/city" MBP_PROOF_HOME="$PD/mbp" MBP_PROOF_PROV="$HERE/gc-session-ssh" proof plan > "$T/out" 2> "$T/err"; RC=$?
         [ $RC = 0 ] && has "$T/out" "--settings $PD/mbp/gt-remote/bundle/city/settings.json" && has "$T/out" "would_refuse None" && ! has "$T/out" "PROBLEMA"; ok $? "cli: plan contra o dry-run do provider de verdade — o --settings do city vira o do bundle do MBP, o provider não recusaria, nada conecta (rc=$RC)"; }
+      # ga-w7qwl1.2.4.3: o bloco do MBP liga claude_account → o provider entrega a chave do cofre (prefixo no comando final) e o agente do domínio gráfico confere o login por ela (--auth-check), não pelo Keychain
+      c cli-plan && { grep -c "CLAUDE_CODE_OAUTH_TOKEN='<chave da conta atual do pool: não lida no dry-run>' nice -n 10 sh -c" "$T/out" > "$T/n1"; grep -c '^  if \[ "\$1" = --auth-check \]; then CLAUDE_CODE_OAUTH_TOKEN=' "$T/out" > "$T/n2"
+        [ "$(cat "$T/n1")" = 1 ] && [ "$(cat "$T/n2")" = 1 ] && ! has "$T/out" "sk-ant-"; ok $? "cli: plan com claude_account no bloco do MBP — a chave do cofre vai como prefixo do comando final (1x) e o lançador tem a conferência de login --auth-check (1x), sem chave no plano ($(cat "$T/n1")/$(cat "$T/n2"))"; }
       # ga-bmmxka: o mesmo plan SEM MBP_PROOF_SSH não sonda o host: mostra o nome do Tailscale (e diz que não sondou), mesmo com só a LAN "respondendo" no stub
       c cli-plan-nosonda && { mk_hostprobe; : > "$T/cli-probe.log"; GC_CITY_PATH="$PD/gt/city" MBP_PROOF_HOME="$PD/mbp" MBP_PROOF_PROV="$HERE/gc-session-ssh" MBP_PROOF_SSH= MBP_HOST_PROBE="$T/hostprobe" HOSTPROBE_UP="athoss-macbook-pro.local" HOSTPROBE_LOG="$T/cli-probe.log" proof plan > "$T/out" 2> "$T/err"; RC=$?
         [ $RC = 0 ] && has "$T/out" '"ssh": "athos@athoss-macbook-pro",' && ! has "$T/out" "athoss-macbook-pro.local" && has "$T/out" "o plan não sonda a rede" && [ ! -s "$T/cli-probe.log" ]; ok $? "cli: plan sem MBP_PROOF_SSH não sonda a rede — mostra o nome do Tailscale e diz que não sondou (rc=$RC, sondas=$(wc -l < "$T/cli-probe.log" | tr -d ' '))"; }
@@ -914,6 +920,8 @@ open(sys.argv[4], "w").write(s.replace(old, new))' "$P" "$1" "$2" "$3"
   mutant e2e athos "o gate do MBP é ignorado" 'return g.returncode == 0, v.get("reason") or self.out(g)[:160]' 'return True, "livre"'
   mutant e2e athosback "still_free nunca aborta" '        raise Aborted(f"antes de {stage}: {why}")' '        return'
   mutant unit,cli,e2e hostblock,cli-plan,ok "o bloco do host perde gui_agent (o provider recusa o start num host que dorme)" '"sleeps": True, "gui_agent": True, ' '"sleeps": True, '
+  mutant unit,cli hostblock,cli-plan "o bloco do host perde claude_account (a sessão do MBP volta ao login do Keychain do domínio gráfico: deslogada)" ' "claude_account": {"current_file": POOL_FILE},' ''
+  mutant unit hostblock "o arquivo da conta atual do pool aponta para outro lugar (o provider leria a conta errada, ou recusaria)" '"shared", "data", "claude_pool_current_account.json"' '"shared", "data", "pool.json"'
   # ---- ga-w7qwl1.2.4: a marca .stop do provider, o agente do domínio gráfico (f) e as duas sessões (g)
   mutant e2e ok,stalestop "a limpeza deixa as marcas .stop do provider em run/" 'if not re.fullmatch(C["stop_rx"], m):' 'if True:'
   mutant e2e stalestop "a marca .stop que o provider deixou na rodada anterior não é tirada antes das pré-condições" 'if re.fullmatch(C["stop_rx"], n):' 'if False:'

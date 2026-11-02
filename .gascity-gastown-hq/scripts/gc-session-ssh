@@ -325,7 +325,8 @@ esac
   rm -f @LAUNCH@; agent_down @LABEL@; exit 15; }"""
 # O agente (roda no launchd gui/<uid>, PATH próprio — o do launchd não tem o Homebrew do MBP): confere o login no PRÓPRIO domínio (três estados: logado / deslogado / ilegível — só "logado" segue; a saída
 # do claude, que tem e-mail e organização, nunca é gravada: do diag só entram loggedIn/authMethod/apiProvider, por lista fixa), abre a sessão, publica o veredito em @RES@ (troca atômica) e fica vivo enquanto a sessão existir.
-# Só comando do claude: `auth status`. O diag (login não ok) é gravado ANTES do veredito: o start lê o diag assim que vê o veredito. `security` roda em 2º plano com prazo de 5 s (cofre trancado pode esperar um diálogo para sempre).
+# Só comando do claude: `auth status` — direto (`"$cl" auth status`), ou, num host com claude_account e sessão claude (ga-w7qwl1.2.4.3), pelo lançador (`sh <lançador> --auth-check`): a chave da conta do pool só existe
+# nele, e é ela (não o login do Keychain, que no domínio gráfico ofusca o do arquivo) que a sessão vai usar; o agente nunca vê a chave. O diag (login não ok) é gravado ANTES do veredito: o start lê o diag assim que vê o veredito. `security` roda em 2º plano com prazo de 5 s (cofre trancado pode esperar um diálogo para sempre).
 GUI_AGENT = r"""#!/bin/sh
 PATH="@PATHX@$HOME/.local/bin:$HOME/go/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"; export PATH
 res=@RES@
@@ -367,7 +368,7 @@ diag() {
     echo "claude=$(clean "$cl") real=$(clean "${rp:-nao-resolvido}")"
   } >@DIAG@.tmp && mv -f @DIAG@.tmp @DIAG@
 }
-o=$("$cl" auth status 2>&1 </dev/null); rc=$?
+o=$(@AUTHCHK@ 2>&1 </dev/null); rc=$?
 lt=$(printf '%s\n' "$o" | grep -cE '"loggedIn"[[:space:]]*:[[:space:]]*true'); lf=$(printf '%s\n' "$o" | grep -cE '"loggedIn"[[:space:]]*:[[:space:]]*false')
 if [ "$rc" -ne 0 ] || [ "$lt" -eq 0 ] || [ "$lf" -ge 1 ]; then diag || :; fi
 if [ "$lf" -ge 1 ] && [ "$lt" -eq 0 ]; then say deslogado; exit 0; fi
@@ -707,8 +708,9 @@ def gui_vals(cfg: Cfg) -> dict:
     return {"@RUN@": q(cfg.root + "/run"), "@PFX@": q(AGENT_PFX), "@PFXRE@": AGENT_PFX.replace(".", "\\."), "@TRIES@": str(cfg.gui_proof), "@HOST@": q(cfg.host)}
 
 
-def gui_agent_sh(cfg: Cfg, name: str, p: dict, lpath: str) -> str:
-    return subst(GUI_AGENT, {"@PATHX@": "".join(d + ":" for d in cfg.path_extra), "@RES@": q(gui_files(cfg, name)["res"]), "@DIAG@": q(gui_files(cfg, name)["diag"]), "@CLAUDE@": q(cfg.claude_bin),
+def gui_agent_sh(cfg: Cfg, name: str, p: dict, lpath: str, chk: bool = False) -> str:
+    """`chk` = a conferência do login passa pelo lançador (auth_check): o agente roda `sh <lançador> --auth-check`, que põe a chave da conta do pool na env só do `claude auth status`."""
+    return subst(GUI_AGENT, {"@AUTHCHK@": f"sh {q(lpath)} --auth-check" if chk else '"$cl" auth status', "@PATHX@": "".join(d + ":" for d in cfg.path_extra), "@RES@": q(gui_files(cfg, name)["res"]), "@DIAG@": q(gui_files(cfg, name)["diag"]), "@CLAUDE@": q(cfg.claude_bin),
                              "@SOCK@": q(cfg.socket), "@NAME@": q(name), "@WORKDIR@": q(p["work_dir"]), "@LAUNCH@": q(lpath), "@TGT@": tgt(name)})
 
 
@@ -764,6 +766,11 @@ while kill -0 "$me" 2>/dev/null; do
 done'''
 
 
+def auth_check(cfg: Cfg, secrets: dict | None) -> bool:
+    """A conferência do login do agente do domínio gráfico passa pelo lançador? Só num host com gui_agent (a config já exige o claude da session_env nele) e uma sessão que leva a chave da conta do pool. Chave VAZIA não conta: o perfil de modelo manda o OAuth vazio de propósito (a sessão não usa a conta)."""
+    return bool(cfg.gui and (secrets or {}).get(OAUTH_ENV))
+
+
 def launcher(cfg: Cfg, name: str, p: dict, secrets: dict | None = None) -> str:
     """`secrets` (a chave da conta do pool) entra SÓ aqui: nunca em p["env"], que o dry-run, o log e os eventos imprimem."""
     exitf = f"{cfg.root}/run/{name}.exit"
@@ -771,7 +778,10 @@ def launcher(cfg: Cfg, name: str, p: dict, secrets: dict | None = None) -> str:
         first = (shlex.split(p["command"]) or [""])[0]
     except ValueError:  # aspas que não fecham: o sh do host é quem vai dizer; só não há o que conferir antes
         first = ""
-    out = ["#!/bin/sh", 'rm -f -- "$0"', f"cd {q(p['work_dir'])} || exit 1"]
+    out = ["#!/bin/sh"]
+    if auth_check(cfg, secrets):  # ga-w7qwl1.2.4.3: o agente do domínio gráfico confere o login AQUI, com a chave na env só do `claude auth status` (prefixo, nunca argv nem export), antes do rm: a sessão ainda vai rodar este arquivo
+        out.append(f'if [ "$1" = --auth-check ]; then {OAUTH_ENV}={q(secrets[OAUTH_ENV])} {q(cfg.claude_bin)} auth status; exit $?; fi')
+    out += ['rm -f -- "$0"', f"cd {q(p['work_dir'])} || exit 1"]
     out += [f"unset {k}" if v == "" else f"export {k}={q(v)}" for k, v in p["env"].items()]
     if cfg.spath:  # o zdot do bundle tem que ser o desta config (mesmo PATH): senão o claude abriria com o shell do usuário, em silêncio
         want = "export PATH='" + cfg.spath + "'"  # a linha que o remote-bundle-build.py --session-path grava nos 4 arquivos
@@ -1054,7 +1064,7 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
                               **({"guard": {"layer": "session", "file": f"{cfg.root}/guard/{GUARD}", "settings": f"{cfg.root}/city/settings.json"}} if cfg.guard_layer == "session" else {}),
                               session_env={"path": cfg.spath, "claude": cfg.claude_bin, "zdot": cfg.zdot} if cfg.spath else None,
                               gui_agent=(dict(gui_files(cfg, name), bootstrap=["launchctl", "bootstrap", "gui/<uid>", gui_files(cfg, name)["plist"]], wait_s=cfg.gui_wait,
-                                              script=gui_agent_sh(cfg, name, p, lpath).split("\n"), plist_xml=gui_plist(cfg, name).split("\n")) if cfg.gui else None),
+                                              script=gui_agent_sh(cfg, name, p, lpath, auth_check(cfg, secrets)).split("\n"), plist_xml=gui_plist(cfg, name).split("\n")) if cfg.gui else None),
                               tmux=["tmux", "-L", cfg.socket, "new-session", "-d", "-s", name, "-c", p["work_dir"], f"sh {lpath}"],
                               ssh=ssh_argv(cfg)), indent=2, sort_keys=True))
         return 0
@@ -1078,7 +1088,7 @@ rm -f @EXITF@; printf %s @B64@ | base64 -d >@LAUNCH@ || exit 1"""
 sleep 1
 T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após abrir: $(cat @EXITF@ 2>/dev/null)" >&2; rm -f @LAUNCH@;@ADOWN@ exit 1; }"""
     gv = {**gui_vals(cfg), "@NAME@": q(name), "@LAUNCH@": q(lpath), **{f"@{k.upper()}@": q(v) for k, v in gui_files(cfg, name).items()}}
-    gv.update({"@AGSH@": gv.pop("@SH@"), "@AGB64@": q(base64.b64encode(gui_agent_sh(cfg, name, p, lpath).encode()).decode()),
+    gv.update({"@AGSH@": gv.pop("@SH@"), "@AGB64@": q(base64.b64encode(gui_agent_sh(cfg, name, p, lpath, auth_check(cfg, secrets)).encode()).decode()),
                "@PLB64@": q(base64.b64encode(gui_plist(cfg, name).encode()).decode()), "@WAIT@": str(cfg.gui_wait)})
     # 1ª chamada (preparo): as funções do agente + a varredura de órfãos (precisa do `$s`, a lista de sessões, e recusa cedo, antes da parte lenta, se não há sessão gráfica).
     # 2ª chamada (abertura): as funções de novo (cada ssh é um script) + o agente no lugar do `new-session`; a recusa do agente chega aqui e desfaz o lançador, o agente e o worktree (trap).

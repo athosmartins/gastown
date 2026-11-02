@@ -39,6 +39,10 @@
 #   fixa do `auth status`, rc do cofre por `security find-generic-password -s` SEM -w/-g, realpath do claude) ANTES do veredito; a recusa do start o imprime depois da causa e o agent_down o apaga; e-mail, organização, token e
 #   conteúdo de credencial plantados não chegam à mensagem, ao estado nem a run/; cofre sem resposta em 5 s, arquivo ausente / ilegível / fora do alcance do stat e diag que não deu para gravar são estados distintos; o caminho
 #   de sucesso e as recusas que não são de login não consultam o cofre.
+#   gacct (ga-w7qwl1.2.4.3) — host de domínio gráfico COM `claude_account` + sessão claude: o agente confere o login pelo LANÇADOR (`sh <lançador> --auth-check`, ramo antes do `rm -f -- "$0"`, que roda `auth status` com
+#   CLAUDE_CODE_OAUTH_TOKEN=<chave da conta do pool> só nessa linha), porque no domínio gráfico o item 'Claude Code-credentials' do Keychain sombreia o arquivo e o `auth status` puro diz loggedIn false (a recusa
+#   DESLOGADO determinística das rodadas 3 e 4 do MBP); a chave NÃO entra no script do agente, no argv, no diag, nos eventos nem no dry-run (varredura de vazamento com controle positivo), o lançador se apaga, o cofre é
+#   lido uma vez; host sem claude_account, sessão que não é claude, perfil de modelo (chave vazia de propósito) e host que não é gráfico seguem exatamente como antes; cofre sem item / fechado recusa antes do ssh.
 #   prep (ga-2hd02v.1.5.9) — o start grava a identidade git POR worktree e a confiança da pasta em ~/.claude.json do host, e qualquer falha derruba o start sem abrir nada: espelho BARE (sem
 #   extensions.worktreeConfig: o core.bare sai do config compartilhado e o commit do worktree continua funcionando, autor = a sessão), modo 600 e o resto do arquivo preservados, idempotente, uma identidade por
 #   worktree; pasta ausente / comum, ~/.claude.json ausente / ilegível (intacto, byte a byte) / com forma estranha, config.worktree travado, identidade que o git não lê de volta → exit 1 com o motivo, nenhum
@@ -419,7 +423,9 @@ EOF
   cat > "$T/claude" <<'EOF'
 #!/bin/sh
 # claude falso: só entende `auth status`, e o login depende de ONDE roda (FAKE_LAUNCHD=1 = dentro do launchd gui), como o do MBP (medido 19/10: pelo ssh loggedIn false, no gui true)
+[ "$1" != hold ] || { printf %s "${CLAUDE_CODE_OAUTH_TOKEN-UNSET}" > "$2"; exec cat; }  # a sessão do teste do grupo gacct: grava a chave que recebeu na env e fica de pé
 printf '%s FAKE_LAUNCHD=%s\n' "$*" "${FAKE_LAUNCHD:-0}" >> @T@/claude.log
+printf '%s|%s\n' "$*" "${CLAUDE_CODE_OAUTH_TOKEN-UNSET}" >> @T@/claude.tokenv  # a chave (de mentira) que cada chamada recebeu na env: UNSET = a env nem existia
 [ "$1 $2" = "auth status" ] || exit 64
 m=$(cat @T@/auth.mode 2>/dev/null); [ -n "$m" ] || m=in
 case "$m" in
@@ -430,6 +436,7 @@ case "$m" in
   truerc)  printf '{\n  "loggedIn": true\n}\n'; exit 1;;
   garbage) echo banana; exit 0;;
   both)    printf '"loggedIn": true\n"loggedIn": false\n'; exit 0;;
+  tok)     if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then printf '{\n  "loggedIn": true,\n  "authMethod": "oauth_token"\n}\n'; exit 0; else printf '{\n  "loggedIn": false\n}\n'; exit 1; fi;;  # o MBP de verdade (medido 30/10): no domínio gráfico o login do arquivo é ofuscado pelo item do Keychain, e só a chave na env vale
   crash)   exit 2;;
   hang)    exec sleep 60;;
   slow)    sleep 7; printf '{\n  "loggedIn": true,\n  "authMethod": "claude.ai"\n}\n'; exit 0;;
@@ -450,7 +457,7 @@ EOF
 }
 lcreset() {  # o domínio gráfico existe e está vazio (agentes de antes são mortos); claude logado; nenhuma falha ligada
   local f; for f in "$T"/lc/loaded/*.pid; do [ -e "$f" ] && kill -s TERM -- "-$(cat "$f")" 2>/dev/null; done
-  find "$T/lc" -mindepth 1 -delete 2>/dev/null; mkdir -p "$T/lc/gui" "$T/lc/loaded"; : > "$T/lc.log"; : > "$T/claude.log"; : > "$T/security.log"; echo in > "$T/auth.mode"; rm -f "$T/lc.mode" "$T/tmux.fail" "$T/plutil.fail" "$T/security.rc" "$T/security.sleep" "$T/lc.cfgdir"
+  find "$T/lc" -mindepth 1 -delete 2>/dev/null; mkdir -p "$T/lc/gui" "$T/lc/loaded"; : > "$T/lc.log"; : > "$T/claude.log"; : > "$T/claude.tokenv"; : > "$T/security.log"; echo in > "$T/auth.mode"; rm -f "$T/lc.mode" "$T/tmux.fail" "$T/plutil.fail" "$T/security.rc" "$T/security.sleep" "$T/lc.cfgdir"
 }
 zdot_put() {  # zdot_put PATH — os 4 arquivos que o remote-bundle-build.py --session-path instala em <raiz>/zdot (a linha do PATH é a que o provider confere)
   mkdir -p "$RR/zdot" "$T/shim-bin"; for f in .zshenv .zprofile .zshrc env.sh; do printf "export PATH='%s'\n" "$1" > "$RR/zdot/$f"; done
@@ -1185,6 +1192,80 @@ EOF
   rm -f "$T/home/.local/bin/claude" "$T/bin/secret"; unset FAKE_VAULT FAKE_SECRET_LOG; cfg 3
 }
 
+g_gacct() {  # ga-w7qwl1.2.4.3: host que dorme (gui_agent) COM claude_account — o agente do domínio gráfico confere o login com a chave do cofre, no mesmo ambiente em que a sessão vai rodar
+  # Medido no MBP (30/10, rodadas 3 e 4 da prova): no domínio gráfico o `claude auth status` dá loggedIn false (o item "Claude Code-credentials" do Keychain ofusca o .credentials.json) e o start era recusado
+  # 'DESLOGADO' em 100% das vezes, MESMO com a chave do pool no cofre — porque a conferência rodava ANTES de a chave existir em qualquer lugar do host que não o lançador. O fake `claude` modo `tok` faz o mesmo: sem a chave na env, false.
+  setup_mbp; local KA=sk-ant-FAKEalfa-0123456789abcdef pool="$T/pool.json" vault="$T/vault" sl="$T/secret.log" L=com.gascity.remote-session. extra r1 i s found N=remote-test-remote-m
+  mkdir -p "$vault" "$T/tmp"; : > "$sl"; printf '%s\n' "$KA" > "$vault/claude-oauth-token-alfa@example.test"
+  printf '{"current":"alfa@example.test","since":"2026-11-02T20:00:00Z","reason":"selftest"}\n' > "$pool"
+  cat > "$T/bin/secret" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "${FAKE_SECRET_LOG:-/dev/null}"
+case "${FAKE_SECRET_MODE:-}" in
+  notfound) echo "Not found: $1" >&2; exit 4;;
+  locked) echo "Error: vault is locked" >&2; exit 1;;
+esac
+[ -f "$FAKE_VAULT/$1" ] || { echo "Not found: $1" >&2; exit 4; }
+cat "$FAKE_VAULT/$1"
+EOF
+  chmod +x "$T/bin/secret"; export FAKE_VAULT="$vault" FAKE_SECRET_LOG="$sl"
+  extra=$(jq -n --arg f "$pool" --arg s "$T/bin/secret" '{claude_account:{current_file:$f,secret:$s}}')
+  gleaks() {  # 0 = a chave $1 apareceu onde NÃO pode: argv do ssh, saída, erro, estado/log do mini, <raiz> (run/ com agente, plist, veredito, diag), disco do host, ps, scrollback, ambiente do tmux do host m
+    local k="$1" f found=1
+    for f in "$T/ssh.log" "$T/out" "$T/err" "$sl" "$T/lc.log"; do has "$f" "$k" && found=0; done
+    grep -rqF "$k" "$T/state" "$RR" "$RH" "$T/tmp" "$T/lc" 2>/dev/null && found=0
+    ps -eo args= | grep -F "$k" | grep -vF grep | grep -q . && found=0
+    for f in $(tmux -L "${SOCK}m" list-sessions -F '#{session_name}' 2>/dev/null); do tmux -L "${SOCK}m" capture-pane -p -S - -t "=$f:" 2>/dev/null | grep -qF "$k" && found=0; done
+    tmux -L "${SOCK}m" show-environment -g 2>/dev/null | grep -qF "$k" && found=0
+    return $found
+  }
+  cfgm "$extra"; mode livre; fresh; lcreset; mkdir -p "$T/state/m/running"; find "$T/state/m/running" -mindepth 1 -delete; : > "$T/state/m/events.jsonl"; : > "$T/state/m/session-ssh.log"
+  # --- dry-run: o desenho (a conferência do agente passa pelo lançador; o lançador a atende ANTES de se apagar; o agente continua sem nenhuma chave) ---
+  pv --dry-run start $N-0 < <(req "claude --x $MSET"); r1=$RC; jq -r '.gui_agent.script[]' "$T/out" > "$T/agent.out"; jq -r '.launcher[]' "$T/out" > "$T/launch.out"
+  [ $r1 = 0 ] && [ "$(jq -r '.claude_account.current' "$T/out")" = alfa@example.test ] && [ "$(grep -c -- '--auth-check' "$T/agent.out")" = 1 ] && grep -qF "sh $RR/run/$N-0.sh --auth-check" "$T/agent.out" && ! grep -qF '$("$cl" auth status ' "$T/agent.out"; ok $? "gacct: host gráfico com claude_account → o agente confere o login pelo lançador (sh <lançador> --auth-check), não rodando o claude solto (rc=$r1)"
+  ! grep -qiE 'token|<chave|sk-ant|oauth' "$T/agent.out" && [ "$(grep -cE '(^|[;&|(] *)"\$cl"' "$T/agent.out")" = 0 ] && grep -qxF "cl=$T/claude" "$T/agent.out"; ok $? "gacct: ...e o script do agente continua sem chave, sem a palavra 'token' e sem EXECUTAR o claude (a chave só existe no lançador)"
+  a=$(grep -n -- '--auth-check' "$T/launch.out" | head -1 | cut -d: -f1); b=$(grep -nxF 'rm -f -- "$0"' "$T/launch.out" | head -1 | cut -d: -f1)
+  [ "$(grep -c -- '--auth-check' "$T/launch.out")" = 1 ] && [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]; ok $? "gacct: o lançador atende --auth-check ANTES do 'rm -f -- \"\$0\"' (a conferência não pode apagar o lançador que a sessão ainda vai rodar) (linha ${a:-nunca} < ${b:-nunca})"
+  sed -n "${a:-1}p" "$T/launch.out" | grep -qE "^if \[ \"\\\$1\" = --auth-check \]; then CLAUDE_CODE_OAUTH_TOKEN='<chave da conta atual do pool: não lida no dry-run>' $T/claude auth status; exit \\\$\?; fi\$"; ok $? "gacct: ...com a chave como PREFIXO do comando (nunca argv nem export) e o único comando é '<claude> auth status'"
+  nossh && [ ! -s "$sl" ]; ok $? "gacct: o dry-run não conecta nem abre o cofre"
+  # --- sem claude_account: tudo como antes (o agente roda o claude, o lançador não tem --auth-check) ---
+  cfgm; pv --dry-run start $N-0 < <(req "claude --x $MSET"); jq -r '.gui_agent.script[]' "$T/out" > "$T/agent.out"; jq -r '.launcher[]' "$T/out" > "$T/launch.out"
+  grep -qF '$("$cl" auth status ' "$T/agent.out" && ! grep -q -- '--auth-check' "$T/agent.out" "$T/launch.out"; ok $? "gacct: host gráfico SEM claude_account = como antes: o agente roda o claude, e nada de --auth-check no agente nem no lançador"
+  cfgm "$extra"; pv --dry-run start $N-0 < <(req "sh -c cat sh $MSET"); jq -r '.gui_agent.script[]' "$T/out" > "$T/agent.out"; jq -r '.launcher[]' "$T/out" > "$T/launch.out"
+  grep -qF '$("$cl" auth status ' "$T/agent.out" && ! grep -q -- '--auth-check' "$T/agent.out" "$T/launch.out" && [ "$(jq -r .claude_account "$T/out")" = null ]; ok $? "gacct: sessão que NÃO é claude num host com claude_account não ganha chave, então o agente confere como antes (sem --auth-check)"
+  cfgm "$(jq -n --argjson e "$extra" '$e + {model_profiles:{"kimi-worker":{base_url:"https://openrouter.ai/api",secret:"openrouter-api-key",key_prefix:"sk-or-",model:"moonshotai/kimi-k3.1-pro",small_model:"moonshotai/kimi-k2.7-code"}}}')"
+  pv --dry-run start kimi-worker-remote-m-1 < <(req "claude --x $MSET"); jq -r '.gui_agent.script[]' "$T/out" > "$T/agent.out"; jq -r '.launcher[]' "$T/out" > "$T/launch.out"
+  grep -qF "CLAUDE_CODE_OAUTH_TOKEN='' " "$T/launch.out" && ! grep -q -- '--auth-check' "$T/agent.out" "$T/launch.out"; ok $? "gacct: sessão de perfil de modelo (OAuth VAZIO de propósito) não ganha --auth-check: conferir 'login' com a env vazia seria conferir o que ela não usa"
+  cfgm "$(jq -n --argjson e "$extra" '$e + {gui_agent:false,sleeps:false}')"; pv --dry-run start $N-0 < <(req "claude --x"); jq -r '.launcher[]' "$T/out" > "$T/launch.out"
+  [ $RC = 0 ] && [ "$(jq -r .gui_agent "$T/out")" = null ] && grep -q "^CLAUDE_CODE_OAUTH_TOKEN='<chave" "$T/launch.out" && ! grep -q -- '--auth-check' "$T/launch.out"; ok $? "gacct: host SEM gui_agent (o servidor) com claude_account e session_env: a chave segue no comando final e o lançador NÃO ganha --auth-check (só o agente gráfico o usa) (rc=$RC)"
+  cfgm "$extra"
+  # --- start de verdade: o login é conferido COM a chave, no domínio gráfico, e a sessão nasce com a mesma chave ---
+  lcreset; echo tok > "$T/auth.mode"; : > "$sl"; fresh; rm -f "$T/gm1.out"
+  TMPDIR="$T/tmp" pv start $N-1 < <(req "claude hold $T/gm1.out $MSET"); r1=$RC; ok $r1 "gacct: start com a chave do pool no cofre e o login do gráfico SÓ válido com a chave na env → o start abre (rc=$r1 $(head -c 220 "$T/err"))"
+  for i in $(seq 1 20); do [ -s "$T/gm1.out" ] && break; sleep 0.5; done
+  [ "$(cat "$T/gm1.out" 2>/dev/null)" = "$KA" ]; ok $? "gacct: a sessão nasce com CLAUDE_CODE_OAUTH_TOKEN = a chave da conta current do pool (o lançador seguiu de pé depois da conferência)"
+  [ "$(cat "$RR/run/${L}$N-1.agent.res" 2>/dev/null)" = ok ] && [ "$(grep -c '^auth status|' "$T/claude.tokenv")" = 1 ] && grep -qxF "auth status|$KA" "$T/claude.tokenv"; ok $? "gacct: o 'auth status' rodou UMA vez e recebeu a chave do cofre na env (o veredito do agente é 'ok')"
+  [ -s "$T/claude.log" ] && ! grep -qv '^auth status FAKE_LAUNCHD=1$' "$T/claude.log"; ok $? "gacct: ...dentro do domínio gráfico (FAKE_LAUNCHD=1), e a sessão do gráfico não rodou outro comando do claude além do 'auth status'"
+  [ "$(grep -c . "$sl")" = 1 ] && has "$sl" "claude-oauth-token-alfa@example.test"; ok $? "gacct: o cofre foi lido UMA vez (pelo start), não pelo agente nem pela conferência"
+  [ ! -e "$RR/run/$N-1.sh" ] && [ ! -e "$RR/run/${L}$N-1.agent.diag" ]; ok $? "gacct: o lançador (que tem a chave) se apagou ao abrir a sessão e nenhum diag foi gravado"
+  ! gleaks "$KA"; ok $? "gacct: a chave não aparece no argv do ssh, na saída, no estado do mini, em <raiz>/run, no ps, no scrollback, no ambiente do tmux nem no plist/agente"
+  printf '%s' "$KA" > "$RR/run/controle"; gleaks "$KA"; r1=$?; rm -f "$RR/run/controle"; ok $r1 "gacct: (controle positivo) a varredura acusa a chave quando ela está de fato em <raiz>/run"
+  pv stop $N-1 </dev/null; [ $RC = 0 ] && [ "$(nload)" = 0 ] && [ "$(nrun)" = 0 ]; ok $? "gacct: o stop recolhe o agente e os arquivos (rc=$RC)"
+  # --- a chave não vale login: o veredito 'deslogado' ainda recusa, e o lançador com a chave não fica no host ---
+  for s in out garbage truerc; do  # truerc: loggedIn true com rc 1 — o rc do claude tem que chegar ao agente pelo lançador (exit $?), senão o 'sinal em que não se confia' passaria
+    lcreset; echo "$s" > "$T/auth.mode"; : > "$sl"; fresh; : > "$T/state/m/events.jsonl"
+    pv start $N-2 < <(req "claude hold $T/gm2.out $MSET"); r1=$RC
+    [ $r1 = 1 ] && { has "$T/err" DESLOGADO || has "$T/err" 'não consegui ler o login'; } && [ "$(count x "${SOCK}m")" = 0 ] && [ "$(nload)" = 0 ] && [ "$(nrun)" = 0 ] && [ ! -e "$RR/run/$N-2.sh" ] && [ ! -e "$T/gm2.out" ] && evt refused $N-2 && ! gleaks "$KA"
+    ok $? "gacct: 'auth status' $s com a chave na env → o start RECUSA (exit 1), nada aberto/carregado, o lançador com a chave não sobra em run/ e a chave não vaza nem pela mensagem nem pelo diag (rc=$r1 $(head -c 120 "$T/err"))"
+  done
+  # --- sem chave no cofre, o start nem chega ao agente ---
+  for s in notfound locked; do
+    lcreset; echo tok > "$T/auth.mode"; fresh; FAKE_SECRET_MODE=$s pv start $N-3 < <(req "claude hold $T/gm3.out $MSET"); r1=$RC
+    [ $r1 = 1 ] && nossh && [ "$(nload)" = 0 ] && [ "$(nrun)" = 0 ] && [ ! -s "$T/claude.tokenv" ]; ok $? "gacct: cofre '$s' → o start recusa antes de qualquer ssh, sem agente e sem rodar o claude, e NÃO cai no login do nó (rc=$r1)"
+  done
+  rm -f "$T/bin/secret"; unset FAKE_VAULT FAKE_SECRET_LOG; cfgm; lcreset
+}
+
 g_prof() {  # perfil de modelo por papel (ga-do1ixn.2): a sessão <papel>-remote-* do papel listado nasce apontada para o fornecedor do perfil, com a chave DELE e nunca a da conta do pool
   local KO=sk-or-v1-FAKEkimi0123456789abcdef KA=sk-ant-FAKEalfa-0123456789abcdef pool="$T/pool.json" vault="$T/vault" sl="$T/secret.log" prof extra mode bad r1 f
   prof='{"kimi-worker":{"base_url":"https://openrouter.ai/api","secret":"openrouter-api-key","key_prefix":"sk-or-","model":"moonshotai/kimi-k3.1-pro","small_model":"moonshotai/kimi-k2.7-code"}}'
@@ -1459,7 +1540,7 @@ g_shard() {  # o filtro do PRÓPRIO selftest (GCSSH_SHARD, GCSSH_ONLY, GCSSH_MUT
   [ $rr = 0 ] && [ "$(printf '%s\n' "$oo" | grep -c '^ok   mutante .* pego')" = 1 ] && printf '%s\n' "$oo" | grep -q '^== final: 1/1 ok ==$' && ! printf '%s\n' "$oo" | grep -q 'NADA RODOU'; ok $? "shard: (controle) GCSSH_SHARD=1/9999 roda exatamente 1 mutante, pego, e sai 0 (rc=$rr: $(printf '%s' "$oo" | tail -c 110))"
 }
 
-all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group lay && g_lay; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group gui && g_gui; group diag && g_diag; group acct && g_acct; group prof && g_prof; group lr && g_lr; group lrd && g_lrd; group abort && g_abort; group shard && g_shard; return 0; }
+all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group lay && g_lay; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group gui && g_gui; group diag && g_diag; group acct && g_acct; group gacct && g_gacct; group prof && g_prof; group lr && g_lr; group lrd && g_lrd; group abort && g_abort; group shard && g_shard; return 0; }
 
 if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
 # GCSSH_SHARD=K/N: dois decimais canônicos (sem sinal, sem espaço, sem zero à esquerda: `[ 3 = 03 ]` é falso e $((mn % 010)) é octal, então a fatia ficaria vazia ou trocada sem aviso), N de 1 a 9999 e K de 0 a N-1
@@ -1709,10 +1790,21 @@ case "$shn" in [1-9]*) ;; *) shard_bad;; esac
   mutant diag "arquivo que o processo não lê dito legível" 's/if \[ -r "\$1" \]; then r=sim; else r=nao; fi/r=sim/'
   mutant diag "valor sem tirar o que não é caractere de caminho" 's/LC_ALL=C tr -cd [^|]*| //'
   mutant gui "o caminho de SUCESSO também consulta o cofre e grava diag" 's/^e=\$(tmux/diag; e=$(tmux/'
+  # gacct (ga-w7qwl1.2.4.3): o agente do domínio gráfico confere o login pelo lançador, com a chave do pool na env; cada peça, uma de cada vez
+  mutant gacct "a conferência nunca passa pelo lançador (volta o 'DESLOGADO' do MBP)" 's/^    return bool(cfg.gui and (secrets or {}).get(OAUTH_ENV))$/    return False/'
+  mutant gacct "a conferência passa pelo lançador em qualquer host com chave (o servidor também)" 's/^    return bool(cfg.gui and (secrets or {}).get(OAUTH_ENV))$/    return bool((secrets or {}).get(OAUTH_ENV))/'
+  mutant gacct "chave VAZIA (perfil de modelo) também ganha a conferência pelo lançador" 's/^    return bool(cfg.gui and (secrets or {}).get(OAUTH_ENV))$/    return bool(cfg.gui and OAUTH_ENV in (secrets or {}))/'
+  mutant gacct "o agente de host gráfico sempre confere pelo lançador (até sem chave)" 's/ --auth-check" if chk else /--auth-check" if True else /'
+  mutant gacct "o agente chama o lançador sem o --auth-check (apagaria o lançador e abriria uma sessão)" 's/ --auth-check" if chk else / " if chk else /'
+  mutant gacct "o lançador atende --auth-check DEPOIS de se apagar" 's/^    out = \["#!\/bin\/sh"\]$/    out = ["#!\/bin\/sh", "rm -f -- $0"]/;s/^    out += \[.rm -f -- "\$0".,/    out += [/'
+  mutant gacct "a chave vai como export (fica no ambiente do shell do lançador)" 's/then {OAUTH_ENV}={q(secrets\[OAUTH_ENV\])} {q(cfg.claude_bin)} auth status; exit/then export {OAUTH_ENV}={q(secrets[OAUTH_ENV])}; {q(cfg.claude_bin)} auth status; exit/'
+  mutant gacct "o lançador confere com o claude do PATH, não o da session_env" 's/{q(secrets\[OAUTH_ENV\])} {q(cfg.claude_bin)} auth status; exit/{q(secrets[OAUTH_ENV])} claude auth status; exit/'
+  mutant gacct "o lançador perde o rc do claude (exit 0)" 's/auth status; exit \$?; fi/auth status; exit 0; fi/'
+  mutant gacct "o lançador confere sem a chave (a env nem existe)" 's/then {OAUTH_ENV}={q(secrets\[OAUTH_ENV\])} {q(cfg.claude_bin)} auth status/then {q(cfg.claude_bin)} auth status/'
   [ -n "${GCSSH_MUTANTS_ONLY:-}" ] || [ "${GCSSH_SHARD%/*}" != 0 ] || {
   echo "-- contra um stub que só sai 0 (a versão 'anterior' não tinha provider nenhum)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"
-  r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate,lay,prep,wt,gui,diag,acct,prof" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
+  r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate,lay,prep,wt,gui,diag,acct,gacct,prof" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
   case "$r" in "RESULT 0/"*|"") ok 1 "stub deveria falhar quase tudo ($r)";; *) ok 0 "stub falha os casos novos ($r)";; esac
   }
   echo "== final: $((n-fails))/$n ok =="
