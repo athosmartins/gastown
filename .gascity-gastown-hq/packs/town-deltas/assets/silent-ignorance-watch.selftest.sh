@@ -243,6 +243,114 @@ rc=$(run9 --notify)
   && ok "instrumento estável de novo + achado real -> volta a alertar (não fica mudo depois da re-seed)" \
   || bad "após estabilizar, achado novo de verdade NÃO alertou — mecanismo ficou mudo permanentemente: $(cat "$TD/out.txt")"
 
+echo "── 10. os ramos que as seções acima não pisam (ga-eedg7fw, hq-mutants): argumento, raízes pelo rig list, stderr do scanner, fingerprint, --seed, no-news, notify ──"
+# O `run` acima sempre fixa SILENT_IGN_ROOTS=/tmp, então a descoberta das raízes (HQ + `gc rig list`) nunca rodava. Aqui o `gc` é de mentira (PATH) e o scanner grava
+# com que --path foi chamado. EQUIVALENTE, sem caso (hq-mutants L121): `printf … | grep -E ':(C1|C2|C3):' >> "$tmp_raw" || true` com `||`→`&&` — o script roda com
+# `set -uo pipefail`, SEM -e, e o rc dessa linha não é lido em lugar nenhum.
+mkdir -p "$TD/stubs" "$TD/stubs-nosha" "$TD/hq" "$TD/rigA"
+cat > "$TD/stubs/gc" <<'GCEOF'
+#!/bin/sh
+# gc rig list --json de mentira: com $GC_STUB_MODE_FILE = ok devolve $GC_STUB_RIGS; qualquer outro modo = não respondeu (sem saída, rc 0)
+[ "$(cat "$GC_STUB_MODE_FILE" 2>/dev/null)" = ok ] && cat "$GC_STUB_RIGS"
+exit 0
+GCEOF
+printf '#!/bin/sh\nexit 1\n' > "$TD/stubs-nosha/shasum"
+printf '#!/bin/sh\n: > "$N10_MARK"\nexit 0\n' > "$TD/notify_mark.sh"
+chmod +x "$TD/stubs/gc" "$TD/stubs-nosha/shasum" "$TD/notify_mark.sh"
+runx() { local rc; env SILENT_IGN_SCAN="$TD/scan.sh" SILENT_IGN_BASELINE="$TD/base.tsv" SILENT_IGN_NOTIFY="${MOCK_NOTIFY:-/usr/bin/true}" \
+  GC_CITY_PATH="${HQDIR:-$TD/hq}" GC_STUB_MODE_FILE="$TD/gc.mode" GC_STUB_RIGS="$TD/rigs.json" SCAN_CALLS="$TD/scan.calls" N10_MARK="$TD/n10_called" \
+  PATH="${EXTRA_PATH:+$EXTRA_PATH:}$TD/stubs:$PATH" timeout 90 bash "$WATCH" "$@" >"$TD/out.txt" 2>&1; rc=$?; echo "$rc"; }
+# scanner que só registra os argumentos e não acha nada; a fingerprint dele já fica estampada (como o mk_scan)
+mk_scan_rec() { printf '#!/bin/bash\necho "$*" >> "${SCAN_CALLS:-/dev/null}"\nexit 0\n' > "$TD/scan.sh"; chmod +x "$TD/scan.sh"
+  shasum -a 256 "$TD/scan.sh" | awk '{print $1}' > "$TD/base.tsv.scanner-fp"; }
+run_in_n10() { env N10_MARK="$TD/n10_called" SILENT_IGN_SCAN="$TD/scan.sh" SILENT_IGN_ROOTS=/tmp SILENT_IGN_BASELINE="$TD/base.tsv" SILENT_IGN_NOTIFY="$1" timeout 90 bash "$WATCH" "${@:2}" >"$TD/out.txt" 2>&1; echo $?; }
+
+# 10a. argumento desconhecido
+printf 'x.sh\tC2\tc\t%s\n' "$NOW" > "$TD/base.tsv"; mk_scan "x.sh:1:C2:c"
+rc=$(run --bogus)
+[ "$rc" = "2" ] && grep -q 'unknown arg: --bogus' "$TD/out.txt" \
+  && ok "argumento desconhecido -> exit 2 e diz qual" || bad "--bogus: rc=$rc ($(head -1 "$TD/out.txt"))"
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "  skip 10b-10d (sem jq nesta máquina: o watch lê o rig list com jq, o teste seria vacuamente verde)"
+else
+# 10b. a raiz principal (HQ) tem de existir
+echo ok > "$TD/gc.mode"; printf '{"rigs":[]}' > "$TD/rigs.json"; mk_scan_rec; : > "$TD/scan.calls"
+rc=$(HQDIR="$TD/nao-existe-hq" runx)
+[ "$rc" = "3" ] && grep -q 'não é um diretório' "$TD/out.txt" && [ ! -s "$TD/scan.calls" ] \
+  && ok "HQ que não é diretório -> exit 3, diz por quê, e o scanner nem roda" || bad "HQ inexistente: rc=$rc scan.calls=$(wc -l < "$TD/scan.calls" | tr -d ' ') ($(head -1 "$TD/out.txt"))"
+rc=$(runx)
+[ "$rc" = "0" ] && [ "$(cat "$TD/scan.calls")" = "--path $TD/hq --quiet" ] \
+  && ok "CONTROLE: HQ existente + nenhum rig -> exit 0 e varre só o HQ" || bad "HQ ok: rc=$rc scan.calls='$(cat "$TD/scan.calls")'"
+
+# 10c. o rig list que não responde NÃO é 'zero rigs'
+echo empty > "$TD/gc.mode"; : > "$TD/scan.calls"
+rc=$(runx)
+[ "$rc" = "3" ] && grep -q "'gc rig list' não respondeu" "$TD/out.txt" && [ ! -s "$TD/scan.calls" ] \
+  && ok "gc rig list sem resposta -> exit 3 (não 'zero rigs'), e nada é varrido" || bad "rig list vazio: rc=$rc ($(head -1 "$TD/out.txt"))"
+
+# 10d. as raízes: HQ primeiro, rig que existe entra, rig que não existe em disco é AVISADO e fica de fora, o HQ repetido no rig list não duplica
+echo ok > "$TD/gc.mode"; : > "$TD/scan.calls"
+printf '{"rigs":[{"path":"%s"},{"path":"%s"},{"path":"%s"}]}' "$TD/rigA" "$TD/nao-existe-rig" "$TD/hq" > "$TD/rigs.json"
+rc=$(runx)
+[ "$rc" = "0" ] && [ "$(cat "$TD/scan.calls")" = "--path $TD/hq --quiet
+--path $TD/rigA --quiet" ] \
+  && ok "varre HQ e o rig que existe, nessa ordem, cada um UMA vez" || bad "raízes varridas: rc=$rc scan.calls='$(tr '\n' '|' < "$TD/scan.calls")'"
+grep -q "aviso: rig '$TD/nao-existe-rig' está no rig list mas NÃO existe em disco" "$TD/out.txt" \
+  && ok "rig do rig list que não existe em disco: AVISA (varredura incompleta) e não o varre" || bad "sem o aviso do rig inexistente: $(cat "$TD/out.txt")"
+fi
+
+# 10e. o stderr do scanner que falhou vai para o operador (a causa não morre em /dev/null); sem stderr, nenhuma linha 'scanner:'
+printf '#!/bin/bash\necho "boom: reason" >&2\nexit 1\n' > "$TD/scan.sh"
+rc=$(run)
+[ "$rc" = "3" ] && grep -q "scanner falhou em '/tmp' (rc=1)" "$TD/out.txt" && grep -q '^    scanner: boom: reason$' "$TD/out.txt" \
+  && ok "scanner falhou com stderr -> exit 3 e a causa aparece ('    scanner: boom: reason')" || bad "stderr do scanner: rc=$rc ($(cat "$TD/out.txt"))"
+printf '#!/bin/bash\nexit 1\n' > "$TD/scan.sh"
+rc=$(run)
+[ "$rc" = "3" ] && grep -q "scanner falhou em '/tmp' (rc=1)" "$TD/out.txt" && ! grep -q '^    scanner:' "$TD/out.txt" \
+  && ok "CONTROLE: scanner falhou SEM stderr -> exit 3 e nenhuma linha 'scanner:' inventada" || bad "scanner mudo: rc=$rc ($(cat "$TD/out.txt"))"
+
+# 10f. não consegui calcular a fingerprint do instrumento: exit 3, nunca 'é o mesmo'
+printf 'x.sh\tC2\tc\t%s\n' "$NOW" > "$TD/base.tsv"; mk_scan "x.sh:1:C2:c"
+rc=$(env SILENT_IGN_SCAN="$TD/scan.sh" SILENT_IGN_ROOTS=/tmp SILENT_IGN_BASELINE="$TD/base.tsv" PATH="$TD/stubs-nosha:$PATH" timeout 90 bash "$WATCH" >"$TD/out.txt" 2>&1; echo $?)
+[ "$rc" = "3" ] && grep -q 'não consegui calcular a fingerprint do scanner' "$TD/out.txt" \
+  && ok "shasum sem resposta -> exit 3 (não afirma que o baseline é comparável)" || bad "fingerprint falhou: rc=$rc ($(cat "$TD/out.txt"))"
+
+# 10g. --seed: semeia, estampa a fingerprint, não alerta, exit 0
+rm -f "$TD/base.tsv" "$TD/base.tsv.scanner-fp"; mk_scan "a.sh:1:C2:ca" "b.sh:2:C2:cb"; rm -f "$TD/base.tsv.scanner-fp"
+rc=$(run --seed)
+[ "$rc" = "0" ] && grep -q 'baseline semeado com 2 achado(s)' "$TD/out.txt" && [ "$(wc -l < "$TD/base.tsv" | tr -d ' ')" = "2" ] \
+  && [ "$(cat "$TD/base.tsv.scanner-fp")" = "$(shasum -a 256 "$TD/scan.sh" | awk '{print $1}')" ] \
+  && ok "--seed: exit 0, baseline com os 2 achados e a fingerprint do scanner estampada" || bad "--seed: rc=$rc baseline=$(wc -l < "$TD/base.tsv" 2>/dev/null) ($(head -1 "$TD/out.txt"))"
+
+# 10h. dry-run com achado NOVO: exit 0, lista o novo, diz que o baseline ficou INTACTO e não o toca
+printf 'x.sh\tC2\tc\t%s\n' "$NOW" > "$TD/base.tsv"; mk_scan "x.sh:1:C2:c" "novo.sh:2:C2:cn"; before=$(cat "$TD/base.tsv")
+rc=$(run)
+[ "$rc" = "0" ] && grep -q '1 NOVO(s)' "$TD/out.txt" && grep -q 'dry-run: baseline INTACTO' "$TD/out.txt" && [ "$(cat "$TD/base.tsv")" = "$before" ] \
+  && ok "dry-run com 1 NOVO: exit 0, avisa que o baseline está INTACTO e não o muda" || bad "dry-run com novo: rc=$rc ($(cat "$TD/out.txt"))"
+
+# 10i. NADA novo e nada re-escalado: exit 0 logo depois do resumo — sem a mensagem de dry-run e, com --notify, SEM chamar o notify
+printf 'x.sh\tC2\tc\t%s\n' "$NOW" > "$TD/base.tsv"; mk_scan "x.sh:1:C2:c"
+rc=$(run)
+[ "$rc" = "0" ] && grep -q '0 NOVO(s) | 0 re-escalado(s)' "$TD/out.txt" && ! grep -q 'dry-run' "$TD/out.txt" \
+  && ok "sem novidade: exit 0 só com o resumo (a mensagem de dry-run é de quando HÁ novidade)" || bad "sem novidade: rc=$rc ($(cat "$TD/out.txt"))"
+rm -f "$TD/n10_called"
+rc=$(run_in_n10 "$TD/notify_mark.sh" --notify)
+[ "$rc" = "0" ] && [ ! -f "$TD/n10_called" ] \
+  && ok "sem novidade + --notify: exit 0 e o notify NÃO é chamado (não alerta à toa)" || bad "sem novidade + --notify: rc=$rc notify=$([ -f "$TD/n10_called" ] && echo chamado || echo não)"
+
+# 10j/k. o alerta que não foi ENTREGUE não consome o achado: notify ausente ou que falha -> exit 3 e o baseline fica como estava (a próxima rodada re-tenta)
+printf 'x.sh\tC2\tc\t%s\n' "$NOW" > "$TD/base.tsv"; mk_scan "x.sh:1:C2:c" "novo.sh:2:C2:cn"; before=$(cat "$TD/base.tsv")
+rc=$(run_in_n10 /nao/existe/notify --notify)
+[ "$rc" = "3" ] && grep -q 'notify não encontrado' "$TD/out.txt" && [ "$(cat "$TD/base.tsv")" = "$before" ] \
+  && ok "notify ausente -> exit 3, diz que o baseline ficou INTACTO e não o muda" || bad "notify ausente: rc=$rc ($(cat "$TD/out.txt"))"
+rc=$(run_in_n10 /usr/bin/false --notify)
+[ "$rc" = "3" ] && grep -q 'notify falhou' "$TD/out.txt" && [ "$(cat "$TD/base.tsv")" = "$before" ] \
+  && ok "notify que falha -> exit 3 e o baseline fica INTACTO (a próxima rodada re-tenta)" || bad "notify que falha: rc=$rc ($(cat "$TD/out.txt"))"
+rc=$(run_in_n10 /usr/bin/true --notify)
+[ "$rc" = "0" ] && grep -q 'alertado e baseline atualizado' "$TD/out.txt" && grep -q 'cn' "$TD/base.tsv" \
+  && ok "CONTROLE: notify que entrega -> exit 0 e o NOVO entra no baseline (o exit 3 acima é condicional)" || bad "notify ok: rc=$rc ($(cat "$TD/out.txt"))"
+
 echo ""
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"
