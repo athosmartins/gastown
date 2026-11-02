@@ -833,6 +833,85 @@ EOF
   return 0
 }
 
+# orphan_delivery_state <git_dir> <is_container> <ref> <bead_id> (ga-6m6iocf)
+# Did THIS bead — its own id, not its parent's — ship a commit to <ref>? Echoes (rc always 0):
+#   found:<sha>  a commit on <ref> whose SUBJECT SCOPE is the exact bead id (feat(<id>):,
+#                fix(<id>):, Merge …/<id>:), and that does not only stage a pending-engine-window patch
+#   none         git answered, and no such commit exists
+#   unknown      git could not answer (repo/ref unreadable, `git log` or `git show` failed, empty arg)
+# THREE states, on purpose: only `found` may close a bead, and only `none` may strip a label. `unknown`
+# is neither — a git hiccup must not close a bead nor take a label off it (falhou != vazio).
+# WHY (ga-6m6iocf, 01/11): `bd create --parent` copies the parent's labels, so a follow-up is born with
+# the parent's story:done; the orphan-close branch trusted that label and closed wa-866v5f.2 and
+# wa-8nfp92.2 without a line of work. Exact id: scan_commit_subject_for_bead/token_bounded already
+# treat "<parent>.<n>" as one id, so a commit scoped `fix(wa-866v5f)` is NOT delivery of wa-866v5f.2.
+# vazio → no commit cites the id: `none`; falhou/ilegível → `unknown` (never `none`, never `found`).
+orphan_delivery_state() {
+  local gdir="$1" container="$2" ref="$3" id="$4" shas sha subj unknown=0
+  { [ -n "$gdir" ] && [ -n "$ref" ] && [ -n "$id" ]; } || { echo unknown; return 0; }
+  git_in "$gdir" "$container" rev-parse -q --verify "$ref" >/dev/null 2>&1 || { echo unknown; return 0; }
+  # vazio → shas="" and the loop is skipped (`none`); falhou → `git log` exits non-zero: `unknown`.
+  shas=$(git_in "$gdir" "$container" log "$ref" -F --grep="$id" --format='%H' 2>/dev/null) \
+    || { echo unknown; return 0; }
+  while IFS= read -r sha; do
+    [ -z "$sha" ] && continue
+    # falhou → this subject cannot be read, so it cannot be ruled out as the delivery: `unknown`.
+    if ! subj=$(git_in "$gdir" "$container" log -1 --format='%s' "$sha" 2>/dev/null); then
+      unknown=1; continue
+    fi
+    subject_impl_scopes_bead "$subj" "$id" || continue
+    # A patch-staging commit (docs/pending-engine-window only) names the id but ships nothing
+    # (ga-fbycg). falhou → the file list cannot be read, so docs-only cannot be ruled out: `unknown`.
+    if ! git_in "$gdir" "$container" show --name-only --format='' "$sha" >/dev/null 2>&1; then
+      unknown=1; continue
+    fi
+    commit_touches_only_pending_patch "$gdir" "$container" "$sha" && continue
+    echo "found:${sha}"; return 0
+  done <<EOF
+$shas
+EOF
+  if [ "$unknown" = "1" ]; then echo unknown; else echo none; fi
+  return 0
+}
+
+# orphan_state_merge <state_a> <state_b> — fold the verdicts of two repos (the rig's own, then the HQ
+# fallback for a foreign story). found beats everything (one repo holding the delivery is enough);
+# otherwise any unknown keeps the whole answer unknown (the repo we could not read may hold it); only
+# none+none is none. Anything that is not exactly found:<sha>/none counts as unknown (allowlist).
+orphan_state_merge() {
+  local a="$1" b="$2"
+  case "$a" in found:?*) echo "$a"; return 0 ;; esac
+  case "$b" in found:?*) echo "$b"; return 0 ;; esac
+  if [ "$a" = "none" ] && [ "$b" = "none" ]; then echo none; else echo unknown; fi
+}
+
+# janitor_orphan_decide <delivery_state> <sig_marker> <has_delivery_label>   (ga-6m6iocf)
+# The orphan-close branch: the bead carries story:done + story:approved and nobody finished it. A label
+# is a claim, not proof; the proof is a commit citing THIS bead's id (orphan_delivery_state). Echoes
+# "<verdict>:<reason>", verdict ∈ {close, reopen, keep}:
+#   found:<sha>                  → close:own-commit-in-origin-main   (as before, now with proof)
+#   none, no gate marker, no delivery:* → reopen:inherited-done-no-own-commit
+#        (strip the inherited story:done/gate:passed; story:approved stays, so it goes back to the
+#         build queue — the bead was never worked)
+#   none + this bead's own terminal gate marker → keep (the gate passed it but the merge commit does
+#        not cite the id: closing would be premature, stripping would erase real gate state; warn)
+#   none + any delivery:* label → keep (delivery labels carry holds and human confirmations; warn only)
+#   unknown / anything else      → keep:git-unreadable (inert: no close, no label change)
+# Allowlist: only `found:<sha>` (close) and `none` with an exact 0 / 0 (reopen) act; anything else,
+# a garbled or empty argument included, lands in keep.
+janitor_orphan_decide() {
+  local state="$1" sig_marker="$2" has_dlabel="$3"
+  case "$state" in
+    found:?*) echo "close:own-commit-in-origin-main"; return 0 ;;
+    none)
+      # Only an exact "0" proves "no marker"; "1", empty or garbled all hold (stripping is the act that needs proof).
+      if [ "$sig_marker" != "0" ]; then echo "keep:own-gate-marker-without-merge-commit"; return 0; fi
+      if [ "$has_dlabel" != "0" ]; then echo "keep:delivery-label-present-needs-review"; return 0; fi
+      echo "reopen:inherited-done-no-own-commit"; return 0 ;;
+  esac
+  echo "keep:git-unreadable"
+}
+
 # branch_merged <git_dir> <is_container> <branch_ref> <main_ref>
 # rc0 iff branch_ref resolves and is an ancestor of main_ref.
 branch_merged() {
@@ -1936,16 +2015,73 @@ EOF
       # fix. The bead keeps appearing in Aprovadas because:
       #   • The story:approved label was NOT removed (prior janitor left it).
       #   • The status is still "open" (prior janitor did not close it).
-      # Close + remove story:approved now to complete the durable terminal.
+      # Close + remove story:approved completes the durable terminal — but only on proof (see ga-6m6iocf below).
       # Guard: skip epics and delivery-active beads (delivery owns the terminal).
+      #
+      # ga-6m6iocf (01/11): the label is a CLAIM, not proof. `bd create --parent` copies the parent's
+      # labels, so a follow-up (wa-866v5f.2, wa-8nfp92.2) is born with the parent's story:done and
+      # this branch closed it without a line of work. It now closes only on a commit that cites THIS
+      # bead's exact id (janitor_orphan_decide / orphan_delivery_state — three states: found / none /
+      # unknown). `none` strips the inherited story:done (+gate:passed) so the still-approved bead
+      # goes back to the build queue; `unknown` (git unreadable) changes nothing. The git read is
+      # read-only, so dry-run runs it too and only the writes below are skipped.
       if [ "$S_REASON" = "already-story-done" ] && [ "$S_EPIC" = "0" ] \
-         && [ "$S_DELIV" = "0" ] && [ "$DRY_RUN" != "1" ]; then
-        bd -C "$RPATH" label remove "$SID" "story:approved"  -q 2>/dev/null || true
-        bd -C "$RPATH" label remove "$SID" "story:in-flight" -q 2>/dev/null || true
-        JORPHAN_MSG="merged-bead-janitor ($SOURCE_BEAD): orphan-close — story:done label was set by a prior janitor pass but the bead was never closed (story:approved not removed). Completing the durable terminal: story:approved removed, bead closed. Mirrors story-delivery ga-i53ua. wa-7nz9l/wa-14w76 shape."
-        bd -C "$RPATH" close "$SID" -r "$JORPHAN_MSG" 2>/dev/null \
-          && log "ORPHAN-CLOSED $SID ($RNAME) — already had story:done, closing now" \
-          || warn "orphan-close failed for $SID ($RNAME) (non-fatal; story:approved already removed)"
+         && [ "$S_DELIV" = "0" ]; then
+        # Same repo scoping as Signal A: a rig-native story is matched in its own rig repo only; the
+        # HQ repo is a fallback for a FOREIGN story in this rig's store.
+        O_STATE=$(orphan_delivery_state "$RGITDIR" "$RCONTAINER" "origin/$RDEFAULT" "$SID")
+        if [ "${O_STATE%%:*}" != "found" ] && [ "${SID%%-*}" != "$RPREFIX" ] && [ "$RGITDIR" != "$HQ_GITDIR" ]; then
+          O_STATE=$(orphan_state_merge "$O_STATE" "$(orphan_delivery_state "$HQ_GITDIR" "$HQ_CONTAINER" "origin/$HQ_DEFAULT" "$SID")")
+        fi
+        O_HAS_DLABEL=0; printf '%s' "$SLABELS" | grep -E '(^| )delivery:' >/dev/null && O_HAS_DLABEL=1
+        O_VERDICT=$(janitor_orphan_decide "$O_STATE" "$S_SIGMK" "$O_HAS_DLABEL")
+        O_REASON="${O_VERDICT#*:}"
+        case "${O_VERDICT%%:*}" in
+          close)
+            if [ "$DRY_RUN" = "1" ]; then
+              log "WOULD-ORPHAN-CLOSE $SID ($RNAME) — own commit proves delivery: ${O_STATE#found:}"
+            else
+              bd -C "$RPATH" label remove "$SID" "story:approved"  -q 2>/dev/null || true
+              bd -C "$RPATH" label remove "$SID" "story:in-flight" -q 2>/dev/null || true
+              JORPHAN_MSG="merged-bead-janitor ($SOURCE_BEAD): orphan-close — story:done label was set by a prior janitor pass but the bead was never closed (story:approved not removed), and a commit citing this bead's own id is in origin/main (${O_STATE#found:}). Completing the durable terminal: story:approved removed, bead closed. Mirrors story-delivery ga-i53ua. wa-7nz9l/wa-14w76 shape."
+              bd -C "$RPATH" close "$SID" -r "$JORPHAN_MSG" 2>/dev/null \
+                && log "ORPHAN-CLOSED $SID ($RNAME) — already had story:done and own commit ${O_STATE#found:}, closing now" \
+                || warn "orphan-close failed for $SID ($RNAME) (non-fatal; story:approved already removed)"
+            fi
+            ;;
+          reopen)
+            # Does the bead carry an inherited gate:passed? Read once; the dry-run line, the strip, the
+            # log line and the comment below all go by this flag.
+            O_GP=0; printf '%s' "$SLABELS" | grep -w "gate:passed" >/dev/null && O_GP=1
+            O_GP_TXT=""; [ "$O_GP" = "1" ] && O_GP_TXT=" (+gate:passed)"
+            if [ "$DRY_RUN" = "1" ]; then
+              log "WOULD-ORPHAN-REOPEN $SID ($RNAME) — story:done without any commit citing its own id: would strip story:done${O_GP_TXT}, keep story:approved, NOT close"
+            else
+              # gate:passed first, story:done last: story:done is the flag that makes the next sweep see
+              # a different bead, so only after IT is gone is the bead "reopened" and the comment posted
+              # (once). If gate:passed will not come off, story:done is left alone too: a half-stripped bead
+              # (no story:done, a stale gate:passed) would sit in the delivery queue with no commit behind
+              # it, so the bead stays exactly as it was and the next sweep tries again.
+              O_STRIP_OK=1
+              if [ "$O_GP" = "1" ]; then
+                bd -C "$RPATH" label remove "$SID" "gate:passed" -q 2>/dev/null \
+                  || { O_STRIP_OK=0; warn "could not remove inherited gate:passed from $SID ($RNAME) — story:done left in place too, the bead stays as it was; the next sweep retries"; }
+              fi
+              if [ "$O_STRIP_OK" = "1" ]; then
+                if bd -C "$RPATH" label remove "$SID" "story:done" -q 2>/dev/null; then
+                  log "ORPHAN-REOPENED $SID ($RNAME) — story:done had no commit citing the bead's own id: NOT closed; inherited story:done${O_GP_TXT} removed, story:approved kept"
+                  bd -C "$RPATH" comment "$SID" "merged-bead-janitor ($SOURCE_BEAD, ga-6m6iocf): this bead carried story:done (with story:approved) but origin/$RDEFAULT has no commit whose subject scope is its own id ($SID) — a parent's commit does not count. The label looks inherited from the parent (bd create --parent copies labels), so the janitor did NOT close it. Removed story:done$([ "$O_GP" = "1" ] && printf ' and gate:passed'); story:approved stays, so the bead is back in the build queue. If it was in fact delivered without a commit, close it by hand with the artifact as reason." 2>/dev/null || true
+                else
+                  warn "could not remove inherited story:done from $SID ($RNAME) — NOT closing it; the next sweep retries"
+                fi
+              fi
+            fi
+            ;;
+          *)
+            # keep: git unreadable, or a gate marker / delivery label that is real state. Not closed, nothing removed.
+            warn "orphan-close SKIPPED for $SID ($RNAME) — story:done without a commit citing its own id and the bead is left untouched ($O_REASON; delivery state: ${O_STATE%%:*})"
+            ;;
+        esac
       fi
     fi
   done <<EOF

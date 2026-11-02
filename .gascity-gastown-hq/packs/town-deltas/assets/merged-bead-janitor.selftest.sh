@@ -36,7 +36,8 @@ for fn in janitor_decide janitor_story_decide token_bounded scan_commit_for_bead
           commit_epoch commit_evidence_stale comments_for_bead commit_touches_only_pending_patch \
           terminal_passed_marker_epoch marker_evidence_stale \
           sling_beads_from_show sling_signals_for_id sling_fallback_eligible_reason \
-          iso_epoch story_gate_passed_grace_state; do
+          iso_epoch story_gate_passed_grace_state \
+          orphan_delivery_state orphan_state_merge janitor_orphan_decide; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by janitor"; exit 1; }
 done
 
@@ -2302,6 +2303,341 @@ grep -qF 'rig limrig (ga): 51 in_progress bead(s)' "$LIM_OUT" \
   && ok "in_progress sweep counted all 51 beads" || bad "in_progress sweep did not see 51 beads (bd list cut at 50): $(grep -F 'in_progress bead(s)' "$LIM_OUT" | head -1)"
 if lim_closed; then ok "the 51st in_progress bead (merged) is closed"; else bad "the 51st in_progress bead was never swept — bd list cut at 50"; fi
 eq "...and only that one was closed" "$(lim_closes)" "1"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ga-6m6iocf — the orphan-close branch closes ONLY on a commit that cites the bead's OWN id
+# ═════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "── ga-6m6iocf: orphan-close needs a commit citing the bead's OWN id (story:done is inherited from the parent) ──"
+# The incident (01/11, wa-866v5f.2 and wa-8nfp92.2): `bd create --parent` copies the parent's labels, so a
+# follow-up is born with the parent's story:done; the orphan-close branch trusted the label and closed the
+# bead without a line of work. The branch now asks git, with THREE answers: found (a commit scoped to the
+# EXACT id) / none / unknown (git could not answer). Only found closes; only none may strip a label;
+# unknown touches nothing (falhou != vazio). Proved three ways: the pure functions on a real git fixture,
+# the REAL sweep (the stub bd/gc harness of ga-botvu2 above, pointed at this fixture), and a battery of
+# mutants that must all die — with a control showing the same harness passes on the unmutated janitor.
+export GIT_CEILING_DIRECTORIES="$T"      # a fixture dir that is not a repo must NOT discover some parent repo
+OC="$T/orphan"; mkdir -p "$OC"
+OC_REAL_GIT=$(command -v git)
+
+# oc_commit <repo> <subject> [body] [file] — one commit with that subject (and body) touching that file
+oc_commit() {
+  local repo="$1" subj="$2" body="${3:-}" f="${4:-log}"
+  mkdir -p "$repo/$(dirname "$f")"; printf '%s\n' "$subj" >> "$repo/$f"
+  git -C "$repo" add -- "$f" >/dev/null 2>&1
+  if [ -n "$body" ]; then git -C "$repo" commit -q -m "$subj" -m "$body" >/dev/null 2>&1
+  else git -C "$repo" commit -q -m "$subj" >/dev/null 2>&1; fi
+}
+git init -q --bare -b main "$OC/origin.git"
+git init -q -b main "$OC/rig"
+git -C "$OC/rig" config user.email oc@selftest; git -C "$OC/rig" config user.name oc
+oc_commit "$OC/rig" "base"
+oc_commit "$OC/rig" "feat(ga-par): the parent story shipped";                OC_SHA_PAR=$(git -C "$OC/rig" rev-parse HEAD)
+oc_commit "$OC/rig" "fix(ga-own.1): the child that really shipped";          OC_SHA_OWN=$(git -C "$OC/rig" rev-parse HEAD)
+oc_commit "$OC/rig" "fix(ga-par.10): the tenth child of the same parent";    OC_SHA_P10=$(git -C "$OC/rig" rev-parse HEAD)
+oc_commit "$OC/rig" "chore(infra): unrelated cleanup" "follow-up of fix(ga-body.1): shipped later"
+oc_commit "$OC/rig" "docs(ga-eng.1): pending-engine-window patch" "" "docs/pending-engine-window/ga-eng.1-x.patch"
+git -C "$OC/rig" remote add origin "$OC/origin.git" && git -C "$OC/rig" push -q origin main >/dev/null 2>&1
+eq "fixture: origin/main holds all six commits" "$(git -C "$OC/rig" rev-list --count origin/main 2>/dev/null)" "6"
+
+# A git that fails ONE kind of read on demand (FAKE_GIT_FAIL): list = the `log --grep` that finds the
+# candidates; listrig = the same, but only against the rig repo; subject = the `log -1` that reads a subject;
+# show = the `show --name-only` that reads the file list. Everything else is the real git.
+mkdir -p "$OC/shim"
+cat > "$OC/shim/git" <<SHIM
+#!/bin/sh
+case "\${FAKE_GIT_FAIL:-}" in
+  list)    case " \$* " in *" log "*"--grep="*) exit 128 ;; esac ;;
+  listrig) case " \$* " in *" -C $OC/rig log "*"--grep="*) exit 128 ;; esac ;;
+  subject) case " \$* " in *" log -1 "*) exit 128 ;; esac ;;
+  show)    case " \$* " in *" show "*) exit 128 ;; esac ;;
+esac
+exec "$OC_REAL_GIT" "\$@"
+SHIM
+chmod +x "$OC/shim/git"
+oc_state()      { orphan_delivery_state "$OC/rig" 0 origin/main "$1"; }
+oc_state_fail() { ( export PATH="$OC/shim:$PATH" FAKE_GIT_FAIL="$1"; hash -r; orphan_delivery_state "$OC/rig" 0 origin/main "$2" ); }
+
+# The pure functions. Run against the real janitor here, and (muted) against every mutant below.
+oc_unit_checks() {
+  local s
+  # — orphan_delivery_state: only the bead's OWN id is delivery —
+  s=$(oc_state ga-own.1)
+  eq "child with its own fix(ga-own.1) commit → found" "${s%%:*}" "found"
+  eq "...and the sha is that commit's" "${s#found:}" "$OC_SHA_OWN"
+  s=$(oc_state ga-par)
+  eq "the parent, with its own feat(ga-par) commit → found" "${s#found:}" "$OC_SHA_PAR"
+  eq "THE INCIDENT: ga-par.1 (child of a delivered parent) → none; the parent's commit is not its delivery" "$(oc_state ga-par.1)" "none"
+  eq "...a second child, ga-par.2 → none" "$(oc_state ga-par.2)" "none"
+  s=$(oc_state ga-par.10)
+  eq "ga-par.10 has a commit of its own → found" "${s#found:}" "$OC_SHA_P10"
+  eq "ga-par.1 is NOT delivered by fix(ga-par.10): one whole id, not a prefix of another" "$(oc_state ga-par.1)" "none"
+  eq "an id named only in a commit BODY → none" "$(oc_state ga-body.1)" "none"
+  eq "a patch-staging commit (docs/pending-engine-window only) ships nothing → none" "$(oc_state ga-eng.1)" "none"
+  eq "a bead no commit mentions → none" "$(oc_state ga-nothing.1)" "none"
+  # — git that cannot answer is `unknown`: never `none` (which may strip a label), never `found` (which closes) —
+  eq "ref that does not exist → unknown"        "$(orphan_delivery_state "$OC/rig" 0 origin/nope ga-own.1)" "unknown"
+  eq "git dir that does not exist → unknown"    "$(orphan_delivery_state "$OC/not-a-repo" 0 origin/main ga-own.1)" "unknown"
+  eq "empty git dir → unknown"                  "$(orphan_delivery_state "" 0 origin/main ga-own.1)" "unknown"
+  eq "empty ref → unknown"                      "$(orphan_delivery_state "$OC/rig" 0 "" ga-own.1)" "unknown"
+  eq "empty id → unknown"                       "$(orphan_delivery_state "$OC/rig" 0 origin/main "")" "unknown"
+  eq "the candidate search (git log --grep) failing → unknown, not none" "$(oc_state_fail list ga-par.1)" "unknown"
+  eq "...also for a bead that WOULD be found"   "$(oc_state_fail list ga-own.1)" "unknown"
+  eq "reading a candidate's subject failing → unknown" "$(oc_state_fail subject ga-own.1)" "unknown"
+  eq "reading a candidate's file list failing → unknown (docs-only cannot be ruled out)" "$(oc_state_fail show ga-own.1)" "unknown"
+  eq "...also on the docs-only commit"          "$(oc_state_fail show ga-eng.1)" "unknown"
+  # — orphan_state_merge: two repos; found wins, and a repo we could not read may hold the delivery —
+  eq "merge: found + none → found"              "$(orphan_state_merge found:abc none)" "found:abc"
+  eq "merge: none + found → found"              "$(orphan_state_merge none found:abc)" "found:abc"
+  eq "merge: unknown + found → found"           "$(orphan_state_merge unknown found:abc)" "found:abc"
+  eq "merge: none + none → none"                "$(orphan_state_merge none none)" "none"
+  eq "merge: none + unknown → unknown"          "$(orphan_state_merge none unknown)" "unknown"
+  eq "merge: unknown + none → unknown"          "$(orphan_state_merge unknown none)" "unknown"
+  eq "merge: unknown + unknown → unknown"       "$(orphan_state_merge unknown unknown)" "unknown"
+  eq "merge: garbage + none → unknown (allowlist)" "$(orphan_state_merge garbage none)" "unknown"
+  eq "merge: empty + empty → unknown"           "$(orphan_state_merge '' '')" "unknown"
+  eq "merge: 'found:' with no sha is not found" "$(orphan_state_merge 'found:' none)" "unknown"
+  # — janitor_orphan_decide: <state> <own gate marker 0|1> <delivery:* label 0|1> —
+  eq "decide: found → close"                    "$(janitor_orphan_decide found:abc 0 0)" "close:own-commit-in-origin-main"
+  eq "decide: found beats a marker and a delivery label (an own commit is proof)" "$(janitor_orphan_decide found:abc 1 1)" "close:own-commit-in-origin-main"
+  eq "decide: none, no marker, no delivery label → reopen (the inherited story:done goes)" "$(janitor_orphan_decide none 0 0)" "reopen:inherited-done-no-own-commit"
+  eq "decide: none + the bead's own terminal gate marker → keep" "$(janitor_orphan_decide none 1 0)" "keep:own-gate-marker-without-merge-commit"
+  eq "decide: none + a delivery:* label → keep" "$(janitor_orphan_decide none 0 1)" "keep:delivery-label-present-needs-review"
+  eq "decide: none + marker flag empty → keep (stripping needs proof)" "$(janitor_orphan_decide none '' 0 | cut -d: -f1)" "keep"
+  eq "decide: none + marker flag garbled → keep"     "$(janitor_orphan_decide none x 0 | cut -d: -f1)" "keep"
+  eq "decide: none + delivery flag empty → keep"     "$(janitor_orphan_decide none 0 '' | cut -d: -f1)" "keep"
+  eq "decide: none + delivery flag garbled → keep"   "$(janitor_orphan_decide none 0 x | cut -d: -f1)" "keep"
+  eq "decide: unknown → keep (inert)"           "$(janitor_orphan_decide unknown 0 0)" "keep:git-unreadable"
+  eq "decide: unknown never acts, whatever else is set" "$(janitor_orphan_decide unknown 1 1 | cut -d: -f1)" "keep"
+  eq "decide: empty state → keep"               "$(janitor_orphan_decide '' 0 0 | cut -d: -f1)" "keep"
+  eq "decide: garbage state → keep"             "$(janitor_orphan_decide banana 0 0 | cut -d: -f1)" "keep"
+  eq "decide: 'found' with no sha → keep"       "$(janitor_orphan_decide found 0 0 | cut -d: -f1)" "keep"
+  eq "decide: 'found:' with an empty sha → keep" "$(janitor_orphan_decide 'found:' 0 0 | cut -d: -f1)" "keep"
+}
+oc_unit_checks
+
+# — the REAL sweep: the ga-botvu2 harness (bv_fixture / bv_sweep) pointed at $OC/rig, the bead id swapped in,
+#   a git shim in front of the real git, and a bd wrapper that serves the gate-marker read when OC_MARKER is set —
+oc_fixture() {   # <bead id> <labels> [gate hand-off stamp age|-]
+  local id="$1" labels="$2" pa="${3:--}"
+  bv_fixture 7200 "$labels" "$pa" -
+  jq --arg id "$id" '.[0].id = $id' "$BV_D/stories.json" > "$BV_D/stories.tmp" && mv "$BV_D/stories.tmp" "$BV_D/stories.json"
+  sed "s#$BV/rig#$OC/rig#" "$BV_D/bin/gc" > "$BV_D/bin/gc.new" && mv "$BV_D/bin/gc.new" "$BV_D/bin/gc"
+  mv "$BV_D/bin/bd" "$BV_D/bin/bd.real"
+  cat > "$BV_D/bin/bd" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+  *" type:quality-gate-marker "*)
+    if [ -n "${OC_MARKER:-}" ]; then printf '[{"id":"ga-mk1","status":"closed","labels":["type:quality-gate-marker","gate-status:passed"]}]'; else printf '[]'; fi
+    exit 0 ;;
+esac
+# OC_FAIL_REMOVE=<label>: `label remove <id> <label>` fails and writes nothing (an injected bd failure)
+if [ -n "${OC_FAIL_REMOVE:-}" ]; then
+  case " $* " in *" label remove "*" $OC_FAIL_REMOVE "*) echo "Error: injected failure" >&2; exit 1 ;; esac
+fi
+exec "$(dirname "$0")/bd.real" "$@"
+STUB
+  cp "$OC/shim/git" "$BV_D/bin/git"
+  chmod +x "$BV_D/bin/gc" "$BV_D/bin/bd" "$BV_D/bin/git"
+}
+oc_sweep() { bv_sweep -; }
+oc_run()   { oc_fixture "$@"; oc_sweep; }
+oc_with()  { local k="$1" v="$2"; shift 2; export "$k=$v"; "$@"; local rc=$?; unset "$k"; return $rc; }
+# oc_make_hq <dir> <subject> — make the HQ city dir a git repo whose origin/main holds one commit
+oc_make_hq() {
+  git init -q -b main "$1" >/dev/null 2>&1; git init -q --bare -b main "$1.origin.git" >/dev/null 2>&1
+  git -C "$1" config user.email oc@selftest; git -C "$1" config user.name oc
+  oc_commit "$1" "$2"
+  git -C "$1" remote add origin "$1.origin.git" && git -C "$1" push -q origin main >/dev/null 2>&1
+}
+oc_out_has() { grep -qF -- "$1" "$BV_OUT"; }
+oc_log_has() { grep -qF -- "$1" "$BV_LOG"; }
+oc_closed()  { oc_log_has " close $1 "; }
+oc_wrote()   { grep -qF -e " label add $1 " -e " label remove $1 " -e " close $1 " -e " comment $1 " -e " update $1 " "$BV_LOG"; }
+# oc_untouched <bead id> <labels it must still have> <what> — no write at all, labels as they were, said out loud
+oc_untouched() {
+  local id="$1" want="$2" what="$3"
+  if oc_wrote "$id"; then bad "$what: the bead was written to: $(grep -F " $id " "$BV_LOG" | head -3 | tr '\n' ';')"; else ok "$what: the bead is untouched"; fi
+  eq "$what: labels unchanged" "$(bv_labels)" "$want"
+  if oc_out_has "orphan-close SKIPPED for $id"; then ok "$what: the sweep says SKIPPED out loud"; else bad "$what: no 'orphan-close SKIPPED' line: $(grep -F "$id" "$BV_OUT" | head -2 | tr '\n' ';')"; fi
+}
+
+oc_e2e_core() {
+  local n1 n2 mode
+  # (a) THE INCIDENT — born with the parent's story:done; the parent shipped, the child was never worked
+  oc_run ga-par.1 "story:approved story:done"
+  if oc_closed ga-par.1; then bad "(a) the child with an inherited story:done and NO commit of its own was CLOSED (the 01/11 incident)"; else ok "(a) child with inherited story:done and no commit of its own → NOT closed"; fi
+  eq "(a) the inherited story:done is gone, story:approved stays (back in the build queue)" "$(bv_labels)" "story:approved"
+  if oc_out_has "ORPHAN-REOPENED ga-par.1"; then ok "(a) the log says ORPHAN-REOPENED"; else bad "(a) no ORPHAN-REOPENED line: $(grep -F ga-par.1 "$BV_OUT" | head -2 | tr '\n' ';')"; fi
+  eq "(a) one comment explains it to whoever opens the bead" "$(grep -cF ' comment ga-par.1 ' "$BV_LOG")" "1"
+  oc_sweep
+  if oc_wrote ga-par.1; then bad "(a) the NEXT sweep wrote to the bead again (flapping): $(grep -F ga-par.1 "$BV_LOG" | head -3 | tr '\n' ';')"; else ok "(a) the next sweep leaves it alone (no flapping)"; fi
+  # (a2) an inherited gate:passed goes too, and goes FIRST: story:done is the flag that makes the next sweep see another bead
+  oc_run ga-par.1 "story:approved story:done gate:passed" 7200
+  eq "(a2) inherited gate:passed + story:done → both removed, story:approved stays" "$(bv_labels)" "story:approved"
+  n1=$(grep -nF ' label remove ga-par.1 gate:passed' "$BV_LOG" | head -1 | cut -d: -f1)
+  n2=$(grep -nF ' label remove ga-par.1 story:done' "$BV_LOG" | head -1 | cut -d: -f1)
+  if [ -n "$n1" ] && [ -n "$n2" ] && [ "$n1" -lt "$n2" ]; then ok "(a2) gate:passed is removed BEFORE story:done"; else bad "(a2) removal order wrong or missing (gate:passed@${n1:-none}, story:done@${n2:-none})"; fi
+  # (b) the bead's OWN commit → closes, as before
+  oc_run ga-own.1 "story:approved story:done"
+  if oc_closed ga-own.1; then ok "(b) a bead with a commit of its own (fix(ga-own.1)) → closed, as before"; else bad "(b) the own-commit bead was NOT closed: $(grep -F ga-own.1 "$BV_OUT" | head -3 | tr '\n' ';')"; fi
+  if grep -F ' close ga-own.1 ' "$BV_LOG" | grep -qF "$OC_SHA_OWN"; then ok "(b) the close reason cites that commit's sha"; else bad "(b) the close reason does not cite $OC_SHA_OWN"; fi
+  if oc_log_has ' label remove ga-own.1 story:approved'; then ok "(b) story:approved removed before the close, as before"; else bad "(b) story:approved was not removed"; fi
+  oc_run ga-par "story:approved story:done"
+  if oc_closed ga-par; then ok "(b) the parent, whose own commit IS feat(ga-par) → closed"; else bad "(b) the parent with its own commit was not closed"; fi
+  # (c) git cannot answer → nothing changes (falhou != vazio)
+  oc_with FAKE_GIT_FAIL list oc_run ga-par.1 "story:approved story:done"
+  oc_untouched ga-par.1 "story:approved story:done" "(c) git log --grep failing, child of a delivered parent"
+  if oc_out_has "delivery state: unknown"; then ok "(c) the SKIPPED line names the state: unknown"; else bad "(c) the SKIPPED line does not say 'delivery state: unknown'"; fi
+  for mode in list subject show; do
+    oc_with FAKE_GIT_FAIL "$mode" oc_run ga-own.1 "story:approved story:done"
+    if oc_closed ga-own.1; then bad "(c) git '$mode' failing: the bead was CLOSED on a read that did not answer"; else ok "(c) git '$mode' failing: a bead that WOULD close is not closed"; fi
+    oc_untouched ga-own.1 "story:approved story:done" "(c) git '$mode' failing, bead with its own commit"
+  done
+  # (d) dry-run: the git read still happens (it is read-only), every write is skipped
+  oc_with BV_DRY 1 oc_run ga-par.1 "story:approved story:done"
+  if oc_wrote ga-par.1; then bad "(d) dry-run wrote to the bead"; else ok "(d) dry-run: no write on the inherited-done child"; fi
+  if oc_out_has "WOULD-ORPHAN-REOPEN ga-par.1"; then ok "(d) dry-run says WOULD-ORPHAN-REOPEN"; else bad "(d) no WOULD-ORPHAN-REOPEN line"; fi
+  oc_with BV_DRY 1 oc_run ga-own.1 "story:approved story:done"
+  if oc_wrote ga-own.1; then bad "(d) dry-run wrote to the own-commit bead"; else ok "(d) dry-run: no write on the own-commit bead"; fi
+  if oc_out_has "WOULD-ORPHAN-CLOSE ga-own.1"; then ok "(d) dry-run says WOULD-ORPHAN-CLOSE"; else bad "(d) no WOULD-ORPHAN-CLOSE line"; fi
+  # (e) the bead's own terminal gate marker is real state: no commit citing the id → held, not stripped, not closed
+  oc_with OC_MARKER 1 oc_run ga-par.1 "story:approved story:done"
+  oc_untouched ga-par.1 "story:approved story:done" "(e) the bead's own gate:passed marker, no commit citing it"
+  # (f) a delivery:* label carries holds and human confirmations: held, not stripped, not closed
+  oc_run ga-par.1 "story:approved story:done delivery:partial"
+  oc_untouched ga-par.1 "story:approved story:done delivery:partial" "(f) a delivery:partial label, no commit citing the id"
+  # (g) a FOREIGN story in this rig's store is also looked up in the HQ repo
+  oc_run wa-fx.1 "story:approved story:done"
+  oc_untouched wa-fx.1 "story:approved story:done" "(g1) foreign story, no commit in the rig, HQ repo unreadable"
+  oc_fixture wa-fx.1 "story:approved story:done"; oc_make_hq "$BV_D/city" "fix(wa-fx.1): delivered from the HQ repo"; oc_sweep
+  if oc_closed wa-fx.1; then ok "(g2) foreign story whose own commit is in the HQ repo → closed"; else bad "(g2) the HQ commit was not found: $(grep -F wa-fx.1 "$BV_OUT" | head -2 | tr '\n' ';')"; fi
+  oc_fixture wa-fx.1 "story:approved story:done"; oc_make_hq "$BV_D/city" "chore(infra): nothing about it"
+  oc_with FAKE_GIT_FAIL listrig oc_sweep
+  oc_untouched wa-fx.1 "story:approved story:done" "(g3) foreign story, RIG repo unreadable, HQ repo clean"
+  oc_fixture wa-fx.1 "story:approved story:done"; oc_make_hq "$BV_D/city" "chore(infra): nothing about it"; oc_sweep
+  if oc_closed wa-fx.1; then bad "(g4) foreign story with no commit anywhere was CLOSED"; else ok "(g4) foreign story with no commit in either repo → not closed"; fi
+  eq "(g4) ...its inherited story:done is removed" "$(bv_labels)" "story:approved"
+  # (h1) the inherited gate:passed will not come off: story:done stays too, and nothing is claimed in a comment.
+  # A half-stripped bead (no story:done, stale gate:passed) would sit in the delivery queue with no commit behind it.
+  oc_with OC_FAIL_REMOVE gate:passed oc_run ga-par.1 "story:approved story:done gate:passed" 7200
+  eq "(h1) gate:passed removal failing: the labels are exactly as they were" "$(bv_labels)" "story:approved story:done gate:passed"
+  if oc_log_has ' label remove ga-par.1 story:done'; then bad "(h1) story:done was removed although gate:passed would not come off"; else ok "(h1) story:done is not touched when gate:passed will not come off"; fi
+  if oc_log_has ' comment ga-par.1 '; then bad "(h1) a comment was posted although nothing was stripped"; else ok "(h1) no comment claims a strip that did not happen"; fi
+  if oc_out_has "could not remove inherited gate:passed from ga-par.1"; then ok "(h1) the failure is said out loud"; else bad "(h1) no WARN about the gate:passed removal: $(grep -F ga-par.1 "$BV_OUT" | head -2 | tr '\n' ';')"; fi
+  if oc_out_has "ORPHAN-REOPENED ga-par.1"; then bad "(h1) the log says ORPHAN-REOPENED for a bead that was not reopened"; else ok "(h1) no ORPHAN-REOPENED for a bead that was not reopened"; fi
+  oc_sweep
+  eq "(h1) the next sweep (bd healthy again) finishes the job" "$(bv_labels)" "story:approved"
+  # (h2) story:done will not come off (gate:passed already did): not closed, no comment, and the retry completes it
+  oc_with OC_FAIL_REMOVE story:done oc_run ga-par.1 "story:approved story:done gate:passed" 7200
+  if oc_closed ga-par.1; then bad "(h2) the bead was closed although story:done would not come off"; else ok "(h2) story:done removal failing: not closed"; fi
+  if oc_log_has ' comment ga-par.1 '; then bad "(h2) a comment was posted although story:done is still there"; else ok "(h2) no comment while story:done is still there"; fi
+  if oc_out_has "could not remove inherited story:done from ga-par.1"; then ok "(h2) the failure is said out loud"; else bad "(h2) no WARN about the story:done removal"; fi
+  oc_sweep
+  eq "(h2) the retry reopens it" "$(bv_labels)" "story:approved"
+  eq "(h2) ...with exactly one comment" "$(grep -cF ' comment ga-par.1 ' "$BV_LOG")" "1"
+}
+oc_e2e_core
+
+# — drift-guard: the sweep feeds the decision what it expects, in this order —
+grep -qF 'O_STATE=$(orphan_delivery_state "$RGITDIR" "$RCONTAINER" "origin/$RDEFAULT" "$SID")' "$JANITOR" \
+  && ok "orphan branch reads the delivery from the rig's own repo first" || bad "orphan branch does not read orphan_delivery_state from the rig repo"
+grep -qF 'janitor_orphan_decide "$O_STATE" "$S_SIGMK" "$O_HAS_DLABEL"' "$JANITOR" \
+  && ok "orphan branch decides on (state, own gate marker, delivery label) in that order" || bad "orphan branch's janitor_orphan_decide call drifted"
+
+# — mutants: each breaks ONE thing the fix depends on; every one must die —
+OC_MUT="$T/oc-mut"; mkdir -p "$OC_MUT"
+OC_MUT_AWK='
+BEGIN { F = ENVIRON["OC_F"]; OLD = ENVIRON["OC_OLD"]; NEW = ENVIRON["OC_NEW"]; inf = (F == "") }
+{
+  line = $0
+  if (!inf && index(line, F "() {") == 1) inf = 1
+  hit = (inf && index(line, OLD) > 0)
+  if (hit) cnt++
+  if (hit && mode == "replace" && !done) { i = index(line, OLD); line = substr(line, 1, i - 1) NEW substr(line, i + length(OLD)); done = 1 }
+  if (mode == "replace") print line
+  if (F != "" && inf && $0 == "}") inf = 0
+}
+END { if (mode == "count") print cnt + 0 }'
+# oc_mutate_file <src> <dst> <function|-> <old> <new> — dst = src with ONE snippet replaced, only inside that
+# function ("-" = anywhere). The snippet must match exactly one line there: a mutation that lands on the wrong
+# line, or on none, proves nothing, so it is a test failure and not a skipped mutant.
+oc_mutate_file() {
+  local src="$1" dst="$2" fn="$3" old="$4" new="$5" cnt
+  [ "$fn" = "-" ] && fn=""
+  cnt=$(OC_F="$fn" OC_OLD="$old" OC_NEW="$new" awk -v mode=count "$OC_MUT_AWK" "$src")
+  [ "$cnt" = "1" ] || { bad "mutant file $(basename "$dst"): the snippet matches $cnt lines in ${fn:-the file} (need exactly 1): $old"; return 1; }
+  OC_F="$fn" OC_OLD="$old" OC_NEW="$new" awk -v mode=replace "$OC_MUT_AWK" "$src" > "$dst"
+}
+# oc_mutant_ok <name> — the finished mutant differs from the janitor and still parses (a syntax error would "kill" any test for the wrong reason)
+oc_mutant_ok() {
+  local f="$OC_MUT/$1.sh"
+  [ -s "$f" ] || { bad "mutant $1: not built"; return 1; }
+  if cmp -s "$JANITOR" "$f"; then bad "mutant $1: identical to the janitor, the mutation changed nothing"; return 1; fi
+  bash -n "$f" 2>/dev/null || { bad "mutant $1: does not parse — it would die for the wrong reason"; return 1; }
+}
+# oc_trial <name> <unit|e2e|both> — the SAME checks, muted, against $OC_MUT/<name>.sh in a subshell with a
+# write cap. OC_TRIAL_RC: 0 = some check failed (killed), 1 = every check held (survived), else harness error.
+oc_trial() {
+  local name="$1" what="$2" f="$OC_MUT/$1.sh"
+  : > "$OC_MUT/$name.first"
+  (
+    ulimit -f 524288 2>/dev/null || true
+    MUT_N=0
+    ok()  { :; }
+    bad() { MUT_N=$((MUT_N+1)); [ "$MUT_N" = 1 ] && printf '%s' "$*" > "$OC_MUT/$name.first"; return 0; }
+    JANITOR="$f"; BV="$OC_MUT/bv-$name"; mkdir -p "$BV"
+    JANITOR_LIB_ONLY=1 source "$f" || exit 99
+    case "$what" in unit|both) oc_unit_checks ;; esac
+    case "$what" in e2e|both)  oc_e2e_core ;; esac
+    [ "$MUT_N" -gt 0 ] && exit 0
+    exit 1
+  ) >/dev/null 2>&1
+  OC_TRIAL_RC=$?
+}
+oc_expect_dead() {   # <name> <unit|e2e|both> <what it breaks>
+  oc_mutant_ok "$1" || return 0
+  oc_trial "$1" "$2"
+  case "$OC_TRIAL_RC" in
+    0) ok "mutant $1 DIES — $3 [first failing check: $(head -c 160 "$OC_MUT/$1.first")]" ;;
+    1) bad "mutant $1 SURVIVED — $3: no check noticed" ;;
+    *) bad "mutant $1: the trial harness failed (rc=$OC_TRIAL_RC), which proves nothing" ;;
+  esac
+}
+
+# control: the SAME harness on the unmodified janitor must find nothing wrong, or a "kill" below means nothing
+cp "$JANITOR" "$OC_MUT/control.sh"
+oc_trial control both
+if [ "$OC_TRIAL_RC" = "1" ]; then ok "control: the mutant harness passes on the unmutated janitor (a kill below is the mutation's doing)"
+else bad "control: the mutant harness is not clean on the unmutated janitor (rc=$OC_TRIAL_RC): $(head -c 200 "$OC_MUT/control.first")"; fi
+
+# THE acceptance mutant: swap the bead's exact id for its parent's prefix
+oc_mutate_file "$JANITOR" "$OC_MUT/m1.0" orphan_delivery_state '-F --grep="$id"' '-F --grep="${id%%.*}"' \
+  && oc_mutate_file "$OC_MUT/m1.0" "$OC_MUT/m1.sh" orphan_delivery_state 'subject_impl_scopes_bead "$subj" "$id"' 'subject_impl_scopes_bead "$subj" "${id%%.*}"'
+oc_expect_dead m1 both "exact id swapped for the parent's prefix"
+oc_mutate_file "$JANITOR" "$OC_MUT/m1b.sh" orphan_delivery_state 'subject_impl_scopes_bead "$subj" "$id" || continue' 'case "$subj" in *"$id"*) ;; *) continue ;; esac'
+oc_expect_dead m1b unit "id matched as a substring of the subject, not as a whole token"
+oc_mutate_file "$JANITOR" "$OC_MUT/m2.sh" orphan_delivery_state "--format='%H' 2>/dev/null) \\" "--format='%H' 2>/dev/null) || true \\"
+oc_expect_dead m2 both "a failing git log reads as an empty answer (falhou == vazio)"
+oc_mutate_file "$JANITOR" "$OC_MUT/m3.sh" orphan_delivery_state 'if ! subj=$(git_in "$gdir" "$container" log -1 --format='"'"'%s'"'"' "$sha" 2>/dev/null); then' 'subj=$(git_in "$gdir" "$container" log -1 --format='"'"'%s'"'"' "$sha" 2>/dev/null); if false; then'
+oc_expect_dead m3 unit "an unreadable subject is ignored instead of making the answer unknown"
+oc_mutate_file "$JANITOR" "$OC_MUT/m4.sh" orphan_delivery_state 'if ! git_in "$gdir" "$container" show --name-only --format='"'"''"'"' "$sha" >/dev/null 2>&1; then' 'git_in "$gdir" "$container" show --name-only --format='"'"''"'"' "$sha" >/dev/null 2>&1; if false; then'
+oc_expect_dead m4 unit "an unreadable file list is ignored (docs-only cannot be ruled out, yet it is called found)"
+oc_mutate_file "$JANITOR" "$OC_MUT/m5.sh" janitor_orphan_decide 'if [ "$sig_marker" != "0" ]; then' 'if false; then'
+oc_expect_dead m5 unit "the bead's own gate marker no longer holds the strip"
+oc_mutate_file "$JANITOR" "$OC_MUT/m5b.sh" janitor_orphan_decide 'if [ "$has_dlabel" != "0" ]; then' 'if false; then'
+oc_expect_dead m5b unit "a delivery:* label no longer holds the strip"
+oc_mutate_file "$JANITOR" "$OC_MUT/m6.sh" janitor_orphan_decide 'echo "keep:git-unreadable"' 'echo "close:mutant-unreadable"'
+oc_expect_dead m6 unit "an unreadable / garbled state closes the bead"
+oc_mutate_file "$JANITOR" "$OC_MUT/m7.sh" orphan_state_merge 'else echo unknown; fi' 'else echo none; fi'
+oc_expect_dead m7 unit "none + unknown folds to none (the unread repo may hold the delivery)"
+oc_mutate_file "$JANITOR" "$OC_MUT/m8.sh" - 'O_VERDICT=$(janitor_orphan_decide "$O_STATE" "$S_SIGMK" "$O_HAS_DLABEL")' 'O_VERDICT="close:mutant"'
+oc_expect_dead m8 e2e "the sweep closes without consulting the decision (the pre-fix behaviour)"
+oc_mutate_file "$JANITOR" "$OC_MUT/m9.sh" - 'O_STATE=$(orphan_state_merge "$O_STATE" "$(orphan_delivery_state "$HQ_GITDIR" "$HQ_CONTAINER" "origin/$HQ_DEFAULT" "$SID")")' 'O_STATE=$(orphan_delivery_state "$HQ_GITDIR" "$HQ_CONTAINER" "origin/$HQ_DEFAULT" "$SID")'
+oc_expect_dead m9 e2e "the HQ verdict replaces the rig's instead of being folded with it"
+oc_mutate_file "$JANITOR" "$OC_MUT/m10.sh" - 'O_STRIP_OK=0; warn "could not remove inherited gate:passed' 'O_STRIP_OK=1; warn "could not remove inherited gate:passed'
+oc_expect_dead m10 e2e "a failed gate:passed removal no longer stops the strip (half-stripped bead + a comment that claims otherwise)"
+unset GIT_CEILING_DIRECTORIES
 
 echo ""
 echo "──────────────────────────────────────────"
