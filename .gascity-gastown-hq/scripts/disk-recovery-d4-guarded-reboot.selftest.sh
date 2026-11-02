@@ -184,7 +184,7 @@ chk "NO_REAL_REBOOT sem stub: osascript NÃO foi chamado e a marca foi desfeita"
 section "o pedido estoura o prazo: não sei se pegou"
 mk_case rb_to; setenv "DR4_REBOOT_CMD=sleep 5"; setenv "DR4_REBOOT_TIMEOUT_S=1"
 run_sut --run
-chk "pedido que estoura o prazo espera como se tivesse pegado (não 'falhou'; veio $RC: $OUT)" '[ "$RC" = 20 ] && contains "continuou no ar" && ! contains "falhou" && contains "não sei se pegou" && ! contains "aceito (rc 0)"'
+chk "pedido que estoura o prazo espera como se tivesse pegado (não 'falhou'; veio $RC: $OUT)" '[ "$RC" = 20 ] && contains "continuou no ar" && ! contains "falhou" && contains "não sei se pegou" && ! contains "aceito (rc 0)" && state_has "pending_mark=$NOW"'
 
 section "o pedido falha / não derruba o mini"
 mk_case rb_fail; echo 1 > "$C/reboot.rc"
@@ -203,7 +203,7 @@ mk_case rb_up   # reboot.rc 0 e o stub não mata ninguém
 run_sut --run
 check "mini vivo depois do pedido: rc 20 (veio $RC: $OUT)" [ "$RC" = 20 ]
 check "mini vivo depois do pedido: uma linha" one_line
-chk "mini vivo depois do pedido: diz que NÃO reiniciou, desfez a marca e avisou" 'contains "NÃO reiniciou" && contains "aceito (rc 0)" && ! state_has "reboots=$NOW" && grep -q "NÃO caiu" "$C/notify.log"'
+chk "mini vivo depois do pedido: diz que NÃO reiniciou (até agora), MANTÉM a marca como PENDENTE com o boot de referência e a espera de 30 min, e avisou (ga-1p1i5jr.4.3: antes soltava a marca)" 'contains "NÃO reiniciou" && contains "PENDENTE" && contains "aceito (rc 0)" && state_has "reboots=$NOW" && state_has "pending_mark=$NOW" && state_has "pending_boot=$BOOT" && state_has "defer_until=$((NOW + 1800))" && grep -q "NÃO caiu" "$C/notify.log"'
 
 section "o AVISO não saiu: sem aviso CONFIRMADO não reinicia, e ninguém carimba 'já avisei' sem entrega (gate ga-24wp723)"
 mk_case nt_ok; touch "$C/reboot.dies"; run_sut --run
@@ -302,7 +302,7 @@ mk_case sx_big; echo "reboots=99999999999999" > "$C/state"
 run_sut --run;  expect_no_reboot "número gigante (14 dígitos) é ilegível, não aritmética muda (senão virava 'cooldown')" 30 "estado do D4"
 mk_case sx_dir; mkdir "$C/state"
 run_sut --run;  expect_no_reboot "estado que é um DIRETÓRIO (existe e não é arquivo legível)" 30 "não é um arquivo legível"
-for k in defer_until defer_notify_ts esc_for; do
+for k in defer_until defer_notify_ts esc_for pending_mark pending_boot; do
   mk_case "sx_k_$k"; echo "$k=x1" > "$C/state"
   run_sut --run;  expect_no_reboot "estado com $k não numérico" 30 "$k"
 done
@@ -481,7 +481,7 @@ chk "envio começou durante o aviso: rc 10, NÃO pediu reinício, nenhuma marca,
 check "envio começou durante o aviso: diz 'cancelado' no aviso" grep -q "cancelado" "$C/notify.log"
 mk_case re_off; echo "touch '$C/off'" > "$C/notify.hook"; setenv "DR4_GRACE_S=3"
 run_sut --run
-chk "interruptor ligado durante a carência: rc 10, não reiniciou (veio $RC: $OUT)" '[ "$RC" = 10 ] && no_reboot'
+chk "interruptor ligado durante a carência: rc 10, não reiniciou, e NÃO grava espera (é um humano mandando calar; o passo 1 o respeita sozinho; veio $RC: $OUT)" '[ "$RC" = 10 ] && no_reboot && ! state_has "defer_until=[1-9]"'
 mk_case re_disk; setenv "DR4_FREE_MB_OVERRIDE="; echo 2048000 > "$C/df.kb"; echo "echo 4096000 > '$C/df.kb'" > "$C/notify.hook"
 run_sut --run
 chk "disco recuperou durante a carência: rc 10, não reiniciou (veio $RC: $OUT)" '[ "$RC" = 10 ] && no_reboot'
@@ -502,6 +502,111 @@ run_sut --run;  check "trava com pid VIVO mas criada ANTES do boot atual (pid re
 kill "$LP" 2>/dev/null; wait "$LP" 2>/dev/null
 mk_case lock_dead; mkdir "$C/state.lock.d"; echo 99999 > "$C/state.lock.d/pid"; touch "$C/reboot.dies"
 run_sut --run;  check "trava com pid MORTO é tomada e o D4 segue (kill 143; veio $RC: $OUT)" [ "$RC" = 143 ]
+
+# ═══ ga-1p1i5jr.4.3 — os 3 pontos que o revisor do gate (ga-24wp723) deixou de fora ═════════════════════════════════════════════════
+n_warn() { grep -c 'reiniciando o mini em' "$C/notify.log"; }   # avisos "reiniciando em Ns" que saíram (o de cancelamento tem outro título)
+
+section "pedido PENDENTE: o mini não caiu em WAIT_S mas pode cair depois (ga-1p1i5jr.4.3, ponto 1)"
+mk_case pd1                                          # rodada 1: pedido aceito, o mini continua no ar
+run_sut --run
+chk "pd1: rc 20, UMA linha, e a marca FICA no estado como PENDENTE (boot de referência e espera de 30 min; veio $RC: $OUT)" '[ "$RC" = 20 ] && one_line && contains "PENDENTE" && state_has "reboots=$NOW" && state_has "pending_mark=$NOW" && state_has "pending_boot=$BOOT" && state_has "defer_until=$((NOW + 1800))"'
+N0=$(n_notify)
+setenv "DR4_NOW=$((NOW + 300))"                      # rodada 2: 5 min depois, MESMO boot, dentro da espera
+run_sut --run
+chk "pd2: pendência dentro da espera: rc 10 'PENDENTE', NÃO pede de novo, NÃO escala (sem mail, sem aviso novo) e a marca segue lá (veio $RC: $OUT)" '[ "$RC" = 10 ] && one_line && contains "PENDENTE" && [ "$(n_reboot)" = 1 ] && [ "$(n_mail)" = 0 ] && [ "$(n_notify)" = "$N0" ] && state_has "reboots=$NOW" && state_has "pending_mark=$NOW"'
+setenv "DR4_NOW=$((NOW + 1900))"                     # rodada 3: a espera acabou e o boot é o mesmo → o mini NÃO reiniciou: solta a marca e tenta de novo
+run_sut --run
+chk "pd3: mesmo boot depois da espera: solta a marca velha, pede de novo (2 pedidos) e a pendência passa para a marca NOVA (veio $RC: $OUT)" '[ "$RC" = 20 ] && [ "$(n_reboot)" = 2 ] && grep -qx "reboots=$((NOW + 1900))" "$C/state" && state_has "pending_mark=$((NOW + 1900))" && grep -q "solto a marca" "$C/log"'
+
+mk_case pd_slow                                      # o desligamento era só LENTO: o mini caiu depois dos WAIT_S e voltou
+run_sut --run
+setenv "DR4_NOW=$((NOW + 2400))"; setenv "DR4_BOOT_EPOCH=$((NOW + 600))"
+run_sut --run
+chk "pd_slow: boot mudou: a marca VALE (rc 10 'cooldown'), a escalada sai UMA vez porque o disco segue baixo, sem novo pedido e a pendência é resolvida (veio $RC: $OUT)" '[ "$RC" = 10 ] && contains "cooldown" && [ "$(n_reboot)" = 1 ] && [ "$(n_mail)" = 1 ] && state_has "reboots=$NOW" && state_has "pending_mark=0" && state_has "pending_boot=0" && state_has "esc_for=$NOW"'
+
+# o boottime vale com tolerância (BOOT_TOL_S=300): ajuste curto do relógio não é reinício; reinício de verdade move o boot por >= 2 h
+tol_case() {  # $1=nome $2=boot na rodada 2 $3=esperado: same|changed
+  mk_case "$1"; run_sut --run
+  setenv "DR4_NOW=$((NOW + 1900))"; setenv "DR4_BOOT_EPOCH=$2"; [ "$3" = same ] && touch "$C/reboot.dies"
+  run_sut --run
+  if [ "$3" = same ]; then
+    chk "$1: boot $2 (diferença dentro da tolerância) = MESMO boot: solta a marca e pede de novo (kill 143; veio $RC: $OUT)" '[ "$RC" = 143 ] && [ "$(n_reboot)" = 2 ] && grep -qx "reboots=$((NOW + 1900))" "$C/state.at-reboot" && grep -qx "pending_mark=0" "$C/state.at-reboot"'
+  else
+    chk "$1: boot $2 (diferença acima da tolerância) = o mini reiniciou: a marca FICA e o cooldown vale (rc 10, sem novo pedido; veio $RC: $OUT)" '[ "$RC" = 10 ] && contains "cooldown" && [ "$(n_reboot)" = 1 ] && state_has "reboots=$NOW" && state_has "pending_mark=0"'
+  fi
+}
+tol_case pd_tol_in   $((BOOT + 120)) same
+tol_case pd_tol_edge $((BOOT + 300)) same           # exatamente a tolerância ainda é o mesmo boot
+tol_case pd_tol_neg  $((BOOT - 120)) same           # o relógio pode ter andado para trás
+tol_case pd_tol_out  $((BOOT + 301)) changed
+tol_case pd_tol_far  $((BOOT + 600)) changed
+tol_case pd_tol_negf $((BOOT - 600)) changed        # a diferença é em módulo: boot MAIS ANTIGO também é outro boot (relógio saltou: não sei, lado inerte)
+
+mk_case pd_dry; run_sut --run; setenv "DR4_NOW=$((NOW + 300))"; cp "$C/state" "$C/state.before"
+run_sut --dry-run
+chk "pd_dry: dry-run durante a pendência: rc 0 'reiniciaria', diz PENDENTE, não grava nada (estado idêntico) e não escala (veio $RC: $OUT)" '[ "$RC" = 0 ] && contains "reiniciaria agora" && contains "PENDENTE" && cmp -s "$C/state" "$C/state.before" && [ "$(n_mail)" = 0 ]'
+# os dois ramos que RESOLVEM a pendência (boot mudou; espera acabou com o mesmo boot) são os que gravam no --run: no --dry-run nenhum pode gravar (a bateria de mutantes achou o buraco)
+mk_case pd_dry_chg; run_sut --run; setenv "DR4_NOW=$((NOW + 2400))"; setenv "DR4_BOOT_EPOCH=$((NOW + 600))"; cp "$C/state" "$C/state.before"
+run_sut --dry-run
+chk "pd_dry_chg: dry-run com o boot mudado: diz 'cooldown', NÃO grava a pendência resolvida (estado idêntico, pending_mark segue lá) e não pede reinício (veio $RC: $OUT)" '[ "$RC" = 10 ] && contains "cooldown" && cmp -s "$C/state" "$C/state.before" && state_has "pending_mark=$NOW" && [ "$(n_reboot)" = 1 ]'
+mk_case pd_dry_exp; run_sut --run; setenv "DR4_NOW=$((NOW + 1900))"; cp "$C/state" "$C/state.before"
+run_sut --dry-run
+chk "pd_dry_exp: dry-run depois da espera com o mesmo boot: diz 'reiniciaria', NÃO grava a marca solta (estado idêntico, a marca velha segue lá) e não pede reinício (veio $RC: $OUT)" '[ "$RC" = 0 ] && contains "reiniciaria agora" && cmp -s "$C/state" "$C/state.before" && state_has "reboots=$NOW" && state_has "pending_mark=$NOW" && [ "$(n_reboot)" = 1 ]'
+
+mk_case pd_disk; run_sut --run                      # disco que recupera no meio da pendência: "recuperou" vence, e a pendência continua anotada
+setenv "DR4_NOW=$((NOW + 300))"; setenv "DR4_FREE_MB_OVERRIDE=3500"
+run_sut --run
+chk "pd_disk: pendência e disco recuperado: 'recuperou' vence (rc 10) e a pendência segue anotada (veio $RC: $OUT)" '[ "$RC" = 10 ] && contains "recuperou" && state_has "pending_mark=$NOW" && [ "$(n_mail)" = 0 ]'
+setenv "DR4_NOW=$((NOW + 2400))"; setenv "DR4_BOOT_EPOCH=$((NOW + 600))"
+run_sut --run
+chk "pd_disk 2: o mini reiniciou e o disco está bom: a pendência é resolvida MESMO ASSIM (a marca fica, pending_mark=0; veio $RC: $OUT)" '[ "$RC" = 10 ] && contains "recuperou" && state_has "reboots=$NOW" && state_has "pending_mark=0"'
+
+mk_case pd_bad1; printf 'v=1\nreboots=%s\ndefer_until=0\npending_mark=%s\npending_boot=%s\n' "$NOW" "$NOW" "x1" > "$C/state"
+run_sut --run;  expect_no_reboot "estado com pending_boot não numérico" 30 "pending_boot"
+mk_case pd_bad2; printf 'v=1\nreboots=%s\npending_mark=%s\n' "$NOW" "$NOW" > "$C/state"
+run_sut --run;  expect_no_reboot "pending_mark SEM pending_boot (não há com o que conferir: nem 'mudou' nem 'igual')" 30 "sem pending_boot"
+mk_case pd_bad3; printf 'v=1\nreboots=%s\npending_mark=%s\npending_boot=0\n' "$NOW" "$NOW" > "$C/state"
+run_sut --run;  expect_no_reboot "pending_mark com pending_boot=0" 30 "sem pending_boot"
+mk_case pd_orph; printf 'v=1\nreboots=\ndefer_until=0\npending_mark=%s\npending_boot=%s\n' "$((NOW - 3000))" "$BOOT" > "$C/state"; touch "$C/reboot.dies"
+run_sut --run;  check "pendência cuja marca nem está na lista (podada/editada): soltar não quebra, o fluxo segue e reinicia (kill 143; veio $RC: $OUT)" [ "$RC" = 143 ]
+
+section "pré-checagem DEPOIS da carência: o que ela leu pode ter mudado nos 60 s (ga-1p1i5jr.4.3, ponto 2)"
+pc_case() {  # $1=nome $2=comando do hook (muda o mundo durante o aviso; escreva @C@ onde iria o diretório do cenário: $C só existe DEPOIS do mk_case) $3=rc esperado $4=trecho do stdout
+  mk_case "$1"; PC_HOOK=${2//@C@/$C}; echo "$PC_HOOK" > "$C/notify.hook"
+  run_sut --run
+  expect_no_reboot "pré-checagem muda durante a carência ($1)" "$3" "$4"
+  chk "$1: sem marca de reinício, espera de 10 min gravada, e o cancelamento foi AVISADO (veio: $OUT)" '! state_has "reboots=$NOW" && state_has "defer_until=$((NOW + 600))" && grep -q "cancelado" "$C/notify.log"'
+}
+pc_case pc_fv  "echo 'FileVault is On.' > '@C@/fdesetup.out'"             20 "FileVault"
+pc_case pc_fv2 "printf 'FileVault is Off.\nDeferred enablement appears to be active for user x.\n' > '@C@/fdesetup.out'" 20 "ADIADA"
+pc_case pc_al  "echo outro > '@C@/autologin.out'"                         20 "autologin"
+pc_case pc_lc  "echo 113 > '@C@/launchctl.rc'"                            20 "postcheck"
+pc_case pc_unk "echo 2 > '@C@/fdesetup.rc'"                               30 "ilegível depois da carência"
+pc_case pc_lcx "echo 1 > '@C@/launchctl.rc'"                              30 "ilegível depois da carência"
+
+section "cancelou DEPOIS do aviso: espera de 10 min, o aviso 'reiniciando em Ns' não se repete a cada rodada (ga-1p1i5jr.4.3, ponto 3)"
+osc_run() {  # $1=nome $2=rc da 1ª rodada $3=comando que desfaz a mudança do hook; o chamador já fez mk_case, o preparo e o notify.hook
+  OSC_RC=$2    # o chk avalia a expressão (eval) dentro da função dele, onde "$2" não existe (set -u): vai por variável
+  run_sut --run
+  chk "$1: 1ª rodada cancela depois do aviso (rc $2; veio $RC: $OUT): sem pedido, UM aviso 'reiniciando em' e espera de 10 min gravada" '[ "$RC" = "$OSC_RC" ] && no_reboot && [ "$(n_warn)" = 1 ] && state_has "defer_until=$((NOW + 600))" && state_has "pending_mark=0"'
+  rm -f "$C/notify.hook"; eval "$3"
+  setenv "DR4_NOW=$((NOW + 60))"
+  run_sut --run
+  chk "$1: 1 min depois, com o mundo normal de novo: NÃO repete o aviso nem pede reinício (rc 10 'adiado até'; veio $RC: $OUT)" '[ "$RC" = 10 ] && contains "adiado até" && no_reboot && [ "$(n_warn)" = 1 ]'
+  setenv "DR4_NOW=$((NOW + 700))"
+  run_sut --run
+  chk "$1: 11 min depois a espera acabou (controle: ela tem fim): avisa DE NOVO e pede o reinício (avisos=$(n_warn), pedidos=$(n_reboot))" '[ "$(n_warn)" = 2 ] && [ "$(n_reboot)" = 1 ]'
+}
+mk_case osc_disk; setenv "DR4_FREE_MB_OVERRIDE="; echo 2048000 > "$C/df.kb"; echo "echo 4096000 > '$C/df.kb'" > "$C/notify.hook"
+osc_run osc_disk 10 "echo 2048000 > '$C/df.kb'"
+mk_case osc_rd;   setenv "DR4_FREE_MB_OVERRIDE="; echo 2048000 > "$C/df.kb"; echo "echo x > '$C/df.kb'" > "$C/notify.hook"
+osc_run osc_rd 30 "echo 2048000 > '$C/df.kb'"
+mk_case osc_pre;  echo "echo 'FileVault is On.' > '$C/fdesetup.out'" > "$C/notify.hook"
+osc_run osc_pre 20 "echo 'FileVault is Off.' > '$C/fdesetup.out'"
+mk_case osc_unk;  echo "echo 2 > '$C/sender.rc'; echo 'nao sei' > '$C/sender.out'" > "$C/notify.hook"
+osc_run osc_unk 30 "echo 0 > '$C/sender.rc'; echo 'central_sender_restart_safe: fila sem envio em voo — pode reiniciar' > '$C/sender.out'"
+mk_case osc_blk;  echo "echo 1 > '$C/sender.rc'; echo 'central_sender_restart_safe: 1 envio(s) em voo' > '$C/sender.out'" > "$C/notify.hook"
+osc_run osc_blk 10 "echo 0 > '$C/sender.rc'; echo 'central_sender_restart_safe: fila sem envio em voo — pode reiniciar' > '$C/sender.out'"
 
 echo
 echo "disk-recovery-d4-guarded-reboot.selftest: PASS=$PASS FAIL=$FAIL"

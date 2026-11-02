@@ -1,6 +1,6 @@
 ## Contents
 
-- O que é · Como ver o que ele decidiu · Como desligar · As guardas · Cooldown e laço · O que ele NÃO faz · Limites conhecidos · O que ainda não foi provado · Testar
+- O que é · Como ver o que ele decidiu · Como desligar · As guardas · Cooldown e laço · O que ele NÃO faz · Pedido pendente · Limites conhecidos · O que ainda não foi provado · Testar
 
 # D4 — reinício guardado do mini (ga-1p1i5jr.4)
 
@@ -40,9 +40,9 @@ Antes das guardas há uma **pré-checagem**: FileVault desligado (e sem habilita
 
 ## Cooldown e laço
 
-1 reinício automático a cada 6 h e no máximo 2 por 24 h; mini no ar há ≥ 2 h (por qualquer causa); 10 min de espera depois que uma guarda adiou; 30 min depois de um pedido que não derrubou o mini. Marca no futuro (relógio voltou) conta como cooldown. Com o disco ainda baixo depois de um reinício nosso o D4 NÃO reinicia de novo: escala UMA vez por reinício (notify -p 5 + mail ao Mayor). O orquestrador, quando entrar, tem a escalada dele também (na branch dele: `D4_COOLDOWN_S 21600`, `escalate_d4_cap`, não chama o D4 por 6 h depois de um rc 0).
+1 reinício automático a cada 6 h e no máximo 2 por 24 h; mini no ar há ≥ 2 h (por qualquer causa); 10 min de espera depois que uma guarda adiou; 30 min depois de um pedido que não derrubou o mini (a marca fica PENDENTE e a rodada seguinte confere o `kern.boottime`: ver "Pedido pendente"). Marca no futuro (relógio voltou) conta como cooldown. Com o disco ainda baixo depois de um reinício nosso o D4 NÃO reinicia de novo: escala UMA vez por reinício (notify -p 5 + mail ao Mayor). O orquestrador, quando entrar, tem a escalada dele também (na branch dele: `D4_COOLDOWN_S 21600`, `escalate_d4_cap`, não chama o D4 por 6 h depois de um rc 0).
 
-O **aviso antes de reiniciar é condição**, não cortesia: push -p 5 com entrega CONFIRMADA; se o push não foi confirmado, mail ao Mayor; se os dois falharem, rc 30 e NÃO reinicia (tenta de novo em 10 min). Depois, 60 s de carência (o interruptor ainda aborta), releitura do disco e das guardas, e só então a marca é gravada, conferida e o pedido sai.
+O **aviso antes de reiniciar é condição**, não cortesia: push -p 5 com entrega CONFIRMADA; se o push não foi confirmado, mail ao Mayor; se os dois falharem, rc 30 e NÃO reinicia (tenta de novo em 10 min). Depois, 60 s de carência (o interruptor ainda aborta), releitura do disco, da pré-checagem e das guardas, e só então a marca é gravada, conferida e o pedido sai. Cancelou DEPOIS do aviso (disco recuperou, pré-checagem reprovou ou ilegível, guarda bloqueou ou ilegível) = espera de 10 min gravada, para a rodada seguinte não reenviar o aviso "reiniciando em 60 s" a cada tick enquanto a leitura oscila no limiar; o interruptor ligado não grava espera (é um humano mandando calar).
 
 Números ilegíveis em `DR4_*` (letra, mais de 9 dígitos) caem no padrão e o log diz `variável(is) DR4_ que não são número caíram no padrão`; nunca viram "sem limite".
 
@@ -52,13 +52,24 @@ Números ilegíveis em `DR4_*` (letra, mais de 9 dígitos) caem no padrão e o l
 - Não espera os beads em `in_progress` nem os markers do gate (o `--check-guards` inteiro bloquearia para sempre). Os markers voltam sozinhos à fila e o inflight-reclaim-guard recolhe as claims.
 - Não faz o notify/mail de rc 0/20 do orquestrador (isso é dele, quando entrar). O aviso ANTES do reinício e os avisos de falha/adiamento são do próprio D4.
 
+## Pedido pendente
+
+(ga-1p1i5jr.4.3) "Ainda no ar 180 s depois do pedido" quer dizer que o mini AINDA não caiu, não que não vai cair: um app segurando o logout termina o desligamento depois. Por isso a marca do reinício **não é solta** nessa hora: ela fica na lista (segura cooldown de 6 h e teto de 2 por 24 h) e o estado guarda `pending_mark` e `pending_boot` (o `kern.boottime` de antes do pedido). A rodada SEGUINTE decide, antes de qualquer cooldown olhar a marca:
+
+- `kern.boottime` mudou (mais de `DR4_BOOT_TOL_S`, 300 s, em módulo): o mini reiniciou depois do pedido, a marca era verdadeira e FICA (cooldown, teto e escalada passam a valer); a pendência é encerrada.
+- `kern.boottime` igual e antes de marca + 30 min: espera (rc 10, "PENDENTE"), sem pedir de novo, sem escalar, sem mail.
+- `kern.boottime` igual e passou marca + 30 min: o mini NÃO reiniciou; solta a marca e segue o fluxo normal (pode pedir de novo).
+- Disco recuperado vence a espera, e a pendência é resolvida mesmo assim na mesma rodada.
+- Estado com `pending_mark` sem `pending_boot` (ou não numérico) = rc 30, NÃO age: sem o boot de referência não há como dizer "mudou" nem "igual". Estado de antes desta fatia (sem as chaves) lê como "sem pendência".
+- Se o D4 não conseguir gravar a pendência, a marca (já gravada e conferida) fica como reinício comum: bloqueia por 6 h, o lado inerte.
+
 ## Limites conhecidos
 
-Apontados pelo revisor do gate (ga-24wp723), fora do escopo desta fatia de teste (o D4 não foi mexido aqui). Nenhum reinicia o mini errado: todos caem do lado inerte ou custam um aviso a mais.
+Os três achados de código do revisor do gate (ga-24wp723) foram fechados na ga-1p1i5jr.4.3 (pedido pendente acima; pré-checagem repetida depois da carência; espera de 10 min depois de cancelar). O que continua valendo:
 
-- **"Ainda no ar" ≠ "não vai cair".** Se o mini continua no ar 180 s depois do pedido, a marca é solta (rc 20, nova tentativa em 30 min). Um desligamento lento (app segurando o logout) pode terminar depois; aí o cooldown e a escalada DESSA queda se perdem. O piso de 2 h de uptime ainda segura o laço. Conserto proposto: marca "pendente" conferida pelo `kern.boottime` na rodada seguinte.
-- **Depois da carência a pré-checagem não se repete** (só o disco e as guardas são relidos).
-- **Releitura oscilando no limiar** (disco recuperou/guarda ilegível sem `defer_until`) pode reenviar o push "reiniciando em 60 s" a cada rodada do orquestrador.
+- **A pendência só é resolvida quando o D4 roda de novo.** Com o interruptor ligado (passo 1) o D4 sai antes de ler o estado; a pendência fica lá, inerte (a marca segura o cooldown), e é resolvida na primeira rodada depois que o interruptor for apagado.
+- **A espera de 10 min depois de um cancelamento vale para o disco crítico (< 1,5 GB) também**: se o disco recuperar durante a carência e voltar a cair logo em seguida, o D4 só reavalia depois dela. É o preço de não repetir o aviso a cada tick.
+- **`kern.boottime` é a única prova de que o mini reiniciou.** Relógio que salta mais de 300 s para qualquer lado conta como "outro boot" (a marca fica e o cooldown vale): o lado inerte.
 
 ## O que ainda não foi provado
 
@@ -68,6 +79,6 @@ Apontados pelo revisor do gate (ga-24wp723), fora do escopo desta fatia de teste
 
 ## Testar
 
-`bash scripts/disk-recovery-d4-guarded-reboot.selftest.sh` — shutdown SIMULADO (nunca reinicia; `DR4_NO_REAL_REBOOT=1` vale em todos os cenários), 378 verificações, ~8 min no mini a load alto (7m36s medido em 01/11). Rode com teto de escrita: `$GC_CITY_PATH/scripts/heavy-guard.sh --what selftest-d4 --max-file-mb 512 -- bash scripts/disk-recovery-d4-guarded-reboot.selftest.sh`. No nó Linux (`mbp-run.sh --repo hq`) dá 1 falha esperada, a trava com pid reaproveitado (o D4 usa o `stat -f %m` do macOS): no macOS, que é onde o D4 roda, passa.
+`bash scripts/disk-recovery-d4-guarded-reboot.selftest.sh` — shutdown SIMULADO (nunca reinicia; `DR4_NO_REAL_REBOOT=1` vale em todos os cenários), 460 verificações (379 da 4.2 + 81 da ga-1p1i5jr.4.3), ~8 min no mini a load alto (7m36s medido em 01/11 para as 379; as 81 novas não foram cronometradas no mini: o nó Linux levou ~170 s para as 460). Rode com teto de escrita: `$GC_CITY_PATH/scripts/heavy-guard.sh --what selftest-d4 --max-file-mb 512 -- bash scripts/disk-recovery-d4-guarded-reboot.selftest.sh`. No nó Linux (`mbp-run.sh --repo hq`) dá 459 + 1 falha esperada, a trava com pid reaproveitado (o D4 usa o `stat -f %m` do macOS): no macOS, que é onde o D4 roda, passa.
 
-Para provar que o teste pega defeito: `DR4_ST_SUT=<cópia mutada do D4> D4_ST_ONLY='^nt_|^cool$' bash scripts/…selftest.sh` roda só esses cenários contra a cópia. Cada mutante (uma quebra na cópia) tem de reprovar.
+Para provar que o teste pega defeito: `DR4_ST_SUT=<cópia mutada do D4> D4_ST_ONLY='^nt_|^cool$' bash scripts/…selftest.sh` roda só esses cenários contra a cópia. Cada mutante (uma quebra na cópia) tem de reprovar. A ga-1p1i5jr.4.3 rodou 32 mutantes sobre o código novo (tolerância e módulo do boottime, espera da pendência, solta/mantém a marca, validação das chaves `pending_*`, gravação no dry-run, pré-checagem depois da carência, espera de 10 min em cada saída de cancelamento): 30 morreram de cara e 2 sobreviveram (o dry-run gravando ao resolver a pendência); o buraco virou os cenários `pd_dry_chg` e `pd_dry_exp` e os 2 morrem agora. Controle sem mutação: FAIL=0.

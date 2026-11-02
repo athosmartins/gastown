@@ -2,7 +2,7 @@
 # disk-recovery-d4-guarded-reboot.sh — D4 da escada de disco: reinício GUARDADO do mini (ga-1p1i5jr.4)
 #
 # ## Contents
-#   Decisão · Contrato · Ordem · Guardas · Reinício · Costuras de teste
+#   Decisão · Contrato · Ordem · Guardas · Reinício · Pedido pendente · Costuras de teste
 #
 # DECISÃO (Athos, 01/11/2026 ~11:00 BRT, AskUserQuestion na sessão do Mayor, citada na ga-1p1i5jr): "A qualquer hora, com guardas" — o mini
 #   reinicia sozinho com o disco < 3 GB por 60 min (ou < 1,5 GB a qualquer momento), só sem ligação em curso nem envio em voo, e AVISA. Os guardas
@@ -18,8 +18,13 @@
 #   volume de dados, nunca `df /`)  4 cooldown de 6 h, teto de 2 por 24 h, mini no ar há < 2 h por qualquer causa (com o disco ainda baixo depois de
 #   um reinício nosso: NÃO reinicia de novo e escala UMA vez por reinício)  5 espera (10 min depois que uma guarda adiou, 30 min depois de um pedido que não derrubou o mini)  6 pré-checagem: FileVault
 #   desligado + autologin do usuário do console + postcheck pós-boot carregado (senão o mini volta parado na tela de senha)  7 guardas  8 `--run`:
-#   aviso -p 5 ANTES (entrega CONFIRMADA; se o push não foi, mail ao Mayor; os dois falharam = rc 30 e NÃO reinicia) → 60 s de carência (o interruptor ainda aborta) → RELÊ disco e guardas (o veredito de minutos atrás não vale) → grava e CONFERE
-#   a marca do reinício → só então pede o reinício; pedido com erro, ou mini ainda no ar 180 s depois, desfaz a marca e sai 20.
+#   aviso -p 5 ANTES (entrega CONFIRMADA; se o push não foi, mail ao Mayor; os dois falharam = rc 30 e NÃO reinicia) → 60 s de carência (o interruptor ainda aborta) → RELÊ disco,
+#   pré-checagem e guardas (o veredito de minutos atrás não vale; cancelou depois do aviso = espera de 10 min, senão a rodada seguinte reenvia o aviso) → grava e CONFERE
+#   a marca do reinício → só então pede o reinício; pedido com erro desfaz a marca e sai 20; mini ainda no ar 180 s depois = marca PENDENTE (abaixo) e sai 20.
+#
+# PEDIDO PENDENTE (ga-1p1i5jr.4.3): "ainda no ar 180 s depois" NÃO é "não vai cair" (um app segurando o logout termina o desligamento depois). A marca fica na lista e o estado guarda
+#   pending_mark/pending_boot; a rodada SEGUINTE (resolve_pending, antes do cooldown) confere o kern.boottime: mudou = o mini reiniciou, a marca vale (cooldown, teto e escalada); igual = não
+#   reiniciou, e depois de marca+30 min solta a marca e segue o fluxo normal (antes disso espera, sem escalar). Tolerância de BOOT_TOL_S para ajuste curto do relógio.
 #
 # GUARDAS (todas avaliadas; qualquer uma bloqueia = 10 + espera + aviso; nenhuma bloqueia mas alguma ilegível = 30): ligação em curso
 #   (disk-recovery-d4-calls-in-flight.py: o live_calls() do pix e o do voicebot devolvem [] em QUALQUER erro, então "não consegui ler" e "não há
@@ -89,7 +94,8 @@ cfg DEFER_S 600        # depois que uma guarda adiou: não tenta de novo por 10 
 cfg DEFER_NOTIFY_S 3600  # aviso de adiamento/"cego" no máximo 1 por hora
 cfg ATTEMPT_GAP_S 1800 # depois de um pedido que NÃO reiniciou: a espera é de 30 min (a mesma espera do hold)
 cfg GRACE_S 60         # carência entre o aviso e o reinício (o interruptor aborta)
-cfg WAIT_S 180         # depois do pedido aceito: espera isto o mini cair; vivo depois = o reinício não aconteceu
+cfg WAIT_S 180         # depois do pedido aceito: espera isto o mini cair; vivo depois = AINDA não caiu (pode estar só lento: a marca fica PENDENTE, ver resolve_pending)
+cfg BOOT_TOL_S 300     # kern.boottime que difere do gravado por até isto = mesmo boot (um reinício de verdade o move por >= MIN_UPTIME_S; um ajuste curto do relógio não é reinício)
 cfg REBOOT_TIMEOUT_S 90
 cfg CALL_MAX_AGE_MIN 240
 cfg GUARD_TIMEOUT_S 60
@@ -183,7 +189,7 @@ send_mail() {  # $1=assunto $2=corpo. rc 0 = entregue; rc 1 = não confirmado (m
 }
 
 # ── estado (chave=valor, escrito inteiro e trocado com mv) ─────────────────────────────────────────────────────────────────────
-S_REBOOTS=""; S_DEFER_UNTIL=0; S_DEFER_NOTIFY=0; S_ESC_FOR=0; STATE_ERR=""
+S_REBOOTS=""; S_DEFER_UNTIL=0; S_DEFER_NOTIFY=0; S_ESC_FOR=0; S_PEND_MARK=0; S_PEND_BOOT=0; STATE_ERR=""
 isnum() { case "$1" in ''|*[!0-9]*) return 1 ;; *) [ "${#1}" -le 12 ] ;; esac; }
 valid_list() {  # lista de números separados por vírgula (vazia vale); elemento vazio ou com > 12 dígitos não vale (estouraria a aritmética sem avisar)
   local e IFS=,
@@ -193,7 +199,7 @@ valid_list() {  # lista de números separados por vírgula (vazia vale); element
 }
 
 state_load() {  # rc 0 = lido (arquivo AUSENTE = estado vazio = primeira vez); rc 1 = existe e não consigo ler/entender → STATE_ERR (NÃO age)
-  S_REBOOTS=""; S_DEFER_UNTIL=0; S_DEFER_NOTIFY=0; S_ESC_FOR=0; STATE_ERR=""
+  S_REBOOTS=""; S_DEFER_UNTIL=0; S_DEFER_NOTIFY=0; S_ESC_FOR=0; S_PEND_MARK=0; S_PEND_BOOT=0; STATE_ERR=""
   [ -e "$STATE" ] || return 0
   [ -r "$STATE" ] && [ -f "$STATE" ] || { STATE_ERR="$STATE existe mas não é um arquivo legível"; return 1; }
   local k v
@@ -205,16 +211,21 @@ state_load() {  # rc 0 = lido (arquivo AUSENTE = estado vazio = primeira vez); r
       defer_until)     isnum "$v" || { STATE_ERR="defer_until='$v'"; return 1; };     S_DEFER_UNTIL=$v ;;
       defer_notify_ts) isnum "$v" || { STATE_ERR="defer_notify_ts='$v'"; return 1; }; S_DEFER_NOTIFY=$v ;;
       esc_for)         isnum "$v" || { STATE_ERR="esc_for='$v'"; return 1; };         S_ESC_FOR=$v ;;
+      # chave ausente → 0 = nenhum pedido pendente (estado de antes da ga-1p1i5jr.4.3 lê assim); valor vazio/não numérico → rc 1 e NÃO age (nunca vira "sem pendência")
+      pending_mark)    isnum "$v" || { STATE_ERR="pending_mark='$v'"; return 1; };    S_PEND_MARK=$v ;;
+      pending_boot)    isnum "$v" || { STATE_ERR="pending_boot='$v'"; return 1; };    S_PEND_BOOT=$v ;;
       *) ;;  # chave que não conheço (versão futura do mesmo v=1): ignora
     esac
   done < "$STATE"
+  # pendência sem o boot de referência não dá para conferir (nem "mudou" nem "igual"): ilegível, NÃO age — soltar a marca ou mantê-la às cegas seria chute
+  if [ "$S_PEND_MARK" -gt 0 ] && [ "$S_PEND_BOOT" -le 0 ]; then STATE_ERR="pending_mark=$S_PEND_MARK sem pending_boot (não há com o que conferir o kern.boottime)"; return 1; fi
   return 0
 }
 state_save() {  # rc 0 = gravou; rc 1 = não gravou (o chamador decide; antes do reinício, NÃO gravar = NÃO reiniciar)
   local tmp="$STATE.tmp.$$"
   mkdir -p "$(dirname "$STATE")" 2>/dev/null
-  if printf 'v=1\nreboots=%s\ndefer_until=%s\ndefer_notify_ts=%s\nesc_for=%s\n' \
-       "$S_REBOOTS" "$S_DEFER_UNTIL" "$S_DEFER_NOTIFY" "$S_ESC_FOR" > "$tmp" 2>/dev/null && mv -f "$tmp" "$STATE" 2>/dev/null; then
+  if printf 'v=1\nreboots=%s\ndefer_until=%s\ndefer_notify_ts=%s\nesc_for=%s\npending_mark=%s\npending_boot=%s\n' \
+       "$S_REBOOTS" "$S_DEFER_UNTIL" "$S_DEFER_NOTIFY" "$S_ESC_FOR" "$S_PEND_MARK" "$S_PEND_BOOT" > "$tmp" 2>/dev/null && mv -f "$tmp" "$STATE" 2>/dev/null; then
     return 0
   fi
   rm -f "$tmp" 2>/dev/null
@@ -273,6 +284,37 @@ read_boot_epoch() {  # rc 0 = BOOT_EPOCH; rc 1 = ilegível. Token EXATO "sec" (a
   fi
   isnum "$b" || { READ_ERR="kern.boottime ilegível ('${b:-vazio}')"; return 1; }
   BOOT_EPOCH=$b; return 0
+}
+
+# ── pedido de reinício PENDENTE (ga-1p1i5jr.4.3) ───────────────────────────────────────────────────────────────────────────────
+# Pedido aceito e o mini ainda no ar WAIT_S depois = "AINDA não caiu", não "não vai cair": um app segurando o logout pode terminar o desligamento depois. Soltar a marca
+# ali perdia o cooldown e a escalada DESSA queda (só o piso de 2 h de uptime segurava o laço). Agora a marca FICA na lista (inerte: segura cooldown e teto) e o estado
+# guarda pending_mark/pending_boot; quem decide é a rodada SEGUINTE, pelo kern.boottime (a tolerância BOOT_TOL_S cobre ajuste curto do relógio; reinício de verdade move >= 2 h):
+#   mudou → o mini reiniciou depois do pedido: a marca era verdadeira e FICA (cooldown, teto e escalada passam a valer);
+#   igual → não reiniciou: antes de marca+ATTEMPT_GAP_S espera (não escala, não pede de novo); depois, solta a marca e segue o fluxo normal.
+PEND_HOLD_UNTIL=0
+resolve_pending() {  # ajusta S_REBOOTS/S_PEND_* e PEND_HOLD_UNTIL (> 0 = ainda pendente, espera até esse instante). Precisa de NOW, BOOT_EPOCH e do estado já lidos; no dry-run não grava
+  PEND_HOLD_UNTIL=0
+  [ "$S_PEND_MARK" -gt 0 ] || return 0
+  local mk=$S_PEND_MARK d hold_to
+  # BOOT_EPOCH já foi lido (ilegível = rc 30 antes de chegar aqui) e S_PEND_BOOT > 0 (o state_load recusa o contrário); os dois são números, a diferença não falha
+  d=$(( BOOT_EPOCH - S_PEND_BOOT )); [ "$d" -ge 0 ] || d=$(( -d ))
+  if [ "$d" -gt "$BOOT_TOL_S" ]; then
+    log "pedido de reinício pendente (marca $mk): o kern.boottime mudou (gravado $S_PEND_BOOT, agora $BOOT_EPOCH): o mini reiniciou depois do pedido — a marca FICA"
+    S_PEND_MARK=0; S_PEND_BOOT=0
+    [ "$DRY" = 1 ] || state_save || log "WARN: não gravei a pendência resolvida em $STATE — a próxima rodada confere de novo (o resultado é o mesmo)"
+    return 0
+  fi
+  hold_to=$(( mk + ATTEMPT_GAP_S ))
+  if [ "$NOW" -lt "$hold_to" ]; then PEND_HOLD_UNTIL=$hold_to; return 0; fi
+  log "pedido de reinício pendente (marca $mk): kern.boottime igual ao gravado ($S_PEND_BOOT, agora $BOOT_EPOCH) e passou a espera de ${ATTEMPT_GAP_S}s — o mini NÃO reiniciou; solto a marca"
+  drop_mark "$mk"; S_PEND_MARK=0; S_PEND_BOOT=0
+  [ "$DRY" = 1 ] || state_save || log "WARN: não gravei a marca solta em $STATE — a próxima rodada solta de novo (o resultado é o mesmo)"
+  return 0
+}
+hold_after_cancel() {  # cancelamento DEPOIS do aviso "reiniciando em Ns": segura DEFER_S. Sem isso a rodada seguinte reenvia o aviso e a carência enquanto a leitura oscila no limiar. Quem chama atualizou NOW
+  S_DEFER_UNTIL=$(( NOW + DEFER_S ))
+  state_save || log "WARN: não gravei a espera de ${DEFER_S}s em $STATE — a próxima rodada pode repetir o aviso"
 }
 
 # ── pré-checagem: o mini volta SOZINHO depois do reinício? ──────────────────────────────────────────────────────────────────────
@@ -475,11 +517,22 @@ if [ "$DRY" = 0 ]; then
   echo $$ > "$LOCKD/pid" 2>/dev/null
 fi
 state_load || emit 30 "não consegui ler o estado do D4 ($STATE_ERR) — NÃO ajo"
+resolve_pending   # pedido de reinício de uma rodada anterior que não derrubou o mini a tempo: decide pelo kern.boottime ANTES de qualquer cooldown olhar a marca
 
 # 3 — o disco ainda está abaixo do limiar? (o orquestrador decidiu há minutos; a leitura pode ter mudado)
 read_free_mb || emit 30 "não consegui ler o disco ($READ_ERR) — NÃO ajo"
 if [ "$FREE_MB" -ge "$MB" ]; then emit 10 "disco recuperou (livre=${FREE_MB}MB >= ${MB}MB) — nada a fazer"; fi
 TIER="sustentado (< $((MB / 1024)) GB)"; [ "$FREE_MB" -lt "$HARD_MB" ] && TIER="crítico (< $((HARD_MB * 10 / 1024 / 10)),$((HARD_MB * 10 / 1024 % 10)) GB)"
+
+# 3b — pedido anterior ainda PENDENTE (o mini não reiniciou até agora, mas o desligamento pode estar só lento): não escala, não pede de novo. Vem DEPOIS do disco (recuperou vence)
+# e ANTES do cooldown (a marca pendente ainda está na lista e o cooldown leria "reiniciou há N min" de um mini que pode não ter reiniciado)
+HOLD_NOTE=""
+if [ "$PEND_HOLD_UNTIL" -gt 0 ]; then
+  PEND_TXT="o pedido de reinício de $(hhmm "$S_PEND_MARK") ainda está PENDENTE: o mini não reiniciou até agora (kern.boottime igual) mas o desligamento pode estar só lento; confiro de novo depois de $(hhmm "$PEND_HOLD_UNTIL") e só então solto a marca"
+  if [ "$DRY" = 0 ]; then emit 10 "$PEND_TXT — repito depois; livre=${FREE_MB}MB"; fi
+  drop_mark "$S_PEND_MARK"   # só em memória (no dry-run nada é gravado): mostra o resto do que o --run faria depois da pendência
+  HOLD_NOTE=" [no --run: $PEND_TXT]"
+fi
 
 # 4 — cooldown, teto diário, mini recém-subido
 LAST=$(last_reboot)
@@ -503,10 +556,9 @@ if [ "$up" -lt "$MIN_UPTIME_S" ]; then
 fi
 
 # 5 — espera: 10 min depois que uma guarda adiou, 30 min depois de um pedido que não derrubou o mini (no dry-run só informa e segue, pra mostrar o resto)
-HOLD_NOTE=""
 if [ "$S_DEFER_UNTIL" -gt "$NOW" ]; then
-  if [ "$DRY" = 0 ]; then emit 10 "adiado até $(hhmm "$S_DEFER_UNTIL") por uma guarda (espera de ${DEFER_S}s) — repito depois"; fi
-  HOLD_NOTE=" [no --run: adiado até $(hhmm "$S_DEFER_UNTIL")]"
+  if [ "$DRY" = 0 ]; then emit 10 "adiado até $(hhmm "$S_DEFER_UNTIL") (espera depois de uma guarda, de um aviso cancelado ou de um pedido que não derrubou o mini) — repito depois"; fi
+  HOLD_NOTE="$HOLD_NOTE [no --run: adiado até $(hhmm "$S_DEFER_UNTIL")]"
 fi
 
 # 6 — o mini volta sozinho?
@@ -560,12 +612,34 @@ while [ "$g" -lt "$GRACE_S" ]; do
 done
 if [ -e "$OFF" ]; then emit 10 "interruptor ligado durante a carência — NÃO reiniciei"; fi
 
+# TODO cancelamento daqui até a marca vale a regra da ga-1p1i5jr.4.3: segura DEFER_S (hold_after_cancel) antes de sair. Quem já mandou "reiniciando em Ns" e cancela sem segurar
+# faz a rodada seguinte mandar o aviso de novo, a cada tick, enquanto a leitura oscila no limiar. (O interruptor acima não segura: é um humano mandando calar, e o passo 1 o respeita.
+# Falha ao gravar a marca, mais abaixo, também não segura: o estado que não grava a marca não grava a espera.)
 NOW=$(now)
-read_free_mb || emit 30 "não consegui reler o disco depois do aviso ($READ_ERR) — NÃO reinicio"
-if [ "$FREE_MB" -ge "$MB" ]; then
-  send_notify 4 "Disco: reinício cancelado, o disco recuperou" "Durante a carência o livre subiu para ${FREE_MB} MB (>= ${MB} MB). Não reiniciei."
-  emit 10 "disco recuperou durante a carência (livre=${FREE_MB}MB) — NÃO reiniciei"
+# vazio → não existe (a leitura é um número ou falha); falhou/ilegível → rc 30, NÃO reinicia, segura DEFER_S
+if ! read_free_mb; then
+  hold_after_cancel
+  emit 30 "não consegui reler o disco depois do aviso ($READ_ERR) — NÃO reinicio; tento de novo às $(hhmm "$S_DEFER_UNTIL")"
 fi
+if [ "$FREE_MB" -ge "$MB" ]; then
+  hold_after_cancel
+  send_notify 4 "Disco: reinício cancelado, o disco recuperou" "Durante a carência o livre subiu para ${FREE_MB} MB (>= ${MB} MB). Não reiniciei. Se cair de novo, só reavalio às $(hhmm "$S_DEFER_UNTIL")."
+  emit 10 "disco recuperou durante a carência (livre=${FREE_MB}MB) — NÃO reiniciei; espera até $(hhmm "$S_DEFER_UNTIL")"
+fi
+# a pré-checagem do passo 6 vale ANTES do aviso; o que ela leu (FileVault, autologin, postcheck, osascript) pode ter mudado nos 60 s de carência, e um mini que
+# não volta sozinho é o pior desfecho. vazio → não existe (cada leitura devolve texto ou rc); reprovou → rc 20; falhou/ilegível → rc 30; nos dois NÃO reinicia e segura DEFER_S
+precheck_env; prc=$?
+case "$prc" in
+  0) ;;
+  20)
+    hold_after_cancel
+    send_notify 5 "Disco: reinício cancelado, a pré-checagem reprovou depois do aviso" "Depois do aviso: ${PRE_WHY}. NÃO reiniciei. Tento de novo às $(hhmm "$S_DEFER_UNTIL")."
+    emit 20 "pré-checagem reprovou depois da carência: $PRE_WHY — NÃO reiniciei; espera até $(hhmm "$S_DEFER_UNTIL")" ;;
+  *)
+    hold_after_cancel
+    send_notify 5 "Disco: reinício cancelado, pré-checagem ilegível depois do aviso" "Depois do aviso não consegui ler: ${PRE_WHY}. NÃO reiniciei. Tento de novo às $(hhmm "$S_DEFER_UNTIL")."
+    emit 30 "pré-checagem ilegível depois da carência: $PRE_WHY — NÃO reinicio; espera até $(hhmm "$S_DEFER_UNTIL")" ;;
+esac
 run_guards; grc=$?
 case "$grc" in
   1)
@@ -574,8 +648,9 @@ case "$grc" in
     state_save || log "WARN: não gravei a espera em $STATE"
     emit 10 "adiado na releitura final — guarda(s) bloqueando (${BLOCK_NAMES}): ${BLOCK_WHY}; livre=${FREE_MB}MB" ;;
   2)
-    send_notify 5 "Disco: reinício cancelado, guarda ilegível na última checagem" "Depois do aviso não consegui ler: ${UNK_WHY}. NÃO reiniciei."
-    emit 30 "não consegui reler guarda(s) (${UNK_NAMES}): ${UNK_WHY} — NÃO reinicio" ;;
+    hold_after_cancel
+    send_notify 5 "Disco: reinício cancelado, guarda ilegível na última checagem" "Depois do aviso não consegui ler: ${UNK_WHY}. NÃO reiniciei. Tento de novo às $(hhmm "$S_DEFER_UNTIL")."
+    emit 30 "não consegui reler guarda(s) (${UNK_NAMES}): ${UNK_WHY} — NÃO reinicio; espera até $(hhmm "$S_DEFER_UNTIL")" ;;
 esac
 
 # a marca vai para o disco ANTES do pedido e é CONFERIDA: o pedido derruba este processo (nada escrito depois conta), e reinício sem marca
@@ -612,11 +687,13 @@ if [ "$rrc" -ne 0 ] && [ "$rrc" -ne 124 ]; then
   emit 20 "$why — o mini NÃO reiniciou; desfiz a marca"
 fi
 rb_clean
-log "pedido ${REQ_DESC}; esperando até ${WAIT_S}s o mini cair — se este processo continuar vivo, o reinício não aconteceu"
+log "pedido ${REQ_DESC}; esperando até ${WAIT_S}s o mini cair — se este processo continuar vivo, o mini AINDA não caiu (pode estar só lento)"
 w=0
 while [ "$w" -lt "$WAIT_S" ]; do sleep 1; w=$((w + 1)); done
-# chegou aqui = o mini AINDA não caiu (≠ "não vai cair": um logout lento pode terminar depois dos ${WAIT_S}s). Solta a marca para o caso comum (diálogo de app, sessão travada):
-# se ele cair mesmo assim, o piso de 2 h de uptime segura o laço, mas o cooldown e a escalada DESTA queda se perdem — risco aceito nesta fatia, fechar na 3/3 (marca "pendente" conferida pelo boottime).
-drop_mark "$MARK"; S_DEFER_UNTIL=$(( NOW + ATTEMPT_GAP_S )); state_save || log "ERROR: não consegui desfazer a marca $MARK em $STATE"
-send_notify 5 "Disco: pedi o reinício e o mini NÃO caiu" "Livre ${FREE_MB} MB. O pedido foi ${REQ_DESC}, e o mini continuava no ar ${WAIT_S}s depois (um app segurando o logout?). Não conta como reinício; tento de novo em $(( ATTEMPT_GAP_S / 60 )) min. Log: $LOG"
-emit 20 "pedido de reinício ${REQ_DESC}; o mini continuou no ar por ${WAIT_S}s — NÃO reiniciou; desfiz a marca (nova tentativa em ${ATTEMPT_GAP_S}s)"
+# chegou aqui = o mini AINDA não caiu (≠ "não vai cair": um logout lento pode terminar depois dos ${WAIT_S}s). A marca FICA na lista e vira PENDENTE (ga-1p1i5jr.4.3): quem
+# decide se o pedido pegou é a rodada de depois de marca+ATTEMPT_GAP_S, pelo kern.boottime (resolve_pending). Este processo só viu o mini vivo, e isso não prova "não reiniciou".
+# Se não conseguir gravar a pendência, a marca (já gravada e conferida acima) fica como reinício comum: bloqueia por COOLDOWN_S, o lado inerte.
+S_PEND_MARK=$MARK; S_PEND_BOOT=$BOOT_EPOCH; S_DEFER_UNTIL=$(( NOW + ATTEMPT_GAP_S ))
+state_save || log "ERROR: não consegui gravar a pendência da marca $MARK em $STATE — ela fica como reinício comum (inerte: bloqueia por ${COOLDOWN_S}s)"
+send_notify 5 "Disco: pedi o reinício e o mini NÃO caiu" "Livre ${FREE_MB} MB. O pedido foi ${REQ_DESC}, e o mini continuava no ar ${WAIT_S}s depois (um app segurando o logout?). A marca fica PENDENTE e conta para cooldown e teto: se o mini cair mais tarde, o reinício vale; se na rodada de depois das $(hhmm "$S_DEFER_UNTIL") o kern.boottime não tiver mudado, solto a marca e tento de novo. Log: $LOG"
+emit 20 "pedido de reinício ${REQ_DESC}; o mini continuou no ar por ${WAIT_S}s — NÃO reiniciou (até agora); marca PENDENTE: a rodada de depois das $(hhmm "$S_DEFER_UNTIL") confere o kern.boottime (mudou = vale; igual = solto a marca e tento de novo)"
