@@ -21,8 +21,40 @@ lag_fields() {   # a idade da fotografia do origin que este clone tem = agora �
   LAG_MAIN=${m:0:7}; LAG_MIN=null; MAIN_AGE=null
   [ -n "$t" ] && LAG_MIN=$(( ($(now) - t) / 60 )); [ -n "$mt" ] && MAIN_AGE=$(( ($(now) - mt) / 60 )); return 0
 }
-cmd_pull() {   # 1) pergunta ao espelho o filtro VIGENTE (gt-mirror-spec; sai com 75 enquanto a varredura de dado não cobre as pontas) 2) confere que é um filtro 3) busca COM esse oid, nunca com outro
-  local ef spec oid old url pre; rig_of "${1:-}"; PULL=erro; ef=$(mktemp) || die 3 "sem tmp"; url=$(g config gtremote.mirrorurl) && pre=$(g config gtremote.ssh) || die 3 "clone sem url/ssh do espelho"
+PULL_MAX_FORA=20   # teto de refs que um pull aceita deixar de fora (ponta ausente no clone); acima disso o dano é grande demais para contornar e o pull FALHA, alto
+broken_refs() {   # $1 = dir de trabalho. As refs que o espelho anuncia, dentro do que o fetch busca, com a ponta AUSENTE neste clone: UMA só derruba o fetch inteiro em "did not send all necessary objects" (ga-yo1n1zg). Grava "<ref> <oid>" por linha em $1/bad. rc 0 = achei e posso contornar · rc 1 = NÃO contorno (RETRY_NOTE diz por quê)
+  local t=$1 pats n; RETRY_NOTE=""
+  # vazio → o clone não tem refspec de fetch: não sei o que o fetch busca, não contorno · falhou/ilegível → idem
+  pats=$(g config --get-all remote.origin.fetch | sed -e '/^\^/d' -e 's/^+//' -e 's/:.*$//'); set -f; set -- $pats; set +f   # set -f: os padrões têm * e não podem virar glob de arquivo
+  [ $# -gt 0 ] || { RETRY_NOTE="o clone não tem refspec de fetch (remote.origin.fetch vazio ou ilegível)"; return 1; }
+  # vazio → o espelho não anunciou ref nenhuma: não sei o que falta, não contorno · falhou → idem (o stderr do fetch segue guardado)
+  if GIT_TERMINAL_PROMPT=0 LC_ALL=C timeout 120 git -C "$GR/$RIG/repo.git" ls-remote origin "$@" > "$t/ls" 2> /dev/null && [ -s "$t/ls" ]; then :; else RETRY_NOTE="não consegui listar as refs do espelho"; return 1; fi
+  # vazio → "clone sem objeto nenhum" é impossível com refs, e tomaria TODA ponta por ausente (excluiria tudo): não contorno · falhou → idem. cat-file -e por ponta custa 16 s no nó e --batch-check MORRE no 1º ausente; a lista inteira custa 0,05 s
+  if g cat-file --batch-all-objects --batch-check='%(objectname)' > "$t/obj" 2> /dev/null && LC_ALL=C sort -u "$t/obj" > "$t/present" && [ -s "$t/present" ]; then :; else RETRY_NOTE="não consegui listar os objetos do clone"; return 1; fi
+  awk -F'\t' '{ print $1 }' "$t/ls" | LC_ALL=C sort -u > "$t/tips"; LC_ALL=C comm -23 "$t/tips" "$t/present" > "$t/miss"
+  awk -F'\t' 'NR == FNR { m[$1] = 1; next } ($1 in m) { print $2 " " $1 }' "$t/miss" "$t/ls" | LC_ALL=C sort > "$t/bad"   # miss vazio → bad vazio (o 2º arquivo é lido como se fosse o 1º)
+  n=$(wc -l < "$t/bad" | tr -d ' '); [ "$n" -gt 0 ] || { RETRY_NOTE="nenhuma ponta anunciada falta neste clone: a causa não é ref sem objeto"; return 1; }
+  grep -q -E '^refs/(remotes/origin/main|gt/synced) ' "$t/bad" && { RETRY_NOTE="a ponta de refs/remotes/origin/main ou de refs/gt/synced falta neste clone: não é ref lateral, não contorno"; return 1; }
+  [ "$n" -le "$PULL_MAX_FORA" ] || { RETRY_NOTE="$n refs com ponta ausente (teto $PULL_MAX_FORA): dano grande demais para contornar"; return 1; }
+}
+fetch_origin() {   # o fetch do pull. $1 = oid do filtro · $2 = arquivo que junta o stderr de TODAS as tentativas. rc 0 = passou (SKIPPED ≠ vazio: passou SEM essas refs) · rc 1 = falhou (RETRY_NOTE = por que não houve segunda tentativa, se não houve)
+  local oid=$1 ef=$2 t r; SKIPPED=""; RETRY_NOTE=""
+  GIT_TERMINAL_PROMPT=0 LC_ALL=C timeout 1800 git -C "$GR/$RIG/repo.git" fetch -q --prune "--filter=sparse:oid=$oid" origin 2> "$ef" && return 0
+  grep -q 'did not send all necessary objects' "$ef" || return 1   # outra falha (rede, filtro recusado, espelho em atualização): não há segunda tentativa
+  t=$(mktemp -d) || { RETRY_NOTE="sem tmp"; return 1; }
+  broken_refs "$t" || { rm -rf "$t"; return 1; }
+  # -c remote.origin.fetch=^<ref> SOMA-SE aos refspecs da config (os positivos seguem valendo, medido) e não deixa nada gravado se o processo morrer; o MESMO --filter vai junto (o oid vigente, nunca outro)
+  set --; while read -r r _; do set -- "$@" -c "remote.origin.fetch=^$r"; done < "$t/bad"
+  echo "--- tentativa 2: sem as refs de ponta ausente ($(awk '{ printf "%s%s", s, $1; s = " " }' "$t/bad")) ---" >> "$ef"
+  if GIT_TERMINAL_PROMPT=0 LC_ALL=C timeout 1800 git -C "$GR/$RIG/repo.git" "$@" fetch -q --prune "--filter=sparse:oid=$oid" origin 2>> "$ef"; then SKIPPED=$(cat "$t/bad"); rm -rf "$t"; return 0; fi   # o rc decide: um fetch que PASSA ainda escreve "Could not read" no stderr
+  rm -rf "$t"; return 1
+}
+skipped_view() {   # as refs que o último pull deixou de fora, em uma linha. arquivo ausente → vazio (nenhuma) · existe e ilegível → "?" (não sei), nunca vazio
+  local f="$GR/$RIG/last-pull-skipped"
+  if [ -r "$f" ]; then awk '{ printf "%s%s(%s)", s, $1, substr($2, 1, 7); s = " " }' "$f"; elif [ -e "$f" ]; then printf '?'; fi
+}
+cmd_pull() {   # 1) pergunta ao espelho o filtro VIGENTE (gt-mirror-spec; sai com 75 enquanto a varredura de dado não cobre as pontas) 2) confere que é um filtro 3) busca COM esse oid, nunca com outro 4) se o fetch morre em "did not send all necessary objects" por ref de ponta ausente, repete UMA vez sem essas refs (fetch_origin)
+  local ef spec oid old url pre; rig_of "${1:-}"; PULL=erro; rm -f "$GR/$RIG/last-pull-skipped"; ef=$(mktemp) || die 3 "sem tmp"; url=$(g config gtremote.mirrorurl) && pre=$(g config gtremote.ssh) || die 3 "clone sem url/ssh do espelho"
   [[ "$url" =~ ^ssh://([A-Za-z0-9_.-]+)@([A-Za-z0-9_.-]+):([0-9]+)/([a-z][a-z0-9_-]*)\.git$ ]] || die 3 "url do espelho ilegível: $url"
   # shellcheck disable=SC2086  # $pre é a linha de opções do ssh; chave e known_hosts só têm [A-Za-z0-9_./-] (conferido no bootstrap)
   if spec=$(timeout 120 $pre -p "${BASH_REMATCH[3]}" "${BASH_REMATCH[1]}@${BASH_REMATCH[2]}" "gt-mirror-spec '${BASH_REMATCH[4]}'" 2> "$ef") \
@@ -31,10 +63,17 @@ cmd_pull() {   # 1) pergunta ao espelho o filtro VIGENTE (gt-mirror-spec; sai co
     printf '%s\n' "$spec" > "$GR/$RIG/sparse.new.$$" && printf '%s\n' "$spec" | sed -e '1d' -e 's/^!//' > "$GR/$RIG/deny.new.$$" && mv "$GR/$RIG/sparse.new.$$" "$GR/$RIG/sparse" && mv "$GR/$RIG/deny.new.$$" "$GR/$RIG/deny" \
       && g config gtremote.sparseoid "$oid" && g config remote.origin.partialclonefilter "sparse:oid=$oid" || die 3 "não gravei o filtro recebido"
     [ -z "$old" ] || [ "$old" = "$oid" ] || echo "pull rig=$RIG AVISO: o filtro do espelho mudou ($old → $oid); rode scan: dado já baixado antes da mudança não some sozinho"
-    if GIT_TERMINAL_PROMPT=0 timeout 1800 git -C "$GR/$RIG/repo.git" fetch -q --prune "--filter=sparse:oid=$oid" origin 2> "$ef"; then PULL=ok; rm -f "$GR/$RIG/last-pull-error"; fi
+    if fetch_origin "$oid" "$ef"; then PULL=ok; rm -f "$GR/$RIG/last-pull-error"
+      if [ -n "$SKIPPED" ]; then   # passou, mas SEM refs: o main foi buscado (nunca fica de fora) e o clone segue com buraco. Tem de ficar visível (stdout, status), nunca parecer um pull limpo
+        printf '%s\n' "$SKIPPED" > "$GR/$RIG/last-pull-skipped" || echo "pull rig=$RIG AVISO: não consegui gravar $GR/$RIG/last-pull-skipped"
+        echo "pull rig=$RIG AVISO: $(printf '%s\n' "$SKIPPED" | wc -l | tr -d ' ') ref(s) ficaram FORA deste pull (ponta ausente neste clone): $(printf '%s\n' "$SKIPPED" | awk '{ printf "%s%s", s, $1; s = " " }'); o main foi buscado, mas o clone precisa de reparo (git fetch --refetch --filter=sparse:oid=<oid>, docs/runbooks/hetzner-git-mirror.md)"
+      fi
+    fi
   fi
-  [ $PULL = ok ] || { grep -q . "$ef" || echo "o espelho não devolveu um filtro de dados válido (resposta vazia ou sem regras)" > "$ef"; echo "$(now) $(grep . "$ef" | tail -n 1 | tr -d '"')" > "$GR/$RIG/last-pull-error"; }; rm -f "$ef"
-  lag_fields; echo "pull rig=$RIG resultado=$PULL main=$LAG_MAIN lag_min=$LAG_MIN$([ $PULL = erro ] && echo " erro=\"$(cut -d' ' -f2- "$GR/$RIG/last-pull-error")\"")"
+  # o last-pull-error é o resumo de sempre na 1ª linha (<epoch> <última linha do git>, + o porquê de não ter havido retry) e, abaixo, o stderr INTEIRO de todas as tentativas (até 200 linhas; o que passar disso é contado, não calado)
+  [ $PULL = ok ] || { grep -q . "$ef" || echo "o espelho não devolveu um filtro de dados válido (resposta vazia ou sem regras)" > "$ef"
+    { echo "$(now) $(grep . "$ef" | tail -n 1 | tr -d '"')${RETRY_NOTE:+ (retry não feito: $RETRY_NOTE)}"; sed -n '1,200p' "$ef"; [ "$(wc -l < "$ef")" -le 200 ] || echo "(… $(( $(wc -l < "$ef") - 200 )) linhas omitidas)"; } > "$GR/$RIG/last-pull-error"; }; rm -f "$ef"
+  lag_fields; echo "pull rig=$RIG resultado=$PULL main=$LAG_MAIN lag_min=$LAG_MIN$([ $PULL = erro ] && echo " erro=\"$(head -n 1 "$GR/$RIG/last-pull-error" | cut -d' ' -f2-)\"")"
   # o atraso fica REGISTRADO a cada pull (não só no wt-add): lag_min = idade da última varredura boa do espelho; null = o clone não tem carimbo (nunca vira 0)
   printf '{"ts":"%s","rig":"%s","pull":"%s","main":"%s","lag_min":%s}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RIG" "$PULL" "$LAG_MAIN" "$LAG_MIN" >> "$GR/pulls.jsonl" 2>/dev/null || echo "pull rig=$RIG AVISO: não consegui gravar $GR/pulls.jsonl"
   [ $PULL = ok ]
@@ -74,7 +113,7 @@ cmd_wt_rm() {
 }
 cmd_status() {
   local rigs r b o s p pre; rigs=${1:-$(ls "$GR" 2>/dev/null | while read -r r; do [ -d "$GR/$r/repo.git" ] && echo "$r"; done)}; [ -n "$rigs" ] || die 2 "nenhum clone"
-  for r in $rigs; do rig_of "$r"; lag_fields; echo "$RIG: main=$LAG_MAIN idade_do_origin_min=$LAG_MIN idade_do_commit_main_min=$MAIN_AGE último_pull_com_erro=[$(cut -d' ' -f2- "$GR/$RIG/last-pull-error" 2>/dev/null)]"
+  for r in $rigs; do rig_of "$r"; lag_fields; echo "$RIG: main=$LAG_MAIN idade_do_origin_min=$LAG_MIN idade_do_commit_main_min=$MAIN_AGE último_pull_com_erro=[$(head -n 1 "$GR/$RIG/last-pull-error" 2>/dev/null | cut -d' ' -f2-)] refs_fora_do_pull=[$(skipped_view)]"
     # os prefixos são os que o bootstrap deu a ESTE clone (crew/ worker/ + os do rig, em remote.origin.push): listar só crew/ e worker/ escondia branch pendente de outro prefixo
     pre=$(g config --get-all remote.origin.push | sed -n 's|^refs/heads/\(.*\)\*:refs/heads/.*|refs/heads/\1|p'); [ -n "$pre" ] || pre="refs/heads/crew/ refs/heads/worker/"
     # shellcheck disable=SC2086  # $pre: prefixos de ref sem espaço (o bootstrap só aceita [a-z0-9_-]/)
