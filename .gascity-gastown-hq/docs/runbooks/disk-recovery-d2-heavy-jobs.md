@@ -1,7 +1,7 @@
 # Disco D2 — parar jobs pesados reiniciáveis (allowlist) — ga-1p1i5jr.2
 
 ## Contents
-- O que é · Como chamar · Contrato (stdout e códigos) · A allowlist · O que o rfb retoma · Registro de "o que parei" · Retomar · Guardas · Selftest · Quem chama o quê
+- O que é · Como chamar · Contrato (stdout e códigos) · A allowlist · O que o rfb retoma (a pergunta do bead) · Registro de "o que parei" · Retomar · Guardas · Selftest · Quem chama o quê
 
 ## O que é
 Degrau D2 da escada de recuperação de disco (D1 limpeza de arquivos → **D2 parar jobs pesados reiniciáveis** → D3 reinício drenado de daemons de RAM → D4 reboot com guardas). Decisão do Athos para a épica `ga-1p1i5jr`: "a qualquer hora, com guardas" (AskUserQuestion na sessão do Mayor, 01/11/2026 ~11h BRT).
