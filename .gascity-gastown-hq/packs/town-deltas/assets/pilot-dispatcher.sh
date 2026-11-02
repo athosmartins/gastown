@@ -13749,7 +13749,7 @@ _pilot_wa_node_pass_check() {
   return 0
 }
 
-# _pilot_wa_node_pass_probe_note <id> <pista> — grava UMA linha `wa-node-pass-probe` por sonda (veredito, base, motivos, classes, caminhos que o classificador deu) e deixa em _PWP_TOKENS as palavras "veredito:classe"
+# _pilot_wa_node_pass_probe_note <id> <pista> [<classe-de-prioridade 0..4>] — grava UMA linha `wa-node-pass-probe` por sonda (veredito, base, motivos, classes, caminhos que o classificador deu) e deixa em _PWP_TOKENS as palavras "veredito:classe"
 # que o resumo da passada soma (ga-2hd02v.3.17: a passada de 05:39Z sondou 12 e mandou 0 ao nó, e o log só dizia "mini 5 · não sei 7" sem o porquê). A classe é o motivo até o 1º `:` (o resto é o caminho/palavra da bead).
 # vazio (reasons=[]: o classificador respondeu sem motivo) → "sem-motivo"; falhou/ilegível (reasons null: saída que o jq não leu) → "ilegivel"; sem saída por definição (timeout, error, missing) → "sem-saida": os três nunca se confundem.
 # Só observa: se a linha não grava ou o jq falha, avisa e segue — o veredito e o despacho não leem nada daqui. Sempre devolve 0.

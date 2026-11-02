@@ -104,7 +104,7 @@ sonda ilegivel vira sem-motivo	if $c == null then ["ilegivel"] elif	if $c == nul
 lista vazia de motivos vira ilegivel	then ["sem-motivo"]	then ["ilegivel"]
 timeout vira ilegivel	else ["sem-saida"] end)	else ["ilegivel"] end)
 classes saem so da lista cortada	(.reasons | map(tostring | split(":")[0] | gsub("[[:space:]]"; "_")) | unique)	(.reasons[:12] | map(tostring | split(":")[0] | gsub("[[:space:]]"; "_")) | unique)
-sem linha de sonda	_pilot_wa_node_pass_probe_note "$_pw_id" "$_pw_lane"; _pw_rsn="$_pw_rsn $_PWP_TOKENS"	:
+sem linha de sonda	_pilot_wa_node_pass_probe_note "$_pw_id" "$_pw_lane" "$(_pilot_priority_class_of "$_pw_pick")"; _pw_rsn="$_pw_rsn $_PWP_TOKENS"	:
 falha ao gravar a sonda nao avisa	|| warn "ga-2hd02v.3.17:	|| true "ga-2hd02v.3.17:
 resumo sem os motivos	stopped:$stop,reasons:$rs}	stopped:$stop}
 log sem os motivos	motivos: ${_pw_rs:-nenhum}	x
