@@ -215,9 +215,12 @@ read_swap_mb() {  # MB de swap EM USO, inteiro, em stdout. vazio → rc 1; falho
   if [ -n "${DR_SWAP_MB_FILE:-}" ]; then
     v=$(cat "$DR_SWAP_MB_FILE" 2>/dev/null) || return 1
   else
+    # O D3 já roda inteiro com LC_ALL=C exportado (linha 58), então o sysctl imprime o ponto mesmo sob o launchd do mini (LANG=pt_BR.UTF-8, onde o do dia a dia imprime 'used = 3015,31M';
+    # scripts/rea-run.sh:71): o D3 nunca ficou mudo por isso (quem ficou foi o maestro D1, que não exportava o LC_ALL). A vírgula também é aceita aqui como cinto e suspensório, para o dia em
+    # que alguém tirar aquela linha 58 ou o sysctl ignorar o LC_ALL; um parser que só conhece o ponto recusaria a rodada inteira (rc 30) e o degrau nunca agiria.
     out=$(sysctl -n vm.swapusage 2>/dev/null) || return 1
     v=$(awk '{for (i = 1; i <= NF; i++) if ($i == "used") { x = $(i + 2); u = substr(x, length(x)); n = substr(x, 1, length(x) - 1)
-          if (n ~ /^[0-9]+(\.[0-9]+)?$/ && (u == "M" || u == "G")) { if (u == "G") n = n * 1024; printf "%d", n; exit } } }' <<<"$out")
+          if (n ~ /^[0-9]+([.,][0-9]+)?$/ && (u == "M" || u == "G")) { sub(",", ".", n); if (u == "G") n = n * 1024; printf "%d", n; exit } } }' <<<"$out")
   fi
   isnum "$v" && [ "${#v}" -le 9 ] || return 1
   printf '%s' "$v"

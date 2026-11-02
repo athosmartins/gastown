@@ -14,25 +14,35 @@
 #   maestro (uma leitura isolada abaixo de 1,5 GB, p.ex. um go build que sobe e solta, não reinicia o mini); duas rodadas coladas (--run à mão ao lado de uma agendada) contam como UMA.
 #   HISTERESE: o cronômetro de um nível só ZERA quando o livre volta a limiar + 512 MB; entre os dois ele nem começa nem zera (um disco oscilando em volta de 3 GB por 5 h não reinicia o
 #   relógio de 60 min a cada subida de 100 MB). Só conta tempo de rodadas que EU li: lacuna > 10 min entre duas leituras (máquina parada, launchd fora, df ilegível) zera cronômetros e marcas.
-# TRÊS ESTADOS    tem / não-tem / não-consegui-saber. df ilegível ou swap ilegível NUNCA viram "tem bastante disco" nem "disco baixo": o maestro NÃO chama degrau nenhum, loga, avisa
+# TRÊS ESTADOS    tem / não-tem / não-consegui-saber. df ilegível NUNCA vira "tem bastante disco" nem "disco baixo": o maestro NÃO chama degrau nenhum, loga, avisa
 #   (notify -p 4, no máximo 1 por hora ENTREGUE — ver ENTREGA) e sai com 30; os cronômetros salvos ficam como estavam (se a falta de leitura passar de 10 min, a lacuna os zera na próxima leitura boa).
+#   O swap NÃO é leitura obrigatória: só entra no texto das mensagens e do log (os limiares são de disco). vm.swapusage ilegível → `swap=?` + "[swap NÃO verificado...]" no log e a rodada SEGUE (fail-open VISÍVEL; o
+#   último swap lido continua no estado, que só guarda número). Lido com LC_ALL=C e aceitando vírgula: sob o launchd do mini (pt_BR) o sysctl imprime "3015,31M", e tratar isso como ilegível desligava a escada inteira.
+#   Trava de instância única que não consigo tomar nem verificar (mkdir falha e a trava não existe, pid não gravável, trava velha que não sai, instância "viva" há mais de LOCK_MAX_MIN=60 min): NÃO é "outra instância"
+#   (essa é a saída 10, calada, o caso normal): WARN no log/stdout, notify -p 4 (no máximo 1 por hora ENTREGUE, marca `.gc/disk-recovery.nolock`) e saída 30, sem ler nem chamar degrau (sem saber se há outra instância,
+#   dois maestros chamariam o mesmo degrau, o D4 inclusive, duas vezes). Só notify, sem mail: o `gc mail` grava no Dolt, e a falta de espaço que quebra o mkdir tende a quebrar o mail junto; o notify já é o canal que a escada usa para tudo que tem de chegar (e o aviso do estado que não grava, o .nosave, é só notify pelo mesmo motivo).
 #   Relógio ilegível: idem, mas só log/stdout e saída 30 (sem hora não há como limitar o aviso a 1 por hora). Estado salvo ilegível, vazio, cortado (falta qualquer chave) ou inválido é guardado como
 #   `.corrupt-<hora>` (link duro, feito ANTES de o novo estado tomar o lugar dele por rename: o arquivo de estado nunca fica sem existir, senão a rodada seguinte seria "primeira rodada"), dito no log, e a rodada
 #   SEGUE com os cronômetros zerados (nada dispara por um histórico que não consegui ler) MAS com o `acted4_ts` = AGORA:
 #   não sei se o D4 acabou de disparar, e o reinício é a ação que não se repete na dúvida; o teto de 6 h vale e, se o disco seguir baixo, escala (notify -p 5 + mail) em vez de reiniciar.
-#   Só o arquivo AUSENTE é "primeira rodada" (acted4_ts=0); apagar o estado à mão é, de propósito, o jeito de zerar tudo, inclusive o teto de 6 h.
+#   Só o arquivo AUSENTE é "primeira rodada" (acted4_ts=0) — ausente = `-e` falso COM o diretório do estado existindo e pesquisável; um `-e` falso sem isso é erro de stat, tratado como ilegível (acted4_ts = agora).
+#   Apagar o estado à mão é, de propósito, o jeito de zerar tudo, inclusive o teto de 6 h.
 #   Estado que não consigo gravar: aviso no log, notify -p 4 (no máximo 1 por hora) e saída 30; e se a marca de ANTES da chamada de um degrau não puder ser gravada, o degrau NÃO é chamado (a rodada acaba, saída 30).
 #   Aviso de degrau que FALHOU: no máximo 1 notify + 1 mail por hora por degrau (a falha repete a cada 5 min; cada mail é um bead + commit no Dolt de uma máquina que está sem disco); "agiu" avisa sempre.
-# ENTREGA         Tentado ≠ entregue. Toda marca de "já avisei" (esc4 da escalada do teto de 6 h, ST=absent do degrau ausente, os carimbos de 1 h warn_ts/nt/ut do estado, o arquivo .nosave) só é gravada DEPOIS de algum canal
+# ENTREGA         Tentado ≠ entregue. Toda marca de "já avisei" (esc4 da escalada do teto de 6 h, ST=absent do degrau ausente, os carimbos de 1 h warn_ts/nt/ut do estado, os arquivos .nosave e .nolock) só é gravada DEPOIS de algum canal
 #   CONFIRMAR: notify de -p >= 4 sai com NOTIFY_FORCE_PUSH=1 e NOTIFY_STRICT_EXIT=1 (sem o STRICT o notify sai 0 em todo caminho que não empurrou; com ele 0 = push com 2xx, 10 = segurado até as 7h pelo silêncio 22h–7h e
 #   gravado no history.db para o flush das 7h, 11 = dedup; 0, 10 e 11 contam como entregue, 12/13/14/1 não) e `gc mail send` com rc 0; -p 3 segue o roteamento normal (rc 0 = o roteador aceitou). Sem confirmação a marca
 #   NÃO é gravada, o log diz "NÃO confirmado/NÃO entregue" e o aviso repete na rodada (ou na chamada do degrau) seguinte: o "preciso de um humano" não se perde porque o disco, o Dolt ou a rede falharam naquela tentativa.
 #   Mesmo contrato do send_notify/send_mail do disk-recovery-d4-guarded-reboot.sh, exceto que o D4 só aceita rc 0 (o aviso dele precisa chegar ANTES de um reinício). Os carimbos de 1 h são por degrau e por classe (FALHOU, NÃO LEU:
 #   o "agiu" não cala um FALHOU), e um carimbo do estado no FUTURO (relógio que andou para trás) não cala o aviso.
+#   Por que 11 (dedup) conta como entregue: os DOIS dedups do notify (already_pushed_recently = mesmo título e mesma mensagem; title_pushed_recently = mesmo TÍTULO com a mensagem diferente) só disparam quando um push com 2xx
+#   saiu há < 30 min (NOTIFY_DEDUP_MIN / NOTIFY_TITLE_DEDUP_MIN), então um aviso do mesmo assunto já está no celular. Custo aceito: com o mesmo título e a mensagem mudando, a nova só sai depois da janela (o título de cada aviso
+#   da escada é fixo por degrau e por classe). E um rc 0 pode ser calado, sem push, nos interruptores anteriores à política do notify (NOTIFY_DISABLE, PYTEST_CURRENT_TEST, preview): são de ambiente de teste, não do launchd
+#   (disk-recovery-d4-guarded-reboot.sh, send_notify).
 # ESTADO, LOG, INTERRUPTORES
 #   estado  $CITY/.gc/disk-recovery.state (chave=valor, escrito inteiro e trocado com mv)   log  $CITY/.gc/logs/disk-recovery.log (gira em 5 MB)
 #   `touch $CITY/.gc/disk-recovery.off` desliga o maestro (sai 10 sem ler nem agir; apague o arquivo para voltar). Instância única por trava (mkdir) — o `--dry-run` não toma a trava.
-#   O swap entra como leitura obrigatória e como contexto da mensagem; os limiares são de disco (a causa de 01/11 foi memória virando swap, e swap ocupa o mesmo disco).
+#   O swap é só contexto da mensagem (ver TRÊS ESTADOS); os limiares são de disco (a causa de 01/11 foi memória virando swap, e swap ocupa o mesmo disco).
 #   Reinício em laço: o `acted4_ts` é gravado ANTES de chamar o D4 (um reinício que mata este processo no meio não perde a marca; se a gravação falha, o D4 não é chamado) e o maestro não chama
 #   `d4 --run` de novo por 6 h depois de um rc 0; nesse caso, com o disco ainda < 3 GB, escala (notify -p 5 + mail, UMA vez por episódio, entregue: ver ENTREGA) em vez de reiniciar. A marca também vale quando o estado salvo some pela metade (ver TRÊS ESTADOS: acted4_ts = agora).
 #   Só se perde com o arquivo de estado AUSENTE (apagado à mão). O contrato pede que o D4 tenha cooldown próprio também (defesa em profundidade, ga-1p1i5jr.4); este maestro não depende disso.
@@ -42,7 +52,7 @@
 #   Cada degrau só entra quando o cronômetro DELE passou; um degrau por rodada; a marca de um degrau some quando o cronômetro dele zera. Ordem: a 1ª chamada de cada degrau no episódio
 #   vai em D2→D3→D4; as repetições vão do mais alto para o mais baixo (senão o D2 repetindo a cada 5 min ocuparia toda rodada atrasada e o D3/D4 nunca teriam vez).
 # MODOS           --run (launchd) · --dry-run (lê o estado salvo, aplica a leitura de agora numa cópia, chama os degraus com --dry-run, não grava estado/log, não avisa, não manda mail).
-#   Sai: 0 rodada feita · 10 interruptor ligado ou outra instância rodando · 20 um degrau falhou · 30 não consegui ler (não agiu) · 2 uso.
+#   Sai: 0 rodada feita · 10 interruptor ligado ou outra instância VIVA rodando · 20 um degrau falhou · 30 não consegui ler o disco, o relógio ou gravar o estado, ou não consegui tomar a trava (não agiu) · 2 uso.
 # VARIÁVEIS (teste) DR_CITY · DR_STATE · DR_LOG · DR_OFF_FILE · DR_LOCK · DR_FREE_MB_FILE / DR_SWAP_MB_FILE (arquivo com o livre / o swap em MB, no lugar de df / sysctl) · DR_NOW_FILE (epoch)
 #   · DR_D2_CMD/DR_D3_CMD/DR_D4_CMD · DR_NOTIFY_BIN · DR_GC_BIN · DR_<NOME> numérico = os nomes da lista `cfg` abaixo (valor que não é número, ou que fica abaixo do mínimo da regra, cai no padrão e é dito no log).
 # TESTE           bash scripts/disk-recovery-ladder.selftest.sh   (hermético: df, swap, relógio, degraus, notify e mail simulados; nada real é parado nem reiniciado)
@@ -65,6 +75,8 @@ VOLUME="/System/Volumes/Data"
 DRY=""
 CFG_WARN=""
 RB_OUT=""
+SWAPNOTE=""  # " [swap NÃO verificado...]" quando o vm.swapusage não foi lido nesta rodada (vai no fim das linhas de leitura/batimento do log)
+LOCK_WHY=""  # por que o acquire_lock devolveu 2 (não consegui tomar nem verificar a trava)
 LOCK_HELD=0
 RC_FINAL=0
 SAVE_FAIL=0
@@ -88,7 +100,7 @@ cfg D4_MB 3072;  cfg D4_HOLD_S 3600
 cfg D4_HARD_MB 1536; cfg D4_HARD_N 2 1; cfg D4_HARD_SPACE_S 100
 cfg HYST_MB 512; cfg GAP_S 600; cfg RETRY_S 300; cfg ACTED_REPEAT_S 1800; cfg D4_COOLDOWN_S 21600
 cfg RUNG_TIMEOUT_S 900; cfg SETTLE_S 15; cfg WARN_EVERY_S 3600; cfg HEARTBEAT_S 3600; cfg LOG_MAX_KB 5120
-cfg NOTIFY_TIMEOUT_S 30; cfg MAIL_TIMEOUT_S 60
+cfg NOTIFY_TIMEOUT_S 30; cfg MAIL_TIMEOUT_S 60; cfg LOCK_MAX_MIN 60 1
 
 log()  { if [ "$DRY" = 1 ]; then printf '[dry-run] %s\n' "$*"; else printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$LOG" 2>/dev/null || true; fi; }
 note() { log "$*"; [ "$DRY" = 1 ] || printf '%s\n' "$*"; }
@@ -124,22 +136,25 @@ read_free_mb() {  # MB livres do volume Data, inteiro, em stdout. vazio → rc 1
 }
 
 read_swap_mb() {  # MB de swap EM USO, inteiro, em stdout. vazio → rc 1; falhou/ilegível/unidade que não é M nem G → rc 1 (não sei ≠ 0 MB de swap)
+  # LC_ALL=C no sysctl: sob o launchd do mini (LANG=pt_BR.UTF-8) ele imprime o decimal com VÍRGULA ("used = 3015,31M": scripts/rea-run.sh:71 e :211, medido em produção), e um parser que só
+  # conhece o ponto recusava 100% das linhas agendadas. A vírgula também é aceita (e trocada por ponto antes da conta: "2,50G" = 2560, não 2048) caso o LC_ALL=C não valha.
   local out v
   if [ -n "${DR_SWAP_MB_FILE:-}" ]; then
     v=$(cat "$DR_SWAP_MB_FILE" 2>/dev/null) || return 1
   else
-    out=$(sysctl -n vm.swapusage 2>/dev/null) || return 1
+    out=$(LC_ALL=C sysctl -n vm.swapusage 2>/dev/null) || return 1
     v=$(printf '%s\n' "$out" | awk '{for (i = 1; i <= NF; i++) if ($i == "used") { x = $(i + 2); u = substr(x, length(x)); n = substr(x, 1, length(x) - 1)
-          if (n ~ /^[0-9]+(\.[0-9]+)?$/ && (u == "M" || u == "G")) { if (u == "G") n = n * 1024; printf "%d", n; exit } } }')
+          if (n ~ /^[0-9]+([.,][0-9]+)?$/ && (u == "M" || u == "G")) { sub(",", ".", n); if (u == "G") n = n * 1024; printf "%d", n; exit } } }')
   fi
   isnum "$v" && [ "${#v}" -le 9 ] || return 1
   printf '%s' "$v"
 }
 
-measure() {  # lê livre e swap → M_FREE, M_SWAP; rc 0 só se OS DOIS foram lidos. Diz em M_WHY o que faltou
-  M_FREE=""; M_SWAP=""; M_WHY=""
+measure() {  # lê livre e swap → M_FREE, M_SWAP; rc 0 só se o DISCO foi lido (M_WHY diz o que faltou). O swap só entra no TEXTO das mensagens e do log, não decide nada (os limiares são de disco):
+  # ilegível → M_SWAP="?" e M_NOTE (visível no log e na mensagem), a rodada SEGUE. Fail-open VISÍVEL: um defeito cosmético do swap não desliga a rede de segurança inteira (o de pt_BR foi exatamente isso)
+  M_FREE=""; M_SWAP=""; M_WHY=""; M_NOTE=""
   M_FREE=$(read_free_mb) || { M_FREE=""; M_WHY="df de $VOLUME ilegível"; }
-  M_SWAP=$(read_swap_mb) || { M_SWAP=""; M_WHY="${M_WHY:+$M_WHY; }swap (vm.swapusage) ilegível"; }
+  M_SWAP=$(read_swap_mb) || { M_SWAP="?"; M_NOTE=" [swap NÃO verificado: vm.swapusage ilegível; só texto, não decide nada]"; }
   [ -z "$M_WHY" ]
 }
 
@@ -208,11 +223,14 @@ state_ok() {  # valida o que foi lido: a marca v=1 existe, TODAS as chaves do sa
 
 load_state() {  # vazio (arquivo ausente) → 1ª rodada, estado zerado, sem aviso, acted4_ts=0; falhou/ilegível/0 bytes/chave que falta/campo inválido → AVISA, estado zerado (cronômetros recomeçam: nada dispara por histórico que não li)
   # MAS acted4_ts=AGORA (não sei se o D4 acabou de disparar: o teto de 6 h vale) e o arquivo ruim é guardado como .corrupt-<hora> (ASIDE: link duro no save_state, antes de o novo estado tomar o lugar dele por rename). Precisa de $NOW.
-  local k="" v=""   # inicializadas: um `read` que falha na 1ª linha (o estado é um diretório, erro de E/S) não atribui o k, e sob `set -u` o `[ -n "$k" ]` do laço mataria a rodada, toda rodada, sem aviso
+  local k="" v="" sd   # k e v inicializadas: um `read` que falha na 1ª linha (o estado é um diretório, erro de E/S) não atribui o k, e sob `set -u` o `[ -n "$k" ]` do laço mataria a rodada, toda rodada, sem aviso
   state_reset
   SEEN=" "
-  [ -e "$STATE" ] || { log "estado: primeira rodada (sem $STATE)"; return 0; }
-  if [ -r "$STATE" ] && [ -s "$STATE" ]; then
+  # AUSENTE de verdade = o `-e` é falso E o diretório do estado existe e dá para pesquisar nele. Sem isso o `-e` falso pode ser um erro de stat (sem permissão no diretório...), que NÃO é "primeira rodada"
+  # (primeira rodada = acted4_ts 0 = teto de 6 h perdido): vai para o ramo "ilegível" abaixo (acted4_ts = agora)
+  sd=$(dirname "$STATE")
+  if [ ! -e "$STATE" ] && [ -d "$sd" ] && [ -x "$sd" ]; then log "estado: primeira rodada (sem $STATE)"; return 0; fi
+  if [ -e "$STATE" ] && [ -r "$STATE" ] && [ -s "$STATE" ]; then
     # `|| [ -n "$k" ]`: a última linha SEM \n final faz o read devolver 1 e o corpo do laço não rodar → o campo final seria ignorado em
     # silêncio e o arquivo passaria como válido (o save_state sempre termina com \n; isto cobre arquivo cortado ou editado à mão)
     while IFS='=' read -r k v || [ -n "$k" ]; do
@@ -379,7 +397,9 @@ run_rung() {  # $1=n $2=agora. rc 1 = degrau ausente (não gastou a rodada; o ch
   if measure; then
     after=$M_FREE; swap2=$M_SWAP; FREE=$M_FREE; SWAP=$M_SWAP
     update_timers "$M_FREE" "$t2" 0
-    LAST_TS=$t2; LAST_FREE=$M_FREE; LAST_SWAP=$M_SWAP
+    LAST_TS=$t2; LAST_FREE=$M_FREE
+    isnum "$M_SWAP" && LAST_SWAP=$M_SWAP   # swap "?" (não verificado): o último valor LIDO fica; o estado só guarda número
+    [ -z "$M_NOTE" ] || log "WARN: re-medição depois do D$n:$M_NOTE"
   else
     log "WARN: re-medição depois do D$n falhou ($M_WHY): sigo sem mexer nos cronômetros"
   fi
@@ -466,10 +486,25 @@ pick_and_run() {  # $1=agora. UM degrau por rodada, só os que têm o cronômetr
 }
 
 # ── trava de instância única ─────────────────────────────────────────────────────────────────────────────────────────────────────
-acquire_lock() {  # rc 0 = peguei; rc 1 = outra instância viva. Trava velha (pid morto, ou vivo mas não é este script) é refeita. Sem pid ainda (mkdir feito, echo pendente) e dir novo (< 1 min) = ocupado
+acquire_lock() {  # rc 0 = peguei · rc 1 = OUTRA INSTÂNCIA VIVA tem a trava (ocupado: o chamador sai 10, calado, é o caso normal) · rc 2 = NÃO CONSEGUI tomar nem verificar a trava (TERCEIRO ESTADO; LOCK_WHY diz qual):
+  # o mkdir falhou e a trava não existe (diretório pai sem escrita, disco sem espaço, montagem somente leitura, um arquivo no lugar), criei a trava mas não consegui gravar o pid nela, uma trava velha que não consigo
+  # remover, ou uma trava de instância "viva" há mais de LOCK_MAX_MIN. Nada disso é "outra instância": o chamador NÃO age e AVISA (saída 30), como o D2 (rc 2) e o D3 (saída 30) fazem com a trava deles.
+  # Trava velha (pid morto, ou vivo mas não é este script) é refeita. Sem pid ainda (mkdir feito, echo pendente) e dir novo (< 1 min) = ocupado
   local p c tries=0
+  LOCK_WHY=""
   while [ "$tries" -lt 2 ]; do
-    if mkdir "$LOCK" 2>/dev/null; then echo $$ > "$LOCK/pid" 2>/dev/null; LOCK_HELD=1; return 0; fi
+    if mkdir "$LOCK" 2>/dev/null; then
+      if { echo $$ > "$LOCK/pid"; } 2>/dev/null; then LOCK_HELD=1; return 0; fi
+      # trava sem dono (sem pid) viraria "ocupada" por 1 min para a rodada seguinte, e a que a gravou meio escrita idem: desfaz
+      rm -f "$LOCK/pid" 2>/dev/null; rmdir "$LOCK" 2>/dev/null
+      LOCK_WHY="criei $LOCK mas não consegui gravar o pid nela (sem permissão ou sem espaço)"
+      return 2
+    fi
+    if [ ! -d "$LOCK" ]; then
+      # o mkdir falhou e a trava NÃO existe: não foi "já existe". Uma 2ª tentativa cobre a outra instância que soltou a trava entre o nosso mkdir e este teste (o laço roda 2 vezes); a 2ª falha é rc 2
+      LOCK_WHY="mkdir $LOCK falhou e a trava não existe (sem permissão, sem espaço, montagem somente leitura ou um arquivo no lugar)"
+      tries=$((tries + 1)); continue
+    fi
     # vazio (sem pid) → ocupado se o dir é novo; falhou/ilegível → idem: na dúvida a outra instância é a dona
     p=$(cat "$LOCK/pid" 2>/dev/null)
     if [ -z "$p" ]; then
@@ -477,24 +512,43 @@ acquire_lock() {  # rc 0 = peguei; rc 1 = outra instância viva. Trava velha (pi
     elif kill -0 "$p" 2>/dev/null; then
       # pid vivo: só é trava velha se o ps LEU outro comando (pid reaproveitado). vazio (ps sem saída) → dúvida → a outra instância é a dona; falhou/ilegível → idem
       c=$(ps -p "$p" -o command= 2>/dev/null)
-      case "$c" in ''|*disk-recovery-ladder*) return 1 ;; esac
+      case "$c" in
+        ''|*disk-recovery-ladder*)
+          # dono vivo, mas só é "ocupado" enquanto for plausível: uma rodada legítima acaba em minutos (o degrau mais longo tem 900 s). Mais velha que LOCK_MAX_MIN é instância PRESA (df pendurado num disco doente,
+          # pid reaproveitado por um editor que tem o nome do script na linha de comando): "ocupado" para sempre seria uma escada morta e muda. Não roubo a trava de um processo vivo: só aviso. find sem resposta = idade desconhecida = ocupado
+          [ -n "$(find "$LOCK" -maxdepth 0 -mmin +"$LOCK_MAX_MIN" 2>/dev/null)" ] || return 1
+          LOCK_WHY="o pid $p tem a trava há mais de ${LOCK_MAX_MIN} min (uma rodada legítima acaba em minutos: instância presa?)"
+          return 2 ;;
+      esac
     fi
+    LOCK_WHY="trava velha em $LOCK (pid '${p:-nenhum}' morto, de outro programa ou sem dono há > 1 min) que não consegui remover"
     rm -f "$LOCK/pid" 2>/dev/null; rmdir "$LOCK" 2>/dev/null
+    # ainda existe e está VAZIA: não consigo removê-la (diretório pai sem escrita) → não sei: rc 2 já, sem a 2ª volta (que a veria "nova" porque o rm do pid mexeu na hora dela e diria "ocupado").
+    # Ainda existe com algo dentro: alguém acabou de gravar o pid dela → a volta seguinte reavalia (e, se for o mesmo caso, o laço acaba em rc 2)
+    if [ -d "$LOCK" ] && [ -z "$(ls -A "$LOCK" 2>/dev/null)" ]; then return 2; fi
     tries=$((tries + 1))
   done
-  return 1
+  return 2
 }
 release_lock() { if [ "$LOCK_HELD" = 1 ]; then rm -f "$LOCK/pid" 2>/dev/null; rmdir "$LOCK" 2>/dev/null; LOCK_HELD=0; fi; return 0; }
 
-nosave_warn() {  # estado que não grava: a escada não guarda tempo e não chama degrau. Avisa -p 4 forçado, no máx. 1 por hora; a marca do aviso é um arquivo VAZIO em $GCDIR (tocar um que já existe não gasta bloco) e só é tocada com o notify CONFIRMADO
-  local m="$GCDIR/disk-recovery.nosave"
+warn_hourly() {  # $1=nome da marca (arquivo VAZIO em $GCDIR; tocar um que já existe não gasta bloco) $2=título $3=mensagem. Avisa -p 4 forçado, no máx. 1 por hora; a marca só é tocada com o notify CONFIRMADO (tentado ≠ entregue).
+  # Se nem a marca se grava (disco sem nenhum espaço, $GCDIR sem escrita) o limite fica com o dedup de 30 min do próprio notify (rc 11 conta como entregue), em vez de a cada rodada
+  local m="$GCDIR/$1"
   [ "$DRY" = 1 ] && return 0
   # vazio (sem marca) → avisa; falhou/ilegível (find sem resposta) → avisa: aqui o silêncio é o lado perigoso
   [ -z "$(find "$m" -maxdepth 0 -mmin -60 2>/dev/null)" ] || return 0
-  if send_notify 4 "Disco: a escada não consegue gravar o estado" "Não consegui gravar $STATE. A escada de recuperação NÃO chama degrau nenhum enquanto isso (sem a marca no disco um reinício se repetiria). (aviso no máximo 1 por hora)"; then
+  if send_notify 4 "$2" "$3"; then
     { : > "$m"; } 2>/dev/null
   fi
   return 0
+}
+nosave_warn() {  # estado que não grava: a escada não guarda tempo e não chama degrau
+  warn_hourly disk-recovery.nosave "Disco: a escada não consegue gravar o estado" "Não consegui gravar $STATE. A escada de recuperação NÃO chama degrau nenhum enquanto isso (sem a marca no disco um reinício se repetiria). (aviso no máximo 1 por hora)"
+}
+nolock_warn() {  # trava que não consigo tomar nem verificar (acquire_lock rc 2): sem saber se há outra instância a escada não lê nem chama degrau (duas instâncias chamariam o mesmo degrau, o D4 inclusive, duas vezes)
+  note "WARN: não consegui tomar nem verificar a trava de instância única ($LOCK): $LOCK_WHY. NÃO sei se há outra instância: não leio e não chamo degrau nenhum nesta rodada; saio com 30"
+  warn_hourly disk-recovery.nolock "Disco: a escada não consegue tomar a trava" "Não consegui tomar nem verificar a trava de instância única da escada ($LOCK): $LOCK_WHY. NÃO sei se há outra instância, então a escada NÃO lê o disco nem chama degrau nenhum enquanto isso. (aviso no máximo 1 por hora)"
 }
 
 rotate_log() {  # log acima de LOG_MAX_KB vira .1 (um só backup). tamanho ilegível → não gira (log maior que o previsto é melhor que log perdido)
@@ -515,7 +569,12 @@ main() {
   if [ -e "$OFF" ]; then note "interruptor ligado ($OFF): não leio, não ajo"; exit 10; fi
 
   if [ "$DRY" != 1 ]; then
-    acquire_lock || { log "outra instância em execução ($LOCK): saio"; exit 10; }
+    acquire_lock; lock_rc=$?
+    case "$lock_rc" in
+      0) ;;
+      1) log "outra instância em execução ($LOCK): saio"; exit 10 ;;
+      *) nolock_warn; exit 30 ;;   # 2 = não consegui tomar nem verificar a trava: terceiro estado, não é "outra instância" (calar aqui deixaria a escada morta e muda)
+    esac
     trap release_lock EXIT
   fi
 
@@ -531,7 +590,7 @@ main() {
     save_state
     exit 30
   fi
-  FREE=$M_FREE; SWAP=$M_SWAP
+  FREE=$M_FREE; SWAP=$M_SWAP; SWAPNOTE=$M_NOTE
 
   # lacuna: tempo que ninguém observou não conta como "abaixo do limiar". Relógio que andou para trás idem.
   if [ "$LAST_TS" -gt 0 ] && { [ "$NOW" -lt "$LAST_TS" ] || [ $(( NOW - LAST_TS )) -gt "$GAP_S" ]; }; then
@@ -540,13 +599,14 @@ main() {
   fi
 
   update_timers "$FREE" "$NOW" 1
-  LAST_TS=$NOW; LAST_FREE=$FREE; LAST_SWAP=$SWAP
+  LAST_TS=$NOW; LAST_FREE=$FREE
+  isnum "$SWAP" && LAST_SWAP=$SWAP   # swap "?" (não verificado): o último valor LIDO fica; o estado só guarda número (state_ok exige)
 
   if [ "$SINCE2" -gt 0 ] || [ "$SINCE3" -gt 0 ] || [ "$SINCE4" -gt 0 ] || [ "$FREE" -le $((D2_MB + HYST_MB)) ] || [ "$DRY" = 1 ]; then
-    log "leitura: livre=${FREE}MB swap=${SWAP}MB | abaixo há: D2=$(held_of 2 "$NOW")s/${D2_HOLD_S}s D3=$(held_of 3 "$NOW")s/${D3_HOLD_S}s D4=$(held_of 4 "$NOW")s/${D4_HOLD_S}s | < ${D4_HARD_MB}MB seguidas=$HARD_N/${D4_HARD_N} | marcas D2=$ST2 D3=$ST3 D4=$ST4"
+    log "leitura: livre=${FREE}MB swap=${SWAP}MB | abaixo há: D2=$(held_of 2 "$NOW")s/${D2_HOLD_S}s D3=$(held_of 3 "$NOW")s/${D3_HOLD_S}s D4=$(held_of 4 "$NOW")s/${D4_HOLD_S}s | < ${D4_HARD_MB}MB seguidas=$HARD_N/${D4_HARD_N} | marcas D2=$ST2 D3=$ST3 D4=$ST4$SWAPNOTE"
   elif [ $(( NOW - HB_TS )) -ge "$HEARTBEAT_S" ]; then
     HB_TS=$NOW
-    log "ok: livre=${FREE}MB swap=${SWAP}MB (sem episódio; batimento 1/h)"
+    log "ok: livre=${FREE}MB swap=${SWAP}MB (sem episódio; batimento 1/h)$SWAPNOTE"
   fi
 
   save_state

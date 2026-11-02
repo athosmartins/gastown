@@ -5,8 +5,11 @@
 #   passam em segundos), os degraus D2/D3/D4 (stubs que registram a chamada e devolvem o rc que o teste manda), `notify` e `gc mail` (stubs que anotam a chamada e falham quando o teste manda; o `notify` imita os
 #   códigos de política do de verdade quando recebe NOTIFY_STRICT_EXIT=1: 10 segurado, 11 dedup, 12 resumo/teto). Nada real é parado, reiniciado ou enviado. O trecho que lê o `df`/`sysctl` de verdade é testado
 #   com shims no PATH (o `df` shim também prova que NUNCA se lê `df /`); `mv`, `ln` e `cp` com defeito entram do mesmo jeito, para provar que o arquivo de estado nunca fica sem existir.
-# O QUE É VERIFICADO  uma seção por regra do maestro (títulos abaixo): fronteiras dos limiares, histerese, lacuna, ordem e um degrau por rodada, piso duro, teto de 6 h do D4, leituras ilegíveis = não age,
+# O QUE É VERIFICADO  uma seção por regra do maestro (títulos abaixo): fronteiras dos limiares, histerese, lacuna, ordem e um degrau por rodada, piso duro, teto de 6 h do D4, df ilegível = não age,
 #   e "tentado ≠ entregue": nenhuma marca de "já avisei" é gravada sem um canal confirmar (notify e mail falhando → a rodada seguinte avisa de novo).
+#   Gate-fix 3: (a) swap ilegível NÃO trava a escada (só entra no texto: segue com o df e DIZ "swap NÃO verificado"), o `sysctl` é chamado sempre com LC_ALL=C e a vírgula do pt_BR (launchd) é lida;
+#   (b) a trava de instância única tem TRÊS estados: peguei / outra instância viva (10, calado) / não consegui tomar nem verificar (30 + aviso -p 4, no máx. 1/h, entregue-depois-carimbado).
+#   As seções novas ficam logo no começo do arquivo: um mutante rodado com ST_FAILFAST=1 é pego em segundos, sem esperar o arquivo inteiro.
 # COMO RODAR     bash scripts/disk-recovery-ladder.selftest.sh        (~3-5 min sob carga)
 #   O caminho de quem tem o disco apertado é pelo guarda: scripts/heavy-guard.sh --what selftest-hq --max-file-mb 512 -- bash scripts/disk-recovery-ladder.selftest.sh
 #   Para testar uma cópia modificada do maestro (mutantes): DR_LADDER_PATH=/caminho/disk-recovery-ladder.mutN.sh ST_FAILFAST=1 bash scripts/disk-recovery-ladder.selftest.sh
@@ -46,13 +49,14 @@ for n in d2 d3 d4; do
   cp /dev/null "$W/stubs/$n"
   cat > "$W/stubs/$n" <<'STUB'
 #!/bin/bash
-# degrau simulado. Modo em $STUB_DIR/mode.<nome>: linhas rc=N msg=... setfree=N slp=N killp=1 waitfor=ARQUIVO (espera o arquivo existir, no máx. 30 s: segura o degrau sem depender da velocidade da máquina)
-n=$(basename "$0"); rc=0; msg="stub $n"; setfree=""; slp=0; killp=0; waitfor=""
+# degrau simulado. Modo em $STUB_DIR/mode.<nome>: linhas rc=N msg=... setfree=N setswap=MISSING (apaga o arquivo do swap: o swap só fica ilegível na re-medição que vem depois do degrau) slp=N killp=1 waitfor=ARQUIVO (espera o arquivo existir, no máx. 30 s: segura o degrau sem depender da velocidade da máquina)
+n=$(basename "$0"); rc=0; msg="stub $n"; setfree=""; setswap=""; slp=0; killp=0; waitfor=""
 [ -f "$STUB_DIR/mode.$n" ] && . "$STUB_DIR/mode.$n"
 echo "$n $1" >> "$STUB_DIR/calls"
 echo $$ > "$STUB_DIR/pid.$n"
 cp "$DR_STATE" "$STUB_DIR/state_at_call.$n" 2>/dev/null
 [ -n "$setfree" ] && printf '%s' "$setfree" > "$DR_FREE_MB_FILE"
+[ "$setswap" = MISSING ] && rm -f "$DR_SWAP_MB_FILE"
 [ "$killp" = 1 ] && kill -9 "$PPID"
 [ "$slp" -gt 0 ] && sleep "$slp"
 w=0; while [ -n "$waitfor" ] && [ ! -e "$waitfor" ] && [ "$w" -lt 300 ]; do sleep 0.1; w=$((w+1)); done
@@ -95,9 +99,13 @@ esac
 STUB
 cat > "$W/bin/sysctl" <<'STUB'
 #!/bin/bash
+echo "LC_ALL=${LC_ALL:-unset}" >> "$STUB_DIR/sysctl.env"     # com que LC_ALL o maestro chamou (o sysctl de verdade muda o decimal com ele)
 case "${STUB_SYSCTL_MODE:-ok}" in
   ok)      echo "total = 2048.00M  used = 1536.25M  free = 511.75M  (encrypted)" ;;
   gig)     echo "total = 4096.00M  used = 2.50G  free = 1.50G  (encrypted)" ;;
+  comma)   echo "total = 2048,00M  used = 1536,25M  free = 511,75M  (encrypted)" ;;      # o que o mini imprime sob o launchd (pt_BR): 'used = 3015,31M' (scripts/rea-run.sh:71)
+  commagig) echo "total = 4096,00M  used = 2,50G  free = 1,50G  (encrypted)" ;;
+  locale)  case "${LC_ALL:-}" in C) echo "total = 2048.00M  used = 1536.25M  free = 511.75M  (encrypted)" ;; *) echo "total = 2048,00M  used = 1536,25M  free = 511,75M  (encrypted)" ;; esac ;;   # como o real: ponto só com LC_ALL=C
   fail)    exit 1 ;;
   garbage) echo "total = ?  used = ??  free = ?" ;;
   kilo)    echo "total = 2048.00M  used = 1536.25K  free = 511.75M  (encrypted)" ;;
@@ -174,6 +182,90 @@ eq "$(nnotify p=)" 0 "interruptor: df ilegível NÃO avisou (nem leu)"
 has "$OUT" "interruptor ligado" "interruptor: diz no stdout/log"
 rm -f "$OFF"; tick 20000 0 "$T0"; eq "$RC" 0 "interruptor desligado: volta a rodar"
 
+section "trava que não consigo tomar nem verificar: TERCEIRO ESTADO (gate-fix 3) — saída 30 + aviso, nunca 'outra instância' calada"
+# Antes: o mkdir falhava por um motivo que não era "já existe" (diretório sem escrita, disco sem espaço, um arquivo no lugar), o `cat pid` vinha vazio, o `find` não achava a pasta e a rodada saía 10, calada,
+# culpando uma 2ª instância que não existe: a escada morta e muda, sem o alarme que o estado não gravável já tem. Agora é rc 2 do acquire_lock → WARN + notify -p 4 (1 por hora, entregue) + saída 30.
+NL='p=4 force=1 t=Disco: a escada não consegue tomar a trava'
+NOLOCK="$CITY/.gc/disk-recovery.nolock"
+reset; : > "$LOCK"; tick 20000 0 "$T0"
+eq "$RC,$(nnotify "$NL")" "30,1" "um ARQUIVO no lugar da trava (o mkdir falha e não há diretório) → 30 e 1 aviso -p 4 forçado, não 10 calado"
+has "$OUT" "não consegui tomar nem verificar a trava" "…WARN no stdout"
+has "$(logtxt)" "mkdir $LOCK falhou e a trava não existe" "…e o log diz o motivo"
+eq "$(ncallall)" 0 "…sem chamar degrau"
+[ ! -e "$STATE" ] && ok "…e sem ler nem gravar o estado (a rodada nem começou)" || nope "gravou estado sem ter a trava"
+setfree 20000; setswap 0; printf '%s' "$T0" > "$W/now"; runl --dry-run
+eq "$RC" 0 "dry-run não toma a trava: roda do mesmo jeito com ela inviável"
+tick 20000 0 $((T0 + 120))
+eq "$(nnotify "$NL")" 1 "…no máximo 1 por hora (2ª rodada calada)"
+touch -t 200001010000 "$NOLOCK"; tick 20000 0 $((T0 + 240))
+eq "$(nnotify "$NL")" 2 "…e de novo depois de 1 h"
+# tentado ≠ entregue: a marca de 1 h só é gravada depois que o notify CONFIRMOU
+reset; : > "$LOCK"; echo fail > "$SD/notify.mode"; tick 20000 0 "$T0"
+eq "$(nnotify "$NL")" 1 "trava inviável com o notify falhando: 1 tentativa"
+[ ! -e "$NOLOCK" ] && ok "…e a marca de 1 h NÃO é gravada" || nope "marca gravada sem o notify confirmar"
+rm -f "$SD/notify.mode"; tick 20000 0 $((T0 + 120))
+eq "$(nnotify "$NL")" 2 "…notify de volta: a rodada seguinte avisa"
+[ -e "$NOLOCK" ] && ok "…e só então grava a marca" || nope "marca não gravada depois da entrega"
+for code in 10 11; do   # STRICT: 10 segurado até as 7h e 11 dedup = o aviso está garantido (mesma leitura do resto do maestro)
+  reset; : > "$LOCK"; echo "strict=$code" > "$SD/notify.mode"; tick 20000 0 "$T0"; tick 20000 0 $((T0 + 120))
+  eq "$(nnotify "$NL"),$([ -e "$NOLOCK" ] && echo marca || echo sem)" "1,marca" "notify rc=$code com STRICT (segurado até as 7h / dedup): conta como entregue, a marca é gravada e a rodada seguinte não repete"
+done
+reset; : > "$LOCK"; echo "strict=12" > "$SD/notify.mode"; tick 20000 0 "$T0"; tick 20000 0 $((T0 + 120))
+eq "$(nnotify "$NL"),$([ -e "$NOLOCK" ] && echo marca || echo sem)" "2,sem" "notify rc=12 com STRICT (resumo mudo, nada saiu): NÃO é entrega, sem marca, repete na rodada seguinte"
+# 2ª tentativa do mkdir: a outra instância pode soltar a trava entre o nosso mkdir (falhou) e o teste "existe?"; isso NÃO é terceiro estado
+mkdir -p "$W/mkbin2"
+printf '#!/bin/bash\ncase "$*" in *disk-recovery.lock) [ -e "$STUB_DIR/mk.once" ] || { : > "$STUB_DIR/mk.once"; exit 1; } ;; esac\nexec /bin/mkdir "$@"\n' > "$W/mkbin2/mkdir"; chmod 755 "$W/mkbin2/mkdir"
+reset; XENV=("PATH=$W/mkbin2:$PATH"); tick 20000 0 "$T0"
+eq "$RC,$(nnotify "$NL")" "0,0" "o 1º mkdir falha sem haver trava (a outra instância soltou no meio) e o 2º passa: a rodada roda (0), sem alarme falso"
+# instância VIVA com a trava há mais de LOCK_MAX_MIN: presa (df pendurado num disco doente, pid reaproveitado por um editor que tem o nome do script). Calar para sempre (10) é a escada morta e muda
+mkdir -p "$W/psbin2"; printf '#!/bin/bash\necho "/bin/bash /x/disk-recovery-ladder.sh --run"\n' > "$W/psbin2/ps"; chmod 755 "$W/psbin2/ps"
+reset; sleep 30 & other=$!; mkdir "$LOCK"; echo "$other" > "$LOCK/pid"; XENV=("PATH=$W/psbin2:$PATH")
+tick 20000 0 "$T0"
+eq "$RC,$(nnotify "$NL")" "10,0" "dono VIVO (ps lê o maestro) com a trava há < 60 min → 10 calado: é o caso normal, sem aviso"
+touch -t 200001010000 "$LOCK"; tick 20000 0 $((T0 + 120))
+eq "$RC,$(nnotify "$NL")" "30,1" "dono vivo com a trava há > 60 min → 30 e 1 aviso (instância presa)"
+has "$(logtxt)" "tem a trava há mais de 60 min" "…o log diz que a instância está presa"
+[ "$(cat "$LOCK/pid" 2>/dev/null)" = "$other" ] && ok "…e a trava do processo vivo fica intacta (aviso, não roubo)" || nope "a trava de um processo vivo foi mexida"
+kill "$other" 2>/dev/null; wait "$other" 2>/dev/null
+reset; XENV=(DR_LOCK_MAX_MIN=0); tick 20000 0 "$T0"
+has "$(logtxt)" "DR_LOCK_MAX_MIN='0'->60" "DR_LOCK_MAX_MIN=0 (abaixo do mínimo, 1: toda trava viva viraria 'presa') cai no padrão e o log diz"
+if [ "$(id -u)" != 0 ]; then
+  reset; mkdir -p "$W/ro"; chmod 555 "$W/ro"; XENV=("DR_LOCK=$W/ro/lock")
+  tick 20000 0 "$T0"
+  eq "$RC,$(nnotify "$NL"),$(ncallall)" "30,1,0" "diretório da trava SEM ESCRITA (a sonda do revisor: antes saía 10 calado) → 30, 1 aviso e nenhum degrau"
+  chmod 755 "$W/ro"
+  # o mkdir passa, mas a trava nasce sem permissão de escrita e o pid não grava (shim de mkdir)
+  mkdir -p "$W/mkbin"
+  printf '#!/bin/bash\n/bin/mkdir "$@" || exit $?\nfor a in "$@"; do case "$a" in */disk-recovery.lock) chmod 555 "$a" ;; esac; done\n' > "$W/mkbin/mkdir"; chmod 755 "$W/mkbin/mkdir"
+  reset; XENV=("PATH=$W/mkbin:$PATH"); tick 20000 0 "$T0"
+  eq "$RC,$(nnotify "$NL")" "30,1" "mkdir passou mas o pid não grava → 30 e 1 aviso"
+  has "$(logtxt)" "não consegui gravar o pid" "…o log diz"
+  [ ! -d "$LOCK" ] && ok "…e a trava sem dono foi desfeita (senão a rodada seguinte ficaria 'ocupada' por 1 min)" || nope "a trava sem pid sobrou"
+  XENV=(); tick 20000 0 $((T0 + 120)); eq "$RC" 0 "…sem o defeito a rodada seguinte roda normal"
+  # trava velha (pid morto) que não sai: diretório pai sem escrita (o rmdir falha) e, em outro arranjo, o próprio diretório da trava sem escrita (o rm do pid falha)
+  ( : ) & dead=$!; wait "$dead"
+  reset; mkdir -p "$W/ro/lock"; echo "$dead" > "$W/ro/lock/pid"; chmod 555 "$W/ro"; XENV=("DR_LOCK=$W/ro/lock")
+  tick 20000 0 "$T0"
+  eq "$RC,$(nnotify "$NL")" "30,1" "trava VELHA (pid morto) que não sai porque o diretório pai não deixa remover → 30 e 1 aviso (não 'ocupada')"
+  has "$(logtxt)" "que não consegui remover" "…o log diz"
+  chmod 755 "$W/ro"
+  reset; mkdir -p "$W/ro/lock"; echo "$dead" > "$W/ro/lock/pid"; chmod 555 "$W/ro/lock"; XENV=("DR_LOCK=$W/ro/lock")
+  tick 20000 0 "$T0"
+  eq "$RC,$(nnotify "$NL")" "30,1" "trava velha cujo pid não consigo apagar (o laço de 2 tentativas acaba com a trava ainda lá) → 30 e 1 aviso"
+  chmod 755 "$W/ro/lock"
+  # estado: `-e` falso por erro de stat (sem permissão no diretório) NÃO é "primeira rodada" (acted4_ts=0 liga o reinício)
+  reset; mkdir -p "$W/ro"; : > "$W/ro/state"; chmod 000 "$W/ro"; XENV=("DR_STATE=$W/ro/state")
+  tick 20000 0 "$T0"
+  has "$OUT" "estado salvo ilegível" "estado num diretório que não consigo pesquisar: tratado como ILEGÍVEL (acted4_ts = agora)"
+  hasnt "$(logtxt)" "primeira rodada" "…e NÃO como 'primeira rodada' (acted4_ts=0, teto de 6 h perdido)"
+  chmod 755 "$W/ro"
+fi
+# o pai do estado existe mas é um ARQUIVO (executável, para o `-x` sozinho não bastar): não há diretório de estado, então o `-e` falso não é "primeira rodada"
+reset; : > "$W/notdir"; chmod 755 "$W/notdir"; XENV=("DR_STATE=$W/notdir/state")
+tick 20000 0 "$T0"
+has "$OUT" "estado salvo ilegível" "pai do estado é um arquivo (não um diretório): tratado como ILEGÍVEL (acted4_ts = agora)"
+hasnt "$(logtxt)" "primeira rodada" "…e NÃO como 'primeira rodada'"
+
 section "leitura ilegível: NÃO age, avisa (df)"
 for bad in MISSING "" abc -5 1.5 99999999999 0x10 " 100 "; do
   reset; walk 5000 0 "$T0" $((T0 + 800)) 100   # episódio em andamento (D2 a 100 s de vencer)
@@ -202,15 +294,62 @@ sed 's/^warn_ts=0$/warn_ts=9999999999/' "$STATE" > "$STATE.x" && mv "$STATE.x" "
 tick MISSING 0 $((T0 + 120))
 eq "$(nnotify 'p=4 force=1')" 1 "carimbo de aviso no FUTURO (relógio andou para trás): não cala o aviso de leitura impossível"
 
-section "leitura ilegível: swap"
+section "leitura ilegível: swap NÃO trava a escada (gate-fix 3: só texto, fail-open VISÍVEL)"
+# O swap só entra no texto das mensagens: os limiares são de disco. Um swap que não leio não pode desligar a rede de segurança (o sysctl em vírgula do pt_BR fez exatamente isso: rodada recusada, 1 aviso por hora, nenhum degrau).
 for bad in MISSING "" abc -1 2.5; do
-  reset; walk 5000 0 "$T0" $((T0 + 800)) 100
+  reset; walk 5000 777 "$T0" $((T0 + 800)) 100
   tick 5000 "$bad" $((T0 + 900))
-  eq "$RC,$(ncall d2 --run)" "30,0" "swap='$bad' → 30 e D2 NÃO chamado"
-  has "$(logtxt)" "swap (vm.swapusage) ilegível" "swap='$bad': log diz o que faltou"
+  eq "$RC,$(ncall d2 --run)" "0,1" "swap='$bad': a rodada SEGUE (0) e o D2 É chamado no tempo dele (o swap não decide nada)"
+  has "$(logtxt)" "swap NÃO verificado" "swap='$bad': o log diz que o swap não foi verificado"
+  has "$(cat "$SD/notify.log")" "swap ? MB" "swap='$bad': o aviso do D2 diz 'swap ?' (não inventa 0)"
+  eq "$(nnotify 'não consegue ler o disco')" 0 "swap='$bad': NÃO avisa 'a escada não consegue ler o disco' (o disco foi lido)"
+  eq "$(sv last_swap_mb)" 777 "swap='$bad': o estado guarda o ÚLTIMO swap lido (777), não '?'"
+  tick 5000 "$bad" $((T0 + 1000))
+  hasnt "$OUT$(logtxt)" "estado salvo ilegível" "swap='$bad': a rodada seguinte lê o estado sem achar que está corrompido (o estado só guarda número)"
+  tick 5000 9 $((T0 + 1100))
+  eq "$(sv last_swap_mb)" 9 "swap='$bad': swap lido de volta → o estado passa a guardar o novo valor"
 done
-tick 5000 0 $((T0 + 1000))
-eq "$(ncall d2 --run)" 1 "leitura volta: o cronômetro seguiu (D2 chamado na 1ª rodada legível, tempo contado desde antes)"
+reset; walk 5000 0 "$T0" $((T0 + 800)) 100
+tick MISSING 0 $((T0 + 900)); tick 5000 MISSING $((T0 + 1000))
+eq "$(ncall d2 --run)" 1 "df ilegível numa rodada e swap ilegível na outra: o cronômetro do df seguiu (a lacuna não passou de 600 s)"
+# a re-medição que vem DEPOIS de um degrau também lê o swap: se ele sumiu nesse momento, o log diz (o aviso do degrau segue com o livre novo) e o estado fica com o último swap lido
+reset; mode d2 rc=0 setfree=9000 setswap=MISSING
+walk 5000 0 "$T0" $((T0 + 900)) 100
+has "$(logtxt)" "re-medição depois do D2: [swap NÃO verificado" "swap ilegível só na re-medição depois do D2: o log diz que não foi verificado"
+eq "$(sv last_free_mb),$(sv last_swap_mb)" "9000,0" "…o estado guarda o livre da re-medição (9000) e o último swap LIDO (0), não '?'"
+# o batimento de 1 h ('ok:') é a linha que o Athos lê com o disco folgado: com o swap ilegível ela diz que ele não foi verificado
+reset; tick 20000 MISSING "$T0"
+has "$(logtxt)" "ok: livre=20000MB swap=?MB (sem episódio; batimento 1/h) [swap NÃO verificado" "disco folgado e swap ilegível: o batimento diz swap=?MB e que o swap não foi verificado"
+
+section "leitor real: df do volume Data (nunca o /) e swap, com LC_ALL=C e com a vírgula do pt_BR (gate-fix 3)"
+# O mini roda a escada no launchd com LANG=pt_BR.UTF-8: o `sysctl vm.swapusage` imprime 'used = 3015,31M' (scripts/rea-run.sh:71). O leitor só aceitava ponto: a rodada era recusada e a escada nunca agia.
+# Aqui os shims de df/sysctl no PATH (o resto dos testes injeta os números por arquivo); o shim 'locale' só dá ponto se for chamado com LC_ALL=C, como o sysctl de verdade.
+BASE_FULL=("${BASE[@]}")
+BASE=( "PATH=$W/bin:/usr/bin:/bin:/usr/sbin:/sbin" "HOME=$W/home" "TMPDIR=$W/tmp" "STUB_DIR=$SD"
+  "DR_CITY=$CITY" "DR_STATE=$STATE" "DR_LOG=$LOG" "DR_OFF_FILE=$OFF" "DR_LOCK=$LOCK" "DR_NOW_FILE=$W/now"
+  "DR_D2_CMD=$W/stubs/d2" "DR_D3_CMD=$W/stubs/d3" "DR_D4_CMD=$W/stubs/d4" "DR_NOTIFY_BIN=$W/stubs/notify" "DR_GC_BIN=$W/stubs/gc" )
+rm -f "$W/df.all" "$W/sysctl.all"
+real() {  # df-modo sysctl-modo [VAR=valor extra]: dry-run com os shims; acumula o que df/sysctl receberam (o reset apaga $SD)
+  [ -f "$SD/df.args" ] && cat "$SD/df.args" >> "$W/df.all"; [ -f "$SD/sysctl.env" ] && cat "$SD/sysctl.env" >> "$W/sysctl.all"
+  reset; XENV=("STUB_DF_MODE=$1" "STUB_SYSCTL_MODE=$2" ${3:+"$3"}); printf '%s' "$T0" > "$W/now"; runl --dry-run
+}
+real ok ok;      eq "$RC" 0 "df e sysctl legíveis → 0"; has "$OUT" "livre=4096MB swap=1536MB" "df Available e swap em uso (M) lidos"
+real ok gig;     has "$OUT" "swap=2560MB" "swap em G convertido para MB"
+real ok comma;   eq "$RC" 0 "sysctl com VÍRGULA decimal ('used = 1536,25M', o mini sob o launchd) → 0 (antes: recusava a rodada)"; has "$OUT" "livre=4096MB swap=1536MB" "…e lê 1536 MB"
+real ok commagig; has "$OUT" "swap=2560MB" "'used = 2,50G' → 2560 MB"
+real ok locale LC_ALL=pt_BR.UTF-8; has "$OUT" "swap=1536MB" "sysctl que só dá ponto com LC_ALL=C, com LC_ALL=pt_BR.UTF-8 herdado do launchd: o maestro chama com LC_ALL=C e lê 1536 MB"
+real ok locale LANG=pt_BR.UTF-8;   has "$OUT" "swap=1536MB" "…idem com só LANG=pt_BR.UTF-8"
+for m in root fail empty garbage big; do real "$m" ok; eq "$RC" 30 "df '$m' → 30"; has "$OUT" "df de /System/Volumes/Data ilegível" "df '$m': diz"; done
+for m in fail garbage kilo noused empty; do   # o swap só entra no texto: ilegível NÃO recusa a rodada (o df, que decide, foi lido)
+  real ok "$m"; eq "$RC" 0 "sysctl '$m' → 0: a escada segue com o df"; has "$OUT" "swap=?MB" "sysctl '$m': a leitura diz swap=?MB (não inventa 0)"; has "$OUT" "swap NÃO verificado" "sysctl '$m': diz que o swap não foi verificado"
+  hasnt "$OUT" "leitura impossível" "sysctl '$m': sem WARN de leitura impossível (o disco foi lido)"
+done
+[ -f "$SD/df.args" ] && cat "$SD/df.args" >> "$W/df.all"; [ -f "$SD/sysctl.env" ] && cat "$SD/sysctl.env" >> "$W/sysctl.all"
+bad=$(grep -v -x -- '-Pm /System/Volumes/Data' "$W/df.all" | head -n 1)
+[ -s "$W/df.all" ] && [ -z "$bad" ] && ok "df chamado SEMPRE com -Pm /System/Volumes/Data (nunca df /)" || nope "df chamado de outro jeito: '$bad'"
+bad=$(grep -v -x -- 'LC_ALL=C' "$W/sysctl.all" | head -n 1)
+[ -s "$W/sysctl.all" ] && [ -z "$bad" ] && ok "sysctl chamado SEMPRE com LC_ALL=C (o decimal do locale não decide a leitura)" || nope "sysctl chamado sem LC_ALL=C: '$bad'"
+BASE=("${BASE_FULL[@]}")
 
 section "fronteiras dos limiares (cronômetro começa em cada nível)"
 for row in "5121 0 0 0" "5120 $T0 0 0" "4097 $T0 0 0" "4096 $T0 $T0 0" "3072 $T0 $T0 0" "3071 $T0 $T0 $T0"; do
@@ -700,21 +839,6 @@ section "rotação do log"
 reset; head -c 5000 /dev/zero | tr '\0' 'x' > "$LOG"; XENV=(DR_LOG_MAX_KB=1)
 tick 20000 0 "$T0"
 [ -f "$LOG.1" ] && ok "log acima do limite foi girado para .1" || nope "log não girou"
-
-section "leitor real: df do volume Data (nunca o /) e swap"
-BASE_FULL=("${BASE[@]}")
-BASE=( "PATH=$W/bin:/usr/bin:/bin:/usr/sbin:/sbin" "HOME=$W/home" "TMPDIR=$W/tmp" "STUB_DIR=$SD"
-  "DR_CITY=$CITY" "DR_STATE=$STATE" "DR_LOG=$LOG" "DR_OFF_FILE=$OFF" "DR_LOCK=$LOCK" "DR_NOW_FILE=$W/now"
-  "DR_D2_CMD=$W/stubs/d2" "DR_D3_CMD=$W/stubs/d3" "DR_D4_CMD=$W/stubs/d4" "DR_NOTIFY_BIN=$W/stubs/notify" "DR_GC_BIN=$W/stubs/gc" )
-real() { [ -f "$SD/df.args" ] && cat "$SD/df.args" >> "$W/df.all"; reset; XENV=("STUB_DF_MODE=$1" "STUB_SYSCTL_MODE=$2"); printf '%s' "$T0" > "$W/now"; runl --dry-run; }
-real ok ok;      eq "$RC" 0 "df e sysctl legíveis → 0"; has "$OUT" "livre=4096MB swap=1536MB" "df Available e swap em uso (M) lidos"
-real ok gig;     has "$OUT" "swap=2560MB" "swap em G convertido para MB"
-for m in root fail empty garbage big; do real "$m" ok; eq "$RC" 30 "df '$m' → 30"; has "$OUT" "df de /System/Volumes/Data ilegível" "df '$m': diz"; done
-for m in fail garbage kilo noused empty; do real ok "$m"; eq "$RC" 30 "sysctl '$m' → 30"; has "$OUT" "swap (vm.swapusage) ilegível" "sysctl '$m': diz"; done
-cat "$SD/df.args" >> "$W/df.all"
-bad=$(grep -v -x -- '-Pm /System/Volumes/Data' "$W/df.all" | head -n 1)
-[ -s "$W/df.all" ] && [ -z "$bad" ] && ok "df chamado SEMPRE com -Pm /System/Volumes/Data (nunca df /)" || nope "df chamado de outro jeito: '$bad'"
-BASE=("${BASE_FULL[@]}")
 
 section "nada vazou"
 [ -z "$(ls "$W/tmp" 2>/dev/null)" ] && ok "nenhum temporário sobrou em TMPDIR" || nope "temporários sobraram: $(ls "$W/tmp")"

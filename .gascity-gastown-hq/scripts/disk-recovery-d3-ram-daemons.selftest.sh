@@ -18,7 +18,7 @@
 #   bw-serve: MEM+CMPRS 800/801 MB e unidades do top, idade 21599/21600 s, secret antes e depois (valor nunca lido), ordem Safari → bw-serve → daemons ·
 #   label ausente ≠ domínio errado · "D3 retomou o envio" na linha · sobra de pausa desfeita antes de ler o disco · teto de tempo em segundos de relógio.
 # COMO RODAR      bash scripts/disk-recovery-d3-ram-daemons.selftest.sh        (~1-3 min)
-#   Para testar uma cópia modificada do degrau (mutantes): DR_D3_PATH=/caminho/disk-recovery-d3-ram-daemons.mutN.sh bash scripts/disk-recovery-d3-ram-daemons.selftest.sh
+#   Para testar uma cópia modificada do degrau (mutantes): DR_D3_PATH=/caminho/disk-recovery-d3-ram-daemons.mutN.sh ST_FAILFAST=1 bash scripts/disk-recovery-d3-ram-daemons.selftest.sh  (ST_FAILFAST=1 sai no 1º FAIL com rc 1)
 set -uo pipefail
 ulimit -f 40960 2>/dev/null   # nenhum arquivo deste teste passa de 20 MB (disco apertado é o assunto)
 
@@ -37,7 +37,12 @@ LOG="$CITY/.gc/logs/disk-recovery-d3.log"; LOCK="$CITY/.gc/disk-recovery-d3.lock
 mkdir -p "$BIN" "$W/tmp" "$W/home" "$WA"
 PASS=0; FAIL=0; OUT=""; RC=0; EXTRA_ENV=""
 ok()   { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
-nope() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n' "$1"; [ -n "${OUT:-}" ] && printf '%s\n' "$OUT" | sed 's/^/        | /' | tail -n 8; return 0; }
+nope() {
+  FAIL=$((FAIL+1)); printf 'FAIL - %s\n' "$1"; [ -n "${OUT:-}" ] && printf '%s\n' "$OUT" | sed 's/^/        | /' | tail -n 8
+  # ST_FAILFAST=1 (para mutantes): o primeiro FAIL já prova que o mutante foi pego (rc 1); chegar ao fim com rc 0 = o selftest NÃO pega aquele mutante
+  if [ "${ST_FAILFAST:-0}" = 1 ]; then printf '\n(ST_FAILFAST) parei no 1º FAIL: %s passaram, %s falharam\n' "$PASS" "$FAIL"; exit 1; fi
+  return 0
+}
 eq()    { if [ "$1" = "$2" ]; then ok "$3"; else nope "$3 (obtido '$1', esperado '$2')"; fi; }
 has()   { if printf '%s' "$1" | grep -q -F -- "$2"; then ok "$3"; else nope "$3 (faltou: $2)"; fi; }
 hasnt() { if printf '%s' "$1" | grep -q -F -- "$2"; then nope "$3 (nao devia ter: $2)"; else ok "$3"; fi; }
@@ -159,8 +164,10 @@ fi
 SH
 cat > "$BIN/sysctl" <<'SH'
 #!/bin/bash
+echo "LC_ALL=${LC_ALL:-unset}" >> "$STUB_DIR/sysctl.env"     # com que LC_ALL o D3 chamou (o sysctl de verdade muda o decimal com ele)
 [ -f "$STUB_DIR/sysctl.fail" ] && exit 1
-cat "$STUB_DIR/sysctl.out"
+# sysctl.pt = como o do mini sob o launchd (pt_BR): vírgula decimal, a não ser que o chamador force LC_ALL=C
+if [ -f "$STUB_DIR/sysctl.pt" ] && [ "${LC_ALL:-}" != C ]; then sed 's/\./,/g' "$STUB_DIR/sysctl.out"; else cat "$STUB_DIR/sysctl.out"; fi
 SH
 cat > "$BIN/top" <<'SH'
 #!/bin/bash
@@ -266,6 +273,8 @@ run_d3() {
       DR_CITY="$CITY" DR_D3_WA="$WA" DR_D3_PIX_DB="$PIX" DR_D3_VOICE_DB="$VOICE" DR_D3_GUARDED="$W/guarded" DR_D3_FREEZE_CMD="$W/freeze" \
       DR_FREE_MB_FILE="$SD/free" DR_SWAP_MB_FILE="$SD/swap" DR_D3_SETTLE_S=0 DR_D3_READY_S=3 DR_D3_DRAIN_S=3 DR_D3_DESPAUSE_S=3 DR_D3_GUARD_SLACK_S=2 DR_D3_CMD_S=5 DR_D3_CURL_S=2 \
       $EXTRA_ENV "$D3" "$@" 2>&1); RC=$?
+  # um host sem o locale pedido em EXTRA_ENV (o nó Linux não tem pt_BR.UTF-8) faz o bash avisar 'setlocale: cannot change locale' em stderr antes de o script rodar: ruído do host, não do D3
+  OUT=$(printf '%s\n' "$OUT" | grep -v -E '^[^ ]*bash: warning: setlocale: ')
   CALLS=$(cat "$SD/calls" 2>/dev/null)
   SEQ=$(printf '%s\n' "$CALLS" | awk '/^kickstart/ {sub(/.*com\.whatsapp\./, ""); printf "%s,", $0} /^guarded/ {printf "G,"}')
 }
@@ -299,6 +308,17 @@ run_d3; expect 0 "livre 4300->" "df: lido do volume Data (4300), nao do /"; has 
 has "$CALLS" "df -Pm /System/Volumes/Data" "df chamado com -Pm no volume Data"; eq "$(printf '%s\n' "$CALLS" | grep -c -x -E 'df +(-[A-Za-z]+ +)*/')" 0 "df nunca chamado com / (so o volume Data)"
 reset; EXTRA_ENV="DR_FREE_MB_FILE= DR_SWAP_MB_FILE="; printf '4300' > "$SD/df.avail"; printf 'total = 8.00G  used = 4.50G  free = 3.50G' > "$SD/sysctl.out"
 run_d3; has "$OUT" "swap 4608->" "sysctl: used = 4.50G vira 4608"
+# gate-fix 3 (ga-1p1i5jr.1): sob o launchd o mini roda com LANG=pt_BR.UTF-8 e o sysctl imprime 'used = 3015,31M'. O D3 já exportava LC_ALL=C (linha 58 do script), então o caso de locale abaixo NÃO é vermelho
+# contra o D3 de antes: é guarda de regressão (se tirarem aquela linha o caso cai). O que era vermelho, e é o que este bloco prova, é a vírgula: um leitor só de ponto recusava a rodada (rc 30).
+reset; EXTRA_ENV="DR_FREE_MB_FILE= DR_SWAP_MB_FILE= LC_ALL=pt_BR.UTF-8 LANG=pt_BR.UTF-8"; printf '4300' > "$SD/df.avail"; printf 'total = 6144.00M  used = 4876.50M  free = 1267.50M  (encrypted)' > "$SD/sysctl.out"; touch "$SD/sysctl.pt"
+run_d3; expect 0 "livre 4300->" "swap com LC_ALL/LANG=pt_BR herdados (o sysctl só dá ponto com LC_ALL=C): o D3 chama o sysctl com LC_ALL=C e age"; has "$OUT" "swap 4876->" "…e lê 4876 MB"
+eq "$(grep -v -x 'LC_ALL=C' "$SD/sysctl.env" | head -n 1)" "" "sysctl chamado SEMPRE com LC_ALL=C"; [ -s "$SD/sysctl.env" ] && ok "…e foi chamado" || nope "o sysctl nem foi chamado"
+reset; EXTRA_ENV="DR_FREE_MB_FILE= DR_SWAP_MB_FILE="; printf '4300' > "$SD/df.avail"; printf 'total = 6144,00M  used = 4876,50M  free = 1267,50M  (encrypted)' > "$SD/sysctl.out"
+run_d3; expect 0 "livre 4300->" "vírgula decimal mesmo com LC_ALL=C (cinto e suspensório): lida"; has "$OUT" "swap 4876->" "…'4876,50M' vira 4876"
+reset; EXTRA_ENV="DR_FREE_MB_FILE= DR_SWAP_MB_FILE="; printf '4300' > "$SD/df.avail"; printf 'total = 8,00G  used = 4,50G  free = 3,50G' > "$SD/sysctl.out"
+run_d3; has "$OUT" "swap 4608->" "'used = 4,50G' vira 4608"
+reset; EXTRA_ENV="DR_FREE_MB_FILE= DR_SWAP_MB_FILE="; printf '4300' > "$SD/df.avail"; printf 'total = 6144,00M  used = 1,2,3M  free = 1M' > "$SD/sysctl.out"
+run_d3; expect 30 "nao consegui ler" "'1,2,3M' (duas vírgulas) continua ilegível = 30"
 reset; EXTRA_ENV="DR_FREE_MB_FILE= DR_SWAP_MB_FILE="; printf '4300' > "$SD/df.avail"; printf 'total = 6144.00M  used = 12K  free = 1M' > "$SD/sysctl.out"
 run_d3; expect 30 "nao consegui ler" "swap com unidade K: ilegivel = 30"; eq "$(kicks)" "" "swap ilegivel: nada reiniciado"
 reset; EXTRA_ENV="DR_FREE_MB_FILE= DR_SWAP_MB_FILE="; printf '4300' > "$SD/df.avail"; touch "$SD/sysctl.fail"; run_d3; expect 30 "swap" "sysctl falha: 30"
