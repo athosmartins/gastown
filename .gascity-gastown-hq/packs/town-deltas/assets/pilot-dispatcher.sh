@@ -15818,6 +15818,23 @@ TASK
       bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
       return 1
     fi
+    # ga-l56lyax: gate:passed. The candidate queries (19 of them, ga-3h8l) already
+    # --exclude-label "gate:passed", but a bead can PASS the gate between selection
+    # and this point (4+ min of latency, ga-88g2) and this re-check did not know the
+    # label: ga-1p1i5jr.2/.3/.4 were re-dispatched to a dog after their PASS/merge on
+    # 01/11, each burning a session that found nothing to build. Same class as the
+    # story:done branch above. The label list is comma-joined, and --exclude-label
+    # matches the WHOLE label, so match the whole token here too (a plain substring
+    # grep would also catch a hypothetical "gate:passed-warn" label and park a bead
+    # that never passed). Reuses $_PREDISPATCH_LABELS — no extra bd round-trip; an
+    # unreadable re-check leaves the labels empty and falls through (fail-open, as
+    # for every check in this block).
+    if echo "$_PREDISPATCH_LABELS" | grep -E '(^|,)gate:passed(,|$)' >/dev/null; then
+      warn "ga-l56lyax: $STORY_ID now has gate:passed (passed the quality gate during builder-target resolution, after the candidate queries had already selected it). Releasing claim and skipping — NOT dispatching a builder onto a bead that already passed."
+      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+      return 1
+    fi
     if echo "$_PREDISPATCH_LABELS" | grep "pilot:dispatched" >/dev/null; then
       warn "ga-88g2: $STORY_ID now has pilot:dispatched (dispatched via another path during builder-target resolution). Releasing claim and skipping."
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true

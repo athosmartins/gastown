@@ -324,6 +324,23 @@ case "$args" in
           # path, not just the isolated _filter_candidates unit test above.
           [ "$_sc2" -gt "$FAKE_NOAUTO_AFTER_SHOWS" ] && lbls="${lbls:+$lbls,}\"${FAKE_NOAUTO_LABEL:-pilot:no-auto-dispatch}\""
         fi
+        # ga-l56lyax: same counter-based race shape as ga-88g2/ga-4iw15 above, for
+        # gate:passed — the bead passes the quality gate AFTER candidate selection
+        # (whose 19 queries already exclude gate:passed, ga-3h8l) and AFTER the
+        # claim-verify show, but BEFORE the pre-dispatch re-check. Own counter file
+        # ($id.showcount3) so it can run independently of the two seams above.
+        # FAKE_GATEPASSED_AFTER_SHOWS=N: Nth and earlier `bd show` calls return
+        # clean; (N+1)th and later carry gate:passed. Unset/empty (the default)
+        # never injects it — every existing scenario is byte-identical to before.
+        # FAKE_GATEPASSED_LABEL: which label gets injected (default "gate:passed"). Scenario 5d3 uses a
+        # near-miss ("gate:passed-warn") to prove the re-check matches the WHOLE label, not a substring.
+        if [ -n "${FAKE_GATEPASSED_AFTER_SHOWS:-}" ]; then
+          _scf3="$STATE/$id.showcount3"
+          _sc3=$(cat "$_scf3" 2>/dev/null || echo 0)
+          _sc3=$((_sc3 + 1))
+          echo "$_sc3" > "$_scf3"
+          [ "$_sc3" -gt "$FAKE_GATEPASSED_AFTER_SHOWS" ] && lbls="${lbls:+$lbls,}\"${FAKE_GATEPASSED_LABEL:-gate:passed}\""
+        fi
         # ga-pd7j: mark the fixture as already in the gate-fix loop (stable label,
         # present from the start — unlike the counter-based escalation above, this
         # test isn't about racing the LABEL, it's about racing a MAYOR COMMENT).
@@ -721,6 +738,38 @@ run_real_dispatch_escalate() { # FAKE_ESCALATE_AFTER_SHOWS
     FAKE_BLOCKED_IDS="" \
     FAKE_SUPPRESS_INFLIGHT=0 \
     FAKE_ESCALATE_AFTER_SHOWS="${1:-}" \
+    FAKE_BUGS_JSON='[{"id":"tt-flight","title":"Durable in-flight fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+# Runs a REAL (non-dry) dispatch where gate:passed lands on the candidate
+# MID-DISPATCH — after N `bd show` reads have already happened — simulating a
+# bead that PASSES the quality gate between candidate selection and dispatch
+# (ga-l56lyax: ga-1p1i5jr.2/.3/.4 were re-dispatched to a dog after their PASS,
+# because the pre-dispatch re-check knew needs-human/in-flight/done/dispatched
+# and the human-gate set but not gate:passed). Arg 1: FAKE_GATEPASSED_AFTER_SHOWS
+# (unset/empty = never injects it, i.e. the plain happy path).
+run_real_dispatch_gatepassed() { # FAKE_GATEPASSED_AFTER_SHOWS [FAKE_GATEPASSED_LABEL]
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
+    DRY_RUN=0 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
+    PILOT_INFLIGHT_RETRIES=3 \
+    PILOT_INFLIGHT_SLEEP=0 \
+    FAKE_BLOCKED_IDS="" \
+    FAKE_SUPPRESS_INFLIGHT=0 \
+    FAKE_GATEPASSED_AFTER_SHOWS="${1:-}" \
+    FAKE_GATEPASSED_LABEL="${2:-}" \
     FAKE_BUGS_JSON='[{"id":"tt-flight","title":"Durable in-flight fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
@@ -2335,6 +2384,62 @@ if [ -f "$STATE/tt-flight.inflight" ]; then
   ok "story:in-flight still set normally when nothing escalated"
 else
   bad "REGRESSION: adding the re-check broke the ordinary happy-path dispatch"
+fi
+
+# ── Scenario 5c2/5d2: gate:passed landing mid-dispatch (ga-l56lyax) ────────────
+# Same TOCTOU window as 5c/5d, different label: the 19 candidate queries exclude
+# gate:passed (ga-3h8l), but a bead that PASSES the gate between selection and
+# dispatch (latency 4+ min, ga-88g2) was dispatched anyway — the re-check never
+# looked at gate:passed. Each re-dispatch burned a dog session that found "nothing
+# to build" and could not release the bead. 5c2 injects gate:passed after the 1st
+# `bd show` (the claim-verify), 5d2 is the no-injection control.
+echo "Scenario 5c2: gate:passed landing mid-dispatch aborts BEFORE a builder is dispatched (ga-l56lyax)"
+LOG5C2="$(run_real_dispatch_gatepassed 1)"
+if echo "$LOG5C2" | grep "ga-l56lyax:.*tt-flight now has gate:passed" >/dev/null; then
+  ok "pre-dispatch re-check detected gate:passed landing mid-dispatch and logged it"
+else
+  bad "REGRESSION: no ga-l56lyax pre-dispatch re-check fired — a bead that already PASSED the gate is re-dispatched to a builder (ga-1p1i5jr.2/.3/.4, 01/11)"
+fi
+if [ -f "$STATE/tt-flight.inflight" ]; then
+  bad "REGRESSION: story:in-flight was set despite gate:passed — a builder was dispatched onto a bead that already passed the gate"
+else
+  ok "story:in-flight was never set — dispatch aborted before finalization"
+fi
+if echo "$LOG5C2" | grep "Dispatch complete:" >/dev/null; then
+  bad "REGRESSION: dispatch completed (builder notified) despite gate:passed landing mid-dispatch"
+else
+  ok "no builder was notified — aborted before the sling/nudge step"
+fi
+if [ -f "$STATE/tt-flight.dispatching" ]; then
+  bad "REGRESSION: pilot:dispatching claim was not released after the gate:passed abort (bead would stay held until the TTL)"
+else
+  ok "pilot:dispatching claim released after the gate:passed abort"
+fi
+
+echo "Scenario 5d2: control — no gate:passed → new re-check never false-positives (ga-l56lyax)"
+LOG5D2="$(run_real_dispatch_gatepassed "")"
+if echo "$LOG5D2" | grep "ga-l56lyax:" >/dev/null; then
+  bad "REGRESSION: gate:passed re-check fired with no gate:passed injected (false positive)"
+else
+  ok "no false positive — gate:passed re-check stayed silent on the plain happy path"
+fi
+if [ -f "$STATE/tt-flight.inflight" ]; then
+  ok "story:in-flight still set normally when nothing passed the gate"
+else
+  bad "REGRESSION: adding the gate:passed re-check broke the ordinary happy-path dispatch"
+fi
+
+echo "Scenario 5d3: near-miss label gate:passed-warn landing mid-dispatch is NOT gate:passed — whole-label match, no false park (ga-l56lyax)"
+LOG5D3="$(run_real_dispatch_gatepassed 1 "gate:passed-warn")"
+if echo "$LOG5D3" | grep "ga-l56lyax:" >/dev/null; then
+  bad "REGRESSION: a gate:passed-warn label parked the bead — the re-check matches a SUBSTRING, not the whole gate:passed label (the candidate queries use --exclude-label, an exact match)"
+else
+  ok "gate:passed-warn did not trigger the gate:passed re-check (whole-label match)"
+fi
+if [ -f "$STATE/tt-flight.inflight" ]; then
+  ok "story:in-flight set normally with a near-miss label — dispatch not aborted"
+else
+  bad "REGRESSION: dispatch aborted on a near-miss gate:passed-warn label"
 fi
 
 # ── Scenario 5e/5f/5g: Mayor out-of-band hold grace window (ga-pd7j) ─────────
