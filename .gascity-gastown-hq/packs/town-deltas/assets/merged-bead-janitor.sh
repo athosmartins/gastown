@@ -817,9 +817,18 @@ commit_evidence_stale() {
 # best-effort idiom as commit_evidence_stale/markers_for_bead: an inability to
 # PROVE docs-only must never grant MORE closing power than today, only less.
 commit_touches_only_pending_patch() {
-  local gdir="$1" container="$2" sha="$3" files f
+  local gdir="$1" container="$2" sha="$3" files
   [ -z "$sha" ] && return 1
   files=$(git_in "$gdir" "$container" show --name-only --format='' "$sha" 2>/dev/null || true)
+  files_only_pending_patch "$files"
+}
+
+# files_only_pending_patch <name-only file list> — the PURE half of commit_touches_only_pending_patch: rc0 iff
+# the list is non-empty and EVERY path in it is a docs/pending-engine-window/ patch; an empty list cannot be
+# proven docs-only (rc1). It takes the list as an argument so a caller that already read it
+# (orphan_delivery_state) does not read it a second time.
+files_only_pending_patch() {
+  local files="$1" f
   [ -z "$files" ] && return 1
   while IFS= read -r f; do
     [ -z "$f" ] && continue
@@ -847,7 +856,7 @@ EOF
 # treat "<parent>.<n>" as one id, so a commit scoped `fix(wa-866v5f)` is NOT delivery of wa-866v5f.2.
 # vazio → no commit cites the id: `none`; falhou/ilegível → `unknown` (never `none`, never `found`).
 orphan_delivery_state() {
-  local gdir="$1" container="$2" ref="$3" id="$4" shas sha subj unknown=0
+  local gdir="$1" container="$2" ref="$3" id="$4" shas sha subj files unknown=0
   { [ -n "$gdir" ] && [ -n "$ref" ] && [ -n "$id" ]; } || { echo unknown; return 0; }
   git_in "$gdir" "$container" rev-parse -q --verify "$ref" >/dev/null 2>&1 || { echo unknown; return 0; }
   # vazio → shas="" and the loop is skipped (`none`); falhou → `git log` exits non-zero: `unknown`.
@@ -861,11 +870,14 @@ orphan_delivery_state() {
     fi
     subject_impl_scopes_bead "$subj" "$id" || continue
     # A patch-staging commit (docs/pending-engine-window only) names the id but ships nothing
-    # (ga-fbycg). falhou → the file list cannot be read, so docs-only cannot be ruled out: `unknown`.
-    if ! git_in "$gdir" "$container" show --name-only --format='' "$sha" >/dev/null 2>&1; then
+    # (ga-fbycg). vazio → no files listed (e.g. a merge commit): not docs-only, so it can be `found`;
+    # falhou → the file list cannot be read, so docs-only cannot be ruled out: `unknown`. ONE read feeds both
+    # the "could it be read" test and the docs-only test: a second read whose failure is swallowed could
+    # disagree with the first and turn an unreadable list into "not docs-only".
+    if ! files=$(git_in "$gdir" "$container" show --name-only --format='' "$sha" 2>/dev/null); then
       unknown=1; continue
     fi
-    commit_touches_only_pending_patch "$gdir" "$container" "$sha" && continue
+    files_only_pending_patch "$files" && continue
     echo "found:${sha}"; return 0
   done <<EOF
 $shas
@@ -895,17 +907,23 @@ orphan_state_merge() {
 #         build queue — the bead was never worked)
 #   none + this bead's own terminal gate marker → keep (the gate passed it but the merge commit does
 #        not cite the id: closing would be premature, stripping would erase real gate state; warn)
+#   none + the marker read FAILED (sig_marker "unknown") → keep:gate-marker-unreadable (we cannot tell this
+#        from the line above, and the strip needs proof; warn, and the next sweep tries again)
 #   none + any delivery:* label → keep (delivery labels carry holds and human confirmations; warn only)
 #   unknown / anything else      → keep:git-unreadable (inert: no close, no label change)
 # Allowlist: only `found:<sha>` (close) and `none` with an exact 0 / 0 (reopen) act; anything else,
-# a garbled or empty argument included, lands in keep.
+# a garbled or empty argument included, lands in keep. sig_marker is 0 (the marker store ANSWERED: none),
+# 1 (this bead has a terminal passed marker) or unknown (the read failed) — the caller must never fold a
+# failed read into 0, because 0 is the only value that lets the strip happen.
 janitor_orphan_decide() {
   local state="$1" sig_marker="$2" has_dlabel="$3"
   case "$state" in
     found:?*) echo "close:own-commit-in-origin-main"; return 0 ;;
     none)
-      # Only an exact "0" proves "no marker"; "1", empty or garbled all hold (stripping is the act that needs proof).
-      if [ "$sig_marker" != "0" ]; then echo "keep:own-gate-marker-without-merge-commit"; return 0; fi
+      # Only an exact "0" proves "no marker" (stripping is the act that needs proof). "1" is real gate state;
+      # unknown / empty / garbled is "could not prove none" — a different reason, the same hold.
+      if [ "$sig_marker" = "1" ]; then echo "keep:own-gate-marker-without-merge-commit"; return 0; fi
+      if [ "$sig_marker" != "0" ]; then echo "keep:gate-marker-unreadable"; return 0; fi
       if [ "$has_dlabel" != "0" ]; then echo "keep:delivery-label-present-needs-review"; return 0; fi
       echo "reopen:inherited-done-no-own-commit"; return 0 ;;
   esac
@@ -1002,18 +1020,26 @@ EOF
 # BEAD / MARKER HELPERS (live Dolt; only used in the sweep, not the pure tests).
 # ═════════════════════════════════════════════════════════════════════════════
 
-# markers_for_bead <bead_id> — echoes the HQ quality-gate markers (JSON array)
-# whose source-bead label is this bead. Empty array on any failure.
-markers_for_bead() {
+# markers_for_bead_strict <bead_id> — the HQ quality-gate markers whose source-bead label is this bead, with a
+# read that FAILED kept apart from one that found NOTHING (ga-6m6iocf gate-fix 1). Echoes the JSON array and
+# returns 0 only when `bd list` exited 0 AND printed a JSON array: `[]` is a real "this bead has no marker".
+# rc 1 = could not read — bd failed, or its stdout was empty / not an array (an error envelope such as
+# "Error: database is unavailable" is not data). What "could not read" means is the caller's decision.
+markers_for_bead_strict() {
   local id="$1" out
   # --include-infra (ga-vm20x, Mayor 07/08): bd 1.1.0 classifies --ephemeral
   # beads as INFRA and hides them from `bd list` by default; gate markers are
   # born ephemeral, so this janitor could not find the very markers it exists
   # to reconcile without this flag.
-  out=$(bd -C "$GC_CITY" list --all --include-infra --json -l type:quality-gate-marker -l "source-bead:$id" 2>/dev/null || echo '[]')
-  [ -z "$out" ] && out='[]'
+  out=$(bd -C "$GC_CITY" list --all --include-infra --json -l type:quality-gate-marker -l "source-bead:$id" 2>/dev/null) || return 1
+  printf '%s' "$out" | jq -e 'type == "array"' >/dev/null 2>&1 || return 1
   printf '%s' "$out"
 }
+
+# markers_for_bead <bead_id> — best-effort: the same markers, or an empty array on any failure. For the signals
+# that default to the inert side when they cannot read (Signal B and friends) that is the right contract; a
+# caller whose ACT needs proof of "no marker" (the orphan-close strip) must use markers_for_bead_strict.
+markers_for_bead() { markers_for_bead_strict "$1" || printf '[]'; }
 
 # comments_for_bead <store_path> <bead_id> — echoes the bead's comments as a JSON
 # array (`bd comments <id> --json` shape: each entry has .created_at), or '[]' on
@@ -1329,6 +1355,14 @@ HQ_DEFAULT=$(printf '%s' "$RIG_LIST_JSON" | jq -r '.rigs[] | select(.hq == true)
 # remote would make the sweep act on outdated state. Pruning tracking refs is
 # also harmless to the commit/marker/branch signals of the other sweeps.
 declare -a FETCHED=()
+declare -a FETCH_FAILED=()
+# fetch_stale <git_dir> — rc0 iff the fetch of that repo failed or timed out in THIS sweep, so its origin/* refs
+# may be behind the remote. fetch_once is once-per-repo, so the answer is the one fetch the sweep made.
+fetch_stale() {
+  local k
+  for k in "${FETCH_FAILED[@]:-}"; do [ -n "$k" ] && [ "$k" = "$1" ] && return 0; done
+  return 1
+}
 fetch_once() {
   local gdir="$1" container="$2" key prune=""
   # --prune ONLY when the branch-prune sweep is enabled — it enumerates local
@@ -1342,7 +1376,7 @@ fetch_once() {
   FETCHED+=("$key")
   timeout "$FETCH_TIMEOUT" sh -c '
     if [ "$3" = "1" ]; then git --git-dir="$1" fetch origin $2 --quiet; else git -C "$1" fetch origin $2 --quiet; fi
-  ' _ "$gdir" "$prune" "$container" 2>/dev/null || warn "fetch failed/timeout for $gdir (continuing with stale refs)"
+  ' _ "$gdir" "$prune" "$container" 2>/dev/null || { FETCH_FAILED+=("$gdir"); warn "fetch failed/timeout for $gdir (continuing with stale refs)"; }
 }
 fetch_once "$HQ_GITDIR" "$HQ_CONTAINER"
 
@@ -1829,7 +1863,10 @@ EOF
     S_GRACE_OPEN=0; case "$S_GRACE" in none|elapsed) S_GRACE_OPEN=1 ;; esac
 
     # Markers (HQ-resident, regardless of which store the bead lives in).
-    SMK=$(markers_for_bead "$SID")
+    # ga-6m6iocf (gate-fix 1): ONE read feeds every use below. A read that FAILED is still '[]' for the older
+    # signals (the same '[]' markers_for_bead gives them on a failed read), but SMK_READ remembers that it failed,
+    # so the orphan branch (which strips labels, an act that needs proof of "no marker") can tell "none" from "could not read".
+    SMK_READ=ok; SMK=$(markers_for_bead_strict "$SID") || { SMK_READ=failed; SMK='[]'; }
     S_OPENMK=0;  has_open_marker "$SMK"           && S_OPENMK=1
     S_SIGMK=0;   has_terminal_passed_marker "$SMK" && S_SIGMK=1
     S_SIGMK_SUPER=0; has_terminal_superseded_marker "$SMK" && S_SIGMK_SUPER=1   # ga-v8ui5
@@ -2029,12 +2066,26 @@ EOF
          && [ "$S_DELIV" = "0" ]; then
         # Same repo scoping as Signal A: a rig-native story is matched in its own rig repo only; the
         # HQ repo is a fallback for a FOREIGN story in this rig's store.
+        O_FOREIGN=0; [ "${SID%%-*}" != "$RPREFIX" ] && [ "$RGITDIR" != "$HQ_GITDIR" ] && O_FOREIGN=1
         O_STATE=$(orphan_delivery_state "$RGITDIR" "$RCONTAINER" "origin/$RDEFAULT" "$SID")
-        if [ "${O_STATE%%:*}" != "found" ] && [ "${SID%%-*}" != "$RPREFIX" ] && [ "$RGITDIR" != "$HQ_GITDIR" ]; then
+        if [ "${O_STATE%%:*}" != "found" ] && [ "$O_FOREIGN" = "1" ]; then
           O_STATE=$(orphan_state_merge "$O_STATE" "$(orphan_delivery_state "$HQ_GITDIR" "$HQ_CONTAINER" "origin/$HQ_DEFAULT" "$SID")")
         fi
+        # Stale refs: `none` means "no commit in the refs we HAVE". If the fetch of a repo consulted here failed in
+        # this sweep, those refs may be behind origin, and a delivery made after the last good fetch would read as
+        # `none` — and `none` is the verdict that strips labels. So `none` over a stale repo is held as `unknown`.
+        # `found` needs no such hold (a stale ref cannot invent a commit); `unknown` is already inert.
+        O_STALE=""
+        if [ "$O_STATE" = "none" ]; then
+          if fetch_stale "$RGITDIR"; then O_STALE="$RGITDIR"
+          elif [ "$O_FOREIGN" = "1" ] && fetch_stale "$HQ_GITDIR"; then O_STALE="$HQ_GITDIR"; fi
+          [ -z "$O_STALE" ] || O_STATE=unknown
+        fi
         O_HAS_DLABEL=0; printf '%s' "$SLABELS" | grep -E '(^| )delivery:' >/dev/null && O_HAS_DLABEL=1
-        O_VERDICT=$(janitor_orphan_decide "$O_STATE" "$S_SIGMK" "$O_HAS_DLABEL")
+        # vazio (a good read, no marker) → 0; falhou/ilegível (the marker read failed) → unknown, NEVER 0: only an
+        # exact "0" lets janitor_orphan_decide strip, so an unreadable marker store holds the bead and says why.
+        O_SIGMK=$S_SIGMK; [ "$SMK_READ" = "ok" ] || O_SIGMK=unknown
+        O_VERDICT=$(janitor_orphan_decide "$O_STATE" "$O_SIGMK" "$O_HAS_DLABEL")
         O_REASON="${O_VERDICT#*:}"
         case "${O_VERDICT%%:*}" in
           close)
@@ -2070,7 +2121,8 @@ EOF
               if [ "$O_STRIP_OK" = "1" ]; then
                 if bd -C "$RPATH" label remove "$SID" "story:done" -q 2>/dev/null; then
                   log "ORPHAN-REOPENED $SID ($RNAME) — story:done had no commit citing the bead's own id: NOT closed; inherited story:done${O_GP_TXT} removed, story:approved kept"
-                  bd -C "$RPATH" comment "$SID" "merged-bead-janitor ($SOURCE_BEAD, ga-6m6iocf): this bead carried story:done (with story:approved) but origin/$RDEFAULT has no commit whose subject scope is its own id ($SID) — a parent's commit does not count. The label looks inherited from the parent (bd create --parent copies labels), so the janitor did NOT close it. Removed story:done$([ "$O_GP" = "1" ] && printf ' and gate:passed'); story:approved stays, so the bead is back in the build queue. If it was in fact delivered without a commit, close it by hand with the artifact as reason." 2>/dev/null || true
+                  bd -C "$RPATH" comment "$SID" "merged-bead-janitor ($SOURCE_BEAD, ga-6m6iocf): this bead carried story:done (with story:approved) but origin/$RDEFAULT$([ "$O_FOREIGN" = "1" ] && printf ' (and origin/%s of the HQ repo)' "$HQ_DEFAULT") has no commit whose subject scope is its own id ($SID) — a parent's commit does not count. The label may have been inherited from the parent (bd create --parent copies labels), so the janitor did NOT close it. Removed story:done$([ "$O_GP" = "1" ] && printf ' and gate:passed'); story:approved stays, so the bead is back in the build queue. If it was in fact delivered without a commit, close it by hand with the artifact as reason." 2>/dev/null \
+                    || warn "could not post the explanation comment on $SID ($RNAME) — story:done is already removed, so the bead went back to the queue without a note"
                 else
                   warn "could not remove inherited story:done from $SID ($RNAME) — NOT closing it; the next sweep retries"
                 fi
@@ -2079,7 +2131,7 @@ EOF
             ;;
           *)
             # keep: git unreadable, or a gate marker / delivery label that is real state. Not closed, nothing removed.
-            warn "orphan-close SKIPPED for $SID ($RNAME) — story:done without a commit citing its own id and the bead is left untouched ($O_REASON; delivery state: ${O_STATE%%:*})"
+            warn "orphan-close SKIPPED for $SID ($RNAME) — story:done without a commit citing its own id and the bead is left untouched ($O_REASON; delivery state: ${O_STATE%%:*}${O_STALE:+; the fetch of $O_STALE failed in this sweep, so the origin refs may be stale})"
             ;;
         esac
       fi

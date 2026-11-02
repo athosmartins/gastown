@@ -37,7 +37,8 @@ for fn in janitor_decide janitor_story_decide token_bounded scan_commit_for_bead
           terminal_passed_marker_epoch marker_evidence_stale \
           sling_beads_from_show sling_signals_for_id sling_fallback_eligible_reason \
           iso_epoch story_gate_passed_grace_state \
-          orphan_delivery_state orphan_state_merge janitor_orphan_decide; do
+          orphan_delivery_state orphan_state_merge janitor_orphan_decide \
+          markers_for_bead markers_for_bead_strict files_only_pending_patch; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by janitor"; exit 1; }
 done
 
@@ -2342,7 +2343,8 @@ eq "fixture: origin/main holds all six commits" "$(git -C "$OC/rig" rev-list --c
 
 # A git that fails ONE kind of read on demand (FAKE_GIT_FAIL): list = the `log --grep` that finds the
 # candidates; listrig = the same, but only against the rig repo; subject = the `log -1` that reads a subject;
-# show = the `show --name-only` that reads the file list. Everything else is the real git.
+# show = the `show --name-only` that reads the file list; fetch = every `git fetch` (the refs go stale);
+# fetchhq = the fetch of every repo EXCEPT the rig's (only the HQ repo's refs go stale). Everything else is the real git.
 mkdir -p "$OC/shim"
 cat > "$OC/shim/git" <<SHIM
 #!/bin/sh
@@ -2351,10 +2353,29 @@ case "\${FAKE_GIT_FAIL:-}" in
   listrig) case " \$* " in *" -C $OC/rig log "*"--grep="*) exit 128 ;; esac ;;
   subject) case " \$* " in *" log -1 "*) exit 128 ;; esac ;;
   show)    case " \$* " in *" show "*) exit 128 ;; esac ;;
+  fetch)   case " \$* " in *" fetch "*) exit 128 ;; esac ;;
+  fetchhq) case " \$* " in *" fetch "*) case " \$* " in *" $OC/rig "*) ;; *) exit 128 ;; esac ;; esac ;;
 esac
 exec "$OC_REAL_GIT" "\$@"
 SHIM
 chmod +x "$OC/shim/git"
+# A bd for the PURE marker-read checks: MODE picks how the marker query answers.
+mkdir -p "$OC/bdstub"
+cat > "$OC/bdstub/bd" <<'BDSTUB'
+#!/bin/sh
+case "${MODE:-ok}" in
+  ok)       printf '[{"id":"ga-mk1","status":"closed","labels":["type:quality-gate-marker","gate-status:passed"]}]' ;;
+  none)     printf '[]' ;;
+  exit1)    echo "Error: database is unavailable" >&2; exit 1 ;;
+  exit1arr) printf '[]'; exit 1 ;;
+  envelope) echo "Error: database is unavailable"; exit 0 ;;
+  empty)    exit 0 ;;
+  object)   printf '{"error":"x"}' ;;
+esac
+BDSTUB
+chmod +x "$OC/bdstub/bd"
+oc_mk_strict() { ( export PATH="$OC/bdstub:$PATH" GC_CITY="$OC" MODE="$1"; hash -r; markers_for_bead_strict ga-x ); }
+oc_mk_lenient() { ( export PATH="$OC/bdstub:$PATH" GC_CITY="$OC" MODE="$1"; hash -r; markers_for_bead ga-x ); }
 oc_state()      { orphan_delivery_state "$OC/rig" 0 origin/main "$1"; }
 oc_state_fail() { ( export PATH="$OC/shim:$PATH" FAKE_GIT_FAIL="$1"; hash -r; orphan_delivery_state "$OC/rig" 0 origin/main "$2" ); }
 
@@ -2413,6 +2434,27 @@ oc_unit_checks() {
   eq "decide: garbage state → keep"             "$(janitor_orphan_decide banana 0 0 | cut -d: -f1)" "keep"
   eq "decide: 'found' with no sha → keep"       "$(janitor_orphan_decide found 0 0 | cut -d: -f1)" "keep"
   eq "decide: 'found:' with an empty sha → keep" "$(janitor_orphan_decide 'found:' 0 0 | cut -d: -f1)" "keep"
+  # — a marker read that FAILED is not "no marker" (gate gate-fix 1): its own reason, the same hold —
+  eq "decide: none + marker read FAILED (unknown) → keep:gate-marker-unreadable" "$(janitor_orphan_decide none unknown 0)" "keep:gate-marker-unreadable"
+  eq "decide: none + marker flag empty → the unreadable reason, not the own-marker one" "$(janitor_orphan_decide none '' 0)" "keep:gate-marker-unreadable"
+  eq "decide: none + marker flag garbled → the unreadable reason" "$(janitor_orphan_decide none x 0)" "keep:gate-marker-unreadable"
+  eq "decide: found beats an unreadable marker (closing never needed it)" "$(janitor_orphan_decide found:abc unknown 0)" "close:own-commit-in-origin-main"
+  eq "decide: unreadable marker + a delivery label → still keep" "$(janitor_orphan_decide none unknown 1 | cut -d: -f1)" "keep"
+  # — markers_for_bead_strict: a read that FAILED is kept apart from one that found NOTHING —
+  eq "strict: markers present → rc 0 and the array" "$(oc_mk_strict ok >/dev/null; echo $?)" "0"
+  eq "strict: a good read with no marker → rc 0 and []" "$(oc_mk_strict none)|$(oc_mk_strict none >/dev/null; echo $?)" "[]|0"
+  for mode in exit1 exit1arr envelope empty object; do
+    oc_mk_strict "$mode" >/dev/null; eq "strict: read FAILED ($mode) → rc 1, not []" "$?" "1"
+  done
+  eq "strict: bd failed after printing a valid [] → still rc 1 (the exit code counts, not just the shape)" "$(oc_mk_strict exit1arr)" ""
+  # — markers_for_bead (best effort) keeps its contract for every other signal: always an array —
+  for mode in exit1 exit1arr envelope empty object; do eq "lenient: read FAILED ($mode) → []" "$(oc_mk_lenient "$mode")" "[]"; done
+  eq "lenient: a good read passes through" "$(oc_mk_lenient none)" "[]"
+  # — files_only_pending_patch: the pure docs-only test —
+  files_only_pending_patch "docs/pending-engine-window/a.patch"; eq "docs-only: a lone patch → rc 0" "$?" "0"
+  files_only_pending_patch ".gascity-gastown-hq/docs/pending-engine-window/a.patch"; eq "docs-only: a lone patch under the city dir → rc 0" "$?" "0"
+  files_only_pending_patch $'docs/pending-engine-window/a.patch\nscripts/x.sh'; eq "docs-only: a patch plus real code → rc 1" "$?" "1"
+  files_only_pending_patch ""; eq "docs-only: an empty list cannot be proven docs-only → rc 1" "$?" "1"
 }
 oc_unit_checks
 
@@ -2428,9 +2470,19 @@ oc_fixture() {   # <bead id> <labels> [gate hand-off stamp age|-]
 #!/usr/bin/env bash
 case " $* " in
   *" type:quality-gate-marker "*)
+    # OC_MARKER_FAIL: the marker READ fails — exit1 = bd errors out with no data; exit1arr = errors out but had already
+    # printed a valid empty array; envelope = exit 0 with an error text instead of JSON; empty = exit 0, no output at all
+    case "${OC_MARKER_FAIL:-}" in
+      exit1)    echo "Error: database is unavailable" >&2; exit 1 ;;
+      exit1arr) printf '[]'; exit 1 ;;
+      envelope) echo "Error: database is unavailable"; exit 0 ;;
+      empty)    exit 0 ;;
+    esac
     if [ -n "${OC_MARKER:-}" ]; then printf '[{"id":"ga-mk1","status":"closed","labels":["type:quality-gate-marker","gate-status:passed"]}]'; else printf '[]'; fi
     exit 0 ;;
 esac
+# OC_FAIL_COMMENT=1: `comment <id> <text>` fails and writes nothing (an injected bd failure)
+if [ -n "${OC_FAIL_COMMENT:-}" ] && [ "${3:-}" = "comment" ]; then echo "Error: injected failure" >&2; exit 1; fi
 # OC_FAIL_REMOVE=<label>: `label remove <id> <label>` fails and writes nothing (an injected bd failure)
 if [ -n "${OC_FAIL_REMOVE:-}" ]; then
   case " $* " in *" label remove "*" $OC_FAIL_REMOVE "*) echo "Error: injected failure" >&2; exit 1 ;; esac
@@ -2539,11 +2591,55 @@ oc_e2e_core() {
 }
 oc_e2e_core
 
+# gate-fix 1 (gate_run ga-l9aqqn1): every input of the strip decision must tell "none" from "could not read".
+# The git verdict already did; the gate marker read and the freshness of the refs did not.
+oc_e2e_gatefix() {
+  local mode
+  # (e2) THE BLOCKING ISSUE: the marker query FAILS. Same bead, same real state as (e) — only the read differs — so the
+  # outcome must be the same: left exactly as it was, said out loud. It used to strip story:done and gate:passed.
+  for mode in exit1 exit1arr envelope empty; do
+    oc_with OC_MARKER_FAIL "$mode" oc_run ga-par.1 "story:approved story:done"
+    oc_untouched ga-par.1 "story:approved story:done" "(e2/$mode) the marker read FAILED, child of a delivered parent, no commit citing it"
+    if oc_out_has "gate-marker-unreadable"; then ok "(e2/$mode) the SKIPPED line names the cause: gate-marker-unreadable"; else bad "(e2/$mode) the SKIPPED line does not say gate-marker-unreadable: $(grep -F ga-par.1 "$BV_OUT" | head -2 | tr '\n' ';')"; fi
+  done
+  oc_with OC_MARKER_FAIL exit1 oc_run ga-par.1 "story:approved story:done gate:passed" 7200
+  eq "(e2) a bead that really HAS gate:passed keeps it when the marker read fails" "$(bv_labels)" "story:approved story:done gate:passed"
+  # (e3) an own commit is proof by itself: closing never needed the marker, so an unreadable one does not hold a close
+  oc_with OC_MARKER_FAIL exit1 oc_run ga-own.1 "story:approved story:done"
+  if oc_closed ga-own.1; then ok "(e3) the marker read failing does not stop a bead with its own commit from closing"; else bad "(e3) the own-commit bead was held by an unreadable marker: $(grep -F ga-own.1 "$BV_OUT" | head -2 | tr '\n' ';')"; fi
+  # (e4) the store recovers → the very next sweep finishes the job (held, not stuck)
+  oc_with OC_MARKER_FAIL exit1 oc_run ga-par.1 "story:approved story:done"
+  oc_sweep
+  eq "(e4) the next sweep, marker store healthy again, strips it" "$(bv_labels)" "story:approved"
+
+  # (i) STALE REFS: the fetch failed, so `none` is only "none in the refs we have". The strip must wait for a fresh answer.
+  oc_with FAKE_GIT_FAIL fetch oc_run ga-par.1 "story:approved story:done"
+  oc_untouched ga-par.1 "story:approved story:done" "(i) the fetch failed, no commit in the (possibly stale) refs"
+  if oc_out_has "failed in this sweep, so the origin refs may be stale"; then ok "(i) the SKIPPED line says the refs may be stale"; else bad "(i) the SKIPPED line does not mention the failed fetch: $(grep -F ga-par.1 "$BV_OUT" | head -2 | tr '\n' ';')"; fi
+  oc_sweep
+  eq "(i) the next sweep, fetch healthy, strips it" "$(bv_labels)" "story:approved"
+  # (i2) `found` needs no hold: a stale ref cannot invent a commit
+  oc_with FAKE_GIT_FAIL fetch oc_run ga-own.1 "story:approved story:done"
+  if oc_closed ga-own.1; then ok "(i2) a failed fetch does not stop a bead whose own commit is already in the refs from closing"; else bad "(i2) the own-commit bead was held by a failed fetch"; fi
+  # (i3) a FOREIGN story also reads the HQ repo: its stale refs hold the strip too (the rig's own fetch is fine)
+  oc_fixture wa-fx.1 "story:approved story:done"; oc_make_hq "$BV_D/city" "chore(infra): nothing about it"
+  oc_with FAKE_GIT_FAIL fetchhq oc_sweep
+  oc_untouched wa-fx.1 "story:approved story:done" "(i3) foreign story, the HQ repo's fetch failed"
+
+  # (h3) the explanatory comment fails to post: the strip stands (the janitor cannot un-strip), and it is said out loud
+  oc_with OC_FAIL_COMMENT 1 oc_run ga-par.1 "story:approved story:done"
+  eq "(h3) comment failing: the labels were stripped as decided" "$(bv_labels)" "story:approved"
+  if oc_out_has "could not post the explanation comment on ga-par.1"; then ok "(h3) the failed comment is said out loud"; else bad "(h3) no WARN about the comment that was not posted: $(grep -F ga-par.1 "$BV_OUT" | head -2 | tr '\n' ';')"; fi
+}
+oc_e2e_gatefix
+
 # — drift-guard: the sweep feeds the decision what it expects, in this order —
 grep -qF 'O_STATE=$(orphan_delivery_state "$RGITDIR" "$RCONTAINER" "origin/$RDEFAULT" "$SID")' "$JANITOR" \
   && ok "orphan branch reads the delivery from the rig's own repo first" || bad "orphan branch does not read orphan_delivery_state from the rig repo"
-grep -qF 'janitor_orphan_decide "$O_STATE" "$S_SIGMK" "$O_HAS_DLABEL"' "$JANITOR" \
+grep -qF 'janitor_orphan_decide "$O_STATE" "$O_SIGMK" "$O_HAS_DLABEL"' "$JANITOR" \
   && ok "orphan branch decides on (state, own gate marker, delivery label) in that order" || bad "orphan branch's janitor_orphan_decide call drifted"
+grep -qF 'SMK=$(markers_for_bead_strict "$SID")' "$JANITOR" \
+  && ok "the story sweep reads the markers with the STRICT read (a failed read is not 'no marker')" || bad "the story sweep no longer uses markers_for_bead_strict"
 
 # — mutants: each breaks ONE thing the fix depends on; every one must die —
 OC_MUT="$T/oc-mut"; mkdir -p "$OC_MUT"
@@ -2576,7 +2672,7 @@ oc_mutant_ok() {
   if cmp -s "$JANITOR" "$f"; then bad "mutant $1: identical to the janitor, the mutation changed nothing"; return 1; fi
   bash -n "$f" 2>/dev/null || { bad "mutant $1: does not parse — it would die for the wrong reason"; return 1; }
 }
-# oc_trial <name> <unit|e2e|both> — the SAME checks, muted, against $OC_MUT/<name>.sh in a subshell with a
+# oc_trial <name> <unit|e2e|gf|both> — the SAME checks, muted, against $OC_MUT/<name>.sh in a subshell with a
 # write cap. OC_TRIAL_RC: 0 = some check failed (killed), 1 = every check held (survived), else harness error.
 oc_trial() {
   local name="$1" what="$2" f="$OC_MUT/$1.sh"
@@ -2590,6 +2686,7 @@ oc_trial() {
     JANITOR_LIB_ONLY=1 source "$f" || exit 99
     case "$what" in unit|both) oc_unit_checks ;; esac
     case "$what" in e2e|both)  oc_e2e_core ;; esac
+    case "$what" in gf|both)   oc_e2e_gatefix ;; esac
     [ "$MUT_N" -gt 0 ] && exit 0
     exit 1
   ) >/dev/null 2>&1
@@ -2621,22 +2718,40 @@ oc_mutate_file "$JANITOR" "$OC_MUT/m2.sh" orphan_delivery_state "--format='%H' 2
 oc_expect_dead m2 both "a failing git log reads as an empty answer (falhou == vazio)"
 oc_mutate_file "$JANITOR" "$OC_MUT/m3.sh" orphan_delivery_state 'if ! subj=$(git_in "$gdir" "$container" log -1 --format='"'"'%s'"'"' "$sha" 2>/dev/null); then' 'subj=$(git_in "$gdir" "$container" log -1 --format='"'"'%s'"'"' "$sha" 2>/dev/null); if false; then'
 oc_expect_dead m3 unit "an unreadable subject is ignored instead of making the answer unknown"
-oc_mutate_file "$JANITOR" "$OC_MUT/m4.sh" orphan_delivery_state 'if ! git_in "$gdir" "$container" show --name-only --format='"'"''"'"' "$sha" >/dev/null 2>&1; then' 'git_in "$gdir" "$container" show --name-only --format='"'"''"'"' "$sha" >/dev/null 2>&1; if false; then'
+oc_mutate_file "$JANITOR" "$OC_MUT/m4.sh" orphan_delivery_state 'if ! files=$(git_in "$gdir" "$container" show --name-only --format='"'"''"'"' "$sha" 2>/dev/null); then' 'files=$(git_in "$gdir" "$container" show --name-only --format='"'"''"'"' "$sha" 2>/dev/null); if false; then'
 oc_expect_dead m4 unit "an unreadable file list is ignored (docs-only cannot be ruled out, yet it is called found)"
-oc_mutate_file "$JANITOR" "$OC_MUT/m5.sh" janitor_orphan_decide 'if [ "$sig_marker" != "0" ]; then' 'if false; then'
-oc_expect_dead m5 unit "the bead's own gate marker no longer holds the strip"
+oc_mutate_file "$JANITOR" "$OC_MUT/m5.sh" janitor_orphan_decide 'if [ "$sig_marker" = "1" ]; then' 'if false; then'
+oc_expect_dead m5 unit "the bead's own terminal gate marker is no longer recognised as such (it would be reported as an unreadable one)"
 oc_mutate_file "$JANITOR" "$OC_MUT/m5b.sh" janitor_orphan_decide 'if [ "$has_dlabel" != "0" ]; then' 'if false; then'
 oc_expect_dead m5b unit "a delivery:* label no longer holds the strip"
 oc_mutate_file "$JANITOR" "$OC_MUT/m6.sh" janitor_orphan_decide 'echo "keep:git-unreadable"' 'echo "close:mutant-unreadable"'
 oc_expect_dead m6 unit "an unreadable / garbled state closes the bead"
 oc_mutate_file "$JANITOR" "$OC_MUT/m7.sh" orphan_state_merge 'else echo unknown; fi' 'else echo none; fi'
 oc_expect_dead m7 unit "none + unknown folds to none (the unread repo may hold the delivery)"
-oc_mutate_file "$JANITOR" "$OC_MUT/m8.sh" - 'O_VERDICT=$(janitor_orphan_decide "$O_STATE" "$S_SIGMK" "$O_HAS_DLABEL")' 'O_VERDICT="close:mutant"'
+oc_mutate_file "$JANITOR" "$OC_MUT/m8.sh" - 'O_VERDICT=$(janitor_orphan_decide "$O_STATE" "$O_SIGMK" "$O_HAS_DLABEL")' 'O_VERDICT="close:mutant"'
 oc_expect_dead m8 e2e "the sweep closes without consulting the decision (the pre-fix behaviour)"
 oc_mutate_file "$JANITOR" "$OC_MUT/m9.sh" - 'O_STATE=$(orphan_state_merge "$O_STATE" "$(orphan_delivery_state "$HQ_GITDIR" "$HQ_CONTAINER" "origin/$HQ_DEFAULT" "$SID")")' 'O_STATE=$(orphan_delivery_state "$HQ_GITDIR" "$HQ_CONTAINER" "origin/$HQ_DEFAULT" "$SID")'
 oc_expect_dead m9 e2e "the HQ verdict replaces the rig's instead of being folded with it"
 oc_mutate_file "$JANITOR" "$OC_MUT/m10.sh" - 'O_STRIP_OK=0; warn "could not remove inherited gate:passed' 'O_STRIP_OK=1; warn "could not remove inherited gate:passed'
 oc_expect_dead m10 e2e "a failed gate:passed removal no longer stops the strip (half-stripped bead + a comment that claims otherwise)"
+# — gate-fix 1 (gate_run ga-l9aqqn1): one mutant per guard it added; every one must die —
+oc_mutate_file "$JANITOR" "$OC_MUT/m11.sh" janitor_orphan_decide 'if [ "$sig_marker" != "0" ]; then echo "keep:gate-marker-unreadable"; return 0; fi' 'if false; then echo "keep:gate-marker-unreadable"; return 0; fi'
+oc_expect_dead m11 unit "an unreadable marker (not exactly 0) no longer holds the strip"
+# THE reviewer's mutant: a failed marker read folded back into 0 ("no marker") — the caller can no longer say "I don't know"
+oc_mutate_file "$JANITOR" "$OC_MUT/m12.sh" - '|| O_SIGMK=unknown' '|| O_SIGMK=0'
+oc_expect_dead m12 gf "a FAILED marker read is folded back into 0 = 'no marker' (error == empty), so the strip erases real gate state"
+oc_mutate_file "$JANITOR" "$OC_MUT/m13.sh" markers_for_bead_strict '-l "source-bead:$id" 2>/dev/null) || return 1' '-l "source-bead:$id" 2>/dev/null) || true'
+oc_expect_dead m13 unit "the strict read ignores bd's exit code (a bd that failed after printing [] reads as 'no marker')"
+oc_mutate_file "$JANITOR" "$OC_MUT/m14.sh" markers_for_bead_strict "jq -e 'type == \"array\"' >/dev/null 2>&1 || return 1" 'true'
+oc_expect_dead m14 unit "the strict read accepts any output as data (an error envelope / empty output reads as 'no marker')"
+oc_mutate_file "$JANITOR" "$OC_MUT/m15.sh" - '[ -z "$O_STALE" ] || O_STATE=unknown' ':'
+oc_expect_dead m15 gf "a none verdict over a repo whose fetch failed still strips (stale refs read as 'no commit')"
+oc_mutate_file "$JANITOR" "$OC_MUT/m16.sh" - 'FETCH_FAILED+=("$gdir"); ' ''
+oc_expect_dead m16 gf "a failed fetch is not remembered, so nothing can tell the refs are stale"
+oc_mutate_file "$JANITOR" "$OC_MUT/m17.sh" - 'elif [ "$O_FOREIGN" = "1" ] && fetch_stale "$HQ_GITDIR"; then O_STALE="$HQ_GITDIR"; fi' 'fi'
+oc_expect_dead m17 gf "a foreign story's HQ repo may be stale and still decide a strip"
+oc_mutate_file "$JANITOR" "$OC_MUT/m18.sh" - '|| warn "could not post the explanation comment on' '|| : "could not post the explanation comment on'
+oc_expect_dead m18 gf "a comment that failed to post is swallowed (the bead is stripped with no note and no trace in the log)"
 unset GIT_CEILING_DIRECTORIES
 
 echo ""
