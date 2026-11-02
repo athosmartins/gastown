@@ -31,12 +31,12 @@
 #
 # O REGISTRO DO QUE FOI PARADO. $D2_STATE (padrão $CITY/.gc/disk-recovery-d2.state), TSV de eventos, só acrescenta:
 #   epoch  EVENTO  id  pid  início_epoch  run_id  livre_MB  detalhe          (campo vazio = `-`)
-#   STOPPING (gravado ANTES do kill) → STOPPED (morreu; carrega o run_id lido do S3) | STOP_FAILED
+#   STOPPING (gravado ANTES do kill) → STOPPED (morreu; carrega o run_id: o `--resume-run <id>` da linha de comando do job, se ele era uma retomada, senão o lido do S3) | STOP_FAILED
 #   RESUME_STARTED · RESUME_REFUSED (o próprio job disse "não rodei": segue pendente) · RESUME_FAILED · ABANDONED (velho demais, saiu da allowlist, já há outro processo)
 #   "Pendente de retomada" = o último evento do id é STOPPING, STOPPED ou RESUME_REFUSED.
 #
 # RETOMAR (--resume). Só retoma o pendente se: o livre >= resume_above_mb do job; está na janela dele; não há processo do job rodando; o run não passou de resume_max_age_s;
-# e o run_id é LIDO (do registro ou do S3, casando pid + hora de início do processo parado) e tem a forma `<epoch>-<pid>` — NUNCA adivinhado. Lança via
+# e o run_id é LIDO (do registro, da linha de comando do job retomado ou do S3, casando pid + hora de início do processo parado) e tem a forma `<epoch>-<pid>` — NUNCA adivinhado. Lança via
 # `launchctl submit` (fora deste processo, para não morrer com o orquestrador) com o MESMO ambiente do plist do job (teto de memória e de RSS inclusos) e vigia
 # $D2_RESUME_WATCH_S s: se o job seguir de pé, é 0 (isso NÃO prova que passou dos portões dele — origem, checkpoints no S3 e mês rodam depois, e o D2 para de olhar ali); se o portão dele recusar
 # (rc 3 "NÃO RODEI": janela, disco 8,25 GiB, outro processo), é 10 e segue pendente. O RÓTULO da retomada: `submit` é KeepAlive (o launchd relança o job ~10 s depois de TODA saída), então o job roda dentro de
@@ -366,7 +366,7 @@ for k, v in d.items():
 }
 
 rfb_launch() {  # $1=run_id → rc 0 = subiu e seguiu vivo (ou já terminou bem) · 10 = o próprio job recusou (rc 3) · 20 = falhou · 30 = não consegui ler/limpar o estado e NÃO lancei. LAUNCH_MSG diz o que houve
-  local rid=$1 envl kv lrc i=0 out code
+  local rid=$1 envl kv lrc i=0 out code lcabs
   LAUNCH_MSG=""
   envl=$(rfb_plist_env) || { LAUNCH_MSG="não consegui ler o EnvironmentVariables de $RFB_PLIST (não chuto o ambiente do job)"; return 30; }
   # vazio (rc 113: o launchd não conhece o rótulo) → não há retomada, segue para o submit; falhou/ilegível (qualquer outro rc) → não sei se já há uma viva: rc 30, não lanço outra por cima
@@ -383,11 +383,14 @@ rfb_launch() {  # $1=run_id → rc 0 = subiu e seguiu vivo (ou já terminou bem)
   # vazio (sem arquivo) → segue; falhou/ilegível (o arquivo ficou e não consegui apagá-lo) → rc 30, não lanço
   rm -f "$RESUME_RC" 2>/dev/null      # MUT:rcclear
   [ ! -e "$RESUME_RC" ] || { LAUNCH_MSG="não consegui apagar o código de saída da retomada anterior ($RESUME_RC): não lanço"; return 30; }      # MUT:rccheck
+  # o wrapper chama o launchctl pelo CAMINHO ABSOLUTO: o PATH do job é o do plist do rfb e pode não ter /bin, e sem o `remove` o KeepAlive relança o job.
+  # vazio/falhou (o command -v não resolve) → o nome como veio: o `launchctl list` lá em cima já teria dado rc 30 se ele não existisse
+  lcabs=$(command -v "$LAUNCHCTL_BIN" 2>/dev/null) || lcabs=$LAUNCHCTL_BIN      # MUT:lcabs
   set -- /usr/bin/env
   while IFS= read -r kv; do [ -n "$kv" ] && set -- "$@" "$kv"; done <<EOF
 $envl
 EOF
-  set -- "$@" /bin/bash -c "$RESUME_WRAPPER" _ "$RESUME_RC" "$RESUME_LABEL" "$LAUNCHCTL_BIN" "$RFB_ROOT" \
+  set -- "$@" /bin/bash -c "$RESUME_WRAPPER" _ "$RESUME_RC" "$RESUME_LABEL" "$lcabs" "$RFB_ROOT" \
     /bin/bash "$RFB_ROOT/scripts/job_timeout.sh" 21600 com.whatsapp.rfb-stream-resume --soft -- \
     "$RFB_PYTHON" "$RFB_ROOT/scripts/rfb_stream_refresh.py" --resume-run "$rid"
   "$LAUNCHCTL_BIN" submit -l "$RESUME_LABEL" -o "$RESUME_LOG" -e "$RESUME_LOG" -- "$@" >/dev/null 2>&1 \
@@ -417,7 +420,7 @@ EOF
 
 # ── --run / --dry-run ───────────────────────────────────────────────────────────────────────────────────────────────────────
 do_run() {
-  local free id adapter re pre stop_mb resume_mb window maxage how procs n pid et p lrc start
+  local free id adapter re pre stop_mb resume_mb window maxage how procs n pid et p lrc start crid
   load_allowlist || finish 30 "$ALLOW_ERR; não ajo"
   free=$(read_free_mb) || finish 30 "não consegui ler o livre de $VOLUME (df); não ajo"      # MUT:freefail
   local plan="" idle="" held="" row
@@ -438,7 +441,11 @@ EOF
       [ -n "$p" ] || continue
       pid=$(printf '%s' "$p" | cut -f1); et=$(printf '%s' "$p" | cut -f4)
       start="-"; [ "$et" -ge 0 ] 2>/dev/null && start=$(( $(now) - et ))      # fixado AGORA: o 2º processo do plano não herda a demora de parar o 1º
-      plan="${plan}${id}${TAB}${pid}${TAB}${start}${TAB}${stop_mb}${TAB}${resume_mb}${TAB}${window}${TAB}${re}${TAB}${pre}${NL}"
+      # o job RETOMADO leva `--resume-run <id>` na PRÓPRIA linha de comando: esse é o run_id dele, LIDO do ps (as chaves do S3 de um run retomado ficam sob o id ANTIGO e pid+hora não as achariam).
+      # vazio (não é uma retomada, ou o id não tem a forma <epoch>-<pid>) → '-' e o run_id vem do S3 como antes; falhou/ilegível (o sed) → '-' também: nunca um id inventado
+      crid=$(printf '%s' "$p" | cut -f5- | sed -n 's/.* --resume-run \([0-9][0-9]*-[0-9][0-9]*\)\( .*\)\{0,1\}$/\1/p' | head -n 1)
+      [ -n "$crid" ] || crid="-"
+      plan="${plan}${id}${TAB}${pid}${TAB}${start}${TAB}${stop_mb}${TAB}${resume_mb}${TAB}${window}${TAB}${re}${TAB}${pre}${TAB}${crid}${NL}"
     done <<EOF
 $procs
 EOF
@@ -467,7 +474,7 @@ EOF
   local rid rrc resume_hint=""
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    IFS="$TAB" read -r id pid start stop_mb resume_mb window re pre <<EOF
+    IFS="$TAB" read -r id pid start stop_mb resume_mb window re pre crid <<EOF
 $line
 EOF
     # re-confere a identidade AGORA, imediatamente antes do primeiro sinal: pid que sumiu ou foi reaproveitado não recebe nada
@@ -479,10 +486,13 @@ EOF
     stop_pid "$re" "$pre" "$pid"; srp=$?
     if [ "$srp" -eq 0 ]; then
       rid="-"
-      if rfb_run_id "$pid" "$start"; then
+      if [ "$crid" != "-" ]; then
+        rid=$crid      # MUT:cmdrid
+        log "$id: run_id $rid lido da linha de comando do processo (--resume-run); o S3 não foi consultado"
+      elif rfb_run_id "$pid" "$start"; then
         case "$RUNID_RES" in
           "ID "*) rid=${RUNID_RES#ID } ;;
-          NONE) log "$id: nenhuma chave stream-run-<epoch>-$pid casa (se este run era um --resume-run, as chaves ficam sob o run_id ANTIGO): run_id fica '-', não adivinho" ;;
+          NONE) log "$id: nenhuma chave stream-run-<epoch>-$pid casa: run_id fica '-', não adivinho" ;;
           *) log "$id: mais de um run casa pid+hora ($RUNID_RES): não adivinho o run_id" ;;
         esac
       else
@@ -527,13 +537,17 @@ do_resume() {
   local free pend line id pid start rid stopts row adapter re pre stop_mb resume_mb window maxage how procs age lrc code
   local started="" failed="" unread="" waiting="" abandoned="" norec="" any=0
   load_allowlist || finish 30 "$ALLOW_ERR; não ajo"
-  pend=$(pending_rows) || finish 30 "não consegui ler o registro $STATE; não ajo"
+  pend=$(pending_rows) || finish 30 "não consegui ler o registro $STATE; não ajo"      # MUT:pendread
   [ -n "$pend" ] || finish 10 "nada a retomar (nenhum job parado pendente em $STATE)"
   free=$(read_free_mb) || finish 30 "não consegui ler o livre de $VOLUME (df); não ajo"
   acquire_lock; lrc=$?      # rc 0 tomei · 1 outra instância · 2 não consegui criar nem verificar (NÃO é "outra instância": mesmo contrato do --run)      # MUT:resumelock
   [ "$lrc" -eq 1 ] && finish 10 "outra instância do D2 em execução ($LOCKD): saio sem agir"
   [ "$lrc" -eq 0 ] || finish 30 "não consegui criar nem verificar a trava $LOCKD (erro de gravação, ou ps/find ilegível): não retomo"
   trim_log
+  # a 1ª leitura foi SEM a trava (barata: o tick sem nada pendente nem chega a tomá-la); uma instância que terminou entre ela e a trava já pode ter retomado ou abandonado o que li.
+  # Releio com a trava na mão. vazio (a outra tratou tudo) → nada a retomar; falhou/ilegível → rc 30, não ajo com uma foto velha
+  pend=$(pending_rows) || finish 30 "não consegui reler o registro $STATE com a trava; não ajo"      # MUT:reread
+  [ -n "$pend" ] || finish 10 "nada a retomar (outra instância tratou o pendente enquanto eu tomava a trava)"
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     IFS="$TAB" read -r id pid start rid stopts <<EOF
@@ -541,7 +555,7 @@ $line
 EOF
     any=1
     row=$(row_of "$id")
-    if [ -z "$row" ]; then
+    if [ -z "$row" ]; then      # MUT:rowgone
       state_append ABANDONED "$id" "$pid" "$start" "$rid" "$free" "saiu da allowlist"
       abandoned="${abandoned}${abandoned:+; }$id (saiu da allowlist)"; continue
     fi
@@ -550,12 +564,12 @@ $row
 EOF
     case "$stopts" in ''|*[!0-9]*) unread="${unread}${unread:+; }$id: registro sem hora válida do STOP"; continue ;; esac
     age=$(( $(now) - stopts ))
-    if [ "$maxage" != "-" ] && [ "$age" -gt "$maxage" ]; then
+    if [ "$maxage" != "-" ] && [ "$age" -gt "$maxage" ]; then      # MUT:maxage
       state_append ABANDONED "$id" "$pid" "$start" "$rid" "$free" "parado há ${age}s > ${maxage}s: o run já não vale"
       abandoned="${abandoned}${abandoned:+; }$id (parado há ${age}s > ${maxage}s: o próximo tick recomeça do zero)"; continue
     fi
     procs=$(find_procs "$re" "$pre") || { unread="${unread}${unread:+; }$id: não consegui ler o ps"; continue; }
-    if [ -n "$procs" ]; then
+    if [ -n "$procs" ]; then      # MUT:running
       state_append ABANDONED "$id" "$pid" "$start" "$rid" "$free" "já há processo do job rodando"
       abandoned="${abandoned}${abandoned:+; }$id (já há processo rodando: pid $(printf '%s\n' "$procs" | head -n 1 | cut -f1))"; continue
     fi
