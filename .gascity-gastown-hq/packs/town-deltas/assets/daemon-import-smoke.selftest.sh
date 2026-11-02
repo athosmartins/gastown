@@ -401,7 +401,9 @@ done
 R="$TMP_ROOT/t32"; mk_tree "$R"; mk_probe "$R"
 mk_plist "$TMP_ROOT/t32.plist" "$R/daemons" "{\"SMOKE_PROBE\":\"$R/probe.json\"}" "$R/venv/bin/python3" probe.py x
 run_smoke "$TMP_ROOT/t32.plist"
-[ "$(verdict)" = "PASS" ] && [ "$(probe "$R/probe.json" argv)" = "[\"$R/daemons/probe.py\", \"x\"]" ] && ok "T32 relative script + WorkingDirectory: PASS, argv carries the resolved absolute path" || bad "T32 got verdict=$(verdict) reason=$(reason) argv=[$(probe "$R/probe.json" argv)]"
+# a relative script goes through os.path.normpath, which also collapses the `//` that a TMPDIR ending in "/" (macOS) leaves in $R
+want_script="$(python3 -I -c 'import os, sys; print(os.path.normpath(sys.argv[1]), end="")' "$R/daemons/probe.py")"
+[ "$(verdict)" = "PASS" ] && [ "$(probe "$R/probe.json" argv)" = "[\"$want_script\", \"x\"]" ] && ok "T32 relative script + WorkingDirectory: PASS, argv carries the resolved absolute path" || bad "T32 got verdict=$(verdict) reason=$(reason) argv=[$(probe "$R/probe.json" argv)]"
 
 # ── T33: an interpreter that is not an executable FILE is refused before any launch ──
 # mutant c11d0573d1 (`isfile and access` -> `isfile or access`): a non-executable file and a directory both slip through to Popen
