@@ -20,7 +20,10 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 W="${WFD_UNDER_TEST:-$HERE/wait-for-dolt.sh}"
 LIBSRC="$HERE/dolt-pid-lib.sh"
-T=$(cd "$(mktemp -d /tmp/wfd.XXXXXX)" && pwd -P)
+# ga-ow127o6: o diretório de trabalho segue o TMPDIR (a caixa do gate só deixa gravar nele) e mktemp que FALHA sai 2 sem rodar nada.
+# vazio/falhou → antes, `cd ""` ficava onde estava (medido em bash 5.2 e 3.2.57) e T virava o cwd, que o `find "$T" -delete` do cleanup varria.
+T=$(mktemp -d "${TMPDIR:-/tmp}/wfd.XXXXXX") || { echo "FAIL mktemp -d falhou em ${TMPDIR:-/tmp}; nada foi testado" >&2; exit 2; }
+T=$(cd "$T" && pwd -P)
 S="$T/state"; RAN="$S/ran"; mkdir -p "$S" "$T/bin" "$T/bin-nolsof"
 BG=""
 cleanup() {
