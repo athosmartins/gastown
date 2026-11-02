@@ -133,10 +133,13 @@ if a[:2] == ["session", "reset"]:
         sys.stderr.write("boom\n")
         sys.exit(1)
     sys.exit(0)
+if a[:2] == ["mail", "send"]:
+    sys.exit(1 if os.environ.get("FAKE_GC_MAIL_FAIL") else 0)
 sys.exit(2)
 '''
 
-NOTIFY = "#!/bin/sh\necho \"$@\" >> \"$FAKE_SEC_DIR/notify.log\"\n[ -n \"$FAKE_NOTIFY_FAIL\" ] && exit 7\nexit 0\n"
+NOTIFY = ("#!/bin/sh\necho \"$@\" >> \"$FAKE_SEC_DIR/notify.log\"\necho \"$NOTIFY_STRICT_EXIT/$NOTIFY_FORCE_PUSH\" >> \"$FAKE_SEC_DIR/notify.env\"\n"
+          "[ -n \"$FAKE_NOTIFY_FAIL\" ] && exit 7\nexit \"${FAKE_NOTIFY_RC:-0}\"\n")      # FAKE_NOTIFY_RC: the strict exit codes of the real notify
 EMAIL = {"crypto": "athoscrypto@gmail.com", "amb": "throw.away.amb@gmail.com", "b85": "athosb85@gmail.com",
          "terr": "terrenos.incorporacoes@gmail.com", "martins": "athosmartins@gmail.com"}
 
@@ -408,7 +411,8 @@ class World:
         }.items():
             monkeypatch.setenv(k, v)
         for k in ("GC_CREW_ACCOUNT", "CLAUDE_CREW_ACCOUNTS", "FAKE_SEC_FAIL", "FAKE_SEC_WFAIL", "FAKE_SEC_DROP", "FAKE_NOTIFY_FAIL",
-                  "GC_CREW_UNSTICK", "FAKE_TMUX_DOWN", "CLAUDE_CREW_TMUX_SOCKET", "GC_CREW_RESET", "FAKE_GC_LIST_FAIL", "FAKE_GC_RESET_FAIL"):
+                  "GC_CREW_UNSTICK", "FAKE_TMUX_DOWN", "CLAUDE_CREW_TMUX_SOCKET", "GC_CREW_RESET", "FAKE_GC_LIST_FAIL", "FAKE_GC_RESET_FAIL",
+                  "FAKE_NOTIFY_RC", "FAKE_GC_MAIL_FAIL", "NOTIFY_STRICT_EXIT", "NOTIFY_FORCE_PUSH"):
             monkeypatch.delenv(k, raising=False)
         self.mp = monkeypatch
         # the world must be sealed: every seam inside this tmp dir, none of them a sentinel
@@ -503,6 +507,14 @@ class World:
     def gc_calls(self):
         p = self.d / "gcd" / "gc.log"
         return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
+
+    def mails(self):
+        """The `mail send` argv of every mail to the Mayor (ga-xoe5ao.4): [..., "-s", subject, "-m", body]."""
+        return [c for c in self.gc_calls() if c[2:4] == ["mail", "send"]]
+
+    def notify_envs(self):
+        p = self.d / "notify.env"
+        return p.read_text().splitlines() if p.exists() else []
 
     def log(self):
         p = self.d / "city" / ".gc" / "logs" / "claude-crew-account.log"
@@ -2385,3 +2397,247 @@ def test_a_gc_that_cannot_run_times_out_or_answers_garbage_names_no_session(w, m
     with monkeypatch.context() as m:
         m.setenv("CLAUDE_CREW_GC", str(w.d / "no-such-gc"))
         assert crew.gc_run(["session", "list", "--json"]) == (None, "")                      # no gc binary at all
+
+
+# ══ ga-xoe5ao.4 (claude-crew-account.py): 18.5 h without a full login in the default item (01/11 08:39Z - 02/11 03:10Z), nobody told ═══
+def _dead_world(w, keys=("terr", "crypto", "amb", "b85")):
+    """The 01/11 shape: no access token in the default, and every stored login is one the CLI refuses to refresh (the test empties the default
+    again after every run, `_run_dead`). A stored copy's access token is expired, so the profile never vouches for it."""
+    _blank_default(w)
+    for k in keys:
+        w.account(k, blob(k))
+    w.decide("terr")
+
+
+def _run_dead(w, *secs):
+    for s in secs:
+        w.run(at=w.now + s)
+        _blank_default(w)
+
+
+def _ep_pushes(w, text="NO full Claude login"):
+    return [n for n in w.notified() if text in n]
+
+
+def test_a_push_asks_notify_for_its_strict_exit_codes_and_forces_it(w):
+    """Breaks if a push goes out as a plain `notify`: without NOTIFY_STRICT_EXIT it exits 0 on every path that did not push (digest, dedup, quiet
+    hours) and the job recorded a push nobody got as 'told' for 6 h - the 18.5 h in which nobody heard that Remote Control was down."""
+    _no_login_problem(w)
+    w.run()
+    assert len(w.notified()) == 1 and w.notify_envs() == ["1/1"]
+
+
+@pytest.mark.parametrize("rc, told", [(0, True), (10, True), (11, True), (12, False), (13, False), (1, False)])
+def test_only_the_exit_codes_of_a_push_that_reached_somebody_count_as_told(w, rc, told):
+    """Breaks if 'told' is exit 0 alone (held for the 7h flush and already-out ARE told) or anything but 7 (12 is the digest / the rate cap)."""
+    _no_login_problem(w)
+    w.mp.setenv("FAKE_NOTIFY_RC", str(rc))
+    w.run()
+    w.run(at=w.now + 600)                                         # past the 5 minutes in which a push that did not go is retried
+    assert len(w.notified()) == (1 if told else 2)
+
+
+def test_two_conditions_never_share_a_title(w):
+    """Breaks if every push is titled the same: notify drops a push whose TITLE went out < 30 min ago, so the second thing wrong in a bad
+    hour - 08:39Z 'default holds no full login', 08:48Z 'cannot heal' - never reached the phone."""
+    _heal_loop_world(w)
+    w.run()
+    titles = [re.search(r"-t (.*?) -p 4 ", n).group(1) for n in w.notified()]
+    assert len(titles) >= 2 and len(set(titles)) == len(titles)
+
+
+def test_the_outage_is_told_after_ten_minutes_by_push_and_mail_again_when_it_ends_and_the_dead_logins_stop_being_written(w):
+    """The 01/11 shape end to end. Breaks if nobody is told, if the Mayor gets no durable copy, if the end is not told, if the news is early or
+    repeated every minute, or if the dead logins are written to the default every 6 h for ever (log #332-#334)."""
+    _dead_world(w)
+    _run_dead(w, 0, 180, 360, 540)
+    assert _ep_pushes(w) == [] and w.mails() == []               # nine minutes in: not news yet
+    _run_dead(w, 600, 660, 3600)
+    assert len(_ep_pushes(w)) == 1 and len(w.mails()) == 1       # ten minutes in a row: ONE push and ONE mail, not one per minute
+    mail = w.mails()[0]
+    subject, body = mail[mail.index("-s") + 1], mail[mail.index("-m") + 1]
+    assert mail[4:7] == ["mayor/", "--from", "controller"] and "SEM login completo" in subject
+    assert "Tried:" in body and EMAIL["b85"] in body and f"claude auth login --email {EMAIL['terr']}" in body and "NOT wired" in body
+    _run_dead(w, 21600 + 600, 21600 + 660, 21600 + 720, 21600 + 780, 21600 + 840)     # 6 h on: every hold has lapsed, each login gets its one more try
+    _run_dead(w, 43200 + 600, 64800 + 600)
+    assert w.writes().count(crew.DEFAULT_SERVICE) == 8           # 4 logins x BURN_LIMIT, then dead (the old script: one more round every 6 h)
+    assert len(_ep_pushes(w)) == 4 and len(w.mails()) == 1       # a reminder every 6 h while it lasts (10 min, 6 h, 12 h, 18 h); the mail goes once
+    assert "dead" in _ep_pushes(w)[-1]
+    pushes = len(w.notified())
+    w.run(dry=True, at=w.now + 87000)                            # a reminder is due, but --dry-run tells nobody
+    assert len(w.notified()) == pushes and len(w.mails()) == 1
+    w.default("terr", blob("terr-relogin"))                      # somebody logged the pool's account in: a live token the profile vouches for
+    for s in (70000, 70300, 70590):
+        w.run(at=w.now + s)
+    assert _ep_pushes(w, "Remote Control is BACK") == [] and len(w.mails()) == 1       # a full login, but not for ten minutes yet
+    for s in (70600, 70660, 70720):
+        w.run(at=w.now + s)
+    assert len(_ep_pushes(w, "Remote Control is BACK")) == 1 and len(w.mails()) == 2   # the end is told once, on both channels
+    assert "no_login" not in w.state() and w.state()["no_login_last"]["end_told"] is True
+    for text in (json.dumps(w.gc_calls()), "\n".join(w.notified()), w.log(), json.dumps(w.state())):
+        assert secrets_in(text, w) == []
+
+
+def test_a_blank_default_that_is_healed_within_ten_minutes_is_not_news(w):
+    """Negative control (the old script tells nobody anything of the kind, so this cannot fail there): a blip of a few minutes must not push,
+    mail or announce an end - a notice nobody needed teaches everybody to ignore the next one."""
+    w.account("crypto", blob("crypto"))
+    w.decide("crypto")
+    _run_dead(w, 0, 120)                                          # blank, healed from crypto's stored copy, blank again
+    w.default("crypto", blob("crypto-live"))                      # the CLI refreshed it: a live login
+    for s in (240, 600, 900, 1500):
+        w.run(at=w.now + s)
+    assert _ep_pushes(w) == [] and _ep_pushes(w, "BACK") == [] and w.mails() == [] and "no_login" not in w.state()
+
+
+def test_a_mail_the_gc_refused_is_retried_every_five_minutes_and_recorded_only_when_it_went(w):
+    _dead_world(w)
+    w.mp.setenv("FAKE_GC_MAIL_FAIL", "1")
+    _run_dead(w, 0, 180, 360, 540, 600, 660)                     # due at 600: refused
+    assert len(w.mails()) == 1 and "gc mail send to the Mayor failed" in w.log()
+    _run_dead(w, 900)                                             # five minutes later: tried again
+    assert len(w.mails()) == 2
+    w.mp.delenv("FAKE_GC_MAIL_FAIL")
+    _run_dead(w, 1200, 1500, 1800, 2100)
+    assert len(w.mails()) == 3                                    # it went this time, and once is enough
+
+
+def test_a_gc_that_cannot_run_is_a_mail_not_sent_not_a_crash(w):
+    _dead_world(w, ("terr",))
+    w.mp.setenv("CLAUDE_CREW_GC", str(w.d / "no-such-gc"))        # no gc binary at all: "cannot tell" is not "sent"
+    _run_dead(w, 0, 600)
+    assert "gc mail send to the Mayor failed (exit=None)" in w.log() and len(_ep_pushes(w)) == 1
+    assert not w.state()["no_login"].get("mailed")
+
+
+def test_a_notify_that_hangs_is_not_told_and_does_not_take_the_run_down(w, monkeypatch):
+    """Breaks if a notify that times out is recorded as told (or raises out of the run): the push is retried five minutes later."""
+    _no_login_problem(w)
+    real = subprocess.run
+
+    def hangs(cmd, *a, **k):
+        if cmd[0] == os.environ["CLAUDE_CREW_NOTIFY"]:
+            raise subprocess.TimeoutExpired(cmd, 30)
+        return real(cmd, *a, **k)
+    with monkeypatch.context() as m:
+        m.setattr(crew.subprocess, "run", hangs)
+        w.run()
+    assert w.notified() == [] and "notify could not run (TimeoutExpired)" in w.log()
+    w.run(at=w.now + 600)                                         # notify answers again: the push that was never told goes out
+    assert len(w.notified()) == 1
+
+
+def test_a_default_item_that_does_not_exist_is_an_episode_too(w):
+    w.account("amb", blob("amb"))
+    w.decide("amb")
+    w.run()
+    w.run(at=w.now + 600)
+    pushes = _ep_pushes(w)
+    assert len(pushes) == 1 and "does not exist" in pushes[0] and len(w.mails()) == 1
+
+
+def test_a_default_item_that_cannot_be_read_neither_extends_nor_ends_an_episode(w):
+    _dead_world(w, ("terr",))
+    _run_dead(w, 0)
+    since = w.state()["no_login"]["since"]
+    w.mp.setenv("FAKE_SEC_FAIL", crew.DEFAULT_SERVICE)            # a locked keychain: cannot tell
+    w.run(at=w.now + 1200)
+    ep = w.state()["no_login"]
+    assert ep["since"] == since and ep["last_bad"] == since and "good_since" not in ep and _ep_pushes(w) == []
+
+
+@pytest.mark.parametrize("damage", ["garbage", {"since": "yesterday"}, {"since": True}, {}], ids=["not-a-record", "text-time", "bool-time", "empty"])
+def test_an_episode_record_that_cannot_be_read_starts_the_clock_again_and_never_tells_early(w, damage):
+    _dead_world(w, ("terr",))
+    w.run()
+    st = w.state()
+    st["no_login"] = damage
+    (w.d / "crew_state.json").write_text(json.dumps(st))
+    _blank_default(w)
+    w.run(at=w.now + 700)
+    assert w.state()["no_login"]["since"] == w.now + 700 and _ep_pushes(w) == [] and w.mails() == []
+
+
+def test_a_login_the_cli_emptied_twice_is_dead_not_written_again_every_six_hours(w):
+    """Breaks if a login the CLI refused twice is tried again each time its 6 h hold lapses (#332-#334: three logins re-written in 13 minutes)."""
+    _heal_loop_world(w)
+    _run_dead(w, 0, 240)                                          # written; empty 4 minutes later: strike 1 (held, as before)
+    assert w.writes().count(crew.DEFAULT_SERVICE) == 1
+    _run_dead(w, 21600 + 60, 21600 + 300)                         # the hold lapsed: one more try... empty again: strike 2
+    assert w.writes().count(crew.DEFAULT_SERVICE) == 2
+    _run_dead(w, 43200 + 60, 64800 + 60)                          # the hold lapsed twice more: dead, so never again
+    assert w.writes().count(crew.DEFAULT_SERVICE) == 2 and "dead" in w.log()
+    (rfp, rec), = w.state()["burned"].items()
+    assert rec["n"] == 2 and rfp == crew.fp("sk-ant-ort01-b85-ref")
+    w.account("b85", blob("b85", rt="b85-relogin"))               # a human redid the login: a new refresh token is another key
+    _run_dead(w, 70000)
+    assert w.writes().count(crew.DEFAULT_SERVICE) == 3
+
+
+def test_a_login_the_cli_refreshed_is_not_held_against_it(w):
+    """Breaks if strikes are never forgiven: a login that took a refresh is alive, and one bad hour must not kill it for good."""
+    _heal_loop_world(w)
+    _run_dead(w, 0, 240)                                          # strike 1
+    (rfp, _), = w.state()["burned"].items()
+    w.run(at=w.now + 21600 + 60)                                  # the second try is written...
+    w.default("b85", blob("b85-refreshed", rt="b85-rotated"))     # ...and this time the CLI refreshes it: a live login, another access token
+    w.run(at=w.now + 21600 + 120)
+    assert rfp not in w.state()["burned"]
+
+
+@pytest.mark.parametrize("damage", [{"svc": "x"}, "garbage", {"n": True, "at": 1}], ids=["no-count", "not-a-record", "count-is-a-bool"])
+def test_a_strike_record_that_lost_its_count_still_holds_the_login(w, damage):
+    """Breaks if 'could not read the strikes' ends as 'never struck': the failed read must land on the inert side (nothing is written)."""
+    _heal_loop_world(w)
+    (w.d / "crew_state.json").write_text(json.dumps({"burned": {crew.fp("sk-ant-ort01-b85-ref"): damage}}))
+    w.run()
+    assert w.writes() == []
+
+
+@pytest.mark.parametrize("wait, becomes", [(getattr(crew, "BURN_WINDOW_S", 1800) + 60, "empty"), (240, "setup-token")], ids=["too-late-to-blame-the-write", "somebody-else-changed-it"])
+def test_an_empty_default_that_cannot_be_blamed_on_the_write_is_no_strike(w, wait, becomes):
+    """Negative control (the old script keeps no strikes, so this cannot fail there): a login is called dead only on the signature - no access token
+    soon after the blind write. Empty an hour later, or replaced by somebody else's setup-token, says nothing about the login that was written."""
+    _heal_loop_world(w)
+    w.run()
+    w.put(crew.DEFAULT_SERVICE, blob("human", refresh=False)) if becomes == "setup-token" else _blank_default(w)
+    w.run(at=w.now + wait)
+    assert not w.state().get("burned")
+
+
+def test_logins_ending_within_a_week_are_said_once_a_day_and_the_best_login_of_the_account_decides(w):
+    """Breaks if the absolute life of a refresh token (~30 days from the login) is found out the day it ends: the default's own ended 02/11
+    19:53Z (the Mayor lost Remote Control), the three config dirs end ~04/11."""
+    w.default("crypto", blob("crypto", rexp_days=20))
+    w.account("crypto", blob("crypto", rexp_days=20))
+    w.account("amb", blob("amb", rexp_days=5))                    # ends in 5 days: said
+    w.account("b85", blob("b85", rexp_days=3))
+    w.put(crew.reserve_service(EMAIL["b85"]), blob("b85-reserve", rexp_days=25))      # ...but b85 has a better login elsewhere: not said
+    w.decide("crypto")
+    w.run()
+    said = lambda: [n for n in w.notified() if "ends in" in n]    # noqa: E731
+    assert len(said()) == 1 and EMAIL["amb"] in said()[0] and "ends in 5.0 days" in said()[0] and f"claude auth login --email {EMAIL['amb']}" in said()[0]
+    assert w.notify_envs() == ["1/"]                              # strict but NOT forced: the quiet hours may hold it for the morning
+    w.run(at=w.now + 7200)                                        # read again, but said less than a day ago
+    assert len(said()) == 1
+    w.run(at=w.now + 90000)
+    assert len(said()) == 2
+
+
+def test_the_login_in_use_counts_for_the_account_that_holds_it(w):
+    w.default("crypto", blob("crypto", rexp_days=2))              # no stored copy at all
+    w.decide("crypto")
+    w.run()
+    said = [n for n in w.notified() if "ends in" in n]
+    assert len(said) == 1 and EMAIL["crypto"] in said[0] and "2.0 days" in said[0]
+
+
+def test_the_newer_stored_login_skip_is_said_once_with_the_facts_not_every_minute(w):
+    """Breaks if 14 h of 'skipped: the stored login is a NEWER one' (02/11) stay one identical line a minute that says nothing about which login is which."""
+    w.default("crypto", blob("crypto", rt="old-login", rexp_days=10))
+    w.account("crypto", blob("crypto", rt="new-login", rexp_days=29))
+    w.decide("crypto")
+    for i in range(3):
+        w.run(at=w.now + 60 * i)
+    assert w.log().count("skipped: the stored login is a NEWER one") == 1
+    assert crew.fp("sk-ant-ort01-new-login-ref") in w.log() and crew.fp("sk-ant-ort01-old-login-ref") in w.log() and "ends 20" in w.log()
