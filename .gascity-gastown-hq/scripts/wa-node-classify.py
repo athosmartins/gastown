@@ -199,12 +199,17 @@ SCAN_EXT = ("py", "sh", "js", "mjs", "cjs", "ts")                    # extensõe
 MAX_STR_LEN = 4000                                                   # limite de custo do regex: de UMA string só os primeiros 4000 caracteres são lidos (dado embutido, SQL gigante). PONTO CEGO conhecido: um `.db`/`osascript` depois do 4000º caractere de uma mesma string não é visto
 MOLE_SLUGS = ("banco-de-dados", "credencial", "host-mac")
 MOLE_INFO_MAX = 6                                                    # pares slug=arquivo nomeados em `info`; o resto vira `mole-evidencia-mais:N`
-CRED_CLI = frozenset(("secret", "bw", "bws", "bitwarden"))           # argv do CLI do cofre: ["secret", "motherduck-token"] é o idioma do WA (26+20+8 ocorrências)
-CRED_CALL_RE = re.compile(r"^_*(?:get_|load_|read_|fetch_|resolve_)?secret$|^_*(?:bw|bws|bitwarden)(?:_\w+)?$", re.I)   # `_secret("x")`, `secret(...)`, `bw_get`; `secrets.token_hex` (stdlib) não casa
-CRED_MOD_RE = re.compile(r"(?:^|\.)(?:_?bitwarden\w*|keychain\w*|credentials?\w*|secret)(?:\.|$)", re.I)   # módulo do cofre/chaveiro; `secrets` (stdlib: números aleatórios) NÃO casa
+CRED_CLI = frozenset(("secret", "bw", "bws", "bitwarden"))           # argv do CLI do cofre: ["secret", "motherduck-token"] é UMA das formas do WA (87 linhas com argv exato, 57 com o CAMINHO do binário -> exec_base; linha de shell -> CRED_SHELL_RE; wrapper secret_bin()/lib.secret_cli -> CRED_CALL_RE/CRED_MOD_RE)
+CRED_CALL_RE = re.compile(r"^_*(?:get_|load_|read_|fetch_|resolve_)?secret(?:_bin|_cli)?$|^_*(?:bw|bws|bitwarden)(?:_\w+)?$", re.I)   # `_secret("x")`, `secret(...)`, `bw_get`; `secrets.token_hex` (stdlib) não casa
+CRED_MOD_RE = re.compile(r"(?:^|\.)(?:_?bitwarden\w*|keychain\w*|credentials?\w*|_?secret(?:_bin|_cli)?)(?:\.|$)", re.I)   # módulo do cofre/chaveiro; `secrets` (stdlib: números aleatórios) NÃO casa
 CRED_FILE_RE = re.compile(r"(?:^|[/\\])(?:\.env(?:\.[\w\-]+)?|credentials?[\w\-]*\.json|token\.json|client_secrets?[\w\-]*\.json|service[_\-]?account[\w\-]*\.json|[\w\-]+\.(?:pem|p12|pfx))$", re.I)   # abrir arquivo de credencial
 CRED_TEXT_RE = re.compile(r"\$\(\s*secret\s+\S|(?<![\w\-])secret\s+[\"'$\w][\w\-\"']*|\bbw\s+(?:get|unlock|login)\b|bitwarden|(?<![\w/])\.env\b|credentials?[\w\-]*\.json|token\.json|client_secrets?[\w\-]*\.json", re.I)   # texto de .sh/.js e de Python que não parseia
 HOST_RE = re.compile(r"\b(?:osascript|launchctl|plutil|pmset|pbcopy|pbpaste|caffeinate|screencapture)\b|Google Chrome|Chrome\.app|Application Support/Google/Chrome|/Applications/|LaunchAgents|LaunchDaemons|~/Library|remote-debugging-port|connect_over_cdp|\bbrew\s+(?:install|services|list)\b|\badb\s+(?:shell|devices|connect|push|pull|-s)\b")   # recurso do Mac do Athos que o nó não tem; `/Users/...` sozinho NÃO conta (é caminho-padrão, não recurso)
+# o ramo `ast` do Python vê STRINGS soltas, não o texto: a mesma ideia escrita como linha de shell ("secret motherduck-token", "/Users/x/.local/bin/secret k") ou como caminho do executável
+# precisa dar o MESMO achado que o ramo de texto (ga-qkc02kk, gate-fix 1). O comando só vale no INÍCIO da string ou depois de operador de shell (`; | & ( \``): "the secret key is missing" é prosa e não conta.
+CRED_SHELL_RE = re.compile(r"(?:^\s*|[;|&(`]\s*)(?:\S*/)?(?:secret\s+(?:[\w\-\"'$][\w\-\"']*|$)|bws?\s+(?:get|list|unlock|login|logout|status|sync|secret|run)\b)|bitwarden|(?<![\w/])\.env\b|credentials?[\w\-]*\.json|token\.json|client_secrets?[\w\-]*\.json", re.I)   # texto de UMA string de Python que parseia
+HOST_SHELL_RE = re.compile(r"(?:^\s*|[;|&(`]\s*)(?:\S*/)?(?:(?:adb|osascript|launchctl|pmset|plutil|pbcopy|pbpaste|caffeinate|screencapture)\b|security\s+(?:find|add|delete|import|export|unlock|lock|list|dump|set|show|create)-[\w\-]+)")   # idem para o Mac: o executável do Mac no começo da linha
+HOST_CALL_RE = re.compile(r"(?:^|_)(?:connect_over_cdp|osascript|launchctl|plutil|pmset|pbcopy|pbpaste|caffeinate|screencapture)(?:_|$)")   # NOME de chamada/módulo: `chromium.connect_over_cdp(...)`, `run_osascript(...)` (o HOST_RE de string não vê nome de função, e `\b` não separa `_`)
 HOST_ARGV = frozenset(("adb", "osascript", "launchctl", "security", "pmset", "plutil", "pbcopy"))   # string que é SÓ o executável (argv[0] de subprocess)
 DB_PINNED_RE = re.compile(r"shared/data/[^\s\"']*\.(?:db|sqlite3?|duckdb)\b|(?<![\w])md:[\w\-]*|/Users/[\w.\-]+/[^\s\"']*\.(?:db|sqlite3?|duckdb)\b|~/[^\s\"']*\.(?:db|sqlite3?|duckdb)\b|\.duckdb\b")   # caminho de banco de PRODUÇÃO fixado (vale em código e em teste)
 DB_BARE_RE = re.compile(r"(?<![\w\-])[\w\-][\w.\-]*\.(?:db|sqlite3?|duckdb)(?![\w])")   # nome de banco solto ("queue.db", "construtoras.db"): em código conta como banco de produção (heurística: o WA monta o caminho por pedaços, "shared" / "data" / "x.db"); em TESTE é o banco que o teste cria em tmp, por isso não conta lá
@@ -914,7 +919,7 @@ def imported_code(tests):
         if ext == "py":
             cands = [c for lvl, mod, names in py_imports(src) for c in py_candidates(t, lvl, mod, names)]
         else:
-            cands = [c for m in JS_IMPORT_RE.finditer(src) for c in js_candidates(t, m.group(2))]
+            cands = [c for m in JS_IMPORT_RE.finditer(strip_js_comments(src)) for c in js_candidates(t, m.group(2))]
         for c in cands:
             if c in present and derivable_code(c) and t not in found.setdefault(c, []):
                 found[c].append(t)
@@ -949,6 +954,19 @@ def import_derivation(tests, paths, info, extra):
     return judged_derived(found, "prova-codigo-derivado-do-teste", paths, tests, info, extra)
 
 
+def exec_base(t):
+    """o nome do executável de UMA string de Python usada como argv[0]: a própria string (sem "/"), ou o basename quando ela tem cara de caminho de executável (`/Users/x/.local/bin/secret`, `~/bin/bw`, `$HOME/…`,
+    `_/secret` de um f-string, `…/bin/…`). Com espaço (linha de shell, o CRED_SHELL_RE/HOST_SHELL_RE cuidam) ou caminho comum (`lib/security`: módulo, não o binário do Mac) -> "" (não é argv[0])."""
+    # vazio (string vazia, com espaço, caminho que não parece executável) -> ""; nunca levanta
+    if not t or any(c.isspace() for c in t):
+        return ""
+    if "/" not in t:
+        return t
+    if t.startswith(("/", "~", "$", "_/", "bin/")) or "/bin/" in t:
+        return t.rsplit("/", 1)[-1]
+    return ""
+
+
 def py_exec_parts(src):
     """(strings, calls, modules) do código EXECUTÁVEL de `src` (Python), sem docstring e sem comentário, por `ast.parse` (nada é executado). Não parseia -> None: quem chama cai no texto (mais largo)."""
     # vazio (arquivo sem string nem chamada) -> três listas vazias, legítimo; falhou/ilegível (SyntaxError, ValueError, RecursionError, MemoryError) -> None, NUNCA listas vazias
@@ -964,10 +982,13 @@ def py_exec_parts(src):
             f = n.body[0]
             if isinstance(f, ast.Expr) and isinstance(f.value, ast.Constant) and isinstance(f.value.value, str):
                 docs.add(id(f.value))
+    pieces = {id(v) for n in ast.walk(tree) if isinstance(n, ast.JoinedStr) for v in n.values if isinstance(v, ast.Constant)}   # pedaços de f-string: entram remontados (abaixo), não um a um
     strs, calls, mods = [], [], []
     for n in ast.walk(tree):
-        if isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in docs:
+        if isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in docs and id(n) not in pieces:
             strs.append(n.value[:MAX_STR_LEN])
+        elif isinstance(n, ast.JoinedStr):   # f"shared/data/{nome}.db", f"secret {chave}": o ast parte em pedaços; remonta com `_` no lugar de cada {…} (o pedaço dinâmico é palavra, como o regex espera)
+            strs.append("".join(v.value if isinstance(v, ast.Constant) and isinstance(v.value, str) else "_" for v in n.values)[:MAX_STR_LEN])
         elif isinstance(n, ast.Call):
             f = n.func
             nm = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else "")
@@ -980,15 +1001,21 @@ def py_exec_parts(src):
     return strs, calls, mods
 
 
+def strip_js_comments(src):
+    """o JS/TS sem comentário (`/* … */` e `// …` até o fim da linha, menos o `//` de URL): `// const m = require('../lib/x.js')` não é import. Tira A MAIS que o comentário só quando há `//` dentro de string na mesma linha
+    (o import depois dele some -> "ninguém importa" -> unknown, o lado conservador). Um require escrito DENTRO de string continua contando (limite conhecido, runbook)."""
+    return re.sub(r"/\*.*?\*/|(?<![:\\])//[^\n]*", "", src, flags=re.S)
+
+
 def strip_comment_lines(text):
     """o texto sem as linhas que SÓ têm comentário (#, //, *, /*): serve para sh/js e para Python que não parseia. Não tira comentário no fim da linha (mais largo, na dúvida acha mais evidência)."""
     return "\n".join(l for l in text.splitlines() if not l.strip().startswith(("#", "//", "*", "/*")))
 
 
 def scan_evidence(path, text, is_test):
-    """{slug: [o que achou]} das moles que o CÓDIGO de `path` mostra (regra 4, ga-qkc02kk). Só o que a lista do Mayor nomeia: (credencial) chamada/argv do cofre (`secret`, `bw`), módulo do cofre, arquivo de credencial
-    (.env, credentials*.json, token.json...); (banco-de-dados) caminho de banco de PRODUÇÃO — `shared/data/x.db`, `md:`, `~/`/`/Users/…/x.db` e, só fora de teste, nome de banco solto (`"queue.db"`: o WA monta o caminho por
-    pedaços); (host-mac) osascript/launchctl/Chrome do Mac/adb. Variável de ambiente com nome de token, `sqlite3.connect(variavel)` e `/Users/…` sozinho NÃO são evidência: o teste os substitui, ou é só caminho-padrão.
+    """{slug: [o que achou]} das moles que o CÓDIGO de `path` mostra (regra 4, ga-qkc02kk). Só o que a lista do Mayor nomeia: (credencial) o cofre em QUALQUER forma do WA — argv exato ou com caminho do binário, linha de shell/f-string ("secret x"), wrapper do repo (secret_bin(), lib.secret_cli),
+    chamada `secret`/`bw`, módulo do cofre —, arquivo de credencial (.env, credentials*.json, token.json...); (banco-de-dados) caminho de banco de PRODUÇÃO — `shared/data/x.db`, `md:`, `~/`/`/Users/…/x.db` e, só fora de teste, nome de banco solto (`"queue.db"`: o WA monta o caminho por
+    pedaços); (host-mac) osascript/launchctl/Chrome do Mac/adb, também como CHAMADA (connect_over_cdp(...)) e em linha de shell. O ramo `ast` (Python que parseia) tem de achar o MESMO que o ramo de texto (.sh/.js): um idioma que só o texto vê vira "li e não achei" no caso comum. Variável de ambiente com nome de token, `sqlite3.connect(variavel)` e `/Users/…` sozinho NÃO são evidência: o teste os substitui, ou é só caminho-padrão.
     Vazio -> {}. Python que não parseia -> o texto sem linhas de comentário (mais largo). Nunca lê o disco: `text` é o que o `git show` devolveu."""
     out = {}
 
@@ -1003,20 +1030,29 @@ def scan_evidence(path, text, is_test):
         for c in calls:
             if CRED_CALL_RE.match(c):
                 hit("credencial", c + "()")
+            if HOST_CALL_RE.search(c):
+                hit("host-mac", c + "()")
         for m in mods:
             if CRED_MOD_RE.search(m):
                 hit("credencial", "import " + m)
+            if any(HOST_CALL_RE.search(x) for x in m.split(".")):
+                hit("host-mac", "import " + m)
         for t in strs:
-            if t in CRED_CLI:
-                hit("credencial", "argv:" + t)
+            b = exec_base(t)
+            if b in CRED_CLI:
+                hit("credencial", "argv:" + b)
             elif CRED_FILE_RE.search(t):
                 hit("credencial", CRED_FILE_RE.search(t).group(0).strip("/\\"))
-            if t in HOST_ARGV:
-                hit("host-mac", "argv:" + t)
             else:
-                m = HOST_RE.search(t)
+                m = CRED_SHELL_RE.search(t)
                 if m:
-                    hit("host-mac", m.group(0))
+                    hit("credencial", "sh:" + m.group(0).strip(" ;|&(`"))
+            if b in HOST_ARGV:
+                hit("host-mac", "argv:" + b)
+            else:
+                m = HOST_RE.search(t) or HOST_SHELL_RE.search(t)
+                if m:
+                    hit("host-mac", m.group(0).strip(" ;|&(`"))
             m = DB_PINNED_RE.search(t) or (None if is_test else DB_BARE_RE.search(t))
             if m:
                 hit("banco-de-dados", m.group(0))
@@ -1084,7 +1120,7 @@ MAX_IMPORTER_SCAN = 60   # testes que citam o módulo e são lidos para ver se I
 
 def importer_tests(code, stem, present):
     """testes de `tests/` em REPO_REF que IMPORTAM `code` (regra 6b, ga-qkc02kk): a prova de "teste vizinho" para código sem teste de nome. O `git grep -w <módulo>` só acha candidatos; quem prova é o `import` estático
-    (Python por `ast`, JS por require/import relativo) que resolve para O MESMO arquivo — citar o nome numa string ou comentário não conta. Vazio (grep rc 1, ou nenhum candidato resolve) -> []; git/grep/leitura do
+    (Python por `ast`, JS por require/import relativo sem os comentários) que resolve para O MESMO arquivo — citar o nome numa string ou comentário não conta (em JS, um require DENTRO de string conta). Vazio (grep rc 1, ou nenhum candidato resolve) -> []; git/grep/leitura do
     candidato que falha -> Unreadable (sobe: nunca "ninguém importa"); candidato que não parseia é PULADO e contado em NOTES (a regra só afirma o que provou)."""
     try:
         r = subprocess.run([GIT, "-C", REPO_DIR, "grep", "-l", "-w", "-F", "-z", "-e", stem, REPO_REF, "--", "tests"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=repo_git_env(), timeout=REPO_TIMEOUT)
@@ -1096,7 +1132,10 @@ def importer_tests(code, stem, present):
     hits = sorted(x[len(pre):] for x in r.stdout.decode("utf-8", "replace").split("\0") if x.startswith(pre))
     if r.returncode == 0 and not hits:
         raise Unreadable("repo-grep-ilegivel")
-    cand = [t for t in hits if t in present and (t.rsplit(".", 1)[-1] == "py" or t.rsplit(".", 1)[-1] in JS_TEST_EXT)][:MAX_IMPORTER_SCAN]
+    cand_all = [t for t in hits if t in present and (t.rsplit(".", 1)[-1] == "py" or t.rsplit(".", 1)[-1] in JS_TEST_EXT)]
+    cand = cand_all[:MAX_IMPORTER_SCAN]
+    if len(cand_all) > len(cand):   # o excesso nem é lido: um importador depois do 60º candidato some como "ninguém importa" (unknown, conservador) — agora avisa em vez de ficar invisível
+        NOTES.append("teste-importador-truncado:%d" % (len(cand_all) - len(cand)))
     out, skipped = [], 0
     for t in cand:
         src = repo_show(t)   # falhou/ilegível -> Unreadable sobe (a regra devolve unknown com a nota)
@@ -1104,7 +1143,7 @@ def importer_tests(code, stem, present):
             if t.endswith(".py"):
                 cands = [c for lvl, mod, names in py_imports(src) for c in py_candidates(t, lvl, mod, names)]
             else:
-                cands = [c for m in JS_IMPORT_RE.finditer(src) for c in js_candidates(t, m.group(2))]
+                cands = [c for m in JS_IMPORT_RE.finditer(strip_js_comments(src)) for c in js_candidates(t, m.group(2))]
         except Unreadable:
             skipped += 1
             continue

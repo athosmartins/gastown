@@ -17,8 +17,11 @@
 #   código, código fora do filtro, .plist/.sql/.env, nome com cara de segredo (português também) e telefone/CPF; absoluto/~/$HOME de dado também é evidência; o token sai do texto das moles (do mais longo ao mais curto).
 #   · MOLES POR EVIDÊNCIA (ga-qkc02kk, regra 4): a palavra mole na bead é prosa e só informa; o código dos arquivos de prova (lido em origin/main) é que barra. Três estados: leu e achou (nome de banco solto, caminho fixado, argv/chamada do cofre,
 #   osascript/launchctl/security, perfil do Chrome) -> mini mesmo SEM palavra; leu e não achou (docstring/comentário, connect(variável), env de token, `import secrets`, /Users/… sozinho, banco solto em TESTE) -> a palavra vai em info;
+#   o Python que parseia acha o MESMO idioma que o texto de .sh/.js (gate-fix 1): binário do cofre com caminho, linha de shell/f-string ("secret x"), wrapper do repo (secret_bin/lib.secret_cli), connect_over_cdp/run_osascript como chamada,
+#   `security` com caminho/em linha de shell, banco em f-string; prosa em string ("the secret key…", "lib/security") não conta;
 #   não consegui ler (repo, arquivo > 1 MB) ou tudo é novo -> a palavra volta a barrar, com a nota. Código só das irmãs é palpite (informa); o que a bead NOMEIA barra; node:ok, exec:manual, PII e freio de envio não mudam.
-#   · TESTE IMPORTADOR (regra 6b): código sem teste de nome ganha os testes que o IMPORTAM (import estático que resolve para o mesmo arquivo; string/comentário não conta; não parseia é pulado e contado; git que falha = unknown com a nota).
+#   · TESTE IMPORTADOR (regra 6b): código sem teste de nome ganha os testes que o IMPORTAM (import estático que resolve para o mesmo arquivo; string/comentário não conta — em JS, require em comentário não conta e require em string conta; não parseia
+#   é pulado e contado; mais de 60 candidatos: o excesso não é lido e a nota avisa; git que falha = unknown com a nota).
 #   · ÂNCORA DO DADO (regra 3): a bead que cita só dado e NOMEIA o módulo é ancorada pelo código derivado (mesmos filtros); sem âncora/fora do nó/leitura que falha o dado segue duro; PII e item que não é evidência impedem a tentativa.
 # CONTROLE NEGATIVO: cada mutante abaixo troca UMA linha do classificador numa cópia e o caso designado tem de reprovar; mutante que sobrevive reprova esta bateria. Um mutante só vale se o
 #   ORIGINAL passa o mesmo caso no mesmo ambiente e se ele não morre por causa do ambiente (ver as 3 regras acima de mk_mutant); caso e mutante de rsync usam stubs que só o mutante separa do original.
@@ -334,6 +337,23 @@ wf lib/mole_tbare2.py $'X = 1'; wf tests/test_mole_tbare2.py $'def (:\nDB = "que
 wf lib/mole_credfile.py $'P = "/etc/app/credentials_prod.json"'; wf tests/test_mole_credfile.py $'mole_credfile'
 wf lib/mole_md.py $'CON = "md:analytics"'; wf tests/test_mole_md.py $'mole_md_x'   # (o teste não cita o módulo: a evidência é a do código, não a prova)
 wf lib/mole_chrome.py $'PROFILE = "Library/Application Support/Google/Chrome/Default"'; wf tests/test_mole_chrome.py $'mole_chrome'
+# gate-fix 1 (ga-qkc02kk): o ramo `ast` do Python acha o MESMO idioma do cofre/Mac que o ramo de texto (.sh/.js): binário com CAMINHO no argv0, constante `.local/bin/secret`, linha de shell (os.popen("secret x"), f-string),
+# wrapper do repo (secret_bin() / lib.secret_cli), connect_over_cdp e run_osascript como CHAMADA, módulo do Mac, `security` com caminho e em linha de shell, banco montado em f-string. mole_prose é PROSA em string (não conta).
+wf lib/mole_credpath.py $'import subprocess\ndef tok():\n    return subprocess.check_output(["/Users/athos/.local/bin/secret", "anthropic-api-key"])'; wf tests/test_mole_credpath.py $'from lib.mole_credpath import tok'
+wf lib/mole_credconst.py $'from pathlib import Path\nBINARIO = Path.home() / ".local/bin/secret"'; wf tests/test_mole_credconst.py $'from lib.mole_credconst import BINARIO'
+wf lib/mole_credpopen.py $'import os\nTOK = os.popen("secret motherduck-token").read()'; wf tests/test_mole_credpopen.py $'from lib.mole_credpopen import TOK'
+wf lib/mole_credfstr.py $'import os\ndef tok(n):\n    return os.popen(f"secret {n}").read()'; wf tests/test_mole_credfstr.py $'from lib.mole_credfstr import tok'
+wf lib/mole_credcall.py $'def cmd(n, secret_bin):\n    return [secret_bin(), n]'; wf tests/test_mole_credcall.py $'from lib.mole_credcall import cmd'
+wf lib/mole_credmod.py $'import lib.secret_cli as sc\nX = sc'; wf tests/test_mole_credmod.py $'from lib.mole_credmod import X'
+wf lib/mole_credpem.py $'KEY = "/etc/app/server.pem"'; wf tests/test_mole_credpem.py $'from lib.mole_credpem import KEY'   # só o CRED_FILE_RE conhece .pem
+wf lib/mole_credjson.py $'P = "gdrive_credentials.json"'; wf tests/test_mole_credjson.py $'from lib.mole_credjson import P'   # prefixo no nome: o CRED_FILE_RE (começo/barra) não pega, o CRED_SHELL_RE (como o texto) pega
+wf lib/mole_hostcdp.py $'async def f(p):\n    return await p.chromium.connect_over_cdp("http://localhost:9222")'; wf tests/test_mole_hostcdp.py $'from lib.mole_hostcdp import f'
+wf lib/mole_hostcall.py $'def f():\n    run_osascript("x")'; wf tests/test_mole_hostcall.py $'from lib.mole_hostcall import f'
+wf lib/mole_hostmod.py $'import osascript\nX = 1'; wf tests/test_mole_hostmod.py $'from lib.mole_hostmod import X'
+wf lib/mole_hostpath.py $'import subprocess\nsubprocess.run(["/usr/bin/security", "find-generic-password"])'; wf tests/test_mole_hostpath.py $'from lib.mole_hostpath import subprocess'
+wf lib/mole_hostshell.py $'import os\nos.system("security find-generic-password -s x")'; wf tests/test_mole_hostshell.py $'from lib.mole_hostshell import os'
+wf lib/mole_dbf.py $'import sqlite3\ndef c(n):\n    return sqlite3.connect(f"shared/data/{n}.db")'; wf tests/test_mole_dbf.py $'from lib.mole_dbf import c'
+wf lib/mole_prose.py $'def f(n):\n    raise RuntimeError("the secret key is missing")\nX = "lib/security"\nY = "lib/secret"\nZ = "security headers are off"\nW = f"the {n} secret is missing"'; wf tests/test_mole_prose.py $'from lib.mole_prose import f'
 wf lib/impt_macmod.py $'# impt_macmod'; wf tests/test_impt_mac_x.py $'from lib.impt_macmod import x'   # o único teste que importa impt_macmod é só-no-Mac (macs-impt.txt)
 wf lib/mole_sibdb.py $'P = "shared/data/y.db"'; wf tests/test_mole_sibdb.py $'mole_sibdb'
 gw add lib/mole_sibdb.py tests/test_mole_sibdb.py && gw commit -q -m "feat(wa-molp1.1): mole_sibdb" || bad "commit da irma do mole nao montado"
@@ -344,6 +364,9 @@ wf lib/impt_target.py $'# impt_target'; wf tests/test_other_area.py $'from lib.i
 wf lib/impt_ghost.py $'# impt_ghost'; wf tests/test_mentions_ghost.py $'# impt_ghost\nX = "impt_ghost"'
 wf lib/impt_jsx.js $'// impt_jsx'; wf tests/area_js.cjs $'const m = require(\'../lib/impt_jsx.js\');'
 wf lib/impt_unparse.py $'# impt_unparse'; wf tests/test_broken_area.py $'def (:\n# impt_unparse'
+wf lib/impt_jscm.js $'// impt_jscm'; wf tests/area_jscm.cjs $'// const m = require(\'../lib/impt_jscm.js\');\n/* const n = require("../lib/impt_jscm.js"); */'   # só comentário: nenhum import de verdade
+wf tests/test_imp_jscm.cjs $'// const a = require(\'../lib/imp_js_mod.js\');\n/* const b = require("../lib/imp_js_esm.mjs"); */'   # regra 8: o teste só tem require em comentário
+wf lib/impt_many.py $'# impt_many'; for i in $(seq -w 1 61); do wf "tests/test_zmany_$i.py" $'from lib.impt_many import x'; done   # 61 testes importam: o teto de leitura é 60
 # âncora do dado (regra 3): a bead cita só queue.db e NOMEIA o módulo. anchor_mod é limpo; anchor_out mora em shared/ (o nó não recebe); anchor_db tem "queue.db" no código
 wf lib/anchor_mod.py $'# anchor_mod'; wf tests/test_anchor_mod.py $'anchor_mod'
 wf shared/anchor_out.py $'# anchor_out'; wf tests/test_anchor_out.py $'anchor_out'
@@ -562,6 +585,7 @@ expect "importa: mais de 6 pares -> 6 em info e o resto contado (codigo-do-teste
 expect "custo: a regra 8 conta no derivacao_ms (>0 quando ela rodou)" "$(T8 tests/test_imp_a.py)" 0 '"custo": \{"ms": [0-9]+, "derivacao_ms": [1-9][0-9]*, "cache": "-"\}, "info"'
 # vazio é legítimo: unknown SEM nota
 expect "vazio: teste que só importa stdlib/pytest -> unknown SEM nota" "$(T8 tests/test_imp_stdlib.py)" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
+expect "vazio: require/import em COMENTÁRIO de JS não é import estático -> unknown SEM nota" "$(T8 tests/test_imp_jscm.cjs)" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
 expect "vazio: carga dinâmica (importlib.import_module) não é import estático -> unknown SEM nota" "$(T8 tests/test_imp_dyn.py)" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
 expect "vazio: teste de 0 bytes lido com sucesso -> unknown SEM nota" "$(T8 tests/test_imp_vazio.py)" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
 expect "vazio: teste que não está em origin/main (novo nesta bead) não tem o que ler -> unknown SEM nota" "$(T8 tests/test_imp_novo.py)" 11 "sem-prova-de-codigo-e-teste.*$SEMNOTA"
@@ -628,6 +652,21 @@ expect "mole: node:ok é decisão humana e continua ignorando as moles (mesmo co
 expect "mole: evidência - arquivo de credencial (credentials_prod.json)" "$(DESC 'ajustar lib/mole_credfile.py')" 10 'moles:credencial.*credentials_prod\.json'
 expect "mole: evidência - conexão MotherDuck (md:...)" "$(DESC 'ajustar lib/mole_md.py e tests/test_mole_md.py')" 10 'moles:banco-de-dados.*\[md:analytics\]'
 expect "mole: evidência - perfil do Chrome do Mac" "$(DESC 'ajustar lib/mole_chrome.py')" 10 'moles:host-mac.*Application Support/Google/Chrome'
+expect "mole: evidência - binário do cofre com CAMINHO no argv0 (/Users/…/.local/bin/secret), o idioma mais comum do WA" "$(DESC 'ajustar lib/mole_credpath.py')" 10 'moles:credencial.*mole-evidencia:credencial=lib/mole_credpath\.py\[argv:secret\]'
+expect "mole: evidência - constante com .local/bin/secret (Path.home() / \".local/bin/secret\")" "$(DESC 'ajustar lib/mole_credconst.py')" 10 'moles:credencial.*mole_credconst\.py\[argv:secret\]'
+expect "mole: evidência - linha de shell os.popen(\"secret motherduck-token\")" "$(DESC 'ajustar lib/mole_credpopen.py')" 10 'moles:credencial.*mole_credpopen\.py\[sh:secret motherduck-token\]'
+expect "mole: evidência - f-string os.popen(f\"secret {n}\") (o pedaço dinâmico vira palavra)" "$(DESC 'ajustar lib/mole_credfstr.py')" 10 'moles:credencial.*mole_credfstr\.py\[sh:secret _\]'
+expect "mole: evidência - arquivo de chave (.pem)" "$(DESC 'ajustar lib/mole_credpem.py')" 10 'moles:credencial.*mole_credpem\.py\[server\.pem\]'
+expect "mole: evidência - arquivo de credencial com prefixo no nome (gdrive_credentials.json), como o ramo de texto acha" "$(DESC 'ajustar lib/mole_credjson.py')" 10 'moles:credencial.*mole_credjson\.py\[sh:credentials\.json\]'
+expect "mole: evidência - chamada ao wrapper do repo secret_bin()" "$(DESC 'ajustar lib/mole_credcall.py')" 10 'moles:credencial.*mole_credcall\.py\[secret_bin\(\)\]'
+expect "mole: evidência - módulo do wrapper do repo (lib.secret_cli)" "$(DESC 'ajustar lib/mole_credmod.py')" 10 'moles:credencial.*mole_credmod\.py\[import lib\.secret_cli\]'
+expect "mole: evidência - connect_over_cdp(...) como CHAMADA (o HOST_RE de string não vê nome de função)" "$(DESC 'ajustar lib/mole_hostcdp.py')" 10 'moles:host-mac.*mole_hostcdp\.py\[connect_over_cdp\(\)\]'
+expect "mole: evidência - run_osascript(...) como chamada (nome com _ ao redor)" "$(DESC 'ajustar lib/mole_hostcall.py')" 10 'moles:host-mac.*mole_hostcall\.py\[run_osascript\(\)\]'
+expect "mole: evidência - módulo do Mac (import osascript)" "$(DESC 'ajustar lib/mole_hostmod.py')" 10 'moles:host-mac.*mole_hostmod\.py\[import osascript\]'
+expect "mole: evidência - /usr/bin/security com CAMINHO no argv0" "$(DESC 'ajustar lib/mole_hostpath.py')" 10 'moles:host-mac.*mole_hostpath\.py\[argv:security\]'
+expect "mole: evidência - linha de shell \"security find-generic-password …\"" "$(DESC 'ajustar lib/mole_hostshell.py')" 10 'moles:host-mac.*mole_hostshell\.py\[security find-generic-password\]'
+expect "mole: evidência - banco montado em f-string (shared/data/{n}.db)" "$(DESC 'ajustar lib/mole_dbf.py')" 10 'moles:banco-de-dados.*mole_dbf\.py\[shared/data/_\.db\]'
+expect_not "mole: PROSA em string (\"the secret key is missing\", \"lib/security\", \"lib/secret\", \"security headers are off\", f\"the {n} secret is missing\") NÃO é evidência" "$(DESC 'ajustar lib/mole_prose.py')" 0 'moles:|mole-evidencia'
 expect_not "mole: nome de banco solto num TESTE que não parseia (texto) também não conta" "$(DESC 'ajustar lib/mole_tbare2.py')" 0 'moles:|mole-evidencia'
 # três estados: não consegui ler / nada para ler -> a palavra volta a valer (como antes), e a resposta diz por quê
 export WA_NODE_REPO="$T/wa-repo-ausente"
@@ -653,6 +692,8 @@ expect "importador: teste que só CITA o nome numa string/comentário (sem impor
 expect "importador: require relativo em teste .cjs também prova" "$(DESC 'ajustar lib/impt_jsx.js')" 0 "$ME.*\"teste-importador:lib/impt_jsx\.js=tests/area_js\.cjs\""
 expect "importador: candidato que não parseia é PULADO e contado (a regra só afirma o que provou)" "$(DESC 'ajustar lib/impt_unparse.py')" 11 'sem-prova-de-codigo-e-teste.*"teste-importador-nao-parseou:1"'
 expect "importador: pela regra 7 (módulo NOMEADO, sem caminho) o par também sai como teste-importador" "$(DESC 'ajustar impt_target quando vem vazio')" 0 "$ME.*\"teste-importador:lib/impt_target\.py=tests/test_other_area\.py\""
+expect "importador: require em COMENTÁRIO de JS (// e /* */) não é import -> unknown (a regra só afirma o que provou)" "$(DESC 'ajustar lib/impt_jscm.js')" 11 'sem-prova-de-codigo-e-teste'
+expect "importador: 61 testes que importam o módulo -> o 61º nem é lido, e a nota AVISA (antes ficava invisível)" "$(DESC 'ajustar lib/impt_many.py')" 0 "$ME.*\"teste-importador-truncado:1\""
 printf '# so comentario\ntests/test_impt_mac*.py\n' > "$T/macs-impt.txt"
 export WA_NODE_MAC_ONLY="$T/macs-impt.txt"; expect "importador: o único teste que importa é só-no-Mac -> sem prova (o nó não o tem): unknown" "$(DESC 'ajustar lib/impt_macmod.py')" 11 'sem-prova-de-codigo-e-teste'; unset WA_NODE_MAC_ONLY
 # falha injetada em cada leitura do importador (só o `git grep` sai 2 / só ele demora / só ele sai 0 sem imprimir / só o `git show` do candidato sai 2): unknown COM a nota, nunca "ninguém importa"
@@ -933,15 +974,15 @@ mutant mole-falha-vira-sem-evid  'return fallback, ["mole-ilegivel:" + str(e)]' 
 mutant mole-falha-sem-nota       'fallback, ["mole-ilegivel:" + str(e)]'                'fallback, []'                                      "$(DESC 'lib/mole_clean.py e tests/test_mole_clean.py')" 0 'mole-ilegivel:repo-git-rc-128' "$MR"
 mutant mole-sem-base-vira-vazio  '    if nread == 0:'                                    '    if False:'                                     "$(DESC 'lib/novo_zz.py abre um sqlite; tests/test_novo_zz.py')" 10 'moles:banco-de-dados.*mole-sem-arquivo-lido' "$MD"
 mutant mole-novo-bloqueia        'novos.append(f)'                                      'raise Unreadable("novo")'                          "$(DESC 'lib/mole_clean.py e lib/novo_zz.py abrem um sqlite; tests/test_mole_clean.py')" 0 'mole-arquivo-novo:1' "$MD"
-mutant mole-docstring-conta      'and isinstance(n.value, str) and id(n) not in docs:'  'and isinstance(n.value, str):'                    "$(DESC 'ajustar lib/mole_clean.py')" 0 '"verdict": "node"' "$MD"
+mutant mole-docstring-conta      ' and id(n) not in docs and id(n) not in pieces:'     ' and id(n) not in pieces:'                    "$(DESC 'ajustar lib/mole_clean.py')" 0 '"verdict": "node"' "$MD"
 mutant mole-sem-ast              'parts = py_exec_parts(text) if path.endswith(".py") else None' 'parts = None'                                 "$(DESC 'ajustar lib/mole_clean.py')" 0 '"verdict": "node"' "$MD"
 mutant mole-teste-bare-conta     'm = DB_PINNED_RE.search(t) or (None if is_test else DB_BARE_RE.search(t))' 'm = DB_PINNED_RE.search(t) or DB_BARE_RE.search(t)' "$(DESC 'ajustar lib/mole_tbare.py')" 0 '"verdict": "node"' "$MD"
 mutant mole-texto-teste-bare     '    if not is_test and "banco-de-dados" not in out:'  '    if "banco-de-dados" not in out:'                 "$(DESC 'ajustar lib/mole_tbare2.py')" 0 '"verdict": "node"' "$MD"
-mutant mole-stdlib-secrets       '|secret)(?:\.|$)", re.I)'                            '|secrets?)(?:\.|$)", re.I)'                       "$(DESC 'ajustar lib/mole_stdsec.py')" 0 '"verdict": "node"' "$MD"
-mutant mole-cofre-argv-ignorado  '            if t in CRED_CLI:'                        '            if False:'                             "$(DESC 'ajustar lib/mole_cred.py')" 10 'moles:credencial' "$MD"
+mutant mole-stdlib-secrets       '|_?secret(?:_bin|_cli)?)(?:\.|$)", re.I)'            '|_?secrets?(?:_bin|_cli)?)(?:\.|$)", re.I)'                       "$(DESC 'ajustar lib/mole_stdsec.py')" 0 '"verdict": "node"' "$MD"
+mutant mole-cofre-argv-ignorado  '            if b in CRED_CLI:'                        '            if False:'                             "$(DESC 'ajustar lib/mole_cred.py')" 10 'moles:credencial' "$MD"
 mutant mole-cofre-chamada        '            if CRED_CALL_RE.match(c):'               '            if False:'                             "$(DESC 'ajustar lib/mole_credfn.py')" 10 'moles:credencial' "$MD"
-mutant mole-cofre-arquivo        '            elif CRED_FILE_RE.search(t):'            '            elif False:'                           "$(DESC 'ajustar lib/mole_credfile.py')" 10 'moles:credencial' "$MD"
-mutant mole-host-argv-ignorado   '            if t in HOST_ARGV:'                       '            if False:'                             "$(DESC 'ajustar lib/mole_secarg.py')" 10 'moles:host-mac' "$MD"
+mutant mole-cofre-arquivo        '            elif CRED_FILE_RE.search(t):'            '            elif False:'                           "$(DESC 'ajustar lib/mole_credpem.py')" 10 'moles:credencial' "$MD"
+mutant mole-host-argv-ignorado   '            if b in HOST_ARGV:'                       '            if False:'                             "$(DESC 'ajustar lib/mole_secarg.py')" 10 'moles:host-mac' "$MD"
 mutant mole-chrome-ignorado      '|Application Support/Google/Chrome'                   ''                                                  "$(DESC 'ajustar lib/mole_chrome.py')" 10 'moles:host-mac' "$MD"
 mutant mole-md-ignorado          '|(?<![\w])md:[\w\-]*'                              ''                                                  "$(DESC 'ajustar lib/mole_md.py e tests/test_mole_md.py')" 10 'moles:banco-de-dados' "$MD"
 mutant mole-users-conta          '|~/Library|remote-debugging-port'                    '|~/Library|/Users/[A-Za-z]|remote-debugging-port' "$(DESC 'ajustar lib/mole_users.py')" 0 '"verdict": "node"' "$MD"
@@ -959,8 +1000,24 @@ mutant importador-rotulo-regra7  '"teste-importador" if TEST_VIA.get((c, t)) els
 IMPQ="WA_NODE_REPO=$RP WA_NODE_MIRROR=$T/mirror-ok WA_NODE_GIT=$T/git-grep-imp-quebra"
 mutant importador-grep-rc-ignorado   $'raise Unreadable("repo-grep-rc-%d" % r.returncode)\n    pre = REPO_REF + ":"\n    hits = sorted(' $'pass\n    pre = REPO_REF + ":"\n    hits = sorted(' "$IMPD" 11 'teste-derivado-ilegivel:repo-grep-rc-2' "$IMPQ"
 mutant importador-grep-sem-resposta  $'raise Unreadable("repo-grep-sem-resposta")\n    if r.returncode not in (0, 1):\n        raise Unreadable("repo-grep-rc-%d" % r.returncode)\n    pre = REPO_REF + ":"\n    hits = sorted(' $'return []\n    if r.returncode not in (0, 1):\n        raise Unreadable("repo-grep-rc-%d" % r.returncode)\n    pre = REPO_REF + ":"\n    hits = sorted(' "$IMPD" 11 'teste-derivado-ilegivel:repo-grep-sem-resposta' "WA_NODE_REPO=$RP WA_NODE_MIRROR=$T/mirror-ok WA_NODE_GIT=$T/git-grep-imp-lento WA_NODE_REPO_TIMEOUT=1"
-mutant importador-grep-mudo-vale     $'raise Unreadable("repo-grep-ilegivel")\n    cand = ' $'pass\n    cand = ' "$IMPD" 11 'teste-derivado-ilegivel:repo-grep-ilegivel' "WA_NODE_REPO=$RP WA_NODE_MIRROR=$T/mirror-ok WA_NODE_GIT=$T/git-grep-imp-mudo"
+mutant importador-grep-mudo-vale     $'raise Unreadable("repo-grep-ilegivel")\n    cand_all = ' $'pass\n    cand_all = ' "$IMPD" 11 'teste-derivado-ilegivel:repo-grep-ilegivel' "WA_NODE_REPO=$RP WA_NODE_MIRROR=$T/mirror-ok WA_NODE_GIT=$T/git-grep-imp-mudo"
 mutant importador-show-vira-vazio    'src = repo_show(t)   # falhou/ilegível -> Unreadable sobe' 'src = ""   # falhou/ilegível -> Unreadable sobe' "$IMPD" 11 'teste-derivado-ilegivel:teste-git-rc-2' "WA_NODE_REPO=$RP WA_NODE_MIRROR=$T/mirror-ok WA_NODE_GIT=$T/git-show-imp-quebra"
+# gate-fix 1 (ga-qkc02kk): o ramo `ast` tem de ser tão largo quanto o de texto no idioma do cofre/Mac
+mutant mole-cofre-caminho-ignorado   '    if t.startswith(("/", "~", "$", "_/", "bin/")) or "/bin/" in t:' '    if False:'                       "$(DESC 'ajustar lib/mole_credpath.py')" 10 'moles:credencial' "$MD"
+mutant mole-cofre-bin-ignorado       '"_/", "bin/")) or "/bin/" in t:'                  '"_/", "bin/")) or False:'                          "$(DESC 'ajustar lib/mole_credconst.py')" 10 'moles:credencial' "$MD"
+mutant mole-cofre-json-shell         '|run)\b)|bitwarden|(?<![\w/])\.env\b|credentials?[\w\-]*\.json'  '|run)\b)|bitwarden|(?<![\w/])\.env\b' "$(DESC 'ajustar lib/mole_credjson.py')" 10 'moles:credencial' "$MD"
+mutant mole-cofre-shell-ignorado     '                m = CRED_SHELL_RE.search(t)'        '                m = None'                                "$(DESC 'ajustar lib/mole_credpopen.py')" 10 'moles:credencial' "$MD"
+mutant mole-fstring-ignorada         '        elif isinstance(n, ast.JoinedStr):'          '        elif False:'                                  "$(DESC 'ajustar lib/mole_dbf.py')" 10 'moles:banco-de-dados' "$MD"
+mutant mole-fstring-pedacos-soltos   ' and id(n) not in docs and id(n) not in pieces:'     ' and id(n) not in docs:'                           "$(DESC 'ajustar lib/mole_prose.py')" 0 '"verdict": "node"' "$MD"
+mutant mole-cofre-wrapper-chamada    'secret(?:_bin|_cli)?$|^_*(?:bw'                    'secret$|^_*(?:bw'                                  "$(DESC 'ajustar lib/mole_credcall.py')" 10 'moles:credencial' "$MD"
+mutant mole-cofre-wrapper-modulo     '|_?secret(?:_bin|_cli)?)(?:\.|$)", re.I)   #'     '|_?secret)(?:\.|$)", re.I)   #'                    "$(DESC 'ajustar lib/mole_credmod.py')" 10 'moles:credencial' "$MD"
+mutant mole-host-chamada-ignorada    '            if HOST_CALL_RE.search(c):'              '            if False:'                                "$(DESC 'ajustar lib/mole_hostcdp.py')" 10 'moles:host-mac' "$MD"
+mutant mole-host-modulo-ignorado     '            if any(HOST_CALL_RE.search(x) for x in m.split(".")):' '            if False:'                      "$(DESC 'ajustar lib/mole_hostmod.py')" 10 'moles:host-mac' "$MD"
+mutant mole-host-shell-ignorado      'm = HOST_RE.search(t) or HOST_SHELL_RE.search(t)'  'm = HOST_RE.search(t)'                              "$(DESC 'ajustar lib/mole_hostshell.py')" 10 'moles:host-mac' "$MD"
+mutant mole-prosa-vira-cofre         '(?:^\s*|[;|&(`]\s*)(?:\S*/)?(?:secret\s+'        '(?:\s*)(?:\S*/)?(?:secret\s+'                    "$(DESC 'ajustar lib/mole_prose.py')" 0 '"verdict": "node"' "$MD"
+mutant importador-js-comentario-conta $'                cands = [c for m in JS_IMPORT_RE.finditer(strip_js_comments(src))' $'                cands = [c for m in JS_IMPORT_RE.finditer(src)' "$(DESC 'ajustar lib/impt_jscm.js')" 11 'sem-prova-de-codigo-e-teste' "$MD"
+mutant importa-js-comentario-conta    $'        else:\n            cands = [c for m in JS_IMPORT_RE.finditer(strip_js_comments(src))' $'        else:\n            cands = [c for m in JS_IMPORT_RE.finditer(src)' "$(T8M tests/test_imp_jscm.cjs)" 11 'sem-prova-de-codigo-e-teste' "$C8"
+mutant importador-trunca-sem-nota    'NOTES.append("teste-importador-truncado:%d" % (len(cand_all) - len(cand)))' 'pass'                    "$(DESC 'ajustar lib/impt_many.py')" 0 'teste-importador-truncado:1' "$MD"
 mutant importador-pula-sem-nota  'NOTES.append("teste-importador-nao-parseou:%d" % skipped)' 'pass'                                           "$(DESC 'ajustar lib/impt_unparse.py')" 11 'teste-importador-nao-parseou:1' "$MD"
 mutant ancora-sem-filtro         '    if any(p not in dsent or any(fnmatch.fnmatchcase(p, g) for g in globs) for p in dpaths):' '    if False:'      "$(DESC 'Medido em queue.db; ajustar anchor_out quando vem vazio')" 10 'caminho-fora-do-filtro:queue\.db.*ancora-derivada-fora-do-no' "$MD"
 mutant ancora-falha-sem-nota     '        info += anotes'                              '        pass'                                          "$(DESC 'Medido em queue.db; ajustar anchor_mod quando vem vazio')" 10 'ancora-derivada-ilegivel:repo-git-rc-128' "$MR"
