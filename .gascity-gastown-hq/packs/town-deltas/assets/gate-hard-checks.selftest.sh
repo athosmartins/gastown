@@ -573,6 +573,11 @@ case "${STUB_GUARD_MODE:-}:$1" in
   (forged-ok:*) echo "template-fragment-lint-guard: OK -- /not/the/tree/under/test"; exit 0 ;;
   (no-match:*)  echo "template-fragment-lint-guard: no changed file matches a template/fragment/pack.toml pattern -- skipping gc lint."; exit 0 ;;
   (ctl-skip:*/ctl) echo "template-fragment-lint-guard: WARNING: no pack.toml found above changed file x -- skipping (nothing to gc lint against)." >&2; exit 0 ;;
+  # rc2: a FAIL line with exit 2 (a crash is not red). bare-unlinted: the tip FAILs naming no pack, the base is never linted.
+  (rc2:*/ctl|bare-unlinted:*/ctl) exec bash "$REAL_GUARD" "$@" ;;
+  (rc2:*)  echo "template-fragment-lint-guard: FAIL -- $1/pa"; exit 2 ;;
+  (bare-unlinted:*/tip)  echo "template-fragment-lint-guard: FAIL"; exit 1 ;;
+  (bare-unlinted:*/base) echo "template-fragment-lint-guard: no changed file matches a template/fragment/pack.toml pattern -- skipping gc lint."; exit 0 ;;
 esac
 exec bash "$REAL_GUARD" "$@"
 STUBG
@@ -584,6 +589,34 @@ run_sut 2b "$R" "$MAIN" "$GOK" ga-x PATH="$FB" REAL_GUARD="$REALG" STUB_GUARD_MO
 run_sut 2b "$R" "$MAIN" "$GOK" ga-x PATH="$FB" REAL_GUARD="$REALG" STUB_GUARD_MODE=forged-ok;  expect "an OK line that does not name the tree under test is not proof (it echoes branch data)" nao-consegui-medir lint-nao-rodou-no-tip
 run_sut 2b "$R" "$MAIN" "$GOK" ga-x PATH="$FB" REAL_GUARD="$REALG" STUB_GUARD_MODE=no-match;   expect "exit 0 and no OK line at all (the guard matched nothing)" nao-consegui-medir lint-nao-rodou-no-tip
 run_sut 2b "$R" "$MAIN" "$GOK" ga-x PATH="$FB" REAL_GUARD="$REALG";                            expect "control: the stand-in delegating to the real guard still reads ok" ok parse-verde-no-tip
+CITY_UNDER=""
+echo "H. third states the sweep found loose (ga-hq1qc5y, hq-mutants lastro): the extraction, the comparison of red lines, a tool's exit status"
+# EQUIVALENT, documented: d251008b6f (cleanup's `return 0`: an EXIT trap, whose status the shell drops) and 2d29fc8b0e (pick_tools' `return 0`: nobody reads it); 2428aa2939 (`mkdir -p "$dest/$(dirname "$path")" || return 1` in
+# extract: the redirect right below fails on the same missing directory and returns 1); c5d5c0e2ba (`[ r -gt worst ] && worst=r` -> `-ge`: at equality it assigns the same number); e319c08df6, d19df7f075, d3bdf183ad and
+# 94045ebd9d (the `return 1` -> `0` of a red-line read or cut that failed: no .norm file is written, so the `comm` right after fails and reaches the same nao-consegui-medir).
+GS="$WORK/gs"; mkdir -p "$GS"; GREAL="$(command -v git)"; MREAL="$(command -v mkdir)"
+printf '#!/bin/sh\ncase "$3 $4" in\n  "ls-tree -r") [ "${GS_FAIL:-}" = lstree ] && { "$GS_REAL_GIT" "$@"; exit 1; } ;;\n  "cat-file blob") [ "${GS_FAIL:-}" = catfile ] && { "$GS_REAL_GIT" "$@"; exit 1; } ;;\n  "rev-parse --show-toplevel") [ "${GS_FAIL:-}" = notop ] && { echo /nonexistent/top; exit 0; } ;;\nesac\nexec "$GS_REAL_GIT" "$@"\n' > "$GS/git"
+printf '#!/bin/sh\nfor a in "$@"; do case "$a" in *"${MK_FAIL:-NOSUCHSUFFIX}") exit 1 ;; esac; done\nexec "$MK_REAL" "$@"\n' > "$GS/mkdir"; chmod +x "$GS/git" "$GS/mkdir"
+run_gs() { run_sut "$@" "PATH=$GS:$PATH" "GS_REAL_GIT=$GREAL" "MK_REAL=$MREAL"; }   # git and mkdir that fail only what GS_FAIL / MK_FAIL name — and fail AFTER printing the good output
+branch_from "$R" main h_doc; bad_doc > "$R/docs/h_new.md"; HTIP="$(commit_all "$R" h-doc)"
+run_gs 2c "$R" "$MAIN" "$HTIP" ga-x;                        expect "control: through the stubs, with nothing failing, a doc without Contents is refused for what it is" fail violacoes-doc-rules
+run_gs 2c "$R" "$MAIN" "$HTIP" ga-x GS_FAIL=lstree;         expect "git ls-tree fails after listing the tree: the extraction is not trusted" nao-consegui-medir extracao-tip
+run_gs 2c "$R" "$MAIN" "$HTIP" ga-x GS_FAIL=catfile;        expect "git cat-file fails after printing the blob: the extraction is not trusted" nao-consegui-medir extracao-tip
+run_gs 2c "$R" "$MAIN" "$HTIP" ga-x MK_FAIL=/tip;           expect "the extraction directory cannot be made" nao-consegui-medir extracao-tip
+run_gs 2c "$R" "$MAIN" "$HTIP" ga-x MK_FAIL=/tip/docs;      expect "a directory inside the extraction cannot be made" nao-consegui-medir extracao-tip
+run_gs 2c "$R" "$MAIN" "$HTIP" ga-x GS_FAIL=notop;          expect "a toplevel that names nothing on disk" nao-consegui-medir sem-toplevel
+# the red-line comparison of 2d and 2b, with an awk (and a grep) that fail while cutting / reading the lines: unmeasured, never "no new break"
+FB5="$WORK/fb5"; cp -a "$FB" "$FB5"; rm -f "$FB5/awk"; printf '#!/bin/sh\ncase "$1:$2" in -v:t=*) exit 1 ;; esac\nexec %s "$@"\n' "$(command -v awk)" > "$FB5/awk"; chmod +x "$FB5/awk"
+FB6="$WORK/fb6"; cp -a "$FB" "$FB6"; rm -f "$FB6/grep"; printf '#!/bin/sh\ncase " $* " in *" -q "*) ;; *"STALE|BROKEN MARKERS|GAP"*) exit 1 ;; esac\nexec %s "$@"\n' "$(command -v grep)" > "$FB6/grep"; chmod +x "$FB6/grep"
+run_sut 2d "$R" "$STIP" "$DTIP" ga-x PATH="$FB5";            expect "an awk that fails while cutting the red lines of E12" nao-consegui-medir e12-linhas-ilegiveis
+run_sut 2d "$R" "$STIP" "$DTIP" ga-x PATH="$FB6";            expect "a grep that fails while reading the red lines of E12" nao-consegui-medir e12-linhas-ilegiveis
+run_sut 2b "$R2" "$JB" "$JS" ga-x PATH="$FB5";               expect "an awk that fails while cutting the finding lines of the parse guard" nao-consegui-medir parse-linhas-ilegiveis
+# a tool's exit status: a crash with exit 1 and no finding line is not red, an exit 2 after a FAIL line is not red, and a FAIL with no pack named has nothing to ask the base about
+C5="$WORK/city5"; mkcity "$C5" e12-crew-doctrine.sh; printf '#!/bin/sh\necho "oops: the tool crashed" >&2\nexit 1\n' > "$C5/packs/town-deltas/assets/e12-crew-doctrine.sh"; chmod +x "$C5/packs/town-deltas/assets/e12-crew-doctrine.sh"
+CITY_UNDER="$C5"; run_sut 2d "$R" "$MAIN" "$OKTIP" ga-x;     expect "an E12 tool that exits 1 and prints no red line is not a finding" nao-consegui-medir e12-inconclusivo-tip
+CITY_UNDER="$C4"
+run_sut 2b "$R" "$MAIN" "$GOK" ga-x PATH="$FB" REAL_GUARD="$REALG" STUB_GUARD_MODE=rc2;           expect "a parse guard that exits 2 after a FAIL line is not red (red needs exit 1)" nao-consegui-medir parse-inconclusivo-tip
+run_sut 2b "$R" "$MAIN" "$GOK" ga-x PATH="$FB" REAL_GUARD="$REALG" STUB_GUARD_MODE=bare-unlinted; expect "a tip that FAILs with no pack named, over a base that was never linted: no pack to vouch for, unmeasured" nao-consegui-medir lint-nao-rodou-na-base
 CITY_UNDER=""
 rm -f "$FB/gc"
 run_sut 2b "$R" "$MAIN" "$GBAD" ga-x PATH="$FB";           expect "no gc on PATH (the guard would exit 0 with only a warning)" nao-consegui-medir sem-gc
