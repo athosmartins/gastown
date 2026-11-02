@@ -23,8 +23,8 @@ blocked:*, counters...) is only REPORTED: removing a hold or a park label RELEAS
 inert direction (a human or the Mayor decides), and `pilot:no-auto-dispatch` is the town's creation default.
 
 DEFAULT IS DRY-RUN. `--apply` removes (one label per `bd label remove` — multi-arg is a silent no-op),
-re-reads the store to CONFIRM each removal (a `bd` write can exit 0 without persisting), and leaves one
-comment on the child. At most --max removals per run. Single instance (flock): a detector costs poll
+re-reads the store to CONFIRM each removal (a `bd` write can exit 0 without persisting), and leaves one audit
+comment on the child per removed label. At most --max removals per run. Single instance (flock): a detector costs poll
 (ga-y0g5x).
 
 READ FAILURES ARE NOT EMPTY (E12): a store whose query fails/garbles is reported UNREADABLE and exit code 2 —

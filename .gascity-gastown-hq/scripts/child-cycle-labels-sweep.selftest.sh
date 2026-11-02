@@ -4,9 +4,11 @@
 # The sweep's SQL (the parent-child edge query, labels/events by id list, UNIX_TIMESTAMP arithmetic, the marker
 # lookup) is the part a canned-rows stub cannot test, so this builds a throwaway Dolt database with the real table shapes
 # and lets a `bd` stub run the sweep's queries against it with `dolt sql`. ZERO calls reach the live city.
-# The stub also FAILS on demand (store down, garbage, marker lookup down, a write that exits 0 and persists
-# nothing) and the test checks the sweep lands in the INERT state: nothing removed, failure visible, exit 2.
-# "Could not read" must never turn into "nothing to do", nor "remove returned 0" into "removed".
+# The stub also FAILS on demand (store down, garbage, a JSON object instead of a list, marker lookup down, a write
+# that fails, a write that exits 0 and persists nothing) and the test checks the sweep lands in the INERT state:
+# nothing removed, failure visible, exit 2. "Could not read" must never turn into "nothing to do", nor "remove
+# returned 0" into "removed". Each failure mode is also checked against the message of the detector that must catch it,
+# so a read that fails cannot pass because some other, later check happened to trip.
 #
 # Last test: the policy lists in the sweep must equal internal/types/label_inherit.go in the bd patch.
 set -uo pipefail
@@ -34,8 +36,9 @@ a = sys.argv[1:]
 with open(os.environ["STUB_CALLS"], "a") as f:
     f.write(" ".join(a) + "\n")
 mode = os.environ.get("STUB_MODE", "ok")
+store = ""
 if a[:1] == ["-C"]:
-    a = a[2:]
+    store, a = a[1], a[2:]
 def dolt(q):
     return subprocess.run(["dolt", "sql", "-r", "json", "-q", q], cwd=os.environ["STUB_DB"], capture_output=True, text=True)
 if a[:1] == ["sql"]:
@@ -44,8 +47,12 @@ if a[:1] == ["sql"]:
         print(json.dumps({"error": "stub: store down"})); sys.exit(1)
     if mode == "garbage":
         print("garbage{{{ not json"); sys.exit(0)
+    if mode == "dict":
+        print(json.dumps({"rows": []})); sys.exit(0)  # valid JSON, rc 0, but an object: not the list the sweep reads
     if mode == "marker_fail" and "source-bead:" in q:
         print(json.dumps({"error": "stub: marker lookup down"})); sys.exit(1)
+    if mode == "marker_hq_only" and "source-bead:" in q and store != os.environ["STUB_HQ"]:
+        print("[]"); sys.exit(0)  # the gate's marker lives in HQ only: any other store has none
     if mode == "probe_fail" and q.startswith("SELECT 1 AS n"):
         print(json.dumps({"error": "stub: pre-check down"})); sys.exit(1)
     if mode == "vanish" and q.startswith("SELECT 1 AS n"):
@@ -62,6 +69,8 @@ elif a[:2] == ["label", "remove"]:
     child, label = a[2], a[3]
     if mode == "lie_remove":
         sys.exit(0)  # exits 0, persists nothing
+    if mode == "remove_rc1":
+        sys.exit(1)  # fails, persists nothing
     q = ("DELETE FROM labels WHERE issue_id='%s' AND label='%s'; "
          "INSERT INTO events VALUES (UUID(), '%s', 'label_removed', 'Removed label: %s', NOW())") % (child, label, child, label)
     sys.exit(dolt(q).returncode)
@@ -124,6 +133,12 @@ issue("ga-c10", "open", "@t2"); child("ga-c10", "ga-p1"); label("ga-c10", "gate:
 # c11: born with gate:passed, no marker, BUT somebody removed another label (lane:small) by hand 1 hour ago -> being curated -> report only
 issue("ga-c11", "open", "@t2"); child("ga-c11", "ga-p1"); label("ga-c11", "gate:passed")
 ev("ga-c11", "label_added", "gate:passed", 0); ev("ga-c11", "label_added", "lane:small", 0); ev("ga-c11", "label_removed", "lane:small", 2 * 86400 - 3600)
+# c12: born gate:passed, but its edge to p1 is `blocks`, not parent-child -> p1 is not its parent -> not listed at all
+issue("ga-c12", "open", "@t2"); label("ga-c12", "gate:passed"); ev("ga-c12", "label_added", "gate:passed", 0)
+s.append("INSERT INTO dependencies VALUES (UUID(),'ga-c12','blocks','ga-p1')")
+# c13: gate:passed added TWICE and never removed -> "added exactly once" is not met -> report only
+issue("ga-c13", "open", "@t2"); child("ga-c13", "ga-p1"); label("ga-c13", "gate:passed")
+ev("ga-c13", "label_added", "gate:passed", 0); ev("ga-c13", "label_added", "gate:passed", 5)
 r = subprocess.run(["dolt", "sql", "-q", "; ".join(s)], cwd=db, capture_output=True, text=True)
 if r.returncode != 0:
     sys.stderr.write(r.stderr); sys.exit(1)
@@ -135,8 +150,14 @@ PY
 sweep() {
   local mode="$1"; shift
   env BD_BIN="$W/bd" GC_BIN="${GC_BIN_OVERRIDE:-/usr/bin/false}" GC_CITY_PATH="$W/hq" \
-      CHILD_CYCLE_LABELS_SWEEP_LOCK="$W/lock" STUB_DB="$DB" STUB_CALLS="$CALLS" STUB_MODE="$mode" \
+      CHILD_CYCLE_LABELS_SWEEP_LOCK="$W/lock" STUB_DB="$DB" STUB_CALLS="$CALLS" STUB_MODE="$mode" STUB_HQ="$W/hq" \
       python3 -I "$SWEEP" --path "$W/rig" "$@" > "$OUT_F" 2>&1
+  RC=$?
+}
+# sweep_city GC_BIN — no --path: the store list comes from `gc rig list`
+sweep_city() {
+  env BD_BIN="$W/bd" GC_BIN="$1" GC_CITY_PATH="$W/hq" CHILD_CYCLE_LABELS_SWEEP_LOCK="$W/lock" STUB_DB="$DB" STUB_CALLS="$CALLS" STUB_MODE=ok \
+      python3 -I "$SWEEP" > "$OUT_F" 2>&1
   RC=$?
 }
 labels_of() { ( cd "$DB" && dolt sql -r csv -q "SELECT label FROM labels WHERE issue_id='$1' ORDER BY label" 2>/dev/null | tail -n +2 | paste -sd, - ); }
@@ -152,7 +173,7 @@ c=$(printf '%s\n' "$s" | grep -c 'ga-c1 ') ; [ "$c" -eq 3 ] && ok "c1: exactly 3
 for l in 'gate:passed' 'story:done' 'gate-approved:abc123'; do
   printf '%s\n' "$s" | grep 'ga-c1 ' | grep -q -- "$l" && ok "c1: $l is a strip candidate" || nope "c1: $l missing from STRIP"
 done
-printf '%s\n' "$s" | grep -q -E 'ga-c[2-8] ' && nope "STRIP section lists a child that must not be stripped" || ok "only c1 is in the STRIP section"
+printf '%s\n' "$s" | grep -q -E 'ga-c([2-9]|1[0-3]) ' && nope "STRIP section lists a child that must not be stripped" || ok "only c1 is in the STRIP section"
 r="$(section REPORT)"
 printf '%s\n' "$r" | grep 'ga-c1 ' | grep -q 'exec:manual' && ok "c1 exec:manual is REPORTED (a hold is not stripped)" || nope "c1 exec:manual not in REPORT"
 printf '%s\n' "$r" | grep 'ga-c2 ' | grep -q 'gate reviewed' && ok "c2: reviewed by the gate -> report only" || nope "c2 not reported as gate-reviewed"
@@ -162,8 +183,9 @@ printf '%s\n' "$r" | grep 'ga-c8 ' | grep -q 'not a completion claim' && ok "c8:
 printf '%s\n' "$r" | grep 'ga-c9 ' | grep -q 'not proven born-with' && ok "c9: removed since (no re-add event) -> report only" || nope "c9 not reported"
 printf '%s\n' "$r" | grep 'ga-c10 ' | grep -q 'not proven born-with' && ok "c10: event stamped before the child existed -> report only" || nope "c10 not reported"
 printf '%s\n' "$r" | grep 'ga-c11 ' | grep -q 'hand-edited in the last 6h' && ok "c11: labels hand-edited an hour ago -> report only (someone is on it)" || nope "c11 not reported as being curated"
-for x in ga-c5 ga-c6 ga-c7; do
-  grep -q "$x " "$OUT_F" && nope "$x must not appear (parent lacks the label / closed / outside the window)" || ok "$x is out of scope and not listed"
+printf '%s\n' "$r" | grep 'ga-c13 ' | grep -q 'not proven born-with' && ok "c13: added twice and never removed -> report only" || nope "c13 not reported"
+for x in ga-c5 ga-c6 ga-c7 ga-c12; do
+  grep -q "$x " "$OUT_F" && nope "$x must not appear (parent lacks the label / closed / outside the window / not a parent-child edge)" || ok "$x is out of scope and not listed"
 done
 [ "$(n_calls ' label remove ')" -eq 0 ] && ok "dry-run: no 'label remove' call" || nope "dry-run issued a label remove"
 [ "$(labels_of ga-c1)" = "$before" ] && ok "dry-run: c1 labels unchanged" || nope "dry-run changed c1 labels"
@@ -181,6 +203,7 @@ want="area:infra,exec:manual,lane:small"
 [ "$(labels_of ga-c9)" = "gate:passed" ] && ok "apply: c9 (removed since) untouched" || nope "apply touched c9"
 [ "$(labels_of ga-c10)" = "gate:passed" ] && ok "apply: c10 (negative delta) untouched" || nope "apply touched c10"
 [ "$(labels_of ga-c11)" = "gate:passed" ] && ok "apply: c11 (being curated) untouched" || nope "apply touched c11"
+[ "$(labels_of ga-c12)" = "gate:passed" ] && [ "$(labels_of ga-c13)" = "gate:passed" ] && ok "apply: c12 (blocks edge) and c13 (added twice) untouched" || nope "apply touched c12/c13"
 [ "$(labels_of ga-c6)" = "gate:passed" ] && [ "$(labels_of ga-c7)" = "gate:passed" ] && ok "apply: closed / old children untouched" || nope "apply touched c6/c7"
 [ "$(labels_of ga-p1 | tr ',' '\n' | sort | paste -sd, -)" = "area:infra,exec:manual,gate-approved:abc123,gate:passed,lane:small,pilot:no-auto-dispatch,story:done" ] && ok "apply: the PARENT is never touched" || nope "apply changed the parent"
 [ "$(n_calls ' label remove ')" -eq 3 ] && ok "apply: exactly 3 single-label removes" || nope "apply: $(n_calls ' label remove ') removes, want 3"
@@ -198,10 +221,12 @@ fresh_db; sweep ok --apply --max 2
 grep -q 'skipped (--max 2 reached)' "$OUT_F" && ok "--max 2: the 3rd is reported skipped" || nope "--max 2: no skipped line"
 
 # ── 5. READ FAILURES land inert (exit 2, nothing removed), never as 'nothing to do' ───────────────────────
-for mode in rc1 garbage; do
+for mode in rc1 garbage dict; do
+  case "$mode" in (rc1) want='bd sql rc=1';; (garbage) want='non-JSON';; (dict) want='non-list';; esac
   fresh_db; sweep "$mode" --apply
   [ "$RC" -eq 2 ] && ok "$mode: exit 2" || nope "$mode: exit $RC, want 2"
   grep -q 'UNREADABLE' "$OUT_F" && ok "$mode: output says UNREADABLE" || nope "$mode: failure not visible"
+  grep -q -- "$want" "$OUT_F" && ok "$mode: named by its own detector ($want)" || nope "$mode: not named by '$want'"
   [ "$(n_calls ' label remove ')" -eq 0 ] && ok "$mode: nothing removed" || nope "$mode: removed something"
   grep -q ' 0 strip candidate' "$OUT_F" && grep -q '0 unreadable' "$OUT_F" && nope "$mode: read as 'clean store'" || ok "$mode: not presented as a clean store"
 done
@@ -209,10 +234,15 @@ fresh_db; sweep marker_fail --apply
 [ "$RC" -eq 2 ] && ok "marker lookup down: exit 2" || nope "marker lookup down: exit $RC, want 2"
 [ "$(n_calls ' label remove ')" -eq 0 ] && ok "marker lookup down: NOTHING stripped (downgraded to report-only)" || nope "marker lookup down: stripped without knowing whether the gate saw it"
 grep -q 'marker lookup unreadable' "$OUT_F" && ok "marker lookup down: note says so" || nope "marker lookup down: no note"
+fresh_db; sweep marker_hq_only --apply
+[ "$(labels_of ga-c2)" = "gate:passed" ] && ok "marker only in HQ (the rig's own store has none): c2 still untouched" || nope "marker kept in HQ only was not seen: c2 was stripped"
 fresh_db; before="$(labels_of ga-c1)"; sweep lie_remove --apply
 [ "$RC" -eq 2 ] && ok "lying remove (rc 0, nothing persisted): exit 2" || nope "lying remove: exit $RC, want 2"
 grep -q 'FAILED.*still there' "$OUT_F" && ok "lying remove: reported FAILED, not removed" || nope "lying remove believed"
 [ "$(n_calls ' comment ga-c1 ')" -eq 0 ] && ok "lying remove: no 'removed' audit comment written" || nope "lying remove: wrote an audit comment"
+fresh_db; sweep remove_rc1 --apply
+[ "$RC" -eq 2 ] && grep -q 'FAILED label remove rc=1' "$OUT_F" && ok "failing remove (rc 1): exit 2, FAILED with the remove's own message" || nope "failing remove: rc=$RC"
+[ "$(n_calls ' comment ga-c1 ')" -eq 0 ] && ok "failing remove: no 'removed' audit comment written" || nope "failing remove: wrote an audit comment"
 
 fresh_db; sweep vanish --apply
 [ "$RC" -eq 0 ] && ok "label removed by someone else first: exit 0" || nope "vanished label: exit $RC, want 0"
@@ -226,28 +256,70 @@ fresh_db; sweep probe_fail --apply
 [ "$(n_calls ' label remove ')" -eq 0 ] && ok "pre-check unreadable: NO blind write" || nope "pre-check unreadable: wrote blind"
 grep -q 'pre-check unreadable' "$OUT_F" && ok "pre-check unreadable: said so" || nope "pre-check unreadable: silent"
 
-# ── 6. store listing: failing `gc rig list` is exit 2, not an empty city ──────────────────────────────────
+# ── 6. store listing: a failing or an empty `gc rig list` is exit 2, not an empty (clean) city ────────────
 fresh_db
-env BD_BIN="$W/bd" GC_BIN=/usr/bin/false GC_CITY_PATH="$W/hq" CHILD_CYCLE_LABELS_SWEEP_LOCK="$W/lock" STUB_DB="$DB" STUB_CALLS="$CALLS" STUB_MODE=ok \
-    python3 -I "$SWEEP" > "$OUT_F" 2>&1; RC=$?
-[ "$RC" -eq 2 ] && grep -q 'cannot list stores' "$OUT_F" && ok "gc rig list down: exit 2 with a message" || nope "gc rig list down: rc=$RC"
+sweep_city /usr/bin/false
+[ "$RC" -eq 2 ] && grep -q 'cannot list stores' "$OUT_F" && grep -q 'gc rig list rc=1' "$OUT_F" && ok "gc rig list down: exit 2 with its own message" || nope "gc rig list down: rc=$RC"
+cat > "$W/gc_empty" <<'GC'
+#!/bin/sh
+echo '{"rigs": []}'
+GC
+chmod +x "$W/gc_empty"
+sweep_city "$W/gc_empty"
+[ "$RC" -eq 2 ] && grep -q 'gc rig list returned no rigs' "$OUT_F" && ok "gc rig list with no rigs: exit 2, not a clean city" || nope "gc rig list with no rigs: rc=$RC"
 
-# ── 7. kill-switch and usage ─────────────────────────────────────────────────────────────────────────────
+# ── 7. kill-switch, usage, single instance ───────────────────────────────────────────────────────────────
 fresh_db; CHILD_CYCLE_LABELS_SWEEP_ENABLED=0 sweep ok --apply
 [ "$RC" -eq 0 ] && [ ! -s "$CALLS" ] && ok "kill-switch: exit 0, no bd call" || nope "kill-switch ignored (rc=$RC)"
 sweep ok --days 0; [ "$RC" -eq 3 ] && ok "bad usage (--days 0): exit 3" || nope "--days 0 exit $RC, want 3"
+# a second run while another one holds the lock does nothing (a detector costs poll: ga-y0g5x)
+fresh_db
+python3 -I -c 'import fcntl, sys, time
+f = open(sys.argv[1], "w"); fcntl.flock(f, fcntl.LOCK_EX); open(sys.argv[2], "w").close(); time.sleep(30)' "$W/lock" "$W/held" &
+holder=$!
+i=0; while [ ! -f "$W/held" ] && [ "$i" -lt 40 ]; do sleep 0.25; i=$((i+1)); done
+if [ -f "$W/held" ]; then
+  sweep ok --apply
+  [ "$RC" -eq 0 ] && grep -q 'another instance holds the lock' "$OUT_F" && [ ! -s "$CALLS" ] && ok "lock held by another run: exit 0, nothing done, no bd call" || nope "lock held by another run: rc=$RC, or the sweep ran anyway"
+else
+  nope "lock holder never started (test setup)"
+fi
+kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
 
 # ── 8. unsafe tokens are refused, never interpolated ─────────────────────────────────────────────────────
 python3 -I - "$SWEEP" <<'PY' && ok "unsafe id/label is refused (Unreadable), not escaped" || nope "unsafe token was interpolated"
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("sweep", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-for bad in ("x'; DROP TABLE labels; --", "a b", "", "ga-1\n", None):
+for bad in ("x'; DROP TABLE labels; --", "a b", "", "ga-1\n", None, "a'b", "a;b", "a\\b", 'a"b'):
     try:
         m._quote(bad)
     except m.Unreadable:
         continue
     sys.exit(1)
 assert m._quote("source-bead:ga-c1") == "'source-bead:ga-c1'"
+PY
+
+# ── 8b. the "born with" rule at its edges; a removal whose time cannot be read counts as "just now" ────────
+python3 -I - "$SWEEP" > "$OUT_F" 2>&1 <<'PY' && ok "born-with edges, and an unreadable removal time counts as now" || nope "born-with edge case wrong"
+import importlib.util, sys, time
+spec = importlib.util.spec_from_file_location("sweep", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+bad = 0
+# ((seconds after creation of each label_added event, number of removals), born with?)
+for ev, want in ((([0], 0), True), (([-2], 0), True), (([-3], 0), False), (([10], 0), True), (([11], 0), False),
+                 (([None], 0), False), (([0, 5], 0), False), (([0], 1), False), (([], 0), False)):
+    got = m.born_with({("c", "l"): ev}, "c", "l")
+    if got != want:
+        print("born_with(%r) = %r, want %r" % (ev, got, want)); bad = 1
+def fake_sql(store, q):
+    if "FROM issues" in q:
+        return [{"id": "c", "ts": "1000"}]
+    return [{"child": "c", "ev": "label_removed", "comment": "Removed label: x", "ts": None}]
+m.sql = fake_sql
+_, last = m.birth_evidence("s", ["c"])
+age = time.time() - last.get("c", 0.0)
+if not 0 <= age < 60:
+    print("a removal with an unreadable time was stamped %.0f s ago, want ~now" % age); bad = 1
+sys.exit(bad)
 PY
 
 # ── 9. policy mirror: the sweep's lists must equal internal/types/label_inherit.go in the bd patch ───────
