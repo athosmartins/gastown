@@ -185,5 +185,151 @@ else bad "order missing: $ORDER"; fi
 [ -f "$HERE/third-state-manual.tsv" ] && ok || bad "ledger missing: third-state-manual.tsv"
 bash -n "$0" && ok || bad "selftest does not parse"
 
+# ── lastro hq-mutants (ga-5mnu1pp): the edges, defaults and exits the fixtures above never put on an exact value ─────────────────
+# In process (python3 -c, no here-document): the module's own functions get the exact input — a ledger row of exactly 3 columns, a verdict
+# at exactly the window start and end, a comment that STARTS with the heading, a read that fails after printing, a deadline that is exactly
+# now. The expectations were derived by hand from the module's docstring, then checked against the real report. Not killable, on purpose:
+# L131 `(x[0], x[1])` -> `(x[0], x[0])` (05edbcba6f: `out` is appended in index order and sort() is stable, so a tie keeps it anyway),
+# L142 `j >= 0` -> `j > 0` and `j >= 1` (5a55c724af 7cf7c435c3: j is -1 or the position of a heading that starts AFTER i >= 0, so never 0),
+# L376 `SystemExit(2)` -> `SystemExit(3)` (e9d82eb6c4: the handler only reads `code == 0`, any other code ends in the same usage exit 64),
+# L152 `text=True` -> `text=False` (b10f971495: json.loads takes the bytes as well as the text, and `bd comments --json` prints UTF-8; only a
+# stdout holding an ENCODED lone surrogate would differ, which strict text mode rejects and bytes mode takes, and bd never prints one).
+PYT='
+import contextlib, datetime, importlib.util, io, json, os, re, sys, time, types
+sys.dont_write_bytecode = True
+mod, W = sys.argv[1], sys.argv[2]
+sp = importlib.util.spec_from_file_location("tsr", mod)
+m = importlib.util.module_from_spec(sp)
+sp.loader.exec_module(m)
+fails = []
+def chk(name, got, want):
+    if callable(got):
+        try:
+            got = got()
+        except Exception as e:
+            got = "raised " + repr(e)
+    if got != want:
+        fails.append("FAIL " + name + ": got " + repr(got)[:240] + " want " + repr(want)[:240])
+def put(name, text):
+    p = W + "/" + name
+    open(p, "w").write(text)
+    return p
+def jl(*rows):
+    return "".join((r if isinstance(r, str) else json.dumps(r)) + "\n" for r in rows)
+def v(ts, bead, result, **k):
+    return dict(ts=ts, event="dispatcher_complete", bead=bead, result=result, **k)
+def city(name, *rows):
+    os.makedirs(W + "/" + name + "/.gc", exist_ok=True)
+    put(name + "/.gc/quality-gate.jsonl", jl(*rows))
+    return W + "/" + name
+class P:
+    def __init__(self, out):
+        self.returncode, self.stdout, self.stderr = 0, out, ""
+def main(*argv):
+    old, sys.argv = sys.argv, ["tsr"] + list(argv)
+    o, e = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(o), contextlib.redirect_stderr(e):
+            rc = m.main()
+    finally:
+        sys.argv = old
+    return rc, o.getvalue(), e.getvalue()
+NOW = "2026-10-16T09:00:00Z"
+NL = ["--now", NOW, "--no-classify", "--ledger", W + "/tsr-no-ledger.tsv"]
+# the readers: what an unreadable path, a blank, a comment, a short row and a duplicate each count as
+os.makedirs(W + "/tsr-dir", exist_ok=True)
+chk("read_jsonl: a path that cannot be opened is unreadable with ZERO bad lines", m.read_jsonl(W + "/tsr-dir"), ("unreadable", [], 0, []))
+chk("read_ledger: absent and unreadable both carry a zero bad count", (m.read_ledger(W + "/tsr-none"), m.read_ledger(W + "/tsr-dir")), (("absent", {}, 0), ("unreadable", {}, 0)))
+chk("read_ledger: blanks and comments are skipped, a 3-column row counts, a bad class or a bad day is bad", m.read_ledger(put("tsr-ledger.tsv", "# note\n\n  \nB1\t2026-10-08\t3o-estado\n B2 \t2026-10-09 \toutro \tsrc\nB3\t2026-10-09\tbanana\tx\nB4\t10/09\toutro\n")), ("ok", {("B1", "2026-10-08"): "3o-estado", ("B2", "2026-10-09"): "outro"}, 2))
+chk("arm_map: the first row of a bead wins; a row without a text bead and arm is bad", m.arm_map(put("tsr-arms.jsonl", jl(dict(bead="x", arm="first"), dict(bead="x", arm="second"), dict(bead="y", arm=None), dict(bead=5, arm="z")))), ("ok", {"x": "first"}, 2))
+rows = [v("2026-10-02T00:00:00Z", "b2", "PASS"), v("2026-10-01T00:00:00Z", "b1", "FAIL"), v("2026-10-03T00:00:00Z", "b3", "PASS", dry_run=1), v("2026-10-03T00:00:00Z", "b4", "SKIPPED"), v("garbage", "b5", "PASS"), dict(v("2026-10-04T00:00:00Z", "x", "PASS"), bead=None), dict(event="guard_dispatched", bead="b6"), v("2026-10-01T00:00:00Z", "b7", "FAIL")]
+out, no_ts, other, dry = m.verdicts(rows)
+chk("verdicts: sorted by time, then log order; no_ts, other and dry read exact", ([d["bead"] for t, i, d in out], no_ts, other, dry), (["b1", "b7", "b2"], 2, 1, 1))
+# one gate run: what its comments can say, and what a failing or late read must not say
+LAB = "Blocking reasons: root-class:error-vs-empty"
+chk("blocking_part: a text that STARTS with the heading has a blocking part", m.blocking_part(LAB), LAB)
+real_run, real_mono, real_rgr = m.subprocess.run, time.monotonic, m.read_gate_run
+def rgr(out, deadline=1e18):
+    m.subprocess.run = lambda cmd, **kw: P(out if kw.get("capture_output") else None)
+    try:
+        return m.read_gate_run("bd", "/c", "R", 5, deadline)
+    finally:
+        m.subprocess.run = real_run
+chk("read_gate_run: the label in a blocking part is the third state", lambda: rgr(json.dumps([dict(text=LAB)])), "3o-estado")
+chk("read_gate_run: a raw newline inside a JSON string is tolerated (strict=False)", lambda: rgr("[{\"text\": \"" + LAB + "\nmore\"}]"), "3o-estado")
+chk("read_gate_run: rows that are not comments with a text are skipped, never crash the read", lambda: rgr(json.dumps([5, dict(text=7), dict(text=LAB)])), "3o-estado")
+time.monotonic = lambda: 100.0
+try:
+    chk("read_gate_run: a deadline that is exactly now has not passed", lambda: rgr(json.dumps([dict(text=LAB)]), 100.0), "3o-estado")
+finally:
+    time.monotonic = real_mono
+args = types.SimpleNamespace(no_classify=False, deadline_s=5, workers=1, bd="bd", timeout_s=5)
+calls = []
+m.read_gate_run = lambda bd, c, run, timeout, deadline: (calls.append(run) or "3o-estado")
+try:
+    res = m.classify([(None, 0, dict(bead="b", ts="2026-10-08T00:00:00Z", gate_run=""))], {}, {}, args, "/c")
+finally:
+    m.read_gate_run = real_rgr
+chk("classify: an empty gate_run is unknown and is never read", (list(res.values()), calls), ([("desconhecido", "-")], []))
+# the cells: exactly 5 observations, exactly 60% and 30%, and the range when some reads are missing
+chk("first_cell: n=5 is a percentage, and exactly 60% reaches the goal", m.first_cell(dict(n=5, **{"pass": 3})), ("60% (3/5)", "atinge"))
+chk("third_cell: exactly 30% does NOT reach the goal", m.third_cell(dict(third=3, outro=7, unk=0)), ("30% (3/10)", "NÃO atinge"))
+chk("third_cell with unread runs: a ceiling of exactly 30% is no conclusion, a floor of exactly 30% misses the goal", (m.third_cell(dict(third=1, outro=7, unk=2))[1], m.third_cell(dict(third=3, outro=5, unk=2))[1]), ("sem conclusão", "NÃO atinge"))
+# the report on a window whose first and last verdicts sit EXACTLY on its edges, with a cut line on each edge too
+EDGE = city("tsr-edge", v("2026-10-09T09:00:00Z", "A1", "PASS", reason="ok"), v("2026-10-16T09:00:00Z", "A2", "FAIL", reason="Reviewer 1 FAIL: x", gate_run="R1"), v("2026-10-12T00:00:00Z", "A3", "PASS", dry_run="1"), v("2026-10-12T00:00:00Z", "A4", "SKIPPED"), "{\"ts\":\"2026-10-09T09:00:00Z\",\"event\":\"dispatcher_comp", "{\"ts\":\"2026-10-16T09:00:00Z\",\"event\":\"dispatcher_comp")
+rc, out, err = main("--city", EDGE, *NL)
+chk("the window is inclusive at both ends: a first verdict at exactly its start and end counts (2 verdicts, 2 first attempts)", "2 vereditos reais na janela (2 beads com 1" in out, True)
+chk("...and so does an unreadable line whose ts is exactly its start or end", re.search(r"; 2 t.m ts leg.vel dentro da janela", out) is not None, True)
+chk("the header gives BRT as UTC-3", "(7 dias; BRT 16/10 06:00)" in out, True)
+chk("a rejection whose comment was not read is counted once as sem leitura", re.search(r"1 reprova.{1,3}es sem leitura", out) is not None, True)
+chk("a dry run and a non-verdict result are both reported", re.search(r"1 resultado\(s\).*1 dry-runs", out) is not None, True)
+chk("a window with only a dry run still reports it", "1 dry-runs" in main("--city", city("tsr-dry", v("2026-10-12T00:00:00Z", "D1", "PASS", reason="ok"), v("2026-10-12T00:00:00Z", "D2", "PASS", dry_run="1")), *NL)[1], True)
+class FakeDT(datetime.datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 10, 16, 9, 0, 0, 500000, tzinfo=tz)
+real_dt = m.datetime
+m.datetime = types.SimpleNamespace(datetime=FakeDT, timezone=datetime.timezone, timedelta=datetime.timedelta)
+try:
+    out = main("--city", city("tsr-lo", v("2026-10-09T09:00:00Z", "L1", "PASS", reason="ok")), "--no-classify", "--ledger", W + "/tsr-no-ledger.tsv")[1]
+finally:
+    m.datetime = real_dt
+chk("the default end of the window is the current WHOLE second: a verdict exactly 7 days before it counts", "1 vereditos reais na janela (1 beads com 1" in out, True)
+# main(): defaults, the usage exits, the default city, and a report that cannot be saved
+seen = []
+real_build = m.build
+m.build = lambda a, c: (seen.append((a, c)) or (["R"], 0))
+try:
+    chk("main: --help exits 0", main("--help")[0], 0)
+    rc = main()[0]
+    a = seen[-1][0]
+    chk("main: the defaults are 7 days, 8 workers, 60 s per read and a 1200 s deadline", (rc, a.days, a.workers, a.timeout_s, a.deadline_s), (0, 7, 8, 60, 1200))
+    chk("main: 1 day and 1 worker are accepted, 0 of either is a usage error (64)", [main("--days", "1")[0], main("--workers", "1")[0], main("--days", "0")[0], main("--workers", "0")[0]], [0, 0, 64, 64])
+    keep = {k: os.environ.pop(k, None) for k in ("GC_CITY_PATH", "GC_CITY")}
+    got = []
+    try:
+        for env in ({"GC_CITY_PATH": "/p"}, {"GC_CITY": "/c"}, {}):
+            for k in keep:
+                os.environ.pop(k, None)
+            os.environ.update(env)
+            main()
+            got.append(seen[-1][1])
+    finally:
+        for k in keep:
+            os.environ.pop(k, None)
+        os.environ.update({k: x for k, x in keep.items() if x is not None})
+    chk("main: the default city is GC_CITY_PATH, else GC_CITY, else the mini", got, ["/p", "/c", "/Users/athos/gt/.gascity-gastown-hq"])
+finally:
+    m.build = real_build
+SV = city("tsr-save", v("2026-10-12T00:00:00Z", "S1", "PASS", reason="ok"))
+os.makedirs(SV + "/.gc/third-state-report.last.txt", exist_ok=True)
+rc, out, err = main("--city", SV, *NL, "--save")
+chk("main: a report that cannot be saved still prints, says so and exits 1", (rc, "consegui gravar o relat" in err, "Total" in out), (1, True, True))
+print("\n".join(fails))
+print("DONE", len(fails))
+'
+TSR_OUT=$(python3 -c "$PYT" "$SCRIPT" "$W" 2>&1)
+case "$TSR_OUT" in *"DONE 0") ok ;; *) bad "lastro hq-mutants block: $TSR_OUT" ;; esac
+
 echo "third-state-report selftest: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
