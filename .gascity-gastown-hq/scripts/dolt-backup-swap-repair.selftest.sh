@@ -160,8 +160,8 @@ mkdir "$T/bin" || exit 1
 REAL_MV="$(command -v mv)"
 [ -x "$REAL_MV" ] || { echo "FATAL: sem mv no PATH"; exit 1; }
 # Os stubs nascem por printf, sem here-document (o bash 3.2.57 do no grava o temporario do
-# here-document em /tmp sem olhar TMPDIR e a jaula nega), e leem STUB_DIR / REAL_MV / MV_FAIL_N
-# do ambiente, onde o `sr` abaixo os poe.
+# here-document em /tmp sem olhar TMPDIR e a jaula que emula o sandbox do gate nega), e leem
+# STUB_DIR / REAL_MV / MV_FAIL_N do ambiente, onde o `sr` abaixo os poe.
 printf '%s\n' '#!/bin/bash' 'echo "$*" >> "$STUB_DIR/mv.log"' \
   'n=$(wc -l < "$STUB_DIR/mv.log" | tr -d " ")' '[ "${MV_FAIL_N:-0}" = "$n" ] && exit 1' \
   'exec "$REAL_MV" "$@"' > "$T/bin/mv"
