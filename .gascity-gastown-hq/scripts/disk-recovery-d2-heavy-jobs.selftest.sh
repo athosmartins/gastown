@@ -2,14 +2,15 @@
 # disk-recovery-d2-heavy-jobs.selftest.sh — selftest do degrau D2 da escada de recuperação de disco (ga-1p1i5jr.2).
 #
 # ## Contents
-#   O que prova · Hermetismo · Cenários de parada (S) · Bateria de mutantes
+#   O que prova · Hermetismo · Cenários de parada (S) · Cenários de retomada (R) · Bateria de mutantes
 #
-# O QUE PROVA. Que o D2 (a) só para o que a allowlist manda, só com o disco no piso e só com o pai certo; (b) nunca age quando não consegue LER o estado (df, ps, allowlist)
-# — três estados, "não sei" não vira "baixo" nem "bom"; (c) só afirma que parou depois de PROVAR a morte (ps E kill -0), escala TERM→KILL e não manda KILL às cegas quando não consegue provar; (d) não para sem antes gravar o registro;
-# (e) devolve UMA linha e os códigos do contrato. A retomada (--resume) e os cenários dela vêm na fatia 2/2 (ga-1p1i5jr.2.1).
+# O QUE PROVA. Que o D2 (a) só para o que a allowlist manda, só com o disco no piso e só com o pai certo; (b) nunca age quando não consegue LER o estado (df, ps, allowlist,
+# registro) — três estados, "não sei" não vira "baixo" nem "bom"; (c) só afirma que parou depois de PROVAR a morte (ps E kill -0), escala TERM→KILL e não manda KILL às cegas quando não consegue provar;
+# (d) não para sem antes gravar o registro; (e) retoma só com o disco de volta, na janela, com run_id LIDO e bem formado (nunca adivinhado) e com o ambiente do plist — e não retoma quando a trava não
+# pôde ser criada (rc 30, causa diferente de "outra instância"); (f) devolve UMA linha e os códigos do contrato.
 # Cada guarda tem um MUTANTE: a bateria final estraga uma linha do script (marcada `# MUT:<nome>`) e exige que o cenário correspondente FALHE.
 #
-# HERMETISMO. Processos de brinquedo (um `bash fakejob-A.sh` num diretório temporário) levam TERM/KILL de verdade — nada além deles. ps/aws/df vêm de stubs ou de
+# HERMETISMO. Processos de brinquedo (um `bash fakejob-A.sh` num diretório temporário) levam TERM/KILL de verdade — nada além deles. ps/aws/launchctl/df vêm de stubs ou de
 # D2_FREE_MB; a allowlist é a do teste (a real só é lida em modo --dry-run, com ps simulado); o df de verdade só roda em s_real_df (somente leitura). O pior que escreve em disco são alguns KB em $TMPDIR. Duração ~1 min.
 set -uo pipefail
 
@@ -79,9 +80,32 @@ n=$(($(cat "${STUB_PS_COUNT:?}" 2>/dev/null || echo 0) + 1)); echo "$n" >"$STUB_
 [ "${STUB_PS_AFTER:-fail}" = fail ] && exit 1
 printf '    1     0 %s 10-00:00:01 /sbin/launchd\n' "$(id -u)"
 EOF
-chmod +x "$T/stub-ps" "$T/stub-ps-seq" "$T/stub-aws"
+cat >"$T/stub-launchctl" <<'EOF'
+#!/bin/bash
+LOG="${STUB_LC_LOG:?}"
+case "${1:-}" in
+  submit) { echo "--- submit"; printf '%s\n' "$@"; } >>"$LOG"; [ "${STUB_LC_SUBMIT_FAIL:-0}" = 1 ] && exit 1; : >"$LOG.submitted"; exit 0 ;;
+  remove) echo "--- remove $*" >>"$LOG"; rm -f "$LOG.submitted"; exit 0 ;;
+  list)   echo "--- list $*" >>"$LOG"
+          [ "${STUB_LC_MODE:-}" = listfail ] && exit 1      # o próprio launchctl quebrado (rc 1), que NÃO é o "não conheço o rótulo" (113)
+          [ -f "$LOG.submitted" ] || exit 113
+          case "${STUB_LC_MODE:-alive}" in
+            alive) printf '{\n\t"LastExitStatus" = 0;\n\t"PID" = 4242;\n};\n' ;;
+            rc3)   printf '{\n\t"LastExitStatus" = 768;\n};\n' ;;
+            rc1)   printf '{\n\t"LastExitStatus" = 256;\n};\n' ;;
+            gone)  exit 113 ;;
+          esac
+          exit 0 ;;
+esac
+exit 64
+EOF
+chmod +x "$T/stub-ps" "$T/stub-ps-seq" "$T/stub-aws" "$T/stub-launchctl"
+"$(command -v python3)" -I -c '
+import plistlib, sys
+plistlib.dump({"Label": "fixture", "EnvironmentVariables": {"LANG": "pt_BR.UTF-8", "RFB_STREAM_WINDOW": "21-6", "RFB_STREAM_MEMORY_LIMIT": "2GB", "RFB_STREAM_RSS_CEILING_GIB": "4"}}, open(sys.argv[1], "wb"))' "$T/fixture.plist"
 mkdir -p "$T/tmp"
 
+NOW0=$(date +%s)
 ALLOW_RE='^bash [^ ]*/fakejob-A\.sh$'
 ALLOW_PRE='.*'
 
@@ -94,12 +118,13 @@ newcase() {  # cria um diretório de caso, exporta o ambiente do D2 e (opcional)
   CASE=$((CASE + 1)); C="$T/case$CASE"; mkdir -p "$C/city/.gc/logs"
   export D2_CITY="$C/city" D2_STATE="$C/state" D2_LOG="$C/log" D2_LOCK="$C/lock.d" D2_ALLOWLIST="$C/allow.tsv"
   # folgas generosas: o stub responde na hora, então não custam tempo; só evitam falso vermelho com a máquina em swap (load 36 medido em 01/11: S5 já falhou por timeout do S3)
-  export D2_TERM_GRACE_S=1 D2_KILL_WAIT_S=6 D2_S3_TIMEOUT_S=15 D2_MAX_MATCH=3
-  export D2_AWS_BIN="$T/stub-aws"
-  export STUB_AWS_FAIL=0 STUB_AWS_NONE=0 STUB_AWS_AMBIG=0
-  export TMPDIR="$T/tmp"
-  unset D2_FREE_MB D2_PS_BIN D2_DF_BIN D2_NOW D2_VOLUME D2_LOCKPS_BIN D2_LOCK_WAIT_S STUB_PS_FILE STUB_PS_COUNT STUB_PS_GOOD STUB_PS_AFTER
+  export D2_TERM_GRACE_S=1 D2_KILL_WAIT_S=6 D2_S3_TIMEOUT_S=15 D2_RESUME_WATCH_S=1 D2_MAX_MATCH=3
+  export D2_AWS_BIN="$T/stub-aws" D2_LAUNCHCTL_BIN="$T/stub-launchctl" D2_RFB_PLIST="$T/fixture.plist" D2_RFB_ROOT=/nonexistent-root D2_RFB_PYTHON=/nonexistent-python
+  export STUB_LC_LOG="$C/lc.log" STUB_LC_MODE=alive STUB_AWS_FAIL=0 STUB_AWS_NONE=0 STUB_AWS_AMBIG=0 STUB_LC_SUBMIT_FAIL=0
+  export TMPDIR="$T/tmp" D2_HOUR=23
+  unset D2_FREE_MB D2_PS_BIN D2_DF_BIN D2_NOW D2_VOLUME D2_LOCKPS_BIN D2_LOCK_WAIT_S STUB_PS_FILE STUB_PS_COUNT STUB_PS_GOOD STUB_PS_AFTER STUB_STATE_FAIL
   mk_allow "$D2_ALLOWLIST" "$ALLOW_RE" "$ALLOW_PRE" 3072 8000 21-6 3600
+  : >"$STUB_LC_LOG"
 }
 run_sut() {  # args → OUT (stdout), RC; confere que o stdout é UMA linha
   local n
@@ -112,6 +137,9 @@ spawn() {  # $1=script → JOBPID
   bash "$1" >/dev/null 2>&1 &
   JOBPID=$!; JOBS="$JOBS $JOBPID"; sleep 0.4
 }
+state_line() {  # $1=evento $2=pid $3=início $4=run_id $5=ts
+  printf '%s\t%s\tjoba\t%s\t%s\t%s\t5000\tfixture\n' "${5:-$NOW0}" "$1" "$2" "$3" "$4" >>"$D2_STATE"
+}
 stub_env_for_job() { export STUB_AWS_PID="$JOBPID" STUB_AWS_EPOCH="$(date +%s)"; }
 
 # ═════════════════ CENÁRIOS DE PARADA ═══════════════════════════════════════════════════════════════════════════════════════
@@ -119,7 +147,6 @@ s_usage() {
   newcase; run_sut; eq "S1 sem argumento: rc 2 (uso)" "$RC" 2
   run_sut --nada; eq "S1 argumento desconhecido: rc 2" "$RC" 2
   run_sut --run --dry-run; eq "S1 dois argumentos: rc 2" "$RC" 2
-  run_sut --resume; eq "S1 --resume ainda não existe (fatia 2/2): rc 2" "$RC" 2
   [ ! -e "$D2_LOG" ]; check $? "S1 uso errado não escreve no log de produção"
 }
 
@@ -140,9 +167,9 @@ s_stop_ok() {
   job_alive "$JOBPID"; [ $? -ne 0 ]; check $? "S5 o job MORREU (provado por ps)"
   has "S5 a linha nomeia job e pid" "$OUT" "joba (pid $JOBPID"
   has "S5 a linha traz o run_id lido do S3 (epoch-pid)" "$OUT" "-${JOBPID}"
-  has "S5 a linha diz como retomar à mão (com o run_id lido)" "$OUT" "--resume-run "
-  has "S5 ...e a partir de que livre" "$OUT" "-${JOBPID} quando livre >= 8000 MB"
+  has "S5 a linha diz como retomar" "$OUT" "--resume quando livre >= 8000 MB"
   local st; st=$(cat "$D2_STATE" 2>/dev/null)
+  case "$(printf '%s\n' "$st" | sed -n 2p | cut -f6)" in *-"$JOBPID") ;; *) [ "$QUIET" = 1 ] || echo "  (diag S5) estado: $st | log: $(cat "$D2_LOG" 2>/dev/null) | aws: $("$D2_AWS_BIN" s3 ls x 2>&1 | tr '\n' '/')" ;; esac
   eq "S5 o registro tem STOPPING e STOPPED" "$(printf '%s\n' "$st" | cut -f2 | tr '\n' ',')" "STOPPING,STOPPED,"
   has "S5 o STOPPED carrega pid e run_id" "$(printf '%s\n' "$st" | sed -n 2p)" "${TAB}${JOBPID}${TAB}"
   has "S5 o STOPPED carrega o run_id <epoch>-<pid>" "$(printf '%s\n' "$st" | sed -n 2p | cut -f6)" "-${JOBPID}"
@@ -156,7 +183,6 @@ s_stop_ambiguous() {
   run_sut --run
   eq "S5b dois run_ids casam pid+hora: ainda para (rc 0)" "$RC" 0
   eq "S5b ...mas o run_id fica '-': não adivinha" "$(sed -n 2p "$D2_STATE" | cut -f6)" "-"
-  has "S5b ...e a linha diz que o run_id NÃO foi lido" "$OUT" "run_id NÃO lido"
   reap
 }
 
@@ -164,8 +190,7 @@ s_stop_s3_down() {
   newcase; spawn "$T/fakejob-A.sh"; stub_env_for_job; export D2_FREE_MB=2500 STUB_AWS_FAIL=1
   run_sut --run
   eq "S5c S3 ilegível: emergência, para assim mesmo (rc 0)" "$RC" 0
-  eq "S5c ...run_id '-' (não adivinha)" "$(sed -n 2p "$D2_STATE" | cut -f6)" "-"
-  has "S5c ...e a linha diz que o run_id NÃO foi lido" "$OUT" "run_id NÃO lido"
+  eq "S5c ...run_id '-' (o --resume tenta de novo)" "$(sed -n 2p "$D2_STATE" | cut -f6)" "-"
   reap
 }
 
@@ -284,6 +309,7 @@ s_dry_run() {  # só diz; não escreve nada
   has "S3 a linha diz 'pararia'" "$OUT" "pararia joba (pid $JOBPID"
   job_alive "$JOBPID"; check $? "S3 o job segue vivo"
   [ ! -e "$D2_STATE" ] && [ ! -e "$D2_LOG" ] && [ ! -e "$D2_LOCK" ]; check $? "S3 --dry-run não criou estado, log nem trava"
+  [ ! -s "$STUB_LC_LOG" ]; check $? "S3 --dry-run não chamou o launchctl"
   export D2_FREE_MB=4000; run_sut --dry-run; eq "S3 --dry-run com o disco folgado: rc 10" "$RC" 10
   reap
 }
@@ -345,7 +371,159 @@ s_stop_unproven() {  # depois do TERM o ps quebra (fail) ou deixa de listar o pi
   done
 }
 
-SCENARIOS="s_usage s_dry_run s_real_allowlist s_real_df s_recheck_unreadable s_stop_unproven s_stop_guard s_stop_ok s_stop_ambiguous s_stop_s3_down s_stubborn s_parent_guard s_df_unreadable s_ps_unreadable s_broad_regex s_allowlist_invalid s_state_unwritable s_lock"
+SCENARIOS="s_usage s_dry_run s_real_allowlist s_real_df s_recheck_unreadable s_stop_unproven s_stop_guard s_stop_ok s_stop_ambiguous s_stop_s3_down s_stubborn s_parent_guard s_df_unreadable s_ps_unreadable s_broad_regex s_allowlist_invalid s_state_unwritable s_lock"   # (a lista final, com os r_*, é montada depois dos cenários de retomada)
+# ═════════════════ CENÁRIOS DE RETOMADA ═══════════════════════════════════════════════════════════════════════════════════
+RID_OK="1793502901-66632"
+r_nothing() { newcase; export D2_FREE_MB=9000; run_sut --resume; eq "R1 nada pendente: rc 10" "$RC" 10; }
+
+r_hysteresis() {
+  newcase; export D2_FREE_MB=6000; state_line STOPPED 66632 "$NOW0" "$RID_OK"
+  run_sut --resume
+  eq "R2 livre 6000 < 8000: rc 10 (adiado)" "$RC" 10
+  [ ! -s "$STUB_LC_LOG" ]; check $? "R2 o launchctl NÃO foi chamado"
+}
+
+r_window() {
+  newcase; export D2_FREE_MB=9000 D2_HOUR=14; state_line STOPPED 66632 "$NOW0" "$RID_OK"
+  run_sut --resume
+  eq "R3 fora da janela 21-6 (14h): rc 10" "$RC" 10
+  [ ! -s "$STUB_LC_LOG" ]; check $? "R3 o launchctl NÃO foi chamado"
+  export D2_HOUR=3; run_sut --resume; eq "R3 03h está na janela (21-6 vira a meia-noite): lança" "$RC" 0
+}
+
+r_launch_ok() {
+  newcase; export D2_FREE_MB=9000; state_line STOPPED 66632 "$NOW0" "$RID_OK"
+  run_sut --resume
+  eq "R4 disco ok + janela + run_id: rc 0 (retomou)" "$RC" 0
+  local lc; lc=$(cat "$STUB_LC_LOG")
+  has "R4 submit levou --resume-run" "$lc" "--resume-run"
+  has "R4 submit levou o run_id lido do registro" "$lc" "$RID_OK"
+  has "R4 submit chamou o rfb_stream_refresh.py" "$lc" "/nonexistent-root/scripts/rfb_stream_refresh.py"
+  has "R4 submit levou o teto de memória do plist (RFB_STREAM_MEMORY_LIMIT)" "$lc" "RFB_STREAM_MEMORY_LIMIT=2GB"
+  has "R4 submit levou o teto de RSS do plist" "$lc" "RFB_STREAM_RSS_CEILING_GIB=4"
+  has "R4 submit usa o job_timeout.sh (--soft)" "$lc" "job_timeout.sh"
+  eq "R4 o registro ganhou RESUME_STARTED" "$(tail -n 1 "$D2_STATE" | cut -f2)" "RESUME_STARTED"
+  run_sut --resume; eq "R14 depois de retomada não há mais pendente: rc 10" "$RC" 10
+}
+
+r_refused() {
+  newcase; export D2_FREE_MB=9000 STUB_LC_MODE=rc3; state_line STOPPED 66632 "$NOW0" "$RID_OK"
+  run_sut --resume
+  eq "R5 o job recusa (rc 3 NÃO RODEI): rc 10" "$RC" 10
+  eq "R5 o registro ganhou RESUME_REFUSED" "$(tail -n 1 "$D2_STATE" | cut -f2)" "RESUME_REFUSED"
+  export STUB_LC_MODE=alive; rm -f "$STUB_LC_LOG.submitted"; run_sut --resume
+  eq "R5 segue pendente: na próxima tentativa o job sobe (rc 0)" "$RC" 0
+}
+
+r_crash() {
+  newcase; export D2_FREE_MB=9000 STUB_LC_MODE=rc1; state_line STOPPED 66632 "$NOW0" "$RID_OK"
+  run_sut --resume
+  eq "R6 o job sai com rc 1 antes da vigia: rc 20" "$RC" 20
+  eq "R6 o registro ganhou RESUME_FAILED" "$(tail -n 1 "$D2_STATE" | cut -f2)" "RESUME_FAILED"
+  has "R6 a linha manda retomar à mão com o run_id" "$OUT" "$RID_OK"
+}
+
+r_no_guess() {  # run_id '-' e S3 ilegível: NÃO inventa
+  newcase; export D2_FREE_MB=9000 STUB_AWS_FAIL=1; state_line STOPPED 66632 "$NOW0" "-"
+  run_sut --resume
+  eq "R7 sem run_id e S3 ilegível: rc 30 (não adivinha)" "$RC" 30
+  [ ! -s "$STUB_LC_LOG" ]; check $? "R7 o launchctl NÃO foi chamado"
+  eq "R7 segue pendente" "$(tail -n 1 "$D2_STATE" | cut -f2)" "STOPPED"
+}
+
+r_derive() {  # run_id '-' mas o S3 acha: usa pid + hora de início do processo parado
+  newcase; export D2_FREE_MB=9000; export STUB_AWS_PID=66632 STUB_AWS_EPOCH=1793502901
+  state_line STOPPED 66632 1793502901 "-"
+  run_sut --resume
+  eq "R12 run_id achado no S3 (pid + hora): rc 0" "$RC" 0
+  has "R12 submit levou o run_id derivado" "$(cat "$STUB_LC_LOG")" "$RID_OK"
+}
+
+r_bad_rid() {
+  newcase; export D2_FREE_MB=9000; state_line STOPPED 66632 "$NOW0" "1793-5;touch $C/PWNED"
+  run_sut --resume
+  eq "R8 run_id com cara de comando: rc 10 (abandonado)" "$RC" 10
+  [ ! -e "$C/PWNED" ]; check $? "R8 nada foi executado"
+  hasnt "R8 o lixo não chegou ao launchctl" "$(cat "$STUB_LC_LOG")" "PWNED"
+  eq "R8 o registro ganhou ABANDONED" "$(tail -n 1 "$D2_STATE" | cut -f2)" "ABANDONED"
+}
+
+r_too_old() {
+  newcase; export D2_FREE_MB=9000; state_line STOPPED 66632 "$NOW0" "$RID_OK" "$((NOW0 - 7200))"
+  run_sut --resume
+  eq "R9 parado há 2 h > validade 1 h: rc 10 (abandonado)" "$RC" 10
+  [ ! -s "$STUB_LC_LOG" ]; check $? "R9 o launchctl NÃO foi chamado"
+  eq "R9 o registro ganhou ABANDONED" "$(tail -n 1 "$D2_STATE" | cut -f2)" "ABANDONED"
+}
+
+r_already_running() {
+  newcase; export D2_FREE_MB=9000; spawn "$T/fakejob-A.sh"; state_line STOPPED 66632 "$NOW0" "$RID_OK"
+  run_sut --resume
+  eq "R10 o job já voltou a rodar: rc 10 (abandonado)" "$RC" 10
+  [ ! -s "$STUB_LC_LOG" ]; check $? "R10 o launchctl NÃO foi chamado"
+  reap
+}
+
+r_plist_unreadable() {
+  newcase; export D2_FREE_MB=9000 D2_RFB_PLIST="$C/nao-existe.plist"; state_line STOPPED 66632 "$NOW0" "$RID_OK"
+  run_sut --resume
+  eq "R11 plist ilegível: rc 30 (não chuta o ambiente)" "$RC" 30
+  ! grep -q '^--- submit' "$STUB_LC_LOG"; check $? "R11 nenhum submit"
+}
+
+r_not_in_allowlist() {
+  newcase; export D2_FREE_MB=9000; state_line STOPPED 66632 "$NOW0" "$RID_OK"
+  sed -i.bak 's/joba/jobz/' "$D2_ALLOWLIST"
+  run_sut --resume
+  eq "R13 job que saiu da allowlist: rc 10 (abandonado)" "$RC" 10
+  [ ! -s "$STUB_LC_LOG" ]; check $? "R13 o launchctl NÃO foi chamado"
+}
+
+r_submit_fails() {
+  newcase; export D2_FREE_MB=9000 STUB_LC_SUBMIT_FAIL=1; state_line STOPPED 66632 "$NOW0" "$RID_OK"
+  run_sut --resume
+  eq "R15 launchctl submit falha: rc 20" "$RC" 20
+}
+
+r_lock() {  # mesmo contrato de trava do --run (S13): rc igual (10 x 30) não basta, a CAUSA na linha é o que distingue "outra instância" de "não consegui criar a trava"
+  newcase; export D2_FREE_MB=9000; state_line STOPPED 66632 "$NOW0" "$RID_OK"
+  mkdir -p "$D2_LOCK"; printf '%s' "$$" >"$D2_LOCK/pid"
+  run_sut --resume
+  eq "R16 trava com dono vivo: rc 10 (outra instância)" "$RC" 10; has "R16 ...e a linha diz 'outra instância'" "$OUT" "outra instância"
+  [ ! -s "$STUB_LC_LOG" ]; check $? "R16 o launchctl NÃO foi chamado"
+  eq "R16 segue pendente" "$(tail -n 1 "$D2_STATE" | cut -f2)" "STOPPED"
+  newcase; export D2_FREE_MB=9000; state_line STOPPED 66632 "$NOW0" "$RID_OK"
+  : >"$C/umarquivo"; export D2_LOCK="$C/umarquivo/lock.d"
+  run_sut --resume
+  eq "R17 trava que não dá para criar (erro de gravação): rc 30, não é 'outra instância'" "$RC" 30; has "R17 ...a causa na linha é a trava" "$OUT" "a trava"
+  hasnt "R17 ...e a linha não diz 'outra instância'" "$OUT" "outra instância"
+  [ ! -s "$STUB_LC_LOG" ]; check $? "R17 o launchctl NÃO foi chamado (sem trava, não retoma)"
+  eq "R17 segue pendente" "$(tail -n 1 "$D2_STATE" | cut -f2)" "STOPPED"
+}
+
+r_start_record() {  # o job subiu (rc 0) mas o RESUME_STARTED não gravou: o buraco no registro NÃO passa em silêncio (stdout e log)
+  newcase; export D2_FREE_MB=9000; state_line STOPPED 66632 "$NOW0" "$RID_OK"
+  chmod 444 "$D2_STATE"
+  ( : >>"$D2_STATE" ) 2>/dev/null; [ $? -ne 0 ]; check $? "R18 pré-condição: o registro está não gravável (rodando como root não vale)"
+  run_sut --resume
+  eq "R18 submit ok com o registro não gravável: rc 0 (o job subiu)" "$RC" 0
+  has "R18 o submit foi feito" "$(cat "$STUB_LC_LOG")" "--- submit"
+  has "R18 a linha traz ALERTA" "$OUT" "ALERTA"; has "R18 ...e nomeia o RESUME_STARTED que não gravou" "$OUT" "RESUME_STARTED"
+  has "R18 o log traz o ALERTA" "$(cat "$D2_LOG" 2>/dev/null)" "ALERTA"
+  eq "R18 o registro segue com o STOPPED (nada gravado)" "$(tail -n 1 "$D2_STATE" | cut -f2)" "STOPPED"
+  chmod 644 "$D2_STATE"
+}
+
+r_list_fails() {  # launchctl list quebrado (rc 1) != "o launchd não conhece o rótulo" (113): não sei se já há retomada viva, então NÃO lança outra por cima
+  newcase; export D2_FREE_MB=9000 STUB_LC_MODE=listfail; state_line STOPPED 66632 "$NOW0" "$RID_OK"
+  run_sut --resume
+  eq "R19 launchctl list quebrado: rc 30 (não sei se há retomada viva)" "$RC" 30; has "R19 ...a causa na linha é o launchctl list" "$OUT" "launchctl list"
+  ! grep -q '^--- submit' "$STUB_LC_LOG"; check $? "R19 nenhum submit"
+  eq "R19 segue pendente" "$(tail -n 1 "$D2_STATE" | cut -f2)" "STOPPED"
+}
+
+SCENARIOS="s_usage s_dry_run s_real_allowlist s_real_df s_recheck_unreadable s_stop_unproven s_stop_guard s_stop_ok s_stop_ambiguous s_stop_s3_down s_stubborn s_parent_guard s_df_unreadable s_ps_unreadable s_broad_regex s_allowlist_invalid s_state_unwritable s_lock
+r_nothing r_hysteresis r_window r_launch_ok r_refused r_crash r_no_guess r_derive r_bad_rid r_too_old r_already_running r_plist_unreadable r_not_in_allowlist r_submit_fails r_lock r_start_record r_list_fails"
 
 SUT="$REAL"
 echo "=== disk-recovery-d2-heavy-jobs.selftest.sh ==="
@@ -391,6 +569,13 @@ kill_mutant lockyoung     lockyoung     '      :      # MUT:lockyoung' s_lock
 kill_mutant killescalate  killescalate  '  :                   # MUT:killescalate' s_stubborn
 kill_mutant record        record        '      :      # MUT:record' s_stop_ok
 kill_mutant recordfirst   recordfirst   '    state_append STOPPING "$id" "$pid" "$start" - "$free" "x" || true      # MUT:recordfirst' s_state_unwritable
+kill_mutant hyst          hyst          '    if false; then      # MUT:hyst' r_hysteresis
+kill_mutant window        window        '    if false; then      # MUT:window' r_window
+kill_mutant noguess       noguess       '        rid="${start}-${pid}"; continue      # MUT:noguess' r_no_guess
+kill_mutant ridvalid      ridvalid      '    if false; then      # MUT:ridvalid' r_bad_rid
+kill_mutant resumelock    resumelock    '  acquire_lock || finish 10 "outra instância do D2 em execução ($LOCKD): saio sem agir"; lrc=0      # MUT:resumelock' r_lock
+kill_mutant startrecord   startrecord   '      0)  state_append RESUME_STARTED "$id" "$pid" "$start" "$rid" "$free" "$LAUNCH_MSG" || true      # MUT:startrecord' r_start_record
+kill_mutant listfail      listfail      '  :      # MUT:listfail' r_list_fails
 
 echo "=== resultado: $PASS passaram, $FAIL falharam ==="
 [ "$FAIL" -eq 0 ]
