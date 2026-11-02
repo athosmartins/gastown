@@ -4,47 +4,45 @@
 # ## Contents
 #   Why · What it does · Verdict and states · Safety · Not done on purpose · Seams · Usage
 #
-# WHY. gc.auto=0 and maintenance.auto=false are set on purpose (a 52-way detached auto-gc storm once filled the boot disk), so git never packs
-# loose objects by itself, and they grow without a ceiling. Measured 31/10 21:2x (Mayor): the live WhatsApp repo held 54,830 loose objects =
-# 2.47 GiB against 440 MiB packed. A manual `git repack -d` with lean settings took ~8 min at load ~50, did not raise swap and FREED 2,085 MB
-# (disk 4.0 -> 6.0 GB). The one job that packs loose objects today, ~/.gastown/scripts/git-maintenance-runner.sh (every 6h), does nothing below
-# 10 GB free — and this host lives at 3-6 GB (its log: 245 SKIPs against 640 runs; 4 of the last 6 cycles skipped). A repack gives disk back, so a
-# guard that waits for the disk to be comfortable blocks the cleanup exactly when it helps. That is the gap this job closes. The runner is not
-# versioned (it lives outside the repo) and is left alone.
+# WHY. gc.auto=0 and maintenance.auto=false are set on purpose (a 52-way detached auto-gc storm once filled the boot disk), so git never packs loose objects by itself and they grow without a ceiling. Measured 31/10 21:2x
+# (Mayor): the live WhatsApp repo held 54,830 loose objects = 2.47 GiB against 440 MiB packed; a manual lean `git repack -d` took ~8 min at load ~50, did not raise swap and FREED 2,085 MB (disk 4.0 -> 6.0 GB). The one job that
+# packs loose objects today, ~/.gastown/scripts/git-maintenance-runner.sh (every 6h; not versioned, left alone), does nothing below 10 GB free — and this host lives at 3-6 GB (its log: 245 SKIPs against 640 runs; 4 of the
+# last 6 cycles skipped). A repack gives disk back, so a guard that waits for the disk to be comfortable blocks the cleanup exactly when it helps. That is the gap this job closes.
 #
-# WHAT IT DOES. Every order tick (30 min) the script reads the clock; outside the night window it ends at once, with one stdout line and no log line. Inside it, for each repo
-# of the list it reads `git count-objects -v` and, when the LOOSE bytes are over the limit (GLR_LIMIT_KIB, 256 MiB — the number
-# jsonl-archive-compact.sh already uses; the bead said 512 as "ex.", and ~/gt holds 430 MiB), runs ONE incremental repack:
+# WHAT IT DOES. Every order tick (30 min) the script reads the clock; outside the night window it ends at once (one stdout line, no log line). Inside it, for each repo of the list it reads `git count-objects -v` and, when the
+# LOOSE bytes are over the limit (GLR_LIMIT_KIB, 256 MiB — the number jsonl-archive-compact.sh already uses; the bead said 512 as "ex.", and ~/gt holds 430 MiB), runs ONE incremental repack:
 #     nice -n 10 git -C <repo> -c pack.threads=1 -c pack.windowMemory=100m -c pack.deltaCacheSize=32m repack -d -q
-# through heavy-guard.sh (the 6 GB disk floor), under a watchdog (below). The repo list is: ~/gt, every ~/gt/<rig>/ and every ~/gt/<rig>/crew/<name>/ that has a
-# real .git DIRECTORY (a git worktree has a .git FILE and shares its parent's objects, so it is skipped). Measured 31/10: only the WA repo (674 MiB) and
-# ~/gt (430 MiB) are over the limit; the 13 crew clones hold <= 4 MiB loose each, so they cost one count each and nothing else.
+# through heavy-guard.sh (the 6 GB disk floor), under a watchdog (below). The repo list: ~/gt, every ~/gt/<rig>/ and every ~/gt/<rig>/crew/<name>/ with a real .git DIRECTORY (a worktree has a .git FILE and shares its parent's
+# objects: skipped). Measured 31/10: only the WA repo (674 MiB) and ~/gt (430 MiB) are over the limit; the 13 crew clones hold <= 4 MiB loose each, so they cost one count each and nothing else.
 #
 # VERDICT AND STATES. Each tick that did something ends with ONE line: `VEREDITO: OK|ADIADO|FALHOU — ...`, and the log keeps it.
 #   OK       below      the loose bytes are not over the limit — nothing was done
 #            repacked   the repack ended 0 and the count AFTER is under the limit; the line carries before -> after (objects, MiB) and the free disk before -> after
 #   ADIADO   deferred-disk  heavy-guard refused (rc 75/76), the room estimate says no, or the free disk cannot be read
-#            deferred-swap  swap in use is over GLR_SWAP_START_MAX_MB, or cannot be read
+#            deferred-swap  swap in use is AT or over GLR_SWAP_START_MAX_MB, or cannot be read
 #            deferred-time  this run's budget (GLR_DEADLINE_S) is spent; the next tick continues with the repos left
 #            A deferral is not a failure and not an OK: it is retried on the next tick of the SAME night, and a repo that ends GLR_ALARM_NIGHTS (3) nights in a row
 #            deferred makes the first tick of the next night notify (priority 3) — without that, "wait for the next night" could repeat for weeks, unseen.
 #   FALHOU   unreadable   `git count-objects -v` failed, timed out, or printed no numeric count/size — the script does NOT measure, does NOT act, and says so
-#            failed / timeout   the repack ended non-zero / was cut at GLR_REPACK_TIMEOUT_S
+#            failed / timeout   the repack ended non-zero / was cut at its budget (rc 124) / ended rc 137 (SIGKILL: the 30 s grace after the budget ran out, or something killed it from outside, e.g. the OOM killer)
 #            interrupted  the watchdog stopped the repack (free disk under the Dolt CRITICAL class, free disk unreadable 3 polls in a row, or swap grew > GLR_SWAP_GROW_MAX_MB)
-#            stalled      the repack ended 0 but the loose bytes are STILL over the limit
+#            stalled      the repack ended 0 but the loose bytes are STILL over the limit — most often UNREACHABLE loose objects, which `repack -d` neither packs nor prunes (see KNOWN LIMIT); the message says so
 #            unverified   the repack ended 0 but the count after cannot be read — "probably fine" is not "OK"
-#            Every FALHOU is terminal for the night (the heavy step is not repeated every 30 min) and sends `notify -p 4 "... job falhou ..."`. Exit code 1.
+#            Every FALHOU of a repo is terminal for the night (the heavy step is not repeated every 30 min — while the state dir is writable: a save that fails is only a WARN) and sends `notify -p 4` titled
+#            "job falhou (<repo>)", one title per repo since notify drops a push whose title equals one sent < 30 min ago. Exit code 1. A failure of the JOB (config, window lib, the lock) is FALHOU with rc 2, titled "(setup)": it ends that tick only.
 #   A repo already settled tonight (any state above except deferred-*) is skipped by the later ticks (a tick where every repo is settled logs nothing). "Tonight" is the LOCAL date of the tick.
 #   "In a row" counts the nights on which the job ran and saw the repo: a night the machine was off breaks nothing and adds nothing.
 #
 # SAFETY.
-#   - Window: jaw_window_open from jsonl-archive-repack-window-lib.sh — a run may START between 00:00 and 04:59 local (the heavy-maintenance window Athos set on 15/10 is 00:00-06:00, and the last start is
-#     an hour before its end) — the same lib the jsonl-archive uses, so the two cannot disagree. A clock that cannot be read is "closed". A repack's time limit is also cut to the window's end
-#     (jaw_window_left_s, less GLR_WINDOW_MARGIN_S 300 s): one that would not end by 06:00 is not started (deferred-time), and one still running then is stopped. If the lib cannot be loaded
-#     the job fails (rc 2 + notify): a missing gate must never read as "no gate".
+#   - Window: jaw_window_open from jsonl-archive-repack-window-lib.sh — a run may START between 00:00 and 04:59 local (the heavy-maintenance window Athos set on 15/10 is 00:00-06:00, the last start an hour before its end), the same
+#     lib the jsonl-archive uses, so the two cannot disagree. A clock that cannot be read is "closed". A repack's time limit is also cut to the window's end (jaw_window_left_s, less GLR_WINDOW_MARGIN_S 300 s): one that would not
+#     end by 06:00 is not started (deferred-time), and one still running then is stopped. If the lib cannot be loaded the job fails (rc 2 + notify): a missing gate must never read as "no gate".
 #   - ONE repacker at a time: the script takes the SAME lock directory as git-maintenance-runner.sh (/tmp/git-maintenance-runner.lock, mkdir, stale after 120 min), so the 6-hourly runner and
 #     this job never repack together. The run's whole budget (GLR_DEADLINE_S 6000 s = 100 min) is below that stale age, so the runner cannot reclaim a live lock. If the runner's lock path
-#     changes, GLR_LOCK must follow.
+#     changes, GLR_LOCK must follow. Three answers, never merged: TAKEN / HELD by a live run (a DIRECTORY younger than the stale age, also one that appears right after our rmdir of a stale one: exit 0) / COULD NOT BE TAKEN
+#     (a missing parent, no space or permission, a file in the way, an unreadable age, a stale lock rmdir cannot remove): FALHOU, rc 2 — nobody holds it, so "another run holds it" would be false and the night's repack would silently not happen.
+#   - Notify: failures go out with NOTIFY_FORCE_PUSH=1 NOTIFY_STRICT_EXIT=1 (notify's contract: otherwise every path that did not push exits 0 and an unknown source lands in the muted digest) and the rc is read: 10 = held until 07:00
+#     (quiet hours; this job runs 00:00-04:59), 11 = deduplicated, anything else but 0 is logged `WARN: notify NOT delivered (rc=N)`. A delivery that failed changes nothing else: verdict, state and exit code are the job's own.
 #   - Room: the repack writes a new pack before the loose copies go. The pack is ~0.18x of the loose bytes in the one measurement we have (2.47 GiB -> ~450 MB), so the estimate is
 #     GLR_PEAK_PCT (50) % of the loose bytes, and the start needs free - estimate >= (Dolt CRITICAL floor + 1) GiB, the rule jsonl-archive-compact.sh uses (ga-q8z86s: dolt-disk-floor-guard calls the
 #     disk critical at <= 3 GiB free, rounded down). Free disk that cannot be read = deferred, never "enough".
@@ -52,11 +50,12 @@
 #     own tmp_pack on TERM; KILL only after a grace) when the free disk falls under (CRITICAL + 1) GiB, when the free disk cannot be read 3 polls in a row, or when swap in use grew by more than
 #     GLR_SWAP_GROW_MAX_MB since the start. A single unreadable swap poll is ignored (the disk poll is the effective guard); an unreadable swap AT THE START defers the repo.
 #     DEFAULTS CHOSEN WITHOUT A MEASUREMENT OF THIS JOB: GLR_SWAP_START_MAX_MB (8192), GLR_SWAP_GROW_MAX_MB (1024), GLR_PEAK_PCT (50). The manual run of 31/10 saw no swap growth.
-#   - Every git/notify call is bounded by `timeout`. This script deletes nothing: the only removal is `rmdir` of its own lock.
+#   - Every git/notify call is bounded by `timeout`. This script deletes nothing of the repos'; the only removals are `rmdir` of its own lock and of a stale lock it reclaims (rmdir takes an empty directory only).
 #
 # NOT DONE ON PURPOSE (the bead): `gc --aggressive`, `repack -a`/`-A`/`-f`, `prune`, `--cruft`. The selftest fails if one of them appears in the repack command. History is never shortened.
-# KNOWN LIMIT: with the disk at 3-5 GB at night (the runner's log shows it) the 6 GB floor defers the repack. The alarm above makes that visible; a smaller-batch road for a tight disk
-# (like ga-ft1iv6's for the jsonl archive) is the follow-up if the deferrals pile up.
+# KNOWN LIMIT: with the disk at 3-5 GB at night (the runner's log shows it) the 6 GB floor defers the repack; the alarm above makes that visible, and a smaller-batch road for a tight disk (like ga-ft1iv6's for the jsonl archive) is the follow-up.
+# KNOWN LIMIT: `repack -d` packs only REACHABLE loose objects: a repo whose UNREACHABLE loose objects alone exceed the limit ends every night `stalled` (FALHOU) after a healthy repack (the message names the likely cause);
+# `git prune`, which clears them, is never run here. The 31/10 measurement (2.47 GiB loose -> ~450 MB pack) says the WhatsApp repo was almost all reachable then.
 #
 # SEAMS (tests; every one has a default): GLR_ROOT GLR_REPOS GLR_LIMIT_KIB GLR_COUNT_TIMEOUT_S GLR_REPACK_TIMEOUT_S GLR_DEADLINE_S GLR_PEAK_PCT GLR_SWAP_START_MAX_MB GLR_SWAP_GROW_MAX_MB GLR_WATCH_SECS
 # GLR_ALARM_NIGHTS GLR_WINDOW_MARGIN_S GLR_LOCK GLR_LOCK_STALE_MIN GLR_STATE_DIR GLR_LOG GLR_GIT GLR_HEAVY_GUARD GLR_NOTIFY GLR_TIMEOUT GLR_SYSCTL GLR_TODAY GLR_FREE_KIB_CMD GLR_SWAP_MB_CMD, JAW_HOUR / JAW_FREE_KIB (the lib's).
@@ -108,19 +107,28 @@ say() {
   return 0
 }
 
-notify_send() { # notify_send <priority> <title> <text>
+notify_send() { # notify_send <priority> <title> <text> — never fails the job; what became of the push goes to the log
+  local rc
   # vazio → no notify binary: say so in the log (the verdict line is there anyway); falhou → the same, the job's own result does not change
   if [ ! -x "$NOTIFY" ]; then say "WARN: notify not executable ($NOTIFY) — not sent: $2: $3"; return 0; fi
-  "$TIMEOUT_BIN" -k 5 30 "$NOTIFY" -t "$2" -p "$1" "$3" >/dev/null 2>&1 || say "WARN: notify failed (rc=$?): $2"
+  # notify's contract (whatsapp_automation/scripts/notify, policy_exit): by default EVERY path that did not push exits 0 ("rc 0" never says "arrived") and an unknown source goes to the muted digest; with FORCE_PUSH + STRICT_EXIT
+  # (what the pack's must-arrive alarms use) the rc says what happened: 0 pushed · 10 held until 07:00 (quiet hours, pushed then) · 11 same TITLE sent < 30 min ago · 12 digest / push cap · 1 failed.
+  # vazio → n/a, an exit code is never empty; falhou → anything but 0/10/11 (the timeout's 124/137 included) is logged NOT delivered — in every case the job's own result is unchanged
+  NOTIFY_FORCE_PUSH=1 NOTIFY_STRICT_EXIT=1 "$TIMEOUT_BIN" -k 5 30 "$NOTIFY" -t "$2" -p "$1" "$3" >/dev/null 2>&1; rc=$?
+  case "$rc" in 0) ;; 10) say "notify held until 07:00 (quiet hours; pushed then): $2" ;; 11) say "notify deduplicated (same title sent < 30 min ago): $2" ;; *) say "WARN: notify NOT delivered (rc=$rc): $2" ;; esac
   return 0
 }
 
 mib() { echo $(( $1 / 1024 )); }
 gib1() { awk -v k="$1" 'BEGIN{printf "%.1f", k/1048576}'; }
 
+# repo_label <repo> — what tells one failing repo from another in a notify TITLE (a push whose title equals one sent < 30 min ago is dropped): the path under ROOT, "gt" for ROOT itself, else the whole path
+repo_label() { local rel; rel=${1#"$ROOT"/}
+  case "$1" in "$ROOT") echo "${ROOT##*/}" ;; "$ROOT"/*) echo "$rel" ;; *) echo "$1" ;; esac; }
+
 setup_fail() { # setup_fail <what> — the job cannot run: a failure, never a silent "nothing to do"
   say "VEREDITO: FALHOU — $1"
-  if [ -n "$TIMEOUT_BIN" ]; then notify_send 4 "git-loose-repack: job falhou" "$1 (ver $LOG)"; fi
+  if [ -n "$TIMEOUT_BIN" ]; then notify_send 4 "git-loose-repack: job falhou (setup)" "$1 (ver $LOG)"; fi
   exit 2
 }
 
@@ -208,7 +216,7 @@ state_load() {
   local f="$STATE_DIR/$(slugify "$1")" line d s b r
   P_DATE=""; P_STATUS=""; P_BASE=0; P_REASON=""
   [ -f "$f" ] || return 0
-  # vazio → an empty/corrupt file is "no previous state" (the streak restarts, a repo may be measured once more — harmless); falhou → the same, with a WARN
+  # vazio → an empty/corrupt file is "no previous state" (the streak restarts and a repo settled tonight is looked at again, repack included — the run's own guards still bound it); falhou → the same, with a WARN
   line="$(head -n 1 "$f" 2>/dev/null)"
   IFS='|' read -r d s b r <<EOF
 $line
@@ -238,7 +246,7 @@ finish() { # finish <repo> <status> <text>
   RES_REPO+=("$repo"); RES_STATUS+=("$st"); RES_TEXT+=("$text")
   if is_failure "$st"; then
     N_FAIL=$((N_FAIL + 1))
-    notify_send 4 "git-loose-repack: job falhou" "$repo: $st — $text (ver $LOG)"
+    notify_send 4 "git-loose-repack: job falhou ($(repo_label "$repo"))" "$repo: $st — $text (ver $LOG)"
   elif is_deferral "$st"; then N_DEF=$((N_DEF + 1))
   elif [ "$st" = below ]; then N_BELOW=$((N_BELOW + 1)); N_OK=$((N_OK + 1))
   else N_OK=$((N_OK + 1)); fi
@@ -252,11 +260,10 @@ stop_tree() { # stop_tree <pid> — TERM (git cleans its tmp_pack), then KILL af
 }
 
 REPACK_RC=0; REPACK_STOP=""; REPACK_PID=""
-run_repack() { # run_repack <repo> <budget_s> — the repack under heavy-guard, with the watchdog
-  local repo="$1" budget="$2" pid free bad=0 swap0 swap stop_floor
+run_repack() { # run_repack <repo> <budget_s> <swap_mb_at_start> (process_repo's checked reading: a second read could fail and switch the swap watchdog off in silence) — the repack under heavy-guard, with the watchdog
+  local repo="$1" budget="$2" swap0="$3" pid free bad=0 swap stop_floor
   stop_floor=$(( (CRITICAL_GB + 1) * KIB_PER_GIB ))
   REPACK_STOP=""
-  swap0="$(swap_used_mb)" || swap0=""
   "$TIMEOUT_BIN" -k 30 "$budget" "$HEAVY_GUARD" --what git-loose-repack -- \
     nice -n 10 "$GIT" -C "$repo" -c pack.threads=1 -c pack.windowMemory=100m -c pack.deltaCacheSize=32m repack -d -q >> "$LOG" 2>&1 &
   pid=$!; REPACK_PID="$pid"
@@ -293,7 +300,7 @@ process_repo() {
       BASE=$((P_BASE + 1))
       if [ "$BASE" -ge "$ALARM_NIGHTS" ]; then
         say "ALARM: $repo ended $BASE nights in a row deferred (last: $P_STATUS — $P_REASON)"
-        notify_send 3 "git-loose-repack: $BASE noites sem repack" "$repo: $BASE noites seguidas adiado ($P_STATUS — $P_REASON). Os soltos seguem crescendo. Ver $LOG"
+        notify_send 3 "git-loose-repack: $BASE noites sem repack ($(repo_label "$repo"))" "$repo: $BASE noites seguidas adiado ($P_STATUS — $P_REASON). Os soltos seguem crescendo. Ver $LOG"
       fi
     fi
   fi
@@ -325,13 +332,14 @@ process_repo() {
 
   free0="$free"; t0=$(date +%s)
   say "repo=$repo repacking: loose=$objs objs $(mib "$kib") MiB, free $(gib1 "$free0") GiB, swap ${swap} MB, budget ${budget}s"
-  run_repack "$repo" "$budget"
+  run_repack "$repo" "$budget" "$swap"
   t1=$(date +%s)
 
   if [ -n "$REPACK_STOP" ]; then finish "$repo" interrupted "watchdog stopped the repack after $((t1 - t0))s: $REPACK_STOP"; return 0; fi
   case "$REPACK_RC" in
     75|76) finish "$repo" deferred-disk "heavy-guard refused (rc=$REPACK_RC): the disk is under its floor or cannot be read"; return 0 ;;
-    124|137) finish "$repo" timeout "the repack was cut at ${budget}s (rc=$REPACK_RC)"; return 0 ;;
+    124) finish "$repo" timeout "the repack was cut at the ${budget}s budget (rc=124)"; return 0 ;;
+    137) finish "$repo" timeout "the repack ended rc=137 (SIGKILL): the ${budget}s budget plus its 30 s grace ran out, or something killed it from outside (the OOM killer, a manual kill)"; return 0 ;;
     0) ;;
     *) finish "$repo" failed "git repack ended rc=$REPACK_RC after $((t1 - t0))s (see $LOG)"; return 0 ;;
   esac
@@ -343,7 +351,7 @@ process_repo() {
   fi
   objs2="$CNT_OBJS"; kib2="$CNT_KIB"
   if [ "$kib2" -gt "$LIMIT_KIB" ]; then
-    finish "$repo" stalled "repack ended 0 but loose is STILL $objs2 objs $(mib "$kib2") MiB (limit $(mib "$LIMIT_KIB") MiB); before: $objs objs $(mib "$kib") MiB"; return 0
+    finish "$repo" stalled "repack ended 0 but loose is STILL $objs2 objs $(mib "$kib2") MiB (limit $(mib "$LIMIT_KIB") MiB); before: $objs objs $(mib "$kib") MiB; likely unreachable loose objects (repack -d neither packs nor prunes them, and this job never prunes): check git fsck --unreachable"; return 0
   fi
   finish "$repo" repacked "loose $objs -> $objs2 objs, $(mib "$kib") -> $(mib "$kib2") MiB; free $(gib1 "$free0") -> $free1_txt GiB; $((t1 - t0))s"
 }
@@ -363,7 +371,7 @@ verdict() {
 dry_run() {
   local repo objs kib
   echo "git-loose-repack --dry-run: limit $(mib "$LIMIT_KIB") MiB; read-only (no window, no lock, no state, no repack)"
-  while IFS= read -r repo; do
+  while IFS= read -r repo <&3; do   # fd 3, not stdin: nothing run inside the loop can swallow the repos that follow
     [ -n "$repo" ] || continue
     if count_loose "$repo"; then
       objs="$CNT_OBJS"; kib="$CNT_KIB"
@@ -371,7 +379,7 @@ dry_run() {
     else
       echo "  UNREADABLE $repo  $COUNT_ERR"
     fi
-  done <<EOF
+  done 3<<EOF
 $(repo_list)
 EOF
   exit 0
@@ -386,15 +394,29 @@ if ! jaw_window_open; then echo "git-loose-repack: $JAW_REASON — nothing to do
 TONIGHT="${GLR_TODAY:-$(date +%F 2>/dev/null)}"
 [ -n "$TONIGHT" ] || setup_fail "the local date cannot be read"
 
-# single flight, shared with git-maintenance-runner.sh (mkdir is atomic). A lock older than LOCK_STALE_MIN is a dead run's.
-if ! mkdir "$LOCK" 2>/dev/null; then
-  # vazio → find printed nothing: the lock counts as fresh (in flight), never as stale; falhou → the same
-  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +"$LOCK_STALE_MIN" 2>/dev/null)" ]; then
-    say "stale lock (> ${LOCK_STALE_MIN} min) — reclaiming"; rmdir "$LOCK" 2>/dev/null
-    mkdir "$LOCK" 2>/dev/null || { echo "git-loose-repack: lock contended after reclaim — exit"; exit 0; }
-  else
-    echo "git-loose-repack: another git maintenance run holds $LOCK — exit (single flight)"; exit 0
+# single flight, shared with git-maintenance-runner.sh (mkdir is atomic). Three answers, never merged: TAKEN / HELD by a live run (exit 0) / COULD NOT BE TAKEN (FALHOU: nobody holds it, the night's repack did not run). "Held" is only a
+# DIRECTORY younger than LOCK_STALE_MIN (an older one is a dead run's: reclaimed); a missing path, a file in the way, an unreadable age or a stale lock that cannot be removed are failures — "another run holds it" would be false there.
+lock_state() { # what is at $LOCK, as one word: nothing | notdir | fresh | stale | unknown
+  local aged
+  [ -e "$LOCK" ] || [ -L "$LOCK" ] || { echo nothing; return 0; }
+  if [ ! -d "$LOCK" ] || [ -L "$LOCK" ]; then echo notdir; return 0; fi
+  # vazio → find printed nothing: younger than LOCK_STALE_MIN (fresh = a run in flight); falhou → rc != 0: the age is UNKNOWN, never "fresh"
+  if ! aged="$(find "$LOCK" -maxdepth 0 -mmin +"$LOCK_STALE_MIN" 2>/dev/null)"; then echo unknown; return 0; fi
+  if [ -n "$aged" ]; then echo stale; else echo fresh; fi
+}
+# vazio → mkdir said nothing; falhou → the rc decides, the text only explains a failure in the log
+if ! LOCK_ERR="$(mkdir "$LOCK" 2>&1)"; then
+  LOCK_AT="$(lock_state)"
+  if [ "$LOCK_AT" = stale ]; then
+    say "stale lock (> ${LOCK_STALE_MIN} min) — reclaiming"
+    rmdir "$LOCK" 2>/dev/null   # its rc is not read: the mkdir after it is the test (a directory rmdir cannot remove makes it fail)
+    if LOCK_ERR="$(mkdir "$LOCK" 2>&1)"; then LOCK_AT=taken; else LOCK_AT="$(lock_state)"; fi   # a FRESH directory now = a live run took it right after our rmdir
   fi
+  case "$LOCK_AT" in
+    taken) ;;
+    fresh) echo "git-loose-repack: another git maintenance run holds $LOCK — exit (single flight)"; exit 0 ;;
+    *) setup_fail "cannot take the lock $LOCK (state: $LOCK_AT; mkdir said: ${LOCK_ERR:-nothing}) — nothing holds it, so the night's repack did not run" ;;
+  esac
 fi
 trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 
@@ -402,7 +424,7 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 on_signal() { # on_signal <name> <exit code>
   if [ -n "$REPACK_PID" ] && kill -0 "$REPACK_PID" 2>/dev/null; then stop_tree "$REPACK_PID"; fi
   say "VEREDITO: FALHOU — the run was ended by $1 while working; a repack in flight was stopped; nothing is settled for tonight"
-  notify_send 4 "git-loose-repack: job falhou" "a execução foi encerrada por $1 no meio do trabalho (ver $LOG)"
+  notify_send 4 "git-loose-repack: job falhou (encerrado por $1)" "a execução foi encerrada por $1 no meio do trabalho (ver $LOG)"
   exit "$2"
 }
 trap 'on_signal TERM 143' TERM
@@ -410,14 +432,15 @@ trap 'on_signal INT 130' INT
 trap 'on_signal HUP 129' HUP
 
 RUN_T0=$(date +%s)
-while IFS= read -r _repo; do
+# the list is read on fd 3, not stdin: nothing run inside the loop (git, notify, heavy-guard) can swallow the repos that follow
+while IFS= read -r _repo <&3; do
   [ -n "$_repo" ] || continue
   process_repo "$_repo"
-done <<EOF
+done 3<<EOF
 $(repo_list)
 EOF
 
-if [ "${#RES_REPO[@]}" -eq 0 ]; then say "VEREDITO: FALHOU — the repo list is EMPTY (ROOT=$ROOT, GLR_REPOS='${REPOS_OVERRIDE}'): nothing was measured"; notify_send 4 "git-loose-repack: job falhou" "lista de repos vazia (ROOT=$ROOT) — nada foi medido. Ver $LOG"; exit 1; fi
+if [ "${#RES_REPO[@]}" -eq 0 ]; then say "VEREDITO: FALHOU — the repo list is EMPTY (ROOT=$ROOT, GLR_REPOS='${REPOS_OVERRIDE}'): nothing was measured"; notify_send 4 "git-loose-repack: job falhou (lista de repos vazia)" "lista de repos vazia (ROOT=$ROOT) — nada foi medido. Ver $LOG"; exit 1; fi
 # a tick whose every repo was already settled has nothing new to say
 if [ "$N_DONE" -eq "${#RES_REPO[@]}" ]; then exit 0; fi
 verdict

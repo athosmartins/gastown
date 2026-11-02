@@ -2,7 +2,7 @@
 # git-loose-repack.selftest.sh (ga-pmu761v) — git-loose-repack.sh, its order file, and the incident it exists for, against REAL throwaway git repos.
 #
 # ## Contents
-#   fixtures · stubs · cases t_* (S1..S21) · order/static checks · mutants (each must make a named case FAIL)
+#   fixtures · stubs · cases t_* (S1..S23) · order/static checks · mutants (each must make a named case FAIL)
 #
 # Hermetic: every repo, state file, log, lock, the heavy-guard stub, the notify stub and the git wrapper live under one temp dir. The real repos, state, log, lock and notify are never touched
 # (GLR_* seams). Repos hold ~16KB blobs and use a limit of 100 KiB, so the same paths run in seconds that run on GiB in production. The free-disk and swap readings are SCRIPTED per reading
@@ -75,7 +75,10 @@ exec "$@"
 EOF
 cat > "$WORK/bin/notify-stub" <<'EOF'
 #!/bin/bash
-echo "$*" >> "$GLR_CASE/notify.log"
+# stand-in for the real notify: logs its arguments AND the two env switches its contract turns on, exits $NOTIFY_STUB_RC (default 0); NOTIFY_STUB_STDIN=1 makes it read its stdin to the end
+[ "${NOTIFY_STUB_STDIN:-0}" = 1 ] && cat >/dev/null
+echo "$* FORCE=${NOTIFY_FORCE_PUSH:-} STRICT=${NOTIFY_STRICT_EXIT:-}" >> "$GLR_CASE/notify.log"
+exit "${NOTIFY_STUB_RC:-0}"
 EOF
 cat > "$WORK/bin/gitw" <<'EOF'
 #!/bin/bash
@@ -87,6 +90,7 @@ bump() { local n; n="$(cat "$GLR_CASE/$1.n" 2>/dev/null || echo 0)"; n=$((n+1));
 case "$verb" in
   count-objects)
     n="$(bump count)"
+    [ "${GITW_STDIN:-0}" = 1 ] && cat >/dev/null     # a git that reads its stdin to the end: it must not be able to eat the script's list of repos
     [ -n "${GITW_COUNT_SLEEP:-}" ] && sleep "$GITW_COUNT_SLEEP"
     [ "${GITW_COUNT_FAIL:-0}" = 1 ] && { echo "fatal: simulated failure" >&2; exit 1; }
     [ -n "${GITW_COUNT_FAIL_NTH:-}" ] && [ "$n" = "$GITW_COUNT_FAIL_NTH" ] && { echo "fatal: simulated failure #$n" >&2; exit 1; }
@@ -141,7 +145,7 @@ mkenv() {
     GLR_HEAVY_GUARD="$WORK/bin/hg-stub" GLR_NOTIFY="$WORK/bin/notify-stub" GLR_GIT="$WORK/bin/gitw"
     GLR_FREE_KIB_CMD="$WORK/bin/freecmd" GLR_SWAP_MB_CMD="$WORK/bin/swapcmd" GLR_WATCH_SECS=0.2 GLR_TODAY=2026-10-31 HG_MODE=pass)
 }
-envrun() { mkenv; env "${ENVV[@]}" "$@" /bin/bash "$SCRIPT" ${ARGS:-}; }
+envrun() { mkenv; env "${ENVV[@]}" "$@" /bin/bash "$SCRIPT" ${ARGS:-} < /dev/null; }
 run() { OUT="$(envrun "$@" 2>&1)"; RC=$?; }
 
 contains() { printf '%s' "$1" | grep -qF -- "$2"; }
@@ -152,6 +156,7 @@ count_in() { local n; n="$(grep -cF -- "$2" "$1" 2>/dev/null)"; echo "${n:-0}"; 
 repack_calls() { count_in "$CASE/git.args" " repack "; }
 hg_calls()     { count_in "$CASE/hg.args" "--what"; }
 state_of()     { cat "$CASE"/state/* 2>/dev/null | head -n 1; }
+notify_titles() { sed -n 's/^-t \(.*\) -p [0-9] .*/\1/p' "$CASE/notify.log" 2>/dev/null | sort -u | wc -l | tr -d ' '; }   # how many DIFFERENT titles notify was called with
 # chk <what> <command...> | chk <what> '<condition string>' — PASS when it succeeds (a 2-argument call is evaluated as a shell condition, so && works inside it); the tail of OUT is shown on failure
 chk() {
   local d="$1" r; shift
@@ -164,16 +169,12 @@ rc_is() { [ "$RC" = "$1" ]; }
 # S1. the limit is STRICT: loose bytes AT the limit are not over it; one byte over repacks; the repack ends with the loose objects packed
 t_limit() {
   newcase; repo8; run GLR_LIMIT_KIB="$K8"
-  chk "S1 loose == limit ($K8 KiB): not over → no repack, VEREDITO: OK" test "$(repack_calls)" = 0 -a "$RC" = 0
-  chk "S1 …and the verdict says OK, state below" contains "$OUT" "VEREDITO: OK"
+  chk "S1 loose == limit ($K8 KiB): not over → no repack, VEREDITO: OK" 'test "$(repack_calls)" = 0 -a "$RC" = 0 && contains "$OUT" "VEREDITO: OK"'
   case "$(state_of)" in *"|below|"*) ok "S1 state file: below" ;; *) bad "S1 state not 'below': $(state_of)" ;; esac
   newcase; repo8; run GLR_LIMIT_KIB=$((K8 + 1000))
   chk "S1 loose under the limit: no repack" test "$(repack_calls)" = 0
   newcase; repo8; local before; before="$(loose_cnt "$CASE/repo")"; run GLR_LIMIT_KIB=$((K8 - 1))
-  chk "S1 loose one KiB over the limit: exactly one repack" test "$(repack_calls)" = 1
-  chk "S1 …and the loose objects are packed (count 0 after, $before before)" test "$(loose_cnt "$CASE/repo")" = 0
-  chk "S1 …VEREDITO: OK, rc 0" contains "$OUT" "VEREDITO: OK"
-  chk "S1 …the log line carries before -> after (objects and MiB)" fcontains "$CASE/log" "loose $before -> 0 objs"
+  chk "S1 loose one KiB over the limit: exactly one repack, the loose objects packed (0 after, $before before), VEREDITO: OK, the log line carries before -> after" 'test "$(repack_calls)" = 1 && test "$(loose_cnt "$CASE/repo")" = 0 && contains "$OUT" "VEREDITO: OK" && fcontains "$CASE/log" "loose $before -> 0 objs"'
   case "$(state_of)" in *"|repacked|"*) ok "S1 state file: repacked" ;; *) bad "S1 state not 'repacked': $(state_of)" ;; esac
 }
 
@@ -181,12 +182,8 @@ t_limit() {
 t_args() {
   newcase; repo8; run
   local line hgl; line="$(grep ' repack ' "$CASE/git.args" | head -n 1)"; hgl="$(head -n 1 "$CASE/hg.args" 2>/dev/null)"
-  chk "S2 pack.threads=1"           contains "$line" "-c pack.threads=1"
-  chk "S2 pack.windowMemory=100m"   contains "$line" "-c pack.windowMemory=100m"
-  chk "S2 pack.deltaCacheSize=32m"  contains "$line" "-c pack.deltaCacheSize=32m"
-  chk "S2 repack -d -q (incremental: the loose objects, then drop them)" contains "$line" "repack -d -q"
-  chk "S2 runs through heavy-guard with the label git-loose-repack" contains "$hgl" "--what git-loose-repack"
-  chk "S2 …under nice -n 10" contains "$hgl" "nice -n 10"
+  chk "S2 the lean flags: pack.threads=1, pack.windowMemory=100m, pack.deltaCacheSize=32m, and repack -d -q (incremental: the loose objects, then drop them)" 'contains "$line" "-c pack.threads=1" && contains "$line" "-c pack.windowMemory=100m" && contains "$line" "-c pack.deltaCacheSize=32m" && contains "$line" "repack -d -q"'
+  chk "S2 runs through heavy-guard with the label git-loose-repack, under nice -n 10" 'contains "$hgl" "--what git-loose-repack" && contains "$hgl" "nice -n 10"'
   if printf '%s\n' "$line" | grep -Eq -- '(^| )(-a|-A|-f|-F|-l|--aggressive|--cruft|--unpack-unreachable|gc|prune)( |$)'; then bad "S2 a forbidden flag/command is in the repack line: $line"; else ok "S2 no -a/-A/-f/-F/-l/--aggressive/--cruft/gc/prune in the repack line"; fi
   if grep -Eq -- ' (gc|prune|maintenance)( |$)' "$CASE/git.args"; then bad "S2 git gc/prune/maintenance was called"; else ok "S2 git was never asked for gc, prune or maintenance"; fi
 }
@@ -198,9 +195,7 @@ t_unreadable() {
     newcase; repo8
     # shellcheck disable=SC2086
     run $v
-    chk "S3 [$v] FALHOU, rc 1, never OK" 'test "$RC" = 1 && contains "$OUT" "VEREDITO: FALHOU" && lacks "$OUT" "VEREDITO: OK"'
-    chk "S3 [$v] nothing was repacked" test "$(repack_calls)" = 0
-    chk "S3 [$v] the failure notify says 'job falhou'" fcontains "$CASE/notify.log" "job falhou"
+    chk "S3 [$v] FALHOU, rc 1, never OK; nothing repacked; the failure notify says 'job falhou'" 'test "$RC" = 1 && contains "$OUT" "VEREDITO: FALHOU" && lacks "$OUT" "VEREDITO: OK" && test "$(repack_calls)" = 0 && fcontains "$CASE/notify.log" "job falhou"'
     case "$(state_of)" in *"|unreadable|"*) ok "S3 [$v] state: unreadable" ;; *) bad "S3 [$v] state not 'unreadable': $(state_of)" ;; esac
     run $v
     chk "S3 [$v] same night, second tick: settled, no second notify, no verdict" 'test "$RC" = 0 -a "$(count_in "$CASE/notify.log" "job falhou")" = 1 && lacks "$OUT" "VEREDITO"'
@@ -216,8 +211,7 @@ t_heavyguard() {
   local m
   for m in 75 76; do
     newcase; repo8; run HG_MODE=$m
-    chk "S4 heavy-guard rc $m: ADIADO, rc 0, nothing repacked" 'test "$RC" = 0 -a "$(repack_calls)" = 0 && contains "$OUT" "VEREDITO: ADIADO" && lacks "$OUT" "VEREDITO: OK"'
-    chk "S4 rc $m: no failure notify" flacks "$CASE/notify.log" "job falhou"
+    chk "S4 heavy-guard rc $m: ADIADO, rc 0, nothing repacked, no failure notify" 'test "$RC" = 0 -a "$(repack_calls)" = 0 && contains "$OUT" "VEREDITO: ADIADO" && lacks "$OUT" "VEREDITO: OK" && flacks "$CASE/notify.log" "job falhou"'
     case "$(state_of)" in *"|deferred-disk|"*) ok "S4 rc $m: state deferred-disk" ;; *) bad "S4 rc $m: state not deferred-disk: $(state_of)" ;; esac
     run HG_MODE=pass
     chk "S4 rc $m: the next tick of the SAME night retries and packs it" 'test "$(hg_calls)" = 2 -a "$(loose_cnt "$CASE/repo")" = 0 && contains "$OUT" "VEREDITO: OK"'
@@ -266,14 +260,12 @@ t_watch_free() {
   newcase; repo8; printf '50000000\n50000000\n2000000\n' > "$CASE/free.seq"
   local t0=$SECONDS; run GITW_REPACK_WAIT_POLLS=8
   chk "S8 free disk falls under Dolt's CRITICAL+1 mid-run: the repack is stopped (interrupted, FALHOU, 'job falhou')" 'contains "$OUT" "status=interrupted" && fcontains "$CASE/notify.log" "job falhou" && test "$RC" = 1'
-  chk "S8 …the stand-in repack did not run to its end, and is not left running" 'test ! -f "$CASE/repack.done" && ! alive "$(cat "$CASE/wrapper.pid" 2>/dev/null || echo 999999)"'
-  chk "S8 …stopped within seconds, not at the wait ceiling" test $((SECONDS - t0)) -lt 25
+  chk "S8 …the stand-in repack did not run to its end, is not left running, and was stopped within seconds (not at the wait ceiling)" 'test ! -f "$CASE/repack.done" && ! alive "$(cat "$CASE/wrapper.pid" 2>/dev/null || echo 999999)" && test $((SECONDS - t0)) -lt 25'
 }
 t_watch_swap() {
   newcase; repo8; printf '100\n100\n100\n1500\n' > "$CASE/swap.seq"
   run GITW_REPACK_WAIT_POLLS=8
-  chk "S9 swap grows > 1024 MB since the start: stopped (interrupted), the line says swap" 'contains "$OUT" "status=interrupted" && contains "$OUT" "swap grew"'
-  chk "S9 …nothing left running, no 'done'" test ! -f "$CASE/repack.done"
+  chk "S9 swap grows > 1024 MB since the start: stopped (interrupted), the line says swap, nothing left running (no 'done')" 'contains "$OUT" "status=interrupted" && contains "$OUT" "swap grew" && test ! -f "$CASE/repack.done"'
 }
 t_watch_unreadable() {
   newcase; repo8; printf '50000000\nx\nx\nx\n' > "$CASE/free.seq"
@@ -299,7 +291,8 @@ t_window() {
   done
 }
 
-# S12. single flight, shared with git-maintenance-runner: a fresh lock = in flight (and left alone), a stale one is reclaimed, our own is released
+# S12. single flight, shared with git-maintenance-runner: a fresh lock = in flight (and left alone), a stale one is reclaimed, our own is released. Three answers, never merged: HELD by a live run (a DIRECTORY younger than
+# the stale age: exit 0) / TAKEN / COULD NOT BE TAKEN for any other reason (FALHOU, rc 2, 'job falhou') — nobody holds the lock then (gate-fix 1 of ga-pmu761v).
 t_lock() {
   newcase; repo8; mkdir "$CASE/lock"; run
   chk "S12 a fresh lock held by someone else: 'single flight', rc 0, nothing done" 'test "$RC" = 0 -a "$(hg_calls)" = 0 && contains "$OUT" "single flight"'
@@ -307,6 +300,19 @@ t_lock() {
   newcase; repo8; mkdir "$CASE/lock"; touch -t 202001010000 "$CASE/lock"; run
   chk "S12 a stale lock (2020) is reclaimed and the work is done" 'test "$(repack_calls)" = 1 && fcontains "$CASE/log" "stale lock"'
   chk "S12 …our lock is released at the end" test ! -d "$CASE/lock"
+}
+t_lock_failures() {
+  newcase; repo8; run GLR_LOCK="$CASE/no-such-dir/lock"
+  chk "S12 the lock cannot be created (missing parent): FALHOU, rc 2, nothing done, 'job falhou' sent, verdict in the log — NOT 'single flight'" 'test "$RC" = 2 -a "$(hg_calls)" = 0 && lacks "$OUT" "single flight" && fcontains "$CASE/notify.log" "job falhou" && fcontains "$CASE/log" "VEREDITO: FALHOU"'
+  newcase; repo8; : > "$CASE/lock"; run
+  chk "S12 a file where the lock directory should be: FALHOU, rc 2, nothing done, the file left alone" 'test "$RC" = 2 -a "$(hg_calls)" = 0 && lacks "$OUT" "single flight" && fcontains "$CASE/notify.log" "job falhou" && test -f "$CASE/lock"'
+  newcase; repo8; mkdir "$CASE/lock"; : > "$CASE/lock/x"; touch -t 202001010000 "$CASE/lock"; run
+  chk "S12 a stale lock that rmdir cannot remove (it holds a file): FALHOU, rc 2, nothing deleted — the old code said 'contended', rc 0, on every tick" 'test "$RC" = 2 -a "$(hg_calls)" = 0 && lacks "$OUT" "single flight" && fcontains "$CASE/notify.log" "job falhou" && test -f "$CASE/lock/x"'
+  newcase; repo8; mkdir "$CASE/lock" "$CASE/fakebin"; printf '#!/bin/bash\nexit 1\n' > "$CASE/fakebin/find"; chmod +x "$CASE/fakebin/find"; run PATH="$CASE/fakebin:$PATH"
+  chk "S12 find fails on an existing lock (age unknown): FALHOU, rc 2 — never read as 'fresh = another run holds it'" 'test "$RC" = 2 -a "$(hg_calls)" = 0 && lacks "$OUT" "single flight" && fcontains "$CASE/notify.log" "job falhou"'
+  newcase; repo8; mkdir "$CASE/lock" "$CASE/fakebin"; touch -t 202001010000 "$CASE/lock"
+  printf '#!/bin/bash\n"%s" "$@"; mkdir "$1"\n' "$(command -v rmdir)" > "$CASE/fakebin/rmdir"; chmod +x "$CASE/fakebin/rmdir"; run PATH="$CASE/fakebin:$PATH"
+  chk "S12 a fresh lock appears right after the reclaim (a live run won): 'single flight', rc 0, nothing done, that lock is NOT removed" 'test "$RC" = 0 -a "$(hg_calls)" = 0 && contains "$OUT" "single flight" && test -d "$CASE/lock"'
 }
 
 # S13. a repo settled tonight is not looked at again tonight; a new night is a new chance
@@ -324,8 +330,7 @@ t_streak() {
   run GLR_TODAY=2026-10-29 HG_MODE=75; run GLR_TODAY=2026-10-30 HG_MODE=75; run GLR_TODAY=2026-10-30 HG_MODE=75; run GLR_TODAY=2026-10-31 HG_MODE=75
   chk "S14 three nights deferred, still no alarm on the third night's own tick (2 nights behind it)" flacks "$CASE/notify.log" "noites"
   run GLR_TODAY=2026-11-01 HG_MODE=75; run GLR_TODAY=2026-11-01 HG_MODE=75
-  chk "S14 night 4, first tick: ONE alarm (priority 3) after 3 nights deferred" 'test "$(count_in "$CASE/notify.log" "noites sem repack")" = 1 && fcontains "$CASE/notify.log" "-p 3"'
-  chk "S14 …and it says how many nights" fcontains "$CASE/notify.log" "3 noites"
+  chk "S14 night 4, first tick: ONE alarm (priority 3) after 3 nights deferred, and it says how many nights" 'test "$(count_in "$CASE/notify.log" "noites sem repack")" = 1 && fcontains "$CASE/notify.log" "-p 3" && fcontains "$CASE/notify.log" "3 noites"'
   run GLR_TODAY=2026-11-02 HG_MODE=pass
   chk "S14 the repack finally runs: OK" contains "$OUT" "VEREDITO: OK"
   run GLR_TODAY=2026-11-03 HG_MODE=75
@@ -340,12 +345,8 @@ t_discovery() {
   git -C "$r/rigA" worktree add -q "$r/rigB/crew/wt" -b wtb 2>/dev/null
   mkrepo "$r/.hid" 1; mkdir -p "$r/plain"
   ARGS="--dry-run"; run GLR_REPOS= GLR_ROOT="$r" JAW_HOUR=12; ARGS=""
-  chk "S15 the root repo is listed" contains "$OUT" "$r"
-  chk "S15 a rig repo over the limit: REPACK" contains "$OUT" "REPACK    $r/rigA"
-  chk "S15 a crew clone (real .git dir) is listed" contains "$OUT" "$r/rigB/crew/x"
-  chk "S15 a git WORKTREE (.git is a file) is not listed" lacks "$OUT" "crew/wt"
-  chk "S15 a dot-directory is not listed" lacks "$OUT" ".hid"
-  chk "S15 a plain directory is not listed" lacks "$OUT" "plain"
+  chk "S15 listed: the root repo, a rig repo over the limit (REPACK), a crew clone with a real .git dir" 'contains "$OUT" "$CASE/root" && contains "$OUT" "REPACK    $CASE/root/rigA" && contains "$OUT" "$CASE/root/rigB/crew/x"'
+  chk "S15 not listed: a git WORKTREE (.git is a file), a dot-directory, a plain directory" 'lacks "$OUT" "crew/wt" && lacks "$OUT" ".hid" && lacks "$OUT" "plain"'
   chk "S15 dry-run: rc 0, nothing repacked, no lock, no state, no log (and the window was closed)" test "$RC" = 0 -a "$(repack_calls)" = 0 -a ! -e "$CASE/state" -a ! -e "$CASE/log" -a ! -e "$CASE/lock"
   ARGS="--dry-run"; run GLR_REPOS= GLR_ROOT="$r" JAW_HOUR=12 GITW_COUNT_FAIL=1; ARGS=""
   chk "S15 dry-run with count-objects failing: UNREADABLE, not 'below'" 'contains "$OUT" "UNREADABLE" && lacks "$OUT" "below "'
@@ -357,6 +358,9 @@ t_after() {
   chk "S16 repack ended 0 but the count after fails: unverified, FALHOU, notify" 'contains "$OUT" "status=unverified" && test "$RC" = 1 && fcontains "$CASE/notify.log" "job falhou"'
   newcase; repo8; run GITW_REPACK_NOOP=1
   chk "S16 repack ended 0 and the loose bytes are STILL over the limit: stalled, FALHOU" 'contains "$OUT" "status=stalled" && test "$RC" = 1'
+  # the reviewer's probe B, with the real git: UNREACHABLE loose objects are never packed by `repack -d` (no -a, no prune — on purpose), so a repo can end a healthy repack still over the limit
+  newcase; repo1; local i; for i in 1 2 3 4 5 6 7 8 9 10 11 12; do head -c 16000 /dev/urandom | git -C "$CASE/repo" hash-object -w --stdin >/dev/null; done; run
+  chk "S16 dangling (unreachable) blobs over the limit survive a healthy repack: stalled, and the message names that likely cause" 'contains "$OUT" "status=stalled" && contains "$OUT" "unreachable" && test "$(repack_calls)" = 1'
 }
 
 # S17. time: the run's budget and the window's end bound the repack; no time = deferred-time, never 'plenty'
@@ -393,23 +397,19 @@ t_signal() {
   local pid=$! i=0
   while [ ! -f "$CASE/wrapper.pid" ] && [ "$i" -lt 100 ]; do sleep 0.2; i=$((i+1)); done
   kill -TERM "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; RC=$?; OUT="$(cat "$CASE/out" 2>/dev/null)"
-  chk "S19 TERM while the repack runs: exit 143" test "$RC" = 143
-  chk "S19 …the stand-in repack is stopped, not left behind" 'test ! -f "$CASE/repack.done" && ! alive "$(cat "$CASE/wrapper.pid" 2>/dev/null || echo 999999)"'
+  chk "S19 TERM while the repack runs: exit 143, the stand-in repack is stopped (not left behind) and the lock is released" 'test "$RC" = 143 && test ! -f "$CASE/repack.done" && ! alive "$(cat "$CASE/wrapper.pid" 2>/dev/null || echo 999999)" && test ! -d "$CASE/lock"'
   chk "S19 …the log says FALHOU / ended by TERM, and 'job falhou' was sent" 'fcontains "$CASE/log" "ended by TERM" && fcontains "$CASE/notify.log" "job falhou"'
-  chk "S19 …the lock is released" test ! -d "$CASE/lock"
 }
 
 # S20. the order file and the script agree (interval, timeout vs the script's deadline and the lock's stale age, exec path)
 t_order() {
   OUT=""; RC=0
-  chk "S20 the order file exists" test -f "$ORDER"
-  chk "S20 the script is executable (the order execs it)" test -x "$SCRIPT_REAL"
+  chk "S20 the order file exists and the script is executable (the order execs it)" 'test -f "$ORDER" -a -x "$SCRIPT_REAL"'
   local trig interval tmo exe dl stale
   trig="$(sed -n 's/^trigger *= *"\(.*\)"/\1/p' "$ORDER")"; interval="$(sed -n 's/^interval *= *"\([0-9]*\)m"/\1/p' "$ORDER")"
   tmo="$(sed -n 's/^timeout *= *"\([0-9]*\)s"/\1/p' "$ORDER")"; exe="$(sed -n 's/^exec *= *"\(.*\)"/\1/p' "$ORDER")"
   dl="$(sed -n 's/^DEADLINE_S="${GLR_DEADLINE_S:-\([0-9]*\)}".*/\1/p' "$SCRIPT_REAL")"; stale="$(sed -n 's/^LOCK_STALE_MIN="${GLR_LOCK_STALE_MIN:-\([0-9]*\)}".*/\1/p' "$SCRIPT_REAL")"
-  chk "S20 trigger is cooldown (a cron expression would be read in UTC; the window is local)" test "$trig" = cooldown
-  chk "S20 interval ≤ 30m (got '$interval')" 'test -n "$interval" && test "$interval" -le 30'
+  chk "S20 trigger is cooldown (a cron expression would be read in UTC; the window is local), interval ≤ 30m (got '$interval')" 'test "$trig" = cooldown && test -n "$interval" && test "$interval" -le 30'
   chk "S20 timeout ($tmo s) covers the script's own deadline ($dl s) + 300 s" 'test -n "$tmo" && test -n "$dl" && test "$tmo" -ge $((dl + 300))'
   chk "S20 timeout stays under the shared lock's stale age (${stale} min)" 'test -n "$stale" && test "$tmo" -le $((stale * 60))'
   chk "S20 exec points at this script and the file exists" test "$exe" = '$PACK_DIR/assets/scripts/git-loose-repack.sh' -a -f "$HERE/git-loose-repack.sh"
@@ -439,7 +439,28 @@ t_static() {
   chk "S21 bash -n" bash -n "$SCRIPT_REAL"
 }
 
-ALL_CASES="t_limit t_args t_unreadable t_heavyguard t_repack_fail t_room t_swap t_watch_free t_watch_swap t_watch_unreadable t_watch_tolerates t_window t_lock t_settled t_streak t_discovery t_after t_time t_setup t_signal t_order t_static"
+# S22. the failure notify must ARRIVE (notify's contract: no STRICT_EXIT = every path that did not push exits 0; no FORCE_PUSH = an unknown source goes to the muted digest; a push whose TITLE equals one sent < 30 min ago is dropped).
+t_notify() {
+  newcase; repo8; run GITW_COUNT_FAIL=1
+  chk "S22 the failure notify carries NOTIFY_FORCE_PUSH=1 and NOTIFY_STRICT_EXIT=1; a push that went out (rc 0) leaves nothing about notify in the log" 'fcontains "$CASE/notify.log" "FORCE=1" && fcontains "$CASE/notify.log" "STRICT=1" && flacks "$CASE/log" "notify"'
+  local pair
+  for pair in "12:WARN: notify NOT delivered (rc=12)" "10:notify held until 07:00" "11:notify deduplicated"; do
+    newcase; repo8; run GITW_COUNT_FAIL=1 NOTIFY_STUB_RC="${pair%%:*}"
+    chk "S22 notify exits ${pair%%:*}: the log says '${pair#*:}' and the job's own rc stays 1" 'fcontains "$CASE/log" "${pair#*:}" && test "$RC" = 1'
+  done
+  newcase; REPOS="$CASE/a $CASE/b"; run GITW_COUNT_FAIL=1
+  chk "S22 two repos fail in one tick: two notifies with two DIFFERENT titles (notify's same-title dedup cannot swallow the second), both 'job falhou'" 'test "$(count_in "$CASE/notify.log" "job falhou")" = 2 && test "$(notify_titles)" = 2'
+}
+
+# S23. nothing inside the repo loop can eat the list of repos (the loop's input): a notify, or a git, that reads its stdin used to swallow every repo after the first, silently (the next tick picked them up).
+t_stdin() {
+  newcase; REPOS="$CASE/a $CASE/b $CASE/c"; run GITW_COUNT_FAIL=1 NOTIFY_STUB_STDIN=1
+  chk "S23 three repos fail and the notify reads stdin: all three are handled in the SAME tick (3 failed)" 'contains "$OUT" "3 failed"'
+  newcase; cp -R "$WORK/tpl1" "$CASE/a"; cp -R "$WORK/tpl1" "$CASE/b"; cp -R "$WORK/tpl1" "$CASE/c"; REPOS="$CASE/a $CASE/b $CASE/c"; run GITW_STDIN=1
+  chk "S23 three repos and a git that reads its stdin to the end: all three are measured (3 below the limit)" 'contains "$OUT" "3 below the limit"'
+}
+
+ALL_CASES="t_limit t_args t_unreadable t_heavyguard t_repack_fail t_room t_swap t_watch_free t_watch_swap t_watch_unreadable t_watch_tolerates t_window t_lock t_lock_failures t_settled t_streak t_discovery t_after t_time t_setup t_signal t_order t_static t_notify t_stdin"
 for fn in $ALL_CASES; do echo "== $fn"; "$fn"; done
 
 # ── mutants: break one thing in a COPY of the script; the named case(s) must fail ─────────────────
@@ -484,14 +505,25 @@ mutant watch-never-unreadable   'if [ "$bad" -ge 3 ]'                           
 mutant stalled-ignored          'if [ "$kib2" -gt "$LIMIT_KIB" ]; then'            'if false; then'                             t_after
 mutant unverified-as-ok         'finish "$repo" unverified'                        'finish "$repo" repacked'                    t_after
 mutant window-ignored           'if ! jaw_window_open; then'                       'if false; then'                             t_window
-mutant lock-ignored             'if ! mkdir "$LOCK" 2>/dev/null; then'             'if false; then'                             t_lock
+mutant lock-ignored             $'the text only explains a failure in the log\nif ! LOCK_ERR="$(mkdir "$LOCK" 2>&1)"; then'  $'the text only explains a failure in the log\nif false; then'  t_lock t_lock_failures
 mutant settled-ignored          'if ! is_deferral "$P_STATUS"; then'               'if false; then'                             t_settled
 mutant alarm-too-late           'if [ "$BASE" -ge "$ALARM_NIGHTS" ]'               'if [ "$BASE" -gt "$ALARM_NIGHTS" ]'         t_streak
 mutant alarm-too-early          'if [ "$BASE" -ge "$ALARM_NIGHTS" ]'               'if [ "$BASE" -ge 1 ]'                       t_streak
-mutant no-job-falhou            'notify_send 4 "git-loose-repack: job falhou" "$repo: $st'  'notify_send 4 "git-loose-repack: job parou" "$repo: $st'  t_unreadable t_after
+mutant no-job-falhou            'notify_send 4 "git-loose-repack: job falhou ($(repo_label "$repo"))" "$repo: $st'  'notify_send 4 "git-loose-repack: job parou ($(repo_label "$repo"))" "$repo: $st'  t_unreadable t_after
 mutant worktree-not-skipped     '[ -d "$d/.git" ] && echo "$d"'                    '[ -e "$d/.git" ] && echo "$d"'              t_discovery
 mutant window-end-ignored       'wl=$(( left - WINDOW_MARGIN_S ))'                 'wl=$(( left + 99999 ))'                     t_time
 mutant no-signal-handler        "trap 'on_signal TERM 143' TERM"                   ":"                                          t_signal
+mutant lock-missing-as-held     '{ echo nothing; return 0; }'                      '{ echo fresh; return 0; }'                  t_lock_failures
+mutant lock-file-as-held        'then echo notdir; return 0; fi'                   'then echo fresh; return 0; fi'              t_lock_failures
+mutant lock-age-unknown-as-held 'then echo unknown; return 0; fi'                  'then echo fresh; return 0; fi'              t_lock_failures
+mutant lock-stuck-as-held       'else LOCK_AT="$(lock_state)"; fi'                 'else LOCK_AT=fresh; fi'                     t_lock_failures
+mutant lock-race-as-failure     'else LOCK_AT="$(lock_state)"; fi'                 'else LOCK_AT=unknown; fi'                   t_lock_failures
+mutant notify-plain             'NOTIFY_FORCE_PUSH=1 NOTIFY_STRICT_EXIT=1 "$TIMEOUT_BIN" -k 5 30'  '"$TIMEOUT_BIN" -k 5 30'  t_notify
+mutant notify-rc-not-read       'case "$rc" in 0) ;; 10) say "notify held'         'case "$rc" in *) ;; 10) say "notify held'  t_notify
+mutant notify-title-shared      '"git-loose-repack: job falhou ($(repo_label "$repo"))" "$repo: $st'  '"git-loose-repack: job falhou" "$repo: $st'  t_notify
+mutant loop-eats-stdin          $'while IFS= read -r _repo <&3; do\n  [ -n "$_repo" ] || continue\n  process_repo "$_repo"\ndone 3<<EOF'  $'while IFS= read -r _repo; do\n  [ -n "$_repo" ] || continue\n  process_repo "$_repo"\ndone <<EOF'  t_stdin
+mutant stalled-no-hint          '; likely unreachable loose objects (repack -d neither packs nor prunes them, and this job never prunes): check git fsck --unreachable'  ''  t_after
+mutant swap-baseline-dropped    'run_repack "$repo" "$budget" "$swap"'             'run_repack "$repo" "$budget" ""'            t_watch_swap
 
 echo
 echo "RESULT: pass=$PASS fail=$FAIL skip=$SKIP"
