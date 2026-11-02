@@ -337,6 +337,154 @@ run_smoke "$TMP_ROOT/t27.plist"
 line="$(printf '%s\n' "$OUT" | sed -n 's/^SMOKE_DETAIL=sys.path at failure: //p' | head -1)"
 [ "$(verdict)" = "FAIL" ] && [ "${#line}" -eq 600 ] && [ "${line: -3}" = "..." ] && ok "T27 sys.path detail on FAIL: exactly 600 characters" || bad "T27 got verdict=$(verdict) detail is ${#line} chars"
 
+# ── hq-mutants lastro (ga-ow127o6): interpreter flags, wrapper corners, interpreter checks and cut widths that T1-T27 never crossed ──
+# T1-T27 launch every daemon as `python script.py` with no flag and no script argument, so parse_python_args' flag loop, the wrapper
+# reader's indentation/comment/cd rules and the width of the reason lines only ever ran on their easy side. The probe entrypoint below
+# writes what the CHILD saw (argv, working directory, -O level), so how the launch was rebuilt is observable and not only the verdict.
+mk_probe() {   # $1 = a mk_tree dir
+  cat > "$1/daemons/probe.py" <<'EOF'
+import json, os, sys
+open(os.environ["SMOKE_PROBE"], "w").write(json.dumps({"argv": sys.argv, "cwd": os.path.realpath(os.getcwd()), "opt": sys.flags.optimize}))
+EOF
+}
+# probe <file> <key> -> that key of the child's record as json text; vazio/falhou: arquivo ausente, ilegível ou sem a chave -> o python falha e não imprime nada,
+# então a comparação reprova (nunca passa por ausência)
+probe() { python3 -I -c 'import json, sys; print(json.dumps(json.load(open(sys.argv[1]))[sys.argv[2]]), end="")' "$1" "$2" 2>/dev/null; }
+realdir() { (cd "$1" && pwd -P); }
+cut_to() {   # cut_to <char> <total> -> <total> chars ending in "..." (what one_line does to a longer string)
+  python3 -I -c 'import sys; print(sys.argv[1] * (int(sys.argv[2]) - 3) + "...", end="")' "$1" "$2"
+}
+
+# ── T28: interpreter flags are skipped to find the script, forwarded to the child, and the script's own arguments follow it ──
+# mutants 57de7c394d 56d94c7f7c 5720549856 45af532eb0 4445607091 (the flag loop) 7ace4b6549 c967a877a5 (a 3-character flag is not -m/-c) 9d0bf05fad (script args)
+R="$TMP_ROOT/t28"; mk_tree "$R"; mk_probe "$R"
+mk_plist "$TMP_ROOT/t28.plist" "$R" "{\"SMOKE_PROBE\":\"$R/probe.json\"}" "$R/venv/bin/python3" -u -W ignore -OO "$R/daemons/probe.py" a "b c"
+run_smoke "$TMP_ROOT/t28.plist"
+[ "$(verdict)" = "PASS" ] && ok "T28 -u -W ignore -OO before the script: PASS" || bad "T28 got verdict=$(verdict) reason=$(reason)"
+[ "$(probe "$R/probe.json" argv)" = "[\"$R/daemons/probe.py\", \"a\", \"b c\"]" ] && ok "T28 the child's argv is the script then ITS arguments, nothing else" || bad "T28 argv: [$(probe "$R/probe.json" argv)]"
+[ "$(probe "$R/probe.json" opt)" = "2" ] && ok "T28 the flags reach the interpreter (-OO -> optimize level 2)" || bad "T28 optimize level: [$(probe "$R/probe.json" opt)]"
+
+# ── T29: flags and no script -> UNKNOWN (rc 2) with the right reason, never a crash ──
+# mutants e3ad19e0ed b6041760ce (loop bound), 16137b38a7 (`i >= len`), 8afb773209 e5d846e2ab (`-W` as the LAST argument), 152840c599 (the UNKNOWN exit code)
+R="$TMP_ROOT/t29"; mk_tree "$R"
+for fl in "-u" "-W" "-W x"; do
+  # shellcheck disable=SC2086
+  mk_plist "$TMP_ROOT/t29.plist" "$R" '{}' "$R/venv/bin/python3" $fl
+  run_smoke "$TMP_ROOT/t29.plist"
+  [ "$(verdict)" = "UNKNOWN" ] && [ "$RC" -eq 2 ] && has "$(reason)" "no script argument after the interpreter flags" && ok "T29 [$fl] and no script: UNKNOWN rc=2, 'no script argument'" || bad "T29 [$fl] got verdict=$(verdict) rc=$RC reason=$(reason)"
+done
+
+# ── T30: -m / -c in every spelling is not emulated ──
+# mutants 33b1d68afb (`-m` / `-c` alone), f7d821e50b 6647b79f6b afb09a5837 ab4b5c4024 e3dac23f52 (attached: -mx, -cx)
+R="$TMP_ROOT/t30"; mk_tree "$R"
+for fl in "-m flask run" "-c x" "-mx $R/daemons/dash.py" "-cx $R/daemons/dash.py"; do
+  # shellcheck disable=SC2086
+  mk_plist "$TMP_ROOT/t30.plist" "$R" '{}' "$R/venv/bin/python3" $fl
+  run_smoke "$TMP_ROOT/t30.plist"
+  [ "$(verdict)" = "UNKNOWN" ] && [ "$RC" -eq 2 ] && has "$(reason)" "launch (-m/-c) is not emulated" && ok "T30 [${fl%% *}] launch: UNKNOWN rc=2, said to be -m/-c" || bad "T30 [$fl] got verdict=$(verdict) rc=$RC reason=$(reason)"
+done
+# EQUIVALENT (ga-ow127o6; 43a00b5a1b and 9e5c3fe8fd, `len(a) > 2` -> `len(a) >= 2` on the attached -m / -c forms): the only 2-character
+# string that startswith("-m") is "-m" itself, which the `a in ("-m", "-c")` alternative before it already took, so `> 2` and `>= 2`
+# raise for exactly the same arguments: no launch line separates them.
+
+# ── T32: a relative entrypoint is resolved against the WorkingDirectory ──
+# mutant a508996b07 (`if not os.path.isabs(script)`)
+R="$TMP_ROOT/t32"; mk_tree "$R"; mk_probe "$R"
+mk_plist "$TMP_ROOT/t32.plist" "$R/daemons" "{\"SMOKE_PROBE\":\"$R/probe.json\"}" "$R/venv/bin/python3" probe.py x
+run_smoke "$TMP_ROOT/t32.plist"
+[ "$(verdict)" = "PASS" ] && [ "$(probe "$R/probe.json" argv)" = "[\"$R/daemons/probe.py\", \"x\"]" ] && ok "T32 relative script + WorkingDirectory: PASS, argv carries the resolved absolute path" || bad "T32 got verdict=$(verdict) reason=$(reason) argv=[$(probe "$R/probe.json" argv)]"
+
+# ── T33: an interpreter that is not an executable FILE is refused before any launch ──
+# mutant c11d0573d1 (`isfile and access` -> `isfile or access`): a non-executable file and a directory both slip through to Popen
+R="$TMP_ROOT/t33"; mk_tree "$R"; mkdir -p "$R/xbin" "$R/dbin/python3"
+: > "$R/xbin/python3"; chmod 644 "$R/xbin/python3"
+for p in "$R/xbin/python3" "$R/dbin/python3"; do
+  mk_plist "$TMP_ROOT/t33.plist" "$R" '{}' "$p" "$R/daemons/dash.py"
+  run_smoke "$TMP_ROOT/t33.plist"
+  [ "$(verdict)" = "UNKNOWN" ] && [ "$RC" -eq 2 ] && has "$(reason)" "interpreter not found: $p" && ok "T33 [${p#$R/}] not an executable file: UNKNOWN 'interpreter not found'" || bad "T33 [${p#$R/}] got verdict=$(verdict) rc=$RC reason=$(reason)"
+done
+
+# ── T34: /usr/bin/env with assignments and no program ──
+# mutant cfc4e8a612 (`while i < len` -> `<=` walks off the end of ProgramArguments)
+R="$TMP_ROOT/t34"; mk_tree "$R"
+mk_plist "$TMP_ROOT/t34.plist" "$R" '{}' /usr/bin/env FOO=bar
+run_smoke "$TMP_ROOT/t34.plist"
+[ "$(verdict)" = "UNKNOWN" ] && has "$(reason)" "env with no program" && ok "T34 env FOO=bar and nothing else: UNKNOWN 'env with no program' (not a crash)" || bad "T34 got verdict=$(verdict) reason=$(reason)"
+
+# ── T35: the wrapper reader — blank and indented lines, a trailing comment, `cd`, and which of two launch lines wins ──
+# mutants 7542298235 420bb46b76 (blank line / TAB and one-space indent are not top level), f63110c146 (comments=True: an apostrophe in a trailing
+# comment must not unbalance the line), 9b1e1f520a 52f5f75b3c b21af0b1a4 (the `cd`), a04cb470b3 (the LAST of two launch lines that agree on exe/script/args)
+R="$TMP_ROOT/t35"; mk_tree "$R"; mk_probe "$R"
+{
+  printf '#!/bin/bash\n'
+  printf 'B="%s"\n' "$R"
+  printf '\n'
+  printf 'if [ -n "${NOPE:-}" ]; then\n'
+  printf '\texec "$B/venv/bin/python3" "$B/daemons/other.py"\n'
+  printf ' exec "$B/venv/bin/python3" "$B/daemons/other2.py"\n'
+  printf 'fi\n'
+  printf 'cd "$B/daemons"\n'
+  printf 'exec "$B/venv/bin/python3" -O "$B/daemons/probe.py" a\n'
+  printf 'exec "$B/venv/bin/python3" "$B/daemons/probe.py" a  # it'"'"'s the launch\n'
+} > "$R/w35.sh"
+mk_plist "$TMP_ROOT/t35.plist" "$R" "{\"SMOKE_PROBE\":\"$R/probe.json\"}" /bin/bash "$R/w35.sh"
+run_smoke "$TMP_ROOT/t35.plist"
+[ "$(verdict)" = "PASS" ] && ok "T35 wrapper with a blank line, indented launch lines and a trailing comment: PASS" || bad "T35 got verdict=$(verdict) reason=$(reason)"
+[ "$(probe "$R/probe.json" argv)" = "[\"$R/daemons/probe.py\", \"a\"]" ] && ok "T35 the comment is not part of the launch line" || bad "T35 argv: [$(probe "$R/probe.json" argv)]"
+[ "$(probe "$R/probe.json" opt)" = "0" ] && ok "T35 of two agreeing launch lines the LAST one wins (no -O)" || bad "T35 optimize level: [$(probe "$R/probe.json" opt)]"
+[ "$(probe "$R/probe.json" cwd)" = "\"$(realdir "$R/daemons")\"" ] && ok "T35 the wrapper's top-level cd decides the working directory" || bad "T35 cwd: [$(probe "$R/probe.json" cwd)]"
+
+# ── T36: the `source` refusal quotes the offending line cut to exactly 80 characters ──
+# mutant bcca73d5e5 (80 -> 81)
+R="$TMP_ROOT/t36"; mk_tree "$R"
+SRCLINE="source /$(python3 -I -c 'print("s" * 120, end="")')"
+printf '#!/bin/bash\n%s\nexec "%s/venv/bin/python3" "%s/daemons/dash.py"\n' "$SRCLINE" "$R" "$R" > "$R/w36.sh"
+mk_plist "$TMP_ROOT/t36.plist" "$R" '{}' /bin/bash "$R/w36.sh"
+run_smoke "$TMP_ROOT/t36.plist"
+want="wrapper sources another file ($(python3 -I -c 'import sys; print(sys.argv[1][:77] + "...", end="")' "$SRCLINE"))"
+[ "$(verdict)" = "UNKNOWN" ] && has "$(reason)" "$want" && ok "T36 the quoted wrapper line is cut to exactly 80 characters (77 + ...)" || bad "T36 got verdict=$(verdict) reason=[$(reason)]"
+
+# ── T37: a reason of EXACTLY 400 characters is not cut ──
+# mutant 1fcab409cb (`len(s) <= limit` -> `<`)
+R="$TMP_ROOT/t37"; mk_tree "$R"
+EXACTWD="$(python3 -I -c 'print("/" + "a" * 183 + "/" + "b" * 182, end="")')"
+mk_plist "$TMP_ROOT/t37.plist" "$EXACTWD" '{}' "$R/venv/bin/python3" "$R/daemons/dash.py"
+run_smoke "$TMP_ROOT/t37.plist"
+want="working directory $EXACTWD does not exist"
+[ "${#want}" -eq 400 ] && [ "$(verdict)" = "UNKNOWN" ] && [ "$(reason)" = "$want" ] && ok "T37 a 400-character reason is shown whole" || bad "T37 want ${#want} chars, got [$(reason)]"
+
+# ── T38: the FAIL reason is cut to 200, each detail line to 300; the UNKNOWN-at-import reason to 160 and its detail to 300 ──
+# mutants 24c0e17fb3 (FAIL reason 200), e96bf68147 (FAIL detail 300), f0221ce263 (other-error reason 160), 42ba05b778 (other-error detail 300)
+R="$TMP_ROOT/t38"; mk_tree "$R"
+python3 -I -c 'print("raise ImportError(\"x\" * 400)")' > "$R/daemons/routes/cls_contacts.py"
+mk_plist "$TMP_ROOT/t38.plist" "$R" '{}' "$R/venv/bin/python3" "$R/daemons/dash.py"
+run_smoke "$TMP_ROOT/t38.plist"
+want="ImportError: $(cut_to x 200) (entrypoint $R/daemons/dash.py, cwd $R)"
+[ "$(verdict)" = "FAIL" ] && [ "$(reason)" = "$want" ] && ok "T38 FAIL reason: the message is cut to exactly 200 characters" || bad "T38 FAIL reason [$(reason)]"
+dline="$(printf '%s\n' "$OUT" | sed -n 's/^SMOKE_DETAIL=\(ImportError: .*\)$/\1/p' | head -1)"
+[ "${#dline}" -eq 300 ] && [ "${dline: -3}" = "..." ] && ok "T38 FAIL detail line: cut to exactly 300 characters" || bad "T38 FAIL detail is ${#dline} chars: [${dline:0:60}]"
+python3 -I -c 'print("raise RuntimeError(\"y\" * 400)")' > "$R/daemons/routes/cls_contacts.py"
+run_smoke "$TMP_ROOT/t38.plist"
+[ "$(verdict)" = "UNKNOWN" ] && has "$(reason)" "RuntimeError at import ($(cut_to y 160))" && ok "T38 UNKNOWN-at-import reason: the message is cut to exactly 160 characters" || bad "T38 UNKNOWN reason [$(reason)]"
+dline="$(printf '%s\n' "$OUT" | sed -n 's/^SMOKE_DETAIL=\(RuntimeError: .*\)$/\1/p' | head -1)"
+[ "${#dline}" -eq 300 ] && [ "${dline: -3}" = "..." ] && ok "T38 UNKNOWN-at-import detail line: cut to exactly 300 characters" || bad "T38 UNKNOWN detail is ${#dline} chars: [${dline:0:60}]"
+
+# ── T39: a crash of the helper is reported with the error cut to exactly 200 characters ──
+# mutant ba5e57b48d (200 -> 201)
+run_smoke "$TMP_ROOT/t1.plist" --timeout "$(python3 -I -c 'print("z" * 300, end="")')"
+r="$(reason)"
+[ "$(verdict)" = "UNKNOWN" ] && [ "$RC" -eq 2 ] && [ "${r#smoke script crashed: ValueError: }" != "$r" ] && [ "${#r}" -eq 234 ] && [ "${r: -3}" = "..." ] && ok "T39 helper crash: the error text is cut to exactly 200 characters" || bad "T39 got verdict=$(verdict) rc=$RC reason is ${#r} chars: [${r:0:80}]"
+
+# ── T40: an interpreter that exists but cannot start (bad shebang): the OS error is cut to exactly 160 characters ──
+# mutant 5981a174c8 (160 -> 161)
+R="$TMP_ROOT/t40"; mk_tree "$R"
+LONGD="$R/$(python3 -I -c 'print("d" * 150, end="")')"; mkdir -p "$LONGD"
+printf '#!/nonexistent/interpreter\n' > "$LONGD/python3"; chmod 755 "$LONGD/python3"
+mk_plist "$TMP_ROOT/t40.plist" "$R" '{}' "$LONGD/python3" "$R/daemons/dash.py"
+run_smoke "$TMP_ROOT/t40.plist"
+r="$(reason)"; prefix="could not start the interpreter: "
+[ "$(verdict)" = "UNKNOWN" ] && [ "${r#$prefix}" != "$r" ] && [ "${#r}" -eq $(( ${#prefix} + 160 )) ] && [ "${r: -3}" = "..." ] && ok "T40 could-not-start: the OS error is cut to exactly 160 characters" || bad "T40 got verdict=$(verdict) reason is ${#r} chars: [${r:0:100}]"
+
 echo
 echo "== result: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]
