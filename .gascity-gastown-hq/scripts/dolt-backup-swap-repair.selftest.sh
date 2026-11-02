@@ -1,9 +1,12 @@
 #!/bin/bash
 # dolt-backup-swap-repair.selftest.sh — unit tests for the pure decision
-# functions of dolt-backup-swap-repair.sh (ga-b14btl).
+# functions of dolt-backup-swap-repair.sh (ga-b14btl), then (ga-qec2rdl) the
+# script itself run against a throw-away BACKUP_ROOT.
 #
-# Hermetic: sources the script as a LIBRARY (DOLT_BACKUP_SWAP_REPAIR_LIB=1).
-# No filesystem fixture, no Dolt, no backup directory is read or written.
+# Hermetic: the first half sources the script as a LIBRARY
+# (DOLT_BACKUP_SWAP_REPAIR_LIB=1) with no filesystem fixture; the second half
+# builds its fixtures under mktemp only, with mv and notify stubs first in PATH.
+# No Dolt and no real backup directory is read or written.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -112,6 +115,138 @@ ok "nenhum valor ambiguo resolve para ACT"
 [ "$(_dry_run_state sim)" != "$(_dry_run_state 1)" ] \
   && ok "UNRECOGNIZED != DRY (o chamador fica sabendo que foi ignorado)" \
   || bad "UNRECOGNIZED e DRY colapsaram"
+
+# ── Codigos de retorno e fluxo principal (lastro hq-mutants, ga-qec2rdl) ────────
+# Ate aqui as funcoes puras so eram lidas pelo que IMPRIMEM: o `return` de cada
+# ramo, o modo lib e o laco que mexe em disco (mv, mensagens, exit) nao eram lidos
+# por ninguem. Daqui em diante o status sai de cada ramo e o proprio script roda
+# como programa contra um BACKUP_ROOT de mentira, com mv e notify de mentira no PATH.
+# EQUIVALENTE (lastro 807c305212, L68): `notify_fail() { ... || true; }` -> `... && true` so muda
+# o STATUS de notify_fail, e o unico chamador (a recusa do rename, ultimo comando do laco) nunca
+# le esse status: o script sai por `exit 0`. Nenhuma saida, arquivo ou codigo de saida difere.
+_rc() { # <rc esperado> <titulo> <comando...>
+  local want="$1" title="$2" got; shift 2
+  "$@" >/dev/null 2>&1; got=$?
+  [ "$got" = "$want" ] && ok "$title (rc=$got)" || bad "$title: rc esperado $want, veio $got"
+}
+_rc 0 "_classify_copy MISSING sai com 0" _classify_copy 0 0
+_rc 0 "_classify_copy UNKNOWN sai com 0" _classify_copy "" 1
+_rc 0 "_classify_copy VALID sai com 0"   _classify_copy 1 1
+_rc 0 "_classify_copy INVALID sai com 0" _classify_copy 1 0
+_rc 0 "_refusal_reason INDETERMINADO sai com 0" _refusal_reason UNKNOWN VALID 0 1
+_rc 0 "_refusal_reason sem primaria sai com 0"  _refusal_reason MISSING VALID 0 1
+_rc 0 "_refusal_reason primaria saudavel sai com 0" _refusal_reason VALID VALID 0 1
+_rc 0 "_refusal_reason sem .new sai com 0"      _refusal_reason INVALID MISSING 0 1
+_rc 0 "_refusal_reason .new sem manifest sai com 0" _refusal_reason INVALID INVALID 0 1
+_rc 0 "_refusal_reason com .old sai com 0"      _refusal_reason INVALID VALID 1 1
+_rc 0 "_refusal_reason nao verificada sai com 0" _refusal_reason INVALID VALID 0 0
+
+# vazio → o diretorio nao existe e o `||` sai; falhou → idem: nunca segue com $T vazio
+T="$(mktemp -d "${TMPDIR:-/tmp}/swaprepair.XXXXXX")" || { echo "FATAL: mktemp falhou"; exit 1; }
+[ -d "$T" ] || { echo "FATAL: mktemp nao criou $T"; exit 1; }
+trap 'rm -rf "$T"' EXIT
+
+# Modo lib: `source` devolve 0, e o script EXECUTADO com LIB=1 sai 0 calado e sem tocar em nada
+# (se o `return` falhasse sem o `|| exit 0`, o fluxo principal rodaria como se nada fosse).
+( . "$SCRIPT" ) >/dev/null 2>&1; got=$?
+[ "$got" = "0" ] && ok "modo lib: source devolve 0" || bad "modo lib: source devolveu $got"
+OUT="$(DOLT_BACKUP_SWAP_REPAIR_LIB=1 DOLT_BACKUP_SWAP_REPAIR_BACKUP_ROOT="$T/nao-existe" \
+  DOLT_BACKUP_SWAP_REPAIR_LOG="$T/lib.log" bash "$SCRIPT" 2>&1)"; RC=$?
+[ "$RC" = "0" ] && [ -z "$OUT" ] && [ ! -e "$T/lib.log" ] \
+  && ok "modo lib: executado sai 0, sem saida e sem log" \
+  || bad "modo lib executado: rc=$RC saida='$OUT'"
+
+mkdir "$T/bin" || exit 1
+REAL_MV="$(command -v mv)"
+[ -x "$REAL_MV" ] || { echo "FATAL: sem mv no PATH"; exit 1; }
+# Os stubs nascem por printf, sem here-document (o bash 3.2.57 do no grava o temporario do
+# here-document em /tmp sem olhar TMPDIR e a jaula nega), e leem STUB_DIR / REAL_MV / MV_FAIL_N
+# do ambiente, onde o `sr` abaixo os poe.
+printf '%s\n' '#!/bin/bash' 'echo "$*" >> "$STUB_DIR/mv.log"' \
+  'n=$(wc -l < "$STUB_DIR/mv.log" | tr -d " ")' '[ "${MV_FAIL_N:-0}" = "$n" ] && exit 1' \
+  'exec "$REAL_MV" "$@"' > "$T/bin/mv"
+printf '%s\n' '#!/bin/bash' 'echo "$*" >> "$STUB_DIR/notify.log"' > "$T/notify"
+chmod +x "$T/bin/mv" "$T/notify"
+
+N=0
+fresh() { N=$((N+1)); R="$T/root$N"; mkdir "$R" || exit 1; }
+mkc() { mkdir "$R/$1" || exit 1; if [ "$2" = ok ]; then : > "$R/$1/manifest"; fi; }   # <nome> bare|ok
+sr() { # <DRY_RUN> <VERIFIED> [VAR=valor ...] — o script como programa contra $R; deixa $OUT e $RC
+  local dry="$1" ver="$2"; shift 2
+  : > "$T/notify.log"; : > "$T/mv.log"; : > "$T/swap.log"
+  OUT="$(env DOLT_BACKUP_SWAP_REPAIR_LIB=0 DOLT_BACKUP_SWAP_REPAIR_BACKUP_ROOT="$R" \
+    DOLT_BACKUP_SWAP_REPAIR_LOG="$T/swap.log" DOLT_BACKUP_SWAP_REPAIR_NOTIFY="$T/notify" \
+    DOLT_BACKUP_SWAP_REPAIR_DRY_RUN="$dry" DOLT_BACKUP_SWAP_REPAIR_VERIFIED="$ver" \
+    STUB_DIR="$T" REAL_MV="$REAL_MV" PATH="$T/bin:$PATH" "$@" bash "$SCRIPT" 2>&1)"
+  RC=$?
+}
+has() { case "$OUT" in *"$1"*) return 0 ;; esac; return 1; }
+inlog() { grep -F -- "$1" "$T/swap.log" >/dev/null 2>&1; }   # arquivo ausente/ilegivel = nao achou = reprova
+# arquivo ausente: o wc nao imprime numero e a comparacao com o esperado reprova, nunca conta 0
+nlines() { wc -l < "$1" | tr -d ' '; }
+
+R="$T/nao-existe"; sr "" 0
+[ "$RC" = "1" ] && has "ERRO:" && inlog "BACKUP_ROOT ausente" && ! has "nenhum <db>.new" \
+  && ok "BACKUP_ROOT inexistente: sai 1, diz ERRO e para" || bad "BACKUP_ROOT inexistente: rc=$RC saida='$OUT'"
+
+fresh; sr "" 0
+[ "$RC" = "0" ] && has "nenhum <db>.new presente" && inlog "nenhum .new" && ! has "nao age" \
+  && ok "raiz vazia: sai 0 e diz que nao ha troca interrompida" || bad "raiz vazia: rc=$RC saida='$OUT'"
+
+fresh; : > "$R/x.new"; mkc y ok; sr 0 1
+[ "$RC" = "0" ] && has "nenhum <db>.new presente" && ! has "nao age" && [ -f "$R/x.new" ] \
+  && ok "um ARQUIVO x.new nao e um diretorio .new: ignorado" || bad "arquivo x.new: rc=$RC saida='$OUT'"
+
+fresh; mkc x ok; mkc x.new ok; sr "" 1
+[ "$RC" = "0" ] && has "x: nao age" && has "TEM manifest" && ! has "nenhum <db>.new" && inlog "recusa" \
+  && [ -d "$R/x.new" ] && [ -f "$R/x/manifest" ] \
+  && ok "primaria saudavel: recusa nomeada e nada se move" || bad "primaria saudavel: rc=$RC saida='$OUT'"
+
+fresh; mkc x bare; mkc x.new ok
+for d in "" 1 true; do
+  sr "$d" 1
+  [ "$RC" = "0" ] && has "completaria (modo seco, nada feito)" && ! has "NAO aplicada" && ! has "troca completada" \
+    && inlog "seco, troca interrompida" && [ ! -e "$R/x.old" ] && [ -d "$R/x.new" ] && [ ! -e "$R/x/manifest" ] \
+    && ok "DRY_RUN='$d': mostra o que faria e nao move nada" || bad "DRY_RUN='$d': rc=$RC saida='$OUT'"
+done
+sr sim 1
+[ "$RC" = "0" ] && has "NAO aplicada: DRY_RUN='sim' nao e um valor reconhecido" && ! has "completaria" \
+  && inlog "nao reconhecido" && [ ! -e "$R/x.old" ] && [ -d "$R/x.new" ] \
+  && ok "DRY_RUN='sim': diz que ignorou o valor e nao move nada" || bad "DRY_RUN='sim': rc=$RC saida='$OUT'"
+sr 0 0
+[ "$RC" = "0" ] && has "restore+contagem" && ! has "troca completada" && [ ! -e "$R/x.old" ] && [ -d "$R/x.new" ] \
+  && ok "agir sem a prova de restore (VERIFIED=0): recusa e nao move nada" || bad "VERIFIED=0: rc=$RC saida='$OUT'"
+
+fresh; mkc x bare; mkc x.new ok; sr 0 1
+[ "$RC" = "0" ] && has "troca completada" && ! has "FALHOU" && inlog "troca completada" && [ ! -s "$T/notify.log" ] \
+  && [ -f "$R/x/manifest" ] && [ -d "$R/x.old" ] && [ ! -e "$R/x.old/manifest" ] && [ ! -e "$R/x.new" ] \
+  && [ "$(nlines "$T/mv.log")" = "2" ] \
+  && ok "agir: invalida vira .old, .new vira primaria, sem alarme" || bad "agir: rc=$RC saida='$OUT'"
+
+# Um log que nao grava nao pode virar "rename falhou" quando os dois mv deram certo.
+fresh; mkc x bare; mkc x.new ok; sr 0 1 DOLT_BACKUP_SWAP_REPAIR_LOG="$T/nao/existe/swap.log"
+[ "$RC" = "0" ] && has "troca completada" && ! has "FALHOU" && [ ! -s "$T/notify.log" ] && [ -f "$R/x/manifest" ] \
+  && ok "log ilegivel: a troca feita continua sendo 'completada', sem alarme falso" || bad "log ilegivel: rc=$RC saida='$OUT'"
+
+fresh; mkc x bare; mkc x.new ok; sr 0 1 MV_FAIL_N=1
+[ "$RC" = "0" ] && has "FALHOU ao renomear" && ! has "troca completada" && inlog "FALHA no rename" \
+  && grep -F "rename falhou" "$T/notify.log" >/dev/null && [ "$(nlines "$T/mv.log")" = "1" ] \
+  && [ ! -e "$R/x.old" ] && [ -d "$R/x.new" ] \
+  && ok "1o mv falha: avisa, notifica e nao tenta o 2o" || bad "1o mv falha: rc=$RC saida='$OUT'"
+fresh; mkc x bare; mkc x.new ok; sr 0 1 MV_FAIL_N=2
+[ "$RC" = "0" ] && has "FALHOU ao renomear" && ! has "troca completada" && grep -F "rename falhou" "$T/notify.log" >/dev/null \
+  && [ "$(nlines "$T/mv.log")" = "2" ] \
+  && ok "2o mv falha: avisa e notifica, nunca diz 'completada'" || bad "2o mv falha: rc=$RC saida='$OUT'"
+
+fresh; mkc x bare; mkc x.new ok; mkc x.old ok; sr 0 1
+[ "$RC" = "0" ] && has "residue-reclaim" && ! has "troca completada" && [ -d "$R/x.new" ] && [ ! -e "$R/x/manifest" ] \
+  && ok ".old do ciclo anterior: recusa e nao sobrescreve" || bad ".old existente: rc=$RC saida='$OUT'"
+fresh; mkc x.new ok; sr 0 1
+[ "$RC" = "0" ] && has "nao existe copia primaria" && ! has "FALHOU" && [ ! -e "$R/x" ] && [ -d "$R/x.new" ] \
+  && ok "sem primaria: recusa e nao inventa uma" || bad "sem primaria: rc=$RC saida='$OUT'"
+fresh; mkc a ok; mkc a.new ok; mkc b bare; mkc b.new ok; sr 0 1
+[ "$RC" = "0" ] && has "a: nao age" && has "b: troca completada" && ! has "nenhum <db>.new" && [ -f "$R/b/manifest" ] \
+  && ok "dois bancos: cada um decide sozinho e o laco segue" || bad "dois bancos: rc=$RC saida='$OUT'"
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" = "0" ] || exit 1
