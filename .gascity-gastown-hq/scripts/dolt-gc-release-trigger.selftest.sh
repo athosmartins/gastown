@@ -31,6 +31,10 @@ export GC_RELEASE_BACKUP_LOCKDIR="$T/nightly.lock.d"
 export GC_RUN_OUTCOME_STATE="$T/outcome.state"          # the job's per-run result record (ga-11vdhe)
 
 PASS=0; FAIL=0
+# Sourcing the trigger in lib mode must run nothing; if it ever ran its entry point it would end with `exit 0` (after replacing any EXIT trap of ours with its own) and
+# this file would stop right there, green. So `exit` itself is guarded: a 0 before the last line is a failure.
+REACHED_END=0
+exit() { local rc="${1:-$?}"; if [ "$REACHED_END" != 1 ] && [ "$rc" = 0 ]; then echo "FAIL: selftest aborted before its last line" >&2; builtin exit 1; fi; builtin exit "$rc"; }
 ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
 
@@ -46,6 +50,14 @@ fi
 # The real run body, captured BEFORE the end-to-end section stubs it: until gate round 2 no test
 # ran it (the env hand-off to the job it starts was only ever seen through the stub).
 _REAL_RUN_MAINT="$(declare -f _trg_run_maintenance)"
+# ga-hq1qc5y (hq-mutants lastro): these functions answer in WORDS (the poll and trigger_main, in their effects) and are documented to always return 0, and the
+# cases below read the words and the effects through $(...) and files, never the status. Each is wrapped so that a call returning non-zero — from any case, in a
+# subshell or not — is written to a file; the last case of this file asserts the file is empty.
+for _fn in _gc_trigger_decision _trg_streak_read _trg_outcome_read _trg_liveness _trg_backoff_s _trg_warn_hourly _trg_state_load _trg_stuck_sweep _trg_poll trigger_main; do
+  eval "$(declare -f "$_fn" | sed "1s/^$_fn /${_fn}__real /")"
+  eval "$_fn() { ${_fn}__real \"\$@\"; local r=\$?; [ \"\$r\" = 0 ] || echo \"$_fn:\$r\" >> \"\$T/nonzero.calls\"; return \"\$r\"; }"
+done
+unset _fn
 
 # ── _gc_trigger_decision: pure. Args: streak avail size staging pct floor min_streak slack
 #    release_enabled(1|0) cooldown_ok(1|0). World = the measured 2026-09-26 numbers:
@@ -1181,8 +1193,85 @@ printf '%s\n' "$_code" | grep -Eq 'GC_TRIGGERED_KIND="\$kind" GC_RUN_TOKEN="\$to
 /bin/bash -n "$TRIGGER" 2>/dev/null && ok "static: parses under /bin/bash (3.2) — the interpreter launchd runs it with" || bad "static: does not parse under /bin/bash 3.2"
 unset _code
 
+# ── ga-hq1qc5y (hq-mutants lastro): the helpers that may fail, the edges of the others, the post-run WARNs, the script as a program ────────────────
+echo "== helpers: status and edges =="
+# EQUIVALENT, documented: 8ea215a12c (`_gc_required_parts` failing inside _gc_trigger_decision: the loop above it already refused every non-numeric size, pct and floor, the only inputs it fails on);
+# 7073eb6390 (`[ "$line" = "$n $flag" ]` in _trg_streak_read: after the case on the flag it cannot be false); 35d16b9578 and 9d28f4e738 (_trg_backoff_s: `-lt` -> `-le` while s == cap doubles once more and
+# the clamp brings it back to the cap; `-gt` -> `-ge` assigns the cap to the cap); cac26e2671 and 4fbf2ea052 (the poll's clamp of a stored backoff, `-gt` -> `-ge`: at equality it assigns the same number);
+# fa54519c71 (`[ -f ] || return 1` in _trg_state_readable: for a directory the `wc -l <` below fails to read it and the same `return 1` follows); 4f99aaeef8 (`mkdir -p ... || return 1` in
+# _trg_state_write: the redirection after it fails on the same missing directory and returns 1); c76d35419c and 22ec8a2fd6 (`|| true` -> `&& true` after a status the function discards: both end in `return 0`).
+_t="$T/helpers"; mkdir -p "$_t"
+_pi_bad=""; for _v in "" abc 0 -1 1.5; do _trg_pos_int "$_v" && _pi_bad="$_pi_bad [$_v]"; done
+_pi_good=""; for _v in 1 6 007; do _trg_pos_int "$_v" || _pi_good="$_pi_good [$_v]"; done
+[ -z "$_pi_bad$_pi_good" ] && ok "pos_int: a whole number >= 1 is usable; blank, text, 0, a sign or a decimal point is not" || bad "pos_int: wrongly accepted:$_pi_bad wrongly refused:$_pi_good"
+unset _v _pi_bad _pi_good
+_TRG_ATT=0; _TRG_NEXT=0; _TRG_DATT=0; _TRG_DNEXT=0
+_trg_set_backoff release 3 30 && _trg_set_backoff direct 4 40; _trg_set_backoff bogus 9 99; _rc=$?
+[ "$_rc" = 1 ] && [ "$_TRG_ATT/$_TRG_NEXT/$_TRG_DATT/$_TRG_DNEXT" = "3/30/4/40" ] && ok "set_backoff: release and direct each set their own pair; any other kind is refused (1) and touches nothing" || bad "set_backoff: rc=$_rc pairs=$_TRG_ATT/$_TRG_NEXT/$_TRG_DATT/$_TRG_DNEXT"
+mkdir -p "$_t/adir"; _trg_state_readable "$_t/adir"; _rc=$?
+[ "$_rc" = 1 ] && ok "state_readable: a directory where the record should be is not a record (1)" || bad "state_readable on a directory: rc=$_rc"
+: > "$_t/afile"; _trg_state_write "$_t/afile/sub/state" 1 d 0 0 0 0 2>/dev/null; _rc=$?
+[ "$_rc" = 1 ] && ok "state_write: a directory that cannot be made fails the write (1)" || bad "state_write under a file: rc=$_rc"
+( GC_TRIGGER_STATE="$_t/rec.state"; _TRG_ATT=1; _TRG_NEXT=2; _TRG_DATT=3; _TRG_DNEXT=4; _trg_record 100 "WAIT x" ) 2>/dev/null; _rc_ok=$?
+( GC_TRIGGER_STATE="$_t/adir"; _TRG_ATT=0; _TRG_NEXT=0; _TRG_DATT=0; _TRG_DNEXT=0; _trg_record 100 "WAIT x" ) 2>/dev/null; _rc_bad=$?
+{ [ "$_rc_ok" = 0 ] && [ "$_rc_bad" = 1 ] && grep -q '^poll=100 decision=WAIT x attempts=1 next_allowed=2 direct_attempts=3 direct_next_allowed=4$' "$_t/rec.state"; } && ok "record: a written record returns 0 and carries all four values; one that cannot be written returns 1" || bad "record: ok=$_rc_ok bad=$_rc_bad file='$(cat "$_t/rec.state" 2>/dev/null)'"
+: > "$DOLT_GC_MAINT_LOG"; _trg_warn_hourly "$((NOW+299))" "w299"; _trg_warn_hourly "$((NOW+300))" "w300"; _trg_warn_hourly abc "wabc"
+{ [ "$(grep -c 'w299' "$DOLT_GC_MAINT_LOG")" = 1 ] && [ "$(grep -c 'w300\|wabc' "$DOLT_GC_MAINT_LOG")" = 0 ]; } && ok "warn_hourly: logged at second 299 of the hour, not at 300, not for a clock that is not a number" || bad "warn_hourly: $(cat "$DOLT_GC_MAINT_LOG")"
+_bo_c="$(GC_TRIGGER_BACKOFF_BASE_S=300 GC_TRIGGER_BACKOFF_MAX_S=1000000000 _trg_backoff_s 40) $(GC_TRIGGER_BACKOFF_BASE_S=100000000 GC_TRIGGER_BACKOFF_MAX_S=999999999 _trg_backoff_s 1) $(GC_TRIGGER_BACKOFF_BASE_S=1000000000 GC_TRIGGER_BACKOFF_MAX_S=999999999 _trg_backoff_s 1)"
+[ "$_bo_c" = "7200 100000000 300" ] && ok "backoff: a 10-digit cap is garbled (7200), a 9-digit base is kept, a 10-digit base is garbled (300)" || bad "backoff digit edges: got '$_bo_c'"
+printf 'poll=%s decision=WAIT x attempts=0 next_allowed=0 direct_attempts=0 direct_next_allowed=0\n' "$NOW" > "$GC_TRIGGER_STATE"
+_lv_now="$(_trg_liveness "$GC_TRIGGER_STATE" "$GC_TRIGGER_LOCKDIR" sleep "$NOW" 900 14400)"
+[ "$_lv_now" = "alive" ] && ok "liveness: a poll stamped at this very second is alive (not a poll in the future)" || bad "liveness poll==now: '$_lv_now'"
+unset _lv_now
+
+# the poll at its edges
+reset_main; AVAIL=12486; printf '6 1\n' > "$GC_SKIP_STREAK_STATE"; poll
+[ "$KICKS" -eq 1 ] && ok "poll: a streak exactly at the minimum (6) is chronic: the run starts" || bad "poll streak==min: kicks=$KICKS dec='$(sdec)'"
+reset_main; AVAIL=20000; SIZE_MB=1500; THRESHOLD_G=1; poll
+[ "$KICKS" -eq 1 ] && ok "poll: hq of exactly the threshold in GB (1500 MB, 1 GB) is not below it: the run starts" || bad "poll size==threshold: kicks=$KICKS dec='$(sdec)'"
+reset_main; AVAIL=12486; KICK_RC=1; poll
+grep -q 'the job exited rc=1' "$DOLT_GC_MAINT_LOG" && ok "poll: a job that exits 1 is said to have exited 1 (only 0 is silent)" || bad "poll job rc=1: $(tail -2 "$DOLT_GC_MAINT_LOG")"
+for _cap_case in "1000000000:999999:$((NOW+7200))" "123456789:999999:$((NOW+999999))"; do
+  IFS=: read -r _cap _nx _want <<< "$_cap_case"
+  reset_main; AVAIL=12486; GC_TRIGGER_BACKOFF_MAX_S="$_cap"
+  _trg_state_write "$GC_TRIGGER_STATE" "$((NOW-60))" "KICK release" 3 "$((NOW+_nx))" 0 0
+  poll
+  [ "$(sget next_allowed)" = "$_want" ] || echo "    (cap '$_cap': next_allowed='$(sget next_allowed)' want '$_want')"
+done 2>&1 | grep -q '(cap' && bad "poll clamp: a 10-digit cap is garbled (clamp to 7200), a 9-digit one is kept (see lines above)" || ok "poll clamp: a 10-digit cap knob is garbled (a far backoff is clamped to now+7200), a 9-digit one is honoured"
+unset _cap_case _cap _nx _want
+reset_main; GC_TRIGGER_ENABLED=0; _saved_now="$(declare -f _gc_now_epoch)"; eval "_gc_now_epoch() { printf '%s' 'abc'; }"; unset GC_NOW_EPOCH
+poll; eval "$_saved_now"; unset _saved_now
+[ ! -e "$GC_TRIGGER_STATE" ] && ok "paused with no readable clock: nothing is written (a blank poll= would make the record unreadable)" || bad "paused, bad clock: state='$(cat "$GC_TRIGGER_STATE")'"
+reset_main; : > "$T/afile"; GC_TRIGGER_LOCKDIR="$T/afile/lock.d"; poll
+grep -q 'cannot create the trigger lock' "$DOLT_GC_MAINT_LOG" && ok "trigger_main: a lock directory that cannot be made is said out loud and stays inert" || bad "lock dir under a file: $(tail -2 "$DOLT_GC_MAINT_LOG")"
+GC_TRIGGER_LOCKDIR="$T/trigger.lock.d"
+
+reset_main; AVAIL=12486; _saved_acq="$(declare -f _dgm_lock_acquire)"; _dgm_lock_acquire() { return 3; }
+poll; eval "$_saved_acq"; unset _saved_acq
+{ [ "$KICKS" -eq 0 ] && [ ! -e "$GC_TRIGGER_STATE" ]; } && ok "trigger_main: a lock status it does not know (3) is neither a run nor a recorded decision" || bad "unknown lock status: kicks=$KICKS state='$(cat "$GC_TRIGGER_STATE" 2>/dev/null)'"
+
+# a state that cannot be recorded after the run is said (and one that can is not)
+for _mode in standing cleared unreachable; do
+  case "$_mode" in cleared) _km=ok; _ko="" ;; unreachable) _km=fail; _ko="dolt-unreachable" ;; *) _km=fail; _ko="" ;; esac
+  reset_main; AVAIL=12486; KICK_MODE="$_km"; KICK_OUTCOME="$_ko"; poll
+  _w_ok="$(grep -c 'could not record the outcome' "$DOLT_GC_MAINT_LOG")"
+  reset_main; AVAIL=12486; KICK_MODE="$_km"; KICK_OUTCOME="$_ko"
+  _trg_run_maintenance() { _stub_run; rm -f "$GC_TRIGGER_STATE"; mkdir "$GC_TRIGGER_STATE"; }
+  poll; _w_bad="$(grep -c 'could not record the outcome' "$DOLT_GC_MAINT_LOG")"
+  _trg_run_maintenance() { _stub_run; }; rmdir "$GC_TRIGGER_STATE" 2>/dev/null
+  [ "$_w_ok" = 0 ] && [ "$_w_bad" -ge 1 ] && ok "post-run ($_mode): a state that cannot be written is WARNed; one that can is silent" || bad "post-run ($_mode): warns when written=$_w_ok, when not=$_w_bad"
+done
+unset _mode _km _ko _w_ok _w_bad
+
+# the script as a program: paused, it writes DISABLED and exits 0 (the rest of this file sources it)
+rm -f "$GC_TRIGGER_STATE"; env -u DOLT_GC_TRIGGER_LIB GC_TRIGGER_ENABLED=0 bash "$TRIGGER" >/dev/null 2>&1; _rc=$?
+{ [ "$_rc" = 0 ] && [ "$(sdec)" = "DISABLED" ]; } && ok "the script run as a program, paused: exit 0 and the state says DISABLED" || bad "script as a program: rc=$_rc state='$(cat "$GC_TRIGGER_STATE" 2>/dev/null)'"
+
+[ ! -s "$T/nonzero.calls" ] && ok "status: every call of _gc_trigger_decision, _trg_streak_read, _trg_outcome_read, _trg_liveness, _trg_backoff_s, _trg_warn_hourly, _trg_state_load, _trg_stuck_sweep, _trg_poll and trigger_main in this file returned 0" || bad "status: non-zero returns recorded: $(sort "$T/nonzero.calls" | uniq -c | tr '\n' ' ')"
+
 unset -f _avail_mb _trg_dir_mb _gc_release_busy _gc_dolt_reachable _trg_run_maintenance _stub_run reset_main poll sget sdec dec nreads mangle_streak _dolt_gc_notify nnotify _mtime_set _hold
 case "$T" in "${TMPDIR:-/tmp}"/dolt-gc-trigger-selftest.*) rm -rf "$T" ;; esac
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
+REACHED_END=1
 [ "$FAIL" -eq 0 ]
