@@ -9,21 +9,26 @@
 # LIMIARES        (MB livres em `df -Pm /System/Volumes/Data` — NUNCA `df /`, que lê o volume de sistema selado e mostra 71% com o Data em 98%)
 #   D2  livre <= 5120 por >= 900 s (15 min)     parar jobs pesados reiniciáveis da allowlist
 #   D3  livre <= 4096 por >= 1800 s (30 min)    restart drenado dos daemons que mais usam RAM
-#   D4  livre <  3072 por >= 3600 s (60 min)    OU livre < 1536 em 2 leituras SEGUIDAS (2 min)   reinício guardado do mini
+#   D4  livre <  3072 por >= 3600 s (60 min)    OU livre < 1536 em 2 leituras SEGUIDAS e separadas por >= 100 s (2 rodadas do launchd)   reinício guardado do mini
 #   O 2º caminho do D4 é parte do limiar dele (decisão do Athos: "< 1,5 GB a qualquer momento"), não um atalho: D2 e D3 só entram depois do tempo deles. As 2 leituras seguidas são do
-#   maestro (uma leitura isolada abaixo de 1,5 GB, p.ex. um go build que sobe e solta, não reinicia o mini).
+#   maestro (uma leitura isolada abaixo de 1,5 GB, p.ex. um go build que sobe e solta, não reinicia o mini); duas rodadas coladas (--run à mão ao lado de uma agendada) contam como UMA.
 #   HISTERESE: o cronômetro de um nível só ZERA quando o livre volta a limiar + 512 MB; entre os dois ele nem começa nem zera (um disco oscilando em volta de 3 GB por 5 h não reinicia o
 #   relógio de 60 min a cada subida de 100 MB). Só conta tempo de rodadas que EU li: lacuna > 10 min entre duas leituras (máquina parada, launchd fora, df ilegível) zera cronômetros e marcas.
 # TRÊS ESTADOS    tem / não-tem / não-consegui-saber. df ilegível ou swap ilegível NUNCA viram "tem bastante disco" nem "disco baixo": o maestro NÃO chama degrau nenhum, loga, avisa
 #   (notify -p 4, no máximo 1 por hora) e sai com 30; os cronômetros salvos ficam como estavam (se a falta de leitura passar de 10 min, a lacuna os zera na próxima leitura boa).
-#   Relógio ilegível: idem, mas só log/stdout e saída 30 (sem hora não há como limitar o aviso a 1 por hora). Estado salvo ilegível ou inválido é posto de lado (`.corrupt-<hora>`),
-#   dito no log, e a rodada SEGUE com os cronômetros zerados (o lado inerte: nada dispara por um histórico que não consegui ler). Estado que não consigo gravar: aviso no log e saída 30; e se a marca de ANTES da chamada de um degrau não puder ser gravada, o degrau NÃO é chamado (a rodada acaba, saída 30).
+#   Relógio ilegível: idem, mas só log/stdout e saída 30 (sem hora não há como limitar o aviso a 1 por hora). Estado salvo ilegível, vazio, cortado (falta qualquer chave) ou inválido é posto de lado
+#   (`.corrupt-<hora>`, só DEPOIS de o novo estado estar gravado), dito no log, e a rodada SEGUE com os cronômetros zerados (nada dispara por um histórico que não consegui ler) MAS com o `acted4_ts` = AGORA:
+#   não sei se o D4 acabou de disparar, e o reinício é a ação que não se repete na dúvida; o teto de 6 h vale e, se o disco seguir baixo, escala (notify -p 5 + mail) em vez de reiniciar.
+#   Só o arquivo AUSENTE é "primeira rodada" (acted4_ts=0); apagar o estado à mão é, de propósito, o jeito de zerar tudo, inclusive o teto de 6 h.
+#   Estado que não consigo gravar: aviso no log, notify -p 4 (no máximo 1 por hora) e saída 30; e se a marca de ANTES da chamada de um degrau não puder ser gravada, o degrau NÃO é chamado (a rodada acaba, saída 30).
+#   Aviso de degrau que FALHOU: no máximo 1 notify + 1 mail por hora por degrau (a falha repete a cada 5 min; cada mail é um bead + commit no Dolt de uma máquina que está sem disco); "agiu" avisa sempre.
 # ESTADO, LOG, INTERRUPTORES
 #   estado  $CITY/.gc/disk-recovery.state (chave=valor, escrito inteiro e trocado com mv)   log  $CITY/.gc/logs/disk-recovery.log (gira em 5 MB)
 #   `touch $CITY/.gc/disk-recovery.off` desliga o maestro (sai 10 sem ler nem agir; apague o arquivo para voltar). Instância única por trava (mkdir) — o `--dry-run` não toma a trava.
 #   O swap entra como leitura obrigatória e como contexto da mensagem; os limiares são de disco (a causa de 01/11 foi memória virando swap, e swap ocupa o mesmo disco).
-#   Reinício em laço é impossível por construção: o `acted4_ts` é gravado ANTES de chamar o D4 (um reinício que mata este processo no meio não perde a marca; se a gravação falha, o D4 não é chamado) e o maestro não chama
-#   `d4 --run` de novo por 6 h depois de um rc 0; nesse caso, com o disco ainda < 3 GB, escala (notify -p 5 + mail) em vez de reiniciar. O contrato pede que o D4 tenha cooldown próprio também (defesa em profundidade, ga-1p1i5jr.4); este maestro não depende disso.
+#   Reinício em laço: o `acted4_ts` é gravado ANTES de chamar o D4 (um reinício que mata este processo no meio não perde a marca; se a gravação falha, o D4 não é chamado) e o maestro não chama
+#   `d4 --run` de novo por 6 h depois de um rc 0; nesse caso, com o disco ainda < 3 GB, escala (notify -p 5 + mail) em vez de reiniciar. A marca também vale quando o estado salvo some pela metade (ver TRÊS ESTADOS: acted4_ts = agora).
+#   Só se perde com o arquivo de estado AUSENTE (apagado à mão). O contrato pede que o D4 tenha cooldown próprio também (defesa em profundidade, ga-1p1i5jr.4); este maestro não depende disso.
 # CONTRATO DOS DEGRAUS  scripts/disk-recovery-d2-heavy-jobs.sh · -d3-ram-daemons.sh · -d4-guarded-reboot.sh, chamados `<script> --run` (real) ou `--dry-run` (só diz o que faria);
 #   stdout = UMA linha; saída 0 = agiu e terminou · 10 = nada a fazer ou guarda adiou · 20 = falhou · 30 = não consegui ler o estado (não age). Passou de 900 s = TERM e conta como 20.
 #   Degrau ausente (ou sem permissão de execução): loga, avisa uma vez (notify -p 4) e PULA para o próximo. 10/20/30 repetem em 5 min; 0 não repete esse degrau por 30 min.
@@ -56,6 +61,8 @@ RB_OUT=""
 LOCK_HELD=0
 RC_FINAL=0
 SAVE_FAIL=0
+ASIDE=""     # estado ruim a pôr de lado (.corrupt-<hora>) só quando o novo já estiver gravado
+SEEN=" "     # chaves que o load_state viu no arquivo
 
 cfg() {  # $1=nome $2=padrão → define a variável $1 com DR_$1 (só dígitos, até 9); vazio → padrão; lixo → padrão E registra em CFG_WARN (limiar que não leio não vira "sem limite")
   local v
@@ -70,7 +77,7 @@ cfg() {  # $1=nome $2=padrão → define a variável $1 com DR_$1 (só dígitos,
 cfg D2_MB 5120;  cfg D2_HOLD_S 900
 cfg D3_MB 4096;  cfg D3_HOLD_S 1800
 cfg D4_MB 3072;  cfg D4_HOLD_S 3600
-cfg D4_HARD_MB 1536; cfg D4_HARD_N 2
+cfg D4_HARD_MB 1536; cfg D4_HARD_N 2; cfg D4_HARD_SPACE_S 100
 cfg HYST_MB 512; cfg GAP_S 600; cfg RETRY_S 300; cfg ACTED_REPEAT_S 1800; cfg D4_COOLDOWN_S 21600
 cfg RUNG_TIMEOUT_S 900; cfg SETTLE_S 15; cfg WARN_EVERY_S 3600; cfg HEARTBEAT_S 3600; cfg LOG_MAX_KB 5120
 cfg NOTIFY_TIMEOUT_S 30; cfg MAIL_TIMEOUT_S 60
@@ -150,9 +157,13 @@ update_timers() {  # $1=livre $2=agora $3=1 conta a leitura para o caminho "< 1,
     fi
   done
   if [ "${3:-0}" = 1 ]; then
-    if [ "$1" -lt "$D4_HARD_MB" ]; then HARD_N=$((HARD_N + 1)); else HARD_N=0; fi
+    # "seguidas" = rodadas separadas por >= D4_HARD_SPACE_S: duas rodadas coladas (--run à mão, launchd atrasado que alcança) são UMA leitura, não duas
+    if [ "$1" -ge "$D4_HARD_MB" ]; then HARD_N=0; HARD_TS=0
+    elif [ "$HARD_N" -eq 0 ]; then HARD_N=1; HARD_TS=$2
+    elif [ $(( $2 - HARD_TS )) -ge "$D4_HARD_SPACE_S" ]; then HARD_N=$((HARD_N + 1)); HARD_TS=$2
+    fi
   elif [ "$1" -ge "$D4_HARD_MB" ]; then
-    HARD_N=0
+    HARD_N=0; HARD_TS=0
   fi
 }
 
@@ -164,14 +175,18 @@ eligible() {  # $1=n $2=agora → rc 0 se o tempo do limiar do degrau passou (D4
 
 # ── estado salvo ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 state_reset() {
-  STV=0; LAST_TS=0; LAST_FREE=0; LAST_SWAP=0; HARD_N=0; ACTED4_TS=0; ESC4=0; WARN_TS=0; WARN2_TS=0; HB_TS=0
-  SINCE2=0; SINCE3=0; SINCE4=0; ST2=none; ST3=none; ST4=none; AT2=0; AT3=0; AT4=0
+  STV=0; LAST_TS=0; LAST_FREE=0; LAST_SWAP=0; HARD_N=0; HARD_TS=0; ACTED4_TS=0; ESC4=0; WARN_TS=0; WARN2_TS=0; HB_TS=0
+  SINCE2=0; SINCE3=0; SINCE4=0; ST2=none; ST3=none; ST4=none; AT2=0; AT3=0; AT4=0; NT2=0; NT3=0; NT4=0
 }
 
-state_ok() {  # valida o que foi lido: a marca v=1 existe (arquivo que não é nosso/truncado não passa), todo campo numérico é número e todo estado é de um conjunto fechado → rc 0
+state_ok() {  # valida o que foi lido: a marca v=1 existe, TODAS as chaves do save_state estão no arquivo (cortado numa fronteira de linha não passa: chave que falta virava 0 em silêncio, e acted4_ts=0 liga o reinício),
+  # todo campo numérico é número e todo estado é de um conjunto fechado → rc 0. vazio (chave ausente) → rc 1; falhou/ilegível → rc 1
   local v
   [ "$STV" = 1 ] || return 1
-  for v in "$LAST_TS" "$LAST_FREE" "$LAST_SWAP" "$HARD_N" "$ACTED4_TS" "$ESC4" "$WARN_TS" "$WARN2_TS" "$HB_TS" "$SINCE2" "$SINCE3" "$SINCE4" "$AT2" "$AT3" "$AT4"; do
+  for v in v last_ts last_free_mb last_swap_mb hard_n hard_ts acted4_ts esc4 warn_ts warn2_ts hb_ts since2 since3 since4 st2 st3 st4 at2 at3 at4 nt2 nt3 nt4; do
+    case "$SEEN" in *" $v "*) ;; *) return 1 ;; esac
+  done
+  for v in "$LAST_TS" "$LAST_FREE" "$LAST_SWAP" "$HARD_N" "$HARD_TS" "$ACTED4_TS" "$ESC4" "$WARN_TS" "$WARN2_TS" "$HB_TS" "$SINCE2" "$SINCE3" "$SINCE4" "$AT2" "$AT3" "$AT4" "$NT2" "$NT3" "$NT4"; do
     isnum "$v" || return 1
   done
   for v in "$ST2" "$ST3" "$ST4"; do
@@ -180,26 +195,30 @@ state_ok() {  # valida o que foi lido: a marca v=1 existe (arquivo que não é n
   return 0
 }
 
-load_state() {  # vazio (arquivo ausente) → 1ª rodada, estado zerado, sem aviso; falhou/ilegível/vazio-de-0-bytes/campo inválido → põe de lado (.corrupt-<hora>), AVISA, estado zerado: cronômetros recomeçam, nada dispara por histórico que não li
+load_state() {  # vazio (arquivo ausente) → 1ª rodada, estado zerado, sem aviso, acted4_ts=0; falhou/ilegível/0 bytes/chave que falta/campo inválido → AVISA, estado zerado (cronômetros recomeçam: nada dispara por histórico que não li)
+  # MAS acted4_ts=AGORA (não sei se o D4 acabou de disparar: o teto de 6 h vale) e o arquivo ruim vai para .corrupt-<hora> só quando o novo estado estiver gravado (ASIDE, no save_state). Precisa de $NOW.
   local k v
   state_reset
+  SEEN=" "
   [ -e "$STATE" ] || { log "estado: primeira rodada (sem $STATE)"; return 0; }
   if [ -r "$STATE" ] && [ -s "$STATE" ]; then
     # `|| [ -n "$k" ]`: a última linha SEM \n final faz o read devolver 1 e o corpo do laço não rodar → o campo final seria ignorado em
     # silêncio e o arquivo passaria como válido (o save_state sempre termina com \n; isto cobre arquivo cortado ou editado à mão)
     while IFS='=' read -r k v || [ -n "$k" ]; do
+      SEEN="$SEEN$k "
       case "$k" in
-        v) STV=$v ;; last_ts) LAST_TS=$v ;; last_free_mb) LAST_FREE=$v ;; last_swap_mb) LAST_SWAP=$v ;; hard_n) HARD_N=$v ;; acted4_ts) ACTED4_TS=$v ;; esc4) ESC4=$v ;;
+        v) STV=$v ;; last_ts) LAST_TS=$v ;; last_free_mb) LAST_FREE=$v ;; last_swap_mb) LAST_SWAP=$v ;; hard_n) HARD_N=$v ;; hard_ts) HARD_TS=$v ;; acted4_ts) ACTED4_TS=$v ;; esc4) ESC4=$v ;;
         warn_ts) WARN_TS=$v ;; warn2_ts) WARN2_TS=$v ;; hb_ts) HB_TS=$v ;;
         since2) SINCE2=$v ;; since3) SINCE3=$v ;; since4) SINCE4=$v ;;
-        st2) ST2=$v ;; st3) ST3=$v ;; st4) ST4=$v ;; at2) AT2=$v ;; at3) AT3=$v ;; at4) AT4=$v ;;
+        st2) ST2=$v ;; st3) ST3=$v ;; st4) ST4=$v ;; at2) AT2=$v ;; at3) AT3=$v ;; at4) AT4=$v ;; nt2) NT2=$v ;; nt3) NT3=$v ;; nt4) NT4=$v ;;
       esac
     done < "$STATE"
     state_ok && return 0
   fi
   state_reset
-  note "WARN: estado salvo ilegível ou inválido ($STATE): ponho de lado e recomeço os cronômetros do zero (nada dispara por histórico que não li)"
-  [ "$DRY" = 1 ] || mv -f "$STATE" "$STATE.corrupt-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+  ACTED4_TS=$NOW
+  note "WARN: estado salvo ilegível, incompleto ou inválido ($STATE): ponho de lado e recomeço os cronômetros do zero (nada dispara por histórico que não li); acted4_ts passa a ser AGORA ($NOW): não sei se o D4 acabou de disparar, então o teto de 6 h vale"
+  [ "$DRY" = 1 ] || ASIDE="$STATE.corrupt-$(date +%Y%m%d%H%M%S)"
   return 0
 }
 
@@ -209,10 +228,10 @@ save_state() {  # grava inteiro num temporário e troca com mv. Falhou (disco ch
   {
     echo "v=1"
     echo "last_ts=$LAST_TS"; echo "last_free_mb=$LAST_FREE"; echo "last_swap_mb=$LAST_SWAP"; echo "hard_n=$HARD_N"
-    echo "acted4_ts=$ACTED4_TS"; echo "esc4=$ESC4"; echo "warn_ts=$WARN_TS"; echo "warn2_ts=$WARN2_TS"; echo "hb_ts=$HB_TS"
+    echo "hard_ts=$HARD_TS"; echo "acted4_ts=$ACTED4_TS"; echo "esc4=$ESC4"; echo "warn_ts=$WARN_TS"; echo "warn2_ts=$WARN2_TS"; echo "hb_ts=$HB_TS"
     echo "since2=$SINCE2"; echo "since3=$SINCE3"; echo "since4=$SINCE4"
-    echo "st2=$ST2"; echo "st3=$ST3"; echo "st4=$ST4"; echo "at2=$AT2"; echo "at3=$AT3"; echo "at4=$AT4"
-  } 2>/dev/null > "$tmp" && mv -f "$tmp" "$STATE" 2>/dev/null || {
+    echo "st2=$ST2"; echo "st3=$ST3"; echo "st4=$ST4"; echo "at2=$AT2"; echo "at3=$AT3"; echo "at4=$AT4"; echo "nt2=$NT2"; echo "nt3=$NT3"; echo "nt4=$NT4"
+  } 2>/dev/null > "$tmp" && { [ -z "$ASIDE" ] || mv -f "$STATE" "$ASIDE" 2>/dev/null; ASIDE=""; } && mv -f "$tmp" "$STATE" 2>/dev/null || {
     rm -f "$tmp" 2>/dev/null
     SAVE_FAIL=1
     note "WARN: não consegui gravar o estado ($STATE): disco cheio ou sem permissão; a escada fica cega para o TEMPO (cada rodada relê o arquivo antigo); saio com 30"
@@ -273,7 +292,7 @@ send_mail() {  # $1=assunto $2=corpo. Mesma regra: em dry-run só mostra; falha 
 
 # ── um degrau ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 run_rung() {  # $1=n $2=agora. rc 1 = degrau ausente (não gastou a rodada; o chamador tenta o próximo); rc 0 = chamou; rc 2 = NÃO chamei porque não consegui gravar a marca antes (a rodada acaba)
-  local n=$1 t0=$2 cmd mode rc cls line held t1 pre4 verb prio preST preAT
+  local n=$1 t0=$2 cmd mode rc cls line held t1 pre4 verb prio preST preAT nt
   cmd=$(rung_cmd "$n")
   # existe e é executável? não existe/falhou/sem permissão → "ausente": loga, avisa uma vez por marca, PULA
   if [ ! -f "$cmd" ] || [ ! -x "$cmd" ]; then
@@ -332,17 +351,26 @@ run_rung() {  # $1=n $2=agora. rc 1 = degrau ausente (não gastou a rodada; o ch
     acted|failed)
       case "$n" in 2) prio=3 ;; 3) prio=4 ;; *) prio=5 ;; esac
       if [ "$cls" = acted ]; then verb="agiu"; else verb="FALHOU"; [ "$prio" -lt 4 ] && prio=4; RC_FINAL=20; fi
-      send_notify "$prio" "Disco: degrau D$n $verb" "D$n $verb: livre ${before} -> ${after} MB, swap ${swap2} MB. $line"
-      send_mail "Disco: degrau D$n $verb (livre ${before} -> ${after} MB)" "Escada de recuperação de disco (ga-1p1i5jr.1).
+      # FALHOU repete a cada RETRY_S (5 min) enquanto o disco está baixo: 1 notify (push forçado) + 1 mail (= um bead e um commit no Dolt) por hora por degrau, o resto só no log. "agiu" avisa sempre (repete no máx. a cada 30 min)
+      nt=$(getv NT "$n")
+      if [ "$cls" = failed ] && [ "$t1" -ge "$nt" ] && [ $(( t1 - nt )) -lt "$WARN_EVERY_S" ]; then
+        log "D$n $verb de novo: o aviso e o mail dele saíram há $(( t1 - nt ))s (no máximo 1 por ${WARN_EVERY_S}s por degrau); só log"
+      else
+        setv NT "$n" "$t1"
+        send_notify "$prio" "Disco: degrau D$n $verb" "D$n $verb: livre ${before} -> ${after} MB, swap ${swap2} MB. $line"
+        send_mail "Disco: degrau D$n $verb (livre ${before} -> ${after} MB)" "Escada de recuperação de disco (ga-1p1i5jr.1).
 Degrau: D$n ($cmd $mode) rc=$rc ($cls)
 Saída do degrau: $line
 Livre antes/depois: ${before} / ${after} MB   Swap depois: ${swap2} MB
 Cronômetros (s abaixo do limiar): D2=$(held_of 2 "$t2") D3=$(held_of 3 "$t2") D4=$(held_of 4 "$t2")   leituras < ${D4_HARD_MB}MB seguidas: $HARD_N
-Log: $LOG   Estado: $STATE   Desligar o maestro: touch $OFF" ;;
+Log: $LOG   Estado: $STATE   Desligar o maestro: touch $OFF"
+      fi ;;
     unknown)
       if [ $(( t1 - WARN2_TS )) -ge "$WARN_EVERY_S" ]; then
         WARN2_TS=$t1
-        send_notify 3 "Disco: degrau D$n não leu o estado" "D$n devolveu rc=$rc (não consegui ler o estado; não agiu): $line"
+        # o D4 cego com o disco crítico é "escada cega" como o df ilegível: -p 4 forçado (a -p 3 pode cair no resumo mudo da hora)
+        prio=3; [ "$n" = 4 ] && prio=4
+        send_notify "$prio" "Disco: degrau D$n não leu o estado" "D$n devolveu rc=$rc (não consegui ler o estado; não agiu): $line"
       fi ;;
   esac
   return 0
@@ -356,10 +384,10 @@ held_of() {  # $1=n $2=agora → segundos que o cronômetro do nível está roda
 escalate_d4_cap() {  # $1=agora. D4 já foi disparado há menos de 6 h e o disco segue < limiar: NÃO reinicia de novo; escala UMA vez por episódio
   [ "$ESC4" = 1 ] && return 0
   local age=$(( $1 - ACTED4_TS ))
-  note "ESCALA: D4 elegível (livre=${FREE}MB) mas o último disparo dele foi há ${age}s (< ${D4_COOLDOWN_S}s): NÃO chamo de novo (sem reinício em laço)"
+  note "ESCALA: D4 elegível (livre=${FREE}MB) mas o último disparo dele (ou a perda do estado salvo, que conto como disparo) foi há ${age}s (< ${D4_COOLDOWN_S}s): NÃO chamo de novo (sem reinício em laço)"
   [ "$DRY" = 1 ] || ESC4=1
-  send_notify 5 "Disco: segue baixo depois do reinício, preciso de um humano" "Livre ${FREE} MB, swap ${SWAP} MB. O último disparo do D4 foi há $((age / 60)) min e o disco segue abaixo do limiar. Não reinicio de novo antes de $((D4_COOLDOWN_S / 3600)) h."
-  send_mail "Disco: D4 já disparou há $((age / 60)) min e o disco segue baixo (livre ${FREE} MB)" "O maestro da escada de disco (ga-1p1i5jr.1) NÃO chama o D4 de novo dentro de ${D4_COOLDOWN_S}s do último disparo (laço de reinício). Livre agora: ${FREE} MB, swap ${SWAP} MB. Último disparo do D4: há ${age}s. Precisa de um humano: o que está comendo o disco depois do boot? Log: $LOG"
+  send_notify 5 "Disco: segue baixo depois do reinício, preciso de um humano" "Livre ${FREE} MB, swap ${SWAP} MB. O último disparo do D4 (ou a perda do estado salvo da escada) foi há $((age / 60)) min e o disco segue abaixo do limiar. Não reinicio de novo antes de $((D4_COOLDOWN_S / 3600)) h."
+  send_mail "Disco: D4 já disparou há $((age / 60)) min e o disco segue baixo (livre ${FREE} MB)" "O maestro da escada de disco (ga-1p1i5jr.1) NÃO chama o D4 de novo dentro de ${D4_COOLDOWN_S}s do último disparo (laço de reinício). Livre agora: ${FREE} MB, swap ${SWAP} MB. Último disparo do D4 (ou perda do estado salvo): há ${age}s. Precisa de um humano: o que está comendo o disco depois do boot? Se o estado salvo se perdeu e o D4 NÃO chegou a disparar, apagar $STATE libera o D4 (zera o teto). Log: $LOG"
 }
 
 try_rung() {  # $1=n $2=agora. rc 0 = chamou o degrau (a rodada acabou); rc 1 = não chamou e a rodada segue (ausente, ou D4 dentro do tempo de espera do reinício); rc 2 = não chamou porque a marca não pôde ser gravada (a rodada acaba)
@@ -392,15 +420,17 @@ pick_and_run() {  # $1=agora. UM degrau por rodada, só os que têm o cronômetr
 
 # ── trava de instância única ─────────────────────────────────────────────────────────────────────────────────────────────────────
 acquire_lock() {  # rc 0 = peguei; rc 1 = outra instância viva. Trava velha (pid morto, ou vivo mas não é este script) é refeita. Sem pid ainda (mkdir feito, echo pendente) e dir novo (< 1 min) = ocupado
-  local p tries=0
+  local p c tries=0
   while [ "$tries" -lt 2 ]; do
     if mkdir "$LOCK" 2>/dev/null; then echo $$ > "$LOCK/pid" 2>/dev/null; LOCK_HELD=1; return 0; fi
     # vazio (sem pid) → ocupado se o dir é novo; falhou/ilegível → idem: na dúvida a outra instância é a dona
     p=$(cat "$LOCK/pid" 2>/dev/null)
     if [ -z "$p" ]; then
       [ -n "$(find "$LOCK" -maxdepth 0 -mmin +1 2>/dev/null)" ] || return 1
-    elif kill -0 "$p" 2>/dev/null && ps -p "$p" -o command= 2>/dev/null | grep -q 'disk-recovery-ladder'; then
-      return 1
+    elif kill -0 "$p" 2>/dev/null; then
+      # pid vivo: só é trava velha se o ps LEU outro comando (pid reaproveitado). vazio (ps sem saída) → dúvida → a outra instância é a dona; falhou/ilegível → idem
+      c=$(ps -p "$p" -o command= 2>/dev/null)
+      case "$c" in ''|*disk-recovery-ladder*) return 1 ;; esac
     fi
     rm -f "$LOCK/pid" 2>/dev/null; rmdir "$LOCK" 2>/dev/null
     tries=$((tries + 1))
@@ -408,6 +438,16 @@ acquire_lock() {  # rc 0 = peguei; rc 1 = outra instância viva. Trava velha (pi
   return 1
 }
 release_lock() { if [ "$LOCK_HELD" = 1 ]; then rm -f "$LOCK/pid" 2>/dev/null; rmdir "$LOCK" 2>/dev/null; LOCK_HELD=0; fi; return 0; }
+
+nosave_warn() {  # estado que não grava: a escada não guarda tempo e não chama degrau. Avisa -p 4 forçado, no máx. 1 por hora; a marca do aviso é um arquivo VAZIO em $GCDIR (tocar um que já existe não gasta bloco)
+  local m="$GCDIR/disk-recovery.nosave"
+  [ "$DRY" = 1 ] && return 0
+  # vazio (sem marca) → avisa; falhou/ilegível (find sem resposta) → avisa: aqui o silêncio é o lado perigoso
+  [ -z "$(find "$m" -maxdepth 0 -mmin -60 2>/dev/null)" ] || return 0
+  send_notify 4 "Disco: a escada não consegue gravar o estado" "Não consegui gravar $STATE. A escada de recuperação NÃO chama degrau nenhum enquanto isso (sem a marca no disco um reinício se repetiria). (aviso no máximo 1 por hora)"
+  : > "$m" 2>/dev/null
+  return 0
+}
 
 rotate_log() {  # log acima de LOG_MAX_KB vira .1 (um só backup). tamanho ilegível → não gira (log maior que o previsto é melhor que log perdido)
   local kb
@@ -448,7 +488,7 @@ main() {
   # lacuna: tempo que ninguém observou não conta como "abaixo do limiar". Relógio que andou para trás idem.
   if [ "$LAST_TS" -gt 0 ] && { [ "$NOW" -lt "$LAST_TS" ] || [ $(( NOW - LAST_TS )) -gt "$GAP_S" ]; }; then
     log "lacuna: última leitura em $LAST_TS, agora $NOW (> ${GAP_S}s ou relógio para trás): cronômetros e marcas zerados (acted4_ts fica)"
-    SINCE2=0; SINCE3=0; SINCE4=0; ST2=none; ST3=none; ST4=none; AT2=0; AT3=0; AT4=0; HARD_N=0; ESC4=0
+    SINCE2=0; SINCE3=0; SINCE4=0; ST2=none; ST3=none; ST4=none; AT2=0; AT3=0; AT4=0; HARD_N=0; HARD_TS=0; ESC4=0
   fi
 
   update_timers "$FREE" "$NOW" 1
@@ -464,7 +504,7 @@ main() {
   save_state
   pick_and_run "$NOW"
   save_state
-  [ "$SAVE_FAIL" = 1 ] && [ "$RC_FINAL" = 0 ] && RC_FINAL=30
+  if [ "$SAVE_FAIL" = 1 ]; then [ "$RC_FINAL" = 0 ] && RC_FINAL=30; nosave_warn; fi
   exit "$RC_FINAL"
 }
 
