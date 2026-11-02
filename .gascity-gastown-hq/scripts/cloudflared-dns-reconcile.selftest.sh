@@ -54,8 +54,9 @@ echo "── Cenarios 3+: o script inteiro contra curl, python3 e cloudflared de
 # Ate aqui so os dois FATAL do preflight rodavam. Agora o resto: cert ausente, tunnel id, sem hostnames,
 # credenciais, o que fazer quando nada falta, criar so o que falta, a rota que falha e o fallback quando a
 # API nao responde. O python3 de mentira so atende o trecho que le o cert.pem do mini (caminho fixo dentro
-# do script); o resto vai para o python3 de verdade. Os stubs nascem por printf, sem here-document (o bash
-# 3.2.57 do no grava o temporario do here-document em /tmp sem olhar TMPDIR e a jaula nega).
+# do script); o resto vai para o python3 de verdade. Os stubs novos nascem por printf, sem here-document (o
+# bash 3.2.57 do no grava o temporario do here-document em /tmp sem olhar TMPDIR e a jaula que emula o
+# sandbox do gate nega).
 # EQUIVALENTES (lastro e95f59f16c L47 e 90615c79ab L56): `notify_fail ... || true` -> `&& true` e o
 # `return 0` de log() -> `return 1` so mudam o STATUS dessas duas funcoes, e nenhum chamador o le (o
 # script nao tem set -e e sai por exit explicito ou pelo `[[ $failed -eq 0 ]]` final).

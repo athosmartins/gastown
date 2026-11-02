@@ -405,9 +405,10 @@ done
 
 # The CLI cases above reach e12_record only through e12_recorded_arm and e12_resolve, whose own guards come first, so the guards inside
 # e12_record (no jq, no state dir, an empty row, a roster that is not a file, an unreadable last byte, an append that fails) were never read
-# by their status, and e12_conf_load / e12_main were never run under set -e. Each case below calls the function in a child that sources
-# the library, with a FUNCTION shim standing in for jq, tr, od or mkdir that FAILS BUT STILL PRINTS A GOOD-LOOKING VALUE — the third state a
-# happy-path test never produces. (ga-qec2rdl, hq-mutants lastro.) EQUIVALENT, documented: 4f28f91c90 and de3fb6044f (`{ [ -f ] && [ -r ]; } ||
+# by their status, and e12_conf_load with no conf and e12_main with no argument were never run under set -e. Each case below calls the
+# function in a child that sources the library. Where a command has to fail in a way the real tools do not, a FUNCTION shim stands in for
+# jq, tr, od or mkdir and FAILS AFTER DOING OR PRINTING THE GOOD THING — the third state a happy-path test never produces. (ga-qec2rdl,
+# hq-mutants lastro.) EQUIVALENT, documented: 4f28f91c90 and de3fb6044f (`{ [ -f ] && [ -r ]; } ||
 # return 3` in e12_recorded_arm): the jq call right below fails with rc 2 on exactly the roster those guards turn away, and that failure is
 # already mapped to rc 3. Measured with and without the guard on a directory, a chmod-000 file and a dangling link: rc 3, empty stdout.
 echo "== 9. e12_record and e12_conf_load: the status of every branch =="

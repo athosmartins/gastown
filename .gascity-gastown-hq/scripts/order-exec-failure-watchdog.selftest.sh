@@ -222,8 +222,8 @@ grep -q '<key>ProcessType</key><string>Interactive</string>' "$PLIST" \
 
 # ── Lastro hq-mutants (ga-qec2rdl) ──────────────────────────────────────────
 # Ate aqui nenhum caso lia o STATUS de run_sweep, o limite exato do cooldown e do clamp, o ramo "so linhas
-# benignas" nem o script EXECUTADO (o guard do modo lib). date, wc e tail de mentira (funcoes deste shell,
-# como os stubs de gc/notify no PATH) fazem falhar o que de graca nao falha.
+# benignas" nem o script EXECUTADO (o guard do modo lib). date, wc e tail de mentira (funcoes deste shell;
+# gc e notify seguem sendo os stubs do PATH) fazem falhar o que de graca nao falha.
 # EQUIVALENTES (lastro): 829c43a963 bc42a497e0 237afdb31f 8dc1c151f3 5f72a8c256 0720001ec3 5a0417f77d 4cfff30377
 # 2752235dc1 0f4a812dbe c2c2b2831a (`cmd || true` -> `cmd && true` em escrita de log/estado: ninguem le o status
 # e nao ha set -e) e aaa8b8590e 6082e67a18 (`command -v X && X ... || true` -> `&& true`: so muda o status de
