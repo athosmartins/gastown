@@ -8,8 +8,10 @@
 #   cada guarda, a extração do código do reinício noturno); o aviso sai ANTES do pedido e com entrega CONFIRMADA (push falho → mail; os dois falhos
 #   ou prazo estourado → não reinicia; escalada e carimbos de "já avisei" só com entrega confirmada); a marca do reinício está NO DISCO antes do pedido; as guardas
 #   são relidas depois da carência; cooldown de 6 h, teto de 2 por 24 h, mini no ar há < 2 h, espera de 10 min; pedido que falha ou que não derruba
-#   o mini desfaz a marca e sai 20; UMA linha no stdout; dry-run não escreve nem avisa. A guarda de ligação é um STUB (o leitor de verdade e o
-#   código dele têm selftest próprio: disk-recovery-d4-calls-in-flight.selftest.sh).
+#   o mini desfaz a marca e sai 20; UMA linha no stdout; dry-run não escreve nem avisa. A guarda de ligação é um STUB na maioria dos cenários (o código do
+#   leitor tem selftest próprio: disk-recovery-d4-calls-in-flight.selftest.sh); a seção "leitor REAL" (ga-1p1i5jr.4.2) roda o D4 contra o leitor de
+#   verdade e bancos WAL de mentira, e cobre ainda: pré-checagem (textos novos, erros estranhos, dry-run), bordas do estado e do cooldown, número
+#   ruim em DR4_* e sentinela DUPLICADA no reinício noturno.
 # COMO NÃO REINICIA: o D4 só chama DR4_REBOOT_CMD (um stub que anota e, no cenário "o mini cai", mata o próprio D4 como o desligamento mata) ou
 #   DR4_OSASCRIPT_BIN (outro stub); DR4_NO_REAL_REBOOT=1 vale em TODOS os cenários: se uma costura sumir, o comando de verdade é recusado.
 # FILTRO: D4_ST_ONLY='^cool$|^cap$' roda só esses cenários; DR4_ST_SUT aponta outra cópia do D4 (a bateria de mutantes usa os dois).
@@ -44,7 +46,8 @@ REALBOOT=$(( $(date +%s) - 100000 ))
 # ── um cenário = um diretório com stubs e um vetor de ambiente ──────────────────────────────────────────────────────────────────
 ENVV=()
 setenv() { ENVV+=("$1"); }   # o último valor de uma variável vence no `env`
-stub() {  # $1=nome $2=conteúdo do script em $C/bin
+stub() {  # $1=nome $2=conteúdo do script em $C/bin (cenário pulado pelo filtro não tem $C/bin)
+  [ "$SKIP" = 1 ] && return 0
   printf '#!/bin/bash\n%s\n' "$2" > "$C/bin/$1"; chmod +x "$C/bin/$1"
 }
 mk_case() {  # $1=nome → C=$T/<nome> com stubs "tudo ok" e o vetor ENVV
@@ -107,6 +110,37 @@ expect_no_reboot() {  # $1=desc $2=rc [$3=trecho]: rc certo + UMA linha + nenhum
   check "$1: uma linha no stdout (veio $NL)" one_line
   check "$1: NÃO pediu reinício" no_reboot
   [ -z "${3:-}" ] || check "$1: stdout cita '$3' (veio: $OUT)" contains "$3"
+}
+
+# ── fixtures do leitor REAL (ga-1p1i5jr.4.2): bancos sqlite em WAL, mesmo molde do selftest do leitor; "estado@minutos-atrás" por linha ──
+CALLS_REAL="${DR4_ST_CALLS:-$D/disk-recovery-d4-calls-in-flight.py}"
+cat > "$T/mkfix.py" <<'PYEOF'
+import sqlite3, sys
+kind, path, rows = sys.argv[1], sys.argv[2], sys.argv[3:]
+con = sqlite3.connect(path)
+con.execute("PRAGMA journal_mode=WAL")
+if kind == "pix":
+    con.execute("CREATE TABLE pix_call_log (id INTEGER PRIMARY KEY, call_id TEXT, state TEXT, started_at TEXT, ended_at TEXT, updated_at TEXT)")
+    table, col = "pix_call_log", "state"
+else:
+    con.execute("CREATE TABLE voicebot_call_log (id INTEGER PRIMARY KEY, call_id TEXT, status TEXT, started_at TEXT, updated_at TEXT)")
+    table, col = "voicebot_call_log", "status"
+for i, r in enumerate(rows):
+    state, _, age = r.partition("@")
+    con.execute("INSERT INTO %s (call_id, %s, started_at) VALUES (?, ?, datetime('now','localtime','-%d minutes'))" % (table, col, int(age)), ("c%d" % i, state))
+con.commit(); con.close()
+PYEOF
+real_calls() {  # depois do mk_case: troca o STUB do leitor pelo leitor REAL e cria os dois bancos em $C. $1/$2 = linhas do pix/voicebot ("dialing@3 bridged@30"); omitido = banco vazio
+  [ "$SKIP" = 1 ] && return 0
+  /usr/bin/python3 -I "$T/mkfix.py" pix "$C/pix.db" ${1:-}; /usr/bin/python3 -I "$T/mkfix.py" vb "$C/vb.db" ${2:-}
+  # o banco de produção é WAL SEM -wal/-shm (os apps abrem e fecham a cada operação) e é esse estado que fez `mode=ro` falhar 34 vezes em 40; o python do
+  # sistema deixa os dois, vazios (já checkpointados), ao fechar: tirá-los não perde linha (o ri_pix prova, ele precisa ainda ver a linha)
+  rm -f "$C/pix.db-wal" "$C/pix.db-shm" "$C/vb.db-wal" "$C/vb.db-shm"
+  setenv "DR4_CALLS_PY=$CALLS_REAL"; setenv "PIX_CALL_QUEUE_DEMAND_DB=$C/pix.db"; setenv "VOICEBOT_COST_DB=$C/vb.db"
+}
+dup_block() {  # $1=NOME da sentinela do nightly → cópia do nightly com o bloco $1-START..$1-END DUPLICADO; aponta o D4 para ela
+  [ "$SKIP" = 1 ] && return 0
+  { cat "$NIGHTLY_REAL"; sed -n "/$1-START/,/$1-END/p" "$NIGHTLY_REAL"; } > "$C/nightly-dup.sh"; setenv "DR4_NIGHTLY=$C/nightly-dup.sh"
 }
 
 # ═══ uso, dry-run, reinício de verdade ═════════════════════════════════════════════════════════════════════════════════════════
@@ -230,6 +264,19 @@ run_sut --run;  expect_no_reboot "mini no ar há 50 min" 10 "no ar há"
 mk_case uptime_edge; setenv "DR4_BOOT_EPOCH=$((NOW - 7200))"; touch "$C/reboot.dies"
 run_sut --run;  check "mini no ar há exatamente 2 h já pode (kill 143; veio $RC: $OUT)" [ "$RC" = 143 ]
 
+section "teto e cooldown: bordas (ga-1p1i5jr.4.2)"
+mk_case cap_old; saved_state "$((NOW - 100000)),$((NOW - 90000))"; touch "$C/reboot.dies"
+run_sut --run;  check "2 reinícios, os dois com mais de 24 h: podem de novo (kill 143; veio $RC: $OUT)" [ "$RC" = 143 ]
+chk "cap_old: a marca nova entra na lista; as velhas (< 7 dias) ficam nela sem contar" 'grep -qx "reboots=$((NOW - 100000)),$((NOW - 90000)),$NOW" "$C/state.at-reboot"'
+mk_case cap_edge; saved_state "$((NOW - 86400)),$((NOW - 30000))"
+run_sut --run;  expect_no_reboot "marca com EXATAMENTE 24 h ainda conta para o teto" 10 "teto diário"
+mk_case cap_edge2; saved_state "$((NOW - 86401)),$((NOW - 30000))"; touch "$C/reboot.dies"
+run_sut --run;  check "marca com 24 h + 1 s já não conta (kill 143; veio $RC: $OUT)" [ "$RC" = 143 ]
+mk_case fut; saved_state $((NOW + 500))
+run_sut --run;  expect_no_reboot "marca no FUTURO (o relógio voltou) conta como cooldown, não é ignorada" 10 "cooldown"
+mk_case prune; saved_state $((NOW - 700000)); touch "$C/reboot.dies"
+run_sut --run;  chk "marca com mais de 7 dias é podada na gravação (kill 143; lista: $(grep reboots= "$C/state.at-reboot" 2>/dev/null))" '[ "$RC" = 143 ] && grep -qx "reboots=$NOW" "$C/state.at-reboot"'
+
 section "estado ilegível ou ausente"
 mk_case st_bad1; echo "reboots=abc" > "$C/state"
 run_sut --run;  expect_no_reboot "reboots não numérico" 30 "estado do D4"
@@ -241,6 +288,35 @@ check "não consegue GRAVAR o estado: rc 20 pela mensagem de gravação, não pe
 check "não consegue GRAVAR o estado: rc 20" [ "$RC" = 20 ]
 check "não consegue gravar o estado: NÃO pediu o reinício" no_reboot
 chmod 755 "$C/ro"
+
+section "estado e boottime: bordas (ga-1p1i5jr.4.2)"
+mk_case sx_v2; printf 'v=2\nreboots=\n' > "$C/state"
+run_sut --run;  expect_no_reboot "estado de versão desconhecida (v=2)" 30 "versão de estado desconhecida"
+mk_case sx_hole; echo "reboots=100,,200" > "$C/state"
+run_sut --run;  expect_no_reboot "lista com elemento vazio no meio (100,,200)" 30 "estado do D4"
+mk_case sx_trail; echo "reboots=100," > "$C/state"
+run_sut --run;  expect_no_reboot "lista que termina em vírgula" 30 "estado do D4"
+mk_case sx_lead; echo "reboots=,100" > "$C/state"
+run_sut --run;  expect_no_reboot "lista que começa com vírgula" 30 "estado do D4"
+mk_case sx_big; echo "reboots=99999999999999" > "$C/state"
+run_sut --run;  expect_no_reboot "número gigante (14 dígitos) é ilegível, não aritmética muda (senão virava 'cooldown')" 30 "estado do D4"
+mk_case sx_dir; mkdir "$C/state"
+run_sut --run;  expect_no_reboot "estado que é um DIRETÓRIO (existe e não é arquivo legível)" 30 "não é um arquivo legível"
+for k in defer_until defer_notify_ts esc_for; do
+  mk_case "sx_k_$k"; echo "$k=x1" > "$C/state"
+  run_sut --run;  expect_no_reboot "estado com $k não numérico" 30 "$k"
+done
+mk_case sx_key; printf 'v=1\nreboots=\nfoo=bar\nsem-igual\n' > "$C/state"; touch "$C/reboot.dies"
+run_sut --run;  check "chave desconhecida e linha sem '=' são ignoradas (versão futura do mesmo v=1): reinicia (kill 143; veio $RC: $OUT)" [ "$RC" = 143 ]
+mk_case sx_nonl; printf 'v=1\nreboots=%s' "$((NOW - 3600))" > "$C/state"
+run_sut --run;  expect_no_reboot "última linha SEM quebra de linha também é lida (cooldown de 1 h)" 10 "cooldown"
+mk_case bt_bad; setenv "DR4_BOOT_EPOCH=abc"
+run_sut --run;  expect_no_reboot "DR4_BOOT_EPOCH ilegível" 30 "quando o mini subiu"
+mk_case bt_sys; setenv "DR4_BOOT_EPOCH="
+run_sut --run;  expect_no_reboot "kern.boottime ilegível (o sysctl devolve outra coisa): não sei, não 'subiu há pouco'" 30 "quando o mini subiu"
+mk_case bt_ok; setenv "DR4_BOOT_EPOCH="; stub sysctl "echo '{ sec = $BOOT, usec = 5 } Mon Oct 31 12:00:00 2026'"; touch "$C/reboot.dies"
+run_sut --run;  check "kern.boottime lido do sysctl: reinicia (kill 143; veio $RC: $OUT)" [ "$RC" = 143 ]
+chk "kern.boottime: leu o token 'sec', não o 'usec' (log: no ar há 1500 min)" 'grep -q "no ar há 1500 min" "$C/log"'
 
 section "pré-checagem"
 mk_case pre_fv;  echo "FileVault is On." > "$C/fdesetup.out"
@@ -255,6 +331,34 @@ mk_case pre_al2; echo "outro" > "$C/autologin.out"
 run_sut --run;  expect_no_reboot "autologin de outro usuário" 20 "autologin"
 mk_case pre_lc1; echo 113 > "$C/launchctl.rc"
 run_sut --run;  expect_no_reboot "postcheck não carregado" 20 "postcheck"
+
+section "pré-checagem: o que a 2/3 não cobre (ga-1p1i5jr.4.2)"
+mk_case px_fv1; echo "Encryption in progress: Percent completed = 12.5" > "$C/fdesetup.out"
+run_sut --run;  expect_no_reboot "FileVault em cifragem (sem a palavra 'On')" 20 "FileVault"
+mk_case px_fv2; echo "FileVault status unknown, call support" > "$C/fdesetup.out"
+run_sut --run;  expect_no_reboot "fdesetup com texto novo que não reconheço (macOS futuro)" 30 "não reconheço"
+mk_case px_fv3; : > "$C/fdesetup.out"
+run_sut --run;  expect_no_reboot "fdesetup sai 0 SEM texto: vazio não é 'desligado'" 30 "não reconheço"
+mk_case px_al1; echo 1 > "$C/autologin.rc"; echo "defaults: permission denied" > "$C/autologin.out"
+run_sut --run;  expect_no_reboot "defaults falha por outro motivo que não 'does not exist' (não sei, não 'sem autologin')" 30 "defaults read autoLoginUser falhou"
+mk_case px_al2; : > "$C/autologin.out"
+run_sut --run;  expect_no_reboot "autoLoginUser vazio (rc 0 sem texto)" 30 "veio vazio"
+mk_case px_lc1; echo 1 > "$C/launchctl.rc"
+run_sut --run;  expect_no_reboot "launchctl falha com rc 1 e sem 'Could not find service': não sei, não 'não carregado'" 30 "launchctl print"
+mk_case px_lc2; stub launchctl "echo 'Could not find service in domain'; exit 1"
+run_sut --run;  expect_no_reboot "launchctl com o texto 'Could not find service' mesmo com rc 1 = não carregado" 20 "postcheck"
+mk_case px_cu1; setenv "DR4_CONSOLE_USER="; stub stat ""; setenv "DR4_STAT_BIN=$C/bin/stat"
+run_sut --run;  expect_no_reboot "usuário do console ilegível (sem DR4_CONSOLE_USER e o stat não devolve nada)" 30 "usuário do console"
+mk_case px_cu2; setenv "DR4_CONSOLE_USER="; stub stat "echo athos"; setenv "DR4_STAT_BIN=$C/bin/stat"; touch "$C/reboot.dies"
+run_sut --run;  check "usuário do console vindo do stat (controle positivo): reinicia (kill 143; veio $RC: $OUT)" [ "$RC" = 143 ]
+mk_case px_osa; setenv "DR4_REBOOT_CMD="; setenv "DR4_OSASCRIPT_BIN=$C/bin/nao-existe"
+run_sut --run;  expect_no_reboot "sem DR4_REBOOT_CMD e sem osascript: reprova (sem sudo não há outro jeito de pedir)" 20 "pré-checagem reprovou"
+check "sem osascript: reprovou ANTES do aviso (nenhum push saiu)" [ "$(n_notify)" = 0 ]
+mk_case px_dry1; echo "FileVault is On." > "$C/fdesetup.out"
+run_sut --dry-run;  check "pré-checagem também no dry-run: FileVault ligado = rc 20 (veio $RC: $OUT)" [ "$RC" = 20 ]
+chk "dry-run reprovado na pré-checagem: uma linha, sem estado, sem aviso" 'one_line && [ ! -e "$C/state" ] && [ "$(n_notify)" = 0 ]'
+mk_case px_dry2; echo 2 > "$C/fdesetup.rc"
+run_sut --dry-run;  check "pré-checagem ilegível no dry-run = rc 30 (veio $RC: $OUT)" [ "$RC" = 30 ]
 
 # ═══ guardas ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
 section "guardas bloqueiam (adia 10 min e avisa)"
@@ -318,6 +422,56 @@ mk_case u_scr3; sed 's/SCRAPER-DAILY-GUARD-START/SCRAPER-DAILY-GUARD-STARTX/' "$
 unk_case "sentinela do scraper mudou (drift)" "sentinela SCRAPER-DAILY-GUARD"
 mk_case u_scr5; sed 's/DOLT-MAINT-PATTERN-END/DOLT-MAINT-PATTERN-ENDX/' "$NIGHTLY_REAL" > "$C/nightly-drift2.sh"; setenv "DR4_NIGHTLY=$C/nightly-drift2.sh"
 unk_case "sentinela do Dolt mudou (drift)" "sentinela DOLT-MAINT-PATTERN"
+mk_case u_scr6; dup_block SCRAPER-DAILY-GUARD
+unk_case "sentinela do scraper DUPLICADA (dois blocos: qual vale? não sei)" "sentinela SCRAPER-DAILY-GUARD"
+mk_case u_dolt2; dup_block DOLT-MAINT-PATTERN
+unk_case "sentinela do Dolt DUPLICADA" "sentinela DOLT-MAINT-PATTERN"
+mk_case u_calls5; printf 'Python 3 banner sem estado\n' > "$C/calls.out"
+unk_case "leitor sai 0 mas SEM a linha 'ok<TAB>…': rc 0 sozinho não é 'não há ligação'" "rc=0"
+mk_case u_nightly; setenv "DR4_NIGHTLY=$C/nao-existe.sh"
+unk_case "reinício noturno ausente" "não legível"
+chk "reinício noturno ausente: as DUAS guardas que dependem dele dizem 'sem leitura'" 'contains "(dolt, scraper)"'
+
+section "leitor REAL de ligações (ga-1p1i5jr.4.1) com bancos WAL de mentira (ga-1p1i5jr.4.2)"
+mk_case ri_ok; real_calls
+chk "precondição: os bancos WAL começam SEM -wal/-shm (o estado de produção)" '[ ! -e "$C/pix.db-wal" ] && [ ! -e "$C/pix.db-shm" ] && [ ! -e "$C/vb.db-wal" ] && [ ! -e "$C/vb.db-shm" ]'
+run_sut --dry-run
+chk "bancos vazios, dry-run: rc 0 e calls=ok (o formato e o --max-age-min do leitor batem com o que o D4 lê, e o WAL sem -wal/-shm abre; veio $RC: $OUT)" '[ "$RC" = 0 ] && one_line && contains "calls=ok"'
+mk_case ri_run; real_calls; touch "$C/reboot.dies"
+run_sut --run
+check "bancos vazios, --run: reinicia (kill 143; a leitura de antes e a de depois da carência passam; veio $RC: $OUT)" [ "$RC" = 143 ]
+mk_case ri_pix; real_calls "dialing@3"
+run_sut --run
+expect_no_reboot "pix 'dialing' recente" 10 "pix: 1 ligação(ões) em curso"
+chk "pix 'dialing': espera de 10 min gravada, sem marca de reinício, um push" 'state_has "defer_until=$((NOW + 600))" && state_has "reboots=$" && [ "$(n_notify)" = 1 ]'
+mk_case ri_vb; real_calls "" "live@2"
+run_sut --run;  expect_no_reboot "voicebot 'live' recente" 10 "voicebot: 1 ligação(ões) em curso"
+mk_case ri_orph; real_calls "dialing@360"
+run_sut --dry-run;  chk "ligação ÓRFÃ (6 h, acima do corte padrão de 4 h) não segura (veio $RC: $OUT)" '[ "$RC" = 0 ] && contains "calls=ok"'
+mk_case ri_age1; real_calls "dialing@30"
+run_sut --dry-run;  chk "controle: a MESMA linha de 30 min com o corte padrão (240) segura (veio $RC: $OUT)" '[ "$RC" = 10 ] && contains "calls"'
+mk_case ri_age2; real_calls "dialing@30"; setenv "DR4_CALL_MAX_AGE_MIN=10"
+run_sut --dry-run;  chk "DR4_CALL_MAX_AGE_MIN chega ao leitor: com corte de 10 min a linha de 30 vira órfã (veio $RC: $OUT)" '[ "$RC" = 0 ] && contains "calls=ok"'
+mk_case ri_nodb; real_calls; rm -f "$C/pix.db"
+unk_case "leitor REAL: banco do pix ausente" "banco ausente"
+chk "banco ausente: o leitor NÃO o criou" '[ ! -e "$C/pix.db" ]'
+mk_case ri_junk; real_calls; echo "isto não é um banco" > "$C/vb.db"
+unk_case "leitor REAL: banco do voicebot corrompido" "voicebot"
+mk_case ri_mix; real_calls "dialing@1"; rm -f "$C/vb.db"
+run_sut --run;  expect_no_reboot "ligação em curso (pix) + banco do voicebot ausente: o bloqueio vence o 'não sei'" 10 "pix: 1 ligação(ões) em curso"
+chk "bloqueio + ilegível dentro do MESMO leitor: a guarda é 'block', não 'sem leitura'" '! contains "sem leitura"'
+mk_case ri_py; real_calls; setenv "DR4_PYTHON=$C/bin/nao-existe"
+unk_case "interpretador do leitor ausente (rc 127)" "rc=127"
+
+section "número ruim em DR4_*: lixo cai no padrão E o log diz (ga-1p1i5jr.4.2)"
+mk_case en_mb; setenv "DR4_MB=abc"; touch "$C/reboot.dies"
+run_sut --run;  chk "DR4_MB=abc cai no padrão 3072: livre 2000 reinicia (kill 143; veio $RC) e o log diz" '[ "$RC" = 143 ] && grep -q "DR4_MB=.abc.->3072" "$C/log"'
+mk_case en_cd; setenv "DR4_COOLDOWN_S=seis"; saved_state $((NOW - 3600))
+run_sut --run;  chk "DR4_COOLDOWN_S=seis NÃO vira 'sem cooldown': cai nos 6 h (rc 10; veio $RC: $OUT) e o log diz" '[ "$RC" = 10 ] && contains "cooldown" && no_reboot && grep -q "DR4_COOLDOWN_S=.seis.->21600" "$C/log"'
+mk_case en_cap; setenv "DR4_DAY_CAP=1234567890"; saved_state "$((NOW - 50000)),$((NOW - 30000))"
+run_sut --run;  chk "DR4_DAY_CAP com 10 dígitos (> 9) cai no padrão 2: o teto segura (rc 10; veio $RC: $OUT)" '[ "$RC" = 10 ] && contains "teto diário" && grep -q "DR4_DAY_CAP=.1234567890.->2" "$C/log"'
+mk_case en_ok; setenv "DR4_MB=4096"; setenv "DR4_FREE_MB_OVERRIDE=3500"; touch "$C/reboot.dies"
+run_sut --run;  chk "controle: número válido (DR4_MB=4096) vale e o log NÃO reclama (kill 143; veio $RC)" '[ "$RC" = 143 ] && ! grep -q "variável(is) DR4_" "$C/log"'
 
 # ═══ releitura depois da carência, trava ═════════════════════════════════════════════════════════════════════════════════════════
 section "releitura depois do aviso: o veredito de minutos atrás não vale"
