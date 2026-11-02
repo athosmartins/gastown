@@ -851,6 +851,92 @@ rc=0; ( POOL_CEILING_LOG="$TMPROOT/notadir/sub/pool-ceiling.log"; _pc_log_append
 eq "$rc" "0" "...and it returns 0"
 unset POOL_CEILING_T_LOAD5 POOL_CEILING_T_NCPU POOL_CEILING_T_MEM POOL_CEILING_T_SWAP_FREE_MB POOL_CEILING_T_SWAP_USED_MB POOL_CEILING_T_DISK_FREE_MB
 
+echo "== 10e. what the sweep still found loose after 10d (ga-hq1qc5y): classifier edges, knob fallbacks, the status of every early return, the log rotation, the status listing"
+# EQUIVALENT, documented (no input changes the DECISION; only the text of a zero-padded number could differ, which no caller writes): every clamp of the shape
+# `[ a -le b ] || a=b` / `if [ a -gt b ]; then a=b; fi` assigns the same number at equality, whichever way the comparison leans: 62af5d6f99 (decide min vs max),
+# 8116e9c99c (decide cur vs min), 67db8cd8b6 (_pc_engine_floor), f4147687bc (resolve cap vs ceiling), d378894e84 (bounds floor), 70be034d63 / 88e021fbf0 /
+# 68693a5119 (step min vs max, max vs engine cap, max vs fixed), d264cb2fea / 78148b16ac (step cur vs max / min); with the ones named in the paragraph above.
+# a911f064e4 (decide `-ge 5` -> `-ge 6`): from 5 arguments up both shift the same 5, below that both shift them all. 5ed75fcef5 and f65df70ac1 (`|| true` -> `&& true`
+# after an assignment / a redirected group): not the last element of the AND-OR list, so errexit is exempt either way, and the function ends in `return 0`.
+rc0() { local r=0; "$@" >/dev/null 2>&1 || r=$?; eq "$r" "0" "$* returns 0"; }   # the classifiers, readers and the step are read under set -e: they never fail
+eq "$(pool_ceiling_class_load 3 1)" "grow" "one core is a core: load5 3 on 1 core (3.0/core) -> grow, not unknown"
+eq "$(pool_ceiling_class_swap 512 100 20000)" "grow" "free swap exactly AT its floor (512 MB) is not low"
+eq "$(pool_ceiling_class_swap 511 100 20000)" "hold" "one MB under the floor, with disk to grow into -> hold"
+eq "$(pool_ceiling_class_swap 100 100 4096)" "hold" "low swap, disk exactly AT the grow minimum (4096 MB) -> hold: only below it squeezes"
+eq "$(pool_ceiling_class_swap 100 100 4095)" "squeeze" "...one MB under it -> squeeze"
+eq "$(pool_ceiling_class_disk 12288)" "grow" "disk exactly AT warn 8 GB + margin 4 GB -> grow: only below it holds"
+eq "$(pool_ceiling_class_disk 12287)" "hold" "...one MB under it -> hold"
+eq "$(DOLT_DISK_FLOOR_CRITICAL_GB=banana pool_ceiling_class_disk 2000)" "squeeze" "a garbage critical-floor knob falls back to 3 GB: 2000 MB is under it -> squeeze"
+eq "$(DOLT_DISK_FLOOR_WARN_GB=banana pool_ceiling_class_disk 9216)" "hold" "a garbage warn-floor knob falls back to 8 GB: 9 GB is under 8 + 4 -> hold"
+eq "$(pool_ceiling_dolt_class 200 '' banana 2500)" "hot" "a garbage cpu line falls back to the default 180: cpu 200 is over it -> hot"
+rc0 pool_ceiling_class_swap banana 100 5000
+rc0 pool_ceiling_class_swap 100 100 5000
+rc0 pool_ceiling_class_swap 5000 5000 20000
+rc0 pool_ceiling_class_disk 1000
+rc0 pool_ceiling_class_disk 5000
+rc0 pool_ceiling_dolt_class '' ''
+rc0 pool_ceiling_dolt_class 999 '' 180 2500
+eq "$(_pc_engine_floor wa-worker abc)$(_pc_engine_floor ps-worker abc)" "" "the engine floor of a base that is not a number is NOTHING (a floor is never guessed)"
+rc0 _pc_engine_floor wa-worker abc
+POOL_CEILING_WA_WORKER_MIN=abc pool_ceiling_bounds wa-worker; eq "$POOL_CEILING_MIN..$POOL_CEILING_MAX" "1..4" "a garbage MIN knob is the pool's default (1), not carried into the bounds"
+# the live readers: load5 and the disk reader return 0 on a reading and on one they cannot parse, and a df that answers garbage is EMPTY, never 0 MB
+STUBB="$TMPROOT/stub-df-bad"; mkdir -p "$STUBB"; printf '#!/bin/sh\necho "Filesystem 1024-blocks Used Available Capacity Mounted on"\necho "/dev/fake 99999999 1 abc 1%% /fake"\n' > "$STUBB/df"; chmod +x "$STUBB/df"
+rc=0; ( unset POOL_CEILING_T_LOAD5; PATH="$STUB:$PATH"; hash -r; pool_ceiling_read_load5 >/dev/null ) || rc=$?; eq "$rc" "0" "the live load5 reader returns 0 on a reading"
+rc=0; ( unset POOL_CEILING_T_LOAD5; PATH="$SYS:$PATH"; hash -r; pool_ceiling_read_load5 >/dev/null ) || rc=$?; eq "$rc" "0" "...and when sysctl has no vm.loadavg to give"
+rc=0; ( unset POOL_CEILING_T_DISK_FREE_MB; PATH="$STUB:$PATH"; hash -r; POOL_CEILING_DISK_PATH="$TMPROOT" pool_ceiling_read_disk_free_mb >/dev/null ) || rc=$?; eq "$rc" "0" "the live disk reader returns 0 on a reading"
+eq "$(unset POOL_CEILING_T_DISK_FREE_MB; PATH="$STUBB:$PATH"; hash -r; POOL_CEILING_DISK_PATH="$TMPROOT" pool_ceiling_read_disk_free_mb)" "" "a df whose free column is garbage reads as EMPTY (not as 0 MB, a squeeze)"
+rc=0; ( unset POOL_CEILING_T_DISK_FREE_MB; PATH="$STUBB:$PATH"; hash -r; POOL_CEILING_DISK_PATH="$TMPROOT" pool_ceiling_read_disk_free_mb >/dev/null ) || rc=$?; eq "$rc" "0" "...and returns 0 there too (this file runs under set -u: the unguarded arithmetic on 'abc' aborts it)"
+# no clock for the queue reader (date fails, no 'now' given): nothing is answered, even by a jq that would answer 7
+eq "$(PATH="$STUB:$PATH"; hash -r; date() { return 1; }; pool_ceiling_queue_from_dispatchable "$TMPROOT/q10d.json" whatsapp_automation)" "" "no readable clock and no 'now' given: the queue reader answers nothing (jq is never asked)"
+rc=0; ( PATH="$STUB:$PATH"; hash -r; date() { return 1; }; pool_ceiling_queue_from_dispatchable "$TMPROOT/q10d.json" whatsapp_automation >/dev/null ) || rc=$?; eq "$rc" "0" "...and returns 0"
+# the step: every early return exits 0 (the ones that speak are checked for what they say); the clock, the rate and the stored stamp at their exact edges
+setsig 31 10 1 5700 412 14336
+n10e=0; f10e() { n10e=$((n10e + 1)); SD10e="$TMPROOT/state-10e-$n10e"; mkdir -p "$SD10e"; }
+s10e() { POOL_CEILING_DYNAMIC=1 POOL_CEILING_STATE_DIR="$SD10e" POOL_CEILING_LOG="$TMPROOT/10e.log" POOL_CEILING_STEP_SECS=60 POOL_CEILING_NOW="${NOW10E:-5000}" pool_ceiling_step "$@"; }
+f10e; rc=0; POOL_CEILING_DYNAMIC=0 pool_ceiling_step wa-worker 2 1 4 2 63 ok ok || rc=$?
+eq "$rc/$POOL_CEILING_RESULT" "0/2" "step switched off: returns 0, the fixed ceiling stays"
+: > "$TMPROOT/kill10e"; rc=0; POOL_CEILING_KILL_FILE="$TMPROOT/kill10e" s10e wa-worker 2 1 4 2 63 ok ok || rc=$?
+eq "$rc/$POOL_CEILING_RESULT" "0/2" "step with the kill file: returns 0, the fixed ceiling stays"
+rc=0; s10e wa-worker banana 1 4 2 63 ok ok || rc=$?
+eq "$rc/$POOL_CEILING_RESULT" "0/" "a fixed ceiling that is not a number: returns 0 and no result (the caller keeps its own)"
+f10e; rc=0; NOW10E=0 s10e wa-worker 2 1 4 2 63 ok ok || rc=$?
+eq "$rc/$POOL_CEILING_RESULT" "0/2" "a clock reading of 0 is no reading: returns 0, the fixed ceiling stays"
+has "$POOL_CEILING_LOGLINE" "relogio" "...and the line says the clock was unreadable"
+rc=0; GC_CITY="" POOL_CEILING_STATE_DIR="" POOL_CEILING_DYNAMIC=1 POOL_CEILING_NOW=5000 pool_ceiling_step wa-worker 2 1 4 2 63 ok ok || rc=$?
+eq "$rc/$POOL_CEILING_RESULT" "0/2" "no state directory configured: returns 0, the fixed ceiling stays"
+has "$POOL_CEILING_LOGLINE" "sem diretorio de estado" "...and the line says there was no state directory"
+: > "$TMPROOT/notadir10e"; rc=0; POOL_CEILING_STATE_DIR="$TMPROOT/notadir10e/sub" POOL_CEILING_DYNAMIC=1 POOL_CEILING_NOW=5000 pool_ceiling_step wa-worker 2 1 4 2 63 ok ok || rc=$?
+eq "$rc/$POOL_CEILING_RESULT" "0/2" "a state directory that cannot be made: returns 0, the fixed ceiling stays"
+has "$POOL_CEILING_LOGLINE" "nao gravavel" "...and the line says it is not writable"
+f10e; printf 'ceiling=3\nat=5000\n' > "$SD10e/wa-worker.state"; rc=0; s10e wa-worker 2 1 4 3 63 ok ok || rc=$?
+eq "$rc/$POOL_CEILING_RESULT" "0/3" "a last step stamped at this very second is inside the rate: the stored 3 is held, returns 0"
+has "$POOL_CEILING_LOGLINE" "ritmo" "...and the line says it was the rate limit"
+f10e; printf 'ceiling=2\nat=4940\n' > "$SD10e/wa-worker.state"; s10e wa-worker 2 1 4 2 63 ok ok
+eq "$POOL_CEILING_RESULT" "3" "a last step exactly one rate (60 s) ago is no longer inside it: the ceiling steps 2 -> 3"
+f10e; printf 'ceiling=3\nat=abc\n' > "$SD10e/wa-worker.state"; s10e wa-worker 2 1 4 2 63 ok ok
+has "$POOL_CEILING_LOGLINE" "corrompido" "a state with a good ceiling and a stamp that is not a number is corrupt, not half-trusted"
+f10e; mkdir "$SD10e/wa-worker.state.tmp.$$"; rc=0; s10e wa-worker 2 1 4 2 63 ok ok || rc=$?
+eq "$rc/$POOL_CEILING_RESULT" "0/2" "a state that cannot be persisted (its temp file is taken by a directory): returns 0, the fixed ceiling stays"
+has "$POOL_CEILING_LOGLINE" "nao persistiu" "...and the line says so"
+unset POOL_CEILING_T_LOAD5 POOL_CEILING_T_NCPU POOL_CEILING_T_MEM POOL_CEILING_T_SWAP_FREE_MB POOL_CEILING_T_SWAP_USED_MB POOL_CEILING_T_DISK_FREE_MB
+# the calibration log: a small log is appended to, one AT the cap (5 MB) is too, one byte over is rotated to .1; no log configured returns 0
+LG="$TMPROOT/rot10e.log"; rm -f "$LG" "$LG.1"; printf 'old row\n' > "$LG"; ( POOL_CEILING_LOG="$LG"; _pc_log_append $LOGARGS )
+[ ! -e "$LG.1" ] && [ "$(wc -l < "$LG" | tr -d ' ')" = 2 ] && ok "a small log is appended to, not rotated" || bad "small log: rotated=$([ -e "$LG.1" ] && echo yes || echo no) lines=$(wc -l < "$LG" | tr -d ' ')"
+rm -f "$LG" "$LG.1"; head -c 5242880 /dev/zero > "$LG"; ( POOL_CEILING_LOG="$LG"; _pc_log_append $LOGARGS )
+[ ! -e "$LG.1" ] && [ "$(wc -c < "$LG" | tr -d ' ')" -gt 5242880 ] && ok "a log exactly AT the 5 MB cap is appended to, not rotated" || bad "log at the cap: rotated=$([ -e "$LG.1" ] && echo yes || echo no)"
+rm -f "$LG" "$LG.1"; head -c 5242881 /dev/zero > "$LG"; ( POOL_CEILING_LOG="$LG"; _pc_log_append $LOGARGS )
+[ -e "$LG.1" ] && [ "$(wc -c < "$LG.1" | tr -d ' ')" = 5242881 ] && [ "$(wc -l < "$LG" | tr -d ' ')" = 1 ] && ok "a log one byte over the cap is rotated to .1 whole and a fresh one starts with the new row" || bad "log over the cap: rotated=$([ -e "$LG.1" ] && echo yes || echo no) lines=$(wc -l < "$LG" | tr -d ' ')"
+rm -f "$LG" "$LG.1"
+rc=0; ( unset POOL_CEILING_LOG GC_CITY; _pc_log_append $LOGARGS ) >/dev/null 2>&1 || rc=$?; eq "$rc" "0" "no log configured: the append returns 0"
+# status: each state file is listed with its ceiling, an empty state directory lists nothing (the unexpanded glob is not a file), and it returns 0
+SDS="$TMPROOT/status10e"; mkdir -p "$SDS"
+out="$(POOL_CEILING_STATE_DIR="$SDS" pool_ceiling_status 2>/dev/null)"
+case "$out" in *"  *:"*) bad "status lists a state file that is not there: $out" ;; *) ok "an empty state directory lists no pool (the unexpanded glob is skipped)" ;; esac
+printf 'ceiling=3\nat=%s\n' "$(date +%s)" > "$SDS/wa-worker.state"
+out="$(POOL_CEILING_STATE_DIR="$SDS" pool_ceiling_status 2>/dev/null)"
+has "$out" "  wa-worker: teto=3 (ultimo passo ha " "status lists a readable state file with its ceiling"
+rc=0; POOL_CEILING_STATE_DIR="$SDS" pool_ceiling_status >/dev/null 2>&1 || rc=$?; eq "$rc" "0" "status returns 0"
+
 echo "== 11. hermetic: this run did not touch the real city's calibration log or state dir"
 eq "$(prod_snapshot)" "$PROD_BEFORE" "no fake-stamped row/state written to the real pool-ceiling.log / pool-ceiling/ by this run (before: $PROD_BEFORE; real sweeps appending meanwhile do not count)"
 # the detector itself: a fake-stamped row in a log it watches IS seen, a real-epoch row is NOT

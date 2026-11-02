@@ -205,6 +205,13 @@ mk_real r4; export POOL_CEILING_AGENTS_DIR="$C/agents"
 awk 'BEGIN { for (i = 0; i < 40000; i++) print "max_active_sessions = 3" }' > "$C/agents/gate-reviewer/agent.toml"; : > "$(FR)"
 out="$(resolve gate-reviewer)"; eq "$(cap_of "$out")" "cap=3 base=3 doubt=" "a 40000-line agent.toml: the first line still counts (it read as unreadable under pipefail)"
 
+# (e) ga-hq1qc5y: a missing pool NAME is no pool even when the agents directory is set, and a reader that reports level 0 for the pool is no override
+mk_city c5; export POOL_CEILING_AGENTS_DIR="$C/agents"; frag "gate-reviewer=2"
+out="$(resolve '')"; eq "$(cap_of "$out")" "cap= base= doubt=" "no pool name: no cap"; has "$out" "sem diretorio de agents" "and the note says there was nothing to look at"
+printf 'pce_fragment_parse() { echo "gate-reviewer=0"; }\n' > "$TMPROOT/engine-level0.sh"
+out="$(POOL_CEILING_ENGINE_SH="$TMPROOT/engine-level0.sh" resolve gate-reviewer)"
+eq "$(cap_of "$out")" "cap=3 base=3 doubt=" "a reader that reports level 0 for the pool is no override (0 would close it): agent.toml's 3 stands"
+
 # the lib's floor/ceiling table MIRRORS the engine's pce_floor / pce_ceil (default knobs). The engine file is the one that can be missing, so the lib
 # cannot source it for these two numbers; this is what keeps the two from drifting apart unnoticed.
 ENG="$SELF_DIR/pool-ceiling-engine.sh"; drift=""
