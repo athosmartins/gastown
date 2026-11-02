@@ -18,7 +18,8 @@
 #   0   agiu e terminou     (--run: parou ao menos um e todos morreram · --resume: lançou a retomada)
 #   10  nada a fazer, ou uma guarda adiou (nada rodando · rodando mas o livre está acima do piso de parada do job · outra instância em execução · retomar ainda não pode: disco, janela, o job recusou)
 #   20  falhou              (não conseguiu gravar o registro, o processo não morreu ou a morte não foi comprovada, a retomada não subiu, erro interno)
-#   30  não consegui ler o estado e por isso NÃO agi (df, ps, allowlist, registro, plist ou launchctl list ilegíveis; ps ilegível na re-conferência antes do primeiro sinal; não consegui criar nem verificar a trava; regex larga demais)
+#   30  não consegui ler o estado e por isso NÃO agi (df, ps, allowlist, registro, plist ou launchctl list ilegíveis; ps ilegível na re-conferência antes do primeiro sinal; não consegui criar nem verificar a trava; regex larga demais;
+#       --resume: não consegui apagar o código de saída da retomada anterior)
 #   --dry-run devolve os mesmos códigos como previsão (0 = agiria). Quem avisa o Athos (notify/mail em 0/20) é o orquestrador: este degrau só escreve o próprio log.
 #
 # A ALLOWLIST. Casa por REGEX contra a linha de comando do processo E a do PAI (o job de verdade tem o pai do launchd), nunca por tamanho de memória. O arquivo é
@@ -36,8 +37,11 @@
 #
 # RETOMAR (--resume). Só retoma o pendente se: o livre >= resume_above_mb do job; está na janela dele; não há processo do job rodando; o run não passou de resume_max_age_s;
 # e o run_id é LIDO (do registro ou do S3, casando pid + hora de início do processo parado) e tem a forma `<epoch>-<pid>` — NUNCA adivinhado. Lança via
-# `launchctl submit` (fora deste processo, para não morrer com o orquestrador) com o MESMO ambiente do plist do job (teto de memória e de RSS inclusos) e espera
-# $D2_RESUME_WATCH_S s: se o job passar dos portões dele e seguir vivo, é 0; se o portão dele recusar (rc 3 "NÃO RODEI": janela, disco 8,25 GiB, outro processo), é 10 e segue pendente.
+# `launchctl submit` (fora deste processo, para não morrer com o orquestrador) com o MESMO ambiente do plist do job (teto de memória e de RSS inclusos) e vigia
+# $D2_RESUME_WATCH_S s: se o job seguir de pé, é 0 (isso NÃO prova que passou dos portões dele — origem, checkpoints no S3 e mês rodam depois, e o D2 para de olhar ali); se o portão dele recusar
+# (rc 3 "NÃO RODEI": janela, disco 8,25 GiB, outro processo), é 10 e segue pendente. O RÓTULO da retomada: `submit` é KeepAlive (o launchd relança o job ~10 s depois de TODA saída), então o job roda dentro de
+# um wrapper que, ao fim, grava o código de saída em .gc/disk-recovery-d2-resume-rfb.rc e REMOVE o próprio rótulo — ele vive só enquanto o job vive, e um job que a escada parou de novo (TERM) não volta sozinho.
+# O arquivo de código é apagado antes de cada lançamento (se não der: rc 30, nada é lançado) e um wrapper relançado por um `remove` que falhou NÃO roda o job outra vez.
 # QUEM CHAMA --resume: a escada chama o D2 só no aperto, então algo tem de chamá-lo quando o disco volta (tick do orquestrador ou um agendador próprio). Sem chamador,
 # o job fica parado até o tick das 00:15, que recomeça do zero.
 #
@@ -75,6 +79,12 @@ RFB_PLIST="${D2_RFB_PLIST:-$HOME/Library/LaunchAgents/com.whatsapp.rfb-monthly-r
 RFB_META_URI="${D2_RFB_META_URI:-s3://urblink-motherduck-backups/real_estate/rfb/_meta/}"
 RESUME_LABEL="com.gascity.d2-resume.rfb"
 RESUME_LOG="$GCDIR/logs/disk-recovery-d2-resume-rfb.log"
+RESUME_RC="$GCDIR/disk-recovery-d2-resume-rfb.rc"      # o código de saída da ÚLTIMA retomada, gravado pelo wrapper abaixo quando o job acaba (o rótulo some junto)
+# O que o launchd roda na retomada: um `bash -c` (parâmetros: arquivo-de-rc rótulo launchctl raiz comando...). `launchctl submit` cria um job KeepAlive — o launchd o RELANÇA ~10 s depois de TODA
+# saída, qualquer que seja o código (medido pelo revisor do gate, ga-1p1i5jr.2.1) —, então o job que acaba depois da vigia rodaria de novo sem parar, e o job que a escada parou (TERM) voltaria sozinho.
+# Por isso o job roda como FILHO e o wrapper, ao fim, grava o código em $RESUME_RC e REMOVE o próprio rótulo (o remove pode terminar o próprio wrapper: o código já está gravado). Se o remove falhar e o launchd relançar o wrapper,
+# o arquivo de código já existe: ele só tenta remover de novo e NÃO roda o job outra vez. Tudo em UMA linha: o `ps` não pode ver o corpo quebrado em várias linhas.
+RESUME_WRAPPER='rcf=$1; lab=$2; lc=$3; root=$4; shift 4; [ -e "$rcf" ] && { "$lc" remove "$lab"; exit 0; }; ( cd "$root" && exec "$@" ); rc=$?; printf "%s\n" "$rc" >"$rcf"; "$lc" remove "$lab"; exit "$rc"'      # MUT:wrapper
 MYUID=$(id -u)
 TAB=$(printf '\t')
 NL='
@@ -355,8 +365,8 @@ for k, v in d.items():
   printf '%s\n' "$out"
 }
 
-rfb_launch() {  # $1=run_id → rc 0 = subiu e seguiu vivo · 10 = o próprio job recusou (rc 3) · 20 = falhou · 30 = ambiente do plist ilegível. LAUNCH_MSG diz o que houve
-  local rid=$1 envl kv lrc i=0 out st code
+rfb_launch() {  # $1=run_id → rc 0 = subiu e seguiu vivo (ou já terminou bem) · 10 = o próprio job recusou (rc 3) · 20 = falhou · 30 = não consegui ler/limpar o estado e NÃO lancei. LAUNCH_MSG diz o que houve
+  local rid=$1 envl kv lrc i=0 out code
   LAUNCH_MSG=""
   envl=$(rfb_plist_env) || { LAUNCH_MSG="não consegui ler o EnvironmentVariables de $RFB_PLIST (não chuto o ambiente do job)"; return 30; }
   # vazio (rc 113: o launchd não conhece o rótulo) → não há retomada, segue para o submit; falhou/ilegível (qualquer outro rc) → não sei se já há uma viva: rc 30, não lanço outra por cima
@@ -369,28 +379,35 @@ rfb_launch() {  # $1=run_id → rc 0 = subiu e seguiu vivo · 10 = o próprio jo
     esac
   fi
   mkdir -p "$(dirname "$RESUME_LOG")" 2>/dev/null
+  # o código de saída de uma retomada ANTERIOR não pode passar pelo desta (nem fazer o wrapper pular o job): apago e confiro que sumiu.
+  # vazio (sem arquivo) → segue; falhou/ilegível (o arquivo ficou e não consegui apagá-lo) → rc 30, não lanço
+  rm -f "$RESUME_RC" 2>/dev/null      # MUT:rcclear
+  [ ! -e "$RESUME_RC" ] || { LAUNCH_MSG="não consegui apagar o código de saída da retomada anterior ($RESUME_RC): não lanço"; return 30; }      # MUT:rccheck
   set -- /usr/bin/env
   while IFS= read -r kv; do [ -n "$kv" ] && set -- "$@" "$kv"; done <<EOF
 $envl
 EOF
-  set -- "$@" /bin/bash -c 'cd "$1" && shift && exec "$@"' _ "$RFB_ROOT" /bin/bash "$RFB_ROOT/scripts/job_timeout.sh" 21600 com.whatsapp.rfb-stream-resume --soft -- \
+  set -- "$@" /bin/bash -c "$RESUME_WRAPPER" _ "$RESUME_RC" "$RESUME_LABEL" "$LAUNCHCTL_BIN" "$RFB_ROOT" \
+    /bin/bash "$RFB_ROOT/scripts/job_timeout.sh" 21600 com.whatsapp.rfb-stream-resume --soft -- \
     "$RFB_PYTHON" "$RFB_ROOT/scripts/rfb_stream_refresh.py" --resume-run "$rid"
   "$LAUNCHCTL_BIN" submit -l "$RESUME_LABEL" -o "$RESUME_LOG" -e "$RESUME_LOG" -- "$@" >/dev/null 2>&1 \
     || { LAUNCH_MSG="launchctl submit falhou"; return 20; }
-  # a vigia: vivo (tem PID) → espera; sumiu ou o list falhou → rc 20 (o job foi submetido e não posso afirmar que está de pé); terminou (sem PID) → leio o código de saída
+  # a vigia: com PID → o job vive, espero; sem PID, ou o rótulo sumiu (o wrapper o remove ao fim) → acabou, e leio o código que ele deixou.
+  # vazio (rc 113: o launchd não conhece mais o rótulo) → acabou; falhou/ilegível (qualquer outro rc) → não sei se está de pé: rc 20, nunca "viva"
   while [ "$i" -lt "$WATCH_S" ]; do
-    out=$("$LAUNCHCTL_BIN" list "$RESUME_LABEL" 2>/dev/null) \
-      || { LAUNCH_MSG="o launchd não lista $RESUME_LABEL depois do submit"; return 20; }
-    case "$out" in
-      *'"PID" = '[0-9]*) sleep 1; i=$((i + 1)) ;;
+    out=$("$LAUNCHCTL_BIN" list "$RESUME_LABEL" 2>/dev/null); lrc=$?
+    case "$lrc" in 0|113) ;; *) LAUNCH_MSG="launchctl list $RESUME_LABEL falhou (rc $lrc) depois do submit: não sei se a retomada está de pé"; return 20 ;; esac      # MUT:watchlist
+    case "$lrc:$out" in
+      0:*'"PID" = '[0-9]*) sleep 1; i=$((i + 1)) ;;
       *) break ;;
     esac
   done
-  if [ "$i" -ge "$WATCH_S" ]; then LAUNCH_MSG="retomada --resume-run $rid viva depois de ${WATCH_S}s (passou dos portões do job); log: $RESUME_LOG"; return 0; fi
-  st=$(printf '%s\n' "$out" | sed -n 's/.*"LastExitStatus" = \([0-9][0-9]*\);.*/\1/p' | head -n 1)
-  "$LAUNCHCTL_BIN" remove "$RESUME_LABEL" >/dev/null 2>&1
-  case "$st" in '') LAUNCH_MSG="a retomada terminou antes de ${WATCH_S}s e não li o código de saída"; return 20 ;; esac
-  code=$st; [ "$st" -gt 255 ] && code=$((st / 256))
+  # "de pé depois da vigia" NÃO prova que passou dos portões do job (origem, checkpoints no S3 e mês rodam depois de imports e rede): o D2 para de olhar aqui; o desfecho fica em $RESUME_RC e no log
+  if [ "$i" -ge "$WATCH_S" ]; then LAUNCH_MSG="retomada --resume-run $rid de pé depois de ${WATCH_S}s; o D2 não a vigia mais (o código de saída fica em $RESUME_RC, o log em $RESUME_LOG)"; return 0; fi
+  "$LAUNCHCTL_BIN" remove "$RESUME_LABEL" >/dev/null 2>&1      # idempotente: o wrapper já o removeu; se ele morreu antes, o launchd o relançaria
+  # vazio (o wrapper não chegou a gravar) → não sei o que houve: rc 20; falhou/ilegível (não é número) → idem. Nunca vira "terminou bem"
+  code=$(cat "$RESUME_RC" 2>/dev/null)
+  case "$code" in ''|*[!0-9]*) LAUNCH_MSG="a retomada terminou antes de ${WATCH_S}s e não li o código de saída ($RESUME_RC)"; return 20 ;; esac      # MUT:rcread
   case "$code" in
     0) LAUNCH_MSG="a retomada --resume-run $rid já terminou com sucesso (rc 0)"; return 0 ;;
     3) LAUNCH_MSG="o job recusou a retomada (rc 3 NÃO RODEI: janela, disco 8,25 GiB, outro processo ou mês já carregado); log: $RESUME_LOG"; return 10 ;;
