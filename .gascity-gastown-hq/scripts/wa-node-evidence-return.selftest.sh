@@ -10,6 +10,9 @@
 # CASOS: ida = linha do Pilot (label/auto, rc 0) + "despachada" do despachante · `release` depois da ida NÃO é erro (a sonda do gate) · shadow, dry-run e linha sem confirmação NÃO são ida
 #   · rc 13/124/128-255 = ida INCERTA (contada, nomeada; 125-127 não) · modo desconhecido · `out` ilegível = "não sei" · despacho sem linha do Pilot · a ÚLTIMA ida manda · erro lido na bead:
 #   recusa do worker, rótulo do gate, sem sinal, NÃO LIDA (bd ausente, rc != 0, JSON ruim, outra bead, loja sem rota) · log ausente/vazio/ilegível · --hours com dígito não-ASCII = rc 2.
+# FRONTEIRAS (ga-eedg7fw, hq-mutants): relógio de mentira (inproc.py/units.py) para cair EXATAMENTE em cada limite: since, o pareamento 0..120 s do dry-run, o despacho sem linha em since, o orçamento de 120 s das leituras de bead.
+#   Mutantes EQUIVALENTES do lastro, sem caso (nenhum teste de comportamento os distingue): (a) `nao_conf[bead] = nao_conf.get(bead, 0) + 1` com `0 → 1`: só as CHAVES de nao_conf são lidas (sorted(nao_conf), len(nao_conf)), nunca o valor;
+#   (b) `1 <= int(a.hours) <= 99999` com `99999 → 100000`: o `re.fullmatch("[0-9]{1,5}")` da mesma linha já impede um 6º dígito, então o teto 99999 nunca é o que barra.
 # CONTROLE NEGATIVO: cada mutante troca UMA linha do relatório numa cópia e o caso designado tem de reprovar.
 # COMO RODAR: bash scripts/wa-node-evidence-return.selftest.sh   (macOS /bin/bash 3.2 e Linux; ~20 s no nó)
 set -u
@@ -179,6 +182,120 @@ expect "--hours com dígito não-ASCII (²) = rc 2, não traceback" 2 '-' --hour
 expect "--hours com dígitos árabe-índicos = rc 2" 2 '-' --hours "١٢"
 if ! grep -q Traceback "$T/err"; then ok "e sem traceback no stderr"; else bad "traceback no stderr"; fi
 expect "argumento desconhecido = rc 2" 2 '-' --nada
+
+# ---- fronteiras com RELÓGIO DE MENTIRA (ga-eedg7fw, hq-mutants): cair EXATAMENTE em cima de cada limite exige que "agora" seja um número que o teste escolhe.
+# inproc.py roda o main() do relatório com time.time() fixo em $WNR_NOW (o resto é o programa de verdade: mesmos argumentos, mesmo stdout, mesmo rc); units.py chama
+# funções direto, com o subprocess.run trocado por um de mentira (instantâneo: nenhum prazo de 0,5 s depende da carga da máquina) que registra o `timeout=` recebido.
+cat > "$T/inproc.py" <<'PYEOF'
+import importlib.util, os, sys, time
+spec = importlib.util.spec_from_file_location("wnr", os.environ["WNR_REP"])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+fixed = float(os.environ["WNR_NOW"])
+time.time = lambda: fixed
+sys.exit(m.main([os.environ["WNR_REP"]] + sys.argv[1:]))
+PYEOF
+cat > "$T/units.py" <<'PYEOF'
+import contextlib, importlib.util, io, os, subprocess, sys, time
+spec = importlib.util.spec_from_file_location("wnr", os.environ["WNR_REP"])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+NOW = float(os.environ["WNR_NOW"]); time.time = lambda: NOW
+city, bd, log = os.environ["WNR_CITY"], os.environ["WNR_BD"], os.environ["WNR_LOG"]
+def chk(label, fn, want):
+    try:
+        got = fn()
+    except Exception as e:   # uma função que EXPLODE onde devia devolver "não sei" é a falha que este teste existe para pegar
+        print("FAIL %s (exceção %s: %s)" % (label, type(e).__name__, e)); return
+    print(("ok   " if got == want else "FAIL ") + label + ("" if got == want else " (veio %r, esperado %r)" % (got, want)))
+cj = m.classifier_json
+chk("classifier_json(None) → None (não é texto: sem exceção)", lambda: cj(None), None)
+chk("classifier_json(5) → None (não é texto: sem exceção)", lambda: cj(5), None)
+chk("classifier_json('   ') → None (só espaço)", lambda: cj("   "), None)
+chk("classifier_json: objeto sem 'info' → None", lambda: cj('{"verdict": 1}'), None)
+chk("classifier_json: 'info' que não é lista → None", lambda: cj('{"info": "x"}'), None)
+chk("classifier_json: JSON que não é objeto → None (sem exceção)", lambda: cj('[1]'), None)
+chk("classifier_json: objeto com 'info' lista → o próprio dict", lambda: cj('{"info": ["a"]}'), {"info": ["a"]})
+chk("classifier_json: texto antes do JSON → a última linha que é objeto", lambda: cj('despachada\n{"info": []}'), {"info": []})
+chk("evidencia_da_ida(None) → None (out nulo = não sei)", lambda: m.evidencia_da_ida(None), None)
+chk("evidencia_da_ida(5) → None (out que não é texto = não sei)", lambda: m.evidencia_da_ida(5), None)
+calls = []
+def fake_run(cmd, **kw):
+    calls.append(kw.get("timeout"))
+    return subprocess.CompletedProcess(cmd, 0, stdout='[{"id": "wa-bud", "labels": [], "metadata": {}}]', stderr="")
+m.subprocess.run = fake_run
+chk("estado_da_bead: restante == 0 → não lida ('orçamento de leitura esgotado'), o bd nem roda", lambda: (m.estado_da_bead(city, bd, "wa-bud", NOW), list(calls)), ((None, "orçamento de leitura esgotado"), []))
+del calls[:]
+chk("estado_da_bead: restante 0,5 s → lê a bead, com timeout=0,5", lambda: (m.estado_da_bead(city, bd, "wa-bud", NOW + 0.5), list(calls)), (("sem_sinal", ""), [0.5]))
+del calls[:]
+chk("estado_da_bead: restante 100 s → o prazo de UMA leitura (20 s) é o teto do timeout", lambda: (m.estado_da_bead(city, bd, "wa-bud", NOW + 100), list(calls)), (("sem_sinal", ""), [20]))
+seen = []
+real = m.estado_da_bead
+def spy(c, b, bead, deadline):
+    seen.append(deadline - NOW); return real(c, b, bead, deadline)
+m.estado_da_bead = spy
+with contextlib.redirect_stdout(io.StringIO()):
+    rc = m.main(["x", "--route-log", log, "--city", city, "--bd", bd, "--json", "--hours", "1"])
+chk("main: o orçamento de TODAS as leituras de bead juntas é de 120 s", lambda: (rc, seen), (0, [120.0]))
+PYEOF
+fixed_case() { newcase; NOW=1800000000; }   # newcase pega o relógio de verdade; aqui o "agora" é o do inproc.py/units.py
+fexpect() { CLS="$T/inproc.py" WNR_REP="$REP" WNR_NOW="$NOW" expect "$@"; }
+SD="despachada para wa-worker-remote-1 (text)"
+
+# janela: a linha do Pilot EXATAMENTE em since (agora − horas) entra; um segundo antes não
+fixed_case; bead wa-w1; { apply_s 3602 wa-w1 0 "$SD"; pilot_s 3600 wa-w1 auto 0 "$EV"; } > "$L"
+fexpect "janela: a linha do Pilot EXATAMENTE em 'since' entra (a ida conta)" 0 '"foram_ao_no": 1' $J --hours 1
+fixed_case; bead wa-w2; { apply_s 3603 wa-w2 0 "$SD"; pilot_s 3601 wa-w2 auto 0 "$EV"; } > "$L"
+fexpect "janela: a linha do Pilot 1 s ANTES de 'since' não entra" 0 '"foram_ao_no": 0' $J --hours 1
+# despacho sem linha do Pilot: só conta se foi na janela (o que veio até 120 s antes só serve para parear)
+fixed_case; { apply_s 3600 wa-w3 0 "$SD"; } > "$L"
+fexpect "despacho EXATAMENTE em 'since' e sem linha do Pilot → aparece em despachos_sem_linha_do_pilot" 0 '"despachos_sem_linha_do_pilot": \["wa-w3"\]' $J --hours 1
+fixed_case; { apply_s 3601 wa-w3 0 "$SD"; } > "$L"
+fexpect "despacho 1 s antes de 'since' (lido só para parear) e sem linha do Pilot → NÃO aparece" 0 '"despachos_sem_linha_do_pilot": \[\]' $J --hours 1
+# dry-run: a linha do Pilot de 0 a 120 s DEPOIS do apply pareia (os dois extremos valem); 121 s depois ou antes do apply não
+DR="dry-run: iria para wa-worker-remote-1 (text)"
+for d in 0 120; do
+  fixed_case; bead wa-d; { apply_s $((500 + d)) wa-d 0 "$DR"; pilot_s 500 wa-d auto 0 "$EV"; } > "$L"
+  fexpect "dry-run: Pilot $d s depois do apply pareia (dry_run_linhas 1, não é ida nem 'sem confirmação')" 0 '"foram_ao_no": 0.*"dry_run_linhas": 1, "sem_confirmacao_do_despachante": \[\]' $J
+done
+fixed_case; bead wa-d; { apply_s 621 wa-d 0 "$DR"; pilot_s 500 wa-d auto 0 "$EV"; } > "$L"
+fexpect "dry-run: Pilot 121 s depois do apply NÃO pareia (sem confirmação do despachante)" 0 '"dry_run_linhas": 0, "sem_confirmacao_do_despachante": \["wa-d"\]' $J
+fixed_case; bead wa-d; { apply_s 499 wa-d 0 "$DR"; pilot_s 500 wa-d auto 0 "$EV"; } > "$L"
+fexpect "dry-run: Pilot 1 s ANTES do apply (a linha do Pilot não pode preceder o despachante) NÃO pareia" 0 '"dry_run_linhas": 0, "sem_confirmacao_do_despachante": \["wa-d"\]' $J
+fixed_case; bead wa-d2; { apply_s 600 wa-d2 0 "$DR"; pilot_s 590 wa-d2 auto 0 "$EV"; pilot_s 580 wa-d2 auto 0 "$EV"; } > "$L"
+fexpect "dry-run: UM apply serve a UMA linha do Pilot (a 2ª fica sem confirmação)" 0 '"dry_run_linhas": 1, "sem_confirmacao_do_despachante": \["wa-d2"\]' $J
+# um despacho e duas linhas do Pilot na janela: a 1ª (mais antiga) fica com ele, e é a evidência DELA que vale
+fixed_case; bead wa-o; { apply_s 1000 wa-o 0 "$SD"; pilot_s 995 wa-o auto 0 "$EV"; pilot_s 990 wa-o auto 0 "$SEM"; } > "$L"
+fexpect "duas linhas do Pilot, um despacho: a linha MAIS ANTIGA pareia (evidência True), a outra fica sem confirmação" 0 '"com_evidencia": 1, "sem_evidencia": 0.*"sem_confirmacao_do_despachante": \["wa-o"\]' $J
+# linha com hora ilegível, bead vazio, bead que não é texto, sem bead: cada uma conta como ilegível (cada perna do `or` sozinha)
+fixed_case
+{ printf '{"ts":"nao-e-data","event":"apply","bead":"wa-b1","rc":0,"detail":"x"}\n'
+  printf '{"ts":"%s","event":"apply","bead":"","rc":0,"detail":"x"}\n' "$(isos 100)"
+  printf '{"ts":"%s","event":"apply","bead":123,"rc":0,"detail":"x"}\n' "$(isos 100)"
+  printf '{"ts":"%s","event":"apply","rc":0,"detail":"x"}\n' "$(isos 100)"; } > "$L"
+fexpect "linhas com hora ilegível / bead vazio / bead que não é texto / sem bead: as 4 contam como ilegíveis" 0 '"linhas_ilegiveis": 4' $J
+# funções direto (units.py): classificador, `out` que não é texto, e o orçamento de leitura das beads
+fixed_case; bead wa-bud; { ida 10 wa-bud "$EV"; } > "$L"     # ida <MINUTOS atrás>: 10 min cabe na janela de --hours 1 que o units.py usa
+UOUT=$(WNR_REP="$REP" WNR_NOW="$NOW" WNR_CITY="$CITY" WNR_BD="$FBD" WNR_LOG="$L" "$PY" -I "$T/units.py" 2>"$T/uerr"); URC=$?
+if [ "$URC" != 0 ]; then bad "units.py não terminou (rc=$URC; $(cut -c1-200 "$T/uerr"))"; fi
+while IFS= read -r ul; do
+  case "$ul" in "ok   "*) ok "${ul#ok   }" ;; "FAIL "*) bad "${ul#FAIL }" ;; *) bad "units.py: linha inesperada: $ul" ;; esac
+done <<EOF_UNITS
+$UOUT
+EOF_UNITS
+# o `out` de uma ida que não é texto: a ida conta e a evidência é DESCONHECIDA (nunca derruba o relatório)
+fixed_case; bead wa-on; { apply_s 102 wa-on 0 "$SD"; printf '{"ts":"%s","event":"pilot-node-route","bead":"wa-on","mode":"auto","rc":0,"out":null,"spawn":"pilot","slots":1}\n' "$(isos 100)"; } > "$L"
+fexpect "out nulo na linha do Pilot: a ida vale e a evidência é 'desconhecida' (rc 0, sem traceback)" 0 '"foram_ao_no": 1, "com_evidencia": 0, "sem_evidencia": 0, "evidencia_desconhecida": \["wa-on"\]' $J
+# --help não é erro de uso; a cidade e o bd resolvidos pelo ambiente (sem --city/--bd); o --json não escapa não-ASCII
+expect "--help sai 0 e mostra o uso (pedir ajuda não é erro de uso)" 0 'usage: wa-node-evidence-return.py' --help
+newcase; bead wa-env; { ida 100 wa-env "$EV"; } > "$L"
+r_env() { OUT=$(env -i PATH="$PATH" "FAKE_BD_CALLS=$CALLS" "$@" "$PY" -I "$REP" --route-log "$L" --json 2>"$T/err"); RC=$?; }   # env -i: o bd de mentira precisa do FAKE_BD_CALLS de volta
+r_env "GC_CITY_PATH=$CITY" "WA_NODE_BD=$FBD"
+if [ "$RC" = 0 ] && printf '%s' "$OUT" | grep -q -E -e '"sem_sinal_de_erro": \["wa-env"\]'; then ok "sem --city/--bd: GC_CITY_PATH acha a cidade e WA_NODE_BD é o bd"; else bad "GC_CITY_PATH + WA_NODE_BD (rc=$RC; $(printf '%s' "$OUT" | cut -c1-240))"; fi
+r_env "GC_CITY=$CITY" "WA_NODE_BD=$FBD"
+if [ "$RC" = 0 ] && printf '%s' "$OUT" | grep -q -E -e '"sem_sinal_de_erro": \["wa-env"\]'; then ok "sem --city/--bd: GC_CITY (sozinho) também acha a cidade"; else bad "GC_CITY + WA_NODE_BD (rc=$RC; $(printf '%s' "$OUT" | cut -c1-240))"; fi
+r_env "GC_CITY_PATH=$CITY" "GC_CITY=$T/outra-cidade-que-nao-existe" "WA_NODE_BD=$FBD"
+if [ "$RC" = 0 ] && printf '%s' "$OUT" | grep -q -E -e '"sem_sinal_de_erro": \["wa-env"\]'; then ok "GC_CITY_PATH vence GC_CITY (o errado é ignorado)"; else bad "GC_CITY_PATH vs GC_CITY (rc=$RC; $(printf '%s' "$OUT" | cut -c1-240))"; fi
+newcase; printf '[{"id":"wa-\\u00e7","labels":["ctx:ready"],"metadata":{}}]\n' > "$STORE/wa-ç.json"; { ida 100 "wa-ç" "$EV"; } > "$L"
+expect "--json não escapa não-ASCII: o id 'wa-ç' sai como está (ensure_ascii=False)" 0 '"sem_sinal_de_erro": \["wa-ç"\]' $J
 
 # ---- controle negativo: um mutante por linha; o caso designado tem de reprovar
 mutant() { # mutant <nome> <trecho original> <trecho novo> <preparo do caso (função)> <rc> <regex> [args do relatório]
