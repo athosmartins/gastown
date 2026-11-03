@@ -13,7 +13,7 @@
 #   de `cat-file --batch-all-objects` é redundante onde a saída já vem ordenada (git >= 2.19); o `LC_ALL=C` só vale com git traduzido (a frase que dispara o retry é em inglês).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd -P); RG=${HRG_S:-$HERE/hetzner-remote-git.sh}
-T=$(mktemp -d "${TMPDIR:-/tmp}/hrg.XXXXXX"); T=$(cd "$T" && pwd -P); chmod 700 "$T"; N=0; F=0; HRG_EXPECT=164
+T=$(mktemp -d "${TMPDIR:-/tmp}/hrg.XXXXXX"); T=$(cd "$T" && pwd -P); chmod 700 "$T"; N=0; F=0; HRG_EXPECT=165
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t GIT_TERMINAL_PROMPT=0
 export GT_REMOTE_GIT=$T/node GT_REMOTE_SSH=$T/bin/ssh GT_REMOTE_NOMUX=1 FAKE_SRV=$T/srv.git FAKE_SPEC=$T/spec REAL_GIT REAL_MKTEMP; REAL_GIT=$(command -v git); REAL_MKTEMP=$(command -v mktemp)
 ok() { N=$((N+1)); echo "ok   $N - $1"; }
@@ -166,8 +166,7 @@ grep -qF 'spec indisponível' "$LPE" && ok "espelho sem filtro: o stderr do ssh 
 
 # ── lastro hq-mutants (ga-0qhveri): o que as seções acima não pisam — o filtro que MUDA, o bootstrap, a idade (lag), status, wt-add/wt-rm e scan ──────────────────────────────────────
 # Cada caso abaixo mata uma troca de `&&`/`||`/`-n`/`!`/limite que deixava o selftest verde. EQUIVALENTES (provados por leitura, sem caso): o `|| true` -> `&& true` das duas leituras `rev-parse -q --verify` do status (sem `set -e`
-# o rc de uma atribuição por $( ) nunca é lido); `remove && prune || [ ! -e ]` do wt-rm (só difere se o `prune` falhar DEPOIS de um `remove` que deu certo, e o git não faz isso; se o `remove` falha a pasta continua lá e o `[ ! -e ]`
-# também falha); o `|| return 2` do `mktemp -d` dentro de denied (sem ele o `git init /r` falha na raiz do disco para quem não é root e o rc continua 2); o `&&` -> `||` entre o `tr` e a conferência de contagem do `find` do scan
+# o rc de uma atribuição por $( ) nunca é lido); o `|| return 2` do `mktemp -d` dentro de denied (sem ele o `git init /r` falha na raiz do disco para quem não é root e o rc continua 2); o `&&` -> `||` entre o `tr` e a conferência de contagem do `find` do scan
 # (se o `find` falha o `tr` não roda, $t/files não existe e a conferência é sempre falsa).
 # EQUIVALENTES do rodízio de 03/11 (ga-59jrj3d, provados por leitura): o `return 0` -> `return 1` do lag_fields (c5c184d44d: os três chamadores o chamam com `;`, e sem `set -e` o status nunca é lido) e o `|| true` -> `&& true` do
 # `old=$(g config gtremote.sparseoid || true)` do pull (fe123d753c: o status da atribuição nunca é lido; o valor é o mesmo).
@@ -178,6 +177,7 @@ printf '%s\n' '#!/bin/sh' 'case "${SHIM2_MODE:-}:${1:-}" in' '  mktempfail:-d) e
   'esac' 'exec "$REAL_MKTEMP" "$@"' > "$T/shim2/mktemp"
 printf '%s\n' '#!/bin/sh' 'case "${SHIM2_MODE:-}:$*" in' \
   '  flood201:*" fetch "*|flood200:*" fetch "*) i=0; max=200; [ "$SHIM2_MODE" = flood200 ] && max=199; while [ $i -lt $max ]; do echo "error: ruido $i" >&2; i=$((i+1)); done; echo "error: ssh://x/y.git did not send all necessary objects" >&2; exit 1 ;;' \
+  '  rmlies:*" worktree remove "*|rmlies:*" worktree prune") exit 0 ;;' \
   'esac' 'exec "$REAL_GIT" "$@"' > "$T/shim2/git"
 chmod 755 "$T/shim2/date" "$T/shim2/mktemp" "$T/shim2/git"
 
@@ -267,6 +267,10 @@ mkdir "$WTA/bead-inc"; wt wt-add gascity bead-inc; [ "$RC" = 3 ] && has 'worktre
 wt wt-add gascity 'Bead Ruim'; [ "$RC" = 2 ] && has 'bead inv' "wt-add: bead que o regex recusa → rc 2" || bad "wt-add bead ruim: rc=$RC" "$OUT"
 wt wt-add gascity bead-b 'Base Ruim'; [ "$RC" = 2 ] && has 'base inv' "wt-add: base que o regex recusa → rc 2" || bad "wt-add base ruim: rc=$RC" "$OUT"
 wt wt-add gascity bead-b; [ "$RC" = 0 ] && ok "wt-add: uma segunda bead" || bad "wt-add bead-b: rc=$RC" "$OUT"
+# (ga-tsi6ovl) um git que MENTE: `worktree remove` e `worktree prune` dizem 0 e a pasta continua la. O `[ ! -e ]` do wt-rm le o estado de DEPOIS, e e' ele que recusa (rc 3): sem ele
+# (314cfe418f, o `&&` antes do `[ ! -e ]` virando `||`) o wt-rm contaria "removido, liberou N KB" sobre uma pasta que existe. Antes dos wt-rm de verdade: a bead-a segue inteira para eles.
+OUT=$(env PATH="$T/shim2:$PATH" SHIM2_MODE=rmlies "$RG" wt-rm gascity bead-a 2>&1); RC=$?
+{ [ "$RC" = 3 ] && [ -e "$WTA/bead-a" ]; } && has 'não removi' "wt-rm: git que diz 0 sem remover → rc 3 'não removi' (a pasta é conferida depois, não o rc do git)" || bad "wt-rm com git que mente: rc=$RC pasta=$([ -e "$WTA/bead-a" ] && echo existe || echo sumiu)" "$OUT"
 find "$WTA/bead-b" -depth -delete   # a pasta some à mão: o clone fica com a entrada velha do worktree
 wt wt-rm gascity bead-a
 [ "$RC" = 0 ] && printf '%s\n' "$OUT" | grep -qE '^wt-rm: bead-a removido, liberou [0-9]+ KB$' && [ ! -e "$WTA/bead-a" ] && ok "wt-rm: remove a pasta e diz quanto liberou" || bad "wt-rm: rc=$RC" "$OUT"
