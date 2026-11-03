@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
-"""claude-login-renew — ga-xoe5ao.5 (slices 1-2 of 3): renew the login of a Claude account of the mini without calling Athos, and call him ONCE when it cannot.
+"""claude-login-renew — ga-xoe5ao.5 (slices 1-3 of 3): renew the login of a Claude account of the mini without calling Athos, and call him ONCE when it cannot.
 
     claude-login-renew.py --account <email> --force      0 = renewed, 2 = not renewed (the line printed and the log say why)
-    claude-login-renew.py                                launches NOTHING: lifts the marks of accounts somebody logged in by hand, retries the pushes not yet delivered
+    claude-login-renew.py                                the scheduled run (launchd, every 15 min): lifts the marks of accounts somebody logged in by hand, retries the
+                                                         pushes not yet delivered, and launches AT MOST ONE attempt, for the first account the forecast or the outage names
+    claude-login-renew.py --dry-run                      the same, but it only SAYS (stderr): nothing launched, written or pushed
+    exit: 0 = ran (or nothing to do), 2 = a forced renewal that did not renew, 64 = usage, 1 = the run could not judge (unreadable state / crew state), could not take the lock
+          or write its state, or crashed (the log says which)
+
+When the scheduled run acts (one account per run, the forecast first by nearest end, then the outage with the pool's pick first):
+  * FORECAST: the best login of a config-dir account (its own item, its reserve) ends within EXPIRY_WARN_S (7 days) or already ended. The account that HOLDS the
+    default item is left alone while the default is a full login: the CLI rotates that login and a fresh login of the same account could cost the default its
+    refresh token (not measured).
+  * OUTAGE: the crew job has had NO full login in the default item for NO_LOGIN_WARN_S (10 min) AND no config-dir account has a usable one stored.
+  An account whose mark says "wait" (`recheck_at`, `next_at`) is not touched before that time. Off switch: GC_LOGIN_RENEW=0 or <city>/.gc/no-login-renew.
+  Whatever the run cannot KNOW launches nothing (and says so): an unreadable state file or crew state, an item that cannot be read.
 
 What an attempt is: `claude auth login --email <e>` with CLAUDE_CONFIG_DIR = the account's own dir (the crew job finds the new item the next minute),
 under a PATH shim for `open`/`xdg-open` that only writes the OAuth URL into a private file - Athos's browser never opens. The URL goes to the DRIVER on
@@ -17,8 +29,7 @@ a password / a phone tap / a security key, or the profile has no session for tha
 driver STOPS (verdict `puzzle`, `needs_password`, `needs_device`, `no_google_session`, `wrong_account`) and nothing is retried. Slice 2: the account is
 then marked "inviavel por automacao" in the state and Athos gets ONE push with the exact step (retried every PUSH_RETRY_S until delivered, never
 repeated); a wall fixed in the BROWSER (CHROME_FIX) is to be looked at again after RECHECK_S (`recheck_at`), a transient failure after RETRY_S (`next_at`),
-the 3rd failure in a row is the same mark; a login made by hand (HAND_LOGIN_GAIN_S more life) lifts the mark.
-Slice 3 (not here): the forecast / outage triggers that READ `recheck_at` and `next_at`, the launchd plist and the off switch.
+the 3rd failure in a row is the same mark; a login made by hand (HAND_LOGIN_GAIN_S more life) lifts the mark. Slice 3: the scheduled run READS `recheck_at` and `next_at`.
 
 Secrets: tokens never leave this process except through `security -i` stdin (the crew module's kc_write); the OAuth URL never reaches argv, log or stdout;
 accounts are named by e-mail and tokens by sha256[:8] fingerprints.
@@ -66,13 +77,14 @@ PUZZLE_RE = re.compile(r"drag the|silhouette|verify (?:that )?you(?:'|’)?re (?
 DEVICE_RE = re.compile(r"tap yes|check your (?:phone|device)|security key|passkey|verify it(?:'|’)s you|use your phone|unusual activity", re.I)
 CHROME_FIX = ("no_google_session", "needs_password")     # fixed in the BROWSER: the job can see it worked. The others are fixed by a login by hand (the Keychain shows it)
 PERMANENT = ("puzzle", "no_google_session", "needs_password", "needs_device", "wrong_account")     # a retry cannot change these: a human can
+DRY = False                     # --dry-run: logs go to stderr, nothing is written, nothing is pushed, nothing is launched
 
 
 def rlog(level: str, msg: str) -> None:
     if "sk-ant-" in msg or "authorize?" in msg or "code_challenge" in msg or "state=" in msg:
         msg = "[line withheld: token- or URL-shaped text]"
-    line = f"{C._iso(C.now())} pid={os.getpid()} renew {level} {msg}"
-    c = C.city()
+    line = f"{C._iso(C.now())} pid={os.getpid()} renew {level} " + ("[dry-run] " if DRY else "") + msg
+    c = None if DRY else C.city()
     try:
         if c and (c / ".gc" / "logs").is_dir():
             with open(c / ".gc" / "logs" / "claude-login-renew.log", "a") as f:
@@ -268,20 +280,20 @@ def state_path() -> Path:
     return Path(os.environ.get("CLAUDE_RENEW_STATE") or DEFAULT_STATE)
 
 
-def load_state() -> dict:
-    # vazio (no file) → a first run; falhou/ilegível (not json, not an object of account records) → an empty state, SAID: marks and tries are lost, a wall may be met once more
+def load_state() -> Tuple[dict, str]:
+    """(state, 'ok'|'missing'|'unreadable'). Missing is a first run. Unreadable is an EMPTY state, said: a forced run goes on (its marks and tries are lost), the scheduled run launches nothing."""
     try:
         d = json.loads(state_path().read_bytes().decode())
     except FileNotFoundError:
-        return {}
+        return {}, "missing"
     except (OSError, ValueError, RecursionError):
         rlog("WARN", f"the state file {state_path()} is unreadable - starting from an empty state (marks and tries are lost)")
-        return {}
+        return {}, "unreadable"
     acc = d.get("accounts", {}) if isinstance(d, dict) else None
     if not (isinstance(acc, dict) and all(isinstance(v, dict) for v in acc.values())):      # valid json of the wrong SHAPE is the same unreadable state, not a crash on every run
         rlog("WARN", f"the state file {state_path()} is unreadable (not an object of account records) - starting from an empty state (marks and tries are lost)")
-        return {}
-    return d
+        return {}, "unreadable"
+    return d, "ok"
 
 
 def publish_state(st: dict) -> None:
@@ -313,37 +325,46 @@ def acct_rec(st: dict, email: str) -> dict:
     return a
 
 
-def holder_of_default() -> Optional[str]:
-    crew, _ = C.load_state()
+def holder_of(crew: dict) -> Optional[str]:
     h = crew.get("current")
     return h if isinstance(h, str) else None
 
 
-def survey(email: str, holder: Optional[str], t: float) -> dict:
-    """best_left: seconds to the end of the best refresh token `email` has (None = no end recorded anywhere); unread: an item that could not be read."""
-    best, unread = None, False
-    for svc in list(C.source_services(email)) + ([C.DEFAULT_SERVICE] if email == holder else []):
+def survey(email: str, crew: dict, t: float) -> dict:
+    """What `email` has: best_left (seconds to the end of its best refresh token, None = no end recorded anywhere), full (a usable full login is stored: one the crew job
+    has not called dead), default_full (the default item holds such a login), unread (an item that could not be read: the account is not judged)."""
+    best, full, default_full, unread = None, False, False, False
+    for svc in list(C.source_services(email)) + ([C.DEFAULT_SERVICE] if email == holder_of(crew) else []):
         s, _, b = C.kc_read(svc)
         # vazio (missing item, an item with no login object) → says nothing; falhou/ilegível (locked keychain, crashed security: 'unknown' with no blob) → NOT judged this run
         if s == "unknown" and b is None:
             unread = True
         elif s == "ok" and b:
-            left = C._ms_left(b["claudeAiOauth"], "refreshTokenExpiresAt", t)
+            o = b["claudeAiOauth"]
+            left = C._ms_left(o, "refreshTokenExpiresAt", t)
             if left is not None:
                 best = left if best is None else max(best, left)
-    return {"best_left": best, "unread": unread}
+            if C.full_login(b, t)[0] and not C.dead_login(crew, C.fp(o.get("refreshToken"))):
+                full, default_full = True, default_full or svc == C.DEFAULT_SERVICE
+    return {"best_left": best, "full": full, "default_full": default_full, "unread": unread}
 
 
-def release_marks(st: dict, holder: Optional[str], t: float) -> None:
+def release_marks(st: dict, crew: dict, t: float) -> None:
     """A mark is lifted when somebody logged the account in by hand: its best login now has HAND_LOGIN_GAIN_S more life than when it was marked,
     or it now has a login with a recorded end where the mark found none."""
     for email, a in list((st.get("accounts") or {}).items()):
         mark = a.get("infeasible")
         if not isinstance(mark, dict):
             continue
-        v, was = survey(email, holder, t), mark.get("left")
+        if "left" not in mark:                                 # every mark is written with a `left` (None = the mark found no login): without it the record is not ours to read
+            rlog("WARN", f"{email}: the mark has no `left` - it cannot be compared with a login, so it stands")
+            continue
+        v, was = survey(email, crew, t), mark["left"]
         # vazio (the item says nothing now) / falhou (cannot be read now) → the mark stands, the inert side; only a MEASURED login lifts it
-        if v["unread"] or v["best_left"] is None:
+        if v["unread"]:
+            rlog("WARN", f"{email}: marked, and an item of the account cannot be read - the mark stands until it can be")
+            continue
+        if v["best_left"] is None:
             continue
         if was is None or (isinstance(was, (int, float)) and not isinstance(was, bool) and v["best_left"] >= was + HAND_LOGIN_GAIN_S):
             a.pop("infeasible")
@@ -352,9 +373,10 @@ def release_marks(st: dict, holder: Optional[str], t: float) -> None:
             rlog("INFO", f"{email}: logged in by hand - the mark is lifted, back in rotation")
 
 
-def step_text(email: str, verdict: str, step: str) -> str:
+def step_text(email: str, mark: dict) -> str:
+    verdict, step, left, at = str(mark.get("verdict") or ""), str(mark.get("step") or ""), mark.get("left"), mark.get("at")
     chrome = ("sign this Google account in ONCE in the automation Chrome on the mini (profile ~/.chrome-cdp, `cdp status`; password and 2-step by you, "
-              "nothing passes through an agent). The job looks again within a day and, from then on, the renewal is automatic")
+              "nothing passes through an agent). Once it is done the job notices within about a day and the renewal is automatic again")
     hand = C.relogin_cmd(email)
     why = {
         "puzzle": f"Anthropic asked a human-verification puzzle at 'Authorize' (not circumvented). Log {email} in by hand, once, in the mini's Terminal: {hand}",
@@ -365,16 +387,21 @@ def step_text(email: str, verdict: str, step: str) -> str:
     }.get(verdict)
     if why is None:
         why = f"{MAX_TRIES} automatic tries failed (last: {step or verdict}). Step: {hand}"
-    return f"{email} cannot be renewed automatically ({verdict}): {why} Its login ends in the next days."
+    if isinstance(left, (int, float)) and not isinstance(left, bool) and isinstance(at, (int, float)) and not isinstance(at, bool):
+        ends = f"Its login ends {C._iso(at + left)}." if left > 0 else "Its login has already ended."
+    else:
+        ends = "No end of its login is recorded."                                 # the mark found no login to measure: said as that, not as "soon"
+    warn = step.split(" | ", 1)[1] if " | " in step else ""                       # what attempt() appended when the item could NOT be put back: Athos must hear it too
+    return f"{email} cannot be renewed automatically ({verdict}): {why} {ends}" + (f" ATTENTION: {warn}" if warn else "")
 
 
 def tell(st: dict, email: str, t: float) -> None:
-    """ONE push per mark: retried every PUSH_RETRY_S while notify does not deliver it, never again once it did."""
+    """ONE push per mark: retried every PUSH_RETRY_S while notify does not deliver it, never again once it did. The verdict is in the TITLE: notify drops a push whose title went out < 30 min ago."""
     mark = acct_rec(st, email).get("infeasible")
     if not isinstance(mark, dict) or mark.get("pushed") or t < C._num(mark.get("next_push")):
         return
     mark["next_push"] = t + PUSH_RETRY_S
-    if push(f"Relogin automatico impossivel: {email}", step_text(email, mark.get("verdict", ""), str(mark.get("step") or ""))):
+    if push(f"Relogin automatico impossivel ({mark.get('verdict', '?')}): {email}", step_text(email, mark)):
         mark["pushed"] = t
 
 
@@ -387,15 +414,20 @@ def mark_infeasible(st: dict, email: str, verdict: str, step: str, left, t: floa
     if old.get("verdict") == verdict:                          # the same wall again: the push that was sent stands (a NEW wall is a new step for Athos, so a new push)
         mark.update({k: old[k] for k in ("pushed", "next_push") if k in old})
     a["infeasible"] = mark
-    rlog("WARN", f"{email}: marked 'inviavel por automacao' ({verdict}: {step}) - one push; " + (f"looked at again in {RECHECK_S // 3600} h" if verdict in CHROME_FIX else "no more tries until it is logged in by hand"))
+    rlog("WARN", f"{email}: marked 'inviavel por automacao' ({verdict}: {step}) - one push; " + (f"looked at again after {RECHECK_S // 3600} h" if verdict in CHROME_FIX else "no more tries until it is logged in by hand"))
 
 
-def run_account(st: dict, holder: Optional[str], email: str, reason: str, t: float) -> Tuple[str, str, Optional[dict]]:
+def run_account(st: dict, crew: dict, email: str, reason: str, t: float) -> Tuple[str, str, Optional[dict]]:
     """One attempt and what it leaves in the state: a proof clears the account's tries and mark; a wall marks it; a transient failure counts."""
     a = acct_rec(st, email)
-    left = survey(email, holder, t)["best_left"]
-    rlog("INFO", f"renewing {email} ({reason}): claude auth login in {acct_dir(email)}")
-    verdict, step, proof = attempt(email, reason, t)
+    v = survey(email, crew, t)
+    if v["unread"]:                                            # a mark's `left` taken with an item missing from the measure could lift the mark later when nobody logged in by hand
+        verdict, step, proof = "skipped", "an item of the account could not be read, so its login is not judged - nothing launched", None
+    else:
+        rlog("INFO", f"renewing {email} ({reason}): claude auth login in {acct_dir(email)}")
+        verdict, step, proof = attempt(email, reason, t)
+        t = C.now()                                            # the attempt takes minutes: the marks, tries and pushes are dated when it ENDED
+    left = v["best_left"]
     a["last"] = {"verdict": verdict, "step": step, "at": t}
     if proof:
         for k in ("tries", "next_at", "infeasible"):
@@ -414,30 +446,93 @@ def run_account(st: dict, holder: Optional[str], email: str, reason: str, t: flo
     return verdict, step, proof
 
 
+def settle(st: dict, emails: List[str], t: float) -> Optional[OSError]:
+    """The state is written BEFORE the pushes (a crash in between re-sends a wall, it does not forget it), the pushes go, the state is written again.
+    A state that cannot be written is RETURNED (the caller says it) and never keeps Athos from hearing about a wall."""
+    errs = [save(st)]
+    for email in emails:
+        tell(st, email, t)
+    errs.append(save(st))
+    return next((e for e in errs if e), None)
+
+
+def disabled() -> Optional[str]:
+    """What switches the job off (None = on): GC_LOGIN_RENEW=0, or the file <city>/.gc/no-login-renew. No reload of anything needed."""
+    if os.environ.get("GC_LOGIN_RENEW") == "0":
+        return "GC_LOGIN_RENEW=0"
+    c = C.city()
+    return str(c / ".gc" / "no-login-renew") if c and (c / ".gc" / "no-login-renew").exists() else None
+
+
+def candidates(st: dict, crew: dict, dec, t: float) -> List[Tuple[str, str]]:
+    """(email, reason) in the order they should be tried: the forecast by nearest end, then the outage with the pool's pick first."""
+    holder = holder_of(crew)
+    surveys = {e: survey(e, crew, t) for e in C.accounts() if acct_dir(e)}
+    forecast, outage = [], []
+    ep = crew.get("no_login")
+    in_outage = (isinstance(ep, dict) and isinstance(ep.get("since"), (int, float)) and not isinstance(ep.get("since"), bool)
+                 and not ep.get("ending") and t - ep["since"] >= C.NO_LOGIN_WARN_S)
+    none_usable = in_outage and all(not v["full"] and not v["unread"] for v in surveys.values())
+    pick = str((dec or {}).get("current") or "").strip().lower() if isinstance(dec, dict) else ""
+    for email, v in surveys.items():
+        a = (st.get("accounts") or {}).get(email) or {}
+        if v["unread"]:
+            rlog("WARN", f"{email}: an item could not be read - the account is not judged this run")
+            continue
+        if email == holder and v["default_full"]:
+            rlog("INFO", f"{email} holds the default and it is a full login - not touched (its rotation keeps it alive)")
+            continue
+        # vazio (no mark) → candidate; a mark whose recheck_at has come → looked at again; falhou/ilegível (a mark that is no object, or has no recheck_at) → stays marked
+        if "infeasible" in a and not (isinstance(a["infeasible"], dict) and t >= C._num(a["infeasible"].get("recheck_at"), float("inf"))):
+            continue
+        wait = a.get("next_at", 0.0)
+        if not isinstance(wait, (int, float)) or isinstance(wait, bool):
+            rlog("WARN", f"{email}: next_at is not a number - the account is not touched until the state is fixed")
+            continue
+        if t < wait:
+            continue
+        if v["best_left"] is not None and v["best_left"] <= C.EXPIRY_WARN_S:
+            forecast.append((v["best_left"], email))
+        elif none_usable:
+            outage.append((0 if email == pick else 1, email))
+    return [(e, "forecast") for _, e in sorted(forecast)] + [(e, "outage") for _, e in sorted(outage)]
+
+
 def run_once(email: str) -> int:
-    """Renew `email` now. 0 = renewed; 2 = not (a wall the job does not get around, a failed try, an account with no config dir): the line says which."""
+    """Renew `email` now. 0 = renewed; 2 = not (a wall the job does not get around, a failed try, an account with no config dir, a job switched off): the line says which."""
+    off = disabled()
+    if off:
+        print(f"{email}: the job is switched off ({off}) - nothing done", file=sys.stderr)
+        return 2
     if email not in C.accounts() or not acct_dir(email):
         print(f"{email}: not one of the accounts with a config dir ('no config dir' = nothing to log into) - nothing done", file=sys.stderr)
         return 2
-    t, st = C.now(), load_state()
-    verdict, step, proof = run_account(st, holder_of_default(), email, "forced", t)
+    t, (st, st_status) = C.now(), load_state()
+    crew, crew_status = C.load_state()
+    if crew_status != "ok":                                    # who holds the default is then unknown, and a fresh login of the holder could cost the default its refresh token
+        print(f"{email}: the crew state {C.state_path()} is {crew_status}, so whether this account holds the default is unknown - nothing done", file=sys.stderr)
+        return 2
+    if DRY:
+        print(f"{email}: [dry-run] would renew it now (forced) - nothing launched", file=sys.stderr)
+        return 0
+    verdict, step, proof = run_account(st, crew, email, "forced", t)
+    t = C.now()
     if proof:
         b, a = proof["before"], proof["after"]
         line = (f"{email}: renewed; item {proof['svc']}: access {b['afp'] if b else 'none'} -> {a['afp']}, refresh {b['rfp'] if b else 'none'} -> {a['rfp']}, ends {a['rexp']}"
                 + (" (owner unverified: the profile could not say whose the login is)" if proof["owner_unverified"] else ""))
     else:
         line = f"{email}: NOT renewed ({verdict}: {step})"
-    errs = [save(st)]                                          # the mark is written BEFORE the push: a crash in between re-sends it, it does not forget the wall
-    tell(st, email, t)                                         # ... and a state that cannot be written never keeps Athos from hearing about a wall
-    errs.append(save(st))
+    err = settle(st, [email], t)
     mark, tries = acct_rec(st, email).get("infeasible"), acct_rec(st, email).get("tries")
-    if not proof and not isinstance(mark, dict) and tries:
+    if not proof and verdict != "skipped" and not isinstance(mark, dict) and tries:
         line += f" - failed try {int(C._num(tries))} of {MAX_TRIES}"
     if isinstance(mark, dict):
-        again = f"looked at again in {RECHECK_S // 3600} h" if mark.get("verdict") in CHROME_FIX else "no automatic retry until it is logged in by hand"
+        again = f"looked at again after {RECHECK_S // 3600} h" if mark.get("verdict") in CHROME_FIX else "no automatic retry until it is logged in by hand"
         line += (f" - marked 'inviavel por automacao' ({again}); by hand: {C.relogin_cmd(email)}. "
-                 + ("Athos was told (one push)." if mark.get("pushed") else f"The push was NOT delivered: the bare run retries it every {PUSH_RETRY_S // 60} min."))
-    err = next((e for e in errs if e), None)
+                 + ("Athos was told (one push)." if mark.get("pushed") else f"The push was NOT delivered: the scheduled run retries it (not before {PUSH_RETRY_S // 60} min from now)."))
+    if st_status == "unreadable":
+        line += " | the state file was unreadable: the marks, tries and pushes of the OTHER accounts were lost (said in the log)"
     if err:
         rlog("ERROR", f"{email}: the state could not be written ({type(err).__name__}): this run's marks and tries are lost")
         line += f" | the state file could not be written ({type(err).__name__}): this run's marks, tries and push are NOT recorded"
@@ -447,14 +542,32 @@ def run_once(email: str) -> int:
 
 
 def housekeeping() -> int:
-    """No account named: launches nothing. Lifts the marks of accounts somebody logged in by hand and retries the pushes that were not delivered."""
-    t, st = C.now(), load_state()
-    release_marks(st, holder_of_default(), t)
-    for email in list(st.get("accounts") or {}):
-        tell(st, email, t)
-    if st.get("accounts"):
-        publish_state(st)
-    return 0
+    """The scheduled run: lifts the marks of accounts somebody logged in by hand, retries the pushes that were not delivered, and launches AT MOST ONE attempt (the first candidate).
+    0 = ran; 1 = it could not judge (state or crew state unreadable) or could not write its state: it launched nothing it could not judge, and the log says why."""
+    off = disabled()
+    if off:
+        rlog("INFO", f"switched off ({off}) - nothing done")
+        return 0
+    t, (st, st_status) = C.now(), load_state()
+    if st_status == "unreadable":                              # without the marks and tries a wall would be met (and pushed) again: nothing is launched, pushed or written
+        rlog("ERROR", f"nothing launched, pushed or written until {state_path()} is fixed or removed: without its marks the job would push the same wall again")
+        return 1
+    crew, crew_status = C.load_state()
+    todo = []
+    if crew_status == "ok":
+        release_marks(st, crew, t)
+        todo = candidates(st, crew, C.load_json(C.decision_path()), t)
+    else:                                                      # who holds the default and who has no login is unknown: no login is judged, only the pending pushes go
+        rlog("ERROR", f"the crew state {C.state_path()} is {crew_status}: no login is judged and nothing is launched")
+    if todo and DRY:
+        rlog("INFO", f"{todo[0][0]}: would be renewed now ({todo[0][1]}) - nothing launched" + (f"; then, in later runs: {', '.join(e for e, _ in todo[1:])}" if todo[1:] else ""))
+    elif todo:
+        run_account(st, crew, todo[0][0], todo[0][1], t)
+        t = C.now()
+    err = None if DRY or not st.get("accounts") else settle(st, list(st["accounts"]), t)
+    if err:
+        rlog("ERROR", f"the state could not be written ({type(err).__name__}): this run's marks, tries and pushes are NOT recorded")
+    return 0 if crew_status == "ok" and not err else 1
 
 
 # ── the driver (python with playwright; runs attached to the Chrome CDP) ───────────────────────
@@ -592,10 +705,14 @@ def drive() -> int:
 def main(argv: List[str]) -> int:
     if argv[:1] == ["drive"]:
         return drive()
+    global DRY
+    DRY = "--dry-run" in argv
+    argv = [x for x in argv if x != "--dry-run"]
     i = argv.index("--account") + 1 if "--account" in argv else 0
     forced = "--force" in argv and 0 < i < len(argv)
     if argv and not forced:
-        print("usage: claude-login-renew.py [--account <email> --force]      (renew that account's login now; no arguments = lift the marks, retry the pushes)", file=sys.stderr)
+        print("usage: claude-login-renew.py [--dry-run] [--account <email> --force]      (--account --force: renew that account's login now; no arguments: the scheduled run; "
+              "--dry-run only says what it would do)", file=sys.stderr)
         return 64
     c = C.city()
     lock = (c / ".gc" / "claude-login-renew.lock") if c and (c / ".gc").is_dir() else state_path().with_suffix(".lock")

@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.claude-login-renew</string>
+
+  <!-- ga-xoe5ao.5 (item 2 of ga-xoe5ao) - AUTOMATIC relogin of the Claude accounts that live in a config dir under
+       ~/.gastown/claude-accounts, so the Remote Control crews never sit on a dead login. Two triggers: the T-7-days
+       forecast (the best stored login of an account ends in 7 days or less; the account that holds the default is left
+       out while the default is a full login) and an outage (the crew job has a "no_login" episode open for 10 minutes or
+       more and no stored login can heal it; the pool's pick goes first). ONE account per run, nearest end first.
+       The run drives `claude auth login` (with the email option) in that account's own dir; Google is passed with the TOTP
+       (`gmail-totp`) in the automation Chrome (CDP, profile ~/.chrome-cdp). NEVER a password, NEVER a way around
+       Anthropic's anti-bot puzzle: at the puzzle / no Google session / a password or a device prompt the account is
+       marked "inviavel por automacao" and Athos gets ONE push with the exact step. A state or crew state it cannot read
+       launches nothing. The crew switch job (claude-crew-account) finds the new item on its next minute.
+
+       This is NOT com.gascity.claude-account-relog (ga-jf689, the quota swap): different job, different label.
+
+       KILL SWITCH (no reload needed): touch /Users/athos/gt/.gascity-gastown-hq/.gc/no-login-renew
+       (or GC_LOGIN_RENEW=0 in the environment).
+       Dry run: run the script by hand with its dry-run option (stderr only: no Keychain write, no browser, no notify,
+       no state, no log file).
+
+       ACTIVATION is a separate, human step (merged is not live), and THIS FILE SITS IN pending-activation/ ON PURPOSE:
+       the deploy (skill-integrity-install.sh) installs every NEW com.gascity.* plist it finds directly under assets/,
+       and this job drives a browser and rewrites Keychain items. To arm it, after the dry run has been read: copy it to
+       ~/Library/LaunchAgents and launchctl load it. See docs/claude-login-renew.md. -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/claude-login-renew.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <!-- 900 s: a forecast is days long and an outage can wait a quarter of an hour on top of the 10 min the crew job
+       already waits. The script holds a flock, so a slow attempt (up to ~5 min) is never doubled. -->
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><false/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/claude-login-renew-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/claude-login-renew-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- /opt/homebrew/bin: python3 with Playwright (the driver). ~/.local/bin: gmail-totp, claude, notify. /usr/bin: security. -->
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <!-- claude asks the Keychain for account $USER; launchd does not always set it. -->
+    <key>USER</key>
+    <string>athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+  </dict>
+</dict>
+</plist>

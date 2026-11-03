@@ -1,5 +1,6 @@
-"""ga-xoe5ao.5.1/.5.2 — claude-login-renew.py, slices 1-2: `--account <e> --force` renews ONE Claude account's login through gmail-totp + the Chrome CDP,
-and what the automation does not get around becomes a mark in the state plus ONE push (the "what cannot be automated" block at the end of the file).
+"""ga-xoe5ao.5.1/.5.2/.5.3 — claude-login-renew.py: `--account <e> --force` renews ONE Claude account's login through gmail-totp + the Chrome CDP,
+what the automation does not get around becomes a mark in the state plus ONE push (the "what cannot be automated" block), and the scheduled run
+(no arguments) launches AT MOST ONE attempt, on the forecast (a login ends in <= 7 days) or the outage (no full login anywhere) — the "scheduled run" blocks.
 
 No network, no real browser, no real Keychain: `security` is a json store, `claude` is a fake that asks "the browser" (`open <url>`) and only finishes
 when the fake driver says the callback happened, the driver is a fake that prints a verdict, the profile is a loopback server. What this proves:
@@ -115,7 +116,8 @@ if v == "ok":
 print(json.dumps({"verdict": v, "step": "at claude.ai/oauth/authorize"}))
 '''
 
-EMAIL = {"crypto": "athoscrypto@gmail.com", "b85": "athosb85@gmail.com", "martins": "athosmartins@gmail.com"}
+EMAIL = {"crypto": "athoscrypto@gmail.com", "b85": "athosb85@gmail.com", "martins": "athosmartins@gmail.com", "terr": "terrenos.incorporacoes@gmail.com",
+         "amb": "throw.away.amb@gmail.com"}
 T0 = float(int(time.time()))
 DAY = 86400
 _GUARD: dict = {}
@@ -150,7 +152,7 @@ def _pin_env(monkeypatch, tmp_path):
     for k, v in {"CLAUDE_CREW_SECURITY": g / "security", "CLAUDE_RENEW_CLAUDE": g / "claude", "CLAUDE_RENEW_DRIVER": json.dumps([str(g / "gmail-totp")]),
                  "GC_CITY_PATH": tmp_path / "pinned-city", "CLAUDE_CREW_STATE": tmp_path / "pinned-crew-state.json",
                  "CLAUDE_CREW_ACCOUNTS_DIR": tmp_path / "pinned-accts", "HOME": tmp_path / "pinned-home", "CLAUDE_CREW_NOTIFY": g / "notify",
-                 "CLAUDE_RENEW_STATE": tmp_path / "pinned-renew-state.json"}.items():
+                 "CLAUDE_RENEW_STATE": tmp_path / "pinned-renew-state.json", "CLAUDE_CREW_DECISION": tmp_path / "pinned-decision.json"}.items():
         monkeypatch.setenv(k, str(v))
     monkeypatch.setenv("PATH", f"{g}:/usr/bin:/bin")
 
@@ -181,30 +183,45 @@ class World:
         (self.d / "city" / ".gc" / "logs").mkdir(parents=True)
         for k, v in {"FAKE_SEC_DIR": str(self.d), "CLAUDE_CREW_SECURITY": str(self.d / "security"), "CLAUDE_RENEW_CLAUDE": str(self.d / "claude"),
                      "CLAUDE_RENEW_DRIVER": json.dumps([str(self.d / "driver"), "drive"]), "CLAUDE_CREW_STATE": str(self.d / "crew_state.json"),
-                     "CLAUDE_CREW_NOTIFY": str(self.d / "notify"), "CLAUDE_RENEW_STATE": str(self.d / "renew_state.json"),
+                     "CLAUDE_CREW_NOTIFY": str(self.d / "notify"), "CLAUDE_RENEW_STATE": str(self.d / "renew_state.json"), "CLAUDE_CREW_DECISION": str(self.d / "pool_decision.json"),
                      "CLAUDE_CREW_ACCOUNTS_DIR": str(self.d / "accts"), "CLAUDE_CREW_USER": "athos", "GC_CITY_PATH": str(self.d / "city"),
                      "CLAUDE_CREW_PROFILE_URL": f"http://127.0.0.1:{self.srv.server_address[1]}/profile", "CLAUDE_CREW_NOW": str(T0)}.items():
             monkeypatch.setenv(k, v)
-        for k in ("CLAUDE_CREW_ACCOUNTS", "FAKE_SEC_FAIL", "FAKE_CLAUDE_MODE", "FAKE_DRIVER_VERDICT", "FAKE_CLAUDE_BLOB", "FAKE_NOTIFY_RC"):
+        for k in ("CLAUDE_CREW_ACCOUNTS", "FAKE_SEC_FAIL", "FAKE_CLAUDE_MODE", "FAKE_DRIVER_VERDICT", "FAKE_CLAUDE_BLOB", "FAKE_NOTIFY_RC", "GC_LOGIN_RENEW"):
             monkeypatch.delenv(k, raising=False)
+        monkeypatch.setattr(renew, "DRY", False, raising=False)  # main() sets it for the whole process: no test leaves a dry run behind
         self.mp = monkeypatch
+        self.crew_state()                                          # the crew job's state: empty but READABLE (a missing or corrupt one is a case of its own)
         assert str(crew.security_bin()).startswith(str(self.d)) and str(crew.city()).startswith(str(self.d))
 
     def store(self):
         p = self.d / "store.json"
         return json.loads(p.read_text()) if p.exists() else {}
 
-    def own(self, key, b):
+    def put(self, service, b):
         s = self.store()
-        s[self.svc(key)] = {"acct": "athos", "secret": json.dumps(b)}
+        s[service] = {"acct": "athos", "secret": json.dumps(b)}
         (self.d / "store.json").write_text(json.dumps(s))
+
+    def own(self, key, b):
+        self.put(self.svc(key), b)
+
+    def default(self, key, b):
+        self.put(crew.DEFAULT_SERVICE, b)
+        self.tokens[b["claudeAiOauth"]["accessToken"]] = EMAIL[key]
+
+    def crew_state(self, **kw):
+        (self.d / "crew_state.json").write_text(json.dumps(kw))
+
+    def decide(self, key):
+        (self.d / "pool_decision.json").write_text(json.dumps({"current": EMAIL[key], "updated": crew._iso(T0), "schema": 1, "exhausted": {}}))
 
     def get(self, service):
         v = self.store().get(service)
         return json.loads(v["secret"]) if v else None
 
     def svc(self, key):
-        return crew.dir_service(str(self.d / "accts" / {"crypto": "athoscrypto", "b85": "athosb85"}[key]))
+        return crew.dir_service(str(self.d / "accts" / {"crypto": "athoscrypto", "b85": "athosb85", "terr": "terrenos", "amb": "throw.away.amb"}[key]))
 
     def login_will_be(self, key, b, *, owner=None):
         """What the fake CLI stores when the browser dance works: `b`, whose access token the profile says belongs to `owner` (default: `key`)."""
@@ -366,7 +383,7 @@ def test_an_item_that_cannot_be_read_is_not_attempted_and_never_overwritten(w, c
     w.own("b85", blob("b85-old", rexp_days=3.0))
     w.mp.setenv("FAKE_SEC_FAIL", w.svc("b85"))
     assert w.run() == 2
-    assert w.calls("claude") == [] and w.calls("driver") == [] and "cannot be put back" in capsys.readouterr().out
+    assert w.calls("claude") == [] and w.calls("driver") == [] and "could not be read" in capsys.readouterr().out
 
 
 def test_an_item_that_cannot_be_read_after_the_try_is_said_as_unreadable_not_as_no_new_login_and_left_alone(w, monkeypatch, capsys):
@@ -602,7 +619,7 @@ def test_a_wall_is_pushed_once_with_the_exact_step_and_never_again_while_it_is_t
     script(w, (verdict, "at the page", None), (verdict, "at the page", None))
     assert w.run() == 2 and w.run() == 2
     (n,), m = w.calls("notify"), w.mark()
-    assert n["strict"] == "1" and n["argv"][:4] == ["-t", f"Relogin automatico impossivel: {EMAIL['b85']}", "-p", "4"]
+    assert n["strict"] == "1" and n["argv"][:4] == ["-t", f"Relogin automatico impossivel ({verdict}): {EMAIL['b85']}", "-p", "4"]
     assert (m["verdict"], m["pushed"], m["left"]) == (verdict, T0, pytest.approx(3 * DAY, abs=2))
     assert ("automation Chrome" if verdict in renew.CHROME_FIX else crew.relogin_cmd(EMAIL["b85"])) in n["argv"][4]
     assert m.get("recheck_at") == (T0 + renew.RECHECK_S if verdict in renew.CHROME_FIX else None)
@@ -687,13 +704,13 @@ def test_a_try_that_launched_nothing_is_not_a_failed_try_and_a_proof_clears_the_
 
 
 def test_a_login_made_by_hand_with_a_day_more_life_lifts_the_mark_and_less_does_not(w):
-    w.own("b85", blob("b85-old", rexp_days=3.0))
+    w.own("b85", blob("b85-old", rexp_days=10.0))                                              # past the 7-day forecast: the bare run only lifts, it does not renew
     script(w, ("puzzle", "s", None))
     w.run()
-    w.own("b85", blob("b85-hand-1", rexp_days=3.5))
+    w.own("b85", blob("b85-hand-1", rexp_days=10.5))
     renew.housekeeping()
     assert w.mark()
-    w.own("b85", blob("b85-hand-2", rexp_days=4.1))
+    w.own("b85", blob("b85-hand-2", rexp_days=11.1))
     renew.housekeeping()
     assert w.mark() is None and "logged in by hand" in w.log()
 
@@ -716,13 +733,13 @@ def test_a_mark_stands_while_the_item_cannot_be_read_and_a_mark_with_no_login_at
 @pytest.mark.parametrize("raw", [b"{not json", b"[1, 2]", b'{"accounts": []}', b'{"accounts": {"x": 5}}'])
 def test_a_state_file_that_cannot_be_read_is_an_empty_state_and_said(w, raw):
     (w.d / "renew_state.json").write_bytes(raw)
-    assert renew.load_state() == {} and "unreadable" in w.log()
+    assert renew.load_state() == ({}, "unreadable") and "unreadable" in w.log()
 
 
 def test_a_state_path_that_cannot_be_read_is_an_empty_state_and_said_but_no_file_is_a_first_run(w):
-    assert renew.load_state() == {} and w.log() == ""
+    assert renew.load_state() == ({}, "missing") and w.log() == ""
     (w.d / "renew_state.json").mkdir()
-    assert renew.load_state() == {} and "unreadable" in w.log()
+    assert renew.load_state() == ({}, "unreadable") and "unreadable" in w.log()
 
 
 def test_a_state_that_cannot_be_written_is_said_on_the_printed_line_and_the_push_still_goes(w, capsys):
@@ -734,8 +751,8 @@ def test_a_state_that_cannot_be_written_is_said_on_the_printed_line_and_the_push
     assert "could not be written" in capsys.readouterr().out and len(w.calls("notify")) == 1
 
 
-def test_the_bare_run_launches_nothing_and_writes_no_state_when_there_is_nothing_to_keep(w):
-    w.own("b85", blob("b85-old", rexp_days=3.0))
+def test_the_bare_run_launches_nothing_and_writes_no_state_when_there_is_nothing_to_do(w):
+    w.own("b85", blob("b85-old", rexp_days=14.0))
     assert renew.main([]) == 0 and w.calls("claude") == [] and w.calls("driver") == [] and not (w.d / "renew_state.json").exists()
 
 
@@ -756,3 +773,339 @@ def test_a_claude_that_cannot_run_is_a_failed_try_named_as_such_and_the_item_is_
     w.mp.setenv("CLAUDE_RENEW_CLAUDE", str(w.d / "no-such-claude"))
     assert w.run() == 2
     assert "cli_unavailable" in capsys.readouterr().out and w.get(w.svc("b85")) == old and acct(w)["tries"] == 1
+
+
+# ── the scheduled run: forecast, outage, ONE account per run, waits, controls (ga-xoe5ao.5.3) ──────────────────────
+def record(w, *outs):
+    """`attempt` replaced by a script that also notes who it was asked for and why; past the script it renews (PROOF)."""
+    seen, it = [], iter(outs)
+
+    def fake(email, reason, t):
+        seen.append((email, reason))
+        return next(it, ("renewed", "", PROOF))
+    w.mp.setattr(renew, "attempt", fake)
+    return seen
+
+
+def healthy(w, days=29.0, *keys):
+    for k in keys or ("crypto", "b85", "terr", "amb"):
+        w.own(k, blob(f"{k}-ok", rexp_days=days))
+
+
+def outage(w, ago=600, **kw):
+    w.crew_state(no_login={"since": T0 - ago}, **kw)
+
+
+@pytest.mark.parametrize("days, launched", [(7.0, True), (7.1, False), (0.5, True)])
+def test_the_forecast_fires_when_the_best_login_ends_within_7_days_and_not_a_minute_later(w, days, launched):
+    healthy(w)
+    w.own("b85", blob("b85-x", rexp_days=days))
+    seen = record(w)
+    assert renew.housekeeping() == 0
+    assert seen == ([(EMAIL["b85"], "forecast")] if launched else [])
+
+
+def test_the_best_of_the_accounts_items_counts_and_an_end_that_is_not_recorded_is_not_a_forecast(w):
+    healthy(w)
+    w.own("b85", blob("b85-own", rexp_days=3.0))
+    w.put(crew.reserve_service(EMAIL["b85"]), blob("b85-reserve", rexp_days=20.0))              # the reserve item has a fresher login: the account is not ending
+    b = blob("amb-x")
+    del b["claudeAiOauth"]["refreshTokenExpiresAt"]
+    w.own("amb", b)                                                                             # no end recorded = unknown, not "ends today"
+    seen = record(w)
+    assert renew.housekeeping() == 0 and seen == []
+
+
+def test_one_account_per_run_the_nearest_end_first_and_the_next_run_takes_the_next(w):
+    healthy(w)
+    for k, d in (("amb", 6.0), ("b85", 2.0), ("terr", 4.0)):
+        w.own(k, blob(f"{k}-x", rexp_days=d))
+    seen = record(w)
+    renew.housekeeping()
+    assert seen == [(EMAIL["b85"], "forecast")]                                                 # three are due, ONE goes
+    w.own("b85", blob("b85-new"))                                                               # it was renewed: its login is fresh
+    renew.housekeeping()
+    w.own("terr", blob("terr-new"))
+    renew.housekeeping()
+    assert seen == [(EMAIL[k], "forecast") for k in ("b85", "terr", "amb")]
+
+
+def test_the_account_that_holds_the_default_is_left_out_while_the_default_is_a_full_login_and_only_then(w):
+    healthy(w)
+    w.own("crypto", blob("crypto-own", rexp_days=2.0))
+    w.own("b85", blob("b85-own", rexp_days=3.0))
+    w.crew_state(current=EMAIL["crypto"])
+    w.default("crypto", blob("crypto-default", rexp_days=25.0))                                 # the default item holds crypto's full login: the rotation keeps it
+    seen = record(w)
+    renew.housekeeping()
+    assert seen == [(EMAIL["b85"], "forecast")]                                                 # b85's own 3 days count; the DEFAULT item (crypto's login) does not count for b85
+    assert f"{EMAIL['crypto']} holds the default and it is a full login" in w.log()
+    w.default("crypto", {"claudeAiOauth": {"accessToken": "sk-ant-oat01-setup-acc", "expiresAt": int((T0 + DAY) * 1000), "scopes": ["user:inference"]}})
+    w.own("b85", blob("b85-new"))                                                               # ... but a default that is NOT a full login (a setup-token) does not excuse it
+    renew.housekeeping()
+    assert seen[1:] == [(EMAIL["crypto"], "forecast")]
+
+
+def test_the_default_item_login_counts_for_the_holder_only(w):
+    healthy(w)
+    w.crew_state(current=EMAIL["crypto"])
+    w.own("crypto", blob("crypto-own", rexp_days=2.0))
+    w.own("b85", blob("b85-own", rexp_days=2.0))
+    w.default("crypto", blob("crypto-default", rexp_days=25.0))
+    w.mp.setenv("FAKE_SEC_FAIL", crew.DEFAULT_SERVICE)                                          # the default item cannot be read: the HOLDER is not judged (WARN) ...
+    seen = record(w)
+    renew.housekeeping()
+    assert seen == [(EMAIL["b85"], "forecast")]                                                 # ... and b85, who has nothing on that item, still is
+    assert f"{EMAIL['crypto']}: an item could not be read" in w.log()
+
+
+# ── the outage ──────────────────────────────────────────────────────────────────
+def test_an_outage_of_10_minutes_with_no_usable_login_renews_the_pool_pick_first_then_the_others_one_per_run(w):
+    outage(w)
+    w.decide("amb")
+    seen = record(w, ("no_full_login", "nothing new", None))
+    renew.housekeeping()
+    renew.housekeeping()                                                                        # amb failed (transient): it waits 6 h, the next in line goes
+    assert seen == [(EMAIL["amb"], "outage"), (EMAIL["b85"], "outage")]
+
+
+@pytest.mark.parametrize("what", ["nine_minutes", "ended", "since_not_a_number", "a_usable_login_exists", "an_item_cannot_be_read"])
+def test_what_is_not_an_outage_launches_nothing(w, what):
+    outage(w)
+    if what == "nine_minutes":
+        outage(w, ago=599)
+    elif what == "ended":
+        w.crew_state(no_login={"since": T0 - 3600, "ending": T0 - 10})
+    elif what == "since_not_a_number":
+        w.crew_state(no_login={"since": "yesterday"})
+    elif what == "a_usable_login_exists":
+        w.own("terr", blob("terr-ok"))                                                          # the crew job heals the default from it: nothing for us to do
+    else:
+        w.mp.setenv("FAKE_SEC_FAIL", w.svc("amb"))                                              # we cannot say there is no login anywhere
+    seen = record(w)
+    assert renew.housekeeping() == 0 and seen == []
+    if what == "an_item_cannot_be_read":
+        assert f"{EMAIL['amb']}: an item could not be read" in w.log()
+
+
+def test_logins_the_crew_job_has_burned_are_not_usable_so_that_is_an_outage(w):
+    healthy(w)
+    outage(w, burned={fps(blob(f"{k}-ok"))[1]: {"n": crew.BURN_LIMIT} for k in ("crypto", "b85", "terr", "amb")})
+    w.decide("terr")
+    seen = record(w)
+    renew.housekeeping()
+    assert seen == [(EMAIL["terr"], "outage")]
+
+
+def test_the_forecast_goes_before_the_outage_and_the_dry_run_says_the_whole_order(w, capsys):
+    outage(w)
+    w.decide("amb")
+    w.own("b85", blob("b85-dying", rexp_days=0.5))                                              # 12 h left: not a full login (under a day), but it ENDS within 7 days
+    assert renew.main(["--dry-run"]) == 0
+    err = capsys.readouterr().err
+    assert (f"{EMAIL['b85']}: would be renewed now (forecast) - nothing launched; then, in later runs: "
+            f"{EMAIL['amb']}, {EMAIL['crypto']}, {EMAIL['terr']}") in err
+
+
+# ── waits and marks ──────────────────────────────────────────────────────────────
+def test_a_failed_try_waits_6_hours_and_the_third_in_a_row_marks_the_account_with_ONE_push(w):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    healthy(w, 29.0, "crypto", "terr", "amb")
+    seen = record(w, *[("no_full_login", "nothing new", None)] * 3)
+    renew.housekeeping()
+    w.at(renew.RETRY_S - 1)
+    renew.housekeeping()
+    assert len(seen) == 1                                                                       # too soon
+    for n in (1, 2):
+        w.at(n * renew.RETRY_S)
+        renew.housekeeping()
+    assert len(seen) == 3 and w.mark()["verdict"] == "failed_3_times"
+    w.at(10 * renew.RETRY_S)
+    renew.housekeeping()
+    assert len(seen) == 3 and len(w.calls("notify")) == 1                                       # marked: no 4th try, ONE push
+
+
+def test_a_wall_is_not_retried_by_the_schedule_and_a_browser_fix_is_looked_at_again_after_24_hours(w):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    healthy(w, 90.0, "crypto", "terr", "amb")                                                    # they outlive the 31 days this test jumps
+    seen = record(w, ("puzzle", "s", None))
+    renew.housekeeping()
+    w.at(30 * DAY)
+    renew.housekeeping()
+    assert len(seen) == 1 and len(w.calls("notify")) == 1                                       # a puzzle waits for a human, however late
+    w.own("terr", blob("terr-old", rexp_days=3.0))
+    seen = record(w, ("no_google_session", "s", None), ("no_google_session", "s", None))
+    w.at(31 * DAY)
+    renew.housekeeping()
+    assert seen == [(EMAIL["terr"], "forecast")] and acct(w, "terr")["infeasible"]["recheck_at"] == T0 + 31 * DAY + renew.RECHECK_S
+    w.at(31 * DAY + renew.RECHECK_S - 1)
+    renew.housekeeping()
+    assert len(seen) == 1                                                                       # not yet
+    w.at(31 * DAY + renew.RECHECK_S)
+    renew.housekeeping()
+    assert len(seen) == 2 and len(w.calls("notify")) == 2                                       # looked at again; the same wall: no new push (b85's + terr's only)
+
+
+@pytest.mark.parametrize("rec", [{"infeasible": "yes"}, {"infeasible": {"verdict": "puzzle"}}, {"infeasible": {"verdict": "puzzle", "left": 3 * DAY}}, {"next_at": "soon"}, {"next_at": True},
+                                 {"infeasible": {"verdict": "no_google_session", "left": 3 * DAY, "recheck_at": "later"}}, {"infeasible": {"verdict": "no_google_session", "recheck_at": "later"}}])
+def test_a_record_that_cannot_be_read_keeps_the_account_untouched(w, rec):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    healthy(w, 29.0, "crypto", "terr", "amb")
+    (w.d / "renew_state.json").write_text(json.dumps({"accounts": {EMAIL["b85"]: rec}}))
+    seen = record(w)
+    assert renew.housekeeping() == 0 and seen == []
+    if "next_at" in rec:
+        assert "next_at is not a number" in w.log()
+    if isinstance(rec.get("infeasible"), dict) and "left" not in rec["infeasible"]:
+        assert "the mark has no `left`" in w.log()
+
+
+def test_a_mark_stands_and_says_so_while_an_item_of_the_account_cannot_be_read(w):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    script(w, ("puzzle", "s", None))
+    w.run()
+    w.own("b85", blob("b85-hand", rexp_days=30.0))
+    w.mp.setenv("FAKE_SEC_FAIL", crew.reserve_service(EMAIL["b85"]))
+    renew.housekeeping()
+    assert w.mark() and "the mark stands until it can be" in w.log()
+
+
+# ── controls ──────────────────────────────────────────────────────────────────
+@pytest.mark.parametrize("how", ["file", "env"])
+def test_the_off_switch_stops_the_scheduled_and_the_forced_run_and_putting_it_back_needs_no_reload(w, how, capsys):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    seen = record(w)
+    sw = w.d / "city" / ".gc" / "no-login-renew"
+    if how == "file":
+        sw.write_text("")
+    else:
+        w.mp.setenv("GC_LOGIN_RENEW", "0")
+    assert renew.main([]) == 0 and seen == [] and "switched off" in w.log()
+    assert renew.main(["--account", EMAIL["b85"], "--force"]) == 2 and seen == [] and "switched off" in capsys.readouterr().err
+    assert not (w.d / "renew_state.json").exists() and w.calls("notify") == []
+    sw.unlink(missing_ok=True)
+    w.mp.delenv("GC_LOGIN_RENEW", raising=False)
+    assert renew.main([]) == 0 and seen == [(EMAIL["b85"], "forecast")]
+
+
+@pytest.mark.parametrize("val", ["1", "", "off", "false"])
+def test_only_a_zero_switches_it_off(w, val):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    w.mp.setenv("GC_LOGIN_RENEW", val)
+    seen = record(w)
+    assert renew.main([]) == 0 and seen == [(EMAIL["b85"], "forecast")]
+
+
+def test_a_dry_run_says_what_it_would_do_and_launches_writes_and_pushes_nothing(w, capsys):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    (w.d / "renew_state.json").write_text(json.dumps({"accounts": {EMAIL["terr"]: {"infeasible": {"verdict": "puzzle", "step": "s", "at": T0, "left": 5.0}}}}))
+    before = (w.d / "renew_state.json").read_bytes()
+    seen = record(w)
+    assert renew.main(["--dry-run"]) == 0
+    err = capsys.readouterr().err
+    assert f"{EMAIL['b85']}: would be renewed now (forecast) - nothing launched" in err and "[dry-run]" in err
+    assert seen == [] and w.calls("claude") == [] and w.calls("notify") == []                    # the pending push of terr's mark was NOT sent
+    assert (w.d / "renew_state.json").read_bytes() == before and w.log() == ""                  # no state written, no log file: stderr only
+    assert renew.main(["--dry-run", "--account", EMAIL["b85"], "--force"]) == 0
+    assert "would renew it now (forced) - nothing launched" in capsys.readouterr().err and seen == []
+
+
+@pytest.mark.parametrize("argv", [["--account", EMAIL["b85"]], ["--force"], ["--bogus"], ["--dry-run", "--account", EMAIL["b85"]], ["--dry-run", "--bogus"]])
+def test_arguments_that_are_not_a_run_are_a_usage_error_and_launch_nothing(w, argv):
+    seen = record(w)
+    assert renew.main(argv) == 64 and seen == []
+
+
+# ── what the run cannot know, it does not act on ─────────────────────────────────────
+@pytest.mark.parametrize("raw", [b"{not json", b"[1]", b'{"accounts": []}'])
+def test_an_unreadable_state_launches_pushes_and_writes_nothing_and_the_exit_says_so(w, raw):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    (w.d / "renew_state.json").write_bytes(raw)
+    seen = record(w)
+    assert renew.housekeeping() == 1 and seen == [] and w.calls("notify") == []
+    assert (w.d / "renew_state.json").read_bytes() == raw and "nothing launched, pushed or written" in w.log()
+
+
+@pytest.mark.parametrize("how", ["missing", "corrupt", "unreadable"])
+def test_a_crew_state_that_cannot_be_read_judges_no_login_but_the_pending_pushes_still_go(w, how, capsys):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    script(w, ("puzzle", "s", None))
+    w.mp.setenv("FAKE_NOTIFY_RC", "1")
+    w.run()                                                                                      # a mark whose push was not delivered
+    assert len(w.calls("notify")) == 1
+    p = w.d / "crew_state.json"
+    if how == "missing":
+        p.unlink()
+    elif how == "corrupt":
+        p.write_text("{nope")
+    else:
+        p.unlink()
+        p.mkdir()
+    w.mp.setenv("FAKE_NOTIFY_RC", "0")
+    w.at(renew.PUSH_RETRY_S)
+    seen = record(w)
+    assert renew.housekeeping() == 1 and seen == []                                              # exit 1 = it could not judge
+    assert f"the crew state {p} is {how}" in w.log() and len(w.calls("notify")) == 2 and w.mark()["pushed"]
+    assert renew.run_once(EMAIL["b85"]) == 2 and f"is {how}, so whether this account holds the default is unknown" in capsys.readouterr().err and seen == []
+
+
+def test_a_forced_run_does_not_launch_when_an_item_that_decides_who_holds_the_default_cannot_be_read(w, capsys):
+    w.own("crypto", blob("crypto-own", rexp_days=3.0))
+    w.crew_state(current=EMAIL["crypto"])
+    w.mp.setenv("FAKE_SEC_FAIL", crew.DEFAULT_SERVICE)
+    assert w.run("crypto") == 2
+    assert w.calls("claude") == [] and "could not be read, so its login is not judged - nothing launched" in capsys.readouterr().out
+    assert "tries" not in acct(w, "crypto")                                                      # nothing launched = not a failed try
+
+
+def test_a_state_that_cannot_be_written_in_the_scheduled_run_is_said_and_the_exit_is_1(w):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    seen = record(w)
+
+    def boom(st):
+        raise PermissionError("read-only")
+    w.mp.setattr(renew, "publish_state", boom)
+    assert renew.housekeeping() == 1 and seen == [(EMAIL["b85"], "forecast")]
+    assert "the state could not be written (PermissionError)" in w.log()
+
+
+def test_a_lock_that_cannot_be_taken_and_a_run_that_crashes_exit_1_and_say_why(w):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    seen = record(w)
+    lock = w.d / "city" / ".gc" / "claude-login-renew.lock"
+    lock.mkdir()                                                                                 # opening a directory for writing: an OSError that is not "lock held"
+    assert renew.main([]) == 1 and renew.main(["--account", EMAIL["b85"], "--force"]) == 1 and seen == []
+    assert "cannot take the lock (IsADirectoryError)" in w.log()
+    lock.rmdir()
+
+    def boom(*a):
+        raise ValueError("boom")
+    w.mp.setattr(renew, "candidates", boom)
+    assert renew.main([]) == 1 and "run failed (ValueError: boom)" in w.log() and seen == []
+    w.mp.setattr(renew, "attempt", boom)
+    assert renew.main(["--account", EMAIL["b85"], "--force"]) == 1 and w.log().count("run failed (ValueError: boom)") == 2
+
+
+# ── the launchd plist (ga-xoe5ao.5.3) ──────────────────────────────────────────────
+ASSETS = HERE.parents[1] / "packs" / "town-deltas" / "assets"
+PLIST = ASSETS / "pending-activation" / "claude-login-renew.plist"
+
+
+def test_the_plist_parses_strictly_has_its_own_label_runs_the_bare_script_every_15_minutes_and_names_the_switch():
+    import plistlib
+    text = PLIST.read_text()
+    d = plistlib.loads(text.encode())                                                          # expat, strict: a double hyphen inside a comment fails here (the pre-push lint refused one)
+    assert d["Label"] == "com.gascity.claude-login-renew" and d["Label"] != "com.gascity.claude-account-relog"
+    assert d["StartInterval"] == 900 and d["RunAtLoad"] is False
+    assert d["ProgramArguments"][0] == "/usr/bin/python3" and len(d["ProgramArguments"]) == 2    # the bare script: no --force, no --account
+    assert d["ProgramArguments"][1].endswith("packs/town-deltas/assets/scripts/claude-login-renew.py") and SCRIPT.is_file()
+    env = d["EnvironmentVariables"]
+    assert {"PATH", "HOME", "USER", "GC_CITY_PATH"} <= set(env) and ".local/bin" in env["PATH"]
+    assert ".gc/no-login-renew" in text and "GC_LOGIN_RENEW=0" in text                          # the switch the comment names is the one the script reads
+
+
+def test_the_plist_is_not_where_the_deploy_installs_new_plists_on_its_own():
+    import re
+    top = {m.group(1) for p in ASSETS.glob("*.plist") for m in [re.search(r"<key>Label</key>\s*<string>([^<]+)</string>", p.read_text())] if m}
+    assert "com.gascity.claude-login-renew" not in top and PLIST.parent.name == "pending-activation"
+    assert "skill-integrity-install.sh" in PLIST.read_text()                                    # and the file says why
