@@ -53,19 +53,25 @@ rep --log "$W/t1.log"
 eq "$(jg rungs.D2.calls rungs.D2.acted rungs.D2.failed rungs.D2.unknown rungs.D2.returned_mb rungs.D2.no_gain)" "4 2 1 1 2200 1" "D2: 4 chamadas = 2 agiram + 1 falhou + 1 não leu; devolveu 4700-2500 = 2200 MB (só as que agiram); a que agiu sem ganho (3000→3000) é contada à parte"
 eq "$(jg rungs.D3.calls rungs.D3.acted rungs.D3.idle rungs.D3.returned_mb rungs.D3.unknown_mb)" "3 2 1 1100 1" "D3: 3 chamadas = 2 agiram + 1 adiou; 1100 MB; a que agiu com depois=? fica FORA da soma e é contada (unknown_mb)"
 eq "$(jg readings hours lines_unstamped alerts_total)" "4 2.5 0 2" "4 leituras (batimentos contam), 2,5 h de cobertura, nenhuma linha sem carimbo, 2 avisos (WARN + ESCALA)"
-R_TEXT=$("$PY" -I "$REPORT" --min-hours 0 --log "$W/t1.log"); case "$R_TEXT" in *"Degrau  chamadas"*"ACEITE"*"ATENDIDO"*) ok "a saída em texto traz a tabela por degrau e o veredito do aceite" ;; *) nope "texto sem tabela/aceite: $R_TEXT" ;; esac
+R_TEXT=$("$PY" -I "$REPORT" --min-hours 0 --log "$W/t1.log"); case "$R_TEXT" in *"Degrau  chamadas"*"reinícios pedidos (inferido): 0, 1ª leitura depois: +0 MB"*"sem ação da escada): ATENDIDO"*) ok "a saída em texto traz a tabela por degrau (nenhum reinício = +0 MB, que é verdade) e o veredito do aceite (ATENDIDO, não 'NAO ATENDIDO')" ;; *) nope "texto sem tabela/aceite: $R_TEXT" ;; esac
 
 section "D4: o reinício mata o maestro, a chamada fica sem resultado"
 { RD 600 1000; CALL 600 4 1000; HB 610 9000; RD 720 1000; CALL 720 4 1000; OUTL 720 4 10 idle 1000 1000; } > "$W/t2.log"
 rep --log "$W/t2.log"
 eq "$(jg rungs.D4.calls rungs.D4.no_result rungs.D4.reboots_inferred rungs.D4.idle rungs.D4.after_boot_mb)" "2 1 1 1 8000" "D4: a chamada sem resultado = 1 reinício pedido; devolveu 9000-1000 = 8000 MB (1ª leitura DEPOIS da chamada); a que adiou (rc 10) não conta"
+# gate-fix 1: reinício pedido e o log acaba (o mini não voltou): NÃO há leitura depois, então não há número — o texto nunca imprime "+0 MB" (o JSON já contava em unknown_mb)
+{ RD 600 1000; CALL 600 4 1000; } > "$W/t3.log"; rep --log "$W/t3.log"; R_TEXT=$("$PY" -I "$REPORT" --min-hours 0 --log "$W/t3.log")
+eq "$(jg rungs.D4.reboots_inferred rungs.D4.boot_unread rungs.D4.unknown_mb)" "1 1 1" "D4 sem nenhuma leitura depois do pedido: 1 reinício, 1 sem leitura depois"
+case "$R_TEXT" in *"+0 MB"*) nope "D4 sem leitura depois: o texto imprimiu '+0 MB' (desconhecido virou número)" ;; *"1ª leitura depois: sem leitura depois"*) ok "D4 sem leitura depois: o texto diz 'sem leitura depois', nunca '+0 MB'" ;; *) nope "D4 sem leitura depois: texto sem a frase: $R_TEXT" ;; esac
+{ RD 600 1000; CALL 600 4 1000; HB 610 9000; RD 800 1000; CALL 800 4 1000; } > "$W/t4.log"; R_TEXT=$("$PY" -I "$REPORT" --min-hours 0 --log "$W/t4.log")
+case "$R_TEXT" in *"1ª leitura depois: +8000 MB (+1 sem leitura depois)"*) ok "2 reinícios, um sem leitura depois: o número do que tem leitura e a contagem do que não tem" ;; *) nope "2 reinícios (um sem leitura): texto errado: $R_TEXT" ;; esac
 
 section "aceite da missão: janela > 60 min com disco < 3 GB"
 { LOWS 600 670 2500; CALL 620 2 2500; OUTL 620 2 10 idle 2500 2500; } > "$W/w1.log"; eq "$(verd "$W/w1.log")" "0 ATENDIDO OK_ADIADA" "70 min baixos com UMA chamada que adiou: ATENDIDO, janela OK_ADIADA (a escada tentou)"
 { LOWS 600 670 2500; CALL 620 2 2500; OUTL 620 2 0 acted 2500 2600; } > "$W/w2.log"; eq "$(verd "$W/w2.log")" "0 ATENDIDO OK" "70 min baixos com um degrau que agiu: OK"
 LOWS 600 670 2500 > "$W/w3.log"; eq "$(verd "$W/w3.log")" "1 NAO_ATENDIDO VIOLACAO" "70 min baixos SEM nenhuma ação: NÃO ATENDIDO (rc 1)"
-LOWS 600 650 2500 > "$W/w4.log"; eq "$(verd "$W/w4.log")" "0 ATENDIDO OK" "50 min baixos sem ação: ainda dentro do prazo"
-{ RD 600 2500; RD 660 2500; } > "$W/w5.log"; eq "$(verd "$W/w5.log")" "0 ATENDIDO OK" "60 min exatos NÃO é > 60"
+{ LOWS 600 650 2500; RD 655 9000; } > "$W/w4.log"; eq "$(verd "$W/w4.log")" "0 ATENDIDO OK" "50 min baixos sem ação e depois uma leitura boa: ainda dentro do prazo"
+{ RD 600 2500; RD 660 2500; RD 665 9000; } > "$W/w5.log"; eq "$(verd "$W/w5.log")" "0 ATENDIDO OK" "60 min exatos NÃO é > 60"
 { RD 600 2500; RD 661 2500; } > "$W/w6.log"; eq "$(verd "$W/w6.log")" "1 NAO_ATENDIDO VIOLACAO" "61 min: a lacuna ENTRE duas leituras baixas une a janela (sem leitura não se sabe que recuperou)"
 { RD 600 2500; HB 690 9000; } > "$W/w7.log"; eq "$(verd "$W/w7.log")" "1 NAO_VERIFICADO NAO_VERIFICADO" "leitura baixa e 90 min de silêncio até uma leitura boa: fim INCERTO → NÃO VERIFICADO, nunca ATENDIDO"
 { LOWS 600 670 2500; CALL 674 4 2500; } > "$W/w8.log"; eq "$(verd "$W/w8.log")" "0 ATENDIDO OK" "ação 4 min depois da última leitura baixa (D4 escrito na mesma rodada) vale"
@@ -75,12 +81,28 @@ LOWS 600 650 2500 > "$W/w4.log"; eq "$(verd "$W/w4.log")" "0 ATENDIDO OK" "50 mi
 
 { RD 600 3072; RD 700 3072; } > "$W/w12.log"; rep --log "$W/w12.log"; eq "$(jg 'windows[].minutes')" "" "livre de exatamente 3072 MB NÃO é < 3 GB: sem janela"
 { RD 600 3071; RD 700 3071; } > "$W/w13.log"; eq "$(verd "$W/w13.log")" "1 NAO_ATENDIDO VIOLACAO" "livre de 3071 MB já é < 3 GB: 100 min sem ação = NÃO ATENDIDO"
+# gate-fix 1: o log TERMINA numa leitura baixa (ou o relógio anda para trás): o fim da janela é desconhecido, então sem nenhuma ação da escada é NÃO VERIFICADO, nunca "tudo bem até agora"
+LOWS 600 630 2500 > "$W/e1.log"; rep --log "$W/e1.log"; R_TEXT=$("$PY" -I "$REPORT" --min-hours 0 --log "$W/e1.log")
+eq "$RC $(jg acceptance 'windows[].verdict' 'windows[].open')" "1 NAO_VERIFICADO NAO_VERIFICADO True" "30 min baixos e o log acaba, sem ação: janela em aberto = NÃO VERIFICADO (não ATENDIDO), marcada open"
+case "$R_TEXT" in *"[NAO_VERIFICADO, em aberto no fim do log]"*) ok "…e o texto diz 'em aberto no fim do log'" ;; *) nope "texto da janela em aberto: $R_TEXT" ;; esac
+{ LOWS 600 630 2500; CALL 620 2 2500; OUTL 620 2 0 acted 2500 2600; } > "$W/e2.log"; eq "$(verd "$W/e2.log")" "0 ATENDIDO OK" "…com um degrau que agiu na janela: OK mesmo em aberto"
+{ LOWS 600 610 2500; LOWS 540 550 2500; } > "$W/e3.log"; eq "$(verd "$W/e3.log")" "1 NAO_VERIFICADO NAO_VERIFICADO,NAO_VERIFICADO" "relógio para trás no meio de uma janela baixa: a continuidade quebra, as duas ficam em aberto"
+# gate-fix 1: o rótulo OK_ADIADA é só para quem adiou (rc 10); chamada que falhou (20), não leu (30) ou morreu sem resultado é OK_TENTOU
+{ LOWS 600 670 2500; CALL 620 2 2500; OUTL 620 2 20 failed 2500 2500; RD 675 9000; } > "$W/w14.log"; eq "$(verd "$W/w14.log")" "0 ATENDIDO OK_TENTOU" "70 min baixos com UMA chamada que falhou (rc 20): OK_TENTOU, não OK_ADIADA"
+{ LOWS 600 670 2500; CALL 620 3 2500; OUTL 620 3 10 idle 2500 2500; CALL 630 2 2500; OUTL 630 2 30 unknown 2500 2500; RD 675 9000; } > "$W/w15.log"; eq "$(verd "$W/w15.log")" "0 ATENDIDO OK_TENTOU" "adiou (D3) e não leu (D2): OK_TENTOU (qualquer não-adiar vence)"
 
 section "cobertura, silêncio, --since e log rotacionado"
-{ HB 600 9000; HB 720 9000; } > "$W/c1.log"
-"$PY" -I "$REPORT" --min-hours 24 --log "$W/c1.log" > /dev/null; eq "$?" 1 "2 h de log com --min-hours 24: rc 1 (canário incompleto) mesmo com o aceite ATENDIDO"
-"$PY" -I "$REPORT" --min-hours 2 --log "$W/c1.log" > /dev/null; eq "$?" 0 "2 h com --min-hours 2: rc 0"
-rep --log "$W/c1.log"; eq "$(jg silences_over_65min[].min max_silence_min)" "120 120" "silêncio de 120 min entre duas linhas (o maestro escreve ao menos 1 por hora) é apontado"
+{ HB 600 9000; HB 660 9000; HB 720 9000; } > "$W/c0.log"
+"$PY" -I "$REPORT" --min-hours 24 --log "$W/c0.log" > /dev/null; eq "$?" 1 "2 h de log com --min-hours 24: rc 1 (canário incompleto) mesmo com o aceite ATENDIDO"
+"$PY" -I "$REPORT" --min-hours 2 --log "$W/c0.log" > /dev/null; eq "$?" 0 "2 h de batimentos de hora em hora com --min-hours 2: rc 0"
+# gate-fix 1: silêncio ENTRE duas leituras boas não é "sem problema": sem leitura não se sabe que o disco ficou bom. 28 h de buraco com --min-hours 24 NÃO pode sair rc 0 / ATENDIDO
+{ HB 600 9000; HB 720 9000; } > "$W/c1.log"; rep --log "$W/c1.log"; R_TEXT=$("$PY" -I "$REPORT" --min-hours 0 --log "$W/c1.log")
+eq "$RC $(jg acceptance silences_over_65min[].min max_silence_min unverified_why[])" "1 NAO_VERIFICADO 120 120 1 silêncio(s) > 65 min" "120 min sem nenhuma linha entre duas leituras boas: apontado e NÃO VERIFICADO (rc 1), com o motivo"
+case "$R_TEXT" in *"disk-recovery.off"*"ACEITE"*"NAO VERIFICADO"*"silêncio(s) > 65 min"*) ok "o texto não promete 1 linha por hora sem condição (job rodando e interruptor desligado) e o ACEITE traz o motivo" ;; *) nope "texto do silêncio/aceite: $R_TEXT" ;; esac
+{ HB 600 9000; HB 665 9000; } > "$W/c3.log"; rep --log "$W/c3.log"; eq "$RC $(jg acceptance)" "0 ATENDIDO" "silêncio de exatamente 65 min NÃO é > 65"
+{ HB 600 9000; HB 666 9000; } > "$W/c4.log"; rep --log "$W/c4.log"; eq "$RC $(jg acceptance)" "1 NAO_VERIFICADO" "66 min já é silêncio"
+printf '%s\n' "[2026-11-02 00:30:00] ok: livre=9000MB swap=0MB (sem episódio; batimento 1/h)" "[2026-11-03 04:30:00] ok: livre=9000MB swap=0MB (sem episódio; batimento 1/h)" > "$W/c2.log"
+rep --log "$W/c2.log" --min-hours 24; eq "$RC $(jg hours acceptance)" "1 28.0 NAO_VERIFICADO" "duas leituras boas com 28 h de silêncio, --min-hours 24: cobertura 28 h mas NÃO VERIFICADO, rc 1 (era rc 0 / ATENDIDO)"
 { LOWS 600 670 2500; HB 780 9000; } > "$W/s1.log"
 rep --log "$W/s1.log" --since '2026-11-02 12:00'; eq "$(jg acceptance readings)" "ATENDIDO 1" "--since corta o que veio antes (a janela ruim fica fora do período)"
 LOWS 600 640 2500 > "$W/r.log.1"; { LOWS 645 670 2500; CALL 660 2 2500; OUTL 660 2 10 idle 2500 2500; } > "$W/r.log"
@@ -93,7 +115,10 @@ if [ "$(id -u)" = 0 ]; then ok "log sem permissão (pulado: root lê tudo)"; els
 mkdir -p "$W/dir.log"; rep --log "$W/dir.log"; eq "$RC ${#OUT}" "3 0" "o caminho é um diretório: rc 3, nenhum relatório"
 { LOWS 600 610 2500; } > "$W/ok1.log"; rep --log "$W/ok1.log" --log "$W/nao-existe.log"; eq "$RC ${#OUT}" "3 0" "UM dos logs pedidos ilegível: rc 3 (o outro não vale sozinho)"
 : > "$W/vazio.log"; rep --log "$W/vazio.log"; eq "$RC $(jg acceptance readings events)" "1 NAO_VERIFICADO 0 0" "log vazio: relatório sem leituras, NÃO VERIFICADO, rc 1 (a escada não escreveu nada)"
-{ printf 'lixo sem carimbo\n'; printf '\200\201\202 bytes inválidos\n'; printf '[2026-13-45 99:99:99] mês 13 não é data\n'; RD 600 2500; printf 'cortada no meio [2026-11-02 10:05'; } > "$W/lixo.log"
+{ printf 'lixo A antes de tudo\n'; HB 540 9000; printf 'lixo B\n'; HB 600 9000; printf 'lixo C\n'; HB 660 9000; printf 'lixo D no fim\n'; } > "$W/u1.log"
+rep --log "$W/u1.log"; A=$(jg lines_unstamped); rep --log "$W/u1.log" --since '2026-11-02 10:00' --until '2026-11-02 10:30'
+eq "$A $(jg lines_unstamped readings)" "4 1 1" "linha sem carimbo vale pela hora da linha de cima: sem período 4; com --since/--until só a que cai dentro (1), não o arquivo inteiro"
+{ printf 'lixo sem carimbo\n'; printf '\200\201\202 bytes inválidos\n'; printf '[2026-13-45 99:99:99] mês 13 não é data\n'; HB 600 9000; printf 'cortada no meio [2026-11-02 10:05'; } > "$W/lixo.log"
 rep --log "$W/lixo.log"; eq "$RC $(jg lines_unstamped readings)" "0 4 1" "lixo (sem carimbo, bytes inválidos, data impossível, linha cortada): contado à parte, a leitura boa continua valendo, nada quebra"
 "$PY" -I "$REPORT" --since 'ontem' --log "$W/ok1.log" > /dev/null 2>&1; eq "$?" 2 "--since que não é data: rc 2 (uso)"
 mkdir -p "$W/city/.gc/logs"; LOWS 600 610 2500 > "$W/city/.gc/logs/disk-recovery.log.1"; LOWS 615 620 2500 > "$W/city/.gc/logs/disk-recovery.log"

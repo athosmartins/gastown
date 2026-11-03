@@ -253,13 +253,17 @@ O que este runbook mediu foi só a bateria inteira do script de hoje (446 / 0, a
 
 ## Prova ponta a ponta e canário de 24 h (D5)
 
-**(a) Simulação ponta a ponta** — `scripts/disk-recovery-e2e.selftest.sh` (~80 s no nó Linux; sem rede nem disco real). Diferente dos selftests de cada peça, que trocam os vizinhos por stubs, aqui o
+**(a) Simulação ponta a ponta** — `scripts/disk-recovery-e2e.selftest.sh` (~80 s no nó Linux a partir de um worktree; pelo `mbp-run.sh` ele roda no mini, está em `hetzner-mac-only.hq.txt`; sem rede nem disco real). Diferente dos selftests de cada peça, que trocam os vizinhos por stubs, aqui o
 maestro REAL chama o D2, o D3 e o D4 REAIS, do jeito do plist (`/bin/bash disk-recovery-ladder.sh --run`, env mínimo), contra UM mundo simulado: `df`, `sysctl`, `launchctl`, `ps`, `footprint`,
 `curl` e `date` são shims que calculam o livre na hora a partir do estado do mundo (rfb de brinquedo morto por TERM de verdade, daemons reiniciados, vazamento de memória, reinício simulado que mata o D4
 e o maestro). Cenários: S-A estouro de memória D2 → D3 → D4 (piso duro) e depois o teto de 6 h com escalada, S-B nada a liberar e o D4 só aos 3600 s, S-C/S-C2 ligação em curso segura o D4 e o D3 com o
 mesmo banco, S-D pico isolado, S-F interruptor 70 min. O último bloco passa o log que o maestro real escreveu pelo relatório (b). `E2E_KEEP=1` mantém o diretório de trabalho; `E2E_LADDER`, `E2E_D2`,
 `E2E_D3`, `E2E_D4` e `E2E_REPORT` apontam cópias modificadas (mutantes); `E2E_BASH=/caminho/bash` roda tudo no bash 3.2 do mini. O cenário S-A pós-boot muda quando a ga-1p1i5jr.6 (o maestro
 passa a chamar o `--resume` do D2 a cada rodada) entrar: atualize-o então, é para isso que ele serve.
+Achado do primeiro gate (o e2e rodado no mini pelo revisor): o D3 ficava CEGO no macOS. Os bancos de ligação são WAL e ficam sem `-wal`/`-shm` entre uma operação e outra dos apps (medido em 01/11, cabeçalho do
+leitor do D4), e o `sqlite3` do mini (3.51) não abre esse estado com `-readonly` ("unable to open database file", rc 14), então a guarda de ligação dava "?" e o D3 saía com rc 30 (o revisor viu `pix=?` no
+log de produção de 03/11). O D3 passou a abrir com `PRAGMA query_only=ON`, como o
+leitor do D4 (o SQLite pode criar o `-shm`/`-wal`; nenhum dado é gravado), e o `sqlite3` do mundo simulado impõe a regra do mini para o e2e e o selftest do D3 pegarem a regressão também no Linux.
 
 **(b) Canário em produção e (c) relatório** — `scripts/disk-recovery-report.py` lê o log do maestro (`.gc/logs/disk-recovery.log` e o `.1`) e calcula, sem relato de ninguém: cobertura (horas, maior
 silêncio), por degrau as chamadas, o que agiu/adiou/falhou e os MB devolvidos, e as janelas com o livre < 3 GB. Depois de 24 h do job carregado (carregado em 02/11 ~22:10 BRT = 03/11 01:10Z; 24 h = 04/11
@@ -269,7 +273,8 @@ silêncio), por degrau as chamadas, o que agiu/adiou/falhou e os MB devolvidos, 
 python3 scripts/disk-recovery-report.py --since 'AAAA-MM-DD HH:MM'     # --json para máquina; rc 0 só com aceite ATENDIDO e >= 24 h de cobertura; rc 3 = log ilegível
 ```
 
-O aceite da missão ("nenhuma janela > 60 min com disco < 3 GB sem uma ação da escada no log") sai como ATENDIDO / NÃO ATENDIDO / NÃO VERIFICADO (silêncio depois de uma leitura baixa não é "recuperou").
+O aceite da missão ("nenhuma janela > 60 min com disco < 3 GB sem uma ação da escada no log") sai como ATENDIDO / NÃO ATENDIDO / NÃO VERIFICADO. Sem leitura não se sabe que o disco ficou bom, então é NÃO VERIFICADO: silêncio de mais de 65 min entre duas linhas quaisquer
+(job parado ou desligado, mini fora), janela baixa ainda aberta no fim do log sem ação da escada, ou fim de janela incerto (silêncio depois de uma leitura baixa não é "recuperou").
 Se o disco nunca ficou ≤ 5 GB o relatório diz que o canário NÃO exercitou a escada: nesse caso o aceite vale por vacuidade e a prova que sobra é a simulação (a).
 O relatório ao Athos é a tabela impressa (chamadas e MB por degrau), não uma narrativa. Testes do relatório: `bash scripts/disk-recovery-report.selftest.sh` (~2 s).
 

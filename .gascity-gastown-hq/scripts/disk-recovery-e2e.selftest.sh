@@ -11,14 +11,14 @@
 # O QUE NÃO PROVA   (1) o reinício de verdade: o AppleEvent do osascript sob o launchd (o D4 diz que só o canário real mostra) e o boot que volta sozinho; (2) o job carregado e vivo no launchd (`launchctl print`) e o que ele
 #   escreveu em 24 h (isso é o canário (b) e o relatório (c): scripts/disk-recovery-report.py lê o log real); (3) o `--resume` do D2 (ga-1p1i5jr.6: hoje o maestro não o chama) e o Safari/bw-serve do D3 (ga-1p1i5jr.7: o `ps`
 #   simulado não lista Safari e o bw-serve não está carregado); (4) rodadas de 120 s só no cenário S-A: os outros usam 300 s (o maestro tolera até 600 s entre leituras e trata o launchd atrasado, mas com 300 s = RETRY_S
-#   o degrau de cima repete a cada rodada e o D2 deixa de ser chamado enquanto ele repetir, de propósito: repetição vai do mais alto ao mais baixo). Achado de passagem: o `out_line` do maestro apaga os bytes acentuados da linha do degrau ("não está" vira "no est" no log e no mail).
-# O MUNDO       df, sysctl, launchctl, ps, footprint, curl são shims no PATH que leem o ESTADO DO MUNDO na hora da chamada: livre = base − (rfb vivo) − (footprint dos daemons). Quem para o rfb de brinquedo
+#   o degrau de cima repete a cada rodada e o D2 deixa de ser chamado enquanto ele repetir, de propósito: repetição vai do mais alto ao mais baixo); (5) a guarda de envio em voo REAL do D4 (central_sender_restart_safe.py, do repo do WhatsApp: aqui o DR4_SENDER_SAFE_PY é um stub que diz "pode reiniciar"; quem a exercita é o canário). Achado de passagem: o `out_line` do maestro apaga os bytes acentuados da linha do degrau ("não está" vira "no est" no log e no mail).
+# O MUNDO       df, sysctl, launchctl, ps, footprint, curl são shims no PATH que leem o ESTADO DO MUNDO na hora da chamada (o sqlite3 só impõe a regra do mini: `-readonly` não abre banco WAL sem -wal/-shm, o estado dos bancos de ligação): livre = base − (rfb vivo) − (footprint dos daemons). Quem para o rfb de brinquedo
 #   (processo de verdade, morto por TERM pelo D2) ou reinicia um daemon (kickstart do shim) faz o livre subir na re-medição seguinte; o "vazamento" desce a base a cada rodada. O reinício simulado MATA o D4 e o
 #   maestro (como o shutdown mata a árvore), e o teste "faz o boot": base saudável, daemons novos, hora de boot nova.
 # SEGURANÇA     nada real é parado, reiniciado ou enviado: os binários do D4 são shims, DR4_NO_REAL_REBOOT=1 vale em todo cenário, `reboot`/`shutdown`/`sudo` e `df /` são armadilhas que gravam em $W/forbidden (o teste
 #   falha se algo cair nelas). O único processo real que morre é o rfb de brinquedo deste teste: o D2 só ENXERGA os processos dele (ps filtrado pelo diretório de trabalho), então o rfb de PRODUÇÃO nunca é visto nem tocado
 #   se estiver rodando na máquina do teste, e várias execuções em paralelo não se enxergam.
-# COMO RODAR    bash scripts/disk-recovery-e2e.selftest.sh        (~80 s no nó Linux, bash 5.2 e 3.2.57). ST_FAILFAST=1 sai no 1º FAIL; E2E_KEEP=1 mantém o diretório de trabalho (logs, estado, rastro). Cópias modificadas (mutantes): E2E_LADDER / E2E_D2 / E2E_D3 / E2E_D4 / E2E_REPORT=/caminho/...
+# COMO RODAR    bash scripts/disk-recovery-e2e.selftest.sh        (~80 s no nó Linux, bash 5.2 e 3.2.57, a partir de um worktree; o mbp-run.sh NÃO o leva ao nó: está em hetzner-mac-only.hq.txt, pois usa o disk-recovery-d2-allowlist.tsv, que o filtro do nó não carrega, e o macOS é a prova que vale). ST_FAILFAST=1 sai no 1º FAIL; E2E_KEEP=1 mantém o diretório de trabalho (logs, estado, rastro). Cópias modificadas (mutantes): E2E_LADDER / E2E_D2 / E2E_D3 / E2E_D4 / E2E_REPORT=/caminho/...
 #   (o arquivo da cópia TEM de manter disk-recovery-ladder / disk-recovery-d2 no nome: as travas de instância única conferem a linha de comando). E2E_BASH=/caminho/bash roda o maestro com outro bash (o plist usa /bin/bash).
 set -uo pipefail
 
@@ -111,6 +111,15 @@ echo "    1     0     0 5-00:00:00 /sbin/launchd"
 /bin/ps "$@" 2>/dev/null | grep -F -- "$E2E_W/rfb/"
 exit 0
 SH
+cat > "$BIN/sqlite3" <<'SH'
+#!/bin/bash
+# sqlite3 do mini (3.51): `-readonly` num banco WAL SEM -wal/-shm não abre ("unable to open database file", rc 14; medido no mini pelo revisor do gate em 03/11 e pelo D4 em 01/11, 34 de 40 leituras). O 3.45 do Linux abre: o shim impõe a regra do mini para o e2e valer igual nos dois; o resto vai ao sqlite3 de verdade
+ro=0; for a in "$@"; do [ "$a" = -readonly ] && ro=1; done
+if [ "$ro" = 1 ]; then for a in "$@"; do
+  { [ -f "$a" ] && [ ! -e "$a-wal" ] && [ ! -e "$a-shm" ] && [ "$(head -c 20 "$a" | tail -c 2 | od -An -tx1 | tr -d ' \n')" = 0202 ]; } && { echo "Error: in prepare, unable to open database file (14)" >&2; exit 14; }
+done; fi
+PATH="${PATH#"${0%/*}":}" exec sqlite3 "$@"
+SH
 cat > "$BIN/footprint" <<'SH'
 #!/bin/bash
 fp=$(awk -v p="$2" '$2 == p {print $4; f = 1} END {exit f ? 0 : 1}' "$E2E_W/world/procs") || exit 1
@@ -173,7 +182,7 @@ for path, (table, col, cols) in DDL.items():
     if extra and path == (pix if extra[0] == "pix" else vb):
         con.execute("INSERT INTO %s (call_id, %s, started_at) VALUES ('c1', ?, datetime('now','localtime','-%d minutes'))" % (table, col, int(extra[2])), (extra[1],))
     con.commit(); con.close()
-    for ext in ("-wal", "-shm"):   # o banco de produção é WAL SEM -wal/-shm (os apps abrem e fecham a cada operação): é esse estado que o leitor do D4 tem de saber abrir
+    for ext in ("-wal", "-shm"):   # o banco de produção é WAL SEM -wal/-shm (os apps abrem e fecham a cada operação): é esse estado que os leitores do D3 (sqlite3) e do D4 (python) têm de saber abrir
         try: os.remove(path + ext)
         except OSError: pass
 PY

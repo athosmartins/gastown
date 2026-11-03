@@ -29,7 +29,7 @@
 #     "COFRE SEM RESPOSTA" e o degrau PARA. Risco aceito (Mayor, 01/11): leitor do cofre só no boot fica sem a chave até reiniciar; quem relê com retry (ex. google_3d_key, 60 s) se cura em ~15 s.
 # GUARDAS         (todas ANTES de cada daemon e do bw-serve; qualquer uma que não esteja "livre" = não reinicia aquele nem os seguintes)
 #   · ligação em curso — as DUAS guardas vazias: pix_call_log (demand_assignments.db) sem linha 'dialing'/'bridged' e voicebot_call_log (voicebot_cost.db) sem linha 'live', ambas atualizadas
-#     nos últimos D3_CALL_WINDOW_S (1800 s; linha mais velha que isso é órfã de crash, o próprio pix_call_queue as resgata). Lidas direto no sqlite, SOMENTE LEITURA: os `live_calls()` dos
+#     nos últimos D3_CALL_WINDOW_S (1800 s; linha mais velha que isso é órfã de crash, o próprio pix_call_queue as resgata). Lidas direto no sqlite com query_only=ON (nenhum dado é gravado; ver db_count): os `live_calls()` dos
 #     módulos engolem erro e devolvem [] (= "sem ligação"), o que viraria "pode reiniciar" quando o banco não abre. Aqui banco que não abre NÃO é "sem ligação".
 #   · congelamento — scripts/deploy_freeze.py check <label>: rc 0 congelado = pula; rc 10 livre; qualquer outro rc = não sei = pula (e conta como "não consegui ler").
 #   · idade — processo com menos de D3_MIN_AGE_S (3600 s) não é reiniciado: alguém acabou de reiniciar (inclusive este degrau) e o footprint dele não diz nada. É o que impede reinício em laço
@@ -292,11 +292,13 @@ http_code() {  # $1=url → código HTTP (3 dígitos) em stdout. falhou/sem resp
 }
 http_ok() { case "$(http_code "$1")" in 2??|3??) return 0 ;; *) return 1 ;; esac; }
 
-# ── guardas de ligação (sqlite SOMENTE LEITURA) ──────────────────────────────────────────────────────────────────────────────────
-db_count() {  # $1=banco $2=SQL de contagem → inteiro em stdout. banco ausente/sem a tabela/travado/saída que não é um número só → rc 1 (não sei ≠ 0 ligações). Nunca cria nada
+# ── guardas de ligação (sqlite com query_only=ON: nenhum dado é gravado) ─────────────────────────────────────────────────────────────
+db_count() {  # $1=banco $2=SQL de contagem → inteiro em stdout. banco ausente/sem a tabela/travado/saída que não é um número só → rc 1 (não sei ≠ 0 ligações). Não grava dado (query_only=ON)
+  # NÃO usar -readonly: o sqlite3 do mini (3.51) não abre com ele um banco WAL sem -wal/-shm ("unable to open database file", rc 14), que é o estado normal destes bancos (os apps abrem e fecham a
+  # conexão a cada operação): o D3 ficava cego (rc 30, "pix=?") sempre que o banco estava nesse estado (34 de 40 leituras do D4 com mode=ro em 01/11; ga-1p1i5jr.5). Como no leitor do D4 (disk-recovery-d4-calls-in-flight.py), o SQLite pode criar o -shm/-wal
   [ -f "$1" ] || return 1
   local rc v
-  bcap "$D3_CMD_S" sqlite3 -readonly -batch -cmd ".timeout 3000" "$1" "$2"; rc=$?
+  bcap "$D3_CMD_S" sqlite3 -batch -cmd ".timeout 3000" -cmd "PRAGMA query_only=ON" "$1" "$2"; rc=$?
   [ "$rc" -eq 0 ] || return 1
   v=$(printf '%s' "$CAP" | tr -d ' \n')
   isnum "$v" && [ "${#v}" -le 9 ] || return 1

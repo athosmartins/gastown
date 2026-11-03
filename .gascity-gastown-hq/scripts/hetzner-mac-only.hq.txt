@@ -226,3 +226,6 @@ scripts/worktree-reaper.selftest.sh
 packs/town-deltas/assets/e12-builder-coverage.selftest.sh
 packs/town-deltas/assets/pool-preamble-build.selftest.sh
 packs/town-deltas/assets/template-fragment-lint-guard.selftest.sh
+# --- acrescentada em 03/11 (ga-1p1i5jr.5, gate-fix 1): o e2e da escada de disco usa scripts/disk-recovery-d2-allowlist.tsv, que o filtro do nó não leva (só extensões de código): pelo nó o revisor do gate mediu
+#     40 ok / 9 FAIL (D2 "unknown", rfb de brinquedo não parado) contra 49 ok num worktree completo. E o macOS é a prova que vale (o mesmo e2e apontou o D3 cego só lá). ---
+scripts/disk-recovery-e2e.selftest.sh

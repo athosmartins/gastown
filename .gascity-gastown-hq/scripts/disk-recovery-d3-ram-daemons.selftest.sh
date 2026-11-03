@@ -4,7 +4,7 @@
 # ## Contents
 #   O que é simulado · O que é verificado · Como rodar
 #
-# O QUE É SIMULADO  launchctl (list/kickstart), ps (por PID e a lista -ax do Safari), footprint, top (bw-serve), osascript (quit do Safari), secret (prova do cofre), sleep (modo lento), curl (API do demand-dashboard e as portas), df e sysctl são shims no PATH; os bancos de ligação são sqlite REAIS e temporários
+# O QUE É SIMULADO  launchctl (list/kickstart), ps (por PID e a lista -ax do Safari), footprint, top (bw-serve), osascript (quit do Safari), secret (prova do cofre), sleep (modo lento), curl (API do demand-dashboard e as portas), df e sysctl são shims no PATH; os bancos de ligação são sqlite REAIS e temporários (o shim do sqlite3 só impõe a regra do mini: `-readonly` não abre banco WAL sem -wal/-shm)
 #   (pix_call_log e voicebot_call_log); o restart guardado, o deploy_freeze e o relógio do disco (arquivos DR_FREE_MB_FILE / DR_SWAP_MB_FILE) são stubs. Nada real é reiniciado, pausado ou enviado.
 # O QUE É VERIFICADO  saída = UMA linha, ASCII, ≤ 290, nada antes dela (stdout+stderr juntos, como o maestro lê) e rc 0/10/20/30/2 em cada cenário · fronteiras (livre 4608/4609, idade 3599/3600 s,
 #   footprint 99/100 MB, janela de ligação 1799/1801 s) · ordem por footprint e parada ao recuperar · só labels da allowlist · cada guarda de ligação (pix dialing/bridged, voicebot live, banco
@@ -13,7 +13,7 @@
 #   daemon voltando devagar, guardado que estoura o tempo, sobra de rodada anterior) · TERM no meio do guardado despausa a fila ·
 #   a LINHA FINAL nunca diz "conferida"/"nada a fazer" por cima de dúvida na fila (TERM com daemon fora do ar / PATCH recusado / sem pausa nossa em aberto / no meio da despausa da sobra; sobra nossa que
 #   o PATCH recusou = 20; fila ilegível no início = 30 se nada foi reiniciado; o guardado que deixa a fila livre apaga a dúvida; o aviso sobrevive ao corte de 290) · orçamento de tempo · trava (viva, morta, solta no fim) ·
-#   interruptor · dry-run sem efeito colateral · df/swap lidos do jeito certo (nunca `df /`) e ilegíveis = 30 · variável numérica inválida · rotação do log · bancos só lidos ·
+#   interruptor · dry-run sem efeito colateral · df/swap lidos do jeito certo (nunca `df /`) e ilegíveis = 30 · variável numérica inválida · rotação do log · bancos só lidos (também WAL sem -wal/-shm, que o sqlite3 do mini não abre com -readonly: shim) ·
 #   (ga-1p1i5jr.7) Safari: só o executável Safari.app/.../Safari, idade 7199/7200 s, prova de que saiu, falha não para o resto e não repete por 6 h, lista de processos vazia/ilegível ≠ fechado ·
 #   bw-serve: MEM+CMPRS 800/801 MB e unidades do top, idade 21599/21600 s, secret antes e depois (valor nunca lido), ordem Safari → bw-serve → daemons ·
 #   label ausente ≠ domínio errado · "D3 retomou o envio" na linha · sobra de pausa desfeita antes de ler o disco · teto de tempo em segundos de relógio.
@@ -206,6 +206,15 @@ cat > "$BIN/sleep" <<'SH'
 if [ -f "$STUB_DIR/sleep.slow" ] && [ "${1:-}" = 0.05 ]; then exec /bin/sleep 0.5; fi
 exec /bin/sleep "$@"
 SH
+cat > "$BIN/sqlite3" <<'SH'
+#!/bin/bash
+# o sqlite3 do mini (3.51): `-readonly` num banco WAL SEM -wal/-shm nao abre ("unable to open database file", rc 14; medido no mini pelo revisor do gate em 03/11 e pelo D4 em 01/11). O 3.45 do Linux abre (e ainda cria -wal/-shm): o shim impoe a regra do mini; o resto vai ao sqlite3 de verdade
+ro=0; for a in "$@"; do [ "$a" = -readonly ] && ro=1; done
+if [ "$ro" = 1 ]; then for a in "$@"; do
+  { [ -f "$a" ] && [ ! -e "$a-wal" ] && [ ! -e "$a-shm" ] && [ "$(head -c 20 "$a" | tail -c 2 | od -An -tx1 | tr -d ' \n')" = 0202 ]; } && { echo "Error: in prepare, unable to open database file (14)" >&2; exit 14; }
+done; fi
+PATH="${PATH#"${0%/*}":}" exec sqlite3 "$@"
+SH
 chmod 755 "$BIN"/*
 cat > "$W/guarded" <<'SH'
 #!/bin/bash
@@ -242,6 +251,8 @@ mkdbs() {
 }
 addpix()   { sqlite3 "$PIX" "INSERT INTO pix_call_log (call_id, phone_norm, state, started_at, updated_at) VALUES ('c$RANDOM', '5511', '$1', datetime('now','localtime','-$2 seconds'), datetime('now','localtime','-$2 seconds'));"; }
 addvoice() { sqlite3 "$VOICE" "INSERT INTO voicebot_call_log (call_id, status, started_at, updated_at) VALUES ('v$RANDOM', '$1', datetime('now','localtime','-$2 seconds'), datetime('now','localtime','-$2 seconds'));"; }
+walmk()  { sqlite3 "$PIX" "PRAGMA journal_mode=WAL;" > /dev/null; sqlite3 "$VOICE" "PRAGMA journal_mode=WAL;" > /dev/null; }   # os dois bancos viram WAL (como em producao); depois do addpix/addvoice, walrun tira o -wal/-shm antes do D3
+walrun() { rm -f "$PIX-wal" "$PIX-shm" "$VOICE-wal" "$VOICE-shm"; run_d3 "$@"; }   # os apps abrem e fecham a conexao a cada operacao: o banco de producao fica WAL SEM -wal/-shm (o SQLite 3.51 do mac pode deixa-los vazios ao fechar, por isso tirar explicitamente)
 hookfor() {  # $1=label $2..=comando que o kickstart roda DEPOIS de reiniciar (efeito colateral simulado)
   local l=$1; shift; printf '%s\n' "$*" > "$SD/hook.$l.sh"; printf 'hook="bash %s/hook.%s.sh"\n' "$SD" "$l" >> "$SD/kick.com.whatsapp.$l"
 }
@@ -383,6 +394,12 @@ reset; addpix dialing 10; before=$(cksum < "$PIX"; cksum < "$VOICE"); run_d3; af
 case "$before" in *[0-9]*) eq "$before" "$after" "guardas so leem: os dois bancos ficam byte a byte iguais" ;; *) nope "guardas so leem: cksum nao devolveu soma (teste vazio)" ;; esac
 reset; hookfor map-viewer "sqlite3 '$VOICE' \"INSERT INTO voicebot_call_log (call_id,status) VALUES ('x','live');\""; run_d3
 expect 0 "parei: ligacao em curso (pix=0 voicebot=1) antes de demand-dashboard" "ligacao aparece entre um daemon e o seguinte: para (rc 0 porque agiu)"; eq "$(kicks)" "map-viewer," "guarda reavaliada antes de CADA daemon: so o map-viewer foi reiniciado"
+# gate-fix 1 (ga-1p1i5jr.5): os bancos de producao sao WAL sem -wal/-shm e o sqlite3 do mini nao os abre com -readonly (o shim impoe isso): a guarda tem de LER, nao cair em "?" (30 = o D3 cego, como no log de producao: "pix=? voicebot=0")
+reset; walmk; walrun; expect 0 "reiniciei" "bancos WAL sem -wal/-shm, nenhuma ligacao: a guarda le 0 e 0 e o D3 age (nao 30)"
+reset; walmk; addpix dialing 10; walrun; expect 10 "ligacao em curso (pix=1 voicebot=0)" "WAL sem -wal/-shm + pix dialing: a guarda LE a ligacao e adia"; eq "$(kicks)" "" "WAL + pix dialing: nada reiniciado"
+reset; walmk; addvoice live 30; walrun; expect 10 "ligacao em curso (pix=0 voicebot=1)" "WAL sem -wal/-shm + voicebot live: adia"
+reset; walmk; addpix dialing 10; rm -f "$PIX-wal" "$PIX-shm" "$VOICE-wal" "$VOICE-shm"; before=$(cksum < "$PIX"; cksum < "$VOICE"); run_d3; after=$(cksum < "$PIX"; cksum < "$VOICE")
+case "$before" in *[0-9]*) eq "$before" "$after" "WAL: ler com o banco aberto para escrita (query_only) nao muda um byte do arquivo principal" ;; *) nope "WAL: cksum nao devolveu soma (teste vazio)" ;; esac
 
 section "prova do restart: PID novo + porta"
 reset; echo 'rc=113' > "$SD/kick.com.whatsapp.map-viewer"; run_d3; expect 20 "map-viewer: kickstart rc=113" "kickstart falha: 20"; eq "$(kicks)" "map-viewer," "kickstart falha: para, nao tenta o seguinte"
