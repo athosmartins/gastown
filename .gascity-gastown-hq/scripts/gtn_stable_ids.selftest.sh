@@ -13,7 +13,8 @@
 #   (o que parou a suíte inteira do WA em 02/11); os 5 formatos (`T` e espaço, com e sem fração, e fração com vírgula) têm de passar com o id `test_clock[<TS>]`.
 # CONTROLES NEGATIVOS: o mesmo cenário de 3 noites contra o script com o corte antigo (id lido da linha humana, cortado no 1º " - ", sem conferir `n`) TEM de ser reprovado; e o plugin sem
 #   os erros (só "failed") TEM de ser reprovado pela conferência contra o resumo; (1b) o plugin sem o espaço TEM de ser reprovado no formato com espaço, e o plugin sem a fração no formato com
-#   fração; o mutante neutro (só um comentário) TEM de passar, senão "reprovado" não prova nada.
+#   fração; o mutante neutro (só um comentário) TEM de passar, senão "reprovado" não prova nada; e os dois mutantes TÊM de ter o mesmo número de aspas do original (no bash 3.2 do mini, uma troca
+#   escrita como "${x/"a"/"b"}" deixa as aspas literais e o mutante vira outro programa: este arquivo roda só no mini, ver hetzner-mac-only.hq.txt).
 # REQUISITO: um python com pytest e pytest-xdist (GTN_PYTHON; padrão o venv do WA). Sem ele: sai 3 ("NÃO RODOU"), nunca 0: um teste que não rodou não é um teste que passou.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -157,12 +158,18 @@ done
 cpl=$(cat "$HERE/gtn_stable_ids.py"; echo x); cpl=${cpl%x}
 sp_old='[T ]'; sp_new='T'; fr_old='(?:[.,]\d+)?'; fr_new=''
 mkdir -p "$T/plug-nosp" "$T/plug-nofr" "$T/plug-neutral"
-printf '%s' "${cpl/"$sp_old"/"$sp_new"}" > "$T/plug-nosp/gtn_stable_ids.py"
-printf '%s' "${cpl/"$fr_old"/"$fr_new"}" > "$T/plug-nofr/gtn_stable_ids.py"
+# a troca vai numa ATRIBUIÇÃO sem aspas externas (como o m= do mutante do script, mais abaixo): dentro de "${x/"a"/"b"}" o bash <= 4.2 (o 3.2.57 do mini) deixa as aspas do texto de troca LITERAIS
+m=${cpl/"$sp_old"/"$sp_new"}; printf '%s' "$m" > "$T/plug-nosp/gtn_stable_ids.py"
+m=${cpl/"$fr_old"/"$fr_new"}; printf '%s' "$m" > "$T/plug-nofr/gtn_stable_ids.py"
 printf '%s' "$cpl" | sed '2i\
 # comentario neutro' > "$T/plug-neutral/gtn_stable_ids.py"
 ck "controle: o plugin sem o espaço difere do original" test -n "$(diff "$HERE/gtn_stable_ids.py" "$T/plug-nosp/gtn_stable_ids.py")"
 ck "controle: o plugin sem a fração difere do original" test -n "$(diff "$HERE/gtn_stable_ids.py" "$T/plug-nofr/gtn_stable_ids.py")"
+# os textos de troca (sp_old/sp_new/fr_old/fr_new) não têm aspas: se o mutante tem mais ou menos aspas que o original, o bash deixou aspas literais na troca e o mutante deixou de ser o pretendido
+nq() { LC_ALL=C tr -cd '"' < "$1" | wc -c | tr -d ' '; }
+sameq() { [ "$(nq "$HERE/gtn_stable_ids.py")" = "$(nq "$1")" ]; }
+ck "controle: o plugin sem o espaço tem o mesmo número de aspas do original (nenhuma aspa literal vazou da troca)" sameq "$T/plug-nosp/gtn_stable_ids.py"
+ck "controle: o plugin sem a fração tem o mesmo número de aspas do original (nenhuma aspa literal vazou da troca)" sameq "$T/plug-nofr/gtn_stable_ids.py"
 runclock espfrac "$T/plug-neutral" "$T/out-clock-neutral"
 ck "controle: o mutante neutro (só um comentário) PASSA o formato espaço + fração (o mutante é executável aqui)" clockok "$T/out-clock-neutral"
 runclock espaco "$T/plug-nosp" "$T/out-clock-nosp"
