@@ -1,6 +1,6 @@
 ## Contents
 - O que é e por que existe
-- Estado de instalação: o job NÃO está carregado
+- Estado de instalação
 - Limiares
 - Como o maestro decide
 - Contrato dos degraus
@@ -9,6 +9,7 @@
 - Três estados: o que o maestro faz quando não consegue ler
 - Teto de 6 h do reinício (D4)
 - Como testar
+- Prova ponta a ponta e canário de 24 h (D5)
 - Medição
 - Decisão citável e fatias
 
@@ -29,13 +30,13 @@ por rodada. Não apaga, não para e não reinicia nada por conta própria.
 | D3 | `scripts/disk-recovery-d3-ram-daemons.sh` (bead ga-1p1i5jr.3) | restart drenado dos daemons que mais usam RAM |
 | D4 | `scripts/disk-recovery-d4-guarded-reboot.sh` (bead ga-1p1i5jr.4) | reinício guardado do mini |
 
-## Estado de instalação: o job NÃO está carregado
+## Estado de instalação
 
-O arquivo `scripts/com.gascity.disk-recovery-ladder.plist` entra no repositório, mas **nada o carregou**. Fazer merge não liga o
-job. Enquanto ninguém rodar o comando abaixo, a escada não existe para o launchd.
-
-Antes de carregar, confira que D2, D3 e D4 existem e são executáveis. Se faltar um, o maestro avisa uma vez por episódio
-(`notify -p 4`; a cada rodada, até o notify confirmar a entrega) e pula para o próximo, mas a escada fica sem aquele degrau.
+O job `com.gascity.disk-recovery-ladder` foi **carregado em 02/11/2026 ~22:10 BRT pelo Mayor** (`cp` + `launchctl bootstrap`; prova no comentário dele na ga-1p1i5jr:
+`launchctl print` → `state = running`, `run interval = 120 seconds`; autorização: a decisão do Athos de 01/11 citada abaixo). Fazer merge de uma mudança em
+`scripts/` NÃO recarrega nada: a cada 120 s o launchd roda o arquivo que estiver na árvore viva (`/Users/athos/gt/.gascity-gastown-hq/scripts/`), então confira lá que a versão mergeada chegou
+(mergeado ≠ vivo) antes de dizer que uma correção está no ar. Para carregar de novo (ou numa máquina nova), com `scripts/` do degrau D2, D3 e D4 já presentes e executáveis (se faltar um, o maestro avisa uma vez por episódio,
+`notify -p 4`, e pula para o próximo):
 
 ```
 cp scripts/com.gascity.disk-recovery-ladder.plist ~/Library/LaunchAgents/
@@ -43,11 +44,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gascity.disk-recover
 launchctl print gui/$(id -u)/com.gascity.disk-recovery-ladder | head -20     # a prova: o serviço existe, run interval = 120 seconds
 ```
 
-Para descarregar: `launchctl bootout gui/$(id -u)/com.gascity.disk-recovery-ladder`. Para pausar sem descarregar:
-`touch .gc/disk-recovery.off`.
-
-Carregar o job é o que liga a escada: quem carrega precisa de autorização citável do Athos. A decisão de que a escada age sozinha,
-a qualquer hora e com guardas, está citada na seção "Decisão citável"; o carregamento em si fica com o Mayor.
+Para descarregar: `launchctl bootout gui/$(id -u)/com.gascity.disk-recovery-ladder`. Para pausar sem descarregar: `touch .gc/disk-recovery.off`. Carregar o job é o que liga a
+escada: quem carrega precisa de autorização citável do Athos (a decisão de que a escada age sozinha, a qualquer hora e com guardas, está em "Decisão citável e fatias").
 
 ## Limiares
 
@@ -252,6 +250,28 @@ Os consertos de revisão (gate-fix 1 a 3: entrega confirmada, trava com três es
 guardado, carimbos de 1 h) ganharam os mutantes deles. Os números estão nos comentários da ga-1p1i5jr.1 e são RELATO dos autores,
 não medição deste runbook: 38 de 38 mortos no gate-fix 2 e 27 de 27 no gate-fix 3 (11 do swap, 13 da trava e do estado, 3 do D3).
 O que este runbook mediu foi só a bateria inteira do script de hoje (446 / 0, acima).
+
+## Prova ponta a ponta e canário de 24 h (D5)
+
+**(a) Simulação ponta a ponta** — `scripts/disk-recovery-e2e.selftest.sh` (~80 s no nó Linux; sem rede nem disco real). Diferente dos selftests de cada peça, que trocam os vizinhos por stubs, aqui o
+maestro REAL chama o D2, o D3 e o D4 REAIS, do jeito do plist (`/bin/bash disk-recovery-ladder.sh --run`, env mínimo), contra UM mundo simulado: `df`, `sysctl`, `launchctl`, `ps`, `footprint`,
+`curl` e `date` são shims que calculam o livre na hora a partir do estado do mundo (rfb de brinquedo morto por TERM de verdade, daemons reiniciados, vazamento de memória, reinício simulado que mata o D4
+e o maestro). Cenários: S-A estouro de memória D2 → D3 → D4 (piso duro) e depois o teto de 6 h com escalada, S-B nada a liberar e o D4 só aos 3600 s, S-C/S-C2 ligação em curso segura o D4 e o D3 com o
+mesmo banco, S-D pico isolado, S-F interruptor 70 min. O último bloco passa o log que o maestro real escreveu pelo relatório (b). `E2E_KEEP=1` mantém o diretório de trabalho; `E2E_LADDER`, `E2E_D2`,
+`E2E_D3`, `E2E_D4` e `E2E_REPORT` apontam cópias modificadas (mutantes); `E2E_BASH=/caminho/bash` roda tudo no bash 3.2 do mini. O cenário S-A pós-boot muda quando a ga-1p1i5jr.6 (o maestro
+passa a chamar o `--resume` do D2 a cada rodada) entrar: atualize-o então, é para isso que ele serve.
+
+**(b) Canário em produção e (c) relatório** — `scripts/disk-recovery-report.py` lê o log do maestro (`.gc/logs/disk-recovery.log` e o `.1`) e calcula, sem relato de ninguém: cobertura (horas, maior
+silêncio), por degrau as chamadas, o que agiu/adiou/falhou e os MB devolvidos, e as janelas com o livre < 3 GB. Depois de 24 h do job carregado (carregado em 02/11 ~22:10 BRT = 03/11 01:10Z; 24 h = 04/11
+01:10Z):
+
+```
+python3 scripts/disk-recovery-report.py --since 'AAAA-MM-DD HH:MM'     # --json para máquina; rc 0 só com aceite ATENDIDO e >= 24 h de cobertura; rc 3 = log ilegível
+```
+
+O aceite da missão ("nenhuma janela > 60 min com disco < 3 GB sem uma ação da escada no log") sai como ATENDIDO / NÃO ATENDIDO / NÃO VERIFICADO (silêncio depois de uma leitura baixa não é "recuperou").
+Se o disco nunca ficou ≤ 5 GB o relatório diz que o canário NÃO exercitou a escada: nesse caso o aceite vale por vacuidade e a prova que sobra é a simulação (a).
+O relatório ao Athos é a tabela impressa (chamadas e MB por degrau), não uma narrativa. Testes do relatório: `bash scripts/disk-recovery-report.selftest.sh` (~2 s).
 
 ## Medição
 
