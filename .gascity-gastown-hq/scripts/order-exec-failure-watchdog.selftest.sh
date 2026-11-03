@@ -230,6 +230,9 @@ grep -q '<key>ProcessType</key><string>Interactive</string>' "$PLIST" \
 # (a linha do notify do _alert: o status do ajudante e' o da linha do gc logo abaixo). Os outros seis (bc42a497e0
 # 237afdb31f 5f72a8c256 5a0417f77d 4cfff30377 6082e67a18) so mudam o status do PROPRIO ajudante: a secao 16 chama
 # cada um com um alvo que nao da para gravar ou remover.
+# EQUIVALENT 2752235dc1 0f4a812dbe c2c2b2831a: `cmd || true` -> `cmd && true` em escrita de estado DENTRO do run_sweep: ninguem le o status e nao ha set -e
+# EQUIVALENT 829c43a963 8dc1c151f3 0720001ec3: o `mkdir -p ... || true` que vem ANTES da escrita no mesmo ajudante: o status da linha seguinte e quem fecha o ajudante
+# EQUIVALENT aaa8b8590e: a linha do notify do _alert: o status do ajudante e o da linha do gc logo abaixo
 date() { if [ "${1-}" = "+%s" ] && [ -n "${FAKE_NOW:-}" ]; then echo "$FAKE_NOW"; else command date "$@"; fi; }
 
 # ── 12. status de run_sweep e o cooldown no limite exato ────────────────────

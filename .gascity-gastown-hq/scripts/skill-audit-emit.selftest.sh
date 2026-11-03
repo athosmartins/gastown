@@ -5,6 +5,7 @@
 #   com `printf … > "$tmp" && mv …` trocado por `||` o mv nunca roda no caminho bom e a métrica do dashboard congela sem aviso. Mutante embutido: o trecho troca UMA vez, o cenário tem de FALHAR.
 # EQUIVALENTE (287db99fd8, L29 `notify_fail() { … || true; }` com `||→&&`): sem `set -e`, o rc de notify_fail não é lido por ninguém (as duas chamadas são seguidas de `exit 2` explícito), então
 #   a função devolver 0 ou o rc do notify dá no mesmo; não há cenário que veja a diferença.
+# EQUIVALENT 287db99fd8: `notify_fail() { ... || true; }` com `||` -> `&&`: sem `set -e`, o rc de notify_fail nao e lido por ninguem (as duas chamadas sao seguidas de `exit 2` explicito)
 set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 J="$SELF_DIR/skill-audit-emit.sh"

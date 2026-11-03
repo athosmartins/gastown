@@ -1886,6 +1886,9 @@ eq("fallback: marca o caminho como NAO-dispatchable, sem idade de snapshot, e he
 # float(...) > NOW) e codigo morto, porque o `any(l.startswith("pilot:held-until"))` anterior ja deu `continue` em toda bead com esse label e `held` ali e sempre []:
 # 034ff3c5c7 28aef54d0b 65d267fb2c 7b6ccba54c 11c28b96bf 103b46b79f 23488fecc2 b5f5119856 ccbe12616b 7b47daf7fe 530e68166d. Mais cb7a532be1 f4d95ae8c3 (os booleanos
 # flowing/held do dicionario de `buildable` nunca sao lidos: so len(buildable) sai) e 561c28a6c7 (`>=` atribui o mesmo valor). O caso abaixo prova a premissa do ramo morto.
+# EQUIVALENT 034ff3c5c7 28aef54d0b 65d267fb2c 7b6ccba54c 11c28b96bf 103b46b79f 23488fecc2 b5f5119856 ccbe12616b 7b47daf7fe 530e68166d: o ramo do teto de held-loop do fallback e codigo morto: o `any(l.startswith("pilot:held-until"))` anterior ja deu `continue` em toda bead com esse label, e `held` ali e sempre []
+# EQUIVALENT cb7a532be1 f4d95ae8c3: os booleanos flowing/held do dicionario de `buildable` nunca sao lidos: so len(buildable) sai
+# EQUIVALENT 561c28a6c7: `age > oldest_active_min` -> `>=`: no empate atribui o mesmo valor
 eq("fallback: qualquer pilot:held-until:* (6 labels, passado ou futuro) e held, nunca parada - o ramo do teto de held-loop fica atras deste",
    [b["id"] for b in _r["stuck"] if b["id"] in ("hl6", "pasth", "hd")], [])
 _r = _fb({"/hq": ([], True)}, [("HQ", "/hq")])

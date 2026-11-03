@@ -323,6 +323,10 @@ FAIL=$((FAIL + $(printf '%s\n' "$UNIT_OUT" | grep -c '^FAIL - ')))
 # real dir); L490 `streak >= 0` -> `> 0` and `>= 1` (73eeca5977 af60fea0b4: a stored 0 and the `else 0` both give 0); L559 `else True -> False` (81e4dcc18c: with
 # an empty tmp_dir the branch that reads it is not taken); L639 `sys.argv[1:]` -> `[0:]` (bf8c509a65: main() looks for three flags, and the
 # script path is none of them).
+# EQUIVALENT 29ee7f07a7 0ec3503a86: `follow_symlinks=False` -> True: `e.is_symlink()` has already skipped every link, so the flag only ever sees a real dir
+# EQUIVALENT 73eeca5977 af60fea0b4: `streak >= 0` -> `> 0` and `>= 1`: a stored 0 and the `else 0` both give 0
+# EQUIVALENT 81e4dcc18c: `else True` -> False: with an empty tmp_dir the branch that reads it is not taken
+# EQUIVALENT bf8c509a65: `sys.argv[1:]` -> `[0:]`: main() looks for three flags, and the script path is none of them
 cat > "$W/unit2.py" <<'PYEOF'
 import contextlib, importlib.util, io, json, os, sys, tempfile, time, types
 from unittest import mock

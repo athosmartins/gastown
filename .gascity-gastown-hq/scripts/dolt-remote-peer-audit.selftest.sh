@@ -27,6 +27,8 @@
 #   - emit: `return 1` → `return 0` na gravação que falha e `return 0` → `return 1` no fim: as quatro chamadas de emit em sample são comandos soltos, NENHUMA lê o rc.
 #     O contrato que se observa é a mensagem no stderr e o que fica (ou não) no log: B7.
 #   Se um dia algum chamador passar a ler o rc do emit, esses quatro viram killable e este parágrafo deve sair.
+# EQUIVALENT 63198f6189 925a51b742: `mkdir -p "$(dirname ...)" 2>/dev/null || true` em emit e em take_lock, com `||` -> `&&`: o script roda com `set -uo pipefail` (SEM -e) e o rc desse mkdir nao e lido em lugar nenhum
+# EQUIVALENT 4647329047 b14312956f: emit: `return 1` -> `0` na gravacao que falha e `return 0` -> `1` no fim: as quatro chamadas de emit em sample sao comandos soltos, NENHUMA le o rc
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

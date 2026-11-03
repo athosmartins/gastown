@@ -387,6 +387,7 @@ done
 # EQUIVALENT (ga-ow127o6; 43a00b5a1b and 9e5c3fe8fd, `len(a) > 2` -> `len(a) >= 2` on the attached -m / -c forms): the only 2-character
 # string that startswith("-m") is "-m" itself, which the `a in ("-m", "-c")` alternative before it already took, so `> 2` and `>= 2`
 # raise for exactly the same arguments: no launch line separates them.
+# EQUIVALENT 43a00b5a1b 9e5c3fe8fd: `len(a) > 2` -> `>= 2` on the attached -m / -c forms: the only 2-character string that startswith("-m") is "-m" itself, which `a in ("-m", "-c")` already took
 
 # ── T31: -I and -P change how sys.path[0] is built, so they are not emulated ──
 R="$TMP_ROOT/t31"; mk_tree "$R"

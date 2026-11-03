@@ -326,6 +326,9 @@ echo "== D2. what the CLI prints and the defaults (ga-0qhveri) =="
 # EQUIVALENT (not killable, proved by reading): scan_arms `t > last` -> `t >= last` (an equal ts assigns the same value) · flag_age `max(0, ...)` -> `max(1, ...)` (the age is only read through
 # `// 3600` and `> hours * 3600`, hours >= 1) · `datetime.now(UTC).replace(microsecond=0)` -> `microsecond=1` (the clock is only read at the second: strftime to minutes, int(timestamp()))
 # · load_sibling `fname[:-3]` -> `fname[:-4]` (the module name is never read: neither sibling looks at __name__ except for its own __main__ guard).
+# EQUIVALENT 51079d669b: flag_age `max(0, ...)` -> `max(1, ...)`: the age is only read through `// 3600` and `> hours * 3600`, hours >= 1
+# EQUIVALENT a0f591ad45: `datetime.now(UTC).replace(microsecond=0)` -> `microsecond=1`: the clock is only read at the second (strftime to minutes, int(timestamp()))
+# EQUIVALENT 7e974aa472: load_sibling `fname[:-3]` -> `fname[:-4]`: the module name is never read (neither sibling looks at __name__ except for its own __main__ guard)
 case_header_and_json() { local E; newcity hj; conf mode=enforce enforce_pct=50; runs ga-j 6; arms ga-j 1 6
   run; want 0 "the header names the conf in force (mode and percentage)" "checagem: ligada \(mode=enforce enforce_pct=50\)"
   newcity hj2; run; want 0 "no conf at all: mode and percentage are '-', never 'None'" "checagem: nao-ligada \(mode=- enforce_pct=-\)"

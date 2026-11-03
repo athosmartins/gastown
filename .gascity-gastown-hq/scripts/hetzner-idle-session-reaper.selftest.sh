@@ -601,6 +601,9 @@ check "casca dormindo ou já fechada: não fecha (a dormindo nem 'viva' é; a fe
 # run_cmd (texto, reap de 5 s), _by_template (rig/t e rig.t) e read_sessions (cada falha é (None, 0, motivo)) no valor exato.
 # Equivalentes: 185e0165d4 (errors="replace" já liga o modo texto do Popen, universal_newlines é redundante), b8f7a7b9a9 (held só é lido com sessões na lista),
 # 7cf10d9a72 (prev["desde"] <= now: no empate os dois lados dão o mesmo valor).
+# EQUIVALENT 185e0165d4: `universal_newlines=True` -> False: `errors="replace"` ja liga o modo texto do Popen, a outra opcao e redundante
+# EQUIVALENT b8f7a7b9a9: `rows is not None` -> `is None` no ramo de `held`: held so e lido com sessoes na lista
+# EQUIVALENT 7cf10d9a72: `prev["desde"] <= now` -> `<`: no empate os dois lados dao o mesmo valor
 cat > "$T/blk.py" <<'PY'
 import importlib.util, os, subprocess, sys
 sys.dont_write_bytecode = True

@@ -8,13 +8,16 @@
 #   lista nova = UMA bead (bug, P2, labels, corpo com a lista COMPLETA, também com 237 ids) e o estado guarda o id · mesma lista = nada · lista que muda = comentário na mesma bead · bead fechada pelo dono = abre outra ·
 #   bead que não consigo ler = não abre outra · lista que zera = um comentário (wa-suite "corrigidas"; hq-mutants nunca afirma "pegos" sem alvo julgado por inteiro) · estado local ilegível = rc 3 · `bd create` sem resposta certa (rc≠0, prazo estourado, sem id — com a bead NASCIDA ou não) = rc 3, estado
 #   intacto, e a volta seguinte LISTA o rig antes de abrir (acha a nossa → comenta, não duplica; não acha → abre; não consegue listar → rc 3 e nada feito) · só conta como nossa a bead com a label e não fechada.
+# REGISTRO DE EQUIVALENTES (ga-eszw2df, casos `newfail[eq]`): `# EQUIVALENT <id>…: <razão>` no selftest da família tira o id da bead e a conta diz quantos ficaram de fora · 1 em 10 declarados volta por rodada, com a razão, e SÓ numa bead que tem pendente (a rodada anda quando nasce bead NOVA) ·
+#   gramática estrita: prosa solta, id de 9/11 hex ou em maiúsculas, razão curta, `##` e comentário no fim de linha de código NÃO declaram · selftest que não leio (ausente, pasta, modo 000, absoluto, fora da árvore, symlink para fora, pasta irmã de mesmo prefixo, 4 MiB + 1) não declara nada e a bead diz que não leu ·
+#   tudo declarado = «Nada pede ação», sem afirmar «nenhum sobrevive» · `round` de outro tipo = rc 3 · wa-suite e wa-mutants não leem o registro nem ganham `round`.
 # CONTROLE NEGATIVO: cada mutante (um trecho do script trocado) TEM que reprovar a bateria.
 # VARIÁVEIS: HNF_UNDER_TEST (script a testar) · HNF_PY (python; padrão /usr/bin/python3) · HNF_NO_MUTANTS=1 · HNF_JOBS (mutantes em paralelo; padrão 4)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NF="${HNF_UNDER_TEST:-$HERE/hetzner-ballast-newfail.py}"
 PY="${HNF_PY:-/usr/bin/python3}"
-T=$(cd "$(mktemp -d /tmp/hnf.XXXXXX)" && pwd -P)
+T=$(cd "$(mktemp -d "${TMPDIR:-/tmp}/hnf.XXXXXX")" && pwd -P)
 cleanup() { find "$T" -mindepth 1 -delete 2> /dev/null; rmdir "$T" 2> /dev/null; }
 trap cleanup EXIT
 trap 'exit 143' TERM INT HUP
@@ -417,8 +420,171 @@ print(json.dumps({"v": 1, "targets": {"lib/\udcff.py": {"hash": "h", "survivors"
   check "newfail[wam]: lista vazia e nenhuma bead nossa → nada (rc 0, nenhuma chamada ao bd)" "0 0" "$RC $(wc -l < "$W/bd.calls" | tr -d ' ')"
 }
 
+
+# ── o registro de equivalentes do hq-mutants (ga-eszw2df) ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+# O selftest da família declara `# EQUIVALENT <id> [<id>…]: <razão>` (a palavra em maiúsculas e em inglês, `#` como 1º caractere não branco, ids de 10 hex, razão de 12 caracteres ou mais) e o id SAI da bead: ela passa a pedir só ação. Duas redes: (1) 1 em cada 10
+# dos declarados volta por RODADA para ser conferido de novo (a rodada anda quando uma bead NOVA nasce; o resto por 10 do id diz em que rodada ele volta); (2) o id leva a linha do código, então a declaração envelhece sozinha quando a linha anda.
+# A amostra é CARONA: só existe numa bead que tem pendente (declarado sozinho nunca abre nem mantém bead: não há ação). Leitura que falha (selftest ausente, ilegível, fora da árvore, grande demais) NÃO declara nada: o sobrevivente fica na lista. Os ids de teste são "%010x" % n: o resto por 10 do id é o próprio n % 10, e a bead nova de uma cidade sem estado é a rodada 1.
+idn() { printf '%010x' "$1"; }
+mkeq() {  # mkeq [--self CAMINHO | --noself] N… — o estado do motor com um sobrevivente por N (id idn N; N par → scripts/a.sh, ímpar → scripts/b.sh), todos os alvos julgados por inteiro; a família de cada um é o selftest do próprio arquivo, ou CAMINHO, ou nenhuma
+  "$PY" -I -c 'import sys, json
+a = sys.argv[1:]
+fam = None
+if a[:1] == ["--self"]:
+    fam, a = a[1], a[2:]
+elif a[:1] == ["--noself"]:
+    fam, a = "", a[1:]
+t = {"scripts/a.sh": {"hash": "h", "total": 1, "verdicts": {"x": "s"}, "survivors": {}}, "scripts/b.sh": {"hash": "h", "total": 1, "verdicts": {"x": "s"}, "survivors": {}}}
+for x in a:
+    i = int(x)
+    f = "scripts/%s.sh" % "ab"[i % 2]
+    r = {"id": "%010x" % i, "file": f, "line": 10 + i, "op": "and-or", "old": "||", "new": "&&"}
+    if fam != "":
+        r["selftest"] = [fam or "scripts/%s.selftest.sh" % "ab"[i % 2]]
+    t[f]["survivors"]["%010x" % i] = r
+print(json.dumps({"v": 1, "targets": t}))' "$@" > "$W/node.confirmed"
+}
+decl() { local f="$1"; shift; mkdir -p "$CITY/scripts"; printf '%s\n' "$@" > "$CITY/scripts/$f"; }   # decl ARQUIVO LINHA… — o selftest da família em $CITY/scripts, uma linha por argumento
+decl_all() {  # decl_all N… — declara cada N (uma linha, razão "razão número N da amostra") no selftest do próprio arquivo (par → a, ímpar → b)
+  local k; mkdir -p "$CITY/scripts"; : > "$CITY/scripts/a.selftest.sh"; : > "$CITY/scripts/b.selftest.sh"
+  for k in "$@"; do printf '# EQUIVALENT %s: razão número %d da amostra\n' "$(idn "$k")" "$k" >> "$CITY/scripts/$([ $((k % 2)) = 0 ] && echo a || echo b).selftest.sh"; done
+}
+seedr() { mkdir -p "$CITY/.gc/hetzner-ballast"; printf '{"v": 1, "fp": null, "bead": null, "n": 0, "round": %s}\n' "$1" > "$CITY/.gc/hetzner-ballast/newfail-hq-mutants.json"; }   # seedr R — estado local sem bead, na rodada R (a bead nova será a R+1)
+ib() { grep -c -E "id=($1)" "$W/bd.stdin.${2:-1}" 2> /dev/null || true; }   # ib 'ID|ID' [N] — linhas do texto (bd.stdin.N) com esses ids
+tb() { grep -c -- "$1" "$W/bd.stdin.${2:-1}" 2> /dev/null || true; }   # tb TEXTO [N] — linhas do texto com o trecho
+RZ="o status do cmd || true não é lido por ninguém"
+has() { "$PY" -I -c 'import sys, json
+try:
+    v = json.load(open(sys.argv[1] + "/.gc/hetzner-ballast/" + sys.argv[3]))
+except (OSError, ValueError):
+    print("ilegivel"); sys.exit(0)
+print("sim" if isinstance(v, dict) and sys.argv[2] in v else "nao")' "$CITY" "$1" "${2:-newfail.json}"; }   # has CHAVE [ARQUIVO] — o estado local tem a chave? (state imprime None para ausente e para null)
+
+g_eq() {
+  local tpl x
+  hqcity; mkeq 0 1 2 3 4 5; decl a.selftest.sh "# EQUIVALENT $(idn 0) $(idn 2): $RZ"; decl b.selftest.sh "# EQUIVALENT $(idn 3): o guarda já falha no mesmo rc da linha de baixo"; nh
+  check "newfail[eq]: id declarado no selftest da família SAI da lista: UMA bead só com os 3 pendentes (1, 4, 5), a conta dos 3 declarados, e rodada 1 e n 3 no estado" \
+    "0 1 3 0 1 1 3" "$RC $(calls create bd.calls) $(ib "$(idn 1)|$(idn 4)|$(idn 5)") $(ib "$(idn 0)|$(idn 2)|$(idn 3)") $(tb 'Fora desta lista: 3 equivalente(s) declarado(s)') $(state round newfail-hq-mutants.json) $(state n newfail-hq-mutants.json)"
+  hqcity; mkeq 0 1 2 3 4 5; seedr 1; decl a.selftest.sh "# EQUIVALENT $(idn 0) $(idn 2): $RZ"; decl b.selftest.sh "# EQUIVALENT $(idn 3): o guarda já falha no mesmo rc da linha de baixo"; nh
+  check "newfail[eq]: a bead nova da rodada 2 traz de volta o declarado de id com resto 2 (o 2), com a razão e o lugar da declaração; o 0 e o 3 seguem fora; título com os 4, rodada 2 e n 4 no estado" \
+    "1 1 3 0 1 1 2 4" "$(tb 'REVALIDAR (amostra da rodada 2: 1 de 3 equivalentes declarados') $(tb "declarado em scripts/a.selftest.sh:1: $RZ") $(ib "$(idn 1)|$(idn 4)|$(idn 5)") $(ib "$(idn 0)|$(idn 3)") $(tb 'Fora desta lista: 2 equivalente(s) declarado(s)') $(calls '^-C /hq create hq-mutants do lastro: 4 mutante' bd.calls) $(state round newfail-hq-mutants.json) $(state n newfail-hq-mutants.json)"
+  check "newfail[eq]: o cabeçalho conta os 3 pendentes (não as 4 linhas da bead), a seção diz o resto da rodada, e REVALIDAR vem DEPOIS dos pendentes e ANTES da linha do declarado" "1 1 ordem-ok" \
+    "$(tb 'item hq-mutants): 3 troca(s)') $(tb 'resto 2 na divisão por 10') $(awk '/^REVALIDAR/ {r = NR} /id=000000000[145]/ {p = NR} /id=0000000002/ {s = NR} END {print (p && r && s && p < r && r < s) ? "ordem-ok" : "ordem-errada"}' "$W/bd.stdin.1")"
+  hqcity; mkeq 0 2 4; seedr 3; decl a.selftest.sh "# EQUIVALENT $(idn 0) $(idn 2) $(idn 4): $RZ"; nh
+  check "newfail[eq]: tudo declarado e NENHUM pendente: a amostra sozinha não abre bead (nenhuma chamada ao bd) e o log diz quantos estão declarados" "0 0 1" "$RC $(wc -l < "$W/bd.calls" | tr -d ' ') $(printf '%s' "$OUT" | grep -c '3 equivalente(s) declarado(s)')"
+  hqcity; mkeq 0 2 4 6; seedr 3; decl a.selftest.sh "# EQUIVALENT $(idn 0) $(idn 2) $(idn 4): $RZ"; nh
+  check "newfail[eq]: com UM pendente (o 6) a bead nasce na rodada 4 e a amostra vai junto: o declarado de resto 4 (o 4), e só ele (2 linhas de id)" "0 1 2 1 1" "$RC $(calls create bd.calls) $(ib '[0-9a-f]{10}') $(ib "$(idn 6)") $(ib "$(idn 4)")"
+  hqcity; mkeq $(seq 0 30); decl_all $(seq 0 29); nh
+  check "newfail[eq]: 30 declarados e UM pendente (o 30) → a amostra da rodada 1 são os 3 de resto 1 (1, 11, 21): UMA bead com 4 linhas de id (3 da amostra + o pendente), e a conta diz 27 declarados fora" "0 1 4 3 1 1 1" "$RC $(calls create bd.calls) $(ib '[0-9a-f]{10}') $(ib "$(idn 1)|$(idn 11)|$(idn 21)") $(ib "$(idn 30)") $(tb 'Fora desta lista: 27 equivalente(s) declarado(s)') $(tb 'amostra da rodada 1: 3 de 30 equivalentes declarados')"
+  hqcity; mkeq 1 2; seedr 0; decl b.selftest.sh "# EQUIVALENT $(idn 1): $("$PY" -I -c 'print("x" * 300)')"; nh
+  check "newfail[eq]: a razão que volta na amostra vem cortada em 200 caracteres (uma razão de 300 não vira um despejo)" "200" "$(grep 'declarado em' "$W/bd.stdin.1" | tr -cd x | wc -c | tr -d ' ')"
+
+  # a razão tem de ter 12 caracteres ou mais; a declaração que NÃO vale é dita (se o id é um sobrevivente de hoje) e o sobrevivente fica na lista
+  hqcity; mkeq 0 2; decl a.selftest.sh "# EQUIVALENT $(idn 0): 12345678901" "# EQUIVALENT $(idn 2): 123456789012" "# EQUIVALENT $(idn 8): 1"; nh
+  check "newfail[eq]: razão de 11 caracteres NÃO declara (o 0 fica na lista) e a de 12 declara (o 2 sai); a linha 'NÃO valeram' nomeia o 0, e o 8, que nem é sobrevivente, não aparece" \
+    "1 0 1 1 0 1" "$(ib "$(idn 0)") $(ib "$(idn 2)") $(tb 'NÃO valeram') $(tb "NÃO valeram.*$(idn 0)") $(tb "$(idn 8)") $(grep 'NÃO valeram' "$W/bd.stdin.1" | grep -o ' em scripts/a.selftest.sh:' | wc -l | tr -d ' ')"
+
+  # a gramática é ESTRITA: nota solta em prosa (a que os selftests de hoje têm) não declara nada; só a linha no formato
+  for tpl in '# EQUIVALENT, documented: %s (o status não é lido por ninguém)' '# EQUIVALENTE %s: o status não é lido por ninguém' '# EQUIVALENTES %s: o status não é lido por ninguém' '# equivalent %s: o status não é lido por ninguém' \
+             '# NOT EQUIVALENT %s: o status não é lido por ninguém' 'echo "# EQUIVALENT %s: o status não é lido por ninguém"' 'true # EQUIVALENT %s: o status não é lido por ninguém' '## EQUIVALENT %s: o status não é lido por ninguém' \
+             '# EQUIVALENT %s o status não é lido por ninguém' '# EQUIVALENT: %s o status não é lido por ninguém' '# EQUIVALENT (%s): o status não é lido por ninguém' '# EQUIVALENT 0%s: o status não é lido por ninguém' \
+             '# EQUIVALENT %s:' '# EQUIVALENT %s:        ' '# EQUIVALENT %s: curta'; do
+    hqcity; mkeq 7; decl b.selftest.sh "$(printf -- "$tpl" "$(idn 7)")"; nh
+    check "newfail[eq]: [$tpl] NÃO é declaração → o sobrevivente fica na lista (1 create)" "1" "$(calls create bd.calls)"
+  done
+  for tpl in '# EQUIVALENT %s: o status não é lido por ninguém' '#EQUIVALENT %s: o status não é lido por ninguém' '    # EQUIVALENT %s: o status não é lido por ninguém' $'\t#\tEQUIVALENT\t%s:\to status não é lido por ninguém' \
+             '# EQUIVALENT 0000000001,%s: o status não é lido por ninguém' '# EQUIVALENT 0000000001 %s: o status não é lido por ninguém' '# EQUIVALENT %s: razão: com dois-pontos: dentro' '# EQUIVALENT %s   :   o status não é lido por ninguém'; do
+    hqcity; mkeq 7; decl b.selftest.sh "$(printf -- "$tpl" "$(idn 7)")"; nh
+    check "newfail[eq]: [$tpl] É declaração → o sobrevivente sai da lista (nenhum create, rc 0)" "0 0" "$RC $(calls create bd.calls)"
+  done
+  hqcity; mkeq 10; decl a.selftest.sh "# EQUIVALENT 000000000A: o status não é lido por ninguém"; nh
+  check "newfail[eq]: id em MAIÚSCULAS (000000000A) não é o id do motor (000000000a) → não declara" "1" "$(calls create bd.calls)"
+  hqcity; mkeq 10; decl a.selftest.sh "# EQUIVALENT 000000000a: o status não é lido por ninguém"; nh
+  check "newfail[eq]: o mesmo id em minúsculas declara" "0" "$(calls create bd.calls)"
+
+  # leitura que falha NÃO declara nada: o sobrevivente fica na lista e a bead diz que não leu
+  hqcity; mkeq 2 3; nh
+  check "newfail[eq]: os selftests da família não existem na árvore → nada declarado, os 2 sobreviventes na lista e a linha 'não consegui ler 2 de 2 selftest(s)'" "1 2 1" "$(calls create bd.calls) $(ib "$(idn 2)|$(idn 3)") $(tb 'REGISTRO: não consegui ler 2 de 2 selftest(s) da família')"
+  hqcity; mkeq 2 3; decl a.selftest.sh "# nenhuma declaração aqui"; nh
+  check "newfail[eq]: um selftest lido (o do 2) e outro ausente (o do 3) → 'não consegui ler 1 de 2' e o nome do ausente (o total é dos selftests da família, não só dos ilegíveis)" "1 2 1" "$(calls create bd.calls) $(ib "$(idn 2)|$(idn 3)") $(tb 'REGISTRO: não consegui ler 1 de 2 selftest(s) da família (scripts/b.selftest.sh)')"
+  hqcity; mkeq --self ../outside.selftest.sh 3; printf '# EQUIVALENT %s: %s\n' "$(idn 3)" "$RZ" > "$T/outside.selftest.sh"; nh
+  check "newfail[eq]: selftest FORA da árvore (../outside.selftest.sh) não vale, nem com a declaração certa → o sobrevivente fica e a bead diz que não leu" "1 1 1" "$(calls create bd.calls) $(ib "$(idn 3)") $(tb 'REGISTRO: não consegui ler 1 de 1')"
+  hqcity; mkeq --self "$T/outside.selftest.sh" 3; nh
+  check "newfail[eq]: caminho ABSOLUTO no estado do motor não vale (o motor grava relativo à árvore)" "1 1" "$(calls create bd.calls) $(ib "$(idn 3)")"
+  hqcity; mkeq 3; mkdir -p "$CITY/scripts"; ln -s "$T/outside.selftest.sh" "$CITY/scripts/b.selftest.sh"; nh
+  check "newfail[eq]: selftest que é symlink para FORA da árvore não vale" "1 1" "$(calls create bd.calls) $(ib "$(idn 3)")"
+  hqcity; mkeq 3; mkdir -p "$CITY/scripts/b.selftest.sh"; nh
+  check "newfail[eq]: selftest que é uma PASTA (não abre) não declara nada → o sobrevivente fica, sem traceback" "0 1 1 0" "$RC $(calls create bd.calls) $(ib "$(idn 3)") $(printf '%s' "$OUT" | grep -c Traceback)"
+  if [ "$(id -u)" != 0 ]; then
+    hqcity; mkeq 3; mkdir -p "$CITY/scripts"; printf '# EQUIVALENT %s: %s\n' "$(idn 3)" "$RZ" > "$CITY/scripts/b.selftest.sh"; chmod 000 "$CITY/scripts/b.selftest.sh"; nh; chmod 644 "$CITY/scripts/b.selftest.sh"
+    check "newfail[eq]: selftest com modo 000 (PermissionError) não declara nada → o sobrevivente fica, a bead diz que não leu, sem traceback" "0 1 1 1 0" "$RC $(calls create bd.calls) $(ib "$(idn 3)") $(tb 'REGISTRO: não consegui ler 1 de 1') $(printf '%s' "$OUT" | grep -c Traceback)"
+  fi
+  hqcity; mkeq 3; mkdir -p "$CITY/scripts"; "$PY" -I -c 'import sys
+with open(sys.argv[1], "wb") as f:
+    f.write(("# EQUIVALENT %s: %s\n" % (sys.argv[2], sys.argv[3])).encode()); f.truncate(int(sys.argv[4]))' "$CITY/scripts/b.selftest.sh" "$(idn 3)" "$RZ" 4194305; nh
+  check "newfail[eq]: selftest de 4 MiB + 1 byte é grande demais → não vale (o sobrevivente fica e a bead diz que não leu)" "1 1 1" "$(calls create bd.calls) $(ib "$(idn 3)") $(tb 'REGISTRO: não consegui ler 1 de 1')"
+  "$PY" -I -c 'import sys
+with open(sys.argv[1], "wb") as f:
+    f.write(("# EQUIVALENT %s: %s\n" % (sys.argv[2], sys.argv[3])).encode()); f.truncate(int(sys.argv[4]))' "$CITY/scripts/b.selftest.sh" "$(idn 3)" "$RZ" 4194304; : > "$W/bd.calls"; nh
+  check "newfail[eq]: o mesmo selftest com EXATOS 4 MiB cabe e a declaração vale (o 3 sai: o comentário 'Nada pede ação' é a prova, e não há create)" "1 0" "$(calls 'comment wa-new1 --stdin' bd.calls) $(calls create bd.calls)"
+  hqcity; mkeq --noself 3; nh
+  check "newfail[eq]: sobrevivente sem a chave selftest (sem família) fica na lista e não gera aviso de leitura" "1 1 0" "$(calls create bd.calls) $(ib "$(idn 3)") $(tb 'REGISTRO:')"
+  hqcity; mkeq 3; decl other.selftest.sh "# EQUIVALENT $(idn 3): $RZ"; nh
+  check "newfail[eq]: a declaração só vale no selftest DA FAMÍLIA do sobrevivente (o testes: do estado): em outro selftest não declara" "1 1" "$(calls create bd.calls) $(ib "$(idn 3)")"
+  hqcity; mkeq 2 3; decl a.selftest.sh "# EQUIVALENT $(idn 3): $RZ"; decl b.selftest.sh "# nenhuma declaração aqui"; nh
+  check "newfail[eq]: o 3 declarado no selftest da família do 2 (um arquivo que a volta LÊ, por causa do 2) NÃO vale: o 3 só vale no b.selftest.sh dele" "1 1" "$(calls create bd.calls) $(ib "$(idn 3)")"
+  hqcity; mkeq --self "$CITY/scripts/b.selftest.sh" 3; decl b.selftest.sh "# EQUIVALENT $(idn 3): $RZ"; nh
+  check "newfail[eq]: caminho ABSOLUTO no estado do motor não vale nem quando aponta para DENTRO da árvore (o motor grava relativo)" "1 1" "$(calls create bd.calls) $(ib "$(idn 3)")"
+  hqcity; mkdir -p "${CITY}x/scripts"; printf '# EQUIVALENT %s: %s\n' "$(idn 3)" "$RZ" > "${CITY}x/scripts/b.selftest.sh"; mkeq --self "../$(basename "$CITY")x/scripts/b.selftest.sh" 3; nh
+  check "newfail[eq]: pasta IRMÃ que só começa com o nome da árvore (cidade1x ao lado de cidade1) está fora dela: a declaração não vale" "1 1" "$(calls create bd.calls) $(ib "$(idn 3)")"
+  hqcity; mkeq 3; mkdir -p "$CITY/scripts"; printf 'caf\351 fora do UTF-8\n# EQUIVALENT %s: %s\n' "$(idn 3)" "$RZ" > "$CITY/scripts/b.selftest.sh"; nh
+  check "newfail[eq]: selftest com um byte fora do UTF-8 é lido (o byte vira '?'), a declaração vale e não há traceback" "0 0 0" "$RC $(calls create bd.calls) $(printf '%s' "$OUT" | grep -c Traceback)"
+  hqcity; mkeq 1 4 5; nh; decl b.selftest.sh "# EQUIVALENT $(idn 1): $RZ"; nh
+  check "newfail[eq]: o 1 passa de pendente a declarado e cai na amostra da rodada 1: o CONJUNTO de ids da bead é o mesmo (1, 4, 5) e só a marca muda, mesmo assim há comentário novo (REVALIDAR) na MESMA bead (1 create só)" "1 1 1" "$(calls 'comment wa-new1 --stdin' bd.calls) $(tb 'REVALIDAR (amostra da rodada 1' 3) $(calls create bd.calls)"
+  hqcity; mkeq 3; decl b.selftest.sh "# EQUIVALENT $(idn 3): $RZ" "# EQUIVALENT $(idn 3): outra razão qualquer para o mesmo id"; nh
+  check "newfail[eq]: o mesmo id declarado duas vezes é UM declarado (a conta não dobra)" "0 0 1" "$RC $(calls create bd.calls) $(printf '%s' "$OUT" | grep -c '1 equivalente(s) declarado(s)')"
+
+  # a bead que já existe: mesma lista = nada; declaração nova = comentário na MESMA bead (a rodada não anda); bead fechada + sobrevivente novo = bead nova (a rodada anda)
+  hqcity; mkeq 0 1 2 3 4 5; decl a.selftest.sh "# EQUIVALENT $(idn 0) $(idn 2): $RZ"; nh; : > "$W/bd.calls"; nh
+  check "newfail[eq]: a MESMA lista de novo → nada a fazer (nenhuma chamada nova ao bd)" "0 1 0" "$RC $(printf '%s' "$OUT" | grep -c 'nada a fazer') $(wc -l < "$W/bd.calls" | tr -d ' ')"
+  decl b.selftest.sh "# EQUIVALENT $(idn 3): $RZ"; nh
+  check "newfail[eq]: declaração NOVA (o 3) com a bead aberta → comentário na MESMA bead (nenhum create) sem o 3 e com os pendentes 1, 4, 5, rodada 1 e n 3 no estado" "0 1 0 0 3 1 3" "$RC $(calls 'comment wa-new1 --stdin' bd.calls) $(calls create bd.calls) $(ib "$(idn 3)" 3) $(ib "$(idn 1)|$(idn 4)|$(idn 5)" 3) $(state round newfail-hq-mutants.json) $(state n newfail-hq-mutants.json)"
+  : > "$W/bd.calls"; nh
+  check "newfail[eq]: a lista que acabou de ser comentada, de novo → nada" "0" "$(wc -l < "$W/bd.calls" | tr -d ' ')"
+  echo closed > "$W/bd.status"; mkeq 0 1 2 3 4 5 6; nh
+  check "newfail[eq]: bead FECHADA + sobrevivente novo (o 6) → bead NOVA: a rodada anda para 2, e o declarado de resto 2 (o 2) volta nela" "1 1 1 2" "$(calls create bd.calls) $(ib "$(idn 6)" 5) $(ib "$(idn 2)" 5) $(state round newfail-hq-mutants.json)"
+
+  # tudo declarado e nada na amostra: a bead não tem o que pedir; o comentário não afirma que nenhum sobrevive (eles existem, estão declarados)
+  hqcity; mkeq 0 1 2; nh; decl a.selftest.sh "# EQUIVALENT $(idn 0) $(idn 2): $RZ"; decl b.selftest.sh "# EQUIVALENT $(idn 1): $RZ"; nh
+  check "newfail[eq]: todos os sobreviventes viram declarados (o 1 seria a amostra da rodada 1, mas a amostra sozinha não segura bead) → um comentário 'Nada pede ação' (não fecha), n a 0, a rodada fica, e NÃO diz 'nenhum sobrevive' nem 'pegos'" \
+    "0 1 1 0 1 1 0 0 0 1" "$RC $(calls 'comment wa-new1 --stdin' bd.calls) $(calls create bd.calls) $(calls close bd.calls) $(tb 'Nada pede ação' 2) $(tb 'os 3 sobrevivente(s) que o estado do motor ainda tem estão todos declarados' 2) $(tb 'nenhum sobrevive' 2) $(tb 'foram pegos' 2) $(state n newfail-hq-mutants.json) $(state round newfail-hq-mutants.json)"
+  nh
+  check "newfail[eq]: o comentário que não pede ação não se repete" "1" "$(calls 'comment wa-new1 --stdin' bd.calls)"
+  hqcity; mkeq 0 1 2; "$PY" -I -c 'import json, sys
+d = json.load(open(sys.argv[1])); d["targets"]["scripts/c.sh"] = {"hash": "h", "skip": "base-vermelha", "retry_after": 9999999999}; print(json.dumps(d))' "$W/node.confirmed" > "$W/node.tmp" && mv "$W/node.tmp" "$W/node.confirmed"
+  nh; decl a.selftest.sh "# EQUIVALENT $(idn 0) $(idn 2): $RZ"; decl b.selftest.sh "# EQUIVALENT $(idn 1): $RZ"; nh
+  check "newfail[eq]: tudo declarado mas há alvo que o motor NÃO julgou por inteiro → o comentário diz 'NÃO prova', nomeia scripts/c.sh (pulado: base-vermelha) e continua sem afirmar 'nenhum sobrevive'" "1 1 1 0" "$(tb 'Nada pede ação' 2) $(tb 'NÃO prova' 2) $(tb 'scripts/c.sh (pulado: base-vermelha)' 2) $(tb 'nenhum sobrevive' 2)"
+  hqcity; mkeq 0 2; decl a.selftest.sh "# EQUIVALENT $(idn 0) $(idn 2): $RZ"; nh
+  check "newfail[eq]: tudo declarado e NENHUMA bead nossa → não abre nada e o log diz quantos estão declarados" "0 0 1" "$RC $(wc -l < "$W/bd.calls" | tr -d ' ') $(printf '%s' "$OUT" | grep -c '2 equivalente(s) declarado(s)')"
+
+  # o estado local: a rodada é um inteiro >= 0; outra coisa = estado de forma errada, rc 3 e nada aberto (avisar de novo sobre uma bead que existe duplicaria)
+  for x in '"x"' '-1' 'true' '1.5' 'null' '[]'; do
+    hqcity; mkeq 1; seedr "$x"; nh
+    check "newfail[eq]: estado local com round $x → rc 3 (forma errada) e nada aberto" "3 0" "$RC $(wc -l < "$W/bd.calls" | tr -d ' ')"
+  done
+
+  # as outras fontes NÃO leem o registro e não ganham a chave round no estado
+  wamcity; "$PY" -I -c 'import json
+print(json.dumps({"v": 1, "targets": {"lib/a.py": {"hash": "h", "total": 1, "verdicts": {"x": "s"}, "survivors": {"0000000001": {"id": "0000000001", "file": "lib/a.py", "line": 5, "op": "cmp", "old": "==", "new": "!=", "selftest": ["scripts/a.selftest.sh"]}}}}}))' > "$W/node.confirmed"
+  decl a.selftest.sh "# EQUIVALENT 0000000001: $RZ"; nw
+  check "newfail[eq]: o wa-mutants NÃO lê o registro: o id declarado continua na lista, sem o aviso de registro, e o estado dele não ganha round" "1 1 0 0 nao" "$(calls create bd.calls) $(ib 0000000001) $(tb 'REGISTRO:') $(tb 'Fora desta lista') $(has round newfail-wa-mutants.json)"
+  newcity; mkconf 2; nf
+  check "newfail[eq]: o wa-suite também não ganha a chave round no estado" "nao" "$(has round newfail.json)"
+}
+
 g_all
 g_hq
+g_eq
 g_wam
 echo "── $((n - fails))/$n ok"
 if [ -n "${HNF_MUTANT:-}" ]; then echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
@@ -448,9 +614,9 @@ a listagem esquece o --limit 0 (trunca em 50 sem avisar)@@    r = run([BD, "-C",
 o prazo do bd ignora HB_BD_TIMEOUT@@        v = float(os.environ.get("HB_BD_TIMEOUT") or 90)@@        v = 90.0
 o texto da falha do create volta a afirmar que nada foi registrado@@Não sei se a bead nasceu no rig do %s;@@Nada foi registrado no rig do %s;
 escrita do estado local que falha vira silêncio (rc 0)@@        die(3, "%s, mas NÃO gravei o estado local (%s): %s" % (done, e, next_round))@@        pass
-a criação não grava o estado (a próxima volta não sabe da bead)@@    save_state_or_die(fp, new, len(items), "abri %s" % new, "a próxima volta lista o rig e comenta nela em vez de abrir outra")@@    pass
-o comentário da lista nova não grava o estado (repete a cada volta)@@        save_state_or_die(fp, bead, len(items), "comentei a lista nova em %s" % bead, "a próxima volta repete o comentário")@@        pass
-o comentário 'corrigidas' não grava o estado (repete a cada volta)@@            save_state_or_die(fp, bead, 0, "comentei em %s que a lista zerou" % bead, "a próxima volta repete o comentário")@@            pass
+a criação não grava o estado (a próxima volta não sabe da bead)@@    save_state_or_die(fp, new, len(items), "abri %s" % new, "a próxima volta lista o rig e comenta nela em vez de abrir outra", rnd)@@    pass
+o comentário da lista nova não grava o estado (repete a cada volta)@@        save_state_or_die(fp, bead, len(items), "comentei a lista nova em %s" % bead, "a próxima volta repete o comentário", rnd)@@        pass
+o comentário 'corrigidas' não grava o estado (repete a cada volta)@@            save_state_or_die(fp, bead, 0, "comentei em %s que a lista zerou" % bead, "a próxima volta repete o comentário", rnd)@@            pass
 lista que zera não comenta@@        if bead and last_n:@@        if False:
 a fonte hq-mutants usa a label do wa-suite@@labels=("origem:lastro-hq-mutants", "area:testes", ROTULO_MUTANTES)@@labels=("origem:lastro-wa-suite", "area:testes", ROTULO_MUTANTES)
 a fonte hq-mutants divide o estado com o wa-suite@@estado="newfail-hq-mutants.json"@@estado="newfail.json"
@@ -463,7 +629,7 @@ alvo SEM hash conta como julgado@@        elif not ent.get("hash"):@@        eli
 alvo sem total (ou verdicts de outro tipo) conta como julgado@@        elif type(total) is not int or not isinstance(ver, dict):@@        elif False:
 mutantes por julgar (total > vereditos) contam como julgados@@        elif len(ver) < total:@@        elif False:
 estado novo (targets {}) vira lista vazia limpa ('nenhum sobrevive')@@    out = [] if targets else [("estado", "sem nenhum alvo: o motor ainda não varreu nada")]@@    out = []
-o comentário que zera esquece a avaliação dos alvos@@inp=F["zerou"](*aval), timeout=60)@@inp=F["zerou"](0, []), timeout=60)
+o comentário que zera esquece a avaliação dos alvos@@inp=F["zerou"](*aval, **({"decl": reg["decl_n"]} if reg else {})), timeout=60)@@inp=F["zerou"](0, [], **({"decl": reg["decl_n"]} if reg else {})), timeout=60)
 o comentário que zera do hq-mutants ignora os alvos não reavaliados@@    if nao:@@    if False:
 a fonte hq-mutants usa a avaliação do wa-suite (nada a declarar)@@avalia=avalia_hq, zerou=zerou_hq@@avalia=avalia_wa, zerou=zerou_hq
 sobrevivente com a linha booleana passa@@type(r.get("line")) is int and @@isinstance(r.get("line"), int) and 
@@ -541,6 +707,58 @@ a lista que zera com todos julgados esquece o aviso do que nunca entra no estado
 a lista que zera com alvo não julgado esquece o aviso do que nunca entra no estado@@nem por isso foi pego. %s Confira@@nem por isso foi pego. %.0s Confira
 o aviso do que nunca entra no estado deixa de dizer que o arquivo NUNCA entra@@ele NUNCA entra no estado do motor@@ele entra no estado do motor
 a conta de bytes do corpo do wa-mutants volta ao encode estrito (traceback com nome fora do UTF-8)@@        used += len(txt.encode("utf-8", "replace")) + 1@@        used += len(txt.encode("utf-8")) + 1
+a gramática dispensa os dois-pontos@@(?:[ \t,]+%s)*)[ \t]*:(.*)$" % (EQ_ID, EQ_ID))@@(?:[ \t,]+%s)*)[ \t]*:?(.*)$" % (EQ_ID, EQ_ID))
+a gramática aceita a palavra em minúsculas e o hex em maiúsculas@@EQ_RX = re.compile(r"^[ \t]*#@@EQ_RX = re.compile(r"(?i)^[ \t]*#
+a gramática aceita comentário no fim de uma linha de código@@EQ_RX = re.compile(r"^[ \t]*#@@EQ_RX = re.compile(r"^.*#
+a gramática aceita ## no começo@@#[ \t]*EQUIVALENT[ \t]+(%s@@#+[ \t]*EQUIVALENT[ \t]+(%s
+a gramática aceita EQUIVALENTE e EQUIVALENTES@@EQUIVALENT[ \t]+(%s@@EQUIVALENT\w*[ \t]+(%s
+a razão mínima cai para 11@@EQ_RAZAO_MIN = 12@@EQ_RAZAO_MIN = 11
+a razão mínima sobe para 13@@EQ_RAZAO_MIN = 12@@EQ_RAZAO_MIN = 13
+a razão não é aparada (os espaços da ponta contam)@@        razao = m.group(2).strip()@@        razao = m.group(2)
+só o primeiro id da linha é declarado@@        for sid in re.split(r"[ \t,]+", m.group(1)):@@        for sid in re.split(r"[ \t,]+", m.group(1))[:1]:
+a declaração vale em qualquer selftest lido (não só o da família)@@for rel in r.get("selftest", []) if sid in lido[rel][0]), None)@@for rel in lido if sid in lido[rel][0]), None)
+selftest fora da árvore vale@@    if os.path.isabs(rel) or not path.startswith(root + os.sep):@@    if False:
+caminho absoluto vale@@    if os.path.isabs(rel) or not path.startswith(root + os.sep):@@    if not path.startswith(root + os.sep):
+caminho que sai da árvore (.. ou symlink) vale@@    if os.path.isabs(rel) or not path.startswith(root + os.sep):@@    if os.path.isabs(rel):
+a árvore casa por prefixo de texto (a pasta irmã de mesmo começo)@@not path.startswith(root + os.sep):@@not path.startswith(root):
+symlink que sai da árvore vale (sem realpath)@@    path = os.path.realpath(os.path.join(root, rel))@@    path = os.path.abspath(os.path.join(root, rel))
+arquivo que não abre derruba a volta@@        return {}, [], type(e).__name__@@        raise
+selftest de 4 MiB + 1 é lido@@    if len(raw) > EQ_MAX_BYTES:@@    if len(raw) > EQ_MAX_BYTES * 2:
+selftest de EXATOS 4 MiB é recusado@@    if len(raw) > EQ_MAX_BYTES:@@    if len(raw) >= EQ_MAX_BYTES:
+o selftest é decodificado em modo estrito (byte fora do UTF-8 derruba)@@raw.decode("utf-8", "replace").split("\n")@@raw.decode("utf-8").split("\n")
+a amostra usa o resto da rodada seguinte@@int(sid, 16) % EQ_AMOSTRA == rnd % EQ_AMOSTRA@@int(sid, 16) % EQ_AMOSTRA == (rnd + 1) % EQ_AMOSTRA
+a amostra é 1 em cada 9@@EQ_AMOSTRA = 10@@EQ_AMOSTRA = 9
+a amostra é 1 em cada 5@@EQ_AMOSTRA = 10@@EQ_AMOSTRA = 5
+a amostra existe sem pendente (abre bead sozinha)@@if pend and int(sid, 16)@@if int(sid, 16)
+a rodada não anda quando nasce bead nova@@        rnd += 1@@        rnd += 0
+a rodada anda também quando só se comenta@@"comentei a lista nova em %s" % bead, "a próxima volta repete o comentário", rnd)@@"comentei a lista nova em %s" % bead, "a próxima volta repete o comentário", rnd + 1)
+a bead nova grava a impressão digital da rodada velha@@        fp = fingerprint(items, tags)@@        pass
+o estado não guarda a rodada@@    if rnd is not None:@@    if False:
+toda fonte guarda a rodada no estado (null no wa-suite)@@    if rnd is not None:@@    if True:
+a rodada do estado local pode ser qualquer coisa@@    if "round" in v and not (type(v["round"]) is int and v["round"] >= 0):@@    if False:
+a rodada do estado local aceita booleano@@type(v["round"]) is int@@isinstance(v["round"], int)
+a rodada do estado local aceita negativo@@type(v["round"]) is int and v["round"] >= 0@@type(v["round"]) is int
+a rodada null do estado local vira rodada 0@@    if "round" in v and not (@@    if v.get("round") is not None and not (
+a impressão digital ignora a marca (pendente x amostra)@@ + ([tags[k]] if tags else []) for k, v in items.items()@@ for k, v in items.items()
+o hq-mutants não lê o registro@@zerou=zerou_hq, registro=True)@@zerou=zerou_hq)
+o wa-mutants também lê o registro@@zerou=zerou_wam, gap_s=WAM_GAP_S)@@zerou=zerou_wam, gap_s=WAM_GAP_S, registro=True)
+o comentário que zera não passa a conta dos declarados@@inp=F["zerou"](*aval, **({"decl": reg["decl_n"]} if reg else {})), timeout=60)@@inp=F["zerou"](*aval), timeout=60)
+o comentário que zera com declarados volta ao texto de lista vazia@@    if decl:@@    if False:
+o comentário 'nada pede ação' esquece o alvo não julgado@@if nao else "Quem tratou a lista fecha esta bead."@@if False else "Quem tratou a lista fecha esta bead."
+sem bead e com tudo declarado o log fica mudo@@        elif reg and reg["decl_n"]:@@        elif False:
+a conta de fora não desconta a amostra@@% (reg["decl_n"] - len(amostra)))@@% reg["decl_n"])
+a conta de fora some quando há declarados@@    if reg["decl_n"]:@@    if False:
+a razão da amostra não é cortada@@razao[sid][2][:EQ_RAZAO_VISTA])@@razao[sid][2])
+a razão da amostra é cortada em 100@@EQ_RAZAO_VISTA = 200@@EQ_RAZAO_VISTA = 100
+a amostra não leva a razão@@        out.extend(_grupos_hq(amostra, reg["razao"]))@@        out.extend(_grupos_hq(amostra))
+os pendentes não entram no texto@@    out.extend(_grupos_hq(pend))@@    pass
+o aviso de selftest ilegível some@@    if reg["ilegiveis"]:@@    if False:
+o aviso de selftest ilegível erra o total@@(len(reg["ilegiveis"]), reg["total_arq"],@@(len(reg["ilegiveis"]), len(reg["ilegiveis"]),
+as declarações recusadas não são ditas@@    if reg["recusadas"]:@@    if False:
+as recusadas listam as declarações curtas de outros ids@@for s2, n in lido[rel][1] if s2 == sid]@@for s2, n in lido[rel][1]]
+o cabeçalho conta a amostra como pendente@@e que pedem ação." % len(pend), "",@@e que pedem ação." % len(items), "",
+o cabeçalho esquece o resto da rodada@@reg["rnd"] % EQ_AMOSTRA, EQ_AMOSTRA), ""]@@0, EQ_AMOSTRA), ""]
+a seção da amostra diz a rodada errada@@% (reg["rnd"], len(amostra), reg["decl_n"],@@% (reg["rnd"] + 1, len(amostra), reg["decl_n"],
 MUT
   "$PY" -I - "$NF" "$T/mutants.txt" "$T" > "$T/mutants.idx" <<'PYEOF'
 import re, sys

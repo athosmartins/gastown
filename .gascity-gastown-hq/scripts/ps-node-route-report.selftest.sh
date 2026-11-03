@@ -11,6 +11,7 @@
 #   substituição de comando, que ninguém lê (o relatório roda sem `set -e`), e a saída do grep -c é a mesma nos dois: nenhuma bateria distingue um do outro. O mesmo vale para a linha do contador (`$LOST`).
 # COMO RODAR: bash scripts/ps-node-route-report.selftest.sh   (macOS /bin/bash 3.2 e Linux; precisa de jq e python3)
 #   REPORT_UNDER_TEST=<cópia do relatório> roda a bateria contra a cópia, sem mutantes, e para no 1º FAIL (é como o controle negativo chama a si mesmo).
+# EQUIVALENT ef6be6b454: `warn_n=$(grep -cF ... || true)` com `||` -> `&&`: so muda o status da substituicao de comando, que ninguem le (o relatorio roda sem `set -e`), e a saida do grep -c e a mesma
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPORT="${REPORT_UNDER_TEST:-$HERE/ps-node-route-report.sh}"

@@ -13,6 +13,9 @@
 # symlink" test there only picks WHICH rc 1 path a symlink or a file takes, because rmdir refuses both (rc 1, nothing removed, nothing logged, with or without the test).
 # ga-59jrj3d, the ids the sweep keeps listing for the three notes above: the pwd -P check of _eph_release_target (65b6c22ae3 `1 -> 0`, b2a4c3b098 no `|| return 1`) and of _eph_drop_empty_staging (60cfd44e9f, 4f8c1198ad); the db-name case of
 # _eph_drop_empty_staging (545ec062a7 `1 -> 0`: _eph_is_ephemeral opens with the very same case); its "real directory, not a symlink" test (578f525654 `&&` -> `||`, d54b0fee13 no `|| return 1`).
+# EQUIVALENT 65b6c22ae3 b2a4c3b098 60cfd44e9f 4f8c1198ad: the `pwd -P` equality of the root and dirname(<root>/<db>) cannot fail for a db the case above it already accepted (the dirname of <root>/<db> is <root>)
+# EQUIVALENT 545ec062a7: the db-name case of _eph_drop_empty_staging repeats what _eph_is_ephemeral has just refused
+# EQUIVALENT 578f525654 d54b0fee13: the "real directory, not a symlink" test only picks WHICH rc 1 path a symlink or a file takes, because rmdir refuses both
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

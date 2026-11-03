@@ -29,6 +29,7 @@
 # and no case here fails on it, by design.
 #
 # Exit 0 iff every assertion holds.
+# EQUIVALENT 780bf08a58: the `|| return 1` of gc_delivery_branch_pick: gc_delivery_branch_globs has its own empty-id guard that returns 1 first (same rc, same empty output, same stdin left unread)
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

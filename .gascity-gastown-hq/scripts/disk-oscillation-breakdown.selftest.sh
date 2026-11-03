@@ -61,6 +61,7 @@ check_summary "used=1K still gets its percentage" 1 0 0 "gap=1K(100%)"
 # EQUIVALENT (ga-ow127o6; c7272bdedb `-lt 0` -> `-le 0` and be4a291165 `-lt 0` -> `-lt 1`, both on the gap clamp):
 # the clamp only has to turn a NEGATIVE gap into 0, and a gap that is already 0 stays 0 whichever way the
 # boundary is written, so `-lt 0`, `-le 0` and `-lt 1` assign 0 to exactly the same inputs: no input separates them.
+# EQUIVALENT be4a291165 c7272bdedb: the gap clamp only has to turn a NEGATIVE gap into 0: `-lt 0`, `-le 0` and `-lt 1` assign 0 to exactly the same inputs
 
 # blocked_dirs propagates through untouched
 check_summary "blocked_dirs count passes through" 500 100 7 "blocked_dirs=7"

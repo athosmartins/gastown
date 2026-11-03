@@ -194,6 +194,10 @@ bash -n "$0" && ok || bad "selftest does not parse"
 # L376 `SystemExit(2)` -> `SystemExit(3)` (e9d82eb6c4: the handler only reads `code == 0`, any other code ends in the same usage exit 64),
 # L152 `text=True` -> `text=False` (b10f971495: json.loads takes the bytes as well as the text, and `bd comments --json` prints UTF-8; only a
 # stdout holding an ENCODED lone surrogate would differ, which strict text mode rejects and bytes mode takes, and bd never prints one).
+# EQUIVALENT 05edbcba6f: `(x[0], x[1])` -> `(x[0], x[0])`: `out` is appended in index order and sort() is stable, so a tie keeps it anyway
+# EQUIVALENT 5a55c724af 7cf7c435c3: `j >= 0` -> `j > 0` and `j >= 1`: j is -1 or the position of a heading that starts AFTER i >= 0, so never 0
+# EQUIVALENT e9d82eb6c4: `SystemExit(2)` -> `SystemExit(3)`: the handler only reads `code == 0`, any other code ends in the same usage exit 64
+# EQUIVALENT b10f971495: `text=True` -> `text=False`: json.loads takes the bytes as well as the text, and `bd comments --json` prints UTF-8
 PYT='
 import contextlib, datetime, importlib.util, io, json, os, re, sys, time, types
 sys.dont_write_bytecode = True

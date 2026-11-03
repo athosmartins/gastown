@@ -38,6 +38,7 @@
 # the removals = rc 1 "UNVERIFIED" (never "verified clear"). Sections 2-9 only looked at "non-zero" or at the message text, so an `exit 1` -> `exit 0` went unseen.
 # EQUIVALENT (dd375a676b, L113 `… | sed 's/ *$//' || true` with `||` -> `&&`): _one_line is only ever called inside a `$( )` (errexit is off there) and when the pipeline
 #   fails it is because grep -v printed nothing, so `out` is empty either way and "no output" is printed either way; the only thing that changes is an rc nobody reads.
+# EQUIVALENT dd375a676b: `... | sed 's/ *$//' || true` with `||` -> `&&`: _one_line is only ever called inside a `$( )` (errexit is off there) and when the pipeline fails `out` is empty either way, and "no output" is printed either way
 
 set -euo pipefail
 

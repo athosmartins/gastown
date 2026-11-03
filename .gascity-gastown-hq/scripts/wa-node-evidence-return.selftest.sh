@@ -17,6 +17,8 @@
 #   morre com UnicodeDecodeError (medido: rc 1 com traceback, o `except (OSError, SubprocessError)` não o pega) enquanto o mutante diz "bd show: JSON ilegível" e segue: matar o mutante exigiria fixar um travamento como esperado, ou consertar o script; fica vivo e a falha vai no relato da entrega.
 # CONTROLE NEGATIVO: cada mutante troca UMA linha do relatório numa cópia e o caso designado tem de reprovar.
 # COMO RODAR: bash scripts/wa-node-evidence-return.selftest.sh   (macOS /bin/bash 3.2 e Linux; ~20 s no nó)
+# EQUIVALENT c97a912d1c 67d20c12a9: `nao_conf.get(bead, 0) + 1` com `+ 1` -> `+ 0` e `0` -> `1`: so as CHAVES de nao_conf sao lidas (sorted, len), nunca o valor
+# EQUIVALENT 00f4307bab: `1 <= int(a.hours) <= 99999` com `99999` -> `100000`: o `re.fullmatch("[0-9]{1,5}")` da mesma linha ja impede um 6o digito
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REP="$HERE/wa-node-evidence-return.py"

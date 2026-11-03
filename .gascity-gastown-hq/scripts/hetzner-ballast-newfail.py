@@ -2,7 +2,7 @@
 """hetzner-ballast-newfail.py — dá DONO ao que um item do lastro confirma: as regressões do wa-suite (ga-r4lw72, a fonte padrão) e os mutantes que sobrevivem ao hq-mutants (ga-2hd02v.5.6.4, `--fonte hq-mutants`) e ao wa-mutants (ga-tmfmvxi, `--fonte wa-mutants`). Roda no MINI (gc order, a cada 30 min). Python 3.9+, só biblioteca padrão.
 
 Contents
-  Para que serve · Fontes · O que lê · O que faz · Três estados · Estado local · Ambiente
+  Para que serve · Fontes · O que lê · O que faz · Registro de equivalentes · Três estados · Estado local · Ambiente
 
 PARA QUE SERVE
   O item wa-suite do lastro (no nó) compara cada rodada completa da suíte inteira do WA com a anterior, e o `new_fail` do resumo ninguém lia (24/10: 237 numa rodada, ruído até separar o tropeço da regressão).
@@ -21,12 +21,19 @@ O QUE FAZ
   segue aberta, a atualiza por comentário com a lista inteira. Bead que o dono fechou e uma lista DIFERENTE depois → abre outra (a MESMA lista com a bead fechada não reabre nada). Lista que zera → um comentário (não fecha: quem corrigiu fecha): wa-suite diz "corrigidas"; hq-mutants só diz o que o estado prova (alvos todos julgados por inteiro) ou, havendo alvo não reavaliado, que vazia NÃO prova que foram pegos. Mesma lista = nada.
   ANTES de abrir, sempre lista o rig (`bd list -l origem:lastro-wa-suite`): se já existe uma nossa não fechada (a criação anterior pode ter nascido sem eu saber), comenta nela em vez de abrir outra.
   Sem a bandeira do nó (.gc/hetzner-node.on) não faz nada, como as outras orders do nó.
+REGISTRO DE EQUIVALENTES (só `--fonte hq-mutants`, ga-eszw2df)
+  Cada rodada gastava um agente inteiro re-triando ~98% de sobreviventes que o selftest JÁ julgou equivalentes (a troca não muda o comportamento). Agora o selftest da FAMÍLIA do sobrevivente (a lista `selftest` do registro do motor, lida na árvore da cidade) declara a equivalência com UMA linha:
+    # EQUIVALENT <id> [<id>…]: <razão>      (a palavra em maiúsculas e em inglês, `#` como 1º caractere não branco, ids de 10 hex minúsculos separados por espaço ou vírgula, dois-pontos, razão de 12 caracteres ou mais)
+  Nota solta em prosa (EQUIVALENTE, "EQUIVALENT, documented:", id no meio da frase) NÃO declara nada, de propósito: o mesmo bloco de notas já trouxe ids que ele próprio dizia NÃO serem equivalentes. O id declarado sai da bead e entra na conta «Fora desta lista: N equivalente(s) declarado(s)».
+  Contra o silêncio permanente: (1) o id leva a LINHA do código (sha1 de arquivo:linha:operador:antes>depois:ocorrência), então a declaração envelhece sozinha quando a linha anda e o sobrevivente reaparece; (2) 1 em cada 10 declarados (o id em hex, resto por 10, igual ao resto da RODADA) volta à bead com a razão e o lugar da declaração, para ser conferido de novo; a rodada é o `round` do estado local e anda +1 quando
+  nasce uma bead NOVA; (3) a amostra é carona: só vai numa bead que tem pendente. Declarado sozinho não abre nem mantém bead (não há ação), e o comentário diz «Nada pede ação» sem afirmar «nenhum sobrevive» (eles existem, estão declarados).
+  Três estados: selftest que não leio (ausente, pasta, caminho absoluto ou fora da árvore, symlink que sai dela, mais de 4 MiB) NÃO declara nada, o sobrevivente fica na lista e a bead diz «REGISTRO: não consegui ler K de N selftest(s)»; declaração com razão curta NÃO vale e a bead a nomeia («NÃO valeram»); a declaração só vale no selftest da FAMÍLIA do sobrevivente.
 TRÊS ESTADOS
   Toda leitura é leu / vazio / não consegui ler. Arquivo ausente no nó = "nada confirmado ainda" (rc 0). ssh que não conectou = rc 98. Arquivo que não é o JSON esperado, estado local ilegível ou bead que não consigo
   ler = rc 3 e NADA é aberto nem comentado: avisar de novo sobre uma bead que já existe duplicaria. Escrita do estado local que falha depois do `bd` ter respondido = rc 3 e a frase "NÃO gravei", nunca traceback: num comentário a próxima volta o repete (repetido é melhor que perdido); depois de um create ela lista o rig e comenta na bead que nasceu.
   `bd create` sem resposta certa (não executou, estourou o prazo, rc ≠ 0 ou respondeu sem o id) = a bead PODE ter nascido: rc 3, estado intacto, e a volta seguinte olha o rig antes de abrir. Rig que não consigo listar = rc 3 e nada feito ("não achei nenhuma nossa" e "não consegui listar" nunca são a mesma resposta).
 ESTADO LOCAL
-  <cidade>/.gc/hetzner-ballast/newfail.json (hq-mutants: newfail-hq-mutants.json; wa-mutants: newfail-wa-mutants.json): {"v": 1, "fp": <impressão digital da última lista avisada>, "bead": <id>, "n": <quantas>, "at": <quando, UTC>}.
+  <cidade>/.gc/hetzner-ballast/newfail.json (hq-mutants: newfail-hq-mutants.json; wa-mutants: newfail-wa-mutants.json): {"v": 1, "fp": <impressão digital da última lista avisada>, "bead": <id>, "n": <quantas>, "at": <quando, UTC>}. O do hq-mutants leva também "round": <rodada, inteiro >= 0; outra coisa = estado de forma errada, rc 3>.
   O "at" é o relógio do adiamento do wa-mutants (comentário no máximo a cada 6 h); sem "at" ou ilegível, o comentário sai na hora.
 AMBIENTE
   GC_CITY_PATH · HETZNER_NODE_HOST (padrão hetzner-teste) · HB_SSH (padrão ssh) · HB_BD (padrão bd) · HB_WA_RIG (padrão /Users/athos/gt/whatsapp_automation) · HB_HQ_RIG (padrão a cidade) · HB_BD_TIMEOUT (segundos do `bd create` e do `bd list`; padrão 90, valor que não é número > 0 = 90). Saída: 0 ok · 3 recusado ou não consegui · 98 ssh fora.
@@ -113,27 +120,34 @@ def load_state():
     if not (isinstance(v, dict) and v.get("v") == 1 and (v.get("fp") is None or isinstance(v.get("fp"), str)) and (v.get("bead") is None or isinstance(v.get("bead"), str))
             and isinstance(v.get("n", 0), int)):
         return None, "%s com forma errada" % os.path.basename(F["estado"])
+    # vazio (sem `round`: estado de antes do registro, ou de outra fonte) → rodada 0; ilegível (presente e não inteiro >= 0, bool incluso) → forma errada, rc 3: a rodada escolhe a amostra, e adivinhar uma repetiria ou pularia conferências
+    if "round" in v and not (type(v["round"]) is int and v["round"] >= 0):
+        return None, "%s com a rodada fora da forma" % os.path.basename(F["estado"])
     return v, ""
 
 
-def save_state(fp, bead, n):
+def save_state(fp, bead, n, rnd=None):
     os.makedirs(OUTDIR, exist_ok=True)
     tmp = F["estado"] + ".tmp"
+    v = {"v": 1, "fp": fp, "bead": bead, "n": n, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    if rnd is not None:   # só a fonte com registro guarda a rodada; as outras mantêm o arquivo de sempre
+        v["round"] = rnd
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"v": 1, "fp": fp, "bead": bead, "n": n, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, f)
+        json.dump(v, f)
     os.replace(tmp, F["estado"])
 
 
-def save_state_or_die(fp, bead, n, done, next_round):
+def save_state_or_die(fp, bead, n, done, next_round, rnd=None):
     """Grava o estado local DEPOIS de o bd ter respondido. Falhou (disco, pasta no lugar do arquivo) → rc 3 dizendo o que já foi feito (`done`) e o que a próxima volta fará (`next_round`); o estado antigo fica."""
     try:
-        save_state(fp, bead, n)
+        save_state(fp, bead, n, rnd)
     except OSError as e:
         die(3, "%s, mas NÃO gravei o estado local (%s): %s" % (done, e, next_round))
 
 
-def fingerprint(items):
-    return hashlib.sha256(json.dumps(sorted([k, v.get("from"), v.get("to")] for k, v in items.items()), ensure_ascii=True).encode("utf-8")).hexdigest()[:16]
+def fingerprint(items, tags=None):
+    """Impressão digital da lista avisada. `tags` (só o registro): id → 'p' (pede ação) ou 's' (amostra a conferir); o mesmo id passar de um para o outro muda o texto da bead, então muda a impressão."""
+    return hashlib.sha256(json.dumps(sorted([k, v.get("from"), v.get("to")] + ([tags[k]] if tags else []) for k, v in items.items()), ensure_ascii=True).encode("utf-8")).hexdigest()[:16]
 
 
 def short(sha):
@@ -193,21 +207,105 @@ def avalia_hq(v):
     return len(targets), out
 
 
-def render_hq(items):
-    """Texto da bead: a lista COMPLETA de mutantes sobreviventes, por arquivo e linha."""
+EQ_ID = r"[0-9a-f]{10}"
+EQ_RX = re.compile(r"^[ \t]*#[ \t]*EQUIVALENT[ \t]+(%s(?:[ \t,]+%s)*)[ \t]*:(.*)$" % (EQ_ID, EQ_ID))   # a linha INTEIRA: `#` na 1ª coluna não branca, a palavra, ids de 10 hex minúsculos, dois-pontos e a razão (prosa solta não casa, de propósito)
+EQ_RAZAO_MIN = 12       # caracteres da razão (sem os espaços das pontas) abaixo dos quais a linha NÃO declara
+EQ_AMOSTRA = 10         # 1 em cada 10 dos declarados volta à bead por rodada
+EQ_MAX_BYTES = 4 << 20  # selftest maior que isto não é lido (o maior de hoje tem 0,8 MB)
+EQ_RAZAO_VISTA = 200    # caracteres da razão que a bead mostra
+
+
+def read_decls(rel):
+    """({id: (linha, razão)} das declarações VÁLIDAS do selftest `rel` (relativo à árvore da cidade), [(id, linha)] das que NÃO valeram por razão curta, motivo). motivo != '' = não li o arquivo: declarações vazias, nada vale."""
+    # vazio (nenhuma linha EQUIVALENT) → ({}, [], ''); falhou/ilegível (caminho absoluto ou fora da árvore, symlink que sai dela, arquivo que não abre, pasta, maior que EQ_MAX_BYTES) → ({}, [], motivo): nada é declarado por ali e o sobrevivente fica na lista
+    root = os.path.realpath(CITY)
+    path = os.path.realpath(os.path.join(root, rel))
+    if os.path.isabs(rel) or not path.startswith(root + os.sep):
+        return {}, [], "fora da árvore"
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(EQ_MAX_BYTES + 1)
+    except OSError as e:
+        return {}, [], type(e).__name__
+    if len(raw) > EQ_MAX_BYTES:
+        return {}, [], "maior que %d MiB" % (EQ_MAX_BYTES >> 20)
+    valid, short = {}, []
+    for n, line in enumerate(raw.decode("utf-8", "replace").split("\n"), 1):
+        m = EQ_RX.match(line)
+        if not m:
+            continue
+        razao = m.group(2).strip()
+        for sid in re.split(r"[ \t,]+", m.group(1)):
+            if len(razao) >= EQ_RAZAO_MIN:
+                valid.setdefault(sid, (n, razao))
+            else:
+                short.append((sid, n))
+    return valid, short, ""
+
+
+def split_registry(items, rnd):
+    """Divide o estado do motor (`items`: TODOS os sobreviventes) pelo registro de equivalentes. A declaração só vale no selftest da FAMÍLIA do sobrevivente (a lista `selftest` do registro dele). A amostra da rodada `rnd` são os declarados de id (hex) com o mesmo
+    resto por EQ_AMOSTRA que a rodada, e SÓ existe se há pendente: declarado sozinho não pede ação. {pend, amostra, razao: id → (selftest, linha, razão), decl_n, ilegiveis: [(selftest, motivo)], total_arq, recusadas: [(id, selftest, linha)], rnd}."""
+    lido = {rel: read_decls(rel) for rel in sorted({t for r in items.values() for t in r.get("selftest", [])})}
+    razao, pend = {}, {}
+    for sid, r in items.items():
+        hit = next(((rel, lido[rel][0][sid][0], lido[rel][0][sid][1]) for rel in r.get("selftest", []) if sid in lido[rel][0]), None)
+        if hit:
+            razao[sid] = hit
+        else:
+            pend[sid] = r
+    amostra = {sid: items[sid] for sid in razao if pend and int(sid, 16) % EQ_AMOSTRA == rnd % EQ_AMOSTRA}
+    recusadas = [(sid, rel, n) for sid in sorted(pend) for rel in pend[sid].get("selftest", []) for s2, n in lido[rel][1] if s2 == sid]
+    return {"pend": pend, "amostra": amostra, "razao": razao, "decl_n": len(razao), "ilegiveis": [(rel, why) for rel, (_, _, why) in lido.items() if why], "total_arq": len(lido), "recusadas": recusadas, "rnd": rnd}
+
+
+def shown_of(reg):
+    """(o que a bead mostra, id → 'p' pede ação / 's' amostra): o pendente e a amostra da rodada (que `split_registry` só monta se há pendente)."""
+    shown = dict(reg["pend"], **reg["amostra"])
+    return shown, dict({k: "s" for k in reg["amostra"]}, **{k: "p" for k in reg["pend"]})
+
+
+def _grupos_hq(items, razao=None):
+    """As linhas de uma lista de sobreviventes, por arquivo e linha; com `razao` (id → (selftest, linha, razão)) cada linha leva embaixo onde e por que foi declarada."""
     files = {}
     for sid, r in items.items():
         files.setdefault(r["file"], []).append((r["line"], sid, r))
-    out = ["Mutantes SOBREVIVENTES confirmados pelo lastro do nó (item hq-mutants): %d troca(s) de UM trecho do código do hq que NENHUM selftest da família reprovou." % len(items), "",
-           "Cada linha é uma quebra deliberada (antes → depois) que deixou os selftests do arquivo VERDES, e que repetida numa cópia limpa também passou: o teste não protege aquela linha. Para fechar, "
-           "ponha no selftest um caso que reprove com a troca (o id é estável: sha1 de arquivo:linha:operador:antes>depois:ocorrência) ou, se a troca não muda o comportamento, diga qual é a equivalência. "
-           "A lista é a do ÚLTIMO rodízio e a bead é atualizada quando ela muda. Um id sai quando o motor varre o arquivo de novo e o mutante morre (ou deixa de existir); arquivo apagado, renomeado ou ainda não varrido de novo "
-           "MANTÉM a linha aqui, e ela pode estar velha: confira no arquivo atual antes de agir.", ""]
+    out = []
     for rel, rows in sorted(files.items()):
         out.append("ARQUIVO %s (%d)" % (rel, len(rows)))
         for line, sid, r in sorted(rows, key=lambda x: (x[0], x[1])):
             fam = ",".join(r.get("selftest", []))
             out.append("  L%d [%s] %s -> %s  id=%s%s" % (line, r.get("op", ""), r.get("old", "").replace("\n", "\\n"), r.get("new", "").replace("\n", "\\n"), sid, "  (testes: %s)" % fam if fam else ""))
+            if razao and sid in razao:
+                out.append("      declarado em %s:%d: %s" % (razao[sid][0], razao[sid][1], razao[sid][2][:EQ_RAZAO_VISTA]))
+        out.append("")
+    return out
+
+
+def render_hq(items, reg):
+    """Texto da bead: o que pede ação, por arquivo e linha; depois a amostra de equivalentes a conferir (com a razão e o lugar), a conta dos declarados que ficam de fora e o que o registro não conseguiu ler."""
+    pend = {k: v for k, v in items.items() if k not in reg["amostra"]}
+    amostra = {k: v for k, v in items.items() if k in reg["amostra"]}
+    out = ["Mutantes SOBREVIVENTES confirmados pelo lastro do nó (item hq-mutants): %d troca(s) de UM trecho do código do hq que NENHUM selftest da família reprovou e que pedem ação." % len(pend), "",
+           "Cada linha é uma quebra deliberada (antes → depois) que deixou os selftests do arquivo VERDES, e que repetida numa cópia limpa também passou: o teste não protege aquela linha. Para fechar, "
+           "ponha no selftest um caso que reprove com a troca (o id é estável: sha1 de arquivo:linha:operador:antes>depois:ocorrência) ou, se a troca NÃO muda o comportamento, declare a equivalência no selftest da família (o de «testes:») com UMA linha "
+           "`# EQUIVALENT <id> [<id>…]: <razão>`: a palavra em maiúsculas e em inglês, `#` como 1º caractere não branco, ids de 10 hex, razão de %d caracteres ou mais; nota solta em prosa não vale. O id sai desta lista e entra na conta de equivalentes declarados, "
+           "e 1 em cada %d deles volta aqui por rodada para ser conferido de novo; como o id leva a linha do código, a declaração envelhece sozinha quando a linha anda (e o sobrevivente reaparece). " % (EQ_RAZAO_MIN, EQ_AMOSTRA) +
+           "A lista é a do ÚLTIMO rodízio e a bead é atualizada quando ela muda. Um id sai quando o motor varre o arquivo de novo e o mutante morre (ou deixa de existir); arquivo apagado, renomeado ou ainda não varrido de novo "
+           "MANTÉM a linha aqui, e ela pode estar velha: confira no arquivo atual antes de agir.", ""]
+    if reg["ilegiveis"]:
+        mais = len(reg["ilegiveis"]) - 5
+        out += ["REGISTRO: não consegui ler %d de %d selftest(s) da família (%s%s): o que eles declaram NÃO vale e esses ids aparecem aqui como pendentes." % (len(reg["ilegiveis"]), reg["total_arq"], ", ".join(rel for rel, _ in reg["ilegiveis"][:5]), "; +%d" % mais if mais > 0 else ""), ""]
+    if reg["recusadas"]:
+        mais = len(reg["recusadas"]) - 10
+        out += ["Declarações que NÃO valeram (razão com menos de %d caracteres): %s%s." % (EQ_RAZAO_MIN, "; ".join("%s em %s:%d" % x for x in reg["recusadas"][:10]), "; +%d" % mais if mais > 0 else ""), ""]
+    out.extend(_grupos_hq(pend))
+    if amostra:
+        out += ["REVALIDAR (amostra da rodada %d: %d de %d equivalentes declarados, os de id com resto %d na divisão por %d): confira se a razão declarada AINDA vale para o código de hoje. Se não vale, apague a linha do registro e mate o mutante com um caso novo no selftest; se vale, não há nada a fazer."
+                % (reg["rnd"], len(amostra), reg["decl_n"], reg["rnd"] % EQ_AMOSTRA, EQ_AMOSTRA), ""]
+        out.extend(_grupos_hq(amostra, reg["razao"]))
+    if reg["decl_n"]:
+        out.append("Fora desta lista: %d equivalente(s) declarado(s) nos selftests da família (# EQUIVALENT <id>: razão), sem ação pendente." % (reg["decl_n"] - len(amostra)))
         out.append("")
     out.append("Fonte: ~/gt-remote/ballast/hq-mutants.state.json no nó (hetzner-ballast-newfail.py --fonte hq-mutants, ga-2hd02v.5.6.4). Não é lead nem dado de cliente: só trechos do código do próprio hq.")
     return "\n".join(out)
@@ -268,11 +366,11 @@ def find_ours():
     return sorted(ids), ""
 
 
-def create(items):
+def create(items, reg=None):
     args = [BD, "-C", F["rig"], "create", F["titulo"] % len(items), "-t", F["tipo"], "-p", F["prio"], "--stdin", "--json"]
     for lb in F["labels"]:
         args += ["-l", lb]
-    r = run(args, inp=F["render"](items), timeout=BD_TIMEOUT)
+    r = run(args, inp=F["render"](items) if reg is None else F["render"](items, reg), timeout=BD_TIMEOUT)
     bead = None
     # vazio (resposta sem id) e falhou (não executou, prazo, rc ≠ 0, JSON ilegível) dão o MESMO bead None, de propósito: o `bd` pode ter gravado antes de falhar ou de ser morto, então nenhum dos quatro prova que
     # nada nasceu. A saída é a mesma nos quatro (rc 3, estado local intacto) e quem decide é a volta seguinte, que lista o rig antes de abrir
@@ -294,10 +392,19 @@ def create(items):
     return bead
 
 
-def zerou_hq(n, nao):
-    """Comentário de lista que zerou. Vazia NÃO é 'pegos': só digo o que o estado prova, e o que ele não prova vai escrito (alvo não reavaliado, estado sem alvo, arquivo que saiu do estado)."""
+def _quais(nao):
+    return "; ".join("%s (%s)" % x for x in nao[:10]) + ("; +%d" % (len(nao) - 10) if len(nao) > 10 else "")
+
+
+def zerou_hq(n, nao, decl=0):
+    """Comentário de lista que zerou. Vazia NÃO é 'pegos': só digo o que o estado prova, e o que ele não prova vai escrito (alvo não reavaliado, estado sem alvo, arquivo que saiu do estado).
+    `decl` > 0 (o registro): o estado do motor AINDA tem `decl` sobreviventes, todos declarados equivalentes; nada pede ação, e nem por isso 'nenhum sobrevive'."""
+    if decl:
+        return ("Nada pede ação nesta bead: os %d sobrevivente(s) que o estado do motor ainda tem estão todos declarados equivalentes nos selftests da família (# EQUIVALENT <id>: razão). %s"
+                % (decl, "Mas isso NÃO prova que não haja sobrevivente novo: alvo(s) que o motor NÃO julgou por inteiro agora: %d [%s]. Confira ~/gt-remote/ballast/hq-mutants.state.json no nó antes de fechar esta bead." % (len(nao), _quais(nao))
+                   if nao else "Quem tratou a lista fecha esta bead."))
     if nao:
-        quais = "; ".join("%s (%s)" % x for x in nao[:10]) + ("; +%d" % (len(nao) - 10) if len(nao) > 10 else "")
+        quais = _quais(nao)
         return ("A lista de mutantes sobreviventes (item hq-mutants) está vazia, mas isso NÃO prova que os testes foram reforçados. Estado do motor: %d alvo(s); NÃO julgados por inteiro agora: %d [%s]. "
                 "Alvo que o motor ainda não reavaliou não tem sobrevivente na lista, nem por isso foi pego. Confira ~/gt-remote/ballast/hq-mutants.state.json no nó antes de fechar esta bead." % (n, len(nao), quais))
     return ("A lista de mutantes sobreviventes (item hq-mutants) está vazia: os %d alvo(s) do estado do motor estão com todos os mutantes julgados e nenhum sobrevive. Quem reforçou o teste fecha esta bead. "
@@ -385,7 +492,7 @@ FONTES = {
     "hq-mutants": dict(arquivo="hq-mutants.state.json", estado="newfail-hq-mutants.json", rig=os.environ.get("HB_HQ_RIG") or CITY, rig_nome="HQ", labels=("origem:lastro-hq-mutants", "area:testes", ROTULO_MUTANTES),
                        tipo="task", prio="3", titulo="hq-mutants do lastro: %d mutante(s) sobrevivente(s) confirmado(s) no main", items=items_hq, forma="v 1, targets {arquivo: {survivors: {id: {file, line, op, old, new}}}}", render=render_hq,
                        coisas="mutantes sobreviventes", gen="os",
-                       avalia=avalia_hq, zerou=zerou_hq),
+                       avalia=avalia_hq, zerou=zerou_hq, registro=True),
     # sem ctx:ready, exec:auto nem rota: o pilot-missing-route-watchdog reencaminha para o pool de dogs a bead que tem as duas (foi o que aconteceu com a ga-iu0fvlo); quem triagem decide
     "wa-mutants": dict(arquivo="wa-mutants.state.json", estado="newfail-wa-mutants.json", rig=os.environ.get("HB_WA_RIG", "/Users/athos/gt/whatsapp_automation"), rig_nome="WA", labels=("origem:lastro-wa-mutants", "area:testes", ROTULO_MUTANTES),
                        tipo="task", prio="3", titulo="wa-mutants do lastro: %d mutante(s) sobrevivente(s) confirmado(s) no main", items=items_hq, forma="v 1, targets {arquivo: {survivors: {id: {file, line, op, old, new}}}}", render=render_wam,
@@ -418,19 +525,26 @@ def main():
     if st == "ausente":
         say("o nó ainda não tem %s: nada confirmado" % F["arquivo"])
         return 0
-    items = items_or_why
+    items = todos = items_or_why   # `todos` = o estado do motor inteiro; `items` = o que a bead mostra (com o registro, só o pendente e a amostra)
     state, why = load_state()
     if state is None:
         die(3, "%s: não abro nem comento bead sem saber o que já avisei" % why)
     bead, last_fp, last_n = state.get("bead"), state.get("fp"), state.get("n", 0)
-    fp = fingerprint(items)
+    rnd = reg = tags = None
+    if F.get("registro"):
+        rnd = state.get("round", 0)   # vazio (estado de antes do registro) → rodada 0; a forma errada o load_state já recusou
+        reg = split_registry(todos, rnd)
+        items, tags = shown_of(reg)
+    fp = fingerprint(items, tags)
     if not items:
         if bead and last_n:
-            r = run([BD, "-C", F["rig"], "comment", bead, "--stdin"], inp=F["zerou"](*aval), timeout=60)
+            r = run([BD, "-C", F["rig"], "comment", bead, "--stdin"], inp=F["zerou"](*aval, **({"decl": reg["decl_n"]} if reg else {})), timeout=60)
             if r is None or r.returncode != 0:
                 die(3, "bd comment falhou em %s: o estado local não mudou; a próxima volta repete" % bead)
-            save_state_or_die(fp, bead, 0, "comentei em %s que a lista zerou" % bead, "a próxima volta repete o comentário")
+            save_state_or_die(fp, bead, 0, "comentei em %s que a lista zerou" % bead, "a próxima volta repete o comentário", rnd)
             say("lista vazia: comentei em %s que a lista zerou (%d alvo(s) não reavaliado(s))" % (bead, len(aval[1])))
+        elif reg and reg["decl_n"]:
+            say("nada pede ação: %d equivalente(s) declarado(s) nos selftests da família" % reg["decl_n"])
         else:
             say("0 %s confirmad%s" % (F["coisas"], F["gen"]))
         return 0
@@ -458,14 +572,19 @@ def main():
             lead = "Esta bead foi reencontrada no rig do %s (uma volta anterior não confirmou se a criou). Lista atual de %s confirmad%s (%d)." % (F["rig_nome"], F["coisas"], F["gen"], len(items))
             say("já existe uma bead nossa aberta no rig do %s (%s): comento em %s em vez de abrir outra" % (F["rig_nome"], ", ".join(ours), bead))
     if action == "comentar":
-        r = run([BD, "-C", F["rig"], "comment", bead, "--stdin"], inp="%s\n\n%s" % (lead, F["render"](items)), timeout=90)
+        r = run([BD, "-C", F["rig"], "comment", bead, "--stdin"], inp="%s\n\n%s" % (lead, F["render"](items) if reg is None else F["render"](items, reg)), timeout=90)
         if r is None or r.returncode != 0:
             die(3, "bd comment falhou em %s: o estado local não mudou; a próxima volta repete" % bead)
-        save_state_or_die(fp, bead, len(items), "comentei a lista nova em %s" % bead, "a próxima volta repete o comentário")
+        save_state_or_die(fp, bead, len(items), "comentei a lista nova em %s" % bead, "a próxima volta repete o comentário", rnd)
         say("%d confirmada(s): comentei a lista nova em %s" % (len(items), bead))
         return 0
-    new = create(items)
-    save_state_or_die(fp, new, len(items), "abri %s" % new, "a próxima volta lista o rig e comenta nela em vez de abrir outra")
+    if reg is not None:   # bead NOVA = rodada nova: a amostra desta bead é a do próximo resto (a bead que já existe segue na rodada dela)
+        rnd += 1
+        reg = split_registry(todos, rnd)
+        items, tags = shown_of(reg)
+        fp = fingerprint(items, tags)
+    new = create(items, reg)
+    save_state_or_die(fp, new, len(items), "abri %s" % new, "a próxima volta lista o rig e comenta nela em vez de abrir outra", rnd)
     say("%d confirmada(s): abri %s no rig do %s" % (len(items), new, F["rig_nome"]))
     return 0
 

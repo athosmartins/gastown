@@ -16,6 +16,7 @@
 #   lê o status da substituição (só o stdout, o padrão), então `return 0` e `return 1` deixam o mesmo estado e o mesmo rc de saída: nenhum caso vê a diferença.
 # CONTROLE NEGATIVO: cada guarda é adulterada (sed numa cópia, pela marca `GUARD:` do script) e o caso que a cobre TEM que passar a falhar; mutante que não muda o arquivo também falha.
 # VARIÁVEIS: WFD_UNDER_TEST (script a testar) · WFD_NO_MUTANTS=1
+# EQUIVALENT 7fb475c066: o `return 0` do ramo "passa de $4" de pick_int virando `return 1`: pick_int so e chamada em `X=$(pick_int ...)`, o script nao tem `set -e` e ninguem le o status da substituicao
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 W="${WFD_UNDER_TEST:-$HERE/wait-for-dolt.sh}"

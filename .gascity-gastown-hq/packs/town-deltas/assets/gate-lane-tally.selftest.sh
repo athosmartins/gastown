@@ -556,6 +556,7 @@ mutant rc-after-json 's/    if p.returncode != 0:   # before the JSON/    if Fal
 # in the same second as its run, a notify that exits 1 (not 3), a bd that quotes 130 characters. Every expectation was derived by hand from
 # the rules in the module's docstring, then checked against the real tally. Not killable, on purpose: L258 `found[row["id"]] = True -> False`
 # (8773afd2e5): `found` is read only through len() and sorted(), never by value.
+# EQUIVALENT 8773afd2e5: `found[row["id"]] = True` -> False: `found` is read only through len() and sorted(), never by value
 PYT='
 import contextlib, importlib.util, io, json, os, shutil, sys
 sys.dont_write_bytecode = True

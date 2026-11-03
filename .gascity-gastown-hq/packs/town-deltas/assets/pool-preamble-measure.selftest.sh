@@ -334,6 +334,9 @@ o="$(PPM_GATE_LOG="$W/gate_nohist.jsonl" python3 "$TOOL" gate-rate --cutover 202
 # NAO matavel, de proposito: L327 `r["rig"] == rig` -> `!=` (67bdc90f2d: mech_fails so e chamada sem rig, o `rig is None` ja decide);
 # L332 `ts < hi_a` -> `<=` (7396ce259a: rig que so tem bead no instante hi_a entra na lista mas bucket() o exclui, e a linha so sai com n>0);
 # L189 `len(v) - 1` -> `len(v) - 0` (7c813362ab: ceil(0.9*n) - 1 e sempre menor que n, o min() nunca escolhe o outro lado).
+# EQUIVALENT 7c813362ab: `len(v) - 1` -> `len(v) - 0`: ceil(0.9*n) - 1 e sempre menor que n, o min() nunca escolhe o outro lado
+# EQUIVALENT 67bdc90f2d: `r["rig"] == rig` -> `!=`: mech_fails so e chamada sem rig, o `rig is None` ja decide
+# EQUIVALENT 7396ce259a: `ts < hi_a` -> `<=`: rig que so tem bead no instante hi_a entra na lista mas bucket() o exclui, e a linha so sai com n>0
 echo "== lastro: bordas, defaults e saidas (em processo)"
 cat > "$W/lastro.py" <<'EOF'
 import argparse, contextlib, datetime, importlib.util, io, json, os, sys, time

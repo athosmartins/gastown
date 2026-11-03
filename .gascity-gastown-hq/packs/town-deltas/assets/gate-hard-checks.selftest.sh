@@ -594,6 +594,11 @@ echo "H. third states the sweep found loose (ga-hq1qc5y, hq-mutants lastro): the
 # EQUIVALENT, documented: d251008b6f (cleanup's `return 0`: an EXIT trap, whose status the shell drops) and 2d29fc8b0e (pick_tools' `return 0`: nobody reads it); 2428aa2939 (`mkdir -p "$dest/$(dirname "$path")" || return 1` in
 # extract: the redirect right below fails on the same missing directory and returns 1); c5d5c0e2ba (`[ r -gt worst ] && worst=r` -> `-ge`: at equality it assigns the same number); e319c08df6, d19df7f075, d3bdf183ad and
 # 94045ebd9d (the `return 1` -> `0` of a red-line read or cut that failed: no .norm file is written, so the `comm` right after fails and reaches the same nao-consegui-medir).
+# EQUIVALENT d251008b6f: cleanup's `return 0` is an EXIT trap, whose status the shell drops
+# EQUIVALENT 2d29fc8b0e: pick_tools' `return 0`: nobody reads it
+# EQUIVALENT 2428aa2939: `mkdir -p "$dest/$(dirname "$path")" || return 1` in extract: the redirect right below fails on the same missing directory and returns 1
+# EQUIVALENT c5d5c0e2ba: `[ r -gt worst ] && worst=r` -> `-ge`: at equality it assigns the same number
+# EQUIVALENT e319c08df6 d19df7f075 d3bdf183ad 94045ebd9d: the `return 1` -> `0` of a red-line read or cut that failed: no .norm file is written, so the `comm` right after fails and reaches the same nao-consegui-medir
 GS="$WORK/gs"; mkdir -p "$GS"; GREAL="$(command -v git)"; MREAL="$(command -v mkdir)"
 printf '#!/bin/sh\ncase "$3 $4" in\n  "ls-tree -r") [ "${GS_FAIL:-}" = lstree ] && { "$GS_REAL_GIT" "$@"; exit 1; } ;;\n  "cat-file blob") [ "${GS_FAIL:-}" = catfile ] && { "$GS_REAL_GIT" "$@"; exit 1; } ;;\n  "rev-parse --show-toplevel") [ "${GS_FAIL:-}" = notop ] && { echo /nonexistent/top; exit 0; } ;;\nesac\nexec "$GS_REAL_GIT" "$@"\n' > "$GS/git"
 printf '#!/bin/sh\nfor a in "$@"; do case "$a" in *"${MK_FAIL:-NOSUCHSUFFIX}") exit 1 ;; esac; done\nexec "$MK_REAL" "$@"\n' > "$GS/mkdir"; chmod +x "$GS/git" "$GS/mkdir"

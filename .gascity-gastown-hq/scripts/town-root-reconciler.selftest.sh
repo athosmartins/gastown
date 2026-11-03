@@ -244,6 +244,10 @@ ROOT="$_saved_ROOT"; REMOTE="$_saved_REMOTE"; BRANCH="$_saved_BRANCH"
 # carimbo-diretorio no cenario 22 le esse status. Tambem nao e': 24909e7bf1 (o `||` entre os dois cp do backup virando `&&`): o 2o cp, depois de um `cp -p` que deu certo, troca o mtime do
 # backup pela hora de agora (os bytes sao os mesmos); o cenario 21 le o mtime.
 # date devolve $FAKE_NOW para `date +%s` quando ele esta definido; git falha quando "<subcomando> <1o arg>" comeca por $GITFAIL.
+# EQUIVALENT 3bf5a69c5c 3ec1b3ce09 18e2ca9f08 8c15fc648f: `cmd || true` -> `cmd && true`: ninguem le o status e nao ha set -e
+# EQUIVALENT 4dd84a5bcb: o `|| true` que fecha a cadeia de cp do backup: ninguem le o status
+# EQUIVALENT 2a4dfbfe9d 7990ceb751 86e745f1c8 d0372d9f4c c3efbaf3cc d1fe4548ab: `$(git ... || echo "")` -> `&&`: quando o git falha nao imprime nada e quando acerta a linha vazia a mais some no $(...)
+# EQUIVALENT 24909e7bf1: JAULA, nao equivalencia: o `||` entre os dois cp virando `&&` troca o mtime do backup pela hora de agora e o cenario 21 o mata fora da jaula (medido 03/11: fora FAIL=1, na jaula PASS=78 FAIL=0); no rodizio fica vivo porque o backup vai para /tmp e a jaula so grava no slot
 date() { if [ "${1-}" = "+%s" ] && [ -n "${FAKE_NOW:-}" ]; then echo "$FAKE_NOW"; else command date "$@"; fi; }
 git() { if [ -n "${GITFAIL:-}" ]; then case "${3-} ${4-}" in "$GITFAIL"*) return 1 ;; esac; fi; command git "$@"; }
 fresh_stamps() { rm -f "$ESCALATE_STAMP" "$NTFY_STAMP"; }

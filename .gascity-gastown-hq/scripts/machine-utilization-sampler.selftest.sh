@@ -66,6 +66,7 @@ echo "── Scenario: the sampler's reading, world by world (ga-hq1qc5y, hq-mut
 # One in-process python run. Every external read (sh, bd_list, ps_count, dolt_ok) is a stub, so each case is a small world whose record is known by hand: every flag of the
 # record is read on both sides of its edge (a bead exactly BUILD_FRESH_SEC old, a marker exactly GATE_STALL_MIN old, the 3-column row of `gc session list`).
 # EQUIVALENT, documented: 304e0ebd20 (`a > gate_oldest_queued_min` -> `>=`: at equality it assigns the same number).
+# EQUIVALENT 304e0ebd20: `a > gate_oldest_queued_min` -> `>=`: at equality it assigns the same number
 PYT='
 import contextlib, datetime, importlib.util, io, json, os, sys, tempfile, types
 for k in ("UTIL_OUT", "UTIL_NOTIFY", "UTIL_BUILD_FRESH_SEC", "UTIL_GATE_STALL_MIN"):

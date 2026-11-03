@@ -589,6 +589,8 @@ echo "== 9. the status of every branch, and the functions the CLI never reaches 
 # section 3 runs under set -euo pipefail and is green with both); 1319ac4b9f and f5aa70ca4e (`{ [ -f ] && [ -r ]; } || return 3` in
 # e9_recorded_arm: the jq call right below fails with rc 2 on exactly the roster those guards turn away and that is already mapped to 3; the
 # directory, mode-000 and dangling-link cases of section 3 stay green without them).
+# EQUIVALENT df54f81999: `last="$(...)" || :` -> `&& :`: an assignment that is not the last element of an AND-OR list is exempt from errexit either way, and nobody reads the list's status
+# EQUIVALENT 1319ac4b9f f5aa70ca4e: the `{ [ -f ] && [ -r ]; } || return 3` guard of e9_recorded_arm: the jq call right below fails with rc 2 on exactly the roster it turns away, and that is already mapped to 3
 kid() { /bin/bash -c "$1" _ "$E9" 2>&1; }   # <script>: a child shell; $1 in the script is the library
 newstate
 _o="$(kid 'set -e; . "$1"; e9_conf_load; echo "reached state=$E9_STATE"')"; _rc=$?

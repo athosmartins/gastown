@@ -411,6 +411,7 @@ done
 # hq-mutants lastro.) EQUIVALENT, documented: 4f28f91c90 and de3fb6044f (`{ [ -f ] && [ -r ]; } ||
 # return 3` in e12_recorded_arm): the jq call right below fails with rc 2 on exactly the roster those guards turn away, and that failure is
 # already mapped to rc 3. Measured with and without the guard on a directory, a chmod-000 file and a dangling link: rc 3, empty stdout.
+# EQUIVALENT 4f28f91c90 de3fb6044f: the `{ [ -f ] && [ -r ]; } || return 3` guard of e12_recorded_arm: the jq call right below fails with rc 2 on exactly the roster it turns away, and that failure is already mapped to rc 3 (measured with and without the guard)
 echo "== 9. e12_record and e12_conf_load: the status of every branch =="
 rec() { # <prelude> — a child sources the lib, runs the prelude (shims), calls e12_record and prints its status
   "${BASH:-/bin/bash}" -c '. "$1"; E12_STATE_DIR="$2"; E12_PCT=50; eval "$3"; e12_record b-1 /st treated stage1; echo "rc=$?"' _ "$E12" "$SD" "$1" 2>/dev/null

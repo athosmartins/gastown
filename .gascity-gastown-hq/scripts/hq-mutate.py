@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """hq-mutate.py — varredura de MUTANTES do código que os *.selftest.sh do hq cobrem (ga-2hd02v.5.6.2): o resultado que alguém lê é a lista de testes que NÃO pegam um bug.
 ## Contents
-  Por quê · Uso · Alvos · Operadores · Veredito · Teto de escrita · Estado · Aplicar um mutante (gate) · Códigos de saída
+  Por quê · Uso · Alvos · Operadores · Autoteste embutido · Registro de equivalentes · Veredito · Teto de escrita · Estado · Aplicar um mutante (gate) · Códigos de saída
 POR QUÊ: um selftest verde com o código quebrado não prova nada. Trocar UM trecho do script (`-gt` por `-ge`, `&&` por `||`, `exit 1` por `exit 0`) e rodar a família de selftests dele diz se algum reprova; se nenhum
   reprova, o mutante SOBREVIVEU e o teste é fraco naquela linha. É CPU que o lastro do nó Hetzner gasta com nice 19 sem custo, e cada achado vira um bead (ga-2hd02v.5.6).
 USO: hq-mutate.py gen ARQUIVO [--tree HQ]                  imprime os candidatos (id, linha, operador, antes, depois), TAB; com --tree o id é o que o `sweep` grava (caminho relativo à árvore)
@@ -17,6 +17,12 @@ ALVOS: o SUJEITO de cada `X.selftest.sh` de scripts/ e packs/town-deltas/assets/
   como `denylist:<palavra>` (o Landlock não barra sinal nem socket unix); a denylist lê o texto do sujeito e da família, não os scripts que eles chamam. Baseline (a família sem mutante) que não dá 0 pula o alvo por 2 dias (`base-vermelha`; `base-ambiente` se 97).
 OPERADORES: no shell só entre tokens soltos (um scanner com pilha passa por aspas, `$( )` e `$(( ))`, comentário e corpo de heredoc: nada em string ou heredoc é mutado, e o `"$( )"` entre aspas duplas fica sem mutar, nunca mutado errado); no python
   pelos tokens (`tokenize`). Scanner que TERMINA com aspa, `$(` ou heredoc aberto se perdeu (o `bash -n` aceita o arquivo): alvo pulado como `scan-perdido`, nunca coberto. Mutante que não compila é `invalid` e não gasta a cota; id estável = sha1(arquivo:linha:operador:antes>depois:ocorrência).
+AUTOTESTE EMBUTIDO (ga-eszw2df): sujeito .py que carrega o próprio `def _selftest()` (ou `def selftest()`: função de TOPO, nome EXATO, decorador incluso) não tem candidato dentro dele. É o código que testa o código: trocar uma fixture ou um assert por outro valor "continua verdadeiro", então o mutante sobrevive por
+  construção e só enche a lista (70 dos 259 sobreviventes do nó em 03/11 eram de dentro do _selftest do child-priority-janitor.py). Vale para `gen`, `apply` (id de dentro da região = id inexistente, rc 4) e `sweep`. O hash do alvo ganha a região SÓ quando ela existe: quem não tem autoteste embutido mantém o hash e não é varrido de novo, quem tem volta a ser julgado
+  uma vez. NÃO cobre: bloco `--selftest` de shell (sem marca estrutural segura), função de outro nome (`selftest_signal`, `run_selftest` são produção) e .py que o `ast` não lê (tokeniza mas não compila: os candidatos de sempre, que o `compile` descarta como `invalid`). O hq-mutate-wa.py herda a exclusão dos
+  candidatos (o scanner é deste motor) sem mudar o hash do plano dele; hoje nenhum lib/ ou daemons/ do WA tem `_selftest` de topo.
+REGISTRO DE EQUIVALENTES (ga-eszw2df): a linha `# EQUIVALENT <id> [<id>…]: <razão>` de um selftest (o hetzner-ballast-newfail.py a lê e tira o sobrevivente declarado da bead; gramática e regras no docstring dele) é COMENTÁRIO PURO para o motor: fica fora do hash do alvo (declarar uma equivalência não custa uma
+  varredura nova), da denylist (a razão pode citar sudo ou tmux) e do `--also` do `apply`. Só a linha no formato: nota solta em prosa, outro comentário e id que não é de 10 hex minúsculos contam como texto do selftest, como sempre.
 VEREDITO: morto = algum selftest da família saiu != 0 (prazo e 97 incluídos) · sobrevivente = todos 0, e roda DE NOVO numa cópia limpa: se a 2ª reprova é `flaky` (não se reporta), senão `confirmed`. Execução cortada pelo TERM não é veredito. Cada mutante roda numa CÓPIA
   da árvore dentro da jaula (--rw só o slot, HOME e TMPDIR descartáveis, `env -i` e só PATH, LANG, LC_*, USER), PROVADA antes de qualquer mutante (`--prove`): sem prova, rc 97 e nada roda.
 TETO DE ESCRITA (ga-e6ug8gq): código alterado pode virar laço de escrita (27/10: um awk em laço gravou 4,2 e 5,6 GB em $TMPDIR, duas vezes, o disco do mini zerou e o Dolt ficou com ENOSPC). Todo filho (a baseline e cada
@@ -36,6 +42,7 @@ APLICAR UM MUTANTE (ga-4kykayr): o gate de submissão (quality-gate-guard.sh, br
 CÓDIGOS: 0 · 2 uso · 3 estado ilegível, árvore ilegível, sem alvos ou gravação que falhou · 97 jaula não provada · 143 interrompido (o estado já gravado vale). `apply`: 0 gravou · 3 não leu/não gravou · 4 id inexistente · 5 o mutante não compila (ou o bash não decidiu) · 6 recusado.
 """
 import argparse
+import ast
 import hashlib
 import io
 import itertools
@@ -58,6 +65,8 @@ SCAN_REV = 2   # entra no hash do alvo: muda quando o scanner ou a regra de vere
 SELFTEST_DIRS = ("scripts", "packs/town-deltas/assets")
 NOT_SUBJECT = re.compile(r"^(hetzner-ballast|hq-mutate|hq-sandbox-run)|\.selftest\.|\.mutants\.")
 EMBEDDED = re.compile(r"\bp?mut\b|[Mm]utante|MUT_")
+SELF_TEST_FUNCS = ("_selftest", "selftest")   # o autoteste embutido de um sujeito .py: função de TOPO com um destes nomes EXATOS (selftest_signal, run_selftest… são código de produção e continuam mutáveis)
+DECL_RX = re.compile(r"^[ \t]*#[ \t]*EQUIVALENT[ \t]+[0-9a-f]{10}(?:[ \t,]+[0-9a-f]{10})*[ \t]*:[^\n]*\n?", re.M)   # a linha do registro de equivalentes (a MESMA gramática do hetzner-ballast-newfail.py, sem o mínimo da razão): comentário puro, fora do hash e da denylist
 SKIP_S = 2 * 86400
 DENY = r"\b(?:sudo|doas|systemctl|launchctl|pkill|killall|osascript|docker|podman|tmux|ssh-add|busctl|dbus-send|socat|gt-netns-run|gt-iso-run)\b|git push|\bkill\b[^\n]*\s-1\b|--unix-socket|\bnc\s+-U"
 PASS_ENV = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME")
@@ -186,12 +195,24 @@ def sh_raw(text):
     return out
 
 
+def self_test_spans(text):
+    """[(primeira linha, última linha)] de cada autoteste embutido do .py: a função de TOPO `def _selftest` / `def selftest`, o decorador incluso (ga-eszw2df). É o código que testa o código: trocar uma fixture ou um assert dele por outro valor
+    'continua verdadeiro', então o mutante sobrevive por construção e só enche a lista (70 dos 259 sobreviventes do nó em 03/11 eram de dentro do _selftest do child-priority-janitor.py). Só o nome exato e só no topo: método de classe ou `selftest_signal` é produção."""
+    # vazio (sem autoteste embutido) → []; falhou/ilegível (o ast não lê o texto que o tokenize leu) → [] também: sem a região o motor gera os candidatos de sempre, e perder a cobertura do código de produção custa mais que o ruído
+    try:
+        body = ast.parse(text).body
+    except (SyntaxError, ValueError):
+        return []
+    return [(min([n.lineno] + [d.lineno for d in n.decorator_list]), n.end_lineno) for n in body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in SELF_TEST_FUNCS]
+
+
 def py_raw(text):
     offs = [0, *itertools.accumulate(len(l) for l in io.StringIO(text).readlines())]
     out = []
+    skip = self_test_spans(text)
     for t in tokenize.generate_tokens(io.StringIO(text).readline):
         (r, c), (r2, c2) = t.start, t.end
-        if r != r2:
+        if r != r2 or any(a <= r <= b for a, b in skip):
             continue
         s, e, w = offs[r - 1] + c, offs[r - 1] + c2, t.string
         if t.type in (tokenize.OP, tokenize.NAME) and w in PY_SWAP:
@@ -234,6 +255,12 @@ def valid(path, text):
     return True if rc == 0 else False if rc in (1, 2) else None
 
 
+def decl_free(raw):
+    """os bytes do selftest SEM as linhas do registro de equivalentes (`# EQUIVALENT <id>…: razão`, ga-eszw2df). São comentário puro: declarar uma equivalência não pode custar uma varredura nova do alvo (o hash leva o texto do selftest) nem pôr o alvo na denylist
+    (a razão pode citar sudo ou tmux de passagem). O surrogateescape devolve byte por byte o que não é declaração: o hash de um selftest sem declaração é o de sempre."""
+    return DECL_RX.sub("", raw.decode("utf-8", "surrogateescape")).encode("utf-8", "surrogateescape")
+
+
 def find_subject(d, stem, text):
     cand = stem
     for _ in range(4):
@@ -263,8 +290,10 @@ def make_plan(tree, state, recent):
     for subj, sts in fam.items():
         rel = subj.relative_to(tree).as_posix()
         names = [s.relative_to(tree).as_posix() for s in sts]
-        blobs = [subj.read_bytes()] + [s.read_bytes() for s in sts]
-        h = hashlib.sha1(b"\0".join(blobs) + b"v%d.s%d" % (VERSION, SCAN_REV)).hexdigest()
+        blobs = [subj.read_bytes()] + [decl_free(s.read_bytes()) for s in sts]
+        # a região entra no hash SÓ quando existe: quem não tem autoteste embutido mantém o hash de sempre e não é varrido de novo (o plano do wa-mutants tem o hash dele e não passa por aqui); quem tem volta a ser julgado uma vez, sem o que saiu do espaço de mutação
+        spans = self_test_spans(blobs[0].decode("utf-8", "replace")) if subj.suffix == ".py" else []
+        h = hashlib.sha1(b"\0".join(blobs) + b"v%d.s%d" % (VERSION, SCAN_REV) + (("e%s" % (spans,)).encode() if spans else b"")).hexdigest()
         text = b"\n".join(blobs).decode("utf-8", "replace")
         fam_text = b"\n".join(blobs[1:]).decode("utf-8", "replace")
         old = state["targets"].get(rel, {})
@@ -612,7 +641,7 @@ def apply(a):
         return 6
     try:
         text, cands = candidates(path, "/".join(parts))
-        also = [Path(p).read_text(encoding="utf-8", errors="replace") for p in a.also]
+        also = [DECL_RX.sub("", Path(p).read_text(encoding="utf-8", errors="replace")) for p in a.also]
     except (OSError, ValueError, SyntaxError, tokenize.TokenError) as e:
         print("hq-mutate: não leio %s (%s)" % (a.file, e), file=sys.stderr)
         return 3
@@ -622,7 +651,7 @@ def apply(a):
         return 6
     m = next((c for c in cands if c["id"] == a.id), None)
     if m is None:
-        print("hq-mutate: o id %s não existe em %s (o arquivo mudou desde a varredura?)" % (a.id, "/".join(parts)), file=sys.stderr)
+        print("hq-mutate: o id %s não existe em %s (o arquivo mudou desde a varredura, ou o trecho é o autoteste embutido, que o motor não muta)" % (a.id, "/".join(parts)), file=sys.stderr)
         return 4
     mutated = text[:m["s"]] + m["new"] + text[m["e"]:]
     if valid(path, mutated) is not True:   # False = não compila · None = não deu para saber: nos dois o mutante não vai a lugar nenhum

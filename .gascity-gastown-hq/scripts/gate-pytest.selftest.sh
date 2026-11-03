@@ -22,6 +22,9 @@
 #   lê vazio e não casa com letra nenhuma); `-gt 0` por `-ge 0` em `nids -gt 0 && ids_fora -eq 1` (ids_fora só vira 1 com um id não vazio, e um id não vazio já conta em nids).
 #   Rodízio de 03/11 (ga-59jrj3d), os ids que o motor segue listando para as três trocas acima: 13d386aabe (laço das opções), 0d2104d20e e ec78bd7950 (grupo de flags curtas), 2754dbb251 (`nids -gt 0`).
 #   Mortos nele: o `--help` que sai 0, a flag sem valor ANTES do alvo, os 50 reprovados que ainda se confirmam um a um e o json_list/json_clip chamados direto (lista vazia ou que cai toda na limpeza = nada impresso, rc 1).
+# EQUIVALENT 13d386aabe: `-gt` por `-ge` no laco das opcoes: com $# = 0 o case ve $1 vazio e sai pelo `*) break`
+# EQUIVALENT 0d2104d20e ec78bd7950: `-lt` por `-le` na leitura de um grupo de flags curtas: a posicao logo depois do fim le vazio e nao casa com letra nenhuma
+# EQUIVALENT 2754dbb251: `-gt 0` por `-ge 0` em `nids -gt 0 && ids_fora -eq 1`: ids_fora so vira 1 com um id nao vazio, e um id nao vazio ja conta em nids
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 GP="$HERE/gate-pytest.sh"

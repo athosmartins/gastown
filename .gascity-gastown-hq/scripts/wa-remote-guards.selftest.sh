@@ -394,6 +394,8 @@ case_u_registry() { uc registry; }
 # Fora do alcance destes casos: a89c4d08ba 1d719f54b0 49ab621386 (equivalentes: o split do ls-tree cai no mesmo ValueError, e nl == 0 só existe com pos == 0, onde o corte é vazio dos
 # dois jeitos) e b82742161c b451aff2f3 (flush=True: só se vê se o processo morre depois de escrever). A cena de G12 com 6+ plists (avisos_cap: d414b9aca8 f6affd9302 a01c4377f4 82a7bd8828)
 # e o guard de confiança que levanta depois de carregar (cut_120_run: d4b87a34d1) vieram depois (ga-r8nsaot).
+# EQUIVALENT a89c4d08ba 1d719f54b0 49ab621386: o split do ls-tree cai no mesmo ValueError, e `nl == 0` so existe com pos == 0, onde o corte e vazio dos dois jeitos
+# EQUIVALENT b82742161c b451aff2f3: `flush=True` -> False: so se ve se o processo morre depois de escrever
 case_u_git() { uc git; }
 case_u_tree() { uc tree; }
 case_u_blob() { uc blob; }

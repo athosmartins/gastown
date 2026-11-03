@@ -6,6 +6,7 @@
 #
 # HERMÉTICO: pasta descartável e uma JAULA FALSA que só registra cada execução e deixa passar. Cada caso é uma IMPRESSÃO DIGITAL (rc, veredito, contagens, execuções na jaula): vale se for a esperada, e o MUTANTE do motor vale se ela mudar (âncora que não casa exatamente 1 vez = INVÁLIDO, ga-31xxl5).
 # TETO DE ESCRITA (ga-e6ug8gq): um mutante cujo selftest entra em laço de escrita morre pelo teto por arquivo (`--fsize-mb`) e conta como MORTO. O caso grava com um awk em laço (fixture `loopy.sh`, parado em ~264 MB só para um motor SEM teto não encher o disco deste selftest) com o teto em 4 MB e confere: o arquivo não passou de 4 MB, o awk morreu (rc 153), em menos de 5 s, o mutante contou como morto e a pasta de trabalho ficou vazia. Cada elo do teto tem seu mutante do motor (teto ausente, em bytes, não fixado, SIGXFSZ ignorado, só no soft, falha que roda mesmo assim, sem mínimo contra um limite herdado, uso sem validação).
+# AUTOTESTE EMBUTIDO E REGISTRO (ga-eszw2df): `def _selftest()` / `def selftest()` de topo de um sujeito .py não gera candidato (gen, apply rc 4, sweep; o hash muda só para quem tem a região) · a linha `# EQUIVALENT <id>…: <razão>` do selftest é comentário puro: fora do hash, da denylist e do --also do apply · leitura que falha = rc 3.
 # AMBIENTE: com a JAULA REAL (Linux com Landlock, o nó) roda também o caso de contenção (o caminho de fora vai no TEXTO do selftest, o `env -i` do motor apagaria uma variável; controle e mutante pelo mesmo caminho); sem ela imprime AMBIENTE e sai 97.
 # O mesmo vale para o caso do teto que o lançador não consegue fixar: ele só é alcançável com o limite duro de escrita ilimitado. Sob um duro finito (p.ex. dentro do `heavy-guard.sh`, 512 MB) o caso e o seu mutante são pulados com AMBIENTE e o exit é 97 (FAIL=0): esta bateria mede o próprio teto, então rode-a com `--max-file-mb 0` ou direto no nó. Seus fixtures são limitados (~260 MB).
 set -u
@@ -421,6 +422,133 @@ fp_plan() {
 }
 EXP_PLAN="todo@scripts/alpha.sh denylist:sudo@scripts/delta.sh todo@scripts/zeta.sh todo@scripts/beta.sh todo@packs/town-deltas/assets/eps.py | cov=sem-novidade part=todo skip=base-vermelha exp=todo"
 peq "plan: alpha (mudou há <7 dias) primeiro; depois sem mutante embutido e menos recente; eps (embutido) por último; gamma e hetzner-ballast fora; cobertura e retry_after" "$EXP_PLAN" fp_plan
+
+# ── autoteste embutido no sujeito (ga-eszw2df) ──────────────────────────────────────────────────────────────────
+# Um sujeito .py que carrega o próprio `def _selftest()` (child-priority-janitor.py: 70 dos 259 sobreviventes do nó em 03/11) tem mutantes ali dentro que sobrevivem POR CONSTRUÇÃO: trocar uma fixture ou um assert do teste por outro valor
+# "continua verdadeiro". O motor não os gera: só a função de TOPO de nome exato (_selftest, selftest), decorador incluso, e só em .py. O hash do alvo muda SÓ para quem tem a região (os outros não voltam a ser varridos).
+mkemb() {  # emb.py: o autoteste (com decorador) entre linhas de produção COLADAS nele, sem linha em branco; emb2.py: método de classe e nome só com o prefixo (continuam mutáveis) e um async e um de topo (são o autoteste)
+  printf '%s\n' 'import sys' 'START = 7' '@_deco(1 > 0)' 'def _selftest():' '    assert total(3, 1) == 2' '    return 0' 'LIMIT = 5' 'def total(a, b):' '    if a > b:' '        return a - b' '    return 0' \
+    'def main():' '    if len(sys.argv) > 1 and sys.argv[1] == "--selftest":' '        return _selftest()' '    return total(2, 1)' 'if __name__ == "__main__":' '    sys.exit(main())' > "$TREE/scripts/emb.py"
+  printf '%s\n' 'class K:' '    def _selftest(self):' '        return 1 == 1' 'def selftest_helper():' '    return 2 > 1' 'async def selftest():' '    return 3 > 2' 'def _selftest():' '    return 4 > 3' > "$TREE/scripts/emb2.py"
+  mkst emb ': emb.py'; mkst emb2 ': emb2.py'
+}
+EXP_EMB_GEN='11|num|0|1
+13|lim|>|>=
+13|num|1|0
+13|num|1|0
+13|swap|==|!=
+13|swap|>|<=
+13|swap|and|or
+15|num|1|0
+15|num|2|3
+16|swap|==|!=
+2|num|7|8
+7|num|5|6
+9|lim|>|>=
+9|swap|>|<='
+EXP_EMB2_GEN='3|num|1|0
+3|num|1|0
+3|swap|==|!=
+5|lim|>|>=
+5|num|1|0
+5|num|2|3
+5|swap|>|<='
+fp_emb_gen() { newfx; mkemb; echo "emb=$(genl "$TREE/scripts/emb.py" | cksum) emb2=$(genl "$TREE/scripts/emb2.py" | cksum)"; }
+EXP_EMB_FP="emb=$(printf '%s\n' "$EXP_EMB_GEN" | cksum) emb2=$(printf '%s\n' "$EXP_EMB2_GEN" | cksum)"
+peq "autoteste embutido: o gen não traz candidato de def _selftest (decorador e última linha inclusos; as linhas coladas dos dois lados ficam) nem de async def selftest; método de classe e nome só com o prefixo continuam mutáveis" "$EXP_EMB_FP" fp_emb_gen
+eid() { python3 -I -c 'import hashlib, sys; print(hashlib.sha1(("%s:%s:%s:%s>%s:1" % tuple(sys.argv[1:6])).encode()).hexdigest()[:10])' "$@"; }   # o id como o doc o define (arquivo:linha:operador:antes>depois:1ª ocorrência), calculado sem o motor
+fp_emb_apply() {  # o id de um trecho de produção (L16) grava o mutante; o id de dentro do autoteste (L5, o do estado velho de uma bead rolante) é id inexistente, rc 4, e nada é gravado
+  newfx; mkemb; local a b
+  hm apply "$TREE/scripts/emb.py" --tree "$TREE" --id "$(eid scripts/emb.py 16 swap '==' '!=')" --out "$F/prod.py" > /dev/null 2>&1; a=$?
+  hm apply "$TREE/scripts/emb.py" --tree "$TREE" --id "$(eid scripts/emb.py 5 swap '==' '!=')" --out "$F/reg.py" > /dev/null 2>&1; b=$?
+  echo "prod=$a mudou=$(diff "$TREE/scripts/emb.py" "$F/prod.py" 2> /dev/null | grep -c '^[<>]') regiao=$b gravou=$([ -e "$F/reg.py" ] && echo SIM || echo nao)"
+}
+EXP_EMB_APPLY="prod=0 mudou=2 regiao=4 gravou=nao"
+peq "autoteste embutido: apply de um id de produção grava (muda UMA linha); apply do id de dentro do autoteste é rc 4 e não grava" "$EXP_EMB_APPLY" fp_emb_apply
+fp_emb_sweep() { newfx; mkemb; sw; cnt; }
+EXP_EMB_SWEEP="rc=0 completo run=21 k=0 c=21 f=0 inv=0 open=21"
+peq "autoteste embutido: a varredura roda só os 21 mutantes de produção (14 de emb.py + 7 de emb2.py), não os 17 de dentro dos autotestes" "$EXP_EMB_SWEEP" fp_emb_sweep
+fp_emb_plan() {  # o estado de ANTES do motor novo (hash sem a região) de cinco alvos todos julgados: só os com autoteste embutido voltam a ser todo; o resto segue sem-novidade; um .py que o ast não lê não derruba o plano
+  newfx; mkemb; mkfoo; printf 'x = 1\n' > "$TREE/scripts/plain.py"; mkst plain ': plain.py'; printf 'x = = 1\n' > "$TREE/scripts/bad.py"; mkst bad ': bad.py'
+  python3 -I -c 'import hashlib, importlib.util, json, sys
+sp = importlib.util.spec_from_file_location("hqm", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+t = {}
+for n in ("emb", "emb2", "plain", "bad", "foo"):
+    subj = n + (".sh" if n == "foo" else ".py")
+    blobs = [open("%s/scripts/%s" % (sys.argv[2], f), "rb").read() for f in (subj, n + ".selftest.sh")]
+    t["scripts/" + subj] = {"hash": hashlib.sha1(b"\0".join(blobs) + b"v%d.s%d" % (m.VERSION, m.SCAN_REV)).hexdigest(), "total": 1, "verdicts": {"a": "k"}}
+json.dump({"v": 1, "targets": t}, open(sys.argv[3], "w"))' "${ENG:-$HM}" "$TREE" "$F/st.json"
+  hm plan --tree "$TREE" --state "$F/st.json" | awk -F'\t' '{print $2 "=" $1}' | sort | paste -sd' ' -
+}
+EXP_EMB_PLAN="scripts/bad.py=sem-novidade scripts/emb.py=todo scripts/emb2.py=todo scripts/foo.sh=sem-novidade scripts/plain.py=sem-novidade"
+peq "autoteste embutido: estado de antes do motor novo → só emb.py e emb2.py (têm a região) voltam a todo; plain.py, foo.sh e o bad.py que o ast não lê seguem sem-novidade" "$EXP_EMB_PLAN" fp_emb_plan
+fp_emb_bad() {  # tokeniza mas não compila (x = = 1): o ast não lê, então não há região a tirar e o gen dá os candidatos de sempre (rc 0), nunca rc 3 nem lista vazia
+  newfx; printf 'x = = 1\n' > "$F/bad.py"; local o rc; o=$(hm gen "$F/bad.py" 2>&1); rc=$?; echo "rc=$rc $(printf '%s' "$o" | cut -f2-5 | tr '\t' '|')"
+}
+EXP_EMB_BAD="rc=0 1|num|1|0"
+peq "autoteste embutido: .py que tokeniza mas o ast não lê = os candidatos de sempre (rc 0), o motor não perde a cobertura por causa da região" "$EXP_EMB_BAD" fp_emb_bad
+
+# ── o registro de equivalentes não custa varredura (ga-eszw2df) ─────────────────────────────────────────────────────────────────────────────────────────
+# A linha `# EQUIVALENT <id> [<id>…]: <razão>` mora no selftest da família (é lida pelo hetzner-ballast-newfail.py) e é comentário puro: o hash do alvo, a denylist e o --also do `apply` não a veem. Sem isso cada declaração custaria uma varredura inteira do
+# alvo (o hash leva o texto do selftest) e uma razão que cita `sudo` ou `tmux` poria o alvo na denylist. Só a linha NO FORMATO (a mesma gramática do registro): nota solta em prosa, outro comentário e id que não é de 10 hex mudam o hash como sempre.
+fp_decl_hash() {  # o hash do plan do foo.sh depois de cada edição do foo.selftest.sh; igual ao de antes = a edição não custa varredura
+  newfx; mkfoo; local st="$TREE/scripts/foo.selftest.sh" h0 o="" k t; h0=$(hm plan --tree "$TREE" --state "$F/st.json" | awk -F'\t' '$2 == "scripts/foo.sh" {print $6}'); cp "$st" "$F/orig"
+  one() {  # one NOME 'linha' [meio]: põe a linha no fim (ou depois da 1ª linha) do selftest original e compara o hash
+    cp "$F/orig" "$st"; if [ "${3:-}" = meio ]; then { sed -n 1p "$F/orig"; printf '%s\n' "$2"; sed -n '2,$p' "$F/orig"; } > "$st"; else printf '%s\n' "$2" >> "$st"; fi
+    t=$(hm plan --tree "$TREE" --state "$F/st.json" | awk -F'\t' '$2 == "scripts/foo.sh" {print $6}'); o="$o $1=$([ "$t" = "$h0" ] && echo igual || echo muda)"
+  }
+  one V1 '# EQUIVALENT 0123456789: a razão tem mais de doze caracteres'
+  one V2 '# EQUIVALENT 0123456789,abcdef0123 a0a0a0a0a0: duas vírgulas e um espaço entre os ids' meio
+  one V3 '    # EQUIVALENT 0123456789: recuada, dentro de uma função'
+  one V4 '# EQUIVALENT 0123456789: a primeira linha do registro, com razão longa
+# EQUIVALENT abcdef0123: a segunda linha do registro, com razão longa'
+  one N1 '# EQUIVALENTE 0123456789: a razão tem mais de doze caracteres'
+  one N2 '# uma nota qualquer, sem o formato'
+  one N3 '# EQUIVALENT 012345678: id de 9 hex não é id do motor'
+  one N4 '# EQUIVALENT 0123456789A: id de 11 hex não é id do motor'
+  one N5 '# EQUIVALENT 012345678A: id em maiúsculas não é id do motor'
+  one N6 ': mudou o código'
+  echo "$o" | sed 's/^ //'
+}
+EXP_DECL_HASH="V1=igual V2=igual V3=igual V4=igual N1=muda N2=muda N3=muda N4=muda N5=muda N6=muda"
+peq "registro: declaração válida no selftest (no fim, no meio, com vários ids, recuada) NÃO muda o hash do alvo (nem duas de uma vez); prosa solta, outro comentário, id de 9 ou 11 hex, id em maiúsculas e código mudado mudam" "$EXP_DECL_HASH" fp_decl_hash
+fp_decl_deny() {  # a razão da declaração cita sudo: o alvo segue todo (a denylist não lê a declaração); o mesmo texto num comentário comum é denylist
+  newfx; mkfoo; local o
+  printf '%s\n' '# EQUIVALENT 0123456789: a razão cita sudo e systemctl de passagem' >> "$TREE/scripts/foo.selftest.sh"
+  o=$(hm plan --tree "$TREE" --state "$F/st.json" | awk -F'\t' '$2 == "scripts/foo.sh" {print $1}')
+  printf '%s\n' '# a nota cita sudo de passagem' >> "$TREE/scripts/foo.selftest.sh"
+  echo "$o $(hm plan --tree "$TREE" --state "$F/st.json" | awk -F'\t' '$2 == "scripts/foo.sh" {print $1}')"
+}
+fp_decl_bytes() {  # selftest com um byte fora do UTF-8 e SEM declaração: o hash é o documentado (bytes do sujeito + bytes do selftest + versão), então o estado de antes segue valendo
+  newfx; mkfoo; printf 'echo caf\351\n' >> "$TREE/scripts/foo.selftest.sh"
+  python3 -I -c 'import hashlib, importlib.util, json, sys
+sp = importlib.util.spec_from_file_location("hqm", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+blobs = [open("%s/scripts/%s" % (sys.argv[2], f), "rb").read() for f in ("foo.sh", "foo.selftest.sh")]
+json.dump({"v": 1, "targets": {"scripts/foo.sh": {"hash": hashlib.sha1(b"\0".join(blobs) + b"v%d.s%d" % (m.VERSION, m.SCAN_REV)).hexdigest(), "total": 1, "verdicts": {"a": "k"}}}}, open(sys.argv[3], "w"))' "${ENG:-$HM}" "$TREE" "$F/st.json"
+  hm plan --tree "$TREE" --state "$F/st.json" | awk -F'\t' '$2 == "scripts/foo.sh" {print $1}'
+}
+peq "registro: selftest com byte fora do UTF-8 e sem declaração mantém o hash documentado (os bytes voltam como entraram)" "sem-novidade" fp_decl_bytes
+peq "registro: razão que cita sudo não põe o alvo na denylist; o mesmo texto num comentário comum põe" "todo denylist:sudo" fp_decl_deny
+fp_decl_apply() {  # o apply (gate) lê o --also sem a declaração: a razão cita tmux e o mutante grava (rc 0); a nota solta com tmux é recusada (rc 6)
+  newfx; mkfoo; local a b id; id=$(hm gen --tree "$TREE" "$TREE/scripts/foo.sh" | head -n 1 | cut -f1)
+  printf '%s\n' '# EQUIVALENT 0123456789: a razão cita tmux de passagem' > "$F/also1"; printf '%s\n' '# a nota cita tmux de passagem' > "$F/also2"
+  hm apply "$TREE/scripts/foo.sh" --tree "$TREE" --id "$id" --out "$F/o1" --also "$F/also1" > /dev/null 2>&1; a=$?
+  hm apply "$TREE/scripts/foo.sh" --tree "$TREE" --id "$id" --out "$F/o2" --also "$F/also2" > /dev/null 2>&1; b=$?
+  echo "$a $b"
+}
+peq "registro: apply com --also que só tem a declaração (cita tmux) grava; com nota solta que cita tmux é recusado (denylist)" "0 6" fp_decl_apply
+fp_decl_unreadable() {  # as leituras que passam por decl_free / DECL_RX FALHAM: --also que não existe ou sem permissão (apply) e sujeito sem permissão (plan) = rc 3 e nada gravado, nunca traceback nem "sem declaração"
+  newfx; mkfoo; local a b c id; id=$(hm gen --tree "$TREE" "$TREE/scripts/foo.sh" | head -n 1 | cut -f1)
+  hm apply "$TREE/scripts/foo.sh" --tree "$TREE" --id "$id" --out "$F/o1" --also /nonexistent/x.selftest.sh > /dev/null 2>&1; a=$?
+  b=n/a; c=n/a
+  if [ "$(id -u)" != 0 ]; then   # root lê arquivo com modo 000: o caso não existe para ele
+    : > "$F/also0"; chmod 000 "$F/also0"; hm apply "$TREE/scripts/foo.sh" --tree "$TREE" --id "$id" --out "$F/o2" --also "$F/also0" > /dev/null 2>&1; b=$?
+    chmod 000 "$TREE/scripts/foo.sh"; hm plan --tree "$TREE" --state "$F/st.json" > /dev/null 2>&1; c=$?; chmod 644 "$TREE/scripts/foo.sh"
+  fi
+  echo "also-ausente=$a also-sem-permissao=$b sujeito-sem-permissao=$c gravou=$([ -e "$F/o1" ] || [ -e "$F/o2" ] && echo SIM || echo nao)"
+}
+EXP_DECL_UNREAD="also-ausente=3 also-sem-permissao=3 sujeito-sem-permissao=3 gravou=nao"; [ "$(id -u)" != 0 ] || EXP_DECL_UNREAD="also-ausente=3 also-sem-permissao=n/a sujeito-sem-permissao=n/a gravou=nao"
+peq "registro: --also que não existe ou sem permissão e sujeito sem permissão = rc 3 (estado inerte), nada gravado" "$EXP_DECL_UNREAD" fp_decl_unreadable
 # mut NOME ANTIGO NOVO: copia o motor e troca ANTIGO por NOVO (tem de casar exatamente 1 vez); o caminho fica em $MP
 mut() {
   MP="$W/eng-$1.py"
@@ -503,6 +631,38 @@ par kill_it slot-unidade         fp_slot "$EXP_SLOT" 'kb - base_kb >= ctx.a.slot
 par kill_it slot-sem-medida      fp_slot "$EXP_SLOT" 'if kb is not None and kb - base_kb >= ctx.a.slot_mb * 1024:' 'if False:'
 par kill_it slot-uso-zero        fp_slot_uso " 2 2 2 2 | $EXP_SW0" 'if a.slot_mb < 1:' 'if a.slot_mb < 0:'
 par kill_it slot-du-ilegivel     fp_slot_semdu "$EXP_SLOT_SEMDU" 'if kb is not None and kb - base_kb >= ctx.a.slot_mb * 1024:' 'if (1 << 40 if kb is None else kb) - base_kb >= ctx.a.slot_mb * 1024:'
+par kill_it autoteste-ligado     fp_emb_gen   "$EXP_EMB_FP" '    return [(min([n.lineno]' '    return []  # [n.lineno]'
+par kill_it autoteste-no-apply   fp_emb_apply "$EXP_EMB_APPLY" '    return [(min([n.lineno]' '    return []  # [n.lineno]'
+par kill_it autoteste-no-sweep   fp_emb_sweep "$EXP_EMB_SWEEP" '    return [(min([n.lineno]' '    return []  # [n.lineno]'
+par kill_it decorador-fora       fp_emb_gen   "$EXP_EMB_FP" 'min([n.lineno] + [d.lineno for d in n.decorator_list])' 'n.lineno'
+par kill_it fim-menos-um         fp_emb_gen   "$EXP_EMB_FP" 'n.end_lineno) for n in body' 'n.end_lineno - 1) for n in body'
+par kill_it fim-mais-um          fp_emb_gen   "$EXP_EMB_FP" 'n.end_lineno) for n in body' 'n.end_lineno + 1) for n in body'
+par kill_it inicio-menos-um      fp_emb_gen   "$EXP_EMB_FP" 'min([n.lineno] + [d.lineno for d in n.decorator_list]), n.end_lineno' 'min([n.lineno] + [d.lineno for d in n.decorator_list]) - 1, n.end_lineno'
+par kill_it so-um-nome           fp_emb_gen   "$EXP_EMB_FP" 'SELF_TEST_FUNCS = ("_selftest", "selftest")' 'SELF_TEST_FUNCS = ("_selftest",)'
+par kill_it por-prefixo          fp_emb_gen   "$EXP_EMB_FP" 'and n.name in SELF_TEST_FUNCS]' 'and n.name.startswith(SELF_TEST_FUNCS)]'
+par kill_it aninhados            fp_emb_gen   "$EXP_EMB_FP" 'for n in body if isinstance' 'for n in ast.walk(ast.parse(text)) if isinstance'
+par kill_it sem-async            fp_emb_gen   "$EXP_EMB_FP" '(ast.FunctionDef, ast.AsyncFunctionDef)' '(ast.FunctionDef,)'
+par kill_it so-a-primeira        fp_emb_gen   "$EXP_EMB_FP" 'and n.name in SELF_TEST_FUNCS]' 'and n.name in SELF_TEST_FUNCS][:1]'
+par kill_it fim-exclusivo        fp_emb_gen   "$EXP_EMB_FP" 'any(a <= r <= b for a, b in skip)' 'any(a <= r < b for a, b in skip)'
+par kill_it inicio-exclusivo     fp_emb_gen   "$EXP_EMB_FP" 'any(a <= r <= b for a, b in skip)' 'any(a < r <= b for a, b in skip)'
+par kill_it regiao-ignorada      fp_emb_gen   "$EXP_EMB_FP" 'if r != r2 or any(a <= r <= b for a, b in skip):' 'if r != r2:'
+par kill_it ast-ilegivel-derruba fp_emb_bad   "$EXP_EMB_BAD" $'    except (SyntaxError, ValueError):\n        return []' $'    except ZeroDivisionError:\n        return []'
+par kill_it ast-ilegivel-no-plano fp_emb_plan "$EXP_EMB_PLAN" $'    except (SyntaxError, ValueError):\n        return []' $'    except ZeroDivisionError:\n        return []'
+par kill_it hash-sem-regiao      fp_emb_plan  "$EXP_EMB_PLAN" ' + (("e%s" % (spans,)).encode() if spans else b"")' ''
+par kill_it hash-sempre          fp_emb_plan  "$EXP_EMB_PLAN" '.encode() if spans else b"")' '.encode() if True else b"")'
+par kill_it registro-no-hash     fp_decl_hash "$EXP_DECL_HASH" '[decl_free(s.read_bytes()) for s in sts]' '[s.read_bytes() for s in sts]'
+par kill_it registro-na-denylist fp_decl_deny "todo denylist:sudo" '[decl_free(s.read_bytes()) for s in sts]' '[s.read_bytes() for s in sts]'
+par kill_it qualquer-comentario  fp_decl_hash "$EXP_DECL_HASH" 'EQUIVALENT[ \t]+[0-9a-f]{10}(?:[ \t,]+[0-9a-f]{10})*[ \t]*:[^\n]*\n?", re.M)' '[^\n]*\n?", re.M)'
+par kill_it prosa-solta-sai      fp_decl_hash "$EXP_DECL_HASH" 'EQUIVALENT[ \t]+[0-9a-f]{10}(?:' 'EQUIVALENT\w*[ \t]+[0-9a-f]{10}(?:'
+par kill_it id-de-9-ou-mais-hex  fp_decl_hash "$EXP_DECL_HASH" '[ \t]+[0-9a-f]{10}(?:[ \t,]+' '[ \t]+[0-9a-f]{9,}(?:[ \t,]+'
+par kill_it id-em-maiusculas     fp_decl_hash "$EXP_DECL_HASH" 'EQUIVALENT[ \t]+[0-9a-f]{10}(?:' 'EQUIVALENT[ \t]+[0-9a-fA-F]{10}(?:'
+par kill_it registro-sem-multilinha fp_decl_hash "$EXP_DECL_HASH" '[^\n]*\n?", re.M)' '[^\n]*\n?")'
+par kill_it so-a-primeira-linha  fp_decl_hash "$EXP_DECL_HASH" 'return DECL_RX.sub("", raw.decode("utf-8", "surrogateescape"))' 'return DECL_RX.sub("", raw.decode("utf-8", "surrogateescape"), count=1)'
+par kill_it bytes-perdidos       fp_decl_bytes "sem-novidade" '.encode("utf-8", "surrogateescape")' '.encode("utf-8", "replace")'
+par kill_it decodifica-com-replace fp_decl_bytes "sem-novidade" 'raw.decode("utf-8", "surrogateescape")' 'raw.decode("utf-8", "replace")'
+par kill_it apply-erro-de-leitura fp_decl_unreadable "$EXP_DECL_UNREAD" $'    except (OSError, ValueError, SyntaxError, tokenize.TokenError) as e:\n        print("hq-mutate: não leio %s (%s)" % (a.file, e), file=sys.stderr)\n        return 3\n    deny' $'    except (ValueError, SyntaxError, tokenize.TokenError) as e:\n        print("hq-mutate: não leio %s (%s)" % (a.file, e), file=sys.stderr)\n        return 3\n    deny'
+par kill_it plan-erro-de-leitura fp_decl_unreadable "$EXP_DECL_UNREAD" $'        except (OSError, ValueError, KeyError, TypeError) as e:\n            print("hq-mutate: %s: %s" % (type(e).__name__, e), file=sys.stderr)' $'        except (ValueError, KeyError, TypeError) as e:\n            print("hq-mutate: %s: %s" % (type(e).__name__, e), file=sys.stderr)'
+par kill_it apply-le-a-declaracao fp_decl_apply "0 6" 'also = [DECL_RX.sub("", Path(p).read_text(encoding="utf-8", errors="replace")) for p in a.also]' 'also = [Path(p).read_text(encoding="utf-8", errors="replace") for p in a.also]'
 reap
 # controle do controle: o `mut` recusa uma âncora ambígua e uma que não casa
 FAIL0=$FAIL   # o mut recusa e conta uma falha própria: aqui a recusa é o esperado, então só a aceitação reprova

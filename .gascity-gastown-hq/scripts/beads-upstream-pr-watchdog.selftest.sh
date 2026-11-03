@@ -558,6 +558,9 @@ echo "== lock edges, the script as a program, unreadable gh / bd output =="
 # _bupw_lock_holder_dead says "dead" only for a pid read from the heartbeat's first line, so a heartbeat that is empty at that point cannot be; the stat chain
 # `A || B || C` -> `A || B && C` (f33a615f4e): it prints the age of whichever of the BSD and GNU forms answers, and an empty line more, which $(...) drops
 # (`A && B || C`, 63d6ca95b6, does not: below).
+# EQUIVALENT 9122e0cab9 da12ce03da 02d2feffe8 8db6498b62 2986485ef0 6d485cfc2d f59c4652e3 a859477f33 75643e9927 83c269f339: `|| true` -> `&& true` after a command whose status nobody reads, under no `set -e`
+# EQUIVALENT 84b1276392: the `.reaping` guard `return 1` -> `0` after `[ ! -s HB ]`: _bupw_lock_holder_dead says "dead" only for a pid read from the heartbeat's first line, so a heartbeat that is empty at that point cannot be
+# EQUIVALENT f33a615f4e: the stat chain `A || B || C` -> `A || B && C`: it prints the age of whichever of the BSD and GNU forms answers, and an empty line more, which $(...) drops
 lk_reset() { rm -rf "$BUPW_LOCK_DIR" "${BUPW_LOCK_DIR}.reaping" "${BUPW_LOCK_DIR}".reaping.dead.* 2>/dev/null; }
 ( : ) & DPID=$!; wait "$DPID" 2>/dev/null   # a pid that was alive a moment ago and is not any more
 lk_dead() { lk_reset; mkdir "$BUPW_LOCK_DIR"; echo "$DPID:deadtoken" > "$BUPW_LOCK_HB"; }

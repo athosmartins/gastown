@@ -451,6 +451,14 @@ fi
 # (c9a2330390: either way the span becomes blanks); L535 (9e6cae76dd 4811986b78 569352adef 5ce418c91f b486d0be6a fba0354185: the `del
 # lines[c_idx]` is dead code, after the section is cut the line at c_idx is the next heading or the end, never a blank); L545 `j <=
 # len(lines)` (13f08e727f: past the end there is no heading to read).
+# EQUIVALENT 09a292562b: L135 `i = 0` is rebound by the `for` before any read
+# EQUIVALENT 11f31a3190 ff2906b462 f6481f352b: `m.group(1)[0]` -> `[1]`: a fence run is one repeated character
+# EQUIVALENT 6c1083c9ac: `i < c_idx` -> `<=`: `others` already leaves c_idx out
+# EQUIVALENT 44cfbe0b43: `not others` -> `others`: REQUIRE_CONTENTS_WITHOUT_H2 is True, so the condition is False either way
+# EQUIVALENT b09a71442d: `h[0] > 2` -> `>= 2`: a ## before Contents ends in contents-late first
+# EQUIVALENT c9a2330390: `len(m.group(0))` -> `group(1)`: either way the span becomes blanks
+# EQUIVALENT 9e6cae76dd 4811986b78 569352adef 5ce418c91f b486d0be6a fba0354185: the `del lines[c_idx]` is dead code: after the section is cut the line at c_idx is the next heading or the end, never a blank
+# EQUIVALENT 13f08e727f: `j <= len(lines)`: past the end there is no heading to read
 echo "-- lastro: edges, defaults and exits, in process"
 cat > "$SBX/lastro.py" <<'PYEOF'
 import contextlib, importlib.util, io, os, subprocess, sys, types

@@ -247,6 +247,7 @@ echo "── 10. os ramos que as seções acima não pisam (ga-eedg7fw, hq-mutan
 # O `run` acima sempre fixa SILENT_IGN_ROOTS=/tmp, então a descoberta das raízes (HQ + `gc rig list`) nunca rodava. Aqui o `gc` é de mentira (PATH) e o scanner grava
 # com que --path foi chamado. EQUIVALENTE, sem caso (hq-mutants L121): `printf … | grep -E ':(C1|C2|C3):' >> "$tmp_raw" || true` com `||`→`&&` — o script roda com
 # `set -uo pipefail`, SEM -e, e o rc dessa linha não é lido em lugar nenhum.
+# EQUIVALENT ed339600c1: `printf ... | grep -E ... >> "$tmp_raw" || true` com `||` -> `&&`: o script roda com `set -uo pipefail`, SEM -e, e o rc dessa linha nao e lido em lugar nenhum
 mkdir -p "$TD/stubs" "$TD/stubs-nosha" "$TD/hq" "$TD/rigA"
 cat > "$TD/stubs/gc" <<'GCEOF'
 #!/bin/sh

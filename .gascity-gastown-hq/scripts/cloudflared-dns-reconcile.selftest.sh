@@ -60,6 +60,7 @@ echo "── Cenarios 3+: o script inteiro contra curl, python3 e cloudflared de
 # EQUIVALENTES (lastro e95f59f16c L47 e 90615c79ab L56): `notify_fail ... || true` -> `&& true` e o
 # `return 0` de log() -> `return 1` so mudam o STATUS dessas duas funcoes, e nenhum chamador o le (o
 # script nao tem set -e e sai por exit explicito ou pelo `[[ $failed -eq 0 ]]` final).
+# EQUIVALENT e95f59f16c 90615c79ab: `notify_fail ... || true` -> `&& true` e o `return 0` de log() -> `return 1` so mudam o STATUS dessas duas funcoes, e nenhum chamador o le (o script nao tem set -e)
 REAL_PY="$(command -v python3)"
 [ -x "$REAL_PY" ] || { echo "FATAL: sem python3 no PATH"; exit 1; }
 BIN="$TMP/bin"; mkdir "$BIN" || exit 1

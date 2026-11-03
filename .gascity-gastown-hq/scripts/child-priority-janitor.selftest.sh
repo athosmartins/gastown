@@ -194,6 +194,14 @@ case_ "in-process: limites do planejador, costuras de I/O, lock e o contador do 
 # trocado: "filha mais urgente não desce" vale com o pai em P2 ou em P3), o `<` -> `<=` de ptarget em plan_raises (atribui o mesmo valor, 51343d2b3a) e o flush=True do
 # _log (5847500c1c: só se vê se o processo morre depois de escrever).
 # vazio → sem a linha 'DONE 0', vermelho; falhou/ilegível → uma linha FAIL ou rc != 0, vermelho.
+# EQUIVALENT 51343d2b3a: `<` -> `<=` de ptarget em plan_raises: atribui o mesmo valor
+# EQUIVALENT 5847500c1c: o `flush=True` do _log: so se ve se o processo morre depois de escrever
+# EQUIVALENT 05d88c954b 093deb0e89 0ff72cbd15 11daa9e4a1 146c3071a3 1547231b81 15ba0348a7 246287f518 250b29933b 251c9d90c3 283f7af2fd 2a2530754f: TRANSITORIO: mutante de dentro do `_selftest()` embutido (L364-533) que o hq-mutate.py novo ja nao gera (confira com `hq-mutate.py gen`); sai do estado quando o motor varrer o janitor de novo, e entao esta linha pode ser apagada
+# EQUIVALENT 2e3e4f09e5 36e4b8b9d6 3c85db7649 3cf36ddf6f 3cf633b500 3ffbc9973e 4468e98ace 4f3cc44912 4f6ebd57a5 5178ea198c 5334adbf0e 5b677359c9: TRANSITORIO: mutante de dentro do `_selftest()` embutido (L364-533) que o hq-mutate.py novo ja nao gera (confira com `hq-mutate.py gen`); sai do estado quando o motor varrer o janitor de novo, e entao esta linha pode ser apagada
+# EQUIVALENT 5baa42cdce 603669880c 605ff672ef 61d41129e3 688a1ef25f 6b2e22a092 6cce0a0f57 6cfe3d2569 6d323c5a73 730a4e8abc 7457c01d5b 746de8e06a: TRANSITORIO: mutante de dentro do `_selftest()` embutido (L364-533) que o hq-mutate.py novo ja nao gera (confira com `hq-mutate.py gen`); sai do estado quando o motor varrer o janitor de novo, e entao esta linha pode ser apagada
+# EQUIVALENT 7693b41cef 78651a9943 7df3cb4781 811019242a 84ed7f8bb4 862d31bda4 965ac0e61d 99582b3abe 9bccec5c2c a12fe42def a2d1a56914 a74224fa12: TRANSITORIO: mutante de dentro do `_selftest()` embutido (L364-533) que o hq-mutate.py novo ja nao gera (confira com `hq-mutate.py gen`); sai do estado quando o motor varrer o janitor de novo, e entao esta linha pode ser apagada
+# EQUIVALENT ad726e3038 adf6e09e62 be82125e00 c29ce79692 c5ca9535a2 c864890e75 cdc493dca7 cf732d7e15 cfaf17b7ff cfc8f44760 d73126b390 d7f628797d: TRANSITORIO: mutante de dentro do `_selftest()` embutido (L364-533) que o hq-mutate.py novo ja nao gera (confira com `hq-mutate.py gen`); sai do estado quando o motor varrer o janitor de novo, e entao esta linha pode ser apagada
+# EQUIVALENT d8a8edda93 dd32fe1d84 e6990befa5 e728bdf8f8 e780a985bb f0167ff049 f17847c3c6 f2db5ca529 f63fcb95be fa7acce942: TRANSITORIO: mutante de dentro do `_selftest()` embutido (L364-533) que o hq-mutate.py novo ja nao gera (confira com `hq-mutate.py gen`); sai do estado quando o motor varrer o janitor de novo, e entao esta linha pode ser apagada
 cat > "$W/blk.py" <<'PY'
 import contextlib, fcntl, importlib.util, io, os, sys, tempfile
 sys.dont_write_bytecode = True

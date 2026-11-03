@@ -59,6 +59,7 @@
 # there is no scenario that sees the difference.
 #
 # Run:  bash packs/town-deltas/assets/pilot-manual-reclaim.selftest.sh
+# EQUIVALENT 825d7d2791 08ba2503b4 09f520a343 d4f03dc13b f51fd9aafb 288e1a3742: `... -q 2>/dev/null || true` -> `&& true`: the script has no `set -e` and nobody reads the rc of those calls (the post-state is VERIFIED from a fresh `bd show` further down)
 set -u
 
 # Resolve relative to this selftest's own location (not a hardcoded main-

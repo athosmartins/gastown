@@ -124,6 +124,7 @@ ok "nenhum valor ambiguo resolve para ACT"
 # EQUIVALENTE (lastro 807c305212, L68): `notify_fail() { ... || true; }` -> `... && true` so muda
 # o STATUS de notify_fail, e o unico chamador (a recusa do rename, ultimo comando do laco) nunca
 # le esse status: o script sai por `exit 0`. Nenhuma saida, arquivo ou codigo de saida difere.
+# EQUIVALENT 807c305212: `notify_fail() { ... || true; }` -> `&& true` so muda o STATUS de notify_fail, e o unico chamador nunca le esse status: o script sai por `exit 0`
 _rc() { # <rc esperado> <titulo> <comando...>
   local want="$1" title="$2" got; shift 2
   "$@" >/dev/null 2>&1; got=$?

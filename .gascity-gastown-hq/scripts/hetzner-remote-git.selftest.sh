@@ -170,6 +170,9 @@ grep -qF 'spec indisponível' "$LPE" && ok "espelho sem filtro: o stderr do ssh 
 # (se o `find` falha o `tr` não roda, $t/files não existe e a conferência é sempre falsa).
 # EQUIVALENTES do rodízio de 03/11 (ga-59jrj3d, provados por leitura): o `return 0` -> `return 1` do lag_fields (c5c184d44d: os três chamadores o chamam com `;`, e sem `set -e` o status nunca é lido) e o `|| true` -> `&& true` do
 # `old=$(g config gtremote.sparseoid || true)` do pull (fe123d753c: o status da atribuição nunca é lido; o valor é o mesmo).
+# EQUIVALENT 5572d3e5d6 6a099af2c5: o `|| true` -> `&& true` das duas leituras `rev-parse -q --verify` do status: sem `set -e` o rc de uma atribuicao por $( ) nunca e lido
+# EQUIVALENT 6c2726b5e0: o `&&` -> `||` entre o `tr` e a conferencia de contagem do `find` do scan: se o `find` falha o `tr` nao roda, $t/files nao existe e a conferencia e sempre falsa
+# EQUIVALENT 3e96e45c69: o `|| return 2` do `mktemp -d` dentro de denied: sem ele o `git init /r` falha na raiz do disco para quem nao e root e o rc continua 2
 mkdir -p "$T/shim2" "$T/home"; export REAL_DATE; REAL_DATE=$(command -v date)
 printf '%s\n' '#!/bin/sh' '[ -n "${FAKE_NOW:-}" ] && [ "${1:-}" = +%s ] && { echo "$FAKE_NOW"; exit 0; }' 'exec "$REAL_DATE" "$@"' > "$T/shim2/date"   # FAKE_NOW fixa o `date +%s` do script: a idade sai exata
 printf '%s\n' '#!/bin/sh' 'case "${SHIM2_MODE:-}:${1:-}" in' '  mktempfail:-d) echo "shim: mktemp -d falhou (de proposito)" >&2; exit 1 ;;' \

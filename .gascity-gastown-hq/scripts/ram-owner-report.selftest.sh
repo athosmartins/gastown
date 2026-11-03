@@ -122,6 +122,10 @@ echo "── Scenario: the module's own functions, edge by edge (ga-hq1qc5y, hq-
 # EQUIVALENT, documented: 63dc55df69 (sys.path.insert position: no other module of that name is on the path), c7bbe33248 (`base <= 0` -> `<` after `not base`: 0 is caught by `not base`,
 # a negative base by both), d0754f3e66 (`d and d > 0` -> `>=`: 0 is falsy before the comparison), 27cf8f8597 (sys.argv[1:] -> [0:]: the script path is not a flag).
 # One in-process python run: the pure functions are called with the numbers that sit ON each edge (the idle limit, the median ratio, the window), and cmd_top / main with a stub for the live sample.
+# EQUIVALENT 63dc55df69: sys.path.insert position: no other module of that name is on the path
+# EQUIVALENT c7bbe33248: `base <= 0` -> `<` after `not base`: 0 is caught by `not base`, a negative base by both
+# EQUIVALENT d0754f3e66: `d and d > 0` -> `>=`: 0 is falsy before the comparison
+# EQUIVALENT 27cf8f8597: `sys.argv[1:]` -> `[0:]`: the script path is not a flag
 PYT='
 import contextlib, datetime, importlib.util, io, json, os, sys, tempfile
 for k in ("RAM_OWNER_IDLE_SESSION_SEC", "RAM_OWNER_ABOVE_MEDIAN_RATIO", "RAM_OWNER_MIN_SAMPLES_FOR_BASELINE", "RAM_OWNER_NOW_EPOCH", "RAM_OWNER_OUT"):

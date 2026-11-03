@@ -378,6 +378,9 @@ done
 # command: falling off the end exits with the status of `$ok`, which is 1 exactly when the explicit exit would have been).
 # 20adc40c2f (`if command -v realpath` -> `if ! command -v realpath`) is equivalent on any PATH that HAS realpath (both branches print the physical path) and is killed by the last scenario,
 # which runs the audit on a PATH without it (ga-r8nsaot).
+# EQUIVALENT b7c9d8d8cd: `info`'s `return 0` -> `1`: nobody reads info's status and there is no set -e
+# EQUIVALENT 0eee0688b9: `list_city_skills`'s `return 0` -> `1`: it is only ever the command of an assignment
+# EQUIVALENT 6c338436aa 9a09ceee49: `$ok && exit 0 || exit 1` is the last command: falling off the end exits with the status of `$ok`, which is 1 exactly when the explicit exit would have been
 scenario "exit codes and the stderr switches"
 rc=0; "$AUDIT" --help >/dev/null 2>&1 || rc=$?
 [[ "$rc" == 0 ]] && ok "--help exits 0" || bad "--help exited $rc"
