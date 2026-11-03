@@ -224,10 +224,12 @@ grep -q '<key>ProcessType</key><string>Interactive</string>' "$PLIST" \
 # Ate aqui nenhum caso lia o STATUS de run_sweep, o limite exato do cooldown e do clamp, o ramo "so linhas
 # benignas" nem o script EXECUTADO (o guard do modo lib). date, wc e tail de mentira (funcoes deste shell;
 # gc e notify seguem sendo os stubs do PATH) fazem falhar o que de graca nao falha.
-# EQUIVALENTES (lastro): 829c43a963 bc42a497e0 237afdb31f 8dc1c151f3 5f72a8c256 0720001ec3 5a0417f77d 4cfff30377
-# 2752235dc1 0f4a812dbe c2c2b2831a (`cmd || true` -> `cmd && true` em escrita de log/estado: ninguem le o status
-# e nao ha set -e) e aaa8b8590e 6082e67a18 (`command -v X && X ... || true` -> `&& true`: so muda o status de
-# _alert, que o run_sweep descarta).
+# EQUIVALENTES (lastro): 2752235dc1 0f4a812dbe c2c2b2831a (`cmd || true` -> `cmd && true` em escrita de estado
+# DENTRO do run_sweep: ninguem le o status e nao ha set -e), 829c43a963 8dc1c151f3 0720001ec3 (o `mkdir -p ... || true`
+# que vem ANTES da escrita no mesmo ajudante: o status da linha seguinte e' quem fecha o ajudante) e aaa8b8590e
+# (a linha do notify do _alert: o status do ajudante e' o da linha do gc logo abaixo). Os outros seis (bc42a497e0
+# 237afdb31f 5f72a8c256 5a0417f77d 4cfff30377 6082e67a18) so mudam o status do PROPRIO ajudante: a secao 16 chama
+# cada um com um alvo que nao da para gravar ou remover.
 date() { if [ "${1-}" = "+%s" ] && [ -n "${FAKE_NOW:-}" ]; then echo "$FAKE_NOW"; else command date "$@"; fi; }
 
 # ── 12. status de run_sweep e o cooldown no limite exato ────────────────────
@@ -293,6 +295,28 @@ ORDER_EXEC_FAILURE_WATCHDOG_LIB=1 OEFW_LOG="$TMP/exec.log" GC_SUPERVISOR_LOG="$T
 ORDER_EXEC_FAILURE_WATCHDOG_LIB=0 OEFW_LOG="$TMP/exec.log" GC_SUPERVISOR_LOG="$TMP/nao-existe.log" bash "$WATCHDOG" >/dev/null 2>&1; rc=$?
 [ "$rc" = "0" ] && grep -F "WARN supervisor.log not found" "$TMP/exec.log" >/dev/null \
   && ok "sem LIB: executar roda uma varredura" || bad "sem LIB executado: rc=$rc"
+
+# ── 16. os ajudantes best-effort devolvem 0 (lastro hq-mutants, ga-r8nsaot) ────────────────────────────────────────
+# Dentro do run_sweep ninguem le o status de log, contador, cooldown ou _alert (sem set -e, e ele fecha com return 0|1 explicito), entao
+# `... || true` -> `... && true` so aparece chamando o ajudante direto com um alvo que nao da para gravar ou remover: um caminho SOB um
+# arquivo comum (ENOTDIR, vale ate para root) e um diretorio onde o contador/cooldown deveria ser um arquivo (rm -f recusa). O _alert
+# fecha com a linha do gc: sem notify nem gc no PATH o `command -v` falha e, sem o `|| true`, e' o status do ajudante.
+echo "── 16. log, contador, cooldown e _alert devolvem 0 com alvo que nao da para gravar ou remover e sem notify nem gc ──"
+BLK="$TMP/arquivo"; : > "$BLK"
+LOG_S="$LOG"; STATE_S="$STATE"; PATH_S="$PATH"
+mkdir -p "${STATE}.fail-counts/d/sub" "${STATE}.cooldown/d/sub" "$TMP/semgc"; for t in date dirname mkdir; do ln -sf "$(type -P $t)" "$TMP/semgc/$t"; done
+{ # o bash AVISA da redirecao que falha antes de aplicar o 2>/dev/null do proprio comando: o aviso sai pelo stderr do grupo, que fica calado
+  LOG="$BLK/x/y.log"; log "x"; rc_log=$?; LOG="$LOG_S"
+  STATE="$BLK/st"; _fail_count_set n 3; rc_fcs=$?; _cooldown_last_set n 3; rc_cls=$?; STATE="$STATE_S"
+  _fail_count_reset d; rc_fcr=$?; _cooldown_clear d; rc_cc=$?
+  PATH="$TMP/semgc"; _alert "assunto" "msg"; rc_al=$?; PATH="$PATH_S"
+} 2>/dev/null
+eq "log com LOG sob um arquivo comum" "$rc_log" "0"
+eq "_fail_count_set com o diretorio sob um arquivo comum" "$rc_fcs" "0"
+eq "_cooldown_last_set com o diretorio sob um arquivo comum" "$rc_cls" "0"
+eq "_fail_count_reset com um diretorio no lugar do arquivo" "$rc_fcr" "0"
+eq "_cooldown_clear com um diretorio no lugar do arquivo" "$rc_cc" "0"
+eq "_alert sem notify nem gc no PATH" "$rc_al" "0"
 
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"
