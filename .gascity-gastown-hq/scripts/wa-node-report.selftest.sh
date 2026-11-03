@@ -41,7 +41,7 @@
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REAL="$HERE/wa-node-report.py"
-MIN_MUT=262
+MIN_MUT=287
 T=$(mktemp -d "${TMPDIR:-/tmp}/wa-node-report.XXXXXX")
 trap 'find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null' EXIT
 fails=0; n=0; MUTANTS=0
@@ -498,12 +498,39 @@ os.makedirs(os.path.join(T, "fila-dir.json"), exist_ok=True)
 os.makedirs(os.path.join(T, "home", ".gc"), exist_ok=True)
 fila(os.path.join("home", ".gc", "pilot-dispatchable.json"), -100)
 
+# ---- ga-0qhveri: o que o lastro mostrou sem caso que reprove
+# k1: duas linhas que NÃO são veredito na mesma bead (a última vale) e um apply rc 0 com texto que ninguém conhece (outro, nunca "despachada")
+jl(os.path.join(city("k1"), ".gc", "wa-node-route.jsonl"), [
+    ap("wa-k1a", -3 * H, 12, "texto-novo-sem-vaga"),
+    ap("wa-k1a", -2 * H, 11, "bead-ilegivel"),
+    ap("wa-k1b", -1 * H, 0, "texto novo que ninguem conhece"),
+])
+# k2: três leituras na mesma hora (10Z): núcleos 16, 16 e 17, e uma sessão WA numa delas: as médias da hora têm três casas e saem com duas
+jl(os.path.join(city("k2"), ".gc", "hetzner-occupancy.jsonl"), [occ(-2 * H, cpu(50.0, nuc=16), ses(["wa-worker-remote-1"])), occ(-2 * H + 900, cpu(50.0, nuc=16), ses([])), occ(-2 * H + 1800, cpu(50.0, nuc=17), ses([]))])
+# k40, k41, k42: 40, 41 e 42 beads com veredito node (sombra) na janela: a lista "para conferir" do texto para em 40 e diz quantas ficaram de fora
+for n in (40, 41, 42):
+    jl(os.path.join(city("k%d" % n), ".gc", "wa-node-route.jsonl"), [ap("wa-q%02d" % i, -2 * H - i, 0, "dry-run: iria para wa-worker-remote-1 (code)") for i in range(n)])
+# kd: 13 beads entregues ao nó DE VERDADE: o texto lista as 12 primeiras
+jl(os.path.join(city("kd"), ".gc", "wa-node-route.jsonl"), [ap("wa-dd%02d" % i, -2 * H - i, 0, "despachada para wa-worker-remote-1 (label)") for i in range(1, 14)])
+# mn: o log de motivos nos cantos: `stopped` vazio e que não é texto, `event` vazio / que não é texto / ausente, UMA linha sem hora, e uma bead sondada duas vezes (node e depois mini)
+jl(os.path.join(city("mn"), ".gc", "wa-node-exempt.jsonl"), [
+    sonda("wa-n1", -3 * H, "node", ["classe-x"]),
+    sonda("wa-n1", -1 * H, "mini", ["classe-y"]),
+    resumo(-2 * H, 3, 1, "", mode="on", kept=1, released=0),
+    resumo(-1 * H, 2, 0, 7, mode="on", kept=0, released=0),
+    {"ts": iso(-1 * H), "event": "", "bead": "wa-n1"},
+    {"ts": iso(-1 * H), "event": 7},
+    {"ts": iso(-1 * H)},
+    {"event": "wa-node-pass-probe", "bead": "wa-nsh", "verdict": "mini", "classes": [FOR]},
+])
+jl(os.path.join(city("mn"), ".gc", "hetzner-occupancy.jsonl"), [occ(-1 * H, cpu(50.0), ses([]))])
 PYEOF
 python3 -I "$T/fx.py" "$FX" "$NOW" || { echo "o gerador de fixtures falhou"; exit 2; }
 # as cidades de fixture moram em $FX
 RT="$FX/rota"; OC="$FX/ocup"; MU="$FX/muitas"; SR="$FX/sr"; LR="$FX/lr"; DR="$FX/dr"; NA="$FX/na"; VZ="$FX/vz"; LX="$FX/lx"; DN="$FX/dn"; SP="$FX/span"; DIA="$FX/dia"; PV="$FX/pv"; OI="$FX/oi"; RL="$FX/real"; EV="$FX/ev"; SOR="$FX/sor"; SV="$FX/sv"; DG="$FX/deg"; SNU="$FX/snu"
 FU="$FX/funil"; F2="$FX/funil2"; PD="$FX/padrao"; HM="$FX/home"
 MT="$FX/mt"; MZ="$FX/mz"; MR="$FX/mr"; MK="$FX/mk"; MQ="$FX/mq"; MW="$FX/mw"; M1="$FX/m1"; MV="$FX/mv"; ML="$FX/ml"; MD="$FX/md"; MX="$FX/mx"
+K1="$FX/k1"; K2="$FX/k2"; K40="$FX/k40"; K41="$FX/k41"; K42="$FX/k42"; KD="$FX/kd"; MN="$FX/mn"   # ga-0qhveri
 # os arquivos soltos (logs do Pilot, filas) moram em $FX; NOPILOT/NOFILA não existem de propósito
 PLU="$FX/pilot-utc.log"; PLB="$FX/pilot-brt.log"; NOPILOT="$FX/nao-existe.log"; NOFILA="$FX/nao-existe.json"
 
@@ -1082,6 +1109,69 @@ chk_motivos_arquivo() { # --exempt-log troca o caminho da cidade; vazio é rc 2
   run UTC --city "$MT" --exempt-log "" && eq "$RC" 2 "caminho vazio = rc 2" && has "$(cat "$T/err")" "--exempt-log quer um caminho (veio vazio)"
 }
 
+# ============================== ga-0qhveri: o que o lastro mostrou sem caso que reprove ==============================
+# EQUIVALENTES (provados por leitura, não há caso que os separe): `max(..., default=0)` da maior lacuna -> default=1 (a lacuna só sai por round(x / 3600, 2): 1 s dá 0,0 como 0) ·
+#   `h["com_wa"]` (inicial 0 -> 1 e `+= 1` -> `+= 0`): o campo é só escrito, nenhuma linha da tabela o lê · `"sondas": 0 -> 1` no setdefault do 1º laço e no do 2º de analyse_motivos: o `["sondas"] = n` seguinte
+#   sempre o sobrescreve (todo token da última sonda está em sondas_tok).
+chk_ultimo_fora_do_veredito() {   # duas linhas que não são veredito na mesma bead: a última vale; rc 0 com texto desconhecido é 'outro', nunca 'despachada'
+  jrun UTC "$K1" --hours 24
+  eq "$(jf '.rota.analise.fora_do_veredito["nao-li"]')" 1 "nao-elegivel e depois nao-li: termina em nao-li" && eq "$(jf '.rota.analise.fora_do_veredito["nao-elegivel"]')" null "...e a primeira não fica" \
+    && eq "$(jf '.rota.analise.fora_do_veredito.outro')" 1 "apply rc 0 com texto que ninguém conhece é 'outro'" && eq "$(vf node-despachada)" 0 "...não é despachada" \
+    && eq "$(jf '.rota.analise.ao_no_de_verdade|length')" 0 "...nem conta como ao nó de verdade"
+}
+chk_ocup_medias_2_casas() {   # 16, 16 e 17 núcleos são 16,333… e 1 WA em 3 leituras é 0,333…: a hora diz 16,33 e 0,33
+  jrun UTC "$K2" --hours 24
+  eq "$(oh $H10 .nucleos_medio)" 16.33 "núcleos médios da hora com duas casas" && eq "$(oh $H10 .wa_medio)" 0.33 "WA médio da hora com duas casas"
+}
+chk_conferir_40() {   # a lista "para conferir" do texto para em 40 e diz quantas ficaram de fora; com 40 não diz nada
+  local n
+  trun UTC "$K40" --hours 24; n=$(printf '%s\n' "$OUT" | grep -c '^    wa-q'); eq "$n" 40 "40 beads: as 40 aparecem" && hasnt "$OUT" "… mais" || return 1
+  trun UTC "$K41" --hours 24; n=$(printf '%s\n' "$OUT" | grep -c '^    wa-q'); eq "$n" 40 "41 beads: aparecem 40" && has "$OUT" "… mais 1 (use --json)" || return 1
+  trun UTC "$K42" --hours 24; n=$(printf '%s\n' "$OUT" | grep -c '^    wa-q'); eq "$n" 40 "42 beads: aparecem 40" && has "$OUT" "… mais 2 (use --json)"
+}
+chk_ao_no_ate_12() {   # 13 entregas ao nó de verdade: a linha lista as 12 primeiras e conta as 13
+  local l
+  trun UTC "$KD" --hours 24; l=$(printf '%s\n' "$OUT" | grep 'WhatsApp ao nó DE VERDADE')
+  has "$l" "13 bead(s)" && has "$l" "wa-dd12" && hasnt "$l" "wa-dd13"
+}
+chk_motivos_cantos() {   # stopped vazio / que não é texto, event vazio / que não é texto / ausente, motivo que só existe numa sonda antiga, UMA linha sem hora
+  jrun UTC "$MN" --hours 24
+  eq "$(jf '.motivos.analise.passadas.parou_por["?"]')" 2 "stopped vazio e stopped que não é texto são '?'" && eq "$(jf '.motivos.analise.eventos_desconhecidos["?"]')" 3 "event vazio, que não é texto e ausente são '?'" \
+    && eq "$(jf '.motivos.analise.eventos_desconhecidos|length')" 1 "...e são UM nome só" && eq "$(jf '.motivos.analise.por_motivo["node:classe-x"].beads')" 0 "motivo só de sonda antiga: 0 beads (a bead terminou noutro veredito)" \
+    && eq "$(jf '.motivos.analise.por_motivo["node:classe-x"].sondas')" 1 "...e 1 sonda" && eq "$(jf '.motivos.analise.sem_hora')" 1 "uma linha sem hora" || return 1
+  trun UTC "$MN" --hours 24
+  has "$OUT" "1 linha(s) do log sem hora legível, FORA das contas acima" && has "$OUT" 'ATENÇÃO — 3 linha(s) de `event` que este relatório não conhece' || return 1
+  trun UTC "$M1" --hours 24
+  hasnt "$OUT" "linha(s) do log sem hora legível" && hasnt "$OUT" 'de `event` que este relatório não conhece'
+}
+chk_aviso_ilegivel() {   # a contagem de "linha(s) ilegível(is)" só sai quando há linha ilegível E o arquivo ainda serve; nunca no funil, nunca na fila, nunca num arquivo todo ilegível
+  trun UTC "$SP" --hours 24
+  hasnt "$OUT" "linha(s) ilegível(is), contadas e fora das contas" || return 1
+  trun UTC "$LX" --hours 24
+  hasnt "$OUT" "linha(s) ilegível(is), contadas e fora das contas" && has "$OUT" "ILEGÍVEL"
+}
+chk_modos_texto() {   # os modos do Pilot vistos saem na linha; sem nenhuma linha do Pilot a linha diz "nenhum"
+  trun UTC "$RT" --hours 24
+  has "$OUT" "modos do Pilot vistos: " && hasnt "$OUT" "modos do Pilot vistos: nenhum" || return 1
+  trun UTC "$SV" --hours 24
+  has "$OUT" "modos do Pilot vistos: nenhum"
+}
+chk_args_extra() {   # --help, o teto dos dois --min-*, a cidade vinda do ambiente
+  run UTC --help
+  [ "$RC" = 0 ] && has "$OUT" "usage: wa-node-report.py" || return 1
+  trun UTC "$SR" --min-hours 100000; [ "$RC" = 2 ] || return 1
+  trun UTC "$SR" --min-beads 100000; [ "$RC" = 2 ] || return 1
+  trun UTC "$SR" --min-hours 99999 --min-beads 99999; [ "$RC" = 0 ] || return 1
+  OUT=$(HOME="$T/sem-home" WA_NODE_REPORT_NOW="$NOW" TZ=UTC GC_CITY_PATH="$SP" python3 -I "$SCRIPT" --pilot-log "$NOPILOT" --dispatchable "$NOFILA" --json 2>/dev/null); RC=$?; J=$OUT
+  eq "$(jf .rota.estado)" ok "sem --city, a cidade vem de GC_CITY_PATH" && eq "$(jf .rota.analise.beads_distintas)" 2 "...e é a cidade span (2 beads), não a padrão" || return 1
+  OUT=$(HOME="$T/sem-home" WA_NODE_REPORT_NOW="$NOW" TZ=UTC GC_CITY_PATH="$SP" python3 -I "$SCRIPT" --city "$NA" --pilot-log "$NOPILOT" --dispatchable "$NOFILA" --json 2>/dev/null); RC=$?; J=$OUT
+  eq "$(jf .rota.estado)" ausente "...e --city vence GC_CITY_PATH"
+}
+chk_ausente_sem_ilegiveis() {   # arquivo ausente: 0 linhas ilegíveis nos três logs (ausente não é 1)
+  jrun UTC "$NA" --hours 24
+  eq "$(jf .rota.ilegiveis)" 0 "rota ausente" && eq "$(jf .ocupacao.ilegiveis)" 0 "ocupação ausente" && eq "$(jf .motivos.ilegiveis)" 0 "motivos ausente"
+}
+
 # ---- o caso real: cada função tem de passar contra o script de verdade
 check() { SCRIPT="$REAL"; VERBOSE=1; if "chk_$1"; then ok "$1"; else bad "$1"; fi; VERBOSE=0; }
 for c in veredito_final sombra_nao_e_entrega ultimo_por_hora instaveis conferir_lista base razoes razoes_so_rc0 sombra_so_shadow incoerente rc13 hook_real apply_ilegivel linhas_ilegiveis janela_rota \
@@ -1090,7 +1180,8 @@ for c in veredito_final sombra_nao_e_entrega ultimo_por_hora instaveis conferir_
          ocup_totais ocup_horas_utc ocup_hora09 ocup_wa_remoto ocup_hora_sem_cpu ocup_texto ocup_ilegiveis ocup_bordas sem_epoch tabela_72 ocup_nao_leitura ocup_so_reaper eventos_desconhecidos horas_so_sem_veredito node_anterior \
          funil_utc funil_fuso funil_texto funil_gancho funil_sem_rota funil_estados wa_id_sem_ponto linhas_degeneradas cpu_sem_nucleos relatorio_nao_formado fila_ok fila_texto fila_hora_ruim fila_estados caminhos_padrao caminho_vazio_rc2 \
          rc3_nenhum_log rc0_basta_um rota_vazia ausente_nao_e_zero args_rc2 args_validos horas_decimal now_env somente_leitura json_uma_linha \
-         motivos_agregado motivos_vazio_nao_e_falhou motivos_fora_das_contas motivos_passadas motivos_entregas motivos_leitura motivos_janela motivos_texto motivos_sem_sonda motivos_estados motivos_arquivo; do
+         motivos_agregado motivos_vazio_nao_e_falhou motivos_fora_das_contas motivos_passadas motivos_entregas motivos_leitura motivos_janela motivos_texto motivos_sem_sonda motivos_estados motivos_arquivo \
+         ultimo_fora_do_veredito ocup_medias_2_casas conferir_40 ao_no_ate_12 motivos_cantos aviso_ilegivel modos_texto args_extra ausente_sem_ilegiveis; do
   check "$c"
 done
 
@@ -1386,6 +1477,33 @@ mut motivos-texto-sondas-viram-beads chk_motivos_texto 'sondas: %d — a MESMA b
 mut motivos-texto-veredito-vira-entrega chk_motivos_texto 'veredito `node` em %d sonda(s) — o que o classificador DISSE, não o que foi ao nó' 'mandaram %d ao nó'
 mut json-sem-motivos chk_json_uma_linha '        "motivos": {"arquivo": exe_p, "estado": xe, "ilegiveis": xbad, "analise": xa},' '        "motivos_": {"arquivo": exe_p, "estado": xe, "ilegiveis": xbad, "analise": xa},'
 mut motivos-escreve-no-log chk_somente_leitura '    xe, xrows, xbad = read_jsonl(exe_p)' "    open(exe_p, \"ab\").close()${nl}    xe, xrows, xbad = read_jsonl(exe_p)"
+
+# -- ga-0qhveri: o que o lastro mostrou sem caso que reprove
+mut ultima-sem-veredito-e-a-primeira chk_ultimo_fora_do_veredito 'b["final"] = b["cats"][-1]' 'b["final"] = b["cats"][0]'
+mut rc0-texto-novo-vira-despachada chk_ultimo_fora_do_veredito 'if rc == 0 and detail.startswith("despachada"):' 'if rc == 0 or detail.startswith("despachada"):'
+mut media-de-nucleos-3-casas chk_ocup_medias_2_casas 'round(h["soma_nuc"] / h["cpu_lidas"], 2)' 'round(h["soma_nuc"] / h["cpu_lidas"], 3)'
+mut media-de-wa-3-casas chk_ocup_medias_2_casas 'round(h["soma_wa"] / h["sess_lidas"], 2)' 'round(h["soma_wa"] / h["sess_lidas"], 3)'
+mut conferir-lista-41 chk_conferir_40 'for n in a["node_para_conferir"][:40]:' 'for n in a["node_para_conferir"][:41]:'
+mut conferir-mais-acima-de-41 chk_conferir_40 'if len(a["node_para_conferir"]) > 40:' 'if len(a["node_para_conferir"]) > 41:'
+mut conferir-mais-com-40 chk_conferir_40 'if len(a["node_para_conferir"]) > 40:' 'if len(a["node_para_conferir"]) >= 40:'
+mut conferir-mais-sempre chk_conferir_40 'if len(a["node_para_conferir"]) > 40:' 'if len(a["node_para_conferir"]) <= 40:'
+mut conferir-mais-conta-41 chk_conferir_40 '(len(a["node_para_conferir"]) - 40))' '(len(a["node_para_conferir"]) - 41))'
+mut ao-no-lista-13 chk_ao_no_ate_12 'a["ao_no_de_verdade"][:12]' 'a["ao_no_de_verdade"][:13]'
+mut parou-por-vazio-e-nao-texto chk_motivos_cantos 'st = st if isinstance(st, str) and st else "?"' 'st = st if isinstance(st, str) or st else "?"'
+mut evento-vazio-e-nao-texto chk_motivos_cantos 'nome = kind if (isinstance(kind, str) and kind) else "?"' 'nome = kind if (isinstance(kind, str) or kind) else "?"'
+mut motivo-so-em-sonda-antiga-tem-bead chk_motivos_cantos 'por_motivo.setdefault(t, {"beads": 0, "sondas": 0, "exemplos": []})["sondas"] = n' 'por_motivo.setdefault(t, {"beads": 1, "sondas": 0, "exemplos": []})["sondas"] = n'
+mut sem-hora-avisa-com-zero chk_motivos_cantos 'if a["sem_hora"] > 0:' 'if a["sem_hora"] >= 0:'
+mut sem-hora-so-com-duas chk_motivos_cantos 'if a["sem_hora"] > 0:' 'if a["sem_hora"] > 1:'
+mut evento-desconhecido-so-com-dois-nomes chk_motivos_cantos 'if len(a["eventos_desconhecidos"]) > 0:' 'if len(a["eventos_desconhecidos"]) > 1:'
+mut aviso-ilegivel-no-arquivo-todo-ilegivel chk_aviso_ilegivel 'if bad and est != "ilegivel":' 'if bad or est != "ilegivel":'
+mut funil-com-ilegivel chk_aviso_ilegivel 'aviso = estado_txt(fu["estado"], 0, fu["arquivo"])' 'aviso = estado_txt(fu["estado"], 1, fu["arquivo"])'
+mut fila-com-ilegivel chk_aviso_ilegivel 'aviso = estado_txt(fi["estado"], 0, fi["arquivo"])' 'aviso = estado_txt(fi["estado"], 1, fi["arquivo"])'
+mut modos-nenhum-invertido chk_modos_texto '", ".join("%s=%d" % kv for kv in sorted(a["modos"].items())) or "nenhum"' '", ".join("%s=%d" % kv for kv in sorted(a["modos"].items())) and "nenhum"'
+mut ajuda-desligada chk_args_extra 'argparse.ArgumentParser(prog="wa-node-report.py", add_help=True)' 'argparse.ArgumentParser(prog="wa-node-report.py", add_help=False)'
+mut min-hours-teto-100000 chk_args_extra '("--min-hours", a.min_hours, 0, 99999)' '("--min-hours", a.min_hours, 0, 100000)'
+mut min-beads-teto-100000 chk_args_extra '("--min-beads", a.min_beads, 0, 99999)' '("--min-beads", a.min_beads, 0, 100000)'
+mut cidade-do-ambiente chk_args_extra 'city = a.city or os.environ.get("GC_CITY_PATH") or DEFAULT_CITY' 'city = a.city or os.environ.get("GC_CITY_PATH") and DEFAULT_CITY'
+mut ausente-com-ilegivel chk_ausente_sem_ilegiveis 'return "ausente", [], 0' 'return "ausente", [], 1'
 
 if [ -z "${WA_NODE_REPORT_ST_NOMUT:-}" ]; then
   [ "$MUTANTS" -ge "$MIN_MUT" ] || { echo "FAIL o piso: só $MUTANTS mutantes (mínimo $MIN_MUT) — apagar mutantes não passa por 'todos mortos'"; fails=$((fails+1)); n=$((n+1)); }
