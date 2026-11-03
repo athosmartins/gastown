@@ -19,6 +19,8 @@
 #
 # EQUIVALENT (ga-u6ueg0q): the exit code of cleanup (an EXIT trap, whose status the shell drops) and of run_detector (read through $( ) in an assignment nobody tests; its verdict is the printed
 # "<class> <rc>" pair) cannot be observed, so turning their `return 0` into `return 1` changes nothing.
+# ga-59jrj3d, the ids the sweep keeps listing for that note: cleanup (253adf629d) and the five `return 0` of run_detector (89c4f744f7 selftest absent, 5c464fa26a mkdir, 69cbb0f143 no summary line, 1c68dd56e5 count not a number, 60c903a39e the end).
+# Measured on bash 5.2.21 and on 3.2.57: `trap c EXIT` with a `c` that returns 1, then `exit 0`, leaves the script at rc 0; `v=$(f)` with an `f` that returns 1, then `exit 0`, too (the only reader of run_detector's status would be a `$?` after the assignment, and there is none).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
