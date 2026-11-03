@@ -2457,7 +2457,7 @@ def test_the_outage_is_told_after_ten_minutes_by_push_and_mail_again_when_it_end
     mail = w.mails()[0]
     subject, body = mail[mail.index("-s") + 1], mail[mail.index("-m") + 1]
     assert mail[4:7] == ["mayor/", "--from", "controller"] and "SEM login completo" in subject
-    assert "Not usable:" in body and EMAIL["b85"] in body and f"claude auth login --email {EMAIL['terr']}" in body and "NOT wired" in body
+    assert "Not usable:" in body and EMAIL["b85"] in body and f"claude auth login --email {EMAIL['terr']}" in body and "claude-login-renew" in body
     _run_dead(w, 21600 + 600, 21600 + 660, 21600 + 720, 21600 + 780, 21600 + 840)     # 6 h on: every hold has lapsed, each login gets its one more try
     _run_dead(w, 43200 + 600, 64800 + 600)
     assert w.writes().count(crew.DEFAULT_SERVICE) == 8           # 4 logins x BURN_LIMIT, then dead (the old script: one more round every 6 h)

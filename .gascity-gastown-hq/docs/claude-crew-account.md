@@ -203,11 +203,10 @@ ilegível pode guardar o login mais novo, então o «melhor login» seria meia l
   depois) ou com item contaminado ela não prova qual está vivo. **Não consegui determinar daqui se estava errada** (sem log nem Keychain neste nó). Não mudei a regra (não sobrescrever é o lado inerte); a linha agora
   sai UMA vez por mudança de fatos e traz as duas impressões, as duas datas de vencimento e o dono que a tabela conhece.
 
-**Relogin automático (item 2 da bead): NÃO entregue aqui.** Precisa do Chrome CDP, do `secret`/gmail-totp e da skill federated-site-login, que só existem no mini (este código foi escrito no nó Hetzner). A única tentativa
-registrada (ga-yyltfk, 04/10, terrenos@) chegou ao "Authorize" e parou no quebra-cabeça anti-bot da Anthropic; o Mayor decidiu então que contornar isso está fora, mesmo com autorização, e cada tentativa pode mandar um
-"Tap Yes" ao celular do Athos. Para a bead de relogin no mini: (1) acionar pela previsão (T-7 dias), não depois do outage; (2) se o quebra-cabeça aparecer, a conta é "inviável por automação" e só então se chama o
-Athos, com o comando exato; (3) login de escopo completo (`claude auth login`, nunca setup-token) em CLAUDE_CONFIG_DIR próprio, com `hasCompletedOnboarding=true`. O job já o recebe sem mudança: um login novo no
-config dir da conta é achado pelo `load_source` no minuto seguinte.
+**Relogin automático (item 2 da bead): entregue no job separado `claude-login-renew` (ga-xoe5ao.5)** — ver `docs/claude-login-renew.md`. Esta crew job
+continua sem nunca chamar `claude`: ela só segue o pool, cura e avisa. O job novo age pela previsão (T-7 dias) e pelo outage, em `CLAUDE_CONFIG_DIR` próprio
+(login de escopo completo, nunca setup-token), e se o quebra-cabeça anti-bot da Anthropic (ga-yyltfk, 04/10) aparecer a conta vira "inviável por automação" e o
+Athos recebe um push com o comando exato. Um login novo no config dir da conta é achado por esta crew job no minuto seguinte (`load_source`), sem mudança.
 
 ## Garantias
 - Nunca chama `claude`; custo de crédito zero (só o perfil, grátis). Nunca escreve no item hasheado do pool.

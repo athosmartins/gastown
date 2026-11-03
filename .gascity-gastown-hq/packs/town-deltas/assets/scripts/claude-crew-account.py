@@ -699,7 +699,7 @@ def no_login_text(ep: dict, dec, t: float) -> str:
     else:
         fix = f"Fix: log ONE account in, the pool's pick first - {relogin_cmd(want)} - and this job writes it to the default item within a minute."
     return (f"the Mayor and the crews have had NO full Claude login for {int((t - _num(ep.get('since'))) // 60)} min - Remote Control is down "
-            f"({ep.get('why')}).{did} {fix} Automatic relogin (gmail-totp) is NOT wired into this job: it needs the mini's browser (ga-xoe5ao.4, item 2).")
+            f"({ep.get('why')}).{did} {fix} This job never calls claude: the automatic relogin (gmail-totp, the mini's browser) is the separate job claude-login-renew (ga-xoe5ao.5), which alerts on its own when it cannot.")
 
 
 def _episode(st: dict) -> Optional[dict]:
