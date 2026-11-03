@@ -132,7 +132,13 @@ def load_state() -> dict:
     except (OSError, ValueError, RecursionError):
         rlog("WARN", f"the state file {state_path()} is unreadable - starting from an empty state (marks and tries are lost)")
         return {}
-    return d if isinstance(d, dict) else {}
+    # valid json of the wrong SHAPE is the same unreadable state - said, not silently emptied, and not left to crash every run on a .get() of a list
+    # (the crash handler returns 1 before publish_state, so a mis-shaped file would wedge the job for good)
+    acc = d.get("accounts", {}) if isinstance(d, dict) else None
+    if not (isinstance(acc, dict) and all(isinstance(v, dict) for v in acc.values())):
+        rlog("WARN", f"the state file {state_path()} is unreadable (not an object of account records: it holds {type(d).__name__}) - starting from an empty state (marks and tries are lost)")
+        return {}
+    return d
 
 
 def publish_state(st: dict) -> None:

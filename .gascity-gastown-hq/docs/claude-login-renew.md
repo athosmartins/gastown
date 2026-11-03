@@ -2,15 +2,9 @@
 
 ## Contents
 
-• O que resolve · Quando age (previsão T-7 dias, outage) · O que é uma tentativa · O que NUNCA faz (quebra-cabeça, senha, aparelho) · Quem julga · Estado, marcas e o push único · Liga/desliga e ativação · Prova ao vivo e o que não foi medido
-
-Item 2 da ga-xoe5ao. Em 01/11 08:39Z–02/11 03:10Z o Mayor e as crews ficaram 18,5 h sem login completo (refresh token vencido).
-A ga-xoe5ao.4 tornou isso **barulhento** (push em 10 min, previsão de 7 dias, `claude-crew-account.py`); este job o torna **raro**.
-Decisão do Athos (02/11): alerta no celular **e** relogin automático via `gmail-totp`, chamando o Athos só quando o job não consegue.
-
-Arquivos: `packs/town-deltas/assets/scripts/claude-login-renew.py`, `packs/town-deltas/assets/claude-login-renew.plist`
-(label `com.gascity.claude-login-renew` — **não** é o `com.gascity.claude-account-relog`, o swap por cota da ga-jf689),
-selftest `scripts/test_claude_login_renew.py` (sem rede; Keychain, `claude`, navegador, TOTP e `notify` simulados).
+• Quando age (a cada 15 min, sob flock, UMA conta por rodada) · O que é uma tentativa
+• O que NUNCA faz · Quem julga · Estado, logs · Liga/desliga e ativação
+• Prova ao vivo e o que não foi medido
 
 ## Quando age (a cada 15 min, sob flock, UMA conta por rodada)
 - **Previsão:** o melhor login guardado de uma conta que tem config dir (`~/.gastown/claude-accounts/<dir>`) termina em ≤ 7 dias (ou já terminou).
@@ -53,6 +47,9 @@ e um push. Sucesso grava no estado `renewed{svc,at,reason,before{afp,rfp,rexp},a
 ## Estado, logs
 `/Users/athos/shared/data/claude_login_renew.json` (`CLAUDE_RENEW_STATE`): `accounts[email]` com `renewed`, `tries`, `next_at`, `last{verdict,step,at}`,
 `infeasible{verdict,step,at,left,pushed,next_push}`. Log: `.gc/logs/claude-login-renew.log`. Lock: `.gc/claude-login-renew.lock`.
+Arquivo ausente = primeira rodada, sem aviso. Arquivo **ilegível ou de forma errada** (JSON quebrado, sem permissão, `accounts` que não é um mapa de
+registros — por exemplo depois de uma edição à mão) vira estado vazio **com uma linha `WARN ... unreadable` no log**: as marcas e as tentativas se perdem
+(um quebra-cabeça pode ser encontrado mais uma vez, com mais um push), mas o job não trava a cada rodada.
 
 ## Liga/desliga e ativação
 - Kill switch sem recarregar: `touch /Users/athos/gt/.gascity-gastown-hq/.gc/no-login-renew` (ou `GC_LOGIN_RENEW=0`).

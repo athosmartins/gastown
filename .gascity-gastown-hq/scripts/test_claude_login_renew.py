@@ -488,6 +488,68 @@ def test_a_cli_that_exits_without_ever_asking_for_a_browser_is_a_failed_try(w):
     assert w.state()["accounts"][EMAIL["b85"]]["last"]["verdict"] == "no_browser_request"
 
 
+# ── reads that fail: the third state is said out loud, never a silent verdict ───────────────────
+@pytest.mark.parametrize("junk", [b"{not json", b"\xff\xfe\x00 not utf8", b"[1, 2]", b'"a string"', b"",
+                                  b'{"accounts": [1]}', b'{"accounts": null}', b'{"accounts": {"x": "a string"}}', b'{"accounts": {"x": ["no"]}}'])
+def test_a_state_file_that_is_corrupt_is_said_and_replaced_not_trusted_nor_fatal(w, junk):
+    (w.d / "renew_state.json").write_bytes(junk)
+    new = blob("b85-new", rexp_days=30.0)
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    w.login_will_be("b85", new)
+    w.run()                                                                      # must not raise
+    assert "unreadable" in w.log() and "empty state" in w.log()
+    rec = w.state()["accounts"][EMAIL["b85"]]["renewed"]                         # rewritten as a valid object, and the run went on
+    assert rec["after"]["rfp"] == fps(new)[1] and fps(w.get(w.svc("b85"))) == fps(new)
+
+
+def test_a_state_path_that_cannot_be_read_is_said_and_the_run_goes_on_with_an_empty_state(w):
+    (w.d / "renew_state.json").mkdir()                                           # read_bytes() -> IsADirectoryError (an OSError), not "missing"
+    assert renew.load_state() == {}
+    assert "unreadable" in w.log()
+
+
+def test_a_state_file_that_is_simply_missing_is_a_first_run_and_says_nothing(w):
+    assert not (w.d / "renew_state.json").exists()
+    assert renew.load_state() == {}
+    assert "unreadable" not in w.log()                                           # vazio is not falhou: no false alarm on the first run
+
+
+def test_a_state_file_that_is_denied_to_us_is_said_and_never_taken_for_a_first_run(w, monkeypatch):
+    (w.d / "renew_state.json").write_text('{"accounts": {"x": {"infeasible": {"verdict": "puzzle"}}}}')   # a mark that exists but cannot be read now
+
+    def deny(self, *a, **k):
+        raise PermissionError(13, "Permission denied")
+    monkeypatch.setattr(Path, "read_bytes", deny)
+    assert renew.load_state() == {}                                              # nothing is trusted from a file we could not read ...
+    assert "unreadable" in w.log() and "marks and tries are lost" in w.log()      # ... and the loss is in the log, unlike a missing file (a first run)
+
+
+def test_a_url_file_that_is_denied_to_us_while_the_cli_lives_never_yields_a_url(tmp_path, monkeypatch):
+    class Cli:                                                                   # alive for two looks, then gone
+        n = 0
+
+        def poll(self):
+            self.n += 1
+            return None if self.n < 3 else 1
+    (tmp_path / "url").write_text("https://claude.ai/oauth/authorize?x=1")       # the URL is there, but we are not allowed to read it
+
+    def deny(self, *a, **k):
+        raise PermissionError(13, "Permission denied")
+    monkeypatch.setattr(Path, "read_text", deny)
+    monkeypatch.setattr(renew.time, "sleep", lambda s: None)
+    assert renew.wait_for_url(Cli(), tmp_path / "url") is None                   # a read that failed is "no URL yet", then a failed try - never a guessed URL
+
+
+def test_a_url_file_that_cannot_be_read_while_the_cli_lives_is_no_url_not_a_crash(tmp_path, monkeypatch):
+    class Dead:                                                                  # the CLI is gone, and the url path is a directory (OSError on read)
+        def poll(self):
+            return 1
+    (tmp_path / "url").mkdir()
+    monkeypatch.setattr(renew, "URL_WAIT_S", 5)
+    assert renew.wait_for_url(Dead(), tmp_path / "url") is None                  # unreadable + dead CLI -> None (a failed try), never a URL it did not read
+    assert renew.wait_for_url(Dead(), tmp_path / "never-written") is None        # missing + dead CLI -> the same
+
+
 def test_a_cli_that_fails_after_the_driver_said_ok_is_a_failed_try(w):
     old = blob("b85", rexp_days=3.0)
     w.own("b85", old)
