@@ -19,8 +19,8 @@
 #   preparo (g_prep): pull que falha segue · sem origin/main · wt-add que falha · árvore sem tests/ · plugin ou gt-iso-run ausente — exit 3, nada gravado · `wt-rm` que não leva a árvore velha embora = `arvore-velha`, exit 3.
 #   estado (g_state): a lista de falhas que é pasta, e o passo final que morre, dão exit 3 (gravacao-falhou / resumo-falhou) sem consumir a ponta · TERM no meio repassa ao pytest, apaga a árvore e não grava · TERM com o pytest ainda não nascido (canário pendurado) sai 143 na hora, sem esperar os 10 s do laço.
 #   registro (g_reg): a linha wa-suite do hetzner-ballast.items.txt (a REAL) lê limpa no governo, é `work` com núcleos FIXOS (um `auto` levaria o orçamento inteiro e o hq-selftests passaria horas sem rodar),
-#     exige o helper, o gt-iso-run, o python do venv, o plugin e `noflag:wa-suite.leak`, e o comando existe na pasta de itens. CALIBRAÇÃO DA RAM (ga-weaih6): o rss_mb cobre núcleos × MB por worker + base + filho de coleta
-#     MEDIDOS no nó, e passa a regra de partida e o piso de pausa do governo no p10 de MemAvailable (um wa-suite de 8 núcleos com teto de 12 GB morria por `rss` aos 5 min em toda rodada).
+#     exige o helper, o gt-iso-run, o python do venv, o plugin e `noflag:wa-suite.leak`, e o comando existe na pasta de itens. CALIBRAÇÃO DA RAM (ga-weaih6, refeita em ga-2hd02v.5.9): o rss_mb cobre núcleos × MB por worker ao FIM da suíte (medido a 5 workers, reescalado pelos núcleos) + base + filho de coleta,
+#     o prazo é o dobro da suíte a esses núcleos (5 workers morriam por `rss` aos 21-37 min), e passa a regra de partida e o piso de pausa do governo no p10 de MemAvailable (um wa-suite de 8 núcleos com teto de 12 GB morria por `rss` aos 5 min em toda rodada).
 #     ga-r4lw72: o hq-selftests também tem núcleos FIXOS (o `auto` ficou com 1 núcleo por 3 h), que cabem junto do wa-suite no orçamento de 9 núcleos (16 - 6 de sessões - 1 de reserva); o prazo dele é pelo menos o dobro
 #     de (soma ~12.555 s de selftest / núcleos); e o cooldown dos dois fica entre 120 s (cada pergunta é um pull ao espelho do mini) e 300 s (o main já mudou durante a rodada de 44 a 80 min).
 #   agenda (g_sched): com o GOVERNO REAL e as colunas papel/núcleos/rss/prazo/cooldown da linha real: com o wa-suite rodando, o hq-selftests ainda começa (núcleos fixos da linha real); e com o hq-selftests JÁ rodando, o wa-suite
@@ -453,12 +453,18 @@ PYEOF
   done
   cmd=$(reg_field 8)
   check "reg: o comando ($cmd) existe e é executável na pasta de itens" "1" "$([ -x "$ITEMS/$cmd" ] && echo 1 || echo 0)"
-  # CALIBRAÇÃO DA RAM (ga-weaih6): o teto rss_mb é o que o governo cobra (passou, `why=rss`) e entra na regra de partida; ele tem que caber na memória que a suíte REALMENTE usa, medida no nó em 24/10 (WA a1079e0e6,
-  # mesmo wa-suite.sh; scripts/hetzner-ballast-wa-suite-mem-probe.py; números e conta em docs/runbooks/hetzner-ballast.md, "Medido"). Suíte maior ou nó diferente = medir de novo e mexer AQUI e no registro.
-  local worker_mb=2064 base_mb=1110 collect_mb=1624 p10_mb=27780 cores rss hq start_mb pause_mb need gv
-  # worker_mb: o maior worker do xdist com a suíte em 98% (2062 MB; cresce com o progresso, então é o pior caso e não a média) · base_mb: mestre do pytest + gt-iso-run/sudo/timeout (soma de RSS 11050 − 5 workers 9942, também em 98%)
-  # collect_mb: o filho `pytest --collect-only` que um teste lança entre 37% e 44% da suíte (pico 1622 MB; some depois) · p10_mb: MemAvailable p10 dos 2432 ticks do governo no nó (40 h; mediana 28953)
+  # CALIBRAÇÃO DA RAM (ga-weaih6, refeita em ga-2hd02v.5.9): o teto rss_mb é o que o governo cobra (passou, `why=rss`) e entra na regra de partida; ele tem que caber na memória que a suíte REALMENTE usa, medida no nó
+  # (scripts/hetzner-ballast-wa-suite-mem-probe.py, mesmo wa-suite.sh; números e conta em docs/runbooks/hetzner-ballast.md, "Medido"). Suíte maior ou nó diferente = medir de novo e mexer AQUI e no registro.
+  # 03/11, WA 0030feeeb, 5 workers, suíte inteira (100.733 testes, 4663 s): o worker do xdist CRESCE com o que roda, então o pior caso é o do FIM da suíte, não o da coleta. 24/10 (82 mil testes) media 2064 MB por worker no fim
+  # e 11795 MB de pico; hoje o pico é 14209 MB (aos 74%), acima do teto desde os 55%, e aos 23% o filho de coleta soma mais 1957 MB: as mortes `why=rss` aos 21-37 min.
+  local w0_mb=2070 wgrow5_mb=467 wmax_pct=107 base_mb=1750 collect_mb=1960 p10_mb=27780 run5_s=4663 cores rss hq start_mb pause_mb need gv worker_mb
+  # w0_mb: cada worker ao fim da coleta (todos importam a árvore de testes inteira; 2070 MB) · wgrow5_mb: quanto um worker cresce até o fim da suíte com 5 workers (média 2537 MB aos 95-99% − 2070). Com n núcleos cada worker roda 1/n
+  # dos testes, então o crescimento é wgrow5_mb × 5/n: é uma SUPOSIÇÃO conservadora (crescimento proporcional ao que o worker executa; a sonda de 3 núcleos deu +201 MB aos 22% e o crescimento real é côncavo, ver runbook "Medido") · wmax_pct: o maior worker contra a média
+  # (2701 contra 2522 MB aos 70-74%) · base_mb: mestre do pytest (1354 MB ao fim; cresce com os relatórios) + o resto da sessão (playwright/node, resource_tracker, chrome falso, gt-iso-run/sudo/timeout; pico 390 MB)
+  # collect_mb: o filho `pytest --collect-only` que um teste lança aos 23% da suíte (pico 1957 MB; some em minutos) · p10_mb: MemAvailable p10 dos 2432 ticks do governo no nó (40 h; mediana 28953) · run5_s: a suíte inteira com 5 workers
   cores=$(num_or_0 "$(reg_field 3)"); rss=$(num_or_0 "$(reg_field 4)"); hq=$(num_or_0 "$(reg_field 4 hq-selftests)")
+  # vazio/falhou (núcleos 0: o registro não deu número) → worker_mb 0 e o check reprova abaixo (cores >= 1); a divisão por 0 nunca roda
+  if [ "$cores" -ge 1 ]; then worker_mb=$(( (w0_mb + wgrow5_mb * 5 / cores) * wmax_pct / 100 )); else worker_mb=0; fi
   # vazio (o governo não imprime os dois números) → gv vazio; falhou/ilegível (o governo não carrega) → gv vazio: os dois viram 0 e reprovam os checks de RAM, nunca passam por falta de leitura
   gv=$("$PY" -I - "$GOV" <<'PYEOF' 2>/dev/null
 import importlib.util, sys
@@ -469,9 +475,12 @@ PYEOF
 )
   read -r start_mb pause_mb <<< "$gv"; start_mb=$(num_or_0 "${start_mb:-}"); pause_mb=$(num_or_0 "${pause_mb:-}")
   need=$((cores * worker_mb + base_mb + collect_mb))
-  check "reg: o rss_mb ($rss) cobre o pior caso MEDIDO de $cores núcleos ($cores × $worker_mb + $base_mb + $collect_mb = $need MB); abaixo disso o governo mata a rodada com why=rss" "1" "$([ "$cores" -ge 1 ] && [ "$rss" -ge 1 ] && [ "$rss" -ge "$need" ] && echo 1 || echo 0)"
+  check "reg: o rss_mb ($rss) cobre o pior caso de $cores núcleos (maior worker ao fim da suíte $worker_mb MB: $cores × $worker_mb + $base_mb + $collect_mb = $need MB); abaixo disso o governo mata a rodada com why=rss" "1" "$([ "$cores" -ge 1 ] && [ "$rss" -ge 1 ] && [ "$rss" -ge "$need" ] && echo 1 || echo 0)"
   check "reg: o rss_mb ($rss) passa a regra de partida do governo no p10 do nó ($rss + $start_mb <= $p10_mb MB); acima disso o wa-suite quase nunca começa" "1" "$([ "$rss" -ge 1 ] && [ "$start_mb" -ge 1 ] && [ $((rss + start_mb)) -le "$p10_mb" ] && echo 1 || echo 0)"
   check "reg: wa-suite ($rss) + hq-selftests ($hq) rodando juntos não cruzam o piso de pausa de RAM ($pause_mb) no p10 do nó ($p10_mb MB)" "1" "$([ "$rss" -ge 1 ] && [ "$hq" -ge 1 ] && [ "$pause_mb" -ge 1 ] && [ $((rss + hq + pause_mb)) -le "$p10_mb" ] && echo 1 || echo 0)"
+  # PRAZO (ga-2hd02v.5.9): menos núcleos = rodada mais longa (5 workers levaram 4663 s na suíte inteira; com n núcleos, ~4663 × 5/n). O prazo é o `timeout` do item e rodada que estoura não deixa resultado: pede o dobro.
+  # vazio (o registro não traz o prazo) → num_or_0 dá 0 e o check reprova; falhou/ilegível (prazo que não é número) → também 0; núcleos 0 → o `[ cores -ge 1 ]` reprova antes da divisão
+  check "reg: o prazo ($(reg_field 5) s) é pelo menos o dobro da suíte inteira a $cores núcleos (2 × $run5_s s × 5 / $cores): rodada que estoura o prazo não deixa resultado" "1" "$([ "$cores" -ge 1 ] && [ "$(num_or_0 "$(reg_field 5)")" -ge $((2 * run5_s * 5 / cores)) ] && echo 1 || echo 0)"
   # NÚCLEOS E COOLDOWN (ga-r4lw72, medido no nó em 24/10): o `auto` do hq-selftests é decidido UMA vez, na partida. Às 15:34Z ele começou ao lado do wa-suite de 8 núcleos (orçamento 9 - 8 = 1) e ficou com 1 núcleo por
   # 3 h (rc 124, prazo); sozinho levava o orçamento inteiro e o wa-suite não começava (18:47Z-20:06Z). O trabalho do hq soma ~12.555 s de selftest (maior: 1.200 s), então 1 núcleo não cabe nos 10800 s do prazo.
   local hqc wac cdn it
@@ -574,12 +583,15 @@ wa-suite.sh@@prep@@wt-add que falha segue em frente@@if ! timeout 900 "$RG" wt-a
 wa-suite.sh@@prep@@clone sem origin/main segue em frente@@[ -n "$main" ] || { say "o clone não tem origin/main"@@[ -n "x" ] || { say "o clone não tem origin/main"
 wa-suite.sh@@prep@@plugin ausente não impede a rodada@@[ -f "$PLUG" ] || {@@true || {
 wa-suite.sh@@prep@@gt-iso-run ou python do venv ausente não impedem a rodada@@  [ -x "$need" ] || {@@  true || {
-hetzner-ballast.items.txt@@reg@@núcleos viram auto (o hq-selftests passaria horas sem rodar)@@wa-suite\twork\t5\t@@wa-suite\twork\tauto\t
-hetzner-ballast.items.txt@@reg@@o prazo do registro não cabe a suíte@@\t5\t13312\t21600\t@@\t5\t13312\t600\t
-hetzner-ballast.items.txt@@reg@@o teto de RAM volta a 12288 (a rodada de 5 núcleos mediu 11795 MB de pico, sem folga para o filho de coleta)@@\t5\t13312\t21600\t@@\t5\t12288\t21600\t
-hetzner-ballast.items.txt@@reg@@os núcleos voltam a 8 com o teto de 13312 (8 × ~2 GB não cabem)@@\t5\t13312\t21600\t@@\t8\t13312\t21600\t
-hetzner-ballast.items.txt@@reg@@o teto sobe para 16384 (nem a regra de partida do governo nem o piso de pausa aceitam)@@\t5\t13312\t21600\t@@\t5\t16384\t21600\t
-hetzner-ballast.items.txt@@reg@@o registro deixa de exigir a flag de vazamento@@,noflag:wa-suite.leak@@
+hetzner-ballast.items.txt@@reg@@núcleos viram auto (o hq-selftests passaria horas sem rodar)@@wa-suite\twork\t3\t@@wa-suite\twork\tauto\t
+hetzner-ballast.items.txt@@reg@@o prazo do registro não cabe a suíte@@\t3\t13312\t21600\t@@\t3\t13312\t600\t
+hetzner-ballast.items.txt@@reg@@o teto de RAM volta a 12288 (o pior caso de 3 núcleos, 12851 MB, não cabe)@@\t3\t13312\t21600\t@@\t3\t12288\t21600\t
+hetzner-ballast.items.txt@@reg@@os núcleos voltam a 8 com o teto de 13312 (8 × ~2 GB não cabem)@@\t3\t13312\t21600\t@@\t8\t13312\t21600\t
+hetzner-ballast.items.txt@@reg@@os núcleos voltam a 5 (ga-2hd02v.5.9: 5 workers deram pico de 14209 MB e passam de 13312 desde os 55% da suíte; o filho de coleta soma +1957 MB aos 23%)@@\t3\t13312\t21600\t@@\t5\t13312\t21600\t
+hetzner-ballast.items.txt@@reg@@os núcleos sobem para 4 (4 × ~2,8 GB ao fim da suíte + base + filho de coleta = 15062 MB, acima do teto)@@\t3\t13312\t21600\t@@\t4\t13312\t21600\t
+hetzner-ballast.items.txt@@reg@@os núcleos caem para 1 (a suíte a 1 núcleo leva ~23000 s e o prazo é 21600 s)@@\t3\t13312\t21600\t@@\t1\t13312\t21600\t
+hetzner-ballast.items.txt@@reg@@o teto sobe para 16384 (nem a regra de partida do governo nem o piso de pausa aceitam)@@\t3\t13312\t21600\t@@\t3\t16384\t21600\t
+hetzner-ballast.items.txt@@reg@@o registro deixa de exigir a flag de vazamento@@,noflag:wa-suite.leak\twa-suite.sh@@\twa-suite.sh
 hetzner-ballast.items.txt@@reg@@o registro deixa de exigir o plugin@@path:~/gt-remote/bin/gtn_stable_ids.py,@@
 hetzner-ballast.items.txt@@reg@@o registro deixa de exigir o gt-iso-run@@exec:~/gt-remote/bin/gt-iso-run,@@
 hetzner-ballast.items.txt@@reg@@o registro deixa de exigir o helper de root@@exec:/usr/local/sbin/gt-netns-run,@@
@@ -595,10 +607,10 @@ wa-suite.sh@@state@@o TERM antes do pytest espera os 10 s@@[ -n "$PYPID" ] && ki
 hetzner-ballast.items.txt@@reg@@o hq-selftests volta a auto (decidido na partida: já deu 1 núcleo por 3 h)@@hq-selftests\twork\t4\t@@hq-selftests\twork\tauto\t
 hetzner-ballast.items.txt@@sched@@o hq-selftests volta a auto (levava o orçamento inteiro e o wa-suite não começava ao lado dele)@@hq-selftests\twork\t4\t@@hq-selftests\twork\tauto\t
 hetzner-ballast.items.txt@@reg@@o hq-selftests sobe para 8 núcleos (com o wa-suite não cabem no orçamento de 9)@@hq-selftests\twork\t4\t@@hq-selftests\twork\t8\t
-hetzner-ballast.items.txt@@sched@@o hq-selftests sobe para 8 núcleos (o wa-suite não começa ao lado dele)@@hq-selftests\twork\t4\t@@hq-selftests\twork\t8\t
+hetzner-ballast.items.txt@@sched@@o hq-selftests sobe para 9 núcleos (com os 3 do wa-suite passa dos 11 do orçamento do teste: o wa-suite não começa ao lado dele; com 8 ainda cabia desde ga-2hd02v.5.9, 8 + 3 = 11, e o grupo reg é quem pega o 8)@@hq-selftests\twork\t4\t@@hq-selftests\twork\t9\t
 hetzner-ballast.items.txt@@reg@@o hq-selftests cai para 1 núcleo (12555 s de selftest não cabem no prazo)@@hq-selftests\twork\t4\t@@hq-selftests\twork\t1\t
 hetzner-ballast.items.txt@@reg@@o cooldown do hq-selftests volta a 600 s (espera pura depois da rodada)@@\t4096\t10800\t180\t@@\t4096\t10800\t600\t
-hetzner-ballast.items.txt@@reg@@o cooldown do wa-suite volta a 600 s@@\t5\t13312\t21600\t180\t@@\t5\t13312\t21600\t600\t
+hetzner-ballast.items.txt@@reg@@o cooldown do wa-suite volta a 600 s@@\t3\t13312\t21600\t180\t@@\t3\t13312\t21600\t600\t
 hetzner-ballast.items.txt@@reg@@o cooldown do hq-selftests cai a 0 (um pull ao espelho a cada tick)@@\t4096\t10800\t180\t@@\t4096\t10800\t0\t
 wa-suite.sh@@conf@@todo suspeito vira confirmado (não confere se ainda reprova hoje)@@newly = [i for i in s_ids if i in now_set and i not in items]@@newly = [i for i in s_ids if i not in items]
 wa-suite.sh@@conf@@a confirmada que passou (corrigida) não sai da lista@@items = {k: v for k, v in c_items.items() if k in now_set}@@items = dict(c_items)

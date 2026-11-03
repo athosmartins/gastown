@@ -8,7 +8,7 @@ Contents
 POR QUÊ: o `rss_mb` da linha wa-suite do registro é o teto que o governo cobra (passou, termina com `why=rss`) e também o que entra na conta de partida (`MemAvailable − rss_mb ≥ ram_start_mb`). Ele é um número
   MEDIDO, e a suíte do WA cresce: quando as rodadas voltarem a morrer por `rss`, ou antes de mexer nos núcleos, rode isto e reponha o número (docs/runbooks/hetzner-ballast.md, "Medido"; o teste
   hetzner-ballast-wa-suite.selftest.sh, grupo reg, fixa a conta núcleos × MB por worker + base ≤ rss_mb).
-USO (do mini; leva ~1 h a 5 núcleos, então SEMPRE solto do ssh):
+USO (do mini; leva ~80 min a 5 núcleos — 78 min medidos em 03/11, ga-2hd02v.5.9 — e ~2 h a 3, então SEMPRE solto do ssh, com limite_s folgado):
   scp scripts/hetzner-ballast-wa-suite-mem-probe.py hetzner-teste:gt-remote/measure/probe.py
   ssh hetzner-teste 'mkdir -p ~/gt-remote/measure/r1 && ( nohup setsid python3 -I ~/gt-remote/measure/probe.py ~/gt-remote/measure/r1 5 7200 > ~/gt-remote/measure/r1.log 2>&1 < /dev/null & )'
   argumentos: <pasta-de-saida> [nucleos=8] [limite_s=900]; a última linha do .log é `probe: fim: …` (a rodada acabou).
