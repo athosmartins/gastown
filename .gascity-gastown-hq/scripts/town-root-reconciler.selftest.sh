@@ -237,11 +237,12 @@ ROOT="$_saved_ROOT"; REMOTE="$_saved_REMOTE"; BRANCH="$_saved_BRANCH"
 # nunca eram tocados. Agora cada ramo roda contra um par de repositorios de brinquedo (origem + clone), com
 # date e git de mentira definidos como funcoes deste shell, como gc e notify acima.
 # EQUIVALENTES (lastro): 3bf5a69c5c 3ec1b3ce09 18e2ca9f08 8c15fc648f (`cmd || true` -> `cmd && true`:
-# ninguem le o status e nao ha set -e); 24909e7bf1 4dd84a5bcb (os dois cp do backup gravam os mesmos bytes);
+# ninguem le o status e nao ha set -e); 4dd84a5bcb (o `|| true` que fecha a cadeia de cp do backup: ninguem le o status);
 # d0372d9f4c 2a4dfbfe9d c3efbaf3cc 7990ceb751 d1fe4548ab 86e745f1c8 (`$(git ... || echo "")` -> `&&`: quando o git
 # falha nao imprime nada e quando acerta a linha vazia a mais some no $(...)).
 # NAO e' equivalente: 033544c743, o `rm -f` que fecha o clear_escalation, muda o status do PROPRIO ajudante; o caso do
-# carimbo-diretorio no cenario 22 le esse status.
+# carimbo-diretorio no cenario 22 le esse status. Tambem nao e': 24909e7bf1 (o `||` entre os dois cp do backup virando `&&`): o 2o cp, depois de um `cp -p` que deu certo, troca o mtime do
+# backup pela hora de agora (os bytes sao os mesmos); o cenario 21 le o mtime.
 # date devolve $FAKE_NOW para `date +%s` quando ele esta definido; git falha quando "<subcomando> <1o arg>" comeca por $GITFAIL.
 date() { if [ "${1-}" = "+%s" ] && [ -n "${FAKE_NOW:-}" ]; then echo "$FAKE_NOW"; else command date "$@"; fi; }
 git() { if [ -n "${GITFAIL:-}" ]; then case "${3-} ${4-}" in "$GITFAIL"*) return 1 ;; esac; fi; command git "$@"; }
@@ -355,11 +356,24 @@ done
 echo "Scenario 21: reconcile_untracked_for_ffpull — identica sai, diferente fica e para, so-local fica, DRY_RUN so avisa"
 mk_pair s21; up_commit trr-collide.sh from-upstream; git -C "$W" fetch -q origin
 printf 'from-upstream\n' > "$W/trr-collide.sh"; printf 'mine only\n' > "$W/local-only.txt"
+# (ga-tsi6ovl) mtime velho e fixo no arquivo e num arquivo de referencia: o backup tem de sair com ele (ver o caso do backup abaixo). Backups de outras passadas deste shell saem antes.
+touch -t 200001020304 "$W/trr-collide.sh"; : > "$TMP/mtime.ref"; touch -t 200001020304 "$TMP/mtime.ref"; rm -f /tmp/trr-collide.sh.backup.*.$$ 2>/dev/null
 : > "$LOG"; reconcile_untracked_for_ffpull "$W" origin/main >/dev/null 2>&1; rc=$?
 [ "$rc" = "0" ] && [ "$RECONCILE_COUNT" = "1" ] && [ -z "${RECONCILE_DIFF_LIST// /}" ] && [ ! -e "$W/trr-collide.sh" ] \
   && [ "$(cat "$W/local-only.txt")" = "mine only" ] && has_log "auto-reconciled identical untracked 'trr-collide.sh'" \
   && ok "colisao identica: removida (com backup) e contada; o arquivo so-local nao e tocado" \
   || bad "untracked identica: rc=$rc count=$RECONCILE_COUNT list='$RECONCILE_DIFF_LIST'"
+# O backup e' feito por `cp -p ... || cp ...`: leva o mtime do arquivo, que diz de quando era o conteudo. Se o `cp` de reserva rodasse DEPOIS de um `cp -p` que deu certo
+# (24909e7bf1, o `||` virando `&&`) os bytes seriam os mesmos e o backup ficaria com a hora de agora. Sem /tmp gravavel (jaula do gate) nao ha backup para medir: o caso diz isso e nao conta.
+_bk=""; for _f in /tmp/trr-collide.sh.backup.*.$$; do [ -f "$_f" ] && _bk="$_f"; done
+if [ -n "$_bk" ]; then
+  { [ "$(cat "$_bk")" = "from-upstream" ] && [ ! "$_bk" -nt "$TMP/mtime.ref" ] && [ ! "$_bk" -ot "$TMP/mtime.ref" ]; } \
+    && ok "colisao identica: o backup leva o mtime do arquivo (cp -p), nao a hora do backup" \
+    || bad "backup da colisao identica: conteudo ou mtime errado ($(ls -l "$_bk"))"
+else
+  echo "  SKIP: sem backup em /tmp (sem /tmp gravavel, jaula do gate): o mtime do backup nao pode ser medido aqui"
+fi
+unset _bk _f
 printf 'mine different\n' > "$W/trr-collide.sh"
 : > "$LOG"; reconcile_untracked_for_ffpull "$W" origin/main >/dev/null 2>&1; rc=$?
 [ "$rc" = "2" ] && [ "$RECONCILE_COUNT" = "0" ] && [ "$RECONCILE_DIFF_LIST" = " trr-collide.sh" ] \
