@@ -38,7 +38,7 @@ O exporter **não tem lock**: dois exporters ao mesmo tempo escrevem o mesmo arc
    ls "$GC_CITY/.gc/runtime/packs/town-deltas/jsonl-hourly-offsite.lock.d" 2>/dev/null && cat "$GC_CITY/.gc/runtime/packs/town-deltas/jsonl-hourly-offsite.lock.d/pid" || echo sem-lock-do-upload
    ```
    Export em voo (até 14 min): esperar terminar. Lock do upload de pid vivo: esperar (ou deixar; o lock do script cobre este lado).
-4. **Instalar e carregar** (cópia simples, sem `-p`: o `story-ga-c0939v.7` usa o mtime do plist instalado como marcador do cutover):
+4. **Instalar e carregar** (antes: `test -x /opt/homebrew/bin/timeout || echo FALTA-timeout`, o plist chama esse binário na frente do script; cópia simples, sem `-p`: o `story-ga-c0939v.7` usa o mtime do plist instalado como marcador do cutover):
    ```bash
    for l in com.gascity.jsonl-export com.gascity.jsonl-hourly-offsite; do
      cp "$GC_CITY/scripts/$l.plist" ~/Library/LaunchAgents/$l.plist
@@ -86,6 +86,7 @@ pgrep -fl 'jsonl-export\.sh' || echo sem-export   # esperar o run em voo termina
 |---|---|
 | silêncio entre o `reload` e o passo 4 | sem export e **sem alerta do watchdog** (passo 1: só um `WARN` no log dele); quem acende é o alarme de idade, quando o `latest.json` passar de 75 min (S3) ou a tabela de 120 min |
 | ABSENT/auto-bootstrap do watchdog num label | o label saiu do launchd **sem** estar `disabled` e o plist está em `~/Library/LaunchAgents`: o watchdog recarrega sozinho (alerta + `RunAtLoad`); se repete, ver `launchctl print`. Depois de um Reverter é o erro a evitar (faltou o `disable`: o job volta e, sem o `skip`, são dois exporters) |
+| `PATH-MISSING` com `/opt/homebrew/bin/timeout` | o watchdog confere só o 1º programa do plist, que aqui é o `timeout` GNU e não o script: sem ele o job nem sobe. Script ausente não dá PATH-MISSING: dá CRASH-LOOP (rc 127) |
 | `SKIP <label>: launchctl-disabled (parada deliberada)` no log do watchdog | esperado depois de um Reverter: é o `disable` segurando, sem religar e sem alerta. Para voltar a rodar: passo 4 (`enable` + `bootstrap`) |
 | heartbeat velho (2700 s exporter, 5400 s upload) → `kickstart -k` | exporter: o `jsonl-export.log` não ganhou `start`/`end`/`skipped-low-disk` em 45 min (o launchd não disparou, ou a rodada nem abriu). Upload: o `.out` sem linha por 90 min. Arquivo do heartbeat **ausente** = sem veredito (`_log_age` vazio), nunca WEDGE: quem cobre é o alarme de idade |
 | `.out` do exporter vazio ou parado, com o `jsonl-export.log` andando | normal: rodada limpa sem mudança não imprime nada no stdout. Não é defeito |
