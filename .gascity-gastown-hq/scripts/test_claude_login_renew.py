@@ -451,6 +451,10 @@ def scr(url, text="", ids=(), pw=False, code=False, buttons=(), email_box=False)
     (("https://claude.ai/login", "This site is protected by reCAPTCHA", (), False, False, ["continue with google"]), "click_google"),
     (("http://localhost:5555/callback", "", (), False, False, []), "done"),
     (("https://claude.ai/loading", "", (), False, False, []), "wait"),
+    (("https://platform.claude.com/oauth/authorize", f"connect {E}", (), False, False, ["authorize"]), "click_authorize"),
+    (("https://evilclaude.com/oauth/authorize", f"connect {E}", (), False, False, ["authorize"]), "wait"),             # a host that merely ENDS in the letters is not Anthropic's
+    (("https://claude.ai.evil.com/login", "", (), False, False, ["continue with google"]), "wait"),
+    (("https://notclaude.ai/login", "", (), False, False, ["continue with google"]), "wait"),
 ])
 def test_every_screen_the_driver_can_meet_has_one_answer(args, want):
     assert scr(*args) == want
@@ -501,6 +505,53 @@ class _Page:
 def test_a_page_whose_text_cannot_be_read_is_not_a_page_with_nothing_on_it():
     assert renew.look(_Page(True))["text"] is None                                # unreadable: the driver skips it, so no puzzle check is bypassed and nothing is clicked
     assert renew.look(_Page(None))["text"] == ""                                  # readable and empty: an empty page, which classify answers on its own
+
+
+class _FPage:
+    def __init__(self, url, text="", buttons=()):
+        self.url, self.text, self.buttons, self.closed, self.clicks, self.handlers = url, text, list(buttons), False, [], []
+
+    def on(self, ev, fn):
+        self.handlers.append(ev)
+
+    def goto(self, *a, **k):
+        pass
+
+    def inner_text(self, sel, timeout=0):
+        return self.text
+
+    def locator(self, sel):
+        return _Loc(False)
+
+    def get_by_role(self, *a, **k):
+        raise AssertionError("a click was attempted on " + self.url)
+
+    def is_closed(self):
+        return self.closed
+
+    def close(self):
+        self.closed = True
+
+
+def test_the_driver_follows_only_its_own_tab_never_another_tab_of_the_shared_profile(monkeypatch, capsys):
+    import io
+    import types
+    foreign = _FPage("https://accounts.google.com/signin/oauth/consent", "Sign in to Claude", ["continue"])    # someone else's flow, in the same Chrome
+    own = _FPage("http://localhost:5555/callback")
+    ctx = types.SimpleNamespace(listeners=[], new_page=lambda: [fn(foreign) for fn in ctx.listeners] and own or own, on=lambda ev, fn: ctx.listeners.append(fn))
+    pw = types.SimpleNamespace(chromium=types.SimpleNamespace(connect_over_cdp=lambda *a, **k: types.SimpleNamespace(contexts=[ctx])))
+    mod = types.ModuleType("playwright.sync_api")
+    mod.sync_playwright = lambda: types.SimpleNamespace(__enter__=lambda s: pw, __exit__=lambda s, *a: False)
+    mod.sync_playwright = lambda: type("SP", (), {"__enter__": lambda s: pw, "__exit__": lambda s, *a: False})()
+    monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", mod)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("https://claude.ai/oauth/authorize?x=1"))
+    monkeypatch.setenv("RENEW_EMAIL", EMAIL["b85"])
+    assert renew.drive() == 0
+    assert '"verdict": "ok"' in capsys.readouterr().out
+    assert ctx.listeners == [] and own.handlers == ["popup"]                      # no context-wide listener: only popups of our own tab are adopted
+    assert foreign.closed is False and foreign.clicks == []                       # the other flow's tab was neither read, clicked nor closed
+    assert own.closed is True                                                    # our own tab is closed on the way out
 
 
 @pytest.mark.parametrize("url, ok", [

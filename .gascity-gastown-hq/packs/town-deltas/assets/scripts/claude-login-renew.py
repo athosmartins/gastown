@@ -276,7 +276,7 @@ def classify(email: str, url: str, text: str, ids: List[str], has_pw: bool, has_
         if has_email_box:                      # Google asks WHICH e-mail to sign in: the profile has no Google session at all, and the job does not type an e-mail into it
             return "no_google_session"
         return "click_continue" if "continue" in buttons else "wait"
-    if host == "claude.ai" or host.endswith(".claude.ai") or host.endswith("claude.com"):
+    if host in ("claude.ai", "claude.com") or host.endswith((".claude.ai", ".claude.com")):      # exact or a true subdomain (leading dot): "evilclaude.com" is nobody's
         if "authorize" in buttons:
             seen = {x.lower() for x in EMAIL_RE.findall(text)}
             return "wrong_account" if seen and me not in seen else "click_authorize"
@@ -325,8 +325,12 @@ def drive() -> int:
         except Exception as e:  # noqa: BLE001
             return say("error", f"the automation Chrome is not reachable ({type(e).__name__}): `cdp restart`")
         ctx = br.contexts[0]                         # the profile's own context: the Google session Athos signed in once
-        owned = [ctx.new_page()]
-        ctx.on("page", lambda pg: owned.append(pg))
+        owned = [ctx.new_page()]                     # ONLY our own tab and the popups IT opens: the profile is shared (federated-site-login, Athos), so a tab someone else opens is never read, clicked or closed
+
+        def adopt(pg) -> None:
+            owned.append(pg)
+            pg.on("popup", adopt)
+        owned[0].on("popup", adopt)
         last = "start"
         try:
             owned[0].goto(url, wait_until="domcontentloaded", timeout=30000)
