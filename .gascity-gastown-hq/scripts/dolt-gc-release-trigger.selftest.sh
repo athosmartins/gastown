@@ -516,6 +516,7 @@ _chk 'zz\n'       "unreadable"
 _chk '5\c'        "unreadable"          # cut mid-write: no newline
 _chk '53 1\c'     "unreadable"          # a complete-looking record with no newline is a torn write
 _chk '53\n'       "unreadable"          # alerted flag missing
+_chk '1\n'        "unreadable"          # a lone "1" is its own flag (no space to cut at), so it passes the flag case: only the join check refuses it (7073eb6390)
 _chk '53 2\n'     "unreadable"          # the flag is 0|1
 _chk '0 1\n'      "unreadable"          # cleared is EXACTLY "0 0" (what _clear_skip_streak writes)
 _chk '00 0\n'     "unreadable"
@@ -1196,9 +1197,10 @@ unset _code
 # ── ga-hq1qc5y (hq-mutants lastro): the helpers that may fail, the edges of the others, the post-run WARNs, the script as a program ────────────────
 echo "== helpers: status and edges =="
 # EQUIVALENT, documented: 8ea215a12c (`_gc_required_parts` failing inside _gc_trigger_decision: the loop above it already refused every non-numeric size, pct and floor, the only inputs it fails on);
-# 7073eb6390 (`[ "$line" = "$n $flag" ]` in _trg_streak_read: after the case on the flag it cannot be false); 35d16b9578 and 9d28f4e738 (_trg_backoff_s: `-lt` -> `-le` while s == cap doubles once more and
+# 35d16b9578 and 9d28f4e738 (_trg_backoff_s: `-lt` -> `-le` while s == cap doubles once more and
 # the clamp brings it back to the cap; `-gt` -> `-ge` assigns the cap to the cap); cac26e2671 and 4fbf2ea052 (the poll's clamp of a stored backoff, `-gt` -> `-ge`: at equality it assigns the same number);
-# fa54519c71 (`[ -f ] || return 1` in _trg_state_readable: for a directory the `wc -l <` below fails to read it and the same `return 1` follows); 4f99aaeef8 (`mkdir -p ... || return 1` in
+# fa54519c71 (`[ -f ] || return 1` in _trg_state_readable: for a directory the `wc -l <` below fails to read it and the same `return 1` follows; so it does for /dev/null, 0 lines. Only a path whose read never
+# finishes tells the two apart, and for the worse (a FIFO: the open() of `wc -l <` waits for a writer; /dev/zero: no end). Nothing creates one at the state path, so no case: a timed one needs an open fd, a subshell and a timer); 4f99aaeef8 (`mkdir -p ... || return 1` in
 # _trg_state_write: the redirection after it fails on the same missing directory and returns 1); c76d35419c and 22ec8a2fd6 (`|| true` -> `&& true` after a status the function discards: both end in `return 0`).
 _t="$T/helpers"; mkdir -p "$_t"
 _pi_bad=""; for _v in "" abc 0 -1 1.5; do _trg_pos_int "$_v" && _pi_bad="$_pi_bad [$_v]"; done
