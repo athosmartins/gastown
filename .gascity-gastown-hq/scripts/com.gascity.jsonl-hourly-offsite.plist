@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.jsonl-hourly-offsite</string>
+
+  <!-- The hourly JSONL upload to S3 (the offsite leg of the beads backup) run by launchd instead of the gc order (2026-11-03, ga-ki02nmt).
+
+       WHAT: the SAME script, the SAME timeout and the SAME cadence as orders/jsonl-hourly-offsite.toml (exec jsonl-hourly-offsite.sh, timeout 2400 s,
+       every 30 min). The order is switched off in the same deploy: city.toml [orders] skip names "jsonl-hourly-offsite".
+
+       WHY: same cause as com.gascity.jsonl-export.plist (the engine dispatcher serves ~1.16 order runs/min against ~14.7 asked, so a 30 min order runs
+       about every 35 min or worse, and latest.json on S3 aged past the 75 min alarm). The upload must not depend on that cap. The -age plist next to this
+       one already watches the result from launchd; this one produces it.
+
+       LOCK: unlike the exporter, this script HAS a single-flight lock (mkdir $STATE/jsonl-hourly-offsite.lock.d, owner pid, reclaimed when the owner is
+       dead or older than 120 min): a second run exits 0 in silence. So a launchd tick that lands while an order run is still going (cutover, or a
+       rollback done in the wrong order) cannot double-upload. That lock is the safety the cutover leans on for this half.
+
+       TIMEOUT: `timeout -k 20 2400` = the order's 2400 s. Typical run ~3 min (median 206 s, p90 326 s, max 579 s over 86 runs, order comment). The
+       timeout is above the 1800 s interval on purpose, as in the order: launchd does not start a second instance of the same label while one runs, and the
+       script's lock covers the rest.
+
+       ENV: only GC_CITY_PATH / GC_CITY_RUNTIME_DIR are needed (the script derives archive and state dir from them; it does not touch Dolt). PATH has
+       /opt/homebrew/bin first on purpose: aws, jq and GNU timeout live there, and without it every run ends rc 2 (tool missing). Credentials come from
+       ~/.aws (file based), the same ones the nightly S3 backup and the -age job use.
+
+       LOG: the script writes its lines to .gc/logs/jsonl-hourly-offsite.log AND to stderr (not stdout). StandardOutPath and StandardErrorPath are the SAME file
+       on purpose: the watchdog heartbeat is the StandardOutPath, and a stdout-only file would never advance for this job (it would read as wedged and the
+       watchdog would kickstart -k a healthy upload). Every run logs at least one line (start of the work, the lock refusal, or the verdict).
+
+       ProcessType Interactive: see com.gascity.jsonl-export.plist (macOS DAS can defer a Standard job under load; ga-9wv5).
+       RunAtLoad: a bootstrap runs a cycle right away; the script is idempotent (same HEAD already on S3 = "ponto batido").
+
+       WATCHDOG: registered in daemon-presence-watchdog.sh (DPW_CRITICAL + heartbeat on the StandardOutPath below, limit 5400 s = 3 cycles).
+       Exit codes (script header): 0 ok / nothing to do, 1 upload failed, 2 could not evaluate, 3 usage. Two non-zero in a row = CRASH-LOOP alert, on top of the
+       script's own phone alert.
+       INSTALL: docs/runbooks/jsonl-launchd-cutover.md (copy to ~/Library/LaunchAgents, launchctl bootstrap, after the skip is live). -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/timeout</string>
+    <string>-k</string>
+    <string>20</string>
+    <string>2400</string>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/jsonl-hourly-offsite.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartInterval</key><integer>1800</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
+
+  <key>StandardOutPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/jsonl-hourly-offsite-launchd.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/jsonl-hourly-offsite-launchd.out</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>GC_CITY_RUNTIME_DIR</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq/.gc/runtime</string>
+  </dict>
+</dict>
+</plist>

@@ -1,0 +1,87 @@
+# Backup do beads (exporter + upload ao S3) rodando do launchd — cutover (ga-ki02nmt)
+
+**Por quê.** O despachante de orders do engine atende ~1,16 run/min contra ~14,7 pedidos/min (cada order roda a cada ~35 min, não importa o `interval`; teto de 4 orders por tick). O RPO do backup não pode depender disso. Medido em 03/11 (ga-ki02nmt):
+- `jsonl-archive` (commits do exporter, horário local -03): 08:23 → 10:24 → 12:38, ou seja **um commit a cada ~2 h** com o order de 15 min;
+- `latest.json` no S3: `data_as_of` 2 h 45 min atrás, `checked_at` 40 min atrás (o upload anda, o dado não);
+- log do upload desde 01/11, mediana do gap entre publicações **47 min, 35 % dos gaps acima de 60 min** (meta: `latest.json` < 4500 s).
+
+**O que muda.** Dois jobs do launchd, **mesmos scripts, mesmos timeouts, mesma cadência** dos orders:
+
+| label | script | a cada | timeout | lock do script |
+|---|---|---|---|---|
+| `com.gascity.jsonl-export` | `packs/town-deltas/assets/scripts/jsonl-export.sh` | 15 min | 840 s (`timeout -k 20`) | **não tem** |
+| `com.gascity.jsonl-hourly-offsite` | `packs/town-deltas/assets/scripts/jsonl-hourly-offsite.sh` | 30 min | 2400 s (`timeout -k 20`) | tem (`jsonl-hourly-offsite.lock.d`, 2º run sai 0 calado) |
+
+Os dois orders (`orders/jsonl-export.toml`, `orders/jsonl-hourly-offsite.toml`) **ficam no repo** como fonte do timeout/intervalo que o plist copia (`scripts/jsonl-launchd-plists.selftest.sh` exige igualdade) e entram em `city.toml` `[orders] skip` — o mesmo deploy. O order `jsonl-hourly-offsite-age` (alarme de idade do `latest.json`, tem gêmeo launchd próprio) **não** é tocado.
+Os dois plists estão em `daemon-presence-watchdog.sh` (`DPW_CRITICAL` + `DPW_HEARTBEAT` 2700 s / 5400 s no `.out` de cada um).
+
+## Ordem do cutover (não inverter)
+
+O exporter **não tem lock**: dois exporters ao mesmo tempo escrevem o mesmo archive. Por isso o order sai **antes** do plist entrar. A janela entre os passos 1 e 4 (poucos minutos) fica sem export; o próximo run recupera tudo (o export é idempotente, lê o estado atual do Dolt).
+
+1. **Merge** (o `city.toml` com o `skip` novo entra no checkout vivo) e recarregar a config: `gc --city "$GC_CITY" reload`.
+   Vai aparecer **PRESENCE-DRIFT** do `daemon-presence-watchdog` (plist em `scripts/` e ainda não carregado): esperado até o passo 4, some sozinho. Não silenciar o watchdog.
+2. **Confirmar que os orders saíram:**
+   ```bash
+   gc --city "$GC_CITY" order list --json | jq -r '.orders[].name' | grep -E '^jsonl-(export|hourly-offsite)$' && echo AINDA-LISTADO || echo ok-fora
+   ```
+   `AINDA-LISTADO` depois de um `gc reload` = o skip não pegou: **parar aqui** (instalar o plist agora dá dois exporters) e avisar o Mayor. Lista que não abre não é "ok-fora": repetir.
+3. **Confirmar que nada está em voo:**
+   ```bash
+   pgrep -fl 'jsonl-export\.sh' || echo sem-export
+   ls "$GC_CITY/.gc/runtime/packs/town-deltas/jsonl-hourly-offsite.lock.d" 2>/dev/null && cat "$GC_CITY/.gc/runtime/packs/town-deltas/jsonl-hourly-offsite.lock.d/pid" || echo sem-lock-do-upload
+   ```
+   Export em voo (até 14 min): esperar terminar. Lock do upload de pid vivo: esperar (ou deixar; o lock do script cobre este lado).
+4. **Instalar e carregar** (cópia simples, sem `-p`: o `story-ga-c0939v.7` usa o mtime do plist instalado como marcador do cutover):
+   ```bash
+   for l in com.gascity.jsonl-export com.gascity.jsonl-hourly-offsite; do
+     cp "$GC_CITY/scripts/$l.plist" ~/Library/LaunchAgents/$l.plist
+     launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/$l.plist
+   done
+   ```
+   `RunAtLoad` roda um ciclo agora. Um `bootstrap` que diz `Input/output error` com o label já carregado = já estava instalado: `launchctl bootout gui/$(id -u)/<label>` e repetir.
+5. **Conferir** (não é para acreditar neste texto):
+   ```bash
+   for l in com.gascity.jsonl-export com.gascity.jsonl-hourly-offsite; do launchctl print "gui/$(id -u)/$l" | grep -E 'state =|runs =|last exit'; done
+   tail -3 "$GC_CITY/.gc/logs/jsonl-export-launchd.out" "$GC_CITY/.gc/logs/jsonl-hourly-offsite-launchd.out"
+   git -C "$GC_CITY/.gc/runtime/packs/maintenance/jsonl-archive" log -5 --format='%h %cI %s'
+   bash "$GC_CITY/packs/town-deltas/assets/scripts/jsonl-hourly-offsite.sh" --status
+   bash "$GC_CITY/packs/town-deltas/assets/prod-tests/gascity/story-ga-7sxdmb.sh"
+   ```
+   O `story-ga-7sxdmb.sh` agora exige: 0 orders rodando `jsonl-export.sh`, os dois nomes fora do `gc order list`, os dois labels carregados apontando para o script deste city, e os dois nomes no `skip`. `story-ga-c0939v.2.sh` e `.7.sh` exigem plist instalado idêntico ao do repo.
+
+## Critério de pronto (ga-ki02nmt) — medir, não afirmar
+
+Por 24 h, com carga alta incluída:
+- `git -C "$GC_CITY/.gc/runtime/packs/maintenance/jsonl-archive" log --since='24 hours ago' --format='%cI'` com commits a cada ~15 min;
+- `jsonl-hourly-offsite.sh --status` com `latest.json` < 4500 s o tempo todo (o alarme de idade, `--age-check`, já mede isso a cada 10 min).
+
+### Limite que o launchd não resolve: a política de disco do exporter (ga-j2f5v5)
+
+Com **menos de 5 GiB livres** o `jsonl-export.sh` se espaça sozinho para **no máximo 1 export por hora** (`skipped-low-disk (cadência estendida)` em `.gc/logs/jsonl-export.log`); na classe CRÍTICA do Dolt (< 4096 MB livres) só com o último export > 3 h. Medido em 03/11: 4942 MB livres, ou seja, abaixo da linha. **Enquanto o disco ficar abaixo de 5 GiB, o launchd tica a cada 15 min mas o exporter pula 3 de cada 4 ticks, e o critério "commit a cada ~15 min" não é atingível por este cutover.** O que destrava é espaço em disco (rodada de limpeza do Mayor), não mudar a política: ela existe porque cada run pesa ~700 MB e um ENOSPC no journal do Dolt já aconteceu (15/10, 17/10). Medir o critério só com o disco ≥ 5 GiB livres.
+
+## Reverter (ordem inversa, também não inverter)
+
+```bash
+for l in com.gascity.jsonl-export com.gascity.jsonl-hourly-offsite; do
+  launchctl bootout "gui/$(id -u)/$l"
+done
+pgrep -fl 'jsonl-export\.sh' || echo sem-export   # esperar o run em voo terminar
+```
+**Só depois** tirar `"jsonl-export"` e `"jsonl-hourly-offsite"` de `city.toml` `[orders] skip` (e `gc reload`). Tirar o `skip` com o plist ainda carregado = dois exporters. Remover os arquivos de `~/Library/LaunchAgents` e os plists de `scripts/` junto (senão o PRESENCE-DRIFT avisa o telefone); o `daemon-presence-watchdog` deixa de listar os labels ao tirá-los de `DPW_CRITICAL`/`DPW_HEARTBEAT`.
+
+## O que pode acender (e é esperado ou não)
+
+| sinal | o que é |
+|---|---|
+| PRESENCE-DRIFT dos dois labels entre o merge e o passo 4 | esperado, some ao carregar |
+| ABSENT/auto-bootstrap do watchdog num label | o plist saiu do launchd: o watchdog recarrega sozinho; se repete, ver `launchctl print` |
+| heartbeat velho (2700 s exporter, 5400 s upload) → `kickstart -k` | o `.out` parou de andar: exporter morto/preso, ou o upload sem linha no `.out` por 90 min |
+| CRASH-LOOP no upload | 2 runs seguidos com rc != 0 (rc 1 = falha de upload, rc 2 = não deu para avaliar): o script já manda o próprio alerta; é falha real, não do launchd |
+| `skipped-low-disk` no `.out` do exporter | política de disco acima, não defeito |
+
+## Pendências conhecidas (não são deste cutover)
+
+- **Lock do exporter:** só o upload tem single-flight. Segurança de hoje = launchd não sobe 2ª instância do mesmo label + `skip` no mesmo deploy + a ordem acima. Um lock dentro do `jsonl-export.sh` é a defesa de verdade (follow-up).
+- `engine patch max_dispatches_per_tick=8`, o plist do `jsonl-table-age` e a mudança da ordem de leitura do exporter são de outros beads.
+- Medição dos 5 orders de 30 s (gate-sweep × 4 rigs, dolt-health): no comentário do bead ga-ki02nmt (proposta: gate-sweep 30 s → 300 s, dolt-health 30 s → 120 s).
