@@ -166,8 +166,9 @@ grep -qF 'spec indisponível' "$LPE" && ok "espelho sem filtro: o stderr do ssh 
 
 # ── lastro hq-mutants (ga-0qhveri): o que as seções acima não pisam — o filtro que MUDA, o bootstrap, a idade (lag), status, wt-add/wt-rm e scan ──────────────────────────────────────
 # Cada caso abaixo mata uma troca de `&&`/`||`/`-n`/`!`/limite que deixava o selftest verde. EQUIVALENTES (provados por leitura, sem caso): o `|| true` -> `&& true` das duas leituras `rev-parse -q --verify` do status (sem `set -e`
-# o rc de uma atribuição por $( ) nunca é lido); `remove && prune || [ ! -e ]` do wt-rm (com a pasta removida o resto vale o mesmo; sem ela o `[ ! -e ]` também falha); o `|| return 2` do `mktemp -d` dentro de denied (sem ele o
-# `git init /r` falha na raiz do disco e o rc continua 2); o `&&` -> `||` entre o `tr` e a conferência de contagem do `find` do scan (se o `find` falha o `tr` não roda, $t/files não existe e a conferência é sempre falsa).
+# o rc de uma atribuição por $( ) nunca é lido); `remove && prune || [ ! -e ]` do wt-rm (só difere se o `prune` falhar DEPOIS de um `remove` que deu certo, e o git não faz isso; se o `remove` falha a pasta continua lá e o `[ ! -e ]`
+# também falha); o `|| return 2` do `mktemp -d` dentro de denied (sem ele o `git init /r` falha na raiz do disco para quem não é root e o rc continua 2); o `&&` -> `||` entre o `tr` e a conferência de contagem do `find` do scan
+# (se o `find` falha o `tr` não roda, $t/files não existe e a conferência é sempre falsa).
 mkdir -p "$T/shim2" "$T/home"; export REAL_DATE; REAL_DATE=$(command -v date)
 printf '%s\n' '#!/bin/sh' '[ -n "${FAKE_NOW:-}" ] && [ "${1:-}" = +%s ] && { echo "$FAKE_NOW"; exit 0; }' 'exec "$REAL_DATE" "$@"' > "$T/shim2/date"   # FAKE_NOW fixa o `date +%s` do script: a idade sai exata
 printf '%s\n' '#!/bin/sh' 'case "${SHIM2_MODE:-}:${1:-}" in' '  mktempfail:-d) echo "shim: mktemp -d falhou (de proposito)" >&2; exit 1 ;;' \
