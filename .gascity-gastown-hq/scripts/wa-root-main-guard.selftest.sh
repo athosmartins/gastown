@@ -45,6 +45,11 @@
 #           statement and the guard has no `set -e`. The two early exits `[ -f "$STATE" ] || return 0` and `[ -e "$STATE" ] || return 0` and the
 #           `|| return 0` after the read can be dropped without a visible difference: with no file the read fails with k empty, and an empty k
 #           reaches the case's `*) return 0` (or, in clear_episode, finds nothing to remove and no episode to close).
+#   S26-S29 (ga-0qhveri, hq-mutants) S26 the backup tag cannot be made: no switch, a WARN line, a priority-5 notify, rc 0; S27 an episode that never
+#           alerted still alerts on a clock near the epoch (NOW below the window); S28 an episode that began at second 1 has an age in minutes (only
+#           0 means "no clock"); S29 no clock AND a notify that fails: the failure line does not claim a window that was kept
+#   EQUIVALENT (more) the `|| true` of `mkdir -p "$HOOKS"` and of the stash push and the stash drop -> `&& true`, and the `return 0` -> `return 1` of
+#           read_state's case and plain() guards: nobody reads the status of any of them and there is no `set -e`.
 # HOW. Real git: a bare "origin" plus a clone as the live root, in a throwaway dir. The guard runs as a subprocess
 # with WA_ROOT_GUARD_{ROOT,CITY,HOOKS,NOW} pointing there and a fake `notify` first on PATH; nothing under /Users/athos
 # is read, no network, no daemons. WRMG_GUARD=<path> runs the harness against another copy of the guard — that is how it
@@ -508,6 +513,36 @@ if env PATH="$NONOTE" sh -c 'command -v notify' >/dev/null 2>&1; then bad "S25 f
   cycle 3 PATH="$NONOTE"
   eq "S25 the window was not spent: the next cycle writes the alert again" "$(grep -c 'OFF-MAIN-DETACHED' "$LOG")" 2
 fi
+
+echo "S26: the backup tag cannot be made — the restore is ABORTED (no switch), the guard says so, notifies at priority 5 and still ends 0"
+mk_world s26; fx checkout -q -b crew/t; echo t > "$ROOT/t.txt"; fx add t.txt; fx commit -q -m crewt
+SH26="$(fx rev-parse --short HEAD)"
+fx update-ref "refs/tags/wa-root-guard-backup-$SH26/block" HEAD   # a ref UNDER the tag's name: git cannot create the tag (directory/file conflict)
+cycle 1
+eq "S26 exit code" "$RC" 0
+has "S26 the abort is logged with the tag name" "$LOG" "could not create backup tag wa-root-guard-backup-$SH26"
+has "S26 ... as an abort" "$LOG" "ABORTING restore"
+eq "S26 the root stays on the crew branch (no switch without a backup)" "$(fx rev-parse --abbrev-ref HEAD)" crew/t
+hasnt "S26 no RESTORED line" "$LOG" "RESTORED"
+has "S26 notified at priority 5, naming the failed backup" "$NOTES" "-p 5 -t wa-root-guard WA root OFF-MAIN on 'crew/t' but backup tag FAILED"
+
+echo "S27: a clock near the epoch (NOW below the window) — an episode that never alerted still alerts once confirmed"
+mk_world s27; fx checkout -q --detach "$U"
+cycle 1 WA_ROOT_GUARD_NOW=300; cycle 2 WA_ROOT_GUARD_NOW=414
+eq "S27 the 2nd cycle alerts although 414 s is less than the 60 min window" "$(nl "$LOG")" 1
+has "S27 the alert line" "$LOG" "OFF-MAIN-DETACHED"
+
+echo "S28: an episode that began at epoch second 1 has a real start — its age is minutes, only 0 means 'no clock'"
+mk_world s28; fx checkout -q --detach "$U"; printf 'off-main 1 1 0\n' > "$STATE"; cycle 2
+has "S28 the age is the minutes since second 1" "$LOG" "cycles=2, ~$(( (T0 + 228 - 1) / 60 ))min)"
+
+echo "S29: no usable clock AND the channel is down — nothing is kept for a retry, so the failure line must not claim a window that was kept"
+mk_world s29; fx checkout -q --detach "$U"
+printf '#!/bin/sh\nexit 1\n' > "$BIN/date"; chmod +x "$BIN/date"
+cycle 1 WA_ROOT_GUARD_NOW=; cycle 2 WA_ROOT_GUARD_NOW= NOTIFY_FAIL=1
+has "S29 the alert line is written" "$LOG" "OFF-MAIN-DETACHED"
+has "S29 the failure line says the log is the only copy" "$LOG" "so this log is its only copy"
+hasnt "S29 ... and does not say the window was kept" "$LOG" "window is NOT spent"
 
 echo ""
 echo "──────────────────────────────────────────"
