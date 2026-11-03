@@ -2,7 +2,7 @@
 # hetzner-remote-git.selftest.sh — hermético: tudo em mktemp, o "espelho" é um bare local servido por um `ssh` de mentira (sem rede, sem sshd, sem tocar nos clones reais). Cobre o `pull` de hetzner-remote-git.sh quando o espelho anuncia uma ref cuja ponta NÃO existe no clone (ga-yo1n1zg).
 #
 # ## Contents
-#   Fixture · Controles · Recuperação · Estado visível · Cura · Falha sem contorno · Recusas · Falha que não é essa
+#   Fixture · Controles · Recuperação · Estado visível · Cura · Falha sem contorno · Recusas · Falha que não é essa · Lastro hq-mutants (filtro que muda, bootstrap, lag, status, wt-add/wt-rm, scan)
 #
 # O CASO: em 02/11 o commit c0cc488b9 sumiu do repo.git do nó; o espelho passou a anunciar uma branch nova nessa ponta e TODO pull/fetch morreu em "did not send all necessary objects" (main parado 70 min), com a causa escondida
 # (last-pull-error guardava só a última linha do stderr). Aqui o commit some do clone da fixture do mesmo jeito (pack reescrito sem ele) e o `pull` de verdade roda contra ele.
@@ -13,7 +13,7 @@
 #   de `cat-file --batch-all-objects` é redundante onde a saída já vem ordenada (git >= 2.19); o `LC_ALL=C` só vale com git traduzido (a frase que dispara o retry é em inglês).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd -P); RG=${HRG_S:-$HERE/hetzner-remote-git.sh}
-T=$(mktemp -d "${TMPDIR:-/tmp}/hrg.XXXXXX"); T=$(cd "$T" && pwd -P); chmod 700 "$T"; N=0; F=0; HRG_EXPECT=85
+T=$(mktemp -d "${TMPDIR:-/tmp}/hrg.XXXXXX"); T=$(cd "$T" && pwd -P); chmod 700 "$T"; N=0; F=0; HRG_EXPECT=153
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t GIT_TERMINAL_PROMPT=0
 export GT_REMOTE_GIT=$T/node GT_REMOTE_SSH=$T/bin/ssh GT_REMOTE_NOMUX=1 FAKE_SRV=$T/srv.git FAKE_SPEC=$T/spec REAL_GIT REAL_MKTEMP; REAL_GIT=$(command -v git); REAL_MKTEMP=$(command -v mktemp)
 ok() { N=$((N+1)); echo "ok   $N - $1"; }
@@ -163,6 +163,142 @@ grep -qF 'retry' "$LPE" && bad "outra falha: tentou contornar o que não era a f
 fresh adv; OUT=$(env FAKE_SSH_FAIL=spec "$RG" pull gascity 2>&1); RC=$?   # falha ANTES do fetch (o espelho não devolve o filtro): as variáveis do retry nunca foram setadas e o pull tem de falhar limpo, não morrer em 'unbound variable'
 [ "$RC" = 1 ] && has 'resultado=erro' "espelho sem filtro (antes do fetch): o pull falha limpo (rc 1, resultado=erro)"; hasnt 'unbound' "espelho sem filtro: nenhuma variável do retry fica sem valor (set -u)"
 grep -qF 'spec indisponível' "$LPE" && ok "espelho sem filtro: o stderr do ssh fica no last-pull-error" || bad "espelho sem filtro: stderr" "$(cat "$LPE" 2>&1)"
+
+# ── lastro hq-mutants (ga-0qhveri): o que as seções acima não pisam — o filtro que MUDA, o bootstrap, a idade (lag), status, wt-add/wt-rm e scan ──────────────────────────────────────
+# Cada caso abaixo mata uma troca de `&&`/`||`/`-n`/`!`/limite que deixava o selftest verde. EQUIVALENTES (provados por leitura, sem caso): o `|| true` -> `&& true` das duas leituras `rev-parse -q --verify` do status (sem `set -e`
+# o rc de uma atribuição por $( ) nunca é lido); `remove && prune || [ ! -e ]` do wt-rm (com a pasta removida o resto vale o mesmo; sem ela o `[ ! -e ]` também falha); o `|| return 2` do `mktemp -d` dentro de denied (sem ele o
+# `git init /r` falha na raiz do disco e o rc continua 2); o `&&` -> `||` entre o `tr` e a conferência de contagem do `find` do scan (se o `find` falha o `tr` não roda, $t/files não existe e a conferência é sempre falsa).
+mkdir -p "$T/shim2" "$T/home"; export REAL_DATE; REAL_DATE=$(command -v date)
+printf '%s\n' '#!/bin/sh' '[ -n "${FAKE_NOW:-}" ] && [ "${1:-}" = +%s ] && { echo "$FAKE_NOW"; exit 0; }' 'exec "$REAL_DATE" "$@"' > "$T/shim2/date"   # FAKE_NOW fixa o `date +%s` do script: a idade sai exata
+printf '%s\n' '#!/bin/sh' 'case "${SHIM2_MODE:-}:${1:-}" in' '  mktempfail:-d) echo "shim: mktemp -d falhou (de proposito)" >&2; exit 1 ;;' \
+  '  mktemp2fail:-d) n=$(cat "$SHIM2_CNT" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$SHIM2_CNT"; [ "$n" -lt 2 ] || { echo "shim: mktemp -d falhou da 2a vez em diante (de proposito)" >&2; exit 1; } ;;' \
+  'esac' 'exec "$REAL_MKTEMP" "$@"' > "$T/shim2/mktemp"
+printf '%s\n' '#!/bin/sh' 'case "${SHIM2_MODE:-}:$*" in' \
+  '  flood201:*" fetch "*|flood200:*" fetch "*) i=0; max=200; [ "$SHIM2_MODE" = flood200 ] && max=199; while [ $i -lt $max ]; do echo "error: ruido $i" >&2; i=$((i+1)); done; echo "error: ssh://x/y.git did not send all necessary objects" >&2; exit 1 ;;' \
+  'esac' 'exec "$REAL_GIT" "$@"' > "$T/shim2/git"
+chmod 755 "$T/shim2/date" "$T/shim2/mktemp" "$T/shim2/git"
+
+# o filtro do espelho MUDA entre dois pulls: sparse, deny, o oid guardado e o partialclonefilter acompanham, e o AVISO diz de qual para qual
+{ cat "$FAKE_SPEC"; echo '!/data/extra'; } > "$T/spec2"; NEWOID=$(git hash-object "$T/spec2")
+fresh adv; git -C "$S" hash-object -w --stdin < "$T/spec2" > /dev/null; OLDOID=$(OIDF)
+OUT=$(env FAKE_SPEC="$T/spec2" "$RG" pull gascity 2>&1); RC=$?
+[ "$RC" = 0 ] && ok "filtro que muda: o pull passa" || bad "filtro que muda: rc=$RC" "$OUT"
+has "o filtro do espelho mudou ($OLDOID" "filtro que muda: o AVISO diz de qual oid saiu"; has "$NEWOID); rode scan" "filtro que muda: ...e para qual foi"
+[ "$(OIDF)" = "$NEWOID" ] && [ "$(git -C "$K" config remote.origin.partialclonefilter)" = "sparse:oid=$NEWOID" ] && ok "filtro que muda: o oid guardado e o partialclonefilter acompanham" || bad "filtro que muda: oid/partialclonefilter" "$(OIDF) $(git -C "$K" config remote.origin.partialclonefilter)"
+cmp -s "$T/spec2" "$T/node/gascity/sparse" && ok "filtro que muda: o sparse é o spec novo" || bad "filtro que muda: sparse"
+[ "$(grep -c . "$T/node/gascity/deny")" = 25 ] && grep -qx '/data/extra' "$T/node/gascity/deny" && ok "filtro que muda: o deny é o spec novo sem a 1ª linha e sem o '!' (25 linhas)" || bad "filtro que muda: deny" "$(wc -l < "$T/node/gascity/deny") linhas"
+# uma resposta que não é um filtro: 24 negações mas a 1ª linha não é '/*'
+{ echo '/lib'; for i in $(seq 1 24); do echo "!/data/y$i"; done; } > "$T/spec.bad"
+fresh adv; OUT=$(env FAKE_SPEC="$T/spec.bad" "$RG" pull gascity 2>&1); RC=$?
+[ "$RC" = 1 ] && has 'resultado=erro' "spec que não abre com '/*' (mesmo com 24 negações): o pull falha" || bad "spec sem '/*': rc=$RC" "$OUT"
+cmp -s "$FAKE_SPEC" "$T/node/gascity/sparse" && ok "spec sem '/*': o filtro gravado não mudou" || bad "spec sem '/*': o sparse mudou"
+# o corpo do last-pull-error tem teto de 200 linhas: com 201 a última é contada, com 200 nada é omitido
+fresh boot; OUT=$(env PATH="$T/shim2:$PATH" SHIM2_MODE=flood201 "$RG" pull gascity 2>&1); RC=$?
+grep -qF '1 linhas omitidas)' "$LPE" && ok "last-pull-error: 201 linhas de stderr: a 201ª é contada como omitida" || bad "last-pull-error: 201 linhas" "$(tail -n 2 "$LPE")"
+fresh boot; OUT=$(env PATH="$T/shim2:$PATH" SHIM2_MODE=flood200 "$RG" pull gascity 2>&1); RC=$?
+grep -qF 'omitidas)' "$LPE" && bad "last-pull-error: 200 linhas cabem no teto, nada é omitido" "$(tail -n 2 "$LPE")" || ok "last-pull-error: 200 linhas cabem no teto, nada é omitido"
+# a listagem de objetos do clone falha: o pull diz que NÃO refez o fetch, e de fato não refez (a marca da 2a tentativa não está no last-pull-error)
+fresh adv; pull objfail; grep -qF -- '--- tentativa 2' "$LPE" && bad "listagem de objetos falha: houve uma 2a tentativa" "$(grep -c . "$LPE") linhas" || ok "listagem de objetos falha: nenhuma 2a tentativa foi feita"
+fresh adv; pull objempty; grep -qF -- '--- tentativa 2' "$LPE" && bad "listagem de objetos vazia: houve uma 2a tentativa" "$(grep -c . "$LPE") linhas" || ok "listagem de objetos vazia: nenhuma 2a tentativa foi feita"
+
+# bootstrap: quatro argumentos bastam, o que o regex recusa, o que não dá para ler, e o ssh que fica gravado
+GRB=$T/nodeb; URLB=ssh://u@127.0.0.1:2293/gascity.git; fresh adv
+bs() { rm -rf "$GRB"; OUT=$(env GT_REMOTE_GIT="$GRB" "$@" 2>&1); RC=$?; }
+bs "$RG" bootstrap rigb "$URLB" "$T/key" "$T/kh"
+[ "$RC" = 0 ] && has 'bootstrap rig=rigb' "bootstrap com 4 argumentos (nenhum prefixo): passa" || bad "bootstrap com 4 argumentos: rc=$RC" "$OUT"
+[ "$(git -C "$GRB/rigb/repo.git" config --get-all remote.origin.push | wc -l | tr -d ' ')" = 2 ] && ok "bootstrap sem prefixo: empurra só crew/ e worker/" || bad "bootstrap sem prefixo: remote.origin.push" "$(git -C "$GRB/rigb/repo.git" config --get-all remote.origin.push)"
+SSHC=$(git -C "$GRB/rigb/repo.git" config gtremote.ssh); printf '%s' "$SSHC" | grep -qF 'ControlMaster=no' && ! printf '%s' "$SSHC" | grep -qF 'ControlMaster=auto' && ok "GT_REMOTE_NOMUX=1: o ssh gravado não usa ControlMaster" || bad "NOMUX: ssh gravado" "$SSHC"
+bs env -u GT_REMOTE_NOMUX "$RG" bootstrap rigb "$URLB" "$T/key" "$T/kh"
+SSHC=$(git -C "$GRB/rigb/repo.git" config gtremote.ssh); printf '%s' "$SSHC" | grep -qF 'ControlMaster=auto' && printf '%s' "$SSHC" | grep -qF "ControlPath=$GRB/.cm-" && ! printf '%s' "$SSHC" | grep -qF 'ControlMaster=no' && ok "sem GT_REMOTE_NOMUX: o ssh gravado multiplexa (ControlMaster=auto, ControlPath no clone)" || bad "sem NOMUX: ssh gravado" "$SSHC"
+bs "$RG" bootstrap Rig "$URLB" "$T/key" "$T/kh"
+[ "$RC" = 2 ] && has 'caractere que recuso' "bootstrap: rig com maiúscula é recusado (rc 2)" || bad "bootstrap rig ruim: rc=$RC" "$OUT"
+[ ! -e "$GRB/Rig" ] && ok "bootstrap: ...e nada foi criado" || bad "bootstrap rig ruim: criou $GRB/Rig"
+bs "$RG" bootstrap rigb "$URLB" "$T/k y" "$T/kh"
+[ "$RC" = 2 ] && has 'caractere que recuso' "bootstrap: chave com espaço é recusada (rc 2, não 3)" || bad "bootstrap chave ruim: rc=$RC" "$OUT"
+bs "$RG" bootstrap rigb "$URLB" "$T/key" "$T/k h"
+[ "$RC" = 2 ] && has 'caractere que recuso' "bootstrap: known_hosts com espaço é recusado (rc 2, não 3)" || bad "bootstrap known_hosts ruim: rc=$RC" "$OUT"
+bs "$RG" bootstrap rigb "$URLB" "$T/sem-chave" "$T/kh"
+[ "$RC" = 3 ] && has 'chave ou known_hosts il' "bootstrap: chave que não existe → rc 3" || bad "bootstrap sem chave: rc=$RC" "$OUT"
+bs "$RG" bootstrap rigb "$URLB" "$T/key" "$T/sem-kh"
+[ "$RC" = 3 ] && has 'chave ou known_hosts il' "bootstrap: known_hosts que não existe → rc 3" || bad "bootstrap sem known_hosts: rc=$RC" "$OUT"
+
+# idade (lag) e status: um nó pequeno só de refs, com datas de commit conhecidas e o `date +%s` do script fixo em 1700010800
+N2=$T/node2; G2=$N2/rg2/repo.git; mkdir -p "$N2/lixo"; git init -q --bare "$G2"; ET=4b825dc642cb6eb9a060e54bf8d69288fbee4904
+mkc() { GIT_AUTHOR_DATE="$2 +0000" GIT_COMMITTER_DATE="$2 +0000" git -C "$G2" commit-tree "$ET" ${3:+-p "$3"} -m "$1"; }
+st() { OUT=$(env PATH="$T/shim2:$PATH" GT_REMOTE_GIT="$N2" FAKE_NOW=1700010800 "$RG" status "$@" 2>&1); RC=$?; }
+P0=$(mkc p0 1699980000); S0=$(mkc base 1699990000 "$P0"); Q=$(mkc synced 1700000000 "$S0")
+git -C "$G2" update-ref refs/remotes/origin/main "$S0"; git -C "$G2" update-ref refs/gt/synced "$Q"
+st rg2; has "main=${S0:0:7} idade_do_origin_min=180 idade_do_commit_main_min=346" "lag: a idade do origin vem do carimbo refs/gt/synced (180 min) e a do commit do main, do commit dele (346 min)"
+git -C "$G2" update-ref -d refs/gt/synced; st rg2; has "idade_do_origin_min=null idade_do_commit_main_min=346" "lag: sem carimbo a idade do origin é null (nunca um número)"
+git -C "$G2" update-ref refs/gt/synced "$Q"; git -C "$G2" update-ref -d refs/remotes/origin/main; st rg2; has "main= idade_do_origin_min=180 idade_do_commit_main_min=null" "lag: sem origin/main o main sai vazio e a idade do commit é null"
+git -C "$G2" update-ref refs/remotes/origin/main "$S0"
+# as situações de uma branch local, só por refs (nenhum remoto)
+PUB=$(mkc pub 1700000300 "$S0"); git -C "$G2" update-ref refs/heads/worker/pub "$PUB"; git -C "$G2" update-ref refs/remotes/origin/worker/pub "$PUB"
+GTP=$(mkc gtp 1700000310 "$S0"); git -C "$G2" update-ref refs/heads/worker/gtp "$GTP"; git -C "$G2" update-ref refs/gt/published/worker/gtp "$GTP"
+git -C "$G2" update-ref refs/heads/worker/old "$P0"
+PEN=$(mkc pen 1700000320 "$S0"); git -C "$G2" update-ref refs/heads/worker/pen "$PEN"
+D1=$(mkc d1 1700000330 "$S0"); D2=$(mkc d2 1700000331 "$S0"); git -C "$G2" update-ref refs/heads/worker/div "$D2"; git -C "$G2" update-ref refs/remotes/origin/worker/div "$D1"
+X=$(mkc x 1700000340 "$S0"); XX=$(mkc xx 1700000341 "$X"); git -C "$G2" update-ref refs/heads/worker/ahead "$XX"; git -C "$G2" update-ref refs/remotes/origin/worker/ahead "$X"
+git -C "$G2" update-ref refs/heads/crew/c1 "$(mkc cr 1700000350 "$S0")"; git -C "$G2" update-ref refs/heads/feat/f1 "$(mkc fe 1700000360 "$S0")"
+st rg2
+has "  worker/pub: publicada no origin" "status: branch igual ao origin/<b>: publicada"
+has "  worker/gtp: publicada no origin" "status: branch igual ao refs/gt/published/<b> (o origin ainda não trouxe): publicada"
+has "  worker/old: sem trabalho novo" "status: branch contida no origin/main: sem trabalho novo"
+has "  worker/pen: PENDENTE (empurre" "status: branch sem origin/<b> e fora do main: pendente"
+has "  worker/div: PENDENTE e DIVERGE de origin/worker/div (${D1:0:7})" "status: origin/<b> e a ponta local, cada uma com commit que a outra não tem: diverge"
+has "  worker/ahead: PENDENTE (empurre" "status: a ponta local é filha do origin/<b>: pendente comum"; hasnt "  worker/ahead: PENDENTE e DIVERGE" "status: ...e não diz que diverge"
+has "  crew/c1: PENDENTE (empurre" "status: sem push configurado os prefixos são crew/ e worker/"; hasnt "feat/f1" "status: ...e feat/ fica de fora"; hasnt "origin/main:" "status: ...e nenhuma outra ref aparece como branch"
+git -C "$G2" config --add remote.origin.push 'refs/heads/feat/*:refs/heads/feat/*'; st rg2
+has "  feat/f1: PENDENTE (empurre" "status: o prefixo vem do push configurado pelo bootstrap (feat/)"; hasnt "worker/pub" "status: ...e só dele"
+git -C "$G2" config --unset-all remote.origin.push
+st; [ "$RC" = 0 ] && has "rg2: main=" "status sem argumento: lista os clones que têm repo.git (e só eles)" || bad "status sem argumento: rc=$RC" "$OUT"
+
+# wt-add / wt-rm de ponta a ponta (o pull de dentro do wt-add é o do espelho de mentira)
+wt() { OUT=$("$RG" "$@" 2>&1); RC=$?; }
+fresh adv; WTA=$T/node/gascity/wt; wt wt-add gascity bead-a
+[ "$RC" = 0 ] && printf '%s\n' "$OUT" | grep -qE '"bead":"bead-a","branch":"worker/bead-a","base":"main","main":"[0-9a-f]{7}","main_age_min":-?[0-9]+,"lag_min":-?[0-9]+,"pull":"ok"\}$' && ok "wt-add: rc 0 e a linha JSON (bead, branch, base, main, idades, pull=ok)" || bad "wt-add: rc=$RC" "$OUT"
+[ -e "$WTA/bead-a/lib/m2.txt" ] && [ ! -e "$WTA/bead-a/data/x1" ] && ok "wt-add: o checkout esparso traz o código liberado e NÃO o arquivo que o spec nega" || bad "wt-add: checkout esparso" "$(ls -R "$WTA/bead-a" 2>&1 | head -n 8)"
+grep -qF '"bead":"bead-a"' "$T/node/worktrees.jsonl" && ok "wt-add: a linha também vai para worktrees.jsonl" || bad "wt-add: worktrees.jsonl"
+wt wt-add gascity bead-a; [ "$RC" = 0 ] && has "wt/bead-a já existe" "wt-add de novo: a pasta pronta é reaproveitada (rc 0)" || bad "wt-add de novo: rc=$RC" "$OUT"
+mkdir "$WTA/bead-inc"; wt wt-add gascity bead-inc; [ "$RC" = 3 ] && has 'worktree incompleto' "wt-add: pasta que existe sem checkout é recusada (rc 3), não tomada por pronta" || bad "wt-add pasta incompleta: rc=$RC" "$OUT"
+wt wt-add gascity 'Bead Ruim'; [ "$RC" = 2 ] && has 'bead inv' "wt-add: bead que o regex recusa → rc 2" || bad "wt-add bead ruim: rc=$RC" "$OUT"
+wt wt-add gascity bead-b 'Base Ruim'; [ "$RC" = 2 ] && has 'base inv' "wt-add: base que o regex recusa → rc 2" || bad "wt-add base ruim: rc=$RC" "$OUT"
+wt wt-add gascity bead-b; [ "$RC" = 0 ] && ok "wt-add: uma segunda bead" || bad "wt-add bead-b: rc=$RC" "$OUT"
+find "$WTA/bead-b" -depth -delete   # a pasta some à mão: o clone fica com a entrada velha do worktree
+wt wt-rm gascity bead-a
+[ "$RC" = 0 ] && printf '%s\n' "$OUT" | grep -qE '^wt-rm: bead-a removido, liberou [0-9]+ KB$' && [ ! -e "$WTA/bead-a" ] && ok "wt-rm: remove a pasta e diz quanto liberou" || bad "wt-rm: rc=$RC" "$OUT"
+[ "$(git -C "$K" worktree list | wc -l | tr -d ' ')" = 1 ] && ok "wt-rm: também poda a entrada velha do worktree que alguém apagou à mão" || bad "wt-rm: a entrada velha ficou" "$(git -C "$K" worktree list)"
+wt wt-rm gascity bead-a; [ "$RC" = 2 ] && has 'sem worktree bead-a' "wt-rm: bead sem worktree → rc 2" || bad "wt-rm sem worktree: rc=$RC" "$OUT"
+wt wt-rm gascity 'Bead Ruim'; [ "$RC" = 2 ] && has 'bead inv' "wt-rm: bead que o regex recusa → rc 2" || bad "wt-rm bead ruim: rc=$RC" "$OUT"
+wt wt-add gascity bead-a; [ "$RC" = 0 ] && [ -e "$WTA/bead-a/lib/m2.txt" ] && ok "wt-add depois do wt-rm: a branch worker/bead-a que ficou é reaproveitada" || bad "wt-add depois do wt-rm: rc=$RC" "$OUT"
+rm -f "$T/node/gascity/sparse"; wt wt-add gascity bead-c; [ "$RC" = 3 ] && has 'clone sem filtro de dados' "wt-add: clone sem o arquivo sparse (nenhum pull deu certo) → rc 3" || bad "wt-add sem sparse: rc=$RC" "$OUT"
+
+# scan: clones de história conhecida, uma lista de dados e um HOME de mentira (nada de /home real nem de GH_TOKEN)
+N3=$T/node3; W3=$T/w3; mkdir -p "$N3/lixo"; git init -q "$W3"; mkdir -p "$W3/lib" "$W3/data"; echo a > "$W3/lib/a.txt"; echo b > "$W3/README"; git -C "$W3" add -A; git -C "$W3" commit -qm c1
+mkrig() { mkdir -p "$N3/$1"; git clone -q --bare "$W3" "$N3/$1/repo.git" 2>/dev/null; git -C "$N3/$1/repo.git" config gtremote.mirrorurl "$(git -C "$N3/$1/repo.git" config remote.origin.url)"; printf '%s\n' '/data/x1' '/data/x2' > "$N3/$1/deny"; }
+SCANRIGS=; sc() { OUT=$(env -u GH_TOKEN -u GITHUB_TOKEN HOME="$T/home" GT_REMOTE_GIT="$N3" "$@" "$RG" scan $SCANRIGS 2>&1); RC=$?; }
+mkrig sc; sc
+[ "$RC" = 0 ] && has 'scan sc: limpo (' "scan sem argumento: lista só o clone que tem repo.git; sem dado negado, sem remoto de fora: limpo, rc 0" || bad "scan limpo: rc=$RC" "$OUT"
+has 'scan credenciais: limpo' "scan: HOME sem credencial do GitHub: limpo"
+mkrig st; mkdir -p "$N3/st/data"; echo x > "$N3/st/data/x2"; mkrig sr; git -C "$N3/sr/repo.git" remote add outro https://example.org/r.git; mkrig nd; rm -f "$N3/nd/deny"
+echo SEGREDO > "$W3/data/x1"; git -C "$W3" add -A; git -C "$W3" commit -qm c2; mkrig sh   # só o sh nasce depois do commit com o dado negado
+SCANRIGS=sh; sc
+[ "$RC" = 1 ] && has 'historico=[data/x1 ] arvore=[] remotos_fora_do_espelho=[]' "scan: blob de caminho negado na história → VIOLAÇÃO só por isso, rc 1" || bad "scan história: rc=$RC" "$OUT"
+SCANRIGS=st; sc
+[ "$RC" = 1 ] && has 'historico=[] arvore=[data/x2 ] remotos_fora_do_espelho=[]' "scan: arquivo de caminho negado na árvore do clone → VIOLAÇÃO só por isso, rc 1" || bad "scan árvore: rc=$RC" "$OUT"
+SCANRIGS=sr; sc
+[ "$RC" = 1 ] && has 'historico=[] arvore=[] remotos_fora_do_espelho=[https://example.org/r.git]' "scan: remoto que não é o espelho → VIOLAÇÃO só por isso, rc 1" || bad "scan remoto: rc=$RC" "$OUT"
+mkdir -p "$T/hc/.ssh"; : > "$T/hc/.netrc"; : > "$T/hc/.ssh/id_ed25519"; printf 'Host github.com\n' > "$T/hc/.ssh/config"; echo 'export GH_TOKEN=y' > "$T/hc/.profile"
+printf '[credential]\n\thelper = store\n' > "$T/gitglobal"; printf '[credential]\n\thelper = store\n' > "$T/gitsystem"; SCANRIGS=sc
+sc HOME="$T/hc" GH_TOKEN=x GIT_CONFIG_GLOBAL="$T/gitglobal" GIT_CONFIG_SYSTEM="$T/gitsystem"
+[ "$RC" = 1 ] && has 'scan sc: limpo (' "scan: só a credencial viola (o clone está limpo) → rc 1" || bad "scan credenciais: rc=$RC" "$OUT"
+for tag in '~/.netrc' '~/.ssh/id_*' '~/.ssh(github)' 'git-config-system(credential)' 'git-config-global(credential)' 'arquivo-de-shell(token)' 'env(token)'; do has "$tag" "scan: a credencial $tag é nomeada"; done
+SCANRIGS=nd; sc
+[ "$RC" = 2 ] && has 'sem a lista de dados' "scan: clone sem o arquivo deny → NÃO consegui (rc 2), nunca limpo" || bad "scan sem deny: rc=$RC" "$OUT"
+SCANRIGS=sc; sc PATH="$T/shim2:$PATH" SHIM2_MODE=mktempfail
+[ "$RC" = 2 ] && ok "scan: mktemp -d falha → rc 2, nunca 0" || bad "scan com mktemp -d falhando: rc=$RC" "$OUT"
+rm -f "$T/cnt"; sc PATH="$T/shim2:$PATH" SHIM2_MODE=mktemp2fail SHIM2_CNT="$T/cnt"
+[ "$RC" = 2 ] && has 'avaliar os nomes do hist' "scan: o mktemp -d de dentro do filtro de nomes falha → o clone é NÃO consegui, não limpo" || bad "scan com o 2º mktemp -d falhando: rc=$RC" "$OUT"
 
 [ "$N" = "$HRG_EXPECT" ] || bad "casos rodados: $N, esperava $HRG_EXPECT (algum caso sumiu, ou foi acrescentado sem atualizar HRG_EXPECT)"
 echo; echo "hetzner-remote-git selftest: $((N-F))/$N ok"; [ "$F" = 0 ] && exit 0 || { echo "FAIL=$F"; exit 1; }
