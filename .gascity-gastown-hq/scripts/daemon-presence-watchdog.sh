@@ -134,11 +134,19 @@ HQ="${DPW_HQ:-/Users/athos/gt/.gascity-gastown-hq}"
 # ga-ki02nmt — com.gascity.jsonl-export (900 s) e com.gascity.jsonl-hourly-offsite (1800 s): o backup das beads saiu do dispatcher de orders (teto de 4
 # por tick, ~35 min por instância) para o launchd. Limite = 3 ciclos de cada um: 2700 s e 5400 s. Um limite menor mataria (kickstart -k) um run SAUDÁVEL:
 # o exporter só escreve no stdout NO FIM da rodada (até 840 s de trabalho, timeout 840 s) e o upload pode levar até 2400 s entre uma linha de log e a seguinte.
-#   - jsonl-export: o .out ganha UMA linha por rodada que termina (resumo `jsonl — exported ...` ou `skipped-low-disk ...`, que a política de
-#     disco imprime a cada tick pulado). Rodada que FALHA escreve só no .err: duas seguidas = CRASH-LOOP (2 saídas não-zero), antes do heartbeat.
+#   - jsonl-export: o heartbeat é o LOG DO PRÓPRIO SCRIPT, .gc/logs/jsonl-export.log, e NÃO o .out do plist. Motivo (achado no pré-gate): uma rodada
+#     limpa sem mudança (o caso comum com a cidade parada) sai com rc 0 e NÃO imprime nada no stdout (jsonl-export.sh, "This exit prints nothing on a
+#     clean run"), então um .out como heartbeat envelheceria sozinho e o vigia daria WEDGE + kickstart -k (que mata um export em andamento) num job
+#     saudável a cada sweep. O log ganha `start pid=` ao abrir e `end rc=N` no trap de EXIT de toda rodada que decide exportar (jex_run_begin /
+#     jex_run_end; jsonl-export.selftest.sh: "clean run: one start and one 'end rc=0'"), e a rodada pulada por disco baixo grava a própria linha
+#     `skipped-low-disk` nele antes de sair com rc 0. Log parado por 3 ciclos = o launchd não disparou ou a rodada nem chegou a abrir (as outras
+#     saídas anteriores ao jex_run_begin são `exit 1`; JSONL_EXPORT_LIB=1 é só dos selftests). Rodada que termina com rc != 0 (ex.: o commit do archive falhou) escreve no .err: duas
+#     seguidas = CRASH-LOOP. NÃO é crash-loop uma rodada com banco que falhou mas rc 0 (`failed: ...` no resumo do .out e no DOG_DONE): igual à order.
 #   - jsonl-hourly-offsite: o script loga em .gc/logs/jsonl-hourly-offsite.log e no STDERR, não no stdout; por isso o plist aponta StandardOutPath e
-#     StandardErrorPath para o MESMO arquivo — senão o .out nunca andaria e o vigia reiniciaria um upload saudável a cada 5400 s.
-# A metade que lê o plist (limite > 2x o StartInterval, e arquivo do heartbeat = StandardOutPath) mora em daemon-presence-watchdog.selftest.sh.
+#     StandardErrorPath para o MESMO arquivo — senão o .out nunca andaria e o vigia reiniciaria um upload saudável a cada 5400 s. Toda rodada loga
+#     ao menos uma linha (início do trabalho, recusa do lock ou veredito), então este .out anda mesmo quando nada subiu.
+# A metade que lê o plist e o script (limite > 2x o StartInterval; arquivo do heartbeat = StandardOutPath no upload, = o log do próprio script no
+# exporter) mora em daemon-presence-watchdog.selftest.sh.
 DPW_HEARTBEAT="${DPW_HEARTBEAT:-com.gascity.pilot|$HQ/.gc/logs/pilot-dispatcher.log|1500
 com.gascity.inflight-reclaim-guard|$HQ/.gc/logs/inflight-reclaim-guard-launchd.out|1500
 com.gascity.context-check-dispatcher|$HQ/.gc/logs/context-check-dispatcher.log|3000
@@ -153,7 +161,7 @@ com.gascity.gate-marker-rehome-janitor|$HQ/.gc/logs/gate-marker-rehome-janitor.o
 com.gascity.child-priority-janitor|$HQ/.gc/logs/child-priority-janitor.out|900
 com.gascity.hetzner-occupancy-watch|$HQ/.gc/logs/hetzner-occupancy-watch.out|2700
 com.gascity.jsonl-hourly-offsite-age|$HQ/.gc/logs/jsonl-hourly-offsite-age.out|1500
-com.gascity.jsonl-export|$HQ/.gc/logs/jsonl-export-launchd.out|2700
+com.gascity.jsonl-export|$HQ/.gc/logs/jsonl-export.log|2700
 com.gascity.jsonl-hourly-offsite|$HQ/.gc/logs/jsonl-hourly-offsite-launchd.out|5400}"
 
 # ── RECYCLER — memory-bounded restart of known-leaky Python dashboards ────────
@@ -1644,14 +1652,18 @@ GCSTUB20
   unset _cp_lbl _cp_line _cp_max
 
   echo "Scenario 22d (ga-ki02nmt): real default covers the two JSONL backup jobs that left the order dispatcher (heartbeat entry + DPW_CRITICAL + 3-cycle limit)"
-  # Mesma classe da 22c, uma volta por job: label|limite esperado. O limite é 3 ciclos do StartInterval do plist (900 s, 1800 s): menor que isso mata um run
-  # saudável com kickstart -k, maior deixa um job parado por horas sem alerta. A metade que LÊ o plist mora em daemon-presence-watchdog.selftest.sh.
-  for _jx in "com.gascity.jsonl-export:2700" "com.gascity.jsonl-hourly-offsite:5400"; do
-    _jx_lbl="${_jx%%:*}"; _jx_want="${_jx##*:}"
-    # vazio (sem entrada) → _jx_line e _jx_max vazios → o ramo "not numeric" abaixo reprova; falhou (awk rc != 0) → mesma saída vazia → reprova, nunca passa
+  # Mesma classe da 22c, uma volta por job: label:limite esperado:arquivo do heartbeat esperado. O limite é 3 ciclos do StartInterval do plist (900 s, 1800 s):
+  # menor que isso mata um run saudável com kickstart -k, maior deixa um job parado por horas sem alerta. O ARQUIVO importa tanto quanto o limite: o do exporter
+  # é o log do próprio script (jsonl-export.log), porque uma rodada limpa sem mudança não escreve no .out e um .out como heartbeat daria WEDGE num job saudável.
+  # A metade que LÊ o plist e o script mora em daemon-presence-watchdog.selftest.sh.
+  for _jx in "com.gascity.jsonl-export:2700:jsonl-export.log" "com.gascity.jsonl-hourly-offsite:5400:jsonl-hourly-offsite-launchd.out"; do
+    _jx_lbl="${_jx%%:*}"; _jx_rest="${_jx#*:}"; _jx_want="${_jx_rest%%:*}"; _jx_wantfile="${_jx_rest#*:}"
+    # vazio (sem entrada) → _jx_line, _jx_max e _jx_file vazios → os ramos "missing"/"not numeric"/"is []" abaixo reprovam; falhou (awk rc != 0) → mesma saída vazia → reprova, nunca passa
     _jx_line="$(printf '%s\n' "$_REAL_DEFAULT_HEARTBEAT" | awk -F'|' -v l="$_jx_lbl" '$1==l{print; exit}')"
     _jx_max="$(printf '%s' "$_jx_line" | awk -F'|' '{print $3}')"
+    _jx_file="$(printf '%s' "$_jx_line" | awk -F'|' '{n=split($2,a,"/"); print a[n]}')"
     if [ -n "$_jx_line" ]; then ok "DPW_HEARTBEAT default covers $_jx_lbl ($_jx_line)"; else bad "DPW_HEARTBEAT default MISSING an entry for $_jx_lbl"; fi
+    if [ -n "$_jx_file" ] && [ "$_jx_file" = "$_jx_wantfile" ]; then ok "$_jx_lbl heartbeat file is $_jx_wantfile"; else bad "$_jx_lbl heartbeat file is [$_jx_file], expected $_jx_wantfile"; fi
     case "$_jx_max" in
       ''|*[!0-9]*) bad "$_jx_lbl heartbeat threshold is not numeric ([$_jx_max])" ;;
       *) if [ "$_jx_max" = "$_jx_want" ]; then ok "$_jx_lbl heartbeat threshold is $_jx_want s (3 cycles)"; else bad "$_jx_lbl heartbeat threshold is [$_jx_max], expected $_jx_want s (3 cycles)"; fi ;;
@@ -1661,7 +1673,7 @@ GCSTUB20
       *) bad "$_jx_lbl has a heartbeat entry but is NOT in DPW_CRITICAL (dead config)" ;;
     esac
   done
-  unset _jx _jx_lbl _jx_want _jx_line _jx_max
+  unset _jx _jx_lbl _jx_rest _jx_want _jx_wantfile _jx_line _jx_max _jx_file
 
   echo "Scenario 23 (ga-g92h): _exit_class distinguishes OOM-killed (137) from a real failure"
   # Provenance checks off (matches the imp17 block's own convention above) --

@@ -16,10 +16,10 @@
 | label | script | a cada | timeout | lock do script |
 |---|---|---|---|---|
 | `com.gascity.jsonl-export` | `packs/town-deltas/assets/scripts/jsonl-export.sh` | 15 min | 840 s (`timeout -k 20`) | **não tem** |
-| `com.gascity.jsonl-hourly-offsite` | `packs/town-deltas/assets/scripts/jsonl-hourly-offsite.sh` | 30 min | 2400 s (`timeout -k 20`) | tem (`jsonl-hourly-offsite.lock.d`, 2º run sai 0 calado) |
+| `com.gascity.jsonl-hourly-offsite` | `packs/town-deltas/assets/scripts/jsonl-hourly-offsite.sh` | 30 min | 2400 s (`timeout -k 20`) | tem (`jsonl-hourly-offsite.lock.d`; o 2º run loga `outro run em andamento; saindo`, não sobe nada e sai 0) |
 
 Os dois orders (`orders/jsonl-export.toml`, `orders/jsonl-hourly-offsite.toml`) **ficam no repo** como fonte do timeout/intervalo que o plist copia (`scripts/jsonl-launchd-plists.selftest.sh` exige igualdade) e entram em `city.toml` `[orders] skip` — o mesmo deploy. O order `jsonl-hourly-offsite-age` (alarme de idade do `latest.json`, tem gêmeo launchd próprio) **não** é tocado.
-Os dois plists estão em `daemon-presence-watchdog.sh` (`DPW_CRITICAL` + `DPW_HEARTBEAT` 2700 s / 5400 s no `.out` de cada um).
+Os dois plists estão em `daemon-presence-watchdog.sh` (`DPW_CRITICAL` + `DPW_HEARTBEAT`): exporter 2700 s no **log do próprio script**, `.gc/logs/jsonl-export.log` (uma rodada limpa sem mudança não escreve no `.out`, então um `.out` como heartbeat daria WEDGE num job saudável); upload 5400 s no `.out` (o script loga no stderr, que o plist junta ao `.out`).
 
 ## Ordem do cutover (não inverter)
 
@@ -49,7 +49,7 @@ O exporter **não tem lock**: dois exporters ao mesmo tempo escrevem o mesmo arc
 5. **Conferir** (não é para acreditar neste texto):
    ```bash
    for l in com.gascity.jsonl-export com.gascity.jsonl-hourly-offsite; do launchctl print "gui/$(id -u)/$l" | grep -E 'state =|runs =|last exit'; done
-   tail -3 "$GC_CITY/.gc/logs/jsonl-export-launchd.out" "$GC_CITY/.gc/logs/jsonl-hourly-offsite-launchd.out"
+   tail -3 "$GC_CITY/.gc/logs/jsonl-export.log" "$GC_CITY/.gc/logs/jsonl-export-launchd.out" "$GC_CITY/.gc/logs/jsonl-hourly-offsite-launchd.out"
    git -C "$GC_CITY/.gc/runtime/packs/maintenance/jsonl-archive" log -5 --format='%h %cI %s'
    bash "$GC_CITY/packs/town-deltas/assets/scripts/jsonl-hourly-offsite.sh" --status
    bash "$GC_CITY/packs/town-deltas/assets/prod-tests/gascity/story-ga-7sxdmb.sh"
@@ -82,9 +82,11 @@ pgrep -fl 'jsonl-export\.sh' || echo sem-export   # esperar o run em voo termina
 |---|---|
 | PRESENCE-DRIFT dos dois labels entre o merge e o passo 4 | esperado, some ao carregar |
 | ABSENT/auto-bootstrap do watchdog num label | o plist saiu do launchd: o watchdog recarrega sozinho; se repete, ver `launchctl print` |
-| heartbeat velho (2700 s exporter, 5400 s upload) → `kickstart -k` | o `.out` parou de andar: exporter morto/preso, ou o upload sem linha no `.out` por 90 min |
+| heartbeat velho (2700 s exporter, 5400 s upload) → `kickstart -k` | exporter: o `jsonl-export.log` não ganhou `start`/`end`/`skipped-low-disk` em 45 min (o launchd não disparou, ou a rodada nem abriu). Upload: o `.out` sem linha por 90 min |
+| `.out` do exporter vazio ou parado, com o `jsonl-export.log` andando | normal: rodada limpa sem mudança não imprime nada no stdout. Não é defeito |
+| `failed: ...` no resumo do exporter (`.out`, DOG_DONE) com rc 0 | um banco falhou e o run seguiu: NÃO conta como CRASH-LOOP (igual ao order). Ler o resumo e o `jsonl-export.log` |
 | CRASH-LOOP no upload | 2 runs seguidos com rc != 0 (rc 1 = falha de upload, rc 2 = não deu para avaliar): o script já manda o próprio alerta; é falha real, não do launchd |
-| `skipped-low-disk` no `.out` do exporter | política de disco acima, não defeito |
+| `skipped-low-disk` no `.out` e no `jsonl-export.log` do exporter | política de disco acima, não defeito |
 
 ## Pendências conhecidas (não são deste cutover)
 
