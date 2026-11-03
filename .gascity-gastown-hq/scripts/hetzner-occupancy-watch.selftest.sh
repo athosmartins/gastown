@@ -19,6 +19,7 @@
 #   Tudo: ~140 s no Linux; no mini, sob carga, a fatia 1 sozinha (238 verificações; hoje são 370) levou ~7 min (medido pelo gate em 19/10). RELÓGIO: nenhum caso mede o tempo de parede do vigia (no mini sob carga só subir o python já passou de 1 s, 19/10): a ordem das duas instâncias é por EVENTO (await) e o único prazo, o do run_cmd, é medido dentro do python.
 # EQUIVALENT 06d87b11fa: `universal_newlines=True` no Popen de run_cmd: com `errors="replace"` o subprocess ja abre os canais em texto, as duas formas devolvem a mesma saida
 # EQUIVALENT 4fac5408e3 c2c527c4eb: parse_stat `lines[i + 1:lines.index(END, i + 1)]` com `i + 0` (no corte ou no index): o corpo passa a incluir a linha BEGIN, que nao comeca por `cpu` e e ignorada, e `lines.index(END, i)` acha o mesmo END (60000 blocos aleatorios, 0 divergencias)
+# EQUIVALENT c91b413c99 f7961235bf: `ensure_ascii=False` -> `True` nas duas gravacoes do ESTADO (antes do mail e depois de um mail que falha): new_st so leva inteiros, null e o baseline de CPU que _baseline_ok aceitou ({epoch,busy,total}, o unico que o vigia grava), entao o JSON sai igual; so um baseline editado a mao com chave extra nao-ASCII os separaria
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WATCH="${HETZNER_OCC_UNDER_TEST:-$HERE/hetzner-occupancy-watch.py}"
