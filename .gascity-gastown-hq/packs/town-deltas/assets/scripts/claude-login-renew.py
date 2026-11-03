@@ -332,8 +332,11 @@ def holder_of(crew: dict) -> Optional[str]:
 
 def survey(email: str, crew: dict, t: float) -> dict:
     """What `email` has: best_left (seconds to the end of its best refresh token, None = no end recorded anywhere), full (a usable full login is stored: one the crew job
-    has not called dead), default_full (the default item holds such a login), unread (an item that could not be read: the account is not judged)."""
-    best, full, default_full, unread = None, False, False, False
+    has not called dead), default_full (the default item holds such a login), unread (an item that could not be read: the account is not judged), no_object (its OWN item parses but holds
+    no login object: it says nothing about a login, yet attempt() will not launch for it - what cannot be put back is not touched)."""
+    best, full, default_full, unread, no_object = None, False, False, False, False
+    d = acct_dir(email)
+    own = C.dir_service(str(d)) if d else None
     for svc in list(C.source_services(email)) + ([C.DEFAULT_SERVICE] if email == holder_of(crew) else []):
         s, _, b = C.kc_read(svc)
         # vazio (missing item, an item with no login object) → says nothing; falhou/ilegível (locked keychain, crashed security: 'unknown' with no blob) → NOT judged this run
@@ -346,7 +349,9 @@ def survey(email: str, crew: dict, t: float) -> dict:
                 best = left if best is None else max(best, left)
             if C.full_login(b, t)[0] and not C.dead_login(crew, C.fp(o.get("refreshToken"))):
                 full, default_full = True, default_full or svc == C.DEFAULT_SERVICE
-    return {"best_left": best, "full": full, "default_full": default_full, "unread": unread}
+        elif s == "unknown" and svc == own:
+            no_object = True
+    return {"best_left": best, "full": full, "default_full": default_full, "unread": unread, "no_object": no_object}
 
 
 def release_marks(st: dict, crew: dict, t: float) -> None:
@@ -503,9 +508,12 @@ def candidates(st: dict, crew: dict, dec, t: float) -> List[Tuple[str, str]]:
             continue
         if t < wait:
             continue
-        if v["best_left"] is not None and v["best_left"] <= C.EXPIRY_WARN_S:
+        due = "forecast" if v["best_left"] is not None and v["best_left"] <= C.EXPIRY_WARN_S else "outage" if none_usable else None
+        if due and v["no_object"]:                             # the SAME precondition attempt() has: an account it would refuse must not be first in line and starve the ones behind it
+            rlog("WARN", f"{email}: due ({due}) but its item holds no login object (a logged-out CLI), so nothing can be launched for it - by hand: {C.relogin_cmd(email)}")
+        elif due == "forecast":
             forecast.append((v["best_left"], email))
-        elif none_usable:
+        elif due == "outage":
             outage.append((0 if email == pick else 1, email))
     return [(e, "forecast") for _, e in sorted(forecast)] + [(e, "outage") for _, e in sorted(outage)]
 
@@ -525,8 +533,10 @@ def run_once(email: str) -> int:
         print(f"{email}: the crew state {C.state_path()} is {crew_status}, so whether this account holds the default is unknown - nothing done", file=sys.stderr)
         return 2
     if DRY:
-        skip = survey(email, crew, t)["unread"]
-        print(f"{email}: [dry-run] " + ("would be SKIPPED (exit 2): an item of the account cannot be read, so its login is not judged" if skip else "would renew it now (forced)") + " - nothing launched", file=sys.stderr)
+        v = survey(email, crew, t)
+        why = ("an item of the account cannot be read, so its login is not judged" if v["unread"]
+               else "its item holds no login object, so it could not be put back if the try went wrong" if v["no_object"] else "")
+        print(f"{email}: [dry-run] " + (f"would be SKIPPED (exit 2): {why}" if why else "would renew it now (forced)") + " - nothing launched", file=sys.stderr)
         return 0
     verdict, step, proof = run_account(st, crew, email, "forced", t)
     t = C.now()
@@ -555,7 +565,7 @@ def run_once(email: str) -> int:
 
 
 def housekeeping() -> int:
-    """The scheduled run: lifts the marks of accounts somebody logged in by hand, retries the pushes that were not delivered, and launches AT MOST ONE attempt (the first candidate).
+    """The scheduled run: lifts the marks of accounts somebody logged in by hand, retries the pushes that were not delivered, and launches AT MOST ONE attempt (the first candidate that can be launched).
     0 = ran; 1 = it could not judge (state or crew state unreadable) or could not write its state: it launched nothing it could not judge, and the log says why."""
     off = disabled()
     if off:
@@ -574,9 +584,12 @@ def housekeeping() -> int:
         rlog("ERROR", f"the crew state {C.state_path()} is {crew_status}: no login is judged and nothing is launched")
     if todo and DRY:
         rlog("INFO", f"{todo[0][0]}: would be renewed now ({todo[0][1]}) - nothing launched" + (f"; then, in later runs: {', '.join(e for e, _ in todo[1:])}" if todo[1:] else ""))
-    elif todo:
-        run_account(st, crew, todo[0][0], todo[0][1], t)
-        t = C.now()
+    else:
+        for email, reason in todo:
+            verdict, _, _ = run_account(st, crew, email, reason, t)
+            t = C.now()
+            if verdict != "skipped":                           # a try that launched NOTHING (skipped) does not use up the run: the next in line gets it, so one account that cannot be tried never starves the rest
+                break
     err = None if DRY or not st.get("accounts") else settle(st, list(st["accounts"]), t)
     if err:
         rlog("ERROR", f"the state could not be written ({type(err).__name__}): this run's marks, tries and pushes are NOT recorded")

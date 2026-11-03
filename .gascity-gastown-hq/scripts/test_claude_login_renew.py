@@ -1196,3 +1196,55 @@ def test_the_plist_is_not_where_the_deploy_installs_new_plists_on_its_own():
     top = {m.group(1) for p in ASSETS.glob("*.plist") for m in [re.search(r"<key>Label</key>\s*<string>([^<]+)</string>", p.read_text())] if m}
     assert "com.gascity.claude-login-renew" not in top and PLIST.parent.name == "pending-activation"
     assert "skill-integrity-install.sh" in PLIST.read_text()                                    # and the file says why
+
+
+# ── an account attempt() would refuse must not be first in line for ever (gate round 2: the queue is one account per run) ─────────────────
+NO_OBJECT = {"mcpOAuth": {"some-mcp": {"accessToken": "mcp-token"}}}                # an item that parses and holds NO login object: what a logged-out CLI leaves
+
+
+def test_in_an_outage_an_account_whose_item_holds_no_login_object_is_not_first_in_line_and_the_log_says_so(w):
+    outage(w)
+    w.decide("b85")                                                                             # the pool's pick goes first... but attempt() would refuse it
+    w.own("b85", NO_OBJECT)
+    seen = record(w)
+    for _ in range(3):
+        assert renew.housekeeping() == 0
+    assert seen == [(EMAIL["crypto"], "outage")] * 3                                            # every run picks a launchable account, never b85
+    assert f"{EMAIL['b85']}: due (outage) but its item holds no login object" in w.log()
+
+
+def test_in_a_forecast_an_account_whose_item_holds_no_login_object_does_not_block_the_one_behind_it(w):
+    healthy(w)
+    w.own("b85", NO_OBJECT)
+    w.put(crew.reserve_service(EMAIL["b85"]), blob("b85-reserve", rexp_days=2.0))               # the reserve ends first: b85 would be the nearest end...
+    w.own("amb", blob("amb-x", rexp_days=5.0))
+    seen = record(w)
+    assert renew.housekeeping() == 0 and seen == [(EMAIL["amb"], "forecast")]
+    assert "due (forecast) but its item holds no login object" in w.log() and f"claude auth login --email {EMAIL['b85']}" in w.log()
+
+
+def test_an_item_with_no_login_object_says_nothing_about_a_login_so_it_does_not_stop_an_outage(w):
+    outage(w)
+    for k in ("crypto", "b85", "terr", "amb"):
+        w.own(k, NO_OBJECT)                                                                     # nobody has a login at all
+    seen = record(w)
+    assert renew.housekeeping() == 0 and seen == []                                             # nothing can be launched for any of them...
+    assert w.log().count("holds no login object") == 4                                          # ...and the log names each, once per run
+
+
+def test_a_try_that_launched_nothing_does_not_use_up_the_run_but_one_that_ran_does(w):
+    healthy(w)
+    for k, d in (("b85", 2.0), ("amb", 4.0), ("terr", 6.0)):
+        w.own(k, blob(f"{k}-x", rexp_days=d))
+    seen = record(w, ("skipped", "an item could not be read between the survey and the try", None))
+    assert renew.housekeeping() == 0
+    assert seen == [(EMAIL["b85"], "forecast"), (EMAIL["amb"], "forecast")]                     # b85 launched nothing: amb gets the run; amb RAN: terr waits for the next one
+    assert acct(w, "b85")["last"]["verdict"] == "skipped" and "tries" not in acct(w, "b85") and "next_at" not in acct(w, "b85")
+    assert "renewed" in acct(w, "amb") and EMAIL["terr"] not in w.state()["accounts"]
+
+
+def test_a_forced_dry_run_says_it_would_be_skipped_when_the_item_holds_no_login_object(w, capsys):
+    w.own("b85", NO_OBJECT)
+    assert renew.main(["--dry-run", "--account", EMAIL["b85"], "--force"]) == 0
+    err = capsys.readouterr().err
+    assert "would be SKIPPED" in err and "no login object" in err and "would renew it now" not in err and w.calls("claude") == []
