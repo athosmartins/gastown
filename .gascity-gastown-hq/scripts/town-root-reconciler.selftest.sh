@@ -236,10 +236,12 @@ ROOT="$_saved_ROOT"; REMOTE="$_saved_REMOTE"; BRANCH="$_saved_BRANCH"
 # reconcile_untracked_for_ffpull nao rodava em lugar nenhum e os limites exatos do maybe_ntfy (45 min, 1 dia)
 # nunca eram tocados. Agora cada ramo roda contra um par de repositorios de brinquedo (origem + clone), com
 # date e git de mentira definidos como funcoes deste shell, como gc e notify acima.
-# EQUIVALENTES (lastro): 3bf5a69c5c 033544c743 3ec1b3ce09 18e2ca9f08 8c15fc648f (`cmd || true` -> `cmd && true`:
+# EQUIVALENTES (lastro): 3bf5a69c5c 3ec1b3ce09 18e2ca9f08 8c15fc648f (`cmd || true` -> `cmd && true`:
 # ninguem le o status e nao ha set -e); 24909e7bf1 4dd84a5bcb (os dois cp do backup gravam os mesmos bytes);
 # d0372d9f4c 2a4dfbfe9d c3efbaf3cc 7990ceb751 d1fe4548ab 86e745f1c8 (`$(git ... || echo "")` -> `&&`: quando o git
 # falha nao imprime nada e quando acerta a linha vazia a mais some no $(...)).
+# NAO e' equivalente: 033544c743, o `rm -f` que fecha o clear_escalation, muda o status do PROPRIO ajudante; o caso do
+# carimbo-diretorio no cenario 22 le esse status.
 # date devolve $FAKE_NOW para `date +%s` quando ele esta definido; git falha quando "<subcomando> <1o arg>" comeca por $GITFAIL.
 date() { if [ "${1-}" = "+%s" ] && [ -n "${FAKE_NOW:-}" ]; then echo "$FAKE_NOW"; else command date "$@"; fi; }
 git() { if [ -n "${GITFAIL:-}" ]; then case "${3-} ${4-}" in "$GITFAIL"*) return 1 ;; esac; fi; command git "$@"; }
@@ -397,6 +399,8 @@ FAKE_NOW=""
   && ok "clear_escalation com escalacao aberta: apaga e registra" || bad "clear_escalation nao registrou"
 : > "$LOG"; clear_escalation
 ! has_log "divergence resolved" && ok "clear_escalation sem escalacao aberta: nao diz nada" || bad "clear_escalation falou sem escalacao"
+mkdir -p "$ESCALATE_STAMP/sub"; rc=0; clear_escalation >/dev/null 2>&1 || rc=$?; rmdir "$ESCALATE_STAMP/sub" "$ESCALATE_STAMP"   # rm -f recusa um diretorio: a limpeza best-effort nao pode devolver o status dele
+[ "$rc" = "0" ] && ok "clear_escalation com o carimbo impossivel de remover (um diretorio): devolve 0" || bad "clear_escalation devolveu $rc com o carimbo impossivel de remover"
 
 echo "Scenario 23: o script executado — modo lib, uma passada (RECONCILE_ONCE) e o laco de verdade"
 printf '%s\n' '#!/bin/bash' 'echo "$*" >> "$GCSTUB_LOG"' > "$TMP/gcstub"; chmod +x "$TMP/gcstub"
