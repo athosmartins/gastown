@@ -459,9 +459,14 @@ def test_the_real_script_runs_from_an_empty_environment_under_both_interpreters(
     env = {"PATH": "/usr/bin:/bin", "HOME": os.environ["HOME"], "CLAUDE_CREW_NOW": str(T0), "CLAUDE_CREW_USER": "athos", "FAKE_SEC_DIR": str(w.d),
            "CLAUDE_CREW_SECURITY": str(w.d / "security"), "CLAUDE_CREW_STATE": str(w.d / "crew_state.json"), "CLAUDE_CREW_ACCOUNTS_DIR": str(w.d / "accts"),
            "GC_CITY_PATH": str(w.d / "city"), "CLAUDE_RENEW_CLAUDE": str(w.d / "claude"), "CLAUDE_RENEW_DRIVER": os.environ["CLAUDE_RENEW_DRIVER"],
-           "FAKE_DRIVER_VERDICT": "puzzle", "CLAUDE_CREW_PROFILE_URL": os.environ["CLAUDE_CREW_PROFILE_URL"]}
+           "FAKE_DRIVER_VERDICT": "puzzle", "CLAUDE_CREW_PROFILE_URL": os.environ["CLAUDE_CREW_PROFILE_URL"],
+           # everything the script WRITES or CALLS is pinned into the world: without these the child falls back to the REAL
+           # shared state file (a fake mark on the real athosb85) and to whatever `notify` the PATH finds (ga-xoe5ao.5.3)
+           "CLAUDE_RENEW_STATE": str(w.d / "renew_state.json"), "CLAUDE_CREW_DECISION": str(w.d / "pool_decision.json"), "CLAUDE_CREW_NOTIFY": str(w.d / "notify")}
     r = subprocess.run([py, str(SCRIPT), "--account", EMAIL["b85"], "--force"], env=env, capture_output=True, text=True, timeout=60)
     assert r.returncode == 2 and "puzzle" in r.stdout, r.stderr
+    mark = json.loads((w.d / "renew_state.json").read_text())["accounts"][EMAIL["b85"]]["infeasible"]    # the mark landed in THIS world's state, not the real one
+    assert mark["verdict"] == "puzzle" and mark["left"] == pytest.approx(3 * 86400, abs=5)
 
 
 # ── the screens the driver reads (pure) ─────────────────────────────────────────
