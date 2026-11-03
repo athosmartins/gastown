@@ -860,6 +860,9 @@ echo "== 10e. what the sweep still found loose after 10d (ga-hq1qc5y): classifie
 # after an assignment / a redirected group): not the last element of the AND-OR list, so errexit is exempt either way, and the function ends in `return 0`.
 rc0() { local r=0; "$@" >/dev/null 2>&1 || r=$?; eq "$r" "0" "$* returns 0"; }   # the classifiers, readers and the step are read under set -e: they never fail
 eq "$(pool_ceiling_class_load 3 1)" "grow" "one core is a core: load5 3 on 1 core (3.0/core) -> grow, not unknown"
+rc0 pool_ceiling_class_load 30 10    # ga-59jrj3d (5d8706573d): the load classifier returns 0 on every branch, the "unknown" one (unreadable load, no cores) included
+rc0 pool_ceiling_class_load '' 10
+rc0 pool_ceiling_class_load 30 0
 eq "$(pool_ceiling_class_swap 512 100 20000)" "grow" "free swap exactly AT its floor (512 MB) is not low"
 eq "$(pool_ceiling_class_swap 511 100 20000)" "hold" "one MB under the floor, with disk to grow into -> hold"
 eq "$(pool_ceiling_class_swap 100 100 4096)" "hold" "low swap, disk exactly AT the grow minimum (4096 MB) -> hold: only below it squeezes"
