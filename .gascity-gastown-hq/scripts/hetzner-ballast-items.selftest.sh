@@ -48,6 +48,8 @@ killtree() {
   return 0
 }
 LEAKSEC=$((20000 + $$ % 20000)); TOYSEC=$((40000 + $$ % 20000))   # durações de `sleep` ÚNICAS desta execução: só os MEUS órfãos são contados (o 7777/4242 fixos viravam falso positivo entre duas baterias ao mesmo tempo)
+# sleeps_of DUR — quantos `sleep DUR` vivem. vazio → 0; falhou/ilegível (ps que falha ou volta sem nada: sempre há ao menos o próprio ps) → "ilegivel:ps", nunca 0 (não consegui ler ≠ nenhum)
+sleeps_of() { local o; o=$(ps -axo command= 2>/dev/null) || { echo "ilegivel:ps"; return 0; }; [ -n "$o" ] || { echo "ilegivel:ps"; return 0; }; printf '%s\n' "$o" | grep -c "^sleep $1\$"; }
 cleanup() { killtree "$T/"; pkill -f "$T/" 2>/dev/null; pkill -f "^sleep ($LEAKSEC|$TOYSEC)\$" 2>/dev/null; sleep 0.2; chmod -R u+rwX "$T" 2>/dev/null; find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null; }
 trap cleanup EXIT
 trap 'exit 143' TERM INT HUP   # sem isto um TERM/INT (TaskStop, ctrl-c) pula o EXIT e deixa processos órfãos
@@ -83,14 +85,13 @@ exit "$rc"
 EOF
 chmod +x "$W/bin/timeout"
 # ga-2hd02v.5.8: o timeout de brinquedo não pode deixar `sleep DUR` órfão. 20 chamadas com DUR=$TOYSEC (único desta execução), depois conta quantos `sleep $TOYSEC` ainda vivem: com o relógio
-# antigo (`sleep "$dur"` filho do vigia) sobram 20; com o novo, 0. Um `sleep 1` do vigia pode estar vivo no instante da contagem, mas não é `sleep $TOYSEC`. O prazo que estoura continua dando rc 124.
+# antigo (`sleep "$dur"` filho do vigia) sobram vários (medido: 15 de 20); com o novo, 0. Um `sleep 1` do vigia pode estar vivo no instante da contagem, mas não é `sleep $TOYSEC`. O prazo que estoura continua dando rc 124.
 if [ -z "${HBI_MUTANT:-}" ]; then
   for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do "$W/bin/timeout" "$TOYSEC" true; done
   sleep 1.2
-  left=$(ps -axo command= 2>/dev/null | grep -c "^sleep $TOYSEC\$")
+  left=$(sleeps_of "$TOYSEC")
   pkill -f "^sleep $TOYSEC\$" 2>/dev/null
-  case "$left" in ''|*[!0-9]*) left="ilegivel:$left" ;; esac
-  check "timeout de brinquedo: 20 chamadas que acabam não deixam nenhum 'sleep DUR' órfão (o 'sleep DUR' filho do vigia deixava 20)" "0" "$left"
+  check "timeout de brinquedo: 20 chamadas que acabam não deixam nenhum 'sleep DUR' órfão (o 'sleep DUR' filho do vigia deixava 15 em 20)" "0" "$left"
   "$W/bin/timeout" 2 sleep 30; rc_tmo=$?
   check "timeout de brinquedo: o prazo que estoura continua dando rc 124" "124" "$rc_tmo"
   "$W/bin/timeout" 2.5 true 2>/dev/null; rc_frac=$?
@@ -181,7 +182,7 @@ g_hq() {
   mkst "$SRC/.gascity-gastown-hq/scripts/brief.selftest.sh" 0 'sleep 0.4 > /dev/null 2>&1 &'   # ainda acabando ao sair (0,4 s): NÃO é vazamento
   git -C "$SRC" add -A && git -C "$SRC" commit -q -m leak && git -C "$GR/gascity/repo.git" fetch -q "$SRC" "+HEAD:refs/remotes/origin/main"
   runhq; sleep 0.3
-  check "hq: o que o selftest deixou vivo no grupo sai com KILL ao acabar (nenhum 'sleep DUR' sobra)" "0" "$(ps -axo command= 2> /dev/null | grep -c "^sleep $LEAKSEC\$")"
+  check "hq: o que o selftest deixou vivo no grupo sai com KILL ao acabar (nenhum 'sleep DUR' sobra)" "0" "$(sleeps_of "$LEAKSEC")"
   check "hq: ...e o selftest que vazou aparece no resumo (leaked 1, leak_names scripts/leak.selftest.sh:1)" "1 scripts/leak.selftest.sh:1" "$(sj leaked) $(sj leak_names.0)"
   check "hq: ...e vazar não reprova: rodada completa, rc 0, só o b reprova" "0 completo 1" "$RC $(sj result) $(sj fail)"
   newrig; PRE_RD='mkdir "$RD/leaks.tsv"' runhq
