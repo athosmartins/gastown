@@ -4398,6 +4398,44 @@ def _blockers_release_epoch(rig_root, bead, now):
     return latest, latest_id
 
 
+# ── a bead the Pilot holds until its defer_until (ga-xow2igp) ────────────────────────────────────────────────────
+# bd hides a bead from `bd ready` until its defer_until, and pilot-dispatcher.sh's _filter_candidates drops one whose
+# defer_until is still ahead WHATEVER its status string says (ga-w8btn: inflight-reclaim-guard resets the status to
+# open and leaves the date alone; a lapsed date must not strand the bead, so only "still ahead" holds). This reconciler
+# lists status=deferred on purpose (ga-hzt8s) but nothing read the date, so a bead the Mayor parked for days fell
+# through every suppression below into "dispatch failing" (03/11: wa-3v5l89, deferred until 05/11 12:00Z, mailed
+# "starving 1203min" — ga-wisp-rmr7d — and was named by the disk note as the oldest waiter — ga-wisp-8qkgp).
+def _deferred_until_reason(bead, now):
+    """Why the Pilot holds `bead` until later — a defer_until still ahead of `now` — or None when it does not.
+
+    Never raises (an exception in _process_store costs the whole rig its cycle). Three answers:
+      * a timestamp strictly ahead of `now` → the reason: the caller keeps the bead out of every starve path;
+      * absent / null / blank / at or before `now` → None: not held, evaluated exactly as before. A lapsed date is
+        not a hold (the Pilot's own filter stops holding at the same instant); the status string can stay "deferred"
+        until `bd ready` next runs, and the bead is then evaluated again like any other;
+      * present but not readable as a timestamp (a number, a list, a string bd would never write, a well-formed one
+        an offset pushes off the calendar) → None as well, and logged: when the bead is released could not be told,
+        which is neither "held" nor "released long ago" — it keeps going through the alarm path (the SAFE DEFAULT in
+        the module docstring) instead of being muted on a value nobody could read.
+    """
+    bead_id = bead.get("id") or bead.get("issue_id") or "?"
+    # vazio (ausente/null/em branco) → None: not held, evaluated as before; ilegível → None too, but logged: the old path (alarm, if it starves) keeps the bead
+    raw = bead.get("defer_until")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    try:
+        epoch = _utc_epoch(raw)
+    except Exception:   # noqa: BLE001 — an offset can push the ends of the calendar out of range (9999-12-31T23:59:59-03:00)
+        epoch = None
+    if epoch is None:
+        _log("  %s: defer_until %.60r cannot be read as a timestamp — not treated as a hold, the bead is evaluated as "
+             "before" % (bead_id, raw))
+        return None
+    if epoch <= now:
+        return None
+    return "defer_until %s is still ahead (in %.0fmin)" % (raw.strip(), (epoch - now) / 60.0)
+
+
 # ── built-branch check (ga-tkcam, ga-lzxhi) ───────────────────────────────────
 # _built_branch_reason() is called per-bead from _process_store(), and only for
 # a bead that has already survived every cheaper suppression this cycle (see
@@ -4895,6 +4933,22 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
         # beads. See selftest scenario (pp) for the regression guard.
         if _is_flowing(bead):
             _log("  %s: flowing (story:in-flight / pilot:dispatched / assignee) — OK" % bead_id)
+            continue
+
+        # A bead the Pilot holds until its defer_until is waiting for the date, not for a dispatch (ga-xow2igp, see
+        # _deferred_until_reason). It stays out of the clock, the alarms and the notes below, and its wait records are
+        # dropped every cycle it is held: the wait that can mean "dispatch failing" starts when the hold ends, so the
+        # first cycle after it starts the clock afresh (a first-seen from before the hold would read the whole hold as
+        # starvation — the mistake ga-9lcp7m fixed for blockers) and its first alarm is a first alarm, not a "STILL
+        # starving (repeat #N)" of the episode before the hold. After _classify(), the keyword flag and _is_flowing()
+        # on purpose: a held bead is still classified and routed out by its labels (ga-hzt8s widened the query so
+        # that deferred beads get classified).
+        defer_reason = _deferred_until_reason(bead, now)
+        if defer_reason is not None:
+            _log("  %s: %s — held by the Pilot until then, not starving: no alarm, no common-cause note, "
+                 "wait clock reset" % (bead_id, defer_reason))
+            state.setdefault("first_seen_approved", {}).pop(bead_id, None)
+            state.setdefault("alarmed", {}).pop(bead_id, None)
             continue
 
         # IMPORTANT 2: track approved-age in daemon state, not updated_at.
@@ -5788,6 +5842,14 @@ def _selftest():
                 lives only in the list is quiet, an unrelated bead alarms, an unreadable list
                 puts both back to alarming). The selftest pins the REAL list to a missing file
                 everywhere else, so (u) and (ga-it3e8-a) are answered by their own handlers
+      (ga-xow2igp-a..h) a bead the Pilot HOLDS until its defer_until (the date decides, whatever the status
+                string says, as in the Pilot's own filter) is not starving — a: the repro (no mail, no push,
+                wait clock and alarm record dropped); b: the line (a minute past / equal to now alarm, one
+                second ahead is held); c: a whole life cycle by cycle (the wait counts from the release, as a
+                FIRST alarm); d, e: neither the disk note nor the pause-cause note counts or names it; f: status
+                open / no status are held too; g: controls (no date, an unreadable date, a held bead is still
+                routed out by its labels); h: the reader over 20 shapes (offsets, a 9-digit fraction, the ends
+                of the calendar, what is not a timestamp)
     """
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers, _sh
@@ -11821,6 +11883,248 @@ def _selftest():
             _ok("(ga-4mxaa8-m) %s" % _lab)
         else:
             _bad("(ga-4mxaa8-m) %s" % _lab, "got %r" % (_det,))
+    _read_pilot_dispatchable_file = lambda: None
+
+    # ── ga-xow2igp: a bead the Pilot HOLDS until its defer_until is not starving ────────────────────────────
+    # 03/11: wa-3v5l89 (status=deferred, defer_until 2026-11-05T12:00Z — a three-night proof the Mayor parked on
+    # purpose) mailed "buildable bead wa-3v5l89 starving 1203min — dispatch failing" (ga-wisp-rmr7d), and the disk
+    # note (ga-wisp-8qkgp) named it the oldest waiter. The store query lists status=deferred on purpose (ga-hzt8s)
+    # but nothing read defer_until, which the Pilot treats as a hold whatever the status string says (ga-w8btn).
+    def _xw_iso(epoch):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+    _XW_AHEAD = _xw_iso(NOW + 2 * 86400)    # like wa-3v5l89: two days ahead
+    _XW_FP = "ctx:ready,exec:auto,story:approved"
+
+    def _xw_bead(bid, defer, status="deferred", age_min=1203.0, labels=None):
+        b = _make_bead(bid, labels=list(labels if labels is not None else _FNEW), age_min=age_min, issue_type="task")
+        if status is not None:
+            b["status"] = status
+        if defer is not None:
+            b["defer_until"] = defer
+        return b
+
+    def _xw_world(disk=None, log=None):
+        """Where every scenario here starts: the Pilot alive and not paused, a queue snapshot that does not list the
+        beads (a bead absent from it alarms, ga-tky97 AC2), no gate focus, the disk as given (None = NÃO MEDIDO)."""
+        global _read_gate_focus_file, _read_disk_state_file, _read_pilot_sweep_pause_state_file
+        global _read_pilot_dispatchable_file, _read_pilot_log_lines
+        _read_gate_focus_file = lambda: None
+        _read_disk_state_file = (lambda: dict(disk)) if disk is not None else (lambda: None)
+        _read_pilot_sweep_pause_state_file = _pause_off
+        _read_pilot_dispatchable_file = lambda: {"items": [{"id": "ga-xow2igp-other", "priority": 2}]}
+        _read_pilot_log_lines = log if log is not None else (lambda: _pilot_recent())
+
+    def _xw_seen(st, ids, age_min=1203.0):
+        for b in ids:
+            st["first_seen_approved"][b] = NOW - age_min * 60
+
+    print("\nScenario (ga-xow2igp-a): THE REPRO — status=deferred, defer_until two days ahead, first seen 1203min ago "
+          "and alarmed once before, the Pilot alive → NO mail of any kind, the log names the date, and the bead's "
+          "wait clock and alarm record are dropped (the wait starts again at the release)")
+    _xw_world()
+    _xwa = "ga-xow2igp-a"
+    _bd_approved = lambda root: [_xw_bead(_xwa, _XW_AHEAD)]
+    st = _reset()
+    _xw_seen(st, [_xwa])
+    st["alarmed"][_xwa] = {"last": NOW - 86400, "count": 1, "fp": _XW_FP}
+    _xw_out = _run_logged(st)
+    if (not mail_calls and not notify_calls and not flow_authority_calls and not ledger_calls
+            and _xwa not in st["first_seen_approved"] and _xwa not in st["alarmed"]
+            and any(_xwa in l and "defer_until %s is still ahead" % _XW_AHEAD in l and "no alarm" in l
+                    for l in _xw_out.splitlines())):
+        _ok("(ga-xow2igp-a): deferred until a date ahead → no mail / push / ledger; the log names the date; "
+            "first-seen clock and alarm record dropped")
+    else:
+        _bad("(ga-xow2igp-a)", "mails=%s notify=%s first_seen=%s alarmed=%s log=%r" % (
+             [s for s, _ in mail_calls], notify_calls, list(st["first_seen_approved"]), list(st["alarmed"]),
+             [l for l in _xw_out.splitlines() if _xwa in l][:3]))
+
+    print("\nScenario (ga-xow2igp-b): the line, drawn as the Pilot draws it (held only while defer_until > now) — a "
+          "date that passed a minute ago (the status can stay 'deferred' until `bd ready` next runs) and a date equal "
+          "to now are evaluated as before and alarm; one second ahead is held")
+    _xw_world()
+    _xwb = ["ga-xow2igp-b-past", "ga-xow2igp-b-now", "ga-xow2igp-b-1s"]
+    _bd_approved = lambda root: [_xw_bead(_xwb[0], _xw_iso(NOW - 60)), _xw_bead(_xwb[1], _xw_iso(NOW)),
+                                 _xw_bead(_xwb[2], _xw_iso(NOW + 1))]
+    st = _reset()
+    _xw_seen(st, _xwb)
+    run_cycle(NOW, st)
+    _xwb_alarmed = [b for b in _xwb if any(b in s for s, _ in _df_mails())]
+    if _xwb_alarmed == _xwb[:2]:
+        _ok("(ga-xow2igp-b): passed a minute ago → alarms as before; equal to now → alarms; one second ahead → held")
+    else:
+        _bad("(ga-xow2igp-b)", "alarmed=%r (want the first two only)" % (_xwb_alarmed,))
+
+    print("\nScenario (ga-xow2igp-c): the whole life, cycle by cycle — deferred for 3h (silent at +0 and +2h, no wait "
+          "clock), the first cycle after the release starts the wait (inside the grace, silent), 25min later it "
+          "alarms with age 25min — counted from the release, not from the first sighting — and as a FIRST alarm (the "
+          "old record was dropped: no 'STILL starving / repeat')")
+    _xwc = "ga-xow2igp-c"
+    _xwc_rel = 3 * 3600
+    _bd_approved = lambda root: [_xw_bead(_xwc, _xw_iso(NOW + _xwc_rel))]
+    st = _reset()
+    _xw_seen(st, [_xwc])
+    st["alarmed"][_xwc] = {"last": NOW - 86400, "count": 2, "fp": _XW_FP}
+    _xwc_rows = []
+    for _dt in (0, 2 * 3600, _xwc_rel + 60, _xwc_rel + 60 + 25 * 60):
+        _reset_captures()
+        _t = NOW + _dt
+        _xw_world(log=lambda: _pilot_recent_at(_t))
+        run_cycle(_t, st)
+        _xwc_rows.append(([s for s, _ in _df_mails()], st["first_seen_approved"].get(_xwc)))
+    _xw_world()
+    if (_xwc_rows[0] == ([], None) and _xwc_rows[1] == ([], None)
+            and _xwc_rows[2] == ([], NOW + _xwc_rel + 60)
+            and len(_xwc_rows[3][0]) == 1 and "starving 25min" in _xwc_rows[3][0][0]
+            and "STILL" not in _xwc_rows[3][0][0] and "repeat" not in _xwc_rows[3][0][0]):
+        _ok("(ga-xow2igp-c): +0 / +2h silent with no clock; the cycle after the release starts it (silent); +25min "
+            "→ one FIRST alarm saying 25min")
+    else:
+        _bad("(ga-xow2igp-c)", "per-cycle (mails, first-seen): %r" % (_xwc_rows,))
+
+    print("\nScenario (ga-xow2igp-d): the disk note (ga-4mxaa8) — disk MEASURED under the floor, a plain starving "
+          "story and the deferred one (by far the oldest) → ONE note that counts and names only the plain story, and "
+          "no per-bead mail for either")
+    _xw_world(disk=_DK_LOW)
+    _xwd = ["ga-xow2igp-d-held", "ga-xow2igp-d-plain"]
+    _bd_approved = lambda root: [_xw_bead(_xwd[0], _XW_AHEAD),
+                                 _xw_bead(_xwd[1], None, status="open", age_min=_STARVE + 5.0)]
+    st = _reset()
+    _xw_seen(st, _xwd[:1])
+    _xw_seen(st, _xwd[1:], age_min=_STARVE + 5.0)
+    run_cycle(NOW, st)
+    _xwd_n = _dk_notes()
+    if (len(_xwd_n) == 1 and "1 bead(s)" in _xwd_n[0][0] and _xwd[1] in _xwd_n[0][1]
+            and _xwd[0] not in _xwd_n[0][0] and _xwd[0] not in _xwd_n[0][1] and not _df_mails()):
+        _ok("(ga-xow2igp-d): 1 disk note for 1 bead (the plain one, named); the deferred one is neither counted nor "
+            "named; 0 per-bead mails")
+    else:
+        _bad("(ga-xow2igp-d)", "notes=%s per-bead=%s" % (
+             [(s, [i for i in _xwd if i in b]) for s, b in _xwd_n], [s for s, _ in _df_mails()]))
+
+    print("\nScenario (ga-xow2igp-e): the pause-cause note (ga-5bzrzu) — the Pilot paused 17 of 56 sweeps; two plain "
+          "old stories and the deferred one (the oldest of all) → ONE cause note for 2 beads whose oldest is a plain "
+          "one; the deferred bead is neither counted nor named")
+    _xw_world(log=lambda: _pc_log(NOW, 56, 17))
+    _read_pilot_dispatchable_file = lambda: None
+    _xwe = ["ga-xow2igp-e-held", "ga-xow2igp-e-p1", "ga-xow2igp-e-p2"]
+    _xwe_ages = {_xwe[0]: 8016, _xwe[1]: 3455, _xwe[2]: 2367}
+    _bd_approved = lambda root: [_xw_bead(_xwe[0], _XW_AHEAD, age_min=8016.0),
+                                 _xw_bead(_xwe[1], None, status="open", age_min=3455.0),
+                                 _xw_bead(_xwe[2], None, status="open", age_min=2367.0)]
+    st = _reset()
+    for _b, _a in _xwe_ages.items():
+        _xw_seen(st, [_b], age_min=float(_a))
+    run_cycle(NOW, st)
+    _xwe_n = _pc_mails()
+    if (len(_xwe_n) == 1 and "2 bead(s)" in _xwe_n[0][0] and _xwe[1] in _xwe_n[0][0] and "3455min" in _xwe_n[0][0]
+            and _xwe[0] not in _xwe_n[0][0] and _xwe[0] not in _xwe_n[0][1] and _xwe[2] in _xwe_n[0][1]
+            and not _df_mails()):
+        _ok("(ga-xow2igp-e): 1 cause note, 2 beads, oldest = the plain 3455min one; the deferred bead (8016min) is "
+            "neither counted nor named; 0 per-bead mails")
+    else:
+        _bad("(ga-xow2igp-e)", "notes=%s per-bead=%s" % ([s for s, _ in _xwe_n], [s for s, _ in _df_mails()]))
+
+    print("\nScenario (ga-xow2igp-f): the hold is the DATE, as in the Pilot's own filter (ga-w8btn) — a future "
+          "defer_until on a bead whose status was reset to open (something else rewrote it, the date was left alone) "
+          "and on one with no status field at all is a hold too")
+    _xw_world()
+    _xwf = ["ga-xow2igp-f-open", "ga-xow2igp-f-nostatus"]
+    _bd_approved = lambda root: [_xw_bead(_xwf[0], _XW_AHEAD, status="open"), _xw_bead(_xwf[1], _XW_AHEAD, status=None)]
+    st = _reset()
+    _xw_seen(st, _xwf)
+    run_cycle(NOW, st)
+    if not mail_calls and not any(b in st["first_seen_approved"] for b in _xwf):
+        _ok("(ga-xow2igp-f): future defer_until on status=open and on a bead with no status → no mail, no wait clock")
+    else:
+        _bad("(ga-xow2igp-f)", "mails=%s first_seen=%s" % ([s for s, _ in mail_calls], list(st["first_seen_approved"])))
+
+    print("\nScenario (ga-xow2igp-g): controls — (1) what is NOT a hold keeps going through the old path: a deferred "
+          "bead with no defer_until, one holding a string that is not a timestamp, one holding a number (the last two "
+          "are named in the log: a date nobody could read mutes nothing); (2) a bead that IS held is still classified "
+          "and routed out by its labels (ga-hzt8s widened the query so that deferred beads get classified)")
+    _xw_world()
+    _xwg = ["ga-xow2igp-g-nodate", "ga-xow2igp-g-junk", "ga-xow2igp-g-number"]
+    _xwg_route = "ga-xow2igp-g-route"
+    _bd_approved = lambda root: [_xw_bead(_xwg[0], None), _xw_bead(_xwg[1], "depois do almoço"),
+                                 _xw_bead(_xwg[2], 1893456000),
+                                 _xw_bead(_xwg_route, _XW_AHEAD, labels=["story:approved", "story:needs-device"])]
+    st = _reset()
+    _xw_seen(st, _xwg)
+    _xw_out = _run_logged(st)
+    _xwg_alarmed = [b for b in _xwg if any(b in s for s, _ in _df_mails())]
+    _xwg_lines = _xw_out.splitlines()
+    for _lab, _good, _det in (
+            ("no defer_until / a string that is not a timestamp / a number → all three alarm as before",
+             _xwg_alarmed == _xwg, _xwg_alarmed),
+            ("the string and the number are named in the log as unreadable; the missing date is not",
+             all(any(b in l and "cannot be read as a timestamp" in l for l in _xwg_lines) for b in _xwg[1:])
+             and not any(_xwg[0] in l and "cannot be read as a timestamp" in l for l in _xwg_lines),
+             [l for l in _xwg_lines if "cannot be read as a timestamp" in l][:3]),
+            ("a held bead (defer_until ahead) carrying story:needs-device is still routed out of story:approved",
+             (_xwg_route, "story:approved") in label_removes and (_xwg_route, "story:needs-device") in label_adds,
+             (label_removes, label_adds))):
+        if _good:
+            _ok("(ga-xow2igp-g) %s" % _lab)
+        else:
+            _bad("(ga-xow2igp-g) %s" % _lab, "got %r" % (_det,))
+
+    print("\nScenario (ga-xow2igp-h): the reader itself — RFC 3339 as bd writes it and the shapes around it: Z, a "
+          "numeric offset (the INSTANT counts, not the wall clock), a 9-digit fraction (python 3.9 cannot "
+          "fromisoformat it), past / now / ahead, absent / null / blank, the ends of the calendar, and what is not a "
+          "timestamp (logged, never an exception)")
+
+    def _xw_east(epoch):
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(epoch + 3 * 3600)) + "+03:00"
+
+    def _xw_call(raw, present=True):
+        bead = {"id": "ga-xow2igp-h"}
+        if present:
+            bead["defer_until"] = raw
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            try:
+                got = _deferred_until_reason(bead, NOW)
+            except Exception as e:   # noqa: BLE001
+                got = "RAISED %r" % (e,)
+        return got, buf.getvalue()
+
+    # (label, raw, key present, held, named in the log as not a timestamp)
+    _xwh = [
+        ("key absent", None, False, False, False),
+        ("null", None, True, False, False),
+        ("empty string", "", True, False, False),
+        ("blank string", "   ", True, False, False),
+        ("Z, one second ahead", _xw_iso(NOW + 1), True, True, False),
+        ("Z, equal to now", _xw_iso(NOW), True, False, False),
+        ("Z, one second behind", _xw_iso(NOW - 1), True, False, False),
+        ("+00:00, ahead", _xw_iso(NOW + 3600)[:-1] + "+00:00", True, True, False),
+        ("+03:00, the instant is 1h ahead (the wall clock reads 4h ahead)", _xw_east(NOW + 3600), True, True, False),
+        ("+03:00, the instant is 1h BEHIND though the wall clock reads 2h ahead", _xw_east(NOW - 3600), True, False, False),
+        ("9-digit fraction, ahead", _xw_iso(NOW + 3600)[:-1] + ".123456789Z", True, True, False),
+        ("end of the calendar", "9999-12-31T23:59:59Z", True, True, False),
+        ("Go's zero time", "0001-01-01T00:00:00Z", True, False, False),
+        ("end of the calendar with an offset that overflows", "9999-12-31T23:59:59-03:00", True, False, True),
+        ("start of the calendar with an offset that overflows", "0001-01-01T00:00:00+03:00", True, False, True),
+        ("not a timestamp", "next week", True, False, True),
+        ("a date that does not exist", "2026-13-45T99:99:99Z", True, False, True),
+        ("a number", 1893456000, True, False, True),
+        ("a boolean", True, True, False, True),
+        ("a list", [_xw_iso(NOW + 3600)], True, False, True),
+    ]
+    _xwh_bad = []
+    for _lab, _raw, _present, _held, _named in _xwh:
+        _got, _logged = _xw_call(_raw, _present)
+        _is_held = isinstance(_got, str) and _got.startswith("defer_until ")
+        _is_named = "cannot be read as a timestamp" in _logged
+        if _is_held != _held or _is_named != _named or (_got is not None and not _is_held):
+            _xwh_bad.append((_lab, _got, _logged.strip()[:80]))
+    if not _xwh_bad:
+        _ok("(ga-xow2igp-h): %d shapes — ahead (any offset, any fraction) → the reason; absent / blank / at or before "
+            "now → None; not a timestamp → None AND logged; no exception on any of them" % len(_xwh))
+    else:
+        _bad("(ga-xow2igp-h)", "%d of %d wrong: %r" % (len(_xwh_bad), len(_xwh), _xwh_bad[:4]))
     _read_pilot_dispatchable_file = lambda: None
 
     # ── result ────────────────────────────────────────────────────────────────
