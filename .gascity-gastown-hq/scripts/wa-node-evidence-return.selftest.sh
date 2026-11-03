@@ -9,12 +9,14 @@
 #   O `bd` de mentira (um script) guarda uma bead por arquivo na pasta da loja e registra quem foi lido.
 # CASOS: ida = linha do Pilot (label/auto, rc 0) + "despachada" do despachante · `release` depois da ida NÃO é erro (a sonda do gate) · shadow, dry-run e linha sem confirmação NÃO são ida
 #   · rc 13/124/128-255 = ida INCERTA (contada, nomeada; 125-127 não) · modo desconhecido · `out` ilegível = "não sei" · despacho sem linha do Pilot · a ÚLTIMA ida manda · erro lido na bead:
-#   recusa do worker, rótulo do gate, sem sinal, NÃO LIDA (bd ausente, rc != 0, JSON ruim, outra bead, loja sem rota) · log ausente/vazio/ilegível · --hours com dígito não-ASCII = rc 2.
+#   recusa do worker, rótulo do gate, sem sinal, NÃO LIDA (bd ausente, rc != 0, saída que não é UTF-8, JSON ruim, outra bead, loja sem rota) · log ausente/vazio/ilegível · --hours com dígito não-ASCII = rc 2.
 # FRONTEIRAS (ga-eedg7fw, hq-mutants): relógio de mentira (inproc.py/units.py) para cair EXATAMENTE em cada limite: since, o pareamento 0..120 s do dry-run, o despacho sem linha em since, o orçamento de 120 s das leituras de bead.
 #   Mutantes EQUIVALENTES do lastro, sem caso (nenhum teste de comportamento os distingue): (a) `nao_conf[bead] = nao_conf.get(bead, 0) + 1` com `0 → 1`: só as CHAVES de nao_conf são lidas (sorted(nao_conf), len(nao_conf)), nunca o valor;
 #   (b) `1 <= int(a.hours) <= 99999` com `99999 → 100000`: o `re.fullmatch("[0-9]{1,5}")` da mesma linha já impede um 6º dígito, então o teto 99999 nunca é o que barra.
-#   Rodízio de 03/11 (ga-59jrj3d): (a') `nao_conf.get(bead, 0) + 1` com `+ 1 → + 0` (c97a912d1c): o mesmo motivo de (a), o valor nunca é lido. (c) `text=True → False` no `bd show` (b0c724ee37): só difere se o `bd` imprimir bytes que não são UTF-8, e aí o ORIGINAL
-#   morre com UnicodeDecodeError (medido: rc 1 com traceback, o `except (OSError, SubprocessError)` não o pega) enquanto o mutante diz "bd show: JSON ilegível" e segue: matar o mutante exigiria fixar um travamento como esperado, ou consertar o script; fica vivo e a falha vai no relato da entrega.
+#   Rodízio de 03/11 (ga-59jrj3d): (a') `nao_conf.get(bead, 0) + 1` com `+ 1 → + 0` (c97a912d1c): o mesmo motivo de (a), o valor nunca é lido.
+#   NÃO é mais equivalente (ga-szzbm93): `text=True → False` no `bd show` (b0c724ee37) só difere se o `bd` imprimir byte que não é UTF-8, e aí o relatório MORRIA com UnicodeDecodeError (medido: rc 1 com traceback; o `except (OSError, SubprocessError)`
+#   não o pegava). A tupla do `except` de estado_da_bead ganhou `UnicodeError`: o byte cai no terceiro estado (bead NÃO LIDA, motivo «bd não respondeu (UnicodeDecodeError)» no stderr); o mutante lê o mesmo byte pelo json.loads e diz «bd show: JSON ilegível».
+#   O caso p_bdutf8 (bead wa-u8) separa os dois pelo MOTIVO, e o controle negativo (`ERX`, o texto que o stderr tem de trazer) prova que o mutante morre e que, sem o `UnicodeError` na tupla, o relatório também reprova.
 # CONTROLE NEGATIVO: cada mutante troca UMA linha do relatório numa cópia e o caso designado tem de reprovar.
 # COMO RODAR: bash scripts/wa-node-evidence-return.selftest.sh   (macOS /bin/bash 3.2 e Linux; ~20 s no nó)
 # EQUIVALENT c97a912d1c 67d20c12a9: `nao_conf.get(bead, 0) + 1` com `+ 1` -> `+ 0` e `0` -> `1`: so as CHAVES de nao_conf sao lidas (sorted, len), nunca o valor
@@ -159,6 +161,12 @@ newcase; echo 'isto não é json' > "$STORE/wa-bj.json"; printf '[]\n' > "$STORE
 printf '[{"id":"wa-tl","labels":"gate:needs-fix"}]\n' > "$STORE/wa-tl.json"; printf '[{"id":"wa-tm","metadata":"x"}]\n' > "$STORE/wa-tm.json"
 { ida 100 wa-bj "$EV"; ida 99 wa-emp "$EV"; ida 98 wa-oid "$EV"; ida 97 wa-tl "$EV"; ida 96 wa-tm "$EV"; } > "$L"
 expect "JSON ruim, lista vazia, outra bead, labels que não é lista, metadata que não é objeto: todas NÃO LIDAS" 0 '"sem_sinal_de_erro": \[\], "beads_nao_lidas": \["wa-bj", "wa-emp", "wa-oid", "wa-tl", "wa-tm"\]' $J
+# ga-szzbm93 (b0c724ee37): o bd imprime UM byte que não é UTF-8 (\377) dentro de uma string do JSON, e o run de text=True levanta UnicodeDecodeError. A bead EXISTE e traz athos.node_recusa, mas a leitura
+# não decodifica: NÃO LIDA, nunca «recusada» (um decode que trocasse o byte leria a recusa), nunca «sem sinal», nunca um traceback que derruba o relatório inteiro.
+p_bdutf8() { newcase; printf '[{"id":"wa-u8","labels":["ctx:ready"],"metadata":{"athos.node_recusa":"x\377y"}}]\n' > "$STORE/wa-u8.json"; { ida 100 wa-u8 "$EV"; } > "$L"; }
+p_bdutf8
+expect "bd que imprime um byte que não é UTF-8: NÃO LIDA (nem recusada, nem sem sinal), rc 0" 0 '"recusadas_pelo_no": \[\], "reprovadas_no_gate": \[\], "sem_sinal_de_erro": \[\], "beads_nao_lidas": \["wa-u8"\]' $J
+if grep -qF 'bead wa-u8 não lida: bd não respondeu (UnicodeDecodeError)' "$T/err" && ! grep -q 'Traceback' "$T/err"; then ok "bd com byte que não é UTF-8: o motivo vai ao stderr e não há traceback"; else bad "bd com byte que não é UTF-8: stderr sem o motivo, ou com traceback ($(head -c 300 "$T/err"))"; fi
 newcase; { ida 100 zz-1 "$EV"; } > "$L"
 expect "prefixo sem rota em routes.jsonl: NÃO LIDA" 0 '"beads_nao_lidas": \["zz-1"\]' $J
 newcase; bead wa-a; { ida 100 wa-a "$EV"; } > "$L"
@@ -317,9 +325,10 @@ open(sys.argv[2], "w", encoding="utf-8").write(src.replace(sys.argv[3], sys.argv
 EOF
   then bad "mutante $name: o trecho original não existe (o relatório mudou? atualize o mutante)"; return; fi
   $prep; CLS="$REP"; run "$@"
-  if ! { [ "$RC" = "$rc" ] && { [ "$rx" = "-" ] || printf '%s' "$OUT" | grep -q -E -e "$rx"; }; }; then bad "mutante $name VAZIO: o relatório ORIGINAL já reprova o caso (rc=$RC; saída: $(printf '%s' "$OUT" | cut -c1-200))"; CLS=""; return; fi
+  # ERX (opcional, ga-szzbm93): regexp que o STDERR do relatório também tem de casar para o caso «passar» (o motivo de uma bead não lida só vai ao stderr); vazio = só rc e stdout, como sempre
+  if ! { [ "$RC" = "$rc" ] && { [ "$rx" = "-" ] || printf '%s' "$OUT" | grep -q -E -e "$rx"; } && { [ -z "${ERX:-}" ] || grep -q -E -e "$ERX" "$T/err"; }; }; then bad "mutante $name VAZIO: o relatório ORIGINAL já reprova o caso (rc=$RC; saída: $(printf '%s' "$OUT" | cut -c1-200); stderr: $(head -c 200 "$T/err"))"; CLS=""; return; fi
   CLS="$M"; run "$@"
-  if [ "$RC" = "$rc" ] && { [ "$rx" = "-" ] || printf '%s' "$OUT" | grep -q -E -e "$rx"; }; then bad "mutante $name SOBREVIVEU (o caso ainda passa)"; else ok "mutante $name morreu"; fi
+  if [ "$RC" = "$rc" ] && { [ "$rx" = "-" ] || printf '%s' "$OUT" | grep -q -E -e "$rx"; } && { [ -z "${ERX:-}" ] || grep -q -E -e "$ERX" "$T/err"; }; then bad "mutante $name SOBREVIVEU (o caso ainda passa)"; else ok "mutante $name morreu"; fi
   CLS=""
 }
 p_shadow()  { newcase; { pilot_s 100 wa-s shadow 0 "$EV"; } > "$L"; }
@@ -362,6 +371,10 @@ mutant ultima-ida-ignorada 'if ultima is None or ts >= ultima[0]:' 'if (ultima i
 mutant nao-lida-vira-sem-sinal 'st = "nao_lida"' 'st = "sem_sinal"' p_bdausente 0 '"sem_sinal_de_erro": \[\], "beads_nao_lidas": \["wa-a"\]' $J --bd "$T/nao-existe-bd"
 mutant bd-rc-ignorado 'if p.returncode != 0:' 'if False:' p_bdrc 0 '"beads_nao_lidas": \["wa-rc"\]' $J
 mutant bead-de-outro-id 'or j.get("id") != bead' 'or False' p_outraid 0 '"beads_nao_lidas": \["wa-oid"\]' $J
+ERX='bead wa-u8 não lida: bd não respondeu \(UnicodeDecodeError\)'   # b0c724ee37: a bead é «não lida» nos dois, mas só o original diz o PORQUÊ certo; sem o UnicodeError na tupla o relatório nem chega ao stdout (rc 1)
+mutant bd-saida-nao-utf8-vira-json-ilegivel 'capture_output=True, text=True,' 'capture_output=True, text=False,' p_bdutf8 0 '"beads_nao_lidas": \["wa-u8"\]' $J
+mutant bd-saida-nao-utf8-derruba-o-relatorio 'subprocess.SubprocessError, UnicodeError) as e:' 'subprocess.SubprocessError) as e:' p_bdutf8 0 '"beads_nao_lidas": \["wa-u8"\]' $J
+ERX=""
 mutant recusa-ignorada 'return "recusada", ""' 'pass' p_recusa 0 '"recusadas_pelo_no": \["wa-b"\]' $J
 mutant recusa-em-branco-conta 'if isinstance(rec, str) and rec.strip():' 'if rec is not None:' p_recbranco 0 '"recusadas_pelo_no": \[\]' $J
 mutant gate-sem-prefixo-de-tentativa 'or x.startswith(PREFIXO_TENTATIVA_GATE)' 'or False' p_gate 0 '"reprovadas_no_gate": \["wa-g1", "wa-g2", "wa-g3"\]' $J

@@ -1115,6 +1115,7 @@ chk_motivos_arquivo() { # --exempt-log troca o caminho da cidade; vazio é rc 2
 #   sempre o sobrescreve (todo token da última sonda está em sondas_tok).
 # EQUIVALENT 41999accdb: `max(..., default=0)` da maior lacuna -> default=1: a lacuna so sai por round(x / 3600, 2), e 1 s da 0,0 como 0
 # EQUIVALENT 6a4f31985f: `h["com_wa"] += 1` -> `+= 0`: o campo e so escrito, nenhuma linha da tabela o le
+# EQUIVALENT a15bfc12b0: `"com_wa": 0` -> `1` no setdefault de analyse_occ: o campo e so escrito (pelo `+= 1` do laço), nenhuma linha da tabela nem do resumo o le; leituras_com_wa_no_no vem de wa_leituras
 # EQUIVALENT 55ab19dc97: `"sondas": 0` -> `1` no setdefault de analyse_motivos: o `["sondas"] = n` seguinte sempre o sobrescreve
 chk_ultimo_fora_do_veredito() {   # duas linhas que não são veredito na mesma bead: a última vale; rc 0 com texto desconhecido é 'outro', nunca 'despachada'
   jrun UTC "$K1" --hours 24

@@ -22,7 +22,7 @@ ESTADOS QUE NÃO SE CONFUNDEM  log ausente ≠ log vazio ≠ log ilegível ≠ n
           contado à parte (os quatro primeiros com as beads NOMEADAS; sombra e dry-run só em número, e o modo desconhecido só em número no --json):
             sem confirmação do despachante · ida INCERTA (rc 13, 124 ou 128-255: o Pilot não sabe se a escrita pegou; é a mesma lista de `_pilot_wa_node_decide`) · `out` ilegível (não dá para saber se havia
             evidência) · despacho sem linha do Pilot (apply à mão: o `out` não foi gravado) · sombra (modo shadow: só o `check`, nada foi atribuído) · dry-run · modo desconhecido.
-          Da bead com evidência: recusada · reprovada no gate · SEM SINAL de erro · não lida (bd não respondeu, loja não achada, JSON estranho). "Não lida" nunca vira "sem sinal".
+          Da bead com evidência: recusada · reprovada no gate · SEM SINAL de erro · não lida (bd não respondeu, loja não achada, saída que não é UTF-8, JSON estranho). "Não lida" nunca vira "sem sinal".
 O QUE NÃO DIZ  (a) O ERRO TEM LIMITES: o rótulo do gate e a recusa não têm data, então podem ser anteriores à ida (a bead pode ter sido tentada no mini antes); e "sem sinal de erro" é só isso: pode estar
           construindo, entregue, solta depois da entrega, ou ter tido a ida DESFEITA (modo pilot: se a sessão do alias não sobe, o Pilot desfaz a escrita com um `bd update` direto e não deixa linha nenhuma:
           a bead volta ao mini sem rastro). (b) Não diz se a bead que ficou no nó foi bem construída. (c) A bead que foi SEM evidência só entra em `sem_evidencia`: o bd não é consultado para ela.
@@ -213,12 +213,12 @@ def estado_da_bead(city, bd, bead, deadline):
     restante = deadline - time.time()
     if restante <= 0:
         return None, "orçamento de leitura esgotado"
-    # vazio (sem saída, ou saída sem a bead pedida) → não lida; falhou/ilegível (bd ausente, prazo, rc != 0, JSON ruim, `labels`/`metadata` do tipo errado) → não lida. `labels`/`metadata` AUSENTES
+    # vazio (sem saída, ou saída sem a bead pedida) → não lida; falhou/ilegível (bd ausente, prazo, rc != 0, saída que não é UTF-8, JSON ruim, `labels`/`metadata` do tipo errado) → não lida. `labels`/`metadata` AUSENTES
     # numa bead lida valem "nenhum": é como o bd serializa a bead sem rótulo.
     try:
         p = subprocess.run([bd, "-C", store, "show", bead, "--json"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
                            timeout=min(LEITURA_BD_S, restante))
-    except (OSError, subprocess.SubprocessError) as e:
+    except (OSError, subprocess.SubprocessError, UnicodeError) as e:   # UnicodeError: text=True decodifica estrito e o byte que não é UTF-8 estoura AQUI, dentro do run (não no json.loads de baixo): sem ele o relatório morria em traceback (rc 1)
         return None, "bd não respondeu (%s)" % type(e).__name__
     if p.returncode != 0:
         return None, "bd show rc=%d" % p.returncode

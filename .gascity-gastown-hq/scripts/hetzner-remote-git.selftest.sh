@@ -173,6 +173,7 @@ grep -qF 'spec indisponível' "$LPE" && ok "espelho sem filtro: o stderr do ssh 
 # EQUIVALENT 5572d3e5d6 6a099af2c5: o `|| true` -> `&& true` das duas leituras `rev-parse -q --verify` do status: sem `set -e` o rc de uma atribuicao por $( ) nunca e lido
 # EQUIVALENT 6c2726b5e0: o `&&` -> `||` entre o `tr` e a conferencia de contagem do `find` do scan: se o `find` falha o `tr` nao roda, $t/files nao existe e a conferencia e sempre falsa
 # EQUIVALENT 3e96e45c69: o `|| return 2` do `mktemp -d` dentro de denied: sem ele o `git init /r` falha na raiz do disco para quem nao e root e o rc continua 2
+# EQUIVALENT c5c184d44d: o `return 0` -> `return 1` do lag_fields: os tres chamadores (pull, wt-add, status) o chamam com `;` e nenhum le o $? depois (o script so tem `set -u`: sem `set -e` e sem trap ERR, o status solto nao derruba nada)
 mkdir -p "$T/shim2" "$T/home"; export REAL_DATE; REAL_DATE=$(command -v date)
 printf '%s\n' '#!/bin/sh' '[ -n "${FAKE_NOW:-}" ] && [ "${1:-}" = +%s ] && { echo "$FAKE_NOW"; exit 0; }' 'exec "$REAL_DATE" "$@"' > "$T/shim2/date"   # FAKE_NOW fixa o `date +%s` do script: a idade sai exata
 printf '%s\n' '#!/bin/sh' 'case "${SHIM2_MODE:-}:${1:-}" in' '  mktempfail:-d) echo "shim: mktemp -d falhou (de proposito)" >&2; exit 1 ;;' \

@@ -88,6 +88,12 @@ for _pos in 1 2 3 5 6 7 8; do   # every numeric input except staging (4th, cover
 done
 [ "$_all" = "1" ] && ok "decision: every other numeric input blank/non-numeric/negative/decimal → WAIT unmeasurable-input (a failed read never looks like 'plenty of room')" || bad "decision: an unmeasurable input was not refused"
 unset _all _args _pos _val _a
+# ga-szzbm93 (8ea215a12c): the helper that computes the gate's numbers can fail on its own (_gc_required_parts returns 1 on a non-numeric size/pct/floor; the loop above refuses those first, so with the real helper
+# that branch is not reached TODAY, but a helper that starts to refuse more would land here). The decision is documented to answer in words and return 0 (the poll reads the word, never the status):
+# A helper that FAILS → WAIT unmeasurable-input and rc 0, never a KICK and never a non-zero status. A stub in a subshell (it does not leak), valid numbers in.
+_dr="$( _gc_required_parts() { return 1; }; dec $S 12000 $SZ $ST $PCT $FL $MIN $SL 1 1 )"; _dr_rc=$?
+[ "$_dr" = "WAIT unmeasurable-input" ] && [ "$_dr_rc" = "0" ] && ok "decision: the gate-numbers helper failing on its own (valid inputs) → WAIT unmeasurable-input and rc 0, not a KICK and not a non-zero status" || bad "decision: helper failing got: '$_dr' rc=$_dr_rc"
+unset _dr _dr_rc
 # Consistency by construction: the trigger must agree with the functions the maintenance job
 # itself uses, over a grid — no second copy of the arithmetic that could drift.
 _grid_ok=1
@@ -1196,13 +1202,14 @@ unset _code
 
 # ── ga-hq1qc5y (hq-mutants lastro): the helpers that may fail, the edges of the others, the post-run WARNs, the script as a program ────────────────
 echo "== helpers: status and edges =="
-# EQUIVALENT, documented: 8ea215a12c (`_gc_required_parts` failing inside _gc_trigger_decision: the loop above it already refused every non-numeric size, pct and floor, the only inputs it fails on);
+# EQUIVALENT, documented (8ea215a12c is NOT one any more: `_gc_required_parts` failing inside _gc_trigger_decision is a case of its own, in the decision section, ga-szzbm93):
 # 35d16b9578 and 9d28f4e738 (_trg_backoff_s: `-lt` -> `-le` while s == cap doubles once more and
 # the clamp brings it back to the cap; `-gt` -> `-ge` assigns the cap to the cap); cac26e2671 and 4fbf2ea052 (the poll's clamp of a stored backoff, `-gt` -> `-ge`: at equality it assigns the same number);
 # fa54519c71 (`[ -f ] || return 1` in _trg_state_readable: for a directory the `wc -l <` below fails to read it and the same `return 1` follows; so it does for /dev/null, 0 lines. Only a path whose read never
 # finishes tells the two apart, and for the worse (a FIFO: the open() of `wc -l <` waits for a writer; /dev/zero: no end). Nothing creates one at the state path, so no case: a timed one needs an open fd, a subshell and a timer); 4f99aaeef8 (`mkdir -p ... || return 1` in
 # _trg_state_write: the redirection after it fails on the same missing directory and returns 1); c76d35419c and 22ec8a2fd6 (`|| true` -> `&& true` after a status the function discards: both end in `return 0`).
 # EQUIVALENT 35d16b9578: _trg_backoff_s: `-lt` -> `-le` while s == cap doubles once more and the clamp brings it back to the cap
+# EQUIVALENT 9d28f4e738: _trg_backoff_s: `-gt` -> `-ge` assigns the cap to the cap: s and max are both canonical numbers there (max went through $(( 10#$max )) above), so at equality the TEXT is the same too (2964 base x max x n combinations, zero-padded and garbled ones included: identical output)
 # EQUIVALENT 4fbf2ea052: the poll's clamp of a stored backoff, `-gt` -> `-ge`: at equality it assigns the same number
 # EQUIVALENT 4f99aaeef8: `mkdir -p ... || return 1` in _trg_state_write: the redirection after it fails on the same missing directory and returns 1
 # EQUIVALENT 22ec8a2fd6: `|| true` -> `&& true` after a status the function discards: it ends in `return 0`

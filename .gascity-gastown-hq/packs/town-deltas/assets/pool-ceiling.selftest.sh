@@ -860,7 +860,8 @@ echo "== 10e. what the sweep still found loose after 10d (ga-hq1qc5y): classifie
 # after an assignment / a redirected group): not the last element of the AND-OR list, so errexit is exempt either way, and the function ends in `return 0`.
 # EQUIVALENT 62af5d6f99 8116e9c99c 12a43c0b64 67db8cd8b6 075c5dec6b d378894e84 40e4485bc5 70be034d63 88e021fbf0 68693a5119 22aeafd207 d264cb2fea 78148b16ac: a clamp (`[ a -le b ] || a=b`, `if [ a -gt b ]; then a=b; fi`) assigns the same number at equality whichever way the comparison leans; only the text of a zero-padded number could differ, which no caller writes
 # EQUIVALENT a911f064e4 07b7b76107: `[ "$#" -ge 5 ] && shift 5 || shift "$#"` with `-ge 6` / `-gt 5`: from 5 arguments up both shift the same 5, below that both shift them all
-# EQUIVALENT 5ed75fcef5 07d526b7ec: `|| true` -> `&& true` after an assignment / a redirected group: not the last element of the AND-OR list, so errexit is exempt either way, and the function ends in `return 0`
+# EQUIVALENT 5ed75fcef5 07d526b7ec f65df70ac1: `|| true` -> `&& true` after an assignment / a redirected group: not the last element of the AND-OR list, so errexit is exempt either way, and the function ends in `return 0`
+# EQUIVALENT f4147687bc: the clamp of the fragment's level to the engine ceiling (resolve cap vs ceiling, `-gt` -> `-ge`) assigns the same number at equality: 288 canonical (pool x agent.toml x fragment) cases, 0 divergences; only a zero-padded agent.toml value (not valid TOML) changes the TEXT of the cap (8 vs 08)
 rc0() { local r=0; "$@" >/dev/null 2>&1 || r=$?; eq "$r" "0" "$* returns 0"; }   # the classifiers, readers and the step are read under set -e: they never fail
 eq "$(pool_ceiling_class_load 3 1)" "grow" "one core is a core: load5 3 on 1 core (3.0/core) -> grow, not unknown"
 rc0 pool_ceiling_class_load 30 10    # ga-59jrj3d (5d8706573d): the load classifier returns 0 on every branch, the "unknown" one (unreadable load, no cores) included
