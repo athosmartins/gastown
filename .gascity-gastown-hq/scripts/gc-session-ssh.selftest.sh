@@ -42,7 +42,9 @@
 #   gacct (ga-w7qwl1.2.4.3) — host de domínio gráfico COM `claude_account` + sessão claude: o agente confere o login pelo LANÇADOR (`sh <lançador> --auth-check`, ramo antes do `rm -f -- "$0"`, que roda `auth status` com
 #   CLAUDE_CODE_OAUTH_TOKEN=<chave da conta do pool> só nessa linha), porque no domínio gráfico o item 'Claude Code-credentials' do Keychain sombreia o arquivo e o `auth status` puro diz loggedIn false (a recusa
 #   DESLOGADO determinística das rodadas 3 e 4 do MBP); a chave NÃO entra no script do agente, no argv, no diag, nos eventos nem no dry-run (varredura de vazamento com controle positivo), o lançador se apaga, o cofre é
-#   lido uma vez; host sem claude_account, sessão que não é claude, perfil de modelo (chave vazia de propósito) e host que não é gráfico seguem exatamente como antes; cofre sem item / fechado recusa antes do ssh.
+#   lido uma vez; host sem claude_account, perfil de modelo (chave vazia de propósito) e host que não é gráfico seguem exatamente como antes; cofre sem item / fechado recusa antes do ssh. (ga-w7qwl1.2.4.4) A sessão que NÃO roda o
+#   claude (a leve `sleep` da prova (g) do MBP) não tem login a conferir: o agente dela não leva conferência, ela não ganha a chave nem abre o cofre, e a dispensa fica dita (`login_check` = lancador / agente / dispensado no
+#   dry-run e no evento 'started'); a recusa do caminho da chave diz que o claude não aceitou a CHAVE, não manda logar no MBP. Os testes de recusa de login do gui/diag usam o CHOLD (um `claude` falso), não mais um `cat`.
 #   prep (ga-2hd02v.1.5.9) — o start grava a identidade git POR worktree e a confiança da pasta em ~/.claude.json do host, e qualquer falha derruba o start sem abrir nada: espelho BARE (sem
 #   extensions.worktreeConfig: o core.bare sai do config compartilhado e o commit do worktree continua funcionando, autor = a sessão), modo 600 e o resto do arquivo preservados, idempotente, uma identidade por
 #   worktree; pasta ausente / comum, ~/.claude.json ausente / ilegível (intacto, byte a byte) / com forma estranha, config.worktree travado, identidade que o git não lê de volta → exit 1 com o motivo, nenhum
@@ -130,7 +132,7 @@ install_host() {  # o guarda e as settings do "servidor" ($RH/.claude), como o b
   mkdir -p "$RH/.claude/hooks"; cp "$src" "$RH/.claude/hooks/$GUARDF"
   jq -n --arg c "python3 -I $RH/.claude/hooks/$GUARDF || exit 2" '{hooks:{PreToolUse:[{matcher:"Bash",hooks:[{type:"command",command:$c}]},{matcher:"Edit|Write|MultiEdit|NotebookEdit",hooks:[{type:"command",command:$c}]}]}}' > "$RH/.claude/settings.json"
 }
-MSET="--settings $RR/city/settings.json"; HOLD="sh -c cat sh $MSET"  # o comando de um host de camada `session` TEM de carregar o settings do bundle (o último --settings); HOLD é o `cat` que mantém a sessão de pé, com ele
+MSET="--settings $RR/city/settings.json"; CHOLD="claude hold /dev/null $MSET"; HOLD="sh -c cat sh $MSET"  # o comando de um host de camada `session` TEM de carregar o settings do bundle (o último --settings); HOLD é o `cat` que mantém a sessão de pé, com ele (ga-w7qwl1.2.4.4: o agente do domínio gráfico só confere o login de quem RODA o claude; CHOLD é o `claude` falso que se mantém de pé, para os testes de recusa/espera do login)
 install_session() {  # a camada da SESSÃO do bundle ($RR/guard + $RR/city/settings.json), como `remote-bundle-build.py build --guard-layer session` a instala; o guarda é o IRMÃO do script em teste. NADA sob $RH/.claude
   local src; src="$(dirname "$P")/$GUARDF"; [ -f "$src" ] || src="$HERE/$GUARDF"
   mkdir -p "$RR/guard" "$RR/city"; cp "$src" "$RR/guard/$GUARDF"
@@ -604,7 +606,7 @@ lcline() { grep -n "$1" "$T/lc.log" | tail -1 | cut -d: -f1; }  # número da ÚL
 gui_refuse() {  # gui_refuse DESCRIÇÃO FRAGMENTO-DO-ERRO [auth.mode [lc.mode [arquivo-de-falha]]] — start recusado: exit 1 com a causa, nada aberto, nada carregado, nada em run/, evento 'refused', Keychain só com a consulta de atributos (login não ok) e nunca outra coisa, claude só 'auth status' no gui
   lcreset; [ -z "${3:-}" ] || echo "$3" > "$T/auth.mode"; [ -z "${4:-}" ] || echo "$4" > "$T/lc.mode"; [ -z "${5:-}" ] || : > "$T/$5"
   mkdir -p "$T/state/m"; : > "$T/state/m/events.jsonl"; fresh
-  pv start w-remote-m-9 < <(req "$HOLD")
+  pv start w-remote-m-9 < <(req "$CHOLD")
   [ $RC = 1 ] && has "$T/err" "$2" && [ "$(count x "${SOCK}m")" = 0 ] && [ "$(nload)" = 0 ] && [ "$(nrun)" = 0 ] && [ ! -e "$T/state/m/running/w-remote-m-9" ] && ! grep -qvxF 'security find-generic-password -s Claude Code-credentials' "$T/security.log" \
     && ! grep -qv '^auth status FAKE_LAUNCHD=1$' "$T/claude.log" && jq -e 'select(.event=="refused" and .session=="w-remote-m-9" and (.reason|startswith("gui_agent:")))' "$T/state/m/events.jsonl" >/dev/null 2>&1
   ok $? "gui: $1 → start recusado (exit 1) com a causa, nada aberto/carregado/em run/, evento 'refused' (rc=$RC $(head -c 140 "$T/err"))"
@@ -667,7 +669,18 @@ g_gui() {
   gui_refuse "plutil reprova o plist" 'plutil -lint' "" "" plutil.fail
   gui_refuse "launchctl bootstrap que falha" 'launchctl bootstrap do agente' "" bootfail
   gui_refuse "tmux do agente que não abre a sessão" 'o tmux do agente não abriu a sessão' "" "" tmux.fail; has "$T/err" boom; ok $? "gui: ...e a causa do tmux vem na mensagem"
-  lcreset; echo out > "$T/auth.mode"; echo stuck > "$T/lc.mode"; : > "$T/state/m/events.jsonl"; pv start w-remote-m-9 < <(req "$HOLD")
+  # --- ga-w7qwl1.2.4.4: o login do claude só importa a sessão que RODA o claude. O $HOLD é um `cat`: com o claude deslogado no domínio gráfico ele abre (as sessões leves da prova (g) do MBP; rodadas 3 e 4 de 30/10, onde o agente as recusava 'DESLOGADO') ---
+  lcreset; echo out > "$T/auth.mode"; : > "$T/state/m/events.jsonl"; fresh
+  pv start w-remote-m-7 < <(req "$HOLD")
+  [ $RC = 0 ] && [ "$(count x "${SOCK}m")" = 1 ] && [ -e "$T/lc/loaded/${L}w-remote-m-7" ] && [ "$(cat "$RR/run/${L}w-remote-m-7.agent.res" 2>/dev/null)" = ok ] && [ ! -s "$T/claude.log" ] && [ ! -e "$RR/run/${L}w-remote-m-7.agent.diag" ]; ok $? "gui: sessão que NÃO roda o claude (um cat) abre mesmo com o claude deslogado no domínio gráfico: a conferência é dispensada, o claude nem é consultado e nenhum diag é gravado (rc=$RC $(head -c 160 "$T/err"))"
+  jq -e 'select(.event=="started" and .session=="w-remote-m-7" and .login_check=="dispensado")' "$T/state/m/events.jsonl" >/dev/null 2>&1; ok $? "gui: ...e o evento 'started' DIZ que o login foi dispensado (login_check=dispensado): a dispensa fica visível, não calada"
+  pv stop w-remote-m-7 </dev/null; [ $RC = 0 ] && [ "$(nload)" = 0 ] && [ "$(nrun)" = 0 ]; ok $? "gui: ...e o stop dela recolhe o agente e os arquivos (rc=$RC)"
+  pv start w-remote-m-7 < <(req "$CHOLD"); [ $RC = 1 ] && has "$T/err" 'DESLOGADO' && [ "$(nload)" = 0 ]; ok $? "gui: ...mas a sessão que RODA o claude, com o claude deslogado, segue recusada: a dispensa é só para quem não o roda (rc=$RC $(head -c 120 "$T/err"))"
+  echo in > "$T/auth.mode"; lcreset
+  pv --dry-run start w-remote-m-7 < <(req "$HOLD"); a=$(jq -r .gui_agent.login_check "$T/out"); jq -r '.gui_agent.script[]' "$T/out" > "$T/agent.out"
+  pv --dry-run start w-remote-m-7 < <(req "$CHOLD"); b=$(jq -r .gui_agent.login_check "$T/out")
+  [ "$a" = dispensado ] && [ "$b" = agente ] && ! grep -qF '"$cl" auth status' "$T/agent.out" && ! grep -q '^o=\$(' "$T/agent.out" && grep -q 'new-session' "$T/agent.out"; ok $? "gui: dry-run: login_check=dispensado (cat) e =agente (claude); o script do agente da dispensada não tem 'auth status' a executar mas ainda abre a sessão (a=$a b=$b)"
+  lcreset; echo out > "$T/auth.mode"; echo stuck > "$T/lc.mode"; : > "$T/state/m/events.jsonl"; pv start w-remote-m-9 < <(req "$CHOLD")
   [ $RC = 1 ] && has "$T/err" 'DESLOGADO' && has "$T/err" 'a ausência NÃO foi provada' && [ -e "$T/lc/loaded/${L}w-remote-m-9" ]; ok $? "gui: recusa cujo agente não se conseguiu remover diz as DUAS coisas (a causa e que o agente ficou) — nunca 'limpo' calado (rc=$RC)"
   # --- 4: o start varre os agentes órfãos do prefixo ANTES de criar o novo (o w-remote-m-9 acima já é uma: só no domínio, sem arquivos) ---
   rm -f "$T/lc.mode"; echo in > "$T/auth.mode"
@@ -705,7 +718,7 @@ g_gui() {
   # --- o start são DUAS chamadas ssh (ga-0k82lw): o que a 1.8 põe dentro delas tem que caber nas regras desse desenho ---
   # a 2ª chamada carrega o agente e espera o veredito do login (até gui_wait_s): com o prazo do start já gasto, o piso dela tem que cobrir essa espera, senão o ssh é cortado com o agente ainda subindo
   lcreset; echo slow > "$T/auth.mode"; cfgm '{"gui_proof_s":2,"start_timeout":3}'; fresh
-  pv start w-remote-m-8 < <(req "$HOLD"); [ $RC = 0 ] && [ "$(count x "${SOCK}m")" = 1 ] && [ -e "$T/lc/loaded/${L}w-remote-m-8" ]; ok $? "gui: 'auth status' de 7 s com start_timeout 3 → a 2ª chamada tem o piso do veredito (OPEN_MIN + gui_wait_s) e o start abre (rc=$RC $(head -c 140 "$T/err"))"
+  pv start w-remote-m-8 < <(req "$CHOLD"); [ $RC = 0 ] && [ "$(count x "${SOCK}m")" = 1 ] && [ -e "$T/lc/loaded/${L}w-remote-m-8" ]; ok $? "gui: 'auth status' de 7 s com start_timeout 3 → a 2ª chamada tem o piso do veredito (OPEN_MIN + gui_wait_s) e o start abre (rc=$RC $(head -c 140 "$T/err"))"
   pv stop w-remote-m-8 </dev/null; echo in > "$T/auth.mode"; cfgm '{"gui_proof_s":2}'
   # o stop chega na parte lenta do start: a 2ª chamada desiste ANTES de carregar o agente (a 1ª só LEU o launchd, na varredura) — e é o rc 14 ('abandonado'), não o 15 da recusa do domínio gráfico (um evento 'refused' de gui_agent para um start que o mini abandonou seria mentira)
   lcreset; : > "$T/state/m/events.jsonl"; fresh; rm -f "$T/slow.mark"
@@ -799,7 +812,7 @@ g_diag() {
   leak() { ! grep -rqsE 'sk-ant|PLANTEDSECRET|LEAKEDTOKEN|leak@example|LeakOrg' "$T/err" "$T/state" "$RR" "$T/claude.log" "$T/security.log" "$T/lc.log" "$T/ssh.log"; }
   dstart() {  # dstart AUTH.MODE [security.rc [security.sleep [CLAUDE_CONFIG_DIR]]] → start recusado; o diag que a recusa imprimiu está em $T/err
     lcreset; echo "$1" > "$T/auth.mode"; [ -z "${2:-}" ] || echo "$2" > "$T/security.rc"; [ -z "${3:-}" ] || echo "$3" > "$T/security.sleep"; [ -z "${4:-}" ] || printf '%s' "$4" > "$T/lc.cfgdir"
-    mkdir -p "$T/state/m"; : > "$T/state/m/events.jsonl"; fresh; pv start w-remote-m-9 < <(req "$HOLD")
+    mkdir -p "$T/state/m"; : > "$T/state/m/events.jsonl"; fresh; pv start w-remote-m-9 < <(req "$CHOLD")
   }
   # --- o diag completo, com e-mail, organização e token na saída do claude e no arquivo de credencial: nada disso sai; o veredito só vem DEPOIS do diag (o cofre demora 1 s) ---
   dstart outpii 44 1
@@ -1228,16 +1241,22 @@ EOF
   [ "$(grep -c -- '--auth-check' "$T/launch.out")" = 1 ] && [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]; ok $? "gacct: o lançador atende --auth-check ANTES do 'rm -f -- \"\$0\"' (a conferência não pode apagar o lançador que a sessão ainda vai rodar) (linha ${a:-nunca} < ${b:-nunca})"
   sed -n "${a:-1}p" "$T/launch.out" | grep -qE "^if \[ \"\\\$1\" = --auth-check \]; then CLAUDE_CODE_OAUTH_TOKEN='<chave da conta atual do pool: não lida no dry-run>' $T/claude auth status; exit \\\$\?; fi\$"; ok $? "gacct: ...com a chave como PREFIXO do comando (nunca argv nem export) e o único comando é '<claude> auth status'"
   nossh && [ ! -s "$sl" ]; ok $? "gacct: o dry-run não conecta nem abre o cofre"
+  [ "$(jq -r .gui_agent.login_check "$T/out")" = lancador ]; ok $? "gacct: dry-run: login_check=lancador (a conferência do agente passa pelo lançador)"
   # --- sem claude_account: tudo como antes (o agente roda o claude, o lançador não tem --auth-check) ---
   cfgm; pv --dry-run start $N-0 < <(req "claude --x $MSET"); jq -r '.gui_agent.script[]' "$T/out" > "$T/agent.out"; jq -r '.launcher[]' "$T/out" > "$T/launch.out"
   grep -qF '$("$cl" auth status ' "$T/agent.out" && ! grep -q -- '--auth-check' "$T/agent.out" "$T/launch.out"; ok $? "gacct: host gráfico SEM claude_account = como antes: o agente roda o claude, e nada de --auth-check no agente nem no lançador"
   cfgm "$extra"; pv --dry-run start $N-0 < <(req "sh -c cat sh $MSET"); jq -r '.gui_agent.script[]' "$T/out" > "$T/agent.out"; jq -r '.launcher[]' "$T/out" > "$T/launch.out"
-  grep -qF '$("$cl" auth status ' "$T/agent.out" && ! grep -q -- '--auth-check' "$T/agent.out" "$T/launch.out" && [ "$(jq -r .claude_account "$T/out")" = null ]; ok $? "gacct: sessão que NÃO é claude num host com claude_account não ganha chave, então o agente confere como antes (sem --auth-check)"
+  [ "$(jq -r .gui_agent.login_check "$T/out")" = dispensado ] && ! grep -qF '"$cl" auth status' "$T/agent.out" && ! grep -q -- '--auth-check' "$T/agent.out" "$T/launch.out" && [ "$(jq -r .claude_account "$T/out")" = null ]; ok $? "gacct: sessão que NÃO é claude num host com claude_account não ganha chave NEM conferência de login: login_check=dispensado, o agente não roda o claude e não há --auth-check"
   cfgm "$(jq -n --argjson e "$extra" '$e + {model_profiles:{"kimi-worker":{base_url:"https://openrouter.ai/api",secret:"openrouter-api-key",key_prefix:"sk-or-",model:"moonshotai/kimi-k3.1-pro",small_model:"moonshotai/kimi-k2.7-code"}}}')"
   pv --dry-run start kimi-worker-remote-m-1 < <(req "claude --x $MSET"); jq -r '.gui_agent.script[]' "$T/out" > "$T/agent.out"; jq -r '.launcher[]' "$T/out" > "$T/launch.out"
-  grep -qF "CLAUDE_CODE_OAUTH_TOKEN='' " "$T/launch.out" && ! grep -q -- '--auth-check' "$T/agent.out" "$T/launch.out"; ok $? "gacct: sessão de perfil de modelo (OAuth VAZIO de propósito) não ganha --auth-check: conferir 'login' com a env vazia seria conferir o que ela não usa"
+  grep -qF "CLAUDE_CODE_OAUTH_TOKEN='' " "$T/launch.out" && ! grep -q -- '--auth-check' "$T/agent.out" "$T/launch.out" && [ "$(jq -r .gui_agent.login_check "$T/out")" = agente ]; ok $? "gacct: sessão de perfil de modelo (OAuth VAZIO de propósito) não ganha --auth-check: conferir 'login' com a env vazia seria conferir o que ela não usa"
   cfgm "$(jq -n --argjson e "$extra" '$e + {gui_agent:false,sleeps:false}')"; pv --dry-run start $N-0 < <(req "claude --x"); jq -r '.launcher[]' "$T/out" > "$T/launch.out"
   [ $RC = 0 ] && [ "$(jq -r .gui_agent "$T/out")" = null ] && grep -q "^CLAUDE_CODE_OAUTH_TOKEN='<chave" "$T/launch.out" && ! grep -q -- '--auth-check' "$T/launch.out"; ok $? "gacct: host SEM gui_agent (o servidor) com claude_account e session_env: a chave segue no comando final e o lançador NÃO ganha --auth-check (só o agente gráfico o usa) (rc=$RC)"
+  # --- ga-w7qwl1.2.4.4: o start de verdade num host SEM gui_agent não tem agente nem conferência: o evento 'started' não leva login_check (dizer 'dispensado' ali seria informação falsa) ---
+  cfgm "$(jq -n --argjson e "$extra" '$e + {gui_agent:false,sleeps:false}')"; mkdir -p "$T/state/m"; : > "$T/state/m/events.jsonl"; fresh
+  pv start $N-5 < <(req "$HOLD"); r1=$RC
+  [ $r1 = 0 ] && jq -e 'select(.event=="started" and .session=="'$N-5'")' "$T/state/m/events.jsonl" >/dev/null 2>&1 && ! jq -e 'select(.event=="started" and has("login_check"))' "$T/state/m/events.jsonl" >/dev/null 2>&1; ok $? "gacct: host SEM gui_agent: o start abre e o evento 'started' NÃO leva login_check (não há conferência de login a dispensar) (rc=$r1 $(head -c 160 "$T/err"))"
+  pv stop $N-5 </dev/null; [ $RC = 0 ] && [ "$(count x "${SOCK}m")" = 0 ]; ok $? "gacct: ...e o stop dela fecha a sessão (rc=$RC)"
   cfgm "$extra"
   # --- start de verdade: o login é conferido COM a chave, no domínio gráfico, e a sessão nasce com a mesma chave ---
   lcreset; echo tok > "$T/auth.mode"; : > "$sl"; fresh; rm -f "$T/gm1.out"
@@ -1250,12 +1269,19 @@ EOF
   [ ! -e "$RR/run/$N-1.sh" ] && [ ! -e "$RR/run/${L}$N-1.agent.diag" ]; ok $? "gacct: o lançador (que tem a chave) se apagou ao abrir a sessão e nenhum diag foi gravado"
   ! gleaks "$KA"; ok $? "gacct: a chave não aparece no argv do ssh, na saída, no estado do mini, em <raiz>/run, no ps, no scrollback, no ambiente do tmux nem no plist/agente"
   printf '%s' "$KA" > "$RR/run/controle"; gleaks "$KA"; r1=$?; rm -f "$RR/run/controle"; ok $r1 "gacct: (controle positivo) a varredura acusa a chave quando ela está de fato em <raiz>/run"
+  jq -e 'select(.event=="started" and .session=="'$N-1'" and .login_check=="lancador")' "$T/state/m/events.jsonl" >/dev/null 2>&1; ok $? "gacct: o evento 'started' da sessão claude diz login_check=lancador"
   pv stop $N-1 </dev/null; [ $RC = 0 ] && [ "$(nload)" = 0 ] && [ "$(nrun)" = 0 ]; ok $? "gacct: o stop recolhe o agente e os arquivos (rc=$RC)"
+  # --- ga-w7qwl1.2.4.4: sessão que NÃO roda o claude (a leve da prova (g)) num host com claude_account: abre SEM chave, SEM conferir o login (o modo tok dá false sem a chave: antes era 'DESLOGADO') e sem abrir o cofre ---
+  lcreset; echo tok > "$T/auth.mode"; : > "$sl"; fresh; : > "$T/state/m/events.jsonl"
+  pv start $N-4 < <(req "$HOLD"); r1=$RC
+  [ $r1 = 0 ] && [ "$(nload)" = 1 ] && [ ! -s "$sl" ] && [ ! -s "$T/claude.tokenv" ] && [ ! -s "$T/claude.log" ] && [ "$(cat "$RR/run/${L}$N-4.agent.res" 2>/dev/null)" = ok ] && jq -e 'select(.event=="started" and .session=="'$N-4'" and .login_check=="dispensado")' "$T/state/m/events.jsonl" >/dev/null 2>&1 && ! gleaks "$KA"
+  ok $? "gacct: sessão leve (cat) com claude_account e o login do gráfico SÓ válido com a chave: abre (a prova (g) do MBP), sem ler o cofre, sem rodar o claude, sem chave em lugar nenhum e com a dispensa dita no evento (rc=$r1 $(head -c 160 "$T/err"))"
+  pv stop $N-4 </dev/null; [ $RC = 0 ] && [ "$(nload)" = 0 ] && [ "$(nrun)" = 0 ]; ok $? "gacct: ...e o stop dela recolhe o agente e os arquivos (rc=$RC)"
   # --- a chave não vale login: o veredito 'deslogado' ainda recusa, e o lançador com a chave não fica no host ---
   for s in out garbage truerc; do  # truerc: loggedIn true com rc 1 — o rc do claude tem que chegar ao agente pelo lançador (exit $?), senão o 'sinal em que não se confia' passaria
     lcreset; echo "$s" > "$T/auth.mode"; : > "$sl"; fresh; : > "$T/state/m/events.jsonl"
     pv start $N-2 < <(req "claude hold $T/gm2.out $MSET"); r1=$RC
-    [ $r1 = 1 ] && { has "$T/err" DESLOGADO || has "$T/err" 'não consegui ler o login'; } && [ "$(count x "${SOCK}m")" = 0 ] && [ "$(nload)" = 0 ] && [ "$(nrun)" = 0 ] && [ ! -e "$RR/run/$N-2.sh" ] && [ ! -e "$T/gm2.out" ] && evt refused $N-2 && ! gleaks "$KA"
+    [ $r1 = 1 ] && { has "$T/err" 'não aceitou a chave da conta do pool' || has "$T/err" 'não consegui ler o login'; } && ! has "$T/err" 'faça o login' && ! has "$T/err" DESLOGADO && [ "$(count x "${SOCK}m")" = 0 ] && [ "$(nload)" = 0 ] && [ "$(nrun)" = 0 ] && [ ! -e "$RR/run/$N-2.sh" ] && [ ! -e "$T/gm2.out" ] && evt refused $N-2 && ! gleaks "$KA"
     ok $? "gacct: 'auth status' $s com a chave na env → o start RECUSA (exit 1), nada aberto/carregado, o lançador com a chave não sobra em run/ e a chave não vaza nem pela mensagem nem pelo diag (rc=$r1 $(head -c 120 "$T/err"))"
   done
   # --- sem chave no cofre, o start nem chega ao agente ---
@@ -1794,13 +1820,22 @@ case "$shn" in [1-9]*) ;; *) shard_bad;; esac
   mutant gacct "a conferência nunca passa pelo lançador (volta o 'DESLOGADO' do MBP)" 's/^    return bool(cfg.gui and (secrets or {}).get(OAUTH_ENV))$/    return False/'
   mutant gacct "a conferência passa pelo lançador em qualquer host com chave (o servidor também)" 's/^    return bool(cfg.gui and (secrets or {}).get(OAUTH_ENV))$/    return bool((secrets or {}).get(OAUTH_ENV))/'
   mutant gacct "chave VAZIA (perfil de modelo) também ganha a conferência pelo lançador" 's/^    return bool(cfg.gui and (secrets or {}).get(OAUTH_ENV))$/    return bool(cfg.gui and OAUTH_ENV in (secrets or {}))/'
-  mutant gacct "o agente de host gráfico sempre confere pelo lançador (até sem chave)" 's/ --auth-check" if chk else /--auth-check" if True else /'
-  mutant gacct "o agente chama o lançador sem o --auth-check (apagaria o lançador e abriria uma sessão)" 's/ --auth-check" if chk else / " if chk else /'
+  mutant gacct "o agente de host gráfico sempre confere pelo lançador (até sem chave)" 's/ --auth-check" if login == "lancador" else / --auth-check" if True else /'
+  mutant gacct "o agente chama o lançador sem o --auth-check (apagaria o lançador e abriria uma sessão)" 's/ --auth-check" if login == "lancador" else / " if login == "lancador" else /'
   mutant gacct "o lançador atende --auth-check DEPOIS de se apagar" 's/^    out = \["#!\/bin\/sh"\]$/    out = ["#!\/bin\/sh", "rm -f -- $0"]/;s/^    out += \[.rm -f -- "\$0".,/    out += [/'
   mutant gacct "a chave vai como export (fica no ambiente do shell do lançador)" 's/then {OAUTH_ENV}={q(secrets\[OAUTH_ENV\])} {q(cfg.claude_bin)} auth status; exit/then export {OAUTH_ENV}={q(secrets[OAUTH_ENV])}; {q(cfg.claude_bin)} auth status; exit/'
   mutant gacct "o lançador confere com o claude do PATH, não o da session_env" 's/{q(secrets\[OAUTH_ENV\])} {q(cfg.claude_bin)} auth status; exit/{q(secrets[OAUTH_ENV])} claude auth status; exit/'
   mutant gacct "o lançador perde o rc do claude (exit 0)" 's/auth status; exit \$?; fi/auth status; exit 0; fi/'
   mutant gacct "o lançador confere sem a chave (a env nem existe)" 's/then {OAUTH_ENV}={q(secrets\[OAUTH_ENV\])} {q(cfg.claude_bin)} auth status/then {q(cfg.claude_bin)} auth status/'
+  # ga-w7qwl1.2.4.4: o login do claude só importa a sessão que RODA o claude (as leves da prova (g) do MBP não o rodam)
+  mutant gui,gacct "a sessão que não roda o claude também é conferida (volta o 'DESLOGADO' da leve, medido 30/10)" 's/return "agente" if runs_claude(p\["command"\]) else "dispensado"/return "agente"/'
+  mutant gui,gacct "TODA sessão sem chave é dispensada (a sessão claude deslogada abriria)" 's/return "agente" if runs_claude(p\["command"\]) else "dispensado"/return "dispensado"/'
+  mutant gui,gacct "o agente da sessão dispensada leva a conferência do mesmo jeito" 's/chk = "" if login == "dispensado" else subst/chk = "" if False else subst/'
+  mutant gui,gacct "o dry-run não diz o modo do login" 's/login_check=lmode, script=/script=/'
+  mutant gui,gacct "o evento 'started' não diz o modo do login (a dispensa ficaria calada)" 's/cfg.event("started", name, \*\*({"login_check": lmode} if cfg.gui else {}))/cfg.event("started", name)/'
+  mutant gui,gacct "o evento 'started' do host sem gui_agent também carrega login_check" 's/\*\*({"login_check": lmode} if cfg.gui else {}))/**({"login_check": lmode} if True else {}))/'
+  mutant gui,gacct "a recusa do caminho da chave manda logar no MBP (remédio errado)" 's/GM_DESLOGADO\["lancador" if lmode == "lancador" else "agente"\]/GM_DESLOGADO["agente"]/'
+  mutant gui,gacct "a recusa sem chave diz que o claude não aceitou a chave" 's/GM_DESLOGADO\["lancador" if lmode == "lancador" else "agente"\]/GM_DESLOGADO["lancador"]/'
   [ -n "${GCSSH_MUTANTS_ONLY:-}" ] || [ "${GCSSH_SHARD%/*}" != 0 ] || {
   echo "-- contra um stub que só sai 0 (a versão 'anterior' não tinha provider nenhum)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"

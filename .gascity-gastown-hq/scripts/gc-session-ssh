@@ -294,6 +294,9 @@ agent_down() {
   [ ! -e @RUN@/"$1".plist ] || { echo "agente $1: o plist continua em @RUN@" >&2; return 1; }
 }
 """
+# O que a recusa 'deslogado' diz, por modo de login (ga-w7qwl1.2.4.4): com a chave do pool na env o remédio NÃO é logar no MBP (o claude não aceitou a chave: binário antigo, chave inválida); sem ela é o login do Keychain (sem aspas, $ nem crase: entra num "..." do sh).
+GM_DESLOGADO = {"agente": "o claude está DESLOGADO no domínio gráfico do host (claude auth status → loggedIn false): faça o login na sessão gráfica do MBP",
+                "lancador": "o claude do domínio gráfico não aceitou a chave da conta do pool na env (claude auth status → loggedIn false): o login do MBP não é o remédio, confira a chave no cofre e a versão do claude"}
 # Varredura do start: label do prefixo (arquivo em run/ OU carregado no domínio) cuja sessão não está na lista do tmux ($s) é órfão e sai; sessão viva fica. Nome fora de [A-Za-z0-9_-] nunca é nosso.
 GUI_SWEEP = r"""agent_sweep() {
   gd=$(launchctl print "gui/$U" 2>/dev/null) || { echo "host @HOST@: não há sessão gráfica (gui/$U) ou o launchctl não respondeu: sem ela o claude não alcança o Keychain e a sessão abriria deslogada (o Athos precisa estar logado no MBP)" >&2; return 1; }
@@ -314,7 +317,7 @@ gi=0; while [ ! -s @RES@ ] && [ "$gi" -lt @WAIT@ ]; do sleep 1; gi=$((gi+1)); do
 gv=$(cat @RES@ 2>/dev/null)
 case "$gv" in
   ok) gm=;;
-  deslogado) gm="o claude está DESLOGADO no domínio gráfico do host (claude auth status → loggedIn false): faça o login na sessão gráfica do MBP";;
+  deslogado) gm="@GMDESLOG@";;
   ilegivel*) gm="não consegui ler o login do claude no domínio gráfico (${gv#ilegivel })";;
   tmux:*) gm="o tmux do agente não abriu a sessão (${gv#tmux: })";;
   "") gm="o agente não respondeu em @WAIT@s";;
@@ -368,14 +371,17 @@ diag() {
     echo "claude=$(clean "$cl") real=$(clean "${rp:-nao-resolvido}")"
   } >@DIAG@.tmp && mv -f @DIAG@.tmp @DIAG@
 }
-o=$(@AUTHCHK@ 2>&1 </dev/null); rc=$?
+@LOGINCHK@
+e=$(tmux -L @SOCK@ new-session -d -s @NAME@ -c @WORKDIR@ "sh @LAUNCH@" 2>&1) || { say "tmux: $(printf '%s' "$e" | head -n 1 | cut -c1-160)"; exit 0; }
+say ok
+while tmux -L @SOCK@ has-session -t @TGT@ 2>/dev/null; do sleep 2; done
+"""
+# A conferência do login (ga-w7qwl1.2.4.4: o agente só a leva quando a sessão RODA o claude; a que não roda — as leves da prova (g) — não tem login a conferir). Entra no GUI_AGENT no lugar de @LOGINCHK@.
+GUI_LOGIN = r"""o=$(@AUTHCHK@ 2>&1 </dev/null); rc=$?
 lt=$(printf '%s\n' "$o" | grep -cE '"loggedIn"[[:space:]]*:[[:space:]]*true'); lf=$(printf '%s\n' "$o" | grep -cE '"loggedIn"[[:space:]]*:[[:space:]]*false')
 if [ "$rc" -ne 0 ] || [ "$lt" -eq 0 ] || [ "$lf" -ge 1 ]; then diag || :; fi
 if [ "$lf" -ge 1 ] && [ "$lt" -eq 0 ]; then say deslogado; exit 0; fi
 if [ "$rc" -ne 0 ] || [ "$lt" -eq 0 ] || [ "$lf" -ge 1 ]; then say "ilegivel rc=$rc"; exit 0; fi
-e=$(tmux -L @SOCK@ new-session -d -s @NAME@ -c @WORKDIR@ "sh @LAUNCH@" 2>&1) || { say "tmux: $(printf '%s' "$e" | head -n 1 | cut -c1-160)"; exit 0; }
-say ok
-while tmux -L @SOCK@ has-session -t @TGT@ 2>/dev/null; do sleep 2; done
 """
 GUI_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -708,9 +714,11 @@ def gui_vals(cfg: Cfg) -> dict:
     return {"@RUN@": q(cfg.root + "/run"), "@PFX@": q(AGENT_PFX), "@PFXRE@": AGENT_PFX.replace(".", "\\."), "@TRIES@": str(cfg.gui_proof), "@HOST@": q(cfg.host)}
 
 
-def gui_agent_sh(cfg: Cfg, name: str, p: dict, lpath: str, chk: bool = False) -> str:
-    """`chk` = a conferência do login passa pelo lançador (auth_check): o agente roda `sh <lançador> --auth-check`, que põe a chave da conta do pool na env só do `claude auth status`."""
-    return subst(GUI_AGENT, {"@AUTHCHK@": f"sh {q(lpath)} --auth-check" if chk else '"$cl" auth status', "@PATHX@": "".join(d + ":" for d in cfg.path_extra), "@RES@": q(gui_files(cfg, name)["res"]), "@DIAG@": q(gui_files(cfg, name)["diag"]), "@CLAUDE@": q(cfg.claude_bin),
+def gui_agent_sh(cfg: Cfg, name: str, p: dict, lpath: str, login: str = "agente") -> str:
+    """`login` (login_mode): 'lancador' = a conferência passa pelo lançador (o agente roda `sh <lançador> --auth-check`, que põe a chave da conta do pool na env só do `claude auth status`); 'agente' = o agente roda o claude solto;
+    'dispensado' = o agente não leva conferência nenhuma (a sessão não roda o claude)."""
+    chk = "" if login == "dispensado" else subst(GUI_LOGIN, {"@AUTHCHK@": f"sh {q(lpath)} --auth-check" if login == "lancador" else '"$cl" auth status'})
+    return subst(GUI_AGENT, {"@LOGINCHK@": chk.rstrip("\n"), "@PATHX@": "".join(d + ":" for d in cfg.path_extra), "@RES@": q(gui_files(cfg, name)["res"]), "@DIAG@": q(gui_files(cfg, name)["diag"]), "@CLAUDE@": q(cfg.claude_bin),
                              "@SOCK@": q(cfg.socket), "@NAME@": q(name), "@WORKDIR@": q(p["work_dir"]), "@LAUNCH@": q(lpath), "@TGT@": tgt(name)})
 
 
@@ -769,6 +777,15 @@ done'''
 def auth_check(cfg: Cfg, secrets: dict | None) -> bool:
     """A conferência do login do agente do domínio gráfico passa pelo lançador? Só num host com gui_agent (a config já exige o claude da session_env nele) e uma sessão que leva a chave da conta do pool. Chave VAZIA não conta: o perfil de modelo manda o OAuth vazio de propósito (a sessão não usa a conta)."""
     return bool(cfg.gui and (secrets or {}).get(OAUTH_ENV))
+
+
+def login_mode(cfg: Cfg, p: dict, secrets: dict | None) -> str:
+    """Como o agente do domínio gráfico trata o login do claude desta sessão (ga-w7qwl1.2.4.4), só num host com gui_agent: 'lancador' = confere com a chave da conta do pool (auth_check); 'agente' = confere o claude solto (sessão claude sem
+    chave: host sem claude_account, ou perfil de modelo); 'dispensado' = a sessão não roda o claude, então o login dele não lhe diz respeito (as 2 sessões leves da prova (g) do MBP, `sleep`: medido 30/10, o agente as recusava 'DESLOGADO'
+    porque no domínio gráfico o `auth status` solto dá loggedIn false). A dispensada NÃO ganha a chave (menos processos com ela = menos exposição, a razão de runs_claude) e a dispensa é dita no dry-run e no evento 'started'."""
+    if auth_check(cfg, secrets):
+        return "lancador"
+    return "agente" if runs_claude(p["command"]) else "dispensado"
 
 
 def launcher(cfg: Cfg, name: str, p: dict, secrets: dict | None = None) -> str:
@@ -1056,6 +1073,7 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
                 raise
     run_dir, exitf = f"{cfg.root}/run", f"{cfg.root}/run/{name}.exit"
     lpath = f"{run_dir}/{name}.sh"
+    lmode = login_mode(cfg, p, secrets)  # só vale num host com gui_agent
     if dry:
         wtd = {"worktree": {"rig": wt["rig"], "path": wt["path"], "add": f"{wt['bin']} wt-add {wt['rig']} {name}", "rm": f"{wt['bin']} wt-rm {wt['rig']} {name}", "start_timeout": start_timeout}} if wt else {}
         print(json.dumps(dict(p, **wtd, host=cfg.host, session=name, session_kind="teste" if TEST_RE.fullmatch(name) else "real", would_refuse=would_refuse, claude_account=acct_view, model_profile=prof_view, launcher=launcher(cfg, name, p, secrets).split("\n"),
@@ -1064,7 +1082,7 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
                               **({"guard": {"layer": "session", "file": f"{cfg.root}/guard/{GUARD}", "settings": f"{cfg.root}/city/settings.json"}} if cfg.guard_layer == "session" else {}),
                               session_env={"path": cfg.spath, "claude": cfg.claude_bin, "zdot": cfg.zdot} if cfg.spath else None,
                               gui_agent=(dict(gui_files(cfg, name), bootstrap=["launchctl", "bootstrap", "gui/<uid>", gui_files(cfg, name)["plist"]], wait_s=cfg.gui_wait,
-                                              script=gui_agent_sh(cfg, name, p, lpath, auth_check(cfg, secrets)).split("\n"), plist_xml=gui_plist(cfg, name).split("\n")) if cfg.gui else None),
+                                              login_check=lmode, script=gui_agent_sh(cfg, name, p, lpath, lmode).split("\n"), plist_xml=gui_plist(cfg, name).split("\n")) if cfg.gui else None),
                               tmux=["tmux", "-L", cfg.socket, "new-session", "-d", "-s", name, "-c", p["work_dir"], f"sh {lpath}"],
                               ssh=ssh_argv(cfg)), indent=2, sort_keys=True))
         return 0
@@ -1088,7 +1106,7 @@ rm -f @EXITF@; printf %s @B64@ | base64 -d >@LAUNCH@ || exit 1"""
 sleep 1
 T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após abrir: $(cat @EXITF@ 2>/dev/null)" >&2; rm -f @LAUNCH@;@ADOWN@ exit 1; }"""
     gv = {**gui_vals(cfg), "@NAME@": q(name), "@LAUNCH@": q(lpath), **{f"@{k.upper()}@": q(v) for k, v in gui_files(cfg, name).items()}}
-    gv.update({"@AGSH@": gv.pop("@SH@"), "@AGB64@": q(base64.b64encode(gui_agent_sh(cfg, name, p, lpath, auth_check(cfg, secrets)).encode()).decode()),
+    gv.update({"@AGSH@": gv.pop("@SH@"), "@AGB64@": q(base64.b64encode(gui_agent_sh(cfg, name, p, lpath, lmode).encode()).decode()), "@GMDESLOG@": GM_DESLOGADO["lancador" if lmode == "lancador" else "agente"],
                "@PLB64@": q(base64.b64encode(gui_plist(cfg, name).encode()).decode()), "@WAIT@": str(cfg.gui_wait)})
     # 1ª chamada (preparo): as funções do agente + a varredura de órfãos (precisa do `$s`, a lista de sessões, e recusa cedo, antes da parte lenta, se não há sessão gráfica).
     # 2ª chamada (abertura): as funções de novo (cada ssh é um script) + o agente no lugar do `new-session`; a recusa do agente chega aqui e desfaz o lançador, o agente e o worktree (trap).
@@ -1133,7 +1151,7 @@ T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após
         raise Fail(err or f"start de {name} recusado em {cfg.host} (rc={rc}, sem mensagem)")
     if rc != 0:
         raise Fail(f"start em {cfg.host} falhou (rc={rc}): {err or out or 'sem mensagem'}")
-    cfg.event("started", name)
+    cfg.event("started", name, **({"login_check": lmode} if cfg.gui else {}))  # a dispensa do login fica dita, não calada
     if cfg.shim:
         shim_pump(cfg)
     cfg.log(f"start {name} ok" + (f" worktree={out.strip()[:200]}" if wt and out.strip() else "") + (f" ignored={','.join(p['ignored'])}" if p["ignored"] else "") +
