@@ -8,9 +8,12 @@
 #   alimentava o script com ids sem " - " escritos à mão. Este arquivo roda o pytest de verdade, num projeto minúsculo que tem os formatos que importam, e passa a saída REAL ao script real.
 # CASOS: (1) plugin: a lista GTN-FAIL tem os 7 ids distintos (irmãos de parametrize com " - ", id com acento escapado pelo pytest, erro de coleta, erro de setup, falha + erro de teardown no
 #   mesmo teste), n=7 e reports=8 = o "5 failed ... 3 errors" do resumo, com xdist (-n 2) e sem (-n 0); sem falhas → n=0 reports=0 · (2) o script, 3 noites com a saída real: a 1ª grava os 7
-#   ids inteiros; a 2ª (um irmão corrigido) diz 0 novas e 1 corrigida; a 3ª (o irmão volta a falhar, o outro continua falhando) lista SÓ o irmão como NOVO.
+#   ids inteiros; a 2ª (um irmão corrigido) diz 0 novas e 1 corrigida; a 3ª (o irmão volta a falhar, o outro continua falhando) lista SÓ o irmão como NOVO · (1b) o relógio no id
+#   (ga-2hd02v.5.7): cada worker do xdist ganha um segundo (e uma fração) DIFERENTE, então um id com relógio que o plugin não normaliza derruba a coleta com "Different tests were collected"
+#   (o que parou a suíte inteira do WA em 02/11); os 5 formatos (`T` e espaço, com e sem fração, e fração com vírgula) têm de passar com o id `test_clock[<TS>]`.
 # CONTROLES NEGATIVOS: o mesmo cenário de 3 noites contra o script com o corte antigo (id lido da linha humana, cortado no 1º " - ", sem conferir `n`) TEM de ser reprovado; e o plugin sem
-#   os erros (só "failed") TEM de ser reprovado pela conferência contra o resumo.
+#   os erros (só "failed") TEM de ser reprovado pela conferência contra o resumo; (1b) o plugin sem o espaço TEM de ser reprovado no formato com espaço, e o plugin sem a fração no formato com
+#   fração; o mutante neutro (só um comentário) TEM de passar, senão "reprovado" não prova nada.
 # REQUISITO: um python com pytest e pytest-xdist (GTN_PYTHON; padrão o venv do WA). Sem ele: sai 3 ("NÃO RODOU"), nunca 0: um teste que não rodou não é um teste que passou.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -118,6 +121,56 @@ ck "controle: o mutante do plugin (sem os erros) difere do original" test -n "$(
 runpy "$T/plug-mut" "$T/out-pm" -n 2
 F=$(sumnum "$T/out-pm" failed); E=$(sumnum "$T/out-pm" 'errors?')
 ck "controle: o plugin sem os erros NÃO fecha com o resumo (é o que o script reprova)" hasnt "$T/out-pm" "^GTN-FAILED: n=7 reports=$((F + E))\$"
+
+# ---- (1b) o relógio no id (ga-2hd02v.5.7): o worker gw0 vê :10, o gw1 vê :11 (e a fração acompanha), então o id só fecha entre os workers se o plugin o normalizar
+clockproj() { # <nome> <relógio com %(s)02d (segundos) e %(f)06d (fração)> — projeto de 1 teste cujo id é o relógio DESTE worker
+  local d="$T/clock-$1"; mkdir -p "$d/tests"
+  cat > "$d/tests/test_clock.py" <<EOF
+import os
+
+import pytest
+
+_W = int(os.environ.get("PYTEST_XDIST_WORKER", "gw0")[2:])  # gw0, gw1: o "relógio" de cada worker difere de propósito
+_R = {"s": 10 + _W, "f": 123456 + _W}
+
+
+@pytest.mark.parametrize("v", ["$2" % _R])
+def test_clock(v):
+    pass
+EOF
+}
+runclock() { # <nome> <dir do plugin> <saída> — pytest de verdade, 2 workers, com o plugin
+  ( cd "$T/clock-$1" && PYTHONPATH="$2" PYTHONHASHSEED=0 "$PY" -m pytest -p no:cacheprovider -p gtn_stable_ids tests/ -v -n 2 ) > "$3" 2>&1; }
+clockok() { # <saída> — fechou: 1 passou, id normalizado, nada de "Different tests", e nenhum relógio cru sobrou no id
+  has "$1" '1 passed' && has "$1" 'test_clock\[<TS>\]' && hasnt "$1" 'Different tests were collected' && hasnt "$1" 'test_clock\[[0-9]{4}-'; }
+clockdies() { # <saída> — a coleta divergiu entre os workers (o sintoma de 02/11)
+  has "$1" 'Different tests were collected'; }
+clockproj tmais   '2026-12-03T03:39:%(s)02d'
+clockproj espaco  '2026-12-03 03:39:%(s)02d'
+clockproj tfrac   '2026-12-03T03:39:%(s)02d.%(f)06d'
+clockproj espfrac '2026-12-03 03:39:%(s)02d.%(f)06d'
+clockproj virgula '2026-12-03 03:39:%(s)02d,%(f)03d'
+for f in tmais espaco tfrac espfrac virgula; do
+  runclock "$f" "$T/plug" "$T/out-clock-$f"
+  ck "relógio ($f): os 2 workers fecham a coleta e o id vira test_clock[<TS>]" clockok "$T/out-clock-$f"
+done
+cpl=$(cat "$HERE/gtn_stable_ids.py"; echo x); cpl=${cpl%x}
+sp_old='[T ]'; sp_new='T'; fr_old='(?:[.,]\d+)?'; fr_new=''
+mkdir -p "$T/plug-nosp" "$T/plug-nofr" "$T/plug-neutral"
+printf '%s' "${cpl/"$sp_old"/"$sp_new"}" > "$T/plug-nosp/gtn_stable_ids.py"
+printf '%s' "${cpl/"$fr_old"/"$fr_new"}" > "$T/plug-nofr/gtn_stable_ids.py"
+printf '%s' "$cpl" | sed '2i\
+# comentario neutro' > "$T/plug-neutral/gtn_stable_ids.py"
+ck "controle: o plugin sem o espaço difere do original" test -n "$(diff "$HERE/gtn_stable_ids.py" "$T/plug-nosp/gtn_stable_ids.py")"
+ck "controle: o plugin sem a fração difere do original" test -n "$(diff "$HERE/gtn_stable_ids.py" "$T/plug-nofr/gtn_stable_ids.py")"
+runclock espfrac "$T/plug-neutral" "$T/out-clock-neutral"
+ck "controle: o mutante neutro (só um comentário) PASSA o formato espaço + fração (o mutante é executável aqui)" clockok "$T/out-clock-neutral"
+runclock espaco "$T/plug-nosp" "$T/out-clock-nosp"
+ck "controle: sem o espaço, o formato com espaço é REPROVADO (a coleta diverge entre os workers)" clockdies "$T/out-clock-nosp"
+runclock tfrac "$T/plug-nofr" "$T/out-clock-nofr"
+ck "controle: sem a fração, o formato com fração é REPROVADO (a coleta diverge entre os workers)" clockdies "$T/out-clock-nofr"
+runclock tmais "$T/plug-nosp" "$T/out-clock-nosp-t"
+ck "controle: sem o espaço, o formato com T continua passando (o mutante só quebra o que deve)" clockok "$T/out-clock-nosp-t"
 
 # ---- (2) o script real, 3 noites, com a saída real
 CITY="$T/city"; mkdir -p "$CITY/.gc/logs" "$CITY/.gc/run"
