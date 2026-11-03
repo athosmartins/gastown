@@ -4375,6 +4375,59 @@ _filter_explicit_deps() {
   [ -z "$filtered" ] && { printf '%s' "$arr"; return 0; }
   printf '%s' "$filtered"
 }
+# ── ga-vdac4cj (gate round 1): "the children could NOT be read" must reach whoever reads the sweep's SENTENCE ─────────────────────────
+# _filter_open_children (below) holds EVERY candidate back when its children read fails - inert - but it runs inside $(...) pipelines, so
+# nothing it sets reaches the parent shell: the sweep then ended with "No dispatchable candidates (Tier 1 or Tier 2). Exiting." - the sentence
+# imparavel-check.py reads as an explicit ZERO - exactly as if the queue had been READ and found empty (measured on scenario 19m FV3: the last
+# decision line was identical to the control run in which the children WERE read and the mother legitimately held). "I could not read" must
+# not produce the output of "I read and found none". So the unreadable branch leaves a MARK, and every reader of the sweep asks it:
+#   - the tail of Step 2c (zero candidates) writes "Candidates UNKNOWN: ..." and not the empty-queue sentence;
+#   - _scan_rig_fallback_pool folds it into RIG_SCAN_UNREADABLE (the rig scan "could not look at everything");
+#   - _pilot_emit_dispatchable writes NO queue file (a population missing the beads held back unread is "cannot tell", not an empty queue).
+# The mark is a FILE, because a variable set in a pipeline dies with its subshell: one "<db_dir><TAB><n>" line per unreadable call, emptied at
+# the start of the emit and again at the start of the dispatch queries (the tail must see only the reads that fed the pool it judges).
+# THREE states, as everywhere: no line = the reads were made; a line = n candidates were held back unread; the mark cannot be kept or read
+# (_CIH_MARK_BROKEN, an unreadable file) = CANNOT TELL, which the readers treat as unknown too - never as "none". The one hole left: an append
+# that fails INSIDE the stage (the disk full at that very moment) cannot tell the parent shell; it is a WARN in the log and the old sentence.
+PILOT_CIH_UNREADABLE_FILE="${PILOT_CIH_UNREADABLE_FILE:-$GC_CITY/.gc/pilot-children-unreadable.sweep}"
+_CIH_MARK_BROKEN=""
+_CIH_LOG_IDS_MAX=5
+# _cih_mark_reset - call at TOP LEVEL (it sets _CIH_MARK_BROKEN in the parent shell): empty the mark; a mark that cannot be kept is said and remembered
+_cih_mark_reset() {
+  _CIH_MARK_BROKEN=""
+  if mkdir -p "$(dirname "$PILOT_CIH_UNREADABLE_FILE")" 2>/dev/null && { : > "$PILOT_CIH_UNREADABLE_FILE"; } 2>/dev/null; then
+    return 0
+  fi
+  _CIH_MARK_BROKEN=1
+  warn "ga-vdac4cj: cannot keep the unreadable-children mark ($PILOT_CIH_UNREADABLE_FILE) - this sweep will not call an empty pool 'empty': its sentence will say UNKNOWN" >&2
+  return 0
+}
+# _cih_mark_unreadable <db_dir> <n> - the stage held n candidate(s) of db_dir back because their children could not be read (always rc 0)
+_cih_mark_unreadable() {
+  { printf '%s\t%s\n' "$1" "$2" >> "$PILOT_CIH_UNREADABLE_FILE"; } 2>/dev/null && return 0
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] [pilot-dispatcher] WARN: could not record the unreadable-children mark for $1 ($PILOT_CIH_UNREADABLE_FILE) - the sentence at the end of this sweep may NOT say UNKNOWN [ga-vdac4cj]" >&2
+  return 0
+}
+# _cih_unreadable_count - prints how many candidates were held back unread since the last reset (0 = the reads were made); rc 1 = CANNOT TELL
+_cih_unreadable_count() {
+  local _n
+  # falhou (the mark could not be kept, the file is missing / unreadable, awk failed) -> rc 1; vazio (no line) -> prints 0;
+  # a line that cannot be read (no count, zero, text) still counts as 1: something was held back unread, never "nothing"
+  { [ -z "${_CIH_MARK_BROKEN:-}" ] && [ -f "$PILOT_CIH_UNREADABLE_FILE" ] && [ -r "$PILOT_CIH_UNREADABLE_FILE" ]; } || return 1
+  _n=$(awk -F '\t' '{ if ($2 ~ /^[0-9]+$/ && $2 + 0 > 0) s += $2; else s += 1 } END { print s + 0 }' "$PILOT_CIH_UNREADABLE_FILE" 2>/dev/null) || return 1
+  printf '%s' "${_n:-0}"
+}
+# _cih_fold_into_rig_scan <count before the scan> - after a rig scan: candidates held back unread DURING it (or a mark that can no longer be read)
+# mean the scan "could not look at everything", whatever its own bd lists said (rc always 0)
+_cih_fold_into_rig_scan() {
+  local _b="${1:-0}" _a
+  if ! _a=$(_cih_unreadable_count); then
+    RIG_SCAN_UNREADABLE="${RIG_SCAN_UNREADABLE:-the unreadable-children mark could not be read}"
+  elif [ "${_a:-0}" -gt "$_b" ] 2>/dev/null; then
+    RIG_SCAN_UNREADABLE="${RIG_SCAN_UNREADABLE:-the children of $((_a - _b)) candidate(s) could not be read}"
+  fi
+  return 0
+}
 # _filter_open_children <db_dir>   (reads candidate JSON array from stdin)
 # ga-vdac4cj: drops a MOTHER whose work belongs to its children. A feature sliced into children (E11: ga-hfx1kou -> .1/.2) keeps its
 # own gate:queued while the slices hold the gate markers; when that label was lost (grw FIX8 used to clear it as a "phantom") the
@@ -4389,6 +4442,10 @@ _filter_explicit_deps() {
 #   unreadable  -> dropped too, with a WARN: INERT AND LOUD. This is deliberately NOT the fail-open of _filter_unblocked /
 #                  _filter_explicit_deps above: there a wrong "keep" costs nothing a later check will not catch, here it costs a
 #                  builder session spent on a bead with nothing to build. A candidate is kept ONLY on an explicit `none`.
+#                  AND MARKED (gate round 1): "held back" is not "found none". The stage leaves a mark (_cih_mark_unreadable) that the
+#                  readers of the sweep's sentence ask - see the block above this comment - so an empty pool that is only empty because
+#                  the read failed never ends as "No dispatchable candidates". Per-bead lines are capped (_CIH_LOG_IDS_MAX, 5) and one
+#                  count line says the rest: a bd outage holds every candidate of 16 chains.
 # THE READ: one FRESH `bd -C <db_dir> list --json --limit 0` per call (every not-closed bead of the store), grouped by `.parent` -
 # NOT a fast path on the candidate's own row: measured 31/10, `dependent_count` in list/ready rows does not count parent-child links
 # (the real mother ga-hfx1kou is 0 there and 2 in `bd show`), so a skip keyed on it never looked at a real mother. An empty candidate
@@ -4397,7 +4454,7 @@ _filter_explicit_deps() {
 # Diagnostics -> stderr (routed to the log by the top-level `exec ... 2>&1`), stdout stays pure JSON.
 _filter_open_children() {
   local db_dir="$1"
-  local arr ids verdicts bid state held_ids="" held_json filtered
+  local arr ids verdicts bid state held_ids="" held_json filtered unread_n=0 ids_n
   arr=$(cat)
   [ -z "$arr" ] && { printf '[]'; return 0; }
 
@@ -4429,23 +4486,35 @@ _filter_open_children() {
       none) ;;
       *)
         held_ids="$held_ids $bid"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [pilot-dispatcher] WARN: holding $bid back in $db_dir - its children could NOT be read; not offering a bead that may have nothing left to build [ga-vdac4cj]" >&2
-        log "[pilot] EXCLUÍDO $bid por _filter_open_children: filhas ilegíveis (bd falhou) - retido, não dispensado" >&2
+        unread_n=$((unread_n + 1))
+        if [ "$unread_n" -le "${_CIH_LOG_IDS_MAX:-5}" ]; then
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] [pilot-dispatcher] WARN: holding $bid back in $db_dir - its children could NOT be read; not offering a bead that may have nothing left to build [ga-vdac4cj]" >&2
+          log "[pilot] EXCLUÍDO $bid por _filter_open_children: filhas ilegíveis (bd falhou) - retido, não dispensado" >&2
+        fi
         ;;
     esac
   done <<< "$ids"
+
+  # the read could not be made for these: held back (inert), said ONCE with the count, and MARKED so the sentence at the end of the sweep says UNKNOWN
+  if [ "$unread_n" -gt 0 ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [pilot-dispatcher] WARN: holding $unread_n candidate(s) back in $db_dir - their children could NOT be read (bd failed, printed nothing or printed garbage): not offering beads that may have nothing left to build, and marking the sweep so its sentence says UNKNOWN, not 'none' [ga-vdac4cj]" >&2
+    _cih_mark_unreadable "$db_dir" "$unread_n"
+  fi
 
   if [ -z "$held_ids" ]; then
     printf '%s' "$arr"
     return 0
   fi
 
-  held_json=$(printf '%s\n' $held_ids | jq -R -s 'split("\n") | map(select(length>0))' 2>/dev/null) || held_json=""
+  held_json=$(printf '%s' "$held_ids" | tr ' ' '\n' | jq -R -s 'split("\n") | map(select(length>0))' 2>/dev/null) || held_json=""
   filtered=""
   [ -n "$held_json" ] && filtered=$(printf '%s' "$arr" | jq -c --argjson held "$held_json" '[.[] | select((.id as $i | $held | index($i)) | not)]' 2>/dev/null) || filtered=""
   # vazio/falhou/ilegível (the drop could not be applied) -> the inert "[]" and a WARN, never the unfiltered list (ga-fesw8n's rule)
   if [ -z "$filtered" ]; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [pilot-dispatcher] WARN: _filter_open_children could not apply its drop for $db_dir - answering [] this sweep (inert) [ga-vdac4cj]" >&2
+    # every candidate of this call is gone from the answer without a verdict: that is "unknown" for the sentence too, not "none"
+    ids_n=$(printf '%s\n' "$ids" | awk 'NF { n++ } END { print n + 0 }')
+    _cih_mark_unreadable "$db_dir" "${ids_n:-1}"
     printf '[]'
     return 0
   fi
@@ -5649,6 +5718,14 @@ _pilot_emit_dispatchable() {
       _all=$(echo "$_all $_r" | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "$_all")
     done <<< "$_rig_paths"
 
+    # ga-vdac4cj (gate round 1): a stage that held candidates back because their children could not be read (or whose mark can no longer be read)
+    # makes this population a PARTIAL read - the held beads are missing, not absent. "Cannot tell" -> write NOTHING, the same rule as the order
+    # check below: the previous file keeps its order and goes stale after PILOT_DISPATCHABLE_TTL; a fresh `count 0` would be a lie with a current timestamp.
+    local _cih_n
+    if ! _cih_n=$(_cih_unreadable_count) || [ "${_cih_n:-0}" -gt 0 ]; then
+      warn "ga-vdac4cj: the children of ${_cih_n:-some} candidate(s) could not be read (or the mark of that could not be kept) while computing the dispatchable queue - NOT writing $PILOT_DISPATCHABLE_FILE: the previous file stays and goes stale after ${PILOT_DISPATCHABLE_TTL}s, because \"cannot tell\" is not \"empty queue\"."
+      return 0
+    fi
     # Order by the ONE shared rule, then project to the painel contract shape. (ga-9t9acg.3: this was
     # `sort_by([priority, created_at, id])` — oldest-first with NO type tier — while _top_candidate served
     # bug-first/newest-first, so the "position" the painel and approved-state-reconciler.py print was the
@@ -5777,6 +5854,8 @@ _ownership_guard_repos_prime || true
 # QUEUE exists independently of whether builder slots are free or the sweep is
 # paused; the painel must reflect it regardless. This is purely additive + fully
 # fail-open: it can never abort or alter the dispatch decisions that follow.
+# ga-vdac4cj: the unreadable-children mark starts empty for the emit; the dispatch queries below get a fresh one (see the block above _filter_open_children).
+_cih_mark_reset
 _pilot_emit_dispatchable
 
 # ── ga-x3nmz: Claude 5h-quota back-off — PAUSE dispatch when the window is dry ─
@@ -11082,6 +11161,9 @@ if [ "$SMALL_SLOTS" -eq "0" ] && [ "$BIG_SLOTS" -eq "0" ]; then
   exit 0
 fi
 
+# ga-vdac4cj: from here to the tail of Step 2c the mark records only the reads that feed THIS sweep's pool (the emit above had its own).
+_cih_mark_reset
+
 # ── Step 2: Tier 1 — Find open bugs + tech-debt beads in HQ DB ───────────────
 # Tier 1 = type:bug OR label:tech-debt, NOT in-flight/done/dispatching, no assignee.
 # Bugs do NOT require story:approved — they are always dispatchable when open.
@@ -11691,10 +11773,13 @@ fi
 # use this JSON array directly (hermetic selftest; no real gc/bd needed).
 # Mirrors PILOT_WA_RIG_TIER2_OVERRIDE (Step 2b-rig-tier2).
 _scan_rig_fallback_pool() {
+  local _cih_b
+  _cih_b=$(_cih_unreadable_count) || _cih_b=0
   # RIG_SCAN_UNREADABLE (ga-9t9acg.2, gate round 1): non-empty = "the scan could not LOOK at every rig DB" (the reason
   # is the value). RIG_MERGED_COUNT=0 then means UNKNOWN, not "no rig candidate" — the caller (Step 2c) must say so
   # and must never read it as an empty queue. Set only for the failures the scan itself can observe: gc rig list,
-  # a registered rig path that is not a directory, each rig's bd list, and its own jq merges.
+  # a registered rig path that is not a directory, each rig's bd list, and its own jq merges - and, since ga-vdac4cj, the filter stage that held
+  # candidates back because their children could not be read (it runs in a pipeline and cannot set this: _cih_fold_into_rig_scan reads its mark).
   RIG_SCAN_UNREADABLE=""
   if [ -n "${PILOT_RIG_FALLBACK_OVERRIDE+x}" ]; then
     local _rfp_filtered
@@ -11708,6 +11793,7 @@ _scan_rig_fallback_pool() {
     RIG_MERGED_JSON="$_rfp_filtered"
     RIG_MERGED_COUNT=$(echo "$RIG_MERGED_JSON" | jq 'length' 2>/dev/null || echo "0")
     RIG_TIER2_COUNT=$((RIG_MERGED_COUNT - RIG_TIER1_COUNT))
+    _cih_fold_into_rig_scan "$_cih_b"
     return 0
   fi
 
@@ -11784,6 +11870,7 @@ _scan_rig_fallback_pool() {
   RIG_MERGED_JSON=$(echo "$ALL_RIG_TIER1 $ALL_RIG_TIER2" \
     | jq -s 'add // [] | unique_by(.id)' 2>/dev/null) || { RIG_SCAN_UNREADABLE="${RIG_SCAN_UNREADABLE:-jq merge failed (rig pool)}"; RIG_MERGED_JSON="[]"; }
   RIG_MERGED_COUNT=$(echo "$RIG_MERGED_JSON" | jq 'length' 2>/dev/null || echo "0")
+  _cih_fold_into_rig_scan "$_cih_b"
 }
 
 # The scan runs when the HQ pool is empty (as before) or while a lane has a free slot (ga-9t9acg.2). SMALL_SLOTS /
@@ -11865,11 +11952,18 @@ fi
 ALL_CANDIDATES_COUNT=$(echo "$ALL_CANDIDATES_JSON" | jq 'length' 2>/dev/null || echo "0")
 
 if [ "$ALL_CANDIDATES_COUNT" = "0" ]; then
+  # ga-vdac4cj (gate round 1): candidates held back because their children could not be read are MISSING from the pool, not absent from the store
+  _cih_n=""
+  _cih_known=1
+  _cih_n=$(_cih_unreadable_count) || _cih_known=""
   if [ -n "${RIG_SCAN_UNREADABLE:-}" ]; then
     # Gate round 2: an empty HQ pool plus a rig scan that could not read everything is "UNKNOWN", not an empty queue.
     # The empty-queue sentence is deliberately NOT written: imparavel-check.py reads it as an explicit zero, and
     # a missing sentence reads as unknown (fail-open) — which is what this is.
     log "Candidates UNKNOWN: the HQ pool is empty and the rig DB scan could not read everything (${RIG_SCAN_UNREADABLE}) — nothing to dispatch from what was readable, but a rig bead may be waiting. Exiting."
+  elif [ -z "$_cih_known" ] || [ "${_cih_n:-0}" -gt 0 ]; then
+    # same rule as above: the empty-queue sentence is NOT written - imparavel-check.py reads it as an explicit zero
+    log "Candidates UNKNOWN: the children of ${_cih_n:-some} candidate(s) could not be read (or the mark of that could not be kept) — they were held back, so an empty pool is NOT proof that nothing is waiting. Exiting."
   else
     log "No dispatchable candidates (Tier 1 or Tier 2). Exiting."
   fi

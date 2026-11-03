@@ -5335,10 +5335,16 @@ else
 fi
 
 FV3="$(run_emit "$VDAC_BUGS" "" 1 "[]" "" 1)"
-if jq -e '[.items[].id] | (index("tt-mother") == null) and (index("tt-plain") == null)' "$FV3" >/dev/null 2>&1; then
-  ok "children unreadable (the bulk read fails): inert - NO candidate is in the emit (the row cannot say which are mothers)"
+# gate round 1: the emit used to write a FRESH queue with count 0 here - a lie with a current timestamp ("I could not read" printed as "I read and found none")
+if [ ! -e "$FV3" ]; then
+  ok "children unreadable (the bulk read fails): the emit writes NOTHING - a population missing the beads held back unread is 'cannot tell', not an empty queue (no candidate leaks either)"
 else
-  bad "children unreadable: emit wrong (got: $(jq -c '[.items[].id]' "$FV3" 2>/dev/null))"
+  bad "children unreadable: the emit wrote a queue anyway (got: $(jq -c '{count,ids:[.items[].id]}' "$FV3" 2>/dev/null))"
+fi
+if grep -q 'could not be read .* while computing the dispatchable queue - NOT writing' "$VDAC_LOG"; then
+  ok "…and the log says why the queue file was left alone"
+else
+  bad "…no 'NOT writing' line for the emit: $(grep -c 'dispatchable queue' "$VDAC_LOG") mentions"
 fi
 if grep -q 'EXCLUÍDO tt-mother por _filter_open_children: filhas ilegíveis' "$VDAC_LOG" && grep -q 'WARN: holding tt-mother back .* could NOT be read' "$VDAC_LOG"; then
   ok "…and it is LOUD: EXCLUÍDO + WARN in the log"
@@ -5346,6 +5352,30 @@ else
   bad "…no loud log lines for the unreadable mother: $(grep -c tt-mother "$VDAC_LOG") mentions"
 fi
 if grep -q 'Lane picks — small: tt-' "$VDAC_LOG"; then bad "…a bead was picked although the children could not be read: $(grep 'Lane picks' "$VDAC_LOG" | head -2)"; else ok "…and nothing is picked this sweep"; fi
+# gate round 1 (the blocking finding): nothing was picked because nothing could be READ, and the sweep's last word must not say "I read and found none"
+# - imparavel-check.py reads that sentence as an explicit zero and turns a real "buildable bead not dispatched" finding into an info note.
+if grep -q 'Candidates UNKNOWN: the children of [0-9][0-9]* candidate(s) could not be read' "$VDAC_LOG"; then
+  ok "…and the sweep's last word is UNKNOWN: 'the children of N candidate(s) could not be read'"
+else
+  bad "…no 'Candidates UNKNOWN: the children of N candidate(s)' sentence: $(tail -3 "$VDAC_LOG" | tr '\n' '|' | cut -c1-260)"
+fi
+if grep -q 'No dispatchable candidates' "$VDAC_LOG"; then
+  bad "…the sweep ended with the empty-queue sentence although nothing could be read (an unknown read as an empty queue)"
+else
+  ok "…and the empty-queue sentence is NOT written"
+fi
+# the control: the SAME mother, its children READ and in the gate (a legitimate hold) -> the pool IS empty and the empty-queue sentence IS the truth
+FV3B="$(run_emit "[$VDAC_MOTHER]" "" 1 "[]" "[$(vdac_kid 1 open '["gate:queued"]')]")"
+if grep -q 'No dispatchable candidates (Tier 1 or Tier 2). Exiting.' "$VDAC_LOG" && ! grep -q 'Candidates UNKNOWN' "$VDAC_LOG"; then
+  ok "control: children READ and in the gate -> the mother is held and the sweep ends as an empty queue (the two endings differ)"
+else
+  bad "control: a legitimate hold did not end as 'No dispatchable candidates' (or printed UNKNOWN): $(tail -3 "$VDAC_LOG" | tr '\n' '|' | cut -c1-260)"
+fi
+if [ -f "$FV3B" ] && jq -e '.count == 0' "$FV3B" >/dev/null 2>&1; then
+  ok "control: …and the emit DOES write its count 0 (the read was made)"
+else
+  bad "control: the emit did not write the zero-shape after a legitimate hold"
+fi
 
 rm -f "$STATE/store-reads.log"
 FV4="$(run_emit)"
@@ -9774,6 +9804,9 @@ has "$DISPATCHER" 'digest-label'          "digest-label exemption reason is wire
 #                            rig-bd-*    its directory exists but the `bd list` of ONE tier fails (bug / tech-debt /
 #                                        story:approved) — each of the scan's three handlers has its own mode
 #                            (ga-9t9acg.2-U9/U10, gate round 2).
+#        "rig-children-fail" → the REAL rig scan over that same rig, every `bd list` answers EXCEPT the children read of that rig
+#                            (`bd -C <rig> list --json --limit 0`): its candidates are held back unread (ga-vdac4cj, gate round 1).
+#   $5 = FAKE_STORE_JSON, $6 = FAKE_STORE_FAIL ("1" = the children read fails for EVERY store): what run_emit's $5/$6 do (ga-vdac4cj).
 #
 # ga-9t9acg.2: the rig JOIN is gated on the live session count being readable (ga-5je3zv), and the count probe runs
 # `timeout N gc session list --json`. These fixtures run on PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin", and a host
@@ -9842,6 +9875,7 @@ _y1m40_mk_rig_shims rig-ghost   "$Y1M40_RIG_GHOST_DIR" ""
 _y1m40_mk_rig_shims rig-bd-bug  "$Y1M40_RIG_REAL"      "-t bug"
 _y1m40_mk_rig_shims rig-bd-debt "$Y1M40_RIG_REAL"      "-l tech-debt"
 _y1m40_mk_rig_shims rig-bd-feat "$Y1M40_RIG_REAL"      "-l story:approved"
+_y1m40_mk_rig_shims rig-children-fail "$Y1M40_RIG_REAL" "--limit 0"
 run_y1m40() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
@@ -9851,13 +9885,13 @@ run_y1m40() {
     broken-timeout) _y_pre="$Y1M40_TO_BAD:" ;;
     jq-fail-union)  _y_pre="$Y1M40_JQ_BAD:" ;;
     rig-list-fails) _y_pre="$Y1M40_GC_BAD:" ;;
-    rig-ok|rig-ghost|rig-bd-bug|rig-bd-debt|rig-bd-feat) _y_pre="$WORK/y1m40-$4:" ;;
+    rig-ok|rig-ghost|rig-bd-bug|rig-bd-debt|rig-bd-feat|rig-children-fail) _y_pre="$WORK/y1m40-$4:" ;;
   esac
   # The rig override is passed as a one-element array so the real-scan modes can leave the variable UNSET (the dispatcher
   # tests ${VAR+x}: "" would still mean "override present"). ${arr[@]+...} keeps an empty array safe on bash 3.2 + -u.
   local _y_rig=(PILOT_RIG_FALLBACK_OVERRIDE="${3:-[]}")
   case "${4:-}" in
-    rig-list-fails|rig-ok|rig-ghost|rig-bd-bug|rig-bd-debt|rig-bd-feat) _y_rig=() ;;
+    rig-list-fails|rig-ok|rig-ghost|rig-bd-bug|rig-bd-debt|rig-bd-feat|rig-children-fail) _y_rig=() ;;
   esac
   env -i \
     DRAIN_WINDOW_OVERRIDE="OPEN" \
@@ -9874,6 +9908,8 @@ run_y1m40() {
     DISPATCH_TO_CAPACITY=1 \
     FAKE_BUGS_JSON="${1:-[]}" \
     FAKE_BLOCKED_IDS="" \
+    FAKE_STORE_JSON="${5:-}" \
+    FAKE_STORE_FAIL="${6:-0}" \
     FAKE_RIG_LIST_JSON="$Y1M40_RIGS" \
     PILOT_TEST_CREW_BRANCH_BEADS="${2:-}" \
     ${_y_rig[@]+"${_y_rig[@]}"} \
@@ -10253,6 +10289,53 @@ if echo "$LOG_U8" | grep -e "could NOT read everything" -e "UNKNOWN whether a ri
   bad "ga-9t9acg.2-U8: a readable scan printed the 'could not read' / UNKNOWN lines — the unreadable signal leaked or fires unconditionally"
 else
   ok "ga-9t9acg.2-U8: a readable scan printed no 'could not read' / UNKNOWN line"
+fi
+
+# ga-vdac4cj (gate round 1): _filter_open_children holds candidates back when their children cannot be read - UNKNOWN, not "none". The stage runs
+# in a pipeline, so it leaves a mark that the rig scan folds into RIG_SCAN_UNREADABLE and the tail of Step 2c reads (the HQ-path sentence is FV3 in
+# scenario 19m). RC1/RC2: the override seam (the chain runs on the HQ store); RC3/RC4: the REAL rig scan over one rig whose children read fails.
+echo "Scenario ga-vdac4cj-RC1: HQ EMPTY and the rig pool's children cannot be read -> UNKNOWN, never 'No dispatchable candidates'"
+LOG_RC1="$(run_y1m40 "[]" "" "[$VDAC_MOTHER]" "" "" 1)"
+if echo "$LOG_RC1" | grep -q 'Candidates UNKNOWN: the HQ pool is empty and the rig DB scan could not read everything (the children of 1 candidate(s) could not be read)'; then
+  ok "ga-vdac4cj-RC1: the exit says 'Candidates UNKNOWN' and names the unread children"
+else
+  bad "ga-vdac4cj-RC1: no 'Candidates UNKNOWN: ... (the children of 1 candidate(s) could not be read)' exit line — $(echo "$LOG_RC1" | tail -3 | tr '\n' '|' | cut -c1-260)"
+fi
+if echo "$LOG_RC1" | grep -q 'No dispatchable candidates'; then
+  bad "ga-vdac4cj-RC1: the sweep ended with 'No dispatchable candidates' although the children could not be read"
+else
+  ok "ga-vdac4cj-RC1: the empty-queue sentence is NOT written"
+fi
+echo "Scenario ga-vdac4cj-RC2 (control): HQ EMPTY, the rig pool's mother has children IN THE GATE (read fine) -> the empty-queue sentence IS the right one"
+LOG_RC2="$(run_y1m40 "[]" "" "[$VDAC_MOTHER]" "" "[$(vdac_kid 1 open '["gate:queued"]')]")"
+if echo "$LOG_RC2" | grep -q 'No dispatchable candidates (Tier 1 or Tier 2). Exiting.' && ! echo "$LOG_RC2" | grep -q -e 'Candidates UNKNOWN' -e 'could NOT read everything'; then
+  ok "ga-vdac4cj-RC2: a hold on READ children ends as an empty queue, with no UNKNOWN / 'could not read' line"
+else
+  bad "ga-vdac4cj-RC2: the control did not end as a plain empty queue — $(echo "$LOG_RC2" | tail -3 | tr '\n' '|' | cut -c1-260)"
+fi
+echo "Scenario ga-vdac4cj-RC3: HQ has work, the REAL rig scan's children read fails -> the join log says UNKNOWN, never 'found no candidate'; HQ work still dispatched"
+LOG_RC3="$(run_y1m40 "$U_HQ_P2" "" "" "rig-children-fail")"
+if echo "$LOG_RC3" | grep -q 'the rig DB scan could NOT read everything (the children of [0-9][0-9]* candidate(s) could not be read)'; then
+  ok "ga-vdac4cj-RC3: the scan says in a WARN that it could not read everything, naming the unread children"
+else
+  bad "ga-vdac4cj-RC3: no 'could NOT read everything (the children of N candidate(s)...' WARN — $(echo "$LOG_RC3" | grep -i 'rig' | tail -3 | tr '\n' '|' | cut -c1-260)"
+fi
+if echo "$LOG_RC3" | grep -q "UNKNOWN whether a rig bead is waiting, not 'none'" && ! echo "$LOG_RC3" | grep -q 'found no candidate to join the HQ pool'; then
+  ok "ga-vdac4cj-RC3: the zero-count line says UNKNOWN and does not claim the rig scan 'found no candidate'"
+else
+  bad "ga-vdac4cj-RC3: the rig count 0 was not announced as UNKNOWN (or was claimed as 'found no candidate') — $(echo "$LOG_RC3" | grep -i 'rig DB scan' | tail -3 | tr '\n' '|' | cut -c1-260)"
+fi
+if echo "$LOG_RC3" | grep -q 'Task title:.*tt-9t9acg2-hqp2'; then
+  ok "ga-vdac4cj-RC3: the HQ work is still dispatched (unread rig children stay inert, they do not stop the sweep)"
+else
+  bad "ga-vdac4cj-RC3: the HQ pool was not dispatched after the rig children could not be read"
+fi
+echo "Scenario ga-vdac4cj-RC4 (control): the same sweep with the rig's children READABLE -> no 'could not read' line, nothing marked"
+LOG_RC4="$(run_y1m40 "$U_HQ_P2" "" "" "rig-ok")"
+if echo "$LOG_RC4" | grep -q -e 'could NOT read everything' -e 'UNKNOWN whether a rig bead' -e 'Candidates UNKNOWN'; then
+  bad "ga-vdac4cj-RC4: a readable rig scan printed the unread-children lines — the mark fires unconditionally or leaks"
+else
+  ok "ga-vdac4cj-RC4: a readable rig scan printed no UNKNOWN / 'could not read' line"
 fi
 
 echo "Scenario ga-y1m40-f (observability): consecutive dispatched=0-with-free-slots sweeps increment a persisted stall counter across separate process invocations"

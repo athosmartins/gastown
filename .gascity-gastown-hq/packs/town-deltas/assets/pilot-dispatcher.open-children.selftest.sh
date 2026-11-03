@@ -19,7 +19,12 @@
 #   5. the lib sourcing block of the real file: loads a good lib, and a missing / corrupt / exiting lib is a WARN, not a dead Pilot;
 #   6. structural guards on the real file: EVERY `_filter_explicit_deps "X"` in a chain is followed by `| _filter_open_children "X"` with
 #      the same store argument (a new chain that forgets it fails here), and the lib is sourced before the first top-level chain;
-#   7. textual MUTANTS of the stage must each be caught.
+#   7. textual MUTANTS of the stage must each be caught;
+#   8. (gate round 1) "could not read" is not "found none": the unreadable branch leaves a MARK - a FILE, because the stage runs in a pipeline
+#      and a variable dies with its subshell - that the readers of the sweep's sentence ask. Pinned here: when it is written (unreadable, and a drop
+#      that cannot be applied; never for "in hand" or "none"), that it crosses the pipeline, the cap on per-bead lines, the helpers (count, damaged
+#      lines, a mark that cannot be kept or read, the rig-scan fold) and the wiring of the readers (the tail of Step 2c, the emit, the rig scan,
+#      the two resets). The sentences themselves are pinned by pilot-dispatcher.selftest.sh, scenario 19m.
 # Needs bash, jq, python3. Exit 0 iff every check holds.
 set -uo pipefail
 
@@ -44,6 +49,11 @@ extract_fn() { sed -n "/^$1() {/,/^}\$/p" "$2"; }
 LOG_FN="log()  { echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] [pilot-dispatcher] \$*\"; }"
 FN="$(extract_fn _filter_open_children "$DISPATCHER")"
 [ -n "$FN" ] || { echo "FATAL: _filter_open_children() not found in $DISPATCHER — has ga-vdac4cj landed?"; exit 2; }
+WARN_FN="warn() { echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] [pilot-dispatcher] WARN: \$*\"; }"
+MARK="$WORK/mark"
+MARK_FNS="$(for f in _cih_mark_reset _cih_mark_unreadable _cih_unreadable_count _cih_fold_into_rig_scan; do extract_fn "$f" "$DISPATCHER"; done)"
+[ "$(printf '%s\n' "$MARK_FNS" | grep -c '^_cih_[a-z_]*() {')" = 4 ] || { echo "FATAL: the unreadable-children mark helpers (4) not found in $DISPATCHER"; exit 2; }
+MARK_FNS_UT="$MARK_FNS"      # the helpers the harnesses use; a helper MUTANT swaps this
 
 # fake bd: logs argv; `[-C db] list --json --limit 0` answers store.{json,raw,fail,empty}, default `[]`. `list --parent` is NOT served.
 cat > "$FAKE/bd" <<'EOF'
@@ -69,9 +79,12 @@ store() { arr "$@" > "$FIX/store.json"; }
 
 # mk_harness <name> <with-lib 1|0> <fn-text>: a script that runs the stage under the Pilot's own shell options
 mk_harness() {
-  { echo 'set -euo pipefail'; echo "$LOG_FN"
+  { echo 'set -euo pipefail'; echo "$LOG_FN"; echo "$WARN_FN"
+    echo "PILOT_CIH_UNREADABLE_FILE=\"\${PILOT_CIH_UNREADABLE_FILE:-$MARK}\"; _CIH_MARK_BROKEN=\"\"; _CIH_LOG_IDS_MAX=5"
+    printf '%s\n' "$MARK_FNS_UT"
     [ "$2" = 1 ] && echo ". \"$LIB\""
     printf '%s\n' "$3"
+    echo '_cih_mark_reset'
     echo 'in="$(cat)"; printf "%s" "$in" | _filter_open_children "$1"; echo "<<rc=$?>>" >&2'
   } > "$WORK/$1.sh"
 }
@@ -149,6 +162,79 @@ reset; echo '[7]' > "$FIX/store.raw"
 run h "$(arr "$(cand M)")"
 eq "a store row that is not an object: held back" "$OUT" "[]"
 
+echo "== 3b. unreadable leaves a MARK that crosses the pipeline (gate round 1): the readers of the sweep's sentence ask it"
+mark_of() { if [ -s "$MARK" ]; then tr '\t' '~' < "$MARK" | tr '\n' '|'; else printf 'clean'; fi; }
+for how in fail empty; do
+  reset; : > "$FIX/store.$how"
+  run h "$(arr "$(cand A)" "$(cand M)")"
+  eq "bd $how: the mark names the store and counts the candidates held unread" "$(mark_of)" "/db/city~2|"
+done
+reset; echo 'Error: dolt unreachable' > "$FIX/store.raw"
+run h "$(arr "$(cand M)")"
+eq "garbage answer: marked too" "$(mark_of)" "/db/city~1|"
+reset; store "$(child M.1 M open gate:queued)"
+run h "$(arr "$(cand M)")"
+eq "children IN HAND is a verdict, not a doubt: no mark" "$(mark_of)" "clean"
+reset; store "$(child M.1 M open)"
+run h "$(arr "$(cand M)")"
+eq "children read and none in hand: no mark" "$(mark_of)" "clean"
+reset
+run h "$(arr "$(cand M)")"
+eq "no children at all (bd answers []): no mark" "$(mark_of)" "clean"
+many=(); for i in $(seq 1 12); do many+=("$(cand "B$i")"); done
+reset; : > "$FIX/store.fail"
+run h "$(arr "${many[@]}")"
+eq "twelve candidates unread: ONE mark line says 12" "$(mark_of)" "/db/city~12|"
+eq "…the per-bead WARN lines are capped at 5" "$(printf '%s' "$ERRT" | grep -c 'WARN: holding B[0-9]* back')" "5"
+printf '%s' "$ERRT" | grep -q 'WARN: holding 12 candidate(s) back in /db/city - their children could NOT be read' && ok "…and ONE summary line carries the count" || bad "no summary line with the count: ${ERRT:0:300}"
+reset; : > "$FIX/store.fail"
+{ echo 'set -euo pipefail'; echo "$LOG_FN"; echo "$WARN_FN"; echo "PILOT_CIH_UNREADABLE_FILE=\"$MARK\"; _CIH_MARK_BROKEN=\"\"; _CIH_LOG_IDS_MAX=5"; printf '%s\n' "$MARK_FNS_UT"; echo ". \"$LIB\""; printf '%s\n' "$FN"
+  echo '_cih_mark_reset; in="$(cat)"; for d in /db/a /db/b; do printf "%s" "$in" | _filter_open_children "$d" >/dev/null; done; echo "count=$(_cih_unreadable_count)"'; } > "$WORK/h2.sh"
+out="$(printf '%s' "$(arr "$(cand A)" "$(cand M)")" | BD_LOG="$WORK/bd.log" FIX="$FIX" PATH="$FAKE:$PATH" bash "$WORK/h2.sh" 2>/dev/null)"
+eq "two stores in one sweep: the mark ADDS (2 + 2), and _cih_unreadable_count says so" "$(printf '%s' "$out" | tail -1)" "count=4"
+eq "…one line per store" "$(mark_of)" "/db/a~2|/db/b~2|"
+echo "   -- a mark that cannot be kept: the stage still holds back (inert), LOUDLY, and the readers say CANNOT TELL"
+mkdir -p "$WORK/markdir"
+reset; : > "$FIX/store.fail"
+OUT="$(printf '%s' "$(arr "$(cand M)")" | PILOT_CIH_UNREADABLE_FILE="$WORK/markdir" BD_LOG="$WORK/bd.log" FIX="$FIX" PATH="$FAKE:$PATH" bash "$WORK/h.sh" /db/city 2>"$WORK/err")"; ERRT="$(cat "$WORK/err")"
+eq "mark path is a directory: the answer is still []" "$OUT" "[]"; eq "…rc 0" "$(rc_of_stage)" "<<rc=0>>"
+printf '%s' "$ERRT" | grep -q 'cannot keep the unreadable-children mark' && ok "…the reset says the mark cannot be kept" || bad "…no 'cannot keep' WARN: ${ERRT:0:300}"
+printf '%s' "$ERRT" | grep -q 'could not record the unreadable-children mark for /db/city' && ok "…and the stage says it could not record the unreadable read" || bad "…no 'could not record' WARN: ${ERRT:0:300}"
+
+echo "== 3c. the helpers of the mark"
+helper_checks() {  # prints a "  ✗" line per broken property; nothing when all hold. Uses MARK_FNS_UT (a helper mutant swaps it)
+  local hc="$WORK/hc.sh" hf="$WORK/hf.sh" hr="$WORK/hr.sh" m="$WORK/hcmark" r
+  { echo 'set -euo pipefail'; echo "$WARN_FN"; echo 'PILOT_CIH_UNREADABLE_FILE="$1"; _CIH_MARK_BROKEN="${2:-}"'; printf '%s\n' "$MARK_FNS_UT"
+    echo 'if out=$(_cih_unreadable_count); then echo "rc=0 out=$out"; else echo "rc=$? out="; fi'; } > "$hc"
+  { echo 'set -euo pipefail'; echo "$WARN_FN"; echo 'PILOT_CIH_UNREADABLE_FILE="$1"; _CIH_MARK_BROKEN=""'; printf '%s\n' "$MARK_FNS_UT"
+    echo 'RIG_SCAN_UNREADABLE="${3:-}"; _cih_fold_into_rig_scan "$2"; echo "[$RIG_SCAN_UNREADABLE]"'; } > "$hf"
+  { echo 'set -euo pipefail'; echo "$WARN_FN"; echo 'PILOT_CIH_UNREADABLE_FILE="$1"; _CIH_MARK_BROKEN=""'; printf '%s\n' "$MARK_FNS_UT"
+    echo '_cih_mark_reset 2>/dev/null; echo "broken=${_CIH_MARK_BROKEN:-0}"; if out=$(_cih_unreadable_count); then echo "rc=0"; else echo "rc=1"; fi'; } > "$hr"
+  chk() { [ "$2" = "$3" ] || echo "  ✗ $1: expected [$3], got [$2]"; }
+  : > "$m";                                       r="$(bash "$hc" "$m" 2>&1)";  chk "an empty mark counts 0 (the reads were made)" "$r" "rc=0 out=0"
+  printf '/db/a\t3\n' > "$m";                      r="$(bash "$hc" "$m" 2>&1)";  chk "one line counts its n" "$r" "rc=0 out=3"
+  printf '/db/a\t2\n/db/b\t5\n' > "$m";            r="$(bash "$hc" "$m" 2>&1)";  chk "lines add up" "$r" "rc=0 out=7"
+  printf 'garbage\n' > "$m";                       r="$(bash "$hc" "$m" 2>&1)";  chk "a line with no count counts 1 (something was held unread)" "$r" "rc=0 out=1"
+  printf '/db/a\t0\n' > "$m";                      r="$(bash "$hc" "$m" 2>&1)";  chk "a zero count counts 1" "$r" "rc=0 out=1"
+  printf '/db/a\tx\n' > "$m";                      r="$(bash "$hc" "$m" 2>&1)";  chk "a text count counts 1" "$r" "rc=0 out=1"
+  printf '\n' > "$m";                              r="$(bash "$hc" "$m" 2>&1)";  chk "a blank line counts 1" "$r" "rc=0 out=1"
+  r="$(bash "$hc" "$WORK/no-such-mark" 2>&1)";     chk "a missing mark is CANNOT TELL (rc 1), not 0" "$r" "rc=1 out="
+  r="$(bash "$hc" "$WORK/markdir" 2>&1)";          chk "a directory is CANNOT TELL (rc 1)" "$r" "rc=1 out="
+  : > "$m";                                       r="$(bash "$hc" "$m" 1 2>&1)"; chk "a mark flagged broken is CANNOT TELL even if the file is there" "$r" "rc=1 out="
+  if [ "$(id -u)" != 0 ]; then : > "$m"; chmod 000 "$m"; r="$(bash "$hc" "$m" 2>&1)"; chmod 644 "$m"; chk "an unreadable mark file is CANNOT TELL" "$r" "rc=1 out="; fi
+  printf '/db/a\t3\n' > "$m"
+  r="$(bash "$hf" "$m" 0 2>&1)";                   chk "fold: 3 held during the scan -> the scan could not look at everything" "$r" "[the children of 3 candidate(s) could not be read]"
+  r="$(bash "$hf" "$m" 1 2>&1)";                   chk "fold: only what was added DURING the scan counts (3 now, 1 before)" "$r" "[the children of 2 candidate(s) could not be read]"
+  r="$(bash "$hf" "$m" 3 2>&1)";                   chk "fold: nothing added during the scan -> nothing to say" "$r" "[]"
+  r="$(bash "$hf" "$m" 0 'gc rig list failed' 2>&1)"; chk "fold: the scan's own reason stays first" "$r" "[gc rig list failed]"
+  r="$(bash "$hf" "$WORK/no-such-mark" 0 2>&1)";   chk "fold: a mark that can no longer be read means the scan could not look" "$r" "[the unreadable-children mark could not be read]"
+  r="$(bash "$hr" "$WORK/not-a-dir-file/mark" 2>&1)"; chk "reset: a mark that cannot be kept is remembered and CANNOT TELL follows" "$r" "$(printf 'broken=1\nrc=1')"
+  mkdir -p "$WORK/hrdir"; r="$(bash "$hr" "$WORK/hrdir/mark" 2>&1)"; chk "reset: a mark that can be kept is clean (0 counted)" "$r" "$(printf 'broken=0\nrc=0')"
+}
+: > "$WORK/not-a-dir-file"
+hout="$(helper_checks)"
+if [ -z "$hout" ]; then ok "the mark helpers: count, damaged lines, cannot-tell cases, rig fold and reset all behave"; else bad "mark helpers broken: $(printf '%s' "$hout" | head -5 | tr '\n' '|')"; fi
+
 echo "== 4. the cost: ONE read per call, and the candidate's own row is not consulted"
 reset
 IN="$(arr "$(cand A 0)" "$(cand B -)" "$(cand C 7)")"
@@ -190,6 +276,7 @@ rm -f "$FAKE/jq"
 eq "drop fails: answer is []" "$OUT" "[]"
 printf '%s' "$ERRT" | grep -q 'could not apply its drop' && ok "…and the WARN says so" || bad "…no 'could not apply its drop' WARN: ${ERRT:0:300}"
 eq "…rc 0" "$(rc_of_stage)" "<<rc=0>>"
+eq "…and every candidate of the call is MARKED unread (gone without a verdict = unknown, not none)" "$(mark_of)" "/db/city~1|"
 
 echo "== 6. the lib sourcing block of the real file"
 BLOCK="$(sed -n '/^_GC_CIH_SIBLING=/,/^unset _GC_CIH_SIBLING/p' "$DISPATCHER")"
@@ -242,6 +329,17 @@ if [ "${sl:-0}" -gt 0 ] && [ "${ft:-0}" -gt 0 ] && [ "$sl" -lt "$ft" ]; then ok 
 # the stage is defined before the sourcing block and after _filter_explicit_deps (functions are defined before the top-level calls)
 fd="$(grep -n '^_filter_explicit_deps() {' "$DISPATCHER" | head -1 | cut -d: -f1)"; od="$(grep -n '^_filter_open_children() {' "$DISPATCHER" | head -1 | cut -d: -f1)"
 [ -n "$fd" ] && [ -n "$od" ] && [ "$od" -gt "$fd" ] && ok "_filter_open_children is defined (line $od) after _filter_explicit_deps (line $fd)" || bad "definition order wrong ($fd / $od)"
+echo "   -- the readers of the mark (gate round 1): a new reader that forgets it, or a lost reset, fails here"
+tailb="$(awk '/^if \[ "\$ALL_CANDIDATES_COUNT" = "0" \]; then/{f=1} f{print} f&&/^  exit 0$/{exit}' "$DISPATCHER")"
+if grep -q '_cih_unreadable_count' <<<"$tailb" && grep -q 'Candidates UNKNOWN: the children of' <<<"$tailb"; then ok "the tail of Step 2c asks the mark and has its own UNKNOWN sentence"; else bad "the tail of Step 2c does not ask the mark (an empty pool read as an empty queue)"; fi
+[ "$(awk '/No dispatchable candidates/{f=1} f&&/^  fi$/{print "ok"; exit}' <<<"$tailb")" = ok ] && ok "…and the empty-queue sentence is in the branch that follows the UNKNOWN ones" || bad "…the empty-queue sentence is not the last branch of the tail"
+emitb="$(extract_fn _pilot_emit_dispatchable "$DISPATCHER")"   # a variable, not a pipe: under pipefail a grep -q that quits early SIGPIPEs the sed and reads as a failure
+grep -q '_cih_unreadable_count' <<<"$emitb" && ok "the emit asks the mark (no queue file from a partial read)" || bad "the emit does not ask the mark"
+eq "the rig scan folds the mark at BOTH exits (override seam and real scan)" "$(extract_fn _scan_rig_fallback_pool "$DISPATCHER" | grep -c '^ *_cih_fold_into_rig_scan "\$_cih_b"$')" "2"
+r1="$(grep -n '^_cih_mark_reset$' "$DISPATCHER" | head -1 | cut -d: -f1)"; r2="$(grep -n '^_cih_mark_reset$' "$DISPATCHER" | sed -n 2p | cut -d: -f1)"
+em="$(grep -n '^_pilot_emit_dispatchable$' "$DISPATCHER" | head -1 | cut -d: -f1)"; b1="$(grep -n '^BUGS_JSON=\$(bd -C "\$GC_CITY" list --json' "$DISPATCHER" | head -1 | cut -d: -f1)"
+if [ -n "$r1" ] && [ -n "$r2" ] && [ -n "$em" ] && [ -n "$b1" ] && [ "$r1" -lt "$em" ] && [ "$em" -lt "$r2" ] && [ "$r2" -lt "$b1" ]; then ok "the mark is reset before the emit (line $r1 < $em) and again before the dispatch queries (line $r2 < $b1)"; else bad "resets misplaced: reset1=$r1 emit=$em reset2=$r2 first-query=$b1"; fi
+eq "exactly two top-level resets" "$(grep -c '^_cih_mark_reset$' "$DISPATCHER")" "2"
 
 echo "== 8. mutants of the stage"
 core() { # the decisions every mutant has to break at least one of; runs the mutant harness h-mut
@@ -266,6 +364,14 @@ core() { # the decisions every mutant has to break at least one of; runs the mut
   printf '#!/bin/sh\ncase "$*" in *"--argjson held"*) exit 5 ;; esac\nexec "%s" "$@"\n' "$REALJQ" > "$FAKE/jq"; chmod +x "$FAKE/jq"
   run h-mut "$(arr "$(cand M 0)")"; rm -f "$FAKE/jq"
   [ "$OUT" = "[]" ] || echo "  ✗ a drop that cannot be applied hands the list on"
+  [ "$(mark_of)" = "/db/city~1|" ] || echo "  ✗ a drop that cannot be applied leaves no mark"
+  # the mark (gate round 1): unreadable writes it, "in hand" and "none" do not, and the per-bead lines are capped
+  reset; : > "$FIX/store.fail"; run h-mut "$(arr "$(cand A 0)" "$(cand M 0)")"
+  [ "$(mark_of)" = "/db/city~2|" ] || echo "  ✗ unreadable leaves no mark counting its candidates ($(mark_of))"
+  reset; store "$(child M.1 M open gate:queued)"; run h-mut "$(arr "$(cand M 0)")"
+  [ "$(mark_of)" = "clean" ] || echo "  ✗ children in hand marks the sweep unreadable ($(mark_of))"
+  reset; : > "$FIX/store.fail"; run h-mut "$(arr "${many[@]}")"
+  [ "$(printf '%s' "$ERRT" | grep -c 'WARN: holding B[0-9]* back')" = "5" ] || echo "  ✗ the per-bead WARN lines of an outage are not capped at 5"
 }
 mutate() { # <out> <literal old> <literal new>: no such literal (or more than one) = not a mutant = loud
   python3 -I -c 'import sys; s=sys.stdin.read(); assert s.count(sys.argv[1])==1, "mutation site not found: "+sys.argv[1][:60]; sys.stdout.write(s.replace(sys.argv[1], sys.argv[2]))' "$2" "$3" <<<"$FN" > "$1"
@@ -292,6 +398,12 @@ if [ -z "${OC_DISPATCHER_UNDER_TEST:-}" ]; then
   check_mutant "a missing verdict is kept"          'state=$(printf '"'"'%s\n'"'"' "$verdicts" | children_state_of "$bid") || state="unreadable"' 'state=$(printf '"'"'%s\n'"'"' "$verdicts" | children_state_of "$bid"); [ "$state" = unreadable ] && state=none'
   check_mutant "in-hand exclusion not logged"      'log "[pilot] EXCLUÍDO $bid por _filter_open_children: filhas em mãos (in_progress / gate / delivery) - o trabalho é das filhas" >&2' ':'
   check_mutant "unreadable not announced"          'log "[pilot] EXCLUÍDO $bid por _filter_open_children: filhas ilegíveis (bd falhou) - retido, não dispensado" >&2' ':'
+  check_mutant "unreadable not marked"             '    _cih_mark_unreadable "$db_dir" "$unread_n"' '    :'
+  check_mutant "in hand also marks the sweep"      '      hand)
+        held_ids="$held_ids $bid"' '      hand)
+        held_ids="$held_ids $bid"; unread_n=$((unread_n + 1))'
+  check_mutant "drop failure not marked"           '    _cih_mark_unreadable "$db_dir" "${ids_n:-1}"' '    :'
+  check_mutant "per-bead lines uncapped"           '        if [ "$unread_n" -le "${_CIH_LOG_IDS_MAX:-5}" ]; then' '        if true; then'
   check_mutant "drop failure hands the list on"    "    printf '[]'
     return 0
   fi
@@ -299,6 +411,23 @@ if [ -z "${OC_DISPATCHER_UNDER_TEST:-}" ]; then
     return 0
   fi
   printf '%s' \"\$filtered\""
+  # mutants of the HELPERS of the mark: each has to break at least one property helper_checks() pins
+  check_mutant_h() { # <name> <literal old> <literal new>
+    local before_fail=$FAIL before_pass=$PASS out
+    MARK_FNS_UT="$(python3 -I -c 'import sys; s=sys.stdin.read(); assert s.count(sys.argv[1])==1, "mutation site not found: "+sys.argv[1][:60]; sys.stdout.write(s.replace(sys.argv[1], sys.argv[2]))' "$2" "$3" <<<"$MARK_FNS" 2>"$WORK/mut.err")" || { MARK_FNS_UT="$MARK_FNS"; bad "helper mutant $1 could not be built: $(cat "$WORK/mut.err")"; return; }
+    out="$(helper_checks)"; MARK_FNS_UT="$MARK_FNS"
+    FAIL=$before_fail; PASS=$before_pass
+    if [ -n "$out" ]; then ok "helper mutant $1 is caught ($(printf '%s\n' "$out" | grep -c '^  ✗') check(s) fail)"; else bad "helper mutant $1 SURVIVED: no property of helper_checks() noticed it"; fi
+  }
+  check_mutant_h "a damaged line counts 0 (lenient)"       "if (\$2 ~ /^[0-9]+\$/ && \$2 + 0 > 0) s += \$2; else s += 1" "if (\$2 ~ /^[0-9]+\$/) s += \$2"
+  check_mutant_h "a mark flagged broken counts 0"          '{ [ -z "${_CIH_MARK_BROKEN:-}" ] && [ -f "$PILOT_CIH_UNREADABLE_FILE" ] && [ -r "$PILOT_CIH_UNREADABLE_FILE" ]; } || return 1' '{ [ -f "$PILOT_CIH_UNREADABLE_FILE" ] && [ -r "$PILOT_CIH_UNREADABLE_FILE" ]; } || return 1'
+  check_mutant_h "a missing mark counts 0"                 '{ [ -z "${_CIH_MARK_BROKEN:-}" ] && [ -f "$PILOT_CIH_UNREADABLE_FILE" ] && [ -r "$PILOT_CIH_UNREADABLE_FILE" ]; } || return 1' '{ [ -z "${_CIH_MARK_BROKEN:-}" ]; } || return 1; [ -f "$PILOT_CIH_UNREADABLE_FILE" ] || { printf 0; return 0; }'
+  check_mutant_h "the fold counts the whole mark"          'RIG_SCAN_UNREADABLE="${RIG_SCAN_UNREADABLE:-the children of $((_a - _b)) candidate(s) could not be read}"' 'RIG_SCAN_UNREADABLE="${RIG_SCAN_UNREADABLE:-the children of ${_a} candidate(s) could not be read}"'
+  check_mutant_h "the fold overwrites the scan reason"     'RIG_SCAN_UNREADABLE="${RIG_SCAN_UNREADABLE:-the children of' 'RIG_SCAN_UNREADABLE="${RIG_SCAN_UNREADABLE:+$RIG_SCAN_UNREADABLE; }the children of'
+  check_mutant_h "an unreadable mark does not stop the scan" 'RIG_SCAN_UNREADABLE="${RIG_SCAN_UNREADABLE:-the unreadable-children mark could not be read}"' ':'
+  check_mutant_h "a mark that cannot be kept is forgotten" '  _CIH_MARK_BROKEN=1
+' '  :
+'
 else
   echo "  ~ SKIP: mutants (OC_DISPATCHER_UNDER_TEST is set)"
 fi
