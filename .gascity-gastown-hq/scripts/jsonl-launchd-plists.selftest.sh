@@ -117,7 +117,7 @@ if mode == "plist":
         else: BAD(f"StandardErrorPath [{se}] != StandardOutPath [{so}]: the heartbeat file would never advance")
     else:
         if so and se and so != se: OK("stdout and stderr go to separate files")
-        else: BAD(f"StandardOutPath == StandardErrorPath [{so}]: a failure would look like a heartbeat")
+        else: BAD(f"StandardOutPath == StandardErrorPath [{so}]: failures would be mixed into the file that carries the run summaries")
     sys.exit(1 if bad else 0)
 
 if mode == "skip":
@@ -190,7 +190,7 @@ expect_bad "exporter ProcessType Background" "ProcessType" plist_check "$W/jx-bg
 sed 's|<key>RunAtLoad</key><true/>|<key>RunAtLoad</key><false/>|' "$JX_PLIST" > "$W/jx-noload.plist"
 expect_bad "exporter RunAtLoad false" "RunAtLoad" plist_check "$W/jx-noload.plist" "$JX_ORDER" jsonl-export.sh 1 0 1
 sed 's|jsonl-export-launchd.err|jsonl-export-launchd.out|' "$JX_PLIST" > "$W/jx-same-err.plist"
-expect_bad "exporter stderr merged into the heartbeat .out (a failure would look like a heartbeat)" "StandardOutPath == StandardErrorPath" plist_check "$W/jx-same-err.plist" "$JX_ORDER" jsonl-export.sh 1 0 1
+expect_bad "exporter stderr merged into the summary .out (failures would be mixed into the summaries)" "StandardOutPath == StandardErrorPath" plist_check "$W/jx-same-err.plist" "$JX_ORDER" jsonl-export.sh 1 0 1
 sed 's|/opt/homebrew/bin:/usr/local/bin|/usr/local/bin|' "$JX_PLIST" > "$W/jx-nopath.plist"
 expect_bad "exporter PATH without /opt/homebrew/bin first" "PATH" plist_check "$W/jx-nopath.plist" "$JX_ORDER" jsonl-export.sh 1 0 1
 

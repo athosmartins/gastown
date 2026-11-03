@@ -26,21 +26,27 @@
            lives there. Without it the script falls back to packs/maintenance and starts from a blank state.
          - the Dolt port: NOT set here on purpose. dolt-target.sh reads it from the runtime state file on every run, so a Dolt restart onto another
            port does not leave this job pointing at a dead one.
-         - `gc` and `bd` on PATH (the DOG_DONE nudge at the end; /Users/athos/.local/bin has bd) and jq/dolt/git in /opt/homebrew/bin.
+         - `gc` on PATH (the DOG_DONE nudge at the end, `|| true`: without it the run still completes) and jq/dolt/git in /opt/homebrew/bin. The script
+           calls no `bd`.
 
        NO LOCK IN THE SCRIPT (it says so in its own header: "there is no single-flight lock"). What stops two runs here: launchd never starts a second
        instance of the same label, and the order is skipped in the same deploy. What would NOT stop them: the order and this job both live at once
        (order not skipped, or skip reverted while this is loaded). The cutover order in docs/runbooks/jsonl-launchd-cutover.md is what prevents it.
 
        DISK POLICY STILL APPLIES (ga-j2f5v5, in the script): below 5 GB free it exports at most once per hour, and at the CRITICAL floor only when the
-       last export is older than 3 h. A tick that is skipped for it prints one line (`skipped-low-disk ...`), so this job's .out still advances.
+       last export is older than 3 h. A tick that is skipped for it prints one line (`skipped-low-disk ...`) to the .out and logs the same line to
+       .gc/logs/jsonl-export.log, then exits 0.
 
        ProcessType Interactive: an unset ProcessType is Standard and macOS DAS can defer such a job under load ("pended nondemand spawn = interval",
        ga-9wv5). The mini lives at load 40-60, which is exactly when the order cadence was lost. RunAtLoad: a bootstrap (install, or the watchdog
        re-loading an ABSENT job) runs a cycle right away; the disk policy decides whether it really exports.
 
-       WATCHDOG: registered in daemon-presence-watchdog.sh (DPW_CRITICAL + a heartbeat on the StandardOutPath below, limit 2700 s = 3 cycles).
-       The .out gets one line per run that ended with a summary or a skip; a run that fails prints to .err only, and two in a row are a CRASH-LOOP alert.
+       WATCHDOG: registered in daemon-presence-watchdog.sh (DPW_CRITICAL + a heartbeat, limit 2700 s = 3 cycles). The heartbeat is NOT the .out below: a clean
+       run with no change prints nothing to stdout (jsonl-export.sh: "This exit prints nothing on a clean run"), so on an idle city the .out stops moving on a
+       healthy job and the watchdog would kickstart -k it every sweep. It is the script's own log, .gc/logs/jsonl-export.log: every run that decides to export
+       logs `start pid=` and, in the EXIT trap, `end rc=N`, and a tick skipped for the disk logs `skipped-low-disk`. The .out carries the summary line of a run
+       that exported, deferred, or hit a failed database (`failed: ...`, still rc 0: not a crash-loop, same as under the order; it is in the .out and the
+       DOG_DONE nudge). A run that ends rc != 0 (e.g. the archive commit failed) writes to the .err, and two in a row are a CRASH-LOOP alert.
        INSTALL: docs/runbooks/jsonl-launchd-cutover.md (copy to ~/Library/LaunchAgents, launchctl bootstrap, after the skip is live). -->
 
   <key>ProgramArguments</key>

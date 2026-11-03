@@ -14,7 +14,7 @@
        one already watches the result from launchd; this one produces it.
 
        LOCK: unlike the exporter, this script HAS a single-flight lock (mkdir $STATE/jsonl-hourly-offsite.lock.d, owner pid, reclaimed when the owner is
-       dead or older than 120 min): a second run exits 0 in silence. So a launchd tick that lands while an order run is still going (cutover, or a
+       dead or older than 120 min): a second run logs "outro run em andamento; saindo" (to the log and stderr, so the .out still advances), uploads nothing and exits 0. So a launchd tick that lands while an order run is still going (cutover, or a
        rollback done in the wrong order) cannot double-upload. That lock is the safety the cutover leans on for this half.
 
        TIMEOUT: `timeout -k 20 2400` = the order's 2400 s. Typical run ~3 min (median 206 s, p90 326 s, max 579 s over 86 runs, order comment). The
