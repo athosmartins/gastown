@@ -1,5 +1,11 @@
 # Backup do beads (exporter + upload ao S3) rodando do launchd — cutover (ga-ki02nmt)
 
+## Contents
+
+• Ordem do cutover (não inverter) · Critério de pronto (ga-ki02nmt) — medir, não afirmar
+• Reverter (ordem inversa, também não inverter) · O que pode acender (e é esperado ou não)
+• Pendências conhecidas (não são deste cutover)
+
 **Por quê.** O despachante de orders do engine atende ~1,16 run/min contra ~14,7 pedidos/min (cada order roda a cada ~35 min, não importa o `interval`; teto de 4 orders por tick). O RPO do backup não pode depender disso. Medido em 03/11 (ga-ki02nmt):
 - `jsonl-archive` (commits do exporter, horário local -03): 08:23 → 10:24 → 12:38, ou seja **um commit a cada ~2 h** com o order de 15 min;
 - `latest.json` no S3: `data_as_of` 2 h 45 min atrás, `checked_at` 40 min atrás (o upload anda, o dado não);
