@@ -26,7 +26,7 @@ Os dois plists estão em `daemon-presence-watchdog.sh` (`DPW_CRITICAL` + `DPW_HE
 O exporter **não tem lock**: dois exporters ao mesmo tempo escrevem o mesmo archive. Por isso o order sai **antes** do plist entrar. A janela entre os passos 1 e 4 (poucos minutos) fica sem export; o próximo run recupera tudo (o export é idempotente, lê o estado atual do Dolt).
 
 1. **Merge** (o `city.toml` com o `skip` novo entra no checkout vivo) e recarregar a config: `gc --city "$GC_CITY" reload`.
-   Vai aparecer **PRESENCE-DRIFT** do `daemon-presence-watchdog` (plist em `scripts/` e ainda não carregado): esperado até o passo 4, some sozinho. Não silenciar o watchdog.
+   O `daemon-presence-watchdog` **não avisa** nesta janela (até o passo 4): os dois labels estão em `DPW_CRITICAL`, o PRESENCE-DRIFT pula quem está lá e, sem o plist em `~/Library/LaunchAgents`, o laço principal só grava `WARN critical daemon ... has no plist on disk` no log dele (sem ntfy nem mail). Esquecer o passo 4 só aparece nos alarmes de idade (`latest.json` > 75 min no S3, tabela > 120 min): faça os passos 2 a 4 em seguida. Não silenciar o watchdog.
 2. **Confirmar que os orders saíram:**
    ```bash
    gc --city "$GC_CITY" order list --json | jq -r '.orders[].name' | grep -E '^jsonl-(export|hourly-offsite)$' && echo AINDA-LISTADO || echo ok-fora
@@ -42,6 +42,7 @@ O exporter **não tem lock**: dois exporters ao mesmo tempo escrevem o mesmo arc
    ```bash
    for l in com.gascity.jsonl-export com.gascity.jsonl-hourly-offsite; do
      cp "$GC_CITY/scripts/$l.plist" ~/Library/LaunchAgents/$l.plist
+     launchctl enable "gui/$(id -u)/$l"   # inofensivo na 1ª vez; depois de um Reverter o label está disabled e o bootstrap falharia
      launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/$l.plist
    done
    ```
@@ -68,21 +69,25 @@ Com **menos de 5 GiB livres** o `jsonl-export.sh` se espaça sozinho para **no m
 
 ## Reverter (ordem inversa, também não inverter)
 
+Só o `bootout` **não segura**: os dois labels estão em `DPW_CRITICAL`, e a cada sweep (~5 min) o watchdog religa (`launchctl bootstrap`, com alerta ABSENT) todo label crítico descarregado cujo plist ainda está em `~/Library/LaunchAgents`; o `RunAtLoad` dispara um export na hora e, com o `skip` fora, são dois exporters. Só o `launchctl disable` é respeitado (`SKIP ... launchctl-disabled`: nem religa nem alerta; `_deliberately_disabled`, ga-4zyex; cenário 2b do `daemon-presence-watchdog.sh --selftest`). Então `disable` **antes** do `bootout`:
+
 ```bash
 for l in com.gascity.jsonl-export com.gascity.jsonl-hourly-offsite; do
+  launchctl disable "gui/$(id -u)/$l"   # persiste (reboot incluído): é o que segura o watchdog
   launchctl bootout "gui/$(id -u)/$l"
 done
 pgrep -fl 'jsonl-export\.sh' || echo sem-export   # esperar o run em voo terminar
 ```
-**Só depois** tirar `"jsonl-export"` e `"jsonl-hourly-offsite"` de `city.toml` `[orders] skip` (e `gc reload`). Tirar o `skip` com o plist ainda carregado = dois exporters. Remover os arquivos de `~/Library/LaunchAgents` e os plists de `scripts/` junto (senão o PRESENCE-DRIFT avisa o telefone); o `daemon-presence-watchdog` deixa de listar os labels ao tirá-los de `DPW_CRITICAL`/`DPW_HEARTBEAT`.
+**Só depois** tirar `"jsonl-export"` e `"jsonl-hourly-offsite"` de `city.toml` `[orders] skip` (e `gc reload`). Tirar o `skip` com o plist ainda carregado, ou com o label só descarregado, sem `disable` (o watchdog o religa), = dois exporters. Remover os arquivos de `~/Library/LaunchAgents` e os plists de `scripts/` junto; o `daemon-presence-watchdog` deixa de listar os labels ao tirá-los de `DPW_CRITICAL`/`DPW_HEARTBEAT` (com o label `disabled`, o PRESENCE-DRIFT de um plist que sobrar em `scripts/` fica calado: `SKIP`, ga-d0s6dc). O `disable` continua gravado no launchd depois disso: um novo cutover passa pelo `launchctl enable` do passo 4.
 
 ## O que pode acender (e é esperado ou não)
 
 | sinal | o que é |
 |---|---|
-| PRESENCE-DRIFT dos dois labels entre o merge e o passo 4 | esperado, some ao carregar |
-| ABSENT/auto-bootstrap do watchdog num label | o plist saiu do launchd: o watchdog recarrega sozinho; se repete, ver `launchctl print` |
-| heartbeat velho (2700 s exporter, 5400 s upload) → `kickstart -k` | exporter: o `jsonl-export.log` não ganhou `start`/`end`/`skipped-low-disk` em 45 min (o launchd não disparou, ou a rodada nem abriu). Upload: o `.out` sem linha por 90 min |
+| silêncio entre o `reload` e o passo 4 | sem export e **sem alerta do watchdog** (passo 1: só um `WARN` no log dele); quem acende é o alarme de idade, quando o `latest.json` passar de 75 min (S3) ou a tabela de 120 min |
+| ABSENT/auto-bootstrap do watchdog num label | o label saiu do launchd **sem** estar `disabled` e o plist está em `~/Library/LaunchAgents`: o watchdog recarrega sozinho (alerta + `RunAtLoad`); se repete, ver `launchctl print`. Depois de um Reverter é o erro a evitar (faltou o `disable`: o job volta e, sem o `skip`, são dois exporters) |
+| `SKIP <label>: launchctl-disabled (parada deliberada)` no log do watchdog | esperado depois de um Reverter: é o `disable` segurando, sem religar e sem alerta. Para voltar a rodar: passo 4 (`enable` + `bootstrap`) |
+| heartbeat velho (2700 s exporter, 5400 s upload) → `kickstart -k` | exporter: o `jsonl-export.log` não ganhou `start`/`end`/`skipped-low-disk` em 45 min (o launchd não disparou, ou a rodada nem abriu). Upload: o `.out` sem linha por 90 min. Arquivo do heartbeat **ausente** = sem veredito (`_log_age` vazio), nunca WEDGE: quem cobre é o alarme de idade |
 | `.out` do exporter vazio ou parado, com o `jsonl-export.log` andando | normal: rodada limpa sem mudança não imprime nada no stdout. Não é defeito |
 | `failed: ...` no resumo do exporter (`.out`, DOG_DONE) com rc 0 | um banco falhou e o run seguiu: NÃO conta como CRASH-LOOP (igual ao order). Ler o resumo e o `jsonl-export.log` |
 | CRASH-LOOP no upload | 2 runs seguidos com rc != 0 (rc 1 = falha de upload, rc 2 = não deu para avaliar): o script já manda o próprio alerta; é falha real, não do launchd |

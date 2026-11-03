@@ -1151,6 +1151,13 @@ PLIST
   run_sweep && bad "absent should return 1" || ok "absent critical daemon returns 1 (alert)"
   grep -q "com.gascity.beta" "$DPW_TEST_BOOTSTRAPS" && ok "absent beta was reloaded (bootstrap)" || bad "absent beta NOT reloaded"
 
+  echo "Scenario 2b (ga-ki02nmt): beta booted out but launchctl-DISABLED (the jsonl rollback: disable + bootout) → NOT re-bootstrapped, no alert; the same beta NOT disabled → re-bootstrapped"
+  : > "$DPW_TEST_BOOTSTRAPS"; : > "$LOG"; DPW_TEST_LOADED="com.gascity.alpha com.gascity.gamma"; DPW_TEST_EXIT=""; DPW_TEST_DISABLED="com.gascity.beta"
+  run_sweep && ok "disabled + absent beta (plist on disk): sweep returns 0, no alert" || bad "a launchctl-disabled absent daemon raised an alert"
+  { [ ! -s "$DPW_TEST_BOOTSTRAPS" ] && grep -q "SKIP com.gascity.beta" "$LOG"; } && ok "disabled + absent beta: NOT re-bootstrapped, skip logged" || bad "a launchctl-disabled daemon was re-bootstrapped (or its skip was not logged)"
+  DPW_TEST_DISABLED=""; run_sweep >/dev/null 2>&1
+  grep -q "com.gascity.beta" "$DPW_TEST_BOOTSTRAPS" && ok "the same beta NOT disabled: re-bootstrapped (a bare bootout does not hold)" || bad "the same beta NOT disabled was not re-bootstrapped"
+
   echo "Scenario 3: DPW_RELOAD=0 → absent alerts but does NOT reload"
   : > "$DPW_TEST_BOOTSTRAPS"; DPW_RELOAD=0; DPW_TEST_LOADED="com.gascity.alpha com.gascity.gamma"; DPW_TEST_EXIT=""
   run_sweep; [ ! -s "$DPW_TEST_BOOTSTRAPS" ] && ok "DPW_RELOAD=0 suppresses auto-reload" || bad "reloaded despite DPW_RELOAD=0"

@@ -19,7 +19,8 @@
 # the order dispatcher for launchd. `wiring` takes the upper limit of the threshold as a 4th argument (default 3000 s, unchanged for the three jobs above):
 # the offsite's own rule "> 2x StartInterval" already means > 3600 s, so a 3000 s cap could never pass it; its cap is 6000 s (3 cycles = 5400 s).
 # The exporter is the exception to "the heartbeat is the plist's StandardOutPath": a clean run with no change prints nothing to stdout, so its heartbeat is
-# the script's own log (jsonl-export.log, a `start pid=` line on every run) and `wiring` proves THAT instead (5th/6th arguments).
+# the script's own log (jsonl-export.log: `start pid=` on a run that exports, `skipped-low-disk` on a tick skipped for the disk) and `wiring` proves THAT instead
+# (5th/6th arguments): a static grep for the file name and for both writers. That they are REACHED (one start + one end rc=0 per clean run, the skip line) is jsonl-export.selftest.sh.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -36,7 +37,7 @@ nope() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n' "$1"; }
 # wiring <watchdog-script> <plist> [<label> [<cap-seconds> [<own-log-basename> <writer-script>]]]: prints "OK ..."/"BAD ..." per proof; rc 1 if any BAD. <label> is the
 # janitor's unless given; <cap-seconds> is the highest threshold that still "catches a hang" (3000 unless given). With <own-log-basename> the heartbeat is NOT the plist's
 # StandardOutPath but the log the job's own script writes (ga-ki02nmt, the exporter: a clean run with no change prints nothing to stdout, so a .out heartbeat goes stale on a
-# healthy job): the watchdog entry must name that file, and <writer-script> must default its log to it and log a `start` line on every run.
+# healthy job): the watchdog entry must name that file, and <writer-script> must default its log to it and carry both writers a heartbeat needs (`start pid=` and `skipped-low-disk`).
 wiring() {
   local s="$1" p="$2" lbl="${3-$LBL}" cap="${4-3000}" ownlog="${5-}" writer="${6-}" rc=0 line file max int out lre
   if [ ! -r "$s" ]; then echo "BAD watchdog script unreadable or missing ($s)"; return 1; fi
@@ -80,10 +81,10 @@ wiring() {
       echo "BAD heartbeat file ([$file]) is not the job's own log ([$ownlog]) — a run with no change writes nothing to the plist's .out, which would read as WEDGED"; rc=1
     elif [ -z "$writer" ] || [ ! -r "$writer" ]; then
       echo "BAD writer script unreadable or missing ([$writer]) — cannot prove it writes $ownlog"; rc=1
-    elif grep -Fq "/.gc/logs/$ownlog}" "$writer" 2>/dev/null && grep -Fq 'jex_log "start pid=' "$writer" 2>/dev/null; then
-      echo "OK heartbeat file $ownlog is the job's own log: the script defaults its log there and logs a start line on every run"
+    elif grep -Fq "/.gc/logs/$ownlog}" "$writer" 2>/dev/null && grep -Fq 'jex_log "start pid=' "$writer" 2>/dev/null && grep -Fq 'jex_log "skipped-low-disk' "$writer" 2>/dev/null; then
+      echo "OK heartbeat file $ownlog is the job's own log: the script defaults its log there and has both writers (start pid= on a run that exports, skipped-low-disk on a tick skipped for the disk)"
     else
-      echo "BAD writer script does not default its log to .gc/logs/$ownlog or does not log a start line on every run — the heartbeat would never advance"; rc=1
+      echo "BAD writer script does not default its log to .gc/logs/$ownlog or lacks the start pid= / skipped-low-disk writer — the heartbeat would stop advancing (WEDGE + kickstart -k on a healthy job)"; rc=1
     fi
   elif [ -n "$out" ] && [ "$(basename "$out")" = "$(basename "$file")" ]; then
     echo "OK plist StandardOutPath ($(basename "$out")) is the file the watchdog reads"
@@ -187,6 +188,8 @@ jsonl_job_cases() {
     expect_reprova "$tag: the script defaults its log to another file" "$DPW" "$plist" "does not default" "$lbl" "$cap" "$ownlog" "$W/$tag-writer-renamed.sh"
     sed 's|jex_log "start pid=|true "start pid=|' "$writer" > "$W/$tag-writer-nostart.sh"
     expect_reprova "$tag: the script stops logging a start line" "$DPW" "$plist" "does not default" "$lbl" "$cap" "$ownlog" "$W/$tag-writer-nostart.sh"
+    sed 's|jex_log "skipped-low-disk|true "skipped-low-disk|' "$writer" > "$W/$tag-writer-noskip.sh"
+    expect_reprova "$tag: the script stops logging the skipped-low-disk line (a tick skipped for the disk would leave the heartbeat still)" "$DPW" "$plist" "does not default" "$lbl" "$cap" "$ownlog" "$W/$tag-writer-noskip.sh"
     expect_reprova "$tag: writer script missing" "$DPW" "$plist" "writer script unreadable" "$lbl" "$cap" "$ownlog" "$W/nonexistent-writer.sh"
     expect_reprova "$tag: writer script handed over empty" "$DPW" "$plist" "writer script unreadable" "$lbl" "$cap" "$ownlog" ""
   else
@@ -202,7 +205,7 @@ JO_LBL="com.gascity.jsonl-hourly-offsite"
 JX_PLIST="${JSONL_EXPORT_PLIST_PATH:-$HERE/$JX_LBL.plist}"
 JO_PLIST="${JSONL_OFFSITE_PLIST_PATH:-$HERE/$JO_LBL.plist}"
 JX_SCRIPT="${JSONL_EXPORT_SCRIPT_PATH:-$HERE/../packs/town-deltas/assets/scripts/jsonl-export.sh}"
-# the exporter: 900 s cycle -> limit 2700 s (3 cycles, under the default 3000 s cap); its heartbeat is its OWN log (jsonl-export.log), written on every run by jsonl-export.sh.
+# the exporter: 900 s cycle -> limit 2700 s (3 cycles, under the default 3000 s cap); its heartbeat is its OWN log (jsonl-export.log), written by jsonl-export.sh on a run that exports and on a tick skipped for the disk.
 # the offsite: 1800 s cycle -> limit 5400 s, cap 6000 s; its heartbeat is the plist's .out (the script logs to stderr, merged into it).
 jsonl_job_cases "$JX_LBL" "$JX_PLIST" 2700 3000 "jsonl-export-launchd.out" "jsonl-export-launchd.err" "jsonl-export.log" "$JX_SCRIPT"
 jsonl_job_cases "$JO_LBL" "$JO_PLIST" 5400 6000 "jsonl-hourly-offsite-launchd.out" "jsonl-hourly-offsite-launchd.err"
