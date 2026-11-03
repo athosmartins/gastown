@@ -13,7 +13,7 @@
 #   de `cat-file --batch-all-objects` é redundante onde a saída já vem ordenada (git >= 2.19); o `LC_ALL=C` só vale com git traduzido (a frase que dispara o retry é em inglês).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd -P); RG=${HRG_S:-$HERE/hetzner-remote-git.sh}
-T=$(mktemp -d "${TMPDIR:-/tmp}/hrg.XXXXXX"); T=$(cd "$T" && pwd -P); chmod 700 "$T"; N=0; F=0; HRG_EXPECT=153
+T=$(mktemp -d "${TMPDIR:-/tmp}/hrg.XXXXXX"); T=$(cd "$T" && pwd -P); chmod 700 "$T"; N=0; F=0; HRG_EXPECT=164
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t GIT_TERMINAL_PROMPT=0
 export GT_REMOTE_GIT=$T/node GT_REMOTE_SSH=$T/bin/ssh GT_REMOTE_NOMUX=1 FAKE_SRV=$T/srv.git FAKE_SPEC=$T/spec REAL_GIT REAL_MKTEMP; REAL_GIT=$(command -v git); REAL_MKTEMP=$(command -v mktemp)
 ok() { N=$((N+1)); echo "ok   $N - $1"; }
@@ -169,6 +169,8 @@ grep -qF 'spec indisponível' "$LPE" && ok "espelho sem filtro: o stderr do ssh 
 # o rc de uma atribuição por $( ) nunca é lido); `remove && prune || [ ! -e ]` do wt-rm (só difere se o `prune` falhar DEPOIS de um `remove` que deu certo, e o git não faz isso; se o `remove` falha a pasta continua lá e o `[ ! -e ]`
 # também falha); o `|| return 2` do `mktemp -d` dentro de denied (sem ele o `git init /r` falha na raiz do disco para quem não é root e o rc continua 2); o `&&` -> `||` entre o `tr` e a conferência de contagem do `find` do scan
 # (se o `find` falha o `tr` não roda, $t/files não existe e a conferência é sempre falsa).
+# EQUIVALENTES do rodízio de 03/11 (ga-59jrj3d, provados por leitura): o `return 0` -> `return 1` do lag_fields (c5c184d44d: os três chamadores o chamam com `;`, e sem `set -e` o status nunca é lido) e o `|| true` -> `&& true` do
+# `old=$(g config gtremote.sparseoid || true)` do pull (fe123d753c: o status da atribuição nunca é lido; o valor é o mesmo).
 mkdir -p "$T/shim2" "$T/home"; export REAL_DATE; REAL_DATE=$(command -v date)
 printf '%s\n' '#!/bin/sh' '[ -n "${FAKE_NOW:-}" ] && [ "${1:-}" = +%s ] && { echo "$FAKE_NOW"; exit 0; }' 'exec "$REAL_DATE" "$@"' > "$T/shim2/date"   # FAKE_NOW fixa o `date +%s` do script: a idade sai exata
 printf '%s\n' '#!/bin/sh' 'case "${SHIM2_MODE:-}:${1:-}" in' '  mktempfail:-d) echo "shim: mktemp -d falhou (de proposito)" >&2; exit 1 ;;' \
@@ -300,6 +302,29 @@ SCANRIGS=sc; sc PATH="$T/shim2:$PATH" SHIM2_MODE=mktempfail
 [ "$RC" = 2 ] && ok "scan: mktemp -d falha → rc 2, nunca 0" || bad "scan com mktemp -d falhando: rc=$RC" "$OUT"
 rm -f "$T/cnt"; sc PATH="$T/shim2:$PATH" SHIM2_MODE=mktemp2fail SHIM2_CNT="$T/cnt"
 [ "$RC" = 2 ] && has 'avaliar os nomes do hist' "scan: o mktemp -d de dentro do filtro de nomes falha → o clone é NÃO consegui, não limpo" || bad "scan com o 2º mktemp -d falhando: rc=$RC" "$OUT"
+SCANRIGS=sc; sc PATH="$T/shim2:$PATH" SHIM2_MODE=mktempfail   # o 1º mktemp -d (o do próprio scan) falha: volta antes do laço, sem varrer clone nem credencial (sem o `|| return 2` o laço rodava com $t vazio)
+hasnt 'scan sc:' "scan: mktemp -d do scan falha → nenhum clone é varrido (nem 'limpo' nem 'NÃO consegui' por clone)"; hasnt 'scan credenciais' "scan: mktemp -d do scan falha → as credenciais também não são varridas"
+
+# ── lastro hq-mutants (ga-59jrj3d): o que o rodízio de 03/11 ainda achou vivo ─────────────────────────────────────────────────────────────────────────────────────────────
+# rig_of: o nome tem de passar no regex E ter repo.git. Nome válido sem clone → rc 2 (com `||` no lugar do `&&` o regex bastava e o erro virava o rc 3 do pull); nome que o regex recusa, mesmo com pasta → rc 2 também.
+wt pull semrig; [ "$RC" = 2 ] && has 'clone desconhecido: semrig' "rig_of: nome válido sem repo.git → rc 2 (não o 3 do pull)" || bad "rig_of sem clone: rc=$RC" "$OUT"
+git init -q --bare "$T/node/UP/repo.git"; wt status UP; [ "$RC" = 2 ] && has 'clone desconhecido: UP' "rig_of: nome que o regex recusa, mesmo com repo.git na pasta → rc 2" || bad "rig_of nome recusado: rc=$RC" "$OUT"
+# refspec de fetch: UM só basta para o retry (com `-gt 1` no lugar do `-gt 0` um clone com um refspec era tomado por "sem refspec") e NENHUM não refaz o fetch (nem deixa a marca da 2a tentativa)
+fresh adv; git -C "$K" config --unset-all remote.origin.fetch; git -C "$K" config --add remote.origin.fetch '+refs/remotes/origin/*:refs/remotes/origin/*'; pull
+[ "$RC" = 0 ] && has 'ref(s) ficaram FORA' "um refspec só: o retry contorna a ref de ponta ausente (o pull passa e o AVISO diz o que ficou fora)" || bad "um refspec só: rc=$RC" "$OUT"
+fresh adv; git -C "$K" config --unset-all remote.origin.fetch; pull fetchfake
+grep -qF -- '--- tentativa 2' "$LPE" && bad "sem refspec: houve uma 2a tentativa" "$(head -n 3 "$LPE")" || ok "sem refspec: nenhuma 2a tentativa foi feita"
+grep -qF 'retry não feito: o clone não tem refspec de fetch' "$LPE" && ok "sem refspec: o last-pull-error diz que o clone não tem refspec de fetch" || bad "sem refspec: nota" "$(head -n 2 "$LPE")"
+# o piso do filtro do espelho: EXATAMENTE 20 negações basta (`-ge 20`); com 19 o pull recusa
+{ echo '/*'; for i in $(seq 1 20); do echo "!/data/z$i"; done; } > "$T/spec20"; { echo '/*'; for i in $(seq 1 19); do echo "!/data/z$i"; done; } > "$T/spec19"
+fresh adv; git -C "$S" hash-object -w --stdin < "$T/spec20" > /dev/null; OUT=$(env FAKE_SPEC="$T/spec20" "$RG" pull gascity 2>&1); RC=$?
+[ "$RC" = 0 ] && has 'resultado=ok' "filtro com 20 negações (o piso): o pull passa" || bad "filtro com 20 negações: rc=$RC" "$OUT"
+fresh adv; git -C "$S" hash-object -w --stdin < "$T/spec19" > /dev/null; OUT=$(env FAKE_SPEC="$T/spec19" "$RG" pull gascity 2>&1); RC=$?
+[ "$RC" = 1 ] && has 'resultado=erro' "filtro com 19 negações (abaixo do piso): o pull falha" || bad "filtro com 19 negações: rc=$RC" "$OUT"
+# scan sem nenhum clone (só pasta que não é clone): NÃO consegui (rc 2), nunca limpo, e nem chega às credenciais
+mkdir -p "$T/node4/lixo"; OUT=$(env HOME="$T/home" GT_REMOTE_GIT="$T/node4" "$RG" scan 2>&1); RC=$?
+[ "$RC" = 2 ] && has 'scan: nenhum clone para varrer' "scan sem nenhum clone: NÃO consegui (rc 2), nunca limpo" || bad "scan sem clone: rc=$RC" "$OUT"
+hasnt 'scan credenciais' "scan sem nenhum clone: nem chega às credenciais"
 
 [ "$N" = "$HRG_EXPECT" ] || bad "casos rodados: $N, esperava $HRG_EXPECT (algum caso sumiu, ou foi acrescentado sem atualizar HRG_EXPECT)"
 echo; echo "hetzner-remote-git selftest: $((N-F))/$N ok"; [ "$F" = 0 ] && exit 0 || { echo "FAIL=$F"; exit 1; }
