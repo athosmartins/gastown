@@ -321,6 +321,8 @@ mk "kb-redondo" 'head -c $((2048 - KB0 % 1024)) /dev/zero | tr "\0" a > lib/pad.
 KB_EXPECT=$(( (KB0 + 2048 - KB0 % 1024) / 1024 ))
 # a ref de confiança em que cada guard falha com uma mensagem de 200 letras: o relatório carrega só as 120 primeiras
 mk "erros-longos" 'printf "raise ValueError(\"%s\")\n" "$(rep 200 d)" > lib/launchd_paid_guard.py; printf "def check(git_range, skipped=None):\n    raise RuntimeError(\"%s\")\n_REPO_ROOT = None\nsubprocess = None\n" "$(rep 200 a)" > scripts/check_mds_registry_guard.py; printf "def check(git_range, skipped=None):\n    raise RuntimeError(\"%s\")\n_REPO_ROOT = None\nsubprocess = None\n" "$(rep 200 b)" > scripts/check_ntfy_bypass_guard.py; printf "def check(src):\n    raise RuntimeError(\"%s\")\n" "$(rep 200 c)" > scripts/check_notify_action_prefix_guard.py'; git -C "$RIG" update-ref refs/remotes/origin/longerr "$SHA"
+# o G12 de confiança que carrega e só levanta ao RODAR (all_repo_plists é chamado fora do try do guard): a exceção sobe até o execute() e o relatório a corta em 120
+mk "g12-levanta-ao-rodar" 'printf "def all_repo_plists():\n    raise RuntimeError(\"%s\")\n" "$(rep 200 e)" >> lib/launchd_paid_guard.py'; git -C "$RIG" update-ref refs/remotes/origin/runerr "$SHA"
 mkdir -p "$T/shim2"
 cat > "$T/shim2/git" <<EOF
 #!/bin/sh
@@ -390,8 +392,8 @@ case_u_header() { uc header; }
 case_u_entries() { uc entries; }
 case_u_registry() { uc registry; }
 # Fora do alcance destes casos: a89c4d08ba 1d719f54b0 49ab621386 (equivalentes: o split do ls-tree cai no mesmo ValueError, e nl == 0 só existe com pos == 0, onde o corte é vazio dos
-# dois jeitos), b82742161c b451aff2f3 (flush=True: só se vê se o processo morre depois de escrever), d414b9aca8 f6affd9302 a01c4377f4 82a7bd8828 (pedem uma cena de G12 com 6+ plists)
-# e d4b87a34d1 (pede um guard de confiança que levante depois de carregar).
+# dois jeitos) e b82742161c b451aff2f3 (flush=True: só se vê se o processo morre depois de escrever). A cena de G12 com 6+ plists (avisos_cap: d414b9aca8 f6affd9302 a01c4377f4 82a7bd8828)
+# e o guard de confiança que levanta depois de carregar (cut_120_run: d4b87a34d1) vieram depois (ga-r8nsaot).
 case_u_git() { uc git; }
 case_u_tree() { uc tree; }
 case_u_blob() { uc blob; }
@@ -401,6 +403,23 @@ case_help() { ( cd "$T" && env -i PATH="$PATH_RUN" "$PY" -I -B "$EXE" -h ) >"$T/
 case_scratch_parents() { local d="$T/par-$RANDOM-$$/p2"; SHA=$S_CLEAN; runx -- --scratch "$d/sc"; [ "$RC" = 0 ] && [ -d "$d/sc/tree" ]; }
 case_internal_error() { : > "$T/afile"; SHA=$S_CLEAN; runx -- --scratch "$T/afile/$(rep 200 d)"; [ "$RC" = 2 ] && grep -qE "erro interno NotADirectoryError: .{160}$" "$T/out" && grep -qxF "wa-remote-guards: RESULT=UNKNOWN sha=? trusted=?" "$T/out"; }
 case_cut_120() { SHA=$S_CLEAN; runx -- --trusted-ref refs/remotes/origin/longerr; [ "$RC" = 2 ] && grep -qE "ValueError: d{120}\)$" "$T/out" && grep -qE "G6 levantou RuntimeError: a{120}$" "$T/out" && grep -qE "G7 levantou RuntimeError: b{120}$" "$T/out" && grep -qE "G7b levantou RuntimeError: c{120}$" "$T/out"; }
+case_cut_120_run() { SHA=$S_CLEAN; runx -- --trusted-ref refs/remotes/origin/runerr; [ "$RC" = 2 ] && res UNKNOWN && gl G12 UNKNOWN && grep -qE "NÃO SEI: erro interno RuntimeError: e{120}$" "$T/out"; }
+case_avisos_cap() {  # a linha AVISO do G12 lista no máximo 5 plists por tipo: 6 ilegíveis (os 6 também sem entrypoint) e 6 agendados sem script, todos já no main (um ilegível JÁ no main só avisa)
+  local D O W2 R2 saved="$RIG" r s i; D=$(mktemp -d "$T/ac.XXXXXX"); O="$D/o.git"; W2="$D/w"; R2="$D/r"
+  git init -q --bare -b main "$O"; git clone -q "$O" "$W2" 2>/dev/null; cp -R "$FIX/." "$W2/"; mkdir -p "$W2/launchd"; printf 'x = 1\n' > "$W2/lib/x.py"; printf '#!/bin/sh\n# ACTION_PREFIX_OK\n' > "$W2/scripts/notify"
+  # o scanner de confiança deste cenário também marca unresolved_entrypoint (a chave que o guard lê do scanner do WA): no plist ilegível, junto com parse_error, e no agendado sem script
+  printf '%s\n' '_raw_scan = scan_plist' 'def scan_plist(path):' '    i = _raw_scan(path)' '    if i.get("parse_error") or (i.get("scheduled") and not i.get("scripts")):' '        i["unresolved_entrypoint"] = True' '    return i' >> "$W2/lib/launchd_paid_guard.py"
+  for i in 1 2 3 4 5 6; do
+    printf '<plist><dict>\n' > "$W2/launchd/com.ruim$i.plist"
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>Label</key><string>com.cego%s</string><key>ProgramArguments</key><array><string>/usr/bin/true</string></array><key>StartInterval</key><integer>3600</integer></dict></plist>\n' "$i" > "$W2/launchd/com.cego$i.plist"
+  done
+  G -C "$W2" add -A >/dev/null && G -C "$W2" commit -qm base && G -C "$W2" push -q origin HEAD:main 2>/dev/null; git clone -q "$O" "$R2" 2>/dev/null
+  G -C "$R2" checkout -q --detach refs/remotes/origin/main && printf 'v = 1\n' > "$R2/lib/y.py" && G -C "$R2" add -A >/dev/null && G -C "$R2" commit -qm novo && s=$(git -C "$R2" rev-parse HEAD) || return 1
+  RIG=$R2; SHA=$s; runx; r=$RC; RIG=$saved
+  [ "$r" = 0 ] && res PASS && gl G12 PASS \
+    && has "$T/out" "AVISO: 6 plist(s) que o scanner não conseguiu ler" && has "$T/out" "launchd/com.ruim5.plist" && ! has "$T/out" "launchd/com.ruim6.plist" \
+    && has "$T/out" "AVISO: 6 plist(s) agendado(s) sem entrypoint resolvido" && has "$T/out" "com.cego1, com.cego2, com.cego3, com.cego4, com.cego5" && ! has "$T/out" "com.cego6"
+}
 case_sha_long() { SHA=$(rep 60 a); runx; [ "$RC" = 2 ] && has "$T/out" "recebi '$(rep 50 a)'" && grep -qxF "wa-remote-guards: RESULT=UNKNOWN sha=$(rep 40 a) trusted=?" "$T/out"; }
 case_sha_blob() { SHA=$BLOB; runx; [ "$RC" = 2 ] && has "$T/out" "${BLOB:0:12} não é um commit do rig"; }
 case_git_stderr_cut() { SHA=$S_CLEAN; runx PATH="$T/shim2:$PATH_RUN"; [ "$RC" = 2 ] && grep -qE "git cat-file -t [0-9a-f]{40}: rc=128: x{160}$" "$T/out"; }
@@ -462,6 +481,8 @@ ck scratch_parents "--scratch cria as pastas que faltam no caminho"
 ck internal_error "erro fora do execute(): rc 2, a linha RESULT=UNKNOWN com sha=? e a mensagem cortada em 160"
 ck u_registry "registro lido sem executar: docstring opcional, __future__ ignorado, uma só atribuição literal de dict; o resto (2ª docstring, chamada, outro import, outro nome, repetida, não-dict, ausente) → NÃO SEI"
 ck cut_120 "a mensagem de exceção do guard de confiança (G12 ao carregar, G6, G7, G7b ao rodar) entra no relatório cortada em 120 caracteres"
+ck cut_120_run "G12 de confiança que carrega e levanta ao RODAR (fora do try do guard): o NÃO SEI de erro interno leva a mensagem cortada em 120 caracteres"
+ck avisos_cap "G12: a linha AVISO lista no máximo 5 plists por tipo (6 ilegíveis e 6 agendados sem script no main): o 5º aparece e o 6º não, e o ilegível não conta como sem entrypoint"
 ck sha_long "--sha de 60 letras: a mensagem cita só as 50 primeiras e o RESULT as 40 primeiras"
 ck sha_blob "--sha de 40 hex que não é commit (um blob): a mensagem cita os 12 primeiros"
 ck git_stderr_cut "git que falha com 200 letras no stderr: o NÃO SEI leva as 160 primeiras"
@@ -531,6 +552,11 @@ mutant carga-corta-em-121 cut_120 'não carregou ({type(e).__name__}: {safe(e)[:
 mutant g6-corta-em-121 cut_120 'G6 levantou {type(e).__name__}: {safe(e)[:120]}' 'G6 levantou {type(e).__name__}: {safe(e)[:121]}'
 mutant g7-corta-em-121 cut_120 'G7 levantou {type(e).__name__}: {safe(e)[:120]}' 'G7 levantou {type(e).__name__}: {safe(e)[:121]}'
 mutant g7b-corta-em-121 cut_120 'G7b levantou {type(e).__name__}: {safe(e)[:120]}' 'G7b levantou {type(e).__name__}: {safe(e)[:121]}'
+mutant erro-interno-do-guard-em-121 cut_120_run 'erro interno {type(e).__name__}: {safe(e)[:120]}"]' 'erro interno {type(e).__name__}: {safe(e)[:121]}"]'
+mutant aviso-ilegiveis-sem-teto avisos_cap 'for i in broken[:5])' 'for i in broken[:6])'
+mutant aviso-sem-script-sem-teto avisos_cap 'for i in blind[:5])' 'for i in blind[:6])'
+mutant sem-script-sem-o-nao-ilegivel avisos_cap 'i.get("unresolved_entrypoint") and not i.get("parse_error")' 'i.get("unresolved_entrypoint") and i.get("parse_error")'
+mutant sem-script-ou-nao-ilegivel avisos_cap 'i.get("unresolved_entrypoint") and not i.get("parse_error")' 'i.get("unresolved_entrypoint") or not i.get("parse_error")'
 mutant sha-citado-em-51 sha_long 'recebi {safe(sha)[:50]!r}' 'recebi {safe(sha)[:51]!r}'
 mutant resultado-com-41 sha_long 'RESULT=UNKNOWN sha={safe(a.sha)[:40]}' 'RESULT=UNKNOWN sha={safe(a.sha)[:41]}'
 mutant commit-citado-em-13 sha_blob '{sha[:12]} não é um commit do rig' '{sha[:13]} não é um commit do rig'
