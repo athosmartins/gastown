@@ -47,7 +47,8 @@ killtree() {
   done
   return 0
 }
-cleanup() { killtree "$T/"; pkill -f "$T/" 2>/dev/null; sleep 0.2; chmod -R u+rwX "$T" 2>/dev/null; find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null; }
+LEAKSEC=$((20000 + $$ % 20000)); TOYSEC=$((40000 + $$ % 20000))   # durações de `sleep` ÚNICAS desta execução: só os MEUS órfãos são contados (o 7777/4242 fixos viravam falso positivo entre duas baterias ao mesmo tempo)
+cleanup() { killtree "$T/"; pkill -f "$T/" 2>/dev/null; pkill -f "^sleep ($LEAKSEC|$TOYSEC)\$" 2>/dev/null; sleep 0.2; chmod -R u+rwX "$T" 2>/dev/null; find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null; }
 trap cleanup EXIT
 trap 'exit 143' TERM INT HUP   # sem isto um TERM/INT (TaskStop, ctrl-c) pula o EXIT e deixa processos órfãos
 fails=0; n=0
@@ -61,17 +62,40 @@ W="$T/w"; mkdir -p "$W/bin"
 cat > "$W/bin/timeout" <<'EOF'
 #!/bin/sh
 # timeout de brinquedo COM prazo de verdade (o do macOS não existe): timeout [-k K] DUR cmd… ; estouro = rc 124 como o GNU
+# O relógio NÃO pode ser um `sleep DUR` filho do vigia: o `kill` do vigia mata o subshell e deixa o `sleep` órfão (ppid 1) vivo por DUR s (300 e 900 nas chamadas dos itens). Medido no nó em 03/11
+# (ga-2hd02v.5.8): ~3060 desses `sleep` por rodada deste selftest, todos na sessão do item hq-selftests, somavam 3863 MB de RSS (257 MB de PSS: página compartilhada contada por processo) e o governo
+# matava a rodada com why=rss. Por isso o vigia confere o pid de segundo em segundo e acaba sozinho quando o comando acaba; o que sobra é, no máximo, um `sleep 1`.
 [ "$1" = -k ] && shift 2
 dur=$1; shift
+# prazo que não é inteiro → rc 125 e nada roda (erro de uso é falha, não "sem prazo"): o relógio de segundo em segundo só serve a inteiros
+case "$dur" in ''|*[!0-9]*) echo "timeout (brinquedo): prazo '$dur' não é inteiro" >&2; exit 125 ;; esac
 f=$(mktemp -u "${TMPDIR:-/tmp}/tmo.XXXXXX")
 "$@" & pid=$!
-( sleep "$dur"; : > "$f"; kill -TERM "$pid" 2>/dev/null; sleep 1; kill -KILL "$pid" 2>/dev/null ) & kp=$!
+( i=0
+  while [ "$i" -lt "$dur" ]; do kill -0 "$pid" 2>/dev/null || exit 0; sleep 1; i=$((i+1)); done
+  kill -0 "$pid" 2>/dev/null || exit 0
+  : > "$f"; kill -TERM "$pid" 2>/dev/null; sleep 1; kill -KILL "$pid" 2>/dev/null ) & kp=$!
 wait "$pid"; rc=$?
+pkill -P "$kp" 2>/dev/null   # o `sleep 1` do vigia (filho dele) sai junto: depois do kill do vigia ele ficaria órfão por até 1 s; sem o comando vivo o vigia sai sozinho na volta do laço
 kill "$kp" 2>/dev/null
 [ -e "$f" ] && { rm -f "$f"; exit 124; }
 exit "$rc"
 EOF
 chmod +x "$W/bin/timeout"
+# ga-2hd02v.5.8: o timeout de brinquedo não pode deixar `sleep DUR` órfão. 20 chamadas com DUR=$TOYSEC (único desta execução), depois conta quantos `sleep $TOYSEC` ainda vivem: com o relógio
+# antigo (`sleep "$dur"` filho do vigia) sobram 20; com o novo, 0. Um `sleep 1` do vigia pode estar vivo no instante da contagem, mas não é `sleep $TOYSEC`. O prazo que estoura continua dando rc 124.
+if [ -z "${HBI_MUTANT:-}" ]; then
+  for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do "$W/bin/timeout" "$TOYSEC" true; done
+  sleep 1.2
+  left=$(ps -axo command= 2>/dev/null | grep -c "^sleep $TOYSEC\$")
+  pkill -f "^sleep $TOYSEC\$" 2>/dev/null
+  case "$left" in ''|*[!0-9]*) left="ilegivel:$left" ;; esac
+  check "timeout de brinquedo: 20 chamadas que acabam não deixam nenhum 'sleep DUR' órfão (o 'sleep DUR' filho do vigia deixava 20)" "0" "$left"
+  "$W/bin/timeout" 2 sleep 30; rc_tmo=$?
+  check "timeout de brinquedo: o prazo que estoura continua dando rc 124" "124" "$rc_tmo"
+  "$W/bin/timeout" 2.5 true 2>/dev/null; rc_frac=$?
+  check "timeout de brinquedo: prazo não inteiro é erro de uso (rc 125), não 'sem prazo'" "125" "$rc_frac"
+fi
 cat > "$W/bin/python3" <<'EOF'
 #!/bin/sh
 # python3 de brinquedo: o real, salvo que COM o arquivo $HBI_PY_CRASH o passo do RESUMO final (o único cujo texto tem "res1, res2, prev_p", "erc, short, pull" no hq-mutants ou "erc, short, hqshort" no wa-mutants) quebra — rc 1 e nada na saída, como um OOM ou um erro do interpretador
@@ -101,7 +125,7 @@ newrig() {  # repo-fonte com a árvore do hq de mentira + o repo bare que o stub
   N=$((${N:-0}+1)); BH="$T/bh$N"; GR="$T/gr$N"; SRC="$T/src$N"; RD="$T/rd$N"; mkdir -p "$BH" "$GR/gascity" "$RD"
   git init -q "$SRC"; local c="$SRC/.gascity-gastown-hq"
   mkst "$c/scripts/a.selftest.sh" 0; mkst "$c/scripts/b.selftest.sh" 1; mkst "$c/scripts/mac.selftest.sh" 1
-  mkst "$c/scripts/env.selftest.sh" 97; mkst "$c/scripts/slow.selftest.sh" 0 'sleep 8'; mkst "$c/packs/town-deltas/assets/c.selftest.sh" 0
+  mkst "$c/scripts/env.selftest.sh" 97; mkst "$c/scripts/slow.selftest.sh" 0 'exec sleep 8'; mkst "$c/packs/town-deltas/assets/c.selftest.sh" 0
   printf '# só-macOS\nscripts/mac.selftest.sh\n' > "$c/scripts/hetzner-mac-only.hq.txt"
   git -C "$SRC" add -A && git -C "$SRC" commit -q -m um && git clone -q --bare "$SRC" "$GR/gascity/repo.git" 2>/dev/null
   git -C "$GR/gascity/repo.git" update-ref refs/remotes/origin/main "$(git -C "$SRC" rev-parse HEAD)"
@@ -136,6 +160,7 @@ EOF
 chmod +x "$W/rg"
 runhq() {  # runhq [VAR=valor…] → $OUT (stdout inteiro), $RC; BALLAST_RUN_DIR novo a cada rodada
   RDN=$((${RDN:-0}+1)); RD="$T/rd$N.$RDN"; mkdir -p "$RD"
+  [ -z "${PRE_RD:-}" ] || eval "$PRE_RD"   # gancho do chamador (PRE_RD='…' runhq): prepara a pasta de trabalho antes da rodada
   OUT=$(env PATH="$W/bin:$PATH" HOME="$T/home" BALLAST_HOME="$BH" BALLAST_RUN_DIR="$RD" BALLAST_CORES=2 BALLAST_REMOTE_GIT="$W/rg" GT_REMOTE_GIT="$GR" HQ_SELFTEST_TIMEOUT=3 "$@" bash "$ITEMS/hq-selftests.sh" 2>"$W/err"); RC=$?
 }
 sj() {  # sj CAMPO — campo do último BALLAST-SUMMARY (JSON) do $OUT
@@ -150,8 +175,21 @@ print(v if isinstance(v,str) else json.dumps(v))' "$1" 2>/dev/null
 
 # ── g_hq ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 g_hq() {
+  # ga-2hd02v.5.8: o que um selftest deixa vivo no GRUPO dele sai com KILL ao acabar (senão fica na sessão do item até o fim da rodada, soma RSS por processo e o governo mata a rodada com why=rss),
+  # e o selftest que vazou aparece no resumo. Vazar NÃO reprova (a rodada é completa, rc 0). O `timeout` de brinquedo não faz setpgid como o GNU: o grupo próprio vem do `set -m` do runner.
+  newrig; mkst "$SRC/.gascity-gastown-hq/scripts/leak.selftest.sh" 0 "sleep $LEAKSEC > /dev/null 2>&1 &"
+  mkst "$SRC/.gascity-gastown-hq/scripts/brief.selftest.sh" 0 'sleep 0.4 > /dev/null 2>&1 &'   # ainda acabando ao sair (0,4 s): NÃO é vazamento
+  git -C "$SRC" add -A && git -C "$SRC" commit -q -m leak && git -C "$GR/gascity/repo.git" fetch -q "$SRC" "+HEAD:refs/remotes/origin/main"
+  runhq; sleep 0.3
+  check "hq: o que o selftest deixou vivo no grupo sai com KILL ao acabar (nenhum 'sleep DUR' sobra)" "0" "$(ps -axo command= 2> /dev/null | grep -c "^sleep $LEAKSEC\$")"
+  check "hq: ...e o selftest que vazou aparece no resumo (leaked 1, leak_names scripts/leak.selftest.sh:1)" "1 scripts/leak.selftest.sh:1" "$(sj leaked) $(sj leak_names.0)"
+  check "hq: ...e vazar não reprova: rodada completa, rc 0, só o b reprova" "0 completo 1" "$RC $(sj result) $(sj fail)"
+  newrig; PRE_RD='mkdir "$RD/leaks.tsv"' runhq
+  check "hq: leaks.tsv que não abre (é uma pasta) → leaked null (não consegui ler ≠ ninguém vazou) e a rodada segue completa" "0 completo null" "$RC $(sj result) $(sj leaked)"
+
   newrig; runhq
   check "hq: rodada completa → rc 0" "0" "$RC"
+  check "hq: ninguém deixou nada vivo → leaked 0 e leak_names vazio" "0 []" "$(sj leaked) $(sj leak_names)"
   check "hq: resultado completo" "completo" "$(sj result)"
   check "hq: 5 contam (a, b, env, slow, c); mac.selftest fica de fora (só-macOS)" "5 1" "$(sj total) $(sj skipped_mac)"
   check "hq: passou 2 (a, c) · reprovou 1 (b) · ambiente 1 (rc 97) · prazo 1 (slow, 3 s)" "2 1 1 1" "$(sj pass) $(sj fail) $(sj ambiente) $(sj timeout)"
@@ -555,6 +593,13 @@ hq-selftests.sh@@a lista só-macOS é ignorada (skip nunca vale)@@    case "$rel
 hq-selftests.sh@@lista só-macOS vazia é aceita (roda tudo)@@[ -n "$pats" ] || { say "lista só-macOS ausente@@[ -n "x" ] || { say "lista só-macOS ausente
 hq-selftests.sh@@a comparação ignora a rodada anterior (tudo que reprova é novo)@@new = sorted(set(kind["fail"]) - prev) if compare == "ok" else []@@new = sorted(set(kind["fail"])) if compare == "ok" else []
 hq-selftests.sh@@a árvore de trabalho nunca é removida@@cleanup() { [ -z "$bead" ] || { "$RG" wt-rm "$RIG" "$bead" > /dev/null 2>&1; branch_rm; }; }@@cleanup() { :; }
+hq-selftests.sh@@o que o selftest deixou vivo no grupo não é morto (a sobra fica na sessão do item)@@kill -KILL -- "-$tp" 2> /dev/null; @@
+hq-selftests.sh@@a sobra morta não é anotada em leaks.tsv@@>> "$RD/leaks.tsv"; fi@@> /dev/null; fi
+hq-selftests.sh@@processo que ainda está acabando conta como vazamento (sem a 1 s de graça e a segunda leitura)@@if [ "$left" -gt 0 ]; then sleep 1; left=@@if false; then sleep 1; left=
+hq-selftests.sh@@o selftest não ganha grupo próprio (sem set -m: com o timeout sem setpgid o kill do grupo não acha nada)@@set -m; ( cd @@( cd 
+hq-selftests.sh@@leaks.tsv que não abre vira 0 (não consegui ler = ninguém vazou)@@    leaked = None@@    leaked = 0
+hq-selftests.sh@@o resumo ignora leaks.tsv@@    for _l in open(leaks_p, encoding="utf-8"):@@    for _l in []:
+hq-selftests.sh@@o resumo não traz leaked (nem vazio)@@"leaked": leaked, "leak_names": leak_names}@@"leak_names": leak_names}
 hq-selftests.sh@@a branch worker/* não sai no fim da rodada@@"$RG" wt-rm "$RIG" "$bead" > /dev/null 2>&1; branch_rm; }; }@@"$RG" wt-rm "$RIG" "$bead" > /dev/null 2>&1; }; }
 hq-selftests.sh@@a branch velha não sai antes do wt-add (a rodada testaria a ponta de outro dia)@@branch_rm
 if ! timeout 900 "$RG" wt-add@@if ! timeout 900 "$RG" wt-add

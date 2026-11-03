@@ -18,15 +18,15 @@ USO (do mini; leva ~2 h, então SEMPRE solto do ssh):
 SAÍDA: samples.jsonl (1 linha por tick: soma de RSS/PSS da sessão inteira, MemAvailable, os 6 selftests de maior RSS e quantos processos cada um deixa vivo depois de acabar) · hot.jsonl (a lista dos
   30 maiores processos sempre que a soma passa de 60% do teto) · peaks.json (por selftest: pico de RSS/PSS/processos, rc, duração, RSS que sobrou vivo no fim; e o pico do item inteiro com a composição) ·
   tests/<nome>.log (a saída de cada selftest). Leitura: o pico do item contra o teto; se RSS >> PSS a conta do governo está inflada por página compartilhada; se o RSS do `leaked` é grande, o selftest vaza.
-SEGURANÇA: só mexe na PRÓPRIA sessão de cada selftest (sid == o líder que lancei), nunca por nome; aborta e termina tudo se MemAvailable < 8000 MB (o governo pausa os itens dele em 10240); roda em nice 19,
+SEGURANÇA: UMA sonda por vez (trava ~/gt-remote/measure/hqprobe.lock; a 2ª sai com rc 3 sem tocar na árvore da 1ª); só mexe na PRÓPRIA sessão de cada selftest (sid == o líder que lancei), nunca por nome; aborta e termina tudo se MemAvailable < 8000 MB (o governo pausa os itens dele em 10240); roda em nice 19,
   ionice idle e oom_score_adj 1000; árvore PRÓPRIA (`ballast-hq-probe`, o item usa `ballast-hq`) no origin/main do espelho; não grava baseline, ponta nem lista de reprovadas do item (hq-selftests.last/.failed/
   .durations ficam como estão) e não passa pelo governo (nem crontab, nem registro).
 VARIÁVEIS (só o selftest troca): HQP_MIN_AVAIL_MB (piso de MemAvailable do aborto; padrão 8000) · HQP_INTERVAL_S (tick; padrão 2) · HQ_SELFTEST_TIMEOUT (prazo de cada selftest; padrão 1200, o do item) ·
-  BALLAST_HQ_RIG · BALLAST_REMOTE_GIT · GT_REMOTE_GIT · BALLAST_HOME (os mesmos do item).
+  HQP_OVERLAY (pasta com arquivos copiados por cima da árvore antes de rodar, para medir um conserto ainda não mergeado) · BALLAST_HQ_RIG · BALLAST_REMOTE_GIT · GT_REMOTE_GIT · BALLAST_HOME (os mesmos do item).
 LIMITES: roda FORA do cgroup do item (sem o teto de 5120 MB do kernel): a proteção é o aborto por MemAvailable e o escopo systemd do USO acima. Mede UMA rodada: o pico depende do commit do hq e de quem
   disputa a CPU. Selftest que sai da sessão (setsid) some da conta do governo e daqui também, de propósito.
 """
-import json, os, signal, subprocess, sys, time
+import fcntl, json, os, signal, subprocess, sys, time
 
 HOME = os.path.expanduser("~")
 GR = os.environ.get("GT_REMOTE_GIT", HOME + "/gt-remote/git")
@@ -194,6 +194,14 @@ def main():
     workers = int(sys.argv[3]) if len(sys.argv) > 3 else 4
     limit = int(sys.argv[4]) if len(sys.argv) > 4 else 9000
     per_test = int(os.environ.get("HQ_SELFTEST_TIMEOUT", "1200"))
+    # trava de instância única: duas sondas usam a MESMA árvore (`ballast-hq-probe`) e a segunda apagaria a da primeira (aconteceu em 03/11, ga-2hd02v.5.8: a 1ª caiu com FileNotFoundError no meio da rodada)
+    # vazio (ninguém segura a trava) → segue; falhou/ilegível (a pasta não cria, o flock não abre) → rc 3 e nada roda: sem a trava não sei se há outra sonda, e "não sei" nunca vira "não há"
+    try:
+        os.makedirs(HOME + "/gt-remote/measure", exist_ok=True)
+        lock = open(HOME + "/gt-remote/measure/hqprobe.lock", "w")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        log("outra sonda já roda (ou a trava não abre: %s): nada roda, a árvore dela fica como está" % e); return 3
     os.makedirs(out + "/tests", exist_ok=True)
     cap = cap_mb()
     wt = "%s/%s/wt/%s" % (GR, RIG, NAME)
@@ -209,6 +217,16 @@ def main():
     if add.returncode != 0 or not os.path.isdir(tree + "/scripts"):
         log("wt-add falhou: %s" % (add.stdout + add.stderr)[-200:]); return 3
     head = subprocess.run(["git", "-C", wt, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    # HQP_OVERLAY=<pasta>: arquivos (com o caminho de dentro do hq: scripts/…) copiados POR CIMA da árvore antes de rodar, para medir um conserto que ainda não chegou ao main.
+    # vazio (variável ausente) → sem overlay; falhou/ilegível (pasta que não existe, cp que falha) → rc 3 e nada roda: medir "com o conserto" sem o conserto seria uma medição falsa
+    ov = os.environ.get("HQP_OVERLAY", "")
+    if ov:
+        if not os.path.isdir(ov):
+            log("HQP_OVERLAY '%s' não é uma pasta: nada roda" % ov); subprocess.run([RG, "wt-rm", RIG, NAME], capture_output=True); return 3
+        cp = subprocess.run(["cp", "-a", ov.rstrip("/") + "/.", tree + "/"], capture_output=True, text=True)
+        if cp.returncode != 0:
+            log("overlay não copiou (rc %d): %s" % (cp.returncode, cp.stderr[-160:])); subprocess.run([RG, "wt-rm", RIG, NAME], capture_output=True); return 3
+        log("overlay aplicado de %s" % ov)
     tests = read_tests(list_arg, tree)
     tests = [t for t in tests if os.path.isfile(os.path.join(tree, t))]
     log("árvore %s em %s; %d selftests, %d trabalhadores, limite %d s, régua %d MB" % (wt, head[:9], len(tests), workers, limit, cap))

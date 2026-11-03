@@ -8,7 +8,7 @@
 #
 # CASOS: sintaxe · wt-add rc 1 → rc 3 e nenhum selftest lançado · wt-add rc 0 sem árvore → rc 3 (vale o efeito, não o rc) · lista vazia → rc 3 · rodada de brinquedo (rc 0): os dois selftests aparecem em
 #        peaks.json com o rc deles · o que segura 60 MB tem pico de RSS >= 50 e PSS <= RSS · o que deixa o `sleep` tem leak_n >= 1 depois de acabar (o órfão conta, como no governo) · a soma do item
-#        no samples.jsonl passa de 50 MB · o piso de MemAvailable acima do que há aborta com `abortado-ram` (rc 0, nada além do aborto) · HQP_MIN_AVAIL_MB=0 / vazio / texto NÃO desligam o piso (voltam ao padrão 8000).
+#        no samples.jsonl passa de 50 MB · o piso de MemAvailable acima do que há aborta com `abortado-ram` (rc 0, nada além do aborto) · HQP_MIN_AVAIL_MB=0 / vazio / texto NÃO desligam o piso (voltam ao padrão 8000). · trava de instância única: com a trava na mão de outro processo → rc 3 sem chamar o espelho; solta → roda.
 # VARIÁVEIS: HMQ_UNDER_TEST (script a testar) · HMQ_PY (padrão /usr/bin/python3)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -102,6 +102,20 @@ check "a árvore da sonda foi removida no fim (wt-rm chamado)" "1" "$([ -e "$T/r
 home 5 "$BODY"
 run 5 "$T/list4.txt" HQP_MIN_AVAIL_MB=99999999
 check "piso de MemAvailable alto demais → aborta com 'abortado-ram'" "1" "$(printf '%s' "$OUT" | grep -c 'fim: abortado-ram')"
+# 7. instância única: com a trava na mão de OUTRO processo a sonda sai com rc 3 e NÃO chama o espelho (a árvore da outra, se houvesse, ficaria como está)
+home 7 "$BODY"; mkdir -p "$T/home.7/gt-remote/measure"
+"$PY" -I -c 'import fcntl, sys, time
+f = open(sys.argv[1], "w"); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(12)' "$T/home.7/gt-remote/measure/hqprobe.lock" &
+HOLD=$!; sleep 1
+run 7 "$T/list4.txt"
+check "outra sonda segura a trava → rc 3" "3" "$RC"
+check "outra sonda segura a trava: a mensagem diz que há outra sonda" "1" "$(printf '%s' "$OUT" | grep -c 'outra sonda')"
+check "outra sonda segura a trava: o espelho NÃO foi chamado (nem wt-rm, nem wt-add)" "0" "$(ls "$T"/rg.7.* 2> /dev/null | wc -l | tr -d ' ')"
+kill "$HOLD" 2> /dev/null; wait "$HOLD" 2> /dev/null
+# trava solta de novo (o dono morreu): a sonda roda
+home 8 "$BODY"; run 8 "$T/list4.txt"
+check "trava livre (o dono anterior morreu) → a sonda roda (rc 0)" "0" "$RC"
+
 # o parser das variáveis, direto: "0", vazio e texto caem no padrão (0 desligaria o piso); inteiro >= 1 vale. O módulo é importável (main só roda como script)
 env_val() { HQP_MIN_AVAIL_MB="$1" "$PY" -I -c 'import importlib.util, sys
 sp = importlib.util.spec_from_file_location("hqp", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m); print(m.MIN_AVAIL_MB)' "$SCRIPT" 2> /dev/null; }

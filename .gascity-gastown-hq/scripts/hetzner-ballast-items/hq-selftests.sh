@@ -6,7 +6,7 @@
 #
 # O QUE FAZ: (1) `hetzner-remote-git.sh pull` (falhou = segue com o clone que há e diz pull=falhou: código velho não é código errado) (2) se a ponta do main é a da última rodada COMPLETA, sai com
 #   "sem-novidade" (3) `wt-add` numa árvore só dele (ballast-hq, e a branch worker/ballast-hq: as duas saem no fim e também no TERM) (4) lista os *.selftest.sh, tira os da lista só-macOS que vem NA ÁRVORE
-#   (scripts/hetzner-mac-only.hq.txt, a mesma do mbp-run.sh) (5) roda em paralelo ($BALLAST_CORES), cada um com prazo, os mais lentos da rodada anterior primeiro (6) quem reprovou roda UMA vez
+#   (scripts/hetzner-mac-only.hq.txt, a mesma do mbp-run.sh) (5) roda em paralelo ($BALLAST_CORES), cada um com prazo e no grupo de processos próprio (o que ainda estiver vivo nele 1 s depois do fim sai com KILL e vai para leaked/leak_names do resumo), os mais lentos da rodada anterior primeiro (6) quem reprovou roda UMA vez
 #   de novo, com menos paralelismo (CPU disputada reprova por prazo de teste; passou na 2ª = flaky, não reprovada) (7) resumo numa linha `BALLAST-SUMMARY: {json}`: contagens e NOMES de selftest.
 # VEREDITO (por selftest, rc do `bash <x>.selftest.sh`): 0 passou · 97 ambiente (o espelho do nó não tem o que o teste quer: o mbp-run.sh chama de AMBIENTE) · 124/137 prazo (CPU disputada ou teste
 #   preso: inconclusivo, NÃO conta como reprovado) · outro = reprovou. "Novas falhas" = reprovadas que não estavam na última rodada COMPLETA. Teste que reprova é dado, não falha do item.
@@ -99,8 +99,17 @@ cat > "$RD/run-one.sh" << 'EOS'
 # $1 = selftest (relativo à árvore); $2 = arquivo de resultados. Só guarda o log de quem não passou.
 rel=$1; out=$2; name=$(printf '%s' "$rel" | tr '/' '_'); s=$(date +%s)
 mkdir -p "$RD/out"
-( cd "$TREE" && exec timeout -k 10 "$PER" bash "$rel" ) > "$RD/out/$name.log" 2>&1 < /dev/null
-rc=$?
+# `set -m`: o selftest roda no GRUPO DE PROCESSOS próprio (líder = $tp), seja qual for o `timeout` (o GNU faz setpgid sozinho; o de brinquedo e o do macOS não). Ao acabar, quem sobrou vivo nesse grupo
+# (órfão com ppid 1 que um selftest deixa para trás) continuaria contando na SESSÃO do item até o fim da rodada: em 03/11 o hetzner-ballast-items.selftest.sh deixava ~3060 `sleep 300/900` assim, somavam
+# 3863 MB de RSS (257 MB de PSS) e o governo matava a rodada com why=rss (ga-2hd02v.5.8). Aqui eles saem com KILL e o selftest que os deixou entra em leaks.tsv.
+# ps ilegível (vazio, falhou ou não numérico) → left=0: não mata nada, estado inerte. Grupo sem membro = nada a matar (kill -- -pgid só alcança quem ainda está nele).
+set -m; ( cd "$TREE" && exec timeout -k 10 "$PER" bash "$rel" ) > "$RD/out/$name.log" 2>&1 < /dev/null & tp=$!; set +m
+wait "$tp"; rc=$?
+left=$(ps -axo pgid= 2> /dev/null | awk -v g="$tp" '$1 == g' | wc -l | tr -d ' ')
+case "$left" in ''|*[!0-9]*) left=0 ;; esac
+# 1 s de graça: o que ainda está acabando (um `cmd &` que termina em milissegundos) não é vazamento; o órfão que fica por minutos continua lá na segunda leitura. Segunda leitura ilegível → 0: não mata.
+if [ "$left" -gt 0 ]; then sleep 1; left=$(ps -axo pgid= 2> /dev/null | awk -v g="$tp" '$1 == g' | wc -l | tr -d ' '); case "$left" in ''|*[!0-9]*) left=0 ;; esac; fi
+if [ "$left" -gt 0 ]; then kill -KILL -- "-$tp" 2> /dev/null; printf '%s\t%s\n' "$rel" "$left" >> "$RD/leaks.tsv"; fi
 printf '%s\t%s\t%s\n' "$rel" "$rc" "$(( $(date +%s) - s ))" >> "$out"
 [ "$rc" -ne 0 ] || rm -f "$RD/out/$name.log"
 exit 0
@@ -118,9 +127,9 @@ awk -F'\t' '$2 != 0 && $2 != 97 && $2 != 124 && $2 != 137 {print $1}' "$RD/resul
 retry_cores=$(( (CORES + 1) / 2 ))
 tr '\n' '\0' < "$RD/retry.txt" | xargs -0 -r -P "$retry_cores" -I{} bash "$RD/run-one.sh" {} "$RD/results2.tsv"
 
-python3 -I - "$RD/results.tsv" "$RD/results2.tsv" "$PREV" "$DUR" "$LAST" "${tested:0:9}" "$tested" "$pull" "$skipped" "$(( $(date +%s) - t0 ))" "$(cut -d' ' -f1 /proc/loadavg 2> /dev/null || echo 0)" "$load0" << 'PY'
+python3 -I - "$RD/results.tsv" "$RD/results2.tsv" "$PREV" "$DUR" "$LAST" "${tested:0:9}" "$tested" "$pull" "$skipped" "$(( $(date +%s) - t0 ))" "$(cut -d' ' -f1 /proc/loadavg 2> /dev/null || echo 0)" "$load0" "$RD/leaks.tsv" << 'PY'
 import json, os, sys
-res1, res2, prev_p, dur_p, last_p, short, full, pull, skipped, secs, load1, load0 = sys.argv[1:13]
+res1, res2, prev_p, dur_p, last_p, short, full, pull, skipped, secs, load1, load0, leaks_p = sys.argv[1:14]
 
 def rd(p):
     out = {}
@@ -143,6 +152,20 @@ for rel, (rc, _s) in sorted(r1.items()):
         kind["flaky"].append(rel)
     else:
         kind["fail"].append(rel)
+# quem deixou processo vivo no grupo ao acabar (leaks.tsv: selftest TAB quantos; um selftest repetido na 2ª tentativa conta UMA vez). vazio (arquivo ausente: ninguém deixou) → 0 e []; falhou/ilegível
+# (existe e não abre) → None: "não consegui ler" nunca vira "ninguém vazou"
+leaked, leak_names = 0, []
+try:
+    _lk = {}
+    for _l in open(leaks_p, encoding="utf-8"):
+        _a = _l.rstrip("\n").split("\t")
+        if len(_a) == 2 and _a[1].isdigit():
+            _lk[_a[0]] = max(_lk.get(_a[0], 0), int(_a[1]))
+    leaked, leak_names = len(_lk), ["%s:%d" % (k, v) for k, v in sorted(_lk.items(), key=lambda kv: -kv[1])[:8]]
+except FileNotFoundError:
+    pass
+except (OSError, UnicodeDecodeError):
+    leaked = None
 # vazio (sem a lista anterior) → primeira; falhou/ilegível (não abre) → indisponivel, a linha de base NÃO anda sem comparação confiável
 compare, prev = "primeira", set()
 if os.path.exists(prev_p):
@@ -156,7 +179,7 @@ new = sorted(set(kind["fail"]) - prev) if compare == "ok" else []
 # hetzner-ballast.sh troca o resumo INTEIRO por null/"grande-demais" acima de 8000, e isso levaria as contagens junto; as contagens (fail, flaky, …) seguem exatas, só a lista de nomes é cortada
 d = {"result": "completo", "main": short, "pull": pull, "total": len(r1), "pass": len(kind["pass"]), "fail": len(kind["fail"]), "flaky": len(kind["flaky"]),
      "ambiente": len(kind["ambiente"]), "timeout": len(kind["timeout"]), "skipped_mac": int(skipped), "compare": compare, "new_fail_n": len(new), "new_fail": new[:15],
-     "fail_names": kind["fail"][:25], "flaky_names": kind["flaky"][:10], "timeout_names": kind["timeout"][:10], "secs": int(secs), "secs_tests": sum(s for _, s in r1.values()), "load1_start": load0, "load1_end": load1}
+     "fail_names": kind["fail"][:25], "flaky_names": kind["flaky"][:10], "timeout_names": kind["timeout"][:10], "secs": int(secs), "secs_tests": sum(s for _, s in r1.values()), "load1_start": load0, "load1_end": load1, "leaked": leaked, "leak_names": leak_names}
 def stage(path, text):
     # falhou (OSError) → levanta: nada foi trocado ainda e o chamador sai com 3; um alvo que é PASTA falha aqui, não só na troca (que viria depois do resumo)
     if os.path.isdir(path):
