@@ -13,6 +13,8 @@
 # FRONTEIRAS (ga-eedg7fw, hq-mutants): relógio de mentira (inproc.py/units.py) para cair EXATAMENTE em cada limite: since, o pareamento 0..120 s do dry-run, o despacho sem linha em since, o orçamento de 120 s das leituras de bead.
 #   Mutantes EQUIVALENTES do lastro, sem caso (nenhum teste de comportamento os distingue): (a) `nao_conf[bead] = nao_conf.get(bead, 0) + 1` com `0 → 1`: só as CHAVES de nao_conf são lidas (sorted(nao_conf), len(nao_conf)), nunca o valor;
 #   (b) `1 <= int(a.hours) <= 99999` com `99999 → 100000`: o `re.fullmatch("[0-9]{1,5}")` da mesma linha já impede um 6º dígito, então o teto 99999 nunca é o que barra.
+#   Rodízio de 03/11 (ga-59jrj3d): (a') `nao_conf.get(bead, 0) + 1` com `+ 1 → + 0` (c97a912d1c): o mesmo motivo de (a), o valor nunca é lido. (c) `text=True → False` no `bd show` (b0c724ee37): só difere se o `bd` imprimir bytes que não são UTF-8, e aí o ORIGINAL
+#   morre com UnicodeDecodeError (medido: rc 1 com traceback, o `except (OSError, SubprocessError)` não o pega) enquanto o mutante diz "bd show: JSON ilegível" e segue: matar o mutante exigiria fixar um travamento como esperado, ou consertar o script; fica vivo e a falha vai no relato da entrega.
 # CONTROLE NEGATIVO: cada mutante troca UMA linha do relatório numa cópia e o caso designado tem de reprovar.
 # COMO RODAR: bash scripts/wa-node-evidence-return.selftest.sh   (macOS /bin/bash 3.2 e Linux; ~20 s no nó)
 set -u
@@ -178,6 +180,7 @@ rmdir "$L"
 expect "--hours 0 = uso errado, rc 2" 2 '-' --hours 0
 expect "--hours abc = uso errado, rc 2" 2 '-' --hours abc
 expect "--hours 100000 = uso errado, rc 2" 2 '-' --hours 100000
+expect "--hours 99999 (o teto) vale: rc 0 e a janela sai como 99999 h" 0 'nas últimas 99999 h' --hours 99999
 expect "--hours com dígito não-ASCII (²) = rc 2, não traceback" 2 '-' --hours "²"
 expect "--hours com dígitos árabe-índicos = rc 2" 2 '-' --hours "١٢"
 if ! grep -q Traceback "$T/err"; then ok "e sem traceback no stderr"; else bad "traceback no stderr"; fi
@@ -262,6 +265,9 @@ fixed_case; bead wa-d; { apply_s 499 wa-d 0 "$DR"; pilot_s 500 wa-d auto 0 "$EV"
 fexpect "dry-run: Pilot 1 s ANTES do apply (a linha do Pilot não pode preceder o despachante) NÃO pareia" 0 '"dry_run_linhas": 0, "sem_confirmacao_do_despachante": \["wa-d"\]' $J
 fixed_case; bead wa-d2; { apply_s 600 wa-d2 0 "$DR"; pilot_s 590 wa-d2 auto 0 "$EV"; pilot_s 580 wa-d2 auto 0 "$EV"; } > "$L"
 fexpect "dry-run: UM apply serve a UMA linha do Pilot (a 2ª fica sem confirmação)" 0 '"dry_run_linhas": 1, "sem_confirmacao_do_despachante": \["wa-d2"\]' $J
+# dois applies ao alcance da 1ª linha do Pilot (70 s e 50 s antes dela), e a 2ª linha só alcança o mais recente (115 s contra 135 s): a 1ª fica com o MAIS RECENTE e a 2ª sobra sem confirmação (ga-59jrj3d)
+fixed_case; bead wa-d3; { apply_s 400 wa-d3 0 "$DR"; apply_s 380 wa-d3 0 "$DR"; pilot_s 330 wa-d3 auto 0 "$EV"; pilot_s 265 wa-d3 auto 0 "$EV"; } > "$L"
+fexpect "dry-run: dois applies ao alcance, a linha do Pilot fica com o MAIS RECENTE; a seguinte só alcançava esse e fica sem confirmação" 0 '"dry_run_linhas": 1, "sem_confirmacao_do_despachante": \["wa-d3"\]' $J
 # um despacho e duas linhas do Pilot na janela: a 1ª (mais antiga) fica com ele, e é a evidência DELA que vale
 fixed_case; bead wa-o; { apply_s 1000 wa-o 0 "$SD"; pilot_s 995 wa-o auto 0 "$EV"; pilot_s 990 wa-o auto 0 "$SEM"; } > "$L"
 fexpect "duas linhas do Pilot, um despacho: a linha MAIS ANTIGA pareia (evidência True), a outra fica sem confirmação" 0 '"com_evidencia": 1, "sem_evidencia": 0.*"sem_confirmacao_do_despachante": \["wa-o"\]' $J
