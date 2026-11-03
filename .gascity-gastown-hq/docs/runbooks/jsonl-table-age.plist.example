@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.jsonl-table-age</string>
+
+  <!-- Table age alarm of the JSONL export archive, the leg that does NOT depend on the gc controller (ga-ieo0wz1). READY, NOT INSTALLED.
+
+       WHAT: runs the table age mode of packs/town-deltas/assets/scripts/jsonl-hourly-offsite.sh. It scans <archive>/<db>/<table>.jsonl mtimes and pushes a phone alert when the OLDEST table of
+       a live database is older than 120 min (JHO_TABLE_AGE_ALERT_S), or when it could not measure twice in a row. Read only and local: no aws, no lock, no git; its own state file
+       (.gc/runtime/packs/town-deltas/jsonl-table-age-state.json), shared with the order of the same name so one incident pushes one alert (6 h throttle), not two.
+
+       WHY A LAUNCHD JOB AND NOT ONLY AN ORDER: the order (orders/jsonl-table-age.toml) goes live on merge, but the controller serves each `cooldown` order once per rotation of its dispatcher
+       (median ~35 min, measured 2026-11-03: it dispatches at most 4 orders per tick against ~14.7 asked per minute), and a stalled controller serves none. Same reasoning and same shape as
+       jsonl-hourly-offsite-age (ga-c0939v.8).
+
+       WHY IT IS A .example IN docs/runbooks AND NOT IN scripts/: daemon-presence-watchdog.sh scans $HQ/scripts for any com.gascity.* plist that is not loaded and alerts (PRESENCE-DRIFT).
+       A plist authored there before it is bootstrapped would page. To install (Mayor):
+         1. cp this file to $HQ/scripts/com.gascity.jsonl-table-age.plist (git mv it out of docs/runbooks in the same commit) and to ~/Library/LaunchAgents/
+         2. launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gascity.jsonl-table-age.plist
+         3. register it in scripts/daemon-presence-watchdog.sh like jsonl-hourly-offsite-age: DPW_CRITICAL plus the heartbeat line
+            com.gascity.jsonl-table-age|$HQ/.gc/logs/jsonl-table-age.out|1500   (the limit is above 2x StartInterval)
+         4. check: `launchctl print gui/$(id -u)/com.gascity.jsonl-table-age | grep -E 'state|last exit'` and one line TABLES: in the .out file.
+
+       CADENCE: StartInterval=600. One scan reads 8 directories: well under 1 s. PATH has /opt/homebrew/bin on purpose: jq lives there, and without it every run would end as UNKNOWN (tool
+       missing) and alert on the second one. The job reads the archive under packs/maintenance/jsonl-archive of the city runtime: GC_CITY_PATH below is what points it there. -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/jsonl-hourly-offsite.sh</string>
+    <string>--table-age</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartInterval</key><integer>600</integer>
+  <key>RunAtLoad</key><true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/jsonl-table-age.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/jsonl-table-age.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+  </dict>
+</dict>
+</plist>

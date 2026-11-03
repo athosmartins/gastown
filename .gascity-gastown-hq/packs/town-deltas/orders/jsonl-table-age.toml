@@ -1,0 +1,16 @@
+# ga-ieo0wz1: alarme de idade da TABELA no archive do export JSONL (a mais velha entre os bancos vivos, limite 120 min, JHO_TABLE_AGE_ALERT_S).
+# Por que existe: um export parcial (`partial=`/`deferred=` no assunto do commit) deixa tabelas de vários bancos 2-3 h na versão anterior enquanto o upload anda e o `issues.jsonl` está fresco.
+# O `--age-check` (jsonl-hourly-offsite-age) mede o upload e o `register_partial` zera num HEAD limpo; nenhum olhava a idade do DADO. Medido em 24 h (30/10-03/11, 106 commits do archive): a tabela
+# mais velha do HEAD passou de 120 min em 20% do tempo, 8% se todo commit fosse completo (só a cadência). Detalhe e tabela de estados: cabeçalho de assets/scripts/jsonl-hourly-offsite.sh e
+# docs/runbooks/jsonl-hourly-offsite.md.
+# Três estados, e só o primeiro é "em dia": em dia / atrasado / sem leitura (archive ausente, nenhum banco vivo, mtime no futuro: avisa na 2ª verificação seguida).
+# É um order SEPARADO do upload e do exporter de propósito: quem atrasa não pode ser quem avisa. Só leitura, local (sem aws, sem lock, sem git), estado próprio.
+# interval 10m, mas o despachante da cidade serve cada order `cooldown` uma vez por rodízio (~35 min mediana, medido em 03/11: ga-ieo0wz1), então o aviso sai uns 35-70 min depois de cruzar os 120 min.
+#   Roda no controller: controller parado NÃO é visto por aqui (a perna launchd, docs/runbooks/jsonl-table-age.plist.example, está pronta e NÃO instalada).
+# timeout 120s: uma varredura de 8 bancos x 6 arquivos leva menos de 1 s; passou disso, algo está errado e o run diz por quê.
+[order]
+description = "Alarm: age of the oldest table in the JSONL export archive (ga-ieo0wz1) — late/unreadable are both distinct from up-to-date"
+trigger = "cooldown"
+interval = "10m"
+timeout = "120s"
+exec = "$PACK_DIR/assets/scripts/jsonl-hourly-offsite.sh --table-age"

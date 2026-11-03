@@ -725,6 +725,141 @@ AGE_EXEC="$(toml_get "$AGE_TOML" exec)"; AGE_EXEC="${AGE_EXEC%% --age-check}"
 tsec() { case "$1" in *s) echo "${1%s}" ;; *m) echo $(( ${1%m} * 60 )) ;; *h) echo $(( ${1%h} * 3600 )) ;; *) echo "?" ;; esac; }
 [ "$(tsec "$(toml_get "$AGE_TOML" timeout)")" -lt 600 ] 2>/dev/null && ok "o alarme tem timeout curto (menor que o intervalo)" || bad "timeout do alarme: $(toml_get "$AGE_TOML" timeout)"
 
+# ── 13f. alarme de idade da TABELA no archive (ga-ieo0wz1) ────────────────────────────────────────
+# O export parcial esconde o RPO: o upload anda (latest.json novo), o `issues.jsonl` está fresco, e 35 tabelas de 7 bancos ficam 2-3 h na versão anterior (`partial=`/`deferred=` no assunto do commit). O
+# `register_partial` zera num HEAD limpo (padrão medido: parcial/limpo/parcial/limpo) e o `--age-check` mede o upload. `--table-age` mede o DADO: a idade da tabela mais velha entre os bancos vivos
+# (mtime de <banco>/<tabela>.jsonl no archive), limite 120 min. Só leitura, local (sem aws, sem lock), estado próprio. Três estados: EM DIA rc 0 / ATRASADO rc 1 / SEM LEITURA rc 2 (nunca "em dia").
+echo "-- 13f. --table-age: idade da tabela mais velha do archive (ga-ieo0wz1)"
+TAGEF() { echo "$S/state/jsonl-table-age-state.json"; }
+TST() { jqf "$1" "$(TAGEF)"; }
+tage() { # args extras; env extra por prefixo. ARCH_OVR troca o archive. Sem aws (JHO_AWS aponta para o nada de propósito) e SEM o utime do offsite(): aqui cada teste põe a idade de cada tabela
+  OUT="$(JHO_ARCHIVE="${ARCH_OVR:-$ARCH}" JHO_STATE_DIR="$S/state" JHO_LOG="$S/log/offsite.log" JHO_AWS=/nao/existe/aws JHO_NOTIFY="${NOTIFY_BIN:-$WORK/bin/notify}" \
+        NOTIFY_LOG="$S/notify.log" JHO_NOW=$((T0 + NOW_OFF)) "$SCRIPT" --table-age "$@" 2>"$S/stderr")"
+  RC=$?
+}
+age_all() { # idade (s), no relógio de mentira, de TODA tabela de todo banco
+  python3 -I -c 'import glob,os,sys;t=int(sys.argv[1]);[os.utime(p,(t,t)) for p in glob.glob(sys.argv[2]+"/*/*.jsonl")]' $((T0 + NOW_OFF - $1)) "$ARCH"
+}
+age_one() { # arquivo relativo ao archive, idade (s)
+  python3 -I -c 'import os,sys;t=int(sys.argv[1]);os.utime(sys.argv[2],(t,t))' $((T0 + NOW_OFF - $2)) "$ARCH/$1"
+}
+age_dir() { # diretório relativo, idade (s) de todos os .jsonl dele
+  python3 -I -c 'import glob,os,sys;t=int(sys.argv[1]);[os.utime(p,(t,t)) for p in glob.glob(sys.argv[2]+"/*.jsonl")]' $((T0 + NOW_OFF - $2)) "$ARCH/$1"
+}
+
+# (a) tudo fresco: em dia, rc 0, sem alerta; a linha diz o que foi medido (2 bancos x 6 tabelas)
+new_env tage1; NOW_OFF=0; age_all 600; tage
+eq "tabelas de 10 min: rc 0 e 'TABLES: OK'" "$RC:${OUT:0:10}" "0:TABLES: OK"
+case "$OUT" in *"age=600s"*"limit=7200s"*"dbs=2 tables=12 retired=0"*) ok "a linha diz idade, limite e o que contou (dbs=2 tables=12 retired=0)" ;; *) bad "linha: $OUT" ;; esac
+eq "sem alerta e estado 'ok'" "$(pushed):$(TST .last_state)" "0:ok"
+[ ! -e "$S/state/jsonl-hourly-offsite-state.json" ] && [ ! -d "$S/state/jsonl-hourly-offsite.lock.d" ] && ok "não cria o estado nem o lock do upload; roda sem aws (JHO_AWS inexistente)" || bad "tocou o estado/lock do upload"
+# nem timeout: o alarme é local (o upload e o --age-check é que precisam de timeout GNU para o aws). PATH só com jq, python3 e o sistema base
+mkdir -p "$WORK/notimeout"; for t in jq python3; do ln -sf "$(command -v "$t")" "$WORK/notimeout/$t"; done
+NT_PATH="$WORK/notimeout:/usr/bin:/bin:/usr/sbin:/sbin"
+if PATH="$NT_PATH" command -v timeout >/dev/null 2>&1 || PATH="$NT_PATH" command -v gtimeout >/dev/null 2>&1; then
+  ok "(este sistema tem timeout no PATH base; caso 'sem timeout' pulado)"
+else
+  new_env tage1b; NOW_OFF=0; age_all 600; PATH="$NT_PATH" tage
+  eq "sem timeout/gtimeout no PATH: mede igual (rc 0, 'TABLES: OK'), não vira 'timeout ausente'" "$RC:${OUT:0:10}" "0:TABLES: OK"
+fi
+
+# (b) o limite: 7200 s ainda em dia, 7201 s atrasado, e a linha NOMEIA a tabela
+new_env tage2; NOW_OFF=0; age_all 600; age_one hq/comments.jsonl 7200; tage
+eq "exatamente no limite (7200 s): em dia, rc 0" "$RC:${OUT:0:10}" "0:TABLES: OK"
+age_one hq/comments.jsonl 7201; tage
+eq "1 s além do limite: ATRASADO rc 1 e o alerta CHEGA ao telefone (push forçado)" "$RC:${OUT:0:12}:$(pushed)" "1:TABLES: LATE:1"
+case "$OUT" in *"oldest=hq/comments age=7201s limit=7200s"*) ok "a linha nomeia a tabela mais velha (hq/comments) com a idade e o limite" ;; *) bad "linha: $OUT" ;; esac
+grep -q -- '-p 4' "$S/notify.log" && grep -q 'tabela' "$S/notify.log" && ok "alerta: título próprio (tabela) e prioridade 4" || bad "alerta mal formado: $(cat "$S/notify.log")"
+case "$(cat "$S/notify.pushed" 2>/dev/null)" in *hq/comments*120*) ok "o texto do alerta nomeia a tabela e o limite em minutos" ;; *) bad "texto: $(cat "$S/notify.pushed" 2>/dev/null)" ;; esac
+# a mais velha entre TODAS manda, não a primeira que passa do limite
+new_env tage3; NOW_OFF=0; age_all 600; age_one hq/labels.jsonl 7300; age_one wa/metadata.jsonl 9000; tage
+case "$OUT" in *"oldest=wa/metadata age=9000s"*) ok "com duas acima do limite a linha traz a MAIS VELHA (wa/metadata, 9000 s)" ;; *) bad "linha: $OUT" ;; esac
+case "$(cat "$S/notify.pushed" 2>/dev/null)" in *hq/labels*) ok "o alerta também lista a outra tabela acima do limite (hq/labels)" ;; *) bad "alerta sem a 2ª tabela: $(cat "$S/notify.pushed" 2>/dev/null)" ;; esac
+
+# (c) 1 alerta a cada 6 h; recuperou e atrasou de novo => na hora
+new_env tage4; NOW_OFF=0; age_all 600; age_one hq/comments.jsonl 8000; tage
+eq "1º run atrasado: alerta" "$RC:$(pushed)" "1:1"
+NOW_OFF=900; tage; eq "15 min depois, ainda atrasado: rc 1, sem novo alerta" "$RC:$(pushed)" "1:1"
+NOW_OFF=$((900 + 21600)); tage; eq "6 h depois, ainda atrasado: o alerta repete" "$(pushed)" 2
+NOW_OFF=30000; age_all 100; tage
+eq "tabelas renovadas: rc 0, o relógio do alerta zera e o log registra a volta" "$RC:${OUT:0:10}:$(TST .last_alert_epoch):$(grep -c 'voltou ao normal' "$S/log/offsite.log")" "0:TABLES: OK:0:1"
+age_one hq/comments.jsonl 7201; tage
+eq "atrasou de novo logo depois de recuperar: alerta NA HORA" "$RC:$(pushed)" "1:3"
+
+# (d) banco aposentado (nenhum arquivo dele andou há mais de 7 dias) não conta, mas aparece em retired=; no limite de 7 dias ainda é vivo
+new_env tage5; NOW_OFF=0; write_db bench_hq_copy b-1; write_db velho v-1; age_all 600; age_dir velho 604801; tage
+eq "banco com tudo parado há 7 d + 1 s: aposentado, não conta, em dia" "$RC:${OUT:0:10}" "0:TABLES: OK"
+case "$OUT" in *"dbs=2 tables=12"*"retired=1"*) ok "a linha mostra retired=1 (quem foi descontado fica à vista)" ;; *) bad "linha: $OUT" ;; esac
+age_dir velho 604800; tage
+eq "no limite de 7 d (604800 s) o banco ainda é vivo: conta e atrasa o alarme" "$RC:${OUT:0:12}" "1:TABLES: LATE"
+age_dir velho 604801; age_one velho/issues.jsonl 3600; tage
+eq "um arquivo recente basta para o banco ser vivo (as outras 5 tabelas dele ficam velhas => ATRASADO)" "$RC:${OUT:0:12}" "1:TABLES: LATE"
+
+# (e) bancos de benchmark/teste (mesma lista do upload, JHO_IGNORE_DBS) não entram na conta
+new_env tage6; NOW_OFF=0; write_db bench_hq_copy b-1; write_db fixdepkeys_abc f-1; age_all 600; age_dir bench_hq_copy 86400; age_dir fixdepkeys_abc 86400; tage
+eq "bench_*/fixdepkeys_* com 1 dia: ignorados, rc 0, e fora de dbs=" "$RC:${OUT:0:10}" "0:TABLES: OK"
+case "$OUT" in *"dbs=2 tables=12"*) ok "só hq e wa contados (dbs=2 tables=12)" ;; *) bad "linha: $OUT" ;; esac
+JHO_IGNORE_DBS="" tage
+eq "JHO_IGNORE_DBS vazio desliga o filtro: os bancos de teste passam a contar => ATRASADO" "$RC:${OUT:0:12}" "1:TABLES: LATE"
+
+# (f) SEM LEITURA nunca é "em dia": archive ausente, sem banco vivo, mtime no futuro. Conta, e avisa na 2ª seguida
+new_env tage7; NOW_OFF=0; age_all 600; ARCH_OVR="$S/nao-existe" tage
+eq "archive inexistente: rc 2, 'TABLES: UNKNOWN' (não é OK), 1ª sem alerta, contador 1" "$RC:${OUT:0:15}:$(pushed):$(TST .consecutive_unreadable)" "2:TABLES: UNKNOWN:0:1"
+case "$OUT" in *"não li o archive"*) ok "o motivo é a leitura que falhou (não li o archive), não 'nenhum banco vivo'" ;; *) bad "motivo: $OUT" ;; esac
+case "$OUT" in *"nenhum banco vivo"*) bad "falha de leitura foi confundida com archive vazio: $OUT" ;; *) ok "e não é dito como archive vazio" ;; esac
+ARCH_OVR="$S/nao-existe" tage
+eq "2ª seguida: o alerta sai e diz que não conseguiu medir" "$RC:$(pushed):$(TST .consecutive_unreadable)" "2:1:2"
+case "$(cat "$S/notify.pushed" 2>/dev/null)" in *"não consegui"*) ok "o texto diz que não conseguiu medir (e não que há tabela velha)" ;; *) bad "texto: $(cat "$S/notify.pushed" 2>/dev/null)" ;; esac
+ARCH_OVR="$S/nao-existe" tage; eq "3ª seguida dentro das 6 h: sem novo alerta, contador segue" "$(pushed):$(TST .consecutive_unreadable)" "1:3"
+tage; eq "archive de volta: rc 0 e o contador de ilegível zera" "$RC:${OUT:0:10}:$(TST .consecutive_unreadable)" "0:TABLES: OK:0"
+mkdir -p "$S/vazio"; ARCH_OVR="$S/vazio" tage
+eq "archive vazio (nenhum banco): rc 2, não 'em dia por falta de tabela'" "$RC:${OUT:0:15}" "2:TABLES: UNKNOWN"
+case "$OUT" in *"nenhum banco vivo"*) ok "e a linha diz o motivo (nenhum banco vivo), não um erro de leitura genérico" ;; *) bad "motivo: $OUT" ;; esac
+new_env tage8; NOW_OFF=0; age_all 600; age_dir wa -3600; tage
+eq "tabelas 1 h NO FUTURO (relógio torto): rc 2, não 'em dia'" "$RC:${OUT:0:15}" "2:TABLES: UNKNOWN"
+age_dir wa -120; tage
+eq "2 min no futuro (diferença de relógio tolerável): idade 0, rc 0" "$RC:${OUT:0:10}" "0:TABLES: OK"
+# o clamp só aparece quando a mais velha É a do futuro (todas no futuro): a linha não pode mostrar idade negativa
+new_env tage8b; NOW_OFF=0; age_all -120; tage
+case "$OUT" in *"age=0s "*) ok "todas 2 min no futuro: a linha mostra age=0s (idade negativa é cortada em 0)" ;; *) bad "idade negativa vazou para a linha: $OUT" ;; esac
+new_env tage9; NOW_OFF=0; age_all 100000; age_dir wa 700000; age_dir hq 700000; tage
+eq "todos os bancos parados há mais de 7 d: nenhum vivo => rc 2 (exporter morto não vira 'tudo aposentado, tudo bem')" "$RC:${OUT:0:15}" "2:TABLES: UNKNOWN"
+case "$OUT" in *"nenhum banco vivo"*"aposentados=2"*) ok "e diz quantos foram aposentados (aposentados=2)" ;; *) bad "motivo: $OUT" ;; esac
+new_env tage10; NOW_OFF=0; age_all 600; chmod 000 "$ARCH/hq"; tage; chmod 755 "$ARCH/hq"
+[ "$(id -u)" = 0 ] && ok "(rodando como root: chmod 000 não barra a leitura; caso pulado)" || eq "diretório de banco ilegível: rc 2 (não conta como 'sem tabelas' nem como fresco)" "$RC:${OUT:0:15}" "2:TABLES: UNKNOWN"
+
+# (g) alerta que não foi entregue não gasta o limite de 6 h
+new_env tage11; NOW_OFF=0; age_all 600; age_one hq/comments.jsonl 8000; NOTIFY_RC=12 tage
+eq "notify sai rc 12 (digest mudo): AVISO no log, sem 'enviado', sem last_alert_epoch" "$RC:$(grep -c 'alerta NÃO entregue' "$S/log/offsite.log"):$(grep -c 'alerta enviado' "$S/log/offsite.log"):$(TST '.last_alert_epoch // "none"')" "1:1:0:none"
+NOW_OFF=60; tage; eq "run seguinte (notify de volta): entrega" "$(pushed)" 1
+
+# (h) só leitura: não muda uma tabela, não pega o lock do upload, não mexe no estado dele; o limite é configurável
+new_env tage12; NOW_OFF=0; age_all 600; printf '{"consecutive_not_ok":3}\n' > "$ST"; SUM0="$(cksum < "$ST")"; mt() { python3 -I -c 'import glob,os,sys;print(sorted((p,os.stat(p).st_mtime_ns) for p in glob.glob(sys.argv[1]+"/*/*.jsonl")))' "$ARCH" | cksum; }; M0="$(mt)"
+mkdir -p "$S/state/jsonl-hourly-offsite.lock.d"; echo 1 > "$S/state/jsonl-hourly-offsite.lock.d/pid"
+tage; eq "com o lock do upload tomado: roda igual (rc 0)" "$RC:${OUT:0:10}" "0:TABLES: OK"
+eq "e deixa o estado do upload e as tabelas (mtime) intactos" "$(cksum < "$ST"):$(mt)" "$SUM0:$M0"
+rm -rf "$S/state/jsonl-hourly-offsite.lock.d"
+new_env tage13; NOW_OFF=0; age_all 700; JHO_TABLE_AGE_ALERT_S=600 tage
+eq "JHO_TABLE_AGE_ALERT_S=600 e tabela de 700 s: ATRASADO" "$RC:${OUT:0:12}" "1:TABLES: LATE"
+age_all 500; JHO_TABLE_AGE_ALERT_S=600 tage; eq "JHO_TABLE_AGE_ALERT_S=600 e tabela de 500 s: em dia" "$RC:${OUT:0:10}" "0:TABLES: OK"
+JHO_TABLE_AGE_ALERT_S=abc tage; eq "limite ilegível não vira 'sem limite': rc 2" "$RC:${OUT:0:15}" "2:TABLES: UNKNOWN"
+case "$OUT" in *"limite não numérico"*) ok "e o motivo é o limite (não um 'não li o archive' vindo do python)" ;; *) bad "motivo: $OUT" ;; esac
+# arquivo temporário do exporter (`<tabela>.jsonl.tmp`, fica para trás se o run morre no meio) não é tabela: não conta nem alarma
+new_env tage14; NOW_OFF=0; age_all 600; : > "$ARCH/hq/comments.jsonl.tmp"; age_one hq/comments.jsonl.tmp 100000; tage
+eq "'.jsonl.tmp' velho ao lado de tabelas frescas: rc 0 (não é tabela)" "$RC:${OUT:0:10}" "0:TABLES: OK"
+case "$OUT" in *"tables=12 "*) ok "e não entra na conta (tables=12, as 12 de verdade)" ;; *) bad "contou o .tmp: $OUT" ;; esac
+OUT="$(JHO_ARCHIVE="$ARCH" JHO_STATE_DIR="$S/state" JHO_LOG="$S/log/offsite.log" "$SCRIPT" --nao-existe 2>&1)"; RC=$?
+eq "modo desconhecido continua rc 3 e o uso cita --table-age" "$RC:$(echo "$OUT" | grep -c -- '--table-age')" "3:1"
+
+# (i) o order: 10 min, o MESMO script com --table-age, timeout curto
+TBL_TOML="$ORDERS_DIR/jsonl-table-age.toml"
+[ -f "$TBL_TOML" ] && ok "order do alarme de tabela existe" || bad "order ausente: $TBL_TOML"
+eq "order: cooldown de 10m" "$(toml_get "$TBL_TOML" trigger):$(toml_get "$TBL_TOML" interval)" "cooldown:10m"
+eq "order chama o MESMO script com --table-age" "$(toml_get "$TBL_TOML" exec)" '$PACK_DIR/assets/scripts/jsonl-hourly-offsite.sh --table-age'
+TBL_EXEC="$(toml_get "$TBL_TOML" exec)"; TBL_EXEC="${TBL_EXEC%% --table-age}"
+[ -x "${TBL_EXEC/\$PACK_DIR/$ORDERS_DIR/..}" ] && ok "o exec do order resolve para um script executável" || bad "exec do order não resolve: $TBL_EXEC"
+[ "$(tsec "$(toml_get "$TBL_TOML" timeout)")" -lt 600 ] 2>/dev/null && ok "o order tem timeout curto (menor que o intervalo)" || bad "timeout do order: $(toml_get "$TBL_TOML" timeout)"
+
 echo "-- 14. helper python (suíte própria)"
 if [ -n "${JHO_SKIP_PYSUITE:-}" ]; then
   # só para a campanha de mutantes do SHELL (a suíte python tem a campanha dela); numa rodada normal isto nunca é ligado

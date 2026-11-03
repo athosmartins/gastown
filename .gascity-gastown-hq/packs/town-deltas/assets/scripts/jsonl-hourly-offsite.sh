@@ -64,6 +64,12 @@
 #   recuperou e atrasou de novo => avisa de novo na hora · rc 2 SEM LEITURA (aws/jq/python3 ausente, S3 mudo, 403, LastModified ausente, ilegível, sem fuso ou no futuro) => NUNCA "em dia": conta, e avisa na
 #   JHO_AGE_UNREADABLE_AFTER-ésima (2) seguida, para uma falha de rede isolada não acordar ninguém. Estado próprio (jsonl-hourly-offsite-age-state.json), sem lock, nada escrito no S3 nem no estado do upload.
 #   NÃO vê o controller parado (o order roda nele). A perna launchd que não depende dele está pronta e NÃO instalada: docs/runbooks/jsonl-hourly-offsite-age.plist.example, bead ga-c0939v.8.
+# MODO --table-age (ga-ieo0wz1): alarme de idade da TABELA, só leitura, em order próprio de 10 min. O export parcial (`partial=`/`deferred=` no assunto do commit) esconde o RPO: o upload anda, o `issues.jsonl`
+#   está fresco e tabelas de vários bancos ficam 2-3 h na versão anterior; o `register_partial` zera num HEAD limpo e o `--age-check` mede o upload, não o dado. Aqui: mtime de <banco>/<tabela>.jsonl no
+#   archive local (a mesma fonte do "fonte parada"), a MAIS VELHA entre os bancos vivos contra JHO_TABLE_AGE_ALERT_S (120 min). Banco vivo = tem arquivo .jsonl que andou em JHO_TABLE_RETIRED_S (7 d) e não casa
+#   JHO_IGNORE_DBS; o descontado aparece em retired=. TRÊS estados: rc 0 EM DIA · rc 1 ATRASADO (notify forçado na hora, 1 a cada JHO_ALERT_EVERY_S, recuperou e atrasou de novo => na hora) · rc 2 SEM LEITURA
+#   (archive ausente/ilegível, nenhum banco vivo, mtime no futuro, limite não numérico, ferramenta ausente) => NUNCA "em dia": avisa na JHO_TABLE_UNREADABLE_AFTER-ésima (2) seguida. Sem aws, sem lock, sem
+#   git: estado próprio (jsonl-table-age-state.json). Limite: lê o mtime da ÁRVORE DE TRABALHO; um run que escreveu e morreu antes do commit mostra tabela fresca que o HEAD (o que sobe) ainda não tem.
 #
 # COSTURAS DE TESTE: JHO_LIB=1 só define funções; JHO_ARCHIVE, JHO_STATE_DIR, JHO_LOG, JHO_AWS, JHO_NOTIFY, JHO_NOW (epoch), JHO_FREE_MB (espaço livre, em MB) apontam para fixtures.
 set -uo pipefail
@@ -104,6 +110,10 @@ AGE_UNREADABLE_AFTER="${JHO_AGE_UNREADABLE_AFTER:-2}"           # verificações
 AGE_S3_TIMEOUT="${JHO_AGE_S3_TIMEOUT:-60}"                      # o alarme é um head-object: não espera 20 min por um S3 mudo
 AGE_STATE_FILE="$STATE_DIR/jsonl-hourly-offsite-age-state.json"
 MAIN_STATE_FILE="$STATE_FILE"                                   # o estado do upload: o alarme só o LÊ (contexto do aviso)
+TABLE_AGE_ALERT_S="${JHO_TABLE_AGE_ALERT_S:-7200}"              # 120 min (ga-ieo0wz1): tabela mais velha do archive acima disso => ATRASADO (a meta de 1 h aperta isto quando a cadência fechar)
+TABLE_RETIRED_S="${JHO_TABLE_RETIRED_S:-604800}"                # banco em que NENHUM arquivo andou há mais disto (7 d) = sobra aposentada: não conta, mas aparece em retired=
+TABLE_UNREADABLE_AFTER="${JHO_TABLE_UNREADABLE_AFTER:-2}"       # verificações seguidas sem leitura até avisar
+TABLE_STATE_FILE="$STATE_DIR/jsonl-table-age-state.json"
 STATUS_MAX_CHECK_AGE_S="${JHO_STATUS_MAX_CHECK_AGE_S:-$AGE_ALERT_S}"   # o mesmo limite do alarme (antes 2h30, quando o order era horário)
 STALE_SOURCE_S="${JHO_STALE_SOURCE_S:-21600}"                  # exporter sem reescrever os bancos obrigatórios há mais de 6 h => fonte parada (medido: runs a cada 27 min, máx 189)
 # ga-tyaozh: sem isso o aws-cli embrulha o corpo num AwsChunkedWrapper que não rebobina e aborta o retry (mesma razão do dolt-s3-backup.sh)
@@ -291,6 +301,79 @@ s3_put_verified() {
   return 0
 }
 
+# ── --table-age (ga-ieo0wz1) ───────────────────────────────────────────────────────────────────
+# Varre <archive>/<banco>/*.jsonl e devolve UM json: dbs, tables, retired, ignored, oldest, oldest_age, over ([[db/tabela, idade]] acima do limite, mais velha primeiro), future ([db/tabela, ...] com mtime
+# mais de 300 s adiante do relógio). Até 300 s no futuro vale idade 0. Falha de leitura => rc 3 e o motivo no stderr (nunca um json "vazio" que pareça archive sem banco).
+TABLE_SCAN_PY='
+import fnmatch, json, os, sys
+arch, now, limit, retired_s, ign = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+pats = [p.strip() for p in ign.split(",") if p.strip()]
+res = {"dbs": 0, "tables": 0, "retired": 0, "ignored": 0, "oldest": None, "oldest_age": None, "over": [], "future": []}
+try:
+    names = sorted(os.listdir(arch))
+except OSError as e:
+    sys.stderr.write("não listei o archive: %s\n" % e); sys.exit(3)
+rows = []
+for n in names:
+    d = os.path.join(arch, n)
+    if n.startswith(".") or not os.path.isdir(d):
+        continue
+    if any(fnmatch.fnmatch(n, p) for p in pats):
+        res["ignored"] += 1
+        continue
+    try:
+        ages = [(n + "/" + f[:-6], now - int(os.stat(os.path.join(d, f)).st_mtime)) for f in sorted(os.listdir(d)) if f.endswith(".jsonl")]
+    except OSError as e:
+        sys.stderr.write("não li o banco %s: %s\n" % (n, e)); sys.exit(3)
+    if not ages:
+        continue
+    if min(a for _, a in ages) > retired_s:
+        res["retired"] += 1
+        continue
+    res["dbs"] += 1
+    for name, age in ages:
+        if age < -300:
+            res["future"].append(name)
+        rows.append((name, max(age, 0)))
+res["tables"] = len(rows)
+if rows:
+    rows.sort(key=lambda r: (-r[1], r[0]))
+    res["oldest"], res["oldest_age"] = rows[0]
+    res["over"] = [[n, a] for n, a in rows if a > limit]
+print(json.dumps(res))
+'
+
+notify_table() { NOTIFY_FORCE_PUSH=1 NOTIFY_STRICT_EXIT=1 "$NOTIFY" -t "Jsonl: tabela velha no archive" -p 4 "🚨 $*" >/dev/null 2>&1; }
+
+# Mesmo contrato do age_alert (no máx. 1 a cada ALERT_EVERY_S; só rc 0 é entregue e gasta o limite; sem como gravar o relógio de aviso, o aviso sai a cada run), com título próprio.
+table_alert() { # texto
+  local now last arc
+  now="$(now_epoch)"; last="$(state_get '.last_alert_epoch' 0)"
+  [ $((now - last)) -ge "$ALERT_EVERY_S" ] || return 0
+  notify_table "$*"; arc=$?
+  if [ $arc -eq 0 ]; then
+    state_update '.last_alert_epoch = $e' --argjson e "$now" || log "TABELA: AVISO: alerta saiu mas last_alert_epoch não gravou (repete no próximo run)"
+    log "TABELA: alerta enviado"
+  else
+    log "TABELA: AVISO: alerta NÃO entregue (rc=$arc); o próximo run tenta de novo"
+  fi
+}
+
+# Não consegui medir a idade das tabelas: NÃO é "em dia". Conta; avisa na TABLE_UNREADABLE_AFTER-ésima seguida.
+table_unreadable() { # motivo
+  local reason="$1" n after="$TABLE_UNREADABLE_AFTER"
+  case "$after" in ""|*[!0-9]*) after=2 ;; esac   # o próprio limite de contagem ilegível não pode calar o alarme
+  n="$(state_get '.consecutive_unreadable' 0)"; n=$((n + 1))
+  state_update '.consecutive_unreadable = $n | .last_check_at = $t | .last_state = "unreadable" | .last_reason = $r' --argjson n "$n" --arg t "$(iso_now)" --arg r "$reason" \
+    || { log "TABELA: AVISO: não gravei o estado do alarme; sem contador, aviso já"; n=$after; }
+  log "TABELA: SEM LEITURA ($n seguida(s)): $reason"
+  echo "TABLES: UNKNOWN $reason"
+  if [ "$n" -ge "$after" ]; then
+    table_alert "não consegui medir a idade das tabelas do archive JSONL ($n verificações seguidas sem leitura): $reason. Sem leitura não é 'em dia': tabela parada pode estar escondida atrás de um upload que anda."
+  fi
+  exit 2
+}
+
 if [ "${JHO_LIB:-0}" = "1" ]; then return 0 2>/dev/null || exit 0; fi
 
 # ═════════════════════════════ execução ═════════════════════════════════════════════════
@@ -298,22 +381,24 @@ MODE="run"
 case "${1:-}" in
   --status) MODE="status" ;;
   --age-check) MODE="age"; STATE_FILE="$AGE_STATE_FILE"; S3_TIMEOUT="$AGE_S3_TIMEOUT" ;;   # estado e timeout próprios; o do upload (MAIN_STATE_FILE) só é lido
+  --table-age) MODE="tableage"; STATE_FILE="$TABLE_STATE_FILE" ;;   # estado próprio; local: sem aws, sem lock
   "") ;;
   -h|--help) sed -n '2,/^set -uo/{/^set -uo/!p;}' "${BASH_SOURCE[0]}"; exit 0 ;;
-  *) echo "uso: jsonl-hourly-offsite.sh [--status | --age-check]" >&2; exit 3 ;;
+  *) echo "uso: jsonl-hourly-offsite.sh [--status | --age-check | --table-age]" >&2; exit 3 ;;
 esac
 
 unknown() { # rc 2, sem veredito. Em run conta como run sem snapshot (antes só stderr: PATH sem /opt/homebrew/bin falhava toda hora, mudo); em --age-check conta como verificação sem leitura; em --status só diz
   if [ "$MODE" = run ]; then log "UNKNOWN: $*"; register_not_ok "unknown: $*"; echo "RESULT: unknown $*"
   elif [ "$MODE" = age ]; then age_unreadable "$*"
+  elif [ "$MODE" = tableage ]; then table_unreadable "$*"
   else echo "UNKNOWN: $*" >&2; fi
   exit 2
 }
-NEED_TOOLS="jq git python3"; [ "$MODE" != age ] || NEED_TOOLS="jq python3"   # o alarme só lê o S3: não usa git nem o helper
-[ -n "$TIMEOUT_BIN" ] || unknown "timeout (GNU) ausente"
+NEED_TOOLS="jq git python3"; [ "$MODE" != age ] && [ "$MODE" != tableage ] || NEED_TOOLS="jq python3"   # os alarmes só leem (S3 / arquivos): não usam git nem o helper
+[ "$MODE" = tableage ] || [ -n "$TIMEOUT_BIN" ] || unknown "timeout (GNU) ausente"   # --table-age é local: nem timeout nem aws
 for t in $NEED_TOOLS; do command -v "$t" >/dev/null 2>&1 || unknown "$t ausente"; done
-[ -x "$AWS" ] || command -v "$AWS" >/dev/null 2>&1 || unknown "aws ausente ($AWS)"
-[ "$MODE" = age ] || [ -f "$PY" ] || unknown "helper ausente: $PY"
+[ "$MODE" = tableage ] || [ -x "$AWS" ] || command -v "$AWS" >/dev/null 2>&1 || unknown "aws ausente ($AWS)"
+[ "$MODE" = age ] || [ "$MODE" = tableage ] || [ -f "$PY" ] || unknown "helper ausente: $PY"
 
 # ── --status ─────────────────────────────────────────────────────────────────────────────
 if [ "$MODE" = status ]; then
@@ -374,6 +459,41 @@ if [ "$MODE" = age ]; then
   log "IDADE: ATRASADO: latest.json com ${age}s (limite ${AGE_ALERT_S}s, LastModified $lm)$ctx"
   echo "AGE: LATE age=${age}s limit=${AGE_ALERT_S}s last_modified=$lm"
   age_alert "latest.json no S3 tem $((age / 60)) min (limite $((AGE_ALERT_S / 60)) min): o upload horário do JSONL não renovou o objeto desde $lm.$ctx"
+  exit 1
+fi
+
+# ── --table-age (ga-ieo0wz1) ──────────────────────────────────────────────────────────────────────────
+if [ "$MODE" = tableage ]; then
+  now="$(now_epoch)"
+  # vazio/ilegível → o limite não existe: SEM LEITURA (um limite vazio viraria "tudo está atrasado" ou, pior, "nada está")
+  case "$TABLE_AGE_ALERT_S$TABLE_RETIRED_S$TABLE_UNREADABLE_AFTER" in *[!0-9]*) unknown "limite não numérico: JHO_TABLE_AGE_ALERT_S='$TABLE_AGE_ALERT_S' JHO_TABLE_RETIRED_S='$TABLE_RETIRED_S' JHO_TABLE_UNREADABLE_AFTER='$TABLE_UNREADABLE_AFTER'" ;; esac
+  [ -n "$TABLE_AGE_ALERT_S" ] && [ -n "$TABLE_RETIRED_S" ] && [ -n "$TABLE_UNREADABLE_AFTER" ] || unknown "limite vazio (JHO_TABLE_*)"
+  herr="$(mktemp "${TMPDIR:-/tmp}/jho-tbl.XXXXXX")" || unknown "mktemp falhou"
+  trap 'rm -f "$herr"' EXIT
+  # falhou (archive ausente, banco ilegível) → SEM LEITURA, nunca um archive "sem tabela velha"
+  tjson="$(python3 -I -c "$TABLE_SCAN_PY" "$ARCHIVE" "$now" "$TABLE_AGE_ALERT_S" "$TABLE_RETIRED_S" "$IGNORE_DBS" 2>"$herr")" \
+    || unknown "não li o archive $ARCHIVE: $(tail -c 200 "$herr" | tr '\n' ' ')"
+  # ilegível (json fora da forma) → SEM LEITURA
+  summary="$(printf '%s' "$tjson" | jq -r '"\(.dbs) \(.tables) \(.retired) \(.ignored) \(.future | length) \(.over | length) \(.oldest // "-") \(.oldest_age // "-")"' 2>/dev/null)" || unknown "resposta ilegível do leitor de tabelas: '${tjson:0:120}'"
+  read -r n_dbs n_tables n_retired n_ignored n_future n_over oldest oage <<< "$summary"
+  case "$n_dbs$n_tables$n_retired$n_ignored$n_future$n_over" in ""|*[!0-9]*) unknown "contagens ilegíveis do leitor de tabelas: '$summary'" ;; esac
+  # vazio → nenhum banco vivo: o archive está vazio, ou todo banco parou há mais de 7 d (exporter morto): NÃO é "em dia por falta de tabela"
+  [ "$n_future" -eq 0 ] || unknown "$n_future tabela(s) com mtime mais de 300s no futuro (ex.: $(printf '%s' "$tjson" | jq -r '.future[0]')): relógio daqui fora de hora"
+  [ "$n_dbs" -gt 0 ] && [ "$n_tables" -gt 0 ] || unknown "nenhum banco vivo em $ARCHIVE (aposentados=$n_retired, ignorados=$n_ignored): o exporter não escreve há mais de $((TABLE_RETIRED_S / 86400)) d, ou o archive está vazio"
+  [[ "$oage" =~ ^[0-9]+$ ]] || unknown "idade ilegível ('$oage') para $oldest"
+  prev="$(state_get '.last_state' '')"
+  line="oldest=$oldest age=${oage}s limit=${TABLE_AGE_ALERT_S}s dbs=$n_dbs tables=$n_tables retired=$n_retired"
+  if [ "$oage" -le "$TABLE_AGE_ALERT_S" ]; then
+    state_update '.consecutive_unreadable = 0 | .last_alert_epoch = 0 | .last_check_at = $t | .last_state = "ok" | .last_age_s = $a' --arg t "$(iso_now)" --argjson a "$oage" || log "TABELA: AVISO: estado do alarme não gravado"
+    case "$prev" in late|unreadable) log "TABELA: voltou ao normal (tabela mais velha com ${oage}s, $oldest; antes: $prev)" ;; esac
+    echo "TABLES: OK $line"
+    exit 0
+  fi
+  others="$(printf '%s' "$tjson" | jq -r '.over[1:6] | map("\(.[0]) \((.[1] / 60) | floor) min") | join(", ")' 2>/dev/null)"   # só enfeite do texto; vazio/falha = sem a lista, o aviso sai igual
+  state_update '.consecutive_unreadable = 0 | .last_check_at = $t | .last_state = "late" | .last_age_s = $a' --arg t "$(iso_now)" --argjson a "$oage" || log "TABELA: AVISO: estado do alarme não gravado (sem relógio de aviso, o aviso sai a cada run)"
+  log "TABELA: ATRASADO: $oldest com ${oage}s (limite ${TABLE_AGE_ALERT_S}s); $n_over tabela(s) acima do limite"
+  echo "TABLES: LATE $line over=$n_over"
+  table_alert "${n_over} tabela(s) do archive JSONL com mais de $((TABLE_AGE_ALERT_S / 60)) min; a mais velha é $oldest com $((oage / 60)) min. Um export parcial ou adiado deixou a versão anterior: o upload horário pode estar em dia com dado velho dentro.${others:+ Também acima: $others.}"
   exit 1
 fi
 

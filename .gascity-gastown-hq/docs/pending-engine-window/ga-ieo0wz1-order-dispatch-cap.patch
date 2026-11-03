@@ -1,0 +1,294 @@
+diff --git a/cmd/gc/order_dispatch.go b/cmd/gc/order_dispatch.go
+index ab92046..41173a3 100644
+--- a/cmd/gc/order_dispatch.go
++++ b/cmd/gc/order_dispatch.go
+@@ -351,6 +351,19 @@ func orderSetSignature(aa []orders.Order) string {
+ 	return fmt.Sprintf("%x", sum[:])
+ }
+ 
++// orderDispatchBudget returns how many orders one controller tick may start:
++// [orders] max_dispatches_per_tick when it is a positive integer, otherwise
++// defaultMaxOrderDispatchesPerTick. Zero, a negative value and "unset" all mean
++// the default; the dispatcher's own "<= 0 = unlimited" is not reachable from
++// config. The default must stay equal to the one documented on
++// config.OrdersConfig.MaxDispatchesPerTick (and in docs/reference/config.md).
++func orderDispatchBudget(cfg *config.City) int {
++	if cfg != nil && cfg.Orders.MaxDispatchesPerTick > 0 {
++		return cfg.Orders.MaxDispatchesPerTick
++	}
++	return defaultMaxOrderDispatchesPerTick
++}
++
+ func buildOrderDispatcherFromOrderSet(cityPath string, cfg *config.City, allAA []orders.Order, rec events.Recorder, stderr io.Writer) orderDispatcher {
+ 	if cfg == nil {
+ 		cfg = &config.City{}
+@@ -386,7 +399,7 @@ func buildOrderDispatcherFromOrderSet(cityPath string, cfg *config.City, allAA [
+ 		rec:                  rec,
+ 		stderr:               lockedStderr(stderr),
+ 		maxTimeout:           cfg.Orders.MaxTimeoutDuration(),
+-		maxDispatchesPerTick: defaultMaxOrderDispatchesPerTick,
++		maxDispatchesPerTick: orderDispatchBudget(cfg),
+ 		cfg:                  cfg,
+ 		cityName:             loadedCityName(cfg, cityPath),
+ 		dispatchCtx:          dispatchCtx,
+diff --git a/cmd/gc/order_dispatch_budget_test.go b/cmd/gc/order_dispatch_budget_test.go
+new file mode 100644
+index 0000000..9557bb6
+--- /dev/null
++++ b/cmd/gc/order_dispatch_budget_test.go
+@@ -0,0 +1,115 @@
++package main
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"testing"
++	"time"
++
++	"github.com/gastownhall/gascity/internal/beads"
++	"github.com/gastownhall/gascity/internal/config"
++	"github.com/gastownhall/gascity/internal/events"
++	"github.com/gastownhall/gascity/internal/orders"
++)
++
++func TestOrderDispatchBudget(t *testing.T) {
++	// The default is documented as 4 on config.OrdersConfig.MaxDispatchesPerTick
++	// and in docs/reference/config.md. Changing it means changing those too.
++	if defaultMaxOrderDispatchesPerTick != 4 {
++		t.Fatalf("defaultMaxOrderDispatchesPerTick = %d; update the default documented on OrdersConfig.MaxDispatchesPerTick and rerun go run ./cmd/genschema", defaultMaxOrderDispatchesPerTick)
++	}
++	withBudget := func(n int) *config.City {
++		cfg := &config.City{}
++		cfg.Orders.MaxDispatchesPerTick = n
++		return cfg
++	}
++	cases := []struct {
++		name string
++		cfg  *config.City
++		want int
++	}{
++		{"nil config", nil, defaultMaxOrderDispatchesPerTick},
++		{"unset", &config.City{}, defaultMaxOrderDispatchesPerTick},
++		{"zero is the default, not unlimited", withBudget(0), defaultMaxOrderDispatchesPerTick},
++		{"negative is the default, not unlimited", withBudget(-3), defaultMaxOrderDispatchesPerTick},
++		{"one", withBudget(1), 1},
++		{"above the default", withBudget(12), 12},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := orderDispatchBudget(tc.cfg); got != tc.want {
++				t.Errorf("orderDispatchBudget() = %d, want %d", got, tc.want)
++			}
++		})
++	}
++}
++
++// The production builder is the only place the budget comes from config.
++func TestBuildOrderDispatcherUsesConfiguredBudget(t *testing.T) {
++	aa := []orders.Order{{Name: "budget-probe", Trigger: "cooldown", Interval: "1m", Exec: "true"}}
++	for _, tc := range []struct {
++		name string
++		set  int
++		want int
++	}{
++		{"unset keeps the default", 0, defaultMaxOrderDispatchesPerTick},
++		{"configured value reaches the dispatcher", 9, 9},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			cfg := &config.City{}
++			cfg.Orders.MaxDispatchesPerTick = tc.set
++			ad := buildOrderDispatcherFromOrderSet(t.TempDir(), cfg, aa, events.Discard, &bytes.Buffer{})
++			m, ok := ad.(*memoryOrderDispatcher)
++			if !ok {
++				t.Fatalf("dispatcher = %T, want *memoryOrderDispatcher", ad)
++			}
++			t.Cleanup(m.cancel)
++			if m.maxDispatchesPerTick != tc.want {
++				t.Errorf("maxDispatchesPerTick = %d, want %d", m.maxDispatchesPerTick, tc.want)
++			}
++		})
++	}
++}
++
++// With more orders due than the cap, one tick starts exactly cap of them; a
++// higher configured cap starts more in the same tick.
++func TestOrderDispatchConfiguredBudgetChangesOrdersPerTick(t *testing.T) {
++	for _, tc := range []struct {
++		name string
++		set  int
++		want int
++	}{
++		{"default cap", 0, defaultMaxOrderDispatchesPerTick},
++		{"raised cap", 6, 6},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			store := beads.NewMemStore()
++			var aa []orders.Order
++			for i := 0; i < 8; i++ {
++				aa = append(aa, orders.Order{
++					Name:     fmt.Sprintf("order-%d", i),
++					Trigger:  "cooldown",
++					Interval: "1m",
++					Exec:     "true",
++				})
++			}
++			ad := buildOrderDispatcherFromListExec(aa, store, nil, func(context.Context, string, string, []string) ([]byte, error) {
++				return []byte("ok\n"), nil
++			}, nil)
++			if ad == nil {
++				t.Fatal("expected non-nil dispatcher")
++			}
++			cfg := &config.City{}
++			cfg.Orders.MaxDispatchesPerTick = tc.set
++			ad.(*memoryOrderDispatcher).maxDispatchesPerTick = orderDispatchBudget(cfg)
++
++			ad.dispatch(context.Background(), t.TempDir(), time.Date(2026, 5, 19, 2, 30, 0, 0, time.UTC))
++			ad.drain(context.Background())
++
++			if got := countOrderTrackingRuns(t, store); got != tc.want {
++				t.Fatalf("orders started in one tick = %d, want %d", got, tc.want)
++			}
++		})
++	}
++}
+diff --git a/docs/reference/config.md b/docs/reference/config.md
+index 14d03ce..6e7dbac 100644
+--- a/docs/reference/config.md
++++ b/docs/reference/config.md
+@@ -551,6 +551,7 @@ OrdersConfig holds order settings.
+ |-------|------|----------|---------|-------------|
+ | `skip` | []string |  |  | Skip lists order names to exclude from scanning. |
+ | `max_timeout` | string |  |  | MaxTimeout is an operator hard cap on per-order timeouts. No order gets more than this duration. Go duration string (e.g., "60s"). Empty means uncapped (no override). |
++| `max_dispatches_per_tick` | integer |  | `4` | MaxDispatchesPerTick caps how many orders one controller tick may start. Orders due beyond the cap wait for a later tick; a rotating cursor keeps the wait fair. A positive integer. Unset or 0 keeps the default of 4. Raise it when more orders are due on every tick than the cap lets through, so that each one runs far less often than its interval says. |
+ | `overrides` | []OrderOverride |  |  | Overrides apply per-order field overrides after scanning. Each override targets an order by name and optionally by rig. |
+ 
+ ## PackDefaults
+diff --git a/docs/schema/city-schema.json b/docs/schema/city-schema.json
+index 60d73c7..b084204 100644
+--- a/docs/schema/city-schema.json
++++ b/docs/schema/city-schema.json
+@@ -1925,6 +1925,11 @@
+           "type": "string",
+           "description": "MaxTimeout is an operator hard cap on per-order timeouts.\nNo order gets more than this duration. Go duration string (e.g., \"60s\").\nEmpty means uncapped (no override)."
+         },
++        "max_dispatches_per_tick": {
++          "type": "integer",
++          "description": "MaxDispatchesPerTick caps how many orders one controller tick may start.\nOrders due beyond the cap wait for a later tick; a rotating cursor keeps\nthe wait fair. A positive integer. Unset or 0 keeps the default of 4.\nRaise it when more orders are due on every tick than the cap lets through,\nso that each one runs far less often than its interval says.",
++          "default": 4
++        },
+         "overrides": {
+           "items": {
+             "$ref": "#/$defs/OrderOverride"
+diff --git a/docs/schema/city-schema.txt b/docs/schema/city-schema.txt
+index 60d73c7..b084204 100644
+--- a/docs/schema/city-schema.txt
++++ b/docs/schema/city-schema.txt
+@@ -1925,6 +1925,11 @@
+           "type": "string",
+           "description": "MaxTimeout is an operator hard cap on per-order timeouts.\nNo order gets more than this duration. Go duration string (e.g., \"60s\").\nEmpty means uncapped (no override)."
+         },
++        "max_dispatches_per_tick": {
++          "type": "integer",
++          "description": "MaxDispatchesPerTick caps how many orders one controller tick may start.\nOrders due beyond the cap wait for a later tick; a rotating cursor keeps\nthe wait fair. A positive integer. Unset or 0 keeps the default of 4.\nRaise it when more orders are due on every tick than the cap lets through,\nso that each one runs far less often than its interval says.",
++          "default": 4
++        },
+         "overrides": {
+           "items": {
+             "$ref": "#/$defs/OrderOverride"
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 42e95f1..1db84a4 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -1750,6 +1750,12 @@ type OrdersConfig struct {
+ 	// No order gets more than this duration. Go duration string (e.g., "60s").
+ 	// Empty means uncapped (no override).
+ 	MaxTimeout string `toml:"max_timeout,omitempty"`
++	// MaxDispatchesPerTick caps how many orders one controller tick may start.
++	// Orders due beyond the cap wait for a later tick; a rotating cursor keeps
++	// the wait fair. A positive integer. Unset or 0 keeps the default of 4.
++	// Raise it when more orders are due on every tick than the cap lets through,
++	// so that each one runs far less often than its interval says.
++	MaxDispatchesPerTick int `toml:"max_dispatches_per_tick,omitempty" jsonschema:"default=4"`
+ 	// Overrides apply per-order field overrides after scanning.
+ 	// Each override targets an order by name and optionally by rig.
+ 	Overrides []OrderOverride `toml:"overrides,omitempty"`
+diff --git a/internal/config/orders_dispatch_budget_test.go b/internal/config/orders_dispatch_budget_test.go
+new file mode 100644
+index 0000000..e3e6f30
+--- /dev/null
++++ b/internal/config/orders_dispatch_budget_test.go
+@@ -0,0 +1,73 @@
++package config
++
++import (
++	"testing"
++
++	"github.com/BurntSushi/toml"
++	"github.com/gastownhall/gascity/internal/fsys"
++)
++
++func TestOrdersMaxDispatchesPerTickParses(t *testing.T) {
++	cases := []struct {
++		name string
++		body string
++		want int
++	}{
++		{"unset", "", 0},
++		{"explicit", "\n[orders]\nmax_dispatches_per_tick = 12\n", 12},
++		{"zero", "\n[orders]\nmax_dispatches_per_tick = 0\n", 0},
++		{"negative is kept as written (the dispatcher side maps it to the default)", "\n[orders]\nmax_dispatches_per_tick = -3\n", -3},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			cfg, err := Parse([]byte("[workspace]\nname = \"test\"\n" + tc.body))
++			if err != nil {
++				t.Fatalf("Parse: %v", err)
++			}
++			if got := cfg.Orders.MaxDispatchesPerTick; got != tc.want {
++				t.Errorf("Orders.MaxDispatchesPerTick = %d, want %d", got, tc.want)
++			}
++		})
++	}
++}
++
++func TestOrdersMaxDispatchesPerTickIsAKnownKey(t *testing.T) {
++	var cfg City
++	md, err := toml.Decode(`
++[workspace]
++name = "test"
++
++[orders]
++max_dispatches_per_tick = 12
++`, &cfg)
++	if err != nil {
++		t.Fatalf("Decode: %v", err)
++	}
++	if warnings := CheckUndecodedKeys(md, "city.toml"); len(warnings) != 0 {
++		t.Errorf("max_dispatches_per_tick must not be reported as an unknown key, got: %v", warnings)
++	}
++}
++
++func TestLoadWithIncludes_OrdersMaxDispatchesPerTickOverride(t *testing.T) {
++	fs := fsys.NewFake()
++	fs.Files["/city/city.toml"] = []byte(`
++include = ["infra.toml"]
++
++[workspace]
++name = "test"
++
++[orders]
++max_dispatches_per_tick = 8
++`)
++	fs.Files["/city/infra.toml"] = []byte(`
++[orders]
++max_dispatches_per_tick = 12
++`)
++	cfg, _, err := LoadWithIncludes(fs, "/city/city.toml")
++	if err != nil {
++		t.Fatalf("LoadWithIncludes: %v", err)
++	}
++	if got := cfg.Orders.MaxDispatchesPerTick; got != 12 {
++		t.Errorf("Orders.MaxDispatchesPerTick = %d, want 12 (the fragment's [orders] wins)", got)
++	}
++}
