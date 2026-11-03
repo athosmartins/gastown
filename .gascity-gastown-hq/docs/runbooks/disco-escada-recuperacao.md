@@ -4,6 +4,7 @@
 - Limiares
 - Como o maestro decide
 - Contrato dos degraus
+- Retomada do D2 (`--resume`)
 - Interruptor, arquivos, saídas
 - Três estados: o que o maestro faz quando não consegue ler
 - Teto de 6 h do reinício (D4)
@@ -115,6 +116,31 @@ O notify e o mail são do maestro. Os degraus não avisam por conta própria. O 
 (o "agiu" não cala um "FALHOU" logo depois), e só é carimbado depois da entrega confirmada (ver "Tentado ≠ entregue"). Cada mail é
 um bead e um commit no Dolt de uma máquina que está sem disco, por isso o limite.
 
+## Retomada do D2 (`--resume`)
+
+O `--run` do D2 para um job pesado reiniciável (hoje o `rfb`) quando o disco aperta. Alguém tem de religá-lo quando o disco volta; sem isso ele
+só recomeça do zero no tick das 00:15. Esse alguém é o maestro (ga-1p1i5jr.6): **toda rodada** (a cada 120 s), com a escada em repouso ou
+em degrau, **depois** do `--run` (se o aperto mandou), ele chama `scripts/disk-recovery-d2-heavy-jobs.sh --resume`. O `--resume` é seguro de
+repetir: o registro do que foi parado, a trava e a decisão (livre ≥ `resume_above_mb`, janela, validade, run_id lido e nunca adivinhado) são do
+próprio D2. O maestro só lê o código de saída.
+
+| rc do `--resume` | O maestro faz |
+|---|---|
+| 0 (retomou) | `notify -p 3` "Disco: D2 retomou o job" com a linha do D2. Sem limite: o registro do D2 já impede repetir. Sem mail |
+| 10 (nada a retomar, ou a guarda adiou) | **Silêncio**, nem uma linha no log. É o único código calado |
+| 20 (não subiu) | Saída 20. `notify -p 4` forçado + mail ao Mayor, no máximo 1 por hora (classe `rc20`). A linha do D2 vai no aviso e traz o `run_id` quando o D2 o sabia (senão ele está no registro `.gc/disk-recovery-d2.state`): retome à mão com `rfb_stream_refresh.py --resume-run <run_id>` |
+| 30 (não li o estado) | Saída 30 (se nada pior aconteceu). `notify -p 4` forçado, no máximo 1 por hora (classe `rc30`). Sem mail |
+| Falha da chamada: script ausente, sem permissão de execução, passou de `RESUME_TIMEOUT_S` (120 s, TERM), rc fora de 0/10/20/30 | **Alerta**, nunca o silêncio do 10. `notify -p 4` forçado, no máximo 1 por hora (classe `broken`). Saída 20 quando o D2 rodou e se comportou mal; ausente/sem execução não muda a saída (como o degrau ausente) |
+
+As marcas de 1 h são `.gc/disk-recovery.resume-{rc20,rc30,broken}`: o epoch do último aviso **entregue**, uma por classe (um alerta de chamada
+não cala um rc 20 que venha logo depois). Marca ausente, vazia, com lixo ou no futuro não cala o aviso. A marca só é gravada depois que algum
+canal confirma a entrega (tentado ≠ entregue); sem confirmação a rodada seguinte avisa de novo. **Limite aceito:** se nem a marca grava (disco
+sem espaço nenhum), o aviso, mail incluído, repete a cada rodada, porque calar um job parado que ninguém retoma é o lado perigoso.
+
+O passo **não roda** quando a rodada acaba antes dele: interruptor ligado, trava não tomada, relógio ou `df` ilegível (sem leitura nada
+age). E **não roda em `--dry-run`**: o `--resume` não tem modo dry-run, chamá-lo lançaria o job de verdade. Ele também não depende do estado
+salvo: roda mesmo que o estado do maestro não grave.
+
 ## Interruptor, arquivos, saídas
 
 | O quê | Onde |
@@ -125,9 +151,10 @@ um bead e um commit no Dolt de uma máquina que está sem disco, por isso o limi
 | stdout / stderr do launchd | `.gc/logs/disk-recovery-ladder.out` e `.err` |
 | Trava | `.gc/disk-recovery.lock` (diretório + pid). Instância única. Trava de pid morto, ou de pid vivo que não é o maestro, é refeita |
 | Marcas de aviso | `.gc/disk-recovery.nosave` (estado que não grava) e `.gc/disk-recovery.nolock` (trava que não tomo): arquivos vazios que limitam o aviso a 1 por hora. Só são tocados depois de o notify confirmar |
+| Marcas da retomada do D2 | `.gc/disk-recovery.resume-{rc20,rc30,broken}`: o epoch do último aviso entregue de cada classe (ver "Retomada do D2"). Apagar uma libera o aviso dela na próxima rodada |
 
 Saídas do script: **0** rodada feita · **10** interruptor ligado, ou OUTRA instância VIVA rodando (calado, é o caso normal) · **20**
-um degrau falhou · **30** não consegui ler o disco ou o relógio, não consegui gravar o estado, ou não consegui tomar nem verificar
+um degrau falhou (ou o `--resume` do D2 falhou: ver "Retomada do D2") · **30** não consegui ler o disco ou o relógio, não consegui gravar o estado, ou não consegui tomar nem verificar
 a trava, e por isso não agi · **2** uso.
 
 A trava tem três resultados: peguei · outra instância viva (sai 10, calado) · não consegui tomar nem verificar (sai 30, com aviso).
@@ -139,7 +166,7 @@ a quebrar o mail junto) e sai 30 sem ler o disco nem chamar degrau, já que sem 
 chamariam o mesmo degrau (o D4, duas vezes).
 
 `--dry-run` lê o estado salvo, aplica a leitura de agora numa cópia em memória e chama os degraus com `--dry-run`. Não grava
-estado nem log, não avisa, não manda mail e não toma a trava.
+estado nem log, não avisa, não manda mail, não toma a trava e não chama o `--resume` do D2.
 
 ## Três estados: o que o maestro faz quando não consegue ler
 
@@ -183,11 +210,14 @@ hora que o teste escolhe (6 h de teto passam em segundos). O trecho que lê `df`
 e o shim do `df` prova que o maestro nunca lê `df /`. Cobre cada fronteira dos limiares (5120/5121, 4096/4097, 3071/3072,
 1535/1536 MB e 899/900 s), a histerese, a lacuna, a ordem e um degrau por rodada, o piso duro, cada código de saída dos degraus,
 degrau ausente, o teto de 6 h (inclusive o maestro morto no meio do D4), df/swap/relógio/estado ilegíveis, o interruptor, a trava,
-o dry-run, configuração inválida, notify e mail com defeito ou travados, rotação do log e estado não gravável.
+o dry-run, configuração inválida, notify e mail com defeito ou travados, rotação do log, estado não gravável e a retomada do D2
+(`--resume`: cada rc 0/10/20/30, D2 ausente, sem permissão, rc 99/2/1 e estouro de prazo, limite de 1 h por classe, marca só depois da
+entrega, marca com lixo ou no futuro, dry-run e saídas antecipadas que não chamam o `--resume`).
 
-Resultado da última rodada completa, contra o maestro como está no `main` (02/11/2026): **446 verificações, 0 falhas**, rc 0, em
-290 s no nó Linux de testes (`scripts/mbp-run.sh --repo hq --dir <worktree> -- scripts/disk-recovery-ladder.selftest.sh`; rc
-96..99 do `mbp-run` significa "rode local", não teste reprovado). No mini a bateria é pesada: uma rodada anterior, com 282
+Resultado da última rodada completa, contra o maestro com o passo `--resume` (ga-1p1i5jr.6, 03/11/2026): **501 verificações, 0 falhas**,
+rc 0, em 452 s no nó Linux de testes. (A rodada anterior, de 02/11/2026, sem o `--resume`: 446 verificações, 0 falhas, 290 s.)
+Comando: `scripts/mbp-run.sh --repo hq --dir <worktree> -- scripts/disk-recovery-ladder.selftest.sh`; rc
+96..99 do `mbp-run` significa "rode local", não teste reprovado. No mini a bateria é pesada: uma rodada anterior, com 282
 verificações, levou 3 min 13 s com load ≈ 35; por isso o selftest local roda sob o `heavy-guard`, que é da classe `selftest`. O guarda vale para o volume INTEIRO: com o
 disco apertado ele recusa (rc 75) ou interrompe (rc 78) mesmo que a queda venha de outro job. Nesse caso espere folga e rode de novo;
 não baixe o piso do guarda para passar. `--min-free-mb` e `--max-disk-drop-mb` existem para ajustar o piso e o limite de queda numa
@@ -198,6 +228,14 @@ O arquivo da cópia TEM de se chamar `disk-recovery-ladder.<id>.sh`: a trava de 
 processo cuja linha de comando contém `disk-recovery-ladder`, e com outro nome o teste da trava falha por engano.
 Com `ST_FAILFAST=1` o selftest para no primeiro FAIL e sai 1 com `(ST_FAILFAST) parei no 1º FAIL: N passaram, M falharam`, o que
 acelera o teste de mutantes (um mutante "pego" é um que faz o selftest sair 1).
+
+Teste de mutação do passo `--resume` (ga-1p1i5jr.6, 03/11/2026): 19 cópias do maestro, cada uma com UMA alteração, rodadas no nó Linux com
+`ST_FAILFAST=1`; o selftest pegou as 19, todas numa asserção da retomada (nenhuma caiu por acaso em outra seção). As alterações: rc 20 ignorado
+(o mutante pedido pela bead), rc 30 ignorado, rc fora de 0/10/20/30 calado, estouro de prazo (124) calado, D2 ausente calado, rc 0 sem o "retomou",
+rc 20 sem o mail, rc 20 sem a saída 20, as três classes de aviso fundidas numa marca, sem o limite de 1 h, marca gravada ANTES da entrega, marca com
+lixo calando o aviso, marca no futuro calando o aviso, marca que a leitura falha (some, ou existe e não lê: um diretório no lugar do arquivo) tratada como "avisei há pouco", `--resume` antes do `--run`, `--resume` chamado em dry-run, prazo do `--resume` ignorado e
+nenhum chamador (o comportamento de antes da bead). Os mutantes ficaram fora do repositório (cópias descartáveis); para refazer, gere a cópia com
+`sed` e rode como descrito acima.
 
 Teste de mutação da PRIMEIRA versão do maestro (01/11/2026; histórico, não vale para o script de hoje): 22 cópias do maestro, cada uma com UMA alteração de 1 a 2 linhas (limiares com `<` no lugar de `<=`
 e o contrário, sem histerese, sem a regra da lacuna, sem o filtro de 2 leituras do piso duro, o tempo do limiar ignorado, marca do D4

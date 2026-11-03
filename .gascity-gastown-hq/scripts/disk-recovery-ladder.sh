@@ -39,6 +39,12 @@
 #   saiu há < 30 min (NOTIFY_DEDUP_MIN / NOTIFY_TITLE_DEDUP_MIN), então um aviso do mesmo assunto já está no celular. Custo aceito: com o mesmo título e a mensagem mudando, a nova só sai depois da janela (o título de cada aviso
 #   da escada é fixo por degrau e por classe). E um rc 0 pode ser calado, sem push, nos interruptores anteriores à política do notify (NOTIFY_DISABLE, PYTEST_CURRENT_TEST, preview): são de ambiente de teste, não do launchd
 #   (disk-recovery-d4-guarded-reboot.sh, send_notify).
+# RETOMADA DO D2  (ga-1p1i5jr.6) Depois do --run (se o aperto mandou), TODA rodada chama `disk-recovery-d2-heavy-jobs.sh --resume` (seguro de repetir: o registro e a trava são do D2). É o que religa o job que o --run parou quando o disco volta;
+#   sem este passo ele só recomeça do zero no tick das 00:15. Roda com a escada em repouso ou em degrau; NÃO roda com o interruptor ligado, sem a trava, com relógio ou df ilegível (sem leitura nada age) nem em --dry-run (o --resume não tem modo dry-run).
+#   rc 0 = retomou (notify -p 3 "retomou", sem limite: o registro do D2 não deixa repetir) · 10 = nada a retomar ou o D2 adiou (SILÊNCIO, o único) · 20 = não subiu (notify -p 4 + mail; a linha do D2 vai junto e traz o run_id quando ele o sabia; saída 20)
+#   · 30 = não li o estado (notify -p 4; saída 30). Falha da CHAMADA (D2 ausente, sem execução, estouro de RESUME_TIMEOUT_S=120 s, rc fora de 0/10/20/30) é ALERTA (notify -p 4, classe `broken`), nunca o silêncio do 10; a saída é 20 quando o D2 rodou e se comportou mal (estouro, rc estranho) e não muda quando ele nem foi lançado (ausente, sem execução).
+#   20, 30 e a falha da chamada: no máx. 1 aviso por hora por classe (marcas `.gc/disk-recovery.resume-{rc20,rc30,broken}` com o epoch do último aviso ENTREGUE; sem canal confirmando, a marca não grava e a rodada seguinte avisa de novo).
+#   Limite aceito: se nem a marca grava (disco sem espaço nenhum) o aviso, o mail inclusive, repete a cada rodada; o outro lado (calar um job parado que ninguém retoma) é o perigoso.
 # ESTADO, LOG, INTERRUPTORES
 #   estado  $CITY/.gc/disk-recovery.state (chave=valor, escrito inteiro e trocado com mv)   log  $CITY/.gc/logs/disk-recovery.log (gira em 5 MB)
 #   `touch $CITY/.gc/disk-recovery.off` desliga o maestro (sai 10 sem ler nem agir; apague o arquivo para voltar). Instância única por trava (mkdir) — o `--dry-run` não toma a trava.
@@ -51,7 +57,7 @@
 #   Degrau ausente (ou sem permissão de execução): loga, avisa uma vez por episódio (notify -p 4; a cada rodada até o notify confirmar) e PULA para o próximo. 10/20/30 repetem em 5 min; 0 não repete esse degrau por 30 min.
 #   Cada degrau só entra quando o cronômetro DELE passou; um degrau por rodada; a marca de um degrau some quando o cronômetro dele zera. Ordem: a 1ª chamada de cada degrau no episódio
 #   vai em D2→D3→D4; as repetições vão do mais alto para o mais baixo (senão o D2 repetindo a cada 5 min ocuparia toda rodada atrasada e o D3/D4 nunca teriam vez).
-# MODOS           --run (launchd) · --dry-run (lê o estado salvo, aplica a leitura de agora numa cópia, chama os degraus com --dry-run, não grava estado/log, não avisa, não manda mail).
+# MODOS           --run (launchd) · --dry-run (lê o estado salvo, aplica a leitura de agora numa cópia, chama os degraus com --dry-run, não grava estado/log, não avisa, não manda mail, não chama o `--resume` do D2).
 #   Sai: 0 rodada feita · 10 interruptor ligado ou outra instância VIVA rodando · 20 um degrau falhou · 30 não consegui ler o disco, o relógio ou gravar o estado, ou não consegui tomar a trava (não agiu) · 2 uso.
 # VARIÁVEIS (teste) DR_CITY · DR_STATE · DR_LOG · DR_OFF_FILE · DR_LOCK · DR_FREE_MB_FILE / DR_SWAP_MB_FILE (arquivo com o livre / o swap em MB, no lugar de df / sysctl) · DR_NOW_FILE (epoch)
 #   · DR_D2_CMD/DR_D3_CMD/DR_D4_CMD · DR_NOTIFY_BIN · DR_GC_BIN · DR_<NOME> numérico = os nomes da lista `cfg` abaixo (valor que não é número, ou que fica abaixo do mínimo da regra, cai no padrão e é dito no log).
@@ -100,7 +106,7 @@ cfg D4_MB 3072;  cfg D4_HOLD_S 3600
 cfg D4_HARD_MB 1536; cfg D4_HARD_N 2 1; cfg D4_HARD_SPACE_S 100
 cfg HYST_MB 512; cfg GAP_S 600; cfg RETRY_S 300; cfg ACTED_REPEAT_S 1800; cfg D4_COOLDOWN_S 21600
 cfg RUNG_TIMEOUT_S 900; cfg SETTLE_S 15; cfg WARN_EVERY_S 3600; cfg HEARTBEAT_S 3600; cfg LOG_MAX_KB 5120
-cfg NOTIFY_TIMEOUT_S 30; cfg MAIL_TIMEOUT_S 60; cfg LOCK_MAX_MIN 60 1
+cfg NOTIFY_TIMEOUT_S 30; cfg MAIL_TIMEOUT_S 60; cfg LOCK_MAX_MIN 60 1; cfg RESUME_TIMEOUT_S 120 1
 
 log()  { if [ "$DRY" = 1 ]; then printf '[dry-run] %s\n' "$*"; else printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$LOG" 2>/dev/null || true; fi; }
 note() { log "$*"; [ "$DRY" = 1 ] || printf '%s\n' "$*"; }
@@ -551,6 +557,76 @@ nolock_warn() {  # trava que não consigo tomar nem verificar (acquire_lock rc 2
   warn_hourly disk-recovery.nolock "Disco: a escada não consegue tomar a trava" "Não consegui tomar nem verificar a trava de instância única da escada ($LOCK): $LOCK_WHY. NÃO sei se há outra instância, então a escada NÃO lê o disco nem chama degrau nenhum enquanto isso. (aviso no máximo 1 por hora)"
 }
 
+# ── retomada do D2 (--resume) ────────────────────────────────────────────────────────────────────────────────────────────────────
+resume_mark_due() {  # $1=classe $2=agora → rc 0 se o aviso dessa classe pode sair (nunca saiu, a janela WARN_EVERY_S passou, ou a marca está no futuro). A marca é um arquivo $GCDIR/disk-recovery.resume-<classe> com o epoch do último aviso ENTREGUE
+  local v
+  # vazio (sem marca) → avisa; falhou/ilegível (sem leitura, lixo, número grande demais) → avisa: aqui o silêncio é o lado perigoso (job parado que ninguém retoma)
+  v=$(cat "$GCDIR/disk-recovery.resume-$1" 2>/dev/null) || v=0
+  isnum "$v" || v=0
+  due "$v" "$2" "$WARN_EVERY_S"
+}
+resume_mark_set() {  # $1=classe $2=agora. Só com o canal CONFIRMADO (tentado ≠ entregue). Grava num temporário e troca com mv: gravação pela metade nunca deixa lixo no lugar da marca
+  local m="$GCDIR/disk-recovery.resume-$1"
+  { printf '%s\n' "$2" > "$m.tmp" && mv -f "$m.tmp" "$m"; } 2>/dev/null && return 0
+  # sem gravar (disco sem espaço nenhum) o aviso repete a cada rodada, mail incluído: limite aceito, o outro lado (calar um job parado) é o perigoso
+  rm -f "$m.tmp" 2>/dev/null
+  log "WARN: não consegui gravar a marca $m: o aviso da retomada do D2 ($1) repete na próxima rodada"
+  return 0
+}
+resume_alert() {  # $1=classe (rc20 | rc30 | broken) $2=agora $3=prioridade $4=título $5=mensagem [$6=assunto do mail $7=corpo]. No máx. 1 por classe por WARN_EVERY_S; a marca só com algum canal confirmado
+  local told=0
+  if ! resume_mark_due "$1" "$2"; then
+    log "retomada do D2 ($1): o aviso dela saiu há menos de ${WARN_EVERY_S}s (no máximo 1 por hora por classe); só log"
+    return 0
+  fi
+  send_notify "$3" "$4" "$5" && told=1
+  if [ -n "${6:-}" ]; then send_mail "$6" "${7:-}" && told=1; fi
+  if [ "$told" = 1 ]; then resume_mark_set "$1" "$2"; else log "WARN: aviso da retomada do D2 ($1) NÃO entregue (notify e mail sem confirmação): marca não gravada, a rodada seguinte avisa de novo"; fi
+  return 0
+}
+resume_d2() {  # chamado uma vez por rodada, DEPOIS do --run (se o aperto mandou). --resume é seguro de repetir (o registro e a trava são do próprio D2): não depende da marca do maestro nem do estado salvo.
+  # Quem retoma o job que o --run parou, quando o disco volta; sem este passo ele só recomeça do zero no tick das 00:15. rc do D2: 0 retomou · 10 nada a retomar / guarda adiou · 20 não subiu · 30 não li o estado.
+  # O 10 é o ÚNICO silêncio: ausente, sem execução, estouro de prazo e rc fora de 0/10/20/30 são falha da CHAMADA e viram aviso (nunca o mesmo que "nada a retomar").
+  local cmd="$D2_CMD" rc line t why
+  if [ "$DRY" = 1 ]; then log "retomada do D2: $cmd --resume não tem modo dry-run (agiria de verdade); não chamado"; return 0; fi
+  # vazio → n/a (a hora vem do relógio); falhou/ilegível → a hora do início da rodada: o carimbo só decide o limite de 1 h
+  t=$(now) || t=$NOW
+  # existe e é executável? não existe/falhou/sem permissão → falha da chamada (aviso), NÃO "nada a retomar"
+  if [ ! -f "$cmd" ] || [ ! -x "$cmd" ]; then
+    why="$cmd não existe ou não executa"
+    note "WARN: retomada do D2 NÃO chamada: $why"   # a saída não muda (como o degrau ausente do run_rung): o alerta é o canal; o rc 20 é de quem rodou e falhou
+    resume_alert broken "$t" 4 "Disco: não consigo chamar a retomada do D2" "$why. Job parado pelo D2 NÃO será retomado até alguém consertar isso (ou retomar à mão: $cmd --resume). (aviso no máximo 1 por hora)"
+    return 0
+  fi
+  run_bounded "$RESUME_TIMEOUT_S" "$cmd" --resume; rc=$?
+  line=$(out_line); rb_clean
+  case "$rc" in
+    10) return 0 ;;
+    0)  note "retomada do D2: rc=0: $line"
+        send_notify 3 "Disco: D2 retomou o job" "$line" ;;
+    20) note "ERROR: retomada do D2 FALHOU: rc=20: $line"
+        RC_FINAL=20
+        resume_alert rc20 "$t" 4 "Disco: a retomada do D2 FALHOU" "O D2 --resume não conseguiu subir o job parado: $line. Retome à mão com o run_id (rfb_stream_refresh.py --resume-run <run_id>): ele vem nessa linha quando o D2 o sabia, senão está no registro do D2 (.gc/disk-recovery-d2.state). (aviso no máximo 1 por hora)" \
+          "Disco: a retomada do D2 FALHOU" "Escada de recuperação de disco (ga-1p1i5jr.6).
+O D2 parou um job pesado para liberar disco e o disco voltou, mas $cmd --resume NÃO conseguiu subi-lo (rc=20).
+Saída do D2: $line
+O run_id vem na linha acima quando o D2 o sabia; senão está no registro do D2 (.gc/disk-recovery-d2.state; o log é .gc/logs/disk-recovery-d2.log). Retome à mão com rfb_stream_refresh.py --resume-run <run_id>. Sem retomada o job só recomeça do zero no tick das 00:15.
+Log do maestro: $LOG" ;;
+    30) note "WARN: retomada do D2: rc=30 (não consegui ler o estado): $line"
+        [ "$RC_FINAL" = 0 ] && RC_FINAL=30
+        resume_alert rc30 "$t" 4 "Disco: D2 não leu o estado da retomada" "D2 --resume devolveu rc=30 (não consegui ler o estado; não retomou nada): $line. Um job parado pode estar esperando. (aviso no máximo 1 por hora)" ;;
+    *)  case "$rc" in
+          124) why="estourou ${RESUME_TIMEOUT_S}s e foi encerrado (TERM)" ;;
+          125) why="não consegui lançar (mktemp falhou?)" ;;
+          *)   why="rc inesperado $rc" ;;
+        esac
+        note "WARN: retomada do D2 com falha na chamada: $why: $line"
+        [ "$rc" = 125 ] || RC_FINAL=20   # 125 = nem lancei (mktemp): o D2 não rodou, então não é "um degrau falhou"; estouro e rc estranho = rodou e se comportou mal
+        resume_alert broken "$t" 4 "Disco: a retomada do D2 falhou na chamada" "$cmd --resume: $why: $line. Não sei se o job parado voltou; retome à mão se preciso. (aviso no máximo 1 por hora)" ;;
+  esac
+  return 0
+}
+
 rotate_log() {  # log acima de LOG_MAX_KB vira .1 (um só backup). tamanho ilegível → não gira (log maior que o previsto é melhor que log perdido)
   local kb
   kb=$(du -k "$LOG" 2>/dev/null | awk '{print $1}')
@@ -612,6 +688,7 @@ main() {
   save_state
   pick_and_run "$NOW"
   save_state
+  resume_d2   # sempre DEPOIS do --run: o --resume lê o registro do D2 já com o que o --run acabou de parar; quem decide se o livre voltou é o próprio D2 (resume_above_mb > stop_below_mb: histerese dele, não minha)
   if [ "$SAVE_FAIL" = 1 ]; then [ "$RC_FINAL" = 0 ] && RC_FINAL=30; nosave_warn; fi
   exit "$RC_FINAL"
 }

@@ -9,6 +9,8 @@
 #   e "tentado ≠ entregue": nenhuma marca de "já avisei" é gravada sem um canal confirmar (notify e mail falhando → a rodada seguinte avisa de novo).
 #   Gate-fix 3: (a) swap ilegível NÃO trava a escada (só entra no texto: segue com o df e DIZ "swap NÃO verificado"), o `sysctl` é chamado sempre com LC_ALL=C e a vírgula do pt_BR (launchd) é lida;
 #   (b) a trava de instância única tem TRÊS estados: peguei / outra instância viva (10, calado) / não consegui tomar nem verificar (30 + aviso -p 4, no máx. 1/h, entregue-depois-carimbado).
+#   Retomada do D2 (ga-1p1i5jr.6): o stub do D2 devolve rc 10 calado a cada `--resume` (o maestro o chama TODA rodada) e o teste manda 0/20/30/99/2/1/estouro/ausente/sem permissão; só o 10 é silêncio, a falha da CHAMADA é alerta,
+#   o aviso sai no máx. 1 por hora por classe e a marca só depois de um canal confirmar; dry-run e saída antecipada não chamam o `--resume`. Mutantes (rc 20 ignorado etc.) em docs/runbooks/disco-escada-recuperacao.md.
 #   As seções novas ficam logo no começo do arquivo: um mutante rodado com ST_FAILFAST=1 é pego em segundos, sem esperar o arquivo inteiro.
 # COMO RODAR     bash scripts/disk-recovery-ladder.selftest.sh        (~3-5 min sob carga)
 #   O caminho de quem tem o disco apertado é pelo guarda: scripts/heavy-guard.sh --what selftest-hq --max-file-mb 512 -- bash scripts/disk-recovery-ladder.selftest.sh
@@ -51,6 +53,16 @@ for n in d2 d3 d4; do
 #!/bin/bash
 # degrau simulado. Modo em $STUB_DIR/mode.<nome>: linhas rc=N msg=... setfree=N setswap=MISSING (apaga o arquivo do swap: o swap só fica ilegível na re-medição que vem depois do degrau) slp=N killp=1 waitfor=ARQUIVO (espera o arquivo existir, no máx. 30 s: segura o degrau sem depender da velocidade da máquina)
 n=$(basename "$0"); rc=0; msg="stub $n"; setfree=""; setswap=""; slp=0; killp=0; waitfor=""
+# --resume (só o D2 tem): o maestro chama a CADA rodada, então o padrão é o rc 10 calado ("nada a retomar"); o teste manda outro em mode.<nome>.resume (rrc= rmsg='...' rslp=N, lido como shell: mensagem entre aspas).
+# Não mexe em state_at_call.* nem em pid.* (são do --run) e só anota a chamada em `calls`.
+if [ "${1:-}" = "--resume" ]; then
+  rrc=10; rmsg="nada a retomar (stub)"; rslp=0
+  [ -f "$STUB_DIR/mode.$n.resume" ] && . "$STUB_DIR/mode.$n.resume"
+  echo "$n $1" >> "$STUB_DIR/calls"
+  [ "$rslp" -gt 0 ] && sleep "$rslp"
+  echo "$rmsg"
+  exit "$rrc"
+fi
 [ -f "$STUB_DIR/mode.$n" ] && . "$STUB_DIR/mode.$n"
 echo "$n $1" >> "$STUB_DIR/calls"
 echo $$ > "$STUB_DIR/pid.$n"
@@ -130,7 +142,9 @@ setfree() { if [ "$1" = MISSING ]; then rm -f "$W/free"; else printf '%s' "$1" >
 setswap() { if [ "$1" = MISSING ]; then rm -f "$W/swap"; else printf '%s' "$1" > "$W/swap"; fi; }
 tick() { setfree "$1"; setswap "$2"; printf '%s' "$3" > "$W/now"; runl --run; }   # livre swap agora
 ncall()  { local n; n=$(grep -c -x -F "$1 $2" "$SD/calls" 2>/dev/null); echo "${n:-0}"; }
-ncallall() { local n; n=$(grep -c . "$SD/calls" 2>/dev/null); echo "${n:-0}"; }
+ncallall() { local n; n=$(grep -v -x -F 'd2 --resume' "$SD/calls" 2>/dev/null | grep -c .); echo "${n:-0}"; }   # chamadas de --run/--dry-run; o --resume (toda rodada) conta à parte em nresume
+nresume() { local n; n=$(grep -c -x -F 'd2 --resume' "$SD/calls" 2>/dev/null); echo "${n:-0}"; }
+rmode() { printf '%s\n' "$@" > "$SD/mode.d2.resume"; }   # o que o D2 --resume devolve: rmode rrc=20 "rmsg='...'"
 nnotify() { local n; n=$(grep -c -F -- "$1" "$SD/notify.log" 2>/dev/null); echo "${n:-0}"; }
 nmail()   { local n; n=$(grep -c -F -- "$1" "$SD/mail.log" 2>/dev/null); echo "${n:-0}"; }
 sv()  { sed -n "s/^$1=//p" "$STATE" 2>/dev/null | head -n 1; }
@@ -173,6 +187,106 @@ has "$(logtxt)" "ok: livre=20000MB" "primeira rodada escreve o batimento"
 n1=$(wc -l < "$LOG"); tick 20000 0 $((T0 + 120)); n2=$(wc -l < "$LOG")
 eq "$n2" "$n1" "rodada tranquila seguinte (dentro de 1 h): nada novo no log"
 [ ! -d "$LOCK" ] && ok "trava liberada ao sair" || nope "trava sobrou"
+
+# ── retomada do D2 (ga-1p1i5jr.6): o maestro chama `d2 --resume` TODA rodada, depois do --run ──────────────────────────────────────────────────────
+# Sem este chamador o job que o D2 parou só recomeça do zero no tick das 00:15. O stub devolve rc 10 calado por padrão (rmode manda outro). Seções logo no começo: um mutante é pego em segundos com ST_FAILFAST=1.
+RM20="$CITY/.gc/disk-recovery.resume-rc20"; RM30="$CITY/.gc/disk-recovery.resume-rc30"; RMB="$CITY/.gc/disk-recovery.resume-broken"
+RN0='p=3 force= t=Disco: D2 retomou o job'
+RN20='p=4 force=1 t=Disco: a retomada do D2 FALHOU'
+RN30='p=4 force=1 t=Disco: D2 não leu o estado da retomada'
+RNB='p=4 force=1 t=Disco: a retomada do D2 falhou na chamada'
+RNA='p=4 force=1 t=Disco: não consigo chamar a retomada do D2'
+nmarks() { ls "$CITY/.gc" 2>/dev/null | grep -c '^disk-recovery\.resume-'; }   # marcas de 1 h da retomada (vazio/ilegível → 0, que é o lado que AVISA)
+
+section "retomada do D2 (--resume): chamada a cada rodada, DEPOIS do --run; só o rc 10 é silêncio"
+reset; tick 20000 0 "$T0"
+eq "$RC,$(nresume)" "0,1" "disco folgado, escada em repouso: o --resume é chamado mesmo assim (1 vez por rodada)"
+eq "$(nnotify p=),$(nmail to=),$(nmarks)" "0,0,0" "rc 10 (nada a retomar): silêncio — nenhum aviso, nenhum mail, nenhuma marca"
+hasnt "$(logtxt)" "retomada do D2" "rc 10: nem uma linha no log do maestro (rodada a cada 2 min)"
+tick 20000 0 $((T0 + 120)); eq "$(nresume)" 2 "…e de novo na rodada seguinte"
+reset; tick 5000 0 "$T0"; tick 5000 0 $((T0 + 450)); tick 5000 0 $((T0 + 900))
+eq "$(tail -n 2 "$SD/calls" | tr '\n' ',')" "d2 --run,d2 --resume," "escada em degrau: o --run vai primeiro e o --resume depois, na MESMA rodada"
+reset; rmode rrc=0 "rmsg='retomou rfb --resume-run 1700000000-4242: de pé depois de 25s'"
+tick 20000 0 "$T0"
+eq "$RC,$(nnotify "$RN0"),$(nmail to=)" "0,1,0" "rc 0 (retomou): saída 0, 1 notify -p 3 'retomou' sem push forçado, sem mail"
+has "$(cat "$SD/notify.log")" "1700000000-4242" "rc 0: a linha do D2 (com o run_id) vai na mensagem"
+has "$(logtxt)" "retomada do D2: rc=0" "rc 0: o log diz"
+eq "$(nmarks)" 0 "rc 0: sem marca de 1 h (quem impede repetir é o registro do próprio D2)"
+reset; rmode rrc=20 "rmsg='retomada --resume-run 1700000000-4242 saiu com rc 3 antes de 25s (retome à mão com o run_id)'"
+tick 20000 0 "$T0"
+eq "$RC,$(nnotify "$RN20"),$(nmail 'subj=Disco: a retomada do D2 FALHOU')" "20,1,1" "rc 20 (não subiu): saída 20, 1 notify -p 4 FORÇADO + 1 mail ao Mayor"
+has "$(cat "$SD/notify.log")" "1700000000-4242" "rc 20: o run_id vai no alerta (para retomar à mão)"
+eq "$(cat "$RM20" 2>/dev/null)" "$T0" "rc 20: a marca de 1 h guarda a hora do aviso entregue"
+tick 20000 0 $((T0 + 120))
+eq "$RC,$(nnotify "$RN20"),$(nmail 'subj=Disco: a retomada do D2 FALHOU')" "20,1,1" "rc 20 2 min depois: segue saída 20 mas SÓ log (no máx. 1 aviso e 1 mail por hora)"
+has "$(logtxt)" "só log" "…e o log diz que calou"
+tick 20000 0 $((T0 + 3599)); eq "$(nnotify "$RN20")" 1 "rc 20 aos 3599 s do aviso: ainda calado"
+tick 20000 0 $((T0 + 3600)); eq "$(nnotify "$RN20"),$(nmail 'subj=Disco: a retomada do D2 FALHOU')" "2,2" "rc 20 aos 3600 s: avisa de novo (notify e mail)"
+reset; rmode rrc=30 "rmsg='não consegui ler o registro /x; não ajo'"
+tick 20000 0 "$T0"
+eq "$RC,$(nnotify "$RN30"),$(nmail to=)" "30,1,0" "rc 30 (não li o estado): saída 30, 1 notify -p 4 forçado, sem mail"
+has "$(cat "$SD/notify.log")" "não consegui ler o estado" "rc 30: o alerta diz 'não consegui ler o estado'"
+tick 20000 0 $((T0 + 120)); eq "$(nnotify "$RN30")" 1 "rc 30 de novo 2 min depois: só log (1 por hora)"
+tick 20000 0 $((T0 + 3600)); eq "$(nnotify "$RN30")" 2 "rc 30 aos 3600 s: avisa de novo"
+
+section "retomada do D2: falha da CHAMADA é ALERTA, nunca o silêncio do rc 10 (ausente, sem permissão, rc 99, rc 2, estouro de prazo)"
+reset; XENV=("DR_D2_CMD=$W/nao-existe"); tick 20000 0 "$T0"
+eq "$RC,$(nnotify "$RNA")" "0,1" "D2 ausente: 1 aviso -p 4 forçado (não é silêncio); a saída não muda, como no degrau ausente"
+has "$OUT" "retomada do D2 NÃO chamada" "D2 ausente: diz no stdout/log"
+eq "$(cat "$RMB" 2>/dev/null)" "$T0" "D2 ausente: marca de 1 h da classe broken"
+tick 20000 0 $((T0 + 120)); eq "$RC,$(nnotify "$RNA")" "0,1" "D2 ausente 2 min depois: aviso calado (1 por hora)"
+tick 20000 0 $((T0 + 3600)); eq "$(nnotify "$RNA")" 2 "D2 ausente aos 3600 s: avisa de novo"
+reset; XENV=("DR_D2_CMD=$W/stubs/noexec"); tick 20000 0 "$T0"
+eq "$RC,$(nnotify "$RNA")" "0,1" "D2 sem permissão de execução: mesmo alerta"
+for code in 99 2 1; do
+  reset; rmode "rrc=$code" "rmsg='saí com $code'"; tick 20000 0 "$T0"
+  eq "$RC,$(nnotify "$RNB")" "20,1" "rc $code (fora de 0/10/20/30): alerta -p 4 forçado, nunca tratado como rc 10"
+  has "$(cat "$SD/notify.log")" "rc inesperado $code" "rc $code: o alerta diz o rc"
+done
+reset; XENV=(DR_RESUME_TIMEOUT_S=1); rmode rrc=0 rslp=30 "rmsg='retomou'"
+SECONDS=0; tick 20000 0 "$T0"; el=$SECONDS
+[ "$el" -le 25 ] && ok "estouro: prazo do --resume limitado (${el}s para um D2 de 30 s e limite 1 s)" || nope "demorou ${el}s"
+eq "$RC,$(nnotify "$RNB"),$(nnotify "$RN0")" "20,1,0" "estourou o prazo: alerta de chamada (e NÃO o 'retomou' que o D2 diria se acabasse)"
+has "$(cat "$SD/notify.log")" "estourou 1s" "estouro: o alerta diz"
+[ -z "$(ls "$W/tmp" 2>/dev/null)" ] && ok "estouro não deixa temporário para trás" || nope "temporários sobraram: $(ls "$W/tmp")"
+reset; XENV=("DR_D2_CMD=$W/nao-existe"); tick 20000 0 "$T0"; XENV=(); rmode rrc=20 "rmsg='x'"; tick 20000 0 $((T0 + 120))
+eq "$(nnotify "$RNA"),$(nnotify "$RN20")" "1,1" "a marca de 1 h é POR CLASSE: o alerta de chamada não cala o rc 20 que vem logo depois"
+
+section "retomada do D2: tentado ≠ entregue — a marca de 1 h só com algum canal confirmando; marca ilegível não cala"
+reset; rmode rrc=20 "rmsg='x'"; echo fail > "$SD/notify.mode"; echo fail > "$SD/mail.mode"
+tick 20000 0 "$T0"
+eq "$RC,$(nnotify "$RN20"),$(nmail 'subj=Disco: a retomada do D2 FALHOU')" "20,1,1" "rc 20 com notify e mail falhando: tentou os dois"
+[ ! -e "$RM20" ] && ok "…e a marca NÃO é gravada" || nope "marca gravada sem nenhum canal confirmar"
+has "$(logtxt)" "NÃO entregue" "…e o log diz"
+rm -f "$SD/notify.mode" "$SD/mail.mode"; tick 20000 0 $((T0 + 120))
+eq "$(nnotify "$RN20"),$([ -e "$RM20" ] && echo marca || echo sem)" "2,marca" "…canais de volta: a rodada seguinte avisa e só então grava a marca"
+reset; rmode rrc=20 "rmsg='x'"; echo fail > "$SD/notify.mode"; tick 20000 0 "$T0"
+eq "$([ -e "$RM20" ] && echo marca || echo sem)" "marca" "rc 20 com o notify falhando mas o mail confirmando: a marca vale (algum canal entregou)"
+reset; XENV=("DR_D2_CMD=$W/nao-existe"); echo fail > "$SD/notify.mode"; tick 20000 0 "$T0"
+eq "$([ -e "$RMB" ] && echo marca || echo sem)" "sem" "alerta de chamada (só notify) com o notify falhando: sem marca"
+rm -f "$SD/notify.mode"; tick 20000 0 $((T0 + 120))
+eq "$(nnotify "$RNA"),$([ -e "$RMB" ] && echo marca || echo sem)" "2,marca" "…notify de volta: avisa na rodada seguinte e grava a marca"
+for junk in lixo "" "$((T0 + 99999))"; do
+  reset; rmode rrc=20 "rmsg='x'"; printf '%s\n' "$junk" > "$RM20"; tick 20000 0 "$T0"
+  eq "$(nnotify "$RN20")" 1 "marca '$junk' (lixo, vazia ou no FUTURO): não cala o aviso"
+done
+reset; rmode rrc=20 "rmsg='x'"; printf '%s\n' "$((T0 - 100))" > "$RM20"; tick 20000 0 "$T0"
+eq "$(nnotify "$RN20")" 0 "marca de 100 s atrás: calado (a janela é de 1 h)"
+# marca que a LEITURA falha (um diretório no lugar do arquivo: o cat sai com erro, até como root): o aviso sai, e segue saindo a cada rodada, nunca cala
+reset; rmode rrc=20 "rmsg='x'"; mkdir -p "$RM20"; tick 20000 0 "$T0"
+eq "$RC,$(nnotify "$RN20")" "20,1" "marca ilegível (cat falha: é um diretório): o aviso sai, não é tratado como 'avisei há pouco'"
+tick 20000 0 $((T0 + 120)); eq "$(nnotify "$RN20")" 2 "…e na rodada seguinte sai de novo (marca ilegível nunca cala)"
+
+section "retomada do D2: dry-run e saídas antecipadas NÃO chamam o --resume (sem leitura nenhuma, nada age)"
+reset; rmode rrc=0 "rmsg='retomou'"; setfree 20000; setswap 0; printf '%s' "$T0" > "$W/now"; runl --dry-run
+eq "$RC,$(nresume),$(nnotify p=)" "0,0,0" "dry-run: o --resume NÃO é chamado (não tem modo dry-run) e nada é avisado"
+has "$OUT" "não tem modo dry-run" "dry-run: diz por que não chamou"
+reset; rmode rrc=0 "rmsg='retomou'"; touch "$OFF"; tick 20000 0 "$T0"
+eq "$RC,$(nresume)" "10,0" "interruptor ligado: não chama o --resume"
+reset; rmode rrc=0 "rmsg='retomou'"; : > "$LOCK"; tick 20000 0 "$T0"
+eq "$RC,$(nresume)" "30,0" "trava que não consigo tomar: não chama o --resume"
+reset; rmode rrc=0 "rmsg='retomou'"; tick MISSING 0 "$T0"
+eq "$RC,$(nresume)" "30,0" "df ilegível: não chama o --resume"
 
 section "interruptor"
 reset; touch "$OFF"; tick MISSING MISSING "$T0"
