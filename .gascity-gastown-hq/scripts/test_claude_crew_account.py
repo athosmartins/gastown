@@ -2457,7 +2457,7 @@ def test_the_outage_is_told_after_ten_minutes_by_push_and_mail_again_when_it_end
     mail = w.mails()[0]
     subject, body = mail[mail.index("-s") + 1], mail[mail.index("-m") + 1]
     assert mail[4:7] == ["mayor/", "--from", "controller"] and "SEM login completo" in subject
-    assert "Tried:" in body and EMAIL["b85"] in body and f"claude auth login --email {EMAIL['terr']}" in body and "NOT wired" in body
+    assert "Not usable:" in body and EMAIL["b85"] in body and f"claude auth login --email {EMAIL['terr']}" in body and "NOT wired" in body
     _run_dead(w, 21600 + 600, 21600 + 660, 21600 + 720, 21600 + 780, 21600 + 840)     # 6 h on: every hold has lapsed, each login gets its one more try
     _run_dead(w, 43200 + 600, 64800 + 600)
     assert w.writes().count(crew.DEFAULT_SERVICE) == 8           # 4 logins x BURN_LIMIT, then dead (the old script: one more round every 6 h)
@@ -2528,15 +2528,20 @@ def test_a_notify_that_hangs_is_not_told_and_does_not_take_the_run_down(w, monke
 
 
 def test_a_default_item_that_does_not_exist_is_an_episode_too(w):
+    """And its notice promises no heal this job does not do (it heals only a default item that EXISTS) and makes no claim about tries it never made."""
     w.account("amb", blob("amb"))
     w.decide("amb")
     w.run()
     w.run(at=w.now + 600)
     pushes = _ep_pushes(w)
     assert len(pushes) == 1 and "does not exist" in pushes[0] and len(w.mails()) == 1
+    assert "NOT put one back by itself" in pushes[0] and "writes it to the default item" not in pushes[0] and w.writes() == []
+    assert "No account has been tried" not in pushes[0] and "time(s)" not in pushes[0]
 
 
-def test_a_default_item_that_cannot_be_read_neither_extends_nor_ends_an_episode(w):
+def test_a_default_item_that_cannot_be_read_does_not_extend_an_episode(w):
+    """The 'extends' half only: this run has no good_since, so it cannot show that an unreadable run does not END anything - that is
+    test_a_run_that_could_not_look_at_the_default_item_never_ends_an_episode (the gate's first review of this bead found the gap)."""
     _dead_world(w, ("terr",))
     _run_dead(w, 0)
     since = w.state()["no_login"]["since"]
@@ -2617,7 +2622,7 @@ def test_logins_ending_within_a_week_are_said_once_a_day_and_the_best_login_of_t
     w.run()
     said = lambda: [n for n in w.notified() if "ends in" in n]    # noqa: E731
     assert len(said()) == 1 and EMAIL["amb"] in said()[0] and "ends in 5.0 days" in said()[0] and f"claude auth login --email {EMAIL['amb']}" in said()[0]
-    assert w.notify_envs() == ["1/"]                              # strict but NOT forced: the quiet hours may hold it for the morning
+    assert w.notify_envs() == ["1/1"]                             # strict AND forced like every other push: FORCE_PUSH keeps it out of the digest, it never pierced the quiet hours (rc 10 = held until 07:00 = told)
     w.run(at=w.now + 7200)                                        # read again, but said less than a day ago
     assert len(said()) == 1
     w.run(at=w.now + 90000)
@@ -2641,3 +2646,182 @@ def test_the_newer_stored_login_skip_is_said_once_with_the_facts_not_every_minut
         w.run(at=w.now + 60 * i)
     assert w.log().count("skipped: the stored login is a NEWER one") == 1
     assert crew.fp("sk-ant-ort01-new-login-ref") in w.log() and crew.fp("sk-ant-ort01-old-login-ref") in w.log() and "ends 20" in w.log()
+
+
+# ══ ga-xoe5ao.4, the gate's first review (claude-crew-account.py): a read that could not be made must not speak ══════════════════════════
+def _back_pushes(w):
+    return _ep_pushes(w, "Remote Control is BACK")
+
+
+def _subjects(w):
+    return [m[m.index("-s") + 1] for m in w.mails()]
+
+
+@pytest.mark.parametrize("cannot_look", ["keychain-locked", "no-pool-decision"])
+def test_a_run_that_could_not_look_at_the_default_item_never_ends_an_episode(w, cannot_look):
+    """Breaks if the END of an episode is decided from the clock alone: a run that could not read the default item (a locked keychain, or no pool
+    decision so the follow step never ran) found it 'good for ten minutes' from a login seen ONCE, 640 s earlier, and told the phone and the Mayor
+    that Remote Control was BACK while the job could not see the item (the gate's blocking finding on claude-crew-account.py tell_no_login)."""
+    _dead_world(w, ("terr",))
+    _run_dead(w, 0, 180, 360, 540, 600, 660)
+    assert len(_ep_pushes(w)) == 1 and len(w.mails()) == 1
+    w.default("terr", blob("terr-relogin"))                       # a human login ...
+    w.run(at=w.now + 700)                                         # ... SEEN once: the ten minutes of "back" start here
+    if cannot_look == "keychain-locked":
+        w.mp.setenv("FAKE_SEC_FAIL", crew.DEFAULT_SERVICE)
+    else:
+        (w.d / "pool_decision.json").unlink()
+    for s in (1340, 2000, 90000):                                 # 640 s after the last full login that was SEEN, then hours
+        w.run(at=w.now + s)
+    assert _back_pushes(w) == [] and len(w.mails()) == 1          # no false all-clear on either channel ...
+    assert w.state()["no_login"]["good_since"] == w.now + 700 and "no_login_last" not in w.state()      # ... and the record is kept, unchanged
+    w.mp.delenv("FAKE_SEC_FAIL", raising=False)
+    w.decide("terr")
+    w.run(at=w.now + 90060)                                       # a run that SAW a full login: now the end is told, once, on both channels
+    assert len(_back_pushes(w)) == 1 and len(w.mails()) == 2 and "no_login" not in w.state()
+
+
+def test_the_notice_says_how_many_logins_the_job_wrote_and_never_that_none_was_tried(w):
+    """Breaks if an episode record with no 'Not usable:' list is read as 'no account has been tried': 4 stored logins, 4 blind writes in ten minutes
+    (heal_choice only records a heal that FAILED), and the push and the mail to the Mayor said 'No account has been tried since it started.'"""
+    _dead_world(w)
+    _run_dead(w, 0, 200, 400, 600)
+    assert w.writes().count(crew.DEFAULT_SERVICE) == 4
+    mail = w.mails()[0]
+    for text in (_ep_pushes(w)[0], mail[mail.index("-m") + 1]):
+        assert "No account has been tried" not in text and "written a stored login to the default item 4 time(s)" in text
+        assert "writes it to the default item within a minute" in text          # this shape the job DOES heal: the promise is true here
+
+
+def test_a_relapse_after_the_end_was_due_is_a_new_episode_with_its_own_news(w):
+    """Breaks if the old record is reused: the end was told on ONE channel (the mail was refused), the default emptied again inside the retry
+    hour, and the relapse was 'the same episode' - no new push (the 6 h window of the first), no new mail (mailed was set) and a real end
+    that skipped its push because end_push was stale."""
+    _dead_world(w, ("terr",))
+    _run_dead(w, 0, 180, 360, 540, 600, 660)
+    w.default("terr", blob("terr-relogin"))
+    w.run(at=w.now + 700)
+    w.mp.setenv("FAKE_GC_MAIL_FAIL", "1")
+    w.run(at=w.now + 1300)                                        # ten minutes of a full login: the end is told - the push went, the mail was refused
+    ep = w.state()["no_login"]
+    assert len(_back_pushes(w)) == 1 and ep.get("end_push") and not ep.get("end_mail")
+    w.mp.delenv("FAKE_GC_MAIL_FAIL")
+    _blank_default(w)                                             # empty AGAIN, inside the retry hour
+    _run_dead(w, 1400, 1460, 1520, 2060)
+    assert len(_ep_pushes(w)) == 2 and len([s for s in _subjects(w) if "SEM login completo" in s]) == 2        # the second outage has its own news ...
+    assert w.state()["no_login"]["since"] == w.now + 1400 and "ending" not in w.state()["no_login"]
+    w.default("terr", blob("terr-relogin-2"))
+    for s in (2100, 2700):
+        w.run(at=w.now + s)
+    assert len(_back_pushes(w)) == 2 and "no_login" not in w.state()           # ... and its own end
+    assert len([s for s in _subjects(w) if "de novo" in s]) == 2               # the first end's refused mail (not retried any more) and the second end's
+
+
+def test_the_end_notice_is_retried_for_one_hour_from_its_first_attempt(w):
+    """Breaks if the retry window runs from the first sight of the login: it stopped ~50 minutes after the first attempt (the doc says one hour)."""
+    _dead_world(w, ("terr",))
+    _run_dead(w, 0, 180, 360, 540, 600, 660)
+    w.default("terr", blob("terr-relogin"))
+    w.run(at=w.now + 700)
+    w.mp.setenv("FAKE_GC_MAIL_FAIL", "1")                         # the mail never goes
+    for s in (1300, 1600, 2500, 3500, 4300):                      # the first attempt is at 1300; 4300 is 3600 s after the login was first SEEN
+        w.run(at=w.now + s)
+    assert "no_login" in w.state()                                # still trying
+    w.run(at=w.now + 4900)                                        # one hour after the first attempt
+    assert "no_login" not in w.state() and w.state()["no_login_last"]["end_told"] is False
+
+
+def test_a_strike_record_that_cannot_be_read_survives_the_burn_of_another_login(w):
+    """Breaks if burn() prunes a damaged record away: dead_login reads it as DEAD (the inert side), and the strike of ANOTHER login must not turn
+    it into 'never struck' (the gate's low finding: _prune drops whatever has no usable time)."""
+    _heal_loop_world(w)
+    other = crew.fp("sk-ant-ort01-other-ref")
+    (w.d / "crew_state.json").write_text(json.dumps({"burned": {other: "garbage"}}))
+    _run_dead(w, 0, 240)                                          # b85 is written blind and found empty again: its strike runs burn()
+    burned = w.state()["burned"]
+    assert crew.fp("sk-ant-ort01-b85-ref") in burned              # the burn did run ...
+    assert burned.get(other) == "garbage"                         # ... and kept the record it could not read
+
+
+def test_a_last_write_record_without_the_fingerprint_of_what_was_written_gives_no_verdict(w):
+    """Breaks if 'cannot tell which token was written' is read as 'the refresh worked': a full login in the default is then compared with a
+    missing fingerprint, differs, and the strikes of that login are forgiven (the lenient side of a read that could not be made)."""
+    w.default("terr", blob("terr-live"))
+    w.decide("terr")
+    rfp = crew.fp("sk-ant-ort01-written-ref")
+    (w.d / "crew_state.json").write_text(json.dumps({"last_write": {"rfp": rfp, "svc": "x", "target": EMAIL["terr"], "at": w.now - 100},
+                                                     "burned": {rfp: {"n": 1, "at": w.now - 100}}}))
+    w.run()
+    assert "last_write" not in w.state()                          # judged once, then it goes ...
+    assert w.state().get("burned", {}).get(rfp, {}).get("n") == 1     # ... without a verdict: the strike stands
+
+
+def test_a_forecast_is_not_made_from_half_a_look_at_an_account(w):
+    """Breaks if an account is told 'its best login ends in 3 days' when another item of it could not be read this hour: the unread item may hold
+    the newer login (the same absent-turned-into-a-claim shape as the end of an episode)."""
+    w.default("crypto", blob("crypto", rexp_days=20))
+    w.account("crypto", blob("crypto", rexp_days=20))
+    w.account("amb", blob("amb", rexp_days=3))
+    w.put(crew.reserve_service(EMAIL["amb"]), blob("amb-reserve", rexp_days=2))
+    w.decide("crypto")
+    w.mp.setenv("FAKE_SEC_FAIL", crew.reserve_service(EMAIL["amb"]))          # one item of amb cannot be read this hour
+    w.run()
+    assert [n for n in w.notified() if "ends in" in n] == []
+    w.mp.delenv("FAKE_SEC_FAIL")
+    w.run(at=w.now + 3700)                                        # the next hour the look is whole: amb's best login is the 3-day one
+    said = [n for n in w.notified() if "ends in" in n]
+    assert len(said) == 1 and EMAIL["amb"] in said[0]
+
+
+def test_kc_read_hands_back_what_it_read_when_the_item_is_not_a_login_but_still_says_unknown(w):
+    """Every other caller treats 'unknown' as 'could not tell' (nothing is written, a source search stops), so the shape stays 'unknown' for them;
+    it carries what was read for the one caller that can tell 'there is no login in it' from 'could not read it'."""
+    svc = crew.DEFAULT_SERVICE
+    w.put(svc, {"mcpOAuth": {}})                                  # what a logged-out CLI leaves: the machine's MCP logins, no Claude login
+    assert crew.kc_read(svc) == ("unknown", "athos", {"mcpOAuth": {}})
+    w.put(svc, {"claudeAiOauth": "x"})                            # the login key is there but is not an object
+    assert crew.kc_read(svc) == ("unknown", "athos", {"claudeAiOauth": "x"})
+    w.put(svc, ["not", "an", "item"])                             # JSON, but not even an object: nothing can be said of it
+    assert crew.kc_read(svc) == ("unknown", None, None)
+    w.mp.setenv("FAKE_SEC_FAIL", svc)                             # a locked keychain
+    assert crew.kc_read(svc) == ("unknown", None, None)
+
+
+def test_a_default_item_that_is_readable_but_holds_no_login_object_is_an_episode_too(w):
+    """Breaks if 'readable, with no claudeAiOauth' stays 'could not tell': it is the opposite of unreadable and it is the very outage this bead is
+    about (a logged-out CLI keeps only the MCP logins), yet nobody was ever told. The job still does not touch or heal such an item."""
+    w.put(crew.DEFAULT_SERVICE, {"mcpOAuth": {"some-server": {"serverName": "x"}}})
+    w.account("amb", blob("amb"))
+    w.decide("amb")
+    w.run()
+    assert w.writes() == [] and len(w.notified()) == 1 and "no login object" in w.notified()[0]          # at once, like 'does not exist'
+    w.run(at=w.now + 600)
+    pushes = _ep_pushes(w)
+    assert len(pushes) == 1 and "no login object" in pushes[0] and "NOT put one back by itself" in pushes[0] and len(w.mails()) == 1
+    assert w.writes() == []
+
+
+def test_a_strike_record_of_the_login_itself_that_cannot_be_read_is_not_rewritten_as_one_strike(w):
+    """Breaks if burn() answers a damaged record of the very login it is striking with 'strike 1': dead_login holds that login (the inert side) and a
+    count of 1 would let it be written again."""
+    rfp = crew.fp("sk-ant-ort01-x-ref")
+    st = {"burned": {rfp: "garbage"}}
+    crew.burn(st, {"rfp": rfp, "svc": "x", "target": EMAIL["terr"], "at": w.now - 10}, w.now)
+    assert st["burned"] == {rfp: "garbage"} and crew.dead_login(st, rfp) is not None
+
+
+@pytest.mark.parametrize("damage", ["yesterday", True, None], ids=["text-time", "bool-time", "null"])
+def test_a_good_since_that_cannot_be_read_restarts_the_end_clock_and_never_tells_early(w, damage):
+    """Breaks if a record whose good_since is damaged sticks for ever (the end can never be told) or ends at once: the end clock restarts - the end is
+    told late, never early."""
+    _dead_world(w, ("terr",))
+    _run_dead(w, 0, 180, 360, 540, 600, 660)
+    w.default("terr", blob("terr-relogin"))
+    w.run(at=w.now + 700)
+    st = w.state()
+    st["no_login"]["good_since"] = damage
+    (w.d / "crew_state.json").write_text(json.dumps(st))
+    w.run(at=w.now + 1400)                                        # the damaged start of the streak is replaced by this run: zero minutes of "back"
+    assert _back_pushes(w) == [] and w.state()["no_login"]["good_since"] == w.now + 1400
+    w.run(at=w.now + 2000)                                        # ten minutes later the end is told, once
+    assert len(_back_pushes(w)) == 1

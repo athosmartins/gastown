@@ -76,7 +76,9 @@ What it does, every run (launchd StartInterval, single instance via flock):
      Mayor and the crews) and nobody heard of it. (a) `notify` exits 0 on every path that did not push unless asked (NOTIFY_STRICT_EXIT=1) and
      every push shared one title (it drops the 2nd push of a title within 30 min): push() speaks the city's strict contract, the title names
      the condition. (b) "no full login" is an EPISODE: after NO_LOGIN_WARN_S in a row a push (reminded every 6 h) + ONE mail to the Mayor with the fix,
-     and the end told the same way (watch_no_login, tell_no_login). (c) A stored login written blind twice that left the default empty both
+     and the end told the same way - but only by a run that SAW a full login (a run that could not read the item, or had no pool decision,
+     neither extends nor ends it), and an outage that comes back once its end was due is a NEW episode (watch_no_login, tell_no_login).
+     (c) A stored login written blind twice that left the default empty both
      times (what a refused refresh looks like - inferred from the log, not seen in the CLI) is dead: it is not written again until it is
      logged in again, instead of every 6 h for ever (burn/dead_login; log #324-#334). (d) A refresh
      token has an ABSOLUTE life (~30 days): logins ending within a week are said once a day (warn_expiring). NOT here: logging an account in by
@@ -318,7 +320,9 @@ def _sec(*args: str, stdin: Optional[str] = None):
 
 def kc_read(service: str) -> Tuple[str, Optional[str], Optional[dict]]:
     """('ok', acct, blob) | ('missing', None, None) | ('unknown', None, None). Only exit 44 is 'not there': a locked
-    keychain or a crashed `security` is 'could not tell', and 'could not tell' never triggers a write."""
+    keychain or a crashed `security` is 'could not tell', and 'could not tell' never triggers a write. An item that WAS read and parsed but
+    holds no login object (a logged-out CLI keeps the MCP logins) is also 'unknown' - no caller may act on it - but carries (acct, blob): the
+    default-item watch tells 'there is no login in it' from 'could not read it' by the blob."""
     try:
         r = _sec("find-generic-password", "-s", service)
         if r.returncode == 44:
@@ -340,8 +344,10 @@ def kc_read(service: str) -> Tuple[str, Optional[str], Optional[dict]]:
         blob = json.loads(r2.stdout.strip())
     except ValueError:
         return "unknown", None, None
-    if not isinstance(blob, dict) or not isinstance(blob.get("claudeAiOauth"), dict):
+    if not isinstance(blob, dict):
         return "unknown", None, None
+    if not isinstance(blob.get("claudeAiOauth"), dict):
+        return "unknown", acct, blob
     return "ok", acct, blob
 
 
@@ -518,10 +524,16 @@ def held_login(st: Optional[dict], rfp: Optional[str], t: float) -> Optional[str
 def burn(st: dict, lw: dict, t: float) -> None:
     """ga-xoe5ao.4: the login of the last blind write (`lw`) was gone from the default item soon after - what a refresh the CLI refused looks like. One strike."""
     burned = st.get("burned")
-    # vazio → a new table; falhou/ilegível → a new table too (strikes are lost, none is invented: at worst one more try per login)
-    burned = _prune(burned if isinstance(burned, dict) else {}, OWNERS_KEEP_S, HELD_MAX - 1, t)
+    # vazio → a new table; falhou/ilegível (not a table) → a new table too (strikes are lost, none is invented: at worst one more try per login)
+    burned = burned if isinstance(burned, dict) else {}
+    # A record whose time cannot be read is KEPT, not pruned: dead_login reads it as DEAD (the inert side) and the strike of another login must not turn it into "never struck"
+    ok_at = {k: v for k, v in burned.items() if isinstance(v, dict) and isinstance(v.get("at"), (int, float)) and not isinstance(v.get("at"), bool)}
+    burned = {**{k: v for k, v in burned.items() if k not in ok_at}, **_prune(ok_at, OWNERS_KEEP_S, HELD_MAX - 1, t)}
     old = burned.get(lw["rfp"])
-    n = (old["n"] if isinstance(old, dict) and isinstance(old.get("n"), int) and not isinstance(old.get("n"), bool) else 0) + 1
+    if old is not None and not (isinstance(old, dict) and isinstance(old.get("n"), int) and not isinstance(old.get("n"), bool)):
+        st["burned"] = burned                              # this login's own record is there but cannot be read: it already holds the login (dead_login), it is not rewritten as "1 strike"
+        return
+    n = (old["n"] if old else 0) + 1
     burned[lw["rfp"]] = {"n": n, "svc": lw.get("svc"), "target": lw.get("target"), "at": t}
     st["burned"] = burned
     log("WARN", f"the {lw.get('target')} login written from {lw.get('svc')} {int(t - _num(lw.get('at')))} s ago is gone from the default item "
@@ -546,7 +558,9 @@ def settle_last_write(st: dict, cur: dict, ok: bool, why: str, t: float) -> None
         if t - at <= BURN_WINDOW_S and why == "no access token":
             burn(st, lw, t)
         st.pop("last_write", None)
-    elif fp(cur["claudeAiOauth"].get("accessToken")) != lw.get("afp"):
+    elif not isinstance(lw.get("afp"), str) or not lw["afp"]:
+        st.pop("last_write", None)                         # no fingerprint of the access token that was written: "a refresh took" cannot be told from "the same token" - no verdict, the strikes stand
+    elif fp(cur["claudeAiOauth"].get("accessToken")) != lw["afp"]:
         if isinstance(st.get("burned"), dict):
             st["burned"].pop(rfp, None)
         st.pop("last_write", None)
@@ -602,19 +616,21 @@ def publish_state(st: dict) -> None:
     os.replace(tmp, p)
 
 
-def push(title: str, text: str, force: bool = True) -> bool:
+def push(title: str, text: str) -> bool:
     """One `notify -p 4` under notify's STRICT contract (its policy_exit, as quoted in git-loose-repack.sh notify_send; claude-pool-guard send_alert).
     By default EVERY path that did NOT push exits 0 and an unknown source goes to the muted digest; this job took that 0 for "told" and stayed
     silent for 6 h. It is one of the holes found after 01/11 08:39Z-02/11 03:10Z (18.5 h in which nobody heard that Remote Control was down);
     which one ate THOSE pushes was not measured: notify and its history live on the mini (ga-xoe5ao.4). With STRICT_EXIT the exit says what
     happened: 0 pushed, 10 held until 07:00 (pushed then), 11 a push with this TITLE went out < 30 min ago (whatever the body - so the title
     carries the condition), 12 digest or push cap, anything else failed. Delivered = 0, 10 or 11; the rest, and notify missing or not running,
-    is NOT delivered and the caller retries. `force` = NOTIFY_FORCE_PUSH, which keeps the push out of the digest; the forecast leaves it off."""
+    is NOT delivered and the caller retries. NOTIFY_FORCE_PUSH keeps every push out of the muted digest; it does NOT pierce the quiet hours
+    (disk-recovery-ladder.sh: "FORCE_PUSH nao fura a madrugada"; git-loose-repack.sh gets 10 for a night job - read there, not measured here),
+    so a push made at night comes back 10 and counts as told: at night the mail to the Mayor is the immediate channel, the phone hears at 07:00."""
     n = os.environ.get("CLAUDE_CREW_NOTIFY") or shutil.which("notify")
     if not n:
         log("ERROR", f"no notify binary: the push '{title}' could not be sent")
         return False
-    env = {**os.environ, "NOTIFY_STRICT_EXIT": "1", **({"NOTIFY_FORCE_PUSH": "1"} if force else {})}
+    env = {**os.environ, "NOTIFY_STRICT_EXIT": "1", "NOTIFY_FORCE_PUSH": "1"}
     try:
         # vazio (nothing printed) → fine, only the exit code counts; falhou/ilegível (cannot run, any exit but 0/10/11) → NOT delivered, said, retried
         r = subprocess.run([n, "-t", title, "-p", "4", f"job falhou: claude-crew-account — {text}"], env=env,
@@ -628,7 +644,7 @@ def push(title: str, text: str, force: bool = True) -> bool:
     return True
 
 
-def alert(st: dict, key: str, msg: str, t: float, every: float = ALERT_EVERY_S, force: bool = True) -> bool:
+def alert(st: dict, key: str, msg: str, t: float, every: float = ALERT_EVERY_S) -> bool:
     """One named line in the log, and ONE push per key per `every`. The title carries the key (notify drops the 2nd push of a title within
     30 min, so two conditions sharing one lost the second). The text carries 'job falhou' so notify routes it to the auto-repair path
     (bead + agent) and not to a mute digest (CLAUDE.md, 'Job agendado novo').
@@ -639,7 +655,7 @@ def alert(st: dict, key: str, msg: str, t: float, every: float = ALERT_EVERY_S, 
     al = st.setdefault("alerts", {})
     if t - _num(al.get(key)) < every:
         return False
-    delivered = push(f"Troca de conta (crews): {key}", msg, force)
+    delivered = push(f"Troca de conta (crews): {key}", msg)
     # "told" only when it was delivered; otherwise the key is set so that it is retried after ALERT_RETRY_S
     al[key] = t if delivered else t - every + ALERT_RETRY_S
     return delivered
@@ -669,10 +685,21 @@ def relogin_cmd(email: str) -> str:
 
 def no_login_text(ep: dict, dec, t: float) -> str:
     want = str((dec or {}).get("current") or "").strip().lower() or next(iter(accounts()), "")
+    # vazio (no count, no list: the job did not record a try) → it says NOTHING about tries, "not recorded" is not "none was tried"; falhou/ilegível (not an int / not a text) → the same
+    n, who, tried = ep.get("writes"), ep.get("wrote"), ep.get("accounts")
+    did = ""
+    if isinstance(n, int) and not isinstance(n, bool) and n > 0:
+        names = ", ".join(x for x in who if isinstance(x, str)) if isinstance(who, list) else ""
+        did = f" This job has written a stored login to the default item {n} time(s) since it started" + (f" ({names})" if names else "") + "."
+    if isinstance(tried, str) and tried:
+        did += " " + tried
+    if ep.get("heals") is False:                                   # a missing item / one with no login object: _follow does not touch it, so no promise of a heal
+        fix = (f"This job heals only a default item that exists and holds a login object, so it will NOT put one back by itself. Fix: log "
+               f"{want or 'an account'} in by hand, in the default config dir - claude auth login" + (f" --email {want}" if want else "") + ".")
+    else:
+        fix = f"Fix: log ONE account in, the pool's pick first - {relogin_cmd(want)} - and this job writes it to the default item within a minute."
     return (f"the Mayor and the crews have had NO full Claude login for {int((t - _num(ep.get('since'))) // 60)} min - Remote Control is down "
-            f"({ep.get('why')}). {ep.get('accounts') or 'No account has been tried since it started.'} Fix: log ONE account in, the pool's "
-            f"pick first - {relogin_cmd(want)} - and this job writes it to the default item within a minute. Automatic relogin (gmail-totp) is NOT "
-            "wired into this job: it needs the mini's browser (ga-xoe5ao.4, item 2).")
+            f"({ep.get('why')}).{did} {fix} Automatic relogin (gmail-totp) is NOT wired into this job: it needs the mini's browser (ga-xoe5ao.4, item 2).")
 
 
 def _episode(st: dict) -> Optional[dict]:
@@ -681,11 +708,18 @@ def _episode(st: dict) -> Optional[dict]:
     return ep if isinstance(ep, dict) and isinstance(ep.get("since"), (int, float)) and not isinstance(ep.get("since"), bool) else None
 
 
-def watch_no_login(st: dict, bad: bool, why: str, t: float) -> None:
+def watch_no_login(st: dict, bad: bool, why: str, t: float, heals: bool = True) -> None:
     """ga-xoe5ao.4: the default item with no full login is an EPISODE, not a line in the log. This keeps its books, early in the run: it starts at
-    the first bad run, a good run only counts toward its end (`good_since`), a bad one cancels that. A run that cannot read the default item never
-    calls this: it neither extends nor ends an episode. The news itself is tell_no_login(), after the heal of the same run."""
+    the first bad run, a good run only counts toward its end (`good_since` = the first one, `good_last` = THIS run saw a full login), a bad one
+    cancels that. A run that cannot read the default item never calls this: it neither extends nor ends an episode (tell_no_login ends one only
+    on a run that stamped good_last). `heals` = whether this job puts a login back in this shape (it does not for an item that is missing or
+    has no login object). Once the end was due (`ending`, set by tell_no_login) a bad run is a NEW outage: the old record's unsent end notice is
+    moot and its told/mailed/end_* must not leak into the news of the new one. The news itself is tell_no_login(), after the heal of the same run."""
     ep = _episode(st)
+    if ep is not None and bad and ep.get("ending"):
+        st["no_login_last"] = {"since": ep["since"], "until": ep.get("good_since"), "end_told": False}
+        log("INFO", "the default item has no full login AGAIN before the end of the last outage was fully told: a new episode, the old end notice is dropped")
+        ep = None
     if ep is None:
         if not bad:
             st.pop("no_login", None)
@@ -694,16 +728,21 @@ def watch_no_login(st: dict, bad: bool, why: str, t: float) -> None:
         for k in ("no-login-episode", "no-login-end"):
             st.setdefault("alerts", {}).pop(k, None)       # a new episode is news again, not held back by the last one's window
     if bad:
-        ep.update(why=why, last_bad=t)
+        ep.update(why=why, last_bad=t, heals=heals)
         ep.pop("good_since", None)
+        ep.pop("good_last", None)
     else:
-        ep.setdefault("good_since", t)
+        gs0 = ep.get("good_since")
+        if not isinstance(gs0, (int, float)) or isinstance(gs0, bool):
+            ep["good_since"] = t                           # vazio → the streak of full logins starts now; ilegível → the end clock restarts too: the end is told late, never early
+        ep["good_last"] = t
 
 
 def tell_no_login(st: dict, dec, t: float) -> None:
     """ga-xoe5ao.4: the news of the episode, AFTER the heal of this run (so it says which accounts failed and why). Once the default has had no
     full login NO_LOGIN_WARN_S in a row: a push (again every ALERT_EVERY_S while it lasts) and ONE mail to the Mayor, with the fix. Once a full
-    login has been back NO_LOGIN_END_S: the end, on both channels, retried until both reached someone (or an hour). An episode nobody was told
+    login has been back NO_LOGIN_END_S AND this very run saw one: the end, on both channels, retried until both reached someone (or an hour from
+    the first attempt). A run that could not look (a locked keychain, no pool decision) says nothing either way. An episode nobody was told
     about ends silently - a blip is not news."""
     ep = _episode(st)
     if ep is None:
@@ -720,14 +759,17 @@ def tell_no_login(st: dict, dec, t: float) -> None:
             if mail_mayor(f"Troca de conta: Mayor/crews SEM login completo há {int((t - since) // 60)} min (Remote Control fora)", text):
                 ep["mailed"] = ep["told"] = t
         return
+    if ep.get("good_last") != t:                           # THIS run did not SEE a full login either: a run that could not look cannot say it is over
+        return
     if not isinstance(gs, (int, float)) or isinstance(gs, bool) or t - gs < NO_LOGIN_END_S:
         return
     if not ep.get("told"):
         log("INFO", f"the default item has a full login again after {int((gs - since) // 60)} min; nobody had been told, so nothing is said now")
         st.pop("no_login", None)
         return
-    text = (f"Remote Control is BACK: the default item has held a full login for {int((t - gs) // 60)} min (the Mayor and the crews "
-            f"had none for {int((gs - since) // 60)} min)")
+    ep.setdefault("ending", t)                             # the outage is over for the news from here: a relapse is a NEW episode (watch_no_login), and the retry hour runs from now
+    text = (f"Remote Control is BACK: a full login is in the default item again - first seen {int((t - gs) // 60)} min ago, and there on this "
+            f"check too (the Mayor and the crews had none for {int((gs - since) // 60)} min)")
     if not ep.get("end_push") and alert(st, "no-login-end", text, t):
         ep["end_push"] = t
     if not ep.get("end_mail") and t - _num(ep.get("mail_try")) >= ALERT_RETRY_S:
@@ -735,7 +777,7 @@ def tell_no_login(st: dict, dec, t: float) -> None:
         if mail_mayor("Troca de conta: Mayor/crews com login completo de novo (Remote Control no ar)", text):
             ep["end_mail"] = t
     done = bool(ep.get("end_push") and ep.get("end_mail"))
-    if done or t - gs >= 3600:                             # told on both channels, or one hour of trying: the record goes either way
+    if done or t - _num(ep.get("ending")) >= 3600:         # told on both channels, or one hour of trying: the record goes either way
         st["no_login_last"] = {"since": since, "until": gs, "end_told": done}
         st.pop("no_login", None)
 
@@ -1710,8 +1752,22 @@ def heal_choice(st: dict, dec: dict, ident: Optional[str], want: str, t: float) 
                                 "step", t)
     ep = st.get("no_login")
     if isinstance(ep, dict):                                   # ga-xoe5ao.4: the episode notice (what reaches the Mayor) says which account failed and why
-        ep["accounts"] = ("Tried: " + " | ".join(short))[:700]
+        ep["accounts"] = ("Not usable: " + " | ".join(short))[:700]
     return None, None, "heal-no-source", None
+
+
+def note_heal_write(st: dict, target: str) -> None:
+    """ga-xoe5ao.4: a login was just written to a default item that had none. The episode notice says how many times and to whom instead of
+    guessing "none was tried" from a record that only a FAILED heal fills in; the 'Not usable:' list was about the heal before this write."""
+    ep = st.get("no_login")
+    if not isinstance(ep, dict):
+        return
+    # vazio (no count / no list yet) → this is the first write: 1, [target]; falhou/ilegível (not an int / not a list of texts) → the same, counted from this write (a count can be low, never invented high)
+    n, who = ep.get("writes"), ep.get("wrote")
+    who = [x for x in who if isinstance(x, str)] if isinstance(who, list) else []
+    ep["writes"] = (n if isinstance(n, int) and not isinstance(n, bool) else 0) + 1
+    ep["wrote"] = (who if target in who else who + [target])[-6:]
+    ep.pop("accounts", None)
 
 
 def resolve_unverified(st: dict, t: float) -> None:
@@ -1748,25 +1804,33 @@ def resolve_unverified(st: dict, t: float) -> None:
 def warn_expiring(st: dict, t: float) -> None:
     """ga-xoe5ao.4: every login has an ABSOLUTE life - the refresh token ends ~30 days after the login (ga-yyltfk; whether a rotation extends it was NOT
     measured) - so logins made together end together (the three config dirs of 05/10 end ~04/11). The best login of each account is said EXPIRY_WARN_S
-    ahead, once a day, by a push that is NOT forced (the quiet hours may hold it for the morning): a week is time to log in again BEFORE the outage.
+    ahead, once a day, by a push like every other (the quiet hours hold it for the morning): a week is time to log in again BEFORE the outage.
+    An account with an item that could not be read (or not looked at in time) is not judged this hour: that item may hold the newer login.
     Runs after the switch, at most once an hour and inside LOOK_BUDGET_S: a slow keychain must never delay the switch (what there was no time for waits an hour)."""
     if t - _num(st.get("expiry_checked")) < EXPIRY_CHECK_S:          # vazio / unreadable → _num() says 0: checked now
         return
     st["expiry_checked"] = t
-    deadline, best = time.monotonic() + LOOK_BUDGET_S, {}
+    deadline, best, unread = time.monotonic() + LOOK_BUDGET_S, {}, set()
     items = [(st.get("current"), DEFAULT_SERVICE)] + [(e, svc) for e in accounts() for svc in source_services(e)]   # the login in use counts for the account that holds it
     for email, svc in items:
-        if not isinstance(email, str) or not email or time.monotonic() > deadline:
+        if not isinstance(email, str) or not email:
+            continue
+        if time.monotonic() > deadline:
+            unread.add(email)                                # no time to look at this item: the account's best login is not known this hour
             continue
         s, _, b = kc_read(svc)
-        # vazio (no item, no expiry field) → that item says nothing; falhou/ilegível (locked keychain) → nothing either: the next hour asks again, no alert is invented
+        # vazio (no item, no expiry field, an item with no login object) → that item says nothing; falhou/ilegível (locked keychain, crashed security) → the
+        # ACCOUNT is not judged this hour (it may hold its newer login there): the next hour asks again, no alert is invented from half a look
+        if s == "unknown" and b is None:
+            unread.add(email)
+            continue
         left = _ms_left(b["claudeAiOauth"], "refreshTokenExpiresAt", t) if s == "ok" and b else None
         if left is not None:
             best[email] = max(left, best.get(email, left))
     for email, left in sorted(best.items()):
-        if 0 < left <= EXPIRY_WARN_S:
+        if email not in unread and 0 < left <= EXPIRY_WARN_S:
             alert(st, f"expiring:{email}", f"the best login of {email} ends in {left / 86400:.1f} days (a refresh token lives ~30 days from the "
-                  f"login): log it in again before then - {relogin_cmd(email)}", t, every=EXPIRY_EVERY_S, force=False)
+                  f"login): log it in again before then - {relogin_cmd(email)}", t, every=EXPIRY_EVERY_S)
 
 
 def _follow(st: dict, dec: dict, user: str, t: float, dry: bool) -> int:
@@ -1777,7 +1841,13 @@ def _follow(st: dict, dec: dict, user: str, t: float, dry: bool) -> int:
         if s == "missing":
             alert(st, "default-missing", "the default item does not exist: Remote Control is down for Mayor and crews until a "
                   "login is put back (this script heals only a default item that exists)", t)
-            watch_no_login(st, True, "the default item does not exist", t)      # 'unknown' (locked keychain) is neither: the episode is left as it is
+            watch_no_login(st, True, "the default item does not exist", t, heals=False)
+        elif isinstance(cur, dict):
+            # vazio/falhou: 'unknown' WITHOUT a blob (locked keychain, crashed security, not an object) is neither: the episode is left as it is;
+            # 'unknown' WITH a blob = read and parsed, and there is no login object in it - the very outage this exists for, still not touched or healed
+            alert(st, "default-no-login", "the default item holds no login object (a logged-out CLI?): Remote Control is down for Mayor and crews "
+                  "until a login is put back (this script heals only a default item that holds one)", t)
+            watch_no_login(st, True, "the default item holds no login object", t, heals=False)
         return 0
     ok, why = full_login(cur, t)
     settle_last_write(st, cur, ok, why, t)
@@ -1824,6 +1894,8 @@ def _follow(st: dict, dec: dict, user: str, t: float, dry: bool) -> int:
                                   "see the log)", t)
         return 0
     f_new = fp(blob["claudeAiOauth"].get("accessToken"))
+    if not ok:
+        note_heal_write(st, target)
     if claimed is None:
         n = int(_num(st.get("unverified_switches"))) + 1
         st["unverified_switches"] = n
