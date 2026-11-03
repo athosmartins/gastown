@@ -9,7 +9,8 @@
 #
 # What is under test is the REAL _pilot_emit_dispatchable, cut out of the dispatcher with sed (same idiom as
 # pilot-dispatcher.exclusion-trace.selftest.sh); only its inputs are stubbed: the per-store query
-# (_emit_query_one -> a fixture) and `gc rig list` (no rigs). Everything else — the order step, the projection,
+# (_emit_query_one -> a fixture), `gc rig list` (no rigs) and the unreadable-children mark file (ga-vdac4cj;
+# the two real helpers that reset and read it are cut out too). Everything else — the order step, the projection,
 # the atomic write, the logging — is the dispatcher's own text, run under the dispatcher's own
 # `set -euo pipefail`.
 #
@@ -20,12 +21,14 @@
 #   (b) the painel contract (keys, count, ttl) is unchanged — only the order moved.
 #   (c) THREE states: an illegible field keeps the bead (at the end of its class) AND its `work-order WARN:`
 #       line reaches the log (the emit body runs under 2>/dev/null, which would swallow it);
-#       "cannot tell" (library missing / exit 2 / empty stdout) writes NOTHING and leaves the previous file
-#       byte-identical, with a WARN that says why; an empty queue is a real, fresh `count 0` file.
+#       "cannot tell" (library missing / exit 2 / empty stdout, or — ga-vdac4cj — candidates held back because their
+#       children could not be read, or a mark of that which cannot be kept) writes NOTHING and leaves the previous
+#       file byte-identical, with a WARN that says why; an empty queue is a real, fresh `count 0` file.
 #   (d) the dispatcher sources the library from next to itself, and a missing library degrades loudly.
 #   (e) MUTATION CONTROLS: each mutant below reverts one property and must make THIS file fail:
-#       the old sort, a swallowed stderr, "cannot tell" read as an empty queue, and three library mutants
-#       (priority only, bug before feature, newest first).
+#       the old sort, a swallowed stderr, "cannot tell" read as an empty queue, the unreadable-children mark
+#       ignored or read as "none held back" (ga-vdac4cj), and the library mutants (priority only, bug before
+#       feature, newest first, no dano class).
 #
 # Env: EO_DISPATCHER_UNDER_TEST / EO_LIB_UNDER_TEST point at a mutant (the mutation controls use them);
 #      EO_SKIP_MUTATION=1 skips (e) (the mutants' own runs). Exit 0 iff every check holds.
@@ -62,12 +65,22 @@ if [ -z "$LOG_FN" ] || [ -z "$WARN_FN" ] || [ -z "$EMIT_FN" ]; then
   echo "FATAL: log()/warn()/_pilot_emit_dispatchable() not found in $DISPATCHER" >&2
   exit 2
 fi
+# ga-vdac4cj: the emit asks the unreadable-children mark before it writes. The dispatcher empties the mark at top level right before the emit
+# (_cih_mark_reset); emit_run does the same with the real helpers, cut out here. vazio/falhou -> FATAL 2: without them the emit would answer
+# "cannot tell" to every fixture and this file would test nothing.
+CIH_FNS="$(extract_fn _cih_mark_reset; extract_fn _cih_unreadable_count)"
+if [ "$(printf '%s\n' "$CIH_FNS" | grep -c '^_cih_[a-z_]*() {')" != 2 ]; then
+  echo "FATAL: _cih_mark_reset()/_cih_unreadable_count() not found in $DISPATCHER" >&2
+  exit 2
+fi
 # The age constant the dispatcher defines next to the library source; the harness has to hand the same one.
 WO_AGE="$(sed -n 's/^_PILOT_WORK_ORDER_AGE="\([a-z]*\)".*/\1/p' "$DISPATCHER" | head -n 1)"
 
 # emit_run <fixture-json> <lib-file|-> — run the dispatcher's own _pilot_emit_dispatchable against a fixture.
 # stdout = the dispatcher's log lines; the file written (or not) is $OUT. `-` sources no library at all.
 # A fresh subshell each time, under the dispatcher's own `set -euo pipefail`.
+# The mark (ga-vdac4cj) starts EMPTY, as the dispatcher leaves it for the emit: EO_MARK_HELD=n then appends the line a stage writes when it held
+# n candidates back unread, and EO_MARK_FILE moves the mark (a path under a regular file = a mark that cannot be kept).
 emit_run() {
   local fixture="$1" lib="$2"
   (
@@ -77,13 +90,18 @@ emit_run() {
     PILOT_EMITTED_DONE=0
     PILOT_DISPATCHABLE_TTL=1800
     PILOT_DISPATCHABLE_FILE="$OUT"
+    PILOT_CIH_UNREADABLE_FILE="${EO_MARK_FILE:-$WORK/cih-mark}"
+    _CIH_MARK_BROKEN=""
     _PILOT_WORK_ORDER_AGE="${WO_AGE:-created}"
     eval "$LOG_FN"
     eval "$WARN_FN"
+    eval "$CIH_FNS"
     gc_json_or_unknown() { printf '%s' '{"rigs":[]}'; }
     _emit_query_one() { printf '%s' "$fixture"; }
     if [ "$lib" != "-" ]; then source "$lib"; fi
     eval "$EMIT_FN"
+    _cih_mark_reset
+    if [ -n "${EO_MARK_HELD:-}" ]; then printf '%s\t%s\n' /db/hq "$EO_MARK_HELD" >> "$PILOT_CIH_UNREADABLE_FILE"; fi
     _pilot_emit_dispatchable
   )
 }
@@ -206,6 +224,20 @@ grep -q 'work-order ERROR: stub: cannot tell' "$WORK/c2-library exits 2.log" \
   && ok "library exits 2: the library's own ERROR line is in the log (the reason is visible)" || bad "library exits 2: the reason never reached the log"
 printf '%s\n' 'work_order_sort() { cat >/dev/null; return 0; }' > "$WORK/lib-empty.sh"
 cannot_tell_case "library exits 0 with EMPTY stdout" "$WORK/lib-empty.sh"
+# ga-vdac4cj (gate round 1): the other road to "cannot tell". The library is fine, but the stage that drops the mothers held candidates back because
+# their children could not be read (the mark has a line), or the mark itself cannot be kept. The population is missing beads that were not found
+# absent: a fresh file, a count 0 above all, would be a lie with a current timestamp.
+EO_MARK_HELD=2
+cannot_tell_case "mark: 2 candidates held back unread" "$LIB"
+EO_MARK_HELD=
+grep -q 'the children of 2 candidate(s) could not be read' "$WORK/c2-mark: 2 candidates held back unread.log" \
+  && ok "mark: the WARN carries how many candidates were held back" || bad "mark: the WARN does not say how many candidates were held back unread"
+: > "$WORK/not-a-dir"
+EO_MARK_FILE="$WORK/not-a-dir/mark"
+cannot_tell_case "mark that cannot be kept" "$LIB"
+EO_MARK_FILE=
+grep -q 'cannot keep the unreadable-children mark' "$WORK/c2-mark that cannot be kept.log" \
+  && ok "mark that cannot be kept: the reset said so in the log" || bad "mark that cannot be kept: no 'cannot keep' line in the log"
 
 echo "== (c3) an empty queue is a real answer: a fresh count 0 file, no WARN"
 printf '%s\n' "$SENTINEL" > "$OUT"
@@ -280,6 +312,11 @@ if [ "${EO_SKIP_MUTATION:-0}" != "1" ]; then
   must_fail "stderr-swallowed" dispatcher '2>"$_wo_err")' '2>/dev/null)'
   # "Cannot tell" read as an empty queue (the error/empty collapse the library's contract forbids).
   must_fail "cannot-tell-is-an-empty-queue" dispatcher '      _wo_ok=0' '      _wo_ok=1; _ordered="[]"'
+  # ga-vdac4cj: the emit stops asking the unreadable-children mark, or reads "the mark cannot be read" as "nothing was held back" (the same collapse).
+  must_fail "ignores-the-unreadable-mark" dispatcher \
+    'if ! _cih_n=$(_cih_unreadable_count) || [ "${_cih_n:-0}" -gt 0 ]; then' 'if false; then'
+  must_fail "unreadable-mark-is-none" dispatcher \
+    'if ! _cih_n=$(_cih_unreadable_count) || [ "${_cih_n:-0}" -gt 0 ]; then' '_cih_n=$(_cih_unreadable_count) || _cih_n=0; if [ "${_cih_n:-0}" -gt 0 ]; then'
   # The library itself, three ways the rule can rot: ignore the type, bugs first, newest first.
   WO_KEY='def wo_key($o): (wo_age($o)) as $e | [wo_prio_class, wo_dano_class, wo_type_class($o), ($e // 9999999999), (.id // "")];'
   must_fail "lib-priority-only" lib "$WO_KEY" 'def wo_key($o): (wo_age($o)) as $e | [wo_prio_class, wo_dano_class, 0, ($e // 9999999999), (.id // "")];'
