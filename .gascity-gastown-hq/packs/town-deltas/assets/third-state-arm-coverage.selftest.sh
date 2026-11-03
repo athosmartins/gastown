@@ -337,7 +337,7 @@ assert d["state"] == "nao-ligada", d["state"]
 assert [d[k] for k in ("runs", "covered", "rows", "bad_rows")] == [0, 0, 0, 0], d
 assert "alarms" not in d and d["alarm_keys"] == [], d
 ' 2>"$W/js.err" && ok "--json of a city that is not switched on: every counter is 0, there is no 'alarms' key (only alarm_keys)" || bad "--json fields wrong :: $(tail -1 "$W/js.err") :: $(printf '%s' "$OUT" | head -c 200)"
-  newcity hj3; conf mode=enforce; E="$(printf '\303\251')"; runs ga-j 5; v 2026-10-31T11:00:00Z "ga-j$E"; ARGS="--json"; run PYTHONIOENCODING=utf-8; ARGS=""
+  newcity hj3; conf mode=enforce; E="$(printf '\303\251')"; runs ga-j 5; v 2026-10-31T11:00:00Z "ga-j$E"; ARGS="--json"; run; ARGS=""   # no PYTHONIOENCODING here: python -I ignores every PYTHON* variable, so the check rests on the default UTF-8 stdout (measured: it is inert)
   printf '%s' "$OUT" | grep -q "ga-j$E" && ok "--json keeps a non-ASCII bead id as it is (not \\u-escaped)" || bad "the non-ASCII bead id was escaped or lost :: $(printf '%s' "$OUT" | head -c 200)"; }
 case_tunables() { newcity tn; conf mode=enforce; runs ga-n 6; arms ga-n 1 6
   run; want 0 "the default window is 24 h" "janela: 2026-10-30T15:00Z -> 2026-10-31T15:00Z UTC \(24h\)"
@@ -364,15 +364,18 @@ case_tunables() { newcity tn; conf mode=enforce; runs ga-n 6; arms ga-n 1 6
   AT=2026-11-01T14:59:59Z run TSAC_WINDOW_H=48; mails 1 "one second short of the default cooldown (24 h): deduped"
   AT=2026-11-01T15:00:00Z run TSAC_WINDOW_H=48; mails 2 "exactly 24 h after the first alarm: alarmed again"
   newcity tn10; conf mode=enforce; runs ga-m 12
-  run TSAC_WINDOW_H=48 TSAC_ESCALATE_AFTER_S=0; AT=2026-11-01T15:00:00Z run TSAC_WINDOW_H=48 TSAC_ESCALATE_AFTER_S=0; mails 2 "TSAC_ESCALATE_AFTER_S=0 is the default cooldown (24 h), not 'always' and not 'never'"; AT=""; }
+  run TSAC_WINDOW_H=48 TSAC_ESCALATE_AFTER_S=0; mails 1 "tick 1: alarmed"
+  AT=2026-10-31T16:00:00Z run TSAC_WINDOW_H=48 TSAC_ESCALATE_AFTER_S=0; mails 1 "TSAC_ESCALATE_AFTER_S=0 is not 'always': a tick 1 h after the first is still deduped"
+  AT=2026-11-01T15:00:00Z run TSAC_WINDOW_H=48 TSAC_ESCALATE_AFTER_S=0; mails 2 "...and not 'never': exactly 24 h after the first alarm it is the default cooldown, so alarmed again"; AT=""; }
 case_tail_edges() { local L1 n; newcity lt2; conf mode=enforce; runs ga-d 6
   L1="[2026-10-31 08:00:00] [quality-gate-guard] HARDCHECK step=2e verdict=nao-consegui-medir reason=fetch-falhou bead=ga-d1 branch=b mode=enforce marker=m checker=[<EMPTY>]"
   n=$((8388608 + 4000 - ${#L1} - 2))
   { printf '%s\n' "$L1"; head -c "$n" /dev/zero | tr '\0' 'x'; printf '\n'; } > "$C/.gc/logs/quality-gate-guard.log"
   run; want 1 "a guard log 4000 bytes over the 8 MiB default tail: its first line has scrolled out" "rodou para ele, ou o log girou\) x6"
-  run TSAC_LOG_TAIL_BYTES=0; want 1 "TSAC_LOG_TAIL_BYTES=0 is the same 8 MiB default" "rodou para ele, ou o log girou\) x6"
+  run TSAC_LOG_TAIL_BYTES=0; want 1 "TSAC_LOG_TAIL_BYTES=0 is not 'unlimited': on the big log it is still the 8 MiB default, the first line stays out" "rodou para ele, ou o log girou\) x6"
   newcity lt3; conf mode=enforce; runs ga-d 6; guardlog "$L1"
-  run TSAC_LOG_TAIL_BYTES="$(wc -c < "$C/.gc/logs/quality-gate-guard.log" | tr -d ' ')"; want 1 "a tail exactly as long as the log reads all of it, first byte included" "fetch-falhou"; }
+  run TSAC_LOG_TAIL_BYTES="$(wc -c < "$C/.gc/logs/quality-gate-guard.log" | tr -d ' ')"; want 1 "a tail exactly as long as the log reads all of it, first byte included" "fetch-falhou"
+  run TSAC_LOG_TAIL_BYTES=0; want 1 "TSAC_LOG_TAIL_BYTES=0 is not 'read nothing': on the small log it is the 8 MiB default, the first line is found" "fetch-falhou"; }
 case_arms_file_counts() { newcity af1; conf mode=enforce; runs ga-a 6
   run; want 1 "no arms file: 0 rows, 0 odd rows, never written" "arquivo de bracos: absent, 0 linha\(s\), 0 ilegivel\(is\)/estranha\(s\), ultima gravacao nunca"
   if [ "$IS_ROOT" = 0 ]; then newcity af2; conf mode=enforce; runs ga-a 6; : > "$C/.gc/third-state-reads-arms.jsonl"; chmod 000 "$C/.gc/third-state-reads-arms.jsonl"; run; chmod 644 "$C/.gc/third-state-reads-arms.jsonl"
@@ -416,7 +419,7 @@ case_help_and_env_city() { newcity hc; conf mode=enforce; runs ga-h 3
   OUT="$(env GC_CITY_PATH="$C" GC_CITY="$W/no-such-city" "$PY" -I "${DETX:-$DETB}" --now "$NOW" --no-lock --no-alarm 2>&1)"; RC=$?; want 0 "both set: GC_CITY_PATH wins" "cidade: [^ ]*/c[0-9]+-hc "; }
 case_order_no_alarm() { newcity on; conf mode=enforce; runs ga-k 12; ARGS="--order --no-alarm"
   run; ARGS=""; want 0 "--order --no-alarm: nothing was delivered, so nothing failed to deliver (rc 0 though the finding stands)" "DIVERGE"; mails 0 "...and nobody is mailed"; }
-case_alarm_in_process() { newcity ip; conf mode=enforce; runs ga-k 12; mkdir -p "$W/unit"
+case_alarm_in_process() { newcity ip; conf mode=enforce; runs ga-k 12; mkdir -p "$C/unit"   # $C/unit, never a dir shared by calls ($W/unit): the seen marks of one run would make every later run fail the FIRST assertion whatever the detector says, and a mutant would be "caught" by stale state
   "$PY" -B -I -c '
 import contextlib, datetime, importlib.util, io, os, subprocess, sys
 s = importlib.util.spec_from_file_location("d", sys.argv[1]); det = importlib.util.module_from_spec(s); s.loader.exec_module(det)
@@ -439,7 +442,7 @@ for env, want in ((None, 120), ("0", 120), ("7", 7)):
     with contextlib.redirect_stdout(io.StringIO()):
         rc = det.main(["--city", city, "--now", "2026-10-31T15:00:00Z", "--no-lock"])
     assert rc == 1 and len(calls) == 1 and calls[0].get("timeout") == want and calls[0].get("capture_output") is True, (env, rc, calls)
-' "${DETX:-$DETB}" "$C" "$W/unit" 2>"$W/ip.err" && ok "in-process: a never-alarmed key alarms on a clock at epoch 100; the delivery timeout is 120 s by default and for 0, the value given otherwise; the router output is captured" || bad "in-process alarm/deliver: $(tail -2 "$W/ip.err" | tr '\n' '|' | cut -c1-300)"; }
+' "${DETX:-$DETB}" "$C" "$C/unit" 2>"$W/ip.err" && ok "in-process: a never-alarmed key alarms on a clock at epoch 100; the delivery timeout is 120 s by default and for 0, the value given otherwise; the router output is captured" || bad "in-process alarm/deliver: $(tail -2 "$W/ip.err" | tr '\n' '|' | cut -c1-300)"; }
 case_diag_unavailable() { newcity du; conf mode=enforce; runs ga-d 6
   run; want 1 "no guard log at all: the diagnosis says it is ABSENT" "quality-gate-guard.log ausente\)"
   if [ "$IS_ROOT" = 0 ]; then mkdir -p "$C/.gc/logs/quality-gate-guard.log"; run; rmdir "$C/.gc/logs/quality-gate-guard.log"
@@ -532,6 +535,9 @@ mutant env_city 'os.environ.get("GC_CITY_PATH") or os.environ.get("GC_CITY"))' '
 mutant order_no_alarm_fails $'    failed = 0\n' $'    failed = 1\n' case_order_no_alarm
 mutant seen_default 'last = seen.get(k, 0)' 'last = seen.get(k, 1)' case_alarm_in_process
 mutant diag_ausente '("ausente" if ls == "absent" else "ilegivel")' '("ausente" if ls != "absent" else "ilegivel")' case_diag_unavailable
+# the two 0-means-default knobs the gate found unpinned (ga-0qhveri, round 1): dropping the `or <default>` makes 0 mean "always" / "read nothing"
+mutant escalate_zero_is_always 'env_int("TSAC_ESCALATE_AFTER_S", 86400) or 86400' 'env_int("TSAC_ESCALATE_AFTER_S", 86400)' case_tunables
+mutant tail_zero_reads_nothing 'env_int("TSAC_LOG_TAIL_BYTES", 8 * 1024 * 1024) or 8 * 1024 * 1024' 'env_int("TSAC_LOG_TAIL_BYTES", 8 * 1024 * 1024)' case_tail_edges
 
 echo "selftest: $PASS passed, $FAILN failed"
 REACHED_END=1
