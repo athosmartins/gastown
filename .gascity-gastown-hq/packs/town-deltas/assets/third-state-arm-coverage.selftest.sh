@@ -311,14 +311,140 @@ case_crash_and_siblings() { local SRC="${DETX:-$DET}"; newcity cr; conf mode=enf
   DETX="$W/bin-crash/third-state-arm-coverage.py"; run; DETX=""; want 2 "a crash inside the detector is rc 2 (NAO SEI), never rc 1 (a finding)" "internal error: RuntimeError"
   mkbin "$W/bin-nosib"; rm -f "$W/bin-nosib/third-state-reads-check.py"; cp "$SRC" "$W/bin-nosib/third-state-arm-coverage.py"; DETX="$W/bin-nosib/third-state-arm-coverage.py"; : > "$MAIL"; rm -f "$C/state/third-state-arm-coverage-seen.json"; run; DETX=""
   want 2 "a missing sibling script is blind (rc 2), not 'no conf'" "NAO SEI"; mailhas "alarme-cego -- nao consegui carregar os scripts irmaos" "...and alarmed"
+  mailhas "nao conseguiu carregar third-state-reads-check.py: FileNotFoundError" "...and the mail body names the sibling and why"
   # a sibling that dies at import in a way nobody listed (a NameError) or that exits: still blind AND alarmed -- not the generic "internal error", not a silent rc 0
   mkbin "$W/bin-nameerr"; rm -f "$W/bin-nameerr/third-state-report.py"; printf 'x = an_undefined_name\n' > "$W/bin-nameerr/third-state-report.py"; cp "$SRC" "$W/bin-nameerr/third-state-arm-coverage.py"
   DETX="$W/bin-nameerr/third-state-arm-coverage.py"; : > "$MAIL"; rm -f "$C/state/third-state-arm-coverage-seen.json"; run; DETX=""
   want 2 "a sibling that raises a NameError at import is blind (rc 2)" "NAO SEI.*NameError"; mailhas "alarme-cego -- nao consegui carregar os scripts irmaos" "...and ALARMED (the blind alarm, not the generic crash)"
+  mailhas "nao conseguiu carregar third-state-report.py: NameError" "...and the mail body says which sibling broke and how"
   mkbin "$W/bin-exit"; rm -f "$W/bin-exit/third-state-report.py"; printf 'import sys\nsys.exit(0)\n' > "$W/bin-exit/third-state-report.py"; cp "$SRC" "$W/bin-exit/third-state-arm-coverage.py"
   DETX="$W/bin-exit/third-state-arm-coverage.py"; : > "$MAIL"; rm -f "$C/state/third-state-arm-coverage-seen.json"; run; DETX=""
   want 2 "a sibling that calls sys.exit(0) at import is blind too, never a silent rc 0" "NAO SEI.*SystemExit"; }
 case_crash_and_siblings
+echo "== D2. what the CLI prints and the defaults (ga-0qhveri) =="
+# The header, the --json fields, the defaults of every tunable AND their "0 = the default" fallback, the edges of the displayed lists, the arms file's counters, the router forms.
+# EQUIVALENT (not killable, proved by reading): scan_arms `t > last` -> `t >= last` (an equal ts assigns the same value) · flag_age `max(0, ...)` -> `max(1, ...)` (the age is only read through
+# `// 3600` and `> hours * 3600`, hours >= 1) · `datetime.now(UTC).replace(microsecond=0)` -> `microsecond=1` (the clock is only read at the second: strftime to minutes, int(timestamp()))
+# · load_sibling `fname[:-3]` -> `fname[:-4]` (the module name is never read: neither sibling looks at __name__ except for its own __main__ guard).
+case_header_and_json() { local E; newcity hj; conf mode=enforce enforce_pct=50; runs ga-j 6; arms ga-j 1 6
+  run; want 0 "the header names the conf in force (mode and percentage)" "checagem: ligada \(mode=enforce enforce_pct=50\)"
+  newcity hj2; run; want 0 "no conf at all: mode and percentage are '-', never 'None'" "checagem: nao-ligada \(mode=- enforce_pct=-\)"
+  ARGS="--json"; run; ARGS=""
+  printf '%s' "$OUT" | "$PY" -I -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["state"] == "nao-ligada", d["state"]
+assert [d[k] for k in ("runs", "covered", "rows", "bad_rows")] == [0, 0, 0, 0], d
+assert "alarms" not in d and d["alarm_keys"] == [], d
+' 2>"$W/js.err" && ok "--json of a city that is not switched on: every counter is 0, there is no 'alarms' key (only alarm_keys)" || bad "--json fields wrong :: $(tail -1 "$W/js.err") :: $(printf '%s' "$OUT" | head -c 200)"
+  newcity hj3; conf mode=enforce; E="$(printf '\303\251')"; runs ga-j 5; v 2026-10-31T11:00:00Z "ga-j$E"; ARGS="--json"; run PYTHONIOENCODING=utf-8; ARGS=""
+  printf '%s' "$OUT" | grep -q "ga-j$E" && ok "--json keeps a non-ASCII bead id as it is (not \\u-escaped)" || bad "the non-ASCII bead id was escaped or lost :: $(printf '%s' "$OUT" | head -c 200)"; }
+case_tunables() { newcity tn; conf mode=enforce; runs ga-n 6; arms ga-n 1 6
+  run; want 0 "the default window is 24 h" "janela: 2026-10-30T15:00Z -> 2026-10-31T15:00Z UTC \(24h\)"
+  run TSAC_WINDOW_H=0; want 0 "TSAC_WINDOW_H=0 is the default (24 h), never 'no window'" "UTC \(24h\)"
+  run TSAC_WINDOW_H=48; want 0 "...and a real value is used as given" "2026-10-29T15:00Z -> 2026-10-31T15:00Z UTC \(48h\)"
+  newcity tn2; conf mode=enforce; runs ga-n 6; arms ga-n 1 6; TZ=UTC touch -t 202610310100 "$C/.gc/third-state-reads.conf"
+  run; want 0 "the conf-age gate waits 8 h by default (conf changed 01:00 -> counts from 09:00)" "runs so contam a partir de 2026-10-31T09:00Z"
+  run TSAC_SLACK_H=0; want 0 "TSAC_SLACK_H=0 is a real zero (counts from the change itself)" "a partir de 2026-10-31T01:00Z"
+  newcity tn3; conf mode=enforce; runs ga-m 4
+  run TSAC_MIN_RUNS=0; want 0 "TSAC_MIN_RUNS=0 is the default (5): 4 beads are still too few" "sem conclusao"
+  newcity tn4; conf mode=enforce; runs ga-m 5
+  run TSAC_MIN_RUNS=0; want 1 "...and 5 beads are enough" "DIVERGE"
+  newcity tn5; conf mode=enforce; runs ga-m 6; arms ga-m 1 5
+  run TSAC_MIN_UNCOVERED=0; want 0 "TSAC_MIN_UNCOVERED=0 is the default (2): one hole in 6 is not enough" "SEM braco: 1"
+  newcity tn6; conf mode=enforce; runs ga-m 6; arms ga-m 1 4
+  run TSAC_MIN_UNCOVERED=0; want 1 "...and two holes are" "SEM braco: 2"
+  newcity tn7; conf mode=enforce; runs ga-m 12; : > "$C/.gc/third-state-reads-check.off"; TZ=UTC touch -t 202610281430 "$C/.gc/third-state-reads-check.off"
+  run; want 1 "a kill-switch flag standing 72.5 h is stale by the default limit" "interruptor presente"; mailhas "interruptor-esquecido -- third-state-reads-check.off ligado ha mais de 72h" "...and the subject names the 72 h limit"
+  : > "$MAIL"; rm -f "$C/state/third-state-arm-coverage-seen.json"; run TSAC_SWITCH_MAX_H=0; mailhas "ligado ha mais de 72h" "TSAC_SWITCH_MAX_H=0 is the default (72)"
+  newcity tn8; conf mode=enforce; runs ga-m 12; : > "$C/.gc/third-state-reads-check.off"; TZ=UTC touch -t 202610311300 "$C/.gc/third-state-reads-check.off"
+  run TSAC_SWITCH_MAX_H=0; mails 0 "...and a 2-h-old flag is nowhere near it"
+  newcity tn9; conf mode=enforce; runs ga-m 12
+  run TSAC_WINDOW_H=48; mails 1 "tick 1: alarmed"
+  AT=2026-11-01T14:59:59Z run TSAC_WINDOW_H=48; mails 1 "one second short of the default cooldown (24 h): deduped"
+  AT=2026-11-01T15:00:00Z run TSAC_WINDOW_H=48; mails 2 "exactly 24 h after the first alarm: alarmed again"
+  newcity tn10; conf mode=enforce; runs ga-m 12
+  run TSAC_WINDOW_H=48 TSAC_ESCALATE_AFTER_S=0; AT=2026-11-01T15:00:00Z run TSAC_WINDOW_H=48 TSAC_ESCALATE_AFTER_S=0; mails 2 "TSAC_ESCALATE_AFTER_S=0 is the default cooldown (24 h), not 'always' and not 'never'"; AT=""; }
+case_tail_edges() { local L1 n; newcity lt2; conf mode=enforce; runs ga-d 6
+  L1="[2026-10-31 08:00:00] [quality-gate-guard] HARDCHECK step=2e verdict=nao-consegui-medir reason=fetch-falhou bead=ga-d1 branch=b mode=enforce marker=m checker=[<EMPTY>]"
+  n=$((8388608 + 4000 - ${#L1} - 2))
+  { printf '%s\n' "$L1"; head -c "$n" /dev/zero | tr '\0' 'x'; printf '\n'; } > "$C/.gc/logs/quality-gate-guard.log"
+  run; want 1 "a guard log 4000 bytes over the 8 MiB default tail: its first line has scrolled out" "rodou para ele, ou o log girou\) x6"
+  run TSAC_LOG_TAIL_BYTES=0; want 1 "TSAC_LOG_TAIL_BYTES=0 is the same 8 MiB default" "rodou para ele, ou o log girou\) x6"
+  newcity lt3; conf mode=enforce; runs ga-d 6; guardlog "$L1"
+  run TSAC_LOG_TAIL_BYTES="$(wc -c < "$C/.gc/logs/quality-gate-guard.log" | tr -d ' ')"; want 1 "a tail exactly as long as the log reads all of it, first byte included" "fetch-falhou"; }
+case_arms_file_counts() { newcity af1; conf mode=enforce; runs ga-a 6
+  run; want 1 "no arms file: 0 rows, 0 odd rows, never written" "arquivo de bracos: absent, 0 linha\(s\), 0 ilegivel\(is\)/estranha\(s\), ultima gravacao nunca"
+  if [ "$IS_ROOT" = 0 ]; then newcity af2; conf mode=enforce; runs ga-a 6; : > "$C/.gc/third-state-reads-arms.jsonl"; chmod 000 "$C/.gc/third-state-reads-arms.jsonl"; run; chmod 644 "$C/.gc/third-state-reads-arms.jsonl"
+    want 1 "an unreadable arms file: also 0 and 0, said as such" "arquivo de bracos: unreadable, 0 linha\(s\), 0 ilegivel\(is\)/estranha\(s\), ultima gravacao nunca"; else ok "(root: chmod 000 case skipped)"; fi
+  newcity af3; conf mode=enforce; runs ga-a 10; arm ga-a1 enforce 2026-10-31T09:00:00Z; arm ga-a2 enforce 2026-10-31T11:30:00Z; arms ga-a 3 7 enforce; arm ga-a8 holdout 2026-10-31T10:15:00Z; arm ga-a9 holdout; arm ga-a10 holdout
+  run; want 0 "10 rows, the LATEST write (not the first) is the last one, wherever it sits in the file" "arquivo de bracos: ok, 10 linha\(s\), 0 ilegivel.*ultima gravacao 2026-10-31T11:30:00Z"
+  printf '%s' "$OUT" | grep -q 'com braco: 10 (enforce 7 / holdout 3); SEM braco: 0' && ok "...and the split is counted per arm (7 / 3, not symmetric)" || bad "split wrong :: $(printf '%s' "$OUT" | grep 'veredito real')"; }
+case_first_line_undated() { newcity fu; conf mode=enforce
+  printf '{"event":"dispatcher_complete","bead":"ga-cut\n' > "$C/.gc/quality-gate.jsonl"   # the very FIRST line of the log: cut off, no ts of its own
+  v 2026-06-04T10:00:00Z ga-june1; runs ga-g 6; arms ga-g 1 6
+  run; want 0 "an undated cut line at the very start of the log is placed by the first readable row after it (June): provably old" "dentro do limite"
+  printf '%s' "$OUT" | grep -q '1 provadamente anteriores' && ok "...and said, not hidden" || bad "the first-line gap was not said :: $(printf '%s' "$OUT" | grep ilegivel)"; }
+case_lists() { local n; newcity sa8; conf mode=enforce; runs ga-u 20; arms ga-u 1 12
+  run; want 1 "8 holes in 20: alarmed" "SEM braco: 8"
+  n="$(grep -o '(sem-linha)' "$MAIL" | wc -l | tr -d ' ')"; [ "$n" = 8 ] && ok "...the mail names all 8" || bad "the mail names $n beads, want 8"
+  grep -q '(sem-linha) \.\.\.\.' "$MAIL" && bad "...no ' ...' after a list of exactly 8" || ok "...and no ' ...' after a list of exactly 8"
+  newcity sa9; conf mode=enforce; runs ga-u 20; arms ga-u 1 11
+  run; want 1 "9 holes in 20: alarmed" "SEM braco: 9"
+  n="$(grep -o '(sem-linha)' "$MAIL" | wc -l | tr -d ' ')"; [ "$n" = 8 ] && ok "...the mail names 8 of the 9" || bad "the mail names $n beads, want 8"
+  grep -q '(sem-linha) \.\.\.\.' "$MAIL" && ok "...and says there are more (' ...')" || bad "the 9th hole is not announced"
+  newcity sa11; conf mode=enforce; runs ga-o 12; arm ga-o1 enforce
+  run; want 1 "11 holes in 12: alarmed" "SEM braco: 11"
+  n="$(printf '%s\n' "$OUT" | grep -c '^    sem braco: ')"; [ "$n" = 10 ] && ok "the text lists 10 of the 11" || bad "the text lists $n holes, want 10"; }
+case_flag_age_text() { newcity fa; conf mode=enforce; runs ga-w 12
+  mkdir "$C/.gc/third-state-reads-check.off"; TZ=UTC touch -t 202610271100 "$C/.gc/third-state-reads-check.off"
+  run; want 1 "the check's own kill switch counts even as a directory (it tests exists, not -f); 100 h old" "interruptores presentes: third-state-reads-check.off \(ha 100h\)"
+  mailhas "O arquivo third-state-reads-check.off existe ha 100h \(limite 72h\)" "...and the stale-switch mail says for how long"; }
+case_router_forms() { newcity rf; conf mode=enforce; runs ga-k 12
+  : > "$C/gc.calls"; printf '#!/bin/sh\necho "gc $*" >> "%s"\nexit 0\n' "$C/gc.calls" > "$C/gc"; chmod +x "$C/gc"
+  printf '#!/bin/sh\necho "$*" >> "$TSAC_MAIL"\nexit 0\n' > "$C/router-noexec"; chmod 644 "$C/router-noexec"
+  run TSAC_ROUTER="$C/router-noexec" GC_BIN="$C/gc"; want 1 "a router file that is not executable is not the router: the mail goes through gc" "DIVERGE"
+  grep -q 'gc mail send mayor' "$C/gc.calls" && ok "...via gc mail send mayor" || bad "the fallback was not used :: $(cat "$C/gc.calls")"
+  printf '%s' "$OUT" | grep -q 'NAO ENTREGUE' && bad "...a non-executable router must never be tried" || ok "...and it was never tried"
+  newcity rf2; conf mode=enforce; runs ga-k 12
+  printf '#!/bin/sh\necho NOISE-ROUTER-STDOUT\necho NOISE-ROUTER-STDERR >&2\necho "$*" >> "$TSAC_MAIL"\nexit 0\n' > "$C/router-noisy"; chmod +x "$C/router-noisy"
+  run TSAC_ROUTER="$C/router-noisy"; want 1 "a router that talks: its output is captured, not echoed into the detector's own output" "DIVERGE"
+  printf '%s' "$OUT" | grep -q 'NOISE-ROUTER' && bad "the router's output leaked into the detector's output" || ok "...nothing of it leaked"; mails 1 "...and it was called"; }
+case_help_and_env_city() { newcity hc; conf mode=enforce; runs ga-h 3
+  OUT="$("$PY" -I "${DETX:-$DETB}" --help 2>&1)"; RC=$?; want 0 "--help prints the description (the docstring's first line) and exits 0" "ga-r4z4ve: alarm when the gate's runs outnumber"
+  OUT="$(env -u GC_CITY_PATH GC_CITY="$C" "$PY" -I "${DETX:-$DETB}" --now "$NOW" --no-lock --no-alarm 2>&1)"; RC=$?; want 0 "no --city and no GC_CITY_PATH: GC_CITY names the city" "cidade: [^ ]*/c[0-9]+-hc "
+  OUT="$(env GC_CITY_PATH="$C" GC_CITY="$W/no-such-city" "$PY" -I "${DETX:-$DETB}" --now "$NOW" --no-lock --no-alarm 2>&1)"; RC=$?; want 0 "both set: GC_CITY_PATH wins" "cidade: [^ ]*/c[0-9]+-hc "; }
+case_order_no_alarm() { newcity on; conf mode=enforce; runs ga-k 12; ARGS="--order --no-alarm"
+  run; ARGS=""; want 0 "--order --no-alarm: nothing was delivered, so nothing failed to deliver (rc 0 though the finding stands)" "DIVERGE"; mails 0 "...and nobody is mailed"; }
+case_alarm_in_process() { newcity ip; conf mode=enforce; runs ga-k 12; mkdir -p "$W/unit"
+  "$PY" -B -I -c '
+import contextlib, datetime, importlib.util, io, os, subprocess, sys
+s = importlib.util.spec_from_file_location("d", sys.argv[1]); det = importlib.util.module_from_spec(s); s.loader.exec_module(det)
+city, scratch = sys.argv[2], sys.argv[3]
+sent = []
+real_deliver = det.deliver
+det.deliver = lambda subject, body, c, t: sent.append(subject) or 0
+res = {"alarms": {"k": ("subj", "body")}, "unevaluated": []}
+failed = det.alarm(res, os.path.join(scratch, "st"), city, datetime.datetime(1970, 1, 1, 0, 1, 40, tzinfo=det.UTC), 86400, 5)
+assert sent == ["subj"] and failed == 0, ("a key never alarmed must alarm, even on a clock at epoch 100", sent, failed)
+det.deliver = real_deliver
+calls = []
+class Done: returncode = 0
+subprocess.run = lambda cmd, **kw: calls.append(kw) or Done()
+for env, want in ((None, 120), ("0", 120), ("7", 7)):
+    calls[:] = []
+    if env is None: os.environ.pop("TSAC_DELIVER_TIMEOUT_S", None)
+    else: os.environ["TSAC_DELIVER_TIMEOUT_S"] = env
+    os.environ["TSAC_STATE_DIR"] = os.path.join(scratch, "st-" + str(env))
+    with contextlib.redirect_stdout(io.StringIO()):
+        rc = det.main(["--city", city, "--now", "2026-10-31T15:00:00Z", "--no-lock"])
+    assert rc == 1 and len(calls) == 1 and calls[0].get("timeout") == want and calls[0].get("capture_output") is True, (env, rc, calls)
+' "${DETX:-$DETB}" "$C" "$W/unit" 2>"$W/ip.err" && ok "in-process: a never-alarmed key alarms on a clock at epoch 100; the delivery timeout is 120 s by default and for 0, the value given otherwise; the router output is captured" || bad "in-process alarm/deliver: $(tail -2 "$W/ip.err" | tr '\n' '|' | cut -c1-300)"; }
+case_diag_unavailable() { newcity du; conf mode=enforce; runs ga-d 6
+  run; want 1 "no guard log at all: the diagnosis says it is ABSENT" "quality-gate-guard.log ausente\)"
+  if [ "$IS_ROOT" = 0 ]; then mkdir -p "$C/.gc/logs/quality-gate-guard.log"; run; rmdir "$C/.gc/logs/quality-gate-guard.log"
+    want 1 "a guard log that cannot be read (a directory): the diagnosis says UNREADABLE" "quality-gate-guard.log ilegivel\)"; fi; }
+case_header_and_json; case_tunables; case_tail_edges; case_arms_file_counts; case_first_line_undated; case_lists; case_flag_age_text; case_router_forms; case_help_and_env_city; case_order_no_alarm; case_alarm_in_process; case_diag_unavailable
 if [ ! -d "$W/bin/__pycache__" ] && { [ "$HAD_PYC" = 1 ] || [ ! -d "$HERE/__pycache__" ]; }; then ok "no __pycache__ written next to the detector or its siblings"; else bad "the detector left a __pycache__ behind"; fi
 ORDER_TOML="$HERE/../orders/third-state-arm-coverage.toml"
 if "$PY" -I -c 'import tomllib' 2>/dev/null; then
@@ -393,6 +519,19 @@ mutant early_forgets '(["diverge"] if res["state"] == "interruptor" else []) + [
 mutant sibling_narrow 'except (Exception, SystemExit) as e:' 'except (OSError, SyntaxError, ImportError, AttributeError) as e:' case_crash_and_siblings
 mutant scalar_is_row $'if isinstance(d, dict):\n            items.append(("row", d))' $'if d is not None:\n            items.append(("row", d))' case_reader_parity
 mutant bad_ts_lost 'items.append(("bad", stamp(report, m.group(1)) if m else None))' 'items.append(("bad", None))' case_reader_parity
+# the new cases of D2 (ga-0qhveri): one representative swap each
+mutant json_alarms_key 'if k != "alarms"' 'if k == "alarms"' case_header_and_json
+mutant window_default 'env_int("TSAC_WINDOW_H", 24) or 24' 'env_int("TSAC_WINDOW_H", 25) or 24' case_tunables
+mutant tail_edge 'fh.seek(0, os.SEEK_END)' 'fh.seek(1, os.SEEK_END)' case_tail_edges
+mutant last_write_min 'last = t if last is None or t > last else last' 'last = t if last is None or t <= last else last' case_arms_file_counts
+mutant first_line_unplaced 'for i in range(len(items) - 1, -1, -1):' 'for i in range(len(items) - 1, 0, -1):' case_first_line_undated
+mutant ellipsis_at_8 '(" ..." if u > 8 else "")' '(" ..." if u >= 8 else "")' case_lists
+mutant kill_switch_dir 'os.path.join(state, tool.KILL), False)' 'os.path.join(state, tool.KILL), True)' case_flag_age_text
+mutant router_not_executable 'os.path.isfile(router) and os.access(router, os.X_OK)' 'os.path.isfile(router) or os.access(router, os.X_OK)' case_router_forms
+mutant env_city 'os.environ.get("GC_CITY_PATH") or os.environ.get("GC_CITY"))' 'os.environ.get("GC_CITY_PATH") and os.environ.get("GC_CITY"))' case_help_and_env_city
+mutant order_no_alarm_fails $'    failed = 0\n' $'    failed = 1\n' case_order_no_alarm
+mutant seen_default 'last = seen.get(k, 0)' 'last = seen.get(k, 1)' case_alarm_in_process
+mutant diag_ausente '("ausente" if ls == "absent" else "ilegivel")' '("ausente" if ls != "absent" else "ilegivel")' case_diag_unavailable
 
 echo "selftest: $PASS passed, $FAILN failed"
 REACHED_END=1
