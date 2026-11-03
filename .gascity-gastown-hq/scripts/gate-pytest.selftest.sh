@@ -20,6 +20,8 @@
 #   argumento do pytest (a mensagem é a dos argumentos que faltam) · o grep -c que imprime a contagem e sai com 2 · a linha SKIPPED de formato que não leio, sob -qq.
 #   EQUIVALENTE: `-gt` por `-ge` no laço das opções (com $# = 0 o case vê $1 vazio e sai pelo `*) break`); `-lt` por `-le` na leitura de um grupo de flags curtas (a posição logo depois do fim
 #   lê vazio e não casa com letra nenhuma); `-gt 0` por `-ge 0` em `nids -gt 0 && ids_fora -eq 1` (ids_fora só vira 1 com um id não vazio, e um id não vazio já conta em nids).
+#   Rodízio de 03/11 (ga-59jrj3d), os ids que o motor segue listando para as três trocas acima: 13d386aabe (laço das opções), 0d2104d20e e ec78bd7950 (grupo de flags curtas), 2754dbb251 (`nids -gt 0`).
+#   Mortos nele: o `--help` que sai 0, a flag sem valor ANTES do alvo, os 50 reprovados que ainda se confirmam um a um e o json_list/json_clip chamados direto (lista vazia ou que cai toda na limpeza = nada impresso, rc 1).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 GP="$HERE/gate-pytest.sh"
@@ -140,6 +142,19 @@ reset; mbp_out "1 failed in 0.5s"; export STUB_MBP_RC=1; rc=$(STUB_LOCAL_RCS=1 r
 has "sem ids: no log" "$LOG" 'sem-ids'; has_local "sem ids: o comando inteiro (arquivo de teste)" "$STUB_LOG" 'arg:tests/test_a.py'
 reset; { for i in $(seq 1 51); do echo "FAILED tests/test_a.py::t$i - x"; done; echo "51 failed in 1s"; } > "$T/mbp.out"; export STUB_MBP_OUT="$T/mbp.out" STUB_MBP_RC=1
 rc=$(STUB_LOCAL_RCS=1 run -- tests/test_a.py -q); expect "51 reprovados → comando inteiro aqui" 1 "$rc"; has "muitos: no log" "$LOG" 'muitos'; hasnt "muitos: não manda 51 ids" "$STUB_LOG" 'test_a.py::t3'
+# 50 reprovados é o teto que ainda se confirma um a um (`-gt 50`): os 50 ids rodam aqui primeiro (o 50º inclusive), e 'muitos' não aparece (ga-59jrj3d)
+reset; { for i in $(seq 1 50); do echo "FAILED tests/test_a.py::t$i - x"; done; echo "50 failed in 1s"; } > "$T/mbp.out"; export STUB_MBP_OUT="$T/mbp.out" STUB_MBP_RC=1
+rc=$(STUB_LOCAL_RCS="0 0" run -- tests/test_a.py -q); expect "50 reprovados (o teto) passam isolados aqui → 0" 0 "$rc"; hasnt "50 reprovados: não é 'muitos'" "$LOG" 'muitos'; has_local "50 reprovados: o 50º id roda aqui, isolado" "$STUB_LOG" 'arg:tests/test_a.py::t50$'
+# --help sai 0 e imprime o cabeçalho; UMA flag sem valor ANTES do alvo não engole o alvo (se toda flag levasse valor o alvo sumia e o comando rodava aqui, sem o MBP) (ga-59jrj3d)
+reset; rc=$(run --help); expect "--help sai 0" 0 "$rc"; has "--help imprime o cabeçalho do script" "$T/out" 'gate-pytest'
+reset; mbp_out "..." "2 passed in 1.20s"; rc=$(run -- -x tests/test_a.py); expect "flag sem valor antes do alvo: o alvo continua alvo (verde no MBP)" 0 "$rc"
+has "flag antes do alvo: o MBP é chamado com o alvo" "$STUB_LOG" 'arg:tests/test_a.py$'; hasnt "flag antes do alvo: nada roda aqui" "$STUB_LOG" 'LOCAL_CALL'
+# json_clip e json_list chamados direto (extraídos do script): nenhum item que sobre = NADA impresso e rc 1, nunca `[]` (ga-59jrj3d)
+eval "$(sed -n '/^json_clip()/p;/^json_list()/,/^}/p' "$GP")"
+jl=$(json_list 20 "SKIPPED " ""); jlrc=$?; expect "json_list: lista vazia → rc 1" 1 "$jlrc"; expect "json_list: lista vazia → nada impresso (nunca '[]')" "" "$jl"
+jl=$(json_list 20 "" '"\\"'); jlrc=$?; expect "json_list: o único item cai todo na limpeza (aspas e barra) → rc 1" 1 "$jlrc"; expect "json_list: ...e nada impresso" "" "$jl"
+jl=$(json_list 20 "SKIPPED " "$(printf 'SKIPPED [1] a\nSKIPPED [2] b')"); jlrc=$?; expect "json_list: dois itens → rc 0" 0 "$jlrc"; expect "json_list: ...e a lista, sem o prefixo" '["[1] a","[2] b"]' "$jl"
+jl=$(json_list 1 "SKIPPED " "$(printf 'SKIPPED [1] a\nSKIPPED [2] b')"); expect "json_list: o máximo corta a lista" '["[1] a"]' "$jl"
 # 4c um id que o MBP reprovou e que NÃO é de nenhum alvo pedido (conftest/plugin que coleta outro arquivo, ou leitura errada): não sei o que rodar → o comando inteiro aqui,
 #    sem rodar o id estranho isolado (rodá-lo isolado e ver passar nada prova sobre o que o revisor pediu)
 reset; mbp_out "FAILED tests/outro.py::test_x - boom" "1 failed in 0.9s"; export STUB_MBP_RC=1
