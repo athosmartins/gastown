@@ -164,14 +164,24 @@ de novo (02:37Z #332, 02:40Z #333, 02:50Z #334). Só um login humano (03:10Z) en
 1. `alert()` dava o push por entregue com o `notify` saindo 0 e ficava calado 6 h. O contrato do próprio `notify` (`policy_exit`, citado em `git-loose-repack.sh`/`notify_send`, `claude-pool-guard.py`/`send_alert`
    e `disk-recovery-ladder.sh`/ENTREGA): por padrão TODO caminho que não empurrou sai 0 ("rc 0 nunca diz 'chegou'") e fonte desconhecida vai ao digest mudo; com `NOTIFY_STRICT_EXIT=1` + `NOTIFY_FORCE_PUSH=1` o rc diz
    o que houve. Agora `push()` pede os dois. Entregue = 0, 10 (segurado até as 7h) ou 11 (o título já saiu há < 30 min); 12 (digest/teto), 13, 1 ou outro = não entregue, repete em 5 min.
+   `NOTIFY_FORCE_PUSH` tira o push do digest mudo mas **não fura o silêncio da noite** (`disk-recovery-ladder.sh`: «FORCE_PUSH não fura a madrugada»): uma queda de madrugada volta com rc 10, conta como avisada e o
+   celular só toca às 7h. De madrugada o canal imediato é o mail ao Mayor. Todo push do job é igual (a previsão de vencimento também), sem exceção de "não forçado".
 2. O título era sempre "Troca de conta (crews)" e o `notify` descarta o 2º push de um título em 30 min: `default-not-full` (08:39Z) e `heal-no-source` (08:48Z) estão a 9 min. O título agora leva a chave.
 3. Nada durável. Além do push, **um mail ao Mayor** (`gc mail send mayor/ --from controller`, o formato do crew-pushguard-check): um no começo do episódio e um no fim.
 
 **Episódio (`watch_no_login` anota, `tell_no_login` avisa, nesta ordem e DEPOIS do heal da rodada, para o aviso dizer quais contas falharam e por quê).** "Sem login completo" = default ausente
-ou sem login completo. Com `NO_LOGIN_WARN_S` = 10 min SEGUIDOS sai UM push (lembrete a cada 6 h enquanto durar) e UM mail com a causa por conta (`Tried: ...`) e o comando que resolve (`claude auth login`
-no config dir da conta que o pool quer: UM login basta, o job o escreve no default em ~1 min). Termina quando há login completo por `NO_LOGIN_END_S` = 10 min (um heal que esvazia de novo em 3–4 min é o
-MESMO episódio); o fim também sai por push + mail, repetido até chegar nos dois (ou 1 h). Episódio de < 10 min não avisa nada, nem o fim. Leitura que não consegue dizer (keychain travado) não estende nem
-encerra; registro de episódio ilegível recomeça o relógio (o aviso atrasa, nunca adianta). Estado: `no_login`, `no_login_last`. Os avisos imediatos de antes (`default-not-full` etc.) continuam, agora sob o contrato estrito do `notify`.
+ou sem login completo (o item existe mas sem access token, **ou não existe, ou é legível mas sem objeto de login** — uma CLI deslogada guarda só os logins MCP; `kc_read` devolve esse caso como `unknown` COM o que leu,
+e só o vigia do default o separa de "não consegui ler"). Com `NO_LOGIN_WARN_S` = 10 min SEGUIDOS sai UM push (lembrete a cada 6 h enquanto durar) e UM mail com o que o job SABE: quantas vezes escreveu um login guardado
+no default e em nome de quem, e por conta o motivo de não servir (`Not usable: ...`, só quando um heal falhou); **registro ausente nunca vira "nenhuma conta foi tentada"** (a frase foi tirada: dizia isso de um
+registro que só um heal que FALHOU preenche). O comando que resolve depende do formato: para "item com login incompleto" é `claude auth login` no config dir da conta que o pool quer (UM login basta, o job o escreve
+no default em ~1 min); para "item ausente" e "sem objeto de login" o job **não cura** (só cura item que existe e tem objeto de login), então o aviso diz que ele NÃO põe o login de volta sozinho e manda logar à mão
+no config dir padrão (`claude auth login --email <conta>`; que isso recria o item padrão não foi medido). Termina quando há login completo por `NO_LOGIN_END_S` = 10 min **e a rodada que decide o fim LEU um
+login completo** (um heal que esvazia de novo em 3–4 min é o MESMO episódio); o fim também sai por push + mail, repetido até chegar nos dois (ou 1 h depois da 1ª tentativa, `ending`). Episódio de < 10 min não avisa
+nada, nem o fim. **Leitura que não consegue dizer (keychain travado, sem decisão do pool) não estende nem encerra**: o fim só sai numa rodada que VIU o login (`good_last`); sem isso um login visto UMA vez bastava
+para um falso «Remote Control no ar» na rodada seguinte, ilegível, 10 min depois. Se o default esvazia de novo DEPOIS de o fim ter vencido (`ending` gravado), é OUTRO episódio: relógio de 10 min novo, push e mail
+novos, e o aviso de fim pendente do anterior se perde (não faz sentido mandar «no ar» com ele fora de novo); antes disso (< 10 min de login completo) segue o MESMO. Registro de episódio ilegível, ou `good_since`
+ilegível, recomeça o relógio (o aviso atrasa, nunca adianta). Estado: `no_login`, `no_login_last`. Os avisos imediatos de antes (`default-not-full`, `default-missing`, e o novo `default-no-login`) continuam, agora sob
+o contrato estrito do `notify`.
 
 **Login queimado (`burn` / `dead_login`).** Uma escrita cega (cópia guardada, access token vencido) cujo default fica "no access token" em até 30 min tem a cara de um refresh recusado pelo CLI (inferência do log #323-#325, não observada no CLI):
 1 strike para aquele refresh token (`burned` no estado). Com `BURN_LIMIT` = 2 o login está morto: não é escrito de novo enquanto o refresh token for o mesmo (login refeito = outra chave), em vez de a cada
@@ -181,7 +191,8 @@ encerra; registro de episódio ilegível recomeça o relógio (o aviso atrasa, n
 
 **Login a vencer (`warn_expiring`).** O refresh token tem validade ABSOLUTA (~30 dias do login; se a rotação a estende NÃO foi medido, ga-yyltfk): athosmartins BACKUP 30/10 13:57Z, terrenos (item padrão) 02/11
 19:53Z, as 3 contas de diretório ~04/11. Logins feitos juntos vencem juntos. A cada hora o job lê o melhor login de cada conta (o do default conta para quem o segura); a que acaba em <= 7 dias gera UM push por
-dia (`expiring:<conta>`, sem forçar: o silêncio da noite vale) com o comando. É o gatilho certo para um relogin automático: refazer a T-7 dias não custa outage se falhar.
+dia (`expiring:<conta>`, um push como os outros: o silêncio da noite segura todos) com o comando. Conta com um item que não pôde ser lido (ou que não deu tempo de olhar) **não é julgada naquela hora**: o item
+ilegível pode guardar o login mais novo, então o «melhor login» seria meia leitura virada em afirmação; a hora seguinte olha de novo. É o gatilho certo para um relogin automático: refazer a T-7 dias não custa outage se falhar.
 
 **Por que os itens guardados ficam vencidos (item 3 da bead): o que se sabe e o que não.**
 - Sabido: (a) validade absoluta de ~30 dias sem renovação agendada; (b) a cópia guardada envelhece a cada rotação do refresh (~8 h de uso, medido na ga-yyltfk) e o sync-back só salva enquanto a conta segura o
@@ -238,8 +249,9 @@ config dir da conta é achado pelo `load_source` no minuto seguinte.
   completo (setup-token, sem o escopo de sessões ou sem access token, login a < 1 dia de vencer) não serve às crews de
   qualquer jeito e é substituída pelo login completo do default, sem comparar datas.
 - (ga-xoe5ao.4) A regra dos 2 strikes se apoia na assinatura "no access token em até 30 min da escrita": é inferência de log (#323-#325), não observação do CLI. Se o CLI esvaziar o item por outro motivo duas vezes
-  seguidas, um login bom é marcado morto até ser refeito (a conta cai para as outras; custo pequeno, mas existe). Sem decisão do pool (arquivo ausente) o episódio nem é rastreado: `_follow` não roda. `NOTIFY_FORCE_PUSH`
-  acorda de madrugada nas quedas reais; só a previsão de vencimento respeita o silêncio da noite.
+  seguidas, um login bom é marcado morto até ser refeito (a conta cai para as outras; custo pequeno, mas existe). Sem decisão do pool (arquivo ausente) o episódio nem é rastreado (`_follow` não roda) e, pela mesma razão, essa
+  rodada também não encerra nenhum. `NOTIFY_FORCE_PUSH` NÃO acorda de madrugada (rc 10, segurado até as 7h, conta como avisado): só o mail ao Mayor é imediato à noite. O «há N min» do aviso conta da 1ª rodada que achou o
+  default sem login até agora, inclusive rodadas que não conseguiram ler no meio (não estendem nem encerram, e também não contam como prova).
 - (ga-xoe5ao.4) O episódio olha só o estado ESTRUTURAL do default (login completo presente). Um login presente que o CLI não consegue renovar mas que não esvazia o item não seria um episódio; não foi visto no
   incidente, e tratar "access token vencido há N min" como queda arriscaria falso alarme à noite (sessões ociosas podem não renovar), então não foi feito sem dado.
 - O servidor tolera o refresh token antigo após a rotação?
@@ -263,7 +275,7 @@ config dir da conta é achado pelo `load_source` no minuto seguinte.
 - (ga-xoe5ao.2) A trava só vale para a troca NÃO verificada. Um `SWITCH` verificado (o perfil respondeu pela cópia guardada) que se repita a
   cada ciclo não é cortado por ela; não foi visto em produção e o mecanismo que esvazia o default (acima) não deveria agir sobre um token vivo.
 
-Testes: `scripts/test_claude_crew_account.py` (237 testes, shim de `security`, servidor de perfil em loopback, `tmux` falso que registra cada argv e cada tecla, `gc` falso que registra cada chamada e aceita `mail send`, `notify` falso que registra o ambiente (STRICT/FORCE) e devolve o rc pedido). O harness é
+Testes: `scripts/test_claude_crew_account.py` (251 testes, shim de `security`, servidor de perfil em loopback, `tmux` falso que registra cada argv e cada tecla, `gc` falso que registra cada chamada e aceita `mail send`, `notify` falso que registra o ambiente (STRICT/FORCE) e devolve o rc pedido). O harness é
 selado: todo teste roda com `CLAUDE_CREW_NOTIFY`, `CLAUDE_CREW_SECURITY` e `GC_CITY_PATH` fixados em stubs/tmp e `PATH`
 sem o `notify` real; no fim da sessão afirma que o log/estado/lock reais não mudaram e que nenhum sentinela foi executado;
 e o script roda de verdade sob `env -i`, com `python3` do pytest e com `/usr/bin/python3` (3.9, o do plist).
