@@ -551,9 +551,10 @@ rm -rf "$BUPW_LOCK_DIR" "${BUPW_LOCK_DIR}.reaping" 2>/dev/null
 echo ""
 echo "== lock edges, the script as a program, unreadable gh / bd output =="
 # EQUIVALENT, documented: `|| true` -> `&& true` after a command whose status nobody reads and under no `set -e` (9122e0cab9, da12ce03da, 02d2feffe8, 8db6498b62,
-# 2986485ef0, 6d485cfc2d, f59c4652e3, a859477f33, 75643e9927, 83c269f339); the same in log() after the append (c57a9845cf): log's status is read only by run_sweep's
-# last statement, and a sweep cannot get that far with an unwritable log (every command in it redirects stderr into $LOG, and a failed redirection skips the command: with
-# the log unwritable the sweep stops at its first gh call and returns 0 there, measured); the `.reaping` guard `return 1` -> `0` after `[ ! -s HB ]` (84b1276392):
+# 2986485ef0, 6d485cfc2d, f59c4652e3, a859477f33, 75643e9927, 83c269f339); the same in log() after the append (c57a9845cf) is equivalent THROUGH run_sweep (log's status is
+# read only by its last statement, and a sweep cannot get that far with an unwritable log: every command in it redirects stderr into $LOG, and a failed redirection skips the
+# command, so the sweep stops at its first gh call and returns 0 there, measured) and is killed by calling log() itself with an unwritable LOG (the case after the heartbeat
+# write, ga-r8nsaot); the `.reaping` guard `return 1` -> `0` after `[ ! -s HB ]` (84b1276392):
 # _bupw_lock_holder_dead says "dead" only for a pid read from the heartbeat's first line, so a heartbeat that is empty at that point cannot be; the stat chain
 # `A || B || C` -> `A || B && C` (f33a615f4e): it prints the age of whichever of the BSD and GNU forms answers, and an empty line more, which $(...) drops
 # (`A && B || C`, 63d6ca95b6, does not: below).
@@ -619,6 +620,8 @@ eq "run_sweep over a gh that answers garbage returns 0" "$rc" "0"
 { grep -q 'unparseable' "$TMP/bad.log" && [ ! -e "$TMP/bad-state.json" ]; } && ok "...says so and writes no state (garbage is not 'no PRs')" || bad "...garbage gh output: log=[$(cat "$TMP/bad.log")] state=$([ -e "$TMP/bad-state.json" ] && echo written || echo none)"
 : > "$TMP/notadir"; rc=0; ( BUPW_LOCK_HB="$TMP/notadir/heartbeat"; _bupw_lock_write_hb ) || rc=$?
 eq "a heartbeat write that fails is told by the file, not by the status: 0" "$rc" "0"
+rc=0; ( LOG="$TMP/notadir/sub/x.log"; log "x" ) >/dev/null 2>&1 || rc=$?   # a path UNDER a plain file: mkdir -p and the append both fail (ENOTDIR, root too); the redirects on the subshell keep the shell's own warning about the failed append out of the output
+eq "log with a LOG that cannot be written returns 0 (best-effort, never fails the caller)" "$rc" "0"
 mkdir -p "$TMP/state-is-a-dir"; : > "$TMP/warn.log"; ( STATE="$TMP/state-is-a-dir"; LOG="$TMP/warn.log"; run_sweep ) >/dev/null 2>&1
 grep -q 'failed to write state file' "$TMP/warn.log" && ok "a state file that cannot be written is said in the log" || bad "unwritable state, no WARN: $(cat "$TMP/warn.log")"
 rm -f "$TMP/ok-state.json"; : > "$TMP/ok.log"; ( STATE="$TMP/ok-state.json"; LOG="$TMP/ok.log"; run_sweep ) >/dev/null 2>&1
