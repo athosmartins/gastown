@@ -14,7 +14,8 @@ USO (do mini; leva ~2 h, então SEMPRE solto do ssh):
   ssh hetzner-teste 'mkdir -p ~/gt-remote/measure/hq1 && ( nohup setsid systemd-run --user --scope --quiet --collect --unit=ballast-hqprobe -p TasksMax=6000 -p MemoryMax=10G -p MemorySwapMax=0 \\
       python3 -I ~/gt-remote/measure/hqprobe.py ~/gt-remote/measure/hq1 [tests.txt] [4] [9000] > ~/gt-remote/measure/hq1.log 2>&1 < /dev/null & )'
   argumentos: <pasta-de-saida> [lista=ordem do item] [trabalhadores=4] [limite_s=9000]; sem `lista`, usa a ordem do item (os mais lentos da última rodada primeiro, hq-selftests.durations).
-  A última linha do .log é `probe: fim: …`.
+  A última linha do .log é `probe: fim: …`. rc: 0 = a lista acabou · 3 = nada rodou (trava, wt-add, lista, overlay) · 4 = limite de tempo (sobrou selftest sem medir) · 5 = abortado (RAM ou /proc) · 143 = sinal.
+  peaks.json diz também `pull` (ok/falhou: com falhou a árvore é a do clone que havia) e `dropped` (nomes da lista que a árvore não tem); PSS que o smaps_rollup não deixou ler vai como null e o `item_peak` traz `sem_pss` (o PSS somado é PISO).
 SAÍDA: samples.jsonl (1 linha por tick: soma de RSS/PSS da sessão inteira, MemAvailable, os 6 selftests de maior RSS e quantos processos cada um deixa vivo depois de acabar) · hot.jsonl (a lista dos
   30 maiores processos sempre que a soma passa de 60% do teto) · peaks.json (por selftest: pico de RSS/PSS/processos, rc, duração, RSS que sobrou vivo no fim; e o pico do item inteiro com a composição) ·
   tests/<nome>.log (a saída de cada selftest). Leitura: o pico do item contra o teto; se RSS >> PSS a conta do governo está inflada por página compartilhada; se o RSS do `leaked` é grande, o selftest vaza.
@@ -183,6 +184,13 @@ def read_tests(arg, tree):
     return sorted(rels, key=lambda r: (-dur.get(r, 10 ** 9), r))
 
 
+def mb(kb, nd=0):
+    # kB → MB. vazio (0 kB lidos) → 0; falhou/ilegível (None: o smaps_rollup não abriu) → None e vai como null no JSON: "não consegui ler" nunca é impresso como 0 MB
+    if kb is None:
+        return None
+    return round(kb / 1024, nd) if nd else kb // 1024
+
+
 def short(rel):
     return os.path.basename(rel).replace(".selftest.sh", "")
 
@@ -209,10 +217,17 @@ def main():
     if os.path.exists(wt):
         subprocess.run([RG, "wt-rm", RIG, NAME], capture_output=True)          # sobra de uma medição minha anterior (nome só meu)
     subprocess.run(["git", "-C", "%s/%s/repo.git" % (GR, RIG), "branch", "-D", "worker/" + NAME], capture_output=True)
+    # vazio (rc 0) → pull "ok"; falhou (rc != 0, prazo estourado) → pull "falhou": segue com o clone que há (código velho não é código errado), MAS o log e o peaks.json dizem, porque o pico medido é o
+    # de uma ponta que pode não ser a do main
+    pull = "ok"
     try:
-        subprocess.run([RG, "pull", RIG], capture_output=True, timeout=300)    # falhou → segue com o clone que há: código velho não é código errado
+        pr = subprocess.run([RG, "pull", RIG], capture_output=True, text=True, timeout=300)
+        if pr.returncode != 0:
+            pull = "falhou"
+            log("AVISO: pull do espelho falhou (rc %d): sigo com o clone que há: %s" % (pr.returncode, (pr.stdout + pr.stderr).strip()[-160:]))
     except subprocess.SubprocessError:
-        log("AVISO: pull do espelho falhou ou estourou: sigo com o clone que há")
+        pull = "falhou"
+        log("AVISO: pull do espelho estourou o prazo: sigo com o clone que há")
     add = subprocess.run([RG, "wt-add", RIG, NAME, "main"], capture_output=True, text=True, timeout=900)
     tree = wt + "/.gascity-gastown-hq"
     if add.returncode != 0 or not os.path.isdir(tree + "/scripts"):
@@ -237,8 +252,12 @@ def main():
         subprocess.run([RG, "wt-rm", RIG, NAME], capture_output=True)
         subprocess.run(["git", "-C", "%s/%s/repo.git" % (GR, RIG), "branch", "-D", "worker/" + NAME], capture_output=True)
         return 3
-    tests = [t for t in tests if os.path.isfile(os.path.join(tree, t))]
-    log("árvore %s em %s; %d selftests, %d trabalhadores, limite %d s, régua %d MB" % (wt, head[:9], len(tests), workers, limit, cap))
+    # vazio (todos existem) → nada a dizer; falhou (nome da lista que a árvore não tem) → fica de fora E é dito, com os nomes: uma lista com nome errado medindo "tudo" seria uma medição de outra coisa
+    dropped = [t for t in tests if not os.path.isfile(os.path.join(tree, t))]
+    tests = [t for t in tests if t not in dropped]
+    if dropped:
+        log("AVISO: %d selftest(s) da lista não existem na árvore e ficam de fora: %s%s" % (len(dropped), ", ".join(dropped[:5]), " …" if len(dropped) > 5 else ""))
+    log("árvore %s em %s; %d selftests, %d trabalhadores, limite %d s, régua %d MB; pull %s" % (wt, head[:9], len(tests), workers, limit, cap, pull))
     if not tests:
         log("nada para rodar"); return 3
     env = dict(os.environ, PATH=HOME + "/.local/bin:" + os.environ["PATH"], PYTHONDONTWRITEBYTECODE="1", GIT_AUTHOR_NAME="gt", GIT_AUTHOR_EMAIL="gt@no",
@@ -290,7 +309,7 @@ def main():
                             sem_pss += 1
                         else:
                             pss += ro["Pss"]
-                        procs_all.append((rkb, pid, pp, st, sid, cmd, (ro or {}).get("Pss")))
+                        procs_all.append((rkb, pid, pp, st, sid, cmd, None if ro is None else ro["Pss"]))   # Pss ilegível → None (null no JSON), nunca 0
                     pss //= 1024
                     item_rss += rss; item_pss += pss; item_n += len(ms)
                     if rss > r["peak_rss_mb"]:
@@ -314,17 +333,17 @@ def main():
                 sf.write(json.dumps(line) + "\n"); sf.flush()
                 procs_all.sort(reverse=True)
                 if item_rss > item_peak["rss_mb"]:
-                    item_peak = {"rss_mb": item_rss, "pss_mb": item_pss, "n": item_n, "t": t, "avail_mb": avail,
+                    item_peak = {"rss_mb": item_rss, "pss_mb": item_pss, "sem_pss": sem_pss, "n": item_n, "t": t, "avail_mb": avail,   # pss_mb é PISO quando sem_pss > 0 (soma só do que o smaps_rollup deixou ler)
                                  "by_test": [{"test": n, "rss_mb": a, "pss_mb": c, "n": b, "after_exit": ex} for a, n, b, c, ex in per[:8]],
-                                 "top_procs": [{"pid": p[1], "ppid": p[2], "rss_mb": p[0] // 1024, "pss_mb": (p[6] or 0) // 1024, "sess": live[p[4]]["name"] if p[4] in live else "?", "cmd": p[5]} for p in procs_all[:20]]}
+                                 "top_procs": [{"pid": p[1], "ppid": p[2], "rss_mb": p[0] // 1024, "pss_mb": mb(p[6]), "sess": live[p[4]]["name"] if p[4] in live else "?", "cmd": p[5]} for p in procs_all[:20]]}
                 if item_rss >= cap * HOT_FRACTION and now - last_hot >= 5:
                     last_hot = now
-                    hf.write(json.dumps({"t": t, "item_rss_mb": item_rss, "item_pss_mb": item_pss, "n": item_n,
-                                         "procs": [{"pid": p[1], "ppid": p[2], "st": p[3], "rss_mb": round(p[0] / 1024, 1), "pss_mb": round((p[6] or 0) / 1024, 1),
+                    hf.write(json.dumps({"t": t, "item_rss_mb": item_rss, "item_pss_mb": item_pss, "sem_pss": sem_pss, "n": item_n,
+                                         "procs": [{"pid": p[1], "ppid": p[2], "st": p[3], "rss_mb": round(p[0] / 1024, 1), "pss_mb": mb(p[6], 1),
                                                     "sess": live[p[4]]["name"] if p[4] in live else "?", "cmd": p[5]} for p in procs_all[:30]]}) + "\n"); hf.flush()
                 if t % 60 < INTERVAL_S:
                     with open(out + "/peaks.json", "w") as pf:
-                        json.dump({"cap_mb": cap, "t": t, "done": done, "live": {r["name"]: {k: r[k] for k in FIELDS if k != "rel"} for r in live.values()},
+                        json.dump({"cap_mb": cap, "t": t, "pull": pull, "dropped": dropped[:20], "done": done, "live": {r["name"]: {k: r[k] for k in FIELDS if k != "rel"} for r in live.values()},
                                    "item_peak": item_peak, "pending": len(pending)}, pf, indent=1)
                 if STOP:
                     why = "sinal"; break
@@ -340,12 +359,14 @@ def main():
         for sid, r in live.items():
             done.setdefault(r["name"], {k: r[k] for k in FIELDS})
         with open(out + "/peaks.json", "w") as pf:
-            json.dump({"cap_mb": cap, "t": int(time.time() - t0), "why": why, "done": done, "item_peak": item_peak, "pending": len(pending)}, pf, indent=1)
+            json.dump({"cap_mb": cap, "t": int(time.time() - t0), "why": why, "pull": pull, "dropped": dropped[:20], "done": done, "item_peak": item_peak, "pending": len(pending)}, pf, indent=1)
         r = subprocess.run([RG, "wt-rm", RIG, NAME], capture_output=True, text=True)
         subprocess.run(["git", "-C", "%s/%s/repo.git" % (GR, RIG), "branch", "-D", "worker/" + NAME], capture_output=True)
-        log("fim: %s; pico do item %d MB (PSS %d) aos %d s, teto %d; wt-rm rc=%d; árvore %s" % (why, item_peak["rss_mb"], item_peak.get("pss_mb", 0), item_peak.get("t", 0), cap,
-                                                                                            r.returncode, "AINDA EXISTE" if os.path.exists(wt) else "removida"))
-    return 0
+        log("fim: %s; pico do item %d MB (PSS %d%s) aos %d s, teto %d; pull %s; wt-rm rc=%d; árvore %s" % (
+            why, item_peak["rss_mb"], item_peak.get("pss_mb", 0), " no mínimo, %d processo(s) sem PSS" % item_peak["sem_pss"] if item_peak.get("sem_pss") else "", item_peak.get("t", 0), cap,
+            pull, r.returncode, "AINDA EXISTE" if os.path.exists(wt) else "removida"))
+    # rc: 0 SÓ quando a lista acabou. limite (4: sobrou selftest sem medir), sinal (143) e abortado-ram/abortado-proc (5) são medição INCOMPLETA: quem encadeia (`&&`, systemd) não pode ler 0 como "medi tudo"
+    return 0 if why == "fim-da-lista" else 4 if why == "limite" else 143 if why == "sinal" else 5
 
 
 if __name__ == "__main__":

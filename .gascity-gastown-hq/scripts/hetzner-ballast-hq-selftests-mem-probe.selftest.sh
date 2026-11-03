@@ -7,8 +7,8 @@
 #   Casos · Variáveis
 #
 # CASOS: sintaxe · wt-add rc 1 → rc 3 e nenhum selftest lançado · wt-add rc 0 sem árvore → rc 3 (vale o efeito, não o rc) · lista vazia → rc 3 · rodada de brinquedo (rc 0): os dois selftests aparecem em
-#        peaks.json com o rc deles · o que segura 60 MB tem pico de RSS >= 50 e PSS <= RSS · o que deixa o `sleep` tem leak_n >= 1 depois de acabar (o órfão conta, como no governo) · a soma do item
-#        no samples.jsonl passa de 50 MB · o piso de MemAvailable acima do que há aborta com `abortado-ram` (rc 0, nada além do aborto) · HQP_MIN_AVAIL_MB=0 / vazio / texto NÃO desligam o piso (voltam ao padrão 8000). · trava de instância única: com a trava na mão de outro processo → rc 3 sem chamar o espelho; solta → roda.
+#        peaks.json com o rc deles · o que segura 60 MB tem pico de RSS >= 50, PSS LIDO (>= 50, nenhum processo sem PSS no pico do item) e PSS <= RSS · o que deixa o `sleep` tem leak_n >= 1 depois de acabar (o órfão conta, como no governo) · a soma do item
+#        no samples.jsonl passa de 50 MB · o piso de MemAvailable acima do que há aborta com `abortado-ram` (rc 5: medição incompleta nunca sai com 0; limite de tempo = rc 4, sinal = rc 143, lista acabada = rc 0) · HQP_MIN_AVAIL_MB=0 / vazio / texto NÃO desligam o piso (voltam ao padrão 8000). · pull do espelho que falha (rc 1) segue com o clone que há MAS o log diz AVISO e o peaks.json traz pull=falhou (ok na rodada normal) · nome da lista que a árvore não tem fica de fora e é NOMEADO (log + `dropped` do peaks.json) · PSS ilegível vai como null (mb), nunca 0. trava de instância única: com a trava na mão de outro processo → rc 3 sem chamar o espelho; solta → roda.
 # VARIÁVEIS: HMQ_UNDER_TEST (script a testar) · HMQ_PY (padrão /usr/bin/python3)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -34,6 +34,7 @@ home() {
   cat > "$H/gt-remote/bin/hetzner-remote-git.sh" << EOS
 #!/bin/sh
 touch "$T/rg.$1.\$1"
+[ "\$1" = pull ] && [ -f "$H/pull.fail" ] && { echo "pull (brinquedo): falhou" >&2; exit 1; }
 WT="$H/gt-remote/git/gascity/wt/\$3"
 case "\$1" in
   wt-add)
@@ -47,11 +48,11 @@ EOS
 }
 # run N LISTA_OU_- [ENV…] — roda a sonda no HOME N com a lista (arquivo) e 2 trabalhadores, limite 60 s; devolve o rc em $RC e a saída em $OUT
 run() { local N=$1 L=$2; shift 2
-  OUT=$(env HOME="$T/home.$N" GT_REMOTE_GIT="$T/home.$N/gt-remote/git" HQP_INTERVAL_S=1 HQP_MIN_AVAIL_MB=1 "$@" "$PY" -I "$SCRIPT" "$T/out.$N" "$L" 2 60 2>&1); RC=$?; }
+  OUT=$(env HOME="$T/home.$N" GT_REMOTE_GIT="$T/home.$N/gt-remote/git" HQP_INTERVAL_S=1 HQP_MIN_AVAIL_MB=1 "$@" "$PY" -I "$SCRIPT" "$T/out.$N" "$L" 2 "${LIM:-60}" 2>&1); RC=$?; }
 jq_() { "$PY" -I -c 'import json, sys
 d = json.load(open(sys.argv[1]))
 for k in sys.argv[2].split("."):
-    d = d[k]
+    d = d[int(k)] if isinstance(d, list) else d[k]
 print(d)' "$@" 2> /dev/null; }
 
 # 1. wt-add rc 1 (não cria árvore): rc 3, nenhum selftest lançado
@@ -85,7 +86,8 @@ P="$T/out.4/peaks.json"
 check "peaks.json lista os 3 selftests" "3" "$("$PY" -I -c 'import json, sys; print(len(json.load(open(sys.argv[1]))["done"]))' "$P" 2> /dev/null)"
 check "segura60: rc 0" "0" "$(jq_ "$P" done.segura60.rc)"
 check "segura60: pico de RSS >= 50 MB" "1" "$([ "$(jq_ "$P" done.segura60.peak_rss_mb)" -ge 50 ] 2> /dev/null && echo 1 || echo 0)"
-check "segura60: PSS <= RSS (a soma de PSS nunca passa a de RSS)" "1" "$([ "$(jq_ "$P" done.segura60.peak_pss_mb)" -le "$(jq_ "$P" done.segura60.peak_rss_mb)" ] 2> /dev/null && echo 1 || echo 0)"
+check "segura60: PSS LIDO (>= 50 MB: um smaps_rollup ilegível viraria 0 e passaria no <= abaixo sem provar nada) e PSS <= RSS" "1 1" "$([ "$(jq_ "$P" done.segura60.peak_pss_mb)" -ge 50 ] 2> /dev/null && echo 1 || echo 0) $([ "$(jq_ "$P" done.segura60.peak_pss_mb)" -le "$(jq_ "$P" done.segura60.peak_rss_mb)" ] 2> /dev/null && echo 1 || echo 0)"
+check "pico do item: nenhum processo sem PSS (sem_pss 0: o PSS somado é exato, não piso) e o pull ok / dropped vazio no peaks.json" "0 ok []" "$(jq_ "$P" item_peak.sem_pss) $(jq_ "$P" pull) $(jq_ "$P" dropped)"
 check "segura60 não deixou nada vivo (leak_n 0)" "0" "$(jq_ "$P" done.segura60.leak_n)"
 check "orfao: o selftest saiu com rc 0" "0" "$(jq_ "$P" done.orfao.rc)"
 check "orfao: o sleep que ficou na sessão foi visto depois do fim (leak_n >= 1)" "1" "$([ "$(jq_ "$P" done.orfao.leak_n)" -ge 1 ] 2> /dev/null && echo 1 || echo 0)"
@@ -102,6 +104,14 @@ check "a árvore da sonda foi removida no fim (wt-rm chamado)" "1" "$([ -e "$T/r
 home 5 "$BODY"
 run 5 "$T/list4.txt" HQP_MIN_AVAIL_MB=99999999
 check "piso de MemAvailable alto demais → aborta com 'abortado-ram'" "1" "$(printf '%s' "$OUT" | grep -c 'fim: abortado-ram')"
+check "...e a medição incompleta NÃO sai com rc 0 (rc 5): quem encadeia a sonda não pode ler 'medi tudo'" "5" "$RC"
+# 5b. limite de tempo: a lista não acabou → rc 4 (o segura60 dorme 6 s; limite 2 s); 5c. TERM no meio → rc 143
+home 15 "$BODY"; LIM=2 run 15 "$T/list4.txt"
+check "limite de tempo estourado com selftest ainda rodando → 'fim: limite' e rc 4 (não 0)" "1 4" "$(printf '%s' "$OUT" | grep -c 'fim: limite') $RC"
+home 16 "$BODY"
+env HOME="$T/home.16" GT_REMOTE_GIT="$T/home.16/gt-remote/git" HQP_INTERVAL_S=1 HQP_MIN_AVAIL_MB=1 "$PY" -I "$SCRIPT" "$T/out.16" "$T/list4.txt" 2 60 > "$T/out16.log" 2>&1 &
+PP=$!; sleep 3; kill -TERM "$PP" 2> /dev/null; wait "$PP"; RC=$?
+check "TERM no meio da medição → 'fim: sinal' e rc 143 (não 0)" "1 143" "$(grep -c 'fim: sinal' "$T/out16.log") $RC"
 # 7. instância única: com a trava na mão de OUTRO processo a sonda sai com rc 3 e NÃO chama o espelho (a árvore da outra, se houvesse, ficaria como está)
 home 7 "$BODY"; mkdir -p "$T/home.7/gt-remote/measure"
 "$PY" -I -c 'import fcntl, sys, time
@@ -115,6 +125,12 @@ kill "$HOLD" 2> /dev/null; wait "$HOLD" 2> /dev/null
 # trava solta de novo (o dono morreu): a sonda roda
 home 8 "$BODY"; run 8 "$T/list4.txt"
 check "trava livre (o dono anterior morreu) → a sonda roda (rc 0)" "0" "$RC"
+# pull do espelho que falha (rc 1): a rodada segue com o clone que há, MAS diz (AVISO no log e pull=falhou no peaks.json); o nome da lista que a árvore não tem é nomeado, não sumido
+home 17 "$BODY"; : > "$T/home.17/pull.fail"
+printf '%s\n' scripts/ok.selftest.sh scripts/nao-existe.selftest.sh > "$T/list17.txt"
+run 17 "$T/list17.txt"
+check "pull que falha (rc 1) → a rodada segue (rc 0), o log diz 'AVISO: pull do espelho falhou (rc 1)' e o peaks.json traz pull=falhou" "0 1 falhou" "$RC $(printf '%s' "$OUT" | grep -c 'AVISO: pull do espelho falhou (rc 1)') $(jq_ "$T/out.17/peaks.json" pull)"
+check "nome da lista que a árvore não tem → fora da rodada, NOMEADO no log e em dropped do peaks.json (1 selftest rodou)" "1 scripts/nao-existe.selftest.sh 1" "$(printf '%s' "$OUT" | grep -c 'AVISO: 1 selftest(s) da lista não existem na árvore e ficam de fora: scripts/nao-existe.selftest.sh') $(jq_ "$T/out.17/peaks.json" dropped.0) $("$PY" -I -c 'import json, sys; print(len(json.load(open(sys.argv[1]))["done"]))' "$T/out.17/peaks.json" 2> /dev/null)"
 
 # ── leituras que FALHAM (E12): cada uma tem de cair no estado INERTE (não sei / nada roda / não mata), nunca no mesmo valor de "vazio" ou de "achei". O módulo é importável (main só roda como script).
 PRELUDE='import importlib.util, os, sys
@@ -130,6 +146,7 @@ check "smaps_rollup que nega (PermissionError) → None" "None" "$(pyx 'with moc
 check "os.listdir(/proc) que falha (OSError) → a leitura SOBE como erro (a rodada aborta), nunca devolve 'ninguém roda'" "OSError" "$(pyx 'with mock.patch("os.listdir", side_effect=OSError("EIO")):
     try: m.scan_sessions([1]); print("sem-erro")
     except OSError: print("OSError")')"
+check "PSS ilegível (None) sai como None (null no JSON), nunca 0; PSS 0 de verdade continua 0" "None 0 2 1.5" "$(pyx 'print(m.mb(None), m.mb(0), m.mb(2048), m.mb(1536, 1))')"
 check "controle: sem falha injetada a sessão do próprio processo tem membros" "True" "$(pyx 'sid = os.getsid(0); print(len(m.scan_sessions([sid])[sid]) >= 1)')"
 for suf in /stat /statm /cmdline; do
   check "leitura de /proc/<pid>$suf que falha (FileNotFoundError, o processo sumiu) → o membro é pulado, a sessão sai vazia, sem erro" "True" "$(pyx "sid = os.getsid(0); real = open
