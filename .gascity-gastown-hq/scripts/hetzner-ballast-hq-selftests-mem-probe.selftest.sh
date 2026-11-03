@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# hetzner-ballast-hq-selftests-mem-probe.selftest.sh — hermético (ga-2hd02v.5.8): a sonda de memória do hq-selftests (scripts/hetzner-ballast-hq-selftests-mem-probe.py) contra um HOME de brinquedo.
+# Sem rede, sem root, sem nó de verdade. A rodada de VERDADE (os 375 selftests do hq no nó, medindo RSS/PSS) só se prova no nó; aqui se prova (1) a trava: árvore que não nasce → rc 3, nada roda;
+# (2) a medição num brinquedo de dois selftests: um que segura ~60 MB e um que deixa um processo vivo na sessão depois de acabar. Precisa de /proc (Linux): fora dele sai 97 (AMBIENTE), nunca 0.
+#
+# Contents
+#   Casos · Variáveis
+#
+# CASOS: sintaxe · wt-add rc 1 → rc 3 e nenhum selftest lançado · wt-add rc 0 sem árvore → rc 3 (vale o efeito, não o rc) · lista vazia → rc 3 · rodada de brinquedo (rc 0): os dois selftests aparecem em
+#        peaks.json com o rc deles · o que segura 60 MB tem pico de RSS >= 50 e PSS <= RSS · o que deixa o `sleep` tem leak_n >= 1 depois de acabar (o órfão conta, como no governo) · a soma do item
+#        no samples.jsonl passa de 50 MB · o piso de MemAvailable acima do que há aborta com `abortado-ram` (rc 0, nada além do aborto) · HQP_MIN_AVAIL_MB=0 / vazio / texto NÃO desligam o piso (voltam ao padrão 8000).
+# VARIÁVEIS: HMQ_UNDER_TEST (script a testar) · HMQ_PY (padrão /usr/bin/python3)
+set -u
+HERE="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT="${HMQ_UNDER_TEST:-$HERE/hetzner-ballast-hq-selftests-mem-probe.py}"
+PY="${HMQ_PY:-/usr/bin/python3}"
+fails=0; n=0
+check() { n=$((n+1)); if [ "$2" = "$3" ]; then echo "ok   $1"; else echo "FAIL $1 (esperado '$2', veio '$3')"; fails=$((fails+1)); fi; }
+
+"$PY" -I -c 'import ast, sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$SCRIPT" 2> /dev/null; check "sintaxe do script" "0" "$?"
+if [ ! -r /proc/self/statm ] || [ ! -r /proc/meminfo ]; then
+  echo "AMBIENTE: sem /proc (não é Linux): a sonda lê /proc; os casos de execução NÃO rodaram"; echo "── $((n - fails))/$n ok (parcial)"; [ "$fails" -eq 0 ] && exit 97 || exit 1
+fi
+
+T=$(cd "$(mktemp -d /tmp/hmq.XXXXXX)" && pwd -P)
+cleanup() { find "$T" -mindepth 1 -delete 2> /dev/null; rmdir "$T" 2> /dev/null; }
+trap cleanup EXIT
+
+# home N CORPO_DO_WT_ADD — HOME de brinquedo: o hetzner-remote-git.sh de brinquedo faz `pull` e `wt-rm` (apaga a árvore) sem erro, e `wt-add` roda CORPO ($WT = a árvore pedida); grava uma marca
+# em $T/rg.<N>.<verbo> a cada chamada. O ballast/items.tsv de brinquedo dá a régua (hq-selftests, rss_mb 4096).
+home() {
+  local H="$T/home.$1"; mkdir -p "$H/gt-remote/bin" "$H/gt-remote/ballast" "$H/gt-remote/git/gascity"
+  printf 'hq-selftests\twork\t4\t4096\t10800\t180\t-\thq-selftests.sh\n' > "$H/gt-remote/ballast/items.tsv"
+  cat > "$H/gt-remote/bin/hetzner-remote-git.sh" << EOS
+#!/bin/sh
+touch "$T/rg.$1.\$1"
+WT="$H/gt-remote/git/gascity/wt/\$3"
+case "\$1" in
+  wt-add)
+$2
+  ;;
+  wt-rm) rm -rf "\$WT" ;;
+esac
+exit 0
+EOS
+  chmod +x "$H/gt-remote/bin/hetzner-remote-git.sh"
+}
+# run N LISTA_OU_- [ENV…] — roda a sonda no HOME N com a lista (arquivo) e 2 trabalhadores, limite 60 s; devolve o rc em $RC e a saída em $OUT
+run() { local N=$1 L=$2; shift 2
+  OUT=$(env HOME="$T/home.$N" GT_REMOTE_GIT="$T/home.$N/gt-remote/git" HQP_INTERVAL_S=1 HQP_MIN_AVAIL_MB=1 "$@" "$PY" -I "$SCRIPT" "$T/out.$N" "$L" 2 60 2>&1); RC=$?; }
+jq_() { "$PY" -I -c 'import json, sys
+d = json.load(open(sys.argv[1]))
+for k in sys.argv[2].split("."):
+    d = d[k]
+print(d)' "$@" 2> /dev/null; }
+
+# 1. wt-add rc 1 (não cria árvore): rc 3, nenhum selftest lançado
+home 1 'exit 1'; : > "$T/list.txt"; run 1 "$T/list.txt"
+check "wt-add rc 1 → rc 3" "3" "$RC"
+check "wt-add rc 1: nenhum log de selftest foi criado" "0" "$(find "$T/out.1/tests" -type f 2> /dev/null | wc -l | tr -d ' ')"
+# 2. wt-add rc 0 mas sem a árvore (scripts/ ausente): rc 3
+home 2 'true'; run 2 "$T/list.txt"
+check "wt-add rc 0 sem árvore (scripts/ ausente) → rc 3 (vale o efeito, não o rc)" "3" "$RC"
+# 3. árvore pronta, lista vazia: rc 3, nada roda
+home 3 'mkdir -p "$WT/.gascity-gastown-hq/scripts"'; run 3 "$T/list.txt"
+check "árvore pronta e lista vazia → rc 3" "3" "$RC"
+
+# 4. rodada de brinquedo: segura60 aloca ~60 MB e espera; orfao deixa um `sleep` na sessão e sai; ok sai na hora
+BODY='mkdir -p "$WT/.gascity-gastown-hq/scripts"
+cat > "$WT/.gascity-gastown-hq/scripts/segura60.selftest.sh" << "EOT"
+python3 -I -c "b = bytearray(60 * 1024 * 1024); b[::4096] = b\"x\" * len(b[::4096]); import time; time.sleep(6)"
+EOT
+cat > "$WT/.gascity-gastown-hq/scripts/orfao.selftest.sh" << "EOT"
+sleep 8 > /dev/null 2>&1 &
+exit 0
+EOT
+cat > "$WT/.gascity-gastown-hq/scripts/ok.selftest.sh" << "EOT"
+exit 0
+EOT'
+home 4 "$BODY"
+printf '%s\n' scripts/segura60.selftest.sh scripts/orfao.selftest.sh scripts/ok.selftest.sh > "$T/list4.txt"
+run 4 "$T/list4.txt"
+check "rodada de brinquedo: rc 0 ('$(printf '%s' "$OUT" | tail -1 | cut -c1-120)')" "0" "$RC"
+P="$T/out.4/peaks.json"
+check "peaks.json lista os 3 selftests" "3" "$("$PY" -I -c 'import json, sys; print(len(json.load(open(sys.argv[1]))["done"]))' "$P" 2> /dev/null)"
+check "segura60: rc 0" "0" "$(jq_ "$P" done.segura60.rc)"
+check "segura60: pico de RSS >= 50 MB" "1" "$([ "$(jq_ "$P" done.segura60.peak_rss_mb)" -ge 50 ] 2> /dev/null && echo 1 || echo 0)"
+check "segura60: PSS <= RSS (a soma de PSS nunca passa a de RSS)" "1" "$([ "$(jq_ "$P" done.segura60.peak_pss_mb)" -le "$(jq_ "$P" done.segura60.peak_rss_mb)" ] 2> /dev/null && echo 1 || echo 0)"
+check "segura60 não deixou nada vivo (leak_n 0)" "0" "$(jq_ "$P" done.segura60.leak_n)"
+check "orfao: o selftest saiu com rc 0" "0" "$(jq_ "$P" done.orfao.rc)"
+check "orfao: o sleep que ficou na sessão foi visto depois do fim (leak_n >= 1)" "1" "$([ "$(jq_ "$P" done.orfao.leak_n)" -ge 1 ] 2> /dev/null && echo 1 || echo 0)"
+check "orfao: o órfão viveu alguns segundos depois do líder (leak_secs >= 2) e o registro não foi zerado quando a sessão esvaziou" "1" "$([ "$(jq_ "$P" done.orfao.leak_secs)" -ge 2 ] 2> /dev/null && echo 1 || echo 0)"
+check "a soma do item no samples.jsonl passou de 50 MB" "1" "$("$PY" -I -c 'import json, sys
+print(1 if max(json.loads(l)["item_rss_mb"] for l in open(sys.argv[1])) >= 50 else 0)' "$T/out.4/samples.jsonl" 2> /dev/null)"
+check "o pico do item bate com o maior ponto do samples.jsonl" "1" "$("$PY" -I -c 'import json, sys
+pk = json.load(open(sys.argv[1]))["item_peak"]["rss_mb"]
+mx = max(json.loads(l)["item_rss_mb"] for l in open(sys.argv[2]))
+print(1 if pk == mx else 0)' "$P" "$T/out.4/samples.jsonl" 2> /dev/null)"
+check "a árvore da sonda foi removida no fim (wt-rm chamado)" "1" "$([ -e "$T/rg.4.wt-rm" ] && echo 1 || echo 0)"
+
+# 5. piso de MemAvailable acima do que há: aborta no 1º tick, sem lançar além dos que cabem no 1º laço; HQP_MIN_AVAIL_MB=0 volta ao padrão (não desliga o piso)
+home 5 "$BODY"
+run 5 "$T/list4.txt" HQP_MIN_AVAIL_MB=99999999
+check "piso de MemAvailable alto demais → aborta com 'abortado-ram'" "1" "$(printf '%s' "$OUT" | grep -c 'fim: abortado-ram')"
+# o parser das variáveis, direto: "0", vazio e texto caem no padrão (0 desligaria o piso); inteiro >= 1 vale. O módulo é importável (main só roda como script)
+env_val() { HQP_MIN_AVAIL_MB="$1" "$PY" -I -c 'import importlib.util, sys
+sp = importlib.util.spec_from_file_location("hqp", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m); print(m.MIN_AVAIL_MB)' "$SCRIPT" 2> /dev/null; }
+check "HQP_MIN_AVAIL_MB=0 NÃO desliga o piso (volta ao padrão 8000)" "8000" "$(env_val 0)"
+check "HQP_MIN_AVAIL_MB vazio → padrão 8000" "8000" "$(env_val '')"
+check "HQP_MIN_AVAIL_MB=abc → padrão 8000" "8000" "$(env_val abc)"
+check "HQP_MIN_AVAIL_MB=1234 → 1234" "1234" "$(env_val 1234)"
+echo "── $((n - fails))/$n ok"
+[ "$fails" -eq 0 ]
