@@ -11,6 +11,8 @@
 # EQUIVALENT: in _eph_release_target and _eph_drop_empty_staging the check "pwd -P of the root equals pwd -P of dirname(<root>/<db>)" cannot fail for a db the case above it already
 # accepted (the dirname of <root>/<db> is <root>); in _eph_drop_empty_staging the case on the db name repeats what _eph_is_ephemeral has just refused; and the "real directory, not a
 # symlink" test there only picks WHICH rc 1 path a symlink or a file takes, because rmdir refuses both (rc 1, nothing removed, nothing logged, with or without the test).
+# ga-59jrj3d, the ids the sweep keeps listing for the three notes above: the pwd -P check of _eph_release_target (65b6c22ae3 `1 -> 0`, b2a4c3b098 no `|| return 1`) and of _eph_drop_empty_staging (60cfd44e9f, 4f8c1198ad); the db-name case of
+# _eph_drop_empty_staging (545ec062a7 `1 -> 0`: _eph_is_ephemeral opens with the very same case); its "real directory, not a symlink" test (578f525654 `&&` -> `||`, d54b0fee13 no `|| return 1`).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -407,6 +409,9 @@ _eph_s3_fingerprint_state 'h q' >/dev/null; rc=$?
 AWS="" _eph_s3_fingerprint_state hq >/dev/null; rc=$?
 [ "$rc" -eq 0 ] && ok "…and so does an unset AWS" || bad "unset AWS gave rc $rc"
 _eph_s3_fingerprint_state hq >/dev/null; [ $? -eq 0 ] && ok "always rc 0 — the answer is the word" || bad "non-zero rc"
+reset_bucket; out="$(_eph_s3_fingerprint_state hq)"; _eph_s3_fingerprint_state hq >/dev/null; rc=$?   # aws s3 cp fails (the file is not in the bucket): the word is "unknown" and the rc is still 0 (ga-59jrj3d)
+[ "$out" = "unknown" ] && [ "$rc" -eq 0 ] && ok "…and so does a failing aws cp (file not in the bucket): unknown, rc 0" || bad "failing aws cp: '$out' rc=$rc"
+putfp '{"run_utc":"2026-10-01T07:05:12Z","databases":{"hq":{"issues":1}}}'
 # Each guard that answers "could not find out" BEFORE any aws call (ga-lwbl088). The fake aws ignores the bucket name and the file is in the bucket, so a guard that
 # lets the call through shows up as an answer other than "unknown" and as a line in $CALLS. $CALLS is emptied by the `: >` just before each read: empty → aws never
 # ran (what is asserted); missing/unreadable → cannot happen, the `: >` makes the file (and `[ ! -s ]` would read a missing one as "no call", never as a call).
