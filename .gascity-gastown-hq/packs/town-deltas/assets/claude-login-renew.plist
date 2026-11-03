@@ -8,7 +8,7 @@
        ~/.gastown/claude-accounts, so the Remote Control crews never sit on a dead login. Two triggers: the T-7-days
        forecast (the best stored login of an account ends in <= 7 days) and an outage (the crew job has a "no_login"
        episode open for >= 10 min and no stored full login can heal it). One account per run, nearest end first.
-       The run drives `claude auth login --email <e>` in that account's own dir; Google is passed with the TOTP
+       The run drives `claude auth login` (with the email option) in that account's own dir; Google is passed with the TOTP
        (`gmail-totp`) in the automation Chrome (CDP, profile ~/.chrome-cdp). NEVER a password, NEVER a way around
        Anthropic's anti-bot puzzle: at the puzzle / no Google session / a password or a device prompt the account is
        marked "inviavel por automacao" and Athos gets ONE push with the exact step. The crew switch job
@@ -18,7 +18,7 @@
 
        KILL SWITCH (no reload needed): touch /Users/athos/gt/.gascity-gastown-hq/.gc/no-login-renew
        (or GC_LOGIN_RENEW=0 in the environment).
-       Dry run: python3 .../claude-login-renew.py --dry-run  (stderr only: no Keychain write, no browser, no notify).
+       Dry run: run the script by hand with its dry-run option (stderr only: no Keychain write, no browser, no notify).
 
        ACTIVATION is a separate, human step (merged != live): copy to ~/Library/LaunchAgents and `launchctl load` it
        AFTER the script exists on main. See docs/claude-login-renew.md. -->

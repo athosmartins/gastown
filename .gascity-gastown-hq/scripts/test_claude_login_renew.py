@@ -848,6 +848,18 @@ def test_the_real_script_runs_from_an_empty_environment_under_both_interpreters(
     assert len(w.pushes()) == 1
 
 
+def test_the_plist_is_well_formed_xml_not_just_text_that_looks_right():
+    import plistlib
+    raw = (HERE.parents[1] / "packs" / "town-deltas" / "assets" / "claude-login-renew.plist").read_bytes()
+    try:
+        d = plistlib.loads(raw)                                                  # strict XML: a double hyphen inside a comment is accepted by launchd and refused here (and by the pre-push plist lint)
+    except Exception as e:  # noqa: BLE001
+        pytest.fail(f"the plist does not parse as XML: {type(e).__name__}: {e}")
+    assert d["Label"] == "com.gascity.claude-login-renew" and d["StartInterval"] == 900 and d["RunAtLoad"] is False
+    assert d["ProgramArguments"][0] == "/usr/bin/python3" and d["ProgramArguments"][1].endswith("/scripts/claude-login-renew.py")
+    assert set(d["EnvironmentVariables"]) >= {"PATH", "HOME", "USER", "GC_CITY_PATH"}
+
+
 def test_the_plist_names_the_job_and_does_not_collide_with_the_quota_swap_job():
     p = (HERE.parents[1] / "packs" / "town-deltas" / "assets" / "claude-login-renew.plist").read_text()
     assert "<key>Label</key><string>com.gascity.claude-login-renew</string>" in p
