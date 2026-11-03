@@ -160,9 +160,10 @@ def read_tests(arg, tree):
     with open(tree + "/scripts/hetzner-mac-only.hq.txt", encoding="utf-8") as f:
         pats = [ln.strip() for ln in f if ln.strip() and not ln.lstrip().startswith("#")]
     if not pats:
-        raise SystemExit("lista só-macOS sem nenhum padrão: não rodo (os testes de macOS viram ruído)")
+        raise ValueError("lista só-macOS sem nenhum padrão: não rodo (os testes de macOS viram ruído)")
     import fnmatch
     rels = []
+    # vazio (árvore sem selftest) → lista vazia; falhou (pasta que não abre: o os.walk engole o erro e devolve nada) → TAMBÉM vazia, e os dois caem no mesmo estado inerte: "nada para rodar", rc 3
     for root, dirs, files in os.walk(tree):
         dirs[:] = [d for d in dirs if d != ".git"]
         for fn in files:
@@ -227,7 +228,15 @@ def main():
         if cp.returncode != 0:
             log("overlay não copiou (rc %d): %s" % (cp.returncode, cp.stderr[-160:])); subprocess.run([RG, "wt-rm", RIG, NAME], capture_output=True); return 3
         log("overlay aplicado de %s" % ov)
-    tests = read_tests(list_arg, tree)
+    # vazio (lista sem nenhum selftest) → tratado logo abaixo ("nada para rodar", rc 3); falhou/ilegível (lista que não abre, lista só-macOS ausente ou sem padrão) → rc 3 e a árvore SAI: a exceção solta
+    # largava a árvore `ballast-hq-probe` no espelho, e a medição seguinte a apagaria como "sobra minha"
+    try:
+        tests = read_tests(list_arg, tree)
+    except (OSError, ValueError, UnicodeDecodeError) as e:
+        log("lista de selftests ilegível ou inválida (%s): nada roda" % e)
+        subprocess.run([RG, "wt-rm", RIG, NAME], capture_output=True)
+        subprocess.run(["git", "-C", "%s/%s/repo.git" % (GR, RIG), "branch", "-D", "worker/" + NAME], capture_output=True)
+        return 3
     tests = [t for t in tests if os.path.isfile(os.path.join(tree, t))]
     log("árvore %s em %s; %d selftests, %d trabalhadores, limite %d s, régua %d MB" % (wt, head[:9], len(tests), workers, limit, cap))
     if not tests:

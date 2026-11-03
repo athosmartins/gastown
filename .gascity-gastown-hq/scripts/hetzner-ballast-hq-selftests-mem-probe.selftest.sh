@@ -116,6 +116,46 @@ kill "$HOLD" 2> /dev/null; wait "$HOLD" 2> /dev/null
 home 8 "$BODY"; run 8 "$T/list4.txt"
 check "trava livre (o dono anterior morreu) → a sonda roda (rc 0)" "0" "$RC"
 
+# ── leituras que FALHAM (E12): cada uma tem de cair no estado INERTE (não sei / nada roda / não mata), nunca no mesmo valor de "vazio" ou de "achei". O módulo é importável (main só roda como script).
+PRELUDE='import importlib.util, os, sys
+from unittest import mock
+sp = importlib.util.spec_from_file_location("hqp", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)'
+pyx() { "$PY" -I -c "$PRELUDE"$'\n'"$1" "$SCRIPT" 2> /dev/null | tail -n 1; }
+check "/proc/meminfo ilegível (open falha com OSError) → MemAvailable None, nunca um número (None aborta a rodada)" "None" "$(pyx 'with mock.patch("builtins.open", side_effect=OSError("EACCES")): print(m.mem_avail_mb())')"
+check "/proc/meminfo sem a linha MemAvailable → None" "None" "$(pyx 'with mock.patch("builtins.open", mock.mock_open(read_data="MemTotal: 1 kB\n")): print(m.mem_avail_mb())')"
+check "items.tsv que não existe (/nonexistent) → a régua cai em 4096, não quebra" "4096" "$(pyx 'm.BH = "/nonexistent/ballast"; print(m.cap_mb())')"
+check "items.tsv sem a linha hq-selftests → 4096" "4096" "$(pyx 'import tempfile; d = tempfile.mkdtemp(); open(d + "/items.tsv", "w").write("queima\tfiller\tauto\t512\t3600\t0\t-\tq.sh\n"); m.BH = d; print(m.cap_mb())')"
+check "smaps_rollup de um pid que não existe → None (o processo conta na soma de RSS, fica em sem_pss)" "None" "$(pyx 'print(m.rollup(2 ** 22 + 12345))')"
+check "smaps_rollup que nega (PermissionError) → None" "None" "$(pyx 'with mock.patch("builtins.open", side_effect=PermissionError("EACCES")): print(m.rollup(os.getpid()))')"
+check "os.listdir(/proc) que falha (OSError) → a leitura SOBE como erro (a rodada aborta), nunca devolve 'ninguém roda'" "OSError" "$(pyx 'with mock.patch("os.listdir", side_effect=OSError("EIO")):
+    try: m.scan_sessions([1]); print("sem-erro")
+    except OSError: print("OSError")')"
+check "controle: sem falha injetada a sessão do próprio processo tem membros" "True" "$(pyx 'sid = os.getsid(0); print(len(m.scan_sessions([sid])[sid]) >= 1)')"
+for suf in /stat /statm /cmdline; do
+  check "leitura de /proc/<pid>$suf que falha (FileNotFoundError, o processo sumiu) → o membro é pulado, a sessão sai vazia, sem erro" "True" "$(pyx "sid = os.getsid(0); real = open
+def fake(p, *a, **k):
+    if str(p).endswith('$suf'): raise FileNotFoundError(p)
+    return real(p, *a, **k)
+with mock.patch('builtins.open', side_effect=fake): print(m.scan_sessions([sid]) == {sid: []})")"
+done
+
+# a lista de selftests e os arquivos que a montam: falhou/ilegível → rc 3, nada roda E a árvore sai (wt-rm); vazio → rc 3 "nada para rodar"; presente → roda
+NOMAC='printf "# só-macOS\nscripts/mac.selftest.sh\n" > "$WT/.gascity-gastown-hq/scripts/hetzner-mac-only.hq.txt"'
+TREE_A='mkdir -p "$WT/.gascity-gastown-hq/scripts"'
+SELF_TESTS='printf "exit 0\n" > "$WT/.gascity-gastown-hq/scripts/ok1.selftest.sh"; printf "exit 0\n" > "$WT/.gascity-gastown-hq/scripts/ok2.selftest.sh"; printf "exit 1\n" > "$WT/.gascity-gastown-hq/scripts/mac.selftest.sh"'
+home 9 "$TREE_A"; run 9 "$T/nonexistent-list.txt"
+check "lista de selftests que não existe (/nonexistent) → rc 3, nada roda e a árvore sai (wt-rm)" "3 1" "$RC $([ -e "$T/rg.9.wt-rm" ] && echo 1 || echo 0)"
+home 10 "$TREE_A"; run 10 -
+check "sem lista e sem a lista só-macOS na árvore → rc 3 (não rodo: os testes de macOS virariam ruído) e a árvore sai" "3 1" "$RC $([ -e "$T/rg.10.wt-rm" ] && echo 1 || echo 0)"
+home 11 "$TREE_A; printf '# só comentário\n' > \"\$WT/.gascity-gastown-hq/scripts/hetzner-mac-only.hq.txt\""; run 11 -
+check "lista só-macOS sem nenhum padrão → rc 3 e a árvore sai" "3 1" "$RC $([ -e "$T/rg.11.wt-rm" ] && echo 1 || echo 0)"
+home 12 "$TREE_A; $NOMAC"; run 12 -
+check "lista só-macOS ok mas a árvore não tem nenhum selftest → rc 3 ('nada para rodar')" "3 1" "$RC $(printf '%s' "$OUT" | grep -c 'nada para rodar')"
+home 13 "$TREE_A; $NOMAC; $SELF_TESTS"; run 13 -
+check "sem lista e sem hq-selftests.durations: roda os da árvore menos o só-macOS (2 selftests, rc 0)" "0 2" "$RC $("$PY" -I -c 'import json, sys; print(len(json.load(open(sys.argv[1]))["done"]))' "$T/out.13/peaks.json" 2> /dev/null)"
+home 14 "$TREE_A; $NOMAC; $SELF_TESTS"; mkdir -p "$T/home.14/gt-remote/ballast/hq-selftests.durations"; run 14 -
+check "hq-selftests.durations que não abre (é uma pasta, IsADirectoryError) → segue com a ordem do find: 2 selftests, rc 0" "0 2" "$RC $("$PY" -I -c 'import json, sys; print(len(json.load(open(sys.argv[1]))["done"]))' "$T/out.14/peaks.json" 2> /dev/null)"
+
 # o parser das variáveis, direto: "0", vazio e texto caem no padrão (0 desligaria o piso); inteiro >= 1 vale. O módulo é importável (main só roda como script)
 env_val() { HQP_MIN_AVAIL_MB="$1" "$PY" -I -c 'import importlib.util, sys
 sp = importlib.util.spec_from_file_location("hqp", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m); print(m.MIN_AVAIL_MB)' "$SCRIPT" 2> /dev/null; }
