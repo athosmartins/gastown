@@ -120,6 +120,7 @@ g_all() {
   newcity; mkconf 3; nf
   check "newfail: lista nova → UMA bead (create, bug, P2, stdin, json, as duas labels, no rig do WA) e o estado guarda o id" "0 1 1 1 1 1 wa-new1 3" \
     "$RC $(calls '^-C /rig create .* -t bug -p 2 --stdin --json -l origem:lastro-wa-suite -l area:testes$' bd.calls) $(calls 'create' bd.calls) $(grep -c 'tests/t000.py::t' "$W/bd.stdin.1") $(grep -c 'tests/t002.py::t' "$W/bd.stdin.1") $(grep -c '^FAIXA aaaaaaaaa .. bbbbbbbbb (3)$' "$W/bd.stdin.1") $(state bead) $(state n)"
+  check "newfail: a bead do wa-suite NÃO leva teste:endurece-mutantes (é bug, não bead só-teste de mutantes)" "1 0" "$(calls 'create' bd.calls) $(calls 'teste:endurece-mutantes' bd.calls)"
   nf
   check "newfail: a MESMA lista de novo → nada a fazer (nenhum bd novo: continuam as 2 chamadas da abertura, o list e o create)" "0 1 2" "$RC $(printf '%s' "$OUT" | grep -c 'nada a fazer') $(wc -l < "$W/bd.calls" | tr -d ' ')"
   # (o show da volta acima não existe: a mesma lista nem lê a bead) — a lista MUDA, a bead está aberta → comentário na mesma bead
@@ -222,7 +223,7 @@ g_hq() {  # a fonte hq-mutants (ga-2hd02v.5.6.4): lê o estado do motor, abre a 
   check "newfail[hq]: alvo SEM a chave survivors (o motor também aceita) = nenhum sobrevivente na lista → rc 0, nada aberto (sem bead anterior, não há o que dizer)" "0 0" "$RC $(wc -l < "$W/bd.calls" | tr -d ' ')"
 
   hqcity; mkhq 3; nh
-  check "newfail[hq]: lista nova → UMA bead (create no rig /hq, task, P3, stdin, json, as duas labels do hq) e o estado do hq guarda o id e n" "0 1 1 wa-new1 3" "$RC $(calls '^-C /hq create hq-mutants do lastro: 3 mutante.* -t task -p 3 --stdin --json -l origem:lastro-hq-mutants -l area:testes$' bd.calls) $(calls 'create' bd.calls) $(state bead newfail-hq-mutants.json) $(state n newfail-hq-mutants.json)"
+  check "newfail[hq]: lista nova → UMA bead (create no rig /hq, task, P3, stdin, json, as TRÊS labels do hq: origem, area e o teste:endurece-mutantes do gate, nesta ordem) e o estado do hq guarda o id e n" "0 1 1 wa-new1 3" "$RC $(calls '^-C /hq create hq-mutants do lastro: 3 mutante.* -t task -p 3 --stdin --json -l origem:lastro-hq-mutants -l area:testes -l teste:endurece-mutantes$' bd.calls) $(calls 'create' bd.calls) $(state bead newfail-hq-mutants.json) $(state n newfail-hq-mutants.json)"
   check "newfail[hq]: o corpo agrupa por arquivo, com linha, troca, id e o selftest de cada sobrevivente; o alvo sem sobrevivente não aparece" "1 1 1 1 0" "$(grep -c '^ARQUIVO scripts/a.sh (2)$' "$W/bd.stdin.1") $(grep -c '^ARQUIVO scripts/b.sh (1)$' "$W/bd.stdin.1") $(grep -c '^  L10 \[cmp\] -eq -> -ne  id=s000  (testes: scripts/a.selftest.sh)$' "$W/bd.stdin.1") $(grep -c '^  L12 .* id=s002' "$W/bd.stdin.1") $(grep -c 'c.sh' "$W/bd.stdin.1")"
   check "newfail[hq]: as fontes não dividem estado: o newfail.json do wa-suite não nasceu" "ausente" "$(state fp newfail.json)"
   nh
@@ -328,7 +329,7 @@ g_wam() {  # a fonte wa-mutants (ga-tmfmvxi): o MESMO formato do hq-mutants, bea
   badw "sobrevivente com a linha em texto" '{"v": 1, "targets": {"lib/a.py": {"survivors": {"x": {"file": "lib/a.py", "line": "7"}}}}}'
 
   wamcity; mkwam 3; nw
-  check "newfail[wam]: lista nova → UMA bead (create no rig /rig, task, P3, stdin, json e SÓ as duas labels da fonte: nada de ctx:ready/exec:auto, que o watchdog de rota entregaria ao pool de dogs) e o estado guarda o id e n" "0 1 1 0 0 wa-new1 3" "$RC $(calls '^-C /rig create wa-mutants do lastro: 3 mutante.* -t task -p 3 --stdin --json -l origem:lastro-wa-mutants -l area:testes$' bd.calls) $(calls 'create' bd.calls) $(calls 'ctx:ready' bd.calls) $(calls 'exec:auto' bd.calls) $(state bead newfail-wa-mutants.json) $(state n newfail-wa-mutants.json)"
+  check "newfail[wam]: lista nova → UMA bead (create no rig /rig, task, P3, stdin, json e SÓ as três labels da fonte, a do gate (teste:endurece-mutantes) incluída: nada de ctx:ready/exec:auto, que o watchdog de rota entregaria ao pool de dogs) e o estado guarda o id e n" "0 1 1 0 0 wa-new1 3" "$RC $(calls '^-C /rig create wa-mutants do lastro: 3 mutante.* -t task -p 3 --stdin --json -l origem:lastro-wa-mutants -l area:testes -l teste:endurece-mutantes$' bd.calls) $(calls 'create' bd.calls) $(calls 'ctx:ready' bd.calls) $(calls 'exec:auto' bd.calls) $(state bead newfail-wa-mutants.json) $(state n newfail-wa-mutants.json)"
   check "newfail[wam]: as fontes não dividem estado: nem o newfail.json do wa-suite nem o do hq-mutants nasceram" "ausente ausente" "$(state fp newfail.json) $(state fp newfail-hq-mutants.json)"
   check "newfail[wam]: o corpo agrupa por arquivo, com linha, troca, id e testes de cada sobrevivente; o alvo sem sobrevivente não aparece" "1 1 1 0" "$(grep -c '^ARQUIVO lib/a.py (2)$' "$W/bd.stdin.1") $(grep -c '^ARQUIVO daemons/b.py (1)$' "$W/bd.stdin.1") $(grep -c '^  L10 \[cmp\] == -> !=  id=w000  (testes: tests/test_a.py)$' "$W/bd.stdin.1") $(grep -c 'lib/c.py' "$W/bd.stdin.1")"
   check "newfail[wam]: o corpo fala do código do WA (lib/, daemons/), diz que não é dado de lead, avisa que a linha pode estar velha e que a bead só muda a cada 6 h" "1 1 1 1" "$(grep -c 'código do WA (lib/, daemons/)' "$W/bd.stdin.1") $(grep -c 'Não é lead nem dado de cliente' "$W/bd.stdin.1") $(grep -c 'pode estar velha' "$W/bd.stdin.1") $(grep -c 'no máximo a cada 6 h' "$W/bd.stdin.1")"
@@ -451,7 +452,7 @@ a criação não grava o estado (a próxima volta não sabe da bead)@@    save_s
 o comentário da lista nova não grava o estado (repete a cada volta)@@        save_state_or_die(fp, bead, len(items), "comentei a lista nova em %s" % bead, "a próxima volta repete o comentário")@@        pass
 o comentário 'corrigidas' não grava o estado (repete a cada volta)@@            save_state_or_die(fp, bead, 0, "comentei em %s que a lista zerou" % bead, "a próxima volta repete o comentário")@@            pass
 lista que zera não comenta@@        if bead and last_n:@@        if False:
-a fonte hq-mutants usa a label do wa-suite@@labels=("origem:lastro-hq-mutants", "area:testes")@@labels=("origem:lastro-wa-suite", "area:testes")
+a fonte hq-mutants usa a label do wa-suite@@labels=("origem:lastro-hq-mutants", "area:testes", ROTULO_MUTANTES)@@labels=("origem:lastro-wa-suite", "area:testes", ROTULO_MUTANTES)
 a fonte hq-mutants divide o estado com o wa-suite@@estado="newfail-hq-mutants.json"@@estado="newfail.json"
 a fonte hq-mutants pede ao nó o arquivo do wa-suite@@arquivo="hq-mutants.state.json"@@arquivo="wa-suite.confirmed"
 a fonte hq-mutants abre a bead no rig do WA@@rig=os.environ.get("HB_HQ_RIG") or CITY@@rig=os.environ.get("HB_WA_RIG") or CITY
@@ -479,9 +480,16 @@ o corpo esquece o id do sobrevivente@@r.get("new", "").replace("\n", "\\n"), sid
 fonte que não conheço cai na padrão (wa-suite)@@    die(2, "uso: hetzner-ballast-newfail.py [--fonte %s]" % "|".join(sorted(FONTES)))@@    return "wa-suite"
 nome de fonte desconhecido dá traceback em vez de rc 2@@    if len(argv) == 2 and argv[0] == "--fonte" and argv[1] in FONTES:@@    if len(argv) == 2 and argv[0] == "--fonte":
 sem argumento a fonte padrão passa a ser hq-mutants@@        return "wa-suite"@@        return "hq-mutants"
-a bead do wa-mutants nasce com ctx:ready e exec:auto (o watchdog de rota a entrega ao pool de dogs)@@labels=("origem:lastro-wa-mutants", "area:testes")@@labels=("origem:lastro-wa-mutants", "area:testes", "ctx:ready", "exec:auto")
-a fonte wa-mutants usa a label do wa-suite@@labels=("origem:lastro-wa-mutants", "area:testes")@@labels=("origem:lastro-wa-suite", "area:testes")
-a fonte wa-mutants usa a label do hq-mutants@@labels=("origem:lastro-wa-mutants", "area:testes")@@labels=("origem:lastro-hq-mutants", "area:testes")
+a bead do wa-mutants nasce com ctx:ready e exec:auto (o watchdog de rota a entrega ao pool de dogs)@@labels=("origem:lastro-wa-mutants", "area:testes", ROTULO_MUTANTES)@@labels=("origem:lastro-wa-mutants", "area:testes", ROTULO_MUTANTES, "ctx:ready", "exec:auto")
+a fonte wa-mutants usa a label do wa-suite@@labels=("origem:lastro-wa-mutants", "area:testes", ROTULO_MUTANTES)@@labels=("origem:lastro-wa-suite", "area:testes", ROTULO_MUTANTES)
+a fonte wa-mutants usa a label do hq-mutants@@labels=("origem:lastro-wa-mutants", "area:testes", ROTULO_MUTANTES)@@labels=("origem:lastro-hq-mutants", "area:testes", ROTULO_MUTANTES)
+a fonte hq-mutants perde o rótulo do gate (a fatia nasce sem teste:endurece-mutantes e o Mayor volta a receber pedido)@@labels=("origem:lastro-hq-mutants", "area:testes", ROTULO_MUTANTES)@@labels=("origem:lastro-hq-mutants", "area:testes")
+a fonte wa-mutants perde o rótulo do gate@@labels=("origem:lastro-wa-mutants", "area:testes", ROTULO_MUTANTES)@@labels=("origem:lastro-wa-mutants", "area:testes")
+a fonte wa-suite ganha o rótulo do gate (a bead dela é bug, não só-teste)@@labels=("origem:lastro-wa-suite", "area:testes")@@labels=("origem:lastro-wa-suite", "area:testes", ROTULO_MUTANTES)
+o rótulo do gate tem o nome errado (singular)@@ROTULO_MUTANTES = "teste:endurece-mutantes"@@ROTULO_MUTANTES = "teste:endurece-mutante"
+o rótulo do gate vira a chave de listagem do hq-mutants (labels[0] deixa de ser origem:*)@@labels=("origem:lastro-hq-mutants", "area:testes", ROTULO_MUTANTES)@@labels=(ROTULO_MUTANTES, "origem:lastro-hq-mutants", "area:testes")
+o rótulo do gate vira a chave de listagem do wa-mutants (labels[0] deixa de ser origem:*)@@labels=("origem:lastro-wa-mutants", "area:testes", ROTULO_MUTANTES)@@labels=(ROTULO_MUTANTES, "origem:lastro-wa-mutants", "area:testes")
+o rótulo do gate vem antes de area:testes no hq-mutants (a ordem do create muda)@@labels=("origem:lastro-hq-mutants", "area:testes", ROTULO_MUTANTES)@@labels=("origem:lastro-hq-mutants", ROTULO_MUTANTES, "area:testes")
 a fonte wa-mutants divide o estado com o hq-mutants@@estado="newfail-wa-mutants.json"@@estado="newfail-hq-mutants.json"
 a fonte wa-mutants pede ao nó o arquivo do hq-mutants@@arquivo="wa-mutants.state.json"@@arquivo="hq-mutants.state.json"
 a fonte wa-mutants abre a bead no rig do HQ@@rig=os.environ.get("HB_WA_RIG", "/Users/athos/gt/whatsapp_automation"), rig_nome="WA", labels=("origem:lastro-wa-mutants"@@rig=os.environ.get("HB_HQ_RIG") or CITY, rig_nome="WA", labels=("origem:lastro-wa-mutants"

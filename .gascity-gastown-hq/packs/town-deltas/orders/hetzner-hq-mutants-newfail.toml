@@ -2,7 +2,7 @@
 # reprova; o que sobrevive a duas rodadas (a 2ª numa cópia limpa) é teste que não protege aquela linha, e o motor o guarda em ~/gt-remote/ballast/hq-mutants.state.json. Sem esta order ninguém lê esse arquivo e o
 # item seria queima disfarçada: gasta CPU e não produz nada que alguém leia.
 #
-# O QUE FAZ: hetzner-ballast-newfail.py --fonte hq-mutants lê o estado do motor no nó (ssh) e mantém UMA bead no rig do HQ (a cidade; task, P3, labels origem:lastro-hq-mutants e area:testes) com a lista COMPLETA
+# O QUE FAZ: hetzner-ballast-newfail.py --fonte hq-mutants lê o estado do motor no nó (ssh) e mantém UMA bead no rig do HQ (a cidade; task, P3, labels origem:lastro-hq-mutants, area:testes e teste:endurece-mutantes, o rótulo que o gate exige para aceitar bead só-teste de mutantes; as fatias com --parent o herdam) com a lista COMPLETA
 # de sobreviventes (arquivo, linha, troca, id, selftest da família): abre quando a lista é nova, comenta quando ela muda ou zera (lista vazia NÃO é "pegos": o comentário diz quantos alvos o motor não
 # reavaliou, e só com todos julgados por inteiro diz que nenhum sobrevive), abre outra se o dono fechou a anterior E a lista mudou depois. ANTES de abrir lista o rig (label origem:lastro-hq-mutants): se já existe uma nossa não fechada, comenta nela em vez de abrir outra.
 # Ler o nó ou o estado local que falha = exit 3 e NADA é aberto; o nó desligado (falta .gc/hetzner-node.on) = não faz nada. Estado local: .gc/hetzner-ballast/newfail-hq-mutants.json (o do wa-suite é outro arquivo).

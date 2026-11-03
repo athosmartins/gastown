@@ -10,9 +10,9 @@ PARA QUE SERVE
 FONTES (`--fonte NOME`; sem o argumento é wa-suite; as fontes não dividem estado, label nem bead)
   wa-suite    lê wa-suite.confirmed, bead no rig do WA (label origem:lastro-wa-suite), bug P2, estado newfail.json.
   hq-mutants  lê hq-mutants.state.json (o estado do motor hq-mutate.py: de cada alvo, `survivors` = os mutantes que NENHUM selftest da família pegou, confirmados por uma 2ª rodada numa cópia limpa), bead no rig do HQ
-              (a cidade; label origem:lastro-hq-mutants), task P3, estado newfail-hq-mutants.json. A lista é a do ÚLTIMO rodízio: o id sai quando o motor varre o alvo de novo e o mutante morre (ou deixa de existir); alvo apagado ou ainda não varrido de novo mantém a linha (pode estar velha).
+              (a cidade; labels origem:lastro-hq-mutants, area:testes e teste:endurece-mutantes), task P3, estado newfail-hq-mutants.json. A lista é a do ÚLTIMO rodízio: o id sai quando o motor varre o alvo de novo e o mutante morre (ou deixa de existir); alvo apagado ou ainda não varrido de novo mantém a linha (pode estar velha).
               Lista que ZERA não é 'pegos': alvo sem sobrevivente também é alvo que o motor NÃO reavaliou (base vermelha, scanner perdido, prazo, estado novo). O comentário diz quantos alvos não foram julgados por inteiro e quais.
-  wa-mutants  lê wa-mutants.state.json (o MESMO formato do hq-mutants, escrito pelo hq-mutate-wa.py sobre lib/ e daemons/ do WA), bead no rig do WA (label origem:lastro-wa-mutants), task P3, estado newfail-wa-mutants.json. SEM ctx:ready, SEM exec:auto e sem rota: o pilot-missing-route-watchdog manda para o pool de dogs a bead que tem as duas (foi o que aconteceu com a ga-iu0fvlo), e quem triagem decide. É UMA bead rolante: a lista muda, a bead é atualizada por comentário no máximo a cada 6 h, e cada texto (bead ou comentário) tem teto de 40000 bytes: os arquivos com mais sobreviventes vêm primeiro e o que não cabe vira uma linha com a conta (o hq-mutants chegou a 136.952 bytes na ga-iu0fvlo). Lista que ZERA NÃO é 'pegos' e o comentário diz os dois buracos: (1) por motivo, quantos alvos que o motor TEM no estado não foram julgados por inteiro (base vermelha, scanner perdido, 'restam N de M'); (2) que arquivo sem teste da família, com família grande, na denylist ou symlink NUNCA entra no estado do motor (o plano o pula e só o conta no `skipped` do resumo, que esta ponta não lê), então a lista vazia não diz nada sobre ele. O aviso (2) sai também com todos os alvos do estado julgados.
+  wa-mutants  lê wa-mutants.state.json (o MESMO formato do hq-mutants, escrito pelo hq-mutate-wa.py sobre lib/ e daemons/ do WA), bead no rig do WA (labels origem:lastro-wa-mutants, area:testes e teste:endurece-mutantes), task P3, estado newfail-wa-mutants.json. SEM ctx:ready, SEM exec:auto e sem rota: o pilot-missing-route-watchdog manda para o pool de dogs a bead que tem as duas (foi o que aconteceu com a ga-iu0fvlo), e quem triagem decide. É UMA bead rolante: a lista muda, a bead é atualizada por comentário no máximo a cada 6 h, e cada texto (bead ou comentário) tem teto de 40000 bytes: os arquivos com mais sobreviventes vêm primeiro e o que não cabe vira uma linha com a conta (o hq-mutants chegou a 136.952 bytes na ga-iu0fvlo). Lista que ZERA NÃO é 'pegos' e o comentário diz os dois buracos: (1) por motivo, quantos alvos que o motor TEM no estado não foram julgados por inteiro (base vermelha, scanner perdido, 'restam N de M'); (2) que arquivo sem teste da família, com família grande, na denylist ou symlink NUNCA entra no estado do motor (o plano o pula e só o conta no `skipped` do resumo, que esta ponta não lê), então a lista vazia não diz nada sobre ele. O aviso (2) sai também com todos os alvos do estado julgados.
 O QUE LÊ (wa-suite)
   `ssh <nó> cat ~/gt-remote/ballast/wa-suite.confirmed`: {"v": 1, "main": <ponta da rodada>, "items": {<id do teste>: {"from": <ponta antes>, "to": <ponta onde apareceu>, "seen": <ponta que confirmou>}}}.
   É o estado ATUAL (o id fica até o teste passar), então olhar menos vezes que a rodada não perde nada.
@@ -373,16 +373,21 @@ def too_soon(state, gap):
     return 0 <= time.time() - t < gap
 
 
+# Rótulo que o braço B do gate exige na bead-FONTE de um marker só-teste de mutantes (quality-gate-guard.sh: gate_base_test_label_declared, que lê só os labels dessa bead, sem subir ao pai).
+# `bd create --parent` herda os labels do pai (a não ser com --no-inherit-labels), então cada fatia do lastro já nasce com ele se a rolante nascer com ele (ga-02jg1in). wa-suite NÃO leva: a bead dela é bug, não só-teste.
+ROTULO_MUTANTES = "teste:endurece-mutantes"
+
+
 FONTES = {
     "wa-suite": dict(arquivo="wa-suite.confirmed", estado="newfail.json", rig=os.environ.get("HB_WA_RIG", "/Users/athos/gt/whatsapp_automation"), rig_nome="WA", labels=("origem:lastro-wa-suite", "area:testes"),
                      tipo="bug", prio="2", titulo="wa-suite do lastro: %d regressão(ões) confirmada(s) no main", items=items_wa, forma="v 1, items {id: {from, to, seen}}", render=render_wa, coisas="regressões", gen="as",
                      avalia=avalia_wa, zerou=lambda n, nao: "As regressões confirmadas pelo lastro do nó (item wa-suite) foram corrigidas: a lista atual está vazia. Quem corrigiu fecha esta bead."),
-    "hq-mutants": dict(arquivo="hq-mutants.state.json", estado="newfail-hq-mutants.json", rig=os.environ.get("HB_HQ_RIG") or CITY, rig_nome="HQ", labels=("origem:lastro-hq-mutants", "area:testes"),
+    "hq-mutants": dict(arquivo="hq-mutants.state.json", estado="newfail-hq-mutants.json", rig=os.environ.get("HB_HQ_RIG") or CITY, rig_nome="HQ", labels=("origem:lastro-hq-mutants", "area:testes", ROTULO_MUTANTES),
                        tipo="task", prio="3", titulo="hq-mutants do lastro: %d mutante(s) sobrevivente(s) confirmado(s) no main", items=items_hq, forma="v 1, targets {arquivo: {survivors: {id: {file, line, op, old, new}}}}", render=render_hq,
                        coisas="mutantes sobreviventes", gen="os",
                        avalia=avalia_hq, zerou=zerou_hq),
     # sem ctx:ready, exec:auto nem rota: o pilot-missing-route-watchdog reencaminha para o pool de dogs a bead que tem as duas (foi o que aconteceu com a ga-iu0fvlo); quem triagem decide
-    "wa-mutants": dict(arquivo="wa-mutants.state.json", estado="newfail-wa-mutants.json", rig=os.environ.get("HB_WA_RIG", "/Users/athos/gt/whatsapp_automation"), rig_nome="WA", labels=("origem:lastro-wa-mutants", "area:testes"),
+    "wa-mutants": dict(arquivo="wa-mutants.state.json", estado="newfail-wa-mutants.json", rig=os.environ.get("HB_WA_RIG", "/Users/athos/gt/whatsapp_automation"), rig_nome="WA", labels=("origem:lastro-wa-mutants", "area:testes", ROTULO_MUTANTES),
                        tipo="task", prio="3", titulo="wa-mutants do lastro: %d mutante(s) sobrevivente(s) confirmado(s) no main", items=items_hq, forma="v 1, targets {arquivo: {survivors: {id: {file, line, op, old, new}}}}", render=render_wam,
                        coisas="mutantes sobreviventes", gen="os", avalia=avalia_hq, zerou=zerou_wam, gap_s=WAM_GAP_S),
 }
