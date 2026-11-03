@@ -420,14 +420,14 @@ def mark_infeasible(st: dict, email: str, verdict: str, step: str, left, t: floa
 def run_account(st: dict, crew: dict, email: str, reason: str, t: float) -> Tuple[str, str, Optional[dict]]:
     """One attempt and what it leaves in the state: a proof clears the account's tries and mark; a wall marks it; a transient failure counts."""
     a = acct_rec(st, email)
-    v = survey(email, crew, t)
+    v, t0 = survey(email, crew, t), t
     if v["unread"]:                                            # a mark's `left` taken with an item missing from the measure could lift the mark later when nobody logged in by hand
         verdict, step, proof = "skipped", "an item of the account could not be read, so its login is not judged - nothing launched", None
     else:
         rlog("INFO", f"renewing {email} ({reason}): claude auth login in {acct_dir(email)}")
         verdict, step, proof = attempt(email, reason, t)
         t = C.now()                                            # the attempt takes minutes: the marks, tries and pushes are dated when it ENDED
-    left = v["best_left"]
+    left = None if v["best_left"] is None else v["best_left"] - (t - t0)      # as of `at` (the push shows the end of the login to the second)
     a["last"] = {"verdict": verdict, "step": step, "at": t}
     if proof:
         for k in ("tries", "next_at", "infeasible"):
@@ -461,13 +461,15 @@ def disabled() -> Optional[str]:
     if os.environ.get("GC_LOGIN_RENEW") == "0":
         return "GC_LOGIN_RENEW=0"
     c = C.city()
+    if c is None:                                              # falhou: the file switch cannot be looked at (only GC_LOGIN_RENEW=0 can switch it off) - the run goes on, but it SAYS so
+        rlog("WARN", "GC_CITY_PATH is not set: the file switch .gc/no-login-renew cannot be looked at (GC_LOGIN_RENEW=0 still switches the job off)")
     return str(c / ".gc" / "no-login-renew") if c and (c / ".gc" / "no-login-renew").exists() else None
 
 
 def candidates(st: dict, crew: dict, dec, t: float) -> List[Tuple[str, str]]:
     """(email, reason) in the order they should be tried: the forecast by nearest end, then the outage with the pool's pick first."""
     holder = holder_of(crew)
-    surveys = {e: survey(e, crew, t) for e in C.accounts() if acct_dir(e)}
+    surveys = {e: survey(e, crew, t) for e in C.accounts()}      # ALL of them: an account with no config dir (a backup or reserve item) is a login the crew job heals from
     forecast, outage = [], []
     ep = crew.get("no_login")
     in_outage = (isinstance(ep, dict) and isinstance(ep.get("since"), (int, float)) and not isinstance(ep.get("since"), bool)
@@ -477,14 +479,24 @@ def candidates(st: dict, crew: dict, dec, t: float) -> List[Tuple[str, str]]:
     for email, v in surveys.items():
         a = (st.get("accounts") or {}).get(email) or {}
         if v["unread"]:
-            rlog("WARN", f"{email}: an item could not be read - the account is not judged this run")
+            rlog("WARN", f"{email}: an item could not be read - the account is not judged this run" + ("" if acct_dir(email) else " (and whether any account has a login is unknown, so no outage is judged)"))
+            continue
+        if not acct_dir(email):                                # nothing to log into: it only counts as a login that may exist (none_usable above), never as a candidate
             continue
         if email == holder and v["default_full"]:
             rlog("INFO", f"{email} holds the default and it is a full login - not touched (its rotation keeps it alive)")
             continue
-        # vazio (no mark) → candidate; a mark whose recheck_at has come → looked at again; falhou/ilegível (a mark that is no object, or has no recheck_at) → stays marked
-        if "infeasible" in a and not (isinstance(a["infeasible"], dict) and t >= C._num(a["infeasible"].get("recheck_at"), float("inf"))):
-            continue
+        # vazio (no mark) → candidate; a mark whose recheck_at has come → looked at again; falhou/ilegível (a mark that is no object, a recheck_at that is no number) → stays marked, SAID
+        if "infeasible" in a:
+            mk = a["infeasible"]
+            if not isinstance(mk, dict):
+                rlog("WARN", f"{email}: the mark is not an object - the account is not touched until the state is fixed")
+                continue
+            if "recheck_at" in mk and (not isinstance(mk["recheck_at"], (int, float)) or isinstance(mk["recheck_at"], bool)):
+                rlog("WARN", f"{email}: the mark's recheck_at is not a number - the account is not touched until the state is fixed")
+                continue
+            if not t >= C._num(mk.get("recheck_at"), float("inf")):    # a wall with no recheck_at waits for a login by hand; one with a recheck_at waits for it
+                continue
         wait = a.get("next_at", 0.0)
         if not isinstance(wait, (int, float)) or isinstance(wait, bool):
             rlog("WARN", f"{email}: next_at is not a number - the account is not touched until the state is fixed")
@@ -513,7 +525,8 @@ def run_once(email: str) -> int:
         print(f"{email}: the crew state {C.state_path()} is {crew_status}, so whether this account holds the default is unknown - nothing done", file=sys.stderr)
         return 2
     if DRY:
-        print(f"{email}: [dry-run] would renew it now (forced) - nothing launched", file=sys.stderr)
+        skip = survey(email, crew, t)["unread"]
+        print(f"{email}: [dry-run] " + ("would be SKIPPED (exit 2): an item of the account cannot be read, so its login is not judged" if skip else "would renew it now (forced)") + " - nothing launched", file=sys.stderr)
         return 0
     verdict, step, proof = run_account(st, crew, email, "forced", t)
     t = C.now()

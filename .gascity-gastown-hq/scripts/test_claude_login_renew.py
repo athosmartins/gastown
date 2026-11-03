@@ -902,6 +902,41 @@ def test_logins_the_crew_job_has_burned_are_not_usable_so_that_is_an_outage(w):
     assert seen == [(EMAIL["terr"], "outage")]
 
 
+MARTINS_ITEM = "Claude Code-credentials-BACKUP-athosmartins-20261004"                           # athosmartins has no config dir: only a backup item, and the crew job heals from it
+
+
+def test_a_backup_login_of_an_account_with_no_config_dir_means_there_is_no_outage(w):
+    outage(w)                                                                                   # the episode stays open ~10 min after a heal: the heal came from the backup
+    w.put(MARTINS_ITEM, blob("martins-ok"))
+    seen = record(w)
+    assert renew.housekeeping() == 0 and seen == []
+
+
+def test_the_holder_with_no_config_dir_and_a_full_default_login_means_there_is_no_outage(w):
+    outage(w, current=EMAIL["martins"])
+    w.default("martins", blob("martins-ok"))
+    seen = record(w)
+    assert renew.housekeeping() == 0 and seen == []
+
+
+def test_a_backup_item_that_cannot_be_read_is_not_an_outage_and_the_log_says_why(w):
+    outage(w)
+    w.mp.setenv("FAKE_SEC_FAIL", MARTINS_ITEM)
+    seen = record(w)
+    assert renew.housekeeping() == 0 and seen == []
+    assert f"{EMAIL['martins']}: an item could not be read" in w.log() and "no outage is judged" in w.log()
+
+
+def test_a_burned_backup_login_does_not_stop_the_outage_and_the_account_with_no_dir_is_never_tried(w, capsys):
+    w.put(MARTINS_ITEM, blob("martins-ok"))
+    outage(w, burned={fps(blob("martins-ok"))[1]: {"n": crew.BURN_LIMIT}})
+    w.decide("amb")
+    seen = record(w)
+    renew.housekeeping()
+    assert seen == [(EMAIL["amb"], "outage")]
+    assert renew.main(["--dry-run"]) == 0 and EMAIL["martins"] not in capsys.readouterr().err
+
+
 def test_the_forecast_goes_before_the_outage_and_the_dry_run_says_the_whole_order(w, capsys):
     outage(w)
     w.decide("amb")
@@ -961,8 +996,37 @@ def test_a_record_that_cannot_be_read_keeps_the_account_untouched(w, rec):
     assert renew.housekeeping() == 0 and seen == []
     if "next_at" in rec:
         assert "next_at is not a number" in w.log()
+    if rec.get("infeasible") == "yes":
+        assert f"{EMAIL['b85']}: the mark is not an object" in w.log()
+    if isinstance(rec.get("infeasible"), dict) and rec["infeasible"].get("recheck_at") == "later":
+        assert f"{EMAIL['b85']}: the mark's recheck_at is not a number" in w.log()
     if isinstance(rec.get("infeasible"), dict) and "left" not in rec["infeasible"]:
         assert "the mark has no `left`" in w.log()
+
+
+def test_a_wall_waiting_for_a_hand_login_or_its_recheck_is_quiet_in_the_log(w):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    script(w, ("puzzle", "s", None))
+    w.run()
+    w.own("amb", blob("amb-old", rexp_days=3.0))
+    script(w, ("no_google_session", "s", None))
+    w.run("amb")
+    before = w.log()
+    renew.housekeeping()
+    new = w.log()[len(before):]
+    assert "not an object" not in new and "not a number" not in new                                # only a record the job cannot READ is worth a line every 15 minutes
+
+
+def test_the_mark_dates_the_end_of_the_login_as_of_the_moment_it_was_marked_not_the_moment_the_attempt_began(w):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+
+    def slow(email, reason, t):
+        w.at(300)                                                                               # the attempt took 5 minutes
+        return "puzzle", "at claude.ai/oauth/authorize", None
+    w.mp.setattr(renew, "attempt", slow)
+    w.run()
+    m = w.mark()
+    assert m["at"] == T0 + 300 and m["at"] + m["left"] == pytest.approx(T0 + 3 * DAY, abs=1)
 
 
 def test_a_mark_stands_and_says_so_while_an_item_of_the_account_cannot_be_read(w):
@@ -976,6 +1040,24 @@ def test_a_mark_stands_and_says_so_while_an_item_of_the_account_cannot_be_read(w
 
 
 # ── controls ──────────────────────────────────────────────────────────────────
+def test_a_forced_dry_run_says_it_would_be_skipped_when_an_item_of_the_account_cannot_be_read(w, capsys):
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    w.mp.setenv("FAKE_SEC_FAIL", crew.reserve_service(EMAIL["b85"]))
+    assert renew.main(["--dry-run", "--account", EMAIL["b85"], "--force"]) == 0
+    err = capsys.readouterr().err
+    assert "would be SKIPPED" in err and "would renew it now" not in err and w.calls("claude") == []
+
+
+def test_without_a_city_the_file_switch_cannot_be_looked_at_and_the_run_says_so_while_the_env_switch_still_works(w, capsys):
+    w.mp.delenv("GC_CITY_PATH")
+    w.own("b85", blob("b85-old", rexp_days=3.0))
+    seen = record(w)
+    assert renew.main([]) == 0 and seen == [(EMAIL["b85"], "forecast")]
+    assert "GC_CITY_PATH is not set: the file switch" in capsys.readouterr().err
+    w.mp.setenv("GC_LOGIN_RENEW", "0")
+    assert renew.main([]) == 0 and seen == [(EMAIL["b85"], "forecast")] and "switched off" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("how", ["file", "env"])
 def test_the_off_switch_stops_the_scheduled_and_the_forced_run_and_putting_it_back_needs_no_reload(w, how, capsys):
     w.own("b85", blob("b85-old", rexp_days=3.0))
