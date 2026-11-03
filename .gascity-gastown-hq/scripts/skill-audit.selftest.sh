@@ -374,8 +374,10 @@ done
 
 # ══ 14. what the hq-mutants sweep found loose (ga-hq1qc5y): the exit codes, the stderr switches, git failing in each way ═══
 # EQUIVALENT, documented: b7c9d8d8cd (`info`'s `return 0` -> `1`: nobody reads info's status and there is no set -e), 0eee0688b9 (`list_city_skills`'s `return 0` -> `1`: it is only
-# ever the command of an assignment), 20adc40c2f (realpath vs the python fallback: both print the physical path), 6c338436aa and 9a09ceee49 (`$ok && exit 0 || exit 1` is the last
+# ever the command of an assignment), 6c338436aa and 9a09ceee49 (`$ok && exit 0 || exit 1` is the last
 # command: falling off the end exits with the status of `$ok`, which is 1 exactly when the explicit exit would have been).
+# 20adc40c2f (`if command -v realpath` -> `if ! command -v realpath`) is equivalent on any PATH that HAS realpath (both branches print the physical path) and is killed by the last scenario,
+# which runs the audit on a PATH without it (ga-r8nsaot).
 scenario "exit codes and the stderr switches"
 rc=0; "$AUDIT" --help >/dev/null 2>&1 || rc=$?
 [[ "$rc" == 0 ]] && ok "--help exits 0" || bad "--help exited $rc"
@@ -404,6 +406,20 @@ for f in none inside toplevel status clean; do
     else [[ "$n" -ge 1 ]] && ok "git ($f) fails but prints what a healthy run prints: flagged, not accepted" || bad "git ($f) failing was read as clean and merged: offpath_count=$n"; fi
 done
 rm -rf "$ROOT" "$GSTUB"
+
+# realpath_of has a fallback for hosts without realpath (older macOS): on every other PATH the first branch answers and the fallback never runs. This PATH holds a link for every executable of
+# the current one EXCEPT realpath; with the fallback gone (or the test inverted) every symlinked consumer reads as dangling, and the clean fixture stops being clean.
+scenario "realpath missing from PATH: the python fallback still resolves the consumer symlinks"
+NORP="$(mktemp -d)"; _oldifs="$IFS"; IFS=:
+for _d in $PATH; do [[ -d "$_d" ]] && ln -s "$_d"/* "$NORP"/ 2>/dev/null; done
+IFS="$_oldifs"; rm -f "$NORP/realpath"
+[[ -z "$( PATH="$NORP"; command -v realpath )" && -n "$( PATH="$NORP"; command -v python3 )" ]] && ok "control: that PATH has python3 and no realpath" || bad "control: the no-realpath PATH is not what it should be"
+ROOT="$(mktemp -d)"; make_fixture "$ROOT"; write_manifest "$ROOT/city"
+OUT="$(PATH="$NORP" run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
+RC=$?
+note "json: $OUT"
+[[ "$(json_field "$OUT" drift_count)" == "0" && "$(json_field "$OUT" offpath_count)" == "0" && "$RC" == "0" ]] && ok "clean fixture stays clean (drift=0, offpath=0, exit 0) through the python fallback" || bad "without realpath the clean fixture is not clean: rc=$RC json=$OUT"
+rm -rf "$ROOT" "$NORP"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo
