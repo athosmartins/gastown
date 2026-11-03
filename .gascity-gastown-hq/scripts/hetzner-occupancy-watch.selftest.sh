@@ -6,11 +6,14 @@
 #
 # CASOS (grupos, na ordem): cfg (configuração em vigor, plist, gramática do Python 3.9) · sess (sessões remotas: 3 estados, MBP fora) · cpu (/proc/stat por ssh: baseline, janela, recuo de contador,
 #   ssh que cai ou trava) · fila (arquivo do Pilot: ausente/velho/futuro/ilegível NÃO é zero; lojas) · estado (ocupado / ocioso / desconhecido: a tabela inteira) · alarme (sequência de 30 min, jitter, cooldown,
-#   mail que falha, modo foco, chave de ligar, vigia cego) · baixa (aviso de CPU baixa, ga-2hd02v.6: CPU média < 85 % por 30 min, sem olhar fila, sessão nem foco; vigia cego para a CPU; o número por dia é a média de CPU) · saida (JSONL, número por dia, arquivos corrompidos, --dry-run, instância única, crash e falha de gravação, nada fora de .gc).
+#   mail que falha, modo foco, chave de ligar, vigia cego) · baixa (aviso de CPU baixa, ga-2hd02v.6: CPU média < 85 % por 30 min, sem olhar fila, sessão nem foco; vigia cego para a CPU; o número por dia é a média de CPU) · saida (JSONL, número por dia, arquivos corrompidos, --dry-run, instância única, crash e falha de gravação, nada fora de .gc) · lastro (rodízio de 03/11, ga-59jrj3d: as funções puras no valor exato, importadas como módulo, e o formato dos arquivos que o vigia grava; roda sozinho em ~5 s: `lastro`).
 # CONTROLE NEGATIVO: cada mutante (um trecho literal do script trocado, que tem de existir UMA vez) TEM de reprovar o grupo que o pega; mutante que passa = teste que não pega o bug. Só roda sem argumento e com o script de verdade.
 #   Cada mutante roda em segundo plano com o PRÓPRIO diretório temporário e para no 1º caso que reprova (o resto do grupo não diz nada de novo): sem isso eram ~80 grupos inteiros em série, mais de 10 min.
 #   EQUIVALENTE (ga-u6ueg0q): `universal_newlines=True` no Popen de run_cmd não tem caso que o separe do False: com `errors="replace"` o subprocess já abre os canais em texto e traduz a quebra de linha,
-#   então as duas formas devolvem a mesma saída.
+#   então as duas formas devolvem a mesma saída (id 06d87b11fa).
+#   EQUIVALENTES do rodízio de 03/11 (ga-59jrj3d, lidos no código; o (a) também por diferencial: 60000 blocos aleatórios contra cada um dos 2 mutantes, 0 divergências): (a) parse_stat, `lines[i + 1:lines.index(END, i + 1)]` com `i + 0` (ids 4fac5408e3 e c2c527c4eb): o corpo passa a incluir a linha
+#   do marcador BEGIN, que não começa por `cpu` e é ignorada, e `lines.index(END, i)` acha o mesmo END porque a linha i é o BEGIN; (b) `ensure_ascii=False` -> `True` nas duas gravações do ESTADO (ids f7961235bf e c91b413c99): o `new_st` só tem chaves fixas em ASCII e valores
+#   inteiros, decimais ou null (o baseline passa por `_baseline_ok`), então o JSON sai igual; nas gravações do diário e do JSONL, que carregam texto de fora, o `ensure_ascii` é coberto no grupo lastro.
 # COMO RODAR: hetzner-occupancy-watch.selftest.sh [grupo ...]   (sem argumento: todos os grupos e o controle negativo). HETZNER_OCC_UNDER_TEST=<script> roda a suíte contra outra cópia.
 #   HOCC_JOBS=N mutantes ao mesmo tempo (padrão 4; 1 = em série) · HOCC_NO_MUTANTS=1 pula o controle negativo (290 dos 370 casos, ~40 s no Linux) · HOCC_SLOW_START=N faz o python do vigia levar N s para subir, como o mini sob carga (com HOCC_NO_MUTANTS=1).
 #   Tudo: ~140 s no Linux; no mini, sob carga, a fatia 1 sozinha (238 verificações; hoje são 370) levou ~7 min (medido pelo gate em 19/10). RELÓGIO: nenhum caso mede o tempo de parede do vigia (no mini sob carga só subir o python já passou de 1 s, 19/10): a ordem das duas instâncias é por EVENTO (await) e o único prazo, o do run_cmd, é medido dentro do python.
@@ -70,6 +73,7 @@ case "${args[0]:-} ${args[1]:-}" in
     printf '%s' "$to" > "$STUB_DIR/mail.$c.to"; printf '%s' "$subj" > "$STUB_DIR/mail.$c.subj"; printf '%s' "$body" > "$STUB_DIR/mail.$c.body"
     echo "${STUB_MAIL_RC:-0}" > "$STUB_DIR/mail.$c.rc"
     [ -n "${STUB_STATE_FILE:-}" ] && [ -f "$STUB_STATE_FILE" ] && cp "$STUB_STATE_FILE" "$STUB_DIR/mail.$c.state"
+    [ -n "${STUB_MAIL_SABOTAGE:-}" ] && [ -n "${STUB_STATE_FILE:-}" ] && { rm -f "$STUB_STATE_FILE"; mkdir "$STUB_STATE_FILE"; }   # $STUB_MAIL_SABOTAGE: o arquivo de estado vira PASTA entre a gravação e o fim do mail (qualquer gravação nova nele falha)
     exit "${STUB_MAIL_RC:-0}" ;;
   *) echo "FORBIDDEN gc $*" >> "$STUB_DIR/forbidden.calls"; exit 99 ;;
 esac
@@ -867,6 +871,277 @@ g_saida() {
 }
 
 # ============================================================================================================================================================================
+# lastro hq-mutants (ga-59jrj3d): o que o rodízio de 03/11 achou vivo. Duas metades: um programa Python que IMPORTA o vigia e confere as funções puras no valor exato (configuração e seus pisos, prazo da morte do processo, cópia do arquivo corrompido,
+# /proc/stat, baseline, fila, foco, sequência de CPU baixa, migração do diário, texto dos três e-mails) e casos de ponta a ponta (formato dos arquivos que o vigia grava, estado editado à mão, contas que só o estado de ontem mostra).
+g_lastro() {
+  local l dj sj
+  echo "--- lastro: funções puras no valor exato (o vigia importado como módulo)"
+  mkdir -p "$T/lastro"
+  cat > "$T/lastro.py" <<'PY'
+import contextlib, importlib.util, io, json, os, sys, time
+sys.dont_write_bytecode = True
+sys.stdout.reconfigure(encoding="utf-8")
+spec = importlib.util.spec_from_file_location("hoc_watch", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+WORK = sys.argv[2]
+EXPECT = 53
+ran = [0]
+
+
+def chk(name, got, want):
+    ran[0] += 1
+    try:
+        g = got() if callable(got) else got
+    except Exception as e:   # uma exceção é o caso reprovado, não o fim do programa
+        print("FAIL %s :: levantou %s: %s" % (name, type(e).__name__, e))
+        return
+    print("ok %s" % name if g == want else "FAIL %s :: obtido=%r esperado=%r" % (name, g, want))
+
+
+# ---- configuração: o padrão, o piso que vale e o logo abaixo que é recusado ----------------------------------------------------------------
+def cfg(**kw):
+    env = {"GC_CITY_PATH": WORK + "/city", "HOME": WORK + "/home"}
+    env.update(kw)
+    return m.load_config(env)
+
+
+def rejects(**kw):
+    try:
+        cfg(**kw)
+    except ValueError:
+        return True
+    return False
+
+
+for key, attr, dflt, lo in (("HETZNER_OCC_INTERVAL_S", "interval_s", 900, 60), ("HETZNER_OCC_IDLE_AFTER_S", "idle_after_s", 1800, 60), ("HETZNER_OCC_BLIND_AFTER_S", "blind_after_s", 3600, 60),
+                            ("HETZNER_OCC_IDLE_COOLDOWN_S", "idle_cooldown_s", 10800, 0), ("HETZNER_OCC_BLIND_COOLDOWN_S", "blind_cooldown_s", 21600, 0),
+                            ("HETZNER_OCC_LOW_AFTER_S", "low_after_s", 1800, 60), ("HETZNER_OCC_LOW_COOLDOWN_S", "low_cooldown_s", 10800, 0),
+                            ("HETZNER_OCC_SSH_TIMEOUT_S", "ssh_timeout_s", 30, 1), ("HETZNER_OCC_GC_TIMEOUT_S", "gc_timeout_s", 60, 1),
+                            ("HETZNER_OCC_BD_TIMEOUT_S", "bd_timeout_s", 60, 1), ("GATE_FOCUS_STALE_S", "focus_stale_s", 7200, 1)):
+    chk("cfg %s: o padrão é %d, o piso %d vale e %d é recusado" % (key, dflt, lo, lo - 1),
+        lambda key=key, attr=attr, lo=lo: (getattr(cfg(), attr), getattr(cfg(**{key: str(lo)}), attr), rejects(**{key: str(lo - 1)})), (dflt, lo, True))
+chk("cfg: STORES vazio é recusado, OTHER_HOSTS vazio vale 'nenhum' e os padrões são hq e mbp",
+    lambda: (rejects(HETZNER_OCC_STORES=""), rejects(HETZNER_OCC_STORES=" , "), cfg(HETZNER_OCC_OTHER_HOSTS="").other_hosts, cfg().other_hosts, cfg().stores), (True, True, [], ["mbp"], ["hq"]))
+chk("cfg: a folga do launchd é 120 s e a tolerância de relógio da fila é 60 s", lambda: (cfg().slack_s, cfg().future_tol_s), (120, 60))
+chk("cfg: o arquivo do Pilot vem do HOME do ambiente; sem HOME no ambiente, do ~ do processo",
+    lambda: (cfg().pilot_file, m.load_config({"GC_CITY_PATH": WORK + "/city"}).pilot_file),
+    (WORK + "/home/.gc/pilot-dispatchable.json", os.path.join(os.path.expanduser("~"), ".gc", "pilot-dispatchable.json")))
+
+
+# ---- processos e arquivos ---------------------------------------------------------------------------------------------------------------------
+class FakeProc:
+    pid = 424242
+
+    def communicate(self, timeout=None):
+        waits.append(timeout)
+        if len(waits) == 1:
+            raise m.subprocess.TimeoutExpired("fake", timeout)
+        return "", ""
+
+
+waits = []
+real_popen, real_killpg, real_run = m.subprocess.Popen, m.os.killpg, m.run_cmd
+m.subprocess.Popen, m.os.killpg = (lambda *a, **k: FakeProc()), (lambda pid, sig: None)
+try:
+    got = m.run_cmd(["fake"], 7)
+except Exception as e:
+    got = "levantou %s: %s" % (type(e).__name__, e)
+finally:
+    m.subprocess.Popen, m.os.killpg = real_popen, real_killpg
+chk("run_cmd: prazo estourado devolve (None, '', '', 'timeout') e, depois de matar, espera 5 s o que sobrou", (got, waits), ((None, "", "", "timeout"), [7, 5]))
+chk("_oneline: junta os espaços, corta em 160 e aceita None", (len(m._oneline("x " * 400)), m._oneline("  a \n b\t c  "), m._oneline(None)), (160, "a b c", ""))
+dj = WORK + "/daily.json"
+
+
+def corrupto(dry):
+    with open(dj, "w") as fh:
+        fh.write("lixo{")
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            r = m.load_json(dj, lambda o: isinstance(o, dict), 1000, dry)
+    except Exception as e:
+        r = "levantou %s: %s" % (type(e).__name__, e)
+    return r, err.getvalue()
+
+
+r1, e1 = corrupto(False)
+chk("load_json: arquivo corrompido vira <arquivo>.corrupt-<epoch> e o original sai do lugar", (r1, os.path.exists(dj + ".corrupt-1000"), os.path.exists(dj)), (None, True, False))
+chk("load_json: o aviso diz que a cópia FICOU em <arquivo>.corrupt-1000", ("a cópia ficou em " + dj + ".corrupt-1000" in e1, "--dry-run" in e1), (True, False))
+r2, e2 = corrupto(True)
+chk("load_json --dry-run com o nome já usado: diz que a cópia IRIA para .corrupt-<epoch>-2 e não move nada", (r2, "(--dry-run) a cópia iria para " + dj + ".corrupt-1000-2" in e2, "ficou em" in e2, os.path.exists(dj)), (None, True, False, True))
+r3, e3 = corrupto(False)
+chk("load_json: nome já usado vira .corrupt-<epoch>-2 (o 2, não o 1)", (os.path.exists(dj + ".corrupt-1000-2"), os.path.exists(dj + ".corrupt-1000-1")), (True, False))
+
+# ---- /proc/stat, baseline e a janela de CPU -------------------------------------------------------------------------------------------------
+B, E = m.BEGIN, m.END
+blk = "\n".join(["ruído do .bashrc", B, "cpu  10 0 5 80 3 1 2 4 0 0", "cpu0 1 0 0 1 0 0 0 0 0 0", "", "intr 5 6 7", "cpu1 1 0 0 1 0 0 0 0 0 0", "  ", "ctxt 9", E, "depois"])
+chk("parse_stat: linha vazia e linha que não é cpuN dentro do bloco não contam como núcleo", lambda: m.parse_stat(blk), ((18, 105, 2), None))
+for nome, b, want in (("válido", {"epoch": 1, "busy": 2, "total": 3}, True), ("zeros valem", {"epoch": 0, "busy": 0, "total": 0}, True), ("falta o total", {"epoch": 1, "busy": 2}, False),
+                      ("valor booleano", {"epoch": 1, "busy": True, "total": 3}, False), ("valor negativo", {"epoch": 1, "busy": -2, "total": 3}, False),
+                      ("valor decimal", {"epoch": 1, "busy": 2.5, "total": 3}, False), ("valor em texto", {"epoch": 1, "busy": "2", "total": 3}, False),
+                      ("None", None, False), ("lista", [1, 2, 3], False)):
+    chk("_baseline_ok: %s" % nome, lambda b=b: m._baseline_ok(b), want)
+def lido():
+    m.run_cmd = lambda argv, t: (0, "\n".join([B, "cpu  1 0 0 6 0 0 0 0 0 0", "cpu0 0 0 0 0 0 0 0 0 0 0", E]), "", None)
+    try:
+        cpu, nb, cores = m.read_cpu(cfg(), {"epoch": 1000, "busy": 0, "total": 0}, 1900)
+    finally:
+        m.run_cmd = real_run
+    return cpu["lido"], cpu["nucleos"], cpu["pct"], cpu["janela_s"], nb, cores
+
+
+chk("read_cpu: 1/7 de núcleo em 900 s sai como 0.14 núcleo (2 casas), 14.3 % e o novo baseline", lido, (True, 0.14, 14.3, 900, {"epoch": 1900, "busy": 1, "total": 7}, 1 / 7))
+
+# ---- fila do Pilot e foco do gate -------------------------------------------------------------------------------------------------------------
+qf, T0 = WORK + "/pilot.json", 1_700_000_000
+
+
+def fila(gen, n_hq):
+    its = [{"id": "ga-%d" % i, "store": "hq"} for i in range(n_hq)] + [{"id": "wa-9", "store": "whatsapp_automation"}]
+    with open(qf, "w") as fh:
+        json.dump({"generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(gen)), "ttl_seconds": 1800, "items": its}, fh)
+    return m.read_queue(cfg(HETZNER_OCC_PILOT_FILE=qf), T0)
+
+
+chk("read_queue: 7 elegíveis dão n = 7 e só os 5 primeiros ids", lambda: [(r["lido"], r["n"], r["ids"]) for r in [fila(T0 - 10, 7)]][0], (True, 7, ["ga-0", "ga-1", "ga-2", "ga-3", "ga-4"]))
+chk("read_queue: gerada 60 s no futuro (a tolerância) ainda vale; 61 s é 'no-futuro'", lambda: (fila(T0 + 60, 1)["lido"], fila(T0 + 61, 1)["motivo"]), (True, "no-futuro"))
+cf = cfg()
+os.makedirs(cf.gc_dir, exist_ok=True)
+with open(os.path.join(cf.gc_dir, "gate-focus.state"), "w") as fh:
+    fh.write("active=1\nat=%d\nactive=0\nat=1\nsem igual\n" % T0)
+chk("read_focus: chave repetida vale a 1ª (ligado) e linha sem '=' não vira chave", lambda: m.read_focus(cf, T0), "ligado")
+
+# ---- números do estado, sequência de CPU baixa e diário ---------------------------------------------------------------------------------------
+chk("_int: 0 vale (>= 0); negativo, bool, texto e decimal vão para o padrão", (m._int(0, 9), m._int(5), m._int(-1, 9), m._int(True, 9), m._int("3", 9), m._int(2.0, 9), m._int(None)), (0, 5, 9, 9, 9, 9, None))
+chk("_flt: 0 vale (>= 0); negativo, bool, infinito, NaN e texto vão para o padrão; inteiro vira decimal",
+    (m._flt(0, 9.0), m._flt(0.5), m._flt(3), m._flt(-0.1, 9.0), m._flt(True, 9.0), m._flt(float("inf"), 9.0), m._flt(float("nan"), 9.0), m._flt("1", 9.0), m._flt(None)),
+    (0.0, 0.5, 3.0, 9.0, 9.0, 9.0, 9.0, 9.0, None))
+cpu = {"lido": True, "pct": 10.0, "janela_s": 900, "ncpu": 16}
+win_n, win_c = 1.6 * 900, 16 * 900
+novo = {"n": 1, "desde": T0 - 900, "nucleos_s": win_n, "cap_s": win_c}
+resto = {"baixa_desde": T0 - 5000, "baixa_nucleos_s": 7.0, "baixa_capacidade_s": 70.0}
+chk("low_streak: estado sem baixas_seguidas recomeça a sequência (n = 1, desde = o início desta janela)", lambda: m.low_streak(cfg(), dict(resto), cpu, 1.6, T0), novo)
+chk("low_streak: baixas_seguidas = 0 também recomeça; com 2 continua (n + 1, desde antigo, acumuladores somados)",
+    lambda: (m.low_streak(cfg(), dict(resto, baixas_seguidas=0), cpu, 1.6, T0), m.low_streak(cfg(), dict(resto, baixas_seguidas=2), cpu, 1.6, T0)),
+    (novo, {"n": 3, "desde": T0 - 5000, "nucleos_s": 7.0 + win_n, "cap_s": 70.0 + win_c}))
+dias = {"dias": {"2026-10-01": {"ocupado": 3}, "2026-10-02": {"ocupacao_pct": 80.0}, "2026-10-03": {"ocupacao_pct": 50.0, "ocupacao_sessao_pct": 70.0},
+                 "2026-10-04": {"cpu_janelas": 2, "ocupacao_pct": 12.0}, "2026-10-05": "não é um dia"}}
+cpu0 = {"ocupacao_pct": None, "cpu_janelas": 0, "cpu_nucleos_s": 0.0, "cpu_capacidade_s": 0}
+chk("migrate_daily: não levanta com dia sem número nenhum nem com dia que não é objeto", lambda: m.migrate_daily(dias), None)
+chk("migrate_daily: dia sem número nenhum só ganha os campos de CPU", dias["dias"]["2026-10-01"], dict(cpu0, ocupado=3))
+chk("migrate_daily: o ocupacao_pct antigo vira ocupacao_sessao_pct e o de CPU fica null", dias["dias"]["2026-10-02"], dict(cpu0, ocupacao_sessao_pct=80.0))
+chk("migrate_daily: quem já tem ocupacao_sessao_pct a mantém", dias["dias"]["2026-10-03"], dict(cpu0, ocupacao_sessao_pct=70.0))
+chk("migrate_daily: dia que já tem cpu_janelas não muda", (dias["dias"]["2026-10-04"], dias["dias"]["2026-10-05"]), ({"cpu_janelas": 2, "ocupacao_pct": 12.0}, "não é um dia"))
+
+# ---- o texto dos três e-mails e o prazo do gc mail send --------------------------------------------------------------------------------------
+cm = cfg()
+RD = {"epoch": T0, "foco": "desligado", "ociosas_seguidas": 3, "cegas_seguidas": 5, "cpu_cegas_seguidas": 4,
+      "fila": {"lido": True, "n": 4, "ids": ["ga-1", "ga-2"], "motivo": None}, "sessoes": {"ativas": 2, "ocupadas": 0, "motivo": None},
+      "cpu": {"nucleos": 0.3, "ncpu": 16, "janela_s": 900, "pct": 1.9, "motivo": None}}
+
+
+def rd(foco="desligado", sess_motivo=None, sess_det=None, cpu_det=None, fila_motivo=None):
+    r = json.loads(json.dumps(RD))
+    r["foco"], r["sessoes"]["motivo"], r["fila"]["motivo"] = foco, sess_motivo, fila_motivo
+    if sess_det is not None:
+        r["sessoes"]["detalhe"] = sess_det
+    if cpu_det is not None:
+        r["cpu"]["detalhe"] = cpu_det
+    return r
+
+
+def lin(b, p):
+    return [x for x in b.split("\n") if x.startswith(p)]
+
+
+def corpo(fn, *a):
+    try:
+        return fn(*a)[1]
+    except Exception as e:
+        return "levantou %s: %s" % (type(e).__name__, e)
+
+
+LOW = {"desde": T0 - 1800, "n": 2, "nucleos_s": 100.0, "cap_s": 200.0}
+b = corpo(m.idle_mail, cm, rd("desconhecido"), 1800)
+chk("idle_mail: foco desconhecido sai como 'desconhecido (tratado como desligado)'", "• foco do gate: desconhecido (tratado como desligado)\n" in b, True)
+chk("idle_mail: o cooldown de 10800 s sai como 'no mínimo 3 h'", "Próximo aviso deste tipo em no mínimo 3 h. " in b, True)
+b = corpo(m.idle_mail, cm, rd("ligado"), 1800)
+chk("idle_mail: foco ligado sai sem o sufixo", ("• foco do gate: ligado\n" in b, "tratado" in b), (True, False))
+b = corpo(m.low_mail, cm, rd("desconhecido"), LOW)
+chk("low_mail: foco desconhecido sai como 'tratado como desligado' e o cooldown como 'no mínimo 3 h'", ("foco do gate: desconhecido (tratado como desligado)" in b, "em no mínimo 3 h. " in b), (True, True))
+b = corpo(m.low_mail, cm, rd("desligado"), LOW)
+chk("low_mail: foco desligado sai sem o sufixo", ("foco do gate: desligado" in b, "tratado" in b), (True, False))
+b = corpo(m.blind_mail, cm, rd(sess_motivo="gc-falhou", sess_det="boom", cpu_det="x", fila_motivo="arquivo-ausente"), 3600)
+chk("blind_mail: a linha de motivos traz o de cada leitura (o da fila também) e o detalhe junta sessão e CPU", (lin(b, "• sessões:"), lin(b, "• detalhe:")),
+    (["• sessões: gc-falhou · CPU: ok · fila: arquivo-ausente"], ["• detalhe: boom x"]))
+b = corpo(m.blind_mail, cm, rd(sess_motivo="gc-falhou"), 3600)
+chk("blind_mail: sem motivo na fila nem detalhe saem 'fila: ok' e '• detalhe: -'", (lin(b, "• sessões:"), lin(b, "• detalhe:")), (["• sessões: gc-falhou · CPU: ok · fila: ok"], ["• detalhe: -"]))
+b = corpo(m.blind_mail, cm, rd(sess_motivo="gc-falhou", sess_det="a" * 300), 3600)
+chk("blind_mail: o detalhe é cortado em 200 caracteres", lin(b, "• detalhe:"), ["• detalhe: " + "a" * 200])
+chk("blind_mail: o cooldown de 21600 s sai como 'no mínimo 6 h'", "em no mínimo 6 h." in b, True)
+seen = []
+m.run_cmd = lambda argv, t: (seen.append(t), (0, "", "", None))[1]
+try:
+    sent = m.send_mail(cm, "assunto", "corpo")
+except Exception as e:
+    sent = "levantou %s: %s" % (type(e).__name__, e)
+finally:
+    m.run_cmd = real_run
+chk("send_mail: o prazo do gc mail send é 45 s", (sent, seen), (True, [45]))
+print("ok o programa rodou até o fim (%d verificações)" % ran[0] if ran[0] == EXPECT else "FAIL o programa rodou %d verificações, esperava %d" % (ran[0], EXPECT))
+PY
+  python3 -I "$T/lastro.py" "$WATCH" "$T/lastro" > "$T/lastro.out" 2>&1
+  while IFS= read -r l; do case "$l" in "ok "*) ok "${l#ok }" ;; *) bad "$l" ;; esac; done < "$T/lastro.out"
+
+  echo "--- lastro: o que o vigia imprime e grava (recuo, ordem das chaves, acento) e as contas que só o estado de ontem mostra"
+  state_set() {   # state_set <chave>=<json> ...: regrava chaves do estado que o vigia deixou (chave sem valor = apaga), como quem o editou à mão
+    python3 -I -c 'import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+for kv in sys.argv[2:]:
+    k, _, v = kv.partition("=")
+    if v == "":
+        d.pop(k, None)
+    else:
+        d[k] = json.loads(v)
+json.dump(d, open(p, "w"))' "$C/.gc/hetzner-occupancy.state.json" "$@"
+  }
+  fresh; W GC_CITY_PATH="$T/çidade" -- --print-config
+  eq "print-config: recuo de 2 espaços e acento sem escape (ensure_ascii=False)" 1 "$(grep -c '^  "city": ".*çidade",$' "$WOUT" | tr -d ' ')"
+  fresh; sessions_are '{"sessions":[{"session_name":"dog-remote-ação","alias":"dog-remote-ação","state":"active"}]}'; beads_are '[{"id":"ga-b1","status":"in_progress","assignee":"dog-remote-ação"}]'
+  dj="$C/.gc/hetzner-occupancy-daily.json"; sj="$C/.gc/hetzner-occupancy.state.json"
+  printf '{"dias":{},"nota":"ação"}' > "$dj"; tick 900 5
+  eq "--print: recuo de 2 espaços e acento sem escape (o nome sai nas duas listas, nomes e nomes_ocupadas)" "1/2" "$(grep -c '^  "estado": "ocupado",$' "$WOUT" | tr -d ' ')/$(grep -c 'dog-remote-ação' "$WOUT" | tr -d ' ')"
+  eq "JSONL: o acento fica como está (ensure_ascii=False)" 1 "$(grep -c '"nomes":\["dog-remote-ação"\]' "$C/.gc/hetzner-occupancy.jsonl" | tr -d ' ')"
+  eq "diário: recuo de 1 espaço, chaves do dia em ordem (a 1ª é cpu_capacidade_s) e o campo extra com acento fica como está" '{| "dias": {|  "2026-10-19": {|   "cpu_capacidade_s": 0,|1' "$(sed -n 1,4p "$dj" | tr '\n' '|')$(grep -c '"nota": "ação"' "$dj" | tr -d ' ')"
+  eq "estado: recuo de 1 espaço, chaves em ordem (a 1ª é alarme_baixa_em) e versao 1" '{| "alarme_baixa_em": null,|1' "$(sed -n 1,2p "$sj" | tr '\n' '|')$(state_f versao)"
+  fresh; tick 900 5 >/dev/null; idle_run 2; STUB_MAIL_RC=1; tick 900 5
+  eq "mail que falha: o estado regravado segue com recuo de 1 espaço e chaves em ordem" '{| "alarme_baixa_em": null,|' "$(sed -n 1,2p "$sj" | tr '\n' '|')"
+  fresh; tick 900 5 >/dev/null; idle_run 2; TENV=(STUB_MAIL_SABOTAGE=1); tick 900 5
+  eq "o arquivo de estado vira pasta durante o mail: sem mail que falhou não há 2ª gravação (rc 0, mail enviado)" "0/enviado" "$RC/$(reading alarme.ocioso)"
+  fresh; tick 900 5 >/dev/null; W -- --dry-run --print
+  eq "--dry-run --print: a leitura traz dry_run = true" true "$(reading dry_run)"
+  fresh_lp; pilot 60 1800 3 0; statfile "$T/stat.txt" 100000 900000 16; STUB_SSH_FILE="$T/stat.txt"; W -- --print
+  NOW=$((NOW + 900)); pilot 60 1800 3 0; statfile "$T/stat.txt" 101000 906000 16; W -- --print
+  eq "baixa: 1000/7000 de 16 núcleos em 900 s = 2057.142... núcleo-s, gravados com 2 casas" 2057.14 "$(state_f baixa_nucleos_s)"
+  fresh; STUB_GC_RC=1; tick 900 5
+  eq "1ª leitura com o gc caindo: já conta 1 leitura cega (a CPU só semeia, mas a sessão não leu)" 1 "$(reading cegas_seguidas)"
+  fresh; tick 900 5 >/dev/null; state_set ociosas_seguidas=; tick 900 5
+  eq "estado sem ociosas_seguidas: a contagem de ocioso recomeça de 0 (a 1ª leitura ociosa é a 1ª)" 1 "$(reading ociosas_seguidas)"
+  fresh; printf '{"versao":1,"cegas_seguidas":0,"decidida_em":%s}' "$((NOW + 900 - 4000))" > "$sj"; tick 900 5
+  eq "aquecimento da CPU (sem baseline) com a última decisão há 66 min: não é leitura cega, nenhum aviso de cego" "nao/0" "$(reading alarme.cego)/$(mails)"
+  fresh; tick 900 5 >/dev/null; state_set cegas_seguidas=0 "decidida_em=$((NOW + 900 - 4000))"; STUB_GC_RC=1; tick 900 5
+  eq "a 1ª leitura cega depois de uma decisão há 66 min já avisa (cegas = 1 basta)" "enviado/1" "$(reading alarme.cego)/$(mails)"
+  fresh; tick 900 5 >/dev/null; printf '{"foo":1}' > "$dj"; tick 900 5
+  eq "diário que é objeto mas sem 'dias': a cópia fica guardada ao lado e o vigia segue (rc 0)" "0/1" "$RC/$(ls "$C/.gc" | grep -c '^hetzner-occupancy-daily.json.corrupt-' | tr -d ' ')"
+  eq "... e o diário novo tem a leitura de agora" 1 "$(jv "$dj" dias.2026-10-19.leituras)"
+  fresh; tick 900 5 >/dev/null; printf '[1,2]' > "$dj"; tick 900 5
+  eq "diário que é uma lista: o mesmo" "0/1" "$RC/$(ls "$C/.gc" | grep -c '^hetzner-occupancy-daily.json.corrupt-' | tr -d ' ')"
+}
+
+# ============================================================================================================================================================================
 # ---- CONTROLE NEGATIVO -----------------------------------------------------------------------------------------------------------------------------------------------------------
 # mutante <nome> <grupos> <trecho> <troca>: troca UM trecho literal do script (tem de aparecer exatamente 1 vez), roda só os grupos que deveriam pegar e exige reprovação. Padrão que não existe = erro.
 # O padrão é conferido aqui, em série; a suíte do mutante roda num subshell em segundo plano (no máximo HOCC_JOBS) e o resultado vai para um arquivo, lido em ordem por mutantes_wait
@@ -1039,7 +1314,7 @@ g_mutantes() {
   mutantes_wait
 }
 
-GROUPS_ALL="cfg sess bead cpu fila estado alarme baixa saida"
+GROUPS_ALL="cfg sess bead cpu fila estado alarme baixa saida lastro"
 run_groups() { local g; for g in "$@"; do "g_$g"; done; }
 
 DEFAULT="$GROUPS_ALL mutantes"; [ -z "${HOCC_NO_MUTANTS:-}" ] || DEFAULT="$GROUPS_ALL"
