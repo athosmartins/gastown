@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.jsonl-export</string>
+
+  <!-- The JSONL export of the Dolt databases (the beads backup, 15 min RPO) run by launchd instead of the gc order (2026-11-03, ga-ki02nmt).
+
+       WHAT: the SAME script, the SAME timeout and the SAME cadence as orders/jsonl-export.toml (exec jsonl-export.sh, timeout 840 s, every 15 min).
+       The order is switched off in the same deploy: city.toml [orders] skip names "jsonl-export" (skip matches by name).
+
+       WHY A LAUNCHD JOB AND NOT THE ORDER: the engine dispatcher serves at most 4 orders per tick (defaultMaxOrderDispatchesPerTick) and 63 order
+       instances ask for ~14.7 runs/min against ~1.16/min served, so every order runs about every 35 min whatever interval it declares
+       (ga-ieo0wz1, measured 03/11 with `gc order history`). The order said 15 min and the archive got a commit every ~73 min. The RPO of the beads
+       must not depend on that cap; a raw launchd StartInterval job does not go through the dispatcher (same reasoning as the -age plist next to it
+       and as the table-age plist).
+
+       WHAT THE ORDER GAVE FOR FREE AND THIS FILE HAS TO GIVE BACK (verified in jsonl-export.sh, not assumed):
+         - the timeout: `timeout -k 20 840` (GNU, /opt/homebrew/bin) = the order's 840 s. The run's work budget is 690 s and the commit after it needs
+           up to 120 s (jsonl-export-budget.selftest.sh holds BUDGET + 120 <= timeout), and 840 s + the 20 s KILL grace stay under the 900 s interval,
+           so a run is over before the next tick. A killed run commits nothing (the one commit sits after the last database), which is why the timeout
+           must not be shorter than the order's. TERM at 840 s runs the script's own trap (it logs `end rc=` to .gc/logs/jsonl-export.log).
+           jsonl-launchd-plists.selftest.sh keeps this plist's timeout equal to the order's and under the interval.
+         - GC_CITY / GC_CITY_PATH / GC_CITY_RUNTIME_DIR, and GC_PACK_STATE_DIR = .gc/runtime/packs/town-deltas: gc sets the state dir of the pack that owns
+           the order, and the state file (jsonl-export-state.json: degraded-table memory, death streak, last-export time that the disk policy reads)
+           lives there. Without it the script falls back to packs/maintenance and starts from a blank state.
+         - the Dolt port: NOT set here on purpose. dolt-target.sh reads it from the runtime state file on every run, so a Dolt restart onto another
+           port does not leave this job pointing at a dead one.
+         - `gc` and `bd` on PATH (the DOG_DONE nudge at the end; /Users/athos/.local/bin has bd) and jq/dolt/git in /opt/homebrew/bin.
+
+       NO LOCK IN THE SCRIPT (it says so in its own header: "there is no single-flight lock"). What stops two runs here: launchd never starts a second
+       instance of the same label, and the order is skipped in the same deploy. What would NOT stop them: the order and this job both live at once
+       (order not skipped, or skip reverted while this is loaded). The cutover order in docs/runbooks/jsonl-launchd-cutover.md is what prevents it.
+
+       DISK POLICY STILL APPLIES (ga-j2f5v5, in the script): below 5 GB free it exports at most once per hour, and at the CRITICAL floor only when the
+       last export is older than 3 h. A tick that is skipped for it prints one line (`skipped-low-disk ...`), so this job's .out still advances.
+
+       ProcessType Interactive: an unset ProcessType is Standard and macOS DAS can defer such a job under load ("pended nondemand spawn = interval",
+       ga-9wv5). The mini lives at load 40-60, which is exactly when the order cadence was lost. RunAtLoad: a bootstrap (install, or the watchdog
+       re-loading an ABSENT job) runs a cycle right away; the disk policy decides whether it really exports.
+
+       WATCHDOG: registered in daemon-presence-watchdog.sh (DPW_CRITICAL + a heartbeat on the StandardOutPath below, limit 2700 s = 3 cycles).
+       The .out gets one line per run that ended with a summary or a skip; a run that fails prints to .err only, and two in a row are a CRASH-LOOP alert.
+       INSTALL: docs/runbooks/jsonl-launchd-cutover.md (copy to ~/Library/LaunchAgents, launchctl bootstrap, after the skip is live). -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/timeout</string>
+    <string>-k</string>
+    <string>20</string>
+    <string>840</string>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/jsonl-export.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
+
+  <key>StandardOutPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/jsonl-export-launchd.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/jsonl-export-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>GC_CITY_RUNTIME_DIR</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq/.gc/runtime</string>
+    <key>GC_PACK_STATE_DIR</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq/.gc/runtime/packs/town-deltas</string>
+  </dict>
+</dict>
+</plist>

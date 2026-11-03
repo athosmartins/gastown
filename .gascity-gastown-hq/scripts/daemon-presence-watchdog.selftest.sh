@@ -14,6 +14,10 @@
 # ga-2hd02v.1.17: the same proof for com.gascity.hetzner-occupancy-watch (last section). That job was installed on the mini with no DPW
 # entry (PRESENCE-DRIFT on every cycle) and this file, which only knew the janitor, could not tell: `wiring` now takes the label as its 3rd
 # argument, and reads StandardOutPath whether the <string> sits on the key's line (the watch's plist) or on the next one (the janitor's).
+#
+# ga-ki02nmt: the same proof for com.gascity.jsonl-export (StartInterval 900) and com.gascity.jsonl-hourly-offsite (1800), the two backup jobs that left
+# the order dispatcher for launchd. `wiring` takes the upper limit of the threshold as a 4th argument (default 3000 s, unchanged for the three jobs above):
+# the offsite's own rule "> 2x StartInterval" already means > 3600 s, so a 3000 s cap could never pass it; its cap is 6000 s (3 cycles = 5400 s).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -27,13 +31,16 @@ PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 nope() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n' "$1"; }
 
-# wiring <watchdog-script> <plist> [<label>]: prints "OK ..."/"BAD ..." per proof; rc 1 if any BAD. <label> is the janitor's unless given.
+# wiring <watchdog-script> <plist> [<label> [<cap-seconds>]]: prints "OK ..."/"BAD ..." per proof; rc 1 if any BAD. <label> is the janitor's unless given;
+# <cap-seconds> is the highest threshold that still "catches a hang" (3000 unless given).
 wiring() {
-  local s="$1" p="$2" lbl="${3-$LBL}" rc=0 line file max int out lre
+  local s="$1" p="$2" lbl="${3-$LBL}" cap="${4-3000}" rc=0 line file max int out lre
   if [ ! -r "$s" ]; then echo "BAD watchdog script unreadable or missing ($s)"; return 1; fi
   if [ ! -r "$p" ]; then echo "BAD plist unreadable or missing ($p)"; return 1; fi
   # a label handed over EMPTY is not the janitor's: it reproves (the ${3-} default only covers an argument that was never given)
   if [ -z "$lbl" ]; then echo "BAD no label to prove (empty argument)"; return 1; fi
+  # a cap that is not a whole number is a bad call, not "no cap": it reproves (vazio → BAD; falhou/ilegível → BAD, nunca um teto que deixa tudo passar)
+  case "$cap" in ''|*[!0-9]*) echo "BAD cap is not a whole number ([$cap])"; return 1 ;; esac
   # vazio (sem a linha) → line vazia → BAD "no heartbeat entry"; falhou (grep rc != 0) → mesma saída vazia → BAD, nunca OK
   line="$(grep -E "^$lbl[|][^|]+[|][0-9]+" "$s" 2>/dev/null | head -1)"
   file="$(printf '%s' "$line" | awk -F'|' '{print $2}')"
@@ -56,10 +63,10 @@ wiring() {
       case "$max" in
         ''|*[!0-9]*) echo "BAD heartbeat threshold is not a number ([$max])"; rc=1 ;;
         *)
-          if [ "$max" -gt $(( int * 2 )) ] && [ "$max" -le 3000 ]; then
-            echo "OK threshold ${max}s is > 2x StartInterval (${int}s) and <= 3000 s"
+          if [ "$max" -gt $(( int * 2 )) ] && [ "$max" -le "$cap" ]; then
+            echo "OK threshold ${max}s is > 2x StartInterval (${int}s) and <= ${cap} s"
           else
-            echo "BAD threshold ${max}s is not in (2x StartInterval ${int}s, 3000 s]"; rc=1
+            echo "BAD threshold ${max}s is not in (2x StartInterval ${int}s, ${cap} s]"; rc=1
           fi ;;
       esac ;;
   esac
@@ -71,10 +78,11 @@ wiring() {
   return $rc
 }
 
-# expect_reprova <name> <script> <plist> [<needle> [<label>]]: wiring must return != 0, and (when given) say <needle>.
+# expect_reprova <name> <script> <plist> [<needle> [<label> [<cap-seconds>]]]: wiring must return != 0, and (when given) say <needle>.
+# <cap-seconds> is only ever given together with <label> (it is the 6th argument, wiring's 4th).
 expect_reprova() {
   local name="$1" s="$2" p="$3" needle="${4:-}" o
-  o="$(wiring "$s" "$p" ${5+"$5"} 2>&1)"
+  o="$(wiring "$s" "$p" ${5+"$5"} ${6+"$6"} 2>&1)"
   if [ $? -eq 0 ]; then nope "$name — passed (rc 0); a broken wiring must reprove"; return; fi
   if [ -n "$needle" ] && ! printf '%s\n' "$o" | grep -q "$needle"; then
     nope "$name — reproved, but not for the expected reason ($needle): $(printf '%s' "$o" | grep '^BAD' | head -2 | tr '\n' ' ')"; return
@@ -130,6 +138,51 @@ expect_reprova "occupancy watch: threshold 3600 s (> 3000 s)" "$W/occ-high.sh" "
 sed '/^DPW_CRITICAL=/s/ com\.gascity\.hetzner-occupancy-watch\([ }]\)/\1/' "$DPW" > "$W/occ-no-critical.sh"
 expect_reprova "occupancy watch: label removed from DPW_CRITICAL" "$W/occ-no-critical.sh" "$OCC_PLIST" "NOT in the DPW_CRITICAL" "$OCC_LBL"
 expect_reprova "occupancy watch: label handed over empty" "$DPW" "$OCC_PLIST" "no label to prove" ""
+
+# ga-ki02nmt: the two JSONL backup jobs that run from launchd instead of the order dispatcher. One function, run once per job:
+#   jsonl_job_cases <label> <plist> <heartbeat-limit> <cap> <out-basename> <err-basename>
+# Each mutation below edits a COPY of the watchdog script (or of the plist) and the case must reprove FOR ITS OWN REASON (the needle). A sed that matches
+# nothing leaves the copy intact, the wiring passes, and the case fails as "passed (rc 0)": a mutation that misses cannot pass silently.
+jsonl_job_cases() {
+  local lbl="$1" plist="$2" lim="$3" cap="$4" outb="$5" errb="$6" tag="${1#com.gascity.}" lre o
+  lre="$(printf '%s' "$lbl" | sed 's/\./\\./g')"
+  echo "== $tag: in the DPW default, its heartbeat is the file its plist writes =="
+  if o="$(wiring "$DPW" "$plist" "$lbl" "$cap" 2>&1)"; then ok "$tag: real default wiring proven"; else nope "$tag: real default wiring NOT proven"; fi
+  printf '%s\n' "$o" | sed 's/^/        | /'
+  grep -v "^$lbl|" "$DPW" > "$W/$tag-no-entry.sh"
+  expect_reprova "$tag: heartbeat entry removed" "$W/$tag-no-entry.sh" "$plist" "no heartbeat entry" "$lbl" "$cap"
+  sed "/^$lre|/s|$outb|$errb|" "$DPW" > "$W/$tag-err-file.sh"
+  expect_reprova "$tag: heartbeat on the plist's $errb, not its $outb" "$W/$tag-err-file.sh" "$plist" "StandardOutPath" "$lbl" "$cap"
+  sed "/^$lre|/s/|$lim\$/|1000/;/^$lre|/s/|$lim}\"\$/|1000}\"/" "$DPW" > "$W/$tag-low.sh"
+  expect_reprova "$tag: threshold 1000 s (< 2x StartInterval)" "$W/$tag-low.sh" "$plist" "threshold" "$lbl" "$cap"
+  sed "/^$lre|/s/|$lim\$/|$((cap + 600))/;/^$lre|/s/|$lim}\"\$/|$((cap + 600))}\"/" "$DPW" > "$W/$tag-high.sh"
+  expect_reprova "$tag: threshold $((cap + 600)) s (> ${cap} s)" "$W/$tag-high.sh" "$plist" "threshold" "$lbl" "$cap"
+  sed "/^DPW_CRITICAL=/s/ $lre\([ }]\)/\1/" "$DPW" > "$W/$tag-no-critical.sh"
+  expect_reprova "$tag: label removed from DPW_CRITICAL" "$W/$tag-no-critical.sh" "$plist" "NOT in the DPW_CRITICAL" "$lbl" "$cap"
+  # the plist's StandardOutPath points somewhere else: the heartbeat file is then one launchd never writes (the watchdog reads "file absent" = no verdict, forever)
+  sed "/<key>StandardOutPath<\\/key>/{n;s|$outb|some-other-file.out|;}" "$plist" > "$W/$tag-other-out.plist"
+  expect_reprova "$tag: plist StandardOutPath is another file" "$DPW" "$W/$tag-other-out.plist" "StandardOutPath" "$lbl" "$cap"
+  expect_reprova "$tag: cap that is not a number" "$DPW" "$plist" "cap is not a whole number" "$lbl" "abc"
+  expect_reprova "$tag: cap handed over empty" "$DPW" "$plist" "cap is not a whole number" "$lbl" ""
+  expect_reprova "$tag: label handed over empty" "$DPW" "$plist" "no label to prove" "" "$cap"
+}
+JX_LBL="com.gascity.jsonl-export"
+JO_LBL="com.gascity.jsonl-hourly-offsite"
+JX_PLIST="${JSONL_EXPORT_PLIST_PATH:-$HERE/$JX_LBL.plist}"
+JO_PLIST="${JSONL_OFFSITE_PLIST_PATH:-$HERE/$JO_LBL.plist}"
+# the exporter: 900 s cycle -> limit 2700 s (3 cycles, under the default 3000 s cap); the offsite: 1800 s cycle -> limit 5400 s, cap 6000 s
+jsonl_job_cases "$JX_LBL" "$JX_PLIST" 2700 3000 "jsonl-export-launchd.out" "jsonl-export-launchd.err"
+jsonl_job_cases "$JO_LBL" "$JO_PLIST" 5400 6000 "jsonl-hourly-offsite-launchd.out" "jsonl-hourly-offsite-launchd.err"
+# the offsite's .out is ALSO its StandardErrorPath (the script logs to stderr; a stdout-only file would never advance): a plist that sends stderr elsewhere
+# keeps wiring() green (it reads StandardOutPath only), so this one is its own check, on the plist.
+# vazio (chave ausente) → err vazio → reprova; falhou/ilegível (awk rc != 0) → mesma saída vazia → reprova, nunca passa em branco
+jo_out="$(awk '/<key>StandardOutPath<\/key>/{ if ($0 !~ /<string>/) getline; gsub(/.*<string>|<\/string>.*/,""); print; exit }' "$JO_PLIST" 2>/dev/null)"
+jo_err="$(awk '/<key>StandardErrorPath<\/key>/{ if ($0 !~ /<string>/) getline; gsub(/.*<string>|<\/string>.*/,""); print; exit }' "$JO_PLIST" 2>/dev/null)"
+if [ -n "$jo_out" ] && [ "$jo_out" = "$jo_err" ]; then
+  ok "jsonl-hourly-offsite: StandardErrorPath == StandardOutPath ($jo_out): the script's stderr log lines advance the heartbeat"
+else
+  nope "jsonl-hourly-offsite: StandardErrorPath [$jo_err] != StandardOutPath [$jo_out]: the heartbeat would never advance (the script logs to stderr)"
+fi
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
