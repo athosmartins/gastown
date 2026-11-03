@@ -115,8 +115,9 @@ source = "packs/town-deltas"
 # (the selftests read them: they are the single source of the timeout the plists copy) but are NOT scheduled while the name is in this list.
 # Both must be here in the SAME deploy as the plists: `skip` matches by name, and the exporter has no single-flight lock (jsonl-export.sh header),
 # so an order and a plist alive together would be two writers on the archive (the offsite has a lock, the exporter does not).
-# Order of the cutover: docs/runbooks/jsonl-launchd-cutover.md. ROLLBACK = `launchctl bootout` both labels FIRST, then drop both names from this
-# list (the order is back on its own 15 min / 30 min cooldown); doing it the other way round is the double-writer case.
+# Order of the cutover: docs/runbooks/jsonl-launchd-cutover.md. ROLLBACK = `launchctl disable` + `launchctl bootout` both labels FIRST, then drop both names
+# from this list (the order is back on its own 15 min / 30 min cooldown); doing it the other way round is the double-writer case. `bootout` alone does not hold:
+# both labels are in the daemon-presence-watchdog's DPW_CRITICAL, which re-bootstraps a booted-out critical label whose plist is still in ~/Library/LaunchAgents unless it is disabled.
 # prod-tests/gascity/story-ga-7sxdmb.sh and story-ga-c0939v.{2,7}.sh assert this state (orders not listed, plists loaded).
 [orders]
 skip = ["wisp-compact", "nudge-on-route", "mol-dog-jsonl", "jsonl-export", "jsonl-hourly-offsite"]
