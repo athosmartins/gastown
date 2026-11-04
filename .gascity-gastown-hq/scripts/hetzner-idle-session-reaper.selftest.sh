@@ -317,6 +317,72 @@ check "teto: 900 s sem bead ainda não fecha" "" "$(closed)"
 reap $((T0+901))
 check "teto: 901 s sem bead fecha" "ga-aaa" "$(closed)"
 
+# 20b. mensagem não é trabalho (ga-uga2a2j): a bead `issue_type=message` ("context cycle", mail) aberta em nome da sessão NÃO a segura. Em 04/11 seis revisores ociosos de 5 h a 2 dias
+# ficaram vivos porque cada um tinha uma dessas abertas (sessoes=7 com_bead=7 fechadas=0 toda rodada). Três estados: é message / não é message / não sei o tipo. Só o literal "message" solta;
+# tipo ausente, nulo, número, lista, objeto ou qualquer outro texto SEGURA (lado inerte: sob dúvida não se fecha sessão).
+msgbead() { # msgbead <assignee> <issue_type, JSON cru: "message", null, 7, [] ...>  (omitir o 2º = bead sem o campo issue_type)
+  if [ $# -ge 2 ]; then
+    printf '[{"id":"ga-wisp-m1","status":"open","assignee":"%s","issue_type":%s,"title":"context cycle"}]\n' "$1" "$2" > "$FAKE/beads.json"
+  else
+    printf '[{"id":"ga-wisp-m1","status":"open","assignee":"%s","title":"context cycle"}]\n' "$1" > "$FAKE/beads.json"
+  fi
+}
+new_world msgSo
+sessions "$(row ga-aaa gate-reviewer-remote-adhoc-1 gate-reviewer-remote active)"
+msgbead gate-reviewer-remote-adhoc-1 '"message"'
+reap $T0
+check "message: 1ª leitura não fecha (o relógio de 15 min começa)" "" "$(closed)"
+check "message: a mensagem não conta como bead segurada (com_bead=0)" 1 "$(grep -c -F 'com_bead=0' "$W/out")"
+reap $((T0+600))
+check "message: 2ª leitura (10 min) não fecha" "" "$(closed)"
+reap $((T0+1200))
+check "message: única bead da sessão é uma mensagem: fecha na 3ª leitura (20 min)" "ga-aaa" "$(closed)"
+
+# mensagem + trabalho de verdade na mesma sessão: o trabalho segura, em todo tipo que não é message
+for tipo in chore molecule task bug; do
+  new_world "msgTrab$tipo"
+  sessions "$(row ga-aaa dog-remote-1 dog-remote active)"
+  printf '[{"id":"ga-wisp-m1","status":"open","assignee":"dog-remote-1","issue_type":"message"},{"id":"ga-w1","status":"in_progress","assignee":"dog-remote-1","issue_type":"%s"}]\n' "$tipo" > "$FAKE/beads.json"
+  for d in 0 600 1200 2400; do reap $((T0+d)); done
+  check "message + $tipo in_progress: o trabalho segura, não fecha" "" "$(closed)"
+done
+
+# tipo desconhecido segura: ausente, nulo, número, lista, objeto, outro texto e variações do literal (a comparação é exata; lista/objeto não podem derrubar o script)
+for v in ABSENTE null 7 '[]' '{"x":1}' '"Message"' '"messages"' '"mail"' '""'; do
+  new_world "msgTipo"
+  sessions "$(row ga-aaa dog-remote-1 dog-remote active)"
+  if [ "$v" = ABSENTE ]; then msgbead dog-remote-1; else msgbead dog-remote-1 "$v"; fi
+  for d in 0 600 1200 2400; do reap $((T0+d)); done
+  check "issue_type=$v: segura, não fecha" "" "$(closed)"
+  check "issue_type=$v: o script não cai" 0 "$RC"
+done
+
+# a releitura logo antes do close também ignora a mensagem, mas enxerga o trabalho que chegou no meio
+new_world msgCorrida
+sessions "$(row ga-aaa dog-remote-1 dog-remote active)"
+seed ga-aaa 1 9
+msgbead dog-remote-1 '"message"'
+printf '[{"id":"ga-wisp-m1","status":"open","assignee":"dog-remote-1","issue_type":"message"},{"id":"ga-w1","status":"in_progress","assignee":"dog-remote-1","issue_type":"chore"}]\n' > "$FAKE/beads.late.json"
+reap $T0
+check "message + corrida: trabalho que chega entre as duas leituras salva a sessão" "" "$(closed)"
+check "message + corrida: o bd foi lido de novo antes de fechar" 2 "$(cat "$FAKE/bd.calls")"
+new_world msgReleitura
+sessions "$(row ga-aaa dog-remote-1 dog-remote active)"
+seed ga-aaa 1 9
+msgbead dog-remote-1 '"message"'
+cp "$FAKE/beads.json" "$FAKE/beads.late.json"
+reap $T0
+check "message + releitura: a mensagem também não segura na 2ª leitura: fecha" "ga-aaa" "$(closed)"
+
+# duas sessões: a que só tem mensagem fecha, a que tem trabalho fica; o dry-run diz o mesmo
+new_world msgDuas
+sessions "$(row ga-aaa gate-reviewer-remote-adhoc-1 gate-reviewer-remote active)" "$(row ga-bbb gate-reviewer-remote-adhoc-2 gate-reviewer-remote active)"
+printf '[{"id":"ga-wisp-m1","status":"open","assignee":"gate-reviewer-remote-adhoc-1","issue_type":"message"},{"id":"ga-wisp-m2","status":"open","assignee":"gate-reviewer-remote-adhoc-2","issue_type":"message"},{"id":"ga-w2","status":"in_progress","assignee":"gate-reviewer-remote-adhoc-2","issue_type":"chore"}]\n' > "$FAKE/beads.json"
+printf '{"versao":1,"sessoes":{"ga-aaa":{"desde":1,"vivas_seguidas":9},"ga-bbb":{"desde":1,"vivas_seguidas":9}},"atualizado_em":1}\n' > "$STATE"  # as duas já vencidas: só o bd decide
+reap $T0 --dry-run
+check "message + 2 sessões, dry-run: fecharia só a que tem só mensagem" 1 "$(grep -c -F 'fecharia: ga-aaa' "$W/out")"
+check "message + 2 sessões, dry-run: não fecharia a que tem trabalho" 0 "$(grep -c -F 'ga-bbb' "$W/out")"
+
 # 21. os padrões e os mínimos da configuração, lidos do módulo: o teto de 60 s do gc e do bd não se mede esperando 60 s, mede-se o que run_cmd entrega ao communicate
 # vazio → o python não imprime nada e o check falha; falhou/ilegível → idem (nada aqui lê arquivo além do próprio módulo sob teste)
 cfg=$(python3 -I - "$EXE" <<'PY'

@@ -11,7 +11,8 @@ REGRA  o launchd do mini roda isto a cada 600 s (com.gascity.hetzner-idle-sessio
          `gc session list --json`   as sessões dos templates HETZNER_REAP_TEMPLATES (dog-remote, gate-reviewer-remote, kimi-worker-remote), com state e closed.
                                     Duas portas (ga-2hd02v.3.27): o campo `template` OU o NOME (session_name/name/alias/agent_name == <template> ou <template>-...), porque a sessão
                                     re-adotada pelo engine vira bead-casca, sem `template` (a lista tende a sair assim). Nome com `-remote-<host>-` (HETZNER_REAP_OTHER_HOSTS, padrão mbp) é de outro nó: fora.
-         `bd list --include-infra --status open,in_progress --json --limit 0`   quem SEGURA bead: assignee = o id, o session_name, o name, o alias ou o agent_name da sessão
+         `bd list --include-infra --status open,in_progress --json --limit 0`   quem SEGURA bead: assignee = o id, o session_name, o name, o alias ou o agent_name da sessão.
+                                    Bead de issue_type "message" (mail, "context cycle") NÃO segura (ga-uga2a2j); issue_type ausente ou de outro valor segura.
        "não consegui ler" (qualquer das duas) = ninguém é fechado e o estado nem anda. Bead ABERTA também segura a sessão (a in_progress sozinha não basta).
        kimi-worker-remote (ga-do1ixn.5) entra: a bead dele é do rig gascity, na loja da HQ, como a do dog-remote.
        wa-worker-remote fica de fora de propósito: a bead dele mora na loja da WA, que o bd da HQ não lê; sem provar "sem bead" não se fecha.
@@ -39,6 +40,7 @@ import traceback
 from types import SimpleNamespace
 
 DEFAULT_CITY = "/Users/athos/gt/.gascity-gastown-hq"
+MESSAGE_TYPE = "message"  # issue_type da bead de mail / "context cycle": não conta como "a sessão tem trabalho" (ga-uga2a2j)
 LIVE = frozenset({"active", "awake"})  # = bead_state.LIVE_SESSION_STATES
 DEAD = frozenset({"asleep", "drained", "closed", "archived", "quarantined", "failed-create"})  # = bead_state.DEAD_SESSION_STATES
 
@@ -237,7 +239,9 @@ def read_sessions(c):
 
 
 def read_holders(c):
-    """(assignees, None) ou (None, motivo). assignees = quem tem bead aberta ou in_progress (inclui as de infra: wisp/molecule/marker nascem efêmeras)."""
+    """(assignees, None) ou (None, motivo). assignees = quem tem bead aberta ou in_progress (inclui as de infra: wisp/molecule/marker nascem efêmeras), MENOS as de
+    issue_type == "message" (mail e o "context cycle" de cada revisor remoto não são trabalho; ga-uga2a2j: seis revisores ociosos de 5 h a 2 dias ficaram vivos segurados por elas).
+    Só o literal "message" solta a sessão: issue_type ausente, nulo, de outro tipo ou ilegível continua segurando (lado inerte)."""
     # vazio → lista [] = ninguém segura bead (leu); saída vazia, falhou, travou ou forma estranha → (None, motivo): o chamador não fecha ninguém ("sem bead" nunca nasce de erro)
     rc, out, err, why = run_cmd([c.bd_bin, "-C", c.city, "list", "--include-infra", "--status", "open,in_progress", "--json", "--limit", "0"], c.bd_timeout_s)
     motivo = _failed(rc, why, "bd")
@@ -249,7 +253,8 @@ def read_holders(c):
         return None, "json-ilegivel" if out.strip() else "saida-vazia"
     if not isinstance(lst, list) or not all(isinstance(b, dict) and (b.get("assignee") is None or isinstance(b["assignee"], str)) for b in lst):
         return None, "forma-desconhecida"
-    return {b["assignee"] for b in lst if b.get("assignee")}, None
+    # issue_type "message" → não segura; ausente/nulo/outro valor/não-texto → segura (`!=` contra um texto: lista ou objeto no campo não derruba, ao contrário de `in frozenset`)
+    return {b["assignee"] for b in lst if b.get("assignee") and b.get("issue_type") != MESSAGE_TYPE}, None
 
 
 def _str(s, key):
