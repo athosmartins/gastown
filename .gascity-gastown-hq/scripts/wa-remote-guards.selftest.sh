@@ -96,6 +96,7 @@ mk "esc" 'paid_files com.fixture.esc "launchd/com.x$(printf "\033")[2Jpaid.plist
 BLOB=$(git -C "$RIG" rev-parse "$MAIN:lib/x.py")
 # refs de confiança alternativas (o `--trusted-ref`): guard que levanta exceção, forma outra, comando git que o atalho não prevê, árvore vazia
 mk "g6-levanta" 'printf "def check(git_range, skipped=None):\n    raise RuntimeError(\"boom\")\n_REPO_ROOT = None\nsubprocess = None\n" > scripts/check_mds_registry_guard.py'; git -C "$RIG" update-ref refs/remotes/origin/bad-g6 "$SHA"
+mk "g6-mata" 'printf "import os, signal\ndef check(git_range, skipped=None):\n    os.kill(os.getpid(), signal.SIGKILL)\n_REPO_ROOT = None\nsubprocess = None\n" > scripts/check_mds_registry_guard.py'; git -C "$RIG" update-ref refs/remotes/origin/kill-g6 "$SHA"
 mk "g12-sem-scan" 'sed -i.bak "s/def scan_plist/def scan_plist_renomeada/" lib/launchd_paid_guard.py; rm lib/launchd_paid_guard.py.bak'; git -C "$RIG" update-ref refs/remotes/origin/shape "$SHA"
 mk "g7-comando-novo" 'sed -i.bak "s/\"diff\", \"--name-only\"/\"log\", \"--name-only\"/" scripts/check_ntfy_bypass_guard.py; rm scripts/check_ntfy_bypass_guard.py.bak'; git -C "$RIG" update-ref refs/remotes/origin/cmd "$SHA"
 git -C "$RIG" update-ref refs/remotes/origin/empty "$(G -C "$RIG" commit-tree "$(git -C "$RIG" hash-object -t tree /dev/null)" -m vazio)"
@@ -370,6 +371,12 @@ res_unknown_any() { grep -qE "^wa-remote-guards: RESULT=UNKNOWN " "$T/out" && ! 
 case_bad_shas() { local s k=0; for s in "$BLOB" "${S_CLEAN:0:12}" "$(echo "$S_CLEAN" | tr a-f A-F)" HEAD "" "${S_CLEAN:0:39}" 0000000000000000000000000000000000000000; do SHA=$s; runx; { [ "$RC" = 2 ] && ! has "$T/out" "RESULT=PASS"; } || k=1; done; [ "$k" = 0 ]; }
 case_git_diff_fails() { SHA=$S_CLEAN; runx PATH="$T/shim:$PATH_RUN"; [ "$RC" = 2 ] && res UNKNOWN && gl G6 UNKNOWN && gl G7 UNKNOWN && gl G12 PASS && gl G7b PASS && ! has "$T/out" "RESULT=PASS"; }
 case_guard_raises() { SHA=$S_CLEAN; runx -- --trusted-ref refs/remotes/origin/bad-g6; [ "$RC" = 2 ] && res UNKNOWN && gl G6 UNKNOWN && has "$T/out" "G6 levantou RuntimeError"; }
+# O relatório parcial sobrevive a um SIGKILL: o gate-done-remote.py roda este script com subprocess.run(timeout=GUARDS_TIMEOUT), que mata o filho com SIGKILL, e o que ele já disse e não esvaziou se perde.
+# Aqui o G6 de confiança mata o PRÓPRIO processo depois de a linha da exportação e a do G12 serem ditas, com o stdout num ARQUIVO (bloco, não linha): só o flush=True do say() as deixa lá (b82742161c).
+# rc 137 é a pré-condição: sem ela a morte foi limpa e o buffer teria sido esvaziado na saída.
+# --scratch explícito: o processo morto não roda o finally que apaga a pasta própria, e a que sobrasse em $T/tmp quebraria no_leftover (o trap de saída recolhe $T inteiro).
+# vazio → sem as linhas ditas antes da morte (o buffer morreu com o processo): falha; falhou → rc != 137 (o guard de confiança não matou): falha.
+case_kill_report() { SHA=$S_CLEAN; runx -- --trusted-ref refs/remotes/origin/kill-g6 --scratch "$T/sc-kill" 2>/dev/null; [ "$RC" = 137 ] && grep -qE '^wa-remote-guards: sha=[0-9a-f]{12} guards de confiança=' "$T/out" && gl G12 PASS && ! has "$T/out" "RESULT="; }
 case_shape_changed() { SHA=$S_CLEAN; runx -- --trusted-ref refs/remotes/origin/shape; [ "$RC" = 2 ] && gl G12 UNKNOWN && has "$T/out" "mudou de forma (falta scan_plist"; }
 case_unforeseen_cmd() { SHA=$S_CLEAN; runx -- --trusted-ref refs/remotes/origin/cmd; [ "$RC" = 2 ] && gl G7 UNKNOWN && has "$T/out" "o guard pediu um comando que o atalho não prevê"; }
 case_empty_trusted() { SHA=$S_CLEAN; runx -- --trusted-ref refs/remotes/origin/empty; [ "$RC" = 2 ] && res UNKNOWN && gl G12 UNKNOWN && gl G6 UNKNOWN && gl G7 UNKNOWN && gl G7b UNKNOWN; }
@@ -392,10 +399,10 @@ case_u_header() { uc header; }
 case_u_entries() { uc entries; }
 case_u_registry() { uc registry; }
 # Fora do alcance destes casos: a89c4d08ba 1d719f54b0 49ab621386 (equivalentes: o split do ls-tree cai no mesmo ValueError, e nl == 0 só existe com pos == 0, onde o corte é vazio dos
-# dois jeitos) e b82742161c b451aff2f3 (flush=True: só se vê se o processo morre depois de escrever). A cena de G12 com 6+ plists (avisos_cap: d414b9aca8 f6affd9302 a01c4377f4 82a7bd8828)
-# e o guard de confiança que levanta depois de carregar (cut_120_run: d4b87a34d1) vieram depois (ga-r8nsaot).
+# dois jeitos) e b451aff2f3 (o flush=True do print do handler de erro interno: só se vê se o processo morre depois de escrever; o do say(), b82742161c, morre em kill_report). A cena de G12
+# com 6+ plists (avisos_cap: d414b9aca8 f6affd9302 a01c4377f4 82a7bd8828) e o guard de confiança que levanta depois de carregar (cut_120_run: d4b87a34d1) vieram depois (ga-r8nsaot).
 # EQUIVALENT a89c4d08ba 1d719f54b0 49ab621386: o split do ls-tree cai no mesmo ValueError, e `nl == 0` so existe com pos == 0, onde o corte e vazio dos dois jeitos
-# EQUIVALENT b82742161c b451aff2f3: `flush=True` -> False: so se ve se o processo morre depois de escrever
+# EQUIVALENT b451aff2f3: `flush=True` -> False: so se ve se o processo morre depois de escrever
 case_u_git() { uc git; }
 case_u_tree() { uc tree; }
 case_u_blob() { uc blob; }
@@ -456,6 +463,7 @@ ck trusted_missing "ref de confiança inexistente → rc 2, nunca passou"
 ck bad_shas "sha inválido (blob, curto, maiúsculo, HEAD, vazio, 39 hex, zeros) → rc 2 e nunca PASS"
 ck git_diff_fails "git diff que FALHA dentro de G6/G7 → NÃO SEI nos dois (o guard real devolveria lista vazia = passou); G12 e G7b seguem"
 ck guard_raises "guard de confiança que levanta exceção → NÃO SEI (o main() dele daria 'fail OPEN' = passou)"
+ck kill_report "SIGKILL no meio da rodada (o G6 de confiança mata o processo): o relatório parcial já está no stdout-arquivo (linha da exportação e G12 PASS), e nenhum RESULT"
 ck shape_changed "guard de confiança que mudou de forma → NÃO SEI com o que falta, e manda atualizar junto"
 ck unforeseen_cmd "guard que pede um comando git que o atalho não prevê → NÃO SEI"
 ck empty_trusted "árvore de confiança sem os guards → NÃO SEI em todos"
@@ -507,6 +515,7 @@ EOF
 }
 mutant facade-git-que-falha-vira-lista-vazia git_diff_fails 'out = git(self.repo, "-c", "core.quotepath=false", "diff", "--no-ext-diff", "--no-textconv", *a[2:])' $'try:\n                out = git(self.repo, "-c", "core.quotepath=false", "diff", "--no-ext-diff", "--no-textconv", *a[2:])\n            except Unknown:\n                out = b""'
 mutant g6-excecao-vira-passou guard_raises 'raise Unknown(f"G6 levantou {type(e).__name__}: {safe(e)[:120]}")' 'return "PASS", "", []'
+mutant say-sem-flush kill_report 'print(f"wa-remote-guards: {msg}", flush=True)' 'print(f"wa-remote-guards: {msg}", flush=False)'
 mutant nao-sei-nao-reprova git_diff_fails 'result = "BLOCKED" if "BLOCKED" in verdicts else "UNKNOWN" if "UNKNOWN" in verdicts else "PASS"' 'result = "BLOCKED" if "BLOCKED" in verdicts else "PASS"'
 mutant bloqueado-nao-reprova g12_blocks 'result = "BLOCKED" if "BLOCKED" in verdicts else "UNKNOWN"' 'result = "UNKNOWN"'
 mutant g12-codigo-do-sha tamper_all 'mod = load_trusted(c.repo, c.tsha, "g12", c.scratch)' 'mod = load_trusted(c.repo, c.sha, "g12", c.scratch)'

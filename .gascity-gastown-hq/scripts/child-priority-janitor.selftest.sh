@@ -191,11 +191,10 @@ if [ "$RC" = 1 ] && [ ! -s "$CALLS" ] && has "cannot take the lock"; then ok "lo
 
 case_ "in-process: limites do planejador, costuras de I/O, lock e o contador do próprio --selftest"
 # Fora do alcance de qualquer caso: os mutantes que trocam uma FIXTURE ou uma ASSERÇÃO dentro do próprio _selftest embutido (o teste continua verdadeiro para o valor
-# trocado: "filha mais urgente não desce" vale com o pai em P2 ou em P3), o `<` -> `<=` de ptarget em plan_raises (atribui o mesmo valor, 51343d2b3a) e o flush=True do
-# _log (5847500c1c: só se vê se o processo morre depois de escrever).
+# trocado: "filha mais urgente não desce" vale com o pai em P2 ou em P3) e o `<` -> `<=` de ptarget em plan_raises (atribui o mesmo valor, 51343d2b3a). O flush=True do
+# _log (5847500c1c) NÃO é equivalente: o caso de SIGKILL logo depois do start (o último deste arquivo) o mata; um buffer que ninguém esvaziou só aparece quando o processo morre sem a saída normal.
 # vazio → sem a linha 'DONE 0', vermelho; falhou/ilegível → uma linha FAIL ou rc != 0, vermelho.
 # EQUIVALENT 51343d2b3a: `<` -> `<=` de ptarget em plan_raises: atribui o mesmo valor
-# EQUIVALENT 5847500c1c: o `flush=True` do _log: so se ve se o processo morre depois de escrever
 # EQUIVALENT 05d88c954b 093deb0e89 0ff72cbd15 11daa9e4a1 146c3071a3 1547231b81 15ba0348a7 246287f518 250b29933b 251c9d90c3 283f7af2fd 2a2530754f: TRANSITORIO: mutante de dentro do `_selftest()` embutido (L364-533) que o hq-mutate.py novo ja nao gera (confira com `hq-mutate.py gen`); sai do estado quando o motor varrer o janitor de novo, e entao esta linha pode ser apagada
 # EQUIVALENT 2e3e4f09e5 36e4b8b9d6 3c85db7649 3cf36ddf6f 3cf633b500 3ffbc9973e 4468e98ace 4f3cc44912 4f6ebd57a5 5178ea198c 5334adbf0e 5b677359c9: TRANSITORIO: mutante de dentro do `_selftest()` embutido (L364-533) que o hq-mutate.py novo ja nao gera (confira com `hq-mutate.py gen`); sai do estado quando o motor varrer o janitor de novo, e entao esta linha pode ser apagada
 # EQUIVALENT 5baa42cdce 603669880c 605ff672ef 61d41129e3 688a1ef25f 6b2e22a092 6cce0a0f57 6cfe3d2569 6d323c5a73 730a4e8abc 7457c01d5b 746de8e06a: TRANSITORIO: mutante de dentro do `_selftest()` embutido (L364-533) que o hq-mutate.py novo ja nao gera (confira com `hq-mutate.py gen`); sai do estado quando o motor varrer o janitor de novo, e entao esta linha pode ser apagada
@@ -305,6 +304,21 @@ JAN_ENABLED=0 run
 if [ "$RC" = 0 ] && [ ! -s "$CALLS" ] && has "kill-switch" && has "start enabled=False"; then
   ok "kill-switch -> nenhuma chamada ao bd, linha de batimento escrita, rc 0"
 else nope "kill-switch ainda chamou o bd ou não logou (rc=$RC)"; fi
+
+case_ "SIGKILL logo depois da linha de start: ela já está no .out (o flush=True do _log; o daemon-presence-watchdog lê o .out do launchd como batimento)"
+# O gc de mentira mata o PAI (o janitor) com SIGKILL na 1ª chamada, antes de o Python poder esvaziar o buffer do stdout: sem o flush=True do _log a linha de start morre
+# junto com o processo (5847500c1c). PYTHONUNBUFFERED fica vazio de propósito: ligado, o buffer não existe e o caso não veria nada.
+# vazio → saída sem a linha de start (o buffer morreu com o processo), vermelho; falhou → rc diferente de 137 (o stub não matou o janitor), vermelho.
+cat > "$W/gc-kill" <<'STUB'
+#!/usr/bin/env bash
+[ "$PPID" = "$STUB_HARNESS" ] || kill -KILL "$PPID"
+exit 0
+STUB
+chmod +x "$W/gc-kill"
+JAN_GC="$W/gc-kill" PYTHONUNBUFFERED= STUB_HARNESS=$$ run 2>/dev/null
+if [ "$RC" = 137 ] && has "[child-priority] start enabled=True" && ! has "sweep done"; then
+  ok "gc que mata o janitor (SIGKILL) na 1ª chamada: rc 137 e a linha de start já estava no .out"
+else nope "SIGKILL depois do start (rc=$RC): a linha de start sumiu com o buffer, ou o stub não matou o janitor"; fi
 
 echo
 echo "== child-priority-janitor.selftest.sh: $PASS ok, $FAIL falha(s)"

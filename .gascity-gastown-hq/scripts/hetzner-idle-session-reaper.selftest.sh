@@ -667,9 +667,9 @@ check "casca dormindo ou já fechada: não fecha (a dormindo nem 'viva' é; a fe
 # run_cmd (texto, reap de 5 s), _by_template (rig/t e rig.t) e read_sessions (cada falha é (None, 0, motivo)) no valor exato.
 # Equivalentes: 185e0165d4 (errors="replace" já liga o modo texto do Popen, universal_newlines é redundante), b8f7a7b9a9 (held só é lido com sessões na lista),
 # 7cf10d9a72 (prev["desde"] <= now: no empate os dois lados dão o mesmo valor).
-# EQUIVALENT 185e0165d4: `universal_newlines=True` -> False: `errors="replace"` ja liga o modo texto do Popen, a outra opcao e redundante
-# EQUIVALENT b8f7a7b9a9: `rows is not None` -> `is None` no ramo de `held`: held so e lido com sessoes na lista
-# EQUIVALENT 7cf10d9a72: `prev["desde"] <= now` -> `<`: no empate os dois lados dao o mesmo valor
+# EQUIVALENT 66f6f8b84d: `universal_newlines=True` -> False: `errors="replace"` ja liga o modo texto do Popen (text_mode = encoding or errors or text or universal_newlines); o run_cmd real devolve o mesmo nas 9 formas de saida medidas (CRLF, CR solto, byte invalido, 120 KB com caractere partido pelo cano, timeout, binario ausente) em py3.12.3 e 3.9.25; era 185e0165d4 antes de a ga-uga2a2j mover a linha
+# EQUIVALENT 7b01226c71: `rows is not None` -> `is None` no ramo de `held`: held so e lido dentro do `for s in rows` (uma unica leitura, achada por ast), e rows None sempre vem com motivo (240 formas de saida do gc), entao a rodada sai antes de usa-lo; era b8f7a7b9a9
+# EQUIVALENT 681ca448bd: `prev["desde"] <= now` -> `<`: no empate os dois lados dao o mesmo inteiro (_int() recusa bool e float); o estado gravado e identico com o relogio anterior antes, igual e depois de agora; era 7cf10d9a72
 cat > "$T/blk.py" <<'PY'
 import importlib.util, os, subprocess, sys
 sys.dont_write_bytecode = True
