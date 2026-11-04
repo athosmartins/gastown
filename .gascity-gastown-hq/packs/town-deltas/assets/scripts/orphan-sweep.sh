@@ -51,6 +51,24 @@
 # exact read that just missed it. A bead that was never healed (a genuinely
 # dead claimant) carries no stamp and sweeps normally.
 #
+# ga-2m9nqn1: the session roster is read TWICE per sweep in total (once BEFORE every `bd list`,
+# once AFTER the last one), not twice per scope. The per-scope version bracketed each scope's
+# `bd list` with its own pair of `gc session list --json` reads, so N rigs cost 2(N+1) of them.
+# One read took ~37 s at load 44 (Mayor, 04/11) and the city has 5 rigs: 12 reads = ~450 s
+# against the order's exec deadline (the engine default, 300 s; orphan-sweep.toml declares
+# none), and 128 sweeps (01-04/11, ~7% of the rounds) died with 'order exec orphan-sweep
+# failed: context deadline exceeded' having reset nothing. The
+# race guard keeps its shape (a session that spawns and claims work after the first read is
+# alive in the second, and SESSION_TMP is the union of both); the window just spans the listing.
+# Why one read covers the rigs: `gc --rig R session list` is not a different list. Session beads
+# live in the CITY store (gc session suspend opens it with openCityStore; nightly-reboot.sh looks
+# for the rig witnesses, */gastown.witness, in the city store's type=session query) and the pool
+# and crew templates are city-scoped, their work_dir merely pointing into a rig. That is inferred
+# from those, not measured on the mini. The check: `comm -13` of the unscoped list's sorted
+# .sessions[].session_name against the sorted union of the per-rig lists must print nothing. If
+# it ever prints a name, that name's rig needs its own pair of reads again (selftest section 12
+# pins the call count, so the change has to show up there).
+#
 # Runs as an exec order (no LLM, no agent, no wisp).
 set -euo pipefail
 
@@ -100,8 +118,8 @@ CONFIRM_THRESHOLD="${ORPHAN_SWEEP_CONFIRM_THRESHOLD:-2}"
 # only the live_session_match() fallback path gets this extra grace.
 RECENT_UPDATE_GRACE_SECS="${ORPHAN_SWEEP_RECENT_UPDATE_GRACE_SECS:-1800}"
 
-# Step 1: Collect in-progress beads from HQ and every rig whose session
-# liveness can be determined.
+# Step 1: Collect in-progress beads from HQ and every rig, bracketed by one
+# city-wide session roster read on each side (1a, 1b, 1c below).
 # `gc bd list` without --rig is HQ-scoped from the city cwd, so per-rig
 # beads are invisible to a bare query — walk every rig explicitly.
 TMP=$(mktemp) || exit 0
@@ -117,10 +135,16 @@ if [ -n "$RIG_LIST" ]; then
     RIG_NAMES=$(echo "$RIG_LIST" | jq -r '.rigs[] | select(.hq == false) | .name' 2>/dev/null) || RIG_NAMES=""
 fi
 
+# One roster read, appended to $SESSION_TMP only if it is a roster: "$@" is the whole command line.
+# vazio → `{"sessions":[]}` is appended and means no live session (the config templates still
+# resolve); falhou/ilegível → return 1 and append nothing: rc != 0, no bytes, or JSON with no
+# .sessions array (an rc-0 answer with no bytes, or JSON without that array, used to be read as
+# "zero live sessions", i.e. every pool assignee an orphan). The callers end the sweep on a 1.
 append_session_list() {
     local session_fetch_tmp
     session_fetch_tmp=$(mktemp) || return 1
-    if "$@" >"$session_fetch_tmp" 2>/dev/null; then
+    if "$@" >"$session_fetch_tmp" 2>/dev/null \
+        && jq -e '(.sessions | type) == "array"' "$session_fetch_tmp" >/dev/null 2>&1; then
         cat "$session_fetch_tmp" >>"$SESSION_TMP"
         rm -f "$session_fetch_tmp"
         return 0
@@ -129,52 +153,43 @@ append_session_list() {
     return 1
 }
 
-append_hq_scope() {
-    local bead_fetch_tmp
-    bead_fetch_tmp=$(mktemp) || return 1
-    append_session_list gc session list --json || {
-        rm -f "$bead_fetch_tmp"
-        return 1
-    }
-    gc bd list --status=in_progress --json --limit=0 2>/dev/null >"$bead_fetch_tmp" || true
-    append_session_list gc session list --json || {
-        rm -f "$bead_fetch_tmp"
-        return 1
-    }
-    cat "$bead_fetch_tmp" >>"$TMP"
-    rm -f "$bead_fetch_tmp"
+# One scope's in-progress rows, appended to $TMP as they come: "$@" is that scope's whole
+# `gc bd list` command line (HQ: no --rig; a rig: --rig <name>).
+# vazio (`[]` or no bytes) → no rows, so that scope's beads are not judged this sweep;
+# falhou/ilegível → the same (`|| true`): an unreachable scope contributes no rows, so none of
+# its beads can be reset on it, while the other scopes are still swept. A half-written body is
+# appended as it always was and then fails the `jq -c -s` slurp below, which resets nothing.
+append_bead_scope() {
+    "$@" 2>/dev/null >>"$TMP" || true
 }
 
-append_rig_scope() {
-    local rig="$1"
-    local bead_fetch_tmp
-    bead_fetch_tmp=$(mktemp) || return 1
-    append_session_list gc --rig "$rig" session list --json || {
-        rm -f "$bead_fetch_tmp"
-        return 1
-    }
-    gc bd list --rig "$rig" --status=in_progress --json --limit=0 2>/dev/null >"$bead_fetch_tmp" || true
-    append_session_list gc --rig "$rig" session list --json || {
-        rm -f "$bead_fetch_tmp"
-        return 1
-    }
-    cat "$bead_fetch_tmp" >>"$TMP"
-    rm -f "$bead_fetch_tmp"
+# Step 1a: the BEFORE roster, one city-wide read ahead of every bd list. The roster is required:
+# with none nobody can be judged, so the sweep ends before it lists anything.
+# vazio → `{"sessions":[]}` is no live session; falhou/ilegível → exit 0 now: nothing listed,
+# nothing reset, nothing counted toward CONFIRM_THRESHOLD.
+append_session_list gc session list --json || {
+    echo "orphan-sweep: session list unreadable before the bead lists, nothing reset this sweep" >&2
+    exit 0
 }
 
-# Step 1b: Get all known live session identities around each bead-list query.
-# The second liveness pass closes the session-list-before-bd-list race where a
-# newly spawned session can claim work after the first pass but before bd-list.
-# HQ liveness is required; per-rig failures only skip that rig's staged bead
-# rows so one stale or unreachable rig does not disable cleanup elsewhere.
-append_hq_scope || exit 0
-
+# Step 1b: the in-progress beads of HQ, then of every rig.
+# vazio → no rows for HQ; falhou/ilegível → no rows for HQ either (append_bead_scope), never a reset
+append_bead_scope gc bd list --status=in_progress --json --limit=0
 while IFS= read -r rig; do
     [ -z "$rig" ] && continue
-    if ! append_rig_scope "$rig"; then
-        echo "orphan-sweep: skipping rig $rig after session-list failure" >&2
-    fi
+    # vazio → no rows for this rig; falhou/ilegível → no rows for this rig, the next rig still runs
+    append_bead_scope gc bd list --rig "$rig" --status=in_progress --json --limit=0
 done <<<"$RIG_NAMES"
+
+# Step 1c: the AFTER roster, one city-wide read behind the LAST bd list. This second liveness pass
+# closes the session-list-before-bd-list race where a newly spawned session can claim work after
+# the first pass but before bd-list: it is alive here, so its bead is not a candidate.
+# vazio → `{"sessions":[]}` is no live session; falhou/ilegível → exit 0: the rows above were
+# listed against a roster that may miss a live claimant, so none of them is judged this sweep.
+append_session_list gc session list --json || {
+    echo "orphan-sweep: session list unreadable after the bead lists, nothing reset this sweep" >&2
+    exit 0
+}
 
 IN_PROGRESS=$(jq -c -s 'add // []' "$TMP" 2>/dev/null) || IN_PROGRESS="[]"
 if [ "$IN_PROGRESS" = "[]" ]; then

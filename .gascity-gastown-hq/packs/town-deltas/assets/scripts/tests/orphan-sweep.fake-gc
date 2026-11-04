@@ -8,23 +8,88 @@
 # town-deltas copy.
 #
 # Dispatches on argv to the minimal set of `gc` subcommands orphan-sweep.sh
-# actually calls: rig list, session list, bd list, bd update, config explain.
-# Reads fixtures from env vars set by the selftest harness (FAKE_SESSION_JSON,
-# FAKE_INPROGRESS_JSON, FAKE_AGENTS) and records resets to $RESET_LOG.
+# actually calls: rig list, session list (city-wide, and the `gc --rig R
+# session list` form the script used before ga-2m9nqn1), bd list (HQ, and
+# `--rig R`), bd update, config explain. Reads fixtures from env vars set by
+# the selftest harness and records resets to $RESET_LOG:
+#   FAKE_SESSION_JSON        the 1st `session list` answer (and every later one
+#                            when FAKE_SESSION_JSON_AFTER is empty)
+#   FAKE_SESSION_JSON_AFTER  the 2nd and later `session list` answers: the roster
+#                            AFTER the bead lists (ga-2m9nqn1)
+#   FAKE_SESSION_FAIL_ON     N: the Nth `session list` call exits 1, no output
+#   FAKE_INPROGRESS_JSON     HQ `bd list` answer (default [])
+#   FAKE_RIGS                space-separated non-HQ rig names `rig list` reports
+#                            (empty: {"rigs":[]})
+#   FAKE_RIG_BEADS_DIR       dir holding <rig>.json, the answer of `bd list --rig
+#                            <rig>` (no such file: [])
+#   FAKE_BDLIST_FAIL_RIG     a rig name: `bd list --rig <that rig>` exits 1
+#   FAKE_AGENTS              space-separated names `config explain` reports
+#   CALL_LOG                 when set, one line per call: the argv as given. The
+#                            shim is a fresh process per call, so "the Nth
+#                            session list" is counted from this file.
 set -euo pipefail
+
+[ -z "${CALL_LOG:-}" ] || printf '%s\n' "$*" >> "$CALL_LOG"
+
+# `gc --rig R <cmd> ...`: the rig is only the scope the sweep asked for; the
+# answers below do not depend on it (that is what ga-2m9nqn1 relies on).
+if [ "${1:-}" = "--rig" ]; then
+    shift 2
+fi
 
 cmd="${1:-}"
 sub="${2:-}"
 
+# `gc bd list --rig R ...` names its rig in the arguments.
+bd_rig=""
+prev=""
+for a in "$@"; do
+    [ "$prev" != "--rig" ] || bd_rig="$a"
+    prev="$a"
+done
+
 case "$cmd $sub" in
 "rig list")
-    echo '{"rigs":[]}'
+    if [ -z "${FAKE_RIGS:-}" ]; then
+        echo '{"rigs":[]}'
+    else
+        printf '{"rigs":[{"name":"hq","hq":true}'
+        for r in $FAKE_RIGS; do
+            printf ',{"name":"%s","hq":false}' "$r"
+        done
+        echo ']}'
+    fi
     ;;
 "session list")
-    printf '%s' "${FAKE_SESSION_JSON:-}"
+    n=1
+    if [ -n "${CALL_LOG:-}" ]; then
+        # this call is already in the log, so the count is its own ordinal
+        n=$(grep -c 'session list' "$CALL_LOG")
+    fi
+    if [ -n "${FAKE_SESSION_FAIL_ON:-}" ] && [ "$n" = "$FAKE_SESSION_FAIL_ON" ]; then
+        echo "orphan-sweep.fake-gc: session list call #$n fails on purpose" >&2
+        exit 1
+    fi
+    if [ "$n" -ge 2 ] && [ -n "${FAKE_SESSION_JSON_AFTER:-}" ]; then
+        printf '%s' "$FAKE_SESSION_JSON_AFTER"
+    else
+        printf '%s' "${FAKE_SESSION_JSON:-}"
+    fi
     ;;
 "bd list")
-    printf '%s' "${FAKE_INPROGRESS_JSON:-[]}"
+    if [ -n "$bd_rig" ]; then
+        if [ "$bd_rig" = "${FAKE_BDLIST_FAIL_RIG:-}" ]; then
+            echo "orphan-sweep.fake-gc: bd list --rig $bd_rig fails on purpose" >&2
+            exit 1
+        fi
+        if [ -n "${FAKE_RIG_BEADS_DIR:-}" ] && [ -f "$FAKE_RIG_BEADS_DIR/$bd_rig.json" ]; then
+            cat "$FAKE_RIG_BEADS_DIR/$bd_rig.json"
+        else
+            printf '[]'
+        fi
+    else
+        printf '%s' "${FAKE_INPROGRESS_JSON:-[]}"
+    fi
     ;;
 "config explain")
     for a in ${FAKE_AGENTS:-}; do

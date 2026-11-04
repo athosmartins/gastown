@@ -15,6 +15,13 @@
 # (orphan-sweep:shielded-until:<epoch>) protects unconditionally while
 # active, does not over-protect once expired, and takes the MAX across
 # accumulated stamps rather than the first (ga-4aree class).
+# Sections 12-16 are new (ga-2m9nqn1): the session roster is read twice per
+# sweep in TOTAL, not twice per scope (12); the first read is ahead of every bd
+# list and the second behind the last (13); the ga-u0vzx/ga-nvx race stays
+# covered, a claimant alive in only one of the two reads is never reset (14); a
+# rig whose bd list fails does not stop cleanup elsewhere (15); and a roster
+# that is missing, or is not a roster, ends the sweep before anything is reset
+# or counted (16).
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,6 +55,8 @@ sandbox_path_init "$WORK" jq || exit 2   # jq: the ledger and the session/bead J
 
 run_sweep() {
     # $1 = FAKE_SESSION_JSON, $2 = FAKE_INPROGRESS_JSON, $3 = FAKE_AGENTS
+    # ga-2m9nqn1: the X_* globals feed the shim's extra knobs (see orphan-sweep.fake-gc); empty = off, which is
+    # all that sections 0-11 ever see.
     # env -i + PATH="$SANDBOX_PATH": the REAL `gc`/`bd` are not on the PATH at all. $FAKE_GC_DIR is first so our `gc`
     # shim is what answers; if it vanishes the answer is "command not found", never /opt/homebrew/bin/gc.
     env -i \
@@ -58,6 +67,12 @@ run_sweep() {
         FAKE_SESSION_JSON="$1" \
         FAKE_INPROGRESS_JSON="$2" \
         FAKE_AGENTS="$3" \
+        FAKE_RIGS="${X_RIGS:-}" \
+        FAKE_RIG_BEADS_DIR="${X_RIG_BEADS_DIR:-}" \
+        FAKE_SESSION_JSON_AFTER="${X_SESSION_AFTER:-}" \
+        FAKE_SESSION_FAIL_ON="${X_SESSION_FAIL_ON:-}" \
+        FAKE_BDLIST_FAIL_RIG="${X_BDLIST_FAIL_RIG:-}" \
+        CALL_LOG="${X_CALL_LOG:-}" \
         bash "$SCRIPT"
 }
 
@@ -69,6 +84,34 @@ ledger_count() {
     [ -f "$ledger" ] || { echo 0; return; }
     jq -r --arg id "$1" '.[$id] // 0' "$ledger" 2>/dev/null || echo 0
 }
+
+# ga-2m9nqn1: the shim logs every gc call to $CALLS (X_CALL_LOG); these read it back. awk, not grep | head, so no
+# reader exits early under pipefail. The patterns are awk regexes without backslashes.
+CALLS="$WORK/calls.log"
+RIGBEADS="$WORK/rigbeads"
+mkdir -p "$RIGBEADS"
+calls()      { if [ -f "$CALLS" ]; then awk -v p="$1" '$0 ~ p {n++} END {print n+0}' "$CALLS"; else echo 0; fi; }
+first_call() { awk -v p="$1" '$0 ~ p {print NR; f=1; exit} END {if (!f) print 0}' "$CALLS"; }
+last_call()  { awk -v p="$1" '$0 ~ p {n=NR} END {print n+0}' "$CALLS"; }
+call_dump()  { awk '/^(bd list|session list|--rig)/' "$CALLS" | tr '\n' ';'; }
+# a sweep whose call log starts empty: "the Nth session list" is counted from the log, so each sweep needs its own
+sweep_logged() { : > "$CALLS"; run_sweep "$@"; }
+# sess_json <name>... -> a roster with one live session per name (no names: an empty roster)
+sess_json() {
+    local out='{"sessions":[' sep='' n
+    for n in "$@"; do
+        out="$out$sep{\"id\":\"id-$n\",\"session_name\":\"$n\",\"alias\":\"$n\",\"agent_name\":\"$n\",\"template\":\"gastown.dog\",\"state\":\"active\",\"closed\":false}"
+        sep=','
+    done
+    printf '%s' "$out]}"
+}
+# bead_json <id> <assignee> -> one in-progress row (no updated_at: not inside the ga-a8t68 grace window)
+bead_json() { printf '{"id":"%s","assignee":"%s"}' "$1" "$2"; }
+x_reset() {
+    X_RIGS=''; X_RIG_BEADS_DIR=''; X_SESSION_AFTER=''; X_SESSION_FAIL_ON=''; X_BDLIST_FAIL_RIG=''; X_CALL_LOG=''
+    rm -f "$RIGBEADS"/*.json
+}
+x_reset
 
 echo "── 0. harness sanity: confirm the gc SHIM (not the real binary) is what runs ──"
 SHIM_CHECK=$(env -i PATH="$SANDBOX_PATH" HOME="$HOME" gc rig list --json)
@@ -165,6 +208,94 @@ INPROGRESS8='[{"id":"ga-test8","assignee":"'"$MULTI_ASSIGNEE"'","labels":["orpha
 run_sweep '{"sessions":[]}' "$INPROGRESS8" "gastown.dog" >/dev/null
 run_sweep '{"sessions":[]}' "$INPROGRESS8" "gastown.dog" >/dev/null
 if [ "$(count_resets ga-test8)" = "0" ]; then ok "MAX of multiple shielded-until labels wins (not the first/an expired one) — bead stays protected"; else bad "took the wrong shielded-until label instead of the MAX — bead was incorrectly reset"; fi
+
+echo "── 12. functional (ga-2m9nqn1): the session roster is read TWICE per sweep in total, not twice per scope (5 rigs = the production shape) ──"
+# Before the fix every scope bracketed its own bd list with two reads: 2 x (HQ + 5 rigs) = 12 reads at ~37 s each
+# (load 44) = ~450 s against the order's 300 s deadline. The shim logs every call; count them.
+RIGS5="property_scrapers marketing lexbh gastown whatsapp_automation"
+x_reset
+X_RIGS="$RIGS5"; X_RIG_BEADS_DIR="$RIGBEADS"; X_CALL_LOG="$CALLS"
+sweep_logged '{"sessions":[]}' '[]' "gastown.dog" >/dev/null
+if [ "$(calls '^session list')" = "2" ]; then ok "5 rigs: exactly 2 city-wide session list reads in the whole sweep"; else bad "5 rigs: $(calls '^session list') city-wide session list reads, want 2 (calls: $(call_dump))"; fi
+if [ "$(calls '^--rig .*session list')" = "0" ]; then ok "5 rigs: no rig-scoped session list read"; else bad "5 rigs: $(calls '^--rig .*session list') rig-scoped session list reads, want 0 - the 2(N+1) shape is back (calls: $(call_dump))"; fi
+BD_OK=1
+[ "$(calls '^bd list --status')" = "1" ] || BD_OK=0
+for r in $RIGS5; do [ "$(calls "^bd list --rig $r ")" = "1" ] || BD_OK=0; done
+[ "$(calls '^bd list')" = "6" ] || BD_OK=0
+if [ "$BD_OK" = "1" ]; then ok "HQ and each of the 5 rigs listed exactly once (6 bd lists)"; else bad "bd list is not HQ + 5 rigs once each (calls: $(call_dump))"; fi
+
+echo "── 13. functional (ga-2m9nqn1): the first read is AHEAD of every bd list and the second BEHIND the last one ──"
+# The race guard (ga-nvx: a session spawns and claims work after the first read but before a bd list) needs the
+# second read to come after the bd lists it protects; with one pair for the whole sweep that means after the LAST one.
+FIRST_SESS=$(first_call '^session list'); LAST_SESS=$(last_call '^session list')
+FIRST_BD=$(first_call '^bd list');        LAST_BD=$(last_call '^bd list')
+if [ "$FIRST_SESS" -gt 0 ] && [ "$FIRST_SESS" -lt "$FIRST_BD" ]; then ok "the first read (call #$FIRST_SESS) is ahead of the first bd list (#$FIRST_BD)"; else bad "the first read is not ahead of every bd list (calls: $(call_dump))"; fi
+if [ "$LAST_BD" -gt 0 ] && [ "$LAST_SESS" -gt "$LAST_BD" ]; then ok "the second read (call #$LAST_SESS) is behind the last bd list (#$LAST_BD)"; else bad "the second read is not behind every bd list (calls: $(call_dump))"; fi
+
+echo "── 14. functional (ga-2m9nqn1, ga-u0vzx/ga-nvx race): a claimant alive in only ONE of the two reads is never reset; one alive in neither still is ──"
+# 'early' is alive only in the first read (gone by the second); 'late' only in the second (it spawned after the first
+# read and claimed work before its scope was listed: the race the second read exists for). Rig beads are judged too.
+x_reset
+printf '[%s,%s]' "$(bead_json wa-race4 claimant-late-rig)" "$(bead_json wa-race5 claimant-ghost-rig)" > "$RIGBEADS/whatsapp_automation.json"
+INPROGRESS_R="[$(bead_json ga-race1 claimant-late),$(bead_json ga-race2 claimant-early),$(bead_json ga-race3 claimant-ghost)]"
+ROSTER_FIRST=$(sess_json claimant-early)
+ROSTER_SECOND=$(sess_json claimant-late claimant-late-rig)
+X_RIGS="$RIGS5"; X_RIG_BEADS_DIR="$RIGBEADS"; X_SESSION_AFTER="$ROSTER_SECOND"; X_CALL_LOG="$CALLS"
+sweep_logged "$ROSTER_FIRST" "$INPROGRESS_R" "gastown.dog" >/dev/null
+sweep_logged "$ROSTER_FIRST" "$INPROGRESS_R" "gastown.dog" >/dev/null
+if [ "$(count_resets ga-race1)" = "0" ] && [ "$(ledger_count ga-race1)" = "0" ]; then ok "claimant alive only in the SECOND read (the race) is not reset and not counted"; else bad "claimant alive only in the second read was reset or counted (resets $(count_resets ga-race1), ledger $(ledger_count ga-race1)) - the ga-nvx race is open"; fi
+if [ "$(count_resets ga-race2)" = "0" ] && [ "$(ledger_count ga-race2)" = "0" ]; then ok "claimant alive only in the FIRST read is not reset and not counted"; else bad "claimant alive only in the first read was reset or counted (resets $(count_resets ga-race2), ledger $(ledger_count ga-race2))"; fi
+if [ "$(count_resets wa-race4)" = "0" ] && [ "$(ledger_count wa-race4)" = "0" ]; then ok "a RIG bead's claimant alive only in the second read is not reset and not counted"; else bad "rig bead with a claimant alive in the second read was reset or counted (resets $(count_resets wa-race4), ledger $(ledger_count wa-race4))"; fi
+if [ "$(count_resets ga-race3)" = "1" ]; then ok "claimant alive in neither read is reset after 2 sweeps (the order still works)"; else bad "claimant alive in neither read: $(count_resets ga-race3) resets, want 1"; fi
+if [ "$(count_resets wa-race5)" = "1" ]; then ok "a RIG bead with nobody alive is reset after 2 sweeps (rig scopes are still judged)"; else bad "rig bead with nobody alive: $(count_resets wa-race5) resets, want 1 - rig scopes are no longer swept"; fi
+
+echo "── 15. functional (ga-2m9nqn1): a rig whose bd list fails adds no rows (not judged, not counted) and does not stop cleanup elsewhere ──"
+x_reset
+printf '[%s]' "$(bead_json mk-down1 claimant-ghost-mk)" > "$RIGBEADS/marketing.json"
+printf '[%s]' "$(bead_json lx-up1 claimant-ghost-lx)" > "$RIGBEADS/lexbh.json"
+INPROGRESS_H="[$(bead_json ga-hq-dead claimant-ghost-hq)]"
+X_RIGS="$RIGS5"; X_RIG_BEADS_DIR="$RIGBEADS"; X_BDLIST_FAIL_RIG="marketing"; X_CALL_LOG="$CALLS"
+sweep_logged '{"sessions":[]}' "$INPROGRESS_H" "gastown.dog" >/dev/null
+sweep_logged '{"sessions":[]}' "$INPROGRESS_H" "gastown.dog" >/dev/null
+if [ "$(count_resets mk-down1)" = "0" ] && [ "$(ledger_count mk-down1)" = "0" ]; then ok "the rig whose bd list failed is neither judged nor counted"; else bad "bead of a rig whose bd list failed was reset or counted (resets $(count_resets mk-down1), ledger $(ledger_count mk-down1))"; fi
+if [ "$(count_resets ga-hq-dead)" = "1" ]; then ok "HQ is still swept when a rig is unreachable"; else bad "HQ bead: $(count_resets ga-hq-dead) resets, want 1 - one unreachable rig disabled cleanup"; fi
+if [ "$(count_resets lx-up1)" = "1" ]; then ok "the rig listed AFTER the unreachable one is still swept"; else bad "rig after the unreachable one: $(count_resets lx-up1) resets, want 1"; fi
+
+echo "── 16. functional (ga-2m9nqn1): a roster that is missing, or is not a roster, ends the sweep before anything is reset or counted ──"
+x_reset
+INPROGRESS_D="[$(bead_json ga-inert1 claimant-ghost-d)]"
+X_RIGS="$RIGS5"; X_RIG_BEADS_DIR="$RIGBEADS"; X_CALL_LOG="$CALLS"
+inert_case() {
+    # $1 label, $2 = what the 1st read answers, $3 = bd list calls the first sweep may make, $4 = text expected on stderr.
+    # Two sweeps: enough to cross CONFIRM_THRESHOLD if a failed sweep counted for anything.
+    local rc=0
+    sweep_logged "$2" "$INPROGRESS_D" "gastown.dog" >/dev/null 2>"$WORK/err.txt" || rc=$?
+    if [ "$rc" = "0" ]; then ok "$1: the sweep exits 0"; else bad "$1: the sweep exited $rc"; fi
+    if [ "$(calls '^bd list')" = "$3" ]; then ok "$1: $3 bd list call(s) before it stopped"; else bad "$1: $(calls '^bd list') bd list calls, want $3 (calls: $(call_dump))"; fi
+    if grep -q -- "$4" "$WORK/err.txt"; then ok "$1: the reason is on stderr"; else bad "$1: stderr does not say why: $(cat "$WORK/err.txt")"; fi
+    sweep_logged "$2" "$INPROGRESS_D" "gastown.dog" >/dev/null 2>&1 || true
+    if [ "$(count_resets ga-inert1)" = "0" ]; then ok "$1: bead NOT reset after 2 sweeps"; else bad "$1: bead reset on an unreadable roster"; fi
+    if [ "$(ledger_count ga-inert1)" = "0" ]; then ok "$1: nothing counted toward the threshold"; else bad "$1: ledger count $(ledger_count ga-inert1) - the unreadable sweep counted"; fi
+}
+X_SESSION_FAIL_ON=1
+inert_case "first read fails (rc 1)" '{"sessions":[]}' 0 "before the bead lists"
+X_SESSION_FAIL_ON=2
+inert_case "second read fails (rc 1)" '{"sessions":[]}' 6 "after the bead lists"
+X_SESSION_FAIL_ON=''
+inert_case "first read answers no bytes (rc 0)" '' 0 "before the bead lists"
+inert_case "first read answers garbage (rc 0)" 'not a roster' 0 "before the bead lists"
+inert_case "first read answers JSON with no .sessions (rc 0)" '{"ok":false}' 0 "before the bead lists"
+inert_case "first read answers sessions=null (rc 0)" '{"sessions":null}' 0 "before the bead lists"
+inert_case "first read answers sessions as an object (rc 0)" '{"sessions":{"a":1}}' 0 "before the bead lists"
+X_SESSION_AFTER='not a roster'
+inert_case "second read answers garbage (rc 0)" '{"sessions":[]}' 6 "after the bead lists"
+X_SESSION_AFTER='{"ok":false}'
+inert_case "second read answers JSON with no .sessions (rc 0)" '{"sessions":[]}' 6 "after the bead lists"
+X_SESSION_AFTER=''
+sweep_logged '{"sessions":[]}' "$INPROGRESS_D" "gastown.dog" >/dev/null
+if [ "$(ledger_count ga-inert1)" = "1" ]; then ok "a healthy sweep right after counts exactly 1: the unreadable ones left no residue"; else bad "healthy sweep after the unreadable ones: ledger count $(ledger_count ga-inert1), want 1"; fi
+sweep_logged '{"sessions":[]}' "$INPROGRESS_D" "gastown.dog" >/dev/null
+if [ "$(count_resets ga-inert1)" = "1" ]; then ok "and the next healthy sweep resets it (the threshold still works)"; else bad "second healthy sweep: $(count_resets ga-inert1) resets, want 1"; fi
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
