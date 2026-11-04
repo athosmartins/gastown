@@ -305,6 +305,18 @@ node_add() { printf '%s|%s|%s\n' "$1" "$((NOW + ${3:-1800} - $2))" "$((NOW + ${3
 after_read() { printf '%s\n' "$1" > "$T/stub/after-read.sh"; }   # after_read <comando>: roda no nó DEPOIS da próxima leitura (a janela entre achar e agir); $STUB_DIR e o relógio em $STUB_DIR/node.now
 node_has() { grep -q "^$1|" "$T/stub/node.tmux" && echo 1 || echo 0; }
 keys_on() { local k; for k in "$@"; do : > "$C/.gc/hetzner-occupancy-$k.on"; done; }
+state_set() {   # state_set <chave>=<json> ...: regrava chaves do estado que o vigia deixou (chave sem valor = apaga), como quem o editou à mão
+  python3 -I -c 'import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+for kv in sys.argv[2:]:
+  k, _, v = kv.partition("=")
+  if v == "":
+      d.pop(k, None)
+  else:
+      d[k] = json.loads(v)
+json.dump(d, open(p, "w"))' "$C/.gc/hetzner-occupancy.state.json" "$@"
+}
 acts() { cat "$T/stub/ssh.act" 2>/dev/null | wc -l | tr -d ' '; }   # quantas ações o vigia mandou ao nó
 notifies() { cat "$T/stub/notify.count" 2>/dev/null || echo 0; }
 creates() { cat "$T/stub/create.count" 2>/dev/null || echo 0; }
@@ -1215,18 +1227,6 @@ PY
   while IFS= read -r l; do case "$l" in "ok "*) ok "${l#ok }" ;; *) bad "$l" ;; esac; done < "$T/lastro.out"
 
   echo "--- lastro: o que o vigia imprime e grava (recuo, ordem das chaves, acento) e as contas que só o estado de ontem mostra"
-  state_set() {   # state_set <chave>=<json> ...: regrava chaves do estado que o vigia deixou (chave sem valor = apaga), como quem o editou à mão
-    python3 -I -c 'import json, sys
-p = sys.argv[1]
-d = json.load(open(p))
-for kv in sys.argv[2:]:
-    k, _, v = kv.partition("=")
-    if v == "":
-        d.pop(k, None)
-    else:
-        d[k] = json.loads(v)
-json.dump(d, open(p, "w"))' "$C/.gc/hetzner-occupancy.state.json" "$@"
-  }
   fresh; W GC_CITY_PATH="$T/çidade" -- --print-config
   eq "print-config: recuo de 2 espaços e acento sem escape (ensure_ascii=False)" 1 "$(grep -c '^  "city": ".*çidade",$' "$WOUT" | tr -d ' ')"
   fresh; sessions_are '{"sessions":[{"session_name":"dog-remote-ação","alias":"dog-remote-ação","state":"active"}]}'; beads_are '[{"id":"ga-b1","status":"in_progress","assignee":"dog-remote-ação"}]'
@@ -1572,6 +1572,14 @@ g_aviso() {
   d4_setup; TENV+=(HETZNER_OCC_ACT_TRIES=3); xrun 5 $LOWW; eq "tentativa sobrando no d2 (3, gastou 3 só no 7º tick): não esgotou, não avisa" "nao/0/0" "$(reading d4)/$(notifies)/$(creates)"
   d4_setup; X_RAM_MB=15000; xrun 5 $LOWW; eq "causa RAM: nada cabe, a escada está esgotada de saída; o D4 avisa e diz que não tentou nada (a causa não tem degrau)" "enviado:entregue/1" "$(reading d4)/$(notifies)"
   has "... com a causa em português e 'nada' no que tentou" "Causa: pouca memória livre no nó: não cabe mais lastro." "$(cat "$T/stub/notify.1.text")"; has "... e que não tentou nada" "Tentei: nada (a causa não tem degrau que caiba)." "$(cat "$T/stub/notify.1.text")"
+  # lixo NÃO lido nunca esgota a escada, qualquer que seja a causa: o D1 é o 1º degrau e o que libera RAM (gate-fix 1, ga-2hd02v.5.10)
+  d4_setup; X_RAM_MB=15000; X_TMUX=falha; xrun 5 $LOWW
+  eq "causa RAM com o LIXO ilegível (tmux falhou): não sei se o D1 tinha o que fazer, então a escada NÃO esgotou: o D4 não avisa nem cria bead, e o D1 aparece 'cego' (d2 e d3: 'ram')" "RAM/false/cego/ram/ram/nao/0/0" "$(reading causa)/$(reading lixo.lido)/$(reading degrau.d1)/$(reading degrau.d2)/$(reading degrau.d3)/$(reading d4)/$(notifies)/$(creates)"
+  X_TMUX=lista; xtick 900 $LOWW; eq "... o tmux volta a ler (sem lixo): o D1 deixa de ser cego, a escada esgota e o D4 avisa (o lixo ilegível era o único que segurava)" "RAM/true/ram/enviado:entregue/1" "$(reading causa)/$(reading lixo.lido)/$(reading degrau.d1)/$(reading d4)/$(notifies)"
+  d4_setup; X_RAM_MB=15000; X_OMIT="now"; xrun 5 $LOWW; eq "RAM com o relógio do nó ilegível (outro motivo de lixo não lido): idem, não esgota" "false/cego/nao/0" "$(reading lixo.lido)/$(reading degrau.d1)/$(reading d4)/$(notifies)"
+  d4_setup; X_TMUX=falha; xrun 5 $LOWW
+  eq "mesma classe, outra causa (lastro-sem-trabalho, o d2 gastou a tentativa) com o LIXO ilegível: a causa começa depois do D1, mas sem ler o lixo o D1 não está 'fora', está 'cego', e a escada NÃO esgota: sem aviso, sem bead" "lastro-sem-trabalho/false/cego/esgotado/nao/0/0" "$(reading causa)/$(reading lixo.lido)/$(reading degrau.d1)/$(reading degrau.d2)/$(reading d4)/$(notifies)/$(creates)"
+  d4_setup; xrun 5 $LOWW >/dev/null; eq "(controle) o mesmo cenário com o lixo LIDO: o D1 é 'fora' (a causa começa no d2) e o D4 avisou" "fora/enviado:entregue" "$(reading degrau.d1)/$(reading d4)"
   d4_setup; X_OMIT="mem"; xrun 5 $LOWW; eq "RAM não lida com núcleo sobrando: a causa é cego, a escada nunca esgota e o D4 NÃO avisa (o cego não vira 'esgotei')" "cego/nao/0/0" "$(reading causa)/$(reading d4)/$(notifies)/$(creates)"
   d4_setup; xrun 4 $LOWW >/dev/null; STUB_SSH_RC=1; xtick 900 $LOWW; eq "CPU não lida na hora do aviso: não há sequência baixa lida, o D4 não é devido" "nao/0" "$(reading d4)/$(notifies)"
   d4_setup; xrun 4 $LOWW >/dev/null; cp "$C/.gc/hetzner-occupancy.state.json" "$T/state.before"; XARGS="--print --dry-run" xtick 900 $LOWW; eq "--dry-run: diz 'enviaria', não manda, não cria bead e não grava o estado" "enviaria/0/0/1" "$(reading d4)/$(notifies)/$(creates)/$(cmp -s "$C/.gc/hetzner-occupancy.state.json" "$T/state.before" && echo 1 || echo 0)"
@@ -1599,6 +1607,23 @@ g_aviso() {
   d4_setup; STUB_NOTIFY_SLEEP=8; TENV+=(HETZNER_OCC_NOTIFY_TIMEOUT_S=2); xrun 5 $LOWW; eq "notify que trava (além do notify_timeout_s): 'timeout' = NÃO saiu, com o mail de reserva" "falhou:timeout/enviado/1" "$(reading d4)/$(reading d4_mail)/$(mails)"
   d4_setup; TENV+=(NOTIFY_BIN="$T/bin/nao-existe"); xrun 5 $LOWW; eq "notify que nem existe: 'nao-executou' = NÃO saiu, com o mail de reserva" "falhou:nao-executou/enviado" "$(reading d4)/$(reading d4_mail)"
   d4_setup; STUB_NOTIFY_RC=12; STUB_MAIL_RC=1; xrun 5 $LOWW; eq "notify e mail falham juntos: o vigia diz as DUAS falhas e continua tentando o notify" "falhou:rc-12/falhou/2026-10-19/null" "$(reading d4)/$(reading d4_mail)/2026-10-19/$(state_f d4_dia)"
+
+  # ---- a falha do notify é de um EPISÓDIO (gate-fix 1, ga-2hd02v.5.10): o marcador só é limpo por um envio que DÁ CERTO, e a sequência baixa (ou o dia) acaba sem isso -------------------
+  # o marcador velho, de uma sequência que já acabou, fazia o `deliver` achar que o mail de reserva da sequência NOVA já tinha saído: o Athos não era avisado e o Mayor também não
+  d4_setup; STUB_NOTIFY_RC=12; xrun 5 $LOWW
+  eq "1º episódio: o notify falha (rc 12), o mail de reserva sai e a falha anotada leva o episódio dela (a sequência baixa em curso)" "falhou:rc-12/enviado/1/1/1" "$(reading d4)/$(reading d4_mail)/$(notifies)/$(mails)/$([ "$(state_f d4_falha_ep)" = "$(state_f baixa_desde)" ] && [ "$(state_f d4_falha_ep)" != null ] && echo 1 || echo 0)"
+  EP1=$(state_f d4_falha_ep)
+  xtick 900 1400 30 50 0; eq "a CPU volta à meta: a sequência acaba SEM um envio que dê certo, e o marcador da falha (hora e episódio) fica no estado: é isto que não pode calar a próxima" "0/$EP1/1" "$(state_f baixas_seguidas)/$(state_f d4_falha_ep)/$([ "$(state_f d4_falha_em)" != null ] && echo 1 || echo 0)"
+  xrun 4 $LOWW; eq "2º episódio (outra sequência baixa, 75 min depois): o notify falha de novo e o mail de reserva sai DE NOVO (o marcador do 1º episódio não vale para este)" "falhou:rc-12/enviado/2/2" "$(reading d4)/$(reading d4_mail)/$(notifies)/$(mails)"
+  eq "... e a falha anotada passa a levar o episódio NOVO" 1 "$([ "$(state_f d4_falha_ep)" = "$(state_f baixa_desde)" ] && [ "$(state_f d4_falha_ep)" != "$EP1" ] && echo 1 || echo 0)"
+  xtick 900 $LOWW; eq "dentro do mesmo episódio a regra antiga segue: 15 min depois é 'espera-retry' e o mail de reserva não se repete" "espera-retry/2/2" "$(reading d4)/$(notifies)/$(mails)"
+  # o espelho do que o revisor reproduziu: marcador com UM DIA, sem episódio gravado (estado antigo), e o notify falha na 1ª tentativa desta sequência
+  d4_setup; xrun 4 $LOWW >/dev/null; state_set "d4_falha_em=$((NOW - 86400))"; STUB_NOTIFY_RC=12; xtick 900 $LOWW
+  eq "marcador de falha com 1 dia e sem episódio: é a 1ª falha DESTA sequência, então o mail de reserva SAI (marcador velho não cala)" "falhou:rc-12/enviado/1/1" "$(reading d4)/$(reading d4_mail)/$(notifies)/$(mails)"
+  d4_setup; xrun 4 $LOWW >/dev/null; state_set "d4_falha_em=$((NOW - 86400))" "d4_falha_ep=12345"; STUB_NOTIFY_RC=12; xtick 900 $LOWW
+  eq "idem com o marcador de OUTRA sequência gravada (episódio diferente do de agora): o mail de reserva sai" "falhou:rc-12/enviado/1/1" "$(reading d4)/$(reading d4_mail)/$(notifies)/$(mails)"
+  d4_setup; xrun 4 $LOWW >/dev/null; state_set "d4_falha_em=$((NOW - 1800))" "d4_falha_ep=12345"; STUB_NOTIFY_RC=12; xtick 900 $LOWW
+  eq "marcador de OUTRA sequência de 30 min atrás: ele também não prende o retry desta ('espera-retry' é do episódio de agora), então o notify é tentado já" "falhou:rc-12/1" "$(reading d4)/$(notifies)"
 
   # ---- a bead do D4 ---------------------------------------------------------------------------------------------------------------------------------------------------------------
   d4_setup; STUB_BD_CREATE_RC=1; xrun 5 $LOWW
@@ -1661,6 +1686,19 @@ PY
   xtick 900 $LOWW; eq "15 min depois: 'espera-retry' (1 h entre tentativas), nada novo sai" "espera-retry/1/1" "$(reading numero_do_dia)/$(notifies)/$(mails)"
   STUB_NOTIFY_RC=0; xtick 900 $LOWW >/dev/null; xtick 900 $LOWW >/dev/null; xtick 900 $LOWW
   eq "1 h depois o notify volta: 'enviado', o dia fica avaliado e a falha limpa; o mail de reserva não se repetiu" "enviado:entregue/2026-10-19/null/1" "$(reading numero_do_dia)/$(state_f dia_avaliado)/$(state_f dia_falha_em)/$(mails)"
+  # a falha do notify do dia é do DIA julgado (gate-fix 1, ga-2hd02v.5.10): o marcador do número de 18/10, que nunca chegou a sair, não cala o mail do número de 19/10 nem prende o retry dele
+  xfresh $((NOW0 + 36000)); keys_on dia; numdia 2026-10-18 60.0 96 '{"lixo":2}' 1; STUB_NOTIFY_RC=12; xtick 900 $LOWW
+  eq "22h15 de 19/10, número de 18/10: o notify falha, o mail de reserva sai e a falha anotada leva o dia julgado" "falhou:rc-12/enviado/1/1/2026-10-18" "$(reading numero_do_dia)/$(reading numero_do_dia_mail)/$(notifies)/$(mails)/$(state_f dia_falha_ep)"
+  numdia 2026-10-19 60.0 96 '{"lixo":2}' 1; for _ in 1 2 3 4 5 6; do xtick 900 $LOWW >/dev/null; done
+  eq "23h45 de 19/10: o notify do número de 18/10 foi tentado de novo na hora seguinte (23h15: 2 notifies) SEM repetir o mail de reserva (1), a leitura de agora espera o retry e a falha segue sendo do dia 18/10" "espera-retry/2/1/2026-10-18" "$(reading numero_do_dia)/$(notifies)/$(mails)/$(state_f dia_falha_ep)"
+  xtick 900 $LOWW; eq "00h00 de 20/10: o número agora é o de 19/10, OUTRO dia: não espera o retry do de 18/10 (a falha dele foi há 45 min) e o mail de reserva dele sai (o marcador do 18/10 não o cala); a falha anotada leva o dia novo" "falhou:rc-12/enviado/3/2/2026-10-19" "$(reading numero_do_dia)/$(reading numero_do_dia_mail)/$(notifies)/$(mails)/$(state_f dia_falha_ep)"
+  # o espelho do que o revisor reproduziu: marcador com UM DIA e sem dia gravado (estado antigo), notify falhando na 1ª tentativa deste número
+  xfresh; keys_on dia; numdia 2026-10-18 60.0 96 '{"lixo":2}' 1; STUB_NOTIFY_RC=12; xtick 900 $LOWW >/dev/null; state_set "dia_falha_em=$((NOW - 86400))" "dia_falha_ep="; xtick 900 $LOWW
+  eq "marcador de falha com 1 dia e sem dia gravado: é a 1ª falha DESTE número, então o mail de reserva SAI de novo (marcador velho não cala)" "falhou:rc-12/enviado/2" "$(reading numero_do_dia)/$(reading numero_do_dia_mail)/$(mails)"
+  xfresh; keys_on dia; numdia 2026-10-18 60.0 96 '{"lixo":2}' 1; STUB_NOTIFY_RC=12; xtick 900 $LOWW >/dev/null; state_set "dia_falha_em=$((NOW - 86400))" "dia_falha_ep=\"2026-10-17\""; xtick 900 $LOWW
+  eq "idem com o marcador do dia 17/10 gravado (outro dia que o julgado agora, 18/10): o mail de reserva sai" "falhou:rc-12/enviado/2" "$(reading numero_do_dia)/$(reading numero_do_dia_mail)/$(mails)"
+  xfresh; keys_on dia; numdia 2026-10-18 60.0 96 '{"lixo":2}' 1; STUB_NOTIFY_RC=12; xtick 900 $LOWW >/dev/null; state_set "dia_falha_em=$((NOW - 1800))" "dia_falha_ep=\"2026-10-17\""; xtick 900 $LOWW
+  eq "marcador do dia 17/10 de 30 min atrás: não prende o retry do número de 18/10 ('espera-retry' é do dia de agora), o notify é tentado já" "falhou:rc-12/2" "$(reading numero_do_dia)/$(notifies)"
   # o número do dia e o D4 são avisos diferentes: o mesmo dia pode ter os dois
   d4_setup; keys_on dia; numdia 2026-10-18 60.0 96 '{"lixo":2}' 1; xrun 5 $LOWW
   eq "o D4 e o número do dia são independentes: 2 notifies (um de cada), cada um uma vez" "enviado:entregue/ja-avaliado/2" "$(reading d4)/$(reading numero_do_dia)/$(notifies)"
@@ -1985,6 +2023,18 @@ g_mutantes() {
   mutante notify-falho-vira-do-dia "aviso" $'new_st["d4_dia"] = st.get("d4_dia")  # não saiu' $'pass  # não saiu'
   mutante notify-falho-gasta-o-dia "aviso" $'new_st["dia_avaliado"] = st.get("dia_avaliado")' $'pass'
   mutante notify-falho-sem-mail "aviso" $'if falha_em is None else None' $'if False else None'
+  # gate-fix 1 (ga-2hd02v.5.10): a falha do notify é de um EPISÓDIO; lixo não lido nunca esgota a escada
+  mutante falha-de-outro-episodio-cala-o-mail "aviso" $'    if falha_em is None or ep is None or falha_ep != ep:\n        return None\n    return falha_em' $'    if falha_em is None:\n        return None\n    return falha_em'
+  mutante falha-sem-dono-vale "aviso" $'or ep is None or falha_ep != ep:' $'or ep is None:'
+  mutante d4-episodio-nao-gravado "aviso" $'(None if falha4 is None else d4_ep)' $'None'
+  mutante dia-episodio-nao-gravado "aviso" $'(None if falhad is None else ykey)' $'None'
+  mutante d4-marcador-de-qualquer-episodio "aviso" $'falha_do_episodio(new_st["d4_falha_em"], new_st["d4_falha_ep"], d4_ep)' $'falha_do_episodio(new_st["d4_falha_em"], new_st["d4_falha_ep"], new_st["d4_falha_ep"])'
+  mutante dia-marcador-de-qualquer-dia "aviso" $'falha_do_episodio(new_st["dia_falha_em"], new_st["dia_falha_ep"], ykey)' $'falha_do_episodio(new_st["dia_falha_em"], new_st["dia_falha_ep"], new_st["dia_falha_ep"])'
+  mutante d4-retry-prende-outro-episodio "aviso" $'plan_notice(c, "d4", d4_due, st.get("d4_dia") == today, d4_falha, now, dry)' $'plan_notice(c, "d4", d4_due, st.get("d4_dia") == today, new_st["d4_falha_em"], now, dry)'
+  mutante dia-retry-prende-outro-dia "aviso" $'plan_notice(c, "dia", True, False, dia_falha, now, dry)' $'plan_notice(c, "dia", True, False, new_st["dia_falha_em"], now, dry)'
+  mutante ram-lixo-cego-esgota "aviso" $', None, not d1_cego' $', None, True'
+  mutante ram-d1-cego-sem-rotulo "aviso" $'d1="cego" if d1_cego else "ram"' $'d1="ram"'
+  mutante lixo-cego-vira-fora "aviso" $'if k == "d1" and d1_cego:' $'if False:'
   mutante notify-sem-espera-do-retry "aviso" $'    if falha_em is not None and 0 <= now - falha_em < c.notify_retry_s:\n        return "espera-retry"' $'    if False:\n        return "espera-retry"'
   # D4: só depois de 6 h, só esgotado, uma vez por dia, e a bead é registro (nunca despachável)
   mutante d4-sem-esgotar "aviso" $'d4_due = low["n"] > 0 and exhausted and' $'d4_due = low["n"] > 0 and'

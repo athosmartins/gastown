@@ -327,7 +327,7 @@ def read_sessions(c):
     for s in lst:
         ident = _ident(s)
         if isinstance(s, dict):
-            known.update(_owners(s))  # o que a cidade conhece por nome, qualquer estado (viva, dormindo, fechada, de outro host): o D1 só mata o que NÃO está aqui
+            known.update(_owners(s))  # o que a cidade conhece por nome na lista do `gc session list --json` (sem --state, o padrão do gc: ativas e suspensas; uma sessão fechada fica de fora): o D1 só mata o que NÃO está aqui
             if ident:
                 known.add(ident)
             if not _owners(s):
@@ -899,14 +899,17 @@ def _tries(st, k):
 def plan_ladder(c, cause, low_due, st, now, lixo, nuc, ram_mb, memo_n):
     """(status_por_degrau, escolhido|None, esgotou). A escada só mexe com a CPU abaixo da régua há >= 30 min (low_due) e causa que diga por onde começar; considera os degraus a partir do da causa, em ordem; UM por leitura
     e com o intervalo global entre ações. Aplicabilidade em 3 estados (sim/não/não li): o que não li NUNCA conta como "esgotado". esgotou = causa dita (ou RAM, em que nada cabe) e nenhum degrau aplicável com chave e
-    tentativa sobrando; degrau aplicável com a chave desligada NÃO esgota (ninguém autorizou a tentar)."""
+    tentativa sobrando; degrau aplicável com a chave desligada NÃO esgota (ninguém autorizou a tentar). O D1 é o 1º degrau e o que libera RAM: lixo NÃO lido nunca esgota a escada, qualquer que seja a causa (a causa pode ter
+    ficado de fora justamente porque o lixo não pôde ser lido), e o D1 aparece `cego` em vez de `fora`/`ram`."""
     status = {k: None for k in RUNGS}
     if not low_due or cause is None:
         return {k: "nao-devido" for k in RUNGS}, None, False
     if cause == "cego":
         return {k: "cego" for k in RUNGS}, None, False
+    d1_cego = not lixo["lido"]
     if cause == "RAM":
-        return {k: "ram" for k in RUNGS}, None, True
+        # nada cabe, mas "nada cabe" só esgota se o lixo (o que liberaria RAM) foi LIDO: sem ler, não sei se o D1 tinha o que fazer
+        return dict({k: "ram" for k in RUNGS}, d1="cego" if d1_cego else "ram"), None, not d1_cego
     appl = {"d1": None if not lixo["lido"] else lixo["n"] > 0 and bool(lixo["_alvos"]),
             "d2": None if not nuc["lido"] or ram_mb is None else d2_extra(c, nuc, ram_mb) >= 1,
             "d3": None if memo_n is None else memo_n > 0}
@@ -916,6 +919,9 @@ def plan_ladder(c, cause, low_due, st, now, lixo, nuc, ram_mb, memo_n):
     for i, k in enumerate(RUNGS):
         if i < RUNGS.index(RUNG_OF_CAUSE[cause]):
             status[k] = "fora"
+            if k == "d1" and d1_cego:  # a causa começa depois dele, mas sem ler o lixo não sei se ele tinha o que fazer
+                status[k] = "cego"
+                exhausted = False
         elif appl[k] is None:
             status[k], exhausted = "cego", False
         elif not appl[k]:
@@ -1020,8 +1026,18 @@ def send_notify(c, title, text):
     return (True, ok[rc]) if rc in ok else (False, "rc-%s" % rc)
 
 
+def falha_do_episodio(falha_em, falha_ep, ep):
+    """A hora da falha do notify, SÓ se ela é do episódio `ep` (D4: a sequência baixa em curso, `baixa_desde`; número do dia: o dia julgado); senão None = "neste episódio ainda não falhou". O marcador só é limpo por um envio que
+    DÁ CERTO, e a sequência ou o dia acaba sem isso: sem o dono, o marcador velho fazia o `deliver` achar que o mail de reserva deste episódio já tinha saído, e o Athos e o Mayor ficavam sem saber (ga-i4t0lzx). Marcador sem dono (estado
+    antigo), de outro episódio ou sem episódio para comparar conta como de OUTRO: o erro cai para mandar o mail de novo, nunca para calar."""
+    if falha_em is None or ep is None or falha_ep != ep:
+        return None
+    return falha_em
+
+
 def deliver(c, title, text, falha_em, now):
-    """(entregue, rótulo, falha_em_novo, mail_ok|None). O notify que não saiu tenta de novo a cada notify_retry_s; o mesmo texto vai UMA vez por `gc mail send mayor` (o Mayor repassa), na 1ª falha."""
+    """(entregue, rótulo, falha_em_novo, mail_ok|None). O notify que não saiu tenta de novo a cada notify_retry_s; o mesmo texto vai UMA vez por `gc mail send mayor` (o Mayor repassa), na 1ª falha DO EPISÓDIO: quem chama passa
+    `falha_em` já filtrado por falha_do_episodio (None = esta é a 1ª falha deste episódio, mesmo que haja marcador de um anterior)."""
     if falha_em is not None and 0 <= now - falha_em < c.notify_retry_s:
         return False, "espera-retry", falha_em, None
     ok, why = send_notify(c, title, text)
@@ -1212,11 +1228,15 @@ def run(args, env):
               "baixa_nucleos_s": None if low["n"] == 0 else round(low["nucleos_s"], 2), "baixa_capacidade_s": None if low["n"] == 0 else low["cap_s"], "alarme_baixa_em": last_low,
               "cpu_extra": new_xbase or (st.get("cpu_extra") if _extra_base_ok(st.get("cpu_extra")) else None), "degraus": deg, "pendentes": pendentes,
               "ultima_acao_em": _int(st.get("ultima_acao_em")), "d4_dia": st.get("d4_dia"), "d4_bead": st.get("d4_bead") if low["n"] > 0 else None, "d4_falha_em": _int(st.get("d4_falha_em")),
-              "dia_avaliado": st.get("dia_avaliado"), "dia_falha_em": _int(st.get("dia_falha_em"))}
+              "d4_falha_ep": _int(st.get("d4_falha_ep")), "dia_avaliado": st.get("dia_avaliado"), "dia_falha_em": _int(st.get("dia_falha_em")),
+              "dia_falha_ep": st.get("dia_falha_ep") if isinstance(st.get("dia_falha_ep"), str) else None}
 
     # avisos ao Athos: o D4 (esgotou) e o número do dia
     d4_due = low["n"] > 0 and exhausted and now - low["desde"] >= c.d4_after_s - c.slack_s
-    s_d4 = plan_notice(c, "d4", d4_due, st.get("d4_dia") == today, new_st["d4_falha_em"], now, dry)
+    # a falha do notify é do EPISÓDIO que a causou (D4: a sequência baixa em curso; número do dia: o dia julgado): marcador de outro episódio não vale como "o mail de reserva deste já saiu"
+    d4_ep = low["desde"] if low["n"] > 0 else None
+    d4_falha = falha_do_episodio(new_st["d4_falha_em"], new_st["d4_falha_ep"], d4_ep)
+    s_d4 = plan_notice(c, "d4", d4_due, st.get("d4_dia") == today, d4_falha, now, dry)
     yday = ykey = None
     if not c.on["dia"]:
         verdict = "desligado"  # sem a chave: nem avalia (INERTE)
@@ -1224,7 +1244,8 @@ def run(args, env):
         verdict = "ja-avaliado"
     else:
         verdict, yday, ykey = judge_yesterday(c, daily, now)
-    s_dia = plan_notice(c, "dia", True, False, new_st["dia_falha_em"], now, dry) if verdict == "abaixo" else verdict
+    dia_falha = falha_do_episodio(new_st["dia_falha_em"], new_st["dia_falha_ep"], ykey)
+    s_dia = plan_notice(c, "dia", True, False, dia_falha, now, dry) if verdict == "abaixo" else verdict
     rd.update(d4=s_d4, numero_do_dia=s_dia)
 
     sends = []  # (chave do estado, valor antigo, assunto, corpo)
@@ -1273,11 +1294,11 @@ def run(args, env):
                 x4 += " Bead: %s." % new_st["d4_bead"]
             new_st["d4_dia"] = today
             save()
-            ok4, why4, falha4, mail4 = deliver(c, t4, x4, new_st["d4_falha_em"], now)
+            ok4, why4, falha4, mail4 = deliver(c, t4, x4, d4_falha, now)
             rd["d4"] = "enviado:" + why4 if ok4 else "falhou:" + why4
             if mail4 is not None:
                 rd["d4_mail"] = "enviado" if mail4 else "falhou"
-            new_st["d4_falha_em"] = falha4
+            new_st["d4_falha_em"], new_st["d4_falha_ep"] = falha4, (None if falha4 is None else d4_ep)
             if not ok4:
                 new_st["d4_dia"] = st.get("d4_dia")  # não saiu: não conta como o aviso do dia (a próxima hora tenta de novo)
             save()
@@ -1285,11 +1306,11 @@ def run(args, env):
             tt, xx = day_notice(c, yday, ykey)
             new_st["dia_avaliado"] = today
             save()
-            okd, whyd, falhad, maild = deliver(c, tt, xx, new_st["dia_falha_em"], now)
+            okd, whyd, falhad, maild = deliver(c, tt, xx, dia_falha, now)
             rd["numero_do_dia"] = "enviado:" + whyd if okd else "falhou:" + whyd
             if maild is not None:
                 rd["numero_do_dia_mail"] = "enviado" if maild else "falhou"
-            new_st["dia_falha_em"] = falhad
+            new_st["dia_falha_em"], new_st["dia_falha_ep"] = falhad, (None if falhad is None else ykey)
             if not okd:
                 new_st["dia_avaliado"] = st.get("dia_avaliado")
             save()
