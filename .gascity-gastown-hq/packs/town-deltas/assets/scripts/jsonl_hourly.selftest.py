@@ -10,6 +10,8 @@ O QUE PROVA:
   A. o parser incremental conta certo em QUALQUER tamanho de bloco (1 byte inclusive) e REJEITA todo dump truncado,
      com lixo, com vírgula sobrando ou não-UTF-8 — a varredura de truncamento cobre cada prefixo possível de um dump válido;
      só os 4 espaços de JSON valem como espaço (NBSP, U+2028, VT, FF são lixo);
+  B2. peças por dia: o build junta as peças <db>/<tabela>/AAAA-MM-DD.jsonl de volta no documento único do pacote (mesmos bytes do layout antigo) e falha fechado
+      sem --tree, em layout misto, com peça faltando, fora de ordem, de tamanho diferente ou fora do formato do Dolt;
   B. build/inspect: só entram <db>/<tabela>.jsonl, o artefato é determinístico, lixo de export abortado fica de fora, symlink/
      hardlink é NOMEADO em skipped, tar de entrada cortado num limite de membro falha (rc != 0) e tabela ilegível vira erro;
   C. manifest: broken quando falta tabela, banco obrigatório ou há erro de parse, ou quando o inspect e o build não descrevem os
@@ -502,6 +504,77 @@ with tempfile.TemporaryDirectory(prefix="jhst.") as T:
     brc, bu, ins_j, man, mrc = pipeline(make_tar(db_members("hq", [{"id": "hq-1"}]) + db_members("wa", [{"id": "wa-1"}]) + db_members("BENCH_x", [{"id": "x"}])),
                                         "case", ignore="bench_*")
     check("casamento diferencia maiúsculas (BENCH_x não é bench_*): na dúvida, não ignora", mrc == 0 and "BENCH_x" in man["databases"] and man["ignored_dbs"] == [])
+
+# ── B2. peças por dia (ga-e4cbc5s) ────────────────────────────────────────────────────
+print("-- B2. peças por dia: o build junta de volta no documento único, o pacote não muda")
+
+
+def piece(rows_):
+    return '{"rows": [%s]}\n' % ",".join(json.dumps(r, separators=(",", ":")) for r in rows_)
+
+
+def tree_txt(members):  # o que `git ls-tree -r -l` imprime: modo, tipo, sha, tamanho alinhado à direita, TAB, caminho
+    return "".join("100644 blob %s %7d\t%s\n" % ("a" * 40, len(c.encode("utf-8")), n) for n, c in reversed(list(members)))   # ao contrário: quem agrupa tem que ordenar
+
+
+CM = [{"id": "c%d" % i, "created_at": d} for i, d in ((1, "2026-11-01 10:00:00"), (2, "2026-11-01 11:00:00"), (3, "2026-11-02 09:00:00"), (4, None))]
+IS = [{"id": "i%d" % i, "created_at": "2026-11-0%d 08:00:00" % d} for i, d in ((1, 1), (2, 2), (3, 2))]
+SMALL = [("hq/config.jsonl", table([{"key": "k"}])), ("hq/dependencies.jsonl", "{}"), ("hq/labels.jsonl", "{}"), ("hq/metadata.jsonl", "{}")]
+PIECES = [("hq/comments/2026-11-01.jsonl", piece(CM[:2])), ("hq/comments/2026-11-02.jsonl", piece(CM[2:3])), ("hq/comments/undated.jsonl", piece(CM[3:])),
+          SMALL[0], SMALL[1], ("hq/issues/2026-11-01.jsonl", piece(IS[:1])), ("hq/issues/2026-11-02.jsonl", piece(IS[1:])), SMALL[2], SMALL[3]]  # a ordem do git archive
+LEGACY = [("hq/comments.jsonl", piece(CM)), SMALL[0], SMALL[1], ("hq/issues.jsonl", piece(IS)), SMALL[2], SMALL[3]]
+
+with tempfile.TemporaryDirectory(prefix="jhst2.") as T2:
+    seq = [0]
+
+    def pbuild(members, tree=None, extra=(), tar=None):
+        """build com as peças; `tree` = membros que a árvore descreve (default: os mesmos); devolve (rc, stderr, files-json ou None, artefato)."""
+        seq[0] += 1
+        tf, out, fj = os.path.join(T2, "t%d.txt" % seq[0]), os.path.join(T2, "a%d.tar.gz" % seq[0]), os.path.join(T2, "f%d.json" % seq[0])
+        args = ["build", "--out", out, "--files-out", fj] + list(extra)
+        if tree is not False:
+            open(tf, "w", encoding="utf-8").write(tree_txt(members if tree is None else tree))
+            args += ["--tree", tf]
+        rc, so, se = run(*args, stdin=tar if tar is not None else make_tar(members))
+        return rc, se, (json.load(open(fj)) if os.path.exists(fj) else None), out
+
+    rc, se, built, art = pbuild(PIECES)
+    lrc, lse, lbuilt, lart = pbuild(LEGACY, tree=False)
+    shas = {f["path"]: f["sha256"] for f in (built or {"files": []})["files"]}
+    check("peças: rc 0 e o pacote tem os 6 <db>/<tabela>.jsonl de sempre (as peças viram o documento único)",
+          rc == 0 and sorted(shas) == sorted(n for n, _ in LEGACY) and not built["skipped"], "rc=%s %s %s" % (rc, se, built))
+    check("peças: o documento de cada tabela tem os MESMOS bytes do layout antigo (mesmo sha256 que o build do tar legado)",
+          lrc == 0 and shas == {f["path"]: f["sha256"] for f in lbuilt["files"]}, repr((shas, lse)))
+    irc, iso, _ = run("inspect", art)
+    check("peças: inspect conta as linhas de todas as peças como uma tabela só", irc == 0 and json.loads(iso)["databases"]["hq"]["comments"] == 4
+          and json.loads(iso)["databases"]["hq"]["issues"] == 3, iso)
+    check("peças: determinístico (mesma entrada, mesmo sha256 do artefato)", built is not None and (pbuild(PIECES)[2] or {}).get("artifact") == built["artifact"])
+    one = [PIECES[5]] + SMALL
+    orc, ose, obuilt, _ = pbuild(one)
+    check("peças: uma peça só => o documento é a própria peça, byte a byte",
+          orc == 0 and {f["path"]: f["sha256"] for f in obuilt["files"]}["hq/issues.jsonl"] == __import__("hashlib").sha256(piece(IS[:1]).encode()).hexdigest(), ose)
+    irc, iso2, ierr = run("inspect", pbuild(PIECES, extra=("--ignore-db", "hq"))[3])
+    check("peças: --ignore-db tira também as peças do banco, sem o documento do banco no pacote", irc == 1 and "hq" not in json.loads(iso2)["databases"], iso2)
+
+    swap = [PIECES[1], PIECES[0]] + PIECES[2:]
+    full_tar = make_tar(PIECES)
+    bad = {
+        "sem --tree": dict(members=PIECES, tree=False),
+        "peça que a árvore não lista": dict(members=PIECES, tree=PIECES[:1] + PIECES[2:]),
+        "peça que a árvore lista e o tar não traz": dict(members=PIECES[:1] + PIECES[2:], tree=PIECES),
+        "tabela inteira que a árvore lista e o tar não traz": dict(members=PIECES[:5] + PIECES[7:], tree=PIECES),
+        "tamanho da árvore diferente do tar": dict(members=PIECES, tree=[(n, c + "x") if n.endswith("11-02.jsonl") else (n, c) for n, c in PIECES]),
+        "peças fora de ordem": dict(members=swap),
+        "documento único ANTES das peças": dict(members=[("hq/comments.jsonl", piece(CM))] + PIECES),
+        "documento único DEPOIS das peças": dict(members=PIECES + [("hq/comments.jsonl", piece(CM))]),
+        "envelope compacto (não é o do Dolt)": dict(members=[(PIECES[0][0], '{"rows":[{"id":"c1"}]}\n')] + PIECES[1:]),
+        "sem a quebra de linha final": dict(members=[(PIECES[0][0], piece(CM[:2]).rstrip("\n"))] + PIECES[1:]),
+        "peça sem linhas": dict(members=[(PIECES[0][0], piece([]))] + PIECES[1:]),
+        "tar cortado no meio do grupo (depois da 1ª peça)": dict(members=PIECES, tar=full_tar[:[mi.offset for mi in tarfile.open(fileobj=io.BytesIO(full_tar)).getmembers()][1]]),
+    }
+    for label, kw in bad.items():
+        rc, se, built_, _ = pbuild(**kw)
+        check("peças (%s) => rc != 0, causa no stderr e nenhum files-out" % label, rc != 0 and se.strip() and built_ is None, "rc=%s %s" % (rc, se[-100:]))
 
 # ── E. retention ──────────────────────────────────────────────────────────────────────
 print("-- E. retention")

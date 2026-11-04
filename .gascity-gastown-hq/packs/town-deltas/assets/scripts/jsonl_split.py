@@ -4,25 +4,24 @@
 Contents
   Por quê · Formato · Subcomandos · Regras de fail-closed
 
-POR QUÊ: cada export regrava hq/comments.jsonl (509 MB) e hq/issues.jsonl (112 MB) inteiros, e o git guarda cada versão como blob novo inteiro até a
-  compactação da madrugada (~180 MB por backup; de dia o disco do mini fica no piso). Em peças por dia só a do dia (mais as poucas de beads antigas
-  editadas) muda de um backup para o outro, e o blob novo é de poucos MB. Quem lê o archive (o pacote horário, jsonl_hourly.py build) junta as peças de volta.
+POR QUÊ: cada export regrava hq/comments.jsonl (509 MB) e hq/issues.jsonl (112 MB) inteiros e o git guarda cada versão como blob novo inteiro até a compactação
+  da madrugada (~180 MB por backup; de dia o disco do mini fica no piso). Em peças por dia só a do dia (e as poucas de beads antigas editadas) muda entre dois
+  backups, e o blob novo é de poucos MB. Quem lê o archive (o pacote horário, jsonl_hourly.py build) junta as peças de volta.
 
-FORMATO: <out-dir>/AAAA-MM-DD.jsonl, dia = os 10 primeiros caracteres de `created_at` ("AAAA-MM-DD HH:MM:SS" do Dolt; "...T..." também vale); linha sem
-  data legível (ausente, nula, fora do formato) vai para undated.jsonl — nunca some. Cada peça é UM documento no formato do Dolt (`{"rows": [` + as linhas
-  separadas por `,` + `]}` + quebra de linha); o texto de cada linha é copiado como está (nada é reserializado) e a ordem é a da entrada.
+FORMATO: <out-dir>/AAAA-MM-DD.jsonl, dia = os 10 primeiros caracteres de `created_at` ("AAAA-MM-DD HH:MM:SS" do Dolt, ou com T); linha sem data legível vai para
+  undated.jsonl — nunca some. Cada peça é UM documento no formato do Dolt (`{"rows": [` + linhas separadas por `,` + `]}` e quebra de linha); o texto de cada linha
+  é copiado como está (nada é reserializado), na ordem da entrada.
 
 SUBCOMANDOS (rc 0 ok / 1 entrada ilegível ou conta que não fecha / 2 uso)
-  split --in F --out-dir D [--key created_at] [--expect-rows N]
-      lê F (documento único) em DUAS passadas. A 1ª não grava nada: valida o documento inteiro, confere --expect-rows e mede cada peça (bytes e sha256).
-      A 2ª grava SÓ as peças que diferem das que já estão em D (o pico de disco é o das peças que mudaram, não o da tabela) e confere o que gravou contra a
-      1ª. Peça de dia que esvaziou é apagada e o mtime de D sempre avança (o alarme de idade da tabela lê o diretório). stdout = {"rows","pieces","written","removed"}.
+  split --in F --out-dir D [--expect-rows N]
+      DUAS passadas sobre F (documento único). A 1ª não grava: valida o documento inteiro, confere --expect-rows e mede cada peça (bytes, sha256). A 2ª grava SÓ as
+      peças que diferem das de D (o pico de disco é o das peças que mudaram, não o da tabela) e confere o que gravou contra a 1ª. Peça de dia que esvaziou é apagada;
+      o mtime de D sempre avança (o alarme de idade da tabela lê o diretório). stdout = {"rows","pieces","written","removed"}.
   count-head --repo R --db NAME --table T [--rev HEAD]
-      stdout = linhas da tabela no `rev` do archive, em documento único (layout antigo) ou em peças (novo); tabela ausente = 0.
+      stdout = linhas da tabela no `rev` do archive, em documento único (layout antigo) ou em peças (novo); ausente = 0.
 
-FAIL-CLOSED: documento truncado, com lixo depois do `}` ou fora da forma, --expect-rows diferente do lido ou arquivo que mudou entre as duas passadas é
-  rc 1 e as peças ficam como estavam (a 1ª passada não grava; temporário de erro na 2ª é apagado). count-head com documento único E peças no mesmo rev,
-  peça ilegível ou repo ilegível é rc 1 SEM número no stdout: ler mal nunca vira 0 aqui, quem chama decide o que fazer.
+FAIL-CLOSED: documento truncado/com lixo/fora da forma, --expect-rows diferente do lido ou arquivo que mudou entre as passadas => rc 1 e as peças ficam como
+  estavam. count-head com documento único E peças no mesmo rev, peça ou repo ilegível => rc 1 SEM número no stdout: ler mal nunca vira 0 aqui.
 """
 import argparse
 import collections
@@ -36,8 +35,9 @@ import tarfile
 
 # python3 -I não põe o diretório do script no sys.path
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from jsonl_hourly import CHUNK, DumpError, PIECE_HEAD, PIECE_TAIL, count_rows, iter_rows, sha256_file  # noqa: E402
+from jsonl_hourly import DumpError, PIECE_HEAD, PIECE_TAIL, count_rows, iter_rows, sha256_file  # noqa: E402
 
+KEY = "created_at"
 MAX_OPEN = 32  # peças abertas ao mesmo tempo (o launchd dá 256 handles); com mais dias que isso a peça é reaberta em append
 UNDATED = "undated"
 _DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -69,31 +69,34 @@ def _tmp(out_dir, p):
     return os.path.join(out_dir, "%s.jsonl.tmp.p%d" % (p, os.getpid()))
 
 
-def _scan(src, key, chunk):
-    """Passada 1, sem gravar nada: valida o documento inteiro e mede cada peça. -> {período: [linhas, sha256, bytes]}"""
-    acc = {}
+def _stream(src):
+    """(período, bytes) de cada linha de `src`, já com o separador (o cabeçalho na 1ª linha do período): o que entra na peça, na ordem."""
+    seen = set()
     try:
         with open(src, "rb") as fh:
-            for obj, text in iter_rows(fh, chunk, raw=True):
-                p = period(obj.get(key))
-                a = acc.get(p)
-                lead = b","
-                if a is None:
-                    a = acc[p] = [0, hashlib.sha256(), 0]
-                    lead = PIECE_HEAD
-                data = lead + text.encode("utf-8")
-                a[0] += 1
-                a[1].update(data)
-                a[2] += len(data)
+            for obj, text in iter_rows(fh, raw=True):
+                p = period(obj.get(KEY))
+                yield p, (b"," if p in seen else PIECE_HEAD) + text.encode("utf-8")
+                seen.add(p)
     except (DumpError, OSError) as e:
         raise SplitError("entrada ilegível (%s): %s" % (src, e))
+
+
+def _scan(src):
+    """Passada 1, sem gravar nada: valida o documento inteiro e mede cada peça. -> {período: [linhas, sha256, bytes]}"""
+    acc = {}
+    for p, data in _stream(src):
+        a = acc.setdefault(p, [0, hashlib.sha256(), 0])
+        a[0] += 1
+        a[1].update(data)
+        a[2] += len(data)
     for a in acc.values():
         a[1].update(PIECE_TAIL)
         a[2] += len(PIECE_TAIL)
     return acc
 
 
-def _write(src, out_dir, key, want, acc, chunk):
+def _write(src, out_dir, want, acc):
     """Passada 2: grava as peças de `want` em <período>.jsonl.tmp.p<pid> e confere linhas e sha256 contra a passada 1."""
     opened, got = collections.OrderedDict(), {}
 
@@ -105,13 +108,9 @@ def _write(src, out_dir, key, want, acc, chunk):
             opened.popitem(last=False)[1].close()
 
     try:
-        with open(src, "rb") as fh:
-            for obj, text in iter_rows(fh, chunk, raw=True):
-                p = period(obj.get(key))
-                if p not in want:
-                    continue
+        for p, data in _stream(src):
+            if p in want:
                 g = got.setdefault(p, [0, hashlib.sha256()])
-                data = (PIECE_HEAD if g[0] == 0 else b",") + text.encode("utf-8")
                 g[0] += 1
                 g[1].update(data)
                 put(p, data)
@@ -119,7 +118,7 @@ def _write(src, out_dir, key, want, acc, chunk):
             if p in got:
                 got[p][1].update(PIECE_TAIL)
                 put(p, PIECE_TAIL)
-    except (DumpError, OSError) as e:
+    except OSError as e:
         raise SplitError("falha gravando as peças de %s: %s" % (src, e))
     finally:
         for f in opened.values():
@@ -128,8 +127,8 @@ def _write(src, out_dir, key, want, acc, chunk):
         raise SplitError("%s mudou entre as duas leituras" % src)
 
 
-def split_doc(src, out_dir, key="created_at", expect_rows=None, chunk=CHUNK):
-    acc = _scan(src, key, chunk)
+def split_doc(src, out_dir, expect_rows=None):
+    acc = _scan(src)
     rows = sum(a[0] for a in acc.values())
     if expect_rows is not None and rows != expect_rows:
         raise SplitError("%s tem %d linhas, esperava %d" % (src, rows, expect_rows))
@@ -150,7 +149,7 @@ def split_doc(src, out_dir, key="created_at", expect_rows=None, chunk=CHUNK):
             want.append(p)
     try:
         if want:
-            _write(src, out_dir, key, want, acc, chunk)
+            _write(src, out_dir, want, acc)
             for p in want:
                 os.replace(_tmp(out_dir, p), os.path.join(out_dir, p + ".jsonl"))
     finally:
@@ -210,7 +209,6 @@ def main(argv=None):
     sp = sub.add_parser("split")
     sp.add_argument("--in", dest="src", required=True)
     sp.add_argument("--out-dir", required=True)
-    sp.add_argument("--key", default="created_at")
     sp.add_argument("--expect-rows", type=int)
     ch = sub.add_parser("count-head")
     ch.add_argument("--repo", required=True)
@@ -220,7 +218,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
     try:
         if args.cmd == "split":
-            print(json.dumps(split_doc(args.src, args.out_dir, args.key, args.expect_rows)))
+            print(json.dumps(split_doc(args.src, args.out_dir, args.expect_rows)))
         else:
             print(count_head(args.repo, args.db, args.table, args.rev))
     except (SplitError, OSError) as e:

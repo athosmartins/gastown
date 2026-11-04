@@ -144,9 +144,6 @@ with tempfile.TemporaryDirectory(prefix="jssp.") as T:
     put(src, "{}\n")
     r5 = js.split_doc(src, out)
     check("split: tabela vazia ({}) => zero peças, o diretório fica e as antigas somem", names(out) == [] and r5["rows"] == 0 and r5["pieces"] == 0, repr((names(out), r5)))
-    put(src, doc([row(1, "2026-11-02")]))
-    js.split_doc(src, out, chunk=1)
-    check("split: funciona com bloco de leitura de 1 byte", [x["id"] for x in read_piece(os.path.join(out, "2026-11-02.jsonl"))] == ["c001"])
 
     # ── B. fail-closed ───────────────────────────────────────────────────────────────────────
     print("-- B. fail-closed")
@@ -171,16 +168,13 @@ with tempfile.TemporaryDirectory(prefix="jssp.") as T:
     check("--expect-rows que não é número => rc 2 (uso), nada muda", rc == 2, "rc=%s %s" % (rc, se[-80:]))
     rc, so, se = run("split", "--in", os.path.join(T, "nao-existe.jsonl"), "--out-dir", out)
     check("entrada que não existe => rc 1 (nunca 'tabela vazia')", rc == 1 and "2026-12-01.jsonl" in names(out), "rc=%s %s" % (rc, se[-80:]))
-    rc, so, se = run("split", "--in", src, "--out-dir", out, "--key", "id")
-    check("--key de uma coluna que nenhuma linha tem como data => tudo em undated (a tabela inteira, como no layout antigo)",
-          rc == 0 and names(out) == ["undated.jsonl"] and json.loads(so)["rows"] == 6, "rc=%s %s %s" % (rc, so, names(out)))
 
     # a 2ª passada confere o que gravou contra a 1ª: se a tabela mudou entre as duas leituras, nenhuma peça vira definitiva
     out4, real_scan = os.path.join(T, "hq", "mudou"), js._scan
     put(src, doc(rows[:5]))
 
-    def lying_scan(*a, **k):
-        acc = real_scan(*a, **k)
+    def lying_scan(*a):
+        acc = real_scan(*a)
         acc["2026-11-02"][0] += 1
         return acc
     js._scan = lying_scan

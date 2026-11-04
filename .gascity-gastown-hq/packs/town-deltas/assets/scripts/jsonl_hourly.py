@@ -18,7 +18,10 @@ FORMATO DO DUMP (medido em 16/10): <db>/<tabela>.jsonl, tabela em {issues, comme
   export abortado que o exporter chegou a commitar e também ficam fora.
 
 SUBCOMANDOS (stdout = JSON, rc 0 ok / 1 dump ilegível / 2 uso)
-  build   --out F.tar.gz --files-out F.json   < tar     filtra o tar do `git archive`, grava o .tar.gz e a lista de arquivos (bytes+sha256)
+  build   --out F.tar.gz --files-out F.json [--tree T.txt] < tar
+                                                        filtra o tar do `git archive`, grava o .tar.gz e a lista de arquivos (bytes+sha256). Tabela em peças no archive
+                                                        (<db>/<tabela>/AAAA-MM-DD.jsonl, ga-e4cbc5s) volta a ser UM documento <db>/<tabela>.jsonl no pacote: --tree = `git ls-tree -r -l <sha>`
+                                                        (o tar pede o tamanho do membro antes dos bytes); sem ele, peça faltando/fora de ordem/de outro tamanho ou documento único E peças = erro
   inspect F.tar.gz                                      conta linhas por <db>/<tabela> LENDO o artefato; erro de parse vira entrada em "errors"
   count   F.jsonl                                       número de linhas de um dump (uma tabela)
   manifest --inspect I.json --built B.json --captured-epoch N --head-epoch N --head-sha S --key K [--require db,db]
@@ -53,7 +56,7 @@ MEMBER_RE = re.compile(r"^(?:\./)?([A-Za-z0-9_][A-Za-z0-9_.-]*)/(" + "|".join(TA
 # ga-e4cbc5s: no ARCHIVE `issues` e `comments` ficam em peças por dia de created_at (<db>/<tabela>/AAAA-MM-DD.jsonl; `undated` para linha sem data), cada uma um
 # documento `{"rows": [...]}` no formato do Dolt. O PACOTE não muda: o build junta as peças de volta no documento único <db>/<tabela>.jsonl.
 SPLIT_TABLES = ("issues", "comments")
-PIECE_RE = re.compile(r"^(?:\./)?([A-Za-z0-9_][A-Za-z0-9_.-]*)/(" + "|".join(SPLIT_TABLES) + r")/(\d{4}-\d{2}-\d{2}|undated)\.jsonl$")
+PIECE_RE = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9_.-]*)/(" + "|".join(SPLIT_TABLES) + r")/(\d{4}-\d{2}-\d{2}|undated)\.jsonl$")
 PIECE_HEAD, PIECE_TAIL = b'{"rows": [', b"]}\n"
 CHUNK = 8 * 1024 * 1024
 # uma linha (issue com description enorme, comentário colado de log) cabe com folga; acima disso o
@@ -236,41 +239,127 @@ def db_ignored(db, patterns):
     return any(fnmatch.fnmatchcase(db, p) for p in patterns)
 
 
+def read_tree_sizes(path):
+    """{caminho: bytes} dos blobs de um `git ls-tree -r -l` (modo tipo sha tamanho TAB caminho)."""
+    sizes = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            meta, _, name = line.rstrip("\n").partition("\t")
+            m = meta.split()
+            if len(m) == 4 and m[1] == "blob" and m[3].isdigit():
+                sizes[name] = int(m[3])
+    return sizes
+
+
+def _join(src, it, first, names, sizes, box):
+    """Bytes do documento único de uma tabela, feito das peças `names` (membros SEGUIDOS do tar, `first` já lido, o resto vem de `it`): o cabeçalho da 1ª, as linhas de todas
+    separadas por `,`, a cauda no fim. Cada peça é conferida enquanto passa (nome e tamanho contra a árvore, cabeçalho e cauda do Dolt, ao menos uma linha). No fim, `box["next"]` = o membro seguinte."""
+    m = first
+    for i, name in enumerate(names):
+        m = m if i == 0 else next(it, None)
+        if m is None or m.name != name or m.size != sizes[name]:
+            raise SystemExit("peça fora do que a árvore diz: esperava %s (%d bytes), veio %s" % (name, sizes[name], "nada" if m is None else "%s (%d bytes)" % (m.name, m.size)))
+        fh = src.extractfile(m)
+        if m.size <= len(PIECE_HEAD) + len(PIECE_TAIL) or fh.read(len(PIECE_HEAD)) != PIECE_HEAD:
+            raise SystemExit('%s: não é um documento do Dolt `{"rows": [...]}` com ao menos uma linha' % name)
+        yield PIECE_HEAD if i == 0 else b","
+        left = m.size - len(PIECE_HEAD) - len(PIECE_TAIL)
+        while left:
+            b = fh.read(min(left, CHUNK))
+            if not b:
+                raise SystemExit("leitura curta em %s" % name)
+            left -= len(b)
+            yield b
+        if fh.read(len(PIECE_TAIL) + 1) != PIECE_TAIL:
+            raise SystemExit("%s: não termina em ]} e quebra de linha, ou tem mais bytes que o tamanho" % name)
+    yield PIECE_TAIL
+    box["next"] = next(it, None)
+
+
+class _Joined:
+    """Leitura sobre os blocos de `_join`, com o `read(n)` que o tarfile espera (n bytes, ou o que falta no fim)."""
+
+    def __init__(self, chunks):
+        self.chunks, self.buf, self.pos = chunks, b"", 0
+
+    def read(self, size=-1):
+        parts = []
+        while size != 0:
+            if self.pos >= len(self.buf):
+                self.buf, self.pos = next(self.chunks, b""), 0
+                if not self.buf:
+                    break
+            b = self.buf[self.pos:self.pos + size] if size > 0 else self.buf[self.pos:]
+            self.pos += len(b)
+            parts.append(b)
+            size -= len(b) if size > 0 else 0
+        return b"".join(parts)
+
+
 def cmd_build(args):
     files, skipped = [], []
     seen = set()
     ignore, ignored = parse_ignore(args.ignore_db), set()
+    sizes = read_tree_sizes(args.tree) if args.tree else {}
+    groups = {}
+    for n in sorted(sizes):
+        pm = PIECE_RE.match(n)
+        if pm:
+            groups.setdefault((pm.group(1), pm.group(2)), []).append(n)
     tail = _Tail(sys.stdin.buffer)
     # fileobj + filename="" : o GzipFile não grava o nome do arquivo de saída no cabeçalho, então o mesmo
     # conteúdo dá os mesmos bytes (e o mesmo sha256) em qualquer diretório de trabalho
     with tarfile.open(fileobj=tail, mode="r|") as src, open(args.out, "wb") as raw, \
             gzip.GzipFile(filename="", mode="wb", fileobj=raw, compresslevel=args.level, mtime=0) as gz, \
             tarfile.open(fileobj=gz, mode="w|", format=tarfile.PAX_FORMAT) as dst:
-        for m in src:
+        it, pending = iter(src), None
+        while True:
+            m, pending = pending or next(it, None), None
+            if m is None:
+                break
             if not m.isreg():
                 if m.issym() or m.islnk():
                     skipped.append(m.name)   # não viaja, mas é NOMEADO; diretórios (um por pasta no git archive) não entram
                 continue
             name = m.name
             mm = MEMBER_RE.match(name)
-            if not mm:
+            pm = None if mm else PIECE_RE.match(name)
+            if not (mm or pm):
                 skipped.append(name)
                 continue
-            if db_ignored(mm.group(1), ignore):
-                ignored.add(mm.group(1))   # banco de teste/benchmark que o exporter arquiva: não viaja, mas o manifest o nomeia
+            db = (mm or pm).group(1)
+            if db_ignored(db, ignore):
+                ignored.add(db)   # banco de teste/benchmark que o exporter arquiva: não viaja, mas o manifest o nomeia
                 continue
-            if name in seen:
-                raise SystemExit("membro repetido no tar: %s" % name)
-            seen.add(name)
-            hs = _Hasher(src.extractfile(m))
-            ti = tarfile.TarInfo(name=name)
-            ti.size = m.size
+            out_name, size, box = name, m.size, {}
+            if pm:   # 1ª peça de uma tabela: o membro do pacote é o documento único, e o tar pede o tamanho dele antes dos bytes
+                out_name = "%s/%s.jsonl" % (db, pm.group(2))
+                names = groups.get((db, pm.group(2)), [])
+                if not names:
+                    raise SystemExit("peça %s sem --tree, ou que a árvore não lista" % name)
+                gen = _join(src, it, m, names, sizes, box)
+                fobj, size = _Joined(gen), sum(sizes[n] for n in names) - (len(PIECE_HEAD) + len(PIECE_TAIL) - 1) * (len(names) - 1)
+            else:
+                fobj = src.extractfile(m)
+            if out_name in seen:
+                raise SystemExit("membro repetido no tar (ou tabela nos dois layouts, documento único e peças): %s" % out_name)
+            seen.add(out_name)
+            hs = _Hasher(fobj)
+            ti = tarfile.TarInfo(name=out_name)
+            ti.size = size
             ti.mtime = 0
             ti.mode = 0o644
             dst.addfile(ti, fileobj=hs)
-            if hs.n != m.size:
-                raise SystemExit("leitura curta em %s: %d de %d bytes" % (name, hs.n, m.size))
-            files.append({"path": name, "bytes": hs.n, "sha256": hs.h.hexdigest()})
+            if hs.n != size:
+                raise SystemExit("leitura curta em %s: %d de %d bytes" % (out_name, hs.n, size))
+            if pm:
+                for _ in gen:   # o tar parou de ler no tamanho declarado: falta rodar o fim do gerador, que guarda o membro seguinte
+                    pass
+                pending = box["next"]
+            files.append({"path": out_name, "bytes": hs.n, "sha256": hs.h.hexdigest()})
+        absent = sorted("%s/%s.jsonl" % k for k in groups if "%s/%s.jsonl" % k not in seen and not db_ignored(k[0], ignore))
+        if absent:
+            raise SystemExit("a árvore lista peças que o tar não trouxe: %s" % ", ".join(absent))
         # o tarfile para na 1ª faixa de zeros; o resto do stdin é lido até o fim para conferir a marca de fim do tar
         # vazio (stdin já no fim) → o laço não roda e a marca é conferida; falhou (OSError) → sobe ao main: rc 1 e o --files-out não é escrito
         while tail.read(CHUNK):
@@ -606,6 +695,7 @@ def main(argv=None):
     b.add_argument("--files-out", required=True)
     b.add_argument("--level", type=int, default=6)
     b.add_argument("--ignore-db", default="", help="padrões fnmatch separados por vírgula; bancos que casam não entram no artefato")
+    b.add_argument("--tree", default="", help="`git ls-tree -r -l <sha>` do archive: os tamanhos que o build precisa para juntar as peças por dia")
     b.set_defaults(fn=cmd_build)
     i = sub.add_parser("inspect")
     i.add_argument("archive")
