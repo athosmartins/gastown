@@ -27,7 +27,7 @@ CAUSA, DEGRAUS E NÚMERO DO DIA  (ga-2hd02v.5.10; 04/11, das 10h às 14h: CPU em
            `nucleos` = {sessoes, lastro, sistema, espera, livres} (núcleos MÉDIOS na janela; somam o ncpu): lastro = ballast.slice, sessoes = o resto do user-<uid>.slice (sessões e o que o mbp-run lança por ssh), sistema = o que sobra do
            ocupado (kernel, serviços do root), espera = iowait, livres = o que nem trabalha nem espera; `ram_mb` (MemAvailable); `lixo` = sessões do tmux do nó que a cidade não reconhece; e `causa`, UMA entre
            lixo > RAM > lastro-sem-trabalho > fila-sem-elegível > cego, só com a CPU lida e abaixo da régua (acima dela é null). A ordem é de PRIORIDADE, não prova de culpa: o que prova é o `efeito` medido na leitura seguinte.
-           lixo = há sessão do tmux do nó (nome com -remote-) que a cidade não lista (em nenhum estado), não segura bead (no hq NEM em rig nenhum) e está quieta há >= 30 min (HETZNER_OCC_D1_IDLE_S), quieta = input E saída (a maior entre session_activity e window_activity, de todas as janelas); RAM = MemAvailable abaixo do piso de partida do lastro (14336 MB,
+           lixo = há sessão do tmux do nó (nome com -remote-) que a cidade não lista (na lista padrão do `gc session list --json`: ativas e suspensas), não segura bead (no hq NEM em rig nenhum) e está quieta há >= 30 min (HETZNER_OCC_D1_IDLE_S), quieta = input E saída (a maior entre session_activity e window_activity, de todas as janelas); RAM = MemAvailable abaixo do piso de partida do lastro (14336 MB,
            HETZNER_OCC_RAM_START_MB) mais um slot (1024 MB): subir o lastro é inútil; lastro-sem-trabalho = sobram >= 2 núcleos livres e há RAM para mais lastro; fila-sem-elegível = a fila elegível do Pilot (hq) lida e vazia;
            cego = o que falta para dizer a causa não foi lido (CPU, cgroup, RAM, fila) OU nenhuma das quatro explica. Leitura cega NUNCA vira "ocioso" nem dispara degrau (os 3 estados valem aqui também).
   degraus  só com a CPU abaixo da régua há >= 30 min (a sequência de `baixa`) e a causa dizendo qual: lixo → D1, lastro-sem-trabalho → D2, fila-sem-elegível → D3; um degrau que não resolve (tentativas esgotadas) deixa o seguinte agir. UM degrau por
@@ -39,9 +39,9 @@ CAUSA, DEGRAUS E NÚMERO DO DIA  (ga-2hd02v.5.10; 04/11, das 10h às 14h: CPU em
                 dele: o vigia só pede com MemAvailable >= piso + 1 slot, e o pedido vence em 2 leituras (ate). Sem consumidor o efeito medido é zero e a escada segue.
     D3 fila     hetzner-occupancy-d3.on: tira da memória de vereditos do Pilot (<cidade>/.gc/wa-node-pass-memo.tsv) as linhas `unknown` ainda frescas, e a passada seguinte reclassifica essas beads de WA; o «Só no ocioso» (P2+ só ocupa o nó quando
                 nenhuma P0/P1 cabe lá, Athos 30/10; ga-2hd02v.3.18 e, na passada do disk floor, ga-2hd02v.3.26) já é do Pilot e vale para o que voltar `node`: o vigia não despacha nada.
-    D4 esgotou  hetzner-occupancy-d4.on: abaixo da régua há >= 6 h (HETZNER_OCC_D4_AFTER_S), sem nenhum degrau aplicável que ainda tenha tentativa (ou com a causa RAM, em que nada cabe) → UM `notify` ao Athos por dia (quanto, por quê, o que foi tentado) e
+    D4 esgotou  hetzner-occupancy-d4.on: abaixo da régua há >= 6 h (HETZNER_OCC_D4_AFTER_S), sem nenhum degrau aplicável que ainda tenha tentativa (ou com a causa RAM, em que nada cabe) e o lixo LIDO (lixo ilegível nunca esgota) → UM `notify` ao Athos por dia (quanto, por quê, o que foi tentado) e
                 uma bead com a causa. O notify roda com NOTIFY_STRICT_EXIT=1 e o rc é conferido: 0 saiu, 10 segurado até as 7 h e 11 já tinha saído contam como entregue; 12 (digest/teto), 13, 14, timeout e qualquer outro NÃO saíram (04/11, ga-i4t0lzx:
-                exit 12 e o aviso não chegou): o vigia manda o mesmo texto por `gc mail send mayor` uma vez e tenta o notify de novo a cada hora.
+                exit 12 e o aviso não chegou): o vigia manda o mesmo texto por `gc mail send mayor` uma vez POR EPISÓDIO (a sequência baixa; o dia julgado) e tenta o notify de novo a cada hora.
   número do dia  hetzner-occupancy-dia.on: na 1ª leitura de cada dia, se o dia anterior fechou com ocupacao_pct < régua (e >= 48 janelas de CPU lidas: dia cego não tem número), 1 notify ao Athos com o % e a causa principal do dia; dia na meta
            ou sem número não avisa (e não gasta o aviso).
 ARQUIVOS (só em <cidade>/.gc): hetzner-occupancy.jsonl (uma leitura por rodada) · hetzner-occupancy-daily.json (o número por dia: ocupado/ocioso/desconhecido;
@@ -303,7 +303,7 @@ def read_holders(c, store=None):
 
 
 def read_sessions(c):
-    # `_reconhecidas` (todo nome que a cidade lista, em qualquer estado, host ou alias) e `_donos` (os assignees de bead in_progress) NÃO vão ao JSONL (o run os tira): servem ao D1, que só mata o que a cidade não reconhece
+    # `_reconhecidas` (todo nome que o `gc session list --json` lista, no padrão do gc: ativas e suspensas; host ou alias) e `_donos` (os assignees de bead in_progress) NÃO vão ao JSONL (o run os tira): servem ao D1, que só mata o que a cidade não reconhece
     r = {"lido": False, "ativas": None, "ocupadas": None, "nomes": [], "nomes_ocupadas": [], "motivo": None, "_reconhecidas": None, "_donos": None}
     rc, out, err, why = run_cmd([c.gc_bin, "--city", c.city, "session", "list", "--json"], c.gc_timeout_s)
     r["motivo"] = _failed(rc, why, "gc")
@@ -898,7 +898,7 @@ def _tries(st, k):
 
 def plan_ladder(c, cause, low_due, st, now, lixo, nuc, ram_mb, memo_n):
     """(status_por_degrau, escolhido|None, esgotou). A escada só mexe com a CPU abaixo da régua há >= 30 min (low_due) e causa que diga por onde começar; considera os degraus a partir do da causa, em ordem; UM por leitura
-    e com o intervalo global entre ações. Aplicabilidade em 3 estados (sim/não/não li): o que não li NUNCA conta como "esgotado". esgotou = causa dita (ou RAM, em que nada cabe) e nenhum degrau aplicável com chave e
+    e com o intervalo global entre ações. Aplicabilidade em 3 estados (sim/não/não li): o que não li NUNCA conta como "esgotado". esgotou = causa dita (ou RAM, em que nada cabe), o lixo lido e nenhum degrau aplicável com chave e
     tentativa sobrando; degrau aplicável com a chave desligada NÃO esgota (ninguém autorizou a tentar). O D1 é o 1º degrau e o que libera RAM: lixo NÃO lido nunca esgota a escada, qualquer que seja a causa (a causa pode ter
     ficado de fora justamente porque o lixo não pôde ser lido), e o D1 aparece `cego` em vez de `fora`/`ram`."""
     status = {k: None for k in RUNGS}
@@ -914,7 +914,7 @@ def plan_ladder(c, cause, low_due, st, now, lixo, nuc, ram_mb, memo_n):
             "d2": None if not nuc["lido"] or ram_mb is None else d2_extra(c, nuc, ram_mb) >= 1,
             "d3": None if memo_n is None else memo_n > 0}
     last = _int(st.get("ultima_acao_em"))
-    cooling = last is not None and 0 <= now - last < c.act_cooldown_s
+    cooling = last is not None and now - last < c.act_cooldown_s  # data da ação no FUTURO (relógio que recuou, estado editado à mão) também esfria: sob dúvida o degrau não age
     chosen, exhausted = None, True
     for i, k in enumerate(RUNGS):
         if i < RUNGS.index(RUNG_OF_CAUSE[cause]):

@@ -1485,6 +1485,11 @@ PY
   eq "... (o ssh de verdade nem foi chamado)" "$a0" "$(acts)"
 
   # ---- tentativas, intervalo e a escada que desce ----------------------------------------------------------------------------------------------------------------------------------
+  # a data da última ação no FUTURO (relógio que recuou, estado editado à mão) esfria como uma ação recente: sob dúvida o degrau não age (gate-fix 1, ga-2hd02v.5.10)
+  ghost3; TENV=(HETZNER_OCC_ACT_COOLDOWN_S=600); xtick 900 $LOWW >/dev/null; xtick 900 255 30 50 150
+  eq "(controle) 15 min depois da ação, com o intervalo de 10 min já cumprido: o d2 age (2 chamadas ao nó no total)" "agiu/2" "$(reading degrau.d2)/$(acts)"
+  ghost3; TENV=(HETZNER_OCC_ACT_COOLDOWN_S=600); xtick 900 $LOWW >/dev/null; state_set "ultima_acao_em=$((NOW + 7200))"; xtick 900 255 30 50 150
+  eq "a mesma leitura com a data da última ação 2 h no FUTURO: o d2 espera ('cooldown') e nada novo vai ao nó" "cooldown/1" "$(reading degrau.d2)/$(acts)"
   ghost3; STUB_TMUX_KILL_FAIL=1; xtick 900 $LOWW >/dev/null; xtick 900 $LOWW; eq "ação que falhou: o intervalo de 30 min vale mesmo assim (d1 e d2 em cooldown)" "cooldown/cooldown/1" "$(reading degrau.d1)/$(reading degrau.d2)/$(acts)"
   xtick 900 $LOWW; eq "30 min depois: a 2ª tentativa do d1 (também falha)" "falhou/2" "$(reading degrau.d1)/$(state_f degraus.d1.tentativas)"
   xtick 900 $LOWW >/dev/null; xtick 900 $LOWW; eq "tentativas gastas: o d1 está esgotado e a escada DESCE para o d2, que age" "esgotado/agiu/3" "$(reading degrau.d1)/$(reading degrau.d2)/$(acts)"
@@ -1981,7 +1986,8 @@ g_mutantes() {
   mutante fila-ilegivel-vira-vazia "causa" $'if fila["lido"] and fila["n"] == 0:' $'if fila["n"] in (0, None):'
   mutante cego-tem-degrau "escada" $'    if cause == "cego":\n        return {k: "cego" for k in RUNGS}, None, False' $'    if False:\n        return {k: "cego" for k in RUNGS}, None, False'
   # a escada: um degrau por vez, com intervalo, com tentativas contadas e sem esgotar o que não li ou ninguém autorizou
-  mutante sem-intervalo-entre-acoes "escada" $'cooling = last is not None and 0 <= now - last < c.act_cooldown_s' $'cooling = False'
+  mutante sem-intervalo-entre-acoes "escada" $'cooling = last is not None and now - last < c.act_cooldown_s' $'cooling = False'
+  mutante acao-no-futuro-nao-esfria "escada" $'cooling = last is not None and now - last < c.act_cooldown_s' $'cooling = last is not None and 0 <= now - last < c.act_cooldown_s'
   mutante tentativas-sem-limite "escada" $'elif _tries(st, k) >= c.act_tries:' $'elif False:'
   mutante degrau-desligado-esgota "escada aviso" $'status[k], exhausted = "desligado", False' $'status[k] = "desligado"'
   mutante degrau-cego-esgota "escada aviso" $'status[k], exhausted = "cego", False' $'status[k] = "cego"'
