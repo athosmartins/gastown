@@ -93,6 +93,22 @@ check("multibyte em bloco de 1 byte volta idêntico", mb == [{"t": "ação — �
 nest = rows(b'{"rows":[{"t":"x},{y"},{"t":"z"}]}', 1)
 check("}, { dentro de string não parte a linha", nest == [{"t": "x},{y"}, {"t": "z"}], repr(nest))
 
+raw_doc = '{"rows": [ {"a":"x\\u00e9 ,}","b":1} ,\n{"a":"ação"}\t]}\n'.encode("utf-8")
+raw_want = [({"a": "x\u00e9 ,}", "b": 1}, '{"a":"x\\u00e9 ,}","b":1}'), ({"a": "ação"}, '{"a":"ação"}')]
+check("iter_rows(raw=True): devolve (objeto, texto da linha COMO está no arquivo, sem espaço em volta) em qualquer tamanho de bloco",
+      all(list(jh.iter_rows(io.BytesIO(raw_doc), c, raw=True)) == raw_want for c in CHUNKS), repr(list(jh.iter_rows(io.BytesIO(raw_doc), 1, raw=True))))
+
+
+def raises_raw(data, chunk):
+    try:
+        list(jh.iter_rows(io.BytesIO(data), chunk, raw=True))
+    except jh.DumpError:
+        return True
+    return False
+
+
+check("iter_rows(raw=True) rejeita o documento truncado (sem `]}`), em qualquer tamanho de bloco", all(raises_raw(raw_doc[:-4], c) for c in CHUNKS))
+
 bad_docs = {
     "arquivo vazio": b"",
     "só espaços": b"   \n",

@@ -50,6 +50,11 @@ import tarfile
 
 TABLES = ("issues", "comments", "dependencies", "labels", "config", "metadata")
 MEMBER_RE = re.compile(r"^(?:\./)?([A-Za-z0-9_][A-Za-z0-9_.-]*)/(" + "|".join(TABLES) + r")\.jsonl$")
+# ga-e4cbc5s: no ARCHIVE `issues` e `comments` ficam em peças por dia de created_at (<db>/<tabela>/AAAA-MM-DD.jsonl; `undated` para linha sem data), cada uma um
+# documento `{"rows": [...]}` no formato do Dolt. O PACOTE não muda: o build junta as peças de volta no documento único <db>/<tabela>.jsonl.
+SPLIT_TABLES = ("issues", "comments")
+PIECE_RE = re.compile(r"^(?:\./)?([A-Za-z0-9_][A-Za-z0-9_.-]*)/(" + "|".join(SPLIT_TABLES) + r")/(\d{4}-\d{2}-\d{2}|undated)\.jsonl$")
+PIECE_HEAD, PIECE_TAIL = b'{"rows": [', b"]}\n"
 CHUNK = 8 * 1024 * 1024
 # uma linha (issue com description enorme, comentário colado de log) cabe com folga; acima disso o
 # arquivo é lixo e ler o resto dele para a memória só atrasaria o erro.
@@ -66,8 +71,8 @@ class DumpError(Exception):
     """Dump que não segue a forma conhecida (truncado, malformado, com lixo)."""
 
 
-def iter_rows(fh, chunk=CHUNK):
-    """Gera cada objeto de `rows` lendo `fh` (binário) em blocos; memória ~ bloco + maior linha.
+def iter_rows(fh, chunk=CHUNK, raw=False):
+    """Gera cada objeto de `rows` lendo `fh` (binário) em blocos; memória ~ bloco + maior linha. Com raw=True gera (objeto, texto da linha COMO ESTÁ no arquivo).
 
     ATENÇÃO a quem consome em streaming: as linhas saem ANTES de o fim do documento ser validado. Se o iterador levantar
     DumpError (truncado, lixo depois do `}`), tudo que já foi emitido tem que ser descartado — só `count_rows` é seguro
@@ -140,7 +145,7 @@ def iter_rows(fh, chunk=CHUNK):
             continue
         st["pos"] = end
         want = "comma_or_end"
-        yield obj
+        yield (obj, buf[pos:end]) if raw else obj
 
     # depois do ]: só `}` e espaço até o fim
     closed = False
