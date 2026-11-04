@@ -418,8 +418,26 @@ expect "derivado: teto de 25 testes por módulo" "$(DESC 'ajustar lib/huge_mod.p
 expect "derivado: teto de 100 candidatos no total (5 módulos x 21 testes)" "$(DESC 'ajustar lib/cap_a.py lib/cap_b.py lib/cap_c.py lib/cap_d.py lib/cap_e.py')" 0 'prova-teste-derivado:100-teste\(s\)\+5-codigo\(s\)'
 expect "freio: lead no texto NÃO segura mais a prova derivada (ga-2hd02v.3.21: era vocabulário, não dado) -> node; o lead fica só em info" "$(DESC 'Corrigir lib/foo_parser.py; o lead some da lista')" 0 '"verdict": "node", "basis": "derivado".*"info": \["dado-de-lead", "teste-derivado:lib/foo_parser\.py='
 expect "freio: terreno, lote, construtora e proprietário no texto também não seguram" "$(DESC 'Corrigir lib/foo_parser.py: o terreno e o lote da construtora do proprietario')" 0 '"verdict": "node", "basis": "derivado"'
-expect "freio: envio no texto manda ao mini" "$(DESC 'Corrigir lib/foo_parser.py antes de enviar a mensagem')" 10 '"reasons": \["freio-derivado:envio-whatsapp"\]'
-expect "freio: lead e envio juntos: só o envio freia (e é o único motivo)" "$(DESC 'Corrigir lib/foo_parser.py: o lead recebe o envio duplicado')" 10 '"reasons": \["freio-derivado:envio-whatsapp"\]'
+expect "freio: envio no texto manda ao mini" "$(DESC 'Corrigir lib/foo_parser.py antes de enviar a mensagem')" 10 '"reasons": \["freio-derivado:envio-acao"\]'
+expect "freio: lead e envio juntos: só o envio freia (e é o único motivo)" "$(DESC 'Corrigir lib/foo_parser.py: o lead recebe o envio duplicado')" 10 '"reasons": \["freio-derivado:envio-acao"\]'
+# ga-2hd02v.5.12: o freio lê só palavra de ENVIO fora de caminho/nome (BRAKE_SEND_RE). Medido em 04/11 nas 26 beads seguradas por este freio: 12 só tinham whatsapp/chip/ban (rótulo de launchd, nome do produto, aparelho da frota), nenhuma envia nada.
+FB_NODE='"verdict": "node", "basis": "derivado"'
+expect "freio 5.12: whatsapp no RÓTULO de launchd (com.whatsapp.db-sync) NÃO freia -> node; a tag larga segue em info (a sombra mede com ela)" "$(DESC 'Corrigir lib/foo_parser.py; o daemon com.whatsapp.db-sync reinicia no deploy')" 0 "$FB_NODE.*\"envio-whatsapp\""
+expect_not "freio 5.12: ...e a tag ESTREITA (a do freio) não aparece" "$(DESC 'Corrigir lib/foo_parser.py; o daemon com.whatsapp.db-sync reinicia no deploy')" 0 '"envio-acao"'
+expect "freio 5.12: o nome do PRODUTO sozinho (WhatsApp) NÃO freia" "$(DESC 'Corrigir lib/foo_parser.py: os daemons do WhatsApp somam um nucleo de CPU')" 0 "$FB_NODE"
+expect "freio 5.12: chip (aparelho da frota) e ban-… (nome de painel) NÃO freiam" "$(DESC 'Corrigir lib/foo_parser.py: o chip Business descartado e o ban-correlation-dashboard')" 0 "$FB_NODE"
+expect "freio 5.12: envio dentro de rota ou nome (/api/curated/enviar-register, fila_envio) NÃO freia" "$(DESC 'Corrigir lib/foo_parser.py e a rota /api/curated/enviar-register da fila_envio')" 0 "$FB_NODE"
+# controles: o que envia de verdade CONTINUA freando (o envio é irreversível; na dúvida entre falso freio e falso passe, freia)
+expect "freio 5.12 (controle): envio composto com hífen (auto-enviar) AINDA freia" "$(DESC 'Corrigir lib/foo_parser.py: o responder pode auto-enviar a mensagem')" 10 '"reasons": \["freio-derivado:envio-acao"\]'
+expect "freio 5.12 (controle): pré-envio, com acento, AINDA freia (o texto é normalizado antes)" "$(DESC 'Corrigir lib/foo_parser.py no pré-envio da cadência')" 10 '"reasons": \["freio-derivado:envio-acao"\]'
+expect "freio 5.12 (caso real, wa-gu0l2t.6): o alerta que PODE AUTO-ENVIAR e faz o envio avulso AINDA freia" "$(DESC 'Corrigir lib/foo_parser.py; o alerta PODE AUTO-ENVIAR e faz o envio avulso')" 10 '"reasons": \["freio-derivado:envio-acao"\]'
+expect "freio 5.12 (controle): ponto final de frase não esconde o envio" "$(DESC 'Corrigir lib/foo_parser.py, que travou o envio.')" 10 '"reasons": \["freio-derivado:envio-acao"\]'
+expect "freio 5.12 (controle): disparo AINDA freia" "$(DESC 'Corrigir lib/foo_parser.py no disparo diario')" 10 '"reasons": \["freio-derivado:envio-acao"\]'
+expect "freio 5.12 (controle): baileys AINDA freia" "$(DESC 'Corrigir lib/foo_parser.py na fila do baileys')" 10 '"reasons": \["freio-derivado:envio-acao"\]'
+expect "freio 5.12 (controle): evolution AINDA freia" "$(DESC 'Corrigir lib/foo_parser.py na chamada da API evolution')" 10 '"reasons": \["freio-derivado:envio-acao"\]'
+# cada exclusão tem o seu caso, sem outra a proteger: `.` ANTES (rótulo que TERMINA na palavra) e `.letra` DEPOIS (palavra que COMEÇA o rótulo) são exclusões diferentes
+expect "freio 5.12: envio como último segmento de um rótulo com ponto (com.envio) NÃO freia" "$(DESC 'Corrigir lib/foo_parser.py no rotulo com.envio')" 0 "$FB_NODE"
+expect "freio 5.12: envio como primeiro segmento de um rótulo com ponto (envio.worker) NÃO freia" "$(DESC 'Corrigir lib/foo_parser.py e o servico envio.worker')" 0 "$FB_NODE"
 expect "freio: palavras informativas que NÃO são da lista (deploy, tela) não bloqueiam a prova derivada" "$(DESC 'Corrigir lib/foo_parser.py no deploy da tela')" 0 '"basis": "derivado"'
 expect "freio: sem prova derivada o lead no texto não muda o unknown (continua não sei, não vira mini)" "$(DESC 'ajustar lib/orfa_unica.py; o lead some')" 11 'sem-prova-de-codigo-e-teste'
 expect "derivado: palavra mole (banco) SEM evidência no código só informa (ga-qkc02kk; a evidência é que barra, ver a seção das moles)" "$(DESC 'Corrigir lib/foo_parser.py que abre um sqlite')" 0 'prova-teste-derivado.*mole-so-em-prosa:banco-de-dados'
@@ -510,7 +528,8 @@ expect "backup: o commit da irmã tocou SÓ a cópia (sem homônimo vivo) -> o c
 expect "backup: o commit da irmã tocou o vivo E a cópia -> só o vivo entra" "$(DESCI wa-par6.2 'corrigir o caso de borda')" 0 'prova-caminho-derivado:1-teste\(s\)\+1-codigo\(s\).*"caminho-derivado-backup-ignorado:1", "caminho-derivado:irmas=lib/irma_copia_mod\.py"'
 # palavras duras/moles e freios valem como sempre
 expect "caminho-freio: lead no texto NÃO segura mais a prova derivada (ga-2hd02v.3.21) -> node, com a origem do caminho em info" "$(DESC 'revisar ficha_donos: o lead some da lista')" 0 '"verdict": "node", "basis": "derivado".*"info": \["dado-de-lead", "caminho-derivado:nome:ficha_donos=lib/ficha_donos\.py"'
-expect "caminho-freio: envio no texto manda ao mini" "$(DESC 'revisar ficha_donos antes de enviar a mensagem')" 10 '"reasons": \["freio-derivado:envio-whatsapp"\]'
+expect "caminho-freio: envio no texto manda ao mini" "$(DESC 'revisar ficha_donos antes de enviar a mensagem')" 10 '"reasons": \["freio-derivado:envio-acao"\]'
+expect "caminho-freio 5.12: whatsapp no RÓTULO (com.whatsapp.painel) NÃO freia a prova por caminho derivado" "$(DESC 'revisar ficha_donos no daemon com.whatsapp.painel')" 0 '"verdict": "node", "basis": "derivado".*"caminho-derivado:nome:ficha_donos=lib/ficha_donos\.py"'
 expect "caminho: palavra mole (banco) SEM evidência no código só informa (ga-qkc02kk)" "$(DESC 'revisar ficha_donos que abre um sqlite')" 0 'prova-caminho-derivado.*mole-so-em-prosa:banco-de-dados'
 expect "caminho: telefone no texto ainda vence" "$(DESC 'revisar ficha_donos (31) 98876-5432')" 10 '"reasons": \["dado-no-texto"\]'
 expect "caminho: node:ok continua dando basis label (a regra 7 nem roda)" "$(labels "$(DESC 'revisar ficha_donos')" '["node:ok"]')" 0 '"basis": "label"'
@@ -598,8 +617,9 @@ expect "filtro: o teste importa um módulo que o rsync nega (shared/) -> mini, o
 export WA_NODE_MAC_ONLY="$T/macs-derivado7.txt"
 expect "mac-only: o teste importa um módulo só do Mac -> mini" "$(T8 tests/test_imp_mac.py)" 10 '"reasons": \["codigo-do-teste-so-no-mac:lib/mac_code_mod\.py"\]'
 unset WA_NODE_MAC_ONLY
-expect "freio: envio no texto manda ao mini (a prova é mais fraca que o teste+código citados)" "$(DESC 'Corrigir o envio da mensagem; teste em tests/test_imp_a.py')" 10 '"reasons": \["freio-derivado:envio-whatsapp"\]'
+expect "freio: envio no texto manda ao mini (a prova é mais fraca que o teste+código citados)" "$(DESC 'Corrigir o envio da mensagem; teste em tests/test_imp_a.py')" 10 '"reasons": \["freio-derivado:envio-acao"\]'
 expect "freio: lead/terreno no texto NÃO freia" "$(DESC 'Corrigir o lead do terreno; teste em tests/test_imp_a.py')" 0 "$C8_OK"
+expect "freio 5.12: whatsapp/chip no texto NÃO freia a prova pelo código derivado do teste" "$(DESC 'Corrigir o chip do daemon com.whatsapp.painel; teste em tests/test_imp_a.py')" 0 "$C8_OK"
 expect "mole: palavra de banco no texto, com o código que o teste importa SEM evidência, só informa (ga-qkc02kk)" "$(DESC 'Corrigir o sqlite; teste em tests/test_imp_a.py')" 0 'prova-codigo-derivado-do-teste.*mole-so-em-prosa:banco-de-dados'
 expect "duro: telefone no texto ainda vence" "$(DESC 'Corrigir o caso (31) 98876-5432; teste em tests/test_imp_a.py')" 10 '"reasons": \["dado-no-texto"\]'
 expect "ordem: nome snake_case que a regra 7 deriva (ficha_donos) vence a regra 8" "$(DESC 'Corrigir ficha_donos; teste em tests/test_imp_a.py')" 0 '"reasons": \["prova-caminho-derivado:'
@@ -686,7 +706,8 @@ expect "mole: palpite das irmãs que NÃO dá para ler (> 1 MB) só vira NOTA: u
 expect_not "mole: ...e esse palpite não vira \`moles:\`" "$(DESCI wa-molp1.2 'corrigir o caso de borda')" 0 'moles:'
 expect "mole: evidência em código que a bead NOMEIA (mole_db) bloqueia" "$(DESC 'ajustar mole_db quando vem vazio')" 10 'moles:banco-de-dados.*mole-evidencia:banco-de-dados=lib/mole_db\.py'
 # as travas de exposição não mudam: freio de envio vale também para a prova pelo teste IMPORTADOR
-expect "freio: envio de WhatsApp ainda manda ao mini na prova pelo teste importador" "$(DESC 'ajustar lib/impt_target.py e o envio por whatsapp')" 10 'freio-derivado:envio-whatsapp'
+expect "freio: envio de WhatsApp ainda manda ao mini na prova pelo teste importador" "$(DESC 'ajustar lib/impt_target.py e o envio por whatsapp')" 10 'freio-derivado:envio-acao'
+expect "freio 5.12: whatsapp no RÓTULO NÃO freia a prova pelo teste importador" "$(DESC 'ajustar lib/impt_target.py e o daemon com.whatsapp.painel')" 0 '"verdict": "node", "basis": "derivado"'
 expect "pii: telefone no texto segue duro mesmo com a âncora derivada" "$(DESC 'Medido em queue.db (31) 98876-5432; ajustar anchor_mod quando vem vazio')" 10 'caminho-fora-do-filtro:queue\.db.*dado-no-texto'
 # ---- teste IMPORTADOR (regra 6b, ga-qkc02kk): código citado SEM teste de nome ganha os testes de tests/ que o IMPORTAM (import estático que resolve para o mesmo arquivo)
 expect "importador: o teste de nome sem relação que IMPORTA o módulo é a prova (basis derivado, par nomeado como teste-importador)" "$(DESC 'ajustar lib/impt_target.py')" 0 "$ME, \"reasons\": \[\"prova-teste-derivado:1-teste\(s\)\+1-codigo\(s\)\"\].*\"teste-importador:lib/impt_target\.py=tests/test_other_area\.py\""
@@ -823,9 +844,26 @@ mutant so-neg-sem-canario-pasta 'no_canary += list(CANARY_OPEN_NO)' 'pass' "$(DE
 # teste derivado (regra 6): um mutante por linha da regra; o repo de mentira e o espelho de mentira vêm por envspec (o padrão da bateria é repo e espelho AUSENTES)
 DV="WA_NODE_REPO=$RP WA_NODE_MIRROR=$T/mirror-ok"
 D_FOO=$(DESC 'Corrigir lib/foo_parser.py quando a entrada vem vazia.')
-mutant derivado-sem-freio       'if blocked:'                          'if False:'                                  "$(DESC 'Corrigir lib/foo_parser.py antes de enviar a mensagem')" 10 'freio-derivado:envio-whatsapp' "$DV"
-mutant derivado-freio-com-lead  'DERIVED_BLOCK_INFO = ("envio-whatsapp",)' 'DERIVED_BLOCK_INFO = ("dado-de-lead", "envio-whatsapp")' "$(DESC 'Corrigir lib/foo_parser.py; o lead some da lista')" 0 '"basis": "derivado"' "$DV"
-mutant derivado-freio-sem-envio 'DERIVED_BLOCK_INFO = ("envio-whatsapp",)' 'DERIVED_BLOCK_INFO = ()'                  "$(DESC 'Corrigir lib/foo_parser.py antes de enviar a mensagem')" 10 'freio-derivado:envio-whatsapp' "$DV"
+mutant derivado-sem-freio       'if blocked:'                          'if False:'                                  "$(DESC 'Corrigir lib/foo_parser.py antes de enviar a mensagem')" 10 'freio-derivado:envio-acao' "$DV"
+mutant derivado-freio-com-lead  'DERIVED_BLOCK_INFO = ("envio-acao",)' 'DERIVED_BLOCK_INFO = ("dado-de-lead", "envio-acao")' "$(DESC 'Corrigir lib/foo_parser.py; o lead some da lista')" 0 '"basis": "derivado"' "$DV"
+mutant derivado-freio-sem-envio 'DERIVED_BLOCK_INFO = ("envio-acao",)' 'DERIVED_BLOCK_INFO = ()'                  "$(DESC 'Corrigir lib/foo_parser.py antes de enviar a mensagem')" 10 'freio-derivado:envio-acao' "$DV"
+# ga-2hd02v.5.12: o freio ESTREITO (BRAKE_SEND_RE). Cada mutante tem um caso designado que só a mutação dele faz reprovar; o trecho original leva o contexto que o torna único (a regex larga do INFO tem palavras parecidas)
+FB_WA="$(DESC 'Corrigir lib/foo_parser.py: os daemons do WhatsApp somam um nucleo de CPU')"
+FB_ROTA="$(DESC 'Corrigir lib/foo_parser.py e a rota /api/curated/enviar-register da fila_envio')"
+FB_BRAKE='freio-derivado:envio-acao'
+mutant freio-volta-a-tag-larga   'DERIVED_BLOCK_INFO = ("envio-acao",)' 'DERIVED_BLOCK_INFO = ("envio-whatsapp",)' "$FB_WA" 0 "$FB_NODE" "$DV"
+mutant freio-com-whatsapp        '(?:envios?|enviar|disparos?|evolution|baileys)(?!' '(?:whatsapp|envios?|enviar|disparos?|evolution|baileys)(?!' "$FB_WA" 0 "$FB_NODE" "$DV"
+mutant freio-com-chip            '(?:envios?|enviar|disparos?|evolution|baileys)(?!' '(?:chips?|envios?|enviar|disparos?|evolution|baileys)(?!' "$(DESC 'Corrigir lib/foo_parser.py: o chip Business descartado e o ban-correlation-dashboard')" 0 "$FB_NODE" "$DV"
+mutant freio-sem-tag-estreita    'info.append("envio-acao")' 'pass' "$(DESC 'Corrigir lib/foo_parser.py antes de enviar a mensagem')" 10 "$FB_BRAKE" "$DV"
+mutant freio-sem-disparo         'enviar|disparos?|evolution|baileys)(?!' 'enviar|evolution|baileys)(?!' "$(DESC 'Corrigir lib/foo_parser.py no disparo diario')" 10 "$FB_BRAKE" "$DV"
+mutant freio-sem-evolution       'disparos?|evolution|baileys)(?!' 'disparos?|baileys)(?!' "$(DESC 'Corrigir lib/foo_parser.py na chamada da API evolution')" 10 "$FB_BRAKE" "$DV"
+mutant freio-sem-baileys         'disparos?|evolution|baileys)(?!' 'disparos?|evolution)(?!' "$(DESC 'Corrigir lib/foo_parser.py na fila do baileys')" 10 "$FB_BRAKE" "$DV"
+mutant freio-hifen-exclui        '(?<![\w/.])' '(?<![\w\-/.])' "$(DESC 'Corrigir lib/foo_parser.py: o responder pode auto-enviar a mensagem')" 10 "$FB_BRAKE" "$DV"
+mutant freio-sem-barra           '(?<![\w/.])' '(?<![\w.])' "$FB_ROTA" 0 "$FB_NODE" "$DV"
+mutant freio-sem-underscore      '(?<![\w/.])' '(?<![/.])' "$FB_ROTA" 0 "$FB_NODE" "$DV"
+mutant freio-sem-ponto-antes     '(?<![\w/.])' '(?<![\w/])' "$(DESC 'Corrigir lib/foo_parser.py no rotulo com.envio')" 0 "$FB_NODE" "$DV"
+mutant freio-sem-ponto-depois    'baileys)(?![\w/]|\.\w)' 'baileys)(?![\w/])' "$(DESC 'Corrigir lib/foo_parser.py e o servico envio.worker')" 0 "$FB_NODE" "$DV"
+mutant freio-tag-larga-some      '("envio-whatsapp", r"\b(whatsapp|' '("envio-wa-x", r"\b(whatsapp|' "$(DESC 'Corrigir lib/foo_parser.py; o daemon com.whatsapp.db-sync reinicia no deploy')" 0 "$FB_NODE.*\"envio-whatsapp\"" "$DV"
 mutant derivado-basis-text      'basis = "derivado" if any(w.startswith(("prova-teste-derivado:", "prova-caminho-derivado:", "prova-codigo-derivado-do-teste:")) for w in why) else "text"' 'basis = "text"' "$D_FOO" 0 '"basis": "derivado"' "$DV"
 mutant derivado-sem-maior       ' and not any(rest == m or rest.startswith(m + "_") for m in longer))' ')' "$(DESC 'ajustar lib/bar_service.py')" 0 'prova-teste-derivado:1-teste\(s\)' "$DV"
 mutant derivado-sem-generico    ' and s not in GENERIC_STEMS'          ''                                           "$(DESC 'ajustar lib/utils.py')" 11 'sem-prova-de-codigo-e-teste' "$DV"
@@ -856,7 +894,7 @@ mutant derivado-sem-teto-total  ')[:MAX_DERIVED_TESTS]'                ')'      
 C8="$DV"
 T8M() { DESC "Corrigir o caso de borda; teste em $1"; }
 C8_RX='"verdict": "node", "basis": "derivado", "reasons": \["prova-codigo-derivado-do-teste:'
-mutant codigo-sem-freio          'return judged_derived(found, "prova-codigo-derivado-do-teste", paths, tests, info, extra)' 'return "node", ["prova-codigo-derivado-do-teste:1-teste(s)+1-codigo(s)"], paths, tests, info + extra' "$(DESC 'Corrigir o envio da mensagem; teste em tests/test_imp_a.py')" 10 'freio-derivado:envio-whatsapp' "$C8"
+mutant codigo-sem-freio          'return judged_derived(found, "prova-codigo-derivado-do-teste", paths, tests, info, extra)' 'return "node", ["prova-codigo-derivado-do-teste:1-teste(s)+1-codigo(s)"], paths, tests, info + extra' "$(DESC 'Corrigir o envio da mensagem; teste em tests/test_imp_a.py')" 10 'freio-derivado:envio-acao' "$C8"
 mutant codigo-sem-filtro         'hard.append("codigo-do-teste-fora-do-filtro:" + p)' 'pass'                  "$(T8M tests/test_imp_fora.py)" 10 'codigo-do-teste-fora-do-filtro:shared/fora_mod' "$C8"
 mutant codigo-sem-mac-only       'hard.append("codigo-do-teste-so-no-mac:" + p)' 'pass'                      "$(T8M tests/test_imp_mac.py)" 10 'codigo-do-teste-so-no-mac:lib/mac_code_mod' "$C8 WA_NODE_MAC_ONLY=$T/macs-derivado7.txt"
 mutant codigo-sem-teto           'if len(dpaths) > MAX_DERIVED_CODE:' 'if False:'                           "$(T8M tests/test_imp_onze.py)" 11 'codigo-do-teste-demais:11' "$C8"
@@ -921,7 +959,7 @@ mutant caminho-teste-de-mentira 'found = derived_tests(dpaths, globs)' 'found = 
 mutant caminho-falha-vira-vazio 'extra.append("caminho-derivado-ilegivel:" + str(e))' 'pass'                          "$FD" 11 'caminho-derivado-ilegivel:repo-git-rc-128' "WA_NODE_REPO=$T/wa-repo-ausente WA_NODE_MIRROR=$T/mirror-ok WA_NODE_CACHE=/dev/null/sem-cache"
 mutant caminho-com-codigo-citado 'if not [c for c in code if c not in ghosts]:' 'if True:'                         "$(DESC 'ajustar lib/sem_teste_mod.py e a ficha_donos')" 11 "$SEMNOTA" "$R7"
 mutant caminho-basis-text       'w.startswith(("prova-teste-derivado:", "prova-caminho-derivado:", "prova-codigo-derivado-do-teste:"))' 'w.startswith("prova-teste-derivado:")' "$FD" 0 '"basis": "derivado"' "$R7"
-mutant caminho-sem-freio        'if blocked:'                          'if False:'                                  "$(DESC 'revisar ficha_donos antes de enviar a mensagem')" 10 'freio-derivado:envio-whatsapp.*caminho-derivado:nome:ficha_donos' "$R7"
+mutant caminho-sem-freio        'if blocked:'                          'if False:'                                  "$(DESC 'revisar ficha_donos antes de enviar a mensagem')" 10 'freio-derivado:envio-acao.*caminho-derivado:nome:ficha_donos' "$R7"
 mutant caminho-custo-zero       '"derivacao_ms": COST["derivacao_ms"]' '"derivacao_ms": 0'                          "$FD" 0 '"derivacao_ms": [1-9][0-9]*' "$R7"
 mutant irmas-sem-campo-parent   'if isinstance(p, str) and PARENT_RE.match(p):' 'if False:'                         "$(printf '{"id":"wa-zzz9","parent":"wa-par1","title":"t","description":"corrigir o caso de borda"}')" 0 'caminho-derivado:irmas=lib/irma_mod' "$R7"
 mutant irmas-id-inteiro         'p = i.rsplit(".", 1)[0]'              'p = i'                                      "$(DESCI wa-par1.3 'corrigir o caso de borda')" 0 'caminho-derivado:irmas=lib/irma_mod' "$R7"

@@ -54,7 +54,7 @@ COMO DECIDE (a 1ª regra que casa vale; tudo é lido da bead, nada é gravado ne
      6b TESTE IMPORTADOR (ga-qkc02kk): código SEM teste de nome ganha os testes de `tests/` que o IMPORTAM — `git grep -w <módulo>` acha candidatos (até 60) e só conta o `import` estático (Python por `ast`; JS por require/import relativo)
      que resolve para O MESMO arquivo; citar o nome numa string ou comentário não conta; candidato que não parseia é pulado e contado (`teste-importador-nao-parseou:N`). Passa pelos mesmos filtros do teste de nome (rsync, mac-only, espelho) e o par
      sai em `info` como `teste-importador:<código>=<teste>`. Só roda para código que não achou teste de nome; git/grep/leitura que falha -> unknown com `teste-derivado-ilegivel`.
-     Achou -> node, basis `derivado` (`info`: teste-derivado:<código>=<teste>); mas se o texto tem palavra informativa de envio de WhatsApp (o freio de DERIVED_BLOCK_INFO; `dado-de-lead` saiu em ga-2hd02v.3.21) -> mini, `freio-derivado:<palavras>`.
+     Achou -> node, basis `derivado` (`info`: teste-derivado:<código>=<teste>); mas se o texto tem palavra de ENVIO fora de identificador (envio(s), enviar, disparo(s), evolution, baileys: a tag `envio-acao`, BRAKE_SEND_RE; o freio de DERIVED_BLOCK_INFO; `dado-de-lead` saiu em ga-2hd02v.3.21 e `whatsapp`/`chip(s)`/`ban` saíram em ga-2hd02v.5.12: eram o nome do produto, não envio) -> mini, `freio-derivado:envio-acao`.
      Não achou -> unknown. Repo/git/espelho ilegível -> unknown com `info` `teste-derivado-ilegivel:<motivo>`; nunca vira node.
   7. CAMINHO DERIVADO (ga-2hd02v.3.20; só quando a bead NÃO cita nenhum arquivo de código — nome solto com extensão de código que não existe em lugar nenhum da árvore lida, o `part.py` de um script de
      diagnóstico, não conta como citado: `info` `caminho-solto-fora-da-arvore:<nome>`, ga-2hd02v.3.22; medido 30/10: 13 de 30 beads sondadas caíam em unknown `sem-prova-de-codigo-e-teste` porque o texto NOMEIA o módulo mas
@@ -65,7 +65,7 @@ COMO DECIDE (a 1ª regra que casa vale; tudo é lido da bead, nada é gravado ne
      conta só os vivos. Só há a cópia -> como antes: deriva e o filtro a freia. Não se generalizou para "ignora o que está fora do filtro": isso viraria o freio em preferência. (b) IRMÃS: os arquivos de código tocados pelos commits `fix|feat(<id>)` das beads de MESMO PAI (o campo `parent` ou o id sem o último `.N`; até 40 commits dos últimos 45 dias, WA_NODE_SIBLING_DAYS; um `git log`
      com prazo próprio, WA_NODE_SIBLING_TIMEOUT, 15 s) que ainda existem na árvore. Mais de 10 arquivos derivados no total = nenhum (`caminho-derivado-demais:N`; é palpite largo). Os caminhos derivados passam pelos MESMOS
      filtros dos citados, sem afrouxar nada: filtro do rsync (fora dele -> mini `caminho-derivado-fora-do-filtro:<p>`), lista mac-only (mini `caminho-derivado-so-no-mac:<p>`), as moles e o PII da regra 3/4 (que já rodaram antes)
-     e o freio de envio da regra 6 (mini `freio-derivado:envio-whatsapp`). A prova do teste é a mesma da regra 6 (o teste que o repo já tem para o código derivado) ou, se a bead cita o teste, o próprio teste citado.
+     e o freio de envio da regra 6 (mini `freio-derivado:envio-acao`). A prova do teste é a mesma da regra 6 (o teste que o repo já tem para o código derivado) ou, se a bead cita o teste, o próprio teste citado.
      Achou -> node, basis `derivado`, motivo `prova-caminho-derivado:N-teste(s)+M-codigo(s)` (`info`: caminho-derivado:<nome:X|irmas>=<caminho>, teste-derivado:<código>=<teste>). Nada derivado ou nenhum teste -> unknown como antes.
      Falha de leitura (repo, git, rsync, mac-only, espelho, git log das irmãs sem resposta) -> unknown com `info` `caminho-derivado-ilegivel:<motivo>`; "falhou" nunca é "vazio" e nunca é node (nem pela regra 8: bead que cita teste e cuja regra 7 não leu fica unknown). Custo: os `git ls-tree`/`git log` só
      rodam com nome ou pai para consultar; o `git log` das irmãs fica num cache por pai (6 h; o cache nunca decide: o conteúdo dele passa pela árvore e pelos filtros, e cache ilegível/vencido/de outro pai é recalculado);
@@ -161,7 +161,12 @@ MIN_STEM = 5                                                         # nome curt
 GENERIC_STEMS = frozenset(("utils", "helpers", "helper", "common", "config", "settings", "server", "client", "models", "routes", "index", "shared", "setup", "types", "tools", "utility", "utilities", "runner", "worker", "daemon"))
 MAX_DERIVED_PER_STEM = 25                                            # testes candidatos por módulo (ordem alfabética); acima disso o excesso nem é lido
 MAX_DERIVED_TESTS = 100                                              # candidatos no total, para o rsync -n e o git grep ficarem curtos
-DERIVED_BLOCK_INFO = ("envio-whatsapp",)                             # palavra informativa que, só para a prova derivada (mais fraca), manda ao mini. `dado-de-lead` saiu (ga-2hd02v.3.21): é regex de VOCABULÁRIO (lead(s), cliente(s), cpf, cnpj, telefone(s), celular(es), conversa(s), dump, csv, xlsx, parquet, terreno(s), lote(s), construtora(s), proprietari*), não de dado, e segurava 18 beads (ga-2hd02v.3.17) — 4 das 15 P0/P1 WA aprovadas (30/10). O dado em si é barrado por portões que não mudam: filtro do rsync, varredura PII do espelho, dado-no-texto (telefone/CPF no JSON da bead — NOME, e-mail, CNPJ e endereço no texto NÃO o acionam: esse freio de vocabulário deixou de existir por pedido do Mayor) e as moles; banco e credencial já bloqueiam antes
+# ga-2hd02v.5.12: o freio da prova derivada olha a tag ESTREITA `envio-acao` (palavra de ENVIO fora de identificador: BRAKE_SEND_RE), não mais a larga `envio-whatsapp`. Medido em 04/11 nas 132 beads WA abertas
+# que o Pilot segurava (94 mini + 38 unknown): 26 caíam em `freio-derivado:envio-whatsapp`; lidas uma a uma, 12 só tinham `whatsapp` (rótulo de launchd `com.whatsapp.*`, nome do produto), `chip(s)` (aparelho da frota) ou
+# `ban` (`ban-correlation-dashboard`) — nenhuma envia nada; das outras 14, só 1 (wa-gu0l2t.6, «PODE AUTO-ENVIAR») muda um caminho de envio sem dúvida (2 mexem na composição da fila de envio) e o resto cita a palavra em prosa. Aquelas palavras são o vocabulário do PRODUTO, o mesmo erro que tirou `dado-de-lead` aqui
+# em ga-2hd02v.3.21. A tag larga `envio-whatsapp` continua em `info` (a sombra mede com ela); só o FREIO passou a ler a estreita. Palavra de envio que sobra (envio, enviar, disparo, evolution, baileys) segue freando: o
+# envio é irreversível (uma mensagem a lead não tem desfazer) e a superfície de envio do WA é larga demais (`whapi` em 275 arquivos, `human_sender` em 177) para trocar a palavra por evidência no código sem medir antes.
+DERIVED_BLOCK_INFO = ("envio-acao",)                                 # palavra informativa que, só para a prova derivada (mais fraca), manda ao mini. `dado-de-lead` saiu (ga-2hd02v.3.21): é regex de VOCABULÁRIO (lead(s), cliente(s), cpf, cnpj, telefone(s), celular(es), conversa(s), dump, csv, xlsx, parquet, terreno(s), lote(s), construtora(s), proprietari*), não de dado, e segurava 18 beads (ga-2hd02v.3.17) — 4 das 15 P0/P1 WA aprovadas (30/10). O dado em si é barrado por portões que não mudam: filtro do rsync, varredura PII do espelho, dado-no-texto (telefone/CPF no JSON da bead — NOME, e-mail, CNPJ e endereço no texto NÃO o acionam: esse freio de vocabulário deixou de existir por pedido do Mayor) e as moles; banco e credencial já bloqueiam antes
 NAME_RE = re.compile(r"(?<![\w/.\-~$])([A-Za-z][A-Za-z0-9]*(?:[_\-][A-Za-z0-9]+)+)(?![\w/]|\.\w)")   # `ficha_donos`, `form-fill`: nome de módulo/tela/daemon SEM caminho (o que tem pasta ou extensão é caminho e já foi lido)
 MAX_NAME_TOKENS = 30                                                 # nomes distintos lidos de uma bead
 MAX_FILES_PER_NAME = 3                                               # um nome que casa mais arquivos que isto é ambíguo: não deriva nada dele
@@ -232,6 +237,11 @@ PH = re.compile(r"(?<![0-9])\+?55 ?\(?[1-9][0-9]\)? ?9?[0-9]{4}-?[0-9]{4}(?![0-9
 CPF = re.compile(r"(?<![0-9])[0-9]{3}\.[0-9]{3}\.[0-9]{3}-[0-9]{2}(?![0-9])")
 SOFT_RE = tuple((slug, re.compile(rx)) for slug, rx in SOFT)
 INFO_RE = tuple((slug, re.compile(rx)) for slug, rx in INFO)
+# o freio da prova derivada (ga-2hd02v.5.12): só palavra de ENVIO (envio(s), enviar, disparo(s), evolution, baileys), e só FORA de caminho/nome — a palavra não pode vir logo depois de `/` ou `.` (nem de letra/dígito/`_`), nem logo antes
+# de `/`, de `.`+letra ou de letra/dígito/`_` (`/api/enviar`, `lib/envio_x.py` são caminho, `fila_envio` é nome, `com.envio.x` é rótulo; ponto final de frase, ponto+espaço, continua valendo). O HÍFEN NÃO exclui: `auto-enviar` e `pré-envio` são envio de verdade, e o freio
+# guarda uma ação irreversível — na dúvida entre um falso freio (custo: a bead fica no mini) e um falso passe (custo: uma mensagem a lead), freia. `whatsapp`, `chip(s)` e `ban` NÃO freiam: são o nome do produto,
+# o aparelho da frota e um prefixo de nome de painel. O texto chega já normalizado por norm() (minúsculo, sem acento).
+BRAKE_SEND_RE = re.compile(r"(?<![\w/.])(?:envios?|enviar|disparos?|evolution|baileys)(?![\w/]|\.\w)")
 
 
 class Unreadable(Exception):
@@ -1175,6 +1185,8 @@ def classify_core(b):
     text = bead_text(b)
     ntext = norm(text.replace(REPO_ABS, ""))   # o prefixo absoluto do repo não é dependência de host (o caminho em si é julgado por extract_paths); outro /Users/... continua mole
     info =[slug for slug, rx in INFO_RE if rx.search(ntext)]
+    if BRAKE_SEND_RE.search(ntext):   # a tag estreita que o freio da prova derivada lê (DERIVED_BLOCK_INFO); a larga `envio-whatsapp` acima só informa
+        info.append("envio-acao")
     if "node:mini" in labels:
         return "mini", ["etiqueta-node:mini"], [], [], info
     # `exec:manual` = um HUMANO executa à mão (criar chave em console, aparelho físico): um construtor do nó nunca faz isso. O Pilot já não roteia essas beads, mas a palavra mole ("chave", "secret") era o que as
