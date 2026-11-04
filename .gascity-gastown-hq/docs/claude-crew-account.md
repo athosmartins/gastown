@@ -2,7 +2,7 @@
 
 ## Contents
 
-• O que faz (a cada 60 s, sob flock) · A tela do limite e o Escape (ga-ci3uao) · A mensagem de limite sem o modal e o último degrau (ga-yqzedv) · Ninguém fica sem aviso: sem login completo, login queimado, login a vencer (ga-xoe5ao.4) · Garantias · Liga/desliga · Riscos abertos (não medidos)
+• O que faz (a cada 60 s, sob flock) · A tela do limite e o Escape (ga-ci3uao) · A mensagem de limite sem o modal e o último degrau (ga-yqzedv) · Ninguém fica sem aviso: sem login completo, login queimado, login a vencer (ga-xoe5ao.4) · Duas lojas para o login default: item e arquivo (ga-i4t0lzx) · Garantias · Liga/desliga · Riscos abertos (não medidos)
 
 Fase 2 da ga-xoe5ao. O pool headless (ga-8hcnvb.1, `claude-pool-account.py`) decide a conta; este script **segue** a decisão
 para quem usa Remote Control (Mayor + crews), reescrevendo o item DEFAULT do Keychain `Claude Code-credentials`.
@@ -203,14 +203,28 @@ ilegível pode guardar o login mais novo, então o «melhor login» seria meia l
   depois) ou com item contaminado ela não prova qual está vivo. **Não consegui determinar daqui se estava errada** (sem log nem Keychain neste nó). Não mudei a regra (não sobrescrever é o lado inerte); a linha agora
   sai UMA vez por mudança de fatos e traz as duas impressões, as duas datas de vencimento e o dono que a tabela conhece.
 
-**Relogin automático (item 2 da bead): NÃO entregue aqui.** Precisa do Chrome CDP, do `secret`/gmail-totp e da skill federated-site-login, que só existem no mini (este código foi escrito no nó Hetzner). A única tentativa
+**Relogin automático (item 2 da bead): não é este job.** É o job `claude-login-renew` (`docs/claude-login-renew.md`, launchd a cada 15 min, no mini: precisa do Chrome CDP, do `secret`/gmail-totp e da skill federated-site-login). Este job só **avisa** e diz isso no alerta de outage (o texto antigo, «Automatic relogin (gmail-totp) is NOT wired», ficou velho e foi trocado em ga-i4t0lzx). O que segue é o histórico das decisões que aquele job respeita. A única tentativa
 registrada (ga-yyltfk, 04/10, terrenos@) chegou ao "Authorize" e parou no quebra-cabeça anti-bot da Anthropic; o Mayor decidiu então que contornar isso está fora, mesmo com autorização, e cada tentativa pode mandar um
 "Tap Yes" ao celular do Athos. Para a bead de relogin no mini: (1) acionar pela previsão (T-7 dias), não depois do outage; (2) se o quebra-cabeça aparecer, a conta é "inviável por automação" e só então se chama o
 Athos, com o comando exato; (3) login de escopo completo (`claude auth login`, nunca setup-token) em CLAUDE_CONFIG_DIR próprio, com `hasCompletedOnboarding=true`. O job já o recebe sem mudança: um login novo no
 config dir da conta é achado pelo `load_source` no minuto seguinte.
 
+## Duas lojas para o login default: item e arquivo (ga-i4t0lzx)
+**O que aconteceu (04/11, a partir de ~13:56Z, ~1 h 20).** A troca de conta do Mayor e das crews travou. O job escrevia só o **item** do Keychain `Claude Code-credentials`; as sessões do tmux (`-L gascity`) rodam na sessão
+de login **Background** do launchd, onde a leitura do Keychain falha (rc 36), então o `claude` delas lê — e **rotaciona** — o arquivo `~/.claude/.credentials.json`. O que o job gravava no item nunca chegava às sessões; o
+`/login` que o Athos fez ao fim da pane gravou o arquivo e foi o que as destravou. (Medido por leitura: só fingerprints; o item e o arquivo vivos não foram tocados.)
+
+**O que o job faz agora** (`put_default`, a mesma disciplina do daemon do pool, ga-6gat1o: `claude-pool-account.py`):
+- **Escreve o arquivo primeiro** (atômico: tmp `O_EXCL|O_NOFOLLOW` 0600, `fsync`, `os.replace`), **lê de volta** e só então escreve o item. Se o item falha, o arquivo volta ao que era (só se ainda for o que esta rodada escreveu). Arquivo que é link simbólico, que não é arquivo regular ou que não se consegue ler **nunca** é sobrescrito (`cred_refusal`).
+- **O arquivo também é fonte.** As sessões rotacionam o token nele, então o login mais novo entre item e arquivo é o login atual (`pick_current`, por `refreshTokenExpiresAt`, depois `expiresAt`; quando não dá para dizer, as duas lojas ficam como estão e a nota sai UMA vez no log). O sync-back usa esse login: **nunca por cima de um login mais novo**.
+- **Cura entre as lojas** (`heal_stores`): a que está atrás recebe o login da que está à frente — inclusive um `/login` feito só no arquivo, que é reconhecido e **limpa o alarme sem ninguém**. Um login completo que não tem onde ficar é estacionado (escrita verificada num item reserva) antes de ser coberto. Arquivo ilegível/recusado não é curado (WARN uma vez).
+- O refresh token mora **em um lugar só**: **nunca copie à mão** o login do arquivo para o item (nem o contrário) — o próximo refresh de uma das cópias mata a outra. Quem copia é este job, com leitura de volta.
+- **Aviso que chega.** O `notify` com `NOTIFY_STRICT_EXIT=1` devolve **12** quando um push *forçado* bate no teto global (8 pushes / 60 min). Em 04/11 o alerta saiu 12 uma vez por janela e ninguém foi avisado. Agora um alerta *urgente* (condição que só gente resolve) que volta 12 é pedido **uma vez mais**, sem `NOTIFY_FORCE_PUSH` e com o marcador «👉 aguardando você» no título e no texto — a rota «decisão» do notify, que o teto não segura (título diferente, para o dedup de 30 min não engolir). Previsão e «voltou» (`urgent=False`) continuam podendo esperar. A função é uma só (`deliver`); o `claude-login-renew` passa a usá-la na ga-i4t0lzx.1 (até lá tem a sua cópia).
+
+**NÃO medido:** quem reescreveu o item default sem o access token às 13:55:52Z; por que o login `d0aeaa6c` morreu; a mudança de sessão Aqua→Background depois do boot. O que a correção garante não depende disso: as duas lojas ficam iguais, com leitura de volta.
+
 ## Garantias
-- Nunca chama `claude`; custo de crédito zero (só o perfil, grátis). Nunca escreve no item hasheado do pool.
+- Nunca chama `claude`; custo de crédito zero (só o perfil, grátis). Nunca escreve no item hasheado do pool. O único arquivo que escreve fora dos itens é `~/.claude/.credentials.json` (0600, atômico, lido de volta).
 - Token nunca em argv, ambiente, log, estado ou notificação.
 - `--dry-run`: só stderr; não escreve, não notifica, não toca o log real; se perder o flock, diz isso.
 - Alerta só conta como "avisado" se o `notify` (contrato estrito, `NOTIFY_STRICT_EXIT=1`) saiu com 0, 10 ou 11; senão tenta de novo em 5 min (não em 6 h). O título leva a condição.
